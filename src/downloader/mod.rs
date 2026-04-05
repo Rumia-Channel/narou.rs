@@ -1,4 +1,5 @@
 pub mod html;
+pub mod novel_info;
 pub mod rate_limit;
 pub mod site_setting;
 
@@ -12,6 +13,11 @@ use crate::error::{NarouError, Result};
 
 use self::rate_limit::RateLimiter;
 use self::site_setting::SiteSetting;
+
+use chrono::Utc;
+
+use crate::db::novel_record::NovelRecord;
+use self::novel_info::NovelInfo;
 
 pub struct Downloader {
     client: reqwest::blocking::Client,
@@ -65,7 +71,28 @@ pub enum TargetType {
     Other,
 }
 
-const SECTION_SAVE_DIR: &str = "本文";
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TocFile {
+    pub title: String,
+    pub author: String,
+    pub toc_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story: Option<String>,
+    pub subtitles: Vec<SubtitleInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub novel_type: Option<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadResult {
+    pub id: i64,
+    pub title: String,
+    pub new_novel: bool,
+    pub updated_count: usize,
+    pub total_count: usize,
+}
+
+pub const SECTION_SAVE_DIR: &str = "本文";
 const RAW_DATA_DIR: &str = "raw";
 const CACHE_SAVE_DIR: &str = "cache";
 const MAX_SECTION_CACHE: usize = 20;
@@ -370,6 +397,419 @@ impl Downloader {
         }
         dir.push(&record.file_title);
         dir
+    }
+
+    pub fn download_novel(
+        &mut self,
+        target: &str,
+    ) -> Result<DownloadResult> {
+        let (existing_id, setting) = self.resolve_target_for_download(target)?;
+        let toc_url = setting.toc_url();
+        let toc_source = self.fetch_toc(&setting)?;
+
+        let info = NovelInfo::load(&setting, &self.client, &toc_source)?;
+
+        let title = info.title.clone().unwrap_or_default();
+        let author = info.author.clone().unwrap_or_default();
+
+        let (novel_type, is_end) = match info.novel_type {
+            Some(nt) => (nt, info.end.unwrap_or(false)),
+            None => {
+                let nt_text = setting.resolve_info_pattern("nt", &toc_source);
+                match nt_text {
+                    Some(text) => setting.get_novel_type_from_string(&text),
+                    None => (1u8, false),
+                }
+            }
+        };
+
+        let subtitles = if novel_type == 2 {
+            self.create_short_story_subtitles(&setting, &toc_source)?
+        } else {
+            self.parse_subtitles_multipage(&setting, &toc_source)?
+        };
+
+        let use_subdirectory = setting.domain.contains("syosetu.com");
+        let ncode = self.extract_ncode(&setting, &toc_source);
+        let file_title = self.compute_file_title(
+            &ncode,
+            &title,
+            setting.append_title_to_folder_name,
+            existing_id,
+        );
+        let sitename = info.sitename.unwrap_or_else(|| setting.sitename.clone());
+
+        let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory, &ncode);
+        std::fs::create_dir_all(&novel_dir)?;
+
+        let section_dir = novel_dir.join(SECTION_SAVE_DIR);
+        let raw_dir = novel_dir.join(RAW_DATA_DIR);
+        std::fs::create_dir_all(&section_dir)?;
+        std::fs::create_dir_all(&raw_dir)?;
+
+        let old_toc = self.load_toc_file(&novel_dir);
+        let old_subtitles: HashMap<String, &SubtitleInfo> = old_toc
+            .as_ref()
+            .map(|t| t.subtitles.iter().map(|s| (s.index.clone(), s)).collect())
+            .unwrap_or_default();
+
+        let mut updated_count = 0usize;
+        for subtitle in &subtitles {
+            let needs_download = match old_subtitles.get(&subtitle.index) {
+                Some(old) => {
+                    subtitle.subtitle != old.subtitle
+                        || subtitle.subdate != old.subdate
+                        || subtitle.subupdate != old.subupdate
+                }
+                None => true,
+            };
+
+            if needs_download {
+                let section = self.download_section(&setting, subtitle)?;
+                self.save_section_file(&section_dir, subtitle, &section)?;
+                self.save_raw_file(&raw_dir, subtitle, &section)?;
+                updated_count += 1;
+            }
+        }
+
+        let toc_file = TocFile {
+            title: title.clone(),
+            author: author.clone(),
+            toc_url: toc_url.clone(),
+            story: info.story.clone(),
+            subtitles: subtitles.clone(),
+            novel_type: Some(novel_type),
+        };
+        self.save_toc_file(&novel_dir, &toc_file)?;
+
+        let record = NovelRecord {
+            id: existing_id.unwrap_or(0),
+            author,
+            title: title.clone(),
+            file_title: file_title.clone(),
+            toc_url,
+            sitename,
+            novel_type,
+            end: is_end,
+            last_update: Utc::now(),
+            new_arrivals_date: Some(Utc::now()),
+            use_subdirectory,
+            general_firstup: info.general_firstup,
+            novelupdated_at: info.novelupdated_at,
+            general_lastup: info.general_lastup,
+            last_mail_date: None,
+            tags: Vec::new(),
+            ncode,
+            domain: Some(setting.domain.clone()),
+            general_all_no: Some(subtitles.len() as i64),
+            length: info.length,
+            suspend: false,
+        };
+
+        let id = crate::db::with_database_mut(|db| {
+            let id = if let Some(eid) = existing_id {
+                if let Some(existing) = db.get(eid) {
+                    let mut updated = existing.clone();
+                    updated.author = record.author.clone();
+                    updated.title = record.title.clone();
+                    updated.end = record.end;
+                    updated.last_update = record.last_update;
+                    updated.novelupdated_at = record.novelupdated_at;
+                    updated.general_lastup = record.general_lastup;
+                    updated.general_all_no = record.general_all_no;
+                    updated.length = record.length;
+                    updated.suspend = false;
+                    db.insert(updated);
+                    eid
+                } else {
+                    let new_id = db.create_new_id();
+                    let mut rec = record;
+                    rec.id = new_id;
+                    db.insert(rec);
+                    new_id
+                }
+            } else {
+                let new_id = db.create_new_id();
+                let mut rec = record;
+                rec.id = new_id;
+                db.insert(rec);
+                new_id
+            };
+            db.save()?;
+            Ok::<i64, NarouError>(id)
+        })?;
+
+        Ok(DownloadResult {
+            id,
+            title,
+            new_novel: existing_id.is_none(),
+            updated_count,
+            total_count: subtitles.len(),
+        })
+    }
+
+    fn resolve_target_for_download(
+        &self,
+        target: &str,
+    ) -> Result<(Option<i64>, SiteSetting)> {
+        let target_type = Self::get_target_type(target);
+
+        match target_type {
+            TargetType::Url => {
+                let setting = self.find_site_setting(target).ok_or_else(|| {
+                    NarouError::InvalidTarget(format!("No site setting for URL: {}", target))
+                })?;
+                let toc_url = setting.toc_url();
+                let existing_id = crate::db::with_database(|db| {
+                    Ok(db.get_by_toc_url(&toc_url).map(|r| r.id))
+                }).ok().flatten();
+                Ok((existing_id, setting))
+            }
+            TargetType::Ncode => {
+                let ncode = target.to_lowercase();
+                let existing_id = crate::db::with_database(|db| {
+                    Ok(db.all_records()
+                        .values()
+                        .find(|r| r.ncode.as_deref() == Some(ncode.as_str()))
+                        .map(|r| r.id))
+                }).ok().flatten();
+                if let Some(id) = existing_id {
+                    let toc_url = crate::db::with_database(|db| {
+                        Ok(db.get(id).map(|r| r.toc_url.clone()))
+                    }).ok().flatten();
+                    let setting = match toc_url {
+                        Some(ref url) => self.find_site_setting(url).ok_or_else(|| {
+                            NarouError::SiteSetting("No matching site setting".into())
+                        })?,
+                        None => return Err(NarouError::NotFound(format!(
+                            "Novel record {} has no toc_url", id
+                        ))),
+                    };
+                    Ok((Some(id), setting))
+                } else {
+                    Err(NarouError::NotFound(format!(
+                        "Novel not found for ncode: {} (use URL for new downloads)",
+                        ncode
+                    )))
+                }
+            }
+            TargetType::Id => {
+                let id: i64 = target
+                    .parse()
+                    .map_err(|_| NarouError::InvalidTarget(target.to_string()))?;
+                let setting = crate::db::with_database(|db| {
+                    Ok(db.get(id).and_then(|r| self.find_site_setting(&r.toc_url)))
+                }).ok().flatten();
+                let setting = setting.ok_or_else(|| {
+                    NarouError::NotFound(format!("Novel not found for ID: {}", id))
+                })?;
+                Ok((Some(id), setting))
+            }
+            TargetType::Other => {
+                let existing_id = crate::db::with_database(|db| {
+                    Ok(db.find_by_title(target).map(|r| r.id))
+                }).ok().flatten();
+                if let Some(id) = existing_id {
+                    let toc_url = crate::db::with_database(|db| {
+                        Ok(db.get(id).map(|r| r.toc_url.clone()))
+                    }).ok().flatten();
+                    let setting = match toc_url {
+                        Some(ref url) => self.find_site_setting(url).ok_or_else(|| {
+                            NarouError::SiteSetting("No matching site setting".into())
+                        })?,
+                        None => return Err(NarouError::NotFound(format!(
+                            "Novel record {} has no toc_url", id
+                        ))),
+                    };
+                    Ok((Some(id), setting))
+                } else {
+                    Err(NarouError::NotFound(format!(
+                        "Novel not found: {} (use URL for new downloads)",
+                        target
+                    )))
+                }
+            }
+        }
+    }
+
+    fn parse_subtitles_multipage(
+        &mut self,
+        setting: &SiteSetting,
+        mut toc_source: &str,
+    ) -> Result<Vec<SubtitleInfo>> {
+        let mut all_subtitles = Vec::new();
+        let mut page = 0;
+        let max_pages = if let Some(pattern) = setting.toc_page_max_pattern() {
+            pattern
+                .captures(toc_source)
+                .and_then(|caps| caps.get(1))
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1)
+        } else {
+            50
+        };
+
+        loop {
+            let page_subs = self.parse_subtitles(setting, toc_source)?;
+            all_subtitles.extend(page_subs);
+
+            page += 1;
+            if page >= max_pages {
+                break;
+            }
+
+            let next_toc_pattern = match setting.next_toc_pattern() {
+                Some(p) => p,
+                None => break,
+            };
+
+            let caps = match next_toc_pattern.captures(toc_source) {
+                Some(c) => c,
+                None => break,
+            };
+
+            let mut next_captures: HashMap<String, String> = HashMap::new();
+            for name in next_toc_pattern.capture_names().flatten() {
+                if let Some(m) = caps.name(name) {
+                    next_captures.insert(name.to_string(), m.as_str().to_string());
+                }
+            }
+
+            let next_url_val = match &setting.next_url {
+                Some(u) => u.clone(),
+                None => break,
+            };
+            let next_url = setting.get_next_url_with_captures(&next_url_val, &next_captures);
+
+            self.rate_limiter.wait();
+            let response = self.client.get(&next_url).send()?;
+            if !response.status().is_success() {
+                break;
+            }
+            let mut body = response.text()?;
+            pretreatment_source(&mut body, setting.encoding());
+            toc_source = Box::leak(body.into_boxed_str());
+        }
+
+        Ok(all_subtitles)
+    }
+
+    fn create_short_story_subtitles(
+        &self,
+        setting: &SiteSetting,
+        toc_source: &str,
+    ) -> Result<Vec<SubtitleInfo>> {
+        let title = setting
+            .resolve_info_pattern("t", toc_source)
+            .unwrap_or_else(|| "短編".to_string());
+
+        Ok(vec![SubtitleInfo {
+            index: "1".to_string(),
+            href: String::new(),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: title,
+            file_subtitle: sanitize_filename("短編"),
+            subdate: String::new(),
+            subupdate: None,
+        }])
+    }
+
+    fn extract_ncode(&self, setting: &SiteSetting, toc_source: &str) -> Option<String> {
+        let url_pattern = {
+            let re = regex::Regex::new(r"(?i)[/?](n\d+[a-z]+)").ok()?;
+            re.captures(&setting.toc_url())
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str().to_lowercase())
+        };
+        url_pattern.or_else(|| {
+            setting.resolve_info_pattern("ncode", toc_source)
+        })
+    }
+
+    fn compute_file_title(
+        &self,
+        ncode: &Option<String>,
+        title: &str,
+        append_title: bool,
+        existing_id: Option<i64>,
+    ) -> String {
+        if let Some(id) = existing_id {
+            if let Ok(Some(record)) = crate::db::with_database(|db| Ok(db.get(id).cloned())) {
+                return record.file_title;
+            }
+        }
+
+        if let Some(ncode) = ncode {
+            if !append_title {
+                return ncode.clone();
+            }
+            let sanitized = sanitize_filename(title);
+            format!("{} {}", ncode, sanitized)
+        } else {
+            sanitize_filename(title)
+        }
+    }
+
+    fn compute_novel_dir(
+        &self,
+        sitename: &str,
+        file_title: &str,
+        use_subdirectory: bool,
+        ncode: &Option<String>,
+    ) -> PathBuf {
+        let mut dir = PathBuf::from(ARCHIVE_ROOT_DIR);
+        dir.push(sitename);
+
+        if use_subdirectory {
+            if let Some(ncode) = ncode {
+                if ncode.len() >= 2 {
+                    dir.push(&ncode[..2]);
+                }
+            }
+        }
+
+        dir.push(file_title);
+        dir
+    }
+
+    fn save_section_file(
+        &self,
+        section_dir: &PathBuf,
+        subtitle: &SubtitleInfo,
+        section: &SectionElement,
+    ) -> Result<()> {
+        let filename = format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle);
+        let path = section_dir.join(filename);
+        let content = serde_yaml::to_string(section)?;
+        std::fs::write(&path, content)?;
+        Ok(())
+    }
+
+    fn save_raw_file(
+        &self,
+        raw_dir: &PathBuf,
+        subtitle: &SubtitleInfo,
+        section: &SectionElement,
+    ) -> Result<()> {
+        let filename = format!("{} {}.html", subtitle.index, subtitle.file_subtitle);
+        let path = raw_dir.join(filename);
+        std::fs::write(&path, &section.body)?;
+        Ok(())
+    }
+
+    fn load_toc_file(&self, novel_dir: &PathBuf) -> Option<TocFile> {
+        let path = novel_dir.join("toc.yaml");
+        let content = std::fs::read_to_string(&path).ok()?;
+        serde_yaml::from_str(&content).ok()
+    }
+
+    fn save_toc_file(&self, novel_dir: &PathBuf, toc: &TocFile) -> Result<()> {
+        let path = novel_dir.join("toc.yaml");
+        let content = serde_yaml::to_string(toc)?;
+        std::fs::write(&path, content)?;
+        Ok(())
     }
 }
 

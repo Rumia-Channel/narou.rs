@@ -176,7 +176,7 @@ impl SiteSetting {
         Regex::new(&resolved).ok()
     }
 
-    fn interpolate(&self, pattern: &str) -> String {
+    pub fn interpolate(&self, pattern: &str) -> String {
         let mut result = pattern.to_string();
         let vars: HashMap<&str, &str> = [
             ("scheme", self.scheme.as_str()),
@@ -298,6 +298,140 @@ impl SiteSetting {
             }
         }
         None
+    }
+
+    pub fn multi_match(
+        &self,
+        source: &str,
+        keys: &[&str],
+    ) -> HashMap<String, String> {
+        let mut match_values: HashMap<String, String> = HashMap::new();
+
+        for key in keys {
+            if let Some(value) = self.resolve_info_pattern_with_captures(key, source, &match_values) {
+                match_values.insert(key.to_string(), value);
+            }
+        }
+
+        match_values
+    }
+
+    fn resolve_info_pattern_with_captures(
+        &self,
+        key: &str,
+        source: &str,
+        prev_captures: &HashMap<String, String>,
+    ) -> Option<String> {
+        let value = match key {
+            "t" => &self.t,
+            "w" => &self.w,
+            "s" => &self.s,
+            "nt" => &self.nt,
+            "ga" => &self.ga,
+            "gf" => &self.gf,
+            "nu" => &self.nu,
+            "gl" => &self.gl,
+            "l" => &self.l,
+            "tags" => &self.tags,
+            "title" => &self.t,
+            "author" => &self.w,
+            "story" => &self.s,
+            _ => return None,
+        };
+
+        let value = value.as_ref()?;
+
+        let patterns: Vec<&str> = match value {
+            SiteSettingValue::Single(s) => vec![s.as_str()],
+            SiteSettingValue::Multiple(entries) => entries
+                .iter()
+                .filter_map(|e| match e {
+                    SiteSettingEntry::Plain(s) => Some(s.as_str()),
+                    SiteSettingEntry::Eval { .. } => None,
+                })
+                .collect(),
+        };
+
+        for pattern in patterns {
+            let resolved = self.interpolate_with_captures(pattern, prev_captures);
+            if let Ok(re) = Regex::new(&resolved) {
+                if let Some(caps) = re.captures(source) {
+                    for name in re.capture_names().flatten() {
+                        if let Some(m) = caps.name(name) {
+                            let v = m.as_str().to_string();
+                            if name == key {
+                                return Some(v);
+                            }
+                        }
+                    }
+                    if let Some(m) = caps.get(1) {
+                        return Some(m.as_str().to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn interpolate_with_captures(
+        &self,
+        pattern: &str,
+        captures: &HashMap<String, String>,
+    ) -> String {
+        let mut result = self.interpolate(pattern);
+
+        let re = Regex::new(r"\\k<(.+?)>").unwrap();
+        result = re
+            .replace_all(&result, |caps: &regex::Captures| {
+                let key = &caps[1];
+                captures
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| self.interpolate_key(key))
+            })
+            .to_string();
+
+        result
+    }
+
+    fn interpolate_key(&self, key: &str) -> String {
+        match key {
+            "scheme" => self.scheme.clone(),
+            "domain" => self.domain.clone(),
+            "top_url" => self.top_url.clone(),
+            _ => String::new(),
+        }
+    }
+
+    pub fn get_novel_type_from_string(&self, status_text: &str) -> (u8, bool) {
+        let empty = HashMap::new();
+        let mapping: &HashMap<String, u8> = self.novel_type_string.as_ref().unwrap_or(&empty);
+        let status_code = mapping
+            .iter()
+            .find(|(k, _)| *k == status_text)
+            .map(|(_, v)| *v)
+            .unwrap_or(1);
+
+        let is_end = status_code == 3;
+        let novel_type = match status_code {
+            1 | 3 => 1,
+            2 => 2,
+            _ => 1,
+        };
+
+        (novel_type, is_end)
+    }
+
+    pub fn get_toc_url_with_captures(&self, captures: &HashMap<String, String>) -> String {
+        self.interpolate_with_captures(&self.toc_url, captures)
+    }
+
+    pub fn get_next_url_with_captures(
+        &self,
+        next_url: &str,
+        captures: &HashMap<String, String>,
+    ) -> String {
+        self.interpolate_with_captures(next_url, captures)
     }
 }
 

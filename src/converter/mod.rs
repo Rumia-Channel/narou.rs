@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use settings::NovelSettings;
 
 use crate::downloader::{SectionElement, TocObject};
-use crate::error::Result;
+use crate::error::{NarouError, Result};
 
 pub struct NovelConverter {
     settings: NovelSettings,
@@ -175,5 +175,41 @@ impl NovelConverter {
     pub fn clear_cache(&mut self) {
         self.section_cache.clear();
         self.cache_dirty = false;
+    }
+
+    pub fn convert_novel_by_id(
+        &mut self,
+        id: i64,
+        novel_dir: &std::path::Path,
+    ) -> Result<String> {
+        let toc_path = novel_dir.join("toc.yaml");
+        let toc_content = std::fs::read_to_string(&toc_path)
+            .map_err(|e| NarouError::Io(e))?;
+        let toc: crate::downloader::TocFile = serde_yaml::from_str(&toc_content)
+            .map_err(|e| NarouError::Yaml(e))?;
+
+        let toc_object = crate::downloader::TocObject {
+            title: toc.title,
+            author: toc.author,
+            toc_url: toc.toc_url,
+            story: toc.story,
+            subtitles: toc.subtitles,
+            novel_type: toc.novel_type,
+        };
+
+        let section_dir = novel_dir.join(crate::downloader::SECTION_SAVE_DIR);
+        let mut sections = Vec::new();
+
+        for sub in &toc_object.subtitles {
+            let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
+            let path = section_dir.join(&filename);
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| NarouError::Io(e))?;
+            let section: crate::downloader::SectionElement = serde_yaml::from_str(&content)
+                .map_err(|e| NarouError::Yaml(e))?;
+            sections.push(section);
+        }
+
+        self.convert_novel(&toc_object, &sections)
     }
 }

@@ -154,7 +154,7 @@ impl ConverterBase {
     }
 
     fn replace_url(&mut self, text: &str) -> String {
-        let re = Regex::new(r#"https?://[^\s<>"']+)"#).unwrap();
+        let re = Regex::new(r#"https?://[^\s<>"']+"#).unwrap();
         let result = re
             .replace_all(text, |caps: &regex::Captures| {
                 let url = caps[0].to_string();

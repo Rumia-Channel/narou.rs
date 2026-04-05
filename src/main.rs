@@ -125,25 +125,159 @@ async fn run_web_server(port: u16, no_browser: bool) {
 }
 
 fn cmd_download(targets: &[String]) {
-    println!("Downloading: {:?}", targets);
-    println!("(Download not yet fully implemented)");
+    use narou_rs::downloader::Downloader;
+
+    if let Err(e) = narou_rs::db::init_database() {
+        eprintln!("Error initializing database: {}", e);
+        std::process::exit(1);
+    }
+
+    let mut downloader = match Downloader::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error creating downloader: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    for target in targets {
+        println!("Downloading: {}", target);
+        match downloader.download_novel(target) {
+            Ok(result) => {
+                if result.new_novel {
+                    println!(
+                        "  New novel: {} (ID: {}, {} sections)",
+                        result.title, result.id, result.total_count
+                    );
+                } else {
+                    println!(
+                        "  Updated: {} (ID: {}, {}/{})",
+                        result.title,
+                        result.id,
+                        result.updated_count,
+                        result.total_count
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("  Error: {}", e);
+            }
+        }
+    }
 }
 
 fn cmd_update(ids: Option<Vec<i64>>, all: bool) {
-    if all {
-        println!("Updating all novels");
-    } else if let Some(id_list) = ids {
-        println!("Updating novels: {:?}", id_list);
-    } else {
-        println!("Usage: narou update --all | narou update <id>...");
+    use narou_rs::downloader::Downloader;
+
+    if let Err(e) = narou_rs::db::init_database() {
+        eprintln!("Error initializing database: {}", e);
         std::process::exit(1);
     }
-    println!("(Update not yet fully implemented)");
+
+    let mut downloader = match Downloader::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error creating downloader: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let target_ids: Vec<i64> = if all {
+        narou_rs::db::with_database(|db| Ok(db.ids())).unwrap_or_default()
+    } else if let Some(id_list) = ids {
+        id_list
+    } else {
+        eprintln!("Usage: narou update --all | narou update <id>...");
+        std::process::exit(1);
+    };
+
+    let total = target_ids.len();
+    let mut success = 0usize;
+    let mut errors = 0usize;
+
+    for id in &target_ids {
+        match downloader.download_novel(&id.to_string()) {
+            Ok(result) => {
+                println!(
+                    "  Updated: {} (ID: {}, {}/{})",
+                    result.title, result.id, result.updated_count, result.total_count
+                );
+                success += 1;
+            }
+            Err(e) => {
+                eprintln!("  Error updating ID {}: {}", id, e);
+                errors += 1;
+            }
+        }
+    }
+
+    println!();
+    println!("Update complete: {}/{} succeeded, {} failed ", success, total, errors);
 }
 
 fn cmd_convert(targets: &[String]) {
-    println!("Converting: {:?}", targets);
-    println!("(Convert not yet fully implemented)");
+    use narou_rs::converter::{NovelConverter};
+    use narou_rs::converter::settings::NovelSettings;
+
+    if let Err(e) = narou_rs::db::init_database() {
+        eprintln!("Error initializing database: {}", e);
+        std::process::exit(1);
+    }
+
+    let settings = NovelSettings::default();
+    let mut converter = NovelConverter::new(settings);
+
+    for target in targets {
+        println!("Converting: {}", target);
+
+        let id: i64 = match target.parse() {
+            Ok(i) => i,
+            Err(_) => {
+                match narou_rs::db::with_database(|db| {
+                    Ok(db.find_by_title(target).map(|r| r.id))
+                }).ok().flatten() {
+                    Some(i) => i,
+                    None => {
+                        eprintln!("  Not found: {}", target);
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let novel_dir = match narou_rs::db::with_database(|db| {
+            let record = db.get(id).ok_or_else(|| {
+                narou_rs::error::NarouError::NotFound(format!("ID: {}", id))
+            })?;
+            let archive_root = db.archive_root();
+            let mut dir = std::path::PathBuf::from(archive_root);
+            dir.push(&record.sitename);
+            if record.use_subdirectory {
+                if let Some(ref ncode) = record.ncode {
+                    if ncode.len() >= 2 {
+                        dir.push(&ncode[..2]);
+                    }
+                }
+            }
+            dir.push(&record.file_title);
+            Ok::<std::path::PathBuf, narou_rs::error::NarouError>(dir)
+        }) {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("  Error: {}", e);
+                continue;
+            }
+        };
+
+        match converter.convert_novel_by_id(id, &novel_dir) {
+            Ok(output_path) => {
+                println!("  Output: {}", output_path);
+            }
+            Err(e) => {
+                eprintln!("  Error: {}", e);
+            }
+        }
+    }
 }
 
 fn cmd_list(tag: Option<&str>, frozen: bool) {
@@ -167,8 +301,8 @@ fn cmd_list(tag: Option<&str>, frozen: bool) {
 
         for r in &list {
             let type_str = match r.novel_type {
-                1 => "\u{9023}\u{8F09}",
-                2 => "\u{77ED}\u{7DE8}",
+                1 => "連載",
+                2 => "短編",
                 _ => "?",
             };
             let end_str = if r.end { " [完]" } else { "" };
@@ -187,21 +321,158 @@ fn cmd_list(tag: Option<&str>, frozen: bool) {
     })
     .unwrap_or(0);
 
-    println!("\nTotal: {} novels", records);
+    println!();
+    println!("Total: {} novels", records);
 }
 
 fn cmd_tag(add: Option<&str>, remove: Option<&str>, targets: &[String]) {
-    println!("Tag operation: add={:?}, remove={:?}, targets={:?}", add, remove, targets);
-    println!("(Tag not yet fully implemented)");
+    use narou_rs::db;
+
+    if let Err(e) = db::init_database() {
+        eprintln!("Error initializing database: {}", e);
+        std::process::exit(1);
+    }
+
+    for target in targets {
+        let id: i64 = match target.parse() {
+            Ok(i) => i,
+            Err(_) => {
+                match db::with_database(|db| {
+                    Ok(db.find_by_title(target).map(|r| r.id))
+                })
+                .unwrap_or(None)
+                {
+                    Some(i) => i,
+                    None => {
+                        eprintln!("  Not found: {}", target);
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let result = db::with_database_mut(|db| {
+            let record = db.get(id).cloned().ok_or_else(|| {
+                narou_rs::error::NarouError::NotFound(format!("ID: {}", id))
+            })?;
+            let mut updated = record;
+            if let Some(tag) = add {
+                if !updated.tags.contains(&tag.to_string()) {
+                    updated.tags.push(tag.to_string());
+                }
+            }
+            if let Some(tag) = remove {
+                updated.tags.retain(|t| t != tag);
+            }
+            db.insert(updated);
+            db.save()
+        });
+
+        match result {
+            Ok(()) => println!("  Tagged ID: {}", id),
+            Err(e) => eprintln!("  Error: {}", e),
+        }
+    }
 }
 
 fn cmd_freeze(targets: &[String], off: bool) {
-    let action = if off { "Unfreezing" } else { "Freezing" };
-    println!("{}: {:?}", action, targets);
-    println!("(Freeze not yet fully implemented)");
+    use narou_rs::db;
+
+    if let Err(e) = db::init_database() {
+        eprintln!("Error initializing database: {}", e);
+        std::process::exit(1);
+    }
+
+    for target in targets {
+        let id: i64 = match target.parse() {
+            Ok(i) => i,
+            Err(_) => {
+                match db::with_database(|db| {
+                    Ok(db.find_by_title(target).map(|r| r.id))
+                })
+                .unwrap_or(None)
+                {
+                    Some(i) => i,
+                    None => {
+                        eprintln!("  Not found: {}", target);
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let result = db::with_database_mut(|db| {
+            let record = db.get(id).cloned().ok_or_else(|| {
+                narou_rs::error::NarouError::NotFound(format!("ID: {}", id))
+            })?;
+            let mut updated = record;
+            if off {
+                updated.tags.retain(|t| t != "frozen");
+            } else if !updated.tags.contains(&"frozen".to_string()) {
+                updated.tags.push("frozen".to_string());
+            }
+            db.insert(updated);
+            db.save()
+        });
+
+        let action = if off { "Unfroze" } else { "Froze" };
+        match result {
+            Ok(()) => println!("  {} ID: {}", action, id),
+            Err(e) => eprintln!("  Error: {}", e),
+        }
+    }
 }
 
 fn cmd_remove(targets: &[String]) {
-    println!("Removing: {:?}", targets);
-    println!("(Remove not yet fully implemented)");
+    use narou_rs::db;
+
+    if let Err(e) = db::init_database() {
+        eprintln!("Error initializing database: {}", e);
+        std::process::exit(1);
+    }
+
+    for target in targets {
+        let id: i64 = match target.parse() {
+            Ok(i) => i,
+            Err(_) => {
+                match db::with_database(|db| {
+                    Ok(db.find_by_title(target).map(|r| r.id))
+                })
+                .unwrap_or(None)
+                {
+                    Some(i) => i,
+                    None => {
+                        eprintln!("  Not found: {}", target);
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let result = db::with_database_mut(|db| {
+            if let Some(record) = db.remove(id) {
+                let novel_dir = db.archive_root().join(&record.sitename);
+                if record.use_subdirectory {
+                    if let Some(ref ncode) = record.ncode {
+                        if ncode.len() >= 2 {
+                            let dir = novel_dir.join(&ncode[..2]).join(&record.file_title);
+                            let _ = std::fs::remove_dir_all(&dir);
+                        }
+                    }
+                } else {
+                    let dir = novel_dir.join(&record.file_title);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+                db.save()?;
+                Ok::<String, narou_rs::error::NarouError>(record.title)
+            } else {
+                Err(narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))
+            }
+        });
+
+        match result {
+            Ok(title) => println!("  Removed: {} (ID: {})", title, id),
+            Err(e) => eprintln!("  Error: {}", e),
+        }
+    }
 }
