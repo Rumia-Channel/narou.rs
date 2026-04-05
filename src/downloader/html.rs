@@ -1,0 +1,168 @@
+use regex::Regex;
+
+pub fn to_aozora(html: &str) -> String {
+    let mut text = html.to_string();
+    text = br_to_aozora(&text);
+    text = p_to_aozora(&text);
+    text = ruby_to_aozora(&text);
+    text = b_to_aozora(&text);
+    text = i_to_aozora(&text);
+    text = s_to_aozora(&text);
+    text = img_to_aozora(&text);
+    text = em_to_sesame(&text);
+    text = delete_all_tags(&text);
+    text = restore_entities(&text);
+    text
+}
+
+fn br_to_aozora(text: &str) -> String {
+    let re = Regex::new(r"<br\s*/?>").unwrap();
+    re.replace_all(text, "\n").to_string().replace("\r\n", "\n")
+}
+
+fn p_to_aozora(text: &str) -> String {
+    let re = Regex::new(r"</p>").unwrap();
+    re.replace_all(text, "\n").to_string()
+}
+
+fn ruby_to_aozora(text: &str) -> String {
+    let mut result = text.to_string();
+    result = result.replace('《', "\u{226A}").replace('》', "\u{226B}");
+
+    let re = Regex::new(r"(?i)<ruby>(.+?)</ruby>").unwrap();
+    result = re
+        .replace_all(&result, |caps: &regex::Captures| {
+            let inner = &caps[1];
+            let rt_re = Regex::new(r"(?i)<rt>").unwrap();
+            let parts: Vec<&str> = rt_re.splitn(inner, 2).collect();
+
+            if parts.len() < 2 {
+                return String::new();
+            }
+
+            let base = strip_tags(parts[0]);
+            let ruby = strip_tags(parts[1]);
+
+            format!("\u{FF5C}{}\u{300C}{}\u{300D}", base, ruby)
+        })
+        .to_string();
+
+    result
+}
+
+fn b_to_aozora(text: &str) -> String {
+    let text = Regex::new(r"(?i)<b[^>]*>")
+        .unwrap()
+        .replace_all(text, "\u{FF3B}\u{FF23}\u{592A}\u{5B57}\u{FF3D}")
+        .to_string();
+    Regex::new(r"(?i)</b>")
+        .unwrap()
+        .replace_all(
+            &text,
+            "\u{FF3B}\u{FF23}\u{592A}\u{5B57}\u{7D42}\u{308F}\u{308A}\u{FF3D}",
+        )
+        .to_string()
+}
+
+fn i_to_aozora(text: &str) -> String {
+    let text = Regex::new(r"(?i)<i[^>]*>")
+        .unwrap()
+        .replace_all(text, "\u{FF3B}\u{FF23}\u{659C}\u{4F53}\u{FF3D}")
+        .to_string();
+    Regex::new(r"(?i)</i>")
+        .unwrap()
+        .replace_all(
+            &text,
+            "\u{FF3B}\u{FF23}\u{659C}\u{4F53}\u{7D42}\u{308F}\u{308A}\u{FF3D}",
+        )
+        .to_string()
+}
+
+fn s_to_aozora(text: &str) -> String {
+    let text = Regex::new(r"(?i)<s[^>]*>")
+        .unwrap()
+        .replace_all(text, "\u{FF3B}\u{FF23}\u{53D6}\u{6D88}\u{7DDA}\u{FF3D}")
+        .to_string();
+    Regex::new(r"(?i)</s>")
+        .unwrap()
+        .replace_all(
+            &text,
+            "\u{FF3B}\u{FF23}\u{53D6}\u{6D88}\u{7DDA}\u{7D42}\u{308F}\u{308A}\u{FF3D}",
+        )
+        .to_string()
+}
+
+fn img_to_aozora(text: &str) -> String {
+    let re = Regex::new(r#"(?i)<img[^>]+src=["']([^"']+)["'][^>]*>"#).unwrap();
+    re.replace_all(
+        text,
+        "\u{FF3B}\u{FF23}\u{633F}\u{7D75}\u{FF08}$1\u{FF09}\u{5165}\u{308B}\u{FF3D}",
+    )
+    .to_string()
+}
+
+fn em_to_sesame(text: &str) -> String {
+    let re = Regex::new(r#"(?i)<em\s+class=["']emphasisDots["']\s*>(.+?)</em>"#).unwrap();
+    let text = re.replace_all(text, "\u{FF3B}\u{FF23}\u{65C1}\u{70B9}\u{FF3D}$1\u{FF3B}\u{FF23}\u{65C1}\u{70B9}\u{7D42}\u{308F}\u{308A}\u{FF3D}").to_string();
+
+    let re2 = Regex::new(r"(?i)<em[^>]*>(.+?)</em>").unwrap();
+    re2.replace_all(&text, "\u{FF3B}\u{FF23}\u{65C1}\u{70B9}\u{FF3D}$1\u{FF3B}\u{FF23}\u{65C1}\u{70B9}\u{7D42}\u{308F}\u{308A}\u{FF3D}")
+        .to_string()
+}
+
+fn delete_all_tags(text: &str) -> String {
+    let mut result = text.to_string();
+    let re = Regex::new(r"<[^>]+>").unwrap();
+    while re.is_match(&result) {
+        result = re.replace_all(&result, "").to_string();
+    }
+    result
+}
+
+fn strip_tags(text: &str) -> String {
+    let re = Regex::new(r"<[^>]+>").unwrap();
+    re.replace_all(text, "").to_string()
+}
+
+fn restore_entities(text: &str) -> String {
+    let mut result = text.to_string();
+    let entities: &[(&str, &str)] = &[
+        ("&quot;", "\""),
+        ("&amp;", "&"),
+        ("&nbsp;", "\u{00A0}"),
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&copy;", "(c)"),
+        ("&#39;", "'"),
+    ];
+
+    for (entity, replacement) in entities {
+        result = result.replace(entity, replacement);
+    }
+
+    result
+}
+
+pub fn sanitize_text(text: &str) -> String {
+    let mut result = text.to_string();
+
+    let script_re = Regex::new(r"(?si)<script[^>]*>.*?</script>").unwrap();
+    result = script_re.replace_all(&result, "").to_string();
+
+    let style_re = Regex::new(r"(?si)<style[^>]*>.*?</style>").unwrap();
+    result = style_re.replace_all(&result, "").to_string();
+
+    let comment_re = Regex::new(r"<!--.*?-->").unwrap();
+    result = comment_re.replace_all(&result, "").to_string();
+
+    result = delete_all_tags(&result);
+
+    result = result.replace("&nbsp;", " ").replace("&#160;", " ");
+
+    result = restore_entities(&result);
+
+    let ws_re = Regex::new(r"\s+").unwrap();
+    result = ws_re.replace_all(&result.trim(), " ").to_string();
+
+    result
+}
