@@ -1,17 +1,22 @@
 pub mod converter_base;
+pub mod device;
 pub mod settings;
+pub mod user_converter;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
 use settings::NovelSettings;
+use user_converter::UserConverter;
 
 use crate::downloader::{SectionElement, TocObject};
 use crate::error::{NarouError, Result};
 
 pub struct NovelConverter {
     settings: NovelSettings,
+    user_converter: Option<UserConverter>,
     section_cache: HashMap<String, CacheEntry>,
     cache_dirty: bool,
 }
@@ -25,6 +30,16 @@ impl NovelConverter {
     pub fn new(settings: NovelSettings) -> Self {
         Self {
             settings,
+            user_converter: None,
+            section_cache: HashMap::new(),
+            cache_dirty: false,
+        }
+    }
+
+    pub fn with_user_converter(settings: NovelSettings, user_converter: UserConverter) -> Self {
+        Self {
+            settings,
+            user_converter: Some(user_converter),
             section_cache: HashMap::new(),
             cache_dirty: false,
         }
@@ -45,7 +60,14 @@ impl NovelConverter {
                 continue;
             }
 
-            let mut converter = converter_base::ConverterBase::new(self.settings.clone());
+            let mut converter = if let Some(ref uc) = self.user_converter {
+                converter_base::ConverterBase::with_user_converter(
+                    self.settings.clone(),
+                    uc.clone(),
+                )
+            } else {
+                converter_base::ConverterBase::new(self.settings.clone())
+            };
 
             let mut batch_inputs = Vec::new();
 
@@ -148,6 +170,9 @@ impl NovelConverter {
         }
         hasher.update(index.to_le_bytes());
         hasher.update(self.compute_settings_signature().as_bytes());
+        if let Some(ref uc) = self.user_converter {
+            hasher.update(uc.signature().as_bytes());
+        }
         hex::encode(hasher.finalize())
     }
 
@@ -177,16 +202,11 @@ impl NovelConverter {
         self.cache_dirty = false;
     }
 
-    pub fn convert_novel_by_id(
-        &mut self,
-        id: i64,
-        novel_dir: &std::path::Path,
-    ) -> Result<String> {
+    pub fn convert_novel_by_id(&mut self, _id: i64, novel_dir: &std::path::Path) -> Result<String> {
         let toc_path = novel_dir.join("toc.yaml");
-        let toc_content = std::fs::read_to_string(&toc_path)
-            .map_err(|e| NarouError::Io(e))?;
-        let toc: crate::downloader::TocFile = serde_yaml::from_str(&toc_content)
-            .map_err(|e| NarouError::Yaml(e))?;
+        let toc_content = std::fs::read_to_string(&toc_path).map_err(|e| NarouError::Io(e))?;
+        let toc: crate::downloader::TocFile =
+            serde_yaml::from_str(&toc_content).map_err(|e| NarouError::Yaml(e))?;
 
         let toc_object = crate::downloader::TocObject {
             title: toc.title,
@@ -203,13 +223,77 @@ impl NovelConverter {
         for sub in &toc_object.subtitles {
             let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
             let path = section_dir.join(&filename);
-            let content = std::fs::read_to_string(&path)
-                .map_err(|e| NarouError::Io(e))?;
-            let section: crate::downloader::SectionElement = serde_yaml::from_str(&content)
-                .map_err(|e| NarouError::Yaml(e))?;
+            let content = std::fs::read_to_string(&path).map_err(|e| NarouError::Io(e))?;
+            let section: crate::downloader::SectionElement =
+                serde_yaml::from_str(&content).map_err(|e| NarouError::Yaml(e))?;
             sections.push(section);
         }
 
-        self.convert_novel(&toc_object, &sections)
+        let aozora_text = self.convert_novel(&toc_object, &sections)?;
+        let output_dir = novel_dir.join("output");
+        std::fs::create_dir_all(&output_dir)?;
+
+        let base_name = sanitize_filename_for_output(&toc_object.title);
+        let txt_path = output_dir.join(format!("{}.txt", base_name));
+        std::fs::write(&txt_path, &aozora_text)?;
+
+        Ok(txt_path.display().to_string())
+    }
+
+    pub fn convert_novel_by_id_with_device(
+        &mut self,
+        _id: i64,
+        novel_dir: &std::path::Path,
+        device: device::Device,
+    ) -> Result<PathBuf> {
+        let toc_path = novel_dir.join("toc.yaml");
+        let toc_content = std::fs::read_to_string(&toc_path).map_err(|e| NarouError::Io(e))?;
+        let toc: crate::downloader::TocFile =
+            serde_yaml::from_str(&toc_content).map_err(|e| NarouError::Yaml(e))?;
+
+        let toc_object = crate::downloader::TocObject {
+            title: toc.title,
+            author: toc.author,
+            toc_url: toc.toc_url,
+            story: toc.story,
+            subtitles: toc.subtitles,
+            novel_type: toc.novel_type,
+        };
+
+        let section_dir = novel_dir.join(crate::downloader::SECTION_SAVE_DIR);
+        let mut sections = Vec::new();
+
+        for sub in &toc_object.subtitles {
+            let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
+            let path = section_dir.join(&filename);
+            let content = std::fs::read_to_string(&path).map_err(|e| NarouError::Io(e))?;
+            let section: crate::downloader::SectionElement =
+                serde_yaml::from_str(&content).map_err(|e| NarouError::Yaml(e))?;
+            sections.push(section);
+        }
+
+        let aozora_text = self.convert_novel(&toc_object, &sections)?;
+        let output_dir = novel_dir.join("output");
+        std::fs::create_dir_all(&output_dir)?;
+
+        let base_name = sanitize_filename_for_output(&toc_object.title);
+        let txt_path = output_dir.join(format!("{}.txt", base_name));
+        std::fs::write(&txt_path, &aozora_text)?;
+
+        let output_manager = device::OutputManager::new(device);
+        let final_path = output_manager.convert_file(&txt_path, &output_dir, &base_name)?;
+
+        Ok(final_path)
+    }
+}
+
+fn sanitize_filename_for_output(name: &str) -> String {
+    let invalid = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\0'];
+    let cleaned: String = name.chars().filter(|c| !invalid.contains(c)).collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "output".to_string()
+    } else {
+        trimmed.chars().take(80).collect()
     }
 }

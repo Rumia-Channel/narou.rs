@@ -18,12 +18,12 @@ pub struct SiteSetting {
     pub url: Option<SiteSettingValue>,
     #[serde(default)]
     pub encoding: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
     pub confirm_over18: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie: Option<String>,
     pub sitename: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
     pub append_title_to_folder_name: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_strip_pattern: Option<String>,
@@ -109,7 +109,61 @@ pub enum SiteSettingEntry {
     Eval { eval: String },
 }
 
+fn deserialize_yes_no_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+
+    struct YesNoBoolVisitor;
+
+    impl<'de> Visitor<'de> for YesNoBoolVisitor {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a boolean or a string \"yes\"/\"no\"")
+        }
+
+        fn visit_bool<E>(self, value: bool) -> std::result::Result<bool, E>
+        where
+            E: de::Error,
+        {
+            Ok(value)
+        }
+
+        fn visit_str<E>(self, value: &str) -> std::result::Result<bool, E>
+        where
+            E: de::Error,
+        {
+            match value.to_lowercase().as_str() {
+                "yes" | "true" | "on" | "1" => Ok(true),
+                "no" | "false" | "off" | "0" => Ok(false),
+                _ => Err(de::Error::invalid_value(de::Unexpected::Str(value), &self)),
+            }
+        }
+    }
+
+    deserializer.deserialize_any(YesNoBoolVisitor)
+}
+
 impl SiteSetting {
+    fn eval_kakuyomu(&self, source: &str, eval_expr: &str) -> Option<String> {
+        let json_re =
+            regex::Regex::new(r"(?s)<script[^>]*>.*?window\.__NUXT__\s*=\s*(\{.*?\});\s*</script>")
+                .ok()?;
+        let caps = json_re.captures(source)?;
+        let json_str = caps.get(1)?.as_str();
+
+        let json_val: serde_json::Value = serde_json::from_str(json_str).ok()?;
+
+        let path_parts: Vec<&str> = eval_expr.split('.').collect();
+        let mut current = &json_val;
+        for part in &path_parts {
+            current = current.get(*part)?;
+        }
+        current.as_str().map(|s| s.to_string())
+    }
+
     pub fn load_all() -> Result<Vec<Self>> {
         let mut settings_map: HashMap<String, Self> = HashMap::new();
 
@@ -177,7 +231,6 @@ impl SiteSetting {
     }
 
     pub fn interpolate(&self, pattern: &str) -> String {
-        let mut result = pattern.to_string();
         let vars: HashMap<&str, &str> = [
             ("scheme", self.scheme.as_str()),
             ("domain", self.domain.as_str()),
@@ -186,15 +239,18 @@ impl SiteSetting {
         .into_iter()
         .collect();
 
-        let re = Regex::new(r"\\k<(.+?)>").unwrap();
-        result = re
-            .replace_all(&result, |caps: &regex::Captures| {
-                let key = &caps[1];
-                vars.get(key).copied().unwrap_or("")
-            })
-            .to_string();
-
-        result
+        let re = Regex::new(r"\\+k<(.+?)>").unwrap();
+        re.replace_all(pattern, |caps: &regex::Captures| {
+            let key = &caps[1];
+            match vars.get(key).copied() {
+                Some(v) => v.to_string(),
+                None => caps
+                    .get(0)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default(),
+            }
+        })
+        .to_string()
     }
 
     pub fn matches_url(&self, url: &str) -> bool {
@@ -203,8 +259,38 @@ impl SiteSetting {
             .map_or(false, |re| re.is_match(url))
     }
 
+    pub fn debug_url_pattern(&self) -> Option<String> {
+        self.compiled_url.as_ref().map(|r| r.as_str().to_string())
+    }
+
     pub fn toc_url(&self) -> String {
         self.interpolate(&self.toc_url)
+    }
+
+    pub fn extract_url_captures(&self, url: &str) -> Option<HashMap<String, String>> {
+        let re = self.compiled_url.as_ref()?;
+        let caps = re.captures(url)?;
+        let mut captures: HashMap<String, String> = HashMap::new();
+        for name in re.capture_names().flatten() {
+            if let Some(m) = caps.name(name) {
+                captures.insert(name.to_string(), m.as_str().to_string());
+            }
+        }
+        Some(captures)
+    }
+
+    pub fn toc_url_with_url_captures(&self, url: &str) -> Option<String> {
+        let captures = self.extract_url_captures(url)?;
+        Some(self.interpolate_with_captures(&self.toc_url, &captures))
+    }
+
+    pub fn novel_info_url_with_captures(
+        &self,
+        url_captures: &HashMap<String, String>,
+    ) -> Option<String> {
+        self.novel_info_url
+            .as_ref()
+            .map(|u| self.interpolate_with_captures(u, url_captures))
     }
 
     pub fn top_url(&self) -> String {
@@ -268,18 +354,22 @@ impl SiteSetting {
 
         let value = value.as_ref()?;
 
-        let patterns: Vec<&str> = match value {
-            SiteSettingValue::Single(s) => vec![s.as_str()],
-            SiteSettingValue::Multiple(entries) => entries
-                .iter()
-                .filter_map(|e| match e {
-                    SiteSettingEntry::Plain(s) => Some(s.as_str()),
-                    SiteSettingEntry::Eval { .. } => None,
-                })
-                .collect(),
+        let entries: Vec<SiteSettingEntry> = match value {
+            SiteSettingValue::Single(s) => vec![SiteSettingEntry::Plain(s.clone())],
+            SiteSettingValue::Multiple(entries) => entries.clone(),
         };
 
-        for pattern in patterns {
+        for entry in &entries {
+            let pattern = match entry {
+                SiteSettingEntry::Plain(s) => s.as_str(),
+                SiteSettingEntry::Eval { eval } => {
+                    if let Some(result) = self.eval_kakuyomu(source, eval) {
+                        return Some(result);
+                    }
+                    continue;
+                }
+            };
+
             let resolved = self.interpolate(pattern);
             if let Ok(re) = Regex::new(&resolved) {
                 if let Some(caps) = re.captures(source) {
@@ -300,15 +390,12 @@ impl SiteSetting {
         None
     }
 
-    pub fn multi_match(
-        &self,
-        source: &str,
-        keys: &[&str],
-    ) -> HashMap<String, String> {
+    pub fn multi_match(&self, source: &str, keys: &[&str]) -> HashMap<String, String> {
         let mut match_values: HashMap<String, String> = HashMap::new();
 
         for key in keys {
-            if let Some(value) = self.resolve_info_pattern_with_captures(key, source, &match_values) {
+            if let Some(value) = self.resolve_info_pattern_with_captures(key, source, &match_values)
+            {
                 match_values.insert(key.to_string(), value);
             }
         }
@@ -341,18 +428,21 @@ impl SiteSetting {
 
         let value = value.as_ref()?;
 
-        let patterns: Vec<&str> = match value {
-            SiteSettingValue::Single(s) => vec![s.as_str()],
-            SiteSettingValue::Multiple(entries) => entries
-                .iter()
-                .filter_map(|e| match e {
-                    SiteSettingEntry::Plain(s) => Some(s.as_str()),
-                    SiteSettingEntry::Eval { .. } => None,
-                })
-                .collect(),
+        let entries: Vec<SiteSettingEntry> = match value {
+            SiteSettingValue::Single(s) => vec![SiteSettingEntry::Plain(s.clone())],
+            SiteSettingValue::Multiple(entries) => entries.clone(),
         };
 
-        for pattern in patterns {
+        for entry in &entries {
+            let pattern = match entry {
+                SiteSettingEntry::Plain(s) => s.as_str(),
+                SiteSettingEntry::Eval { eval } => {
+                    if let Some(result) = self.eval_kakuyomu(source, eval) {
+                        return Some(result);
+                    }
+                    continue;
+                }
+            };
             let resolved = self.interpolate_with_captures(pattern, prev_captures);
             if let Ok(re) = Regex::new(&resolved) {
                 if let Some(caps) = re.captures(source) {
@@ -373,14 +463,14 @@ impl SiteSetting {
         None
     }
 
-    fn interpolate_with_captures(
+    pub fn interpolate_with_captures(
         &self,
         pattern: &str,
         captures: &HashMap<String, String>,
     ) -> String {
         let mut result = self.interpolate(pattern);
 
-        let re = Regex::new(r"\\k<(.+?)>").unwrap();
+        let re = Regex::new(r"\\+k<(.+?)>").unwrap();
         result = re
             .replace_all(&result, |caps: &regex::Captures| {
                 let key = &caps[1];

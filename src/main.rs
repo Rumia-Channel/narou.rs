@@ -127,92 +127,105 @@ async fn run_web_server(port: u16, no_browser: bool) {
 fn cmd_download(targets: &[String]) {
     use narou_rs::downloader::Downloader;
 
-    if let Err(e) = narou_rs::db::init_database() {
-        eprintln!("Error initializing database: {}", e);
-        std::process::exit(1);
-    }
-
-    let mut downloader = match Downloader::new() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error creating downloader: {}", e);
+    let targets = targets.to_vec();
+    let result = std::thread::spawn(move || {
+        if let Err(e) = narou_rs::db::init_database() {
+            eprintln!("Error initializing database: {}", e);
             std::process::exit(1);
         }
-    };
 
-    for target in targets {
-        println!("Downloading: {}", target);
-        match downloader.download_novel(target) {
-            Ok(result) => {
-                if result.new_novel {
-                    println!(
-                        "  New novel: {} (ID: {}, {} sections)",
-                        result.title, result.id, result.total_count
-                    );
-                } else {
-                    println!(
-                        "  Updated: {} (ID: {}, {}/{})",
-                        result.title,
-                        result.id,
-                        result.updated_count,
-                        result.total_count
-                    );
+        let mut downloader = match Downloader::new() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Error creating downloader: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        for target in targets {
+            println!("Downloading: {}", target);
+            match downloader.download_novel(&target) {
+                Ok(result) => {
+                    if result.new_novel {
+                        println!(
+                            "  New novel: {} (ID: {}, {} sections)",
+                            result.title, result.id, result.total_count
+                        );
+                    } else {
+                        println!(
+                            "  Updated: {} (ID: {}, {}/{})",
+                            result.title,
+                            result.id,
+                            result.updated_count,
+                            result.total_count
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  Error: {}", e);
                 }
             }
-            Err(e) => {
-                eprintln!("  Error: {}", e);
-            }
         }
+    }).join();
+
+    if let Err(e) = result {
+        eprintln!("Thread panicked: {:?}", e);
     }
 }
 
 fn cmd_update(ids: Option<Vec<i64>>, all: bool) {
-    use narou_rs::downloader::Downloader;
+    let result = std::thread::spawn(move || {
+        use narou_rs::downloader::Downloader;
 
-    if let Err(e) = narou_rs::db::init_database() {
-        eprintln!("Error initializing database: {}", e);
-        std::process::exit(1);
-    }
-
-    let mut downloader = match Downloader::new() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error creating downloader: {}", e);
+        if let Err(e) = narou_rs::db::init_database() {
+            eprintln!("Error initializing database: {}", e);
             std::process::exit(1);
         }
-    };
 
-    let target_ids: Vec<i64> = if all {
-        narou_rs::db::with_database(|db| Ok(db.ids())).unwrap_or_default()
-    } else if let Some(id_list) = ids {
-        id_list
-    } else {
-        eprintln!("Usage: narou update --all | narou update <id>...");
-        std::process::exit(1);
-    };
-
-    let total = target_ids.len();
-    let mut success = 0usize;
-    let mut errors = 0usize;
-
-    for id in &target_ids {
-        match downloader.download_novel(&id.to_string()) {
-            Ok(result) => {
-                println!(
-                    "  Updated: {} (ID: {}, {}/{})",
-                    result.title, result.id, result.updated_count, result.total_count
-                );
-                success += 1;
-            }
+        let mut downloader = match Downloader::new() {
+            Ok(d) => d,
             Err(e) => {
-                eprintln!("  Error updating ID {}: {}", id, e);
-                errors += 1;
+                eprintln!("Error creating downloader: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let target_ids: Vec<i64> = if all {
+            narou_rs::db::with_database(|db| Ok(db.ids())).unwrap_or_default()
+        } else if let Some(id_list) = ids {
+            id_list
+        } else {
+            eprintln!("Usage: narou update --all | narou update <id>...");
+            std::process::exit(1);
+        };
+
+        let total = target_ids.len();
+        let mut success = 0usize;
+        let mut errors = 0usize;
+
+        for id in &target_ids {
+            match downloader.download_novel(&id.to_string()) {
+                Ok(result) => {
+                    println!(
+                        "  Updated: {} (ID: {}, {}/{})",
+                        result.title, result.id, result.updated_count, result.total_count
+                    );
+                    success += 1;
+                }
+                Err(e) => {
+                    eprintln!("  Error updating ID {}: {}", id, e);
+                    errors += 1;
+                }
             }
         }
-    }
 
-    println!();
-    println!("Update complete: {}/{} succeeded, {} failed ", success, total, errors);
+        println!();
+        println!("Update complete: {}/{} succeeded, {} failed ", success, total, errors);
+    }).join();
+
+    if let Err(e) = result {
+        eprintln!("Thread panicked: {:?}", e);
+    }
 }
 
 fn cmd_convert(targets: &[String]) {

@@ -26,6 +26,7 @@ impl NovelInfo {
         setting: &SiteSetting,
         client: &reqwest::blocking::Client,
         toc_source: &str,
+        url_captures: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut info = Self {
             title: None,
@@ -43,7 +44,8 @@ impl NovelInfo {
         };
 
         if let Some(novel_info_url) = &setting.novel_info_url {
-            let resolved_url = setting.interpolate(novel_info_url);
+            let resolved_url = setting.novel_info_url_with_captures(url_captures)
+                .unwrap_or_else(|| setting.interpolate(novel_info_url));
             let response = client.get(&resolved_url).send()?;
             if !response.status().is_success() {
                 return Ok(info);
@@ -80,10 +82,7 @@ impl NovelInfo {
                 .raw_captures
                 .get("nu")
                 .and_then(|s| parse_narou_date(s));
-            info.length = info
-                .raw_captures
-                .get("l")
-                .and_then(|s| s.parse().ok());
+            info.length = info.raw_captures.get("l").and_then(|s| s.parse().ok());
         } else {
             let keys = ["title", "author", "story"];
             info.raw_captures = setting.multi_match(toc_source, &keys);
@@ -120,9 +119,7 @@ fn parse_narou_date(s: &str) -> Option<DateTime<Utc>> {
             return Some(dt.and_utc());
         }
         if let Ok(d) = chrono::NaiveDate::parse_from_str(s, fmt) {
-            return d
-                .and_hms_opt(0, 0, 0)
-                .map(|dt| dt.and_utc());
+            return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
         }
     }
 

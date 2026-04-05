@@ -1,9 +1,11 @@
 use regex::Regex;
 
 use super::settings::NovelSettings;
+use super::user_converter::UserConverter;
 
 pub struct ConverterBase {
     pub settings: NovelSettings,
+    pub user_converter: Option<UserConverter>,
     url_stash: Vec<String>,
     english_stash: Vec<String>,
     illust_stash: Vec<String>,
@@ -26,6 +28,19 @@ impl ConverterBase {
     pub fn new(settings: NovelSettings) -> Self {
         Self {
             settings,
+            user_converter: None,
+            url_stash: Vec::new(),
+            english_stash: Vec::new(),
+            illust_stash: Vec::new(),
+            kanji_num_stash: Vec::new(),
+            kome_count: 0,
+        }
+    }
+
+    pub fn with_user_converter(settings: NovelSettings, user_converter: UserConverter) -> Self {
+        Self {
+            settings,
+            user_converter: Some(user_converter),
             url_stash: Vec::new(),
             english_stash: Vec::new(),
             illust_stash: Vec::new(),
@@ -36,6 +51,11 @@ impl ConverterBase {
 
     pub fn convert(&mut self, text: &str, text_type: TextType) -> String {
         let mut result = text.to_string();
+
+        if let Some(ref uc) = self.user_converter {
+            uc.apply_before_settings(&mut self.settings);
+            result = uc.apply_before(&result, text_type, &mut self.settings);
+        }
 
         result = self.rstrip_all_lines(&result);
         result = self.hankakukana_to_zenkakukana(&result);
@@ -65,6 +85,11 @@ impl ConverterBase {
         result = self.rebuild_kome_to_gaiji(&result);
         result = self.rebuild_illust(&result);
         result = self.delete_dust_char(&result);
+
+        if let Some(ref uc) = self.user_converter {
+            result = uc.apply_after(&result, text_type, &mut self.settings);
+            uc.apply_after_settings(&mut self.settings);
+        }
 
         result
     }

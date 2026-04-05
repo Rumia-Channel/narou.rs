@@ -39,4 +39,6 @@ pub struct NovelRecord {
     pub length: Option<i64>,
     #[serde(default)]
     pub suspend: bool,
+    #[serde(default)]
+    pub is_narou: bool,
 }

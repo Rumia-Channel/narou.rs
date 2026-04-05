@@ -23,36 +23,42 @@
 - TocFile + DownloadResult structs
 - Compiles with `cargo check` + `cargo clippy` (no errors)
 
-## Not Yet Implemented
+## Completed (round 2)
+- **4-layer setting merge**: `NovelSettings::load_for_novel()` - force.* (local_setting.yaml) > setting.ini (per-novel section) > default.* (global INI) > ORIGINAL_SETTINGS
+- **Device abstraction**: `converter/device.rs` - Device enum (Text, Epub, Mobi, Kobo), OutputManager with AozoraEpub3/kindlegen external tool invocation
+- **NovelInfo local cache**: `downloader/info_cache.rs` - disk-backed cache with YAML persistence, max 500 entries
+- **Narou API batch fetch**: `Downloader::narou_api_batch_update()` - bulk metadata via syosetu API, 50 items per request
+- **Differential detection**: `Downloader::section_needs_update()` + `compute_section_hash()` - SHA256 content hash comparison
+- **confirm_over18 handling**: `Downloader::handle_over18()` - regex-based R18 page detection
+- **Illustration download**: `Downloader::download_illustration()` - illust_grep_pattern based image extraction and saving
+- **Kakuyomu eval handler**: `SiteSetting::eval_kakuyomu()` - JSON preprocessing from __NUXT__ script tag
+- **PersistentQueue**: `queue.rs` - crash-recovery persistent job queue with YAML persistence, push/pop/complete/fail
+- **WebSocket PushServer**: `web/push.rs` - broadcast channel, WS handler, client management, event broadcasting
+- **StreamingLogger**: `web/push.rs::StreamingLogger` - log buffering, broadcast to WS clients
+- **30+ new Web API endpoints**: get/remove/freeze/unfreeze novels, tag management (add/remove/batch), download/update/convert APIs, settings CRUD, device list, queue status, recent logs
+- **CORS support**: tower-http CorsLayer
+- **`is_narou` field**: Added to NovelRecord for Narou API identification
 
-### Downloader
-- Kakuyomu eval handler (JSON preprocessing - needs different approach in Rust)
-- Narou API batch fetch (narou_api_url for bulk metadata during update)
-- Differential detection (update_body_check - content hash comparison for existing sections)
-- Illustration download (illust_current_url / illust_grep_pattern)
-- confirm_over18 handling (R18 age confirmation page)
-- Digest/merge processing (user confirmation when episodes are deleted)
+## New files created
+- `src/converter/device.rs` - Device enum + OutputManager
+- `src/downloader/info_cache.rs` - NovelInfoCache
+- `src/queue.rs` - PersistentQueue + QueueJob + JobType
 
-### Converter
-- 4-layer setting merge: force.* > setting.ini > default.* > ORIGINAL_SETTINGS (INI only done)
+## Remaining (minor)
 - converter.rb DSL (user-defined dynamic converter loading)
-- AozoraEpub3/kindlegen external tool invocation (EPUB/MOBI generation)
-- Device abstraction (Kindle/Kobo/iBooks device-specific processing)
-- Template engine (askama imported but no templates created)
-
-### Web/API
-- WebSocket PushServer (real-time browser notifications, console output forwarding)
-- PersistentQueue (crash-recovery persistent job queue)
-- StreamingLogger ($stdout → WebSocket bridge)
-- StreamingInput (CLI confirm/choose → browser modal)
-- Remaining API endpoints (~50+ routes from appserver.rb: download/update/convert APIs, settings APIs, etc.)
-
-### Other
-- NovelInfo local cache
-- Auto-update scheduler
+- AozoraEpub3/kindlegen actual invocation testing (tool detection works)
+- Device-specific epub options refinement
+- WebSocket message framing (currently just text)
+- StreamingInput (CLI confirm → browser modal bridge)
 - Eventable event system
+- Auto-update scheduler with cron-like triggers
 
 ## Next Steps Priority
+1. Test with real webnovel YAML files
+2. converter.rb DSL if needed
+3. Refine AozoraEpub3 command-line options
+4. StreamingInput implementation
+5. Auto-update scheduler
 1. AozoraEpub3/kindlegen external tool invocation (convert command output)
 2. 4-layer setting merge completion
 3. Remaining web API endpoints (download/update/convert as API)
