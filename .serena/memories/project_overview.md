@@ -57,6 +57,19 @@ src/
 - Windows-compatible (path separators, atomic write retry on EACCES)
 - Singleton Database pattern with static Mutex + helper functions
 
+## Edition Note
+- Rust edition 2024: `\n` in println! requires `println!()` separate call or use `{key}` with space before text. String escapes like `\u{NNNN}` work normally but some tools may double-escape backslashes.
+
+## CLI Subcommands (all implemented)
+- `web [--port N] [--no-browser]` - Axum web server
+- `download <url|ncode|id>...` - Full pipeline: resolve→TOC→metadata→sections→save→DB
+- `update [--all | <id>...]` - Re-download all or specified novels
+- `convert <id|title>...` - Convert saved novel to Aozora text
+- `list [--tag T] [--frozen]` - List novels with optional filters
+- `tag --add T | --remove T <targets>` - Add/remove tags
+- `freeze <targets> [--off]` - Freeze/unfreeze novels
+- `remove <targets>` - Remove novel (DB + files)
+
 ## Reference Sources (Ruby, read-only)
 - `sample/narou/` - Ruby source code for reference
 - Key files: database.rb, inventory.rb, downloader.rb, converterbase.rb, novelconverter.rb, appserver.rb, sitesetting.rb, html.rb, novelsetting.rb
