@@ -74,6 +74,8 @@ pub struct SubtitleInfo {
     pub subdate: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subupdate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_time: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,11 +93,29 @@ pub struct TocObject {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SectionElement {
     pub data_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub introduction: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub postscript: Option<String>,
+    #[serde(default)]
+    pub introduction: String,
+    #[serde(default)]
+    pub postscript: String,
     pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionFile {
+    pub index: String,
+    pub href: String,
+    #[serde(default)]
+    pub chapter: String,
+    #[serde(default)]
+    pub subchapter: String,
+    pub subtitle: String,
+    pub file_subtitle: String,
+    pub subdate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subupdate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_time: Option<String>,
+    pub element: SectionElement,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -335,6 +355,7 @@ impl Downloader {
                 file_subtitle,
                 subdate,
                 subupdate,
+                download_time: None,
             });
 
             if full_match.end() == 0 {
@@ -349,9 +370,9 @@ impl Downloader {
         &mut self,
         setting: &SiteSetting,
         subtitle: &SubtitleInfo,
-    ) -> Result<SectionElement> {
+    ) -> Result<(SectionElement, String)> {
         if let Some(cached) = self.section_cache.get(&subtitle.index) {
-            return Ok(cached.clone());
+            return Ok((cached.clone(), String::new()));
         }
 
         self.rate_limiter.wait();
@@ -371,36 +392,41 @@ impl Downloader {
             return Err(response.error_for_status().unwrap_err().into());
         }
 
-        let mut body = response.text()?;
-        pretreatment_source(&mut body, setting.encoding());
+        let mut html_source = response.text()?;
+        pretreatment_source(&mut html_source, setting.encoding());
 
         let mut element = SectionElement {
             data_type: "html".to_string(),
-            introduction: None,
-            postscript: None,
+            introduction: String::new(),
+            postscript: String::new(),
             body: String::new(),
         };
 
         if let Some(pattern) = setting.introduction_pattern() {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                if let Some(caps) = re.captures(&body) {
-                    element.introduction =
-                        caps.name("introduction").map(|m| m.as_str().to_string());
+            if let Ok(re) = compile_html_pattern(pattern) {
+                if let Some(caps) = re.captures(&html_source) {
+                    element.introduction = caps
+                        .name("introduction")
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_default();
                 }
             }
         }
 
         if let Some(pattern) = setting.postscript_pattern() {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                if let Some(caps) = re.captures(&body) {
-                    element.postscript = caps.name("postscript").map(|m| m.as_str().to_string());
+            if let Ok(re) = compile_html_pattern(pattern) {
+                if let Some(caps) = re.captures(&html_source) {
+                    element.postscript = caps
+                        .name("postscript")
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_default();
                 }
             }
         }
 
         if let Some(pattern) = setting.body_pattern() {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                if let Some(caps) = re.captures(&body) {
+            if let Ok(re) = compile_html_pattern(pattern) {
+                if let Some(caps) = re.captures(&html_source) {
                     element.body = caps
                         .name("body")
                         .map(|m| m.as_str().to_string())
@@ -417,7 +443,7 @@ impl Downloader {
         self.section_cache
             .insert(subtitle.index.clone(), element.clone());
 
-        Ok(element)
+        Ok((element, html_source))
     }
 
     pub fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
@@ -541,12 +567,8 @@ impl Downloader {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(section.body.as_bytes());
-        if let Some(ref intro) = section.introduction {
-            hasher.update(intro.as_bytes());
-        }
-        if let Some(ref post) = section.postscript {
-            hasher.update(post.as_bytes());
-        }
+        hasher.update(section.introduction.as_bytes());
+        hasher.update(section.postscript.as_bytes());
         hex::encode(hasher.finalize())
     }
 
@@ -602,8 +624,8 @@ impl Downloader {
 
         let re = regex::Regex::new(illust_url_pattern).map_err(|e| NarouError::Regex(e))?;
 
-        let intro_text = section.introduction.as_deref().unwrap_or("");
-        let post_text = section.postscript.as_deref().unwrap_or("");
+        let intro_text = section.introduction.as_str();
+        let post_text = section.postscript.as_str();
         let sources = [&section.body, intro_text, post_text];
 
         let mut illust_dir = section_dir.clone();
@@ -674,11 +696,20 @@ impl Downloader {
 
     pub fn download_novel(&mut self, target: &str) -> Result<DownloadResult> {
         let (existing_id, setting) = self.resolve_target_for_download(target)?;
-        let url_captures = setting
-            .extract_url_captures(target)
-            .unwrap_or_default();
-        let toc_url = if url_captures.is_empty() {
-            setting.toc_url()
+
+        let db_toc_url = if let Some(id) = existing_id {
+            crate::db::with_database(|db| Ok(db.get(id).map(|r| r.toc_url.clone())))
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
+        let url_captures = setting.extract_url_captures(target).unwrap_or_default();
+        let toc_url = if let Some(ref url) = db_toc_url {
+            url.clone()
+        } else if url_captures.is_empty() {
+            setting.interpolate(&setting.toc_url)
         } else {
             setting.interpolate_with_captures(&setting.toc_url, &url_captures)
         };
@@ -731,6 +762,7 @@ impl Downloader {
             .unwrap_or_default();
 
         let mut updated_count = 0usize;
+        let mut final_subtitles = Vec::with_capacity(subtitles.len());
         for subtitle in &subtitles {
             let needs_download = match old_subtitles.get(&subtitle.index) {
                 Some(old) => {
@@ -741,12 +773,21 @@ impl Downloader {
                 None => true,
             };
 
-            if needs_download {
-                let section = self.download_section(&setting, subtitle)?;
+            let download_time = if needs_download {
+                let (section, raw_html) = self.download_section(&setting, subtitle)?;
                 self.save_section_file(&section_dir, subtitle, &section)?;
-                self.save_raw_file(&raw_dir, subtitle, &section)?;
+                self.save_raw_file(&raw_dir, subtitle, &raw_html)?;
                 updated_count += 1;
-            }
+                Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string())
+            } else {
+                old_subtitles
+                    .get(&subtitle.index)
+                    .and_then(|old| old.download_time.clone())
+            };
+
+            let mut sub = subtitle.clone();
+            sub.download_time = download_time;
+            final_subtitles.push(sub);
         }
 
         let toc_file = TocFile {
@@ -754,10 +795,11 @@ impl Downloader {
             author: author.clone(),
             toc_url: toc_url.clone(),
             story: info.story.clone(),
-            subtitles: subtitles.clone(),
+            subtitles: final_subtitles,
             novel_type: Some(novel_type),
         };
         self.save_toc_file(&novel_dir, &toc_file)?;
+        self.ensure_default_files(&novel_dir, &title, &author, &toc_url);
 
         let record = NovelRecord {
             id: existing_id.unwrap_or(0),
@@ -867,7 +909,7 @@ impl Downloader {
                             return Err(NarouError::NotFound(format!(
                                 "Novel record {} has no toc_url",
                                 id
-                            )))
+                            )));
                         }
                     };
                     Ok((Some(id), setting))
@@ -910,7 +952,7 @@ impl Downloader {
                             return Err(NarouError::NotFound(format!(
                                 "Novel record {} has no toc_url",
                                 id
-                            )))
+                            )));
                         }
                     };
                     Ok((Some(id), setting))
@@ -1005,6 +1047,7 @@ impl Downloader {
             file_subtitle: sanitize_filename("短編"),
             subdate: String::new(),
             subupdate: None,
+            download_time: None,
         }])
     }
 
@@ -1072,7 +1115,20 @@ impl Downloader {
     ) -> Result<()> {
         let filename = format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle);
         let path = section_dir.join(filename);
-        let content = serde_yaml::to_string(section)?;
+        let file_data = SectionFile {
+            index: subtitle.index.clone(),
+            href: subtitle.href.clone(),
+            chapter: subtitle.chapter.clone(),
+            subchapter: subtitle.subchapter.clone(),
+            subtitle: subtitle.subtitle.clone(),
+            file_subtitle: subtitle.file_subtitle.clone(),
+            subdate: subtitle.subdate.clone(),
+            subupdate: subtitle.subupdate.clone(),
+            download_time: Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string()),
+            element: section.clone(),
+        };
+        let yaml_body = serde_yaml::to_string(&file_data)?;
+        let content = format!("---\n{}\n", yaml_body);
         std::fs::write(&path, content)?;
         Ok(())
     }
@@ -1081,11 +1137,11 @@ impl Downloader {
         &self,
         raw_dir: &PathBuf,
         subtitle: &SubtitleInfo,
-        section: &SectionElement,
+        raw_html: &str,
     ) -> Result<()> {
         let filename = format!("{} {}.html", subtitle.index, subtitle.file_subtitle);
         let path = raw_dir.join(filename);
-        std::fs::write(&path, &section.body)?;
+        std::fs::write(&path, raw_html)?;
         Ok(())
     }
 
@@ -1095,11 +1151,36 @@ impl Downloader {
         serde_yaml::from_str(&content).ok()
     }
 
+    fn fix_yaml_block_scalar(yaml: &str) -> String {
+        let re = regex::Regex::new(r"(?m)^story:\s*\|[-+]?\s*$").unwrap();
+        let result = re.replace_all(yaml, "story: |+").to_string();
+        result
+    }
+
     fn save_toc_file(&self, novel_dir: &PathBuf, toc: &TocFile) -> Result<()> {
         let path = novel_dir.join("toc.yaml");
-        let content = serde_yaml::to_string(toc)?;
+        let yaml_body = serde_yaml::to_string(toc)?;
+        let content = format!("---\n{}\n", Self::fix_yaml_block_scalar(&yaml_body));
         std::fs::write(&path, content)?;
         Ok(())
+    }
+
+    fn ensure_default_files(&self, novel_dir: &PathBuf, title: &str, author: &str, toc_url: &str) {
+        let setting_path = novel_dir.join("setting.ini");
+        if !setting_path.exists() {
+            let default_ini = crate::converter::settings::IniData::new();
+            let content = default_ini.to_ini_string();
+            let _ = std::fs::write(&setting_path, content);
+        }
+
+        let replace_path = novel_dir.join("replace.txt");
+        if !replace_path.exists() {
+            let content = format!(
+                "; 単純置換用ファイル\n;\n; 対象小説情報\n; タイトル: {}\n; 作者: {}\n; URL: {}\n;\n; 書式\n; 置換対象<tab>置換文字\n;\n; サンプル\n; 一〇歳\t十歳\n; 第一章\t［＃ゴシック体］第一章［＃ゴシック体終わり］\n;\n; 正規表現での置換などは converter.yaml で対応して下さい\n",
+                title, author, toc_url
+            );
+            let _ = std::fs::write(&replace_path, content);
+        }
     }
 }
 
@@ -1113,6 +1194,13 @@ fn build_section_url(setting: &SiteSetting, href: &str) -> String {
     } else {
         format!("{}/{}", setting.toc_url().trim_end_matches('/'), href)
     }
+}
+
+fn compile_html_pattern(pattern: &str) -> std::result::Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(pattern)
+        .dot_matches_new_line(true)
+        .size_limit(10_000_000)
+        .build()
 }
 
 fn pretreatment_source(src: &mut String, _encoding: &str) {

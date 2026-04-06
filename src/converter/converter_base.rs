@@ -50,7 +50,7 @@ impl ConverterBase {
     }
 
     pub fn convert(&mut self, text: &str, text_type: TextType) -> String {
-        let mut result = text.to_string();
+        let mut result = crate::downloader::html::to_aozora(text);
 
         if let Some(ref uc) = self.user_converter {
             uc.apply_before_settings(&mut self.settings);
@@ -567,8 +567,9 @@ fn num_to_kanji(mut num: u64) -> String {
                     for (small_val, small_name) in small_units {
                         if digit >= *small_val {
                             let small_digit = digit / *small_val;
+                            let idx = small_digit.min(9) as usize;
                             if small_digit > 1 || *small_val == digit {
-                                result.push(KANJI_DIGITS[small_digit as usize]);
+                                result.push(KANJI_DIGITS[idx]);
                             }
                             result.push_str(small_name);
                         }

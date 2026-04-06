@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -78,7 +78,7 @@ pub struct SiteSetting {
     pub tags: Option<SiteSettingValue>,
 
     #[serde(skip)]
-    compiled_url: Option<Regex>,
+    compiled_url: Vec<Regex>,
     #[serde(skip)]
     compiled_subtitles: Option<Regex>,
     #[serde(skip)]
@@ -190,7 +190,7 @@ impl SiteSetting {
     }
 
     fn compile(&mut self) {
-        self.compiled_url = self.url.as_ref().and_then(|v| self.compile_value(v));
+        self.compiled_url = self.compile_url_patterns();
         self.compiled_subtitles = self.subtitles.as_ref().and_then(|v| self.compile_value(v));
         self.compiled_body = self
             .body_pattern
@@ -230,11 +230,57 @@ impl SiteSetting {
         Regex::new(&resolved).ok()
     }
 
+    fn compile_url_patterns(&self) -> Vec<Regex> {
+        let mut patterns = Vec::new();
+        if let Some(ref url_val) = self.url {
+            match url_val {
+                SiteSettingValue::Single(s) => {
+                    let resolved = self.interpolate(s);
+                    if let Ok(re) = Regex::new(&resolved) {
+                        patterns.push(re);
+                    }
+                }
+                SiteSettingValue::Multiple(entries) => {
+                    for entry in entries {
+                        if let SiteSettingEntry::Plain(s) = entry {
+                            let resolved = self.interpolate(s);
+                            if let Ok(re) = Regex::new(&resolved) {
+                                patterns.push(re);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        patterns
+    }
+
     pub fn interpolate(&self, pattern: &str) -> String {
+        let top_url_resolved = {
+            let re = Regex::new(r"\\+k<(.+?)>").unwrap();
+            let scheme = self.scheme.as_str();
+            let domain = self.domain.as_str();
+            let mut result = self.top_url.as_str().to_string();
+            result = re
+                .replace_all(&result, |caps: &regex::Captures| {
+                    let key = &caps[1];
+                    match key {
+                        "scheme" => scheme.to_string(),
+                        "domain" => domain.to_string(),
+                        _ => caps
+                            .get(0)
+                            .map(|m| m.as_str().to_string())
+                            .unwrap_or_default(),
+                    }
+                })
+                .to_string();
+            result
+        };
+
         let vars: HashMap<&str, &str> = [
             ("scheme", self.scheme.as_str()),
             ("domain", self.domain.as_str()),
-            ("top_url", self.top_url.as_str()),
+            ("top_url", &top_url_resolved),
         ]
         .into_iter()
         .collect();
@@ -254,13 +300,11 @@ impl SiteSetting {
     }
 
     pub fn matches_url(&self, url: &str) -> bool {
-        self.compiled_url
-            .as_ref()
-            .map_or(false, |re| re.is_match(url))
+        self.compiled_url.iter().any(|re| re.is_match(url))
     }
 
     pub fn debug_url_pattern(&self) -> Option<String> {
-        self.compiled_url.as_ref().map(|r| r.as_str().to_string())
+        self.compiled_url.first().map(|r| r.as_str().to_string())
     }
 
     pub fn toc_url(&self) -> String {
@@ -268,15 +312,18 @@ impl SiteSetting {
     }
 
     pub fn extract_url_captures(&self, url: &str) -> Option<HashMap<String, String>> {
-        let re = self.compiled_url.as_ref()?;
-        let caps = re.captures(url)?;
-        let mut captures: HashMap<String, String> = HashMap::new();
-        for name in re.capture_names().flatten() {
-            if let Some(m) = caps.name(name) {
-                captures.insert(name.to_string(), m.as_str().to_string());
+        for re in &self.compiled_url {
+            if let Some(caps) = re.captures(url) {
+                let mut captures: HashMap<String, String> = HashMap::new();
+                for name in re.capture_names().flatten() {
+                    if let Some(m) = caps.name(name) {
+                        captures.insert(name.to_string(), m.as_str().to_string());
+                    }
+                }
+                return Some(captures);
             }
         }
-        Some(captures)
+        None
     }
 
     pub fn toc_url_with_url_captures(&self, url: &str) -> Option<String> {
@@ -444,7 +491,10 @@ impl SiteSetting {
                 }
             };
             let resolved = self.interpolate_with_captures(pattern, prev_captures);
-            if let Ok(re) = Regex::new(&resolved) {
+            let re = RegexBuilder::new(&resolved)
+                .dot_matches_new_line(true)
+                .build();
+            if let Ok(re) = re {
                 if let Some(caps) = re.captures(source) {
                     for name in re.capture_names().flatten() {
                         if let Some(m) = caps.name(name) {
@@ -488,7 +538,7 @@ impl SiteSetting {
         match key {
             "scheme" => self.scheme.clone(),
             "domain" => self.domain.clone(),
-            "top_url" => self.top_url.clone(),
+            "top_url" => self.interpolate(&self.top_url),
             _ => String::new(),
         }
     }

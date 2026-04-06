@@ -92,7 +92,7 @@ impl IniData {
         self.set("global", key, value);
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn to_ini_string(&self) -> String {
         let mut output = String::new();
 
         let mut first = true;
@@ -124,6 +124,11 @@ impl IniData {
             }
         }
 
+        output
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let output = self.to_ini_string();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }

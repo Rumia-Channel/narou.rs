@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    Router,
     extract::State,
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::IntoResponse,
     routing::get,
-    Router,
 };
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};

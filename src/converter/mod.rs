@@ -71,18 +71,20 @@ impl NovelConverter {
 
             let mut batch_inputs = Vec::new();
 
-            if let Some(intro) = &section.introduction {
-                if !intro.is_empty() {
-                    batch_inputs.push((intro.clone(), converter_base::TextType::Introduction));
-                }
+            if !section.introduction.is_empty() {
+                batch_inputs.push((
+                    section.introduction.clone(),
+                    converter_base::TextType::Introduction,
+                ));
             }
 
             batch_inputs.push((section.body.clone(), converter_base::TextType::Body));
 
-            if let Some(post) = &section.postscript {
-                if !post.is_empty() {
-                    batch_inputs.push((post.clone(), converter_base::TextType::Postscript));
-                }
+            if !section.postscript.is_empty() {
+                batch_inputs.push((
+                    section.postscript.clone(),
+                    converter_base::TextType::Postscript,
+                ));
             }
 
             let results = converter.convert_multi(&batch_inputs);
@@ -131,18 +133,29 @@ impl NovelConverter {
     fn render_novel_text(&self, toc: &TocObject, sections: &[Vec<String>]) -> Result<String> {
         let mut output = String::new();
 
-        let title = self.settings.novel_title.as_str();
-        let author = self.settings.novel_author.as_str();
+        let title = toc.title.as_str();
+        let author = toc.author.as_str();
 
-        output.push_str(&format!("{}\n", title));
-        output.push_str(&format!("{}\n", author));
+        output.push_str(title);
         output.push('\n');
+        output.push_str(author);
+        output.push('\n');
+        output.push('\n');
+
+        output.push_str("\u{FF3B}\u{FF30}\u{533A}\u{5207}\u{7DDA}\u{FF3D}\n");
 
         if let Some(ref story) = toc.story {
             if !story.is_empty() {
-                output.push_str(&format!("{}\n", story));
+                output.push_str("あらすじ：\n");
+                output.push_str(story);
                 output.push('\n');
             }
+        }
+
+        if !toc.toc_url.is_empty() {
+            output.push_str("掲載ページ:\n");
+            output.push_str(&format!("<{}>\n", toc.toc_url));
+            output.push_str("\u{FF3B}\u{FF30}\u{533A}\u{5207}\u{7DDA}\u{FF3D}\n");
         }
 
         for section_lines in sections {
@@ -162,12 +175,8 @@ impl NovelConverter {
     fn compute_digest(&self, section: &SectionElement, index: usize) -> String {
         let mut hasher = Sha256::new();
         hasher.update(section.body.as_bytes());
-        if let Some(ref intro) = section.introduction {
-            hasher.update(intro.as_bytes());
-        }
-        if let Some(ref post) = section.postscript {
-            hasher.update(post.as_bytes());
-        }
+        hasher.update(section.introduction.as_bytes());
+        hasher.update(section.postscript.as_bytes());
         hasher.update(index.to_le_bytes());
         hasher.update(self.compute_settings_signature().as_bytes());
         if let Some(ref uc) = self.user_converter {
@@ -217,17 +226,7 @@ impl NovelConverter {
             novel_type: toc.novel_type,
         };
 
-        let section_dir = novel_dir.join(crate::downloader::SECTION_SAVE_DIR);
-        let mut sections = Vec::new();
-
-        for sub in &toc_object.subtitles {
-            let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
-            let path = section_dir.join(&filename);
-            let content = std::fs::read_to_string(&path).map_err(|e| NarouError::Io(e))?;
-            let section: crate::downloader::SectionElement =
-                serde_yaml::from_str(&content).map_err(|e| NarouError::Yaml(e))?;
-            sections.push(section);
-        }
+        let sections = load_sections_from_dir(novel_dir, &toc_object.subtitles)?;
 
         let aozora_text = self.convert_novel(&toc_object, &sections)?;
         let output_dir = novel_dir.join("output");
@@ -260,17 +259,7 @@ impl NovelConverter {
             novel_type: toc.novel_type,
         };
 
-        let section_dir = novel_dir.join(crate::downloader::SECTION_SAVE_DIR);
-        let mut sections = Vec::new();
-
-        for sub in &toc_object.subtitles {
-            let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
-            let path = section_dir.join(&filename);
-            let content = std::fs::read_to_string(&path).map_err(|e| NarouError::Io(e))?;
-            let section: crate::downloader::SectionElement =
-                serde_yaml::from_str(&content).map_err(|e| NarouError::Yaml(e))?;
-            sections.push(section);
-        }
+        let sections = load_sections_from_dir(novel_dir, &toc_object.subtitles)?;
 
         let aozora_text = self.convert_novel(&toc_object, &sections)?;
         let output_dir = novel_dir.join("output");
@@ -285,6 +274,34 @@ impl NovelConverter {
 
         Ok(final_path)
     }
+}
+
+fn load_sections_from_dir(
+    novel_dir: &std::path::Path,
+    subtitles: &[crate::downloader::SubtitleInfo],
+) -> Result<Vec<crate::downloader::SectionElement>> {
+    let section_dir = novel_dir.join(crate::downloader::SECTION_SAVE_DIR);
+    let mut sections = Vec::new();
+
+    for sub in subtitles {
+        let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
+        let path = section_dir.join(&filename);
+        let content = std::fs::read_to_string(&path).map_err(|e| NarouError::Io(e))?;
+        let section = if content.starts_with("---") {
+            let without_front = content.replacen("---", "", 1);
+            let section_file: crate::downloader::SectionFile =
+                serde_yaml::from_str(without_front.trim_start())
+                    .map_err(|e| NarouError::Yaml(e))?;
+            section_file.element
+        } else {
+            let section: crate::downloader::SectionElement =
+                serde_yaml::from_str(&content).map_err(|e| NarouError::Yaml(e))?;
+            section
+        };
+        sections.push(section);
+    }
+
+    Ok(sections)
 }
 
 fn sanitize_filename_for_output(name: &str) -> String {

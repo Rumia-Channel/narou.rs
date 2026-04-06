@@ -44,7 +44,8 @@ impl NovelInfo {
         };
 
         if let Some(novel_info_url) = &setting.novel_info_url {
-            let resolved_url = setting.novel_info_url_with_captures(url_captures)
+            let resolved_url = setting
+                .novel_info_url_with_captures(url_captures)
                 .unwrap_or_else(|| setting.interpolate(novel_info_url));
             let response = client.get(&resolved_url).send()?;
             if !response.status().is_success() {

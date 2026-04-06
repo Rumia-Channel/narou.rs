@@ -1,11 +1,11 @@
 pub mod push;
 
 use axum::{
+    Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
     routing::{delete, get, post, put},
-    Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -98,7 +98,10 @@ pub fn create_router() -> Router {
         .route("/api/log/recent", get(recent_logs))
         .route("/ws", get(push::ws_handler_with_app_state))
         .layer(CorsLayer::permissive())
-        .with_state(AppState { port: 3000, push_server })
+        .with_state(AppState {
+            port: 3000,
+            push_server,
+        })
 }
 
 async fn index() -> &'static str {
@@ -133,7 +136,9 @@ async fn api_list(
                 .filter(|r| {
                     r.title.to_lowercase().contains(&search_lower)
                         || r.author.to_lowercase().contains(&search_lower)
-                        || r.tags.iter().any(|t| t.to_lowercase().contains(&search_lower))
+                        || r.tags
+                            .iter()
+                            .any(|t| t.to_lowercase().contains(&search_lower))
                 })
                 .collect()
         };
@@ -155,9 +160,10 @@ async fn api_list(
                 "title" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
                 "author" => a.author.to_lowercase().cmp(&b.author.to_lowercase()),
                 "last_update" => a.last_update.cmp(&b.last_update),
-                "general_lastup" => {
-                    a.general_lastup.unwrap_or_default().cmp(&b.general_lastup.unwrap_or_default())
-                }
+                "general_lastup" => a
+                    .general_lastup
+                    .unwrap_or_default()
+                    .cmp(&b.general_lastup.unwrap_or_default()),
                 "sitename" => a.sitename.cmp(&b.sitename),
                 _ => std::cmp::Ordering::Equal,
             };
@@ -254,7 +260,9 @@ async fn get_novel(
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let record = with_database(|db| {
-        db.get(id).cloned().ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
+        db.get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
     })
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
@@ -289,7 +297,10 @@ async fn remove_novel(
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     state.push_server.broadcast("remove", &result);
-    Ok(Json(ApiResponse { success: true, message: result }))
+    Ok(Json(ApiResponse {
+        success: true,
+        message: result,
+    }))
 }
 
 async fn freeze_novel(
@@ -297,7 +308,10 @@ async fn freeze_novel(
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     with_database_mut(|db| {
-        let record = db.get(id).cloned().ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
+        let record = db
+            .get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
         let mut updated = record;
         if !updated.tags.contains(&"frozen".to_string()) {
             updated.tags.push("frozen".to_string());
@@ -308,7 +322,10 @@ async fn freeze_novel(
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     state.push_server.broadcast("freeze", &id.to_string());
-    Ok(Json(ApiResponse { success: true, message: format!("Froze {}", id) }))
+    Ok(Json(ApiResponse {
+        success: true,
+        message: format!("Froze {}", id),
+    }))
 }
 
 async fn unfreeze_novel(
@@ -316,7 +333,10 @@ async fn unfreeze_novel(
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     with_database_mut(|db| {
-        let record = db.get(id).cloned().ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
+        let record = db
+            .get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
         let mut updated = record;
         updated.tags.retain(|t| t != "frozen");
         db.insert(updated);
@@ -325,7 +345,10 @@ async fn unfreeze_novel(
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     state.push_server.broadcast("unfreeze", &id.to_string());
-    Ok(Json(ApiResponse { success: true, message: format!("Unfroze {}", id) }))
+    Ok(Json(ApiResponse {
+        success: true,
+        message: format!("Unfroze {}", id),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -339,7 +362,10 @@ async fn add_tag(
     Json(body): Json<TagBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     with_database_mut(|db| {
-        let record = db.get(id).cloned().ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
+        let record = db
+            .get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
         let mut updated = record;
         if !updated.tags.contains(&body.tag) {
             updated.tags.push(body.tag.clone());
@@ -349,8 +375,13 @@ async fn add_tag(
     })
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    state.push_server.broadcast("tag_add", &format!("{} {}", id, body.tag));
-    Ok(Json(ApiResponse { success: true, message: "Tag added".to_string() }))
+    state
+        .push_server
+        .broadcast("tag_add", &format!("{} {}", id, body.tag));
+    Ok(Json(ApiResponse {
+        success: true,
+        message: "Tag added".to_string(),
+    }))
 }
 
 async fn remove_tag(
@@ -359,7 +390,10 @@ async fn remove_tag(
     Json(body): Json<TagBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     with_database_mut(|db| {
-        let record = db.get(id).cloned().ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
+        let record = db
+            .get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
         let mut updated = record;
         updated.tags.retain(|t| t != &body.tag);
         db.insert(updated);
@@ -367,8 +401,13 @@ async fn remove_tag(
     })
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    state.push_server.broadcast("tag_remove", &format!("{} {}", id, body.tag));
-    Ok(Json(ApiResponse { success: true, message: "Tag removed".to_string() }))
+    state
+        .push_server
+        .broadcast("tag_remove", &format!("{} {}", id, body.tag));
+    Ok(Json(ApiResponse {
+        success: true,
+        message: "Tag removed".to_string(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,7 +421,10 @@ async fn update_tags(
     Json(body): Json<TagsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     with_database_mut(|db| {
-        let record = db.get(id).cloned().ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
+        let record = db
+            .get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
         let mut updated = record;
         updated.tags = body.tags;
         db.insert(updated);
@@ -391,7 +433,10 @@ async fn update_tags(
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     state.push_server.broadcast("tags_update", &id.to_string());
-    Ok(Json(ApiResponse { success: true, message: "Tags updated".to_string() }))
+    Ok(Json(ApiResponse {
+        success: true,
+        message: "Tags updated".to_string(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,8 +466,14 @@ async fn batch_tag(
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.push_server.broadcast("batch_tag", &format!("{} items tagged with {}", count, tag_body.tag));
-    Ok(Json(ApiResponse { success: true, message: format!("Tagged {} novels", count) }))
+    state.push_server.broadcast(
+        "batch_tag",
+        &format!("{} items tagged with {}", count, tag_body.tag),
+    );
+    Ok(Json(ApiResponse {
+        success: true,
+        message: format!("Tagged {} novels", count),
+    }))
 }
 
 async fn batch_untag(
@@ -445,8 +496,13 @@ async fn batch_untag(
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.push_server.broadcast("batch_untag", &count.to_string());
-    Ok(Json(ApiResponse { success: true, message: format!("Untagged {} novels", count) }))
+    state
+        .push_server
+        .broadcast("batch_untag", &count.to_string());
+    Ok(Json(ApiResponse {
+        success: true,
+        message: format!("Untagged {} novels", count),
+    }))
 }
 
 async fn batch_freeze(
@@ -470,8 +526,13 @@ async fn batch_freeze(
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.push_server.broadcast("batch_freeze", &count.to_string());
-    Ok(Json(ApiResponse { success: true, message: format!("Froze {} novels", count) }))
+    state
+        .push_server
+        .broadcast("batch_freeze", &count.to_string());
+    Ok(Json(ApiResponse {
+        success: true,
+        message: format!("Froze {} novels", count),
+    }))
 }
 
 async fn batch_unfreeze(
@@ -493,8 +554,13 @@ async fn batch_unfreeze(
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.push_server.broadcast("batch_unfreeze", &count.to_string());
-    Ok(Json(ApiResponse { success: true, message: format!("Unfroze {} novels", count) }))
+    state
+        .push_server
+        .broadcast("batch_unfreeze", &count.to_string());
+    Ok(Json(ApiResponse {
+        success: true,
+        message: format!("Unfroze {} novels", count),
+    }))
 }
 
 async fn batch_remove(
@@ -525,8 +591,13 @@ async fn batch_remove(
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.push_server.broadcast("batch_remove", &count.to_string());
-    Ok(Json(ApiResponse { success: true, message: format!("Removed {} novels", count) }))
+    state
+        .push_server
+        .broadcast("batch_remove", &count.to_string());
+    Ok(Json(ApiResponse {
+        success: true,
+        message: format!("Removed {} novels", count),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -539,10 +610,13 @@ async fn api_download(
     Json(body): Json<DownloadBody>,
 ) -> Json<serde_json::Value> {
     let targets = body.targets;
-    let results: Vec<serde_json::Value> = targets.iter().map(|target| {
-        state.push_server.broadcast_download_start(target);
-        serde_json::json!({ "target": target, "status": "queued" })
-    }).collect();
+    let results: Vec<serde_json::Value> = targets
+        .iter()
+        .map(|target| {
+            state.push_server.broadcast_download_start(target);
+            serde_json::json!({ "target": target, "status": "queued" })
+        })
+        .collect();
 
     serde_json::json!({ "results": results }).into()
 }
@@ -565,7 +639,9 @@ async fn api_update(
         Vec::new()
     };
 
-    state.push_server.broadcast("update_start", &format!("{} novels", ids.len()));
+    state
+        .push_server
+        .broadcast("update_start", &format!("{} novels", ids.len()));
     serde_json::json!({ "status": "queued", "count": ids.len() }).into()
 }
 
@@ -580,10 +656,14 @@ async fn api_convert(
     Json(body): Json<ConvertBody>,
 ) -> Json<serde_json::Value> {
     let device = body.device.unwrap_or_else(|| "text".to_string());
-    let results: Vec<serde_json::Value> = body.targets.iter().map(|target| {
-        state.push_server.broadcast_convert_start(target);
-        serde_json::json!({ "target": target, "device": device, "status": "queued" })
-    }).collect();
+    let results: Vec<serde_json::Value> = body
+        .targets
+        .iter()
+        .map(|target| {
+            state.push_server.broadcast_convert_start(target);
+            serde_json::json!({ "target": target, "device": device, "status": "queued" })
+        })
+        .collect();
 
     serde_json::json!({ "results": results }).into()
 }
@@ -593,7 +673,9 @@ async fn get_settings(
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let record = with_database(|db| {
-        db.get(id).cloned().ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
+        db.get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
     })
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
@@ -617,8 +699,7 @@ async fn get_settings(
         &novel_dir,
     );
 
-    let value = serde_json::to_value(&settings)
-        .unwrap_or_else(|_| serde_json::json!({}));
+    let value = serde_json::to_value(&settings).unwrap_or_else(|_| serde_json::json!({}));
     Ok(Json(value))
 }
 
@@ -628,7 +709,9 @@ async fn save_settings(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     let record = with_database(|db| {
-        db.get(id).cloned().ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
+        db.get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
     })
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
@@ -654,7 +737,12 @@ async fn save_settings(
 
     if let Some(obj) = body.as_object() {
         for (key, value) in obj {
-            if key == "id" || key == "title" || key == "author" || key == "archive_path" || key == "replace_patterns" {
+            if key == "id"
+                || key == "title"
+                || key == "author"
+                || key == "archive_path"
+                || key == "replace_patterns"
+            {
                 continue;
             }
             let ini_value = match value {
@@ -668,7 +756,9 @@ async fn save_settings(
                         continue;
                     }
                 }
-                serde_json::Value::String(s) => crate::converter::settings::IniValue::String(s.clone()),
+                serde_json::Value::String(s) => {
+                    crate::converter::settings::IniValue::String(s.clone())
+                }
                 serde_json::Value::Null => crate::converter::settings::IniValue::Null,
                 _ => continue,
             };
@@ -679,14 +769,18 @@ async fn save_settings(
     ini.save(&ini_path)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(ApiResponse { success: true, message: "Settings saved".to_string() }))
+    Ok(Json(ApiResponse {
+        success: true,
+        message: "Settings saved".to_string(),
+    }))
 }
 
 async fn list_devices(State(_state): State<AppState>) -> Json<serde_json::Value> {
     let devices = crate::converter::device::OutputManager::available_devices();
-    let list: Vec<serde_json::Value> = devices.iter().map(|(name, available)| {
-        serde_json::json!({ "name": name, "available": available })
-    }).collect();
+    let list: Vec<serde_json::Value> = devices
+        .iter()
+        .map(|(name, available)| serde_json::json!({ "name": name, "available": available }))
+        .collect();
     Json(serde_json::json!({ "devices": list }))
 }
 
@@ -704,12 +798,17 @@ async fn queue_status(State(_state): State<AppState>) -> Json<serde_json::Value>
 }
 
 async fn queue_clear(State(_state): State<AppState>) -> Json<ApiResponse> {
-    let result = crate::queue::PersistentQueue::with_default()
-        .and_then(|q| q.clear());
+    let result = crate::queue::PersistentQueue::with_default().and_then(|q| q.clear());
 
     match result {
-        Ok(_) => Json(ApiResponse { success: true, message: "Queue cleared".to_string() }),
-        Err(e) => Json(ApiResponse { success: false, message: e.to_string() }),
+        Ok(_) => Json(ApiResponse {
+            success: true,
+            message: "Queue cleared".to_string(),
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            message: e.to_string(),
+        }),
     }
 }
 

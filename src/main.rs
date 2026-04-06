@@ -82,7 +82,11 @@ async fn main() {
         Commands::List { tag, frozen } => {
             cmd_list(tag.as_deref(), frozen);
         }
-        Commands::Tag { add, remove, targets } => {
+        Commands::Tag {
+            add,
+            remove,
+            targets,
+        } => {
             if targets.is_empty() {
                 eprintln!("Usage: narou tag --add <tag> <targets>...");
                 std::process::exit(1);
@@ -154,10 +158,7 @@ fn cmd_download(targets: &[String]) {
                     } else {
                         println!(
                             "  Updated: {} (ID: {}, {}/{})",
-                            result.title,
-                            result.id,
-                            result.updated_count,
-                            result.total_count
+                            result.title, result.id, result.updated_count, result.total_count
                         );
                     }
                 }
@@ -166,7 +167,8 @@ fn cmd_download(targets: &[String]) {
                 }
             }
         }
-    }).join();
+    })
+    .join();
 
     if let Err(e) = result {
         eprintln!("Thread panicked: {:?}", e);
@@ -220,8 +222,12 @@ fn cmd_update(ids: Option<Vec<i64>>, all: bool) {
         }
 
         println!();
-        println!("Update complete: {}/{} succeeded, {} failed ", success, total, errors);
-    }).join();
+        println!(
+            "Update complete: {}/{} succeeded, {} failed ",
+            success, total, errors
+        );
+    })
+    .join();
 
     if let Err(e) = result {
         eprintln!("Thread panicked: {:?}", e);
@@ -229,7 +235,7 @@ fn cmd_update(ids: Option<Vec<i64>>, all: bool) {
 }
 
 fn cmd_convert(targets: &[String]) {
-    use narou_rs::converter::{NovelConverter};
+    use narou_rs::converter::NovelConverter;
     use narou_rs::converter::settings::NovelSettings;
 
     if let Err(e) = narou_rs::db::init_database() {
@@ -246,9 +252,10 @@ fn cmd_convert(targets: &[String]) {
         let id: i64 = match target.parse() {
             Ok(i) => i,
             Err(_) => {
-                match narou_rs::db::with_database(|db| {
-                    Ok(db.find_by_title(target).map(|r| r.id))
-                }).ok().flatten() {
+                match narou_rs::db::with_database(|db| Ok(db.find_by_title(target).map(|r| r.id)))
+                    .ok()
+                    .flatten()
+                {
                     Some(i) => i,
                     None => {
                         eprintln!("  Not found: {}", target);
@@ -259,9 +266,9 @@ fn cmd_convert(targets: &[String]) {
         };
 
         let novel_dir = match narou_rs::db::with_database(|db| {
-            let record = db.get(id).ok_or_else(|| {
-                narou_rs::error::NarouError::NotFound(format!("ID: {}", id))
-            })?;
+            let record = db
+                .get(id)
+                .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
             let archive_root = db.archive_root();
             let mut dir = std::path::PathBuf::from(archive_root);
             dir.push(&record.sitename);
@@ -350,10 +357,8 @@ fn cmd_tag(add: Option<&str>, remove: Option<&str>, targets: &[String]) {
         let id: i64 = match target.parse() {
             Ok(i) => i,
             Err(_) => {
-                match db::with_database(|db| {
-                    Ok(db.find_by_title(target).map(|r| r.id))
-                })
-                .unwrap_or(None)
+                match db::with_database(|db| Ok(db.find_by_title(target).map(|r| r.id)))
+                    .unwrap_or(None)
                 {
                     Some(i) => i,
                     None => {
@@ -365,9 +370,10 @@ fn cmd_tag(add: Option<&str>, remove: Option<&str>, targets: &[String]) {
         };
 
         let result = db::with_database_mut(|db| {
-            let record = db.get(id).cloned().ok_or_else(|| {
-                narou_rs::error::NarouError::NotFound(format!("ID: {}", id))
-            })?;
+            let record = db
+                .get(id)
+                .cloned()
+                .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
             let mut updated = record;
             if let Some(tag) = add {
                 if !updated.tags.contains(&tag.to_string()) {
@@ -400,10 +406,8 @@ fn cmd_freeze(targets: &[String], off: bool) {
         let id: i64 = match target.parse() {
             Ok(i) => i,
             Err(_) => {
-                match db::with_database(|db| {
-                    Ok(db.find_by_title(target).map(|r| r.id))
-                })
-                .unwrap_or(None)
+                match db::with_database(|db| Ok(db.find_by_title(target).map(|r| r.id)))
+                    .unwrap_or(None)
                 {
                     Some(i) => i,
                     None => {
@@ -415,9 +419,10 @@ fn cmd_freeze(targets: &[String], off: bool) {
         };
 
         let result = db::with_database_mut(|db| {
-            let record = db.get(id).cloned().ok_or_else(|| {
-                narou_rs::error::NarouError::NotFound(format!("ID: {}", id))
-            })?;
+            let record = db
+                .get(id)
+                .cloned()
+                .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
             let mut updated = record;
             if off {
                 updated.tags.retain(|t| t != "frozen");
@@ -448,10 +453,8 @@ fn cmd_remove(targets: &[String]) {
         let id: i64 = match target.parse() {
             Ok(i) => i,
             Err(_) => {
-                match db::with_database(|db| {
-                    Ok(db.find_by_title(target).map(|r| r.id))
-                })
-                .unwrap_or(None)
+                match db::with_database(|db| Ok(db.find_by_title(target).map(|r| r.id)))
+                    .unwrap_or(None)
                 {
                     Some(i) => i,
                     None => {
