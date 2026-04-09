@@ -10,10 +10,12 @@ pub struct ConverterBase {
     english_stash: Vec<String>,
     illust_stash: Vec<String>,
     kanji_num_stash: Vec<String>,
-    kome_count: usize,
+    hankaku_num_comma_stash: Vec<String>,
+    force_indent_chapter_stash: Vec<String>,
+    text_type: TextType,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TextType {
     Story,
     Chapter,
@@ -33,7 +35,9 @@ impl ConverterBase {
             english_stash: Vec::new(),
             illust_stash: Vec::new(),
             kanji_num_stash: Vec::new(),
-            kome_count: 0,
+            hankaku_num_comma_stash: Vec::new(),
+            force_indent_chapter_stash: Vec::new(),
+            text_type: TextType::Body,
         }
     }
 
@@ -45,51 +49,48 @@ impl ConverterBase {
             english_stash: Vec::new(),
             illust_stash: Vec::new(),
             kanji_num_stash: Vec::new(),
-            kome_count: 0,
+            hankaku_num_comma_stash: Vec::new(),
+            force_indent_chapter_stash: Vec::new(),
+            text_type: TextType::Body,
         }
     }
 
+    fn reset_stashes(&mut self) {
+        self.url_stash.clear();
+        self.english_stash.clear();
+        self.illust_stash.clear();
+        self.kanji_num_stash.clear();
+        self.hankaku_num_comma_stash.clear();
+        self.force_indent_chapter_stash.clear();
+    }
+
     pub fn convert(&mut self, text: &str, text_type: TextType) -> String {
-        let mut result = crate::downloader::html::to_aozora(text);
+        if text.is_empty() {
+            return String::new();
+        }
+
+        self.reset_stashes();
+        self.text_type = text_type;
+
+        let mut result = text.to_string();
+
+        result = self.rstrip_all_lines(&result);
 
         if let Some(ref uc) = self.user_converter {
             uc.apply_before_settings(&mut self.settings);
             result = uc.apply_before(&result, text_type, &mut self.settings);
         }
 
-        result = self.rstrip_all_lines(&result);
-        result = self.hankakukana_to_zenkakukana(&result);
-        result = self.auto_join_in_brackets(&result);
-        if self.settings.enable_auto_join_line {
-            result = self.auto_join_line(&result);
-        }
-        result = self.erase_comments_block(&result);
-        result = self.replace_url(&result);
-        result = self.replace_narou_tag(&result);
-        result = self.convert_numbers(&result);
-        result = self.insert_separate_space(&result);
-        result = self.convert_special_characters(&result);
-        result = self.modify_kana_ni_to_kanji_ni(&result);
-
+        result = self.before_hook(&result);
+        result = self.convert_for_all_data(&result);
         result = self.convert_main_loop(&result, text_type);
-
-        if self.settings.enable_ruby {
-            result = self.narou_ruby(&result);
-        }
-
-        if self.settings.enable_convert_horizontal_ellipsis {
-            result = self.convert_horizontal_ellipsis(&result);
-        }
-
-        result = self.rebuild_url(&result);
-        result = self.rebuild_kome_to_gaiji(&result);
-        result = self.rebuild_illust(&result);
-        result = self.delete_dust_char(&result);
 
         if let Some(ref uc) = self.user_converter {
             result = uc.apply_after(&result, text_type, &mut self.settings);
             uc.apply_after_settings(&mut self.settings);
         }
+
+        result = self.replace_by_replace_txt(&result);
 
         result
     }
@@ -99,6 +100,64 @@ impl ConverterBase {
             .iter()
             .map(|(text, tt)| self.convert(text, *tt))
             .collect()
+    }
+
+    fn before_hook(&self, text: &str) -> String {
+        let mut result = text.to_string();
+
+        match self.text_type {
+            TextType::Body | TextType::TextFile => {
+                if self.settings.enable_convert_page_break {
+                    result = self.convert_page_break(&result);
+                }
+            }
+            _ => {}
+        }
+
+        if self.text_type != TextType::Story && self.settings.enable_pack_blank_line {
+            result = result.replace("\n\n", "\n");
+            let re = Regex::new(r"(^\n){3}").unwrap();
+            result = re.replace_all(&result, "\n\n").to_string();
+        }
+
+        result
+    }
+
+    fn convert_page_break(&self, text: &str) -> String {
+        let threshold = self.settings.to_page_break_threshold;
+        if threshold < 1 {
+            return text.to_string();
+        }
+        let pattern = format!("(^\n){{{},}}", threshold);
+        let re = Regex::new(&pattern).unwrap();
+        re.replace_all(text, "\u{FF3B}\u{FF03}\u{6539}\u{9801}\u{FF3D}\n")
+            .to_string()
+    }
+
+    fn convert_for_all_data(&mut self, text: &str) -> String {
+        let mut result = text.to_string();
+
+        result = self.hankakukana_to_zenkakukana(&result);
+        result = self.auto_join_in_brackets(&result);
+        if self.settings.enable_auto_join_line {
+            result = self.auto_join_line(&result);
+        }
+        result = self.erase_comments_block(&result);
+        self.replace_illust_tag(&mut result);
+        self.replace_url(&mut result);
+        result = self.replace_narou_tag(&result);
+        result = self.convert_numbers(&mut result);
+        result = self.stash_kome(&result);
+        result = self.convert_double_angle_quotation_to_gaiji(&result);
+        result = self.convert_novel_rule(&result);
+        result = self.convert_head_half_spaces(&result);
+        result = self.modify_kana_ni_to_kanji_ni(&result);
+
+        if self.settings.enable_prolonged_sound_mark_to_dash {
+            result = self.convert_prolonged_sound_mark_to_dash(&result);
+        }
+
+        result
     }
 
     fn rstrip_all_lines(&self, text: &str) -> String {
@@ -121,6 +180,9 @@ impl ConverterBase {
     }
 
     fn auto_join_in_brackets(&self, text: &str) -> String {
+        if !self.settings.enable_auto_join_in_brackets {
+            return text.to_string();
+        }
         let mut result = text.to_string();
         for (open, close) in &[("\u{300C}", "\u{300D}"), ("\u{300E}", "\u{300F}")] {
             let re = Regex::new(&format!(
@@ -142,40 +204,33 @@ impl ConverterBase {
     }
 
     fn auto_join_line(&self, text: &str) -> String {
-        let lines: Vec<&str> = text.lines().collect();
-        let mut result = Vec::new();
-        let mut i = 0;
-
-        while i < lines.len() {
-            let line = lines[i];
-            if i + 1 < lines.len() {
-                let next = lines[i + 1];
-                let trimmed_next = next.trim_start_matches('\u{3000}');
-
-                let should_join = line.ends_with('\u{3001}')
-                    || line.ends_with('\u{3002}')
-                    || line.ends_with('\u{FF01}')
-                    || line.ends_with('\u{FF1F}')
-                    || line.ends_with('\u{2026}')
-                    || line.ends_with('\u{2025}')
-                    || (line.ends_with('\u{300C}') && !next.starts_with('\u{3000}'));
-
-                if should_join && !trimmed_next.is_empty() && !is_special_line_start(trimmed_next) {
-                    result.push(format!("{}{}", line, trimmed_next));
-                    i += 2;
-                    continue;
-                }
-            }
-            result.push(line.to_string());
-            i += 1;
-        }
-
-        result.join("\n")
+        let re = Regex::new(r"([^、])、\n　([^「『\(（【<＜〈《≪・■…‥―　１-９一-九])").unwrap();
+        re.replace_all(text, "$!1、$!2").to_string()
     }
 
     fn erase_comments_block(&self, text: &str) -> String {
         let re = Regex::new(r"(?m)^-{5,}.*$").unwrap();
         re.replace_all(text, "").to_string()
+    }
+
+    fn replace_illust_tag(&mut self, text: &mut String) {
+        if !self.settings.enable_illust {
+            let re = Regex::new(r#"<img[^>]+src="([^"]+)"[^>]*>"#).unwrap();
+            *text = re.replace_all(text, "").to_string();
+            return;
+        }
+        let re = Regex::new(r#"<img[^>]+src="([^"]+)"[^>]*>"#).unwrap();
+        *text = re
+            .replace_all(text, |caps: &regex::Captures| {
+                let url = caps[1].to_string();
+                let idx = self.illust_stash.len();
+                self.illust_stash.push(format!(
+                    "\u{FF3B}\u{FF03}\u{633F}\u{7D75}\u{FF08}{}\u{FF09}\u{5165}\u{308B}\u{FF3D}",
+                    url
+                ));
+                format!("\u{FF3B}\u{FF03}ILUST={}\u{FF3D}", idx)
+            })
+            .to_string();
     }
 
     fn replace_url(&mut self, text: &str) -> String {
@@ -185,36 +240,56 @@ impl ConverterBase {
                 let url = caps[0].to_string();
                 let idx = self.url_stash.len();
                 self.url_stash.push(url);
-                format!("\u{FF3B}\u{FF23}URL={}\u{FF3D}", idx)
+                format!("\u{FF3B}\u{FF03}URL={}\u{FF3D}", idx)
             })
             .to_string();
         result
     }
 
     fn replace_narou_tag(&self, text: &str) -> String {
-        let result = text.replace("\u{3010}\u{6539}\u{30DA}\u{30FC}\u{30B8}\u{3011}", "");
-        result
+        text.replace("\u{3010}\u{6539}\u{30DA}\u{30FC}\u{30B8}\u{3011}", "")
     }
 
     fn convert_numbers(&mut self, text: &str) -> String {
-        if self.settings.enable_convert_num_to_kanji {
-            self.convert_numbers_to_kanji(text)
-        } else {
-            self.hankaku_num_to_zenkaku(text)
+        match self.text_type {
+            TextType::Subtitle | TextType::Chapter | TextType::Story => {
+                self.hankaku_num_to_zenkaku(text)
+            }
+            _ => {
+                if self.settings.enable_convert_num_to_kanji {
+                    self.convert_numbers_to_kanji(text)
+                } else {
+                    self.hankaku_num_to_zenkaku(text)
+                }
+            }
         }
     }
 
     fn convert_numbers_to_kanji(&mut self, text: &str) -> String {
-        let re = Regex::new(r"\d+").unwrap();
+        let re = Regex::new(r"[\d\u{FF10}-\u{FF19},\u{FF0C}]+").unwrap();
         let result = re
             .replace_all(text, |caps: &regex::Captures| {
                 let num_str = &caps[0];
-                if num_str.contains(',') {
-                    let idx = self.kanji_num_stash.len();
-                    self.kanji_num_stash.push(num_str.to_string());
-                    return format!("\u{FF3B}\u{FF23}KNUM={}\u{FF3D}", idx);
+                if num_str.contains(',') || num_str.contains('\u{FF0C}') {
+                    let cleaned = num_str.replace('\u{FF0C}', ",");
+                    let idx = self.hankaku_num_comma_stash.len();
+                    self.hankaku_num_comma_stash.push(cleaned);
+                    return format!(
+                        "\u{FF3B}\u{FF03}\u{534A}\u{89D2}\u{6570}\u{5B57}\u{FF1D}{}\u{FF3D}",
+                        idx
+                    );
                 }
-                if let Ok(num) = num_str.parse::<u64>() {
+                let hankaku: String = num_str
+                    .chars()
+                    .map(|c| {
+                        if ('\u{FF10}'..='\u{FF19}').contains(&c) {
+                            char::from_u32(c as u32 - 0xFF10 + '0' as u32).unwrap_or(c)
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                if let Ok(num) = hankaku.parse::<u64>() {
                     num_to_kanji(num)
                 } else {
                     num_str.to_string()
@@ -233,64 +308,19 @@ impl ConverterBase {
         result
     }
 
-    fn convert_special_characters(&mut self, text: &str) -> String {
-        let mut result = text.to_string();
-
-        let symbols: &[(&str, &str)] = &[
-            ("!", "\u{FF01}"),
-            ("?", "\u{FF1F}"),
-            ("#", "\u{FF03}"),
-            ("$", "\u{FF04}"),
-            ("%", "\u{FF05}"),
-            ("&", "\u{FF06}"),
-            ("(", "\u{FF08}"),
-            (")", "\u{FF09}"),
-            ("*", "\u{FF0A}"),
-            ("+", "\u{FF0B}"),
-            (",", "\u{FF0C}"),
-            ("-", "\u{FF0D}"),
-            (".", "\u{3002}"),
-            ("/", "\u{FF0F}"),
-            (":", "\u{FF1A}"),
-            (";", "\u{FF1B}"),
-            ("<", "\u{FF1C}"),
-            ("=", "\u{FF1D}"),
-            (">", "\u{FF1E}"),
-            ("@", "\u{FF20}"),
-            ("[", "\u{FF3B}"),
-            ("]", "\u{FF3D}"),
-            ("^", "\u{FF3E}"),
-            ("_", "\u{FF3F}"),
-            ("`", "\u{FF40}"),
-            ("{", "\u{FF5B}"),
-            ("|", "\u{FF5C}"),
-            ("}", "\u{FF5D}"),
-            ("~", "\u{FF5E}"),
-            ("\\", "\u{FFE5}"),
-        ];
-
-        for (half, full) in symbols {
-            result = result.replace(half, full);
-        }
-
-        result = self.stash_kome(&result);
-        result = self.convert_double_angle_quotation_to_gaiji(&result);
-        result = self.convert_novel_rule(&result);
-        result = self.convert_head_half_spaces(&result);
-
-        result
-    }
-
-    fn stash_kome(&mut self, text: &str) -> String {
-        let count = text.matches('\u{203B}').count();
-        self.kome_count = count;
-        text.to_string()
+    fn stash_kome(&self, text: &str) -> String {
+        text.replace('\u{203B}', "\u{203B}\u{203B}")
     }
 
     fn convert_double_angle_quotation_to_gaiji(&self, text: &str) -> String {
-        let result = text.replace('\u{226A}', "\u{203B}\u{FF3B}\u{FF23}\u{59CB}\u{3081}\u{4E8C}\u{91CD}\u{5C71}\u{62EC}\u{5F27}\u{FF3D}");
-        let result = result.replace('\u{226B}', "\u{203B}\u{FF3B}\u{FF23}\u{7D42}\u{308F}\u{308A}\u{4E8C}\u{91CD}\u{5C71}\u{62EC}\u{5F27}\u{FF3D}");
-        result
+        let result = text.replace(
+            '\u{226A}',
+            "\u{203B}\u{FF3B}\u{FF03}\u{59CB}\u{3081}\u{4E8C}\u{91CD}\u{5C71}\u{62EC}\u{5F27}\u{FF3D}",
+        );
+        result.replace(
+            '\u{226B}',
+            "\u{203B}\u{FF3B}\u{FF03}\u{7D42}\u{308F}\u{308A}\u{4E8C}\u{91CD}\u{5C71}\u{62EC}\u{5F27}\u{FF3D}",
+        )
     }
 
     fn convert_novel_rule(&self, text: &str) -> String {
@@ -329,6 +359,9 @@ impl ConverterBase {
     }
 
     fn modify_kana_ni_to_kanji_ni(&self, text: &str) -> String {
+        if !self.settings.enable_kana_ni_to_kanji_ni {
+            return text.to_string();
+        }
         let mut result = text.to_string();
         let re = Regex::new(r"\u{30CB}").unwrap();
         result = re
@@ -337,56 +370,220 @@ impl ConverterBase {
         result
     }
 
-    fn convert_main_loop(&self, text: &str, text_type: TextType) -> String {
-        let lines: Vec<&str> = text.lines().collect();
-        let mut result = Vec::new();
+    fn convert_prolonged_sound_mark_to_dash(&self, text: &str) -> String {
+        let re = Regex::new(r"\u{30FC}{2,}").unwrap();
+        re.replace_all(text, |caps: &regex::Captures| {
+            "\u{2015}".repeat(caps[0].chars().count())
+        })
+        .to_string()
+    }
 
-        for line in &lines {
-            let processed = self.process_line(line, text_type);
-            result.push(processed);
+    fn convert_main_loop(&self, text: &str, text_type: TextType) -> String {
+        if text_type == TextType::Subtitle {
+            return text.to_string();
         }
 
-        result.join("\n")
+        let lines: Vec<&str> = text.lines().collect();
+        let mut result = Vec::new();
+        let mut before_line = String::new();
+        let mut request_insert_blank = false;
+
+        for line in &lines {
+            let mut line = line.to_string();
+            line = zenkaku_rstrip(&line);
+
+            if request_insert_blank {
+                if !is_blank_line(&line) {
+                    result.push(String::new());
+                }
+                request_insert_blank = false;
+                before_line.clear();
+            }
+
+            if matches!(text_type, TextType::Body | TextType::TextFile) {
+                let mut prefix = String::new();
+                if line.contains("\u{FF3B}\u{FF03}\u{7AE0}\u{898B}\u{51FA}\u{3057}\u{3063}\u{307D}\u{3044}\u{6587}\u{FF1D}") {
+                    if !is_blank_line(&before_line) {
+                        prefix.push('\n');
+                    }
+                    request_insert_blank = true;
+                }
+                if is_border_symbol(&line) {
+                    if !is_blank_line(&before_line) {
+                        prefix.push('\n');
+                    }
+                    request_insert_blank = true;
+                    line = format!("\u{3000}\u{3000}\u{3000}\u{3000}{}", line.trim_start());
+                }
+                if !prefix.is_empty() {
+                    line = format!("{}{}", prefix, line);
+                }
+            }
+
+            result.push(line.clone());
+            before_line = line;
+        }
+
+        let mut data = result.join("\n");
+
+        if matches!(text_type, TextType::Body | TextType::TextFile) {
+            self.rebuild_force_indent_chapter(&mut data);
+        }
+
+        self.rebuild_illust(&mut data);
+        self.rebuild_url(&mut data);
+        self.rebuild_hankaku_num_comma(&mut data);
+        self.rebuild_kome_to_gaiji(&mut data);
+
+        if matches!(text_type, TextType::Body | TextType::TextFile) {
+            if self.settings.enable_half_indent_bracket {
+                self.half_indent_bracket(&mut data);
+            }
+            self.auto_indent(&mut data);
+        }
+
+        if self.settings.enable_ruby {
+            self.narou_ruby(&mut data);
+        }
+
+        if self.settings.enable_convert_horizontal_ellipsis {
+            data = self.convert_horizontal_ellipsis(&data);
+        }
+
+        self.convert_double_angle_quotation_to_gaiji_post(&mut data);
+        self.delete_dust_char(&mut data);
+
+        data
     }
 
-    fn process_line(&self, line: &str, _text_type: TextType) -> String {
-        let mut line = line.to_string();
+    fn rebuild_force_indent_chapter(&self, data: &mut String) {
+        let re = Regex::new(r"\u{FF3B}\u{FF03}\u{7AE0}\u{898B}\u{51FA}\u{3057}\u{3063}\u{307D}\u{3044}\u{6587}\u{FF1D}(\d+)\u{FF3D}")
+            .unwrap();
+        *data = re
+            .replace_all(data, |caps: &regex::Captures| {
+                let idx: usize = caps[1].parse().unwrap_or(0);
+                self.force_indent_chapter_stash
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .to_string();
+    }
 
-        line = line
-            .trim_end_matches(|c: char| c.is_whitespace() || c == '\u{3000}')
+    fn rebuild_illust(&self, data: &mut String) {
+        let re = Regex::new(r"\u{FF3B}\u{FF03}ILUST=(\d+)\u{FF3D}").unwrap();
+        *data = re
+            .replace_all(data, |caps: &regex::Captures| {
+                let idx: usize = caps[1].parse().unwrap_or(0);
+                self.illust_stash.get(idx).cloned().unwrap_or_default()
+            })
+            .to_string();
+    }
+
+    fn rebuild_url(&self, data: &mut String) {
+        let re = Regex::new(r"\u{FF3B}\u{FF03}URL=(\d+)\u{FF3D}").unwrap();
+        *data = re
+            .replace_all(data, |caps: &regex::Captures| {
+                let idx: usize = caps[1].parse().unwrap_or(0);
+                self.url_stash.get(idx).cloned().unwrap_or_default()
+            })
+            .to_string();
+    }
+
+    fn rebuild_hankaku_num_comma(&self, data: &mut String) {
+        let re =
+            Regex::new(r"\u{FF3B}\u{FF03}\u{534A}\u{89D2}\u{6570}\u{5B57}\u{FF1D}(\d+)\u{FF3D}")
+                .unwrap();
+        *data = re
+            .replace_all(data, |caps: &regex::Captures| {
+                let idx: usize = caps[1].parse().unwrap_or(0);
+                self.hankaku_num_comma_stash
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .to_string();
+    }
+
+    fn rebuild_kome_to_gaiji(&self, data: &mut String) {
+        *data = data.replace(
+            "\u{203B}\u{203B}",
+            "\u{203B}\u{FF3B}\u{FF03}\u{7C73}\u{5370}\u{3001}1-2-8\u{FF3D}",
+        );
+    }
+
+    fn half_indent_bracket(&self, data: &mut String) {
+        let re = Regex::new(
+            r"(?m)^[ 　\t]*((?:[\u{3005}\u{300C}\u{300E}\u{FF08}\u{3010}\u{3008}\u{300A}\u{300C}\u{FF08}\u{3011}]|\u{203B}\u{FF3B}\u{FF03}\u{59CB}\u{3081}\u{4E8C}\u{91CD}\u{5C71}\u{62EC}\u{5F27}\u{FF3D}))"
+        ).unwrap();
+        *data = re
+            .replace_all(data, |caps: &regex::Captures| {
+                format!(
+                    "\u{FF3B}\u{FF03}\u{4E8C}\u{5206}\u{30A2}\u{30AD}\u{FF3D}{}",
+                    &caps[1]
+                )
+            })
+            .to_string();
+    }
+
+    fn auto_indent(&self, data: &mut String) {
+        let re = Regex::new(r"(?m)^(\u{2014}{1,})").unwrap();
+        *data = re
+            .replace_all(data, |caps: &regex::Captures| {
+                format!("\u{3000}{}", &caps[1])
+            })
             .to_string();
 
-        line
+        if self.settings.enable_force_indent || self.settings.enable_auto_indent {
+            let ignore_chars = "\u{3000}\u{3001}\u{3002}\u{2026}\u{2025}\u{2015}\u{30FC}\u{300D}\u{300F}\u{FF09}\u{FF5D}\u{300B}\u{3011}\u{FF1D}\u{FF01}\u{2605}\u{2606}\u{266A}\u{FF3B}\u{2014}\u{30FB}\u{2022}";
+            let re = Regex::new(&format!(r"(?m)^([^{0}])", regex::escape(ignore_chars))).unwrap();
+            *data = re
+                .replace_all(data, |caps: &regex::Captures| {
+                    let ch = &caps[1];
+                    if ch == "・" {
+                        let _rest = &caps[0];
+                        let after = &data[caps.get(0).unwrap().end()..];
+                        if after.starts_with('・') {
+                            format!("\u{3000}{}", ch)
+                        } else {
+                            ch.to_string()
+                        }
+                    } else if ch == " " || ch == "\u{3000}" {
+                        "\u{3000}".to_string()
+                    } else {
+                        format!("\u{3000}{}", ch)
+                    }
+                })
+                .to_string();
+        }
     }
 
-    fn narou_ruby(&self, text: &str) -> String {
-        let mut result = text.to_string();
-
+    fn narou_ruby(&self, data: &mut String) {
         let guillemet_re = Regex::new(r"\u{226A}(.+?)\u{226B}").unwrap();
-        result = guillemet_re
-            .replace_all(&result, |caps: &regex::Captures| {
+        let original = data.clone();
+        *data = guillemet_re
+            .replace_all(&original, |caps: &regex::Captures| {
                 let ruby_text = &caps[1];
-                let base = self.find_ruby_base(&result, caps.get(0).unwrap().start());
+                let base = self.find_ruby_base(&original, caps.get(0).unwrap().start());
                 format!("\u{FF5C}{}\u{300C}{}\u{300D}", base, ruby_text)
             })
             .to_string();
 
         let paren_re = Regex::new(r"\u{FF08}(.+?)\u{FF09}").unwrap();
-        result = paren_re
-            .replace_all(&result, |caps: &regex::Captures| {
+        let original = data.clone();
+        *data = paren_re
+            .replace_all(&original, |caps: &regex::Captures| {
                 let ruby_text = &caps[1];
                 if ruby_text.is_empty() || ruby_text.starts_with(' ') {
                     return caps[0].to_string();
                 }
-                let base = self.find_ruby_base(&result, caps.get(0).unwrap().start());
+                let base = self.find_ruby_base(&original, caps.get(0).unwrap().start());
                 if base.is_empty() {
                     return caps[0].to_string();
                 }
                 format!("\u{FF5C}{}\u{300C}{}\u{300D}", base, ruby_text)
             })
             .to_string();
-
-        result
     }
 
     fn find_ruby_base(&self, text: &str, pos: usize) -> String {
@@ -395,12 +592,13 @@ impl ConverterBase {
 
         let mut base = String::new();
         let ruby_eligible = |c: char| -> bool {
-            matches!(c,
-                '\u{4E00}'..='\u{9FFF}' |
-                '\u{3040}'..='\u{309F}' |
-                '\u{30A0}'..='\u{30FF}' |
-                '\u{FF66}'..='\u{FF9F}' |
-                '\u{FF21}'..='\u{FF3A}'
+            matches!(
+                c,
+                '\u{4E00}'..='\u{9FFF}'
+                    | '\u{3040}'..='\u{309F}'
+                    | '\u{30A0}'..='\u{30FF}'
+                    | '\u{FF66}'..='\u{FF9F}'
+                    | '\u{FF21}'..='\u{FF3A}'
             )
         };
 
@@ -423,49 +621,73 @@ impl ConverterBase {
         re.replace_all(text, "\u{2026}").to_string()
     }
 
-    fn rebuild_url(&self, text: &str) -> String {
-        let re = Regex::new(r"\u{FF3B}\u{FF23}URL=(\d+)\u{FF3D}").unwrap();
-        re.replace_all(text, |caps: &regex::Captures| {
-            let idx: usize = caps[1].parse().unwrap_or(0);
-            self.url_stash.get(idx).cloned().unwrap_or_default()
-        })
-        .to_string()
+    fn convert_double_angle_quotation_to_gaiji_post(&self, data: &mut String) {
+        *data = data.replace(
+            '\u{226A}',
+            "\u{203B}\u{FF3B}\u{FF03}\u{59CB}\u{3081}\u{4E8C}\u{91CD}\u{5C71}\u{62EC}\u{5F27}\u{FF3D}",
+        );
+        *data = data.replace(
+            '\u{226B}',
+            "\u{203B}\u{FF3B}\u{FF03}\u{7D42}\u{308F}\u{308A}\u{4E8C}\u{91CD}\u{5C71}\u{62EC}\u{5F27}\u{FF3D}",
+        );
     }
 
-    fn rebuild_kome_to_gaiji(&self, text: &str) -> String {
-        text.to_string()
-    }
-
-    fn rebuild_illust(&self, text: &str) -> String {
-        let re = Regex::new(r"\u{FF3B}\u{FF23}ILUST=(\d+)\u{FF3D}").unwrap();
-        re.replace_all(text, |caps: &regex::Captures| {
-            let idx: usize = caps[1].parse().unwrap_or(0);
-            self.illust_stash.get(idx).cloned().unwrap_or_default()
-        })
-        .to_string()
-    }
-
-    fn delete_dust_char(&self, text: &str) -> String {
-        text.chars()
+    fn delete_dust_char(&self, data: &mut String) {
+        *data = data
+            .chars()
             .filter(|&c| {
-                !matches!(c as u32,
-                    0x200B..=0x200F |
-                    0x2028..=0x202F |
-                    0x2060..=0x206F |
-                    0xFEFF
+                !matches!(
+                    c as u32,
+                    0x200B..=0x200F | 0x2028..=0x202F | 0x2060..=0x206F | 0xFEFF
                 )
             })
-            .collect()
+            .collect();
     }
 
-    fn insert_separate_space(&self, text: &str) -> String {
-        if !self.settings.enable_insert_word_separator
-            && !self.settings.enable_insert_char_separator
-        {
-            return text.to_string();
+    fn replace_by_replace_txt(&self, text: &str) -> String {
+        let mut result = text.to_string();
+        for (src, dst) in &self.settings.replace_patterns {
+            result = result.replace(src, dst);
         }
-        text.to_string()
+        result
     }
+}
+
+fn zenkaku_rstrip(line: &str) -> String {
+    line.trim_end_matches(|c: char| c == '\u{3000}' || c.is_whitespace())
+        .to_string()
+}
+
+fn is_blank_line(line: &str) -> bool {
+    line.trim().is_empty()
+}
+
+fn is_border_symbol(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let first = trimmed.chars().next().unwrap();
+    matches!(
+        first,
+        '\u{25A0}'
+            | '\u{25A1}'
+            | '\u{25B2}'
+            | '\u{25B3}'
+            | '\u{25C6}'
+            | '\u{25C7}'
+            | '\u{25CF}'
+            | '\u{25CB}'
+            | '\u{2605}'
+            | '\u{2606}'
+            | '\u{266A}'
+            | '\u{266B}'
+            | '\u{FF0A}'
+            | '\u{FF0D}'
+            | '\u{FF1A}'
+            | '\u{FF1B}'
+            | '\u{301C}'
+    )
 }
 
 fn is_halfwidth_katakana(ch: char) -> bool {
@@ -479,38 +701,6 @@ fn to_fullwidth_katakana(ch: char) -> char {
 
 fn to_fullwidth_digit(ch: char) -> char {
     char::from_u32(ch as u32 - '0' as u32 + 0xFF10).unwrap_or(ch)
-}
-
-fn is_special_line_start(s: &str) -> bool {
-    if s.is_empty() {
-        return true;
-    }
-    let first = s.chars().next().unwrap();
-    matches!(
-        first,
-        '\u{3000}'
-            | '\u{3001}'
-            | '\u{3002}'
-            | '\u{2026}'
-            | '\u{2025}'
-            | '\u{2015}'
-            | '\u{30FC}'
-            | '\u{300D}'
-            | '\u{300F}'
-            | '\u{FF09}'
-            | '\u{FF5D}'
-            | '\u{300B}'
-            | '\u{3011}'
-            | '\u{FF1D}'
-            | '\u{FF01}'
-            | '\u{2605}'
-            | '\u{2606}'
-            | '\u{266A}'
-            | '\u{FF3B}'
-            | '\u{2014}'
-            | '\u{30FB}'
-            | '\u{2022}'
-    )
 }
 
 fn normalize_ellipsis(text: &str) -> String {

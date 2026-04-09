@@ -16,12 +16,14 @@ pub fn to_aozora(html: &str) -> String {
 }
 
 fn br_to_aozora(text: &str) -> String {
-    let re = Regex::new(r"<br\s*/?>").unwrap();
-    re.replace_all(text, "\n").to_string().replace("\r\n", "\n")
+    let re = Regex::new(r"[\r\n]+").unwrap();
+    let text = re.replace_all(text, "").to_string();
+    let re = Regex::new(r"(?i)<br\s*/?>").unwrap();
+    re.replace_all(&text, "\n").to_string()
 }
 
 fn p_to_aozora(text: &str) -> String {
-    let re = Regex::new(r"</p>").unwrap();
+    let re = Regex::new(r"(?i)\n?</p>").unwrap();
     re.replace_all(text, "\n").to_string()
 }
 
@@ -53,13 +55,13 @@ fn ruby_to_aozora(text: &str) -> String {
 fn b_to_aozora(text: &str) -> String {
     let text = Regex::new(r"(?i)<b[^>]*>")
         .unwrap()
-        .replace_all(text, "\u{FF3B}\u{FF23}\u{592A}\u{5B57}\u{FF3D}")
+        .replace_all(text, "\u{FF3B}\u{FF03}\u{592A}\u{5B57}\u{FF3D}")
         .to_string();
     Regex::new(r"(?i)</b>")
         .unwrap()
         .replace_all(
             &text,
-            "\u{FF3B}\u{FF23}\u{592A}\u{5B57}\u{7D42}\u{308F}\u{308A}\u{FF3D}",
+            "\u{FF3B}\u{FF03}\u{592A}\u{5B57}\u{7D42}\u{308F}\u{308A}\u{FF3D}",
         )
         .to_string()
 }
@@ -67,13 +69,13 @@ fn b_to_aozora(text: &str) -> String {
 fn i_to_aozora(text: &str) -> String {
     let text = Regex::new(r"(?i)<i[^>]*>")
         .unwrap()
-        .replace_all(text, "\u{FF3B}\u{FF23}\u{659C}\u{4F53}\u{FF3D}")
+        .replace_all(text, "\u{FF3B}\u{FF03}\u{659C}\u{4F53}\u{FF3D}")
         .to_string();
     Regex::new(r"(?i)</i>")
         .unwrap()
         .replace_all(
             &text,
-            "\u{FF3B}\u{FF23}\u{659C}\u{4F53}\u{7D42}\u{308F}\u{308A}\u{FF3D}",
+            "\u{FF3B}\u{FF03}\u{659C}\u{4F53}\u{7D42}\u{308F}\u{308A}\u{FF3D}",
         )
         .to_string()
 }
@@ -81,13 +83,13 @@ fn i_to_aozora(text: &str) -> String {
 fn s_to_aozora(text: &str) -> String {
     let text = Regex::new(r"(?i)<s[^>]*>")
         .unwrap()
-        .replace_all(text, "\u{FF3B}\u{FF23}\u{53D6}\u{6D88}\u{7DDA}\u{FF3D}")
+        .replace_all(text, "\u{FF3B}\u{FF03}\u{53D6}\u{6D88}\u{7DDA}\u{FF3D}")
         .to_string();
     Regex::new(r"(?i)</s>")
         .unwrap()
         .replace_all(
             &text,
-            "\u{FF3B}\u{FF23}\u{53D6}\u{6D88}\u{7DDA}\u{7D42}\u{308F}\u{308A}\u{FF3D}",
+            "\u{FF3B}\u{FF03}\u{53D6}\u{6D88}\u{7DDA}\u{7D42}\u{308F}\u{308A}\u{FF3D}",
         )
         .to_string()
 }
@@ -96,17 +98,17 @@ fn img_to_aozora(text: &str) -> String {
     let re = Regex::new(r#"(?i)<img[^>]+src=["']([^"']+)["'][^>]*>"#).unwrap();
     re.replace_all(
         text,
-        "\u{FF3B}\u{FF23}\u{633F}\u{7D75}\u{FF08}$1\u{FF09}\u{5165}\u{308B}\u{FF3D}",
+        "\u{FF3B}\u{FF03}\u{633F}\u{7D75}\u{FF08}$1\u{FF09}\u{5165}\u{308B}\u{FF3D}",
     )
     .to_string()
 }
 
 fn em_to_sesame(text: &str) -> String {
     let re = Regex::new(r#"(?i)<em\s+class=["']emphasisDots["']\s*>(.+?)</em>"#).unwrap();
-    let text = re.replace_all(text, "\u{FF3B}\u{FF23}\u{65C1}\u{70B9}\u{FF3D}$1\u{FF3B}\u{FF23}\u{65C1}\u{70B9}\u{7D42}\u{308F}\u{308A}\u{FF3D}").to_string();
+    let text = re.replace_all(text, "\u{FF3B}\u{FF03}\u{65C1}\u{70B9}\u{FF3D}$1\u{FF3B}\u{FF03}\u{65C1}\u{70B9}\u{7D42}\u{308F}\u{308A}\u{FF3D}").to_string();
 
     let re2 = Regex::new(r"(?i)<em[^>]*>(.+?)</em>").unwrap();
-    re2.replace_all(&text, "\u{FF3B}\u{FF23}\u{65C1}\u{70B9}\u{FF3D}$1\u{FF3B}\u{FF23}\u{65C1}\u{70B9}\u{7D42}\u{308F}\u{308A}\u{FF3D}")
+    re2.replace_all(&text, "\u{FF3B}\u{FF03}\u{65C1}\u{70B9}\u{FF3D}$1\u{FF3B}\u{FF03}\u{65C1}\u{70B9}\u{7D42}\u{308F}\u{308A}\u{FF3D}")
         .to_string()
 }
 

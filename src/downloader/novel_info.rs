@@ -52,12 +52,15 @@ impl NovelInfo {
                 return Ok(info);
             }
             let mut body = response.text()?;
-            body.retain(|c| c != '\r');
+            crate::downloader::pretreatment_source(&mut body, setting.encoding());
 
             let keys = [
                 "t", "w", "s", "nt", "ga", "gf", "nu", "gl", "l", "tags", "sitename",
             ];
             info.raw_captures = setting.multi_match(&body, &keys);
+            if info.raw_captures.is_empty() {
+                return Ok(info);
+            }
 
             info.title = info.raw_captures.get("t").cloned();
             info.author = info.raw_captures.get("w").cloned();

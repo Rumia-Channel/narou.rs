@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use settings::NovelSettings;
 use user_converter::UserConverter;
 
-use crate::downloader::{SectionElement, TocObject};
+use crate::downloader::{SectionElement, SectionFile, TocObject};
 use crate::error::{NarouError, Result};
 
 pub struct NovelConverter {
@@ -23,7 +23,17 @@ pub struct NovelConverter {
 
 struct CacheEntry {
     digest: String,
-    converted_lines: Vec<String>,
+    converted_section: ConvertedSection,
+}
+
+#[derive(Clone)]
+struct ConvertedSection {
+    chapter: String,
+    subchapter: String,
+    subtitle: String,
+    introduction: String,
+    body: String,
+    postscript: String,
 }
 
 impl NovelConverter {
@@ -45,131 +55,289 @@ impl NovelConverter {
         }
     }
 
-    pub fn convert_novel(
-        &mut self,
-        toc: &TocObject,
-        sections: &[SectionElement],
-    ) -> Result<String> {
+    pub fn convert_novel(&mut self, toc: &TocObject, sections: &[SectionFile]) -> Result<String> {
+        let mut converted_story = String::new();
+        if let Some(ref story) = toc.story {
+            if !story.is_empty() {
+                let mut converter = self.make_converter();
+                converted_story = converter.convert(story, converter_base::TextType::Story);
+            }
+        }
+
         let mut converted_sections = Vec::new();
 
         for (i, section) in sections.iter().enumerate() {
-            let digest = self.compute_digest(section, i);
+            let digest = self.compute_digest(&section.element, i);
 
             if let Some(cached) = self.section_cache.get(&digest) {
-                converted_sections.push(cached.converted_lines.clone());
+                converted_sections.push(cached.converted_section.clone());
                 continue;
             }
 
-            let mut converter = if let Some(ref uc) = self.user_converter {
-                converter_base::ConverterBase::with_user_converter(
-                    self.settings.clone(),
-                    uc.clone(),
-                )
-            } else {
-                converter_base::ConverterBase::new(self.settings.clone())
-            };
+            let mut converter = self.make_converter();
+
+            let chapter = section.chapter.clone();
+            let subchapter = section.subchapter.clone();
+            let subtitle = section.subtitle.clone();
+
+            let is_html =
+                section.element.data_type != "text" && section.element.data_type != "text/plain";
 
             let mut batch_inputs = Vec::new();
 
-            if !section.introduction.is_empty() {
-                batch_inputs.push((
-                    section.introduction.clone(),
-                    converter_base::TextType::Introduction,
-                ));
+            if !chapter.is_empty() {
+                batch_inputs.push((chapter.clone(), converter_base::TextType::Chapter));
+            }
+            if !subtitle.is_empty() {
+                batch_inputs.push((subtitle.clone(), converter_base::TextType::Subtitle));
             }
 
-            batch_inputs.push((section.body.clone(), converter_base::TextType::Body));
+            let intro_text = if is_html && !section.element.introduction.is_empty() {
+                crate::downloader::html::to_aozora(&section.element.introduction)
+            } else {
+                section.element.introduction.clone()
+            };
+            let body_text = if is_html && !section.element.body.is_empty() {
+                crate::downloader::html::to_aozora(&section.element.body)
+            } else {
+                section.element.body.clone()
+            };
+            let post_text = if is_html && !section.element.postscript.is_empty() {
+                crate::downloader::html::to_aozora(&section.element.postscript)
+            } else {
+                section.element.postscript.clone()
+            };
 
-            if !section.postscript.is_empty() {
-                batch_inputs.push((
-                    section.postscript.clone(),
-                    converter_base::TextType::Postscript,
-                ));
+            if !intro_text.is_empty() {
+                batch_inputs.push((intro_text, converter_base::TextType::Introduction));
+            }
+            batch_inputs.push((body_text, converter_base::TextType::Body));
+            if !post_text.is_empty() {
+                batch_inputs.push((post_text, converter_base::TextType::Postscript));
             }
 
             let results = converter.convert_multi(&batch_inputs);
 
-            let mut section_lines = Vec::new();
-            section_lines
-                .push("\u{FF3B}\u{FF23}\u{6539}\u{30DA}\u{30FC}\u{30B8}\u{FF3D}".to_string());
+            let mut ri = 0;
+            let conv_chapter = if !chapter.is_empty() {
+                let r = results[ri].clone();
+                ri += 1;
+                r
+            } else {
+                String::new()
+            };
+            let conv_subtitle = if !subtitle.is_empty() {
+                let r = results[ri].clone();
+                ri += 1;
+                r
+            } else {
+                String::new()
+            };
+            let conv_intro = if !section.element.introduction.is_empty() {
+                let r = results[ri].clone();
+                ri += 1;
+                r
+            } else {
+                String::new()
+            };
+            let conv_body = results[ri].clone();
+            ri += 1;
+            let conv_post = if !section.element.postscript.is_empty() {
+                let r = results[ri].clone();
+                r
+            } else {
+                String::new()
+            };
 
-            if i < toc.subtitles.len() {
-                let sub = &toc.subtitles[i];
-                if !sub.chapter.is_empty() {
-                    section_lines.push(format!(
-                        "\u{FF3B}\u{FF23}\u{4E09}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}\u{FF3B}\u{FF23}\u{5927}\u{898B}\u{51FA}\u{3057}\u{FF3D}{}\u{FF3B}\u{FF23}\u{5927}\u{898B}\u{51FA}\u{3057}\u{7D42}\u{308F}\u{308A}\u{FF3D}",
-                        sub.chapter
-                    ));
-                }
-                if !sub.subtitle.is_empty() {
-                    section_lines.push(format!(
-                        "\u{FF3B}\u{FF23}\u{4E09}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}\u{FF3B}\u{FF23}\u{4E2D}\u{898B}\u{51FA}\u{3057}\u{FF3D}{}\u{FF3B}\u{FF23}\u{4E2D}\u{898B}\u{51FA}\u{3057}\u{7D42}\u{308F}\u{308A}\u{FF3D}",
-                        sub.subtitle
-                    ));
-                }
-            }
-
-            for result_text in &results {
-                for line in result_text.lines() {
-                    section_lines.push(line.to_string());
-                }
-            }
+            let cs = ConvertedSection {
+                chapter: conv_chapter,
+                subchapter: subchapter.clone(),
+                subtitle: conv_subtitle,
+                introduction: conv_intro,
+                body: conv_body,
+                postscript: conv_post,
+            };
 
             self.section_cache.insert(
                 digest.clone(),
                 CacheEntry {
                     digest,
-                    converted_lines: section_lines.clone(),
+                    converted_section: cs.clone(),
                 },
             );
             self.cache_dirty = true;
 
-            converted_sections.push(section_lines);
+            converted_sections.push(cs);
         }
 
-        self.render_novel_text(toc, &converted_sections)
+        self.render_novel_text(toc, &converted_story, &converted_sections)
     }
 
-    fn render_novel_text(&self, toc: &TocObject, sections: &[Vec<String>]) -> Result<String> {
+    fn render_novel_text(
+        &self,
+        toc: &TocObject,
+        story: &str,
+        sections: &[ConvertedSection],
+    ) -> Result<String> {
         let mut output = String::new();
 
-        let title = toc.title.as_str();
-        let author = toc.author.as_str();
+        let title = if self.settings.novel_title.is_empty() {
+            &toc.title
+        } else {
+            &self.settings.novel_title
+        };
+        let author = if self.settings.novel_author.is_empty() {
+            &toc.author
+        } else {
+            &self.settings.novel_author
+        };
 
         output.push_str(title);
         output.push('\n');
         output.push_str(author);
         output.push('\n');
+
+        let cover_chuki = self.create_cover_chuki();
+        output.push_str(&cover_chuki);
         output.push('\n');
 
-        output.push_str("\u{FF3B}\u{FF30}\u{533A}\u{5207}\u{7DDA}\u{FF3D}\n");
+        output.push_str("\u{FF3B}\u{FF03}\u{533A}\u{5207}\u{308A}\u{7DDA}\u{FF3D}\n");
 
-        if let Some(ref story) = toc.story {
-            if !story.is_empty() {
-                output.push_str("あらすじ：\n");
-                output.push_str(story);
+        if !story.is_empty() {
+            output.push_str("あらすじ：\n");
+            output.push_str(story);
+            if !story.ends_with('\n') {
                 output.push('\n');
             }
+            output.push('\n');
         }
 
         if !toc.toc_url.is_empty() {
             output.push_str("掲載ページ:\n");
-            output.push_str(&format!("<{}>\n", toc.toc_url));
-            output.push_str("\u{FF3B}\u{FF30}\u{533A}\u{5207}\u{7DDA}\u{FF3D}\n");
+            output.push_str(&format!(
+                "<a href=\"{}\">{}</a>\n",
+                toc.toc_url, toc.toc_url
+            ));
+            output.push_str("\u{FF3B}\u{FF03}\u{533A}\u{5207}\u{308A}\u{7DDA}\u{FF3D}\n");
         }
 
-        for section_lines in sections {
-            for line in section_lines {
-                output.push_str(line);
-                output.push('\n');
+        output.push('\n');
+
+        for section in sections {
+            output.push_str("\u{FF3B}\u{FF03}\u{6539}\u{30DA}\u{30FC}\u{30B8}\u{FF3D}\n");
+
+            if !section.chapter.is_empty() {
+                output.push_str("\u{FF3B}\u{FF03}\u{30DA}\u{30FC}\u{30B8}\u{306E}\u{5DE6}\u{53F3}\u{4E2D}\u{592E}\u{FF3D}\n");
+                output.push_str(&format!(
+                    "\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{67F1}\u{FF3D}{}\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{67F1}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n",
+                    title
+                ));
+                output.push_str(&format!(
+                    "\u{FF3B}\u{FF03}\u{FF13}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}\u{FF3B}\u{FF03}\u{5927}\u{898B}\u{51FA}\u{3057}\u{FF3D}{}\u{FF3B}\u{FF03}\u{5927}\u{898B}\u{51FA}\u{3057}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n",
+                    section.chapter
+                ));
+                output.push_str("\u{FF3B}\u{FF03}\u{6539}\u{30DA}\u{30FC}\u{30B8}\u{FF3D}\n");
+            }
+
+            if !section.subchapter.is_empty() {
+                let trimmed_subchapter = section.subchapter.trim_end();
+                output.push_str(&format!(
+                    "\u{FF3B}\u{FF03}\u{FF11}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}\u{FF3B}\u{FF03}\u{FF11}\u{6BB5}\u{968E}\u{5927}\u{304D}\u{306A}\u{6587}\u{5B57}\u{FF3D}{}\u{FF3B}\u{FF03}\u{5927}\u{304D}\u{306A}\u{6587}\u{5B57}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n",
+                    trimmed_subchapter
+                ));
+            }
+
+            output.push('\n');
+
+            let indent = if self.settings.enable_yokogaki {
+                "\u{FF3B}\u{FF03}\u{FF11}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}"
+            } else {
+                "\u{FF3B}\u{FF03}\u{FF13}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}"
+            };
+            let trimmed_subtitle = section.subtitle.trim_end();
+            output.push_str(&format!(
+                "{}［＃中見出し］{}［＃中見出し終わり］\n",
+                indent, trimmed_subtitle
+            ));
+
+            output.push_str("\n\n");
+
+            if !section.introduction.is_empty() {
+                let style = &self.settings.author_comment_style;
+                if style == "simple" {
+                    output.push_str("\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{FF18}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}\n");
+                    output.push_str("\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{FF12}\u{6BB5}\u{968E}\u{5C0F}\u{3055}\u{306A}\u{6587}\u{5B57}\u{FF3D}\n");
+                    output.push_str(&section.introduction);
+                    output.push_str("\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5C0F}\u{3055}\u{306A}\u{6587}\u{5B57}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n");
+                    output.push_str("\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5B57}\u{4E0B}\u{3052}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n");
+                } else if style == "plain" {
+                    output.push_str("\n\n");
+                    output.push_str(&section.introduction);
+                    output.push_str(
+                        "\n\n\u{FF3B}\u{FF03}\u{533A}\u{5207}\u{308A}\u{7DDA}\u{FF3D}\n\n",
+                    );
+                } else {
+                    output.push_str(&format!(
+                        "\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{524D}\u{66F8}\u{304D}\u{FF3D}\n{}\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{524D}\u{66F8}\u{304D}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n",
+                        section.introduction
+                    ));
+                }
+            }
+
+            output.push_str("\n\n");
+
+            let body_text = section.body.trim_start_matches('\n');
+            output.push_str(&body_text);
+
+            if !section.postscript.is_empty() {
+                let style = &self.settings.author_comment_style;
+                if style == "simple" {
+                    output.push_str("\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{FF18}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}\n");
+                    output.push_str("\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{FF12}\u{6BB5}\u{968E}\u{5C0F}\u{3055}\u{306A}\u{6587}\u{5B57}\u{FF3D}\n");
+                    output.push_str(&section.postscript);
+                    output.push_str("\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5C0F}\u{3055}\u{306A}\u{6587}\u{5B57}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n");
+                    output.push_str("\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5B57}\u{4E0B}\u{3052}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n");
+                } else if style == "plain" {
+                    output
+                        .push_str("\n\u{FF3B}\u{FF03}\u{533A}\u{5207}\u{308A}\u{7DDA}\u{FF3D}\n\n");
+                    output.push_str(&section.postscript);
+                    output.push_str("\n");
+                } else {
+                    output.push_str(&format!(
+                        "\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{5F8C}\u{66F8}\u{304D}\u{FF3D}\n{}\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5F8C}\u{66F8}\u{304D}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n",
+                        section.postscript
+                    ));
+                }
             }
         }
 
         if self.settings.enable_display_end_of_book {
-            output.push_str("\u{FF08}\u{672C}\u{3092}\u{8AAD}\u{307F}\u{7D42}\u{308F}\u{308A}\u{307E}\u{3057}\u{305F}\u{FF09}\n");
+            output.push_str("\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{5730}\u{4ED8}\u{304D}\u{FF3D}\u{FF3B}\u{FF03}\u{5C0F}\u{66F8}\u{304D}\u{FF3D}\u{FF08}\u{672C}\u{3092}\u{8AAD}\u{307F}\u{7D42}\u{308F}\u{308A}\u{307E}\u{3057}\u{305F}\u{FF09}\u{FF3B}\u{FF03}\u{5C0F}\u{66F8}\u{304D}\u{7D42}\u{308F}\u{308A}\u{FF3D}\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5730}\u{4ED8}\u{304D}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n");
         }
 
         Ok(output)
+    }
+
+    fn create_cover_chuki(&self) -> String {
+        let archive_path = &self.settings.archive_path;
+        for ext in &[".jpg", ".png", ".jpeg"] {
+            let cover_path = archive_path.join(format!("cover{}", ext));
+            if cover_path.exists() {
+                return format!(
+                    "\u{FF3B}\u{FF03}\u{633F}\u{7D75}\u{FF08}cover{}\u{FF09}\u{5165}\u{308B}\u{FF3D}",
+                    ext
+                );
+            }
+        }
+        String::new()
+    }
+
+    fn make_converter(&self) -> converter_base::ConverterBase {
+        if let Some(ref uc) = self.user_converter {
+            converter_base::ConverterBase::with_user_converter(self.settings.clone(), uc.clone())
+        } else {
+            converter_base::ConverterBase::new(self.settings.clone())
+        }
     }
 
     fn compute_digest(&self, section: &SectionElement, index: usize) -> String {
@@ -177,6 +345,7 @@ impl NovelConverter {
         hasher.update(section.body.as_bytes());
         hasher.update(section.introduction.as_bytes());
         hasher.update(section.postscript.as_bytes());
+        hasher.update(section.data_type.as_bytes());
         hasher.update(index.to_le_bytes());
         hasher.update(self.compute_settings_signature().as_bytes());
         if let Some(ref uc) = self.user_converter {
@@ -203,6 +372,21 @@ impl NovelConverter {
                 .as_bytes(),
         );
         hasher.update(self.settings.date_format.as_bytes());
+        hasher.update(self.settings.enable_pack_blank_line.to_string().as_bytes());
+        hasher.update(
+            self.settings
+                .enable_auto_join_in_brackets
+                .to_string()
+                .as_bytes(),
+        );
+        hasher.update(self.settings.enable_auto_join_line.to_string().as_bytes());
+        hasher.update(
+            self.settings
+                .enable_half_indent_bracket
+                .to_string()
+                .as_bytes(),
+        );
+        hasher.update(self.settings.author_comment_style.as_bytes());
         hex::encode(hasher.finalize())
     }
 
@@ -279,7 +463,7 @@ impl NovelConverter {
 fn load_sections_from_dir(
     novel_dir: &std::path::Path,
     subtitles: &[crate::downloader::SubtitleInfo],
-) -> Result<Vec<crate::downloader::SectionElement>> {
+) -> Result<Vec<crate::downloader::SectionFile>> {
     let section_dir = novel_dir.join(crate::downloader::SECTION_SAVE_DIR);
     let mut sections = Vec::new();
 
@@ -287,17 +471,8 @@ fn load_sections_from_dir(
         let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
         let path = section_dir.join(&filename);
         let content = std::fs::read_to_string(&path).map_err(|e| NarouError::Io(e))?;
-        let section = if content.starts_with("---") {
-            let without_front = content.replacen("---", "", 1);
-            let section_file: crate::downloader::SectionFile =
-                serde_yaml::from_str(without_front.trim_start())
-                    .map_err(|e| NarouError::Yaml(e))?;
-            section_file.element
-        } else {
-            let section: crate::downloader::SectionElement =
-                serde_yaml::from_str(&content).map_err(|e| NarouError::Yaml(e))?;
-            section
-        };
+        let section: crate::downloader::SectionFile =
+            serde_yaml::from_str(&content).map_err(|e| NarouError::Yaml(e))?;
         sections.push(section);
     }
 

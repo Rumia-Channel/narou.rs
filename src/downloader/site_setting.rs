@@ -30,6 +30,9 @@ pub struct SiteSetting {
     pub toc_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitles: Option<SiteSettingValue>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub href: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_toc: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -219,15 +222,21 @@ impl SiteSetting {
         let pattern = match value {
             SiteSettingValue::Single(s) => s.clone(),
             SiteSettingValue::Multiple(entries) => {
-                let first = entries.first()?;
-                match first {
-                    SiteSettingEntry::Plain(s) => s.clone(),
-                    SiteSettingEntry::Eval { .. } => return None,
+                let first_plain = entries
+                    .iter()
+                    .find(|e| matches!(e, SiteSettingEntry::Plain(_)));
+                match first_plain {
+                    Some(SiteSettingEntry::Plain(s)) => s.clone(),
+                    _ => return None,
                 }
             }
         };
         let resolved = self.interpolate(&pattern);
-        Regex::new(&resolved).ok()
+        RegexBuilder::new(&resolved)
+            .dot_matches_new_line(true)
+            .multi_line(true)
+            .build()
+            .ok()
     }
 
     fn compile_url_patterns(&self) -> Vec<Regex> {
@@ -281,6 +290,7 @@ impl SiteSetting {
             ("scheme", self.scheme.as_str()),
             ("domain", self.domain.as_str()),
             ("top_url", &top_url_resolved),
+            ("toc_url", self.toc_url.as_str()),
         ]
         .into_iter()
         .collect();
@@ -493,6 +503,7 @@ impl SiteSetting {
             let resolved = self.interpolate_with_captures(pattern, prev_captures);
             let re = RegexBuilder::new(&resolved)
                 .dot_matches_new_line(true)
+                .multi_line(true)
                 .build();
             if let Ok(re) = re {
                 if let Some(caps) = re.captures(source) {
@@ -511,6 +522,17 @@ impl SiteSetting {
             }
         }
         None
+    }
+
+    pub fn interpolate_subtitles_href(
+        &self,
+        template: &str,
+        index: &str,
+        url_captures: &HashMap<String, String>,
+    ) -> String {
+        let mut vars = url_captures.clone();
+        vars.insert("index".to_string(), index.to_string());
+        self.interpolate_with_captures(template, &vars)
     }
 
     pub fn interpolate_with_captures(
