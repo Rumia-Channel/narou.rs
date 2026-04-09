@@ -245,7 +245,7 @@ impl Default for NovelSettings {
             kanji_num_with_units_lower_digit_zero: 3,
             enable_alphabet_force_zenkaku: false,
             disable_alphabet_word_to_zenkaku: false,
-            enable_half_indent_bracket: true,
+            enable_half_indent_bracket: false,
             enable_auto_indent: true,
             enable_force_indent: false,
             enable_auto_join_in_brackets: true,

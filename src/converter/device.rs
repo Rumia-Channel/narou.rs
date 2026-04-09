@@ -63,10 +63,17 @@ impl OutputManager {
         }
 
         if cfg!(windows) {
-            let candidates = [
+            let mut candidates = vec![
                 format!("C:\\Tools\\{}\\{}.bat", name, name),
                 format!("C:\\Tools\\{}\\{}", name, name),
             ];
+            if name.eq_ignore_ascii_case("AozoraEpub3") {
+                candidates.extend([
+                    "C:\\Users\\rumia\\Documents\\AozoraEpub3\\AozoraEpub3.jar".to_string(),
+                    "C:\\Users\\rumia\\Documents\\AozoraEpub3\\AozoraEpub3.exe".to_string(),
+                    "C:\\Users\\rumia\\Documents\\AozoraEpub3\\AozoraEpub3.bat".to_string(),
+                ]);
+            }
             for candidate in &candidates {
                 let p = PathBuf::from(candidate);
                 if p.exists() {
@@ -78,6 +85,71 @@ impl OutputManager {
         None
     }
 
+    fn build_aozora_command(&self) -> Result<(Command, PathBuf)> {
+        let tool_path = self
+            .aozora_epub3_path
+            .as_ref()
+            .ok_or_else(|| NarouError::Conversion("AozoraEpub3 not found".into()))?;
+
+        let working_dir = tool_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let mut cmd = if tool_path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
+            let java_path =
+                Self::find_external_tool("java").unwrap_or_else(|| PathBuf::from("java"));
+            let mut cmd = Command::new(java_path);
+            cmd.arg("-cp").arg(tool_path);
+            cmd.arg("AozoraEpub3");
+            cmd
+        } else {
+            Command::new(tool_path)
+        };
+
+        cmd.current_dir(&working_dir);
+        Ok((cmd, working_dir))
+    }
+
+    fn run_aozora_epub3(
+        &self,
+        input_txt: &Path,
+        output_dir: &Path,
+        output_ext: &str,
+    ) -> Result<PathBuf> {
+        let (mut cmd, _) = self.build_aozora_command()?;
+        let base_name = input_txt
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| NarouError::Conversion("Invalid input filename".into()))?;
+        let output_path = output_dir.join(format!("{}{}", base_name, output_ext));
+
+        cmd.arg("-d").arg(output_dir);
+        cmd.arg("-ext").arg(output_ext);
+        cmd.arg("-of");
+        cmd.arg(input_txt);
+
+        let status = cmd
+            .status()
+            .map_err(|e| NarouError::Conversion(format!("Failed to run AozoraEpub3: {}", e)))?;
+
+        if !status.success() {
+            return Err(NarouError::Conversion(format!(
+                "AozoraEpub3 exited with status: {}",
+                status
+            )));
+        }
+
+        if !output_path.exists() {
+            return Err(NarouError::Conversion(format!(
+                "AozoraEpub3 did not create expected output: {}",
+                output_path.display()
+            )));
+        }
+
+        Ok(output_path)
+    }
+
     pub fn convert_file(
         &self,
         input_txt: &Path,
@@ -85,61 +157,20 @@ impl OutputManager {
         base_name: &str,
     ) -> Result<PathBuf> {
         match self.device {
-            Device::Text => {
-                let output = output_dir.join(format!("{}{}", base_name, self.device.extension()));
-                std::fs::copy(input_txt, &output)?;
-                Ok(output)
-            }
-            Device::Epub | Device::Kobo => {
-                let tool_path = self
-                    .aozora_epub3_path
-                    .as_ref()
-                    .ok_or_else(|| NarouError::Conversion("AozoraEpub3 not found".into()))?;
-                let epub_output =
-                    output_dir.join(format!("{}{}", base_name, self.device.extension()));
-
-                let mut cmd = Command::new(tool_path);
-                cmd.arg("-i").arg(input_txt);
-                cmd.arg("-o").arg(&epub_output);
-
-                if self.device == Device::Kobo {
-                    cmd.arg("--device").arg("kobo");
-                }
-
-                let status = cmd.status().map_err(|e| {
-                    NarouError::Conversion(format!("Failed to run AozoraEpub3: {}", e))
-                })?;
-
-                if !status.success() {
-                    return Err(NarouError::Conversion(format!(
-                        "AozoraEpub3 exited with status: {}",
-                        status
-                    )));
-                }
-
-                Ok(epub_output)
-            }
+            Device::Text => Ok(input_txt.to_path_buf()),
+            Device::Epub => self.run_aozora_epub3(input_txt, output_dir, ".epub"),
+            Device::Kobo => self.run_aozora_epub3(input_txt, output_dir, ".kepub.epub"),
             Device::Mobi => {
-                let aozora_path = self
-                    .aozora_epub3_path
-                    .as_ref()
-                    .ok_or_else(|| NarouError::Conversion("AozoraEpub3 not found".into()))?;
-                let epub_temp = output_dir.join(format!("{}_temp.epub", base_name));
-
-                let mut cmd = Command::new(aozora_path);
-                cmd.arg("-i").arg(input_txt);
-                cmd.arg("-o").arg(&epub_temp);
-
-                let status = cmd.status().map_err(|e| {
-                    NarouError::Conversion(format!("Failed to run AozoraEpub3: {}", e))
-                })?;
-
-                if !status.success() {
-                    return Err(NarouError::Conversion(format!(
-                        "AozoraEpub3 exited with status: {}",
-                        status
-                    )));
-                }
+                let temp_input = output_dir.join(format!("{}_mobi_source.txt", base_name));
+                std::fs::copy(input_txt, &temp_input)?;
+                let epub_temp = match self.run_aozora_epub3(&temp_input, output_dir, ".epub") {
+                    Ok(path) => path,
+                    Err(err) => {
+                        let _ = std::fs::remove_file(&temp_input);
+                        return Err(err);
+                    }
+                };
+                let _ = std::fs::remove_file(&temp_input);
 
                 let kindlegen_path = self
                     .kindlegen_path
@@ -149,8 +180,14 @@ impl OutputManager {
                     output_dir.join(format!("{}{}", base_name, self.device.extension()));
 
                 let mut cmd2 = Command::new(kindlegen_path);
+                cmd2.current_dir(output_dir);
                 cmd2.arg(&epub_temp);
-                cmd2.arg("-o").arg(&mobi_output);
+                cmd2.arg("-o").arg(
+                    mobi_output
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| NarouError::Conversion("Invalid output filename".into()))?,
+                );
 
                 let status2 = cmd2.status().map_err(|e| {
                     NarouError::Conversion(format!("Failed to run kindlegen: {}", e))

@@ -32,20 +32,21 @@ fn ruby_to_aozora(text: &str) -> String {
     result = result.replace('《', "\u{226A}").replace('》', "\u{226B}");
 
     let re = Regex::new(r"(?i)<ruby>(.+?)</ruby>").unwrap();
+    let rt_re = Regex::new(r"(?i)<rt>").unwrap();
+    let rp_re = Regex::new(r"(?i)<rp>").unwrap();
     result = re
         .replace_all(&result, |caps: &regex::Captures| {
             let inner = &caps[1];
-            let rt_re = Regex::new(r"(?i)<rt>").unwrap();
             let parts: Vec<&str> = rt_re.splitn(inner, 2).collect();
 
             if parts.len() < 2 {
-                return String::new();
+                return strip_tags(parts[0]);
             }
 
-            let base = strip_tags(parts[0]);
-            let ruby = strip_tags(parts[1]);
+            let base = strip_tags(rp_re.split(parts[0]).next().unwrap_or(parts[0]));
+            let ruby = strip_tags(rp_re.split(parts[1]).next().unwrap_or(parts[1]));
 
-            format!("\u{FF5C}{}\u{300C}{}\u{300D}", base, ruby)
+            format!("｜{}《{}》", base, ruby)
         })
         .to_string();
 
@@ -105,10 +106,10 @@ fn img_to_aozora(text: &str) -> String {
 
 fn em_to_sesame(text: &str) -> String {
     let re = Regex::new(r#"(?i)<em\s+class=["']emphasisDots["']\s*>(.+?)</em>"#).unwrap();
-    let text = re.replace_all(text, "\u{FF3B}\u{FF03}\u{65C1}\u{70B9}\u{FF3D}$1\u{FF3B}\u{FF03}\u{65C1}\u{70B9}\u{7D42}\u{308F}\u{308A}\u{FF3D}").to_string();
+    let text = re.replace_all(text, "\u{FF3B}\u{FF03}\u{508D}\u{70B9}\u{FF3D}$1\u{FF3B}\u{FF03}\u{508D}\u{70B9}\u{7D42}\u{308F}\u{308A}\u{FF3D}").to_string();
 
     let re2 = Regex::new(r"(?i)<em[^>]*>(.+?)</em>").unwrap();
-    re2.replace_all(&text, "\u{FF3B}\u{FF03}\u{65C1}\u{70B9}\u{FF3D}$1\u{FF3B}\u{FF03}\u{65C1}\u{70B9}\u{7D42}\u{308F}\u{308A}\u{FF3D}")
+    re2.replace_all(&text, "\u{FF3B}\u{FF03}\u{508D}\u{70B9}\u{FF3D}$1\u{FF3B}\u{FF03}\u{508D}\u{70B9}\u{7D42}\u{308F}\u{308A}\u{FF3D}")
         .to_string()
 }
 

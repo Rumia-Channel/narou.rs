@@ -14,6 +14,7 @@ use tower_http::cors::CorsLayer;
 use crate::db::with_database;
 use crate::db::with_database_mut;
 use crate::error::NarouError;
+use crate::queue::{JobType, PersistentQueue};
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -64,7 +65,7 @@ pub struct ApiResponse {
     pub message: String,
 }
 
-pub fn create_router() -> Router {
+pub fn create_router(port: u16) -> Router {
     let push_server = Arc::new(push::PushServer::new());
 
     Router::new()
@@ -99,7 +100,7 @@ pub fn create_router() -> Router {
         .route("/ws", get(push::ws_handler_with_app_state))
         .layer(CorsLayer::permissive())
         .with_state(AppState {
-            port: 3000,
+            port,
             push_server,
         })
 }
@@ -610,15 +611,44 @@ async fn api_download(
     Json(body): Json<DownloadBody>,
 ) -> Json<serde_json::Value> {
     let targets = body.targets;
+    let queue = match open_queue() {
+        Ok(queue) => queue,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+                "results": []
+            })
+            .into();
+        }
+    };
+    let jobs: Vec<(JobType, String)> = targets
+        .iter()
+        .cloned()
+        .map(|target| (JobType::Download, target))
+        .collect();
+    let ids = match queue.push_batch(&jobs) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return serde_json::json!({
+                "success": false,
+                "message": e.to_string(),
+                "results": []
+            })
+            .into();
+        }
+    };
+
     let results: Vec<serde_json::Value> = targets
         .iter()
-        .map(|target| {
-            state.push_server.broadcast_download_start(target);
-            serde_json::json!({ "target": target, "status": "queued" })
+        .zip(ids.iter())
+        .map(|(target, job_id)| {
+            state.push_server.broadcast("download_queued", target);
+            serde_json::json!({ "target": target, "job_id": job_id, "status": "queued" })
         })
         .collect();
 
-    serde_json::json!({ "results": results }).into()
+    serde_json::json!({ "success": true, "results": results }).into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -639,10 +669,43 @@ async fn api_update(
         Vec::new()
     };
 
+    let queue = match open_queue() {
+        Ok(queue) => queue,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+                "count": 0
+            })
+            .into();
+        }
+    };
+    let jobs: Vec<(JobType, String)> = ids
+        .iter()
+        .map(|id| (JobType::Update, id.to_string()))
+        .collect();
+    let job_ids = match queue.push_batch(&jobs) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return serde_json::json!({
+                "success": false,
+                "message": e.to_string(),
+                "count": 0
+            })
+            .into();
+        }
+    };
+
     state
         .push_server
-        .broadcast("update_start", &format!("{} novels", ids.len()));
-    serde_json::json!({ "status": "queued", "count": ids.len() }).into()
+        .broadcast("update_queued", &format!("{} novels", ids.len()));
+    serde_json::json!({
+        "success": true,
+        "status": "queued",
+        "count": ids.len(),
+        "job_ids": job_ids
+    })
+    .into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -656,16 +719,50 @@ async fn api_convert(
     Json(body): Json<ConvertBody>,
 ) -> Json<serde_json::Value> {
     let device = body.device.unwrap_or_else(|| "text".to_string());
+    let queue = match open_queue() {
+        Ok(queue) => queue,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+                "results": []
+            })
+            .into();
+        }
+    };
+    let jobs: Vec<(JobType, String)> = body
+        .targets
+        .iter()
+        .map(|target| (JobType::Convert, format!("{}\t{}", target, device)))
+        .collect();
+    let ids = match queue.push_batch(&jobs) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return serde_json::json!({
+                "success": false,
+                "message": e.to_string(),
+                "results": []
+            })
+            .into();
+        }
+    };
+
     let results: Vec<serde_json::Value> = body
         .targets
         .iter()
-        .map(|target| {
-            state.push_server.broadcast_convert_start(target);
-            serde_json::json!({ "target": target, "device": device, "status": "queued" })
+        .zip(ids.iter())
+        .map(|(target, job_id)| {
+            state.push_server.broadcast("convert_queued", target);
+            serde_json::json!({
+                "target": target,
+                "device": device,
+                "job_id": job_id,
+                "status": "queued"
+            })
         })
         .collect();
 
-    serde_json::json!({ "results": results }).into()
+    serde_json::json!({ "success": true, "results": results }).into()
 }
 
 async fn get_settings(
@@ -785,10 +882,17 @@ async fn list_devices(State(_state): State<AppState>) -> Json<serde_json::Value>
 }
 
 async fn queue_status(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let queue = crate::queue::PersistentQueue::with_default().unwrap_or_else(|_| {
-        let path = std::path::PathBuf::from(".narou").join("queue.yaml");
-        crate::queue::PersistentQueue::new(&path).unwrap()
-    });
+    let queue = match open_queue() {
+        Ok(queue) => queue,
+        Err(message) => {
+            return Json(serde_json::json!({
+                "pending": 0,
+                "completed": 0,
+                "failed": 0,
+                "error": message,
+            }));
+        }
+    };
 
     Json(serde_json::json!({
         "pending": queue.pending_count(),
@@ -798,7 +902,7 @@ async fn queue_status(State(_state): State<AppState>) -> Json<serde_json::Value>
 }
 
 async fn queue_clear(State(_state): State<AppState>) -> Json<ApiResponse> {
-    let result = crate::queue::PersistentQueue::with_default().and_then(|q| q.clear());
+    let result = open_queue().and_then(|q| q.clear().map_err(|e| e.to_string()));
 
     match result {
         Ok(_) => Json(ApiResponse {
@@ -810,6 +914,15 @@ async fn queue_clear(State(_state): State<AppState>) -> Json<ApiResponse> {
             message: e.to_string(),
         }),
     }
+}
+
+fn open_queue() -> Result<PersistentQueue, String> {
+    PersistentQueue::with_default()
+        .or_else(|_| {
+            let path = std::path::PathBuf::from(".narou").join("queue.yaml");
+            PersistentQueue::new(&path)
+        })
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Deserialize)]

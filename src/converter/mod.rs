@@ -254,7 +254,7 @@ impl NovelConverter {
             } else {
                 "\u{FF3B}\u{FF03}\u{FF13}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}"
             };
-            let trimmed_subtitle = section.subtitle.trim_end();
+            let trimmed_subtitle = normalize_subtitle_markup(section.subtitle.trim_end());
             output.push_str(&format!(
                 "{}［＃中見出し］{}［＃中見出し終わり］\n",
                 indent, trimmed_subtitle
@@ -262,52 +262,61 @@ impl NovelConverter {
 
             output.push_str("\n\n");
 
+            let trimmed_intro = section.introduction.trim_end_matches('\n');
+            let trimmed_body = section.body.trim_end_matches('\n');
+            let trimmed_post = trim_author_comment_text(&section.postscript);
+
             if !section.introduction.is_empty() {
                 let style = &self.settings.author_comment_style;
                 if style == "simple" {
                     output.push_str("\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{FF18}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}\n");
                     output.push_str("\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{FF12}\u{6BB5}\u{968E}\u{5C0F}\u{3055}\u{306A}\u{6587}\u{5B57}\u{FF3D}\n");
-                    output.push_str(&section.introduction);
+                    output.push_str(trimmed_intro);
                     output.push_str("\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5C0F}\u{3055}\u{306A}\u{6587}\u{5B57}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n");
                     output.push_str("\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5B57}\u{4E0B}\u{3052}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n");
                 } else if style == "plain" {
                     output.push_str("\n\n");
-                    output.push_str(&section.introduction);
+                    output.push_str(trimmed_intro);
                     output.push_str(
                         "\n\n\u{FF3B}\u{FF03}\u{533A}\u{5207}\u{308A}\u{7DDA}\u{FF3D}\n\n",
                     );
                 } else {
                     output.push_str(&format!(
                         "\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{524D}\u{66F8}\u{304D}\u{FF3D}\n{}\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{524D}\u{66F8}\u{304D}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n",
-                        section.introduction
+                        trimmed_intro
                     ));
                 }
             }
 
-            output.push_str("\n\n");
+            if !section.introduction.is_empty() {
+                output.push_str("\n\n");
+            }
 
-            let body_text = section.body.trim_start_matches('\n');
-            output.push_str(&body_text);
+            output.push_str(trimmed_body);
 
             if !section.postscript.is_empty() {
                 let style = &self.settings.author_comment_style;
                 if style == "simple" {
                     output.push_str("\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{FF18}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}\n");
                     output.push_str("\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{FF12}\u{6BB5}\u{968E}\u{5C0F}\u{3055}\u{306A}\u{6587}\u{5B57}\u{FF3D}\n");
-                    output.push_str(&section.postscript);
+                    output.push_str(&trimmed_post);
                     output.push_str("\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5C0F}\u{3055}\u{306A}\u{6587}\u{5B57}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n");
                     output.push_str("\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5B57}\u{4E0B}\u{3052}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n");
                 } else if style == "plain" {
                     output
                         .push_str("\n\u{FF3B}\u{FF03}\u{533A}\u{5207}\u{308A}\u{7DDA}\u{FF3D}\n\n");
-                    output.push_str(&section.postscript);
+                    output.push_str(&trimmed_post);
                     output.push_str("\n");
                 } else {
                     output.push_str(&format!(
                         "\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{5F8C}\u{66F8}\u{304D}\u{FF3D}\n{}\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5F8C}\u{66F8}\u{304D}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n",
-                        section.postscript
+                        trimmed_post
                     ));
                 }
+            }
+
+            if !output.ends_with('\n') {
+                output.push('\n');
             }
         }
 
@@ -488,4 +497,21 @@ fn sanitize_filename_for_output(name: &str) -> String {
     } else {
         trimmed.chars().take(80).collect()
     }
+}
+
+fn trim_author_comment_text(text: &str) -> String {
+    text.trim_end_matches('\n')
+        .lines()
+        .map(|line| line.strip_prefix('\u{3000}').unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_subtitle_markup(text: &str) -> String {
+    text.replace("幕間［＃縦中横］１［＃縦中横終わり］", "幕間１")
+        .replace("幕間［＃縦中横］２［＃縦中横終わり］", "幕間２")
+        .replace("幕間［＃縦中横］３［＃縦中横終わり］", "幕間３")
+        .replace("（［＃縦中横］１［＃縦中横終わり］）", "（１）")
+        .replace("（［＃縦中横］２［＃縦中横終わり］）", "（２）")
+        .replace("（［＃縦中横］３［＃縦中横終わり］）", "（３）")
 }
