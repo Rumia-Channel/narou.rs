@@ -16,12 +16,14 @@ use user_converter::UserConverter;
 
 use crate::downloader::{SectionElement, SectionFile, TocObject};
 use crate::error::{NarouError, Result};
+use crate::progress::ProgressReporter;
 
 pub struct NovelConverter {
     settings: NovelSettings,
     user_converter: Option<UserConverter>,
     section_cache: HashMap<String, CacheEntry>,
     cache_dirty: bool,
+    progress: Option<Box<dyn ProgressReporter>>,
 }
 
 struct CacheEntry {
@@ -36,6 +38,7 @@ impl NovelConverter {
             user_converter: None,
             section_cache: HashMap::new(),
             cache_dirty: false,
+            progress: None,
         }
     }
 
@@ -45,7 +48,12 @@ impl NovelConverter {
             user_converter: Some(user_converter),
             section_cache: HashMap::new(),
             cache_dirty: false,
+            progress: None,
         }
+    }
+
+    pub fn set_progress(&mut self, progress: Box<dyn ProgressReporter>) {
+        self.progress = Some(progress);
     }
 
     pub fn convert_novel(&mut self, toc: &TocObject, sections: &[SectionFile]) -> Result<String> {
@@ -59,12 +67,28 @@ impl NovelConverter {
         }
 
         let mut converted_sections = Vec::new();
+        let total = sections.len() as u64;
+
+        if let Some(ref p) = self.progress {
+            p.set_length(total);
+            p.set_message(&format!("Convert {}", toc.title));
+        }
 
         for (i, section) in sections.iter().enumerate() {
+            if let Some(ref p) = self.progress {
+                p.set_message(&format!(
+                    "Convert {} [{}/{}]",
+                    toc.title, i + 1, sections.len()
+                ));
+            }
+
             let digest = self.compute_digest(&section.element, i);
 
             if let Some(cached) = self.section_cache.get(&digest) {
                 converted_sections.push(cached.converted_section.clone());
+                if let Some(ref p) = self.progress {
+                    p.inc(1);
+                }
                 continue;
             }
 
@@ -162,6 +186,16 @@ impl NovelConverter {
             self.cache_dirty = true;
 
             converted_sections.push(cs);
+            if let Some(ref p) = self.progress {
+                p.inc(1);
+            }
+        }
+
+        if let Some(ref p) = self.progress {
+            p.finish_with_message(&format!(
+                "Convert {} done ({} sections)",
+                toc.title, sections.len()
+            ));
         }
 
         Ok(render::render_novel_text(

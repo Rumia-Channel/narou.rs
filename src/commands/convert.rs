@@ -1,6 +1,7 @@
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
 use narou_rs::converter::NovelConverter;
+use narou_rs::progress::CliProgress;
 
 use super::resolve_target_to_id;
 
@@ -10,11 +11,12 @@ pub fn cmd_convert(targets: &[String]) {
         std::process::exit(1);
     }
 
-    for target in targets {
-        println!("Converting: {}", target);
+    let multi = CliProgress::multi();
+    let multi_clone = multi.clone();
 
+    for target in targets {
         let Some(id) = resolve_target_to_id(target) else {
-            eprintln!("  Not found: {}", target);
+            let _ = multi_clone.println(&format!("  Not found: {}", target));
             continue;
         };
 
@@ -31,10 +33,15 @@ pub fn cmd_convert(targets: &[String]) {
         }) {
             Ok(data) => data,
             Err(e) => {
-                eprintln!("  Error: {}", e);
+                let _ = multi_clone.println(&format!("  Error: {}", e));
                 continue;
             }
         };
+
+        let progress = CliProgress::with_multi(
+            &format!("Convert {}", title),
+            multi_clone.clone(),
+        );
 
         let settings = NovelSettings::load_for_novel(id, &title, &author, &novel_dir);
         let mut converter =
@@ -43,14 +50,17 @@ pub fn cmd_convert(targets: &[String]) {
             } else {
                 NovelConverter::new(settings)
             };
+        converter.set_progress(Box::new(progress));
 
         match converter.convert_novel_by_id(id, &novel_dir) {
             Ok(output_path) => {
-                println!("  Output: {}", output_path);
+                let _ = multi_clone.println(&format!("  Output: {}", output_path));
             }
             Err(e) => {
-                eprintln!("  Error: {}", e);
+                let _ = multi_clone.println(&format!("  Error: {}", e));
             }
         }
     }
+
+    drop(multi);
 }

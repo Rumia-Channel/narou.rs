@@ -20,6 +20,7 @@ use chrono::Utc;
 use crate::db::DATABASE;
 use crate::db::novel_record::NovelRecord;
 use crate::error::{NarouError, Result};
+use crate::progress::ProgressReporter;
 
 use self::fetch::HttpFetcher;
 use self::narou_api::narou_api_batch_update;
@@ -45,6 +46,7 @@ pub struct Downloader {
     fetcher: HttpFetcher,
     site_settings: Vec<SiteSetting>,
     section_cache: SectionCache,
+    progress: Option<Box<dyn ProgressReporter>>,
 }
 
 impl Downloader {
@@ -68,6 +70,7 @@ impl Downloader {
             fetcher,
             site_settings,
             section_cache: SectionCache::new(),
+            progress: None,
         })
     }
 
@@ -352,8 +355,20 @@ impl Downloader {
             .unwrap_or_default();
 
         let mut updated_count = 0usize;
+        let total = subtitles.len() as u64;
         let mut final_subtitles = Vec::with_capacity(subtitles.len());
+
+        if let Some(ref p) = self.progress {
+            p.set_length(total);
+            p.set_message(&format!("DL {}", title));
+        }
+
         for subtitle in &subtitles {
+            if let Some(ref p) = self.progress {
+                p.set_message(&format!("DL {} [{}/{}]",
+                    title, final_subtitles.len() + 1, subtitles.len()));
+            }
+
             let needs_download = match old_subtitles.get(&subtitle.index) {
                 Some(old) => {
                     subtitle.subtitle != old.subtitle
@@ -379,6 +394,17 @@ impl Downloader {
             let mut sub = subtitle.clone();
             sub.download_time = download_time;
             final_subtitles.push(sub);
+
+            if let Some(ref p) = self.progress {
+                p.inc(1);
+            }
+        }
+
+        if let Some(ref p) = self.progress {
+            p.finish_with_message(&format!(
+                "DL {} done ({}/{})",
+                title, updated_count, subtitles.len()
+            ));
         }
 
         let toc_file = TocFile {
@@ -637,6 +663,10 @@ impl Downloader {
                 .unwrap_or(false))
         })
         .unwrap_or(false)
+    }
+
+    pub fn set_progress(&mut self, progress: Box<dyn ProgressReporter>) {
+        self.progress = Some(progress);
     }
 
     pub fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
