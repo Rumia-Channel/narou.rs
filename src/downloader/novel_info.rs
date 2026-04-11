@@ -52,7 +52,7 @@ impl NovelInfo {
                 return Ok(info);
             }
             let mut body = response.text()?;
-            crate::downloader::pretreatment_source(&mut body, setting.encoding());
+            crate::downloader::pretreatment_source(&mut body, setting.encoding(), Some(setting));
 
             let keys = [
                 "t", "w", "s", "nt", "ga", "gf", "nu", "gl", "l", "tags", "sitename",

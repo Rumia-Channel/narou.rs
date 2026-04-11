@@ -1,0 +1,110 @@
+// narou preprocess DSL grammar — Ruby-inspired safe subset
+// Used in webnovel/*.yaml "preprocess" field
+
+WHITESPACE = _{ " " | "\t" }
+COMMENT     = _{ "#" ~ (!"\n" ~ ANY)* }
+
+program = { SOI ~ (stmt ~ TERM)* ~ stmt? ~ EOI }
+
+TERM = _{ "\n" | "\r\n" }
+
+stmt = {
+    guard_stmt
+    | let_stmt
+    | set_stmt
+    | if_stmt
+    | for_stmt
+    | emit_stmt
+    | insert_stmt
+}
+
+guard_stmt  = { "guard" ~ string }
+let_stmt    = { "let" ~ ident ~ "=" ~ expr }
+set_stmt    = { "set" ~ lvalue ~ "=" ~ expr }
+emit_stmt   = { "emit" ~ expr }
+insert_stmt = { "insert_at_match" }
+
+if_stmt = {
+    "if" ~ expr ~ TERM+
+    ~ stmts
+    ~ (TERM* ~ "else" ~ TERM+ ~ stmts)?
+    ~ TERM* ~ "end"
+}
+
+for_stmt = {
+    "for" ~ ident ~ "in" ~ expr ~ TERM+
+    ~ stmts
+    ~ TERM* ~ "end"
+}
+
+stmts = { (stmt ~ TERM*)* }
+
+// ---------- l-value ----------
+lvalue      = { ident ~ bracket_key* }
+bracket_key = { "[" ~ string ~ "]" }
+
+// ---------- expressions ----------
+expr       = _{ or_expr }
+or_expr    = { and_expr ~ ("||" ~ and_expr)* }
+and_expr   = { unary_expr ~ ("&&" ~ unary_expr)* }
+unary_expr = { "!" ~ unary_expr | cmp_expr }
+cmp_expr   = { primary ~ (("==" | "!=") ~ primary)? }
+
+primary = _{
+    string
+    | extract_json_expr
+    | chain_expr
+    | array_literal
+    | null_lit
+    | "(" ~ expr ~ ")"
+}
+
+// --- JSON extraction ---
+extract_json_expr = { "extract_json" ~ "(" ~ regex ~ ")" }
+
+// --- accessor + method chain ---
+chain_expr = { accessor ~ method* }
+
+accessor     = { ident ~ access_part* }
+access_part  = _{ dot_access | bracket_access }
+dot_access   = { "." ~ ident }
+bracket_access = { "[" ~ bracket_inner ~ "]" }
+bracket_inner  = _{ string | accessor }
+
+method = _{
+    ".map" ~ block
+    | ".flat_map" ~ block
+    | ".flatten"
+    | ".compact"
+    | ".join" ~ "(" ~ string ~ ")"
+    | ".gsub" ~ "(" ~ string ~ "," ~ string ~ ")"
+    | ".replace" ~ "(" ~ string ~ "," ~ string ~ ")"
+    | ".is_array"
+    | ".empty"
+}
+
+block = { "{" ~ "|" ~ ident ~ "|" ~ expr ~ "}" }
+
+// ---------- strings ----------
+string   = _{ i_string | r_string }
+i_string = { "\"" ~ i_part* ~ "\"" }
+i_part   = _{ interp | i_text }
+interp   = { "${" ~ accessor ~ "}" }
+i_text   = @{ (!(("\"") | ("${")) ~ ANY)+ }
+
+r_string = { "'" ~ r_text ~ "'" }
+r_text   = @{ (!"'" ~ ANY)* }
+
+// ---------- regex ----------
+regex       = { "/" ~ regex_body ~ "/" ~ regex_flags? }
+regex_body  = @{ (!"/" ~ ANY)+ }
+regex_flags = @{ ("s" | "m" | "i")* }
+
+// ---------- literals ----------
+array_literal = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
+null_lit      = { "null" }
+
+// ---------- identifier ----------
+ident = @{
+    (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")*
+}

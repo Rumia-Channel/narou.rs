@@ -4,6 +4,9 @@
 - Rust internals, libraries, data structures, and algorithms may differ from Ruby, but externally visible behavior must match narou.rb as much as possible.
 - Compatibility targets include CLI/API arguments and behavior, YAML syntax handling (`webnovel/*.yaml`, `converter.yaml`, etc.), `.narou/` inventory file reads/writes, output directory structure, and generated text files.
 - User-initialized `webnovel/*.yaml` under the working narou root must be preferred over bundled YAML, allowing users to freely modify site definitions like narou.rb. Bundled `webnovel/*.yaml` is a fallback/source for initial copies.
+- Site-specific download preprocessing and extraction must be YAML-driven wherever narou.rb expresses it through `webnovel/*.yaml`. Rust code may use different internals, but users must be able to update the initialized root's `webnovel/*.yaml` to change site behavior.
+- Current caveat as of 2026-04: `src/downloader/mod.rs::kakuyomu_preprocess` is a temporary Rust hardcode that expands Kakuyomu JSON into intermediate `title::...` / `Episode;...` lines. This is not the desired final compatibility design. The recent `tableOfContentsV2` handling fixes the immediate download failure, but it should be treated as a bridge until the Kakuyomu preprocessing semantics are moved back under YAML-driven control.
+- Handoff priority: implement a safe Rust-side interpretation model for YAML-defined preprocessing (`code: eval:`-like behavior) so bundled and user-edited `webnovel/kakuyomu.jp.yaml` can control the JSON-to-intermediate-text transform without adding more site-specific Rust branches.
 - `narou init` should follow narou.rb reference behavior:
   - create `.narou/` and `小説データ/` for a new root;
   - create/copy a user-editable `webnovel/` directory;

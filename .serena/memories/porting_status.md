@@ -53,6 +53,13 @@
 5. subtitle の `［＃縦中横］` ノイズを正規化
 6. 最後の残件だった `｜東雲さん《 ・ ・ ・ ・ 》` を、無効な明示ルビ spacing として gaiji 表現へ変換
 
+## YAML駆動化 (2026-04-11 完了)
+- pest-based DSL parser 実装 (`src/downloader/preprocess.pest`, `src/downloader/preprocess.rs`)
+- `kakuyomu.jp.yaml` の `code: eval:` (Ruby) を `preprocess: |-` (DSL) に移行
+- `kakuyomu_preprocess()` ハードコード + `eval_kakuyomu()` を削除
+- `pretreatment_source()` を generic preprocessor 経由に変更
+- 回帰テスト: 25,273/25,273 行 差分0 (完全一致)
+
 ## 次にやること（優先順位）
 
 ### P1: 変換互換の固定化

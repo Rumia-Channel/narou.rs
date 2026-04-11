@@ -25,3 +25,5 @@ parking_lot = "0.12"
 dashmap = "6"
 tower-http = { version = "0.6", features = ["cors"] }
 futures = "0.3"
+pest = "2.8.6"
+pest_derive = "2.8.6"

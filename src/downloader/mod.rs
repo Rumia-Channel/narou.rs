@@ -1,6 +1,7 @@
 pub mod html;
 pub mod info_cache;
 pub mod novel_info;
+pub mod preprocess;
 pub mod rate_limit;
 pub mod site_setting;
 
@@ -290,7 +291,7 @@ impl Downloader {
         }
 
         let mut body = response.text()?;
-        pretreatment_source(&mut body, setting.encoding());
+        pretreatment_source(&mut body, setting.encoding(), Some(setting));
 
         if let Some(error_pattern) = setting.error_message() {
             if let Ok(re) = regex::Regex::new(error_pattern) {
@@ -406,7 +407,7 @@ impl Downloader {
         }
 
         let mut html_source = response.text()?;
-        pretreatment_source(&mut html_source, setting.encoding());
+        pretreatment_source(&mut html_source, setting.encoding(), Some(setting));
 
         let mut element = SectionElement {
             data_type: "html".to_string(),
@@ -1031,7 +1032,7 @@ impl Downloader {
                 break;
             }
             let mut body = response.text()?;
-            pretreatment_source(&mut body, setting.encoding());
+            pretreatment_source(&mut body, setting.encoding(), Some(setting));
             toc_source = Box::leak(body.into_boxed_str());
         }
 
@@ -1235,206 +1236,14 @@ fn compile_html_pattern(pattern: &str) -> std::result::Result<regex::Regex, rege
         .build()
 }
 
-fn kakuyomu_preprocess(src: &mut String) {
-    let magic = "KakuyomuPreprocessEvalMagicWord";
-    if src.contains(magic) {
-        return;
-    }
-    let re = match regex::Regex::new(
-        r#"(?s)<script id="__NEXT_DATA__" type="application/json">(.+?)</script>"#,
-    ) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    let caps = match re.captures(src) {
-        Some(c) => c,
-        None => return,
-    };
-    let json_str = match caps.get(1) {
-        Some(m) => m.as_str(),
-        None => return,
-    };
-    let root: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    let state = match root
-        .get("props")
-        .and_then(|p| p.get("pageProps"))
-        .and_then(|p| p.get("__APOLLO_STATE__"))
-    {
-        Some(v) => v,
-        None => return,
-    };
-
-    let work_id = match root.get("query").and_then(|q| q.get("workId")) {
-        Some(v) => match v.as_str() {
-            Some(s) => s.to_string(),
-            None => return,
-        },
-        None => return,
-    };
-
-    let work_key = format!("Work:{}", work_id);
-    let work = match state.get(&work_key) {
-        Some(v) => v,
-        None => return,
-    };
-
-    let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("<!---"));
-    lines.push(magic.to_string());
-
-    let title = work.get("title").and_then(|v| v.as_str()).unwrap_or("");
-    lines.push(format!("title::{}", title));
-
-    let author = work
-        .get("author")
-        .and_then(|a| a.get("__ref"))
-        .and_then(|r| r.as_str())
-        .and_then(|r| state.get(r))
-        .and_then(|a| a.get("activityName"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let alt_author = work
-        .get("alternateAuthorName")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let author_line = if !alt_author.is_empty() {
-        format!("author::{}／{}", alt_author, author)
-    } else {
-        format!("author::{}", author)
-    };
-    lines.push(author_line);
-
-    let intro = work
-        .get("introduction")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .replace('\n', "<br>");
-    lines.push(format!("introduction::{}", intro));
-
-    let serial_status = work
-        .get("serialStatus")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    lines.push(format!("serialStatus::{}", serial_status));
-
-    let pub_count = work
-        .get("publicEpisodeCount")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    lines.push(format!("publicEpisodeCount::{}", pub_count));
-
-    let published_at = work
-        .get("publishedAt")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    lines.push(format!("publishedAt::{}", published_at));
-
-    let edited_at = work.get("editedAt").and_then(|v| v.as_str()).unwrap_or("");
-    lines.push(format!("editedAt::{}", edited_at));
-
-    let last_ep_pub = work
-        .get("lastEpisodePublishedAt")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    lines.push(format!("lastEpisodePublishedAt::{}", last_ep_pub));
-
-    let total_chars = work
-        .get("totalCharacterCount")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    lines.push(format!("totalCharacterCount::{}", total_chars));
-
-    if let Some(tags) = work.get("tagLabels").and_then(|v| v.as_array()) {
-        for tag in tags {
-            if let Some(t) = tag.as_str() {
-                lines.push(format!("tag::{}", t));
-            }
-        }
-    }
-
-    let toc = match work
-        .get("tableOfContents")
-        .or_else(|| work.get("tableOfContentsV2"))
-        .and_then(|v| v.as_array())
-    {
-        Some(arr) => arr.clone(),
-        None => return,
-    };
-
-    let mut toc_entries: Vec<String> = Vec::new();
-    for toc_item in &toc {
-        if let Some(toc_ref) = toc_item.get("__ref").and_then(|r| r.as_str()) {
-            let resolved = match state.get(toc_ref) {
-                Some(v) => v,
-                None => continue,
-            };
-            let chapter = resolved.get("chapter");
-            let episodes = resolved.get("episodeUnions");
-
-            if let Some(ch) = chapter {
-                if let Some(ch_ref) = ch.get("__ref").and_then(|r| r.as_str()) {
-                    let ch_resolved = match state.get(ch_ref) {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                    let level = ch_resolved
-                        .get("level")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(1);
-                    let ch_id = ch_resolved.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    let ch_title = ch_resolved
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    toc_entries.push(format!("Chapter;{};{};{}", level, ch_id, ch_title));
-                }
-            }
-
-            if let Some(ep_arr) = episodes.and_then(|v| v.as_array()) {
-                for ep in ep_arr {
-                    if let Some(ep_ref) = ep.get("__ref").and_then(|r| r.as_str()) {
-                        let ep_resolved = match state.get(ep_ref) {
-                            Some(v) => v,
-                            None => continue,
-                        };
-                        let ep_id = ep_resolved.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        let ep_pub = ep_resolved
-                            .get("publishedAt")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let ep_title = ep_resolved
-                            .get("title")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        toc_entries.push(format!("Episode;{};{};{}", ep_id, ep_pub, ep_title));
-                    }
-                }
-            }
-        }
-    }
-
-    for entry in &toc_entries {
-        lines.push(entry.clone());
-    }
-
-    lines.push(format!("--->"));
-
-    if let Some(pos) = caps.get(0) {
-        let insert_pos = pos.start();
-        let block = lines.join("\n");
-        src.insert_str(insert_pos, &block);
-    }
-}
-
-pub fn pretreatment_source(src: &mut String, encoding: &str) {
+pub fn pretreatment_source(src: &mut String, _encoding: &str, setting: Option<&SiteSetting>) {
     src.retain(|c| c != '\r');
     decode_numeric_entities(src);
-    kakuyomu_preprocess(src);
+    if let Some(setting) = setting {
+        if let Some(pipeline) = setting.preprocess_pipeline() {
+            preprocess::run_preprocess(pipeline, src);
+        }
+    }
 }
 
 fn decode_numeric_entities(src: &mut String) {

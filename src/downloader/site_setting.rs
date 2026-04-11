@@ -81,6 +81,12 @@ pub struct SiteSetting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<SiteSettingValue>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preprocess: Option<String>,
+
+    #[serde(skip)]
+    compiled_preprocess: Option<crate::downloader::preprocess::PreprocessPipeline>,
+
     #[serde(skip)]
     compiled_url: Vec<Regex>,
     #[serde(skip)]
@@ -151,22 +157,7 @@ where
 }
 
 impl SiteSetting {
-    fn eval_kakuyomu(&self, source: &str, eval_expr: &str) -> Option<String> {
-        let json_re =
-            regex::Regex::new(r"(?s)<script[^>]*>.*?window\.__NUXT__\s*=\s*(\{.*?\});\s*</script>")
-                .ok()?;
-        let caps = json_re.captures(source)?;
-        let json_str = caps.get(1)?.as_str();
 
-        let json_val: serde_json::Value = serde_json::from_str(json_str).ok()?;
-
-        let path_parts: Vec<&str> = eval_expr.split('.').collect();
-        let mut current = &json_val;
-        for part in &path_parts {
-            current = current.get(*part)?;
-        }
-        current.as_str().map(|s| s.to_string())
-    }
 
     pub fn load_all() -> Result<Vec<Self>> {
         let mut load_dirs = Vec::new();
@@ -190,6 +181,10 @@ impl SiteSetting {
     }
 
     fn compile(&mut self) {
+        if let Some(ref src) = self.preprocess {
+            self.compiled_preprocess =
+                crate::downloader::preprocess::PreprocessPipeline::compile(src).ok();
+        }
         self.compiled_url = self.compile_url_patterns();
         self.compiled_subtitles = self.subtitles.as_ref().and_then(|v| self.compile_value(v));
         self.compiled_body = self
@@ -391,6 +386,10 @@ impl SiteSetting {
         self.compiled_toc_page_max.as_ref()
     }
 
+    pub fn preprocess_pipeline(&self) -> Option<&crate::downloader::preprocess::PreprocessPipeline> {
+        self.compiled_preprocess.as_ref()
+    }
+
     pub fn resolve_info_pattern(&self, key: &str, source: &str) -> Option<String> {
         let value = match key {
             "t" => &self.t,
@@ -416,10 +415,7 @@ impl SiteSetting {
         for entry in &entries {
             let pattern = match entry {
                 SiteSettingEntry::Plain(s) => s.as_str(),
-                SiteSettingEntry::Eval { eval } => {
-                    if let Some(result) = self.eval_kakuyomu(source, eval) {
-                        return Some(result);
-                    }
+                SiteSettingEntry::Eval { .. } => {
                     continue;
                 }
             };
@@ -490,10 +486,7 @@ impl SiteSetting {
         for entry in &entries {
             let pattern = match entry {
                 SiteSettingEntry::Plain(s) => s.as_str(),
-                SiteSettingEntry::Eval { eval } => {
-                    if let Some(result) = self.eval_kakuyomu(source, eval) {
-                        return Some(result);
-                    }
+                SiteSettingEntry::Eval { .. } => {
                     continue;
                 }
             };
