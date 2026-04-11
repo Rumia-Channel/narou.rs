@@ -49,25 +49,78 @@ cargo check              # Type-check
 ## Project Structure
 ```
 src/
-  main.rs                          - CLI (clap subcommands: download, update, convert, list, etc.)
+  main.rs                          - CLI entry point (thin dispatcher, ~70行)
+  cli.rs                           - clap定義 (Cli struct + Commands enum)
   error.rs                         - NarouError enum + Result type
+  commands/
+    mod.rs                         - pub mod + resolve_target_to_id helper
+    init.rs                        - narou init (ディレクトリ作成, AozoraEpub3設定)
+    download.rs                    - narou download
+    update.rs                      - narou update
+    convert.rs                     - narou convert
+    web.rs                         - narou web (Axumサーバー起動)
+    manage.rs                      - narou list / tag / freeze / remove
   db/
-    mod.rs                         - Database (singleton, CRUD, sorting, tag index)
+    mod.rs                         - シングルトン (DATABASE static, init_database, with_database/mut)
+    database.rs                    - Database struct (CRUD, sort, tag index)
     novel_record.rs                - NovelRecord struct
     inventory.rs                   - Inventory (LRU cache, atomic write, Windows retry)
     index_store.rs                 - IndexStore (SHA256 fingerprint)
+    paths.rs                       - novel_dir_for_record, create_subdirectory_name
   downloader/
-    mod.rs                         - Downloader (full DL pipeline, SectionFile/SectionElement structs)
-    site_setting.rs                - SiteSetting (YAML, \k<name> interpolation, multi_match)
+    mod.rs                         - Downloader struct (DL pipeline orchestrator)
+    types.rs                       - SectionElement, SectionFile, TocObject, DownloadResult 等
+    fetch.rs                       - HttpFetcher (3-tier: curl crate → reqwest → wget)
+    toc.rs                         - fetch_toc, parse_subtitles, parse_subtitles_multipage
+    section.rs                     - download_section, parse_section_html, section cache
+    persistence.rs                 - save_section_file, save_raw_file, save_toc_file, ensure_default_files
+    narou_api.rs                   - narou_api_batch_update (なろうAPI一括更新)
+    util.rs                        - build_section_url, pretreatment_source, sanitize_filename 等
+    site_setting/
+      mod.rs                       - SiteSetting struct, accessor methods, compile, load_all, tests
+      interpolate.rs               - \k<name> テンプレートエンジン
+      info_extraction.rs           - resolve_info_pattern, multi_match, get_novel_type_from_string
+      loader.rs                    - load_all_from_dirs, load_settings_from_dir, merge_site_setting
+      serde_helpers.rs             - deserialize_yes_no_bool
+    preprocess/
+      mod.rs                       - PreprocessPipeline struct, run_preprocess
+      ast.rs                       - Stmt, Expr, StrPart, Accessor 等 (AST型定義)
+      parser.rs                    - PreprocessParser (pest grammar), parse_preprocess, build_*
+      interpreter.rs               - Ctx, eval_expr, eval_stmt, eval_method
+    novel_info.rs                  - NovelInfo (from_toc_source / from_novel_info_source)
     html.rs                        - to_aozora (HTML→青空文庫形式変換)
+    info_cache.rs                  - 小説情報キャッシュ
     rate_limit.rs                  - RateLimiter
+    preprocess.pest                - pest grammar file
   converter/
-    mod.rs                         - NovelConverter (convert_novel, render_novel_text, section cache)
-    converter_base.rs              - ConverterBase (Ruby準拠のテキスト変換パイプライン)
-    settings.rs                    - NovelSettings (44 items, replace.txt parser)
-    user_converter.rs              - converter.yaml 対応 (宣言的ユーザー定義コンバータ)
+    mod.rs                         - NovelConverter struct, convert_novel pipeline, cache
+    render.rs                      - render_novel_text (novel.txt.erb相当), ConvertedSection
+    output.rs                      - create_output_text_path/filename, extract_domain/ncode_like
+    ini.rs                         - IniData / IniValue (INI parser/serializer)
+    settings.rs                    - NovelSettings (44 items, INI overlay, replace.txt)
+    device.rs                      - OutputManager (端末別出力)
+    converter_base/
+      mod.rs                       - ConverterBase struct, TextType, convert pipeline orchestrator
+      character_conversion.rs      - 半角/全角変換, 数字→漢数字, TCY
+      indentation.rs               - auto_indent, half_indent_bracket, insert_separate_space
+      stash_rebuild.rs             - illust/URL/kome stash & rebuild
+      ruby.rs                      - narou_ruby, find_ruby_base (ルビ注記処理)
+      text_normalization.rs        - rstrip, ellipsis, page_break, dust_char, blank_line 等
+    user_converter/
+      mod.rs                       - UserConverter struct, load, apply_before/after, signature
+      setting_override.rs          - apply_setting_override (converter.yaml設定オーバーライド)
   web/
-    mod.rs                         - Axum API (30+ endpoints)
+    mod.rs                         - AppState, create_router (Axumルーター定義)
+    state.rs                       - ApiResponse, IdPath, ListParams 等 (DTO structs)
+    novels.rs                      - index, novels_count, api_list, get/remove/freeze/unfreeze
+    tags.rs                        - add_tag, remove_tag, update_tags
+    batch.rs                       - batch_tag/untag/freeze/unfreeze/remove
+    jobs.rs                        - api_download/update/convert, queue_status/clear
+    novel_settings.rs              - get_settings, save_settings, list_devices
+    misc.rs                        - version_current, tag_list, notepad_read/save, recent_logs
+    push.rs                        - PushServer, WebSocket, StreamingLogger
+  queue.rs                         - PersistentQueue (SQLite-backed job queue)
+  lib.rs                           - library root
 sample/
   novel/                           - テスト用CWD (.narou/ + webnovel/*.yaml)
   narou/                           - Ruby参照ソース (git submodule的な位置, .gitignore)
