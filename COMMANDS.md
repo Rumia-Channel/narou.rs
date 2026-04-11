@@ -1,0 +1,670 @@
+# narou.rs コマンド互換性ドキュメント
+
+narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状況・要件を整理する。
+
+---
+
+## 目次
+
+1. [グローバルオプション](#グローバルオプション)
+2. [コマンドショートカット](#コマンドショートカット)
+3. [実装状況サマリ](#実装状況サマリ)
+4. [各コマンドの詳細仕様](#各コマンドの詳細仕様)
+5. [実装優先度](#実装優先度)
+
+---
+
+## グローバルオプション
+
+全コマンドの前に処理される。`ARGV` から削除されてからコマンドに渡される。
+
+| オプション | 説明 | Rust 実装 |
+|-----------|------|:---------:|
+| `--no-color` | カラー表示を無効にする | ❌ |
+| `--multiple` | 引数区切りに `,` も使えるようにする | ❌ |
+| `--time` | 実行時間を表示する | ❌ |
+| `--backtrace` | エラー時に詳細バックトレースを表示 | ❌ |
+| `--user-agent <UA>` | カスタム User-Agent | ✅ |
+
+**補足**: `default_args.<command>` 設定でコマンドごとのデフォルト引数を `local_setting.yaml` に定義可能。CLIフラグがこれを上書きする。
+
+---
+
+## コマンドショートカット
+
+narou.rb はコマンド名の先頭1文字または2文字でコマンドを一意に特定できる。
+
+| 1文字 | 2文字 | コマンド |
+|:-----:|:-----:|---------|
+| `d` | `do` | download |
+| `u` | `up` | update |
+| `l` | `li` | list |
+| `c` | `co` | convert |
+| `di` | | diff |
+| `se` | | setting |
+| `al` | | alias |
+| `in` | | inspect |
+| `se` | | send (settingと衝突。`se`→settingが優先) |
+| `fo` | | folder |
+| `br` | | browser |
+| `r` | `re` | remove |
+| `f` | `fr` | freeze |
+| `t` | `ta` | tag |
+| `w` | `we` | web |
+| `ma` | | mail |
+| `ba` | | backup |
+| `cs` | | csv |
+| `cl` | | clean |
+| `lo` | | log |
+| `tr` | | trace |
+| `h` | `he` | help |
+| `v` | `ve` | version |
+| | | init (`i`はinspectが優先) |
+
+---
+
+## 実装状況サマリ
+
+| コマンド | narou.rb | Rust 完了度 | 備考 |
+|---------|:--------:|:-----------:|------|
+| `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
+| `download` | ✅ | 🟡 部分 | `--force`, `--no-convert`, `--freeze` 不足 |
+| `update` | ✅ | 🟡 部分 | `--gl`, `--convert-only-new-arrival` 不足 |
+| `convert` | ✅ | 🟡 部分 | `--device`, `--no-epub`, `--output` 等不足 |
+| `list` | ✅ | 🟡 部分 | `--latest`, `--reverse`, `--url`, `--filter` 等不足 |
+| `tag` | ✅ | 🟡 部分 | `--color`, `--clear`, `--list` 不足 |
+| `freeze` | ✅ | ✅ 完了 | `--list`, `--on` 不足だが基本機能あり |
+| `remove` | ✅ | 🟡 部分 | `--yes`, `--with-file` 不足 |
+| `web` | ✅ | 🟡 部分 | APIのみ。HTML UIなし |
+| `setting` | ✅ | ❌ 未実装 | |
+| `diff` | ✅ | ❌ 未実装 | |
+| `send` | ✅ | ❌ 未実装 | USB 経由端末送信 |
+| `mail` | ✅ | ❌ 未実装 | Send-to-Kindle 等 |
+| `backup` | ✅ | ❌ 未実装 | |
+| `clean` | ✅ | ❌ 未実装 | |
+| `help` | ✅ | ❌ 未実装 | clap `--help` のみ |
+| `version` | ✅ | ❌ 未実装 | clap `--version` のみ |
+| `log` | ✅ | ❌ 未実装 | |
+| `folder` | ✅ | ❌ 未実装 | |
+| `browser` | ✅ | ❌ 未実装 | |
+| `alias` | ✅ | ❌ 未実装 | |
+| `inspect` | ✅ | ❌ 未実装 | |
+| `csv` | ✅ | ❌ 未実装 | |
+| `trace` | ✅ | ❌ 未実装 | デバッグ用 |
+
+---
+
+## 各コマンドの詳細仕様
+
+### 1. `init` — ✅ 完了
+
+> 現在のフォルダを小説用に初期化します
+
+| オプション | 短縮 | 型 | デフォルト | 説明 |
+|-----------|------|-----|-----------|------|
+| `--path` | `-p` | string | — | AozoraEpub3 フォルダ指定。`:keep` で既存再利用 |
+| `--line-height` | `-l` | float | 1.8 | 行の高さ (em) |
+
+**Rust 実装**: `src/commands/init.rs` (396行)。完全実装済み。
+
+---
+
+### 2. `download` — 🟡 部分
+
+> 指定した小説をダウンロードします
+
+| オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
+|-----------|------|-----|-----------|------|:----:|
+| `--force` | `-f` | flag | false | 全話強制再DL | ❌ |
+| `--no-convert` | `-n` | flag | false | DLのみ、変換スキップ | ❌ |
+| `--freeze` | `-z` | flag | false | DL後に凍結 | ❌ |
+| `--remove` | `-r` | flag | false | DL後に削除(変換+送信のみ) | ❌ |
+| `--mail` | `-m` | flag | false | DL後にメール送信 | ❌ |
+| targets | | Vec\<String\> | — | URL/Nコード/ID/タイトル | ✅ |
+
+**不足動作**:
+- 引数なしでインタラクティブモード (stdin から URL 入力)
+- `--freeze` で DL 完了後に自動凍結
+- `--remove` で DL+変換+送信後に元データ削除 (economy 設定の一部)
+
+---
+
+### 3. `update` — 🟡 部分
+
+> 小説を更新します
+
+| オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
+|-----------|------|-----|-----------|------|:----:|
+| `--no-convert` | `-n` | flag | false | 変換スキップ | ✅ |
+| `--convert-only-new-arrival` | `-a` | flag | false | 新着がある場合のみ変換 | ❌ |
+| `--gl [OPT]` | — | string | — | general_lastup 更新。OPT: なし=全, `narou`, `other` | ❌ |
+| `--force` | `-f` | flag | false | 凍結小説も更新 | ✅ |
+| `--sort-by KEY` | `-s` | string | — | 更新順ソート | ✅ |
+| `--ignore-all` | `-i` | flag | false | 引数なし時の全更新を無効化 | ❌ |
+| ids | | Vec\<String\> | — | ID/タイトル/tag:NAME | ✅ |
+| `--all` | | flag | false | 全小説更新 | ✅ |
+
+**不足動作**:
+- `--gl`: なろう API バッチで `general_lastup` を更新し、変更のあった小説に `modified` タグを付与
+- `--convert-only-new-arrival`: `updated_count > 0` の場合のみ変換
+- `--ignore-all`: `narou update` (引数なし) が全更新になるのを防ぐ安全弁
+- `_convert_failure` フラグによる再変換
+- `modified` タグの管理
+- 完結検出 (`end` タグの自動追加/削除)
+- Hotentry 収集・統合電子書籍生成
+
+---
+
+### 4. `convert` — 🟡 部分
+
+> 小説を変換します。管理小説以外にテキストファイルも変換可能
+
+| オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
+|-----------|------|-----|-----------|------|:----:|
+| `--output FILE` | `-o` | string | — | 出力ファイル名指定 | ❌ |
+| `--make-zip` | — | flag | false | i文庫 ZIP 作成 | ❌ |
+| `--enc ENCODING` | `-e` | string | UTF-8 | テキストファイル文字コード | ❌ |
+| `--no-epub` | — | flag | false | EPUB 生成スキップ | ❌ |
+| `--no-mobi` | — | flag | false | MOBI 生成スキップ | ❌ |
+| `--no-strip` | — | flag | false | MOBI ストリップスキップ | ❌ |
+| `--no-zip` | — | flag | false | ZIP 作成スキップ | ❌ |
+| `--no-open` | — | flag | false | 出力フォルダを開かない | ❌ |
+| `--inspect` | `-i` | flag | false | 小説状態調査ログ表示 | ❌ |
+| `--verbose` | `-v` | flag | false | AozoraEpub3/kindlegen 標準出力表示 | ❌ |
+| `--ignore-default` | — | flag | false | default.* 設定を無視 | ❌ |
+| `--ignore-force` | — | flag | false | force.* 設定を無視 | ❌ |
+| targets | | Vec\<String\> | — | ID/タイトル/ファイルパス | ✅ |
+
+**不足動作**:
+- テキストファイルの直接変換 (DBにないファイルパス指定)
+- `convert.copy-to` への自動コピー
+- `convert.multi-device` による複数端末同時変換
+- EPUB→MOBI 変換パイプライン (AozoraEpub3 + kindlegen)
+- i文庫 ZIP 作成
+- 変換後の端末送信
+- `dc:subject` へのタグ埋め込み
+- ThreadPool による並列変換
+
+**注**: EPUB/MOBI 生成は AozoraEpub3.jar と kindlegen への依存がある。Rust 側のテキスト変換 (`novel.txt` 生成) は完了しているが、AozoraEpub3 の呼び出しパイプラインは別途必要。
+
+---
+
+### 5. `list` — 🟡 部分
+
+> 現在管理している小説の一覧を表示します
+
+| オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
+|-----------|------|-----|-----------|------|:----:|
+| `--latest` | `-l` | flag | false | 最新更新順でソート | ❌ |
+| `--gl` | — | flag | false | general_lastup でソート | ❌ |
+| `--reverse` | `-r` | flag | false | 逆順ソート | ❌ |
+| `--url` | `-u` | flag | false | URL 表示 | ❌ |
+| `--kind` | `-k` | flag | false | 小説種別表示 (短編/連載) | ❌ |
+| `--site` | `-s` | flag | false | サイト名表示 | ❌ |
+| `--author` | `-a` | flag | false | 作者名表示 | ❌ |
+| `--filter VAL` | `-f` | string | — | フィルタ: `series`/`ss`/`frozen`/`nonfrozen` | ❌ |
+| `--grep VAL` | `-g` | string | — | テキスト検索。`-` prefix で NOT | ❌ |
+| `--tag [TAGS]` | `-t` | string | — | タグ表示/フィルタ | ✅ (部分) |
+| `--echo` | `-e` | flag | false | パイプ時も人間可読出力 | ❌ |
+| `--frozen` | — | flag | false | 凍結済みのみ | ✅ |
+| limit | | int | — | 表示数上限 | ❌ |
+
+**不足動作**:
+- パイプ接続時はスペース区切りID一覧を出力 (他コマンドへのチェーン用)
+- 6時間以内更新の小説をハイライト
+- 列のカスタマイズ (`--url`, `--kind`, `--site`, `--author`)
+
+---
+
+### 6. `setting` — ❌ 未実装
+
+> 各コマンドの設定を変更します
+
+| オプション | 短縮 | 型 | デフォルト | 説明 |
+|-----------|------|-----|-----------|------|
+| `--list` | `-l` | flag | false | 現在の設定一覧表示 |
+| `--all` | `-a` | flag | false | 全設定可能変数を表示 |
+| `--burn` | — | flag | false | 共通設定を小説別 setting.ini に焼き込み |
+
+**使用形式**:
+```
+narou setting name=value   # 設定
+narou setting name=        # 削除
+narou setting name         # 読み取り
+```
+
+**設定スコープ**:
+- `local_setting.yaml` (プロジェクトローカル)
+- `~/.narousetting/global_setting.yaml` (グローバル)
+- `default.*` = 未設定小説のデフォルト値
+- `force.*` = 全小説の強制上書き値
+
+**主要 local_setting 項目**:
+
+| 設定名 | 型 | 説明 |
+|-------|-----|------|
+| `device` | select | 対象端末 (kindle/kobo/等) |
+| `hotentry` | boolean | hotentry 自動生成 |
+| `concurrency` | boolean | 並列DL+変換 |
+| `logging` | boolean | ログ保存 |
+| `update.interval` | float | 小説間ウェイト (秒、最小2.5) |
+| `update.strong` | boolean | 同日更新時の内容チェック |
+| `update.convert-only-new-arrival` | boolean | 新着時のみ変換 |
+| `update.sort-by` | select | 更新順ソートキー |
+| `update.auto-schedule.enable` | boolean | 自動更新スケジューラ有効 |
+| `update.auto-schedule` | string | スケジュール時刻 (HHMM, カンマ区切り) |
+| `convert.copy-to` | directory | 変換ファイルのコピー先 |
+| `convert.copy-zip-to` | directory | ZIP ファイルのコピー先 |
+| `convert.copy-to-grouping` | multiple | コピー先のグルーピング |
+| `convert.no-open` | boolean | 変換後にフォルダを開かない |
+| `convert.inspect` | boolean | 常に調査ログ表示 |
+| `convert.multi-device` | multiple | 複数端末同時変換 |
+| `convert.filename-to-ncode` | boolean | 出力ファイル名にNコード使用 |
+| `convert.make-zip` | boolean | i文庫 ZIP 作成 |
+| `download.interval` | float | 話間DL ウェイト (秒) |
+| `download.wait-steps` | integer | N話ごとに長待機 |
+| `download.use-subdirectory` | boolean | サブディレクトリ使用 |
+| `send.without-freeze` | boolean | 送信時に凍結除外 |
+| `economy` | multiple | 省容量設定 (cleanup_temp/send_delete/nosave_diff/nosave_raw) |
+| `guard-spoiler` | boolean | DL時の話名非表示 |
+| `auto-add-tags` | boolean | サイトタグ自動追加 |
+| `user-agent` | string | カスタム User-Agent |
+| `webui.theme` | select | WebUI テーマ |
+
+**主要 global_setting 項目**:
+
+| 設定名 | 型 | 説明 |
+|-------|-----|------|
+| `aozoraepub3dir` | directory | AozoraEpub3 の場所 |
+| `line-height` | float | 行の高さ |
+| `difftool` | string | 外部 diff ツールパス |
+| `difftool.arg` | string | diff ツール引数 (%OLD, %NEW) |
+| `no-color` | boolean | カラー表示無効 |
+| `server-port` | integer | Web サーバポート (+1 は WebSocket) |
+| `server-bind` | string | Web サーババインドアドレス |
+| `server-basic-auth.*` | bool/str | Basic 認証設定 |
+| `over18` | boolean | 18+ フラグ |
+
+**実装要件**:
+- `local_setting.yaml` / `global_setting.yaml` の読み書き
+- 設定値のバリデーション (型チェック、選択肢チェック)
+- `default.*` / `force.*` プレフィックスの解決
+- `--burn` による setting.ini への焼き込み
+- 端末変更時の関連設定自動調整
+
+---
+
+### 7. `freeze` — ✅ 完了 (小オプション不足)
+
+> 小説の凍結設定を行います
+
+| オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
+|-----------|------|-----|-----------|------|:----:|
+| `--list` | `-l` | flag | false | 凍結小説一覧 | ❌ |
+| `--on` | — | flag | false | 強制凍結 | ❌ |
+| `--off` | — | flag | false | 強制解除 | ✅ |
+
+**不足動作**:
+- デフォルトはトグル動作 (凍結→解除、未凍結→凍結)
+- `--on` / `--off` で方向を強制
+- `--list` で凍結済み一覧表示
+- 解除時に `404` タグも削除
+
+---
+
+### 8. `tag` — 🟡 部分
+
+> 各小説にタグを設定及び閲覧が出来ます
+
+| オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
+|-----------|------|-----|-----------|------|:----:|
+| `--add TAGS` | `-a` | string | — | タグ追加 (スペース区切り) | ✅ |
+| `--delete TAGS` | `-d` | string | — | タグ削除 | ✅ (--remove) |
+| `--color COL` | `-c` | string | auto | タグ色設定 | ❌ |
+| `--clear` | — | flag | false | 全タグクリア | ❌ |
+| `--list` | `-l` | flag | false | タグ一覧表示 | ❌ |
+| targets | | Vec\<String\> | — | 対象小説 | ✅ |
+
+**不足動作**:
+- 引数なし = タグ一覧表示
+- タグ指定のみ(モードなし) = タグ検索 (`list --tag` に委譲)
+- 禁止文字: `:;"'><$@&^\\\|%/`` と `hotentry`
+- 色の自動ローテーション (green/yellow/blue/magenta/cyan/red/white)
+- 特殊タグ: `end` (完結), `404` (削除済み)
+
+---
+
+### 9. `remove` — 🟡 部分
+
+> 小説を削除します
+
+| オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
+|-----------|------|-----|-----------|------|:----:|
+| `--yes` | `-y` | flag | false | 確認スキップ | ❌ |
+| `--with-file` | `-w` | flag | false | ファイルも削除 | ❌ (常時削除) |
+| `--all-ss` | — | flag | false | 全短編小説を対象 | ❌ |
+| targets | | Vec\<String\> | — | 対象小説 | ✅ |
+
+**不足動作**:
+- デフォルトはDB indexのみ削除 (ファイル残す)
+- `--with-file` でファイル含め完全削除
+- インタラクティブ確認プロンプト
+- 凍結中は削除不可
+- `--all-ss` で `novel_type == 2` を一括選択
+- 変換中ロックチェック
+
+---
+
+### 10. `diff` — ❌ 未実装
+
+> 更新された小説の差分を表示します
+
+| オプション | 短縮 | 型 | デフォルト | 説明 |
+|-----------|------|-----|-----------|------|
+| `--number NUM` | `-n` | int | 1 | 差分番号 (1=最新) |
+| `--list` | `-l` | flag | false | 差分一覧表示 |
+| `--clean` | `-c` | flag | false | 指定小説の差分全削除 |
+| `--all-clean` | — | flag | false | 凍結以外の全差分削除 |
+| `--no-tool` | — | flag | false | 外部 diff ツールを使わない |
+| `-N` (数値) | — | int | — | `-n N` の短縮形 |
+| target | | string | — | 小説指定 (省略時=最終更新) |
+
+**実装要件**:
+- raw/ ディレクトリ内の過去セクションの差分管理
+- セクション YAML から一時テキスト生成 → 差分表示
+- 外部 diff ツール統合 (`difftool` / `difftool.arg` 設定)
+- 内蔵差分ビューア (カラー付き)
+- 差分バージョン指定: `2023.02.21@01.39.46` 形式
+
+---
+
+### 11. `send` — ❌ 未実装
+
+> 変換したEPUB/MOBIを電子書籍端末に送信します
+
+| オプション | 短縮 | 型 | デフォルト | 説明 |
+|-----------|------|-----|-----------|------|
+| `--without-freeze` | `-w` | flag | false | 凍結小説を除外 |
+| `--force` | `-f` | flag | false | タイムスタンプ無視で強制送信 |
+| `--backup-bookmark` | `-b` | flag | false | ブックマークバックアップ (KindlePW) |
+| `--restore-bookmark` | `-r` | flag | false | ブックマーク復元 |
+| device | | string | — | 端末名 (kindle/kobo/等)。省略時=設定値 |
+| targets | | Vec\<string\> | — | 対象。省略時=全小説 |
+
+**実装要件**:
+- USB マスストレージ経由で端末の documents/ へコピー
+- `last_mail_date` による差分送信
+- `convert.copy-to` 設定との連動
+- 端末別のファイル配置規則
+- hotentry 対応
+
+---
+
+### 12. `mail` — ❌ 未実装
+
+> 変換したEPUB/MOBIをメールで送信します
+
+| オプション | 短縮 | 型 | デフォルト | 説明 |
+|-----------|------|-----|-----------|------|
+| `--force` | `-f` | flag | false | 全非凍結小説を強制送信 |
+| targets | | Vec\<string\> | — | 対象。`hotentry` 指定可 |
+
+**実装要件**:
+- SMTP 設定 (`mail_setting.yaml`)
+- Send-to-Kindle 対応
+- `last_mail_date` による差分送信
+- hotentry 自動メール (`hotentry.auto-mail` 設定)
+
+---
+
+### 13. `web` — 🟡 部分
+
+> WEBアプリケーション用サーバを起動します
+
+| オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
+|-----------|------|-----|-----------|------|:----:|
+| `--port PORT` | `-p` | int | 3000 | サーバポート | ✅ |
+| `--no-browser` | `-n` | flag | false | ブラウザ自動起動抑制 | ✅ |
+
+**不足動作**:
+- WebSocket ポート = HTTP ポート + 1
+- 初回起動時のファイアウォール警告
+- 自動更新スケジューラの起動
+- Basic 認証 (`server-basic-auth` 設定)
+- `server-bind` 設定対応
+- HTML フロントエンド (Ruby 版は HAML テンプレート)
+- `webui.theme` 設定
+- `webui.performance-mode` 設定
+
+---
+
+### 14. `backup` — ❌ 未実装
+
+> 小説のバックアップを作成します
+
+オプションなし。
+
+**実装要件**:
+- `<novel_dir>/backup/` に ZIP 作成
+- ファイル名: `<title>_<YYYYMMDDHHMMSS>.zip`
+- 既存バックアップファイルは除外
+- タイトルは180バイトで切り詰め
+
+---
+
+### 15. `clean` — ❌ 未実装
+
+> ゴミファイルを削除します
+
+| オプション | 短縮 | 型 | デフォルト | 説明 |
+|-----------|------|-----|-----------|------|
+| `--force` | `-f` | flag | false | 実際に削除 |
+| `--dry-run` | `-n` | flag | false | 表示のみ |
+| `--all` | `-a` | flag | false | 全小説を対象 |
+| target | | string | — | 小説指定 (省略時=最終変換) |
+
+**実装要件**:
+- orphaned な `raw_data/*.txt` と `section_save/*.yaml` の検出
+- TOC の subtitles に含まれないファイルを特定
+- 凍結小説は `--all` でもスキップ
+- `--force` なしの場合はリストのみ
+
+---
+
+### 16. `help` — ❌ 未実装 (clap --help のみ)
+
+> このヘルプを表示します
+
+**実装要件**:
+- 未初期化時: `narou init` を促すメッセージ
+- 初期化済み: コマンド一覧 + oneline_help
+- グローバルオプション表示
+- ショートカット説明
+- 各コマンドの `-h` で詳細ヘルプ
+
+---
+
+### 17. `version` — ❌ 未実装 (clap --version のみ)
+
+> バージョンを表示します
+
+| オプション | 短縮 | 型 | デフォルト | 説明 |
+|-----------|------|-----|-----------|------|
+| `--more` | `-m` | flag | false | Java/AozoraEpub3 バージョンも表示 |
+
+---
+
+### 18. `log` — ❌ 未実装
+
+> 保存したログを表示します
+
+| オプション | 短縮 | 型 | デフォルト | 説明 |
+|-----------|------|-----|-----------|------|
+| `--num NUM` | `-n` | int | 20 | 表示行数 |
+| `--tail` | `-t` | flag | false | ストリーミング (`tail -f` 相当) |
+| `--source-convert` | `-c` | flag | false | 変換ログを表示 |
+| target | | string | — | ログファイルパス直接指定可 |
+
+**実装要件**:
+- `logging=true` 設定が必要
+- ログファイルの保存先管理
+- `tail -f` 相当のストリーミング表示
+
+---
+
+### 19. `folder` — ❌ 未実装
+
+> 小説の保存フォルダを開きます
+
+| オプション | 短縮 | 型 | デフォルト | 説明 |
+|-----------|------|-----|-----------|------|
+| `--no-open` | `-n` | flag | false | パス表示のみ |
+| target | | string | — | 小説指定 |
+
+**実装要件**:
+- ファイルマネージャで小説ディレクトリを開く (`open::that` または同等)
+- パスを常に stdout に出力
+
+---
+
+### 20. `browser` — ❌ 未実装
+
+> 小説の掲載ページをブラウザで開きます
+
+| オプション | 短縮 | 型 | デフォルト | 説明 |
+|-----------|------|-----|-----------|------|
+| `--vote` | `-v` | flag | false | 感想ページを開く (なろうのみ) |
+| target | | string | — | 小説指定 |
+
+**実装要件**:
+- デフォルトブラウザで `toc_url` を開く
+- `--vote` は最新話の感想ページ (`#my_novelpoint`) を開く
+
+---
+
+### 21. `alias` — ❌ 未実装
+
+> 小説のIDに紐付けた別名を作成します
+
+| オプション | 短縮 | 型 | デフォルト | 説明 |
+|-----------|------|-----|-----------|------|
+| `--list` | `-l` | flag | false | 現在の別名一覧 |
+| assignment | | string | — | `name=target` で設定、`name=` で削除 |
+
+**実装要件**:
+- `alias.yaml` の読み書き
+- 別名 → ID 解決をターゲット解決パイプラインに統合
+- 英数字+アンダースコアのみ。禁止語: `hotentry`
+
+---
+
+### 22. `inspect` — ❌ 未実装
+
+> 小説状態の調査状況ログを表示します
+
+オプションなし。target 省略時 = 最終変換小説。
+
+**実装要件**:
+- `NovelSetting` + `Inspector` メッセージの読み取り・表示
+- `convert.inspect=true` で常時表示
+
+---
+
+### 23. `csv` — ❌ 未実装
+
+> 小説リストをCSV形式で出力したりインポートしたりします
+
+| オプション | 短縮 | 型 | デフォルト | 説明 |
+|-----------|------|-----|-----------|------|
+| `--output FILE` | `-o` | string | stdout | CSV 保存先 |
+| `--import FILE` | `-i` | string | — | CSV からインポート |
+
+**実装要件**:
+- エクスポート列: id, title, author, sitename, url, novel_type, tags, frozen, last_update, general_lastup
+- インポート: `url` 列が必須。各行を `download` に渡す
+
+---
+
+### 24. `trace` — ❌ 未実装
+
+> 直前のバックトレースを表示します
+
+オプションなし。デバッグ用。
+
+---
+
+## 実装優先度
+
+### P0: コアパイプラインの完成
+既存9コマンドの互換性を完成させる。
+
+| タスク | コマンド | 影響 |
+|-------|---------|------|
+| download `--force`, `--no-convert`, `--freeze` | download | DL フラグ互換 |
+| update `--gl`, `--convert-only-new-arrival`, `--ignore-all` | update | 更新精度向上 |
+| convert `--device`, `--no-open`, `--output` | convert | 変換パイプライン完成 |
+| list `--latest`, `--reverse`, `--filter`, `--url`, `--author`, `--site` | list | 一覧表示の実用性 |
+| tag `--color`, `--clear`, `--list` | tag | タグ管理の完成 |
+| remove `--yes`, `--with-file` | remove | 削除の安全性 |
+| freeze `--list`, `--on` | freeze | 凍結管理の完成 |
+
+### P1: 設定管理基盤
+多くのコマンドが `local_setting` / `global_setting` に依存する。
+
+| タスク | 説明 |
+|-------|------|
+| `setting` コマンド | 設定の読み書き・一覧・バリデーション |
+| `default.*` / `force.*` 解決 | 設定カスケードの実装 |
+| 設定値型バリデーション | boolean/integer/float/string/directory/select/multiple |
+
+### P2: ユーティリティコマンド
+比較的独立して実装可能。
+
+| コマンド | 難易度 | 依存 |
+|---------|:------:|------|
+| `help` | 低 | なし |
+| `version` | 低 | なし |
+| `folder` | 低 | なし |
+| `browser` | 低 | なし |
+| `alias` | 低 | `alias.yaml` |
+| `backup` | 低 | ZIP 圧縮 |
+| `clean` | 低 | TOC 読み込み |
+| `csv` | 中 | DL パイプライン |
+| `inspect` | 中 | Inspector メッセージ |
+| `log` | 中 | ログシステム |
+
+### P3: 端末連携
+外部ツール依存。
+
+| コマンド | 難易度 | 依存 |
+|---------|:------:|------|
+| `send` | 高 | USB マスストレージ、端末別規則 |
+| `mail` | 高 | SMTP 設定 |
+| `diff` | 中 | 外部 diff ツール、raw データ管理 |
+
+### P4: グローバル機能
+
+| 機能 | 説明 |
+|------|------|
+| `--no-color` | 全コマンド対応 |
+| `--multiple` | 引数区切り `,` 対応 |
+| `--time` | 実行時間計測 |
+| `--backtrace` | 詳細エラー表示 |
+| コマンドショートカット | 1-2文字省略名 |
+| `default_args.*` | コマンド別デフォルト引数 |
+
+---
+
+## 設定型定義参照
+
+設定値の型は `setting.rb` で定義されている。Rust 側でも同等の型定義が必要。
+
+| 型 | 説明 | 例 |
+|-----|------|-----|
+| `:boolean` | 真偽値 | `true` / `false` |
+| `:integer` | 整数 | `10` |
+| `:float` | 浮動小数点 | `2.5` |
+| `:string` | 文字列 | `"Kindle PaperWhite"` |
+| `:directory` | ディレクトリパス (存在チェック) | `"/path/to/dir"` |
+| `:select` | 選択肢から一つ | `device`: `kindle`, `kobo`, 等 |
+| `:multiple` | 選択肢から複数 (カンマ区切り) | `economy`: `cleanup_temp,send_delete` |
