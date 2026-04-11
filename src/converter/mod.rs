@@ -4,6 +4,7 @@ pub mod settings;
 pub mod user_converter;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
@@ -60,7 +61,8 @@ impl NovelConverter {
         if let Some(ref story) = toc.story {
             if !story.is_empty() {
                 let mut converter = self.make_converter();
-                converted_story = converter.convert(story, converter_base::TextType::Story);
+                let story_text = normalize_story_source(story);
+                converted_story = converter.convert(&story_text, converter_base::TextType::Story);
             }
         }
 
@@ -404,7 +406,7 @@ impl NovelConverter {
         self.cache_dirty = false;
     }
 
-    pub fn convert_novel_by_id(&mut self, _id: i64, novel_dir: &std::path::Path) -> Result<String> {
+    pub fn convert_novel_by_id(&mut self, id: i64, novel_dir: &std::path::Path) -> Result<String> {
         let toc_path = novel_dir.join("toc.yaml");
         let toc_content = std::fs::read_to_string(&toc_path).map_err(|e| NarouError::Io(e))?;
         let toc: crate::downloader::TocFile =
@@ -422,11 +424,7 @@ impl NovelConverter {
         let sections = load_sections_from_dir(novel_dir, &toc_object.subtitles)?;
 
         let aozora_text = self.convert_novel(&toc_object, &sections)?;
-        let output_dir = novel_dir.join("output");
-        std::fs::create_dir_all(&output_dir)?;
-
-        let base_name = sanitize_filename_for_output(&toc_object.title);
-        let txt_path = output_dir.join(format!("{}.txt", base_name));
+        let txt_path = create_output_text_path(&self.settings, id, novel_dir, &toc_object);
         std::fs::write(&txt_path, &aozora_text)?;
 
         Ok(txt_path.display().to_string())
@@ -455,15 +453,15 @@ impl NovelConverter {
         let sections = load_sections_from_dir(novel_dir, &toc_object.subtitles)?;
 
         let aozora_text = self.convert_novel(&toc_object, &sections)?;
-        let output_dir = novel_dir.join("output");
-        std::fs::create_dir_all(&output_dir)?;
-
-        let base_name = sanitize_filename_for_output(&toc_object.title);
-        let txt_path = output_dir.join(format!("{}.txt", base_name));
+        let txt_path = create_output_text_path(&self.settings, _id, novel_dir, &toc_object);
         std::fs::write(&txt_path, &aozora_text)?;
 
         let output_manager = device::OutputManager::new(device);
-        let final_path = output_manager.convert_file(&txt_path, &output_dir, &base_name)?;
+        let base_name = txt_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("output");
+        let final_path = output_manager.convert_file(&txt_path, novel_dir, base_name)?;
 
         Ok(final_path)
     }
@@ -499,6 +497,88 @@ fn sanitize_filename_for_output(name: &str) -> String {
     }
 }
 
+fn create_output_text_path(
+    settings: &NovelSettings,
+    id: i64,
+    novel_dir: &Path,
+    toc: &TocObject,
+) -> PathBuf {
+    novel_dir.join(create_output_text_filename(settings, id, toc))
+}
+
+fn create_output_text_filename(settings: &NovelSettings, id: i64, toc: &TocObject) -> String {
+    if !settings.output_filename.trim().is_empty() {
+        return ensure_txt_extension(&sanitize_filename_for_output(&settings.output_filename));
+    }
+
+    if convert_filename_to_ncode() {
+        let record = crate::db::with_database(|db| Ok(db.get(id).cloned()))
+            .ok()
+            .flatten();
+        let domain = record
+            .as_ref()
+            .and_then(|r| r.domain.clone())
+            .or_else(|| extract_domain(&toc.toc_url))
+            .unwrap_or_else(|| "unknown".to_string());
+        let ncode = record
+            .as_ref()
+            .and_then(|r| r.ncode.clone())
+            .or_else(|| extract_ncode_like(&toc.toc_url))
+            .unwrap_or_else(|| sanitize_filename_for_output(&toc.title));
+        return format!("{}_{}.txt", domain.replace('.', "_"), ncode);
+    }
+
+    let author = if settings.novel_author.is_empty() {
+        &toc.author
+    } else {
+        &settings.novel_author
+    };
+    let title = if settings.novel_title.is_empty() {
+        &toc.title
+    } else {
+        &settings.novel_title
+    };
+    ensure_txt_extension(&sanitize_filename_for_output(&format!("[{}] {}", author, title)))
+}
+
+fn convert_filename_to_ncode() -> bool {
+    crate::db::with_database(|db| {
+        let settings: HashMap<String, serde_yaml::Value> = db
+            .inventory()
+            .load("local_setting", crate::db::inventory::InventoryScope::Local)?;
+        Ok(settings
+            .get("convert.filename-to-ncode")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false))
+    })
+    .unwrap_or(false)
+}
+
+fn ensure_txt_extension(filename: &str) -> String {
+    if filename.to_lowercase().ends_with(".txt") {
+        filename.to_string()
+    } else {
+        format!("{filename}.txt")
+    }
+}
+
+fn extract_domain(url: &str) -> Option<String> {
+    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    without_scheme
+        .split('/')
+        .next()
+        .filter(|domain| !domain.is_empty())
+        .map(str::to_string)
+}
+
+fn extract_ncode_like(url: &str) -> Option<String> {
+    let trimmed = url.trim_end_matches('/');
+    trimmed
+        .rsplit('/')
+        .find(|part| !part.is_empty() && *part != "works")
+        .map(str::to_string)
+}
+
 fn trim_author_comment_text(text: &str) -> String {
     text.trim_end_matches('\n')
         .lines()
@@ -514,4 +594,21 @@ fn normalize_subtitle_markup(text: &str) -> String {
         .replace("（［＃縦中横］１［＃縦中横終わり］）", "（１）")
         .replace("（［＃縦中横］２［＃縦中横終わり］）", "（２）")
         .replace("（［＃縦中横］３［＃縦中横終わり］）", "（３）")
+}
+
+fn normalize_story_source(story: &str) -> String {
+    if looks_like_html(story) {
+        crate::downloader::html::to_aozora(story)
+    } else {
+        story.to_string()
+    }
+}
+
+fn looks_like_html(text: &str) -> bool {
+    text.contains("<br")
+        || text.contains("<BR")
+        || text.contains("</p>")
+        || text.contains("</P>")
+        || text.contains("<ruby")
+        || text.contains("<RUBY")
 }

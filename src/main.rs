@@ -274,17 +274,7 @@ fn cmd_convert(targets: &[String]) {
             let record = db
                 .get(id)
                 .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
-            let archive_root = db.archive_root();
-            let mut dir = std::path::PathBuf::from(archive_root);
-            dir.push(&record.sitename);
-            if record.use_subdirectory {
-                if let Some(ref ncode) = record.ncode {
-                    if ncode.len() >= 2 {
-                        dir.push(&ncode[..2]);
-                    }
-                }
-            }
-            dir.push(&record.file_title);
+            let dir = narou_rs::db::existing_novel_dir_for_record(db.archive_root(), record);
             Ok::<std::path::PathBuf, narou_rs::error::NarouError>(dir)
         }) {
             Ok(dir) => dir,
@@ -472,18 +462,8 @@ fn cmd_remove(targets: &[String]) {
 
         let result = db::with_database_mut(|db| {
             if let Some(record) = db.remove(id) {
-                let novel_dir = db.archive_root().join(&record.sitename);
-                if record.use_subdirectory {
-                    if let Some(ref ncode) = record.ncode {
-                        if ncode.len() >= 2 {
-                            let dir = novel_dir.join(&ncode[..2]).join(&record.file_title);
-                            let _ = std::fs::remove_dir_all(&dir);
-                        }
-                    }
-                } else {
-                    let dir = novel_dir.join(&record.file_title);
-                    let _ = std::fs::remove_dir_all(&dir);
-                }
+                let dir = db::existing_novel_dir_for_record(db.archive_root(), &record);
+                let _ = std::fs::remove_dir_all(&dir);
                 db.save()?;
                 Ok::<String, narou_rs::error::NarouError>(record.title)
             } else {

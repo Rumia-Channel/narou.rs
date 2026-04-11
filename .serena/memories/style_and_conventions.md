@@ -2,6 +2,7 @@
 
 ## Code Style
 - **No comments** unless explicitly asked
+- Do not edit `Cargo.toml` directly for dependency changes. Use Cargo commands such as `cargo add` and `cargo update` so dependency versions come from the current registry metadata. If a direct manifest edit is unavoidable, document why and verify with `cargo check`.
 - Use `thiserror` for error types with `#[from]` for automatic conversions
 - `pub type Result<T> = std::result::Result<T, NarouError>` pattern
 - Use `parking_lot::Mutex` over `std::sync::Mutex`

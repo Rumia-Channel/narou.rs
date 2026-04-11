@@ -3,6 +3,17 @@
 ## Overview
 narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウェア）のサーバー実行部分をRustに移植するプロジェクト。なろう・カクヨム等のサイトからのDL・変換が動作し、narou.rbの出力フォーマットと完全互換性を持つことを目指す。
 
+## Porting Policy
+- このプログラムは `sample/narou` にある本家 narou.rb を Rust へ移行するための互換実装である。
+- 内部ライブラリ、データ構造、処理系統、実装アルゴリズムは Ruby 版と同一である必要はない。Rust 側で保守しやすく、安全で、検証しやすい構成を優先してよい。
+- 互換性の主対象は外部から観測できる挙動である。特に CLI/API の引数・戻り値・エラー挙動、`webnovel/*.yaml` や `converter.yaml` などの YAML 構文理解、`.narou/` 配下のデータ読み書き、最終的なファイル出力を narou.rb と徹底的に合わせる。
+- Ruby 実装は仕様の参照元として扱う。処理手順をそのまま写すことよりも、同じ入力から同じ外部挙動・同じ出力を得ることを優先する。
+
+## Dependency Policy
+- `Cargo.toml` は原則として直接編集しない。
+- 依存クレートの追加・更新は `cargo add`、`cargo update` など Cargo のコマンド経由で行い、その時点で取得できる最新の互換バージョンを使う。
+- 例外的に `Cargo.toml` の手編集が必要な場合は、先に理由を明確化し、変更後に `cargo check` などで検証する。
+
 ## Build & Run
 ```powershell
 cargo build              # Build (edition 2024)

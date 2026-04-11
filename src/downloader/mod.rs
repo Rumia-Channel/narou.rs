@@ -694,17 +694,7 @@ impl Downloader {
     }
 
     pub fn get_novel_data_dir(&self, record: &crate::db::novel_record::NovelRecord) -> PathBuf {
-        let mut dir = PathBuf::from(ARCHIVE_ROOT_DIR);
-        dir.push(&record.sitename);
-        if record.use_subdirectory {
-            if let Some(ref ncode) = record.ncode {
-                if ncode.len() >= 2 {
-                    dir.push(&ncode[..2]);
-                }
-            }
-        }
-        dir.push(&record.file_title);
-        dir
+        crate::db::novel_dir_for_record(&PathBuf::from(ARCHIVE_ROOT_DIR), record)
     }
 
     pub fn download_novel(&mut self, target: &str) -> Result<DownloadResult> {
@@ -750,7 +740,7 @@ impl Downloader {
             self.parse_subtitles_multipage(&setting, &toc_source, &url_captures)?
         };
 
-        let use_subdirectory = setting.domain.contains("syosetu.com");
+        let use_subdirectory = self.download_use_subdirectory(existing_id);
         let ncode = self
             .extract_ncode(&setting, &toc_source)
             .or_else(|| url_captures.get("ncode").cloned());
@@ -762,7 +752,7 @@ impl Downloader {
         );
         let sitename = info.sitename.unwrap_or_else(|| setting.sitename.clone());
 
-        let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory, &ncode);
+        let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory);
         std::fs::create_dir_all(&novel_dir)?;
 
         let section_dir = novel_dir.join(SECTION_SAVE_DIR);
@@ -809,10 +799,7 @@ impl Downloader {
             title: title.clone(),
             author: author.clone(),
             toc_url: toc_url.clone(),
-            story: info
-                .story
-                .as_ref()
-                .map(|s| s.replace("<br>", "\n")),
+            story: info.story.as_ref().map(|s| s.replace("<br>", "\n")),
 
             subtitles: final_subtitles,
             novel_type: Some(novel_type),
@@ -1113,21 +1100,38 @@ impl Downloader {
         sitename: &str,
         file_title: &str,
         use_subdirectory: bool,
-        ncode: &Option<String>,
     ) -> PathBuf {
         let mut dir = PathBuf::from(ARCHIVE_ROOT_DIR);
         dir.push(sitename);
 
         if use_subdirectory {
-            if let Some(ncode) = ncode {
-                if ncode.len() >= 2 {
-                    dir.push(&ncode[..2]);
-                }
+            let subdirectory = crate::db::create_subdirectory_name(file_title);
+            if !subdirectory.is_empty() {
+                dir.push(subdirectory);
             }
         }
 
         dir.push(file_title);
         dir
+    }
+
+    fn download_use_subdirectory(&self, existing_id: Option<i64>) -> bool {
+        if let Some(id) = existing_id {
+            if let Ok(Some(record)) = crate::db::with_database(|db| Ok(db.get(id).cloned())) {
+                return record.use_subdirectory;
+            }
+        }
+
+        crate::db::with_database(|db| {
+            let settings: HashMap<String, serde_yaml::Value> = db
+                .inventory()
+                .load("local_setting", crate::db::inventory::InventoryScope::Local)?;
+            Ok(settings
+                .get("download.use-subdirectory")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false))
+        })
+        .unwrap_or(false)
     }
 
     fn save_section_file(
@@ -1373,10 +1377,7 @@ fn kakuyomu_preprocess(src: &mut String) {
                         .get("level")
                         .and_then(|v| v.as_i64())
                         .unwrap_or(1);
-                    let ch_id = ch_resolved
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let ch_id = ch_resolved.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let ch_title = ch_resolved
                         .get("title")
                         .and_then(|v| v.as_str())

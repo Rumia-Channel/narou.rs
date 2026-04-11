@@ -50,6 +50,12 @@ src/
     mod.rs            - Axum API server (routes, DataTables support)
 ```
 
+## Porting Policy
+- This project is a Rust compatibility port of the upstream narou.rb implementation under `sample/narou`.
+- Rust internals do not need to match the Ruby libraries, data structures, processing pipeline, or algorithms.
+- Compatibility is judged by externally visible behavior: CLI/API arguments and results, YAML syntax support (`webnovel/*.yaml`, `converter.yaml`, etc.), `.narou/` file reads/writes, and final generated output files.
+- Treat the Ruby implementation as the reference specification, but prefer Rust designs that are maintainable, safe, and easy to verify when they preserve the same external behavior and output.
+
 ## Key Design Decisions
 - Database YAML format compatible with narou.rb's `database.yaml` / `database_index.yaml`
 - Site settings YAML (`webnovel/*.yaml`) format compatible (including `\k<name>` variable interpolation)

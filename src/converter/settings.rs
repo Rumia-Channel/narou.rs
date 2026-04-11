@@ -326,10 +326,6 @@ impl NovelSettings {
             settings.novel_author.clone()
         };
 
-        if settings.output_filename.is_empty() {
-            settings.output_filename = sanitize_filename_for_settings(novel_title);
-        }
-
         settings
     }
 
@@ -816,13 +812,3 @@ pub fn load_replace_patterns(path: &Path) -> Vec<(String, String)> {
     patterns
 }
 
-fn sanitize_filename_for_settings(name: &str) -> String {
-    let invalid = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\0'];
-    let cleaned: String = name.chars().filter(|c| !invalid.contains(c)).collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        "output".to_string()
-    } else {
-        trimmed.chars().take(80).collect()
-    }
-}

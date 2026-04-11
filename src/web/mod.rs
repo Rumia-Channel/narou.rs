@@ -99,10 +99,7 @@ pub fn create_router(port: u16) -> Router {
         .route("/api/log/recent", get(recent_logs))
         .route("/ws", get(push::ws_handler_with_app_state))
         .layer(CorsLayer::permissive())
-        .with_state(AppState {
-            port,
-            push_server,
-        })
+        .with_state(AppState { port, push_server })
 }
 
 async fn index() -> &'static str {
@@ -277,18 +274,8 @@ async fn remove_novel(
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     let result = with_database_mut(|db| {
         if let Some(record) = db.remove(id) {
-            let novel_dir = db.archive_root().join(&record.sitename);
-            if record.use_subdirectory {
-                if let Some(ref ncode) = record.ncode {
-                    if ncode.len() >= 2 {
-                        let dir = novel_dir.join(&ncode[..2]).join(&record.file_title);
-                        let _ = std::fs::remove_dir_all(&dir);
-                    }
-                }
-            } else {
-                let dir = novel_dir.join(&record.file_title);
-                let _ = std::fs::remove_dir_all(&dir);
-            }
+            let dir = crate::db::existing_novel_dir_for_record(db.archive_root(), &record);
+            let _ = std::fs::remove_dir_all(&dir);
             db.save()?;
             Ok::<String, NarouError>(record.title)
         } else {
@@ -572,18 +559,8 @@ async fn batch_remove(
         let mut count = 0usize;
         for id in &body.ids {
             if let Some(record) = db.remove(*id) {
-                let novel_dir = db.archive_root().join(&record.sitename);
-                if record.use_subdirectory {
-                    if let Some(ref ncode) = record.ncode {
-                        if ncode.len() >= 2 {
-                            let dir = novel_dir.join(&ncode[..2]).join(&record.file_title);
-                            let _ = std::fs::remove_dir_all(&dir);
-                        }
-                    }
-                } else {
-                    let dir = novel_dir.join(&record.file_title);
-                    let _ = std::fs::remove_dir_all(&dir);
-                }
+                let dir = crate::db::existing_novel_dir_for_record(db.archive_root(), &record);
+                let _ = std::fs::remove_dir_all(&dir);
                 count += 1;
             }
         }
@@ -776,18 +753,13 @@ async fn get_settings(
     })
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    let archive_root = with_database(|db| Ok(db.archive_root().to_path_buf()))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let mut novel_dir = archive_root.join(&record.sitename);
-    if record.use_subdirectory {
-        if let Some(ref ncode) = record.ncode {
-            if ncode.len() >= 2 {
-                novel_dir.push(&ncode[..2]);
-            }
-        }
-    }
-    novel_dir.push(&record.file_title);
+    let novel_dir = with_database(|db| {
+        Ok(crate::db::existing_novel_dir_for_record(
+            db.archive_root(),
+            &record,
+        ))
+    })
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let settings = crate::converter::settings::NovelSettings::load_for_novel(
         id,
@@ -812,18 +784,13 @@ async fn save_settings(
     })
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    let archive_root = with_database(|db| Ok(db.archive_root().to_path_buf()))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let mut novel_dir = archive_root.join(&record.sitename);
-    if record.use_subdirectory {
-        if let Some(ref ncode) = record.ncode {
-            if ncode.len() >= 2 {
-                novel_dir.push(&ncode[..2]);
-            }
-        }
-    }
-    novel_dir.push(&record.file_title);
+    let novel_dir = with_database(|db| {
+        Ok(crate::db::existing_novel_dir_for_record(
+            db.archive_root(),
+            &record,
+        ))
+    })
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let ini_path = novel_dir.join("setting.ini");
     std::fs::create_dir_all(&novel_dir)
