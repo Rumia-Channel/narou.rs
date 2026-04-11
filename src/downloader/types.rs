@@ -115,6 +115,8 @@ pub struct TocFile {
 pub struct DownloadResult {
     pub id: i64,
     pub title: String,
+    pub author: String,
+    pub novel_dir: std::path::PathBuf,
     pub new_novel: bool,
     pub updated_count: usize,
     pub total_count: usize,

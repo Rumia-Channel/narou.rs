@@ -17,6 +17,7 @@ impl SiteSetting {
             "gl" => &self.gl,
             "l" => &self.l,
             "tags" => &self.tags,
+            "sitename" => &self.sitename_pattern,
             _ => return None,
         };
 
@@ -86,6 +87,7 @@ impl SiteSetting {
             "gl" => &self.gl,
             "l" => &self.l,
             "tags" => &self.tags,
+            "sitename" => &self.sitename_pattern,
             "title" => &self.t,
             "author" => &self.w,
             "story" => &self.s,

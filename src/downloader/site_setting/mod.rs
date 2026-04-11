@@ -13,6 +13,10 @@ use crate::error::Result;
 
 pub use serde_helpers::deserialize_yes_no_bool;
 
+fn looks_like_pattern(s: &str) -> bool {
+    s.contains("(?<") || s.contains("(?P<")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteSetting {
     pub name: String,
@@ -31,6 +35,8 @@ pub struct SiteSetting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie: Option<String>,
     pub sitename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sitename_pattern: Option<SiteSettingValue>,
     #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
     pub append_title_to_folder_name: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,6 +155,10 @@ impl SiteSetting {
     }
 
     pub(super) fn compile(&mut self) {
+        if looks_like_pattern(&self.sitename) && self.sitename_pattern.is_none() {
+            self.sitename_pattern = Some(SiteSettingValue::Single(self.sitename.clone()));
+            self.sitename = self.name.clone();
+        }
         if let Some(ref src) = self.preprocess {
             let result = crate::downloader::preprocess::PreprocessPipeline::compile(src);
             self.compiled_preprocess = result.ok();

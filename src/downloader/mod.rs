@@ -421,7 +421,7 @@ impl Downloader {
 
         let record = NovelRecord {
             id: existing_id.unwrap_or(0),
-            author,
+            author: author.clone(),
             title: title.clone(),
             file_title: file_title.clone(),
             toc_url,
@@ -481,7 +481,9 @@ impl Downloader {
 
         Ok(DownloadResult {
             id,
-            title,
+            title: title.clone(),
+            author: author.clone(),
+            novel_dir,
             new_novel: existing_id.is_none(),
             updated_count,
             total_count: subtitles.len(),
@@ -750,6 +752,45 @@ mod tests {
         assert!(html.contains("Chapter;1;10;第一章"));
         assert!(!html.contains("Chapter;1;10;;第一章"));
         assert!(html.contains("Episode;20;2021-01-12T16:13:02Z;第1話"));
+    }
+
+    #[test]
+    fn r18_narou_sitename_pattern_is_moved_to_sitename_pattern_field() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "novel18.syosetu.com")
+            .unwrap();
+
+        assert!(
+            !setting.sitename.contains("(?<"),
+            "sitename should be a plain display name after compile, got: {}",
+            setting.sitename
+        );
+        assert!(
+            setting.sitename_pattern.is_some(),
+            "sitename_pattern should be populated for R18 narou"
+        );
+        assert_eq!(setting.sitename, "小説家になろうR18");
+    }
+
+    #[test]
+    fn r18_narou_extracts_sitename_from_info_html() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "novel18.syosetu.com")
+            .unwrap();
+
+        assert!(setting.sitename_pattern.is_some());
+
+        let html = "<h1 class=\"p-infotop-title\">\n<a href=\"/n7534il/\">テスト小説タイトル</a>\n</h1>\n<dt class=\"p-infotop-data__title\">掲載サイト</dt>\n<dd class=\"p-infotop-data__value\">ノクターンノベルズ(夜の恋愛)</dd>\n<dt class=\"p-infotop-data__title\">作者名</dt>\n<dd class=\"p-infotop-data__value\"><a href=\"/mypage/top/view/id/12345/\">テスト作者</a></dd>";
+
+        let info = NovelInfo::from_novel_info_source(setting, html);
+
+        assert_eq!(info.title.as_deref(), Some("テスト小説タイトル"));
+        assert_eq!(info.author.as_deref(), Some("テスト作者"));
+        assert_eq!(info.sitename.as_deref(), Some("ノクターンノベルズ"));
     }
 
     #[test]
