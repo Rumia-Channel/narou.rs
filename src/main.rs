@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use tracing::info;
@@ -12,6 +13,12 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
+    Init {
+        #[arg(short = 'p', long = "path")]
+        aozora_path: Option<String>,
+        #[arg(short = 'l', long = "line-height")]
+        line_height: Option<f64>,
+    },
     Web {
         #[arg(short, long, default_value_t = 3000)]
         port: u16,
@@ -59,6 +66,15 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Init {
+            aozora_path,
+            line_height,
+        } => {
+            if let Err(e) = cmd_init(aozora_path.as_deref(), line_height) {
+                eprintln!("Error initializing: {}", e);
+                std::process::exit(1);
+            }
+        }
         Commands::Web { port, no_browser } => {
             run_web_server(port, no_browser).await;
         }
@@ -108,6 +124,48 @@ async fn main() {
             cmd_remove(&targets);
         }
     }
+}
+
+fn cmd_init(aozora_path: Option<&str>, line_height: Option<f64>) -> narou_rs::error::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let already_root = find_existing_narou_root(&cwd);
+    let root = already_root.clone().unwrap_or(cwd);
+
+    if already_root.is_none() {
+        std::fs::create_dir_all(root.join(".narou"))?;
+        println!(".narou/ を作成しました");
+
+        let archive_root = root.join("小説データ");
+        std::fs::create_dir_all(&archive_root)?;
+        println!("小説データ/ を作成しました");
+
+        let user_webnovel_dir = root.join("webnovel");
+        std::fs::create_dir_all(&user_webnovel_dir)?;
+        let copied = copy_bundled_webnovel_files(&user_webnovel_dir)?;
+        if copied == 0 {
+            println!("webnovel/ を作成しました");
+        } else {
+            println!("webnovel/ を作成しました ({} files)", copied);
+        }
+    } else {
+        println!("既に初期化済みです: {}", root.display());
+    }
+
+    let created_inventory = ensure_dot_narou_files(&root)?;
+    if created_inventory > 0 {
+        println!(
+            ".narou/ に初期ファイルを作成しました ({} files)",
+            created_inventory
+        );
+    }
+
+    save_global_init_settings(aozora_path, line_height)?;
+
+    if already_root.is_none() {
+        println!("初期化が完了しました！");
+    }
+
+    Ok(())
 }
 
 async fn run_web_server(port: u16, no_browser: bool) {
@@ -242,14 +300,12 @@ fn cmd_update(ids: Option<Vec<i64>>, all: bool) {
 fn cmd_convert(targets: &[String]) {
     use narou_rs::converter::NovelConverter;
     use narou_rs::converter::settings::NovelSettings;
+    use narou_rs::converter::user_converter::UserConverter;
 
     if let Err(e) = narou_rs::db::init_database() {
         eprintln!("Error initializing database: {}", e);
         std::process::exit(1);
     }
-
-    let settings = NovelSettings::default();
-    let mut converter = NovelConverter::new(settings);
 
     for target in targets {
         println!("Converting: {}", target);
@@ -270,19 +326,31 @@ fn cmd_convert(targets: &[String]) {
             }
         };
 
-        let novel_dir = match narou_rs::db::with_database(|db| {
+        let (novel_dir, title, author) = match narou_rs::db::with_database(|db| {
             let record = db
                 .get(id)
                 .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
             let dir = narou_rs::db::existing_novel_dir_for_record(db.archive_root(), record);
-            Ok::<std::path::PathBuf, narou_rs::error::NarouError>(dir)
+            Ok::<(std::path::PathBuf, String, String), narou_rs::error::NarouError>((
+                dir,
+                record.title.clone(),
+                record.author.clone(),
+            ))
         }) {
-            Ok(dir) => dir,
+            Ok(data) => data,
             Err(e) => {
                 eprintln!("  Error: {}", e);
                 continue;
             }
         };
+
+        let settings = NovelSettings::load_for_novel(id, &title, &author, &novel_dir);
+        let mut converter =
+            if let Some(user_converter) = UserConverter::load_with_title(&novel_dir, &title) {
+                NovelConverter::with_user_converter(settings, user_converter)
+            } else {
+                NovelConverter::new(settings)
+            };
 
         match converter.convert_novel_by_id(id, &novel_dir) {
             Ok(output_path) => {
@@ -476,4 +544,256 @@ fn cmd_remove(targets: &[String]) {
             Err(e) => eprintln!("  Error: {}", e),
         }
     }
+}
+
+fn find_existing_narou_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    loop {
+        if current.join(".narou").is_dir() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn ensure_dot_narou_files(root: &Path) -> narou_rs::error::Result<usize> {
+    let dir = root.join(".narou");
+    std::fs::create_dir_all(&dir)?;
+
+    let files = [
+        ("local_setting.yaml", "--- {}\n"),
+        ("database.yaml", "--- {}\n"),
+        (
+            "database_index.yaml",
+            "---\nby_toc_url: {}\nby_title: {}\nmeta: {}\n",
+        ),
+        ("alias.yaml", "--- {}\n"),
+        ("freeze.yaml", "--- {}\n"),
+        ("tag_colors.yaml", "--- {}\n"),
+        ("latest_convert.yaml", "--- {}\n"),
+        ("queue.yaml", "---\njobs: []\ncompleted: []\nfailed: []\n"),
+        ("notepad.txt", ""),
+    ];
+
+    let mut created = 0usize;
+    for (name, content) in files {
+        let path = dir.join(name);
+        if !path.exists() {
+            std::fs::write(path, content)?;
+            created += 1;
+        }
+    }
+    Ok(created)
+}
+
+fn copy_bundled_webnovel_files(destination: &Path) -> narou_rs::error::Result<usize> {
+    let source = bundled_webnovel_dir();
+    let Some(source) = source else {
+        return Ok(0);
+    };
+
+    let mut copied = 0usize;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        let is_yaml = matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("yaml") | Some("yml")
+        );
+        if !is_yaml {
+            continue;
+        }
+        let filename = match path.file_name() {
+            Some(name) => name,
+            None => continue,
+        };
+        let target = destination.join(filename);
+        if !target.exists() {
+            std::fs::copy(&path, &target)?;
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
+fn bundled_webnovel_dir() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("webnovel"));
+        }
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("webnovel"));
+
+    candidates.into_iter().find(|path| path.is_dir())
+}
+
+fn save_global_init_settings(
+    aozora_path: Option<&str>,
+    line_height: Option<f64>,
+) -> narou_rs::error::Result<()> {
+    if aozora_path.is_none() && line_height.is_none() {
+        return Ok(());
+    }
+
+    let global_dir = home_dir().join(".narousetting");
+    let global_path = global_dir.join("global_setting.yaml");
+
+    let mut settings = if global_path.exists() {
+        let raw = std::fs::read_to_string(&global_path)?;
+        serde_yaml::from_str::<std::collections::BTreeMap<String, serde_yaml::Value>>(&raw)
+            .unwrap_or_default()
+    } else {
+        std::collections::BTreeMap::new()
+    };
+
+    let resolved_aozora_path = resolve_init_aozora_path(aozora_path, &settings);
+    let Some(resolved_aozora_path) = resolved_aozora_path else {
+        if aozora_path.is_some() {
+            println!("指定されたフォルダにAozoraEpub3がありません。");
+        }
+        println!("AozoraEpub3 の設定をスキップしました");
+        return Ok(());
+    };
+
+    let height = line_height
+        .or_else(|| settings.get("line-height").and_then(|value| value.as_f64()))
+        .unwrap_or(1.8);
+
+    settings.insert(
+        "aozoraepub3dir".to_string(),
+        serde_yaml::Value::String(resolved_aozora_path.clone()),
+    );
+    settings.insert(
+        "line-height".to_string(),
+        serde_yaml::to_value(height).unwrap_or(serde_yaml::Value::Null),
+    );
+
+    rewrite_aozoraepub3_files(&resolved_aozora_path, height)?;
+
+    let content = serde_yaml::to_string(&settings)?;
+    std::fs::create_dir_all(&global_dir)?;
+    std::fs::write(global_path, content)?;
+    println!("グローバル設定を保存しました");
+
+    Ok(())
+}
+
+fn resolve_init_aozora_path(
+    aozora_path: Option<&str>,
+    settings: &std::collections::BTreeMap<String, serde_yaml::Value>,
+) -> Option<String> {
+    match aozora_path {
+        Some(":keep") => settings
+            .get("aozoraepub3dir")
+            .and_then(|value| value.as_str())
+            .and_then(validate_aozoraepub3_path),
+        Some(path) => validate_aozoraepub3_path(path),
+        None => settings
+            .get("aozoraepub3dir")
+            .and_then(|value| value.as_str())
+            .and_then(validate_aozoraepub3_path),
+    }
+}
+
+fn validate_aozoraepub3_path(path: &str) -> Option<String> {
+    let normalized = normalize_path_string(path);
+    if PathBuf::from(&normalized).join("AozoraEpub3.jar").exists() {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn rewrite_aozoraepub3_files(aozora_path: &str, line_height: f64) -> narou_rs::error::Result<()> {
+    let preset_dir = preset_dir()?;
+    let aozora_dir = PathBuf::from(aozora_path);
+
+    let custom_chuki_tag = std::fs::read_to_string(preset_dir.join("custom_chuki_tag.txt"))?;
+    let chuki_tag_path = aozora_dir.join("chuki_tag.txt");
+    let mut chuki_tag = std::fs::read_to_string(&chuki_tag_path)?;
+    let embedded_mark = "### Narou.rb embedded custom chuki ###";
+    if let (Some(start), Some(end)) = (chuki_tag.find(embedded_mark), chuki_tag.rfind(embedded_mark))
+    {
+        if start != end {
+            let end = end + embedded_mark.len();
+            chuki_tag.replace_range(start..end, &custom_chuki_tag);
+        } else {
+            chuki_tag.push('\n');
+            chuki_tag.push_str(&custom_chuki_tag);
+        }
+    } else {
+        chuki_tag.push('\n');
+        chuki_tag.push_str(&custom_chuki_tag);
+    }
+    std::fs::write(&chuki_tag_path, chuki_tag)?;
+
+    std::fs::copy(
+        preset_dir.join("AozoraEpub3.ini"),
+        aozora_dir.join("AozoraEpub3.ini"),
+    )?;
+
+    let vertical_font = std::fs::read_to_string(preset_dir.join("vertical_font.css"))?
+        .replace("<%= line_height %>", &format_line_height(line_height));
+    let vertical_font_path = aozora_dir
+        .join("template")
+        .join("OPS")
+        .join("css_custom")
+        .join("vertical_font.css");
+    if let Some(parent) = vertical_font_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(vertical_font_path, vertical_font)?;
+
+    println!("AozoraEpub3 の構成ファイルを書き換えました");
+    Ok(())
+}
+
+fn preset_dir() -> narou_rs::error::Result<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("preset"));
+        }
+    }
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    candidates.push(manifest_dir.join("preset"));
+    candidates.push(manifest_dir.join("sample").join("narou").join("preset"));
+
+    candidates.into_iter().find(|path| path.is_dir()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "narou preset directory not found").into()
+    })
+}
+
+fn format_line_height(line_height: f64) -> String {
+    let mut text = line_height.to_string();
+    if text.contains('.') {
+        while text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+    }
+    text
+}
+
+fn normalize_path_string(path: &str) -> String {
+    let path = path.trim_matches('"');
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| PathBuf::from(path))
+        .display()
+        .to_string()
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("."))
+        })
 }

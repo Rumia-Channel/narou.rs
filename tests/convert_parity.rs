@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use narou_rs::converter::NovelConverter;
 use narou_rs::converter::settings::NovelSettings;
-use narou_rs::downloader::{SectionElement, SectionFile, SubtitleInfo, TocObject};
+use narou_rs::downloader::{SectionElement, SectionFile, SubtitleInfo, TocFile, TocObject};
 
 #[test]
 fn story_html_is_converted_before_text_pipeline() {
@@ -57,15 +57,41 @@ fn kakuyomu_sample_matches_narou_rb_reference_byte_for_byte() {
     let sample_root = root.join("sample");
     let reference = find_file_named(&sample_root, "kakuyomu_jp_1177354055617350769.txt")
         .expect("reference output fixture");
-    let novel_dir = find_dir_starting_with(&sample_root.join("novel"), "1177354055617350769")
-        .expect("downloaded kakuyomu sample");
+    let novel_dir =
+        find_dir_starting_with(&sample_root, "1177354055617350769").expect("kakuyomu sample");
 
     let mut converter = NovelConverter::new(NovelSettings::default());
-    let output = converter.convert_novel_by_id(2, &novel_dir).unwrap();
+    let output = convert_sample_to_string(&mut converter, &novel_dir);
 
     let reference_bytes = fs::read(reference).unwrap();
-    let output_bytes = fs::read(output).unwrap();
-    assert_eq!(output_bytes, reference_bytes);
+    assert_eq!(output.into_bytes(), reference_bytes);
+}
+
+fn convert_sample_to_string(converter: &mut NovelConverter, novel_dir: &Path) -> String {
+    let toc: TocFile =
+        serde_yaml::from_str(&fs::read_to_string(novel_dir.join("toc.yaml")).expect("toc.yaml"))
+            .expect("parse toc.yaml");
+    let toc_object = TocObject {
+        title: toc.title,
+        author: toc.author,
+        toc_url: toc.toc_url,
+        story: toc.story,
+        subtitles: toc.subtitles,
+        novel_type: toc.novel_type,
+    };
+    let sections = toc_object
+        .subtitles
+        .iter()
+        .map(|sub| {
+            let path = novel_dir
+                .join("本文")
+                .join(format!("{} {}.yaml", sub.index, sub.file_subtitle));
+            serde_yaml::from_str::<SectionFile>(&fs::read_to_string(path).expect("section yaml"))
+                .expect("parse section yaml")
+        })
+        .collect::<Vec<_>>();
+
+    converter.convert_novel(&toc_object, &sections).unwrap()
 }
 
 fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
