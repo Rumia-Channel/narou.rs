@@ -9,7 +9,7 @@ serde_yaml = "0.9"
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
-reqwest = { version = "0.12", features = ["cookies", "gzip", "brotli", "deflate", "blocking"] }
+reqwest = { version = "0.12", features = ["cookies", "gzip", "brotli", "deflate", "blocking", "native-tls"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -25,6 +25,7 @@ parking_lot = "0.12"
 dashmap = "6"
 tower-http = { version = "0.6", features = ["cors"] }
 futures = "0.3"
-pest = "2.8.6"
-pest_derive = "2.8.6"
-ua_generator = { git = "https://github.com/spider-rs/ua_generator.git", version = "0.5.56" }
+pest = "2.8"
+pest_derive = "2.8"
+ua_generator = { git = "https://github.com/spider-rs/ua_generator.git", version = "0.5" }
+curl = "0.4"

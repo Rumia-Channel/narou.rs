@@ -7,10 +7,9 @@ pub mod site_setting;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use reqwest::header::{
-    ACCEPT, ACCEPT_CHARSET, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONNECTION, HeaderMap, HeaderValue,
+    HeaderMap, HeaderValue, ACCEPT, ACCEPT_CHARSET, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONNECTION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,10 +58,12 @@ pub struct NarouApiEntry {
     pub length: i64,
 }
 
+const FAIL_THRESHOLD: u8 = 5;
+
 pub struct Downloader {
     client: reqwest::blocking::Client,
     user_agent: String,
-    prefer_curl: bool,
+    tier_failures: HashMap<String, [u8; 3]>,
     rate_limiter: RateLimiter,
     site_settings: Vec<SiteSetting>,
     section_cache: HashMap<String, SectionElement>,
@@ -188,7 +189,7 @@ impl Downloader {
         Ok(Self {
             client,
             user_agent: ua,
-            prefer_curl: false,
+            tier_failures: HashMap::new(),
             rate_limiter: RateLimiter::new(),
             site_settings,
             section_cache: HashMap::new(),
@@ -291,56 +292,137 @@ impl Downloader {
         None
     }
 
-    pub fn fetch_toc(&mut self, setting: &SiteSetting, toc_url: &str) -> Result<String> {
-        self.rate_limiter.wait();
-        let url = toc_url.to_string();
+    fn domain_of(url: &str) -> &str {
+        let s = url.strip_prefix("https://").unwrap_or(url);
+        let s = s.strip_prefix("http://").unwrap_or(s);
+        s.split('/').next().unwrap_or(s)
+    }
 
-        if self.prefer_curl {
-            if let Some(body) = self.fetch_text_with_curl(&url, setting.cookie()) {
-                let mut body = body;
-                pretreatment_source(&mut body, setting.encoding(), Some(setting));
+    fn fetch_text(&mut self, url: &str, cookie: Option<&str>) -> Result<String> {
+        let domain = Self::domain_of(url).to_string();
+
+        let skip_curl = self
+            .tier_failures
+            .get(&domain)
+            .map_or(false, |f| f[0] >= FAIL_THRESHOLD);
+        let skip_reqwest = self
+            .tier_failures
+            .get(&domain)
+            .map_or(false, |f| f[1] >= FAIL_THRESHOLD);
+        let skip_wget = self
+            .tier_failures
+            .get(&domain)
+            .map_or(false, |f| f[2] >= FAIL_THRESHOLD);
+
+        if !skip_curl {
+            if let Some(body) = self.fetch_tier_curl(url, cookie) {
                 return Ok(body);
             }
+            self.tier_failures.entry(domain.clone()).or_insert([0; 3])[0] += 1;
         }
 
-        let mut request = self.client.get(&url);
-
-        if let Some(cookie) = setting.cookie() {
-            request = request.header("Cookie", cookie);
-        }
-
-        let response = request.send()?;
-        let status = response.status();
-        if !status.is_success() {
-            if status.as_u16() == 403 {
-                if let Some(body) = self.fetch_text_with_curl(&url, setting.cookie()) {
-                    self.prefer_curl = true;
-                    let mut body = body;
-                    pretreatment_source(&mut body, setting.encoding(), Some(setting));
-
-                    if let Some(error_pattern) = setting.error_message() {
-                        if let Ok(re) = regex::Regex::new(error_pattern) {
-                            if re.is_match(&body) {
-                                return Err(NarouError::NotFound(
-                                    "Novel deleted or private".into(),
-                                ));
-                            }
-                        }
-                    }
-
-                    return Ok(body);
+        if !skip_reqwest {
+            match self.fetch_tier_reqwest(url, cookie) {
+                Ok(body) => return Ok(body),
+                Err(_) => {
+                    self.tier_failures.entry(domain.clone()).or_insert([0; 3])[1] += 1;
                 }
             }
-            if status.as_u16() == 503 {
-                return Err(NarouError::SuspendDownload("Rate limited (503)".into()));
-            }
-            if status.as_u16() == 404 {
-                return Err(NarouError::NotFound(url));
-            }
-            return Err(response.error_for_status().unwrap_err().into());
         }
 
-        let mut body = response.text()?;
+        if !skip_wget {
+            if let Some(body) = self.fetch_tier_wget(url, cookie) {
+                return Ok(body);
+            }
+            self.tier_failures.entry(domain.clone()).or_insert([0; 3])[2] += 1;
+        }
+
+        Err(NarouError::NotFound(url.to_string()))
+    }
+
+    fn fetch_tier_curl(&self, url: &str, cookie: Option<&str>) -> Option<String> {
+        let mut handle = curl::easy::Easy::new();
+        handle.url(url).ok()?;
+        handle.useragent(&self.user_agent).ok()?;
+        handle.follow_location(true).ok()?;
+        handle.accept_encoding("gzip, deflate").ok();
+
+        let mut headers = curl::easy::List::new();
+        headers.append("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8").ok()?;
+        headers
+            .append("Accept-Language: ja,en-US;q=0.9,en;q=0.8")
+            .ok()?;
+        headers.append("Accept-Charset: utf-8").ok()?;
+        headers.append("Connection: keep-alive").ok()?;
+        if let Some(cookie) = cookie {
+            headers.append(&format!("Cookie: {cookie}")).ok()?;
+        }
+        handle.http_headers(headers).ok()?;
+
+        let mut body = Vec::new();
+        {
+            let mut transfer = handle.transfer();
+            transfer
+                .write_function(|data| {
+                    body.extend_from_slice(data);
+                    Ok(data.len())
+                })
+                .ok()?;
+            transfer.perform().ok()?;
+        }
+
+        let code = handle.response_code().ok()?;
+        if code >= 400 {
+            return None;
+        }
+
+        Some(String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn fetch_tier_reqwest(&self, url: &str, cookie: Option<&str>) -> Result<String> {
+        let mut request = self.client.get(url);
+        if let Some(cookie) = cookie {
+            request = request.header("Cookie", cookie);
+        }
+        let response = request.send()?;
+        let status = response.status();
+        if status.as_u16() == 503 {
+            return Err(NarouError::SuspendDownload("Rate limited (503)".into()));
+        }
+        if status.as_u16() == 404 {
+            return Err(NarouError::NotFound(url.to_string()));
+        }
+        if !status.is_success() {
+            return Err(response.error_for_status().unwrap_err().into());
+        }
+        Ok(response.text()?)
+    }
+
+    fn fetch_tier_wget(&self, url: &str, cookie: Option<&str>) -> Option<String> {
+        let mut cmd = std::process::Command::new("wget");
+        cmd.arg("--quiet")
+            .arg("--output-document=-")
+            .arg("--no-check-certificate")
+            .arg(format!("--user-agent={}", &self.user_agent))
+            .arg("--header=Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+            .arg("--header=Accept-Language: ja,en-US;q=0.9,en;q=0.8")
+            .arg("--header=Accept-Encoding: gzip, deflate")
+            .arg("--header=Connection: keep-alive");
+        if let Some(cookie) = cookie {
+            cmd.arg(format!("--header=Cookie: {cookie}"));
+        }
+        let output = cmd.arg(url).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    pub fn fetch_toc(&mut self, setting: &SiteSetting, toc_url: &str) -> Result<String> {
+        self.rate_limiter.wait();
+
+        let body = self.fetch_text(toc_url, setting.cookie())?;
+        let mut body = body;
         pretreatment_source(&mut body, setting.encoding(), Some(setting));
 
         if let Some(error_pattern) = setting.error_message() {
@@ -443,38 +525,8 @@ impl Downloader {
         self.rate_limiter.wait();
         let url = build_section_url(setting, toc_url, &subtitle.href);
 
-        if self.prefer_curl {
-            if let Some(mut html_source) = self.fetch_text_with_curl(&url, setting.cookie()) {
-                pretreatment_source(&mut html_source, setting.encoding(), Some(setting));
-                return self.parse_section_html(setting, subtitle, html_source);
-            }
-        }
-
-        let mut request = self.client.get(&url);
-        if let Some(cookie) = setting.cookie() {
-            request = request.header("Cookie", cookie);
-        }
-
-        let response = request.send()?;
-        let status = response.status();
-        let mut html_source = if !status.is_success() {
-            if status.as_u16() == 403 {
-                if let Some(body) = self.fetch_text_with_curl(&url, setting.cookie()) {
-                    self.prefer_curl = true;
-                    body
-                } else {
-                    return Err(response.error_for_status().unwrap_err().into());
-                }
-            } else {
-                if status.as_u16() == 503 {
-                    return Err(NarouError::SuspendDownload("Rate limited (503)".into()));
-                }
-                return Err(response.error_for_status().unwrap_err().into());
-            }
-        } else {
-            response.text()?
-        };
-
+        let html_source = self.fetch_text(&url, setting.cookie())?;
+        let mut html_source = html_source;
         pretreatment_source(&mut html_source, setting.encoding(), Some(setting));
         self.parse_section_html(setting, subtitle, html_source)
     }
@@ -536,40 +588,6 @@ impl Downloader {
         Ok((element, html_source))
     }
 
-    fn fetch_text_with_curl(&self, url: &str, cookie: Option<&str>) -> Option<String> {
-        let mut command = std::process::Command::new(curl_command());
-        command
-            .arg("--fail")
-            .arg("--silent")
-            .arg("--show-error")
-            .arg("--location")
-            .arg("--http1.1")
-            .arg("--compressed")
-            .arg("--user-agent")
-            .arg(&self.user_agent)
-            .arg("--header")
-            .arg("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-            .arg("--header")
-            .arg("Accept-Language: ja,en-US;q=0.9,en;q=0.8")
-            .arg("--header")
-            .arg(curl_accept_encoding_header())
-            .arg("--header")
-            .arg("Accept-Charset: utf-8")
-            .arg("--header")
-            .arg("Connection: keep-alive");
-
-        if let Some(cookie) = cookie {
-            command.arg("--header").arg(format!("Cookie: {cookie}"));
-        }
-
-        let output = command.arg(url).output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-
-        Some(String::from_utf8_lossy(&output.stdout).into_owned())
-    }
-
     fn load_novel_info(
         &mut self,
         setting: &SiteSetting,
@@ -584,34 +602,13 @@ impl Downloader {
             .novel_info_url_with_captures(url_captures)
             .unwrap_or_else(|| setting.interpolate(novel_info_url));
 
-        if self.prefer_curl {
-            if let Some(mut body) = self.fetch_text_with_curl(&resolved_url, setting.cookie()) {
+        match self.fetch_text(&resolved_url, setting.cookie()) {
+            Ok(mut body) => {
                 pretreatment_source(&mut body, setting.encoding(), Some(setting));
-                return Ok(NovelInfo::from_novel_info_source(setting, &body));
+                Ok(NovelInfo::from_novel_info_source(setting, &body))
             }
+            Err(_) => Ok(NovelInfo::from_toc_source(setting, toc_source)),
         }
-
-        let mut request = self.client.get(&resolved_url);
-        if let Some(cookie) = setting.cookie() {
-            request = request.header("Cookie", cookie);
-        }
-
-        let response = request.send()?;
-        if response.status().is_success() {
-            let mut body = response.text()?;
-            pretreatment_source(&mut body, setting.encoding(), Some(setting));
-            return Ok(NovelInfo::from_novel_info_source(setting, &body));
-        }
-
-        if response.status().as_u16() == 403 {
-            if let Some(mut body) = self.fetch_text_with_curl(&resolved_url, setting.cookie()) {
-                self.prefer_curl = true;
-                pretreatment_source(&mut body, setting.encoding(), Some(setting));
-                return Ok(NovelInfo::from_novel_info_source(setting, &body));
-            }
-        }
-
-        Ok(NovelInfo::from_toc_source(setting, toc_source))
     }
 
     pub fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
@@ -1392,35 +1389,6 @@ fn default_request_headers() -> HeaderMap {
     headers.insert(ACCEPT_CHARSET, HeaderValue::from_static("utf-8"));
     headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
     headers
-}
-
-fn curl_command() -> &'static str {
-    if cfg!(windows) { "curl.exe" } else { "curl" }
-}
-
-fn curl_accept_encoding_header() -> &'static str {
-    if curl_supports_brotli() {
-        "Accept-Encoding: gzip, deflate, br"
-    } else {
-        "Accept-Encoding: gzip, deflate"
-    }
-}
-
-fn curl_supports_brotli() -> bool {
-    static SUPPORTS_BROTLI: OnceLock<bool> = OnceLock::new();
-    *SUPPORTS_BROTLI.get_or_init(|| {
-        let output = std::process::Command::new(curl_command())
-            .arg("-V")
-            .output()
-            .ok();
-        output
-            .and_then(|out| String::from_utf8(out.stdout).ok())
-            .map(|text| {
-                let lower = text.to_ascii_lowercase();
-                lower.contains("brotli") || lower.contains("libbrotli")
-            })
-            .unwrap_or(false)
-    })
 }
 
 fn build_section_url(setting: &SiteSetting, toc_url: &str, href: &str) -> String {
