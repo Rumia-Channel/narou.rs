@@ -36,3 +36,5 @@ target
 /.cocoindex_code
 
 errors.txt
+
+*.txt

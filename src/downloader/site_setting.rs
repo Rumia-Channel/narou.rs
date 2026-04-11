@@ -182,8 +182,8 @@ impl SiteSetting {
 
     fn compile(&mut self) {
         if let Some(ref src) = self.preprocess {
-            self.compiled_preprocess =
-                crate::downloader::preprocess::PreprocessPipeline::compile(src).ok();
+            let result = crate::downloader::preprocess::PreprocessPipeline::compile(src);
+            self.compiled_preprocess = result.ok();
         }
         self.compiled_url = self.compile_url_patterns();
         self.compiled_subtitles = self.subtitles.as_ref().and_then(|v| self.compile_value(v));
@@ -257,48 +257,7 @@ impl SiteSetting {
     }
 
     pub fn interpolate(&self, pattern: &str) -> String {
-        let top_url_resolved = {
-            let re = Regex::new(r"\\+k<(.+?)>").unwrap();
-            let scheme = self.scheme.as_str();
-            let domain = self.domain.as_str();
-            let mut result = self.top_url.as_str().to_string();
-            result = re
-                .replace_all(&result, |caps: &regex::Captures| {
-                    let key = &caps[1];
-                    match key {
-                        "scheme" => scheme.to_string(),
-                        "domain" => domain.to_string(),
-                        _ => caps
-                            .get(0)
-                            .map(|m| m.as_str().to_string())
-                            .unwrap_or_default(),
-                    }
-                })
-                .to_string();
-            result
-        };
-
-        let vars: HashMap<&str, &str> = [
-            ("scheme", self.scheme.as_str()),
-            ("domain", self.domain.as_str()),
-            ("top_url", &top_url_resolved),
-            ("toc_url", self.toc_url.as_str()),
-        ]
-        .into_iter()
-        .collect();
-
-        let re = Regex::new(r"\\+k<(.+?)>").unwrap();
-        re.replace_all(pattern, |caps: &regex::Captures| {
-            let key = &caps[1];
-            match vars.get(key).copied() {
-                Some(v) => v.to_string(),
-                None => caps
-                    .get(0)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default(),
-            }
-        })
-        .to_string()
+        self.interpolate_with_captures(pattern, &HashMap::new())
     }
 
     pub fn matches_url(&self, url: &str) -> bool {
@@ -530,29 +489,97 @@ impl SiteSetting {
         pattern: &str,
         captures: &HashMap<String, String>,
     ) -> String {
-        let mut result = self.interpolate(pattern);
-
+        let base = self.build_base_vars();
         let re = Regex::new(r"\\+k<(.+?)>").unwrap();
-        result = re
-            .replace_all(&result, |caps: &regex::Captures| {
-                let key = &caps[1];
-                captures
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| self.interpolate_key(key))
-            })
-            .to_string();
-
-        result
+        re.replace_all(pattern, |caps: &regex::Captures| {
+            let key = &caps[1];
+            self.resolve_k_key(key, captures, &base, &mut Vec::new())
+        })
+        .to_string()
     }
 
-    fn interpolate_key(&self, key: &str) -> String {
-        match key {
-            "scheme" => self.scheme.clone(),
-            "domain" => self.domain.clone(),
-            "top_url" => self.interpolate(&self.top_url),
-            _ => String::new(),
+    fn resolve_k_key(
+        &self,
+        key: &str,
+        captures: &HashMap<String, String>,
+        base: &HashMap<String, String>,
+        seen: &mut Vec<String>,
+    ) -> String {
+        if seen.contains(&key.to_string()) {
+            return String::new();
         }
+        seen.push(key.to_string());
+        let value = captures
+            .get(key)
+            .cloned()
+            .or_else(|| base.get(key).cloned());
+        match value {
+            Some(v) => {
+                let re = Regex::new(r"\\+k<(.+?)>").unwrap();
+                re.replace_all(&v, |caps: &regex::Captures| {
+                    let k = &caps[1];
+                    self.resolve_k_key(k, captures, base, seen)
+                })
+                .to_string()
+            }
+            None => format!("\\k<{}>", key),
+        }
+    }
+
+    
+
+    fn build_base_vars(&self) -> HashMap<String, String> {
+        let mut vars = HashMap::new();
+        vars.insert("scheme".to_string(), self.scheme.clone());
+        vars.insert("domain".to_string(), self.domain.clone());
+        vars.insert("top_url".to_string(), self.top_url.clone());
+        vars.insert("toc_url".to_string(), self.toc_url.clone());
+        vars.insert("name".to_string(), self.name.clone());
+        vars.insert("sitename".to_string(), self.sitename.clone());
+        vars.insert("encoding".to_string(), self.encoding.clone());
+        if let Some(ref v) = self.cookie {
+            vars.insert("cookie".to_string(), v.clone());
+        }
+        if let Some(ref v) = self.href {
+            vars.insert("href".to_string(), v.clone());
+        }
+        if let Some(ref v) = self.next_toc {
+            vars.insert("next_toc".to_string(), v.clone());
+        }
+        if let Some(ref v) = self.next_url {
+            vars.insert("next_url".to_string(), v.clone());
+        }
+        if let Some(ref v) = self.toc_page_max {
+            vars.insert("toc_page_max".to_string(), v.clone());
+        }
+        if let Some(ref v) = self.body_pattern {
+            vars.insert("body_pattern".to_string(), v.clone());
+        }
+        if let Some(ref v) = self.introduction_pattern {
+            vars.insert("introduction_pattern".to_string(), v.clone());
+        }
+        if let Some(ref v) = self.postscript_pattern {
+            vars.insert("postscript_pattern".to_string(), v.clone());
+        }
+        if let Some(ref v) = self.novel_info_url {
+            vars.insert("novel_info_url".to_string(), v.clone());
+        }
+        if let Some(ref v) = self.error_message {
+            vars.insert("error_message".to_string(), v.clone());
+        }
+        if let Some(ref v) = self.title_strip_pattern {
+            vars.insert("title_strip_pattern".to_string(), v.clone());
+        }
+        if let Some(ref v) = self.narou_api_url {
+            vars.insert("narou_api_url".to_string(), v.clone());
+        }
+        if let Some(ref v) = self.illust_current_url {
+            vars.insert("illust_current_url".to_string(), v.clone());
+        }
+        if let Some(ref v) = self.illust_grep_pattern {
+            vars.insert("illust_grep_pattern".to_string(), v.clone());
+        }
+        vars
     }
 
     pub fn get_novel_type_from_string(&self, status_text: &str) -> (u8, bool) {

@@ -113,8 +113,11 @@ pub fn parse_preprocess(source: &str) -> Result<Vec<Stmt>, String> {
         .map_err(|e| format!("preprocess parse error: {e}"))?;
     let mut stmts = Vec::new();
     for pair in pairs {
-        if pair.as_rule() == Rule::stmt {
-            stmts.push(build_stmt(pair));
+        for inner in pair.into_inner() {
+            if inner.as_rule() == Rule::stmt {
+                let stmt_inner = inner.into_inner().next().unwrap();
+                stmts.push(build_stmt(stmt_inner));
+            }
         }
     }
     Ok(stmts)
@@ -152,10 +155,23 @@ fn build_stmt(pair: pest::iterators::Pair<Rule>) -> Stmt {
             for p in inner {
                 match p.as_rule() {
                     Rule::stmt => {
+                        let inner_stmt = p.into_inner().next().unwrap();
                         if in_else {
-                            else_body.get_or_insert_with(Vec::new).push(build_stmt(p));
+                            else_body.get_or_insert_with(Vec::new).push(build_stmt(inner_stmt));
                         } else {
-                            body.push(build_stmt(p));
+                            body.push(build_stmt(inner_stmt));
+                        }
+                    }
+                    Rule::stmts => {
+                        for sp in p.into_inner() {
+                            if sp.as_rule() == Rule::stmt {
+                                let inner_stmt = sp.into_inner().next().unwrap();
+                                if in_else {
+                                    else_body.get_or_insert_with(Vec::new).push(build_stmt(inner_stmt));
+                                } else {
+                                    body.push(build_stmt(inner_stmt));
+                                }
+                            }
                         }
                     }
                     _ => {
@@ -175,7 +191,24 @@ fn build_stmt(pair: pest::iterators::Pair<Rule>) -> Stmt {
             let mut inner = pair.into_inner();
             let var = inner.next().unwrap().as_str().to_string();
             let iter = build_expr(inner.next().unwrap());
-            let body = inner.filter(|p| p.as_rule() == Rule::stmt).map(build_stmt).collect();
+            let mut body = Vec::new();
+            for p in inner {
+                match p.as_rule() {
+                    Rule::stmt => {
+                        let inner_stmt = p.into_inner().next().unwrap();
+                        body.push(build_stmt(inner_stmt));
+                    }
+                    Rule::stmts => {
+                        for sp in p.into_inner() {
+                            if sp.as_rule() == Rule::stmt {
+                                let inner_stmt = sp.into_inner().next().unwrap();
+                                body.push(build_stmt(inner_stmt));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Stmt::For { var, iter, body }
         }
         _ => unreachable!("unexpected stmt rule: {:?}", pair.as_rule()),
@@ -232,7 +265,7 @@ fn build_expr(pair: pest::iterators::Pair<Rule>) -> Expr {
             }
         }
         Rule::primary => build_expr(pair.into_inner().next().unwrap()),
-        Rule::string => Expr::String(build_string_parts(pair)),
+        Rule::string | Rule::i_string | Rule::r_string => Expr::String(build_string_parts(pair)),
         Rule::extract_json_expr => {
             let mut inner = pair.into_inner();
             let regex_pair = inner.next().unwrap();
@@ -241,8 +274,25 @@ fn build_expr(pair: pest::iterators::Pair<Rule>) -> Expr {
         }
         Rule::chain_expr => {
             let mut inner = pair.into_inner();
-            let accessor = build_accessor(inner.next().unwrap());
-            let methods: Vec<Method> = inner.map(build_method).collect();
+            let base_name = inner.next().unwrap().as_str().to_string();
+            let mut path: Vec<AccessPart> = Vec::new();
+            let mut methods: Vec<Method> = Vec::new();
+            for part in inner {
+                match part.as_rule() {
+                    Rule::dot_access => {
+                        let field = part.into_inner().next().unwrap().as_str().to_string();
+                        path.push(AccessPart::Dot(field));
+                    }
+                    Rule::bracket_access => {
+                        let key_pair = part.into_inner().next().unwrap();
+                        path.push(AccessPart::Bracket(build_bracket_key(key_pair)));
+                    }
+                    _ => {
+                        methods.push(build_method(part));
+                    }
+                }
+            }
+            let accessor = Accessor { base: base_name, path };
             if methods.is_empty() {
                 Expr::Access(accessor)
             } else {
@@ -359,37 +409,95 @@ fn build_access_part(pair: pest::iterators::Pair<Rule>) -> AccessPart {
 
 fn build_bracket_key(pair: pest::iterators::Pair<Rule>) -> BracketKey {
     match pair.as_rule() {
-        Rule::string => BracketKey::Str(build_string_parts(pair)),
-        Rule::accessor => BracketKey::Accessor(build_accessor(pair)),
+        Rule::string | Rule::i_string | Rule::r_string => BracketKey::Str(build_string_parts(pair)),
+        Rule::chain_expr => {
+            let accessor = {
+                let mut inner = pair.into_inner();
+                let base = inner.next().unwrap().as_str().to_string();
+                let path = inner
+                    .filter_map(|p| match p.as_rule() {
+                        Rule::dot_access => {
+                            let field = p.into_inner().next().unwrap().as_str().to_string();
+                            Some(AccessPart::Dot(field))
+                        }
+                        Rule::bracket_access => {
+                            let key_pair = p.into_inner().next().unwrap();
+                            Some(AccessPart::Bracket(build_bracket_key(key_pair)))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                Accessor { base, path }
+            };
+            BracketKey::Accessor(accessor)
+        }
         _ => unreachable!("unexpected bracket_key: {:?}", pair.as_rule()),
+    }
+}
+
+fn build_string_from_inner(pair: pest::iterators::Pair<Rule>) -> Vec<StrPart> {
+    match pair.as_rule() {
+        Rule::i_string | Rule::r_string => build_string_parts(pair),
+        other => unreachable!("unexpected string inner: {:?}", other),
     }
 }
 
 fn build_lvalue(pair: pest::iterators::Pair<Rule>) -> LValue {
     let mut inner = pair.into_inner();
     let base = inner.next().unwrap().as_str().to_string();
-    let keys: Vec<Vec<StrPart>> = inner.map(|p| build_string_parts(p)).collect();
-    if keys.is_empty() {
+    let mut dot_keys: Vec<String> = Vec::new();
+    let mut bracket_keys: Vec<Vec<StrPart>> = Vec::new();
+    for part in inner {
+        match part.as_rule() {
+            Rule::dot_key => {
+                dot_keys.push(part.into_inner().next().unwrap().as_str().to_string());
+            }
+            Rule::bracket_key => {
+                let key_inner = part.into_inner().next().unwrap();
+                bracket_keys.push(build_string_from_inner(key_inner));
+            }
+            other => unreachable!("unexpected lvalue part: {:?}", other),
+        }
+    }
+    if dot_keys.len() == 1 && bracket_keys.is_empty() {
+        LValue::Hash {
+            base,
+            keys: vec![dot_keys.into_iter().map(|k| StrPart::Lit(k)).collect()],
+        }
+    } else if !bracket_keys.is_empty() {
+        LValue::Hash {
+            base,
+            keys: bracket_keys,
+        }
+    } else if dot_keys.is_empty() {
         LValue::Var(base)
     } else {
-        LValue::Hash { base, keys }
+        LValue::Hash {
+            base,
+            keys: dot_keys.into_iter().map(|k| vec![StrPart::Lit(k)]).collect(),
+        }
     }
+}
+
+fn build_block(pair: pest::iterators::Pair<Rule>) -> (String, Expr) {
+    let mut inner = pair.into_inner();
+    let var = inner.next().unwrap().as_str().to_string();
+    let body = Box::new(build_expr(inner.next().unwrap()));
+    (var, *body)
 }
 
 fn build_method(pair: pest::iterators::Pair<Rule>) -> Method {
     let s = pair.as_str();
     match s {
         s if s.starts_with(".map ") || s.starts_with(".map{") => {
-            let mut inner = pair.into_inner();
-            let var = inner.next().unwrap().as_str().to_string();
-            let body = Box::new(build_expr(inner.next().unwrap()));
-            Method::Map { var, body }
+            let block = pair.into_inner().next().unwrap();
+            let (var, body) = build_block(block);
+            Method::Map { var, body: Box::new(body) }
         }
         s if s.starts_with(".flat_map") => {
-            let mut inner = pair.into_inner();
-            let var = inner.next().unwrap().as_str().to_string();
-            let body = Box::new(build_expr(inner.next().unwrap()));
-            Method::FlatMap { var, body }
+            let block = pair.into_inner().next().unwrap();
+            let (var, body) = build_block(block);
+            Method::FlatMap { var, body: Box::new(body) }
         }
         ".flatten" => Method::Flatten,
         ".compact" => Method::Compact,
@@ -591,7 +699,13 @@ fn eval_method(ctx: &mut Ctx, val: Value, method: &Method) -> Value {
                 ctx.set(var, item.clone());
                 let mapped = eval_expr(ctx, body);
                 if let Some(sub) = mapped.as_array() {
-                    result.extend(sub.iter().cloned());
+                    for elem in sub {
+                        if let Some(nested) = elem.as_array() {
+                            result.extend(nested.iter().cloned());
+                        } else {
+                            result.push(elem.clone());
+                        }
+                    }
                 } else {
                     result.push(mapped);
                 }

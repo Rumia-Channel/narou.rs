@@ -4,7 +4,9 @@
 WHITESPACE = _{ " " | "\t" }
 COMMENT     = _{ "#" ~ (!"\n" ~ ANY)* }
 
-program = { SOI ~ (stmt ~ TERM)* ~ stmt? ~ EOI }
+program = { SOI ~ TERML* ~ (stmt ~ TERML+)* ~ stmt? ~ EOI }
+
+TERML = _{ TERM | COMMENT }
 
 TERM = _{ "\n" | "\r\n" }
 
@@ -25,22 +27,23 @@ emit_stmt   = { "emit" ~ expr }
 insert_stmt = { "insert_at_match" }
 
 if_stmt = {
-    "if" ~ expr ~ TERM+
+    "if" ~ expr ~ TERML+
     ~ stmts
-    ~ (TERM* ~ "else" ~ TERM+ ~ stmts)?
-    ~ TERM* ~ "end"
+    ~ (TERML* ~ "else" ~ TERML+ ~ stmts)?
+    ~ TERML* ~ "end"
 }
 
 for_stmt = {
-    "for" ~ ident ~ "in" ~ expr ~ TERM+
+    "for" ~ ident ~ "in" ~ expr ~ TERML+
     ~ stmts
-    ~ TERM* ~ "end"
+    ~ TERML* ~ "end"
 }
 
-stmts = { (stmt ~ TERM*)* }
+stmts = { TERML* ~ (stmt ~ TERML+)* ~ stmt? }
 
 // ---------- l-value ----------
-lvalue      = { ident ~ bracket_key* }
+lvalue      = { ident ~ (dot_key | bracket_key)* }
+dot_key     = { "." ~ ident }
 bracket_key = { "[" ~ string ~ "]" }
 
 // ---------- expressions ----------
@@ -63,15 +66,13 @@ primary = _{
 extract_json_expr = { "extract_json" ~ "(" ~ regex ~ ")" }
 
 // --- accessor + method chain ---
-chain_expr = { accessor ~ method* }
-
-accessor     = { ident ~ access_part* }
-access_part  = _{ dot_access | bracket_access }
+chain_expr = { ident ~ chain_part* }
+chain_part = _{ method | dot_access | bracket_access }
 dot_access   = { "." ~ ident }
 bracket_access = { "[" ~ bracket_inner ~ "]" }
-bracket_inner  = _{ string | accessor }
+bracket_inner  = _{ string | chain_expr }
 
-method = _{
+method = {
     ".map" ~ block
     | ".flat_map" ~ block
     | ".flatten"
@@ -83,13 +84,16 @@ method = _{
     | ".empty"
 }
 
-block = { "{" ~ "|" ~ ident ~ "|" ~ expr ~ "}" }
+BLOCK_OPEN = _{ "{" }
+BLOCK_CLOSE = _{ "}" }
+PIPE = _{ "|" }
+block = { BLOCK_OPEN ~ PIPE ~ ident ~ PIPE ~ expr ~ BLOCK_CLOSE }
 
 // ---------- strings ----------
 string   = _{ i_string | r_string }
 i_string = { "\"" ~ i_part* ~ "\"" }
 i_part   = _{ interp | i_text }
-interp   = { "${" ~ accessor ~ "}" }
+interp   = { "${" ~ chain_expr ~ "}" }
 i_text   = @{ (!(("\"") | ("${")) ~ ANY)+ }
 
 r_string = { "'" ~ r_text ~ "'" }
@@ -97,7 +101,8 @@ r_text   = @{ (!"'" ~ ANY)* }
 
 // ---------- regex ----------
 regex       = { "/" ~ regex_body ~ "/" ~ regex_flags? }
-regex_body  = @{ (!"/" ~ ANY)+ }
+regex_body  = @{ (escape_slash | !"/" ~ ANY)+ }
+escape_slash = _{ "\\" ~ "/" }
 regex_flags = @{ ("s" | "m" | "i")* }
 
 // ---------- literals ----------
