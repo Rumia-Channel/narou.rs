@@ -76,7 +76,7 @@ impl NovelInfo {
 
             info.general_firstup = info
                 .raw_captures
-                .get("ga")
+                .get("gf")
                 .and_then(|s| parse_narou_date(s));
             info.general_lastup = info
                 .raw_captures
@@ -109,6 +109,10 @@ fn parse_narou_date(s: &str) -> Option<DateTime<Utc>> {
         return DateTime::from_timestamp(ts, 0);
     }
 
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+
     let formats = [
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
@@ -128,4 +132,22 @@ fn parse_narou_date(s: &str) -> Option<DateTime<Utc>> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_narou_date;
+    use chrono::{Datelike, Timelike};
+
+    #[test]
+    fn parse_narou_date_accepts_kakuyomu_rfc3339() {
+        let date = parse_narou_date("2021-01-10T16:13:02Z").expect("date");
+
+        assert_eq!(date.year(), 2021);
+        assert_eq!(date.month(), 1);
+        assert_eq!(date.day(), 10);
+        assert_eq!(date.hour(), 16);
+        assert_eq!(date.minute(), 13);
+        assert_eq!(date.second(), 2);
+    }
 }

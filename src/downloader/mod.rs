@@ -841,6 +841,7 @@ impl Downloader {
                     updated.file_title = record.file_title.clone();
                     updated.end = record.end;
                     updated.last_update = record.last_update;
+                    updated.general_firstup = record.general_firstup;
                     updated.novelupdated_at = record.novelupdated_at;
                     updated.general_lastup = record.general_lastup;
                     updated.general_all_no = record.general_all_no;
@@ -1089,7 +1090,11 @@ impl Downloader {
                 return ncode.clone();
             }
             let sanitized = sanitize_filename(title);
-            format!("{} {}", ncode, sanitized)
+            if sanitized.is_empty() {
+                ncode.clone()
+            } else {
+                format!("{} {}", ncode, sanitized)
+            }
         } else {
             sanitize_filename(title)
         }
@@ -1352,7 +1357,11 @@ fn kakuyomu_preprocess(src: &mut String) {
         }
     }
 
-    let toc = match work.get("tableOfContents").and_then(|v| v.as_array()) {
+    let toc = match work
+        .get("tableOfContents")
+        .or_else(|| work.get("tableOfContentsV2"))
+        .and_then(|v| v.as_array())
+    {
         Some(arr) => arr.clone(),
         None => return,
     };
@@ -1454,5 +1463,76 @@ fn sanitize_filename(name: &str) -> String {
         .collect::<String>()
         .chars()
         .take(80)
-        .collect()
+        .collect::<String>()
+        .trim_end_matches([' ', '.'])
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kakuyomu_preprocess;
+
+    #[test]
+    fn kakuyomu_preprocess_supports_table_of_contents_v2() {
+        let json = r#"{
+            "props": {
+                "pageProps": {
+                    "__APOLLO_STATE__": {
+                        "Work:1177354055617350769": {
+                            "title": "「先輩の妹じゃありません！」",
+                            "author": {"__ref": "UserAccount:1"},
+                            "alternateAuthorName": null,
+                            "introduction": "intro\nbody",
+                            "serialStatus": "COMPLETED",
+                            "publicEpisodeCount": 1,
+                            "publishedAt": "2021-01-10T16:13:02Z",
+                            "editedAt": "2021-01-11T16:13:02Z",
+                            "lastEpisodePublishedAt": "2021-01-12T16:13:02Z",
+                            "totalCharacterCount": 1234,
+                            "tagLabels": ["tag-a"],
+                            "tableOfContentsV2": [{"__ref": "TableOfContentsChapter:10"}]
+                        },
+                        "UserAccount:1": {
+                            "activityName": "author-name"
+                        },
+                        "TableOfContentsChapter:10": {
+                            "chapter": {"__ref": "Chapter:10"},
+                            "episodeUnions": [{"__ref": "Episode:20"}]
+                        },
+                        "Chapter:10": {
+                            "id": "10",
+                            "level": 1,
+                            "title": "第一章"
+                        },
+                        "Episode:20": {
+                            "id": "20",
+                            "publishedAt": "2021-01-12T16:13:02Z",
+                            "title": "第1話"
+                        }
+                    }
+                }
+            },
+            "query": {
+                "workId": "1177354055617350769"
+            }
+        }"#;
+        let mut html = format!(
+            r#"<html><script id="__NEXT_DATA__" type="application/json">{}</script></html>"#,
+            json
+        );
+
+        kakuyomu_preprocess(&mut html);
+
+        assert!(html.contains("KakuyomuPreprocessEvalMagicWord"));
+        assert!(html.contains("title::「先輩の妹じゃありません！」"));
+        assert!(html.contains("author::author-name"));
+        assert!(html.contains("Chapter;1;10;第一章"));
+        assert!(html.contains("Episode;20;2021-01-12T16:13:02Z;第1話"));
+    }
+
+    #[test]
+    fn sanitize_filename_removes_windows_trailing_dots_and_spaces() {
+        assert_eq!(super::sanitize_filename("title. "), "title");
+        assert_eq!(super::sanitize_filename("bad/name?"), "bad_name_");
+    }
 }
