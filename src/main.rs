@@ -1,3 +1,4 @@
+use std::io::{self, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -159,7 +160,7 @@ fn cmd_init(aozora_path: Option<&str>, line_height: Option<f64>) -> narou_rs::er
         );
     }
 
-    save_global_init_settings(aozora_path, line_height)?;
+    init_aozoraepub3_settings(aozora_path, line_height, already_root.is_some())?;
 
     if already_root.is_none() {
         println!("初期化が完了しました！");
@@ -630,14 +631,11 @@ fn bundled_webnovel_dir() -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_dir())
 }
 
-fn save_global_init_settings(
+fn init_aozoraepub3_settings(
     aozora_path: Option<&str>,
     line_height: Option<f64>,
+    force: bool,
 ) -> narou_rs::error::Result<()> {
-    if aozora_path.is_none() && line_height.is_none() {
-        return Ok(());
-    }
-
     let global_dir = home_dir().join(".narousetting");
     let global_path = global_dir.join("global_setting.yaml");
 
@@ -649,7 +647,17 @@ fn save_global_init_settings(
         std::collections::BTreeMap::new()
     };
 
-    let resolved_aozora_path = resolve_init_aozora_path(aozora_path, &settings);
+    if !force && aozora_path.is_none() && line_height.is_none() && settings.contains_key("aozoraepub3dir") {
+        return Ok(());
+    }
+
+    println!("AozoraEpub3の設定を行います");
+    if !settings.contains_key("aozoraepub3dir") {
+        println!("!!!WARNING!!!");
+        println!("AozoraEpub3の構成ファイルを書き換えます。narouコマンド用に別途新規インストールしておくことをオススメします");
+    }
+
+    let resolved_aozora_path = resolve_init_aozora_path(aozora_path, &settings)?;
     let Some(resolved_aozora_path) = resolved_aozora_path else {
         if aozora_path.is_some() {
             println!("指定されたフォルダにAozoraEpub3がありません。");
@@ -658,9 +666,14 @@ fn save_global_init_settings(
         return Ok(());
     };
 
-    let height = line_height
-        .or_else(|| settings.get("line-height").and_then(|value| value.as_f64()))
-        .unwrap_or(1.8);
+    let height = match line_height {
+        Some(height) => height,
+        None if io::stdin().is_terminal() => ask_line_height(&settings)?,
+        None => settings
+            .get("line-height")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(1.8),
+    };
 
     settings.insert(
         "aozoraepub3dir".to_string(),
@@ -684,17 +697,86 @@ fn save_global_init_settings(
 fn resolve_init_aozora_path(
     aozora_path: Option<&str>,
     settings: &std::collections::BTreeMap<String, serde_yaml::Value>,
-) -> Option<String> {
+) -> narou_rs::error::Result<Option<String>> {
     match aozora_path {
-        Some(":keep") => settings
+        Some(":keep") => Ok(settings
             .get("aozoraepub3dir")
             .and_then(|value| value.as_str())
-            .and_then(validate_aozoraepub3_path),
-        Some(path) => validate_aozoraepub3_path(path),
-        None => settings
+            .and_then(validate_aozoraepub3_path)),
+        Some(path) => Ok(validate_aozoraepub3_path(path)),
+        None if io::stdin().is_terminal() => ask_aozoraepub3_path(settings),
+        None => Ok(settings
             .get("aozoraepub3dir")
             .and_then(|value| value.as_str())
-            .and_then(validate_aozoraepub3_path),
+            .and_then(validate_aozoraepub3_path)),
+    }
+}
+
+fn ask_aozoraepub3_path(
+    settings: &std::collections::BTreeMap<String, serde_yaml::Value>,
+) -> narou_rs::error::Result<Option<String>> {
+    let current_path = settings.get("aozoraepub3dir").and_then(|value| value.as_str());
+    println!();
+    println!("AozoraEpub3のあるフォルダを入力して下さい:");
+    if let Some(current_path) = current_path {
+        println!("(未入力でスキップ、:keep で現在と同じ場所を指定)");
+        println!("(現在の場所:{})", current_path);
+    } else {
+        println!("(未入力でスキップ)");
+    }
+
+    loop {
+        print!(">");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input)? == 0 {
+            return Ok(None);
+        }
+        let input = input.trim();
+        if input.is_empty() {
+            return Ok(None);
+        }
+        if input == ":keep" {
+            if let Some(path) = current_path.and_then(validate_aozoraepub3_path) {
+                return Ok(Some(path));
+            }
+        } else if let Some(path) = validate_aozoraepub3_path(input) {
+            return Ok(Some(path));
+        }
+        println!("入力されたフォルダにAozoraEpub3がありません。もう一度入力して下さい:");
+    }
+}
+
+fn ask_line_height(
+    settings: &std::collections::BTreeMap<String, serde_yaml::Value>,
+) -> narou_rs::error::Result<f64> {
+    let default = settings
+        .get("line-height")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(1.8);
+
+    println!();
+    println!("行間の調整を行います。小説の行の高さを設定して下さい(単位 em):");
+    println!("1em = 1文字分の高さ");
+    println!("行の高さ＝1文字分の高さ＋行間の高さ");
+    println!("オススメは 1.8");
+    println!("(未入力で {} を採用)", format_line_height(default));
+
+    loop {
+        print!(">");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input)? == 0 {
+            return Ok(default);
+        }
+        let input = input.trim();
+        if input.is_empty() {
+            return Ok(default);
+        }
+        match input.parse::<f64>() {
+            Ok(value) => return Ok(value),
+            Err(_) => println!("数値を入力して下さい:"),
+        }
     }
 }
 

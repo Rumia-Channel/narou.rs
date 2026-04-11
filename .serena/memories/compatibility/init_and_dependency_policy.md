@@ -8,6 +8,7 @@
   - create `.narou/` and `小説データ/` for a new root;
   - create/copy a user-editable `webnovel/` directory;
   - keep `.narou/local_setting.yaml` and other inventory YAML empty unless user settings exist, because narou.rb generally applies defaults at read sites;
+  - when `narou init` is run from an interactive terminal, ask for the AozoraEpub3 directory and line height like narou.rb; in non-interactive environments, do not block for input and skip when no existing setting is available;
   - create Ruby-compatible inventory files such as `database.yaml`, `database_index.yaml`, `alias.yaml`, `freeze.yaml`, `tag_colors.yaml`, `latest_convert.yaml`, `queue.yaml`, and `notepad.txt` when missing;
   - only save global AozoraEpub3 settings when the configured directory contains `AozoraEpub3.jar`; `-p :keep` should reuse an existing valid global path; line-height defaults to 1.8 only when AozoraEpub3 settings are actually saved;
   - when a valid AozoraEpub3 path is configured, rewrite the same AozoraEpub3 support files as narou.rb: append/replace custom `chuki_tag.txt`, copy `AozoraEpub3.ini`, and render/copy `template/OPS/css_custom/vertical_font.css` with the configured line height.
