@@ -88,6 +88,17 @@ sample/
 - Convert動作確認: なろう版はnarou.rb参照データと完全互換
 - カクヨム版: 構造（大見出し/柱/改ページ/中見出し/end-of-book）は完全一致
 - ※米印変換、全角数字も完全一致
+- syosetu.org（ハーメルン）向けの403回避対応を追加: デフォルトUAを `ua_generator::ua::spoof_firefox_ua()` のランダム生成にし、reqwest/curl双方でwget相当のHTTP/1.1、Accept系ヘッダー、Cookie、圧縮対応を使う。
+- syosetu.orgのタイトル/作者取得を修正: `novel_info_url` の取得も `Downloader` のUA/header/curl fallback経路を通す。`https://syosetu.org/?mode=ss_detail&nid=232822` の現行HTML断片からタイトル・作者・連載種別を抽出するテストを追加済み。
+
+### 2026-04-11 syosetu.org DL対応メモ
+- reqwestでUAだけを変えてもsyosetu.orgは403になるケースがある。wget/curlで通っていた差分は、UA以外にHTTP/1.1、Accept/Accept-Language/Accept-Encoding/Accept-Charset/Connection、Cookie保持、圧縮展開が揃っている点。
+- `Downloader::with_user_agent(None)` と `--user-agent random` は `ua_generator` のFirefox系ランダムUAを使う。Chrome系UAはCloudflare challengeに寄るケースがあったため、現時点ではFirefox系を既定にしている。
+- reqwest clientは `.cookie_store(true)`, `.http1_only()`, `.gzip(true)`, `.brotli(true)`, `.deflate(true)` を有効化している。デフォルトヘッダーの `Accept-Encoding` は `gzip, deflate, br`。
+- 403時は `curl.exe`（非Windowsは `curl`）へfallbackする。curl側は `--http1.1 --compressed` と同じAccept系ヘッダーを指定する。ローカルのcurlがbrotli非対応の場合、`Accept-Encoding` は `gzip, deflate` に落とす。
+- 一度curl fallbackが成功したら `prefer_curl = true` にし、以後のTOC/本文/novel_info取得を先にcurlで試す。reqwestで毎話403→curl retryになる遅延を避けるため。
+- syosetu.orgの本文リンク `1.html` などは、YAMLの `href` テンプレートだけに頼ると `https://syosetu.org/novel//k<ncode>/1.html` のように壊れる。`build_section_url(setting, toc_url, href)` で目次URL基準の相対URLとして解決する。
+- 注意: `https://syosetu.org/novel/232822/` の251話フルDL完走は未検証。情報ページ取得・タイトル/作者抽出・対象テスト・既存テストは確認済み。
 
 ### 未解決 (第16ラウンドの残課題)
 **カクヨム版の行数が合わない**: 参照25,273行 vs 出力25,766行 (+493行)
@@ -173,7 +184,7 @@ For each section:
 (if enable_display_end_of_book) \n［＃ここから地付き］［＃小書き］（本を読み終わりました）［＃小書き終わり］［＃ここで地付き終わり］\n
 ```
 
-## 全修正済みバグ一覧 (25件)
+## 全修正済みバグ一覧 (31件)
 1. DOTALL regex: body/introduction/postscriptパターンに`dot_matches_new_line(true)`
 2. save_raw_file: 抽出bodyではなくraw HTMLを保存
 3. HTML変換の順序: `to_aozora()`をconvertパイプラインの最初で実行
@@ -199,3 +210,9 @@ For each section:
 23. br_to_aozora: HTML中改行を先に全除去（Ruby準拠）
 24. p_to_aozora: `\n?</p>` 対応（Ruby準拠）
 25. body先頭 `\n` をテンプレート挿入時にstrip
+26. デフォルトUA: 固定UAではなく `ua_generator` のFirefox系ランダムUAを使用。`--user-agent random` も同じ扱い。
+27. syosetu.org 403対策: reqwestのデフォルトヘッダー、Cookie store、HTTP/1.1、gzip/brotli/deflateを有効化。
+28. syosetu.org fallback: reqwest 403時にwget相当ヘッダー付きのcurl fallbackを追加し、成功後は `prefer_curl` でcurl優先に切り替える。
+29. Brotli対応: reqwestはbrotli展開を有効化。curl fallbackは `curl -V` でbrotli対応を検出し、非対応なら `Accept-Encoding: gzip, deflate` に落とす。
+30. syosetu.org本文URL: `1.html` などの相対hrefを目次URL基準で解決し、壊れた `/novel//k<ncode>/...` URLを作らない。
+31. syosetu.orgタイトル/作者: `novel_info_url` 取得もDownloaderのUA/header/curl fallbackを通し、情報ページからタイトル・作者・連載種別を抽出するテストを追加。

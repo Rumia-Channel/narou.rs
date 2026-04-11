@@ -22,13 +22,8 @@ pub struct NovelInfo {
 }
 
 impl NovelInfo {
-    pub fn load(
-        setting: &SiteSetting,
-        client: &reqwest::blocking::Client,
-        toc_source: &str,
-        url_captures: &HashMap<String, String>,
-    ) -> Result<Self> {
-        let mut info = Self {
+    fn empty() -> Self {
+        Self {
             title: None,
             author: None,
             story: None,
@@ -41,61 +36,79 @@ impl NovelInfo {
             tags: None,
             sitename: None,
             raw_captures: HashMap::new(),
-        };
+        }
+    }
 
+    pub fn load(
+        setting: &SiteSetting,
+        client: &reqwest::blocking::Client,
+        toc_source: &str,
+        url_captures: &HashMap<String, String>,
+    ) -> Result<Self> {
         if let Some(novel_info_url) = &setting.novel_info_url {
             let resolved_url = setting
                 .novel_info_url_with_captures(url_captures)
                 .unwrap_or_else(|| setting.interpolate(novel_info_url));
             let response = client.get(&resolved_url).send()?;
             if !response.status().is_success() {
-                return Ok(info);
+                return Ok(Self::empty());
             }
             let mut body = response.text()?;
             crate::downloader::pretreatment_source(&mut body, setting.encoding(), Some(setting));
 
-            let keys = [
-                "t", "w", "s", "nt", "ga", "gf", "nu", "gl", "l", "tags", "sitename",
-            ];
-            info.raw_captures = setting.multi_match(&body, &keys);
-            if info.raw_captures.is_empty() {
-                return Ok(info);
-            }
-
-            info.title = info.raw_captures.get("t").cloned();
-            info.author = info.raw_captures.get("w").cloned();
-            info.story = info.raw_captures.get("s").cloned();
-            info.tags = info.raw_captures.get("tags").cloned();
-            info.sitename = info.raw_captures.get("sitename").cloned();
-
-            if let Some(nt_text) = info.raw_captures.get("nt") {
-                let (novel_type, is_end) = setting.get_novel_type_from_string(nt_text);
-                info.novel_type = Some(novel_type);
-                info.end = Some(is_end);
-            }
-
-            info.general_firstup = info
-                .raw_captures
-                .get("gf")
-                .and_then(|s| parse_narou_date(s));
-            info.general_lastup = info
-                .raw_captures
-                .get("gl")
-                .and_then(|s| parse_narou_date(s));
-            info.novelupdated_at = info
-                .raw_captures
-                .get("nu")
-                .and_then(|s| parse_narou_date(s));
-            info.length = info.raw_captures.get("l").and_then(|s| s.parse().ok());
+            Ok(Self::from_novel_info_source(setting, &body))
         } else {
-            let keys = ["title", "author", "story"];
-            info.raw_captures = setting.multi_match(toc_source, &keys);
-            info.title = info.raw_captures.get("title").cloned();
-            info.author = info.raw_captures.get("author").cloned();
-            info.story = info.raw_captures.get("story").cloned();
+            Ok(Self::from_toc_source(setting, toc_source))
+        }
+    }
+
+    pub fn from_novel_info_source(setting: &SiteSetting, source: &str) -> Self {
+        let mut info = Self::empty();
+        let keys = [
+            "t", "w", "s", "nt", "ga", "gf", "nu", "gl", "l", "tags", "sitename",
+        ];
+        info.raw_captures = setting.multi_match(source, &keys);
+        if info.raw_captures.is_empty() {
+            return info;
         }
 
-        Ok(info)
+        info.title = info.raw_captures.get("t").cloned();
+        info.author = info.raw_captures.get("w").cloned();
+        info.story = info.raw_captures.get("s").cloned();
+        info.tags = info.raw_captures.get("tags").cloned();
+        info.sitename = info.raw_captures.get("sitename").cloned();
+
+        if let Some(nt_text) = info.raw_captures.get("nt") {
+            let (novel_type, is_end) = setting.get_novel_type_from_string(nt_text);
+            info.novel_type = Some(novel_type);
+            info.end = Some(is_end);
+        }
+
+        info.general_firstup = info
+            .raw_captures
+            .get("gf")
+            .and_then(|s| parse_narou_date(s));
+        info.general_lastup = info
+            .raw_captures
+            .get("gl")
+            .and_then(|s| parse_narou_date(s));
+        info.novelupdated_at = info
+            .raw_captures
+            .get("nu")
+            .and_then(|s| parse_narou_date(s));
+        info.length = info.raw_captures.get("l").and_then(|s| s.parse().ok());
+
+        info
+    }
+
+    pub fn from_toc_source(setting: &SiteSetting, toc_source: &str) -> Self {
+        let mut info = Self::empty();
+        let keys = ["title", "author", "story"];
+        info.raw_captures = setting.multi_match(toc_source, &keys);
+        info.title = info.raw_captures.get("title").cloned();
+        info.author = info.raw_captures.get("author").cloned();
+        info.story = info.raw_captures.get("story").cloned();
+        info
     }
 }
 

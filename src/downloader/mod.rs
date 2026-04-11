@@ -7,6 +7,7 @@ pub mod site_setting;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use reqwest::header::{
     ACCEPT, ACCEPT_CHARSET, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONNECTION, HeaderMap, HeaderValue,
@@ -177,6 +178,7 @@ impl Downloader {
             .cookie_store(true)
             .http1_only()
             .gzip(true)
+            .brotli(true)
             .deflate(true)
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
@@ -550,7 +552,7 @@ impl Downloader {
             .arg("--header")
             .arg("Accept-Language: ja,en-US;q=0.9,en;q=0.8")
             .arg("--header")
-            .arg("Accept-Encoding: gzip, deflate")
+            .arg(curl_accept_encoding_header())
             .arg("--header")
             .arg("Accept-Charset: utf-8")
             .arg("--header")
@@ -566,6 +568,50 @@ impl Downloader {
         }
 
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn load_novel_info(
+        &mut self,
+        setting: &SiteSetting,
+        toc_source: &str,
+        url_captures: &HashMap<String, String>,
+    ) -> Result<NovelInfo> {
+        let Some(novel_info_url) = &setting.novel_info_url else {
+            return Ok(NovelInfo::from_toc_source(setting, toc_source));
+        };
+
+        let resolved_url = setting
+            .novel_info_url_with_captures(url_captures)
+            .unwrap_or_else(|| setting.interpolate(novel_info_url));
+
+        if self.prefer_curl {
+            if let Some(mut body) = self.fetch_text_with_curl(&resolved_url, setting.cookie()) {
+                pretreatment_source(&mut body, setting.encoding(), Some(setting));
+                return Ok(NovelInfo::from_novel_info_source(setting, &body));
+            }
+        }
+
+        let mut request = self.client.get(&resolved_url);
+        if let Some(cookie) = setting.cookie() {
+            request = request.header("Cookie", cookie);
+        }
+
+        let response = request.send()?;
+        if response.status().is_success() {
+            let mut body = response.text()?;
+            pretreatment_source(&mut body, setting.encoding(), Some(setting));
+            return Ok(NovelInfo::from_novel_info_source(setting, &body));
+        }
+
+        if response.status().as_u16() == 403 {
+            if let Some(mut body) = self.fetch_text_with_curl(&resolved_url, setting.cookie()) {
+                self.prefer_curl = true;
+                pretreatment_source(&mut body, setting.encoding(), Some(setting));
+                return Ok(NovelInfo::from_novel_info_source(setting, &body));
+            }
+        }
+
+        Ok(NovelInfo::from_toc_source(setting, toc_source))
     }
 
     pub fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
@@ -827,7 +873,7 @@ impl Downloader {
         };
         let toc_source = self.fetch_toc(&setting, &toc_url)?;
 
-        let info = NovelInfo::load(&setting, &self.client, &toc_source, &url_captures)?;
+        let info = self.load_novel_info(&setting, &toc_source, &url_captures)?;
 
         let title = info.title.clone().unwrap_or_default();
         let author = info.author.clone().unwrap_or_default();
@@ -1339,7 +1385,10 @@ fn default_request_headers() -> HeaderMap {
         ACCEPT_LANGUAGE,
         HeaderValue::from_static("ja,en-US;q=0.9,en;q=0.8"),
     );
-    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate"));
+    headers.insert(
+        ACCEPT_ENCODING,
+        HeaderValue::from_static("gzip, deflate, br"),
+    );
     headers.insert(ACCEPT_CHARSET, HeaderValue::from_static("utf-8"));
     headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
     headers
@@ -1347,6 +1396,31 @@ fn default_request_headers() -> HeaderMap {
 
 fn curl_command() -> &'static str {
     if cfg!(windows) { "curl.exe" } else { "curl" }
+}
+
+fn curl_accept_encoding_header() -> &'static str {
+    if curl_supports_brotli() {
+        "Accept-Encoding: gzip, deflate, br"
+    } else {
+        "Accept-Encoding: gzip, deflate"
+    }
+}
+
+fn curl_supports_brotli() -> bool {
+    static SUPPORTS_BROTLI: OnceLock<bool> = OnceLock::new();
+    *SUPPORTS_BROTLI.get_or_init(|| {
+        let output = std::process::Command::new(curl_command())
+            .arg("-V")
+            .output()
+            .ok();
+        output
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|text| {
+                let lower = text.to_ascii_lowercase();
+                lower.contains("brotli") || lower.contains("libbrotli")
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn build_section_url(setting: &SiteSetting, toc_url: &str, href: &str) -> String {
@@ -1411,6 +1485,7 @@ fn sanitize_filename(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::novel_info::NovelInfo;
     use super::site_setting::SiteSetting;
 
     #[test]
@@ -1484,5 +1559,27 @@ mod tests {
         assert!(html.contains("Chapter;1;10;第一章"));
         assert!(!html.contains("Chapter;1;10;;第一章"));
         assert!(html.contains("Episode;20;2021-01-12T16:13:02Z;第1話"));
+    }
+
+    #[test]
+    fn syosetu_org_info_patterns_extract_title_and_author() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "ハーメルン").unwrap();
+        let html = r#"
+<tr><td class="label" width="13%">タイトル</td><td ><a href=https://syosetu.org/novel/232822/>和風ファンタジーな鬱エロゲーの名無し戦闘員に転生したんだが周囲の女がヤベー奴ばかりで嫌な予感しかしない件</a></td><td class="label" width="10%">小説ID</td><td width="20%">232822</td></tr>
+<tr><td class="label">原作</td><td>ファンタジー</td><td class="label">作者</td><td ><a href=https://syosetu.org/user/214537/>鉄鋼怪人</a></td></tr>
+<tr><td class="label">話数</td><td >連載(連載中) 251話</td></tr>
+"#;
+
+        let info = NovelInfo::from_novel_info_source(setting, html);
+
+        assert_eq!(
+            info.title.as_deref(),
+            Some(
+                "和風ファンタジーな鬱エロゲーの名無し戦闘員に転生したんだが周囲の女がヤベー奴ばかりで嫌な予感しかしない件"
+            )
+        );
+        assert_eq!(info.author.as_deref(), Some("鉄鋼怪人"));
+        assert_eq!(info.novel_type, Some(1));
     }
 }
