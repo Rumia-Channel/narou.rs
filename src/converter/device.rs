@@ -85,12 +85,13 @@ impl OutputManager {
     }
 
     fn find_aozora_epub3_from_settings() -> Option<PathBuf> {
-        let settings_path = home_dir()?.join(".narousetting").join("global_setting.yaml");
+        let settings_path = home_dir()?
+            .join(".narousetting")
+            .join("global_setting.yaml");
         let raw = std::fs::read_to_string(settings_path).ok()?;
-        let settings = serde_yaml::from_str::<std::collections::BTreeMap<String, serde_yaml::Value>>(
-            &raw,
-        )
-        .ok()?;
+        let settings =
+            serde_yaml::from_str::<std::collections::BTreeMap<String, serde_yaml::Value>>(&raw)
+                .ok()?;
         let dir = settings.get("aozoraepub3dir")?.as_str()?;
         let jar = PathBuf::from(dir).join("AozoraEpub3.jar");
         jar.exists().then_some(jar)

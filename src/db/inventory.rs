@@ -4,8 +4,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 use crate::error::{NarouError, Result};
 

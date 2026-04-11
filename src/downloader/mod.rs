@@ -1,164 +1,51 @@
+pub mod fetch;
 pub mod html;
 pub mod info_cache;
+pub mod narou_api;
 pub mod novel_info;
+pub mod persistence;
 pub mod preprocess;
 pub mod rate_limit;
+pub mod section;
 pub mod site_setting;
+pub mod toc;
+pub mod types;
+pub mod util;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, ACCEPT_CHARSET, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONNECTION,
-};
-use serde::{Deserialize, Serialize};
-
-use crate::db::DATABASE;
-use crate::error::{NarouError, Result};
-
-use self::rate_limit::RateLimiter;
-use self::site_setting::SiteSetting;
-
 use chrono::Utc;
 
-use self::novel_info::NovelInfo;
+use crate::db::DATABASE;
 use crate::db::novel_record::NovelRecord;
+use crate::error::{NarouError, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NarouApiResult {
-    #[serde(default)]
-    pub allcount: i64,
-    #[serde(default)]
-    pub data: Vec<NarouApiEntry>,
-}
+use self::fetch::HttpFetcher;
+use self::narou_api::narou_api_batch_update;
+use self::novel_info::NovelInfo;
+use self::persistence::{
+    ensure_default_files, load_toc_file, save_raw_file, save_section_file, save_toc_file,
+};
+use self::section::{download_section, SectionCache};
+use self::site_setting::SiteSetting;
+use self::toc::{
+    create_short_story_subtitles, fetch_toc, parse_subtitles_multipage,
+};
+use self::util::sanitize_filename;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NarouApiEntry {
-    #[serde(default)]
-    pub ncode: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub writer: String,
-    #[serde(default)]
-    pub story: String,
-    #[serde(default)]
-    pub novel_type: i64,
-    #[serde(default)]
-    pub end: i64,
-    #[serde(default)]
-    pub general_all_no: i64,
-    #[serde(default)]
-    pub general_firstup: String,
-    #[serde(default)]
-    pub general_lastup: String,
-    #[serde(default)]
-    pub novelupdated_at: String,
-    #[serde(default)]
-    pub length: i64,
-}
-
-const FAIL_THRESHOLD: u8 = 5;
+pub use self::types::{
+    DownloadResult, NarouApiEntry, NarouApiResult, SectionElement, SectionFile,
+    SubtitleInfo, TocFile, TocObject, TargetType,
+    SECTION_SAVE_DIR, RAW_DATA_DIR, ARCHIVE_ROOT_DIR,
+};
+pub use self::util::pretreatment_source;
 
 pub struct Downloader {
-    client: reqwest::blocking::Client,
-    user_agent: String,
-    tier_failures: HashMap<String, [u8; 3]>,
-    rate_limiter: RateLimiter,
+    fetcher: HttpFetcher,
     site_settings: Vec<SiteSetting>,
-    section_cache: HashMap<String, SectionElement>,
+    section_cache: SectionCache,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubtitleInfo {
-    pub index: String,
-    pub href: String,
-    #[serde(default)]
-    pub chapter: String,
-    #[serde(default)]
-    pub subchapter: String,
-    pub subtitle: String,
-    pub file_subtitle: String,
-    pub subdate: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subupdate: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub download_time: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TocObject {
-    pub title: String,
-    pub author: String,
-    pub toc_url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub story: Option<String>,
-    pub subtitles: Vec<SubtitleInfo>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub novel_type: Option<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SectionElement {
-    pub data_type: String,
-    #[serde(default)]
-    pub introduction: String,
-    #[serde(default)]
-    pub postscript: String,
-    pub body: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SectionFile {
-    pub index: String,
-    pub href: String,
-    #[serde(default)]
-    pub chapter: String,
-    #[serde(default)]
-    pub subchapter: String,
-    pub subtitle: String,
-    pub file_subtitle: String,
-    pub subdate: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subupdate: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub download_time: Option<String>,
-    pub element: SectionElement,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum TargetType {
-    Url,
-    Ncode,
-    Id,
-    Other,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TocFile {
-    pub title: String,
-    pub author: String,
-    pub toc_url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub story: Option<String>,
-    pub subtitles: Vec<SubtitleInfo>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub novel_type: Option<u8>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DownloadResult {
-    pub id: i64,
-    pub title: String,
-    pub new_novel: bool,
-    pub updated_count: usize,
-    pub total_count: usize,
-}
-
-pub const SECTION_SAVE_DIR: &str = "本文";
-const RAW_DATA_DIR: &str = "raw";
-const CACHE_SAVE_DIR: &str = "cache";
-const MAX_SECTION_CACHE: usize = 20;
 
 impl Downloader {
     pub fn new() -> Result<Self> {
@@ -173,26 +60,14 @@ impl Downloader {
             Some(ua) if !ua.trim().is_empty() => ua.to_string(),
             _ => ua_generator::ua::spoof_firefox_ua().to_string(),
         };
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(&ua)
-            .default_headers(default_request_headers())
-            .cookie_store(true)
-            .http1_only()
-            .gzip(true)
-            .brotli(true)
-            .deflate(true)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
 
+        let fetcher = HttpFetcher::new(&ua)?;
         let site_settings = SiteSetting::load_all()?;
 
         Ok(Self {
-            client,
-            user_agent: ua,
-            tier_failures: HashMap::new(),
-            rate_limiter: RateLimiter::new(),
+            fetcher,
             site_settings,
-            section_cache: HashMap::new(),
+            section_cache: SectionCache::new(),
         })
     }
 
@@ -292,302 +167,6 @@ impl Downloader {
         None
     }
 
-    fn domain_of(url: &str) -> &str {
-        let s = url.strip_prefix("https://").unwrap_or(url);
-        let s = s.strip_prefix("http://").unwrap_or(s);
-        s.split('/').next().unwrap_or(s)
-    }
-
-    fn fetch_text(&mut self, url: &str, cookie: Option<&str>) -> Result<String> {
-        let domain = Self::domain_of(url).to_string();
-
-        let skip_curl = self
-            .tier_failures
-            .get(&domain)
-            .map_or(false, |f| f[0] >= FAIL_THRESHOLD);
-        let skip_reqwest = self
-            .tier_failures
-            .get(&domain)
-            .map_or(false, |f| f[1] >= FAIL_THRESHOLD);
-        let skip_wget = self
-            .tier_failures
-            .get(&domain)
-            .map_or(false, |f| f[2] >= FAIL_THRESHOLD);
-
-        if !skip_curl {
-            if let Some(body) = self.fetch_tier_curl(url, cookie) {
-                return Ok(body);
-            }
-            self.tier_failures.entry(domain.clone()).or_insert([0; 3])[0] += 1;
-        }
-
-        if !skip_reqwest {
-            match self.fetch_tier_reqwest(url, cookie) {
-                Ok(body) => return Ok(body),
-                Err(_) => {
-                    self.tier_failures.entry(domain.clone()).or_insert([0; 3])[1] += 1;
-                }
-            }
-        }
-
-        if !skip_wget {
-            if let Some(body) = self.fetch_tier_wget(url, cookie) {
-                return Ok(body);
-            }
-            self.tier_failures.entry(domain.clone()).or_insert([0; 3])[2] += 1;
-        }
-
-        Err(NarouError::NotFound(url.to_string()))
-    }
-
-    fn fetch_tier_curl(&self, url: &str, cookie: Option<&str>) -> Option<String> {
-        let mut handle = curl::easy::Easy::new();
-        handle.url(url).ok()?;
-        handle.useragent(&self.user_agent).ok()?;
-        handle.follow_location(true).ok()?;
-        handle.accept_encoding("gzip, deflate").ok();
-
-        let mut headers = curl::easy::List::new();
-        headers.append("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8").ok()?;
-        headers
-            .append("Accept-Language: ja,en-US;q=0.9,en;q=0.8")
-            .ok()?;
-        headers.append("Accept-Charset: utf-8").ok()?;
-        headers.append("Connection: keep-alive").ok()?;
-        if let Some(cookie) = cookie {
-            headers.append(&format!("Cookie: {cookie}")).ok()?;
-        }
-        handle.http_headers(headers).ok()?;
-
-        let mut body = Vec::new();
-        {
-            let mut transfer = handle.transfer();
-            transfer
-                .write_function(|data| {
-                    body.extend_from_slice(data);
-                    Ok(data.len())
-                })
-                .ok()?;
-            transfer.perform().ok()?;
-        }
-
-        let code = handle.response_code().ok()?;
-        if code >= 400 {
-            return None;
-        }
-
-        Some(String::from_utf8_lossy(&body).into_owned())
-    }
-
-    fn fetch_tier_reqwest(&self, url: &str, cookie: Option<&str>) -> Result<String> {
-        let mut request = self.client.get(url);
-        if let Some(cookie) = cookie {
-            request = request.header("Cookie", cookie);
-        }
-        let response = request.send()?;
-        let status = response.status();
-        if status.as_u16() == 503 {
-            return Err(NarouError::SuspendDownload("Rate limited (503)".into()));
-        }
-        if status.as_u16() == 404 {
-            return Err(NarouError::NotFound(url.to_string()));
-        }
-        if !status.is_success() {
-            return Err(response.error_for_status().unwrap_err().into());
-        }
-        Ok(response.text()?)
-    }
-
-    fn fetch_tier_wget(&self, url: &str, cookie: Option<&str>) -> Option<String> {
-        let mut cmd = std::process::Command::new("wget");
-        cmd.arg("--quiet")
-            .arg("--output-document=-")
-            .arg("--no-check-certificate")
-            .arg(format!("--user-agent={}", &self.user_agent))
-            .arg("--header=Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-            .arg("--header=Accept-Language: ja,en-US;q=0.9,en;q=0.8")
-            .arg("--header=Accept-Encoding: gzip, deflate")
-            .arg("--header=Connection: keep-alive");
-        if let Some(cookie) = cookie {
-            cmd.arg(format!("--header=Cookie: {cookie}"));
-        }
-        let output = cmd.arg(url).output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&output.stdout).into_owned())
-    }
-
-    pub fn fetch_toc(&mut self, setting: &SiteSetting, toc_url: &str) -> Result<String> {
-        self.rate_limiter.wait();
-
-        let body = self.fetch_text(toc_url, setting.cookie())?;
-        let mut body = body;
-        pretreatment_source(&mut body, setting.encoding(), Some(setting));
-
-        if let Some(error_pattern) = setting.error_message() {
-            if let Ok(re) = regex::Regex::new(error_pattern) {
-                if re.is_match(&body) {
-                    return Err(NarouError::NotFound("Novel deleted or private".into()));
-                }
-            }
-        }
-
-        Ok(body)
-    }
-
-    pub fn parse_subtitles(
-        &self,
-        setting: &SiteSetting,
-        toc_source: &str,
-        url_captures: &HashMap<String, String>,
-    ) -> Result<Vec<SubtitleInfo>> {
-        let subtitles_pattern = setting
-            .subtitles_pattern()
-            .ok_or_else(|| NarouError::SiteSetting("No subtitles pattern defined".into()))?;
-
-        let mut subtitles = Vec::new();
-        let mut remaining = toc_source;
-
-        while let Some(caps) = subtitles_pattern.captures(remaining) {
-            let full_match = caps.get(0).unwrap();
-            remaining = &remaining[full_match.end()..];
-
-            let index = caps
-                .name("index")
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            let href = caps
-                .name("href")
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_else(|| {
-                    if let Some(href_tpl) = &setting.href {
-                        setting.interpolate_subtitles_href(href_tpl, &index, url_captures)
-                    } else {
-                        String::new()
-                    }
-                });
-            let chapter = caps
-                .name("chapter")
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            let subchapter = caps
-                .name("subchapter")
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            let subtitle_raw = caps
-                .name("subtitle")
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            let subdate = caps
-                .name("subdate")
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            let subupdate = caps.name("subupdate").map(|m| m.as_str().to_string());
-            let subdate = if subdate.is_empty() {
-                subupdate.clone().unwrap_or_default()
-            } else {
-                subdate
-            };
-
-            let file_subtitle = sanitize_filename(&subtitle_raw);
-
-            subtitles.push(SubtitleInfo {
-                index,
-                href,
-                chapter,
-                subchapter,
-                subtitle: subtitle_raw,
-                file_subtitle,
-                subdate,
-                subupdate,
-                download_time: None,
-            });
-
-            if full_match.end() == 0 {
-                break;
-            }
-        }
-
-        Ok(subtitles)
-    }
-
-    pub fn download_section(
-        &mut self,
-        setting: &SiteSetting,
-        subtitle: &SubtitleInfo,
-        toc_url: &str,
-    ) -> Result<(SectionElement, String)> {
-        if let Some(cached) = self.section_cache.get(&subtitle.index) {
-            return Ok((cached.clone(), String::new()));
-        }
-
-        self.rate_limiter.wait();
-        let url = build_section_url(setting, toc_url, &subtitle.href);
-
-        let html_source = self.fetch_text(&url, setting.cookie())?;
-        let mut html_source = html_source;
-        pretreatment_source(&mut html_source, setting.encoding(), Some(setting));
-        self.parse_section_html(setting, subtitle, html_source)
-    }
-
-    fn parse_section_html(
-        &mut self,
-        setting: &SiteSetting,
-        subtitle: &SubtitleInfo,
-        html_source: String,
-    ) -> Result<(SectionElement, String)> {
-        let mut element = SectionElement {
-            data_type: "html".to_string(),
-            introduction: String::new(),
-            postscript: String::new(),
-            body: String::new(),
-        };
-
-        if let Some(pattern) = setting.introduction_pattern() {
-            if let Ok(re) = compile_html_pattern(pattern) {
-                if let Some(caps) = re.captures(&html_source) {
-                    element.introduction = caps
-                        .name("introduction")
-                        .map(|m| m.as_str().to_string())
-                        .unwrap_or_default();
-                }
-            }
-        }
-
-        if let Some(pattern) = setting.postscript_pattern() {
-            if let Ok(re) = compile_html_pattern(pattern) {
-                if let Some(caps) = re.captures(&html_source) {
-                    element.postscript = caps
-                        .name("postscript")
-                        .map(|m| m.as_str().to_string())
-                        .unwrap_or_default();
-                }
-            }
-        }
-
-        if let Some(pattern) = setting.body_pattern() {
-            if let Ok(re) = compile_html_pattern(pattern) {
-                if let Some(caps) = re.captures(&html_source) {
-                    element.body = caps
-                        .name("body")
-                        .map(|m| m.as_str().to_string())
-                        .unwrap_or_default();
-                }
-            }
-        }
-
-        if self.section_cache.len() >= MAX_SECTION_CACHE {
-            if let Some(oldest_key) = self.section_cache.keys().next().cloned() {
-                self.section_cache.remove(&oldest_key);
-            }
-        }
-        self.section_cache
-            .insert(subtitle.index.clone(), element.clone());
-
-        Ok((element, html_source))
-    }
-
     fn load_novel_info(
         &mut self,
         setting: &SiteSetting,
@@ -602,159 +181,13 @@ impl Downloader {
             .novel_info_url_with_captures(url_captures)
             .unwrap_or_else(|| setting.interpolate(novel_info_url));
 
-        match self.fetch_text(&resolved_url, setting.cookie()) {
+        match self.fetcher.fetch_text(&resolved_url, setting.cookie()) {
             Ok(mut body) => {
                 pretreatment_source(&mut body, setting.encoding(), Some(setting));
                 Ok(NovelInfo::from_novel_info_source(setting, &body))
             }
             Err(_) => Ok(NovelInfo::from_toc_source(setting, toc_source)),
         }
-    }
-
-    pub fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
-        let narou_ids: Vec<(i64, String)> = crate::db::with_database(|db| {
-            Ok(db
-                .all_records()
-                .values()
-                .filter(|r| r.is_narou && r.ncode.is_some())
-                .filter_map(|r| r.ncode.as_ref().map(|nc| (r.id, nc.clone())))
-                .collect())
-        })
-        .unwrap_or_default();
-
-        if narou_ids.is_empty() {
-            return Ok((0, 0));
-        }
-
-        let mut all_ncodes = Vec::new();
-        for chunk in narou_ids.chunks(50) {
-            let ncodes: Vec<&str> = chunk.iter().map(|(_, nc)| nc.as_str()).collect();
-            all_ncodes.push(ncodes.join("-"));
-        }
-
-        let api_url = "https://api.syosetu.com/novelapi/api/";
-        let mut total_updated = 0usize;
-        let mut total_failed = 0usize;
-
-        for ncode_chunk in &all_ncodes {
-            self.rate_limiter.wait();
-            let url = format!(
-                "{}?of=t-nt-ga-gf-nu-gl-l-w-s-e-ncode-allno-novelpage&out=json&ncode={}",
-                api_url, ncode_chunk
-            );
-
-            let response = match self.client.get(&url).send() {
-                Ok(r) => r,
-                Err(_e) => {
-                    total_failed += 50;
-                    continue;
-                }
-            };
-
-            if !response.status().is_success() {
-                total_failed += 50;
-                continue;
-            }
-
-            let body = match response.text() {
-                Ok(b) => b,
-                Err(_) => {
-                    total_failed += 50;
-                    continue;
-                }
-            };
-
-            let api_result: NarouApiResult = match serde_json::from_str(&body) {
-                Ok(r) => r,
-                Err(_) => {
-                    total_failed += 50;
-                    continue;
-                }
-            };
-
-            for entry in &api_result.data {
-                if let Some(id) = narou_ids
-                    .iter()
-                    .find(|(_, nc)| nc == &entry.ncode)
-                    .map(|(id, _)| *id)
-                {
-                    let updated = crate::db::with_database_mut(|db| {
-                        if let Some(record) = db.get(id).cloned() {
-                            let mut r = record;
-                            r.title = entry.title.clone();
-                            r.author = entry.writer.clone();
-                            r.end = entry.end == 1;
-                            r.general_all_no = Some(entry.general_all_no);
-                            r.length = Some(entry.length);
-
-                            if let Ok(dt) =
-                                chrono::DateTime::parse_from_rfc3339(&entry.general_firstup)
-                            {
-                                r.general_firstup = Some(dt.with_timezone(&Utc));
-                            }
-                            if let Ok(dt) =
-                                chrono::DateTime::parse_from_rfc3339(&entry.general_lastup)
-                            {
-                                r.general_lastup = Some(dt.with_timezone(&Utc));
-                            }
-                            if let Ok(dt) =
-                                chrono::DateTime::parse_from_rfc3339(&entry.novelupdated_at)
-                            {
-                                r.novelupdated_at = Some(dt.with_timezone(&Utc));
-                            }
-
-                            if entry.novel_type == 2 {
-                                r.novel_type = 2;
-                            } else {
-                                r.novel_type = 1;
-                            }
-
-                            db.insert(r);
-                            Ok(true)
-                        } else {
-                            Ok(false)
-                        }
-                    })
-                    .unwrap_or(false);
-
-                    if updated {
-                        total_updated += 1;
-                    }
-                }
-            }
-        }
-
-        let _ = crate::db::with_database_mut(|db| db.save());
-        Ok((total_updated, total_failed))
-    }
-
-    fn compute_section_hash(section: &SectionElement) -> String {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(section.body.as_bytes());
-        hasher.update(section.introduction.as_bytes());
-        hasher.update(section.postscript.as_bytes());
-        hex::encode(hasher.finalize())
-    }
-
-    fn section_needs_update(
-        section_dir: &PathBuf,
-        subtitle: &SubtitleInfo,
-        new_section: &SectionElement,
-    ) -> bool {
-        let filename = format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle);
-        let path = section_dir.join(&filename);
-        if !path.exists() {
-            return true;
-        }
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(existing) = serde_yaml::from_str::<SectionElement>(&content) {
-                let old_hash = Self::compute_section_hash(&existing);
-                let new_hash = Self::compute_section_hash(new_section);
-                return old_hash != new_hash;
-            }
-        }
-        true
     }
 
     fn handle_over18(&self, setting: &SiteSetting, body: &str) -> Option<String> {
@@ -825,8 +258,8 @@ impl Downloader {
                         continue;
                     }
 
-                    self.rate_limiter.wait();
-                    match self.client.get(url).send() {
+                    self.fetcher.rate_limiter.wait();
+                    match self.fetcher.client.get(url).send() {
                         Ok(resp) => {
                             if resp.status().is_success() {
                                 if let Ok(bytes) = resp.bytes() {
@@ -845,8 +278,8 @@ impl Downloader {
         Ok(())
     }
 
-    pub fn get_novel_data_dir(&self, record: &crate::db::novel_record::NovelRecord) -> PathBuf {
-        crate::db::novel_dir_for_record(&PathBuf::from(ARCHIVE_ROOT_DIR), record)
+    pub fn get_novel_data_dir(&self, record: &NovelRecord) -> PathBuf {
+        crate::db::novel_dir_for_record(&PathBuf::from(types::ARCHIVE_ROOT_DIR), record)
     }
 
     pub fn download_novel(&mut self, target: &str) -> Result<DownloadResult> {
@@ -868,7 +301,7 @@ impl Downloader {
         } else {
             setting.interpolate_with_captures(&setting.toc_url, &url_captures)
         };
-        let toc_source = self.fetch_toc(&setting, &toc_url)?;
+        let toc_source = fetch_toc(&mut self.fetcher, &setting, &toc_url)?;
 
         let info = self.load_novel_info(&setting, &toc_source, &url_captures)?;
 
@@ -887,9 +320,9 @@ impl Downloader {
         };
 
         let subtitles = if novel_type == 2 {
-            self.create_short_story_subtitles(&setting, &toc_source)?
+            create_short_story_subtitles(&setting, &toc_source)?
         } else {
-            self.parse_subtitles_multipage(&setting, &toc_source, &url_captures)?
+            parse_subtitles_multipage(&mut self.fetcher, &setting, &toc_source, &url_captures)?
         };
 
         let use_subdirectory = self.download_use_subdirectory(existing_id);
@@ -907,12 +340,12 @@ impl Downloader {
         let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory);
         std::fs::create_dir_all(&novel_dir)?;
 
-        let section_dir = novel_dir.join(SECTION_SAVE_DIR);
-        let raw_dir = novel_dir.join(RAW_DATA_DIR);
+        let section_dir = novel_dir.join(types::SECTION_SAVE_DIR);
+        let raw_dir = novel_dir.join(types::RAW_DATA_DIR);
         std::fs::create_dir_all(&section_dir)?;
         std::fs::create_dir_all(&raw_dir)?;
 
-        let old_toc = self.load_toc_file(&novel_dir);
+        let old_toc = load_toc_file(&novel_dir);
         let old_subtitles: HashMap<String, &SubtitleInfo> = old_toc
             .as_ref()
             .map(|t| t.subtitles.iter().map(|s| (s.index.clone(), s)).collect())
@@ -931,9 +364,10 @@ impl Downloader {
             };
 
             let download_time = if needs_download {
-                let (section, raw_html) = self.download_section(&setting, subtitle, &toc_url)?;
-                self.save_section_file(&section_dir, subtitle, &section)?;
-                self.save_raw_file(&raw_dir, subtitle, &raw_html)?;
+                let (section, raw_html) =
+                    download_section(&mut self.fetcher, &mut self.section_cache, &setting, subtitle, &toc_url)?;
+                save_section_file(&section_dir, subtitle, &section)?;
+                save_raw_file(&raw_dir, subtitle, &raw_html)?;
                 updated_count += 1;
                 Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string())
             } else {
@@ -956,8 +390,8 @@ impl Downloader {
             subtitles: final_subtitles,
             novel_type: Some(novel_type),
         };
-        self.save_toc_file(&novel_dir, &toc_file)?;
-        self.ensure_default_files(&novel_dir, &title, &author, &toc_url);
+        save_toc_file(&novel_dir, &toc_file)?;
+        ensure_default_files(&novel_dir, &title, &author, &toc_url);
 
         let record = NovelRecord {
             id: existing_id.unwrap_or(0),
@@ -1126,92 +560,6 @@ impl Downloader {
         }
     }
 
-    fn parse_subtitles_multipage(
-        &mut self,
-        setting: &SiteSetting,
-        mut toc_source: &str,
-        url_captures: &HashMap<String, String>,
-    ) -> Result<Vec<SubtitleInfo>> {
-        let mut all_subtitles = Vec::new();
-        let mut page = 0;
-        let max_pages = if let Some(pattern) = setting.toc_page_max_pattern() {
-            pattern
-                .captures(toc_source)
-                .and_then(|caps| caps.get(1))
-                .and_then(|m| m.as_str().parse::<usize>().ok())
-                .unwrap_or(1)
-                .max(1)
-        } else {
-            50
-        };
-
-        loop {
-            let page_subs = self.parse_subtitles(setting, toc_source, url_captures)?;
-            all_subtitles.extend(page_subs);
-
-            page += 1;
-            if page >= max_pages {
-                break;
-            }
-
-            let next_toc_pattern = match setting.next_toc_pattern() {
-                Some(p) => p,
-                None => break,
-            };
-
-            let caps = match next_toc_pattern.captures(toc_source) {
-                Some(c) => c,
-                None => break,
-            };
-
-            let mut next_captures: HashMap<String, String> = HashMap::new();
-            for name in next_toc_pattern.capture_names().flatten() {
-                if let Some(m) = caps.name(name) {
-                    next_captures.insert(name.to_string(), m.as_str().to_string());
-                }
-            }
-
-            let next_url_val = match &setting.next_url {
-                Some(u) => u.clone(),
-                None => break,
-            };
-            let next_url = setting.get_next_url_with_captures(&next_url_val, &next_captures);
-
-            self.rate_limiter.wait();
-            let response = self.client.get(&next_url).send()?;
-            if !response.status().is_success() {
-                break;
-            }
-            let mut body = response.text()?;
-            pretreatment_source(&mut body, setting.encoding(), Some(setting));
-            toc_source = Box::leak(body.into_boxed_str());
-        }
-
-        Ok(all_subtitles)
-    }
-
-    fn create_short_story_subtitles(
-        &self,
-        setting: &SiteSetting,
-        toc_source: &str,
-    ) -> Result<Vec<SubtitleInfo>> {
-        let title = setting
-            .resolve_info_pattern("t", toc_source)
-            .unwrap_or_else(|| "短編".to_string());
-
-        Ok(vec![SubtitleInfo {
-            index: "1".to_string(),
-            href: String::new(),
-            chapter: String::new(),
-            subchapter: String::new(),
-            subtitle: title,
-            file_subtitle: sanitize_filename("短編"),
-            subdate: String::new(),
-            subupdate: None,
-            download_time: None,
-        }])
-    }
-
     fn extract_ncode(&self, setting: &SiteSetting, toc_source: &str) -> Option<String> {
         let url_pattern = {
             let re = regex::Regex::new(r"(?i)[/?](n\d+[a-z]+)").ok()?;
@@ -1258,7 +606,7 @@ impl Downloader {
         file_title: &str,
         use_subdirectory: bool,
     ) -> PathBuf {
-        let mut dir = PathBuf::from(ARCHIVE_ROOT_DIR);
+        let mut dir = PathBuf::from(types::ARCHIVE_ROOT_DIR);
         dir.push(sitename);
 
         if use_subdirectory {
@@ -1291,164 +639,9 @@ impl Downloader {
         .unwrap_or(false)
     }
 
-    fn save_section_file(
-        &self,
-        section_dir: &PathBuf,
-        subtitle: &SubtitleInfo,
-        section: &SectionElement,
-    ) -> Result<()> {
-        let filename = format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle);
-        let path = section_dir.join(filename);
-        let file_data = SectionFile {
-            index: subtitle.index.clone(),
-            href: subtitle.href.clone(),
-            chapter: subtitle.chapter.clone(),
-            subchapter: subtitle.subchapter.clone(),
-            subtitle: subtitle.subtitle.clone(),
-            file_subtitle: subtitle.file_subtitle.clone(),
-            subdate: subtitle.subdate.clone(),
-            subupdate: subtitle.subupdate.clone(),
-            download_time: Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string()),
-            element: section.clone(),
-        };
-        let yaml_body = serde_yaml::to_string(&file_data)?;
-        let content = format!("---\n{}\n", yaml_body);
-        std::fs::write(&path, content)?;
-        Ok(())
+    pub fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
+        narou_api_batch_update(&mut self.fetcher)
     }
-
-    fn save_raw_file(
-        &self,
-        raw_dir: &PathBuf,
-        subtitle: &SubtitleInfo,
-        raw_html: &str,
-    ) -> Result<()> {
-        let filename = format!("{} {}.html", subtitle.index, subtitle.file_subtitle);
-        let path = raw_dir.join(filename);
-        std::fs::write(&path, raw_html)?;
-        Ok(())
-    }
-
-    fn load_toc_file(&self, novel_dir: &PathBuf) -> Option<TocFile> {
-        let path = novel_dir.join("toc.yaml");
-        let content = std::fs::read_to_string(&path).ok()?;
-        serde_yaml::from_str(&content).ok()
-    }
-
-    fn fix_yaml_block_scalar(yaml: &str) -> String {
-        let re = regex::Regex::new(r"(?m)^story:\s*\|[-+]?\s*$").unwrap();
-        let result = re.replace_all(yaml, "story: |-").to_string();
-        result
-    }
-
-    fn save_toc_file(&self, novel_dir: &PathBuf, toc: &TocFile) -> Result<()> {
-        let path = novel_dir.join("toc.yaml");
-        let yaml_body = serde_yaml::to_string(toc)?;
-        let content = format!("---\n{}\n", Self::fix_yaml_block_scalar(&yaml_body));
-        std::fs::write(&path, content)?;
-        Ok(())
-    }
-
-    fn ensure_default_files(&self, novel_dir: &PathBuf, title: &str, author: &str, toc_url: &str) {
-        let setting_path = novel_dir.join("setting.ini");
-        if !setting_path.exists() {
-            let default_ini = crate::converter::settings::IniData::new();
-            let content = default_ini.to_ini_string();
-            let _ = std::fs::write(&setting_path, content);
-        }
-
-        let replace_path = novel_dir.join("replace.txt");
-        if !replace_path.exists() {
-            let content = format!(
-                "; 単純置換用ファイル\n;\n; 対象小説情報\n; タイトル: {}\n; 作者: {}\n; URL: {}\n;\n; 書式\n; 置換対象<tab>置換文字\n;\n; サンプル\n; 一〇歳\t十歳\n; 第一章\t［＃ゴシック体］第一章［＃ゴシック体終わり］\n;\n; 正規表現での置換などは converter.yaml で対応して下さい\n",
-                title, author, toc_url
-            );
-            let _ = std::fs::write(&replace_path, content);
-        }
-    }
-}
-
-const ARCHIVE_ROOT_DIR: &str = "小説データ";
-
-fn default_request_headers() -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static(
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        ),
-    );
-    headers.insert(
-        ACCEPT_LANGUAGE,
-        HeaderValue::from_static("ja,en-US;q=0.9,en;q=0.8"),
-    );
-    headers.insert(
-        ACCEPT_ENCODING,
-        HeaderValue::from_static("gzip, deflate, br"),
-    );
-    headers.insert(ACCEPT_CHARSET, HeaderValue::from_static("utf-8"));
-    headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
-    headers
-}
-
-fn build_section_url(setting: &SiteSetting, toc_url: &str, href: &str) -> String {
-    if href.starts_with("http://") || href.starts_with("https://") {
-        href.to_string()
-    } else if href.starts_with('/') {
-        format!("{}{}", setting.top_url(), href)
-    } else if href.is_empty() {
-        toc_url.to_string()
-    } else {
-        format!("{}/{}", toc_url.trim_end_matches('/'), href)
-    }
-}
-
-fn compile_html_pattern(pattern: &str) -> std::result::Result<regex::Regex, regex::Error> {
-    regex::RegexBuilder::new(pattern)
-        .dot_matches_new_line(true)
-        .size_limit(10_000_000)
-        .build()
-}
-
-pub fn pretreatment_source(src: &mut String, _encoding: &str, setting: Option<&SiteSetting>) {
-    src.retain(|c| c != '\r');
-    decode_numeric_entities(src);
-    if let Some(setting) = setting {
-        if let Some(pipeline) = setting.preprocess_pipeline() {
-            preprocess::run_preprocess(pipeline, src);
-        }
-    }
-}
-
-fn decode_numeric_entities(src: &mut String) {
-    let hex_re = regex::Regex::new(r"&#x([0-9a-fA-F]+);").unwrap();
-    let dec_re = regex::Regex::new(r"&#(\d+);").unwrap();
-
-    *src = hex_re
-        .replace_all(src, |caps: &regex::Captures| {
-            let code = u32::from_str_radix(&caps[1], 16).unwrap_or(0xFFFD);
-            char::from_u32(code).unwrap_or('\u{FFFD}').to_string()
-        })
-        .to_string();
-
-    *src = dec_re
-        .replace_all(src, |caps: &regex::Captures| {
-            let code: u32 = caps[1].parse().unwrap_or(0xFFFD);
-            char::from_u32(code).unwrap_or('\u{FFFD}').to_string()
-        })
-        .to_string();
-}
-
-fn sanitize_filename(name: &str) -> String {
-    let invalid = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
-    name.chars()
-        .map(|c| if invalid.contains(&c) { '_' } else { c })
-        .collect::<String>()
-        .chars()
-        .take(80)
-        .collect::<String>()
-        .trim_end_matches([' ', '.'])
-        .to_string()
 }
 
 #[cfg(test)]
@@ -1458,8 +651,8 @@ mod tests {
 
     #[test]
     fn sanitize_filename_removes_windows_trailing_dots_and_spaces() {
-        assert_eq!(super::sanitize_filename("title. "), "title");
-        assert_eq!(super::sanitize_filename("bad/name?"), "bad_name_");
+        assert_eq!(super::util::sanitize_filename("title. "), "title");
+        assert_eq!(super::util::sanitize_filename("bad/name?"), "bad_name_");
     }
 
     #[test]
@@ -1517,7 +710,7 @@ mod tests {
             json
         );
 
-        super::pretreatment_source(&mut html, "UTF-8", Some(setting));
+        super::util::pretreatment_source(&mut html, "UTF-8", Some(setting));
 
         assert!(html.contains("KakuyomuPreprocessEvalMagicWord"));
         assert!(html.contains("title::先輩の妹じゃありません！"));
