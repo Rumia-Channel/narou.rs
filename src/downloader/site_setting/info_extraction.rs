@@ -60,8 +60,7 @@ impl SiteSetting {
         let mut match_values: HashMap<String, String> = HashMap::new();
 
         for key in keys {
-            if let Some(value) =
-                self.resolve_info_pattern_with_captures(key, source, &match_values)
+            if let Some(value) = self.resolve_info_pattern_with_captures(key, source, &match_values)
             {
                 match_values.insert(key.to_string(), value);
             }

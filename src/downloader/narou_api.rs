@@ -81,18 +81,15 @@ pub fn narou_api_batch_update(fetcher: &mut HttpFetcher) -> Result<(usize, usize
                         r.general_all_no = Some(entry.general_all_no);
                         r.length = Some(entry.length);
 
-                        if let Ok(dt) =
-                            chrono::DateTime::parse_from_rfc3339(&entry.general_firstup)
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.general_firstup)
                         {
                             r.general_firstup = Some(dt.with_timezone(&Utc));
                         }
-                        if let Ok(dt) =
-                            chrono::DateTime::parse_from_rfc3339(&entry.general_lastup)
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.general_lastup)
                         {
                             r.general_lastup = Some(dt.with_timezone(&Utc));
                         }
-                        if let Ok(dt) =
-                            chrono::DateTime::parse_from_rfc3339(&entry.novelupdated_at)
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.novelupdated_at)
                         {
                             r.novelupdated_at = Some(dt.with_timezone(&Utc));
                         }

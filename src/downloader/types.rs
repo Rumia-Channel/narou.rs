@@ -111,6 +111,13 @@ pub struct TocFile {
     pub novel_type: Option<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateStatus {
+    Ok,
+    None,
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub struct DownloadResult {
     pub id: i64,
@@ -120,6 +127,11 @@ pub struct DownloadResult {
     pub new_novel: bool,
     pub updated_count: usize,
     pub total_count: usize,
+    pub status: UpdateStatus,
+    pub title_changed: bool,
+    pub author_changed: bool,
+    pub story_changed: bool,
+    pub sections_deleted: bool,
 }
 
 pub const SECTION_SAVE_DIR: &str = "本文";

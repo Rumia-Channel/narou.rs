@@ -60,11 +60,7 @@ pub fn save_section_file(
     Ok(())
 }
 
-pub fn save_raw_file(
-    raw_dir: &PathBuf,
-    subtitle: &SubtitleInfo,
-    raw_html: &str,
-) -> Result<()> {
+pub fn save_raw_file(raw_dir: &PathBuf, subtitle: &SubtitleInfo, raw_html: &str) -> Result<()> {
     let filename = format!("{} {}.html", subtitle.index, subtitle.file_subtitle);
     let path = raw_dir.join(filename);
     std::fs::write(&path, raw_html)?;
@@ -108,4 +104,3 @@ pub fn ensure_default_files(novel_dir: &PathBuf, title: &str, author: &str, toc_
         let _ = std::fs::write(&replace_path, content);
     }
 }
-

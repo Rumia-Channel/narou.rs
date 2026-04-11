@@ -7,7 +7,11 @@ use super::site_setting::SiteSetting;
 use super::types::SubtitleInfo;
 use super::util::{pretreatment_source, sanitize_filename};
 
-pub fn fetch_toc(fetcher: &mut HttpFetcher, setting: &SiteSetting, toc_url: &str) -> Result<String> {
+pub fn fetch_toc(
+    fetcher: &mut HttpFetcher,
+    setting: &SiteSetting,
+    toc_url: &str,
+) -> Result<String> {
     fetcher.rate_limiter.wait();
 
     let body = fetcher.fetch_text(toc_url, setting.cookie())?;

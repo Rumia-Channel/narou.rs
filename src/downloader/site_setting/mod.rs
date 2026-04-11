@@ -1,5 +1,5 @@
-mod interpolate;
 mod info_extraction;
+mod interpolate;
 mod loader;
 mod serde_helpers;
 

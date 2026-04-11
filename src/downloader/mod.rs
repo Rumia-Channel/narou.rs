@@ -17,8 +17,8 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 
-use crate::db::DATABASE;
 use crate::db::novel_record::NovelRecord;
+use crate::db::DATABASE;
 use crate::error::{NarouError, Result};
 use crate::progress::ProgressReporter;
 
@@ -30,15 +30,12 @@ use self::persistence::{
 };
 use self::section::{download_section, SectionCache};
 use self::site_setting::SiteSetting;
-use self::toc::{
-    create_short_story_subtitles, fetch_toc, parse_subtitles_multipage,
-};
+use self::toc::{create_short_story_subtitles, fetch_toc, parse_subtitles_multipage};
 use self::util::sanitize_filename;
 
 pub use self::types::{
-    DownloadResult, NarouApiEntry, NarouApiResult, SectionElement, SectionFile,
-    SubtitleInfo, TocFile, TocObject, TargetType,
-    SECTION_SAVE_DIR, RAW_DATA_DIR, ARCHIVE_ROOT_DIR,
+    DownloadResult, NarouApiEntry, NarouApiResult, SectionElement, SectionFile, SubtitleInfo,
+    TargetType, TocFile, TocObject, UpdateStatus, ARCHIVE_ROOT_DIR, RAW_DATA_DIR, SECTION_SAVE_DIR,
 };
 pub use self::util::pretreatment_source;
 
@@ -354,6 +351,11 @@ impl Downloader {
             .map(|t| t.subtitles.iter().map(|s| (s.index.clone(), s)).collect())
             .unwrap_or_default();
 
+        let old_title = old_toc.as_ref().map(|t| t.title.clone());
+        let old_author = old_toc.as_ref().map(|t| t.author.clone());
+        let old_story = old_toc.as_ref().and_then(|t| t.story.clone());
+        let old_section_count = old_toc.as_ref().map(|t| t.subtitles.len()).unwrap_or(0);
+
         let mut updated_count = 0usize;
         let total = subtitles.len() as u64;
         let mut final_subtitles = Vec::with_capacity(subtitles.len());
@@ -365,22 +367,38 @@ impl Downloader {
 
         for subtitle in &subtitles {
             if let Some(ref p) = self.progress {
-                p.set_message(&format!("DL {} [{}/{}]",
-                    title, final_subtitles.len() + 1, subtitles.len()));
+                p.set_message(&format!(
+                    "DL {} [{}/{}]",
+                    title,
+                    final_subtitles.len() + 1,
+                    subtitles.len()
+                ));
             }
 
             let needs_download = match old_subtitles.get(&subtitle.index) {
                 Some(old) => {
-                    subtitle.subtitle != old.subtitle
-                        || subtitle.subdate != old.subdate
-                        || subtitle.subupdate != old.subupdate
+                    let subtitle_changed = subtitle.subtitle != old.subtitle;
+                    let date_changed =
+                        subtitle.subdate != old.subdate || subtitle.subupdate != old.subupdate;
+                    let file_missing = !section_dir
+                        .join(format!(
+                            "{} {}.yaml",
+                            subtitle.index, subtitle.file_subtitle
+                        ))
+                        .exists();
+                    subtitle_changed || date_changed || file_missing
                 }
                 None => true,
             };
 
             let download_time = if needs_download {
-                let (section, raw_html) =
-                    download_section(&mut self.fetcher, &mut self.section_cache, &setting, subtitle, &toc_url)?;
+                let (section, raw_html) = download_section(
+                    &mut self.fetcher,
+                    &mut self.section_cache,
+                    &setting,
+                    subtitle,
+                    &toc_url,
+                )?;
                 save_section_file(&section_dir, subtitle, &section)?;
                 save_raw_file(&raw_dir, subtitle, &raw_html)?;
                 updated_count += 1;
@@ -403,16 +421,23 @@ impl Downloader {
         if let Some(ref p) = self.progress {
             p.finish_with_message(&format!(
                 "DL {} done ({}/{})",
-                title, updated_count, subtitles.len()
+                title,
+                updated_count,
+                subtitles.len()
             ));
         }
+
+        let title_changed = old_title.as_deref() != Some(&title);
+        let author_changed = old_author.as_deref() != Some(&author);
+        let new_story = info.story.as_ref().map(|s| s.replace("<br>", "\n"));
+        let story_changed = old_story != new_story;
+        let sections_deleted = old_section_count > subtitles.len();
 
         let toc_file = TocFile {
             title: title.clone(),
             author: author.clone(),
             toc_url: toc_url.clone(),
-            story: info.story.as_ref().map(|s| s.replace("<br>", "\n")),
-
+            story: new_story.clone(),
             subtitles: final_subtitles,
             novel_type: Some(novel_type),
         };
@@ -479,6 +504,19 @@ impl Downloader {
             Ok::<i64, NarouError>(id)
         })?;
 
+        let has_changes = updated_count > 0
+            || existing_id.is_none()
+            || title_changed
+            || author_changed
+            || story_changed
+            || sections_deleted;
+
+        let status = if has_changes {
+            types::UpdateStatus::Ok
+        } else {
+            types::UpdateStatus::None
+        };
+
         Ok(DownloadResult {
             id,
             title: title.clone(),
@@ -487,6 +525,11 @@ impl Downloader {
             new_novel: existing_id.is_none(),
             updated_count,
             total_count: subtitles.len(),
+            status,
+            title_changed,
+            author_changed,
+            story_changed,
+            sections_deleted,
         })
     }
 

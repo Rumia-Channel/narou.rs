@@ -1,5 +1,5 @@
-use super::site_setting::SiteSetting;
 use super::preprocess;
+use super::site_setting::SiteSetting;
 
 pub fn build_section_url(setting: &SiteSetting, toc_url: &str, href: &str) -> String {
     if href.starts_with("http://") || href.starts_with("https://") {

@@ -41,8 +41,7 @@ fn load_settings_from_dir(dir: PathBuf, settings: &mut Vec<SiteSetting>) {
                                     *existing = merged;
                                 }
                             }
-                        } else if let Ok(setting) =
-                            serde_yaml::from_value::<SiteSetting>(raw_yaml)
+                        } else if let Ok(setting) = serde_yaml::from_value::<SiteSetting>(raw_yaml)
                         {
                             settings.push(setting);
                         }

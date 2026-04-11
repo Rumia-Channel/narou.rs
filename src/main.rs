@@ -32,8 +32,21 @@ async fn main() {
             }
             commands::download::cmd_download(&targets, user_agent);
         }
-        Commands::Update { ids, all } => {
-            commands::update::cmd_update(ids, all, user_agent);
+        Commands::Update {
+            ids,
+            all,
+            force,
+            no_convert,
+            sort_by,
+        } => {
+            commands::update::cmd_update(commands::update::UpdateOptions {
+                ids,
+                all,
+                force,
+                no_convert,
+                sort_by,
+                user_agent,
+            });
         }
         Commands::Convert { targets } => {
             if targets.is_empty() {

@@ -27,9 +27,15 @@ pub enum Commands {
         targets: Vec<String>,
     },
     Update {
-        ids: Option<Vec<i64>>,
+        ids: Option<Vec<String>>,
         #[arg(long)]
         all: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        no_convert: bool,
+        #[arg(long)]
+        sort_by: Option<String>,
     },
     Convert {
         targets: Vec<String>,

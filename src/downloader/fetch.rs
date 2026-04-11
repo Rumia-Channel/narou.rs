@@ -67,18 +67,14 @@ impl HttpFetcher {
                 self.prefer_curl = true;
                 return Ok(body);
             }
-            self.tier_failures
-                .entry(domain.clone())
-                .or_insert([0; 3])[0] += 1;
+            self.tier_failures.entry(domain.clone()).or_insert([0; 3])[0] += 1;
         }
 
         if !skip_reqwest {
             match self.fetch_tier_reqwest(url, cookie) {
                 Ok(body) => return Ok(body),
                 Err(_) => {
-                    self.tier_failures
-                        .entry(domain.clone())
-                        .or_insert([0; 3])[1] += 1;
+                    self.tier_failures.entry(domain.clone()).or_insert([0; 3])[1] += 1;
                 }
             }
         }
@@ -87,9 +83,7 @@ impl HttpFetcher {
             if let Some(body) = self.fetch_tier_wget(url, cookie) {
                 return Ok(body);
             }
-            self.tier_failures
-                .entry(domain.clone())
-                .or_insert([0; 3])[2] += 1;
+            self.tier_failures.entry(domain.clone()).or_insert([0; 3])[2] += 1;
         }
 
         Err(NarouError::NotFound(url.to_string()))
