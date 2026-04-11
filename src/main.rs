@@ -1,36 +1,98 @@
 mod cli;
 mod commands;
 
+use std::time::Instant;
+
 use clap::Parser;
 
 use cli::{Cli, Commands};
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
 
-    let cli = Cli::parse();
-    let user_agent = cli.user_agent.clone();
+    let global_flags = cli::preprocess_args(&mut args);
+    let show_time = global_flags.show_time;
+    let backtrace = global_flags.backtrace;
+    let no_color = global_flags.no_color;
+    let user_agent = global_flags.user_agent.clone();
+
+    if no_color {
+        unsafe {
+            std::env::set_var("NO_COLOR", "1");
+        }
+    }
+
+    if !args.is_empty() {
+        cli::inject_default_args(&mut args);
+    }
+
+    let start = if show_time {
+        Some(Instant::now())
+    } else {
+        None
+    };
+
+    let exit_code = run_command(args, user_agent, backtrace).await;
+
+    if let Some(start) = start {
+        let elapsed = start.elapsed();
+        eprintln!("実行時間 {:.1}秒", elapsed.as_secs_f64());
+    }
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
+
+async fn run_command(args: Vec<String>, user_agent: Option<String>, backtrace: bool) -> i32 {
+    let cli = match Cli::try_parse_from(std::iter::once("narou".to_string()).chain(args)) {
+        Ok(cli) => cli,
+        Err(e) => {
+            if backtrace {
+                eprintln!("{}", e);
+            } else {
+                let msg = format!("{}", e);
+                for line in msg.lines().take(5) {
+                    eprintln!("{}", line);
+                }
+            }
+            return 1;
+        }
+    };
+
+    let ua = user_agent.or(cli.user_agent);
 
     match cli.command {
+        Commands::Web { port, no_browser } => {
+            commands::web::run_web_server(port, no_browser).await;
+            0
+        }
+        other => run_sync_command(other, ua, backtrace),
+    }
+}
+
+fn run_sync_command(command: Commands, user_agent: Option<String>, backtrace: bool) -> i32 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match command {
         Commands::Init {
             aozora_path,
             line_height,
         } => {
             if let Err(e) = commands::init::cmd_init(aozora_path.as_deref(), line_height) {
                 eprintln!("Error initializing: {}", e);
-                std::process::exit(1);
+                1
+            } else {
+                0
             }
-        }
-        Commands::Web { port, no_browser } => {
-            commands::web::run_web_server(port, no_browser).await;
         }
         Commands::Download { targets } => {
             if targets.is_empty() {
                 eprintln!("Usage: narou download <url|ncode|id>...");
-                std::process::exit(1);
+                1
+            } else {
+                commands::download::cmd_download(&targets, user_agent);
+                0
             }
-            commands::download::cmd_download(&targets, user_agent);
         }
         Commands::Update {
             ids,
@@ -47,16 +109,20 @@ async fn main() {
                 sort_by,
                 user_agent,
             });
+            0
         }
         Commands::Convert { targets } => {
             if targets.is_empty() {
                 eprintln!("Usage: narou convert <url|ncode|id>...");
-                std::process::exit(1);
+                1
+            } else {
+                commands::convert::cmd_convert(&targets);
+                0
             }
-            commands::convert::cmd_convert(&targets);
         }
         Commands::List { tag, frozen } => {
             commands::manage::cmd_list(tag.as_deref(), frozen);
+            0
         }
         Commands::Tag {
             add,
@@ -65,23 +131,29 @@ async fn main() {
         } => {
             if targets.is_empty() {
                 eprintln!("Usage: narou tag --add <tag> <targets>...");
-                std::process::exit(1);
+                1
+            } else {
+                commands::manage::cmd_tag(add.as_deref(), remove.as_deref(), &targets);
+                0
             }
-            commands::manage::cmd_tag(add.as_deref(), remove.as_deref(), &targets);
         }
         Commands::Freeze { targets, off } => {
             if targets.is_empty() {
                 eprintln!("Usage: narou freeze <targets>...");
-                std::process::exit(1);
+                1
+            } else {
+                commands::manage::cmd_freeze(&targets, off);
+                0
             }
-            commands::manage::cmd_freeze(&targets, off);
         }
         Commands::Remove { targets } => {
             if targets.is_empty() {
                 eprintln!("Usage: narou remove <targets>...");
-                std::process::exit(1);
+                1
+            } else {
+                commands::manage::cmd_remove(&targets);
+                0
             }
-            commands::manage::cmd_remove(&targets);
         }
         Commands::Setting {
             args,
@@ -90,6 +162,27 @@ async fn main() {
             burn,
         } => {
             commands::setting::cmd_setting(&args, list, all, burn);
+            0
+        }
+        Commands::Web { .. } => unreachable!(),
+    }));
+
+    match result {
+        Ok(code) => code,
+        Err(panic_info) => {
+            if backtrace {
+                if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    eprintln!("panic: {}", s);
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    eprintln!("panic: {}", s);
+                } else {
+                    eprintln!("panic: unknown error");
+                }
+            } else {
+                eprintln!("エラーが発生したため終了しました。");
+                eprintln!("詳細なエラーログは --backtrace オプションを付けて再度実行して下さい。");
+            }
+            127
         }
     }
 }

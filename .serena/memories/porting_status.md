@@ -47,27 +47,22 @@
 | `csv` | ❌ 未実装 | CSV エクスポート/インポート |
 | `trace` | ❌ 未実装 | デバッグ用 |
 
-## 完了済み基盤機能
-- DL: なろう(n8858hb, 24セクション), カクヨム(ID=2, 294セクション), syosetu.org
-- Convert: なろう版はnarou.rb参照データと完全互換
-- カクヨム版: 構造完全一致、+493行の差（auto_indent bug が原因）
-- Web API: 30+ endpoints (Axum)
-- 3-tier HTTP fetch: curl crate → reqwest → wget
-- YAML駆動前処理: pest DSL parser 実装済み
-- モジュール分割: 10ファイル → 66ファイル
-- 進捗バー (indicatif MultiProgress)
-- R18 sitename 動的抽出
-- 自動変換パイプライン (DL/Update → Convert)
-- update コマンド: 凍結チェック、ターゲット解決(tag:NAME/^tag:NAME)、メタデータ変更検出、ステータスメッセージ、小説間インターバル
-
-## Known Issues
-- カクヨム版 auto_indent bug: +493行 (根本原因特定済み、修正方針3案あり)
+### グローバル機能 (2026-04-12 完了)
+- ✅ `--no-color`: NO_COLOR 環境変数設定 + global_setting.yaml の `no-color` キー参照
+- ✅ `--multiple`: カンマ区切り引数展開（`multiple-delimiter` 設定対応）
+- ✅ `--time`: 実行時間表示（at_exit パターン）
+- ✅ `--backtrace`: panic時のフルスタックトレース表示
+- ✅ `--user-agent <UA>`: カスタム User-Agent
+- ✅ コマンドショートカット: `d`→download, `u`→update 等（Ruby版と同一の逆順ハッシュ構築）
+- ✅ `-v`/`--version` → version コマンド変換
+- ✅ 引数なし → help コマンドフォールバック
+- ✅ `default_args.<cmd>` 注入: local_setting.yaml から引数なし+TTY時のみ
 
 ## 実装優先度
 - P0: 既存9コマンドの不足オプション補完 (download flags, list flags, convert flags)
 - P1: ユーティリティコマンド (help, version, folder, browser, alias, backup, clean, csv, inspect, log)
 - P3: 端末連携 (send, mail, diff)
-- P4: グローバル機能 (--no-color, --multiple, --time, --backtrace, ショートカット)
+- ~~P4: グローバル機能 (--no-color, --multiple, --time, --backtrace, ショートカット)~~ ✅ 完了
 
 ## 参照データ
 - カクヨム: `sample/1177354055617350769 .../kakuyomu_jp_1177354055617350769.txt` (25,273行)
