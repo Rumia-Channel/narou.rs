@@ -8,6 +8,8 @@ use tracing::info;
 #[derive(Parser, Debug)]
 #[command(name = "narou", about = "narou.rs - A Rust port of narou.rb")]
 struct Cli {
+    #[arg(long, global = true)]
+    user_agent: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -65,6 +67,7 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+    let user_agent = cli.user_agent.clone();
 
     match cli.command {
         Commands::Init {
@@ -84,10 +87,10 @@ async fn main() {
                 eprintln!("Usage: narou download <url|ncode|id>...");
                 std::process::exit(1);
             }
-            cmd_download(&targets);
+            cmd_download(&targets, user_agent);
         }
         Commands::Update { ids, all } => {
-            cmd_update(ids, all);
+            cmd_update(ids, all, user_agent);
         }
         Commands::Convert { targets } => {
             if targets.is_empty() {
@@ -192,7 +195,7 @@ async fn run_web_server(port: u16, no_browser: bool) {
     axum::serve(listener, app).await.unwrap();
 }
 
-fn cmd_download(targets: &[String]) {
+fn cmd_download(targets: &[String], user_agent: Option<String>) {
     use narou_rs::downloader::Downloader;
 
     let targets = targets.to_vec();
@@ -202,7 +205,7 @@ fn cmd_download(targets: &[String]) {
             std::process::exit(1);
         }
 
-        let mut downloader = match Downloader::new() {
+        let mut downloader = match Downloader::with_user_agent(user_agent.as_deref()) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("Error creating downloader: {}", e);
@@ -239,7 +242,7 @@ fn cmd_download(targets: &[String]) {
     }
 }
 
-fn cmd_update(ids: Option<Vec<i64>>, all: bool) {
+fn cmd_update(ids: Option<Vec<i64>>, all: bool, user_agent: Option<String>) {
     let result = std::thread::spawn(move || {
         use narou_rs::downloader::Downloader;
 
@@ -248,7 +251,7 @@ fn cmd_update(ids: Option<Vec<i64>>, all: bool) {
             std::process::exit(1);
         }
 
-        let mut downloader = match Downloader::new() {
+        let mut downloader = match Downloader::with_user_agent(user_agent.as_deref()) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("Error creating downloader: {}", e);
@@ -647,14 +650,20 @@ fn init_aozoraepub3_settings(
         std::collections::BTreeMap::new()
     };
 
-    if !force && aozora_path.is_none() && line_height.is_none() && settings.contains_key("aozoraepub3dir") {
+    if !force
+        && aozora_path.is_none()
+        && line_height.is_none()
+        && settings.contains_key("aozoraepub3dir")
+    {
         return Ok(());
     }
 
     println!("AozoraEpub3の設定を行います");
     if !settings.contains_key("aozoraepub3dir") {
         println!("!!!WARNING!!!");
-        println!("AozoraEpub3の構成ファイルを書き換えます。narouコマンド用に別途新規インストールしておくことをオススメします");
+        println!(
+            "AozoraEpub3の構成ファイルを書き換えます。narouコマンド用に別途新規インストールしておくことをオススメします"
+        );
     }
 
     let resolved_aozora_path = resolve_init_aozora_path(aozora_path, &settings)?;
@@ -715,7 +724,9 @@ fn resolve_init_aozora_path(
 fn ask_aozoraepub3_path(
     settings: &std::collections::BTreeMap<String, serde_yaml::Value>,
 ) -> narou_rs::error::Result<Option<String>> {
-    let current_path = settings.get("aozoraepub3dir").and_then(|value| value.as_str());
+    let current_path = settings
+        .get("aozoraepub3dir")
+        .and_then(|value| value.as_str());
     println!();
     println!("AozoraEpub3のあるフォルダを入力して下さい:");
     if let Some(current_path) = current_path {
@@ -797,8 +808,10 @@ fn rewrite_aozoraepub3_files(aozora_path: &str, line_height: f64) -> narou_rs::e
     let chuki_tag_path = aozora_dir.join("chuki_tag.txt");
     let mut chuki_tag = std::fs::read_to_string(&chuki_tag_path)?;
     let embedded_mark = "### Narou.rb embedded custom chuki ###";
-    if let (Some(start), Some(end)) = (chuki_tag.find(embedded_mark), chuki_tag.rfind(embedded_mark))
-    {
+    if let (Some(start), Some(end)) = (
+        chuki_tag.find(embedded_mark),
+        chuki_tag.rfind(embedded_mark),
+    ) {
         if start != end {
             let end = end + embedded_mark.len();
             chuki_tag.replace_range(start..end, &custom_chuki_tag);
@@ -844,9 +857,16 @@ fn preset_dir() -> narou_rs::error::Result<PathBuf> {
     candidates.push(manifest_dir.join("preset"));
     candidates.push(manifest_dir.join("sample").join("narou").join("preset"));
 
-    candidates.into_iter().find(|path| path.is_dir()).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "narou preset directory not found").into()
-    })
+    candidates
+        .into_iter()
+        .find(|path| path.is_dir())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "narou preset directory not found",
+            )
+            .into()
+        })
 }
 
 fn format_line_height(line_height: f64) -> String {

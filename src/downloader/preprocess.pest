@@ -57,6 +57,7 @@ primary = _{
     string
     | extract_json_expr
     | chain_expr
+    | array_chain_expr
     | array_literal
     | null_lit
     | "(" ~ expr ~ ")"
@@ -107,6 +108,7 @@ regex_flags = @{ ("s" | "m" | "i")* }
 
 // ---------- literals ----------
 array_literal = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
+array_chain_expr = { array_literal ~ method+ }
 null_lit      = { "null" }
 
 // ---------- identifier ----------

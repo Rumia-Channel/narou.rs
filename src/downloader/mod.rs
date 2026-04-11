@@ -149,14 +149,26 @@ pub struct DownloadResult {
 }
 
 pub const SECTION_SAVE_DIR: &str = "本文";
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const RAW_DATA_DIR: &str = "raw";
 const CACHE_SAVE_DIR: &str = "cache";
 const MAX_SECTION_CACHE: usize = 20;
 
 impl Downloader {
     pub fn new() -> Result<Self> {
+        Self::with_user_agent(None)
+    }
+
+    pub fn with_user_agent(user_agent: Option<&str>) -> Result<Self> {
+        let ua = match user_agent {
+            Some(ua) if ua.eq_ignore_ascii_case("random") => {
+                ua_generator::ua::spoof_chrome_ua().to_string()
+            }
+            Some(ua) if !ua.trim().is_empty() => ua.to_string(),
+            _ => DEFAULT_USER_AGENT.to_string(),
+        };
         let client = reqwest::blocking::Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .user_agent(&ua)
             .gzip(true)
             .brotli(true)
             .deflate(true)
@@ -1279,16 +1291,26 @@ fn sanitize_filename(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::kakuyomu_preprocess;
+    use super::site_setting::SiteSetting;
 
     #[test]
-    fn kakuyomu_preprocess_supports_table_of_contents_v2() {
+    fn sanitize_filename_removes_windows_trailing_dots_and_spaces() {
+        assert_eq!(super::sanitize_filename("title. "), "title");
+        assert_eq!(super::sanitize_filename("bad/name?"), "bad_name_");
+    }
+
+    #[test]
+    fn kakuyomu_preprocess_yaml_supports_table_of_contents_v2_and_tags() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "カクヨム").unwrap();
+        assert!(setting.preprocess_pipeline().is_some());
+
         let json = r#"{
             "props": {
                 "pageProps": {
                     "__APOLLO_STATE__": {
                         "Work:1177354055617350769": {
-                            "title": "「先輩の妹じゃありません！」",
+                            "title": "先輩の妹じゃありません！",
                             "author": {"__ref": "UserAccount:1"},
                             "alternateAuthorName": null,
                             "introduction": "intro\nbody",
@@ -1309,11 +1331,13 @@ mod tests {
                             "episodeUnions": [{"__ref": "Episode:20"}]
                         },
                         "Chapter:10": {
+                            "__typename": "Chapter",
                             "id": "10",
                             "level": 1,
                             "title": "第一章"
                         },
                         "Episode:20": {
+                            "__typename": "Episode",
                             "id": "20",
                             "publishedAt": "2021-01-12T16:13:02Z",
                             "title": "第1話"
@@ -1330,18 +1354,15 @@ mod tests {
             json
         );
 
-        kakuyomu_preprocess(&mut html);
+        super::pretreatment_source(&mut html, "UTF-8", Some(setting));
 
         assert!(html.contains("KakuyomuPreprocessEvalMagicWord"));
-        assert!(html.contains("title::「先輩の妹じゃありません！」"));
+        assert!(html.contains("title::先輩の妹じゃありません！"));
         assert!(html.contains("author::author-name"));
+        assert!(html.contains("introduction::intro<br>body"));
+        assert!(html.contains("tag::tag-a"));
         assert!(html.contains("Chapter;1;10;第一章"));
+        assert!(!html.contains("Chapter;1;10;;第一章"));
         assert!(html.contains("Episode;20;2021-01-12T16:13:02Z;第1話"));
-    }
-
-    #[test]
-    fn sanitize_filename_removes_windows_trailing_dots_and_spaces() {
-        assert_eq!(super::sanitize_filename("title. "), "title");
-        assert_eq!(super::sanitize_filename("bad/name?"), "bad_name_");
     }
 }

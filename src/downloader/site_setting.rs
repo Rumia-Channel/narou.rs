@@ -157,8 +157,6 @@ where
 }
 
 impl SiteSetting {
-
-
     pub fn load_all() -> Result<Vec<Self>> {
         let mut load_dirs = Vec::new();
 
@@ -345,7 +343,9 @@ impl SiteSetting {
         self.compiled_toc_page_max.as_ref()
     }
 
-    pub fn preprocess_pipeline(&self) -> Option<&crate::downloader::preprocess::PreprocessPipeline> {
+    pub fn preprocess_pipeline(
+        &self,
+    ) -> Option<&crate::downloader::preprocess::PreprocessPipeline> {
         self.compiled_preprocess.as_ref()
     }
 
@@ -525,8 +525,6 @@ impl SiteSetting {
             None => format!("\\k<{}>", key),
         }
     }
-
-    
 
     fn build_base_vars(&self) -> HashMap<String, String> {
         let mut vars = HashMap::new();

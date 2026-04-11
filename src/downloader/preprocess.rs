@@ -45,6 +45,10 @@ pub enum Expr {
         base: Accessor,
         methods: Vec<Method>,
     },
+    ValueChain {
+        base: Box<Expr>,
+        methods: Vec<Method>,
+    },
     Array(Vec<Expr>),
     Null,
     Not(Box<Expr>),
@@ -89,14 +93,8 @@ pub enum LValue {
 
 #[derive(Debug, Clone)]
 pub enum Method {
-    Map {
-        var: String,
-        body: Box<Expr>,
-    },
-    FlatMap {
-        var: String,
-        body: Box<Expr>,
-    },
+    Map { var: String, body: Box<Expr> },
+    FlatMap { var: String, body: Box<Expr> },
     Flatten,
     Compact,
     Join(Vec<StrPart>),
@@ -149,38 +147,8 @@ fn build_stmt(pair: pest::iterators::Pair<Rule>) -> Stmt {
         Rule::if_stmt => {
             let mut inner = pair.into_inner();
             let cond = build_expr(inner.next().unwrap());
-            let mut body = Vec::new();
-            let mut else_body = None;
-            let mut in_else = false;
-            for p in inner {
-                match p.as_rule() {
-                    Rule::stmt => {
-                        let inner_stmt = p.into_inner().next().unwrap();
-                        if in_else {
-                            else_body.get_or_insert_with(Vec::new).push(build_stmt(inner_stmt));
-                        } else {
-                            body.push(build_stmt(inner_stmt));
-                        }
-                    }
-                    Rule::stmts => {
-                        for sp in p.into_inner() {
-                            if sp.as_rule() == Rule::stmt {
-                                let inner_stmt = sp.into_inner().next().unwrap();
-                                if in_else {
-                                    else_body.get_or_insert_with(Vec::new).push(build_stmt(inner_stmt));
-                                } else {
-                                    body.push(build_stmt(inner_stmt));
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        if p.as_str() == "else" {
-                            in_else = true;
-                        }
-                    }
-                }
-            }
+            let body = inner.next().map(build_stmt_list).unwrap_or_default();
+            let else_body = inner.next().map(build_stmt_list);
             Stmt::If {
                 cond,
                 body,
@@ -191,28 +159,18 @@ fn build_stmt(pair: pest::iterators::Pair<Rule>) -> Stmt {
             let mut inner = pair.into_inner();
             let var = inner.next().unwrap().as_str().to_string();
             let iter = build_expr(inner.next().unwrap());
-            let mut body = Vec::new();
-            for p in inner {
-                match p.as_rule() {
-                    Rule::stmt => {
-                        let inner_stmt = p.into_inner().next().unwrap();
-                        body.push(build_stmt(inner_stmt));
-                    }
-                    Rule::stmts => {
-                        for sp in p.into_inner() {
-                            if sp.as_rule() == Rule::stmt {
-                                let inner_stmt = sp.into_inner().next().unwrap();
-                                body.push(build_stmt(inner_stmt));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            let body = inner.next().map(build_stmt_list).unwrap_or_default();
             Stmt::For { var, iter, body }
         }
         _ => unreachable!("unexpected stmt rule: {:?}", pair.as_rule()),
     }
+}
+
+fn build_stmt_list(pair: pest::iterators::Pair<Rule>) -> Vec<Stmt> {
+    pair.into_inner()
+        .filter(|p| p.as_rule() == Rule::stmt)
+        .map(|p| build_stmt(p.into_inner().next().unwrap()))
+        .collect()
 }
 
 fn build_expr(pair: pest::iterators::Pair<Rule>) -> Expr {
@@ -292,7 +250,10 @@ fn build_expr(pair: pest::iterators::Pair<Rule>) -> Expr {
                     }
                 }
             }
-            let accessor = Accessor { base: base_name, path };
+            let accessor = Accessor {
+                base: base_name,
+                path,
+            };
             if methods.is_empty() {
                 Expr::Access(accessor)
             } else {
@@ -300,6 +261,15 @@ fn build_expr(pair: pest::iterators::Pair<Rule>) -> Expr {
                     base: accessor,
                     methods,
                 }
+            }
+        }
+        Rule::array_chain_expr => {
+            let mut inner = pair.into_inner();
+            let base = build_expr(inner.next().unwrap());
+            let methods = inner.map(build_method).collect();
+            Expr::ValueChain {
+                base: Box::new(base),
+                methods,
             }
         }
         Rule::array_literal => {
@@ -474,7 +444,10 @@ fn build_lvalue(pair: pest::iterators::Pair<Rule>) -> LValue {
     } else {
         LValue::Hash {
             base,
-            keys: dot_keys.into_iter().map(|k| vec![StrPart::Lit(k)]).collect(),
+            keys: dot_keys
+                .into_iter()
+                .map(|k| vec![StrPart::Lit(k)])
+                .collect(),
         }
     }
 }
@@ -492,12 +465,18 @@ fn build_method(pair: pest::iterators::Pair<Rule>) -> Method {
         s if s.starts_with(".map ") || s.starts_with(".map{") => {
             let block = pair.into_inner().next().unwrap();
             let (var, body) = build_block(block);
-            Method::Map { var, body: Box::new(body) }
+            Method::Map {
+                var,
+                body: Box::new(body),
+            }
         }
         s if s.starts_with(".flat_map") => {
             let block = pair.into_inner().next().unwrap();
             let (var, body) = build_block(block);
-            Method::FlatMap { var, body: Box::new(body) }
+            Method::FlatMap {
+                var,
+                body: Box::new(body),
+            }
         }
         ".flatten" => Method::Flatten,
         ".compact" => Method::Compact,
@@ -625,11 +604,19 @@ fn eval_expr(ctx: &mut Ctx, expr: &Expr) -> Value {
         Expr::Not(inner) => Value::Bool(!is_truthy(&eval_expr(ctx, inner))),
         Expr::Or(left, right) => {
             let lv = eval_expr(ctx, left);
-            if is_truthy(&lv) { lv } else { eval_expr(ctx, right) }
+            if is_truthy(&lv) {
+                lv
+            } else {
+                eval_expr(ctx, right)
+            }
         }
         Expr::And(left, right) => {
             let lv = eval_expr(ctx, left);
-            if !is_truthy(&lv) { lv } else { eval_expr(ctx, right) }
+            if !is_truthy(&lv) {
+                lv
+            } else {
+                eval_expr(ctx, right)
+            }
         }
         Expr::Eq(left, right) => {
             Value::Bool(val_equals(&eval_expr(ctx, left), &eval_expr(ctx, right)))
@@ -645,9 +632,14 @@ fn eval_expr(ctx: &mut Ctx, expr: &Expr) -> Value {
             }
             val
         }
-        Expr::Array(items) => {
-            Value::Array(items.iter().map(|e| eval_expr(ctx, e)).collect())
+        Expr::ValueChain { base, methods } => {
+            let mut val = eval_expr(ctx, base);
+            for method in methods {
+                val = eval_method(ctx, val, method);
+            }
+            val
         }
+        Expr::Array(items) => Value::Array(items.iter().map(|e| eval_expr(ctx, e)).collect()),
         Expr::ExtractJson(_, _) | Expr::Regex(_, _) => Value::Null,
     }
 }

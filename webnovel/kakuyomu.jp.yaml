@@ -20,7 +20,7 @@ preprocess: |-
 
   let json = extract_json(/<script id="__NEXT_DATA__" type="application\/json">(.+?)<\/script>/s)
 
-  let data = json.props.pageProperties.__APOLLO_STATE__
+  let data = json.props.pageProps.__APOLLO_STATE__
   let work_id = json.query.workId
   let work = data["Work:${work_id}"]
 
@@ -30,7 +30,7 @@ preprocess: |-
   let toc = toc.flat_map { |item| [item.chapter, item.episodeUnions] }
   let toc = toc.compact
   let toc = toc.map { |item| data[item.__ref] }
-  let toc = toc.map { |item| "${item.__typename};${item.level};${item.id};${item.publishedAt};${item.title}" }
+  let toc = toc.map { |item| [item.__typename, item.level, item.id, item.publishedAt, item.title].compact.join(";") }
 
   # Author: resolve __ref → activityName
   let author_ref = work.author.__ref
@@ -63,9 +63,7 @@ preprocess: |-
   emit "lastEpisodePublishedAt::${work.lastEpisodePublishedAt}"
   emit "totalCharacterCount::${work.totalCharacterCount}"
 
-  for tag in work.tagLabels
-    emit tag
-  end
+  emit work.tagLabels
 
   for entry in toc
     emit entry
