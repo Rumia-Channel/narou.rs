@@ -1,6 +1,6 @@
+use narou_rs::converter::NovelConverter;
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
-use narou_rs::converter::NovelConverter;
 use narou_rs::progress::CliProgress;
 
 use super::resolve_target_to_id;
@@ -38,10 +38,7 @@ pub fn cmd_convert(targets: &[String]) {
             }
         };
 
-        let progress = CliProgress::with_multi(
-            &format!("Convert {}", title),
-            multi_clone.clone(),
-        );
+        let progress = CliProgress::with_multi(&format!("Convert {}", title), multi_clone.clone());
 
         let settings = NovelSettings::load_for_novel(id, &title, &author, &novel_dir);
         let mut converter =

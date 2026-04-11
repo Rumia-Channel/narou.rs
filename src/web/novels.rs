@@ -7,8 +7,8 @@ use axum::{
 use crate::db::{with_database, with_database_mut};
 use crate::error::NarouError;
 
-use super::state::{ApiResponse, IdPath, ListParams, NovelListItem, NovelListResponse};
 use super::AppState;
+use super::state::{ApiResponse, IdPath, ListParams, NovelListItem, NovelListResponse};
 
 pub async fn index() -> &'static str {
     "narou.rs API server"

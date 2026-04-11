@@ -7,8 +7,8 @@ use axum::{
 use crate::db::with_database_mut;
 use crate::error::NarouError;
 
-use super::state::{ApiResponse, IdPath, TagBody, TagsBody};
 use super::AppState;
+use super::state::{ApiResponse, IdPath, TagBody, TagsBody};
 
 pub async fn add_tag(
     State(state): State<AppState>,

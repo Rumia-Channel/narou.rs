@@ -83,5 +83,13 @@ async fn main() {
             }
             commands::manage::cmd_remove(&targets);
         }
+        Commands::Setting {
+            args,
+            list,
+            all,
+            burn,
+        } => {
+            commands::setting::cmd_setting(&args, list, all, burn);
+        }
     }
 }

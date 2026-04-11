@@ -76,7 +76,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `freeze` | ✅ | ✅ 完了 | `--list`, `--on` 不足だが基本機能あり |
 | `remove` | ✅ | 🟡 部分 | `--yes`, `--with-file` 不足 |
 | `web` | ✅ | 🟡 部分 | APIのみ。HTML UIなし |
-| `setting` | ✅ | ❌ 未実装 | |
+| `setting` | ✅ | ✅ 完了 | |
 | `diff` | ✅ | ❌ 未実装 | |
 | `send` | ✅ | ❌ 未実装 | USB 経由端末送信 |
 | `mail` | ✅ | ❌ 未実装 | Send-to-Kindle 等 |
@@ -216,7 +216,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 
 ---
 
-### 6. `setting` — ❌ 未実装
+### 6. `setting` — ✅ 完了
 
 > 各コマンドの設定を変更します
 
@@ -285,12 +285,17 @@ narou setting name         # 読み取り
 | `server-basic-auth.*` | bool/str | Basic 認証設定 |
 | `over18` | boolean | 18+ フラグ |
 
-**実装要件**:
-- `local_setting.yaml` / `global_setting.yaml` の読み書き
+**実装済み (Rust)**:
+- `local_setting.yaml` / `global_setting.yaml` の読み書き (`Inventory`)
 - 設定値のバリデーション (型チェック、選択肢チェック)
-- `default.*` / `force.*` プレフィックスの解決
+- `default.*` / `force.*` プレフィックスの解決 (フラットドット記法対応)
+- `--list` 現在値一覧表示
+- `--all` 全変数表示
 - `--burn` による setting.ini への焼き込み
-- 端末変更時の関連設定自動調整
+- `name` 読み取り、`name=value` 設定、`name=` 削除
+- 不明変数名のエラー、古い変数の掃除削除
+- エラー数を終了コードとして返す
+- `apply_force_and_default_settings` で変換時の `force.*/default.*` をフラットキーから正しく解決
 
 ---
 

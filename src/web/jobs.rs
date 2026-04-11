@@ -1,13 +1,10 @@
-use axum::{
-    extract::State,
-    response::Json,
-};
+use axum::{extract::State, response::Json};
 
 use crate::db::with_database;
 use crate::queue::{JobType, PersistentQueue};
 
-use super::state::{ApiResponse, ConvertBody, DownloadBody, UpdateBody};
 use super::AppState;
+use super::state::{ApiResponse, ConvertBody, DownloadBody, UpdateBody};
 
 pub async fn api_download(
     State(state): State<AppState>,

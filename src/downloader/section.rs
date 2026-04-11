@@ -4,7 +4,7 @@ use crate::error::Result;
 
 use super::fetch::HttpFetcher;
 use super::site_setting::SiteSetting;
-use super::types::{SectionElement, SubtitleInfo, MAX_SECTION_CACHE};
+use super::types::{MAX_SECTION_CACHE, SectionElement, SubtitleInfo};
 use super::util::{build_section_url, compile_html_pattern, pretreatment_source};
 
 pub struct SectionCache {

@@ -78,7 +78,9 @@ impl NovelConverter {
             if let Some(ref p) = self.progress {
                 p.set_message(&format!(
                     "Convert {} [{}/{}]",
-                    toc.title, i + 1, sections.len()
+                    toc.title,
+                    i + 1,
+                    sections.len()
                 ));
             }
 
@@ -194,7 +196,8 @@ impl NovelConverter {
         if let Some(ref p) = self.progress {
             p.finish_with_message(&format!(
                 "Convert {} done ({} sections)",
-                toc.title, sections.len()
+                toc.title,
+                sections.len()
             ));
         }
 

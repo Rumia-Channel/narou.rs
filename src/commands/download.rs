@@ -1,6 +1,6 @@
+use narou_rs::converter::NovelConverter;
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
-use narou_rs::converter::NovelConverter;
 use narou_rs::downloader::Downloader;
 use narou_rs::progress::CliProgress;
 
@@ -24,10 +24,7 @@ pub fn cmd_download(targets: &[String], user_agent: Option<String>) {
         let multi_clone = multi.clone();
 
         for target in targets {
-            let progress = CliProgress::with_multi(
-                &format!("DL {}", target),
-                multi_clone.clone(),
-            );
+            let progress = CliProgress::with_multi(&format!("DL {}", target), multi_clone.clone());
             downloader.set_progress(Box::new(progress));
 
             match downloader.download_novel(&target) {
@@ -70,23 +67,14 @@ fn auto_convert(
     multi: &std::sync::Arc<indicatif::MultiProgress>,
     dl: &narou_rs::downloader::DownloadResult,
 ) -> Result<(), String> {
-    let settings = NovelSettings::load_for_novel(
-        dl.id,
-        &dl.title,
-        &dl.author,
-        &dl.novel_dir,
-    );
-    let mut converter =
-        if let Some(uc) = UserConverter::load_with_title(&dl.novel_dir, &dl.title) {
-            NovelConverter::with_user_converter(settings, uc)
-        } else {
-            NovelConverter::new(settings)
-        };
+    let settings = NovelSettings::load_for_novel(dl.id, &dl.title, &dl.author, &dl.novel_dir);
+    let mut converter = if let Some(uc) = UserConverter::load_with_title(&dl.novel_dir, &dl.title) {
+        NovelConverter::with_user_converter(settings, uc)
+    } else {
+        NovelConverter::new(settings)
+    };
 
-    let progress = CliProgress::with_multi(
-        &format!("Convert {}", dl.title),
-        multi.clone(),
-    );
+    let progress = CliProgress::with_multi(&format!("Convert {}", dl.title), multi.clone());
     converter.set_progress(Box::new(progress));
 
     match converter.convert_novel_by_id(dl.id, &dl.novel_dir) {

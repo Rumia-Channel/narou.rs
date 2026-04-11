@@ -17,8 +17,8 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 
-use crate::db::novel_record::NovelRecord;
 use crate::db::DATABASE;
+use crate::db::novel_record::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::progress::ProgressReporter;
 
@@ -28,14 +28,15 @@ use self::novel_info::NovelInfo;
 use self::persistence::{
     ensure_default_files, load_toc_file, save_raw_file, save_section_file, save_toc_file,
 };
-use self::section::{download_section, SectionCache};
+use self::section::{SectionCache, download_section};
 use self::site_setting::SiteSetting;
 use self::toc::{create_short_story_subtitles, fetch_toc, parse_subtitles_multipage};
 use self::util::sanitize_filename;
 
 pub use self::types::{
-    DownloadResult, NarouApiEntry, NarouApiResult, SectionElement, SectionFile, SubtitleInfo,
-    TargetType, TocFile, TocObject, UpdateStatus, ARCHIVE_ROOT_DIR, RAW_DATA_DIR, SECTION_SAVE_DIR,
+    ARCHIVE_ROOT_DIR, DownloadResult, NarouApiEntry, NarouApiResult, RAW_DATA_DIR,
+    SECTION_SAVE_DIR, SectionElement, SectionFile, SubtitleInfo, TargetType, TocFile, TocObject,
+    UpdateStatus,
 };
 pub use self::util::pretreatment_source;
 

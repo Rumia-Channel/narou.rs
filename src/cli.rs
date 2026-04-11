@@ -61,4 +61,13 @@ pub enum Commands {
     Remove {
         targets: Vec<String>,
     },
+    Setting {
+        args: Vec<String>,
+        #[arg(short, long)]
+        list: bool,
+        #[arg(short, long)]
+        all: bool,
+        #[arg(long)]
+        burn: bool,
+    },
 }

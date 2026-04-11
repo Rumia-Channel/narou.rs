@@ -1,8 +1,8 @@
 pub mod batch;
 pub mod jobs;
 pub mod misc;
-pub mod novels;
 pub mod novel_settings;
+pub mod novels;
 pub mod push;
 pub mod state;
 pub mod tags;

@@ -1,5 +1,15 @@
 # narou.rb Porting Status (updated 2026-04-12)
 
+## ⚠ 互換性の要件レベル（妥協なし）
+- 外部から観測できる挙動の互換性は**妥協せず完璧に**追求する。
+- **設定ファイルの位置**: `.narou/local_setting.yaml`、`~/.narousetting/global_setting.yaml` など Ruby 版と同一パス。
+- **設定ファイルの読み書き互換**: Rust が書いた YAML を Ruby が読め、Ruby が書いた YAML を Rust が読めること。`---` ヘッダ有無は許容、意味論は一致。
+- **全設定項目の読み書き**: Rust 側に未実装機能の設定項目も `narou setting` で読み取り・設定・削除可能。`default.*`、`force.*`、`default_args.*` の動的変数名もすべて受け付ける。
+- **CLI の引数・戻り値・エラー・終了コード**: Ruby 版と同一。
+- **`webnovel/*.yaml`・`.narou/` 配下のデータ構造**: Ruby 版が読める形式。
+- **最終的な変換出力ファイル**: narou.rb の出力と同一。
+- 内部実装は異なってよい。上記外部互換性を満たす限り自由。
+
 ## ⚠ COMMANDS.md 同期ルール
 - `COMMANDS.md` は narou.rb 全24コマンドのオプション・挙動と Rust 側実装状況を管理するマスタードキュメント。
 - **コマンドの新規実装・オプション追加・フラグ追加・挙動変更を行うたびに、必ず `COMMANDS.md` の該当箇所をリアルタイムに更新する。**
@@ -21,7 +31,7 @@
 | `freeze` | ✅ 完了 | `--list`, `--on` 不足だが基本機能あり |
 | `remove` | 🟡 部分 | `--yes`, `--with-file` 不足 |
 | `web` | 🟡 部分 | APIのみ。HTML UIなし |
-| `setting` | ❌ 未実装 | 設定読み書き・一覧・バリデーション |
+| `setting` | ✅ 完了 | local/global YAML読み書き、型バリデーション、default/force/default_args.*対応、--burn |
 | `diff` | ❌ 未実装 | 差分表示 |
 | `send` | ❌ 未実装 | USB 経由端末送信 |
 | `mail` | ❌ 未実装 | Send-to-Kindle |
@@ -55,8 +65,7 @@
 
 ## 実装優先度
 - P0: 既存9コマンドの不足オプション補完 (download flags, list flags, convert flags)
-- P1: `setting` コマンド (local_setting/global_setting 読み書き)
-- P2: ユーティリティコマンド (help, version, folder, browser, alias, backup, clean, csv, inspect, log)
+- P1: ユーティリティコマンド (help, version, folder, browser, alias, backup, clean, csv, inspect, log)
 - P3: 端末連携 (send, mail, diff)
 - P4: グローバル機能 (--no-color, --multiple, --time, --backtrace, ショートカット)
 

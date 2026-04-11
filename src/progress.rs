@@ -31,9 +31,11 @@ impl CliProgress {
     pub fn new(msg: &str) -> Self {
         let pb = ProgressBar::new(0);
         pb.set_style(
-            ProgressStyle::with_template("{msg} {spinner:.green} [{wide_bar:.cyan/blue}] {pos}/{len}")
-                .unwrap()
-                .progress_chars("█▓░"),
+            ProgressStyle::with_template(
+                "{msg} {spinner:.green} [{wide_bar:.cyan/blue}] {pos}/{len}",
+            )
+            .unwrap()
+            .progress_chars("█▓░"),
         );
         pb.set_message(msg.to_string());
         Self { pb, multi: None }
@@ -42,12 +44,17 @@ impl CliProgress {
     pub fn with_multi(msg: &str, multi: Arc<MultiProgress>) -> Self {
         let pb = multi.add(ProgressBar::new(0));
         pb.set_style(
-            ProgressStyle::with_template("{msg} {spinner:.green} [{wide_bar:.cyan/blue}] {pos}/{len}")
-                .unwrap()
-                .progress_chars("█▓░"),
+            ProgressStyle::with_template(
+                "{msg} {spinner:.green} [{wide_bar:.cyan/blue}] {pos}/{len}",
+            )
+            .unwrap()
+            .progress_chars("█▓░"),
         );
         pb.set_message(msg.to_string());
-        Self { pb, multi: Some(multi) }
+        Self {
+            pb,
+            multi: Some(multi),
+        }
     }
 
     pub fn new_spinner(msg: &str) -> Self {
@@ -69,7 +76,10 @@ impl CliProgress {
                 .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
         );
         pb.set_message(msg.to_string());
-        Self { pb, multi: Some(multi) }
+        Self {
+            pb,
+            multi: Some(multi),
+        }
     }
 
     pub fn multi() -> Arc<MultiProgress> {
@@ -80,7 +90,8 @@ impl CliProgress {
 impl ProgressReporter for CliProgress {
     fn set_length(&self, len: u64) {
         self.pb.set_length(len);
-        self.pb.enable_steady_tick(std::time::Duration::from_millis(100));
+        self.pb
+            .enable_steady_tick(std::time::Duration::from_millis(100));
     }
 
     fn inc(&self, delta: u64) {

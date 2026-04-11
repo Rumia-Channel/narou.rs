@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use indicatif::MultiProgress;
 
+use narou_rs::converter::NovelConverter;
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
-use narou_rs::converter::NovelConverter;
 use narou_rs::downloader::{DownloadResult, Downloader, UpdateStatus};
 use narou_rs::progress::{CliProgress, ProgressReporter};
 

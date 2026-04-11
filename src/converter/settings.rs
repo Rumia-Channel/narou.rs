@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -144,7 +145,7 @@ impl NovelSettings {
 
         settings = Self::apply_ini_defaults(&settings, &ini);
         settings = Self::apply_ini_novel(&settings, &ini, novel_id);
-        settings = Self::apply_force_settings(&settings, &local_setting_path);
+        settings = Self::apply_force_and_default_settings(&settings, &local_setting_path);
 
         settings.novel_title = if settings.novel_title.is_empty() {
             novel_title.to_string()
@@ -181,24 +182,275 @@ impl NovelSettings {
         s
     }
 
-    fn apply_force_settings(settings: &Self, local_setting_path: &Path) -> Self {
+    fn apply_force_and_default_settings(settings: &Self, local_setting_path: &Path) -> Self {
         let mut s = settings.clone();
         if !local_setting_path.exists() {
             return s;
         }
         if let Ok(content) = fs::read_to_string(local_setting_path) {
             if let Ok(data) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-                if let Some(force_map) = data.get("force").and_then(|v| v.as_mapping()) {
-                    for (key, value) in force_map {
+                if let Some(mapping) = data.as_mapping() {
+                    let mut default_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
+                    let mut force_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
+                    for (key, value) in mapping {
                         if let Some(key_str) = key.as_str() {
-                            let ini_val = yaml_value_to_ini(value);
-                            Self::apply_single_setting(&mut s, key_str, &ini_val);
+                            if let Some(rest) = key_str.strip_prefix("default.") {
+                                default_settings.insert(rest, value);
+                            } else if let Some(rest) = key_str.strip_prefix("force.") {
+                                force_settings.insert(rest, value);
+                            }
+                        }
+                    }
+                    let defaults = NovelSettings::default();
+                    let original_defaults = Self::get_original_defaults(&defaults);
+                    for (name, default_val) in &original_defaults {
+                        let ini_key = name;
+                        if force_settings.contains_key(ini_key) {
+                            let ini_val = yaml_value_to_ini(force_settings[ini_key]);
+                            Self::apply_single_setting(&mut s, ini_key, &ini_val);
+                        } else if s.has_default_setting(ini_key, default_val) {
+                            if let Some(val) = default_settings.get(ini_key) {
+                                let ini_val = yaml_value_to_ini(val);
+                                Self::apply_single_setting(&mut s, ini_key, &ini_val);
+                            }
                         }
                     }
                 }
             }
         }
         s
+    }
+
+    fn has_default_setting(&self, key: &str, default_val: &IniValue) -> bool {
+        let current = Self::get_setting_as_ini(self, key);
+        current == *default_val
+    }
+
+    fn get_setting_as_ini(s: &Self, key: &str) -> IniValue {
+        match key {
+            "enable_yokogaki" => IniValue::Boolean(s.enable_yokogaki),
+            "enable_inspect" => IniValue::Boolean(s.enable_inspect),
+            "enable_convert_num_to_kanji" => IniValue::Boolean(s.enable_convert_num_to_kanji),
+            "enable_kanji_num_with_units" => IniValue::Boolean(s.enable_kanji_num_with_units),
+            "kanji_num_with_units_lower_digit_zero" => {
+                IniValue::Integer(s.kanji_num_with_units_lower_digit_zero)
+            }
+            "enable_alphabet_force_zenkaku" => IniValue::Boolean(s.enable_alphabet_force_zenkaku),
+            "disable_alphabet_word_to_zenkaku" => {
+                IniValue::Boolean(s.disable_alphabet_word_to_zenkaku)
+            }
+            "enable_half_indent_bracket" => IniValue::Boolean(s.enable_half_indent_bracket),
+            "enable_auto_indent" => IniValue::Boolean(s.enable_auto_indent),
+            "enable_force_indent" => IniValue::Boolean(s.enable_force_indent),
+            "enable_auto_join_in_brackets" => IniValue::Boolean(s.enable_auto_join_in_brackets),
+            "enable_auto_join_line" => IniValue::Boolean(s.enable_auto_join_line),
+            "enable_enchant_midashi" => IniValue::Boolean(s.enable_enchant_midashi),
+            "enable_author_comments" => IniValue::Boolean(s.enable_author_comments),
+            "enable_erase_introduction" => IniValue::Boolean(s.enable_erase_introduction),
+            "enable_erase_postscript" => IniValue::Boolean(s.enable_erase_postscript),
+            "enable_ruby" => IniValue::Boolean(s.enable_ruby),
+            "enable_illust" => IniValue::Boolean(s.enable_illust),
+            "enable_transform_fraction" => IniValue::Boolean(s.enable_transform_fraction),
+            "enable_transform_date" => IniValue::Boolean(s.enable_transform_date),
+            "date_format" => IniValue::String(s.date_format.clone()),
+            "enable_convert_horizontal_ellipsis" => {
+                IniValue::Boolean(s.enable_convert_horizontal_ellipsis)
+            }
+            "enable_convert_page_break" => IniValue::Boolean(s.enable_convert_page_break),
+            "to_page_break_threshold" => IniValue::Integer(s.to_page_break_threshold),
+            "enable_dakuten_font" => IniValue::Boolean(s.enable_dakuten_font),
+            "enable_display_end_of_book" => IniValue::Boolean(s.enable_display_end_of_book),
+            "enable_add_date_to_title" => IniValue::Boolean(s.enable_add_date_to_title),
+            "title_date_format" => IniValue::String(s.title_date_format.clone()),
+            "title_date_align" => IniValue::String(s.title_date_align.clone()),
+            "title_date_target" => IniValue::String(s.title_date_target.clone()),
+            "enable_ruby_youon_to_big" => IniValue::Boolean(s.enable_ruby_youon_to_big),
+            "enable_pack_blank_line" => IniValue::Boolean(s.enable_pack_blank_line),
+            "enable_kana_ni_to_kanji_ni" => IniValue::Boolean(s.enable_kana_ni_to_kanji_ni),
+            "enable_insert_word_separator" => IniValue::Boolean(s.enable_insert_word_separator),
+            "enable_insert_char_separator" => IniValue::Boolean(s.enable_insert_char_separator),
+            "enable_strip_decoration_tag" => IniValue::Boolean(s.enable_strip_decoration_tag),
+            "enable_add_end_to_title" => IniValue::Boolean(s.enable_add_end_to_title),
+            "enable_prolonged_sound_mark_to_dash" => {
+                IniValue::Boolean(s.enable_prolonged_sound_mark_to_dash)
+            }
+            "cut_old_subtitles" => IniValue::Integer(s.cut_old_subtitles),
+            "slice_size" => IniValue::Integer(s.slice_size),
+            "author_comment_style" => IniValue::String(s.author_comment_style.clone()),
+            "novel_author" => IniValue::String(s.novel_author.clone()),
+            "novel_title" => IniValue::String(s.novel_title.clone()),
+            "output_filename" => IniValue::String(s.output_filename.clone()),
+            _ => IniValue::Null,
+        }
+    }
+
+    fn get_original_defaults(defaults: &Self) -> Vec<(&'static str, IniValue)> {
+        vec![
+            (
+                "enable_yokogaki",
+                IniValue::Boolean(defaults.enable_yokogaki),
+            ),
+            ("enable_inspect", IniValue::Boolean(defaults.enable_inspect)),
+            (
+                "enable_convert_num_to_kanji",
+                IniValue::Boolean(defaults.enable_convert_num_to_kanji),
+            ),
+            (
+                "enable_kanji_num_with_units",
+                IniValue::Boolean(defaults.enable_kanji_num_with_units),
+            ),
+            (
+                "kanji_num_with_units_lower_digit_zero",
+                IniValue::Integer(defaults.kanji_num_with_units_lower_digit_zero),
+            ),
+            (
+                "enable_alphabet_force_zenkaku",
+                IniValue::Boolean(defaults.enable_alphabet_force_zenkaku),
+            ),
+            (
+                "disable_alphabet_word_to_zenkaku",
+                IniValue::Boolean(defaults.disable_alphabet_word_to_zenkaku),
+            ),
+            (
+                "enable_half_indent_bracket",
+                IniValue::Boolean(defaults.enable_half_indent_bracket),
+            ),
+            (
+                "enable_auto_indent",
+                IniValue::Boolean(defaults.enable_auto_indent),
+            ),
+            (
+                "enable_force_indent",
+                IniValue::Boolean(defaults.enable_force_indent),
+            ),
+            (
+                "enable_auto_join_in_brackets",
+                IniValue::Boolean(defaults.enable_auto_join_in_brackets),
+            ),
+            (
+                "enable_auto_join_line",
+                IniValue::Boolean(defaults.enable_auto_join_line),
+            ),
+            (
+                "enable_enchant_midashi",
+                IniValue::Boolean(defaults.enable_enchant_midashi),
+            ),
+            (
+                "enable_author_comments",
+                IniValue::Boolean(defaults.enable_author_comments),
+            ),
+            (
+                "enable_erase_introduction",
+                IniValue::Boolean(defaults.enable_erase_introduction),
+            ),
+            (
+                "enable_erase_postscript",
+                IniValue::Boolean(defaults.enable_erase_postscript),
+            ),
+            ("enable_ruby", IniValue::Boolean(defaults.enable_ruby)),
+            ("enable_illust", IniValue::Boolean(defaults.enable_illust)),
+            (
+                "enable_transform_fraction",
+                IniValue::Boolean(defaults.enable_transform_fraction),
+            ),
+            (
+                "enable_transform_date",
+                IniValue::Boolean(defaults.enable_transform_date),
+            ),
+            (
+                "date_format",
+                IniValue::String(defaults.date_format.clone()),
+            ),
+            (
+                "enable_convert_horizontal_ellipsis",
+                IniValue::Boolean(defaults.enable_convert_horizontal_ellipsis),
+            ),
+            (
+                "enable_convert_page_break",
+                IniValue::Boolean(defaults.enable_convert_page_break),
+            ),
+            (
+                "to_page_break_threshold",
+                IniValue::Integer(defaults.to_page_break_threshold),
+            ),
+            (
+                "enable_dakuten_font",
+                IniValue::Boolean(defaults.enable_dakuten_font),
+            ),
+            (
+                "enable_display_end_of_book",
+                IniValue::Boolean(defaults.enable_display_end_of_book),
+            ),
+            (
+                "enable_add_date_to_title",
+                IniValue::Boolean(defaults.enable_add_date_to_title),
+            ),
+            (
+                "title_date_format",
+                IniValue::String(defaults.title_date_format.clone()),
+            ),
+            (
+                "title_date_align",
+                IniValue::String(defaults.title_date_align.clone()),
+            ),
+            (
+                "title_date_target",
+                IniValue::String(defaults.title_date_target.clone()),
+            ),
+            (
+                "enable_ruby_youon_to_big",
+                IniValue::Boolean(defaults.enable_ruby_youon_to_big),
+            ),
+            (
+                "enable_pack_blank_line",
+                IniValue::Boolean(defaults.enable_pack_blank_line),
+            ),
+            (
+                "enable_kana_ni_to_kanji_ni",
+                IniValue::Boolean(defaults.enable_kana_ni_to_kanji_ni),
+            ),
+            (
+                "enable_insert_word_separator",
+                IniValue::Boolean(defaults.enable_insert_word_separator),
+            ),
+            (
+                "enable_insert_char_separator",
+                IniValue::Boolean(defaults.enable_insert_char_separator),
+            ),
+            (
+                "enable_strip_decoration_tag",
+                IniValue::Boolean(defaults.enable_strip_decoration_tag),
+            ),
+            (
+                "enable_add_end_to_title",
+                IniValue::Boolean(defaults.enable_add_end_to_title),
+            ),
+            (
+                "enable_prolonged_sound_mark_to_dash",
+                IniValue::Boolean(defaults.enable_prolonged_sound_mark_to_dash),
+            ),
+            (
+                "cut_old_subtitles",
+                IniValue::Integer(defaults.cut_old_subtitles),
+            ),
+            ("slice_size", IniValue::Integer(defaults.slice_size)),
+            (
+                "author_comment_style",
+                IniValue::String(defaults.author_comment_style.clone()),
+            ),
+            (
+                "novel_author",
+                IniValue::String(defaults.novel_author.clone()),
+            ),
+            (
+                "novel_title",
+                IniValue::String(defaults.novel_title.clone()),
+            ),
+            (
+                "output_filename",
+                IniValue::String(defaults.output_filename.clone()),
+            ),
+        ]
     }
 
     fn apply_single_setting(settings: &mut Self, key: &str, value: &IniValue) {

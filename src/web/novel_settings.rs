@@ -7,8 +7,8 @@ use axum::{
 use crate::db::with_database;
 use crate::error::NarouError;
 
-use super::state::{ApiResponse, IdPath};
 use super::AppState;
+use super::state::{ApiResponse, IdPath};
 
 pub async fn get_settings(
     State(_state): State<AppState>,
@@ -88,9 +88,7 @@ pub async fn save_settings(
                         continue;
                     }
                 }
-                serde_json::Value::String(s) => {
-                    crate::converter::ini::IniValue::String(s.clone())
-                }
+                serde_json::Value::String(s) => crate::converter::ini::IniValue::String(s.clone()),
                 serde_json::Value::Null => crate::converter::ini::IniValue::Null,
                 _ => continue,
             };

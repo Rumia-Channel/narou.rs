@@ -1,14 +1,10 @@
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-};
+use axum::{extract::State, http::StatusCode, response::Json};
 
 use crate::db::with_database_mut;
 use crate::error::NarouError;
 
-use super::state::{ApiResponse, BatchIdsBody, TagBody};
 use super::AppState;
+use super::state::{ApiResponse, BatchIdsBody, TagBody};
 
 pub async fn batch_tag(
     State(state): State<AppState>,
