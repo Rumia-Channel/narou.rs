@@ -1,27 +1,27 @@
 use std::collections::HashMap;
 
-use regex::{Regex, RegexBuilder};
+use regex::RegexBuilder;
 
 use super::{SiteSetting, SiteSettingEntry, SiteSettingValue};
 
 impl SiteSetting {
     pub fn resolve_info_pattern(&self, key: &str, source: &str) -> Option<String> {
         let value = match key {
-            "t" => &self.t,
-            "w" => &self.w,
-            "s" => &self.s,
-            "nt" => &self.nt,
-            "ga" => &self.ga,
-            "gf" => &self.gf,
-            "nu" => &self.nu,
-            "gl" => &self.gl,
-            "l" => &self.l,
-            "tags" => &self.tags,
-            "sitename" => &self.sitename_pattern,
+            "t" => self.t.as_ref().or(self.title.as_ref()),
+            "w" => self.w.as_ref().or(self.author.as_ref()),
+            "s" => self.s.as_ref().or(self.story.as_ref()),
+            "nt" => self.nt.as_ref(),
+            "ga" => self.ga.as_ref(),
+            "gf" => self.gf.as_ref(),
+            "nu" => self.nu.as_ref(),
+            "gl" => self.gl.as_ref(),
+            "l" => self.l.as_ref(),
+            "tags" => self.tags.as_ref(),
+            "sitename" => self.sitename_pattern.as_ref(),
             _ => return None,
         };
 
-        let value = value.as_ref()?;
+        let value = value?;
 
         let entries: Vec<SiteSettingEntry> = match value {
             SiteSettingValue::Single(s) => vec![SiteSettingEntry::Plain(s.clone())],
@@ -37,7 +37,11 @@ impl SiteSetting {
             };
 
             let resolved = self.interpolate(pattern);
-            if let Ok(re) = Regex::new(&resolved) {
+            let re = RegexBuilder::new(&resolved)
+                .dot_matches_new_line(true)
+                .multi_line(true)
+                .build();
+            if let Ok(re) = re {
                 if let Some(caps) = re.captures(source) {
                     for name in re.capture_names().flatten() {
                         if !capture_name_matches_key(key, name) {
@@ -76,24 +80,21 @@ impl SiteSetting {
         prev_captures: &HashMap<String, String>,
     ) -> Option<String> {
         let value = match key {
-            "t" => &self.t,
-            "w" => &self.w,
-            "s" => &self.s,
-            "nt" => &self.nt,
-            "ga" => &self.ga,
-            "gf" => &self.gf,
-            "nu" => &self.nu,
-            "gl" => &self.gl,
-            "l" => &self.l,
-            "tags" => &self.tags,
-            "sitename" => &self.sitename_pattern,
-            "title" => &self.t,
-            "author" => &self.w,
-            "story" => &self.s,
+            "t" | "title" => self.t.as_ref().or(self.title.as_ref()),
+            "w" | "author" => self.w.as_ref().or(self.author.as_ref()),
+            "s" | "story" => self.s.as_ref().or(self.story.as_ref()),
+            "nt" => self.nt.as_ref(),
+            "ga" => self.ga.as_ref(),
+            "gf" => self.gf.as_ref(),
+            "nu" => self.nu.as_ref(),
+            "gl" => self.gl.as_ref(),
+            "l" => self.l.as_ref(),
+            "tags" => self.tags.as_ref(),
+            "sitename" => self.sitename_pattern.as_ref(),
             _ => return None,
         };
 
-        let value = value.as_ref()?;
+        let value = value?;
 
         let entries: Vec<SiteSettingEntry> = match value {
             SiteSettingValue::Single(s) => vec![SiteSettingEntry::Plain(s.clone())],

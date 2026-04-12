@@ -1354,6 +1354,7 @@ dependencies = [
  "clap",
  "curl",
  "dashmap",
+ "encoding_rs",
  "futures",
  "hex",
  "indicatif",

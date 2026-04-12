@@ -14,7 +14,7 @@ pub fn fetch_toc(
 ) -> Result<String> {
     fetcher.rate_limiter.wait();
 
-    let body = fetcher.fetch_text(toc_url, setting.cookie())?;
+    let body = fetcher.fetch_text(toc_url, setting.cookie(), Some(setting.encoding()))?;
     let mut body = body;
     pretreatment_source(&mut body, setting.encoding(), Some(setting));
 

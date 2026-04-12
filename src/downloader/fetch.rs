@@ -40,11 +40,11 @@ impl HttpFetcher {
         })
     }
 
-    pub fn fetch_text(&mut self, url: &str, cookie: Option<&str>) -> Result<String> {
+    pub fn fetch_text(&mut self, url: &str, cookie: Option<&str>, encoding: Option<&str>) -> Result<String> {
         let domain = domain_of(url).to_string();
 
         if self.prefer_curl {
-            if let Some(body) = self.fetch_tier_curl(url, cookie) {
+            if let Some(body) = self.fetch_tier_curl(url, cookie, encoding) {
                 return Ok(body);
             }
         }
@@ -63,7 +63,7 @@ impl HttpFetcher {
             .map_or(false, |f| f[2] >= FAIL_THRESHOLD);
 
         if !skip_curl && !self.prefer_curl {
-            if let Some(body) = self.fetch_tier_curl(url, cookie) {
+            if let Some(body) = self.fetch_tier_curl(url, cookie, encoding) {
                 self.prefer_curl = true;
                 return Ok(body);
             }
@@ -71,7 +71,7 @@ impl HttpFetcher {
         }
 
         if !skip_reqwest {
-            match self.fetch_tier_reqwest(url, cookie) {
+            match self.fetch_tier_reqwest(url, cookie, encoding) {
                 Ok(body) => return Ok(body),
                 Err(_) => {
                     self.tier_failures.entry(domain.clone()).or_insert([0; 3])[1] += 1;
@@ -80,7 +80,7 @@ impl HttpFetcher {
         }
 
         if !skip_wget {
-            if let Some(body) = self.fetch_tier_wget(url, cookie) {
+            if let Some(body) = self.fetch_tier_wget(url, cookie, encoding) {
                 return Ok(body);
             }
             self.tier_failures.entry(domain.clone()).or_insert([0; 3])[2] += 1;
@@ -89,7 +89,7 @@ impl HttpFetcher {
         Err(NarouError::NotFound(url.to_string()))
     }
 
-    pub fn fetch_tier_curl(&self, url: &str, cookie: Option<&str>) -> Option<String> {
+    pub fn fetch_tier_curl(&self, url: &str, cookie: Option<&str>, encoding: Option<&str>) -> Option<String> {
         let mut handle = curl::easy::Easy::new();
         handle.url(url).ok()?;
         handle.useragent(&self.user_agent).ok()?;
@@ -127,10 +127,10 @@ impl HttpFetcher {
             return None;
         }
 
-        Some(String::from_utf8_lossy(&body).into_owned())
+        Some(decode_with_encoding(&body, encoding))
     }
 
-    pub fn fetch_tier_reqwest(&self, url: &str, cookie: Option<&str>) -> Result<String> {
+    pub fn fetch_tier_reqwest(&self, url: &str, cookie: Option<&str>, encoding: Option<&str>) -> Result<String> {
         let mut request = self.client.get(url);
         if let Some(cookie) = cookie {
             request = request.header("Cookie", cookie);
@@ -146,10 +146,16 @@ impl HttpFetcher {
         if !status.is_success() {
             return Err(response.error_for_status().unwrap_err().into());
         }
-        Ok(response.text()?)
+        match encoding {
+            Some(e) if !e.eq_ignore_ascii_case("utf-8") && !e.eq_ignore_ascii_case("utf8") => {
+                let bytes = response.bytes()?;
+                Ok(decode_with_encoding(&bytes, encoding))
+            }
+            _ => Ok(response.text()?),
+        }
     }
 
-    pub fn fetch_tier_wget(&self, url: &str, cookie: Option<&str>) -> Option<String> {
+    pub fn fetch_tier_wget(&self, url: &str, cookie: Option<&str>, encoding: Option<&str>) -> Option<String> {
         let mut cmd = std::process::Command::new("wget");
         cmd.arg("--quiet")
             .arg("--output-document=-")
@@ -166,7 +172,22 @@ impl HttpFetcher {
         if !output.status.success() {
             return None;
         }
-        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        Some(decode_with_encoding(&output.stdout, encoding))
+    }
+}
+
+fn decode_with_encoding(bytes: &[u8], encoding: Option<&str>) -> String {
+    let enc = match encoding {
+        Some(e) if !e.eq_ignore_ascii_case("utf-8") && !e.eq_ignore_ascii_case("utf8") => e,
+        _ => return String::from_utf8_lossy(bytes).into_owned(),
+    };
+    let encoder = encoding_rs::Encoding::for_label(enc.as_bytes());
+    match encoder {
+        Some(enc) => {
+            let (cow, _encoding_used, _had_errors) = enc.decode(bytes);
+            cow.into_owned()
+        }
+        None => String::from_utf8_lossy(bytes).into_owned(),
     }
 }
 

@@ -46,7 +46,7 @@ pub fn download_section(
     fetcher.rate_limiter.wait();
     let url = build_section_url(setting, toc_url, &subtitle.href);
 
-    let html_source = fetcher.fetch_text(&url, setting.cookie())?;
+    let html_source = fetcher.fetch_text(&url, setting.cookie(), Some(setting.encoding()))?;
     let mut html_source = html_source;
     pretreatment_source(&mut html_source, setting.encoding(), Some(setting));
     parse_section_html(cache, setting, subtitle, html_source)

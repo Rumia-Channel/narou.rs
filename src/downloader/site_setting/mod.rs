@@ -72,6 +72,12 @@ pub struct SiteSetting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub illust_grep_pattern: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<SiteSettingValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<SiteSettingValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story: Option<SiteSettingValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub t: Option<SiteSettingValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub w: Option<SiteSettingValue>,

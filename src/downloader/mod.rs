@@ -313,7 +313,7 @@ impl Downloader {
             .novel_info_url_with_captures(url_captures)
             .unwrap_or_else(|| setting.interpolate(novel_info_url));
 
-        match self.fetcher.fetch_text(&resolved_url, setting.cookie()) {
+        match self.fetcher.fetch_text(&resolved_url, setting.cookie(), Some(setting.encoding())) {
             Ok(mut body) => {
                 pretreatment_source(&mut body, setting.encoding(), Some(setting));
                 Ok(NovelInfo::from_novel_info_source(setting, &body))
@@ -1226,5 +1226,26 @@ mod tests {
         );
         assert_eq!(info.author.as_deref(), Some("鉄鋼怪人"));
         assert_eq!(info.novel_type, Some(1));
+    }
+
+    #[test]
+    fn arcadia_toc_patterns_extract_title_and_author_from_legacy_yaml_keys() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "Arcadia").unwrap();
+        let html = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("sample")
+                .join("novel")
+                .join("test_arcadia_page.html"),
+        )
+        .unwrap();
+
+        let info = NovelInfo::from_toc_source(setting, &html);
+
+        assert_eq!(
+            info.title.as_deref(),
+            Some("異世界に来たけど至って普通に喫茶店とかやってますが何か問題でも？")
+        );
+        assert_eq!(info.author.as_deref(), Some("風見鶏"));
     }
 }
