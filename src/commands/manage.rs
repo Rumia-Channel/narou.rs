@@ -84,7 +84,7 @@ pub fn cmd_tag(add: Option<&str>, remove: Option<&str>, targets: &[String]) {
     }
 }
 
-pub fn cmd_freeze(targets: &[String], off: bool) {
+pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
     use narou_rs::db;
 
     if let Err(e) = db::init_database() {
@@ -92,9 +92,19 @@ pub fn cmd_freeze(targets: &[String], off: bool) {
         std::process::exit(1);
     }
 
+    if list {
+        cmd_list(None, true);
+        return;
+    }
+
+    if targets.is_empty() {
+        crate::commands::help::display_command_help("freeze");
+        return;
+    }
+
     for target in targets {
         let Some(id) = resolve_target_to_id(target) else {
-            eprintln!("  Not found: {}", target);
+            eprintln!("{} は存在しません", target);
             continue;
         };
 
@@ -103,19 +113,42 @@ pub fn cmd_freeze(targets: &[String], off: bool) {
                 .get(id)
                 .cloned()
                 .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
+            let title = record.title.clone();
+            let is_frozen = record.tags.contains(&"frozen".to_string());
+
             let mut updated = record;
-            if off {
-                updated.tags.retain(|t| t != "frozen");
-            } else if !updated.tags.contains(&"frozen".to_string()) {
-                updated.tags.push("frozen".to_string());
+
+            let should_freeze = if on {
+                true
+            } else if off {
+                false
+            } else {
+                !is_frozen
+            };
+
+            if should_freeze {
+                if !is_frozen {
+                    updated.tags.push("frozen".to_string());
+                }
+                db.insert(updated);
+                db.save()?;
+                Ok::<(String, bool), narou_rs::error::NarouError>((title, true))
+            } else {
+                if is_frozen {
+                    updated.tags.retain(|t| t != "frozen");
+                }
+                if updated.tags.contains(&"404".to_string()) {
+                    updated.tags.retain(|t| t != "404");
+                }
+                db.insert(updated);
+                db.save()?;
+                Ok::<(String, bool), narou_rs::error::NarouError>((title, false))
             }
-            db.insert(updated);
-            db.save()
         });
 
-        let action = if off { "Unfroze" } else { "Froze" };
         match result {
-            Ok(()) => println!("  {} ID: {}", action, id),
+            Ok((title, true)) => println!("{} を凍結しました", title),
+            Ok((title, false)) => println!("{} の凍結を解除しました", title),
             Err(e) => eprintln!("  Error: {}", e),
         }
     }

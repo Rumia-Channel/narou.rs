@@ -157,14 +157,14 @@ fn run_sync_command(command: Commands, user_agent: Option<String>, backtrace: bo
                 0
             }
         }
-        Commands::Freeze { targets, off } => {
-            if targets.is_empty() {
-                eprintln!("Usage: narou freeze <targets>...");
-                1
-            } else {
-                commands::manage::cmd_freeze(&targets, off);
-                0
-            }
+        Commands::Freeze {
+            targets,
+            list,
+            on,
+            off,
+        } => {
+            commands::manage::cmd_freeze(&targets, list, on, off);
+            0
         }
         Commands::Remove { targets } => {
             if targets.is_empty() {

@@ -278,6 +278,10 @@ pub enum Commands {
     },
     Freeze {
         targets: Vec<String>,
+        #[arg(short, long)]
+        list: bool,
+        #[arg(long)]
+        on: bool,
         #[arg(long)]
         off: bool,
     },
