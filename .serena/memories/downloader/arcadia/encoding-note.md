@@ -1,0 +1,1 @@
+Arcadia site YAML should not declare `encoding: UTF-8`; that field is not part of narou.rb's bundled Arcadia definition. Rust's downloader still supports optional `encoding` for future compatibility and for sites that truly need non-UTF-8 decoding, but Arcadia should rely on UTF-8 defaults and the actual fix for section retrieval was href HTML-entity decoding (`&amp;` -> `&`).

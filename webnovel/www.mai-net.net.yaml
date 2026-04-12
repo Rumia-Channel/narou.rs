@@ -7,7 +7,6 @@ category: '' # カテゴリ無しの場合を考慮する
 url:
   - https?://\\k<domain>/bbs/sst/sst.php\?act=dump&cate=(?<category>.+?)&all=(?<ncode>\d+)
   - https?://\\k<domain>/bbs/sst/sst.php\?act=dump&cate=&all=(?<ncode>\d+)
-encoding: UTF-8
 confirm_over18: no
 append_title_to_folder_name: yes
 title_strip_pattern: (【.+?】|\(.+?\)|（.+?）)
