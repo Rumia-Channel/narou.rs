@@ -2,6 +2,7 @@ pub mod convert;
 pub mod download;
 pub mod help;
 pub mod init;
+pub mod mail;
 pub mod manage;
 pub mod setting;
 pub mod update;

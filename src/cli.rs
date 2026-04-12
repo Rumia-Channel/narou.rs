@@ -249,6 +249,11 @@ pub enum Commands {
         #[arg(short = 'm', long)]
         mail: bool,
     },
+    Mail {
+        targets: Vec<String>,
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
     Update {
         ids: Option<Vec<String>>,
         #[arg(short = 'f', long)]

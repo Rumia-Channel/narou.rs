@@ -13,6 +13,7 @@ use narou_rs::converter::device::{Device, OutputManager};
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
 use narou_rs::db::inventory::InventoryScope;
+use narou_rs::mail::{ensure_mail_setting_file, load_mail_setting, send_target_with_setting, MailSettingLoadError};
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::downloader::{DownloadResult, Downloader, SubtitleInfo, TargetType, TocFile, TocObject, UpdateStatus};
 use narou_rs::progress::CliProgress;
@@ -758,9 +759,39 @@ fn process_hotentry(
 
     let _ = copy_to_hotentry_output(&final_path, if device == Device::Text { None } else { Some(device) });
     let _ = send_hotentry_output(&final_path, if device == Device::Text { None } else { Some(device) }, multi);
+    mail_hotentry_if_enabled();
 
     let _ = multi.println(format!("hotentry を生成しました: {}", final_path.display()));
     Ok(())
+}
+
+fn mail_hotentry_if_enabled() {
+    if !load_local_setting_bool("hotentry.auto-mail") {
+        return;
+    }
+
+    match load_mail_setting() {
+        Ok(setting) => {
+            if let Err(e) = send_target_with_setting(&setting, "hotentry", false, false) {
+                eprintln!("{}", e);
+            }
+        }
+        Err(MailSettingLoadError::NotFound(_)) => match ensure_mail_setting_file() {
+            Ok(path) => {
+                println!("created {}", path.display());
+                println!("メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。");
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+            }
+        },
+        Err(MailSettingLoadError::Incomplete(_)) => {
+            eprintln!("設定ファイルの書き換えが終了していないようです。\n設定ファイルは mail_setting.yaml にあります");
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+        }
+    }
 }
 
 struct HotentryEntry {

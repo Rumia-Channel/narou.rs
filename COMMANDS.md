@@ -83,8 +83,8 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | コマンド | narou.rb | Rust 完了度 | 備考 |
 |---------|:--------:|:-----------:|------|
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
-| `download` | ✅ | 🟡 部分 | `--mail` 未実装（メール機能自体未実装のため） |
-| `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、digest選択肢、差分cache退避、hotentryのcopy/sendまでは実装済み。mail/hotentry細部が未完 |
+| `download` | ✅ | 🟡 部分 | `--mail` を追加。メール設定の自動作成と送信は実装済みだが、全互換確認は継続中 |
+| `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、digest選択肢、差分cache退避、hotentryのcopy/send/mailまでは実装済み。周辺出力/イベント細部が残る |
 | `convert` | ✅ | 🟡 部分 | `--device`, `--no-epub`, `--output` 等不足 |
 | `list` | ✅ | 🟡 部分 | `--latest`, `--reverse`, `--url`, `--filter` 等不足 |
 | `tag` | ✅ | 🟡 部分 | `--color`, `--clear`, `--list` 不足 |
@@ -94,7 +94,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `setting` | ✅ | 🟡 部分 | 基本読み書きは実装済み。ただし default/force/default_args 系と全設定網羅に不足 |
 | `diff` | ✅ | ❌ 未実装 | |
 | `send` | ✅ | ❌ 未実装 | USB 経由端末送信 |
-| `mail` | ✅ | ❌ 未実装 | Send-to-Kindle 等 |
+| `mail` | ✅ | 🟡 部分 | `mail_setting.yaml` 読込と SMTP 送信の基盤を追加。Pony/mail 設定の完全互換は要確認だが、hotentry 自動メールは実装済み |
 | `backup` | ✅ | ❌ 未実装 | |
 | `clean` | ✅ | ❌ 未実装 | |
 | `help` | ✅ | 🟡 部分 | トップレベルは概ね実装済み。各コマンド -h は Ruby版詳細ヘルプとの差分あり |
@@ -134,7 +134,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `--no-convert` | `-n` | flag | false | DLのみ、変換スキップ | ✅ |
 | `--freeze` | `-z` | flag | false | DL後に凍結 | ✅ |
 | `--remove` | `-r` | flag | false | DL後に削除(変換+送信のみ) | ✅ |
-| `--mail` | `-m` | flag | false | DL後にメール送信 | ❌ |
+| `--mail` | `-m` | flag | false | DL後にメール送信 | ✅ |
 | targets | | Vec\<String\> | — | URL/Nコード/ID/タイトル | ✅ |
 
 **実装済み動作**:
@@ -153,7 +153,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - Nコード指定時は `https://ncode.syosetu.com/<ncode>/` からURLキャプチャを作り、サイト定義の `\k<ncode>` を展開してDLする
 
 **不足動作**:
-- `--mail`: メール送信機能自体が未実装のためスタブ
+- `--mail`: 変換済み電子書籍を `mail_setting.yaml` に従って送信
 - 再ダウンロード確認プロンプト (Ruby: `Narou::Input.confirm("再ダウンロードしますか")`)
 
 ---
@@ -205,7 +205,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `--all` は Ruby版に存在しないRust独自オプションだったため削除
 
 **完了扱いにしない理由 / 不足動作**:
-- `mail hotentry` 連携（mailコマンド自体が未実装）
+- `mail hotentry` 連携（hotentry.auto-mail 含む）
 - `confirm_over18?` の global_setting 永続化は未実装で、現状は都度確認のみ
 - Ruby版の section hash cache 永続化との完全な外部互換は未確認
 - Ruby版の詳細表示・hotentry後処理・割り込み時Worker cancelなど、周辺出力/イベント処理の細部は追加突合が必要
@@ -476,7 +476,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 12. `mail` — ❌ 未実装
+### 12. `mail` — 🟡 部分
 
 > 変換したEPUB/MOBIをメールで送信します
 
@@ -684,7 +684,7 @@ narou setting name         # 読み取り
 | タスク | コマンド | 影響 |
 |-------|---------|------|
 | download `--force`, `--no-convert`, `--freeze` | download | DL フラグ互換 |
-| update の残互換実装 | update | Ruby版ターゲット解決・`--gl`主要挙動・`update.strong`・digest選択肢・差分用 cache 退避・hotentry の copy/send までは実装済み。mail/hotentry細部と周辺出力/イベント細部が残る |
+| update の残互換実装 | update | Ruby版ターゲット解決・`--gl`主要挙動・`update.strong`・digest選択肢・差分用 cache 退避・hotentry の copy/send/mail までは実装済み。周辺出力/イベント細部が残る |
 | convert `--device`, `--no-open`, `--output` | convert | 変換パイプライン完成 |
 | list `--latest`, `--reverse`, `--filter`, `--url`, `--author`, `--site` | list | 一覧表示の実用性 |
 | tag `--color`, `--clear`, `--list` | tag | タグ管理の完成 |

@@ -114,6 +114,10 @@ fn run_sync_command(command: Commands, user_agent: Option<String>, backtrace: bo
             });
             0
         }
+        Commands::Mail { targets, force } => {
+            commands::mail::cmd_mail(commands::mail::MailOptions { targets, force });
+            0
+        }
         Commands::Update {
             ids,
             force,

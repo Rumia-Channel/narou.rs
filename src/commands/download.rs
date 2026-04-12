@@ -7,6 +7,7 @@ use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
 use narou_rs::converter::NovelConverter;
 use narou_rs::downloader::{Downloader, TargetType, UpdateStatus};
+use narou_rs::mail::{ensure_mail_setting_file, load_mail_setting, send_target_with_setting};
 use narou_rs::progress::CliProgress;
 
 pub struct DownloadOptions {
@@ -433,6 +434,21 @@ fn print_download_status(multi: &Arc<MultiProgress>, dl: &narou_rs::downloader::
 }
 
 fn after_process(multi: &Arc<MultiProgress>, target: &str, opts: &DownloadOptions) {
+    if opts.mail {
+        match load_mail_setting() {
+            Ok(setting) => {
+                if let Err(e) = send_target_with_setting(&setting, target, false, true) {
+                    eprintln!("{}", e);
+                }
+            }
+            Err(_) => {
+                if let Ok(path) = ensure_mail_setting_file() {
+                    let _ = multi.println(format!("created {}", path.display()));
+                    let _ = multi.println("メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。");
+                }
+            }
+        }
+    }
     if opts.freeze {
         let _ = multi.println(format!("凍結: {}", target));
         super::manage::freeze_by_target(target);
