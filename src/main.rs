@@ -116,7 +116,6 @@ fn run_sync_command(command: Commands, user_agent: Option<String>, backtrace: bo
         }
         Commands::Update {
             ids,
-            all,
             force,
             no_convert,
             convert_only_new_arrival,
@@ -126,7 +125,6 @@ fn run_sync_command(command: Commands, user_agent: Option<String>, backtrace: bo
         } => {
             commands::update::cmd_update(commands::update::UpdateOptions {
                 ids,
-                all,
                 force,
                 no_convert,
                 convert_only_new_arrival,

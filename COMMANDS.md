@@ -75,7 +75,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 |---------|:--------:|:-----------:|------|
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
 | `download` | ✅ | 🟡 部分 | `--mail` 未実装（メール機能自体未実装のため） |
-| `update` | ✅ | 🟡 部分 | CLIフラグは概ね実装済み。ただし hotentry、完結タグ、Ruby版ターゲット解決等が未完 |
+| `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動は実装済み。hotentry と `update.strong` が未完 |
 | `convert` | ✅ | 🟡 部分 | `--device`, `--no-epub`, `--output` 等不足 |
 | `list` | ✅ | 🟡 部分 | `--latest`, `--reverse`, `--url`, `--filter` 等不足 |
 | `tag` | ✅ | 🟡 部分 | `--color`, `--clear`, `--list` 不足 |
@@ -141,6 +141,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `mistook_count` 追跡 → 終了コード反映
 - 複数ターゲット間の水平線セパレータ
 - 有効ターゲット検証: Nコード or URL(サイト設定マッチ)
+- Nコード指定時は `https://ncode.syosetu.com/<ncode>/` からURLキャプチャを作り、サイト定義の `\k<ncode>` を展開してDLする
 
 **不足動作**:
 - `--mail`: メール送信機能自体が未実装のためスタブ
@@ -160,8 +161,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `--force` | `-f` | flag | false | 凍結小説も更新 | ✅ |
 | `--sort-by KEY` | `-s` | string | — | 更新順ソート | ✅ |
 | `--ignore-all` | `-i` | flag | false | 引数なし時の全更新を無効化 | ✅ |
-| ids | | Vec\<String\> | — | ID/タイトル/tag:NAME | ✅ |
-| `--all` | | flag | false | 全小説更新 | ✅ |
+| ids | | Vec\<String\> | — | ID/URL/Nコード/タイトル/別名/tag:NAME/タグ名 | ✅ |
 
 **実装済み動作**:
 - `-n`/`--no-convert`: 変換スキップ
@@ -170,23 +170,27 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `-f`/`--force`: 凍結小説も更新
 - `-s`/`--sort-by KEY`: 更新順ソート（設定 `update.sort-by` にも対応）。有効キー: `id`, `last_update`, `title`, `author`, `new_arrivals_date`, `general_lastup`
 - `-i`/`--ignore-all`: 引数なし時の全更新を無効化
+- ターゲット解決: Ruby版 `tagname_to_ids`/`Downloader.get_data_by_target` 相当に合わせ、ID、URL、Nコード、タイトル、`.narou/alias.yaml` 別名、通常タグ名、`tag:NAME`、`^tag:NAME` を解決
+- 既存小説更新時は Ruby版同様に DB の `toc_url` から `ncode` などのURLキャプチャを復元し、DB上の `sitename` を保存先決定で優先する
+- あらすじ比較は `<br>`/`<br/>`/`<br />` と改行・行末空白を正規化し、実質同一なら更新扱いにしない
+- 凍結チェック: Ruby版と同じ `.narou/freeze.yaml` を参照（既存Rustデータ移行用に `frozen` タグも補助的に認識）
 - `modified` タグ管理: 更新成功時に自動削除、`--gl` で変更検出時に自動付与
+- `end` タグ管理: 更新・`--gl other` で完結状態に合わせて `end` タグを同期
 - `_convert_failure` フラグ: 変換失敗時に記録、次回更新で再変換を試行
-- `update.interval` 設定対応（最低2.5秒）
+- `update.interval` 設定対応（最低2.5秒、YAMLの数値/文字列を許容）
+- `update.convert-only-new-arrival` 設定対応（YAMLの真偽値/文字列/数値を許容）
 - `last_check_date` 追跡
 - ソートキーバリデーション（不正キーでエラー+終了コード127）
+- `setting update.sort-by` の select 値を Ruby版 `Narou::UPDATE_SORT_KEYS` と同期済み
 - 小説間インターバル（Ruby版 `Interval` クラス互換）
-- 全件更新時の凍結スキップ＋エラーメッセージ（Ruby互換）
+- 全件更新時の凍結スキップ、個別指定時の凍結メッセージ
 - 終了コード: エラー数（最大127）、中断時126
+- `--all` は Ruby版に存在しないRust独自オプションだったため削除
 
 **完了扱いにしない理由 / 不足動作**:
 - Hotentry 収集・統合電子書籍生成（`hotentry` 設定、`HotentryManager`）
-- 完結検出 (`end` タグの自動追加/削除)
-- Ruby版 `Downloader.get_data_by_target` 相当のターゲット解決（Nコード/URL/別名/通常タグ名）が未完全。現状は ID/タイトル/`tag:`/`^tag:` 中心。
 - `update.strong` の強更新挙動は未確認/未実装。
-- `update.sort-by` の `setting` コマンド側 select 値と `update` 実処理側の有効キーが一致していない。
-- `--all` は Rust 側追加オプションで Ruby 版にはないため、互換仕様として要整理。
-- `--gl` は実装済みだが、Ruby版 `GeneralLastupUpdater` と API URL・対象分類・エラー挙動の詳細突合が必要。
+- Ruby版の詳細表示・hotentry後処理・割り込み時Worker cancelなど、周辺出力/イベント処理の細部は追加突合が必要
 
 ---
 
@@ -662,7 +666,7 @@ narou setting name         # 読み取り
 | タスク | コマンド | 影響 |
 |-------|---------|------|
 | download `--force`, `--no-convert`, `--freeze` | download | DL フラグ互換 |
-| update の Ruby版挙動突合 | update | `--gl`, `--convert-only-new-arrival`, `--ignore-all` は実装済みだが完了判定には詳細互換確認が必要 |
+| update の残互換実装 | update | Ruby版ターゲット解決・`--gl`主要挙動は実装済み。hotentry、`update.strong`、周辺出力/イベント細部が残る |
 | convert `--device`, `--no-open`, `--output` | convert | 変換パイプライン完成 |
 | list `--latest`, `--reverse`, `--filter`, `--url`, `--author`, `--site` | list | 一覧表示の実用性 |
 | tag `--color`, `--clear`, `--list` | tag | タグ管理の完成 |

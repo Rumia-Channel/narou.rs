@@ -801,7 +801,14 @@ fn setting_variables() -> SettingVariables {
             "update.sort-by",
             sel(
                 "アップデートを指定した項目順で行う",
-                vec!["id", "title", "author", "general_lastup"],
+                vec![
+                    "id",
+                    "last_update",
+                    "title",
+                    "author",
+                    "new_arrivals_date",
+                    "general_lastup",
+                ],
             ),
         ),
         (

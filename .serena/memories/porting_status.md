@@ -26,8 +26,8 @@
 | コマンド | 完了度 | 備考 |
 |---------|:------:|------|
 | `init` | ✅ 完了 | AozoraEpub3 設定含め完全 |
-| `download` | 🟡 部分 | `--force`/`-f`, `--no-convert`/`-n`, `--freeze`/`-z`, `--remove`/`-r` 実装済み。`--mail`/`-m` スタブ。インタラクティブモード実装済み。 |
-| `update` | 🟡 部分 | CLIフラグは概ね実装済み。ただし hotentry、完結タグ、Ruby版ターゲット解決、`update.strong`、`--gl` 詳細互換が未完 |
+| `download` | 🟡 部分 | `--force`/`-f`, `--no-convert`/`-n`, `--freeze`/`-z`, `--remove`/`-r` 実装済み。Nコード指定時の `\k<ncode>` 展開修正済み。`--mail`/`-m` スタブ。インタラクティブモード実装済み。 |
+| `update` | 🟡 部分 | Ruby版ターゲット解決、既存DBのtoc_url/sitename優先、あらすじ正規化比較、freeze.yaml参照、完結タグ同期、`--gl`主要挙動は実装済み。ただし hotentry、`update.strong`、周辺出力/イベント細部が未完 |
 | `convert` | 🟡 部分 | `--device`, `--no-epub`, `--output` 等不足 |
 | `list` | 🟡 部分 | `--latest`, `--reverse`, `--url`, `--filter` 等不足 |
 | `tag` | 🟡 部分 | `--color`, `--clear`, `--list` 不足 |

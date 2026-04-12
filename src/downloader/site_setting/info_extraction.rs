@@ -40,7 +40,7 @@ impl SiteSetting {
             if let Ok(re) = Regex::new(&resolved) {
                 if let Some(caps) = re.captures(source) {
                     for name in re.capture_names().flatten() {
-                        if name != key {
+                        if !capture_name_matches_key(key, name) {
                             continue;
                         }
                         if let Some(m) = caps.name(name) {
@@ -117,7 +117,7 @@ impl SiteSetting {
                     for name in re.capture_names().flatten() {
                         if let Some(m) = caps.name(name) {
                             let v = m.as_str().to_string();
-                            if name == key {
+                            if capture_name_matches_key(key, name) {
                                 return Some(v);
                             }
                         }
@@ -149,4 +149,22 @@ impl SiteSetting {
 
         (novel_type, is_end)
     }
+}
+
+fn capture_name_matches_key(key: &str, capture_name: &str) -> bool {
+    let aliases: &[&str] = match key {
+        "t" | "title" => &["t", "title"],
+        "w" | "author" => &["w", "writer", "author"],
+        "s" | "story" => &["s", "story"],
+        "nt" => &["nt", "novel_type"],
+        "ga" => &["ga", "general_all_no"],
+        "gf" => &["gf", "general_firstup"],
+        "nu" => &["nu", "novelupdated_at"],
+        "gl" => &["gl", "general_lastup"],
+        "l" => &["l", "length"],
+        "tags" => &["tags", "tag"],
+        "sitename" => &["sitename"],
+        _ => &[key],
+    };
+    aliases.contains(&capture_name)
 }

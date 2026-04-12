@@ -15,10 +15,10 @@ pub mod util;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
-use crate::db::novel_record::NovelRecord;
 use crate::db::DATABASE;
+use crate::db::novel_record::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::progress::ProgressReporter;
 
@@ -28,14 +28,15 @@ use self::novel_info::NovelInfo;
 use self::persistence::{
     ensure_default_files, load_toc_file, save_raw_file, save_section_file, save_toc_file,
 };
-use self::section::{download_section, SectionCache};
+use self::section::{SectionCache, download_section};
 use self::site_setting::SiteSetting;
 use self::toc::{create_short_story_subtitles, fetch_toc, parse_subtitles_multipage};
 use self::util::sanitize_filename;
 
 pub use self::types::{
-    DownloadResult, NarouApiEntry, NarouApiResult, SectionElement, SectionFile, SubtitleInfo,
-    TargetType, TocFile, TocObject, UpdateStatus, ARCHIVE_ROOT_DIR, RAW_DATA_DIR, SECTION_SAVE_DIR,
+    ARCHIVE_ROOT_DIR, DownloadResult, NarouApiEntry, NarouApiResult, RAW_DATA_DIR,
+    SECTION_SAVE_DIR, SectionElement, SectionFile, SubtitleInfo, TargetType, TocFile, TocObject,
+    UpdateStatus,
 };
 pub use self::util::pretreatment_source;
 
@@ -44,6 +45,42 @@ pub struct Downloader {
     site_settings: Vec<SiteSetting>,
     section_cache: SectionCache,
     progress: Option<Box<dyn ProgressReporter>>,
+}
+
+fn ncode_target_url(target: &str) -> Option<String> {
+    if matches!(Downloader::get_target_type(target), TargetType::Ncode) {
+        Some(format!(
+            "https://ncode.syosetu.com/{}/",
+            target.to_lowercase()
+        ))
+    } else {
+        None
+    }
+}
+
+fn story_changed(old_story: &Option<String>, fetched_story: &Option<String>) -> bool {
+    match (old_story, fetched_story) {
+        (None, None) => false,
+        (Some(old), Some(new)) => {
+            normalize_story_for_compare(old) != normalize_story_for_compare(new)
+        }
+        (None, Some(new)) => !normalize_story_for_compare(new).is_empty(),
+        (Some(old), None) => !normalize_story_for_compare(old).is_empty(),
+    }
+}
+
+fn normalize_story_for_compare(story: &str) -> String {
+    let br = regex::Regex::new(r"(?i)<br\s*/?>").expect("valid br regex");
+    let normalized = br.replace_all(story, "\n");
+    normalized
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 impl Downloader {
@@ -94,7 +131,9 @@ impl Downloader {
                 let setting = self.find_site_setting(target).ok_or_else(|| {
                     NarouError::InvalidTarget(format!("No site setting found for URL: {}", target))
                 })?;
-                let toc_url = setting.toc_url();
+                let toc_url = setting
+                    .toc_url_with_url_captures(target)
+                    .unwrap_or_else(|| setting.toc_url());
                 let db = DATABASE.lock();
                 if let Some(db) = db.as_ref() {
                     if let Some(record) = db.get_by_toc_url(&toc_url) {
@@ -188,6 +227,48 @@ impl Downloader {
             }
             Err(_) => Ok(NovelInfo::from_toc_source(setting, toc_source)),
         }
+    }
+
+    pub fn fetch_latest_status_by_id(
+        &mut self,
+        id: i64,
+    ) -> Result<(
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+        Option<i64>,
+        Option<bool>,
+    )> {
+        let (toc_url, ncode) = crate::db::with_database(|db| {
+            Ok(db.get(id).map(|r| (r.toc_url.clone(), r.ncode.clone())))
+        })?
+        .ok_or_else(|| NarouError::NotFound(format!("Novel not found for ID: {}", id)))?;
+
+        let setting = self
+            .find_site_setting(&toc_url)
+            .ok_or_else(|| NarouError::SiteSetting("No matching site setting".into()))?;
+
+        let mut url_captures = setting.extract_url_captures(&toc_url).unwrap_or_default();
+        if let Some(ncode) = ncode {
+            url_captures.entry("ncode".to_string()).or_insert(ncode);
+        }
+
+        let toc_source = fetch_toc(&mut self.fetcher, &setting, &toc_url)?;
+        let info = self.load_novel_info(&setting, &toc_source, &url_captures)?;
+
+        let is_end = if info.novel_type.is_some() {
+            info.end
+        } else {
+            setting
+                .resolve_info_pattern("nt", &toc_source)
+                .map(|text| setting.get_novel_type_from_string(&text).1)
+        };
+
+        Ok((
+            info.novelupdated_at,
+            info.general_lastup,
+            info.length,
+            is_end,
+        ))
     }
 
     fn handle_over18(&self, setting: &SiteSetting, body: &str) -> Option<String> {
@@ -301,7 +382,12 @@ impl Downloader {
             None
         };
 
-        let url_captures = setting.extract_url_captures(target).unwrap_or_default();
+        let url_captures = db_toc_url
+            .as_deref()
+            .and_then(|url| setting.extract_url_captures(url))
+            .or_else(|| setting.extract_url_captures(target))
+            .or_else(|| ncode_target_url(target).and_then(|url| setting.extract_url_captures(&url)))
+            .unwrap_or_default();
         let toc_url = if let Some(ref url) = db_toc_url {
             url.clone()
         } else if url_captures.is_empty() {
@@ -315,6 +401,11 @@ impl Downloader {
 
         let title = info.title.clone().unwrap_or_default();
         let author = info.author.clone().unwrap_or_default();
+        let existing_record = existing_id.and_then(|eid| {
+            crate::db::with_database(|db| Ok(db.get(eid).cloned()))
+                .ok()
+                .flatten()
+        });
 
         let (novel_type, is_end) = match info.novel_type {
             Some(nt) => (nt, info.end.unwrap_or(false)),
@@ -343,7 +434,17 @@ impl Downloader {
             setting.append_title_to_folder_name,
             existing_id,
         );
-        let sitename = info.sitename.unwrap_or_else(|| setting.sitename.clone());
+        let sitename = existing_record
+            .as_ref()
+            .and_then(|r| {
+                if r.sitename.is_empty() {
+                    None
+                } else {
+                    Some(r.sitename.clone())
+                }
+            })
+            .or_else(|| info.sitename.clone())
+            .unwrap_or_else(|| setting.sitename.clone());
 
         let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory);
         std::fs::create_dir_all(&novel_dir)?;
@@ -439,22 +540,27 @@ impl Downloader {
             ));
         }
 
-        let title_changed = old_title.as_deref() != Some(&title);
-        let author_changed = old_author.as_deref() != Some(&author);
-        let new_story = info.story.as_ref().map(|s| s.replace("<br>", "\n"));
-        let story_changed = old_story != new_story;
+        let db_title = existing_record
+            .as_ref()
+            .map(|r| r.title.clone())
+            .filter(|t| !t.is_empty());
+        let db_author = existing_record
+            .as_ref()
+            .map(|r| r.author.clone())
+            .filter(|a| !a.is_empty());
+        let old_title_for_compare = old_title.clone().or_else(|| db_title.clone());
+        let old_author_for_compare = old_author.clone().or_else(|| db_author.clone());
+        let title_changed = !title.is_empty() && old_title_for_compare.as_deref() != Some(&title);
+        let author_changed =
+            !author.is_empty() && old_author_for_compare.as_deref() != Some(&author);
+        let fetched_story = info.story.clone();
+        let story_changed = story_changed(&old_story, &fetched_story);
+        let new_story = if story_changed {
+            fetched_story
+        } else {
+            old_story.clone().or(fetched_story)
+        };
         let sections_deleted = old_section_count > subtitles.len();
-
-        let db_title = existing_id.and_then(|eid| {
-            crate::db::with_database(|db| Ok(db.get(eid).map(|r| r.title.clone())))
-                .ok()
-                .flatten()
-        });
-        let db_author = existing_id.and_then(|eid| {
-            crate::db::with_database(|db| Ok(db.get(eid).map(|r| r.author.clone())))
-                .ok()
-                .flatten()
-        });
 
         let toc_title = if title.is_empty() {
             old_title
@@ -486,8 +592,8 @@ impl Downloader {
 
         let record = NovelRecord {
             id: existing_id.unwrap_or(0),
-            author: author.clone(),
-            title: title.clone(),
+            author: toc_author.clone(),
+            title: toc_title.clone(),
             file_title: file_title.clone(),
             toc_url,
             sitename,
@@ -522,14 +628,22 @@ impl Downloader {
                         updated.title = record.title.clone();
                     }
                     updated.file_title = record.file_title.clone();
+                    updated.toc_url = record.toc_url.clone();
+                    updated.sitename = record.sitename.clone();
                     updated.end = record.end;
                     updated.last_update = record.last_update;
+                    if updated_count > 0 {
+                        updated.new_arrivals_date = record.new_arrivals_date;
+                    }
+                    updated.use_subdirectory = record.use_subdirectory;
                     updated.general_firstup = record.general_firstup;
                     updated.novelupdated_at = record.novelupdated_at;
                     updated.general_lastup = record.general_lastup;
                     updated.general_all_no = record.general_all_no;
                     updated.length = record.length;
+                    updated.domain = record.domain.clone();
                     updated.suspend = false;
+                    updated.is_narou = record.is_narou;
                     db.insert(updated);
                     eid
                 } else {
@@ -630,7 +744,9 @@ impl Downloader {
                         NarouError::InvalidTarget(format!("対応外のncodeです({})", ncode))
                     })?;
                     let existing_id = crate::db::with_database(|db| {
-                        let toc_url = setting.toc_url();
+                        let toc_url = setting
+                            .toc_url_with_url_captures(&narou_url)
+                            .unwrap_or_else(|| setting.toc_url());
                         Ok(db.get_by_toc_url(&toc_url).map(|r| r.id))
                     })
                     .ok()

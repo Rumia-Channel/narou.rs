@@ -251,8 +251,6 @@ pub enum Commands {
     },
     Update {
         ids: Option<Vec<String>>,
-        #[arg(long)]
-        all: bool,
         #[arg(short = 'f', long)]
         force: bool,
         #[arg(short = 'n', long)]
