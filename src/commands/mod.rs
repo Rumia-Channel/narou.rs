@@ -1,5 +1,6 @@
 pub mod convert;
 pub mod download;
+pub mod help;
 pub mod init;
 pub mod manage;
 pub mod setting;

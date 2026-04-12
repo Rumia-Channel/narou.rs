@@ -33,7 +33,12 @@ async fn main() {
         None
     };
 
-    let exit_code = run_command(args, user_agent, backtrace).await;
+    let exit_code = if !args.is_empty() && args[0] == "help" {
+        commands::help::cmd_help();
+        0
+    } else {
+        run_command(args, user_agent, backtrace).await
+    };
 
     if let Some(start) = start {
         let elapsed = start.elapsed();

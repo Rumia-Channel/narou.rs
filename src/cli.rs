@@ -67,11 +67,15 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
             flags.user_agent = Some(arg["--user-agent=".len()..].to_string());
             args.remove(i);
         } else if arg == "-h" || arg == "--help" {
-            args[i] = "--help".to_string();
             if i > 0 {
-                let val = args.remove(i);
-                args.insert(0, val);
+                resolve_command_shortcut(args, i);
+                let cmd_name = args[i].clone();
+                if crate::commands::help::display_command_help(&cmd_name) {
+                    std::process::exit(0);
+                }
             }
+            args.clear();
+            args.push("help".to_string());
             break;
         } else if arg == "-v" || arg == "--version" {
             args[i] = "version".to_string();
@@ -86,6 +90,13 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
 
     if args.is_empty() {
         args.push("help".to_string());
+    }
+
+    if args.len() > 1 && args[1..].iter().any(|a| a == "-h" || a == "--help") {
+        let cmd_name = args[0].clone();
+        if crate::commands::help::display_command_help(&cmd_name) {
+            std::process::exit(0);
+        }
     }
 
     if flags.multiple {
