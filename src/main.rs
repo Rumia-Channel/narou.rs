@@ -119,14 +119,20 @@ fn run_sync_command(command: Commands, user_agent: Option<String>, backtrace: bo
             all,
             force,
             no_convert,
+            convert_only_new_arrival,
+            gl,
             sort_by,
+            ignore_all,
         } => {
             commands::update::cmd_update(commands::update::UpdateOptions {
                 ids,
                 all,
                 force,
                 no_convert,
+                convert_only_new_arrival,
+                gl,
                 sort_by,
+                ignore_all,
                 user_agent,
             });
             0

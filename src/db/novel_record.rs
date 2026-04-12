@@ -41,4 +41,12 @@ pub struct NovelRecord {
     pub suspend: bool,
     #[serde(default)]
     pub is_narou: bool,
+    #[serde(with = "chrono::serde::ts_seconds_option", default)]
+    pub last_check_date: Option<DateTime<Utc>>,
+    #[serde(
+        default,
+        skip_serializing_if = "std::ops::Not::not",
+        rename = "_convert_failure"
+    )]
+    pub convert_failure: bool,
 }

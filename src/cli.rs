@@ -253,12 +253,18 @@ pub enum Commands {
         ids: Option<Vec<String>>,
         #[arg(long)]
         all: bool,
-        #[arg(long)]
+        #[arg(short = 'f', long)]
         force: bool,
-        #[arg(long)]
+        #[arg(short = 'n', long)]
         no_convert: bool,
+        #[arg(short = 'a', long)]
+        convert_only_new_arrival: bool,
         #[arg(long)]
+        gl: Option<Option<String>>,
+        #[arg(short = 's', long = "sort-by")]
         sort_by: Option<String>,
+        #[arg(short = 'i', long)]
+        ignore_all: bool,
     },
     Convert {
         targets: Vec<String>,

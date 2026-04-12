@@ -445,16 +445,44 @@ impl Downloader {
         let story_changed = old_story != new_story;
         let sections_deleted = old_section_count > subtitles.len();
 
+        let db_title = existing_id.and_then(|eid| {
+            crate::db::with_database(|db| Ok(db.get(eid).map(|r| r.title.clone())))
+                .ok()
+                .flatten()
+        });
+        let db_author = existing_id.and_then(|eid| {
+            crate::db::with_database(|db| Ok(db.get(eid).map(|r| r.author.clone())))
+                .ok()
+                .flatten()
+        });
+
+        let toc_title = if title.is_empty() {
+            old_title
+                .filter(|t| !t.is_empty())
+                .or(db_title)
+                .unwrap_or_default()
+        } else {
+            title.clone()
+        };
+        let toc_author = if author.is_empty() {
+            old_author
+                .filter(|t| !t.is_empty())
+                .or(db_author)
+                .unwrap_or_default()
+        } else {
+            author.clone()
+        };
+
         let toc_file = TocFile {
-            title: title.clone(),
-            author: author.clone(),
+            title: toc_title.clone(),
+            author: toc_author.clone(),
             toc_url: toc_url.clone(),
             story: new_story.clone(),
             subtitles: final_subtitles,
             novel_type: Some(novel_type),
         };
         save_toc_file(&novel_dir, &toc_file)?;
-        ensure_default_files(&novel_dir, &title, &author, &toc_url);
+        ensure_default_files(&novel_dir, &toc_title, &toc_author, &toc_url);
 
         let record = NovelRecord {
             id: existing_id.unwrap_or(0),
@@ -479,14 +507,20 @@ impl Downloader {
             length: info.length,
             suspend: false,
             is_narou: setting.is_narou,
+            last_check_date: None,
+            convert_failure: false,
         };
 
         let id = crate::db::with_database_mut(|db| {
             let id = if let Some(eid) = existing_id {
                 if let Some(existing) = db.get(eid) {
                     let mut updated = existing.clone();
-                    updated.author = record.author.clone();
-                    updated.title = record.title.clone();
+                    if !record.author.is_empty() {
+                        updated.author = record.author.clone();
+                    }
+                    if !record.title.is_empty() {
+                        updated.title = record.title.clone();
+                    }
                     updated.file_title = record.file_title.clone();
                     updated.end = record.end;
                     updated.last_update = record.last_update;
@@ -531,8 +565,8 @@ impl Downloader {
 
         Ok(DownloadResult {
             id,
-            title: title.clone(),
-            author: author.clone(),
+            title: toc_title.clone(),
+            author: toc_author.clone(),
             novel_dir,
             new_novel: existing_id.is_none(),
             updated_count,
