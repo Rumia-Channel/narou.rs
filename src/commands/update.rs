@@ -1,21 +1,27 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::io::{self, IsTerminal, Read};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use indicatif::MultiProgress;
 
+use narou_rs::compat::{convert_existing_novel, current_device, load_local_setting_bool, load_local_setting_string, load_local_setting_value, yaml_value_to_string};
 use narou_rs::converter::NovelConverter;
+use narou_rs::converter::device::{Device, OutputManager};
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
 use narou_rs::db::inventory::InventoryScope;
 use narou_rs::downloader::site_setting::SiteSetting;
-use narou_rs::downloader::{DownloadResult, Downloader, TargetType, UpdateStatus};
+use narou_rs::downloader::{DownloadResult, Downloader, SubtitleInfo, TargetType, TocFile, TocObject, UpdateStatus};
 use narou_rs::progress::CliProgress;
 
 const MODIFIED_TAG: &str = "modified";
 const INTERVAL_MIN_SECS: f64 = 2.5;
 const FORCE_WAIT_SECS: f64 = 2.0;
+const HOTENTRY_DIR_NAME: &str = "hotentry";
+const HOTENTRY_FOOTER: &str = "［＃ここから地付き］［＃小書き］（本を読み終わりました）［＃小書き終わり］［＃ここで地付き終わり］";
 
 const UPDATE_SORT_KEYS: &[(&str, &str)] = &[
     ("id", "ID"),
@@ -51,15 +57,18 @@ pub fn cmd_update(opts: UpdateOptions) {
             return;
         }
 
-        let setting_sort_by = load_setting_string("update.sort-by");
+        let setting_sort_by = load_local_setting_string("update.sort-by");
         let sort_by = resolve_sort_key(opts.sort_by.as_deref().or(setting_sort_by.as_deref()));
 
-        let convert_only_new_arrival =
-            opts.convert_only_new_arrival || load_setting_bool("update.convert-only-new-arrival");
+        let convert_only_new_arrival = opts.convert_only_new_arrival
+            || load_local_setting_bool("update.convert-only-new-arrival");
         let interval_secs = load_setting_float("update.interval", INTERVAL_MIN_SECS);
 
+        let stdin_targets = read_targets_from_stdin();
+        let merged_ids = merge_cli_and_stdin_targets(opts.ids, stdin_targets);
+        let is_bulk = merged_ids.is_none();
         let (target_ids, unresolved_count) =
-            resolve_targets(opts.ids.as_deref(), opts.ignore_all, sort_by.as_deref());
+            resolve_targets(merged_ids.as_deref(), opts.ignore_all, sort_by.as_deref());
         if target_ids.is_empty() {
             if unresolved_count > 0 {
                 std::process::exit(unresolved_count.min(127) as i32);
@@ -67,7 +76,6 @@ pub fn cmd_update(opts: UpdateOptions) {
             return;
         }
 
-        let is_bulk = opts.ids.is_none();
         let _total = target_ids.len();
         let mut mistook = unresolved_count;
 
@@ -81,6 +89,8 @@ pub fn cmd_update(opts: UpdateOptions) {
 
         let multi = CliProgress::multi();
         let multi_clone = multi.clone();
+        let hotentry_enabled = load_local_setting_bool("hotentry");
+        let mut hotentries: HashMap<i64, Vec<SubtitleInfo>> = HashMap::new();
 
         let mut last_time = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs_f64(interval_secs))
@@ -113,13 +123,16 @@ pub fn cmd_update(opts: UpdateOptions) {
 
             match downloader.download_novel(&id.to_string()) {
                 Ok(dl) => {
-                    remove_modified_tag(dl.id);
-                    update_last_check_date(dl.id);
-                    sync_end_tag(dl.id);
-
                     print_status_messages(&multi_clone, &dl);
 
-                    let new_arrivals = dl.updated_count > 0 || dl.new_novel;
+                    if hotentry_enabled && !dl.new_arrival_subtitles.is_empty() {
+                        hotentries
+                            .entry(dl.id)
+                            .or_default()
+                            .extend(dl.new_arrival_subtitles.clone());
+                    }
+
+                    let new_arrivals = dl.new_arrivals;
                     let has_convert_failure = narou_rs::db::with_database(|db| {
                         Ok(db.get(dl.id).map(|r| r.convert_failure).unwrap_or(false))
                     })
@@ -127,6 +140,9 @@ pub fn cmd_update(opts: UpdateOptions) {
 
                     match dl.status {
                         UpdateStatus::Ok => {
+                            remove_modified_tag(dl.id);
+                            update_last_check_date(dl.id);
+                            sync_end_tag(dl.id);
                             if opts.no_convert {
                                 std::thread::sleep(std::time::Duration::from_secs_f64(
                                     FORCE_WAIT_SECS,
@@ -142,11 +158,27 @@ pub fn cmd_update(opts: UpdateOptions) {
                             }
                         }
                         UpdateStatus::None => {
+                            remove_modified_tag(dl.id);
+                            update_last_check_date(dl.id);
+                            sync_end_tag(dl.id);
                             if !has_convert_failure {
                                 continue;
                             }
                         }
                         UpdateStatus::Failed => {
+                            mistook += 1;
+                            continue;
+                        }
+                        UpdateStatus::Canceled => {
+                            let title = if dl.title.is_empty() {
+                                get_novel_title(id)
+                            } else {
+                                dl.title.clone()
+                            };
+                            let _ = multi_clone.println(format!(
+                                "ID:{} {} の更新はキャンセルされました",
+                                id, title
+                            ));
                             mistook += 1;
                             continue;
                         }
@@ -156,7 +188,7 @@ pub fn cmd_update(opts: UpdateOptions) {
                         let _ = multi_clone.println("前回変換できなかったので再変換します");
                     }
 
-                    match auto_convert(&multi_clone, &dl) {
+                    match auto_convert(&multi_clone, &dl, is_bulk) {
                         Ok(()) => {
                             clear_convert_failure(dl.id);
                         }
@@ -168,6 +200,9 @@ pub fn cmd_update(opts: UpdateOptions) {
                     }
                 }
                 Err(e) => {
+                    if matches!(e, narou_rs::error::NarouError::SuspendDownload(_)) {
+                        std::panic::resume_unwind(Box::new(e.to_string()));
+                    }
                     let title = get_novel_title(id);
                     let _ = multi_clone
                         .println(format!("ID:{} {} の更新は失敗しました\n  {}", id, title, e));
@@ -177,6 +212,13 @@ pub fn cmd_update(opts: UpdateOptions) {
         }
 
         let _ = narou_rs::db::with_database_mut(|db| db.save());
+
+        if hotentry_enabled {
+            if let Err(e) = process_hotentry(&multi_clone, &hotentries) {
+                let _ = multi_clone.println(format!("hotentry の処理に失敗しました\n  {}", e));
+                mistook += 1;
+            }
+        }
 
         if mistook > 0 {
             let _ = multi_clone.println(format!("\n{} 件のエラーが発生しました", mistook));
@@ -235,6 +277,38 @@ fn resolve_targets(
         sort_update_ids_by_key(&mut all_ids, key);
     }
     (all_ids, 0)
+}
+
+fn read_targets_from_stdin() -> Vec<String> {
+    if std::io::stdin().is_terminal() {
+        return Vec::new();
+    }
+
+    let mut input = String::new();
+    if io::stdin().read_to_string(&mut input).is_err() {
+        return Vec::new();
+    }
+
+    input
+        .split_whitespace()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect()
+}
+
+fn merge_cli_and_stdin_targets(
+    ids: Option<Vec<String>>,
+    stdin_targets: Vec<String>,
+) -> Option<Vec<String>> {
+    match (ids, stdin_targets.is_empty()) {
+        (Some(mut ids), false) => {
+            ids.extend(stdin_targets);
+            Some(ids)
+        }
+        (Some(ids), true) => Some(ids),
+        (None, false) => Some(stdin_targets),
+        (None, true) => None,
+    }
 }
 
 fn resolve_sort_key(key: Option<&str>) -> Option<String> {
@@ -590,58 +664,172 @@ fn print_status_messages(multi: &Arc<MultiProgress>, dl: &DownloadResult) {
         UpdateStatus::None => {
             let _ = multi.println(format!("{} に更新はありません", dl.title));
         }
+        UpdateStatus::Canceled => {}
         UpdateStatus::Failed => {}
     }
 }
 
-fn auto_convert(multi: &Arc<MultiProgress>, dl: &DownloadResult) -> Result<(), String> {
-    let settings = NovelSettings::load_for_novel(dl.id, &dl.title, &dl.author, &dl.novel_dir);
-    let mut converter = if let Some(uc) = UserConverter::load_with_title(&dl.novel_dir, &dl.title) {
-        NovelConverter::with_user_converter(settings, uc)
+fn auto_convert(_multi: &Arc<MultiProgress>, dl: &DownloadResult, no_open: bool) -> Result<(), String> {
+    convert_existing_novel(dl.id, &dl.title, &dl.author, &dl.novel_dir, no_open).map(|_| ())
+}
+
+fn process_hotentry(
+    multi: &Arc<MultiProgress>,
+    hotentries: &HashMap<i64, Vec<SubtitleInfo>>,
+) -> Result<(), String> {
+    if hotentries.is_empty() {
+        return Ok(());
+    }
+
+    let mut collected: Vec<(i64, PathBuf, TocObject, Vec<SubtitleInfo>)> = Vec::new();
+    for (id, subtitles) in hotentries {
+        if subtitles.is_empty() {
+            continue;
+        }
+
+        let (novel_dir, title, author) = narou_rs::db::with_database(|db| {
+            let record = db
+                .get(*id)
+                .cloned()
+                .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
+            let novel_dir = narou_rs::db::existing_novel_dir_for_record(db.archive_root(), &record);
+            Ok::<_, narou_rs::error::NarouError>((novel_dir, record.title, record.author))
+        })
+        .map_err(|e| e.to_string())?;
+
+        let toc = load_toc_object(&novel_dir).map_err(|e| e.to_string())?;
+        let _ = (title, author);
+        collected.push((*id, novel_dir, toc, subtitles.clone()));
+    }
+
+    if collected.is_empty() {
+        return Ok(());
+    }
+
+    let _ = multi.println("───────────────────────────────────");
+    let _ = multi.println("hotentry の変換を開始");
+
+    let mut converted_entries = Vec::new();
+    for (id, novel_dir, toc, subtitles) in &collected {
+        let settings = NovelSettings::load_for_novel(*id, &toc.title, &toc.author, novel_dir);
+        let mut settings = settings;
+        settings.enable_illust = false;
+        let display_title = settings.novel_title.clone();
+        let display_author = settings.novel_author.clone();
+
+        let mut converter = if let Some(uc) = UserConverter::load_with_title(novel_dir, &toc.title) {
+            NovelConverter::with_user_converter(settings, uc)
+        } else {
+            NovelConverter::new(settings)
+        };
+
+        let text = converter
+            .convert_subtitles_for_hotentry(toc, subtitles, novel_dir)
+            .map_err(|e| e.to_string())?;
+        converted_entries.push(HotentryEntry {
+            title: display_title,
+            author: display_author,
+            text,
+        });
+    }
+
+    let hotentry_dir = hotentry_dir_path();
+    std::fs::create_dir_all(&hotentry_dir).map_err(|e| e.to_string())?;
+
+    let now = chrono::Local::now();
+    let hotentry_title = now.format("hotentry %y/%m/%d %H:%M").to_string();
+    let hotentry_text = render_hotentry_text(&hotentry_title, &converted_entries, &now);
+    let txt_path = hotentry_dir.join(now.format("hotentry_%y-%m-%d_%H%M.txt").to_string());
+    std::fs::write(&txt_path, &hotentry_text).map_err(|e| e.to_string())?;
+
+    let device = current_device().unwrap_or(Device::Text);
+    let final_path = if device == Device::Text {
+        txt_path.clone()
     } else {
-        NovelConverter::new(settings)
+        let output_manager = OutputManager::new(device);
+        let base_name = txt_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("hotentry");
+        output_manager
+            .convert_file(&txt_path, &hotentry_dir, base_name)
+            .map_err(|e| e.to_string())?
     };
 
-    let progress = CliProgress::with_multi(&format!("Convert {}", dl.title), multi.clone());
-    converter.set_progress(Box::new(progress));
+    let _ = copy_to_hotentry_output(&final_path, if device == Device::Text { None } else { Some(device) });
+    let _ = send_hotentry_output(&final_path, if device == Device::Text { None } else { Some(device) }, multi);
 
-    match converter.convert_novel_by_id(dl.id, &dl.novel_dir) {
-        Ok(path) => {
-            let _ = multi.println(format!("  Converted: {}", path));
-            Ok(())
-        }
-        Err(e) => Err(e.to_string()),
-    }
+    let _ = multi.println(format!("hotentry を生成しました: {}", final_path.display()));
+    Ok(())
 }
 
-fn load_setting_value(key: &str) -> Option<serde_yaml::Value> {
-    narou_rs::db::with_database(|db| {
-        let settings: HashMap<String, serde_yaml::Value> = db
-            .inventory()
-            .load("local_setting", InventoryScope::Local)?;
-        Ok(settings.get(key).cloned())
+struct HotentryEntry {
+    title: String,
+    author: String,
+    text: String,
+}
+
+fn load_toc_object(novel_dir: &Path) -> narou_rs::error::Result<TocObject> {
+    let toc_path = novel_dir.join("toc.yaml");
+    let toc_content = std::fs::read_to_string(&toc_path)?;
+    let toc: TocFile = serde_yaml::from_str(&toc_content)?;
+    Ok(TocObject {
+        title: toc.title,
+        author: toc.author,
+        toc_url: toc.toc_url,
+        story: toc.story,
+        subtitles: toc.subtitles,
+        novel_type: toc.novel_type,
     })
-    .ok()
-    .flatten()
 }
 
-fn load_setting_string(key: &str) -> Option<String> {
-    load_setting_value(key).and_then(|v| yaml_value_to_string(&v))
+fn hotentry_dir_path() -> PathBuf {
+    PathBuf::from(HOTENTRY_DIR_NAME)
 }
 
-fn load_setting_bool(key: &str) -> bool {
-    load_setting_value(key)
-        .and_then(|v| match v {
-            serde_yaml::Value::Bool(b) => Some(b),
-            serde_yaml::Value::String(s) => Some(matches!(s.as_str(), "true" | "yes" | "on" | "1")),
-            serde_yaml::Value::Number(n) => Some(n.as_i64().unwrap_or(0) != 0),
-            _ => None,
-        })
-        .unwrap_or(false)
+fn render_hotentry_text(
+    hotentry_title: &str,
+    entries: &[HotentryEntry],
+    now: &chrono::DateTime<chrono::Local>,
+) -> String {
+    let mut output = String::new();
+    output.push_str(hotentry_title);
+    output.push('\n');
+    output.push_str("Narou.rb\n\n");
+    output.push_str("［＃改ページ］\n");
+    output.push_str(&format!(
+        "このデータは{}頃作成されました。\n\n",
+        now.format("%y年%m月%d日\u{3000}%H時%M分")
+    ));
+    output.push_str("■収録作品一覧\n");
+    for entry in entries {
+        output.push_str("［＃１字下げ］");
+        output.push_str(&entry.title);
+        output.push('\n');
+    }
+    output.push('\n');
+
+    for entry in entries {
+        output.push_str("［＃改ページ］\n");
+        output.push_str("［＃ページの左右中央］\n");
+        output.push_str("［＃１字下げ］［＃大見出し］");
+        output.push_str(&entry.title);
+        output.push_str("［＃大見出し終わり］\n");
+        output.push_str("［＃ここから地付き］");
+        output.push_str(&entry.author);
+        output.push_str("［＃ここで地付き終わり］\n");
+        output.push_str(entry.text.trim_end_matches('\n'));
+        output.push('\n');
+    }
+
+    output.push('\n');
+    output.push_str(HOTENTRY_FOOTER);
+    output.push('\n');
+    output
 }
 
 fn load_setting_float(key: &str, default: f64) -> f64 {
-    load_setting_value(key)
+    load_local_setting_value(key)
         .and_then(|v| match v {
             serde_yaml::Value::Number(n) => n.as_f64(),
             serde_yaml::Value::String(s) => s.parse::<f64>().ok(),
@@ -651,12 +839,74 @@ fn load_setting_float(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-fn yaml_value_to_string(value: &serde_yaml::Value) -> Option<String> {
-    match value {
-        serde_yaml::Value::String(s) => Some(s.clone()),
-        serde_yaml::Value::Number(n) => Some(n.to_string()),
-        serde_yaml::Value::Bool(b) => Some(b.to_string()),
-        _ => None,
+fn copy_to_hotentry_output(src_path: &Path, _device: Option<Device>) -> Result<Option<PathBuf>, String> {
+    let copy_to_dir =
+        load_local_setting_string("convert.copy-to").or_else(|| load_local_setting_string("convert.copy_to"));
+    let Some(copy_to_dir) = copy_to_dir else {
+        return Ok(None);
+    };
+    let base = PathBuf::from(&copy_to_dir);
+    if !base.is_dir() {
+        return Err(format!(
+            "{} はフォルダではないかすでに削除されています。コピー出来ませんでした",
+            copy_to_dir
+        ));
+    }
+    let mut dst_dir = base;
+    if let Some(device) = _device {
+        if narou_rs::compat::load_local_setting_list("convert.copy-to-grouping")
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case("device"))
+        {
+            dst_dir.push(device.display_name());
+            std::fs::create_dir_all(&dst_dir).map_err(|e| e.to_string())?;
+        }
+    }
+    let dst = dst_dir.join(
+        src_path
+            .file_name()
+            .ok_or_else(|| "Invalid converted filename".to_string())?,
+    );
+    std::fs::copy(src_path, &dst).map_err(|e| e.to_string())?;
+    println!("{} へコピーしました", dst.display());
+    Ok(Some(dst))
+}
+
+fn send_hotentry_output(
+    ebook_file: &Path,
+    device: Option<Device>,
+    multi: &Arc<MultiProgress>,
+) -> Result<(), String> {
+    let Some(device) = device else {
+        return Ok(());
+    };
+    let manager = OutputManager::new(device);
+    if !device.physical_support() || !manager.connecting() || ebook_file.extension().is_none() {
+        return Ok(());
+    }
+    if format!(
+        ".{}",
+        ebook_file
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+    ) != device.extension()
+    {
+        return Ok(());
+    }
+    if !manager.ebook_file_old(ebook_file) {
+        return Ok(());
+    }
+    let _ = multi.println(format!("{}へ送信しています", device.display_name()));
+    match manager.copy_to_documents(ebook_file).map_err(|e| e.to_string())? {
+        Some(path) => {
+            let _ = multi.println(format!("{} へコピーしました", path.display()));
+            Ok(())
+        }
+        None => Err(format!(
+            "{}が見つからなかったためコピー出来ませんでした",
+            device.display_name()
+        )),
     }
 }
 

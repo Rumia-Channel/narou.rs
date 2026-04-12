@@ -84,11 +84,11 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 |---------|:--------:|:-----------:|------|
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
 | `download` | ✅ | 🟡 部分 | `--mail` 未実装（メール機能自体未実装のため） |
-| `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較は実装済み。hotentry が未完 |
+| `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、digest選択肢、差分cache退避、hotentryのcopy/sendまでは実装済み。mail/hotentry細部が未完 |
 | `convert` | ✅ | 🟡 部分 | `--device`, `--no-epub`, `--output` 等不足 |
 | `list` | ✅ | 🟡 部分 | `--latest`, `--reverse`, `--url`, `--filter` 等不足 |
 | `tag` | ✅ | 🟡 部分 | `--color`, `--clear`, `--list` 不足 |
-| `freeze` | ✅ | 🟡 部分 | 全オプションは実装済み。ただし freeze.yaml 互換とターゲット解決が未完 |
+| `freeze` | ✅ | 🟡 部分 | 全オプションは実装済み。freeze.yaml と `frozen` タグの同期は実装済みだが、ターゲット解決のRuby完全互換は未確認 |
 | `remove` | ✅ | 🟡 部分 | `--yes`, `--with-file` 不足 |
 | `web` | ✅ | 🟡 部分 | APIのみ。HTML UIなし |
 | `setting` | ✅ | 🟡 部分 | 基本読み書きは実装済み。ただし default/force/default_args 系と全設定網羅に不足 |
@@ -179,6 +179,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `-f`/`--force`: 凍結小説も更新
 - `-s`/`--sort-by KEY`: 更新順ソート（設定 `update.sort-by` にも対応）。有効キー: `id`, `last_update`, `title`, `author`, `new_arrivals_date`, `general_lastup`
 - `-i`/`--ignore-all`: 引数なし時の全更新を無効化
+- 標準入力からのターゲット読み取りに対応。Ruby版同様 `narou tag ... | narou u` や `narou l -t "foo bar" | narou u` のようなパイプ入力を解決
 - ターゲット解決: Ruby版 `tagname_to_ids`/`Downloader.get_data_by_target` 相当に合わせ、ID、URL、Nコード、タイトル、`.narou/alias.yaml` 別名、通常タグ名、`tag:NAME`、`^tag:NAME` を解決
 - 既存小説更新時は Ruby版同様に DB の `toc_url` から `ncode` などのURLキャプチャを復元し、DB上の `sitename` を保存先決定で優先する
 - あらすじ比較は `<br>`/`<br/>`/`<br />` と改行・行末空白を正規化し、実質同一なら更新扱いにしない
@@ -190,6 +191,12 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `update.strong` 設定対応。同日更新時は保存済み `本文/*.yaml` の本文要素と取得本文をハッシュ比較し、実質同一なら更新扱いにしない
 - `update.convert-only-new-arrival` 設定対応（YAMLの真偽値/文字列/数値を許容）
 - `last_check_date` 追跡
+- `download.choices-of-digest-options` 設定対応。Ruby版と同じ 1-8 のダイジェスト化選択肢を処理し、キャンセル・凍結・バックアップ・あらすじ表示・ブラウザ起動・保存フォルダ起動・変換を実行
+- ダイジェスト化キャンセル時は `UpdateStatus::Canceled` を返し、`update` / `download` コマンド側でRuby版相当のキャンセル表示と終了コード加算を行う
+- 差分更新時は Ruby版同様 `本文/cache/<timestamp>/` に旧sectionを退避し、差分が無い場合は空cacheディレクトリを削除
+- `SuspendDownload` 発生時は通常失敗ではなくバッチ全体の中断として扱うように修正
+- `auto-add-tags` 設定対応。site YAML の `tags` パターンから取得したタグをDBタグへ自動追加
+- `hotentry` / `hotentry.auto-mail` 設定のうち、hotentry の新着話収集・統合テキスト生成・device に応じた変換・`copy-to`・端末送信までは実装済み
 - ソートキーバリデーション（不正キーでエラー+終了コード127）
 - `setting update.sort-by` の select 値を Ruby版 `Narou::UPDATE_SORT_KEYS` と同期済み
 - 小説間インターバル（Ruby版 `Interval` クラス互換）
@@ -198,8 +205,9 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `--all` は Ruby版に存在しないRust独自オプションだったため削除
 
 **完了扱いにしない理由 / 不足動作**:
-- Hotentry 収集・統合電子書籍生成（`hotentry` 設定、`HotentryManager`）
-- Ruby版の差分用 `本文/cache/` 退避や section hash cache との完全な外部連携は未確認
+- `mail hotentry` 連携（mailコマンド自体が未実装）
+- `confirm_over18?` の global_setting 永続化は未実装で、現状は都度確認のみ
+- Ruby版の section hash cache 永続化との完全な外部互換は未確認
 - Ruby版の詳細表示・hotentry後処理・割り込み時Worker cancelなど、周辺出力/イベント処理の細部は追加突合が必要
 
 ---
@@ -676,7 +684,7 @@ narou setting name         # 読み取り
 | タスク | コマンド | 影響 |
 |-------|---------|------|
 | download `--force`, `--no-convert`, `--freeze` | download | DL フラグ互換 |
-| update の残互換実装 | update | Ruby版ターゲット解決・`--gl`主要挙動・`update.strong` 相当の同日本文比較は実装済み。hotentry、差分用 cache 退避、周辺出力/イベント細部が残る |
+| update の残互換実装 | update | Ruby版ターゲット解決・`--gl`主要挙動・`update.strong`・digest選択肢・差分用 cache 退避・hotentry の copy/send までは実装済み。mail/hotentry細部と周辺出力/イベント細部が残る |
 | convert `--device`, `--no-open`, `--output` | convert | 変換パイプライン完成 |
 | list `--latest`, `--reverse`, `--filter`, `--url`, `--author`, `--site` | list | 一覧表示の実用性 |
 | tag `--color`, `--clear`, `--list` | tag | タグ管理の完成 |

@@ -29,6 +29,35 @@ impl Device {
             Device::Kobo => ".epub",
         }
     }
+
+    pub fn display_name(&self) -> &str {
+        match self {
+            Device::Text => "text",
+            Device::Epub => "EPUB",
+            Device::Mobi => "Kindle",
+            Device::Kobo => "Kobo",
+        }
+    }
+
+    pub fn physical_support(&self) -> bool {
+        matches!(self, Device::Mobi | Device::Kobo)
+    }
+
+    pub fn volume_name(&self) -> Option<&'static str> {
+        match self {
+            Device::Mobi => Some("Kindle"),
+            Device::Kobo => Some("KOBOeReader"),
+            _ => None,
+        }
+    }
+
+    pub fn documents_path_candidates(&self) -> &'static [&'static str] {
+        match self {
+            Device::Mobi => &["documents", "Documents", "Books"],
+            Device::Kobo => &["/"],
+            _ => &[],
+        }
+    }
 }
 
 pub struct OutputManager {
@@ -237,6 +266,75 @@ impl OutputManager {
         ];
         devices
     }
+
+    pub fn get_documents_path(&self) -> Option<PathBuf> {
+        let volume_name = self.device.volume_name()?;
+        let root = if cfg!(windows) {
+            find_windows_volume_root(volume_name)
+        } else if cfg!(target_os = "macos") {
+            let path = PathBuf::from("/Volumes").join(volume_name);
+            path.exists().then_some(path)
+        } else {
+            find_unix_volume_root(volume_name)
+        }?;
+
+        for relative in self.device.documents_path_candidates() {
+            let candidate = if *relative == "/" {
+                root.clone()
+            } else {
+                root.join(relative)
+            };
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+
+        None
+    }
+
+    pub fn connecting(&self) -> bool {
+        self.device.physical_support() && self.get_documents_path().is_some()
+    }
+
+    pub fn ebook_file_old(&self, src_file: &Path) -> bool {
+        let Some(documents_path) = self.get_documents_path() else {
+            return true;
+        };
+        let dst_path = documents_path.join(
+            src_file
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default(),
+        );
+        if !dst_path.exists() {
+            return true;
+        }
+        let src_time = std::fs::metadata(src_file).and_then(|m| m.modified()).ok();
+        let dst_time = std::fs::metadata(dst_path).and_then(|m| m.modified()).ok();
+        match (src_time, dst_time) {
+            (Some(src), Some(dst)) => src > dst,
+            _ => true,
+        }
+    }
+
+    pub fn copy_to_documents(&self, src_file: &Path) -> Result<Option<PathBuf>> {
+        let Some(documents_path) = self.get_documents_path() else {
+            return Ok(None);
+        };
+        let dst_path = documents_path.join(
+            src_file
+                .file_name()
+                .ok_or_else(|| NarouError::Conversion("Invalid source filename".into()))?,
+        );
+        std::fs::copy(src_file, &dst_path)?;
+        if crate::compat::load_local_setting_list("economy")
+            .iter()
+            .any(|v| v == "send_delete")
+        {
+            let _ = std::fs::remove_file(src_file);
+        }
+        Ok(Some(dst_path))
+    }
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -249,4 +347,45 @@ fn home_dir() -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+fn find_windows_volume_root(volume_name: &str) -> Option<PathBuf> {
+    for letter in b'A'..=b'Z' {
+        let drive = format!("{}:\\", letter as char);
+        let path = PathBuf::from(&drive);
+        if !path.exists() {
+            continue;
+        }
+
+        let output = Command::new("cmd")
+            .args(["/C", "vol", &drive])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.to_lowercase().contains(&volume_name.to_lowercase()) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn find_unix_volume_root(volume_name: &str) -> Option<PathBuf> {
+    let mut roots = vec![PathBuf::from("/media"), PathBuf::from("/mnt")];
+    if let Some(home) = home_dir() {
+        if let Some(user) = home.file_name().and_then(|v| v.to_str()) {
+            roots.push(PathBuf::from("/run/media").join(user));
+            roots.push(PathBuf::from("/media").join(user));
+        }
+    }
+
+    for root in roots {
+        let path = root.join(volume_name);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    None
 }

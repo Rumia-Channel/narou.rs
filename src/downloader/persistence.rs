@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -67,6 +67,25 @@ pub fn save_raw_file(raw_dir: &PathBuf, subtitle: &SubtitleInfo, raw_html: &str)
     let filename = format!("{} {}.html", subtitle.index, subtitle.file_subtitle);
     let path = raw_dir.join(filename);
     std::fs::write(&path, raw_html)?;
+    Ok(())
+}
+
+pub fn move_file_to_dir(path: &Path, dst_dir: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst_dir)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| crate::error::NarouError::Io(std::io::Error::other("invalid file name")))?;
+    std::fs::rename(path, dst_dir.join(file_name))?;
+    Ok(())
+}
+
+pub fn remove_dir_if_empty(path: &Path) -> Result<()> {
+    if path.is_dir() && std::fs::read_dir(path)?.next().is_none() {
+        std::fs::remove_dir_all(path)?;
+    }
     Ok(())
 }
 

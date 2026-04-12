@@ -115,6 +115,7 @@ pub struct TocFile {
 pub enum UpdateStatus {
     Ok,
     None,
+    Canceled,
     Failed,
 }
 
@@ -125,6 +126,8 @@ pub struct DownloadResult {
     pub author: String,
     pub novel_dir: std::path::PathBuf,
     pub new_novel: bool,
+    pub new_arrivals: bool,
+    pub new_arrival_subtitles: Vec<SubtitleInfo>,
     pub updated_count: usize,
     pub total_count: usize,
     pub status: UpdateStatus,

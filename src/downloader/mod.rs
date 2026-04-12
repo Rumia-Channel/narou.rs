@@ -13,9 +13,11 @@ pub mod types;
 pub mod util;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
+use regex::Regex;
 
 use crate::db::DATABASE;
 use crate::db::novel_record::NovelRecord;
@@ -27,7 +29,7 @@ use self::narou_api::narou_api_batch_update;
 use self::novel_info::NovelInfo;
 use self::persistence::{
     compute_section_hash, ensure_default_files, load_section_file, load_toc_file, save_raw_file,
-    save_section_file, save_toc_file,
+    save_section_file, save_toc_file, move_file_to_dir, remove_dir_if_empty,
 };
 use self::section::{SectionCache, download_section};
 use self::site_setting::SiteSetting;
@@ -85,25 +87,84 @@ fn normalize_story_for_compare(story: &str) -> String {
 }
 
 fn load_local_setting_bool(key: &str) -> bool {
+    crate::compat::load_local_setting_bool(key)
+}
+
+fn load_local_setting_string(key: &str) -> Option<String> {
+    crate::compat::load_local_setting_string(key)
+}
+
+fn load_global_setting_bool(key: &str) -> bool {
     crate::db::with_database(|db| {
         let settings: HashMap<String, serde_yaml::Value> = db
             .inventory()
-            .load("local_setting", crate::db::inventory::InventoryScope::Local)?;
-        Ok(settings.get(key).cloned())
+            .load("global_setting", crate::db::inventory::InventoryScope::Global)?;
+        Ok(settings.get(key).and_then(|value| match value {
+            serde_yaml::Value::Bool(v) => Some(*v),
+            serde_yaml::Value::String(v) => Some(matches!(v.as_str(), "true" | "yes" | "on" | "1")),
+            serde_yaml::Value::Number(v) => Some(v.as_i64().unwrap_or(0) != 0),
+            _ => None,
+        }))
     })
     .ok()
     .flatten()
-    .and_then(|value| match value {
-        serde_yaml::Value::Bool(b) => Some(b),
-        serde_yaml::Value::String(s) => Some(matches!(s.as_str(), "true" | "yes" | "on" | "1")),
-        serde_yaml::Value::Number(n) => Some(n.as_i64().unwrap_or(0) != 0),
-        _ => None,
-    })
     .unwrap_or(false)
 }
 
 fn section_filename(subtitle: &SubtitleInfo) -> String {
     format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle)
+}
+
+fn create_cache_dir(section_dir: &Path) -> Result<Option<PathBuf>> {
+    if crate::compat::load_local_setting_list("economy")
+        .iter()
+        .any(|v| v == "nosave_diff")
+    {
+        return Ok(None);
+    }
+    let cache_dir = section_dir
+        .join(types::CACHE_SAVE_DIR)
+        .join(chrono::Local::now().format("%Y.%m.%d@%H.%M.%S").to_string());
+    std::fs::create_dir_all(&cache_dir)?;
+    Ok(Some(cache_dir))
+}
+
+fn move_to_cache_dir(section_dir: &Path, cache_dir: Option<&Path>, subtitle: &SubtitleInfo) -> Result<()> {
+    let Some(cache_dir) = cache_dir else {
+        return Ok(());
+    };
+    let path = section_dir.join(section_filename(subtitle));
+    move_file_to_dir(&path, cache_dir)
+}
+
+fn remove_cache_dir_if_empty(cache_dir: Option<&Path>) -> Result<()> {
+    if let Some(cache_dir) = cache_dir {
+        remove_dir_if_empty(cache_dir)?;
+    }
+    Ok(())
+}
+
+fn sections_latest_update_time(subtitles: &[SubtitleInfo], key: &str, subkey: Option<&str>) -> Option<DateTime<Utc>> {
+    let mut latest: Option<DateTime<Utc>> = None;
+    for subtitle in subtitles {
+        let value = match key {
+            "subupdate" => subtitle.subupdate.as_deref().unwrap_or_else(|| {
+                if subkey == Some("subdate") {
+                    subtitle.subdate.as_str()
+                } else {
+                    ""
+                }
+            }),
+            _ => subtitle.subdate.as_str(),
+        };
+        let Some(parsed) = parse_loose_datetime(value) else {
+            continue;
+        };
+        if latest.is_none_or(|current| parsed > current) {
+            latest = Some(parsed);
+        }
+    }
+    latest
 }
 
 fn parse_loose_datetime(value: &str) -> Option<DateTime<Utc>> {
@@ -162,6 +223,20 @@ fn date_string_is_newer(latest: &str, old: &str) -> bool {
 fn date_string_to_ymd(value: &str) -> Option<String> {
     let dt = parse_loose_datetime(value)?;
     Some(format!("{:04}{:02}{:02}", dt.year(), dt.month(), dt.day()))
+}
+
+fn sanitize_site_tags(raw: &str) -> Vec<String> {
+    let cleaned = crate::downloader::html::sanitize_text(raw)
+        .replace("キーワードが設定されていません", "")
+        .replace("キーワード", "");
+    let regex_meta = Regex::new(r#"\"?\(\?\.\+\?\)\"?|\(\?<?[^)]*\)"#).expect("valid regex");
+    let cleaned = regex_meta.replace_all(&cleaned, "").to_string();
+    cleaned
+        .split([' ', '　'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect()
 }
 
 fn section_timestamp_ymd(path: &PathBuf, download_time: Option<&str>) -> Option<String> {
@@ -364,22 +439,65 @@ impl Downloader {
         ))
     }
 
-    fn handle_over18(&self, setting: &SiteSetting, body: &str) -> Option<String> {
-        if !setting.confirm_over18 {
-            return None;
+    fn process_digest(
+        &self,
+        existing_id: Option<i64>,
+        toc_url: &str,
+        novel_dir: &Path,
+        title: &str,
+        latest_story: &str,
+        old_count: usize,
+        latest_count: usize,
+    ) -> Result<bool> {
+        if latest_count >= old_count {
+            return Ok(false);
         }
-        let patterns = [
-            r"(?i)over.?18|age.?verification|年齢確認",
-            r"(?i)<form[^>]*>.*?</form>",
-        ];
-        for pattern in &patterns {
-            if let Ok(re) = regex::Regex::new(pattern) {
-                if re.is_match(body) {
-                    return Some("over18=yes".to_string());
+
+        let mut message = format!(
+            "更新後の話数が保存されている話数より減少していることを検知しました。\nダイジェスト化されている可能性があるので、更新に関しての処理を選択して下さい。\n\n保存済み話数: {}\n更新後の話数: {}\n\n",
+            old_count, latest_count
+        );
+
+        loop {
+            match crate::compat::choose_digest_action(title, &message) {
+                crate::compat::DigestChoice::Update => return Ok(false),
+                crate::compat::DigestChoice::Cancel => return Ok(true),
+                crate::compat::DigestChoice::CancelAndFreeze => {
+                    if let Some(id) = existing_id {
+                        let _ = crate::compat::set_frozen_state(id, true);
+                    }
+                    return Ok(true);
+                }
+                crate::compat::DigestChoice::Backup => {
+                    let backup_name = crate::compat::create_backup(novel_dir, title)?;
+                    println!("{} を作成しました", backup_name);
+                }
+                crate::compat::DigestChoice::ShowStory => {
+                    println!("あらすじ");
+                    println!("{}", latest_story);
+                }
+                crate::compat::DigestChoice::OpenBrowser => {
+                    crate::compat::open_browser(toc_url);
+                }
+                crate::compat::DigestChoice::OpenFolder => {
+                    crate::compat::open_directory(novel_dir, None);
+                }
+                crate::compat::DigestChoice::Convert => {
+                    if let Some(id) = existing_id {
+                        let author = crate::db::with_database(|db| {
+                            Ok(db.get(id).map(|record| record.author.clone()).unwrap_or_default())
+                        })
+                        .unwrap_or_default();
+                        let _ = crate::compat::convert_existing_novel(id, title, &author, novel_dir, false);
+                    }
                 }
             }
+
+            if std::io::stdin().is_terminal() {
+                message.clear();
+            }
+            let _ = std::io::stdout().flush();
         }
-        None
     }
 
     fn download_illustration(
@@ -489,6 +607,26 @@ impl Downloader {
             setting.interpolate_with_captures(&setting.toc_url, &url_captures)
         };
         let toc_source = fetch_toc(&mut self.fetcher, &setting, &toc_url)?;
+        if setting.confirm_over18 && !load_global_setting_bool("over18") {
+            if !crate::compat::confirm("年齢認証：あなたは18歳以上ですか", false, false) {
+                return Ok(DownloadResult {
+                    id: existing_id.unwrap_or(0),
+                    title: String::new(),
+                    author: String::new(),
+                    novel_dir: PathBuf::new(),
+                    new_novel: existing_id.is_none(),
+                    new_arrivals: false,
+                    new_arrival_subtitles: Vec::new(),
+                    updated_count: 0,
+                    total_count: 0,
+                    status: UpdateStatus::Canceled,
+                    title_changed: false,
+                    author_changed: false,
+                    story_changed: false,
+                    sections_deleted: false,
+                });
+            }
+        }
 
         let info = self.load_novel_info(&setting, &toc_source, &url_captures)?;
 
@@ -558,10 +696,53 @@ impl Downloader {
         let old_story = old_toc.as_ref().and_then(|t| t.story.clone());
         let old_section_count = old_toc.as_ref().map(|t| t.subtitles.len()).unwrap_or(0);
 
+        let fetched_story = info.story.clone();
+        let digest_story = old_story.clone().or_else(|| fetched_story.clone()).unwrap_or_default();
+        if !force && old_section_count > subtitles.len() {
+            let title_for_digest = if title.is_empty() {
+                old_title.clone().unwrap_or_default()
+            } else {
+                title.clone()
+            };
+            if self.process_digest(
+                existing_id,
+                &toc_url,
+                &novel_dir,
+                &title_for_digest,
+                &digest_story,
+                old_section_count,
+                subtitles.len(),
+            )? {
+                return Ok(DownloadResult {
+                    id: existing_id.unwrap_or(0),
+                    title: title_for_digest,
+                    author: if author.is_empty() {
+                        old_author.clone().unwrap_or_default()
+                    } else {
+                        author.clone()
+                    },
+                    novel_dir,
+                    new_novel: existing_id.is_none(),
+                    new_arrivals: false,
+                    new_arrival_subtitles: Vec::new(),
+                    updated_count: 0,
+                    total_count: subtitles.len(),
+                    status: UpdateStatus::Canceled,
+                    title_changed: false,
+                    author_changed: false,
+                    story_changed: false,
+                    sections_deleted: true,
+                });
+            }
+        }
+
         let mut updated_count = 0usize;
+        let mut new_arrivals = existing_id.is_none();
+        let mut new_arrival_subtitles = Vec::new();
         let total = subtitles.len() as u64;
         let mut final_subtitles = Vec::with_capacity(subtitles.len());
         let strong_update = load_local_setting_bool("update.strong");
+        let mut cache_dir: Option<PathBuf> = None;
 
         if let Some(ref p) = self.progress {
             p.set_length(total);
@@ -569,6 +750,9 @@ impl Downloader {
         }
 
         for subtitle in &subtitles {
+            let latest_section_path = section_dir.join(section_filename(subtitle));
+            let is_new_arrival = !latest_section_path.exists();
+
             if let Some(ref p) = self.progress {
                 p.set_message(&format!(
                     "DL {} [{}/{}]",
@@ -603,6 +787,12 @@ impl Downloader {
                         &toc_url,
                     )?
                 };
+                if latest_section_path.exists() {
+                    if cache_dir.is_none() {
+                        cache_dir = create_cache_dir(&section_dir)?;
+                    }
+                    move_to_cache_dir(&section_dir, cache_dir.as_deref(), subtitle)?;
+                }
                 save_section_file(&section_dir, subtitle, &section)?;
                 save_raw_file(&raw_dir, subtitle, &raw_html)?;
                 updated_count += 1;
@@ -615,12 +805,18 @@ impl Downloader {
 
             let mut sub = subtitle.clone();
             sub.download_time = download_time;
+            if needs_download && is_new_arrival {
+                new_arrivals = true;
+                new_arrival_subtitles.push(sub.clone());
+            }
             final_subtitles.push(sub);
 
             if let Some(ref p) = self.progress {
                 p.inc(1);
             }
         }
+
+        remove_cache_dir_if_empty(cache_dir.as_deref())?;
 
         if let Some(ref p) = self.progress {
             p.finish_with_message(&format!(
@@ -644,7 +840,6 @@ impl Downloader {
         let title_changed = !title.is_empty() && old_title_for_compare.as_deref() != Some(&title);
         let author_changed =
             !author.is_empty() && old_author_for_compare.as_deref() != Some(&author);
-        let fetched_story = info.story.clone();
         let story_changed = story_changed(&old_story, &fetched_story);
         let new_story = if story_changed {
             fetched_story
@@ -708,6 +903,21 @@ impl Downloader {
             convert_failure: false,
         };
 
+        let auto_add_tags = load_local_setting_bool("auto-add-tags");
+        let mut merged_tags = existing_record
+            .as_ref()
+            .map(|record| record.tags.clone())
+            .unwrap_or_default();
+        if auto_add_tags {
+            if let Some(raw_tags) = setting.resolve_info_pattern("tags", &toc_source) {
+                for tag in sanitize_site_tags(&raw_tags) {
+                    if !merged_tags.contains(&tag) {
+                        merged_tags.push(tag);
+                    }
+                }
+            }
+        }
+
         let id = crate::db::with_database_mut(|db| {
             let id = if let Some(eid) = existing_id {
                 if let Some(existing) = db.get(eid) {
@@ -735,12 +945,16 @@ impl Downloader {
                     updated.domain = record.domain.clone();
                     updated.suspend = false;
                     updated.is_narou = record.is_narou;
+                    if !merged_tags.is_empty() {
+                        updated.tags = merged_tags.clone();
+                    }
                     db.insert(updated);
                     eid
                 } else {
                     let new_id = db.create_new_id();
                     let mut rec = record;
                     rec.id = new_id;
+                    rec.tags = merged_tags.clone();
                     db.insert(rec);
                     new_id
                 }
@@ -748,6 +962,7 @@ impl Downloader {
                 let new_id = db.create_new_id();
                 let mut rec = record;
                 rec.id = new_id;
+                rec.tags = merged_tags.clone();
                 db.insert(rec);
                 new_id
             };
@@ -774,6 +989,8 @@ impl Downloader {
             author: toc_author.clone(),
             novel_dir,
             new_novel: existing_id.is_none(),
+            new_arrivals,
+            new_arrival_subtitles,
             updated_count,
             total_count: subtitles.len(),
             status,

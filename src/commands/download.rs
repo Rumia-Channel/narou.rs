@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use indicatif::MultiProgress;
 
-use narou_rs::converter::NovelConverter;
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
+use narou_rs::converter::NovelConverter;
 use narou_rs::downloader::{Downloader, TargetType, UpdateStatus};
 use narou_rs::progress::CliProgress;
 
@@ -88,9 +88,12 @@ pub fn cmd_download(opts: DownloadOptions) {
                 Ok(dl) => {
                     print_download_status(&multi_clone, &dl);
 
-                    if dl.status != UpdateStatus::Ok {
-                        mistook += 1;
-                        continue;
+                    match dl.status {
+                        UpdateStatus::Ok => {}
+                        UpdateStatus::None | UpdateStatus::Failed | UpdateStatus::Canceled => {
+                            mistook += 1;
+                            continue;
+                        }
                     }
 
                     if opts.no_convert {
@@ -103,6 +106,9 @@ pub fn cmd_download(opts: DownloadOptions) {
                     }
                 }
                 Err(e) => {
+                    if matches!(e, narou_rs::error::NarouError::SuspendDownload(_)) {
+                        std::panic::resume_unwind(Box::new(e.to_string()));
+                    }
                     let _ = multi_clone.println(format!("  Error: {}", e));
                     mistook += 1;
                 }
@@ -415,6 +421,12 @@ fn print_download_status(multi: &Arc<MultiProgress>, dl: &narou_rs::downloader::
         }
         UpdateStatus::None => {
             let _ = multi.println(format!("{} に更新はありません", dl.title));
+        }
+        UpdateStatus::Canceled => {
+            let _ = multi.println(format!(
+                "ID:{} {} の更新はキャンセルされました",
+                dl.id, dl.title
+            ));
         }
         UpdateStatus::Failed => {}
     }

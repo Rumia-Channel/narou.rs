@@ -209,6 +209,25 @@ impl NovelConverter {
         ))
     }
 
+    pub fn convert_subtitles_for_hotentry(
+        &mut self,
+        toc: &TocObject,
+        subtitles: &[crate::downloader::SubtitleInfo],
+        novel_dir: &std::path::Path,
+    ) -> Result<String> {
+        let sections = load_sections_from_dir(novel_dir, subtitles)?;
+        let empty_toc = TocObject {
+            title: toc.title.clone(),
+            author: toc.author.clone(),
+            toc_url: toc.toc_url.clone(),
+            story: None,
+            subtitles: subtitles.to_vec(),
+            novel_type: toc.novel_type,
+        };
+        let aozora_text = self.convert_novel(&empty_toc, &sections)?;
+        Ok(strip_book_header_and_footer(&aozora_text))
+    }
+
     fn make_converter(&self) -> converter_base::ConverterBase {
         if let Some(ref uc) = self.user_converter {
             converter_base::ConverterBase::with_user_converter(self.settings.clone(), uc.clone())
@@ -350,4 +369,32 @@ fn load_sections_from_dir(
     }
 
     Ok(sections)
+}
+
+fn strip_book_header_and_footer(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(first_page_break) = lines.iter().position(|line| *line == "［＃改ページ］")
+    else {
+        return text.to_string();
+    };
+
+    let mut start = first_page_break;
+    while start > 0 && lines[start - 1].is_empty() {
+        start -= 1;
+    }
+
+    let mut end = lines.len();
+    while end > start && lines[end - 1].is_empty() {
+        end -= 1;
+    }
+
+    let footer = "［＃ここから地付き］［＃小書き］（本を読み終わりました）［＃小書き終わり］［＃ここで地付き終わり］";
+    if end > start && lines[end - 1] == footer {
+        end -= 1;
+        while end > start && lines[end - 1].is_empty() {
+            end -= 1;
+        }
+    }
+
+    lines[start..end].join("\n")
 }

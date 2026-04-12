@@ -1,3 +1,4 @@
+pub mod compat;
 pub mod converter;
 pub mod db;
 pub mod downloader;
