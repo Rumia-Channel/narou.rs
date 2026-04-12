@@ -17,8 +17,8 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 
-use crate::db::DATABASE;
 use crate::db::novel_record::NovelRecord;
+use crate::db::DATABASE;
 use crate::error::{NarouError, Result};
 use crate::progress::ProgressReporter;
 
@@ -28,15 +28,14 @@ use self::novel_info::NovelInfo;
 use self::persistence::{
     ensure_default_files, load_toc_file, save_raw_file, save_section_file, save_toc_file,
 };
-use self::section::{SectionCache, download_section};
+use self::section::{download_section, SectionCache};
 use self::site_setting::SiteSetting;
 use self::toc::{create_short_story_subtitles, fetch_toc, parse_subtitles_multipage};
 use self::util::sanitize_filename;
 
 pub use self::types::{
-    ARCHIVE_ROOT_DIR, DownloadResult, NarouApiEntry, NarouApiResult, RAW_DATA_DIR,
-    SECTION_SAVE_DIR, SectionElement, SectionFile, SubtitleInfo, TargetType, TocFile, TocObject,
-    UpdateStatus,
+    DownloadResult, NarouApiEntry, NarouApiResult, SectionElement, SectionFile, SubtitleInfo,
+    TargetType, TocFile, TocObject, UpdateStatus, ARCHIVE_ROOT_DIR, RAW_DATA_DIR, SECTION_SAVE_DIR,
 };
 pub use self::util::pretreatment_source;
 
@@ -284,6 +283,14 @@ impl Downloader {
     }
 
     pub fn download_novel(&mut self, target: &str) -> Result<DownloadResult> {
+        self.download_novel_with_force(target, false)
+    }
+
+    pub fn download_novel_with_force(
+        &mut self,
+        target: &str,
+        force: bool,
+    ) -> Result<DownloadResult> {
         let (existing_id, setting) = self.resolve_target_for_download(target)?;
 
         let db_toc_url = if let Some(id) = existing_id {
@@ -376,20 +383,24 @@ impl Downloader {
                 ));
             }
 
-            let needs_download = match old_subtitles.get(&subtitle.index) {
-                Some(old) => {
-                    let subtitle_changed = subtitle.subtitle != old.subtitle;
-                    let date_changed =
-                        subtitle.subdate != old.subdate || subtitle.subupdate != old.subupdate;
-                    let file_missing = !section_dir
-                        .join(format!(
-                            "{} {}.yaml",
-                            subtitle.index, subtitle.file_subtitle
-                        ))
-                        .exists();
-                    subtitle_changed || date_changed || file_missing
+            let needs_download = if force {
+                true
+            } else {
+                match old_subtitles.get(&subtitle.index) {
+                    Some(old) => {
+                        let subtitle_changed = subtitle.subtitle != old.subtitle;
+                        let date_changed =
+                            subtitle.subdate != old.subdate || subtitle.subupdate != old.subupdate;
+                        let file_missing = !section_dir
+                            .join(format!(
+                                "{} {}.yaml",
+                                subtitle.index, subtitle.file_subtitle
+                            ))
+                            .exists();
+                        subtitle_changed || date_changed || file_missing
+                    }
+                    None => true,
                 }
-                None => true,
             };
 
             let download_time = if needs_download {
@@ -580,10 +591,17 @@ impl Downloader {
                     };
                     Ok((Some(id), setting))
                 } else {
-                    Err(NarouError::NotFound(format!(
-                        "Novel not found for ncode: {} (use URL for new downloads)",
-                        ncode
-                    )))
+                    let narou_url = format!("https://ncode.syosetu.com/{}/", ncode);
+                    let setting = self.find_site_setting(&narou_url).ok_or_else(|| {
+                        NarouError::InvalidTarget(format!("対応外のncodeです({})", ncode))
+                    })?;
+                    let existing_id = crate::db::with_database(|db| {
+                        let toc_url = setting.toc_url();
+                        Ok(db.get_by_toc_url(&toc_url).map(|r| r.id))
+                    })
+                    .ok()
+                    .flatten();
+                    Ok((existing_id, setting))
                 }
             }
             TargetType::Id => {
@@ -713,6 +731,10 @@ impl Downloader {
 
     pub fn set_progress(&mut self, progress: Box<dyn ProgressReporter>) {
         self.progress = Some(progress);
+    }
+
+    pub fn site_setting_matches_url(&self, url: &str) -> bool {
+        self.find_site_setting(url).is_some()
     }
 
     pub fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {

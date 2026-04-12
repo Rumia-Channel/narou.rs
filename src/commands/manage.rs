@@ -135,20 +135,60 @@ pub fn cmd_remove(targets: &[String]) {
             continue;
         };
 
-        let result = db::with_database_mut(|db| {
-            if let Some(record) = db.remove(id) {
-                let dir = db::existing_novel_dir_for_record(db.archive_root(), &record);
-                let _ = std::fs::remove_dir_all(&dir);
-                db.save()?;
-                Ok::<String, narou_rs::error::NarouError>(record.title)
-            } else {
-                Err(narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))
-            }
-        });
+        remove_by_id(id);
+    }
+}
 
-        match result {
-            Ok(title) => println!("  Removed: {} (ID: {})", title, id),
-            Err(e) => eprintln!("  Error: {}", e),
+pub fn freeze_by_target(target: &str) {
+    use narou_rs::db;
+
+    let Some(id) = resolve_target_to_id(target) else {
+        return;
+    };
+
+    let result = db::with_database_mut(|db| {
+        let record = db
+            .get(id)
+            .cloned()
+            .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
+        let mut updated = record;
+        if !updated.tags.contains(&"frozen".to_string()) {
+            updated.tags.push("frozen".to_string());
         }
+        db.insert(updated);
+        db.save()
+    });
+
+    match result {
+        Ok(()) => println!("  Froze ID: {}", id),
+        Err(e) => eprintln!("  Error: {}", e),
+    }
+}
+
+pub fn remove_by_target(target: &str) {
+    let Some(id) = resolve_target_to_id(target) else {
+        return;
+    };
+
+    remove_by_id(id);
+}
+
+fn remove_by_id(id: i64) {
+    use narou_rs::db;
+
+    let result = db::with_database_mut(|db| {
+        if let Some(record) = db.remove(id) {
+            let dir = db::existing_novel_dir_for_record(db.archive_root(), &record);
+            let _ = std::fs::remove_dir_all(&dir);
+            db.save()?;
+            Ok::<String, narou_rs::error::NarouError>(record.title)
+        } else {
+            Err(narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))
+        }
+    });
+
+    match result {
+        Ok(title) => println!("  Removed: {} (ID: {})", title, id),
+        Err(e) => eprintln!("  Error: {}", e),
     }
 }

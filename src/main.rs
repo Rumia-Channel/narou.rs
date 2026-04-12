@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 
+use std::io::IsTerminal;
 use std::time::Instant;
 
 use clap::Parser;
@@ -90,14 +91,28 @@ fn run_sync_command(command: Commands, user_agent: Option<String>, backtrace: bo
                 0
             }
         }
-        Commands::Download { targets } => {
-            if targets.is_empty() {
+        Commands::Download {
+            targets,
+            force,
+            no_convert,
+            freeze,
+            remove,
+            mail,
+        } => {
+            if targets.is_empty() && !std::io::stdin().is_terminal() {
                 eprintln!("Usage: narou download <url|ncode|id>...");
-                1
-            } else {
-                commands::download::cmd_download(&targets, user_agent);
-                0
+                return 1;
             }
+            commands::download::cmd_download(commands::download::DownloadOptions {
+                targets,
+                force,
+                no_convert,
+                freeze,
+                remove,
+                mail,
+                user_agent,
+            });
+            0
         }
         Commands::Update {
             ids,

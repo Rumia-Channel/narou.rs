@@ -72,7 +72,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | コマンド | narou.rb | Rust 完了度 | 備考 |
 |---------|:--------:|:-----------:|------|
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
-| `download` | ✅ | 🟡 部分 | `--force`, `--no-convert`, `--freeze` 不足 |
+| `download` | ✅ | 🟡 部分 | `--mail` 未実装（メール機能自体未実装のため） |
 | `update` | ✅ | 🟡 部分 | `--gl`, `--convert-only-new-arrival` 不足 |
 | `convert` | ✅ | 🟡 部分 | `--device`, `--no-epub`, `--output` 等不足 |
 | `list` | ✅ | 🟡 部分 | `--latest`, `--reverse`, `--url`, `--filter` 等不足 |
@@ -119,17 +119,30 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 
 | オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
 |-----------|------|-----|-----------|------|:----:|
-| `--force` | `-f` | flag | false | 全話強制再DL | ❌ |
-| `--no-convert` | `-n` | flag | false | DLのみ、変換スキップ | ❌ |
-| `--freeze` | `-z` | flag | false | DL後に凍結 | ❌ |
-| `--remove` | `-r` | flag | false | DL後に削除(変換+送信のみ) | ❌ |
+| `--force` | `-f` | flag | false | 全話強制再DL | ✅ |
+| `--no-convert` | `-n` | flag | false | DLのみ、変換スキップ | ✅ |
+| `--freeze` | `-z` | flag | false | DL後に凍結 | ✅ |
+| `--remove` | `-r` | flag | false | DL後に削除(変換+送信のみ) | ✅ |
 | `--mail` | `-m` | flag | false | DL後にメール送信 | ❌ |
 | targets | | Vec\<String\> | — | URL/Nコード/ID/タイトル | ✅ |
 
+**実装済み動作**:
+- `-f`/`--force`: 全話強制再ダウンロード (`Downloader::download_novel_with_force`)
+- `-n`/`--no-convert`: 変換スキップ
+- `-z`/`--freeze`: DL完了後に自動凍結 (`--freeze` は `--remove` より優先)
+- `-r`/`--remove`: DL+変換後にDBから削除（ファイルは残る）
+- 引数なしでインタラクティブモード (stdin から URL 入力、TTY時のみ)
+- 凍結チェック: 凍結済み小説はスキップ
+- ダウンロード済みチェック: 既存小説はスキップ（`--force`で上書き）
+- タグ展開: `tag:NAME` → 該当IDに展開、`^tag:NAME` → 補集合
+- `tagname_to_ids`: ID優先、未登録はタグ名として展開
+- `mistook_count` 追跡 → 終了コード反映
+- 複数ターゲット間の水平線セパレータ
+- 有効ターゲット検証: Nコード or URL(サイト設定マッチ)
+
 **不足動作**:
-- 引数なしでインタラクティブモード (stdin から URL 入力)
-- `--freeze` で DL 完了後に自動凍結
-- `--remove` で DL+変換+送信後に元データ削除 (economy 設定の一部)
+- `--mail`: メール送信機能自体が未実装のためスタブ
+- 再ダウンロード確認プロンプト (Ruby: `Narou::Input.confirm("再ダウンロードしますか")`)
 
 ---
 

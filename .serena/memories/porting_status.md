@@ -23,7 +23,7 @@
 | コマンド | 完了度 | 備考 |
 |---------|:------:|------|
 | `init` | ✅ 完了 | AozoraEpub3 設定含め完全 |
-| `download` | 🟡 部分 | `--force`, `--no-convert`, `--freeze` 不足 |
+| `download` | 🟡 部分 | `--force`/`-f`, `--no-convert`/`-n`, `--freeze`/`-z`, `--remove`/`-r` 実装済み。`--mail`/`-m` スタブ。インタラクティブモード実装済み。 |
 | `update` | 🟡 部分 | `--all/--force/--no-convert/--sort-by` 実装済。`--gl`, `--convert-only-new-arrival`, `--ignore-all` 不足 |
 | `convert` | 🟡 部分 | `--device`, `--no-epub`, `--output` 等不足 |
 | `list` | 🟡 部分 | `--latest`, `--reverse`, `--url`, `--filter` 等不足 |
@@ -37,7 +37,7 @@
 | `mail` | ❌ 未実装 | Send-to-Kindle |
 | `backup` | ❌ 未実装 | ZIP バックアップ |
 | `clean` | ❌ 未実装 | ゴミファイル削除 |
-| `help` | ❌ 未実装 | clap --help のみ |
+| `help` | ✅ 完了 | メインヘルプ + 各コマンド -h 完全対応 |
 | `version` | ❌ 未実装 | clap --version のみ |
 | `log` | ❌ 未実装 | ログ表示 |
 | `folder` | ❌ 未実装 | フォルダを開く |

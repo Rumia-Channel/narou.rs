@@ -238,6 +238,16 @@ pub enum Commands {
     },
     Download {
         targets: Vec<String>,
+        #[arg(short = 'f', long)]
+        force: bool,
+        #[arg(short = 'n', long)]
+        no_convert: bool,
+        #[arg(short = 'z', long)]
+        freeze: bool,
+        #[arg(short = 'r', long)]
+        remove: bool,
+        #[arg(short = 'm', long)]
+        mail: bool,
     },
     Update {
         ids: Option<Vec<String>>,

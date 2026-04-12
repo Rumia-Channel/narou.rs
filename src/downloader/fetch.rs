@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use reqwest::header::{
-    ACCEPT, ACCEPT_CHARSET, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONNECTION, HeaderMap, HeaderValue,
+    HeaderMap, HeaderValue, ACCEPT, ACCEPT_CHARSET, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONNECTION,
 };
 
 use crate::error::{NarouError, Result};
