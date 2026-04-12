@@ -120,25 +120,36 @@ pub fn cmd_update(opts: UpdateOptions) {
                     print_status_messages(&multi_clone, &dl);
 
                     let new_arrivals = dl.updated_count > 0 || dl.new_novel;
-
-                    if opts.no_convert {
-                        std::thread::sleep(std::time::Duration::from_secs_f64(FORCE_WAIT_SECS));
-                        continue;
-                    }
-
-                    if convert_only_new_arrival && !new_arrivals {
-                        std::thread::sleep(std::time::Duration::from_secs_f64(FORCE_WAIT_SECS));
-                        continue;
-                    }
-
-                    let should_convert = dl.status == UpdateStatus::Ok;
                     let has_convert_failure = narou_rs::db::with_database(|db| {
                         Ok(db.get(dl.id).map(|r| r.convert_failure).unwrap_or(false))
                     })
                     .unwrap_or(false);
 
-                    if !should_convert && !has_convert_failure {
-                        continue;
+                    match dl.status {
+                        UpdateStatus::Ok => {
+                            if opts.no_convert {
+                                std::thread::sleep(std::time::Duration::from_secs_f64(
+                                    FORCE_WAIT_SECS,
+                                ));
+                                continue;
+                            }
+
+                            if convert_only_new_arrival && !new_arrivals {
+                                std::thread::sleep(std::time::Duration::from_secs_f64(
+                                    FORCE_WAIT_SECS,
+                                ));
+                                continue;
+                            }
+                        }
+                        UpdateStatus::None => {
+                            if !has_convert_failure {
+                                continue;
+                            }
+                        }
+                        UpdateStatus::Failed => {
+                            mistook += 1;
+                            continue;
+                        }
                     }
 
                     if has_convert_failure {

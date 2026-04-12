@@ -15,7 +15,7 @@ pub mod util;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
 
 use crate::db::DATABASE;
 use crate::db::novel_record::NovelRecord;
@@ -26,7 +26,8 @@ use self::fetch::HttpFetcher;
 use self::narou_api::narou_api_batch_update;
 use self::novel_info::NovelInfo;
 use self::persistence::{
-    ensure_default_files, load_toc_file, save_raw_file, save_section_file, save_toc_file,
+    compute_section_hash, ensure_default_files, load_section_file, load_toc_file, save_raw_file,
+    save_section_file, save_toc_file,
 };
 use self::section::{SectionCache, download_section};
 use self::site_setting::SiteSetting;
@@ -81,6 +82,98 @@ fn normalize_story_for_compare(story: &str) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+
+fn load_local_setting_bool(key: &str) -> bool {
+    crate::db::with_database(|db| {
+        let settings: HashMap<String, serde_yaml::Value> = db
+            .inventory()
+            .load("local_setting", crate::db::inventory::InventoryScope::Local)?;
+        Ok(settings.get(key).cloned())
+    })
+    .ok()
+    .flatten()
+    .and_then(|value| match value {
+        serde_yaml::Value::Bool(b) => Some(b),
+        serde_yaml::Value::String(s) => Some(matches!(s.as_str(), "true" | "yes" | "on" | "1")),
+        serde_yaml::Value::Number(n) => Some(n.as_i64().unwrap_or(0) != 0),
+        _ => None,
+    })
+    .unwrap_or(false)
+}
+
+fn section_filename(subtitle: &SubtitleInfo) -> String {
+    format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle)
+}
+
+fn parse_loose_datetime(value: &str) -> Option<DateTime<Utc>> {
+    let mut value = value.trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+
+    value = value
+        .replace('年', "/")
+        .replace('月', "/")
+        .replace('日', "")
+        .replace('時', ":")
+        .replace('分', ":")
+        .replace('秒', "");
+    value = value.trim().trim_end_matches(':').to_string();
+
+    if let Ok(ts) = value.parse::<i64>() {
+        return DateTime::from_timestamp(ts, 0);
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(&value) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(dt) = DateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S%.f %z") {
+        return Some(dt.with_timezone(&Utc));
+    }
+
+    let formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y/%m/%d",
+    ];
+
+    for fmt in &formats {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(&value, fmt) {
+            return Some(dt.and_utc());
+        }
+        if let Ok(date) = NaiveDate::parse_from_str(&value, fmt) {
+            return date.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+        }
+    }
+
+    None
+}
+
+fn date_string_is_newer(latest: &str, old: &str) -> bool {
+    match (parse_loose_datetime(latest), parse_loose_datetime(old)) {
+        (Some(latest_dt), Some(old_dt)) => latest_dt > old_dt,
+        _ => latest > old,
+    }
+}
+
+fn date_string_to_ymd(value: &str) -> Option<String> {
+    let dt = parse_loose_datetime(value)?;
+    Some(format!("{:04}{:02}{:02}", dt.year(), dt.month(), dt.day()))
+}
+
+fn section_timestamp_ymd(path: &PathBuf, download_time: Option<&str>) -> Option<String> {
+    if let Some(download_time) = download_time
+        && let Some(ymd) = date_string_to_ymd(download_time)
+    {
+        return Some(ymd);
+    }
+
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let dt = DateTime::<Utc>::from(modified);
+    Some(format!("{:04}{:02}{:02}", dt.year(), dt.month(), dt.day()))
 }
 
 impl Downloader {
@@ -468,6 +561,7 @@ impl Downloader {
         let mut updated_count = 0usize;
         let total = subtitles.len() as u64;
         let mut final_subtitles = Vec::with_capacity(subtitles.len());
+        let strong_update = load_local_setting_bool("update.strong");
 
         if let Some(ref p) = self.progress {
             p.set_length(total);
@@ -484,34 +578,31 @@ impl Downloader {
                 ));
             }
 
-            let needs_download = if force {
-                true
+            let (needs_download, predownloaded) = if force {
+                (true, None)
             } else {
-                match old_subtitles.get(&subtitle.index) {
-                    Some(old) => {
-                        let subtitle_changed = subtitle.subtitle != old.subtitle;
-                        let date_changed =
-                            subtitle.subdate != old.subdate || subtitle.subupdate != old.subupdate;
-                        let file_missing = !section_dir
-                            .join(format!(
-                                "{} {}.yaml",
-                                subtitle.index, subtitle.file_subtitle
-                            ))
-                            .exists();
-                        subtitle_changed || date_changed || file_missing
-                    }
-                    None => true,
-                }
+                self.section_needs_download(
+                    &setting,
+                    subtitle,
+                    old_subtitles.get(&subtitle.index).copied(),
+                    &section_dir,
+                    &toc_url,
+                    strong_update,
+                )?
             };
 
             let download_time = if needs_download {
-                let (section, raw_html) = download_section(
-                    &mut self.fetcher,
-                    &mut self.section_cache,
-                    &setting,
-                    subtitle,
-                    &toc_url,
-                )?;
+                let (section, raw_html) = if let Some(downloaded) = predownloaded {
+                    downloaded
+                } else {
+                    download_section(
+                        &mut self.fetcher,
+                        &mut self.section_cache,
+                        &setting,
+                        subtitle,
+                        &toc_url,
+                    )?
+                };
                 save_section_file(&section_dir, subtitle, &section)?;
                 save_raw_file(&raw_dir, subtitle, &raw_html)?;
                 updated_count += 1;
@@ -691,6 +782,84 @@ impl Downloader {
             story_changed,
             sections_deleted,
         })
+    }
+
+    fn section_needs_download(
+        &mut self,
+        setting: &SiteSetting,
+        latest: &SubtitleInfo,
+        old: Option<&SubtitleInfo>,
+        section_dir: &PathBuf,
+        toc_url: &str,
+        strong_update: bool,
+    ) -> Result<(bool, Option<(SectionElement, String)>)> {
+        let Some(old) = old else {
+            return Ok((true, None));
+        };
+
+        if old.subtitle != latest.subtitle || old.chapter != latest.chapter {
+            return Ok((true, None));
+        }
+
+        let old_section_path = section_dir.join(section_filename(old));
+        if !old_section_path.exists() {
+            return Ok((true, None));
+        }
+
+        let latest_subupdate = latest.subupdate.as_deref();
+        let mut old_subupdate = old.subupdate.as_deref();
+        if latest_subupdate.is_some() && old_subupdate.is_none() {
+            old_subupdate = Some(old.subdate.as_str());
+        }
+
+        let (date_says_update, strong_basis_date) = if let (
+            Some(old_subupdate),
+            Some(latest_subupdate),
+        ) = (old_subupdate, latest_subupdate)
+        {
+            if old_subupdate.is_empty() {
+                return Ok((!latest_subupdate.is_empty(), None));
+            }
+            (
+                date_string_is_newer(latest_subupdate, old_subupdate),
+                Some(old_subupdate),
+            )
+        } else {
+            if old.subdate.is_empty() {
+                return Ok((true, None));
+            }
+            (
+                date_string_is_newer(&latest.subdate, &old.subdate),
+                Some(old.subdate.as_str()),
+            )
+        };
+
+        if !date_says_update {
+            return Ok((false, None));
+        }
+
+        if strong_update
+            && let Some(basis_date) = strong_basis_date
+            && date_string_to_ymd(basis_date)
+                == section_timestamp_ymd(&old_section_path, old.download_time.as_deref())
+        {
+            let downloaded = download_section(
+                &mut self.fetcher,
+                &mut self.section_cache,
+                setting,
+                latest,
+                toc_url,
+            )?;
+            let new_hash = compute_section_hash(&downloaded.0);
+            let old_hash = load_section_file(&old_section_path)
+                .map(|section| compute_section_hash(&section.element));
+            if old_hash.as_deref() == Some(new_hash.as_str()) {
+                return Ok((false, None));
+            }
+            return Ok((true, Some(downloaded)));
+        }
+
+        Ok((true, None))
     }
 
     fn resolve_target_for_download(&self, target: &str) -> Result<(Option<i64>, SiteSetting)> {
@@ -901,6 +1070,34 @@ mod tests {
     fn sanitize_filename_removes_windows_trailing_dots_and_spaces() {
         assert_eq!(super::util::sanitize_filename("title. "), "title");
         assert_eq!(super::util::sanitize_filename("bad/name?"), "bad_name_");
+    }
+
+    #[test]
+    fn update_date_comparison_uses_newer_dates_not_inequality() {
+        assert!(super::date_string_is_newer(
+            "2026-04-12 10:00",
+            "2026-04-12 09:59"
+        ));
+        assert!(!super::date_string_is_newer(
+            "2026-04-12 09:59",
+            "2026-04-12 10:00"
+        ));
+        assert!(!super::date_string_is_newer(
+            "2026年04月12日 10時00分",
+            "2026-04-12 10:00"
+        ));
+    }
+
+    #[test]
+    fn update_strong_date_basis_matches_ruby_ymd_conversion() {
+        assert_eq!(
+            super::date_string_to_ymd("2026年04月12日 10時00分"),
+            Some("20260412".to_string())
+        );
+        assert_eq!(
+            super::date_string_to_ymd("2026-04-12 10:00:00.123456 +0900"),
+            Some("20260412".to_string())
+        );
     }
 
     #[test]

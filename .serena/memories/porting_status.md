@@ -9,6 +9,8 @@
 - **`webnovel/*.yaml`・`.narou/` 配下のデータ構造**: Ruby 版が読める形式。
 - **最終的な変換出力ファイル**: narou.rb の出力と同一。
 - 内部実装は異なってよい。上記外部互換性を満たす限り自由。
+- Ruby 版の内部手順は外部仕様を抽出するために読む。Rust 側では、外部挙動・データ互換・出力互換を壊さない限り、Ruby の逐語的移植よりも堅牢性、保守性、検証容易性、性能、安全性が高い設計を優先する。
+- Ruby 版に既知の脆さや古い都合がある場合は、同じ外部結果になることをテストやドキュメントで確認した上で、Rust 側ではより良い内部設計を採用する。
 
 ## ⚠ COMMANDS.md 同期ルール
 - `COMMANDS.md` は narou.rb 全24コマンドのオプション・挙動と Rust 側実装状況を管理するマスタードキュメント。
@@ -27,7 +29,7 @@
 |---------|:------:|------|
 | `init` | ✅ 完了 | AozoraEpub3 設定含め完全 |
 | `download` | 🟡 部分 | `--force`/`-f`, `--no-convert`/`-n`, `--freeze`/`-z`, `--remove`/`-r` 実装済み。Nコード指定時の `\k<ncode>` 展開修正済み。`--mail`/`-m` スタブ。インタラクティブモード実装済み。 |
-| `update` | 🟡 部分 | Ruby版ターゲット解決、既存DBのtoc_url/sitename優先、あらすじ正規化比較、freeze.yaml参照、完結タグ同期、`--gl`主要挙動は実装済み。ただし hotentry、`update.strong`、周辺出力/イベント細部が未完 |
+| `update` | 🟡 部分 | Ruby版ターゲット解決、既存DBのtoc_url/sitename優先、あらすじ正規化比較、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較は実装済み。ただし hotentry、差分用 cache 退避、周辺出力/イベント細部が未完 |
 | `convert` | 🟡 部分 | `--device`, `--no-epub`, `--output` 等不足 |
 | `list` | 🟡 部分 | `--latest`, `--reverse`, `--url`, `--filter` 等不足 |
 | `tag` | 🟡 部分 | `--color`, `--clear`, `--list` 不足 |

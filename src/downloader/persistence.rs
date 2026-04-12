@@ -25,14 +25,17 @@ pub fn section_needs_update(
     if !path.exists() {
         return true;
     }
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        if let Ok(existing) = serde_yaml::from_str::<SectionElement>(&content) {
-            let old_hash = compute_section_hash(&existing);
-            let new_hash = compute_section_hash(new_section);
-            return old_hash != new_hash;
-        }
+    if let Some(existing) = load_section_file(&path) {
+        let old_hash = compute_section_hash(&existing.element);
+        let new_hash = compute_section_hash(new_section);
+        return old_hash != new_hash;
     }
     true
+}
+
+pub fn load_section_file(path: &PathBuf) -> Option<SectionFile> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_yaml::from_str(&content).ok()
 }
 
 pub fn save_section_file(
