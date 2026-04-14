@@ -1,5 +1,5 @@
 use narou_rs::mail::{
-    ensure_mail_setting_file, load_mail_setting, send_target_with_setting, MailSettingLoadError,
+    MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
 };
 
 pub struct MailOptions {
@@ -27,7 +27,9 @@ fn cmd_mail_inner(opts: MailOptions) -> Result<(), i32> {
                 1
             })?;
             println!("created {}", path.display());
-            println!("メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。");
+            println!(
+                "メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。"
+            );
             return Ok(());
         }
         Err(MailSettingLoadError::Incomplete(_)) => {

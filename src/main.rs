@@ -1,5 +1,8 @@
+#[macro_use]
+mod output_macros;
 mod cli;
 mod commands;
+mod logger;
 
 use std::io::IsTerminal;
 use std::time::Instant;
@@ -24,8 +27,12 @@ async fn main() {
         }
     }
 
+    logger::init();
+    logger::init_tracing(no_color);
+
     if !args.is_empty() {
         cli::inject_default_args(&mut args);
+        cli::inject_command_defaults(&mut args);
     }
 
     let start = if show_time {
@@ -192,6 +199,18 @@ fn run_sync_command(command: Commands, user_agent: Option<String>, backtrace: bo
             commands::setting::cmd_setting(&args, list, all, burn);
             0
         }
+        Commands::Log {
+            path,
+            num,
+            tail,
+            source_convert,
+        } => match commands::log::cmd_log(path.as_deref(), num, tail, source_convert) {
+            Ok(_) => 0,
+            Err(e) => {
+                commands::log::report_error(&e);
+                127
+            }
+        },
         Commands::Version { more } => {
             commands::version::cmd_version(more);
             0

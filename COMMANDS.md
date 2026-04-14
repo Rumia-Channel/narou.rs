@@ -99,7 +99,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `clean` | ✅ | ❌ 未実装 | |
 | `help` | ✅ | 🟡 部分 | トップレベルは概ね実装済み。各コマンド -h は Ruby版詳細ヘルプとの差分あり |
 | `version` | ✅ | ✅ 完了 | `-v`/`--version` と `--more` を実装。出力順序、help 文言、AozoraEpub3 探索、失敗時メッセージを Ruby 版に揃えた |
-| `log` | ✅ | ❌ 未実装 | |
+| `log` | ✅ | ✅ 完了 | `--num`, `--tail`, `--source-convert`, `<path>` を実装。最新ログ選択、`.narou/local_setting.yaml` の `log.*` 既定値、`*_convert` フィルタも対応 |
 | `folder` | ✅ | ❌ 未実装 | |
 | `browser` | ✅ | ❌ 未実装 | |
 | `alias` | ✅ | ❌ 未実装 | |
@@ -562,7 +562,7 @@ narou setting name         # 読み取り
 **完了扱いにしない理由 / 不足動作**:
 - `help` は未実装コマンド分も narou.rb から移植する方針だが、`narou <command> -h` の詳細文・Examples・Configuration・Variable List が Ruby版 `sample/narou/lib/command/*.rb` と完全一致していない。
 - `setting -h` の `Local Variable List` / `Global Variable List` が省略されている。
-- `list`, `log`, `folder`, `browser`, `backup`, `inspect`, `clean`, `diff`, `send`, `mail`, `alias`, `csv` などで banner、説明文、Examples、Options の省略・改変・追加がある。
+- `list`, `folder`, `browser`, `backup`, `inspect`, `clean`, `diff`, `send`, `mail`, `alias`, `csv` などで banner、説明文、Examples、Options の省略・改変・追加がある。
 - `tag -h` は Ruby版にない `--list` を表示しており、Ruby版 help 互換として要整理。
 
 ---
@@ -579,7 +579,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 18. `log` — ❌ 未実装
+### 18. `log` — ✅ 完了
 
 > 保存したログを表示します
 
@@ -588,12 +588,9 @@ narou setting name         # 読み取り
 | `--num NUM` | `-n` | int | 20 | 表示行数 |
 | `--tail` | `-t` | flag | false | ストリーミング (`tail -f` 相当) |
 | `--source-convert` | `-c` | flag | false | 変換ログを表示 |
-| target | | string | — | ログファイルパス直接指定可 |
+| `<path>` | | string | — | ログファイルパス直接指定可 |
 
-**実装要件**:
-- `logging=true` 設定が必要
-- ログファイルの保存先管理
-- `tail -f` 相当のストリーミング表示
+**Rust 実装**: `src/commands/log.rs` で `narou log` / `-n` / `-t` / `-c` / `<path>` に対応。最新ログは `log/*.txt` を更新日時順で選択し、`.narou/local_setting.yaml` の `log.num` / `log.tail` / `log.source-convert` も既定値として反映。`-c` は Ruby版同様 `*_convert` ログだけを対象にする。
 
 ---
 

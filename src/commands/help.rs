@@ -1,5 +1,7 @@
 use std::io::{self, Write};
 
+use crate::logger;
+
 struct CmdInfo {
     name: &'static str,
     oneline: &'static str,
@@ -152,14 +154,16 @@ fn is_initialized() -> bool {
 }
 
 pub fn cmd_help() {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    logger::without_logging(|| {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
 
-    if is_initialized() {
-        display_help(&mut out);
-    } else {
-        display_help_first_time(&mut out);
-    }
+        if is_initialized() {
+            display_help(&mut out);
+        } else {
+            display_help_first_time(&mut out);
+        }
+    });
 }
 
 fn display_help(out: &mut dyn Write) {
@@ -801,24 +805,35 @@ const CLEAN_HELP: CmdHelp = CmdHelp {
 };
 
 const LOG_HELP: CmdHelp = CmdHelp {
-    banner: "[<target>] [options]",
+    banner: "[options] [<path>]",
     description: "\
-  ・保存したログを表示します。
-  ・logging=true の設定が必要です。
+  ・{{LOG_DIR}} に保存されたログを表示します。
+  ・logging 設定が有効な場合のみ、ログは保存されます。
+  ・<path> を指定しない場合、最新のログが表示されます。
+  ・デフォルトでは末尾20行のログを表示します。
 
   Examples:
-    narou log 0
-    narou log 0 -n 50
-    narou log 0 --tail",
+    narou s logging=true # ログの保存を有効にする
+
+    narou log
+    narou log -n 100     # 100行分のログを表示
+    narou log -t         # tail -f オプションのようにログを流し続ける
+
+    narou log log/narou.txt # 直接ファイルを指定可能
+
+    # concurrency 設定（更新・変換同時実行）が有効時は変換ログが別ファイルに
+    # 分かれるので、変換ログを表示したい場合は -c オプションを付ける
+    # （指定しなかった場合は通常ログの方を表示）
+    narou log -c         # 変換ログを表示",
     options: &[
-        opt(Some("-n"), "--num", Some("NUM"), "表示行数(デフォルト20)"),
+        opt(Some("-n"), "--num", Some("NUM"), "表示する行数を指定する"),
+        opt(Some("-t"), "--tail", None, "ログを流し続ける"),
         opt(
-            Some("-t"),
-            "--tail",
+            Some("-c"),
+            "--source-convert",
             None,
-            "ストリーミング表示(tail -f相当)",
+            "変換ログを表示する。<path> を直接指定した場合は無視",
         ),
-        opt(Some("-c"), "--source-convert", None, "変換ログを表示"),
     ],
 };
 
@@ -989,7 +1004,15 @@ fn render_command_help(out: &mut dyn Write, cmd_name: &str, help: &CmdHelp) {
     }
 
     let _ = writeln!(out);
-    for line in help.description.lines() {
+    let description = if cmd_name == "log" {
+        let log_dir = logger::log_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        help.description.replace("{{LOG_DIR}}", &log_dir)
+    } else {
+        help.description.to_string()
+    };
+    for line in description.lines() {
         if line.is_empty() {
             let _ = writeln!(out);
         } else if line.starts_with(' ') || line.starts_with('\t') {

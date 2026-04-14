@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use indicatif::MultiProgress;
 
+use narou_rs::converter::NovelConverter;
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
-use narou_rs::converter::NovelConverter;
 use narou_rs::downloader::{Downloader, TargetType, UpdateStatus};
 use narou_rs::mail::{ensure_mail_setting_file, load_mail_setting, send_target_with_setting};
 use narou_rs::progress::CliProgress;

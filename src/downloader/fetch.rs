@@ -40,7 +40,12 @@ impl HttpFetcher {
         })
     }
 
-    pub fn fetch_text(&mut self, url: &str, cookie: Option<&str>, encoding: Option<&str>) -> Result<String> {
+    pub fn fetch_text(
+        &mut self,
+        url: &str,
+        cookie: Option<&str>,
+        encoding: Option<&str>,
+    ) -> Result<String> {
         let domain = domain_of(url).to_string();
 
         if self.prefer_curl {
@@ -89,7 +94,12 @@ impl HttpFetcher {
         Err(NarouError::NotFound(url.to_string()))
     }
 
-    pub fn fetch_tier_curl(&self, url: &str, cookie: Option<&str>, encoding: Option<&str>) -> Option<String> {
+    pub fn fetch_tier_curl(
+        &self,
+        url: &str,
+        cookie: Option<&str>,
+        encoding: Option<&str>,
+    ) -> Option<String> {
         let mut handle = curl::easy::Easy::new();
         handle.url(url).ok()?;
         handle.useragent(&self.user_agent).ok()?;
@@ -130,7 +140,12 @@ impl HttpFetcher {
         Some(decode_with_encoding(&body, encoding))
     }
 
-    pub fn fetch_tier_reqwest(&self, url: &str, cookie: Option<&str>, encoding: Option<&str>) -> Result<String> {
+    pub fn fetch_tier_reqwest(
+        &self,
+        url: &str,
+        cookie: Option<&str>,
+        encoding: Option<&str>,
+    ) -> Result<String> {
         let mut request = self.client.get(url);
         if let Some(cookie) = cookie {
             request = request.header("Cookie", cookie);
@@ -155,7 +170,12 @@ impl HttpFetcher {
         }
     }
 
-    pub fn fetch_tier_wget(&self, url: &str, cookie: Option<&str>, encoding: Option<&str>) -> Option<String> {
+    pub fn fetch_tier_wget(
+        &self,
+        url: &str,
+        cookie: Option<&str>,
+        encoding: Option<&str>,
+    ) -> Option<String> {
         let mut cmd = std::process::Command::new("wget");
         cmd.arg("--quiet")
             .arg("--output-document=-")

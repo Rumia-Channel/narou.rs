@@ -184,6 +184,17 @@ pub fn inject_default_args(args: &mut Vec<String>) {
     }
 }
 
+pub fn inject_command_defaults(args: &mut Vec<String>) {
+    if args.is_empty() {
+        return;
+    }
+
+    match args[0].as_str() {
+        "log" => inject_log_defaults(args),
+        _ => {}
+    }
+}
+
 fn load_default_args(cmd_name: &str) -> Vec<String> {
     let key = format!("default_args.{}", cmd_name);
     load_local_setting_value(&key)
@@ -192,6 +203,24 @@ fn load_default_args(cmd_name: &str) -> Vec<String> {
 }
 
 fn load_local_setting_value(key: &str) -> Option<String> {
+    load_local_setting_raw_value(key).and_then(|value| match value {
+        serde_yaml::Value::String(s) => Some(s),
+        serde_yaml::Value::Number(v) => Some(v.to_string()),
+        serde_yaml::Value::Bool(v) => Some(v.to_string()),
+        _ => None,
+    })
+}
+
+fn load_local_setting_bool(key: &str) -> Option<bool> {
+    match load_local_setting_raw_value(key)? {
+        serde_yaml::Value::Bool(v) => Some(v),
+        serde_yaml::Value::Number(v) => v.as_i64().map(|n| n != 0),
+        serde_yaml::Value::String(v) => parse_bool(&v),
+        _ => None,
+    }
+}
+
+fn load_local_setting_raw_value(key: &str) -> Option<serde_yaml::Value> {
     let dir = std::env::current_dir().ok()?;
     if !dir.join(".narou").exists() {
         return None;
@@ -203,10 +232,45 @@ fn load_local_setting_value(key: &str) -> Option<String> {
             narou_rs::db::inventory::InventoryScope::Local,
         )
         .ok()?;
-    settings
-        .get(key)
-        .and_then(|v: &serde_yaml::Value| v.as_str())
-        .map(|s: &str| s.to_string())
+    settings.get(key).cloned()
+}
+
+fn inject_log_defaults(args: &mut Vec<String>) {
+    let mut defaults = Vec::new();
+
+    if !has_option(args, "-n", "--num") {
+        if let Some(value) = load_local_setting_value("log.num") {
+            defaults.push("--num".to_string());
+            defaults.push(value);
+        }
+    }
+    if !has_option(args, "-t", "--tail") && load_local_setting_bool("log.tail").unwrap_or(false) {
+        defaults.push("--tail".to_string());
+    }
+    if !has_option(args, "-c", "--source-convert")
+        && load_local_setting_bool("log.source-convert").unwrap_or(false)
+    {
+        defaults.push("--source-convert".to_string());
+    }
+
+    for token in defaults.into_iter().rev() {
+        args.insert(1, token);
+    }
+}
+
+fn has_option(args: &[String], short: &str, long: &str) -> bool {
+    let long_prefix = format!("{}=", long);
+    args.iter()
+        .skip(1)
+        .any(|arg| arg == short || arg == long || arg.starts_with(&long_prefix))
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 fn is_terminal_stdin() -> bool {
@@ -325,6 +389,15 @@ pub enum Commands {
         all: bool,
         #[arg(long)]
         burn: bool,
+    },
+    Log {
+        path: Option<String>,
+        #[arg(short = 'n', long = "num", default_value_t = 20)]
+        num: usize,
+        #[arg(short = 't', long)]
+        tail: bool,
+        #[arg(short = 'c', long = "source-convert")]
+        source_convert: bool,
     },
     Version {
         #[arg(short = 'm', long)]

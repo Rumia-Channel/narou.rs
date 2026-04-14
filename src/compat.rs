@@ -3,10 +3,10 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use crate::converter::NovelConverter;
 use crate::converter::device::Device;
 use crate::converter::settings::NovelSettings;
 use crate::converter::user_converter::UserConverter;
-use crate::converter::NovelConverter;
 use crate::db::inventory::InventoryScope;
 use crate::error::{NarouError, Result};
 

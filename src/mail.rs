@@ -9,8 +9,8 @@ use lettre::{SmtpTransport, Transport};
 
 use crate::converter::output::create_output_text_filename;
 use crate::converter::settings::NovelSettings;
-use crate::db::inventory::Inventory;
 use crate::db::NovelRecord;
+use crate::db::inventory::Inventory;
 use crate::downloader::site_setting::SiteSetting;
 use crate::downloader::{Downloader, TargetType, TocObject};
 use crate::error::Result;

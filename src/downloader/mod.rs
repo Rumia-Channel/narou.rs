@@ -28,8 +28,8 @@ use self::fetch::HttpFetcher;
 use self::narou_api::narou_api_batch_update;
 use self::novel_info::NovelInfo;
 use self::persistence::{
-    compute_section_hash, ensure_default_files, load_section_file, load_toc_file, save_raw_file,
-    save_section_file, save_toc_file, move_file_to_dir, remove_dir_if_empty,
+    compute_section_hash, ensure_default_files, load_section_file, load_toc_file, move_file_to_dir,
+    remove_dir_if_empty, save_raw_file, save_section_file, save_toc_file,
 };
 use self::section::{SectionCache, download_section};
 use self::site_setting::SiteSetting;
@@ -96,9 +96,10 @@ fn load_local_setting_string(key: &str) -> Option<String> {
 
 fn load_global_setting_bool(key: &str) -> bool {
     crate::db::with_database(|db| {
-        let settings: HashMap<String, serde_yaml::Value> = db
-            .inventory()
-            .load("global_setting", crate::db::inventory::InventoryScope::Global)?;
+        let settings: HashMap<String, serde_yaml::Value> = db.inventory().load(
+            "global_setting",
+            crate::db::inventory::InventoryScope::Global,
+        )?;
         Ok(settings.get(key).and_then(|value| match value {
             serde_yaml::Value::Bool(v) => Some(*v),
             serde_yaml::Value::String(v) => Some(matches!(v.as_str(), "true" | "yes" | "on" | "1")),
@@ -129,7 +130,11 @@ fn create_cache_dir(section_dir: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(cache_dir))
 }
 
-fn move_to_cache_dir(section_dir: &Path, cache_dir: Option<&Path>, subtitle: &SubtitleInfo) -> Result<()> {
+fn move_to_cache_dir(
+    section_dir: &Path,
+    cache_dir: Option<&Path>,
+    subtitle: &SubtitleInfo,
+) -> Result<()> {
     let Some(cache_dir) = cache_dir else {
         return Ok(());
     };
@@ -144,7 +149,11 @@ fn remove_cache_dir_if_empty(cache_dir: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn sections_latest_update_time(subtitles: &[SubtitleInfo], key: &str, subkey: Option<&str>) -> Option<DateTime<Utc>> {
+fn sections_latest_update_time(
+    subtitles: &[SubtitleInfo],
+    key: &str,
+    subkey: Option<&str>,
+) -> Option<DateTime<Utc>> {
     let mut latest: Option<DateTime<Utc>> = None;
     for subtitle in subtitles {
         let value = match key {
@@ -388,7 +397,10 @@ impl Downloader {
             .novel_info_url_with_captures(url_captures)
             .unwrap_or_else(|| setting.interpolate(novel_info_url));
 
-        match self.fetcher.fetch_text(&resolved_url, setting.cookie(), Some(setting.encoding())) {
+        match self
+            .fetcher
+            .fetch_text(&resolved_url, setting.cookie(), Some(setting.encoding()))
+        {
             Ok(mut body) => {
                 pretreatment_source(&mut body, setting.encoding(), Some(setting));
                 Ok(NovelInfo::from_novel_info_source(setting, &body))
@@ -485,10 +497,15 @@ impl Downloader {
                 crate::compat::DigestChoice::Convert => {
                     if let Some(id) = existing_id {
                         let author = crate::db::with_database(|db| {
-                            Ok(db.get(id).map(|record| record.author.clone()).unwrap_or_default())
+                            Ok(db
+                                .get(id)
+                                .map(|record| record.author.clone())
+                                .unwrap_or_default())
                         })
                         .unwrap_or_default();
-                        let _ = crate::compat::convert_existing_novel(id, title, &author, novel_dir, false);
+                        let _ = crate::compat::convert_existing_novel(
+                            id, title, &author, novel_dir, false,
+                        );
                     }
                 }
             }
@@ -608,7 +625,8 @@ impl Downloader {
         };
         let toc_source = fetch_toc(&mut self.fetcher, &setting, &toc_url)?;
         if setting.confirm_over18 && !load_global_setting_bool("over18") {
-            if !crate::compat::confirm("年齢認証：あなたは18歳以上ですか", false, false) {
+            if !crate::compat::confirm("年齢認証：あなたは18歳以上ですか", false, false)
+            {
                 return Ok(DownloadResult {
                     id: existing_id.unwrap_or(0),
                     title: String::new(),
@@ -697,7 +715,10 @@ impl Downloader {
         let old_section_count = old_toc.as_ref().map(|t| t.subtitles.len()).unwrap_or(0);
 
         let fetched_story = info.story.clone();
-        let digest_story = old_story.clone().or_else(|| fetched_story.clone()).unwrap_or_default();
+        let digest_story = old_story
+            .clone()
+            .or_else(|| fetched_story.clone())
+            .unwrap_or_default();
         if !force && old_section_count > subtitles.len() {
             let title_for_digest = if title.is_empty() {
                 old_title.clone().unwrap_or_default()

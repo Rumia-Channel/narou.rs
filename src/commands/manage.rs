@@ -1,48 +1,52 @@
 use super::resolve_target_to_id;
 
+use crate::logger;
+
 pub fn cmd_list(tag: Option<&str>, frozen: bool) {
-    use narou_rs::db;
+    logger::without_logging(|| {
+        use narou_rs::db;
 
-    if let Err(e) = db::init_database() {
-        eprintln!("Error initializing database: {}", e);
-        std::process::exit(1);
-    }
-
-    let records = db::with_database(|db| {
-        let mut list: Vec<_> = db.all_records().values().collect();
-        list.sort_by_key(|r| r.id);
-
-        if let Some(tag_filter) = tag {
-            list.retain(|r| r.tags.iter().any(|t| t == tag_filter));
-        }
-        if frozen {
-            list.retain(|r| r.tags.iter().any(|t| t == "frozen"));
+        if let Err(e) = db::init_database() {
+            eprintln!("Error initializing database: {}", e);
+            std::process::exit(1);
         }
 
-        for r in &list {
-            let type_str = match r.novel_type {
-                1 => "連載",
-                2 => "短編",
-                _ => "?",
-            };
-            let end_str = if r.end { " [完]" } else { "" };
-            let tags_str = if r.tags.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", r.tags.join(", "))
-            };
-            println!(
-                " ID:{:>4} | {} | {}{} | {} | {}",
-                r.id, type_str, r.title, end_str, r.author, tags_str
-            );
-        }
+        let records = db::with_database(|db| {
+            let mut list: Vec<_> = db.all_records().values().collect();
+            list.sort_by_key(|r| r.id);
 
-        Ok(list.len())
-    })
-    .unwrap_or(0);
+            if let Some(tag_filter) = tag {
+                list.retain(|r| r.tags.iter().any(|t| t == tag_filter));
+            }
+            if frozen {
+                list.retain(|r| r.tags.iter().any(|t| t == "frozen"));
+            }
 
-    println!();
-    println!("Total: {} novels", records);
+            for r in &list {
+                let type_str = match r.novel_type {
+                    1 => "連載",
+                    2 => "短編",
+                    _ => "?",
+                };
+                let end_str = if r.end { " [完]" } else { "" };
+                let tags_str = if r.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", r.tags.join(", "))
+                };
+                println!(
+                    " ID:{:>4} | {} | {}{} | {} | {}",
+                    r.id, type_str, r.title, end_str, r.author, tags_str
+                );
+            }
+
+            Ok(list.len())
+        })
+        .unwrap_or(0);
+
+        println!();
+        println!("Total: {} novels", records);
+    });
 }
 
 pub fn cmd_tag(add: Option<&str>, remove: Option<&str>, targets: &[String]) {

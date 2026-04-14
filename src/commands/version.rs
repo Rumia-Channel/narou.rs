@@ -18,8 +18,7 @@ fn version_more() {
         .as_ref()
         .and_then(|path| path.parent().map(|dir| dir.to_path_buf()));
 
-    let java_output = match run_java_command(working_dir.as_deref())
-    {
+    let java_output = match run_java_command(working_dir.as_deref()) {
         Ok(output) => output,
         Err(_) => {
             println!("Java実行時にエラーが発生しました");
@@ -48,8 +47,7 @@ fn version_more() {
         .map(|name| name.to_string())
         .unwrap_or_else(|| aozoraepub3_jar.to_string_lossy().to_string());
 
-    let aozora_output = match run_aozora_command(working_dir.as_deref(), &classpath)
-    {
+    let aozora_output = match run_aozora_command(working_dir.as_deref(), &classpath) {
         Ok(output) => output,
         Err(_) => {
             println!("AozoraEpub3実行時にエラーが発生しました");
@@ -92,7 +90,9 @@ fn print_stream(text: &str) {
     }
 }
 
-fn run_java_command(current_dir: Option<&std::path::Path>) -> std::io::Result<std::process::Output> {
+fn run_java_command(
+    current_dir: Option<&std::path::Path>,
+) -> std::io::Result<std::process::Output> {
     let mut command = java_command();
     if let Some(dir) = current_dir {
         command.current_dir(dir);

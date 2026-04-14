@@ -7,15 +7,22 @@ use std::sync::Arc;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use indicatif::MultiProgress;
 
-use narou_rs::compat::{convert_existing_novel, current_device, load_local_setting_bool, load_local_setting_string, load_local_setting_value, yaml_value_to_string};
+use narou_rs::compat::{
+    convert_existing_novel, current_device, load_local_setting_bool, load_local_setting_string,
+    load_local_setting_value, yaml_value_to_string,
+};
 use narou_rs::converter::NovelConverter;
 use narou_rs::converter::device::{Device, OutputManager};
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
 use narou_rs::db::inventory::InventoryScope;
-use narou_rs::mail::{ensure_mail_setting_file, load_mail_setting, send_target_with_setting, MailSettingLoadError};
 use narou_rs::downloader::site_setting::SiteSetting;
-use narou_rs::downloader::{DownloadResult, Downloader, SubtitleInfo, TargetType, TocFile, TocObject, UpdateStatus};
+use narou_rs::downloader::{
+    DownloadResult, Downloader, SubtitleInfo, TargetType, TocFile, TocObject, UpdateStatus,
+};
+use narou_rs::mail::{
+    MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
+};
 use narou_rs::progress::CliProgress;
 
 const MODIFIED_TAG: &str = "modified";
@@ -670,7 +677,11 @@ fn print_status_messages(multi: &Arc<MultiProgress>, dl: &DownloadResult) {
     }
 }
 
-fn auto_convert(_multi: &Arc<MultiProgress>, dl: &DownloadResult, no_open: bool) -> Result<(), String> {
+fn auto_convert(
+    _multi: &Arc<MultiProgress>,
+    dl: &DownloadResult,
+    no_open: bool,
+) -> Result<(), String> {
     convert_existing_novel(dl.id, &dl.title, &dl.author, &dl.novel_dir, no_open).map(|_| ())
 }
 
@@ -718,7 +729,8 @@ fn process_hotentry(
         let display_title = settings.novel_title.clone();
         let display_author = settings.novel_author.clone();
 
-        let mut converter = if let Some(uc) = UserConverter::load_with_title(novel_dir, &toc.title) {
+        let mut converter = if let Some(uc) = UserConverter::load_with_title(novel_dir, &toc.title)
+        {
             NovelConverter::with_user_converter(settings, uc)
         } else {
             NovelConverter::new(settings)
@@ -757,8 +769,23 @@ fn process_hotentry(
             .map_err(|e| e.to_string())?
     };
 
-    let _ = copy_to_hotentry_output(&final_path, if device == Device::Text { None } else { Some(device) });
-    let _ = send_hotentry_output(&final_path, if device == Device::Text { None } else { Some(device) }, multi);
+    let _ = copy_to_hotentry_output(
+        &final_path,
+        if device == Device::Text {
+            None
+        } else {
+            Some(device)
+        },
+    );
+    let _ = send_hotentry_output(
+        &final_path,
+        if device == Device::Text {
+            None
+        } else {
+            Some(device)
+        },
+        multi,
+    );
     mail_hotentry_if_enabled();
 
     let _ = multi.println(format!("hotentry を生成しました: {}", final_path.display()));
@@ -779,14 +806,18 @@ fn mail_hotentry_if_enabled() {
         Err(MailSettingLoadError::NotFound(_)) => match ensure_mail_setting_file() {
             Ok(path) => {
                 println!("created {}", path.display());
-                println!("メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。");
+                println!(
+                    "メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。"
+                );
             }
             Err(e) => {
                 eprintln!("Error: {}", e);
             }
         },
         Err(MailSettingLoadError::Incomplete(_)) => {
-            eprintln!("設定ファイルの書き換えが終了していないようです。\n設定ファイルは mail_setting.yaml にあります");
+            eprintln!(
+                "設定ファイルの書き換えが終了していないようです。\n設定ファイルは mail_setting.yaml にあります"
+            );
         }
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -870,9 +901,12 @@ fn load_setting_float(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-fn copy_to_hotentry_output(src_path: &Path, _device: Option<Device>) -> Result<Option<PathBuf>, String> {
-    let copy_to_dir =
-        load_local_setting_string("convert.copy-to").or_else(|| load_local_setting_string("convert.copy_to"));
+fn copy_to_hotentry_output(
+    src_path: &Path,
+    _device: Option<Device>,
+) -> Result<Option<PathBuf>, String> {
+    let copy_to_dir = load_local_setting_string("convert.copy-to")
+        .or_else(|| load_local_setting_string("convert.copy_to"));
     let Some(copy_to_dir) = copy_to_dir else {
         return Ok(None);
     };
@@ -929,7 +963,10 @@ fn send_hotentry_output(
         return Ok(());
     }
     let _ = multi.println(format!("{}へ送信しています", device.display_name()));
-    match manager.copy_to_documents(ebook_file).map_err(|e| e.to_string())? {
+    match manager
+        .copy_to_documents(ebook_file)
+        .map_err(|e| e.to_string())?
+    {
         Some(path) => {
             let _ = multi.println(format!("{} へコピーしました", path.display()));
             Ok(())
