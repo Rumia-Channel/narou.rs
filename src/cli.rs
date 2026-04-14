@@ -458,6 +458,12 @@ pub enum Commands {
         ignore_all: bool,
     },
     Convert {
+        #[arg(short = 'o', long = "output")]
+        output: Option<String>,
+        #[arg(long = "ignore-default")]
+        ignore_default: bool,
+        #[arg(long = "ignore-force")]
+        ignore_force: bool,
         #[arg(short = 'i', long)]
         inspect: bool,
         #[arg(long = "no-open")]

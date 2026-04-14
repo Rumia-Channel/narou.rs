@@ -205,6 +205,9 @@ fn run_sync_command(
         }
         Commands::Convert {
             targets,
+            output,
+            ignore_default,
+            ignore_force,
             inspect,
             no_open,
         } => {
@@ -212,7 +215,14 @@ fn run_sync_command(
                 eprintln!("Usage: narou convert <url|ncode|id>...");
                 1
             } else {
-                commands::convert::cmd_convert(&targets, inspect, no_open);
+                commands::convert::cmd_convert(
+                    &targets,
+                    output.as_deref(),
+                    inspect,
+                    no_open,
+                    ignore_default,
+                    ignore_force,
+                );
                 0
             }
         }

@@ -124,6 +124,24 @@ impl NovelSettings {
         novel_author: &str,
         archive_path: &Path,
     ) -> Self {
+        Self::load_for_novel_with_options(
+            novel_id,
+            novel_title,
+            novel_author,
+            archive_path,
+            false,
+            false,
+        )
+    }
+
+    pub fn load_for_novel_with_options(
+        novel_id: i64,
+        novel_title: &str,
+        novel_author: &str,
+        archive_path: &Path,
+        ignore_force: bool,
+        ignore_default: bool,
+    ) -> Self {
         let _original = Self::default();
 
         let ini_path = archive_path.join("setting.ini");
@@ -151,7 +169,12 @@ impl NovelSettings {
 
         settings = Self::apply_ini_defaults(&settings, &ini);
         settings = Self::apply_ini_novel(&settings, &ini, novel_id);
-        settings = Self::apply_force_and_default_settings(&settings, &local_setting_path);
+        settings = Self::apply_force_and_default_settings(
+            &settings,
+            &local_setting_path,
+            ignore_force,
+            ignore_default,
+        );
 
         settings.novel_title = if settings.novel_title.is_empty() {
             novel_title.to_string()
@@ -188,7 +211,12 @@ impl NovelSettings {
         s
     }
 
-    fn apply_force_and_default_settings(settings: &Self, local_setting_path: &Path) -> Self {
+    fn apply_force_and_default_settings(
+        settings: &Self,
+        local_setting_path: &Path,
+        ignore_force: bool,
+        ignore_default: bool,
+    ) -> Self {
         let mut s = settings.clone();
         if !local_setting_path.exists() {
             return s;
@@ -200,10 +228,16 @@ impl NovelSettings {
                     let mut force_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
                     for (key, value) in mapping {
                         if let Some(key_str) = key.as_str() {
-                            if let Some(rest) = key_str.strip_prefix("default.") {
-                                default_settings.insert(rest, value);
-                            } else if let Some(rest) = key_str.strip_prefix("force.") {
-                                force_settings.insert(rest, value);
+                            if !ignore_default {
+                                if let Some(rest) = key_str.strip_prefix("default.") {
+                                    default_settings.insert(rest, value);
+                                    continue;
+                                }
+                            }
+                            if !ignore_force {
+                                if let Some(rest) = key_str.strip_prefix("force.") {
+                                    force_settings.insert(rest, value);
+                                }
                             }
                         }
                     }
@@ -917,6 +951,52 @@ mod tests {
 
         assert!(settings.enable_inspect);
         assert!(settings.enable_erase_introduction);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_for_novel_with_options_ignores_force_and_default_settings() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "narou-rs-settings-ignore-test-{}-{}",
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive_path = root.join("小説データ").join("test-novel");
+        std::fs::create_dir_all(root.join(".narou")).unwrap();
+        std::fs::create_dir_all(&archive_path).unwrap();
+        std::fs::write(
+            root.join(".narou").join("local_setting.yaml"),
+            "default.enable_inspect: true\nforce.enable_erase_introduction: true\n",
+        )
+        .unwrap();
+
+        std::env::set_current_dir(&archive_path).unwrap();
+        let ignore_default = NovelSettings::load_for_novel_with_options(
+            1,
+            "title",
+            "author",
+            &archive_path,
+            false,
+            true,
+        );
+        let ignore_force = NovelSettings::load_for_novel_with_options(
+            1,
+            "title",
+            "author",
+            &archive_path,
+            true,
+            false,
+        );
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(!ignore_default.enable_inspect);
+        assert!(!ignore_force.enable_erase_introduction);
 
         let _ = std::fs::remove_dir_all(root);
     }
