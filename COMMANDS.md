@@ -92,7 +92,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `setting` | ✅ | 🟡 部分 | 基本読み書きは実装済み。ただし default/force/default_args 系と全設定網羅に不足 |
 | `diff` | ✅ | ✅ 完了 | 外部 diff ツール、raw データ管理 |
 | `send` | ✅ | ✅ 完了 | Kindle/Kobo/Reader 送信、`--without-freeze`、栞 backup/restore、hotentry を実装 |
-| `mail` | ✅ | 🟡 部分 | `mail_setting.yaml` 読込と SMTP 送信の基盤を追加。Pony/mail 設定の完全互換は要確認だが、hotentry 自動メールは実装済み |
+| `mail` | ✅ | 🟡 部分 | `mail_setting.yaml` bootstrap / 不完全設定 path 表示 / spinner / hotentry / `last_mail_date` 差分送信まで実装。Pony 互換と割り込み周辺の最終確認が残る |
 | `backup` | ✅ | ✅ 完了 | `narou backup`/複数 target、`backup/` 除外、180バイト切り詰めまで対応 |
 | `clean` | ✅ | ✅ 完了 | `latest_convert` 既定値、`--all`、`--force`/`--dry-run`、freeze スキップ、`raw/*.txt|*.html` と `本文/*.yaml` の orphan 判定を実装 |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
@@ -480,14 +480,19 @@ narou setting name         # 読み取り
 
 | オプション | 短縮 | 型 | デフォルト | 説明 |
 |-----------|------|-----|-----------|------|
-| `--force` | `-f` | flag | false | 全非凍結小説を強制送信 |
+| `--force` | `-f` | flag | false | 全ての小説を強制送信 |
 | targets | | Vec\<string\> | — | 対象。`hotentry` 指定可 |
 
-**実装要件**:
-- SMTP 設定 (`mail_setting.yaml`)
-- Send-to-Kindle 対応
-- `last_mail_date` による差分送信
-- hotentry 自動メール (`hotentry.auto-mail` 設定)
+**Rust 実装**:
+- `mail_setting.yaml` の読み込み、未作成時の preset コピー、初回作成時の `last_mail_date` 初期化を実装
+- 設定不完全時は Ruby版同様に設定ファイルのフルパス付きでエラーを表示
+- target 省略時は凍結以外の全小説を対象にし、`last_mail_date` と `new_arrivals_date` を比較して未送信分だけ送る
+- `hotentry` 特別扱い、tag 展開、alias / タイトル / URL / Nコード解決に対応
+- 送信中は `メールを送信しています...` の進捗表示を行い、成功時に `last_mail_date` を更新する
+
+**完了扱いにしない理由 / 不足動作**:
+- Ruby版 Mailer/Pony 設定の全オプション互換は未確認で、現状は `smtp` 経路を主対象にしている
+- Ctrl+C 割り込みの runtime 最終確認と、実SMTPを使った end-to-end 検証がまだ不足
 
 ---
 
@@ -542,7 +547,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 16. `help` — 🟡 部分
+### 16. `help` — ✅ 完了
 
 > このヘルプを表示します
 
@@ -554,11 +559,11 @@ narou setting name         # 読み取り
 - `NO_COLOR` 環境変数対応（ANSIエスケープコード条件付き出力）
 - 引数なし（`narou`）およびショートカット（`h`, `he`）からのフォールバック対応
 
-**完了扱いにしない理由 / 不足動作**:
-- `help` は未実装コマンド分も narou.rb から移植する方針だが、`narou <command> -h` の詳細文・Examples・Configuration・Variable List が Ruby版 `sample/narou/lib/command/*.rb` と完全一致していない。
-- `setting -h` の `Local Variable List` / `Global Variable List` が省略されている。
-- `list`, `inspect`, `send`, `mail`, `csv` などで banner、説明文、Examples、Options の省略・改変・追加がある。
-- `tag -h` は Ruby版にない `--list` を表示しており、Ruby版 help 互換として要整理。
+**Rust 実装**:
+- 未初期化時 / 初期化済み時のトップレベル help を Ruby版相当に表示
+- 全24コマンドの oneline help、グローバルオプション、ショートカット説明を同一順序で表示
+- `narou <command> -h` の banner、説明文、Examples、Options を Ruby版各 command に合わせて整備
+- `convert` の `Configuration:` 節、`setting -h` の Variable List、`update --gl` の詳細説明表も表示
 
 ---
 

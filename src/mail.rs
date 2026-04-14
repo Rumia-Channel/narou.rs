@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, Body, Mailbox, Message, MultiPart, SinglePart};
@@ -16,6 +20,7 @@ use crate::downloader::{Downloader, TargetType, TocObject};
 use crate::error::Result;
 
 pub const MAIL_SETTING_FILE: &str = "mail_setting.yaml";
+pub const MAIL_INTERRUPTED_MESSAGE: &str = "メール送信を中断しました";
 
 #[derive(Debug, Clone)]
 pub struct MailSetting {
@@ -149,10 +154,20 @@ pub fn send_target_with_setting(
     send_all: bool,
     force: bool,
 ) -> std::result::Result<bool, String> {
+    send_target_with_setting_interruptible(setting, target, send_all, force, None)
+}
+
+pub fn send_target_with_setting_interruptible(
+    setting: &MailSetting,
+    target: &str,
+    send_all: bool,
+    force: bool,
+    interrupted: Option<&AtomicBool>,
+) -> std::result::Result<bool, String> {
     let target = alias_to_target(target);
 
     if target == "hotentry" {
-        return send_hotentry(setting, send_all);
+        return send_hotentry(setting, send_all, interrupted);
     }
 
     let record = match resolve_record(&target)? {
@@ -202,23 +217,24 @@ pub fn send_target_with_setting(
         return Ok(false);
     }
 
-    println!(
-        "<bold><green>ID:{}　{}</green></bold>",
-        record.id, record.title
-    );
+    println!("{}", green_bold(&format!("ID:{}　{}", record.id, record.title)));
 
     for ebook_path in ebook_paths {
         if !ebook_path.exists() {
             continue;
         }
-        print!("メールを送信しています");
         let body = ebook_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default()
             .to_string();
-        send_mail(setting, &record.id.to_string(), &body, &ebook_path)?;
-        println!();
+        send_mail_with_progress(
+            setting,
+            &record.id.to_string(),
+            &body,
+            &ebook_path,
+            interrupted,
+        )?;
         println!(
             "{} をメールで送信しました",
             ebook_path
@@ -232,7 +248,11 @@ pub fn send_target_with_setting(
     Ok(true)
 }
 
-fn send_hotentry(setting: &MailSetting, send_all: bool) -> std::result::Result<bool, String> {
+fn send_hotentry(
+    setting: &MailSetting,
+    send_all: bool,
+    interrupted: Option<&AtomicBool>,
+) -> std::result::Result<bool, String> {
     let ext = current_device_ext().unwrap_or_else(|| ".epub".to_string());
     let Some(path) = newest_hotentry_file_path(&ext)? else {
         return Ok(false);
@@ -250,15 +270,13 @@ fn send_hotentry(setting: &MailSetting, send_all: bool) -> std::result::Result<b
         return Ok(false);
     }
 
-    println!("<bold><green>hotentry</green></bold>");
-    print!("メールを送信しています");
+    println!("{}", green_bold("hotentry"));
     let body = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default()
         .to_string();
-    send_mail(setting, "hotentry", &body, &path)?;
-    println!();
+    send_mail_with_progress(setting, "hotentry", &body, &path, interrupted)?;
     println!(
         "{} をメールで送信しました",
         path.file_name()
@@ -300,6 +318,49 @@ pub fn send_mail(
     let transport = build_transport(setting)?;
     transport.send(&message).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn send_mail_with_progress(
+    setting: &MailSetting,
+    id: &str,
+    body: &str,
+    attachment_path: &Path,
+    interrupted: Option<&AtomicBool>,
+) -> std::result::Result<(), String> {
+    let setting = setting.clone();
+    let id = id.to_string();
+    let body = body.to_string();
+    let attachment_path = attachment_path.to_path_buf();
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let _ = tx.send(send_mail(&setting, &id, &body, &attachment_path));
+    });
+
+    print!("メールを送信しています");
+    let _ = std::io::stdout().flush();
+
+    loop {
+        if interrupted.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            println!();
+            return Err(MAIL_INTERRUPTED_MESSAGE.to_string());
+        }
+
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(result) => {
+                println!();
+                return result;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                print!(".");
+                let _ = std::io::stdout().flush();
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                println!();
+                return Err("メール送信に失敗しました".to_string());
+            }
+        }
+    }
 }
 
 fn build_transport(setting: &MailSetting) -> std::result::Result<SmtpTransport, String> {
@@ -493,6 +554,14 @@ fn attachment_name(id: &str, path: &Path) -> String {
     format!("{}{}", id, ext)
 }
 
+fn green_bold(text: &str) -> String {
+    if std::env::var_os("NO_COLOR").is_some() {
+        text.to_string()
+    } else {
+        format!("\x1b[1;32m{}\x1b[0m", text)
+    }
+}
+
 fn guess_attachment_content_type(path: &Path) -> ContentType {
     match path
         .extension()
@@ -601,4 +670,46 @@ fn preset_dir() -> Result<PathBuf> {
             )
             .into()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAIL_INTERRUPTED_MESSAGE, MailSetting, attachment_name, send_mail_with_progress};
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::TempDir;
+
+    #[test]
+    fn attachment_name_reuses_original_extension() {
+        let path = std::path::Path::new("example.kepub.epub");
+        assert_eq!(attachment_name("hotentry", path), "hotentry.kepub.epub");
+    }
+
+    #[test]
+    fn send_mail_with_progress_returns_interrupt_message() {
+        let tmp = TempDir::new().unwrap();
+        let attachment = tmp.path().join("sample.epub");
+        std::fs::write(&attachment, "dummy").unwrap();
+
+        let interrupted = AtomicBool::new(true);
+        let setting = MailSetting {
+            from: "sender@example.com".to_string(),
+            to: "receiver@example.com".to_string(),
+            subject: "subject".to_string(),
+            via: "unsupported".to_string(),
+            via_options: HashMap::new(),
+            extras: HashMap::new(),
+        };
+
+        let err = send_mail_with_progress(
+            &setting,
+            "1",
+            "body",
+            &attachment,
+            Some(&interrupted),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, MAIL_INTERRUPTED_MESSAGE);
+    }
 }

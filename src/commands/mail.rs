@@ -1,11 +1,17 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+
 use narou_rs::mail::{
-    MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
+    MAIL_INTERRUPTED_MESSAGE, MailSettingLoadError, ensure_mail_setting_file, load_mail_setting,
+    send_target_with_setting_interruptible,
 };
 
 pub struct MailOptions {
     pub targets: Vec<String>,
     pub force: bool,
 }
+
+static MAIL_INTERRUPT_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 pub fn cmd_mail(opts: MailOptions) {
     if let Err(code) = cmd_mail_inner(opts) {
@@ -19,6 +25,9 @@ fn cmd_mail_inner(opts: MailOptions) -> Result<(), i32> {
         return Err(1);
     }
 
+    let interrupted = mail_interrupt_flag()?;
+    interrupted.store(false, Ordering::SeqCst);
+
     let setting = match load_mail_setting() {
         Ok(setting) => setting,
         Err(MailSettingLoadError::NotFound(_)) => {
@@ -30,12 +39,11 @@ fn cmd_mail_inner(opts: MailOptions) -> Result<(), i32> {
             println!(
                 "メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。"
             );
+            println!("注意：次回以降のupdateで新着があった場合に送信可能フラグが立ちます");
             return Ok(());
         }
-        Err(MailSettingLoadError::Incomplete(_)) => {
-            eprintln!(
-                "設定ファイルの書き換えが終了していないようです。\n設定ファイルは mail_setting.yaml にあります"
-            );
+        Err(e @ MailSettingLoadError::Incomplete(_)) => {
+            eprintln!("{}", e);
             return Err(127);
         }
         Err(e) => {
@@ -52,14 +60,42 @@ fn cmd_mail_inner(opts: MailOptions) -> Result<(), i32> {
     };
 
     for target in targets {
-        if let Err(e) = send_target_with_setting(&setting, &target, send_all, opts.force) {
+        if let Err(e) = send_target_with_setting_interruptible(
+            &setting,
+            &target,
+            send_all,
+            opts.force,
+            Some(interrupted.as_ref()),
+        ) {
+            if e == MAIL_INTERRUPTED_MESSAGE {
+                println!("{}", e);
+                return Err(126);
+            }
             eprintln!("{}", e);
             return Err(127);
         }
     }
 
-    let _ = narou_rs::db::with_database_mut(|db| db.save());
     Ok(())
+}
+
+fn mail_interrupt_flag() -> Result<Arc<AtomicBool>, i32> {
+    if let Some(flag) = MAIL_INTERRUPT_FLAG.get() {
+        return Ok(flag.clone());
+    }
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let handler_flag = flag.clone();
+    ctrlc::set_handler(move || {
+        handler_flag.store(true, Ordering::SeqCst);
+    })
+    .map_err(|e| {
+        eprintln!("Error: {}", e);
+        1
+    })?;
+
+    let _ = MAIL_INTERRUPT_FLAG.set(flag.clone());
+    Ok(flag)
 }
 
 fn collect_all_targets() -> Vec<String> {
