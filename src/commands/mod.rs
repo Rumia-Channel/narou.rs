@@ -5,6 +5,7 @@ pub mod init;
 pub mod mail;
 pub mod manage;
 pub mod setting;
+pub mod version;
 pub mod update;
 pub mod web;
 

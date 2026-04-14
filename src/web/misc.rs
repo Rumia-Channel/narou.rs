@@ -4,15 +4,13 @@ use axum::{
 };
 
 use crate::db::with_database;
+use crate::version;
 
 use super::AppState;
 use super::state::{ApiResponse, LogsParams};
 
 pub async fn version_current(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "name": "narou.rs"
-    }))
+    Json(version::version_json())
 }
 
 pub async fn tag_list(State(_state): State<AppState>) -> Json<serde_json::Value> {

@@ -830,12 +830,12 @@ const TRACE_HELP: CmdHelp = CmdHelp {
 
 const VERSION_HELP: CmdHelp = CmdHelp {
     banner: "[options]",
-    description: "  バージョンを表示します。",
+    description: "  ・バージョンを表示します",
     options: &[opt(
         Some("-m"),
         "--more",
         None,
-        "Java/AozoraEpub3 のバージョンも表示する",
+        "Java と AozoraEpub3 のバージョンも表示する",
     )],
 };
 

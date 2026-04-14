@@ -192,6 +192,10 @@ fn run_sync_command(command: Commands, user_agent: Option<String>, backtrace: bo
             commands::setting::cmd_setting(&args, list, all, burn);
             0
         }
+        Commands::Version { more } => {
+            commands::version::cmd_version(more);
+            0
+        }
         Commands::Web { .. } => unreachable!(),
     }));
 

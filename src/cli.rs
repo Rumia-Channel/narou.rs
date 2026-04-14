@@ -213,6 +213,26 @@ fn is_terminal_stdin() -> bool {
     std::io::stdin().is_terminal()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_flag_becomes_version_command() {
+        let mut args = vec!["--version".to_string()];
+        let _flags = preprocess_args(&mut args);
+        assert_eq!(args, vec!["version".to_string()]);
+    }
+
+    #[test]
+    fn version_command_keeps_more_option() {
+        let mut args = vec!["--version".to_string(), "--more".to_string()];
+        let _flags = preprocess_args(&mut args);
+        assert_eq!(args[0], "version");
+        assert!(args.iter().any(|arg| arg == "--more"));
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "narou", about = "narou.rs - A Rust port of narou.rb")]
 pub struct Cli {
@@ -305,5 +325,9 @@ pub enum Commands {
         all: bool,
         #[arg(long)]
         burn: bool,
+    },
+    Version {
+        #[arg(short = 'm', long)]
+        more: bool,
     },
 }
