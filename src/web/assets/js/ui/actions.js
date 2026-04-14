@@ -69,13 +69,14 @@ export function bindActions() {
     State.viewNonfrozen = true;
     lsSet('view-frozen', 'true');
     lsSet('view-nonfrozen', 'true');
+    setHiddenCols([]);
+    applyColumnVisibility();
     syncViewChecks();
     renderNovelList();
   });
 
   on('action-view-setting', () => {
-    // TODO: column visibility configuration modal
-    showNotification('表示項目設定は今後実装予定です', 'info');
+    openColvisModal();
   });
 
   on('action-view-novel-list-wide', () => {
@@ -129,6 +130,8 @@ export function bindActions() {
      'setting-new-tab', 'buttons-top', 'buttons-footer'].forEach(k =>
       localStorage.removeItem('narou-rs-webui-' + k)
     );
+    setHiddenCols([]);
+    applyColumnVisibility();
     syncViewChecks();
     renderNovelList();
     showNotification('表示設定をリセットしました', 'info');
@@ -241,6 +244,26 @@ export function bindActions() {
   // --- About modal ---
   on('about-close', () => El.aboutModal?.classList.add('hide'));
   on('about-ok', () => El.aboutModal?.classList.add('hide'));
+
+  // --- Column visibility modal ---
+  on('colvis-close', () => El.colvisModal?.classList.add('hide'));
+  on('colvis-ok', () => {
+    const cbs = El.colvisList?.querySelectorAll('input[type="checkbox"]') || [];
+    const hidden = [];
+    cbs.forEach(cb => { if (!cb.checked) hidden.push(cb.dataset.col); });
+    setHiddenCols(hidden);
+    applyColumnVisibility();
+    El.colvisModal?.classList.add('hide');
+  });
+  on('colvis-show-all', () => {
+    El.colvisList?.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = true);
+  });
+  on('colvis-hide-all', () => {
+    El.colvisList?.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = false);
+  });
+  on('colvis-reset', () => {
+    El.colvisList?.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = true);
+  });
 
   // --- Confirm modal ---
   on('confirm-cancel', () => El.confirmModal?.classList.add('hide'));
@@ -490,6 +513,9 @@ export function bindActions() {
 
   // Initial sync
   syncViewChecks();
+  applyColumnVisibility();
+  updateEnableSelected();
+  populateFooterPanel();
 
   // Apply theme
   if (State.theme && State.theme !== 'default') {
@@ -505,6 +531,44 @@ function on(id, handler) {
     e.preventDefault();
     handler(e);
   });
+}
+
+function populateFooterPanel() {
+  const src = El.mainControlPanel;
+  const dst = El.footerControlPanel;
+  if (!src || !dst || dst.children.length > 0) return;
+  const clone = src.cloneNode(true);
+  clone.removeAttribute('id');
+  // Remap IDs on cloned elements to avoid duplicate IDs;
+  // use click delegation instead
+  clone.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
+  while (clone.firstChild) dst.appendChild(clone.firstChild);
+
+  // Delegate clicks from footer panel to main panel buttons by class/text
+  dst.addEventListener('click', (e) => {
+    const link = e.target.closest('a, button');
+    if (!link) return;
+    // Find the matching element in the main control panel
+    const mainEl = findMainPanelMatch(link);
+    if (mainEl) {
+      e.preventDefault();
+      mainEl.click();
+    }
+  });
+}
+
+function findMainPanelMatch(clonedEl) {
+  const src = El.mainControlPanel;
+  if (!src) return null;
+  // Match by original ID attribute (stored as data-orig-id) or by text content
+  const text = clonedEl.textContent.trim();
+  const title = clonedEl.getAttribute('title');
+  const candidates = src.querySelectorAll('a, button');
+  for (const c of candidates) {
+    if (title && c.getAttribute('title') === title) return c;
+    if (c.textContent.trim() === text) return c;
+  }
+  return null;
 }
 
 function getVisibleIds() {
@@ -651,6 +715,76 @@ async function downloadCsv() {
   a.download = 'novels.csv';
   a.click();
   URL.revokeObjectURL(url);
+}
+
+/* ===== Column Visibility ===== */
+
+const COLVIS_COLUMNS = [
+  { cls: 'col-id', label: 'ID' },
+  { cls: 'col-update', label: '更新日' },
+  { cls: 'col-general-lastup', label: '最新話掲載日' },
+  { cls: 'col-last-check', label: '更新チェック日' },
+  { cls: 'col-author', label: '作者名' },
+  { cls: 'col-site', label: '掲載' },
+  { cls: 'col-novel-type', label: '種別' },
+  { cls: 'col-tags', label: 'タグ' },
+  { cls: 'col-episodes', label: '話数' },
+  { cls: 'col-length', label: '文字数' },
+  { cls: 'col-status', label: '状態' },
+  { cls: 'col-url', label: 'リンク' },
+  { cls: 'col-menu', label: '個別' },
+];
+
+// title is always visible — not in the list
+const COLVIS_DEFAULT = COLVIS_COLUMNS.map(c => c.cls);
+
+function getHiddenCols() {
+  const raw = localStorage.getItem('narou-rs-webui-hidden-cols');
+  if (!raw) return [];
+  try { return JSON.parse(raw); } catch { return []; }
+}
+
+function setHiddenCols(arr) {
+  localStorage.setItem('narou-rs-webui-hidden-cols', JSON.stringify(arr));
+}
+
+function applyColumnVisibility() {
+  const hidden = new Set(getHiddenCols());
+  const style = document.getElementById('colvis-style') || (() => {
+    const s = document.createElement('style');
+    s.id = 'colvis-style';
+    document.head.appendChild(s);
+    return s;
+  })();
+  if (hidden.size === 0) {
+    style.textContent = '';
+    return;
+  }
+  style.textContent = [...hidden].map(cls =>
+    `.${cls} { display: none !important; }`
+  ).join('\n');
+}
+
+function openColvisModal() {
+  const list = El.colvisList;
+  if (!list) return;
+  list.innerHTML = '';
+  const hidden = new Set(getHiddenCols());
+
+  for (const col of COLVIS_COLUMNS) {
+    const li = document.createElement('li');
+    const label = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !hidden.has(col.cls);
+    cb.dataset.col = col.cls;
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(col.label));
+    li.appendChild(label);
+    list.appendChild(li);
+  }
+
+  El.colvisModal?.classList.remove('hide');
 }
 
 /* ===== Data refresh ===== */

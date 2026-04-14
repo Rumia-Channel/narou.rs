@@ -270,7 +270,11 @@ function updateSelectionBadge() {
 export function updateEnableSelected() {
   const hasSelection = State.selectedIds.size > 0;
   document.querySelectorAll('.enable-selected').forEach(el => {
-    el.classList.toggle('active', hasSelection);
+    if (el.tagName === 'BUTTON') {
+      el.disabled = !hasSelection;
+    } else {
+      el.classList.toggle('disabled', !hasSelection);
+    }
   });
 }
 

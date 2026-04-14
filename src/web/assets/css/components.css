@@ -99,6 +99,13 @@
   pointer-events: none;
 }
 
+.enable-selected.disabled,
+li.enable-selected.disabled a {
+  opacity: 0.45;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
 /* Button groups */
 .btn-group {
   position: relative;

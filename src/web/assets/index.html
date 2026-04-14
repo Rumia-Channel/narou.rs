@@ -339,6 +339,31 @@
       </div>
     </div>
 
+    <!-- Column Visibility Modal -->
+    <div class="modal-overlay hide" id="colvis-modal">
+      <div class="modal-dialog modal-dialog-sm">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="colvis-close" type="button">&times;</button>
+            <h4 class="modal-title">表示する項目を設定</h4>
+          </div>
+          <div class="modal-body">
+            <div class="colvis-buttons">
+              <button class="btn btn-default btn-sm" id="colvis-show-all" type="button">全ての項目を表示</button>
+              <button class="btn btn-default btn-sm" id="colvis-hide-all" type="button">全て隠す</button>
+              <button class="btn btn-default btn-sm" id="colvis-reset" type="button">元に戻す</button>
+            </div>
+            <ul class="colvis-list" id="colvis-list">
+              <!-- populated by JS -->
+            </ul>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-primary" id="colvis-ok" type="button">OK</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Notepad Modal -->
     <div class="modal-overlay hide" id="notepad-modal">
       <div class="modal-dialog">
