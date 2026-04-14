@@ -2,7 +2,8 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use indicatif::MultiProgress;
@@ -31,6 +32,11 @@ const FORCE_WAIT_SECS: f64 = 2.0;
 const HOTENTRY_DIR_NAME: &str = "hotentry";
 const HOTENTRY_FOOTER: &str = "［＃ここから地付き］［＃小書き］（本を読み終わりました）［＃小書き終わり］［＃ここで地付き終わり］";
 
+static UPDATE_INTERRUPT_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+struct UpdateInterrupted;
+
 const UPDATE_SORT_KEYS: &[(&str, &str)] = &[
     ("id", "ID"),
     ("last_update", "更新日"),
@@ -52,17 +58,23 @@ pub struct UpdateOptions {
 }
 
 pub fn cmd_update(opts: UpdateOptions) {
-    let result = std::thread::spawn(move || {
+    let result = std::thread::spawn(move || -> std::result::Result<(), UpdateInterrupted> {
         if let Err(e) = narou_rs::db::init_database() {
             eprintln!("Error initializing database: {}", e);
             std::process::exit(1);
         }
 
+        let interrupted = match update_interrupt_flag() {
+            Ok(flag) => flag,
+            Err(code) => std::process::exit(code),
+        };
+        interrupted.store(false, AtomicOrdering::SeqCst);
+
         repair_empty_titles();
 
         if let Some(ref gl_opt) = opts.gl {
             update_general_lastup(gl_opt.as_deref(), opts.user_agent.as_deref());
-            return;
+            return Ok(());
         }
 
         let setting_sort_by = load_local_setting_string("update.sort-by");
@@ -81,7 +93,7 @@ pub fn cmd_update(opts: UpdateOptions) {
             if unresolved_count > 0 {
                 std::process::exit(unresolved_count.min(127) as i32);
             }
-            return;
+            return Ok(());
         }
 
         let _total = target_ids.len();
@@ -105,6 +117,8 @@ pub fn cmd_update(opts: UpdateOptions) {
             .unwrap_or_else(std::time::Instant::now);
 
         for (i, &id) in target_ids.iter().enumerate() {
+            abort_if_interrupted(interrupted.as_ref())?;
+
             if i > 0 {
                 let _ = multi_clone.println("\u{2500}".repeat(35));
             }
@@ -122,7 +136,7 @@ pub fn cmd_update(opts: UpdateOptions) {
 
             let elapsed = last_time.elapsed().as_secs_f64();
             if elapsed < interval_secs {
-                std::thread::sleep(std::time::Duration::from_secs_f64(interval_secs - elapsed));
+                sleep_with_interrupt(interval_secs - elapsed, interrupted.as_ref())?;
             }
             last_time = std::time::Instant::now();
 
@@ -209,7 +223,7 @@ pub fn cmd_update(opts: UpdateOptions) {
                 }
                 Err(e) => {
                     if matches!(e, narou_rs::error::NarouError::SuspendDownload(_)) {
-                        std::panic::resume_unwind(Box::new(e.to_string()));
+                        return Err(UpdateInterrupted);
                     }
                     let title = get_novel_title(id);
                     let _ = multi_clone
@@ -222,6 +236,7 @@ pub fn cmd_update(opts: UpdateOptions) {
         let _ = narou_rs::db::with_database_mut(|db| db.save());
 
         if hotentry_enabled {
+            abort_if_interrupted(interrupted.as_ref())?;
             if let Err(e) = process_hotentry(&multi_clone, &hotentries) {
                 let _ = multi_clone.println(format!("hotentry の処理に失敗しました\n  {}", e));
                 mistook += 1;
@@ -236,16 +251,68 @@ pub fn cmd_update(opts: UpdateOptions) {
         if mistook > 0 {
             std::process::exit(mistook.min(127) as i32);
         }
+        Ok(())
     })
     .join();
 
-    if let Err(e) = result {
-        if let Some(s) = e.downcast_ref::<String>() {
-            eprintln!("アップデートを中断しました: {}", s);
-        } else {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(UpdateInterrupted)) => {
             eprintln!("アップデートを中断しました");
+            std::process::exit(126);
         }
-        std::process::exit(126);
+        Err(e) => {
+            if let Some(s) = e.downcast_ref::<String>() {
+                eprintln!("アップデートを中断しました: {}", s);
+            } else {
+                eprintln!("アップデートを中断しました");
+            }
+            std::process::exit(126);
+        }
+    }
+}
+
+fn update_interrupt_flag() -> Result<Arc<AtomicBool>, i32> {
+    if let Some(flag) = UPDATE_INTERRUPT_FLAG.get() {
+        return Ok(flag.clone());
+    }
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let handler_flag = flag.clone();
+    ctrlc::set_handler(move || {
+        handler_flag.store(true, AtomicOrdering::SeqCst);
+    })
+    .map_err(|e| {
+        eprintln!("Error: {}", e);
+        1
+    })?;
+
+    let _ = UPDATE_INTERRUPT_FLAG.set(flag.clone());
+    Ok(flag)
+}
+
+fn abort_if_interrupted(interrupted: &AtomicBool) -> std::result::Result<(), UpdateInterrupted> {
+    if interrupted.load(AtomicOrdering::SeqCst) {
+        Err(UpdateInterrupted)
+    } else {
+        Ok(())
+    }
+}
+
+fn sleep_with_interrupt(
+    wait_secs: f64,
+    interrupted: &AtomicBool,
+) -> std::result::Result<(), UpdateInterrupted> {
+    let total = std::time::Duration::from_secs_f64(wait_secs.max(0.0));
+    let deadline = std::time::Instant::now() + total;
+    loop {
+        abort_if_interrupted(interrupted)?;
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(100)));
     }
 }
 
@@ -1230,4 +1297,22 @@ fn parse_api_datetime(value: &str) -> Option<DateTime<Utc>> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{abort_if_interrupted, sleep_with_interrupt};
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn abort_if_interrupted_returns_err_when_flag_is_set() {
+        let interrupted = AtomicBool::new(true);
+        assert!(abort_if_interrupted(&interrupted).is_err());
+    }
+
+    #[test]
+    fn sleep_with_interrupt_returns_immediately_for_zero_duration() {
+        let interrupted = AtomicBool::new(false);
+        sleep_with_interrupt(0.0, &interrupted).unwrap();
+    }
 }
