@@ -229,23 +229,50 @@ fn run_sync_command(
             all_clean,
             no_tool,
         }),
-        Commands::List { tag, frozen } => {
-            commands::manage::cmd_list(tag.as_deref(), frozen);
-            0
-        }
+        Commands::List {
+            limit,
+            latest,
+            general_lastup,
+            reverse,
+            url,
+            kind,
+            site,
+            author,
+            filter,
+            grep,
+            tag,
+            echo,
+            frozen,
+        } => commands::manage::cmd_list(commands::manage::ListOptions {
+            limit,
+            latest,
+            general_lastup,
+            reverse,
+            url,
+            kind,
+            site,
+            author,
+            filter,
+            grep,
+            tag,
+            echo,
+            frozen,
+        }),
         Commands::Tag {
             add,
-            remove,
+            delete,
+            color,
+            clear,
+            no_overwrite_color,
             targets,
-        } => {
-            if targets.is_empty() {
-                eprintln!("Usage: narou tag --add <tag> <targets>...");
-                1
-            } else {
-                commands::manage::cmd_tag(add.as_deref(), remove.as_deref(), &targets);
-                0
-            }
-        }
+        } => commands::manage::cmd_tag(commands::manage::TagOptions {
+            add,
+            delete,
+            color,
+            clear,
+            no_overwrite_color,
+            targets,
+        }),
         Commands::Freeze {
             targets,
             list,

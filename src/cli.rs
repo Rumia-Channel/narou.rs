@@ -427,16 +427,43 @@ pub enum Commands {
         no_tool: bool,
     },
     List {
-        #[arg(short, long)]
-        tag: Option<String>,
-        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(short = 'l', long)]
+        latest: bool,
+        #[arg(long = "gl")]
+        general_lastup: bool,
+        #[arg(short = 'r', long)]
+        reverse: bool,
+        #[arg(short = 'u', long)]
+        url: bool,
+        #[arg(short = 'k', long)]
+        kind: bool,
+        #[arg(short = 's', long)]
+        site: bool,
+        #[arg(short = 'a', long)]
+        author: bool,
+        #[arg(short = 'f', long = "filter")]
+        filter: Option<String>,
+        #[arg(short = 'g', long = "grep")]
+        grep: Option<String>,
+        #[arg(short = 't', long = "tag", num_args = 0..=1)]
+        tag: Option<Option<String>>,
+        #[arg(short = 'e', long)]
+        echo: bool,
+        #[arg(long, hide = true)]
         frozen: bool,
     },
     Tag {
-        #[arg(short, long)]
+        #[arg(short = 'a', long = "add")]
         add: Option<String>,
-        #[arg(short, long)]
-        remove: Option<String>,
+        #[arg(short = 'd', long = "delete", alias = "remove")]
+        delete: Option<String>,
+        #[arg(short = 'c', long = "color")]
+        color: Option<String>,
+        #[arg(long = "clear")]
+        clear: bool,
+        #[arg(long = "no-overwrite-color", hide = true)]
+        no_overwrite_color: bool,
         targets: Vec<String>,
     },
     Freeze {

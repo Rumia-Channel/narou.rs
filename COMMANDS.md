@@ -84,8 +84,8 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `download` | ✅ | 🟡 部分 | `--mail` を追加。メール設定の自動作成と送信は実装済みだが、全互換確認は継続中 |
 | `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、digest選択肢、差分cache退避、hotentryのcopy/send/mailまでは実装済み。周辺出力/イベント細部が残る |
 | `convert` | ✅ | 🟡 部分 | `--device`, `--no-epub`, `--output` 等不足 |
-| `list` | ✅ | 🟡 部分 | `--latest`, `--reverse`, `--url`, `--filter` 等不足 |
-| `tag` | ✅ | 🟡 部分 | `--color`, `--clear`, `--list` 不足 |
+| `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--echo` と pipe 時ID出力まで実装 |
+| `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションまで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
 | `remove` | ✅ | ✅ 完了 | `--yes`, `--with-file`, `--all-ss`、確認、freeze/lock チェックを実装 |
 | `web` | ✅ | 🟡 部分 | APIのみ。HTML UIなし |
@@ -244,30 +244,32 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 
 ---
 
-### 5. `list` — 🟡 部分
+### 5. `list` — ✅ 完了
 
 > 現在管理している小説の一覧を表示します
 
 | オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
 |-----------|------|-----|-----------|------|:----:|
-| `--latest` | `-l` | flag | false | 最新更新順でソート | ❌ |
-| `--gl` | — | flag | false | general_lastup でソート | ❌ |
-| `--reverse` | `-r` | flag | false | 逆順ソート | ❌ |
-| `--url` | `-u` | flag | false | URL 表示 | ❌ |
-| `--kind` | `-k` | flag | false | 小説種別表示 (短編/連載) | ❌ |
-| `--site` | `-s` | flag | false | サイト名表示 | ❌ |
-| `--author` | `-a` | flag | false | 作者名表示 | ❌ |
-| `--filter VAL` | `-f` | string | — | フィルタ: `series`/`ss`/`frozen`/`nonfrozen` | ❌ |
-| `--grep VAL` | `-g` | string | — | テキスト検索。`-` prefix で NOT | ❌ |
-| `--tag [TAGS]` | `-t` | string | — | タグ表示/フィルタ | ✅ (部分) |
-| `--echo` | `-e` | flag | false | パイプ時も人間可読出力 | ❌ |
-| `--frozen` | — | flag | false | 凍結済みのみ | ✅ |
-| limit | | int | — | 表示数上限 | ❌ |
+| `--latest` | `-l` | flag | false | 最新更新順でソート | ✅ |
+| `--gl` | — | flag | false | 更新日ではなく最新話掲載日を使用 | ✅ |
+| `--reverse` | `-r` | flag | false | 逆順ソート | ✅ |
+| `--url` | `-u` | flag | false | URL 表示 | ✅ |
+| `--kind` | `-k` | flag | false | 小説種別表示 (短編/連載) | ✅ |
+| `--site` | `-s` | flag | false | サイト名表示 | ✅ |
+| `--author` | `-a` | flag | false | 作者名表示 | ✅ |
+| `--filter VAL` | `-f` | string | — | フィルタ: `series`/`ss`/`frozen`/`nonfrozen` | ✅ |
+| `--grep VAL` | `-g` | string | — | テキスト検索。`-` prefix で NOT | ✅ |
+| `--tag [TAGS]` | `-t` | string | — | タグ表示/フィルタ | ✅ |
+| `--echo` | `-e` | flag | false | パイプ時も人間可読出力 | ✅ |
+| limit | | int | — | 表示数上限 | ✅ |
 
-**不足動作**:
-- パイプ接続時はスペース区切りID一覧を出力 (他コマンドへのチェーン用)
-- 6時間以内更新の小説をハイライト
-- 列のカスタマイズ (`--url`, `--kind`, `--site`, `--author`)
+**Rust 実装**:
+- `limit` positional、`--latest` / `--gl` / `--reverse`、列追加オプション (`--url` / `--kind` / `--site` / `--author`) を実装
+- `--filter` は `series` / `ss` / `frozen` / `nonfrozen` の複数指定と Ruby版相当の不正値エラー (終了コード127) に対応
+- `--grep` は AND / `-word` の NOT 検索に対応
+- `--tag` は無引数でタグ列表示、引数付きで全指定タグを含む小説に絞り込む
+- TTY では人間可読一覧、pipe / redirect 時は ID のみ、`--echo` 時はヘッダ付き一覧を出力する
+- `.narou/freeze.yaml` に基づく凍結表示、6時間以内更新の色分け、`tag_colors.yaml` によるタグ色付けを実装
 
 ---
 
@@ -383,25 +385,25 @@ narou setting name         # 読み取り
 
 ---
 
-### 8. `tag` — 🟡 部分
+### 8. `tag` — ✅ 完了
 
 > 各小説にタグを設定及び閲覧が出来ます
 
 | オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
 |-----------|------|-----|-----------|------|:----:|
 | `--add TAGS` | `-a` | string | — | タグ追加 (スペース区切り) | ✅ |
-| `--delete TAGS` | `-d` | string | — | タグ削除 | ✅ (--remove) |
-| `--color COL` | `-c` | string | auto | タグ色設定 | ❌ |
-| `--clear` | — | flag | false | 全タグクリア | ❌ |
-| `--list` | `-l` | flag | false | タグ一覧表示 | ❌ |
+| `--delete TAGS` | `-d` | string | — | タグ削除 | ✅ |
+| `--color COL` | `-c` | string | auto | タグ色設定 | ✅ |
+| `--clear` | — | flag | false | 全タグクリア | ✅ |
 | targets | | Vec\<String\> | — | 対象小説 | ✅ |
 
-**不足動作**:
-- 引数なし = タグ一覧表示
-- タグ指定のみ(モードなし) = タグ検索 (`list --tag` に委譲)
-- 禁止文字: `:;"'><$@&^\\\|%/`` と `hotentry`
-- 色の自動ローテーション (green/yellow/blue/magenta/cyan/red/white)
-- 特殊タグ: `end` (完結), `404` (削除済み)
+**Rust 実装**:
+- 引数なしでタグ一覧表示、タグ名のみ指定時は Ruby版同様 `list --tag` 相当の検索へ委譲
+- `--add` / `--delete` はスペース区切り複数タグを処理し、`--clear` は対象小説のタグを全削除する
+- `--color` は `green/yellow/blue/magenta/cyan/red/white` を受け付け、無効色は Ruby版同様に警告して無視する
+- `tag_colors.yaml` の保存順を保持しつつ、自動色ローテーション (green→yellow→blue→magenta→cyan→red→white) を実装
+- 追加タグの禁止文字 `:;"'><$@&^\\\|%/\`` と禁止語 `hotentry` を Ruby版相当に検証する
+- 編集後は `現在のタグは ... です` を表示し、タグ名/`tag:NAME`/ID/URL/Nコード/タイトル/alias のターゲット解決に対応
 
 ---
 
@@ -690,10 +692,10 @@ narou setting name         # 読み取り
 | download `--force`, `--no-convert`, `--freeze` | download | DL フラグ互換 |
 | update の残互換実装 | update | Ruby版ターゲット解決・`--gl`主要挙動・`update.strong`・digest選択肢・差分用 cache 退避・hotentry の copy/send/mail までは実装済み。周辺出力/イベント細部が残る |
 | convert `--device`, `--no-open`, `--output` | convert | 変換パイプライン完成 |
-| list `--latest`, `--reverse`, `--filter`, `--url`, `--author`, `--site` | list | 一覧表示の実用性 |
-| tag `--color`, `--clear`, `--list` | tag | タグ管理の完成 |
-| remove `--yes`, `--with-file` | remove | 削除の安全性 |
-| freeze `--list`, `--on` | freeze | 凍結管理の完成 |
+| download の残互換実装 | download | 再DL確認・mail 周辺 |
+| setting の残互換実装 | setting | 全設定変数と device hook の詰め |
+| help の残互換実装 | help | 各コマンド詳細ヘルプの完全一致 |
+| inspect のログ生成側 | inspect | `convert.inspect` / Inspector 互換 |
 
 ### P1: 設定管理基盤
 多くのコマンドが `local_setting` / `global_setting` に依存する。

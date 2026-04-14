@@ -449,7 +449,6 @@ const LIST_HELP: CmdHelp = CmdHelp {
         ),
         opt(Some("-t"), "--tag", Some("[TAGS]"), "タグ表示/フィルタ"),
         opt(Some("-e"), "--echo", None, "パイプ時も人間可読出力"),
-        opt(None, "--frozen", None, "凍結済みのみ表示"),
     ],
 };
 
@@ -553,7 +552,6 @@ const TAG_HELP: CmdHelp = CmdHelp {
         opt(Some("-d"), "--delete", Some("TAGS"), "タグを外す"),
         opt(Some("-c"), "--color", Some("COL"), "タグの色を指定する"),
         opt(None, "--clear", None, "全てのタグを削除する"),
-        opt(Some("-l"), "--list", None, "存在するタグ一覧を表示する"),
     ],
 };
 
