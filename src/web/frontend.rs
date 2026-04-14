@@ -8,6 +8,10 @@ pub async fn index() -> Html<&'static str> {
     Html(include_str!("assets/index.html"))
 }
 
+pub async fn settings_page() -> Html<&'static str> {
+    Html(include_str!("assets/settings.html"))
+}
+
 pub async fn asset(Path(path): Path<String>) -> Response {
     let (content_type, body) = match path.as_str() {
         "css/theme.css" => ("text/css; charset=utf-8", include_str!("assets/css/theme.css")),
@@ -20,6 +24,10 @@ pub async fn asset(Path(path): Path<String>) -> Response {
         "css/responsive.css" => (
             "text/css; charset=utf-8",
             include_str!("assets/css/responsive.css"),
+        ),
+        "css/settings.css" => (
+            "text/css; charset=utf-8",
+            include_str!("assets/css/settings.css"),
         ),
         "js/main.js" => (
             "application/javascript; charset=utf-8",
@@ -56,6 +64,10 @@ pub async fn asset(Path(path): Path<String>) -> Response {
         "js/ui/context_menu.js" => (
             "application/javascript; charset=utf-8",
             include_str!("assets/js/ui/context_menu.js"),
+        ),
+        "js/settings.js" => (
+            "application/javascript; charset=utf-8",
+            include_str!("assets/js/settings.js"),
         ),
         _ => {
             return (

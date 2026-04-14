@@ -1,5 +1,6 @@
 pub mod batch;
 pub mod frontend;
+pub mod global_settings;
 pub mod jobs;
 pub mod misc;
 pub mod novel_settings;
@@ -63,6 +64,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/queue/status", get(jobs::queue_status))
         .route("/api/queue/clear", post(jobs::queue_clear))
         .route("/api/log/recent", get(misc::recent_logs))
+        .route("/api/global_setting", get(global_settings::get_global_settings))
+        .route("/api/global_setting", post(global_settings::save_global_settings))
+        .route("/settings", get(frontend::settings_page))
         .layer(middleware::from_fn_with_state(
             auth_state,
             basic_auth_middleware,

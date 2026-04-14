@@ -10,5 +10,6 @@ pub mod logger;
 pub mod mail;
 pub mod progress;
 pub mod queue;
+pub mod setting_info;
 pub mod version;
 pub mod web;

@@ -1,0 +1,347 @@
+/* Settings page styles */
+
+/* Container */
+.settings-container {
+  max-width: 60rem;
+  margin: 0 auto;
+  padding-top: 1rem;
+}
+
+/* Tab pills */
+.settings-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-bottom: 1rem;
+  padding: 0;
+  list-style: none;
+  border-bottom: 0.125rem solid var(--border-color);
+  padding-bottom: 0.5rem;
+}
+
+.settings-tabs li {
+  margin: 0;
+}
+
+.settings-tabs li a {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: 0.25rem;
+  text-decoration: none;
+  color: var(--text-color);
+  background: transparent;
+  cursor: pointer;
+  font-size: 0.9375rem;
+  transition: background 0.15s, color 0.15s;
+}
+
+.settings-tabs li a:hover {
+  background: var(--hover-bg, rgba(0, 0, 0, 0.06));
+}
+
+.settings-tabs li.active a {
+  background: var(--primary-color, #337ab7);
+  color: #fff;
+}
+
+.settings-tabs li a .error-badge {
+  color: var(--danger-color, #d9534f);
+  margin-left: 0.25rem;
+  font-weight: bold;
+}
+
+/* Tab panes */
+.tab-content .tab-pane {
+  display: none;
+}
+
+.tab-content .tab-pane.active {
+  display: block;
+}
+
+/* Panel (narou.rb panel-info style) */
+.panel-settings {
+  border: 0.0625rem solid var(--info-border, #bce8f1);
+  border-radius: 0.25rem;
+  margin-bottom: 1rem;
+  background: var(--panel-bg, #fff);
+}
+
+.panel-settings .panel-heading {
+  background: var(--info-bg, #d9edf7);
+  color: var(--info-text, #31708f);
+  padding: 0.625rem 1rem;
+  border-bottom: 0.0625rem solid var(--info-border, #bce8f1);
+  border-radius: 0.25rem 0.25rem 0 0;
+  font-size: 0.9375rem;
+}
+
+/* List group items */
+.list-group {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.list-group-item {
+  padding: 0.75rem 1rem;
+  border-bottom: 0.0625rem solid var(--border-color, #ddd);
+}
+
+.list-group-item:last-child {
+  border-bottom: none;
+}
+
+.list-group-item.has-error {
+  background: var(--danger-bg, #f2dede);
+}
+
+.list-group-item-heading {
+  font-size: 0.9375rem;
+  font-weight: 600;
+  margin: 0 0 0.5rem 0;
+  color: var(--heading-color, #333);
+  word-break: break-all;
+}
+
+.list-group-item-text {
+  font-size: 0.875rem;
+}
+
+/* Boolean toggle (checkbox style matching narou.rb switch-light) */
+.switch-light {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  user-select: none;
+  gap: 0.5rem;
+}
+
+.switch-light input[type="checkbox"] {
+  display: none;
+}
+
+.switch-track {
+  position: relative;
+  width: 3.5rem;
+  height: 1.75rem;
+  background: var(--switch-off-bg, #ccc);
+  border-radius: 1rem;
+  transition: background 0.2s;
+  flex-shrink: 0;
+}
+
+.switch-track::after {
+  content: '';
+  position: absolute;
+  top: 0.125rem;
+  left: 0.125rem;
+  width: 1.5rem;
+  height: 1.5rem;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+
+.switch-light input:checked + .switch-track {
+  background: var(--primary-color, #337ab7);
+}
+
+.switch-light input:checked + .switch-track::after {
+  transform: translateX(1.75rem);
+}
+
+.switch-label-text {
+  font-size: 0.875rem;
+  color: var(--text-muted, #777);
+}
+
+/* Three-way toggle (for default.*/force.* booleans) */
+.switch-3way {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  background: var(--well-bg, #f5f5f5);
+  border: 0.0625rem solid var(--border-color, #ddd);
+  border-radius: 0.25rem;
+  overflow: hidden;
+}
+
+.switch-3way input[type="radio"] {
+  display: none;
+}
+
+.switch-3way label {
+  padding: 0.375rem 0.75rem;
+  cursor: pointer;
+  font-size: 0.875rem;
+  color: var(--text-color, #333);
+  border-right: 0.0625rem solid var(--border-color, #ddd);
+  margin: 0;
+  transition: background 0.15s, color 0.15s;
+}
+
+.switch-3way label:last-of-type {
+  border-right: none;
+}
+
+.switch-3way input:checked + label {
+  background: var(--primary-color, #337ab7);
+  color: #fff;
+}
+
+/* Select / input fields */
+.setting-select {
+  width: 100%;
+  max-width: 25rem;
+  padding: 0.375rem 0.625rem;
+  border: 0.0625rem solid var(--border-color, #ccc);
+  border-radius: 0.25rem;
+  font-size: 0.875rem;
+  background: var(--input-bg, #fff);
+  color: var(--text-color, #333);
+}
+
+.setting-input {
+  width: 100%;
+  max-width: 25rem;
+  padding: 0.375rem 0.625rem;
+  border: 0.0625rem solid var(--border-color, #ccc);
+  border-radius: 0.25rem;
+  font-size: 0.875rem;
+  background: var(--input-bg, #fff);
+  color: var(--text-color, #333);
+}
+
+.setting-input:focus,
+.setting-select:focus {
+  border-color: var(--primary-color, #337ab7);
+  outline: none;
+  box-shadow: 0 0 0 0.125rem rgba(51, 122, 183, 0.25);
+}
+
+/* Multiple select */
+.setting-select[multiple] {
+  min-height: 5rem;
+}
+
+/* Help text */
+.setting-help {
+  margin-top: 0.375rem;
+  color: var(--text-muted, #777);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+
+/* Placeholder text for inputs */
+.setting-input::placeholder {
+  color: var(--text-muted, #aaa);
+  font-style: italic;
+}
+
+/* Replace tab textarea */
+.replace-textarea {
+  width: 100%;
+  min-height: 20rem;
+  padding: 0.625rem;
+  border: 0.0625rem solid var(--border-color, #ccc);
+  border-radius: 0.25rem;
+  font-family: monospace;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  resize: vertical;
+  background: var(--input-bg, #fff);
+  color: var(--text-color, #333);
+}
+
+.replace-textarea:focus {
+  border-color: var(--primary-color, #337ab7);
+  outline: none;
+  box-shadow: 0 0 0 0.125rem rgba(51, 122, 183, 0.25);
+}
+
+.replace-info {
+  margin-bottom: 0.75rem;
+}
+
+.replace-info li {
+  font-size: 0.875rem;
+  color: var(--text-muted, #555);
+  margin-bottom: 0.25rem;
+}
+
+/* Save button area */
+.settings-bottom-save {
+  text-align: center;
+  padding: 1.5rem 0;
+}
+
+.settings-bottom-save .btn {
+  min-width: 12rem;
+}
+
+/* Toast notification */
+.settings-toast {
+  position: fixed;
+  bottom: 2rem;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 0.75rem 1.5rem;
+  border-radius: 0.25rem;
+  font-size: 0.9375rem;
+  z-index: 9999;
+  opacity: 0;
+  transition: opacity 0.3s;
+  pointer-events: none;
+}
+
+.settings-toast.show {
+  opacity: 1;
+}
+
+.settings-toast.success {
+  background: var(--success-color, #5cb85c);
+  color: #fff;
+}
+
+.settings-toast.error {
+  background: var(--danger-color, #d9534f);
+  color: #fff;
+}
+
+/* Navbar btn on settings page */
+.navbar-btn {
+  margin: 0.5rem 0.625rem;
+  padding: 0.375rem 1rem;
+  font-size: 0.875rem;
+}
+
+.navbar-right {
+  margin-left: auto;
+}
+
+/* Responsive */
+@media (max-width: 48rem) {
+  .settings-container {
+    padding: 0.5rem;
+  }
+
+  .settings-tabs {
+    gap: 0.125rem;
+  }
+
+  .settings-tabs li a {
+    padding: 0.375rem 0.625rem;
+    font-size: 0.8125rem;
+  }
+
+  .setting-select,
+  .setting-input {
+    max-width: 100%;
+  }
+
+  .switch-3way label {
+    padding: 0.25rem 0.5rem;
+    font-size: 0.8125rem;
+  }
+}
