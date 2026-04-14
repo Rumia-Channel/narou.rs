@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use super::ini::{IniData, IniValue};
-use crate::error::Result;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NovelSettings {
@@ -129,7 +128,14 @@ impl NovelSettings {
 
         let ini_path = archive_path.join("setting.ini");
         let replace_path = archive_path.join("replace.txt");
-        let local_setting_path = archive_path.join(".narou").join("local_setting.yaml");
+        let local_setting_path = crate::db::inventory::Inventory::with_default_root()
+            .map(|inventory| {
+                inventory
+                    .root_dir()
+                    .join(".narou")
+                    .join("local_setting.yaml")
+            })
+            .unwrap_or_else(|_| PathBuf::from(".narou").join("local_setting.yaml"));
 
         let ini = match IniData::load_file(&ini_path) {
             Ok(i) => i,
@@ -870,6 +876,49 @@ fn yaml_value_to_ini(value: &serde_yaml::Value) -> IniValue {
         serde_yaml::Value::String(s) => IniValue::String(s.clone()),
         serde_yaml::Value::Null => IniValue::Null,
         _ => IniValue::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::NovelSettings;
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn load_for_novel_reads_project_local_setting_defaults() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "narou-rs-settings-test-{}-{}",
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive_path = root.join("小説データ").join("test-novel");
+        std::fs::create_dir_all(root.join(".narou")).unwrap();
+        std::fs::create_dir_all(&archive_path).unwrap();
+        std::fs::write(
+            root.join(".narou").join("local_setting.yaml"),
+            "default.enable_inspect: true\ndefault.enable_erase_introduction: true\n",
+        )
+        .unwrap();
+
+        std::env::set_current_dir(&archive_path).unwrap();
+        let settings = NovelSettings::load_for_novel(1, "title", "author", &archive_path);
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(settings.enable_inspect);
+        assert!(settings.enable_erase_introduction);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

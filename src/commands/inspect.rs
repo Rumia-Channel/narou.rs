@@ -1,12 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use narou_rs::converter::inspector::INSPECT_LOG_NAME;
 use narou_rs::db;
 
 use super::download;
 use super::log;
 
-const INSPECT_LOG_NAME: &str = "調査ログ.txt";
 const HR_TEXT: &str = "―――――――――――――――――――――――――――――――";
 
 pub fn cmd_inspect(targets: &[String]) -> i32 {
@@ -100,7 +100,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(base.join("調査ログ.txt"), "sample log\n").unwrap();
+        std::fs::write(base.join(super::INSPECT_LOG_NAME), "sample log\n").unwrap();
 
         assert_eq!(read_inspect_log(&base).as_deref(), Some("sample log\n"));
 

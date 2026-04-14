@@ -211,6 +211,7 @@ pub fn inject_command_defaults(args: &mut Vec<String>) {
     }
 
     match args[0].as_str() {
+        "convert" => inject_convert_defaults(args),
         "log" => inject_log_defaults(args),
         _ => {}
     }
@@ -276,6 +277,14 @@ fn inject_log_defaults(args: &mut Vec<String>) {
 
     for token in defaults.into_iter().rev() {
         args.insert(1, token);
+    }
+}
+
+fn inject_convert_defaults(args: &mut Vec<String>) {
+    if !has_option(args, "-i", "--inspect")
+        && load_local_setting_bool("convert.inspect").unwrap_or(false)
+    {
+        args.insert(1, "--inspect".to_string());
     }
 }
 
@@ -410,6 +419,8 @@ pub enum Commands {
         ignore_all: bool,
     },
     Convert {
+        #[arg(short = 'i', long)]
+        inspect: bool,
         targets: Vec<String>,
     },
     Diff {

@@ -83,7 +83,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
 | `download` | ✅ | 🟡 部分 | `--mail` を追加。メール設定の自動作成と送信は実装済みだが、全互換確認は継続中 |
 | `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、digest選択肢、差分cache退避、hotentryのcopy/send/mailまでは実装済み。周辺出力/イベント細部が残る |
-| `convert` | ✅ | 🟡 部分 | `--device`, `--no-epub`, `--output` 等不足 |
+| `convert` | ✅ | 🟡 部分 | `--inspect` / `convert.inspect` / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定までは実装。`--device`, `--no-epub`, `--output` 等が残る |
 | `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--echo` と pipe 時ID出力まで実装 |
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションまで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
@@ -101,7 +101,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `folder` | ✅ | ✅ 完了 | `--no-open`、引数省略時 help、alias/tag 解決を実装 |
 | `browser` | ✅ | ✅ 完了 | `--vote` で最新話感想ページ生成、引数省略時 help、alias/tag 解決を実装 |
 | `alias` | ✅ | ✅ 完了 | `alias.yaml` 読み書き、`--list`、`name=` 解除、`hotentry` 禁止語、共通ターゲット解決への統合を実装 |
-| `inspect` | ✅ | 🟡 部分 | `調査ログ.txt` 表示、target 省略時 `latest_convert` fallback、複数 target、tag 展開を実装。ログ生成側 (`convert.inspect`) は未実装 |
+| `inspect` | ✅ | 🟡 部分 | `調査ログ.txt` 表示に加えて、変換時のログ生成・`convert.inspect`・summary/full display まで実装。Ruby Inspector の警告/エラー系細部が残る |
 | `csv` | ✅ | ✅ 完了 | CSV export/import、`-o` / `-i`、`url` ヘッダー必須、download 経由 import を実装 |
 | `trace` | ✅ | ✅ 完了 | `trace_dump.txt` を表示。panic 時に保存されたバックトレースを読む |
 
@@ -224,7 +224,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `--no-strip` | — | flag | false | MOBI ストリップスキップ | ❌ |
 | `--no-zip` | — | flag | false | ZIP 作成スキップ | ❌ |
 | `--no-open` | — | flag | false | 出力フォルダを開かない | ❌ |
-| `--inspect` | `-i` | flag | false | 小説状態調査ログ表示 | ❌ |
+| `--inspect` | `-i` | flag | false | 小説状態調査ログ表示 | ✅ |
 | `--verbose` | `-v` | flag | false | AozoraEpub3/kindlegen 標準出力表示 | ❌ |
 | `--ignore-default` | — | flag | false | default.* 設定を無視 | ❌ |
 | `--ignore-force` | — | flag | false | force.* 設定を無視 | ❌ |
@@ -239,6 +239,12 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 変換後の端末送信
 - `dc:subject` へのタグ埋め込み
 - ThreadPool による並列変換
+
+**Rust 実装メモ**:
+- `-i/--inspect` を clap / `main.rs` / `commands::convert` に接続し、`local_setting.yaml` の `convert.inspect=true` も Ruby版同様に direct convert の既定値として注入する
+- 変換後に `調査ログ.txt` を常に保存し、`enable_inspect` が有効なときは行末読点状況とカギ括弧内改行状況を記録する
+- `--inspect` 指定時は full display、未指定時は Ruby版同様に summary だけを出す
+- `enable_erase_introduction` / `enable_erase_postscript` を section 変換に反映し、`enable_auto_indent` は Ruby版 `Inspector#inspect_indent` 相当の比率判定でのみ有効化する
 
 **注**: EPUB/MOBI 生成は AozoraEpub3.jar と kindlegen への依存がある。Rust 側のテキスト変換 (`novel.txt` 生成) は完了しているが、AozoraEpub3 の呼び出しパイプラインは別途必要。
 
@@ -653,10 +659,14 @@ narou setting name         # 読み取り
 
 オプションなし。target 省略時 = 最終変換小説。
 
-**Rust 実装**: `src/commands/inspect.rs` で `調査ログ.txt` の読み取り表示を実装。target 省略時は `.narou/latest_convert.yaml` の `id` を使い、複数 target は Ruby版同様に区切り線付きで順に表示する。ログが存在しない場合は `調査ログがまだ無いようです` を表示する。
+**Rust 実装**:
+- `src/commands/inspect.rs` で `調査ログ.txt` の読み取り表示を実装。target 省略時は `.narou/latest_convert.yaml` の `id` を使い、複数 target は Ruby版同様に区切り線付きで順に表示する。ログが存在しない場合は `調査ログがまだ無いようです` を表示する
+- `src/converter/inspector.rs` を追加し、変換時に `調査ログ.txt` を保存するようにした
+- `convert.inspect=true` と `convert --inspect` で full display、通常 convert では Ruby版同様 summary 表示にした
 
 **不足動作**:
-- 変換時の検査処理そのもの (`Inspector` 相当) は未移植で、`convert.inspect=true` による調査ログ生成・常時表示はまだ動かない
+- Ruby版 `Inspector` が conversion 中に出す警告/エラー（括弧不整合、括弧内自動結合警告、`modify_kana_ni_to_kanji_ni` INFO など）は未移植
+- テキストファイル変換経路を含めた Ruby版 `inspect` 完全互換は継続確認が必要
 
 ---
 
@@ -699,7 +709,7 @@ narou setting name         # 読み取り
 | convert `--device`, `--no-open`, `--output` | convert | 変換パイプライン完成 |
 | download の残互換実装 | download | 再DL確認・mail 周辺 |
 | setting の残互換実装 | setting | 全設定変数と device hook の詰め |
-| inspect のログ生成側 | inspect | `convert.inspect` / Inspector 互換 |
+| inspect の残警告/エラー互換 | inspect | Ruby Inspector の conversion-time メッセージ |
 
 ### P1: 設定管理基盤
 多くのコマンドが `local_setting` / `global_setting` に依存する。

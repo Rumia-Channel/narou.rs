@@ -5,7 +5,7 @@ use narou_rs::progress::CliProgress;
 
 use super::resolve_target_to_id;
 
-pub fn cmd_convert(targets: &[String]) {
+pub fn cmd_convert(targets: &[String], inspect: bool) {
     if let Err(e) = narou_rs::db::init_database() {
         eprintln!("Error initializing database: {}", e);
         std::process::exit(1);
@@ -48,10 +48,16 @@ pub fn cmd_convert(targets: &[String]) {
                 NovelConverter::new(settings)
             };
         converter.set_progress(Box::new(progress));
+        converter.set_display_inspector(inspect);
 
         match converter.convert_novel_by_id(id, &novel_dir) {
             Ok(output_path) => {
                 let _ = multi_clone.println(&format!("  Output: {}", output_path));
+                if let Some(inspection) = converter.take_inspection_output() {
+                    for line in inspection.split('\n') {
+                        let _ = multi_clone.println(line);
+                    }
+                }
             }
             Err(e) => {
                 let _ = multi_clone.println(&format!("  Error: {}", e));

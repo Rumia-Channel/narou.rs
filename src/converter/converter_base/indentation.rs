@@ -102,9 +102,12 @@ impl ConverterBase {
             })
             .to_string();
 
-        if self.settings.enable_force_indent || self.settings.enable_auto_indent {
-            let ignore_chars = "(\u{FF08}\u{300C}\u{300E}\u{3008}\u{300A}\u{226A}\u{3010}\u{3014}\u{2015}\u{30FB}\u{203B}\u{FF3B}\u{301D}\u{E000}\n";
-            let re = Regex::new(&format!(r"(?m)^([^{0}])", regex::escape(ignore_chars))).unwrap();
+        if self.settings.enable_force_indent
+            || (self.settings.enable_auto_indent
+                && crate::converter::inspector::Inspector::should_auto_indent(data))
+        {
+            let ignore_chars = "(\u{FF08}\u{300C}\u{300E}\u{3008}\u{300A}\u{226A}\u{3010}\u{3014}\u{2015}\u{30FB}\u{203B}\u{FF3B}\u{301D}\u{E000}";
+            let re = Regex::new(&format!(r"(?m)^([^\n{}])", regex::escape(ignore_chars))).unwrap();
             *data = re
                 .replace_all(data, |caps: &regex::Captures| {
                     let ch = &caps[1];

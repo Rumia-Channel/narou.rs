@@ -1,6 +1,7 @@
 pub mod converter_base;
 pub mod device;
 pub mod ini;
+pub mod inspector;
 pub mod output;
 pub mod render;
 pub mod settings;
@@ -24,6 +25,8 @@ pub struct NovelConverter {
     section_cache: HashMap<String, CacheEntry>,
     cache_dirty: bool,
     progress: Option<Box<dyn ProgressReporter>>,
+    display_inspector: bool,
+    last_inspection_output: Option<String>,
 }
 
 struct CacheEntry {
@@ -39,6 +42,8 @@ impl NovelConverter {
             section_cache: HashMap::new(),
             cache_dirty: false,
             progress: None,
+            display_inspector: false,
+            last_inspection_output: None,
         }
     }
 
@@ -49,11 +54,21 @@ impl NovelConverter {
             section_cache: HashMap::new(),
             cache_dirty: false,
             progress: None,
+            display_inspector: false,
+            last_inspection_output: None,
         }
     }
 
     pub fn set_progress(&mut self, progress: Box<dyn ProgressReporter>) {
         self.progress = Some(progress);
+    }
+
+    pub fn set_display_inspector(&mut self, display_inspector: bool) {
+        self.display_inspector = display_inspector;
+    }
+
+    pub fn take_inspection_output(&mut self) -> Option<String> {
+        self.last_inspection_output.take()
     }
 
     pub fn convert_novel(&mut self, toc: &TocObject, sections: &[SectionFile]) -> Result<String> {
@@ -112,7 +127,9 @@ impl NovelConverter {
                 batch_inputs.push((subtitle.clone(), converter_base::TextType::Subtitle));
             }
 
-            let intro_text = if is_html && !section.element.introduction.is_empty() {
+            let intro_text = if self.settings.enable_erase_introduction {
+                String::new()
+            } else if is_html && !section.element.introduction.is_empty() {
                 crate::downloader::html::to_aozora(&section.element.introduction)
             } else {
                 section.element.introduction.clone()
@@ -122,18 +139,22 @@ impl NovelConverter {
             } else {
                 section.element.body.clone()
             };
-            let post_text = if is_html && !section.element.postscript.is_empty() {
+            let post_text = if self.settings.enable_erase_postscript {
+                String::new()
+            } else if is_html && !section.element.postscript.is_empty() {
                 crate::downloader::html::to_aozora(&section.element.postscript)
             } else {
                 section.element.postscript.clone()
             };
+            let has_intro = !intro_text.is_empty();
+            let has_post = !post_text.is_empty();
 
-            if !intro_text.is_empty() {
-                batch_inputs.push((intro_text, converter_base::TextType::Introduction));
+            if has_intro {
+                batch_inputs.push((intro_text.clone(), converter_base::TextType::Introduction));
             }
             batch_inputs.push((body_text, converter_base::TextType::Body));
-            if !post_text.is_empty() {
-                batch_inputs.push((post_text, converter_base::TextType::Postscript));
+            if has_post {
+                batch_inputs.push((post_text.clone(), converter_base::TextType::Postscript));
             }
 
             let results = converter.convert_multi(&batch_inputs);
@@ -153,7 +174,7 @@ impl NovelConverter {
             } else {
                 String::new()
             };
-            let conv_intro = if !section.element.introduction.is_empty() {
+            let conv_intro = if has_intro {
                 let r = results[ri].clone();
                 ri += 1;
                 r
@@ -162,7 +183,7 @@ impl NovelConverter {
             };
             let conv_body = results[ri].clone();
             ri += 1;
-            let conv_post = if !section.element.postscript.is_empty() {
+            let conv_post = if has_post {
                 let r = results[ri].clone();
                 r
             } else {
@@ -260,6 +281,13 @@ impl NovelConverter {
                 .as_bytes(),
         );
         hasher.update(self.settings.enable_auto_indent.to_string().as_bytes());
+        hasher.update(
+            self.settings
+                .enable_erase_introduction
+                .to_string()
+                .as_bytes(),
+        );
+        hasher.update(self.settings.enable_erase_postscript.to_string().as_bytes());
         hasher.update(self.settings.enable_ruby.to_string().as_bytes());
         hasher.update(
             self.settings
@@ -292,6 +320,7 @@ impl NovelConverter {
     }
 
     pub fn convert_novel_by_id(&mut self, id: i64, novel_dir: &std::path::Path) -> Result<String> {
+        self.last_inspection_output = None;
         let toc_path = novel_dir.join("toc.yaml");
         let toc_content = std::fs::read_to_string(&toc_path).map_err(|e| NarouError::Io(e))?;
         let toc: crate::downloader::TocFile =
@@ -312,6 +341,7 @@ impl NovelConverter {
         let txt_path = output::create_output_text_path(&self.settings, id, novel_dir, &toc_object);
         std::fs::write(&txt_path, &aozora_text)?;
         save_latest_convert(id)?;
+        self.inspect_converted_text(&aozora_text)?;
 
         Ok(txt_path.display().to_string())
     }
@@ -322,6 +352,7 @@ impl NovelConverter {
         novel_dir: &std::path::Path,
         device: device::Device,
     ) -> Result<PathBuf> {
+        self.last_inspection_output = None;
         let toc_path = novel_dir.join("toc.yaml");
         let toc_content = std::fs::read_to_string(&toc_path).map_err(|e| NarouError::Io(e))?;
         let toc: crate::downloader::TocFile =
@@ -342,6 +373,7 @@ impl NovelConverter {
         let txt_path = output::create_output_text_path(&self.settings, _id, novel_dir, &toc_object);
         std::fs::write(&txt_path, &aozora_text)?;
         save_latest_convert(_id)?;
+        self.inspect_converted_text(&aozora_text)?;
 
         let output_manager = device::OutputManager::new(device);
         let base_name = txt_path
@@ -351,6 +383,25 @@ impl NovelConverter {
         let final_path = output_manager.convert_file(&txt_path, novel_dir, base_name)?;
 
         Ok(final_path)
+    }
+
+    fn inspect_converted_text(&mut self, aozora_text: &str) -> Result<()> {
+        let mut inspector = inspector::Inspector::new(&self.settings);
+        if self.settings.enable_inspect {
+            inspector
+                .inspect_end_touten_conditions(aozora_text, self.settings.enable_auto_join_line);
+            inspector.countup_return_in_brackets(
+                aozora_text,
+                self.settings.enable_auto_join_in_brackets,
+            );
+        }
+        inspector.save().map_err(NarouError::Io)?;
+        self.last_inspection_output = if self.display_inspector {
+            inspector.display_text()
+        } else {
+            inspector.summary_text()
+        };
+        Ok(())
     }
 }
 

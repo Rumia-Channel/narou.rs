@@ -270,6 +270,9 @@ pub fn convert_existing_novel(
     };
 
     println!("  Converted: {}", output_path.display());
+    if let Some(inspection) = converter.take_inspection_output() {
+        println!("{}", inspection);
+    }
 
     if let Some(device) = device {
         let _ = copy_to_converted_file(&output_path, Some(device), id);
