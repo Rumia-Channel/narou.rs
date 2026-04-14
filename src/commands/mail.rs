@@ -99,20 +99,21 @@ fn mail_interrupt_flag() -> Result<Arc<AtomicBool>, i32> {
 }
 
 fn collect_all_targets() -> Vec<String> {
-    let mut ids = narou_rs::db::with_database(|db| Ok(db.ids())).unwrap_or_default();
-    ids.sort_unstable();
-    ids.into_iter()
-        .filter(|id| {
-            narou_rs::db::with_database(|db| {
-                Ok(db
-                    .get(*id)
-                    .map(|record| !record.tags.contains(&"frozen".to_string()))
-                    .unwrap_or(false))
+    let frozen_ids = narou_rs::compat::load_frozen_ids().unwrap_or_default();
+    narou_rs::db::with_database(|db| {
+        let mut ids = db.ids();
+        ids.sort_unstable();
+        Ok(ids
+            .into_iter()
+            .filter(|id| {
+                db.get(*id)
+                    .map(|record| !narou_rs::compat::record_is_frozen(record, &frozen_ids))
+                    .unwrap_or(false)
             })
-            .unwrap_or(false)
-        })
-        .map(|id| id.to_string())
-        .collect()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>())
+    })
+    .unwrap_or_default()
 }
 
 fn expand_targets(targets: &[String]) -> Vec<String> {

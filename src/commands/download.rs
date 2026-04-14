@@ -456,18 +456,9 @@ fn parse_confirm_input(input: &str, default: bool) -> Option<bool> {
 }
 
 fn is_novel_frozen(target: &str) -> bool {
-    let data = get_data_by_target(target);
-    if let Some(rec) = data {
-        narou_rs::db::with_database(|db| {
-            Ok(db
-                .get(rec.id)
-                .map(|r| r.tags.contains(&"frozen".to_string()))
-                .unwrap_or(false))
-        })
+    get_data_by_target(target)
+        .map(|rec| narou_rs::compat::is_frozen_id(rec.id))
         .unwrap_or(false)
-    } else {
-        false
-    }
 }
 
 fn print_download_status(multi: &Arc<MultiProgress>, dl: &narou_rs::downloader::DownloadResult) {

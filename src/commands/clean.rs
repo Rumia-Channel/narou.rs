@@ -57,11 +57,12 @@ fn cmd_clean_inner(
 }
 
 fn clean_all(remove: bool) -> Result<(), String> {
+    let frozen_ids = narou_rs::compat::load_frozen_ids().map_err(|e| e.to_string())?;
     let dirs = db::with_database(|db| {
         let archive_root = db.archive_root().to_path_buf();
         let mut dirs = Vec::new();
         for record in db.all_records().values() {
-            if record.tags.iter().any(|tag| tag == "frozen") {
+            if narou_rs::compat::record_is_frozen(record, &frozen_ids) {
                 continue;
             }
             dirs.push(novel_dir_for_record(&archive_root, record));

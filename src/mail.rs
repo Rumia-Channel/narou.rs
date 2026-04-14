@@ -9,6 +9,7 @@ use std::time::Duration;
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, Body, Mailbox, Message, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
+use lettre::transport::smtp::extension::ClientId;
 use lettre::{SmtpTransport, Transport};
 
 use crate::converter::output::create_output_text_filename;
@@ -370,8 +371,9 @@ fn build_transport(setting: &MailSetting) -> std::result::Result<SmtpTransport, 
     let port = yaml_u16(via_options.get("port")).unwrap_or(587);
     let user_name = yaml_string(via_options.get("user_name")).unwrap_or_default();
     let password = yaml_string(via_options.get("password")).unwrap_or_default();
-    let authentication = yaml_string(via_options.get("authentication"));
+    let authentication = smtp_auth_mechanisms(via_options.get("authentication"));
     let enable_starttls_auto = yaml_bool(via_options.get("enable_starttls_auto")).unwrap_or(true);
+    let domain = yaml_string(via_options.get("domain")).filter(|value| !value.is_empty());
 
     let mut builder = if port == 465 {
         SmtpTransport::relay(&host)
@@ -389,10 +391,12 @@ fn build_transport(setting: &MailSetting) -> std::result::Result<SmtpTransport, 
         builder = builder.credentials(Credentials::new(user_name, password));
     }
 
-    if let Some(auth) = authentication.as_deref() {
-        if auth.eq_ignore_ascii_case(":plain") || auth.eq_ignore_ascii_case("plain") {
-            builder = builder.authentication(vec![Mechanism::Plain]);
-        }
+    if let Some(domain) = domain {
+        builder = builder.hello_name(ClientId::Domain(domain));
+    }
+
+    if !authentication.is_empty() {
+        builder = builder.authentication(authentication);
     }
 
     Ok(builder.build())
@@ -630,6 +634,37 @@ fn yaml_string(value: Option<&serde_yaml::Value>) -> Option<String> {
     yaml_value_to_string(value)
 }
 
+fn yaml_string_list(value: Option<&serde_yaml::Value>) -> Vec<String> {
+    match value {
+        Some(serde_yaml::Value::Sequence(values)) => values
+            .iter()
+            .filter_map(|v| yaml_value_to_string(Some(v)))
+            .collect(),
+        Some(value) => yaml_string(Some(value))
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+fn smtp_auth_mechanisms(value: Option<&serde_yaml::Value>) -> Vec<Mechanism> {
+    yaml_string_list(value)
+        .into_iter()
+        .filter_map(|raw| match raw.trim_start_matches(':').to_ascii_lowercase().as_str() {
+            "plain" => Some(Mechanism::Plain),
+            "login" => Some(Mechanism::Login),
+            "xoauth2" => Some(Mechanism::Xoauth2),
+            _ => None,
+        })
+        .collect()
+}
+
 fn yaml_bool(value: Option<&serde_yaml::Value>) -> Option<bool> {
     let value = value?;
     match value {
@@ -674,9 +709,13 @@ fn preset_dir() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAIL_INTERRUPTED_MESSAGE, MailSetting, attachment_name, send_mail_with_progress};
+    use super::{
+        MAIL_INTERRUPTED_MESSAGE, MailSetting, attachment_name, build_transport,
+        send_mail_with_progress, smtp_auth_mechanisms,
+    };
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
+    use lettre::transport::smtp::authentication::Mechanism;
     use tempfile::TempDir;
 
     #[test]
@@ -711,5 +750,64 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, MAIL_INTERRUPTED_MESSAGE);
+    }
+
+    #[test]
+    fn smtp_auth_mechanisms_accept_ruby_symbols_and_lists() {
+        assert_eq!(
+            smtp_auth_mechanisms(Some(&serde_yaml::Value::String(":login".to_string()))),
+            vec![Mechanism::Login]
+        );
+        assert_eq!(
+            smtp_auth_mechanisms(Some(&serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String(":plain".to_string()),
+                serde_yaml::Value::String("xoauth2".to_string()),
+            ]))),
+            vec![Mechanism::Plain, Mechanism::Xoauth2]
+        );
+    }
+
+    #[test]
+    fn build_transport_accepts_domain_and_login_authentication() {
+        let mut via_options = HashMap::new();
+        via_options.insert(
+            "address".to_string(),
+            serde_yaml::Value::String("smtp.example.com".to_string()),
+        );
+        via_options.insert(
+            "port".to_string(),
+            serde_yaml::Value::Number(serde_yaml::Number::from(587)),
+        );
+        via_options.insert(
+            "enable_starttls_auto".to_string(),
+            serde_yaml::Value::Bool(false),
+        );
+        via_options.insert(
+            "user_name".to_string(),
+            serde_yaml::Value::String("user".to_string()),
+        );
+        via_options.insert(
+            "password".to_string(),
+            serde_yaml::Value::String("secret".to_string()),
+        );
+        via_options.insert(
+            "authentication".to_string(),
+            serde_yaml::Value::String(":login".to_string()),
+        );
+        via_options.insert(
+            "domain".to_string(),
+            serde_yaml::Value::String("example.com".to_string()),
+        );
+
+        let setting = MailSetting {
+            from: "sender@example.com".to_string(),
+            to: "receiver@example.com".to_string(),
+            subject: "subject".to_string(),
+            via: "smtp".to_string(),
+            via_options,
+            extras: HashMap::new(),
+        };
+
+        build_transport(&setting).unwrap();
     }
 }

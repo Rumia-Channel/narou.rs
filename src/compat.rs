@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -90,6 +90,33 @@ pub fn current_device() -> Option<Device> {
     let raw = load_local_setting_string("device")?;
     let device = Device::from_str(&raw);
     (device != Device::Text).then_some(device)
+}
+
+pub fn load_frozen_ids() -> Result<HashSet<i64>> {
+    crate::db::with_database(|db| {
+        let frozen: HashMap<i64, serde_yaml::Value> =
+            db.inventory().load("freeze", InventoryScope::Local)?;
+        Ok(frozen.into_keys().collect())
+    })
+}
+
+pub fn record_is_frozen(record: &crate::db::NovelRecord, frozen_ids: &HashSet<i64>) -> bool {
+    frozen_ids.contains(&record.id) || record.tags.iter().any(|tag| tag == "frozen")
+}
+
+pub fn is_frozen_id(id: i64) -> bool {
+    let frozen_ids = load_frozen_ids().unwrap_or_default();
+    if frozen_ids.contains(&id) {
+        return true;
+    }
+
+    crate::db::with_database(|db| {
+        Ok(db
+            .get(id)
+            .map(|record| record_is_frozen(record, &frozen_ids))
+            .unwrap_or(false))
+    })
+    .unwrap_or(false)
 }
 
 pub fn set_frozen_state(id: i64, frozen: bool) -> Result<()> {
@@ -469,7 +496,39 @@ fn sanitize_backup_name(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_backup_name;
+    use chrono::{TimeZone, Utc};
+
+    use super::{record_is_frozen, sanitize_backup_name};
+    use crate::db::NovelRecord;
+
+    fn sample_record(id: i64, tags: &[&str]) -> NovelRecord {
+        NovelRecord {
+            id,
+            author: "author".to_string(),
+            title: format!("title-{}", id),
+            file_title: format!("file-{}", id),
+            toc_url: format!("https://example.com/{}/", id),
+            sitename: "site".to_string(),
+            novel_type: 1,
+            end: false,
+            last_update: Utc.with_ymd_and_hms(2026, 4, 14, 0, 0, 0).unwrap(),
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: None,
+            general_lastup: None,
+            last_mail_date: None,
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ncode: None,
+            domain: None,
+            general_all_no: None,
+            length: None,
+            suspend: false,
+            is_narou: false,
+            last_check_date: None,
+            convert_failure: false,
+        }
+    }
 
     #[test]
     fn sanitize_backup_name_matches_ruby_replacements() {
@@ -489,5 +548,15 @@ mod tests {
     #[test]
     fn sanitize_backup_name_falls_back_when_empty() {
         assert_eq!(sanitize_backup_name(""), "");
+    }
+
+    #[test]
+    fn record_is_frozen_checks_freeze_inventory_before_tags() {
+        let mut frozen_ids = std::collections::HashSet::new();
+        frozen_ids.insert(1);
+
+        assert!(record_is_frozen(&sample_record(1, &[]), &frozen_ids));
+        assert!(record_is_frozen(&sample_record(2, &["frozen"]), &frozen_ids));
+        assert!(!record_is_frozen(&sample_record(3, &[]), &frozen_ids));
     }
 }

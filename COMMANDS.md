@@ -142,7 +142,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `-r`/`--remove`: DL+変換後にDBから削除（ファイルは残る）
 - `-m`/`--mail`: 変換後に `mail` コマンドと同じ helper で送信。設定未作成時は `mail_setting.yaml` を生成し、注意メッセージも Ruby版に寄せた
 - 引数なしでインタラクティブモード (stdin から URL 入力、TTY時のみ)
-- 凍結チェック: 凍結済み小説はスキップ
+- 凍結チェック: Ruby版と同じ `.narou/freeze.yaml` を優先し、移行互換として `frozen` タグも補助的に認識した上で凍結済み小説をスキップ
 - ダウンロード済みチェック: 既存小説はスキップ（`--force`で上書き）
 - DB に記録があるのに保存フォルダが消えていた場合は、Ruby版同様に DB インデックスを削除して `再ダウンロードしますか (y/n)?` を確認する。非TTYでは yes 扱いで再DLへ進む
 - タグ展開: `tag:NAME` → 該当IDに展開、`^tag:NAME` → 補集合
@@ -503,9 +503,10 @@ narou setting name         # 読み取り
 **Rust 実装**:
 - `mail_setting.yaml` の読み込み、未作成時の preset コピー、初回作成時の `last_mail_date` 初期化を実装
 - 設定不完全時は Ruby版同様に設定ファイルのフルパス付きでエラーを表示
-- target 省略時は凍結以外の全小説を対象にし、`last_mail_date` と `new_arrivals_date` を比較して未送信分だけ送る
+- target 省略時は `.narou/freeze.yaml` を優先しつつ `frozen` タグも補助的に認識して凍結以外の全小説を対象にし、`last_mail_date` と `new_arrivals_date` を比較して未送信分だけ送る
 - `hotentry` 特別扱い、tag 展開、alias / タイトル / URL / Nコード解決に対応
 - 送信中は `メールを送信しています...` の進捗表示を行い、成功時に `last_mail_date` を更新する
+- `smtp` 経路では preset に含まれる `via_options.domain` を EHLO 名へ反映し、`authentication` は `:plain` / `:login` / `:xoauth2` を受理する
 
 **完了扱いにしない理由 / 不足動作**:
 - Ruby版 Mailer/Pony 設定の全オプション互換は未確認で、現状は `smtp` 経路を主対象にしている

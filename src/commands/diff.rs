@@ -435,8 +435,10 @@ fn clean_all_diff() -> std::result::Result<(), String> {
     })
     .map_err(|e| e.to_string())?;
 
+    let frozen_ids = compat::load_frozen_ids().map_err(|e| e.to_string())?;
+
     for record in records {
-        if record.tags.iter().any(|tag| tag == "frozen") {
+        if compat::record_is_frozen(&record, &frozen_ids) {
             continue;
         }
 
