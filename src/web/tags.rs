@@ -64,6 +64,64 @@ pub async fn remove_tag(
     }))
 }
 
+/// POST /api/novels/{id}/tags — add multiple tags (frontend-compatible)
+pub async fn add_tags(
+    State(state): State<AppState>,
+    Path(IdPath { id }): Path<IdPath>,
+    Json(body): Json<TagsBody>,
+) -> Result<Json<ApiResponse>, (StatusCode, String)> {
+    with_database_mut(|db| {
+        let record = db
+            .get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
+        let mut updated = record;
+        for tag in &body.tags {
+            if !updated.tags.contains(tag) {
+                updated.tags.push(tag.clone());
+            }
+        }
+        db.insert(updated);
+        db.save()
+    })
+    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    state
+        .push_server
+        .broadcast("tag_add", &format!("{} {:?}", id, body.tags));
+    Ok(Json(ApiResponse {
+        success: true,
+        message: "Tags added".to_string(),
+    }))
+}
+
+/// POST /api/novels/{id}/tags/remove — remove multiple tags (frontend-compatible)
+pub async fn remove_tags(
+    State(state): State<AppState>,
+    Path(IdPath { id }): Path<IdPath>,
+    Json(body): Json<TagsBody>,
+) -> Result<Json<ApiResponse>, (StatusCode, String)> {
+    with_database_mut(|db| {
+        let record = db
+            .get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
+        let mut updated = record;
+        updated.tags.retain(|t| !body.tags.contains(t));
+        db.insert(updated);
+        db.save()
+    })
+    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    state
+        .push_server
+        .broadcast("tag_remove", &format!("{} {:?}", id, body.tags));
+    Ok(Json(ApiResponse {
+        success: true,
+        message: "Tags removed".to_string(),
+    }))
+}
+
 pub async fn update_tags(
     State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
