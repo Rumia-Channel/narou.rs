@@ -17,12 +17,11 @@ use tower_http::cors::CorsLayer;
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub port: u16,
+    pub ws_port: u16,
     pub push_server: Arc<push::PushServer>,
 }
 
-pub fn create_router(port: u16) -> Router {
-    let push_server = Arc::new(push::PushServer::new());
-
+pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(novels::index))
         .route("/api/novels/count", get(novels::novels_count))
@@ -52,7 +51,6 @@ pub fn create_router(port: u16) -> Router {
         .route("/api/queue/status", get(jobs::queue_status))
         .route("/api/queue/clear", post(jobs::queue_clear))
         .route("/api/log/recent", get(misc::recent_logs))
-        .route("/ws", get(push::ws_handler_with_app_state))
         .layer(CorsLayer::permissive())
-        .with_state(AppState { port, push_server })
+        .with_state(state)
 }

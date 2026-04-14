@@ -499,7 +499,10 @@ mod tests {
         std::fs::create_dir_all(root.join(".narou")).unwrap();
         let inventory = narou_rs::db::inventory::Inventory::new(root.clone());
         let mut settings = HashMap::new();
-        settings.insert("convert.no-strip".to_string(), serde_yaml::Value::Bool(true));
+        settings.insert(
+            "convert.no-strip".to_string(),
+            serde_yaml::Value::Bool(true),
+        );
         inventory
             .save(
                 "local_setting",
@@ -567,7 +570,10 @@ mod tests {
         std::fs::create_dir_all(root.join(".narou")).unwrap();
         let inventory = narou_rs::db::inventory::Inventory::new(root.clone());
         let mut settings = HashMap::new();
-        settings.insert("convert.make-zip".to_string(), serde_yaml::Value::Bool(true));
+        settings.insert(
+            "convert.make-zip".to_string(),
+            serde_yaml::Value::Bool(true),
+        );
         inventory
             .save(
                 "local_setting",
@@ -607,8 +613,8 @@ pub enum Commands {
         line_height: Option<f64>,
     },
     Web {
-        #[arg(short, long, default_value_t = 3000)]
-        port: u16,
+        #[arg(short, long)]
+        port: Option<u16>,
         #[arg(short, long, default_value_t = false)]
         no_browser: bool,
     },

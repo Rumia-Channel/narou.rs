@@ -523,18 +523,19 @@ narou setting name         # 読み取り
 
 | オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
 |-----------|------|-----|-----------|------|:----:|
-| `--port PORT` | `-p` | int | 3000 | サーバポート | ✅ |
+| `--port PORT` | `-p` | int | 未指定時は global `server-port` / 初回はランダム保存 | サーバポート | ✅ |
 | `--no-browser` | `-n` | flag | false | ブラウザ自動起動抑制 | ✅ |
 
 **実装済み動作**:
+- `--port` 未指定時は Ruby版同様 global `server-port` を使い、未設定ならランダムポートを採番して保存する
+- global `server-bind` を読み、未設定時は `127.0.0.1` に bind する（`localhost` は `127.0.0.1` 扱い）
+- WebSocket サーバは HTTP と別に `server-port + 1` で起動する
+- 初回起動時は Ruby版同様にファイアウォール許可と停止方法の案内を表示し、`server_setting.yaml` に起動済みフラグを保存する
 - API の凍結/解凍操作と一覧上の `frozen` 判定は CLI と同じ `.narou/freeze.yaml` を優先し、`frozen` タグは補助的に扱う
 
 **不足動作**:
-- WebSocket ポート = HTTP ポート + 1
-- 初回起動時のファイアウォール警告
 - 自動更新スケジューラの起動
 - Basic 認証 (`server-basic-auth` 設定)
-- `server-bind` 設定対応
 - HTML フロントエンド (Ruby 版は HAML テンプレート)
 - `webui.theme` 設定
 - `webui.performance-mode` 設定

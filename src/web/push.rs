@@ -124,7 +124,7 @@ impl Default for PushServer {
     }
 }
 
-pub fn create_push_router(push_server: Arc<PushServer>) -> Router<Arc<PushServer>> {
+pub fn create_push_router(push_server: Arc<PushServer>) -> Router {
     Router::new()
         .route("/ws", get(ws_handler))
         .with_state(push_server)
