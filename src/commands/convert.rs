@@ -21,6 +21,9 @@ pub fn cmd_convert(
     encoding: Option<&str>,
     no_epub: bool,
     no_mobi: bool,
+    no_strip: bool,
+    no_zip: bool,
+    make_zip: bool,
     inspect: bool,
     no_open: bool,
     verbose: bool,
@@ -36,8 +39,11 @@ pub fn cmd_convert(
     let multi_clone = multi.clone();
     let mut first_output_dir = None;
     let output_parts = output.map(split_output_name);
-    let selected_device = narou_rs::compat::current_device();
-    let output_device = effective_convert_device(selected_device, no_epub, no_mobi);
+    let _ = no_strip;
+    let selected_devices = match resolve_selected_devices(make_zip, &multi_clone) {
+        Ok(devices) => devices,
+        Err(()) => return,
+    };
     let encoding = match normalize_text_file_encoding_name(encoding) {
         Ok(encoding) => encoding,
         Err(message) => {
@@ -46,135 +52,176 @@ pub fn cmd_convert(
         }
     };
 
-    if let Some(device) = selected_device {
-        let _ = multi_clone.println(&format!(">> {}用に変換します", device.display_name()));
-    }
+    for selected_device in selected_devices {
+        let output_device = effective_convert_device(selected_device, no_epub, no_mobi, no_zip);
+        let copy_device = effective_copy_device(selected_device, output_device);
+        let create_ibunko_side_epub =
+            matches!(selected_device, Some(narou_rs::converter::device::Device::Ibunko))
+                && !no_epub
+                && matches!(output_device, Some(narou_rs::converter::device::Device::Ibunko));
 
-    for (index, target) in targets.iter().enumerate() {
-        let output_filename = output_parts.as_ref().map(|(basename, ext)| {
-            build_output_filename(
-                basename,
-                ext,
-                if targets.len() > 1 {
-                    Some(index + 1)
-                } else {
-                    None
-                },
-            )
-        });
-
-        let target_path = Path::new(target);
-        if target_path.is_file() {
-            convert_text_target(
-                target,
-                target_path,
-                output_filename.as_deref(),
-                encoding.as_deref(),
-                inspect,
-                ignore_default,
-                ignore_force,
-                output_device,
-                selected_device,
-                verbose,
-                &multi_clone,
-                &mut first_output_dir,
-            );
-            continue;
+        if let Some(device) = selected_device {
+            let _ = multi_clone.println(&format!(">> {}用に変換します", device.display_name()));
         }
 
-        let Some(id) = resolve_target_to_id(target) else {
-            let _ = multi_clone.println(&format!("{} は存在しません", target));
-            continue;
-        };
+        for (index, target) in targets.iter().enumerate() {
+            let output_filename = output_parts.as_ref().map(|(basename, ext)| {
+                build_output_filename(
+                    basename,
+                    ext,
+                    if targets.len() > 1 {
+                        Some(index + 1)
+                    } else {
+                        None
+                    },
+                )
+            });
 
-        let dc_subjects = match load_dc_subjects_for_novel(id) {
-            Ok(subjects) => subjects,
-            Err(err) => {
-                let _ = multi_clone.println(&err);
-                None
-            }
-        };
-
-        let (novel_dir, title, author) = match narou_rs::db::with_database(|db| {
-            let record = db
-                .get(id)
-                .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
-            let dir = narou_rs::db::existing_novel_dir_for_record(db.archive_root(), record);
-            Ok::<(std::path::PathBuf, String, String), narou_rs::error::NarouError>((
-                dir,
-                record.title.clone(),
-                record.author.clone(),
-            ))
-        }) {
-            Ok(data) => data,
-            Err(e) => {
-                let _ = multi_clone.println(&format!("  Error: {}", e));
+            let target_path = Path::new(target);
+            if target_path.is_file() {
+                convert_text_target(
+                    target,
+                    target_path,
+                    output_filename.as_deref(),
+                    encoding.as_deref(),
+                    inspect,
+                    ignore_default,
+                    ignore_force,
+                    selected_device,
+                    output_device,
+                    copy_device,
+                    create_ibunko_side_epub,
+                    verbose,
+                    &multi_clone,
+                    &mut first_output_dir,
+                );
                 continue;
             }
-        };
 
-        let progress = CliProgress::with_multi(&format!("Convert {}", title), multi_clone.clone());
-
-        let mut settings = NovelSettings::load_for_novel_with_options(
-            id,
-            &title,
-            &author,
-            &novel_dir,
-            ignore_force,
-            ignore_default,
-        );
-        if let Some(output_filename) = &output_filename {
-            settings.output_filename = output_filename.clone();
-        }
-        let mut converter =
-            if let Some(user_converter) = UserConverter::load_with_title(&novel_dir, &title) {
-                NovelConverter::with_user_converter(settings, user_converter)
-            } else {
-                NovelConverter::new(settings)
+            let Some(id) = resolve_target_to_id(target) else {
+                let _ = multi_clone.println(&format!("{} は存在しません", target));
+                continue;
             };
-        converter.set_progress(Box::new(progress));
-        converter.set_display_inspector(inspect);
 
-        let result = match output_device {
-            Some(device) => converter
-                .convert_novel_by_id_with_device(id, &novel_dir, device, verbose)
-                .map(|path| path.display().to_string()),
-            None => converter.convert_novel_by_id(id, &novel_dir),
-        };
-
-        match result {
-            Ok(output_path) => {
-                let _ = multi_clone.println(&format!("  Output: {}", output_path));
-                if first_output_dir.is_none() {
-                    first_output_dir = std::path::Path::new(&output_path)
-                        .parent()
-                        .map(|path| path.to_path_buf());
-                }
-                if let Err(err) =
-                    print_copy_to_result(&output_path, selected_device, id, &multi_clone)
-                {
+            let dc_subjects = match load_dc_subjects_for_novel(id) {
+                Ok(subjects) => subjects,
+                Err(err) => {
                     let _ = multi_clone.println(&err);
+                    None
                 }
-                if let Some(device) = selected_device {
+            };
+
+            let (novel_dir, title, author) = match narou_rs::db::with_database(|db| {
+                let record = db
+                    .get(id)
+                    .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
+                let dir = narou_rs::db::existing_novel_dir_for_record(db.archive_root(), record);
+                Ok::<(std::path::PathBuf, String, String), narou_rs::error::NarouError>((
+                    dir,
+                    record.title.clone(),
+                    record.author.clone(),
+                ))
+            }) {
+                Ok(data) => data,
+                Err(e) => {
+                    let _ = multi_clone.println(&format!("  Error: {}", e));
+                    continue;
+                }
+            };
+
+            let progress =
+                CliProgress::with_multi(&format!("Convert {}", title), multi_clone.clone());
+
+            let mut settings = NovelSettings::load_for_novel_with_options(
+                id,
+                &title,
+                &author,
+                &novel_dir,
+                ignore_force,
+                ignore_default,
+            );
+            if let Some(output_filename) = &output_filename {
+                settings.output_filename = output_filename.clone();
+            }
+            apply_device_related_settings(&mut settings, selected_device);
+            let include_illust = settings.enable_illust;
+            let mut converter =
+                if let Some(user_converter) = UserConverter::load_with_title(&novel_dir, &title) {
+                    NovelConverter::with_user_converter(settings, user_converter)
+                } else {
+                    NovelConverter::new(settings)
+                };
+            converter.set_progress(Box::new(progress));
+            converter.set_display_inspector(inspect);
+
+            let result = match output_device {
+                Some(device) => converter
+                    .convert_novel_by_id_with_device(id, &novel_dir, device, verbose)
+                    .map(|path| path.display().to_string()),
+                None => converter.convert_novel_by_id(id, &novel_dir),
+            };
+
+            match result {
+                Ok(output_path) => {
+                    if create_ibunko_side_epub {
+                        match create_ibunko_epub_output(
+                            Path::new(&output_path),
+                            narou_rs::converter::device::Device::Epub,
+                            include_illust,
+                            verbose,
+                        ) {
+                            Ok(Some(epub_path)) => {
+                                apply_dc_subjects_if_needed(
+                                    &epub_path,
+                                    dc_subjects.as_deref(),
+                                    &multi_clone,
+                                );
+                                let _ =
+                                    multi_clone.println(&format!("  Output: {}", epub_path.display()));
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                let _ = multi_clone.println(&err);
+                            }
+                        }
+                    }
+                    let _ = multi_clone.println(&format!("  Output: {}", output_path));
+                    if first_output_dir.is_none() {
+                        first_output_dir = std::path::Path::new(&output_path)
+                            .parent()
+                            .map(|path| path.to_path_buf());
+                    }
                     if let Err(err) =
-                        print_send_result(&output_path, device, &multi_clone)
+                        print_copy_to_result(&output_path, copy_device, id, &multi_clone)
                     {
                         let _ = multi_clone.println(&err);
                     }
-                }
-                apply_dc_subjects_if_needed(
-                    Path::new(&output_path),
-                    dc_subjects.as_deref(),
-                    &multi_clone,
-                );
-                if let Some(inspection) = converter.take_inspection_output() {
-                    for line in inspection.split('\n') {
-                        let _ = multi_clone.println(line);
+                    if output_path.to_ascii_lowercase().ends_with(".zip") {
+                        if let Err(err) = print_copy_zip_to_result(&output_path, &multi_clone) {
+                            let _ = multi_clone.println(&err);
+                        }
+                    }
+                    if let Some(device) = copy_device {
+                        if let Err(err) =
+                            print_send_result(&output_path, device, &multi_clone)
+                        {
+                            let _ = multi_clone.println(&err);
+                        }
+                    }
+                    apply_dc_subjects_if_needed(
+                        Path::new(&output_path),
+                        dc_subjects.as_deref(),
+                        &multi_clone,
+                    );
+                    if let Some(inspection) = converter.take_inspection_output() {
+                        for line in inspection.split('\n') {
+                            let _ = multi_clone.println(line);
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                let _ = multi_clone.println(&format!("  Error: {}", e));
+                Err(e) => {
+                    let _ = multi_clone.println(&format!("  Error: {}", e));
+                }
             }
         }
     }
@@ -196,8 +243,10 @@ fn convert_text_target(
     inspect: bool,
     ignore_default: bool,
     ignore_force: bool,
+    selected_device: Option<narou_rs::converter::device::Device>,
     output_device: Option<narou_rs::converter::device::Device>,
     copy_device: Option<narou_rs::converter::device::Device>,
+    create_ibunko_side_epub: bool,
     verbose: bool,
     multi_clone: &indicatif::MultiProgress,
     first_output_dir: &mut Option<PathBuf>,
@@ -227,6 +276,8 @@ fn convert_text_target(
     if let Some(output_filename) = output_filename {
         settings.output_filename = output_filename.to_string();
     }
+    apply_device_related_settings(&mut settings, selected_device);
+    let include_illust = settings.enable_illust;
 
     let mut converter =
         if let Some(user_converter) = UserConverter::load_with_title(&archive_path, &source_name) {
@@ -243,6 +294,22 @@ fn convert_text_target(
 
     match result {
         Ok(output_path) => {
+            if create_ibunko_side_epub {
+                match create_ibunko_epub_output(
+                    Path::new(&output_path),
+                    narou_rs::converter::device::Device::Epub,
+                    include_illust,
+                    verbose,
+                ) {
+                    Ok(Some(epub_path)) => {
+                        let _ = multi_clone.println(&format!("  Output: {}", epub_path.display()));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        let _ = multi_clone.println(&err);
+                    }
+                }
+            }
             let _ = multi_clone.println(&format!("  Output: {}", output_path));
             if first_output_dir.is_none() {
                 *first_output_dir = Path::new(&output_path)
@@ -251,6 +318,11 @@ fn convert_text_target(
             }
             if let Err(err) = print_copy_to_result(&output_path, copy_device, 0, multi_clone) {
                 let _ = multi_clone.println(&err);
+            }
+            if output_path.to_ascii_lowercase().ends_with(".zip") {
+                if let Err(err) = print_copy_zip_to_result(&output_path, multi_clone) {
+                    let _ = multi_clone.println(&err);
+                }
             }
             if let Some(device) = copy_device {
                 if let Err(err) = print_send_result(&output_path, device, multi_clone) {
@@ -269,16 +341,135 @@ fn effective_convert_device(
     selected_device: Option<narou_rs::converter::device::Device>,
     no_epub: bool,
     no_mobi: bool,
+    no_zip: bool,
 ) -> Option<narou_rs::converter::device::Device> {
-    if no_epub {
-        return None;
-    }
     match selected_device {
+        Some(narou_rs::converter::device::Device::Ibunko) => {
+            if !no_zip {
+                Some(narou_rs::converter::device::Device::Ibunko)
+            } else if !no_epub {
+                Some(narou_rs::converter::device::Device::Epub)
+            } else {
+                None
+            }
+        }
+        _ if no_epub => None,
         Some(narou_rs::converter::device::Device::Mobi) if no_mobi => {
             Some(narou_rs::converter::device::Device::Epub)
         }
         other => other,
     }
+}
+
+fn resolve_selected_devices(
+    make_zip: bool,
+    multi_clone: &indicatif::MultiProgress,
+) -> std::result::Result<Vec<Option<narou_rs::converter::device::Device>>, ()> {
+    if make_zip {
+        return Ok(vec![Some(narou_rs::converter::device::Device::Ibunko)]);
+    }
+
+    let Some(raw) = narou_rs::compat::load_local_setting_string("convert.multi-device") else {
+        return Ok(vec![narou_rs::compat::current_device()]);
+    };
+
+    let mut devices = Vec::new();
+    for name in raw.split(',').map(str::trim) {
+        if name.is_empty() {
+            continue;
+        }
+        let parsed = match name.to_ascii_lowercase().as_str() {
+            "kindle" => Some(narou_rs::converter::device::Device::Mobi),
+            "kobo" => Some(narou_rs::converter::device::Device::Kobo),
+            "epub" => Some(narou_rs::converter::device::Device::Epub),
+            "ibunko" => Some(narou_rs::converter::device::Device::Ibunko),
+            "reader" => Some(narou_rs::converter::device::Device::Reader),
+            "ibooks" => Some(narou_rs::converter::device::Device::Ibooks),
+            _ => None,
+        };
+        if let Some(device) = parsed {
+            devices.push(Some(device));
+        } else {
+            let _ = multi_clone.println(format!(
+                "[convert.multi-device] {} は有効な端末名ではありません",
+                name
+            ));
+        }
+    }
+
+    if devices.is_empty() {
+        let _ = multi_clone.println("有効な端末名がひとつもありませんでした");
+        return Err(());
+    }
+
+    if let Some(index) = devices.iter().position(|device| {
+        matches!(device, Some(narou_rs::converter::device::Device::Mobi))
+    }) {
+        let kindle = devices.remove(index);
+        devices.insert(0, kindle);
+    }
+
+    Ok(devices)
+}
+
+fn effective_copy_device(
+    selected_device: Option<narou_rs::converter::device::Device>,
+    output_device: Option<narou_rs::converter::device::Device>,
+) -> Option<narou_rs::converter::device::Device> {
+    if output_device.is_none() {
+        return None;
+    }
+    match (selected_device, output_device) {
+        (
+            Some(narou_rs::converter::device::Device::Ibunko),
+            Some(narou_rs::converter::device::Device::Epub),
+        ) => None,
+        _ => selected_device,
+    }
+}
+
+fn apply_device_related_settings(
+    settings: &mut NovelSettings,
+    device: Option<narou_rs::converter::device::Device>,
+) {
+    let Some(device) = device else {
+        return;
+    };
+    settings.enable_half_indent_bracket =
+        matches!(device, narou_rs::converter::device::Device::Mobi);
+}
+
+fn create_ibunko_epub_output(
+    primary_output_path: &Path,
+    epub_device: narou_rs::converter::device::Device,
+    include_illust: bool,
+    verbose: bool,
+) -> std::result::Result<Option<PathBuf>, String> {
+    if !primary_output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase().ends_with(".zip"))
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+
+    let txt_path = primary_output_path.with_extension("txt");
+    if !txt_path.exists() {
+        return Ok(None);
+    }
+    let output_dir = txt_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let base_name = txt_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("output");
+    let path = narou_rs::converter::device::OutputManager::new(epub_device)
+        .with_verbose(verbose)
+        .convert_file(&txt_path, output_dir, base_name, include_illust)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(path))
 }
 
 fn load_dc_subjects_for_novel(novel_id: i64) -> std::result::Result<Option<Vec<String>>, String> {
@@ -508,6 +699,32 @@ fn print_send_result(
     _multi_clone: &indicatif::MultiProgress,
 ) -> std::result::Result<(), String> {
     narou_rs::compat::send_file_to_device(Path::new(output_path), device)
+}
+
+fn print_copy_zip_to_result(
+    output_path: &str,
+    multi_clone: &indicatif::MultiProgress,
+) -> std::result::Result<(), String> {
+    let Some(copy_to_dir) =
+        narou_rs::compat::load_local_setting_string("convert.copy-zip-to")
+    else {
+        return Ok(());
+    };
+    let base = PathBuf::from(&copy_to_dir);
+    if !base.is_dir() {
+        return Err(format!(
+            "{} はフォルダではないかすでに削除されています。ZIPをコピー出来ませんでした",
+            copy_to_dir
+        ));
+    }
+    let dst = base.join(
+        Path::new(output_path)
+            .file_name()
+            .ok_or_else(|| "Invalid ZIP filename".to_string())?,
+    );
+    std::fs::copy(output_path, &dst).map_err(|e| e.to_string())?;
+    let _ = multi_clone.println(&format!("{} へZIPをコピーしました", dst.display()));
+    Ok(())
 }
 
 fn split_output_name(output: &str) -> (String, String) {

@@ -83,7 +83,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
 | `download` | ✅ | 🟡 部分 | `--mail` を追加。メール設定の自動作成と送信は実装済みだが、全互換確認は継続中 |
 | `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、digest選択肢、差分cache退避、hotentryのcopy/send/mailまでは実装済み。周辺出力/イベント細部が残る |
-| `convert` | ✅ | 🟡 部分 | `--output` / `--enc` / テキストファイル入力 / `--inspect` / `convert.inspect` / `--no-open` / `--no-epub` / `--no-mobi` / `--verbose` / `device` 設定反映 / `convert.copy-to` / `convert.copy-to-grouping` / `--ignore-default` / `--ignore-force` / `dc:subject` 埋め込み / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFOまでは実装。`--no-strip`, `--no-zip`, send 周辺が残る |
+| `convert` | ✅ | 🟡 部分 | `--output` / `--enc` / テキストファイル入力 / `--inspect` / `convert.inspect` / `--no-open` / `--no-epub` / `--no-mobi` / `--make-zip` / `--no-zip` / `--verbose` / `device` 設定反映 / `convert.multi-device` / `convert.copy-to` / `convert.copy-zip-to` / `convert.copy-to-grouping` / `--ignore-default` / `--ignore-force` / `dc:subject` 埋め込み / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFOまでは実装。`--no-strip` と実機 send 最終確認が残る |
 | `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--echo` と pipe 時ID出力まで実装 |
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションまで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
@@ -217,12 +217,12 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
 |-----------|------|-----|-----------|------|:----:|
 | `--output FILE` | `-o` | string | — | 出力ファイル名指定 | ✅ |
-| `--make-zip` | — | flag | false | i文庫 ZIP 作成 | ❌ |
+| `--make-zip` | — | flag | false | i文庫 ZIP 作成 | ✅ |
 | `--enc ENCODING` | `-e` | string | UTF-8 | テキストファイル文字コード | ✅ |
 | `--no-epub` | — | flag | false | EPUB 生成スキップ | ✅ |
 | `--no-mobi` | — | flag | false | MOBI 生成スキップ | ✅ |
 | `--no-strip` | — | flag | false | MOBI ストリップスキップ | ❌ |
-| `--no-zip` | — | flag | false | ZIP 作成スキップ | ❌ |
+| `--no-zip` | — | flag | false | ZIP 作成スキップ | ✅ |
 | `--no-open` | — | flag | false | 出力フォルダを開かない | ✅ |
 | `--inspect` | `-i` | flag | false | 小説状態調査ログ表示 | ✅ |
 | `--verbose` | `-v` | flag | false | AozoraEpub3/kindlegen 標準出力表示 | ✅ |
@@ -231,11 +231,8 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | targets | | Vec\<String\> | — | ID/タイトル/ファイルパス | ✅ |
 
 **不足動作**:
-- `convert.multi-device` による複数端末同時変換
-- EPUB→MOBI 変換パイプライン (AozoraEpub3 + kindlegen)
-- i文庫 ZIP 作成
-- 変換後の端末送信
-- ThreadPool による並列変換
+- `--no-strip` の実処理（現状の Rust は常時 no-strip 相当）
+- 変換後の端末送信の実機最終検証
 
 **Rust 実装メモ**:
 - `-o/--output` を direct convert に接続し、フォルダ部分を無視して保存先小説フォルダ配下へ出力する。複数 target 時は Ruby版同様 `basename (n).ext` を付ける
@@ -243,10 +240,15 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `--no-open` と `convert.no-open=true` を direct convert に反映し、既定では最初に生成した出力ファイルの保存フォルダを開く
 - `device` 設定が `text` 以外なら direct convert でも `OutputManager` 経由で ebook を生成し、`--no-epub` と `convert.no-epub=true` があれば Ruby版同様 txt のみに戻す
 - `device=kindle` かつ `--no-mobi` / `convert.no-mobi=true` の場合は kindlegen を呼ばず EPUB 出力へ切り替える。`sample\\novel` で `device: kindle` を一時設定して `convert --no-mobi 3` の `.epub` 出力を確認済み
+- kindlegen の探索は AozoraEpub3 同梱 / PATH / Windows の Kindle Previewer 3 同梱版を順に見るようにし、Ruby版同様 exit code 2 のみをエラー扱いに寄せた。`sample\\novel` で `device: kindle` の通常変換から `.mobi` 出力まで確認済み
+- `--make-zip` / `convert.make-zip=true` と `device=ibunko` を direct convert に接続し、i文庫 ZIP を生成できるようにした。ZIP には本文 `.txt`・`挿絵/*`・`cover.*` を同梱し、`sample\\novel` で ZIP/EPUB 併産を確認済み
+- `--no-zip` / `convert.no-zip=true` も direct convert に反映し、`sample\\novel` で `--make-zip --no-zip 3` 実行時は EPUB のみ残ることを確認済み
 - `--verbose` 未指定時は AozoraEpub3 / kindlegen の標準出力を抑止し、指定時のみ透過表示する。`sample\\novel` で `device: epub` の通常変換では AozoraEpub3 行が出ず、`--verbose` 付きでは `Detected encoding = UTF-8` / `変換開始` が表示されることを確認済み
 - `convert.add-dc-subject-to-epub=true` 時は DB タグから `convert.dc-subject-exclude-tags` を除いた値を EPUB 内 `standard.opf` の `<dc:subject>` へ埋め込む。除外設定未作成時は Ruby版同様 `404,end` を自動保存し、`sample\\novel` で `alpha` タグだけが埋め込まれ `end` は除外されることを確認済み
 - direct `convert` 後の端末送信は従来の compat 経路と同じ `send_file_to_device` helper へ揃えた。`sample\\novel` の `device: epub` 経路では副作用なく通ることを確認したが、Kindle/Kobo/Reader 実機での最終検証までは未了
 - `convert.copy-to` / `convert.copy_to` と `convert.copy-to-grouping` の device/site グルーピングも direct convert へ接続し、`sample\\novel` で `device=epub` + `copy-to-grouping=device,site` のコピー先生成を確認済み
+- `convert.copy-zip-to` も direct convert へ接続し、`sample\\novel` で `--make-zip 3` 実行時に ZIP のコピー出力を確認済み
+- `convert.multi-device` があれば `device` より優先して複数端末へ順に変換する。Ruby版同様 `kindle` を先頭へ寄せ、無効な端末名は警告し、`sample\\novel` で `convert.multi-device: epub,ibunko` により EPUB + ZIP 出力を確認済み
 - `--ignore-default` / `--ignore-force` を `NovelSettings::load_for_novel_with_options` に渡し、`default.*` / `force.*` の適用を個別に無効化できるようにした
 - DB 管理小説だけでなくファイルパス指定の textfile 変換も `commands::convert` に接続し、`--enc` による UTF-8 / Shift_JIS / EUC-JP 系のデコードと `enable_enchant_midashi` 推奨 INFO を追加した
 - 変換後に `調査ログ.txt` を常に保存し、`enable_inspect` が有効なときは行末読点状況とカギ括弧内改行状況を記録する
@@ -714,7 +716,7 @@ narou setting name         # 読み取り
 |-------|---------|------|
 | download `--force`, `--no-convert`, `--freeze` | download | DL フラグ互換 |
 | update の残互換実装 | update | Ruby版ターゲット解決・`--gl`主要挙動・`update.strong`・digest選択肢・差分用 cache 退避・hotentry の copy/send/mail までは実装済み。周辺出力/イベント細部が残る |
-| convert `--no-strip`, `--no-zip`, send | convert | 変換パイプライン完成 |
+| convert `--no-strip`, send | convert | `--make-zip` / `--no-zip` / `convert.multi-device` / ZIP copy は実装済み。残りは MOBI strip と実機 send 最終確認 |
 | download の残互換実装 | download | 再DL確認・mail 周辺 |
 
 ### P1: 設定管理基盤

@@ -520,7 +520,12 @@ impl NovelConverter {
             .unwrap_or("output");
         let final_path = device::OutputManager::new(device)
             .with_verbose(verbose)
-            .convert_file(&txt_path, &self.settings.archive_path, base_name)?;
+            .convert_file(
+                &txt_path,
+                &self.settings.archive_path,
+                base_name,
+                self.settings.enable_illust,
+            )?;
         Ok(final_path.display().to_string())
     }
 
@@ -588,7 +593,13 @@ impl NovelConverter {
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or("output");
-        let final_path = output_manager.convert_file(&txt_path, novel_dir, base_name)?;
+        let final_path = output_manager.convert_file(
+            &txt_path,
+            novel_dir,
+            base_name,
+            self.settings.enable_illust,
+        )?;
+
 
         Ok(final_path)
     }

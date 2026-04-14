@@ -1,6 +1,12 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use regex::Regex;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipWriter};
+
+use crate::downloader::util::decode_numeric_entities;
 use crate::error::{NarouError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,7 +15,9 @@ pub enum Device {
     Epub,
     Mobi,
     Kobo,
+    Ibunko,
     Reader,
+    Ibooks,
 }
 
 impl Device {
@@ -18,7 +26,9 @@ impl Device {
             "epub" => Device::Epub,
             "mobi" | "kindle" => Device::Mobi,
             "kobo" => Device::Kobo,
+            "ibunko" => Device::Ibunko,
             "reader" => Device::Reader,
+            "ibooks" => Device::Ibooks,
             _ => Device::Text,
         }
     }
@@ -29,7 +39,9 @@ impl Device {
             Device::Epub => ".epub",
             Device::Mobi => ".mobi",
             Device::Kobo => ".epub",
+            Device::Ibunko => ".zip",
             Device::Reader => ".epub",
+            Device::Ibooks => ".epub",
         }
     }
 
@@ -39,7 +51,9 @@ impl Device {
             Device::Epub => ".epub",
             Device::Mobi => ".mobi",
             Device::Kobo => ".kepub.epub",
+            Device::Ibunko => ".zip",
             Device::Reader => ".epub",
+            Device::Ibooks => ".epub",
         }
     }
 
@@ -59,7 +73,9 @@ impl Device {
             Device::Epub => "EPUB",
             Device::Mobi => "Kindle",
             Device::Kobo => "Kobo",
+            Device::Ibunko => "i文庫",
             Device::Reader => "SonyReader",
+            Device::Ibooks => "iBooks",
         }
     }
 
@@ -119,6 +135,15 @@ impl OutputManager {
             }
         }
 
+        if name.eq_ignore_ascii_case("kindlegen") {
+            if let Some(path) = Self::find_kindlegen_next_to_aozora() {
+                return Some(path);
+            }
+            if let Some(path) = Self::find_kindlegen_from_kindle_previewer() {
+                return Some(path);
+            }
+        }
+
         if let Ok(output) = Command::new("where").arg(name).output() {
             if output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout);
@@ -144,6 +169,39 @@ impl OutputManager {
         }
 
         None
+    }
+
+    fn find_kindlegen_next_to_aozora() -> Option<PathBuf> {
+        let aozora = Self::find_aozora_epub3_from_settings()?;
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        let candidate = aozora.parent()?.join(format!("kindlegen{suffix}"));
+        candidate.exists().then_some(candidate)
+    }
+
+    fn find_kindlegen_from_kindle_previewer() -> Option<PathBuf> {
+        if !cfg!(windows) {
+            return None;
+        }
+
+        let relative = Path::new("Amazon")
+            .join("Kindle Previewer 3")
+            .join("lib")
+            .join("fc")
+            .join("bin")
+            .join("kindlegen.exe");
+
+        let mut candidates = Vec::new();
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(local_app_data).join(&relative));
+        }
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            candidates.push(PathBuf::from(program_files).join(&relative));
+        }
+        if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
+            candidates.push(PathBuf::from(program_files_x86).join(&relative));
+        }
+
+        candidates.into_iter().find(|candidate| candidate.exists())
     }
 
     fn find_aozora_epub3_from_settings() -> Option<PathBuf> {
@@ -232,17 +290,115 @@ impl OutputManager {
         Ok(output_path)
     }
 
+    fn create_ibunko_zip(
+        &self,
+        input_txt: &Path,
+        include_illust: bool,
+    ) -> Result<PathBuf> {
+        let mut data = std::fs::read_to_string(input_txt)?;
+        let html_re = Regex::new(r"</?[^>]+>").unwrap();
+        loop {
+            let next = html_re.replace_all(&data, "").to_string();
+            if next == data {
+                break;
+            }
+            data = next;
+        }
+
+        data = decode_ibunko_html_entities(&data);
+
+        let illust_re = Regex::new(r"［＃挿絵（(.+?)）入る］").unwrap();
+        data = illust_re
+            .replace_all(&data, "<IMG SRC=\"$1\">")
+            .to_string();
+        data = data.replace("［＃改ページ］", "<PBR>");
+        data = data.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\r\n");
+
+        let sanitized_txt_path = input_txt.with_file_name(format!(
+            "{}.ibunko.txt",
+            input_txt
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("output")
+        ));
+        std::fs::write(&sanitized_txt_path, data)?;
+
+        let zipfile_path = input_txt.with_extension("zip");
+        if zipfile_path.exists() {
+            let _ = std::fs::remove_file(&zipfile_path);
+        }
+
+        {
+            let file = std::fs::File::create(&zipfile_path)?;
+            let mut zip = ZipWriter::new(file);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+            zip.start_file(
+                input_txt
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| NarouError::Conversion("Invalid iBunko filename".into()))?,
+                options,
+            )
+            .map_err(|e| NarouError::Conversion(e.to_string()))?;
+            zip.write_all(&std::fs::read(&sanitized_txt_path)?)?;
+
+            if include_illust {
+                let illust_dirpath = input_txt
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("挿絵");
+                if illust_dirpath.exists() {
+                    for entry in std::fs::read_dir(&illust_dirpath)? {
+                        let entry = entry?;
+                        if !entry.file_type()?.is_file() {
+                            continue;
+                        }
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        zip.start_file(format!("挿絵/{name}"), options)
+                            .map_err(|e| NarouError::Conversion(e.to_string()))?;
+                        zip.write_all(&std::fs::read(entry.path())?)?;
+                    }
+                }
+            }
+
+            for ext in [".jpg", ".png", ".jpeg"] {
+                let cover_name = format!("cover{ext}");
+                let cover_path = input_txt
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(&cover_name);
+                if cover_path.exists() {
+                    zip.start_file(cover_name, options)
+                        .map_err(|e| NarouError::Conversion(e.to_string()))?;
+                    zip.write_all(&std::fs::read(cover_path)?)?;
+                    break;
+                }
+            }
+
+            zip.finish()
+                .map_err(|e| NarouError::Conversion(e.to_string()))?;
+        }
+
+        let _ = std::fs::remove_file(sanitized_txt_path);
+        Ok(zipfile_path)
+    }
+
     pub fn convert_file(
         &self,
         input_txt: &Path,
         output_dir: &Path,
         base_name: &str,
+        include_illust: bool,
     ) -> Result<PathBuf> {
         match self.device {
             Device::Text => Ok(input_txt.to_path_buf()),
             Device::Epub => self.run_aozora_epub3(input_txt, output_dir, ".epub"),
             Device::Kobo => self.run_aozora_epub3(input_txt, output_dir, ".kepub.epub"),
+            Device::Ibunko => self.create_ibunko_zip(input_txt, include_illust),
             Device::Reader => self.run_aozora_epub3(input_txt, output_dir, ".epub"),
+            Device::Ibooks => self.run_aozora_epub3(input_txt, output_dir, ".epub"),
             Device::Mobi => {
                 let temp_input = output_dir.join(format!("{}_mobi_source.txt", base_name));
                 std::fs::copy(input_txt, &temp_input)?;
@@ -282,10 +438,24 @@ impl OutputManager {
 
                 let _ = std::fs::remove_file(&epub_temp);
 
-                if !status2.success() {
+                if let Some(code) = status2.code() {
+                    if code == 2 {
+                        return Err(NarouError::Conversion(format!(
+                            "kindlegen exited with status: {}",
+                            status2
+                        )));
+                    }
+                } else {
                     return Err(NarouError::Conversion(format!(
                         "kindlegen exited with status: {}",
                         status2
+                    )));
+                }
+
+                if !mobi_output.exists() {
+                    return Err(NarouError::Conversion(format!(
+                        "kindlegen did not create expected output: {}",
+                        mobi_output.display()
                     )));
                 }
 
@@ -309,8 +479,13 @@ impl OutputManager {
                 "kobo".to_string(),
                 Self::find_external_tool("AozoraEpub3").is_some(),
             ),
+            ("ibunko".to_string(), true),
             (
                 "reader".to_string(),
+                Self::find_external_tool("AozoraEpub3").is_some(),
+            ),
+            (
+                "ibooks".to_string(),
                 Self::find_external_tool("AozoraEpub3").is_some(),
             ),
         ];
@@ -408,6 +583,17 @@ fn normalize_windows_verbatim_path(path: &Path) -> PathBuf {
     }
 }
 
+fn decode_ibunko_html_entities(text: &str) -> String {
+    let mut data = text
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    decode_numeric_entities(&mut data);
+    data
+}
+
 fn find_windows_volume_root(volume_name: &str) -> Option<PathBuf> {
     for letter in b'A'..=b'Z' {
         let drive = format!("{}:\\", letter as char);
@@ -453,7 +639,7 @@ fn find_unix_volume_root(volume_name: &str) -> Option<PathBuf> {
 mod tests {
     use std::path::Path;
 
-    use super::{Device, normalize_windows_verbatim_path};
+    use super::{Device, decode_ibunko_html_entities, normalize_windows_verbatim_path};
 
     #[test]
     fn kobo_matches_kepub_output_suffix() {
@@ -467,5 +653,11 @@ mod tests {
             normalize_windows_verbatim_path(Path::new(r"\\?\C:\Tools\AozoraEpub3\AozoraEpub3.jar")),
             Path::new(r"C:\Tools\AozoraEpub3\AozoraEpub3.jar")
         );
+    }
+
+    #[test]
+    fn decode_ibunko_html_entities_decodes_ampersand_last() {
+        assert_eq!(decode_ibunko_html_entities("&amp;lt;"), "&lt;");
+        assert_eq!(decode_ibunko_html_entities("&lt;tag&gt;"), "<tag>");
     }
 }

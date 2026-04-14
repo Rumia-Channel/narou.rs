@@ -765,7 +765,7 @@ fn process_hotentry(
             .and_then(|stem| stem.to_str())
             .unwrap_or("hotentry");
         output_manager
-            .convert_file(&txt_path, &hotentry_dir, base_name)
+            .convert_file(&txt_path, &hotentry_dir, base_name, false)
             .map_err(|e| e.to_string())?
     };
 
