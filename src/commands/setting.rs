@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 
+use narou_rs::compat::confirm;
 use narou_rs::converter::ini::{IniData, IniValue};
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::db::inventory::{Inventory, InventoryScope};
 use narou_rs::db::{novel_dir_for_record, with_database};
 
-use super::resolve_target_to_id;
+use super::download::{get_data_by_target, tagname_to_ids};
 
 pub fn cmd_setting(args: &[String], list: bool, all: bool, burn: bool) {
     if let Err(e) = cmd_setting_inner(args, list, all, burn) {
@@ -33,7 +36,7 @@ fn cmd_setting_inner(
     }
 
     if all {
-        display_variable_list();
+        display_variable_list(true);
         return Ok(());
     }
 
@@ -109,6 +112,9 @@ fn cmd_setting_inner(
                     let display = format_yaml_value(&casted);
                     settings.insert(name.clone(), casted);
                     println!("{} を {} に設定しました", name, display);
+                    if name == "device" && matches!(s, Scope::Local) {
+                        modify_settings_when_device_changed(settings);
+                    }
                 }
                 Err(msg) => {
                     eprintln!("{}", msg);
@@ -217,11 +223,8 @@ fn cast_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> 
         .strip_prefix("default.")
         .or_else(|| name.strip_prefix("force."))
     {
-        if let Some(info) = setting_variables().get(rest) {
-            return cast_value_for_type(info.var_type, value_str, info.select_keys.as_deref());
-        }
-        if ORIGINAL_SETTING_NAMES.contains(&rest) {
-            return Ok(serde_yaml::Value::String(value_str.to_string()));
+        if let Some(template) = original_setting_template(rest) {
+            return cast_value_for_ini_value(&template, value_str);
         }
     }
 
@@ -230,6 +233,50 @@ fn cast_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> 
     }
 
     Err(format!("{} は不明な名前です", name))
+}
+
+fn original_setting_template(name: &str) -> Option<IniValue> {
+    get_original_settings()
+        .into_iter()
+        .find(|(setting_name, _)| setting_name == name)
+        .map(|(_, value)| value)
+}
+
+fn cast_value_for_ini_value(
+    template: &IniValue,
+    value_str: &str,
+) -> Result<serde_yaml::Value, String> {
+    match template {
+        IniValue::Boolean(_) => match value_str.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(serde_yaml::Value::Bool(true)),
+            "false" => Ok(serde_yaml::Value::Bool(false)),
+            _ => Err(format!(
+                "値が {} ではありません",
+                var_type_description(VarType::Boolean).trim_end()
+            )),
+        },
+        IniValue::Integer(_) => value_str
+            .parse::<i64>()
+            .map(|i| serde_yaml::Value::Number(i.into()))
+            .map_err(|_| {
+                format!(
+                    "値が {} ではありません",
+                    var_type_description(VarType::Integer).trim_end()
+                )
+            }),
+        IniValue::Float(_) => value_str
+            .parse::<f64>()
+            .map(|f| serde_yaml::Value::Number(serde_yaml::Number::from(f)))
+            .map_err(|_| {
+                format!(
+                    "値が {} ではありません",
+                    var_type_description(VarType::Float).trim_end()
+                )
+            }),
+        IniValue::String(_) | IniValue::Null => {
+            Ok(serde_yaml::Value::String(value_str.to_string()))
+        }
+    }
 }
 
 fn cast_value_for_type(
@@ -252,7 +299,7 @@ fn cast_value_for_type(
         VarType::Multiple => {
             if let Some(keys) = select_keys {
                 for part in value_str.split(',') {
-                    if !keys.iter().any(|k| k == part.trim()) {
+                    if !keys.iter().any(|k| k == part) {
                         return Err(format!(
                             "不明な値です。{} の中から指定して下さい",
                             keys.join(", ")
@@ -263,34 +310,67 @@ fn cast_value_for_type(
             Ok(serde_yaml::Value::String(value_str.to_string()))
         }
         VarType::Boolean => {
-            let lower = value_str.to_lowercase();
+            let lower = value_str.trim().to_ascii_lowercase();
             match lower.as_str() {
-                "true" | "yes" | "on" => Ok(serde_yaml::Value::Bool(true)),
-                "false" | "no" | "off" => Ok(serde_yaml::Value::Bool(false)),
+                "true" => Ok(serde_yaml::Value::Bool(true)),
+                "false" => Ok(serde_yaml::Value::Bool(false)),
                 _ => Err(format!(
-                    "{} は真偽値ではありません。true または false を指定して下さい",
-                    value_str
+                    "値が {} ではありません",
+                    var_type_description(VarType::Boolean).trim_end()
                 )),
             }
         }
         VarType::Integer => value_str
             .parse::<i64>()
             .map(|i| serde_yaml::Value::Number(i.into()))
-            .map_err(|_| format!("{} は整数ではありません", value_str)),
+            .map_err(|_| {
+                format!(
+                    "値が {} ではありません",
+                    var_type_description(VarType::Integer).trim_end()
+                )
+            }),
         VarType::Float => value_str
             .parse::<f64>()
-            .map(|f| {
-                serde_yaml::Value::Number(if f == f as i64 as f64 {
-                    (f as i64).into()
-                } else {
-                    serde_yaml::Number::from(f)
-                })
-            })
-            .map_err(|_| format!("{} は小数ではありません", value_str)),
-        VarType::String | VarType::Directory => {
-            Ok(serde_yaml::Value::String(value_str.to_string()))
+            .map(|f| serde_yaml::Value::Number(serde_yaml::Number::from(f)))
+            .map_err(|_| {
+                format!(
+                    "値が {} ではありません",
+                    var_type_description(VarType::Float).trim_end()
+                )
+            }),
+        VarType::String => Ok(serde_yaml::Value::String(value_str.to_string())),
+        VarType::Directory => {
+            let path = Path::new(value_str);
+            if !path.is_dir() {
+                return Err(format!(
+                    "値が {} ではありません",
+                    var_type_description(VarType::Directory).trim_end()
+                ));
+            }
+            let expanded = fs::canonicalize(path).map_err(|_| {
+                format!(
+                    "値が {} ではありません",
+                    var_type_description(VarType::Directory).trim_end()
+                )
+            })?;
+            Ok(serde_yaml::Value::String(
+                strip_extended_path_prefix(expanded)
+                    .to_string_lossy()
+                    .to_string(),
+            ))
         }
     }
+}
+
+fn strip_extended_path_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest);
+        }
+    }
+    path
 }
 
 fn output_setting_list(inv: &Inventory) {
@@ -341,12 +421,12 @@ fn sweep_dust_variable(
     deleted
 }
 
-fn display_variable_list() {
+fn display_variable_list(show_all: bool) {
     let vars = setting_variables();
 
     println!("Local Variable List:");
     for (name, info) in &vars.local {
-        if !info.invisible {
+        if show_all || !info.invisible {
             let type_desc = var_type_description(info.var_type);
             println!("    {:32} {} {}", name, type_desc, info.help);
         }
@@ -355,7 +435,7 @@ fn display_variable_list() {
     println!();
     println!("Global Variable List:");
     for (name, info) in &vars.global {
-        if !info.invisible {
+        if show_all || !info.invisible {
             let type_desc = var_type_description(info.var_type);
             println!("    {:32} {} {}", name, type_desc, info.help);
         }
@@ -384,15 +464,21 @@ fn display_variable_list() {
     }
 }
 
-fn display_help() {
+pub(crate) fn display_help() {
     let vars = setting_variables();
 
+    println!("  Usage: narou setting [<name>=<value> ...] [options]");
+    println!("  Usage: narou setting --burn <target> [<target2> ...]");
+    println!();
     println!("各コマンドの設定の変更が出来ます。");
     println!("Global な設定はユーザープロファイルに保存され、すべての narou コマンドで使われます");
     println!("下の一覧は一部です。すべてを確認するには -a オプションを付けて確認して下さい");
     println!("default. で始まる設定は、setting.ini で未設定時の項目の挙動を指定することが出来ます");
     println!(
         "force. で始まる設定は、setting.ini や default.* 等の指定を全て無視して項目の挙動を強制出来ます"
+    );
+    println!(
+        "default_args. で始まる設定は、各コマンドのデフォルトオプションを指定することが出来ます"
     );
     println!();
     println!("Local Variable List:");
@@ -414,11 +500,21 @@ fn display_help() {
     }
 
     println!();
+    println!("これ以外にも設定出来る項目があります。確認する場合は");
+    println!("narou setting -a コマンドを参照して下さい");
+    println!();
     println!("Examples:");
     println!("  narou setting --list                 # 現在の設置値一覧を表示");
     println!("  narou setting convert.no-open=true   # 値を設定する");
     println!("  narou setting convert.no-epub=        # 右辺に何も書かないとその設定を削除出来る");
     println!("  narou setting device                 # 変数名だけ書くと現在の値を確認出来る");
+    println!("  narou s convert.copy-to=C:/dropbox/mobi");
+    println!("  narou s convert.copy-to=\"C:\\Documents and Settings\\user\\epub\"");
+    println!();
+    println!("Options:");
+    println!("    -l, --list                    現在の設定値を確認する");
+    println!("    -a, --all                     設定できる全ての変数名を表示する");
+    println!("        --burn                    指定した小説の未設定項目に共通設定を焼き付ける");
 }
 
 fn burn_default_settings(
@@ -427,23 +523,30 @@ fn burn_default_settings(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if targets.is_empty() {
         eprintln!("対象小説を指定して下さい");
-        std::process::exit(1);
+        std::process::exit(127);
     }
 
+    let msg = "指定された小説のsetting.iniの未項目設定に共通設定を焼き付けます。\n\
+(共通設定とはsetting.iniの項目が未設定時に使用される default.* 系設定およびNarou.rbオリジナル設定のこと)\n\
+よろしいですか";
+    if !confirm(msg, false, true) {
+        return Ok(());
+    }
+
+    let targets = tagname_to_ids(targets);
     let default_settings = load_settings_by_pattern(inv, "default");
     let original_settings = get_original_settings();
     let archive_root = inv.root_dir().join("小説データ");
 
     for target in targets {
-        let id = match resolve_target_to_id(target) {
-            Some(id) => id,
+        let data = match get_data_by_target(&target) {
+            Some(data) => data,
             None => {
                 eprintln!("{} は存在しません", target);
                 continue;
             }
         };
-
-        let record = match with_database(|db| Ok(db.get(id).cloned())) {
+        let record = match with_database(|db| Ok(db.get(data.id).cloned())) {
             Ok(Some(r)) => r,
             _ => {
                 eprintln!("{} は存在しません", target);
@@ -467,10 +570,60 @@ fn burn_default_settings(
         }
 
         ini.save(&ini_path)?;
-        println!("{} の設定を保存しました", record.title);
+        println!("{} の設定を保存しました", data.title);
     }
 
     Ok(())
+}
+
+fn modify_settings_when_device_changed(settings: &mut HashMap<String, serde_yaml::Value>) {
+    let Some(device) = settings.get("device").and_then(|value| match value {
+        serde_yaml::Value::String(s) => Some(s.to_string()),
+        _ => None,
+    }) else {
+        return;
+    };
+
+    let device_key = device.to_ascii_lowercase();
+    let display_name = match device_key.as_str() {
+        "kindle" => "Kindle",
+        "kobo" => "Kobo",
+        "epub" => "EPUB",
+        "ibunko" => "i文庫",
+        "reader" => "SonyReader",
+        "ibooks" => "iBooks",
+        _ => return,
+    };
+
+    let desired_half_indent = device_key == "kindle";
+    let related = [(
+        "default.enable_half_indent_bracket",
+        serde_yaml::Value::Bool(desired_half_indent),
+    )];
+
+    let mut changed = Vec::new();
+    for (name, new_value) in related {
+        if settings.get(name) != Some(&new_value) {
+            settings.insert(name.to_string(), new_value.clone());
+            changed.push((name, new_value));
+        }
+    }
+
+    if changed.is_empty() {
+        return;
+    }
+
+    println!(
+        "端末を{}に指定したことで、以下の関連設定が変更されました",
+        display_name
+    );
+    for (name, value) in changed {
+        println!(
+            "  → {} が {} に変更されました",
+            name,
+            format_yaml_value(&value)
+        );
+    }
 }
 
 fn load_settings_by_pattern(inv: &Inventory, pattern: &str) -> HashMap<String, serde_yaml::Value> {
@@ -745,7 +898,10 @@ fn setting_variables() -> SettingVariables {
     let local_vars = vec![
         (
             "device",
-            sel("変換、送信対象の端末", vec!["Kindle", "Kobo", "PocketBook"]),
+            sel(
+                "変換、送信対象の端末",
+                vec!["kindle", "kobo", "epub", "ibunko", "reader", "ibooks"],
+            ),
         ),
         (
             "hotentry",
@@ -873,7 +1029,7 @@ fn setting_variables() -> SettingVariables {
             "convert.multi-device",
             multi(
                 "複数の端末用に同時に変換する",
-                vec!["Kindle", "Kobo", "PocketBook"],
+                vec!["kindle", "kobo", "epub", "ibunko", "reader", "ibooks"],
             ),
         ),
         (
@@ -1034,12 +1190,11 @@ fn setting_variables() -> SettingVariables {
 
 fn var_type_description(vt: VarType) -> &'static str {
     match vt {
-        VarType::Boolean => "真偽値",
-        VarType::Integer => "整数",
-        VarType::Float => "小数",
-        VarType::String => "文字列",
+        VarType::Boolean => "true/false  ",
+        VarType::Integer => "整数        ",
+        VarType::Float => "小数点数    ",
+        VarType::String | VarType::Select => "文字列      ",
         VarType::Directory => "フォルダパス",
-        VarType::Select => "選択",
-        VarType::Multiple => "複数選択",
+        VarType::Multiple => "文字列(複数)",
     }
 }

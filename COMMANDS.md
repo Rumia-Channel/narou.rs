@@ -300,7 +300,7 @@ narou setting name         # 読み取り
 
 | 設定名 | 型 | 説明 |
 |-------|-----|------|
-| `device` | select | 対象端末 (kindle/kobo/等) |
+| `device` | select | 対象端末 (kindle/kobo/epub/ibunko/reader/ibooks) |
 | `hotentry` | boolean | hotentry 自動生成 |
 | `concurrency` | boolean | 並列DL+変換 |
 | `logging` | boolean | ログ保存 |
@@ -344,20 +344,20 @@ narou setting name         # 読み取り
 
 **実装済み (Rust)**:
 - `local_setting.yaml` / `global_setting.yaml` の読み書き (`Inventory`)
-- 設定値のバリデーション (型チェック、選択肢チェック)
+- 設定値のバリデーション (型チェック、選択肢チェック、boolean の true/false 厳密化)
 - `--list` 現在値一覧表示
 - `--all` 全変数表示
 - `--burn` による setting.ini への焼き込み
+- `--burn` の確認プロンプトと tag ターゲット展開
 - `name` 読み取り、`name=value` 設定、`name=` 削除
 - 不明変数名のエラー、古い変数の掃除削除
 - エラー数を終了コードとして返す
 - `apply_force_and_default_settings` で変換時の `force.*/default.*` をフラットキーから正しく解決
+- `device` 変更時の関連設定の自動反映（Ruby版 hook の一部）
 
 **完了扱いにしない理由 / 不足動作**:
-- `narou setting default.*=...` / `force.*=...` / `default_args.*=...` の設定・読み取り・削除が、コマンド側のスコープ判定と完全には接続されていない。`cast_value` には一部対応があるが、Ruby版互換の外部挙動として要修正。
-- Ruby版 `SETTING_VARIABLES` との全項目突合が未完。`device` の選択肢や大文字小文字、隠し項目、型、select/multiple 値に差分が残る可能性がある。
-- Ruby版の `device` 変更時の関連設定自動変更（`modify_settings_when_device_changed` / device hook）が未実装。
-- `setting -h` は Ruby版の `Local Variable List` / `Global Variable List` を help 内に表示するが、Rust版 help は省略している。
+- Ruby版 `SETTING_VARIABLES` との全項目突合が未完。hidden 項目、help の細部、select/multiple 値の表記差分が残る可能性がある。
+- Ruby版の device hook 群は未完全で、関連設定変更も `default.enable_half_indent_bracket` だけを再現している。
 
 ---
 
@@ -431,7 +431,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 10. `diff` — ❌ 未実装
+### 10. `diff` — ✅ 完了
 
 > 更新された小説の差分を表示します
 
@@ -445,12 +445,11 @@ narou setting name         # 読み取り
 | `-N` (数値) | — | int | — | `-n N` の短縮形 |
 | target | | string | — | 小説指定 (省略時=最終更新) |
 
-**実装要件**:
-- raw/ ディレクトリ内の過去セクションの差分管理
-- セクション YAML から一時テキスト生成 → 差分表示
-- 外部 diff ツール統合 (`difftool` / `difftool.arg` 設定)
-- 内蔵差分ビューア (カラー付き)
-- 差分バージョン指定: `2023.02.21@01.39.46` 形式
+**実装状況**:
+- `-n/--number` と `-N` 短縮形、`-l/--list`、`-c/--clean`、`--all-clean`、`--no-tool` を実装済み
+- 差分バージョン指定 `YYYY.MM.DD@HH.MM.SS` / `;` 区切りに対応
+- セクション YAML からの一時テキスト生成、外部 diff ツール統合、内蔵差分ビューアを実装済み
+- 既定対象は最新更新の小説で、差分キャッシュは `本文/cache/<version>/` に配置する
 
 ---
 

@@ -200,6 +200,23 @@ fn run_sync_command(
                 0
             }
         }
+        Commands::Diff {
+            target,
+            view_diff_version,
+            number,
+            list,
+            clean,
+            all_clean,
+            no_tool,
+        } => commands::diff::cmd_diff(commands::diff::DiffOptions {
+            target,
+            view_diff_version,
+            number: number.unwrap_or(1).max(1),
+            list,
+            clean,
+            all_clean,
+            no_tool,
+        }),
         Commands::List { tag, frozen } => {
             commands::manage::cmd_list(tag.as_deref(), frozen);
             0

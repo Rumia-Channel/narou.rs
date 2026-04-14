@@ -103,6 +103,10 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
         apply_multiple(args);
     }
 
+    if args.first().is_some_and(|arg| arg == "diff") {
+        expand_diff_short_number_options(args);
+    }
+
     if !flags.no_color {
         flags.no_color = load_global_no_color();
     }
@@ -132,6 +136,23 @@ fn apply_multiple(args: &mut Vec<String>) {
             }
         }
     }
+}
+
+fn expand_diff_short_number_options(args: &mut Vec<String>) {
+    let mut expanded = Vec::with_capacity(args.len());
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0
+            && arg.starts_with('-')
+            && arg.len() > 1
+            && arg[1..].chars().all(|ch| ch.is_ascii_digit())
+        {
+            expanded.push("-n".to_string());
+            expanded.push(arg[1..].to_string());
+        } else {
+            expanded.push(arg.clone());
+        }
+    }
+    *args = expanded;
 }
 
 fn load_multiple_delimiter() -> String {
@@ -295,6 +316,27 @@ mod tests {
         assert_eq!(args[0], "version");
         assert!(args.iter().any(|arg| arg == "--more"));
     }
+
+    #[test]
+    fn diff_short_number_option_is_expanded() {
+        let mut args = vec![
+            "diff".to_string(),
+            "1".to_string(),
+            "-2".to_string(),
+            "--no-tool".to_string(),
+        ];
+        expand_diff_short_number_options(&mut args);
+        assert_eq!(
+            args,
+            vec![
+                "diff".to_string(),
+                "1".to_string(),
+                "-n".to_string(),
+                "2".to_string(),
+                "--no-tool".to_string(),
+            ]
+        );
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -358,6 +400,20 @@ pub enum Commands {
     },
     Convert {
         targets: Vec<String>,
+    },
+    Diff {
+        target: Option<String>,
+        view_diff_version: Option<String>,
+        #[arg(short = 'n', long = "number")]
+        number: Option<usize>,
+        #[arg(short = 'l', long)]
+        list: bool,
+        #[arg(short = 'c', long = "clean")]
+        clean: bool,
+        #[arg(long = "all-clean")]
+        all_clean: bool,
+        #[arg(long)]
+        no_tool: bool,
     },
     List {
         #[arg(short, long)]

@@ -1,5 +1,6 @@
 pub mod backup;
 pub mod convert;
+pub mod diff;
 pub mod download;
 pub mod help;
 pub mod init;

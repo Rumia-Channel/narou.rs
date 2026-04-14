@@ -1,13 +1,23 @@
 use regex::Regex;
 
 pub fn to_aozora(html: &str) -> String {
+    to_aozora_with_options(html, false)
+}
+
+pub fn to_aozora_strip_decoration(html: &str) -> String {
+    to_aozora_with_options(html, true)
+}
+
+fn to_aozora_with_options(html: &str, strip_decoration_tag: bool) -> String {
     let mut text = html.to_string();
     text = br_to_aozora(&text);
     text = p_to_aozora(&text);
     text = ruby_to_aozora(&text);
-    text = b_to_aozora(&text);
-    text = i_to_aozora(&text);
-    text = s_to_aozora(&text);
+    if !strip_decoration_tag {
+        text = b_to_aozora(&text);
+        text = i_to_aozora(&text);
+        text = s_to_aozora(&text);
+    }
     text = img_to_aozora(&text);
     text = em_to_sesame(&text);
     text = delete_all_tags(&text);

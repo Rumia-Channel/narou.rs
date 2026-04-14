@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 
 use crate::backtracer;
+use crate::commands::setting;
 use crate::logger;
 
 struct CmdInfo {
@@ -616,14 +617,19 @@ const INIT_HELP: CmdHelp = CmdHelp {
 const DIFF_HELP: CmdHelp = CmdHelp {
     banner: "[<target>] [options]",
     description: "\
-  ・更新された小説の差分を表示します。
-  ・対象を指定しなかった場合、最後に更新した小説が対象になります。
+  ・指定した小説の更新前後の変更点の差分を表示します。
+  ・対象小説を指定しなかった場合は直前に更新した小説の差分を表示します。
+  ・好きな差分表示プログラムを使いたい場合は difftool を設定して変更できます。
 
   Examples:
-    narou diff 0
-    narou diff 0 -n 2
-    narou diff 0 --list
-    narou diff --all-clean",
+    narou diff          # 直前に更新した小説の差分を表示
+    narou diff 6
+    narou diff 6 -n 2   # 最新から2番目の差分との比較
+    narou diff 6 -2     # -n 2 の省略した記述方法
+    narou diff 6 2013.02.21@01.39.46   # 差分を直接指定
+    narou diff 6 -l     # 過去にどの話数の差分があるのかを確認
+    narou setting difftool=\"C:\\Program Files\\WinMerge\\WinMergeU.exe\"
+    narou setting difftool.arg='-u %OLD %NEW'",
     options: &[
         opt(Some("-n"), "--number", Some("NUM"), "差分番号(1=最新)"),
         opt(Some("-l"), "--list", None, "差分一覧を表示"),
@@ -973,6 +979,10 @@ fn find_command_help(name: &str) -> Option<&'static CmdHelp> {
 }
 
 pub fn display_command_help(cmd_name: &str) -> bool {
+    if cmd_name == "setting" {
+        setting::display_help();
+        return true;
+    }
     let Some(help) = find_command_help(cmd_name) else {
         return false;
     };

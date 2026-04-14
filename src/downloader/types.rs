@@ -65,6 +65,7 @@ pub struct TocObject {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SectionElement {
+    #[serde(default)]
     pub data_type: String,
     #[serde(default)]
     pub introduction: String,
