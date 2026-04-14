@@ -1,5 +1,6 @@
 #[macro_use]
 mod output_macros;
+mod backtracer;
 mod cli;
 mod commands;
 mod logger;
@@ -8,6 +9,7 @@ use std::io::IsTerminal;
 use std::time::Instant;
 
 use clap::Parser;
+use futures::FutureExt;
 
 use cli::{Cli, Commands};
 
@@ -30,6 +32,8 @@ async fn main() {
     logger::init();
     logger::init_tracing(no_color);
 
+    let trace_args = args.clone();
+
     if !args.is_empty() {
         cli::inject_default_args(&mut args);
         cli::inject_command_defaults(&mut args);
@@ -41,11 +45,35 @@ async fn main() {
         None
     };
 
-    let exit_code = if !args.is_empty() && args[0] == "help" {
-        commands::help::cmd_help();
-        0
-    } else {
-        run_command(args, user_agent, backtrace).await
+    let trace_args_for_run = trace_args.clone();
+    let exit_code = match std::panic::AssertUnwindSafe(async move {
+        if !args.is_empty() && args[0] == "help" {
+            commands::help::cmd_help();
+            0
+        } else {
+            run_command(args, trace_args_for_run, user_agent, backtrace).await
+        }
+    })
+    .catch_unwind()
+    .await
+    {
+        Ok(code) => code,
+        Err(panic_info) => {
+            backtracer::save_log(&trace_args, panic_info.as_ref());
+            if backtrace {
+                if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    eprintln!("panic: {}", s);
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    eprintln!("panic: {}", s);
+                } else {
+                    eprintln!("panic: unknown error");
+                }
+            } else {
+                eprintln!("エラーが発生したため終了しました。");
+                eprintln!("詳細なエラーログは --backtrace オプションを付けて再度実行して下さい。");
+            }
+            127
+        }
     };
 
     if let Some(start) = start {
@@ -58,7 +86,12 @@ async fn main() {
     }
 }
 
-async fn run_command(args: Vec<String>, user_agent: Option<String>, backtrace: bool) -> i32 {
+async fn run_command(
+    args: Vec<String>,
+    trace_args: Vec<String>,
+    user_agent: Option<String>,
+    backtrace: bool,
+) -> i32 {
     let cli = match Cli::try_parse_from(std::iter::once("narou".to_string()).chain(args)) {
         Ok(cli) => cli,
         Err(e) => {
@@ -81,11 +114,16 @@ async fn run_command(args: Vec<String>, user_agent: Option<String>, backtrace: b
             commands::web::run_web_server(port, no_browser).await;
             0
         }
-        other => run_sync_command(other, ua, backtrace),
+        other => run_sync_command(other, trace_args, ua, backtrace),
     }
 }
 
-fn run_sync_command(command: Commands, user_agent: Option<String>, backtrace: bool) -> i32 {
+fn run_sync_command(
+    command: Commands,
+    trace_args: Vec<String>,
+    user_agent: Option<String>,
+    backtrace: bool,
+) -> i32 {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match command {
         Commands::Init {
             aozora_path,
@@ -199,6 +237,13 @@ fn run_sync_command(command: Commands, user_agent: Option<String>, backtrace: bo
             commands::setting::cmd_setting(&args, list, all, burn);
             0
         }
+        Commands::Trace => match commands::trace::cmd_trace() {
+            Ok(_) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                127
+            }
+        },
         Commands::Log {
             path,
             num,
@@ -221,6 +266,7 @@ fn run_sync_command(command: Commands, user_agent: Option<String>, backtrace: bo
     match result {
         Ok(code) => code,
         Err(panic_info) => {
+            backtracer::save_log(&trace_args, panic_info.as_ref());
             if backtrace {
                 if let Some(s) = panic_info.downcast_ref::<&str>() {
                     eprintln!("panic: {}", s);

@@ -308,7 +308,7 @@ fn modified_time(path: &Path) -> std::time::SystemTime {
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
 }
 
-fn find_narou_root() -> Option<PathBuf> {
+pub(crate) fn find_narou_root() -> Option<PathBuf> {
     let mut current = std::env::current_dir().ok()?;
     loop {
         if current.join(".narou").is_dir() {

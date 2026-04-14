@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 
+use crate::backtracer;
 use crate::logger;
 
 struct CmdInfo {
@@ -839,7 +840,9 @@ const LOG_HELP: CmdHelp = CmdHelp {
 
 const TRACE_HELP: CmdHelp = CmdHelp {
     banner: "",
-    description: "  直前のバックトレースを表示します。",
+    description: "\
+  ・エラーが発生した際に保存されたバックトレースログを表示します。
+  ・ログテキスト自体は {{TRACE_LOG_PATH}} に保存されています。",
     options: &[],
 };
 
@@ -1004,13 +1007,18 @@ fn render_command_help(out: &mut dyn Write, cmd_name: &str, help: &CmdHelp) {
     }
 
     let _ = writeln!(out);
-    let description = if cmd_name == "log" {
-        let log_dir = logger::log_dir()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default();
-        help.description.replace("{{LOG_DIR}}", &log_dir)
-    } else {
-        help.description.to_string()
+    let description = match cmd_name {
+        "log" => {
+            let log_dir = logger::log_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+            help.description.replace("{{LOG_DIR}}", &log_dir)
+        }
+        "trace" => help.description.replace(
+            "{{TRACE_LOG_PATH}}",
+            &backtracer::log_path().display().to_string(),
+        ),
+        _ => help.description.to_string(),
     };
     for line in description.lines() {
         if line.is_empty() {

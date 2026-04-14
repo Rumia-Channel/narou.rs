@@ -6,6 +6,7 @@ pub mod log;
 pub mod mail;
 pub mod manage;
 pub mod setting;
+pub mod trace;
 pub mod update;
 pub mod version;
 pub mod web;

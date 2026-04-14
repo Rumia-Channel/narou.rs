@@ -44,13 +44,13 @@
 | `clean` | ❌ 未実装 | ゴミファイル削除 |
 | `help` | 🟡 部分 | トップレベルは概ね実装済み。各コマンド `-h` は Ruby版詳細ヘルプとの差分あり |
 | `version` | 🟡 部分 | `-v`/`--version` と `--more` を実装。Ruby版の出力細部は継続確認 |
-| `log` | ❌ 未実装 | ログ表示 |
+| `log` | ✅ 完了 | `--num`, `--tail`, `--source-convert`, `<path>` を実装。最新ログ選択、`.narou/local_setting.yaml` の `log.*` 既定値、`*_convert` フィルタも対応 |
 | `folder` | ❌ 未実装 | フォルダを開く |
 | `browser` | ❌ 未実装 | ブラウザで開く |
 | `alias` | ❌ 未実装 | ID別名管理 |
 | `inspect` | ❌ 未実装 | 小説状態調査 |
 | `csv` | ❌ 未実装 | CSV エクスポート/インポート |
-| `trace` | ❌ 未実装 | デバッグ用 |
+| `trace` | ✅ 完了 | `trace_dump.txt` を表示。panic 時に保存されたバックトレースを読む |
 
 ### グローバル機能 (2026-04-12 完了)
 - ✅ `--no-color`: NO_COLOR 環境変数設定 + global_setting.yaml の `no-color` キー参照

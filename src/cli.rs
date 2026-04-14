@@ -399,6 +399,7 @@ pub enum Commands {
         #[arg(short = 'c', long = "source-convert")]
         source_convert: bool,
     },
+    Trace,
     Version {
         #[arg(short = 'm', long)]
         more: bool,
