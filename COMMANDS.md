@@ -82,7 +82,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 |---------|:--------:|:-----------:|------|
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
 | `download` | ✅ | 🟡 部分 | `--mail` と保存フォルダ欠落時の再DL確認まで実装。`mail` 系の最終 end-to-end 確認待ちで保留 |
-| `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、digest選択肢、差分cache退避、hotentryのcopy/send/mailまでは実装済み。周辺出力/イベント細部が残る |
+| `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、section hash cache 永続化、digest選択肢、差分cache退避、hotentryのcopy/send/mailまでは実装済み。周辺出力/イベント細部が残る |
 | `convert` | ✅ | 🟡 部分 | `--output` / `--enc` / テキストファイル入力 / `--inspect` / `convert.inspect` / `--no-open` / `--no-epub` / `--no-mobi` / `--no-strip` / `--make-zip` / `--no-zip` / `--verbose` / `device` 設定反映 / `convert.multi-device` / `convert.copy-to` / `convert.copy-zip-to` / `convert.copy-to-grouping` / `--ignore-default` / `--ignore-force` / `dc:subject` 埋め込み / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFOまでは実装。実機 send 最終確認が残る |
 | `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--echo` と pipe 時ID出力まで実装 |
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションまで実装 |
@@ -188,6 +188,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `_convert_failure` フラグ: 変換失敗時に記録、次回更新で再変換を試行
 - `update.interval` 設定対応（最低2.5秒、YAMLの数値/文字列を許容）
 - `update.strong` 設定対応。同日更新時は保存済み `本文/*.yaml` の本文要素と取得本文をハッシュ比較し、実質同一なら更新扱いにしない
+- Ruby版同様 `.narou/section_hash_cache.yaml` を永続化し、strong update 時の既存 section digest を再利用する
 - `update.convert-only-new-arrival` 設定対応（YAMLの真偽値/文字列/数値を許容）
 - `last_check_date` 追跡
 - `download.choices-of-digest-options` 設定対応。Ruby版と同じ 1-8 のダイジェスト化選択肢を処理し、キャンセル・凍結・バックアップ・あらすじ表示・ブラウザ起動・保存フォルダ起動・変換を実行
@@ -205,7 +206,6 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `--all` は Ruby版に存在しないRust独自オプションだったため削除
 
 **完了扱いにしない理由 / 不足動作**:
-- Ruby版の section hash cache 永続化との完全な外部互換は未確認
 - Ruby版の詳細表示・hotentry後処理・割り込み時Worker cancelなど、周辺出力/イベント処理の細部は追加突合が必要
 
 ---
@@ -717,7 +717,7 @@ narou setting name         # 読み取り
 | タスク | コマンド | 影響 |
 |-------|---------|------|
 | download `--force`, `--no-convert`, `--freeze` | download | DL フラグ互換 |
-| update の残互換実装 | update | Ruby版ターゲット解決・`--gl`主要挙動・`update.strong`・digest選択肢・差分用 cache 退避・hotentry の copy/send/mail までは実装済み。周辺出力/イベント細部が残る |
+| update の残互換実装 | update | Ruby版ターゲット解決・`--gl`主要挙動・`update.strong`・section hash cache 永続化・digest選択肢・差分用 cache 退避・hotentry の copy/send/mail までは実装済み。周辺出力/イベント細部が残る |
 | convert send | convert | `--no-strip` まで実装済み。残りは実機 send 最終確認 |
 | download の残互換実装 | download | command 固有の欠落はほぼ解消。残りは `mail` と共有の実SMTP end-to-end 確認 |
 

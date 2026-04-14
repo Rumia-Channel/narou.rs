@@ -43,10 +43,14 @@ pub use self::types::{
 };
 pub use self::util::pretreatment_source;
 
+const SECTION_HASH_CACHE_NAME: &str = "section_hash_cache";
+
 pub struct Downloader {
     fetcher: HttpFetcher,
     site_settings: Vec<SiteSetting>,
     section_cache: SectionCache,
+    section_hash_cache: HashMap<String, HashMap<String, String>>,
+    section_hash_cache_dirty: bool,
     progress: Option<Box<dyn ProgressReporter>>,
 }
 
@@ -116,7 +120,10 @@ fn save_global_setting_bool(key: &str, value: bool) -> Result<()> {
     crate::db::with_database_mut(|db| {
         let mut settings: HashMap<String, serde_yaml::Value> = db
             .inventory()
-            .load("global_setting", crate::db::inventory::InventoryScope::Global)
+            .load(
+                "global_setting",
+                crate::db::inventory::InventoryScope::Global,
+            )
             .unwrap_or_default();
         settings.insert(key.to_string(), serde_yaml::Value::Bool(value));
         db.inventory().save(
@@ -130,6 +137,13 @@ fn save_global_setting_bool(key: &str, value: bool) -> Result<()> {
 
 fn section_filename(subtitle: &SubtitleInfo) -> String {
     format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle)
+}
+
+fn section_relative_path(subtitle: &SubtitleInfo) -> String {
+    PathBuf::from(types::SECTION_SAVE_DIR)
+        .join(section_filename(subtitle))
+        .to_string_lossy()
+        .to_string()
 }
 
 fn create_cache_dir(section_dir: &Path) -> Result<Option<PathBuf>> {
@@ -292,11 +306,20 @@ impl Downloader {
 
         let fetcher = HttpFetcher::new(&ua)?;
         let site_settings = SiteSetting::load_all()?;
+        let section_hash_cache = crate::db::with_database(|db| {
+            db.inventory().load(
+                SECTION_HASH_CACHE_NAME,
+                crate::db::inventory::InventoryScope::Local,
+            )
+        })
+        .unwrap_or_default();
 
         Ok(Self {
             fetcher,
             site_settings,
             section_cache: SectionCache::new(),
+            section_hash_cache,
+            section_hash_cache_dirty: false,
             progress: None,
         })
     }
@@ -781,6 +804,7 @@ impl Downloader {
         let mut final_subtitles = Vec::with_capacity(subtitles.len());
         let strong_update = load_local_setting_bool("update.strong");
         let mut cache_dir: Option<PathBuf> = None;
+        let mut pending_section_hashes: HashMap<String, String> = HashMap::new();
 
         if let Some(ref p) = self.progress {
             p.set_length(total);
@@ -807,6 +831,7 @@ impl Downloader {
                     &setting,
                     subtitle,
                     old_subtitles.get(&subtitle.index).copied(),
+                    existing_id,
                     &section_dir,
                     &toc_url,
                     strong_update,
@@ -829,9 +854,19 @@ impl Downloader {
                     if cache_dir.is_none() {
                         cache_dir = create_cache_dir(&section_dir)?;
                     }
+                    if let Some(id) = existing_id {
+                        self.clear_section_digest(id, &section_relative_path(subtitle));
+                    }
                     move_to_cache_dir(&section_dir, cache_dir.as_deref(), subtitle)?;
                 }
                 save_section_file(&section_dir, subtitle, &section)?;
+                let digest = compute_section_hash(&section);
+                let relative_path = section_relative_path(subtitle);
+                if let Some(id) = existing_id {
+                    self.store_section_digest(id, &relative_path, &digest);
+                } else {
+                    pending_section_hashes.insert(relative_path, digest);
+                }
                 save_raw_file(&raw_dir, subtitle, &raw_html)?;
                 self.download_illustration(&setting, &section, &section_dir, subtitle)?;
                 updated_count += 1;
@@ -1021,6 +1056,15 @@ impl Downloader {
             Ok::<i64, NarouError>(id)
         })?;
 
+        if let Some(old_id) = existing_id {
+            self.move_section_hash_bucket(old_id, id);
+        } else {
+            for (relative_path, digest) in pending_section_hashes {
+                self.store_section_digest(id, &relative_path, &digest);
+            }
+        }
+        self.flush_section_hash_cache()?;
+
         let has_changes = updated_count > 0
             || existing_id.is_none()
             || title_changed
@@ -1057,6 +1101,7 @@ impl Downloader {
         setting: &SiteSetting,
         latest: &SubtitleInfo,
         old: Option<&SubtitleInfo>,
+        existing_id: Option<i64>,
         section_dir: &PathBuf,
         toc_url: &str,
         strong_update: bool,
@@ -1119,9 +1164,24 @@ impl Downloader {
                 toc_url,
             )?;
             let new_hash = compute_section_hash(&downloaded.0);
-            let old_hash = load_section_file(&old_section_path)
-                .map(|section| compute_section_hash(&section.element));
+            let relative_path = section_relative_path(old);
+            let old_hash = existing_id
+                .and_then(|id| {
+                    self.ensure_cached_section_digest(id, &relative_path, &old_section_path)
+                })
+                .or_else(|| {
+                    load_section_file(&old_section_path).map(|section| {
+                        let digest = compute_section_hash(&section.element);
+                        if let Some(id) = existing_id {
+                            self.store_section_digest(id, &relative_path, &digest);
+                        }
+                        digest
+                    })
+                });
             if old_hash.as_deref() == Some(new_hash.as_str()) {
+                if let Some(id) = existing_id {
+                    self.store_section_digest(id, &relative_path, &new_hash);
+                }
                 return Ok((false, None));
             }
             return Ok((true, Some(downloaded)));
@@ -1316,6 +1376,82 @@ impl Downloader {
         .unwrap_or(false)
     }
 
+    fn cached_section_digest(&self, id: i64, relative_path: &str) -> Option<&str> {
+        self.section_hash_cache
+            .get(&id.to_string())
+            .and_then(|bucket| bucket.get(relative_path))
+            .map(String::as_str)
+    }
+
+    fn store_section_digest(&mut self, id: i64, relative_path: &str, digest: &str) {
+        let bucket = self.section_hash_cache.entry(id.to_string()).or_default();
+        if bucket.get(relative_path).map(String::as_str) != Some(digest) {
+            bucket.insert(relative_path.to_string(), digest.to_string());
+            self.section_hash_cache_dirty = true;
+        }
+    }
+
+    fn ensure_cached_section_digest(
+        &mut self,
+        id: i64,
+        relative_path: &str,
+        full_path: &PathBuf,
+    ) -> Option<String> {
+        if let Some(digest) = self.cached_section_digest(id, relative_path) {
+            return Some(digest.to_string());
+        }
+
+        let section = load_section_file(full_path)?;
+        let digest = compute_section_hash(&section.element);
+        self.store_section_digest(id, relative_path, &digest);
+        Some(digest)
+    }
+
+    fn clear_section_digest(&mut self, id: i64, relative_path: &str) {
+        let key = id.to_string();
+        let should_remove_bucket = if let Some(bucket) = self.section_hash_cache.get_mut(&key) {
+            if bucket.remove(relative_path).is_some() {
+                self.section_hash_cache_dirty = true;
+                bucket.is_empty()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if should_remove_bucket {
+            self.section_hash_cache.remove(&key);
+        }
+    }
+
+    fn move_section_hash_bucket(&mut self, from_id: i64, to_id: i64) {
+        if from_id == to_id {
+            return;
+        }
+        if let Some(bucket) = self.section_hash_cache.remove(&from_id.to_string()) {
+            if !bucket.is_empty() {
+                self.section_hash_cache.insert(to_id.to_string(), bucket);
+                self.section_hash_cache_dirty = true;
+            }
+        }
+    }
+
+    fn flush_section_hash_cache(&mut self) -> Result<()> {
+        if !self.section_hash_cache_dirty {
+            return Ok(());
+        }
+        crate::db::with_database(|db| {
+            db.inventory().save(
+                SECTION_HASH_CACHE_NAME,
+                crate::db::inventory::InventoryScope::Local,
+                &self.section_hash_cache,
+            )?;
+            Ok(())
+        })?;
+        self.section_hash_cache_dirty = false;
+        Ok(())
+    }
+
     pub fn set_progress(&mut self, progress: Box<dyn ProgressReporter>) {
         self.progress = Some(progress);
     }
@@ -1331,6 +1467,7 @@ impl Downloader {
 
 #[cfg(test)]
 mod tests {
+    use super::Downloader;
     use super::novel_info::NovelInfo;
     use super::site_setting::SiteSetting;
 
@@ -1515,5 +1652,23 @@ mod tests {
             Some("異世界に来たけど至って普通に喫茶店とかやってますが何か問題でも？")
         );
         assert_eq!(info.author.as_deref(), Some("風見鶏"));
+    }
+
+    #[test]
+    fn section_hash_cache_store_and_clear_roundtrip() {
+        let mut downloader = Downloader::with_user_agent(None).unwrap();
+        downloader.store_section_digest(42, "本文\\1 test.yaml", "digest-1");
+
+        assert_eq!(
+            downloader.cached_section_digest(42, "本文\\1 test.yaml"),
+            Some("digest-1")
+        );
+
+        downloader.clear_section_digest(42, "本文\\1 test.yaml");
+
+        assert_eq!(
+            downloader.cached_section_digest(42, "本文\\1 test.yaml"),
+            None
+        );
     }
 }
