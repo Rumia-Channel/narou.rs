@@ -155,7 +155,18 @@ pub fn cmd_convert(
                 {
                     let _ = multi_clone.println(&err);
                 }
-                apply_dc_subjects_if_needed(Path::new(&output_path), dc_subjects.as_deref(), &multi_clone);
+                if let Some(device) = selected_device {
+                    if let Err(err) =
+                        print_send_result(&output_path, device, &multi_clone)
+                    {
+                        let _ = multi_clone.println(&err);
+                    }
+                }
+                apply_dc_subjects_if_needed(
+                    Path::new(&output_path),
+                    dc_subjects.as_deref(),
+                    &multi_clone,
+                );
                 if let Some(inspection) = converter.take_inspection_output() {
                     for line in inspection.split('\n') {
                         let _ = multi_clone.println(line);
@@ -240,6 +251,11 @@ fn convert_text_target(
             }
             if let Err(err) = print_copy_to_result(&output_path, copy_device, 0, multi_clone) {
                 let _ = multi_clone.println(&err);
+            }
+            if let Some(device) = copy_device {
+                if let Err(err) = print_send_result(&output_path, device, multi_clone) {
+                    let _ = multi_clone.println(&err);
+                }
             }
             print_inspection_output(&mut converter, multi_clone);
         }
@@ -484,6 +500,14 @@ fn print_copy_to_result(
         let _ = multi_clone.println(&format!("{} へコピーしました", path.display()));
     }
     Ok(())
+}
+
+fn print_send_result(
+    output_path: &str,
+    device: narou_rs::converter::device::Device,
+    _multi_clone: &indicatif::MultiProgress,
+) -> std::result::Result<(), String> {
+    narou_rs::compat::send_file_to_device(Path::new(output_path), device)
 }
 
 fn split_output_name(output: &str) -> (String, String) {

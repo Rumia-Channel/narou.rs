@@ -245,6 +245,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `device=kindle` かつ `--no-mobi` / `convert.no-mobi=true` の場合は kindlegen を呼ばず EPUB 出力へ切り替える。`sample\\novel` で `device: kindle` を一時設定して `convert --no-mobi 3` の `.epub` 出力を確認済み
 - `--verbose` 未指定時は AozoraEpub3 / kindlegen の標準出力を抑止し、指定時のみ透過表示する。`sample\\novel` で `device: epub` の通常変換では AozoraEpub3 行が出ず、`--verbose` 付きでは `Detected encoding = UTF-8` / `変換開始` が表示されることを確認済み
 - `convert.add-dc-subject-to-epub=true` 時は DB タグから `convert.dc-subject-exclude-tags` を除いた値を EPUB 内 `standard.opf` の `<dc:subject>` へ埋め込む。除外設定未作成時は Ruby版同様 `404,end` を自動保存し、`sample\\novel` で `alpha` タグだけが埋め込まれ `end` は除外されることを確認済み
+- direct `convert` 後の端末送信は従来の compat 経路と同じ `send_file_to_device` helper へ揃えた。`sample\\novel` の `device: epub` 経路では副作用なく通ることを確認したが、Kindle/Kobo/Reader 実機での最終検証までは未了
 - `convert.copy-to` / `convert.copy_to` と `convert.copy-to-grouping` の device/site グルーピングも direct convert へ接続し、`sample\\novel` で `device=epub` + `copy-to-grouping=device,site` のコピー先生成を確認済み
 - `--ignore-default` / `--ignore-force` を `NovelSettings::load_for_novel_with_options` に渡し、`default.*` / `force.*` の適用を個別に無効化できるようにした
 - DB 管理小説だけでなくファイルパス指定の textfile 変換も `commands::convert` に接続し、`--enc` による UTF-8 / Shift_JIS / EUC-JP 系のデコードと `enable_enchant_midashi` 推奨 INFO を追加した

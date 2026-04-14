@@ -352,7 +352,7 @@ fn get_copy_to_directory(
     Ok(Some(dir))
 }
 
-fn send_file_to_device(ebook_file: &Path, device: Device) -> std::result::Result<(), String> {
+pub fn send_file_to_device(ebook_file: &Path, device: Device) -> std::result::Result<(), String> {
     let manager = crate::converter::device::OutputManager::new(device);
     if !device.physical_support() || !manager.connecting() || !device.matches_ebook_file(ebook_file)
     {
