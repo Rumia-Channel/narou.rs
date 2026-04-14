@@ -1,5 +1,6 @@
 use axum::{extract::State, http::StatusCode, response::Json};
 
+use crate::compat::set_frozen_state;
 use crate::db::with_database_mut;
 use crate::error::NarouError;
 
@@ -71,22 +72,12 @@ pub async fn batch_freeze(
     State(state): State<AppState>,
     Json(body): Json<BatchIdsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
-    let count = with_database_mut(|db| {
-        let mut count = 0usize;
-        for id in &body.ids {
-            if let Some(record) = db.get(*id).cloned() {
-                let mut updated = record;
-                if !updated.tags.contains(&"frozen".to_string()) {
-                    updated.tags.push("frozen".to_string());
-                }
-                db.insert(updated);
-                count += 1;
-            }
+    let mut count = 0usize;
+    for id in &body.ids {
+        if set_frozen_state(*id, true).is_ok() {
+            count += 1;
         }
-        db.save()?;
-        Ok::<usize, NarouError>(count)
-    })
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
 
     state
         .push_server
@@ -101,20 +92,12 @@ pub async fn batch_unfreeze(
     State(state): State<AppState>,
     Json(body): Json<BatchIdsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
-    let count = with_database_mut(|db| {
-        let mut count = 0usize;
-        for id in &body.ids {
-            if let Some(record) = db.get(*id).cloned() {
-                let mut updated = record;
-                updated.tags.retain(|t| t != "frozen");
-                db.insert(updated);
-                count += 1;
-            }
+    let mut count = 0usize;
+    for id in &body.ids {
+        if set_frozen_state(*id, false).is_ok() {
+            count += 1;
         }
-        db.save()?;
-        Ok::<usize, NarouError>(count)
-    })
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
 
     state
         .push_server

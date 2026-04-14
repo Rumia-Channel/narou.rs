@@ -526,6 +526,9 @@ narou setting name         # 読み取り
 | `--port PORT` | `-p` | int | 3000 | サーバポート | ✅ |
 | `--no-browser` | `-n` | flag | false | ブラウザ自動起動抑制 | ✅ |
 
+**実装済み動作**:
+- API の凍結/解凍操作と一覧上の `frozen` 判定は CLI と同じ `.narou/freeze.yaml` を優先し、`frozen` タグは補助的に扱う
+
 **不足動作**:
 - WebSocket ポート = HTTP ポート + 1
 - 初回起動時のファイアウォール警告

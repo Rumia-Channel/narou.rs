@@ -4,6 +4,7 @@ use axum::{
     response::Json,
 };
 
+use crate::compat::{load_frozen_ids, record_is_frozen, set_frozen_state};
 use crate::db::{with_database, with_database_mut};
 use crate::error::NarouError;
 
@@ -32,6 +33,7 @@ pub async fn api_list(
 
     let response = with_database(|db| {
         let all_records: Vec<_> = db.all_records().values().collect();
+        let frozen_ids = load_frozen_ids().unwrap_or_default();
 
         let mut filtered: Vec<_> = if search.is_empty() {
             all_records
@@ -96,7 +98,7 @@ pub async fn api_list(
                     .map(|d: chrono::DateTime<chrono::Utc>| d.format("%Y-%m-%d").to_string()),
                 tags: r.tags.clone(),
                 new_arrivals: false,
-                frozen: r.tags.contains(&"frozen".to_string()),
+                frozen: record_is_frozen(r, &frozen_ids),
                 length: r.length,
             })
             .collect();
@@ -155,19 +157,7 @@ pub async fn freeze_novel(
     State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
-    with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
-        if !updated.tags.contains(&"frozen".to_string()) {
-            updated.tags.push("frozen".to_string());
-        }
-        db.insert(updated);
-        db.save()
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    set_frozen_state(id, true).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     state.push_server.broadcast("freeze", &id.to_string());
     Ok(Json(ApiResponse {
@@ -180,17 +170,7 @@ pub async fn unfreeze_novel(
     State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
-    with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
-        updated.tags.retain(|t| t != "frozen");
-        db.insert(updated);
-        db.save()
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    set_frozen_state(id, false).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     state.push_server.broadcast("unfreeze", &id.to_string());
     Ok(Json(ApiResponse {
