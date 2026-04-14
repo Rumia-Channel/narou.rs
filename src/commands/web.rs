@@ -37,12 +37,21 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
     );
 
     let push_server = Arc::new(web::push::PushServer::new());
-    let app = web::create_router(web::AppState {
+    let basic_auth_header = match load_basic_auth_header() {
+        Ok(header) => header,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let app_state = web::AppState {
         port: address.port,
         ws_port: address.ws_port,
         push_server: push_server.clone(),
-    });
-    let ws_app = web::push::create_push_router(push_server);
+        basic_auth_header,
+    };
+    let app = web::create_router(app_state.clone());
+    let ws_app = web::push::create_push_router(app_state);
 
     let addr: SocketAddr = format!("{}:{}", address.host, address.port)
         .parse()
@@ -93,6 +102,25 @@ fn resolve_web_address(user_port: Option<u16>) -> Result<WebAddress, String> {
         port,
         ws_port,
     })
+}
+
+fn load_basic_auth_header() -> Result<Option<String>, String> {
+    let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
+    let global_setting: HashMap<String, Value> = inventory
+        .load("global_setting", InventoryScope::Global)
+        .unwrap_or_default();
+    let enabled = yaml_bool(global_setting.get("server-basic-auth.enable")).unwrap_or(false);
+    if !enabled {
+        return Ok(None);
+    }
+    let user = yaml_string(global_setting.get("server-basic-auth.user")).unwrap_or_default();
+    let password =
+        yaml_string(global_setting.get("server-basic-auth.password")).unwrap_or_default();
+    if user.is_empty() || password.is_empty() {
+        return Ok(None);
+    }
+    let token = encode_base64(format!("{}:{}", user, password).as_bytes());
+    Ok(Some(format!("Basic {}", token)))
 }
 
 fn confirm_first_web_boot(no_browser: bool) -> Result<bool, String> {
@@ -189,9 +217,37 @@ fn yaml_u16(value: Option<&Value>) -> Option<u16> {
     }
 }
 
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut index = 0usize;
+    while index < input.len() {
+        let b0 = input[index];
+        let b1 = input.get(index + 1).copied().unwrap_or(0);
+        let b2 = input.get(index + 2).copied().unwrap_or(0);
+        let combined = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+
+        out.push(TABLE[((combined >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((combined >> 12) & 0x3f) as usize] as char);
+        if index + 1 < input.len() {
+            out.push(TABLE[((combined >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if index + 2 < input.len() {
+            out.push(TABLE[(combined & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+
+        index += 3;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{display_host, normalize_bind_host};
+    use super::{display_host, encode_base64, normalize_bind_host};
 
     #[test]
     fn normalize_bind_host_defaults_to_loopback() {
@@ -206,5 +262,11 @@ mod tests {
     fn display_host_prefers_localhost_alias() {
         assert_eq!(display_host("127.0.0.1"), "localhost");
         assert_eq!(display_host("0.0.0.0"), "0.0.0.0");
+    }
+
+    #[test]
+    fn encode_base64_matches_basic_examples() {
+        assert_eq!(encode_base64(b"user:pass"), "dXNlcjpwYXNz");
+        assert_eq!(encode_base64(b"ab"), "YWI=");
     }
 }

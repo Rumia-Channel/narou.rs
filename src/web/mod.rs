@@ -9,6 +9,9 @@ pub mod tags;
 
 use axum::{
     Router,
+    http::{StatusCode, header},
+    middleware,
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
 use std::sync::Arc;
@@ -19,9 +22,11 @@ pub struct AppState {
     pub port: u16,
     pub ws_port: u16,
     pub push_server: Arc<push::PushServer>,
+    pub basic_auth_header: Option<String>,
 }
 
 pub fn create_router(state: AppState) -> Router {
+    let auth_state = state.clone();
     Router::new()
         .route("/", get(novels::index))
         .route("/api/novels/count", get(novels::novels_count))
@@ -51,6 +56,36 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/queue/status", get(jobs::queue_status))
         .route("/api/queue/clear", post(jobs::queue_clear))
         .route("/api/log/recent", get(misc::recent_logs))
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            basic_auth_middleware,
+        ))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+async fn basic_auth_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    let Some(expected) = state.basic_auth_header.as_deref() else {
+        return next.run(request).await;
+    };
+
+    let authorized = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        == Some(expected);
+    if authorized {
+        return next.run(request).await;
+    }
+
+    let mut response = (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        header::HeaderValue::from_static("Basic realm=\"narou.rs\""),
+    );
+    response
 }

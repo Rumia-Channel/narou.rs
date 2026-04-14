@@ -531,11 +531,11 @@ narou setting name         # 読み取り
 - global `server-bind` を読み、未設定時は `127.0.0.1` に bind する（`localhost` は `127.0.0.1` 扱い）
 - WebSocket サーバは HTTP と別に `server-port + 1` で起動する
 - 初回起動時は Ruby版同様にファイアウォール許可と停止方法の案内を表示し、`server_setting.yaml` に起動済みフラグを保存する
+- global `server-basic-auth.*` が有効な場合は HTTP/WS の両ルータで Basic 認証を要求する
 - API の凍結/解凍操作と一覧上の `frozen` 判定は CLI と同じ `.narou/freeze.yaml` を優先し、`frozen` タグは補助的に扱う
 
 **不足動作**:
 - 自動更新スケジューラの起動
-- Basic 認証 (`server-basic-auth` 設定)
 - HTML フロントエンド (Ruby 版は HAML テンプレート)
 - `webui.theme` 設定
 - `webui.performance-mode` 設定

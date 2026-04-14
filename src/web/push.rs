@@ -124,10 +124,10 @@ impl Default for PushServer {
     }
 }
 
-pub fn create_push_router(push_server: Arc<PushServer>) -> Router {
+pub fn create_push_router(state: AppState) -> Router {
     Router::new()
-        .route("/ws", get(ws_handler))
-        .with_state(push_server)
+        .route("/ws", get(ws_handler_with_app_state))
+        .with_state(state)
 }
 
 pub async fn ws_handler_with_app_state(
@@ -135,13 +135,6 @@ pub async fn ws_handler_with_app_state(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state.push_server))
-}
-
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(push_server): State<Arc<PushServer>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, push_server))
 }
 
 async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>) {
