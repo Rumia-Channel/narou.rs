@@ -7,7 +7,9 @@ use narou_rs::converter::NovelConverter;
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
 use narou_rs::downloader::{Downloader, TargetType, UpdateStatus};
-use narou_rs::mail::{ensure_mail_setting_file, load_mail_setting, send_target_with_setting};
+use narou_rs::mail::{
+    MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
+};
 use narou_rs::progress::CliProgress;
 
 pub struct DownloadOptions {
@@ -62,63 +64,82 @@ fn cmd_download_inner(opts: DownloadOptions) -> i32 {
             let _ = multi_clone.println(format!("{}", "\u{2500}".repeat(35)));
         }
 
-        let data = get_data_by_target(target);
+        let mut download_target = target.clone();
+        loop {
+            let data = get_data_by_target(&download_target);
 
-        if is_novel_frozen(target) {
-            if let Some(ref rec) = data {
-                let _ = multi_clone.println(format!(
-                    "{} は凍結中です\nダウンロードを中止しました",
-                    rec.title
-                ));
-            }
-            mistook += 1;
-            continue;
-        }
-
-        if !opts.force {
-            if let Some(ref rec) = data {
-                if has_novel_data_dir(target) {
+            if is_novel_frozen(&download_target) {
+                if let Some(ref rec) = data {
                     let _ = multi_clone.println(format!(
-                        "{} はダウンロード済みです。\nID: {}\ntitle: {}",
-                        target, rec.id, rec.title
+                        "{} は凍結中です\nダウンロードを中止しました",
+                        rec.title
                     ));
-                    mistook += 1;
-                    continue;
                 }
-            }
-        }
-
-        let progress = CliProgress::with_multi(&format!("DL {}", target), multi_clone.clone());
-        downloader.set_progress(Box::new(progress));
-
-        match downloader.download_novel_with_force(target, opts.force) {
-            Ok(dl) => {
-                print_download_status(&multi_clone, &dl);
-
-                match dl.status {
-                    UpdateStatus::Ok => {}
-                    UpdateStatus::None | UpdateStatus::Failed | UpdateStatus::Canceled => {
-                        mistook += 1;
-                        continue;
-                    }
-                }
-
-                if opts.no_convert {
-                    after_process(&multi_clone, target, &opts);
-                } else {
-                    if let Err(e) = auto_convert(&multi_clone, &dl) {
-                        let _ = multi_clone.println(format!("  Convert error: {}", e));
-                    }
-                    after_process(&multi_clone, target, &opts);
-                }
-            }
-            Err(e) => {
-                if matches!(e, narou_rs::error::NarouError::SuspendDownload(_)) {
-                    std::panic::resume_unwind(Box::new(e.to_string()));
-                }
-                let _ = multi_clone.println(format!("  Error: {}", e));
                 mistook += 1;
+                break;
             }
+
+            if !opts.force {
+                if let Some(existing) = inspect_existing_download(&download_target) {
+                    match existing {
+                        ExistingDownloadState::Present(rec) => {
+                            let _ = multi_clone.println(format!(
+                                "{} はダウンロード済みです。\nID: {}\ntitle: {}",
+                                download_target, rec.id, rec.title
+                            ));
+                            mistook += 1;
+                            break;
+                        }
+                        ExistingDownloadState::Missing { record, path } => {
+                            eprintln!(
+                                "{} が見つかりません。\n保存フォルダが消去されていたため、データベースのインデックスを削除しました。",
+                                path.display()
+                            );
+                            if confirm("再ダウンロードしますか", false, true) {
+                                download_target = record.toc_url;
+                                continue;
+                            }
+                            mistook += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let progress =
+                CliProgress::with_multi(&format!("DL {}", download_target), multi_clone.clone());
+            downloader.set_progress(Box::new(progress));
+
+            match downloader.download_novel_with_force(&download_target, opts.force) {
+                Ok(dl) => {
+                    print_download_status(&multi_clone, &dl);
+
+                    match dl.status {
+                        UpdateStatus::Ok => {}
+                        UpdateStatus::None | UpdateStatus::Failed | UpdateStatus::Canceled => {
+                            mistook += 1;
+                            break;
+                        }
+                    }
+
+                    if opts.no_convert {
+                        after_process(&multi_clone, &download_target, &opts);
+                    } else {
+                        if let Err(e) = auto_convert(&multi_clone, &dl) {
+                            let _ = multi_clone.println(format!("  Convert error: {}", e));
+                        }
+                        after_process(&multi_clone, &download_target, &opts);
+                    }
+                }
+                Err(e) => {
+                    if matches!(e, narou_rs::error::NarouError::SuspendDownload(_)) {
+                        std::panic::resume_unwind(Box::new(e.to_string()));
+                    }
+                    let _ = multi_clone.println(format!("  Error: {}", e));
+                    mistook += 1;
+                }
+            }
+            break;
         }
     }
 
@@ -275,6 +296,12 @@ pub(crate) fn tagname_to_ids(targets: &[String]) -> Vec<String> {
 pub(crate) struct RecordInfo {
     pub(crate) id: i64,
     pub(crate) title: String,
+    pub(crate) toc_url: String,
+}
+
+enum ExistingDownloadState {
+    Present(RecordInfo),
+    Missing { record: RecordInfo, path: std::path::PathBuf },
 }
 
 pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
@@ -287,6 +314,7 @@ pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
                     Ok(db.get(id).map(|r| RecordInfo {
                         id: r.id,
                         title: r.title.clone(),
+                        toc_url: r.toc_url.clone(),
                     }))
                 })
                 .ok()
@@ -301,6 +329,7 @@ pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
                 Ok(db.get_by_toc_url(&toc_url).map(|r| RecordInfo {
                     id: r.id,
                     title: r.title.clone(),
+                    toc_url: r.toc_url.clone(),
                 }))
             })
             .ok()
@@ -314,6 +343,7 @@ pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
                         return Ok(Some(RecordInfo {
                             id: r.id,
                             title: r.title.clone(),
+                            toc_url: r.toc_url.clone(),
                         }));
                     }
                 }
@@ -326,6 +356,7 @@ pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
             Ok(db.find_by_title(&target).map(|r| RecordInfo {
                 id: r.id,
                 title: r.title.clone(),
+                toc_url: r.toc_url.clone(),
             }))
         })
         .ok()
@@ -347,9 +378,36 @@ fn resolve_toc_url_from_url(target: &str) -> Option<String> {
     None
 }
 
-fn has_novel_data_dir(target: &str) -> bool {
+fn inspect_existing_download(target: &str) -> Option<ExistingDownloadState> {
+    let record = get_record_for_target(target)?;
+    let info = RecordInfo {
+        id: record.id,
+        title: record.title.clone(),
+        toc_url: record.toc_url.clone(),
+    };
+    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .unwrap_or_else(|_| std::path::PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR));
+    let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
+    if novel_dir.exists() {
+        return Some(ExistingDownloadState::Present(info));
+    }
+
+    if let Err(err) = narou_rs::db::with_database_mut(|db| {
+        db.remove(record.id);
+        db.save()
+    }) {
+        eprintln!("Warning: stale database index cleanup failed: {}", err);
+    }
+
+    Some(ExistingDownloadState::Missing {
+        record: info,
+        path: novel_dir,
+    })
+}
+
+fn get_record_for_target(target: &str) -> Option<narou_rs::db::NovelRecord> {
     let target_type = Downloader::get_target_type(target);
-    let record = match target_type {
+    match target_type {
         TargetType::Id => {
             if let Ok(id) = target.parse::<i64>() {
                 narou_rs::db::with_database(|db| Ok(db.get(id).cloned()))
@@ -364,18 +422,36 @@ fn has_novel_data_dir(target: &str) -> bool {
                 .ok()
                 .flatten()
         }),
-    };
+    }
+}
 
-    if let Some(rec) = record {
-        let novel_dir = narou_rs::db::novel_dir_for_record(
-            &std::path::PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR),
-            &rec,
-        );
-        novel_dir
-            .join(narou_rs::downloader::SECTION_SAVE_DIR)
-            .exists()
-    } else {
-        false
+fn confirm(message: &str, default: bool, nontty_default: bool) -> bool {
+    if !std::io::stdin().is_terminal() {
+        return nontty_default;
+    }
+
+    loop {
+        print!("{} (y/n)?: ", message);
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).unwrap_or(0) == 0 {
+            return nontty_default;
+        }
+        if let Some(answer) = parse_confirm_input(&input, default) {
+            return answer;
+        }
+    }
+}
+
+fn parse_confirm_input(input: &str, default: bool) -> Option<bool> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Some(default);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
     }
 }
 
@@ -445,11 +521,23 @@ fn after_process(multi: &Arc<MultiProgress>, target: &str, opts: &DownloadOption
                     eprintln!("{}", e);
                 }
             }
-            Err(_) => {
+            Err(MailSettingLoadError::NotFound(_)) => {
                 if let Ok(path) = ensure_mail_setting_file() {
                     let _ = multi.println(format!("created {}", path.display()));
                     let _ = multi.println("メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。");
+                    let _ = multi.println(
+                        "注意：次回以降のupdateで新着があった場合に送信可能フラグが立ちます",
+                    );
                 }
+            }
+            Err(MailSettingLoadError::Incomplete(path)) => {
+                eprintln!(
+                    "設定ファイルの書き換えが終了していないようです。\n設定ファイルは {} にあります",
+                    path.display()
+                );
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
             }
         }
     }
@@ -482,5 +570,29 @@ fn auto_convert(
             Ok(())
         }
         Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_confirm_input;
+
+    #[test]
+    fn parse_confirm_input_accepts_yes_and_no() {
+        assert_eq!(parse_confirm_input("y", false), Some(true));
+        assert_eq!(parse_confirm_input("yes", false), Some(true));
+        assert_eq!(parse_confirm_input("n", true), Some(false));
+        assert_eq!(parse_confirm_input("no", true), Some(false));
+    }
+
+    #[test]
+    fn parse_confirm_input_uses_default_on_empty() {
+        assert_eq!(parse_confirm_input("", false), Some(false));
+        assert_eq!(parse_confirm_input("\n", true), Some(true));
+    }
+
+    #[test]
+    fn parse_confirm_input_rejects_invalid_values() {
+        assert_eq!(parse_confirm_input("maybe", false), None);
     }
 }

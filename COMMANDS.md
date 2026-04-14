@@ -81,7 +81,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | コマンド | narou.rb | Rust 完了度 | 備考 |
 |---------|:--------:|:-----------:|------|
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
-| `download` | ✅ | 🟡 部分 | `--mail` を追加。メール設定の自動作成と送信は実装済みだが、全互換確認は継続中 |
+| `download` | ✅ | 🟡 部分 | `--mail` と保存フォルダ欠落時の再DL確認まで実装。`mail` 系の最終 end-to-end 確認待ちで保留 |
 | `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、digest選択肢、差分cache退避、hotentryのcopy/send/mailまでは実装済み。周辺出力/イベント細部が残る |
 | `convert` | ✅ | 🟡 部分 | `--output` / `--enc` / テキストファイル入力 / `--inspect` / `convert.inspect` / `--no-open` / `--no-epub` / `--no-mobi` / `--make-zip` / `--no-zip` / `--verbose` / `device` 設定反映 / `convert.multi-device` / `convert.copy-to` / `convert.copy-zip-to` / `convert.copy-to-grouping` / `--ignore-default` / `--ignore-force` / `dc:subject` 埋め込み / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFOまでは実装。`--no-strip` と実機 send 最終確認が残る |
 | `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--echo` と pipe 時ID出力まで実装 |
@@ -140,9 +140,11 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `-n`/`--no-convert`: 変換スキップ
 - `-z`/`--freeze`: DL完了後に自動凍結 (`--freeze` は `--remove` より優先)
 - `-r`/`--remove`: DL+変換後にDBから削除（ファイルは残る）
+- `-m`/`--mail`: 変換後に `mail` コマンドと同じ helper で送信。設定未作成時は `mail_setting.yaml` を生成し、注意メッセージも Ruby版に寄せた
 - 引数なしでインタラクティブモード (stdin から URL 入力、TTY時のみ)
 - 凍結チェック: 凍結済み小説はスキップ
 - ダウンロード済みチェック: 既存小説はスキップ（`--force`で上書き）
+- DB に記録があるのに保存フォルダが消えていた場合は、Ruby版同様に DB インデックスを削除して `再ダウンロードしますか (y/n)?` を確認する。非TTYでは yes 扱いで再DLへ進む
 - タグ展開: `tag:NAME` → 該当IDに展開、`^tag:NAME` → 補集合
 - `tagname_to_ids`: ID優先、未登録はタグ名として展開
 - `mistook_count` 追跡 → 終了コード反映
@@ -150,9 +152,8 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 有効ターゲット検証: Nコード or URL(サイト設定マッチ)
 - Nコード指定時は `https://ncode.syosetu.com/<ncode>/` からURLキャプチャを作り、サイト定義の `\k<ncode>` を展開してDLする
 
-**不足動作**:
-- `--mail`: 変換済み電子書籍を `mail_setting.yaml` に従って送信
-- 再ダウンロード確認プロンプト (Ruby: `Narou::Input.confirm("再ダウンロードしますか")`)
+**完了扱いにしない理由 / 不足動作**:
+- `--mail` の最終的な実SMTP end-to-end 検証は `mail` コマンド側の未了項目と共通
 
 ---
 
