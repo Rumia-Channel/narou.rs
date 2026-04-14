@@ -158,10 +158,10 @@ fn get_scope_of_variable_name(name: &str) -> Option<Scope> {
     if vars.global.iter().any(|(n, _)| *n == name) {
         return Some(Scope::Global);
     }
-    if name.starts_with("default.") || name.starts_with("force.") {
+    if is_known_original_setting_name(name) {
         return Some(Scope::Local);
     }
-    if name.starts_with("default_args.") {
+    if is_known_default_arg_name(name) {
         return Some(Scope::Local);
     }
     None
@@ -214,6 +214,23 @@ const ORIGINAL_SETTING_NAMES: &[&str] = &[
     "output_filename",
 ];
 
+const DEFAULT_ARG_COMMAND_NAMES: &[&str] = &[
+    "alias", "backup", "browser", "clean", "console", "convert", "csv", "diff", "download",
+    "folder", "freeze", "help", "init", "inspect", "list", "log", "mail", "remove", "send",
+    "setting", "tag", "trace", "update", "version", "web",
+];
+
+fn is_known_original_setting_name(name: &str) -> bool {
+    name.strip_prefix("default.")
+        .or_else(|| name.strip_prefix("force."))
+        .is_some_and(|rest| ORIGINAL_SETTING_NAMES.contains(&rest))
+}
+
+fn is_known_default_arg_name(name: &str) -> bool {
+    name.strip_prefix("default_args.")
+        .is_some_and(|cmd| DEFAULT_ARG_COMMAND_NAMES.contains(&cmd))
+}
+
 fn cast_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> {
     if let Some(info) = setting_variables().get(name) {
         return cast_value_for_type(info.var_type, value_str, info.select_keys.as_deref());
@@ -228,7 +245,7 @@ fn cast_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> 
         }
     }
 
-    if name.starts_with("default_args.") {
+    if is_known_default_arg_name(name) {
         return Ok(serde_yaml::Value::String(value_str.to_string()));
     }
 
@@ -455,11 +472,7 @@ fn display_variable_list(show_all: bool) {
 
     println!();
     println!("default_args.* 系設定 (各コマンドのデフォルトオプション):");
-    for cmd in &[
-        "init", "download", "update", "convert", "list", "tag", "freeze", "remove", "setting",
-        "web", "send", "diff", "mail", "backup", "clean", "csv", "inspect", "log", "folder",
-        "browser", "alias", "version", "help",
-    ] {
+    for cmd in DEFAULT_ARG_COMMAND_NAMES {
         println!("    default_args.{}", cmd);
     }
 }
@@ -882,6 +895,12 @@ fn setting_variables() -> SettingVariables {
         invisible: true,
         select_keys: None,
     };
+    let invis_sel = |help: &'static str, keys: Vec<&'static str>| VarInfo {
+        var_type: VarType::Select,
+        help,
+        invisible: true,
+        select_keys: Some(keys.iter().map(|s| s.to_string()).collect()),
+    };
     let sel = |help: &'static str, keys: Vec<&'static str>| VarInfo {
         var_type: VarType::Select,
         help,
@@ -899,7 +918,7 @@ fn setting_variables() -> SettingVariables {
         (
             "device",
             sel(
-                "変換、送信対象の端末",
+                "変換、送信対象の端末(sendの--help参照)",
                 vec!["kindle", "kobo", "epub", "ibunko", "reader", "ibooks"],
             ),
         ),
@@ -909,11 +928,17 @@ fn setting_variables() -> SettingVariables {
         ),
         (
             "hotentry.auto-mail",
-            vis(VarType::Boolean, "hotentryをメールで送る"),
+            vis(
+                VarType::Boolean,
+                "hotentryをメールで送る(mail設定済みの場合)",
+            ),
         ),
         (
             "concurrency",
-            vis(VarType::Boolean, "ダウンロードと変換の同時実行を有効にする"),
+            vis(
+                VarType::Boolean,
+                "ダウンロードと変換の同時実行を有効にする。有効にするとログの出力方式が変更される",
+            ),
         ),
         (
             "concurrency.format-queue-text",
@@ -929,24 +954,39 @@ fn setting_variables() -> SettingVariables {
                 "同時実行時の変換キュー表示スタイルのフォーマット",
             ),
         ),
-        ("logging", vis(VarType::Boolean, "ログの保存を有効にする")),
+        (
+            "logging",
+            vis(
+                VarType::Boolean,
+                "ログの保存を有効にする。保存場所はlogフォルダ。concurrencyが有効な場合、変換ログだけ別ファイルに出力される",
+            ),
+        ),
         (
             "logging.format-filename",
-            vis(VarType::String, "ログファイル名のフォーマット"),
+            vis(
+                VarType::String,
+                "ログファイル名のフォーマット。日付でファイルを分けたくなければ固定ファイル名にする。書式は http://bit.ly/date_format 参照",
+            ),
         ),
         (
             "logging.format-timestamp",
-            vis(VarType::String, "ログ内のタイムスタンプのフォーマット"),
+            vis(
+                VarType::String,
+                "ログ内のタイムスタンプのフォーマット。タイムスタンプを記録したくなければ $none とだけ入力",
+            ),
         ),
         (
             "update.interval",
-            vis(VarType::Float, "更新時に各作品間で指定した秒数待機する"),
+            vis(
+                VarType::Float,
+                "更新時に各作品間で指定した秒数待機する(処理時間を含む)",
+            ),
         ),
         (
             "update.strong",
             vis(
                 VarType::Boolean,
-                "改稿日当日の連続更新でも更新漏れが起きないようにする",
+                "改稿日当日の連続更新でも更新漏れが起きないように、中身もチェックして更新を検知する(やや処理が重くなる)",
             ),
         ),
         (
@@ -973,17 +1013,23 @@ fn setting_variables() -> SettingVariables {
         ),
         (
             "update.auto-schedule",
-            vis(VarType::String, "自動アップデートする時間を指定する"),
+            vis(
+                VarType::String,
+                "自動アップデートする時間を指定する。カンマ区切りで複数指定可能。\n      書式：HHMM (例: 0800,1200,1800 = 8時、12時、18時)",
+            ),
         ),
         (
             "convert.copy-to",
-            vis(VarType::Directory, "変換したらこのフォルダにコピーする"),
+            vis(
+                VarType::Directory,
+                "変換したらこのフォルダにコピーする\n      ※注意：存在しないフォルダだとエラーになる",
+            ),
         ),
         (
             "convert.copy-zip-to",
             vis(
                 VarType::Directory,
-                "生成したZIPファイルをこのフォルダにコピーする",
+                "生成したZIPファイルをこのフォルダにコピーする\n      ※注意：存在しないフォルダだとエラーになる",
             ),
         ),
         (
@@ -1015,7 +1061,10 @@ fn setting_variables() -> SettingVariables {
         ),
         (
             "convert.make-zip",
-            vis(VarType::Boolean, "ZIPファイルの作成を有効にする"),
+            vis(
+                VarType::Boolean,
+                "ZIPファイルの作成を有効にする（対応端末: i文庫）",
+            ),
         ),
         (
             "convert.no-open",
@@ -1028,23 +1077,29 @@ fn setting_variables() -> SettingVariables {
         (
             "convert.multi-device",
             multi(
-                "複数の端末用に同時に変換する",
+                "複数の端末用に同時に変換する。deviceよりも優先される。端末名をカンマ区切りで入力。ただのEPUBを出力したい場合はepubを指定",
                 vec!["kindle", "kobo", "epub", "ibunko", "reader", "ibooks"],
             ),
         ),
         (
             "convert.filename-to-ncode",
-            vis(VarType::Boolean, "書籍ファイル名をNコードで出力する"),
+            vis(
+                VarType::Boolean,
+                "書籍ファイル名をNコードで出力する(ドメイン_Nコードの形式)",
+            ),
         ),
         (
             "convert.add-dc-subject-to-epub",
-            vis(VarType::Boolean, "EPUB変換時にdc:subject要素を追加する"),
+            vis(
+                VarType::Boolean,
+                "EPUB変換時にstandard.opfファイルにdc:subject要素を追加する。小説のタグ情報がdc:subjectとして埋め込まれます",
+            ),
         ),
         (
             "convert.dc-subject-exclude-tags",
             vis(
                 VarType::String,
-                "dc:subjectから除外するタグをカンマ区切りで指定する",
+                "dc:subjectから除外するタグをカンマ区切りで指定する。初期値は「404,end」（初回実行時に自動設定される）。すべてのタグを埋め込みたい場合は空文字列を設定",
             ),
         ),
         (
@@ -1053,7 +1108,10 @@ fn setting_variables() -> SettingVariables {
         ),
         (
             "download.wait-steps",
-            vis(VarType::Integer, "指定した話数ごとに長めのウェイトが入る"),
+            vis(
+                VarType::Integer,
+                "指定した話数ごとに長めのウェイトが入る\n      ※注意：11以上を設定してもなろうの場合は10話ごとにウェイトが入ります",
+            ),
         ),
         (
             "download.use-subdirectory",
@@ -1077,7 +1135,7 @@ fn setting_variables() -> SettingVariables {
             "send.backup-bookmark",
             vis(
                 VarType::Boolean,
-                "一括送信時に栞データを自動でバックアップする",
+                "一括送信時に栞データを自動でバックアップする(KindlePW系用)",
             ),
         ),
         (
@@ -1087,11 +1145,17 @@ fn setting_variables() -> SettingVariables {
         (
             "economy",
             multi(
-                "容量節約に関する設定",
+                "容量節約に関する設定。カンマ区切りで設定\n(cleanup_temp:変換後に作業ファイルを削除 send_delete:送信後に書籍ファイルを削除 nosave_diff:差分ファイルを保存しない nosave_raw:rawデータを保存しない)",
                 vec!["cleanup_temp", "send_delete", "nosave_diff", "nosave_raw"],
             ),
         ),
-        ("guard-spoiler", vis(VarType::Boolean, "ネタバレ防止機能")),
+        (
+            "guard-spoiler",
+            vis(
+                VarType::Boolean,
+                "ネタバレ防止機能。ダウンロード時の各話タイトルを伏せ字で表示する",
+            ),
+        ),
         (
             "auto-add-tags",
             vis(
@@ -1101,32 +1165,53 @@ fn setting_variables() -> SettingVariables {
         ),
         (
             "normalize-filename",
-            vis(VarType::Boolean, "ファイル名の文字列をNFCで正規化する"),
+            vis(
+                VarType::Boolean,
+                "ファイル名の文字列をNFCで正規化する。※既存データとの互換性が無くなる可能性があるので、バックアップを取った上で機能を理解の上有効にして下さい",
+            ),
         ),
         (
             "folder-length-limit",
-            vis(VarType::Integer, "小説を格納するフォルダ名の長さを制限する"),
+            vis(
+                VarType::Integer,
+                "小説を格納するフォルダ名の長さを制限する。デフォルトは50文字",
+            ),
         ),
         (
             "filename-length-limit",
-            vis(VarType::Integer, "各話保存時のファイル名の長さを制限する"),
+            vis(
+                VarType::Integer,
+                "各話保存時のファイル名の長さを制限する。出力される電子書籍ファイル名の長さを制限する場合は ebook-filename-length-limit を設定すること。※この設定は既存小説にも影響が出るのでファイル名の長さでエラーが出ない限り基本的にはいじらないこと。デフォルトは50文字",
+            ),
         ),
         (
             "ebook-filename-length-limit",
             vis(
                 VarType::Integer,
-                "出力される電子書籍ファイル名の長さを制限する",
+                "出力される電子書籍ファイル名の長さを制限する。保存時に長さでエラーが出る場合などに設定する。※デフォルトは無制限",
             ),
         ),
-        ("user-agent", vis(VarType::String, "User-Agent 設定")),
+        (
+            "user-agent",
+            vis(
+                VarType::String,
+                "User-Agent 設定\n未指定時 Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            ),
+        ),
         ("webui.theme", invis(VarType::Select, "WEB UI 用テーマ選択")),
         (
             "webui.table.reload-timing",
-            invis(VarType::Select, "小説リストの更新タイミングを選択"),
+            invis_sel(
+                "小説リストの更新タイミングを選択。未設定時は１作品ごとに更新",
+                vec!["every", "queue"],
+            ),
         ),
         (
             "webui.performance-mode",
-            sel("パフォーマンスモードを設定", vec!["auto", "on", "off"]),
+            sel(
+                "パフォーマンスモードを設定。autoの場合は小説数2000件以上で自動的に有効になります",
+                vec!["auto", "on", "off"],
+            ),
         ),
     ];
 
@@ -1135,26 +1220,35 @@ fn setting_variables() -> SettingVariables {
             "aozoraepub3dir",
             invis(VarType::Directory, "AozoraEpub3のあるフォルダを指定"),
         ),
-        ("line-height", invis(VarType::Float, "行間サイズ")),
+        (
+            "line-height",
+            invis(
+                VarType::Float,
+                "行間サイズ(narou init から指定しないと反映されません)",
+            ),
+        ),
         (
             "difftool",
             vis(VarType::String, "diffで使うツールのパスを指定する"),
         ),
         (
             "difftool.arg",
-            vis(VarType::String, "difftoolで使う引数を設定"),
+            vis(VarType::String, "difftoolで使う引数を設定(オプション)"),
         ),
         ("no-color", vis(VarType::Boolean, "カラー表示を無効にする")),
         (
             "color-parser",
             sel(
-                "コンソール上でのANSIカラーを表示する方法の選択",
+                "コンソール上でのANSIカラーを表示する方法の選択(Windowsのみ)。system: システムに任せる(デフォルト) / self: Narou.rbで処理",
                 vec!["system", "self"],
             ),
         ),
         (
             "server-port",
-            vis(VarType::Integer, "WEBサーバ起動時のポート"),
+            vis(
+                VarType::Integer,
+                "WEBサーバ起動時のポート。server-port + 1 のポートも WebSocket で使用",
+            ),
         ),
         (
             "server-bind",
@@ -1196,5 +1290,42 @@ fn var_type_description(vt: VarType) -> &'static str {
         VarType::String | VarType::Select => "文字列      ",
         VarType::Directory => "フォルダパス",
         VarType::Multiple => "文字列(複数)",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_dynamic_setting_names_are_validated() {
+        assert!(matches!(
+            get_scope_of_variable_name("default.enable_auto_indent"),
+            Some(Scope::Local)
+        ));
+        assert!(matches!(
+            get_scope_of_variable_name("force.enable_auto_indent"),
+            Some(Scope::Local)
+        ));
+        assert!(matches!(
+            get_scope_of_variable_name("default_args.trace"),
+            Some(Scope::Local)
+        ));
+        assert!(matches!(
+            get_scope_of_variable_name("default_args.console"),
+            Some(Scope::Local)
+        ));
+
+        assert!(get_scope_of_variable_name("default.not_exists").is_none());
+        assert!(get_scope_of_variable_name("force.not_exists").is_none());
+        assert!(get_scope_of_variable_name("default_args.not_exists").is_none());
+    }
+
+    #[test]
+    fn unknown_dynamic_values_are_rejected() {
+        assert!(cast_value("default_args.not_exists", "-n").is_err());
+        assert!(cast_value("default.not_exists", "true").is_err());
+        assert!(cast_value("webui.table.reload-timing", "invalid").is_err());
+        assert!(cast_value("webui.table.reload-timing", "every").is_ok());
     }
 }

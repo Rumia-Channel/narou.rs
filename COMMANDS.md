@@ -89,7 +89,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
 | `remove` | ✅ | ✅ 完了 | `--yes`, `--with-file`, `--all-ss`、確認、freeze/lock チェックを実装 |
 | `web` | ✅ | 🟡 部分 | APIのみ。HTML UIなし |
-| `setting` | ✅ | 🟡 部分 | 基本読み書きは実装済み。ただし default/force/default_args 系と全設定網羅に不足 |
+| `setting` | ✅ | 🟡 部分 | 基本読み書きは実装済み。default/force/default_args の既知名検証や select 値検証も追加済み。hidden 項目・original setting help 網羅が残る |
 | `diff` | ✅ | ✅ 完了 | 外部 diff ツール、raw データ管理 |
 | `send` | ✅ | ✅ 完了 | Kindle/Kobo/Reader 送信、`--without-freeze`、栞 backup/restore、hotentry を実装 |
 | `mail` | ✅ | 🟡 部分 | `mail_setting.yaml` bootstrap / 不完全設定 path 表示 / spinner / hotentry / `last_mail_date` 差分送信まで実装。Pony 互換と割り込み周辺の最終確認が残る |
@@ -345,6 +345,9 @@ narou setting name         # 読み取り
 **実装済み (Rust)**:
 - `local_setting.yaml` / `global_setting.yaml` の読み書き (`Inventory`)
 - 設定値のバリデーション (型チェック、選択肢チェック、boolean の true/false 厳密化)
+- `default.*` / `force.*` / `default_args.*` は既知の original setting / command 名だけ受理し、未知名を拒否
+- `default_args.trace` / `default_args.console` を含む Ruby 由来の command 名を受理
+- `webui.table.reload-timing` など hidden select 項目でも選択肢チェックを実施
 - `--list` 現在値一覧表示
 - `--all` 全変数表示
 - `--burn` による setting.ini への焼き込み
@@ -356,7 +359,7 @@ narou setting name         # 読み取り
 - `device` 変更時の関連設定の自動反映（Ruby版 hook の一部）
 
 **完了扱いにしない理由 / 不足動作**:
-- Ruby版 `SETTING_VARIABLES` との全項目突合が未完。hidden 項目、help の細部、select/multiple 値の表記差分が残る可能性がある。
+- Ruby版 `SETTING_VARIABLES` との全項目突合が未完。特に `default.*` / `force.*` 側の help・select summary の完全移植と `webui.theme` 候補値の同期が残る。
 - Ruby版の device hook 群は未完全で、関連設定変更も `default.enable_half_indent_bracket` だけを再現している。
 
 ---
