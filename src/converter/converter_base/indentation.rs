@@ -55,6 +55,25 @@ impl ConverterBase {
         let kana = "\u{30A1}-\u{30F6}\u{30FC}";
         let re = Regex::new(&format!(r"([^{0}]{{2}})\u{{30CB}}([^{0}]{{2}})", kana)).unwrap();
         re.replace_all(text, |caps: &regex::Captures| {
+            if let Some(ref inspector) = self.inspector {
+                let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                let prefix = text[..caps.get(0).unwrap().start()]
+                    .chars()
+                    .rev()
+                    .take(10)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<String>();
+                let suffix = text[caps.get(0).unwrap().end()..]
+                    .chars()
+                    .take(10)
+                    .collect::<String>();
+                inspector.borrow_mut().info(format!(
+                    "カタカナのニを漢字の二に修正しました\n≫≫≫ 該当箇所\n...{}...",
+                    prefix + matched + &suffix
+                ));
+            }
             format!("{}\u{4E8C}{}", &caps[1], &caps[2])
         })
         .to_string()

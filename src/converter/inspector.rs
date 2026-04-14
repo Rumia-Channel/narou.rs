@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use super::settings::NovelSettings;
 
 pub const INSPECT_LOG_NAME: &str = "調査ログ.txt";
+const LINE_LENGTH_THRESHOLD: usize = 400;
 const BRACKETS_RETURN_COUNT_THRESHOLD: usize = 7;
 const END_TOUTEN_COUNT_THRESHOLD: usize = 50;
 const AUTO_INDENT_THRESHOLD_RATIO: f64 = 0.5;
@@ -34,6 +35,7 @@ struct Message {
 pub struct Inspector {
     archive_path: PathBuf,
     messages: Vec<Message>,
+    subtitle: String,
 }
 
 impl Inspector {
@@ -41,7 +43,17 @@ impl Inspector {
         Self {
             archive_path: settings.archive_path.clone(),
             messages: Vec::new(),
+            subtitle: String::new(),
         }
+    }
+
+    pub fn reset(&mut self) {
+        self.messages.clear();
+        self.subtitle.clear();
+    }
+
+    pub fn set_subtitle(&mut self, subtitle: impl Into<String>) {
+        self.subtitle = subtitle.into();
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -173,11 +185,72 @@ impl Inspector {
         (dont_indent_line_count as f64 / target_line_count as f64) > AUTO_INDENT_THRESHOLD_RATIO
     }
 
-    fn info(&mut self, body: impl Into<String>) {
+    pub fn info(&mut self, body: impl Into<String>) {
         self.messages.push(Message {
             level: MessageLevel::Info,
             body: body.into(),
         });
+    }
+
+    pub fn warning(&mut self, body: impl Into<String>) {
+        self.messages.push(Message {
+            level: MessageLevel::Warning,
+            body: body.into(),
+        });
+    }
+
+    pub fn error(&mut self, body: impl Into<String>) {
+        self.messages.push(Message {
+            level: MessageLevel::Error,
+            body: body.into(),
+        });
+    }
+
+    pub fn validate_joined_inner_brackets(
+        &mut self,
+        raw_strings: &str,
+        joined_strings: &str,
+    ) -> bool {
+        if raw_strings.matches('\n').count() >= BRACKETS_RETURN_COUNT_THRESHOLD {
+            self.warning(format!(
+                "改行が規定の回数を超えて検出されました。作者による意図的な改行とみなし、連結を中止しました。\n{}",
+                self.omit_message(raw_strings)
+            ));
+            return true;
+        }
+
+        if joined_strings.chars().count() >= LINE_LENGTH_THRESHOLD {
+            self.warning(format!(
+                "連結結果が長過ぎます。連結を中止しました。特殊な用途(手紙形式)等でかぎ括弧が使われている可能性があります。\n{}",
+                self.omit_message(raw_strings)
+            ));
+            return true;
+        }
+
+        false
+    }
+
+    pub fn inspect_invalid_openclose_brackets(
+        &mut self,
+        data: &str,
+        open: char,
+        close: char,
+        replacements: &[String],
+    ) {
+        for bracket in [open, close] {
+            let mut buffer = data.to_string();
+            while let Some((index, _)) = buffer.char_indices().find(|(_, ch)| *ch == bracket) {
+                let before = rebuild_brackets(&buffer[..index], replacements);
+                let after = rebuild_brackets(&buffer[index + bracket.len_utf8()..], replacements);
+                let snippet = format!("{}{}{}", tail_chars(&before, 15), bracket, after);
+                self.error(format!(
+                    "かぎ括弧({})が正しく閉じていません。\n{}",
+                    bracket,
+                    self.omit_message(&snippet)
+                ));
+                buffer.truncate(index);
+            }
+        }
     }
 
     fn count(&self, level: MessageLevel) -> usize {
@@ -220,6 +293,23 @@ impl Inspector {
 
         results
     }
+
+    fn omit_message(&self, strings: &str) -> String {
+        let navigation = if self.subtitle.is_empty() {
+            String::new()
+        } else {
+            format!("in {}", self.subtitle)
+        };
+        format!(
+            "≫≫≫ 該当箇所 {}\n...{}...",
+            navigation,
+            strings
+                .chars()
+                .take(36)
+                .collect::<String>()
+                .replace('\n', "\\n")
+        )
+    }
 }
 
 fn is_ignore_indent_char(ch: char) -> bool {
@@ -239,6 +329,27 @@ fn is_ignore_indent_char(ch: char) -> bool {
             | '［'
             | '〝'
     )
+}
+
+fn rebuild_brackets(data: &str, replacements: &[String]) -> String {
+    let re = regex::Regex::new(r"［＃かぎ括弧＝(\d+)］").unwrap();
+    re.replace_all(data, |caps: &regex::Captures| {
+        let index = caps[1].parse::<usize>().unwrap_or(usize::MAX);
+        replacements
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| caps[0].to_string())
+    })
+    .to_string()
+}
+
+fn tail_chars(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        text.to_string()
+    } else {
+        text.chars().skip(count - max_chars).collect()
+    }
 }
 
 #[cfg(test)]

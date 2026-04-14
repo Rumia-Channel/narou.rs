@@ -7,8 +7,10 @@ pub mod render;
 pub mod settings;
 pub mod user_converter;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use sha2::{Digest, Sha256};
 
@@ -25,6 +27,7 @@ pub struct NovelConverter {
     section_cache: HashMap<String, CacheEntry>,
     cache_dirty: bool,
     progress: Option<Box<dyn ProgressReporter>>,
+    inspector: Rc<RefCell<inspector::Inspector>>,
     display_inspector: bool,
     last_inspection_output: Option<String>,
 }
@@ -36,24 +39,28 @@ struct CacheEntry {
 
 impl NovelConverter {
     pub fn new(settings: NovelSettings) -> Self {
+        let inspector = Rc::new(RefCell::new(inspector::Inspector::new(&settings)));
         Self {
             settings,
             user_converter: None,
             section_cache: HashMap::new(),
             cache_dirty: false,
             progress: None,
+            inspector,
             display_inspector: false,
             last_inspection_output: None,
         }
     }
 
     pub fn with_user_converter(settings: NovelSettings, user_converter: UserConverter) -> Self {
+        let inspector = Rc::new(RefCell::new(inspector::Inspector::new(&settings)));
         Self {
             settings,
             user_converter: Some(user_converter),
             section_cache: HashMap::new(),
             cache_dirty: false,
             progress: None,
+            inspector,
             display_inspector: false,
             last_inspection_output: None,
         }
@@ -72,6 +79,8 @@ impl NovelConverter {
     }
 
     pub fn convert_novel(&mut self, toc: &TocObject, sections: &[SectionFile]) -> Result<String> {
+        let mut erased_intro_count = 0usize;
+        let mut erased_post_count = 0usize;
         let mut converted_story = String::new();
         if let Some(ref story) = toc.story {
             if !story.is_empty() {
@@ -114,6 +123,14 @@ impl NovelConverter {
             let chapter = section.chapter.clone();
             let subchapter = section.subchapter.clone();
             let subtitle = section.subtitle.clone();
+            let inspect_subtitle = if !subtitle.trim().is_empty() {
+                subtitle.trim().to_string()
+            } else if !subchapter.trim().is_empty() {
+                subchapter.trim().to_string()
+            } else {
+                chapter.trim().to_string()
+            };
+            self.inspector.borrow_mut().set_subtitle(inspect_subtitle);
 
             let is_html =
                 section.element.data_type != "text" && section.element.data_type != "text/plain";
@@ -128,6 +145,9 @@ impl NovelConverter {
             }
 
             let intro_text = if self.settings.enable_erase_introduction {
+                if !section.element.introduction.is_empty() {
+                    erased_intro_count += 1;
+                }
                 String::new()
             } else if is_html && !section.element.introduction.is_empty() {
                 crate::downloader::html::to_aozora(&section.element.introduction)
@@ -140,6 +160,9 @@ impl NovelConverter {
                 section.element.body.clone()
             };
             let post_text = if self.settings.enable_erase_postscript {
+                if !section.element.postscript.is_empty() {
+                    erased_post_count += 1;
+                }
                 String::new()
             } else if is_html && !section.element.postscript.is_empty() {
                 crate::downloader::html::to_aozora(&section.element.postscript)
@@ -222,6 +245,19 @@ impl NovelConverter {
             ));
         }
 
+        if self.settings.enable_erase_introduction && erased_intro_count > 0 {
+            self.inspector.borrow_mut().info(format!(
+                "前書きをすべて削除しました。削除した数は{}個です。",
+                erased_intro_count
+            ));
+        }
+        if self.settings.enable_erase_postscript && erased_post_count > 0 {
+            self.inspector.borrow_mut().info(format!(
+                "後書きをすべて削除しました。削除した数は{}個です。",
+                erased_post_count
+            ));
+        }
+
         Ok(render::render_novel_text(
             &self.settings,
             toc,
@@ -251,9 +287,16 @@ impl NovelConverter {
 
     fn make_converter(&self) -> converter_base::ConverterBase {
         if let Some(ref uc) = self.user_converter {
-            converter_base::ConverterBase::with_user_converter(self.settings.clone(), uc.clone())
+            converter_base::ConverterBase::with_user_converter_and_inspector(
+                self.settings.clone(),
+                uc.clone(),
+                self.inspector.clone(),
+            )
         } else {
-            converter_base::ConverterBase::new(self.settings.clone())
+            converter_base::ConverterBase::with_inspector(
+                self.settings.clone(),
+                self.inspector.clone(),
+            )
         }
     }
 
@@ -321,6 +364,7 @@ impl NovelConverter {
 
     pub fn convert_novel_by_id(&mut self, id: i64, novel_dir: &std::path::Path) -> Result<String> {
         self.last_inspection_output = None;
+        self.inspector.borrow_mut().reset();
         let toc_path = novel_dir.join("toc.yaml");
         let toc_content = std::fs::read_to_string(&toc_path).map_err(|e| NarouError::Io(e))?;
         let toc: crate::downloader::TocFile =
@@ -353,6 +397,7 @@ impl NovelConverter {
         device: device::Device,
     ) -> Result<PathBuf> {
         self.last_inspection_output = None;
+        self.inspector.borrow_mut().reset();
         let toc_path = novel_dir.join("toc.yaml");
         let toc_content = std::fs::read_to_string(&toc_path).map_err(|e| NarouError::Io(e))?;
         let toc: crate::downloader::TocFile =
@@ -386,20 +431,20 @@ impl NovelConverter {
     }
 
     fn inspect_converted_text(&mut self, aozora_text: &str) -> Result<()> {
-        let mut inspector = inspector::Inspector::new(&self.settings);
         if self.settings.enable_inspect {
-            inspector
+            self.inspector
+                .borrow_mut()
                 .inspect_end_touten_conditions(aozora_text, self.settings.enable_auto_join_line);
-            inspector.countup_return_in_brackets(
+            self.inspector.borrow_mut().countup_return_in_brackets(
                 aozora_text,
                 self.settings.enable_auto_join_in_brackets,
             );
         }
-        inspector.save().map_err(NarouError::Io)?;
+        self.inspector.borrow().save().map_err(NarouError::Io)?;
         self.last_inspection_output = if self.display_inspector {
-            inspector.display_text()
+            self.inspector.borrow().display_text()
         } else {
-            inspector.summary_text()
+            self.inspector.borrow().summary_text()
         };
         Ok(())
     }

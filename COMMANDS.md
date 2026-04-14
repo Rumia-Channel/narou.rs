@@ -101,7 +101,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `folder` | ✅ | ✅ 完了 | `--no-open`、引数省略時 help、alias/tag 解決を実装 |
 | `browser` | ✅ | ✅ 完了 | `--vote` で最新話感想ページ生成、引数省略時 help、alias/tag 解決を実装 |
 | `alias` | ✅ | ✅ 完了 | `alias.yaml` 読み書き、`--list`、`name=` 解除、`hotentry` 禁止語、共通ターゲット解決への統合を実装 |
-| `inspect` | ✅ | 🟡 部分 | `調査ログ.txt` 表示に加えて、変換時のログ生成・`convert.inspect`・summary/full display まで実装。Ruby Inspector の警告/エラー系細部が残る |
+| `inspect` | ✅ | 🟡 部分 | `調査ログ.txt` 表示、変換時ログ生成、`convert.inspect`、summary/full display、括弧/kana/前後書き系メッセージまでは実装。illustration / textfile 系が残る |
 | `csv` | ✅ | ✅ 完了 | CSV export/import、`-o` / `-i`、`url` ヘッダー必須、download 経由 import を実装 |
 | `trace` | ✅ | ✅ 完了 | `trace_dump.txt` を表示。panic 時に保存されたバックトレースを読む |
 
@@ -663,10 +663,11 @@ narou setting name         # 読み取り
 - `src/commands/inspect.rs` で `調査ログ.txt` の読み取り表示を実装。target 省略時は `.narou/latest_convert.yaml` の `id` を使い、複数 target は Ruby版同様に区切り線付きで順に表示する。ログが存在しない場合は `調査ログがまだ無いようです` を表示する
 - `src/converter/inspector.rs` を追加し、変換時に `調査ログ.txt` を保存するようにした
 - `convert.inspect=true` と `convert --inspect` で full display、通常 convert では Ruby版同様 summary 表示にした
+- `auto_join_in_brackets` の警告/エラー、`modify_kana_ni_to_kanji_ni` INFO、`enable_erase_introduction` / `enable_erase_postscript` INFO も inspection に反映した
 
 **不足動作**:
-- Ruby版 `Inspector` が conversion 中に出す警告/エラー（括弧不整合、括弧内自動結合警告、`modify_kana_ni_to_kanji_ni` INFO など）は未移植
-- テキストファイル変換経路を含めた Ruby版 `inspect` 完全互換は継続確認が必要
+- `illustration.rb` 経由の INFO/ERROR（挿絵保存成功・未対応画像形式・例外） は未移植
+- テキストファイル変換時の `enchant_midashi` 関連 INFO と、textfile 経路を含めた Ruby版 `inspect` 完全互換は継続確認が必要
 
 ---
 
@@ -709,7 +710,7 @@ narou setting name         # 読み取り
 | convert `--device`, `--no-open`, `--output` | convert | 変換パイプライン完成 |
 | download の残互換実装 | download | 再DL確認・mail 周辺 |
 | setting の残互換実装 | setting | 全設定変数と device hook の詰め |
-| inspect の残警告/エラー互換 | inspect | Ruby Inspector の conversion-time メッセージ |
+| inspect の残挿絵/textfile互換 | inspect | illustration / textfile 経路の Inspector メッセージ |
 
 ### P1: 設定管理基盤
 多くのコマンドが `local_setting` / `global_setting` に依存する。

@@ -4,14 +4,19 @@ mod ruby;
 mod stash_rebuild;
 mod text_normalization;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use regex::Regex;
 
+use super::inspector::Inspector;
 use super::settings::NovelSettings;
 use super::user_converter::UserConverter;
 
 pub struct ConverterBase {
     pub settings: NovelSettings,
     pub user_converter: Option<UserConverter>,
+    pub inspector: Option<Rc<RefCell<Inspector>>>,
     pub url_stash: Vec<String>,
     pub english_stash: Vec<String>,
     pub illust_stash: Vec<String>,
@@ -37,6 +42,7 @@ impl ConverterBase {
         Self {
             settings,
             user_converter: None,
+            inspector: None,
             url_stash: Vec::new(),
             english_stash: Vec::new(),
             illust_stash: Vec::new(),
@@ -51,6 +57,41 @@ impl ConverterBase {
         Self {
             settings,
             user_converter: Some(user_converter),
+            inspector: None,
+            url_stash: Vec::new(),
+            english_stash: Vec::new(),
+            illust_stash: Vec::new(),
+            kanji_num_stash: Vec::new(),
+            hankaku_num_comma_stash: Vec::new(),
+            force_indent_chapter_stash: Vec::new(),
+            text_type: TextType::Body,
+        }
+    }
+
+    pub fn with_inspector(settings: NovelSettings, inspector: Rc<RefCell<Inspector>>) -> Self {
+        Self {
+            settings,
+            user_converter: None,
+            inspector: Some(inspector),
+            url_stash: Vec::new(),
+            english_stash: Vec::new(),
+            illust_stash: Vec::new(),
+            kanji_num_stash: Vec::new(),
+            hankaku_num_comma_stash: Vec::new(),
+            force_indent_chapter_stash: Vec::new(),
+            text_type: TextType::Body,
+        }
+    }
+
+    pub fn with_user_converter_and_inspector(
+        settings: NovelSettings,
+        user_converter: UserConverter,
+        inspector: Rc<RefCell<Inspector>>,
+    ) -> Self {
+        Self {
+            settings,
+            user_converter: Some(user_converter),
+            inspector: Some(inspector),
             url_stash: Vec::new(),
             english_stash: Vec::new(),
             illust_stash: Vec::new(),

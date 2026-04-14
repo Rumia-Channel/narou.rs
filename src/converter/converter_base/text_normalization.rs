@@ -11,25 +11,70 @@ impl ConverterBase {
     }
 
     pub(super) fn auto_join_in_brackets(&self, text: &str) -> String {
-        if !self.settings.enable_auto_join_in_brackets {
+        if !self.settings.enable_auto_join_in_brackets && !self.settings.enable_inspect {
             return text.to_string();
         }
         let mut result = text.to_string();
-        for (open, close) in &[("\u{300C}", "\u{300D}"), ("\u{300E}", "\u{300F}")] {
-            let re = Regex::new(&format!(
-                r"({})(.*?)({})",
-                regex::escape(open),
-                regex::escape(close)
-            ))
-            .unwrap();
-            result = re
-                .replace_all(&result, |caps: &regex::Captures| {
-                    let open_ch = &caps[1];
-                    let inner = caps[2].replace('\n', "");
-                    let close_ch = &caps[3];
-                    format!("{}{}{}", open_ch, inner, close_ch)
-                })
-                .to_string();
+        for (open, close) in [('\u{300C}', '\u{300D}'), ('\u{300E}', '\u{300F}')] {
+            let mut replacements = Vec::new();
+            let mut transformed = String::new();
+            let mut last = 0usize;
+            let mut depth = 0usize;
+            let mut start = None;
+
+            for (idx, ch) in result.char_indices() {
+                if ch == open {
+                    if depth == 0 {
+                        start = Some(idx);
+                    }
+                    depth += 1;
+                } else if ch == close && depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        let begin = start.take().unwrap();
+                        let end = idx + ch.len_utf8();
+                        transformed.push_str(&result[last..begin]);
+
+                        let raw = &result[begin..end];
+                        let replacement = if self.settings.enable_auto_join_in_brackets {
+                            if let Some(joined) = join_inner_bracket(raw) {
+                                let blocked = self
+                                    .inspector
+                                    .as_ref()
+                                    .map(|inspector| {
+                                        inspector
+                                            .borrow_mut()
+                                            .validate_joined_inner_brackets(raw, &joined)
+                                    })
+                                    .unwrap_or(false);
+                                if blocked { raw.to_string() } else { joined }
+                            } else {
+                                raw.to_string()
+                            }
+                        } else {
+                            raw.to_string()
+                        };
+
+                        transformed.push_str(&format!("［＃かぎ括弧＝{}］", replacements.len()));
+                        replacements.push(replacement);
+                        last = end;
+                    }
+                }
+            }
+            transformed.push_str(&result[last..]);
+
+            if self.settings.enable_inspect {
+                if let Some(ref inspector) = self.inspector {
+                    inspector.borrow_mut().inspect_invalid_openclose_brackets(
+                        &transformed,
+                        open,
+                        close,
+                        &replacements,
+                    );
+                }
+            }
+
+            result = rebuild_brackets(&transformed, &replacements);
         }
         result
     }
@@ -125,6 +170,34 @@ impl ConverterBase {
         }
         result
     }
+}
+
+fn join_inner_bracket(text: &str) -> Option<String> {
+    if !text.contains('\n') {
+        return None;
+    }
+
+    let re = Regex::new(r"([…―])\n").unwrap();
+    let joined = re.replace_all(text, "$1。\n").to_string();
+    Some(
+        joined
+            .split('\n')
+            .map(|line| line.trim_start_matches('\u{3000}'))
+            .collect::<Vec<_>>()
+            .join(""),
+    )
+}
+
+fn rebuild_brackets(text: &str, replacements: &[String]) -> String {
+    let re = Regex::new(r"［＃かぎ括弧＝(\d+)］").unwrap();
+    re.replace_all(text, |caps: &regex::Captures| {
+        let index = caps[1].parse::<usize>().unwrap_or(usize::MAX);
+        replacements
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| caps[0].to_string())
+    })
+    .to_string()
 }
 
 pub fn zenkaku_rstrip(line: &str) -> String {
