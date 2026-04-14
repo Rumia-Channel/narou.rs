@@ -91,6 +91,7 @@ pub fn cmd_convert(
                     output_device,
                     copy_device,
                     create_ibunko_side_epub,
+                    no_strip,
                     verbose,
                     &multi_clone,
                     &mut first_output_dir,
@@ -156,7 +157,7 @@ pub fn cmd_convert(
 
             let result = match output_device {
                 Some(device) => converter
-                    .convert_novel_by_id_with_device(id, &novel_dir, device, verbose)
+                    .convert_novel_by_id_with_device(id, &novel_dir, device, no_strip, verbose)
                     .map(|path| path.display().to_string()),
                 None => converter.convert_novel_by_id(id, &novel_dir),
             };
@@ -247,6 +248,7 @@ fn convert_text_target(
     output_device: Option<narou_rs::converter::device::Device>,
     copy_device: Option<narou_rs::converter::device::Device>,
     create_ibunko_side_epub: bool,
+    no_strip: bool,
     verbose: bool,
     multi_clone: &indicatif::MultiProgress,
     first_output_dir: &mut Option<PathBuf>,
@@ -288,7 +290,7 @@ fn convert_text_target(
     converter.set_display_inspector(inspect);
 
     let result = match output_device {
-        Some(device) => converter.convert_text_file_with_device(&text, device, verbose),
+        Some(device) => converter.convert_text_file_with_device(&text, device, no_strip, verbose),
         None => converter.convert_text_file(&text),
     };
 

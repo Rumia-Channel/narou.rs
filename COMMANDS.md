@@ -83,7 +83,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
 | `download` | ✅ | 🟡 部分 | `--mail` と保存フォルダ欠落時の再DL確認まで実装。`mail` 系の最終 end-to-end 確認待ちで保留 |
 | `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、digest選択肢、差分cache退避、hotentryのcopy/send/mailまでは実装済み。周辺出力/イベント細部が残る |
-| `convert` | ✅ | 🟡 部分 | `--output` / `--enc` / テキストファイル入力 / `--inspect` / `convert.inspect` / `--no-open` / `--no-epub` / `--no-mobi` / `--make-zip` / `--no-zip` / `--verbose` / `device` 設定反映 / `convert.multi-device` / `convert.copy-to` / `convert.copy-zip-to` / `convert.copy-to-grouping` / `--ignore-default` / `--ignore-force` / `dc:subject` 埋め込み / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFOまでは実装。`--no-strip` と実機 send 最終確認が残る |
+| `convert` | ✅ | 🟡 部分 | `--output` / `--enc` / テキストファイル入力 / `--inspect` / `convert.inspect` / `--no-open` / `--no-epub` / `--no-mobi` / `--no-strip` / `--make-zip` / `--no-zip` / `--verbose` / `device` 設定反映 / `convert.multi-device` / `convert.copy-to` / `convert.copy-zip-to` / `convert.copy-to-grouping` / `--ignore-default` / `--ignore-force` / `dc:subject` 埋め込み / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFOまでは実装。実機 send 最終確認が残る |
 | `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--echo` と pipe 時ID出力まで実装 |
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションまで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
@@ -222,7 +222,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `--enc ENCODING` | `-e` | string | UTF-8 | テキストファイル文字コード | ✅ |
 | `--no-epub` | — | flag | false | EPUB 生成スキップ | ✅ |
 | `--no-mobi` | — | flag | false | MOBI 生成スキップ | ✅ |
-| `--no-strip` | — | flag | false | MOBI ストリップスキップ | ❌ |
+| `--no-strip` | — | flag | false | MOBI ストリップスキップ | ✅ |
 | `--no-zip` | — | flag | false | ZIP 作成スキップ | ✅ |
 | `--no-open` | — | flag | false | 出力フォルダを開かない | ✅ |
 | `--inspect` | `-i` | flag | false | 小説状態調査ログ表示 | ✅ |
@@ -232,7 +232,6 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | targets | | Vec\<String\> | — | ID/タイトル/ファイルパス | ✅ |
 
 **不足動作**:
-- `--no-strip` の実処理（現状の Rust は常時 no-strip 相当）
 - 変換後の端末送信の実機最終検証
 
 **Rust 実装メモ**:
@@ -242,6 +241,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `device` 設定が `text` 以外なら direct convert でも `OutputManager` 経由で ebook を生成し、`--no-epub` と `convert.no-epub=true` があれば Ruby版同様 txt のみに戻す
 - `device=kindle` かつ `--no-mobi` / `convert.no-mobi=true` の場合は kindlegen を呼ばず EPUB 出力へ切り替える。`sample\\novel` で `device: kindle` を一時設定して `convert --no-mobi 3` の `.epub` 出力を確認済み
 - kindlegen の探索は AozoraEpub3 同梱 / PATH / Windows の Kindle Previewer 3 同梱版を順に見るようにし、Ruby版同様 exit code 2 のみをエラー扱いに寄せた。`sample\\novel` で `device: kindle` の通常変換から `.mobi` 出力まで確認済み
+- `--no-strip` を `OutputManager` まで通し、通常の Kindle 変換では kindlegen 後に SRCS セクションを除去するようにした。`sample\\novel` で stripped `.mobi` が 1,676,009 bytes、`--no-strip` 時は 4,176,001 bytes となりサイズ差を確認済み
 - `--make-zip` / `convert.make-zip=true` と `device=ibunko` を direct convert に接続し、i文庫 ZIP を生成できるようにした。ZIP には本文 `.txt`・`挿絵/*`・`cover.*` を同梱し、`sample\\novel` で ZIP/EPUB 併産を確認済み
 - `--no-zip` / `convert.no-zip=true` も direct convert に反映し、`sample\\novel` で `--make-zip --no-zip 3` 実行時は EPUB のみ残ることを確認済み
 - `--verbose` 未指定時は AozoraEpub3 / kindlegen の標準出力を抑止し、指定時のみ透過表示する。`sample\\novel` で `device: epub` の通常変換では AozoraEpub3 行が出ず、`--verbose` 付きでは `Detected encoding = UTF-8` / `変換開始` が表示されることを確認済み
@@ -717,8 +717,8 @@ narou setting name         # 読み取り
 |-------|---------|------|
 | download `--force`, `--no-convert`, `--freeze` | download | DL フラグ互換 |
 | update の残互換実装 | update | Ruby版ターゲット解決・`--gl`主要挙動・`update.strong`・digest選択肢・差分用 cache 退避・hotentry の copy/send/mail までは実装済み。周辺出力/イベント細部が残る |
-| convert `--no-strip`, send | convert | `--make-zip` / `--no-zip` / `convert.multi-device` / ZIP copy は実装済み。残りは MOBI strip と実機 send 最終確認 |
-| download の残互換実装 | download | 再DL確認・mail 周辺 |
+| convert send | convert | `--no-strip` まで実装済み。残りは実機 send 最終確認 |
+| download の残互換実装 | download | command 固有の欠落はほぼ解消。残りは `mail` と共有の実SMTP end-to-end 確認 |
 
 ### P1: 設定管理基盤
 多くのコマンドが `local_setting` / `global_setting` に依存する。

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -107,6 +108,7 @@ pub struct OutputManager {
     aozora_epub3_path: Option<PathBuf>,
     kindlegen_path: Option<PathBuf>,
     verbose: bool,
+    no_strip: bool,
 }
 
 impl OutputManager {
@@ -116,11 +118,17 @@ impl OutputManager {
             aozora_epub3_path: Self::find_external_tool("AozoraEpub3"),
             kindlegen_path: Self::find_external_tool("kindlegen"),
             verbose: false,
+            no_strip: false,
         }
     }
 
     pub fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
+        self
+    }
+
+    pub fn with_no_strip(mut self, no_strip: bool) -> Self {
+        self.no_strip = no_strip;
         self
     }
 
@@ -459,6 +467,12 @@ impl OutputManager {
                     )));
                 }
 
+                if !self.no_strip {
+                    if let Err(err) = strip_mobi_file(&mobi_output) {
+                        eprintln!("{}", err);
+                    }
+                }
+
                 Ok(mobi_output)
             }
         }
@@ -574,6 +588,190 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct StripError(String);
+
+impl StripError {
+    fn invalid_format() -> Self {
+        Self("invalid file format".to_string())
+    }
+
+    fn no_sources_section() -> Self {
+        Self("File doesn't contain the sources section.".to_string())
+    }
+
+    fn invalid_srcs_section() -> Self {
+        Self("SRCS section num does not point to SRCS.".to_string())
+    }
+}
+
+impl fmt::Display for StripError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn strip_mobi_file(path: &Path) -> std::result::Result<(), StripError> {
+    let data = std::fs::read(path).map_err(|e| StripError(e.to_string()))?;
+    let stripped = strip_mobi_sources(&data)?;
+    std::fs::write(path, stripped).map_err(|e| StripError(e.to_string()))?;
+    Ok(())
+}
+
+fn strip_mobi_sources(datain: &[u8]) -> std::result::Result<Vec<u8>, StripError> {
+    if slice_range(datain, 0x3c, 0x44)? != b"BOOKMOBI" {
+        return Err(StripError::invalid_format());
+    }
+
+    let num_sections = read_be_u16(datain, 76)? as u32;
+    let offset0 = read_be_u32(datain, 78)? as usize;
+    let offset1 = read_be_u32(datain, 86)? as usize;
+    let mobiheader = slice_range(datain, offset0, offset1)?;
+    let srcs_secnum = read_be_u32(mobiheader, 0xe0)?;
+    let srcs_cnt = read_be_u32(mobiheader, 0xe4)?;
+    if srcs_secnum == u32::MAX || srcs_cnt == 0 {
+        return Err(StripError::no_sources_section());
+    }
+
+    let next_section = srcs_secnum
+        .checked_add(srcs_cnt)
+        .ok_or_else(StripError::invalid_format)?;
+    if srcs_secnum >= num_sections || next_section > num_sections {
+        return Err(StripError::invalid_format());
+    }
+    let srcs_offset = read_be_u32(datain, 78 + (srcs_secnum as usize * 8))? as usize;
+    let next_offset = read_be_u32(datain, 78 + (next_section as usize * 8))? as usize;
+    if slice_range(datain, srcs_offset, srcs_offset + 4)? != b"SRCS" {
+        return Err(StripError::invalid_srcs_section());
+    }
+    let srcs_length = next_offset
+        .checked_sub(srcs_offset)
+        .ok_or_else(StripError::invalid_format)?;
+    let remaining_sections = num_sections
+        .checked_sub(srcs_cnt)
+        .ok_or_else(StripError::invalid_format)?;
+
+    let mut data_file = Vec::new();
+    data_file.extend_from_slice(slice_range(datain, 0, 68)?);
+    data_file.extend_from_slice(&((remaining_sections * 2) + 1).to_be_bytes());
+    data_file.extend_from_slice(slice_range(datain, 72, 76)?);
+    data_file.extend_from_slice(&(remaining_sections as u16).to_be_bytes());
+
+    let mut delta = -8i64 * i64::from(srcs_cnt);
+    for i in 0..srcs_secnum {
+        let offset = i64::from(read_be_u32(datain, 78 + (i as usize * 8))?) + delta;
+        if offset < 0 {
+            return Err(StripError::invalid_format());
+        }
+        let flgval = read_be_u32(datain, 82 + (i as usize * 8))?;
+        data_file.extend_from_slice(&(offset as u32).to_be_bytes());
+        data_file.extend_from_slice(&flgval.to_be_bytes());
+    }
+
+    delta -= srcs_length as i64;
+    for i in next_section..num_sections {
+        let offset = i64::from(read_be_u32(datain, 78 + (i as usize * 8))?) + delta;
+        if offset < 0 {
+            return Err(StripError::invalid_format());
+        }
+        let flgval = 2 * (i - srcs_cnt);
+        data_file.extend_from_slice(&(offset as u32).to_be_bytes());
+        data_file.extend_from_slice(&flgval.to_be_bytes());
+    }
+
+    let first_offset = read_be_u32(&data_file, 78)? as usize;
+    if first_offset < data_file.len() {
+        return Err(StripError::invalid_format());
+    }
+    data_file.resize(first_offset, 0);
+    data_file.extend_from_slice(slice_range(datain, offset0, srcs_offset)?);
+    data_file.extend_from_slice(slice_from(datain, srcs_offset + srcs_length)?);
+
+    let new_offset0 = read_be_u32(&data_file, 78)? as usize;
+    let new_offset1 = read_be_u32(&data_file, 86)? as usize;
+    let mut new_mobiheader = slice_range(&data_file, new_offset0, new_offset1)?.to_vec();
+    patch_range(&mut new_mobiheader, 0xe0, &u32::MAX.to_be_bytes())?;
+    patch_range(&mut new_mobiheader, 0xe4, &0u32.to_be_bytes())?;
+    update_exth121(&mut new_mobiheader, srcs_secnum, srcs_cnt);
+    patch_range(&mut data_file, new_offset0, &new_mobiheader)?;
+
+    Ok(data_file)
+}
+
+fn update_exth121(mobiheader: &mut [u8], srcs_secnum: u32, srcs_cnt: u32) {
+    let Ok(mobi_length) = read_be_u32(mobiheader, 0x14) else {
+        return;
+    };
+    let Ok(exth_flag) = read_be_u32(mobiheader, 0x80) else {
+        return;
+    };
+    if exth_flag & 0x40 == 0 {
+        return;
+    }
+
+    let exth_start = 16usize.saturating_add(mobi_length as usize);
+    let Ok(exth_magic) = slice_range(mobiheader, exth_start, exth_start + 4) else {
+        return;
+    };
+    if exth_magic != b"EXTH" {
+        return;
+    }
+    let Ok(nitems) = read_be_u32(mobiheader, exth_start + 8) else {
+        return;
+    };
+
+    let mut pos = exth_start + 12;
+    for _ in 0..nitems {
+        let Ok(item_type) = read_be_u32(mobiheader, pos) else {
+            return;
+        };
+        let Ok(size) = read_be_u32(mobiheader, pos + 4) else {
+            return;
+        };
+        if size < 8 {
+            return;
+        }
+        if item_type == 121 {
+            let Ok(boundaryptr) = read_be_u32(mobiheader, pos + 8) else {
+                return;
+            };
+            if srcs_secnum <= boundaryptr {
+                let adjusted = boundaryptr.saturating_sub(srcs_cnt).to_be_bytes();
+                if patch_range(mobiheader, pos + 8, &adjusted).is_err() {
+                    return;
+                }
+            }
+        }
+        pos = pos.saturating_add(size as usize);
+    }
+}
+
+fn read_be_u16(data: &[u8], offset: usize) -> std::result::Result<u16, StripError> {
+    let bytes = slice_range(data, offset, offset + 2)?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_be_u32(data: &[u8], offset: usize) -> std::result::Result<u32, StripError> {
+    let bytes = slice_range(data, offset, offset + 4)?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn patch_range(data: &mut [u8], offset: usize, replacement: &[u8]) -> std::result::Result<(), StripError> {
+    let range = data
+        .get_mut(offset..offset + replacement.len())
+        .ok_or_else(StripError::invalid_format)?;
+    range.copy_from_slice(replacement);
+    Ok(())
+}
+
+fn slice_range(data: &[u8], start: usize, end: usize) -> std::result::Result<&[u8], StripError> {
+    data.get(start..end).ok_or_else(StripError::invalid_format)
+}
+
+fn slice_from(data: &[u8], start: usize) -> std::result::Result<&[u8], StripError> {
+    data.get(start..).ok_or_else(StripError::invalid_format)
+}
+
 fn normalize_windows_verbatim_path(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     if cfg!(windows) && raw.starts_with(r"\\?\") {
@@ -639,7 +837,10 @@ fn find_unix_volume_root(volume_name: &str) -> Option<PathBuf> {
 mod tests {
     use std::path::Path;
 
-    use super::{Device, decode_ibunko_html_entities, normalize_windows_verbatim_path};
+    use super::{
+        Device, StripError, decode_ibunko_html_entities, normalize_windows_verbatim_path,
+        strip_mobi_sources,
+    };
 
     #[test]
     fn kobo_matches_kepub_output_suffix() {
@@ -659,5 +860,25 @@ mod tests {
     fn decode_ibunko_html_entities_decodes_ampersand_last() {
         assert_eq!(decode_ibunko_html_entities("&amp;lt;"), "&lt;");
         assert_eq!(decode_ibunko_html_entities("&lt;tag&gt;"), "<tag>");
+    }
+
+    #[test]
+    fn strip_mobi_sources_rejects_non_mobi_input() {
+        let err = strip_mobi_sources(b"not-a-mobi").unwrap_err();
+        assert_eq!(err.to_string(), StripError::invalid_format().to_string());
+    }
+
+    #[test]
+    fn strip_mobi_sources_reports_missing_srcs_section() {
+        let mut data = vec![0u8; 512];
+        data[0x3c..0x44].copy_from_slice(b"BOOKMOBI");
+        data[76..78].copy_from_slice(&2u16.to_be_bytes());
+        data[78..82].copy_from_slice(&100u32.to_be_bytes());
+        data[86..90].copy_from_slice(&400u32.to_be_bytes());
+        data[100 + 0xe0..100 + 0xe4].copy_from_slice(&u32::MAX.to_be_bytes());
+        data[100 + 0xe4..100 + 0xe8].copy_from_slice(&0u32.to_be_bytes());
+
+        let err = strip_mobi_sources(&data).unwrap_err();
+        assert_eq!(err.to_string(), StripError::no_sources_section().to_string());
     }
 }

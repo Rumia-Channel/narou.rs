@@ -260,7 +260,7 @@ pub fn convert_existing_novel(
     let device = current_device();
     let output_path = match device {
         Some(device) => converter
-            .convert_novel_by_id_with_device(id, novel_dir, device, false)
+            .convert_novel_by_id_with_device(id, novel_dir, device, false, false)
             .map_err(|e| e.to_string())?,
         None => PathBuf::from(
             converter
