@@ -261,6 +261,15 @@ fn run_sync_command(
             commands::setting::cmd_setting(&args, list, all, burn);
             0
         }
+        Commands::Alias { args, list } => commands::alias::cmd_alias(&args, list),
+        Commands::Folder { targets, no_open } => commands::folder::cmd_folder(&targets, no_open),
+        Commands::Browser { targets, vote } => commands::browser::cmd_browser(&targets, vote),
+        Commands::Clean {
+            targets,
+            force,
+            dry_run,
+            all,
+        } => commands::clean::cmd_clean(&targets, force, dry_run, all),
         Commands::Trace => match commands::trace::cmd_trace() {
             Ok(_) => 0,
             Err(e) => {

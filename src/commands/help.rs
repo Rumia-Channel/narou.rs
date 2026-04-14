@@ -696,13 +696,19 @@ const MAIL_HELP: CmdHelp = CmdHelp {
 };
 
 const ALIAS_HELP: CmdHelp = CmdHelp {
-    banner: "[<name>=<target>] [options]",
+    banner: "[<alias_name>=<target> ...] [options]",
     description: "\
-  ・小説のIDに紐付けた別名を作成します。
-  ・別名は各コマンドでID指定の代わりに使用できます。
+  ・小説に別名を付けて、<target>の代わりに使えるようにします
+  ・別名に使える文字列は半角のアルファベットと数字と_(アンダーバー)だけです
+  ・指定した別名が既に存在していた場合は上書きされます
+  ・<alias_name>= のように = の右辺を指定しなかった場合は設定した別名を解除します
+  ・<target>には、ID、タイトル、NコードもしくはURLが指定出来ます
+  ・別名はコマンド用なので、リスト表示に使うタイトルには反映されません
+  ・別名はupdateコマンド以外でも、<target>が指定出来る箇所では全て使えます
 
   Examples:
     narou alias musyoku=0
+    narou alias musyoku=無職転生
     narou alias --list
     narou alias musyoku=   # 削除",
     options: &[opt(Some("-l"), "--list", None, "現在の別名一覧を表示")],
@@ -721,13 +727,16 @@ const INSPECT_HELP: CmdHelp = CmdHelp {
 };
 
 const FOLDER_HELP: CmdHelp = CmdHelp {
-    banner: "[<target>] [options]",
+    banner: "<target> [<target2> ...] [options]",
     description: "\
-  ・小説の保存フォルダを開きます。
-  ・対象を指定しなかった場合、最後に変換した小説が対象になります。
+  ・指定した小説データの保存フォルダを開きます
+  ・複数指定した場合は、複数のフォルダが一気に開きます
+  ・デフォルトではフォルダを開きますが、--no-open を付けると
+    開かずに保存フォルダまでのパスのみを表示します
 
   Examples:
     narou folder 0
+    narou folder n9669bk
     narou folder 0 -n    # パスのみ表示",
     options: &[opt(
         Some("-n"),
@@ -738,13 +747,15 @@ const FOLDER_HELP: CmdHelp = CmdHelp {
 };
 
 const BROWSER_HELP: CmdHelp = CmdHelp {
-    banner: "[<target>] [options]",
+    banner: "<target> [<target2> ...] [options]",
     description: "\
-  ・小説の掲載ページをブラウザで開きます。
-  ・対象を指定しなかった場合、最後に変換した小説が対象になります。
+  ・指定した小説データの掲載ページをブラウザで開きます
+  ・複数指定した場合は、複数の掲載ページが一気に開きます
+  ・--vote オプションが指定された場合、最新の話の感想入力画面が開きます
 
   Examples:
     narou browser 0
+    narou browser n9669bk
     narou browser 0 --vote",
     options: &[opt(
         Some("-v"),
@@ -794,14 +805,16 @@ const CSV_HELP: CmdHelp = CmdHelp {
 };
 
 const CLEAN_HELP: CmdHelp = CmdHelp {
-    banner: "[<target>] [options]",
+    banner: "[<target> ...] [options]",
     description: "\
-  ・ゴミファイルを削除します。
-  ・TOCに含まれないraw_data/*.txtやsection_save/*.yamlを検出します。
-  ・対象を指定しなかった場合、最後に変換した小説が対象になります。
+  ・<target>の小説のゴミファイルを削除します
+  ・ゴミファイルは、目次内には存在しないraw/*.txt, raw/*.html, 本文/*.yamlが対象になります
+  ・<target>を省略した場合、直前に変換した小説が対象になります
+  ・未凍結の小説全てのゴミファイルを削除したい場合は --all を使います
 
   Examples:
     narou clean 0
+    narou clean
     narou clean --all
     narou clean --all -f    # 実際に削除",
     options: &[

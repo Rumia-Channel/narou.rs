@@ -311,6 +311,7 @@ impl NovelConverter {
         let aozora_text = self.convert_novel(&toc_object, &sections)?;
         let txt_path = output::create_output_text_path(&self.settings, id, novel_dir, &toc_object);
         std::fs::write(&txt_path, &aozora_text)?;
+        save_latest_convert(id)?;
 
         Ok(txt_path.display().to_string())
     }
@@ -340,6 +341,7 @@ impl NovelConverter {
         let aozora_text = self.convert_novel(&toc_object, &sections)?;
         let txt_path = output::create_output_text_path(&self.settings, _id, novel_dir, &toc_object);
         std::fs::write(&txt_path, &aozora_text)?;
+        save_latest_convert(_id)?;
 
         let output_manager = device::OutputManager::new(device);
         let base_name = txt_path
@@ -369,6 +371,24 @@ fn load_sections_from_dir(
     }
 
     Ok(sections)
+}
+
+fn save_latest_convert(id: i64) -> Result<()> {
+    let inventory = crate::db::inventory::Inventory::with_default_root()?;
+    let mut latest: std::collections::HashMap<String, serde_yaml::Value> = inventory.load(
+        "latest_convert",
+        crate::db::inventory::InventoryScope::Local,
+    )?;
+    latest.insert(
+        "id".to_string(),
+        serde_yaml::Value::Number(serde_yaml::Number::from(id)),
+    );
+    inventory.save(
+        "latest_convert",
+        crate::db::inventory::InventoryScope::Local,
+        &latest,
+    )?;
+    Ok(())
 }
 
 fn strip_book_header_and_footer(text: &str) -> String {

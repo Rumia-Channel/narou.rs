@@ -276,7 +276,8 @@ pub(crate) struct RecordInfo {
 }
 
 pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
-    let target_type = Downloader::get_target_type(target);
+    let target = super::resolve_alias_target(target);
+    let target_type = Downloader::get_target_type(&target);
     match target_type {
         TargetType::Id => {
             if let Ok(id) = target.parse::<i64>() {
@@ -293,7 +294,7 @@ pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
             }
         }
         TargetType::Url => {
-            let toc_url = resolve_toc_url_from_url(target)?;
+            let toc_url = resolve_toc_url_from_url(&target)?;
             narou_rs::db::with_database(|db| {
                 Ok(db.get_by_toc_url(&toc_url).map(|r| RecordInfo {
                     id: r.id,
@@ -320,7 +321,7 @@ pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
             .flatten()
         }
         _ => narou_rs::db::with_database(|db| {
-            Ok(db.find_by_title(target).map(|r| RecordInfo {
+            Ok(db.find_by_title(&target).map(|r| RecordInfo {
                 id: r.id,
                 title: r.title.clone(),
             }))

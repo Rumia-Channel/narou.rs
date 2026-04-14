@@ -449,6 +449,30 @@ pub enum Commands {
         #[arg(long)]
         burn: bool,
     },
+    Alias {
+        args: Vec<String>,
+        #[arg(short = 'l', long)]
+        list: bool,
+    },
+    Folder {
+        targets: Vec<String>,
+        #[arg(short = 'n', long = "no-open")]
+        no_open: bool,
+    },
+    Browser {
+        targets: Vec<String>,
+        #[arg(short = 'v', long)]
+        vote: bool,
+    },
+    Clean {
+        targets: Vec<String>,
+        #[arg(short = 'f', long)]
+        force: bool,
+        #[arg(short = 'n', long = "dry-run")]
+        dry_run: bool,
+        #[arg(short = 'a', long)]
+        all: bool,
+    },
     Log {
         path: Option<String>,
         #[arg(short = 'n', long = "num", default_value_t = 20)]
