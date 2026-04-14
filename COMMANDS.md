@@ -83,7 +83,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
 | `download` | ✅ | 🟡 部分 | `--mail` を追加。メール設定の自動作成と送信は実装済みだが、全互換確認は継続中 |
 | `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、digest選択肢、差分cache退避、hotentryのcopy/send/mailまでは実装済み。周辺出力/イベント細部が残る |
-| `convert` | ✅ | 🟡 部分 | `--inspect` / `convert.inspect` / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定までは実装。`--device`, `--no-epub`, `--output` 等が残る |
+| `convert` | ✅ | 🟡 部分 | `--inspect` / `convert.inspect` / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定、保存済み挿絵のローカル注記化までは実装。`--device`, `--no-epub`, `--output` 等が残る |
 | `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--echo` と pipe 時ID出力まで実装 |
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションまで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
@@ -245,6 +245,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 変換後に `調査ログ.txt` を常に保存し、`enable_inspect` が有効なときは行末読点状況とカギ括弧内改行状況を記録する
 - `--inspect` 指定時は full display、未指定時は Ruby版同様に summary だけを出す
 - `enable_erase_introduction` / `enable_erase_postscript` を section 変換に反映し、`enable_auto_indent` は Ruby版 `Inspector#inspect_indent` 相当の比率判定でのみ有効化する
+- 保存済み `挿絵/<section-index>-<count>.<ext>` があれば HTML `<img>` を対応する青空文庫注記へローカルパスで復元する。`sample\\novel` の n8858hb section 16 で `［＃挿絵（挿絵/16-0.jpg）入る］` を確認済み
 
 **注**: EPUB/MOBI 生成は AozoraEpub3.jar と kindlegen への依存がある。Rust 側のテキスト変換 (`novel.txt` 生成) は完了しているが、AozoraEpub3 の呼び出しパイプラインは別途必要。
 

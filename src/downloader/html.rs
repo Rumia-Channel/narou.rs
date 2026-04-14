@@ -64,7 +64,7 @@ fn ruby_to_aozora(text: &str) -> String {
 }
 
 fn b_to_aozora(text: &str) -> String {
-    let text = Regex::new(r"(?i)<b[^>]*>")
+    let text = Regex::new(r"(?i)<b(?:\s[^>]*)?>")
         .unwrap()
         .replace_all(text, "\u{FF3B}\u{FF03}\u{592A}\u{5B57}\u{FF3D}")
         .to_string();
@@ -78,7 +78,7 @@ fn b_to_aozora(text: &str) -> String {
 }
 
 fn i_to_aozora(text: &str) -> String {
-    let text = Regex::new(r"(?i)<i[^>]*>")
+    let text = Regex::new(r"(?i)<i(?:\s[^>]*)?>")
         .unwrap()
         .replace_all(text, "\u{FF3B}\u{FF03}\u{659C}\u{4F53}\u{FF3D}")
         .to_string();
@@ -92,7 +92,7 @@ fn i_to_aozora(text: &str) -> String {
 }
 
 fn s_to_aozora(text: &str) -> String {
-    let text = Regex::new(r"(?i)<s[^>]*>")
+    let text = Regex::new(r"(?i)<s(?:\s[^>]*)?>")
         .unwrap()
         .replace_all(text, "\u{FF3B}\u{FF03}\u{53D6}\u{6D88}\u{7DDA}\u{FF3D}")
         .to_string();
@@ -178,4 +178,19 @@ pub fn sanitize_text(text: &str) -> String {
     result = ws_re.replace_all(&result.trim(), " ").to_string();
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_aozora;
+
+    #[test]
+    fn to_aozora_keeps_img_as_illustration_not_italic() {
+        let html = r#"<p>前</p><p><a href="//29644.mitemin.net/i422674/" target="_blank"><img src="挿絵/16-0.jpg" alt="挿絵(By みてみん)" border="0" /></a></p><p>後</p>"#;
+
+        let text = to_aozora(html);
+
+        assert!(text.contains("［＃挿絵（挿絵/16-0.jpg）入る］"));
+        assert!(!text.contains("［＃斜体］"));
+    }
 }

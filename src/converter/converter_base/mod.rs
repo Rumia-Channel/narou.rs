@@ -180,7 +180,7 @@ impl ConverterBase {
         }
         result = self.erase_comments_block(&result);
         self.replace_illust_tag(&mut result);
-        self.replace_url(&mut result);
+        result = self.replace_url(&result);
         result = self.replace_narou_tag(&result);
         result = self.convert_numbers(&mut result);
         result = self.exception_reconvert_kanji_to_num(&result);

@@ -816,9 +816,22 @@ impl Downloader {
                 }
                 save_section_file(&section_dir, subtitle, &section)?;
                 save_raw_file(&raw_dir, subtitle, &raw_html)?;
+                self.download_illustration(&setting, &section, &section_dir, subtitle)?;
                 updated_count += 1;
                 Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string())
             } else {
+                if setting.illust_grep_pattern.is_some() {
+                    if let Ok(content) = std::fs::read_to_string(&latest_section_path) {
+                        if let Ok(section_file) = serde_yaml::from_str::<SectionFile>(&content) {
+                            self.download_illustration(
+                                &setting,
+                                &section_file.element,
+                                &section_dir,
+                                subtitle,
+                            )?;
+                        }
+                    }
+                }
                 old_subtitles
                     .get(&subtitle.index)
                     .and_then(|old| old.download_time.clone())

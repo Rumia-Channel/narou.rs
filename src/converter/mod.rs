@@ -134,6 +134,15 @@ impl NovelConverter {
 
             let is_html =
                 section.element.data_type != "text" && section.element.data_type != "text/plain";
+            let (localized_body_html, localized_intro_html, localized_post_html) = if is_html {
+                localize_section_html_illustrations(&self.settings.archive_path, section)
+            } else {
+                (
+                    section.element.body.clone(),
+                    section.element.introduction.clone(),
+                    section.element.postscript.clone(),
+                )
+            };
 
             let mut batch_inputs = Vec::new();
 
@@ -150,14 +159,14 @@ impl NovelConverter {
                 }
                 String::new()
             } else if is_html && !section.element.introduction.is_empty() {
-                crate::downloader::html::to_aozora(&section.element.introduction)
+                crate::downloader::html::to_aozora(&localized_intro_html)
             } else {
-                section.element.introduction.clone()
+                localized_intro_html.clone()
             };
             let body_text = if is_html && !section.element.body.is_empty() {
-                crate::downloader::html::to_aozora(&section.element.body)
+                crate::downloader::html::to_aozora(&localized_body_html)
             } else {
-                section.element.body.clone()
+                localized_body_html.clone()
             };
             let post_text = if self.settings.enable_erase_postscript {
                 if !section.element.postscript.is_empty() {
@@ -165,9 +174,9 @@ impl NovelConverter {
                 }
                 String::new()
             } else if is_html && !section.element.postscript.is_empty() {
-                crate::downloader::html::to_aozora(&section.element.postscript)
+                crate::downloader::html::to_aozora(&localized_post_html)
             } else {
-                section.element.postscript.clone()
+                localized_post_html.clone()
             };
             let has_intro = !intro_text.is_empty();
             let has_post = !post_text.is_empty();
@@ -513,4 +522,155 @@ fn strip_book_header_and_footer(text: &str) -> String {
     }
 
     lines[start..end].join("\n")
+}
+
+fn localize_section_html_illustrations(
+    archive_path: &std::path::Path,
+    section: &crate::downloader::SectionFile,
+) -> (String, String, String) {
+    let illust_dir = archive_path.join("挿絵");
+    let mut illust_count = 0usize;
+    let body = localize_html_img_sources(
+        &section.element.body,
+        &illust_dir,
+        &section.index,
+        &mut illust_count,
+    );
+    let introduction = localize_html_img_sources(
+        &section.element.introduction,
+        &illust_dir,
+        &section.index,
+        &mut illust_count,
+    );
+    let postscript = localize_html_img_sources(
+        &section.element.postscript,
+        &illust_dir,
+        &section.index,
+        &mut illust_count,
+    );
+    (body, introduction, postscript)
+}
+
+fn localize_html_img_sources(
+    html: &str,
+    illust_dir: &std::path::Path,
+    section_index: &str,
+    illust_count: &mut usize,
+) -> String {
+    let re = regex::Regex::new(r#"(?i)(<img[^>]+src=["'])([^"']+)(["'][^>]*>)"#).unwrap();
+    re.replace_all(html, |caps: &regex::Captures| {
+        let url = caps[2].to_string();
+        let filename = format!(
+            "{}-{}.{}",
+            section_index,
+            *illust_count,
+            illustration_extension_from_url(&url)
+        );
+        *illust_count += 1;
+
+        let localized = if illust_dir.join(&filename).exists() {
+            format!("挿絵/{}", filename)
+        } else {
+            url
+        };
+        format!("{}{}{}", &caps[1], localized, &caps[3])
+    })
+    .to_string()
+}
+
+fn illustration_extension_from_url(url: &str) -> &'static str {
+    if url.contains(".png") {
+        "png"
+    } else if url.contains(".gif") {
+        "gif"
+    } else if url.contains(".webp") {
+        "webp"
+    } else {
+        "jpg"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NovelConverter, illustration_extension_from_url, localize_section_html_illustrations,
+    };
+    use crate::{
+        converter::settings::NovelSettings,
+        downloader::{SectionElement, SectionFile, TocObject},
+    };
+
+    fn make_temp_illustration_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "narou-rs-illust-localize-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn make_illustration_section() -> SectionFile {
+        SectionFile {
+            index: "16".to_string(),
+            href: String::new(),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: "１６　発狂　（挿絵あり）".to_string(),
+            file_subtitle: "１６　発狂　（挿絵あり）".to_string(),
+            subdate: String::new(),
+            subupdate: None,
+            download_time: None,
+            element: SectionElement {
+                data_type: "html".to_string(),
+                introduction: String::new(),
+                postscript: String::new(),
+                body: r#"<p>前</p><p><a href="//29644.mitemin.net/i422674/" target="_blank"><img src="//29644.mitemin.net/userpageimage/viewimagebig/icode/i422674/" alt="挿絵(By みてみん)" border="0" /></a></p><p>後</p>"#
+                    .to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn localize_section_html_illustrations_rewrites_existing_saved_images() {
+        let root = make_temp_illustration_root();
+        let illust_dir = root.join("挿絵");
+        std::fs::create_dir_all(&illust_dir).unwrap();
+        std::fs::write(illust_dir.join("16-0.jpg"), b"dummy").unwrap();
+
+        let section = make_illustration_section();
+
+        let (body, _, _) = localize_section_html_illustrations(&root, &section);
+        assert!(body.contains(r#"src="挿絵/16-0.jpg""#));
+        assert_eq!(illustration_extension_from_url("http://x/y.png"), "png");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn convert_novel_keeps_localized_illustration_annotation() {
+        let root = make_temp_illustration_root();
+        let illust_dir = root.join("挿絵");
+        std::fs::create_dir_all(&illust_dir).unwrap();
+        std::fs::write(illust_dir.join("16-0.jpg"), b"dummy").unwrap();
+
+        let mut settings = NovelSettings::default();
+        settings.archive_path = root.clone();
+        let toc = TocObject {
+            title: "title".to_string(),
+            author: "author".to_string(),
+            toc_url: String::new(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(0),
+        };
+        let mut converter = NovelConverter::new(settings);
+        let text = converter
+            .convert_novel(&toc, &[make_illustration_section()])
+            .unwrap();
+
+        assert!(text.contains("［＃挿絵（挿絵/16-0.jpg）入る］"), "{text}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
