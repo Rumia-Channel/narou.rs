@@ -557,6 +557,8 @@ pub enum Commands {
         ignore_force: bool,
         #[arg(short = 'i', long)]
         inspect: bool,
+        #[arg(short = 'v', long)]
+        verbose: bool,
         #[arg(long = "no-open")]
         no_open: bool,
         targets: Vec<String>,

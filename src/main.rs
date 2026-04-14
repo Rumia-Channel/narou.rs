@@ -212,6 +212,7 @@ fn run_sync_command(
             ignore_default,
             ignore_force,
             inspect,
+            verbose,
             no_open,
         } => {
             if targets.is_empty() {
@@ -226,6 +227,7 @@ fn run_sync_command(
                     no_mobi,
                     inspect,
                     no_open,
+                    verbose,
                     ignore_default,
                     ignore_force,
                 );

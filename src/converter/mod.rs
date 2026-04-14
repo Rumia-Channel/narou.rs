@@ -511,17 +511,16 @@ impl NovelConverter {
         &mut self,
         text: &str,
         device: device::Device,
+        verbose: bool,
     ) -> Result<String> {
         let txt_path = PathBuf::from(self.convert_text_file(text)?);
         let base_name = txt_path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or("output");
-        let final_path = device::OutputManager::new(device).convert_file(
-            &txt_path,
-            &self.settings.archive_path,
-            base_name,
-        )?;
+        let final_path = device::OutputManager::new(device)
+            .with_verbose(verbose)
+            .convert_file(&txt_path, &self.settings.archive_path, base_name)?;
         Ok(final_path.display().to_string())
     }
 
@@ -558,6 +557,7 @@ impl NovelConverter {
         _id: i64,
         novel_dir: &std::path::Path,
         device: device::Device,
+        verbose: bool,
     ) -> Result<PathBuf> {
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();
@@ -583,7 +583,7 @@ impl NovelConverter {
         save_latest_convert(_id)?;
         self.inspect_converted_text(&aozora_text)?;
 
-        let output_manager = device::OutputManager::new(device);
+        let output_manager = device::OutputManager::new(device).with_verbose(verbose);
         let base_name = txt_path
             .file_stem()
             .and_then(|stem| stem.to_str())

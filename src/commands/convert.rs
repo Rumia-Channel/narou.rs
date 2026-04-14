@@ -1,10 +1,17 @@
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use encoding_rs::{Encoding, UTF_8};
 use narou_rs::converter::NovelConverter;
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
+use narou_rs::db::inventory::{Inventory, InventoryScope};
 use narou_rs::progress::CliProgress;
+use regex::Regex;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use super::resolve_target_to_id;
 
@@ -16,6 +23,7 @@ pub fn cmd_convert(
     no_mobi: bool,
     inspect: bool,
     no_open: bool,
+    verbose: bool,
     ignore_default: bool,
     ignore_force: bool,
 ) {
@@ -67,6 +75,7 @@ pub fn cmd_convert(
                 ignore_force,
                 output_device,
                 selected_device,
+                verbose,
                 &multi_clone,
                 &mut first_output_dir,
             );
@@ -76,6 +85,14 @@ pub fn cmd_convert(
         let Some(id) = resolve_target_to_id(target) else {
             let _ = multi_clone.println(&format!("{} は存在しません", target));
             continue;
+        };
+
+        let dc_subjects = match load_dc_subjects_for_novel(id) {
+            Ok(subjects) => subjects,
+            Err(err) => {
+                let _ = multi_clone.println(&err);
+                None
+            }
         };
 
         let (novel_dir, title, author) = match narou_rs::db::with_database(|db| {
@@ -120,7 +137,7 @@ pub fn cmd_convert(
 
         let result = match output_device {
             Some(device) => converter
-                .convert_novel_by_id_with_device(id, &novel_dir, device)
+                .convert_novel_by_id_with_device(id, &novel_dir, device, verbose)
                 .map(|path| path.display().to_string()),
             None => converter.convert_novel_by_id(id, &novel_dir),
         };
@@ -138,6 +155,7 @@ pub fn cmd_convert(
                 {
                     let _ = multi_clone.println(&err);
                 }
+                apply_dc_subjects_if_needed(Path::new(&output_path), dc_subjects.as_deref(), &multi_clone);
                 if let Some(inspection) = converter.take_inspection_output() {
                     for line in inspection.split('\n') {
                         let _ = multi_clone.println(line);
@@ -169,6 +187,7 @@ fn convert_text_target(
     ignore_force: bool,
     output_device: Option<narou_rs::converter::device::Device>,
     copy_device: Option<narou_rs::converter::device::Device>,
+    verbose: bool,
     multi_clone: &indicatif::MultiProgress,
     first_output_dir: &mut Option<PathBuf>,
 ) {
@@ -207,7 +226,7 @@ fn convert_text_target(
     converter.set_display_inspector(inspect);
 
     let result = match output_device {
-        Some(device) => converter.convert_text_file_with_device(&text, device),
+        Some(device) => converter.convert_text_file_with_device(&text, device, verbose),
         None => converter.convert_text_file(&text),
     };
 
@@ -244,6 +263,194 @@ fn effective_convert_device(
         }
         other => other,
     }
+}
+
+fn load_dc_subjects_for_novel(novel_id: i64) -> std::result::Result<Option<Vec<String>>, String> {
+    if novel_id <= 0 || !narou_rs::compat::load_local_setting_bool("convert.add-dc-subject-to-epub")
+    {
+        return Ok(None);
+    }
+
+    let record = narou_rs::db::with_database(|db| Ok(db.get(novel_id).cloned()))
+        .map_err(|e| e.to_string())?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    if record.tags.is_empty() {
+        return Ok(None);
+    }
+
+    let excluded_tags = load_dc_subject_exclude_tags()?;
+    let subjects: Vec<String> = record
+        .tags
+        .iter()
+        .map(|tag| tag.trim())
+        .filter(|tag| !tag.is_empty() && !excluded_tags.iter().any(|excluded| excluded == tag))
+        .map(ToString::to_string)
+        .collect();
+    if subjects.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(subjects))
+}
+
+fn load_dc_subject_exclude_tags() -> std::result::Result<Vec<String>, String> {
+    if let Some(raw) = narou_rs::compat::load_local_setting_string("convert.dc-subject-exclude-tags")
+    {
+        return Ok(raw
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect());
+    }
+
+    let default_value = "404,end".to_string();
+    let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
+    let mut settings: HashMap<String, serde_yaml::Value> = inventory
+        .load("local_setting", InventoryScope::Local)
+        .map_err(|e| e.to_string())?;
+    settings.insert(
+        "convert.dc-subject-exclude-tags".to_string(),
+        serde_yaml::Value::String(default_value.clone()),
+    );
+    inventory
+        .save("local_setting", InventoryScope::Local, &settings)
+        .map_err(|e| e.to_string())?;
+
+    Ok(default_value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn apply_dc_subjects_if_needed(
+    output_path: &Path,
+    subjects: Option<&[String]>,
+    multi_clone: &indicatif::MultiProgress,
+) {
+    let Some(subjects) = subjects else {
+        return;
+    };
+    if subjects.is_empty() || !is_epub_output(output_path) {
+        return;
+    }
+
+    match add_dc_subject_to_epub(output_path, subjects) {
+        Ok(()) => {
+            let _ = multi_clone.println(&format!("dc:subjectを追加しました: {}", subjects.join(", ")));
+        }
+        Err(err) => {
+            let _ = multi_clone.println(&format!("dc:subject追加中にエラーが発生しました: {}", err));
+            let _ = multi_clone.println("dc:subject埋め込み処理に失敗しましたが、変換を続行します");
+        }
+    }
+}
+
+fn is_epub_output(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase().ends_with(".epub"))
+        .unwrap_or(false)
+}
+
+fn add_dc_subject_to_epub(
+    epub_path: &Path,
+    subjects: &[String],
+) -> std::result::Result<(), String> {
+    if subjects.is_empty() {
+        return Ok(());
+    }
+
+    let mut archive =
+        ZipArchive::new(File::open(epub_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
+        let mut body = Vec::new();
+        entry.read_to_end(&mut body).map_err(|e| e.to_string())?;
+        entries.push((entry.name().to_string(), body));
+    }
+
+    let Some(opf_index) = entries
+        .iter()
+        .position(|(name, _)| name.ends_with("standard.opf"))
+    else {
+        return Err("standard.opfファイルが見つかりませんでした".to_string());
+    };
+
+    let mut content = String::from_utf8(entries[opf_index].1.clone()).map_err(|e| e.to_string())?;
+    let subject_re = Regex::new(r"(?ms)<dc:subject>.*?</dc:subject>\s*\n?\s*")
+        .map_err(|e| e.to_string())?;
+    content = subject_re.replace_all(&content, "").into_owned();
+
+    let subject_lines: Vec<String> = subjects
+        .iter()
+        .map(|subject| subject.trim())
+        .filter(|subject| !subject.is_empty())
+        .map(|subject| format!("\t\t<dc:subject>{}</dc:subject>", escape_xml(subject)))
+        .collect();
+    if !subject_lines.is_empty() {
+        let metadata_re = Regex::new(r"(?s)(\s*)</metadata>").map_err(|e| e.to_string())?;
+        if !metadata_re.is_match(&content) {
+            return Err("</metadata> が見つかりませんでした".to_string());
+        }
+        content = metadata_re
+            .replace(&content, format!("\n{}\n$1</metadata>", subject_lines.join("\n")))
+            .into_owned();
+    }
+    entries[opf_index].1 = content.into_bytes();
+
+    let Some(mimetype_index) = entries.iter().position(|(name, _)| name == "mimetype") else {
+        return Err("mimetypeファイルが見つかりません".to_string());
+    };
+
+    let temp_path = epub_path.with_file_name(format!(
+        "{}.tmp",
+        epub_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("output.epub")
+    ));
+    {
+        let file = File::create(&temp_path).map_err(|e| e.to_string())?;
+        let mut writer = ZipWriter::new(file);
+        let stored =
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        writer
+            .start_file("mimetype", stored)
+            .map_err(|e| e.to_string())?;
+        writer
+            .write_all(&entries[mimetype_index].1)
+            .map_err(|e| e.to_string())?;
+
+        let deflated = SimpleFileOptions::default();
+        for (name, body) in &entries {
+            if name == "mimetype" {
+                continue;
+            }
+            writer
+                .start_file(name, deflated)
+                .map_err(|e| e.to_string())?;
+            writer.write_all(body).map_err(|e| e.to_string())?;
+        }
+        writer.finish().map_err(|e| e.to_string())?;
+    }
+
+    std::fs::remove_file(epub_path).map_err(|e| e.to_string())?;
+    std::fs::rename(&temp_path, epub_path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn text_output_archive_path(target_path: &Path, output_filename: Option<&str>) -> PathBuf {

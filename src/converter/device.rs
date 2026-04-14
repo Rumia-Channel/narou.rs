@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::error::{NarouError, Result};
 
@@ -90,6 +90,7 @@ pub struct OutputManager {
     device: Device,
     aozora_epub3_path: Option<PathBuf>,
     kindlegen_path: Option<PathBuf>,
+    verbose: bool,
 }
 
 impl OutputManager {
@@ -98,7 +99,13 @@ impl OutputManager {
             device,
             aozora_epub3_path: Self::find_external_tool("AozoraEpub3"),
             kindlegen_path: Self::find_external_tool("kindlegen"),
+            verbose: false,
         }
+    }
+
+    pub fn with_verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
     }
 
     pub fn device(&self) -> Device {
@@ -199,6 +206,10 @@ impl OutputManager {
         cmd.arg("-ext").arg(output_ext);
         cmd.arg("-of");
         cmd.arg(input_txt);
+        if !self.verbose {
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+        }
 
         let status = cmd
             .status()
@@ -260,6 +271,10 @@ impl OutputManager {
                         .and_then(|name| name.to_str())
                         .ok_or_else(|| NarouError::Conversion("Invalid output filename".into()))?,
                 );
+                if !self.verbose {
+                    cmd2.stdout(Stdio::null());
+                    cmd2.stderr(Stdio::null());
+                }
 
                 let status2 = cmd2.status().map_err(|e| {
                     NarouError::Conversion(format!("Failed to run kindlegen: {}", e))
