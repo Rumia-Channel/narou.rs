@@ -306,7 +306,7 @@ const UPDATE_HELP: CmdHelp = CmdHelp {
 
     # foo タグ及び bar タグが両方付いた小説のみ更新(タグのAND指定)
     narou tag foo bar | narou u
-    narou l -t \"foo bar\" | narou u",
+    narou l -t \"foo bar\" | narou u   # こっちでも同じ(覚えやすい方を使う)",
     options: &[
         opt(
             Some("-n"),
@@ -324,7 +324,7 @@ const UPDATE_HELP: CmdHelp = CmdHelp {
             None,
             "--gl",
             Some("[OPT]"),
-            "データベースに最新話掲載日を反映させる",
+            "データベースに最新話掲載日を反映させる\n                             |    OPT   |          概要\n                             | 指定なし | 全ての小説を対象にする\n                             |   narou  | なろうAPIを使える小説のみ対象\n                             |   other  | なろうAPIが使えない小説のみ対象",
         ),
         opt(Some("-f"), "--force", None, "凍結済みも更新する"),
         opt(
@@ -691,17 +691,25 @@ const MAIL_HELP: CmdHelp = CmdHelp {
     banner: "[<target> ...] [options]",
     description: "\
   ・変換したEPUB/MOBIをメールで送信します。
-  ・Send-to-Kindle 等のメール送信機能を利用します。
+  ・主にSend to Kindleを使うためのコマンドです。
+  ・<target>で指定した小説の電子書籍データメールで送信します。
+  ・<target>を省略した場合、新着があった小説を全て送信します。
+  ・メールの送信設定は、mail_setting.yamlファイルを編集します。
+    (初めてコマンドを使うときに自動で作成されます)
+  ・<target>にhotentryを指定した場合、最新のhotentryを送信します。
 
   Examples:
-    narou mail
-    narou mail -f
-    narou mail hotentry",
+    narou mail 6         # 新着関係なくメール(送信済みフラグは立つ)
+
+    narou update
+    narou mail           # updateで新着があった小説を全てメール
+
+    narou mail --force   # 凍結済以外の全ての小説を強制的にメール(使い方に注意)",
     options: &[opt(
         Some("-f"),
         "--force",
         None,
-        "全非凍結小説を強制送信する",
+        "全ての小説を強制的に送信",
     )],
 };
 
@@ -727,9 +735,9 @@ const ALIAS_HELP: CmdHelp = CmdHelp {
 const INSPECT_HELP: CmdHelp = CmdHelp {
     banner: "[<target> ...]",
     description: "\
-  ・引数を指定しなかった場合は直前に変換した小説の状態調査状況ログを表示します
-  ・小説を指定した場合はその小説のログを表示します
-  ・narou setting convert.inspect=true とすれば変換時に常に表示されるようになります
+  ・引数を指定しなかった場合は直前に変換した小説の状態調査状況ログを表示します。
+  ・小説を指定した場合はその小説のログを表示します。
+  ・narou setting convert.inspect=true とすれば変換時に常に表示されるようになります。
 
   Examples:
     narou inspect     # 直前の変換時のログを表示
@@ -1074,7 +1082,33 @@ fn render_command_help(out: &mut dyn Write, cmd_name: &str, help: &CmdHelp) {
                 (None, Some(a)) => format!("    {}={}", opt_item.long, a),
                 (None, None) => format!("    {}", opt_item.long),
             };
-            let _ = writeln!(out, "    {:30} {}", switches, opt_item.help);
+            let mut help_lines = opt_item.help.lines();
+            if let Some(first_line) = help_lines.next() {
+                let _ = writeln!(out, "    {:30} {}", switches, first_line);
+            }
+            for line in help_lines {
+                let _ = writeln!(out, "    {:30} {}", "", line);
+            }
         }
+    }
+
+    if let Some(footer) = command_footer(cmd_name) {
+        let _ = writeln!(out);
+        for line in footer.lines() {
+            if line.is_empty() {
+                let _ = writeln!(out);
+            } else {
+                let _ = writeln!(out, "{}", line);
+            }
+        }
+    }
+}
+
+fn command_footer(cmd_name: &str) -> Option<String> {
+    match cmd_name {
+        "convert" => Some(
+            "  Configuration:\n    --make-zip, --no-epub, --no-mobi, --no-strip, --no-zip, --no-open , --inspect は narou setting コマンドで恒常的な設定にすることが可能です。\n    convert.copy-to を設定すれば変換したEPUB/MOBIを指定のフォルダに自動でコピー出来ます。\n    device で設定した端末が接続されていた場合、対応するデータを自動送信します。\n    詳しくは narou setting --help を参照して下さい。".to_string(),
+        ),
+        _ => None,
     }
 }

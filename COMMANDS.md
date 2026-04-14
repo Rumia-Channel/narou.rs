@@ -95,7 +95,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `mail` | ✅ | 🟡 部分 | `mail_setting.yaml` 読込と SMTP 送信の基盤を追加。Pony/mail 設定の完全互換は要確認だが、hotentry 自動メールは実装済み |
 | `backup` | ✅ | ✅ 完了 | `narou backup`/複数 target、`backup/` 除外、180バイト切り詰めまで対応 |
 | `clean` | ✅ | ✅ 完了 | `latest_convert` 既定値、`--all`、`--force`/`--dry-run`、freeze スキップ、`raw/*.txt|*.html` と `本文/*.yaml` の orphan 判定を実装 |
-| `help` | ✅ | 🟡 部分 | トップレベルは概ね実装済み。各コマンド -h は Ruby版詳細ヘルプとの差分あり |
+| `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
 | `version` | ✅ | ✅ 完了 | `-v`/`--version` と `--more` を実装。出力順序、help 文言、AozoraEpub3 探索、失敗時メッセージを Ruby 版に揃えた |
 | `log` | ✅ | ✅ 完了 | `--num`, `--tail`, `--source-convert`, `<path>` を実装。最新ログ選択、`.narou/local_setting.yaml` の `log.*` 既定値、`*_convert` フィルタも対応 |
 | `folder` | ✅ | ✅ 完了 | `--no-open`、引数省略時 help、alias/tag 解決を実装 |
@@ -694,7 +694,6 @@ narou setting name         # 読み取り
 | convert `--device`, `--no-open`, `--output` | convert | 変換パイプライン完成 |
 | download の残互換実装 | download | 再DL確認・mail 周辺 |
 | setting の残互換実装 | setting | 全設定変数と device hook の詰め |
-| help の残互換実装 | help | 各コマンド詳細ヘルプの完全一致 |
 | inspect のログ生成側 | inspect | `convert.inspect` / Inspector 互換 |
 
 ### P1: 設定管理基盤
