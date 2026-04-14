@@ -4,6 +4,7 @@ pub mod misc;
 pub mod novel_settings;
 pub mod novels;
 pub mod push;
+pub mod scheduler;
 pub mod state;
 pub mod tags;
 pub mod worker;

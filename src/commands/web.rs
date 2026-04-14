@@ -77,11 +77,15 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let ws_listener = tokio::net::TcpListener::bind(ws_addr).await.unwrap();
-    let worker_task = web::worker::start_queue_worker(root_dir, push_server.clone());
+    let worker_task = web::worker::start_queue_worker(root_dir.clone(), push_server.clone());
+    let scheduler_task = web::scheduler::start_auto_update_scheduler(root_dir, push_server.clone());
 
     let ws_task = tokio::spawn(async move { axum::serve(ws_listener, ws_app).await });
     axum::serve(listener, app).await.unwrap();
     worker_task.abort();
+    if let Some(task) = scheduler_task {
+        task.abort();
+    }
     ws_task.abort();
 }
 

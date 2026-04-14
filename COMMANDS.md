@@ -88,7 +88,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションまで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
 | `remove` | ✅ | ✅ 完了 | `--yes`, `--with-file`, `--all-ss`、確認、freeze/lock チェックを実装 |
-| `web` | ✅ | 🟡 部分 | API と queue worker は実装済み。HTML UIなし |
+| `web` | ✅ | 🟡 部分 | API / queue worker / auto-scheduler は実装済み。HTML UIなし |
 | `setting` | ✅ | ✅ 完了 | 基本読み書き、`--burn`、dynamic `default/force/default_args`、hidden select 値検証、`setting -a` の全変数一覧まで Ruby 互換に揃えた |
 | `diff` | ✅ | ✅ 完了 | 外部 diff ツール、raw データ管理 |
 | `send` | ✅ | ✅ 完了 | Kindle/Kobo/Reader 送信、`--without-freeze`、栞 backup/restore、hotentry を実装 |
@@ -536,9 +536,10 @@ narou setting name         # 読み取り
 - queue worker が `.narou/queue.yaml` を継続監視し、download / update / convert の queued job を別プロセスで順次実行する
 - Web 経由の convert job は `--no-open` で非対話化し、API 指定 device は worker 専用 override で child process に渡す
 - `queue_clear` は deadlock しないように永続キュー保存順を修正済み
+- local `update.auto-schedule.enable` / `update.auto-schedule` が有効なら、Ruby版同様に時刻指定で自動アップデートを実行する
+- 自動アップデートは `--gl narou` → `modified` タグ対象 → その他小説の順に child `update` を実行し、`server_setting.current_sort` が有効なら対応する `--sort-by` も引き継ぐ
 
 **不足動作**:
-- 自動更新スケジューラの起動
 - HTML フロントエンド (Ruby 版は HAML テンプレート)
 - `webui.theme` 設定
 - `webui.performance-mode` 設定
