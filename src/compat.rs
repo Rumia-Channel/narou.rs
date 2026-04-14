@@ -350,16 +350,7 @@ fn get_copy_to_directory(
 
 fn send_file_to_device(ebook_file: &Path, device: Device) -> std::result::Result<(), String> {
     let manager = crate::converter::device::OutputManager::new(device);
-    if !device.physical_support() || !manager.connecting() || ebook_file.extension().is_none() {
-        return Ok(());
-    }
-    if format!(
-        ".{}",
-        ebook_file
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or_default()
-    ) != device.extension()
+    if !device.physical_support() || !manager.connecting() || !device.matches_ebook_file(ebook_file)
     {
         return Ok(());
     }

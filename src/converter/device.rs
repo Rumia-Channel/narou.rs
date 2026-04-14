@@ -9,6 +9,7 @@ pub enum Device {
     Epub,
     Mobi,
     Kobo,
+    Reader,
 }
 
 impl Device {
@@ -17,6 +18,7 @@ impl Device {
             "epub" => Device::Epub,
             "mobi" | "kindle" => Device::Mobi,
             "kobo" => Device::Kobo,
+            "reader" => Device::Reader,
             _ => Device::Text,
         }
     }
@@ -27,7 +29,28 @@ impl Device {
             Device::Epub => ".epub",
             Device::Mobi => ".mobi",
             Device::Kobo => ".epub",
+            Device::Reader => ".epub",
         }
+    }
+
+    pub fn ebook_file_ext(&self) -> &str {
+        match self {
+            Device::Text => ".txt",
+            Device::Epub => ".epub",
+            Device::Mobi => ".mobi",
+            Device::Kobo => ".kepub.epub",
+            Device::Reader => ".epub",
+        }
+    }
+
+    pub fn matches_ebook_file(&self, path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| {
+                name.to_ascii_lowercase()
+                    .ends_with(&self.ebook_file_ext().to_ascii_lowercase())
+            })
+            .unwrap_or(false)
     }
 
     pub fn display_name(&self) -> &str {
@@ -36,17 +59,19 @@ impl Device {
             Device::Epub => "EPUB",
             Device::Mobi => "Kindle",
             Device::Kobo => "Kobo",
+            Device::Reader => "SonyReader",
         }
     }
 
     pub fn physical_support(&self) -> bool {
-        matches!(self, Device::Mobi | Device::Kobo)
+        matches!(self, Device::Mobi | Device::Kobo | Device::Reader)
     }
 
     pub fn volume_name(&self) -> Option<&'static str> {
         match self {
             Device::Mobi => Some("Kindle"),
             Device::Kobo => Some("KOBOeReader"),
+            Device::Reader => Some("READER"),
             _ => None,
         }
     }
@@ -55,6 +80,7 @@ impl Device {
         match self {
             Device::Mobi => &["documents", "Documents", "Books"],
             Device::Kobo => &["/"],
+            Device::Reader => &["Sony_Reader/media/books"],
             _ => &[],
         }
     }
@@ -201,6 +227,7 @@ impl OutputManager {
             Device::Text => Ok(input_txt.to_path_buf()),
             Device::Epub => self.run_aozora_epub3(input_txt, output_dir, ".epub"),
             Device::Kobo => self.run_aozora_epub3(input_txt, output_dir, ".kepub.epub"),
+            Device::Reader => self.run_aozora_epub3(input_txt, output_dir, ".epub"),
             Device::Mobi => {
                 let temp_input = output_dir.join(format!("{}_mobi_source.txt", base_name));
                 std::fs::copy(input_txt, &temp_input)?;
@@ -261,6 +288,10 @@ impl OutputManager {
             }),
             (
                 "kobo".to_string(),
+                Self::find_external_tool("AozoraEpub3").is_some(),
+            ),
+            (
+                "reader".to_string(),
                 Self::find_external_tool("AozoraEpub3").is_some(),
             ),
         ];
@@ -388,4 +419,17 @@ fn find_unix_volume_root(volume_name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::Device;
+
+    #[test]
+    fn kobo_matches_kepub_output_suffix() {
+        assert!(Device::Kobo.matches_ebook_file(Path::new("novel.kepub.epub")));
+        assert!(!Device::Kobo.matches_ebook_file(Path::new("novel.epub")));
+    }
 }

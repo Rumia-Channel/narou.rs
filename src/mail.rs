@@ -396,7 +396,7 @@ fn resolve_record(target: &str) -> std::result::Result<Option<NovelRecord>, Stri
     }
 }
 
-fn get_ebook_file_paths(
+pub fn get_ebook_file_paths(
     record: &NovelRecord,
     novel_dir: &Path,
     ext: &str,
@@ -432,7 +432,7 @@ fn get_ebook_file_paths(
     Ok(paths)
 }
 
-fn newest_hotentry_file_path(ext: &str) -> std::result::Result<Option<PathBuf>, String> {
+pub fn newest_hotentry_file_path(ext: &str) -> std::result::Result<Option<PathBuf>, String> {
     let root = Inventory::with_default_root().map_err(|e| e.to_string())?;
     let hotentry_dir = root.root_dir().join("hotentry");
     if !hotentry_dir.exists() {
@@ -467,7 +467,7 @@ fn update_last_mail_date(id: i64) -> std::result::Result<(), String> {
 }
 
 fn current_device_ext() -> Option<String> {
-    crate::compat::current_device().map(|device| device.extension().to_string())
+    crate::compat::current_device().map(|device| device.ebook_file_ext().to_string())
 }
 
 fn alias_to_target(target: &str) -> String {

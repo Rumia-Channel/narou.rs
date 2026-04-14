@@ -162,6 +162,19 @@ fn run_sync_command(
             commands::mail::cmd_mail(commands::mail::MailOptions { targets, force });
             0
         }
+        Commands::Send {
+            args,
+            without_freeze,
+            force,
+            backup_bookmark,
+            restore_bookmark,
+        } => commands::send::cmd_send(commands::send::SendOptions {
+            args,
+            without_freeze,
+            force,
+            backup_bookmark,
+            restore_bookmark,
+        }),
         Commands::Backup { targets } => match commands::backup::cmd_backup(&targets) {
             Ok(_) => 0,
             Err(e) => {

@@ -946,16 +946,7 @@ fn send_hotentry_output(
         return Ok(());
     };
     let manager = OutputManager::new(device);
-    if !device.physical_support() || !manager.connecting() || ebook_file.extension().is_none() {
-        return Ok(());
-    }
-    if format!(
-        ".{}",
-        ebook_file
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or_default()
-    ) != device.extension()
+    if !device.physical_support() || !manager.connecting() || !device.matches_ebook_file(ebook_file)
     {
         return Ok(());
     }

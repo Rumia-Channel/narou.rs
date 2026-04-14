@@ -380,6 +380,17 @@ pub enum Commands {
         #[arg(short = 'f', long)]
         force: bool,
     },
+    Send {
+        args: Vec<String>,
+        #[arg(short = 'w', long = "without-freeze")]
+        without_freeze: bool,
+        #[arg(short = 'f', long)]
+        force: bool,
+        #[arg(short = 'b', long = "backup-bookmark")]
+        backup_bookmark: bool,
+        #[arg(short = 'r', long = "restore-bookmark")]
+        restore_bookmark: bool,
+    },
     Backup {
         targets: Vec<String>,
     },
