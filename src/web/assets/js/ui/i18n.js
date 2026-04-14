@@ -1,164 +1,112 @@
-import { elements, state } from "../core/state.js";
-
-const I18N = {
+/**
+ * Internationalization: JP/EN translations
+ */
+const DICT = {
   ja: {
-    pageTitle: "narou.rs WEB UI",
-    queueLabel: "キュー",
-    selectedLabel: "選択",
-    filterLabel: "絞り込み",
-    filterPlaceholder: "タイトル / 作者 / タグ",
-    reloadButton: "再読込",
-    downloadButton: "Download",
-    updateButton: "Update",
-    convertButton: "Convert",
-    freezeButton: "Freeze",
-    unfreezeButton: "Unfreeze",
-    clearButton: "クリア",
-    removeButton: "Remove",
-    columnId: "ID",
-    columnTitle: "タイトル",
-    columnAuthor: "作者",
-    columnSite: "サイト",
-    columnUpdated: "更新日",
-    columnLatest: "最新話掲載日",
-    columnTags: "タグ",
-    columnStatus: "状態",
-    columnActions: "操作",
-    queueHeading: "キュー",
-    clearQueueButton: "キュー消去",
-    queuePending: "待機",
-    queueCompleted: "完了",
-    queueFailed: "失敗",
-    consoleHeading: "コンソール",
-    notepadHeading: "メモ帳",
-    saveButton: "保存",
-    notepadPlaceholder: "メモ帳",
-    tagsHeading: "タグ",
-    emptyState: "対象の小説がありません。",
-    statusFrozen: "凍結",
-    statusEnd: "完結",
-    statusActive: "通常",
-    actionUpdate: "Update",
-    actionConvert: "Convert",
-    actionFreeze: "Freeze",
-    actionUnfreeze: "Unfreeze",
-    actionTags: "タグ",
-    actionRemove: "Remove",
-    initMessage: "WEB UI を初期化しました",
-    reloadMessage: "一覧・タグ・キュー・メモ帳を再読込しました",
-    notepadSaved: "メモ帳を保存しました",
-    wsConnected: "WebSocket に接続しました",
-    wsDisconnected: "WebSocket が切断されました",
-    wsError: "WebSocket エラー",
-    queueDownloadPrompt: "ダウンロード対象を空白または改行区切りで指定",
-    queueDownloadQueued: "ダウンロードをキューに追加しました",
-    queueUpdateAllConfirm: "選択がないため全小説を update しますか?",
-    queueUpdateAllQueued: "全小説の update をキューに追加しました",
-    queueUpdateQueued: "update をキューに追加しました",
-    queueConvertAlert: "変換する小説を選択して下さい",
-    queueConvertPrompt: "変換 device を指定",
-    queueConvertQueued: "convert をキューに追加しました",
-    batchSelectAlert: "小説を選択して下さい",
-    removeSelectedAlert: "削除する小説を選択して下さい",
-    removeSelectedConfirm: "件の小説を削除しますか?",
-    rowRemoveConfirm: "を削除しますか?",
-    tagsPrompt: "タグをカンマ区切りで指定",
-    queueCleared: "キューを消去しました",
-    languageChanged: "言語を切り替えました",
+    menuView: '表示',
+    menuSelect: '選択',
+    menuTag: 'タグ',
+    menuTool: 'ツール',
+    viewAll: '全ての小説を表示',
+    viewNonfrozen: '凍結中以外を表示',
+    viewFrozen: '凍結中を表示',
+    viewWide: '小説リストの幅を広げる',
+    selectVisible: '表示されている小説を選択',
+    selectAll: '全ての小説を選択',
+    selectClear: '選択を全て解除',
+    tagEdit: '選択した小説のタグを編集',
+    toolNotepad: 'メモ帳',
+    toolCsvDownload: 'CSV形式でリストをダウンロード',
+    serverShutdown: 'サーバをシャットダウン',
+    notepadTitle: 'メモ帳',
+    saveButton: '保存',
+    queueTitle: 'キュー',
+    queuePending: '待機',
+    queueCompleted: '完了',
+    queueFailed: '失敗',
+    clearQueueButton: 'キュー消去',
+    colLastUpdate: '最終更新日',
+    colGeneralLastup: '最新話掲載日',
+    colTitle: 'タイトル',
+    colAuthor: '作者',
+    colSite: 'サイト名',
+    colTags: 'タグ',
+    colStatus: '状態',
+    updateView: '表示されている小説を更新',
+    updateForce: '凍結済みでも更新',
+    freezeOn: '選択した小説を凍結',
+    freezeOff: '選択した小説の凍結を解除',
+    otherDiff: '選択した小説の最新の差分を表示',
+    otherFolder: '選択した小説の保存フォルダを開く',
+    otherBackup: '選択した小説のバックアップを作成',
+    otherMail: '選択した小説をメールで送信',
+    statusNew: '新着',
+    statusUpdated: '更新',
+    confirmRemove: '選択した小説を本当に削除しますか？',
+    confirmShutdown: 'サーバをシャットダウンしますか？',
   },
   en: {
-    pageTitle: "narou.rs WEB UI",
-    queueLabel: "Queue",
-    selectedLabel: "Selected",
-    filterLabel: "Filter",
-    filterPlaceholder: "title / author / tag",
-    reloadButton: "Reload",
-    downloadButton: "Download",
-    updateButton: "Update",
-    convertButton: "Convert",
-    freezeButton: "Freeze",
-    unfreezeButton: "Unfreeze",
-    clearButton: "Clear",
-    removeButton: "Remove",
-    columnId: "ID",
-    columnTitle: "Title",
-    columnAuthor: "Author",
-    columnSite: "Site",
-    columnUpdated: "Updated",
-    columnLatest: "Latest",
-    columnTags: "Tags",
-    columnStatus: "Status",
-    columnActions: "Actions",
-    queueHeading: "Queue",
-    clearQueueButton: "Clear queue",
-    queuePending: "Pending",
-    queueCompleted: "Completed",
-    queueFailed: "Failed",
-    consoleHeading: "Console",
-    notepadHeading: "Notepad",
-    saveButton: "Save",
-    notepadPlaceholder: "Notepad",
-    tagsHeading: "Tags",
-    emptyState: "No novels found.",
-    statusFrozen: "Frozen",
-    statusEnd: "End",
-    statusActive: "Active",
-    actionUpdate: "Update",
-    actionConvert: "Convert",
-    actionFreeze: "Freeze",
-    actionUnfreeze: "Unfreeze",
-    actionTags: "Tags",
-    actionRemove: "Remove",
-    initMessage: "WEB UI initialized",
-    reloadMessage: "Reloaded list, tags, queue, and notepad",
-    notepadSaved: "Notepad saved",
-    wsConnected: "WebSocket connected",
-    wsDisconnected: "WebSocket disconnected",
-    wsError: "WebSocket error",
-    queueDownloadPrompt: "Enter download targets separated by spaces or newlines",
-    queueDownloadQueued: "Queued download",
-    queueUpdateAllConfirm: "No novels selected. Queue update for all novels?",
-    queueUpdateAllQueued: "Queued update for all novels",
-    queueUpdateQueued: "Queued update",
-    queueConvertAlert: "Select at least one novel to convert",
-    queueConvertPrompt: "Choose convert device",
-    queueConvertQueued: "Queued convert",
-    batchSelectAlert: "Select at least one novel",
-    removeSelectedAlert: "Select at least one novel to remove",
-    removeSelectedConfirm: "novels will be removed. Continue?",
-    rowRemoveConfirm: "will be removed. Continue?",
-    tagsPrompt: "Edit tags as comma-separated values",
-    queueCleared: "Queue cleared",
-    languageChanged: "Language switched",
+    menuView: 'View',
+    menuSelect: 'Select',
+    menuTag: 'Tags',
+    menuTool: 'Tools',
+    viewAll: 'Show all novels',
+    viewNonfrozen: 'Show non-frozen',
+    viewFrozen: 'Show frozen only',
+    viewWide: 'Widen novel list',
+    selectVisible: 'Select visible novels',
+    selectAll: 'Select all novels',
+    selectClear: 'Clear selection',
+    tagEdit: 'Edit tags for selected novels',
+    toolNotepad: 'Notepad',
+    toolCsvDownload: 'Download list as CSV',
+    serverShutdown: 'Shutdown server',
+    notepadTitle: 'Notepad',
+    saveButton: 'Save',
+    queueTitle: 'Queue',
+    queuePending: 'Pending',
+    queueCompleted: 'Completed',
+    queueFailed: 'Failed',
+    clearQueueButton: 'Clear Queue',
+    colLastUpdate: 'Last Update',
+    colGeneralLastup: 'Latest Post',
+    colTitle: 'Title',
+    colAuthor: 'Author',
+    colSite: 'Site',
+    colTags: 'Tags',
+    colStatus: 'Status',
+    updateView: 'Update visible novels',
+    updateForce: 'Update even if frozen',
+    freezeOn: 'Freeze selected',
+    freezeOff: 'Unfreeze selected',
+    otherDiff: 'Show latest diff',
+    otherFolder: 'Open novel folder',
+    otherBackup: 'Create backup',
+    otherMail: 'Send by mail',
+    statusNew: 'New',
+    statusUpdated: 'Updated',
+    confirmRemove: 'Really remove the selected novels?',
+    confirmShutdown: 'Shutdown the server?',
   },
 };
 
-export function loadPreferredLanguage() {
-  const saved = window.localStorage.getItem("narou-rs-webui-language");
-  return saved === "en" ? "en" : "ja";
-}
-
-export function setLanguage(language) {
-  state.language = language === "en" ? "en" : "ja";
-  window.localStorage.setItem("narou-rs-webui-language", state.language);
-  applyTranslations();
-}
-
-export function applyTranslations() {
-  document.documentElement.lang = state.language;
-  document.title = t("pageTitle");
-
-  document.querySelectorAll("[data-i18n]").forEach((element) => {
-    element.textContent = t(element.dataset.i18n);
-  });
-  document.querySelectorAll("[data-i18n-placeholder]").forEach((element) => {
-    element.placeholder = t(element.dataset.i18nPlaceholder);
-  });
-
-  elements.langJa.classList.toggle("is-active", state.language === "ja");
-  elements.langEn.classList.toggle("is-active", state.language === "en");
-}
-
 export function t(key) {
-  return I18N[state.language]?.[key] || I18N.ja[key] || key;
+  const lang = localStorage.getItem('narou-rs-webui-language') || 'ja';
+  return (DICT[lang] && DICT[lang][key]) || (DICT.ja[key]) || key;
+}
+
+export function applyI18n() {
+  const lang = localStorage.getItem('narou-rs-webui-language') || 'ja';
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    const text = (DICT[lang] && DICT[lang][key]) || (DICT.ja[key]);
+    if (text) el.textContent = text;
+  });
+}
+
+export function toggleLanguage() {
+  const current = localStorage.getItem('narou-rs-webui-language') || 'ja';
+  const next = current === 'ja' ? 'en' : 'ja';
+  localStorage.setItem('narou-rs-webui-language', next);
+  applyI18n();
 }

@@ -1,144 +1,266 @@
-import { elements, state, syncSelectionUi } from "../core/state.js";
-import { t } from "./i18n.js";
+/**
+ * Novel list rendering: table rows with click-to-select (no per-row action buttons)
+ */
+import { State, El } from '../core/state.js';
+import { t } from './i18n.js';
 
-export function renderNovels() {
-  elements.novelsTbody.innerHTML = "";
+const TAG_COLOR_MAP = {
+  green: 'tag-green',
+  yellow: 'tag-yellow',
+  blue: 'tag-blue',
+  magenta: 'tag-magenta',
+  cyan: 'tag-cyan',
+  red: 'tag-red',
+  white: 'tag-white',
+};
 
-  if (state.novels.length === 0) {
-    const empty = document.createElement("tr");
-    empty.innerHTML = `<td colspan="10"><div class="empty-state">${escapeHtml(t("emptyState"))}</div></td>`;
-    elements.novelsTbody.appendChild(empty);
-    syncSelectionUi();
-    return;
+/**
+ * Render the full novel table body
+ */
+export function renderNovelList() {
+  const tbody = El.novelListBody;
+  if (!tbody) return;
+
+  const filtered = getFilteredNovels();
+  const sorted = sortNovels(filtered);
+
+  const fragment = document.createDocumentFragment();
+  for (const novel of sorted) {
+    fragment.appendChild(createRow(novel));
+  }
+  tbody.textContent = '';
+  tbody.appendChild(fragment);
+
+  updateSelectionBadge();
+  updateEnableSelected();
+}
+
+function getFilteredNovels() {
+  let list = State.novels;
+
+  // View mode filter
+  if (State.viewMode === 'nonfrozen') {
+    list = list.filter(n => !State.frozenIds.has(String(n.id)));
+  } else if (State.viewMode === 'frozen') {
+    list = list.filter(n => State.frozenIds.has(String(n.id)));
   }
 
-  for (const novel of state.novels) {
-    const fragment = elements.rowTemplate.content.cloneNode(true);
-    const row = fragment.querySelector("tr");
-    const checkbox = fragment.querySelector(".row-checkbox");
-    checkbox.dataset.id = String(novel.id);
-    checkbox.checked = state.selected.has(novel.id);
-    row.classList.toggle("is-selected", checkbox.checked);
+  // Text filter
+  if (State.filterText) {
+    const q = State.filterText.toLowerCase();
+    list = list.filter(n => {
+      const searchable = [
+        n.title || '', n.author || '', n.sitename || '',
+        String(n.id), ...(n.tags || []),
+      ].join(' ').toLowerCase();
+      return searchable.includes(q);
+    });
+  }
 
-    fragment.querySelector(".row-id").textContent = novel.id;
-    fragment.querySelector(".row-title").textContent = novel.title;
-    fragment.querySelector(".row-author").textContent = novel.author;
-    fragment.querySelector(".row-site").textContent = novel.sitename;
-    fragment.querySelector(".row-updated").textContent = novel.last_update;
-    fragment.querySelector(".row-latest").textContent = novel.general_lastup || "—";
+  return list;
+}
 
-    const tagCell = fragment.querySelector(".row-tags");
-    for (const tag of novel.tags) {
-      tagCell.appendChild(createTagElement(tag));
+function sortNovels(novels) {
+  const col = State.sortCol;
+  const asc = State.sortAsc;
+
+  const keyFn = (n) => {
+    switch (col) {
+      case 0: return n.id || 0;
+      case 1: return n.last_update || '';
+      case 2: return n.general_lastup || '';
+      case 3: return (n.title || '').toLowerCase();
+      case 4: return (n.author || '').toLowerCase();
+      case 5: return (n.sitename || '').toLowerCase();
+      default: return '';
     }
+  };
 
-    const statusCell = fragment.querySelector(".row-status");
-    statusCell.appendChild(createStatusBadge(novel));
+  return [...novels].sort((a, b) => {
+    const ka = keyFn(a);
+    const kb = keyFn(b);
+    let cmp = 0;
+    if (ka < kb) cmp = -1;
+    else if (ka > kb) cmp = 1;
+    return asc ? cmp : -cmp;
+  });
+}
 
-    const actions = fragment.querySelector(".row-actions");
-    actions.appendChild(createActionButton(t("actionUpdate"), "update", novel.id));
-    actions.appendChild(createActionButton(t("actionConvert"), "convert", novel.id));
-    actions.appendChild(
-      createActionButton(
-        novel.frozen ? t("actionUnfreeze") : t("actionFreeze"),
-        novel.frozen ? "unfreeze" : "freeze",
-        novel.id,
-      ),
-    );
-    actions.appendChild(createActionButton(t("actionTags"), "tags", novel.id));
-    actions.appendChild(createActionButton(t("actionRemove"), "remove", novel.id));
+function createRow(novel) {
+  const tr = document.createElement('tr');
+  tr.dataset.id = novel.id;
 
-    elements.novelsTbody.appendChild(fragment);
+  const isFrozen = State.frozenIds.has(String(novel.id));
+  const isSelected = State.selectedIds.has(String(novel.id));
+
+  if (isFrozen) tr.classList.add('frozen');
+  if (isSelected) tr.classList.add('selected');
+
+  tr.addEventListener('click', (e) => {
+    if (e.target.closest('.tag-label')) return;
+    toggleSelect(novel.id);
+  });
+
+  const idText = isFrozen ? `＊${novel.id}` : String(novel.id);
+
+  tr.innerHTML = `
+    <td class="col-id">${esc(idText)}</td>
+    <td class="col-update">${formatDate(novel.last_update)}</td>
+    <td class="col-latest">${formatDate(novel.general_lastup)}</td>
+    <td class="col-title">${esc(novel.title || '')}</td>
+    <td class="col-author">${esc(novel.author || '')}</td>
+    <td class="col-site">${esc(novel.sitename || '')}</td>
+    <td class="col-tags">${renderTags(novel.tags || [])}</td>
+    <td class="col-status">${renderStatus(novel)}</td>
+  `;
+
+  return tr;
+}
+
+function toggleSelect(id) {
+  const key = String(id);
+  if (State.selectedIds.has(key)) {
+    State.selectedIds.delete(key);
+  } else {
+    State.selectedIds.add(key);
   }
 
-  syncSelectionUi();
+  const row = El.novelListBody?.querySelector(`tr[data-id="${id}"]`);
+  if (row) row.classList.toggle('selected', State.selectedIds.has(key));
+
+  updateSelectionBadge();
+  updateEnableSelected();
 }
 
-export function renderTags(tags) {
-  elements.tagList.innerHTML = "";
-  tags.forEach((tag) => elements.tagList.appendChild(createTagElement(tag, true)));
+export function selectVisible() {
+  const rows = El.novelListBody?.querySelectorAll('tr[data-id]') || [];
+  for (const row of rows) {
+    State.selectedIds.add(row.dataset.id);
+    row.classList.add('selected');
+  }
+  updateSelectionBadge();
+  updateEnableSelected();
 }
 
-export function updateQueueUi(queue) {
-  const pending = queue.pending || 0;
-  const completed = queue.completed || 0;
-  const failed = queue.failed || 0;
-
-  elements.queuePending.textContent = pending;
-  elements.queueCompleted.textContent = completed;
-  elements.queueFailed.textContent = failed;
-  elements.queuePendingDetail.textContent = pending;
-  elements.queueCompletedDetail.textContent = completed;
-  elements.queueFailedDetail.textContent = failed;
+export function selectAll() {
+  for (const n of State.novels) {
+    State.selectedIds.add(String(n.id));
+  }
+  renderNovelList();
 }
 
-export function appendEvent(level, message) {
-  const entry = document.createElement("div");
-  entry.className = "event-entry";
-  const now = new Date().toLocaleTimeString("ja-JP", { hour12: false });
-  entry.innerHTML = `<strong>[${escapeHtml(String(level).toUpperCase())}]</strong> ${escapeHtml(now)} ${escapeHtml(message || "")}`;
-  elements.eventLog.appendChild(entry);
-  elements.eventLog.scrollTop = elements.eventLog.scrollHeight;
+export function clearSelection() {
+  State.selectedIds.clear();
+  renderNovelList();
+}
 
-  state.eventCount += 1;
-  if (state.eventCount > 300 && elements.eventLog.firstChild) {
-    elements.eventLog.removeChild(elements.eventLog.firstChild);
-    state.eventCount -= 1;
+function updateSelectionBadge() {
+  if (El.badgeSelecting) {
+    const count = State.selectedIds.size;
+    El.badgeSelecting.textContent = count > 0 ? String(count) : '0';
   }
 }
 
-export function clearConsole() {
-  elements.eventLog.innerHTML = "";
-  state.eventCount = 0;
+function updateEnableSelected() {
+  const hasSelection = State.selectedIds.size > 0;
+  document.querySelectorAll('.enable-selected').forEach(el => {
+    el.classList.toggle('active', hasSelection);
+  });
 }
 
-function createStatusBadge(novel) {
-  const badge = document.createElement("span");
-  badge.className = "status-badge";
-  const labels = [];
-
-  if (novel.frozen) {
-    badge.classList.add("frozen");
-    labels.push(t("statusFrozen"));
-  }
-  if (novel.end) {
-    badge.classList.add("end");
-    labels.push(t("statusEnd"));
-  }
-  if (labels.length === 0) {
-    labels.push(t("statusActive"));
-  }
-
-  badge.textContent = labels.join(" / ");
-  return badge;
+function renderTags(tags) {
+  return tags.map(tag => {
+    const colorName = State.tagColors[tag] || 'default';
+    const cls = TAG_COLOR_MAP[colorName] || 'tag-default';
+    return `<span class="tag-label ${cls}" data-tag="${esc(tag)}">${esc(tag)}</span>`;
+  }).join('');
 }
 
-function createActionButton(label, action, id) {
-  const button = document.createElement("button");
-  button.className = "row-action";
-  button.type = "button";
-  button.dataset.action = action;
-  button.dataset.id = String(id);
-  button.textContent = label;
-  return button;
-}
-
-function createTagElement(tag, clickable = false) {
-  const element = document.createElement(clickable ? "button" : "span");
-  element.className = clickable ? "tag-link" : "tag-pill";
-  element.textContent = tag;
-  if (clickable) {
-    element.type = "button";
-    element.dataset.filterTag = tag;
+function renderStatus(novel) {
+  const parts = [];
+  if (novel.new_arrival_date) {
+    parts.push(`<span class="status-new">${t('statusNew')}</span>`);
   }
-  return element;
+  if (novel.new_update_date) {
+    parts.push(`<span class="status-updated">${t('statusUpdated')}</span>`);
+  }
+  if (novel.general_lastup) {
+    const badge = getTimeBadge(novel.general_lastup);
+    if (badge) parts.push(badge);
+  }
+  return parts.join(' ');
 }
 
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
+function getTimeBadge(dateStr) {
+  if (!dateStr) return '';
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return '';
+  const diffMs = Date.now() - d.getTime();
+  const hours = diffMs / (1000 * 60 * 60);
+
+  if (hours < 1) return '<span class="gl-badge gl-1h">1h</span>';
+  if (hours < 6) return '<span class="gl-badge gl-6h">6h</span>';
+  if (hours < 24) return '<span class="gl-badge gl-24h">24h</span>';
+  if (hours < 72) return '<span class="gl-badge gl-3d">3d</span>';
+  if (hours < 168) return '<span class="gl-badge gl-1w">1w</span>';
+  return '';
+}
+
+function formatDate(dateStr) {
+  if (!dateStr) return '';
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return dateStr;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  const h = String(d.getHours()).padStart(2, '0');
+  const min = String(d.getMinutes()).padStart(2, '0');
+  return `${y}/${m}/${day} ${h}:${min}`;
+}
+
+function esc(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+/**
+ * Render tag list in navbar dropdown
+ */
+export function renderTagList() {
+  const canvas = El.tagListCanvas;
+  if (!canvas) return;
+  canvas.textContent = '';
+
+  for (const tag of State.tags) {
+    const colorName = State.tagColors[tag] || 'default';
+    const cls = TAG_COLOR_MAP[colorName] || 'tag-default';
+    const span = document.createElement('span');
+    span.className = `tag-label ${cls}`;
+    span.textContent = tag;
+    span.dataset.tag = tag;
+    span.addEventListener('click', () => {
+      State.filterText = tag;
+      if (El.filterInput) El.filterInput.value = tag;
+      if (El.filterClear) El.filterClear.classList.remove('hide');
+      renderNovelList();
+    });
+    canvas.appendChild(span);
+  }
+}
+
+/**
+ * Update the queue display
+ */
+export function renderQueueStatus() {
+  const qs = State.queueStatus;
+  if (El.queueCount) {
+    El.queueCount.textContent = String(qs.pending || 0);
+  }
+  const pending = document.getElementById('queue-pending-detail');
+  const completed = document.getElementById('queue-completed-detail');
+  const failed = document.getElementById('queue-failed-detail');
+  if (pending) pending.textContent = String(qs.pending || 0);
+  if (completed) completed.textContent = String(qs.completed || 0);
+  if (failed) failed.textContent = String(qs.failed || 0);
 }

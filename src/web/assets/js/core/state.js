@@ -1,54 +1,44 @@
-export const state = {
-  config: null,
-  devices: [],
+/**
+ * Application state management
+ */
+export const State = {
   novels: [],
-  selected: new Set(),
-  search: "",
-  sortColumn: 0,
-  sortDir: "asc",
-  queue: { pending: 0, completed: 0, failed: 0 },
+  selectedIds: new Set(),
+  frozenIds: new Set(),
+  tags: [],
+  tagColors: {},
+  queueStatus: { pending: 0, completed: 0, failed: 0 },
+  filterText: '',
+  viewMode: 'nonfrozen',
+  sortCol: 1,
+  sortAsc: false,
+  wideMode: false,
+  consoleExpanded: false,
   performanceMode: false,
-  eventCount: 0,
-  pollTimer: null,
-  language: "ja",
+  wsPort: null,
+  theme: 'default',
+  reloadTiming: 600,
+  language: localStorage.getItem('narou-rs-webui-language') || 'ja',
 };
 
-export const elements = {};
+/** Cached DOM elements */
+export const El = {};
 
-export function cacheElements() {
-  elements.searchInput = document.getElementById("search-input");
-  elements.novelsTbody = document.getElementById("novels-tbody");
-  elements.selectAll = document.getElementById("select-all");
-  elements.selectedCount = document.getElementById("selected-count");
-  elements.queuePending = document.getElementById("queue-pending");
-  elements.queueCompleted = document.getElementById("queue-completed");
-  elements.queueFailed = document.getElementById("queue-failed");
-  elements.queuePendingDetail = document.getElementById("queue-pending-detail");
-  elements.queueCompletedDetail = document.getElementById("queue-completed-detail");
-  elements.queueFailedDetail = document.getElementById("queue-failed-detail");
-  elements.eventLog = document.getElementById("event-log");
-  elements.notepad = document.getElementById("notepad");
-  elements.tagList = document.getElementById("tag-list");
-  elements.rowTemplate = document.getElementById("novel-row-template");
-  elements.langJa = document.getElementById("lang-ja");
-  elements.langEn = document.getElementById("lang-en");
-}
+const ELEMENT_IDS = [
+  'header-navbar', 'navbar-toggle-btn', 'navbar-collapse',
+  'badge-selecting', 'queue-count', 'queue-display',
+  'filter-input', 'filter-clear',
+  'console', 'console-trash', 'console-expand',
+  'novel-list-body',
+  'notepad-modal', 'notepad', 'notepad-close', 'save-notepad-button',
+  'queue-modal', 'queue-modal-close', 'queue-pending-detail',
+  'queue-completed-detail', 'queue-failed-detail', 'queue-clear-button',
+  'tag-list-canvas',
+];
 
-export function selectedIds() {
-  return Array.from(state.selected.values()).sort((left, right) => left - right);
-}
-
-export function pruneSelection() {
-  const visibleIds = new Set(state.novels.map((novel) => novel.id));
-  for (const id of Array.from(state.selected.values())) {
-    if (!visibleIds.has(id)) {
-      state.selected.delete(id);
-    }
+export function initElements() {
+  for (const id of ELEMENT_IDS) {
+    const key = id.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+    El[key] = document.getElementById(id);
   }
-}
-
-export function syncSelectionUi() {
-  elements.selectedCount.textContent = String(state.selected.size);
-  const selectableCount = state.novels.length;
-  elements.selectAll.checked = selectableCount > 0 && state.selected.size === selectableCount;
 }

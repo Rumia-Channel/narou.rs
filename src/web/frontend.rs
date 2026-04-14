@@ -45,6 +45,10 @@ pub async fn asset(Path(path): Path<String>) -> Response {
             "application/javascript; charset=utf-8",
             include_str!("assets/js/ui/actions.js"),
         ),
+        "js/ui/dropdown.js" => (
+            "application/javascript; charset=utf-8",
+            include_str!("assets/js/ui/dropdown.js"),
+        ),
         _ => {
             return (
                 StatusCode::NOT_FOUND,

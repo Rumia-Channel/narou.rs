@@ -1,37 +1,77 @@
-* {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
 }
 
-html,
-body {
-  margin: 0;
-  min-height: 100%;
-  background: var(--bg);
-  color: var(--text);
-  font-family: "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif;
-  font-size: var(--font-md);
-  line-height: var(--line-base);
+html {
+  font-size: var(--base-font-size);
+  -webkit-tap-highlight-color: rgba(0, 0, 0, 0);
 }
 
-body.performance-mode * {
+body {
+  margin: 0;
+  padding-top: var(--navbar-height);
+  font-family: "Helvetica Neue", Helvetica, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", Arial, sans-serif;
+  font-size: var(--base-font-size);
+  line-height: var(--base-line-height);
+  color: var(--text-color);
+  background-color: var(--body-bg);
+  overflow-y: scroll;
+}
+
+body.performance-mode *,
+body.performance-mode *::before,
+body.performance-mode *::after {
   transition: none !important;
+  animation: none !important;
+}
+
+a {
+  color: var(--link-color);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
 }
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
+  margin: 0;
 }
 
 button {
   cursor: pointer;
 }
 
-a {
-  color: inherit;
+h1, h2, h3, h4, h5, h6 {
+  margin-top: 0;
+  margin-bottom: 0.7em;
+  font-weight: 500;
 }
 
-h2 {
+p {
+  margin: 0 0 0.7em;
+}
+
+dl, dd {
   margin: 0;
-  font-size: var(--font-md);
+}
+
+ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.hide {
+  display: none !important;
+}
+
+.text-muted {
+  color: var(--text-muted);
 }
