@@ -158,7 +158,11 @@ fn get_scope_of_variable_name(name: &str) -> Option<Scope> {
     if vars.global.iter().any(|(n, _)| *n == name) {
         return Some(Scope::Global);
     }
-    if is_known_original_setting_name(name) {
+    if name
+        .strip_prefix("default.")
+        .or_else(|| name.strip_prefix("force."))
+        .is_some_and(|rest| original_setting_var_info(rest).is_some())
+    {
         return Some(Scope::Local);
     }
     if is_known_default_arg_name(name) {
@@ -167,64 +171,20 @@ fn get_scope_of_variable_name(name: &str) -> Option<Scope> {
     None
 }
 
-const ORIGINAL_SETTING_NAMES: &[&str] = &[
-    "enable_yokogaki",
-    "enable_inspect",
-    "enable_convert_num_to_kanji",
-    "enable_kanji_num_with_units",
-    "kanji_num_with_units_lower_digit_zero",
-    "enable_alphabet_force_zenkaku",
-    "disable_alphabet_word_to_zenkaku",
-    "enable_half_indent_bracket",
-    "enable_auto_indent",
-    "enable_force_indent",
-    "enable_auto_join_in_brackets",
-    "enable_auto_join_line",
-    "enable_enchant_midashi",
-    "enable_author_comments",
-    "enable_erase_introduction",
-    "enable_erase_postscript",
-    "enable_ruby",
-    "enable_illust",
-    "enable_transform_fraction",
-    "enable_transform_date",
-    "date_format",
-    "enable_convert_horizontal_ellipsis",
-    "enable_convert_page_break",
-    "to_page_break_threshold",
-    "enable_dakuten_font",
-    "enable_display_end_of_book",
-    "enable_add_date_to_title",
-    "title_date_format",
-    "title_date_align",
-    "title_date_target",
-    "enable_ruby_youon_to_big",
-    "enable_pack_blank_line",
-    "enable_kana_ni_to_kanji_ni",
-    "enable_insert_word_separator",
-    "enable_insert_char_separator",
-    "enable_strip_decoration_tag",
-    "enable_add_end_to_title",
-    "enable_prolonged_sound_mark_to_dash",
-    "cut_old_subtitles",
-    "slice_size",
-    "author_comment_style",
-    "novel_author",
-    "novel_title",
-    "output_filename",
-];
-
 const DEFAULT_ARG_COMMAND_NAMES: &[&str] = &[
     "alias", "backup", "browser", "clean", "console", "convert", "csv", "diff", "download",
     "folder", "freeze", "help", "init", "inspect", "list", "log", "mail", "remove", "send",
     "setting", "tag", "trace", "update", "version", "web",
 ];
 
-fn is_known_original_setting_name(name: &str) -> bool {
-    name.strip_prefix("default.")
-        .or_else(|| name.strip_prefix("force."))
-        .is_some_and(|rest| ORIGINAL_SETTING_NAMES.contains(&rest))
-}
+const WEBUI_THEME_NAMES: &[&str] = &[
+    "Cerulean",
+    "Darkly",
+    "Readable",
+    "Slate",
+    "Superhero",
+    "United",
+];
 
 fn is_known_default_arg_name(name: &str) -> bool {
     name.strip_prefix("default_args.")
@@ -240,8 +200,8 @@ fn cast_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> 
         .strip_prefix("default.")
         .or_else(|| name.strip_prefix("force."))
     {
-        if let Some(template) = original_setting_template(rest) {
-            return cast_value_for_ini_value(&template, value_str);
+        if let Some(info) = original_setting_var_info(rest) {
+            return cast_value_for_type(info.var_type, value_str, info.select_keys.as_deref());
         }
     }
 
@@ -250,50 +210,6 @@ fn cast_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> 
     }
 
     Err(format!("{} は不明な名前です", name))
-}
-
-fn original_setting_template(name: &str) -> Option<IniValue> {
-    get_original_settings()
-        .into_iter()
-        .find(|(setting_name, _)| setting_name == name)
-        .map(|(_, value)| value)
-}
-
-fn cast_value_for_ini_value(
-    template: &IniValue,
-    value_str: &str,
-) -> Result<serde_yaml::Value, String> {
-    match template {
-        IniValue::Boolean(_) => match value_str.trim().to_ascii_lowercase().as_str() {
-            "true" => Ok(serde_yaml::Value::Bool(true)),
-            "false" => Ok(serde_yaml::Value::Bool(false)),
-            _ => Err(format!(
-                "値が {} ではありません",
-                var_type_description(VarType::Boolean).trim_end()
-            )),
-        },
-        IniValue::Integer(_) => value_str
-            .parse::<i64>()
-            .map(|i| serde_yaml::Value::Number(i.into()))
-            .map_err(|_| {
-                format!(
-                    "値が {} ではありません",
-                    var_type_description(VarType::Integer).trim_end()
-                )
-            }),
-        IniValue::Float(_) => value_str
-            .parse::<f64>()
-            .map(|f| serde_yaml::Value::Number(serde_yaml::Number::from(f)))
-            .map_err(|_| {
-                format!(
-                    "値が {} ではありません",
-                    var_type_description(VarType::Float).trim_end()
-                )
-            }),
-        IniValue::String(_) | IniValue::Null => {
-            Ok(serde_yaml::Value::String(value_str.to_string()))
-        }
-    }
 }
 
 fn cast_value_for_type(
@@ -438,14 +354,38 @@ fn sweep_dust_variable(
     deleted
 }
 
+fn print_variable_entry(name: &str, info: &VarInfo, newline_help: bool) {
+    let type_desc = var_type_description(info.var_type);
+    if newline_help {
+        println!("    {:32} {}", name, type_desc);
+        println!("      {}", info.help);
+    } else {
+        println!("    {:32} {} {}", name, type_desc, info.help);
+    }
+}
+
 fn display_variable_list(show_all: bool) {
     let vars = setting_variables();
 
     println!("Local Variable List:");
     for (name, info) in &vars.local {
         if show_all || !info.invisible {
-            let type_desc = var_type_description(info.var_type);
-            println!("    {:32} {} {}", name, type_desc, info.help);
+            print_variable_entry(name, info, false);
+        }
+    }
+    if show_all {
+        for prefix in ["default", "force"] {
+            for (name, info) in original_setting_var_infos() {
+                print_variable_entry(&format!("{}.{}", prefix, name), &info, true);
+            }
+        }
+        for cmd in DEFAULT_ARG_COMMAND_NAMES {
+            println!(
+                "    {:32} {} {} コマンドのデフォルトオプション",
+                format!("default_args.{}", cmd),
+                var_type_description(VarType::String),
+                cmd
+            );
         }
     }
 
@@ -453,27 +393,8 @@ fn display_variable_list(show_all: bool) {
     println!("Global Variable List:");
     for (name, info) in &vars.global {
         if show_all || !info.invisible {
-            let type_desc = var_type_description(info.var_type);
-            println!("    {:32} {} {}", name, type_desc, info.help);
+            print_variable_entry(name, info, false);
         }
-    }
-
-    println!();
-    println!("default.* 系設定 (setting.ini 未設定時のデフォルト値):");
-    for setting_name in ORIGINAL_SETTING_NAMES {
-        println!("    default.{}", setting_name);
-    }
-
-    println!();
-    println!("force.* 系設定 (全小説に強制適用):");
-    for setting_name in ORIGINAL_SETTING_NAMES {
-        println!("    force.{}", setting_name);
-    }
-
-    println!();
-    println!("default_args.* 系設定 (各コマンドのデフォルトオプション):");
-    for cmd in DEFAULT_ARG_COMMAND_NAMES {
-        println!("    default_args.{}", cmd);
     }
 }
 
@@ -882,6 +803,305 @@ impl SettingVariables {
     }
 }
 
+fn original_setting_var_infos() -> Vec<(&'static str, VarInfo)> {
+    let info = |vt: VarType, help: &'static str| VarInfo {
+        var_type: vt,
+        help,
+        invisible: true,
+        select_keys: None,
+    };
+    let select = |help: &'static str, keys: Vec<&'static str>| VarInfo {
+        var_type: VarType::Select,
+        help,
+        invisible: true,
+        select_keys: Some(keys.iter().map(|s| s.to_string()).collect()),
+    };
+
+    vec![
+        ("enable_yokogaki", info(VarType::Boolean, "横書きにする")),
+        (
+            "enable_inspect",
+            info(
+                VarType::Boolean,
+                "小説に対する各種調査を実行する。結果を表示するには narou inspect コマンドを使用",
+            ),
+        ),
+        (
+            "enable_convert_num_to_kanji",
+            info(VarType::Boolean, "数字の漢数字変換を有効にする"),
+        ),
+        (
+            "enable_kanji_num_with_units",
+            info(VarType::Boolean, "漢数字変換した場合、千・万などに変換する"),
+        ),
+        (
+            "kanji_num_with_units_lower_digit_zero",
+            info(
+                VarType::Integer,
+                "〇(ゼロ)が最低この数字以上付いてないと千・万などをつける対象にしない",
+            ),
+        ),
+        (
+            "enable_alphabet_force_zenkaku",
+            info(
+                VarType::Boolean,
+                "アルファベットを強制的に全角にする。false の場合は英文は半角、8文字未満の英単語は全角になる",
+            ),
+        ),
+        (
+            "disable_alphabet_word_to_zenkaku",
+            info(
+                VarType::Boolean,
+                "enable_alphabet_force_zenkaku が false の場合に、8文字未満の英単語を全角にする機能を抑制する。英文中にルビがふってあり、英文ではなく英単語と認識されて全角化されてしまう場合などに使用",
+            ),
+        ),
+        (
+            "enable_half_indent_bracket",
+            info(VarType::Boolean, "行頭かぎ括弧に二分アキを挿入する"),
+        ),
+        (
+            "enable_auto_indent",
+            info(
+                VarType::Boolean,
+                "自動行頭字下げ機能。行頭字下げが行われているかを判断し、適切に行頭字下げをするか",
+            ),
+        ),
+        (
+            "enable_force_indent",
+            info(
+                VarType::Boolean,
+                "行頭字下げを必ず行うか。enable_auto_indent の設定は無視される",
+            ),
+        ),
+        (
+            "enable_auto_join_in_brackets",
+            info(
+                VarType::Boolean,
+                "かぎ括弧内自動連結を有効にする\n例)\n「～～～！\n　＊＊＊？」  → 「～～～！　＊＊＊？」",
+            ),
+        ),
+        (
+            "enable_auto_join_line",
+            info(
+                VarType::Boolean,
+                "行末が読点で終わっている部分を出来るだけ連結する",
+            ),
+        ),
+        (
+            "enable_enchant_midashi",
+            info(
+                VarType::Boolean,
+                "［＃改ページ］直後の行に中見出しを付与する（テキストファイルを直接変換する場合のみの設定）",
+            ),
+        ),
+        (
+            "enable_author_comments",
+            info(
+                VarType::Boolean,
+                "作者コメントを検出する（テキストファイルを直接変換する場合のみの設定）",
+            ),
+        ),
+        (
+            "enable_erase_introduction",
+            info(VarType::Boolean, "前書きを削除する"),
+        ),
+        (
+            "enable_erase_postscript",
+            info(VarType::Boolean, "後書きを削除する"),
+        ),
+        (
+            "enable_ruby",
+            info(VarType::Boolean, "ルビ処理を有効にする"),
+        ),
+        (
+            "enable_illust",
+            info(VarType::Boolean, "挿絵タグを有効にする（false なら削除）"),
+        ),
+        (
+            "enable_transform_fraction",
+            info(
+                VarType::Boolean,
+                "○／×表記を×分の○表記に変換する。日付表記(10/23)と誤爆しやすいので注意",
+            ),
+        ),
+        (
+            "enable_transform_date",
+            info(
+                VarType::Boolean,
+                "日付表記(20yy/mm/dd)を任意の形式(date_formatで指定)に変換する",
+            ),
+        ),
+        (
+            "date_format",
+            info(VarType::String, "書式は http://bit.ly/date_format を参考"),
+        ),
+        (
+            "enable_convert_horizontal_ellipsis",
+            info(
+                VarType::Boolean,
+                "中黒(・)を並べて三点リーダーもどきにしているのを三点リーダーに変換する",
+            ),
+        ),
+        (
+            "enable_convert_page_break",
+            info(
+                VarType::Boolean,
+                "`to_page_break_threshold` で設定した個数以上連続する空行を改ページに変換する",
+            ),
+        ),
+        (
+            "to_page_break_threshold",
+            info(
+                VarType::Integer,
+                "ここで設定した値が `enable_convert_page_break` に反映される",
+            ),
+        ),
+        (
+            "enable_dakuten_font",
+            info(
+                VarType::Boolean,
+                "濁点表現をNarou.rbで処理する(濁点フォントを使用する)。false の場合はAozoraEpub3に任せる",
+            ),
+        ),
+        (
+            "enable_display_end_of_book",
+            info(VarType::Boolean, "小説の最後に本を読み終わった表示をする"),
+        ),
+        (
+            "enable_add_date_to_title",
+            info(
+                VarType::Boolean,
+                "変換後の小説のタイトルに最新話掲載日や更新日等の日付を付加する",
+            ),
+        ),
+        (
+            "title_date_format",
+            info(
+                VarType::String,
+                "enable_add_date_to_title で付与する日付のフォーマット。書式は http://bit.ly/date_format を参照。\nNarou.rb専用の書式として下記のものも使用可能。\n$t 小説のタイトル($tを使った場合はtitle_date_alignは無視される)\n$s 2045年までの残り時間(10分単位の4桁の36進数)\n$ns 小説が掲載されているサイト名\n$nt 小説種別（短編 or 連載）\n$ntag 小説のタグをカンマ区切りにしたもの",
+            ),
+        ),
+        (
+            "title_date_align",
+            select(
+                "enable_add_date_to_title が有効な場合に付与される日付の位置。left(タイトルの前) か right(タイトルの後)。title_date_format で $t を使用した場合この設定は無視される",
+                vec!["left", "right"],
+            ),
+        ),
+        (
+            "title_date_target",
+            select(
+                "enable_add_date_to_title で付与する日付の種類。\ngeneral_lastup(最新話掲載日),last_update(更新日),new_arrivals_date(新着を確認した日),convert(変換した日)",
+                vec![
+                    "general_lastup",
+                    "last_update",
+                    "new_arrivals_date",
+                    "convert",
+                ],
+            ),
+        ),
+        (
+            "enable_ruby_youon_to_big",
+            info(
+                VarType::Boolean,
+                "ルビの拗音(ぁ、ぃ等)を商業書籍のように大きくする",
+            ),
+        ),
+        (
+            "enable_pack_blank_line",
+            info(VarType::Boolean, "縦書きで読みやすいように空行を減らす"),
+        ),
+        (
+            "enable_kana_ni_to_kanji_ni",
+            info(
+                VarType::Boolean,
+                "漢字の二と間違えてカタカナのニを使っていそうなのを、漢字に直す",
+            ),
+        ),
+        (
+            "enable_insert_word_separator",
+            info(
+                VarType::Boolean,
+                "単語選択がしやすいように単語単位の区切りデータを挿入する（Kindle専用）※Kindle ファームウェア 5.9.6.1 から MOBI ファイルでも単語選択が可能になったので、この機能を使う必要がなくなりました",
+            ),
+        ),
+        (
+            "enable_insert_char_separator",
+            info(
+                VarType::Boolean,
+                "文字選択がしやすいように１文字ずつ区切りデータを挿入する（Kindle専用。enable_insert_word_separator が有効な場合無この設定は無視される）※Kindle ファームウェア 5.9.6.1 から MOBI ファイルでも単語選択が可能になったので、この機能を使う必要がなくなりました",
+            ),
+        ),
+        (
+            "enable_strip_decoration_tag",
+            info(
+                VarType::Boolean,
+                "HTMLの装飾系タグを削除する（主にArcadiaの作品に影響）",
+            ),
+        ),
+        (
+            "enable_add_end_to_title",
+            info(VarType::Boolean, "完結済み小説のタイトルに(完結)と表示する"),
+        ),
+        (
+            "enable_prolonged_sound_mark_to_dash",
+            info(
+                VarType::Boolean,
+                "長音記号を２つ以上つなげている場合に全角ダッシュに置換する",
+            ),
+        ),
+        (
+            "cut_old_subtitles",
+            info(
+                VarType::Integer,
+                "１話目から指定した話数分、変換の対象外にする。全話数分以上の数値を指定した場合、最新話だけ変換する",
+            ),
+        ),
+        (
+            "slice_size",
+            info(
+                VarType::Integer,
+                "小説が指定した話数より多い場合、指定した話数ごとに分割する。cut_old_subtitlesで処理した後の話数を対象に処理する",
+            ),
+        ),
+        (
+            "author_comment_style",
+            select(
+                "作者コメント(前書き・後書き)の装飾方法を指定する。KoboやAdobe Digital Editionでは「CSSで装飾」にするとデザインが崩れるのでそれ以外を推奨。css:CSSで装飾、simple:シンプルに段落、plain:装飾しない",
+                vec!["css", "simple", "plain"],
+            ),
+        ),
+        (
+            "novel_author",
+            info(
+                VarType::String,
+                "小説の著者名を変更する。作品内著者名及び出力ファイル名に影響する",
+            ),
+        ),
+        (
+            "novel_title",
+            info(
+                VarType::String,
+                "小説のタイトルを変更する。作品内タイトル及び出力ファイル名に影響する",
+            ),
+        ),
+        (
+            "output_filename",
+            info(
+                VarType::String,
+                "出力ファイル名を任意の文字列に変更する。convert.filename-to-ncode の設定よりも優先される。※拡張子を含めないで下さい",
+            ),
+        ),
+    ]
+}
+
+fn original_setting_var_info(name: &str) -> Option<VarInfo> {
+    original_setting_var_infos()
+        .into_iter()
+        .find(|(setting_name, _)| *setting_name == name)
+        .map(|(_, info)| info)
+}
+
 fn setting_variables() -> SettingVariables {
     let vis = |vt: VarType, help: &'static str| VarInfo {
         var_type: vt,
@@ -1198,7 +1418,10 @@ fn setting_variables() -> SettingVariables {
                 "User-Agent 設定\n未指定時 Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             ),
         ),
-        ("webui.theme", invis(VarType::Select, "WEB UI 用テーマ選択")),
+        (
+            "webui.theme",
+            invis_sel("WEB UI 用テーマ選択", WEBUI_THEME_NAMES.to_vec()),
+        ),
         (
             "webui.table.reload-timing",
             invis_sel(
@@ -1327,5 +1550,9 @@ mod tests {
         assert!(cast_value("default.not_exists", "true").is_err());
         assert!(cast_value("webui.table.reload-timing", "invalid").is_err());
         assert!(cast_value("webui.table.reload-timing", "every").is_ok());
+        assert!(cast_value("webui.theme", "unknown").is_err());
+        assert!(cast_value("webui.theme", "Cerulean").is_ok());
+        assert!(cast_value("default.title_date_align", "middle").is_err());
+        assert!(cast_value("default.title_date_align", "left").is_ok());
     }
 }

@@ -89,7 +89,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
 | `remove` | ✅ | ✅ 完了 | `--yes`, `--with-file`, `--all-ss`、確認、freeze/lock チェックを実装 |
 | `web` | ✅ | 🟡 部分 | APIのみ。HTML UIなし |
-| `setting` | ✅ | 🟡 部分 | 基本読み書きは実装済み。default/force/default_args の既知名検証や select 値検証も追加済み。hidden 項目・original setting help 網羅が残る |
+| `setting` | ✅ | ✅ 完了 | 基本読み書き、`--burn`、dynamic `default/force/default_args`、hidden select 値検証、`setting -a` の全変数一覧まで Ruby 互換に揃えた |
 | `diff` | ✅ | ✅ 完了 | 外部 diff ツール、raw データ管理 |
 | `send` | ✅ | ✅ 完了 | Kindle/Kobo/Reader 送信、`--without-freeze`、栞 backup/restore、hotentry を実装 |
 | `mail` | ✅ | 🟡 部分 | `mail_setting.yaml` bootstrap / 不完全設定 path 表示 / spinner / hotentry / `last_mail_date` 差分送信まで実装。Pony 互換と割り込み周辺の最終確認が残る |
@@ -273,7 +273,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 
 ---
 
-### 6. `setting` — 🟡 部分
+### 6. `setting` — ✅ 完了
 
 > 各コマンドの設定を変更します
 
@@ -347,20 +347,17 @@ narou setting name         # 読み取り
 - 設定値のバリデーション (型チェック、選択肢チェック、boolean の true/false 厳密化)
 - `default.*` / `force.*` / `default_args.*` は既知の original setting / command 名だけ受理し、未知名を拒否
 - `default_args.trace` / `default_args.console` を含む Ruby 由来の command 名を受理
-- `webui.table.reload-timing` など hidden select 項目でも選択肢チェックを実施
+- `webui.table.reload-timing` / `webui.theme` など hidden select 項目でも選択肢チェックを実施
 - `--list` 現在値一覧表示
 - `--all` 全変数表示
+- `setting -a` では hidden 項目に加え、`default.*` / `force.*` / `default_args.*` を型・説明付きで Local Variable List に列挙
 - `--burn` による setting.ini への焼き込み
 - `--burn` の確認プロンプトと tag ターゲット展開
 - `name` 読み取り、`name=value` 設定、`name=` 削除
 - 不明変数名のエラー、古い変数の掃除削除
 - エラー数を終了コードとして返す
 - `apply_force_and_default_settings` で変換時の `force.*/default.*` をフラットキーから正しく解決
-- `device` 変更時の関連設定の自動反映（Ruby版 hook の一部）
-
-**完了扱いにしない理由 / 不足動作**:
-- Ruby版 `SETTING_VARIABLES` との全項目突合が未完。特に `default.*` / `force.*` 側の help・select summary の完全移植と `webui.theme` 候補値の同期が残る。
-- Ruby版の device hook 群は未完全で、関連設定変更も `default.enable_half_indent_bracket` だけを再現している。
+- `device` 変更時の関連設定の自動反映（Ruby の `RELATED_VARIABLES` に合わせて `default.enable_half_indent_bracket` を変更）
 
 ---
 
