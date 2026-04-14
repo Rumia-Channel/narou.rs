@@ -297,15 +297,39 @@ pub fn send_mail(
         return Err(format!("unsupported mail via: {}", setting.via));
     }
 
+    let message = build_message(setting, id, body, attachment_path)?;
+
+    let transport = build_transport(setting)?;
+    transport.send(&message).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn build_message(
+    setting: &MailSetting,
+    id: &str,
+    body: &str,
+    attachment_path: &Path,
+) -> std::result::Result<Message, String> {
     let from = parse_mailbox(&setting.from)?;
-    let to = parse_mailbox(&setting.to)?;
+    let to = parse_mailboxes(&setting.to)?;
     let attachment_name = attachment_name(id, attachment_path);
     let attachment_bytes = std::fs::read(attachment_path).map_err(|e| e.to_string())?;
 
-    let message = Message::builder()
-        .from(from)
-        .to(to)
-        .subject(setting.subject.clone())
+    let mut builder = Message::builder().from(from).subject(setting.subject.clone());
+    for mailbox in to {
+        builder = builder.to(mailbox);
+    }
+    for mailbox in yaml_mailboxes(setting.extras.get("reply_to"))? {
+        builder = builder.reply_to(mailbox);
+    }
+    for mailbox in yaml_mailboxes(setting.extras.get("cc"))? {
+        builder = builder.cc(mailbox);
+    }
+    for mailbox in yaml_mailboxes(setting.extras.get("bcc"))? {
+        builder = builder.bcc(mailbox);
+    }
+
+    builder
         .multipart(
             MultiPart::mixed()
                 .singlepart(SinglePart::plain(body.to_string()))
@@ -314,11 +338,7 @@ pub fn send_mail(
                     guess_attachment_content_type(attachment_path),
                 )),
         )
-        .map_err(|e| e.to_string())?;
-
-    let transport = build_transport(setting)?;
-    transport.send(&message).map_err(|e| e.to_string())?;
-    Ok(())
+        .map_err(|e| e.to_string())
 }
 
 fn send_mail_with_progress(
@@ -588,6 +608,22 @@ fn parse_mailbox(raw: &str) -> std::result::Result<Mailbox, String> {
     raw.trim().parse::<Mailbox>().map_err(|e| e.to_string())
 }
 
+fn parse_mailboxes(raw: &str) -> std::result::Result<Vec<Mailbox>, String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(parse_mailbox)
+        .collect()
+}
+
+fn yaml_mailboxes(value: Option<&serde_yaml::Value>) -> std::result::Result<Vec<Mailbox>, String> {
+    let mut mailboxes = Vec::new();
+    for raw in yaml_string_list(value) {
+        mailboxes.extend(parse_mailboxes(&raw)?);
+    }
+    Ok(mailboxes)
+}
+
 fn parse_symbolic_yaml_map(
     raw: &str,
 ) -> std::result::Result<HashMap<String, serde_yaml::Value>, MailSettingLoadError> {
@@ -710,8 +746,8 @@ fn preset_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAIL_INTERRUPTED_MESSAGE, MailSetting, attachment_name, build_transport,
-        send_mail_with_progress, smtp_auth_mechanisms,
+        MAIL_INTERRUPTED_MESSAGE, MailSetting, attachment_name, build_message,
+        build_transport, send_mail_with_progress, smtp_auth_mechanisms,
     };
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
@@ -809,5 +845,48 @@ mod tests {
         };
 
         build_transport(&setting).unwrap();
+    }
+
+    #[test]
+    fn build_message_applies_reply_to_cc_and_bcc_headers() {
+        let tmp = TempDir::new().unwrap();
+        let attachment = tmp.path().join("sample.epub");
+        std::fs::write(&attachment, "dummy").unwrap();
+
+        let mut extras = HashMap::new();
+        extras.insert(
+            "reply_to".to_string(),
+            serde_yaml::Value::String("reply@example.com".to_string()),
+        );
+        extras.insert(
+            "cc".to_string(),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("cc1@example.com".to_string()),
+                serde_yaml::Value::String("cc2@example.com".to_string()),
+            ]),
+        );
+        extras.insert(
+            "bcc".to_string(),
+            serde_yaml::Value::String("bcc@example.com".to_string()),
+        );
+
+        let setting = MailSetting {
+            from: "sender@example.com".to_string(),
+            to: "to1@example.com, to2@example.com".to_string(),
+            subject: "subject".to_string(),
+            via: "smtp".to_string(),
+            via_options: HashMap::new(),
+            extras,
+        };
+
+        let message = build_message(&setting, "1", "body", &attachment).unwrap();
+        let formatted = String::from_utf8(message.formatted()).unwrap();
+
+        assert!(formatted.contains("To: to1@example.com"));
+        assert!(formatted.contains("to2@example.com"));
+        assert!(formatted.contains("Reply-To: reply@example.com"));
+        assert!(formatted.contains("Cc: cc1@example.com"));
+        assert!(formatted.contains("cc2@example.com"));
+        assert!(formatted.contains("Content-Type: application/epub+zip"));
     }
 }
