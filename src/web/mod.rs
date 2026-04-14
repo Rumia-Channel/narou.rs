@@ -6,6 +6,7 @@ pub mod novels;
 pub mod push;
 pub mod state;
 pub mod tags;
+pub mod worker;
 
 use axum::{
     Router,

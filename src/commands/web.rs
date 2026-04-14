@@ -52,6 +52,13 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
     };
     let app = web::create_router(app_state.clone());
     let ws_app = web::push::create_push_router(app_state);
+    let root_dir = match Inventory::with_default_root() {
+        Ok(inventory) => inventory.root_dir().to_path_buf(),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let addr: SocketAddr = format!("{}:{}", address.host, address.port)
         .parse()
@@ -70,9 +77,11 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let ws_listener = tokio::net::TcpListener::bind(ws_addr).await.unwrap();
+    let worker_task = web::worker::start_queue_worker(root_dir, push_server.clone());
 
     let ws_task = tokio::spawn(async move { axum::serve(ws_listener, ws_app).await });
     axum::serve(listener, app).await.unwrap();
+    worker_task.abort();
     ws_task.abort();
 }
 

@@ -188,7 +188,7 @@ pub async fn queue_clear(State(_state): State<AppState>) -> Json<ApiResponse> {
     }
 }
 
-pub(super) fn open_queue() -> Result<PersistentQueue, String> {
+pub(crate) fn open_queue() -> Result<PersistentQueue, String> {
     PersistentQueue::with_default()
         .or_else(|_| {
             let path = std::path::PathBuf::from(".narou").join("queue.yaml");

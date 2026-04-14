@@ -371,6 +371,10 @@ fn resolve_selected_devices(
         return Ok(vec![Some(narou_rs::converter::device::Device::Ibunko)]);
     }
 
+    if let Some(device) = load_web_worker_device_override() {
+        return Ok(vec![device]);
+    }
+
     let Some(raw) = narou_rs::compat::load_local_setting_string("convert.multi-device") else {
         return Ok(vec![narou_rs::compat::current_device()]);
     };
@@ -380,15 +384,7 @@ fn resolve_selected_devices(
         if name.is_empty() {
             continue;
         }
-        let parsed = match name.to_ascii_lowercase().as_str() {
-            "kindle" => Some(narou_rs::converter::device::Device::Mobi),
-            "kobo" => Some(narou_rs::converter::device::Device::Kobo),
-            "epub" => Some(narou_rs::converter::device::Device::Epub),
-            "ibunko" => Some(narou_rs::converter::device::Device::Ibunko),
-            "reader" => Some(narou_rs::converter::device::Device::Reader),
-            "ibooks" => Some(narou_rs::converter::device::Device::Ibooks),
-            _ => None,
-        };
+        let parsed = parse_device_name(name);
         if let Some(device) = parsed {
             devices.push(Some(device));
         } else {
@@ -412,6 +408,33 @@ fn resolve_selected_devices(
     }
 
     Ok(devices)
+}
+
+fn load_web_worker_device_override() -> Option<Option<narou_rs::converter::device::Device>> {
+    let raw = std::env::var("NAROU_RS_WEB_DEVICE").ok()?;
+    parse_web_worker_device_name(&raw)
+}
+
+fn parse_device_name(name: &str) -> Option<narou_rs::converter::device::Device> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "kindle" => Some(narou_rs::converter::device::Device::Mobi),
+        "kobo" => Some(narou_rs::converter::device::Device::Kobo),
+        "epub" => Some(narou_rs::converter::device::Device::Epub),
+        "ibunko" => Some(narou_rs::converter::device::Device::Ibunko),
+        "reader" => Some(narou_rs::converter::device::Device::Reader),
+        "ibooks" => Some(narou_rs::converter::device::Device::Ibooks),
+        _ => None,
+    }
+}
+
+fn parse_web_worker_device_name(
+    name: &str,
+) -> Option<Option<narou_rs::converter::device::Device>> {
+    if name.trim().eq_ignore_ascii_case("text") {
+        Some(None)
+    } else {
+        parse_device_name(name).map(Some)
+    }
 }
 
 fn effective_copy_device(
@@ -841,7 +864,8 @@ fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
 mod tests {
     use super::{
         build_output_filename, decode_text_file_as_utf8, decode_text_file_with_encoding,
-        normalize_text_file_encoding_name, split_output_name,
+        normalize_text_file_encoding_name, parse_device_name, parse_web_worker_device_name,
+        split_output_name,
     };
 
     #[test]
@@ -886,5 +910,19 @@ mod tests {
         let path = std::path::Path::new(r"C:\tmp\sample.txt");
         let decoded = decode_text_file_with_encoding(encoded.as_ref(), "sjis", path).unwrap();
         assert_eq!(decoded, "タイトル\r\n作者\r\n本文");
+    }
+
+    #[test]
+    fn parse_device_name_accepts_web_worker_device_names() {
+        assert!(matches!(
+            parse_device_name("kindle"),
+            Some(narou_rs::converter::device::Device::Mobi)
+        ));
+        assert!(parse_device_name("unknown").is_none());
+    }
+
+    #[test]
+    fn parse_web_worker_device_name_accepts_text_override() {
+        assert_eq!(parse_web_worker_device_name("text"), Some(None));
     }
 }

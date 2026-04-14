@@ -194,10 +194,12 @@ impl PersistentQueue {
     }
 
     pub fn clear(&self) -> Result<()> {
-        let mut state = self.state.lock();
-        state.jobs.clear();
-        state.completed.clear();
-        state.failed.clear();
+        {
+            let mut state = self.state.lock();
+            state.jobs.clear();
+            state.completed.clear();
+            state.failed.clear();
+        }
         self.save()
     }
 }
@@ -228,5 +230,27 @@ fn find_narou_root() -> Result<PathBuf> {
                 ".narou directory not found".to_string(),
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JobType, PersistentQueue};
+
+    #[test]
+    fn clear_saves_without_relocking_deadlock() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        queue.push(JobType::Download, "1").unwrap();
+        queue.complete("done").unwrap();
+        queue.fail("failed").unwrap();
+
+        queue.clear().unwrap();
+
+        let reloaded = PersistentQueue::new(&queue_path).unwrap();
+        assert_eq!(reloaded.pending_count(), 0);
+        assert_eq!(reloaded.completed_count(), 0);
+        assert_eq!(reloaded.failed_count(), 0);
     }
 }
