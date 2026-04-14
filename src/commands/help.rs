@@ -715,14 +715,15 @@ const ALIAS_HELP: CmdHelp = CmdHelp {
 };
 
 const INSPECT_HELP: CmdHelp = CmdHelp {
-    banner: "[<target>]",
+    banner: "[<target> ...]",
     description: "\
-  ・小説状態の調査状況ログを表示します。
-  ・対象を指定しなかった場合、最後に変換した小説が対象になります。
+  ・引数を指定しなかった場合は直前に変換した小説の状態調査状況ログを表示します
+  ・小説を指定した場合はその小説のログを表示します
+  ・narou setting convert.inspect=true とすれば変換時に常に表示されるようになります
 
   Examples:
-    narou inspect 0
-    narou inspect n9669bk",
+    narou inspect     # 直前の変換時のログを表示
+    narou inspect 6   # ログを表示したい小説を指定する",
     options: &[],
 };
 
@@ -781,25 +782,25 @@ const BACKUP_HELP: CmdHelp = CmdHelp {
 const CSV_HELP: CmdHelp = CmdHelp {
     banner: "[options]",
     description: "\
-  ・小説リストをCSV形式で出力したりインポートしたりします。
-  ・エクスポート: 全小説の情報をCSV形式で出力
-  ・インポート: CSVファイルから小説を一括ダウンロード
+  ・現在管理している小説の情報をCSV形式で出力したり、逆にインポートが出来ます
+  ・インポートするCSVファイルには最低限 url というヘッダーが必要です
 
   Examples:
-    narou csv -o list.csv
-    narou csv -i list.csv",
+    narou csv                 # CSV形式でそのまま表示
+    narou csv -o novels.csv   # novels.csv というファイル名で保存
+    narou csv -i novels.csv   # ファイルからインポート",
     options: &[
         opt(
             Some("-o"),
             "--output",
             Some("FILE"),
-            "CSVファイルの出力先を指定",
+            "指定したファイル名で保存",
         ),
         opt(
             Some("-i"),
             "--import",
             Some("FILE"),
-            "CSVファイルからインポート",
+            "指定したファイルからインポート",
         ),
     ],
 };

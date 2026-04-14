@@ -473,6 +473,15 @@ pub enum Commands {
         #[arg(short = 'a', long)]
         all: bool,
     },
+    Inspect {
+        targets: Vec<String>,
+    },
+    Csv {
+        #[arg(short = 'o', long = "output")]
+        output: Option<String>,
+        #[arg(short = 'i', long = "import")]
+        import: Option<String>,
+    },
     Log {
         path: Option<String>,
         #[arg(short = 'n', long = "num", default_value_t = 20)]

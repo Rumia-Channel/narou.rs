@@ -2,9 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use narou_rs::compat::yaml_value_to_string;
 use narou_rs::db;
-use narou_rs::db::inventory::{Inventory, InventoryScope};
 use narou_rs::db::paths::novel_dir_for_record;
 use narou_rs::downloader::persistence::load_toc_file;
 use narou_rs::downloader::{RAW_DATA_DIR, SECTION_SAVE_DIR};
@@ -37,7 +35,7 @@ fn cmd_clean_inner(
     }
 
     if targets.is_empty() {
-        let Some(target) = latest_convert_target()? else {
+        let Some(target) = super::latest_convert_target() else {
             return Ok(());
         };
         if let Some(dir) = resolve_novel_dir(&target) {
@@ -57,16 +55,6 @@ fn cmd_clean_inner(
 
     Ok(())
 }
-
-fn latest_convert_target() -> Result<Option<String>, String> {
-    let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let latest: HashMapLike = inventory
-        .load("latest_convert", InventoryScope::Local)
-        .map_err(|e| e.to_string())?;
-    Ok(latest.get("id").and_then(yaml_value_to_string))
-}
-
-type HashMapLike = std::collections::HashMap<String, serde_yaml::Value>;
 
 fn clean_all(remove: bool) -> Result<(), String> {
     let dirs = db::with_database(|db| {

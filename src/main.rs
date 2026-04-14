@@ -156,8 +156,7 @@ fn run_sync_command(
                 remove,
                 mail,
                 user_agent,
-            });
-            0
+            })
         }
         Commands::Mail { targets, force } => {
             commands::mail::cmd_mail(commands::mail::MailOptions { targets, force });
@@ -270,6 +269,10 @@ fn run_sync_command(
             dry_run,
             all,
         } => commands::clean::cmd_clean(&targets, force, dry_run, all),
+        Commands::Inspect { targets } => commands::inspect::cmd_inspect(&targets),
+        Commands::Csv { output, import } => {
+            commands::csv::cmd_csv(output.as_deref(), import.as_deref())
+        }
         Commands::Trace => match commands::trace::cmd_trace() {
             Ok(_) => 0,
             Err(e) => {

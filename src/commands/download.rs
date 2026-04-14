@@ -21,111 +21,113 @@ pub struct DownloadOptions {
     pub user_agent: Option<String>,
 }
 
-pub fn cmd_download(opts: DownloadOptions) {
-    let result = std::thread::spawn(move || {
-        if let Err(e) = narou_rs::db::init_database() {
-            eprintln!("Error initializing database: {}", e);
-            std::process::exit(1);
+pub fn cmd_download(opts: DownloadOptions) -> i32 {
+    match std::thread::spawn(move || cmd_download_inner(opts)).join() {
+        Ok(code) => code,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn cmd_download_inner(opts: DownloadOptions) -> i32 {
+    if let Err(e) = narou_rs::db::init_database() {
+        eprintln!("Error initializing database: {}", e);
+        return 1;
+    }
+
+    let mut downloader = match Downloader::with_user_agent(opts.user_agent.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error creating downloader: {}", e);
+            return 1;
         }
+    };
 
-        let mut downloader = match Downloader::with_user_agent(opts.user_agent.as_deref()) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Error creating downloader: {}", e);
-                std::process::exit(1);
-            }
-        };
+    let mut targets = opts.targets.clone();
 
-        let mut targets = opts.targets.clone();
-
+    if targets.is_empty() {
+        targets = interactive_mode(&downloader);
         if targets.is_empty() {
-            targets = interactive_mode(&downloader);
-            if targets.is_empty() {
-                return;
+            return 0;
+        }
+    }
+
+    targets = tagname_to_ids(&targets);
+
+    let multi = CliProgress::multi();
+    let multi_clone = multi.clone();
+    let mut mistook = 0usize;
+
+    for (i, target) in targets.iter().enumerate() {
+        if i > 0 {
+            let _ = multi_clone.println(format!("{}", "\u{2500}".repeat(35)));
+        }
+
+        let data = get_data_by_target(target);
+
+        if is_novel_frozen(target) {
+            if let Some(ref rec) = data {
+                let _ = multi_clone.println(format!(
+                    "{} は凍結中です\nダウンロードを中止しました",
+                    rec.title
+                ));
+            }
+            mistook += 1;
+            continue;
+        }
+
+        if !opts.force {
+            if let Some(ref rec) = data {
+                if has_novel_data_dir(target) {
+                    let _ = multi_clone.println(format!(
+                        "{} はダウンロード済みです。\nID: {}\ntitle: {}",
+                        target, rec.id, rec.title
+                    ));
+                    mistook += 1;
+                    continue;
+                }
             }
         }
 
-        targets = tagname_to_ids(&targets);
+        let progress = CliProgress::with_multi(&format!("DL {}", target), multi_clone.clone());
+        downloader.set_progress(Box::new(progress));
 
-        let multi = CliProgress::multi();
-        let multi_clone = multi.clone();
-        let mut mistook = 0usize;
+        match downloader.download_novel_with_force(target, opts.force) {
+            Ok(dl) => {
+                print_download_status(&multi_clone, &dl);
 
-        for (i, target) in targets.iter().enumerate() {
-            if i > 0 {
-                let _ = multi_clone.println(format!("{}", "\u{2500}".repeat(35)));
-            }
-
-            let data = get_data_by_target(target);
-
-            if is_novel_frozen(target) {
-                if let Some(ref rec) = data {
-                    let _ = multi_clone.println(format!(
-                        "{} は凍結中です\nダウンロードを中止しました",
-                        rec.title
-                    ));
-                }
-                mistook += 1;
-                continue;
-            }
-
-            if !opts.force {
-                if let Some(ref rec) = data {
-                    if has_novel_data_dir(target) {
-                        let _ = multi_clone.println(format!(
-                            "{} はダウンロード済みです。\nID: {}\ntitle: {}",
-                            target, rec.id, rec.title
-                        ));
+                match dl.status {
+                    UpdateStatus::Ok => {}
+                    UpdateStatus::None | UpdateStatus::Failed | UpdateStatus::Canceled => {
                         mistook += 1;
                         continue;
                     }
                 }
-            }
 
-            let progress = CliProgress::with_multi(&format!("DL {}", target), multi_clone.clone());
-            downloader.set_progress(Box::new(progress));
-
-            match downloader.download_novel_with_force(target, opts.force) {
-                Ok(dl) => {
-                    print_download_status(&multi_clone, &dl);
-
-                    match dl.status {
-                        UpdateStatus::Ok => {}
-                        UpdateStatus::None | UpdateStatus::Failed | UpdateStatus::Canceled => {
-                            mistook += 1;
-                            continue;
-                        }
+                if opts.no_convert {
+                    after_process(&multi_clone, target, &opts);
+                } else {
+                    if let Err(e) = auto_convert(&multi_clone, &dl) {
+                        let _ = multi_clone.println(format!("  Convert error: {}", e));
                     }
-
-                    if opts.no_convert {
-                        after_process(&multi_clone, target, &opts);
-                    } else {
-                        if let Err(e) = auto_convert(&multi_clone, &dl) {
-                            let _ = multi_clone.println(format!("  Convert error: {}", e));
-                        }
-                        after_process(&multi_clone, target, &opts);
-                    }
-                }
-                Err(e) => {
-                    if matches!(e, narou_rs::error::NarouError::SuspendDownload(_)) {
-                        std::panic::resume_unwind(Box::new(e.to_string()));
-                    }
-                    let _ = multi_clone.println(format!("  Error: {}", e));
-                    mistook += 1;
+                    after_process(&multi_clone, target, &opts);
                 }
             }
+            Err(e) => {
+                if matches!(e, narou_rs::error::NarouError::SuspendDownload(_)) {
+                    std::panic::resume_unwind(Box::new(e.to_string()));
+                }
+                let _ = multi_clone.println(format!("  Error: {}", e));
+                mistook += 1;
+            }
         }
+    }
 
-        drop(multi);
+    drop(multi);
 
-        if mistook > 0 {
-            std::process::exit(mistook.min(127) as i32);
-        }
-    })
-    .join();
-
-    if let Err(_) = result {
-        std::process::exit(127);
+    if mistook > 0 {
+        mistook.min(127) as i32
+    } else {
+        0
     }
 }
 
