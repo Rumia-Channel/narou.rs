@@ -195,7 +195,8 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 差分更新時は Ruby版同様 `本文/cache/<timestamp>/` に旧sectionを退避し、差分が無い場合は空cacheディレクトリを削除
 - `SuspendDownload` 発生時は通常失敗ではなくバッチ全体の中断として扱うように修正
 - `auto-add-tags` 設定対応。site YAML の `tags` パターンから取得したタグをDBタグへ自動追加
-- `hotentry` / `hotentry.auto-mail` 設定のうち、hotentry の新着話収集・統合テキスト生成・device に応じた変換・`copy-to`・端末送信までは実装済み
+- `hotentry` / `hotentry.auto-mail` 設定のうち、hotentry の新着話収集・統合テキスト生成・device に応じた変換・`copy-to`・端末送信・mail までは実装済み
+- `confirm_over18?` 相当として、R18 サイトで承諾した場合は global `over18: true` を保存し、以後は再確認しない
 - ソートキーバリデーション（不正キーでエラー+終了コード127）
 - `setting update.sort-by` の select 値を Ruby版 `Narou::UPDATE_SORT_KEYS` と同期済み
 - 小説間インターバル（Ruby版 `Interval` クラス互換）
@@ -204,8 +205,6 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `--all` は Ruby版に存在しないRust独自オプションだったため削除
 
 **完了扱いにしない理由 / 不足動作**:
-- `mail hotentry` 連携（hotentry.auto-mail 含む）
-- `confirm_over18?` の global_setting 永続化は未実装で、現状は都度確認のみ
 - Ruby版の section hash cache 永続化との完全な外部互換は未確認
 - Ruby版の詳細表示・hotentry後処理・割り込み時Worker cancelなど、周辺出力/イベント処理の細部は追加突合が必要
 

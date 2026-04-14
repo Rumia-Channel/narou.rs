@@ -112,6 +112,22 @@ fn load_global_setting_bool(key: &str) -> bool {
     .unwrap_or(false)
 }
 
+fn save_global_setting_bool(key: &str, value: bool) -> Result<()> {
+    crate::db::with_database_mut(|db| {
+        let mut settings: HashMap<String, serde_yaml::Value> = db
+            .inventory()
+            .load("global_setting", crate::db::inventory::InventoryScope::Global)
+            .unwrap_or_default();
+        settings.insert(key.to_string(), serde_yaml::Value::Bool(value));
+        db.inventory().save(
+            "global_setting",
+            crate::db::inventory::InventoryScope::Global,
+            &settings,
+        )?;
+        Ok(())
+    })
+}
+
 fn section_filename(subtitle: &SubtitleInfo) -> String {
     format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle)
 }
@@ -644,6 +660,7 @@ impl Downloader {
                     sections_deleted: false,
                 });
             }
+            save_global_setting_bool("over18", true)?;
         }
 
         let info = self.load_novel_info(&setting, &toc_source, &url_captures)?;
