@@ -86,7 +86,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `convert` | ✅ | 🟡 部分 | `--device`, `--no-epub`, `--output` 等不足 |
 | `list` | ✅ | 🟡 部分 | `--latest`, `--reverse`, `--url`, `--filter` 等不足 |
 | `tag` | ✅ | 🟡 部分 | `--color`, `--clear`, `--list` 不足 |
-| `freeze` | ✅ | 🟡 部分 | 全オプションは実装済み。freeze.yaml と `frozen` タグの同期は実装済みだが、ターゲット解決のRuby完全互換は未確認 |
+| `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
 | `remove` | ✅ | ✅ 完了 | `--yes`, `--with-file`, `--all-ss`、確認、freeze/lock チェックを実装 |
 | `web` | ✅ | 🟡 部分 | APIのみ。HTML UIなし |
 | `setting` | ✅ | 🟡 部分 | 基本読み書きは実装済み。ただし default/force/default_args 系と全設定網羅に不足 |
@@ -359,7 +359,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 7. `freeze` — 🟡 部分
+### 7. `freeze` — ✅ 完了
 
 > 小説の凍結設定を行います
 
@@ -378,11 +378,8 @@ narou setting name         # 読み取り
 - 解除時に `404` タグも削除
 - 引数なし時はヘルプ表示
 - タイトル付きメッセージ: `タイトル を凍結しました` / `タイトル の凍結を解除しました`
-
-**完了扱いにしない理由 / 不足動作**:
-- Ruby版は `.narou/freeze.yaml` を凍結状態の保存先にするが、Rust版は `NovelRecord.tags` の `frozen` タグで管理しており、ファイル互換が崩れている。
-- Ruby版は `tagname_to_ids` と `Downloader.get_data_by_target` 経由で ID/Nコード/URL/タイトル/別名/タグ名を解決する。Rust版は主に ID/タイトルのみで、タグ展開や別名解決が未完。
-- `--list` も Ruby版は `List.execute!("--filter", "frozen")` 相当で freeze 状態を見るが、Rust版は tag ベースの `list --frozen` に依存している。
+- `.narou/freeze.yaml` を保存先に使い、`frozen` タグとも同期
+- `tagname_to_ids` と `Downloader.get_data_by_target` 相当で ID/Nコード/URL/タイトル/別名/タグ名を解決
 
 ---
 

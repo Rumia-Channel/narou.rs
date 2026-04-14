@@ -112,11 +112,12 @@ pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
         return;
     }
 
-    for target in targets {
-        let Some(id) = resolve_target_to_id(target) else {
+    for target in download::tagname_to_ids(targets) {
+        let Some(data) = download::get_data_by_target(&target) else {
             eprintln!("{} は存在しません", target);
             continue;
         };
+        let id = data.id;
 
         let result = db::with_database_mut(|db| {
             let mut frozen_list: std::collections::HashMap<i64, serde_yaml::Value> = db
@@ -127,7 +128,7 @@ pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
                 .cloned()
                 .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
             let title = record.title.clone();
-            let is_frozen = record.tags.contains(&"frozen".to_string());
+            let is_frozen = frozen_list.contains_key(&id);
 
             let mut updated = record;
 
@@ -251,9 +252,10 @@ pub fn cmd_remove(targets: &[String], yes: bool, with_file: bool, all_ss: bool) 
 pub fn freeze_by_target(target: &str) {
     use narou_rs::db;
 
-    let Some(id) = resolve_target_to_id(target) else {
+    let Some(data) = download::get_data_by_target(target) else {
         return;
     };
+    let id = data.id;
 
     let result = db::with_database_mut(|db| {
         let mut frozen_list: std::collections::HashMap<i64, serde_yaml::Value> = db
