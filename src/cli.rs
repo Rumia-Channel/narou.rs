@@ -450,6 +450,12 @@ pub enum Commands {
     },
     Remove {
         targets: Vec<String>,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(short = 'w', long = "with-file")]
+        with_file: bool,
+        #[arg(long = "all-ss")]
+        all_ss: bool,
     },
     Setting {
         args: Vec<String>,

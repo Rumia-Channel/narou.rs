@@ -255,15 +255,12 @@ fn run_sync_command(
             commands::manage::cmd_freeze(&targets, list, on, off);
             0
         }
-        Commands::Remove { targets } => {
-            if targets.is_empty() {
-                eprintln!("Usage: narou remove <targets>...");
-                1
-            } else {
-                commands::manage::cmd_remove(&targets);
-                0
-            }
-        }
+        Commands::Remove {
+            targets,
+            yes,
+            with_file,
+            all_ss,
+        } => commands::manage::cmd_remove(&targets, yes, with_file, all_ss),
         Commands::Setting {
             args,
             list,

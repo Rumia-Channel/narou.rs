@@ -87,7 +87,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `list` | ✅ | 🟡 部分 | `--latest`, `--reverse`, `--url`, `--filter` 等不足 |
 | `tag` | ✅ | 🟡 部分 | `--color`, `--clear`, `--list` 不足 |
 | `freeze` | ✅ | 🟡 部分 | 全オプションは実装済み。freeze.yaml と `frozen` タグの同期は実装済みだが、ターゲット解決のRuby完全互換は未確認 |
-| `remove` | ✅ | 🟡 部分 | `--yes`, `--with-file` 不足 |
+| `remove` | ✅ | ✅ 完了 | `--yes`, `--with-file`, `--all-ss`、確認、freeze/lock チェックを実装 |
 | `web` | ✅ | 🟡 部分 | APIのみ。HTML UIなし |
 | `setting` | ✅ | 🟡 部分 | 基本読み書きは実装済み。ただし default/force/default_args 系と全設定網羅に不足 |
 | `diff` | ✅ | ✅ 完了 | 外部 diff ツール、raw データ管理 |
@@ -408,24 +408,23 @@ narou setting name         # 読み取り
 
 ---
 
-### 9. `remove` — 🟡 部分
+### 9. `remove` — ✅ 完了
 
 > 小説を削除します
 
 | オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
 |-----------|------|-----|-----------|------|:----:|
-| `--yes` | `-y` | flag | false | 確認スキップ | ❌ |
-| `--with-file` | `-w` | flag | false | ファイルも削除 | ❌ (常時削除) |
-| `--all-ss` | — | flag | false | 全短編小説を対象 | ❌ |
+| `--yes` | `-y` | flag | false | 確認スキップ | ✅ |
+| `--with-file` | `-w` | flag | false | ファイルも削除 | ✅ |
+| `--all-ss` | — | flag | false | 全短編小説を対象 | ✅ |
 | targets | | Vec\<String\> | — | 対象小説 | ✅ |
 
-**不足動作**:
-- デフォルトはDB indexのみ削除 (ファイル残す)
-- `--with-file` でファイル含め完全削除
-- インタラクティブ確認プロンプト
-- 凍結中は削除不可
-- `--all-ss` で `novel_type == 2` を一括選択
-- 変換中ロックチェック
+**Rust 実装**:
+- デフォルトは Ruby版同様 DB index のみ削除し、保存フォルダは残したまま `toc.yaml` だけ削除する
+- `--with-file` で小説保存フォルダを完全削除する
+- `--yes` 未指定時は Ruby版 `Input.confirm` 相当で削除確認を出す
+- `--all-ss` で `novel_type == 2` の短編を全選択する。短編が存在しない場合は `短編小説がひとつもありません` を表示する
+- tag 展開、alias/タイトル/URL/Nコード解決、freeze.yaml ベースの凍結判定、`.narou/lock.yaml` が存在する場合の変換中チェックを実装
 
 ---
 
