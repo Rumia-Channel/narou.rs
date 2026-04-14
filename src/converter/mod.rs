@@ -507,6 +507,24 @@ impl NovelConverter {
         Ok(txt_path.display().to_string())
     }
 
+    pub fn convert_text_file_with_device(
+        &mut self,
+        text: &str,
+        device: device::Device,
+    ) -> Result<String> {
+        let txt_path = PathBuf::from(self.convert_text_file(text)?);
+        let base_name = txt_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("output");
+        let final_path = device::OutputManager::new(device).convert_file(
+            &txt_path,
+            &self.settings.archive_path,
+            base_name,
+        )?;
+        Ok(final_path.display().to_string())
+    }
+
     pub fn convert_novel_by_id(&mut self, id: i64, novel_dir: &std::path::Path) -> Result<String> {
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();

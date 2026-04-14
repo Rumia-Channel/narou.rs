@@ -153,10 +153,11 @@ impl OutputManager {
     }
 
     fn build_aozora_command(&self) -> Result<(Command, PathBuf)> {
-        let tool_path = self
-            .aozora_epub3_path
-            .as_ref()
-            .ok_or_else(|| NarouError::Conversion("AozoraEpub3 not found".into()))?;
+        let tool_path = normalize_windows_verbatim_path(
+            self.aozora_epub3_path
+                .as_ref()
+                .ok_or_else(|| NarouError::Conversion("AozoraEpub3 not found".into()))?,
+        );
 
         let working_dir = tool_path
             .parent()
@@ -166,12 +167,15 @@ impl OutputManager {
         let mut cmd = if tool_path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
             let java_path =
                 Self::find_external_tool("java").unwrap_or_else(|| PathBuf::from("java"));
+            let jar_name = tool_path
+                .file_name()
+                .ok_or_else(|| NarouError::Conversion("Invalid AozoraEpub3 path".into()))?;
             let mut cmd = Command::new(java_path);
-            cmd.arg("-cp").arg(tool_path);
+            cmd.arg("-cp").arg(jar_name);
             cmd.arg("AozoraEpub3");
             cmd
         } else {
-            Command::new(tool_path)
+            Command::new(&tool_path)
         };
 
         cmd.current_dir(&working_dir);
@@ -380,6 +384,15 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
+fn normalize_windows_verbatim_path(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if cfg!(windows) && raw.starts_with(r"\\?\") {
+        PathBuf::from(raw.trim_start_matches(r"\\?\"))
+    } else {
+        path.to_path_buf()
+    }
+}
+
 fn find_windows_volume_root(volume_name: &str) -> Option<PathBuf> {
     for letter in b'A'..=b'Z' {
         let drive = format!("{}:\\", letter as char);
@@ -425,11 +438,19 @@ fn find_unix_volume_root(volume_name: &str) -> Option<PathBuf> {
 mod tests {
     use std::path::Path;
 
-    use super::Device;
+    use super::{Device, normalize_windows_verbatim_path};
 
     #[test]
     fn kobo_matches_kepub_output_suffix() {
         assert!(Device::Kobo.matches_ebook_file(Path::new("novel.kepub.epub")));
         assert!(!Device::Kobo.matches_ebook_file(Path::new("novel.epub")));
+    }
+
+    #[test]
+    fn normalize_windows_verbatim_path_strips_prefix() {
+        assert_eq!(
+            normalize_windows_verbatim_path(Path::new(r"\\?\C:\Tools\AozoraEpub3\AozoraEpub3.jar")),
+            Path::new(r"C:\Tools\AozoraEpub3\AozoraEpub3.jar")
+        );
     }
 }

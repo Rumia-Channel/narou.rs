@@ -12,6 +12,7 @@ pub fn cmd_convert(
     targets: &[String],
     output: Option<&str>,
     encoding: Option<&str>,
+    no_epub: bool,
     inspect: bool,
     no_open: bool,
     ignore_default: bool,
@@ -26,6 +27,11 @@ pub fn cmd_convert(
     let multi_clone = multi.clone();
     let mut first_output_dir = None;
     let output_parts = output.map(split_output_name);
+    let device = if no_epub {
+        None
+    } else {
+        narou_rs::compat::current_device()
+    };
     let encoding = match normalize_text_file_encoding_name(encoding) {
         Ok(encoding) => encoding,
         Err(message) => {
@@ -33,6 +39,10 @@ pub fn cmd_convert(
             return;
         }
     };
+
+    if let Some(device) = device {
+        let _ = multi_clone.println(&format!(">> {}用に変換します", device.display_name()));
+    }
 
     for (index, target) in targets.iter().enumerate() {
         let output_filename = output_parts.as_ref().map(|(basename, ext)| {
@@ -57,6 +67,7 @@ pub fn cmd_convert(
                 inspect,
                 ignore_default,
                 ignore_force,
+                device,
                 &multi_clone,
                 &mut first_output_dir,
             );
@@ -108,7 +119,14 @@ pub fn cmd_convert(
         converter.set_progress(Box::new(progress));
         converter.set_display_inspector(inspect);
 
-        match converter.convert_novel_by_id(id, &novel_dir) {
+        let result = match device {
+            Some(device) => converter
+                .convert_novel_by_id_with_device(id, &novel_dir, device)
+                .map(|path| path.display().to_string()),
+            None => converter.convert_novel_by_id(id, &novel_dir),
+        };
+
+        match result {
             Ok(output_path) => {
                 let _ = multi_clone.println(&format!("  Output: {}", output_path));
                 if first_output_dir.is_none() {
@@ -145,6 +163,7 @@ fn convert_text_target(
     inspect: bool,
     ignore_default: bool,
     ignore_force: bool,
+    device: Option<narou_rs::converter::device::Device>,
     multi_clone: &indicatif::MultiProgress,
     first_output_dir: &mut Option<PathBuf>,
 ) {
@@ -182,7 +201,12 @@ fn convert_text_target(
         };
     converter.set_display_inspector(inspect);
 
-    match converter.convert_text_file(&text) {
+    let result = match device {
+        Some(device) => converter.convert_text_file_with_device(&text, device),
+        None => converter.convert_text_file(&text),
+    };
+
+    match result {
         Ok(output_path) => {
             let _ = multi_clone.println(&format!("  Output: {}", output_path));
             if first_output_dir.is_none() {
