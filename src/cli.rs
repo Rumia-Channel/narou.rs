@@ -291,6 +291,11 @@ fn inject_convert_defaults(args: &mut Vec<String>) {
     {
         args.insert(1, "--no-epub".to_string());
     }
+    if !has_option(args, "", "--no-mobi")
+        && load_local_setting_bool("convert.no-mobi").unwrap_or(false)
+    {
+        args.insert(1, "--no-mobi".to_string());
+    }
     if !has_option(args, "", "--no-open")
         && load_local_setting_bool("convert.no-open").unwrap_or(false)
     {
@@ -431,6 +436,40 @@ mod tests {
 
         assert_eq!(args, vec!["convert", "--no-epub", "1"]);
     }
+
+    #[test]
+    fn convert_no_mobi_is_injected_from_local_setting() {
+        let _guard = cwd_lock().lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "narou-rs-cli-no-mobi-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".narou")).unwrap();
+        let inventory = narou_rs::db::inventory::Inventory::new(root.clone());
+        let mut settings = HashMap::new();
+        settings.insert("convert.no-mobi".to_string(), serde_yaml::Value::Bool(true));
+        inventory
+            .save(
+                "local_setting",
+                narou_rs::db::inventory::InventoryScope::Local,
+                &settings,
+            )
+            .unwrap();
+
+        let current = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+
+        let mut args = vec!["convert".to_string(), "1".to_string()];
+        inject_command_defaults(&mut args);
+
+        std::env::set_current_dir(current).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+
+        assert_eq!(args, vec!["convert", "--no-mobi", "1"]);
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -510,6 +549,8 @@ pub enum Commands {
         encoding: Option<String>,
         #[arg(long = "no-epub")]
         no_epub: bool,
+        #[arg(long = "no-mobi")]
+        no_mobi: bool,
         #[arg(long = "ignore-default")]
         ignore_default: bool,
         #[arg(long = "ignore-force")]

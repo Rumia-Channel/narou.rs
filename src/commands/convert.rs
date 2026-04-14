@@ -13,6 +13,7 @@ pub fn cmd_convert(
     output: Option<&str>,
     encoding: Option<&str>,
     no_epub: bool,
+    no_mobi: bool,
     inspect: bool,
     no_open: bool,
     ignore_default: bool,
@@ -27,11 +28,8 @@ pub fn cmd_convert(
     let multi_clone = multi.clone();
     let mut first_output_dir = None;
     let output_parts = output.map(split_output_name);
-    let device = if no_epub {
-        None
-    } else {
-        narou_rs::compat::current_device()
-    };
+    let selected_device = narou_rs::compat::current_device();
+    let output_device = effective_convert_device(selected_device, no_epub, no_mobi);
     let encoding = match normalize_text_file_encoding_name(encoding) {
         Ok(encoding) => encoding,
         Err(message) => {
@@ -40,7 +38,7 @@ pub fn cmd_convert(
         }
     };
 
-    if let Some(device) = device {
+    if let Some(device) = selected_device {
         let _ = multi_clone.println(&format!(">> {}用に変換します", device.display_name()));
     }
 
@@ -67,7 +65,8 @@ pub fn cmd_convert(
                 inspect,
                 ignore_default,
                 ignore_force,
-                device,
+                output_device,
+                selected_device,
                 &multi_clone,
                 &mut first_output_dir,
             );
@@ -119,7 +118,7 @@ pub fn cmd_convert(
         converter.set_progress(Box::new(progress));
         converter.set_display_inspector(inspect);
 
-        let result = match device {
+        let result = match output_device {
             Some(device) => converter
                 .convert_novel_by_id_with_device(id, &novel_dir, device)
                 .map(|path| path.display().to_string()),
@@ -134,7 +133,9 @@ pub fn cmd_convert(
                         .parent()
                         .map(|path| path.to_path_buf());
                 }
-                if let Err(err) = print_copy_to_result(&output_path, device, id, &multi_clone) {
+                if let Err(err) =
+                    print_copy_to_result(&output_path, selected_device, id, &multi_clone)
+                {
                     let _ = multi_clone.println(&err);
                 }
                 if let Some(inspection) = converter.take_inspection_output() {
@@ -166,7 +167,8 @@ fn convert_text_target(
     inspect: bool,
     ignore_default: bool,
     ignore_force: bool,
-    device: Option<narou_rs::converter::device::Device>,
+    output_device: Option<narou_rs::converter::device::Device>,
+    copy_device: Option<narou_rs::converter::device::Device>,
     multi_clone: &indicatif::MultiProgress,
     first_output_dir: &mut Option<PathBuf>,
 ) {
@@ -204,7 +206,7 @@ fn convert_text_target(
         };
     converter.set_display_inspector(inspect);
 
-    let result = match device {
+    let result = match output_device {
         Some(device) => converter.convert_text_file_with_device(&text, device),
         None => converter.convert_text_file(&text),
     };
@@ -217,7 +219,7 @@ fn convert_text_target(
                     .parent()
                     .map(|path| path.to_path_buf());
             }
-            if let Err(err) = print_copy_to_result(&output_path, device, 0, multi_clone) {
+            if let Err(err) = print_copy_to_result(&output_path, copy_device, 0, multi_clone) {
                 let _ = multi_clone.println(&err);
             }
             print_inspection_output(&mut converter, multi_clone);
@@ -225,6 +227,22 @@ fn convert_text_target(
         Err(e) => {
             let _ = multi_clone.println(&format!("  Error: {}", e));
         }
+    }
+}
+
+fn effective_convert_device(
+    selected_device: Option<narou_rs::converter::device::Device>,
+    no_epub: bool,
+    no_mobi: bool,
+) -> Option<narou_rs::converter::device::Device> {
+    if no_epub {
+        return None;
+    }
+    match selected_device {
+        Some(narou_rs::converter::device::Device::Mobi) if no_mobi => {
+            Some(narou_rs::converter::device::Device::Epub)
+        }
+        other => other,
     }
 }
 
