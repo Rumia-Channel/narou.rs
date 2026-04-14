@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod frontend;
 pub mod jobs;
 pub mod misc;
 pub mod novel_settings;
@@ -30,10 +31,12 @@ pub struct AppState {
 pub fn create_router(state: AppState) -> Router {
     let auth_state = state.clone();
     Router::new()
-        .route("/", get(novels::index))
+        .route("/", get(frontend::index))
+        .route("/assets/{*path}", get(frontend::asset))
         .route("/api/novels/count", get(novels::novels_count))
         .route("/api/list", get(novels::api_list))
         .route("/api/version/current.json", get(misc::version_current))
+        .route("/api/webui/config", get(misc::webui_config))
         .route("/api/tag_list", get(misc::tag_list))
         .route("/api/notepad/read", get(misc::notepad_read))
         .route("/api/notepad/save", post(misc::notepad_save))

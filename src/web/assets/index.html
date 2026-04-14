@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="none">
+    <title>narou.rs WEB UI</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%232b4c7e'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='white' font-family='Arial,sans-serif'%3EN%3C/text%3E%3C/svg%3E">
+    <link rel="stylesheet" href="/assets/css/theme.css">
+    <link rel="stylesheet" href="/assets/css/base.css">
+    <link rel="stylesheet" href="/assets/css/layout.css">
+    <link rel="stylesheet" href="/assets/css/components.css">
+    <link rel="stylesheet" href="/assets/css/responsive.css">
+  </head>
+  <body>
+    <header class="navbar">
+      <div class="navbar-brand-group">
+        <div class="navbar-brand">narou.rs WEB UI</div>
+        <div class="navbar-subtitle">pure JS / pure CSS frontend</div>
+      </div>
+
+      <div class="navbar-center">
+        <div class="queue-summary">
+          <span class="queue-summary__label" data-i18n="queueLabel">Queue</span>
+          <span id="queue-pending">0</span>
+          <span>/</span>
+          <span id="queue-completed">0</span>
+          <span>/</span>
+          <span id="queue-failed">0</span>
+        </div>
+        <div class="selected-summary">
+          <span data-i18n="selectedLabel">Selected</span>
+          <span id="selected-count">0</span>
+        </div>
+      </div>
+
+      <div class="navbar-tools">
+        <label class="search-box">
+          <span data-i18n="filterLabel">Filter</span>
+          <input id="search-input" type="search" data-i18n-placeholder="filterPlaceholder" placeholder="title / author / tag">
+        </label>
+        <div class="language-toggle" role="group" aria-label="Language">
+          <button id="lang-ja" class="lang-button" type="button">JP</button>
+          <button id="lang-en" class="lang-button" type="button">EN</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="page-shell">
+      <section class="console-panel card">
+        <div class="section-header">
+          <h2 data-i18n="consoleHeading">Console</h2>
+          <button id="console-clear-button" class="button button-secondary button-small" data-i18n="clearButton">Clear</button>
+        </div>
+        <div id="event-log" class="event-log"></div>
+      </section>
+
+      <section class="control-panel card">
+        <div class="control-group">
+          <button id="refresh-button" class="button button-secondary" data-i18n="reloadButton">Reload</button>
+          <button id="download-button" class="button button-primary" data-i18n="downloadButton">Download</button>
+          <button id="update-button" class="button button-success" data-i18n="updateButton">Update</button>
+          <button id="convert-button" class="button button-success" data-i18n="convertButton">Convert</button>
+        </div>
+        <div class="control-group">
+          <button id="freeze-button" class="button button-secondary" data-i18n="freezeButton">Freeze</button>
+          <button id="unfreeze-button" class="button button-secondary" data-i18n="unfreezeButton">Unfreeze</button>
+          <button id="clear-selection-button" class="button button-secondary" data-i18n="clearButton">Clear</button>
+          <button id="remove-button" class="button button-danger" data-i18n="removeButton">Remove</button>
+        </div>
+      </section>
+
+      <div class="content-grid">
+        <section class="list-panel card">
+          <div class="table-scroll">
+            <table id="novels-table">
+              <thead>
+                <tr>
+                  <th class="checkbox-col"><input id="select-all" type="checkbox" aria-label="select all"></th>
+                  <th><button class="sort-button" data-column="0" data-i18n="columnId">ID</button></th>
+                  <th><button class="sort-button" data-column="3" data-i18n="columnTitle">Title</button></th>
+                  <th><button class="sort-button" data-column="4" data-i18n="columnAuthor">Author</button></th>
+                  <th><button class="sort-button" data-column="5" data-i18n="columnSite">Site</button></th>
+                  <th><button class="sort-button" data-column="1" data-i18n="columnUpdated">Updated</button></th>
+                  <th><button class="sort-button" data-column="2" data-i18n="columnLatest">Latest</button></th>
+                  <th data-i18n="columnTags">Tags</th>
+                  <th data-i18n="columnStatus">Status</th>
+                  <th class="actions-col" data-i18n="columnActions">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="novels-tbody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <aside class="sidebar">
+          <section class="card sidebar-card">
+            <div class="section-header">
+              <h2 data-i18n="queueHeading">Queue</h2>
+              <button id="queue-clear-button" class="button button-secondary button-small" data-i18n="clearQueueButton">Clear queue</button>
+            </div>
+            <dl class="queue-grid">
+              <dt data-i18n="queuePending">Pending</dt>
+              <dd id="queue-pending-detail">0</dd>
+              <dt data-i18n="queueCompleted">Completed</dt>
+              <dd id="queue-completed-detail">0</dd>
+              <dt data-i18n="queueFailed">Failed</dt>
+              <dd id="queue-failed-detail">0</dd>
+            </dl>
+          </section>
+
+          <section class="card sidebar-card">
+            <div class="section-header">
+              <h2 data-i18n="tagsHeading">Tags</h2>
+            </div>
+            <div id="tag-list" class="tag-list"></div>
+          </section>
+
+          <section class="card sidebar-card">
+            <div class="section-header">
+              <h2 data-i18n="notepadHeading">Notepad</h2>
+              <button id="save-notepad-button" class="button button-primary button-small" data-i18n="saveButton">Save</button>
+            </div>
+            <textarea id="notepad" class="notepad" data-i18n-placeholder="notepadPlaceholder" placeholder="メモ帳"></textarea>
+          </section>
+        </aside>
+      </div>
+    </main>
+
+    <template id="novel-row-template">
+      <tr>
+        <td class="checkbox-col"><input class="row-checkbox" type="checkbox" aria-label="select row"></td>
+        <td class="row-id"></td>
+        <td class="row-title"></td>
+        <td class="row-author"></td>
+        <td class="row-site"></td>
+        <td class="row-updated"></td>
+        <td class="row-latest"></td>
+        <td class="row-tags"></td>
+        <td class="row-status"></td>
+        <td class="row-actions"></td>
+      </tr>
+    </template>
+
+    <script type="module" src="/assets/js/main.js"></script>
+  </body>
+</html>

@@ -3,6 +3,7 @@ use axum::{
     response::Json,
 };
 
+use crate::compat::load_local_setting_string;
 use crate::db::with_database;
 use crate::version;
 
@@ -11,6 +12,22 @@ use super::state::{ApiResponse, LogsParams};
 
 pub async fn version_current(State(_state): State<AppState>) -> Json<serde_json::Value> {
     Json(version::version_json())
+}
+
+pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let theme = load_local_setting_string("webui.theme").unwrap_or_else(|| "Cerulean".to_string());
+    let performance_mode =
+        load_local_setting_string("webui.performance-mode").unwrap_or_else(|| "auto".to_string());
+    let reload_timing = load_local_setting_string("webui.table.reload-timing")
+        .unwrap_or_else(|| "every".to_string());
+
+    Json(serde_json::json!({
+        "theme": theme,
+        "performance_mode": performance_mode,
+        "reload_timing": reload_timing,
+        "ws_port": state.ws_port,
+        "port": state.port,
+    }))
 }
 
 pub async fn tag_list(State(_state): State<AppState>) -> Json<serde_json::Value> {

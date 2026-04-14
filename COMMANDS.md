@@ -88,7 +88,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションまで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
 | `remove` | ✅ | ✅ 完了 | `--yes`, `--with-file`, `--all-ss`、確認、freeze/lock チェックを実装 |
-| `web` | ✅ | 🟡 部分 | API / queue worker / auto-scheduler は実装済み。HTML UIなし |
+| `web` | ✅ | 🟡 部分 | API / queue worker / auto-scheduler に加え、pure JS / pure CSS の分割 frontend、JP/EN 切替、theme/performance/reload 設定反映までは実装済み。narou.rb との細部 parity は継続中 |
 | `setting` | ✅ | ✅ 完了 | 基本読み書き、`--burn`、dynamic `default/force/default_args`、hidden select 値検証、`setting -a` の全変数一覧まで Ruby 互換に揃えた |
 | `diff` | ✅ | ✅ 完了 | 外部 diff ツール、raw データ管理 |
 | `send` | ✅ | ✅ 完了 | Kindle/Kobo/Reader 送信、`--without-freeze`、栞 backup/restore、hotentry を実装 |
@@ -538,11 +538,16 @@ narou setting name         # 読み取り
 - `queue_clear` は deadlock しないように永続キュー保存順を修正済み
 - local `update.auto-schedule.enable` / `update.auto-schedule` が有効なら、Ruby版同様に時刻指定で自動アップデートを実行する
 - 自動アップデートは `--gl narou` → `modified` タグ対象 → その他小説の順に child `update` を実行し、`server_setting.current_sort` が有効なら対応する `--sort-by` も引き継ぐ
+- `/` では pure JS / pure CSS の分割 asset frontend を配信し、navbar / console / control panel / list + sidebar の構成で一覧操作できる
+- UI は日本語既定で、JP/EN トグルによる切替と `localStorage` 永続化に対応する
+- `webui.theme` / `webui.performance-mode` / `webui.table.reload-timing` を `/api/webui/config` 経由で反映し、CSS variable ベースの theme token と polling 挙動へ接続する
+- レスポンシブ CSS を分離し、スマートフォン幅でも一覧・キュー・メモ帳を同じ asset 構成で表示できる
+- 一覧 API の `frozen` 取得は DB 再入ロックによる deadlock を避けるよう修正済み
+- favicon は data URL で埋め込み、追加 route なしでブラウザ 404 を出さない
 
 **不足動作**:
-- HTML フロントエンド (Ruby 版は HAML テンプレート)
-- `webui.theme` 設定
-- `webui.performance-mode` 設定
+- narou.rb の HAML/UI と完全一致するレベルの細かな見た目・配置・文言差分の洗い込み
+- Web UI の各操作・表示を Ruby 版 view/helper と突き合わせた最終 parity 確認
 
 ---
 

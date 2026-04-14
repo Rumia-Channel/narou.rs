@@ -7,7 +7,7 @@ use crate::converter::NovelConverter;
 use crate::converter::device::Device;
 use crate::converter::settings::NovelSettings;
 use crate::converter::user_converter::UserConverter;
-use crate::db::inventory::InventoryScope;
+use crate::db::inventory::{Inventory, InventoryScope};
 use crate::error::{NarouError, Result};
 use unicode_normalization::UnicodeNormalization;
 
@@ -94,10 +94,13 @@ pub fn current_device() -> Option<Device> {
 
 pub fn load_frozen_ids() -> Result<HashSet<i64>> {
     crate::db::with_database(|db| {
-        let frozen: HashMap<i64, serde_yaml::Value> =
-            db.inventory().load("freeze", InventoryScope::Local)?;
-        Ok(frozen.into_keys().collect())
+        load_frozen_ids_from_inventory(db.inventory())
     })
+}
+
+pub fn load_frozen_ids_from_inventory(inventory: &Inventory) -> Result<HashSet<i64>> {
+    let frozen: HashMap<i64, serde_yaml::Value> = inventory.load("freeze", InventoryScope::Local)?;
+    Ok(frozen.into_keys().collect())
 }
 
 pub fn record_is_frozen(record: &crate::db::NovelRecord, frozen_ids: &HashSet<i64>) -> bool {
@@ -497,8 +500,9 @@ fn sanitize_backup_name(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
+    use crate::db::inventory::Inventory;
 
-    use super::{record_is_frozen, sanitize_backup_name};
+    use super::{load_frozen_ids_from_inventory, record_is_frozen, sanitize_backup_name};
     use crate::db::NovelRecord;
 
     fn sample_record(id: i64, tags: &[&str]) -> NovelRecord {
@@ -556,7 +560,24 @@ mod tests {
         frozen_ids.insert(1);
 
         assert!(record_is_frozen(&sample_record(1, &[]), &frozen_ids));
-        assert!(record_is_frozen(&sample_record(2, &["frozen"]), &frozen_ids));
+        assert!(record_is_frozen(
+            &sample_record(2, &["frozen"]),
+            &frozen_ids
+        ));
         assert!(!record_is_frozen(&sample_record(3, &[]), &frozen_ids));
+    }
+
+    #[test]
+    fn load_frozen_ids_from_inventory_reads_freeze_yaml_without_database_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        std::fs::write(temp.path().join(".narou").join("freeze.yaml"), "1: true\n3: true\n").unwrap();
+
+        let inventory = Inventory::new(temp.path().to_path_buf());
+        let frozen_ids = load_frozen_ids_from_inventory(&inventory).unwrap();
+
+        assert!(frozen_ids.contains(&1));
+        assert!(frozen_ids.contains(&3));
+        assert_eq!(frozen_ids.len(), 2);
     }
 }

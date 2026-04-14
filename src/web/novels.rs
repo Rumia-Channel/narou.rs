@@ -4,7 +4,7 @@ use axum::{
     response::Json,
 };
 
-use crate::compat::{load_frozen_ids, record_is_frozen, set_frozen_state};
+use crate::compat::{load_frozen_ids_from_inventory, record_is_frozen, set_frozen_state};
 use crate::db::{with_database, with_database_mut};
 use crate::error::NarouError;
 
@@ -30,10 +30,10 @@ pub async fn api_list(
     let search = params.search_value.unwrap_or_default();
     let order_col = params.order_column.unwrap_or(0);
     let order_dir = params.order_dir.unwrap_or_else(|| "asc".to_string());
+    let frozen_ids = with_database(|db| load_frozen_ids_from_inventory(db.inventory())).unwrap_or_default();
 
     let response = with_database(|db| {
         let all_records: Vec<_> = db.all_records().values().collect();
-        let frozen_ids = load_frozen_ids().unwrap_or_default();
 
         let mut filtered: Vec<_> = if search.is_empty() {
             all_records
