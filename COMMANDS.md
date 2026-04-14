@@ -83,7 +83,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
 | `download` | ✅ | 🟡 部分 | `--mail` を追加。メール設定の自動作成と送信は実装済みだが、全互換確認は継続中 |
 | `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、digest選択肢、差分cache退避、hotentryのcopy/send/mailまでは実装済み。周辺出力/イベント細部が残る |
-| `convert` | ✅ | 🟡 部分 | `--output` / `--inspect` / `convert.inspect` / `--no-open` / `--ignore-default` / `--ignore-force` / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定、保存済み挿絵のローカル注記化までは実装。`--device`, `--no-epub` 等が残る |
+| `convert` | ✅ | 🟡 部分 | `--output` / `--inspect` / `convert.inspect` / `--no-open` / `--ignore-default` / `--ignore-force` / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFOまでは実装。`--device`, `--no-epub`, テキストファイル入力等が残る |
 | `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--echo` と pipe 時ID出力まで実装 |
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションまで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
@@ -101,7 +101,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `folder` | ✅ | ✅ 完了 | `--no-open`、引数省略時 help、alias/tag 解決を実装 |
 | `browser` | ✅ | ✅ 完了 | `--vote` で最新話感想ページ生成、引数省略時 help、alias/tag 解決を実装 |
 | `alias` | ✅ | ✅ 完了 | `alias.yaml` 読み書き、`--list`、`name=` 解除、`hotentry` 禁止語、共通ターゲット解決への統合を実装 |
-| `inspect` | ✅ | 🟡 部分 | `調査ログ.txt` 表示、変換時ログ生成、`convert.inspect`、summary/full display、括弧/kana/前後書き系メッセージまでは実装。illustration / textfile 系が残る |
+| `inspect` | ✅ | 🟡 部分 | `調査ログ.txt` 表示、変換時ログ生成、`convert.inspect`、summary/full display、括弧/kana/前後書き系メッセージ、挿絵保存成功/失敗メッセージまでは実装。textfile 系が残る |
 | `csv` | ✅ | ✅ 完了 | CSV export/import、`-o` / `-i`、`url` ヘッダー必須、download 経由 import を実装 |
 | `trace` | ✅ | ✅ 完了 | `trace_dump.txt` を表示。panic 時に保存されたバックトレースを読む |
 
@@ -668,9 +668,9 @@ narou setting name         # 読み取り
 - `src/converter/inspector.rs` を追加し、変換時に `調査ログ.txt` を保存するようにした
 - `convert.inspect=true` と `convert --inspect` で full display、通常 convert では Ruby版同様 summary 表示にした
 - `auto_join_in_brackets` の警告/エラー、`modify_kana_ni_to_kanji_ni` INFO、`enable_erase_introduction` / `enable_erase_postscript` INFO も inspection に反映した
+- `illustration.rb` 相当として、HTML挿絵のローカル保存、保存成功 INFO、未対応画像形式 / 例外 ERROR も convert 中の inspection に反映した
 
 **不足動作**:
-- `illustration.rb` 経由の INFO/ERROR（挿絵保存成功・未対応画像形式・例外） は未移植
 - テキストファイル変換時の `enchant_midashi` 関連 INFO と、textfile 経路を含めた Ruby版 `inspect` 完全互換は継続確認が必要
 
 ---
@@ -711,10 +711,10 @@ narou setting name         # 読み取り
 |-------|---------|------|
 | download `--force`, `--no-convert`, `--freeze` | download | DL フラグ互換 |
 | update の残互換実装 | update | Ruby版ターゲット解決・`--gl`主要挙動・`update.strong`・digest選択肢・差分用 cache 退避・hotentry の copy/send/mail までは実装済み。周辺出力/イベント細部が残る |
-| convert `--device`, `--no-open`, `--output` | convert | 変換パイプライン完成 |
+| convert `--device`, `--no-epub`, textfile 入力 | convert | 変換パイプライン完成 |
 | download の残互換実装 | download | 再DL確認・mail 周辺 |
 | setting の残互換実装 | setting | 全設定変数と device hook の詰め |
-| inspect の残挿絵/textfile互換 | inspect | illustration / textfile 経路の Inspector メッセージ |
+| inspect の残 textfile 互換 | inspect | textfile 経路の Inspector メッセージ |
 
 ### P1: 設定管理基盤
 多くのコマンドが `local_setting` / `global_setting` に依存する。
