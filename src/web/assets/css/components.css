@@ -271,13 +271,16 @@
 .col-id { width: 3em; text-align: right; }
 .col-update { width: 7.5em; white-space: nowrap; }
 .col-general-lastup { width: 7.5em; white-space: nowrap; }
+.col-last-check { width: 7.5em; white-space: nowrap; }
 .col-title { min-width: 10em; }
 .col-author { width: 7em; }
-.col-site { width: 6em; }
-.col-url { width: 3em; text-align: center; }
+.col-site { width: 5em; }
+.col-novel-type { width: 3em; text-align: center; }
+.col-tags { width: 8em; }
+.col-episodes { width: 4em; text-align: center; }
 .col-length { width: 5em; text-align: right; }
 .col-status { width: 5em; }
-.col-tags { width: 8em; }
+.col-url { width: 3em; text-align: center; }
 .col-menu { width: 2.5em; text-align: center; }
 
 /* ========== Tags ========== */

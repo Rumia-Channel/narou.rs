@@ -80,9 +80,12 @@ function sortNovels(novels) {
       case 'id': return n.id || 0;
       case 'last_update': return n.last_update || '';
       case 'general_lastup': return n.general_lastup || '';
+      case 'last_check_date': return n.last_check_date || '';
       case 'title': return (n.title || '').toLowerCase();
       case 'author': return (n.author || '').toLowerCase();
       case 'sitename': return (n.sitename || '').toLowerCase();
+      case 'novel_type': return n.novel_type || 0;
+      case 'general_all_no': return n.general_all_no || 0;
       case 'length': return n.length || 0;
       default: return '';
     }
@@ -140,6 +143,9 @@ function createRow(novel) {
       : formatDate(novel.general_lastup);
   }
 
+  // last_check_date
+  const checkCell = novel.last_check_date ? formatDate(novel.last_check_date) : '';
+
   // Tags
   const tagsHtml = renderTags(novel.tags || []);
 
@@ -148,30 +154,40 @@ function createRow(novel) {
   if (novel.end === false || novel.end === 0) statusParts.push('連載中');
   else if (novel.end === true || novel.end === 1) statusParts.push('完結');
 
-  // TOC URL
+  // TOC URL link button
   const tocUrl = novel.toc_url || '';
   const tocLink = tocUrl
-    ? `<a href="${esc(tocUrl)}" target="_blank" rel="noopener" class="toc-link" title="${esc(tocUrl)}">&#x1F517;</a>`
+    ? `<a href="${esc(tocUrl)}" target="_blank" rel="noopener" class="btn-link-icon" title="${esc(tocUrl)}">&#x1F517;</a>`
     : '';
 
-  // Length (episode count)
-  const episodeCount = novel.general_all_no != null ? novel.general_all_no : novel.length;
-  const lengthText = episodeCount != null ? String(episodeCount) : '';
+  // Episode count with "話" suffix (narou.rb style)
+  const episodes = novel.general_all_no != null ? novel.general_all_no : 0;
+  const episodesText = episodes ? episodes + '話' : '';
 
-  // Menu button (opens context menu)
-  const menuBtn = `<button class="row-action-btn btn-menu-icon" data-menu-id="${novel.id}" type="button" title="メニュー">&#x22EE;</button>`;
+  // Character count with "字" suffix (narou.rb style)
+  const charCount = novel.length;
+  const lengthText = charCount != null && charCount > 0 ? unitizeNumeric(charCount) + '字' : '';
+
+  // Novel type
+  const novelTypeText = novel.novel_type === 2 ? '短編' : '';
+
+  // Menu button (opens context menu) — glyphicon-option-horizontal equivalent
+  const menuBtn = `<button class="row-action-btn btn-menu-icon" data-menu-id="${novel.id}" type="button" title="個別メニュー">⋯</button>`;
 
   tr.innerHTML = `
     <td class="col-id">${esc(idText)}</td>
     <td class="col-update">${updateCell}</td>
     <td class="col-general-lastup">${glCell}</td>
+    <td class="col-last-check">${checkCell}</td>
     <td class="col-title">${esc(novel.title || '')}</td>
     <td class="col-author"><span class="filterable" data-filter="${esc(novel.author || '')}">${esc(novel.author || '')}</span></td>
     <td class="col-site"><span class="filterable" data-filter="${esc(novel.sitename || '')}">${esc(novel.sitename || '')}</span></td>
-    <td class="col-url">${tocLink}</td>
+    <td class="col-novel-type">${novelTypeText}</td>
+    <td class="col-tags">${tagsHtml}</td>
+    <td class="col-episodes">${episodesText}</td>
     <td class="col-length">${lengthText}</td>
     <td class="col-status">${statusParts.join(', ')}</td>
-    <td class="col-tags">${tagsHtml}</td>
+    <td class="col-url">${tocLink}</td>
     <td class="col-menu">${menuBtn}</td>
   `;
 
@@ -381,7 +397,7 @@ function setCheck(id, checked) {
 
 function getTimeBadge(dateStr) {
   if (!dateStr) return '';
-  const d = new Date(dateStr);
+  const d = new Date(dateStr.replace(/-/g, '/'));
   if (isNaN(d.getTime())) return '';
   const diffMs = Date.now() - d.getTime();
   const hours = diffMs / (1000 * 60 * 60);
@@ -396,14 +412,18 @@ function getTimeBadge(dateStr) {
 
 function formatDate(dateStr) {
   if (!dateStr) return '';
-  const d = new Date(dateStr);
+  // API returns "YYYY-MM-DD HH:MM" — convert dashes to slashes for display
+  const m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}:\d{2})/);
+  if (m) return `${m[1]}/${m[2]}/${m[3]} ${m[4]}`;
+  // Fallback: try Date parsing
+  const d = new Date(dateStr.replace(/-/g, '/'));
   if (isNaN(d.getTime())) return dateStr;
   const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
   const h = String(d.getHours()).padStart(2, '0');
   const min = String(d.getMinutes()).padStart(2, '0');
-  return `${y}/${m}/${day} ${h}:${min}`;
+  return `${y}/${mo}/${day} ${h}:${min}`;
 }
 
 function formatLength(n) {
@@ -411,6 +431,15 @@ function formatLength(n) {
   if (n >= 10000) return (n / 10000).toFixed(1) + '万';
   if (n >= 1000) return (n / 1000).toFixed(1) + '千';
   return String(n);
+}
+
+/** Narou.rb-compatible unitizeNumeric: 10000→"1.0万", 1000→"1,000" etc. */
+function unitizeNumeric(num) {
+  if (num == null) return '';
+  if (num >= 10000) {
+    return (num / 10000).toFixed(1) + '万';
+  }
+  return num.toLocaleString();
 }
 
 function esc(s) {

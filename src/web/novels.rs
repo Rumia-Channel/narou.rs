@@ -55,9 +55,13 @@ pub async fn api_list(
             0 => "id",
             1 => "last_update",
             2 => "general_lastup",
-            3 => "title",
-            4 => "author",
-            5 => "sitename",
+            3 => "last_check_date",
+            4 => "title",
+            5 => "author",
+            6 => "sitename",
+            7 => "novel_type",
+            9 => "general_all_no",
+            10 => "length",
             _ => "id",
         };
 
@@ -72,7 +76,17 @@ pub async fn api_list(
                     .general_lastup
                     .unwrap_or_default()
                     .cmp(&b.general_lastup.unwrap_or_default()),
+                "last_check_date" => a
+                    .last_check_date
+                    .unwrap_or_default()
+                    .cmp(&b.last_check_date.unwrap_or_default()),
                 "sitename" => a.sitename.cmp(&b.sitename),
+                "novel_type" => a.novel_type.cmp(&b.novel_type),
+                "general_all_no" => a
+                    .general_all_no
+                    .unwrap_or(0)
+                    .cmp(&b.general_all_no.unwrap_or(0)),
+                "length" => a.length.unwrap_or(0).cmp(&b.length.unwrap_or(0)),
                 _ => std::cmp::Ordering::Equal,
             };
             if reverse { va.reverse() } else { va }
@@ -85,23 +99,33 @@ pub async fn api_list(
             .into_iter()
             .skip(start as usize)
             .take(length as usize)
-            .map(|r| NovelListItem {
-                id: r.id,
-                title: r.title.clone(),
-                author: r.author.clone(),
-                sitename: r.sitename.clone(),
-                novel_type: r.novel_type,
-                end: r.end,
-                last_update: r.last_update.format("%Y-%m-%d %H:%M").to_string(),
-                general_lastup: r
-                    .general_lastup
-                    .map(|d: chrono::DateTime<chrono::Utc>| d.format("%Y-%m-%d %H:%M").to_string()),
-                tags: r.tags.clone(),
-                new_arrivals: false,
-                frozen: record_is_frozen(r, &frozen_ids),
-                length: r.length,
-                toc_url: r.toc_url.clone(),
-                general_all_no: r.general_all_no,
+            .map(|r| {
+                let now = chrono::Utc::now();
+                let is_new = r.new_arrivals_date.is_some_and(|nad| {
+                    let limit = chrono::Duration::seconds(259200); // 3 days
+                    nad >= r.last_update && (nad + limit) > now
+                });
+                NovelListItem {
+                    id: r.id,
+                    title: r.title.clone(),
+                    author: r.author.clone(),
+                    sitename: r.sitename.clone(),
+                    novel_type: r.novel_type,
+                    end: r.end,
+                    last_update: r.last_update.format("%Y-%m-%d %H:%M").to_string(),
+                    general_lastup: r.general_lastup
+                        .map(|d| d.format("%Y-%m-%d %H:%M").to_string()),
+                    last_check_date: r.last_check_date
+                        .map(|d| d.format("%Y-%m-%d %H:%M").to_string()),
+                    new_arrivals_date: r.new_arrivals_date
+                        .map(|d| d.format("%Y-%m-%d %H:%M").to_string()),
+                    tags: r.tags.clone(),
+                    new_arrivals: is_new,
+                    frozen: record_is_frozen(r, &frozen_ids),
+                    length: r.length,
+                    toc_url: r.toc_url.clone(),
+                    general_all_no: r.general_all_no,
+                }
             })
             .collect();
 

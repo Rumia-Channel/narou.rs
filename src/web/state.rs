@@ -42,6 +42,8 @@ pub struct NovelListItem {
     pub end: bool,
     pub last_update: String,
     pub general_lastup: Option<String>,
+    pub last_check_date: Option<String>,
+    pub new_arrivals_date: Option<String>,
     pub tags: Vec<String>,
     pub new_arrivals: bool,
     pub frozen: bool,
