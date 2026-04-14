@@ -83,7 +83,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
 | `download` | ✅ | 🟡 部分 | `--mail` を追加。メール設定の自動作成と送信は実装済みだが、全互換確認は継続中 |
 | `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、digest選択肢、差分cache退避、hotentryのcopy/send/mailまでは実装済み。周辺出力/イベント細部が残る |
-| `convert` | ✅ | 🟡 部分 | `--inspect` / `convert.inspect` / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定、保存済み挿絵のローカル注記化までは実装。`--device`, `--no-epub`, `--output` 等が残る |
+| `convert` | ✅ | 🟡 部分 | `--inspect` / `convert.inspect` / `--no-open` / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定、保存済み挿絵のローカル注記化までは実装。`--device`, `--no-epub`, `--output` 等が残る |
 | `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--echo` と pipe 時ID出力まで実装 |
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションまで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
@@ -223,7 +223,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `--no-mobi` | — | flag | false | MOBI 生成スキップ | ❌ |
 | `--no-strip` | — | flag | false | MOBI ストリップスキップ | ❌ |
 | `--no-zip` | — | flag | false | ZIP 作成スキップ | ❌ |
-| `--no-open` | — | flag | false | 出力フォルダを開かない | ❌ |
+| `--no-open` | — | flag | false | 出力フォルダを開かない | ✅ |
 | `--inspect` | `-i` | flag | false | 小説状態調査ログ表示 | ✅ |
 | `--verbose` | `-v` | flag | false | AozoraEpub3/kindlegen 標準出力表示 | ❌ |
 | `--ignore-default` | — | flag | false | default.* 設定を無視 | ❌ |
@@ -242,6 +242,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 
 **Rust 実装メモ**:
 - `-i/--inspect` を clap / `main.rs` / `commands::convert` に接続し、`local_setting.yaml` の `convert.inspect=true` も Ruby版同様に direct convert の既定値として注入する
+- `--no-open` と `convert.no-open=true` を direct convert に反映し、既定では最初に生成した出力ファイルの保存フォルダを開く
 - 変換後に `調査ログ.txt` を常に保存し、`enable_inspect` が有効なときは行末読点状況とカギ括弧内改行状況を記録する
 - `--inspect` 指定時は full display、未指定時は Ruby版同様に summary だけを出す
 - `enable_erase_introduction` / `enable_erase_postscript` を section 変換に反映し、`enable_auto_indent` は Ruby版 `Inspector#inspect_indent` 相当の比率判定でのみ有効化する

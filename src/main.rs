@@ -203,12 +203,16 @@ fn run_sync_command(
             });
             0
         }
-        Commands::Convert { targets, inspect } => {
+        Commands::Convert {
+            targets,
+            inspect,
+            no_open,
+        } => {
             if targets.is_empty() {
                 eprintln!("Usage: narou convert <url|ncode|id>...");
                 1
             } else {
-                commands::convert::cmd_convert(&targets, inspect);
+                commands::convert::cmd_convert(&targets, inspect, no_open);
                 0
             }
         }

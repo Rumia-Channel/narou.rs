@@ -286,6 +286,11 @@ fn inject_convert_defaults(args: &mut Vec<String>) {
     {
         args.insert(1, "--inspect".to_string());
     }
+    if !has_option(args, "", "--no-open")
+        && load_local_setting_bool("convert.no-open").unwrap_or(false)
+    {
+        args.insert(1, "--no-open".to_string());
+    }
 }
 
 fn has_option(args: &[String], short: &str, long: &str) -> bool {
@@ -310,6 +315,7 @@ fn is_terminal_stdin() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn version_flag_becomes_version_command() {
@@ -345,6 +351,39 @@ mod tests {
                 "--no-tool".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn convert_no_open_is_injected_from_local_setting() {
+        let root = std::env::temp_dir().join(format!(
+            "narou-rs-cli-no-open-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".narou")).unwrap();
+        let inventory = narou_rs::db::inventory::Inventory::new(root.clone());
+        let mut settings = HashMap::new();
+        settings.insert("convert.no-open".to_string(), serde_yaml::Value::Bool(true));
+        inventory
+            .save(
+                "local_setting",
+                narou_rs::db::inventory::InventoryScope::Local,
+                &settings,
+            )
+            .unwrap();
+
+        let current = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+
+        let mut args = vec!["convert".to_string(), "1".to_string()];
+        inject_command_defaults(&mut args);
+
+        std::env::set_current_dir(current).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+
+        assert_eq!(args, vec!["convert", "--no-open", "1"]);
     }
 }
 
@@ -421,6 +460,8 @@ pub enum Commands {
     Convert {
         #[arg(short = 'i', long)]
         inspect: bool,
+        #[arg(long = "no-open")]
+        no_open: bool,
         targets: Vec<String>,
     },
     Diff {

@@ -5,7 +5,7 @@ use narou_rs::progress::CliProgress;
 
 use super::resolve_target_to_id;
 
-pub fn cmd_convert(targets: &[String], inspect: bool) {
+pub fn cmd_convert(targets: &[String], inspect: bool, no_open: bool) {
     if let Err(e) = narou_rs::db::init_database() {
         eprintln!("Error initializing database: {}", e);
         std::process::exit(1);
@@ -13,6 +13,7 @@ pub fn cmd_convert(targets: &[String], inspect: bool) {
 
     let multi = CliProgress::multi();
     let multi_clone = multi.clone();
+    let mut first_output_dir = None;
 
     for target in targets {
         let Some(id) = resolve_target_to_id(target) else {
@@ -53,6 +54,11 @@ pub fn cmd_convert(targets: &[String], inspect: bool) {
         match converter.convert_novel_by_id(id, &novel_dir) {
             Ok(output_path) => {
                 let _ = multi_clone.println(&format!("  Output: {}", output_path));
+                if first_output_dir.is_none() {
+                    first_output_dir = std::path::Path::new(&output_path)
+                        .parent()
+                        .map(|path| path.to_path_buf());
+                }
                 if let Some(inspection) = converter.take_inspection_output() {
                     for line in inspection.split('\n') {
                         let _ = multi_clone.println(line);
@@ -66,4 +72,10 @@ pub fn cmd_convert(targets: &[String], inspect: bool) {
     }
 
     drop(multi);
+
+    if !no_open && !narou_rs::compat::load_local_setting_bool("convert.no-open") {
+        if let Some(dir) = first_output_dir {
+            narou_rs::compat::open_directory(&dir, Some("小説の保存フォルダを開きますか"));
+        }
+    }
 }
