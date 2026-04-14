@@ -134,13 +134,17 @@ function createRow(novel) {
   if (updateBadge) updateCell += updateBadge + ' ';
   updateCell += formatDate(novel.last_update);
 
-  // general_lastup with time badge
+  // general_lastup with time badge + hint-new-arrival when newer than last_update
   let glCell = '';
+  let glHint = false;
   if (novel.general_lastup) {
     const badge = getTimeBadge(novel.general_lastup);
-    glCell = badge
-      ? `${badge} ${formatDate(novel.general_lastup)}`
-      : formatDate(novel.general_lastup);
+    const dateStr = formatDate(novel.general_lastup);
+    glCell = badge ? `${badge} ${dateStr}` : dateStr;
+    // narou.rb highlights when general_lastup > last_update (new content available)
+    if (novel.general_lastup > novel.last_update) {
+      glHint = true;
+    }
   }
 
   // last_check_date
@@ -177,7 +181,7 @@ function createRow(novel) {
   tr.innerHTML = `
     <td class="col-id">${esc(idText)}</td>
     <td class="col-update">${updateCell}</td>
-    <td class="col-general-lastup">${glCell}</td>
+    <td class="col-general-lastup${glHint ? ' hint-new-arrival' : ''}">${glCell}</td>
     <td class="col-last-check">${checkCell}</td>
     <td class="col-title">${esc(novel.title || '')}</td>
     <td class="col-author"><span class="filterable" data-filter="${esc(novel.author || '')}">${esc(novel.author || '')}</span></td>

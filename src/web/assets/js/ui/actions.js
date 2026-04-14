@@ -248,11 +248,56 @@ export function bindActions() {
   // --- Diff modal ---
   on('diff-close', () => El.diffModal?.classList.add('hide'));
 
-  // --- Control panel buttons ---
+  // --- Download modal ---
+  const downloadModal = document.getElementById('download-modal');
+  const downloadInput = document.getElementById('download-input');
+  const downloadDropHere = document.getElementById('download-link-drop-here');
+
   on('btn-download', () => {
-    const url = prompt('ダウンロードURLを入力:');
-    if (url) postJson('/api/download', { targets: [url] });
+    if (downloadModal) {
+      downloadInput.value = '';
+      downloadModal.classList.remove('hide');
+      setTimeout(() => downloadInput?.focus(), 100);
+    }
   });
+
+  on('download-modal-close', () => downloadModal?.classList.add('hide'));
+  on('download-cancel', () => downloadModal?.classList.add('hide'));
+
+  on('download-submit', () => {
+    const text = downloadInput?.value?.trim();
+    if (!text) return;
+    const targets = text.split(/[\s\n]+/).filter(Boolean);
+    if (targets.length === 0) return;
+    const mail = document.getElementById('download-mail')?.checked || false;
+    postJson('/api/download', { targets, mail });
+    downloadModal?.classList.add('hide');
+  });
+
+  // D&D support for download modal
+  if (downloadDropHere) {
+    const dropArea = downloadDropHere.parentElement;
+    dropArea.addEventListener('dragenter', (e) => {
+      e.preventDefault();
+      downloadDropHere.classList.add('dragover');
+    });
+    dropArea.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    });
+    dropArea.addEventListener('dragleave', () => {
+      downloadDropHere.classList.remove('dragover');
+    });
+    dropArea.addEventListener('drop', (e) => {
+      e.preventDefault();
+      downloadDropHere.classList.remove('dragover');
+      const text = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain') || '';
+      if (text) {
+        const current = downloadInput.value;
+        downloadInput.value = current ? current + '\n' + text : text;
+      }
+    });
+  }
 
   on('action-download-force', () => {
     if (State.selectedIds.size === 0) return;

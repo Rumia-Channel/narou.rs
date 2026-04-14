@@ -352,6 +352,66 @@
   color: var(--text-color);
 }
 
+/* Download modal */
+.download-textarea {
+  display: block;
+  width: 100%;
+  padding: 0.5em;
+  font-size: 0.95em;
+  border: 0.07em solid var(--border-color);
+  border-radius: var(--btn-border-radius);
+  resize: vertical;
+  background: var(--body-bg);
+  color: var(--text-color);
+  margin-bottom: 0.8em;
+}
+
+#download-link-drop-area {
+  margin-bottom: 0.8em;
+}
+
+#download-link-drop-here {
+  position: relative;
+  width: 100%;
+  height: 6em;
+  border: 0.25em dashed var(--border-color);
+  color: var(--text-muted);
+  transition: border-color 0.4s ease, background-color 0.4s ease, color 0.4s ease;
+  border-radius: var(--btn-border-radius);
+}
+
+#download-link-drop-here.dragover {
+  border-color: #ada;
+  background-color: rgba(92, 184, 92, 0.1);
+  color: #5cb85c;
+}
+
+#download-link-drop-here.error {
+  border-color: #ebccd1;
+  background-color: rgba(217, 83, 79, 0.08);
+  color: #d9534f;
+}
+
+#download-link-drop-here .inner {
+  position: absolute;
+  display: table;
+  width: 100%;
+  height: 100%;
+  text-align: center;
+  font-size: 1em;
+  font-weight: bold;
+}
+
+#download-link-drop-here .inner > div {
+  display: table-cell;
+  vertical-align: middle;
+}
+
+.checkbox-inline {
+  cursor: pointer;
+  font-size: 0.9em;
+}
+
 /* Queue detail list */
 .queue-detail-list {
   display: grid;

@@ -324,6 +324,23 @@
   font-weight: bold;
 }
 
+/* narou.rb: date cell annotation colors for recent updates */
+.new-arrivals {
+  color: var(--new-arrival-color);
+  font-weight: bold;
+}
+
+.new-update {
+  color: var(--new-update-color);
+  font-weight: bold;
+}
+
+/* narou.rb: hint when general_lastup > last_update (new content available) */
+.hint-new-arrival {
+  background-color: rgba(255, 200, 0, 0.15);
+  border-radius: 0.2em;
+}
+
 .gl-badge {
   display: inline-block;
   padding: 0.05em 0.35em;

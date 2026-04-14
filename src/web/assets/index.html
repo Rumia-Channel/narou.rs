@@ -267,22 +267,22 @@
 
     <!-- Context Menu (hidden, shown on right-click) -->
     <ul class="context-menu hide" id="context-menu" role="menu">
-      <li><a href="#" id="ctx-setting">変換設定</a></li>
+      <li><a href="#" id="ctx-setting">小説の変換設定</a></li>
       <li><a href="#" id="ctx-diff">差分を表示</a></li>
       <li><a href="#" id="ctx-tag-edit">タグを編集</a></li>
       <li class="divider"></li>
-      <li><a href="#" id="ctx-freeze-toggle">凍結/凍結解除</a></li>
+      <li><a href="#" id="ctx-freeze-toggle">凍結</a></li>
       <li><a href="#" id="ctx-update">更新</a></li>
-      <li><a href="#" id="ctx-update-force">強制更新</a></li>
+      <li><a href="#" id="ctx-update-force">凍結済みでも更新</a></li>
       <li><a href="#" id="ctx-send">送信</a></li>
       <li class="divider"></li>
       <li><a href="#" id="ctx-remove">削除</a></li>
       <li><a href="#" id="ctx-convert">変換</a></li>
-      <li><a href="#" id="ctx-inspect">調査</a></li>
+      <li><a href="#" id="ctx-inspect">調査状況ログを表示</a></li>
       <li class="divider"></li>
-      <li><a href="#" id="ctx-folder">フォルダを開く</a></li>
-      <li><a href="#" id="ctx-backup">バックアップ</a></li>
-      <li><a href="#" id="ctx-download-force">強制再ダウンロード</a></li>
+      <li><a href="#" id="ctx-folder">保存フォルダを開く</a></li>
+      <li><a href="#" id="ctx-backup">バックアップを作成</a></li>
+      <li><a href="#" id="ctx-download-force">再ダウンロード</a></li>
       <li><a href="#" id="ctx-mail">メールで送信</a></li>
     </ul>
 
@@ -352,6 +352,35 @@
           </div>
           <div class="modal-footer">
             <button class="btn btn-primary" id="save-notepad-button" type="button">保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Download Modal (narou.rb: download_form) -->
+    <div class="modal-overlay hide" id="download-modal">
+      <div class="modal-dialog">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="download-modal-close" type="button">&times;</button>
+            <h4 class="modal-title">ダウンロードする小説のURL、もしくはNコードを入力(複数可)</h4>
+          </div>
+          <div class="modal-body">
+            <textarea id="download-input" class="download-textarea" rows="4" placeholder="小説のURLかNコードを入力（複数入力する場合は半角スペースか改行で区切る）"></textarea>
+            <div id="download-link-drop-area">
+              <div id="download-link-drop-here">
+                <div class="inner"><div>ここにリンクかショートカットファイルをドラッグ</div></div>
+              </div>
+            </div>
+            <div class="text-right">
+              <label class="checkbox-inline">
+                <input type="checkbox" id="download-mail"> ダウンロード終了後にメールで送信する
+              </label>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="download-cancel" type="button">キャンセル</button>
+            <button class="btn btn-primary" id="download-submit" type="button">ダウンロード</button>
           </div>
         </div>
       </div>

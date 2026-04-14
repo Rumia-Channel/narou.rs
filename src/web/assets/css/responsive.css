@@ -83,8 +83,15 @@
     -webkit-overflow-scrolling: touch;
   }
 
+  /* Hide less-important columns on tablet (narou.rb hides most on touch) */
+  .col-general-lastup,
+  .col-last-check,
   .col-author,
-  .col-site {
+  .col-site,
+  .col-novel-type,
+  .col-length,
+  .col-status,
+  .col-url {
     display: none;
   }
 
@@ -103,8 +110,10 @@
     font-size: 1rem;
   }
 
-  .col-latest,
-  .col-tags {
+  /* On phone: only show ID, title, episodes, menu */
+  .col-update,
+  .col-tags,
+  .col-episodes {
     display: none;
   }
 
