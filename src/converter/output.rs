@@ -15,6 +15,18 @@ pub(crate) fn create_output_text_path(
     novel_dir.join(create_output_text_filename(settings, id, toc))
 }
 
+pub(crate) fn create_output_text_path_for_textfile(
+    settings: &NovelSettings,
+    converted_text: &str,
+) -> PathBuf {
+    settings
+        .archive_path
+        .join(create_output_text_filename_for_textfile(
+            settings,
+            converted_text,
+        ))
+}
+
 pub(crate) fn create_output_text_filename(
     settings: &NovelSettings,
     id: i64,
@@ -89,6 +101,32 @@ fn ensure_txt_extension(filename: &str) -> String {
     }
 }
 
+fn create_output_text_filename_for_textfile(
+    settings: &NovelSettings,
+    converted_text: &str,
+) -> String {
+    if !settings.output_filename.trim().is_empty() {
+        return ensure_txt_extension(&sanitize_filename_for_output(&settings.output_filename));
+    }
+
+    let (title, author) = extract_title_and_author_from_text(converted_text);
+    if convert_filename_to_ncode() {
+        return ensure_txt_extension(&sanitize_filename_for_output(&format!("text_{}", title)));
+    }
+
+    ensure_txt_extension(&sanitize_filename_for_output(&format!(
+        "[{}] {}",
+        author, title
+    )))
+}
+
+fn extract_title_and_author_from_text(text: &str) -> (String, String) {
+    let mut lines = text.lines();
+    let title = lines.next().unwrap_or("").to_string();
+    let author = lines.next().unwrap_or("").to_string();
+    (title, author)
+}
+
 fn extract_domain(url: &str) -> Option<String> {
     let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     without_scheme
@@ -104,4 +142,33 @@ fn extract_ncode_like(url: &str) -> Option<String> {
         .rsplit('/')
         .find(|part| !part.is_empty() && *part != "works")
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_output_text_path_for_textfile;
+    use crate::converter::settings::NovelSettings;
+
+    #[test]
+    fn textfile_output_path_uses_title_and_author_from_text() {
+        let root = std::env::temp_dir().join(format!(
+            "narou-rs-textfile-output-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut settings = NovelSettings::default();
+        settings.archive_path = root.clone();
+
+        let path = create_output_text_path_for_textfile(&settings, "タイトル\n作者\n本文");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("[作者] タイトル.txt")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -460,6 +460,8 @@ pub enum Commands {
     Convert {
         #[arg(short = 'o', long = "output")]
         output: Option<String>,
+        #[arg(short = 'e', long = "enc")]
+        encoding: Option<String>,
         #[arg(long = "ignore-default")]
         ignore_default: bool,
         #[arg(long = "ignore-force")]

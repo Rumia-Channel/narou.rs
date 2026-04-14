@@ -177,6 +177,22 @@ fn create_cover_chuki(settings: &NovelSettings) -> String {
     String::new()
 }
 
+pub(crate) fn insert_cover_chuki_for_textfile(settings: &NovelSettings, text: &str) -> String {
+    let cover_chuki = create_cover_chuki(settings);
+    if cover_chuki.is_empty() {
+        return text.to_string();
+    }
+
+    let parts: Vec<&str> = text.splitn(3, '\n').collect();
+    match parts.as_slice() {
+        [title, author, rest] => format!("{title}\n{author}\n{cover_chuki}\n{rest}"),
+        [title, author] => format!("{title}\n{author}\n{cover_chuki}"),
+        [title] => format!("{title}\n\n{cover_chuki}"),
+        [] => cover_chuki,
+        _ => text.to_string(),
+    }
+}
+
 pub(crate) fn trim_author_comment_text(text: &str) -> String {
     text.trim_end_matches('\n')
         .lines()

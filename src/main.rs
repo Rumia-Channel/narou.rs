@@ -206,6 +206,7 @@ fn run_sync_command(
         Commands::Convert {
             targets,
             output,
+            encoding,
             ignore_default,
             ignore_force,
             inspect,
@@ -218,6 +219,7 @@ fn run_sync_command(
                 commands::convert::cmd_convert(
                     &targets,
                     output.as_deref(),
+                    encoding.as_deref(),
                     inspect,
                     no_open,
                     ignore_default,

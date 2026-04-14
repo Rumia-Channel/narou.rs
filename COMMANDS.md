@@ -83,7 +83,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
 | `download` | ✅ | 🟡 部分 | `--mail` を追加。メール設定の自動作成と送信は実装済みだが、全互換確認は継続中 |
 | `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、digest選択肢、差分cache退避、hotentryのcopy/send/mailまでは実装済み。周辺出力/イベント細部が残る |
-| `convert` | ✅ | 🟡 部分 | `--output` / `--inspect` / `convert.inspect` / `--no-open` / `--ignore-default` / `--ignore-force` / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFOまでは実装。`--device`, `--no-epub`, テキストファイル入力等が残る |
+| `convert` | ✅ | 🟡 部分 | `--output` / `--enc` / テキストファイル入力 / `--inspect` / `convert.inspect` / `--no-open` / `--ignore-default` / `--ignore-force` / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript` 反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFOまでは実装。`--device`, `--no-epub` 等が残る |
 | `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--echo` と pipe 時ID出力まで実装 |
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションまで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
@@ -101,7 +101,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `folder` | ✅ | ✅ 完了 | `--no-open`、引数省略時 help、alias/tag 解決を実装 |
 | `browser` | ✅ | ✅ 完了 | `--vote` で最新話感想ページ生成、引数省略時 help、alias/tag 解決を実装 |
 | `alias` | ✅ | ✅ 完了 | `alias.yaml` 読み書き、`--list`、`name=` 解除、`hotentry` 禁止語、共通ターゲット解決への統合を実装 |
-| `inspect` | ✅ | 🟡 部分 | `調査ログ.txt` 表示、変換時ログ生成、`convert.inspect`、summary/full display、括弧/kana/前後書き系メッセージ、挿絵保存成功/失敗メッセージまでは実装。textfile 系が残る |
+| `inspect` | ✅ | ✅ 完了 | `調査ログ.txt` 表示、変換時ログ生成、`convert.inspect`、summary/full display、括弧/kana/前後書き系、挿絵保存成功/失敗、textfile の `enable_enchant_midashi` 推奨 INFO まで実装 |
 | `csv` | ✅ | ✅ 完了 | CSV export/import、`-o` / `-i`、`url` ヘッダー必須、download 経由 import を実装 |
 | `trace` | ✅ | ✅ 完了 | `trace_dump.txt` を表示。panic 時に保存されたバックトレースを読む |
 
@@ -218,7 +218,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 |-----------|------|-----|-----------|------|:----:|
 | `--output FILE` | `-o` | string | — | 出力ファイル名指定 | ✅ |
 | `--make-zip` | — | flag | false | i文庫 ZIP 作成 | ❌ |
-| `--enc ENCODING` | `-e` | string | UTF-8 | テキストファイル文字コード | ❌ |
+| `--enc ENCODING` | `-e` | string | UTF-8 | テキストファイル文字コード | ✅ |
 | `--no-epub` | — | flag | false | EPUB 生成スキップ | ❌ |
 | `--no-mobi` | — | flag | false | MOBI 生成スキップ | ❌ |
 | `--no-strip` | — | flag | false | MOBI ストリップスキップ | ❌ |
@@ -231,7 +231,6 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | targets | | Vec\<String\> | — | ID/タイトル/ファイルパス | ✅ |
 
 **不足動作**:
-- テキストファイルの直接変換 (DBにないファイルパス指定)
 - `convert.copy-to` への自動コピー
 - `convert.multi-device` による複数端末同時変換
 - EPUB→MOBI 変換パイプライン (AozoraEpub3 + kindlegen)
@@ -245,6 +244,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `-i/--inspect` を clap / `main.rs` / `commands::convert` に接続し、`local_setting.yaml` の `convert.inspect=true` も Ruby版同様に direct convert の既定値として注入する
 - `--no-open` と `convert.no-open=true` を direct convert に反映し、既定では最初に生成した出力ファイルの保存フォルダを開く
 - `--ignore-default` / `--ignore-force` を `NovelSettings::load_for_novel_with_options` に渡し、`default.*` / `force.*` の適用を個別に無効化できるようにした
+- DB 管理小説だけでなくファイルパス指定の textfile 変換も `commands::convert` に接続し、`--enc` による UTF-8 / Shift_JIS / EUC-JP 系のデコードと `enable_enchant_midashi` 推奨 INFO を追加した
 - 変換後に `調査ログ.txt` を常に保存し、`enable_inspect` が有効なときは行末読点状況とカギ括弧内改行状況を記録する
 - `--inspect` 指定時は full display、未指定時は Ruby版同様に summary だけを出す
 - `enable_erase_introduction` / `enable_erase_postscript` を section 変換に反映し、`enable_auto_indent` は Ruby版 `Inspector#inspect_indent` 相当の比率判定でのみ有効化する
@@ -657,7 +657,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 22. `inspect` — 🟡 部分
+### 22. `inspect` — ✅ 完了
 
 > 小説状態の調査状況ログを表示します
 
@@ -669,9 +669,7 @@ narou setting name         # 読み取り
 - `convert.inspect=true` と `convert --inspect` で full display、通常 convert では Ruby版同様 summary 表示にした
 - `auto_join_in_brackets` の警告/エラー、`modify_kana_ni_to_kanji_ni` INFO、`enable_erase_introduction` / `enable_erase_postscript` INFO も inspection に反映した
 - `illustration.rb` 相当として、HTML挿絵のローカル保存、保存成功 INFO、未対応画像形式 / 例外 ERROR も convert 中の inspection に反映した
-
-**不足動作**:
-- テキストファイル変換時の `enchant_midashi` 関連 INFO と、textfile 経路を含めた Ruby版 `inspect` 完全互換は継続確認が必要
+- textfile 変換時も `enable_enchant_midashi` が false なら Ruby版同様の推奨 INFO を記録し、`sample\\novel` で UTF-8 / Shift_JIS の実変換と `調査ログ.txt` 保存を確認済み
 
 ---
 
@@ -711,10 +709,9 @@ narou setting name         # 読み取り
 |-------|---------|------|
 | download `--force`, `--no-convert`, `--freeze` | download | DL フラグ互換 |
 | update の残互換実装 | update | Ruby版ターゲット解決・`--gl`主要挙動・`update.strong`・digest選択肢・差分用 cache 退避・hotentry の copy/send/mail までは実装済み。周辺出力/イベント細部が残る |
-| convert `--device`, `--no-epub`, textfile 入力 | convert | 変換パイプライン完成 |
+| convert `--device`, `--no-epub`, ebook 出力 | convert | 変換パイプライン完成 |
 | download の残互換実装 | download | 再DL確認・mail 周辺 |
 | setting の残互換実装 | setting | 全設定変数と device hook の詰め |
-| inspect の残 textfile 互換 | inspect | textfile 経路の Inspector メッセージ |
 
 ### P1: 設定管理基盤
 多くのコマンドが `local_setting` / `global_setting` に依存する。

@@ -146,14 +146,7 @@ impl NovelSettings {
 
         let ini_path = archive_path.join("setting.ini");
         let replace_path = archive_path.join("replace.txt");
-        let local_setting_path = crate::db::inventory::Inventory::with_default_root()
-            .map(|inventory| {
-                inventory
-                    .root_dir()
-                    .join(".narou")
-                    .join("local_setting.yaml")
-            })
-            .unwrap_or_else(|_| PathBuf::from(".narou").join("local_setting.yaml"));
+        let local_setting_path = Self::local_setting_path();
 
         let ini = match IniData::load_file(&ini_path) {
             Ok(i) => i,
@@ -188,6 +181,56 @@ impl NovelSettings {
         };
 
         settings
+    }
+
+    pub fn create_for_text_file_with_options(
+        archive_path: &Path,
+        source_name: &str,
+        ignore_force: bool,
+        ignore_default: bool,
+    ) -> Self {
+        let ini_path = archive_path.join("setting.ini");
+        let replace_path = archive_path.join("replace.txt");
+        let local_setting_path = Self::local_setting_path();
+
+        let ini = match IniData::load_file(&ini_path) {
+            Ok(i) => i,
+            Err(_) => IniData::new(),
+        };
+
+        let mut settings = Self::default();
+        settings.title = Some(source_name.to_string());
+        settings.author = Some(String::new());
+        settings.archive_path = archive_path.to_path_buf();
+        settings.replace_patterns = load_replace_patterns(&replace_path);
+
+        settings = Self::apply_ini_defaults(&settings, &ini);
+        settings = Self::apply_force_and_default_settings(
+            &settings,
+            &local_setting_path,
+            ignore_force,
+            ignore_default,
+        );
+
+        if settings.novel_title.is_empty() {
+            settings.novel_title = source_name.to_string();
+        }
+        if settings.novel_author.is_empty() {
+            settings.novel_author = String::new();
+        }
+
+        settings
+    }
+
+    fn local_setting_path() -> PathBuf {
+        crate::db::inventory::Inventory::with_default_root()
+            .map(|inventory| {
+                inventory
+                    .root_dir()
+                    .join(".narou")
+                    .join("local_setting.yaml")
+            })
+            .unwrap_or_else(|_| PathBuf::from(".narou").join("local_setting.yaml"))
     }
 
     fn apply_ini_defaults(settings: &Self, ini: &IniData) -> Self {

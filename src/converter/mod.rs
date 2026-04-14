@@ -484,6 +484,29 @@ impl NovelConverter {
         self.cache_dirty = false;
     }
 
+    pub fn convert_text_file(&mut self, text: &str) -> Result<String> {
+        self.last_inspection_output = None;
+        self.inspector.borrow_mut().reset();
+
+        let mut converter = self.make_converter();
+        let mut aozora_text = converter.convert(text, converter_base::TextType::TextFile);
+        if !self.settings.enable_enchant_midashi {
+            self.inspector.borrow_mut().info(
+                "テキストファイルの処理を実行しましたが、改行直後の見出し付与は有効になっていません。setting.ini の enable_enchant_midashi を true にすることをお薦めします。".to_string(),
+            );
+        }
+
+        aozora_text = render::insert_cover_chuki_for_textfile(&self.settings, &aozora_text);
+        let txt_path = output::create_output_text_path_for_textfile(&self.settings, &aozora_text);
+        if let Some(parent) = txt_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&txt_path, &aozora_text)?;
+        self.inspect_converted_text(&aozora_text)?;
+
+        Ok(txt_path.display().to_string())
+    }
+
     pub fn convert_novel_by_id(&mut self, id: i64, novel_dir: &std::path::Path) -> Result<String> {
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();
@@ -843,6 +866,32 @@ mod tests {
             .unwrap();
 
         assert!(text.contains("［＃挿絵（挿絵/16-0.jpg）入る］"), "{text}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn convert_text_file_records_enchant_midashi_recommendation() {
+        let root = make_temp_illustration_root();
+
+        let mut settings = NovelSettings::default();
+        settings.archive_path = root.clone();
+        settings.output_filename = "converted.txt".to_string();
+        settings.enable_enchant_midashi = false;
+        settings.enable_inspect = true;
+
+        let mut converter = NovelConverter::new(settings);
+        converter.set_display_inspector(true);
+        let output_path = converter
+            .convert_text_file("タイトル\n作者\n本文です。\n")
+            .unwrap();
+
+        assert!(std::path::Path::new(&output_path).exists());
+        let inspection = converter.take_inspection_output().unwrap_or_default();
+        assert!(inspection.contains("改行直後の見出し付与は有効になっていません"));
+
+        let saved_log = std::fs::read_to_string(root.join("調査ログ.txt")).unwrap();
+        assert!(saved_log.contains("改行直後の見出し付与は有効になっていません"));
 
         let _ = std::fs::remove_dir_all(root);
     }
