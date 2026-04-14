@@ -163,6 +163,13 @@ fn run_sync_command(
             commands::mail::cmd_mail(commands::mail::MailOptions { targets, force });
             0
         }
+        Commands::Backup { targets } => match commands::backup::cmd_backup(&targets) {
+            Ok(_) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                127
+            }
+        },
         Commands::Update {
             ids,
             force,

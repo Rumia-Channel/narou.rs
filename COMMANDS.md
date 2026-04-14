@@ -95,7 +95,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `diff` | ✅ | ❌ 未実装 | |
 | `send` | ✅ | ❌ 未実装 | USB 経由端末送信 |
 | `mail` | ✅ | 🟡 部分 | `mail_setting.yaml` 読込と SMTP 送信の基盤を追加。Pony/mail 設定の完全互換は要確認だが、hotentry 自動メールは実装済み |
-| `backup` | ✅ | ❌ 未実装 | |
+| `backup` | ✅ | ✅ 完了 | `narou backup`/複数 target、`backup/` 除外、180バイト切り詰めまで対応 |
 | `clean` | ✅ | ❌ 未実装 | |
 | `help` | ✅ | 🟡 部分 | トップレベルは概ね実装済み。各コマンド -h は Ruby版詳細ヘルプとの差分あり |
 | `version` | ✅ | ✅ 完了 | `-v`/`--version` と `--more` を実装。出力順序、help 文言、AozoraEpub3 探索、失敗時メッセージを Ruby 版に揃えた |
@@ -514,17 +514,13 @@ narou setting name         # 読み取り
 
 ---
 
-### 14. `backup` — ❌ 未実装
+### 14. `backup` — ✅ 完了
 
 > 小説のバックアップを作成します
 
 オプションなし。
 
-**実装要件**:
-- `<novel_dir>/backup/` に ZIP 作成
-- ファイル名: `<title>_<YYYYMMDDHHMMSS>.zip`
-- 既存バックアップファイルは除外
-- タイトルは180バイトで切り詰め
+**Rust 実装**: `src/commands/backup.rs` で Ruby 版同様に複数 target を順に処理し、`backup/` 直下へ ZIP を保存する。バックアップ名はタイトルを Ruby 版同様に整形して 180 バイトで切り詰める。
 
 ---
 
@@ -562,7 +558,7 @@ narou setting name         # 読み取り
 **完了扱いにしない理由 / 不足動作**:
 - `help` は未実装コマンド分も narou.rb から移植する方針だが、`narou <command> -h` の詳細文・Examples・Configuration・Variable List が Ruby版 `sample/narou/lib/command/*.rb` と完全一致していない。
 - `setting -h` の `Local Variable List` / `Global Variable List` が省略されている。
-- `list`, `folder`, `browser`, `backup`, `inspect`, `clean`, `diff`, `send`, `mail`, `alias`, `csv` などで banner、説明文、Examples、Options の省略・改変・追加がある。
+- `list`, `folder`, `browser`, `inspect`, `clean`, `diff`, `send`, `mail`, `alias`, `csv` などで banner、説明文、Examples、Options の省略・改変・追加がある。
 - `tag -h` は Ruby版にない `--list` を表示しており、Ruby版 help 互換として要整理。
 
 ---
@@ -711,7 +707,6 @@ narou setting name         # 読み取り
 | `folder` | 低 | なし |
 | `browser` | 低 | なし |
 | `alias` | 低 | `alias.yaml` |
-| `backup` | 低 | ZIP 圧縮 |
 | `clean` | 低 | TOC 読み込み |
 | `csv` | 中 | DL パイプライン |
 | `inspect` | 中 | Inspector メッセージ |

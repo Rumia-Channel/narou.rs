@@ -9,6 +9,7 @@ use crate::converter::settings::NovelSettings;
 use crate::converter::user_converter::UserConverter;
 use crate::db::inventory::InventoryScope;
 use crate::error::{NarouError, Result};
+use unicode_normalization::UnicodeNormalization;
 
 const DIGEST_CHOICES: &[(&str, &str)] = &[
     ("1", "このまま更新する"),
@@ -232,8 +233,8 @@ pub fn create_backup(novel_dir: &Path, title: &str) -> Result<String> {
 
     let file = fs::File::create(&backup_path)?;
     let mut zip = zip::ZipWriter::new(file);
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     add_directory_to_zip(&mut zip, novel_dir, novel_dir, options)?;
     zip.finish()
         .map_err(|e| NarouError::Conversion(e.to_string()))?;
@@ -388,6 +389,32 @@ fn add_directory_to_zip(
     current_dir: &Path,
     options: zip::write::SimpleFileOptions,
 ) -> Result<()> {
+    let mut files = Vec::new();
+    collect_backup_files(base_dir, current_dir, &mut files)?;
+
+    let mut entries: Vec<(String, PathBuf)> = files
+        .into_iter()
+        .map(|path| {
+            let rel_name = relative_backup_path(base_dir, &path)?;
+            Ok((rel_name, path))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (rel_name, path) in entries {
+        let mut file = fs::File::open(&path)?;
+        zip.start_file(rel_name.replace('\\', "/"), options)
+            .map_err(|e| NarouError::Conversion(e.to_string()))?;
+        std::io::copy(&mut file, zip)?;
+    }
+    Ok(())
+}
+
+fn collect_backup_files(
+    base_dir: &Path,
+    current_dir: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<()> {
     for entry in fs::read_dir(current_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -398,32 +425,74 @@ fn add_directory_to_zip(
             continue;
         }
         if path.is_dir() {
-            add_directory_to_zip(zip, base_dir, &path, options)?;
+            collect_backup_files(base_dir, &path, files)?;
         } else if path.is_file() {
-            let mut file = fs::File::open(&path)?;
-            let rel_name = rel.to_string_lossy().replace('\\', "/");
-            zip.start_file(rel_name, options)
-                .map_err(|e| NarouError::Conversion(e.to_string()))?;
-            std::io::copy(&mut file, zip)?;
+            files.push(path);
         }
     }
     Ok(())
 }
 
+fn relative_backup_path(base_dir: &Path, path: &Path) -> Result<String> {
+    let rel = path
+        .strip_prefix(base_dir)
+        .map_err(|e| NarouError::Conversion(e.to_string()))?;
+    Ok(rel.to_string_lossy().to_string())
+}
+
 fn sanitize_backup_name(title: &str) -> String {
-    let invalid = [
-        '/', '\\', ':', '*', '?', '"', '<', '>', '|', '\0', '[', ']', '{', '}', '.',
-    ];
-    let mut cleaned: String = title
-        .chars()
-        .map(|ch| if invalid.contains(&ch) { '＿' } else { ch })
-        .collect();
-    if cleaned.len() > 180 {
-        cleaned.truncate(180);
+    let mut cleaned = String::with_capacity(title.len());
+    for ch in title.chars() {
+        match ch {
+            '/' => cleaned.push('／'),
+            '\\' => cleaned.push('￥'),
+            ':' => cleaned.push('：'),
+            '*' => cleaned.push('＊'),
+            '?' => cleaned.push('？'),
+            '"' => cleaned.push('”'),
+            '<' => cleaned.push('〈'),
+            '>' => cleaned.push('〉'),
+            '[' => cleaned.push('［'),
+            ']' => cleaned.push('］'),
+            '{' => cleaned.push('｛'),
+            '}' => cleaned.push('｝'),
+            '|' => cleaned.push('｜'),
+            '.' => cleaned.push('．'),
+            '`' => cleaned.push('｀'),
+            '\0' | '\t' | '\n' | '\r' => {}
+            _ => cleaned.push(ch),
+        }
     }
-    if cleaned.trim().is_empty() {
-        "backup".to_string()
-    } else {
-        cleaned
+    if load_local_setting_bool("normalize-filename") {
+        cleaned = cleaned.nfc().collect();
+    }
+    while cleaned.as_bytes().len() > 180 {
+        cleaned.pop();
+    }
+    cleaned
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_backup_name;
+
+    #[test]
+    fn sanitize_backup_name_matches_ruby_replacements() {
+        assert_eq!(
+            sanitize_backup_name("a/b\\c:d*e?f\"g<h>i[j]k{l}m|n.o`p\tq\nr"),
+            "a／b￥c：d＊e？f”g〈h〉i［j］k｛l｝m｜n．o｀pqr"
+        );
+    }
+
+    #[test]
+    fn sanitize_backup_name_truncates_by_byte_length() {
+        let name = sanitize_backup_name(&"あ".repeat(100));
+        assert!(name.as_bytes().len() <= 180);
+        assert!(name.chars().all(|ch| ch == 'あ'));
+    }
+
+    #[test]
+    fn sanitize_backup_name_falls_back_when_empty() {
+        assert_eq!(sanitize_backup_name(""), "");
     }
 }

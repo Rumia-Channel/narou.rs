@@ -338,6 +338,9 @@ pub enum Commands {
         #[arg(short = 'f', long)]
         force: bool,
     },
+    Backup {
+        targets: Vec<String>,
+    },
     Update {
         ids: Option<Vec<String>>,
         #[arg(short = 'f', long)]

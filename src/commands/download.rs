@@ -186,7 +186,7 @@ fn valid_target(downloader: &Downloader, target: &str) -> bool {
     }
 }
 
-fn tagname_to_ids(targets: &[String]) -> Vec<String> {
+pub(crate) fn tagname_to_ids(targets: &[String]) -> Vec<String> {
     let mut expanded = Vec::new();
 
     for target in targets {
@@ -198,7 +198,7 @@ fn tagname_to_ids(targets: &[String]) -> Vec<String> {
             })
             .unwrap_or_default();
             if tag_ids.is_empty() {
-                expanded.push(target.clone());
+                expanded.push(tag_name.to_string());
             } else {
                 for id in tag_ids {
                     let s = id.to_string();
@@ -214,7 +214,8 @@ fn tagname_to_ids(targets: &[String]) -> Vec<String> {
                 Ok(index.get(tag_name).cloned().unwrap_or_default())
             })
             .unwrap_or_default();
-            let all_ids = narou_rs::db::with_database(|db| Ok(db.ids())).unwrap_or_default();
+            let mut all_ids = narou_rs::db::with_database(|db| Ok(db.ids())).unwrap_or_default();
+            all_ids.sort_unstable();
             for id in all_ids {
                 if !exclude_ids.contains(&id) {
                     let s = id.to_string();
@@ -269,12 +270,12 @@ fn tagname_to_ids(targets: &[String]) -> Vec<String> {
     expanded
 }
 
-struct RecordInfo {
-    id: i64,
-    title: String,
+pub(crate) struct RecordInfo {
+    pub(crate) id: i64,
+    pub(crate) title: String,
 }
 
-fn get_data_by_target(target: &str) -> Option<RecordInfo> {
+pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
     let target_type = Downloader::get_target_type(target);
     match target_type {
         TargetType::Id => {

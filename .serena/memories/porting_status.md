@@ -1,4 +1,4 @@
-# narou.rb Porting Status (updated 2026-04-12)
+# narou.rb Porting Status (updated 2026-04-14)
 
 ## ⚠ 互換性の要件レベル（妥協なし）
 - 外部から観測できる挙動の互換性は**妥協せず完璧に**追求する。
@@ -40,7 +40,7 @@
 | `diff` | ❌ 未実装 | 差分表示 |
 | `send` | ❌ 未実装 | USB 経由端末送信 |
 | `mail` | ❌ 未実装 | Send-to-Kindle |
-| `backup` | ❌ 未実装 | ZIP バックアップ |
+| `backup` | ✅ 完了 | ZIP バックアップ |
 | `clean` | ❌ 未実装 | ゴミファイル削除 |
 | `help` | 🟡 部分 | トップレベルは概ね実装済み。各コマンド `-h` は Ruby版詳細ヘルプとの差分あり |
 | `version` | 🟡 部分 | `-v`/`--version` と `--more` を実装。Ruby版の出力細部は継続確認 |

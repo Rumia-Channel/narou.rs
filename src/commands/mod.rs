@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod convert;
 pub mod download;
 pub mod help;

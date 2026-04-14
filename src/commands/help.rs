@@ -749,11 +749,11 @@ const BROWSER_HELP: CmdHelp = CmdHelp {
 };
 
 const BACKUP_HELP: CmdHelp = CmdHelp {
-    banner: "[<target>]",
+    banner: "<target> [<target2> ...]",
     description: "\
-  ・小説のバックアップを作成します。
-  ・対象を指定しなかった場合、最後に変換した小説が対象になります。
-  ・バックアップは <novel_dir>/backup/ にZIP形式で保存されます。
+  ・指定した小説のバックアップを作成します。
+  ・バックアップファイルはZIP圧縮され、小説保存フォルダ直下のbackupフォルダに保存されます。
+  ・バックアップ対象は、バックアップファイル以外の小説保存フォルダにあるファイル全てが対象です。
 
   Examples:
     narou backup 0
