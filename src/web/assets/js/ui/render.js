@@ -122,11 +122,14 @@ function createRow(novel) {
 
   const idText = isFrozen ? `＊${novel.id}` : String(novel.id);
 
-  // New arrival mark
-  let updateCell = formatDate(novel.last_update);
+  // New arrival mark + time badge on last_update
+  let updateCell = '';
   if (novel.new_arrivals) {
-    updateCell = `<span class="status-new-dot" title="新着">●</span> ${updateCell}`;
+    updateCell += '<span class="status-new-dot" title="新着">●</span> ';
   }
+  const updateBadge = getTimeBadge(novel.last_update);
+  if (updateBadge) updateCell += updateBadge + ' ';
+  updateCell += formatDate(novel.last_update);
 
   // general_lastup with time badge
   let glCell = '';
@@ -142,7 +145,6 @@ function createRow(novel) {
 
   // Status
   const statusParts = [];
-  if (novel.novel_type) statusParts.push(esc(novel.novel_type));
   if (novel.end === false || novel.end === 0) statusParts.push('連載中');
   else if (novel.end === true || novel.end === 1) statusParts.push('完結');
 
@@ -152,8 +154,9 @@ function createRow(novel) {
     ? `<a href="${esc(tocUrl)}" target="_blank" rel="noopener" class="toc-link" title="${esc(tocUrl)}">&#x1F517;</a>`
     : '';
 
-  // Length
-  const lengthText = novel.length != null ? formatLength(novel.length) : '';
+  // Length (episode count)
+  const episodeCount = novel.general_all_no != null ? novel.general_all_no : novel.length;
+  const lengthText = episodeCount != null ? String(episodeCount) : '';
 
   // Menu button (opens context menu)
   const menuBtn = `<button class="row-action-btn btn-menu-icon" data-menu-id="${novel.id}" type="button" title="メニュー">&#x22EE;</button>`;
@@ -161,6 +164,7 @@ function createRow(novel) {
   tr.innerHTML = `
     <td class="col-id">${esc(idText)}</td>
     <td class="col-update">${updateCell}</td>
+    <td class="col-general-lastup">${glCell}</td>
     <td class="col-title">${esc(novel.title || '')}</td>
     <td class="col-author"><span class="filterable" data-filter="${esc(novel.author || '')}">${esc(novel.author || '')}</span></td>
     <td class="col-site"><span class="filterable" data-filter="${esc(novel.sitename || '')}">${esc(novel.sitename || '')}</span></td>
@@ -399,7 +403,7 @@ function formatDate(dateStr) {
   const day = String(d.getDate()).padStart(2, '0');
   const h = String(d.getHours()).padStart(2, '0');
   const min = String(d.getMinutes()).padStart(2, '0');
-  return `${y}/${m}/${day}\n${h}:${min}`;
+  return `${y}/${m}/${day} ${h}:${min}`;
 }
 
 function formatLength(n) {

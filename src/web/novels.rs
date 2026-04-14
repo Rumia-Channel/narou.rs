@@ -95,7 +95,7 @@ pub async fn api_list(
                 last_update: r.last_update.format("%Y-%m-%d %H:%M").to_string(),
                 general_lastup: r
                     .general_lastup
-                    .map(|d: chrono::DateTime<chrono::Utc>| d.format("%Y-%m-%d").to_string()),
+                    .map(|d: chrono::DateTime<chrono::Utc>| d.format("%Y-%m-%d %H:%M").to_string()),
                 tags: r.tags.clone(),
                 new_arrivals: false,
                 frozen: record_is_frozen(r, &frozen_ids),

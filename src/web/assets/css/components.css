@@ -245,8 +245,11 @@
   background-color: var(--table-hover-bg);
 }
 
+.table tbody tr.selected > * {
+  box-shadow: inset 0 0 0 9999em rgba(255, 212, 0, 0.3);
+}
+
 .table tbody tr.selected {
-  background-color: var(--table-selected-bg);
   font-weight: bold;
 }
 
@@ -254,14 +257,20 @@
   background-color: var(--table-frozen-tint);
 }
 
+.table tbody tr.frozen td {
+  color: #6caddd;
+}
+
 .table tbody tr {
   cursor: pointer;
   transition: background-color 0.1s;
+  user-select: none;
 }
 
 /* Column widths */
 .col-id { width: 3em; text-align: right; }
 .col-update { width: 7.5em; white-space: nowrap; }
+.col-general-lastup { width: 7.5em; white-space: nowrap; }
 .col-title { min-width: 10em; }
 .col-author { width: 7em; }
 .col-site { width: 6em; }

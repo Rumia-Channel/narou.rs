@@ -46,6 +46,9 @@
                 <li><a href="#" id="action-view-toggle-buttons-top"><span class="check-mark"></span> ボタンをページ上部に表示</a></li>
                 <li><a href="#" id="action-view-toggle-buttons-footer"><span class="check-mark"></span> ボタンを画面下部に表示</a></li>
                 <li class="divider"></li>
+                <li><a href="#" id="action-view-link-to-edit-menu">個別メニューを編集...</a></li>
+                <li><a href="#" id="action-view-select-menu-style">個別メニューの表示スタイルを選択</a></li>
+                <li class="divider"></li>
                 <li><a href="#" id="action-view-reset">表示設定を全てリセット</a></li>
               </ul>
             </li>
@@ -83,10 +86,13 @@
                 <span data-i18n="menuTool">ツール</span> <span class="caret"></span>
               </a>
               <ul class="dropdown-menu" id="tool-menu">
+                <li><a href="#" id="action-tool-dnd-window">D&amp;Dウィンドウを開く</a></li>
+                <li class="divider"></li>
                 <li><a href="#" id="action-tool-csv-download">CSV形式でリストをダウンロード</a></li>
                 <li><a href="#" id="action-tool-csv-import">CSVファイルからインポート</a></li>
                 <li class="divider"></li>
-                <li><a href="#" id="action-tool-notepad">メモ帳（ポップアップ）</a></li>
+                <li><a href="#" id="action-tool-notepad">メモ帳（別ページ）</a></li>
+                <li><a href="#" id="action-tool-notepad-popup">メモ帳（ポップアップ）</a></li>
               </ul>
             </li>
           </ul>
@@ -239,6 +245,7 @@
             <tr>
               <th class="col-id sortable" data-sort="id">ID</th>
               <th class="col-update sortable active-sort" data-sort="last_update">最終更新日</th>
+              <th class="col-general-lastup sortable" data-sort="general_lastup">最新話掲載日</th>
               <th class="col-title sortable" data-sort="title">タイトル</th>
               <th class="col-author sortable" data-sort="author">作者</th>
               <th class="col-site sortable" data-sort="sitename">サイト名</th>
