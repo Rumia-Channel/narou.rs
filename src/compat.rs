@@ -275,7 +275,9 @@ pub fn convert_existing_novel(
     }
 
     if let Some(device) = device {
-        let _ = copy_to_converted_file(&output_path, Some(device), id);
+        if let Ok(Some(path)) = copy_to_converted_file(&output_path, Some(device), id) {
+            println!("{} へコピーしました", path.display());
+        }
         let _ = send_file_to_device(&output_path, device);
     }
 
@@ -286,7 +288,7 @@ pub fn convert_existing_novel(
     Ok(output_path)
 }
 
-fn copy_to_converted_file(
+pub fn copy_to_converted_file(
     src_path: &Path,
     device: Option<Device>,
     novel_id: i64,
@@ -303,7 +305,6 @@ fn copy_to_converted_file(
             .ok_or_else(|| "Invalid converted filename".to_string())?,
     );
     fs::copy(src_path, &dst).map_err(|e| e.to_string())?;
-    println!("{} へコピーしました", dst.display());
     Ok(Some(dst))
 }
 

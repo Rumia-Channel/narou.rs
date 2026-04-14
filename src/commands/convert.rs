@@ -134,6 +134,9 @@ pub fn cmd_convert(
                         .parent()
                         .map(|path| path.to_path_buf());
                 }
+                if let Err(err) = print_copy_to_result(&output_path, device, id, &multi_clone) {
+                    let _ = multi_clone.println(&err);
+                }
                 if let Some(inspection) = converter.take_inspection_output() {
                     for line in inspection.split('\n') {
                         let _ = multi_clone.println(line);
@@ -214,6 +217,9 @@ fn convert_text_target(
                     .parent()
                     .map(|path| path.to_path_buf());
             }
+            if let Err(err) = print_copy_to_result(&output_path, device, 0, multi_clone) {
+                let _ = multi_clone.println(&err);
+            }
             print_inspection_output(&mut converter, multi_clone);
         }
         Err(e) => {
@@ -239,6 +245,20 @@ fn print_inspection_output(converter: &mut NovelConverter, multi_clone: &indicat
             let _ = multi_clone.println(line);
         }
     }
+}
+
+fn print_copy_to_result(
+    output_path: &str,
+    device: Option<narou_rs::converter::device::Device>,
+    novel_id: i64,
+    multi_clone: &indicatif::MultiProgress,
+) -> std::result::Result<(), String> {
+    if let Some(path) =
+        narou_rs::compat::copy_to_converted_file(Path::new(output_path), device, novel_id)?
+    {
+        let _ = multi_clone.println(&format!("{} へコピーしました", path.display()));
+    }
+    Ok(())
 }
 
 fn split_output_name(output: &str) -> (String, String) {

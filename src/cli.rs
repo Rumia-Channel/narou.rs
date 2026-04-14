@@ -321,6 +321,12 @@ fn is_terminal_stdin() -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn cwd_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn version_flag_becomes_version_command() {
@@ -360,6 +366,7 @@ mod tests {
 
     #[test]
     fn convert_no_open_is_injected_from_local_setting() {
+        let _guard = cwd_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "narou-rs-cli-no-open-{}",
             std::time::SystemTime::now()
@@ -393,6 +400,7 @@ mod tests {
 
     #[test]
     fn convert_no_epub_is_injected_from_local_setting() {
+        let _guard = cwd_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "narou-rs-cli-no-epub-{}",
             std::time::SystemTime::now()
