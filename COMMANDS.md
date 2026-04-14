@@ -92,7 +92,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `setting` | ✅ | ✅ 完了 | 基本読み書き、`--burn`、dynamic `default/force/default_args`、hidden select 値検証、`setting -a` の全変数一覧まで Ruby 互換に揃えた |
 | `diff` | ✅ | ✅ 完了 | 外部 diff ツール、raw データ管理 |
 | `send` | ✅ | ✅ 完了 | Kindle/Kobo/Reader 送信、`--without-freeze`、栞 backup/restore、hotentry を実装 |
-| `mail` | ✅ | 🟡 部分 | `mail_setting.yaml` bootstrap / 不完全設定 path 表示 / spinner / hotentry / `last_mail_date` 差分送信まで実装。Pony 互換と割り込み周辺の最終確認が残る |
+| `mail` | ✅ | 🟡 部分 | `mail_setting.yaml` bootstrap / 不完全設定 path 表示 / spinner / hotentry / `last_mail_date` 差分送信、Pony寄りの SMTP/TLS オプション受理までは実装。実SMTP の最終確認が残る |
 | `backup` | ✅ | ✅ 完了 | `narou backup`/複数 target、`backup/` 除外、180バイト切り詰めまで対応 |
 | `clean` | ✅ | ✅ 完了 | `latest_convert` 既定値、`--all`、`--force`/`--dry-run`、freeze スキップ、`raw/*.txt|*.html` と `本文/*.yaml` の orphan 判定を実装 |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
@@ -507,11 +507,12 @@ narou setting name         # 読み取り
 - `hotentry` 特別扱い、tag 展開、alias / タイトル / URL / Nコード解決に対応
 - 送信中は `メールを送信しています...` の進捗表示を行い、成功時に `last_mail_date` を更新する
 - `smtp` 経路では preset に含まれる `via_options.domain` を EHLO 名へ反映し、`authentication` は `:plain` / `:login` / `:xoauth2` を受理する
+- `smtp` の TLS 解釈は Ruby/Pony 寄りに拡張し、`ssl` / `tls` / `enable_starttls` / `enable_starttls_auto` と `openssl_verify_mode: :none` を受理する
 - message 生成では `reply_to` / `cc` / `bcc` を受理し、複数宛先は YAML sequence またはカンマ区切り文字列で解釈する
 
 **完了扱いにしない理由 / 不足動作**:
-- Ruby版 Mailer/Pony 設定の全オプション互換は未確認で、現状は `smtp` 経路を主対象にしている
-- Ctrl+C 割り込みの runtime 最終確認と、実SMTPを使った end-to-end 検証がまだ不足
+- Ruby版 Mailer/Pony 設定のうち `smtp` 以外の経路や周辺オプションは未確認
+- 実SMTP を使った sender-side / arrival-side の end-to-end 検証がまだ不足
 
 ---
 

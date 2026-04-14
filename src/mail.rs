@@ -9,6 +9,7 @@ use std::time::Duration;
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, Body, Mailbox, Message, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
+use lettre::transport::smtp::client::{Tls, TlsParametersBuilder};
 use lettre::transport::smtp::extension::ClientId;
 use lettre::{SmtpTransport, Transport};
 
@@ -22,6 +23,14 @@ use crate::error::Result;
 
 pub const MAIL_SETTING_FILE: &str = "mail_setting.yaml";
 pub const MAIL_INTERRUPTED_MESSAGE: &str = "メール送信を中断しました";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmtpTlsMode {
+    None,
+    Opportunistic,
+    Required,
+    Wrapper,
+}
 
 #[derive(Debug, Clone)]
 pub struct MailSetting {
@@ -218,7 +227,10 @@ pub fn send_target_with_setting_interruptible(
         return Ok(false);
     }
 
-    println!("{}", green_bold(&format!("ID:{}　{}", record.id, record.title)));
+    println!(
+        "{}",
+        green_bold(&format!("ID:{}　{}", record.id, record.title))
+    );
 
     for ebook_path in ebook_paths {
         if !ebook_path.exists() {
@@ -315,7 +327,9 @@ fn build_message(
     let attachment_name = attachment_name(id, attachment_path);
     let attachment_bytes = std::fs::read(attachment_path).map_err(|e| e.to_string())?;
 
-    let mut builder = Message::builder().from(from).subject(setting.subject.clone());
+    let mut builder = Message::builder()
+        .from(from)
+        .subject(setting.subject.clone());
     for mailbox in to {
         builder = builder.to(mailbox);
     }
@@ -392,20 +406,13 @@ fn build_transport(setting: &MailSetting) -> std::result::Result<SmtpTransport, 
     let user_name = yaml_string(via_options.get("user_name")).unwrap_or_default();
     let password = yaml_string(via_options.get("password")).unwrap_or_default();
     let authentication = smtp_auth_mechanisms(via_options.get("authentication"));
-    let enable_starttls_auto = yaml_bool(via_options.get("enable_starttls_auto")).unwrap_or(true);
     let domain = yaml_string(via_options.get("domain")).filter(|value| !value.is_empty());
+    let tls_mode = smtp_tls_mode(via_options, port);
 
-    let mut builder = if port == 465 {
-        SmtpTransport::relay(&host)
-            .map_err(|e| e.to_string())?
-            .port(port)
-    } else if enable_starttls_auto {
-        SmtpTransport::starttls_relay(&host)
-            .map_err(|e| e.to_string())?
-            .port(port)
-    } else {
-        SmtpTransport::builder_dangerous(&host).port(port)
-    };
+    let mut builder = SmtpTransport::builder_dangerous(&host).port(port);
+    if let Some(tls) = smtp_tls(via_options, tls_mode, domain.as_deref().unwrap_or(&host))? {
+        builder = builder.tls(tls);
+    }
 
     if !user_name.is_empty() {
         builder = builder.credentials(Credentials::new(user_name, password));
@@ -420,6 +427,58 @@ fn build_transport(setting: &MailSetting) -> std::result::Result<SmtpTransport, 
     }
 
     Ok(builder.build())
+}
+
+fn smtp_tls_mode(via_options: &HashMap<String, serde_yaml::Value>, port: u16) -> SmtpTlsMode {
+    if yaml_bool(via_options.get("ssl")).unwrap_or(false)
+        || yaml_bool(via_options.get("tls")).unwrap_or(false)
+        || port == 465
+    {
+        return SmtpTlsMode::Wrapper;
+    }
+    if yaml_bool(via_options.get("enable_starttls")).unwrap_or(false) {
+        return SmtpTlsMode::Required;
+    }
+    if yaml_bool(via_options.get("enable_starttls_auto")).unwrap_or(true) {
+        return SmtpTlsMode::Opportunistic;
+    }
+    SmtpTlsMode::None
+}
+
+fn smtp_tls(
+    via_options: &HashMap<String, serde_yaml::Value>,
+    mode: SmtpTlsMode,
+    tls_domain: &str,
+) -> std::result::Result<Option<Tls>, String> {
+    if mode == SmtpTlsMode::None {
+        return Ok(None);
+    }
+
+    let mut builder = TlsParametersBuilder::new(tls_domain.to_string());
+    if smtp_accept_invalid_certs(via_options) {
+        builder = builder
+            .dangerous_accept_invalid_certs(true)
+            .dangerous_accept_invalid_hostnames(true);
+    }
+    let params = builder.build().map_err(|e| e.to_string())?;
+    let tls = match mode {
+        SmtpTlsMode::None => unreachable!(),
+        SmtpTlsMode::Opportunistic => Tls::Opportunistic(params),
+        SmtpTlsMode::Required => Tls::Required(params),
+        SmtpTlsMode::Wrapper => Tls::Wrapper(params),
+    };
+    Ok(Some(tls))
+}
+
+fn smtp_accept_invalid_certs(via_options: &HashMap<String, serde_yaml::Value>) -> bool {
+    yaml_string(via_options.get("openssl_verify_mode"))
+        .map(|mode| {
+            matches!(
+                mode.trim_start_matches(':').to_ascii_lowercase().as_str(),
+                "none" | "verify_none"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn resolve_record(target: &str) -> std::result::Result<Option<NovelRecord>, String> {
@@ -692,12 +751,14 @@ fn yaml_string_list(value: Option<&serde_yaml::Value>) -> Vec<String> {
 fn smtp_auth_mechanisms(value: Option<&serde_yaml::Value>) -> Vec<Mechanism> {
     yaml_string_list(value)
         .into_iter()
-        .filter_map(|raw| match raw.trim_start_matches(':').to_ascii_lowercase().as_str() {
-            "plain" => Some(Mechanism::Plain),
-            "login" => Some(Mechanism::Login),
-            "xoauth2" => Some(Mechanism::Xoauth2),
-            _ => None,
-        })
+        .filter_map(
+            |raw| match raw.trim_start_matches(':').to_ascii_lowercase().as_str() {
+                "plain" => Some(Mechanism::Plain),
+                "login" => Some(Mechanism::Login),
+                "xoauth2" => Some(Mechanism::Xoauth2),
+                _ => None,
+            },
+        )
         .collect()
 }
 
@@ -746,12 +807,13 @@ fn preset_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAIL_INTERRUPTED_MESSAGE, MailSetting, attachment_name, build_message,
-        build_transport, send_mail_with_progress, smtp_auth_mechanisms,
+        MAIL_INTERRUPTED_MESSAGE, MailSetting, SmtpTlsMode, attachment_name, build_message,
+        build_transport, send_mail_with_progress, smtp_accept_invalid_certs, smtp_auth_mechanisms,
+        smtp_tls_mode,
     };
+    use lettre::transport::smtp::authentication::Mechanism;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
-    use lettre::transport::smtp::authentication::Mechanism;
     use tempfile::TempDir;
 
     #[test]
@@ -776,14 +838,8 @@ mod tests {
             extras: HashMap::new(),
         };
 
-        let err = send_mail_with_progress(
-            &setting,
-            "1",
-            "body",
-            &attachment,
-            Some(&interrupted),
-        )
-        .unwrap_err();
+        let err = send_mail_with_progress(&setting, "1", "body", &attachment, Some(&interrupted))
+            .unwrap_err();
 
         assert_eq!(err, MAIL_INTERRUPTED_MESSAGE);
     }
@@ -845,6 +901,32 @@ mod tests {
         };
 
         build_transport(&setting).unwrap();
+    }
+
+    #[test]
+    fn smtp_tls_mode_matches_pony_style_flags() {
+        let mut via_options = HashMap::new();
+        assert_eq!(smtp_tls_mode(&via_options, 587), SmtpTlsMode::Opportunistic);
+
+        via_options.insert("enable_starttls".to_string(), serde_yaml::Value::Bool(true));
+        assert_eq!(smtp_tls_mode(&via_options, 587), SmtpTlsMode::Required);
+
+        via_options.remove("enable_starttls");
+        via_options.insert("ssl".to_string(), serde_yaml::Value::Bool(true));
+        assert_eq!(smtp_tls_mode(&via_options, 587), SmtpTlsMode::Wrapper);
+
+        assert_eq!(smtp_tls_mode(&HashMap::new(), 465), SmtpTlsMode::Wrapper);
+    }
+
+    #[test]
+    fn smtp_accept_invalid_certs_recognizes_verify_none() {
+        let mut via_options = HashMap::new();
+        via_options.insert(
+            "openssl_verify_mode".to_string(),
+            serde_yaml::Value::String(":none".to_string()),
+        );
+
+        assert!(smtp_accept_invalid_certs(&via_options));
     }
 
     #[test]
