@@ -240,12 +240,13 @@ async function downloadCsv() {
 
 export async function refreshList() {
   try {
-    const data = await fetchJson('/api/list');
-    if (data && Array.isArray(data.novels)) {
-      State.novels = data.novels;
-      if (data.frozen_ids) {
-        State.frozenIds = new Set(data.frozen_ids.map(String));
-      }
+    const resp = await fetchJson('/api/list');
+    if (resp && Array.isArray(resp.data)) {
+      State.novels = resp.data;
+      // Build frozen set from each record's frozen flag
+      State.frozenIds = new Set(
+        resp.data.filter(n => n.frozen).map(n => String(n.id))
+      );
     }
   } catch { /* ignore */ }
   renderNovelList();

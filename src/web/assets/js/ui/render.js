@@ -178,11 +178,8 @@ function renderTags(tags) {
 
 function renderStatus(novel) {
   const parts = [];
-  if (novel.new_arrival_date) {
+  if (novel.new_arrivals) {
     parts.push(`<span class="status-new">${t('statusNew')}</span>`);
-  }
-  if (novel.new_update_date) {
-    parts.push(`<span class="status-updated">${t('statusUpdated')}</span>`);
   }
   if (novel.general_lastup) {
     const badge = getTimeBadge(novel.general_lastup);
