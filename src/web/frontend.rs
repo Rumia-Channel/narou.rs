@@ -12,6 +12,14 @@ pub async fn settings_page() -> Html<&'static str> {
     Html(include_str!("assets/settings.html"))
 }
 
+pub async fn help_page() -> Html<&'static str> {
+    Html(include_str!("assets/help.html"))
+}
+
+pub async fn novel_setting_page(Path(_id): Path<i64>) -> Html<&'static str> {
+    Html(include_str!("assets/novel_setting.html"))
+}
+
 pub async fn asset(Path(path): Path<String>) -> Response {
     let (content_type, body) = match path.as_str() {
         "css/theme.css" => ("text/css; charset=utf-8", include_str!("assets/css/theme.css")),

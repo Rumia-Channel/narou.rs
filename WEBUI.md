@@ -12,10 +12,10 @@
 | # | パス | 説明 | Rust |
 |---|------|------|------|
 | 1 | `/` | メインページ (小説リスト・コンソール・コントロール) | 🟡 |
-| 2 | `/settings` | 環境設定ページ (グローバル/ローカル設定) | ❌ |
-| 3 | `/help` | ヘルプページ | ❌ |
+| 2 | `/settings` | 環境設定ページ (グローバル/ローカル設定) | ✅ |
+| 3 | `/help` | ヘルプページ | ✅ |
 | 4 | `/about` | About ダイアログ (部分テンプレート) | ❌ |
-| 5 | `/novels/:id/setting` | 個別小説の変換設定 (GET/POST) | ❌ |
+| 5 | `/novels/:id/setting` | 個別小説の変換設定 (GET/POST) | ✅ |
 | 6 | `/novels/:id/author_comments` | 前書き/後書きビューア | ❌ |
 | 7 | `/novels/:id/download` | EPUB/端末ファイルのDL | ❌ |
 | 8 | `/notepad` | メモ帳 (別ページ版) | ❌ |
@@ -439,14 +439,14 @@ Ruby版: bootbox.js ベースのカスタム確認ダイアログ
 | エンドポイント | メソッド | 説明 | Rust |
 |-------------|--------|------|------|
 | `/api/convert` | POST | 変換 | ✅ |
-| `/api/mail` | POST | メール送信 | ❌ |
-| `/api/send` | POST | 端末送信 | ❌ |
-| `/api/backup` | POST | バックアップ | ❌ |
-| `/api/inspect` | POST | 調査 | ❌ |
+| `/api/mail` | POST | メール送信 | ✅ |
+| `/api/send` | POST | 端末送信 | ✅ |
+| `/api/backup` | POST | バックアップ | ✅ |
+| `/api/inspect` | POST | 調査 | ✅ |
 | `/api/diff` | POST | 差分表示 | ❌ |
-| `/api/diff_list` | GET | 差分リスト取得 | ❌ |
+| `/api/diff_list` | GET | 差分リスト取得 | ✅ |
 | `/api/diff_clean` | POST | 差分キャッシュ削除 | ❌ |
-| `/api/folder` | POST | フォルダを開く | ❌ |
+| `/api/folder` | POST | フォルダを開く | ✅ |
 | `/api/backup_bookmark` | POST | 栞バックアップ | ❌ |
 
 ### 6.4 凍結・削除
@@ -478,7 +478,7 @@ Ruby版: bootbox.js ベースのカスタム確認ダイアログ
 | `/api/remove_pending_task` | POST | タスク削除 | ❌ |
 | `/api/restore_pending_tasks` | POST | タスク復元 | ❌ |
 | `/api/cancel_running_task` | POST | 実行中タスク取消 | ❌ |
-| `/api/cancel` | POST | キャンセル | ❌ |
+| `/api/cancel` | POST | キャンセル | ✅ |
 
 ### 6.7 ユーティリティ
 
@@ -487,8 +487,8 @@ Ruby版: bootbox.js ベースのカスタム確認ダイアログ
 | `/api/history` | GET | コンソール履歴 | ❌ |
 | `/api/clear_history` | POST | 履歴消去 | ❌ |
 | `/api/story` | GET | あらすじ取得 | ❌ |
-| `/api/csv/download` | GET | CSV エクスポート | ❌ |
-| `/api/csv/import` | POST | CSV インポート | ❌ |
+| `/api/csv/download` | GET | CSV エクスポート | ✅ |
+| `/api/csv/import` | POST | CSV インポート | ✅ |
 | `/api/notepad/read` | GET | メモ帳読取 | ✅ |
 | `/api/notepad/save` | POST | メモ帳保存 | ✅ |
 | `/api/version/current.json` | GET | 現在バージョン | ✅ |
@@ -500,7 +500,7 @@ Ruby版: bootbox.js ベースのカスタム確認ダイアログ
 | エンドポイント | メソッド | 説明 | Rust |
 |-------------|--------|------|------|
 | `/shutdown` | POST | シャットダウン | ✅ |
-| `/reboot` | POST | 再起動 | ❌ |
+| `/reboot` | POST | 再起動 | ✅ |
 | `/update_system` | POST | システム更新 | ❌ |
 | `/check_already_update_system` | GET | 更新チェック | ❌ |
 | `/api/eject` | POST | 端末取出し | ❌ |

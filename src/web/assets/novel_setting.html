@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>narou.rs - 個別設定</title>
+<style>
+body { font-family: sans-serif; max-width: 900px; margin: 2em auto; padding: 0 1em; color: #333; }
+h1 { border-bottom: 2px solid #4a90d9; padding-bottom: .3em; font-size: 1.4em; }
+.loading { color: #888; }
+.error { color: #c33; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid #ddd; padding: .5em .7em; text-align: left; }
+th { background: #f8f8f8; width: 30%; }
+input[type=text], input[type=number], select { width: 100%; padding: .3em; box-sizing: border-box; }
+input[type=checkbox] { transform: scale(1.2); }
+.actions { margin: 1.5em 0; }
+.btn { padding: .5em 1.5em; background: #4a90d9; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 1em; }
+.btn:hover { background: #357abd; }
+.btn-secondary { background: #888; }
+.btn-secondary:hover { background: #666; }
+.msg { margin: .5em 0; padding: .5em; border-radius: 4px; }
+.msg-success { background: #dfd; color: #262; }
+.msg-error { background: #fdd; color: #622; }
+</style>
+</head>
+<body>
+<h1 id="page-title">個別設定</h1>
+<div id="content"><p class="loading">読み込み中...</p></div>
+<div class="actions">
+  <button class="btn" id="save-btn" style="display:none">保存</button>
+  <button class="btn btn-secondary" onclick="location.href='/'">戻る</button>
+</div>
+<div id="msg"></div>
+
+<script>
+(async () => {
+  const path = location.pathname;
+  const m = path.match(/^\/novels\/(\d+)\/setting$/);
+  if (!m) { document.getElementById('content').innerHTML = '<p class="error">不正なURL</p>'; return; }
+  const id = m[1];
+
+  try {
+    const resp = await fetch(`/api/settings/${id}`);
+    if (!resp.ok) throw new Error(await resp.text());
+    const data = await resp.json();
+    document.getElementById('page-title').textContent = `個別設定: ${data.title || 'ID ' + id}`;
+    renderSettings(data);
+    document.getElementById('save-btn').style.display = '';
+    document.getElementById('save-btn').addEventListener('click', () => saveSettings(id));
+  } catch (e) {
+    document.getElementById('content').innerHTML = `<p class="error">${e.message}</p>`;
+  }
+})();
+
+function renderSettings(data) {
+  const skip = new Set(['id','title','author','archive_path','replace_patterns']);
+  const entries = Object.entries(data).filter(([k]) => !skip.has(k));
+  if (entries.length === 0) {
+    document.getElementById('content').innerHTML = '<p>設定項目がありません</p>';
+    return;
+  }
+  let html = '<table>';
+  for (const [key, val] of entries) {
+    html += `<tr><th>${esc(key)}</th><td>${inputFor(key, val)}</td></tr>`;
+  }
+  html += '</table>';
+  document.getElementById('content').innerHTML = html;
+}
+
+function inputFor(key, val) {
+  const id = `setting-${key}`;
+  if (typeof val === 'boolean') {
+    return `<input type="checkbox" id="${id}" data-key="${esc(key)}" data-type="bool" ${val ? 'checked' : ''}>`;
+  }
+  if (typeof val === 'number') {
+    return `<input type="number" id="${id}" data-key="${esc(key)}" data-type="number" value="${val}">`;
+  }
+  const s = val == null ? '' : String(val);
+  return `<input type="text" id="${id}" data-key="${esc(key)}" data-type="string" value="${esc(s)}">`;
+}
+
+async function saveSettings(id) {
+  const body = {};
+  document.querySelectorAll('[data-key]').forEach(el => {
+    const key = el.dataset.key;
+    if (el.dataset.type === 'bool') body[key] = el.checked;
+    else if (el.dataset.type === 'number') body[key] = Number(el.value);
+    else body[key] = el.value;
+  });
+  try {
+    const resp = await fetch(`/api/settings/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const result = await resp.json();
+    const msg = document.getElementById('msg');
+    msg.className = result.success ? 'msg msg-success' : 'msg msg-error';
+    msg.textContent = result.message || (result.success ? '保存しました' : 'エラー');
+  } catch (e) {
+    const msg = document.getElementById('msg');
+    msg.className = 'msg msg-error';
+    msg.textContent = e.message;
+  }
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+</script>
+</body>
+</html>

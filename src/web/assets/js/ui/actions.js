@@ -41,7 +41,7 @@ export function bindActions() {
 
   El.consoleHistory?.addEventListener('click', async () => {
     try {
-      const data = await fetchJson('/api/recent_logs');
+      const data = await fetchJson('/api/log/recent');
       if (data?.logs && El.console) {
         El.console.textContent = data.logs;
         El.console.scrollTop = El.console.scrollHeight;
@@ -483,7 +483,7 @@ export function bindActions() {
     freezeToggle: async (id) => {
       const novel = State.novels.find(n => n.id === id);
       const endpoint = novel?.frozen ? '/api/novels/unfreeze' : '/api/novels/freeze';
-      await postJson(endpoint, { ids: [String(id)] });
+      await postJson(endpoint, { ids: [Number(id)] });
       await refreshList();
     },
     updateSingle: (id) => postJson('/api/update', { targets: [String(id)] }),
@@ -492,7 +492,7 @@ export function bindActions() {
     removeSingle: async (id) => {
       const novel = State.novels.find(n => n.id === id);
       if (!confirm(`「${novel?.title || id}」を削除しますか？`)) return;
-      await postJson('/api/novels/remove', { ids: [String(id)] });
+      await postJson('/api/novels/remove', { ids: [Number(id)] });
       await refreshList();
     },
     convertSingle: (id) => postJson('/api/convert', { targets: [String(id)] }),
@@ -584,7 +584,7 @@ function setSelectMode(mode) {
 
 async function batchAction(endpoint) {
   if (State.selectedIds.size === 0) return;
-  await postJson(endpoint, { ids: [...State.selectedIds] });
+  await postJson(endpoint, { ids: [...State.selectedIds].map(Number) });
   await refreshList();
 }
 
@@ -664,7 +664,7 @@ async function openNotepad() {
 
 async function openAbout() {
   try {
-    const data = await fetchJson('/api/version');
+    const data = await fetchJson('/api/version/current.json');
     if (El.aboutVersion) {
       El.aboutVersion.textContent = data?.version || '-';
     }

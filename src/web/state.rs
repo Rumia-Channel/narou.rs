@@ -70,12 +70,17 @@ pub struct TagsBody {
 #[derive(Debug, Deserialize)]
 pub struct DownloadBody {
     pub targets: Vec<String>,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub mail: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateBody {
-    pub ids: Option<Vec<i64>>,
-    pub all: Option<bool>,
+    pub targets: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,4 +92,14 @@ pub struct ConvertBody {
 #[derive(Debug, Deserialize)]
 pub struct LogsParams {
     pub count: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TargetsBody {
+    pub targets: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CsvImportBody {
+    pub csv: String,
 }

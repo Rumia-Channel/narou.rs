@@ -25,6 +25,9 @@ pub enum JobType {
     Download,
     Update,
     Convert,
+    Send,
+    Backup,
+    Mail,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +215,9 @@ fn generate_job_id(job_type: JobType, target: &str) -> String {
         JobType::Download => "dl".hash(&mut hasher),
         JobType::Update => "up".hash(&mut hasher),
         JobType::Convert => "cv".hash(&mut hasher),
+        JobType::Send => "sd".hash(&mut hasher),
+        JobType::Backup => "bk".hash(&mut hasher),
+        JobType::Mail => "ml".hash(&mut hasher),
     }
     target.hash(&mut hasher);
     std::process::id().hash(&mut hasher);

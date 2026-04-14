@@ -59,12 +59,21 @@ fn execute_job(root_dir: &Path, job: &QueueJob) -> bool {
 
     match job.job_type {
         JobType::Download => {
-            command.arg("download").arg(&job.target);
+            command.arg("download");
+            for part in job.target.split('\t') {
+                if !part.is_empty() {
+                    command.arg(part);
+                }
+            }
         }
         JobType::Update => {
             command.arg("update");
             if !job.target.is_empty() {
-                command.arg(&job.target);
+                for part in job.target.split('\t') {
+                    if !part.is_empty() {
+                        command.arg(part);
+                    }
+                }
             }
         }
         JobType::Convert => {
@@ -72,6 +81,20 @@ fn execute_job(root_dir: &Path, job: &QueueJob) -> bool {
             command.arg("convert").arg("--no-open").arg(target);
             if let Some(device) = device {
                 command.env("NAROU_RS_WEB_DEVICE", device);
+            }
+        }
+        JobType::Send => {
+            command.arg("send").arg(&job.target);
+        }
+        JobType::Backup => {
+            command.arg("backup").arg(&job.target);
+        }
+        JobType::Mail => {
+            command.arg("send").arg("--mail");
+            for part in job.target.split('\t') {
+                if !part.is_empty() {
+                    command.arg(part);
+                }
             }
         }
     }
