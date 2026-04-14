@@ -301,7 +301,10 @@ pub(crate) struct RecordInfo {
 
 enum ExistingDownloadState {
     Present(RecordInfo),
-    Missing { record: RecordInfo, path: std::path::PathBuf },
+    Missing {
+        record: RecordInfo,
+        path: std::path::PathBuf,
+    },
 }
 
 pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {

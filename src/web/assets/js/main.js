@@ -5,7 +5,7 @@ import { State, El, initElements } from './core/state.js';
 import { fetchJson } from './core/http.js';
 import { applyI18n } from './ui/i18n.js';
 import { initDropdowns } from './ui/dropdown.js';
-import { renderNovelList, renderQueueStatus, renderTagList } from './ui/render.js';
+import { renderNovelList, renderQueueStatus, renderTagList, syncViewChecks } from './ui/render.js';
 import { bindActions, refreshList, refreshQueue, refreshTags } from './ui/actions.js';
 
 let ws = null;
@@ -16,13 +16,15 @@ async function init() {
   applyI18n();
   bindActions();
 
-  // Load config
+  // Load config from server
   try {
     const config = await fetchJson('/api/webui/config');
     if (config) {
-      if (config.theme) {
+      if (config.theme && !localStorage.getItem('narou-rs-webui-theme')) {
         State.theme = config.theme;
-        document.documentElement.dataset.theme = config.theme;
+        document.documentElement.dataset.theme = config.theme === 'default' ? '' : config.theme;
+        const sel = El.themeSelect;
+        if (sel) sel.value = config.theme;
       }
       if (config.ws_port) State.wsPort = config.ws_port;
       if (config.performance_mode) State.performanceMode = config.performance_mode;
@@ -36,6 +38,9 @@ async function init() {
 
   // Initial data load
   await Promise.all([refreshList(), refreshQueue(), refreshTags()]);
+
+  // Sync UI state (check marks, wide mode, footer)
+  syncViewChecks();
 
   // WebSocket
   connectWebSocket();
@@ -78,15 +83,31 @@ function connectWebSocket() {
 }
 
 function handleWsMessage(msg) {
-  if (msg.type === 'log' || msg.type === 'console') {
-    appendConsole(msg.text || msg.message || JSON.stringify(msg));
-  } else if (msg.type === 'status' || msg.type === 'queue') {
-    refreshQueue();
-  } else if (msg.type === 'refresh' || msg.type === 'list_updated') {
-    refreshList();
-    refreshTags();
-  } else {
-    appendConsole(msg.text || msg.message || JSON.stringify(msg));
+  switch (msg.type) {
+    case 'log':
+    case 'console':
+      appendConsole(msg.text || msg.message || JSON.stringify(msg));
+      break;
+    case 'status':
+    case 'queue':
+    case 'notification.queue':
+      refreshQueue();
+      break;
+    case 'refresh':
+    case 'list_updated':
+    case 'table.reload':
+      refreshList();
+      refreshTags();
+      break;
+    case 'tag.updateCanvas':
+      refreshTags();
+      break;
+    case 'echo':
+      appendConsole(msg.body || '');
+      break;
+    default:
+      appendConsole(msg.text || msg.message || JSON.stringify(msg));
+      break;
   }
 }
 

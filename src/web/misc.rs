@@ -4,6 +4,7 @@ use axum::{
 };
 
 use crate::compat::load_local_setting_string;
+use crate::db::inventory::InventoryScope;
 use crate::db::with_database;
 use crate::version;
 
@@ -39,7 +40,64 @@ pub async fn tag_list(State(_state): State<AppState>) -> Json<serde_json::Value>
     })
     .unwrap_or_default();
 
-    Json(serde_json::json!({ "tags": tags }))
+    // Load tag colors from inventory
+    let tag_colors = with_database(|db| {
+        let inv = db.inventory();
+        let colors: std::collections::HashMap<String, String> =
+            inv.load("tag_colors", InventoryScope::Local).unwrap_or_default();
+        Ok(colors)
+    })
+    .unwrap_or_default();
+
+    Json(serde_json::json!({ "tags": tags, "tag_colors": tag_colors }))
+}
+
+pub async fn tag_change_color(
+    State(_state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<ApiResponse> {
+    let tag = body["tag"].as_str().unwrap_or("");
+    let color = body["color"].as_str().unwrap_or("");
+
+    if tag.is_empty() {
+        return Json(ApiResponse {
+            success: false,
+            message: "tag is required".to_string(),
+        });
+    }
+
+    let result = with_database(|db| {
+        let inv = db.inventory();
+        let mut colors: std::collections::HashMap<String, String> =
+            inv.load("tag_colors", InventoryScope::Local).unwrap_or_default();
+        if color.is_empty() {
+            colors.remove(tag);
+        } else {
+            colors.insert(tag.to_string(), color.to_string());
+        }
+        inv.save("tag_colors", InventoryScope::Local, &colors)?;
+        Ok(())
+    });
+
+    match result {
+        Ok(()) => Json(ApiResponse {
+            success: true,
+            message: "OK".to_string(),
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            message: e.to_string(),
+        }),
+    }
+}
+
+pub async fn all_novel_ids(State(_state): State<AppState>) -> Json<serde_json::Value> {
+    let ids = with_database(|db| {
+        let ids: Vec<i64> = db.all_records().keys().copied().collect();
+        Ok(ids)
+    })
+    .unwrap_or_default();
+    Json(serde_json::json!({ "ids": ids }))
 }
 
 pub async fn notepad_read(State(_state): State<AppState>) -> Json<serde_json::Value> {

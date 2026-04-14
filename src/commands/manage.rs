@@ -65,9 +65,10 @@ impl ListOptions {
         if self.frozen {
             filters.push("frozen".to_string());
         }
-        if let Some(invalid) = filters.iter().find(|item| {
-            !matches!(item.as_str(), "series" | "ss" | "frozen" | "nonfrozen")
-        }) {
+        if let Some(invalid) = filters
+            .iter()
+            .find(|item| !matches!(item.as_str(), "series" | "ss" | "frozen" | "nonfrozen"))
+        {
             return Err(format!(
                 "不明なフィルターです({})\nfilters = {}",
                 invalid, FILTER_TYPE_HELP
@@ -290,12 +291,8 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
             "green" | "yellow" | "blue" | "magenta" | "cyan" | "red" | "white" => {
                 if let Some(tags) = mode.tag_names() {
                     for tag in tags {
-                        explicit_color_changed |= set_tag_color(
-                            &mut tag_colors,
-                            tag,
-                            &color,
-                            options.no_overwrite_color,
-                        );
+                        explicit_color_changed |=
+                            set_tag_color(&mut tag_colors, tag, &color, options.no_overwrite_color);
                     }
                 }
             }
@@ -383,10 +380,8 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
             }
 
             if !updated.tags.is_empty() {
-                auto_color_changed |= ensure_tag_colors(
-                    &mut tag_colors,
-                    updated.tags.iter().map(String::as_str),
-                );
+                auto_color_changed |=
+                    ensure_tag_colors(&mut tag_colors, updated.tags.iter().map(String::as_str));
                 outputs.push(TagOutput::Current(updated.tags.clone()));
             }
 
@@ -470,18 +465,27 @@ fn output_list(options: &ListOptions, lines: &[DecoratedNovel], stdout_is_tty: b
         println!("{}", options.header());
         println!(
             "{}",
-            lines.iter().map(|line| line.colored.as_str()).collect::<Vec<_>>().join("\n")
+            lines
+                .iter()
+                .map(|line| line.colored.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     } else if options.echo {
         println!("{}", options.header());
         println!(
             "{}",
-            lines.iter().map(|line| line.plain.as_str()).collect::<Vec<_>>().join("\n")
+            lines
+                .iter()
+                .map(|line| line.plain.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     } else {
         println!(
             "{}",
-            lines.iter()
+            lines
+                .iter()
                 .map(|line| line.id.to_string())
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -638,7 +642,25 @@ fn build_tag_mode(options: &TagOptions) -> Result<TagMode, String> {
     if let Some(tags) = &options.add {
         let tags = split_words(Some(tags.as_str()));
         for tag in &tags {
-            if tag.chars().any(|c| matches!(c, ':' | ';' | '"' | '\'' | '>' | '<' | '$' | '@' | '&' | '^' | '\\' | '|' | '%' | '/' | '`')) {
+            if tag.chars().any(|c| {
+                matches!(
+                    c,
+                    ':' | ';'
+                        | '"'
+                        | '\''
+                        | '>'
+                        | '<'
+                        | '$'
+                        | '@'
+                        | '&'
+                        | '^'
+                        | '\\'
+                        | '|'
+                        | '%'
+                        | '/'
+                        | '`'
+                )
+            }) {
                 return Err(format!("{} に使用禁止記号が含まれています", tag));
             }
             if tag == "hotentry" {
@@ -788,7 +810,11 @@ fn save_tag_colors(tag_colors: &TagColors) -> Result<(), String> {
     }
 
     inventory
-        .save("tag_colors", InventoryScope::Local, &serde_yaml::Value::Mapping(mapping))
+        .save(
+            "tag_colors",
+            InventoryScope::Local,
+            &serde_yaml::Value::Mapping(mapping),
+        )
         .map_err(|err| err.to_string())
 }
 
@@ -969,7 +995,10 @@ pub fn cmd_remove(targets: &[String], yes: bool, with_file: bool, all_ss: bool) 
         };
 
         if locked_ids.contains(&data.id) {
-            log::report_error(&format!("{} は変換中なため削除出来ませんでした", data.title));
+            log::report_error(&format!(
+                "{} は変換中なため削除出来ませんでした",
+                data.title
+            ));
             continue;
         }
         if frozen_ids.contains(&data.id) {
@@ -1062,8 +1091,7 @@ fn remove_novel_by_id(id: i64, with_file: bool) -> Result<RemoveOutcome, String>
             .cloned()
             .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
         let dir = db::existing_novel_dir_for_record(db.archive_root(), &record);
-        remove_novel_files(&dir, with_file)
-            .map_err(narou_rs::error::NarouError::Conversion)?;
+        remove_novel_files(&dir, with_file).map_err(narou_rs::error::NarouError::Conversion)?;
         db.remove(id);
         db.save()?;
         Ok::<RemoveOutcome, narou_rs::error::NarouError>(RemoveOutcome {
@@ -1095,8 +1123,10 @@ fn load_inventory_ids(name: &str) -> HashSet<i64> {
     use narou_rs::db;
 
     db::with_database(|db| {
-        let values: std::collections::HashMap<i64, serde_yaml::Value> =
-            db.inventory().load(name, InventoryScope::Local).unwrap_or_default();
+        let values: std::collections::HashMap<i64, serde_yaml::Value> = db
+            .inventory()
+            .load(name, InventoryScope::Local)
+            .unwrap_or_default();
         Ok(values.into_keys().collect::<HashSet<_>>())
     })
     .unwrap_or_default()
@@ -1139,8 +1169,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        build_tag_mode, ensure_tag_colors, matches_filters, matches_grep, remove_novel_files,
-        TagColors, TagOptions,
+        TagColors, TagOptions, build_tag_mode, ensure_tag_colors, matches_filters, matches_grep,
+        remove_novel_files,
     };
     use narou_rs::db::novel_record::NovelRecord;
 
@@ -1189,9 +1219,18 @@ mod tests {
         assert!(ensure_tag_colors(&mut tag_colors, ["later"]));
         assert!(ensure_tag_colors(&mut tag_colors, ["todo"]));
 
-        assert_eq!(tag_colors.colors.get("fav").map(String::as_str), Some("green"));
-        assert_eq!(tag_colors.colors.get("later").map(String::as_str), Some("yellow"));
-        assert_eq!(tag_colors.colors.get("todo").map(String::as_str), Some("blue"));
+        assert_eq!(
+            tag_colors.colors.get("fav").map(String::as_str),
+            Some("green")
+        );
+        assert_eq!(
+            tag_colors.colors.get("later").map(String::as_str),
+            Some("yellow")
+        );
+        assert_eq!(
+            tag_colors.colors.get("todo").map(String::as_str),
+            Some("blue")
+        );
     }
 
     #[test]
@@ -1199,11 +1238,26 @@ mod tests {
         let series = sample_record(1, 1, &["end"]);
         let short_story = sample_record(2, 2, &[]);
 
-        assert!(matches_filters(&series, true, &["series".to_string(), "frozen".to_string()]));
-        assert!(matches_filters(&short_story, false, &["ss".to_string(), "nonfrozen".to_string()]));
-        assert!(!matches_filters(&short_story, true, &["series".to_string()]));
+        assert!(matches_filters(
+            &series,
+            true,
+            &["series".to_string(), "frozen".to_string()]
+        ));
+        assert!(matches_filters(
+            &short_story,
+            false,
+            &["ss".to_string(), "nonfrozen".to_string()]
+        ));
+        assert!(!matches_filters(
+            &short_story,
+            true,
+            &["series".to_string()]
+        ));
 
-        assert!(matches_grep("作者名 紫炎 ハーメルン", &["紫炎".to_string(), "-なろう".to_string()]));
+        assert!(matches_grep(
+            "作者名 紫炎 ハーメルン",
+            &["紫炎".to_string(), "-なろう".to_string()]
+        ));
         assert!(!matches_grep("小説家になろう", &["-なろう".to_string()]));
     }
 

@@ -222,7 +222,9 @@ narou setting device=デバイス名 で指定出来ます。\n\
     ))
 }
 
-fn collect_all_targets(hotentry_enabled: bool) -> Result<(Vec<String>, HashMap<String, String>), String> {
+fn collect_all_targets(
+    hotentry_enabled: bool,
+) -> Result<(Vec<String>, HashMap<String, String>), String> {
     db::with_database(|db| {
         let mut ids = db.ids();
         ids.sort_unstable();
@@ -275,10 +277,9 @@ fn resolve_send_target(
         return Ok(None);
     };
     let record = load_record(data.id)?;
-    let novel_dir = db::with_database(|db| {
-        Ok(existing_novel_dir_for_record(db.archive_root(), &record))
-    })
-    .map_err(|e| e.to_string())?;
+    let novel_dir =
+        db::with_database(|db| Ok(existing_novel_dir_for_record(db.archive_root(), &record)))
+            .map_err(|e| e.to_string())?;
     let ebook_paths = get_ebook_file_paths(&record, &novel_dir, device.ebook_file_ext())?;
     let title = titles
         .get(target)
@@ -299,7 +300,8 @@ fn copy_with_progress(device: SendDevice, ebook_path: &Path) -> Result<Option<Pa
         .ok_or_else(|| "送信先端末が不正です".to_string())?;
     print!("{}へ送信しています", device.name());
     let src_file = ebook_path.to_path_buf();
-    let handle = thread::spawn(move || OutputManager::new(manager_device).copy_to_documents(&src_file));
+    let handle =
+        thread::spawn(move || OutputManager::new(manager_device).copy_to_documents(&src_file));
 
     while !handle.is_finished() {
         thread::sleep(Duration::from_millis(500));
@@ -377,7 +379,11 @@ fn bookmark_storage_path(device: SendDevice) -> Result<PathBuf, String> {
 
 fn collect_kindle_bookmark_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     collect_files_matching(root, &|path| {
-        let Some(parent) = path.parent().and_then(|value| value.file_name()).and_then(|v| v.to_str()) else {
+        let Some(parent) = path
+            .parent()
+            .and_then(|value| value.file_name())
+            .and_then(|v| v.to_str())
+        else {
             return false;
         };
         if !parent.ends_with(".sdr") {
@@ -474,7 +480,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        SendDevice, collect_kindle_bookmark_files, collect_stored_bookmark_files, copy_grouped_files,
+        SendDevice, collect_kindle_bookmark_files, collect_stored_bookmark_files,
+        copy_grouped_files,
     };
 
     #[test]
@@ -500,8 +507,20 @@ mod tests {
         assert_eq!(files.len(), 2);
 
         copy_grouped_files(&files, dst_root.path(), false).unwrap();
-        assert!(dst_root.path().join("foo.sdr").join("bookmark.azw3f").exists());
-        assert!(dst_root.path().join("foo.sdr").join("bookmark.azw3r").exists());
+        assert!(
+            dst_root
+                .path()
+                .join("foo.sdr")
+                .join("bookmark.azw3f")
+                .exists()
+        );
+        assert!(
+            dst_root
+                .path()
+                .join("foo.sdr")
+                .join("bookmark.azw3r")
+                .exists()
+        );
     }
 
     #[test]

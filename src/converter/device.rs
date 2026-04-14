@@ -298,11 +298,7 @@ impl OutputManager {
         Ok(output_path)
     }
 
-    fn create_ibunko_zip(
-        &self,
-        input_txt: &Path,
-        include_illust: bool,
-    ) -> Result<PathBuf> {
+    fn create_ibunko_zip(&self, input_txt: &Path, include_illust: bool) -> Result<PathBuf> {
         let mut data = std::fs::read_to_string(input_txt)?;
         let html_re = Regex::new(r"</?[^>]+>").unwrap();
         loop {
@@ -316,11 +312,12 @@ impl OutputManager {
         data = decode_ibunko_html_entities(&data);
 
         let illust_re = Regex::new(r"［＃挿絵（(.+?)）入る］").unwrap();
-        data = illust_re
-            .replace_all(&data, "<IMG SRC=\"$1\">")
-            .to_string();
+        data = illust_re.replace_all(&data, "<IMG SRC=\"$1\">").to_string();
         data = data.replace("［＃改ページ］", "<PBR>");
-        data = data.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\r\n");
+        data = data
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\n', "\r\n");
 
         let sanitized_txt_path = input_txt.with_file_name(format!(
             "{}.ibunko.txt",
@@ -756,7 +753,11 @@ fn read_be_u32(data: &[u8], offset: usize) -> std::result::Result<u32, StripErro
     Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-fn patch_range(data: &mut [u8], offset: usize, replacement: &[u8]) -> std::result::Result<(), StripError> {
+fn patch_range(
+    data: &mut [u8],
+    offset: usize,
+    replacement: &[u8],
+) -> std::result::Result<(), StripError> {
     let range = data
         .get_mut(offset..offset + replacement.len())
         .ok_or_else(StripError::invalid_format)?;
@@ -879,6 +880,9 @@ mod tests {
         data[100 + 0xe4..100 + 0xe8].copy_from_slice(&0u32.to_be_bytes());
 
         let err = strip_mobi_sources(&data).unwrap_err();
-        assert_eq!(err.to_string(), StripError::no_sources_section().to_string());
+        assert_eq!(
+            err.to_string(),
+            StripError::no_sources_section().to_string()
+        );
     }
 }

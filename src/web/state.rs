@@ -46,6 +46,8 @@ pub struct NovelListItem {
     pub new_arrivals: bool,
     pub frozen: bool,
     pub length: Option<i64>,
+    pub toc_url: String,
+    pub general_all_no: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

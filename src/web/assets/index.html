@@ -14,7 +14,7 @@
   </head>
   <body>
     <!-- Fixed Top Navbar -->
-    <nav id="header-navbar" class="navbar navbar-fixed-top">
+    <nav id="header-navbar" class="navbar navbar-fixed-top" role="navigation">
       <div class="navbar-inner">
         <div class="navbar-header">
           <button class="navbar-toggle" id="navbar-toggle-btn" type="button" aria-label="Toggle navigation">
@@ -22,36 +22,51 @@
             <span class="icon-bar"></span>
             <span class="icon-bar"></span>
           </button>
-          <a class="navbar-brand" href="#">Narou.rs WEB UI</a>
+          <a class="navbar-brand" href="#" data-move-to="top">Narou.rs WEB UI</a>
         </div>
         <div class="navbar-collapse" id="navbar-collapse">
           <!-- Left nav menus -->
           <ul class="nav navbar-nav">
+            <!-- 表示 (View) -->
             <li class="dropdown">
               <a class="dropdown-toggle" href="#" data-dropdown="view-menu">
                 <span data-i18n="menuView">表示</span> <span class="caret"></span>
               </a>
               <ul class="dropdown-menu" id="view-menu">
-                <li><a href="#" id="action-view-all" data-i18n="viewAll">全ての小説を表示</a></li>
+                <li><a href="#" id="action-view-all">全ての項目を表示</a></li>
+                <li><a href="#" id="action-view-setting">表示する項目を設定</a></li>
                 <li class="divider"></li>
-                <li><a href="#" id="action-view-nonfrozen"><span class="check-mark"></span> <span data-i18n="viewNonfrozen">凍結中以外を表示</span></a></li>
-                <li><a href="#" id="action-view-frozen"><span class="check-mark"></span> <span data-i18n="viewFrozen">凍結中を表示</span></a></li>
+                <li><a href="#" id="action-view-novel-list-wide"><span class="check-mark"></span> 小説リストの幅を広げる <span class="shortcut">W</span></a></li>
                 <li class="divider"></li>
-                <li><a href="#" id="action-view-wide"><span class="check-mark"></span> <span data-i18n="viewWide">小説リストの幅を広げる</span></a></li>
+                <li><a href="#" id="action-view-nonfrozen"><span class="check-mark"></span> 凍結中以外を表示 <span class="shortcut">Shift+F</span></a></li>
+                <li><a href="#" id="action-view-frozen"><span class="check-mark"></span> 凍結中を表示 <span class="shortcut">F</span></a></li>
+                <li class="divider"></li>
+                <li><a href="#" id="action-view-toggle-setting-new-tab"><span class="check-mark"></span> 変換設定ページは新規タブで開く</a></li>
+                <li class="divider"></li>
+                <li><a href="#" id="action-view-toggle-buttons-top"><span class="check-mark"></span> ボタンをページ上部に表示</a></li>
+                <li><a href="#" id="action-view-toggle-buttons-footer"><span class="check-mark"></span> ボタンを画面下部に表示</a></li>
+                <li class="divider"></li>
+                <li><a href="#" id="action-view-reset">表示設定を全てリセット</a></li>
               </ul>
             </li>
+            <!-- 選択 (Select) -->
             <li class="dropdown">
               <a class="dropdown-toggle" href="#" data-dropdown="select-menu">
                 <span data-i18n="menuSelect">選択</span>
                 <span class="badge" id="badge-selecting">0</span>
                 <span class="caret"></span>
               </a>
-              <ul class="dropdown-menu" id="select-menu">
-                <li><a href="#" id="action-select-view" data-i18n="selectVisible">表示されている小説を選択</a></li>
-                <li><a href="#" id="action-select-all" data-i18n="selectAll">全ての小説を選択</a></li>
-                <li><a href="#" id="action-select-clear" data-i18n="selectClear">選択を全て解除</a></li>
+              <ul class="dropdown-menu dropdown-menu-wide" id="select-menu">
+                <li><a href="#" id="action-select-view">表示されている小説を選択 <span class="shortcut">Ctrl+A</span></a></li>
+                <li><a href="#" id="action-select-all">全ての小説を選択 <span class="shortcut">Shift+A</span></a></li>
+                <li><a href="#" id="action-select-clear">選択を全て解除 <span class="shortcut">ESC</span></a></li>
+                <li class="divider"></li>
+                <li><a href="#" id="action-select-mode-single"><span class="check-mark"></span> シングル選択モード <span class="shortcut">S</span></a></li>
+                <li><a href="#" id="action-select-mode-multi"><span class="check-mark"></span> 範囲選択モード <span class="shortcut">R</span></a></li>
+                <li><a href="#" id="action-select-mode-hybrid"><span class="check-mark"></span> ハイブリッド選択モード <span class="shortcut">H</span></a></li>
               </ul>
             </li>
+            <!-- タグ (Tag) -->
             <li class="dropdown">
               <a class="dropdown-toggle" href="#" data-dropdown="tag-menu">
                 <span data-i18n="menuTag">タグ</span> <span class="caret"></span>
@@ -59,44 +74,69 @@
               <ul class="dropdown-menu dropdown-menu-tags" id="tag-menu">
                 <li><div id="tag-list-canvas" class="tag-list-canvas"></div></li>
                 <li class="divider"></li>
-                <li class="enable-selected"><a href="#" id="action-tag-edit" data-i18n="tagEdit">選択した小説のタグを編集</a></li>
+                <li class="enable-selected"><a href="#" id="action-tag-edit">選択した小説のタグを編集 <span class="shortcut">T</span></a></li>
               </ul>
             </li>
+            <!-- ツール (Tool) -->
             <li class="dropdown">
               <a class="dropdown-toggle" href="#" data-dropdown="tool-menu">
                 <span data-i18n="menuTool">ツール</span> <span class="caret"></span>
               </a>
               <ul class="dropdown-menu" id="tool-menu">
-                <li><a href="#" id="action-tool-notepad" data-i18n="toolNotepad">メモ帳</a></li>
+                <li><a href="#" id="action-tool-csv-download">CSV形式でリストをダウンロード</a></li>
+                <li><a href="#" id="action-tool-csv-import">CSVファイルからインポート</a></li>
                 <li class="divider"></li>
-                <li><a href="#" id="action-tool-csv-download" data-i18n="toolCsvDownload">CSV形式でリストをダウンロード</a></li>
+                <li><a href="#" id="action-tool-notepad">メモ帳（ポップアップ）</a></li>
               </ul>
             </li>
           </ul>
-          <!-- Right nav -->
+          <!-- Right nav items -->
           <ul class="nav navbar-nav navbar-right">
+            <!-- Options (⚙) -->
             <li class="dropdown">
               <a class="dropdown-toggle" href="#" data-dropdown="options-menu">
-                <span class="icon-cog">&#x2699;</span>
+                <span class="icon-cog hidden-xs">&#x2699;</span>
+                <span class="visible-xs-inline" data-i18n="menuOption">オプション</span>
                 <span class="caret"></span>
               </a>
               <ul class="dropdown-menu dropdown-menu-right" id="options-menu">
+                <li><a href="#" id="action-option-settings">&#x1F527; 環境設定...</a></li>
+                <li class="divider"></li>
+                <li><a href="#" id="action-option-help">&#x2753; ヘルプ...</a></li>
+                <li><a href="#" id="action-option-about">&#x2139;&#xFE0F; Narou.rs について</a></li>
+                <li class="divider"></li>
                 <li><a href="#" id="action-lang-toggle"><span id="lang-label">Language: 日本語 ↔ English</span></a></li>
                 <li class="divider"></li>
-                <li><a href="#" id="action-option-about">Narou.rs について</a></li>
+                <li id="theme-submenu-container">
+                  <div class="theme-selector">
+                    <span class="theme-label">テーマ:</span>
+                    <select id="theme-select" class="theme-select">
+                      <option value="default">Cerulean</option>
+                      <option value="Darkly">Darkly</option>
+                      <option value="Readable">Readable</option>
+                      <option value="Slate">Slate</option>
+                      <option value="Superhero">Superhero</option>
+                      <option value="United">United</option>
+                    </select>
+                  </div>
+                </li>
                 <li class="divider"></li>
-                <li><a href="#" id="action-option-shutdown" data-i18n="serverShutdown">サーバをシャットダウン</a></li>
+                <li><a href="#" id="action-option-server-reboot">&#x1F504; サーバを再起動</a></li>
+                <li><a href="#" id="action-option-shutdown">&#x23FB; サーバをシャットダウン</a></li>
               </ul>
             </li>
           </ul>
-          <!-- Queue display (navbar-right) -->
-          <p class="queue-indicator navbar-right" id="queue-display" role="button" title="キュー状態">
+          <!-- Queue display -->
+          <p class="queue-indicator navbar-right" id="queue-display" role="button" tabindex="0" title="クリックでキュー一覧を表示">
             <span class="queue-icon">&#x1F4E5;</span>
-            <span class="queue-badge" id="queue-count">0</span>
+            <span class="queue-sizes" id="queue-sizes">
+              <span class="queue-size queue-size-default" id="queue-count">0</span>
+            </span>
           </p>
-          <!-- Filter input (navbar-right) -->
-          <div class="navbar-form navbar-right">
+          <!-- Filter input -->
+          <div class="navbar-form navbar-right" role="search">
             <div class="filter-group">
+              <span class="filter-search-icon" id="filter-search-icon">&#x1F50D;</span>
               <input id="filter-input" class="filter-input" type="text" placeholder="Filter" autocomplete="off">
               <span class="filter-clear hide" id="filter-clear">&times;</span>
             </div>
@@ -105,78 +145,188 @@
       </div>
     </nav>
 
-    <!-- Console -->
-    <div class="container-main" id="console-container">
-      <div id="console" class="console"></div>
-      <div class="console-buttons">
-        <button class="console-btn" id="console-trash" type="button" title="表示と履歴を削除">&#x1F5D1;</button>
-        <button class="console-btn" id="console-expand" type="button" title="拡大/縮小">&#x2922;</button>
+    <!-- Footer Navbar (hidden, shown when "buttons fix footer" enabled) -->
+    <nav id="footer-navbar" class="navbar navbar-fixed-bottom hide">
+      <div class="navbar-inner">
+        <div class="control-panel-inner" id="footer-control-panel"></div>
+      </div>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="container-main container-body" role="main">
+
+      <!-- Console -->
+      <div id="console-container">
+        <div id="console" class="console"></div>
+        <div class="console-buttons" id="console-buttons">
+          <span class="console-btn" id="console-cancel" title="処理を中断">&#x274C;</span>
+          <span class="console-btn" id="console-history" title="全ての履歴を取得">&#x2601;</span>
+          <span class="console-btn" id="console-trash" title="表示と履歴を削除">&#x1F5D1;</span>
+          <span class="console-btn" id="console-expand" title="拡大">
+            <span class="expand-icon">&#x2922;</span>
+            <span class="collapse-icon hide">&#x2923;</span>
+          </span>
+        </div>
+      </div>
+
+      <!-- Control Panel -->
+      <div id="control-panel">
+        <div class="control-panel-inner" id="main-control-panel">
+          <!-- Download -->
+          <div class="btn-group">
+            <button class="btn btn-primary button-download" id="btn-download" type="button" title="新規ダウンロード">Download</button>
+            <button class="btn btn-primary dropdown-toggle" type="button" data-dropdown="download-submenu"><span class="caret"></span></button>
+            <ul class="dropdown-menu" id="download-submenu">
+              <li><a href="#" id="action-download-force" class="enable-selected">選択した小説を強制再ダウンロード</a></li>
+            </ul>
+          </div>
+          <!-- Update -->
+          <div class="btn-group">
+            <button class="btn btn-success button-update" id="btn-update" type="button" title="選択した小説を更新">Update</button>
+            <button class="btn btn-success dropdown-toggle" type="button" data-dropdown="update-submenu"><span class="caret"></span></button>
+            <ul class="dropdown-menu" id="update-submenu">
+              <li><a href="#" id="action-update-general-lastup">最新話掲載日を確認</a></li>
+              <li><a href="#" id="action-update-by-tag">タグを指定して更新</a></li>
+              <li><a href="#" id="action-update-view">表示されている小説を更新</a></li>
+              <li><a href="#" id="action-update-force">凍結済みでも更新</a></li>
+            </ul>
+          </div>
+          <!-- な/他/🔄 -->
+          <div class="btn-group">
+            <button class="btn btn-success btn-short" id="btn-gl-narou" type="button" title="最新話掲載日をなろうAPIで確認">な</button>
+            <button class="btn btn-success btn-short" id="btn-gl-other" type="button" title="その他の小説の最新話掲載日を確認">他</button>
+            <button class="btn btn-success btn-short" id="btn-gl-modified" type="button" title="modifiedタグが付いた小説を更新">&#x1F504;</button>
+          </div>
+          <!-- Send -->
+          <div class="btn-group">
+            <button class="btn btn-warning button-send enable-selected" id="btn-send" type="button" title="選択した小説を送信">Send</button>
+          </div>
+          <!-- Freeze -->
+          <div class="btn-group">
+            <button class="btn btn-info dropdown-toggle enable-selected" type="button" data-dropdown="freeze-submenu">Freeze <span class="caret"></span></button>
+            <ul class="dropdown-menu" id="freeze-submenu">
+              <li><a href="#" id="action-freeze-on">選択した小説を凍結</a></li>
+              <li><a href="#" id="action-freeze-off">選択した小説の凍結を解除</a></li>
+            </ul>
+          </div>
+          <!-- Remove -->
+          <div class="btn-group">
+            <button class="btn btn-danger enable-selected" id="btn-remove" type="button" title="選択した小説を削除">Remove</button>
+          </div>
+          <!-- Convert -->
+          <div class="btn-group">
+            <button class="btn btn-default enable-selected" id="btn-convert" type="button" title="選択した小説を変換">Convert</button>
+          </div>
+          <!-- Other -->
+          <div class="btn-group">
+            <button class="btn btn-default dropdown-toggle enable-selected" type="button" data-dropdown="other-submenu">Other <span class="caret"></span></button>
+            <ul class="dropdown-menu" id="other-submenu">
+              <li><a href="#" id="action-other-diff">選択した小説の最新の差分を表示</a></li>
+              <li><a href="#" id="action-other-inspect">選択した小説の調査状況ログを表示</a></li>
+              <li><a href="#" id="action-other-folder">選択した小説の保存フォルダを開く</a></li>
+              <li><a href="#" id="action-other-backup">選択した小説のバックアップを作成</a></li>
+              <li><a href="#" id="action-other-setting-burn">選択した小説の設定の未設定項目に共通設定を焼付ける</a></li>
+              <li><a href="#" id="action-other-mail">選択した小説をメールで送信</a></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- Novel List Table -->
+      <div id="novel-list-container">
+        <table id="novel-list" class="table table-bordered" cellspacing="0">
+          <thead>
+            <tr>
+              <th class="col-id sortable" data-sort="id">ID</th>
+              <th class="col-update sortable active-sort" data-sort="last_update">最終更新日</th>
+              <th class="col-title sortable" data-sort="title">タイトル</th>
+              <th class="col-author sortable" data-sort="author">作者</th>
+              <th class="col-site sortable" data-sort="sitename">サイト名</th>
+              <th class="col-url">掲載URL</th>
+              <th class="col-length sortable" data-sort="length">話数</th>
+              <th class="col-status">状態</th>
+              <th class="col-tags">タグ</th>
+              <th class="col-menu">メニュー</th>
+            </tr>
+          </thead>
+          <tbody id="novel-list-body"></tbody>
+        </table>
+      </div>
+
+    </div>
+
+    <!-- Context Menu (hidden, shown on right-click) -->
+    <ul class="context-menu hide" id="context-menu" role="menu">
+      <li><a href="#" id="ctx-setting">変換設定</a></li>
+      <li><a href="#" id="ctx-diff">差分を表示</a></li>
+      <li><a href="#" id="ctx-tag-edit">タグを編集</a></li>
+      <li class="divider"></li>
+      <li><a href="#" id="ctx-freeze-toggle">凍結/凍結解除</a></li>
+      <li><a href="#" id="ctx-update">更新</a></li>
+      <li><a href="#" id="ctx-update-force">強制更新</a></li>
+      <li><a href="#" id="ctx-send">送信</a></li>
+      <li class="divider"></li>
+      <li><a href="#" id="ctx-remove">削除</a></li>
+      <li><a href="#" id="ctx-convert">変換</a></li>
+      <li><a href="#" id="ctx-inspect">調査</a></li>
+      <li class="divider"></li>
+      <li><a href="#" id="ctx-folder">フォルダを開く</a></li>
+      <li><a href="#" id="ctx-backup">バックアップ</a></li>
+      <li><a href="#" id="ctx-download-force">強制再ダウンロード</a></li>
+      <li><a href="#" id="ctx-mail">メールで送信</a></li>
+    </ul>
+
+    <!-- Tag Color Selection Menu (hidden, shown on tag right-click) -->
+    <ul class="context-menu hide" id="select-color-menu" role="menu">
+      <li><a href="#" data-color="green"><span class="tag-label tag-green tag-fixed-width">Green</span></a></li>
+      <li><a href="#" data-color="yellow"><span class="tag-label tag-yellow tag-fixed-width">Yellow</span></a></li>
+      <li><a href="#" data-color="blue"><span class="tag-label tag-blue tag-fixed-width">Blue</span></a></li>
+      <li><a href="#" data-color="magenta"><span class="tag-label tag-magenta tag-fixed-width">Magenta</span></a></li>
+      <li><a href="#" data-color="cyan"><span class="tag-label tag-cyan tag-fixed-width">Cyan</span></a></li>
+      <li><a href="#" data-color="red"><span class="tag-label tag-red tag-fixed-width">Red</span></a></li>
+      <li><a href="#" data-color="white"><span class="tag-label tag-white tag-fixed-width">White</span></a></li>
+    </ul>
+
+    <!-- Tag Edit Modal -->
+    <div class="modal-overlay hide" id="tag-edit-modal">
+      <div class="modal-dialog">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="tag-edit-close" type="button">&times;</button>
+            <h4 class="modal-title">タグの編集</h4>
+          </div>
+          <div class="modal-body">
+            <div id="tag-editor-current" class="tag-editor-current"></div>
+            <div class="tag-editor-input">
+              <input type="text" id="new-tag-input" class="new-tag-input" placeholder="新しいタグを入力...">
+              <button class="btn btn-primary btn-sm" id="add-tag-button" type="button">追加</button>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="tag-edit-cancel" type="button">閉じる</button>
+          </div>
+        </div>
       </div>
     </div>
 
-    <!-- Control Panel -->
-    <div class="container-main" id="control-panel">
-      <div class="control-panel-inner">
-        <div class="btn-group">
-          <button class="btn btn-primary" id="btn-download" type="button">Download</button>
-        </div>
-        <div class="btn-group">
-          <button class="btn btn-success" id="btn-update" type="button">Update</button>
-          <button class="btn btn-success dropdown-toggle" type="button" data-dropdown="update-submenu"><span class="caret"></span></button>
-          <ul class="dropdown-menu" id="update-submenu">
-            <li><a href="#" id="action-update-view" data-i18n="updateView">表示されている小説を更新</a></li>
-            <li><a href="#" id="action-update-force" data-i18n="updateForce">凍結済みでも更新</a></li>
-          </ul>
-        </div>
-        <div class="btn-group">
-          <button class="btn btn-success btn-short" id="btn-gl-narou" type="button" title="なろうAPIで確認">な</button>
-          <button class="btn btn-success btn-short" id="btn-gl-other" type="button" title="その他の最新話確認">他</button>
-        </div>
-        <div class="btn-group">
-          <button class="btn btn-warning" id="btn-send" type="button">Send</button>
-        </div>
-        <div class="btn-group">
-          <button class="btn btn-info dropdown-toggle" type="button" data-dropdown="freeze-submenu">Freeze <span class="caret"></span></button>
-          <ul class="dropdown-menu" id="freeze-submenu">
-            <li><a href="#" id="action-freeze-on" data-i18n="freezeOn">選択した小説を凍結</a></li>
-            <li><a href="#" id="action-freeze-off" data-i18n="freezeOff">選択した小説の凍結を解除</a></li>
-          </ul>
-        </div>
-        <div class="btn-group">
-          <button class="btn btn-danger enable-selected" id="btn-remove" type="button">Remove</button>
-        </div>
-        <div class="btn-group">
-          <button class="btn btn-default enable-selected" id="btn-convert" type="button">Convert</button>
-        </div>
-        <div class="btn-group">
-          <button class="btn btn-default dropdown-toggle enable-selected" type="button" data-dropdown="other-submenu">Other <span class="caret"></span></button>
-          <ul class="dropdown-menu" id="other-submenu">
-            <li><a href="#" id="action-other-diff" data-i18n="otherDiff">選択した小説の最新の差分を表示</a></li>
-            <li><a href="#" id="action-other-folder" data-i18n="otherFolder">選択した小説の保存フォルダを開く</a></li>
-            <li><a href="#" id="action-other-backup" data-i18n="otherBackup">選択した小説のバックアップを作成</a></li>
-            <li><a href="#" id="action-other-mail" data-i18n="otherMail">選択した小説をメールで送信</a></li>
-          </ul>
+    <!-- About Modal -->
+    <div class="modal-overlay hide" id="about-modal">
+      <div class="modal-dialog modal-dialog-sm">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="about-close" type="button">&times;</button>
+            <h4 class="modal-title">Narou.rs について</h4>
+          </div>
+          <div class="modal-body">
+            <p><strong>Narou.rs WEB UI</strong></p>
+            <p>Version: <span id="about-version">-</span></p>
+            <p>Rust port of narou.rb — Web小説管理・電子書籍変換</p>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="about-ok" type="button">OK</button>
+          </div>
         </div>
       </div>
-    </div>
-
-    <!-- Novel List Table -->
-    <div class="container-main" id="novel-list-container">
-      <table id="novel-list" class="table table-bordered">
-        <thead>
-          <tr>
-            <th class="col-id sortable" data-sort="0">ID</th>
-            <th class="col-update sortable active-sort" data-sort="1" data-i18n="colLastUpdate">最終更新日</th>
-            <th class="col-latest sortable" data-sort="2" data-i18n="colGeneralLastup">最新話掲載日</th>
-            <th class="col-title sortable" data-sort="3" data-i18n="colTitle">タイトル</th>
-            <th class="col-author sortable" data-sort="4" data-i18n="colAuthor">作者</th>
-            <th class="col-site sortable" data-sort="5" data-i18n="colSite">サイト名</th>
-            <th class="col-tags" data-i18n="colTags">タグ</th>
-            <th class="col-status" data-i18n="colStatus">状態</th>
-          </tr>
-        </thead>
-        <tbody id="novel-list-body"></tbody>
-      </table>
     </div>
 
     <!-- Notepad Modal -->
@@ -185,40 +335,81 @@
         <div class="modal-content">
           <div class="modal-header">
             <button class="modal-close" id="notepad-close" type="button">&times;</button>
-            <h4 class="modal-title" data-i18n="notepadTitle">メモ帳</h4>
+            <h4 class="modal-title">メモ帳</h4>
           </div>
           <div class="modal-body">
             <textarea id="notepad" class="notepad-textarea" placeholder="メモ帳"></textarea>
           </div>
           <div class="modal-footer">
-            <button class="btn btn-primary" id="save-notepad-button" type="button" data-i18n="saveButton">保存</button>
+            <button class="btn btn-primary" id="save-notepad-button" type="button">保存</button>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- Queue Modal -->
+    <!-- Queue Manager Modal -->
     <div class="modal-overlay hide" id="queue-modal">
-      <div class="modal-dialog">
+      <div class="modal-dialog modal-dialog-lg">
         <div class="modal-content">
           <div class="modal-header">
             <button class="modal-close" id="queue-modal-close" type="button">&times;</button>
-            <h4 class="modal-title" data-i18n="queueTitle">キュー</h4>
+            <h4 class="modal-title">キュー管理</h4>
           </div>
           <div class="modal-body">
-            <dl class="queue-detail-list">
-              <dt data-i18n="queuePending">待機</dt>
-              <dd id="queue-pending-detail">0</dd>
-              <dt data-i18n="queueCompleted">完了</dt>
-              <dd id="queue-completed-detail">0</dd>
-              <dt data-i18n="queueFailed">失敗</dt>
-              <dd id="queue-failed-detail">0</dd>
-            </dl>
-            <button class="btn btn-default" id="queue-clear-button" type="button" data-i18n="clearQueueButton">キュー消去</button>
+            <div class="queue-section">
+              <h5>実行中</h5>
+              <div id="queue-running-list" class="queue-task-list"></div>
+            </div>
+            <div class="queue-section">
+              <h5>待機中 <span class="queue-hint" id="queue-pending-count"></span></h5>
+              <div id="queue-pending-list" class="queue-task-list"></div>
+            </div>
+            <div class="queue-actions">
+              <button class="btn btn-default btn-sm" id="queue-clear-button" type="button">キュー消去</button>
+            </div>
           </div>
         </div>
       </div>
     </div>
+
+    <!-- Confirm Modal (for server-driven confirm dialogs) -->
+    <div class="modal-overlay hide" id="confirm-modal">
+      <div class="modal-dialog modal-dialog-sm">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h4 class="modal-title" id="confirm-title">確認</h4>
+          </div>
+          <div class="modal-body">
+            <p id="confirm-message"></p>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="confirm-cancel" type="button">キャンセル</button>
+            <button class="btn btn-primary" id="confirm-ok" type="button">OK</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Diff List Modal -->
+    <div class="modal-overlay hide" id="diff-modal">
+      <div class="modal-dialog modal-dialog-lg">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="diff-close" type="button">&times;</button>
+            <h4 class="modal-title">差分表示</h4>
+          </div>
+          <div class="modal-body">
+            <div id="diff-list-container" class="diff-list-container"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Notifications (fadeout alerts) -->
+    <div id="notification-container" class="notification-container"></div>
+
+    <!-- Scroll-to-top button -->
+    <div class="move-to-top hide" id="move-to-top" title="トップに戻る">&#x25B2;</div>
 
     <script type="module" src="/assets/js/main.js"></script>
   </body>

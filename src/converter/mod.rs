@@ -605,7 +605,6 @@ impl NovelConverter {
             self.settings.enable_illust,
         )?;
 
-
         Ok(final_path)
     }
 

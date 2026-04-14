@@ -110,6 +110,24 @@
   padding: 0 var(--container-padding);
 }
 
+/* Container body gets top padding for the fixed navbar */
+.container-body {
+  padding-top: calc(var(--navbar-height) + 0.5em);
+}
+
+/* ========== Footer Navbar ========== */
+.navbar-fixed-bottom {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  min-height: 2.5rem;
+  background-color: var(--body-bg);
+  border-top: 0.07em solid var(--border-color);
+  z-index: 1030;
+  padding: 0.3em var(--container-padding);
+}
+
 /* ========== Console ========== */
 #console-container {
   position: relative;

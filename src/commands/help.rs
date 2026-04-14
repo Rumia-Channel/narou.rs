@@ -705,12 +705,7 @@ const MAIL_HELP: CmdHelp = CmdHelp {
     narou mail           # updateで新着があった小説を全てメール
 
     narou mail --force   # 凍結済以外の全ての小説を強制的にメール(使い方に注意)",
-    options: &[opt(
-        Some("-f"),
-        "--force",
-        None,
-        "全ての小説を強制的に送信",
-    )],
+    options: &[opt(Some("-f"), "--force", None, "全ての小説を強制的に送信")],
 };
 
 const ALIAS_HELP: CmdHelp = CmdHelp {

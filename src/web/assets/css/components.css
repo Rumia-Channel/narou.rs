@@ -261,13 +261,15 @@
 
 /* Column widths */
 .col-id { width: 3em; text-align: right; }
-.col-update { width: 7.5em; }
-.col-latest { width: 7.5em; }
+.col-update { width: 7.5em; white-space: nowrap; }
 .col-title { min-width: 10em; }
 .col-author { width: 7em; }
 .col-site { width: 6em; }
+.col-url { width: 3em; text-align: center; }
+.col-length { width: 5em; text-align: right; }
+.col-status { width: 5em; }
 .col-tags { width: 8em; }
-.col-status { width: 4em; }
+.col-menu { width: 2.5em; text-align: center; }
 
 /* ========== Tags ========== */
 .tag-label {
@@ -325,6 +327,325 @@
 .gl-24h { background-color: var(--gl-24h-bg); }
 .gl-3d { background-color: var(--gl-3d-bg); }
 .gl-1w { background-color: var(--gl-1w-bg); color: #333; }
+
+/* ========== Context Menu ========== */
+.context-menu {
+  position: fixed;
+  z-index: 1060;
+  min-width: 12em;
+  padding: 0.35em 0;
+  background-color: var(--dropdown-bg);
+  border: 0.07em solid var(--dropdown-border);
+  border-radius: var(--btn-border-radius);
+  box-shadow: var(--dropdown-shadow);
+  list-style: none;
+  margin: 0;
+}
+
+.context-menu > li > a {
+  display: block;
+  padding: 0.3em 1.2em;
+  color: var(--dropdown-text);
+  white-space: nowrap;
+  text-decoration: none;
+  font-size: var(--btn-font-size);
+  cursor: pointer;
+}
+
+.context-menu > li > a:hover {
+  background-color: var(--dropdown-hover-bg);
+}
+
+.context-menu > li.divider {
+  height: 0;
+  margin: 0.35em 0;
+  border-top: 0.07em solid var(--dropdown-divider);
+}
+
+/* ========== Tag Editor ========== */
+.tag-editor-current {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3em;
+  margin-bottom: 0.8em;
+  min-height: 2em;
+}
+
+.tag-editable {
+  position: relative;
+  padding-right: 1.4em;
+}
+
+.tag-remove {
+  position: absolute;
+  right: 0.2em;
+  top: 50%;
+  transform: translateY(-50%);
+  cursor: pointer;
+  font-weight: bold;
+  opacity: 0.5;
+}
+
+.tag-remove:hover {
+  opacity: 1;
+}
+
+.tag-editor-input {
+  display: flex;
+  gap: 0.5em;
+}
+
+.new-tag-input {
+  flex: 1;
+  padding: 0.4em 0.6em;
+  font-size: 0.9em;
+  border: 0.07em solid var(--border-color);
+  border-radius: var(--btn-border-radius);
+  background: var(--body-bg);
+  color: var(--text-color);
+}
+
+.tag-fixed-width {
+  display: inline-block;
+  min-width: 5em;
+  text-align: center;
+}
+
+/* ========== Notification Container ========== */
+.notification-container {
+  position: fixed;
+  top: calc(var(--navbar-height) + 0.5em);
+  right: 1em;
+  z-index: 1100;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4em;
+  pointer-events: none;
+}
+
+.notification {
+  padding: 0.6em 1.2em;
+  border-radius: var(--btn-border-radius);
+  font-size: 0.9em;
+  color: #fff;
+  pointer-events: auto;
+  opacity: 1;
+  transition: opacity 0.5s;
+}
+
+.notification-info { background-color: var(--btn-info-bg); }
+.notification-success { background-color: var(--btn-success-bg); }
+.notification-error { background-color: var(--btn-danger-bg); }
+.notification-warning { background-color: var(--btn-warning-bg); }
+.notification-fadeout { opacity: 0; }
+
+/* ========== Move-to-top ========== */
+.move-to-top {
+  position: fixed;
+  bottom: 1.5em;
+  right: 1.5em;
+  z-index: 1020;
+  width: 2.5em;
+  height: 2.5em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: var(--navbar-bg);
+  color: #fff;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 1em;
+  opacity: 0.7;
+  transition: opacity 0.2s;
+}
+
+.move-to-top:hover {
+  opacity: 1;
+}
+
+/* ========== New Arrival Dot ========== */
+.status-new-dot {
+  color: var(--new-arrival-color);
+  font-size: 0.7em;
+  vertical-align: middle;
+}
+
+/* ========== Per-row action button ========== */
+.row-action-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0.15em 0.3em;
+  font-size: 1.1em;
+  color: var(--text-muted);
+  line-height: 1;
+}
+
+.row-action-btn:hover {
+  color: var(--text-color);
+}
+
+/* ========== Filterable text ========== */
+.filterable {
+  cursor: pointer;
+}
+
+.filterable:hover {
+  text-decoration: underline;
+}
+
+/* ========== Queue task list ========== */
+.queue-section {
+  margin-bottom: 1em;
+}
+
+.queue-section h5 {
+  margin: 0 0 0.5em;
+  font-size: 1rem;
+}
+
+.queue-hint {
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+
+.queue-task-list {
+  min-height: 2em;
+  background: var(--table-odd-bg);
+  border-radius: var(--btn-border-radius);
+  padding: 0.5em;
+}
+
+.queue-task-item {
+  padding: 0.3em 0.5em;
+  border-bottom: 0.07em solid var(--border-color);
+}
+
+.queue-task-item:last-child {
+  border-bottom: none;
+}
+
+.queue-running {
+  font-weight: bold;
+}
+
+.queue-actions {
+  padding-top: 0.5em;
+}
+
+/* ========== Shortcut labels in menu ========== */
+.shortcut {
+  float: right;
+  margin-left: 2em;
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+/* ========== Dropdown wide ========== */
+.dropdown-menu-wide {
+  min-width: 18em;
+}
+
+/* ========== Theme selector ========== */
+.theme-selector {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  padding: 0.3em 1.2em;
+}
+
+.theme-label {
+  font-size: var(--btn-font-size);
+  color: var(--dropdown-text);
+}
+
+.theme-select {
+  padding: 0.2em 0.4em;
+  font-size: 0.85em;
+  border: 0.07em solid var(--border-color);
+  border-radius: var(--btn-border-radius);
+  background: var(--body-bg);
+  color: var(--text-color);
+}
+
+/* ========== Diff display ========== */
+.diff-list-container {
+  max-height: 30em;
+  overflow-y: auto;
+}
+
+.diff-entry {
+  margin-bottom: 1em;
+}
+
+.diff-entry h5 {
+  margin: 0 0 0.3em;
+  font-size: 1rem;
+}
+
+.diff-content {
+  background: var(--console-bg);
+  color: var(--console-text);
+  padding: 0.5em;
+  border-radius: var(--btn-border-radius);
+  font-family: "Consolas", "Liberation Mono", "Courier New", monospace;
+  font-size: 0.85em;
+  white-space: pre-wrap;
+  overflow-x: auto;
+  max-height: 20em;
+}
+
+/* ========== Queue badge active ========== */
+.queue-size-active {
+  background-color: var(--btn-warning-bg);
+  color: #fff;
+  padding: 0.15em 0.4em;
+  border-radius: 0.7em;
+  font-size: 0.75em;
+  font-weight: bold;
+}
+
+.queue-size-default {
+  font-size: 0.9em;
+  color: var(--navbar-text);
+}
+
+/* ========== TOC link ========== */
+.toc-link {
+  color: var(--link-color);
+  text-decoration: none;
+  font-size: 1.1em;
+}
+
+.toc-link:hover {
+  text-decoration: underline;
+}
+
+/* ========== Wide mode ========== */
+.wide-mode {
+  max-width: none !important;
+}
+
+/* ========== Modal size variants ========== */
+.modal-dialog-sm {
+  max-width: 24rem;
+}
+
+.modal-dialog-lg {
+  max-width: 50rem;
+}
+
+/* ========== Filter search icon ========== */
+.filter-search-icon {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 0.85em;
+  color: rgba(255, 255, 255, 0.5);
+  pointer-events: none;
+  display: none;
+}
 
 /* ========== Enable-selected pattern ========== */
 .enable-selected {

@@ -100,6 +100,8 @@ pub async fn api_list(
                 new_arrivals: false,
                 frozen: record_is_frozen(r, &frozen_ids),
                 length: r.length,
+                toc_url: r.toc_url.clone(),
+                general_all_no: r.general_all_no,
             })
             .collect();
 

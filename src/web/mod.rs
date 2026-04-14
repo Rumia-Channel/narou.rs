@@ -38,6 +38,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/version/current.json", get(misc::version_current))
         .route("/api/webui/config", get(misc::webui_config))
         .route("/api/tag_list", get(misc::tag_list))
+        .route("/api/tag/change_color", post(misc::tag_change_color))
+        .route("/api/novels/all_ids", get(misc::all_novel_ids))
         .route("/api/notepad/read", get(misc::notepad_read))
         .route("/api/notepad/save", post(misc::notepad_save))
         .route("/api/novels/{id}", get(novels::get_novel))
