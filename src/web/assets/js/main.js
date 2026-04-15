@@ -117,10 +117,48 @@ function handleWsMessage(msg) {
     case 'echo':
       appendConsole(msg.body || '');
       break;
+    case 'progressbar.init':
+      initProgressBar(msg.data?.topic);
+      break;
+    case 'progressbar.step':
+      setProgressBar(msg.data?.percent, msg.data?.topic);
+      break;
+    case 'progressbar.clear':
+      removeProgressBar(msg.data?.topic);
+      break;
     default:
       appendConsole(msg.text || msg.message || JSON.stringify(msg));
       break;
   }
+}
+
+var progressBars = {};
+
+function initProgressBar(topic) {
+  var key = topic || 'default';
+  removeProgressBar(key);
+  var con = El.console;
+  if (!con) return;
+  var wrapper = document.createElement('div');
+  wrapper.className = 'progress';
+  wrapper.innerHTML = '<div class="progress-bar" style="width:0%"></div>';
+  con.appendChild(wrapper);
+  progressBars[key] = wrapper.querySelector('.progress-bar');
+  con.scrollTop = con.scrollHeight;
+}
+
+function setProgressBar(percent, topic) {
+  var key = topic || 'default';
+  if (!progressBars[key]) initProgressBar(key);
+  progressBars[key].style.width = (percent || 0) + '%';
+}
+
+function removeProgressBar(topic) {
+  var key = topic || 'default';
+  if (!progressBars[key]) return;
+  var wrapper = progressBars[key].parentElement;
+  if (wrapper) wrapper.remove();
+  delete progressBars[key];
 }
 
 function appendConsole(text) {

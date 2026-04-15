@@ -112,6 +112,30 @@ impl PushServer {
         self.broadcast("convert_complete", result);
     }
 
+    pub fn broadcast_progressbar_init(&self, topic: &str) {
+        let payload = serde_json::json!({
+            "type": "progressbar.init",
+            "data": { "topic": topic }
+        });
+        self.channel.send(&payload.to_string());
+    }
+
+    pub fn broadcast_progressbar_step(&self, percent: f64, topic: &str) {
+        let payload = serde_json::json!({
+            "type": "progressbar.step",
+            "data": { "percent": percent, "topic": topic }
+        });
+        self.channel.send(&payload.to_string());
+    }
+
+    pub fn broadcast_progressbar_clear(&self, topic: &str) {
+        let payload = serde_json::json!({
+            "type": "progressbar.clear",
+            "data": { "topic": topic }
+        });
+        self.channel.send(&payload.to_string());
+    }
+
     pub fn register_client(&self, sender: broadcast::Sender<String>) -> usize {
         let mut id_guard = self.next_client_id.lock();
         let id = *id_guard;
