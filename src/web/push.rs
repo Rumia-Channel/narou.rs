@@ -39,6 +39,8 @@ pub struct PushServer {
     channel: BroadcastChannel,
     clients: DashMap<usize, broadcast::Sender<String>>,
     next_client_id: Mutex<usize>,
+    console_history: Mutex<Vec<String>>,
+    max_history: usize,
 }
 
 impl PushServer {
@@ -47,6 +49,8 @@ impl PushServer {
             channel: BroadcastChannel::new(),
             clients: DashMap::new(),
             next_client_id: Mutex::new(1),
+            console_history: Mutex::new(Vec::new()),
+            max_history: 10000,
         }
     }
 
@@ -63,7 +67,9 @@ impl PushServer {
             "type": event_type,
             "data": data,
         });
-        self.channel.send(&message.to_string());
+        let msg_str = message.to_string();
+        self.append_history(data);
+        self.channel.send(&msg_str);
     }
 
     pub fn broadcast_progress(&self, current: usize, total: usize, message: &str) {
@@ -82,6 +88,7 @@ impl PushServer {
             "level": level,
             "message": message,
         });
+        self.append_history(message);
         self.channel.send(&payload.to_string());
     }
 
@@ -115,6 +122,31 @@ impl PushServer {
 
     pub fn unregister_client(&self, id: usize) {
         self.clients.remove(&id);
+    }
+
+    fn append_history(&self, message: &str) {
+        let mut history = self.console_history.lock();
+        history.push(message.to_string());
+        if history.len() > self.max_history {
+            let drain_count = history.len() - self.max_history + 500;
+            history.drain(..drain_count);
+        }
+    }
+
+    pub fn get_history(&self) -> String {
+        let history = self.console_history.lock();
+        history.join("\n")
+    }
+
+    pub fn clear_history(&self) {
+        let mut history = self.console_history.lock();
+        history.clear();
+    }
+
+    pub fn recent_logs(&self, count: usize) -> Vec<String> {
+        let history = self.console_history.lock();
+        let start = history.len().saturating_sub(count);
+        history[start..].to_vec()
     }
 }
 
@@ -220,5 +252,18 @@ impl StreamingLogger {
         let buf = self.buffer.lock();
         let start = buf.len().saturating_sub(count);
         buf[start..].to_vec()
+    }
+
+    pub fn full_history(&self) -> String {
+        let buf = self.buffer.lock();
+        buf.iter()
+            .map(|e| format!("[{}] {}", e.timestamp, e.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn clear_history(&self) {
+        let mut buf = self.buffer.lock();
+        buf.clear();
     }
 }

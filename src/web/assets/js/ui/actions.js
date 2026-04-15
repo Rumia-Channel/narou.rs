@@ -20,9 +20,10 @@ export function bindActions() {
   });
 
   // --- Console buttons ---
-  El.consoleTrash?.addEventListener('click', () => {
+  El.consoleTrash?.addEventListener('click', async () => {
     if (El.console) El.console.textContent = '';
     State.consoleHistory = [];
+    try { await postJson('/api/clear_history', {}); } catch { /* ignore */ }
   });
 
   El.consoleExpand?.addEventListener('click', () => {
@@ -41,9 +42,9 @@ export function bindActions() {
 
   El.consoleHistory?.addEventListener('click', async () => {
     try {
-      const data = await fetchJson('/api/log/recent');
-      if (data?.logs && El.console) {
-        El.console.textContent = data.logs;
+      const data = await fetchJson('/api/history');
+      if (data?.history !== undefined && El.console) {
+        El.console.textContent = data.history;
         El.console.scrollTop = El.console.scrollHeight;
       }
     } catch { /* ignore */ }

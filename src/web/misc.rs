@@ -129,7 +129,19 @@ pub async fn recent_logs(
     Query(params): Query<LogsParams>,
 ) -> Json<serde_json::Value> {
     let count = params.count.unwrap_or(100);
-    let logger = super::push::StreamingLogger::new(state.push_server.clone());
-    let logs = logger.recent_logs(count);
+    let logs = state.push_server.recent_logs(count);
     Json(serde_json::json!({ "logs": logs }))
+}
+
+pub async fn console_history(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let history = state.push_server.get_history();
+    Json(serde_json::json!({ "history": history }))
+}
+
+pub async fn clear_history(State(state): State<AppState>) -> Json<ApiResponse> {
+    state.push_server.clear_history();
+    Json(ApiResponse {
+        success: true,
+        message: "History cleared".to_string(),
+    })
 }
