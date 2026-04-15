@@ -5,6 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::logger;
+use narou_rs::termcolor::bold_colored;
 
 pub fn cmd_log(
     path: Option<&str>,
@@ -17,7 +18,9 @@ pub fn cmd_log(
 
 pub fn report_error(message: &str) {
     logger::without_logging(|| {
-        if std::env::var_os("NO_COLOR").is_some() {
+        if narou_rs::progress::is_web_mode() {
+            eprintln!("{} {}", bold_colored("[ERROR]", "red"), message);
+        } else if std::env::var_os("NO_COLOR").is_some() {
             eprintln!("[ERROR] {}", message);
         } else {
             eprintln!("\x1b[1;31m[ERROR]\x1b[0m {}", message);
