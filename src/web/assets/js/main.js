@@ -209,10 +209,17 @@ function appendConsole(text) {
   if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
 
   for (var i = 0; i < lines.length; i++) {
-    var div = document.createElement('div');
-    div.className = 'console-line';
-    div.textContent = lines[i];
-    con.appendChild(div);
+    // Ruby web mode sends <hr> for horizontal rules; also detect text HR (U+2015 × 30+)
+    if (lines[i] === '<hr>' || /^―{30,}$/.test(lines[i])) {
+      var hr = document.createElement('hr');
+      hr.className = 'console-line console-hr';
+      con.appendChild(hr);
+    } else {
+      var div = document.createElement('div');
+      div.className = 'console-line';
+      div.textContent = lines[i];
+      con.appendChild(div);
+    }
   }
 
   // Trim old lines (only console-line elements, preserve progress bars)

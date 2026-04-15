@@ -710,7 +710,7 @@ impl Downloader {
         let subtitles = if novel_type == 2 {
             create_short_story_subtitles(&setting, &toc_source)?
         } else {
-            parse_subtitles_multipage(&mut self.fetcher, &setting, &toc_source, &url_captures)?
+            parse_subtitles_multipage(&mut self.fetcher, &setting, &toc_source, &url_captures, &title)?
         };
 
         let use_subdirectory = self.download_use_subdirectory(existing_id);

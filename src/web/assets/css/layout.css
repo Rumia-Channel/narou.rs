@@ -164,6 +164,13 @@
   min-height: 1.2em;
 }
 
+hr.console-hr {
+  border: none;
+  border-top: 0.07em solid var(--console-text);
+  margin: 0.3em 0;
+  min-height: 0;
+}
+
 .console-buttons {
   position: absolute;
   top: 0.3em;

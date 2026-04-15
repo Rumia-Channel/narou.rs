@@ -109,6 +109,7 @@ pub fn parse_subtitles_multipage(
     setting: &SiteSetting,
     mut toc_source: &str,
     url_captures: &HashMap<String, String>,
+    title: &str,
 ) -> Result<Vec<SubtitleInfo>> {
     let mut all_subtitles = Vec::new();
     let mut page = 0;
@@ -122,6 +123,10 @@ pub fn parse_subtitles_multipage(
     } else {
         50
     };
+
+    if max_pages >= 5 && !title.is_empty() {
+        println!("{} の目次ページを取得中...", title);
+    }
 
     loop {
         let page_subs = parse_subtitles(setting, toc_source, url_captures)?;
