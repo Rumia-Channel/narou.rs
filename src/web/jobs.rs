@@ -119,6 +119,20 @@ pub async fn api_update(
     };
 
     let count = jobs.len();
+    // Ruby parity: output update start message before queueing
+    let is_update_all = targets.is_empty();
+    let sort_display = current_sort_display_string();
+    if is_update_all {
+        state.push_server.broadcast_echo(
+            &format!("全ての小説の更新を開始します（{}件を{}で処理）", count, sort_display),
+            "stdout",
+        );
+    } else if !has_flags {
+        state.push_server.broadcast_echo(
+            &format!("更新を開始します（{}件を{}で処理）", count, sort_display),
+            "stdout",
+        );
+    }
     let job_ids = match queue.push_batch(&jobs) {
         Ok(ids) => ids,
         Err(e) => {
@@ -762,7 +776,6 @@ fn kill_running_child(state: &AppState) {
                 "stdout",
             );
         }
-        state.push_server.broadcast_echo("--- ジョブをキャンセルしました ---", "stdout");
     }
 }
 
@@ -976,6 +989,13 @@ pub async fn api_update_by_tag(
         .iter()
         .map(|id| (JobType::Update, id.to_string()))
         .collect();
+    let count = jobs.len();
+    // Ruby parity: output update start message
+    let sort_display = current_sort_display_string();
+    state.push_server.broadcast_echo(
+        &format!("更新を開始します（{}件を{}で処理）", count, sort_display),
+        "stdout",
+    );
     let job_ids = match queue.push_batch(&jobs) {
         Ok(ids) => ids,
         Err(e) => {
@@ -1193,4 +1213,31 @@ pub async fn api_reboot(
         success: true,
         message: "Rebooting".to_string(),
     })
+}
+
+/// Ruby parity: build sort display string like "タイトル昇順" or "ID順"
+fn current_sort_display_string() -> String {
+    const SORT_COLUMN_LABELS: &[&str] = &[
+        "ID", "最終更新日", "最新話掲載日", "最終確認日", "タイトル", "作者",
+        "サイト名", "小説種別", "タグ", "話数", "文字数", "状態", "URL",
+    ];
+
+    let sort_state = (|| -> Option<(usize, String)> {
+        let inv = crate::db::inventory::Inventory::with_default_root().ok()?;
+        let server_setting: serde_json::Map<String, serde_json::Value> =
+            inv.load("server_setting", crate::db::inventory::InventoryScope::Global).ok()?;
+        let current_sort = server_setting.get("current_sort")?;
+        let column = current_sort.get("column")?.as_u64()? as usize;
+        let dir = current_sort.get("dir")?.as_str()?.to_string();
+        Some((column, dir))
+    })();
+
+    match sort_state {
+        Some((column, dir)) => {
+            let label = SORT_COLUMN_LABELS.get(column).unwrap_or(&"不明");
+            let dir_label = if dir == "desc" { "降順" } else { "昇順" };
+            format!("{}{}", label, dir_label)
+        }
+        None => "ID順".to_string(),
+    }
 }

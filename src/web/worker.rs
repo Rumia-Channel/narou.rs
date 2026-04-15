@@ -36,10 +36,6 @@ pub fn start_queue_worker(
 
             *running_job.lock() = Some(job.clone());
             push_server.broadcast_event("queue_start", &job.id);
-            push_server.broadcast_echo(
-                &format!("--- ジョブ開始: {:?} {} ---", job.job_type, job.target),
-                "stdout",
-            );
 
             let root_dir = root_dir.clone();
             let job_for_run = job.clone();
@@ -57,17 +53,9 @@ pub fn start_queue_worker(
             *running_job.lock() = None;
             if success {
                 let _ = queue.complete(&job.id);
-                push_server.broadcast_echo(
-                    &format!("--- ジョブ完了: {:?} {} ---", job.job_type, job.target),
-                    "stdout",
-                );
                 push_server.broadcast_event("queue_complete", &job.id);
             } else {
                 let _ = queue.fail(&job.id);
-                push_server.broadcast_echo(
-                    &format!("--- ジョブ失敗: {:?} {} ---", job.job_type, job.target),
-                    "stdout",
-                );
                 push_server.broadcast_event("queue_failed", &job.id);
             }
             // Trigger frontend table reload after DB refresh
