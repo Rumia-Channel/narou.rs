@@ -117,22 +117,6 @@ impl PushServer {
         self.broadcast("error", message);
     }
 
-    pub fn broadcast_download_start(&self, target: &str) {
-        self.broadcast("download_start", target);
-    }
-
-    pub fn broadcast_download_complete(&self, result: &str) {
-        self.broadcast("download_complete", result);
-    }
-
-    pub fn broadcast_convert_start(&self, target: &str) {
-        self.broadcast("convert_start", target);
-    }
-
-    pub fn broadcast_convert_complete(&self, result: &str) {
-        self.broadcast("convert_complete", result);
-    }
-
     pub fn broadcast_progressbar_init(&self, topic: &str) {
         let payload = serde_json::json!({
             "type": "progressbar.init",
