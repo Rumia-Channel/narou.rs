@@ -61,7 +61,7 @@ fn cmd_download_inner(opts: DownloadOptions) -> i32 {
 
     for (i, target) in targets.iter().enumerate() {
         if i > 0 {
-            let _ = multi_clone.println(format!("{}", "\u{2500}".repeat(35)));
+            println!("{}", "\u{2500}".repeat(35));
         }
 
         let mut download_target = target.clone();
@@ -70,10 +70,10 @@ fn cmd_download_inner(opts: DownloadOptions) -> i32 {
 
             if is_novel_frozen(&download_target) {
                 if let Some(ref rec) = data {
-                    let _ = multi_clone.println(format!(
+                    println!(
                         "{} は凍結中です\nダウンロードを中止しました",
                         rec.title
-                    ));
+                    );
                 }
                 mistook += 1;
                 break;
@@ -83,10 +83,10 @@ fn cmd_download_inner(opts: DownloadOptions) -> i32 {
                 if let Some(existing) = inspect_existing_download(&download_target) {
                     match existing {
                         ExistingDownloadState::Present(rec) => {
-                            let _ = multi_clone.println(format!(
+                            println!(
                                 "{} はダウンロード済みです。\nID: {}\ntitle: {}",
                                 download_target, rec.id, rec.title
-                            ));
+                            );
                             mistook += 1;
                             break;
                         }
@@ -112,7 +112,7 @@ fn cmd_download_inner(opts: DownloadOptions) -> i32 {
 
             match downloader.download_novel_with_force(&download_target, opts.force) {
                 Ok(dl) => {
-                    print_download_status(&multi_clone, &dl);
+                    print_download_status(&dl);
 
                     match dl.status {
                         UpdateStatus::Ok => {}
@@ -123,19 +123,19 @@ fn cmd_download_inner(opts: DownloadOptions) -> i32 {
                     }
 
                     if opts.no_convert {
-                        after_process(&multi_clone, &download_target, &opts);
+                        after_process(&download_target, &opts);
                     } else {
                         if let Err(e) = auto_convert(&multi_clone, &dl) {
-                            let _ = multi_clone.println(format!("  Convert error: {}", e));
+                            println!("  Convert error: {}", e);
                         }
-                        after_process(&multi_clone, &download_target, &opts);
+                        after_process(&download_target, &opts);
                     }
                 }
                 Err(e) => {
                     if matches!(e, narou_rs::error::NarouError::SuspendDownload(_)) {
                         std::panic::resume_unwind(Box::new(e.to_string()));
                     }
-                    let _ = multi_clone.println(format!("  Error: {}", e));
+                    println!("  Error: {}", e);
                     mistook += 1;
                 }
             }
@@ -464,50 +464,50 @@ fn is_novel_frozen(target: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn print_download_status(multi: &Arc<MultiProgress>, dl: &narou_rs::downloader::DownloadResult) {
+fn print_download_status(dl: &narou_rs::downloader::DownloadResult) {
     match dl.status {
         UpdateStatus::Ok => {
             if dl.new_novel {
-                let _ = multi.println(format!(
+                println!(
                     "{} のDL完了 (ID:{}, {}セクション)",
                     dl.title, dl.id, dl.total_count
-                ));
+                );
             } else if dl.updated_count > 0 {
-                let _ = multi.println(format!(
+                println!(
                     "{} の更新完了 (ID:{}, {}/{}話更新)",
                     dl.title, dl.id, dl.updated_count, dl.total_count
-                ));
+                );
             } else if dl.title_changed {
-                let _ = multi.println(format!(
+                println!(
                     "ID:{} {} のタイトルが更新されています",
                     dl.id, dl.title
-                ));
+                );
             } else if dl.story_changed {
-                let _ = multi.println(format!(
+                println!(
                     "ID:{} {} のあらすじが更新されています",
                     dl.id, dl.title
-                ));
+                );
             } else if dl.author_changed {
-                let _ = multi.println(format!(
+                println!(
                     "ID:{} {} の作者名が更新されています",
                     dl.id, dl.title
-                ));
+                );
             }
         }
         UpdateStatus::None => {
-            let _ = multi.println(format!("{} に更新はありません", dl.title));
+            println!("{} に更新はありません", dl.title);
         }
         UpdateStatus::Canceled => {
-            let _ = multi.println(format!(
+            println!(
                 "ID:{} {} の更新はキャンセルされました",
                 dl.id, dl.title
-            ));
+            );
         }
         UpdateStatus::Failed => {}
     }
 }
 
-fn after_process(multi: &Arc<MultiProgress>, target: &str, opts: &DownloadOptions) {
+fn after_process(target: &str, opts: &DownloadOptions) {
     if opts.mail {
         match load_mail_setting() {
             Ok(setting) => {
@@ -517,9 +517,9 @@ fn after_process(multi: &Arc<MultiProgress>, target: &str, opts: &DownloadOption
             }
             Err(MailSettingLoadError::NotFound(_)) => {
                 if let Ok(path) = ensure_mail_setting_file() {
-                    let _ = multi.println(format!("created {}", path.display()));
-                    let _ = multi.println("メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。");
-                    let _ = multi.println(
+                    println!("created {}", path.display());
+                    println!("メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。");
+                    println!(
                         "注意：次回以降のupdateで新着があった場合に送信可能フラグが立ちます",
                     );
                 }
@@ -536,10 +536,10 @@ fn after_process(multi: &Arc<MultiProgress>, target: &str, opts: &DownloadOption
         }
     }
     if opts.freeze {
-        let _ = multi.println(format!("凍結: {}", target));
+        println!("凍結: {}", target);
         super::manage::freeze_by_target(target);
     } else if opts.remove {
-        let _ = multi.println(format!("削除: {}", target));
+        println!("削除: {}", target);
         super::manage::remove_by_target(target);
     }
 }
@@ -560,7 +560,7 @@ fn auto_convert(
 
     match converter.convert_novel_by_id(dl.id, &dl.novel_dir) {
         Ok(path) => {
-            let _ = multi.println(format!("  Converted: {}", path));
+            println!("  Converted: {}", path);
             Ok(())
         }
         Err(e) => Err(e.to_string()),

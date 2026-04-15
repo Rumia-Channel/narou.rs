@@ -548,6 +548,8 @@ impl NovelConverter {
             novel_type: toc.novel_type,
         };
 
+        self.display_header(id, &toc_object.title);
+
         let sections = load_sections_from_dir(novel_dir, &toc_object.subtitles)?;
 
         let aozora_text = self.convert_novel(&toc_object, &sections)?;
@@ -555,6 +557,8 @@ impl NovelConverter {
         std::fs::write(&txt_path, &aozora_text)?;
         save_latest_convert(id)?;
         self.inspect_converted_text(&aozora_text)?;
+
+        self.display_footer();
 
         Ok(txt_path.display().to_string())
     }
@@ -583,6 +587,8 @@ impl NovelConverter {
             novel_type: toc.novel_type,
         };
 
+        self.display_header(_id, &toc_object.title);
+
         let sections = load_sections_from_dir(novel_dir, &toc_object.subtitles)?;
 
         let aozora_text = self.convert_novel(&toc_object, &sections)?;
@@ -590,6 +596,8 @@ impl NovelConverter {
         std::fs::write(&txt_path, &aozora_text)?;
         save_latest_convert(_id)?;
         self.inspect_converted_text(&aozora_text)?;
+
+        self.display_footer();
 
         let output_manager = device::OutputManager::new(device)
             .with_verbose(verbose)
@@ -625,6 +633,16 @@ impl NovelConverter {
             self.inspector.borrow().summary_text()
         };
         Ok(())
+    }
+
+    /// Ruby: display_header — "ID:{id}　{title} の変換を開始"
+    fn display_header(&self, id: i64, title: &str) {
+        println!("ID:{}　{} の変換を開始", id, title);
+    }
+
+    /// Ruby: display_footer — "縦書用の変換が終了しました"
+    fn display_footer(&self) {
+        println!("縦書用の変換が終了しました");
     }
 }
 

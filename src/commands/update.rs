@@ -120,7 +120,7 @@ pub fn cmd_update(opts: UpdateOptions) {
             abort_if_interrupted(interrupted.as_ref())?;
 
             if i > 0 {
-                let _ = multi_clone.println("\u{2500}".repeat(35));
+                println!("{}", "\u{2500}".repeat(35));
             }
 
             let frozen = !opts.force && is_novel_frozen(id);
@@ -129,7 +129,7 @@ pub fn cmd_update(opts: UpdateOptions) {
                     continue;
                 }
                 let title = get_novel_title(id);
-                let _ = multi_clone.println(format!("ID:{}　{} は凍結中です", id, title));
+                println!("ID:{}　{} は凍結中です", id, title);
                 mistook += 1;
                 continue;
             }
@@ -145,7 +145,7 @@ pub fn cmd_update(opts: UpdateOptions) {
 
             match downloader.download_novel(&id.to_string()) {
                 Ok(dl) => {
-                    print_status_messages(&multi_clone, &dl);
+                    print_status_messages(&dl);
 
                     if hotentry_enabled && !dl.new_arrival_subtitles.is_empty() {
                         hotentries
@@ -197,25 +197,25 @@ pub fn cmd_update(opts: UpdateOptions) {
                             } else {
                                 dl.title.clone()
                             };
-                            let _ = multi_clone.println(format!(
+                            println!(
                                 "ID:{} {} の更新はキャンセルされました",
                                 id, title
-                            ));
+                            );
                             mistook += 1;
                             continue;
                         }
                     }
 
                     if has_convert_failure {
-                        let _ = multi_clone.println("前回変換できなかったので再変換します");
+                        println!("前回変換できなかったので再変換します");
                     }
 
-                    match auto_convert(&multi_clone, &dl, is_bulk) {
+                    match auto_convert(&dl, is_bulk) {
                         Ok(()) => {
                             clear_convert_failure(dl.id);
                         }
                         Err(e) => {
-                            let _ = multi_clone.println(format!("  Convert error: {}", e));
+                            println!("  Convert error: {}", e);
                             set_convert_failure(dl.id);
                             mistook += 1;
                         }
@@ -226,8 +226,7 @@ pub fn cmd_update(opts: UpdateOptions) {
                         return Err(UpdateInterrupted);
                     }
                     let title = get_novel_title(id);
-                    let _ = multi_clone
-                        .println(format!("ID:{} {} の更新は失敗しました\n  {}", id, title, e));
+                    println!("ID:{} {} の更新は失敗しました\n  {}", id, title, e);
                     mistook += 1;
                 }
             }
@@ -237,14 +236,14 @@ pub fn cmd_update(opts: UpdateOptions) {
 
         if hotentry_enabled {
             abort_if_interrupted(interrupted.as_ref())?;
-            if let Err(e) = process_hotentry(&multi_clone, &hotentries) {
-                let _ = multi_clone.println(format!("hotentry の処理に失敗しました\n  {}", e));
+            if let Err(e) = process_hotentry(&hotentries) {
+                println!("hotentry の処理に失敗しました\n  {}", e);
                 mistook += 1;
             }
         }
 
         if mistook > 0 {
-            let _ = multi_clone.println(format!("\n{} 件のエラーが発生しました", mistook));
+            println!("\n{} 件のエラーが発生しました", mistook);
         }
         drop(multi);
 
@@ -704,40 +703,40 @@ fn clear_convert_failure(id: i64) {
     });
 }
 
-fn print_status_messages(multi: &Arc<MultiProgress>, dl: &DownloadResult) {
+fn print_status_messages(dl: &DownloadResult) {
     match dl.status {
         UpdateStatus::Ok => {
             if dl.new_novel {
-                let _ = multi.println(format!(
+                println!(
                     "{} のDL完了 (ID:{}, {}セクション)",
                     dl.title, dl.id, dl.total_count
-                ));
+                );
             } else if dl.sections_deleted {
-                let _ = multi.println(format!(
+                println!(
                     "ID:{} {} は一部の話が削除されています",
                     dl.id, dl.title
-                ));
+                );
             } else if dl.updated_count > 0 {
-                let _ = multi.println(format!("{} の更新が完了しました", dl.title));
+                println!("{} の更新が完了しました", dl.title);
             } else if dl.title_changed {
-                let _ = multi.println(format!(
+                println!(
                     "ID:{} {} のタイトルが更新されています",
                     dl.id, dl.title
-                ));
+                );
             } else if dl.story_changed {
-                let _ = multi.println(format!(
+                println!(
                     "ID:{} {} のあらすじが更新されています",
                     dl.id, dl.title
-                ));
+                );
             } else if dl.author_changed {
-                let _ = multi.println(format!(
+                println!(
                     "ID:{} {} の作者名が更新されています",
                     dl.id, dl.title
-                ));
+                );
             }
         }
         UpdateStatus::None => {
-            let _ = multi.println(format!("{} に更新はありません", dl.title));
+            println!("{} に更新はありません", dl.title);
         }
         UpdateStatus::Canceled => {}
         UpdateStatus::Failed => {}
@@ -745,7 +744,6 @@ fn print_status_messages(multi: &Arc<MultiProgress>, dl: &DownloadResult) {
 }
 
 fn auto_convert(
-    _multi: &Arc<MultiProgress>,
     dl: &DownloadResult,
     no_open: bool,
 ) -> Result<(), String> {
@@ -753,7 +751,6 @@ fn auto_convert(
 }
 
 fn process_hotentry(
-    multi: &Arc<MultiProgress>,
     hotentries: &HashMap<i64, Vec<SubtitleInfo>>,
 ) -> Result<(), String> {
     if hotentries.is_empty() {
@@ -785,8 +782,8 @@ fn process_hotentry(
         return Ok(());
     }
 
-    let _ = multi.println("───────────────────────────────────");
-    let _ = multi.println("hotentry の変換を開始");
+    println!("───────────────────────────────────");
+    println!("hotentry の変換を開始");
 
     let mut converted_entries = Vec::new();
     for (id, novel_dir, toc, subtitles) in &collected {
@@ -851,11 +848,10 @@ fn process_hotentry(
         } else {
             Some(device)
         },
-        multi,
     );
     mail_hotentry_if_enabled();
 
-    let _ = multi.println(format!("hotentry を生成しました: {}", final_path.display()));
+    println!("hotentry を生成しました: {}", final_path.display());
     Ok(())
 }
 
@@ -1007,7 +1003,6 @@ fn copy_to_hotentry_output(
 fn send_hotentry_output(
     ebook_file: &Path,
     device: Option<Device>,
-    multi: &Arc<MultiProgress>,
 ) -> Result<(), String> {
     let Some(device) = device else {
         return Ok(());
@@ -1020,13 +1015,13 @@ fn send_hotentry_output(
     if !manager.ebook_file_old(ebook_file) {
         return Ok(());
     }
-    let _ = multi.println(format!("{}へ送信しています", device.display_name()));
+    println!("{}へ送信しています", device.display_name());
     match manager
         .copy_to_documents(ebook_file)
         .map_err(|e| e.to_string())?
     {
         Some(path) => {
-            let _ = multi.println(format!("{} へコピーしました", path.display()));
+            println!("{} へコピーしました", path.display());
             Ok(())
         }
         None => Err(format!(

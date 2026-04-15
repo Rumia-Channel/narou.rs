@@ -805,13 +805,18 @@ impl Downloader {
         let strong_update = load_local_setting_bool("update.strong");
         let mut cache_dir: Option<PathBuf> = None;
         let mut pending_section_hashes: HashMap<String, String> = HashMap::new();
+        let display_id = existing_id.unwrap_or(0);
 
         if let Some(ref p) = self.progress {
             p.set_length(total);
             p.set_message(&format!("DL {}", title));
         }
+        println!("ID:{}　{} のDL開始", display_id, title);
 
-        for subtitle in &subtitles {
+        let mut last_chapter = String::new();
+        let mut last_subchapter = String::new();
+
+        for (si, subtitle) in subtitles.iter().enumerate() {
             let latest_section_path = section_dir.join(section_filename(subtitle));
             let is_new_arrival = !latest_section_path.exists();
 
@@ -822,6 +827,16 @@ impl Downloader {
                     final_subtitles.len() + 1,
                     subtitles.len()
                 ));
+            }
+
+            // Print chapter/subchapter headers (Ruby: only when changed)
+            if !subtitle.chapter.is_empty() && subtitle.chapter != last_chapter {
+                println!("{}", subtitle.chapter);
+                last_chapter = subtitle.chapter.clone();
+            }
+            if !subtitle.subchapter.is_empty() && subtitle.subchapter != last_subchapter {
+                println!("{}", subtitle.subchapter);
+                last_subchapter = subtitle.subchapter.clone();
             }
 
             let (needs_download, predownloaded) = if force {
@@ -897,6 +912,32 @@ impl Downloader {
             }
             final_subtitles.push(sub);
 
+            // Ruby-compatible section progress line
+            {
+                let mut line = String::new();
+                if novel_type == 1 {
+                    // Series: "第{index}部分　" (only if index ≤ 4 digits)
+                    if subtitle.index.len() <= 4 {
+                        line.push_str(&format!("第{}部分　", subtitle.index));
+                    }
+                } else {
+                    line.push_str("短編　");
+                }
+                line.push_str(&format!(
+                    "{} ({}/{})",
+                    subtitle.subtitle,
+                    si + 1,
+                    subtitles.len()
+                ));
+                if needs_download {
+                    if is_new_arrival && (existing_id.is_some() || force) {
+                        line.push_str(" (新着)");
+                    } else if !is_new_arrival && force {
+                        line.push_str(" (更新あり)");
+                    }
+                }
+                println!("{}", line);
+            }
             if let Some(ref p) = self.progress {
                 p.inc(1);
             }

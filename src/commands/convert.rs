@@ -40,14 +40,14 @@ pub fn cmd_convert(
     let mut first_output_dir = None;
     let output_parts = output.map(split_output_name);
     let _ = no_strip;
-    let selected_devices = match resolve_selected_devices(make_zip, &multi_clone) {
+    let selected_devices = match resolve_selected_devices(make_zip) {
         Ok(devices) => devices,
         Err(()) => return,
     };
     let encoding = match normalize_text_file_encoding_name(encoding) {
         Ok(encoding) => encoding,
         Err(message) => {
-            let _ = multi_clone.println(message);
+            println!("{}", message);
             return;
         }
     };
@@ -61,10 +61,18 @@ pub fn cmd_convert(
                 && matches!(output_device, Some(narou_rs::converter::device::Device::Ibunko));
 
         if let Some(device) = selected_device {
-            let _ = multi_clone.println(&format!(">> {}用に変換します", device.display_name()));
+            println!(">> {}用に変換します", device.display_name());
         }
 
+        let total_count = targets.len();
+        let mut completed_count = 0usize;
+        println!("変換処理開始: {} 件の小説を処理します", total_count);
+
         for (index, target) in targets.iter().enumerate() {
+            if index > 0 {
+                println!("{}", "\u{2015}".repeat(35));
+            }
+            println!("[{}/{}] 処理中: {}", index + 1, total_count, target);
             let output_filename = output_parts.as_ref().map(|(basename, ext)| {
                 build_output_filename(
                     basename,
@@ -93,21 +101,20 @@ pub fn cmd_convert(
                     create_ibunko_side_epub,
                     no_strip,
                     verbose,
-                    &multi_clone,
                     &mut first_output_dir,
                 );
                 continue;
             }
 
             let Some(id) = resolve_target_to_id(target) else {
-                let _ = multi_clone.println(&format!("{} は存在しません", target));
+                println!("{} は存在しません", target);
                 continue;
             };
 
             let dc_subjects = match load_dc_subjects_for_novel(id) {
                 Ok(subjects) => subjects,
                 Err(err) => {
-                    let _ = multi_clone.println(&err);
+                    println!("{}", err);
                     None
                 }
             };
@@ -125,7 +132,7 @@ pub fn cmd_convert(
             }) {
                 Ok(data) => data,
                 Err(e) => {
-                    let _ = multi_clone.println(&format!("  Error: {}", e));
+                    println!("  Error: {}", e);
                     continue;
                 }
             };
@@ -175,56 +182,60 @@ pub fn cmd_convert(
                                 apply_dc_subjects_if_needed(
                                     &epub_path,
                                     dc_subjects.as_deref(),
-                                    &multi_clone,
                                 );
-                                let _ =
-                                    multi_clone.println(&format!("  Output: {}", epub_path.display()));
+                                println!("  Output: {}", epub_path.display());
                             }
                             Ok(None) => {}
                             Err(err) => {
-                                let _ = multi_clone.println(&err);
+                                println!("{}", err);
                             }
                         }
                     }
-                    let _ = multi_clone.println(&format!("  Output: {}", output_path));
+                    println!("  Output: {}", output_path);
                     if first_output_dir.is_none() {
                         first_output_dir = std::path::Path::new(&output_path)
                             .parent()
                             .map(|path| path.to_path_buf());
                     }
                     if let Err(err) =
-                        print_copy_to_result(&output_path, copy_device, id, &multi_clone)
+                        print_copy_to_result(&output_path, copy_device, id)
                     {
-                        let _ = multi_clone.println(&err);
+                        println!("{}", err);
                     }
                     if output_path.to_ascii_lowercase().ends_with(".zip") {
-                        if let Err(err) = print_copy_zip_to_result(&output_path, &multi_clone) {
-                            let _ = multi_clone.println(&err);
+                        if let Err(err) = print_copy_zip_to_result(&output_path) {
+                            println!("{}", err);
                         }
                     }
                     if let Some(device) = copy_device {
                         if let Err(err) =
-                            print_send_result(&output_path, device, &multi_clone)
+                            print_send_result(&output_path, device)
                         {
-                            let _ = multi_clone.println(&err);
+                            println!("{}", err);
                         }
                     }
                     apply_dc_subjects_if_needed(
                         Path::new(&output_path),
                         dc_subjects.as_deref(),
-                        &multi_clone,
                     );
                     if let Some(inspection) = converter.take_inspection_output() {
                         for line in inspection.split('\n') {
-                            let _ = multi_clone.println(line);
+                            println!("{}", line);
                         }
                     }
+                    completed_count += 1;
+                    println!("[{}/{}] 完了: {}", index + 1, total_count, target);
                 }
                 Err(e) => {
-                    let _ = multi_clone.println(&format!("  Error: {}", e));
+                    println!("[{}/{}] エラー: {} - {}", index + 1, total_count, target, e);
                 }
             }
         }
+
+        println!(
+            "変換処理完了: {}/{} 件が正常に変換されました",
+            completed_count, total_count
+        );
     }
 
     drop(multi);
@@ -250,14 +261,13 @@ fn convert_text_target(
     create_ibunko_side_epub: bool,
     no_strip: bool,
     verbose: bool,
-    multi_clone: &indicatif::MultiProgress,
     first_output_dir: &mut Option<PathBuf>,
 ) {
     let text = match read_text_file(target_path, encoding) {
         Ok(text) => text,
         Err(message) => {
             for line in message.lines() {
-                let _ = multi_clone.println(line);
+                println!("{}", line);
             }
             return;
         }
@@ -304,37 +314,37 @@ fn convert_text_target(
                     verbose,
                 ) {
                     Ok(Some(epub_path)) => {
-                        let _ = multi_clone.println(&format!("  Output: {}", epub_path.display()));
+                        println!("  Output: {}", epub_path.display());
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        let _ = multi_clone.println(&err);
+                        println!("{}", err);
                     }
                 }
             }
-            let _ = multi_clone.println(&format!("  Output: {}", output_path));
+            println!("  Output: {}", output_path);
             if first_output_dir.is_none() {
                 *first_output_dir = Path::new(&output_path)
                     .parent()
                     .map(|path| path.to_path_buf());
             }
-            if let Err(err) = print_copy_to_result(&output_path, copy_device, 0, multi_clone) {
-                let _ = multi_clone.println(&err);
+            if let Err(err) = print_copy_to_result(&output_path, copy_device, 0) {
+                println!("{}", err);
             }
             if output_path.to_ascii_lowercase().ends_with(".zip") {
-                if let Err(err) = print_copy_zip_to_result(&output_path, multi_clone) {
-                    let _ = multi_clone.println(&err);
+                if let Err(err) = print_copy_zip_to_result(&output_path) {
+                    println!("{}", err);
                 }
             }
             if let Some(device) = copy_device {
-                if let Err(err) = print_send_result(&output_path, device, multi_clone) {
-                    let _ = multi_clone.println(&err);
+                if let Err(err) = print_send_result(&output_path, device) {
+                    println!("{}", err);
                 }
             }
-            print_inspection_output(&mut converter, multi_clone);
+            print_inspection_output(&mut converter);
         }
         Err(e) => {
-            let _ = multi_clone.println(&format!("  Error: {}", e));
+            println!("  Error: {}", e);
         }
     }
 }
@@ -365,7 +375,6 @@ fn effective_convert_device(
 
 fn resolve_selected_devices(
     make_zip: bool,
-    multi_clone: &indicatif::MultiProgress,
 ) -> std::result::Result<Vec<Option<narou_rs::converter::device::Device>>, ()> {
     if make_zip {
         return Ok(vec![Some(narou_rs::converter::device::Device::Ibunko)]);
@@ -388,15 +397,15 @@ fn resolve_selected_devices(
         if let Some(device) = parsed {
             devices.push(Some(device));
         } else {
-            let _ = multi_clone.println(format!(
+            println!(
                 "[convert.multi-device] {} は有効な端末名ではありません",
                 name
-            ));
+            );
         }
     }
 
     if devices.is_empty() {
-        let _ = multi_clone.println("有効な端末名がひとつもありませんでした");
+        println!("有効な端末名がひとつもありませんでした");
         return Err(());
     }
 
@@ -561,7 +570,6 @@ fn load_dc_subject_exclude_tags() -> std::result::Result<Vec<String>, String> {
 fn apply_dc_subjects_if_needed(
     output_path: &Path,
     subjects: Option<&[String]>,
-    multi_clone: &indicatif::MultiProgress,
 ) {
     let Some(subjects) = subjects else {
         return;
@@ -572,11 +580,11 @@ fn apply_dc_subjects_if_needed(
 
     match add_dc_subject_to_epub(output_path, subjects) {
         Ok(()) => {
-            let _ = multi_clone.println(&format!("dc:subjectを追加しました: {}", subjects.join(", ")));
+            println!("dc:subjectを追加しました: {}", subjects.join(", "));
         }
         Err(err) => {
-            let _ = multi_clone.println(&format!("dc:subject追加中にエラーが発生しました: {}", err));
-            let _ = multi_clone.println("dc:subject埋め込み処理に失敗しましたが、変換を続行します");
+            println!("dc:subject追加中にエラーが発生しました: {}", err);
+            println!("dc:subject埋め込み処理に失敗しましたが、変換を続行します");
         }
     }
 }
@@ -696,10 +704,10 @@ fn text_output_archive_path(target_path: &Path, output_filename: Option<&str>) -
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-fn print_inspection_output(converter: &mut NovelConverter, multi_clone: &indicatif::MultiProgress) {
+fn print_inspection_output(converter: &mut NovelConverter) {
     if let Some(inspection) = converter.take_inspection_output() {
         for line in inspection.split('\n') {
-            let _ = multi_clone.println(line);
+            println!("{}", line);
         }
     }
 }
@@ -708,12 +716,11 @@ fn print_copy_to_result(
     output_path: &str,
     device: Option<narou_rs::converter::device::Device>,
     novel_id: i64,
-    multi_clone: &indicatif::MultiProgress,
 ) -> std::result::Result<(), String> {
     if let Some(path) =
         narou_rs::compat::copy_to_converted_file(Path::new(output_path), device, novel_id)?
     {
-        let _ = multi_clone.println(&format!("{} へコピーしました", path.display()));
+        println!("{} へコピーしました", path.display());
     }
     Ok(())
 }
@@ -721,14 +728,12 @@ fn print_copy_to_result(
 fn print_send_result(
     output_path: &str,
     device: narou_rs::converter::device::Device,
-    _multi_clone: &indicatif::MultiProgress,
 ) -> std::result::Result<(), String> {
     narou_rs::compat::send_file_to_device(Path::new(output_path), device)
 }
 
 fn print_copy_zip_to_result(
     output_path: &str,
-    multi_clone: &indicatif::MultiProgress,
 ) -> std::result::Result<(), String> {
     let Some(copy_to_dir) =
         narou_rs::compat::load_local_setting_string("convert.copy-zip-to")
@@ -748,7 +753,7 @@ fn print_copy_zip_to_result(
             .ok_or_else(|| "Invalid ZIP filename".to_string())?,
     );
     std::fs::copy(output_path, &dst).map_err(|e| e.to_string())?;
-    let _ = multi_clone.println(&format!("{} へZIPをコピーしました", dst.display()));
+    println!("{} へZIPをコピーしました", dst.display());
     Ok(())
 }
 
