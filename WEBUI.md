@@ -129,7 +129,8 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | 全履歴取得ボタン | `.console-history` | `#console-history` (☁) | ✅ |
 | ゴミ箱ボタン | `.console-trash` | `#console-trash` (🗑) | ✅ |
 | 拡大/縮小ボタン | `.console-expand` (full/small切替) | `#console-expand` (⤢/⤣) | ✅ |
-| デュアルコンソール | 並行モード時に左右分割 | なし | ❌ |
+| サブプロセス出力ストリーミング | `StreamingLogger`で$stdoutをキャプチャ→echo WS | `Stdio::piped()`+BufRead→echo WS | ✅ |
+| デュアルコンソール | `concurrency`設定時に`$stdout2`で左右分割 | なし | ❌ |
 
 ---
 
@@ -523,6 +524,8 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `table.reload` / `refresh` / `list_updated` | S→C | ✅ (refreshList+refreshTags) | ✅ |
 | `tag.updateCanvas` | S→C | ✅ (refreshTags) | ✅ |
 | `status` / `queue` / `notification.queue` | S→C | ✅ (refreshQueue) | ✅ |
+| `queue_start` / `queue_complete` / `queue_failed` | S→C | ✅ (refreshQueue) | ✅ |
+| `error` | S→C | ✅ (appendConsole) | ✅ |
 | 再接続 | 5秒リトライ | ✅ (5s setTimeout) | ✅ |
 | `progressbar.init/step/clear` | S→C | ✅ (PushServer + main.js) | ✅ |
 | `ping.modal` (サーバー主導モーダル) | S→C | なし | ❌ |
@@ -593,9 +596,9 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 **コンテキストメニュー**: 15/15 項目 ✅ (作者コメント表示含む)
 **モーダル**: 8/8 ✅ (タグ編集, About, 差分, 確認, メモ帳, ダウンロード, キュー, 列可視性)
 **キーボードショートカット**: 12/12 ✅
-**テーマ**: 6/6 ✅
+**テーマ**: 6/6 ✅ (全ページCSS変数化、hardcoded色・px値なし)
 **API**: 51 実装済み / 6 未実装 (eject, version/latest, backup_bookmark, validate_url, reorder, cancel_running)
-**WebSocket**: 基本イベント ✅, 進捗バー ✅, モーダル/メモ帳同期 ❌
+**WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, 進捗バー ✅, DB自動更新+table.reload ✅, モーダル/メモ帳同期 ❌
 **設定ページ**: ✅
 **言語切替**: ✅ (Rust独自)
 **レスポンシブ**: ✅
