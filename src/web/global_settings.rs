@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 use crate::setting_info::{
     VarType, original_setting_var_infos, setting_variables, tab_for_setting,
+    webui_help_override,
 };
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::db::with_database;
@@ -264,12 +265,14 @@ fn build_setting_entry(
     tab: &str,
     value: Option<serde_yaml::Value>,
 ) -> serde_json::Value {
+    let help = webui_help_override(name, info.help)
+        .unwrap_or_else(|| info.help.to_string());
     serde_json::json!({
         "name": name,
         "scope": scope,
         "tab": tab,
         "var_type": info.var_type,
-        "help": info.help,
+        "help": help,
         "value": yaml_to_json(value),
         "select_keys": info.select_keys,
         "invisible": info.invisible,

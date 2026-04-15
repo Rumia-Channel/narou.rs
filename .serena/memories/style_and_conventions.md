@@ -1,5 +1,10 @@
 # Style and Conventions
 
+## コミット時のコード整形禁止ルール
+- git diff に現れる変更は機能的意味を持つものだけにする。
+- 禁止: 既存コードの改行+インデントし直し、一行化、use/import 順序の入れ替えなど見た目だけの変更。
+- 許容: 機能変更に付随して不可避な場合のみ（例: 引数追加による行長変化）。
+
 ## Code Style
 - **No comments** unless explicitly asked
 - Do not edit `Cargo.toml` directly for dependency changes. Use Cargo commands such as `cargo add` and `cargo update` so dependency versions come from the current registry metadata. If a direct manifest edit is unavoidable, document why and verify with `cargo check`.
