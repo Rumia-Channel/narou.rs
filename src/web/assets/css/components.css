@@ -308,8 +308,8 @@ li.enable-selected.disabled a {
   border-bottom: 0.07em solid var(--dropdown-divider); font-size: 0.95em;
 }
 .story-popover-body {
-  padding: 8px 12px; font-size: 0.9em;
-  max-height: 300px; overflow-y: auto; line-height: 1.5;
+  padding: 0.5em 0.75em; font-size: 0.9em;
+  max-height: 18.75em; overflow-y: auto; line-height: 1.5;
 }
 
 /* ========== Tags ========== */
@@ -691,7 +691,7 @@ li.enable-selected.disabled a {
 }
 
 .btn-diff-clean {
-  padding: 2px 8px;
+  padding: 0.125em 0.5em;
   font-size: 0.8rem;
   cursor: pointer;
 }
