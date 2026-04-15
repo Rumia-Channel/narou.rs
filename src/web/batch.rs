@@ -29,10 +29,8 @@ pub async fn batch_tag(
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state.push_server.broadcast(
-        "batch_tag",
-        &format!("{} items tagged with {}", count, tag_body.tag),
-    );
+    state.push_server.broadcast_event("table.reload", "");
+    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
         message: format!("Tagged {} novels", count),
@@ -59,9 +57,8 @@ pub async fn batch_untag(
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state
-        .push_server
-        .broadcast("batch_untag", &count.to_string());
+    state.push_server.broadcast_event("table.reload", "");
+    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
         message: format!("Untagged {} novels", count),
@@ -79,9 +76,7 @@ pub async fn batch_freeze(
         }
     }
 
-    state
-        .push_server
-        .broadcast("batch_freeze", &count.to_string());
+    state.push_server.broadcast_event("table.reload", "");
     Ok(Json(ApiResponse {
         success: true,
         message: format!("Froze {} novels", count),
@@ -99,9 +94,7 @@ pub async fn batch_unfreeze(
         }
     }
 
-    state
-        .push_server
-        .broadcast("batch_unfreeze", &count.to_string());
+    state.push_server.broadcast_event("table.reload", "");
     Ok(Json(ApiResponse {
         success: true,
         message: format!("Unfroze {} novels", count),
@@ -129,9 +122,7 @@ pub async fn batch_remove(
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    state
-        .push_server
-        .broadcast("batch_remove", &count.to_string());
+    state.push_server.broadcast_event("table.reload", "");
     Ok(Json(ApiResponse {
         success: true,
         message: format!("Removed {} novels", count),

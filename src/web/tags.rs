@@ -29,9 +29,8 @@ pub async fn add_tag(
     })
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    state
-        .push_server
-        .broadcast("tag_add", &format!("{} {}", id, body.tag));
+    state.push_server.broadcast_event("table.reload", "");
+    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
         message: "Tag added".to_string(),
@@ -55,9 +54,8 @@ pub async fn remove_tag(
     })
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    state
-        .push_server
-        .broadcast("tag_remove", &format!("{} {}", id, body.tag));
+    state.push_server.broadcast_event("table.reload", "");
+    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
         message: "Tag removed".to_string(),
@@ -86,9 +84,8 @@ pub async fn add_tags(
     })
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    state
-        .push_server
-        .broadcast("tag_add", &format!("{} {:?}", id, body.tags));
+    state.push_server.broadcast_event("table.reload", "");
+    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
         message: "Tags added".to_string(),
@@ -113,9 +110,8 @@ pub async fn remove_tags(
     })
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    state
-        .push_server
-        .broadcast("tag_remove", &format!("{} {:?}", id, body.tags));
+    state.push_server.broadcast_event("table.reload", "");
+    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
         message: "Tags removed".to_string(),
@@ -139,7 +135,8 @@ pub async fn update_tags(
     })
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    state.push_server.broadcast("tags_update", &id.to_string());
+    state.push_server.broadcast_event("table.reload", "");
+    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
         message: "Tags updated".to_string(),

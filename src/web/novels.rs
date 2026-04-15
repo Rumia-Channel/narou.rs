@@ -217,7 +217,7 @@ pub async fn remove_novel(
     })
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    state.push_server.broadcast("remove", &result);
+    state.push_server.broadcast_event("table.reload", "");
     Ok(Json(ApiResponse {
         success: true,
         message: result,
@@ -230,7 +230,7 @@ pub async fn freeze_novel(
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     set_frozen_state(id, true).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    state.push_server.broadcast("freeze", &id.to_string());
+    state.push_server.broadcast_event("table.reload", "");
     Ok(Json(ApiResponse {
         success: true,
         message: format!("Froze {}", id),
@@ -243,7 +243,7 @@ pub async fn unfreeze_novel(
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     set_frozen_state(id, false).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    state.push_server.broadcast("unfreeze", &id.to_string());
+    state.push_server.broadcast_event("table.reload", "");
     Ok(Json(ApiResponse {
         success: true,
         message: format!("Unfroze {}", id),

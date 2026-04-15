@@ -221,6 +221,22 @@ async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>) {
 
     let client_id = push_server.register_client(push_server.channel().sender.clone());
 
+    // Send console history to new client (Ruby parity: pushserver.rb lines 76-78)
+    {
+        let history = push_server.console_history.lock().clone();
+        for entry in history {
+            let payload = serde_json::json!({
+                "type": "echo",
+                "body": entry,
+                "target_console": "stdout",
+            });
+            if sender.send(Message::Text(payload.to_string().into())).await.is_err() {
+                push_server.unregister_client(client_id);
+                return;
+            }
+        }
+    }
+
     let result = tokio::spawn(async move {
         loop {
             match rx.recv().await {

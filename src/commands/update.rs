@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
-use indicatif::MultiProgress;
 
 use narou_rs::compat::{
     convert_existing_novel, current_device, load_local_setting_bool, load_local_setting_string,
