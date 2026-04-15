@@ -70,7 +70,7 @@ const ELEMENT_IDS = [
   'novel-list-body', 'novel-list', 'novel-list-container',
   'control-panel',
   'notepad-modal', 'notepad', 'notepad-close', 'save-notepad-button',
-  'queue-modal', 'queue-modal-close', 'queue-clear-button',
+  'queue-modal', 'queue-modal-close', 'queue-clear-button', 'queue-reload-button',
   'queue-running-list', 'queue-pending-list', 'queue-pending-count',
   'tag-list-canvas',
   'tag-edit-modal', 'tag-edit-close', 'tag-edit-cancel',

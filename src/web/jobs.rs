@@ -5,8 +5,8 @@ use crate::queue::{JobType, PersistentQueue};
 
 use super::AppState;
 use super::state::{
-    ApiResponse, ConvertBody, CsvImportBody, DiffBody, DiffCleanBody, DownloadBody, TargetsBody,
-    TaskIdBody, UpdateBody,
+    ApiResponse, ConvertBody, CsvImportBody, DiffBody, DiffCleanBody, DownloadBody, ReorderBody,
+    TargetsBody, TaskIdBody, UpdateBody,
 };
 
 pub async fn api_download(
@@ -860,6 +860,54 @@ pub async fn remove_pending_task(
             message: e.to_string(),
         }),
     }
+}
+
+// POST /api/reorder_pending_tasks
+pub async fn reorder_pending_tasks(
+    State(_state): State<AppState>,
+    Json(body): Json<ReorderBody>,
+) -> Json<ApiResponse> {
+    let queue = match open_queue() {
+        Ok(q) => q,
+        Err(e) => {
+            return Json(ApiResponse {
+                success: false,
+                message: e,
+            });
+        }
+    };
+
+    match queue.reorder_pending(&body.task_ids) {
+        Ok(_) => Json(ApiResponse {
+            success: true,
+            message: "タスクの並び替えが完了しました".to_string(),
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            message: e.to_string(),
+        }),
+    }
+}
+
+// GET /api/get_queue_size
+pub async fn get_queue_size(
+    State(_state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let (default_count, convert_count) = match open_queue() {
+        Ok(q) => {
+            let tasks = q.get_pending_tasks();
+            let convert = tasks.iter().filter(|t| matches!(t.job_type, JobType::Convert)).count();
+            let default = tasks.len() - convert;
+            (default, convert)
+        }
+        Err(_) => (0, 0),
+    };
+
+    Json(serde_json::json!({
+        "default": default_count,
+        "convert": convert_count,
+        "total": default_count + convert_count,
+    }))
 }
 
 // POST /api/shutdown

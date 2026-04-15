@@ -125,7 +125,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 |------|--------|--------|------|
 | コンテナ | `#console-container` | `#console-container` | ✅ |
 | 表示エリア | `#console.console` (dark bg) | `#console.console` | ✅ |
-| キュー中断ボタン | `.queue-cancel` | `#console-cancel` (❌) | ✅ |
+| キュー中断ボタン | `.queue-cancel` | `#console-cancel` | ✅ |
 | 全履歴取得ボタン | `.console-history` | `#console-history` (☁) | ✅ |
 | ゴミ箱ボタン | `.console-trash` | `#console-trash` (🗑) | ✅ |
 | 拡大/縮小ボタン | `.console-expand` (full/small切替) | `#console-expand` (⤢/⤣) | ✅ |

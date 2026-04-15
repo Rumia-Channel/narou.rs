@@ -415,19 +415,28 @@ function formatTaskTime(epoch) {
   return `${hh}:${mm}:${ss}`;
 }
 
-function renderTaskItem(task, isRunning) {
+function renderTaskItem(task, isRunning, idx, total) {
   const label = JOB_TYPE_LABELS[task.type] || task.type;
   const time = formatTaskTime(task.created_at);
   const icon = isRunning ? '&#x25B6;' : '&#x23F3;';
-  const deleteBtn = isRunning
-    ? ''
-    : `<button class="queue-task-delete" data-task-id="${esc(task.id)}" title="削除">&#x1F5D1;</button>`;
-  return `<div class="queue-task-item${isRunning ? ' queue-running' : ''}">
+  let actionBtns = '';
+  if (isRunning) {
+    actionBtns = `<button class="queue-task-cancel" data-task-id="${esc(task.id)}" title="中止">&#x23F9;</button>`;
+  } else {
+    const upBtn = idx > 0
+      ? `<button class="queue-task-up" data-task-idx="${idx}" title="上へ">&#x25B2;</button>`
+      : `<button class="queue-task-up" disabled title="上へ">&#x25B2;</button>`;
+    const downBtn = idx < total - 1
+      ? `<button class="queue-task-down" data-task-idx="${idx}" title="下へ">&#x25BC;</button>`
+      : `<button class="queue-task-down" disabled title="下へ">&#x25BC;</button>`;
+    actionBtns = `${upBtn}${downBtn}<button class="queue-task-delete" data-task-id="${esc(task.id)}" title="削除">&#x1F5D1;</button>`;
+  }
+  return `<div class="queue-task-item${isRunning ? ' queue-running' : ''}" data-task-id="${esc(task.id)}">
     <span class="queue-task-icon">${icon}</span>
     <span class="queue-task-label">${esc(label)}</span>
     <span class="queue-task-target">${esc(task.target)}</span>
     <span class="queue-task-time">${time}</span>
-    ${deleteBtn}
+    <span class="queue-task-actions">${actionBtns}</span>
   </div>`;
 }
 
@@ -435,14 +444,21 @@ export function renderQueueDetailed() {
   const qd = State.queueDetailed;
   if (El.queueRunningList) {
     if (qd.running && qd.running.length > 0) {
-      El.queueRunningList.innerHTML = qd.running.map(t => renderTaskItem(t, true)).join('');
+      El.queueRunningList.innerHTML = qd.running.map((t, i) => renderTaskItem(t, true, i, qd.running.length)).join('');
+      El.queueRunningList.querySelectorAll('.queue-task-cancel').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          await postJson('/api/cancel_running_task', { task_id: btn.dataset.taskId });
+          const { refreshQueueDetailed } = await import('./actions.js');
+          await refreshQueueDetailed();
+        });
+      });
     } else {
       El.queueRunningList.textContent = 'なし';
     }
   }
   if (El.queuePendingList) {
     if (qd.pending && qd.pending.length > 0) {
-      El.queuePendingList.innerHTML = qd.pending.map(t => renderTaskItem(t, false)).join('');
+      El.queuePendingList.innerHTML = qd.pending.map((t, i) => renderTaskItem(t, false, i, qd.pending.length)).join('');
       El.queuePendingList.querySelectorAll('.queue-task-delete').forEach(btn => {
         btn.addEventListener('click', async () => {
           const taskId = btn.dataset.taskId;
@@ -451,6 +467,24 @@ export function renderQueueDetailed() {
           await refreshQueueDetailed();
         });
       });
+      // Up/down reorder buttons
+      const wireReorder = (selector, direction) => {
+        El.queuePendingList.querySelectorAll(selector).forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const idx = parseInt(btn.dataset.taskIdx, 10);
+            const ids = qd.pending.map(t => t.id);
+            const swapIdx = idx + direction;
+            if (swapIdx >= 0 && swapIdx < ids.length) {
+              [ids[idx], ids[swapIdx]] = [ids[swapIdx], ids[idx]];
+              await postJson('/api/reorder_pending_tasks', { task_ids: ids });
+              const { refreshQueueDetailed } = await import('./actions.js');
+              await refreshQueueDetailed();
+            }
+          });
+        });
+      };
+      wireReorder('.queue-task-up', -1);
+      wireReorder('.queue-task-down', 1);
     } else {
       El.queuePendingList.textContent = 'なし';
     }

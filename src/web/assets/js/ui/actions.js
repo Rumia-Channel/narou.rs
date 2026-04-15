@@ -222,6 +222,9 @@ export function bindActions() {
     await postJson('/api/queue/clear', {});
     await refreshQueueDetailed();
   });
+  on('queue-reload-button', async () => {
+    await refreshQueueDetailed();
+  });
 
   // --- Notepad modal ---
   on('notepad-close', () => El.notepadModal?.classList.add('hide'));

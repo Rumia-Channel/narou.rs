@@ -126,3 +126,8 @@ pub struct DiffCleanBody {
 pub struct TaskIdBody {
     pub task_id: String,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ReorderBody {
+    pub task_ids: Vec<String>,
+}

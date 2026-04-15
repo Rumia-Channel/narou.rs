@@ -213,6 +213,29 @@ impl PersistentQueue {
         Ok(removed)
     }
 
+    pub fn reorder_pending(&self, task_ids: &[String]) -> Result<bool> {
+        let reordered = {
+            let mut state = self.state.lock();
+            let mut new_jobs = VecDeque::with_capacity(state.jobs.len());
+            // First, add jobs in the specified order
+            for id in task_ids {
+                if let Some(pos) = state.jobs.iter().position(|j| &j.id == id) {
+                    new_jobs.push_back(state.jobs.remove(pos).unwrap());
+                }
+            }
+            // Then append any remaining jobs not in the list
+            for job in state.jobs.drain(..) {
+                new_jobs.push_back(job);
+            }
+            state.jobs = new_jobs;
+            true
+        };
+        if reordered {
+            self.save()?;
+        }
+        Ok(reordered)
+    }
+
     pub fn clear_pending(&self) -> Result<()> {
         {
             let mut state = self.state.lock();
