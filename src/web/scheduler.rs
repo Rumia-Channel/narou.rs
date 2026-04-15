@@ -55,9 +55,9 @@ pub fn start_auto_update_scheduler(
             };
 
             sleep_until(next_run).await;
-            push_server.broadcast(
-                "auto_update_scheduled",
-                &next_run.format("%Y/%m/%d %H:%M:%S").to_string(),
+            push_server.broadcast_echo(
+                &format!("自動アップデートが予定されています: {}", next_run.format("%Y/%m/%d %H:%M:%S")),
+                "stdout",
             );
 
             let root_dir = root_dir.clone();
@@ -139,11 +139,11 @@ fn execute_auto_update(root_dir: &Path, push_server: &PushServer) {
         "自動アップデートを実行中... ({})",
         Local::now().format("%Y/%m/%d %H:%M:%S")
     );
-    push_server.broadcast("auto_update_start", "");
+    push_server.broadcast_echo("自動アップデートを開始します", "stdout");
 
     let sort_args = build_auto_update_sort_args();
     if !run_update_phase(root_dir, &["--gl", "narou"], "なろうAPIによる更新確認") {
-        push_server.broadcast("auto_update_failed", "narou_gl");
+        push_server.broadcast_echo("自動アップデート失敗: なろうAPI更新確認", "stdout");
         return;
     }
 
@@ -159,7 +159,7 @@ fn execute_auto_update(root_dir: &Path, push_server: &PushServer) {
         let mut args = sort_args.clone();
         args.extend(modified_ids.iter().map(String::as_str));
         if !run_update_phase(root_dir, &args, "modified タグ更新") {
-            push_server.broadcast("auto_update_failed", "modified");
+            push_server.broadcast_echo("自動アップデート失敗: modified タグ更新", "stdout");
             return;
         }
     }
@@ -174,13 +174,14 @@ fn execute_auto_update(root_dir: &Path, push_server: &PushServer) {
         let mut args = sort_args;
         args.extend(other_ids.iter().map(String::as_str));
         if !run_update_phase(root_dir, &args, "その他小説更新") {
-            push_server.broadcast("auto_update_failed", "other");
+            push_server.broadcast_echo("自動アップデート失敗: その他小説更新", "stdout");
             return;
         }
     }
 
     println!("自動アップデートが正常に完了しました");
-    push_server.broadcast("auto_update_complete", "");
+    push_server.broadcast_echo("自動アップデートが正常に完了しました", "stdout");
+    push_server.broadcast_event("table.reload", "");
 }
 
 fn build_auto_update_sort_args() -> Vec<&'static str> {

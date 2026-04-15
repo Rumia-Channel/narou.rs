@@ -58,11 +58,11 @@ pub async fn api_download(
         .iter()
         .zip(ids.iter())
         .map(|(target, job_id)| {
-            state.push_server.broadcast("download_queued", target);
             serde_json::json!({ "target": target, "job_id": job_id, "status": "queued" })
         })
         .collect();
 
+    state.push_server.broadcast_event("notification.queue", "");
     serde_json::json!({ "success": true, "results": results }).into()
 }
 
@@ -133,7 +133,7 @@ pub async fn api_update(
 
     state
         .push_server
-        .broadcast("update_queued", &format!("{} novels", count));
+        .broadcast_event("notification.queue", "");
     serde_json::json!({
         "success": true,
         "status": "queued",
@@ -181,7 +181,6 @@ pub async fn api_convert(
         .iter()
         .zip(ids.iter())
         .map(|(target, job_id)| {
-            state.push_server.broadcast("convert_queued", target);
             serde_json::json!({
                 "target": target,
                 "device": device,
@@ -191,6 +190,7 @@ pub async fn api_convert(
         })
         .collect();
 
+    state.push_server.broadcast_event("notification.queue", "");
     serde_json::json!({ "success": true, "results": results }).into()
 }
 
@@ -292,9 +292,7 @@ pub async fn api_send(
         }
     };
 
-    for target in &targets {
-        state.push_server.broadcast("send_queued", target);
-    }
+    state.push_server.broadcast_event("notification.queue", "");
     serde_json::json!({
         "success": true,
         "count": ids.len(),
@@ -313,15 +311,11 @@ pub async fn api_inspect(
     let target_refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
     args.extend(&target_refs);
 
-    state
-        .push_server
-        .broadcast("inspect_start", &targets.join(", "));
-
     match run_immediate(&args) {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if !stdout.is_empty() {
-                state.push_server.broadcast("inspect", &stdout);
+                state.push_server.broadcast_echo(&stdout, "stdout");
             }
             Json(ApiResponse {
                 success: output.status.success(),
@@ -392,9 +386,7 @@ pub async fn api_backup(
         }
     };
 
-    for target in &targets {
-        state.push_server.broadcast("backup_queued", target);
-    }
+    state.push_server.broadcast_event("notification.queue", "");
     serde_json::json!({
         "success": true,
         "count": ids.len(),
@@ -434,9 +426,7 @@ pub async fn api_mail(
         }
     };
 
-    for target in &targets {
-        state.push_server.broadcast("mail_queued", target);
-    }
+    state.push_server.broadcast_event("notification.queue", "");
     serde_json::json!({
         "success": true,
         "count": ids.len(),
@@ -455,15 +445,11 @@ pub async fn api_setting_burn(
     let target_refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
     args.extend(&target_refs);
 
-    state
-        .push_server
-        .broadcast("setting_burn_start", &targets.join(", "));
-
     match run_immediate(&args) {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if !stdout.is_empty() {
-                state.push_server.broadcast("setting_burn", &stdout);
+                state.push_server.broadcast_echo(&stdout, "stdout");
             }
             Json(ApiResponse {
                 success: output.status.success(),
@@ -554,17 +540,17 @@ pub async fn api_diff(
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if !stdout.is_empty() {
-                    state.push_server.broadcast("console", &stdout);
+                    state.push_server.broadcast_echo(&stdout, "stdout");
                 }
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stderr.is_empty() {
-                    state.push_server.broadcast("console", &stderr);
+                    state.push_server.broadcast_echo(&stderr, "stdout");
                 }
             }
             Err(e) => {
                 state
                     .push_server
-                    .broadcast("console", &format!("diff error: {}", e));
+                    .broadcast_echo(&format!("diff error: {}", e), "stdout");
             }
         }
     }
@@ -591,7 +577,7 @@ pub async fn api_diff_clean(
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if !stdout.is_empty() {
-                state.push_server.broadcast("console", &stdout);
+                state.push_server.broadcast_echo(&stdout, "stdout");
             }
             Json(ApiResponse {
                 success: output.status.success(),
@@ -643,8 +629,9 @@ pub async fn api_csv_import(
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if !stdout.is_empty() {
-                state.push_server.broadcast("csv_import", &stdout);
+                state.push_server.broadcast_echo(&stdout, "stdout");
             }
+            state.push_server.broadcast_event("table.reload", "");
             Json(ApiResponse {
                 success: output.status.success(),
                 message: if output.status.success() {
@@ -1164,7 +1151,7 @@ pub async fn api_shutdown(
     State(state): State<AppState>,
     Json(_body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
-    state.push_server.broadcast("shutdown", "Server shutting down");
+    state.push_server.broadcast_event("shutdown", "");
     // Schedule exit after brief delay to allow response
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1181,7 +1168,7 @@ pub async fn api_reboot(
     State(state): State<AppState>,
     Json(_body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
-    state.push_server.broadcast("reboot", "Server rebooting");
+    state.push_server.broadcast_event("reboot", "");
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
