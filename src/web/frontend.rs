@@ -20,6 +20,18 @@ pub async fn novel_setting_page(Path(_id): Path<i64>) -> Html<&'static str> {
     Html(include_str!("assets/novel_setting.html"))
 }
 
+pub async fn rebooting_page() -> Html<&'static str> {
+    Html(include_str!("assets/rebooting.html"))
+}
+
+pub async fn notepad_page() -> Html<&'static str> {
+    Html(include_str!("assets/notepad.html"))
+}
+
+pub async fn author_comments_page(Path(_id): Path<i64>) -> Html<&'static str> {
+    Html(include_str!("assets/author_comments.html"))
+}
+
 pub async fn asset(Path(path): Path<String>) -> Response {
     let (content_type, body) = match path.as_str() {
         "css/theme.css" => ("text/css; charset=utf-8", include_str!("assets/css/theme.css")),

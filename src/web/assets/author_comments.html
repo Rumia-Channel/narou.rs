@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>まえがき・あとがき - Narou.rb WEB UI</title>
+  <link rel="stylesheet" href="/assets/css/theme.css">
+  <link rel="stylesheet" href="/assets/css/base.css">
+  <link rel="stylesheet" href="/assets/css/layout.css">
+  <style>
+    .ac-container {
+      max-width: 56em;
+      margin: 1.5em auto;
+      padding: 0 var(--container-padding);
+    }
+    .ac-container h1 {
+      font-size: 1.6em;
+      margin-bottom: 0.5em;
+    }
+    .ac-container ul {
+      margin-bottom: 1em;
+      padding-left: 1.5em;
+    }
+    .ac-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .ac-table tr {
+      border-bottom: 0.07em solid var(--table-border);
+    }
+    .ac-table tr:nth-child(even) {
+      background-color: var(--table-stripe-bg);
+    }
+    .ac-table td {
+      padding: 0.6em;
+    }
+    .ac-table dl {
+      margin: 0;
+    }
+    .ac-table dt {
+      font-weight: bold;
+      margin-top: 0.4em;
+    }
+    .ac-table dd {
+      margin-left: 0;
+    }
+    .ac-table dd.indent {
+      margin-left: 2em;
+      margin-right: 2em;
+    }
+    .ac-table dd.subtitle {
+      font-size: 1.1em;
+    }
+    .ac-loading {
+      color: var(--text-muted);
+      padding: 2em 0;
+    }
+  </style>
+</head>
+<body>
+  <nav class="navbar">
+    <div class="navbar-inner">
+      <a class="navbar-brand" href="/">Narou.rb</a>
+    </div>
+  </nav>
+  <div class="ac-container">
+    <h1 id="ac-title">まえがき・あとがき</h1>
+    <ul id="ac-stats">
+      <li>読み込み中...</li>
+    </ul>
+    <div id="ac-loading" class="ac-loading">読み込み中...</div>
+    <table class="ac-table" id="ac-table" style="display:none;">
+      <tbody id="ac-body"></tbody>
+    </table>
+  </div>
+  <script>
+    (function() {
+      var pathParts = window.location.pathname.split('/');
+      var novelId = pathParts[2];
+
+      fetch('/api/novels/' + novelId + '/author_comments')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          document.getElementById('ac-title').textContent = data.title;
+          document.getElementById('ac-stats').innerHTML =
+            '<li>まえがき率 ' + data.introductions_ratio + '%</li>' +
+            '<li>あとがき率 ' + data.postscripts_ratio + '%</li>' +
+            '<li><a href="/novels/' + novelId + '/setting#enable_author_comments">まえがき・あとがき削除設定へ飛ぶ</a></li>';
+
+          var tbody = document.getElementById('ac-body');
+          data.comments.forEach(function(c) {
+            var tr = document.createElement('tr');
+            var td = document.createElement('td');
+            td.innerHTML =
+              '<dl>' +
+              '<dd class="subtitle">' + escapeHtml(c.subtitle) + '</dd>' +
+              '<dt>まえがき</dt>' +
+              '<dd class="indent">' + (c.introduction || '') + '</dd>' +
+              '<dt>あとがき</dt>' +
+              '<dd class="indent">' + (c.postscript || '') + '</dd>' +
+              '</dl>';
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+          });
+
+          document.getElementById('ac-loading').style.display = 'none';
+          document.getElementById('ac-table').style.display = '';
+        })
+        .catch(function() {
+          document.getElementById('ac-loading').textContent = 'データの読み込みに失敗しました';
+        });
+
+      function escapeHtml(s) {
+        var d = document.createElement('div');
+        d.appendChild(document.createTextNode(s));
+        return d.innerHTML;
+      }
+    })();
+  </script>
+</body>
+</html>

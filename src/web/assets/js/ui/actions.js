@@ -151,7 +151,8 @@ export function bindActions() {
   on('action-tag-edit', () => openTagEditor());
 
   // --- Tool menu ---
-  on('action-tool-notepad', openNotepad);
+  on('action-tool-notepad', () => { window.location.href = '/notepad'; });
+  on('action-tool-notepad-popup', openNotepad);
   on('action-tool-csv-download', downloadCsv);
   on('action-tool-csv-import', () => {
     // Trigger hidden file input
@@ -199,7 +200,7 @@ export function bindActions() {
   on('action-option-server-reboot', async () => {
     if (!confirm('サーバを再起動しますか？')) return;
     await postJson('/api/reboot', {});
-    showNotification('サーバを再起動中...', 'info');
+    window.location.href = '/_rebooting';
   });
 
   // Theme selection
@@ -508,6 +509,7 @@ export function bindActions() {
     backupSingle: (id) => postJson('/api/backup', { targets: [String(id)] }),
     downloadForceSingle: (id) => postJson('/api/download', { targets: [String(id)], force: true }),
     mailSingle: (id) => postJson('/api/mail', { targets: [String(id)] }),
+    authorComments: (id) => { window.location.href = '/novels/' + id + '/author_comments'; },
     refreshTags: () => refreshTags(),
     refreshList: () => refreshList(),
   };

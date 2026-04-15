@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>メモ帳 - Narou.rb WEB UI</title>
+  <link rel="stylesheet" href="/assets/css/theme.css">
+  <link rel="stylesheet" href="/assets/css/base.css">
+  <link rel="stylesheet" href="/assets/css/layout.css">
+  <style>
+    .notepad-container {
+      max-width: 56em;
+      margin: 1.5em auto;
+      padding: 0 var(--container-padding);
+    }
+    .notepad-container h1 {
+      font-size: 1.6em;
+      margin-bottom: 0.5em;
+    }
+    .notepad-container ul {
+      color: var(--text-muted);
+      margin-bottom: 1em;
+      padding-left: 1.5em;
+    }
+    #notepad {
+      width: 100%;
+      min-height: 24em;
+      padding: 0.6em;
+      font-size: var(--base-font-size);
+      color: var(--text-color);
+      background-color: var(--input-bg);
+      border: 0.07em solid var(--input-border);
+      border-radius: var(--border-radius);
+      resize: vertical;
+    }
+    #notepad:focus {
+      border-color: var(--btn-primary-bg);
+      outline: none;
+    }
+    .notepad-status {
+      margin-top: 0.4em;
+      font-size: 0.85em;
+      color: var(--text-muted);
+    }
+  </style>
+</head>
+<body>
+  <nav class="navbar">
+    <div class="navbar-inner">
+      <a class="navbar-brand" href="/">Narou.rb</a>
+    </div>
+  </nav>
+  <div class="notepad-container">
+    <h1>メモ帳</h1>
+    <ul>
+      <li>編集したら自動でサーバに保存されます</li>
+      <li>別のブラウザで開いていても内容をリアルタイムに同期します</li>
+    </ul>
+    <textarea id="notepad"></textarea>
+    <div class="notepad-status" id="notepad-status"></div>
+  </div>
+  <script>
+    (function() {
+      var textarea = document.getElementById('notepad');
+      var status = document.getElementById('notepad-status');
+      var saveTimer = null;
+
+      fetch('/api/notepad/read')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          textarea.value = data.content || '';
+        });
+
+      textarea.addEventListener('input', function() {
+        if (saveTimer) clearTimeout(saveTimer);
+        status.textContent = '';
+        saveTimer = setTimeout(function() {
+          fetch('/api/notepad/save', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: textarea.value })
+          }).then(function() {
+            status.textContent = '保存しました';
+            setTimeout(function() { status.textContent = ''; }, 2000);
+          });
+        }, 500);
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::Json,
+    response::{Json, Response},
 };
 
 use crate::compat::{load_frozen_ids_from_inventory, record_is_frozen, set_frozen_state};
@@ -242,4 +242,160 @@ pub async fn unfreeze_novel(
         success: true,
         message: format!("Unfroze {}", id),
     }))
+}
+
+pub async fn author_comments(
+    State(_state): State<AppState>,
+    Path(IdPath { id }): Path<IdPath>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let record = with_database(|db| {
+        db.get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
+    })
+    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    let novel_dir = with_database(|db| {
+        Ok(crate::db::existing_novel_dir_for_record(
+            db.archive_root(),
+            &record,
+        ))
+    })
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let toc = crate::downloader::persistence::load_toc_file(&novel_dir)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "TOC not found".to_string()))?;
+
+    let section_dir = novel_dir.join(crate::downloader::SECTION_SAVE_DIR);
+    let mut comments = Vec::new();
+    let mut introductions_count: usize = 0;
+    let mut postscripts_count: usize = 0;
+
+    for sub in &toc.subtitles {
+        let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
+        let path = section_dir.join(&filename);
+        let sf = match crate::downloader::persistence::load_section_file(&path) {
+            Some(sf) => sf,
+            None => continue,
+        };
+
+        let data_type = if sf.element.data_type.is_empty() {
+            "text"
+        } else {
+            &sf.element.data_type
+        };
+        let (introduction, postscript) = if data_type == "html" {
+            (
+                crate::downloader::html::to_aozora_strip_decoration(&sf.element.introduction),
+                crate::downloader::html::to_aozora_strip_decoration(&sf.element.postscript),
+            )
+        } else {
+            (
+                sf.element.introduction.clone(),
+                sf.element.postscript.clone(),
+            )
+        };
+
+        if !introduction.is_empty() {
+            introductions_count += 1;
+        }
+        if !postscript.is_empty() {
+            postscripts_count += 1;
+        }
+
+        comments.push(serde_json::json!({
+            "subtitle": sub.subtitle,
+            "introduction": introduction.replace('\n', "<br>"),
+            "postscript": postscript.replace('\n', "<br>"),
+        }));
+    }
+
+    let total = toc.subtitles.len() as f64;
+    let introductions_ratio = if total > 0.0 {
+        (introductions_count as f64 / total * 100.0 * 100.0).round() / 100.0
+    } else {
+        0.0
+    };
+    let postscripts_ratio = if total > 0.0 {
+        (postscripts_count as f64 / total * 100.0 * 100.0).round() / 100.0
+    } else {
+        0.0
+    };
+
+    Ok(Json(serde_json::json!({
+        "title": record.title,
+        "introductions_ratio": introductions_ratio,
+        "postscripts_ratio": postscripts_ratio,
+        "comments": comments,
+    })))
+}
+
+pub async fn download_ebook(
+    Path(IdPath { id }): Path<IdPath>,
+) -> Result<Response, (StatusCode, String)> {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    let record = with_database(|db| {
+        db.get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
+    })
+    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    let novel_dir = with_database(|db| {
+        Ok(crate::db::existing_novel_dir_for_record(
+            db.archive_root(),
+            &record,
+        ))
+    })
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let device = crate::compat::current_device();
+    let ext = device
+        .as_ref()
+        .map(|d| d.ebook_file_ext())
+        .unwrap_or(".epub");
+
+    let paths = crate::mail::get_ebook_file_paths(&record, &novel_dir, ext)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let find_existing = |paths: &[std::path::PathBuf]| -> Option<std::path::PathBuf> {
+        paths.iter().find(|p| p.exists()).cloned()
+    };
+
+    let file_path = find_existing(&paths)
+        .or_else(|| {
+            if ext != ".epub" {
+                crate::mail::get_ebook_file_paths(&record, &novel_dir, ".epub")
+                    .ok()
+                    .and_then(|eps| find_existing(&eps))
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Ebook not found for ID={}", id),
+            )
+        })?;
+
+    let data = std::fs::read(&file_path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let filename = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("ebook.epub");
+    let disposition = format!("attachment; filename=\"{}\"", filename);
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_DISPOSITION, disposition),
+        ],
+        data,
+    )
+        .into_response())
 }

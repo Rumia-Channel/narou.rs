@@ -42,6 +42,7 @@ export function initContextMenu() {
   bindItem('ctx-backup', () => actionHandlers.backupSingle?.(contextTarget));
   bindItem('ctx-download-force', () => actionHandlers.downloadForceSingle?.(contextTarget));
   bindItem('ctx-mail', () => actionHandlers.mailSingle?.(contextTarget));
+  bindItem('ctx-author-comments', () => actionHandlers.authorComments?.(contextTarget));
 }
 
 function bindItem(id, handler) {

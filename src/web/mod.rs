@@ -92,6 +92,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/settings", get(frontend::settings_page))
         .route("/help", get(frontend::help_page))
         .route("/novels/{id}/setting", get(frontend::novel_setting_page))
+        .route("/_rebooting", get(frontend::rebooting_page))
+        .route("/notepad", get(frontend::notepad_page))
+        .route("/novels/{id}/author_comments", get(frontend::author_comments_page))
+        .route("/novels/{id}/download", get(novels::download_ebook))
+        .route("/api/novels/{id}/author_comments", get(novels::author_comments))
         .layer(middleware::from_fn_with_state(
             auth_state,
             basic_auth_middleware,

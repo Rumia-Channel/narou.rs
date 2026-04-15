@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Narou.rb WEB UI - 再起動中</title>
+  <link rel="stylesheet" href="/assets/css/theme.css">
+  <link rel="stylesheet" href="/assets/css/base.css">
+  <style>
+    body {
+      padding: 2.5em;
+    }
+    h2 {
+      color: var(--text-muted);
+    }
+    a {
+      color: var(--link-color);
+    }
+    a:hover {
+      color: var(--link-hover);
+    }
+  </style>
+</head>
+<body>
+  <h2>サーバを再起動しています<span id="rebooting-busy">.</span></h2>
+  <p>再起動が完了したら自動的にページがリロードされます。</p>
+  <p>しばらく待ってもリロードされない場合は<a href="/">こちら</a>をクリックするかブラウザのリロードボタンを押してみてください。</p>
+  <script>
+    var busy = document.getElementById("rebooting-busy");
+    setInterval(function() {
+      busy.textContent += ".";
+      if (busy.textContent.length >= 6) {
+        busy.textContent = ".";
+      }
+    }, 500);
+
+    setInterval(function() {
+      fetch("/api/version/current.json", { method: "GET" })
+        .then(function(res) {
+          if (res.ok) {
+            window.location.href = "/";
+          }
+        })
+        .catch(function() {});
+    }, 2000);
+  </script>
+</body>
+</html>
