@@ -387,11 +387,23 @@ export function renderQueueStatus() {
 
 const JOB_TYPE_LABELS = {
   download: 'ダウンロード',
-  update: 'アップデート',
+  download_force: '強制ダウンロード',
+  update: '更新',
+  update_by_tag: '更新',
+  update_general_lastup: '最新話掲載日更新',
+  auto_update: '自動アップデート',
   convert: '変換',
-  send: '送信',
+  mail: 'メール送信',
+  send: '端末送信',
+  freeze: '凍結',
+  remove: '削除',
   backup: 'バックアップ',
-  mail: 'メール',
+  inspect: 'inspect',
+  diff: '差分確認',
+  diff_clean: '差分確認(clean)',
+  setting_burn: '設定焼き込み',
+  backup_bookmark: 'しおりバックアップ',
+  eject: '端末の取り外し',
 };
 
 function formatTaskTime(epoch) {
