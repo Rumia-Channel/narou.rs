@@ -76,6 +76,11 @@ function connectWebSocket() {
     return;
   }
 
+  ws.onopen = () => {
+    const con = document.getElementById('console');
+    if (con) con.innerHTML = '';
+  };
+
   ws.onmessage = (event) => {
     try {
       const msg = JSON.parse(event.data);
@@ -126,6 +131,18 @@ function handleWsMessage(msg) {
     case 'queue_failed':
       refreshQueue();
       break;
+    case 'shutdown':
+      appendConsole('サーバーをシャットダウンしています...');
+      break;
+    case 'reboot':
+      appendConsole('サーバーを再起動しています...');
+      setTimeout(() => { location.href = '/_rebooting'; }, 500);
+      break;
+    case 'console.clear': {
+      const con = document.getElementById('console');
+      if (con) con.innerHTML = '';
+      break;
+    }
     case 'error':
       appendConsole('[エラー] ' + (msg.data || msg.message || ''));
       break;
