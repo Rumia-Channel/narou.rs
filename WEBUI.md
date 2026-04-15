@@ -18,7 +18,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | 7 | `/novels/:id/author_comments` | 前書き/後書き | `author_comments.html` + API | ✅ |
 | 8 | `/novels/:id/download` | ebook ダウンロード | `novels.rs` download_ebook | ✅ |
 | 9 | `/_rebooting` | 再起動中表示 | `rebooting.html` | ✅ |
-| 10 | `/edit_menu` | 編集メニュー | なし | ❌ |
+| 10 | `/edit_menu` | 編集メニュー | `edit_menu.html` | ✅ |
 
 ---
 
@@ -73,7 +73,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 
 | # | ID | ラベル | Rust |
 |---|-----|--------|------|
-| 1 | `#action-tool-dnd-window` | D&Dウィンドウを開く | 🟡 (HTML要素あり、別ウィンドウ未実装) |
+| 1 | `#action-tool-dnd-window` | D&Dウィンドウを開く | ✅ (`/widget/drag_and_drop` 別ウィンドウ) |
 | — | divider | — | ✅ |
 | 2 | `#action-tool-csv-download` | CSV形式でリストをダウンロード | ✅ |
 | 3 | `#action-tool-csv-import` | CSVファイルからインポート | ✅ (ファイルピッカー+API呼出) |
@@ -358,6 +358,19 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | 全て表示/全て隠す/リセット | — | ✅ (3ボタン) | ✅ |
 | localStorage永続化 | — | `narou-rs-webui-hidden-cols` | ✅ |
 
+### 3.9 タグ指定アップデートモーダル
+
+**Rust版: ✅ 実装済み (`#update-by-tag-modal`)**
+
+| 機能 | Ruby版 | Rust版 | 状態 |
+|------|--------|--------|------|
+| タグ一覧取得 | `/api/taginfo.json` | POST `/api/taginfo.json` | ✅ |
+| 包含タグチェックボックス | `data-tagname` | `data-tagname` | ✅ |
+| 除外タグチェックボックス | `data-exclusion-tagname` | `data-exclusion-tagname` | ✅ |
+| タグ色表示 | `tag-label` with background-color | `tag-label` with style | ✅ |
+| タグ件数表示 | `TAG(COUNT)` 形式 | `TAG(COUNT)` 形式 | ✅ |
+| 更新実行 | POST `/api/update_by_tag` | POST `/api/update_by_tag` | ✅ |
+
 ---
 
 ## 4. キーボードショートカット
@@ -435,6 +448,8 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/diff_list` | POST | ✅ |
 | `/api/diff` | POST | ✅ (差分コマンド実行) |
 | `/api/diff_clean` | POST | ✅ (差分キャッシュ削除) |
+| `/api/update_by_tag` | POST | ✅ (タグ指定更新) |
+| `/api/update_general_lastup` | POST | ✅ (GL確認更新) |
 
 ### 6.3 凍結・削除 (バッチ)
 
@@ -442,6 +457,9 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 |-------------|--------|------|
 | `/api/novels/freeze` | POST | ✅ (BatchIdsBody) |
 | `/api/novels/unfreeze` | POST | ✅ |
+| `/api/freeze` | POST | ✅ (トグル) |
+| `/api/freeze_on` | POST | ✅ |
+| `/api/freeze_off` | POST | ✅ |
 | `/api/novels/remove` | POST | ✅ (with_file: falseがデフォルト) |
 | `/api/remove` | POST | ✅ (with_file パラメータ対応) |
 | `/api/remove_with_file` | POST | ✅ (常にファイル削除) |
@@ -500,22 +518,34 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/sort_state` | GET | ✅ (ソート状態取得) |
 | `/api/sort_state` | POST | ✅ (ソート状態保存) |
 | `/api/story` | GET | ✅ (あらすじ取得) |
+| `/api/taginfo.json` | POST | ✅ (タグ情報+HTML) |
+| `/api/validate_url_regexp_list` | GET | ✅ (URL正規表現一覧) |
 
-### 6.8 システム
+### 6.8 タスク復元
+
+| エンドポイント | メソッド | Rust |
+|-------------|--------|------|
+| `/api/restore_pending_tasks` | POST | ✅ (保留タスク数報告) |
+| `/api/defer_restore_pending_tasks` | POST | ✅ (保留タスク消去) |
+| `/api/confirm_running_tasks` | POST | ✅ (再実行/延期判定) |
+
+### 6.9 システム
 
 | エンドポイント | メソッド | Rust |
 |-------------|--------|------|
 | `/api/shutdown` | POST | ✅ |
 | `/api/reboot` | POST | ✅ |
 
-### 6.9 未実装 API (Ruby版にあるが Rust版未実装)
+### 6.10 未実装 API (Ruby版にあるが Rust版未実装)
 
 | エンドポイント | 説明 |
 |-------------|------|
-| `/api/version/latest.json` | 最新バージョンチェック |
-| `/api/backup_bookmark` | 栞バックアップ |
-| `/api/eject` | 端末取出し |
-| `/api/validate_url_regexp_list` | URL正規表現一覧 |
+| `/api/version/latest.json` | 最新バージョンチェック (外部API依存) |
+| `/api/backup_bookmark` | 栞バックアップ (実機検証必要) |
+| `/api/eject` | 端末取出し (実機検証必要) |
+| `/api/download4ssl` | SSL互換DL (レガシー) |
+| `/api/download_request` | DL済みチェック (D&Dウィジェット向け) |
+| `/api/downloadable.gif` | DL状態GIF画像 (レガシー) |
 
 ---
 
@@ -595,14 +625,14 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 
 ## 12. 実装サマリ
 
-**ページ**: 9/10 ✅ (メイン, 設定, ヘルプ, About, 個別設定, メモ帳, 作者コメント, ebook DL, 再起動)
+**ページ**: 10/10 ✅ (メイン, 設定, ヘルプ, About, 個別設定, メモ帳, 作者コメント, ebook DL, 再起動, 編集メニュー)
 **ナビバー要素**: 全メニュー ✅ (表示/選択/タグ/ツール/オプション)
 **コントロールパネル**: 10/11 ボタン ✅ (Eject以外)
 **コンテキストメニュー**: 15/15 項目 ✅ (作者コメント表示含む)
-**モーダル**: 8/8 ✅ (タグ編集, About, 差分, 確認, メモ帳, ダウンロード, キュー, 列可視性)
+**モーダル**: 9/9 ✅ (タグ編集, About, 差分, 確認, メモ帳, ダウンロード, キュー, 列可視性, タグ指定アップデート)
 **キーボードショートカット**: 12/12 ✅
 **テーマ**: 6/6 ✅ (全ページCSS変数化、hardcoded色・px値なし)
-**API**: 57 実装済み / 4 未実装 (eject, version/latest, backup_bookmark, validate_url)
+**API**: 66 実装済み / 6 未実装 (eject, version/latest, backup_bookmark, download4ssl, download_request, downloadable.gif)
 **WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, 進捗バー ✅, DB自動更新+table.reload ✅, モーダル/メモ帳同期 ❌
 **設定ページ**: ✅
 **言語切替**: ✅ (Rust独自)
