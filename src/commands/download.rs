@@ -61,7 +61,7 @@ fn cmd_download_inner(opts: DownloadOptions) -> i32 {
 
     for (i, target) in targets.iter().enumerate() {
         if i > 0 {
-            println!("{}", "\u{2500}".repeat(35));
+            println!("{}", "\u{2015}".repeat(35));
         }
 
         let mut download_target = target.clone();

@@ -9,7 +9,7 @@ use narou_rs::db::inventory::InventoryScope;
 use super::download;
 use super::log;
 
-const HR_TEXT: &str = "―――――――――――――――――――――――――――――――";
+const HR_TEXT: &str = "―――――――――――――――――――――――――――――――――――";
 
 pub fn cmd_csv(output: Option<&str>, import: Option<&str>) -> i32 {
     match cmd_csv_inner(output, import) {

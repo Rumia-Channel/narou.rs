@@ -7,7 +7,7 @@ use narou_rs::db;
 use super::download;
 use super::log;
 
-const HR_TEXT: &str = "―――――――――――――――――――――――――――――――";
+const HR_TEXT: &str = "―――――――――――――――――――――――――――――――――――";
 
 pub fn cmd_inspect(targets: &[String]) -> i32 {
     match cmd_inspect_inner(targets) {

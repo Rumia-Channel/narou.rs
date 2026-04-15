@@ -119,7 +119,7 @@ pub fn cmd_update(opts: UpdateOptions) {
             abort_if_interrupted(interrupted.as_ref())?;
 
             if i > 0 {
-                println!("{}", "\u{2500}".repeat(35));
+                println!("{}", "\u{2015}".repeat(35));
             }
 
             let frozen = !opts.force && is_novel_frozen(id);
@@ -197,7 +197,7 @@ pub fn cmd_update(opts: UpdateOptions) {
                                 dl.title.clone()
                             };
                             println!(
-                                "ID:{} {} の更新はキャンセルされました",
+                                "ID:{}　{} の更新はキャンセルされました",
                                 id, title
                             );
                             mistook += 1;
@@ -225,7 +225,7 @@ pub fn cmd_update(opts: UpdateOptions) {
                         return Err(UpdateInterrupted);
                     }
                     let title = get_novel_title(id);
-                    println!("ID:{} {} の更新は失敗しました\n  {}", id, title, e);
+                    println!("ID:{}　{} の更新は失敗しました", id, title);
                     mistook += 1;
                 }
             }
@@ -712,24 +712,24 @@ fn print_status_messages(dl: &DownloadResult) {
                 );
             } else if dl.sections_deleted {
                 println!(
-                    "ID:{} {} は一部の話が削除されています",
+                    "ID:{}　{} は一部の話が削除されています",
                     dl.id, dl.title
                 );
             } else if dl.updated_count > 0 {
                 println!("{} の更新が完了しました", dl.title);
             } else if dl.title_changed {
                 println!(
-                    "ID:{} {} のタイトルが更新されています",
+                    "ID:{}　{} のタイトルが更新されています",
                     dl.id, dl.title
                 );
             } else if dl.story_changed {
                 println!(
-                    "ID:{} {} のあらすじが更新されています",
+                    "ID:{}　{} のあらすじが更新されています",
                     dl.id, dl.title
                 );
             } else if dl.author_changed {
                 println!(
-                    "ID:{} {} の作者名が更新されています",
+                    "ID:{}　{} の作者名が更新されています",
                     dl.id, dl.title
                 );
             }
@@ -781,7 +781,7 @@ fn process_hotentry(
         return Ok(());
     }
 
-    println!("───────────────────────────────────");
+    println!("{}", "\u{2015}".repeat(35));
     println!("hotentry の変換を開始");
 
     let mut converted_entries = Vec::new();
