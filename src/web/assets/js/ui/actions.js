@@ -40,7 +40,7 @@ export function bindActions() {
   });
 
   El.consoleCancel?.addEventListener('click', async () => {
-    await postJson('/api/queue/cancel', {});
+    await postJson('/api/cancel', {});
   });
 
   El.consoleHistory?.addEventListener('click', async () => {

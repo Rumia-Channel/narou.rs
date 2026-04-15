@@ -737,6 +737,41 @@ pub async fn queue_cancel(
     })
 }
 
+// POST /api/cancel — cancel running task (Ruby parity: does NOT clear queue)
+pub async fn api_cancel(
+    State(state): State<AppState>,
+) -> Json<ApiResponse> {
+    kill_running_child(&state);
+    state.push_server.broadcast_event("notification.queue", "");
+    Json(ApiResponse {
+        success: true,
+        message: "キャンセルしました".to_string(),
+    })
+}
+
+// POST /api/download_force — force re-download (Ruby parity: accepts "ids" param)
+pub async fn api_download_force(
+    State(state): State<AppState>,
+    Json(body): Json<super::state::IdsBody>,
+) -> Json<serde_json::Value> {
+    let targets: Vec<String> = body
+        .ids
+        .iter()
+        .map(|v| match v {
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            _ => v.to_string(),
+        })
+        .collect();
+
+    let download_body = super::state::DownloadBody {
+        targets,
+        force: true,
+        mail: false,
+    };
+    api_download(State(state), Json(download_body)).await
+}
+
 // POST /api/cancel_running_task — cancel specific running task
 pub async fn cancel_running_task(
     State(state): State<AppState>,

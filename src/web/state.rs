@@ -102,6 +102,11 @@ pub struct TargetsBody {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct IdsBody {
+    pub ids: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CsvImportBody {
     pub csv: String,
 }

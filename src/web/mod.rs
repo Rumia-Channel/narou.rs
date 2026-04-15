@@ -65,6 +65,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/remove", post(batch::batch_remove))
         .route("/api/remove_with_file", post(batch::batch_remove_with_file))
         .route("/api/download", post(jobs::api_download))
+        .route("/api/download_force", post(jobs::api_download_force))
+        .route("/api/cancel", post(jobs::api_cancel))
         .route("/api/update", post(jobs::api_update))
         .route("/api/convert", post(jobs::api_convert))
         .route("/api/settings/{id}", get(novel_settings::get_settings))
