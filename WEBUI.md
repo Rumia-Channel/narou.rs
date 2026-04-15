@@ -450,6 +450,8 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/diff_clean` | POST | ✅ (差分キャッシュ削除) |
 | `/api/update_by_tag` | POST | ✅ (タグ指定更新) |
 | `/api/update_general_lastup` | POST | ✅ (GL確認更新) |
+| `/api/cancel` | POST | ✅ (実行中タスクkillのみ、キュー消去なし) |
+| `/api/download_force` | POST | ✅ (強制再DL) |
 
 ### 6.3 凍結・削除 (バッチ)
 
@@ -479,6 +481,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/novels/{id}/tags/remove` | POST | ✅ (複数タグ削除) |
 | `/api/novels/tag` | POST | ✅ (バッチタグ追加) |
 | `/api/novels/tag` | DELETE | ✅ (バッチタグ削除) |
+| `/api/edit_tag` | POST | ✅ (三状態バルク編集: 0=削除, 1=維持, 2=追加) |
 
 ### 6.5 キュー
 
@@ -554,7 +557,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | 機能 | Ruby版 | Rust版 | 状態 |
 |------|--------|--------|------|
 | WebSocket接続 | port + 1 | port + 1 (config.ws_port) | ✅ |
-| `echo` (コンソール出力) | S→C | ✅ (appendConsole) | ✅ |
+| `echo` (コンソール出力) | S→C | ✅ (appendConsole, HTML span色付き対応) | ✅ |
 | `log` / `console` | S→C | ✅ (appendConsole) | ✅ |
 | `table.reload` / `refresh` / `list_updated` | S→C | ✅ (refreshList+refreshTags) | ✅ |
 | `tag.updateCanvas` | S→C | ✅ (refreshTags) | ✅ |
@@ -562,7 +565,13 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `queue_start` / `queue_complete` / `queue_failed` | S→C | ✅ (refreshQueue) | ✅ |
 | `error` | S→C | ✅ (appendConsole) | ✅ |
 | 再接続 | 5秒リトライ | ✅ (5s setTimeout) | ✅ |
-| `progressbar.init/step/clear` | S→C | ✅ (PushServer + main.js) | ✅ |
+| 接続時履歴送信 | 直近60件を接続時にプッシュ | ✅ (history_on_connect) | ✅ |
+| 接続時コンソールクリア | 接続時にconsole.clear | ✅ (ws.onopen → console.clear) | ✅ |
+| `shutdown` | S→C | ✅ (メッセージ表示) | ✅ |
+| `reboot` | S→C | ✅ (/_rebooting へリダイレクト) | ✅ |
+| `console.clear` | S→C | ✅ (コンソール内容クリア) | ✅ |
+| TermColorLight色付き出力 | `<span>` HTML色付き | ✅ (termcolor.rs + innerHTML) | ✅ |
+| `progressbar.init/step/clear` | S→C | ✅ (WebProgress + main.js) | ✅ |
 | `ping.modal` (サーバー主導モーダル) | S→C | なし | ❌ |
 | `notepad.change` (メモ帳同期) | S→C | なし | ❌ |
 | `device.ejectable` | S→C | なし | ❌ |
@@ -632,8 +641,8 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 **モーダル**: 9/9 ✅ (タグ編集, About, 差分, 確認, メモ帳, ダウンロード, キュー, 列可視性, タグ指定アップデート)
 **キーボードショートカット**: 12/12 ✅
 **テーマ**: 6/6 ✅ (全ページCSS変数化、hardcoded色・px値なし)
-**API**: 66 実装済み / 6 未実装 (eject, version/latest, backup_bookmark, download4ssl, download_request, downloadable.gif)
-**WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, 進捗バー ✅, DB自動更新+table.reload ✅, モーダル/メモ帳同期 ❌
+**API**: 69 実装済み / 6 未実装 (eject, version/latest, backup_bookmark, download4ssl, download_request, downloadable.gif)
+**WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, TermColorLight色付き出力 ✅, 進捗バー ✅, DB自動更新+table.reload ✅, 履歴on-connect ✅, console.clear ✅, shutdown/reboot ✅, モーダル/メモ帳同期 ❌
 **設定ページ**: ✅
 **言語切替**: ✅ (Rust独自)
 **レスポンシブ**: ✅
