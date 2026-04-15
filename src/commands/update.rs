@@ -23,7 +23,7 @@ use narou_rs::downloader::{
 use narou_rs::mail::{
     MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
 };
-use narou_rs::progress::CliProgress;
+use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
 
 const MODIFIED_TAG: &str = "modified";
 const INTERVAL_MIN_SECS: f64 = 2.5;
@@ -139,8 +139,12 @@ pub fn cmd_update(opts: UpdateOptions) {
             }
             last_time = std::time::Instant::now();
 
-            let progress = CliProgress::with_multi(&format!("DL {}", id), multi_clone.clone());
-            downloader.set_progress(Box::new(progress));
+            let progress: Box<dyn narou_rs::progress::ProgressReporter> = if is_web_mode() {
+                Box::new(WebProgress::new("update"))
+            } else {
+                Box::new(CliProgress::with_multi(&format!("DL {}", id), multi_clone.clone()))
+            };
+            downloader.set_progress(progress);
 
             match downloader.download_novel(&id.to_string()) {
                 Ok(dl) => {

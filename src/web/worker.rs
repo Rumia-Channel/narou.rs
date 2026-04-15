@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 use crate::db::with_database_mut;
+use crate::progress::WS_LINE_PREFIX;
 use crate::queue::{JobType, QueueJob};
 
 use super::jobs::open_queue;
@@ -76,7 +77,8 @@ fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, r
         .current_dir(root_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .env("NAROU_RS_WEB_MODE", "1");
 
     match job.job_type {
         JobType::Download => {
@@ -139,7 +141,16 @@ fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, r
             let reader = std::io::BufReader::new(out);
             for line in reader.lines() {
                 match line {
-                    Ok(text) => ps_out.broadcast_echo(&text, "stdout"),
+                    Ok(text) => {
+                        if let Some(json_str) = text.strip_prefix(WS_LINE_PREFIX) {
+                            // Structured WS event from child process — send directly
+                            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                ps_out.broadcast_raw(&msg);
+                            }
+                        } else {
+                            ps_out.broadcast_echo(&text, "stdout");
+                        }
+                    }
                     Err(_) => break,
                 }
             }

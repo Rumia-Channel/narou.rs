@@ -93,6 +93,11 @@ impl PushServer {
         self.channel.send(&payload.to_string());
     }
 
+    /// Send a pre-built JSON message directly (used by WebProgress interception in worker).
+    pub fn broadcast_raw(&self, value: &serde_json::Value) {
+        self.channel.send(&value.to_string());
+    }
+
     pub fn broadcast_progress(&self, current: usize, total: usize, message: &str) {
         let payload = serde_json::json!({
             "type": "progress",

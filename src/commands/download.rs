@@ -10,7 +10,7 @@ use narou_rs::downloader::{Downloader, TargetType, UpdateStatus};
 use narou_rs::mail::{
     MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
 };
-use narou_rs::progress::CliProgress;
+use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
 
 pub struct DownloadOptions {
     pub targets: Vec<String>,
@@ -106,9 +106,12 @@ fn cmd_download_inner(opts: DownloadOptions) -> i32 {
                 }
             }
 
-            let progress =
-                CliProgress::with_multi(&format!("DL {}", download_target), multi_clone.clone());
-            downloader.set_progress(Box::new(progress));
+            let progress: Box<dyn narou_rs::progress::ProgressReporter> = if is_web_mode() {
+                Box::new(WebProgress::new("download"))
+            } else {
+                Box::new(CliProgress::with_multi(&format!("DL {}", download_target), multi_clone.clone()))
+            };
+            downloader.set_progress(progress);
 
             match downloader.download_novel_with_force(&download_target, opts.force) {
                 Ok(dl) => {
@@ -555,8 +558,12 @@ fn auto_convert(
         NovelConverter::new(settings)
     };
 
-    let progress = CliProgress::with_multi(&format!("Convert {}", dl.title), multi.clone());
-    converter.set_progress(Box::new(progress));
+    let progress: Box<dyn narou_rs::progress::ProgressReporter> = if is_web_mode() {
+        Box::new(WebProgress::new("convert"))
+    } else {
+        Box::new(CliProgress::with_multi(&format!("Convert {}", dl.title), multi.clone()))
+    };
+    converter.set_progress(progress);
 
     match converter.convert_novel_by_id(dl.id, &dl.novel_dir) {
         Ok(path) => {

@@ -8,7 +8,7 @@ use narou_rs::converter::NovelConverter;
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
 use narou_rs::db::inventory::{Inventory, InventoryScope};
-use narou_rs::progress::CliProgress;
+use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
 use regex::Regex;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -137,8 +137,11 @@ pub fn cmd_convert(
                 }
             };
 
-            let progress =
-                CliProgress::with_multi(&format!("Convert {}", title), multi_clone.clone());
+            let progress: Box<dyn narou_rs::progress::ProgressReporter> = if is_web_mode() {
+                Box::new(WebProgress::new("convert"))
+            } else {
+                Box::new(CliProgress::with_multi(&format!("Convert {}", title), multi_clone.clone()))
+            };
 
             let mut settings = NovelSettings::load_for_novel_with_options(
                 id,
@@ -159,7 +162,7 @@ pub fn cmd_convert(
                 } else {
                     NovelConverter::new(settings)
                 };
-            converter.set_progress(Box::new(progress));
+            converter.set_progress(progress);
             converter.set_display_inspector(inspect);
 
             let result = match output_device {

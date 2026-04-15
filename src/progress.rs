@@ -1,6 +1,17 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
+/// Prefix for structured WebSocket messages in stdout.
+/// Lines starting with this prefix are intercepted by the web worker
+/// and sent as WebSocket events instead of being echoed to the console.
+pub const WS_LINE_PREFIX: &str = "__NAROU_WS__:";
+
+/// Check if running under the web server (subprocess mode)
+pub fn is_web_mode() -> bool {
+    std::env::var("NAROU_RS_WEB_MODE").is_ok()
+}
 
 pub trait ProgressReporter: Send + Sync {
     fn set_length(&self, len: u64);
@@ -118,5 +129,77 @@ impl ProgressReporter for CliProgress {
 impl Drop for CliProgress {
     fn drop(&mut self) {
         self.pb.finish_and_clear();
+    }
+}
+
+/// Progress reporter for web mode — outputs structured lines to stdout
+/// that the web worker intercepts and converts to WebSocket events.
+pub struct WebProgress {
+    topic: String,
+    length: AtomicU64,
+    position: AtomicU64,
+}
+
+impl WebProgress {
+    pub fn new(topic: &str) -> Self {
+        let wp = Self {
+            topic: topic.to_string(),
+            length: AtomicU64::new(0),
+            position: AtomicU64::new(0),
+        };
+        wp.send("progressbar.init", serde_json::json!({ "topic": topic }));
+        wp
+    }
+
+    fn send(&self, event_type: &str, data: serde_json::Value) {
+        let msg = serde_json::json!({ "type": event_type, "data": data });
+        println!("{}{}", WS_LINE_PREFIX, msg);
+    }
+
+    fn emit_step(&self) {
+        let len = self.length.load(Ordering::Relaxed);
+        let pos = self.position.load(Ordering::Relaxed);
+        if len > 0 {
+            let percent = (pos as f64 / len as f64) * 100.0;
+            self.send(
+                "progressbar.step",
+                serde_json::json!({ "percent": percent, "topic": self.topic }),
+            );
+        }
+    }
+}
+
+impl ProgressReporter for WebProgress {
+    fn set_length(&self, len: u64) {
+        self.length.store(len, Ordering::Relaxed);
+    }
+
+    fn inc(&self, delta: u64) {
+        self.position.fetch_add(delta, Ordering::Relaxed);
+        self.emit_step();
+    }
+
+    fn set_message(&self, _msg: &str) {
+        // Web mode doesn't display message updates (progress bar only)
+    }
+
+    fn finish_with_message(&self, _msg: &str) {
+        self.send(
+            "progressbar.clear",
+            serde_json::json!({ "topic": self.topic }),
+        );
+    }
+
+    fn println(&self, msg: &str) {
+        println!("{}", msg);
+    }
+}
+
+impl Drop for WebProgress {
+    fn drop(&mut self) {
+        self.send(
+            "progressbar.clear",
+            serde_json::json!({ "topic": self.topic }),
+        );
     }
 }
