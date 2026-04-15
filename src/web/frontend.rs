@@ -32,6 +32,10 @@ pub async fn author_comments_page(Path(_id): Path<i64>) -> Html<&'static str> {
     Html(include_str!("assets/author_comments.html"))
 }
 
+pub async fn dnd_window_page() -> Html<&'static str> {
+    Html(include_str!("assets/dnd_window.html"))
+}
+
 pub async fn asset(Path(path): Path<String>) -> Response {
     let (content_type, body) = match path.as_str() {
         "css/theme.css" => ("text/css; charset=utf-8", include_str!("assets/css/theme.css")),

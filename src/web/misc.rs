@@ -205,3 +205,17 @@ pub async fn save_sort_state(
         }),
     }
 }
+
+pub async fn validate_url_regexp_list(
+    State(_state): State<AppState>,
+) -> Json<serde_json::Value> {
+    use crate::downloader::site_setting::SiteSetting;
+
+    let patterns: Vec<String> = SiteSetting::load_all()
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|s| s.url_patterns_for_validation())
+        .collect();
+
+    Json(serde_json::json!(patterns))
+}

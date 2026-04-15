@@ -173,6 +173,10 @@ export function bindActions() {
     });
     input.click();
   });
+  on('action-tool-dnd-window', () => {
+    window.open('/widget/drag_and_drop', 'dnd_window',
+      'width=400,height=350,menubar=no,toolbar=no,location=no,status=no,resizable=yes,scrollbars=yes');
+  });
 
   // --- Options menu ---
   on('action-lang-toggle', () => {

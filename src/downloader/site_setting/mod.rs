@@ -248,6 +248,20 @@ impl SiteSetting {
         self.compiled_url.first().map(|r| r.as_str().to_string())
     }
 
+    /// Returns URL patterns for validation, with named groups replaced by non-capturing groups.
+    /// Matches Ruby's validate_url_regexp_list behavior.
+    pub fn url_patterns_for_validation(&self) -> Vec<String> {
+        let named_group_re = regex::Regex::new(r"\?P?<[^>]+>").unwrap();
+        self.compiled_url
+            .iter()
+            .map(|re| {
+                let pattern = re.as_str().to_string();
+                let cleaned = named_group_re.replace_all(&pattern, "?:");
+                format!("({cleaned})")
+            })
+            .collect()
+    }
+
     pub fn toc_url(&self) -> String {
         self.interpolate(&self.toc_url)
     }

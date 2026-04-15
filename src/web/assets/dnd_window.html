@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Narou.rs DnD Window</title>
+  <link rel="stylesheet" href="/assets/css/theme.css">
+  <link rel="stylesheet" href="/assets/css/base.css">
+  <style>
+    html, body {
+      position: relative;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+    .console {
+      position: relative;
+      height: 100%;
+      background: var(--console-bg, #1a1a2e);
+      color: var(--console-text, #e0e0e0);
+      font-family: monospace;
+      font-size: 0.85em;
+      padding: 0.5em;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    #information {
+      position: absolute;
+      width: 100%;
+      top: 50%;
+      margin-top: -1em;
+      text-align: center;
+      color: var(--text-muted, #aaa);
+      font-size: 1.2em;
+      font-weight: bold;
+      opacity: 0.4;
+      pointer-events: none;
+    }
+    .queue-indicator {
+      position: absolute;
+      top: 0.2em;
+      right: 0.5em;
+      color: var(--text-muted, #aaa);
+      font-size: 0.9em;
+    }
+    .queue-indicator .badge {
+      background: var(--btn-primary-bg, #2196F3);
+      color: #fff;
+      padding: 0.15em 0.4em;
+      border-radius: 0.6em;
+      font-size: 0.85em;
+      margin-left: 0.3em;
+    }
+    #link-drop-overlay {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 120, 215, 0.15);
+      border: 0.2em dashed var(--btn-primary-bg, #2196F3);
+      z-index: 100;
+      pointer-events: none;
+    }
+    #link-drop-overlay.active {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #link-drop-overlay .drop-icon {
+      font-size: 3em;
+      color: var(--btn-primary-bg, #2196F3);
+      opacity: 0.6;
+    }
+    #drop-cover {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      z-index: 101;
+      display: none;
+    }
+    #drop-cover.active {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div id="console" class="console"></div>
+  <div id="information">
+    このウィンドウ内にダウンロードしたい<br>
+    小説のリンクをドラッグ＆ドロップ
+  </div>
+  <div class="queue-indicator">
+    📥 <span id="queue-count" class="badge">0</span>
+  </div>
+  <div id="link-drop-overlay">
+    <span class="drop-icon">⬇</span>
+  </div>
+  <div id="drop-cover"></div>
+
+  <script>
+    (function() {
+      var consoleEl = document.getElementById('console');
+      var overlay = document.getElementById('link-drop-overlay');
+      var dropCover = document.getElementById('drop-cover');
+      var queueCount = document.getElementById('queue-count');
+      var information = document.getElementById('information');
+
+      // WebSocket for console output and queue events
+      var wsPort = parseInt(location.port, 10) + 1;
+      var wsUrl = 'ws://' + location.hostname + ':' + wsPort;
+      var ws;
+
+      function connectWs() {
+        ws = new WebSocket(wsUrl);
+        ws.onmessage = function(event) {
+          try {
+            var msg = JSON.parse(event.data);
+            if (msg.event === 'echo' || msg.event === 'log' || msg.event === 'console') {
+              appendConsole(msg.data || '');
+            } else if (msg.event === 'notification.queue' || msg.event === 'queue' || msg.event === 'status') {
+              refreshQueueCount();
+            } else if (msg.event === 'table.reload' || msg.event === 'refresh' || msg.event === 'list_updated') {
+              // table reload not relevant here
+            }
+          } catch(e) {}
+        };
+        ws.onclose = function() {
+          setTimeout(connectWs, 5000);
+        };
+      }
+      connectWs();
+
+      function appendConsole(text) {
+        if (information.style.display !== 'none') {
+          information.style.display = 'none';
+        }
+        var line = document.createElement('div');
+        line.textContent = text;
+        consoleEl.appendChild(line);
+        consoleEl.scrollTop = consoleEl.scrollHeight;
+      }
+
+      function refreshQueueCount() {
+        fetch('/api/get_queue_size')
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            queueCount.textContent = data.total || 0;
+          })
+          .catch(function() {});
+      }
+      refreshQueueCount();
+
+      // Drag & drop handling
+      window.addEventListener('dragenter', function(e) {
+        e.preventDefault();
+        overlay.classList.add('active');
+        dropCover.classList.add('active');
+      });
+
+      dropCover.addEventListener('dragover', function(e) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+      });
+
+      dropCover.addEventListener('dragleave', function(e) {
+        overlay.classList.remove('active');
+        dropCover.classList.remove('active');
+      });
+
+      dropCover.addEventListener('drop', function(e) {
+        e.preventDefault();
+        overlay.classList.remove('active');
+        dropCover.classList.remove('active');
+
+        var link = '';
+        var dt = e.dataTransfer;
+        if (dt.types) {
+          for (var i = 0; i < dt.types.length; i++) {
+            var type = dt.types[i];
+            if (type === 'text/uri-list' || type === 'text/plain' || type === 'Text') {
+              link = dt.getData(type);
+              if (link) break;
+            }
+          }
+        }
+
+        if (link && link.trim()) {
+          var targets = link.trim().split(/[\s\n]+/).filter(Boolean);
+          if (targets.length > 0) {
+            appendConsole('ダウンロード開始: ' + targets.join(', '));
+            fetch('/api/download', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ targets: targets })
+            }).catch(function(err) {
+              appendConsole('エラー: ' + err.message);
+            });
+          }
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
