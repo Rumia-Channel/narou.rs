@@ -642,7 +642,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 **キーボードショートカット**: 12/12 ✅
 **テーマ**: 6/6 ✅ (全ページCSS変数化、hardcoded色・px値なし)
 **API**: 69 実装済み / 6 未実装 (eject, version/latest, backup_bookmark, download4ssl, download_request, downloadable.gif)
-**WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, TermColorLight色付き出力 ✅, 進捗バー ✅, DB自動更新+table.reload ✅, 履歴on-connect ✅, console.clear ✅, shutdown/reboot ✅, モーダル/メモ帳同期 ❌
+**WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, TermColorLight色付き出力 ✅, 進捗バー ✅, DB自動更新+table.reload+tag.updateCanvas ✅, 履歴on-connect ✅, console.clear ✅, shutdown/reboot ✅, 起動時バージョン表示+未完了タスク警告 ✅, モーダル/メモ帳同期 ❌
 **設定ページ**: ✅
 **言語切替**: ✅ (Rust独自)
 **レスポンシブ**: ✅
