@@ -8,7 +8,7 @@ use crate::db::with_database_mut;
 use crate::error::NarouError;
 
 use super::AppState;
-use super::state::{ApiResponse, IdPath, TagBody, TagsBody};
+use super::state::{ApiResponse, EditTagBody, IdPath, TagBody, TagsBody};
 
 pub async fn add_tag(
     State(state): State<AppState>,
@@ -141,4 +141,70 @@ pub async fn update_tags(
         success: true,
         message: "Tags updated".to_string(),
     }))
+}
+
+/// POST /api/edit_tag — bulk tag edit with tri-state (Ruby parity)
+/// states: { "tag_name": 0|1|2 } where 0=delete, 1=keep, 2=add
+pub async fn edit_tag(
+    State(state): State<AppState>,
+    Json(body): Json<EditTagBody>,
+) -> Json<serde_json::Value> {
+    let ids: Vec<i64> = body
+        .ids
+        .iter()
+        .filter_map(|v| match v {
+            serde_json::Value::Number(n) => n.as_i64(),
+            serde_json::Value::String(s) => s.parse::<i64>().ok(),
+            _ => None,
+        })
+        .collect();
+
+    if ids.is_empty() {
+        return serde_json::json!({ "success": false, "error": "No valid IDs" }).into();
+    }
+
+    // Group tags by state: 0=delete, 2=add (1=keep is no-op)
+    let mut tags_to_add: Vec<String> = Vec::new();
+    let mut tags_to_delete: Vec<String> = Vec::new();
+
+    for (tag, state_val) in &body.states {
+        let s = match state_val {
+            serde_json::Value::Number(n) => n.as_i64().unwrap_or(1),
+            serde_json::Value::String(s) => s.parse::<i64>().unwrap_or(1),
+            _ => 1,
+        };
+        match s {
+            0 => tags_to_delete.push(tag.clone()),
+            2 => tags_to_add.push(tag.clone()),
+            _ => {} // 1 = keep, no-op
+        }
+    }
+
+    let result = with_database_mut(|db| {
+        for &id in &ids {
+            if let Some(record) = db.get(id).cloned() {
+                let mut updated = record;
+                // Delete tags
+                if !tags_to_delete.is_empty() {
+                    updated.tags.retain(|t| !tags_to_delete.contains(t));
+                }
+                // Add tags
+                for tag in &tags_to_add {
+                    if !updated.tags.contains(tag) {
+                        updated.tags.push(tag.clone());
+                    }
+                }
+                db.insert(updated);
+            }
+        }
+        db.save()
+    });
+
+    if let Err(e) = result {
+        return serde_json::json!({ "success": false, "error": e.to_string() }).into();
+    }
+
+    state.push_server.broadcast_event("table.reload", "");
+    state.push_server.broadcast_event("tag.updateCanvas", "");
+    serde_json::json!({ "success": true }).into()
 }

@@ -107,6 +107,12 @@ pub struct IdsBody {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct EditTagBody {
+    pub ids: Vec<serde_json::Value>,
+    pub states: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CsvImportBody {
     pub csv: String,
 }

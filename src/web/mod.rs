@@ -100,6 +100,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/csv/import", post(jobs::api_csv_import))
         .route("/api/csv/download", get(jobs::api_csv_download))
         .route("/api/validate_url_regexp_list", get(misc::validate_url_regexp_list))
+        .route("/api/edit_tag", post(tags::edit_tag))
         .route("/api/update_by_tag", post(jobs::api_update_by_tag))
         .route("/api/taginfo.json", post(jobs::api_taginfo))
         .route("/api/update_general_lastup", post(jobs::api_update_general_lastup))
