@@ -112,12 +112,15 @@ pub async fn batch_remove(
     State(state): State<AppState>,
     Json(body): Json<BatchIdsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
+    let with_file = body.with_file.unwrap_or(false);
     let count = with_database_mut(|db| {
         let mut count = 0usize;
         for id in &body.ids {
             if let Some(record) = db.remove(*id) {
-                let dir = crate::db::existing_novel_dir_for_record(db.archive_root(), &record);
-                let _ = std::fs::remove_dir_all(&dir);
+                if with_file {
+                    let dir = crate::db::existing_novel_dir_for_record(db.archive_root(), &record);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
                 count += 1;
             }
         }
@@ -133,4 +136,15 @@ pub async fn batch_remove(
         success: true,
         message: format!("Removed {} novels", count),
     }))
+}
+
+pub async fn batch_remove_with_file(
+    State(state): State<AppState>,
+    Json(body): Json<BatchIdsBody>,
+) -> Result<Json<ApiResponse>, (StatusCode, String)> {
+    let body = BatchIdsBody {
+        ids: body.ids,
+        with_file: Some(true),
+    };
+    batch_remove(State(state), Json(body)).await
 }

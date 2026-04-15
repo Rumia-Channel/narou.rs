@@ -198,11 +198,17 @@ pub async fn get_story(
 pub async fn remove_novel(
     State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
+    body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
+    let with_file = body
+        .and_then(|b| b.get("with_file").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
     let result = with_database_mut(|db| {
         if let Some(record) = db.remove(id) {
-            let dir = crate::db::existing_novel_dir_for_record(db.archive_root(), &record);
-            let _ = std::fs::remove_dir_all(&dir);
+            if with_file {
+                let dir = crate::db::existing_novel_dir_for_record(db.archive_root(), &record);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
             db.save()?;
             Ok::<String, NarouError>(record.title)
         } else {

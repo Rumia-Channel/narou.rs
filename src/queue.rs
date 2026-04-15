@@ -213,6 +213,14 @@ impl PersistentQueue {
         Ok(removed)
     }
 
+    pub fn clear_pending(&self) -> Result<()> {
+        {
+            let mut state = self.state.lock();
+            state.jobs.clear();
+        }
+        self.save()
+    }
+
     pub fn clear(&self) -> Result<()> {
         {
             let mut state = self.state.lock();

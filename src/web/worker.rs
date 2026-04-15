@@ -16,6 +16,7 @@ pub fn start_queue_worker(
     root_dir: PathBuf,
     push_server: Arc<PushServer>,
     running_job: Arc<parking_lot::Mutex<Option<QueueJob>>>,
+    running_child_pid: Arc<parking_lot::Mutex<Option<u32>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -43,7 +44,8 @@ pub fn start_queue_worker(
             let root_dir = root_dir.clone();
             let job_for_run = job.clone();
             let ps = Arc::clone(&push_server);
-            let success = tokio::task::spawn_blocking(move || execute_job(&root_dir, &job_for_run, &ps))
+            let pid_ref = Arc::clone(&running_child_pid);
+            let success = tokio::task::spawn_blocking(move || execute_job(&root_dir, &job_for_run, &ps, &pid_ref))
                 .await
                 .unwrap_or(false);
 
@@ -75,7 +77,7 @@ pub fn start_queue_worker(
     })
 }
 
-fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>) -> bool {
+fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, running_pid: &Arc<parking_lot::Mutex<Option<u32>>>) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         push_server.broadcast_echo("エラー: 実行ファイルパスを取得できません", "stdout");
         return false;
@@ -138,6 +140,9 @@ fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>) -
         }
     };
 
+    // Store child PID for external cancellation
+    *running_pid.lock() = Some(child.id());
+
     // Stream stdout in a separate thread
     let stdout = child.stdout.take();
     let ps_out = Arc::clone(push_server);
@@ -169,6 +174,7 @@ fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>) -
     });
 
     let status = child.wait().map(|s| s.success()).unwrap_or(false);
+    *running_pid.lock() = None;
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     status

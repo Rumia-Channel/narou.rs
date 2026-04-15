@@ -28,6 +28,7 @@ pub struct AppState {
     pub push_server: Arc<push::PushServer>,
     pub basic_auth_header: Option<String>,
     pub running_job: Arc<parking_lot::Mutex<Option<crate::queue::QueueJob>>>,
+    pub running_child_pid: Arc<parking_lot::Mutex<Option<u32>>>,
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -58,6 +59,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/novels/freeze", post(batch::batch_freeze))
         .route("/api/novels/unfreeze", post(batch::batch_unfreeze))
         .route("/api/novels/remove", post(batch::batch_remove))
+        .route("/api/remove", post(batch::batch_remove))
+        .route("/api/remove_with_file", post(batch::batch_remove_with_file))
         .route("/api/download", post(jobs::api_download))
         .route("/api/update", post(jobs::api_update))
         .route("/api/convert", post(jobs::api_convert))
@@ -67,6 +70,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/queue/status", get(jobs::queue_status))
         .route("/api/queue/clear", post(jobs::queue_clear))
         .route("/api/queue/cancel", post(jobs::queue_cancel))
+        .route("/api/cancel_running_task", post(jobs::cancel_running_task))
         .route("/api/get_pending_tasks", get(jobs::get_pending_tasks))
         .route("/api/remove_pending_task", post(jobs::remove_pending_task))
         .route("/api/log/recent", get(misc::recent_logs))

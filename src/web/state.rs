@@ -55,6 +55,8 @@ pub struct NovelListItem {
 #[derive(Debug, Deserialize)]
 pub struct BatchIdsBody {
     pub ids: Vec<i64>,
+    #[serde(default)]
+    pub with_file: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -45,12 +45,14 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
         }
     };
     let running_job = Arc::new(parking_lot::Mutex::new(None));
+    let running_child_pid = Arc::new(parking_lot::Mutex::new(None));
     let app_state = web::AppState {
         port: address.port,
         ws_port: address.ws_port,
         push_server: push_server.clone(),
         basic_auth_header,
         running_job: running_job.clone(),
+        running_child_pid: running_child_pid.clone(),
     };
     let app = web::create_router(app_state.clone());
     let ws_app = web::push::create_push_router(app_state);
@@ -79,7 +81,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let ws_listener = tokio::net::TcpListener::bind(ws_addr).await.unwrap();
-    let worker_task = web::worker::start_queue_worker(root_dir.clone(), push_server.clone(), running_job);
+    let worker_task = web::worker::start_queue_worker(root_dir.clone(), push_server.clone(), running_job, running_child_pid);
     let scheduler_task = web::scheduler::start_auto_update_scheduler(root_dir, push_server.clone());
 
     let ws_task = tokio::spawn(async move { axum::serve(ws_listener, ws_app).await });

@@ -717,15 +717,66 @@ pub async fn api_csv_download(
         .into_response()
 }
 
-// POST /api/queue/cancel
+// POST /api/queue/cancel — cancel all: kill running + clear pending
 pub async fn queue_cancel(
     State(state): State<AppState>,
 ) -> Json<ApiResponse> {
-    state.push_server.broadcast("queue_cancel", "");
+    // Kill running subprocess if any
+    kill_running_child(&state);
+
+    // Clear pending tasks from queue
+    if let Ok(queue) = open_queue() {
+        let _ = queue.clear_pending();
+    }
+
+    state.push_server.broadcast_event("notification.queue", "");
     Json(ApiResponse {
         success: true,
-        message: "Cancel requested".to_string(),
+        message: "キャンセルしました".to_string(),
     })
+}
+
+// POST /api/cancel_running_task — cancel specific running task
+pub async fn cancel_running_task(
+    State(state): State<AppState>,
+    Json(body): Json<TaskIdBody>,
+) -> Json<serde_json::Value> {
+    let running = state.running_job.lock().clone();
+    if let Some(job) = running {
+        if job.id == body.task_id {
+            kill_running_child(&state);
+            return serde_json::json!({ "status": "ok" }).into();
+        }
+    }
+    serde_json::json!({ "error": "実行中の処理を中断できませんでした" }).into()
+}
+
+fn kill_running_child(state: &AppState) {
+    let pid = state.running_child_pid.lock().take();
+    if let Some(pid) = pid {
+        // Kill process tree on Windows using taskkill /T
+        // On Unix, fall back to plain kill via std::process::Command
+        let result = if cfg!(windows) {
+            std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+        } else {
+            std::process::Command::new("kill")
+                .args(["-TERM", &format!("-{}", pid)])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+        };
+        if let Err(e) = result {
+            state.push_server.broadcast_echo(
+                &format!("プロセス終了に失敗: {}", e),
+                "stdout",
+            );
+        }
+        state.push_server.broadcast_echo("--- ジョブをキャンセルしました ---", "stdout");
+    }
 }
 
 // GET /api/get_pending_tasks
