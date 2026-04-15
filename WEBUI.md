@@ -235,8 +235,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | 12 | バックアップを作成 | backup API | ✅ |
 | 13 | 再ダウンロード | download_force API | ✅ |
 | 14 | メールで送信 | mail API | ✅ |
-
-**Ruby版との差分**: 「前書き/後書き」(author_comments) は未実装。
+| 15 | 作者コメント表示 | author_comments ページ表示 | ✅ |
 
 ---
 
@@ -276,10 +275,10 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 |------|--------|--------|------|
 | モーダル表示 | `#queue-manager-modal` | `#queue-modal` | ✅ |
 | 実行中タスク表示 | タスク文字列表示 | `#queue-running-list` | ✅ |
-| 待機タスクリスト | ドラッグ並替 | `#queue-pending-list` (リスト表示のみ) | 🟡 |
+| 待機タスクリスト | ドラッグ並替 | `#queue-pending-list` (タスク詳細表示+個別削除) | 🟡 (ドラッグ並替なし) |
 | キュー消去ボタン | あり | `#queue-clear-button` | ✅ |
 | ドラッグ&ドロップ並替 | あり | なし | ❌ |
-| 個別タスク取消 | あり | POST `/api/remove_pending_task` (API実装済み、UIは未接続) | 🟡 |
+| 個別タスク取消 | あり | POST `/api/remove_pending_task` + 🗑ボタン | ✅ |
 
 ### 3.2 タグ編集モーダル
 
@@ -511,8 +510,6 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/validate_url_regexp_list` | URL正規表現一覧 |
 | `/api/reorder_pending_tasks` | タスク並替 |
 | `/api/cancel_running_task` | 実行中タスク取消 |
-| `/novels/:id/download` | ebook ファイルストリーミング |
-| `/novels/:id/author_comments` | 前書き/後書きページ |
 
 ---
 
@@ -593,12 +590,13 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 **ページ**: 9/10 ✅ (メイン, 設定, ヘルプ, About, 個別設定, メモ帳, 作者コメント, ebook DL, 再起動)
 **ナビバー要素**: 全メニュー ✅ (表示/選択/タグ/ツール/オプション)
 **コントロールパネル**: 10/11 ボタン ✅ (Eject以外)
-**コンテキストメニュー**: 15/15 項目 ✅
+**コンテキストメニュー**: 15/15 項目 ✅ (作者コメント表示含む)
 **モーダル**: 8/8 ✅ (タグ編集, About, 差分, 確認, メモ帳, ダウンロード, キュー, 列可視性)
 **キーボードショートカット**: 12/12 ✅
 **テーマ**: 6/6 ✅
-**API**: 49 実装済み / 4 未実装 (主にeject, version/latest, reorder, cancel_running)
+**API**: 51 実装済み / 6 未実装 (eject, version/latest, backup_bookmark, validate_url, reorder, cancel_running)
 **WebSocket**: 基本イベント ✅, 進捗バー ✅, モーダル/メモ帳同期 ❌
 **設定ページ**: ✅
 **言語切替**: ✅ (Rust独自)
 **レスポンシブ**: ✅
+**i18n 監査**: ✅ (JOB_TYPE_LABELS を Ruby版と完全一致に修正済み)
