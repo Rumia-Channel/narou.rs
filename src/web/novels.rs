@@ -156,6 +156,45 @@ pub async fn get_novel(
     Ok(Json(value))
 }
 
+pub async fn get_story(
+    State(_state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let id_str = params
+        .get("id")
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "id is required".to_string()))?;
+    let id: i64 = id_str
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid id".to_string()))?;
+
+    let record = with_database(|db| {
+        db.get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
+    })
+    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    let novel_dir = with_database(|db| {
+        Ok(crate::db::existing_novel_dir_for_record(
+            db.archive_root(),
+            &record,
+        ))
+    })
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let toc = crate::downloader::persistence::load_toc_file(&novel_dir);
+    let (title, story) = match toc {
+        Some(t) => {
+            let s = t.story.unwrap_or_default().trim().to_string();
+            let html_story = s.replace('\n', "<br>");
+            (t.title, html_story)
+        }
+        None => (record.title, String::new()),
+    };
+
+    Ok(Json(serde_json::json!({ "title": title, "story": story })))
+}
+
 pub async fn remove_novel(
     State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,

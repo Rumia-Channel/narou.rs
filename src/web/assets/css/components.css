@@ -288,7 +288,29 @@ li.enable-selected.disabled a {
 .col-length { width: 5em; text-align: right; }
 .col-status { width: 5em; }
 .col-url { width: 3em; text-align: center; }
+.col-story { width: 2.5em; text-align: center; }
 .col-menu { width: 2.5em; text-align: center; }
+
+.btn-story {
+  background: none; border: 1px solid #ccc; border-radius: 3px;
+  cursor: pointer; font-size: 0.85em; padding: 1px 5px; color: #337ab7;
+}
+.btn-story:hover { background: #eee; }
+
+.story-popover {
+  position: absolute; z-index: 10000;
+  background: #fff; border: 1px solid #ccc; border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.2);
+  max-width: 400px; min-width: 200px; padding: 0;
+}
+.story-popover-title {
+  font-weight: bold; padding: 8px 12px;
+  border-bottom: 1px solid #eee; font-size: 0.95em;
+}
+.story-popover-body {
+  padding: 8px 12px; font-size: 0.9em;
+  max-height: 300px; overflow-y: auto; line-height: 1.5;
+}
 
 /* ========== Tags ========== */
 .tag-label {

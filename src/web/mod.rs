@@ -71,6 +71,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/clear_history", post(misc::clear_history))
         .route("/api/sort_state", get(misc::get_sort_state))
         .route("/api/sort_state", post(misc::save_sort_state))
+        .route("/api/story", get(novels::get_story))
         .route("/api/global_setting", get(global_settings::get_global_settings))
         .route("/api/global_setting", post(global_settings::save_global_settings))
         .route("/api/send", post(jobs::api_send))

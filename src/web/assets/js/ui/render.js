@@ -3,6 +3,7 @@
  * context menu, click-to-select, and per-row action buttons.
  */
 import { State, El, lsSet } from '../core/state.js';
+import { fetchJson } from '../core/http.js';
 import { showContextMenu, showTagColorMenu } from './context_menu.js';
 
 const TAG_COLOR_MAP = {
@@ -192,6 +193,7 @@ function createRow(novel) {
     <td class="col-length">${lengthText}</td>
     <td class="col-status">${statusParts.join(', ')}</td>
     <td class="col-url">${tocLink}</td>
+    <td class="col-story"><button class="row-action-btn btn-story" data-story-id="${novel.id}" type="button" title="あらすじ">ℹ</button></td>
     <td class="col-menu">${menuBtn}</td>
   `;
 
@@ -201,6 +203,38 @@ function createRow(novel) {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       showContextMenu(e, novel.id);
+    });
+  }
+
+  // Bind story popover button
+  const storyBtn = tr.querySelector('.btn-story');
+  if (storyBtn) {
+    storyBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const existing = document.querySelector('.story-popover');
+      if (existing) existing.remove();
+
+      const nid = storyBtn.dataset.storyId;
+      try {
+        const data = await fetchJson(`/api/story?id=${nid}`);
+        if (!data) return;
+        const pop = document.createElement('div');
+        pop.className = 'story-popover';
+        pop.innerHTML = `<div class="story-popover-title">${data.title || ''}</div>
+          <div class="story-popover-body">${data.story || '(あらすじなし)'}</div>`;
+        document.body.appendChild(pop);
+        const rect = storyBtn.getBoundingClientRect();
+        pop.style.top = (rect.bottom + window.scrollY + 4) + 'px';
+        pop.style.left = Math.max(0, rect.left + window.scrollX - 200) + 'px';
+
+        const dismiss = (ev) => {
+          if (!pop.contains(ev.target) && ev.target !== storyBtn) {
+            pop.remove();
+            document.removeEventListener('click', dismiss);
+          }
+        };
+        setTimeout(() => document.addEventListener('click', dismiss), 0);
+      } catch { /* ignore */ }
     });
   }
 
