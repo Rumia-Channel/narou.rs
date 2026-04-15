@@ -41,7 +41,7 @@
 
 .settings-tabs li.active a {
   background: var(--primary-color, #337ab7);
-  color: #fff;
+  color: var(--btn-text, #fff);
 }
 
 .settings-tabs li a .error-badge {
@@ -138,7 +138,7 @@
   left: 0.125rem;
   width: 1.5rem;
   height: 1.5rem;
-  background: #fff;
+  background: var(--body-bg, #fff);
   border-radius: 50%;
   transition: transform 0.2s;
 }
@@ -187,7 +187,7 @@
 
 .switch-3way input:checked + label {
   background: var(--primary-color, #337ab7);
-  color: #fff;
+  color: var(--btn-text, #fff);
 }
 
 /* Select / input fields */
@@ -301,12 +301,12 @@
 
 .settings-toast.success {
   background: var(--success-color, #5cb85c);
-  color: #fff;
+  color: var(--btn-text, #fff);
 }
 
 .settings-toast.error {
   background: var(--danger-color, #d9534f);
-  color: #fff;
+  color: var(--btn-text, #fff);
 }
 
 /* Navbar btn on settings page */

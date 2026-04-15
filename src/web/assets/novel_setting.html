@@ -4,27 +4,39 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>narou.rs - 個別設定</title>
+<link rel="stylesheet" href="/assets/css/theme.css">
+<link rel="stylesheet" href="/assets/css/base.css">
+<link rel="stylesheet" href="/assets/css/layout.css">
 <style>
-body { font-family: sans-serif; max-width: 900px; margin: 2em auto; padding: 0 1em; color: #333; }
-h1 { border-bottom: 2px solid #4a90d9; padding-bottom: .3em; font-size: 1.4em; }
-.loading { color: #888; }
-.error { color: #c33; }
-table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-th, td { border: 1px solid #ddd; padding: .5em .7em; text-align: left; }
-th { background: #f8f8f8; width: 30%; }
-input[type=text], input[type=number], select { width: 100%; padding: .3em; box-sizing: border-box; }
-input[type=checkbox] { transform: scale(1.2); }
+.ns-container { max-width: 56em; margin: 1.5em auto; padding: 0 var(--container-padding); }
+.ns-container h1 { border-bottom: 0.15em solid var(--btn-primary-bg); padding-bottom: .3em; font-size: 1.4em; }
+.loading { color: var(--text-muted); }
+.error { color: var(--btn-danger-bg); }
+.ns-container table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+.ns-container th, .ns-container td { border: 0.07em solid var(--border-color); padding: .5em .7em; text-align: left; }
+.ns-container th { background: var(--table-header-bg); color: var(--table-header-text); width: 30%; }
+.ns-container input[type=text], .ns-container input[type=number], .ns-container select {
+  width: 100%; padding: .3em; box-sizing: border-box;
+  color: var(--text-color); background-color: var(--input-bg); border: 0.07em solid var(--input-border); border-radius: var(--border-radius);
+}
+.ns-container input[type=checkbox] { transform: scale(1.2); }
 .actions { margin: 1.5em 0; }
-.btn { padding: .5em 1.5em; background: #4a90d9; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 1em; }
-.btn:hover { background: #357abd; }
-.btn-secondary { background: #888; }
-.btn-secondary:hover { background: #666; }
-.msg { margin: .5em 0; padding: .5em; border-radius: 4px; }
-.msg-success { background: #dfd; color: #262; }
-.msg-error { background: #fdd; color: #622; }
+.btn { padding: .5em 1.5em; background: var(--btn-primary-bg); color: var(--btn-text); border: none; border-radius: var(--border-radius); cursor: pointer; font-size: 1em; }
+.btn:hover { opacity: 0.85; }
+.btn-secondary { background: var(--text-muted); }
+.btn-secondary:hover { opacity: 0.85; }
+.msg { margin: .5em 0; padding: .5em; border-radius: var(--border-radius); }
+.msg-success { background: var(--btn-success-bg); color: var(--btn-text); }
+.msg-error { background: var(--btn-danger-bg); color: var(--btn-text); }
 </style>
 </head>
 <body>
+<nav class="navbar">
+  <div class="navbar-inner">
+    <a class="navbar-brand" href="/">Narou.rs</a>
+  </div>
+</nav>
+<div class="ns-container">
 <h1 id="page-title">個別設定</h1>
 <div id="content"><p class="loading">読み込み中...</p></div>
 <div class="actions">
@@ -32,6 +44,7 @@ input[type=checkbox] { transform: scale(1.2); }
   <button class="btn btn-secondary" onclick="location.href='/'">戻る</button>
 </div>
 <div id="msg"></div>
+</div>
 
 <script>
 (async () => {

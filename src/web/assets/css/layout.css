@@ -389,15 +389,15 @@
 }
 
 #download-link-drop-here.dragover {
-  border-color: #ada;
+  border-color: var(--btn-success-border);
   background-color: rgba(92, 184, 92, 0.1);
-  color: #5cb85c;
+  color: var(--btn-success-bg);
 }
 
 #download-link-drop-here.error {
-  border-color: #ebccd1;
+  border-color: var(--btn-danger-border);
   background-color: rgba(217, 83, 79, 0.08);
-  color: #d9534f;
+  color: var(--btn-danger-bg);
 }
 
 #download-link-drop-here .inner {

@@ -11,7 +11,13 @@
   --text-color: #333;
   --text-muted: #777;
   --link-color: #2fa4e7;
+  --link-hover: #1a87c7;
   --border-color: #ddd;
+
+  /* Form inputs */
+  --input-bg: #fff;
+  --input-border: #ccc;
+  --border-radius: 0.25em;
 
   /* Buttons */
   --btn-primary-bg: #2fa4e7;
@@ -34,6 +40,7 @@
   --table-header-text: #ddd0cc;
   --table-odd-bg: #f8f3e5;
   --table-even-bg: #fffcef;
+  --table-stripe-bg: #f8f3e5;
   --table-sort-odd-bg: #f0ecde;
   --table-sort-even-bg: #f8f3e5;
   --table-hover-bg: #ded;
@@ -88,6 +95,19 @@
   /* Modal */
   --modal-backdrop: rgba(0, 0, 0, 0.5);
 
+  /* Settings page aliases */
+  --primary-color: #2fa4e7;
+  --success-color: #73a839;
+  --danger-color: #c12e2a;
+  --danger-bg: #f2dede;
+  --info-bg: #d9edf7;
+  --info-text: #31708f;
+  --info-border: #bce8f1;
+  --heading-color: #333;
+  --well-bg: #f5f5f5;
+  --panel-bg: #fff;
+  --switch-off-bg: #ccc;
+
   /* Layout (relative units) */
   --container-padding: 1rem;
   --btn-padding-y: 0.4em;
@@ -110,6 +130,10 @@
   --text-color: #eee;
   --text-muted: #999;
   --border-color: #444;
+  --link-hover: #5bb8ef;
+
+  --input-bg: #333;
+  --input-border: #555;
 
   --btn-default-bg: #444;
   --btn-default-border: #555;
@@ -119,6 +143,7 @@
   --table-header-text: #ddd;
   --table-odd-bg: #2a2a2a;
   --table-even-bg: #333;
+  --table-stripe-bg: #2a2a2a;
   --table-sort-odd-bg: #353535;
   --table-sort-even-bg: #3a3a3a;
   --table-hover-bg: #3d5a3d;
@@ -141,6 +166,18 @@
 
   --queue-badge-bg: #555;
   --badge-bg: rgba(255, 255, 255, 0.2);
+
+  --primary-color: #375a7f;
+  --success-color: #00bc8c;
+  --danger-color: #e74c3c;
+  --danger-bg: #3a2020;
+  --info-bg: #1a3a4a;
+  --info-text: #5bc0de;
+  --info-border: #2a5a6a;
+  --heading-color: #eee;
+  --well-bg: #2a2a2a;
+  --panel-bg: #333;
+  --switch-off-bg: #555;
 }
 
 :root[data-theme="Slate"] {
@@ -153,7 +190,11 @@
   --text-color: #c8c8c8;
   --text-muted: #868686;
   --link-color: #fff;
+  --link-hover: #aaa;
   --border-color: #1c1e22;
+
+  --input-bg: #32373d;
+  --input-border: #1c1e22;
 
   --btn-primary-bg: #3a3f44;
   --btn-primary-border: #2e3338;
@@ -173,6 +214,7 @@
   --table-header-text: #c8c8c8;
   --table-odd-bg: #2e3338;
   --table-even-bg: #353a3f;
+  --table-stripe-bg: #2e3338;
   --table-hover-bg: #434a52;
   --table-selected-bg: #4a5057;
   --table-border: #1c1e22;
@@ -185,6 +227,18 @@
   --dropdown-border: #2e3338;
   --dropdown-divider: #2e3338;
   --dropdown-text: #c8c8c8;
+
+  --primary-color: #3a3f44;
+  --success-color: #62c462;
+  --danger-color: #ee5f5b;
+  --danger-bg: #3a2828;
+  --info-bg: #2a3a44;
+  --info-text: #5bc0de;
+  --info-border: #3a4a54;
+  --heading-color: #c8c8c8;
+  --well-bg: #32373d;
+  --panel-bg: #3a3f44;
+  --switch-off-bg: #555;
 }
 
 :root[data-theme="Superhero"] {
@@ -197,7 +251,11 @@
   --text-color: #ebebeb;
   --text-muted: #8e8e8e;
   --link-color: #df691a;
+  --link-hover: #e8822e;
   --border-color: #1c2d3f;
+
+  --input-bg: #3a4d5f;
+  --input-border: #1c2d3f;
 
   --btn-primary-bg: #df691a;
   --btn-primary-border: #c85e17;
@@ -211,6 +269,7 @@
   --table-header-text: #ebebeb;
   --table-odd-bg: #2b3e50;
   --table-even-bg: #344b5f;
+  --table-stripe-bg: #2b3e50;
   --table-hover-bg: #3d5a70;
   --table-selected-bg: #4a5d3a;
   --table-border: #1c2d3f;
@@ -223,6 +282,18 @@
   --dropdown-border: #3b4b5a;
   --dropdown-divider: #3b4b5a;
   --dropdown-text: #ebebeb;
+
+  --primary-color: #df691a;
+  --success-color: #5cb85c;
+  --danger-color: #d9534f;
+  --danger-bg: #3a2020;
+  --info-bg: #1c3040;
+  --info-text: #79c0d9;
+  --info-border: #2a4050;
+  --heading-color: #ebebeb;
+  --well-bg: #344b5f;
+  --panel-bg: #3a4d5f;
+  --switch-off-bg: #4e5d6c;
 }
 
 /* Light themes */

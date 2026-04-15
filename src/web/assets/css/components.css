@@ -265,7 +265,7 @@ li.enable-selected.disabled a {
 }
 
 .table tbody tr.frozen td {
-  color: #6caddd;
+  color: var(--link-color);
 }
 
 .table tbody tr {
@@ -292,20 +292,20 @@ li.enable-selected.disabled a {
 .col-menu { width: 2.5em; text-align: center; }
 
 .btn-story {
-  background: none; border: 1px solid #ccc; border-radius: 3px;
-  cursor: pointer; font-size: 0.85em; padding: 1px 5px; color: #337ab7;
+  background: none; border: 0.07em solid var(--border-color); border-radius: var(--border-radius);
+  cursor: pointer; font-size: 0.85em; padding: 0.07em 0.35em; color: var(--link-color);
 }
-.btn-story:hover { background: #eee; }
+.btn-story:hover { background: var(--dropdown-hover-bg); }
 
 .story-popover {
   position: absolute; z-index: 10000;
-  background: #fff; border: 1px solid #ccc; border-radius: 4px;
-  box-shadow: 0 2px 8px rgba(0,0,0,.2);
-  max-width: 400px; min-width: 200px; padding: 0;
+  background: var(--dropdown-bg); border: 0.07em solid var(--dropdown-border); border-radius: var(--border-radius);
+  box-shadow: var(--dropdown-shadow);
+  max-width: 25em; min-width: 12.5em; padding: 0;
 }
 .story-popover-title {
-  font-weight: bold; padding: 8px 12px;
-  border-bottom: 1px solid #eee; font-size: 0.95em;
+  font-weight: bold; padding: 0.5em 0.75em;
+  border-bottom: 0.07em solid var(--dropdown-divider); font-size: 0.95em;
 }
 .story-popover-body {
   padding: 8px 12px; font-size: 0.9em;
@@ -319,7 +319,7 @@ li.enable-selected.disabled a {
   font-size: 0.8em;
   font-weight: bold;
   border-radius: 0.2em;
-  color: #fff;
+  color: var(--btn-text);
   margin: 0.1em;
   white-space: nowrap;
   cursor: pointer;
@@ -375,7 +375,7 @@ li.enable-selected.disabled a {
   padding: 0.05em 0.35em;
   font-size: 0.75em;
   font-weight: bold;
-  color: #fff;
+  color: var(--btn-text);
   border-radius: 0.2em;
   line-height: 1.2;
 }
@@ -384,7 +384,7 @@ li.enable-selected.disabled a {
 .gl-6h { background-color: var(--gl-6h-bg); }
 .gl-24h { background-color: var(--gl-24h-bg); }
 .gl-3d { background-color: var(--gl-3d-bg); }
-.gl-1w { background-color: var(--gl-1w-bg); color: #333; }
+.gl-1w { background-color: var(--gl-1w-bg); color: var(--text-color); }
 
 /* ========== Context Menu ========== */
 .context-menu {
@@ -485,7 +485,7 @@ li.enable-selected.disabled a {
   padding: 0.6em 1.2em;
   border-radius: var(--btn-border-radius);
   font-size: 0.9em;
-  color: #fff;
+  color: var(--btn-text);
   pointer-events: auto;
   opacity: 1;
   transition: opacity 0.5s;
@@ -509,7 +509,7 @@ li.enable-selected.disabled a {
   align-items: center;
   justify-content: center;
   background-color: var(--navbar-bg);
-  color: #fff;
+  color: var(--navbar-text);
   border-radius: 50%;
   cursor: pointer;
   font-size: 1em;
@@ -711,7 +711,7 @@ li.enable-selected.disabled a {
 /* ========== Queue badge active ========== */
 .queue-size-active {
   background-color: var(--btn-warning-bg);
-  color: #fff;
+  color: var(--btn-text);
   padding: 0.15em 0.4em;
   border-radius: 0.7em;
   font-size: 0.75em;

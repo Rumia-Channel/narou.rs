@@ -4,19 +4,29 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>narou.rs - ヘルプ</title>
+<link rel="stylesheet" href="/assets/css/theme.css">
+<link rel="stylesheet" href="/assets/css/base.css">
+<link rel="stylesheet" href="/assets/css/layout.css">
 <style>
-body { font-family: sans-serif; max-width: 800px; margin: 2em auto; padding: 0 1em; line-height: 1.6; color: #333; }
-h1 { border-bottom: 2px solid #4a90d9; padding-bottom: .3em; }
-h2 { margin-top: 1.5em; color: #4a90d9; }
-code { background: #f4f4f4; padding: .15em .3em; border-radius: 3px; }
-kbd { background: #eee; border: 1px solid #ccc; border-radius: 3px; padding: .1em .4em; font-size: .9em; }
-table { border-collapse: collapse; width: 100%; margin: .5em 0; }
-th, td { border: 1px solid #ddd; padding: .4em .6em; text-align: left; }
-th { background: #f8f8f8; }
-a { color: #4a90d9; }
+.help-container { max-width: 50em; margin: 1.5em auto; padding: 0 var(--container-padding); line-height: 1.6; }
+.help-container h1 { border-bottom: 0.15em solid var(--btn-primary-bg); padding-bottom: .3em; }
+.help-container h2 { margin-top: 1.5em; color: var(--btn-primary-bg); }
+.help-container code { background: var(--table-stripe-bg); padding: .15em .3em; border-radius: var(--border-radius); }
+.help-container kbd { background: var(--table-stripe-bg); border: 0.07em solid var(--border-color); border-radius: var(--border-radius); padding: .1em .4em; font-size: .9em; }
+.help-container table { border-collapse: collapse; width: 100%; margin: .5em 0; }
+.help-container th, .help-container td { border: 0.07em solid var(--border-color); padding: .4em .6em; text-align: left; }
+.help-container th { background: var(--table-header-bg); color: var(--table-header-text); }
+.help-container a { color: var(--link-color); }
+.help-container a:hover { color: var(--link-hover); }
 </style>
 </head>
 <body>
+<nav class="navbar">
+  <div class="navbar-inner">
+    <a class="navbar-brand" href="/">Narou.rs</a>
+  </div>
+</nav>
+<div class="help-container">
 <h1>narou.rs WEB UI ヘルプ</h1>
 
 <h2>概要</h2>
@@ -36,7 +46,7 @@ a { color: #4a90d9; }
 </table>
 
 <h2>基本操作</h2>
-<ul>
+<ul style="list-style: disc; padding-left: 1.5em;">
   <li><strong>ダウンロード</strong>: URLを入力して小説をダウンロードします</li>
   <li><strong>更新</strong>: 選択した小説または全小説の更新を確認します</li>
   <li><strong>変換</strong>: 選択した小説を電子書籍形式に変換します</li>
@@ -51,5 +61,6 @@ a { color: #4a90d9; }
 <p>小説にタグを付けて分類できます。タグ名を右クリックすると色を変更できます。</p>
 
 <p style="margin-top:2em;text-align:center"><a href="/">← メインページに戻る</a></p>
+</div>
 </body>
 </html>
