@@ -276,10 +276,12 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 |------|--------|--------|------|
 | モーダル表示 | `#queue-manager-modal` | `#queue-modal` | ✅ |
 | 実行中タスク表示 | タスク文字列表示 | `#queue-running-list` | ✅ |
-| 待機タスクリスト | ドラッグ並替 | `#queue-pending-list` (タスク詳細表示+個別削除) | 🟡 (ドラッグ並替なし) |
+| 待機タスクリスト | ドラッグ並替 | `#queue-pending-list` (詳細+個別削除+上下並替) | 🟡 (ドラッグ並替なし、上下ボタンあり) |
 | キュー消去ボタン | あり | `#queue-clear-button` | ✅ |
-| ドラッグ&ドロップ並替 | あり | なし | ❌ |
+| 再読み込みボタン | あり | `#queue-reload-button` | ✅ |
+| ドラッグ&ドロップ並替 | あり | なし (上下ボタンで代替) | 🟡 |
 | 個別タスク取消 | あり | POST `/api/remove_pending_task` + 🗑ボタン | ✅ |
+| 実行中タスク中止 | あり | POST `/api/cancel_running_task` + ⏹ボタン | ✅ |
 
 ### 3.2 タグ編集モーダル
 
@@ -470,6 +472,8 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/cancel_running_task` | POST | ✅ (特定タスク取消) |
 | `/api/get_pending_tasks` | GET | ✅ (待機タスク詳細) |
 | `/api/remove_pending_task` | POST | ✅ (タスク個別削除) |
+| `/api/reorder_pending_tasks` | POST | ✅ (タスク並替) |
+| `/api/get_queue_size` | GET | ✅ (キューサイズ取得) |
 
 ### 6.6 設定
 
@@ -512,7 +516,6 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/backup_bookmark` | 栞バックアップ |
 | `/api/eject` | 端末取出し |
 | `/api/validate_url_regexp_list` | URL正規表現一覧 |
-| `/api/reorder_pending_tasks` | タスク並替 |
 
 ---
 
@@ -599,7 +602,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 **モーダル**: 8/8 ✅ (タグ編集, About, 差分, 確認, メモ帳, ダウンロード, キュー, 列可視性)
 **キーボードショートカット**: 12/12 ✅
 **テーマ**: 6/6 ✅ (全ページCSS変数化、hardcoded色・px値なし)
-**API**: 54 実装済み / 5 未実装 (eject, version/latest, backup_bookmark, validate_url, reorder)
+**API**: 57 実装済み / 4 未実装 (eject, version/latest, backup_bookmark, validate_url)
 **WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, 進捗バー ✅, DB自動更新+table.reload ✅, モーダル/メモ帳同期 ❌
 **設定ページ**: ✅
 **言語切替**: ✅ (Rust独自)

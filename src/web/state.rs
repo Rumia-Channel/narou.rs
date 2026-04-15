@@ -131,3 +131,24 @@ pub struct TaskIdBody {
 pub struct ReorderBody {
     pub task_ids: Vec<String>,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateByTagBody {
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub exclusion_tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TagInfoBody {
+    pub ids: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub with_exclusion: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConfirmRunningTasksBody {
+    #[serde(default)]
+    pub rerun: Option<String>,
+}

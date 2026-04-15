@@ -1,7 +1,7 @@
 use axum::{extract::State, http::StatusCode, response::Json};
 
-use crate::compat::set_frozen_state;
-use crate::db::with_database_mut;
+use crate::compat::{load_frozen_ids_from_inventory, set_frozen_state};
+use crate::db::{with_database, with_database_mut};
 use crate::error::NarouError;
 
 use super::AppState;
@@ -147,4 +147,28 @@ pub async fn batch_remove_with_file(
         with_file: Some(true),
     };
     batch_remove(State(state), Json(body)).await
+}
+
+pub async fn batch_freeze_toggle(
+    State(state): State<AppState>,
+    Json(body): Json<BatchIdsBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let frozen_ids = with_database(|db| load_frozen_ids_from_inventory(db.inventory()))
+        .unwrap_or_default();
+    let mut count = 0usize;
+    for id in &body.ids {
+        let is_frozen = frozen_ids.contains(id);
+        if set_frozen_state(*id, !is_frozen).is_ok() {
+            count += 1;
+        }
+    }
+
+    state
+        .push_server
+        .broadcast_event("table.reload", "");
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "凍結状態を切り替えました",
+        "count": count,
+    })))
 }

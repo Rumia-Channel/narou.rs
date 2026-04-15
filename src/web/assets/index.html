@@ -496,6 +496,31 @@
       </div>
     </div>
 
+    <!-- Update by Tag modal -->
+    <div class="modal-overlay hide" id="update-by-tag-modal">
+      <div class="modal-dialog">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="update-by-tag-close" type="button">&times;</button>
+            <h4 class="modal-title">タグを指定してアップデート</h4>
+          </div>
+          <div class="modal-body">
+            <div id="update-by-tag-field">
+              <p>更新したい小説のタグにチェックを入れて下さい。</p>
+              <div id="update-by-tag-include"></div>
+              <br>
+              <p>除外タグを指定して更新したいものがあればチェックを入れて下さい。</p>
+              <div id="update-by-tag-exclude"></div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn" id="update-by-tag-cancel">キャンセル</button>
+            <button class="btn btn-primary" id="update-by-tag-submit">更新する</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Notifications (fadeout alerts) -->
     <div id="notification-container" class="notification-container"></div>
 

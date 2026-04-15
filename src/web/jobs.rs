@@ -5,8 +5,8 @@ use crate::queue::{JobType, PersistentQueue};
 
 use super::AppState;
 use super::state::{
-    ApiResponse, ConvertBody, CsvImportBody, DiffBody, DiffCleanBody, DownloadBody, ReorderBody,
-    TargetsBody, TaskIdBody, UpdateBody,
+    ApiResponse, ConfirmRunningTasksBody, ConvertBody, CsvImportBody, DiffBody, DiffCleanBody,
+    DownloadBody, ReorderBody, TagInfoBody, TargetsBody, TaskIdBody, UpdateBody, UpdateByTagBody,
 };
 
 pub async fn api_download(
@@ -908,6 +908,255 @@ pub async fn get_queue_size(
         "convert": convert_count,
         "total": default_count + convert_count,
     }))
+}
+
+// POST /api/update_by_tag — update novels filtered by tags
+pub async fn api_update_by_tag(
+    State(state): State<AppState>,
+    Json(body): Json<UpdateByTagBody>,
+) -> Json<serde_json::Value> {
+    let mut tag_params: Vec<String> = body
+        .tags
+        .iter()
+        .map(|t| format!("tag:{}", t))
+        .collect();
+    tag_params.extend(
+        body.exclusion_tags
+            .iter()
+            .map(|t| format!("^tag:{}", t)),
+    );
+
+    if tag_params.is_empty() {
+        return serde_json::json!({
+            "success": false,
+            "message": "tags or exclusion_tags required",
+        })
+        .into();
+    }
+
+    // Resolve matching novel IDs from database
+    let ids = with_database(|db| {
+        let all = db.all_records();
+        let mut matching_ids: Vec<i64> = Vec::new();
+
+        for (&id, record) in all {
+            let record_tags: Vec<&str> = record.tags.iter().map(|s| s.as_str()).collect();
+            let mut include = false;
+            let mut exclude = false;
+
+            for tag in &body.tags {
+                if record_tags.contains(&tag.as_str()) {
+                    include = true;
+                }
+            }
+            for tag in &body.exclusion_tags {
+                if record_tags.contains(&tag.as_str()) {
+                    exclude = true;
+                }
+            }
+
+            // Include if matches any inclusion tag and no exclusion tag
+            if (body.tags.is_empty() || include) && !exclude {
+                matching_ids.push(id);
+            }
+        }
+        Ok(matching_ids)
+    })
+    .unwrap_or_default();
+
+    if ids.is_empty() {
+        return serde_json::json!({
+            "success": true,
+            "message": "対象の小説がありません",
+            "count": 0,
+        })
+        .into();
+    }
+
+    let queue = match open_queue() {
+        Ok(queue) => queue,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+                "count": 0,
+            })
+            .into();
+        }
+    };
+
+    let jobs: Vec<(JobType, String)> = ids
+        .iter()
+        .map(|id| (JobType::Update, id.to_string()))
+        .collect();
+    let job_ids = match queue.push_batch(&jobs) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return serde_json::json!({
+                "success": false,
+                "message": e.to_string(),
+                "count": 0,
+            })
+            .into();
+        }
+    };
+
+    state
+        .push_server
+        .broadcast_event("notification.queue", "");
+    serde_json::json!({
+        "success": true,
+        "count": job_ids.len(),
+    })
+    .into()
+}
+
+// POST /api/taginfo.json — return tag information for update-by-tag dialog
+pub async fn api_taginfo(
+    State(_state): State<AppState>,
+    Json(body): Json<TagInfoBody>,
+) -> Json<serde_json::Value> {
+    let with_exclusion = body.with_exclusion.unwrap_or(false);
+
+    let tag_info = with_database(|db| {
+        let tag_index = db.tag_index();
+        let tag_colors = {
+            let inv = db.inventory();
+            let colors: std::collections::HashMap<String, String> = inv
+                .load("tag_colors", crate::db::inventory::InventoryScope::Local)
+                .unwrap_or_default();
+            colors
+        };
+
+        let mut result: Vec<serde_json::Value> = Vec::new();
+        let mut sorted_tags: Vec<(&String, &Vec<i64>)> = tag_index.iter().collect();
+        sorted_tags.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+        for (tag, ids) in sorted_tags {
+            let color = tag_colors.get(tag).map(|c| c.as_str()).unwrap_or("");
+            let style = if color.is_empty() {
+                String::new()
+            } else {
+                format!(" style=\"background-color:{}\"", color)
+            };
+            let html = format!(
+                "<span class=\"tag-label\"{}>{}({})</span>",
+                style, tag, ids.len()
+            );
+            let mut entry = serde_json::json!({
+                "tag": tag,
+                "count": ids.len(),
+                "html": html,
+            });
+            if with_exclusion {
+                let exc_html = format!(
+                    "<span class=\"tag-label tag-exclusion\"{}>{}({})</span>",
+                    style, tag, ids.len()
+                );
+                entry["exclusion_html"] = serde_json::json!(exc_html);
+            }
+            result.push(entry);
+        }
+        Ok(result)
+    })
+    .unwrap_or_default();
+
+    Json(serde_json::json!(tag_info))
+}
+
+// POST /api/restore_pending_tasks
+pub async fn restore_pending_tasks(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    // In Rust, pending tasks are already persisted in queue.yaml and will be
+    // picked up by the worker. Just count and report.
+    let count = match open_queue() {
+        Ok(q) => q.get_pending_tasks().len(),
+        Err(_) => 0,
+    };
+    state
+        .push_server
+        .broadcast_event("notification.queue", "");
+    serde_json::json!({ "status": "ok", "count": count }).into()
+}
+
+// POST /api/defer_restore_pending_tasks
+pub async fn defer_restore_pending_tasks(
+    State(_state): State<AppState>,
+) -> Json<serde_json::Value> {
+    // Clear pending tasks (defer = discard them)
+    if let Ok(queue) = open_queue() {
+        let _ = queue.clear_pending();
+    }
+    serde_json::json!({ "status": "ok" }).into()
+}
+
+// POST /api/confirm_running_tasks
+pub async fn confirm_running_tasks(
+    State(state): State<AppState>,
+    Json(body): Json<ConfirmRunningTasksBody>,
+) -> Json<serde_json::Value> {
+    if body.rerun.as_deref() == Some("true") {
+        // Resume: keep pending tasks, report count
+        let count = match open_queue() {
+            Ok(q) => q.get_pending_tasks().len(),
+            Err(_) => 0,
+        };
+        state
+            .push_server
+            .broadcast_event("notification.queue", "");
+        serde_json::json!({ "status": "ok", "count": count }).into()
+    } else {
+        // Defer: clear pending tasks
+        if let Ok(queue) = open_queue() {
+            let _ = queue.clear_pending();
+        }
+        serde_json::json!({ "status": "ok" }).into()
+    }
+}
+
+// POST /api/update_general_lastup
+pub async fn api_update_general_lastup(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let option = body["option"].as_str().unwrap_or("all");
+    let mut args = vec!["update", "--gl"];
+    if option != "all" {
+        args.push(option);
+    }
+
+    let queue = match open_queue() {
+        Ok(queue) => queue,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+            })
+            .into();
+        }
+    };
+
+    let target = args[1..].join("\t");
+    match queue.push(JobType::Update, &target) {
+        Ok(id) => {
+            state
+                .push_server
+                .broadcast_event("notification.queue", "");
+            serde_json::json!({
+                "success": true,
+                "job_id": id,
+            })
+            .into()
+        }
+        Err(e) => {
+            serde_json::json!({
+                "success": false,
+                "message": e.to_string(),
+            })
+            .into()
+        }
+    }
 }
 
 // POST /api/shutdown

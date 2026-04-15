@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>個別メニューの編集 - Narou.rs</title>
+  <link rel="stylesheet" href="/assets/css/theme.css">
+  <link rel="stylesheet" href="/assets/css/base.css">
+  <style>
+    :root {
+      --edit-panel-height: 25em;
+    }
+    .container { max-width: 60em; margin: 0 auto; padding: 1em; }
+    h1 { font-size: 1.5em; margin-bottom: 0.5em; }
+    .instructions { color: var(--text-muted); font-size: 0.85em; margin-bottom: 1em; }
+    .instructions li { margin-bottom: 0.3em; }
+    .edit-row { display: flex; gap: 0.5em; align-items: stretch; margin-bottom: 1em; flex-wrap: wrap; }
+    .panel-label {
+      display: inline-block;
+      background: var(--tag-bg, #666);
+      color: var(--tag-color, #fff);
+      padding: 0.15em 0.5em;
+      border-radius: 0.2em;
+      font-size: 0.8em;
+      margin-bottom: 0.3em;
+    }
+    .item-list-col { flex: 2; min-width: 12em; }
+    .arrow-col {
+      flex: 0 0 3em;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .editor-col { flex: 2; min-width: 12em; }
+    .preview-col { flex: 1; min-width: 8em; }
+    #menu-items-table {
+      width: 100%;
+      border-collapse: collapse;
+      height: var(--edit-panel-height);
+      max-height: var(--edit-panel-height);
+      overflow-y: auto;
+      display: block;
+      cursor: pointer;
+      border: 0.0625em solid var(--table-border);
+    }
+    #menu-items-table tr {
+      display: block;
+      width: 100%;
+      border-bottom: 0.0625em solid var(--table-border);
+    }
+    #menu-items-table tr:hover { background: var(--table-hover-bg); }
+    #menu-items-table tr.active { background: var(--btn-primary-bg, #337ab7); color: var(--btn-primary-color, #fff); }
+    #menu-items-table td {
+      padding: 0.4em 0.6em;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .command-label {
+      background: var(--bg-secondary, #f5f5f5);
+      color: var(--text-muted);
+      padding: 0.1em 0.4em;
+      border-radius: 0.2em;
+      font-size: 0.75em;
+    }
+    #menu-items-table tr.active .command-label {
+      background: rgba(255,255,255,0.2);
+      color: inherit;
+    }
+    #input-box {
+      width: 100%;
+      height: var(--edit-panel-height);
+      resize: vertical;
+      font-family: monospace;
+      font-size: 0.9em;
+      padding: 0.4em;
+      background: var(--input-bg);
+      color: var(--input-color);
+      border: 0.0625em solid var(--input-border);
+      border-radius: 0.2em;
+    }
+    .arrow-btn {
+      background: var(--btn-bg);
+      color: var(--btn-color);
+      border: 0.0625em solid var(--btn-border);
+      border-radius: 0.2em;
+      padding: 0.4em 0.8em;
+      cursor: pointer;
+      font-size: 1.2em;
+    }
+    .arrow-btn:hover { background: var(--btn-hover-bg); }
+    .btn-row { display: flex; gap: 0.5em; justify-content: center; margin-bottom: 1em; flex-wrap: wrap; }
+    .btn {
+      padding: 0.4em 1em;
+      border: 0.0625em solid var(--btn-border);
+      border-radius: 0.2em;
+      cursor: pointer;
+      font-size: 0.9em;
+      background: var(--btn-bg);
+      color: var(--btn-color);
+    }
+    .btn:hover { background: var(--btn-hover-bg); }
+    .btn-primary { background: var(--btn-primary-bg, #337ab7); color: var(--btn-primary-color, #fff); border-color: var(--btn-primary-border, #2e6da4); }
+    .btn-primary:hover { opacity: 0.9; }
+    #preview-area {
+      border: 0.0625em solid var(--table-border);
+      border-radius: 0.2em;
+      padding: 0.3em 0;
+      background: var(--dropdown-bg, #fff);
+      min-height: 10em;
+    }
+    #preview-area .menu-item {
+      padding: 0.3em 1em;
+      cursor: pointer;
+      color: var(--dropdown-color, #333);
+      font-size: 0.9em;
+    }
+    #preview-area .menu-item:hover { background: var(--dropdown-hover-bg, #f5f5f5); }
+    #preview-area .menu-divider {
+      height: 0;
+      margin: 0.3em 0;
+      border-top: 0.0625em solid var(--table-border);
+    }
+    .flash-message {
+      position: fixed;
+      top: 1em;
+      right: 1em;
+      background: var(--btn-primary-bg, #5cb85c);
+      color: #fff;
+      padding: 0.5em 1em;
+      border-radius: 0.3em;
+      opacity: 0;
+      transition: opacity 0.3s;
+      z-index: 1000;
+    }
+    .flash-message.show { opacity: 1; }
+    .notepad-section { margin-top: 1em; }
+    #notepad-area {
+      width: 100%;
+      height: 10em;
+      resize: vertical;
+      font-family: monospace;
+      font-size: 0.9em;
+      padding: 0.4em;
+      background: var(--input-bg);
+      color: var(--input-color);
+      border: 0.0625em solid var(--input-border);
+      border-radius: 0.2em;
+    }
+    .notepad-hint { color: var(--text-muted); font-size: 0.8em; display: inline-block; margin-left: 0.5em; }
+  </style>
+</head>
+<body>
+  <div class="flash-message" id="flash-msg"></div>
+  <div class="container">
+    <h1>個別メニューの編集</h1>
+    <ul class="instructions">
+      <li>編集内容はブラウザに保存されます。他のPCのブラウザでも同じ内容にしたい場合は下部にあるメモ帳を使ってコピペして下さい。</li>
+      <li>書式は「ラベル&lt;&gt;コマンド」になっています。空行や不正な書式の場合は無視されます。また、ラベル部分は自由に設定出来ます。</li>
+    </ul>
+    <div class="edit-row">
+      <div class="item-list-col">
+        <span class="panel-label">項目一覧</span>
+        <table id="menu-items-table"><tbody></tbody></table>
+      </div>
+      <div class="arrow-col">
+        <button class="arrow-btn" id="btn-move" title="選択した項目を編集欄に追加">→</button>
+      </div>
+      <div class="editor-col">
+        <span class="panel-label">編集欄</span>
+        <textarea id="input-box"></textarea>
+      </div>
+      <div class="preview-col">
+        <span class="panel-label">プレビュー</span>
+        <div id="preview-area"></div>
+      </div>
+    </div>
+    <div class="btn-row">
+      <div style="flex:2;text-align:center">
+        <button class="btn" id="btn-clear-active">選択を解除</button>
+      </div>
+      <div style="flex:0 0 3em"></div>
+      <div style="flex:2;text-align:center">
+        <button class="btn btn-primary" id="btn-save">保存</button>
+        <button class="btn" id="btn-clear">消去</button>
+        <button class="btn" id="btn-reset">デフォに戻す</button>
+      </div>
+      <div style="flex:1"></div>
+    </div>
+    <div class="notepad-section">
+      <span class="panel-label">メモ帳</span>
+      <span class="notepad-hint">※自動でサーバに保存されます</span>
+      <textarea id="notepad-area"></textarea>
+    </div>
+  </div>
+  <script>
+  (function() {
+    var STORAGE_KEY = 'context_menu_text';
+
+    var ALL_ITEMS = [
+      { label: '――――――――(区切り)', command: 'divider' },
+      { label: '小説の変換設定', command: 'setting' },
+      { label: '差分を表示', command: 'diff' },
+      { label: 'タグを編集', command: 'edit_tag' },
+      { label: '凍結 or 解凍', command: 'freeze_toggle' },
+      { label: '更新', command: 'update' },
+      { label: '凍結済みでも更新', command: 'update_force' },
+      { label: '送信', command: 'send' },
+      { label: '削除', command: 'remove' },
+      { label: '変換', command: 'convert' },
+      { label: '調査状況ログを表示', command: 'inspect' },
+      { label: '保存フォルダを開く', command: 'folder' },
+      { label: 'バックアップを作成', command: 'backup' },
+      { label: '再ダウンロード', command: 'download_force' },
+      { label: 'メールで送信', command: 'mail' },
+      { label: '作者コメント表示', command: 'author_comments' }
+    ];
+
+    var DEFAULT_COMMANDS = [
+      'setting', 'diff', 'edit_tag', 'freeze_toggle', 'update',
+      'send', 'remove', 'convert', 'inspect', 'folder', 'backup',
+      'mail', 'author_comments'
+    ];
+
+    function createDefaultMenuText() {
+      var lines = [];
+      DEFAULT_COMMANDS.forEach(function(cmd) {
+        var item = ALL_ITEMS.find(function(i) { return i.command === cmd; });
+        if (item) lines.push(item.label + '<>' + cmd);
+      });
+      return lines.join('\n');
+    }
+
+    function loadMenuText() {
+      return localStorage.getItem(STORAGE_KEY) || createDefaultMenuText();
+    }
+
+    function saveMenuText(text) {
+      localStorage.setItem(STORAGE_KEY, text.trim());
+    }
+
+    // Build item list table
+    var tbody = document.querySelector('#menu-items-table tbody');
+    ALL_ITEMS.forEach(function(item) {
+      var tr = document.createElement('tr');
+      tr.dataset.menuLabel = item.label;
+      tr.dataset.menuCommand = item.command;
+      var td = document.createElement('td');
+      td.innerHTML = item.label + ' <span class="command-label">' + item.command + '</span>';
+      tr.appendChild(td);
+      tr.addEventListener('click', function() { tr.classList.toggle('active'); });
+      tbody.appendChild(tr);
+    });
+
+    var inputBox = document.getElementById('input-box');
+    var previewArea = document.getElementById('preview-area');
+
+    inputBox.value = loadMenuText();
+
+    function refreshPreview() {
+      previewArea.innerHTML = '';
+      var lines = inputBox.value.split('\n');
+      lines.forEach(function(line) {
+        var parts = line.split('<>');
+        var label = parts[0], command = parts[1];
+        if (!command) return;
+        if (command.trim() === 'divider') {
+          var div = document.createElement('div');
+          div.className = 'menu-divider';
+          previewArea.appendChild(div);
+        } else {
+          var el = document.createElement('div');
+          el.className = 'menu-item';
+          el.textContent = label;
+          previewArea.appendChild(el);
+        }
+      });
+    }
+
+    refreshPreview();
+
+    // Debounced preview update on edit
+    var timer = null;
+    inputBox.addEventListener('input', function() {
+      clearTimeout(timer);
+      timer = setTimeout(refreshPreview, 300);
+    });
+
+    // Move selected items to editor
+    document.getElementById('btn-move').addEventListener('click', function() {
+      var rows = document.querySelectorAll('#menu-items-table tr.active');
+      rows.forEach(function(row) {
+        var label = row.dataset.menuLabel;
+        var command = row.dataset.menuCommand;
+        var line = label + '<>' + command;
+        var val = inputBox.value.trim();
+        inputBox.value = val ? val + '\n' + line : line;
+        row.classList.remove('active');
+      });
+      refreshPreview();
+    });
+
+    document.getElementById('btn-clear-active').addEventListener('click', function() {
+      document.querySelectorAll('#menu-items-table tr.active').forEach(function(r) {
+        r.classList.remove('active');
+      });
+    });
+
+    document.getElementById('btn-save').addEventListener('click', function() {
+      saveMenuText(inputBox.value);
+      refreshPreview();
+      showFlash('保存が完了しました');
+    });
+
+    document.getElementById('btn-clear').addEventListener('click', function() {
+      inputBox.value = '';
+      refreshPreview();
+    });
+
+    document.getElementById('btn-reset').addEventListener('click', function() {
+      inputBox.value = createDefaultMenuText();
+      refreshPreview();
+    });
+
+    function showFlash(msg) {
+      var el = document.getElementById('flash-msg');
+      el.textContent = msg;
+      el.classList.add('show');
+      setTimeout(function() { el.classList.remove('show'); }, 2000);
+    }
+
+    // Notepad — auto-save to server
+    var notepadArea = document.getElementById('notepad-area');
+    fetch('/api/notepad/read').then(function(r) { return r.json(); }).then(function(data) {
+      notepadArea.value = data.content || '';
+    });
+    var notepadTimer = null;
+    notepadArea.addEventListener('input', function() {
+      clearTimeout(notepadTimer);
+      notepadTimer = setTimeout(function() {
+        fetch('/api/notepad/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: notepadArea.value })
+        });
+      }, 1000);
+    });
+  })();
+  </script>
+</body>
+</html>

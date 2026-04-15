@@ -36,6 +36,10 @@ pub async fn dnd_window_page() -> Html<&'static str> {
     Html(include_str!("assets/dnd_window.html"))
 }
 
+pub async fn edit_menu_page() -> Html<&'static str> {
+    Html(include_str!("assets/edit_menu.html"))
+}
+
 pub async fn asset(Path(path): Path<String>) -> Response {
     let (content_type, body) = match path.as_str() {
         "css/theme.css" => ("text/css; charset=utf-8", include_str!("assets/css/theme.css")),

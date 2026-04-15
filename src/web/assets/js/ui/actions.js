@@ -348,9 +348,55 @@ export function bindActions() {
     postJson('/api/update', { targets: ['--gl'] });
   });
 
-  on('action-update-by-tag', () => {
-    const tag = prompt('更新するタグ名を入力:');
-    if (tag) postJson('/api/update', { targets: ['--tag', tag] });
+  on('action-update-by-tag', async () => {
+    try {
+      const taginfo = await postJson('/api/taginfo.json', { ids: [0], with_exclusion: true });
+      if (!Array.isArray(taginfo) || taginfo.length === 0) {
+        showNotification('タグが登録されていません', 'warning');
+        return;
+      }
+      const includeDiv = document.getElementById('update-by-tag-include');
+      const excludeDiv = document.getElementById('update-by-tag-exclude');
+      includeDiv.innerHTML = '';
+      excludeDiv.innerHTML = '';
+      taginfo.forEach(info => {
+        const lbl = document.createElement('label');
+        lbl.style.cssText = 'display:inline-block;margin:0.2em 0.5em;cursor:pointer';
+        lbl.innerHTML = '<input type="checkbox" data-tagname="' +
+          info.tag.replace(/"/g, '&quot;') + '"> ' + info.html + '&nbsp;&nbsp;';
+        includeDiv.appendChild(lbl);
+      });
+      taginfo.forEach(info => {
+        const lbl = document.createElement('label');
+        lbl.style.cssText = 'display:inline-block;margin:0.2em 0.5em;cursor:pointer';
+        lbl.innerHTML = '<input type="checkbox" data-exclusion-tagname="' +
+          info.tag.replace(/"/g, '&quot;') + '"> ' +
+          (info.exclusion_html || info.html) + '&nbsp;&nbsp;';
+        excludeDiv.appendChild(lbl);
+      });
+      document.getElementById('update-by-tag-modal').classList.remove('hide');
+    } catch (e) {
+      showNotification('タグ情報の取得に失敗しました', 'error');
+    }
+  });
+
+  on('update-by-tag-close', () => document.getElementById('update-by-tag-modal')?.classList.add('hide'));
+  on('update-by-tag-cancel', () => document.getElementById('update-by-tag-modal')?.classList.add('hide'));
+  on('update-by-tag-submit', () => {
+    const tags = [];
+    const exclusion_tags = [];
+    document.querySelectorAll('#update-by-tag-include input[data-tagname]:checked').forEach(cb => {
+      tags.push(cb.dataset.tagname);
+    });
+    document.querySelectorAll('#update-by-tag-exclude input[data-exclusion-tagname]:checked').forEach(cb => {
+      exclusion_tags.push(cb.dataset.exclusionTagname);
+    });
+    if (tags.length === 0 && exclusion_tags.length === 0) {
+      showNotification('タグを選択してください', 'warning');
+      return;
+    }
+    postJson('/api/update_by_tag', { tags, exclusion_tags });
+    document.getElementById('update-by-tag-modal')?.classList.add('hide');
   });
 
   on('action-update-view', () => {
@@ -420,6 +466,10 @@ export function bindActions() {
   on('action-other-mail', () => {
     if (State.selectedIds.size === 0) return;
     postJson('/api/mail', { targets: [...State.selectedIds] });
+  });
+
+  on('action-view-link-to-edit-menu', () => {
+    window.open('/edit_menu', '_blank');
   });
 
   // --- Table header sort ---
