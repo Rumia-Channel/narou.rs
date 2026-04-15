@@ -117,6 +117,18 @@ function handleWsMessage(msg) {
     case 'echo':
       appendConsole(msg.body || '');
       break;
+    case 'queue_start':
+      refreshQueue();
+      break;
+    case 'queue_complete':
+      refreshQueue();
+      break;
+    case 'queue_failed':
+      refreshQueue();
+      break;
+    case 'error':
+      appendConsole('[エラー] ' + (msg.data || msg.message || ''));
+      break;
     case 'progressbar.init':
       initProgressBar(msg.data?.topic);
       break;
@@ -127,7 +139,7 @@ function handleWsMessage(msg) {
       removeProgressBar(msg.data?.topic);
       break;
     default:
-      appendConsole(msg.text || msg.message || JSON.stringify(msg));
+      console.debug('Unknown WS event:', msg);
       break;
   }
 }

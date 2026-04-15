@@ -1,3 +1,4 @@
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -5,6 +6,7 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
+use crate::db::with_database_mut;
 use crate::queue::{JobType, QueueJob};
 
 use super::jobs::open_queue;
@@ -32,27 +34,50 @@ pub fn start_queue_worker(
             };
 
             *running_job.lock() = Some(job.clone());
-            push_server.broadcast("queue_start", &job.id);
+            push_server.broadcast_event("queue_start", &job.id);
+            push_server.broadcast_echo(
+                &format!("--- ジョブ開始: {:?} {} ---", job.job_type, job.target),
+                "stdout",
+            );
+
             let root_dir = root_dir.clone();
             let job_for_run = job.clone();
-            let success = tokio::task::spawn_blocking(move || execute_job(&root_dir, &job_for_run))
+            let ps = Arc::clone(&push_server);
+            let success = tokio::task::spawn_blocking(move || execute_job(&root_dir, &job_for_run, &ps))
                 .await
                 .unwrap_or(false);
+
+            // Refresh in-memory database from disk (subprocess may have modified it)
+            if let Err(e) = with_database_mut(|db| db.refresh()) {
+                push_server.broadcast_error(&format!("DB更新エラー: {}", e));
+            }
 
             *running_job.lock() = None;
             if success {
                 let _ = queue.complete(&job.id);
-                push_server.broadcast("queue_complete", &job.id);
+                push_server.broadcast_echo(
+                    &format!("--- ジョブ完了: {:?} {} ---", job.job_type, job.target),
+                    "stdout",
+                );
+                push_server.broadcast_event("queue_complete", &job.id);
             } else {
                 let _ = queue.fail(&job.id);
-                push_server.broadcast("queue_failed", &job.id);
+                push_server.broadcast_echo(
+                    &format!("--- ジョブ失敗: {:?} {} ---", job.job_type, job.target),
+                    "stdout",
+                );
+                push_server.broadcast_event("queue_failed", &job.id);
             }
+            // Trigger frontend table reload after DB refresh
+            push_server.broadcast_event("table.reload", "");
+            push_server.broadcast_event("notification.queue", "");
         }
     })
 }
 
-fn execute_job(root_dir: &Path, job: &QueueJob) -> bool {
+fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>) -> bool {
     let Ok(exe) = std::env::current_exe() else {
+        push_server.broadcast_echo("エラー: 実行ファイルパスを取得できません", "stdout");
         return false;
     };
 
@@ -60,8 +85,8 @@ fn execute_job(root_dir: &Path, job: &QueueJob) -> bool {
     command
         .current_dir(root_dir)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     match job.job_type {
         JobType::Download => {
@@ -105,10 +130,48 @@ fn execute_job(root_dir: &Path, job: &QueueJob) -> bool {
         }
     }
 
-    command
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            push_server.broadcast_echo(&format!("プロセス起動失敗: {}", e), "stdout");
+            return false;
+        }
+    };
+
+    // Stream stdout in a separate thread
+    let stdout = child.stdout.take();
+    let ps_out = Arc::clone(push_server);
+    let stdout_thread = std::thread::spawn(move || {
+        if let Some(out) = stdout {
+            let reader = std::io::BufReader::new(out);
+            for line in reader.lines() {
+                match line {
+                    Ok(text) => ps_out.broadcast_echo(&text, "stdout"),
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    // Stream stderr in a separate thread
+    let stderr = child.stderr.take();
+    let ps_err = Arc::clone(push_server);
+    let stderr_thread = std::thread::spawn(move || {
+        if let Some(err) = stderr {
+            let reader = std::io::BufReader::new(err);
+            for line in reader.lines() {
+                match line {
+                    Ok(text) => ps_err.broadcast_echo(&text, "stdout"),
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    let status = child.wait().map(|s| s.success()).unwrap_or(false);
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
+    status
 }
 
 fn parse_convert_job_target(value: &str) -> (&str, Option<&str>) {

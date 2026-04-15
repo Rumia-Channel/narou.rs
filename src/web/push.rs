@@ -21,7 +21,7 @@ pub struct BroadcastChannel {
 
 impl BroadcastChannel {
     pub fn new() -> Self {
-        let (sender, _) = broadcast::channel(256);
+        let (sender, _) = broadcast::channel(4096);
         Self { sender }
     }
 
@@ -70,6 +70,27 @@ impl PushServer {
         let msg_str = message.to_string();
         self.append_history(data);
         self.channel.send(&msg_str);
+    }
+
+    /// Send a control event (table.reload, queue_start, etc.) without polluting console history.
+    pub fn broadcast_event(&self, event_type: &str, data: &str) {
+        let message = serde_json::json!({
+            "type": event_type,
+            "data": data,
+        });
+        self.channel.send(&message.to_string());
+    }
+
+    /// Send an echo event to stream subprocess output to the browser console.
+    /// Matches Ruby's `{echo: {target_console: "stdout", body: "...", no_history: false}}`.
+    pub fn broadcast_echo(&self, body: &str, target_console: &str) {
+        let payload = serde_json::json!({
+            "type": "echo",
+            "body": body,
+            "target_console": target_console,
+        });
+        self.append_history(body);
+        self.channel.send(&payload.to_string());
     }
 
     pub fn broadcast_progress(&self, current: usize, total: usize, message: &str) {
@@ -201,9 +222,18 @@ async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>) {
     let client_id = push_server.register_client(push_server.channel().sender.clone());
 
     let result = tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            if sender.send(Message::Text(msg.into())).await.is_err() {
-                break;
+        loop {
+            match rx.recv().await {
+                Ok(msg) => {
+                    if sender.send(Message::Text(msg.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!("WebSocket client lagged, skipped {} messages", n);
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     })
