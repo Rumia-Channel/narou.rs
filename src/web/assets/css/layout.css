@@ -160,6 +160,10 @@
   max-height: 80vh;
 }
 
+.console-line {
+  min-height: 1.2em;
+}
+
 .console-buttons {
   position: absolute;
   top: 0.3em;

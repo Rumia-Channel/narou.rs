@@ -52,11 +52,14 @@ function getFilteredNovels() {
   // Text/tag filter
   if (State.filterText) {
     const q = State.filterText.toLowerCase();
-    // Support tag: prefix for tag-only filtering
+    // Support tag: prefix for tag-only filtering (supports OR with |)
     if (q.startsWith('tag:')) {
       const tagQ = q.slice(4);
+      const tagParts = tagQ.split('|').map(t => t.trim()).filter(Boolean);
       list = list.filter(n =>
-        (n.tags || []).some(t => t.toLowerCase().includes(tagQ))
+        tagParts.some(tp =>
+          (n.tags || []).some(t => t.toLowerCase().includes(tp))
+        )
       );
     } else {
       list = list.filter(n => {

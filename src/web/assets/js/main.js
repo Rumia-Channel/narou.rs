@@ -173,20 +173,41 @@ function removeProgressBar(topic) {
   delete progressBars[key];
 }
 
+var lastLineComplete = true;
+
 function appendConsole(text) {
   const con = El.console;
   if (!con) return;
 
-  const maxLines = State.performanceMode ? 200 : 1000;
-  con.textContent += text + '\n';
-
-  // Trim old lines
-  const lines = con.textContent.split('\n');
-  if (lines.length > maxLines) {
-    con.textContent = lines.slice(-maxLines).join('\n');
+  // Ensure text ends with newline (worker strips \n from BufReader::lines())
+  if (text.length > 0 && !text.endsWith('\n')) {
+    text += '\n';
   }
 
-  con.scrollTop = con.scrollHeight;
+  const maxLines = State.performanceMode ? 200 : 1000;
+  const wasBottom = (con.scrollTop + con.clientHeight >= con.scrollHeight - 4);
+
+  const lines = text.split('\n');
+  // Remove trailing empty element from split (text ends with \n)
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+
+  for (var i = 0; i < lines.length; i++) {
+    var div = document.createElement('div');
+    div.className = 'console-line';
+    div.textContent = lines[i];
+    con.appendChild(div);
+  }
+
+  // Trim old lines (only console-line elements, preserve progress bars)
+  var lineEls = con.querySelectorAll('.console-line');
+  if (lineEls.length > maxLines) {
+    var toRemove = lineEls.length - maxLines;
+    for (var j = 0; j < toRemove; j++) {
+      lineEls[j].remove();
+    }
+  }
+
+  if (wasBottom) con.scrollTop = con.scrollHeight;
 }
 
 document.addEventListener('DOMContentLoaded', init);

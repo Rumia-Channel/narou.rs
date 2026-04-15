@@ -21,7 +21,10 @@ export function bindActions() {
 
   // --- Console buttons ---
   El.consoleTrash?.addEventListener('click', async () => {
-    if (El.console) El.console.textContent = '';
+    if (El.console) {
+      var lines = El.console.querySelectorAll('.console-line');
+      lines.forEach(function(el) { el.remove(); });
+    }
     State.consoleHistory = [];
     try { await postJson('/api/clear_history', {}); } catch { /* ignore */ }
   });
@@ -44,7 +47,15 @@ export function bindActions() {
     try {
       const data = await fetchJson('/api/history');
       if (data?.history !== undefined && El.console) {
-        El.console.textContent = data.history;
+        var lines = El.console.querySelectorAll('.console-line');
+        lines.forEach(function(el) { el.remove(); });
+        var histLines = data.history.split('\n');
+        histLines.forEach(function(line) {
+          var div = document.createElement('div');
+          div.className = 'console-line';
+          div.textContent = line;
+          El.console.appendChild(div);
+        });
         El.console.scrollTop = El.console.scrollHeight;
       }
     } catch { /* ignore */ }
