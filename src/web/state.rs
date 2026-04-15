@@ -119,3 +119,8 @@ fn default_diff_number() -> String {
 pub struct DiffCleanBody {
     pub target: serde_json::Value,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct TaskIdBody {
+    pub task_id: String,
+}

@@ -196,6 +196,23 @@ impl PersistentQueue {
         self.state.lock().clone()
     }
 
+    pub fn get_pending_tasks(&self) -> Vec<QueueJob> {
+        self.state.lock().jobs.iter().cloned().collect()
+    }
+
+    pub fn remove_pending(&self, task_id: &str) -> Result<bool> {
+        let removed = {
+            let mut state = self.state.lock();
+            let before = state.jobs.len();
+            state.jobs.retain(|j| j.id != task_id);
+            state.jobs.len() < before
+        };
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
     pub fn clear(&self) -> Result<()> {
         {
             let mut state = self.state.lock();

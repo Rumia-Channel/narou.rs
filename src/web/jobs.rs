@@ -6,7 +6,7 @@ use crate::queue::{JobType, PersistentQueue};
 use super::AppState;
 use super::state::{
     ApiResponse, ConvertBody, CsvImportBody, DiffBody, DiffCleanBody, DownloadBody, TargetsBody,
-    UpdateBody,
+    TaskIdBody, UpdateBody,
 };
 
 pub async fn api_download(
@@ -726,6 +726,76 @@ pub async fn queue_cancel(
         success: true,
         message: "Cancel requested".to_string(),
     })
+}
+
+// GET /api/get_pending_tasks
+pub async fn get_pending_tasks(
+    State(_state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let queue = match open_queue() {
+        Ok(q) => q,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "pending": [],
+                "running": [],
+                "pending_count": 0,
+                "running_count": 0,
+                "error": e,
+            }));
+        }
+    };
+
+    let pending = queue.get_pending_tasks();
+    let pending_count = pending.len();
+    let pending_json: Vec<serde_json::Value> = pending
+        .iter()
+        .map(|j| {
+            serde_json::json!({
+                "id": j.id,
+                "type": j.job_type,
+                "target": j.target,
+                "created_at": j.created_at,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "pending": pending_json,
+        "running": [],
+        "pending_count": pending_count,
+        "running_count": 0,
+    }))
+}
+
+// POST /api/remove_pending_task
+pub async fn remove_pending_task(
+    State(_state): State<AppState>,
+    Json(body): Json<TaskIdBody>,
+) -> Json<ApiResponse> {
+    let queue = match open_queue() {
+        Ok(q) => q,
+        Err(e) => {
+            return Json(ApiResponse {
+                success: false,
+                message: e,
+            });
+        }
+    };
+
+    match queue.remove_pending(&body.task_id) {
+        Ok(true) => Json(ApiResponse {
+            success: true,
+            message: "Task removed".to_string(),
+        }),
+        Ok(false) => Json(ApiResponse {
+            success: false,
+            message: "キューから削除できませんでした".to_string(),
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            message: e.to_string(),
+        }),
+    }
 }
 
 // POST /api/shutdown

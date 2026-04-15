@@ -66,6 +66,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/queue/status", get(jobs::queue_status))
         .route("/api/queue/clear", post(jobs::queue_clear))
         .route("/api/queue/cancel", post(jobs::queue_cancel))
+        .route("/api/get_pending_tasks", get(jobs::get_pending_tasks))
+        .route("/api/remove_pending_task", post(jobs::remove_pending_task))
         .route("/api/log/recent", get(misc::recent_logs))
         .route("/api/history", get(misc::console_history))
         .route("/api/clear_history", post(misc::clear_history))
