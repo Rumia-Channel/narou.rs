@@ -187,7 +187,10 @@ pub fn cmd_convert(
                                     &epub_path,
                                     dc_subjects.as_deref(),
                                 );
-                                println!("  Output: {}", epub_path.display());
+                                if let Some(fname) = epub_path.file_name().and_then(|n| n.to_str()) {
+                                    println!("{} を出力しました", fname);
+                                }
+                                println!("{}", bold_colored("EPUBファイルを出力しました", "green"));
                             }
                             Ok(None) => {}
                             Err(err) => {
@@ -195,7 +198,15 @@ pub fn cmd_convert(
                             }
                         }
                     }
-                    println!("  Output: {}", output_path);
+                    let output_lower = output_path.to_ascii_lowercase();
+                    if let Some(fname) = Path::new(&output_path).file_name().and_then(|n| n.to_str()) {
+                        println!("{} を出力しました", fname);
+                    }
+                    if output_lower.ends_with(".mobi") || output_lower.ends_with(".azw3") {
+                        println!("{}", bold_colored("MOBIファイルを出力しました", "green"));
+                    } else if output_lower.ends_with(".epub") || output_lower.ends_with(".kepub.epub") {
+                        println!("{}", bold_colored("EPUBファイルを出力しました", "green"));
+                    }
                     if first_output_dir.is_none() {
                         first_output_dir = std::path::Path::new(&output_path)
                             .parent()
@@ -318,7 +329,10 @@ fn convert_text_target(
                     verbose,
                 ) {
                     Ok(Some(epub_path)) => {
-                        println!("  Output: {}", epub_path.display());
+                        if let Some(fname) = epub_path.file_name().and_then(|n| n.to_str()) {
+                            println!("{} を出力しました", fname);
+                        }
+                        println!("{}", bold_colored("EPUBファイルを出力しました", "green"));
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -326,7 +340,15 @@ fn convert_text_target(
                     }
                 }
             }
-            println!("  Output: {}", output_path);
+            let output_lower = output_path.to_ascii_lowercase();
+            if let Some(fname) = Path::new(&output_path).file_name().and_then(|n| n.to_str()) {
+                println!("{} を出力しました", fname);
+            }
+            if output_lower.ends_with(".mobi") || output_lower.ends_with(".azw3") {
+                println!("{}", bold_colored("MOBIファイルを出力しました", "green"));
+            } else if output_lower.ends_with(".epub") || output_lower.ends_with(".kepub.epub") {
+                println!("{}", bold_colored("EPUBファイルを出力しました", "green"));
+            }
             if first_output_dir.is_none() {
                 *first_output_dir = Path::new(&output_path)
                     .parent()

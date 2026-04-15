@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crate::termcolor::bold_colored;
 use super::settings::NovelSettings;
 
 pub const INSPECT_LOG_NAME: &str = "調査ログ.txt";
@@ -93,12 +94,20 @@ impl Inspector {
         let errors_and_warnings = self
             .render_filtered(|level| matches!(level, MessageLevel::Error | MessageLevel::Warning));
         if !errors_and_warnings.is_empty() {
-            sections.push(format!("※警告・エラー\n{}", errors_and_warnings));
+            sections.push(format!(
+                "{}\n\n{}\n",
+                bold_colored("―――― 小説にエラーもしくは警告が存在します ――――", "yellow"),
+                errors_and_warnings
+            ));
         }
 
         let info = self.render_filtered(|level| level == MessageLevel::Info);
         if !info.is_empty() {
-            sections.push(format!("※情報\n{}", info));
+            sections.push(format!(
+                "{}\n\n{}\n",
+                bold_colored("―――― 小説の検査状況を表示します ――――", "yellow"),
+                info
+            ));
         }
 
         if sections.is_empty() {

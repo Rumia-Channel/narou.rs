@@ -24,7 +24,7 @@ use narou_rs::mail::{
     MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
 };
 use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
-use narou_rs::termcolor::colored;
+use narou_rs::termcolor::{bold_colored, colored};
 
 const MODIFIED_TAG: &str = "modified";
 const INTERVAL_MIN_SECS: f64 = 2.5;
@@ -334,7 +334,7 @@ fn resolve_targets(
                     resolved.push(id);
                 }
             } else {
-                eprintln!("[ERROR] {} は管理小説の中に存在しません", target);
+                eprintln!("{} {} は管理小説の中に存在しません", bold_colored("[ERROR]", "red"), target);
                 unresolved_count += 1;
             }
         }
