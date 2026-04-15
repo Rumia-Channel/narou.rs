@@ -431,6 +431,12 @@ export function bindActions() {
       th.classList.add('active-sort');
       if (State.sortAsc) th.classList.add('sort-asc');
       renderNovelList();
+
+      // Persist sort state to server
+      const reverseColMap = { id: 0, last_update: 1, general_lastup: 2, last_check_date: 3,
+        title: 4, author: 5, sitename: 6, novel_type: 7, general_all_no: 9, length: 10 };
+      const colIdx = reverseColMap[State.sortCol] ?? 2;
+      postJson('/api/sort_state', { column: colIdx, dir: State.sortAsc ? 'asc' : 'desc' }).catch(() => {});
     });
   });
 

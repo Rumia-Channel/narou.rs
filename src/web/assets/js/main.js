@@ -36,6 +36,18 @@ async function init() {
     document.body.classList.add('performance-mode');
   }
 
+  // Load sort state from server
+  try {
+    const sortState = await fetchJson('/api/sort_state');
+    if (sortState) {
+      const colMap = { 0: 'id', 1: 'last_update', 2: 'general_lastup', 3: 'last_check_date',
+        4: 'title', 5: 'author', 6: 'sitename', 7: 'novel_type', 9: 'general_all_no', 10: 'length' };
+      const col = colMap[sortState.column] || 'last_update';
+      State.sortCol = col;
+      State.sortAsc = sortState.dir === 'asc';
+    }
+  } catch { /* use defaults */ }
+
   // Initial data load
   await Promise.all([refreshList(), refreshQueue(), refreshTags()]);
 

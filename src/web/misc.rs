@@ -4,7 +4,7 @@ use axum::{
 };
 
 use crate::compat::load_local_setting_string;
-use crate::db::inventory::InventoryScope;
+use crate::db::inventory::{Inventory, InventoryScope};
 use crate::db::with_database;
 use crate::version;
 
@@ -144,4 +144,64 @@ pub async fn clear_history(State(state): State<AppState>) -> Json<ApiResponse> {
         success: true,
         message: "History cleared".to_string(),
     })
+}
+
+pub async fn get_sort_state(State(_state): State<AppState>) -> Json<serde_json::Value> {
+    let sort_state = (|| -> Option<serde_json::Value> {
+        let inv = Inventory::with_default_root().ok()?;
+        let server_setting: serde_json::Value =
+            inv.load("server_setting", InventoryScope::Global).ok()?;
+        server_setting.get("current_sort").cloned()
+    })();
+
+    match sort_state {
+        Some(state) => Json(state),
+        None => Json(serde_json::json!({"column": 2, "dir": "desc"})),
+    }
+}
+
+pub async fn save_sort_state(
+    State(_state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<ApiResponse> {
+    let column = body.get("column");
+    let dir = body.get("dir");
+
+    if column.is_none() || dir.is_none() {
+        return Json(ApiResponse {
+            success: false,
+            message: "column and dir are required".to_string(),
+        });
+    }
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let inv = Inventory::with_default_root()?;
+        let mut server_setting: serde_json::Map<String, serde_json::Value> = inv
+            .load("server_setting", InventoryScope::Global)
+            .unwrap_or_default();
+        server_setting.insert(
+            "current_sort".to_string(),
+            serde_json::json!({
+                "column": column.unwrap(),
+                "dir": dir.unwrap(),
+            }),
+        );
+        inv.save(
+            "server_setting",
+            InventoryScope::Global,
+            &serde_json::Value::Object(server_setting),
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => Json(ApiResponse {
+            success: true,
+            message: "OK".to_string(),
+        }),
+        Err(e) => Json(ApiResponse {
+            success: false,
+            message: e.to_string(),
+        }),
+    }
 }

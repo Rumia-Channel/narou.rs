@@ -390,6 +390,15 @@ export function syncViewChecks() {
   if (El.footerNavbar) {
     El.footerNavbar.classList.toggle('hide', !State.buttonsFooter);
   }
+
+  // Sort column highlight
+  document.querySelectorAll('.sortable').forEach(th => {
+    th.classList.remove('active-sort', 'sort-asc');
+    if (th.dataset.sort === State.sortCol) {
+      th.classList.add('active-sort');
+      if (State.sortAsc) th.classList.add('sort-asc');
+    }
+  });
 }
 
 function setCheck(id, checked) {
