@@ -456,6 +456,30 @@
       </div>
     </div>
 
+    <!-- Remove Confirm Modal -->
+    <div class="modal-overlay hide" id="remove-modal">
+      <div class="modal-dialog modal-dialog-sm">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h4 class="modal-title" data-i18n="remove_confirm_title">選択した小説を削除しますか？</h4>
+          </div>
+          <div class="modal-body">
+            <div id="remove-novel-list" style="max-height:18em;overflow:auto"></div>
+            <div style="text-align:right;margin-top:0.5em">
+              <label>
+                <input type="checkbox" id="remove-with-file">
+                <span data-i18n="remove_with_file">保存フォルダ・ファイルも一緒に削除する</span>
+              </label>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="remove-cancel" type="button" data-i18n="cancel">キャンセル</button>
+            <button class="btn btn-danger" id="remove-ok" type="button" data-i18n="remove_btn">削除する</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Diff List Modal -->
     <div class="modal-overlay hide" id="diff-modal">
       <div class="modal-dialog modal-dialog-lg">

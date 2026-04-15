@@ -44,6 +44,10 @@ const DICT = {
     statusUpdated: '更新',
     confirmRemove: '選択した小説を本当に削除しますか？',
     confirmShutdown: 'サーバをシャットダウンしますか？',
+    remove_confirm_title: '選択した小説を削除しますか？',
+    remove_with_file: '保存フォルダ・ファイルも一緒に削除する',
+    cancel: 'キャンセル',
+    remove_btn: '削除する',
   },
   en: {
     menuView: 'View',
@@ -87,6 +91,10 @@ const DICT = {
     statusUpdated: 'Updated',
     confirmRemove: 'Really remove the selected novels?',
     confirmShutdown: 'Shutdown the server?',
+    remove_confirm_title: 'Remove selected novels?',
+    remove_with_file: 'Also delete saved folders and files',
+    cancel: 'Cancel',
+    remove_btn: 'Remove',
   },
 };
 

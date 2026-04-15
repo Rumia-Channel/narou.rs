@@ -102,7 +102,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | 要素 | Ruby版 | Rust版 | 状態 |
 |------|--------|--------|------|
 | アイコン | `.glyphicon-inbox` | 📥 (Unicode) | ✅ |
-| サイズバッジ | `.queue__sizes` (default + convert分割) | `#queue-count` 単一 | 🟡 (分割なし) |
+| サイズバッジ | `.queue__sizes` (default + convert分割) | `#queue-count` 単一 | ✅ (concurrency未実装のため分割不要) |
 | クリックでモーダル表示 | キューマネージャー | キューマネージャーモーダル | ✅ |
 | ツールチップ | "クリックでキュー一覧を表示" | "クリックでキュー一覧を表示" | ✅ |
 | アクティブ状態 (色変化) | `.queue.active` | `queue-size-active` | ✅ |
@@ -440,7 +440,9 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 |-------------|--------|------|
 | `/api/novels/freeze` | POST | ✅ (BatchIdsBody) |
 | `/api/novels/unfreeze` | POST | ✅ |
-| `/api/novels/remove` | POST | ✅ |
+| `/api/novels/remove` | POST | ✅ (with_file: falseがデフォルト) |
+| `/api/remove` | POST | ✅ (with_file パラメータ対応) |
+| `/api/remove_with_file` | POST | ✅ (常にファイル削除) |
 | `/api/novels/{id}/freeze` | POST | ✅ (個別) |
 | `/api/novels/{id}/unfreeze` | POST | ✅ |
 
@@ -464,7 +466,8 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 |-------------|--------|------|
 | `/api/queue/status` | GET | ✅ |
 | `/api/queue/clear` | POST | ✅ |
-| `/api/queue/cancel` | POST | ✅ |
+| `/api/queue/cancel` | POST | ✅ (プロセスkill + pending消去) |
+| `/api/cancel_running_task` | POST | ✅ (特定タスク取消) |
 | `/api/get_pending_tasks` | GET | ✅ (待機タスク詳細) |
 | `/api/remove_pending_task` | POST | ✅ (タスク個別削除) |
 
@@ -510,7 +513,6 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/eject` | 端末取出し |
 | `/api/validate_url_regexp_list` | URL正規表現一覧 |
 | `/api/reorder_pending_tasks` | タスク並替 |
-| `/api/cancel_running_task` | 実行中タスク取消 |
 
 ---
 
@@ -597,7 +599,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 **モーダル**: 8/8 ✅ (タグ編集, About, 差分, 確認, メモ帳, ダウンロード, キュー, 列可視性)
 **キーボードショートカット**: 12/12 ✅
 **テーマ**: 6/6 ✅ (全ページCSS変数化、hardcoded色・px値なし)
-**API**: 51 実装済み / 6 未実装 (eject, version/latest, backup_bookmark, validate_url, reorder, cancel_running)
+**API**: 54 実装済み / 5 未実装 (eject, version/latest, backup_bookmark, validate_url, reorder)
 **WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, 進捗バー ✅, DB自動更新+table.reload ✅, モーダル/メモ帳同期 ❌
 **設定ページ**: ✅
 **言語切替**: ✅ (Rust独自)

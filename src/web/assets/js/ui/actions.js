@@ -377,8 +377,7 @@ export function bindActions() {
 
   on('btn-remove', async () => {
     if (State.selectedIds.size === 0) return;
-    if (!confirm('選択した小説を削除しますか？')) return;
-    await batchAction('/api/novels/remove');
+    showRemoveModal([...State.selectedIds]);
   });
 
   on('btn-convert', () => {
@@ -498,10 +497,7 @@ export function bindActions() {
     updateForceSingle: (id) => postJson('/api/update', { targets: [String(id)], force: true }),
     sendSingle: (id) => postJson('/api/send', { targets: [String(id)] }),
     removeSingle: async (id) => {
-      const novel = State.novels.find(n => n.id === id);
-      if (!confirm(`「${novel?.title || id}」を削除しますか？`)) return;
-      await postJson('/api/novels/remove', { ids: [Number(id)] });
-      await refreshList();
+      showRemoveModal([Number(id)]);
     },
     convertSingle: (id) => postJson('/api/convert', { targets: [String(id)] }),
     inspectSingle: (id) => postJson('/api/inspect', { targets: [String(id)] }),
@@ -724,6 +720,36 @@ function escHtml(s) {
   const div = document.createElement('div');
   div.textContent = String(s);
   return div.innerHTML;
+}
+
+/* ===== Remove Confirm Modal ===== */
+
+function showRemoveModal(ids) {
+  if (!ids || ids.length === 0) return;
+  // Build novel title list
+  const items = ids.map(id => {
+    const n = State.novels.find(n => n.id === id);
+    return '<li>' + escHtml(n?.title || String(id)) + '</li>';
+  }).join('');
+  El.removeNovelList.innerHTML = '<ul>' + items + '</ul>';
+  El.removeWithFile.checked = false;
+  El.removeModal?.classList.remove('hide');
+
+  // One-shot handlers
+  const cleanup = () => {
+    El.removeModal?.classList.add('hide');
+    El.removeOk.removeEventListener('click', onOk);
+    El.removeCancel.removeEventListener('click', onCancel);
+  };
+  const onOk = async () => {
+    const withFile = El.removeWithFile.checked;
+    cleanup();
+    await postJson('/api/novels/remove', { ids: ids, with_file: withFile });
+    await refreshList();
+  };
+  const onCancel = () => cleanup();
+  El.removeOk.addEventListener('click', onOk);
+  El.removeCancel.addEventListener('click', onCancel);
 }
 
 /* ===== CSV ===== */

@@ -78,6 +78,8 @@ const ELEMENT_IDS = [
   'about-modal', 'about-close', 'about-ok', 'about-version',
   'confirm-modal', 'confirm-title', 'confirm-message',
   'confirm-cancel', 'confirm-ok',
+  'remove-modal', 'remove-novel-list', 'remove-with-file',
+  'remove-cancel', 'remove-ok',
   'diff-modal', 'diff-close', 'diff-list-container',
   'colvis-modal', 'colvis-close', 'colvis-ok', 'colvis-list',
   'colvis-show-all', 'colvis-hide-all', 'colvis-reset',
