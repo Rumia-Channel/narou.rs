@@ -20,6 +20,7 @@ use user_converter::UserConverter;
 use crate::downloader::{SectionElement, SectionFile, TocObject};
 use crate::error::{NarouError, Result};
 use crate::progress::ProgressReporter;
+use crate::termcolor::bold_colored;
 
 pub struct NovelConverter {
     settings: NovelSettings,
@@ -637,7 +638,7 @@ impl NovelConverter {
 
     /// Ruby: display_header — "ID:{id}　{title} の変換を開始"
     fn display_header(&self, id: i64, title: &str) {
-        println!("ID:{}　{} の変換を開始", id, title);
+        println!("{}", bold_colored(&format!("ID:{}　{} の変換を開始", id, title), "green"));
     }
 
     /// Ruby: display_footer — "縦書用の変換が終了しました"

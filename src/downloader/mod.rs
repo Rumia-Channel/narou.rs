@@ -23,6 +23,7 @@ use crate::db::DATABASE;
 use crate::db::novel_record::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::progress::ProgressReporter;
+use crate::termcolor::{bold_colored, colored};
 
 use self::fetch::HttpFetcher;
 use self::narou_api::narou_api_batch_update;
@@ -811,7 +812,7 @@ impl Downloader {
             p.set_length(total);
             p.set_message(&format!("DL {}", title));
         }
-        println!("ID:{}　{} のDL開始", display_id, title);
+        println!("{}", bold_colored(&format!("ID:{}　{} のDL開始", display_id, title), "green"));
 
         let mut last_chapter = String::new();
         let mut last_subchapter = String::new();
@@ -931,7 +932,7 @@ impl Downloader {
                 ));
                 if needs_download {
                     if is_new_arrival && (existing_id.is_some() || force) {
-                        line.push_str(" (新着)");
+                        line.push_str(&bold_colored(" (新着)", "magenta"));
                     } else if !is_new_arrival && force {
                         line.push_str(" (更新あり)");
                     }

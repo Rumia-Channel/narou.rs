@@ -120,16 +120,19 @@ pub async fn api_update(
 
     let count = jobs.len();
     // Ruby parity: output update start message before queueing
+    // Ruby uses <white>...</white>.termcolor which maps to color:#bbb
     let is_update_all = targets.is_empty();
     let sort_display = current_sort_display_string();
     if is_update_all {
+        let msg = format!("全ての小説の更新を開始します（{}件を{}で処理）", count, sort_display);
         state.push_server.broadcast_echo(
-            &format!("全ての小説の更新を開始します（{}件を{}で処理）", count, sort_display),
+            &format!("<span style=\"color:#bbb\">{}</span>", msg),
             "stdout",
         );
     } else if !has_flags {
+        let msg = format!("更新を開始します（{}件を{}で処理）", count, sort_display);
         state.push_server.broadcast_echo(
-            &format!("更新を開始します（{}件を{}で処理）", count, sort_display),
+            &format!("<span style=\"color:#bbb\">{}</span>", msg),
             "stdout",
         );
     }
@@ -1027,8 +1030,9 @@ pub async fn api_update_by_tag(
     let count = jobs.len();
     // Ruby parity: output update start message
     let sort_display = current_sort_display_string();
+    let msg = format!("更新を開始します（{}件を{}で処理）", count, sort_display);
     state.push_server.broadcast_echo(
-        &format!("更新を開始します（{}件を{}で処理）", count, sort_display),
+        &format!("<span style=\"color:#bbb\">{}</span>", msg),
         "stdout",
     );
     let job_ids = match queue.push_batch(&jobs) {

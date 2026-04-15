@@ -11,5 +11,6 @@ pub mod mail;
 pub mod progress;
 pub mod queue;
 pub mod setting_info;
+pub mod termcolor;
 pub mod version;
 pub mod web;

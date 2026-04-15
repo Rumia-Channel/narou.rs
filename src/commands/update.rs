@@ -24,6 +24,7 @@ use narou_rs::mail::{
     MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
 };
 use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
+use narou_rs::termcolor::colored;
 
 const MODIFIED_TAG: &str = "modified";
 const INTERVAL_MIN_SECS: f64 = 2.5;
@@ -210,7 +211,7 @@ pub fn cmd_update(opts: UpdateOptions) {
                     }
 
                     if has_convert_failure {
-                        println!("前回変換できなかったので再変換します");
+                        println!("{}", colored("前回変換できなかったので再変換します", "yellow"));
                     }
 
                     match auto_convert(&dl, is_bulk) {

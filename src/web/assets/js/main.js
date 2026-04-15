@@ -217,7 +217,12 @@ function appendConsole(text) {
     } else {
       var div = document.createElement('div');
       div.className = 'console-line';
-      div.textContent = lines[i];
+      // If text contains <span> tags (from color output), render as HTML
+      if (/<span[\s>]/.test(lines[i])) {
+        div.innerHTML = lines[i];
+      } else {
+        div.textContent = lines[i];
+      }
       con.appendChild(div);
     }
   }

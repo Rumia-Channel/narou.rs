@@ -9,6 +9,7 @@ use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
 use narou_rs::db::inventory::{Inventory, InventoryScope};
 use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
+use narou_rs::termcolor::bold_colored;
 use regex::Regex;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -61,7 +62,7 @@ pub fn cmd_convert(
                 && matches!(output_device, Some(narou_rs::converter::device::Device::Ibunko));
 
         if let Some(device) = selected_device {
-            println!(">> {}用に変換します", device.display_name());
+            println!("{}", bold_colored(&format!(">> {}用に変換します", device.display_name()), "magenta"));
         }
 
         let total_count = targets.len();
