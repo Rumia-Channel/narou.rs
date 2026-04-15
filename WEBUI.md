@@ -187,6 +187,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | 12 | 状態 | 連載中/完結 | ✅ | ✅ |
 | 13 | リンク | ToC URL (🔗アイコン) | ✅ | ✅ |
 | 14 | 個別 | ⋯ メニューボタン (→コンテキストメニュー) | ✅ | ✅ |
+| 15 | あらすじ | ℹボタンでポップオーバー表示 | ✅ (API: `/api/story`) | ✅ |
 
 #### 2.4.2 行の状態表示
 
@@ -278,7 +279,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | 待機タスクリスト | ドラッグ並替 | `#queue-pending-list` (リスト表示のみ) | 🟡 |
 | キュー消去ボタン | あり | `#queue-clear-button` | ✅ |
 | ドラッグ&ドロップ並替 | あり | なし | ❌ |
-| 個別タスク取消 | あり | なし | ❌ |
+| 個別タスク取消 | あり | POST `/api/remove_pending_task` (API実装済み、UIは未接続) | 🟡 |
 
 ### 3.2 タグ編集モーダル
 
@@ -309,8 +310,10 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | 機能 | Ruby版 | Rust版 | 状態 |
 |------|--------|--------|------|
 | 差分リスト取得 | あり | POST `/api/diff_list` | ✅ |
+| 差分コマンド実行 | あり | POST `/api/diff` | ✅ |
 | タイトル表示 | あり | `<h5>` タイトル | ✅ |
 | 差分内容表示 | あり | `<pre>` preformatted | ✅ |
+| 差分キャッシュ削除ボタン | あり | POST `/api/diff_clean` (エントリ毎の🗑ボタン) | ✅ |
 
 ### 3.5 確認ダイアログ
 
@@ -428,6 +431,8 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/folder` | POST | ✅ |
 | `/api/setting_burn` | POST | ✅ |
 | `/api/diff_list` | POST | ✅ |
+| `/api/diff` | POST | ✅ (差分コマンド実行) |
+| `/api/diff_clean` | POST | ✅ (差分キャッシュ削除) |
 
 ### 6.3 凍結・削除 (バッチ)
 
@@ -460,6 +465,8 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/queue/status` | GET | ✅ |
 | `/api/queue/clear` | POST | ✅ |
 | `/api/queue/cancel` | POST | ✅ |
+| `/api/get_pending_tasks` | GET | ✅ (待機タスク詳細) |
+| `/api/remove_pending_task` | POST | ✅ (タスク個別削除) |
 
 ### 6.6 設定
 
@@ -481,6 +488,11 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/notepad/save` | POST | ✅ |
 | `/api/version/current.json` | GET | ✅ |
 | `/api/log/recent` | GET | ✅ |
+| `/api/history` | GET | ✅ (コンソール全履歴) |
+| `/api/clear_history` | POST | ✅ (履歴消去) |
+| `/api/sort_state` | GET | ✅ (ソート状態取得) |
+| `/api/sort_state` | POST | ✅ (ソート状態保存) |
+| `/api/story` | GET | ✅ (あらすじ取得) |
 
 ### 6.8 システム
 
@@ -494,18 +506,10 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | エンドポイント | 説明 |
 |-------------|------|
 | `/api/version/latest.json` | 最新バージョンチェック |
-| `/api/sort_state` | ソート状態永続化 |
-| `/api/diff` | 差分比較コマンド実行 |
-| `/api/diff_clean` | 差分キャッシュ削除 |
-| `/api/history` | コンソール全履歴 |
-| `/api/clear_history` | 履歴消去 |
-| `/api/story` | あらすじ取得 |
 | `/api/backup_bookmark` | 栞バックアップ |
 | `/api/eject` | 端末取出し |
 | `/api/validate_url_regexp_list` | URL正規表現一覧 |
-| `/api/get_pending_tasks` | 待機タスク詳細 |
 | `/api/reorder_pending_tasks` | タスク並替 |
-| `/api/remove_pending_task` | タスク個別削除 |
 | `/api/cancel_running_task` | 実行中タスク取消 |
 | `/novels/:id/download` | ebook ファイルストリーミング |
 | `/novels/:id/author_comments` | 前書き/後書きページ |
@@ -593,7 +597,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 **モーダル**: 8/8 ✅ (タグ編集, About, 差分, 確認, メモ帳, ダウンロード, キュー, 列可視性)
 **キーボードショートカット**: 12/12 ✅
 **テーマ**: 6/6 ✅
-**API**: 38 実装済み / 16 未実装 (主にキュー詳細操作, 履歴, eject, version/latest)
+**API**: 45 実装済み / 8 未実装 (主にeject, version/latest, reorder, cancel_running, author_comments, download)
 **WebSocket**: 基本イベント ✅, 進捗バー/モーダル/メモ帳同期 ❌
 **設定ページ**: ✅
 **言語切替**: ✅ (Rust独自)
