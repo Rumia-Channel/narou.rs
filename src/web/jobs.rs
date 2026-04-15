@@ -730,7 +730,7 @@ pub async fn queue_cancel(
 
 // GET /api/get_pending_tasks
 pub async fn get_pending_tasks(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
     let queue = match open_queue() {
         Ok(q) => q,
@@ -759,11 +759,24 @@ pub async fn get_pending_tasks(
         })
         .collect();
 
+    let running_guard = state.running_job.lock();
+    let (running_json, running_count) = if let Some(job) = running_guard.as_ref() {
+        (vec![serde_json::json!({
+            "id": job.id,
+            "type": job.job_type,
+            "target": job.target,
+            "created_at": job.created_at,
+        })], 1)
+    } else {
+        (vec![], 0)
+    };
+    drop(running_guard);
+
     Json(serde_json::json!({
         "pending": pending_json,
-        "running": [],
+        "running": running_json,
         "pending_count": pending_count,
-        "running_count": 0,
+        "running_count": running_count,
     }))
 }
 

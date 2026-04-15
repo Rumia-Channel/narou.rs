@@ -27,6 +27,7 @@ pub struct AppState {
     pub ws_port: u16,
     pub push_server: Arc<push::PushServer>,
     pub basic_auth_header: Option<String>,
+    pub running_job: Arc<parking_lot::Mutex<Option<crate::queue::QueueJob>>>,
 }
 
 pub fn create_router(state: AppState) -> Router {

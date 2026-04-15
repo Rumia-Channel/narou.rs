@@ -27,6 +27,7 @@ export const State = {
   tags: [],
   tagColors: {},
   queueStatus: { pending: 0, completed: 0, failed: 0, running: null },
+  queueDetailed: { pending: [], running: [], pending_count: 0, running_count: 0 },
   filterText: '',
 
   // View flags (persisted to localStorage)

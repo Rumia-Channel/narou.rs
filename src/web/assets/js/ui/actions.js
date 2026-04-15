@@ -6,7 +6,7 @@ import { State, El, lsSet, lsBool } from '../core/state.js';
 import { fetchJson, postJson } from '../core/http.js';
 import { toggleLanguage } from './i18n.js';
 import {
-  renderNovelList, renderTagList, renderQueueStatus,
+  renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed,
   selectVisible, selectAll, clearSelection, updateEnableSelected,
   syncViewChecks, showNotification,
 } from './render.js';
@@ -214,13 +214,13 @@ export function bindActions() {
   // --- Queue display ---
   El.queueDisplay?.addEventListener('click', () => {
     El.queueModal?.classList.remove('hide');
-    refreshQueue();
+    refreshQueueDetailed();
   });
 
   on('queue-modal-close', () => El.queueModal?.classList.add('hide'));
   on('queue-clear-button', async () => {
     await postJson('/api/queue/clear', {});
-    await refreshQueue();
+    await refreshQueueDetailed();
   });
 
   // --- Notepad modal ---
@@ -831,6 +831,16 @@ export async function refreshQueue() {
     if (data) {
       State.queueStatus = data;
       renderQueueStatus();
+    }
+  } catch { /* ignore */ }
+}
+
+export async function refreshQueueDetailed() {
+  try {
+    const data = await fetchJson('/api/get_pending_tasks');
+    if (data) {
+      State.queueDetailed = data;
+      renderQueueDetailed();
     }
   } catch { /* ignore */ }
 }

@@ -3,7 +3,7 @@
  * context menu, click-to-select, and per-row action buttons.
  */
 import { State, El, lsSet } from '../core/state.js';
-import { fetchJson } from '../core/http.js';
+import { fetchJson, postJson } from '../core/http.js';
 import { showContextMenu, showTagColorMenu } from './context_menu.js';
 
 const TAG_COLOR_MAP = {
@@ -380,6 +380,71 @@ export function renderQueueStatus() {
   }
   if (El.queuePendingCount) {
     El.queuePendingCount.textContent = `(${qs.pending || 0})`;
+  }
+}
+
+/* ===== Queue Detailed ===== */
+
+const JOB_TYPE_LABELS = {
+  download: 'ダウンロード',
+  update: 'アップデート',
+  convert: '変換',
+  send: '送信',
+  backup: 'バックアップ',
+  mail: 'メール',
+};
+
+function formatTaskTime(epoch) {
+  if (!epoch) return '';
+  const d = new Date(epoch * 1000);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
+function renderTaskItem(task, isRunning) {
+  const label = JOB_TYPE_LABELS[task.type] || task.type;
+  const time = formatTaskTime(task.created_at);
+  const icon = isRunning ? '&#x25B6;' : '&#x23F3;';
+  const deleteBtn = isRunning
+    ? ''
+    : `<button class="queue-task-delete" data-task-id="${esc(task.id)}" title="削除">&#x1F5D1;</button>`;
+  return `<div class="queue-task-item${isRunning ? ' queue-running' : ''}">
+    <span class="queue-task-icon">${icon}</span>
+    <span class="queue-task-label">${esc(label)}</span>
+    <span class="queue-task-target">${esc(task.target)}</span>
+    <span class="queue-task-time">${time}</span>
+    ${deleteBtn}
+  </div>`;
+}
+
+export function renderQueueDetailed() {
+  const qd = State.queueDetailed;
+  if (El.queueRunningList) {
+    if (qd.running && qd.running.length > 0) {
+      El.queueRunningList.innerHTML = qd.running.map(t => renderTaskItem(t, true)).join('');
+    } else {
+      El.queueRunningList.textContent = 'なし';
+    }
+  }
+  if (El.queuePendingList) {
+    if (qd.pending && qd.pending.length > 0) {
+      El.queuePendingList.innerHTML = qd.pending.map(t => renderTaskItem(t, false)).join('');
+      El.queuePendingList.querySelectorAll('.queue-task-delete').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const taskId = btn.dataset.taskId;
+          await postJson('/api/remove_pending_task', { task_id: taskId });
+          const { refreshQueueDetailed } = await import('./actions.js');
+          await refreshQueueDetailed();
+        });
+      });
+    } else {
+      El.queuePendingList.textContent = 'なし';
+    }
+  }
+  if (El.queuePendingCount) {
+    El.queuePendingCount.textContent = `(${qd.pending_count || 0})`;
   }
 }
 

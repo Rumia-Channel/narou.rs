@@ -10,7 +10,11 @@ use crate::queue::{JobType, QueueJob};
 use super::jobs::open_queue;
 use super::push::PushServer;
 
-pub fn start_queue_worker(root_dir: PathBuf, push_server: Arc<PushServer>) -> JoinHandle<()> {
+pub fn start_queue_worker(
+    root_dir: PathBuf,
+    push_server: Arc<PushServer>,
+    running_job: Arc<parking_lot::Mutex<Option<QueueJob>>>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let queue = match open_queue() {
@@ -27,6 +31,7 @@ pub fn start_queue_worker(root_dir: PathBuf, push_server: Arc<PushServer>) -> Jo
                 continue;
             };
 
+            *running_job.lock() = Some(job.clone());
             push_server.broadcast("queue_start", &job.id);
             let root_dir = root_dir.clone();
             let job_for_run = job.clone();
@@ -34,6 +39,7 @@ pub fn start_queue_worker(root_dir: PathBuf, push_server: Arc<PushServer>) -> Jo
                 .await
                 .unwrap_or(false);
 
+            *running_job.lock() = None;
             if success {
                 let _ = queue.complete(&job.id);
                 push_server.broadcast("queue_complete", &job.id);
