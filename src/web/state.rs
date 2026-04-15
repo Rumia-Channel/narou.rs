@@ -103,3 +103,19 @@ pub struct TargetsBody {
 pub struct CsvImportBody {
     pub csv: String,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct DiffBody {
+    pub ids: Vec<serde_json::Value>,
+    #[serde(default = "default_diff_number")]
+    pub number: String,
+}
+
+fn default_diff_number() -> String {
+    "1".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffCleanBody {
+    pub target: serde_json::Value,
+}

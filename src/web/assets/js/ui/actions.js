@@ -691,11 +691,25 @@ async function openDiffList(ids) {
     const data = await postJson('/api/diff_list', { targets: ids });
     if (data?.diffs) {
       container.innerHTML = data.diffs.map(d =>
-        `<div class="diff-entry">
-          <h5>${escHtml(d.title || d.id)}</h5>
+        `<div class="diff-entry" data-diff-id="${escHtml(String(d.id))}">
+          <div class="diff-header">
+            <h5>${escHtml(d.title || d.id)}</h5>
+            <button class="btn btn-sm btn-diff-clean" data-id="${escHtml(String(d.id))}" title="差分キャッシュを削除">🗑 クリア</button>
+          </div>
           <pre class="diff-content">${escHtml(d.content || 'No diff')}</pre>
         </div>`
       ).join('');
+      container.querySelectorAll('.btn-diff-clean').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const id = btn.dataset.id;
+          await postJson('/api/diff_clean', { target: id });
+          const entry = btn.closest('.diff-entry');
+          if (entry) {
+            const pre = entry.querySelector('.diff-content');
+            if (pre) pre.textContent = 'No diff';
+          }
+        });
+      });
     } else {
       container.innerHTML = '<p>差分データがありません</p>';
     }

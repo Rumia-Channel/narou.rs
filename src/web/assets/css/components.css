@@ -636,9 +636,22 @@ li.enable-selected.disabled a {
   margin-bottom: 1em;
 }
 
+.diff-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.3em;
+}
+
 .diff-entry h5 {
-  margin: 0 0 0.3em;
+  margin: 0;
   font-size: 1rem;
+}
+
+.btn-diff-clean {
+  padding: 2px 8px;
+  font-size: 0.8rem;
+  cursor: pointer;
 }
 
 .diff-content {

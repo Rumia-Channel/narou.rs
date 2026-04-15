@@ -4,7 +4,10 @@ use crate::db::with_database;
 use crate::queue::{JobType, PersistentQueue};
 
 use super::AppState;
-use super::state::{ApiResponse, ConvertBody, CsvImportBody, DownloadBody, TargetsBody, UpdateBody};
+use super::state::{
+    ApiResponse, ConvertBody, CsvImportBody, DiffBody, DiffCleanBody, DownloadBody, TargetsBody,
+    UpdateBody,
+};
 
 pub async fn api_download(
     State(state): State<AppState>,
@@ -528,6 +531,82 @@ pub async fn api_diff_list(
     }
 
     serde_json::json!({ "diffs": diffs }).into()
+}
+
+// POST /api/diff
+pub async fn api_diff(
+    State(state): State<AppState>,
+    Json(body): Json<DiffBody>,
+) -> Json<ApiResponse> {
+    let ids: Vec<String> = body
+        .ids
+        .iter()
+        .map(|v| match v {
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .collect();
+
+    for id in &ids {
+        let args = vec!["diff", "--no-tool", id, "--number", &body.number];
+        match run_immediate(&args) {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !stdout.is_empty() {
+                    state.push_server.broadcast("console", &stdout);
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.is_empty() {
+                    state.push_server.broadcast("console", &stderr);
+                }
+            }
+            Err(e) => {
+                state
+                    .push_server
+                    .broadcast("console", &format!("diff error: {}", e));
+            }
+        }
+    }
+
+    Json(ApiResponse {
+        success: true,
+        message: format!("Diff completed for {} novel(s)", ids.len()),
+    })
+}
+
+// POST /api/diff_clean
+pub async fn api_diff_clean(
+    State(state): State<AppState>,
+    Json(body): Json<DiffCleanBody>,
+) -> Json<ApiResponse> {
+    let target = match &body.target {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+
+    let args = vec!["diff", "--clean", &target];
+    match run_immediate(&args) {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if !stdout.is_empty() {
+                state.push_server.broadcast("console", &stdout);
+            }
+            Json(ApiResponse {
+                success: output.status.success(),
+                message: if output.status.success() {
+                    format!("Diff cleaned for {}", target)
+                } else {
+                    String::from_utf8_lossy(&output.stderr).to_string()
+                },
+            })
+        }
+        Err(e) => Json(ApiResponse {
+            success: false,
+            message: e,
+        }),
+    }
 }
 
 // POST /api/csv/import

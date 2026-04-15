@@ -81,6 +81,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/mail", post(jobs::api_mail))
         .route("/api/setting_burn", post(jobs::api_setting_burn))
         .route("/api/diff_list", post(jobs::api_diff_list))
+        .route("/api/diff", post(jobs::api_diff))
+        .route("/api/diff_clean", post(jobs::api_diff_clean))
         .route("/api/csv/import", post(jobs::api_csv_import))
         .route("/api/csv/download", get(jobs::api_csv_download))
         .route("/api/shutdown", post(jobs::api_shutdown))
