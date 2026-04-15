@@ -61,6 +61,7 @@ pub fn start_queue_worker(
             }
             // Trigger frontend table reload after DB refresh
             push_server.broadcast_event("table.reload", "");
+            push_server.broadcast_event("tag.updateCanvas", "");
             push_server.broadcast_event("notification.queue", "");
         }
     })

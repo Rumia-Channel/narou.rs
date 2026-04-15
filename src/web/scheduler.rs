@@ -8,6 +8,7 @@ use serde_yaml::Value;
 use tokio::task::JoinHandle;
 
 use crate::compat::{load_local_setting_bool, load_local_setting_string};
+use crate::termcolor::colored;
 use crate::db;
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::downloader::site_setting::SiteSetting;
@@ -152,6 +153,10 @@ fn execute_auto_update(root_dir: &Path, push_server: &PushServer) {
     if modified_ids.is_empty() {
         println!("自動アップデート: modified タグの付いた小説はありません");
     } else {
+        push_server.broadcast_echo(
+            &colored("modified タグの付いた小説を更新します", "yellow"),
+            "stdout",
+        );
         println!(
             "自動アップデート: modified タグの付いた小説を更新します ({}件)",
             modified_ids.len()
@@ -182,6 +187,7 @@ fn execute_auto_update(root_dir: &Path, push_server: &PushServer) {
     println!("自動アップデートが正常に完了しました");
     push_server.broadcast_echo("自動アップデートが正常に完了しました", "stdout");
     push_server.broadcast_event("table.reload", "");
+    push_server.broadcast_event("tag.updateCanvas", "");
 }
 
 fn build_auto_update_sort_args() -> Vec<&'static str> {

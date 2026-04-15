@@ -84,6 +84,23 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
     let worker_task = web::worker::start_queue_worker(root_dir.clone(), push_server.clone(), running_job, running_child_pid);
     let scheduler_task = web::scheduler::start_auto_update_scheduler(root_dir, push_server.clone());
 
+    // Ruby parity: broadcast startup messages to web console
+    {
+        use narou_rs::termcolor::colored;
+        let ver = narou_rs::version::create_version_string();
+        push_server.broadcast_echo(&colored(&format!("Narou.rs version {}", ver), "white"), "stdout");
+
+        if let Ok(queue) = narou_rs::queue::PersistentQueue::with_default() {
+            let count = queue.pending_count();
+            if count > 0 {
+                push_server.broadcast_echo(
+                    &colored(&format!("前回未完了のタスクが{}件見つかりました。WEB UI から再開できます。", count), "yellow"),
+                    "stdout",
+                );
+            }
+        }
+    }
+
     let ws_task = tokio::spawn(async move { axum::serve(ws_listener, ws_app).await });
     axum::serve(listener, app).await.unwrap();
     worker_task.abort();

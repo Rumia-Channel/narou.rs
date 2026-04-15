@@ -1167,6 +1167,8 @@ pub async fn api_update_general_lastup(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let option = body["option"].as_str().unwrap_or("all");
+    let is_update_modified = body["is_update_modified"].as_str() == Some("true")
+        || body["is_update_modified"].as_bool() == Some(true);
     let mut args = vec!["update", "--gl"];
     if option != "all" {
         args.push(option);
@@ -1189,6 +1191,14 @@ pub async fn api_update_general_lastup(
             state
                 .push_server
                 .broadcast_event("notification.queue", "");
+
+            // Ruby parity: if is_update_modified, chain a second update for tag:modified
+            if is_update_modified {
+                if let Ok(queue2) = open_queue() {
+                    let _ = queue2.push(JobType::Update, "--tag\tmodified");
+                }
+            }
+
             serde_json::json!({
                 "success": true,
                 "job_id": id,
