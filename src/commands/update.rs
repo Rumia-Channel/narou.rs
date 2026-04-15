@@ -257,14 +257,14 @@ pub fn cmd_update(opts: UpdateOptions) {
     match result {
         Ok(Ok(())) => {}
         Ok(Err(UpdateInterrupted)) => {
-            eprintln!("アップデートを中断しました");
+            println!("アップデートを中断しました");
             std::process::exit(126);
         }
         Err(e) => {
             if let Some(s) = e.downcast_ref::<String>() {
-                eprintln!("アップデートを中断しました: {}", s);
+                println!("アップデートを中断しました: {}", s);
             } else {
-                eprintln!("アップデートを中断しました");
+                println!("アップデートを中断しました");
             }
             std::process::exit(126);
         }

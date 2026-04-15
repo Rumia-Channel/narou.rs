@@ -182,12 +182,12 @@ fn interactive_mode(downloader: &Downloader) -> Vec<String> {
 
         if valid_target(downloader, input) {
             if targets.contains(&input.to_string()) {
-                eprintln!("入力済みです");
+                println!("入力済みです");
             } else {
                 targets.push(input.to_string());
             }
         } else {
-            eprintln!("対応外の小説です");
+            println!("対応外の小説です");
         }
         print_prompt(targets.len());
     }

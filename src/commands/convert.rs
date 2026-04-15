@@ -66,7 +66,7 @@ pub fn cmd_convert(
 
         let total_count = targets.len();
         let mut completed_count = 0usize;
-        println!("変換処理開始: {} 件の小説を処理します", total_count);
+        println!("変換処理開始: {}件の小説を処理します", total_count);
 
         for (index, target) in targets.iter().enumerate() {
             if index > 0 {
@@ -233,7 +233,7 @@ pub fn cmd_convert(
         }
 
         println!(
-            "変換処理完了: {}/{} 件が正常に変換されました",
+            "変換処理完了: {}/{}件が正常に変換されました",
             completed_count, total_count
         );
     }
