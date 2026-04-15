@@ -14,10 +14,10 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | 3 | `/novels/:id/setting` | 個別小説設定 | `settings.js` 内で動的切替 | ✅ |
 | 4 | `/help` | ヘルプページ | `window.open` で外部/内部 | ✅ |
 | 5 | `/about` | バージョン情報 | `#about-modal` モーダル | ✅ |
-| 6 | `/notepad` | メモ帳 (別ページ) | なし (モーダルのみ) | ❌ |
-| 7 | `/novels/:id/author_comments` | 前書き/後書き | なし | ❌ |
-| 8 | `/novels/:id/download` | ebook ダウンロード | なし | ❌ |
-| 9 | `/_rebooting` | 再起動中表示 | なし | ❌ |
+| 6 | `/notepad` | メモ帳 (別ページ) | `notepad.html` | ✅ |
+| 7 | `/novels/:id/author_comments` | 前書き/後書き | `author_comments.html` + API | ✅ |
+| 8 | `/novels/:id/download` | ebook ダウンロード | `novels.rs` download_ebook | ✅ |
+| 9 | `/_rebooting` | 再起動中表示 | `rebooting.html` | ✅ |
 | 10 | `/edit_menu` | 編集メニュー | なし | ❌ |
 
 ---
@@ -78,7 +78,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | 2 | `#action-tool-csv-download` | CSV形式でリストをダウンロード | ✅ |
 | 3 | `#action-tool-csv-import` | CSVファイルからインポート | ✅ (ファイルピッカー+API呼出) |
 | — | divider | — | ✅ |
-| 4 | `#action-tool-notepad` | メモ帳（別ページ） | ✅ (ポップアップモーダルで実装) |
+| 4 | `#action-tool-notepad` | メモ帳（別ページ） | ✅ (`/notepad` へ遷移) |
 | 5 | `#action-tool-notepad-popup` | メモ帳（ポップアップ） | ✅ |
 
 #### 2.1.6 オプションメニュー (右ドロップダウン ⚙)
@@ -331,7 +331,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | 保存 | POST `/api/notepad/save` | `#save-notepad-button` | ✅ |
 | 保存通知 | あり | showNotification() | ✅ |
 | WebSocket 同期 | `notepad.change` イベント | なし | ❌ |
-| 別ページ版 | `/notepad` (別ページ) | なし | ❌ |
+| 別ページ版 | `/notepad` (別ページ) | `notepad.html` | ✅ |
 
 ### 3.7 ダウンロードモーダル
 
@@ -527,7 +527,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `tag.updateCanvas` | S→C | ✅ (refreshTags) | ✅ |
 | `status` / `queue` / `notification.queue` | S→C | ✅ (refreshQueue) | ✅ |
 | 再接続 | 5秒リトライ | ✅ (5s setTimeout) | ✅ |
-| `progressbar.init/step/clear` | S→C | なし | ❌ |
+| `progressbar.init/step/clear` | S→C | ✅ (PushServer + main.js) | ✅ |
 | `ping.modal` (サーバー主導モーダル) | S→C | なし | ❌ |
 | `notepad.change` (メモ帳同期) | S→C | なし | ❌ |
 | `device.ejectable` | S→C | なし | ❌ |
@@ -590,15 +590,15 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 
 ## 12. 実装サマリ
 
-**ページ**: 5/10 ✅ (メイン, 設定, ヘルプ, About, 個別設定)
+**ページ**: 9/10 ✅ (メイン, 設定, ヘルプ, About, 個別設定, メモ帳, 作者コメント, ebook DL, 再起動)
 **ナビバー要素**: 全メニュー ✅ (表示/選択/タグ/ツール/オプション)
 **コントロールパネル**: 10/11 ボタン ✅ (Eject以外)
-**コンテキストメニュー**: 14/15 項目 ✅ (author_comments以外)
+**コンテキストメニュー**: 15/15 項目 ✅
 **モーダル**: 8/8 ✅ (タグ編集, About, 差分, 確認, メモ帳, ダウンロード, キュー, 列可視性)
 **キーボードショートカット**: 12/12 ✅
 **テーマ**: 6/6 ✅
-**API**: 45 実装済み / 8 未実装 (主にeject, version/latest, reorder, cancel_running, author_comments, download)
-**WebSocket**: 基本イベント ✅, 進捗バー/モーダル/メモ帳同期 ❌
+**API**: 49 実装済み / 4 未実装 (主にeject, version/latest, reorder, cancel_running)
+**WebSocket**: 基本イベント ✅, 進捗バー ✅, モーダル/メモ帳同期 ❌
 **設定ページ**: ✅
 **言語切替**: ✅ (Rust独自)
 **レスポンシブ**: ✅
