@@ -103,6 +103,22 @@ pub const WEBUI_THEME_NAMES: &[&str] = &[
     "United",
 ];
 
+/// Command names that support `default_args.*`.
+pub const DEFAULT_ARG_COMMAND_NAMES: &[&str] = &[
+    "alias", "backup", "browser", "clean", "console", "convert", "csv", "diff", "download",
+    "folder", "freeze", "help", "init", "inspect", "list", "log", "mail", "remove", "send",
+    "setting", "tag", "trace", "update", "version", "web",
+];
+
+pub fn default_arg_command_names() -> &'static [&'static str] {
+    DEFAULT_ARG_COMMAND_NAMES
+}
+
+pub fn is_known_default_arg_name(name: &str) -> bool {
+    name.strip_prefix("default_args.")
+        .is_some_and(|cmd| DEFAULT_ARG_COMMAND_NAMES.contains(&cmd))
+}
+
 /// Per-novel setting variable metadata (used for default.*/force.* tabs)
 pub fn original_setting_var_infos() -> Vec<(&'static str, VarInfo)> {
     let info = |vt: VarType, help: &'static str| VarInfo {
@@ -393,7 +409,20 @@ pub fn original_setting_var_infos() -> Vec<(&'static str, VarInfo)> {
                 "出力ファイル名を任意の文字列に変更する。convert.filename-to-ncode の設定よりも優先される。※拡張子を含めないで下さい",
             ),
         ),
-    ]
+        ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_arg_command_names_cover_web_and_alias() {
+        assert!(default_arg_command_names().contains(&"web"));
+        assert!(default_arg_command_names().contains(&"alias"));
+        assert!(is_known_default_arg_name("default_args.convert"));
+        assert!(!is_known_default_arg_name("default_args.not_exists"));
+    }
 }
 
 /// Local setting variable metadata

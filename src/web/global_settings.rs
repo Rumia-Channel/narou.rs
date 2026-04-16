@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::setting_info::{
-    SettingVariables, VarInfo, VarType, original_setting_var_infos, setting_variables,
-    tab_for_setting,
+    SettingVariables, VarInfo, VarType, default_arg_command_names, is_known_default_arg_name,
+    original_setting_var_infos, setting_variables, tab_for_setting,
     webui_help_override,
 };
 use crate::db::inventory::{Inventory, InventoryScope};
@@ -113,11 +113,7 @@ pub async fn get_global_settings(
     }
 
     // default_args.* entries from known commands
-    let command_names = [
-        "download", "update", "convert", "diff", "inspect", "send", "trace",
-        "console", "list", "csv",
-    ];
-    for cmd in &command_names {
+    for cmd in default_arg_command_names() {
         let name = format!("default_args.{}", cmd);
         let value = local_values.get(&name).cloned();
         settings.push(serde_json::json!({
@@ -343,7 +339,7 @@ fn coerce_setting_value(
             return coerce_value_for_type(info, value);
         }
     }
-    if name.starts_with("default_args.") {
+    if is_known_default_arg_name(name) {
         return coerce_string_value(value);
     }
     Err("不明な設定名です".to_string())

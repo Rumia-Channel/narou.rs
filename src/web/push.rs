@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use axum::{
     Router,
+    http::{HeaderMap, header},
     extract::State,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use dashmap::DashMap;
@@ -41,6 +42,7 @@ pub struct PushServer {
     next_client_id: Mutex<usize>,
     console_history: Mutex<Vec<(String, String)>>,
     max_history: usize,
+    accepted_domains: Vec<String>,
 }
 
 impl PushServer {
@@ -51,11 +53,42 @@ impl PushServer {
             next_client_id: Mutex::new(1),
             console_history: Mutex::new(Vec::new()),
             max_history: 10000,
+            accepted_domains: vec!["*".to_string()],
         }
     }
 
     pub fn channel(&self) -> &BroadcastChannel {
         &self.channel
+    }
+
+    pub fn set_accepted_domains<I, S>(&mut self, domains: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let collected: Vec<String> = domains
+            .into_iter()
+            .map(Into::into)
+            .map(|domain| domain.trim().to_string())
+            .filter(|domain| !domain.is_empty())
+            .collect();
+        self.accepted_domains = if collected.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            collected
+        };
+    }
+
+    pub fn accepted_domains(&self) -> &[String] {
+        &self.accepted_domains
+    }
+
+    pub fn accepts_origin(&self, origin: &str) -> bool {
+        let domain = origin_to_domain(origin);
+        self.accepted_domains.iter().any(|pattern| {
+            pattern == "*"
+                || wildcard_match(&pattern.to_ascii_lowercase(), &domain.to_ascii_lowercase())
+        })
     }
 
     pub fn client_count(&self) -> usize {
@@ -214,8 +247,17 @@ pub fn create_push_router(state: AppState) -> Router {
 pub async fn ws_handler_with_app_state(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-) -> impl IntoResponse {
+    headers: HeaderMap,
+) -> Response {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !state.push_server.accepts_origin(origin) {
+        return (axum::http::StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
     ws.on_upgrade(move |socket| handle_socket(socket, state.push_server))
+        .into_response()
 }
 
 async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>) {
@@ -261,6 +303,59 @@ async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>) {
 
     push_server.unregister_client(client_id);
     let _ = result;
+}
+
+fn origin_to_domain(origin: &str) -> String {
+    let trimmed = origin.trim();
+    if trimmed.is_empty() || trimmed == "null" || trimmed == "file://" {
+        return "null".to_string();
+    }
+    let without_scheme = trimmed.split_once("://").map(|(_, rest)| rest).unwrap_or(trimmed);
+    let host_port = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    let host = host_port.split('@').next_back().unwrap_or(host_port);
+    host.split(':').next().unwrap_or(host).to_string()
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    wildcard_match_bytes(pattern.as_bytes(), text.as_bytes())
+}
+
+fn wildcard_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+    match pattern[0] {
+        b'*' => {
+            wildcard_match_bytes(&pattern[1..], text)
+                || (!text.is_empty() && wildcard_match_bytes(pattern, &text[1..]))
+        }
+        b'?' => !text.is_empty() && wildcard_match_bytes(&pattern[1..], &text[1..]),
+        c => !text.is_empty() && c == text[0] && wildcard_match_bytes(&pattern[1..], &text[1..]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_origin_respects_wildcards() {
+        let mut server = PushServer::new();
+        server.set_accepted_domains(["127.0.0.1", "localhost", "*.example.com"]);
+        assert!(server.accepts_origin("http://localhost:3000"));
+        assert!(server.accepts_origin("https://api.example.com"));
+        assert!(!server.accepts_origin("https://evil.test"));
+    }
+
+    #[test]
+    fn origin_to_domain_handles_null_and_file() {
+        assert_eq!(origin_to_domain("null"), "null");
+        assert_eq!(origin_to_domain("file://"), "null");
+        assert_eq!(origin_to_domain("https://Example.com:8080/path"), "Example.com");
+    }
 }
 
 use serde::Serialize;

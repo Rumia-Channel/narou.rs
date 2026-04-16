@@ -8,7 +8,9 @@ use narou_rs::converter::settings::NovelSettings;
 use narou_rs::db::inventory::{Inventory, InventoryScope};
 use narou_rs::db::{novel_dir_for_record, with_database};
 use narou_rs::setting_info::{
-    self, SettingVariables, VarInfo, VarType,
+    self, default_arg_command_names,
+    is_known_default_arg_name as shared_is_known_default_arg_name, SettingVariables, VarInfo,
+    VarType,
 };
 
 use super::download::{get_data_by_target, tagname_to_ids};
@@ -174,15 +176,8 @@ fn get_scope_of_variable_name(name: &str) -> Option<Scope> {
     None
 }
 
-const DEFAULT_ARG_COMMAND_NAMES: &[&str] = &[
-    "alias", "backup", "browser", "clean", "console", "convert", "csv", "diff", "download",
-    "folder", "freeze", "help", "init", "inspect", "list", "log", "mail", "remove", "send",
-    "setting", "tag", "trace", "update", "version", "web",
-];
-
 fn is_known_default_arg_name(name: &str) -> bool {
-    name.strip_prefix("default_args.")
-        .is_some_and(|cmd| DEFAULT_ARG_COMMAND_NAMES.contains(&cmd))
+    shared_is_known_default_arg_name(name)
 }
 
 fn cast_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> {
@@ -373,7 +368,7 @@ fn display_variable_list(show_all: bool) {
                 print_variable_entry(&format!("{}.{}", prefix, name), &info, true);
             }
         }
-        for cmd in DEFAULT_ARG_COMMAND_NAMES {
+        for cmd in default_arg_command_names() {
             println!(
                 "    {:32} {} {} コマンドのデフォルトオプション",
                 format!("default_args.{}", cmd),

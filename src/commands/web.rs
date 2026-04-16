@@ -37,7 +37,16 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
         address.host, address.port, address.ws_port
     );
 
-    let push_server = Arc::new(web::push::PushServer::new());
+    let mut push_server = web::push::PushServer::new();
+    let domains = match load_ws_accepted_domains(&address.host) {
+        Ok(domains) => domains,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    push_server.set_accepted_domains(domains);
+    let push_server = Arc::new(push_server);
     let basic_auth_header = match load_basic_auth_header() {
         Ok(header) => header,
         Err(e) => {
@@ -344,6 +353,32 @@ fn load_basic_auth_header() -> Result<Option<String>, String> {
     }
     let token = encode_base64(format!("{}:{}", user, password).as_bytes());
     Ok(Some(format!("Basic {}", token)))
+}
+
+fn load_ws_accepted_domains(host: &str) -> Result<Vec<String>, String> {
+    let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
+    let global_setting: HashMap<String, Value> = inventory
+        .load("global_setting", InventoryScope::Global)
+        .unwrap_or_default();
+    let mut accepted_domains = match host {
+        "0.0.0.0" => vec!["*".to_string()],
+        "127.0.0.1" => vec!["127.0.0.1".to_string(), "localhost".to_string()],
+        value if !value.trim().is_empty() => vec![value.trim().to_string()],
+        _ => vec!["127.0.0.1".to_string(), "localhost".to_string()],
+    };
+    if accepted_domains.first().is_some_and(|domain| domain == "*") {
+        return Ok(accepted_domains);
+    }
+    if let Some(extra) = yaml_string(global_setting.get("server-ws-add-accepted-domains")) {
+        accepted_domains.extend(
+            extra
+                .split(',')
+                .map(str::trim)
+                .filter(|domain| !domain.is_empty())
+                .map(ToString::to_string),
+        );
+    }
+    Ok(accepted_domains)
 }
 
 fn confirm_first_web_boot(no_browser: bool) -> Result<bool, String> {
