@@ -104,6 +104,14 @@
   margin-left: auto;
 }
 
+/* Desktop: reorder right-side elements to match Bootstrap 3 float:right visual order
+   (float:right renders in reverse source order: Filter | Queue | Options) */
+@media (min-width: 48.0625em) {
+  .navbar-collapse > .navbar-form { order: 1; }
+  .navbar-collapse > .queue-indicator { order: 2; }
+  .navbar-collapse > .nav.navbar-right { order: 3; }
+}
+
 /* ========== Main Containers ========== */
 .container-main {
   width: 100%;
