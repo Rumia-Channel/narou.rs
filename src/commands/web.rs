@@ -80,8 +80,9 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
         let _ = open::that(&url);
     }
 
-    let listener = bind_or_kill_and_retry(addr, "HTTP").await;
-    let ws_listener = bind_or_kill_and_retry(ws_addr, "WebSocket").await;
+    let listener = bind_or_shutdown_and_retry(addr, &address.host, address.port, "HTTP").await;
+    let ws_listener =
+        bind_or_shutdown_and_retry(ws_addr, &address.host, address.ws_port, "WebSocket").await;
     let worker_task = web::worker::start_queue_worker(root_dir.clone(), push_server.clone(), running_job, running_child_pid);
     let scheduler_task = web::scheduler::start_auto_update_scheduler(root_dir, push_server.clone());
 
@@ -139,21 +140,33 @@ fn resolve_web_address(user_port: Option<u16>) -> Result<WebAddress, String> {
     })
 }
 
-async fn bind_or_kill_and_retry(addr: SocketAddr, label: &str) -> tokio::net::TcpListener {
+async fn bind_or_shutdown_and_retry(
+    addr: SocketAddr,
+    host: &str,
+    port: u16,
+    label: &str,
+) -> tokio::net::TcpListener {
     match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            if try_kill_previous_server(addr.port()) {
+            if try_shutdown_existing_server(host, port) {
                 match tokio::net::TcpListener::bind(addr).await {
                     Ok(l) => l,
                     Err(e) => {
-                        eprintln!("{} ポート {} のバインドに失敗しました: {}", label, addr.port(), e);
+                        eprintln!(
+                            "{} ポート {} のバインドに失敗しました: {}",
+                            label, port, e
+                        );
                         std::process::exit(1);
                     }
                 }
             } else {
-                eprintln!("ポート {} は既に使用されています。", addr.port());
-                eprintln!("別のポートを指定するには --port オプションを使ってください。");
+                eprintln!(
+                    "ポート {} は既に使用されています。\n\
+                     既にサーバが起動していませんか？\n\
+                     別のポートを指定するには --port オプションを使ってください。",
+                    port
+                );
                 std::process::exit(1);
             }
         }
@@ -164,70 +177,53 @@ async fn bind_or_kill_and_retry(addr: SocketAddr, label: &str) -> tokio::net::Tc
     }
 }
 
-fn try_kill_previous_server(port: u16) -> bool {
-    if let Some(pid) = find_pid_on_port(port) {
-        eprintln!(
-            "ポート {} を使用中のプロセス (PID: {}) を終了しています...",
-            port, pid
-        );
-        let result = kill_process(pid);
-        if result {
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        result
-    } else {
-        false
-    }
-}
+/// Try to gracefully shut down an existing narou server via HTTP POST /api/shutdown.
+/// This is fully cross-platform (no OS-specific commands).
+fn try_shutdown_existing_server(host: &str, port: u16) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
 
-fn kill_process(pid: u32) -> bool {
-    #[cfg(windows)]
-    {
-        std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-    #[cfg(not(windows))]
-    {
-        std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-}
+    let display = if host == "127.0.0.1" { "localhost" } else { host };
+    let addr: SocketAddr = match format!("{}:{}", host, port).parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
 
-fn find_pid_on_port(port: u16) -> Option<u32> {
-    #[cfg(windows)]
-    {
-        let output = std::process::Command::new("netstat")
-            .args(["-ano", "-p", "TCP"])
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let port_str = format!(":{}", port);
-        for line in stdout.lines() {
-            if line.contains(&port_str) && line.contains("LISTENING") {
-                return line.split_whitespace().last()?.parse().ok();
-            }
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
+        return false;
+    };
+
+    eprintln!(
+        "ポート {} で稼働中のサーバへシャットダウンを要求しています...",
+        port
+    );
+
+    let request = format!(
+        "POST /api/shutdown HTTP/1.1\r\n\
+         Host: {}:{}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: 2\r\n\
+         Connection: close\r\n\r\n\
+         {{}}",
+        display, port
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let mut buf = [0u8; 512];
+    let _ = stream.read(&mut buf);
+    drop(stream);
+
+    // Wait for port to become free (up to 5 seconds)
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(250));
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_err() {
+            return true;
         }
-        None
     }
-    #[cfg(not(windows))]
-    {
-        let output = std::process::Command::new("lsof")
-            .args(["-i", &format!(":{}", port), "-t", "-sTCP:LISTEN"])
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout.trim().lines().next()?.parse().ok()
-    }
+    false
 }
 
 fn load_basic_auth_header() -> Result<Option<String>, String> {
