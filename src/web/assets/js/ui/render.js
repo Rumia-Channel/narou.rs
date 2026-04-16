@@ -857,14 +857,18 @@ function formatDateCell(dateStr, options = {}) {
   const labelClass = options.labelClass || '';
   let html = '<div class="date-cell">';
   html += `<span class="date-cell-date">${date}</span>`;
-  if (time) {
-    html += `<span class="date-cell-time">${time}</span>`;
+  if (time || label) {
+    html += '<span class="date-cell-inline">';
+    if (time) {
+      html += `<span class="date-cell-time">${time}</span>`;
+    }
+    if (label) {
+      html += `<span class="date-cell-label${labelClass ? ' ' + labelClass : ''}">${label}</span>`;
+    }
+    html += '</span>';
   }
   if (extraLine) {
     html += `<span class="date-cell-extra">${extraLine}</span>`;
-  }
-  if (label) {
-    html += `<span class="date-cell-label${labelClass ? ' ' + labelClass : ''}">${label}</span>`;
   }
   html += '</div>';
   return html;

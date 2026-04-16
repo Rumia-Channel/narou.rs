@@ -301,10 +301,21 @@ li.enable-selected.disabled a {
 }
 
 .date-cell-date,
-.date-cell-time,
-.date-cell-extra,
-.date-cell-label {
+.date-cell-extra {
   display: block;
+}
+
+.date-cell-inline {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0.25em;
+  white-space: nowrap;
+}
+
+.date-cell-time,
+.date-cell-label {
+  display: inline-block;
 }
 
 .date-cell-time,
