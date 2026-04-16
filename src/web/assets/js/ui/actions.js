@@ -250,7 +250,7 @@ export function bindActions() {
   on('notepad-close', () => El.notepadModal?.classList.add('hide'));
   on('save-notepad-button', async () => {
     const text = El.notepad?.value || '';
-    await postJson('/api/notepad/save', { text });
+    await postJson('/api/notepad/save', { text, content: text });
     El.notepadModal?.classList.add('hide');
     showNotification('メモ帳を保存しました', 'success');
   });
@@ -269,6 +269,20 @@ export function bindActions() {
   // --- About modal ---
   on('about-close', () => El.aboutModal?.classList.add('hide'));
   on('about-ok', () => El.aboutModal?.classList.add('hide'));
+  on('about-check-latest', async () => {
+    await updateLatestVersionInfo();
+  });
+
+  on('queue-restore-yes', async () => {
+    El.queueRestoreModal?.classList.add('hide');
+    await postJson('/api/restore_pending_tasks', {});
+    await refreshQueueDetailed();
+  });
+  on('queue-restore-no', async () => {
+    El.queueRestoreModal?.classList.add('hide');
+    await postJson('/api/defer_restore_pending_tasks', {});
+    await refreshQueueDetailed();
+  });
 
   // --- Column visibility modal ---
   on('colvis-close', () => El.colvisModal?.classList.add('hide'));
@@ -612,7 +626,14 @@ export function bindActions() {
     backupSingle: (id) => postJson('/api/backup', { targets: [String(id)] }),
     downloadForceSingle: (id) => postJson('/api/download', { targets: [String(id)], force: true }),
     mailSingle: (id) => postJson('/api/mail', { targets: [String(id)] }),
-    authorComments: (id) => { window.location.href = '/novels/' + id + '/author_comments'; },
+    authorComments: (id) => {
+      const popup = window.open(
+        '/novels/' + id + '/author_comments',
+        'author_comments_' + id,
+        'width=760,height=640,menubar=no,toolbar=no,location=no,status=no,resizable=yes,scrollbars=yes'
+      );
+      if (!popup) window.location.href = '/novels/' + id + '/author_comments';
+    },
     refreshTags: () => refreshTags(),
     refreshList: () => refreshList(),
   };
@@ -767,8 +788,18 @@ async function addTagFromInput() {
 /* ===== Notepad ===== */
 
 async function openNotepad() {
+  const popup = window.open(
+    '/notepad',
+    'narou_notepad',
+    'width=760,height=720,menubar=no,toolbar=no,location=no,status=no,resizable=yes,scrollbars=yes'
+  );
+  if (popup) {
+    popup.focus();
+    return;
+  }
+
   const data = await fetchJson('/api/notepad/read');
-  if (El.notepad) El.notepad.value = data?.text || '';
+  if (El.notepad) El.notepad.value = data?.text || data?.content || '';
   El.notepadModal?.classList.remove('hide');
 }
 
@@ -782,6 +813,28 @@ async function openAbout() {
     }
   } catch { /* ignore */ }
   El.aboutModal?.classList.remove('hide');
+  if (El.aboutLatestVersion) {
+    El.aboutLatestVersion.textContent = '最新バージョン: 確認中...';
+  }
+  void updateLatestVersionInfo();
+}
+
+async function updateLatestVersionInfo() {
+  if (!El.aboutLatestVersion) return;
+  try {
+    const data = await fetchJson('/api/version/latest.json');
+    if (data?.success) {
+      const latest = data.latest_version || '-';
+      const current = data.current_version || '-';
+      El.aboutLatestVersion.textContent =
+        `最新バージョン: ${latest}${data.update_available ? ' (更新あり)' : ' (最新)'} / 現在: ${current}`;
+      return;
+    }
+    El.aboutLatestVersion.textContent =
+      `最新バージョン: 取得失敗${data?.message ? ' (' + data.message + ')' : ''}`;
+  } catch (e) {
+    El.aboutLatestVersion.textContent = '最新バージョン: 取得失敗';
+  }
 }
 
 /* ===== Diff list ===== */

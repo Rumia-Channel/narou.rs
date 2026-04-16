@@ -16,6 +16,14 @@ pub async fn help_page() -> Html<&'static str> {
     Html(include_str!("assets/help.html"))
 }
 
+pub async fn about_page() -> Html<&'static str> {
+    Html(include_str!("assets/about.html"))
+}
+
+pub async fn bookmarklet_page() -> Html<&'static str> {
+    Html(include_str!("assets/bookmarklet.html"))
+}
+
 pub async fn novel_setting_page(Path(_id): Path<i64>) -> Html<&'static str> {
     Html(include_str!("assets/novel_setting.html"))
 }

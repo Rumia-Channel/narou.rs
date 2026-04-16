@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>narou.rs - ブックマークレット</title>
+<link rel="stylesheet" href="/assets/css/theme.css">
+<link rel="stylesheet" href="/assets/css/base.css">
+<link rel="stylesheet" href="/assets/css/layout.css">
+<style>
+.bookmarklet-container { max-width: 44em; margin: 1.5em auto; padding: 0 var(--container-padding); line-height: 1.6; }
+.bookmarklet-container h1 { border-bottom: 0.15em solid var(--btn-primary-bg); padding-bottom: .3em; }
+.bookmarklet-container code { background: var(--table-stripe-bg); padding: .15em .3em; border-radius: var(--border-radius); }
+.bookmarklet-container .bookmarklet {
+  display: inline-block;
+  padding: .5em .8em;
+  border: 0.07em solid var(--btn-primary-border);
+  border-radius: var(--border-radius);
+  background: var(--btn-primary-bg);
+  color: var(--btn-text);
+  text-decoration: none;
+  margin: .5em 0;
+}
+.bookmarklet-container a { color: var(--link-color); }
+</style>
+</head>
+<body>
+<nav class="navbar">
+  <div class="navbar-inner">
+    <a class="navbar-brand" href="/">Narou.rs</a>
+  </div>
+</nav>
+<div class="bookmarklet-container">
+  <h1>ブックマークレット</h1>
+  <p>下のリンクをブックマークバーへドラッグして使います。</p>
+  <p><a id="bookmarklet-link" class="bookmarklet" href="#">Narou.rs を開く</a></p>
+  <p>ブックマークレットは、現在のタブから narou.rs を別ウィンドウで開きます。</p>
+  <p><a href="/about">About</a> / <a href="/help">Help</a></p>
+</div>
+<script>
+(function() {
+  var link = document.getElementById('bookmarklet-link');
+  var code = "javascript:(function(){window.open('" + location.origin.replace(/'/g, "%27") + "/','narou_rs','width=1200,height=800,resizable=yes,scrollbars=yes');})();";
+  link.href = code;
+  link.textContent = 'Narou.rs を開く';
+})();
+</script>
+</body>
+</html>

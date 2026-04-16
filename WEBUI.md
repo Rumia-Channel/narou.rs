@@ -13,12 +13,13 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | 2 | `/settings` | 環境設定ページ | `settings.html` + `settings.js` | ✅ |
 | 3 | `/novels/:id/setting` | 個別小説設定 | `settings.js` 内で動的切替 | ✅ |
 | 4 | `/help` | ヘルプページ | `window.open` で外部/内部 | ✅ |
-| 5 | `/about` | バージョン情報 | `#about-modal` モーダル | ✅ |
+| 5 | `/about` | バージョン情報 | `about.html` + `#about-modal` | ✅ |
 | 6 | `/notepad` | メモ帳 (別ページ) | `notepad.html` | ✅ |
 | 7 | `/novels/:id/author_comments` | 前書き/後書き | `author_comments.html` + API | ✅ |
 | 8 | `/novels/:id/download` | ebook ダウンロード | `novels.rs` download_ebook | ✅ |
 | 9 | `/_rebooting` | 再起動中表示 | `rebooting.html` | ✅ |
-| 10 | `/edit_menu` | 編集メニュー | `edit_menu.html` | ✅ |
+| 10 | `/bookmarklet` | ブックマークレット案内 | `bookmarklet.html` | ✅ |
+| 11 | `/edit_menu` | 編集メニュー | `edit_menu.html` | ✅ |
 
 ---
 
@@ -243,7 +244,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 ### 2.6 範囲選択メニュー
 
 Ruby版: `#rect-select-menu` — 範囲選択モードでドラッグ後に表示
-**Rust版: ❌ 未実装 (選択モード切替のみ、ドラッグ選択動作は未実装)**
+**Rust版: ✅ 実装済み (ドラッグ選択/矩形選択/ハイブリッド選択)**
 
 ---
 
@@ -276,10 +277,10 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 |------|--------|--------|------|
 | モーダル表示 | `#queue-manager-modal` | `#queue-modal` | ✅ |
 | 実行中タスク表示 | タスク文字列表示 | `#queue-running-list` | ✅ |
-| 待機タスクリスト | ドラッグ並替 | `#queue-pending-list` (詳細+個別削除+上下並替) | 🟡 (ドラッグ並替なし、上下ボタンあり) |
+| 待機タスクリスト | ドラッグ並替 | `#queue-pending-list` (詳細+個別削除+上下並替+ドラッグ) | ✅ |
 | キュー消去ボタン | あり | `#queue-clear-button` | ✅ |
 | 再読み込みボタン | あり | `#queue-reload-button` | ✅ |
-| ドラッグ&ドロップ並替 | あり | なし (上下ボタンで代替) | 🟡 |
+| ドラッグ&ドロップ並替 | あり | あり (上下ボタン + ドラッグ) | ✅ |
 | 個別タスク取消 | あり | POST `/api/remove_pending_task` + 🗑ボタン | ✅ |
 | 実行中タスク中止 | あり | POST `/api/cancel_running_task` + ⏹ボタン | ✅ |
 
@@ -302,7 +303,8 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | 機能 | Ruby版 | Rust版 | 状態 |
 |------|--------|--------|------|
 | バージョン表示 | あり | `#about-version` (APIから取得) | ✅ |
-| 最新バージョンチェック | `/api/version/latest.json` | なし | ❌ |
+| 最新バージョンチェック | `/api/version/latest.json` | あり | ✅ |
+| ブックマークレット案内 | あり | `/bookmarklet` | ✅ |
 | ライセンス情報 | あり | 簡易テキスト | 🟡 |
 
 ### 3.4 差分表示モーダル
@@ -655,7 +657,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 **モーダル**: 9/9 ✅ (タグ編集, About, 差分, 確認, メモ帳, ダウンロード, キュー, 列可視性, タグ指定アップデート)
 **キーボードショートカット**: 12/12 ✅
 **テーマ**: 6/6 ✅ (全ページCSS変数化、hardcoded色・px値なし)
-**API**: 70 実装済み / 5 未実装 (eject, version/latest, download4ssl, download_request, downloadable.gif)
+**API**: 71 実装済み / 4 未実装 (eject, download4ssl, download_request, downloadable.gif)
 **WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, TermColorLight色付き出力 ✅, 進捗バー ✅, DB自動更新+table.reload+tag.updateCanvas ✅, 履歴on-connect ✅, console.clear ✅, shutdown/reboot ✅, 起動時バージョン表示+未完了タスク警告 ✅, モーダル/メモ帳同期 ❌
 **設定ページ**: ✅ (`webui.performance-mode` の auto/on/off と `webui.table.reload-timing` の every/queue を反映)
 **言語切替**: ✅ (Rust独自)

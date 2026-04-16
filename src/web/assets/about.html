@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>narou.rs - について</title>
+<link rel="stylesheet" href="/assets/css/theme.css">
+<link rel="stylesheet" href="/assets/css/base.css">
+<link rel="stylesheet" href="/assets/css/layout.css">
+<style>
+.about-container { max-width: 44em; margin: 1.5em auto; padding: 0 var(--container-padding); line-height: 1.6; }
+.about-container h1 { border-bottom: 0.15em solid var(--btn-primary-bg); padding-bottom: .3em; }
+.about-container .panel { background: var(--bg-secondary); border-radius: var(--border-radius); padding: 1em; margin: 1em 0; }
+.about-container a { color: var(--link-color); }
+.about-container a:hover { color: var(--link-hover); }
+.about-actions { display: flex; gap: .5em; flex-wrap: wrap; margin-top: 1em; }
+.about-actions .btn { text-decoration: none; }
+</style>
+</head>
+<body>
+<nav class="navbar">
+  <div class="navbar-inner">
+    <a class="navbar-brand" href="/">Narou.rs</a>
+  </div>
+</nav>
+<div class="about-container">
+  <h1>narou.rs について</h1>
+  <div class="panel">
+    <p><strong>Narou.rs WEB UI</strong></p>
+    <p>Version: <span id="version-current">-</span></p>
+    <p>Latest: <span id="version-latest">-</span></p>
+    <p id="version-note"></p>
+  </div>
+  <div class="panel">
+    <p>narou.rb の互換実装です。Web小説のダウンロード・更新・変換を行えます。</p>
+    <div class="about-actions">
+      <a class="btn btn-primary" href="/bookmarklet" target="_blank" rel="noopener">ブックマークレット</a>
+      <a class="btn btn-default" href="/help" target="_blank" rel="noopener">ヘルプ</a>
+      <a class="btn btn-default" href="/">メインへ戻る</a>
+    </div>
+  </div>
+</div>
+<script>
+(function() {
+  var current = document.getElementById('version-current');
+  var latest = document.getElementById('version-latest');
+  var note = document.getElementById('version-note');
+
+  function setText(el, value) {
+    if (el) el.textContent = value;
+  }
+
+  fetch('/api/version/current.json')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      setText(current, data.version || '-');
+    });
+
+  fetch('/api/version/latest.json')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.success) {
+        setText(latest, data.latest_version || '-');
+        setText(note, data.update_available ? '更新があります' : '最新です');
+      } else {
+        setText(latest, '-');
+        setText(note, data.message || '取得に失敗しました');
+      }
+    });
+})();
+</script>
+</body>
+</html>

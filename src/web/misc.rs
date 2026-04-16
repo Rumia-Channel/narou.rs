@@ -2,6 +2,8 @@ use axum::{
     extract::{Query, State},
     response::Json,
 };
+use reqwest::header::USER_AGENT;
+use std::time::Duration;
 
 use crate::compat::{load_local_setting_bool, load_local_setting_string};
 use crate::db::inventory::{Inventory, InventoryScope};
@@ -13,6 +15,66 @@ use super::state::{ApiResponse, LogsParams};
 
 pub async fn version_current(State(_state): State<AppState>) -> Json<serde_json::Value> {
     Json(version::version_json())
+}
+
+pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::Value> {
+    let current = version::create_version_string();
+    let repo = "Rumia-Channel/narou.rs";
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest client");
+
+    let resp = client
+        .get(url)
+        .header(USER_AGENT, "narou.rs")
+        .send()
+        .await;
+
+    match resp {
+        Ok(resp) if resp.status().is_success() => {
+            let json_text = resp.text().await.unwrap_or_default();
+            let json: serde_json::Value = serde_json::from_str(&json_text).unwrap_or_default();
+            let latest = json["tag_name"]
+                .as_str()
+                .or_else(|| json["name"].as_str())
+                .unwrap_or("")
+                .trim()
+                .trim_start_matches('v')
+                .to_string();
+            let current_plain = normalize_version(&current);
+            Json(serde_json::json!({
+                "success": true,
+                "current_version": current,
+                "latest_version": latest,
+                "update_available": !latest.is_empty() && latest != current_plain,
+                "url": json["html_url"].as_str().unwrap_or("https://github.com/Rumia-Channel/narou.rs/releases/latest"),
+            }))
+        }
+        Ok(resp) => Json(serde_json::json!({
+            "success": false,
+            "current_version": current,
+            "message": format!("latest version request failed: {}", resp.status()),
+            "url": "https://github.com/Rumia-Channel/narou.rs/releases/latest",
+        })),
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "current_version": current,
+            "message": e.to_string(),
+            "url": "https://github.com/Rumia-Channel/narou.rs/releases/latest",
+        })),
+    }
+}
+
+fn normalize_version(version: &str) -> String {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -109,14 +171,17 @@ pub async fn all_novel_ids(State(_state): State<AppState>) -> Json<serde_json::V
 
 pub async fn notepad_read(State(_state): State<AppState>) -> Json<serde_json::Value> {
     let content = std::fs::read_to_string(".narou/notepad.txt").unwrap_or_default();
-    Json(serde_json::json!({ "content": content }))
+    Json(serde_json::json!({ "content": content, "text": content }))
 }
 
 pub async fn notepad_save(
     State(_state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
-    let content = body["content"].as_str().unwrap_or("");
+    let content = body["content"]
+        .as_str()
+        .or_else(|| body["text"].as_str())
+        .unwrap_or("");
     let result = std::fs::write(".narou/notepad.txt", content);
 
     match result {

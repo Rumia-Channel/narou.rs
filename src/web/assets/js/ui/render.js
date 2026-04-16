@@ -16,6 +16,9 @@ const TAG_COLOR_MAP = {
   white: 'tag-white',
 };
 
+let selectionDrag = null;
+let queueDragTaskId = null;
+
 /* ===== Rendering ===== */
 
 export function renderNovelList() {
@@ -26,8 +29,8 @@ export function renderNovelList() {
   const sorted = sortNovels(filtered);
 
   const fragment = document.createDocumentFragment();
-  for (const novel of sorted) {
-    fragment.appendChild(createRow(novel));
+  for (let i = 0; i < sorted.length; i++) {
+    fragment.appendChild(createRow(sorted[i], i));
   }
   tbody.textContent = '';
   tbody.appendChild(fragment);
@@ -50,29 +53,110 @@ function getFilteredNovels() {
   }
 
   // Text/tag filter
-  if (State.filterText) {
-    const q = State.filterText.toLowerCase();
-    // Support tag: prefix for tag-only filtering (supports OR with |)
-    if (q.startsWith('tag:')) {
-      const tagQ = q.slice(4);
-      const tagParts = tagQ.split('|').map(t => t.trim()).filter(Boolean);
-      list = list.filter(n =>
-        tagParts.some(tp =>
-          (n.tags || []).some(t => t.toLowerCase().includes(tp))
-        )
-      );
-    } else {
-      list = list.filter(n => {
-        const searchable = [
-          n.title || '', n.author || '', n.sitename || '',
-          String(n.id), ...(n.tags || []),
-        ].join(' ').toLowerCase();
-        return searchable.includes(q);
-      });
-    }
+  const query = (State.filterText || '').trim();
+  if (query) {
+    const groups = splitFilterGroups(query);
+    list = list.filter(novel => groups.some(group => group.every(token => matchFilterToken(novel, token))));
   }
 
   return list;
+}
+
+function splitFilterGroups(query) {
+  return [splitFilterTerms(query)];
+}
+
+function splitFilterTerms(group) {
+  const terms = [];
+  let current = '';
+  let quoted = false;
+
+  for (let i = 0; i < group.length; i++) {
+    const ch = group[i];
+    if (ch === '"') {
+      quoted = !quoted;
+      current += ch;
+      continue;
+    }
+    if (/\s/.test(ch) && !quoted) {
+      if (current.trim()) terms.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+
+  if (current.trim()) terms.push(current.trim());
+  return terms.map(parseFilterToken);
+}
+
+function parseFilterToken(rawToken) {
+  const token = rawToken.trim();
+  const negate = token.startsWith('-') || token.startsWith('!');
+  const body = negate ? token.slice(1) : token;
+  const colon = body.indexOf(':');
+  const field = colon > 0 ? body.slice(0, colon).toLowerCase() : '';
+  const value = stripFilterQuotes((colon > 0 ? body.slice(colon + 1) : body).trim()).toLowerCase();
+  return { negate, field, value };
+}
+
+function stripFilterQuotes(value) {
+  if (value.startsWith('"') && value.endsWith('"')) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
+function matchFilterToken(novel, token) {
+  const target = (text) => String(text || '').toLowerCase();
+  const tags = (novel.tags || []).map(tag => target(tag));
+  let matched = false;
+  const values = token.value.split('|').map(v => v.trim()).filter(Boolean);
+  const matchAny = (predicate) => values.some(predicate);
+  const plainText = [
+    target(novel.title),
+    target(novel.author),
+    target(novel.sitename),
+    String(novel.id),
+    ...tags,
+  ].join(' ');
+
+  switch (token.field) {
+    case 'tag':
+      matched = matchAny(v =>
+        tags.some(tag => tag.includes(v))
+      );
+      break;
+    case 'author':
+      matched = matchAny(v => target(novel.author).includes(v));
+      break;
+    case 'site':
+    case 'sitename':
+      matched = matchAny(v => target(novel.sitename).includes(v));
+      break;
+    case 'title':
+      matched = matchAny(v => target(novel.title).includes(v));
+      break;
+    case 'id':
+      matched = matchAny(v => String(novel.id) === v);
+      break;
+    case 'status':
+      matched = matchAny(v => {
+        if (v === 'frozen') return !!novel.frozen;
+        if (v === 'unfrozen' || v === 'active') return !novel.frozen;
+        if (v === 'ongoing') return novel.end === false || novel.end === 0;
+        if (v === 'finished' || v === 'complete') return novel.end === true || novel.end === 1;
+        return false;
+      });
+      break;
+    default:
+      matched = values.length > 0
+        ? values.some(v => plainText.includes(v))
+        : plainText.includes(token.value);
+      break;
+  }
+
+  return token.negate ? !matched : matched;
 }
 
 function sortNovels(novels) {
@@ -105,9 +189,11 @@ function sortNovels(novels) {
   });
 }
 
-function createRow(novel) {
+function createRow(novel, rowIndex) {
   const tr = document.createElement('tr');
   tr.dataset.id = novel.id;
+  tr.dataset.rowIndex = String(rowIndex);
+  tr.draggable = false;
 
   const isFrozen = novel.frozen;
   const isSelected = State.selectedIds.has(String(novel.id));
@@ -115,12 +201,7 @@ function createRow(novel) {
   if (isFrozen) tr.classList.add('frozen');
   if (isSelected) tr.classList.add('selected');
 
-  // Click to select (hybrid: small movement = toggle; drag not implemented yet)
-  tr.addEventListener('click', (e) => {
-    if (e.target.closest('.tag-label') || e.target.closest('.row-action-btn')
-        || e.target.closest('a[href]')) return;
-    toggleSelect(novel.id);
-  });
+  bindRowSelection(tr, novel, rowIndex);
 
   // Right-click context menu
   tr.addEventListener('contextmenu', (e) => {
@@ -272,6 +353,94 @@ function createRow(novel) {
 
 /* ===== Selection ===== */
 
+function syncSelectionClasses() {
+  const rows = El.novelListBody?.querySelectorAll('tr[data-id]') || [];
+  for (const row of rows) {
+    row.classList.toggle('selected', State.selectedIds.has(String(row.dataset.id)));
+  }
+  updateSelectionBadge();
+  updateEnableSelected();
+}
+
+function setSelectedIds(ids, replace = true) {
+  if (replace) {
+    State.selectedIds.clear();
+  }
+  for (const id of ids) {
+    State.selectedIds.add(String(id));
+  }
+  syncSelectionClasses();
+}
+
+function getRowIndexFromElement(row) {
+  const idx = Number.parseInt(row?.dataset.rowIndex || '', 10);
+  return Number.isFinite(idx) ? idx : -1;
+}
+
+function bindRowSelection(tr, novel, rowIndex) {
+  const interactiveSelector = '.tag-label, .row-action-btn, a[href], button, input, textarea, select';
+
+  tr.addEventListener('mousedown', (e) => {
+    if (e.button !== 0 || e.target.closest(interactiveSelector)) return;
+    if (State.selectMode === 'single') return;
+
+    selectionDrag = {
+      startIndex: rowIndex,
+      lastIndex: rowIndex,
+      moved: false,
+      startX: e.clientX,
+      startY: e.clientY,
+      mode: State.selectMode,
+    };
+  });
+
+  tr.addEventListener('click', (e) => {
+    if (e.target.closest(interactiveSelector)) return;
+    if (selectionDrag?.moved) return;
+
+    if (State.selectMode === 'single') {
+      clearSelection();
+      toggleSelect(novel.id);
+      return;
+    }
+
+    toggleSelect(novel.id);
+  });
+}
+
+function handleSelectionDragMove(e) {
+  if (!selectionDrag || e.buttons !== 1) return;
+  const dx = Math.abs(e.clientX - selectionDrag.startX);
+  const dy = Math.abs(e.clientY - selectionDrag.startY);
+  if (!selectionDrag.moved && dx < 4 && dy < 4) return;
+
+  const rows = Array.from(El.novelListBody?.querySelectorAll('tr[data-id]') || []);
+  const hit = document.elementFromPoint(e.clientX, e.clientY)?.closest?.('tr[data-id]');
+  if (!hit) return;
+
+  const currentIndex = getRowIndexFromElement(hit);
+  if (currentIndex < 0 || currentIndex === selectionDrag.lastIndex) {
+    selectionDrag.moved = true;
+    return;
+  }
+
+  selectionDrag.moved = true;
+  selectionDrag.lastIndex = currentIndex;
+
+  const start = Math.min(selectionDrag.startIndex, currentIndex);
+  const end = Math.max(selectionDrag.startIndex, currentIndex);
+  const ids = rows.slice(start, end + 1).map(row => row.dataset.id);
+  setSelectedIds(ids, true);
+}
+
+function handleSelectionDragEnd() {
+  if (!selectionDrag) return;
+  selectionDrag = null;
+}
+
+document.addEventListener('mousemove', handleSelectionDragMove);
+document.addEventListener('mouseup', handleSelectionDragEnd);
+
 export function toggleSelect(id) {
   const key = String(id);
   if (State.selectedIds.has(key)) {
@@ -280,33 +449,27 @@ export function toggleSelect(id) {
     State.selectedIds.add(key);
   }
 
-  const row = El.novelListBody?.querySelector(`tr[data-id="${id}"]`);
-  if (row) row.classList.toggle('selected', State.selectedIds.has(key));
-
-  updateSelectionBadge();
-  updateEnableSelected();
+  syncSelectionClasses();
 }
 
 export function selectVisible() {
   const rows = El.novelListBody?.querySelectorAll('tr[data-id]') || [];
   for (const row of rows) {
     State.selectedIds.add(row.dataset.id);
-    row.classList.add('selected');
   }
-  updateSelectionBadge();
-  updateEnableSelected();
+  syncSelectionClasses();
 }
 
 export function selectAll() {
   for (const n of State.novels) {
     State.selectedIds.add(String(n.id));
   }
-  renderNovelList();
+  syncSelectionClasses();
 }
 
 export function clearSelection() {
   State.selectedIds.clear();
-  renderNovelList();
+  syncSelectionClasses();
 }
 
 function updateSelectionBadge() {
@@ -446,7 +609,7 @@ function renderTaskItem(task, isRunning, idx, total) {
       : `<button class="queue-task-down" disabled title="下へ">&#x25BC;</button>`;
     actionBtns = `${upBtn}${downBtn}<button class="queue-task-delete" data-task-id="${esc(task.id)}" title="削除">&#x1F5D1;</button>`;
   }
-  return `<div class="queue-task-item${isRunning ? ' queue-running' : ''}" data-task-id="${esc(task.id)}">
+  return `<div class="queue-task-item${isRunning ? ' queue-running' : ''}" data-task-id="${esc(task.id)}"${isRunning ? '' : ' draggable="true"'}>
     <span class="queue-task-icon">${icon}</span>
     <span class="queue-task-label">${esc(label)}</span>
     <span class="queue-task-target">${esc(task.target)}</span>
@@ -500,6 +663,7 @@ export function renderQueueDetailed() {
       };
       wireReorder('.queue-task-up', -1);
       wireReorder('.queue-task-down', 1);
+      wireQueueDragDrop();
     } else {
       El.queuePendingList.textContent = 'なし';
     }
@@ -507,6 +671,88 @@ export function renderQueueDetailed() {
   if (El.queuePendingCount) {
     El.queuePendingCount.textContent = `(${qd.pending_count || 0})`;
   }
+  if (State.queueRestoreCheckPending) {
+    State.queueRestoreCheckPending = false;
+    State.queueRestorePrompted = qd.pending_count > 0;
+    if (qd.pending_count > 0) {
+      El.queueRestoreModal?.classList.remove('hide');
+    }
+  }
+}
+
+function wireQueueDragDrop() {
+  if (!El.queuePendingList) return;
+  const rows = Array.from(El.queuePendingList.querySelectorAll('.queue-task-item[data-task-id]'));
+
+  rows.forEach(row => {
+    row.addEventListener('dragstart', (e) => {
+      queueDragTaskId = row.dataset.taskId || null;
+      row.classList.add('queue-drag-source');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', queueDragTaskId || '');
+    });
+    row.addEventListener('dragend', () => {
+      queueDragTaskId = null;
+      row.classList.remove('queue-drag-source');
+      El.queuePendingList?.querySelectorAll('.queue-drop-before, .queue-drop-after')
+        .forEach(el => el.classList.remove('queue-drop-before', 'queue-drop-after'));
+    });
+    row.addEventListener('dragover', (e) => {
+      if (!queueDragTaskId || queueDragTaskId === row.dataset.taskId) return;
+      e.preventDefault();
+      const rect = row.getBoundingClientRect();
+      const before = e.clientY < rect.top + rect.height / 2;
+      row.classList.toggle('queue-drop-before', before);
+      row.classList.toggle('queue-drop-after', !before);
+    });
+    row.addEventListener('dragleave', () => {
+      row.classList.remove('queue-drop-before', 'queue-drop-after');
+    });
+    row.addEventListener('drop', async (e) => {
+      if (!queueDragTaskId || queueDragTaskId === row.dataset.taskId) return;
+      e.preventDefault();
+      const rect = row.getBoundingClientRect();
+      const before = e.clientY < rect.top + rect.height / 2;
+      await reorderQueuedTask(queueDragTaskId, row.dataset.taskId, before);
+    });
+  });
+
+  if (El.queuePendingList.dataset.dragParentBound !== 'true') {
+    El.queuePendingList.dataset.dragParentBound = 'true';
+    El.queuePendingList.addEventListener('dragover', (e) => {
+      if (!queueDragTaskId) return;
+      e.preventDefault();
+    });
+    El.queuePendingList.addEventListener('drop', async (e) => {
+      if (!queueDragTaskId) return;
+      const target = e.target.closest?.('.queue-task-item[data-task-id]');
+      if (target) return;
+      e.preventDefault();
+      await reorderQueuedTask(queueDragTaskId, null, false);
+    });
+  }
+}
+
+async function reorderQueuedTask(sourceId, targetId, before) {
+  queueDragTaskId = null;
+  const pending = State.queueDetailed?.pending || [];
+  const ids = pending.map(t => t.id);
+  const from = ids.indexOf(sourceId);
+  if (from < 0) return;
+  ids.splice(from, 1);
+  if (targetId) {
+    let to = ids.indexOf(targetId);
+    if (to < 0) to = ids.length;
+    if (!before) to += 1;
+    if (to < 0) to = 0;
+    if (to > ids.length) to = ids.length;
+    ids.splice(to, 0, sourceId);
+  } else {
+    ids.push(sourceId);
+  }
+  await postJson('/api/reorder_pending_tasks', { task_ids: ids });
+  const { refreshQueueDetailed } = await import('./actions.js');
+  await refreshQueueDetailed();
 }
 
 /* ===== Notifications ===== */

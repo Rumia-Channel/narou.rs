@@ -343,9 +343,12 @@
           <div class="modal-body">
             <p><strong>Narou.rs WEB UI</strong></p>
             <p>Version: <span id="about-version">-</span></p>
+            <p id="about-latest-version">最新バージョン: -</p>
             <p>Rust port of narou.rb — Web小説管理・電子書籍変換</p>
+            <p><a href="/bookmarklet" target="_blank" rel="noopener">ブックマークレット</a></p>
           </div>
           <div class="modal-footer">
+            <button class="btn btn-default" id="about-check-latest" type="button">最新バージョンを確認</button>
             <button class="btn btn-default" id="about-ok" type="button">OK</button>
           </div>
         </div>
@@ -445,6 +448,24 @@
               <button class="btn btn-default btn-sm" id="queue-reload-button" type="button">再読み込み</button>
               <button class="btn btn-default btn-sm" id="queue-clear-button" type="button">キュー消去</button>
             </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Queue Restore Prompt -->
+    <div class="modal-overlay hide" id="queue-restore-modal">
+      <div class="modal-dialog modal-dialog-sm">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h4 class="modal-title">待機中タスクの復元</h4>
+          </div>
+          <div class="modal-body">
+            <p>前回の終了時に残っていた待機中タスクがあります。復元しますか？</p>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="queue-restore-no" type="button">破棄</button>
+            <button class="btn btn-primary" id="queue-restore-yes" type="button">復元</button>
           </div>
         </div>
       </div>

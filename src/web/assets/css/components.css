@@ -608,6 +608,22 @@ li.enable-selected.disabled a {
   gap: 0.5em;
 }
 
+.queue-task-item[draggable="true"] {
+  cursor: grab;
+}
+
+.queue-task-item.queue-drag-source {
+  opacity: 0.65;
+}
+
+.queue-task-item.queue-drop-before {
+  box-shadow: inset 0 0.15em 0 0 var(--btn-primary-bg);
+}
+
+.queue-task-item.queue-drop-after {
+  box-shadow: inset 0 -0.15em 0 0 var(--btn-primary-bg);
+}
+
 .queue-task-item:last-child {
   border-bottom: none;
 }

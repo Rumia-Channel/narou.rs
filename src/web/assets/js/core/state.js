@@ -28,6 +28,8 @@ export const State = {
   tagColors: {},
   queueStatus: { pending: 0, completed: 0, failed: 0, running: null },
   queueDetailed: { pending: [], running: [], pending_count: 0, running_count: 0 },
+  queueRestorePrompted: false,
+  queueRestoreCheckPending: true,
   filterText: '',
 
   // View flags (persisted to localStorage)
@@ -75,10 +77,12 @@ const ELEMENT_IDS = [
   'notepad-modal', 'notepad', 'notepad-close', 'save-notepad-button',
   'queue-modal', 'queue-modal-close', 'queue-clear-button', 'queue-reload-button',
   'queue-running-list', 'queue-pending-list', 'queue-pending-count',
+  'queue-restore-modal', 'queue-restore-yes', 'queue-restore-no',
   'tag-list-canvas',
   'tag-edit-modal', 'tag-edit-close', 'tag-edit-cancel',
   'tag-editor-current', 'new-tag-input', 'add-tag-button',
   'about-modal', 'about-close', 'about-ok', 'about-version',
+  'about-latest-version', 'about-check-latest',
   'confirm-modal', 'confirm-title', 'confirm-message',
   'confirm-cancel', 'confirm-ok',
   'remove-modal', 'remove-novel-list', 'remove-with-file',
