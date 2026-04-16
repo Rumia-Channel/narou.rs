@@ -34,8 +34,9 @@ target
 
 /sample
 /examples
-/.cocoindex_code
 
 errors.txt
 
 *.txt
+# CocoIndex Code (ccc)
+/.cocoindex_code/
