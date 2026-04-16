@@ -883,6 +883,7 @@ const COLVIS_COLUMNS = [
   { cls: 'col-length', label: '文字数' },
   { cls: 'col-status', label: '状態' },
   { cls: 'col-url', label: 'リンク' },
+  { cls: 'col-story', label: 'あらすじ' },
   { cls: 'col-menu', label: '個別' },
 ];
 

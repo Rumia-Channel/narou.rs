@@ -274,7 +274,9 @@ impl StreamingLogger {
 
     pub fn log(&self, level: &str, message: &str) {
         let entry = StreamingLogEntry {
-            timestamp: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            timestamp: chrono::Utc::now()
+                .with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).unwrap())
+                .format("%Y-%m-%d %H:%M:%S").to_string(),
             level: level.to_string(),
             message: message.to_string(),
         };

@@ -3,6 +3,7 @@ use axum::{
     http::StatusCode,
     response::{Json, Response},
 };
+use chrono::{DateTime, FixedOffset, Utc};
 
 use crate::compat::{load_frozen_ids_from_inventory, record_is_frozen, set_frozen_state};
 use crate::db::{with_database, with_database_mut};
@@ -10,6 +11,19 @@ use crate::error::NarouError;
 
 use super::AppState;
 use super::state::{ApiResponse, IdPath, ListParams, NovelListItem, NovelListResponse};
+
+/// JST (+09:00) timezone offset
+fn jst() -> FixedOffset {
+    FixedOffset::east_opt(9 * 3600).unwrap()
+}
+
+fn format_jst(dt: DateTime<Utc>) -> String {
+    dt.with_timezone(&jst()).format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn format_jst_opt(dt: Option<DateTime<Utc>>) -> Option<String> {
+    dt.map(|d| format_jst(d))
+}
 
 pub async fn index() -> &'static str {
     "narou.rs API server"
@@ -112,13 +126,10 @@ pub async fn api_list(
                     sitename: r.sitename.clone(),
                     novel_type: r.novel_type,
                     end: r.end,
-                    last_update: r.last_update.format("%Y-%m-%d %H:%M").to_string(),
-                    general_lastup: r.general_lastup
-                        .map(|d| d.format("%Y-%m-%d %H:%M").to_string()),
-                    last_check_date: r.last_check_date
-                        .map(|d| d.format("%Y-%m-%d %H:%M").to_string()),
-                    new_arrivals_date: r.new_arrivals_date
-                        .map(|d| d.format("%Y-%m-%d %H:%M").to_string()),
+                    last_update: format_jst(r.last_update),
+                    general_lastup: format_jst_opt(r.general_lastup),
+                    last_check_date: format_jst_opt(r.last_check_date),
+                    new_arrivals_date: format_jst_opt(r.new_arrivals_date),
                     tags: r.tags.clone(),
                     new_arrivals: is_new,
                     frozen: record_is_frozen(r, &frozen_ids),

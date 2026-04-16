@@ -1097,7 +1097,14 @@ impl Downloader {
                     updated.toc_url = record.toc_url.clone();
                     updated.sitename = record.sitename.clone();
                     updated.end = record.end;
-                    updated.last_update = record.last_update;
+                    let has_changes = updated_count > 0
+                        || title_changed
+                        || author_changed
+                        || story_changed
+                        || sections_deleted;
+                    if has_changes || existing_id.is_none() {
+                        updated.last_update = record.last_update;
+                    }
                     if updated_count > 0 {
                         updated.new_arrivals_date = record.new_arrivals_date;
                     }
@@ -1106,7 +1113,7 @@ impl Downloader {
                     updated.novelupdated_at = record.novelupdated_at.or(updated.novelupdated_at);
                     updated.general_lastup = record.general_lastup.or(updated.general_lastup);
                     updated.general_all_no = record.general_all_no;
-                    updated.length = record.length;
+                    updated.length = record.length.or(updated.length);
                     updated.domain = record.domain.clone();
                     updated.suspend = false;
                     updated.is_narou = record.is_narou;

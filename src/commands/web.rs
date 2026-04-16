@@ -79,8 +79,30 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
         let _ = open::that(&url);
     }
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    let ws_listener = tokio::net::TcpListener::bind(ws_addr).await.unwrap();
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                eprintln!("ポート {} は既に使用されています。", address.port);
+                eprintln!("既にサーバが起動していませんか？");
+                eprintln!("別のポートを指定するには --port オプションを使ってください。");
+            } else {
+                eprintln!("サーバの起動に失敗しました: {}", e);
+            }
+            std::process::exit(1);
+        }
+    };
+    let ws_listener = match tokio::net::TcpListener::bind(ws_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                eprintln!("WebSocket ポート {} は既に使用されています。", address.ws_port);
+            } else {
+                eprintln!("WebSocket サーバの起動に失敗しました: {}", e);
+            }
+            std::process::exit(1);
+        }
+    };
     let worker_task = web::worker::start_queue_worker(root_dir.clone(), push_server.clone(), running_job, running_child_pid);
     let scheduler_task = web::scheduler::start_auto_update_scheduler(root_dir, push_server.clone());
 
