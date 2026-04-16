@@ -483,12 +483,43 @@ impl Downloader {
                 .map(|text| setting.get_novel_type_from_string(&text).1)
         };
 
-        Ok((
-            info.novelupdated_at,
-            info.general_lastup,
-            info.length,
-            is_end,
-        ))
+        let novel_type = info.novel_type.unwrap_or_else(|| {
+            setting
+                .resolve_info_pattern("nt", &toc_source)
+                .map(|text| setting.get_novel_type_from_string(&text).0)
+                .unwrap_or(1u8)
+        });
+
+        // Ruby: get_general_lastup / get_novelupdated_at fall back to subtitle dates
+        // when novel_info_url is unavailable (e.g. Arcadia)
+        let mut novelupdated_at = info.novelupdated_at;
+        let mut general_lastup = info.general_lastup;
+        if novelupdated_at.is_none() || general_lastup.is_none() {
+            let subtitles = if novel_type == 2 {
+                create_short_story_subtitles(&setting, &toc_source).ok()
+            } else {
+                let title = info.title.as_deref().unwrap_or("");
+                parse_subtitles_multipage(
+                    &mut self.fetcher,
+                    &setting,
+                    &toc_source,
+                    &url_captures,
+                    title,
+                )
+                .ok()
+            };
+            if let Some(subs) = &subtitles {
+                if novelupdated_at.is_none() {
+                    novelupdated_at =
+                        sections_latest_update_time(subs, "subupdate", Some("subdate"));
+                }
+                if general_lastup.is_none() {
+                    general_lastup = sections_latest_update_time(subs, "subdate", None);
+                }
+            }
+        }
+
+        Ok((novelupdated_at, general_lastup, info.length, is_end))
     }
 
     fn process_digest(
@@ -1017,8 +1048,10 @@ impl Downloader {
             new_arrivals_date: Some(Utc::now()),
             use_subdirectory,
             general_firstup: info.general_firstup,
-            novelupdated_at: info.novelupdated_at,
-            general_lastup: info.general_lastup,
+            novelupdated_at: info.novelupdated_at
+                .or_else(|| sections_latest_update_time(&subtitles, "subupdate", Some("subdate"))),
+            general_lastup: info.general_lastup
+                .or_else(|| sections_latest_update_time(&subtitles, "subdate", None)),
             last_mail_date: None,
             tags: Vec::new(),
             ncode,
@@ -1065,9 +1098,9 @@ impl Downloader {
                         updated.new_arrivals_date = record.new_arrivals_date;
                     }
                     updated.use_subdirectory = record.use_subdirectory;
-                    updated.general_firstup = record.general_firstup;
-                    updated.novelupdated_at = record.novelupdated_at;
-                    updated.general_lastup = record.general_lastup;
+                    updated.general_firstup = record.general_firstup.or(updated.general_firstup);
+                    updated.novelupdated_at = record.novelupdated_at.or(updated.novelupdated_at);
+                    updated.general_lastup = record.general_lastup.or(updated.general_lastup);
                     updated.general_all_no = record.general_all_no;
                     updated.length = record.length;
                     updated.domain = record.domain.clone();
