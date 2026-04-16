@@ -290,6 +290,33 @@ li.enable-selected.disabled a {
 .col-story { width: 2.5em; text-align: center; }
 .col-menu { width: 2.5em; text-align: center; }
 
+.date-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.10em;
+  text-align: center;
+  line-height: 1.2;
+}
+
+.date-cell-date,
+.date-cell-time,
+.date-cell-extra,
+.date-cell-label {
+  display: block;
+}
+
+.date-cell-time,
+.date-cell-extra {
+  font-size: 0.85em;
+}
+
+.date-cell-label {
+  font-size: 0.75em;
+  font-weight: bold;
+}
+
 .btn-story {
   background: none; border: 0.05em solid var(--border-color); border-radius: var(--border-radius);
   cursor: pointer; font-size: 0.85em; padding: 0.05em 0.35em; color: var(--link-color);

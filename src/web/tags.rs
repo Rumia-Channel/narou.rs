@@ -24,6 +24,16 @@ pub async fn add_tag(
         if !updated.tags.contains(&body.tag) {
             updated.tags.push(body.tag.clone());
         }
+        {
+            let inventory = db.inventory();
+            let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
+            if super::tag_colors::ensure_tag_colors(
+                &mut tag_colors,
+                updated.tags.iter().map(String::as_str),
+            ) {
+                super::tag_colors::save_tag_colors(inventory, &tag_colors)?;
+            }
+        }
         db.insert(updated);
         db.save()
     })
@@ -79,6 +89,16 @@ pub async fn add_tags(
                 updated.tags.push(tag.clone());
             }
         }
+        {
+            let inventory = db.inventory();
+            let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
+            if super::tag_colors::ensure_tag_colors(
+                &mut tag_colors,
+                updated.tags.iter().map(String::as_str),
+            ) {
+                super::tag_colors::save_tag_colors(inventory, &tag_colors)?;
+            }
+        }
         db.insert(updated);
         db.save()
     })
@@ -130,6 +150,16 @@ pub async fn update_tags(
             .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
         let mut updated = record;
         updated.tags = body.tags;
+        {
+            let inventory = db.inventory();
+            let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
+            if super::tag_colors::ensure_tag_colors(
+                &mut tag_colors,
+                updated.tags.iter().map(String::as_str),
+            ) {
+                super::tag_colors::save_tag_colors(inventory, &tag_colors)?;
+            }
+        }
         db.insert(updated);
         db.save()
     })
@@ -181,6 +211,7 @@ pub async fn edit_tag(
     }
 
     let result = with_database_mut(|db| {
+        let mut touched_tags: Vec<String> = Vec::new();
         for &id in &ids {
             if let Some(record) = db.get(id).cloned() {
                 let mut updated = record;
@@ -194,7 +225,18 @@ pub async fn edit_tag(
                         updated.tags.push(tag.clone());
                     }
                 }
+                touched_tags.extend(updated.tags.iter().cloned());
                 db.insert(updated);
+            }
+        }
+        {
+            let inventory = db.inventory();
+            let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
+            if super::tag_colors::ensure_tag_colors(
+                &mut tag_colors,
+                touched_tags.iter().map(String::as_str),
+            ) {
+                super::tag_colors::save_tag_colors(inventory, &tag_colors)?;
             }
         }
         db.save()

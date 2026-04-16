@@ -8,6 +8,7 @@ pub mod novels;
 pub mod push;
 pub mod scheduler;
 pub mod state;
+mod tag_colors;
 pub mod tags;
 pub mod worker;
 

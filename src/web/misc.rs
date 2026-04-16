@@ -35,20 +35,19 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
 }
 
 pub async fn tag_list(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let tags = with_database(|db| {
+    let (tags, tag_colors) = with_database(|db| {
         let index = db.tag_index();
         let mut list: Vec<(&String, &Vec<i64>)> = index.iter().collect();
         list.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-        Ok(list.into_iter().map(|(k, _)| k.clone()).collect::<Vec<_>>())
-    })
-    .unwrap_or_default();
+        let tags = list.into_iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
 
-    // Load tag colors from inventory
-    let tag_colors = with_database(|db| {
-        let inv = db.inventory();
-        let colors: std::collections::HashMap<String, String> =
-            inv.load("tag_colors", InventoryScope::Local).unwrap_or_default();
-        Ok(colors)
+        let inventory = db.inventory();
+        let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
+        if super::tag_colors::ensure_tag_colors(&mut tag_colors, tags.iter().map(String::as_str)) {
+            super::tag_colors::save_tag_colors(inventory, &tag_colors)?;
+        }
+
+        Ok((tags, tag_colors.into_map()))
     })
     .unwrap_or_default();
 
@@ -68,17 +67,22 @@ pub async fn tag_change_color(
             message: "tag is required".to_string(),
         });
     }
+    if !color.is_empty() && !super::tag_colors::is_valid_tag_color(color) {
+        return Json(ApiResponse {
+            success: false,
+            message: format!("{}という色は存在しません", color),
+        });
+    }
 
     let result = with_database(|db| {
         let inv = db.inventory();
-        let mut colors: std::collections::HashMap<String, String> =
-            inv.load("tag_colors", InventoryScope::Local).unwrap_or_default();
+        let mut colors = super::tag_colors::load_tag_colors(inv)?;
         if color.is_empty() {
             colors.remove(tag);
         } else {
-            colors.insert(tag.to_string(), color.to_string());
+            colors.set(tag, color);
         }
-        inv.save("tag_colors", InventoryScope::Local, &colors)?;
+        super::tag_colors::save_tag_colors(inv, &colors)?;
         Ok(())
     });
 

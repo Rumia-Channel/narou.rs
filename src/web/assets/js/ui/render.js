@@ -130,19 +130,19 @@ function createRow(novel) {
   const idText = isFrozen ? `＊${novel.id}` : String(novel.id);
 
   // New arrival mark + date cell on last_update
-  let updateCell = '';
-  if (novel.new_arrivals) {
-    updateCell += '<span class="status-new-dot" title="新着">●</span> ';
-  }
-  const updateBadge = getTimeBadge(novel.last_update);
-  updateCell += formatDateCell(novel.last_update, updateBadge);
+  const updateCell = formatDateCell(novel.last_update, {
+    label: novel.new_arrivals ? '新着' : '',
+    labelClass: novel.new_arrivals ? 'new-arrivals' : '',
+  });
 
   // general_lastup with time badge + hint-new-arrival when newer than last_update
   let glCell = '';
   let glHint = false;
   if (novel.general_lastup) {
     const badge = getTimeBadge(novel.general_lastup);
-    glCell = formatDateCell(novel.general_lastup, badge);
+    glCell = formatDateCell(novel.general_lastup, {
+      extraLine: badge,
+    });
     // narou.rb highlights when general_lastup > last_update (new content available)
     if (novel.general_lastup > novel.last_update) {
       glHint = true;
@@ -150,7 +150,7 @@ function createRow(novel) {
   }
 
   // last_check_date
-  const checkCell = novel.last_check_date ? formatDateCell(novel.last_check_date, '') : '';
+  const checkCell = novel.last_check_date ? formatDateCell(novel.last_check_date) : '';
 
   // Tags
   const tagsHtml = renderTags(novel.tags || []);
@@ -603,12 +603,24 @@ function formatDate(dateStr) {
   return { date: `${y}/${mo}/${day}`, time: `${h}:${min}` };
 }
 
-function formatDateCell(dateStr, badge) {
+function formatDateCell(dateStr, options = {}) {
   const { date, time } = formatDate(dateStr);
   if (!date) return '';
-  let html = date;
-  const timePart = badge ? `${time} ${badge}` : time;
-  if (timePart) html += `<br>${timePart}`;
+  const extraLine = options.extraLine || '';
+  const label = options.label || '';
+  const labelClass = options.labelClass || '';
+  let html = '<div class="date-cell">';
+  html += `<span class="date-cell-date">${date}</span>`;
+  if (time) {
+    html += `<span class="date-cell-time">${time}</span>`;
+  }
+  if (extraLine) {
+    html += `<span class="date-cell-extra">${extraLine}</span>`;
+  }
+  if (label) {
+    html += `<span class="date-cell-label${labelClass ? ' ' + labelClass : ''}">${label}</span>`;
+  }
+  html += '</div>';
   return html;
 }
 

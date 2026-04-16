@@ -986,6 +986,7 @@ export async function refreshTags() {
       State.tags = data.tags || [];
       State.tagColors = data.tag_colors || data.colors || {};
       renderTagList();
+      renderNovelList();
     }
   } catch { /* ignore */ }
 }
