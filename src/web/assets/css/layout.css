@@ -107,7 +107,7 @@
 /* Desktop: reorder right-side elements to match Bootstrap 3 float:right visual order
    (float:right renders in reverse source order: Filter | Queue | Options) */
 @media (min-width: 48.0625em) {
-  .navbar-collapse > .navbar-form { order: 1; }
+  .navbar-collapse > .navbar-form { order: 1; flex: 1; min-width: 0; margin-left: 0.5em; }
   .navbar-collapse > .queue-indicator { order: 2; }
   .navbar-collapse > .nav.navbar-right { order: 3; }
 }
@@ -286,10 +286,11 @@ hr.console-hr {
   position: relative;
   display: flex;
   align-items: center;
+  flex: 1;
 }
 
 .filter-input {
-  width: 12em;
+  width: 100%;
   padding: 0.30em 2em 0.30em 0.60em;
   font-size: 0.85rem;
   border: 0.05em solid rgba(255, 255, 255, 0.30);
@@ -297,7 +298,7 @@ hr.console-hr {
   background: rgba(255, 255, 255, 0.15);
   color: var(--navbar-text);
   outline: none;
-  transition: width 0.20s, background-color 0.15s;
+  transition: background-color 0.15s;
 }
 
 .filter-input::placeholder {
@@ -305,7 +306,6 @@ hr.console-hr {
 }
 
 .filter-input:focus {
-  width: 16em;
   background: rgba(255, 255, 255, 0.25);
 }
 
