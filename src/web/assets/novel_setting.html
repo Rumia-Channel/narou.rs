@@ -13,21 +13,26 @@
 .loading { color: var(--text-muted); }
 .error { color: var(--btn-danger-bg); }
 .ns-container table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-.ns-container th, .ns-container td { border: 0.07em solid var(--border-color); padding: .5em .7em; text-align: left; }
-.ns-container th { background: var(--table-header-bg); color: var(--table-header-text); width: 30%; }
-.ns-container input[type=text], .ns-container input[type=number], .ns-container select {
+.ns-container th, .ns-container td { border: 0.07em solid var(--border-color); padding: .5em .7em; text-align: left; vertical-align: top; }
+.ns-container th { background: var(--table-header-bg); color: var(--table-header-text); width: 28%; }
+.ns-container input[type=text], .ns-container input[type=number], .ns-container select, .ns-container textarea {
   width: 100%; padding: .3em; box-sizing: border-box;
   color: var(--text-color); background-color: var(--input-bg); border: 0.07em solid var(--input-border); border-radius: var(--border-radius);
 }
-.ns-container input[type=checkbox] { transform: scale(1.2); }
+.ns-container textarea { min-height: 8em; resize: vertical; }
 .actions { margin: 1.5em 0; }
 .btn { padding: .5em 1.5em; background: var(--btn-primary-bg); color: var(--btn-text); border: none; border-radius: var(--border-radius); cursor: pointer; font-size: 1em; }
 .btn:hover { opacity: 0.85; }
 .btn-secondary { background: var(--text-muted); }
-.btn-secondary:hover { opacity: 0.85; }
+.btn-danger { background: var(--btn-danger-bg); }
 .msg { margin: .5em 0; padding: .5em; border-radius: var(--border-radius); }
 .msg-success { background: var(--btn-success-bg); color: var(--btn-text); }
 .msg-error { background: var(--btn-danger-bg); color: var(--btn-text); }
+.panel { margin: 1.5em 0; padding: 1em; border: 0.07em solid var(--border-color); border-radius: var(--border-radius); background: var(--panel-bg); }
+.panel h2 { margin-top: 0; font-size: 1.15em; }
+.help { color: var(--text-muted); font-size: .95em; margin-top: .4em; white-space: pre-wrap; }
+.replace-table td:nth-child(2), .replace-table td:nth-child(4) { width: 4em; text-align: center; }
+.row-actions { white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -58,49 +63,145 @@
     if (!resp.ok) throw new Error(await resp.text());
     const data = await resp.json();
     document.getElementById('page-title').textContent = `個別設定: ${data.title || 'ID ' + id}`;
-    renderSettings(data);
+    renderPage(data);
     document.getElementById('save-btn').style.display = '';
     document.getElementById('save-btn').addEventListener('click', () => saveSettings(id));
   } catch (e) {
-    document.getElementById('content').innerHTML = `<p class="error">${e.message}</p>`;
+    document.getElementById('content').innerHTML = `<p class="error">${esc(e.message)}</p>`;
   }
 })();
 
-function renderSettings(data) {
-  const skip = new Set(['id','title','author','archive_path','replace_patterns']);
-  const entries = Object.entries(data).filter(([k]) => !skip.has(k));
-  if (entries.length === 0) {
-    document.getElementById('content').innerHTML = '<p>設定項目がありません</p>';
-    return;
-  }
-  let html = '<table>';
-  for (const [key, val] of entries) {
-    html += `<tr><th>${esc(key)}</th><td>${inputFor(key, val)}</td></tr>`;
-  }
-  html += '</table>';
-  document.getElementById('content').innerHTML = html;
+function renderPage(data) {
+  const settings = data.settings || [];
+  const replacePatterns = data.replace_patterns || [];
+  const settingsHtml = renderSettingsTable(settings);
+  const replaceHtml = renderReplaceTable(replacePatterns);
+  document.getElementById('content').innerHTML = `
+    <div class="panel">
+      <h2>変換設定</h2>
+      <div>・この小説専用の変換時の設定を変更出来ます（setting.ini を書き換えます）</div>
+      <div>・未設定の項目は空欄のまま保存されます</div>
+      ${settingsHtml}
+    </div>
+    <div class="panel">
+      <h2>置換設定</h2>
+      <div>・この小説の文章を置換する設定を行うことが出来ます（replace.txt を書き換えます）</div>
+      <div>・保存するとこの小説の replace.txt に書かれているコメントは削除されます</div>
+      ${replaceHtml}
+    </div>
+  `;
 }
 
-function inputFor(key, val) {
-  const id = `setting-${key}`;
-  if (typeof val === 'boolean') {
-    return `<input type="checkbox" id="${id}" data-key="${esc(key)}" data-type="bool" ${val ? 'checked' : ''}>`;
+function renderSettingsTable(settings) {
+  if (settings.length === 0) {
+    return '<p>設定項目がありません</p>';
   }
-  if (typeof val === 'number') {
-    return `<input type="number" id="${id}" data-key="${esc(key)}" data-type="number" value="${val}">`;
+  let html = '<table class="settings-table"><tbody>';
+  for (const item of settings) {
+    html += `<tr id="row-${escAttr(item.name)}"><th>${esc(item.name)}</th><td>${settingInput(item)}</td></tr>`;
+    if (item.help) {
+      html += `<tr><td colspan="2"><div class="help">${esc(item.help)}</div></td></tr>`;
+    }
   }
-  const s = val == null ? '' : String(val);
-  return `<input type="text" id="${id}" data-key="${esc(key)}" data-type="string" value="${esc(s)}">`;
+  html += '</tbody></table>';
+  return html;
+}
+
+function settingInput(item) {
+  const key = item.name;
+  const value = item.value;
+  const type = item.var_type;
+  const selectKeys = item.select_keys || [];
+  const base = `data-setting-name="${escAttr(key)}" data-setting-type="${escAttr(type)}"`;
+  if (type === 'boolean') {
+    const selected = value === true ? 'true' : value === false ? 'false' : '';
+    return `
+      <select ${base}>
+        <option value="" ${selected === '' ? 'selected' : ''}>未設定</option>
+        <option value="false" ${selected === 'false' ? 'selected' : ''}>いいえ</option>
+        <option value="true" ${selected === 'true' ? 'selected' : ''}>はい</option>
+      </select>`;
+  }
+  if (type === 'select') {
+    let options = `<option value="" ${value == null || value === '' ? 'selected' : ''}>未設定</option>`;
+    for (const option of selectKeys) {
+      options += `<option value="${escAttr(option)}" ${value === option ? 'selected' : ''}>${esc(option)}</option>`;
+    }
+    return `<select ${base}>${options}</select>`;
+  }
+  if (type === 'integer' || type === 'float') {
+    const step = type === 'float' ? 'any' : '1';
+    const val = value == null ? '' : String(value);
+    return `<input type="number" step="${step}" value="${escAttr(val)}" ${base}>`;
+  }
+  const val = value == null ? '' : String(value);
+  return `<input type="text" value="${escAttr(val)}" ${base}>`;
+}
+
+function renderReplaceTable(patterns) {
+  const rows = [...patterns, { left: '', right: '' }];
+  let html = '<table class="replace-table"><thead><tr><th>対象文字列</th><th></th><th>置き換える文字列</th><th></th></tr></thead><tbody>';
+  for (const pattern of rows) {
+    html += `
+      <tr class="replace-pattern-tr">
+        <td><input type="text" data-replace-left value="${escAttr(pattern.left || '')}"></td>
+        <td>→</td>
+        <td><input type="text" data-replace-right value="${escAttr(pattern.right || '')}"></td>
+        <td class="row-actions"><button class="btn btn-danger btn-replace-remove" type="button">削除</button></td>
+      </tr>`;
+  }
+  html += `
+      <tr>
+        <td colspan="4"><button class="btn btn-secondary" id="btn-replace-add" type="button">１行追加</button></td>
+      </tr>
+    </tbody></table>`;
+  return html;
+}
+
+function collectSettings() {
+  const settings = [];
+  document.querySelectorAll('[data-setting-name]').forEach(el => {
+    const name = el.dataset.settingName;
+    const type = el.dataset.settingType;
+    let value = null;
+    if (type === 'boolean') {
+      const raw = el.value;
+      if (raw === 'true') value = true;
+      else if (raw === 'false') value = false;
+    } else if (type === 'integer') {
+      const raw = el.value.trim();
+      if (raw !== '') value = raw;
+    } else if (type === 'float') {
+      const raw = el.value.trim();
+      if (raw !== '') value = raw;
+    } else {
+      const raw = el.value;
+      if (raw.trim() !== '') value = raw;
+    }
+    settings.push({ name, value });
+  });
+  return settings;
+}
+
+function collectReplacePatterns() {
+  const patterns = [];
+  document.querySelectorAll('.replace-pattern-tr').forEach(tr => {
+    const leftEl = tr.querySelector('[data-replace-left]');
+    const rightEl = tr.querySelector('[data-replace-right]');
+    if (!leftEl || !rightEl) return;
+    const left = leftEl.value.trim();
+    const right = rightEl.value.trim();
+    if (!left) return;
+    patterns.push({ left, right });
+  });
+  return patterns;
 }
 
 async function saveSettings(id) {
-  const body = {};
-  document.querySelectorAll('[data-key]').forEach(el => {
-    const key = el.dataset.key;
-    if (el.dataset.type === 'bool') body[key] = el.checked;
-    else if (el.dataset.type === 'number') body[key] = Number(el.value);
-    else body[key] = el.value;
-  });
+  const body = {
+    settings: collectSettings(),
+    replace_patterns: collectReplacePatterns(),
+  };
   try {
     const resp = await fetch(`/api/settings/${id}`, {
       method: 'POST',
@@ -118,10 +219,42 @@ async function saveSettings(id) {
   }
 }
 
+document.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'btn-replace-add') {
+    const tbody = e.target.closest('table').querySelector('tbody');
+    const row = createReplaceRow('', '');
+    tbody.insertBefore(row, tbody.lastElementChild);
+    return;
+  }
+  if (e.target && e.target.classList.contains('btn-replace-remove')) {
+    const rows = document.querySelectorAll('.replace-pattern-tr');
+    if (rows.length === 1) {
+      const tbody = e.target.closest('table').querySelector('tbody');
+      tbody.insertBefore(createReplaceRow('', ''), tbody.lastElementChild);
+    }
+    e.target.closest('tr').remove();
+  }
+});
+
+function createReplaceRow(left, right) {
+  const tr = document.createElement('tr');
+  tr.className = 'replace-pattern-tr';
+  tr.innerHTML = `
+    <td><input type="text" data-replace-left value="${escAttr(left)}"></td>
+    <td>→</td>
+    <td><input type="text" data-replace-right value="${escAttr(right)}"></td>
+    <td class="row-actions"><button class="btn btn-danger btn-replace-remove" type="button">削除</button></td>`;
+  return tr;
+}
+
 function esc(s) {
   const d = document.createElement('div');
   d.textContent = String(s);
   return d.innerHTML;
+}
+
+function escAttr(s) {
+  return esc(s).replace(/"/g, '&quot;');
 }
 </script>
 </body>
