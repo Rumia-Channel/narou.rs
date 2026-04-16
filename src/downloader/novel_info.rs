@@ -96,7 +96,9 @@ impl NovelInfo {
             .raw_captures
             .get("nu")
             .and_then(|s| parse_narou_date(s));
-        info.length = info.raw_captures.get("l").and_then(|s| s.parse().ok());
+        info.length = info.raw_captures.get("l").and_then(|s| {
+            s.replace(',', "").trim().parse().ok()
+        });
 
         info
     }
