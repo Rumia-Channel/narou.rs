@@ -23,7 +23,7 @@ use crate::db::DATABASE;
 use crate::db::novel_record::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::progress::ProgressReporter;
-use crate::termcolor::{bold_colored, colored};
+use crate::termcolor::bold_colored;
 
 use self::fetch::HttpFetcher;
 use self::narou_api::narou_api_batch_update;
@@ -93,10 +93,6 @@ fn normalize_story_for_compare(story: &str) -> String {
 
 fn load_local_setting_bool(key: &str) -> bool {
     crate::compat::load_local_setting_bool(key)
-}
-
-fn load_local_setting_string(key: &str) -> Option<String> {
-    crate::compat::load_local_setting_string(key)
 }
 
 fn load_global_setting_bool(key: &str) -> bool {
@@ -829,48 +825,27 @@ impl Downloader {
             }
         }
 
+        struct SectionPlan {
+            latest_section_path: PathBuf,
+            is_new_arrival: bool,
+            needs_download: bool,
+            predownloaded: Option<(SectionElement, String)>,
+        }
+
         let mut updated_count = 0usize;
         let mut new_arrivals = existing_id.is_none();
         let mut new_arrival_subtitles = Vec::new();
-        let total = subtitles.len() as u64;
         let mut final_subtitles = Vec::with_capacity(subtitles.len());
         let strong_update = load_local_setting_bool("update.strong");
         let mut cache_dir: Option<PathBuf> = None;
         let mut pending_section_hashes: HashMap<String, String> = HashMap::new();
         let display_id = existing_id.unwrap_or(0);
+        let mut section_plans = Vec::with_capacity(subtitles.len());
+        let mut download_count = 0usize;
 
-        if let Some(ref p) = self.progress {
-            p.set_length(total);
-            p.set_message(&format!("DL {}", title));
-        }
-        println!("{}", bold_colored(&format!("ID:{}　{} のDL開始", display_id, title), "green"));
-
-        let mut last_chapter = String::new();
-        let mut last_subchapter = String::new();
-
-        for (si, subtitle) in subtitles.iter().enumerate() {
+        for subtitle in &subtitles {
             let latest_section_path = section_dir.join(section_filename(subtitle));
             let is_new_arrival = !latest_section_path.exists();
-
-            if let Some(ref p) = self.progress {
-                p.set_message(&format!(
-                    "DL {} [{}/{}]",
-                    title,
-                    final_subtitles.len() + 1,
-                    subtitles.len()
-                ));
-            }
-
-            // Print chapter/subchapter headers (Ruby: only when changed)
-            if !subtitle.chapter.is_empty() && subtitle.chapter != last_chapter {
-                println!("{}", subtitle.chapter);
-                last_chapter = subtitle.chapter.clone();
-            }
-            if !subtitle.subchapter.is_empty() && subtitle.subchapter != last_subchapter {
-                println!("{}", subtitle.subchapter);
-                last_subchapter = subtitle.subchapter.clone();
-            }
-
             let (needs_download, predownloaded) = if force {
                 (true, None)
             } else {
@@ -884,9 +859,59 @@ impl Downloader {
                     strong_update,
                 )?
             };
+            if needs_download {
+                download_count += 1;
+            }
+            section_plans.push(SectionPlan {
+                latest_section_path,
+                is_new_arrival,
+                needs_download,
+                predownloaded,
+            });
+        }
+
+        if let Some(ref p) = self.progress {
+            p.set_length(download_count as u64);
+            p.set_message(&format!("DL {}", title));
+        }
+
+        let mut last_chapter = String::new();
+        let mut last_subchapter = String::new();
+        let mut started_download = false;
+        let mut downloaded_index = 0usize;
+
+        for (si, (subtitle, plan)) in subtitles.iter().zip(section_plans.into_iter()).enumerate() {
+            let latest_section_path = plan.latest_section_path;
+            let is_new_arrival = plan.is_new_arrival;
+            let needs_download = plan.needs_download;
 
             let download_time = if needs_download {
-                let (section, raw_html) = if let Some(downloaded) = predownloaded {
+                if !started_download {
+                    println!(
+                        "{}",
+                        bold_colored(&format!("ID:{}　{} のDL開始", display_id, title), "green")
+                    );
+                    started_download = true;
+                }
+                if let Some(ref p) = self.progress {
+                    p.set_message(&format!(
+                        "DL {} [{}/{}]",
+                        title,
+                        downloaded_index + 1,
+                        download_count
+                    ));
+                }
+
+                if !subtitle.chapter.is_empty() && subtitle.chapter != last_chapter {
+                    println!("{}", subtitle.chapter);
+                    last_chapter = subtitle.chapter.clone();
+                }
+                if !subtitle.subchapter.is_empty() && subtitle.subchapter != last_subchapter {
+                    println!("{}", subtitle.subchapter);
+                    last_subchapter = subtitle.subchapter.clone();
+                }
+
+                let (section, raw_html) = if let Some(downloaded) = plan.predownloaded {
                     downloaded
                 } else {
                     download_section(
@@ -917,6 +942,7 @@ impl Downloader {
                 save_raw_file(&raw_dir, subtitle, &raw_html)?;
                 self.download_illustration(&setting, &section, &section_dir, subtitle)?;
                 updated_count += 1;
+                downloaded_index += 1;
                 Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string())
             } else {
                 if setting.illust_grep_pattern.is_some() {
@@ -944,8 +970,7 @@ impl Downloader {
             }
             final_subtitles.push(sub);
 
-            // Ruby-compatible section progress line
-            {
+            if needs_download {
                 let mut line = String::new();
                 if novel_type == 1 {
                     // Series: "第{index}部分　" (only if index ≤ 4 digits)
@@ -969,9 +994,9 @@ impl Downloader {
                     }
                 }
                 println!("{}", line);
-            }
-            if let Some(ref p) = self.progress {
-                p.inc(1);
+                if let Some(ref p) = self.progress {
+                    p.inc(1);
+                }
             }
         }
 

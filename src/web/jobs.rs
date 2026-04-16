@@ -9,6 +9,8 @@ use super::state::{
     DownloadBody, ReorderBody, TagInfoBody, TargetsBody, TaskIdBody, UpdateBody, UpdateByTagBody,
 };
 
+const WEBUI_UPDATE_START_PREFIX: &str = "__webui_update_start__=";
+
 pub async fn api_download(
     State(state): State<AppState>,
     Json(body): Json<DownloadBody>,
@@ -90,52 +92,43 @@ pub async fn api_update(
     // e.g. [] → update all (empty target)
     let has_flags = targets.iter().any(|t| t.starts_with("--"));
 
-    let jobs: Vec<(JobType, String)> = if has_flags {
-        // CLI-style args: join as single job target
-        let combined = targets.join("\t");
-        vec![(JobType::Update, combined)]
-    } else if targets.is_empty() {
-        // Update all
-        let ids = with_database(|db| Ok(db.ids())).unwrap_or_default();
-        if body.force {
-            ids.iter()
-                .map(|id| (JobType::Update, format!("--force\t{}", id)))
-                .collect()
-        } else {
-            ids.iter()
-                .map(|id| (JobType::Update, id.to_string()))
-                .collect()
-        }
-    } else if body.force {
-        targets
-            .iter()
-            .map(|t| (JobType::Update, format!("--force\t{}", t)))
-            .collect()
-    } else {
-        targets
-            .iter()
-            .map(|t| (JobType::Update, t.clone()))
-            .collect()
-    };
-
-    let count = jobs.len();
-    // Ruby parity: output update start message before queueing
-    // Ruby uses <white>...</white>.termcolor which maps to color:#bbb
     let is_update_all = targets.is_empty();
-    let sort_display = current_sort_display_string();
-    if is_update_all {
-        let msg = format!("全ての小説の更新を開始します（{}件を{}で処理）", count, sort_display);
-        state.push_server.broadcast_echo(
-            &format!("<span style=\"color:#bbb\">{}</span>", msg),
-            "stdout",
-        );
-    } else if !has_flags {
-        let msg = format!("更新を開始します（{}件を{}で処理）", count, sort_display);
-        state.push_server.broadcast_echo(
-            &format!("<span style=\"color:#bbb\">{}</span>", msg),
-            "stdout",
-        );
-    }
+    let count;
+    let combined = if has_flags {
+        count = 1;
+        targets.join("\t")
+    } else {
+        let mut args = if is_update_all {
+            with_database(|db| Ok(db.ids().into_iter().map(|id| id.to_string()).collect::<Vec<_>>()))
+                .unwrap_or_default()
+        } else {
+            targets.clone()
+        };
+        count = args.len();
+        if count == 0 {
+            return serde_json::json!({
+                "success": true,
+                "status": "queued",
+                "count": 0,
+                "job_ids": []
+            })
+            .into();
+        }
+        if body.force {
+            args.insert(0, "--force".to_string());
+        }
+        let sort_display = current_sort_display_string();
+        let start_message = if is_update_all {
+            format!("全ての小説の更新を開始します（{}件を{}で処理）", count, sort_display)
+        } else {
+            format!("更新を開始します（{}件を{}で処理）", count, sort_display)
+        };
+        let mut parts = Vec::with_capacity(args.len() + 1);
+        parts.push(format!("{}{}", WEBUI_UPDATE_START_PREFIX, start_message));
+        parts.extend(args);
+        parts.join("\t")
+    };
+    let jobs = vec![(JobType::Update, combined)];
     let job_ids = match queue.push_batch(&jobs) {
         Ok(ids) => ids,
         Err(e) => {
@@ -1057,19 +1050,9 @@ pub async fn api_update_by_tag(
         }
     };
 
-    let jobs: Vec<(JobType, String)> = ids
-        .iter()
-        .map(|id| (JobType::Update, id.to_string()))
-        .collect();
-    let count = jobs.len();
-    // Ruby parity: output update start message
-    let sort_display = current_sort_display_string();
-    let msg = format!("更新を開始します（{}件を{}で処理）", count, sort_display);
-    state.push_server.broadcast_echo(
-        &format!("<span style=\"color:#bbb\">{}</span>", msg),
-        "stdout",
-    );
-    let job_ids = match queue.push_batch(&jobs) {
+    let count = ids.len();
+    let jobs = vec![(JobType::Update, tag_params.join("\t"))];
+    let _job_ids = match queue.push_batch(&jobs) {
         Ok(ids) => ids,
         Err(e) => {
             return serde_json::json!({
@@ -1086,7 +1069,7 @@ pub async fn api_update_by_tag(
         .broadcast_event("notification.queue", "");
     serde_json::json!({
         "success": true,
-        "count": job_ids.len(),
+        "count": count,
     })
     .into()
 }

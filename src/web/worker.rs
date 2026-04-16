@@ -14,6 +14,8 @@ use crate::queue::{JobType, QueueJob};
 use super::jobs::open_queue;
 use super::push::PushServer;
 
+const WEBUI_UPDATE_START_PREFIX: &str = "__webui_update_start__=";
+
 pub fn start_queue_worker(
     root_dir: PathBuf,
     push_server: Arc<PushServer>,
@@ -105,7 +107,18 @@ fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, r
         JobType::Update => {
             command.arg("update");
             if !job.target.is_empty() {
-                for part in job.target.split('\t') {
+                let mut parts = job.target.split('\t');
+                if let Some(first) = parts.next() {
+                    if let Some(message) = first.strip_prefix(WEBUI_UPDATE_START_PREFIX) {
+                        push_server.broadcast_echo(
+                            &format!("<span style=\"color:#bbb\">{}</span>", message),
+                            "stdout",
+                        );
+                    } else if !first.is_empty() {
+                        command.arg(first);
+                    }
+                }
+                for part in parts {
                     if !part.is_empty() {
                         command.arg(part);
                     }
