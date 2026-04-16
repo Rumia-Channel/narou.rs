@@ -26,9 +26,9 @@
 
 .navbar-brand {
   display: inline-block;
-  padding: 0.4em 0;
-  margin-right: 1em;
-  font-size: 1.15rem;
+  padding: 0.9375rem;
+  font-size: 1.125rem;
+  line-height: 1.25rem;
   font-weight: bold;
   color: var(--navbar-text);
   white-space: nowrap;
@@ -84,7 +84,7 @@
   display: inline-flex;
   align-items: center;
   gap: 0.3em;
-  padding: 0.6em 0.8em;
+  padding: 0.9375rem;
   color: var(--navbar-text);
   font-size: var(--btn-font-size);
   white-space: nowrap;

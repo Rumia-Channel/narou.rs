@@ -979,7 +979,7 @@ export async function refreshTags() {
     const data = await fetchJson('/api/tag_list');
     if (data) {
       State.tags = data.tags || [];
-      State.tagColors = data.colors || {};
+      State.tagColors = data.tag_colors || data.colors || {};
       renderTagList();
     }
   } catch { /* ignore */ }

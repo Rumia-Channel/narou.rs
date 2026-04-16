@@ -4,7 +4,7 @@
   --navbar-text: #fff;
   --navbar-hover-bg: rgba(255, 255, 255, 0.15);
   --navbar-border: #178acc;
-  --navbar-height: 3.2rem;
+  --navbar-height: 3.125rem;
 
   /* Body */
   --body-bg: #fff;
@@ -113,8 +113,8 @@
   --btn-padding-y: 0.4em;
   --btn-padding-x: 0.85em;
   --btn-border-radius: 0.25em;
-  --btn-font-size: 0.875rem;
-  --table-cell-padding: 0.3em;
+  --btn-font-size: 1em;
+  --table-cell-padding: 0.25rem;
   --base-font-size: 87.5%;
   --base-line-height: 1.42857;
 }
