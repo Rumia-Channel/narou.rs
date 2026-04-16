@@ -90,7 +90,7 @@
   --dropdown-border: #ccc;
   --dropdown-divider: #e5e5e5;
   --dropdown-text: #333;
-  --dropdown-shadow: 0 0.4em 0.85em rgba(0, 0, 0, 0.175);
+  --dropdown-shadow: 0 0.40em 0.85em rgba(0, 0, 0, 0.175);
 
   /* Modal */
   --modal-backdrop: rgba(0, 0, 0, 0.5);
@@ -110,20 +110,20 @@
 
   /* Layout (relative units) */
   --container-padding: 1rem;
-  --btn-padding-y: 0.4em;
+  --btn-padding-y: 0.40em;
   --btn-padding-x: 0.85em;
   --btn-border-radius: 0.25em;
   --btn-font-size: 1em;
   --table-cell-padding: 0.25rem;
   --base-font-size: 87.5%;
-  --base-line-height: 1.42857;
+  --base-line-height: 1.45;
 }
 
 /* Dark themes */
 :root[data-theme="Darkly"] {
   --navbar-bg: #375a7f;
   --navbar-text: #fff;
-  --navbar-hover-bg: rgba(255, 255, 255, 0.1);
+  --navbar-hover-bg: rgba(255, 255, 255, 0.10);
   --navbar-border: #2d4d6d;
 
   --body-bg: #222;
@@ -148,7 +148,7 @@
   --table-sort-even-bg: #3a3a3a;
   --table-hover-bg: #3d5a3d;
   --table-selected-bg: #4a4a3a;
-  --table-frozen-tint: rgba(108, 173, 221, 0.1);
+  --table-frozen-tint: rgba(108, 173, 221, 0.10);
   --table-border: #555;
 
   --console-bg: #111;
@@ -162,10 +162,10 @@
   --dropdown-border: #555;
   --dropdown-divider: #555;
   --dropdown-text: #eee;
-  --dropdown-shadow: 0 0.4em 0.85em rgba(0, 0, 0, 0.4);
+  --dropdown-shadow: 0 0.40em 0.85em rgba(0, 0, 0, 0.40);
 
   --queue-badge-bg: #555;
-  --badge-bg: rgba(255, 255, 255, 0.2);
+  --badge-bg: rgba(255, 255, 255, 0.20);
 
   --primary-color: #375a7f;
   --success-color: #00bc8c;
@@ -183,7 +183,7 @@
 :root[data-theme="Slate"] {
   --navbar-bg: #3a3f44;
   --navbar-text: #c8c8c8;
-  --navbar-hover-bg: rgba(255, 255, 255, 0.1);
+  --navbar-hover-bg: rgba(255, 255, 255, 0.10);
   --navbar-border: #2e3338;
 
   --body-bg: #272b30;

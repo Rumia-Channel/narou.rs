@@ -40,7 +40,7 @@
 
   .navbar-form {
     width: 100%;
-    padding: 0.3em 1em;
+    padding: 0.30em 1em;
   }
 
   .filter-input {
@@ -60,7 +60,7 @@
     position: static;
     box-shadow: none;
     border: none;
-    background-color: rgba(0, 0, 0, 0.08);
+    background-color: rgba(0, 0, 0, 0.10);
     padding-left: 1em;
     width: 100%;
   }
@@ -103,7 +103,7 @@
 /* Small phone (<= 30em / ~480px) */
 @media (max-width: 30em) {
   :root {
-    --btn-font-size: 0.8rem;
+    --btn-font-size: 0.80rem;
   }
 
   .navbar-brand {

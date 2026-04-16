@@ -6,7 +6,7 @@
   width: 100%;
   min-height: var(--navbar-height);
   background-color: var(--navbar-bg);
-  border-bottom: 0.07em solid var(--navbar-border);
+  border-bottom: 0.05em solid var(--navbar-border);
   z-index: 1030;
 }
 
@@ -43,7 +43,7 @@
 .navbar-toggle {
   display: none;
   background: transparent;
-  border: 0.07em solid rgba(255, 255, 255, 0.3);
+  border: 0.05em solid rgba(255, 255, 255, 0.30);
   border-radius: var(--btn-border-radius);
   padding: 0.5em 0.65em;
   margin-right: 0.5em;
@@ -51,10 +51,10 @@
 
 .navbar-toggle .icon-bar {
   display: block;
-  width: 1.4em;
+  width: 1.40em;
   height: 0.15em;
   background-color: var(--navbar-text);
-  border-radius: 0.07em;
+  border-radius: 0.05em;
 }
 
 .navbar-toggle .icon-bar + .icon-bar {
@@ -83,7 +83,7 @@
 .nav > li > .dropdown-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 0.3em;
+  gap: 0.30em;
   padding: 0.9375rem;
   color: var(--navbar-text);
   font-size: var(--btn-font-size);
@@ -123,9 +123,9 @@
   width: 100%;
   min-height: 2.5rem;
   background-color: var(--body-bg);
-  border-top: 0.07em solid var(--border-color);
+  border-top: 0.05em solid var(--border-color);
   z-index: 1030;
-  padding: 0.3em var(--container-padding);
+  padding: 0.30em var(--container-padding);
 }
 
 .navbar-fixed-bottom .control-panel-inner {
@@ -148,12 +148,12 @@
   max-height: var(--console-height);
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 0.5em 0.7em;
+  padding: 0.5em 0.70em;
   font-family: "Consolas", "Liberation Mono", "Courier New", monospace;
   font-size: 0.85em;
   white-space: pre-wrap;
   word-break: break-all;
-  transition: max-height 0.2s ease;
+  transition: max-height 0.20s ease;
 }
 
 .console.expanded {
@@ -161,22 +161,22 @@
 }
 
 .console-line {
-  min-height: 1.2em;
+  min-height: 1.20em;
 }
 
 hr.console-hr {
   border: none;
-  border-top: 0.07em solid var(--console-text);
-  margin: 0.3em 0;
+  border-top: 0.05em solid var(--console-text);
+  margin: 0.30em 0;
   min-height: 0;
 }
 
 .console-buttons {
   position: absolute;
-  top: 0.3em;
+  top: 0.30em;
   right: calc(var(--container-padding) + 0.5em);
   display: flex;
-  gap: 0.3em;
+  gap: 0.30em;
 }
 
 .console-btn {
@@ -184,10 +184,10 @@ hr.console-hr {
   border: none;
   color: var(--console-text);
   font-size: 0.85em;
-  padding: 0.15em 0.4em;
+  padding: 0.15em 0.40em;
   border-radius: var(--btn-border-radius);
   cursor: pointer;
-  opacity: 0.6;
+  opacity: 0.60;
   transition: opacity 0.15s;
 }
 
@@ -199,7 +199,7 @@ hr.console-hr {
 #control-panel {
   padding-top: 0.5em;
   padding-bottom: 0.5em;
-  border-bottom: 0.07em solid var(--border-color);
+  border-bottom: 0.05em solid var(--border-color);
   background: var(--body-bg);
 }
 
@@ -221,8 +221,8 @@ hr.console-hr {
 .queue-indicator {
   display: inline-flex;
   align-items: center;
-  gap: 0.3em;
-  padding: 0.6em 0.5em;
+  gap: 0.30em;
+  padding: 0.60em 0.5em;
   margin: 0;
   color: var(--navbar-text);
   cursor: pointer;
@@ -230,17 +230,17 @@ hr.console-hr {
 }
 
 .queue-icon {
-  font-size: 1.1em;
+  font-size: 1.10em;
 }
 
 .queue-badge {
   display: inline-block;
-  min-width: 1.3em;
-  padding: 0.15em 0.4em;
+  min-width: 1.30em;
+  padding: 0.15em 0.40em;
   font-size: 0.75em;
   font-weight: bold;
   text-align: center;
-  border-radius: 0.7em;
+  border-radius: 0.70em;
   background-color: var(--queue-badge-bg);
   color: var(--queue-badge-text);
   line-height: 1;
@@ -262,18 +262,18 @@ hr.console-hr {
 
 .filter-input {
   width: 12em;
-  padding: 0.3em 2em 0.3em 0.6em;
+  padding: 0.30em 2em 0.30em 0.60em;
   font-size: 0.85rem;
-  border: 0.07em solid rgba(255, 255, 255, 0.3);
+  border: 0.05em solid rgba(255, 255, 255, 0.30);
   border-radius: 1em;
   background: rgba(255, 255, 255, 0.15);
   color: var(--navbar-text);
   outline: none;
-  transition: width 0.2s, background-color 0.15s;
+  transition: width 0.20s, background-color 0.15s;
 }
 
 .filter-input::placeholder {
-  color: rgba(255, 255, 255, 0.6);
+  color: rgba(255, 255, 255, 0.60);
 }
 
 .filter-input:focus {
@@ -284,8 +284,8 @@ hr.console-hr {
 .filter-clear {
   position: absolute;
   right: 0.5em;
-  font-size: 1.1em;
-  color: rgba(255, 255, 255, 0.6);
+  font-size: 1.10em;
+  color: rgba(255, 255, 255, 0.60);
   cursor: pointer;
   line-height: 1;
 }
@@ -313,8 +313,8 @@ hr.console-hr {
 
 .modal-content {
   background: var(--body-bg);
-  border-radius: 0.4em;
-  box-shadow: 0 0.3em 1em rgba(0, 0, 0, 0.3);
+  border-radius: 0.40em;
+  box-shadow: 0 0.30em 1em rgba(0, 0, 0, 0.30);
   overflow: hidden;
 }
 
@@ -322,8 +322,8 @@ hr.console-hr {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0.7em 1em;
-  border-bottom: 0.07em solid var(--border-color);
+  padding: 0.70em 1em;
+  border-bottom: 0.05em solid var(--border-color);
 }
 
 .modal-title {
@@ -334,7 +334,7 @@ hr.console-hr {
 .modal-close {
   background: none;
   border: none;
-  font-size: 1.4em;
+  font-size: 1.40em;
   color: var(--text-muted);
   cursor: pointer;
   line-height: 1;
@@ -353,8 +353,8 @@ hr.console-hr {
   display: flex;
   justify-content: flex-end;
   gap: 0.5em;
-  padding: 0.7em 1em;
-  border-top: 0.07em solid var(--border-color);
+  padding: 0.70em 1em;
+  border-top: 0.05em solid var(--border-color);
 }
 
 .notepad-textarea {
@@ -363,8 +363,8 @@ hr.console-hr {
   min-height: 12em;
   padding: 0.5em;
   font-family: "Consolas", "Liberation Mono", "Courier New", monospace;
-  font-size: 0.9em;
-  border: 0.07em solid var(--border-color);
+  font-size: 0.90em;
+  border: 0.05em solid var(--border-color);
   border-radius: var(--btn-border-radius);
   resize: vertical;
   background: var(--body-bg);
@@ -377,16 +377,16 @@ hr.console-hr {
   width: 100%;
   padding: 0.5em;
   font-size: 0.95em;
-  border: 0.07em solid var(--border-color);
+  border: 0.05em solid var(--border-color);
   border-radius: var(--btn-border-radius);
   resize: vertical;
   background: var(--body-bg);
   color: var(--text-color);
-  margin-bottom: 0.8em;
+  margin-bottom: 0.80em;
 }
 
 #download-link-drop-area {
-  margin-bottom: 0.8em;
+  margin-bottom: 0.80em;
 }
 
 #download-link-drop-here {
@@ -395,19 +395,19 @@ hr.console-hr {
   height: 6em;
   border: 0.25em dashed var(--border-color);
   color: var(--text-muted);
-  transition: border-color 0.4s ease, background-color 0.4s ease, color 0.4s ease;
+  transition: border-color 0.40s ease, background-color 0.40s ease, color 0.40s ease;
   border-radius: var(--btn-border-radius);
 }
 
 #download-link-drop-here.dragover {
   border-color: var(--btn-success-border);
-  background-color: rgba(92, 184, 92, 0.1);
+  background-color: rgba(92, 184, 92, 0.10);
   color: var(--btn-success-bg);
 }
 
 #download-link-drop-here.error {
   border-color: var(--btn-danger-border);
-  background-color: rgba(217, 83, 79, 0.08);
+  background-color: rgba(217, 83, 79, 0.10);
   color: var(--btn-danger-bg);
 }
 
@@ -428,14 +428,14 @@ hr.console-hr {
 
 .checkbox-inline {
   cursor: pointer;
-  font-size: 0.9em;
+  font-size: 0.90em;
 }
 
 /* Queue detail list */
 .queue-detail-list {
   display: grid;
   grid-template-columns: auto 1fr;
-  gap: 0.3em 1em;
+  gap: 0.30em 1em;
   margin-bottom: 1em;
 }
 
@@ -450,8 +450,8 @@ hr.console-hr {
 
 .colvis-buttons {
   display: flex;
-  gap: 0.4em;
-  margin-bottom: 0.8em;
+  gap: 0.40em;
+  margin-bottom: 0.80em;
   flex-wrap: wrap;
 }
 
@@ -462,7 +462,7 @@ hr.console-hr {
 }
 
 .colvis-list li {
-  padding: 0.3em 0;
+  padding: 0.30em 0;
 }
 
 .colvis-list li label {

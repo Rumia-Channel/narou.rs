@@ -4,22 +4,22 @@
   width: 0;
   height: 0;
   vertical-align: middle;
-  border-top: 0.3em solid;
-  border-right: 0.3em solid transparent;
-  border-left: 0.3em solid transparent;
+  border-top: 0.30em solid;
+  border-right: 0.30em solid transparent;
+  border-left: 0.30em solid transparent;
 }
 
 /* ========== Badge ========== */
 .badge {
   display: inline-block;
-  min-width: 0.7em;
+  min-width: 0.70em;
   padding: 0.15em 0.5em;
   font-size: 0.75em;
   font-weight: bold;
   text-align: center;
   white-space: nowrap;
   vertical-align: middle;
-  border-radius: 0.7em;
+  border-radius: 0.70em;
   background-color: var(--badge-bg);
   color: var(--badge-text);
   line-height: 1;
@@ -38,7 +38,7 @@
   text-align: center;
   white-space: nowrap;
   vertical-align: middle;
-  border: 0.07em solid transparent;
+  border: 0.05em solid transparent;
   border-radius: var(--btn-border-radius);
   cursor: pointer;
   user-select: none;
@@ -114,7 +114,7 @@ li.enable-selected.disabled a {
 
 .btn-group > .btn + .btn,
 .btn-group > .btn + .dropdown-toggle {
-  margin-left: -0.07em;
+  margin-left: -0.05em;
 }
 
 .btn-group > .btn:first-child:not(:last-child) {
@@ -146,7 +146,7 @@ li.enable-selected.disabled a {
   min-width: 10em;
   padding: 0.35em 0;
   background-color: var(--dropdown-bg);
-  border: 0.07em solid var(--dropdown-border);
+  border: 0.05em solid var(--dropdown-border);
   border-radius: var(--btn-border-radius);
   box-shadow: var(--dropdown-shadow);
 }
@@ -169,7 +169,7 @@ li.enable-selected.disabled a {
 
 .dropdown-menu > li > a {
   display: block;
-  padding: 0.3em 1.2em;
+  padding: 0.30em 1.20em;
   color: var(--dropdown-text);
   white-space: nowrap;
   text-decoration: none;
@@ -184,7 +184,7 @@ li.enable-selected.disabled a {
 .dropdown-menu > li.divider {
   height: 0;
   margin: 0.35em 0;
-  border-top: 0.07em solid var(--dropdown-divider);
+  border-top: 0.05em solid var(--dropdown-divider);
 }
 
 .check-mark {
@@ -207,7 +207,7 @@ li.enable-selected.disabled a {
 .table th,
 .table td {
   padding: var(--table-cell-padding);
-  border: 0.07em solid var(--table-border);
+  border: 0.05em solid var(--table-border);
   text-align: left;
   vertical-align: middle;
 }
@@ -231,12 +231,12 @@ li.enable-selected.disabled a {
 
 .table thead th.active-sort::after {
   content: " ▼";
-  font-size: 0.7em;
+  font-size: 0.70em;
 }
 
 .table thead th.active-sort.sort-asc::after {
   content: " ▲";
-  font-size: 0.7em;
+  font-size: 0.70em;
 }
 
 .table tbody tr:nth-child(odd) {
@@ -252,7 +252,7 @@ li.enable-selected.disabled a {
 }
 
 .table tbody tr.selected > * {
-  box-shadow: inset 0 0 0 9999em rgba(255, 212, 0, 0.3);
+  box-shadow: inset 0 0 0 9999em rgba(255, 212, 0, 0.30);
 }
 
 .table tbody tr.selected {
@@ -269,7 +269,7 @@ li.enable-selected.disabled a {
 
 .table tbody tr {
   cursor: pointer;
-  transition: background-color 0.1s;
+  transition: background-color 0.10s;
   user-select: none;
 }
 
@@ -291,38 +291,38 @@ li.enable-selected.disabled a {
 .col-menu { width: 2.5em; text-align: center; }
 
 .btn-story {
-  background: none; border: 0.07em solid var(--border-color); border-radius: var(--border-radius);
-  cursor: pointer; font-size: 0.85em; padding: 0.07em 0.35em; color: var(--link-color);
+  background: none; border: 0.05em solid var(--border-color); border-radius: var(--border-radius);
+  cursor: pointer; font-size: 0.85em; padding: 0.05em 0.35em; color: var(--link-color);
 }
 .btn-story:hover { background: var(--dropdown-hover-bg); }
 
 .story-popover {
   position: absolute; z-index: 10000;
-  background: var(--dropdown-bg); border: 0.07em solid var(--dropdown-border); border-radius: var(--border-radius);
+  background: var(--dropdown-bg); border: 0.05em solid var(--dropdown-border); border-radius: var(--border-radius);
   box-shadow: var(--dropdown-shadow);
   max-width: 25em; min-width: 12.5em; padding: 0;
 }
 .story-popover-title {
   font-weight: bold; padding: 0.5em 0.75em;
-  border-bottom: 0.07em solid var(--dropdown-divider); font-size: 0.95em;
+  border-bottom: 0.05em solid var(--dropdown-divider); font-size: 0.95em;
 }
 .story-popover-body {
-  padding: 0.5em 0.75em; font-size: 0.9em;
+  padding: 0.5em 0.75em; font-size: 0.90em;
   max-height: 18.75em; overflow-y: auto; line-height: 1.5;
 }
 
 /* ========== Tags ========== */
 .tag-label {
   display: inline-block;
-  padding: 0.1em 0.4em;
-  font-size: 0.8em;
+  padding: 0.10em 0.40em;
+  font-size: 0.80em;
   font-weight: bold;
-  border-radius: 0.2em;
+  border-radius: 0.20em;
   color: var(--btn-text);
-  margin: 0.1em;
+  margin: 0.10em;
   white-space: nowrap;
   cursor: pointer;
-  line-height: 1.3;
+  line-height: 1.30;
 }
 
 .tag-green { background-color: var(--tag-green); }
@@ -331,14 +331,14 @@ li.enable-selected.disabled a {
 .tag-magenta { background-color: var(--tag-magenta); }
 .tag-cyan { background-color: var(--tag-cyan); }
 .tag-red { background-color: var(--tag-red); }
-.tag-white { background-color: var(--tag-white-bg); border: 0.07em solid var(--tag-white-border); color: var(--tag-white-text); }
+.tag-white { background-color: var(--tag-white-bg); border: 0.05em solid var(--tag-white-border); color: var(--tag-white-text); }
 .tag-default { background-color: var(--tag-default-bg); color: var(--tag-default-text); }
 
 .tag-list-canvas {
-  padding: 0.3em 0.6em;
+  padding: 0.30em 0.60em;
   display: flex;
   flex-wrap: wrap;
-  gap: 0.2em;
+  gap: 0.20em;
 }
 
 /* ========== Status Badges ========== */
@@ -366,7 +366,7 @@ li.enable-selected.disabled a {
 /* narou.rb: hint when general_lastup > last_update (new content available) */
 .hint-new-arrival {
   background-color: rgba(255, 200, 0, 0.15);
-  border-radius: 0.2em;
+  border-radius: 0.20em;
 }
 
 .gl-badge {
@@ -375,8 +375,8 @@ li.enable-selected.disabled a {
   font-size: 0.75em;
   font-weight: bold;
   color: var(--btn-text);
-  border-radius: 0.2em;
-  line-height: 1.2;
+  border-radius: 0.20em;
+  line-height: 1.20;
 }
 
 .gl-1h { background-color: var(--gl-1h-bg); }
@@ -392,7 +392,7 @@ li.enable-selected.disabled a {
   min-width: 12em;
   padding: 0.35em 0;
   background-color: var(--dropdown-bg);
-  border: 0.07em solid var(--dropdown-border);
+  border: 0.05em solid var(--dropdown-border);
   border-radius: var(--btn-border-radius);
   box-shadow: var(--dropdown-shadow);
   list-style: none;
@@ -401,7 +401,7 @@ li.enable-selected.disabled a {
 
 .context-menu > li > a {
   display: block;
-  padding: 0.3em 1.2em;
+  padding: 0.30em 1.20em;
   color: var(--dropdown-text);
   white-space: nowrap;
   text-decoration: none;
@@ -416,26 +416,26 @@ li.enable-selected.disabled a {
 .context-menu > li.divider {
   height: 0;
   margin: 0.35em 0;
-  border-top: 0.07em solid var(--dropdown-divider);
+  border-top: 0.05em solid var(--dropdown-divider);
 }
 
 /* ========== Tag Editor ========== */
 .tag-editor-current {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.3em;
-  margin-bottom: 0.8em;
+  gap: 0.30em;
+  margin-bottom: 0.80em;
   min-height: 2em;
 }
 
 .tag-editable {
   position: relative;
-  padding-right: 1.4em;
+  padding-right: 1.40em;
 }
 
 .tag-remove {
   position: absolute;
-  right: 0.2em;
+  right: 0.20em;
   top: 50%;
   transform: translateY(-50%);
   cursor: pointer;
@@ -454,9 +454,9 @@ li.enable-selected.disabled a {
 
 .new-tag-input {
   flex: 1;
-  padding: 0.4em 0.6em;
-  font-size: 0.9em;
-  border: 0.07em solid var(--border-color);
+  padding: 0.40em 0.60em;
+  font-size: 0.90em;
+  border: 0.05em solid var(--border-color);
   border-radius: var(--btn-border-radius);
   background: var(--body-bg);
   color: var(--text-color);
@@ -476,14 +476,14 @@ li.enable-selected.disabled a {
   z-index: 1100;
   display: flex;
   flex-direction: column;
-  gap: 0.4em;
+  gap: 0.40em;
   pointer-events: none;
 }
 
 .notification {
-  padding: 0.6em 1.2em;
+  padding: 0.60em 1.20em;
   border-radius: var(--btn-border-radius);
-  font-size: 0.9em;
+  font-size: 0.90em;
   color: var(--btn-text);
   pointer-events: auto;
   opacity: 1;
@@ -512,8 +512,8 @@ li.enable-selected.disabled a {
   border-radius: 50%;
   cursor: pointer;
   font-size: 1em;
-  opacity: 0.7;
-  transition: opacity 0.2s;
+  opacity: 0.70;
+  transition: opacity 0.20s;
 }
 
 .move-to-top:hover {
@@ -523,7 +523,7 @@ li.enable-selected.disabled a {
 /* ========== New Arrival Dot ========== */
 .status-new-dot {
   color: var(--new-arrival-color);
-  font-size: 0.7em;
+  font-size: 0.70em;
   vertical-align: middle;
 }
 
@@ -532,8 +532,8 @@ li.enable-selected.disabled a {
   background: none;
   border: none;
   cursor: pointer;
-  padding: 0.15em 0.3em;
-  font-size: 1.1em;
+  padding: 0.15em 0.30em;
+  font-size: 1.10em;
   color: var(--text-muted);
   line-height: 1;
 }
@@ -574,8 +574,8 @@ li.enable-selected.disabled a {
 }
 
 .queue-task-item {
-  padding: 0.3em 0.5em;
-  border-bottom: 0.07em solid var(--border-color);
+  padding: 0.30em 0.5em;
+  border-bottom: 0.05em solid var(--border-color);
   display: flex;
   align-items: center;
   gap: 0.5em;
@@ -587,7 +587,7 @@ li.enable-selected.disabled a {
 
 .queue-task-icon {
   flex-shrink: 0;
-  width: 1.2em;
+  width: 1.20em;
   text-align: center;
 }
 
@@ -615,13 +615,13 @@ li.enable-selected.disabled a {
   border: none;
   background: none;
   cursor: pointer;
-  padding: 0 0.3em;
+  padding: 0 0.30em;
   color: var(--btn-danger-bg);
   font-size: 1em;
 }
 
 .queue-task-delete:hover {
-  opacity: 0.7;
+  opacity: 0.70;
 }
 
 .queue-task-actions {
@@ -649,12 +649,12 @@ li.enable-selected.disabled a {
 .queue-task-cancel:hover,
 .queue-task-up:hover,
 .queue-task-down:hover {
-  opacity: 0.7;
+  opacity: 0.70;
 }
 
 .queue-task-up:disabled,
 .queue-task-down:disabled {
-  opacity: 0.3;
+  opacity: 0.30;
   cursor: default;
 }
 
@@ -684,7 +684,7 @@ li.enable-selected.disabled a {
   display: flex;
   align-items: center;
   gap: 0.5em;
-  padding: 0.3em 1.2em;
+  padding: 0.30em 1.20em;
 }
 
 .theme-label {
@@ -693,9 +693,9 @@ li.enable-selected.disabled a {
 }
 
 .theme-select {
-  padding: 0.2em 0.4em;
+  padding: 0.20em 0.40em;
   font-size: 0.85em;
-  border: 0.07em solid var(--border-color);
+  border: 0.05em solid var(--border-color);
   border-radius: var(--btn-border-radius);
   background: var(--body-bg);
   color: var(--text-color);
@@ -715,7 +715,7 @@ li.enable-selected.disabled a {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 0.3em;
+  margin-bottom: 0.30em;
 }
 
 .diff-entry h5 {
@@ -725,7 +725,7 @@ li.enable-selected.disabled a {
 
 .btn-diff-clean {
   padding: 0.125em 0.5em;
-  font-size: 0.8rem;
+  font-size: 0.80rem;
   cursor: pointer;
 }
 
@@ -745,14 +745,14 @@ li.enable-selected.disabled a {
 .queue-size-active {
   background-color: var(--btn-warning-bg);
   color: var(--btn-text);
-  padding: 0.15em 0.4em;
-  border-radius: 0.7em;
+  padding: 0.15em 0.40em;
+  border-radius: 0.70em;
   font-size: 0.75em;
   font-weight: bold;
 }
 
 .queue-size-default {
-  font-size: 0.9em;
+  font-size: 0.90em;
   color: var(--navbar-text);
 }
 
@@ -760,7 +760,7 @@ li.enable-selected.disabled a {
 .toc-link {
   color: var(--link-color);
   text-decoration: none;
-  font-size: 1.1em;
+  font-size: 1.10em;
 }
 
 .toc-link:hover {
@@ -807,14 +807,14 @@ li.enable-selected.disabled a {
 /* ========== Progress Bar ========== */
 .progress {
   width: 100%;
-  height: 1.2em;
+  height: 1.20em;
   background-color: var(--input-bg);
   border-radius: var(--border-radius);
-  margin: 0.3em 0;
+  margin: 0.30em 0;
   overflow: hidden;
 }
 .progress-bar {
   height: 100%;
   background-color: var(--btn-success-bg);
-  transition: width 0.3s ease;
+  transition: width 0.30s ease;
 }
