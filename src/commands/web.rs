@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -160,36 +160,52 @@ async fn bind_or_shutdown_and_retry(
     port: u16,
     label: &str,
 ) -> tokio::net::TcpListener {
-    match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // Layer 1: HTTP graceful shutdown (cross-platform, identifies narou)
-            if try_shutdown_via_http(host, port) || try_kill_via_pid_file(port) {
-                match tokio::net::TcpListener::bind(addr).await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        eprintln!(
-                            "{} ポート {} のバインドに失敗しました: {}",
-                            label, port, e
-                        );
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                eprintln!(
-                    "ポート {} は既に使用されています。\n\
-                     既にサーバが起動していませんか？\n\
-                     別のポートを指定するには --port オプションを使ってください。",
-                    port
-                );
-                std::process::exit(1);
-            }
+    // First attempt: bind with SO_REUSEADDR (matching Ruby/WEBrick behavior).
+    // On Windows this succeeds even when the old process still holds the port.
+    // On Unix this handles TIME_WAIT but NOT an active listener.
+    match create_reusable_listener(addr) {
+        Ok(l) => return l,
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            // Active listener exists (Unix) — try cleanup
+            try_shutdown_via_http(host, port);
+            try_kill_via_pid_file(port);
         }
         Err(e) => {
             eprintln!("{} サーバの起動に失敗しました: {}", label, e);
             std::process::exit(1);
         }
     }
+
+    // Retry after cleanup
+    match create_reusable_listener(addr) {
+        Ok(l) => l,
+        Err(_) => {
+            eprintln!(
+                "ポート {} は既に使用されています。\n\
+                 既にサーバが起動していませんか？\n\
+                 別のポートを指定するには --port オプションを使ってください。",
+                port
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Create a TCP listener with SO_REUSEADDR set, matching Ruby/WEBrick behaviour.
+/// This allows rebinding a port that is in TIME_WAIT (all platforms) or still
+/// held by a lingering old process (Windows).
+fn create_reusable_listener(addr: SocketAddr) -> io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
 }
 
 // --- PID file management ---
@@ -218,20 +234,20 @@ fn read_pid_file() -> Option<u32> {
 
 // --- Shutdown strategies ---
 
-/// Strategy 1: Send HTTP POST /api/shutdown to the existing server.
-/// Works when the old server is fully responsive.
-fn try_shutdown_via_http(host: &str, port: u16) -> bool {
+/// Best-effort HTTP shutdown of a running narou server.
+/// May fail if the server is in graceful-shutdown mode (Ctrl+C already pressed).
+fn try_shutdown_via_http(host: &str, port: u16) {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
     let display = if host == "127.0.0.1" { "localhost" } else { host };
     let addr: SocketAddr = match format!("{}:{}", host, port).parse() {
         Ok(a) => a,
-        Err(_) => return false,
+        Err(_) => return,
     };
 
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
-        return false;
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+        return;
     };
 
     eprintln!(
@@ -249,27 +265,31 @@ fn try_shutdown_via_http(host: &str, port: u16) -> bool {
         display, port
     );
     if stream.write_all(request.as_bytes()).is_err() {
-        return false;
+        return;
     }
 
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut buf = [0u8; 512];
     let _ = stream.read(&mut buf);
     drop(stream);
 
-    wait_for_port_free(&addr)
+    // Brief wait for the old server to exit
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_millis(250));
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_err() {
+            return;
+        }
+    }
 }
 
-/// Strategy 2: Kill via PID file (fallback for when HTTP shutdown doesn't work,
-/// e.g. server is in a zombie state after partial Ctrl+C).
-fn try_kill_via_pid_file(port: u16) -> bool {
+/// Best-effort kill of the old server process via PID file.
+fn try_kill_via_pid_file(port: u16) {
     let Some(pid) = read_pid_file() else {
-        return false;
+        return;
     };
 
-    // Don't kill ourselves
     if pid == std::process::id() {
-        return false;
+        return;
     }
 
     eprintln!(
@@ -277,53 +297,34 @@ fn try_kill_via_pid_file(port: u16) -> bool {
         pid
     );
 
-    let killed = {
-        #[cfg(windows)]
-        {
-            std::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/F"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        }
-        #[cfg(not(windows))]
-        {
-            std::process::Command::new("kill")
-                .arg(pid.to_string())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-        }
-    };
-
-    if !killed {
-        return false;
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 
+    // Wait for the process to die and port to free, regardless of kill exit code
     let addr: SocketAddr = match format!("127.0.0.1:{}", port).parse() {
         Ok(a) => a,
-        Err(_) => {
-            std::thread::sleep(Duration::from_secs(1));
-            return true;
-        }
+        Err(_) => return,
     };
-    wait_for_port_free(&addr)
-}
-
-/// Poll until the port is no longer accepting connections (up to 5 seconds).
-fn wait_for_port_free(addr: &SocketAddr) -> bool {
-    use std::net::TcpStream;
-    for _ in 0..20 {
+    for _ in 0..12 {
         std::thread::sleep(Duration::from_millis(250));
-        if TcpStream::connect_timeout(addr, Duration::from_millis(100)).is_err() {
-            return true;
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_err() {
+            return;
         }
     }
-    false
 }
 
 fn load_basic_auth_header() -> Result<Option<String>, String> {
@@ -394,7 +395,7 @@ fn find_available_web_port(host: &str) -> Result<u16, String> {
 }
 
 fn can_bind(host: &str, port: u16) -> bool {
-    TcpListener::bind((host, port)).is_ok()
+    std::net::TcpListener::bind((host, port)).is_ok()
 }
 
 fn normalize_bind_host(bind: Option<String>) -> String {
