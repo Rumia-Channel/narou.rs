@@ -88,7 +88,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションまで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
 | `remove` | ✅ | ✅ 完了 | `--yes`, `--with-file`, `--all-ss`、確認、freeze/lock チェックを実装 |
-| `web` | ✅ | 🟡 部分 | API / queue worker / auto-scheduler に加え、pure JS / pure CSS の分割 frontend、JP/EN 切替、theme/performance/reload 設定反映までは実装済み。narou.rb との細部 parity は継続中 |
+| `web` | ✅ | 🟡 部分 | API / queue worker / auto-scheduler に加え、pure JS / pure CSS の分割 frontend、JP/EN 切替、theme/performance/reload 設定反映までは実装済み。frontend は全件取得+client-side 描画のため narou.rb 細部 parity は継続中 |
 | `setting` | ✅ | ✅ 完了 | 基本読み書き、`--burn`、dynamic `default/force/default_args`、hidden select 値検証、`setting -a` の全変数一覧まで Ruby 互換に揃えた |
 | `diff` | ✅ | ✅ 完了 | 外部 diff ツール、raw データ管理 |
 | `send` | ✅ | ✅ 完了 | Kindle/Kobo/Reader 送信、`--without-freeze`、栞 backup/restore、hotentry を実装 |
@@ -284,6 +284,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 **Rust 実装**:
 - `limit` positional、`--latest` / `--gl` / `--reverse`、列追加オプション (`--url` / `--kind` / `--site` / `--author`) を実装
 - `--filter` は `series` / `ss` / `frozen` / `nonfrozen` の複数指定と Ruby版相当の不正値エラー (終了コード127) に対応
+- hidden 互換オプション `--frozen` も受理し、`--filter frozen` 相当として扱う
 - `--grep` は AND / `-word` の NOT 検索に対応
 - `--tag` は無引数でタグ列表示、引数付きで全指定タグを含む小説に絞り込む
 - TTY では人間可読一覧、pipe / redirect 時は ID のみ、`--echo` 時はヘッダ付き一覧を出力する
@@ -533,14 +534,14 @@ narou setting name         # 読み取り
 - 初回起動時は Ruby版同様にファイアウォール許可と停止方法の案内を表示し、`server_setting.yaml` に起動済みフラグを保存する
 - global `server-basic-auth.*` が有効な場合は HTTP/WS の両ルータで Basic 認証を要求する
 - API の凍結/解凍操作と一覧上の `frozen` 判定は CLI と同じ `.narou/freeze.yaml` を優先し、`frozen` タグは補助的に扱う
-- queue worker が `.narou/queue.yaml` を継続監視し、download / update / convert の queued job を別プロセスで順次実行する
+- queue worker が `.narou/queue.yaml` 永続キューを読み書きし、download / update / convert / send / backup / mail の queued job を別プロセスで順次実行する
 - Web 経由の convert job は `--no-open` で非対話化し、API 指定 device は worker 専用 override で child process に渡す
 - `queue_clear` は deadlock しないように永続キュー保存順を修正済み
 - local `update.auto-schedule.enable` / `update.auto-schedule` が有効なら、Ruby版同様に時刻指定で自動アップデートを実行する
 - 自動アップデートは `--gl narou` → `modified` タグ対象 → その他小説の順に child `update` を実行し、`server_setting.current_sort` が有効なら対応する `--sort-by` も引き継ぐ
 - `/` では pure JS / pure CSS の分割 asset frontend を配信し、navbar / console / control panel / list + sidebar の構成で一覧操作できる
 - UI は日本語既定で、JP/EN トグルによる切替と `localStorage` 永続化に対応する
-- `webui.theme` / `webui.performance-mode` / `webui.table.reload-timing` を `/api/webui/config` 経由で反映し、CSS variable ベースの theme token と polling 挙動へ接続する
+- `webui.theme` / `webui.performance-mode` / `webui.table.reload-timing` を `/api/webui/config` と worker 側設定参照経由で反映し、theme 初期値、performance auto/on/off 判定、table reload の every/queue 挙動へ接続する
 - レスポンシブ CSS を分離し、スマートフォン幅でも一覧・キュー・メモ帳を同じ asset 構成で表示できる
 - 一覧 API の `frozen` 取得は DB 再入ロックによる deadlock を避けるよう修正済み
 - favicon は data URL で埋め込み、追加 route なしでブラウザ 404 を出さない

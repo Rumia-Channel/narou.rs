@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
+use crate::compat::load_local_setting_string;
 use crate::db::with_database_mut;
 use crate::progress::WS_LINE_PREFIX;
 use crate::queue::{JobType, QueueJob};
@@ -59,12 +60,23 @@ pub fn start_queue_worker(
                 let _ = queue.fail(&job.id);
                 push_server.broadcast_event("queue_failed", &job.id);
             }
-            // Trigger frontend table reload after DB refresh
-            push_server.broadcast_event("table.reload", "");
-            push_server.broadcast_event("tag.updateCanvas", "");
+            if should_reload_table_after_job(&queue) {
+                push_server.broadcast_event("table.reload", "");
+                push_server.broadcast_event("tag.updateCanvas", "");
+            }
             push_server.broadcast_event("notification.queue", "");
         }
     })
+}
+
+fn should_reload_table_after_job(queue: &crate::queue::PersistentQueue) -> bool {
+    match load_local_setting_string("webui.table.reload-timing")
+        .as_deref()
+        .unwrap_or("every")
+    {
+        "queue" => queue.pending_count() == 0,
+        _ => true,
+    }
 }
 
 fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, running_pid: &Arc<parking_lot::Mutex<Option<u32>>>) -> bool {

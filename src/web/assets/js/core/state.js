@@ -51,10 +51,11 @@ export const State = {
   concurrencyEnabled: false,
 
   // Config from server
-  performanceMode: false,
+  performanceMode: 'auto',
+  tableReloadTiming: 'every',
   wsPort: null,
   theme: lsGet('theme', 'default'),
-  reloadTiming: 600,
+  pollIntervalSeconds: 600,
   language: lsGet('language', 'ja'),
 };
 

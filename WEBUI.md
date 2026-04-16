@@ -102,7 +102,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | 要素 | Ruby版 | Rust版 | 状態 |
 |------|--------|--------|------|
 | アイコン | `.glyphicon-inbox` | 📥 (Unicode) | ✅ |
-| サイズバッジ | `.queue__sizes` (default + convert分割) | `#queue-count` 単一 | ✅ (concurrency未実装のため分割不要) |
+| サイズバッジ | `.queue__sizes` (default + convert分割) | `#queue-count` 単一 | ✅ (concurrency 時も単一表示) |
 | クリックでモーダル表示 | キューマネージャー | キューマネージャーモーダル | ✅ |
 | ツールチップ | "クリックでキュー一覧を表示" | "クリックでキュー一覧を表示" | ✅ |
 | アクティブ状態 (色変化) | `.queue.active` | `queue-size-active` | ✅ |
@@ -130,7 +130,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | ゴミ箱ボタン | `.console-trash` | `#console-trash` (🗑) | ✅ |
 | 拡大/縮小ボタン | `.console-expand` (full/small切替) | `#console-expand` (⤢/⤣) | ✅ |
 | サブプロセス出力ストリーミング | `StreamingLogger`で$stdoutをキャプチャ→echo WS | `Stdio::piped()`+BufRead→echo WS | ✅ |
-| デュアルコンソール | `concurrency`設定時に`$stdout2`で左右分割 | なし | ❌ |
+| デュアルコンソール | `concurrency`設定時に`$stdout2`で左右分割 | `#console-stdout2` + `#console-col-right` | ✅ |
 
 ---
 
@@ -175,8 +175,8 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | # | カラム | 説明 | Rust | 状態 |
 |---|--------|------|------|------|
 | 1 | ID | 数値ID (凍結時 ＊ID) | ✅ | ✅ |
-| 2 | 更新日 | 更新日 (時間バッジ: 1h/6h/24h/3d/1w + 新着●マーク) | ✅ (バッジ+新着マーク) | ✅ |
-| 3 | 最新話掲載日 | general_lastup (時間バッジ付き、新着ヒント色) | ✅ (バッジ+hint-new-arrival) | ✅ |
+| 2 | 更新日 | 日付/時刻の中央寄せ表示 + `新着` ラベル | ✅ (`date-cell` + `new-arrivals`) | ✅ |
+| 3 | 最新話掲載日 | general_lastup (日付/時刻 + 時間バッジ、新着ヒント色) | ✅ (`date-cell` + `gl-badge` + `hint-new-arrival`) | ✅ |
 | 4 | 更新チェック日 | last_check_date | ✅ | ✅ |
 | 5 | タイトル | タイトル表示 | ✅ | ✅ |
 | 6 | 作者名 | クリックでフィルタ | ✅ (.filterable) | ✅ |
@@ -196,8 +196,8 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 |------|--------|--------|------|
 | 選択行ハイライト | 黄色背景 | `.selected` 黄色背景 | ✅ |
 | 凍結行 | 青色テキスト + ＊マーク | `.frozen` クラス + ＊マーク | ✅ |
-| 新着マーク | マゼンタ ● | `.status-new-dot` ● | ✅ |
-| 更新時間バッジ | 1h(赤)/6h(緑)/24h(青)/3d(灰)/1w(水色) | `.gl-badge.gl-1h/6h/24h/3d/1w` | ✅ |
+| 新着表示 | マゼンタ強調 | `.date-cell-label.new-arrivals` | ✅ |
+| 更新時間バッジ | 1h(赤)/6h(緑)/24h(青)/3d(灰)/1w(水色) | `.gl-badge.gl-1h/6h/24h/3d/1w` (general_lastup列) | ✅ |
 | 新着ヒント (GL > last_update) | 背景色変化 | `.hint-new-arrival` | ✅ |
 | 奇数/偶数行色 | CSS striping | CSS変数で指定 | ✅ |
 
@@ -205,7 +205,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 
 | 機能 | Ruby版 | Rust版 | 状態 |
 |------|--------|--------|------|
-| ソート (ヘッダークリック) | DataTables server-side | JS クライアントサイドソート | ✅ |
+| ソート (ヘッダークリック) | DataTables server-side | JS クライアントサイドソート（`/api/list` の server-side params は現状未使用） | ✅ |
 | ソートインジケータ | ▲▼ アイコン | `.active-sort` + `.sort-asc` | ✅ |
 | 列の表示/非表示切替 | DataTables ColVis | 列可視性モーダル (#colvis-modal) | ✅ |
 | ページネーション | DataTables paging | なし (全件表示) | ❌ |
@@ -428,7 +428,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | 機能 | Ruby版 | Rust版 | 状態 |
 |------|--------|--------|------|
 | テーマ選択UI | ⚙メニューにテーマリスト | `#theme-select` セレクトボックス | ✅ |
-| テーマ永続化 | `webui.theme` 設定値 | localStorage `narou-rs-webui-theme` | ✅ |
+| テーマ永続化 | `webui.theme` 設定値 | localStorage 優先、未保存時は `webui.theme` を初期値に使用 | ✅ |
 | サーバー側テーマ反映 | 設定値で初期テーマ決定 | `/api/webui/config` → `config.theme` | ✅ |
 
 ---
@@ -657,7 +657,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 **テーマ**: 6/6 ✅ (全ページCSS変数化、hardcoded色・px値なし)
 **API**: 70 実装済み / 5 未実装 (eject, version/latest, download4ssl, download_request, downloadable.gif)
 **WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, TermColorLight色付き出力 ✅, 進捗バー ✅, DB自動更新+table.reload+tag.updateCanvas ✅, 履歴on-connect ✅, console.clear ✅, shutdown/reboot ✅, 起動時バージョン表示+未完了タスク警告 ✅, モーダル/メモ帳同期 ❌
-**設定ページ**: ✅
+**設定ページ**: ✅ (`webui.performance-mode` の auto/on/off と `webui.table.reload-timing` の every/queue を反映)
 **言語切替**: ✅ (Rust独自)
 **レスポンシブ**: ✅
 **i18n 監査**: ✅ (JOB_TYPE_LABELS を Ruby版と完全一致に修正済み)

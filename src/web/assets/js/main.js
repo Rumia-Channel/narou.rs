@@ -10,6 +10,32 @@ import { bindActions, refreshList, refreshQueue, refreshTags } from './ui/action
 
 let ws = null;
 
+function isPerformanceModeEnabled() {
+  switch (State.performanceMode) {
+    case 'on':
+      return true;
+    case 'off':
+      return false;
+    case 'auto':
+    default:
+      return State.novels.length >= 2000;
+  }
+}
+
+function applyPerformanceMode() {
+  document.body.classList.toggle('performance-mode', isPerformanceModeEnabled());
+}
+
+async function refreshListWithUiState() {
+  await refreshList();
+  applyPerformanceMode();
+}
+
+async function refreshListAndTags() {
+  await refreshListWithUiState();
+  await refreshTags();
+}
+
 async function init() {
   initElements();
   initDropdowns();
@@ -28,17 +54,13 @@ async function init() {
       }
       if (config.ws_port) State.wsPort = config.ws_port;
       if (config.performance_mode) State.performanceMode = config.performance_mode;
-      if (typeof config.reload_timing === 'number') State.reloadTiming = config.reload_timing;
+      if (config.reload_timing) State.tableReloadTiming = config.reload_timing;
       if (config.concurrency_enabled) {
         State.concurrencyEnabled = true;
         if (El.consoleColRight) El.consoleColRight.classList.remove('hide');
       }
     }
   } catch { /* use defaults */ }
-
-  if (State.performanceMode) {
-    document.body.classList.add('performance-mode');
-  }
 
   // Load sort state from server
   try {
@@ -53,7 +75,7 @@ async function init() {
   } catch { /* use defaults */ }
 
   // Initial data load
-  await Promise.all([refreshList(), refreshQueue(), refreshTags()]);
+  await Promise.all([refreshListWithUiState(), refreshQueue(), refreshTags()]);
 
   // Sync UI state (check marks, wide mode, footer)
   syncViewChecks();
@@ -62,9 +84,9 @@ async function init() {
   connectWebSocket();
 
   // Periodic refresh
-  const interval = Math.max(State.reloadTiming, 10) * 1000;
+  const interval = Math.max(State.pollIntervalSeconds, 10) * 1000;
   setInterval(async () => {
-    await refreshList();
+    await refreshListWithUiState();
     await refreshQueue();
   }, interval);
 }
@@ -119,8 +141,7 @@ function handleWsMessage(msg) {
     case 'refresh':
     case 'list_updated':
     case 'table.reload':
-      refreshList();
-      refreshTags();
+      refreshListAndTags();
       break;
     case 'tag.updateCanvas':
       refreshTags();
@@ -216,7 +237,7 @@ function appendConsole(text, targetConsole) {
     text += '\n';
   }
 
-  const maxLines = State.performanceMode ? 200 : 1000;
+  const maxLines = isPerformanceModeEnabled() ? 200 : 1000;
   const wasBottom = (con.scrollTop + con.clientHeight >= con.scrollHeight - 4);
 
   const lines = text.split('\n');

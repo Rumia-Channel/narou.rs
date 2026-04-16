@@ -965,8 +965,10 @@ export async function refreshQueue() {
     if (data) {
       State.queueStatus = data;
       renderQueueStatus();
+      return data;
     }
   } catch { /* ignore */ }
+  return null;
 }
 
 export async function refreshQueueDetailed() {
