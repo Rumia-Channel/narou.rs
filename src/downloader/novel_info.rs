@@ -103,11 +103,12 @@ impl NovelInfo {
 
     pub fn from_toc_source(setting: &SiteSetting, toc_source: &str) -> Self {
         let mut info = Self::empty();
-        let keys = ["title", "author", "story"];
+        let keys = ["title", "author", "story", "tags"];
         info.raw_captures = setting.multi_match(toc_source, &keys);
         info.title = info.raw_captures.get("title").cloned();
         info.author = info.raw_captures.get("author").cloned();
         info.story = info.raw_captures.get("story").cloned();
+        info.tags = info.raw_captures.get("tags").cloned();
         info
     }
 }

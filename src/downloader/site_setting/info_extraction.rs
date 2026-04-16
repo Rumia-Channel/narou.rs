@@ -4,6 +4,56 @@ use regex::RegexBuilder;
 
 use super::{SiteSetting, SiteSettingEntry, SiteSettingValue};
 
+/// Try matching with the standard regex crate first; fall back to fancy-regex
+/// for patterns that use lookahead/lookbehind (unsupported by the regex crate).
+fn try_regex_captures(
+    pattern: &str,
+    source: &str,
+    key: &str,
+) -> Option<String> {
+    let re = RegexBuilder::new(pattern)
+        .dot_matches_new_line(true)
+        .multi_line(true)
+        .build();
+
+    if let Ok(re) = re {
+        if let Some(caps) = re.captures(source) {
+            for name in re.capture_names().flatten() {
+                if capture_name_matches_key(key, name) {
+                    if let Some(m) = caps.name(name) {
+                        return Some(m.as_str().to_string());
+                    }
+                }
+            }
+            if let Some(m) = caps.get(1) {
+                return Some(m.as_str().to_string());
+            }
+        }
+        return None;
+    }
+
+    // Fallback to fancy-regex for lookahead/lookbehind patterns
+    let fre = fancy_regex::RegexBuilder::new(pattern)
+        .dot_matches_new_line(true)
+        .multi_line(true)
+        .build();
+    if let Ok(fre) = fre {
+        if let Ok(Some(caps)) = fre.captures(source) {
+            for name in fre.capture_names().flatten() {
+                if capture_name_matches_key(key, name) {
+                    if let Some(m) = caps.name(name) {
+                        return Some(m.as_str().to_string());
+                    }
+                }
+            }
+            if let Some(m) = caps.get(1) {
+                return Some(m.as_str().to_string());
+            }
+        }
+    }
+    None
+}
+
 impl SiteSetting {
     pub fn resolve_info_pattern(&self, key: &str, source: &str) -> Option<String> {
         let value = match key {
@@ -37,24 +87,8 @@ impl SiteSetting {
             };
 
             let resolved = self.interpolate(pattern);
-            let re = RegexBuilder::new(&resolved)
-                .dot_matches_new_line(true)
-                .multi_line(true)
-                .build();
-            if let Ok(re) = re {
-                if let Some(caps) = re.captures(source) {
-                    for name in re.capture_names().flatten() {
-                        if !capture_name_matches_key(key, name) {
-                            continue;
-                        }
-                        if let Some(m) = caps.name(name) {
-                            return Some(m.as_str().to_string());
-                        }
-                    }
-                    if let Some(m) = caps.get(1) {
-                        return Some(m.as_str().to_string());
-                    }
-                }
+            if let Some(v) = try_regex_captures(&resolved, source, key) {
+                return Some(v);
             }
         }
         None
@@ -109,24 +143,8 @@ impl SiteSetting {
                 }
             };
             let resolved = self.interpolate_with_captures(pattern, prev_captures);
-            let re = RegexBuilder::new(&resolved)
-                .dot_matches_new_line(true)
-                .multi_line(true)
-                .build();
-            if let Ok(re) = re {
-                if let Some(caps) = re.captures(source) {
-                    for name in re.capture_names().flatten() {
-                        if let Some(m) = caps.name(name) {
-                            let v = m.as_str().to_string();
-                            if capture_name_matches_key(key, name) {
-                                return Some(v);
-                            }
-                        }
-                    }
-                    if let Some(m) = caps.get(1) {
-                        return Some(m.as_str().to_string());
-                    }
-                }
+            if let Some(v) = try_regex_captures(&resolved, source, key) {
+                return Some(v);
             }
         }
         None
@@ -168,4 +186,22 @@ fn capture_name_matches_key(key: &str, capture_name: &str) -> bool {
         _ => &[key],
     };
     aliases.contains(&capture_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ncode_tags_regex_match() {
+        // The ncode tags pattern uses negative lookahead which requires fancy-regex
+        let pattern = "<dt class=\"p-infotop-data__title\">\\s*キーワード\\s*</dt>\\s*<dd class=\"p-infotop-data__value\">\\s*\n(?<tag>(?:(?!キーワードが設定されていません)[\\s\\S])*?)\\s*</dd>";
+
+        let source = "<dt class=\"p-infotop-data__title\">キーワード</dt>\n<dd class=\"p-infotop-data__value\">\nR15&nbsp;残酷な描写あり&nbsp;近未来 シムワールド 無敵\n</dd>";
+
+        let result = try_regex_captures(pattern, source, "tags");
+        assert!(result.is_some(), "tags regex should match via fancy-regex fallback");
+        let tag_val = result.unwrap();
+        assert!(tag_val.contains("R15"), "should contain R15, got: {}", tag_val);
+    }
 }

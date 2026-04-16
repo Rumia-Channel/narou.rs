@@ -1070,7 +1070,11 @@ impl Downloader {
             .map(|record| record.tags.clone())
             .unwrap_or_default();
         if auto_add_tags {
-            if let Some(raw_tags) = setting.resolve_info_pattern("tags", &toc_source) {
+            let raw_tags_opt = info
+                .tags
+                .clone()
+                .or_else(|| setting.resolve_info_pattern("tags", &toc_source));
+            if let Some(raw_tags) = raw_tags_opt {
                 for tag in sanitize_site_tags(&raw_tags) {
                     if !merged_tags.contains(&tag) {
                         merged_tags.push(tag);
