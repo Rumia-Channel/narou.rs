@@ -206,6 +206,10 @@
           <!-- Send -->
           <div class="btn-group">
             <button class="btn btn-warning button-send enable-selected" id="btn-send" type="button" title="選択した小説を送信">Send</button>
+            <button class="btn btn-warning dropdown-toggle" type="button" data-dropdown="send-submenu"><span class="caret"></span></button>
+            <ul class="dropdown-menu" id="send-submenu">
+              <li><a href="#" id="action-send-backup-bookmark">端末の栞データをバックアップ</a></li>
+            </ul>
           </div>
           <!-- Freeze -->
           <div class="btn-group">
@@ -516,6 +520,38 @@
           <div class="modal-footer">
             <button class="btn" id="update-by-tag-cancel">キャンセル</button>
             <button class="btn btn-primary" id="update-by-tag-submit">更新する</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- GL Update (最新話掲載日確認) modal -->
+    <div class="modal-overlay hide" id="gl-update-modal">
+      <div class="modal-dialog">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="gl-update-close" type="button">&times;</button>
+            <h4 class="modal-title">最新話掲載日の確認</h4>
+          </div>
+          <div class="modal-body">
+            <p>凍結済みを除く各小説の最新話掲載日のみを確認して反映させます。<br>
+            なろうAPIを使える小説はAPIを使用して一括で確認するので、高速に掲載日を調べることが出来ます。その他の小説はひとつずつ確認するので時間がかかります。</p>
+            <ul>
+              <li>検索除外されている小説はAPIでは確認出来ません。</li>
+              <li>最新話掲載日は通常のUpdateでも更新されています。</li>
+              <li>更新が確認された小説には<code>modified</code>タグが自動で追加されます。Updateすることで削除されます。(ジャンルなどのNarou.rbが見ていない情報だけが変更されても更新されたとみなされます)</li>
+              <li>"実際に小説のデータが修正されてからなろうAPIに反映されるまで平均5分程度(最大2時間)の誤差があります。"<span style="color:var(--text-muted)">（<a href="http://dev.syosetu.com/man/api/" target="_blank">公式サイト</a>から引用）</span></li>
+            </ul>
+            <p style="text-align:right">
+              <label style="display:inline-block;margin:0.2em 0.5em;cursor:pointer"><input type="checkbox" id="gl-update-narou" checked> なろう小説をAPIで確認</label>
+              &nbsp;&nbsp;&nbsp;
+              <label style="display:inline-block;margin:0.2em 0.5em;cursor:pointer"><input type="checkbox" id="gl-update-other"> その他の小説を確認</label><br>
+              <label style="display:inline-block;margin:0.2em 0.5em;cursor:pointer"><input type="checkbox" id="gl-update-modified"> 確認後にmodifiedタグが付いた小説をUpdate</label>
+            </p>
+          </div>
+          <div class="modal-footer">
+            <button class="btn" id="gl-update-cancel">キャンセル</button>
+            <button class="btn btn-primary" id="gl-update-submit">確認する</button>
           </div>
         </div>
       </div>

@@ -145,7 +145,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | 3 | **な** (success/緑) | — | ✅ | ✅ |
 | 4 | **他** (success/緑) | — | ✅ | ✅ |
 | 5 | **🔄** (success/緑) | — | ✅ (modifiedタグ付き更新) | ✅ |
-| 6 | **Send** (warning/橙) | — | ✅ | ✅ |
+| 6 | **Send** (warning/橙) | ドロップダウン: 栞バックアップ | ✅ (ドロップダウン+backup_bookmark) | ✅ |
 | 7 | **Freeze** (info/水色) | ドロップダウン: 凍結/解除 | ✅ | ✅ |
 | 8 | **Remove** (danger/赤) | — | ✅ (確認ダイアログ付き) | ✅ |
 | 9 | **Convert** (default/白) | — | ✅ | ✅ |
@@ -182,7 +182,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | 6 | 作者名 | クリックでフィルタ | ✅ (.filterable) | ✅ |
 | 7 | 掲載 | サイト名、クリックでフィルタ | ✅ (.filterable) | ✅ |
 | 8 | 種別 | 短編/連載 | ✅ | ✅ |
-| 9 | タグ | 色付きバッジ (7色対応) | ✅ | ✅ |
+| 9 | タグ | 色付きバッジ (7色対応)、クリックでフィルタ | ✅ (tag:xxxフィルタ) | ✅ |
 | 10 | 話数 | `N話` 形式 | ✅ | ✅ |
 | 11 | 文字数 | 万字/千字 表示 (unitizeNumeric) | ✅ | ✅ |
 | 12 | 状態 | 連載中/完結 | ✅ | ✅ |
@@ -371,6 +371,20 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | タグ件数表示 | `TAG(COUNT)` 形式 | `TAG(COUNT)` 形式 | ✅ |
 | 更新実行 | POST `/api/update_by_tag` | POST `/api/update_by_tag` | ✅ |
 
+### 3.10 GL確認モーダル
+
+**Rust版: ✅ 実装済み (`#gl-update-modal`)**
+
+| 機能 | Ruby版 | Rust版 | 状態 |
+|------|--------|--------|------|
+| 説明テキスト表示 | bootbox.dialog | `#gl-update-modal` | ✅ |
+| なろう小説チェックボックス | `narou` (デフォルトON) | `#gl-check-narou` | ✅ |
+| その他チェックボックス | `other` (デフォルトOFF) | `#gl-check-other` | ✅ |
+| modified更新チェックボックス | `updateModified` (デフォルトOFF) | `#gl-check-modified` | ✅ |
+| localStorage永続化 | `update_general_lastup_checked` | 同左 | ✅ |
+| 確認実行 | POST `/api/update_general_lastup` | 同左 | ✅ |
+| 公式サイトリンク | `http://dev.syosetu.com/man/api/` | 同左 | ✅ |
+
 ---
 
 ## 4. キーボードショートカット
@@ -442,6 +456,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/send` | POST | ✅ |
 | `/api/mail` | POST | ✅ |
 | `/api/backup` | POST | ✅ |
+| `/api/backup_bookmark` | POST | ✅ (栞バックアップ) |
 | `/api/inspect` | POST | ✅ |
 | `/api/folder` | POST | ✅ |
 | `/api/setting_burn` | POST | ✅ |
@@ -544,7 +559,6 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | エンドポイント | 説明 |
 |-------------|------|
 | `/api/version/latest.json` | 最新バージョンチェック (外部API依存) |
-| `/api/backup_bookmark` | 栞バックアップ (実機検証必要) |
 | `/api/eject` | 端末取出し (実機検証必要) |
 | `/api/download4ssl` | SSL互換DL (レガシー) |
 | `/api/download_request` | DL済みチェック (D&Dウィジェット向け) |
@@ -641,7 +655,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 **モーダル**: 9/9 ✅ (タグ編集, About, 差分, 確認, メモ帳, ダウンロード, キュー, 列可視性, タグ指定アップデート)
 **キーボードショートカット**: 12/12 ✅
 **テーマ**: 6/6 ✅ (全ページCSS変数化、hardcoded色・px値なし)
-**API**: 69 実装済み / 6 未実装 (eject, version/latest, backup_bookmark, download4ssl, download_request, downloadable.gif)
+**API**: 70 実装済み / 5 未実装 (eject, version/latest, download4ssl, download_request, downloadable.gif)
 **WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, TermColorLight色付き出力 ✅, 進捗バー ✅, DB自動更新+table.reload+tag.updateCanvas ✅, 履歴on-connect ✅, console.clear ✅, shutdown/reboot ✅, 起動時バージョン表示+未完了タスク警告 ✅, モーダル/メモ帳同期 ❌
 **設定ページ**: ✅
 **言語切替**: ✅ (Rust独自)

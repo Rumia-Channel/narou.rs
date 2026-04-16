@@ -1,9 +1,47 @@
-use chrono::Utc;
+use chrono::{NaiveDate, NaiveDateTime, Utc, DateTime};
 
 use crate::error::Result;
 
 use super::fetch::HttpFetcher;
-use super::types::NarouApiResult;
+
+/// Parse a date/time string from the Syosetu API.
+/// The API returns dates as `"YYYY-MM-DD HH:MM:SS"` (not RFC 3339).
+fn parse_api_datetime(value: &str) -> Option<DateTime<Utc>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(value, fmt) {
+            return Some(dt.and_utc());
+        }
+        if let Ok(date) = NaiveDate::parse_from_str(value, fmt) {
+            return date.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+        }
+    }
+    None
+}
+
+/// Parse Syosetu API JSON response.
+/// The API returns a flat array: `[{"allcount":N}, {entry1}, {entry2}, ...]`.
+fn parse_api_entries(body: &str) -> Vec<serde_json::Value> {
+    let arr: Vec<serde_json::Value> = match serde_json::from_str(body) {
+        Ok(a) => a,
+        Err(_) => return Vec::new(),
+    };
+    // Skip first element (allcount metadata), return data entries that have ncode
+    arr.into_iter()
+        .skip(1)
+        .filter(|v| v.get("ncode").is_some())
+        .collect()
+}
 
 pub fn narou_api_batch_update(fetcher: &mut HttpFetcher) -> Result<(usize, usize)> {
     let narou_ids: Vec<(i64, String)> = crate::db::with_database(|db| {
@@ -20,84 +58,90 @@ pub fn narou_api_batch_update(fetcher: &mut HttpFetcher) -> Result<(usize, usize
         return Ok((0, 0));
     }
 
-    let mut all_ncodes = Vec::new();
-    for chunk in narou_ids.chunks(50) {
-        let ncodes: Vec<&str> = chunk.iter().map(|(_, nc)| nc.as_str()).collect();
-        all_ncodes.push(ncodes.join("-"));
-    }
-
     let api_url = "https://api.syosetu.com/novelapi/api/";
     let mut total_updated = 0usize;
     let mut total_failed = 0usize;
 
-    for ncode_chunk in &all_ncodes {
+    // Ruby prepends `n-` to the of parameter (api.rb:38).
+    // API field abbreviations: n=ncode, t=title, w=writer, s=story,
+    // nt=novel_type, e=end, ga=general_all_no, gf=general_firstup,
+    // gl=general_lastup, nu=novelupdated_at, l=length
+    for chunk in narou_ids.chunks(50) {
+        let ncodes: Vec<&str> = chunk.iter().map(|(_, nc)| nc.as_str()).collect();
+        let ncode_param = ncodes.join("-");
+
         fetcher.rate_limiter.wait();
         let url = format!(
-            "{}?of=t-nt-ga-gf-nu-gl-l-w-s-e-ncode-allno-novelpage&out=json&ncode={}",
-            api_url, ncode_chunk
+            "{}?of=n-t-nt-ga-gf-nu-gl-l-w-s-e&out=json&ncode={}",
+            api_url, ncode_param
         );
 
         let response = match fetcher.client.get(&url).send() {
             Ok(r) => r,
             Err(_e) => {
-                total_failed += 50;
+                total_failed += chunk.len();
                 continue;
             }
         };
 
         if !response.status().is_success() {
-            total_failed += 50;
+            total_failed += chunk.len();
             continue;
         }
 
         let body = match response.text() {
             Ok(b) => b,
             Err(_) => {
-                total_failed += 50;
+                total_failed += chunk.len();
                 continue;
             }
         };
 
-        let api_result: NarouApiResult = match serde_json::from_str(&body) {
-            Ok(r) => r,
-            Err(_) => {
-                total_failed += 50;
-                continue;
-            }
-        };
+        let entries = parse_api_entries(&body);
 
-        for entry in &api_result.data {
-            if let Some(id) = narou_ids
+        for entry in &entries {
+            let entry_ncode = entry
+                .get("ncode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if let Some(id) = chunk
                 .iter()
-                .find(|(_, nc)| nc == &entry.ncode)
+                .find(|(_, nc)| nc.eq_ignore_ascii_case(entry_ncode))
                 .map(|(id, _)| *id)
             {
                 let updated = crate::db::with_database_mut(|db| {
                     if let Some(record) = db.get(id).cloned() {
                         let mut r = record;
-                        r.title = entry.title.clone();
-                        r.author = entry.writer.clone();
-                        r.end = entry.end == 1;
-                        r.general_all_no = Some(entry.general_all_no);
-                        r.length = Some(entry.length);
 
-                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.general_firstup)
-                        {
-                            r.general_firstup = Some(dt.with_timezone(&Utc));
+                        if let Some(s) = entry.get("title").and_then(|v| v.as_str()) {
+                            r.title = s.to_string();
                         }
-                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.general_lastup)
-                        {
-                            r.general_lastup = Some(dt.with_timezone(&Utc));
+                        if let Some(s) = entry.get("writer").and_then(|v| v.as_str()) {
+                            r.author = s.to_string();
                         }
-                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.novelupdated_at)
-                        {
-                            r.novelupdated_at = Some(dt.with_timezone(&Utc));
+                        if let Some(n) = entry.get("end").and_then(|v| v.as_i64()) {
+                            r.end = n == 1;
+                        }
+                        if let Some(n) = entry.get("general_all_no").and_then(|v| v.as_i64()) {
+                            r.general_all_no = Some(n);
+                        }
+                        if let Some(n) = entry.get("length").and_then(|v| v.as_i64()) {
+                            r.length = Some(n);
                         }
 
-                        if entry.novel_type == 2 {
-                            r.novel_type = 2;
-                        } else {
-                            r.novel_type = 1;
+                        if let Some(s) = entry.get("general_firstup").and_then(|v| v.as_str()) {
+                            r.general_firstup = parse_api_datetime(s);
+                        }
+                        if let Some(s) = entry.get("general_lastup").and_then(|v| v.as_str()) {
+                            r.general_lastup = parse_api_datetime(s);
+                        }
+                        if let Some(s) = entry.get("novelupdated_at").and_then(|v| v.as_str()) {
+                            r.novelupdated_at = parse_api_datetime(s);
+                        }
+
+                        if let Some(nt) = entry.get("novel_type").and_then(|v| v.as_i64()) {
+                            r.novel_type = if nt == 2 { 2 } else { 1 };
                         }
 
                         db.insert(r);

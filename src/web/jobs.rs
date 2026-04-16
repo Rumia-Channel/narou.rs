@@ -412,6 +412,40 @@ pub async fn api_backup(
     .into()
 }
 
+// POST /api/backup_bookmark — backup bookmarks from device
+pub async fn api_backup_bookmark(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let queue = match open_queue() {
+        Ok(queue) => queue,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+            })
+            .into();
+        }
+    };
+    // Ruby parity: runs "send --backup-bookmark"
+    let job_id = match queue.push(JobType::Send, "--backup-bookmark") {
+        Ok(id) => id,
+        Err(e) => {
+            return serde_json::json!({
+                "success": false,
+                "message": e.to_string(),
+            })
+            .into();
+        }
+    };
+
+    state.push_server.broadcast_event("notification.queue", "");
+    serde_json::json!({
+        "success": true,
+        "job_id": job_id,
+    })
+    .into()
+}
+
 // POST /api/mail
 pub async fn api_mail(
     State(state): State<AppState>,

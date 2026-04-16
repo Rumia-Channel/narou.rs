@@ -356,7 +356,37 @@ export function bindActions() {
   });
 
   on('action-update-general-lastup', () => {
-    postJson('/api/update', { targets: ['--gl'] });
+    // Restore saved checkbox state from localStorage
+    const saved = JSON.parse(localStorage.getItem('gl_update_checked') || '{}');
+    const cbNarou = document.getElementById('gl-update-narou');
+    const cbOther = document.getElementById('gl-update-other');
+    const cbModified = document.getElementById('gl-update-modified');
+    if (cbNarou) cbNarou.checked = saved.narou !== undefined ? saved.narou : true;
+    if (cbOther) cbOther.checked = saved.other !== undefined ? saved.other : false;
+    if (cbModified) cbModified.checked = saved.updateModified !== undefined ? saved.updateModified : false;
+    document.getElementById('gl-update-modal')?.classList.remove('hide');
+  });
+
+  on('gl-update-close', () => document.getElementById('gl-update-modal')?.classList.add('hide'));
+  on('gl-update-cancel', () => document.getElementById('gl-update-modal')?.classList.add('hide'));
+  on('gl-update-submit', () => {
+    const glNarou = document.getElementById('gl-update-narou')?.checked;
+    const glOther = document.getElementById('gl-update-other')?.checked;
+    const isUpdateModified = document.getElementById('gl-update-modified')?.checked;
+    // Save state
+    localStorage.setItem('gl_update_checked', JSON.stringify({
+      narou: glNarou, other: glOther, updateModified: isUpdateModified
+    }));
+    if (!glNarou && !glOther) {
+      document.getElementById('gl-update-modal')?.classList.add('hide');
+      return;
+    }
+    let option = (glNarou && glOther) ? 'all' : (glNarou ? 'narou' : 'other');
+    postJson('/api/update_general_lastup', {
+      option: option,
+      is_update_modified: isUpdateModified
+    });
+    document.getElementById('gl-update-modal')?.classList.add('hide');
   });
 
   on('action-update-by-tag', async () => {
@@ -434,6 +464,10 @@ export function bindActions() {
   on('btn-send', () => {
     if (State.selectedIds.size === 0) return;
     postJson('/api/send', { targets: [...State.selectedIds] });
+  });
+
+  on('action-send-backup-bookmark', () => {
+    postJson('/api/backup_bookmark', {});
   });
 
   on('action-freeze-on', () => batchAction('/api/novels/freeze'));

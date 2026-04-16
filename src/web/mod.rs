@@ -92,6 +92,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/inspect", post(jobs::api_inspect))
         .route("/api/folder", post(jobs::api_folder))
         .route("/api/backup", post(jobs::api_backup))
+        .route("/api/backup_bookmark", post(jobs::api_backup_bookmark))
         .route("/api/mail", post(jobs::api_mail))
         .route("/api/setting_burn", post(jobs::api_setting_burn))
         .route("/api/diff_list", post(jobs::api_diff_list))

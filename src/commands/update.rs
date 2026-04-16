@@ -1126,7 +1126,7 @@ fn update_general_lastup_narou(
 
             fetcher.rate_limiter.wait();
             let url = format!(
-                "{}?of=nu-gl-l-ncode&out=json&ncode={}",
+                "{}?of=n-nu-gl-l&out=json&ncode={}",
                 api_url, ncode_param
             );
 

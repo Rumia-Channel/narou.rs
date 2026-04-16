@@ -255,6 +255,20 @@ function createRow(novel) {
     });
   });
 
+  // Bind tag click filtering (click tag in row → filter by that tag)
+  tr.querySelectorAll('.tag-label').forEach(el => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const tag = el.dataset.tag;
+      if (tag) {
+        State.filterText = 'tag:' + tag;
+        if (El.filterInput) El.filterInput.value = 'tag:' + tag;
+        if (El.filterClear) El.filterClear.classList.remove('hide');
+        renderNovelList();
+      }
+    });
+  });
+
   return tr;
 }
 
