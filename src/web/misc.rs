@@ -3,7 +3,7 @@ use axum::{
     response::Json,
 };
 
-use crate::compat::load_local_setting_string;
+use crate::compat::{load_local_setting_bool, load_local_setting_string};
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::db::with_database;
 use crate::version;
@@ -22,12 +22,15 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
     let reload_timing = load_local_setting_string("webui.table.reload-timing")
         .unwrap_or_else(|| "every".to_string());
 
+    let concurrency_enabled = load_local_setting_bool("concurrency");
+
     Json(serde_json::json!({
         "theme": theme,
         "performance_mode": performance_mode,
         "reload_timing": reload_timing,
         "ws_port": state.ws_port,
         "port": state.port,
+        "concurrency_enabled": concurrency_enabled,
     }))
 }
 

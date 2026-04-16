@@ -141,6 +141,26 @@
   position: relative;
 }
 
+.console-panes {
+  display: flex;
+  gap: 0;
+}
+
+.console-col-left {
+  flex: 1 1 100%;
+  min-width: 0;
+}
+
+.console-col-right {
+  flex: 0 0 35%;
+  min-width: 0;
+  border-left: 0.05em solid var(--table-border);
+}
+
+.console-col-right.hide {
+  display: none;
+}
+
 .console {
   background-color: var(--console-bg);
   color: var(--console-text);

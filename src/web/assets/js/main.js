@@ -29,6 +29,10 @@ async function init() {
       if (config.ws_port) State.wsPort = config.ws_port;
       if (config.performance_mode) State.performanceMode = config.performance_mode;
       if (typeof config.reload_timing === 'number') State.reloadTiming = config.reload_timing;
+      if (config.concurrency_enabled) {
+        State.concurrencyEnabled = true;
+        if (El.consoleColRight) El.consoleColRight.classList.remove('hide');
+      }
     }
   } catch { /* use defaults */ }
 
@@ -79,6 +83,8 @@ function connectWebSocket() {
   ws.onopen = () => {
     const con = document.getElementById('console');
     if (con) con.innerHTML = '';
+    const con2 = document.getElementById('console-stdout2');
+    if (con2) con2.innerHTML = '';
   };
 
   ws.onmessage = (event) => {
@@ -120,7 +126,7 @@ function handleWsMessage(msg) {
       refreshTags();
       break;
     case 'echo':
-      appendConsole(msg.body || '');
+      appendConsole(msg.body || '', msg.target_console);
       break;
     case 'queue_start':
       refreshQueue();
@@ -141,19 +147,21 @@ function handleWsMessage(msg) {
     case 'console.clear': {
       const con = document.getElementById('console');
       if (con) con.innerHTML = '';
+      const con2 = document.getElementById('console-stdout2');
+      if (con2) con2.innerHTML = '';
       break;
     }
     case 'error':
       appendConsole('[エラー] ' + (msg.data || msg.message || ''));
       break;
     case 'progressbar.init':
-      initProgressBar(msg.data?.topic);
+      initProgressBar(msg.data?.topic, msg.target_console);
       break;
     case 'progressbar.step':
-      setProgressBar(msg.data?.percent, msg.data?.topic);
+      setProgressBar(msg.data?.percent, msg.data?.topic, msg.target_console);
       break;
     case 'progressbar.clear':
-      removeProgressBar(msg.data?.topic);
+      removeProgressBar(msg.data?.topic, msg.target_console);
       break;
     default:
       console.debug('Unknown WS event:', msg);
@@ -161,12 +169,19 @@ function handleWsMessage(msg) {
   }
 }
 
+function getConsoleEl(targetConsole) {
+  if (targetConsole === 'stdout2' && State.concurrencyEnabled) {
+    return document.getElementById('console-stdout2');
+  }
+  return El.console;
+}
+
 var progressBars = {};
 
-function initProgressBar(topic) {
-  var key = topic || 'default';
-  removeProgressBar(key);
-  var con = El.console;
+function initProgressBar(topic, targetConsole) {
+  var key = (targetConsole || 'stdout') + ':' + (topic || 'default');
+  removeProgressBar(topic, targetConsole);
+  var con = getConsoleEl(targetConsole);
   if (!con) return;
   var wrapper = document.createElement('div');
   wrapper.className = 'progress';
@@ -176,14 +191,14 @@ function initProgressBar(topic) {
   con.scrollTop = con.scrollHeight;
 }
 
-function setProgressBar(percent, topic) {
-  var key = topic || 'default';
-  if (!progressBars[key]) initProgressBar(key);
+function setProgressBar(percent, topic, targetConsole) {
+  var key = (targetConsole || 'stdout') + ':' + (topic || 'default');
+  if (!progressBars[key]) initProgressBar(topic, targetConsole);
   progressBars[key].style.width = (percent || 0) + '%';
 }
 
-function removeProgressBar(topic) {
-  var key = topic || 'default';
+function removeProgressBar(topic, targetConsole) {
+  var key = (targetConsole || 'stdout') + ':' + (topic || 'default');
   if (!progressBars[key]) return;
   var wrapper = progressBars[key].parentElement;
   if (wrapper) wrapper.remove();
@@ -192,8 +207,8 @@ function removeProgressBar(topic) {
 
 var lastLineComplete = true;
 
-function appendConsole(text) {
-  const con = El.console;
+function appendConsole(text, targetConsole) {
+  const con = getConsoleEl(targetConsole);
   if (!con) return;
 
   // Ensure text ends with newline (worker strips \n from BufReader::lines())

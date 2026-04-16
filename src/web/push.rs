@@ -39,7 +39,7 @@ pub struct PushServer {
     channel: BroadcastChannel,
     clients: DashMap<usize, broadcast::Sender<String>>,
     next_client_id: Mutex<usize>,
-    console_history: Mutex<Vec<String>>,
+    console_history: Mutex<Vec<(String, String)>>,
     max_history: usize,
 }
 
@@ -68,7 +68,7 @@ impl PushServer {
             "data": data,
         });
         let msg_str = message.to_string();
-        self.append_history(data);
+        self.append_history(data, "stdout");
         self.channel.send(&msg_str);
     }
 
@@ -89,7 +89,7 @@ impl PushServer {
             "body": body,
             "target_console": target_console,
         });
-        self.append_history(body);
+        self.append_history(body, target_console);
         self.channel.send(&payload.to_string());
     }
 
@@ -114,7 +114,7 @@ impl PushServer {
             "level": level,
             "message": message,
         });
-        self.append_history(message);
+        self.append_history(message, "stdout");
         self.channel.send(&payload.to_string());
     }
 
@@ -123,25 +123,40 @@ impl PushServer {
     }
 
     pub fn broadcast_progressbar_init(&self, topic: &str) {
+        self.broadcast_progressbar_init_to(topic, "stdout");
+    }
+
+    pub fn broadcast_progressbar_init_to(&self, topic: &str, target_console: &str) {
         let payload = serde_json::json!({
             "type": "progressbar.init",
-            "data": { "topic": topic }
+            "data": { "topic": topic },
+            "target_console": target_console,
         });
         self.channel.send(&payload.to_string());
     }
 
     pub fn broadcast_progressbar_step(&self, percent: f64, topic: &str) {
+        self.broadcast_progressbar_step_to(percent, topic, "stdout");
+    }
+
+    pub fn broadcast_progressbar_step_to(&self, percent: f64, topic: &str, target_console: &str) {
         let payload = serde_json::json!({
             "type": "progressbar.step",
-            "data": { "percent": percent, "topic": topic }
+            "data": { "percent": percent, "topic": topic },
+            "target_console": target_console,
         });
         self.channel.send(&payload.to_string());
     }
 
     pub fn broadcast_progressbar_clear(&self, topic: &str) {
+        self.broadcast_progressbar_clear_to(topic, "stdout");
+    }
+
+    pub fn broadcast_progressbar_clear_to(&self, topic: &str, target_console: &str) {
         let payload = serde_json::json!({
             "type": "progressbar.clear",
-            "data": { "topic": topic }
+            "data": { "topic": topic },
+            "target_console": target_console,
         });
         self.channel.send(&payload.to_string());
     }
@@ -158,9 +173,9 @@ impl PushServer {
         self.clients.remove(&id);
     }
 
-    fn append_history(&self, message: &str) {
+    fn append_history(&self, message: &str, target_console: &str) {
         let mut history = self.console_history.lock();
-        history.push(message.to_string());
+        history.push((message.to_string(), target_console.to_string()));
         if history.len() > self.max_history {
             let drain_count = history.len() - self.max_history + 500;
             history.drain(..drain_count);
@@ -169,7 +184,7 @@ impl PushServer {
 
     pub fn get_history(&self) -> String {
         let history = self.console_history.lock();
-        history.join("\n")
+        history.iter().map(|(msg, _)| msg.as_str()).collect::<Vec<_>>().join("\n")
     }
 
     pub fn clear_history(&self) {
@@ -180,7 +195,7 @@ impl PushServer {
     pub fn recent_logs(&self, count: usize) -> Vec<String> {
         let history = self.console_history.lock();
         let start = history.len().saturating_sub(count);
-        history[start..].to_vec()
+        history[start..].iter().map(|(msg, _)| msg.clone()).collect()
     }
 }
 
@@ -213,11 +228,11 @@ async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>) {
     // Send console history to new client (Ruby parity: pushserver.rb lines 76-78)
     {
         let history = push_server.console_history.lock().clone();
-        for entry in history {
+        for (body, target_console) in history {
             let payload = serde_json::json!({
                 "type": "echo",
-                "body": entry,
-                "target_console": "stdout",
+                "body": body,
+                "target_console": target_console,
             });
             if sender.send(Message::Text(payload.to_string().into())).await.is_err() {
                 push_server.unregister_client(client_id);

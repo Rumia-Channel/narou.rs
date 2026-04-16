@@ -256,7 +256,7 @@ li.enable-selected.disabled a {
 }
 
 .table tbody tr.selected {
-  font-weight: bold;
+  /* No font-weight: bold — it causes column width reflow (Ruby uses box-shadow only) */
 }
 
 .table tbody tr.frozen {
@@ -768,8 +768,9 @@ li.enable-selected.disabled a {
 }
 
 /* ========== Wide mode ========== */
-.wide-mode {
+.container-main.wide-mode {
   max-width: none !important;
+  width: 100% !important;
 }
 
 /* ========== Modal size variants ========== */

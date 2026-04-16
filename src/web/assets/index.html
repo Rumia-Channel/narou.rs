@@ -163,7 +163,14 @@
 
       <!-- Console -->
       <div id="console-container">
-        <div id="console" class="console"></div>
+        <div class="console-panes">
+          <div class="console-col-left">
+            <div id="console" class="console"></div>
+          </div>
+          <div class="console-col-right hide" id="console-col-right">
+            <div id="console-stdout2" class="console"></div>
+          </div>
+        </div>
         <div class="console-buttons" id="console-buttons">
           <span class="console-btn" id="console-cancel" title="処理を中断">&#x274C;</span>
           <span class="console-btn" id="console-history" title="全ての履歴を取得">&#x2601;</span>

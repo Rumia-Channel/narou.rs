@@ -25,12 +25,17 @@ export function bindActions() {
       var lines = El.console.querySelectorAll('.console-line');
       lines.forEach(function(el) { el.remove(); });
     }
+    if (El.consoleStdout2) {
+      var lines2 = El.consoleStdout2.querySelectorAll('.console-line');
+      lines2.forEach(function(el) { el.remove(); });
+    }
     State.consoleHistory = [];
     try { await postJson('/api/clear_history', {}); } catch { /* ignore */ }
   });
 
   El.consoleExpand?.addEventListener('click', () => {
     El.console?.classList.toggle('expanded');
+    El.consoleStdout2?.classList.toggle('expanded');
     State.consoleExpanded = !State.consoleExpanded;
     // Toggle icon
     const expand = El.consoleExpand?.querySelector('.expand-icon');

@@ -544,9 +544,9 @@ export function syncViewChecks() {
   setCheck('action-select-mode-multi', State.selectMode === 'rect');
   setCheck('action-select-mode-hybrid', State.selectMode === 'hybrid');
 
-  // Wide mode
-  const container = El.novelListContainer;
-  if (container) container.classList.toggle('wide-mode', State.wideMode);
+  // Wide mode — toggle on .container-main (which has max-width in responsive.css)
+  const containerMain = document.querySelector('.container-main');
+  if (containerMain) containerMain.classList.toggle('wide-mode', State.wideMode);
 
   // Footer navbar
   if (El.footerNavbar) {

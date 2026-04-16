@@ -48,6 +48,7 @@ export const State = {
   // Console
   consoleExpanded: false,
   consoleHistory: [],
+  concurrencyEnabled: false,
 
   // Config from server
   performanceMode: false,
@@ -64,7 +65,8 @@ const ELEMENT_IDS = [
   'header-navbar', 'navbar-toggle-btn', 'navbar-collapse',
   'badge-selecting', 'queue-count', 'queue-display', 'queue-sizes',
   'filter-input', 'filter-clear', 'filter-search-icon',
-  'console', 'console-cancel', 'console-history',
+  'console', 'console-stdout2', 'console-col-right',
+  'console-cancel', 'console-history',
   'console-trash', 'console-expand', 'console-buttons',
   'main-control-panel', 'footer-control-panel', 'footer-navbar',
   'novel-list-body', 'novel-list', 'novel-list-container',
