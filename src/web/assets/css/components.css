@@ -275,9 +275,9 @@ li.enable-selected.disabled a {
 
 /* Column widths */
 .col-id { width: 3em; text-align: right; }
-.col-update { width: 7.5em; white-space: nowrap; }
-.col-general-lastup { width: 7.5em; white-space: nowrap; }
-.col-last-check { width: 7.5em; white-space: nowrap; }
+.col-update { width: 7.5em; white-space: nowrap; text-align: center; }
+.col-general-lastup { width: 7.5em; white-space: nowrap; text-align: center; }
+.col-last-check { width: 7.5em; white-space: nowrap; text-align: center; }
 .col-title { min-width: 10em; }
 .col-author { width: 7em; }
 .col-site { width: 5em; }

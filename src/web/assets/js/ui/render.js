@@ -129,22 +129,20 @@ function createRow(novel) {
 
   const idText = isFrozen ? `＊${novel.id}` : String(novel.id);
 
-  // New arrival mark + time badge on last_update
+  // New arrival mark + date cell on last_update
   let updateCell = '';
   if (novel.new_arrivals) {
     updateCell += '<span class="status-new-dot" title="新着">●</span> ';
   }
   const updateBadge = getTimeBadge(novel.last_update);
-  if (updateBadge) updateCell += updateBadge + ' ';
-  updateCell += formatDate(novel.last_update);
+  updateCell += formatDateCell(novel.last_update, updateBadge);
 
   // general_lastup with time badge + hint-new-arrival when newer than last_update
   let glCell = '';
   let glHint = false;
   if (novel.general_lastup) {
     const badge = getTimeBadge(novel.general_lastup);
-    const dateStr = formatDate(novel.general_lastup);
-    glCell = badge ? `${badge} ${dateStr}` : dateStr;
+    glCell = formatDateCell(novel.general_lastup, badge);
     // narou.rb highlights when general_lastup > last_update (new content available)
     if (novel.general_lastup > novel.last_update) {
       glHint = true;
@@ -152,7 +150,7 @@ function createRow(novel) {
   }
 
   // last_check_date
-  const checkCell = novel.last_check_date ? formatDate(novel.last_check_date) : '';
+  const checkCell = novel.last_check_date ? formatDateCell(novel.last_check_date, '') : '';
 
   // Tags
   const tagsHtml = renderTags(novel.tags || []);
@@ -590,19 +588,28 @@ function getTimeBadge(dateStr) {
 }
 
 function formatDate(dateStr) {
-  if (!dateStr) return '';
-  // API returns "YYYY-MM-DD HH:MM" — two-line display: date + time
+  if (!dateStr) return { date: '', time: '' };
+  // API returns "YYYY-MM-DD HH:MM"
   const m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}:\d{2})/);
-  if (m) return `${m[1]}/${m[2]}/${m[3]}<br>${m[4]}`;
+  if (m) return { date: `${m[1]}/${m[2]}/${m[3]}`, time: m[4] };
   // Fallback: try Date parsing
   const d = new Date(dateStr.replace(/-/g, '/'));
-  if (isNaN(d.getTime())) return dateStr;
+  if (isNaN(d.getTime())) return { date: dateStr, time: '' };
   const y = d.getFullYear();
   const mo = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
   const h = String(d.getHours()).padStart(2, '0');
   const min = String(d.getMinutes()).padStart(2, '0');
-  return `${y}/${mo}/${day}<br>${h}:${min}`;
+  return { date: `${y}/${mo}/${day}`, time: `${h}:${min}` };
+}
+
+function formatDateCell(dateStr, badge) {
+  const { date, time } = formatDate(dateStr);
+  if (!date) return '';
+  let html = date;
+  const timePart = badge ? `${time} ${badge}` : time;
+  if (timePart) html += `<br>${timePart}`;
+  return html;
 }
 
 function formatLength(n) {
