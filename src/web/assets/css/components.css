@@ -313,6 +313,12 @@ li.enable-selected.disabled a {
   white-space: nowrap;
 }
 
+.date-cell-inline-extra {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+
 .date-cell-time,
 .date-cell-label {
   display: inline-block;

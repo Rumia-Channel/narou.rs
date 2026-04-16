@@ -222,7 +222,7 @@ function createRow(novel, rowIndex) {
   if (novel.general_lastup) {
     const badge = getTimeBadge(novel.general_lastup);
     glCell = formatDateCell(novel.general_lastup, {
-      extraLine: badge,
+      inlineExtra: badge,
     });
     // narou.rb highlights when general_lastup > last_update (new content available)
     if (novel.general_lastup > novel.last_update) {
@@ -852,18 +852,22 @@ function formatDate(dateStr) {
 function formatDateCell(dateStr, options = {}) {
   const { date, time } = formatDate(dateStr);
   if (!date) return '';
+  const inlineExtra = options.inlineExtra || '';
   const extraLine = options.extraLine || '';
   const label = options.label || '';
   const labelClass = options.labelClass || '';
   let html = '<div class="date-cell">';
   html += `<span class="date-cell-date">${date}</span>`;
-  if (time || label) {
+  if (time || label || inlineExtra) {
     html += '<span class="date-cell-inline">';
     if (time) {
       html += `<span class="date-cell-time">${time}</span>`;
     }
     if (label) {
       html += `<span class="date-cell-label${labelClass ? ' ' + labelClass : ''}">${label}</span>`;
+    }
+    if (inlineExtra) {
+      html += `<span class="date-cell-inline-extra">${inlineExtra}</span>`;
     }
     html += '</span>';
   }
