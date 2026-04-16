@@ -128,25 +128,24 @@ pub async fn api_update(
         parts.extend(args);
         parts.join("\t")
     };
-    let jobs = vec![(JobType::Update, combined)];
-    let job_ids = match queue.push_batch(&jobs) {
-        Ok(ids) => ids,
-        Err(e) => {
+    let (job_ids, queued) = match push_update_job_if_needed(&queue, &state.running_job, combined) {
+        Ok(result) => result,
+        Err(message) => {
             return serde_json::json!({
                 "success": false,
-                "message": e.to_string(),
+                "message": message,
                 "count": 0
             })
             .into();
         }
     };
 
-    state
-        .push_server
-        .broadcast_event("notification.queue", "");
+    if queued {
+        state.push_server.broadcast_event("notification.queue", "");
+    }
     serde_json::json!({
         "success": true,
-        "status": "queued",
+        "status": if queued { "queued" } else { "already_queued" },
         "count": count,
         "job_ids": job_ids
     })
@@ -258,6 +257,39 @@ fn targets_to_strings(targets: &[serde_json::Value]) -> Vec<String> {
             other => other.to_string(),
         })
         .collect()
+}
+
+fn existing_update_job_id(
+    queue: &PersistentQueue,
+    running_job: &parking_lot::Mutex<Option<crate::queue::QueueJob>>,
+    target: &str,
+) -> Option<String> {
+    if let Some(job) = running_job.lock().as_ref() {
+        if matches!(job.job_type, JobType::Update) && job.target == target {
+            return Some(job.id.clone());
+        }
+    }
+
+    queue
+        .get_pending_tasks()
+        .into_iter()
+        .find(|job| matches!(job.job_type, JobType::Update) && job.target == target)
+        .map(|job| job.id)
+}
+
+fn push_update_job_if_needed(
+    queue: &PersistentQueue,
+    running_job: &parking_lot::Mutex<Option<crate::queue::QueueJob>>,
+    target: String,
+) -> Result<(Vec<String>, bool), String> {
+    if let Some(existing_id) = existing_update_job_id(queue, running_job, &target) {
+        return Ok((vec![existing_id], false));
+    }
+
+    queue
+        .push_batch(&[(JobType::Update, target)])
+        .map(|ids| (ids, true))
+        .map_err(|e| e.to_string())
 }
 
 /// Helper: spawn an immediate child process with the given args
@@ -1051,25 +1083,26 @@ pub async fn api_update_by_tag(
     };
 
     let count = ids.len();
-    let jobs = vec![(JobType::Update, tag_params.join("\t"))];
-    let _job_ids = match queue.push_batch(&jobs) {
-        Ok(ids) => ids,
-        Err(e) => {
+    let target = tag_params.join("	");
+    let (_job_ids, queued) = match push_update_job_if_needed(&queue, &state.running_job, target) {
+        Ok(result) => result,
+        Err(message) => {
             return serde_json::json!({
                 "success": false,
-                "message": e.to_string(),
+                "message": message,
                 "count": 0,
             })
             .into();
         }
     };
 
-    state
-        .push_server
-        .broadcast_event("notification.queue", "");
+    if queued {
+        state.push_server.broadcast_event("notification.queue", "");
+    }
     serde_json::json!({
         "success": true,
         "count": count,
+        "status": if queued { "queued" } else { "already_queued" },
     })
     .into()
 }
@@ -1202,33 +1235,40 @@ pub async fn api_update_general_lastup(
         }
     };
 
-    let target = args[1..].join("\t");
-    match queue.push(JobType::Update, &target) {
-        Ok(id) => {
-            state
-                .push_server
-                .broadcast_event("notification.queue", "");
+    let target = args[1..].join("	");
+    match push_update_job_if_needed(&queue, &state.running_job, target) {
+        Ok((job_ids, queued)) => {
+            let mut enqueued_any = queued;
 
             // Ruby parity: if is_update_modified, chain a second update for tag:modified
             if is_update_modified {
                 if let Ok(queue2) = open_queue() {
-                    let _ = queue2.push(JobType::Update, "--tag\tmodified");
+                    if let Ok((_, modified_queued)) = push_update_job_if_needed(
+                        &queue2,
+                        &state.running_job,
+                        "--tag	modified".to_string(),
+                    ) {
+                        enqueued_any |= modified_queued;
+                    }
                 }
+            }
+
+            if enqueued_any {
+                state.push_server.broadcast_event("notification.queue", "");
             }
 
             serde_json::json!({
                 "success": true,
-                "job_id": id,
+                "job_id": job_ids.into_iter().next(),
+                "status": if queued { "queued" } else { "already_queued" },
             })
             .into()
         }
-        Err(e) => {
-            serde_json::json!({
-                "success": false,
-                "message": e.to_string(),
-            })
-            .into()
-        }
+        Err(message) => serde_json::json!({
+            "success": false,
+            "message": message,
+        })
+        .into(),
     }
 }
 
@@ -1305,5 +1345,47 @@ fn current_sort_display_string() -> String {
             format!("{}{}", label, dir_label)
         }
         None => "ID順".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use parking_lot::Mutex;
+
+    use crate::queue::{JobType, PersistentQueue, QueueJob};
+
+    use super::{existing_update_job_id, push_update_job_if_needed};
+
+    #[test]
+    fn push_update_job_if_needed_reuses_pending_update_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = PersistentQueue::new(&temp.path().join("queue.yaml")).unwrap();
+        let running_job = Mutex::new(None);
+        let first = push_update_job_if_needed(&queue, &running_job, "1\t2\t3".to_string()).unwrap();
+
+        let second = push_update_job_if_needed(&queue, &running_job, "1\t2\t3".to_string()).unwrap();
+
+        assert!(first.1);
+        assert!(!second.1);
+        assert_eq!(first.0, second.0);
+        assert_eq!(queue.pending_count(), 1);
+    }
+
+    #[test]
+    fn existing_update_job_id_matches_running_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = PersistentQueue::new(&temp.path().join("queue.yaml")).unwrap();
+        let running_job = Mutex::new(Some(QueueJob {
+            id: "running-job".to_string(),
+            job_type: JobType::Update,
+            target: "--tag\tmodified".to_string(),
+            created_at: 0,
+            retry_count: 0,
+            max_retries: 3,
+        }));
+
+        let existing = existing_update_job_id(&queue, &running_job, "--tag\tmodified");
+
+        assert_eq!(existing.as_deref(), Some("running-job"));
     }
 }

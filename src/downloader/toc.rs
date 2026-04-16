@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
 use crate::error::{NarouError, Result};
+use crate::progress::ProgressReporter;
 
 use super::fetch::HttpFetcher;
+use super::novel_info::NovelInfo;
 use super::site_setting::SiteSetting;
 use super::types::SubtitleInfo;
 use super::util::{pretreatment_source, sanitize_filename};
@@ -110,6 +112,7 @@ pub fn parse_subtitles_multipage(
     mut toc_source: &str,
     url_captures: &HashMap<String, String>,
     title: &str,
+    progress: Option<&dyn ProgressReporter>,
 ) -> Result<Vec<SubtitleInfo>> {
     let mut all_subtitles = Vec::new();
     let mut page = 0;
@@ -123,9 +126,13 @@ pub fn parse_subtitles_multipage(
     } else {
         50
     };
-
-    if max_pages >= 5 && !title.is_empty() {
-        println!("{} の目次ページを取得中...", title);
+    let show_progress = max_pages >= 5 && !title.is_empty();
+    if show_progress {
+        if let Some(progress) = progress {
+            progress.set_position(0);
+            progress.set_length(max_pages as u64);
+            progress.set_message(&format!("目次 {}", title));
+        }
     }
 
     loop {
@@ -133,6 +140,11 @@ pub fn parse_subtitles_multipage(
         all_subtitles.extend(page_subs);
 
         page += 1;
+        if show_progress {
+            if let Some(progress) = progress {
+                progress.inc(1);
+            }
+        }
         if page >= max_pages {
             break;
         }
@@ -170,16 +182,110 @@ pub fn parse_subtitles_multipage(
         toc_source = Box::leak(body.into_boxed_str());
     }
 
+    if show_progress {
+        if let Some(progress) = progress {
+            progress.set_position(0);
+        }
+    }
+
     Ok(all_subtitles)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct MockProgress {
+        lengths: Mutex<Vec<u64>>,
+        positions: Mutex<Vec<u64>>,
+        increments: Mutex<Vec<u64>>,
+        messages: Mutex<Vec<String>>,
+    }
+
+    impl ProgressReporter for MockProgress {
+        fn set_length(&self, len: u64) {
+            self.lengths.lock().unwrap().push(len);
+        }
+
+        fn set_position(&self, pos: u64) {
+            self.positions.lock().unwrap().push(pos);
+        }
+
+        fn inc(&self, delta: u64) {
+            self.increments.lock().unwrap().push(delta);
+        }
+
+        fn set_message(&self, msg: &str) {
+            self.messages.lock().unwrap().push(msg.to_string());
+        }
+
+        fn finish_with_message(&self, _msg: &str) {}
+
+        fn println(&self, _msg: &str) {}
+    }
+
+    #[test]
+    fn multipage_toc_uses_existing_progress_for_long_series() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "ncode.syosetu.com")
+            .unwrap();
+        let toc_source = r#"
+<a href="/n1234aa/?p=5" class="c-pager__item c-pager__item--last">5</a>
+<div class="p-eplist__sublist">
+<a href="/n1234aa/1/" class="p-eplist__subtitle">
+第1話
+</a>
+<div class="p-eplist__update">
+2024年01月01日 00時00分
+</div>
+</div>
+"#;
+        let mut fetcher = HttpFetcher::new("test-agent").unwrap();
+        let progress = MockProgress::default();
+
+        let subtitles = parse_subtitles_multipage(
+            &mut fetcher,
+            setting,
+            toc_source,
+            &HashMap::new(),
+            "テスト作品",
+            Some(&progress),
+        )
+        .unwrap();
+
+        assert!(subtitles.is_empty() || subtitles.len() == 1);
+        assert_eq!(*progress.lengths.lock().unwrap(), vec![5]);
+        assert_eq!(*progress.increments.lock().unwrap(), vec![1]);
+        assert_eq!(
+            *progress.messages.lock().unwrap(),
+            vec!["目次 テスト作品".to_string()]
+        );
+        assert_eq!(*progress.positions.lock().unwrap(), vec![0, 0]);
+    }
 }
 
 pub fn create_short_story_subtitles(
     setting: &SiteSetting,
     toc_source: &str,
+    info: &NovelInfo,
 ) -> Result<Vec<SubtitleInfo>> {
-    let title = setting
-        .resolve_info_pattern("t", toc_source)
+    let title = info
+        .title
+        .clone()
+        .or_else(|| setting.resolve_info_pattern("t", toc_source))
         .unwrap_or_else(|| "短編".to_string());
+    let subdate = info.raw_captures.get("gf").cloned().unwrap_or_default();
+    let subupdate = info
+        .raw_captures
+        .get("nu")
+        .cloned()
+        .or_else(|| info.raw_captures.get("gl").cloned())
+        .or_else(|| info.raw_captures.get("gf").cloned());
 
     Ok(vec![SubtitleInfo {
         index: "1".to_string(),
@@ -188,8 +294,8 @@ pub fn create_short_story_subtitles(
         subchapter: String::new(),
         subtitle: title,
         file_subtitle: sanitize_filename("短編"),
-        subdate: String::new(),
-        subupdate: None,
+        subdate,
+        subupdate,
         download_time: None,
     }])
 }

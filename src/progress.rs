@@ -15,6 +15,7 @@ pub fn is_web_mode() -> bool {
 
 pub trait ProgressReporter: Send + Sync {
     fn set_length(&self, len: u64);
+    fn set_position(&self, pos: u64);
     fn inc(&self, delta: u64);
     fn set_message(&self, msg: &str);
     fn finish_with_message(&self, msg: &str);
@@ -25,6 +26,7 @@ pub struct NoProgress;
 
 impl ProgressReporter for NoProgress {
     fn set_length(&self, _len: u64) {}
+    fn set_position(&self, _pos: u64) {}
     fn inc(&self, _delta: u64) {}
     fn set_message(&self, _msg: &str) {}
     fn finish_with_message(&self, _msg: &str) {}
@@ -105,6 +107,10 @@ impl ProgressReporter for CliProgress {
             .enable_steady_tick(std::time::Duration::from_millis(100));
     }
 
+    fn set_position(&self, pos: u64) {
+        self.pb.set_position(pos);
+    }
+
     fn inc(&self, delta: u64) {
         self.pb.inc(delta);
     }
@@ -172,6 +178,11 @@ impl WebProgress {
 impl ProgressReporter for WebProgress {
     fn set_length(&self, len: u64) {
         self.length.store(len, Ordering::Relaxed);
+    }
+
+    fn set_position(&self, pos: u64) {
+        self.position.store(pos, Ordering::Relaxed);
+        self.emit_step();
     }
 
     fn inc(&self, delta: u64) {

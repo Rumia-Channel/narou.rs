@@ -492,7 +492,7 @@ impl Downloader {
         let mut general_lastup = info.general_lastup;
         if novelupdated_at.is_none() || general_lastup.is_none() {
             let subtitles = if novel_type == 2 {
-                create_short_story_subtitles(&setting, &toc_source).ok()
+                create_short_story_subtitles(&setting, &toc_source, &info).ok()
             } else {
                 let title = info.title.as_deref().unwrap_or("");
                 parse_subtitles_multipage(
@@ -501,6 +501,7 @@ impl Downloader {
                     &toc_source,
                     &url_captures,
                     title,
+                    self.progress.as_deref(),
                 )
                 .ok()
             };
@@ -736,9 +737,16 @@ impl Downloader {
         };
 
         let subtitles = if novel_type == 2 {
-            create_short_story_subtitles(&setting, &toc_source)?
+            create_short_story_subtitles(&setting, &toc_source, &info)?
         } else {
-            parse_subtitles_multipage(&mut self.fetcher, &setting, &toc_source, &url_captures, &title)?
+            parse_subtitles_multipage(
+                &mut self.fetcher,
+                &setting,
+                &toc_source,
+                &url_captures,
+                &title,
+                self.progress.as_deref(),
+            )?
         };
 
         let use_subdirectory = self.download_use_subdirectory(existing_id);
@@ -871,6 +879,7 @@ impl Downloader {
         }
 
         if let Some(ref p) = self.progress {
+            p.set_position(0);
             p.set_length(download_count as u64);
             p.set_message(&format!("DL {}", title));
         }
@@ -1614,6 +1623,44 @@ mod tests {
             super::date_string_to_ymd("2026-04-12 10:00:00.123456 +0900"),
             Some("20260412".to_string())
         );
+    }
+
+    #[test]
+    fn short_story_subtitles_use_novel_info_dates() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "ncode.syosetu.com")
+            .unwrap();
+        let mut raw_captures = std::collections::HashMap::new();
+        raw_captures.insert("gf".to_string(), "2024-01-02 03:04".to_string());
+        raw_captures.insert("gl".to_string(), "2024-01-05 06:07".to_string());
+
+        let info = NovelInfo {
+            title: Some("短編タイトル".to_string()),
+            author: None,
+            story: None,
+            novel_type: Some(2),
+            end: Some(true),
+            general_firstup: None,
+            general_lastup: None,
+            novelupdated_at: None,
+            length: None,
+            tags: None,
+            sitename: None,
+            raw_captures: raw_captures.clone(),
+        };
+        let subtitles = super::toc::create_short_story_subtitles(setting, "", &info).unwrap();
+        assert_eq!(subtitles[0].subdate, "2024-01-02 03:04");
+        assert_eq!(subtitles[0].subupdate.as_deref(), Some("2024-01-05 06:07"));
+
+        raw_captures.remove("gl");
+        let info = NovelInfo {
+            raw_captures,
+            ..info
+        };
+        let subtitles = super::toc::create_short_story_subtitles(setting, "", &info).unwrap();
+        assert_eq!(subtitles[0].subupdate.as_deref(), Some("2024-01-02 03:04"));
     }
 
     #[test]
