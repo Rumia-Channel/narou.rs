@@ -83,6 +83,10 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
     let listener = bind_or_shutdown_and_retry(addr, &address.host, address.port, "HTTP").await;
     let ws_listener =
         bind_or_shutdown_and_retry(ws_addr, &address.host, address.ws_port, "WebSocket").await;
+
+    // Write PID file for restart recovery
+    write_pid_file();
+
     let worker_task = web::worker::start_queue_worker(root_dir.clone(), push_server.clone(), running_job, running_child_pid);
     let scheduler_task = web::scheduler::start_auto_update_scheduler(root_dir, push_server.clone());
 
@@ -103,13 +107,23 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
         }
     }
 
+    // Graceful shutdown on Ctrl+C so the ports are properly released
+    let shutdown_signal = async {
+        tokio::signal::ctrl_c().await.ok();
+        eprintln!();
+    };
+
     let ws_task = tokio::spawn(async move { axum::serve(ws_listener, ws_app).await });
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+        .unwrap();
     worker_task.abort();
     if let Some(task) = scheduler_task {
         task.abort();
     }
     ws_task.abort();
+    remove_pid_file();
 }
 
 fn resolve_web_address(user_port: Option<u16>) -> Result<WebAddress, String> {
@@ -149,7 +163,8 @@ async fn bind_or_shutdown_and_retry(
     match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            if try_shutdown_existing_server(host, port) {
+            // Layer 1: HTTP graceful shutdown (cross-platform, identifies narou)
+            if try_shutdown_via_http(host, port) || try_kill_via_pid_file(port) {
                 match tokio::net::TcpListener::bind(addr).await {
                     Ok(l) => l,
                     Err(e) => {
@@ -177,9 +192,35 @@ async fn bind_or_shutdown_and_retry(
     }
 }
 
-/// Try to gracefully shut down an existing narou server via HTTP POST /api/shutdown.
-/// This is fully cross-platform (no OS-specific commands).
-fn try_shutdown_existing_server(host: &str, port: u16) -> bool {
+// --- PID file management ---
+
+fn pid_file_path() -> Option<std::path::PathBuf> {
+    Some(std::env::current_dir().ok()?.join(".narou").join("server.pid"))
+}
+
+fn write_pid_file() {
+    if let Some(path) = pid_file_path() {
+        let _ = std::fs::write(&path, std::process::id().to_string());
+    }
+}
+
+fn remove_pid_file() {
+    if let Some(path) = pid_file_path() {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+fn read_pid_file() -> Option<u32> {
+    let path = pid_file_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    content.trim().parse().ok()
+}
+
+// --- Shutdown strategies ---
+
+/// Strategy 1: Send HTTP POST /api/shutdown to the existing server.
+/// Works when the old server is fully responsive.
+fn try_shutdown_via_http(host: &str, port: u16) -> bool {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -216,10 +257,69 @@ fn try_shutdown_existing_server(host: &str, port: u16) -> bool {
     let _ = stream.read(&mut buf);
     drop(stream);
 
-    // Wait for port to become free (up to 5 seconds)
+    wait_for_port_free(&addr)
+}
+
+/// Strategy 2: Kill via PID file (fallback for when HTTP shutdown doesn't work,
+/// e.g. server is in a zombie state after partial Ctrl+C).
+fn try_kill_via_pid_file(port: u16) -> bool {
+    let Some(pid) = read_pid_file() else {
+        return false;
+    };
+
+    // Don't kill ourselves
+    if pid == std::process::id() {
+        return false;
+    }
+
+    eprintln!(
+        "PIDファイルから前回のサーバプロセス (PID: {}) を終了しています...",
+        pid
+    );
+
+    let killed = {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+    };
+
+    if !killed {
+        return false;
+    }
+
+    let addr: SocketAddr = match format!("127.0.0.1:{}", port).parse() {
+        Ok(a) => a,
+        Err(_) => {
+            std::thread::sleep(Duration::from_secs(1));
+            return true;
+        }
+    };
+    wait_for_port_free(&addr)
+}
+
+/// Poll until the port is no longer accepting connections (up to 5 seconds).
+fn wait_for_port_free(addr: &SocketAddr) -> bool {
+    use std::net::TcpStream;
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(250));
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_err() {
+        if TcpStream::connect_timeout(addr, Duration::from_millis(100)).is_err() {
             return true;
         }
     }
