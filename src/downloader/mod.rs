@@ -290,7 +290,7 @@ fn sanitize_site_tags(raw: &str) -> Vec<String> {
     let regex_meta = Regex::new(r#"\"?\(\?\.\+\?\)\"?|\(\?<?[^)]*\)"#).expect("valid regex");
     let cleaned = regex_meta.replace_all(&cleaned, "").to_string();
     cleaned
-        .split([' ', '　'])
+        .split_whitespace()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string())
@@ -1739,7 +1739,7 @@ mod tests {
                             "editedAt": "2021-01-11T16:13:02Z",
                             "lastEpisodePublishedAt": "2021-01-12T16:13:02Z",
                             "totalCharacterCount": 1234,
-                            "tagLabels": ["tag-a"],
+                            "tagLabels": ["tag-a", "tag-b"],
                             "tableOfContentsV2": [{"__ref": "TableOfContentsChapter:10"}]
                         },
                         "UserAccount:1": {
@@ -1780,6 +1780,9 @@ mod tests {
         assert!(html.contains("author::author-name"));
         assert!(html.contains("introduction::intro<br>body"));
         assert!(html.contains("tag::tag-a"));
+        assert!(html.contains("tag::tag-b"));
+        let tags = setting.resolve_info_pattern("tags", &html).unwrap();
+        assert_eq!(super::sanitize_site_tags(&tags), vec!["tag-a", "tag-b"]);
         assert!(html.contains("Chapter;1;10;第一章"));
         assert!(!html.contains("Chapter;1;10;;第一章"));
         assert!(html.contains("Episode;20;2021-01-12T16:13:02Z;第1話"));

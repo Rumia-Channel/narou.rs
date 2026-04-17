@@ -54,6 +54,66 @@ fn try_regex_captures(
     None
 }
 
+fn try_regex_captures_all(pattern: &str, source: &str, key: &str) -> Vec<String> {
+    let re = RegexBuilder::new(pattern)
+        .dot_matches_new_line(true)
+        .multi_line(true)
+        .build();
+
+    if let Ok(re) = re {
+        let mut values: Vec<String> = Vec::new();
+        for caps in re.captures_iter(source) {
+            let mut matched = false;
+            for name in re.capture_names().flatten() {
+                if capture_name_matches_key(key, name)
+                    && let Some(m) = caps.name(name)
+                {
+                    values.push(m.as_str().to_string());
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched
+                && let Some(m) = caps.get(1)
+            {
+                values.push(m.as_str().to_string());
+            }
+        }
+        return values;
+    }
+
+    let fre = fancy_regex::RegexBuilder::new(pattern)
+        .dot_matches_new_line(true)
+        .multi_line(true)
+        .build();
+    if let Ok(fre) = fre {
+        let mut values: Vec<String> = Vec::new();
+        for caps_result in fre.captures_iter(source) {
+            let Ok(caps) = caps_result else {
+                continue;
+            };
+            let mut matched = false;
+            for name in fre.capture_names().flatten() {
+                if capture_name_matches_key(key, name)
+                    && let Some(m) = caps.name(name)
+                {
+                    values.push(m.as_str().to_string());
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched
+                && let Some(m) = caps.get(1)
+            {
+                values.push(m.as_str().to_string());
+            }
+        }
+        return values;
+    }
+
+    Vec::new()
+}
+
 impl SiteSetting {
     pub fn resolve_info_pattern(&self, key: &str, source: &str) -> Option<String> {
         let value = match key {
@@ -87,6 +147,12 @@ impl SiteSetting {
             };
 
             let resolved = self.interpolate(pattern);
+            if key == "tags" {
+                let values = try_regex_captures_all(&resolved, source, key);
+                if !values.is_empty() {
+                    return Some(values.join("\n"));
+                }
+            }
             if let Some(v) = try_regex_captures(&resolved, source, key) {
                 return Some(v);
             }
@@ -143,6 +209,12 @@ impl SiteSetting {
                 }
             };
             let resolved = self.interpolate_with_captures(pattern, prev_captures);
+            if key == "tags" {
+                let values = try_regex_captures_all(&resolved, source, key);
+                if !values.is_empty() {
+                    return Some(values.join("\n"));
+                }
+            }
             if let Some(v) = try_regex_captures(&resolved, source, key) {
                 return Some(v);
             }
@@ -203,5 +275,13 @@ mod tests {
         assert!(result.is_some(), "tags regex should match via fancy-regex fallback");
         let tag_val = result.unwrap();
         assert!(tag_val.contains("R15"), "should contain R15, got: {}", tag_val);
+    }
+
+    #[test]
+    fn test_multiline_tag_capture_collects_all_matches() {
+        let pattern = "^tag::(?<tag>.+?)$";
+        let source = "tag::tag-a\ntag::tag-b\ntag::tag-c";
+        let result = try_regex_captures_all(pattern, source, "tags");
+        assert_eq!(result, vec!["tag-a", "tag-b", "tag-c"]);
     }
 }
