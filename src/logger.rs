@@ -20,6 +20,7 @@ static SUPPRESS_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug, Clone)]
 struct LoggerState {
     enabled: bool,
+    split_convert_logs: bool,
     log_dir: Option<PathBuf>,
     format_filename: String,
     format_timestamp: String,
@@ -32,6 +33,7 @@ impl LoggerState {
     fn disabled() -> Self {
         Self {
             enabled: false,
+            split_convert_logs: false,
             log_dir: None,
             format_filename: DEFAULT_LOG_FORMAT_FILENAME.to_string(),
             format_timestamp: DEFAULT_LOG_FORMAT_TIMESTAMP.to_string(),
@@ -51,6 +53,7 @@ impl LoggerState {
         let logging_enabled = yaml_bool(settings.get("logging"));
         let logging_enabled =
             logging_enabled && std::env::var("NAROU_ENV").ok().as_deref() != Some("test");
+        let split_convert_logs = yaml_bool(settings.get("concurrency"));
 
         let log_dir = root_dir.join("log");
         if logging_enabled {
@@ -66,6 +69,7 @@ impl LoggerState {
 
         Self {
             enabled: logging_enabled,
+            split_convert_logs,
             log_dir: Some(log_dir),
             format_filename,
             format_timestamp,
@@ -110,6 +114,15 @@ where
     }
     let _guard = Reset;
     f()
+}
+
+pub fn use_convert_log_postfix(enable: bool) {
+    let mut state = state().lock().expect("logger state lock poisoned");
+    state.log_postfix = if enable && state.split_convert_logs {
+        Some("_convert".to_string())
+    } else {
+        None
+    };
 }
 
 pub fn emit_stdout(text: &str, newline: bool) {
@@ -349,7 +362,13 @@ fn yaml_string(value: Option<&serde_yaml::Value>) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn cwd_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -389,5 +408,30 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn convert_commands_use_convert_log_postfix_when_concurrency_is_enabled() {
+        let _guard = cwd_lock().lock().unwrap();
+        let dir = temp_dir("logger_convert_postfix");
+        let narou_dir = dir.join(".narou");
+        fs::create_dir_all(&narou_dir).unwrap();
+        fs::write(
+            narou_dir.join("local_setting.yaml"),
+            "logging: true\nconcurrency: true\n",
+        )
+        .unwrap();
+
+        let current = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        init();
+        use_convert_log_postfix(true);
+        let path = state().lock().unwrap().current_log_path().unwrap();
+
+        std::env::set_current_dir(current).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(path.file_name().unwrap().to_string_lossy().contains("_convert"));
     }
 }

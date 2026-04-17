@@ -108,6 +108,7 @@ async fn run_command(
     };
 
     let ua = user_agent.or(cli.user_agent);
+    logger::use_convert_log_postfix(matches!(&cli.command, Commands::Convert { .. }));
 
     match cli.command {
         Commands::Web { port, no_browser } => {
