@@ -587,7 +587,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `reboot` | S→C | ✅ (/_rebooting へリダイレクト) | ✅ |
 | `console.clear` | S→C | ✅ (コンソール内容クリア) | ✅ |
 | TermColorLight色付き出力 | `<span>` HTML色付き | ✅ (termcolor.rs + innerHTML) | ✅ |
-| `progressbar.init/step/clear` | S→C | ✅ (WebProgress + main.js) | ✅ |
+| `progressbar.init/step/clear` | S→C | ✅ (WebProgress + main.js、`stdout` / `stdout2` 各コンソール下端に表示して完了時に消去) | ✅ |
 | `ping.modal` (サーバー主導モーダル) | S→C | なし | ❌ |
 | `notepad.change` (メモ帳同期) | S→C | なし | ❌ |
 | `device.ejectable` | S→C | なし | ❌ |

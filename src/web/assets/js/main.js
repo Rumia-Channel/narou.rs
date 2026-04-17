@@ -108,6 +108,7 @@ function connectWebSocket() {
     if (con) con.innerHTML = '';
     const con2 = document.getElementById('console-stdout2');
     if (con2) con2.innerHTML = '';
+    clearAllProgressBars();
   };
 
   ws.onmessage = (event) => {
@@ -172,6 +173,7 @@ function handleWsMessage(msg) {
       if (con) con.innerHTML = '';
       const con2 = document.getElementById('console-stdout2');
       if (con2) con2.innerHTML = '';
+      clearAllProgressBars();
       break;
     }
     case 'error':
@@ -213,31 +215,36 @@ function getConsoleEl(targetConsole) {
 
 var progressBars = {};
 
-function getProgressHost() {
-  var host = document.getElementById('global-progressbars');
+function getProgressHost(targetConsole) {
+  var consoleEl = getConsoleEl(targetConsole);
+  if (!consoleEl) return null;
+  var host = consoleEl.parentElement?.querySelector('.console-progress-host');
   if (host) return host;
   host = document.createElement('div');
-  host.id = 'global-progressbars';
-  host.className = 'global-progressbars hide';
-  document.body.appendChild(host);
+  host.className = 'console-progress-host hide';
+  consoleEl.parentElement?.appendChild(host);
   return host;
 }
 
-function updateProgressHostVisibility() {
-  var host = document.getElementById('global-progressbars');
+function updateProgressHostVisibility(targetConsole) {
+  var consoleEl = getConsoleEl(targetConsole);
+  var host = consoleEl?.parentElement?.querySelector('.console-progress-host');
   if (!host) return;
-  host.classList.toggle('hide', Object.keys(progressBars).length === 0);
+  var hasItems = host.childElementCount > 0;
+  host.classList.toggle('hide', !hasItems);
+  consoleEl.classList.toggle('console-with-progress', hasItems);
 }
 
 function initProgressBar(topic, targetConsole) {
   var key = (targetConsole || 'stdout') + ':' + (topic || 'default');
   removeProgressBar(topic, targetConsole);
-  var host = getProgressHost();
+  var host = getProgressHost(targetConsole);
+  if (!host) return;
   var wrapper = document.createElement('div');
-  wrapper.className = 'global-progress-item';
+  wrapper.className = 'console-progress-item';
   if (topic) {
     var label = document.createElement('div');
-    label.className = 'global-progress-topic';
+    label.className = 'console-progress-topic';
     label.textContent = topic;
     wrapper.appendChild(label);
   }
@@ -250,7 +257,7 @@ function initProgressBar(topic, targetConsole) {
     wrapper: wrapper,
     bar: progress.querySelector('.progress-bar'),
   };
-  updateProgressHostVisibility();
+  updateProgressHostVisibility(targetConsole);
 }
 
 function setProgressBar(percent, topic, targetConsole) {
@@ -265,7 +272,18 @@ function removeProgressBar(topic, targetConsole) {
   var wrapper = progressBars[key].wrapper;
   if (wrapper) wrapper.remove();
   delete progressBars[key];
-  updateProgressHostVisibility();
+  updateProgressHostVisibility(targetConsole);
+}
+
+function clearAllProgressBars() {
+  Object.keys(progressBars).forEach(function(key) {
+    var wrapper = progressBars[key].wrapper;
+    if (wrapper) wrapper.remove();
+  });
+  progressBars = {};
+  ['stdout', 'stdout2'].forEach(function(targetConsole) {
+    updateProgressHostVisibility(targetConsole);
+  });
 }
 
 var lastLineComplete = true;

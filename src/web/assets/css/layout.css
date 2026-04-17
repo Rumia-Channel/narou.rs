@@ -157,12 +157,14 @@
 .console-col-left {
   flex: 1 1 100%;
   min-width: 0;
+  position: relative;
 }
 
 .console-col-right {
   flex: 0 0 35%;
   min-width: 0;
   border-left: 0.05em solid var(--table-border);
+  position: relative;
 }
 
 .console-col-right.hide {
@@ -182,6 +184,10 @@
   white-space: pre-wrap;
   word-break: break-all;
   transition: max-height 0.20s ease;
+}
+
+.console.console-with-progress {
+  padding-bottom: 3.8em;
 }
 
 .console.expanded {
