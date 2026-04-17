@@ -439,23 +439,19 @@ li.enable-selected.disabled a {
   font-weight: bold;
 }
 
-/* narou.rb: date cell annotation colors for recent updates */
-.new-arrivals {
+/* narou.rb parity: the date text itself is NOT colored. Only the pseudo-element
+   " 新着" / " 更新" label following the date is colored, matching style.scss
+   `span.new-arrivals:after { color: magenta; content: " 新着" }` etc. */
+.new-arrivals::after {
+  content: " 新着";
   color: var(--new-arrival-color);
   font-weight: bold;
 }
 
-.date-cell-inline.new-arrivals::after {
-  content: " 新着";
-}
-
-.new-update {
+.new-update::after {
+  content: " 更新";
   color: var(--new-update-color);
   font-weight: bold;
-}
-
-.date-cell-inline.new-update::after {
-  content: " 更新";
 }
 
 /* narou.rb: hint when general_lastup > last_update (new content available) */
@@ -472,6 +468,51 @@ li.enable-selected.disabled a {
   left: -0.05em;
 }
 
+/* narou.rb parity: general-lastup time-ago pill is injected via pseudo-element
+   on a single `<span class="general-lastup gl-XXhour">` so there's no extra DOM.
+   Matches style.scss `.gl-60minutes &::after { content: "1h"; background-color: ... }`. */
+.general-lastup {
+  position: relative;
+}
+
+.general-lastup.gl-60minutes::after,
+.general-lastup.gl-6hour::after,
+.general-lastup.gl-24hour::after,
+.general-lastup.gl-3days::after,
+.general-lastup.gl-1week::after {
+  position: relative;
+  left: 0.30em;
+  padding: 1px 0.20em;
+  font-size: 0.75em;
+  font-weight: bold;
+  color: var(--btn-text);
+  border-radius: 0.20em;
+  white-space: nowrap;
+}
+
+.general-lastup.gl-60minutes::after {
+  content: "1h";
+  background-color: var(--gl-1h-bg);
+}
+.general-lastup.gl-6hour::after {
+  content: "6h";
+  background-color: var(--gl-6h-bg);
+}
+.general-lastup.gl-24hour::after {
+  content: "24h";
+  background-color: var(--gl-24h-bg);
+}
+.general-lastup.gl-3days::after {
+  content: "3d";
+  background-color: var(--gl-3d-bg);
+  color: var(--text-color);
+}
+.general-lastup.gl-1week::after {
+  content: "1w";
+  background-color: var(--gl-1w-bg);
+  color: var(--text-color);
+}
+
 .gl-badge {
   display: inline-block;
   padding: 0.05em 0.35em;
@@ -480,13 +521,8 @@ li.enable-selected.disabled a {
   color: var(--btn-text);
   border-radius: 0.20em;
   line-height: 1.20;
+  margin-left: 0.25em;
 }
-
-.gl-1h { background-color: var(--gl-1h-bg); }
-.gl-6h { background-color: var(--gl-6h-bg); }
-.gl-24h { background-color: var(--gl-24h-bg); }
-.gl-3d { background-color: var(--gl-3d-bg); }
-.gl-1w { background-color: var(--gl-1w-bg); color: var(--text-color); }
 
 /* ========== Context Menu ========== */
 .context-menu {

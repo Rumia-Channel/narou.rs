@@ -286,21 +286,23 @@ function createRow(novel, rowIndex) {
 
   const idText = isFrozen ? `＊${novel.id}` : String(novel.id);
 
-  // narou.rb parity: last_update gets "新着"/"更新" marks for 6 hours
+  // narou.rb parity: last_update cell — new-arrivals/new-update class goes only
+  // on the inline span (matches `span.new-arrivals:after { content: " 新着" }`).
+  // The date text itself is NOT colored, only the pseudo-element label.
   const updateMarkClass = getLastUpdateMarkClass(novel);
   const updateCell = formatDateCell(novel.last_update, {
-    wrapperClass: updateMarkClass,
     inlineClass: updateMarkClass,
   });
 
-  // narou.rb parity: hint-new-arrival when general_lastup is newer than last_update
+  // narou.rb parity: general_lastup cell —
+  //   <div class="hint-new-arrival?"><span class="general-lastup gl-XXhour">date<br>time</span></div>
   let glCell = '';
   if (novel.general_lastup) {
-    const badge = getTimeBadge(novel.general_lastup);
+    const glBadgeClass = getGeneralLastupClass(novel.general_lastup);
     const glHint = hasGeneralLastupHint(novel);
     glCell = formatDateCell(novel.general_lastup, {
-      inlineExtra: badge,
       wrapperClass: glHint ? 'hint-new-arrival' : '',
+      spanClass: `general-lastup ${glBadgeClass}`.trim(),
     });
   }
 
@@ -898,18 +900,17 @@ function setCheck(id, checked) {
 
 /* ===== Helpers ===== */
 
-function getTimeBadge(dateStr) {
+function getGeneralLastupClass(dateStr) {
   const d = parseDateValue(dateStr);
-  if (!d) return '';
-  const diffMs = Date.now() - d.getTime();
-  const hours = diffMs / (1000 * 60 * 60);
-
-  if (hours < 1) return '<span class="gl-badge gl-1h">1h</span>';
-  if (hours < 6) return '<span class="gl-badge gl-6h">6h</span>';
-  if (hours < 24) return '<span class="gl-badge gl-24h">24h</span>';
-  if (hours < 72) return '<span class="gl-badge gl-3d">3d</span>';
-  if (hours < 168) return '<span class="gl-badge gl-1w">1w</span>';
-  return '';
+  if (!d) return 'gl-other';
+  const diffSec = (Date.now() - d.getTime()) / 1000;
+  // narou.rb GENERAL_LASTUP_CLASSES thresholds (seconds, class)
+  if (diffSec <= 60 * 60) return 'gl-60minutes';
+  if (diffSec <= 6 * 60 * 60) return 'gl-6hour';
+  if (diffSec <= 24 * 60 * 60) return 'gl-24hour';
+  if (diffSec <= 3 * 24 * 60 * 60) return 'gl-3days';
+  if (diffSec <= 7 * 24 * 60 * 60) return 'gl-1week';
+  return 'gl-other';
 }
 
 function parseDateValue(dateStr) {
@@ -979,23 +980,35 @@ function formatDateCell(dateStr, options = {}) {
   const label = options.label || '';
   const labelClass = options.labelClass || '';
   const wrapperClass = options.wrapperClass || '';
-  let html = `<div class="date-cell${wrapperClass ? ' ' + wrapperClass : ''}">`;
-  html += `<span class="date-cell-date">${date}</span>`;
+  const spanClass = options.spanClass || '';
+
+  // narou.rb parity: when spanClass is provided, wrap the date content in a
+  // single <span class="{spanClass}"> inside the outer div — matching
+  //   <div class="hint-new-arrival?"><span class="general-lastup gl-XXhour">date<br>time</span></div>
+  let inner = '';
+  inner += `<span class="date-cell-date">${date}</span>`;
   if (time || label || inlineExtra) {
-    html += `<span class="date-cell-inline${inlineClass ? ' ' + inlineClass : ''}">`;
+    inner += `<span class="date-cell-inline${inlineClass ? ' ' + inlineClass : ''}">`;
     if (time) {
-      html += `<span class="date-cell-time">${time}</span>`;
+      inner += `<span class="date-cell-time">${time}</span>`;
     }
     if (label) {
-      html += `<span class="date-cell-label${labelClass ? ' ' + labelClass : ''}">${label}</span>`;
+      inner += `<span class="date-cell-label${labelClass ? ' ' + labelClass : ''}">${label}</span>`;
     }
     if (inlineExtra) {
-      html += `<span class="date-cell-inline-extra">${inlineExtra}</span>`;
+      inner += `<span class="date-cell-inline-extra">${inlineExtra}</span>`;
     }
-    html += '</span>';
+    inner += '</span>';
   }
   if (extraLine) {
-    html += `<span class="date-cell-extra">${extraLine}</span>`;
+    inner += `<span class="date-cell-extra">${extraLine}</span>`;
+  }
+
+  let html = `<div class="date-cell${wrapperClass ? ' ' + wrapperClass : ''}">`;
+  if (spanClass) {
+    html += `<span class="${spanClass}">${inner}</span>`;
+  } else {
+    html += inner;
   }
   html += '</div>';
   return html;
