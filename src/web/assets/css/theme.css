@@ -74,7 +74,8 @@
   --gl-6h-bg: #5cb85c;
   --gl-24h-bg: #5487d9;
   --gl-3d-bg: #8aaec8;
-  --gl-1w-bg: #cde;
+  --gl-1w-bg: #d9d9ff;
+  --gl-1w-text: #6d6d6d;
 
   /* Queue badge */
   --queue-badge-bg: #777;

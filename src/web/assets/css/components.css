@@ -533,7 +533,7 @@ li.enable-selected.disabled a {
 .general-lastup.gl-1week::after {
   content: "1w";
   background-color: var(--gl-1w-bg);
-  color: var(--text-color);
+  color: var(--gl-1w-text);
 }
 
 .gl-badge {
