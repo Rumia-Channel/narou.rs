@@ -69,60 +69,76 @@ pub async fn edit_menu_page() -> Html<String> {
 
 pub async fn asset(Path(path): Path<String>) -> Response {
     let (content_type, body) = match path.as_str() {
-        "css/theme.css" => ("text/css; charset=utf-8", include_str!("assets/css/theme.css")),
-        "css/base.css" => ("text/css; charset=utf-8", include_str!("assets/css/base.css")),
-        "css/layout.css" => ("text/css; charset=utf-8", include_str!("assets/css/layout.css")),
+        "css/theme.css" => (
+            "text/css; charset=utf-8",
+            include_str!("assets/css/theme.css").as_bytes(),
+        ),
+        "css/base.css" => (
+            "text/css; charset=utf-8",
+            include_str!("assets/css/base.css").as_bytes(),
+        ),
+        "css/layout.css" => (
+            "text/css; charset=utf-8",
+            include_str!("assets/css/layout.css").as_bytes(),
+        ),
         "css/components.css" => (
             "text/css; charset=utf-8",
-            include_str!("assets/css/components.css"),
+            include_str!("assets/css/components.css").as_bytes(),
         ),
         "css/responsive.css" => (
             "text/css; charset=utf-8",
-            include_str!("assets/css/responsive.css"),
+            include_str!("assets/css/responsive.css").as_bytes(),
         ),
         "css/settings.css" => (
             "text/css; charset=utf-8",
-            include_str!("assets/css/settings.css"),
+            include_str!("assets/css/settings.css").as_bytes(),
         ),
         "js/main.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("assets/js/main.js"),
+            include_str!("assets/js/main.js").as_bytes(),
         ),
         "js/core/state.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("assets/js/core/state.js"),
+            include_str!("assets/js/core/state.js").as_bytes(),
         ),
         "js/core/http.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("assets/js/core/http.js"),
+            include_str!("assets/js/core/http.js").as_bytes(),
         ),
         "js/ui/i18n.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("assets/js/ui/i18n.js"),
+            include_str!("assets/js/ui/i18n.js").as_bytes(),
         ),
         "js/ui/render.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("assets/js/ui/render.js"),
+            include_str!("assets/js/ui/render.js").as_bytes(),
         ),
         "js/ui/actions.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("assets/js/ui/actions.js"),
+            include_str!("assets/js/ui/actions.js").as_bytes(),
         ),
         "js/ui/dropdown.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("assets/js/ui/dropdown.js"),
+            include_str!("assets/js/ui/dropdown.js").as_bytes(),
         ),
         "js/ui/shortcuts.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("assets/js/ui/shortcuts.js"),
+            include_str!("assets/js/ui/shortcuts.js").as_bytes(),
         ),
         "js/ui/context_menu.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("assets/js/ui/context_menu.js"),
+            include_str!("assets/js/ui/context_menu.js").as_bytes(),
         ),
         "js/settings.js" => (
             "application/javascript; charset=utf-8",
-            include_str!("assets/js/settings.js"),
+            include_str!("assets/js/settings.js").as_bytes(),
+        ),
+        "fonts/Material_Symbols/MaterialSymbolsOutlined-VariableFont_FILL,GRAD,opsz,wght.ttf" => (
+            "font/ttf",
+            include_bytes!(
+                "assets/fonts/Material_Symbols/MaterialSymbolsOutlined-VariableFont_FILL,GRAD,opsz,wght.ttf"
+            )
+            .as_slice(),
         ),
         _ => {
             return (
@@ -140,6 +156,10 @@ pub async fn asset(Path(path): Path<String>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{apply_asset_versions, asset_version};
+    use axum::{
+        extract::Path,
+        http::{StatusCode, header},
+    };
 
     #[test]
     fn apply_asset_versions_appends_query_hashes_to_known_assets() {
@@ -154,5 +174,16 @@ mod tests {
         let version = asset_version("js/main.js").unwrap();
         assert!(!version.contains('='));
         assert!(version.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'));
+    }
+
+    #[tokio::test]
+    async fn font_asset_is_served() {
+        let response = super::asset(Path(
+            "fonts/Material_Symbols/MaterialSymbolsOutlined-VariableFont_FILL,GRAD,opsz,wght.ttf"
+                .to_string(),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "font/ttf");
     }
 }
