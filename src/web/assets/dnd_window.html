@@ -105,30 +105,88 @@
       var queueCount = document.getElementById('queue-count');
       var information = document.getElementById('information');
 
-      // WebSocket for console output and queue events
-      var wsPort = parseInt(location.port, 10) + 1;
-      var wsUrl = 'ws://' + location.hostname + ':' + wsPort;
       var ws;
+      var reconnectTimer = null;
 
-      function connectWs() {
-        ws = new WebSocket(wsUrl);
+      function defaultWsPort() {
+        var port = parseInt(location.port, 10);
+        return Number.isFinite(port) ? String(port + 1) : '';
+      }
+
+      function buildWsUrl(wsPort) {
+        var url = new URL('/ws', location.href);
+        url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        if (wsPort) {
+          url.port = String(wsPort);
+        }
+        return url.toString();
+      }
+
+      function scheduleReconnect(wsPort) {
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+        }
+        reconnectTimer = setTimeout(function() {
+          connectWs(wsPort);
+        }, 5000);
+      }
+
+      function handleWsMessage(msg) {
+        switch (msg.type) {
+          case 'log':
+          case 'console':
+            appendConsole(msg.text || msg.message || msg.data || '');
+            break;
+          case 'echo':
+            appendConsole(msg.body || msg.data || '', msg.target_console);
+            break;
+          case 'status':
+          case 'queue':
+          case 'notification.queue':
+          case 'queue_start':
+          case 'queue_complete':
+          case 'queue_failed':
+            refreshQueueCount();
+            break;
+          case 'error':
+            appendConsole('[エラー] ' + (msg.data || msg.message || ''));
+            break;
+        }
+      }
+
+      function connectWs(wsPort) {
+        try {
+          ws = new WebSocket(buildWsUrl(wsPort));
+        } catch (e) {
+          scheduleReconnect(wsPort);
+          return;
+        }
+
         ws.onmessage = function(event) {
           try {
-            var msg = JSON.parse(event.data);
-            if (msg.event === 'echo' || msg.event === 'log' || msg.event === 'console') {
-              appendConsole(msg.data || '');
-            } else if (msg.event === 'notification.queue' || msg.event === 'queue' || msg.event === 'status') {
-              refreshQueueCount();
-            } else if (msg.event === 'table.reload' || msg.event === 'refresh' || msg.event === 'list_updated') {
-              // table reload not relevant here
-            }
-          } catch(e) {}
+            handleWsMessage(JSON.parse(event.data));
+          } catch (e) {
+            appendConsole(event.data || '');
+          }
         };
         ws.onclose = function() {
-          setTimeout(connectWs, 5000);
+          scheduleReconnect(wsPort);
+        };
+        ws.onerror = function() {
+          if (ws) {
+            ws.close();
+          }
         };
       }
-      connectWs();
+
+      fetch('/api/webui/config')
+        .then(function(r) { return r.json(); })
+        .then(function(config) {
+          connectWs((config && config.ws_port) || defaultWsPort());
+        })
+        .catch(function() {
+          connectWs(defaultWsPort());
+        });
 
       function appendConsole(text) {
         if (information.style.display !== 'none') {
@@ -192,9 +250,16 @@
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ targets: targets })
-            }).catch(function(err) {
-              appendConsole('エラー: ' + err.message);
-            });
+            })
+              .then(function(response) {
+                if (!response.ok) {
+                  throw new Error('HTTP ' + response.status);
+                }
+                refreshQueueCount();
+              })
+              .catch(function(err) {
+                appendConsole('エラー: ' + err.message);
+              });
           }
         }
       });
