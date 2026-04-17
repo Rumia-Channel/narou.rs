@@ -86,6 +86,7 @@ fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, r
         push_server.broadcast_echo("エラー: 実行ファイルパスを取得できません", "stdout");
         return false;
     };
+    let target_console = console_target_for_job(job.job_type);
 
     let mut command = std::process::Command::new(exe);
     command
@@ -112,7 +113,7 @@ fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, r
                     if let Some(message) = first.strip_prefix(WEBUI_UPDATE_START_PREFIX) {
                         push_server.broadcast_echo(
                             &format!("<span style=\"color:#bbb\">{}</span>", message),
-                            "stdout",
+                            target_console,
                         );
                     } else if !first.is_empty() {
                         command.arg(first);
@@ -162,6 +163,7 @@ fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, r
     // Stream stdout in a separate thread
     let stdout = child.stdout.take();
     let ps_out = Arc::clone(push_server);
+    let stdout_target_console = target_console;
     let stdout_thread = std::thread::spawn(move || {
         if let Some(out) = stdout {
             let reader = std::io::BufReader::new(out);
@@ -171,10 +173,12 @@ fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, r
                         if let Some(json_str) = text.strip_prefix(WS_LINE_PREFIX) {
                             // Structured WS event from child process — send directly
                             if let Ok(msg) = serde_json::from_str::<serde_json::Value>(json_str) {
-                                ps_out.broadcast_raw(&msg);
+                                let routed =
+                                    route_structured_web_message(msg, stdout_target_console);
+                                ps_out.broadcast_raw(&routed);
                             }
                         } else {
-                            ps_out.broadcast_echo(&text, "stdout");
+                            ps_out.broadcast_echo(&text, stdout_target_console);
                         }
                     }
                     Err(_) => break,
@@ -186,12 +190,13 @@ fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, r
     // Stream stderr in a separate thread
     let stderr = child.stderr.take();
     let ps_err = Arc::clone(push_server);
+    let stderr_target_console = target_console;
     let stderr_thread = std::thread::spawn(move || {
         if let Some(err) = stderr {
             let reader = std::io::BufReader::new(err);
             for line in reader.lines() {
                 match line {
-                    Ok(text) => ps_err.broadcast_echo(&text, "stdout"),
+                    Ok(text) => ps_err.broadcast_echo(&text, stderr_target_console),
                     Err(_) => break,
                 }
             }
@@ -205,6 +210,29 @@ fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, r
     status
 }
 
+fn console_target_for_job(job_type: JobType) -> &'static str {
+    match job_type {
+        JobType::Convert | JobType::Send | JobType::Mail => "stdout2",
+        _ => "stdout",
+    }
+}
+
+fn route_structured_web_message(
+    mut message: serde_json::Value,
+    target_console: &str,
+) -> serde_json::Value {
+    if target_console != "stdout"
+        && message.get("target_console").is_none()
+        && let Some(object) = message.as_object_mut()
+    {
+        object.insert(
+            "target_console".to_string(),
+            serde_json::Value::String(target_console.to_string()),
+        );
+    }
+    message
+}
+
 fn parse_convert_job_target(value: &str) -> (&str, Option<&str>) {
     let mut parts = value.splitn(2, '\t');
     let target = parts.next().unwrap_or(value);
@@ -214,11 +242,30 @@ fn parse_convert_job_target(value: &str) -> (&str, Option<&str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_convert_job_target;
+    use super::{console_target_for_job, parse_convert_job_target, route_structured_web_message};
+    use crate::queue::JobType;
 
     #[test]
     fn parse_convert_job_target_splits_device_override() {
         assert_eq!(parse_convert_job_target("1\tkindle"), ("1", Some("kindle")));
         assert_eq!(parse_convert_job_target("1"), ("1", None));
+    }
+
+    #[test]
+    fn console_target_for_convert_jobs_is_stdout2() {
+        assert_eq!(console_target_for_job(JobType::Convert), "stdout2");
+        assert_eq!(console_target_for_job(JobType::Send), "stdout2");
+        assert_eq!(console_target_for_job(JobType::Mail), "stdout2");
+        assert_eq!(console_target_for_job(JobType::Download), "stdout");
+    }
+
+    #[test]
+    fn route_structured_web_message_adds_target_console() {
+        let message = serde_json::json!({
+            "type": "progressbar.init",
+            "data": { "topic": "convert" }
+        });
+        let routed = route_structured_web_message(message, "stdout2");
+        assert_eq!(routed["target_console"], "stdout2");
     }
 }

@@ -156,7 +156,12 @@ pub async fn api_convert(
     State(state): State<AppState>,
     Json(body): Json<ConvertBody>,
 ) -> Json<serde_json::Value> {
-    let device = body.device.unwrap_or_else(|| "text".to_string());
+    let device = body
+        .device
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let queue = match open_queue() {
         Ok(queue) => queue,
         Err(message) => {
@@ -171,7 +176,12 @@ pub async fn api_convert(
     let jobs: Vec<(JobType, String)> = body
         .targets
         .iter()
-        .map(|target| (JobType::Convert, format!("{}\t{}", target, device)))
+        .map(|target| {
+            (
+                JobType::Convert,
+                encode_convert_job_target(target, device.as_deref()),
+            )
+        })
         .collect();
     let ids = match queue.push_batch(&jobs) {
         Ok(ids) => ids,
@@ -290,6 +300,13 @@ fn push_update_job_if_needed(
         .push_batch(&[(JobType::Update, target)])
         .map(|ids| (ids, true))
         .map_err(|e| e.to_string())
+}
+
+fn encode_convert_job_target(target: &str, device: Option<&str>) -> String {
+    match device.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(device) => format!("{}\t{}", target, device),
+        None => target.to_string(),
+    }
 }
 
 /// Helper: spawn an immediate child process with the given args
@@ -1354,7 +1371,19 @@ mod tests {
 
     use crate::queue::{JobType, PersistentQueue, QueueJob};
 
-    use super::{existing_update_job_id, push_update_job_if_needed};
+    use super::{encode_convert_job_target, existing_update_job_id, push_update_job_if_needed};
+
+    #[test]
+    fn encode_convert_job_target_omits_default_override() {
+        assert_eq!(encode_convert_job_target("12", None), "12");
+        assert_eq!(encode_convert_job_target("12", Some("   ")), "12");
+    }
+
+    #[test]
+    fn encode_convert_job_target_keeps_explicit_device() {
+        assert_eq!(encode_convert_job_target("12", Some("epub")), "12\tepub");
+        assert_eq!(encode_convert_job_target("12", Some("text")), "12\ttext");
+    }
 
     #[test]
     fn push_update_job_if_needed_reuses_pending_update_job() {
