@@ -123,7 +123,7 @@
   --table-col-title-min-width: 14em;
   --table-col-author-width: 8.5em;
   --table-col-site-width: 6.5em;
-  --table-col-novel-type-width: 3.5em;
+  --table-col-novel-type-width: 3ch;
   --table-col-tags-width: 10em;
   --table-col-episodes-width: 4.5em;
   --table-col-length-width: 6em;
@@ -132,7 +132,7 @@
   --table-col-title-reflow-extra: 3em;
   --table-col-author-reflow-extra: 2em;
   --table-col-site-reflow-extra: 1em;
-  --table-col-status-width: 6em;
+  --table-col-status-width: 2ch;
   --table-col-url-width: 3.25em;
   --table-col-download-width: 3em;
   --table-col-folder-width: 3em;
