@@ -242,9 +242,9 @@ function sortNovels(novels) {
   const keyFn = (n) => {
     switch (col) {
       case 'id': return n.id || 0;
-      case 'last_update': return n.last_update || '';
-      case 'general_lastup': return n.general_lastup || '';
-      case 'last_check_date': return n.last_check_date || '';
+      case 'last_update': return n.last_update || 0;
+      case 'general_lastup': return n.general_lastup || 0;
+      case 'last_check_date': return n.last_check_date || 0;
       case 'title': return (n.title || '').toLowerCase();
       case 'author': return (n.author || '').toLowerCase();
       case 'sitename': return (n.sitename || '').toLowerCase();
@@ -913,8 +913,10 @@ function getTimeBadge(dateStr) {
 }
 
 function parseDateValue(dateStr) {
-  if (!dateStr) return null;
-  const d = new Date(String(dateStr).replace(/-/g, '/'));
+  if (dateStr == null || dateStr === '') return null;
+  const d = typeof dateStr === 'number'
+    ? new Date(dateStr * 1000)
+    : new Date(String(dateStr).replace(/-/g, '/'));
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
@@ -943,8 +945,18 @@ function hasGeneralLastupHint(novel) {
 }
 
 function formatDate(dateStr) {
-  if (!dateStr) return { date: '', time: '' };
-  // API returns "YYYY-MM-DD HH:MM"
+  if (dateStr == null || dateStr === '') return { date: '', time: '' };
+  if (typeof dateStr === 'number') {
+    const d = parseDateValue(dateStr);
+    if (!d) return { date: '', time: '' };
+    const y = d.getFullYear();
+    const mo = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    const h = String(d.getHours()).padStart(2, '0');
+    const min = String(d.getMinutes()).padStart(2, '0');
+    return { date: `${y}/${mo}/${day}`, time: `${h}:${min}` };
+  }
+  // Backward-compatible fallback for pre-timestamp payloads
   const m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}:\d{2})/);
   if (m) return { date: `${m[1]}/${m[2]}/${m[3]}`, time: m[4] };
   // Fallback: try Date parsing

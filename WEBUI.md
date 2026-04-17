@@ -173,6 +173,8 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 
 #### 2.4.1 カラム一覧
 
+`/api/list` の日時系 (`last_update`, `new_arrivals_date`, `general_lastup`, `last_check_date`) は narou.rb と同じく epoch integer を返し、描画側で表示文字列へ変換する。
+
 | # | カラム | 説明 | Rust | 状態 |
 |---|--------|------|------|------|
 | 1 | ID | 数値ID (凍結時 ＊ID) | ✅ | ✅ |

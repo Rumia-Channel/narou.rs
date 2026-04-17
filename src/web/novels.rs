@@ -3,7 +3,7 @@ use axum::{
     http::StatusCode,
     response::{Json, Response},
 };
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, Utc};
 
 use crate::compat::{load_frozen_ids_from_inventory, record_is_frozen, set_frozen_state};
 use crate::db::{with_database, with_database_mut};
@@ -13,19 +13,6 @@ use super::AppState;
 use super::state::{ApiResponse, IdPath, ListParams, NovelListItem, NovelListResponse};
 
 const ANNOTATION_COLOR_TIME_LIMIT_SECS: i64 = 6 * 60 * 60;
-
-/// JST (+09:00) timezone offset
-fn jst() -> FixedOffset {
-    FixedOffset::east_opt(9 * 3600).unwrap()
-}
-
-fn format_jst(dt: DateTime<Utc>) -> String {
-    dt.with_timezone(&jst()).format("%Y-%m-%d %H:%M").to_string()
-}
-
-fn format_jst_opt(dt: Option<DateTime<Utc>>) -> Option<String> {
-    dt.map(|d| format_jst(d))
-}
 
 fn is_new_arrivals_marker(
     new_arrivals_date: Option<DateTime<Utc>>,
@@ -147,10 +134,10 @@ fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (Status
                     sitename: r.sitename.clone(),
                     novel_type: r.novel_type,
                     end: r.end,
-                    last_update: format_jst(r.last_update),
-                    general_lastup: format_jst_opt(r.general_lastup),
-                    last_check_date: format_jst_opt(r.last_check_date),
-                    new_arrivals_date: format_jst_opt(r.new_arrivals_date),
+                    last_update: r.last_update.timestamp(),
+                    general_lastup: r.general_lastup.map(|dt| dt.timestamp()),
+                    last_check_date: r.last_check_date.map(|dt| dt.timestamp()),
+                    new_arrivals_date: r.new_arrivals_date.map(|dt| dt.timestamp()),
                     tags: r.tags.clone(),
                     new_arrivals: is_new,
                     frozen: record_is_frozen(r, &frozen_ids),
@@ -176,8 +163,9 @@ fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (Status
 
 #[cfg(test)]
 mod tests {
-    use super::is_new_arrivals_marker;
+    use super::{NovelListItem, is_new_arrivals_marker};
     use chrono::{Duration, TimeZone, Utc};
+    use serde_json::json;
 
     #[test]
     fn new_arrivals_marker_uses_ruby_six_hour_window() {
@@ -195,6 +183,35 @@ mod tests {
         let earlier = last_update - Duration::minutes(1);
         let now = last_update + Duration::minutes(30);
         assert!(!is_new_arrivals_marker(Some(earlier), last_update, now));
+    }
+
+    #[test]
+    fn novel_list_item_serializes_dates_as_epoch_integers() {
+        let item = NovelListItem {
+            id: 5,
+            title: "title".to_string(),
+            author: "author".to_string(),
+            sitename: "site".to_string(),
+            novel_type: 1,
+            end: false,
+            last_update: 1_776_384_000,
+            general_lastup: Some(1_776_470_400),
+            last_check_date: Some(1_776_556_800),
+            new_arrivals_date: Some(1_776_384_000),
+            tags: vec!["tag".to_string()],
+            new_arrivals: true,
+            frozen: false,
+            suspend: false,
+            length: Some(1234),
+            toc_url: "https://example.com".to_string(),
+            general_all_no: Some(99),
+        };
+
+        let value = serde_json::to_value(item).unwrap();
+        assert_eq!(value["last_update"], json!(1_776_384_000));
+        assert_eq!(value["general_lastup"], json!(1_776_470_400));
+        assert_eq!(value["last_check_date"], json!(1_776_556_800));
+        assert_eq!(value["new_arrivals_date"], json!(1_776_384_000));
     }
 }
 
