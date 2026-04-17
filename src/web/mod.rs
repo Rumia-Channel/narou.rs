@@ -19,7 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -28,6 +28,7 @@ pub struct AppState {
     pub push_server: Arc<push::PushServer>,
     pub basic_auth_header: Option<String>,
     pub queue: Arc<crate::queue::PersistentQueue>,
+    pub restore_prompt_pending: Arc<AtomicBool>,
     pub running_jobs: Arc<parking_lot::Mutex<Vec<crate::queue::QueueJob>>>,
     pub running_child_pids: Arc<parking_lot::Mutex<std::collections::HashMap<String, u32>>>,
 }

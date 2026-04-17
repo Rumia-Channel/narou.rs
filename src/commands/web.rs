@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use narou_rs::db::inventory::{Inventory, InventoryScope};
@@ -72,6 +73,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
             std::process::exit(1);
         }
     };
+    let restore_prompt_pending = Arc::new(AtomicBool::new(queue.pending_count() > 0));
     let running_jobs = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let running_child_pids = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let app_state = web::AppState {
@@ -80,6 +82,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
         push_server: push_server.clone(),
         basic_auth_header,
         queue: queue.clone(),
+        restore_prompt_pending: restore_prompt_pending.clone(),
         running_jobs: running_jobs.clone(),
         running_child_pids: running_child_pids.clone(),
     };

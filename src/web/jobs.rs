@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use axum::{
     extract::{Query, State},
@@ -181,6 +182,10 @@ fn push_update_job_if_needed(
 
 fn running_job_count(state: &AppState) -> usize {
     state.running_jobs.lock().len()
+}
+
+fn restorable_tasks_available(state: &AppState, pending_count: usize) -> bool {
+    state.restore_prompt_pending.load(Ordering::Relaxed) && pending_count > 0
 }
 
 fn running_job_count_for_lane(state: &AppState, lane: QueueLane) -> usize {
@@ -1150,6 +1155,7 @@ pub async fn get_pending_tasks(
 ) -> Json<serde_json::Value> {
     let pending = state.queue.get_pending_tasks();
     let pending_count = pending.len();
+    let restorable_tasks_available = restorable_tasks_available(&state, pending_count);
     let pending_json: Vec<serde_json::Value> = pending
         .iter()
         .map(|j| {
@@ -1181,6 +1187,8 @@ pub async fn get_pending_tasks(
         "running": running_json,
         "pending_count": pending_count,
         "running_count": running_count,
+        "restorable_tasks_available": restorable_tasks_available,
+        "restore_prompt_pending": restorable_tasks_available,
     }))
 }
 
@@ -1382,6 +1390,7 @@ pub async fn restore_pending_tasks(
 ) -> Json<serde_json::Value> {
     // In Rust, pending tasks are already persisted in queue.yaml and will be
     // picked up by the worker. Just count and report.
+    state.restore_prompt_pending.store(false, Ordering::Relaxed);
     let count = state.queue.get_pending_tasks().len();
     state
         .push_server
@@ -1394,6 +1403,7 @@ pub async fn defer_restore_pending_tasks(
     State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
     // Clear pending tasks (defer = discard them)
+    state.restore_prompt_pending.store(false, Ordering::Relaxed);
     let _ = state.queue.clear_pending();
     serde_json::json!({ "status": "ok" }).into()
 }
@@ -1405,6 +1415,7 @@ pub async fn confirm_running_tasks(
 ) -> Json<serde_json::Value> {
     if body.rerun.as_deref() == Some("true") {
         // Resume: keep pending tasks, report count
+        state.restore_prompt_pending.store(false, Ordering::Relaxed);
         let count = state.queue.get_pending_tasks().len();
         state
             .push_server
@@ -1554,11 +1565,13 @@ fn current_sort_display_string() -> String {
 #[cfg(test)]
 mod tests {
     use parking_lot::Mutex;
+    use std::sync::Arc;
 
     use crate::queue::{JobType, PersistentQueue, QueueJob};
 
     use super::{
         encode_convert_job_target, existing_update_job_id, push_update_job_if_needed,
+        restorable_tasks_available,
         validate_diff_number, validate_download_targets, validate_general_lastup_option,
     };
 
@@ -1635,5 +1648,28 @@ mod tests {
     fn modified_followup_target_matches_ruby_tag_selector() {
         let target = "tag:modified".to_string();
         assert_eq!(target, "tag:modified");
+    }
+
+    #[test]
+    fn restorable_tasks_are_only_available_while_startup_prompt_is_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = Arc::new(PersistentQueue::new(&temp.path().join("queue.yaml")).unwrap());
+        queue.push(JobType::Download, "n1234aa").unwrap();
+        let state = crate::web::AppState {
+            port: 0,
+            ws_port: 0,
+            push_server: Arc::new(crate::web::push::PushServer::new()),
+            basic_auth_header: None,
+            queue,
+            restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            running_jobs: Arc::new(Mutex::new(Vec::new())),
+            running_child_pids: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        };
+
+        assert!(restorable_tasks_available(&state, 1));
+        state
+            .restore_prompt_pending
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!restorable_tasks_available(&state, 1));
     }
 }

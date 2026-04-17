@@ -674,8 +674,8 @@ export function renderQueueDetailed() {
   }
   if (State.queueRestoreCheckPending) {
     State.queueRestoreCheckPending = false;
-    State.queueRestorePrompted = qd.pending_count > 0;
-    if (qd.pending_count > 0) {
+    State.queueRestorePrompted = !!(qd.restore_prompt_pending && qd.restorable_tasks_available);
+    if (State.queueRestorePrompted) {
       El.queueRestoreModal?.classList.remove('hide');
     }
   }
