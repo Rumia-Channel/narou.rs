@@ -366,8 +366,9 @@ export function bindActions() {
   }
 
   on('action-download-force', () => {
-    if (State.selectedIds.size === 0) return;
-    postJson('/api/download', { targets: [...State.selectedIds], force: true });
+    const ids = requireSelectedIds();
+    if (!ids) return;
+    postJson('/api/download', { targets: ids, force: true });
   });
 
   on('btn-update', () => {
@@ -485,8 +486,9 @@ export function bindActions() {
   });
 
   on('btn-send', () => {
-    if (State.selectedIds.size === 0) return;
-    postJson('/api/send', { targets: [...State.selectedIds] });
+    const ids = requireSelectedIds();
+    if (!ids) return;
+    postJson('/api/send', { targets: ids });
   });
 
   on('action-send-backup-bookmark', () => {
@@ -497,43 +499,51 @@ export function bindActions() {
   on('action-freeze-off', () => batchAction('/api/novels/unfreeze'));
 
   on('btn-remove', async () => {
-    if (State.selectedIds.size === 0) return;
-    showRemoveModal([...State.selectedIds]);
+    const ids = requireSelectedIds();
+    if (!ids) return;
+    showRemoveModal(ids);
   });
 
   on('btn-convert', () => {
-    if (State.selectedIds.size === 0) return;
-    postJson('/api/convert', { targets: [...State.selectedIds] });
+    const ids = requireSelectedIds();
+    if (!ids) return;
+    postJson('/api/convert', { targets: ids });
   });
 
   on('action-other-diff', () => {
-    if (State.selectedIds.size === 0) return;
-    openDiffList([...State.selectedIds]);
+    const ids = requireSelectedIds();
+    if (!ids) return;
+    openDiffList(ids);
   });
 
   on('action-other-inspect', () => {
-    if (State.selectedIds.size === 0) return;
-    postJson('/api/inspect', { targets: [...State.selectedIds] });
+    const ids = requireSelectedIds();
+    if (!ids) return;
+    postJson('/api/inspect', { targets: ids });
   });
 
   on('action-other-folder', () => {
-    if (State.selectedIds.size === 0) return;
-    postJson('/api/folder', { targets: [...State.selectedIds] });
+    const ids = requireSelectedIds();
+    if (!ids) return;
+    postJson('/api/folder', { targets: ids });
   });
 
   on('action-other-backup', () => {
-    if (State.selectedIds.size === 0) return;
-    postJson('/api/backup', { targets: [...State.selectedIds] });
+    const ids = requireSelectedIds();
+    if (!ids) return;
+    postJson('/api/backup', { targets: ids });
   });
 
   on('action-other-setting-burn', () => {
-    if (State.selectedIds.size === 0) return;
-    postJson('/api/setting_burn', { targets: [...State.selectedIds] });
+    const ids = requireSelectedIds();
+    if (!ids) return;
+    postJson('/api/setting_burn', { targets: ids });
   });
 
   on('action-other-mail', () => {
-    if (State.selectedIds.size === 0) return;
-    postJson('/api/mail', { targets: [...State.selectedIds] });
+    const ids = requireSelectedIds();
+    if (!ids) return;
+    postJson('/api/mail', { targets: ids });
   });
 
   on('action-view-link-to-edit-menu', () => {
@@ -730,16 +740,24 @@ function setSelectMode(mode) {
 }
 
 async function batchAction(endpoint) {
-  if (State.selectedIds.size === 0) return;
-  await postJson(endpoint, { ids: [...State.selectedIds].map(Number) });
+  const ids = requireSelectedIds();
+  if (!ids) return;
+  await postJson(endpoint, { ids: ids.map(Number) });
   await refreshList();
+}
+
+function requireSelectedIds() {
+  const ids = [...State.selectedIds];
+  if (ids.length > 0) return ids;
+  showNotification('小説を選択してください', 'warning');
+  return null;
 }
 
 /* ===== Tag editor ===== */
 
 function openTagEditor(ids) {
-  const targetIds = ids || [...State.selectedIds];
-  if (targetIds.length === 0) return;
+  const targetIds = ids || requireSelectedIds();
+  if (!targetIds || targetIds.length === 0) return;
 
   El.tagEditModal?.classList.remove('hide');
   El.tagEditModal.dataset.ids = JSON.stringify(targetIds);

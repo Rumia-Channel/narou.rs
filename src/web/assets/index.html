@@ -77,7 +77,7 @@
               <ul class="dropdown-menu dropdown-menu-tags" id="tag-menu">
                 <li><div id="tag-list-canvas" class="tag-list-canvas"></div></li>
                 <li class="divider"></li>
-                <li class="enable-selected"><a href="#" id="action-tag-edit">選択した小説のタグを編集 <span class="shortcut">T</span></a></li>
+                <li><a href="#" id="action-tag-edit">選択した小説のタグを編集 <span class="shortcut">T</span></a></li>
               </ul>
             </li>
             <!-- ツール (Tool) -->
@@ -190,7 +190,7 @@
             <button class="btn btn-primary button-download" id="btn-download" type="button" title="新規ダウンロード">Download</button>
             <button class="btn btn-primary dropdown-toggle" type="button" data-dropdown="download-submenu"><span class="caret"></span></button>
             <ul class="dropdown-menu" id="download-submenu">
-              <li><a href="#" id="action-download-force" class="enable-selected">選択した小説を強制再ダウンロード</a></li>
+              <li><a href="#" id="action-download-force">選択した小説を強制再ダウンロード</a></li>
             </ul>
           </div>
           <!-- Update -->
@@ -220,7 +220,7 @@
           </div>
           <!-- Freeze -->
           <div class="btn-group">
-            <button class="btn btn-info dropdown-toggle enable-selected" type="button" data-dropdown="freeze-submenu">Freeze <span class="caret"></span></button>
+            <button class="btn btn-info dropdown-toggle" type="button" data-dropdown="freeze-submenu">Freeze <span class="caret"></span></button>
             <ul class="dropdown-menu" id="freeze-submenu">
               <li><a href="#" id="action-freeze-on">選択した小説を凍結</a></li>
               <li><a href="#" id="action-freeze-off">選択した小説の凍結を解除</a></li>
@@ -228,22 +228,22 @@
           </div>
           <!-- Remove -->
           <div class="btn-group">
-            <button class="btn btn-danger enable-selected" id="btn-remove" type="button" title="選択した小説を削除">Remove</button>
+            <button class="btn btn-danger" id="btn-remove" type="button" title="選択した小説を削除">Remove</button>
           </div>
           <!-- Convert -->
           <div class="btn-group">
-            <button class="btn btn-default enable-selected" id="btn-convert" type="button" title="選択した小説を変換">Convert</button>
+            <button class="btn btn-default" id="btn-convert" type="button" title="選択した小説を変換">Convert</button>
           </div>
           <!-- Other -->
           <div class="btn-group">
-            <button class="btn btn-default dropdown-toggle enable-selected" type="button" data-dropdown="other-submenu">Other <span class="caret"></span></button>
+            <button class="btn btn-default dropdown-toggle" type="button" data-dropdown="other-submenu">Other <span class="caret"></span></button>
             <ul class="dropdown-menu" id="other-submenu">
               <li><a href="#" id="action-other-diff">選択した小説の最新の差分を表示</a></li>
               <li><a href="#" id="action-other-inspect">選択した小説の調査状況ログを表示</a></li>
               <li><a href="#" id="action-other-folder">選択した小説の保存フォルダを開く</a></li>
               <li><a href="#" id="action-other-backup">選択した小説のバックアップを作成</a></li>
               <li><a href="#" id="action-other-setting-burn">選択した小説の設定の未設定項目に共通設定を焼付ける</a></li>
-              <li><a href="#" id="action-other-mail">選択した小説をメールで送信</a></li>
+              <li><a href="#" id="action-other-mail" class="enable-selected">選択した小説をメールで送信</a></li>
             </ul>
           </div>
         </div>
