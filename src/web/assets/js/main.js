@@ -47,19 +47,7 @@ async function init() {
   try {
     const config = await fetchJson('/api/webui/config');
     if (config) {
-      if (config.theme && !localStorage.getItem('narou-rs-webui-theme')) {
-        State.theme = config.theme;
-        document.documentElement.dataset.theme = config.theme === 'default' ? '' : config.theme;
-        const sel = El.themeSelect;
-        if (sel) sel.value = config.theme;
-      }
-      if (config.ws_port) State.wsPort = config.ws_port;
-      if (config.performance_mode) State.performanceMode = config.performance_mode;
-      if (config.reload_timing) State.tableReloadTiming = config.reload_timing;
-      if (config.concurrency_enabled) {
-        State.concurrencyEnabled = true;
-        if (El.consoleColRight) El.consoleColRight.classList.remove('hide');
-      }
+      applyWebConfig(config);
     }
   } catch { /* use defaults */ }
 
@@ -129,6 +117,26 @@ function connectWebSocket() {
   };
 }
 
+function applyWebConfig(config) {
+  if (config.theme && !localStorage.getItem('narou-rs-webui-theme')) {
+    State.theme = config.theme;
+    document.documentElement.dataset.theme = config.theme === 'default' ? '' : config.theme;
+    const sel = El.themeSelect;
+    if (sel) sel.value = config.theme;
+  }
+  if (config.ws_port) State.wsPort = config.ws_port;
+  if (config.performance_mode) State.performanceMode = config.performance_mode;
+  if (config.reload_timing) State.tableReloadTiming = config.reload_timing;
+  setConcurrencyEnabled(Boolean(config.concurrency_enabled));
+}
+
+function setConcurrencyEnabled(enabled) {
+  State.concurrencyEnabled = enabled;
+  if (El.consoleColRight) {
+    El.consoleColRight.classList.toggle('hide', !enabled);
+  }
+}
+
 function handleWsMessage(msg) {
   switch (msg.type) {
     case 'log':
@@ -188,7 +196,13 @@ function handleWsMessage(msg) {
       initProgressBar(msg.data?.topic, msg.target_console);
       break;
     case 'progressbar.step':
-      setProgressBar(msg.data?.percent, msg.data?.topic, msg.target_console);
+      setProgressBar(
+        msg.data?.percent,
+        msg.data?.current,
+        msg.data?.total,
+        msg.data?.topic,
+        msg.target_console
+      );
       break;
     case 'progressbar.clear':
       removeProgressBar(msg.data?.topic, msg.target_console);
@@ -212,8 +226,9 @@ function rememberRebootReturnTo() {
 }
 
 function getConsoleEl(targetConsole) {
-  if (targetConsole === 'stdout2' && State.concurrencyEnabled) {
-    return document.getElementById('console-stdout2');
+  if (targetConsole === 'stdout2') {
+    if (!State.concurrencyEnabled) setConcurrencyEnabled(true);
+    return document.getElementById('console-stdout2') || El.console;
   }
   return El.console;
 }
@@ -247,12 +262,10 @@ function initProgressBar(topic, targetConsole) {
   if (!host) return;
   var wrapper = document.createElement('div');
   wrapper.className = 'console-progress-item';
-  if (topic) {
-    var label = document.createElement('div');
-    label.className = 'console-progress-topic';
-    label.textContent = topic;
-    wrapper.appendChild(label);
-  }
+  var label = document.createElement('div');
+  label.className = 'console-progress-topic';
+  label.textContent = formatProgressLabel(0, 0, 0);
+  wrapper.appendChild(label);
   var progress = document.createElement('div');
   progress.className = 'progress';
   progress.innerHTML = '<div class="progress-bar" style="width:0%"></div>';
@@ -261,14 +274,16 @@ function initProgressBar(topic, targetConsole) {
   progressBars[key] = {
     wrapper: wrapper,
     bar: progress.querySelector('.progress-bar'),
+    label: label,
   };
   updateProgressHostVisibility(targetConsole);
 }
 
-function setProgressBar(percent, topic, targetConsole) {
+function setProgressBar(percent, current, total, topic, targetConsole) {
   var key = (targetConsole || 'stdout') + ':' + (topic || 'default');
   if (!progressBars[key]) initProgressBar(topic, targetConsole);
   progressBars[key].bar.style.width = (percent || 0) + '%';
+  progressBars[key].label.textContent = formatProgressLabel(current, total, percent);
 }
 
 function removeProgressBar(topic, targetConsole) {
@@ -289,6 +304,13 @@ function clearAllProgressBars() {
   ['stdout', 'stdout2'].forEach(function(targetConsole) {
     updateProgressHostVisibility(targetConsole);
   });
+}
+
+function formatProgressLabel(current, total, percent) {
+  var currentValue = Number.isFinite(current) ? current : 0;
+  var totalValue = Number.isFinite(total) ? total : 0;
+  var percentValue = Number.isFinite(percent) ? percent : 0;
+  return '進捗 ' + currentValue + '/' + totalValue + ' ' + percentValue.toFixed(1) + '%';
 }
 
 function sanitizeConsoleSpanStyle(styleText) {

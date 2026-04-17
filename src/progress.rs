@@ -169,7 +169,12 @@ impl WebProgress {
             let percent = (pos as f64 / len as f64) * 100.0;
             self.send(
                 "progressbar.step",
-                serde_json::json!({ "percent": percent, "topic": self.topic }),
+                serde_json::json!({
+                    "current": pos,
+                    "total": len,
+                    "percent": percent,
+                    "topic": self.topic
+                }),
             );
         }
     }
