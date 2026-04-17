@@ -2,6 +2,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use narou_rs::error::Result;
+use narou_rs::setting_info::default_local_setting_value;
 
 pub fn cmd_init(aozora_path: Option<&str>, line_height: Option<f64>) -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -84,7 +85,47 @@ fn ensure_dot_narou_files(root: &Path) -> Result<usize> {
             created += 1;
         }
     }
+    if ensure_default_local_settings(&dir.join("local_setting.yaml"))? {
+        created += 1;
+    }
     Ok(created)
+}
+
+fn ensure_default_local_settings(path: &Path) -> Result<bool> {
+    const DEFAULT_KEYS: &[&str] = &[
+        "convert.dc-subject-exclude-tags",
+        "download.interval",
+        "download.wait-steps",
+        "folder-length-limit",
+        "filename-length-limit",
+        "user-agent",
+    ];
+
+    let mut settings = if path.exists() {
+        let raw = std::fs::read_to_string(path)?;
+        serde_yaml::from_str::<std::collections::BTreeMap<String, serde_yaml::Value>>(&raw)
+            .unwrap_or_default()
+    } else {
+        std::collections::BTreeMap::new()
+    };
+
+    let mut changed = false;
+    for key in DEFAULT_KEYS {
+        if settings.contains_key(*key) {
+            continue;
+        }
+        if let Some(value) = default_local_setting_value(key) {
+            settings.insert((*key).to_string(), value);
+            changed = true;
+        }
+    }
+
+    if changed {
+        let content = serde_yaml::to_string(&settings)?;
+        std::fs::write(path, content)?;
+    }
+
+    Ok(changed)
 }
 
 fn copy_bundled_webnovel_files(destination: &Path) -> Result<usize> {
@@ -375,6 +416,50 @@ fn format_line_height(line_height: f64) -> String {
         }
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_default_local_settings;
+
+    #[test]
+    fn ensure_default_local_settings_writes_expected_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("local_setting.yaml");
+
+        assert!(ensure_default_local_settings(&path).unwrap());
+
+        let settings: std::collections::BTreeMap<String, serde_yaml::Value> =
+            serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            settings.get("user-agent"),
+            Some(&serde_yaml::Value::String("auto".to_string()))
+        );
+        assert_eq!(
+            settings.get("download.interval"),
+            Some(&serde_yaml::to_value(0.7f64).unwrap())
+        );
+        assert_eq!(
+            settings.get("download.wait-steps"),
+            Some(&serde_yaml::Value::Number(serde_yaml::Number::from(0)))
+        );
+    }
+
+    #[test]
+    fn ensure_default_local_settings_preserves_existing_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("local_setting.yaml");
+        std::fs::write(&path, "---\nuser-agent: custom-agent\n").unwrap();
+
+        assert!(ensure_default_local_settings(&path).unwrap());
+
+        let settings: std::collections::BTreeMap<String, serde_yaml::Value> =
+            serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            settings.get("user-agent"),
+            Some(&serde_yaml::Value::String("custom-agent".to_string()))
+        );
+    }
 }
 
 fn normalize_path_string(path: &str) -> String {

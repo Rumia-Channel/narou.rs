@@ -156,7 +156,7 @@
   color: var(--text-muted, #777);
 }
 
-/* Three-way toggle (for default.*/force.* booleans) */
+/* Three-way toggle for default.* / force.* booleans */
 .switch-3way {
   display: inline-flex;
   align-items: center;

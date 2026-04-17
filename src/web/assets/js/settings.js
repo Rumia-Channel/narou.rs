@@ -101,7 +101,7 @@
 
     // Help text
     if (setting.help) {
-      html += '<p class="setting-help">' + escapeHtml(setting.help).replace(/\n/g, '<br>') + '</p>';
+      html += '<p class="setting-help">' + renderHelpHtml(setting.help) + '</p>';
     }
 
     html += '</div></div>';
@@ -121,11 +121,11 @@
     }
 
     if (type === 'select') {
-      return renderSelect(name, value, setting.select_keys || []);
+      return renderSelect(name, value, setting.select_keys || [], setting.select_summaries || []);
     }
 
     if (type === 'multiple') {
-      return renderMultiple(name, value, setting.select_keys || []);
+      return renderMultiple(name, value, setting.select_keys || [], setting.select_summaries || []);
     }
 
     // text / integer / float / string / directory
@@ -159,19 +159,20 @@
            '</div>';
   }
 
-  function renderSelect(name, value, keys) {
+  function renderSelect(name, value, keys, summaries) {
     let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '">';
     const isTheme = (name === 'webui.theme');
     html += '<option value="">' + (isTheme ? 'デフォルト' : '未設定') + '</option>';
-    keys.forEach(function(key) {
+    keys.forEach(function(key, index) {
       const selected = (value === key) ? ' selected' : '';
-      html += '<option value="' + escapeAttr(key) + '"' + selected + '>' + escapeHtml(key) + '</option>';
+      const label = summaries[index] || key;
+      html += '<option value="' + escapeAttr(key) + '"' + selected + '>' + escapeHtml(label) + '</option>';
     });
     html += '</select>';
     return html;
   }
 
-  function renderMultiple(name, value, keys) {
+  function renderMultiple(name, value, keys, summaries) {
     let selectedItems = [];
     if (Array.isArray(value)) {
       selectedItems = value;
@@ -180,9 +181,10 @@
     }
 
     let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '" multiple>';
-    keys.forEach(function(key) {
+    keys.forEach(function(key, index) {
       const selected = selectedItems.includes(key) ? ' selected' : '';
-      html += '<option value="' + escapeAttr(key) + '"' + selected + '>' + escapeHtml(key) + '</option>';
+      const label = summaries[index] || key;
+      html += '<option value="' + escapeAttr(key) + '"' + selected + '>' + escapeHtml(label) + '</option>';
     });
     html += '</select>';
     return html;
@@ -339,6 +341,11 @@
       case 'directory': return 'フォルダパスを入力';
       default: return '値を入力';
     }
+  }
+
+  function renderHelpHtml(help) {
+    if (!help) return '';
+    return String(help).replace(/\n/g, '<br>');
   }
 
   function showToast(msg, type) {

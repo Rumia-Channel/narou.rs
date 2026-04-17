@@ -2,9 +2,10 @@ use axum::{extract::State, response::Json};
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::converter::device::Device;
 use crate::setting_info::{
     SettingVariables, VarInfo, VarType, default_arg_command_names, is_known_default_arg_name,
-    original_setting_var_infos, setting_variables, tab_for_setting,
+    default_local_setting_value, original_setting_var_infos, setting_variables, tab_for_setting,
     webui_help_override,
 };
 use crate::db::inventory::{Inventory, InventoryScope};
@@ -25,7 +26,7 @@ const TABS: &[(&str, &str, &str)] = &[
     (
         "global",
         "Global",
-        "Global な設定はユーザープロファイルに保存され、ostに関わらず適用されます",
+        "Global な設定はユーザープロファイルに保存され、OSに関わらず適用されます",
     ),
     (
         "default",
@@ -78,7 +79,10 @@ pub async fn get_global_settings(
         if tab.is_none() {
             continue;
         }
-        let value = local_values.get(*name).cloned();
+        let value = local_values
+            .get(*name)
+            .cloned()
+            .or_else(|| default_local_setting_value(name));
         settings.push(build_setting_entry(name, info, "local", tab.unwrap(), value));
     }
 
@@ -289,7 +293,55 @@ fn build_setting_entry(
         "help": help,
         "value": yaml_to_json(value),
         "select_keys": info.select_keys,
+        "select_summaries": select_summaries_for_setting(name, info),
         "invisible": info.invisible,
+    })
+}
+
+fn select_summaries_for_setting(name: &str, info: &VarInfo) -> Option<Vec<String>> {
+    let keys = info.select_keys.as_ref()?;
+    let base_name = name
+        .strip_prefix("default.")
+        .or_else(|| name.strip_prefix("force."))
+        .unwrap_or(name);
+    Some(match base_name {
+        "device" | "convert.multi-device" => keys
+            .iter()
+            .map(|key| Device::from_str(key).display_name().to_string())
+            .collect(),
+        "update.sort-by" => keys
+            .iter()
+            .map(|key| match key.as_str() {
+                "id" => "ID".to_string(),
+                "last_update" => "更新日".to_string(),
+                "title" => "タイトル".to_string(),
+                "author" => "作者".to_string(),
+                "site" => "掲載サイト".to_string(),
+                "keyword" => "キーワード".to_string(),
+                "general_lastup" => "掲載日".to_string(),
+                "new_arrivals_date" => "新着日".to_string(),
+                _ => key.clone(),
+            })
+            .collect(),
+        "convert.copy-to-grouping" => vec![
+            "端末毎にまとめる".to_string(),
+            "掲載サイト毎にまとめる".to_string(),
+        ],
+        "economy" => vec![
+            "変換後に作業ファイルを削除".to_string(),
+            "送信後に書籍ファイルを削除".to_string(),
+            "差分ファイルを保存しない".to_string(),
+            "rawデータを保存しない".to_string(),
+        ],
+        "webui.table.reload-timing" => {
+            vec!["１作品ごとに更新".to_string(), "キューごとに更新".to_string()]
+        }
+        "webui.performance-mode" => vec![
+            "自動判定".to_string(),
+            "常に有効".to_string(),
+            "常に無効".to_string(),
+        ],
+        _ => keys.clone(),
     })
 }
 
@@ -552,6 +604,39 @@ mod tests {
         assert_eq!(
             settings.get("default.enable_half_indent_bracket"),
             Some(&serde_yaml::Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn select_summaries_use_display_labels() {
+        let vars = setting_variables();
+        let info = vars
+            .get("webui.performance-mode")
+            .expect("webui.performance-mode metadata");
+        assert_eq!(
+            select_summaries_for_setting("webui.performance-mode", info),
+            Some(vec![
+                "自動判定".to_string(),
+                "常に有効".to_string(),
+                "常に無効".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn select_summaries_support_default_prefixed_settings() {
+        let vars = setting_variables();
+        let info = vars.get("device").expect("device metadata");
+        assert_eq!(
+            select_summaries_for_setting("default.device", info),
+            Some(vec![
+                "Kindle".to_string(),
+                "Kobo".to_string(),
+                "EPUB".to_string(),
+                "i文庫".to_string(),
+                "SonyReader".to_string(),
+                "iBooks".to_string(),
+            ])
         );
     }
 }

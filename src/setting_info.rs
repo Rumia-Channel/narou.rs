@@ -33,6 +33,19 @@ pub struct SettingVariables {
     pub global: Vec<(&'static str, VarInfo)>,
 }
 
+pub fn default_local_setting_value(name: &str) -> Option<serde_yaml::Value> {
+    match name {
+        "convert.dc-subject-exclude-tags" => Some(serde_yaml::Value::String("404,end".to_string())),
+        "download.interval" => serde_yaml::to_value(0.7f64).ok(),
+        "download.wait-steps" => Some(serde_yaml::Value::Number(serde_yaml::Number::from(0))),
+        "folder-length-limit" | "filename-length-limit" => {
+            Some(serde_yaml::Value::Number(serde_yaml::Number::from(50)))
+        }
+        "user-agent" => Some(serde_yaml::Value::String("auto".to_string())),
+        _ => None,
+    }
+}
+
 impl SettingVariables {
     pub fn get(&self, name: &str) -> Option<&VarInfo> {
         for (n, info) in &self.local {
@@ -739,7 +752,7 @@ pub fn setting_variables() -> SettingVariables {
             "user-agent",
             vis(
                 VarType::String,
-                "User-Agent 設定\n未指定時 Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "User-Agent 設定\n未指定時 auto",
             ),
         ),
         (

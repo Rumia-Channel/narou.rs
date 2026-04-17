@@ -250,13 +250,19 @@ fn parse_loose_datetime(value: &str) -> Option<DateTime<Utc>> {
 }
 
 fn resolve_user_agent(user_agent: Option<&str>, saved_user_agent: Option<String>) -> String {
+    let is_auto = |ua: &str| {
+        let trimmed = ua.trim();
+        trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("auto")
+            || trimmed.eq_ignore_ascii_case("random")
+    };
     match user_agent {
-        Some(ua) if ua.eq_ignore_ascii_case("random") => {
+        Some(ua) if is_auto(ua) => {
             ua_generator::ua::spoof_firefox_ua().to_string()
         }
         Some(ua) if !ua.trim().is_empty() => ua.to_string(),
         _ => match saved_user_agent {
-            Some(ua) if ua.eq_ignore_ascii_case("random") => {
+            Some(ua) if is_auto(&ua) => {
                 ua_generator::ua::spoof_firefox_ua().to_string()
             }
             Some(ua) if !ua.trim().is_empty() => ua,
@@ -1629,6 +1635,21 @@ mod tests {
             resolve_user_agent(None, Some("saved-agent".to_string())),
             "saved-agent"
         );
+    }
+
+    #[test]
+    fn resolve_user_agent_treats_auto_as_randomized_value() {
+        let resolved = resolve_user_agent(Some("auto"), Some("saved-agent".to_string()));
+        assert!(!resolved.is_empty());
+        assert_ne!(resolved, "saved-agent");
+        assert_ne!(resolved, "auto");
+    }
+
+    #[test]
+    fn resolve_user_agent_treats_saved_auto_as_randomized_value() {
+        let resolved = resolve_user_agent(None, Some("auto".to_string()));
+        assert!(!resolved.is_empty());
+        assert_ne!(resolved, "auto");
     }
 
     #[test]
