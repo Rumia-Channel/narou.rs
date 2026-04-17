@@ -1,7 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 
@@ -23,7 +24,7 @@ use narou_rs::downloader::{
 use narou_rs::mail::{
     MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
 };
-use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
+use narou_rs::progress::{CliProgress, WebProgress, WS_LINE_PREFIX, is_web_mode};
 use narou_rs::termcolor::{bold_colored, colored};
 
 const MODIFIED_TAG: &str = "modified";
@@ -751,7 +752,80 @@ fn auto_convert(
     dl: &DownloadResult,
     no_open: bool,
 ) -> Result<(), String> {
+    if is_web_mode() {
+        return auto_convert_via_web_subprocess(dl.id, no_open);
+    }
     convert_existing_novel(dl.id, &dl.title, &dl.author, &dl.novel_dir, no_open).map(|_| ())
+}
+
+fn auto_convert_via_web_subprocess(id: i64, no_open: bool) -> Result<(), String> {
+    let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut command = Command::new(exe_path);
+    command.arg("convert");
+    if no_open {
+        command.arg("--no-open");
+    }
+    command.arg(id.to_string());
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let stdout = child.stdout.take().ok_or_else(|| "convert stdout を取得できません".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "convert stderr を取得できません".to_string())?;
+
+    let stdout_thread = std::thread::spawn(move || relay_web_convert_stream(stdout));
+    let stderr_thread = std::thread::spawn(move || relay_web_convert_stream(stderr));
+
+    let status = child.wait().map_err(|e| e.to_string())?;
+    stdout_thread
+        .join()
+        .map_err(|_| "convert stdout relay thread が panic しました".to_string())??;
+    stderr_thread
+        .join()
+        .map_err(|_| "convert stderr relay thread が panic しました".to_string())??;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(match status.code() {
+            Some(code) => format!("convert が終了コード {} で失敗しました", code),
+            None => "convert が異常終了しました".to_string(),
+        })
+    }
+}
+
+fn relay_web_convert_stream<R: io::Read>(reader: R) -> Result<(), String> {
+    let reader = BufReader::new(reader);
+    for line in reader.lines() {
+        relay_web_convert_line(&line.map_err(|e| e.to_string())?);
+    }
+    Ok(())
+}
+
+fn relay_web_convert_line(text: &str) {
+    println!("{}", reroute_web_convert_line(text));
+}
+
+fn reroute_web_convert_line(text: &str) -> String {
+    if let Some(json_str) = text.strip_prefix(WS_LINE_PREFIX) {
+        if let Ok(mut message) =
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json_str)
+        {
+            message.insert(
+                "target_console".to_string(),
+                serde_json::Value::String("stdout2".to_string()),
+            );
+            return format!("{}{}", WS_LINE_PREFIX, serde_json::Value::Object(message));
+        }
+    }
+    format!(
+        "{}{}",
+        WS_LINE_PREFIX,
+        serde_json::json!({
+            "type": "echo",
+            "body": text,
+            "target_console": "stdout2"
+        })
+    )
 }
 
 fn process_hotentry(
@@ -1300,7 +1374,7 @@ fn parse_api_datetime(value: &str) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{abort_if_interrupted, sleep_with_interrupt};
+    use super::{WS_LINE_PREFIX, abort_if_interrupted, reroute_web_convert_line, sleep_with_interrupt};
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -1313,5 +1387,34 @@ mod tests {
     fn sleep_with_interrupt_returns_immediately_for_zero_duration() {
         let interrupted = AtomicBool::new(false);
         sleep_with_interrupt(0.0, &interrupted).unwrap();
+    }
+
+    #[test]
+    fn reroute_web_convert_line_wraps_plain_text_for_stdout2() {
+        let routed = reroute_web_convert_line("Converted: test.epub");
+        assert!(routed.starts_with(WS_LINE_PREFIX));
+        let json = routed.trim_start_matches(WS_LINE_PREFIX);
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(value["type"], "echo");
+        assert_eq!(value["body"], "Converted: test.epub");
+        assert_eq!(value["target_console"], "stdout2");
+    }
+
+    #[test]
+    fn reroute_web_convert_line_retargets_structured_events_to_stdout2() {
+        let source = format!(
+            "{}{}",
+            WS_LINE_PREFIX,
+            serde_json::json!({
+                "type": "progressbar.step",
+                "data": { "current": 3, "total": 9, "percent": 33.3, "topic": "convert" }
+            })
+        );
+        let routed = reroute_web_convert_line(&source);
+        let json = routed.trim_start_matches(WS_LINE_PREFIX);
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(value["type"], "progressbar.step");
+        assert_eq!(value["target_console"], "stdout2");
+        assert_eq!(value["data"]["current"], 3);
     }
 }
