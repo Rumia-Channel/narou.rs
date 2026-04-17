@@ -351,8 +351,11 @@ pub async fn author_comments(
     let mut postscripts_count: usize = 0;
 
     for sub in &toc.subtitles {
-        let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
-        let path = section_dir.join(&filename);
+        let Some(path) =
+            crate::downloader::persistence::resolve_section_file_path(&section_dir, sub)
+        else {
+            continue;
+        };
         let sf = match crate::downloader::persistence::load_section_file(&path) {
             Some(sf) => sf,
             None => continue,

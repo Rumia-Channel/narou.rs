@@ -655,8 +655,18 @@ fn load_sections_from_dir(
     let mut sections = Vec::new();
 
     for sub in subtitles {
-        let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
-        let path = section_dir.join(&filename);
+        let path = crate::downloader::persistence::resolve_section_file_path(&section_dir, sub)
+            .ok_or_else(|| {
+                let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
+                NarouError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "section file not found: expected '{}' in {}",
+                        filename,
+                        section_dir.display()
+                    ),
+                ))
+            })?;
         let content = std::fs::read_to_string(&path).map_err(|e| NarouError::Io(e))?;
         let section: crate::downloader::SectionFile =
             serde_yaml::from_str(&content).map_err(|e| NarouError::Yaml(e))?;

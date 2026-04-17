@@ -33,6 +33,34 @@ pub fn section_needs_update(
     true
 }
 
+pub fn resolve_section_file_path(
+    section_dir: &Path,
+    subtitle: &SubtitleInfo,
+) -> Option<PathBuf> {
+    let filename = format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle);
+    let exact = section_dir.join(&filename);
+    if exact.exists() {
+        return Some(exact);
+    }
+    find_section_file_by_index(section_dir, &subtitle.index)
+}
+
+pub fn find_section_file_by_index(section_dir: &Path, index: &str) -> Option<PathBuf> {
+    let prefix = format!("{} ", index);
+    let entries = std::fs::read_dir(section_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".yaml") {
+            continue;
+        }
+        let stem = &name[..name.len() - 5];
+        if stem == index || stem.starts_with(&prefix) {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
 pub fn load_section_file(path: &PathBuf) -> Option<SectionFile> {
     let content = std::fs::read_to_string(path).ok()?;
     serde_yaml::from_str(&content).ok()
