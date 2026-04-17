@@ -303,6 +303,30 @@ fn date_string_to_ymd(value: &str) -> Option<String> {
     Some(format!("{:04}{:02}{:02}", dt.year(), dt.month(), dt.day()))
 }
 
+fn resolve_download_status(
+    force: bool,
+    updated_count: usize,
+    existing_id: Option<i64>,
+    title_changed: bool,
+    author_changed: bool,
+    story_changed: bool,
+    sections_deleted: bool,
+) -> types::UpdateStatus {
+    let has_changes = force
+        || updated_count > 0
+        || existing_id.is_none()
+        || title_changed
+        || author_changed
+        || story_changed
+        || sections_deleted;
+
+    if has_changes {
+        types::UpdateStatus::Ok
+    } else {
+        types::UpdateStatus::None
+    }
+}
+
 fn sanitize_site_tags(raw: &str) -> Vec<String> {
     let cleaned = crate::downloader::html::sanitize_text(raw)
         .replace("キーワードが設定されていません", "")
@@ -1223,18 +1247,15 @@ impl Downloader {
         }
         self.flush_section_hash_cache()?;
 
-        let has_changes = updated_count > 0
-            || existing_id.is_none()
-            || title_changed
-            || author_changed
-            || story_changed
-            || sections_deleted;
-
-        let status = if has_changes {
-            types::UpdateStatus::Ok
-        } else {
-            types::UpdateStatus::None
-        };
+        let status = resolve_download_status(
+            force,
+            updated_count,
+            existing_id,
+            title_changed,
+            author_changed,
+            story_changed,
+            sections_deleted,
+        );
 
         Ok(DownloadResult {
             id,
@@ -1699,6 +1720,18 @@ mod tests {
             super::date_string_to_ymd("2026-04-12 10:00:00.123456 +0900"),
             Some("20260412".to_string())
         );
+    }
+
+    #[test]
+    fn forced_redownload_never_reports_no_updates() {
+        assert!(matches!(
+            super::resolve_download_status(false, 0, Some(1), false, false, false, false),
+            super::types::UpdateStatus::None
+        ));
+        assert!(matches!(
+            super::resolve_download_status(true, 0, Some(1), false, false, false, false),
+            super::types::UpdateStatus::Ok
+        ));
     }
 
     #[test]
