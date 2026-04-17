@@ -35,7 +35,7 @@ use self::persistence::{
 use self::section::{SectionCache, download_section};
 use self::site_setting::SiteSetting;
 use self::toc::{create_short_story_subtitles, fetch_toc, parse_subtitles_multipage};
-use self::util::sanitize_filename;
+use self::util::{load_length_limit, mask_spoiler_text, sanitize_filename_with_limit};
 
 pub use self::types::{
     ARCHIVE_ROOT_DIR, DownloadResult, NarouApiEntry, NarouApiResult, RAW_DATA_DIR,
@@ -249,6 +249,22 @@ fn parse_loose_datetime(value: &str) -> Option<DateTime<Utc>> {
     None
 }
 
+fn resolve_user_agent(user_agent: Option<&str>, saved_user_agent: Option<String>) -> String {
+    match user_agent {
+        Some(ua) if ua.eq_ignore_ascii_case("random") => {
+            ua_generator::ua::spoof_firefox_ua().to_string()
+        }
+        Some(ua) if !ua.trim().is_empty() => ua.to_string(),
+        _ => match saved_user_agent {
+            Some(ua) if ua.eq_ignore_ascii_case("random") => {
+                ua_generator::ua::spoof_firefox_ua().to_string()
+            }
+            Some(ua) if !ua.trim().is_empty() => ua,
+            _ => ua_generator::ua::spoof_firefox_ua().to_string(),
+        },
+    }
+}
+
 fn date_string_is_newer(latest: &str, old: &str) -> bool {
     match (parse_loose_datetime(latest), parse_loose_datetime(old)) {
         (Some(latest_dt), Some(old_dt)) => latest_dt > old_dt,
@@ -293,13 +309,10 @@ impl Downloader {
     }
 
     pub fn with_user_agent(user_agent: Option<&str>) -> Result<Self> {
-        let ua = match user_agent {
-            Some(ua) if ua.eq_ignore_ascii_case("random") => {
-                ua_generator::ua::spoof_firefox_ua().to_string()
-            }
-            Some(ua) if !ua.trim().is_empty() => ua.to_string(),
-            _ => ua_generator::ua::spoof_firefox_ua().to_string(),
-        };
+        let ua = resolve_user_agent(
+            user_agent,
+            crate::compat::load_local_setting_string("user-agent"),
+        );
 
         let fetcher = HttpFetcher::new(&ua)?;
         let site_settings = SiteSetting::load_all()?;
@@ -669,6 +682,7 @@ impl Downloader {
         force: bool,
     ) -> Result<DownloadResult> {
         let (existing_id, setting) = self.resolve_target_for_download(target)?;
+        self.fetcher.configure_rate_limiter(setting.is_narou);
 
         let db_toc_url = if let Some(id) = existing_id {
             crate::db::with_database(|db| Ok(db.get(id).map(|r| r.toc_url.clone())))
@@ -850,6 +864,7 @@ impl Downloader {
         let display_id = existing_id.unwrap_or(0);
         let mut section_plans = Vec::with_capacity(subtitles.len());
         let mut download_count = 0usize;
+        let guard_spoiler = load_local_setting_bool("guard-spoiler");
 
         for subtitle in &subtitles {
             let latest_section_path = section_dir.join(section_filename(subtitle));
@@ -989,12 +1004,12 @@ impl Downloader {
                 } else {
                     line.push_str("短編　");
                 }
-                line.push_str(&format!(
-                    "{} ({}/{})",
-                    subtitle.subtitle,
-                    si + 1,
-                    subtitles.len()
-                ));
+                let printable_subtitle = if guard_spoiler {
+                    mask_spoiler_text(&subtitle.subtitle)
+                } else {
+                    subtitle.subtitle.clone()
+                };
+                line.push_str(&format!("{} ({}/{})", printable_subtitle, si + 1, subtitles.len()));
                 if needs_download {
                     if is_new_arrival && (existing_id.is_some() || force) {
                         line.push_str(&bold_colored(" (新着)", "magenta"));
@@ -1446,14 +1461,16 @@ impl Downloader {
             if !append_title {
                 return ncode.clone();
             }
-            let sanitized = sanitize_filename(title);
+            let limit = load_length_limit("folder-length-limit", Some(50));
+            let combined_title = format!("{} {}", ncode, title);
+            let sanitized = sanitize_filename_with_limit(&combined_title, limit);
             if sanitized.is_empty() {
                 ncode.clone()
             } else {
-                format!("{} {}", ncode, sanitized)
+                sanitized
             }
         } else {
-            sanitize_filename(title)
+            sanitize_filename_with_limit(title, load_length_limit("folder-length-limit", Some(50)))
         }
     }
 
@@ -1581,13 +1598,14 @@ impl Downloader {
     }
 
     pub fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
+        self.fetcher.configure_rate_limiter(true);
         narou_api_batch_update(&mut self.fetcher)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Downloader;
+    use super::{Downloader, resolve_user_agent};
     use super::novel_info::NovelInfo;
     use super::site_setting::SiteSetting;
 
@@ -1595,6 +1613,22 @@ mod tests {
     fn sanitize_filename_removes_windows_trailing_dots_and_spaces() {
         assert_eq!(super::util::sanitize_filename("title. "), "title");
         assert_eq!(super::util::sanitize_filename("bad/name?"), "bad_name_");
+    }
+
+    #[test]
+    fn resolve_user_agent_prefers_cli_value_over_saved_value() {
+        assert_eq!(
+            resolve_user_agent(Some("cli-agent"), Some("saved-agent".to_string())),
+            "cli-agent"
+        );
+    }
+
+    #[test]
+    fn resolve_user_agent_uses_saved_value_when_cli_value_missing() {
+        assert_eq!(
+            resolve_user_agent(None, Some("saved-agent".to_string())),
+            "saved-agent"
+        );
     }
 
     #[test]

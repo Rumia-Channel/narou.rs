@@ -89,8 +89,21 @@ fn sanitize_filename_for_output(name: &str) -> String {
     if trimmed.is_empty() {
         "output".to_string()
     } else {
-        trimmed.chars().take(80).collect()
+        match output_filename_length_limit() {
+            Some(limit) => trimmed.chars().take(limit).collect(),
+            None => trimmed.to_string(),
+        }
     }
+}
+
+fn output_filename_length_limit() -> Option<usize> {
+    crate::compat::load_local_setting_value("ebook-filename-length-limit")
+        .and_then(|value| match value {
+            serde_yaml::Value::Number(number) => number.as_i64(),
+            serde_yaml::Value::String(raw) => raw.parse::<i64>().ok(),
+            _ => None,
+        })
+        .map(|limit| limit.max(0) as usize)
 }
 
 fn ensure_txt_extension(filename: &str) -> String {

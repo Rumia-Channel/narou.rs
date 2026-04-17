@@ -7,7 +7,7 @@ use super::fetch::HttpFetcher;
 use super::novel_info::NovelInfo;
 use super::site_setting::SiteSetting;
 use super::types::SubtitleInfo;
-use super::util::{pretreatment_source, sanitize_filename};
+use super::util::{load_length_limit, pretreatment_source, sanitize_filename, sanitize_filename_with_limit};
 
 pub fn fetch_toc(
     fetcher: &mut HttpFetcher,
@@ -39,6 +39,7 @@ pub fn parse_subtitles(
     let subtitles_pattern = setting
         .subtitles_pattern()
         .ok_or_else(|| NarouError::SiteSetting("No subtitles pattern defined".into()))?;
+    let filename_length_limit = load_length_limit("filename-length-limit", Some(50));
 
     let mut subtitles = Vec::new();
     let mut remaining = toc_source;
@@ -84,7 +85,14 @@ pub fn parse_subtitles(
             subdate
         };
 
-        let file_subtitle = sanitize_filename(&subtitle_raw);
+        let file_subtitle = match filename_length_limit {
+            Some(limit) => {
+                let reserved = index.chars().count() + 1;
+                let subtitle_limit = limit.saturating_sub(reserved);
+                sanitize_filename_with_limit(&subtitle_raw, Some(subtitle_limit))
+            }
+            None => sanitize_filename_with_limit(&subtitle_raw, None),
+        };
 
         subtitles.push(SubtitleInfo {
             index,
@@ -293,7 +301,13 @@ pub fn create_short_story_subtitles(
         chapter: String::new(),
         subchapter: String::new(),
         subtitle: title,
-        file_subtitle: sanitize_filename("短編"),
+        file_subtitle: match load_length_limit("filename-length-limit", Some(50)) {
+            Some(limit) => {
+                let reserved = "1".chars().count() + 1;
+                sanitize_filename_with_limit("短編", Some(limit.saturating_sub(reserved)))
+            }
+            None => sanitize_filename("短編"),
+        },
         subdate,
         subupdate,
         download_time: None,

@@ -596,7 +596,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 
 ## 8. 設定ページ (`/settings`)
 
-**Rust版: ✅ 実装済み (settings.js + settings.html)**
+**Rust版: ✅ 実装済み (settings.js + settings.html、保存した local/detail 設定の runtime 反映まで対応)**
 
 | 機能 | Ruby版 | Rust版 | 状態 |
 |------|--------|--------|------|
@@ -659,7 +659,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 **テーマ**: 6/6 ✅ (全ページCSS変数化、hardcoded色・px値なし)
 **API**: 71 実装済み / 4 未実装 (eject, download4ssl, download_request, downloadable.gif)
 **WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, TermColorLight色付き出力 ✅, 進捗バー ✅, DB自動更新+table.reload+tag.updateCanvas ✅, 履歴on-connect ✅, console.clear ✅, shutdown/reboot ✅, 起動時バージョン表示+未完了タスク警告 ✅, モーダル/メモ帳同期 ❌
-**設定ページ**: ✅ (`webui.performance-mode` の auto/on/off と `webui.table.reload-timing` の every/queue を反映)
+**設定ページ**: ✅ (`webui.performance-mode` / `webui.table.reload-timing` に加え、`download.interval` / `download.wait-steps` / `user-agent` / `guard-spoiler` / 各種 length-limit を runtime 反映)
 **言語切替**: ✅ (Rust独自)
 **レスポンシブ**: ✅
 **i18n 監査**: ✅ (JOB_TYPE_LABELS を Ruby版と完全一致に修正済み)

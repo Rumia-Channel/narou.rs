@@ -64,21 +64,46 @@ pub fn decode_numeric_entities(src: &mut String) {
         .to_string();
 }
 
-pub fn sanitize_filename(name: &str) -> String {
+pub fn load_length_limit(key: &str, default: Option<usize>) -> Option<usize> {
+    crate::compat::load_local_setting_value(key)
+        .and_then(|value| match value {
+            serde_yaml::Value::Number(number) => number.as_i64(),
+            serde_yaml::Value::String(raw) => raw.parse::<i64>().ok(),
+            _ => None,
+        })
+        .map(|limit| limit.max(0) as usize)
+        .or(default)
+}
+
+pub fn sanitize_filename_with_limit(name: &str, limit: Option<usize>) -> String {
     let invalid = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
-    name.chars()
-        .map(|c| if invalid.contains(&c) { '_' } else { c })
-        .collect::<String>()
+    let sanitized = name
         .chars()
-        .take(80)
-        .collect::<String>()
-        .trim_end_matches([' ', '.'])
-        .to_string()
+        .map(|c| if invalid.contains(&c) { '_' } else { c })
+        .collect::<String>();
+    let truncated = match limit {
+        Some(limit) => sanitized.chars().take(limit).collect::<String>(),
+        None => sanitized,
+    };
+    truncated.trim_end_matches([' ', '.']).to_string()
+}
+
+pub fn sanitize_filename(name: &str) -> String {
+    sanitize_filename_with_limit(name, Some(80))
+}
+
+pub fn mask_spoiler_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '0'..='9' | '０'..='９' | ' ' | '　' | '、' | '。' | '!' | '?' | '！' | '？' => ch,
+            _ => '●',
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::build_section_url;
+    use super::{build_section_url, mask_spoiler_text, sanitize_filename_with_limit};
     use crate::downloader::site_setting::SiteSetting;
 
     #[test]
@@ -96,5 +121,15 @@ mod tests {
             url,
             "http://www.mai-net.net/bbs/sst/sst.php?act=dump&cate=all&all=6858&n=0"
         );
+    }
+
+    #[test]
+    fn sanitize_filename_with_limit_truncates_after_sanitizing() {
+        assert_eq!(sanitize_filename_with_limit("ab/cd", Some(4)), "ab_c");
+    }
+
+    #[test]
+    fn mask_spoiler_text_preserves_digits_and_punctuation() {
+        assert_eq!(mask_spoiler_text("第12話!? テスト"), "●12●!? ●●●");
     }
 }

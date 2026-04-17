@@ -35,9 +35,13 @@ impl HttpFetcher {
             client,
             user_agent: user_agent.to_string(),
             tier_failures: HashMap::new(),
-            rate_limiter: RateLimiter::new(),
+            rate_limiter: RateLimiter::new(false),
             prefer_curl: false,
         })
+    }
+
+    pub fn configure_rate_limiter(&mut self, is_narou: bool) {
+        self.rate_limiter = RateLimiter::new(is_narou);
     }
 
     pub fn fetch_text(
