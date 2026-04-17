@@ -118,7 +118,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `--path` | `-p` | string | — | AozoraEpub3 フォルダ指定。`:keep` で既存再利用 |
 | `--line-height` | `-l` | float | 1.8 | 行の高さ (em) |
 
-**Rust 実装**: `src/commands/init.rs`。AozoraEpub3 設定に加え、`.narou/local_setting.yaml` には Ruby 互換の実効初期値として `download.interval`, `download.wait-steps`, `folder-length-limit`, `filename-length-limit`, `convert.dc-subject-exclude-tags`, `user-agent=auto` を不足分のみ補完する。
+**Rust 実装**: `src/commands/init.rs`。AozoraEpub3 設定に加え、`.narou/local_setting.yaml` には Ruby 互換の実効初期値として `download.interval`, `download.wait-steps`, `folder-length-limit`, `filename-length-limit`, `convert.dc-subject-exclude-tags`, `user-agent=auto` を不足分のみ補完する。AozoraEpub3 / mail 用の preset は repo 直下 `preset/` に同梱し、`init` / `mail` が `sample/narou/preset` に依存せず自己完結で動くようにした。
 
 ---
 

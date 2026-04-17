@@ -1,0 +1,29 @@
+### Narou.rb embedded custom chuki ###
+
+####カスタム注記
+二分アキ	<span class="half_em_space"></span>
+一字下げ	<div class="pt1">	</div>	1
+二字下げ	<div class="pt2">	</div>	1
+三字下げ	<div class="pt3">	</div>	1
+ここからパラメーター	<div class="custom_parameter_block">		1
+ここでパラメーター終わり	</div>		1
+ここから前書き	<div class="introduction">		1
+ここで前書き終わり	</div><div class="clear"></div>		1
+ここから後書き	<div class="postscript">		1
+ここで後書き終わり	</div><div class="clear"></div>		1
+濁点	<span class="dakuten">
+濁点終わり	</span>
+ここから柱	<div class="running_head yoko">		1
+ここで柱終わり	</div>		1
+zws	&#8203;
+
+### Narou.rb embedded custom chuki ###
+
+### Narou Bridge embedded custom chuki ###
+ｌｉｎｋ＿ｓ	<a href="
+link_s	<a href="
+ｌｉｎｋ＿ｔ	">
+link_t	">
+ｌｉｎｋ＿ｅ	</a>
+link_e	</a>
+### Narou Bridge embedded custom chuki ###

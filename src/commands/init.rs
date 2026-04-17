@@ -420,7 +420,7 @@ fn format_line_height(line_height: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_default_local_settings;
+    use super::{ensure_default_local_settings, rewrite_aozoraepub3_files};
 
     #[test]
     fn ensure_default_local_settings_writes_expected_defaults() {
@@ -459,6 +459,65 @@ mod tests {
             settings.get("user-agent"),
             Some(&serde_yaml::Value::String("custom-agent".to_string()))
         );
+    }
+
+    #[test]
+    fn rewrite_aozoraepub3_files_writes_expected_support_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let aozora_dir = temp.path();
+        std::fs::write(aozora_dir.join("AozoraEpub3.jar"), "").unwrap();
+        std::fs::write(aozora_dir.join("chuki_tag.txt"), "base\n").unwrap();
+
+        rewrite_aozoraepub3_files(aozora_dir.to_str().unwrap(), 1.8).unwrap();
+
+        let chuki = std::fs::read_to_string(aozora_dir.join("chuki_tag.txt")).unwrap();
+        assert!(chuki.contains("### Narou.rb embedded custom chuki ###"));
+        assert!(chuki.contains("custom_parameter_block"));
+
+        assert!(aozora_dir.join("AozoraEpub3.ini").exists());
+
+        let vertical = std::fs::read_to_string(
+            aozora_dir
+                .join("template")
+                .join("OPS")
+                .join("css_custom")
+                .join("vertical_font.css"),
+        )
+        .unwrap();
+        assert!(vertical.contains("line-height: 1.8em !important;"));
+    }
+
+    #[test]
+    fn rewrite_aozoraepub3_files_replaces_existing_embedded_block() {
+        let temp = tempfile::tempdir().unwrap();
+        let aozora_dir = temp.path();
+        std::fs::write(aozora_dir.join("AozoraEpub3.jar"), "").unwrap();
+        std::fs::write(
+            aozora_dir.join("chuki_tag.txt"),
+            "before\n### Narou.rb embedded custom chuki ###\nold\n### Narou.rb embedded custom chuki ###\nafter\n",
+        )
+        .unwrap();
+
+        rewrite_aozoraepub3_files(aozora_dir.to_str().unwrap(), 1.6).unwrap();
+
+        let chuki = std::fs::read_to_string(aozora_dir.join("chuki_tag.txt")).unwrap();
+        assert!(!chuki.contains("\nold\n"));
+        assert_eq!(
+            chuki.matches("### Narou.rb embedded custom chuki ###").count(),
+            2
+        );
+        assert!(chuki.contains("before\n"));
+        assert!(chuki.contains("\nafter\n"));
+    }
+
+    #[test]
+    fn preset_dir_prefers_repo_root_preset_directory() {
+        let path = super::preset_dir().unwrap();
+        let expected = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("preset");
+        assert_eq!(path, expected);
+        assert!(path.join("AozoraEpub3.ini").exists());
+        assert!(path.join("custom_chuki_tag.txt").exists());
+        assert!(path.join("vertical_font.css").exists());
     }
 }
 
