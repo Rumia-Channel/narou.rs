@@ -33,7 +33,7 @@ export const State = {
   filterText: '',
 
   // View flags (persisted to localStorage)
-  viewFrozen: lsBool('view-frozen', false),
+  viewFrozen: lsBool('view-frozen', true),
   viewNonfrozen: lsBool('view-nonfrozen', true),
   wideMode: lsBool('wide-mode', false),
   settingNewTab: lsBool('setting-new-tab', false),
