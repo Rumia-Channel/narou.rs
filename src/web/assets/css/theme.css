@@ -117,6 +117,28 @@
   --table-cell-padding: 0.25rem;
   --base-font-size: 87.5%;
   --base-line-height: 1.45;
+  --content-max-width: 104em;
+  --table-col-id-width: 3.5em;
+  --table-col-date-width: 8.75em;
+  --table-col-title-min-width: 14em;
+  --table-col-author-width: 8.5em;
+  --table-col-site-width: 6.5em;
+  --table-col-novel-type-width: 3.5em;
+  --table-col-tags-width: 10em;
+  --table-col-episodes-width: 4.5em;
+  --table-col-length-width: 6em;
+  --table-col-average-length-width: 6em;
+  --table-col-episodes-reflow-extra: 4ch;
+  --table-col-title-reflow-extra: 3em;
+  --table-col-author-reflow-extra: 2em;
+  --table-col-site-reflow-extra: 1em;
+  --table-col-status-width: 6em;
+  --table-col-url-width: 3.25em;
+  --table-col-download-width: 3em;
+  --table-col-folder-width: 3em;
+  --table-col-update-action-width: 3em;
+  --table-col-story-width: 3em;
+  --table-col-menu-width: 3em;
 }
 
 /* Dark themes */

@@ -68,6 +68,8 @@ pub async fn edit_menu_page() -> Html<String> {
 }
 
 pub async fn asset(Path(path): Path<String>) -> Response {
+    // WEB UI assets are embedded at compile time, so this routing table must stay
+    // aligned with the files under src/web/assets/.
     let (content_type, body) = match path.as_str() {
         "css/theme.css" => (
             "text/css; charset=utf-8",
@@ -139,6 +141,14 @@ pub async fn asset(Path(path): Path<String>) -> Response {
                 "assets/fonts/Material_Symbols/MaterialSymbolsOutlined-VariableFont_FILL,GRAD,opsz,wght.ttf"
             )
             .as_slice(),
+        ),
+        "fonts/FORMUDPGothic/FORMUDPGothic-Regular.ttf" => (
+            "font/ttf",
+            include_bytes!("assets/fonts/FORMUDPGothic/FORMUDPGothic-Regular.ttf").as_slice(),
+        ),
+        "fonts/FORMUDPGothic/FORMUDPGothic-Bold.ttf" => (
+            "font/ttf",
+            include_bytes!("assets/fonts/FORMUDPGothic/FORMUDPGothic-Bold.ttf").as_slice(),
         ),
         _ => {
             return (

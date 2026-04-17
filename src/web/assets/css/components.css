@@ -262,6 +262,7 @@ li.enable-selected.disabled a {
   white-space: nowrap;
   cursor: default;
   user-select: none;
+  text-align: center;
 }
 
 .table thead th.sortable {
@@ -317,21 +318,25 @@ li.enable-selected.disabled a {
 }
 
 /* Column widths */
-.col-id { width: 3em; text-align: right; }
-.col-update { width: 7.5em; white-space: nowrap; text-align: center; }
-.col-general-lastup { width: 7.5em; white-space: nowrap; text-align: center; }
-.col-last-check { width: 7.5em; white-space: nowrap; text-align: center; }
-.col-title { min-width: 10em; }
-.col-author { width: 7em; }
-.col-site { width: 5em; }
-.col-novel-type { width: 3em; text-align: center; }
-.col-tags { width: 8em; }
-.col-episodes { width: 4em; text-align: center; }
-.col-length { width: 5em; text-align: right; }
-.col-status { width: 5em; }
-.col-url { width: 3em; text-align: center; }
-.col-story { width: 2.5em; text-align: center; }
-.col-menu { width: 2.5em; text-align: center; }
+.col-id { width: var(--table-col-id-width); text-align: center; }
+.col-update { width: var(--table-col-date-width); white-space: nowrap; text-align: center; }
+.col-general-lastup { width: var(--table-col-date-width); white-space: nowrap; text-align: center; }
+.col-last-check { width: var(--table-col-date-width); white-space: nowrap; text-align: center; }
+.col-title { min-width: var(--table-col-title-min-width); }
+.col-author { width: var(--table-col-author-width); }
+.col-site { width: var(--table-col-site-width); }
+.col-novel-type { width: var(--table-col-novel-type-width); text-align: center; }
+.col-tags { width: var(--table-col-tags-width); }
+.col-episodes { width: var(--table-col-episodes-width); text-align: center; }
+.col-length { width: var(--table-col-length-width); text-align: right; }
+.col-average-length { width: var(--table-col-average-length-width); text-align: right; }
+.col-status { width: var(--table-col-status-width); text-align: center; }
+.col-url { width: var(--table-col-url-width); text-align: center; }
+.col-download { width: var(--table-col-download-width); text-align: center; }
+.col-folder { width: var(--table-col-folder-width); text-align: center; }
+.col-update-action { width: var(--table-col-update-action-width); text-align: center; }
+.col-story { width: var(--table-col-story-width); text-align: center; }
+.col-menu { width: var(--table-col-menu-width); text-align: center; }
 
 .date-cell {
   display: flex;
@@ -367,9 +372,10 @@ li.enable-selected.disabled a {
   display: inline-block;
 }
 
+.date-cell-date,
 .date-cell-time,
 .date-cell-extra {
-  font-size: 0.85em;
+  font-size: 1em;
 }
 
 .date-cell-label {
@@ -384,6 +390,9 @@ li.enable-selected.disabled a {
 .btn-story:hover { background: var(--dropdown-hover-bg); }
 
 .btn-story .material-symbols-outlined,
+.btn-download .material-symbols-outlined,
+.btn-folder .material-symbols-outlined,
+.btn-update-action .material-symbols-outlined,
 .btn-menu-icon .material-symbols-outlined,
 .btn-link-icon .material-symbols-outlined {
   font-size: 1em;
@@ -943,6 +952,22 @@ li.enable-selected.disabled a {
 .container-main.wide-mode {
   max-width: none !important;
   width: 100% !important;
+}
+
+#novel-list.episodes-width-target .col-episodes {
+  width: calc(var(--table-col-episodes-width) + var(--table-col-episodes-reflow-extra));
+}
+
+#novel-list.episodes-width-target .col-title {
+  min-width: calc(var(--table-col-title-min-width) + var(--table-col-title-reflow-extra));
+}
+
+#novel-list.episodes-width-target .col-author {
+  width: calc(var(--table-col-author-width) + var(--table-col-author-reflow-extra));
+}
+
+#novel-list.episodes-width-target .col-site {
+  width: calc(var(--table-col-site-width) + var(--table-col-site-reflow-extra));
 }
 
 /* ========== Modal size variants ========== */

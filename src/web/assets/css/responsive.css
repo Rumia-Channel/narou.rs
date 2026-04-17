@@ -83,18 +83,6 @@
     -webkit-overflow-scrolling: touch;
   }
 
-  /* Hide less-important columns on tablet (narou.rb hides most on touch) */
-  .col-general-lastup,
-  .col-last-check,
-  .col-author,
-  .col-site,
-  .col-novel-type,
-  .col-length,
-  .col-status,
-  .col-url {
-    display: none;
-  }
-
   .modal-dialog {
     max-width: 100%;
   }
@@ -108,13 +96,6 @@
 
   .navbar-brand {
     font-size: 1rem;
-  }
-
-  /* On phone: only show ID, title, episodes, menu */
-  .col-update,
-  .col-tags,
-  .col-episodes {
-    display: none;
   }
 
   .console {
@@ -132,7 +113,7 @@
   }
 
   .container-main {
-    max-width: 80em;
+    max-width: var(--content-max-width);
     margin-left: auto;
     margin-right: auto;
   }
@@ -140,7 +121,7 @@
   /* In wide mode, only the novel table expands; console and controls stay constrained */
   .container-main.wide-mode > #console-container,
   .container-main.wide-mode > #control-panel {
-    max-width: calc(80em - 2 * var(--container-padding));
+    max-width: calc(var(--content-max-width) - 2 * var(--container-padding));
     margin-left: auto;
     margin-right: auto;
   }

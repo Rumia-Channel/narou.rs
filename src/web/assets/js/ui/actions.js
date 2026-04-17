@@ -19,6 +19,8 @@ import {
 const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
 
 export function bindActions() {
+  applyColumnVisibility();
+
   // --- Navbar toggle (mobile) ---
   El.navbarToggleBtn?.addEventListener('click', () => {
     El.navbarCollapse?.classList.toggle('open');
@@ -112,6 +114,7 @@ export function bindActions() {
     State.wideMode = !State.wideMode;
     lsSet('wide-mode', String(State.wideMode));
     syncViewChecks();
+    applyColumnVisibility();
   });
 
   on('action-view-nonfrozen', () => {
@@ -149,7 +152,7 @@ export function bindActions() {
   });
 
   on('action-view-reset', () => {
-    State.viewFrozen = false;
+    State.viewFrozen = true;
     State.viewNonfrozen = true;
     State.wideMode = false;
     State.settingNewTab = false;
@@ -160,7 +163,7 @@ export function bindActions() {
       localStorage.removeItem('narou-rs-webui-' + k)
     );
     localStorage.removeItem('menu_style');
-    setHiddenCols([]);
+    clearHiddenColsPreference();
     applyColumnVisibility();
     syncViewChecks();
     renderNovelList();
@@ -315,7 +318,7 @@ export function bindActions() {
     El.colvisList?.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = false);
   });
   on('colvis-reset', () => {
-    El.colvisList?.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = true);
+    resetColvisCheckboxesToDefault();
   });
 
   // --- Confirm modal ---
@@ -617,6 +620,7 @@ export function bindActions() {
       State.wideMode = !State.wideMode;
       lsSet('wide-mode', String(State.wideMode));
       syncViewChecks();
+      applyColumnVisibility();
     },
     viewFrozen: () => {
       State.viewFrozen = !State.viewFrozen;
@@ -998,23 +1002,78 @@ const COLVIS_COLUMNS = [
   { cls: 'col-tags', label: 'タグ' },
   { cls: 'col-episodes', label: '話数' },
   { cls: 'col-length', label: '文字数' },
+  { cls: 'col-average-length', label: '平均文字数' },
   { cls: 'col-status', label: '状態' },
   { cls: 'col-url', label: 'リンク' },
+  { cls: 'col-download', label: 'ＤＬ' },
+  { cls: 'col-folder', label: '保存先' },
+  { cls: 'col-update-action', label: '更新' },
   { cls: 'col-story', label: 'あらすじ' },
   { cls: 'col-menu', label: '個別' },
 ];
 
-// title is always visible — not in the list
-const COLVIS_DEFAULT = COLVIS_COLUMNS.map(c => c.cls);
+const COLVIS_STORAGE_KEY = 'narou-rs-webui-hidden-cols';
+const COLVIS_DEFAULT_VISIBLE_DESKTOP = new Set([
+  'col-id',
+  'col-update',
+  'col-general-lastup',
+  'col-author',
+  'col-site',
+  'col-tags',
+  'col-status',
+  'col-url',
+  'col-folder',
+  'col-update-action',
+  'col-menu',
+]);
+const COLVIS_DEFAULT_VISIBLE_NARROW = new Set([
+  'col-download',
+  'col-menu',
+]);
+
+function getDefaultVisibleCols() {
+  if (window.matchMedia('(max-width: 48em)').matches) {
+    return COLVIS_DEFAULT_VISIBLE_NARROW;
+  }
+  return COLVIS_DEFAULT_VISIBLE_DESKTOP;
+}
+
+function getDefaultHiddenCols() {
+  const visible = getDefaultVisibleCols();
+  return COLVIS_COLUMNS
+    .map(col => col.cls)
+    .filter(cls => !visible.has(cls));
+}
 
 function getHiddenCols() {
-  const raw = localStorage.getItem('narou-rs-webui-hidden-cols');
-  if (!raw) return [];
-  try { return JSON.parse(raw); } catch { return []; }
+  const raw = localStorage.getItem(COLVIS_STORAGE_KEY);
+  if (raw === null) return getDefaultHiddenCols();
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      const allowed = new Set(COLVIS_COLUMNS.map(col => col.cls));
+      return parsed.filter(cls => allowed.has(cls));
+    }
+  } catch { /* ignore */ }
+  return getDefaultHiddenCols();
 }
 
 function setHiddenCols(arr) {
-  localStorage.setItem('narou-rs-webui-hidden-cols', JSON.stringify(arr));
+  const allowed = new Set(COLVIS_COLUMNS.map(col => col.cls));
+  const sanitized = arr.filter(cls => allowed.has(cls));
+  localStorage.setItem(COLVIS_STORAGE_KEY, JSON.stringify(sanitized));
+}
+
+function clearHiddenColsPreference() {
+  localStorage.removeItem(COLVIS_STORAGE_KEY);
+}
+
+function updateEpisodesWidthTarget(hidden = new Set(getHiddenCols())) {
+  const table = El.novelList;
+  if (!table) return;
+  const expandEpisodes = hidden.has('col-length')
+    && hidden.has('col-average-length');
+  table.classList.toggle('episodes-width-target', expandEpisodes);
 }
 
 function applyColumnVisibility() {
@@ -1025,6 +1084,7 @@ function applyColumnVisibility() {
     document.head.appendChild(s);
     return s;
   })();
+  updateEpisodesWidthTarget(hidden);
   if (hidden.size === 0) {
     style.textContent = '';
     return;
@@ -1054,6 +1114,13 @@ function openColvisModal() {
   }
 
   El.colvisModal?.classList.remove('hide');
+}
+
+function resetColvisCheckboxesToDefault() {
+  const hidden = new Set(getDefaultHiddenCols());
+  El.colvisList?.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    cb.checked = !hidden.has(cb.dataset.col);
+  });
 }
 
 function openMenuStyleModal() {

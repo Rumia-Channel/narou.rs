@@ -193,6 +193,9 @@ function stripFilterQuotes(value) {
 function matchFilterToken(novel, token) {
   const target = (text) => String(text || '').toLowerCase();
   const tags = (novel.tags || []).map(tag => target(tag));
+  const statusText = target(getStatusText(novel));
+  const novelTypeText = target(getNovelTypeText(novel));
+  const averageLength = getAverageLengthValue(novel);
   let matched = false;
   const values = token.value.split('|').map(v => v.trim()).filter(Boolean);
   const matchAny = (predicate) => values.some(predicate);
@@ -200,7 +203,12 @@ function matchFilterToken(novel, token) {
     target(novel.title),
     target(novel.author),
     target(novel.sitename),
+    novelTypeText,
+    statusText,
     String(novel.id),
+    String(getEpisodeCount(novel)),
+    String(novel.length || ''),
+    String(averageLength || ''),
     ...tags,
   ].join(' ');
 
@@ -258,6 +266,7 @@ function sortNovels(novels) {
       case 'novel_type': return n.novel_type || 0;
       case 'general_all_no': return n.general_all_no || 0;
       case 'length': return n.length || 0;
+      case 'average_length': return getAverageLengthValue(n);
       default: return '';
     }
   };
@@ -320,10 +329,7 @@ function createRow(novel, rowIndex) {
   const tagsHtml = renderTags(novel.tags || []);
 
   // Status
-  const statusParts = [];
-  if (novel.end === false || novel.end === 0) statusParts.push('連載中');
-  else if (novel.end === true || novel.end === 1) statusParts.push('完結');
-  if (novel.suspend === true) statusParts.push('中断');
+  const statusText = getStatusText(novel);
 
   // TOC URL link button
   const tocUrl = novel.toc_url || '';
@@ -332,35 +338,46 @@ function createRow(novel, rowIndex) {
     : '';
 
   // Episode count with "話" suffix (narou.rb style)
-  const episodes = novel.general_all_no != null ? novel.general_all_no : 0;
-  const episodesText = episodes ? episodes + '話' : '';
+  const episodes = getEpisodeCount(novel);
+  const episodesText = episodes + '話';
 
   // Character count with "字" suffix (narou.rb style)
   const charCount = novel.length;
   const lengthText = charCount != null && charCount > 0 ? unitizeNumeric(charCount) + '字' : '';
 
+  // Average characters per episode (narou.rb style)
+  const averageLength = getAverageLengthValue(novel);
+  const averageLengthText = averageLength > 0 ? averageLength.toLocaleString() : '';
+
   // Novel type
-  const novelTypeText = novel.novel_type === 2 ? '短編' : '';
+  const novelTypeText = getNovelTypeText(novel);
 
   // Menu button (opens context menu) — glyphicon-option-horizontal equivalent
+  const downloadLink = `<a href="/novels/${encodeURIComponent(String(novel.id))}/download" class="row-action-btn btn-download" title="書籍データをダウンロード">${materialIcon('download', 'icon-only')}</a>`;
+  const folderBtn = `<button class="row-action-btn btn-folder" data-folder-id="${novel.id}" type="button" title="保存先を開く">${materialIcon('folder_open', 'icon-only')}</button>`;
+  const updateBtn = `<button class="row-action-btn btn-update-action" data-update-id="${novel.id}" type="button" title="凍結済みでも更新">${materialIcon('refresh', 'icon-only')}</button>`;
   const menuBtn = `<button class="row-action-btn btn-menu-icon" data-menu-id="${novel.id}" type="button" title="個別メニュー">${materialIcon('more_horiz', 'icon-only')}</button>`;
 
   tr.innerHTML = `
-    <td class="col-id">${esc(idText)}</td>
+    <td class="col-id" style="text-align:center">${esc(idText)}</td>
     <td class="col-update">${updateCell}</td>
     <td class="col-general-lastup">${glCell}</td>
     <td class="col-last-check">${checkCell}</td>
     <td class="col-title">${esc(novel.title || '')}</td>
     <td class="col-author"><span class="filterable" data-filter="${esc(novel.author || '')}">${esc(novel.author || '')}</span></td>
     <td class="col-site"><span class="filterable" data-filter="${esc(novel.sitename || '')}">${esc(novel.sitename || '')}</span></td>
-    <td class="col-novel-type">${novelTypeText}</td>
+    <td class="col-novel-type" style="text-align:center">${novelTypeText}</td>
     <td class="col-tags">${tagsHtml}</td>
-    <td class="col-episodes">${episodesText}</td>
+    <td class="col-episodes" style="text-align:center">${episodesText}</td>
     <td class="col-length">${lengthText}</td>
-    <td class="col-status">${statusParts.join(', ')}</td>
-    <td class="col-url">${tocLink}</td>
-    <td class="col-story"><button class="row-action-btn btn-story" data-story-id="${novel.id}" type="button" title="あらすじ">${materialIcon('info', 'icon-only')}</button></td>
-    <td class="col-menu">${menuBtn}</td>
+    <td class="col-average-length">${averageLengthText}</td>
+    <td class="col-status" style="text-align:center">${esc(statusText)}</td>
+    <td class="col-url" style="text-align:center">${tocLink}</td>
+    <td class="col-download" style="text-align:center">${downloadLink}</td>
+    <td class="col-folder" style="text-align:center">${folderBtn}</td>
+    <td class="col-update-action" style="text-align:center">${updateBtn}</td>
+    <td class="col-story" style="text-align:center"><button class="row-action-btn btn-story" data-story-id="${novel.id}" type="button" title="あらすじ">${materialIcon('info', 'icon-only')}</button></td>
+    <td class="col-menu" style="text-align:center">${menuBtn}</td>
   `;
 
   // Bind per-row menu button
@@ -369,6 +386,36 @@ function createRow(novel, rowIndex) {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       showContextMenu(e, novel.id);
+    });
+  }
+
+  const folder = tr.querySelector('.btn-folder');
+  if (folder) {
+    folder.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try {
+        const result = await postJson('/api/folder', { targets: [String(novel.id)] });
+        if (result?.success === false) {
+          showNotification(result.message || '保存先を開けませんでした', 'warning');
+        }
+      } catch {
+        showNotification('保存先を開けませんでした', 'warning');
+      }
+    });
+  }
+
+  const update = tr.querySelector('.btn-update-action');
+  if (update) {
+    update.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try {
+        const result = await postJson('/api/update', { targets: [String(novel.id)], force: true });
+        if (result?.success === false) {
+          showNotification(result.message || '更新ジョブを追加できませんでした', 'warning');
+        }
+      } catch {
+        showNotification('更新ジョブを追加できませんでした', 'warning');
+      }
     });
   }
 
@@ -563,6 +610,31 @@ function updateSelectionBadge() {
     const count = State.selectedIds.size;
     El.badgeSelecting.textContent = count > 0 ? String(count) : '0';
   }
+}
+
+function getEpisodeCount(novel) {
+  return Number.isFinite(Number(novel.general_all_no)) ? Number(novel.general_all_no) : 0;
+}
+
+function getAverageLengthValue(novel) {
+  const episodes = getEpisodeCount(novel);
+  const length = Number(novel.length || 0);
+  if (episodes <= 0 || length <= 0) return 0;
+  return Math.floor(length / episodes);
+}
+
+function getNovelTypeText(novel) {
+  return Number(novel.novel_type) === 2 ? '短編' : '連載';
+}
+
+function getStatusText(novel) {
+  const tags = Array.isArray(novel.tags) ? novel.tags : [];
+  const status = [];
+  if (novel.frozen) status.push('凍結');
+  if (tags.includes('end') || novel.end === true || novel.end === 1) status.push('完結');
+  if (tags.includes('404')) status.push('削除');
+  if (novel.suspend === true) status.push('中断');
+  return status.join(', ');
 }
 
 export function updateEnableSelected() {

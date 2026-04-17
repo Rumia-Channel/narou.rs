@@ -38,12 +38,26 @@ html {
 body {
   margin: 0;
   padding-top: var(--navbar-height);
-  font-family: "Helvetica Neue", Helvetica, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", Arial, sans-serif;
+  font-family: "FORM UDPGothic", "Hiragino Sans", "Yu Gothic UI", "Segoe UI", Helvetica, Arial, sans-serif;
   font-size: var(--base-font-size);
   line-height: var(--base-line-height);
   color: var(--text-color);
   background-color: var(--body-bg);
   overflow-y: scroll;
+}
+
+@font-face {
+  font-family: "FORM UDPGothic";
+  src: url("/assets/fonts/FORMUDPGothic/FORMUDPGothic-Regular.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 400;
+}
+
+@font-face {
+  font-family: "FORM UDPGothic";
+  src: url("/assets/fonts/FORMUDPGothic/FORMUDPGothic-Bold.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 700;
 }
 
 @font-face {
