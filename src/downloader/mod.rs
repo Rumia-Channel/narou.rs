@@ -689,6 +689,10 @@ impl Downloader {
     ) -> Result<DownloadResult> {
         let (existing_id, setting) = self.resolve_target_for_download(target)?;
         self.fetcher.configure_rate_limiter(setting.is_narou);
+        let provisional_id = match existing_id {
+            Some(id) => id,
+            None => crate::db::with_database(|db| Ok(db.create_new_id()))?,
+        };
 
         let db_toc_url = if let Some(id) = existing_id {
             crate::db::with_database(|db| Ok(db.get(id).map(|r| r.toc_url.clone())))
@@ -716,7 +720,7 @@ impl Downloader {
             if !crate::compat::confirm("年齢認証：あなたは18歳以上ですか", false, false)
             {
                 return Ok(DownloadResult {
-                    id: existing_id.unwrap_or(0),
+                    id: provisional_id,
                     title: String::new(),
                     author: String::new(),
                     novel_dir: PathBuf::new(),
@@ -831,7 +835,7 @@ impl Downloader {
                 subtitles.len(),
             )? {
                 return Ok(DownloadResult {
-                    id: existing_id.unwrap_or(0),
+                    id: provisional_id,
                     title: title_for_digest,
                     author: if author.is_empty() {
                         old_author.clone().unwrap_or_default()
@@ -867,7 +871,7 @@ impl Downloader {
         let strong_update = load_local_setting_bool("update.strong");
         let mut cache_dir: Option<PathBuf> = None;
         let mut pending_section_hashes: HashMap<String, String> = HashMap::new();
-        let display_id = existing_id.unwrap_or(0);
+        let display_id = provisional_id;
         let mut section_plans = Vec::with_capacity(subtitles.len());
         let mut download_count = 0usize;
         let guard_spoiler = load_local_setting_bool("guard-spoiler");
@@ -1091,7 +1095,7 @@ impl Downloader {
         ensure_default_files(&novel_dir, &toc_title, &toc_author, &toc_url);
 
         let record = NovelRecord {
-            id: existing_id.unwrap_or(0),
+            id: provisional_id,
             author: toc_author.clone(),
             title: toc_title.clone(),
             file_title: file_title.clone(),
@@ -1178,7 +1182,7 @@ impl Downloader {
                     db.insert(updated);
                     eid
                 } else {
-                    let new_id = db.create_new_id();
+                    let new_id = provisional_id;
                     let mut rec = record;
                     rec.id = new_id;
                     rec.tags = merged_tags.clone();
