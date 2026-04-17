@@ -383,6 +383,12 @@ li.enable-selected.disabled a {
 }
 .btn-story:hover { background: var(--dropdown-hover-bg); }
 
+.btn-story .material-symbols-outlined,
+.btn-menu-icon .material-symbols-outlined,
+.btn-link-icon .material-symbols-outlined {
+  font-size: 1em;
+}
+
 .story-popover {
   position: absolute; z-index: 10000;
   background: var(--dropdown-bg); border: 0.05em solid var(--dropdown-border); border-radius: var(--border-radius);
@@ -744,6 +750,17 @@ li.enable-selected.disabled a {
   flex-shrink: 0;
   width: 1.20em;
   text-align: center;
+}
+
+.queue-task-icon .material-symbols-outlined,
+.queue-task-cancel .material-symbols-outlined,
+.queue-task-up .material-symbols-outlined,
+.queue-task-down .material-symbols-outlined,
+.queue-task-delete .material-symbols-outlined,
+.btn-diff-clean .material-symbols-outlined,
+.filter-search-icon .material-symbols-outlined,
+.move-to-top .material-symbols-outlined {
+  font-size: 1em;
 }
 
 .queue-task-label {

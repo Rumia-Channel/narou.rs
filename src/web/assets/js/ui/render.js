@@ -21,6 +21,13 @@ const ANNOTATION_COLOR_TIME_LIMIT_MS = 6 * 60 * 60 * 1000;
 let selectionDrag = null;
 let queueDragTaskId = null;
 
+function materialIcon(name, extraClass = '') {
+  const cls = extraClass
+    ? `material-symbols-outlined ${extraClass}`
+    : 'material-symbols-outlined';
+  return `<span class="${cls}" aria-hidden="true">${name}</span>`;
+}
+
 /* ===== Rendering ===== */
 
 export function renderNovelList() {
@@ -321,7 +328,7 @@ function createRow(novel, rowIndex) {
   // TOC URL link button
   const tocUrl = novel.toc_url || '';
   const tocLink = tocUrl
-    ? `<a href="${esc(tocUrl)}" target="_blank" rel="noopener" class="btn-link-icon" title="${esc(tocUrl)}">&#x1F517;</a>`
+    ? `<a href="${esc(tocUrl)}" target="_blank" rel="noopener" class="btn-link-icon" title="${esc(tocUrl)}">${materialIcon('link', 'icon-only')}</a>`
     : '';
 
   // Episode count with "話" suffix (narou.rb style)
@@ -336,7 +343,7 @@ function createRow(novel, rowIndex) {
   const novelTypeText = novel.novel_type === 2 ? '短編' : '';
 
   // Menu button (opens context menu) — glyphicon-option-horizontal equivalent
-  const menuBtn = `<button class="row-action-btn btn-menu-icon" data-menu-id="${novel.id}" type="button" title="個別メニュー">⋯</button>`;
+  const menuBtn = `<button class="row-action-btn btn-menu-icon" data-menu-id="${novel.id}" type="button" title="個別メニュー">${materialIcon('more_horiz', 'icon-only')}</button>`;
 
   tr.innerHTML = `
     <td class="col-id">${esc(idText)}</td>
@@ -352,7 +359,7 @@ function createRow(novel, rowIndex) {
     <td class="col-length">${lengthText}</td>
     <td class="col-status">${statusParts.join(', ')}</td>
     <td class="col-url">${tocLink}</td>
-    <td class="col-story"><button class="row-action-btn btn-story" data-story-id="${novel.id}" type="button" title="あらすじ">ℹ</button></td>
+    <td class="col-story"><button class="row-action-btn btn-story" data-story-id="${novel.id}" type="button" title="あらすじ">${materialIcon('info', 'icon-only')}</button></td>
     <td class="col-menu">${menuBtn}</td>
   `;
 
@@ -678,18 +685,20 @@ function formatTaskTime(epoch) {
 function renderTaskItem(task, isRunning, idx, total) {
   const label = JOB_TYPE_LABELS[task.type] || task.type;
   const time = formatTaskTime(task.created_at);
-  const icon = isRunning ? '&#x25B6;' : '&#x23F3;';
+  const icon = isRunning
+    ? materialIcon('play_arrow', 'icon-only')
+    : materialIcon('schedule', 'icon-only');
   let actionBtns = '';
   if (isRunning) {
-    actionBtns = `<button class="queue-task-cancel" data-task-id="${esc(task.id)}" title="中止">&#x23F9;</button>`;
+    actionBtns = `<button class="queue-task-cancel" data-task-id="${esc(task.id)}" title="中止">${materialIcon('stop', 'icon-only')}</button>`;
   } else {
     const upBtn = idx > 0
-      ? `<button class="queue-task-up" data-task-idx="${idx}" title="上へ">&#x25B2;</button>`
-      : `<button class="queue-task-up" disabled title="上へ">&#x25B2;</button>`;
+      ? `<button class="queue-task-up" data-task-idx="${idx}" title="上へ">${materialIcon('keyboard_arrow_up', 'icon-only')}</button>`
+      : `<button class="queue-task-up" disabled title="上へ">${materialIcon('keyboard_arrow_up', 'icon-only')}</button>`;
     const downBtn = idx < total - 1
-      ? `<button class="queue-task-down" data-task-idx="${idx}" title="下へ">&#x25BC;</button>`
-      : `<button class="queue-task-down" disabled title="下へ">&#x25BC;</button>`;
-    actionBtns = `${upBtn}${downBtn}<button class="queue-task-delete" data-task-id="${esc(task.id)}" title="削除">&#x1F5D1;</button>`;
+      ? `<button class="queue-task-down" data-task-idx="${idx}" title="下へ">${materialIcon('keyboard_arrow_down', 'icon-only')}</button>`
+      : `<button class="queue-task-down" disabled title="下へ">${materialIcon('keyboard_arrow_down', 'icon-only')}</button>`;
+    actionBtns = `${upBtn}${downBtn}<button class="queue-task-delete" data-task-id="${esc(task.id)}" title="削除">${materialIcon('delete', 'icon-only')}</button>`;
   }
   return `<div class="queue-task-item${isRunning ? ' queue-running' : ''}" data-task-id="${esc(task.id)}"${isRunning ? '' : ' draggable="true"'}>
     <span class="queue-task-icon">${icon}</span>

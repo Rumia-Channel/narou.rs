@@ -214,6 +214,9 @@ hr.console-hr {
 }
 
 .console-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   background: rgba(255, 255, 255, 0.15);
   border: none;
   color: var(--console-text);
@@ -264,6 +267,9 @@ hr.console-hr {
 }
 
 .queue-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   font-size: 1.10em;
 }
 

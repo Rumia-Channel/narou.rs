@@ -907,7 +907,7 @@ async function openDiffList(ids) {
         `<div class="diff-entry" data-diff-id="${escHtml(String(d.id))}">
           <div class="diff-header">
             <h5>${escHtml(d.title || d.id)}</h5>
-            <button class="btn btn-sm btn-diff-clean" data-id="${escHtml(String(d.id))}" title="差分キャッシュを削除">🗑 クリア</button>
+            <button class="btn btn-sm btn-diff-clean" data-id="${escHtml(String(d.id))}" title="差分キャッシュを削除"><span class="material-symbols-outlined icon-leading" aria-hidden="true">delete</span>クリア</button>
           </div>
           <pre class="diff-content">${escHtml(d.content || 'No diff')}</pre>
         </div>`

@@ -98,18 +98,18 @@
           </ul>
           <!-- Right nav items -->
           <ul class="nav navbar-nav navbar-right">
-            <!-- Options (⚙) -->
+            <!-- Options -->
             <li class="dropdown">
               <a class="dropdown-toggle" href="#" data-dropdown="options-menu">
-                <span class="icon-cog hidden-xs">&#x2699;</span>
+                <span class="icon-cog hidden-xs"><span class="material-symbols-outlined icon-only" aria-hidden="true">settings</span></span>
                 <span class="visible-xs-inline" data-i18n="menuOption">オプション</span>
                 <span class="caret"></span>
               </a>
               <ul class="dropdown-menu dropdown-menu-right" id="options-menu">
-                <li><a href="#" id="action-option-settings">&#x1F527; 環境設定...</a></li>
+                <li><a href="#" id="action-option-settings"><span class="material-symbols-outlined icon-leading" aria-hidden="true">build</span>環境設定...</a></li>
                 <li class="divider"></li>
-                <li><a href="#" id="action-option-help">&#x2753; ヘルプ...</a></li>
-                <li><a href="#" id="action-option-about">&#x2139;&#xFE0F; Narou.rs について</a></li>
+                <li><a href="#" id="action-option-help"><span class="material-symbols-outlined icon-leading" aria-hidden="true">help</span>ヘルプ...</a></li>
+                <li><a href="#" id="action-option-about"><span class="material-symbols-outlined icon-leading" aria-hidden="true">info</span>Narou.rs について</a></li>
                 <li class="divider"></li>
                 <li><a href="#" id="action-lang-toggle"><span id="lang-label">Language: 日本語 ↔ English</span></a></li>
                 <li class="divider"></li>
@@ -127,14 +127,14 @@
                   </div>
                 </li>
                 <li class="divider"></li>
-                <li><a href="#" id="action-option-server-reboot">&#x1F504; サーバを再起動</a></li>
-                <li><a href="#" id="action-option-shutdown">&#x23FB; サーバをシャットダウン</a></li>
+                <li><a href="#" id="action-option-server-reboot"><span class="material-symbols-outlined icon-leading" aria-hidden="true">sync</span>サーバを再起動</a></li>
+                <li><a href="#" id="action-option-shutdown"><span class="material-symbols-outlined icon-leading" aria-hidden="true">power_settings_new</span>サーバをシャットダウン</a></li>
               </ul>
             </li>
           </ul>
           <!-- Queue display -->
           <p class="queue-indicator navbar-right" id="queue-display" role="button" tabindex="0" title="クリックでキュー一覧を表示">
-            <span class="queue-icon">&#x1F4E5;</span>
+            <span class="queue-icon"><span class="material-symbols-outlined icon-only" aria-hidden="true">move_to_inbox</span></span>
             <span class="queue-sizes" id="queue-sizes">
               <span class="queue-size queue-size-default" id="queue-count">0</span>
             </span>
@@ -142,7 +142,7 @@
           <!-- Filter input -->
           <div class="navbar-form navbar-right" role="search">
             <div class="filter-group">
-              <span class="filter-search-icon" id="filter-search-icon">&#x1F50D;</span>
+              <span class="filter-search-icon" id="filter-search-icon"><span class="material-symbols-outlined icon-only" aria-hidden="true">search</span></span>
               <input id="filter-input" class="filter-input" type="text" placeholder="Filter" autocomplete="off">
               <span class="filter-clear hide" id="filter-clear">&times;</span>
             </div>
@@ -172,12 +172,12 @@
           </div>
         </div>
         <div class="console-buttons" id="console-buttons">
-          <span class="console-btn" id="console-cancel" title="処理を中断">&#x274C;</span>
-          <span class="console-btn" id="console-history" title="全ての履歴を取得">&#x2601;</span>
-          <span class="console-btn" id="console-trash" title="表示と履歴を削除">&#x1F5D1;</span>
+          <span class="console-btn" id="console-cancel" title="処理を中断"><span class="material-symbols-outlined icon-only" aria-hidden="true">cancel</span></span>
+          <span class="console-btn" id="console-history" title="全ての履歴を取得"><span class="material-symbols-outlined icon-only" aria-hidden="true">history</span></span>
+          <span class="console-btn" id="console-trash" title="表示と履歴を削除"><span class="material-symbols-outlined icon-only" aria-hidden="true">delete</span></span>
           <span class="console-btn" id="console-expand" title="拡大">
-            <span class="expand-icon">&#x2922;</span>
-            <span class="collapse-icon hide">&#x2923;</span>
+            <span class="expand-icon"><span class="material-symbols-outlined icon-only" aria-hidden="true">open_in_full</span></span>
+            <span class="collapse-icon hide"><span class="material-symbols-outlined icon-only" aria-hidden="true">close_fullscreen</span></span>
           </span>
         </div>
       </div>
@@ -204,11 +204,11 @@
               <li><a href="#" id="action-update-force">凍結済みでも更新</a></li>
             </ul>
           </div>
-          <!-- な/他/🔄 -->
+          <!-- な/他/sync -->
           <div class="btn-group">
             <button class="btn btn-success btn-short" id="btn-gl-narou" type="button" title="最新話掲載日をなろうAPIで確認">な</button>
             <button class="btn btn-success btn-short" id="btn-gl-other" type="button" title="その他の小説の最新話掲載日を確認">他</button>
-            <button class="btn btn-success btn-short" id="btn-gl-modified" type="button" title="modifiedタグが付いた小説を更新">&#x1F504;</button>
+            <button class="btn btn-success btn-short" id="btn-gl-modified" type="button" title="modifiedタグが付いた小説を更新"><span class="material-symbols-outlined icon-only" aria-hidden="true">sync</span></button>
           </div>
           <!-- Send -->
           <div class="btn-group">
@@ -615,7 +615,7 @@
     <div id="notification-container" class="notification-container"></div>
 
     <!-- Scroll-to-top button -->
-    <div class="move-to-top hide" id="move-to-top" title="トップに戻る">&#x25B2;</div>
+    <div class="move-to-top hide" id="move-to-top" title="トップに戻る"><span class="material-symbols-outlined icon-only" aria-hidden="true">arrow_upward</span></div>
 
     <script type="module" src="/assets/js/main.js"></script>
   </body>

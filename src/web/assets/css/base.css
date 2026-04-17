@@ -46,6 +46,39 @@ body {
   overflow-y: scroll;
 }
 
+@font-face {
+  font-family: "Material Symbols Outlined";
+  src: url("/assets/fonts/Material_Symbols/MaterialSymbolsOutlined-VariableFont_FILL,GRAD,opsz,wght.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 100 700;
+}
+
+.material-symbols-outlined {
+  font-family: "Material Symbols Outlined";
+  font-style: normal;
+  font-weight: 400;
+  font-size: 1em;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  vertical-align: middle;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+}
+
+.material-symbols-outlined.icon-leading {
+  margin-right: 0.20em;
+}
+
+.material-symbols-outlined.icon-only {
+  margin-right: 0;
+}
+
 body.performance-mode *,
 body.performance-mode *::before,
 body.performance-mode *::after {

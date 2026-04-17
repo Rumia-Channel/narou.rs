@@ -42,6 +42,9 @@
       position: absolute;
       top: 0.2em;
       right: 0.5em;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3em;
       color: var(--text-muted, #aaa);
       font-size: 0.9em;
     }
@@ -90,10 +93,10 @@
     小説のリンクをドラッグ＆ドロップ
   </div>
   <div class="queue-indicator">
-    📥 <span id="queue-count" class="badge">0</span>
+    <span class="material-symbols-outlined icon-only" aria-hidden="true">move_to_inbox</span><span id="queue-count" class="badge">0</span>
   </div>
   <div id="link-drop-overlay">
-    <span class="drop-icon">⬇</span>
+    <span class="drop-icon"><span class="material-symbols-outlined icon-only" aria-hidden="true">download</span></span>
   </div>
   <div id="drop-cover"></div>
 
