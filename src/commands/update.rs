@@ -16,6 +16,7 @@ use narou_rs::converter::NovelConverter;
 use narou_rs::converter::device::{Device, OutputManager};
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
+use narou_rs::db::NovelRecord;
 use narou_rs::db::inventory::InventoryScope;
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::downloader::{
@@ -669,6 +670,41 @@ fn update_last_check_date(id: i64) {
     });
 }
 
+fn apply_general_lastup_check_result(
+    record: &mut NovelRecord,
+    novelupdated_at: Option<DateTime<Utc>>,
+    general_lastup: Option<DateTime<Utc>>,
+    length: Option<i64>,
+    is_end: Option<bool>,
+    now: DateTime<Utc>,
+) {
+    let last_check = record.last_check_date.or(Some(record.last_update));
+
+    if let Some(nu) = novelupdated_at {
+        if let Some(lc) = last_check
+            && nu > lc
+            && !record.tags.iter().any(|tag| tag == MODIFIED_TAG)
+        {
+            record.tags.push(MODIFIED_TAG.to_string());
+        }
+        record.novelupdated_at = Some(nu);
+    }
+
+    if let Some(gl) = general_lastup {
+        record.general_lastup = Some(gl);
+    }
+
+    if let Some(len) = length {
+        record.length = Some(len);
+    }
+
+    if let Some(end) = is_end {
+        record.end = end;
+    }
+
+    record.last_check_date = Some(now);
+}
+
 fn sync_end_tag(id: i64) {
     let _ = narou_rs::db::with_database_mut(|db| {
         if let Some(record) = db.get(id).cloned() {
@@ -1197,28 +1233,14 @@ fn update_general_lastup_narou(
                     let _ = narou_rs::db::with_database_mut(|db| {
                         if let Some(record) = db.get(*id).cloned() {
                             let mut r = record;
-
-                            let novelupdated_at = parse_api_datetime(&entry.novelupdated_at);
-                            let general_lastup = parse_api_datetime(&entry.general_lastup);
-
-                            let last_check = r.last_check_date.or(Some(r.last_update));
-
-                            if let Some(nu) = novelupdated_at {
-                                if let Some(lc) = last_check
-                                    && nu > lc
-                                    && !r.tags.contains(&MODIFIED_TAG.to_string())
-                                {
-                                    r.tags.push(MODIFIED_TAG.to_string());
-                                }
-                                r.novelupdated_at = Some(nu);
-                            }
-
-                            if let Some(gl) = general_lastup {
-                                r.general_lastup = Some(gl);
-                            }
-
-                            r.length = Some(entry.length);
-                            r.last_check_date = Some(Utc::now());
+                            apply_general_lastup_check_result(
+                                &mut r,
+                                parse_api_datetime(&entry.novelupdated_at),
+                                parse_api_datetime(&entry.general_lastup),
+                                Some(entry.length),
+                                None,
+                                Utc::now(),
+                            );
 
                             db.insert(r);
                         }
@@ -1252,26 +1274,14 @@ fn update_general_lastup_other(novels: &[i64], user_agent: Option<&str>) {
         let _ = narou_rs::db::with_database_mut(|db| {
             if let Some(record) = db.get(id).cloned() {
                 let mut r = record;
-                let last_check = r.last_check_date.or(Some(r.last_update));
-                if let Some(nu) = novelupdated_at {
-                    if let Some(lc) = last_check
-                        && nu > lc
-                        && !r.tags.contains(&MODIFIED_TAG.to_string())
-                    {
-                        r.tags.push(MODIFIED_TAG.to_string());
-                    }
-                    r.novelupdated_at = Some(nu);
-                }
-                if let Some(gl) = general_lastup {
-                    r.general_lastup = Some(gl);
-                }
-                if let Some(len) = length {
-                    r.length = Some(len);
-                }
-                if let Some(end) = is_end {
-                    r.end = end;
-                }
-                r.last_check_date = Some(Utc::now());
+                apply_general_lastup_check_result(
+                    &mut r,
+                    novelupdated_at,
+                    general_lastup,
+                    length,
+                    is_end,
+                    Utc::now(),
+                );
                 db.insert(r);
             }
             Ok::<(), narou_rs::error::NarouError>(())
@@ -1343,7 +1353,12 @@ fn parse_api_datetime(value: &str) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{abort_if_interrupted, sleep_with_interrupt};
+    use super::{
+        MODIFIED_TAG, abort_if_interrupted, apply_general_lastup_check_result,
+        sleep_with_interrupt,
+    };
+    use chrono::{Duration, TimeZone, Utc};
+    use narou_rs::db::NovelRecord;
     use narou_rs::compat::reroute_web_line_to_console;
     use narou_rs::progress::WS_LINE_PREFIX;
     use std::sync::atomic::AtomicBool;
@@ -1387,5 +1402,83 @@ mod tests {
         assert_eq!(value["type"], "progressbar.step");
         assert_eq!(value["target_console"], "stdout2");
         assert_eq!(value["data"]["current"], 3);
+    }
+
+    fn sample_record(last_update: chrono::DateTime<Utc>) -> NovelRecord {
+        NovelRecord {
+            id: 1,
+            author: "author".to_string(),
+            title: "title".to_string(),
+            file_title: "title".to_string(),
+            toc_url: "https://example.com".to_string(),
+            sitename: "example".to_string(),
+            novel_type: 1,
+            end: false,
+            last_update,
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: None,
+            general_lastup: None,
+            last_mail_date: None,
+            tags: Vec::new(),
+            ncode: None,
+            domain: None,
+            general_all_no: None,
+            length: None,
+            suspend: false,
+            is_narou: false,
+            last_check_date: None,
+            convert_failure: false,
+        }
+    }
+
+    #[test]
+    fn general_lastup_check_uses_last_update_fallback_and_preserves_it() {
+        let last_update = Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap();
+        let mut record = sample_record(last_update);
+        let novelupdated_at = Some(last_update + Duration::minutes(5));
+        let general_lastup = Some(last_update + Duration::minutes(10));
+        let now = last_update + Duration::minutes(20);
+
+        apply_general_lastup_check_result(
+            &mut record,
+            novelupdated_at,
+            general_lastup,
+            Some(12345),
+            Some(true),
+            now,
+        );
+
+        assert_eq!(record.last_update, last_update);
+        assert_eq!(record.novelupdated_at, novelupdated_at);
+        assert_eq!(record.general_lastup, general_lastup);
+        assert_eq!(record.length, Some(12345));
+        assert!(record.end);
+        assert_eq!(record.last_check_date, Some(now));
+        assert!(record.tags.iter().any(|tag| tag == MODIFIED_TAG));
+    }
+
+    #[test]
+    fn general_lastup_check_respects_existing_last_check_date() {
+        let last_update = Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap();
+        let mut record = sample_record(last_update);
+        record.last_check_date = Some(last_update + Duration::hours(1));
+        let stale_after_update = Some(last_update + Duration::minutes(30));
+        let now = last_update + Duration::hours(2);
+
+        apply_general_lastup_check_result(
+            &mut record,
+            stale_after_update,
+            None,
+            None,
+            None,
+            now,
+        );
+
+        assert_eq!(record.last_update, last_update);
+        assert_eq!(record.novelupdated_at, stale_after_update);
+        assert_eq!(record.last_check_date, Some(now));
+        assert!(!record.tags.iter().any(|tag| tag == MODIFIED_TAG));
     }
 }
