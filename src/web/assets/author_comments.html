@@ -85,7 +85,7 @@
           document.getElementById('ac-stats').innerHTML =
             '<li>まえがき率 ' + data.introductions_ratio + '%</li>' +
             '<li>あとがき率 ' + data.postscripts_ratio + '%</li>' +
-            '<li><a href="/novels/' + novelId + '/setting#enable_author_comments">まえがき・あとがき削除設定へ飛ぶ</a></li>';
+              '<li><a href="/novels/' + novelId + '/setting#row-enable_author_comments">まえがき・あとがき削除設定へ飛ぶ</a></li>';
 
           var tbody = document.getElementById('ac-body');
           data.comments.forEach(function(c) {
