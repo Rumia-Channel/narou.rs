@@ -1832,6 +1832,8 @@ mod tests {
 <tr><td class="label" width="13%">タイトル</td><td ><a href=https://syosetu.org/novel/232822/>和風ファンタジーな鬱エロゲーの名無し戦闘員に転生したんだが周囲の女がヤベー奴ばかりで嫌な予感しかしない件</a></td><td class="label" width="10%">小説ID</td><td width="20%">232822</td></tr>
 <tr><td class="label">原作</td><td>ファンタジー</td><td class="label">作者</td><td ><a href=https://syosetu.org/user/214537/>鉄鋼怪人</a></td></tr>
 <tr><td class="label">話数</td><td >連載(連載中) 251話</td></tr>
+<tr><td class="label">掲載開始</td><td width="26%">2020年08月01日(土) 00:33</td><td class="label">話数</td><td width="20%">連載(連載中) 251話</td></tr>
+<tr><td class="label">最新投稿</td><td>2026年04月17日(金) 07:00</td><td class="label">総文字数</td><td>3,666,651文字</td></tr>
 "#;
 
         let info = NovelInfo::from_novel_info_source(setting, html);
@@ -1844,6 +1846,30 @@ mod tests {
         );
         assert_eq!(info.author.as_deref(), Some("鉄鋼怪人"));
         assert_eq!(info.novel_type, Some(1));
+        assert_eq!(
+            info.general_firstup.map(|dt| dt.format("%Y-%m-%d %H:%M").to_string()),
+            Some("2020-08-01 00:33".to_string())
+        );
+        assert_eq!(
+            info.general_lastup.map(|dt| dt.format("%Y-%m-%d %H:%M").to_string()),
+            Some("2026-04-17 07:00".to_string())
+        );
+    }
+
+    #[test]
+    fn syosetu_org_tag_pattern_extracts_all_tags() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "ハーメルン").unwrap();
+        let html = r#"
+<tr><td class="label">タグ</td><td colspan=3 ><a href="https://syosetu.org/search/?mode=search&word=和風ファンタジー">和風ファンタジー</a> <a href="https://syosetu.org/search/?mode=search&word=妖">妖</a> <a href="https://syosetu.org/search/?mode=search&word=ヤンデレ">ヤンデレ</a> <a href="https://syosetu.org/search/?mode=search&word=闇夜の蛍">闇夜の蛍</a> </td></tr>
+"#;
+
+        let tags = setting.resolve_info_pattern("tags", html).unwrap();
+
+        assert_eq!(
+            super::sanitize_site_tags(&tags),
+            vec!["和風ファンタジー", "妖", "ヤンデレ", "闇夜の蛍"]
+        );
     }
 
     #[test]

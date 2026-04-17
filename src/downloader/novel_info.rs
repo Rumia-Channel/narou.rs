@@ -116,6 +116,7 @@ impl NovelInfo {
 }
 
 fn parse_narou_date(s: &str) -> Option<DateTime<Utc>> {
+    let s = normalize_narou_date(s);
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -150,6 +151,28 @@ fn parse_narou_date(s: &str) -> Option<DateTime<Utc>> {
     None
 }
 
+fn normalize_narou_date(s: &str) -> String {
+    let mut normalized = String::with_capacity(s.len());
+    let mut skipping_paren = false;
+
+    for ch in s.trim().chars() {
+        match ch {
+            '(' | '（' => skipping_paren = true,
+            ')' | '）' => skipping_paren = false,
+            _ if skipping_paren => {}
+            '年' => normalized.push('/'),
+            '月' => normalized.push('/'),
+            '日' => {}
+            '時' => normalized.push(':'),
+            '分' => normalized.push(':'),
+            '秒' => {}
+            _ => normalized.push(ch),
+        }
+    }
+
+    normalized.trim().trim_end_matches(':').trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_narou_date;
@@ -165,5 +188,17 @@ mod tests {
         assert_eq!(date.hour(), 16);
         assert_eq!(date.minute(), 13);
         assert_eq!(date.second(), 2);
+    }
+
+    #[test]
+    fn parse_narou_date_accepts_japanese_datetime_with_weekday() {
+        let date = parse_narou_date("2026年04月17日(金) 07:00").expect("date");
+
+        assert_eq!(date.year(), 2026);
+        assert_eq!(date.month(), 4);
+        assert_eq!(date.day(), 17);
+        assert_eq!(date.hour(), 7);
+        assert_eq!(date.minute(), 0);
+        assert_eq!(date.second(), 0);
     }
 }
