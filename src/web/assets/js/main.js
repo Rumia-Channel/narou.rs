@@ -410,6 +410,17 @@ function sanitizeConsoleNodes(source, target) {
       target.appendChild(document.createTextNode(child.textContent || ''));
       continue;
     }
+    if (child.nodeType === Node.ELEMENT_NODE && child.tagName === 'RUBY') {
+      appendConsoleRubyBaseText(child, target);
+      continue;
+    }
+    if (child.nodeType === Node.ELEMENT_NODE && (child.tagName === 'RT' || child.tagName === 'RP')) {
+      continue;
+    }
+    if (child.nodeType === Node.ELEMENT_NODE && child.tagName === 'RB') {
+      sanitizeConsoleNodes(child, target);
+      continue;
+    }
     if (child.nodeType === Node.ELEMENT_NODE && child.tagName === 'SPAN') {
       var style = sanitizeConsoleSpanStyle(child.getAttribute('style') || '');
       if (!style) {
@@ -423,6 +434,26 @@ function sanitizeConsoleNodes(source, target) {
       continue;
     }
     target.appendChild(document.createTextNode(child.textContent || ''));
+  }
+}
+
+function appendConsoleRubyBaseText(source, target) {
+  var rbElements = source.querySelectorAll('rb');
+  if (rbElements.length > 0) {
+    for (var i = 0; i < rbElements.length; i++) {
+      target.appendChild(document.createTextNode(rbElements[i].textContent || ''));
+    }
+    return;
+  }
+
+  var children = source.childNodes || [];
+  for (var i = 0; i < children.length; i++) {
+    var child = children[i];
+    if (child.nodeType === Node.TEXT_NODE) {
+      target.appendChild(document.createTextNode(child.textContent || ''));
+    } else if (child.nodeType === Node.ELEMENT_NODE && child.tagName !== 'RT' && child.tagName !== 'RP') {
+      sanitizeConsoleNodes(child, target);
+    }
   }
 }
 
@@ -459,8 +490,8 @@ function appendConsole(text, targetConsole) {
     } else {
       var div = document.createElement('div');
       div.className = 'console-line';
-      // If text contains <span> tags (from color output), render as HTML
-      if (/<span[\s>]/i.test(lines[i])) {
+      // Allow limited HTML in console output: styled spans and ruby stripped to base text.
+      if (/<(?:span|ruby|rb|rt|rp)[\s>]/i.test(lines[i])) {
         appendSanitizedConsoleHtml(div, lines[i]);
       } else {
         div.textContent = lines[i];
