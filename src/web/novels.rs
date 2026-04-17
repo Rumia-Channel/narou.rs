@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Form, Path, Query, State},
     http::StatusCode,
     response::{Json, Response},
 };
@@ -38,6 +38,17 @@ pub async fn api_list(
     Query(params): Query<ListParams>,
     State(_state): State<AppState>,
 ) -> Result<Json<NovelListResponse>, (StatusCode, String)> {
+    api_list_inner(params)
+}
+
+pub async fn api_list_post(
+    State(_state): State<AppState>,
+    Form(params): Form<ListParams>,
+) -> Result<Json<NovelListResponse>, (StatusCode, String)> {
+    api_list_inner(params)
+}
+
+fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (StatusCode, String)> {
     let draw = params.draw.unwrap_or(1);
     let start = params.start.unwrap_or(0);
     let length = params.length.unwrap_or(50);

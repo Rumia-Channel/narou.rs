@@ -58,18 +58,6 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
             std::process::exit(1);
         }
     };
-    let running_job = Arc::new(parking_lot::Mutex::new(None));
-    let running_child_pid = Arc::new(parking_lot::Mutex::new(None));
-    let app_state = web::AppState {
-        port: address.port,
-        ws_port: address.ws_port,
-        push_server: push_server.clone(),
-        basic_auth_header,
-        running_job: running_job.clone(),
-        running_child_pid: running_child_pid.clone(),
-    };
-    let app = web::create_router(app_state.clone());
-    let ws_app = web::push::create_push_router(app_state);
     let root_dir = match Inventory::with_default_root() {
         Ok(inventory) => inventory.root_dir().to_path_buf(),
         Err(e) => {
@@ -77,6 +65,26 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
             std::process::exit(1);
         }
     };
+    let queue = match narou_rs::queue::PersistentQueue::new(&root_dir.join(".narou").join("queue.yaml")) {
+        Ok(queue) => Arc::new(queue),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let running_jobs = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let running_child_pids = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let app_state = web::AppState {
+        port: address.port,
+        ws_port: address.ws_port,
+        push_server: push_server.clone(),
+        basic_auth_header,
+        queue: queue.clone(),
+        running_jobs: running_jobs.clone(),
+        running_child_pids: running_child_pids.clone(),
+    };
+    let app = web::create_router(app_state.clone());
+    let ws_app = web::push::create_push_router(app_state);
 
     let addr: SocketAddr = format!("{}:{}", address.host, address.port)
         .parse()
@@ -100,7 +108,14 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
     // Write PID file for restart recovery
     write_pid_file();
 
-    let worker_task = web::worker::start_queue_worker(root_dir.clone(), push_server.clone(), running_job, running_child_pid);
+    let worker_tasks = web::worker::start_queue_workers(
+        root_dir.clone(),
+        queue,
+        push_server.clone(),
+        running_jobs,
+        running_child_pids,
+        narou_rs::compat::load_local_setting_bool("concurrency"),
+    );
     let scheduler_task = web::scheduler::start_auto_update_scheduler(root_dir, push_server.clone());
 
     // Ruby parity: broadcast startup messages to web console
@@ -131,7 +146,9 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
         .with_graceful_shutdown(shutdown_signal)
         .await
         .unwrap();
-    worker_task.abort();
+    for worker_task in worker_tasks {
+        worker_task.abort();
+    }
     if let Some(task) = scheduler_task {
         task.abort();
     }

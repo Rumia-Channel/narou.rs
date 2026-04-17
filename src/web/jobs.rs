@@ -1,7 +1,17 @@
-use axum::{extract::State, response::Json};
+use std::path::PathBuf;
+
+use axum::{
+    extract::{Query, State},
+    http::{StatusCode, header},
+    response::{Html, IntoResponse, Json, Response},
+};
+use serde::Deserialize;
 
 use crate::db::with_database;
-use crate::queue::{JobType, PersistentQueue};
+use crate::downloader::site_setting::SiteSetting;
+use crate::downloader::types::{CACHE_SAVE_DIR, SECTION_SAVE_DIR, SectionFile};
+use crate::downloader::{Downloader, TargetType};
+use crate::queue::{JobType, PersistentQueue, QueueJob, QueueLane};
 
 use super::AppState;
 use super::state::{
@@ -10,6 +20,21 @@ use super::state::{
 };
 
 const WEBUI_UPDATE_START_PREFIX: &str = "__webui_update_start__=";
+const TRANSPARENT_GIF: &[u8] = &[
+    71, 73, 70, 56, 57, 97, 1, 0, 1, 0, 128, 0, 0, 0, 0, 0, 255, 255, 255, 33, 249, 4, 1, 0,
+    0, 0, 0, 44, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 68, 1, 0, 59,
+];
+
+#[derive(Debug, Deserialize)]
+pub struct BookmarkletDownloadQuery {
+    pub target: Option<String>,
+    pub mail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffListQuery {
+    pub target: Option<String>,
+}
 
 fn html_escape(value: &str) -> String {
     value
@@ -43,53 +68,300 @@ fn validate_general_lastup_option(option: &str) -> Result<Option<&'static str>, 
     }
 }
 
-pub async fn api_download(
-    State(state): State<AppState>,
-    Json(body): Json<DownloadBody>,
-) -> Json<serde_json::Value> {
-    let targets = body.targets;
-    if let Err(message) = validate_download_targets(&targets) {
-        return serde_json::json!({
-            "success": false,
-            "message": message,
-            "results": []
-        })
-        .into();
-    }
-    let queue = match open_queue() {
-        Ok(queue) => queue,
-        Err(message) => {
-            return serde_json::json!({
-                "success": false,
-                "message": message,
-                "results": []
-            })
-            .into();
-        }
-    };
+fn query_to_bool(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "yes" | "on"))
+}
 
-    let job_type = if body.mail {
-        JobType::Mail
-    } else {
-        JobType::Download
-    };
-
+fn queue_download_jobs(
+    queue: &PersistentQueue,
+    targets: &[String],
+    force: bool,
+    mail: bool,
+) -> Result<Vec<String>, String> {
+    validate_download_targets(targets)?;
+    let job_type = if mail { JobType::Mail } else { JobType::Download };
     let jobs: Vec<(JobType, String)> = targets
         .iter()
         .map(|target| {
-            if body.force {
+            if force {
                 (job_type, format!("--force\t{}", target))
             } else {
                 (job_type, target.clone())
             }
         })
         .collect();
-    let ids = match queue.push_batch(&jobs) {
+    queue.push_batch(&jobs).map_err(|e| e.to_string())
+}
+
+fn queue_bookmarklet_download(
+    queue: &PersistentQueue,
+    target: &str,
+    mail: bool,
+) -> Result<String, String> {
+    let job_target = if mail {
+        format!("--mail\t{}", target)
+    } else {
+        target.to_string()
+    };
+    queue
+        .push(JobType::Download, &job_target)
+        .map_err(|e| e.to_string())
+}
+
+fn resolve_existing_id_for_target(target: &str) -> Option<i64> {
+    match Downloader::get_target_type(target) {
+        TargetType::Id => {
+            let id = target.parse::<i64>().ok()?;
+            with_database(|db| Ok(db.get(id).map(|record| record.id)))
+                .ok()
+                .flatten()
+        }
+        TargetType::Url => {
+            let settings = SiteSetting::load_all().ok()?;
+            let setting = settings.iter().find(|setting| setting.matches_url(target))?;
+            let toc_url = setting
+                .toc_url_with_url_captures(target)
+                .unwrap_or_else(|| setting.toc_url());
+            with_database(|db| Ok(db.get_by_toc_url(&toc_url).map(|record| record.id)))
+                .ok()
+                .flatten()
+        }
+        TargetType::Ncode => {
+            let ncode = target.to_lowercase();
+            with_database(|db| {
+                Ok(db
+                    .all_records()
+                    .values()
+                    .find(|record| record.ncode.as_deref() == Some(ncode.as_str()))
+                    .map(|record| record.id))
+            })
+            .ok()
+            .flatten()
+        }
+        _ => with_database(|db| Ok(db.find_by_title(target).map(|record| record.id)))
+            .ok()
+            .flatten(),
+    }
+}
+
+fn existing_update_job_id(
+    queue: &PersistentQueue,
+    running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
+    target: &str,
+) -> Option<String> {
+    if let Some(job) = running_jobs
+        .lock()
+        .iter()
+        .find(|job| matches!(job.job_type, JobType::Update) && job.target == target)
+    {
+        return Some(job.id.clone());
+    }
+
+    queue
+        .get_pending_tasks()
+        .into_iter()
+        .find(|job| matches!(job.job_type, JobType::Update) && job.target == target)
+        .map(|job| job.id)
+}
+
+fn push_update_job_if_needed(
+    queue: &PersistentQueue,
+    running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
+    target: String,
+) -> Result<(Vec<String>, bool), String> {
+    if let Some(existing_id) = existing_update_job_id(queue, running_jobs, &target) {
+        return Ok((vec![existing_id], false));
+    }
+
+    queue
+        .push_batch(&[(JobType::Update, target)])
+        .map(|ids| (ids, true))
+        .map_err(|e| e.to_string())
+}
+
+fn running_job_count(state: &AppState) -> usize {
+    state.running_jobs.lock().len()
+}
+
+fn running_job_count_for_lane(state: &AppState, lane: QueueLane) -> usize {
+    state
+        .running_jobs
+        .lock()
+        .iter()
+        .filter(|job| job.job_type.lane() == lane)
+        .count()
+}
+
+fn running_job_by_id(state: &AppState, task_id: &str) -> Option<QueueJob> {
+    state
+        .running_jobs
+        .lock()
+        .iter()
+        .find(|job| job.id == task_id)
+        .cloned()
+}
+
+fn kill_running_child(state: &AppState) {
+    let pids: Vec<u32> = {
+        let mut guard = state.running_child_pids.lock();
+        let values = guard.values().copied().collect();
+        guard.clear();
+        values
+    };
+    for pid in pids {
+        kill_process_tree(pid, &state.push_server);
+    }
+}
+
+fn kill_running_child_for_job(state: &AppState, job_id: &str) -> bool {
+    let pid = state.running_child_pids.lock().remove(job_id);
+    if let Some(pid) = pid {
+        kill_process_tree(pid, &state.push_server);
+        true
+    } else {
+        false
+    }
+}
+
+fn kill_process_tree(pid: u32, push_server: &std::sync::Arc<super::push::PushServer>) {
+    let result = if cfg!(windows) {
+        std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+    } else {
+        std::process::Command::new("kill")
+            .args(["-TERM", &format!("-{}", pid)])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+    };
+    if let Err(e) = result {
+        push_server.broadcast_echo(&format!("プロセス終了に失敗: {}", e), "stdout");
+    }
+}
+
+fn read_sorted_cache_dirs(cache_root: &PathBuf) -> Result<Vec<PathBuf>, String> {
+    let mut list = Vec::new();
+    for entry in std::fs::read_dir(cache_root).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            list.push(path);
+        }
+    }
+    list.sort_by(|a, b| {
+        let a_name = a.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+        let b_name = b.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+        b_name.cmp(a_name)
+    });
+    Ok(list)
+}
+
+fn read_sorted_section_files(dir: &PathBuf) -> Result<Vec<PathBuf>, String> {
+    let mut list = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("yaml") {
+            list.push(path);
+        }
+    }
+    list.sort_by_key(|path| {
+        path.file_stem()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.split_once(' ').map(|(index, _)| index.to_string()))
+            .and_then(|index| index.parse::<usize>().ok())
+            .unwrap_or(0)
+    });
+    Ok(list)
+}
+
+fn render_diff_list_html_for_target(target: &str) -> String {
+    let Some(id) = resolve_existing_id_for_target(target) else {
+        return String::new();
+    };
+    let Ok((record, archive_root)) = with_database(|db| {
+        Ok((db.get(id).cloned(), db.archive_root().to_path_buf()))
+    }) else {
+        return String::new();
+    };
+    let Some(record) = record else {
+        return String::new();
+    };
+
+    let cache_root = crate::db::existing_novel_dir_for_record(&archive_root, &record)
+        .join(SECTION_SAVE_DIR)
+        .join(CACHE_SAVE_DIR);
+    let Ok(cache_dirs) = read_sorted_cache_dirs(&cache_root) else {
+        return String::new();
+    };
+    if cache_dirs.is_empty() {
+        return String::new();
+    }
+
+    let mut html = String::new();
+    for (number, cache_dir) in cache_dirs.iter().enumerate() {
+        let version = cache_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        html.push_str("<div class=\"diff-list-group\">");
+        html.push_str(&format!(
+            "<div class=\"diff-list-version\">{}&nbsp;&nbsp;-{}</div>",
+            html_escape(version),
+            number + 1
+        ));
+        let Ok(section_paths) = read_sorted_section_files(cache_dir) else {
+            html.push_str("</div>");
+            continue;
+        };
+        if section_paths.is_empty() {
+            html.push_str("<div class=\"diff-list-entry\">(最新話のみのアップデート)</div></div>");
+            continue;
+        }
+        for section_path in section_paths {
+            let Ok(content) = std::fs::read_to_string(&section_path) else {
+                continue;
+            };
+            let Ok(section) = serde_yaml::from_str::<SectionFile>(&content) else {
+                continue;
+            };
+            html.push_str(&format!(
+                "<div class=\"diff-list-entry\">第{}部分　{}</div>",
+                html_escape(&section.index),
+                html_escape(section.subtitle.trim_end())
+            ));
+        }
+        html.push_str("</div>");
+    }
+    html
+}
+
+fn gif_response() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/gif"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        TRANSPARENT_GIF,
+    )
+        .into_response()
+}
+
+pub async fn api_download(
+    State(state): State<AppState>,
+    Json(body): Json<DownloadBody>,
+) -> Json<serde_json::Value> {
+    let targets = body.targets;
+    let ids = match queue_download_jobs(state.queue.as_ref(), &targets, body.force, body.mail) {
         Ok(ids) => ids,
-        Err(e) => {
+        Err(message) => {
             return serde_json::json!({
                 "success": false,
-                "message": e.to_string(),
+                "message": message,
                 "results": []
             })
             .into();
@@ -113,18 +385,6 @@ pub async fn api_update(
     Json(body): Json<UpdateBody>,
 ) -> Json<serde_json::Value> {
     let targets = targets_to_strings(&body.targets);
-
-    let queue = match open_queue() {
-        Ok(queue) => queue,
-        Err(message) => {
-            return serde_json::json!({
-                "success": false,
-                "message": message,
-                "count": 0
-            })
-            .into();
-        }
-    };
 
     // Build a single update job target string from CLI-style args
     // e.g. ["--gl", "narou"] → "--gl\tnarou"
@@ -168,7 +428,8 @@ pub async fn api_update(
         parts.extend(args);
         parts.join("\t")
     };
-    let (job_ids, queued) = match push_update_job_if_needed(&queue, &state.running_job, combined) {
+    let (job_ids, queued) =
+        match push_update_job_if_needed(state.queue.as_ref(), &state.running_jobs, combined) {
         Ok(result) => result,
         Err(message) => {
             return serde_json::json!({
@@ -202,17 +463,6 @@ pub async fn api_convert(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let queue = match open_queue() {
-        Ok(queue) => queue,
-        Err(message) => {
-            return serde_json::json!({
-                "success": false,
-                "message": message,
-                "results": []
-            })
-            .into();
-        }
-    };
     let jobs: Vec<(JobType, String)> = body
         .targets
         .iter()
@@ -223,7 +473,7 @@ pub async fn api_convert(
             )
         })
         .collect();
-    let ids = match queue.push_batch(&jobs) {
+    let ids = match state.queue.push_batch(&jobs) {
         Ok(ids) => ids,
         Err(e) => {
             return serde_json::json!({
@@ -253,30 +503,25 @@ pub async fn api_convert(
     serde_json::json!({ "success": true, "results": results }).into()
 }
 
-pub async fn queue_status(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let queue = match open_queue() {
-        Ok(queue) => queue,
-        Err(message) => {
-            return Json(serde_json::json!({
-                "pending": 0,
-                "completed": 0,
-                "failed": 0,
-                "error": message,
-            }));
-        }
+pub async fn queue_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let running_jobs = state.running_jobs.lock().clone();
+    let running_count = running_job_count(&state);
+    let running_label = match running_jobs.as_slice() {
+        [] => serde_json::Value::Null,
+        [job] => serde_json::Value::String(job.target.clone()),
+        jobs => serde_json::Value::String(format!("{} 件実行中", jobs.len())),
     };
-
     Json(serde_json::json!({
-        "pending": queue.pending_count(),
-        "completed": queue.completed_count(),
-        "failed": queue.failed_count(),
+        "pending": state.queue.pending_count(),
+        "completed": state.queue.completed_count(),
+        "failed": state.queue.failed_count(),
+        "running": running_label,
+        "running_count": running_count,
     }))
 }
 
-pub async fn queue_clear(State(_state): State<AppState>) -> Json<ApiResponse> {
-    let result = open_queue().and_then(|q| q.clear().map_err(|e| e.to_string()));
-
-    match result {
+pub async fn queue_clear(State(state): State<AppState>) -> Json<ApiResponse> {
+    match state.queue.clear() {
         Ok(_) => Json(ApiResponse {
             success: true,
             message: "Queue cleared".to_string(),
@@ -286,15 +531,6 @@ pub async fn queue_clear(State(_state): State<AppState>) -> Json<ApiResponse> {
             message: e.to_string(),
         }),
     }
-}
-
-pub(crate) fn open_queue() -> Result<PersistentQueue, String> {
-    PersistentQueue::with_default()
-        .or_else(|_| {
-            let path = std::path::PathBuf::from(".narou").join("queue.yaml");
-            PersistentQueue::new(&path)
-        })
-        .map_err(|e| e.to_string())
 }
 
 /// Helper: convert mixed JSON values (numbers or strings) into string targets
@@ -307,39 +543,6 @@ fn targets_to_strings(targets: &[serde_json::Value]) -> Vec<String> {
             other => other.to_string(),
         })
         .collect()
-}
-
-fn existing_update_job_id(
-    queue: &PersistentQueue,
-    running_job: &parking_lot::Mutex<Option<crate::queue::QueueJob>>,
-    target: &str,
-) -> Option<String> {
-    if let Some(job) = running_job.lock().as_ref() {
-        if matches!(job.job_type, JobType::Update) && job.target == target {
-            return Some(job.id.clone());
-        }
-    }
-
-    queue
-        .get_pending_tasks()
-        .into_iter()
-        .find(|job| matches!(job.job_type, JobType::Update) && job.target == target)
-        .map(|job| job.id)
-}
-
-fn push_update_job_if_needed(
-    queue: &PersistentQueue,
-    running_job: &parking_lot::Mutex<Option<crate::queue::QueueJob>>,
-    target: String,
-) -> Result<(Vec<String>, bool), String> {
-    if let Some(existing_id) = existing_update_job_id(queue, running_job, &target) {
-        return Ok((vec![existing_id], false));
-    }
-
-    queue
-        .push_batch(&[(JobType::Update, target)])
-        .map(|ids| (ids, true))
-        .map_err(|e| e.to_string())
 }
 
 fn encode_convert_job_target(target: &str, device: Option<&str>) -> String {
@@ -366,21 +569,11 @@ pub async fn api_send(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let targets = targets_to_strings(&body.targets);
-    let queue = match open_queue() {
-        Ok(queue) => queue,
-        Err(message) => {
-            return serde_json::json!({
-                "success": false,
-                "message": message,
-            })
-            .into();
-        }
-    };
     let jobs: Vec<(JobType, String)> = targets
         .iter()
         .map(|t| (JobType::Send, t.clone()))
         .collect();
-    let ids = match queue.push_batch(&jobs) {
+    let ids = match state.queue.push_batch(&jobs) {
         Ok(ids) => ids,
         Err(e) => {
             return serde_json::json!({
@@ -460,21 +653,11 @@ pub async fn api_backup(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let targets = targets_to_strings(&body.targets);
-    let queue = match open_queue() {
-        Ok(queue) => queue,
-        Err(message) => {
-            return serde_json::json!({
-                "success": false,
-                "message": message,
-            })
-            .into();
-        }
-    };
     let jobs: Vec<(JobType, String)> = targets
         .iter()
         .map(|t| (JobType::Backup, t.clone()))
         .collect();
-    let ids = match queue.push_batch(&jobs) {
+    let ids = match state.queue.push_batch(&jobs) {
         Ok(ids) => ids,
         Err(e) => {
             return serde_json::json!({
@@ -498,18 +681,8 @@ pub async fn api_backup(
 pub async fn api_backup_bookmark(
     State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
-    let queue = match open_queue() {
-        Ok(queue) => queue,
-        Err(message) => {
-            return serde_json::json!({
-                "success": false,
-                "message": message,
-            })
-            .into();
-        }
-    };
     // Ruby parity: runs "send --backup-bookmark"
-    let job_id = match queue.push(JobType::Send, "--backup-bookmark") {
+    let job_id = match state.queue.push(JobType::Send, "--backup-bookmark") {
         Ok(id) => id,
         Err(e) => {
             return serde_json::json!({
@@ -534,21 +707,11 @@ pub async fn api_mail(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let targets = targets_to_strings(&body.targets);
-    let queue = match open_queue() {
-        Ok(queue) => queue,
-        Err(message) => {
-            return serde_json::json!({
-                "success": false,
-                "message": message,
-            })
-            .into();
-        }
-    };
     let jobs: Vec<(JobType, String)> = targets
         .iter()
         .map(|t| (JobType::Mail, t.clone()))
         .collect();
-    let ids = match queue.push_batch(&jobs) {
+    let ids = match state.queue.push_batch(&jobs) {
         Ok(ids) => ids,
         Err(e) => {
             return serde_json::json!({
@@ -650,6 +813,78 @@ pub async fn api_diff_list(
     }
 
     serde_json::json!({ "diffs": diffs }).into()
+}
+
+// GET /api/diff_list
+pub async fn api_diff_list_get(
+    State(_state): State<AppState>,
+    Query(params): Query<DiffListQuery>,
+) -> Html<String> {
+    Html(
+        params
+            .target
+            .as_deref()
+            .map(render_diff_list_html_for_target)
+            .unwrap_or_default(),
+    )
+}
+
+// GET /api/download_request
+pub async fn api_download_request(
+    State(state): State<AppState>,
+    Query(params): Query<BookmarkletDownloadQuery>,
+) -> Json<serde_json::Value> {
+    let Some(target) = params.target.as_deref().map(str::trim).filter(|target| !target.is_empty()) else {
+        return Json(serde_json::json!({ "status": 2, "id": null }));
+    };
+    if let Some(id) = resolve_existing_id_for_target(target) {
+        return Json(serde_json::json!({ "status": 1, "id": id }));
+    }
+    match queue_bookmarklet_download(
+        state.queue.as_ref(),
+        target,
+        query_to_bool(params.mail.as_deref()),
+    ) {
+        Ok(_) => {
+            state.push_server.broadcast_event("notification.queue", "");
+            Json(serde_json::json!({ "status": 0, "id": null }))
+        }
+        Err(_) => Json(serde_json::json!({ "status": 2, "id": null })),
+    }
+}
+
+// GET /api/downloadable.gif
+pub async fn api_downloadable_gif(
+    State(_state): State<AppState>,
+    Query(params): Query<BookmarkletDownloadQuery>,
+) -> Response {
+    let _number = match params.target.as_deref() {
+        Some(target) if !target.trim().is_empty() => {
+            if resolve_existing_id_for_target(target).is_some() { 1 } else { 0 }
+        }
+        _ => 2,
+    };
+    gif_response()
+}
+
+// GET /api/download4ssl
+pub async fn api_download4ssl(
+    State(state): State<AppState>,
+    Query(params): Query<BookmarkletDownloadQuery>,
+) -> Response {
+    let Some(target) = params.target.as_deref().map(str::trim).filter(|target| !target.is_empty()) else {
+        return gif_response();
+    };
+    if queue_bookmarklet_download(
+        state.queue.as_ref(),
+        target,
+        query_to_bool(params.mail.as_deref()),
+    )
+    .is_ok()
+    {
+        state.push_server.broadcast_event("notification.queue", "");
+    }
+    gif_response()
 }
 
 // POST /api/diff
@@ -854,9 +1089,7 @@ pub async fn queue_cancel(
     kill_running_child(&state);
 
     // Clear pending tasks from queue
-    if let Ok(queue) = open_queue() {
-        let _ = queue.clear_pending();
-    }
+    let _ = state.queue.clear_pending();
 
     state.push_server.broadcast_event("notification.queue", "");
     Json(ApiResponse {
@@ -905,61 +1138,17 @@ pub async fn cancel_running_task(
     State(state): State<AppState>,
     Json(body): Json<TaskIdBody>,
 ) -> Json<serde_json::Value> {
-    let running = state.running_job.lock().clone();
-    if let Some(job) = running {
-        if job.id == body.task_id {
-            kill_running_child(&state);
-            return serde_json::json!({ "status": "ok" }).into();
-        }
+    if running_job_by_id(&state, &body.task_id).is_some() && kill_running_child_for_job(&state, &body.task_id) {
+        return serde_json::json!({ "status": "ok" }).into();
     }
     serde_json::json!({ "error": "実行中の処理を中断できませんでした" }).into()
-}
-
-fn kill_running_child(state: &AppState) {
-    let pid = state.running_child_pid.lock().take();
-    if let Some(pid) = pid {
-        // Kill process tree on Windows using taskkill /T
-        // On Unix, fall back to plain kill via std::process::Command
-        let result = if cfg!(windows) {
-            std::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-        } else {
-            std::process::Command::new("kill")
-                .args(["-TERM", &format!("-{}", pid)])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-        };
-        if let Err(e) = result {
-            state.push_server.broadcast_echo(
-                &format!("プロセス終了に失敗: {}", e),
-                "stdout",
-            );
-        }
-    }
 }
 
 // GET /api/get_pending_tasks
 pub async fn get_pending_tasks(
     State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
-    let queue = match open_queue() {
-        Ok(q) => q,
-        Err(e) => {
-            return Json(serde_json::json!({
-                "pending": [],
-                "running": [],
-                "pending_count": 0,
-                "running_count": 0,
-                "error": e,
-            }));
-        }
-    };
-
-    let pending = queue.get_pending_tasks();
+    let pending = state.queue.get_pending_tasks();
     let pending_count = pending.len();
     let pending_json: Vec<serde_json::Value> = pending
         .iter()
@@ -973,18 +1162,19 @@ pub async fn get_pending_tasks(
         })
         .collect();
 
-    let running_guard = state.running_job.lock();
-    let (running_json, running_count) = if let Some(job) = running_guard.as_ref() {
-        (vec![serde_json::json!({
-            "id": job.id,
-            "type": job.job_type,
-            "target": job.target,
-            "created_at": job.created_at,
-        })], 1)
-    } else {
-        (vec![], 0)
-    };
-    drop(running_guard);
+    let running = state.running_jobs.lock().clone();
+    let running_count = running.len();
+    let running_json: Vec<serde_json::Value> = running
+        .iter()
+        .map(|job| {
+            serde_json::json!({
+                "id": job.id,
+                "type": job.job_type,
+                "target": job.target,
+                "created_at": job.created_at,
+            })
+        })
+        .collect();
 
     Json(serde_json::json!({
         "pending": pending_json,
@@ -996,20 +1186,10 @@ pub async fn get_pending_tasks(
 
 // POST /api/remove_pending_task
 pub async fn remove_pending_task(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<TaskIdBody>,
 ) -> Json<ApiResponse> {
-    let queue = match open_queue() {
-        Ok(q) => q,
-        Err(e) => {
-            return Json(ApiResponse {
-                success: false,
-                message: e,
-            });
-        }
-    };
-
-    match queue.remove_pending(&body.task_id) {
+    match state.queue.remove_pending(&body.task_id) {
         Ok(true) => Json(ApiResponse {
             success: true,
             message: "Task removed".to_string(),
@@ -1027,20 +1207,10 @@ pub async fn remove_pending_task(
 
 // POST /api/reorder_pending_tasks
 pub async fn reorder_pending_tasks(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<ReorderBody>,
 ) -> Json<ApiResponse> {
-    let queue = match open_queue() {
-        Ok(q) => q,
-        Err(e) => {
-            return Json(ApiResponse {
-                success: false,
-                message: e,
-            });
-        }
-    };
-
-    match queue.reorder_pending(&body.task_ids) {
+    match state.queue.reorder_pending(&body.task_ids) {
         Ok(_) => Json(ApiResponse {
             success: true,
             message: "タスクの並び替えが完了しました".to_string(),
@@ -1054,23 +1224,13 @@ pub async fn reorder_pending_tasks(
 
 // GET /api/get_queue_size
 pub async fn get_queue_size(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
-    let (default_count, convert_count) = match open_queue() {
-        Ok(q) => {
-            let tasks = q.get_pending_tasks();
-            let convert = tasks.iter().filter(|t| matches!(t.job_type, JobType::Convert)).count();
-            let default = tasks.len() - convert;
-            (default, convert)
-        }
-        Err(_) => (0, 0),
-    };
-
-    Json(serde_json::json!({
-        "default": default_count,
-        "convert": convert_count,
-        "total": default_count + convert_count,
-    }))
+    let default_count = state.queue.pending_count_for_lane(QueueLane::Default)
+        + running_job_count_for_lane(&state, QueueLane::Default);
+    let secondary_count = state.queue.pending_count_for_lane(QueueLane::Secondary)
+        + running_job_count_for_lane(&state, QueueLane::Secondary);
+    Json(serde_json::json!([default_count, secondary_count]))
 }
 
 // POST /api/update_by_tag — update novels filtered by tags
@@ -1136,21 +1296,10 @@ pub async fn api_update_by_tag(
         .into();
     }
 
-    let queue = match open_queue() {
-        Ok(queue) => queue,
-        Err(message) => {
-            return serde_json::json!({
-                "success": false,
-                "message": message,
-                "count": 0,
-            })
-            .into();
-        }
-    };
-
     let count = ids.len();
     let target = tag_params.join("	");
-    let (_job_ids, queued) = match push_update_job_if_needed(&queue, &state.running_job, target) {
+    let (_job_ids, queued) =
+        match push_update_job_if_needed(state.queue.as_ref(), &state.running_jobs, target) {
         Ok(result) => result,
         Err(message) => {
             return serde_json::json!({
@@ -1233,10 +1382,7 @@ pub async fn restore_pending_tasks(
 ) -> Json<serde_json::Value> {
     // In Rust, pending tasks are already persisted in queue.yaml and will be
     // picked up by the worker. Just count and report.
-    let count = match open_queue() {
-        Ok(q) => q.get_pending_tasks().len(),
-        Err(_) => 0,
-    };
+    let count = state.queue.get_pending_tasks().len();
     state
         .push_server
         .broadcast_event("notification.queue", "");
@@ -1245,12 +1391,10 @@ pub async fn restore_pending_tasks(
 
 // POST /api/defer_restore_pending_tasks
 pub async fn defer_restore_pending_tasks(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
     // Clear pending tasks (defer = discard them)
-    if let Ok(queue) = open_queue() {
-        let _ = queue.clear_pending();
-    }
+    let _ = state.queue.clear_pending();
     serde_json::json!({ "status": "ok" }).into()
 }
 
@@ -1261,19 +1405,14 @@ pub async fn confirm_running_tasks(
 ) -> Json<serde_json::Value> {
     if body.rerun.as_deref() == Some("true") {
         // Resume: keep pending tasks, report count
-        let count = match open_queue() {
-            Ok(q) => q.get_pending_tasks().len(),
-            Err(_) => 0,
-        };
+        let count = state.queue.get_pending_tasks().len();
         state
             .push_server
             .broadcast_event("notification.queue", "");
         serde_json::json!({ "status": "ok", "count": count }).into()
     } else {
         // Defer: clear pending tasks
-        if let Ok(queue) = open_queue() {
-            let _ = queue.clear_pending();
-        }
+        let _ = state.queue.clear_pending();
         serde_json::json!({ "status": "ok" }).into()
     }
 }
@@ -1301,32 +1440,19 @@ pub async fn api_update_general_lastup(
         args.push(option);
     }
 
-    let queue = match open_queue() {
-        Ok(queue) => queue,
-        Err(message) => {
-            return serde_json::json!({
-                "success": false,
-                "message": message,
-            })
-            .into();
-        }
-    };
-
     let target = args[1..].join("	");
-    match push_update_job_if_needed(&queue, &state.running_job, target) {
+    match push_update_job_if_needed(state.queue.as_ref(), &state.running_jobs, target) {
         Ok((job_ids, queued)) => {
             let mut enqueued_any = queued;
 
             // Ruby parity: if is_update_modified, chain a second update for tag:modified
             if is_update_modified {
-                if let Ok(queue2) = open_queue() {
-                    if let Ok((_, modified_queued)) = push_update_job_if_needed(
-                        &queue2,
-                        &state.running_job,
-                        "tag:modified".to_string(),
-                    ) {
-                        enqueued_any |= modified_queued;
-                    }
+                if let Ok((_, modified_queued)) = push_update_job_if_needed(
+                    state.queue.as_ref(),
+                    &state.running_jobs,
+                    "tag:modified".to_string(),
+                ) {
+                    enqueued_any |= modified_queued;
                 }
             }
 
@@ -1452,10 +1578,10 @@ mod tests {
     fn push_update_job_if_needed_reuses_pending_update_job() {
         let temp = tempfile::tempdir().unwrap();
         let queue = PersistentQueue::new(&temp.path().join("queue.yaml")).unwrap();
-        let running_job = Mutex::new(None);
-        let first = push_update_job_if_needed(&queue, &running_job, "1\t2\t3".to_string()).unwrap();
+        let running_jobs = Mutex::new(Vec::new());
+        let first = push_update_job_if_needed(&queue, &running_jobs, "1\t2\t3".to_string()).unwrap();
 
-        let second = push_update_job_if_needed(&queue, &running_job, "1\t2\t3".to_string()).unwrap();
+        let second = push_update_job_if_needed(&queue, &running_jobs, "1\t2\t3".to_string()).unwrap();
 
         assert!(first.1);
         assert!(!second.1);
@@ -1467,16 +1593,16 @@ mod tests {
     fn existing_update_job_id_matches_running_job() {
         let temp = tempfile::tempdir().unwrap();
         let queue = PersistentQueue::new(&temp.path().join("queue.yaml")).unwrap();
-        let running_job = Mutex::new(Some(QueueJob {
+        let running_jobs = Mutex::new(vec![QueueJob {
             id: "running-job".to_string(),
             job_type: JobType::Update,
             target: "--tag\tmodified".to_string(),
             created_at: 0,
             retry_count: 0,
             max_retries: 3,
-        }));
+        }]);
 
-        let existing = existing_update_job_id(&queue, &running_job, "--tag\tmodified");
+        let existing = existing_update_job_id(&queue, &running_jobs, "--tag\tmodified");
 
         assert_eq!(existing.as_deref(), Some("running-job"));
     }

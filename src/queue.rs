@@ -30,6 +30,21 @@ pub enum JobType {
     Mail,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueLane {
+    Default,
+    Secondary,
+}
+
+impl JobType {
+    pub fn lane(self) -> QueueLane {
+        match self {
+            JobType::Convert | JobType::Send | JobType::Mail => QueueLane::Secondary,
+            _ => QueueLane::Default,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueState {
     pub jobs: VecDeque<QueueJob>,
@@ -47,6 +62,7 @@ impl Default for QueueState {
     }
 }
 
+#[derive(Debug)]
 pub struct PersistentQueue {
     path: PathBuf,
     state: Mutex<QueueState>,
@@ -129,6 +145,16 @@ impl PersistentQueue {
         Some(job)
     }
 
+    pub fn pop_for_lane(&self, lane: QueueLane) -> Option<QueueJob> {
+        let job = {
+            let mut state = self.state.lock();
+            let index = state.jobs.iter().position(|job| job.job_type.lane() == lane)?;
+            state.jobs.remove(index)?
+        };
+        let _ = self.save();
+        Some(job)
+    }
+
     pub fn complete(&self, job_id: &str) -> Result<()> {
         {
             let mut state = self.state.lock();
@@ -182,6 +208,15 @@ impl PersistentQueue {
 
     pub fn pending_count(&self) -> usize {
         self.state.lock().jobs.len()
+    }
+
+    pub fn pending_count_for_lane(&self, lane: QueueLane) -> usize {
+        self.state
+            .lock()
+            .jobs
+            .iter()
+            .filter(|job| job.job_type.lane() == lane)
+            .count()
     }
 
     pub fn completed_count(&self) -> usize {
@@ -289,7 +324,7 @@ fn find_narou_root() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobType, PersistentQueue};
+    use super::{JobType, PersistentQueue, QueueLane};
 
     #[test]
     fn clear_saves_without_relocking_deadlock() {
@@ -306,5 +341,24 @@ mod tests {
         assert_eq!(reloaded.pending_count(), 0);
         assert_eq!(reloaded.completed_count(), 0);
         assert_eq!(reloaded.failed_count(), 0);
+    }
+
+    #[test]
+    fn pop_for_lane_removes_first_matching_lane_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        queue.push(JobType::Download, "1").unwrap();
+        queue.push(JobType::Convert, "2").unwrap();
+        queue.push(JobType::Update, "3").unwrap();
+
+        let popped = queue.pop_for_lane(QueueLane::Secondary).unwrap();
+        assert!(matches!(popped.job_type, JobType::Convert));
+        assert_eq!(queue.pending_count_for_lane(QueueLane::Secondary), 0);
+
+        let remaining = queue.get_pending_tasks();
+        assert_eq!(remaining.len(), 2);
+        assert!(matches!(remaining[0].job_type, JobType::Download));
+        assert!(matches!(remaining[1].job_type, JobType::Update));
     }
 }

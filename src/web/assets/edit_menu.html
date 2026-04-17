@@ -335,6 +335,22 @@
     fetch('/api/notepad/read').then(function(r) { return r.json(); }).then(function(data) {
       notepadArea.value = data.content || '';
     });
+    function connectNotepadSocket(wsPort) {
+      var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      var ws = new WebSocket(proto + '//' + location.hostname + ':' + wsPort + '/ws');
+      ws.onmessage = function(event) {
+        try {
+          var msg = JSON.parse(event.data);
+          if (msg.type === 'notepad.change' && document.activeElement !== notepadArea) {
+            notepadArea.value = msg.data || '';
+          }
+        } catch (_) {}
+      };
+      ws.onclose = function() { setTimeout(function() { connectNotepadSocket(wsPort); }, 5000); };
+    }
+    fetch('/api/webui/config').then(function(r) { return r.json(); }).then(function(data) {
+      if (data && data.ws_port) connectNotepadSocket(data.ws_port);
+    });
     var notepadTimer = null;
     notepadArea.addEventListener('input', function() {
       clearTimeout(notepadTimer);

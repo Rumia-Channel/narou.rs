@@ -529,8 +529,11 @@ export function renderTagList() {
 
 export function renderQueueStatus() {
   const qs = State.queueStatus;
+  const runningCount = typeof qs.running_count === 'number'
+    ? qs.running_count
+    : (qs.running ? 1 : 0);
   if (El.queueCount) {
-    const total = (qs.pending || 0) + (qs.running ? 1 : 0);
+    const total = (qs.pending || 0) + runningCount;
     El.queueCount.textContent = String(total);
     El.queueCount.classList.toggle('queue-size-active', total > 0);
   }

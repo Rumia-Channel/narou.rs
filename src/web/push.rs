@@ -215,9 +215,15 @@ impl PushServer {
         }
     }
 
-    pub fn get_history(&self) -> String {
+    pub fn get_history_for(&self, stream: Option<&str>) -> String {
         let history = self.console_history.lock();
-        history.iter().map(|(msg, _)| msg.as_str()).collect::<Vec<_>>().join("\n")
+        let target_stream = stream.unwrap_or("stdout");
+        history
+            .iter()
+            .filter(|(_, target_console)| target_console == target_stream)
+            .map(|(msg, _)| msg.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn clear_history(&self) {

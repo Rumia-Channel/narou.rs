@@ -1,8 +1,10 @@
 use axum::{
     extract::{Query, State},
-    response::Json,
+    http::header,
+    response::{Html, IntoResponse, Json, Response},
 };
 use reqwest::header::USER_AGENT;
+use serde::Deserialize;
 use std::time::Duration;
 
 use crate::compat::{load_local_setting_bool, load_local_setting_string};
@@ -12,6 +14,38 @@ use crate::version;
 
 use super::AppState;
 use super::state::{ApiResponse, LogsParams};
+
+#[derive(Debug, Deserialize)]
+pub struct TagListParams {
+    format: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HistoryParams {
+    stream: Option<String>,
+    format: Option<String>,
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn tag_color_class(color: &str) -> &'static str {
+    match color {
+        "green" => "tag-green",
+        "yellow" => "tag-yellow",
+        "blue" => "tag-blue",
+        "magenta" => "tag-magenta",
+        "cyan" => "tag-cyan",
+        "red" => "tag-red",
+        "white" => "tag-white",
+        _ => "tag-default",
+    }
+}
 
 pub async fn version_current(State(_state): State<AppState>) -> Json<serde_json::Value> {
     Json(version::version_json())
@@ -96,7 +130,10 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
     }))
 }
 
-pub async fn tag_list(State(_state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn tag_list(
+    State(_state): State<AppState>,
+    Query(params): Query<TagListParams>,
+) -> Response {
     let (tags, tag_colors) = with_database(|db| {
         let index = db.tag_index();
         let mut list: Vec<(&String, &Vec<i64>)> = index.iter().collect();
@@ -113,7 +150,24 @@ pub async fn tag_list(State(_state): State<AppState>) -> Json<serde_json::Value>
     })
     .unwrap_or_default();
 
-    Json(serde_json::json!({ "tags": tags, "tag_colors": tag_colors }))
+    if params.format.as_deref() == Some("json") {
+        return Json(serde_json::json!({ "tags": tags, "tag_colors": tag_colors })).into_response();
+    }
+
+    let mut html = String::from(
+        "<div><span class=\"tag-label tag-default tag-reset\" data-tag=\"\">タグ検索を解除</span></div>\
+<div class=\"text-muted\" style=\"font-size:0.8em\">Altキーを押しながらで除外検索</div>",
+    );
+    for tag in &tags {
+        let escaped_tag = html_escape(tag);
+        let class = tag_color_class(tag_colors.get(tag).map(|value| value.as_str()).unwrap_or("default"));
+        html.push_str(&format!(
+            "<div><span class=\"tag-label {}\" data-tag=\"{}\">{}</span> \
+<span class=\"select-color-button\" data-target-tag=\"{}\"><span class=\"tag-label {} tag-fixed-width\">a</span></span></div>",
+            class, escaped_tag, escaped_tag, escaped_tag, class
+        ));
+    }
+    Html(html).into_response()
 }
 
 pub async fn tag_change_color(
@@ -175,7 +229,7 @@ pub async fn notepad_read(State(_state): State<AppState>) -> Json<serde_json::Va
 }
 
 pub async fn notepad_save(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
     let content = body["content"]
@@ -185,10 +239,13 @@ pub async fn notepad_save(
     let result = std::fs::write(".narou/notepad.txt", content);
 
     match result {
-        Ok(_) => Json(ApiResponse {
-            success: true,
-            message: "Saved".to_string(),
-        }),
+        Ok(_) => {
+            state.push_server.broadcast_event("notepad.change", content);
+            Json(ApiResponse {
+                success: true,
+                message: "Saved".to_string(),
+            })
+        }
         Err(e) => Json(ApiResponse {
             success: false,
             message: e.to_string(),
@@ -205,9 +262,19 @@ pub async fn recent_logs(
     Json(serde_json::json!({ "logs": logs }))
 }
 
-pub async fn console_history(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let history = state.push_server.get_history();
-    Json(serde_json::json!({ "history": history }))
+pub async fn console_history(
+    State(state): State<AppState>,
+    Query(params): Query<HistoryParams>,
+) -> Response {
+    let history = state.push_server.get_history_for(params.stream.as_deref());
+    if params.format.as_deref() == Some("json") {
+        return Json(serde_json::json!({ "history": history })).into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        history,
+    )
+        .into_response()
 }
 
 pub async fn clear_history(State(state): State<AppState>) -> Json<ApiResponse> {

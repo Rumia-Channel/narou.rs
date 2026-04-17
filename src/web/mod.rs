@@ -27,8 +27,9 @@ pub struct AppState {
     pub ws_port: u16,
     pub push_server: Arc<push::PushServer>,
     pub basic_auth_header: Option<String>,
-    pub running_job: Arc<parking_lot::Mutex<Option<crate::queue::QueueJob>>>,
-    pub running_child_pid: Arc<parking_lot::Mutex<Option<u32>>>,
+    pub queue: Arc<crate::queue::PersistentQueue>,
+    pub running_jobs: Arc<parking_lot::Mutex<Vec<crate::queue::QueueJob>>>,
+    pub running_child_pids: Arc<parking_lot::Mutex<std::collections::HashMap<String, u32>>>,
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -37,7 +38,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/", get(frontend::index))
         .route("/assets/{*path}", get(frontend::asset))
         .route("/api/novels/count", get(novels::novels_count))
-        .route("/api/list", get(novels::api_list))
+        .route("/api/list", get(novels::api_list).post(novels::api_list_post))
         .route("/api/version/current.json", get(misc::version_current))
         .route("/api/version/latest.json", get(misc::version_latest))
         .route("/api/webui/config", get(misc::webui_config))
@@ -96,7 +97,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/backup_bookmark", post(jobs::api_backup_bookmark))
         .route("/api/mail", post(jobs::api_mail))
         .route("/api/setting_burn", post(jobs::api_setting_burn))
-        .route("/api/diff_list", post(jobs::api_diff_list))
+        .route("/api/diff_list", get(jobs::api_diff_list_get).post(jobs::api_diff_list))
         .route("/api/diff", post(jobs::api_diff))
         .route("/api/diff_clean", post(jobs::api_diff_clean))
         .route("/api/csv/import", post(jobs::api_csv_import))
@@ -106,6 +107,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/update_by_tag", post(jobs::api_update_by_tag))
         .route("/api/taginfo.json", post(jobs::api_taginfo))
         .route("/api/update_general_lastup", post(jobs::api_update_general_lastup))
+        .route("/api/download_request", get(jobs::api_download_request))
+        .route("/api/downloadable.gif", get(jobs::api_downloadable_gif))
+        .route("/api/download4ssl", get(jobs::api_download4ssl))
         .route("/api/restore_pending_tasks", post(jobs::restore_pending_tasks))
         .route("/api/defer_restore_pending_tasks", post(jobs::defer_restore_pending_tasks))
         .route("/api/confirm_running_tasks", post(jobs::confirm_running_tasks))

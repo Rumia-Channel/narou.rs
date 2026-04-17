@@ -148,6 +148,11 @@ function handleWsMessage(msg) {
     case 'tag.updateCanvas':
       refreshTags();
       break;
+    case 'notepad.change':
+      if (El.notepad && El.notepad.value !== (msg.data || '')) {
+        El.notepad.value = msg.data || '';
+      }
+      break;
     case 'echo':
       appendConsole(msg.body || '', msg.target_console);
       break;

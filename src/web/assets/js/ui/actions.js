@@ -55,18 +55,15 @@ export function bindActions() {
 
   El.consoleHistory?.addEventListener('click', async () => {
     try {
-      const data = await fetchJson('/api/history');
-      if (data?.history !== undefined && El.console) {
-        var lines = El.console.querySelectorAll('.console-line');
-        lines.forEach(function(el) { el.remove(); });
-        var histLines = data.history.split('\n');
-        histLines.forEach(function(line) {
-          var div = document.createElement('div');
-          div.className = 'console-line';
-          div.textContent = line;
-          El.console.appendChild(div);
-        });
-        El.console.scrollTop = El.console.scrollHeight;
+      const mainData = await fetchJson('/api/history?format=json');
+      if (mainData?.history !== undefined && El.console) {
+        replaceConsoleHistory(El.console, mainData.history);
+      }
+      if (State.concurrencyEnabled && El.consoleStdout2) {
+        const subData = await fetchJson('/api/history?format=json&stream=stdout2');
+        if (subData?.history !== undefined) {
+          replaceConsoleHistory(El.consoleStdout2, subData.history);
+        }
       }
     } catch { /* ignore */ }
   });
@@ -1100,7 +1097,7 @@ export async function refreshQueueDetailed() {
 
 export async function refreshTags() {
   try {
-    const data = await fetchJson('/api/tag_list');
+    const data = await fetchJson('/api/tag_list?format=json');
     if (data) {
       State.tags = data.tags || [];
       State.tagColors = data.tag_colors || data.colors || {};
@@ -1108,4 +1105,16 @@ export async function refreshTags() {
       renderNovelList();
     }
   } catch { /* ignore */ }
+}
+
+function replaceConsoleHistory(consoleEl, history) {
+  var lines = consoleEl.querySelectorAll('.console-line');
+  lines.forEach(function(el) { el.remove(); });
+  String(history || '').split('\n').forEach(function(line) {
+    var div = document.createElement('div');
+    div.className = 'console-line';
+    div.textContent = line;
+    consoleEl.appendChild(div);
+  });
+  consoleEl.scrollTop = consoleEl.scrollHeight;
 }

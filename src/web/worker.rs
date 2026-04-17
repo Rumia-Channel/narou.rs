@@ -3,58 +3,86 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use std::collections::HashMap;
 
 use tokio::task::JoinHandle;
 
 use crate::compat::load_local_setting_string;
 use crate::db::with_database_mut;
 use crate::progress::WS_LINE_PREFIX;
-use crate::queue::{JobType, QueueJob};
-
-use super::jobs::open_queue;
+use crate::queue::{JobType, PersistentQueue, QueueLane, QueueJob};
 use super::push::PushServer;
 
 const WEBUI_UPDATE_START_PREFIX: &str = "__webui_update_start__=";
 
-pub fn start_queue_worker(
+#[derive(Clone, Copy)]
+enum WorkerLane {
+    All,
+    Default,
+    Secondary,
+}
+
+pub fn start_queue_workers(
     root_dir: PathBuf,
+    queue: Arc<PersistentQueue>,
     push_server: Arc<PushServer>,
-    running_job: Arc<parking_lot::Mutex<Option<QueueJob>>>,
-    running_child_pid: Arc<parking_lot::Mutex<Option<u32>>>,
+    running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
+    running_child_pids: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    concurrency_enabled: bool,
+) -> Vec<JoinHandle<()>> {
+    let lanes = if concurrency_enabled {
+        vec![WorkerLane::Default, WorkerLane::Secondary]
+    } else {
+        vec![WorkerLane::All]
+    };
+    lanes
+        .into_iter()
+        .map(|lane| {
+            start_queue_worker_for_lane(
+                root_dir.clone(),
+                Arc::clone(&queue),
+                Arc::clone(&push_server),
+                Arc::clone(&running_jobs),
+                Arc::clone(&running_child_pids),
+                lane,
+            )
+        })
+        .collect()
+}
+
+fn start_queue_worker_for_lane(
+    root_dir: PathBuf,
+    queue: Arc<PersistentQueue>,
+    push_server: Arc<PushServer>,
+    running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
+    running_child_pids: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    lane: WorkerLane,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let queue = match open_queue() {
-                Ok(queue) => queue,
-                Err(message) => {
-                    push_server.broadcast_error(&message);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-            };
-
-            let Some(job) = queue.pop() else {
+            let Some(job) = pop_next_job(queue.as_ref(), lane) else {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             };
 
-            *running_job.lock() = Some(job.clone());
+            register_running_job(&running_jobs, &job);
             push_server.broadcast_event("queue_start", &job.id);
 
             let root_dir = root_dir.clone();
             let job_for_run = job.clone();
             let ps = Arc::clone(&push_server);
-            let pid_ref = Arc::clone(&running_child_pid);
-            let success = tokio::task::spawn_blocking(move || execute_job(&root_dir, &job_for_run, &ps, &pid_ref))
-                .await
-                .unwrap_or(false);
+            let pid_ref = Arc::clone(&running_child_pids);
+            let success =
+                tokio::task::spawn_blocking(move || execute_job(&root_dir, &job_for_run, &ps, &pid_ref))
+                    .await
+                    .unwrap_or(false);
 
             // Refresh in-memory database from disk (subprocess may have modified it)
             if let Err(e) = with_database_mut(|db| db.refresh()) {
                 push_server.broadcast_error(&format!("DB更新エラー: {}", e));
             }
 
-            *running_job.lock() = None;
+            unregister_running_job(&running_jobs, &job.id);
             if success {
                 let _ = queue.complete(&job.id);
                 push_server.broadcast_event("queue_complete", &job.id);
@@ -62,7 +90,7 @@ pub fn start_queue_worker(
                 let _ = queue.fail(&job.id);
                 push_server.broadcast_event("queue_failed", &job.id);
             }
-            if should_reload_table_after_job(&queue) {
+            if should_reload_table_after_job(queue.as_ref(), &running_jobs) {
                 push_server.broadcast_event("table.reload", "");
                 push_server.broadcast_event("tag.updateCanvas", "");
             }
@@ -71,22 +99,48 @@ pub fn start_queue_worker(
     })
 }
 
-fn should_reload_table_after_job(queue: &crate::queue::PersistentQueue) -> bool {
+fn pop_next_job(queue: &PersistentQueue, lane: WorkerLane) -> Option<QueueJob> {
+    match lane {
+        WorkerLane::All => queue.pop(),
+        WorkerLane::Default => queue.pop_for_lane(QueueLane::Default),
+        WorkerLane::Secondary => queue.pop_for_lane(QueueLane::Secondary),
+    }
+}
+
+fn register_running_job(running_jobs: &parking_lot::Mutex<Vec<QueueJob>>, job: &QueueJob) {
+    let mut guard = running_jobs.lock();
+    guard.retain(|existing| existing.id != job.id);
+    guard.push(job.clone());
+}
+
+fn unregister_running_job(running_jobs: &parking_lot::Mutex<Vec<QueueJob>>, job_id: &str) {
+    running_jobs.lock().retain(|job| job.id != job_id);
+}
+
+fn should_reload_table_after_job(
+    queue: &PersistentQueue,
+    running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
+) -> bool {
     match load_local_setting_string("webui.table.reload-timing")
         .as_deref()
         .unwrap_or("every")
     {
-        "queue" => queue.pending_count() == 0,
+        "queue" => queue.pending_count() == 0 && running_jobs.lock().is_empty(),
         _ => true,
     }
 }
 
-fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, running_pid: &Arc<parking_lot::Mutex<Option<u32>>>) -> bool {
+fn execute_job(
+    root_dir: &Path,
+    job: &QueueJob,
+    push_server: &Arc<PushServer>,
+    running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+) -> bool {
+    let target_console = console_target_for_job(job.job_type);
     let Ok(exe) = std::env::current_exe() else {
-        push_server.broadcast_echo("エラー: 実行ファイルパスを取得できません", "stdout");
+        push_server.broadcast_echo("エラー: 実行ファイルパスを取得できません", target_console);
         return false;
     };
-    let target_console = console_target_for_job(job.job_type);
 
     let mut command = std::process::Command::new(exe);
     command
@@ -152,13 +206,13 @@ fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, r
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
-            push_server.broadcast_echo(&format!("プロセス起動失敗: {}", e), "stdout");
+            push_server.broadcast_echo(&format!("プロセス起動失敗: {}", e), target_console);
             return false;
         }
     };
 
     // Store child PID for external cancellation
-    *running_pid.lock() = Some(child.id());
+    running_pids.lock().insert(job.id.clone(), child.id());
 
     // Stream stdout in a separate thread
     let stdout = child.stdout.take();
@@ -204,7 +258,7 @@ fn execute_job(root_dir: &Path, job: &QueueJob, push_server: &Arc<PushServer>, r
     });
 
     let status = child.wait().map(|s| s.success()).unwrap_or(false);
-    *running_pid.lock() = None;
+    running_pids.lock().remove(&job.id);
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     status

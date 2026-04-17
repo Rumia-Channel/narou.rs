@@ -71,6 +71,34 @@
           textarea.value = data.content || '';
         });
 
+      function showStatus(message) {
+        status.textContent = message;
+        setTimeout(function() {
+          if (status.textContent === message) status.textContent = '';
+        }, 2000);
+      }
+
+      function connectWebSocket(wsPort) {
+        var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        var ws = new WebSocket(proto + '//' + location.hostname + ':' + wsPort + '/ws');
+        ws.onmessage = function(event) {
+          try {
+            var msg = JSON.parse(event.data);
+            if (msg.type === 'notepad.change' && document.activeElement !== textarea) {
+              textarea.value = msg.data || '';
+              showStatus('他の画面の変更を反映しました');
+            }
+          } catch (_) {}
+        };
+        ws.onclose = function() { setTimeout(function() { connectWebSocket(wsPort); }, 5000); };
+      }
+
+      fetch('/api/webui/config')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (data && data.ws_port) connectWebSocket(data.ws_port);
+        });
+
       textarea.addEventListener('input', function() {
         if (saveTimer) clearTimeout(saveTimer);
         status.textContent = '';
@@ -80,8 +108,7 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text: textarea.value })
           }).then(function() {
-            status.textContent = '保存しました';
-            setTimeout(function() { status.textContent = ''; }, 2000);
+            showStatus('保存しました');
           });
         }, 500);
       });
