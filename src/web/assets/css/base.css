@@ -7,6 +7,32 @@
 html {
   font-size: 100%;
   -webkit-tap-highlight-color: rgba(0, 0, 0, 0);
+  scrollbar-color: var(--btn-primary-bg) var(--input-bg);
+  scrollbar-width: thin;
+}
+
+* {
+  scrollbar-color: var(--btn-primary-bg) var(--input-bg);
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: 0.75em;
+  height: 0.75em;
+}
+
+*::-webkit-scrollbar-track {
+  background-color: var(--input-bg);
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--btn-primary-bg);
+  border: 0.15em solid var(--input-bg);
+  border-radius: var(--border-radius);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--btn-primary-border);
 }
 
 body {

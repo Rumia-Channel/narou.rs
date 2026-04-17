@@ -199,31 +199,59 @@ function getConsoleEl(targetConsole) {
 
 var progressBars = {};
 
+function getProgressHost() {
+  var host = document.getElementById('global-progressbars');
+  if (host) return host;
+  host = document.createElement('div');
+  host.id = 'global-progressbars';
+  host.className = 'global-progressbars hide';
+  document.body.appendChild(host);
+  return host;
+}
+
+function updateProgressHostVisibility() {
+  var host = document.getElementById('global-progressbars');
+  if (!host) return;
+  host.classList.toggle('hide', Object.keys(progressBars).length === 0);
+}
+
 function initProgressBar(topic, targetConsole) {
   var key = (targetConsole || 'stdout') + ':' + (topic || 'default');
   removeProgressBar(topic, targetConsole);
-  var con = getConsoleEl(targetConsole);
-  if (!con) return;
+  var host = getProgressHost();
   var wrapper = document.createElement('div');
-  wrapper.className = 'progress';
-  wrapper.innerHTML = '<div class="progress-bar" style="width:0%"></div>';
-  con.appendChild(wrapper);
-  progressBars[key] = wrapper.querySelector('.progress-bar');
-  con.scrollTop = con.scrollHeight;
+  wrapper.className = 'global-progress-item';
+  if (topic) {
+    var label = document.createElement('div');
+    label.className = 'global-progress-topic';
+    label.textContent = topic;
+    wrapper.appendChild(label);
+  }
+  var progress = document.createElement('div');
+  progress.className = 'progress';
+  progress.innerHTML = '<div class="progress-bar" style="width:0%"></div>';
+  wrapper.appendChild(progress);
+  host.appendChild(wrapper);
+  progressBars[key] = {
+    wrapper: wrapper,
+    bar: progress.querySelector('.progress-bar'),
+  };
+  updateProgressHostVisibility();
 }
 
 function setProgressBar(percent, topic, targetConsole) {
   var key = (targetConsole || 'stdout') + ':' + (topic || 'default');
   if (!progressBars[key]) initProgressBar(topic, targetConsole);
-  progressBars[key].style.width = (percent || 0) + '%';
+  progressBars[key].bar.style.width = (percent || 0) + '%';
 }
 
 function removeProgressBar(topic, targetConsole) {
   var key = (targetConsole || 'stdout') + ':' + (topic || 'default');
   if (!progressBars[key]) return;
-  var wrapper = progressBars[key].parentElement;
+  var wrapper = progressBars[key].wrapper;
   if (wrapper) wrapper.remove();
   delete progressBars[key];
+  updateProgressHostVisibility();
 }
 
 var lastLineComplete = true;
