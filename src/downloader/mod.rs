@@ -203,20 +203,40 @@ fn sections_latest_update_time(
     latest
 }
 
+pub(crate) fn normalize_narou_datetime(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut skipping_paren = false;
+
+    for ch in value.trim().chars() {
+        match ch {
+            '(' | '（' => skipping_paren = true,
+            ')' | '）' => skipping_paren = false,
+            _ if skipping_paren => {}
+            '年' => normalized.push('/'),
+            '月' => normalized.push('/'),
+            '日' => {}
+            '時' => normalized.push(':'),
+            '分' => normalized.push(':'),
+            '秒' => {}
+            '\u{00A0}' => normalized.push(' '),
+            _ => normalized.push(ch),
+        }
+    }
+
+    let separator_space = Regex::new(r"\s*([/:])\s*").expect("valid datetime separator regex");
+    let normalized = separator_space.replace_all(&normalized, "$1");
+    let whitespace = Regex::new(r"\s+").expect("valid whitespace regex");
+    whitespace
+        .replace_all(normalized.trim().trim_end_matches(':'), " ")
+        .trim()
+        .to_string()
+}
+
 fn parse_loose_datetime(value: &str) -> Option<DateTime<Utc>> {
-    let mut value = value.trim().to_string();
+    let value = normalize_narou_datetime(value);
     if value.is_empty() {
         return None;
     }
-
-    value = value
-        .replace('年', "/")
-        .replace('月', "/")
-        .replace('日', "")
-        .replace('時', ":")
-        .replace('分', ":")
-        .replace('秒', "");
-    value = value.trim().trim_end_matches(':').to_string();
 
     if let Ok(ts) = value.parse::<i64>() {
         return DateTime::from_timestamp(ts, 0);
@@ -1670,6 +1690,10 @@ mod tests {
         assert_eq!(
             super::date_string_to_ymd("2026年04月12日 10時00分"),
             Some("20260412".to_string())
+        );
+        assert_eq!(
+            super::date_string_to_ymd("2025年 10月 28日 07時 56分"),
+            Some("20251028".to_string())
         );
         assert_eq!(
             super::date_string_to_ymd("2026-04-12 10:00:00.123456 +0900"),

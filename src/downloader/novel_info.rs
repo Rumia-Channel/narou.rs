@@ -116,7 +116,7 @@ impl NovelInfo {
 }
 
 fn parse_narou_date(s: &str) -> Option<DateTime<Utc>> {
-    let s = normalize_narou_date(s);
+    let s = super::normalize_narou_datetime(s);
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -149,28 +149,6 @@ fn parse_narou_date(s: &str) -> Option<DateTime<Utc>> {
     }
 
     None
-}
-
-fn normalize_narou_date(s: &str) -> String {
-    let mut normalized = String::with_capacity(s.len());
-    let mut skipping_paren = false;
-
-    for ch in s.trim().chars() {
-        match ch {
-            '(' | '（' => skipping_paren = true,
-            ')' | '）' => skipping_paren = false,
-            _ if skipping_paren => {}
-            '年' => normalized.push('/'),
-            '月' => normalized.push('/'),
-            '日' => {}
-            '時' => normalized.push(':'),
-            '分' => normalized.push(':'),
-            '秒' => {}
-            _ => normalized.push(ch),
-        }
-    }
-
-    normalized.trim().trim_end_matches(':').trim().to_string()
 }
 
 #[cfg(test)]

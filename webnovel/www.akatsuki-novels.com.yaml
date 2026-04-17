@@ -23,7 +23,7 @@ story: |-
 # 目次取得設定
 toc_url: \\k<top_url>/stories/index/novel_id~\\k<ncode>
 subtitles: |-
-  (?:<tr><td style="border: 0; padding: 0;word-break:break-all;" colspan=\\"2\\"><b>(?<chapter>.+?)</b></td></tr>)*<tr><td>(  )?<a href="(?<href>/stories/view/(?<index>\d+)/novel_id\~\d+)">(?<subtitle>.+?)</a> </td><td class="font-s">(?<subupdate>.+?) </td></tr>
+  (?:<tr><td[^>]*colspan=\\"2\\"[^>]*><b>(?<chapter>.+?)</b></td></tr>)?<tr><td>(?:&nbsp;|\s)*<a href="(?<href>/stories/view/(?<index>\d+)/novel_id\~\d+)">(?<subtitle>.+?)</a>(?:&nbsp;|\s)*</td><td class="font-s">(?<subupdate>.+?)(?:&nbsp;|\s)*</td></tr>
 
 # subdate(初投稿日)がない場合、一番最初のsubupdateで代用する
 subdate: no

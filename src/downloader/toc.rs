@@ -275,6 +275,32 @@ mod tests {
         );
         assert_eq!(*progress.positions.lock().unwrap(), vec![0, 0]);
     }
+
+    #[test]
+    fn akatsuki_toc_pattern_extracts_sections_with_nbsp_indent() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "暁").unwrap();
+        let toc_source = r#"
+<table class="list" cellpadding="0" cellspacing="0"><thead><tr><th>タイトル</th><th width="250">更新日時</th></tr></thead><tbody><tr><td style="border: 0; padding: 0;word-break:break-all;" colspan=\"2\"><b>ゼンヒ巡査部長編</b></td></tr><tr><td>&nbsp;&nbsp;<a href="/stories/view/313728/novel_id~31149">プロローグ:新任巡査部長、扇皇 ゼンヒ</a>&nbsp;</td><td class="font-s">2025年 10月 24日 07時 00分&nbsp;</td></tr><tr><td><a href="/stories/view/313729/novel_id~31149">Case1:三毛猫の捜索</a>&nbsp;</td><td class="font-s">2025年 10月 24日 12時 00分&nbsp;</td></tr></tbody></table>
+"#;
+
+        let subtitles = parse_subtitles(setting, toc_source, &HashMap::new()).unwrap();
+
+        assert_eq!(subtitles.len(), 2);
+        assert_eq!(subtitles[0].chapter, "ゼンヒ巡査部長編");
+        assert_eq!(subtitles[0].index, "313728");
+        assert_eq!(subtitles[0].subtitle, "プロローグ:新任巡査部長、扇皇 ゼンヒ");
+        assert_eq!(
+            subtitles[0].href,
+            "/stories/view/313728/novel_id~31149".to_string()
+        );
+        assert_eq!(
+            subtitles[0].subupdate.as_deref(),
+            Some("2025年 10月 24日 07時 00分")
+        );
+        assert_eq!(subtitles[1].chapter, "");
+        assert_eq!(subtitles[1].index, "313729");
+    }
 }
 
 pub fn create_short_story_subtitles(
