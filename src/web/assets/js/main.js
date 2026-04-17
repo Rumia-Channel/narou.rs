@@ -10,6 +10,7 @@ import { bindActions, refreshList, refreshQueue, refreshTags } from './ui/action
 
 let ws = null;
 const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
+const CONSOLE_BOTTOM_THRESHOLD = 8;
 
 function isPerformanceModeEnabled() {
   switch (State.performanceMode) {
@@ -42,6 +43,8 @@ async function init() {
   initDropdowns();
   applyI18n();
   bindActions();
+  bindConsoleAutoScroll(El.console);
+  bindConsoleAutoScroll(El.consoleStdout2);
 
   // Load config from server
   try {
@@ -93,9 +96,15 @@ function connectWebSocket() {
 
   ws.onopen = () => {
     const con = document.getElementById('console');
-    if (con) con.innerHTML = '';
+    if (con) {
+      con.innerHTML = '';
+      setConsolePinned(con, true);
+    }
     const con2 = document.getElementById('console-stdout2');
-    if (con2) con2.innerHTML = '';
+    if (con2) {
+      con2.innerHTML = '';
+      setConsolePinned(con2, true);
+    }
     clearAllProgressBars();
   };
 
@@ -183,9 +192,15 @@ function handleWsMessage(msg) {
       break;
     case 'console.clear': {
       const con = document.getElementById('console');
-      if (con) con.innerHTML = '';
+      if (con) {
+        con.innerHTML = '';
+        setConsolePinned(con, true);
+      }
       const con2 = document.getElementById('console-stdout2');
-      if (con2) con2.innerHTML = '';
+      if (con2) {
+        con2.innerHTML = '';
+        setConsolePinned(con2, true);
+      }
       clearAllProgressBars();
       break;
     }
@@ -233,6 +248,47 @@ function getConsoleEl(targetConsole) {
   return El.console;
 }
 
+function getConsolePinKeyByElement(consoleEl) {
+  return consoleEl?.id === 'console-stdout2' ? 'stdout2' : 'main';
+}
+
+function isConsoleNearBottom(consoleEl) {
+  return consoleEl.scrollTop + consoleEl.clientHeight >= consoleEl.scrollHeight - CONSOLE_BOTTOM_THRESHOLD;
+}
+
+function setConsolePinned(consoleEl, pinned) {
+  if (!consoleEl) return;
+  State.consolePinned[getConsolePinKeyByElement(consoleEl)] = pinned;
+}
+
+function isConsolePinned(consoleEl) {
+  if (!consoleEl) return false;
+  return State.consolePinned[getConsolePinKeyByElement(consoleEl)] !== false;
+}
+
+function scrollConsoleToBottom(consoleEl) {
+  if (!consoleEl) return;
+  consoleEl.scrollTop = consoleEl.scrollHeight;
+}
+
+function syncPinnedConsole(consoleEl) {
+  if (isConsolePinned(consoleEl)) {
+    scrollConsoleToBottom(consoleEl);
+  }
+}
+
+function bindConsoleAutoScroll(consoleEl) {
+  if (!consoleEl) return;
+  setConsolePinned(consoleEl, true);
+  consoleEl.addEventListener('scroll', () => {
+    setConsolePinned(consoleEl, isConsoleNearBottom(consoleEl));
+  }, { passive: true });
+  if (typeof ResizeObserver !== 'undefined') {
+    const observer = new ResizeObserver(() => syncPinnedConsole(consoleEl));
+    observer.observe(consoleEl);
+  }
+}
+
 var progressBars = {};
 
 function getProgressHost(targetConsole) {
@@ -253,6 +309,7 @@ function updateProgressHostVisibility(targetConsole) {
   var hasItems = host.childElementCount > 0;
   host.classList.toggle('hide', !hasItems);
   consoleEl.classList.toggle('console-with-progress', hasItems);
+  syncPinnedConsole(consoleEl);
 }
 
 function initProgressBar(topic, targetConsole) {
@@ -387,7 +444,7 @@ function appendConsole(text, targetConsole) {
   }
 
   const maxLines = isPerformanceModeEnabled() ? 200 : 1000;
-  const wasBottom = (con.scrollTop + con.clientHeight >= con.scrollHeight - 4);
+  const shouldStick = isConsolePinned(con);
 
   const lines = text.split('\n');
   // Remove trailing empty element from split (text ends with \n)
@@ -421,7 +478,9 @@ function appendConsole(text, targetConsole) {
     }
   }
 
-  if (wasBottom) con.scrollTop = con.scrollHeight;
+  if (shouldStick) {
+    scrollConsoleToBottom(con);
+  }
 }
 
 document.addEventListener('DOMContentLoaded', init);

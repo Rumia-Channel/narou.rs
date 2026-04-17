@@ -58,6 +58,7 @@ export const State = {
   // Console
   consoleExpanded: false,
   consoleHistory: [],
+  consolePinned: { main: true, stdout2: true },
   concurrencyEnabled: false,
 
   // Config from server

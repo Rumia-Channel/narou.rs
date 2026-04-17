@@ -31,10 +31,12 @@ export function bindActions() {
     if (El.console) {
       var lines = El.console.querySelectorAll('.console-line');
       lines.forEach(function(el) { el.remove(); });
+      State.consolePinned.main = true;
     }
     if (El.consoleStdout2) {
       var lines2 = El.consoleStdout2.querySelectorAll('.console-line');
       lines2.forEach(function(el) { el.remove(); });
+      State.consolePinned.stdout2 = true;
     }
     State.consoleHistory = [];
     try { await postJson('/api/clear_history', {}); } catch { /* ignore */ }
@@ -1194,5 +1196,10 @@ function replaceConsoleHistory(consoleEl, history) {
     div.textContent = line;
     consoleEl.appendChild(div);
   });
+  if (consoleEl.id === 'console-stdout2') {
+    State.consolePinned.stdout2 = true;
+  } else {
+    State.consolePinned.main = true;
+  }
   consoleEl.scrollTop = consoleEl.scrollHeight;
 }
