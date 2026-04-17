@@ -12,6 +12,8 @@ use crate::error::NarouError;
 use super::AppState;
 use super::state::{ApiResponse, IdPath, ListParams, NovelListItem, NovelListResponse};
 
+const ANNOTATION_COLOR_TIME_LIMIT_SECS: i64 = 6 * 60 * 60;
+
 /// JST (+09:00) timezone offset
 fn jst() -> FixedOffset {
     FixedOffset::east_opt(9 * 3600).unwrap()
@@ -23,6 +25,17 @@ fn format_jst(dt: DateTime<Utc>) -> String {
 
 fn format_jst_opt(dt: Option<DateTime<Utc>>) -> Option<String> {
     dt.map(|d| format_jst(d))
+}
+
+fn is_new_arrivals_marker(
+    new_arrivals_date: Option<DateTime<Utc>>,
+    last_update: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    new_arrivals_date.is_some_and(|nad| {
+        let limit = chrono::Duration::seconds(ANNOTATION_COLOR_TIME_LIMIT_SECS);
+        nad >= last_update && (nad + limit) > now
+    })
 }
 
 pub async fn index() -> &'static str {
@@ -126,10 +139,7 @@ fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (Status
             .take(length as usize)
             .map(|r| {
                 let now = chrono::Utc::now();
-                let is_new = r.new_arrivals_date.is_some_and(|nad| {
-                    let limit = chrono::Duration::seconds(259200); // 3 days
-                    nad >= r.last_update && (nad + limit) > now
-                });
+                let is_new = is_new_arrivals_marker(r.new_arrivals_date, r.last_update, now);
                 NovelListItem {
                     id: r.id,
                     title: r.title.clone(),
@@ -162,6 +172,30 @@ fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (Status
     .map_err(|e: NarouError| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_new_arrivals_marker;
+    use chrono::{Duration, TimeZone, Utc};
+
+    #[test]
+    fn new_arrivals_marker_uses_ruby_six_hour_window() {
+        let last_update = Utc.with_ymd_and_hms(2026, 4, 17, 0, 0, 0).unwrap();
+        let now = last_update + Duration::hours(5);
+        assert!(is_new_arrivals_marker(Some(last_update), last_update, now));
+
+        let expired = last_update + Duration::hours(7);
+        assert!(!is_new_arrivals_marker(Some(last_update), last_update, expired));
+    }
+
+    #[test]
+    fn new_arrivals_marker_requires_new_arrivals_date_not_older_than_last_update() {
+        let last_update = Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap();
+        let earlier = last_update - Duration::minutes(1);
+        let now = last_update + Duration::minutes(30);
+        assert!(!is_new_arrivals_marker(Some(earlier), last_update, now));
+    }
 }
 
 pub async fn get_novel(

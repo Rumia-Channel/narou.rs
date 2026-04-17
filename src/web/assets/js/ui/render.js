@@ -16,6 +16,7 @@ const TAG_COLOR_MAP = {
   white: 'tag-white',
 };
 const PAGE_LENGTH_OPTIONS = [20, 50, 100, 200, 500, -1];
+const ANNOTATION_COLOR_TIME_LIMIT_MS = 6 * 60 * 60 * 1000;
 
 let selectionDrag = null;
 let queueDragTaskId = null;
@@ -285,17 +286,18 @@ function createRow(novel, rowIndex) {
 
   const idText = isFrozen ? `＊${novel.id}` : String(novel.id);
 
-  // New arrival mark + date cell on last_update
+  // narou.rb parity: last_update gets "新着"/"更新" marks for 6 hours
+  const updateMarkClass = getLastUpdateMarkClass(novel);
   const updateCell = formatDateCell(novel.last_update, {
-    label: novel.new_arrivals ? '新着' : '',
-    labelClass: novel.new_arrivals ? 'new-arrivals' : '',
+    wrapperClass: updateMarkClass,
+    inlineClass: updateMarkClass,
   });
 
-  // general_lastup with time badge + hint-new-arrival when newer than last_update
+  // narou.rb parity: hint-new-arrival when general_lastup is newer than last_update
   let glCell = '';
   if (novel.general_lastup) {
     const badge = getTimeBadge(novel.general_lastup);
-    const glHint = novel.general_lastup > novel.last_update;
+    const glHint = hasGeneralLastupHint(novel);
     glCell = formatDateCell(novel.general_lastup, {
       inlineExtra: badge,
       wrapperClass: glHint ? 'hint-new-arrival' : '',
@@ -897,9 +899,8 @@ function setCheck(id, checked) {
 /* ===== Helpers ===== */
 
 function getTimeBadge(dateStr) {
-  if (!dateStr) return '';
-  const d = new Date(dateStr.replace(/-/g, '/'));
-  if (isNaN(d.getTime())) return '';
+  const d = parseDateValue(dateStr);
+  if (!d) return '';
   const diffMs = Date.now() - d.getTime();
   const hours = diffMs / (1000 * 60 * 60);
 
@@ -911,14 +912,44 @@ function getTimeBadge(dateStr) {
   return '';
 }
 
+function parseDateValue(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(String(dateStr).replace(/-/g, '/'));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function getLastUpdateMarkClass(novel) {
+  const lastUpdate = parseDateValue(novel.last_update);
+  if (!lastUpdate) return '';
+  const newArrivalsDate = parseDateValue(novel.new_arrivals_date);
+  const now = Date.now();
+  if (
+    newArrivalsDate &&
+    newArrivalsDate.getTime() >= lastUpdate.getTime() &&
+    newArrivalsDate.getTime() + ANNOTATION_COLOR_TIME_LIMIT_MS >= now
+  ) {
+    return 'new-arrivals';
+  }
+  if (lastUpdate.getTime() + ANNOTATION_COLOR_TIME_LIMIT_MS >= now) {
+    return 'new-update';
+  }
+  return '';
+}
+
+function hasGeneralLastupHint(novel) {
+  const generalLastup = parseDateValue(novel.general_lastup);
+  const lastUpdate = parseDateValue(novel.last_update);
+  return !!(generalLastup && lastUpdate && generalLastup.getTime() > lastUpdate.getTime());
+}
+
 function formatDate(dateStr) {
   if (!dateStr) return { date: '', time: '' };
   // API returns "YYYY-MM-DD HH:MM"
   const m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}:\d{2})/);
   if (m) return { date: `${m[1]}/${m[2]}/${m[3]}`, time: m[4] };
   // Fallback: try Date parsing
-  const d = new Date(dateStr.replace(/-/g, '/'));
-  if (isNaN(d.getTime())) return { date: dateStr, time: '' };
+  const d = parseDateValue(dateStr);
+  if (!d) return { date: dateStr, time: '' };
   const y = d.getFullYear();
   const mo = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
@@ -931,6 +962,7 @@ function formatDateCell(dateStr, options = {}) {
   const { date, time } = formatDate(dateStr);
   if (!date) return '';
   const inlineExtra = options.inlineExtra || '';
+  const inlineClass = options.inlineClass || '';
   const extraLine = options.extraLine || '';
   const label = options.label || '';
   const labelClass = options.labelClass || '';
@@ -938,7 +970,7 @@ function formatDateCell(dateStr, options = {}) {
   let html = `<div class="date-cell${wrapperClass ? ' ' + wrapperClass : ''}">`;
   html += `<span class="date-cell-date">${date}</span>`;
   if (time || label || inlineExtra) {
-    html += '<span class="date-cell-inline">';
+    html += `<span class="date-cell-inline${inlineClass ? ' ' + inlineClass : ''}">`;
     if (time) {
       html += `<span class="date-cell-time">${time}</span>`;
     }

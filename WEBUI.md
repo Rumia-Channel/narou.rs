@@ -197,7 +197,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 |------|--------|--------|------|
 | 選択行ハイライト | 黄色背景 | `.selected` 黄色背景 | ✅ |
 | 凍結行 | 青色テキスト + ＊マーク | `.frozen` クラス + ＊マーク | ✅ |
-| 新着表示 | マゼンタ強調 | `.date-cell-label.new-arrivals` | ✅ |
+| 新着/更新表示 | 6時間以内は `新着`(マゼンタ) / `更新`(緑) | `.new-arrivals` / `.new-update` | ✅ |
 | 更新時間バッジ | 1h(赤)/6h(緑)/24h(青)/3d(灰)/1w(水色) | `.gl-badge.gl-1h/6h/24h/3d/1w` (general_lastup列) | ✅ |
 | 新着ヒント (GL > last_update) | マゼンタの ● マーカー | `.hint-new-arrival` | ✅ |
 | 奇数/偶数行色 | CSS striping | CSS変数で指定 | ✅ |

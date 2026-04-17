@@ -445,9 +445,17 @@ li.enable-selected.disabled a {
   font-weight: bold;
 }
 
+.date-cell-inline.new-arrivals::after {
+  content: " 新着";
+}
+
 .new-update {
   color: var(--new-update-color);
   font-weight: bold;
+}
+
+.date-cell-inline.new-update::after {
+  content: " 更新";
 }
 
 /* narou.rb: hint when general_lastup > last_update (new content available) */
