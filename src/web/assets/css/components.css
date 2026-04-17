@@ -385,9 +385,17 @@ li.enable-selected.disabled a {
 
 .btn-story {
   background: none; border: 0.05em solid var(--border-color); border-radius: var(--border-radius);
-  cursor: pointer; font-size: 0.85em; padding: 0.05em 0.35em; color: var(--link-color);
+  cursor: pointer; font-size: 0.85em; padding: 0.05em 0.35em; color: var(--text-color);
 }
 .btn-story:hover { background: var(--dropdown-hover-bg); }
+
+.btn-link-icon {
+  color: var(--text-color);
+}
+
+.btn-link-icon:hover {
+  color: var(--text-color);
+}
 
 .btn-story .material-symbols-outlined,
 .btn-download .material-symbols-outlined,
@@ -688,12 +696,12 @@ li.enable-selected.disabled a {
   cursor: pointer;
   padding: 0.15em 0.30em;
   font-size: 1.10em;
-  color: var(--text-muted);
+  color: var(--text-color);
   line-height: 1;
 }
 
 .row-action-btn:hover {
-  color: var(--text-color);
+  opacity: 0.75;
 }
 
 /* ========== Filterable text ========== */
@@ -797,7 +805,7 @@ li.enable-selected.disabled a {
   background: none;
   cursor: pointer;
   padding: 0 0.30em;
-  color: var(--btn-danger-bg);
+  color: var(--text-color);
   font-size: 1em;
 }
 
@@ -824,7 +832,7 @@ li.enable-selected.disabled a {
 }
 
 .queue-task-cancel {
-  color: var(--btn-danger-bg);
+  color: var(--text-color);
 }
 
 .queue-task-cancel:hover,
@@ -986,7 +994,7 @@ li.enable-selected.disabled a {
   top: 50%;
   transform: translateY(-50%);
   font-size: 0.85em;
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--text-color);
   pointer-events: none;
   display: none;
 }

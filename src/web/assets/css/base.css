@@ -83,6 +83,7 @@ body {
   user-select: none;
   -webkit-font-smoothing: antialiased;
   font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+  color: currentColor;
 }
 
 .material-symbols-outlined.icon-leading {

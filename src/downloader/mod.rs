@@ -1156,14 +1156,7 @@ impl Downloader {
                     updated.toc_url = record.toc_url.clone();
                     updated.sitename = record.sitename.clone();
                     updated.end = record.end;
-                    let has_changes = updated_count > 0
-                        || title_changed
-                        || author_changed
-                        || story_changed
-                        || sections_deleted;
-                    if has_changes || existing_id.is_none() {
-                        updated.last_update = record.last_update;
-                    }
+                    updated.last_update = record.last_update;
                     if updated_count > 0 {
                         updated.new_arrivals_date = record.new_arrivals_date;
                     }
