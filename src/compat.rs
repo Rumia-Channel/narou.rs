@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use crate::converter::NovelConverter;
@@ -59,6 +59,47 @@ pub fn load_local_setting_bool(key: &str) -> bool {
             _ => None,
         })
         .unwrap_or(false)
+}
+
+pub fn relay_web_stream_to_console<R: io::Read>(
+    reader: R,
+    target_console: &str,
+) -> std::result::Result<(), String> {
+    let reader = BufReader::new(reader);
+    for line in reader.lines() {
+        println!(
+            "{}",
+            reroute_web_line_to_console(&line.map_err(|e| e.to_string())?, target_console)
+        );
+    }
+    Ok(())
+}
+
+pub fn reroute_web_line_to_console(text: &str, target_console: &str) -> String {
+    if let Some(json_str) = text.strip_prefix(crate::progress::WS_LINE_PREFIX) {
+        if let Ok(mut message) =
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json_str)
+        {
+            message.insert(
+                "target_console".to_string(),
+                serde_json::Value::String(target_console.to_string()),
+            );
+            return format!(
+                "{}{}",
+                crate::progress::WS_LINE_PREFIX,
+                serde_json::Value::Object(message)
+            );
+        }
+    }
+    format!(
+        "{}{}",
+        crate::progress::WS_LINE_PREFIX,
+        serde_json::json!({
+            "type": "echo",
+            "body": text,
+            "target_console": target_console
+        })
+    )
 }
 
 pub fn load_local_setting_list(key: &str) -> Vec<String> {
@@ -501,8 +542,12 @@ fn sanitize_backup_name(title: &str) -> String {
 mod tests {
     use chrono::{TimeZone, Utc};
     use crate::db::inventory::Inventory;
+    use crate::progress::WS_LINE_PREFIX;
 
-    use super::{load_frozen_ids_from_inventory, record_is_frozen, sanitize_backup_name};
+    use super::{
+        load_frozen_ids_from_inventory, record_is_frozen, reroute_web_line_to_console,
+        sanitize_backup_name,
+    };
     use crate::db::NovelRecord;
 
     fn sample_record(id: i64, tags: &[&str]) -> NovelRecord {
@@ -552,6 +597,35 @@ mod tests {
     #[test]
     fn sanitize_backup_name_falls_back_when_empty() {
         assert_eq!(sanitize_backup_name(""), "");
+    }
+
+    #[test]
+    fn reroute_web_line_to_console_wraps_plain_text_for_requested_console() {
+        let routed = reroute_web_line_to_console("Converted: test.txt", "stdout2");
+        assert!(routed.starts_with(WS_LINE_PREFIX));
+        let json = routed.trim_start_matches(WS_LINE_PREFIX);
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(value["type"], "echo");
+        assert_eq!(value["body"], "Converted: test.txt");
+        assert_eq!(value["target_console"], "stdout2");
+    }
+
+    #[test]
+    fn reroute_web_line_to_console_retargets_structured_messages() {
+        let source = format!(
+            "{}{}",
+            WS_LINE_PREFIX,
+            serde_json::json!({
+                "type": "progressbar.step",
+                "data": { "current": 1, "total": 2, "percent": 50.0, "topic": "convert" }
+            })
+        );
+        let routed = reroute_web_line_to_console(&source, "stdout2");
+        let json = routed.trim_start_matches(WS_LINE_PREFIX);
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(value["type"], "progressbar.step");
+        assert_eq!(value["target_console"], "stdout2");
+        assert_eq!(value["data"]["topic"], "convert");
     }
 
     #[test]

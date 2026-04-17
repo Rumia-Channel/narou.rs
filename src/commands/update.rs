@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::io::{self, BufRead, BufReader, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -10,7 +10,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 
 use narou_rs::compat::{
     convert_existing_novel, current_device, load_local_setting_bool, load_local_setting_string,
-    load_local_setting_value, yaml_value_to_string,
+    load_local_setting_value, relay_web_stream_to_console, yaml_value_to_string,
 };
 use narou_rs::converter::NovelConverter;
 use narou_rs::converter::device::{Device, OutputManager};
@@ -24,7 +24,7 @@ use narou_rs::downloader::{
 use narou_rs::mail::{
     MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
 };
-use narou_rs::progress::{CliProgress, WebProgress, WS_LINE_PREFIX, is_web_mode};
+use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
 use narou_rs::termcolor::{bold_colored, colored};
 
 const MODIFIED_TAG: &str = "modified";
@@ -794,38 +794,7 @@ fn auto_convert_via_web_subprocess(id: i64, no_open: bool) -> Result<(), String>
 }
 
 fn relay_web_convert_stream<R: io::Read>(reader: R) -> Result<(), String> {
-    let reader = BufReader::new(reader);
-    for line in reader.lines() {
-        relay_web_convert_line(&line.map_err(|e| e.to_string())?);
-    }
-    Ok(())
-}
-
-fn relay_web_convert_line(text: &str) {
-    println!("{}", reroute_web_convert_line(text));
-}
-
-fn reroute_web_convert_line(text: &str) -> String {
-    if let Some(json_str) = text.strip_prefix(WS_LINE_PREFIX) {
-        if let Ok(mut message) =
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json_str)
-        {
-            message.insert(
-                "target_console".to_string(),
-                serde_json::Value::String("stdout2".to_string()),
-            );
-            return format!("{}{}", WS_LINE_PREFIX, serde_json::Value::Object(message));
-        }
-    }
-    format!(
-        "{}{}",
-        WS_LINE_PREFIX,
-        serde_json::json!({
-            "type": "echo",
-            "body": text,
-            "target_console": "stdout2"
-        })
-    )
+    relay_web_stream_to_console(reader, "stdout2")
 }
 
 fn process_hotentry(
@@ -1374,7 +1343,9 @@ fn parse_api_datetime(value: &str) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WS_LINE_PREFIX, abort_if_interrupted, reroute_web_convert_line, sleep_with_interrupt};
+    use super::{abort_if_interrupted, sleep_with_interrupt};
+    use narou_rs::compat::reroute_web_line_to_console;
+    use narou_rs::progress::WS_LINE_PREFIX;
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -1391,7 +1362,7 @@ mod tests {
 
     #[test]
     fn reroute_web_convert_line_wraps_plain_text_for_stdout2() {
-        let routed = reroute_web_convert_line("Converted: test.epub");
+        let routed = reroute_web_line_to_console("Converted: test.epub", "stdout2");
         assert!(routed.starts_with(WS_LINE_PREFIX));
         let json = routed.trim_start_matches(WS_LINE_PREFIX);
         let value: serde_json::Value = serde_json::from_str(json).unwrap();
@@ -1410,7 +1381,7 @@ mod tests {
                 "data": { "current": 3, "total": 9, "percent": 33.3, "topic": "convert" }
             })
         );
-        let routed = reroute_web_convert_line(&source);
+        let routed = reroute_web_line_to_console(&source, "stdout2");
         let json = routed.trim_start_matches(WS_LINE_PREFIX);
         let value: serde_json::Value = serde_json::from_str(json).unwrap();
         assert_eq!(value["type"], "progressbar.step");

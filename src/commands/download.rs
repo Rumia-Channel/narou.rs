@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use indicatif::MultiProgress;
@@ -551,6 +552,10 @@ fn auto_convert(
     multi: &Arc<MultiProgress>,
     dl: &narou_rs::downloader::DownloadResult,
 ) -> Result<(), String> {
+    if is_web_mode() {
+        return auto_convert_via_web_subprocess(dl.id);
+    }
+
     let settings = NovelSettings::load_for_novel(dl.id, &dl.title, &dl.author, &dl.novel_dir);
     let mut converter = if let Some(uc) = UserConverter::load_with_title(&dl.novel_dir, &dl.title) {
         NovelConverter::with_user_converter(settings, uc)
@@ -571,6 +576,45 @@ fn auto_convert(
             Ok(())
         }
         Err(e) => Err(e.to_string()),
+    }
+}
+
+fn auto_convert_via_web_subprocess(id: i64) -> Result<(), String> {
+    let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut command = Command::new(exe_path);
+    command.arg("convert").arg("--no-open").arg(id.to_string());
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "convert stdout を取得できません".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "convert stderr を取得できません".to_string())?;
+
+    let stdout_thread =
+        std::thread::spawn(move || narou_rs::compat::relay_web_stream_to_console(stdout, "stdout2"));
+    let stderr_thread =
+        std::thread::spawn(move || narou_rs::compat::relay_web_stream_to_console(stderr, "stdout2"));
+
+    let status = child.wait().map_err(|e| e.to_string())?;
+    stdout_thread
+        .join()
+        .map_err(|_| "convert stdout relay thread が panic しました".to_string())??;
+    stderr_thread
+        .join()
+        .map_err(|_| "convert stderr relay thread が panic しました".to_string())??;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(match status.code() {
+            Some(code) => format!("convert が終了コード {} で失敗しました", code),
+            None => "convert が異常終了しました".to_string(),
+        })
     }
 }
 
