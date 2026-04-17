@@ -1853,15 +1853,16 @@ mod tests {
     fn arcadia_toc_patterns_extract_title_and_author_from_legacy_yaml_keys() {
         let settings = SiteSetting::load_all().unwrap();
         let setting = settings.iter().find(|s| s.name == "Arcadia").unwrap();
-        let html = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("sample")
-                .join("novel")
-                .join("test_arcadia_page.html"),
-        )
-        .unwrap();
+        let html = r#"
+<html>
+  <body>
+    <font size=4 color=4444aa>異世界に来たけど至って普通に喫茶店とかやってますが何か問題でも？</font>
+    <tt>Name: 風見鶏</tt>
+  </body>
+</html>
+"#;
 
-        let info = NovelInfo::from_toc_source(setting, &html);
+        let info = NovelInfo::from_toc_source(setting, html);
 
         assert_eq!(
             info.title.as_deref(),

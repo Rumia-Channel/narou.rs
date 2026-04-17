@@ -237,6 +237,7 @@ function createRow(novel, rowIndex) {
   const statusParts = [];
   if (novel.end === false || novel.end === 0) statusParts.push('連載中');
   else if (novel.end === true || novel.end === 1) statusParts.push('完結');
+  if (novel.suspend === true) statusParts.push('中断');
 
   // TOC URL link button
   const tocUrl = novel.toc_url || '';
@@ -299,8 +300,8 @@ function createRow(novel, rowIndex) {
         if (!data) return;
         const pop = document.createElement('div');
         pop.className = 'story-popover';
-        pop.innerHTML = `<div class="story-popover-title">${data.title || ''}</div>
-          <div class="story-popover-body">${data.story || '(あらすじなし)'}</div>`;
+        pop.innerHTML = `<div class="story-popover-title">${esc(data.title || '')}</div>
+          <div class="story-popover-body">${renderMultilineHtml(data.story, '(あらすじなし)')}</div>`;
         document.body.appendChild(pop);
         const rect = storyBtn.getBoundingClientRect();
         pop.style.top = (rect.bottom + window.scrollY + 4) + 'px';
@@ -896,4 +897,9 @@ function esc(s) {
   const div = document.createElement('div');
   div.textContent = String(s);
   return div.innerHTML;
+}
+
+function renderMultilineHtml(value, fallback) {
+  const normalized = String(value || fallback || '').replace(/<br\s*\/?>/gi, '\n');
+  return esc(normalized).replace(/\n/g, '<br>');
 }

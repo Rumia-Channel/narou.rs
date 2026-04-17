@@ -286,6 +286,68 @@ function clearAllProgressBars() {
   });
 }
 
+function sanitizeConsoleSpanStyle(styleText) {
+  var declarations = String(styleText || '')
+    .split(';')
+    .map(function(part) { return part.trim(); })
+    .filter(Boolean);
+  if (!declarations.length || declarations.length > 2) return '';
+
+  var color = '';
+  var fontWeight = '';
+  for (var i = 0; i < declarations.length; i++) {
+    var separator = declarations[i].indexOf(':');
+    if (separator <= 0) return '';
+    var name = declarations[i].slice(0, separator).trim().toLowerCase();
+    var value = declarations[i].slice(separator + 1).trim();
+    if (name === 'color') {
+      if (!/^[#(),.%\sa-zA-Z0-9-]+$/.test(value)) return '';
+      color = value;
+    } else if (name === 'font-weight') {
+      if (value.toLowerCase() !== 'bold') return '';
+      fontWeight = 'bold';
+    } else {
+      return '';
+    }
+  }
+  if (!color) return '';
+
+  var parts = [];
+  if (fontWeight) parts.push('font-weight:bold');
+  parts.push('color:' + color);
+  return parts.join(';');
+}
+
+function sanitizeConsoleNodes(source, target) {
+  var children = source.childNodes || [];
+  for (var i = 0; i < children.length; i++) {
+    var child = children[i];
+    if (child.nodeType === Node.TEXT_NODE) {
+      target.appendChild(document.createTextNode(child.textContent || ''));
+      continue;
+    }
+    if (child.nodeType === Node.ELEMENT_NODE && child.tagName === 'SPAN') {
+      var style = sanitizeConsoleSpanStyle(child.getAttribute('style') || '');
+      if (!style) {
+        target.appendChild(document.createTextNode(child.textContent || ''));
+        continue;
+      }
+      var span = document.createElement('span');
+      span.setAttribute('style', style);
+      sanitizeConsoleNodes(child, span);
+      target.appendChild(span);
+      continue;
+    }
+    target.appendChild(document.createTextNode(child.textContent || ''));
+  }
+}
+
+function appendSanitizedConsoleHtml(target, html) {
+  var template = document.createElement('template');
+  template.innerHTML = html;
+  sanitizeConsoleNodes(template.content, target);
+}
+
 var lastLineComplete = true;
 
 function appendConsole(text, targetConsole) {
@@ -314,8 +376,8 @@ function appendConsole(text, targetConsole) {
       var div = document.createElement('div');
       div.className = 'console-line';
       // If text contains <span> tags (from color output), render as HTML
-      if (/<span[\s>]/.test(lines[i])) {
-        div.innerHTML = lines[i];
+      if (/<span[\s>]/i.test(lines[i])) {
+        appendSanitizedConsoleHtml(div, lines[i]);
       } else {
         div.textContent = lines[i];
       }

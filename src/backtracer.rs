@@ -19,7 +19,10 @@ pub fn log_path() -> PathBuf {
 }
 
 pub fn save_log(argv: &[String], panic_info: &(dyn Any + Send)) {
-    let path = log_path();
+    save_log_to_path(log_path(), argv, panic_info);
+}
+
+fn save_log_to_path(path: PathBuf, argv: &[String], panic_info: &(dyn Any + Send)) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -112,11 +115,12 @@ mod tests {
     #[test]
     fn save_log_writes_trace_file() {
         let dir = temp_dir("backtracer_save");
-        fs::create_dir_all(dir.join(".narou")).unwrap();
-        with_current_dir(&dir, || {
-            let panic = std::panic::catch_unwind(|| panic!("boom")).unwrap_err();
-            save_log(&["trace".to_string(), "foo".to_string()], panic.as_ref());
-        });
+        let panic = std::panic::catch_unwind(|| panic!("boom")).unwrap_err();
+        save_log_to_path(
+            dir.join("trace_dump.txt"),
+            &["trace".to_string(), "foo".to_string()],
+            panic.as_ref(),
+        );
 
         let content = fs::read_to_string(dir.join("trace_dump.txt")).unwrap();
         assert!(content.contains("trace foo"));

@@ -47,6 +47,7 @@ pub struct NovelListItem {
     pub tags: Vec<String>,
     pub new_arrivals: bool,
     pub frozen: bool,
+    pub suspend: bool,
     pub length: Option<i64>,
     pub toc_url: String,
     pub general_all_no: Option<i64>,

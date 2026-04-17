@@ -54,17 +54,32 @@ fn story_html_is_converted_before_text_pipeline() {
 #[test]
 fn kakuyomu_sample_matches_narou_rb_reference_byte_for_byte() {
     let root = std::env::current_dir().unwrap();
-    let sample_root = root.join("sample");
-    let reference = find_file_named(&sample_root, "kakuyomu_jp_1177354055617350769.txt")
-        .expect("reference output fixture");
-    let novel_dir =
-        find_dir_starting_with(&sample_root, "1177354055617350769").expect("kakuyomu sample");
+    let kakuyomu_root = root.join("sample").join("novel").join("小説データ").join("カクヨム");
+    let mut checked = 0;
 
-    let mut converter = NovelConverter::new(NovelSettings::default());
-    let output = convert_sample_to_string(&mut converter, &novel_dir);
+    for entry in fs::read_dir(&kakuyomu_root).expect("kakuyomu sample root") {
+        let path = entry.expect("sample entry").path();
+        if !path.is_dir() {
+            continue;
+        }
 
-    let reference_bytes = fs::read(reference).unwrap();
-    assert_eq!(output.into_bytes(), reference_bytes);
+        let Some(reference) = find_reference_output(&path) else {
+            continue;
+        };
+
+        let mut converter = NovelConverter::new(NovelSettings::default());
+        let output = convert_sample_to_string(&mut converter, &path);
+        let reference_bytes = fs::read(&reference).unwrap();
+        assert_eq!(
+            output.into_bytes(),
+            reference_bytes,
+            "reference mismatch for {}",
+            path.display()
+        );
+        checked += 1;
+    }
+
+    assert!(checked > 0, "reference output fixture");
 }
 
 fn convert_sample_to_string(converter: &mut NovelConverter, novel_dir: &Path) -> String {
@@ -94,37 +109,17 @@ fn convert_sample_to_string(converter: &mut NovelConverter, novel_dir: &Path) ->
     converter.convert_novel(&toc_object, &sections).unwrap()
 }
 
-fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
+fn find_reference_output(root: &Path) -> Option<PathBuf> {
     let entries = fs::read_dir(root).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() && path.file_name().and_then(|n| n.to_str()) == Some(name) {
-            return Some(path);
-        }
-        if path.is_dir() {
-            if let Some(found) = find_file_named(&path, name) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-fn find_dir_starting_with(root: &Path, prefix: &str) -> Option<PathBuf> {
-    let entries = fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if path
+        if path.is_file()
+            && path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|name| name.starts_with(prefix))
-            {
-                return Some(path);
-            }
-            if let Some(found) = find_dir_starting_with(&path, prefix) {
-                return Some(found);
-            }
+                .is_some_and(|name| name.starts_with("kakuyomu_jp_") && name.ends_with(".txt"))
+        {
+            return Some(path);
         }
     }
     None

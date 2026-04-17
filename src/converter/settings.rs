@@ -76,7 +76,7 @@ impl Default for NovelSettings {
             kanji_num_with_units_lower_digit_zero: 3,
             enable_alphabet_force_zenkaku: false,
             disable_alphabet_word_to_zenkaku: false,
-            enable_half_indent_bracket: false,
+            enable_half_indent_bracket: true,
             enable_auto_indent: true,
             enable_force_indent: false,
             enable_auto_join_in_brackets: true,
@@ -966,6 +966,11 @@ mod tests {
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn default_enables_half_indent_bracket_like_ruby() {
+        assert!(NovelSettings::default().enable_half_indent_bracket);
+    }
 
     #[test]
     fn load_for_novel_reads_project_local_setting_defaults() {

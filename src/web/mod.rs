@@ -20,7 +20,6 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -128,7 +127,6 @@ pub fn create_router(state: AppState) -> Router {
             auth_state,
             basic_auth_middleware,
         ))
-        .layer(CorsLayer::permissive())
         .with_state(state)
 }
 

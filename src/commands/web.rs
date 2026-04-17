@@ -22,6 +22,10 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
         eprintln!("Error initializing database: {}", e);
         std::process::exit(1);
     }
+    if let Err(e) = fill_general_all_no_in_database() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
 
     let address = match resolve_web_address(port) {
         Ok(address) => address,
@@ -133,6 +137,40 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
     }
     ws_task.abort();
     remove_pid_file();
+}
+
+fn fill_general_all_no_in_database() -> Result<(), String> {
+    narou_rs::db::with_database_mut(|db| {
+        let archive_root = db.archive_root().to_path_buf();
+        let ids: Vec<i64> = db
+            .all_records()
+            .values()
+            .filter(|record| record.general_all_no.is_none())
+            .map(|record| record.id)
+            .collect();
+        let mut modified = false;
+
+        for id in ids {
+            let Some(record) = db.get(id).cloned() else {
+                continue;
+            };
+            let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
+            let Some(toc) = narou_rs::downloader::persistence::load_toc_file(&novel_dir) else {
+                continue;
+            };
+            let Some(target) = db.all_records_mut().get_mut(&id) else {
+                continue;
+            };
+            target.general_all_no = Some(toc.subtitles.len() as i64);
+            modified = true;
+        }
+
+        if modified {
+            db.save()?;
+        }
+        Ok(())
+    })
+    .map_err(|e| e.to_string())
 }
 
 fn resolve_web_address(user_port: Option<u16>) -> Result<WebAddress, String> {

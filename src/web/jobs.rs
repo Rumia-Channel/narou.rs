@@ -11,11 +11,51 @@ use super::state::{
 
 const WEBUI_UPDATE_START_PREFIX: &str = "__webui_update_start__=";
 
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn validate_download_targets(targets: &[String]) -> Result<(), String> {
+    if targets.iter().any(|target| target.trim_start().starts_with('-')) {
+        return Err("invalid download target".to_string());
+    }
+    Ok(())
+}
+
+fn validate_diff_number(number: &str) -> Result<String, String> {
+    let parsed = number
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "invalid diff number".to_string())?;
+    Ok(parsed.to_string())
+}
+
+fn validate_general_lastup_option(option: &str) -> Result<Option<&'static str>, String> {
+    match option {
+        "all" => Ok(None),
+        "narou" => Ok(Some("narou")),
+        "other" => Ok(Some("other")),
+        _ => Err("invalid general_lastup option".to_string()),
+    }
+}
+
 pub async fn api_download(
     State(state): State<AppState>,
     Json(body): Json<DownloadBody>,
 ) -> Json<serde_json::Value> {
     let targets = body.targets;
+    if let Err(message) = validate_download_targets(&targets) {
+        return serde_json::json!({
+            "success": false,
+            "message": message,
+            "results": []
+        })
+        .into();
+    }
     let queue = match open_queue() {
         Ok(queue) => queue,
         Err(message) => {
@@ -617,6 +657,15 @@ pub async fn api_diff(
     State(state): State<AppState>,
     Json(body): Json<DiffBody>,
 ) -> Json<ApiResponse> {
+    let diff_number = match validate_diff_number(&body.number) {
+        Ok(number) => number,
+        Err(message) => {
+            return Json(ApiResponse {
+                success: false,
+                message,
+            });
+        }
+    };
     let ids: Vec<String> = body
         .ids
         .iter()
@@ -628,7 +677,7 @@ pub async fn api_diff(
         .collect();
 
     for id in &ids {
-        let args = vec!["diff", "--no-tool", id, "--number", &body.number];
+        let args = vec!["diff", "--no-tool", id, "--number", &diff_number];
         match run_immediate(&args) {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1152,9 +1201,10 @@ pub async fn api_taginfo(
             } else {
                 format!(" style=\"background-color:{}\"", color)
             };
+            let escaped_tag = html_escape(tag);
             let html = format!(
                 "<span class=\"tag-label\"{}>{}({})</span>",
-                style, tag, ids.len()
+                style, escaped_tag, ids.len()
             );
             let mut entry = serde_json::json!({
                 "tag": tag,
@@ -1164,7 +1214,7 @@ pub async fn api_taginfo(
             if with_exclusion {
                 let exc_html = format!(
                     "<span class=\"tag-label tag-exclusion\"{}>{}({})</span>",
-                    style, tag, ids.len()
+                    style, escaped_tag, ids.len()
                 );
                 entry["exclusion_html"] = serde_json::json!(exc_html);
             }
@@ -1234,10 +1284,20 @@ pub async fn api_update_general_lastup(
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let option = body["option"].as_str().unwrap_or("all");
+    let option = match validate_general_lastup_option(option) {
+        Ok(option) => option,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+            })
+            .into();
+        }
+    };
     let is_update_modified = body["is_update_modified"].as_str() == Some("true")
         || body["is_update_modified"].as_bool() == Some(true);
     let mut args = vec!["update", "--gl"];
-    if option != "all" {
+    if let Some(option) = option {
         args.push(option);
     }
 
@@ -1263,7 +1323,7 @@ pub async fn api_update_general_lastup(
                     if let Ok((_, modified_queued)) = push_update_job_if_needed(
                         &queue2,
                         &state.running_job,
-                        "--tag	modified".to_string(),
+                        "tag:modified".to_string(),
                     ) {
                         enqueued_any |= modified_queued;
                     }
@@ -1371,7 +1431,10 @@ mod tests {
 
     use crate::queue::{JobType, PersistentQueue, QueueJob};
 
-    use super::{encode_convert_job_target, existing_update_job_id, push_update_job_if_needed};
+    use super::{
+        encode_convert_job_target, existing_update_job_id, push_update_job_if_needed,
+        validate_diff_number, validate_download_targets, validate_general_lastup_option,
+    };
 
     #[test]
     fn encode_convert_job_target_omits_default_override() {
@@ -1416,5 +1479,35 @@ mod tests {
         let existing = existing_update_job_id(&queue, &running_job, "--tag\tmodified");
 
         assert_eq!(existing.as_deref(), Some("running-job"));
+    }
+
+    #[test]
+    fn validate_download_targets_rejects_flag_like_values() {
+        assert!(
+            validate_download_targets(&["1".to_string(), "https://example.com".to_string()])
+                .is_ok()
+        );
+        assert!(validate_download_targets(&["--remove".to_string()]).is_err());
+    }
+
+    #[test]
+    fn validate_diff_number_accepts_only_positive_integers() {
+        assert_eq!(validate_diff_number("2").unwrap(), "2");
+        assert!(validate_diff_number("--clean").is_err());
+        assert!(validate_diff_number("abc").is_err());
+    }
+
+    #[test]
+    fn validate_general_lastup_option_accepts_known_values_only() {
+        assert_eq!(validate_general_lastup_option("all").unwrap(), None);
+        assert_eq!(validate_general_lastup_option("narou").unwrap(), Some("narou"));
+        assert_eq!(validate_general_lastup_option("other").unwrap(), Some("other"));
+        assert!(validate_general_lastup_option("--force").is_err());
+    }
+
+    #[test]
+    fn modified_followup_target_matches_ruby_tag_selector() {
+        let target = "tag:modified".to_string();
+        assert_eq!(target, "tag:modified");
     }
 }

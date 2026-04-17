@@ -95,9 +95,9 @@
               '<dl>' +
               '<dd class="subtitle">' + escapeHtml(c.subtitle) + '</dd>' +
               '<dt>まえがき</dt>' +
-              '<dd class="indent">' + (c.introduction || '') + '</dd>' +
+              '<dd class="indent">' + renderBodyHtml(c.introduction) + '</dd>' +
               '<dt>あとがき</dt>' +
-              '<dd class="indent">' + (c.postscript || '') + '</dd>' +
+              '<dd class="indent">' + renderBodyHtml(c.postscript) + '</dd>' +
               '</dl>';
             tr.appendChild(td);
             tbody.appendChild(tr);
@@ -114,6 +114,11 @@
         var d = document.createElement('div');
         d.appendChild(document.createTextNode(s));
         return d.innerHTML;
+      }
+
+      function renderBodyHtml(s) {
+        var normalized = String(s || '').replace(/<br\s*\/?>/gi, '\n');
+        return escapeHtml(normalized).replace(/\n/g, '<br>');
       }
     })();
   </script>

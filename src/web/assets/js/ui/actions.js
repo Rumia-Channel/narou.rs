@@ -431,14 +431,14 @@ export function bindActions() {
         const lbl = document.createElement('label');
         lbl.style.cssText = 'display:inline-block;margin:0.2em 0.5em;cursor:pointer';
         lbl.innerHTML = '<input type="checkbox" data-tagname="' +
-          info.tag.replace(/"/g, '&quot;') + '"> ' + info.html + '&nbsp;&nbsp;';
+          escAttr(info.tag) + '"> ' + info.html + '&nbsp;&nbsp;';
         includeDiv.appendChild(lbl);
       });
       taginfo.forEach(info => {
         const lbl = document.createElement('label');
         lbl.style.cssText = 'display:inline-block;margin:0.2em 0.5em;cursor:pointer';
         lbl.innerHTML = '<input type="checkbox" data-exclusion-tagname="' +
-          info.tag.replace(/"/g, '&quot;') + '"> ' +
+          escAttr(info.tag) + '"> ' +
           (info.exclusion_html || info.html) + '&nbsp;&nbsp;';
         excludeDiv.appendChild(lbl);
       });
@@ -927,6 +927,10 @@ function escHtml(s) {
   const div = document.createElement('div');
   div.textContent = String(s);
   return div.innerHTML;
+}
+
+function escAttr(s) {
+  return escHtml(s).replace(/"/g, '&quot;');
 }
 
 /* ===== Remove Confirm Modal ===== */

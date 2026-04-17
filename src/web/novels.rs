@@ -133,6 +133,7 @@ pub async fn api_list(
                     tags: r.tags.clone(),
                     new_arrivals: is_new,
                     frozen: record_is_frozen(r, &frozen_ids),
+                    suspend: r.suspend,
                     length: r.length,
                     toc_url: r.toc_url.clone(),
                     general_all_no: r.general_all_no,
@@ -196,9 +197,8 @@ pub async fn get_story(
     let toc = crate::downloader::persistence::load_toc_file(&novel_dir);
     let (title, story) = match toc {
         Some(t) => {
-            let s = t.story.unwrap_or_default().trim().to_string();
-            let html_story = s.replace('\n', "<br>");
-            (t.title, html_story)
+            let story = t.story.unwrap_or_default().trim().to_string();
+            (t.title, story)
         }
         None => (record.title, String::new()),
     };
@@ -322,8 +322,8 @@ pub async fn author_comments(
 
         comments.push(serde_json::json!({
             "subtitle": sub.subtitle,
-            "introduction": introduction.replace('\n', "<br>"),
-            "postscript": postscript.replace('\n', "<br>"),
+            "introduction": introduction,
+            "postscript": postscript,
         }));
     }
 

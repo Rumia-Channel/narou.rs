@@ -407,7 +407,8 @@ mod tests {
         assert!(summary.contains("INFO：1件"));
 
         let display = inspector.display_text().unwrap();
-        assert!(display.contains("※情報"));
+        assert!(display.contains("―――― 小説の検査状況を表示します ――――"));
+        assert!(display.contains("[INFO]"));
         assert!(display.contains("50個の行末読点を発見しました。"));
         assert!(display.contains("enable_auto_join_line を true にすることをお薦めします。"));
 
