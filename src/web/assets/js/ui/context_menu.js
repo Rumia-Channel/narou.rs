@@ -1,11 +1,56 @@
 /**
  * Context menu — right-click actions on table rows
  */
-import { State, El } from '../core/state.js';
+import { El } from '../core/state.js';
 import { postJson } from '../core/http.js';
 
 let contextTarget = null;
 let actionHandlers = {};
+let menuTextCache = null;
+
+const MENU_TEXT_KEY = 'context_menu_text';
+const MENU_STYLE_KEY = 'menu_style';
+const DEFAULT_COMMANDS = [
+  'setting', 'diff', 'edit_tag', 'divider',
+  'freeze_toggle', 'update', 'update_force', 'send', 'divider',
+  'remove', 'convert', 'inspect', 'divider', 'folder', 'backup', 'download_force',
+  'mail', 'author_comments',
+];
+const MENU_ITEMS = [
+  { label: '――――――――(区切り)', command: 'divider' },
+  { label: '小説の変換設定', command: 'setting' },
+  { label: '差分を表示', command: 'diff' },
+  { label: 'タグを編集', command: 'edit_tag' },
+  { label: '凍結 or 解凍', command: 'freeze_toggle' },
+  { label: '更新', command: 'update' },
+  { label: '凍結済みでも更新', command: 'update_force' },
+  { label: '送信', command: 'send' },
+  { label: '削除', command: 'remove' },
+  { label: '変換', command: 'convert' },
+  { label: '調査状況ログを表示', command: 'inspect' },
+  { label: '保存フォルダを開く', command: 'folder' },
+  { label: 'バックアップを作成', command: 'backup' },
+  { label: '再ダウンロード', command: 'download_force' },
+  { label: 'メールで送信', command: 'mail' },
+  { label: '作者コメント表示', command: 'author_comments' },
+];
+const MENU_COMMAND_HANDLERS = {
+  setting: () => actionHandlers.openSetting?.(contextTarget),
+  diff: () => actionHandlers.showDiff?.(contextTarget),
+  edit_tag: () => actionHandlers.tagEditSingle?.(contextTarget),
+  freeze_toggle: () => actionHandlers.freezeToggle?.(contextTarget),
+  update: () => actionHandlers.updateSingle?.(contextTarget),
+  update_force: () => actionHandlers.updateForceSingle?.(contextTarget),
+  send: () => actionHandlers.sendSingle?.(contextTarget),
+  remove: () => actionHandlers.removeSingle?.(contextTarget),
+  convert: () => actionHandlers.convertSingle?.(contextTarget),
+  inspect: () => actionHandlers.inspectSingle?.(contextTarget),
+  folder: () => actionHandlers.folderSingle?.(contextTarget),
+  backup: () => actionHandlers.backupSingle?.(contextTarget),
+  download_force: () => actionHandlers.downloadForceSingle?.(contextTarget),
+  mail: () => actionHandlers.mailSingle?.(contextTarget),
+  author_comments: () => actionHandlers.authorComments?.(contextTarget),
+};
 
 export function setContextHandlers(handlers) {
   actionHandlers = handlers;
@@ -14,6 +59,8 @@ export function setContextHandlers(handlers) {
 export function initContextMenu() {
   const menu = El.contextMenu;
   if (!menu) return;
+
+  rebuildContextMenu();
 
   // Close on outside click
   document.addEventListener('click', (e) => {
@@ -27,31 +74,19 @@ export function initContextMenu() {
     menu.classList.add('hide');
   });
 
-  // Bind menu item clicks
-  bindItem('ctx-setting', () => actionHandlers.openSetting?.(contextTarget));
-  bindItem('ctx-diff', () => actionHandlers.showDiff?.(contextTarget));
-  bindItem('ctx-tag-edit', () => actionHandlers.tagEditSingle?.(contextTarget));
-  bindItem('ctx-freeze-toggle', () => actionHandlers.freezeToggle?.(contextTarget));
-  bindItem('ctx-update', () => actionHandlers.updateSingle?.(contextTarget));
-  bindItem('ctx-update-force', () => actionHandlers.updateForceSingle?.(contextTarget));
-  bindItem('ctx-send', () => actionHandlers.sendSingle?.(contextTarget));
-  bindItem('ctx-remove', () => actionHandlers.removeSingle?.(contextTarget));
-  bindItem('ctx-convert', () => actionHandlers.convertSingle?.(contextTarget));
-  bindItem('ctx-inspect', () => actionHandlers.inspectSingle?.(contextTarget));
-  bindItem('ctx-folder', () => actionHandlers.folderSingle?.(contextTarget));
-  bindItem('ctx-backup', () => actionHandlers.backupSingle?.(contextTarget));
-  bindItem('ctx-download-force', () => actionHandlers.downloadForceSingle?.(contextTarget));
-  bindItem('ctx-mail', () => actionHandlers.mailSingle?.(contextTarget));
-  bindItem('ctx-author-comments', () => actionHandlers.authorComments?.(contextTarget));
-}
-
-function bindItem(id, handler) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.addEventListener('click', (e) => {
+  menu.addEventListener('click', (e) => {
+    const link = e.target.closest('a[data-command]');
+    if (!link || !menu.contains(link)) return;
     e.preventDefault();
-    El.contextMenu.classList.add('hide');
-    handler();
+    menu.classList.add('hide');
+    const command = link.dataset.command;
+    MENU_COMMAND_HANDLERS[command]?.();
+  });
+
+  window.addEventListener('storage', (e) => {
+    if (!e.key || e.key === MENU_TEXT_KEY) {
+      rebuildContextMenu();
+    }
   });
 }
 
@@ -61,23 +96,26 @@ export function showContextMenu(e, novelId) {
 
   const menu = El.contextMenu;
   if (!menu) return;
-
-  // Update freeze label
-  const freezeEl = document.getElementById('ctx-freeze-toggle');
-  if (freezeEl) {
-    const novel = State.novels.find(n => n.id === novelId);
-    freezeEl.textContent = novel?.frozen ? '凍結解除' : '凍結';
-  }
+  rebuildContextMenu();
 
   // Position menu
   menu.classList.remove('hide');
   const menuW = menu.offsetWidth;
   const menuH = menu.offsetHeight;
+  const style = getStoredMenuStyle();
   let x = e.clientX;
   let y = e.clientY;
 
-  if (x + menuW > window.innerWidth) x = window.innerWidth - menuW - 4;
-  if (y + menuH > window.innerHeight) y = window.innerHeight - menuH - 4;
+  if (window.innerWidth < x + menuW) {
+    x -= menuW;
+  }
+  if (window.innerHeight < y + menuH) {
+    if (style === 'windows') {
+      y -= menuH;
+    } else {
+      y -= (y + menuH) - window.innerHeight + 5;
+    }
+  }
   if (x < 0) x = 0;
   if (y < 0) y = 0;
 
@@ -128,5 +166,72 @@ async function changeTagColor(tagName, color) {
     await postJson('/api/tag/change_color', { tag: tagName, color });
     actionHandlers.refreshTags?.();
     actionHandlers.refreshList?.();
+  } catch { /* ignore */ }
+}
+
+export function getStoredMenuStyle() {
+  return getStorageValue(MENU_STYLE_KEY, 'windows') === 'mac' ? 'mac' : 'windows';
+}
+
+export function setStoredMenuStyle(style) {
+  setStorageValue(MENU_STYLE_KEY, style === 'mac' ? 'mac' : 'windows');
+}
+
+function rebuildContextMenu() {
+  const menu = El.contextMenu;
+  if (!menu) return;
+
+  const menuText = getStoredMenuText();
+  if (menuText === menuTextCache) return;
+
+  menuTextCache = menuText;
+  menu.textContent = '';
+
+  for (const line of menuText.split('\n')) {
+    const [label = '', command = ''] = line.split('<>');
+    if (!command) continue;
+
+    const li = document.createElement('li');
+    if (command === 'divider') {
+      li.className = 'divider';
+      menu.appendChild(li);
+      continue;
+    }
+
+    li.className = `context-menu-${command}`;
+    const link = document.createElement('a');
+    link.href = '#';
+    link.dataset.command = command;
+    link.textContent = label;
+    li.appendChild(link);
+    menu.appendChild(li);
+  }
+}
+
+function getStoredMenuText() {
+  return getStorageValue(MENU_TEXT_KEY, createDefaultMenuText()).trim();
+}
+
+function createDefaultMenuText() {
+  const lines = [];
+  for (const command of DEFAULT_COMMANDS) {
+    const item = MENU_ITEMS.find(entry => entry.command === command);
+    if (item) lines.push(item.label + '<>' + item.command);
+  }
+  return lines.join('\n');
+}
+
+function getStorageValue(key, fallback) {
+  try {
+    const value = localStorage.getItem(key);
+    return value !== null ? value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function setStorageValue(key, value) {
+  try {
+    localStorage.setItem(key, value);
   } catch { /* ignore */ }
 }

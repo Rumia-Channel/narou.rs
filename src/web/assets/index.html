@@ -278,26 +278,7 @@
     </div>
 
     <!-- Context Menu (hidden, shown on right-click) -->
-    <ul class="context-menu hide" id="context-menu" role="menu">
-      <li><a href="#" id="ctx-setting">小説の変換設定</a></li>
-      <li><a href="#" id="ctx-diff">差分を表示</a></li>
-      <li><a href="#" id="ctx-tag-edit">タグを編集</a></li>
-      <li class="divider"></li>
-      <li><a href="#" id="ctx-freeze-toggle">凍結</a></li>
-      <li><a href="#" id="ctx-update">更新</a></li>
-      <li><a href="#" id="ctx-update-force">凍結済みでも更新</a></li>
-      <li><a href="#" id="ctx-send">送信</a></li>
-      <li class="divider"></li>
-      <li><a href="#" id="ctx-remove">削除</a></li>
-      <li><a href="#" id="ctx-convert">変換</a></li>
-      <li><a href="#" id="ctx-inspect">調査状況ログを表示</a></li>
-      <li class="divider"></li>
-      <li><a href="#" id="ctx-folder">保存フォルダを開く</a></li>
-      <li><a href="#" id="ctx-backup">バックアップを作成</a></li>
-      <li><a href="#" id="ctx-download-force">再ダウンロード</a></li>
-      <li><a href="#" id="ctx-mail">メールで送信</a></li>
-      <li><a href="#" id="ctx-author-comments">作者コメント表示</a></li>
-    </ul>
+    <ul class="context-menu hide" id="context-menu" role="menu" aria-label="個別メニュー"></ul>
 
     <!-- Tag Color Selection Menu (hidden, shown on tag right-click) -->
     <ul class="context-menu hide" id="select-color-menu" role="menu">
@@ -375,6 +356,36 @@
           </div>
           <div class="modal-footer">
             <button class="btn btn-primary" id="colvis-ok" type="button">OK</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Menu Style Modal -->
+    <div class="modal-overlay hide" id="menu-style-modal">
+      <div class="modal-dialog modal-dialog-sm">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="menu-style-close" type="button">&times;</button>
+            <h4 class="modal-title">個別メニューの表示スタイルを選択</h4>
+          </div>
+          <div class="modal-body">
+            <div class="radio">
+              <label>
+                <input type="radio" id="menu-style-windows" name="menu-style" value="windows">
+                Windows スタイル：<br>メニューが画面外にはみ出そうとしたら、カーソルの上側に表示する
+              </label>
+            </div>
+            <div class="radio">
+              <label>
+                <input type="radio" id="menu-style-mac" name="menu-style" value="mac">
+                Mac スタイル：<br>メニューがはみ出さないよう上にずらして表示する
+              </label>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="menu-style-cancel" type="button">キャンセル</button>
+            <button class="btn btn-primary" id="menu-style-save" type="button">OK</button>
           </div>
         </div>
       </div>

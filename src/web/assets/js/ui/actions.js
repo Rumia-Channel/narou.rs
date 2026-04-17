@@ -11,7 +11,10 @@ import {
   syncViewChecks, showNotification,
 } from './render.js';
 import { setShortcutHandlers, initShortcuts } from './shortcuts.js';
-import { setContextHandlers, initContextMenu, initTagColorMenu } from './context_menu.js';
+import {
+  setContextHandlers, initContextMenu, initTagColorMenu,
+  getStoredMenuStyle, setStoredMenuStyle,
+} from './context_menu.js';
 
 export function bindActions() {
   // --- Navbar toggle (mobile) ---
@@ -144,9 +147,10 @@ export function bindActions() {
     State.buttonsTop = true;
     State.buttonsFooter = false;
     ['view-frozen', 'view-nonfrozen', 'wide-mode',
-     'setting-new-tab', 'buttons-top', 'buttons-footer'].forEach(k =>
+      'setting-new-tab', 'buttons-top', 'buttons-footer'].forEach(k =>
       localStorage.removeItem('narou-rs-webui-' + k)
     );
+    localStorage.removeItem('menu_style');
     setHiddenCols([]);
     applyColumnVisibility();
     syncViewChecks();
@@ -534,6 +538,16 @@ export function bindActions() {
 
   on('action-view-link-to-edit-menu', () => {
     window.open('/edit_menu', '_blank');
+  });
+
+  on('action-view-select-menu-style', openMenuStyleModal);
+  on('menu-style-close', closeMenuStyleModal);
+  on('menu-style-cancel', closeMenuStyleModal);
+  on('menu-style-save', () => {
+    const checked = document.querySelector('input[name="menu-style"]:checked');
+    setStoredMenuStyle(checked?.value || 'windows');
+    closeMenuStyleModal();
+    showNotification('個別メニューの表示スタイルを保存しました', 'success');
   });
 
   // --- Table header sort ---
@@ -995,6 +1009,19 @@ function openColvisModal() {
   }
 
   El.colvisModal?.classList.remove('hide');
+}
+
+function openMenuStyleModal() {
+  const style = getStoredMenuStyle();
+  const windowsRadio = document.getElementById('menu-style-windows');
+  const macRadio = document.getElementById('menu-style-mac');
+  if (windowsRadio) windowsRadio.checked = style === 'windows';
+  if (macRadio) macRadio.checked = style === 'mac';
+  document.getElementById('menu-style-modal')?.classList.remove('hide');
+}
+
+function closeMenuStyleModal() {
+  document.getElementById('menu-style-modal')?.classList.add('hide');
 }
 
 /* ===== Data refresh ===== */
