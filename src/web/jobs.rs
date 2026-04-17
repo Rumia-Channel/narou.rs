@@ -389,7 +389,17 @@ pub async fn api_update(
     State(state): State<AppState>,
     Json(body): Json<UpdateBody>,
 ) -> Json<serde_json::Value> {
-    let targets = targets_to_strings(&body.targets);
+    let targets = match normalize_update_targets(&targets_to_strings(&body.targets)) {
+        Ok(targets) => targets,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+                "count": 0
+            })
+            .into();
+        }
+    };
 
     // Build a single update job target string from CLI-style args
     // e.g. ["--gl", "narou"] → "--gl\tnarou"
@@ -456,6 +466,36 @@ pub async fn api_update(
         "job_ids": job_ids
     })
     .into()
+}
+
+fn normalize_update_targets(targets: &[String]) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::with_capacity(targets.len());
+    let mut i = 0usize;
+    while i < targets.len() {
+        let target = &targets[i];
+        if let Some(tag) = target.strip_prefix("--tag=") {
+            if tag.is_empty() {
+                return Err("--tag requires a tag name".to_string());
+            }
+            normalized.push(format!("tag:{}", tag));
+            i += 1;
+            continue;
+        }
+        if target == "--tag" {
+            let Some(tag) = targets.get(i + 1) else {
+                return Err("--tag requires a tag name".to_string());
+            };
+            if tag.starts_with('-') {
+                return Err("--tag requires a tag name".to_string());
+            }
+            normalized.push(format!("tag:{}", tag));
+            i += 2;
+            continue;
+        }
+        normalized.push(target.clone());
+        i += 1;
+    }
+    Ok(normalized)
 }
 
 pub async fn api_convert(
@@ -1571,7 +1611,7 @@ mod tests {
 
     use super::{
         encode_convert_job_target, existing_update_job_id, push_update_job_if_needed,
-        restorable_tasks_available,
+        normalize_update_targets, restorable_tasks_available,
         validate_diff_number, validate_download_targets, validate_general_lastup_option,
     };
 
@@ -1609,13 +1649,13 @@ mod tests {
         let running_jobs = Mutex::new(vec![QueueJob {
             id: "running-job".to_string(),
             job_type: JobType::Update,
-            target: "--tag\tmodified".to_string(),
+            target: "tag:modified".to_string(),
             created_at: 0,
             retry_count: 0,
             max_retries: 3,
         }]);
 
-        let existing = existing_update_job_id(&queue, &running_jobs, "--tag\tmodified");
+        let existing = existing_update_job_id(&queue, &running_jobs, "tag:modified");
 
         assert_eq!(existing.as_deref(), Some("running-job"));
     }
@@ -1648,6 +1688,19 @@ mod tests {
     fn modified_followup_target_matches_ruby_tag_selector() {
         let target = "tag:modified".to_string();
         assert_eq!(target, "tag:modified");
+    }
+
+    #[test]
+    fn normalize_update_targets_converts_tag_flag() {
+        let normalized = normalize_update_targets(&["--tag".to_string(), "modified".to_string()])
+            .unwrap();
+        assert_eq!(normalized, vec!["tag:modified"]);
+    }
+
+    #[test]
+    fn normalize_update_targets_rejects_missing_tag_name() {
+        assert!(normalize_update_targets(&["--tag".to_string()]).is_err());
+        assert!(normalize_update_targets(&["--tag".to_string(), "--gl".to_string()]).is_err());
     }
 
     #[test]

@@ -495,7 +495,7 @@ export function bindActions() {
   });
 
   on('btn-gl-modified', () => {
-    postJson('/api/update', { targets: ['--tag', 'modified'] });
+    postJson('/api/update', { targets: ['tag:modified'] });
   });
 
   on('btn-send', () => {
