@@ -16,6 +16,8 @@ import {
   getStoredMenuStyle, setStoredMenuStyle,
 } from './context_menu.js';
 
+const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
+
 export function bindActions() {
   // --- Navbar toggle (mobile) ---
   El.navbarToggleBtn?.addEventListener('click', () => {
@@ -223,6 +225,7 @@ export function bindActions() {
 
   on('action-option-server-reboot', async () => {
     if (!confirm('サーバを再起動しますか？')) return;
+    rememberRebootReturnTo();
     await postJson('/api/reboot', {});
     window.location.href = '/_rebooting';
   });
@@ -688,6 +691,18 @@ function on(id, handler) {
     e.preventDefault();
     handler(e);
   });
+}
+
+function rememberRebootReturnTo() {
+  if (window.location.pathname === '/_rebooting') return;
+  try {
+    sessionStorage.setItem(
+      REBOOT_RETURN_TO_KEY,
+      window.location.pathname + window.location.search + window.location.hash
+    );
+  } catch {
+    // Ignore storage errors and fall back to root.
+  }
 }
 
 function populateFooterPanel() {

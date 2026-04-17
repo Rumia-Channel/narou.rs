@@ -9,6 +9,7 @@ import { renderNovelList, renderQueueStatus, renderTagList, syncViewChecks } fro
 import { bindActions, refreshList, refreshQueue, refreshTags } from './ui/actions.js';
 
 let ws = null;
+const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
 
 function isPerformanceModeEnabled() {
   switch (State.performanceMode) {
@@ -163,6 +164,7 @@ function handleWsMessage(msg) {
       break;
     case 'reboot':
       appendConsole('サーバーを再起動しています...');
+      rememberRebootReturnTo();
       setTimeout(() => { location.href = '/_rebooting'; }, 500);
       break;
     case 'console.clear': {
@@ -187,6 +189,18 @@ function handleWsMessage(msg) {
     default:
       console.debug('Unknown WS event:', msg);
       break;
+  }
+}
+
+function rememberRebootReturnTo() {
+  if (location.pathname === '/_rebooting') return;
+  try {
+    sessionStorage.setItem(
+      REBOOT_RETURN_TO_KEY,
+      location.pathname + location.search + location.hash
+    );
+  } catch {
+    // Ignore storage errors and fall back to root.
   }
 }
 

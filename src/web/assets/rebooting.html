@@ -26,6 +26,7 @@
   <p>再起動が完了したら自動的にページがリロードされます。</p>
   <p>しばらく待ってもリロードされない場合は<a href="/">こちら</a>をクリックするかブラウザのリロードボタンを押してみてください。</p>
   <script>
+    var rebootReturnKey = "narou-rs-webui-reboot-return-to";
     var busy = document.getElementById("rebooting-busy");
     setInterval(function() {
       busy.textContent += ".";
@@ -34,11 +35,25 @@
       }
     }, 500);
 
+    function resolveReturnTo() {
+      try {
+        var value = sessionStorage.getItem(rebootReturnKey);
+        if (value && value.charAt(0) === "/" && !value.startsWith("//") && value !== "/_rebooting") {
+          return value;
+        }
+      } catch (e) {}
+      return "/";
+    }
+
     setInterval(function() {
       fetch("/api/version/current.json", { method: "GET" })
         .then(function(res) {
           if (res.ok) {
-            window.location.href = "/";
+            var returnTo = resolveReturnTo();
+            try {
+              sessionStorage.removeItem(rebootReturnKey);
+            } catch (e) {}
+            window.location.href = returnTo;
           }
         })
         .catch(function() {});
