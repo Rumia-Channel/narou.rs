@@ -177,7 +177,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 |---|--------|------|------|------|
 | 1 | ID | 数値ID (凍結時 ＊ID) | ✅ | ✅ |
 | 2 | 更新日 | 日付/時刻の中央寄せ表示 + `新着` ラベル | ✅ (`date-cell` + `new-arrivals`) | ✅ |
-| 3 | 最新話掲載日 | general_lastup (日付/時刻 + 時間バッジ、新着ヒント色) | ✅ (`date-cell` + `gl-badge` + `hint-new-arrival`) | ✅ |
+| 3 | 最新話掲載日 | general_lastup (日付/時刻 + 時間バッジ、新着ヒント色) | ✅ (`date-cell.hint-new-arrival` + `gl-badge`) | ✅ |
 | 4 | 更新チェック日 | last_check_date | ✅ | ✅ |
 | 5 | タイトル | タイトル表示 | ✅ | ✅ |
 | 6 | 作者名 | クリックでフィルタ | ✅ (.filterable) | ✅ |

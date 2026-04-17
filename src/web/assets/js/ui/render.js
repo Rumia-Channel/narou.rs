@@ -218,16 +218,13 @@ function createRow(novel, rowIndex) {
 
   // general_lastup with time badge + hint-new-arrival when newer than last_update
   let glCell = '';
-  let glHint = false;
   if (novel.general_lastup) {
     const badge = getTimeBadge(novel.general_lastup);
+    const glHint = novel.general_lastup > novel.last_update;
     glCell = formatDateCell(novel.general_lastup, {
       inlineExtra: badge,
+      wrapperClass: glHint ? 'hint-new-arrival' : '',
     });
-    // narou.rb highlights when general_lastup > last_update (new content available)
-    if (novel.general_lastup > novel.last_update) {
-      glHint = true;
-    }
   }
 
   // last_check_date
@@ -264,7 +261,7 @@ function createRow(novel, rowIndex) {
   tr.innerHTML = `
     <td class="col-id">${esc(idText)}</td>
     <td class="col-update">${updateCell}</td>
-    <td class="col-general-lastup${glHint ? ' hint-new-arrival' : ''}">${glCell}</td>
+    <td class="col-general-lastup">${glCell}</td>
     <td class="col-last-check">${checkCell}</td>
     <td class="col-title">${esc(novel.title || '')}</td>
     <td class="col-author"><span class="filterable" data-filter="${esc(novel.author || '')}">${esc(novel.author || '')}</span></td>
@@ -856,7 +853,8 @@ function formatDateCell(dateStr, options = {}) {
   const extraLine = options.extraLine || '';
   const label = options.label || '';
   const labelClass = options.labelClass || '';
-  let html = '<div class="date-cell">';
+  const wrapperClass = options.wrapperClass || '';
+  let html = `<div class="date-cell${wrapperClass ? ' ' + wrapperClass : ''}">`;
   html += `<span class="date-cell-date">${date}</span>`;
   if (time || label || inlineExtra) {
     html += '<span class="date-cell-inline">';
