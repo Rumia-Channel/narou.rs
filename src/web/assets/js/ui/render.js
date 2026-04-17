@@ -15,6 +15,7 @@ const TAG_COLOR_MAP = {
   red: 'tag-red',
   white: 'tag-white',
 };
+const PAGE_LENGTH_OPTIONS = [20, 50, 100, 200, 500, -1];
 
 let selectionDrag = null;
 let queueDragTaskId = null;
@@ -27,16 +28,90 @@ export function renderNovelList() {
 
   const filtered = getFilteredNovels();
   const sorted = sortNovels(filtered);
+  const pageLength = normalizePageLength(State.pageLength);
+  const totalCount = sorted.length;
+  const totalPages = pageLength === -1 ? 1 : Math.max(1, Math.ceil(totalCount / pageLength));
+  State.currentPage = Math.min(Math.max(State.currentPage || 1, 1), totalPages);
+  const start = pageLength === -1 ? 0 : (State.currentPage - 1) * pageLength;
+  const end = pageLength === -1 ? totalCount : Math.min(start + pageLength, totalCount);
+  const visible = pageLength === -1 ? sorted : sorted.slice(start, end);
 
   const fragment = document.createDocumentFragment();
-  for (let i = 0; i < sorted.length; i++) {
-    fragment.appendChild(createRow(sorted[i], i));
+  for (let i = 0; i < visible.length; i++) {
+    fragment.appendChild(createRow(visible[i], i));
   }
   tbody.textContent = '';
   tbody.appendChild(fragment);
+  renderPageLengthSelector(pageLength);
+  renderPageInfo(totalCount, start, end);
+  renderPagination(totalPages);
 
   updateSelectionBadge();
   updateEnableSelected();
+}
+
+function normalizePageLength(value) {
+  return PAGE_LENGTH_OPTIONS.includes(value) ? value : 50;
+}
+
+function renderPageLengthSelector(pageLength) {
+  if (El.novelListLength) {
+    El.novelListLength.value = String(pageLength);
+  }
+}
+
+function renderPageInfo(totalCount, start, end) {
+  if (!El.novelListInfo) return;
+  if (totalCount === 0) {
+    El.novelListInfo.textContent = '該当なし';
+    return;
+  }
+  if (State.pageLength === -1) {
+    El.novelListInfo.textContent = `全 ${totalCount} 件`;
+    return;
+  }
+  El.novelListInfo.textContent = `${start + 1} - ${end} / ${totalCount} 件`;
+}
+
+function renderPagination(totalPages) {
+  if (!El.novelListPagination) return;
+  if (State.pageLength === -1 || totalPages <= 1) {
+    El.novelListPagination.innerHTML = '';
+    return;
+  }
+
+  const pages = visiblePageNumbers(totalPages, State.currentPage);
+  const buttons = [
+    renderPageButton('&laquo;', 1, State.currentPage === 1),
+    renderPageButton('&lsaquo;', State.currentPage - 1, State.currentPage === 1),
+    ...pages.map(page => renderPageButton(String(page), page, false, page === State.currentPage)),
+    renderPageButton('&rsaquo;', State.currentPage + 1, State.currentPage === totalPages),
+    renderPageButton('&raquo;', totalPages, State.currentPage === totalPages),
+  ];
+  El.novelListPagination.innerHTML = buttons.join('');
+  El.novelListPagination.querySelectorAll('button[data-page]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const nextPage = Number.parseInt(btn.dataset.page || '', 10);
+      if (!Number.isFinite(nextPage)) return;
+      State.currentPage = nextPage;
+      renderNovelList();
+    });
+  });
+}
+
+function visiblePageNumbers(totalPages, currentPage) {
+  if (totalPages <= 7) {
+    return Array.from({ length: totalPages }, (_, index) => index + 1);
+  }
+  const start = Math.max(1, currentPage - 2);
+  const end = Math.min(totalPages, start + 4);
+  const adjustedStart = Math.max(1, end - 4);
+  return Array.from({ length: end - adjustedStart + 1 }, (_, index) => adjustedStart + index);
+}
+
+function renderPageButton(label, page, disabled, active = false) {
+  const classes = ['btn', active ? 'btn-primary' : 'btn-default'];
+  return `<button type="button" class="${classes.join(' ')}" data-page="${page}"${disabled ? ' disabled' : ''}>${label}</button>`;
 }
 
 function getFilteredNovels() {
@@ -325,6 +400,7 @@ function createRow(novel, rowIndex) {
       const val = el.dataset.filter;
       if (val) {
         State.filterText = val;
+        State.currentPage = 1;
         if (El.filterInput) El.filterInput.value = val;
         if (El.filterClear) El.filterClear.classList.remove('hide');
         renderNovelList();
@@ -339,6 +415,7 @@ function createRow(novel, rowIndex) {
       const tag = el.dataset.tag;
       if (tag) {
         State.filterText = 'tag:' + tag;
+        State.currentPage = 1;
         if (El.filterInput) El.filterInput.value = 'tag:' + tag;
         if (El.filterClear) El.filterClear.classList.remove('hide');
         renderNovelList();

@@ -71,14 +71,24 @@ export function bindActions() {
   // --- Filter ---
   El.filterInput?.addEventListener('input', () => {
     State.filterText = El.filterInput.value;
+    State.currentPage = 1;
     El.filterClear?.classList.toggle('hide', !State.filterText);
     renderNovelList();
   });
 
   El.filterClear?.addEventListener('click', () => {
     State.filterText = '';
+    State.currentPage = 1;
     if (El.filterInput) El.filterInput.value = '';
     El.filterClear?.classList.add('hide');
+    renderNovelList();
+  });
+
+  El.novelListLength?.addEventListener('change', () => {
+    const next = Number.parseInt(El.novelListLength.value, 10);
+    State.pageLength = Number.isFinite(next) ? next : 50;
+    State.currentPage = 1;
+    lsSet('page-length', String(State.pageLength));
     renderNovelList();
   });
 
@@ -570,6 +580,7 @@ export function bindActions() {
         State.sortCol = col;
         State.sortAsc = false;
       }
+      State.currentPage = 1;
       document.querySelectorAll('.sortable').forEach(h => {
         h.classList.remove('active-sort', 'sort-asc');
       });

@@ -18,7 +18,13 @@ function lsBool(key, fallback) {
   return v === null ? fallback : v === 'true';
 }
 
-export { lsGet, lsSet, lsBool };
+function lsInt(key, fallback) {
+  const raw = lsGet(key, '');
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+export { lsGet, lsSet, lsBool, lsInt };
 
 export const State = {
   novels: [],
@@ -46,6 +52,8 @@ export const State = {
   // Sort
   sortCol: 'last_update',
   sortAsc: false,
+  pageLength: lsInt('page-length', 50),
+  currentPage: 1,
 
   // Console
   consoleExpanded: false,
@@ -73,6 +81,7 @@ const ELEMENT_IDS = [
   'console-trash', 'console-expand', 'console-buttons',
   'main-control-panel', 'footer-control-panel', 'footer-navbar',
   'novel-list-body', 'novel-list', 'novel-list-container',
+  'novel-list-length', 'novel-list-info', 'novel-list-pagination',
   'control-panel',
   'notepad-modal', 'notepad', 'notepad-close', 'save-notepad-button',
   'queue-modal', 'queue-modal-close', 'queue-clear-button', 'queue-reload-button',

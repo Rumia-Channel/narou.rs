@@ -204,6 +204,49 @@ li.enable-selected.disabled a {
   border-spacing: 0;
 }
 
+.table-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.70em;
+  margin-bottom: 0.60em;
+  flex-wrap: wrap;
+}
+
+.dt-length {
+  display: flex;
+  align-items: center;
+  gap: 0.35em;
+  color: var(--text-color);
+}
+
+.table-length-select {
+  padding: 0.20em 0.40em;
+  font-size: 0.85em;
+  border: 0.05em solid var(--border-color);
+  border-radius: var(--btn-border-radius);
+  background: var(--body-bg);
+  color: var(--text-color);
+}
+
+.table-page-info {
+  color: var(--text-muted);
+  font-size: 0.90em;
+}
+
+.table-pagination {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 0.35em;
+  margin-top: 0.60em;
+}
+
+.table-pagination .btn {
+  min-width: 2.40em;
+  padding: 0.20em 0.55em;
+}
+
 .table th,
 .table td {
   padding: var(--table-cell-padding);
@@ -409,8 +452,16 @@ li.enable-selected.disabled a {
 
 /* narou.rb: hint when general_lastup > last_update (new content available) */
 .hint-new-arrival {
-  background-color: rgba(255, 200, 0, 0.15);
-  border-radius: 0.20em;
+  position: relative;
+}
+
+.hint-new-arrival::before {
+  position: absolute;
+  content: "●";
+  color: var(--new-arrival-color);
+  opacity: 0.6;
+  top: -0.35em;
+  left: -0.05em;
 }
 
 .gl-badge {

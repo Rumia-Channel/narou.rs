@@ -177,7 +177,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 |---|--------|------|------|------|
 | 1 | ID | 数値ID (凍結時 ＊ID) | ✅ | ✅ |
 | 2 | 更新日 | 日付/時刻の中央寄せ表示 + `新着` ラベル | ✅ (`date-cell` + `new-arrivals`) | ✅ |
-| 3 | 最新話掲載日 | general_lastup (日付/時刻 + 時間バッジ、新着ヒント色) | ✅ (`date-cell.hint-new-arrival` + `gl-badge`) | ✅ |
+| 3 | 最新話掲載日 | general_lastup (日付/時刻 + 時間バッジ、新着ヒント) | ✅ (`date-cell.hint-new-arrival` + `gl-badge`) | ✅ |
 | 4 | 更新チェック日 | last_check_date | ✅ | ✅ |
 | 5 | タイトル | タイトル表示 | ✅ | ✅ |
 | 6 | 作者名 | クリックでフィルタ | ✅ (.filterable) | ✅ |
@@ -199,7 +199,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | 凍結行 | 青色テキスト + ＊マーク | `.frozen` クラス + ＊マーク | ✅ |
 | 新着表示 | マゼンタ強調 | `.date-cell-label.new-arrivals` | ✅ |
 | 更新時間バッジ | 1h(赤)/6h(緑)/24h(青)/3d(灰)/1w(水色) | `.gl-badge.gl-1h/6h/24h/3d/1w` (general_lastup列) | ✅ |
-| 新着ヒント (GL > last_update) | 背景色変化 | `.hint-new-arrival` | ✅ |
+| 新着ヒント (GL > last_update) | マゼンタの ● マーカー | `.hint-new-arrival` | ✅ |
 | 奇数/偶数行色 | CSS striping | CSS変数で指定 | ✅ |
 
 #### 2.4.3 テーブル機能
@@ -209,7 +209,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | ソート (ヘッダークリック) | DataTables server-side | JS クライアントサイドソート（`/api/list` の server-side params は現状未使用） | ✅ |
 | ソートインジケータ | ▲▼ アイコン | `.active-sort` + `.sort-asc` | ✅ |
 | 列の表示/非表示切替 | DataTables ColVis | 列可視性モーダル (#colvis-modal) | ✅ |
-| ページネーション | DataTables paging | なし (全件表示) | ❌ |
+| ページネーション | DataTables paging + length selector | JS クライアントサイド paging + `件分表示` selector | ✅ |
 | 列ドラッグ並べ替え | — | なし | ❌ |
 
 ---
