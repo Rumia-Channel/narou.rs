@@ -82,9 +82,12 @@ function renderPageInfo(totalCount, start, end) {
 }
 
 function renderPagination(totalPages) {
-  if (!El.novelListPagination) return;
+  const containers = [El.novelListPaginationTop, El.novelListPagination].filter(Boolean);
+  if (containers.length === 0) return;
   if (State.pageLength === -1 || totalPages <= 1) {
-    El.novelListPagination.innerHTML = '';
+    containers.forEach(container => {
+      container.innerHTML = '';
+    });
     return;
   }
 
@@ -96,13 +99,16 @@ function renderPagination(totalPages) {
     renderPageButton('&rsaquo;', State.currentPage + 1, State.currentPage === totalPages),
     renderPageButton('&raquo;', totalPages, State.currentPage === totalPages),
   ];
-  El.novelListPagination.innerHTML = buttons.join('');
-  El.novelListPagination.querySelectorAll('button[data-page]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const nextPage = Number.parseInt(btn.dataset.page || '', 10);
-      if (!Number.isFinite(nextPage)) return;
-      State.currentPage = nextPage;
-      renderNovelList();
+  const html = buttons.join('');
+  containers.forEach(container => {
+    container.innerHTML = html;
+    container.querySelectorAll('button[data-page]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const nextPage = Number.parseInt(btn.dataset.page || '', 10);
+        if (!Number.isFinite(nextPage)) return;
+        State.currentPage = nextPage;
+        renderNovelList();
+      });
     });
   });
 }

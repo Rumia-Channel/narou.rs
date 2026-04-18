@@ -82,7 +82,7 @@ const ELEMENT_IDS = [
   'console-trash', 'console-expand', 'console-buttons',
   'main-control-panel', 'footer-control-panel', 'footer-navbar',
   'novel-list-body', 'novel-list', 'novel-list-container',
-  'novel-list-length', 'novel-list-info', 'novel-list-pagination',
+  'novel-list-length', 'novel-list-info', 'novel-list-pagination-top', 'novel-list-pagination',
   'control-panel',
   'notepad-modal', 'notepad', 'notepad-close', 'save-notepad-button',
   'queue-modal', 'queue-modal-close', 'queue-clear-button', 'queue-reload-button',

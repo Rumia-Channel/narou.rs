@@ -242,6 +242,10 @@ li.enable-selected.disabled a {
   margin-top: 0.60em;
 }
 
+.table-pagination-top {
+  margin-top: 0;
+}
+
 .table-pagination .btn {
   min-width: 2.40em;
   padding: 0.20em 0.55em;
