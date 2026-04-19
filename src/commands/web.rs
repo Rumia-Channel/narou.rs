@@ -76,6 +76,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
     let restore_prompt_pending = Arc::new(AtomicBool::new(queue.pending_count() > 0));
     let running_jobs = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let running_child_pids = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let auto_update_scheduler = Arc::new(parking_lot::Mutex::new(None));
     let app_state = web::AppState {
         port: address.port,
         ws_port: address.ws_port,
@@ -85,6 +86,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
         restore_prompt_pending: restore_prompt_pending.clone(),
         running_jobs: running_jobs.clone(),
         running_child_pids: running_child_pids.clone(),
+        auto_update_scheduler: auto_update_scheduler.clone(),
     };
     let app = web::create_router(app_state.clone());
     let ws_app = web::push::create_push_router(app_state);
@@ -113,13 +115,18 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
 
     let worker_tasks = web::worker::start_queue_workers(
         root_dir.clone(),
-        queue,
+        queue.clone(),
         push_server.clone(),
-        running_jobs,
+        running_jobs.clone(),
         running_child_pids,
         narou_rs::compat::load_local_setting_bool("concurrency"),
     );
-    let scheduler_task = web::scheduler::start_auto_update_scheduler(root_dir, push_server.clone());
+    web::scheduler::restart_auto_update_scheduler(
+        queue,
+        running_jobs,
+        push_server.clone(),
+        &auto_update_scheduler,
+    );
 
     // Ruby parity: broadcast startup messages to web console
     {
@@ -152,9 +159,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
     for worker_task in worker_tasks {
         worker_task.abort();
     }
-    if let Some(task) = scheduler_task {
-        task.abort();
-    }
+    web::scheduler::stop_auto_update_scheduler(&auto_update_scheduler);
     ws_task.abort();
     remove_pid_file();
 }

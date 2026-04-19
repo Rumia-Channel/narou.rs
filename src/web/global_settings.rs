@@ -155,7 +155,7 @@ pub async fn get_global_settings(
 
 /// POST /api/setting — save settings
 pub async fn save_global_settings(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
     let Some(entries) = body["settings"].as_object() else {
@@ -176,6 +176,7 @@ pub async fn save_global_settings(
     let mut global_changes: HashMap<String, serde_yaml::Value> = HashMap::new();
     let mut deletes_local: Vec<String> = Vec::new();
     let mut deletes_global: Vec<String> = Vec::new();
+    let mut auto_schedule_changed = false;
 
     for (name, json_val) in entries {
         // Determine scope
@@ -213,6 +214,7 @@ pub async fn save_global_settings(
             let mut settings: HashMap<String, serde_yaml::Value> = inv
                 .load("local_setting", InventoryScope::Local)
                 .unwrap_or_default();
+            let auto_schedule_before = auto_schedule_snapshot(&settings);
             let previous_device = setting_string(settings.get("device"));
             for (k, v) in local_changes {
                 settings.insert(k, v);
@@ -224,13 +226,18 @@ pub async fn save_global_settings(
                 apply_device_related_settings(&mut settings);
             }
             inv.save("local_setting", InventoryScope::Local, &settings)?;
-            Ok(())
+            Ok(auto_schedule_before != auto_schedule_snapshot(&settings))
         });
-        if let Err(e) = result {
-            return Json(ApiResponse {
-                success: false,
-                message: format!("Failed to save local settings: {}", e),
-            });
+        match result {
+            Ok(changed) => {
+                auto_schedule_changed = changed;
+            }
+            Err(e) => {
+                return Json(ApiResponse {
+                    success: false,
+                    message: format!("Failed to save local settings: {}", e),
+                });
+            }
         }
     }
 
@@ -270,10 +277,34 @@ pub async fn save_global_settings(
         }
     }
 
+    if auto_schedule_changed {
+        let started = crate::web::scheduler::restart_auto_update_scheduler(
+            state.queue.clone(),
+            state.running_jobs.clone(),
+            state.push_server.clone(),
+            &state.auto_update_scheduler,
+        );
+        let message = if started {
+            "自動アップデートスケジューラーを更新しました"
+        } else {
+            "自動アップデートスケジューラーを停止しました"
+        };
+        state.push_server.broadcast_echo(message, "stdout");
+    }
+
     Json(ApiResponse {
         success: true,
         message: "設定を保存しました".to_string(),
     })
+}
+
+fn auto_schedule_snapshot(
+    settings: &HashMap<String, serde_yaml::Value>,
+) -> (Option<serde_yaml::Value>, Option<serde_yaml::Value>) {
+    (
+        settings.get("update.auto-schedule.enable").cloned(),
+        settings.get("update.auto-schedule").cloned(),
+    )
 }
 
 fn build_setting_entry(

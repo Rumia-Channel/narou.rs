@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +12,7 @@ use crate::termcolor::colored;
 use crate::db;
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::downloader::site_setting::SiteSetting;
+use crate::queue::{JobType, PersistentQueue, QueueJob};
 
 use super::push::PushServer;
 
@@ -33,7 +34,8 @@ const SORT_COLUMN_KEYS: &[&str] = &[
 ];
 
 pub fn start_auto_update_scheduler(
-    root_dir: PathBuf,
+    queue: Arc<PersistentQueue>,
+    running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
     push_server: Arc<PushServer>,
 ) -> Option<JoinHandle<()>> {
     let enabled = load_local_setting_bool("update.auto-schedule.enable");
@@ -42,13 +44,17 @@ pub fn start_auto_update_scheduler(
         return None;
     }
 
-    Some(tokio::spawn(async move {
-        let times = parse_schedule_times(&schedule_string);
-        if times.is_empty() {
-            eprintln!("自動アップデートスケジューラーの時刻指定が不正です: {}", schedule_string);
-            return;
-        }
+    let times = parse_schedule_times(&schedule_string);
+    if times.is_empty() {
+        eprintln!("自動アップデートスケジューラーの時刻指定が不正です: {}", schedule_string);
+        push_server.broadcast_echo(
+            &format!("自動アップデートスケジューラーの時刻指定が不正です: {}", schedule_string),
+            "stdout",
+        );
+        return None;
+    }
 
+    Some(tokio::spawn(async move {
         loop {
             let Some(next_run) = calculate_next_run_time(&times) else {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -61,12 +67,53 @@ pub fn start_auto_update_scheduler(
                 "stdout",
             );
 
-            let root_dir = root_dir.clone();
-            let push_server = push_server.clone();
-            let _ = tokio::task::spawn_blocking(move || execute_auto_update(&root_dir, &push_server))
-                .await;
+            match queue_auto_update_job_if_needed(queue.as_ref(), &running_jobs) {
+                Ok((job_id, true)) => {
+                    push_server.broadcast_echo(
+                        &format!("自動アップデートをキューに追加しました ({})", job_id),
+                        "stdout",
+                    );
+                    push_server.broadcast_event("notification.queue", "");
+                }
+                Ok((_, false)) => {
+                    push_server.broadcast_echo(
+                        "自動アップデートは既にキューまたは実行中に存在します",
+                        "stdout",
+                    );
+                }
+                Err(message) => {
+                    push_server.broadcast_echo(
+                        &format!("自動アップデートのキュー追加に失敗しました: {}", message),
+                        "stdout",
+                    );
+                }
+            }
         }
     }))
+}
+
+pub fn restart_auto_update_scheduler(
+    queue: Arc<PersistentQueue>,
+    running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
+    push_server: Arc<PushServer>,
+    scheduler_task: &parking_lot::Mutex<Option<JoinHandle<()>>>,
+) -> bool {
+    if let Some(task) = scheduler_task.lock().take() {
+        task.abort();
+    }
+
+    let task = start_auto_update_scheduler(queue, running_jobs, push_server);
+    let started = task.is_some();
+    *scheduler_task.lock() = task;
+    started
+}
+
+pub fn stop_auto_update_scheduler(
+    scheduler_task: &parking_lot::Mutex<Option<JoinHandle<()>>>,
+) {
+    if let Some(task) = scheduler_task.lock().take() {
+        task.abort();
+    }
 }
 
 fn parse_schedule_times(schedule_string: &str) -> Vec<(u32, u32)> {
@@ -135,7 +182,7 @@ async fn sleep_until(target_time: chrono::DateTime<Local>) {
     }
 }
 
-fn execute_auto_update(root_dir: &Path, push_server: &PushServer) {
+pub fn execute_auto_update(root_dir: &Path, push_server: &PushServer) -> bool {
     println!(
         "自動アップデートを実行中... ({})",
         Local::now().format("%Y/%m/%d %H:%M:%S")
@@ -145,7 +192,7 @@ fn execute_auto_update(root_dir: &Path, push_server: &PushServer) {
     let sort_args = build_auto_update_sort_args();
     if !run_update_phase(root_dir, &["--gl", "narou"], "なろうAPIによる更新確認") {
         push_server.broadcast_echo("自動アップデート失敗: なろうAPI更新確認", "stdout");
-        return;
+        return false;
     }
 
     let (modified_ids, other_ids) = collect_auto_update_target_ids();
@@ -165,7 +212,7 @@ fn execute_auto_update(root_dir: &Path, push_server: &PushServer) {
         args.extend(modified_ids.iter().map(String::as_str));
         if !run_update_phase(root_dir, &args, "modified タグ更新") {
             push_server.broadcast_echo("自動アップデート失敗: modified タグ更新", "stdout");
-            return;
+            return false;
         }
     }
 
@@ -180,7 +227,7 @@ fn execute_auto_update(root_dir: &Path, push_server: &PushServer) {
         args.extend(other_ids.iter().map(String::as_str));
         if !run_update_phase(root_dir, &args, "その他小説更新") {
             push_server.broadcast_echo("自動アップデート失敗: その他小説更新", "stdout");
-            return;
+            return false;
         }
     }
 
@@ -188,6 +235,7 @@ fn execute_auto_update(root_dir: &Path, push_server: &PushServer) {
     push_server.broadcast_echo("自動アップデートが正常に完了しました", "stdout");
     push_server.broadcast_event("table.reload", "");
     push_server.broadcast_event("tag.updateCanvas", "");
+    true
 }
 
 fn build_auto_update_sort_args() -> Vec<&'static str> {
@@ -285,6 +333,34 @@ fn collect_auto_update_target_ids() -> (Vec<String>, Vec<String>) {
     (modified_ids, other_ids)
 }
 
+fn queue_auto_update_job_if_needed(
+    queue: &PersistentQueue,
+    running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
+) -> std::result::Result<(String, bool), String> {
+    if let Some(existing_id) = running_jobs
+        .lock()
+        .iter()
+        .find(|job| matches!(job.job_type, JobType::AutoUpdate))
+        .map(|job| job.id.clone())
+    {
+        return Ok((existing_id, false));
+    }
+
+    if let Some(existing_id) = queue
+        .get_pending_tasks()
+        .into_iter()
+        .find(|job| matches!(job.job_type, JobType::AutoUpdate))
+        .map(|job| job.id)
+    {
+        return Ok((existing_id, false));
+    }
+
+    queue
+        .push(JobType::AutoUpdate, "")
+        .map(|id| (id, true))
+        .map_err(|e| e.to_string())
+}
+
 fn run_update_phase(root_dir: &Path, args: &[&str], label: &str) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         println!("{} で重大なエラーが発生しました（実行ファイルを取得できません）", label);
@@ -311,14 +387,24 @@ fn run_update_phase(root_dir: &Path, args: &[&str], label: &str) -> bool {
     match code {
         0 => {
             println!("{} が完了しました", label);
-            true
+            refresh_database_after_phase(label)
         }
         1..=9 => {
             println!("{} が完了しました（{}件の小説でエラーがありました）", label, code);
-            true
+            refresh_database_after_phase(label)
         }
         _ => {
             println!("{} で重大なエラーが発生しました（終了コード: {}）", label, code);
+            false
+        }
+    }
+}
+
+fn refresh_database_after_phase(label: &str) -> bool {
+    match db::with_database_mut(|db| db.refresh()) {
+        Ok(()) => true,
+        Err(e) => {
+            println!("{} 後のDB再読み込みに失敗しました: {}", label, e);
             false
         }
     }
@@ -328,7 +414,10 @@ fn run_update_phase(root_dir: &Path, args: &[&str], label: &str) -> bool {
 mod tests {
     use super::{
         auto_update_sort_key_from_value, calculate_next_run_time, parse_schedule_times,
+        queue_auto_update_job_if_needed,
     };
+    use parking_lot::Mutex;
+    use crate::queue::{JobType, PersistentQueue, QueueJob};
 
     #[test]
     fn parse_schedule_times_accepts_four_digit_times() {
@@ -350,5 +439,42 @@ mod tests {
         .unwrap();
 
         assert_eq!(auto_update_sort_key_from_value(&server_setting), Some("last_check_date"));
+    }
+
+    #[test]
+    fn queue_auto_update_job_reuses_pending_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = PersistentQueue::new(&temp.path().join("queue.yaml")).unwrap();
+        let running_jobs = Mutex::new(Vec::new());
+
+        let (first_id, first_queued) =
+            queue_auto_update_job_if_needed(&queue, &running_jobs).unwrap();
+        let (second_id, second_queued) =
+            queue_auto_update_job_if_needed(&queue, &running_jobs).unwrap();
+
+        assert!(first_queued);
+        assert!(!second_queued);
+        assert_eq!(first_id, second_id);
+        assert_eq!(queue.pending_count(), 1);
+    }
+
+    #[test]
+    fn queue_auto_update_job_reuses_running_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = PersistentQueue::new(&temp.path().join("queue.yaml")).unwrap();
+        let running_jobs = Mutex::new(vec![QueueJob {
+            id: "running-auto".to_string(),
+            job_type: JobType::AutoUpdate,
+            target: String::new(),
+            created_at: 0,
+            retry_count: 0,
+            max_retries: 3,
+        }]);
+
+        let (job_id, queued) = queue_auto_update_job_if_needed(&queue, &running_jobs).unwrap();
+
+        assert!(!queued);
+        assert_eq!(job_id, "running-auto");
+        assert_eq!(queue.pending_count(), 0);
     }
 }

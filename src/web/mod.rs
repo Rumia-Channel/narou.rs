@@ -20,6 +20,7 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use std::sync::{Arc, atomic::AtomicBool};
+use tokio::task::JoinHandle;
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -31,6 +32,7 @@ pub struct AppState {
     pub restore_prompt_pending: Arc<AtomicBool>,
     pub running_jobs: Arc<parking_lot::Mutex<Vec<crate::queue::QueueJob>>>,
     pub running_child_pids: Arc<parking_lot::Mutex<std::collections::HashMap<String, u32>>>,
+    pub auto_update_scheduler: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
 }
 
 pub fn create_router(state: AppState) -> Router {

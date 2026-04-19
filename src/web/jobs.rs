@@ -1717,6 +1717,7 @@ mod tests {
             restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             running_jobs: Arc::new(Mutex::new(Vec::new())),
             running_child_pids: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            auto_update_scheduler: Arc::new(Mutex::new(None)),
         };
 
         assert!(restorable_tasks_available(&state, 1));

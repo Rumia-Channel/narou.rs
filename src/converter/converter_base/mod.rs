@@ -247,7 +247,8 @@ impl ConverterBase {
                     && !line.starts_with('\t')
                     && !is_border_symbol(&line)
                 {
-                    line.insert(0, '\u{E000}');
+                    let marker_pos = line.bytes().take_while(|&byte| byte == b'\n').count();
+                    line.insert(marker_pos, '\u{E000}');
                 }
             }
 

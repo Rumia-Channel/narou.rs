@@ -534,11 +534,11 @@ narou setting name         # 読み取り
 - 初回起動時は Ruby版同様にファイアウォール許可と停止方法の案内を表示し、`server_setting.yaml` に起動済みフラグを保存する
 - global `server-basic-auth.*` が有効な場合は HTTP/WS の両ルータで Basic 認証を要求する
 - API の凍結/解凍操作と一覧上の `frozen` 判定は CLI と同じ `.narou/freeze.yaml` を優先し、`frozen` タグは補助的に扱う
-- queue worker が `.narou/queue.yaml` 永続キューを読み書きし、download / update / convert / send / backup / mail の queued job を別プロセスで順次実行する
+- queue worker が `.narou/queue.yaml` 永続キューを読み書きし、download / update / auto_update / convert / send / backup / mail の queued job を別プロセスまたは worker 内処理で順次実行する
 - Web 経由の convert job は `--no-open` で非対話化し、API 指定 device は worker 専用 override で child process に渡す
 - `queue_clear` は deadlock しないように永続キュー保存順を修正済み
-- local `update.auto-schedule.enable` / `update.auto-schedule` が有効なら、Ruby版同様に時刻指定で自動アップデートを実行する
-- 自動アップデートは `--gl narou` → `modified` タグ対象 → その他小説の順に child `update` を実行し、`server_setting.current_sort` が有効なら対応する `--sort-by` も引き継ぐ
+- local `update.auto-schedule.enable` / `update.auto-schedule` が有効なら、Ruby版同様に時刻指定で自動アップデートを Web queue に投入する。設定保存時は Ruby版同様に scheduler を stop/start し、サーバ再起動なしで変更を反映する
+- 自動アップデートは `--gl narou` → `modified` タグ対象 → その他小説の順に child `update` を実行し、各 phase 後に Web サーバ側 DB を再読み込みして `modified` タグ検出漏れを防ぐ。`server_setting.current_sort` が有効なら対応する `--sort-by` も引き継ぐ
 - Web サーバ起動時は Ruby版 `fill_general_all_no_in_database` 相当に、`general_all_no` 未設定レコードの `toc.yaml` を読んで話数をDBへ補完する
 - `/` では pure JS / pure CSS の分割 asset frontend を配信し、navbar / console / control panel / list + sidebar の構成で一覧操作できる
 - UI は日本語既定で、JP/EN トグルによる切替と `localStorage` 永続化に対応する

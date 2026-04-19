@@ -136,6 +136,10 @@ fn execute_job(
     push_server: &Arc<PushServer>,
     running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
 ) -> bool {
+    if matches!(job.job_type, JobType::AutoUpdate) {
+        return crate::web::scheduler::execute_auto_update(root_dir, push_server.as_ref());
+    }
+
     let target_console = console_target_for_job(job.job_type);
     let Ok(exe) = std::env::current_exe() else {
         push_server.broadcast_echo("エラー: 実行ファイルパスを取得できません", target_console);
@@ -201,6 +205,7 @@ fn execute_job(
                 }
             }
         }
+        JobType::AutoUpdate => unreachable!(),
     }
 
     let mut child = match command.spawn() {
@@ -311,6 +316,7 @@ mod tests {
         assert_eq!(console_target_for_job(JobType::Send), "stdout2");
         assert_eq!(console_target_for_job(JobType::Mail), "stdout2");
         assert_eq!(console_target_for_job(JobType::Download), "stdout");
+        assert_eq!(console_target_for_job(JobType::AutoUpdate), "stdout");
     }
 
     #[test]

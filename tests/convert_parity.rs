@@ -67,7 +67,10 @@ fn kakuyomu_sample_matches_narou_rb_reference_byte_for_byte() {
             continue;
         };
 
-        let mut converter = NovelConverter::new(NovelSettings::default());
+        // Reference fixtures were generated with the sample EPUB device defaults.
+        let mut settings = NovelSettings::default();
+        settings.enable_half_indent_bracket = false;
+        let mut converter = NovelConverter::new(settings);
         let output = convert_sample_to_string(&mut converter, &path);
         let reference_bytes = fs::read(&reference).unwrap();
         assert_eq!(

@@ -24,6 +24,7 @@ pub struct QueueJob {
 pub enum JobType {
     Download,
     Update,
+    AutoUpdate,
     Convert,
     Send,
     Backup,
@@ -297,6 +298,7 @@ fn generate_job_id(job_type: JobType, target: &str) -> String {
     match job_type {
         JobType::Download => "dl".hash(&mut hasher),
         JobType::Update => "up".hash(&mut hasher),
+        JobType::AutoUpdate => "au".hash(&mut hasher),
         JobType::Convert => "cv".hash(&mut hasher),
         JobType::Send => "sd".hash(&mut hasher),
         JobType::Backup => "bk".hash(&mut hasher),
