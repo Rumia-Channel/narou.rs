@@ -1558,7 +1558,7 @@ pub async fn api_reboot(
             });
         }
     };
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = reboot_args_with_no_browser(std::env::args().skip(1).collect());
     // Spawn replacement process, then exit
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1573,6 +1573,14 @@ pub async fn api_reboot(
         success: true,
         message: "Rebooting".to_string(),
     })
+}
+
+fn reboot_args_with_no_browser(mut args: Vec<String>) -> Vec<String> {
+    if args.iter().any(|arg| arg == "-n" || arg == "--no-browser") {
+        return args;
+    }
+    args.push("--no-browser".to_string());
+    args
 }
 
 /// Ruby parity: build sort display string like "タイトル昇順" or "ID順"
@@ -1611,7 +1619,7 @@ mod tests {
 
     use super::{
         encode_convert_job_target, existing_update_job_id, push_update_job_if_needed,
-        normalize_update_targets, restorable_tasks_available,
+        normalize_update_targets, reboot_args_with_no_browser, restorable_tasks_available,
         validate_diff_number, validate_download_targets, validate_general_lastup_option,
     };
 
@@ -1682,6 +1690,39 @@ mod tests {
         assert_eq!(validate_general_lastup_option("narou").unwrap(), Some("narou"));
         assert_eq!(validate_general_lastup_option("other").unwrap(), Some("other"));
         assert!(validate_general_lastup_option("--force").is_err());
+    }
+
+    #[test]
+    fn reboot_args_adds_no_browser_to_prevent_new_tab() {
+        assert_eq!(
+            reboot_args_with_no_browser(vec!["web".to_string()]),
+            vec!["web".to_string(), "--no-browser".to_string()]
+        );
+        assert_eq!(
+            reboot_args_with_no_browser(vec![
+                "web".to_string(),
+                "--port".to_string(),
+                "33000".to_string()
+            ]),
+            vec![
+                "web".to_string(),
+                "--port".to_string(),
+                "33000".to_string(),
+                "--no-browser".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn reboot_args_preserves_existing_no_browser() {
+        assert_eq!(
+            reboot_args_with_no_browser(vec!["web".to_string(), "--no-browser".to_string()]),
+            vec!["web".to_string(), "--no-browser".to_string()]
+        );
+        assert_eq!(
+            reboot_args_with_no_browser(vec!["web".to_string(), "-n".to_string()]),
+            vec!["web".to_string(), "-n".to_string()]
+        );
     }
 
     #[test]
