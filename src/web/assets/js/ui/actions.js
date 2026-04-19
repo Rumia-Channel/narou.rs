@@ -17,6 +17,7 @@ import {
 } from './context_menu.js';
 
 const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
+let tagSuggestionIndex = -1;
 
 export function bindActions() {
   applyColumnVisibility();
@@ -280,10 +281,16 @@ export function bindActions() {
   });
 
   // --- Tag edit modal ---
-  on('tag-edit-close', () => El.tagEditModal?.classList.add('hide'));
-  on('tag-edit-cancel', () => El.tagEditModal?.classList.add('hide'));
+  on('tag-edit-close', closeTagEditor);
+  on('tag-edit-cancel', closeTagEditor);
   on('add-tag-button', addTagFromInput);
+  El.newTagInput?.addEventListener('input', renderTagSuggestions);
+  El.newTagInput?.addEventListener('focus', renderTagSuggestions);
+  El.newTagInput?.addEventListener('blur', () => {
+    setTimeout(hideTagSuggestions, 120);
+  });
   El.newTagInput?.addEventListener('keydown', (e) => {
+    if (handleTagSuggestionKeydown(e)) return;
     if (e.key === 'Enter') {
       e.preventDefault();
       addTagFromInput();
@@ -789,6 +796,11 @@ function requireSelectedIds() {
 
 /* ===== Tag editor ===== */
 
+function closeTagEditor() {
+  hideTagSuggestions();
+  El.tagEditModal?.classList.add('hide');
+}
+
 function openTagEditor(ids) {
   const targetIds = ids || requireSelectedIds();
   if (!targetIds || targetIds.length === 0) return;
@@ -807,6 +819,7 @@ function openTagEditor(ids) {
     for (const tag of currentTags) {
       const span = document.createElement('span');
       span.className = 'tag-label tag-default tag-editable';
+      span.dataset.tag = tag;
       span.textContent = tag;
       const removeBtn = document.createElement('span');
       removeBtn.className = 'tag-remove';
@@ -828,27 +841,177 @@ function openTagEditor(ids) {
     El.newTagInput.value = '';
     El.newTagInput.focus();
   }
+  hideTagSuggestions();
 }
 
 async function addTagFromInput() {
   const input = El.newTagInput;
   if (!input) return;
-  const tag = input.value.trim();
-  if (!tag) return;
+  const tags = splitTagInput(input.value);
+  if (tags.length === 0) return;
 
   const idsJson = El.tagEditModal?.dataset.ids;
   const ids = idsJson ? JSON.parse(idsJson) : [...State.selectedIds];
 
   for (const id of ids) {
-    await postJson(`/api/novels/${id}/tags`, { tags: [tag] });
+    await postJson(`/api/novels/${id}/tags`, { tags });
   }
 
   input.value = '';
+  hideTagSuggestions();
   await refreshList();
   await refreshTags();
 
   // Re-open to refresh display
   openTagEditor(ids);
+}
+
+function splitTagInput(value) {
+  const seen = new Set();
+  const tags = [];
+  for (const raw of String(value || '').split(/[\s　]+/u)) {
+    const tag = raw.trim();
+    if (!tag || seen.has(tag)) continue;
+    seen.add(tag);
+    tags.push(tag);
+  }
+  return tags;
+}
+
+function renderTagSuggestions() {
+  const input = El.newTagInput;
+  const box = El.tagSuggestions;
+  if (!input || !box) return;
+
+  const fragment = getActiveTagFragment(input.value);
+  const query = normalizeTagCandidate(fragment.value);
+  if (!query) {
+    hideTagSuggestions();
+    return;
+  }
+
+  const currentTags = getCurrentEditorTags();
+  const candidates = State.tags
+    .filter(tag => !currentTags.has(tag))
+    .map(tag => ({ tag, score: tagSuggestionScore(tag, query) }))
+    .filter(item => item.score >= 0)
+    .sort((a, b) => a.score - b.score || a.tag.localeCompare(b.tag, 'ja'))
+    .slice(0, 10);
+
+  if (candidates.length === 0) {
+    hideTagSuggestions();
+    return;
+  }
+
+  tagSuggestionIndex = Math.min(Math.max(tagSuggestionIndex, 0), candidates.length - 1);
+  box.innerHTML = '';
+  candidates.forEach((item, index) => {
+    const option = document.createElement('button');
+    option.type = 'button';
+    option.className = 'tag-suggestion-option';
+    option.classList.toggle('active', index === tagSuggestionIndex);
+    option.textContent = item.tag;
+    option.dataset.tag = item.tag;
+    option.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+    });
+    option.addEventListener('click', () => {
+      replaceActiveTagFragment(item.tag);
+    });
+    box.appendChild(option);
+  });
+  box.classList.remove('hide');
+}
+
+function handleTagSuggestionKeydown(event) {
+  const box = El.tagSuggestions;
+  if (!box || box.classList.contains('hide')) return false;
+  const options = Array.from(box.querySelectorAll('.tag-suggestion-option'));
+  if (options.length === 0) return false;
+
+  if (event.key === 'ArrowDown') {
+    event.preventDefault();
+    tagSuggestionIndex = (tagSuggestionIndex + 1) % options.length;
+    updateTagSuggestionActive(options);
+    return true;
+  }
+  if (event.key === 'ArrowUp') {
+    event.preventDefault();
+    tagSuggestionIndex = (tagSuggestionIndex + options.length - 1) % options.length;
+    updateTagSuggestionActive(options);
+    return true;
+  }
+  if (event.key === 'Tab' || event.key === 'Enter') {
+    const option = options[tagSuggestionIndex] || options[0];
+    if (option?.dataset.tag) {
+      event.preventDefault();
+      replaceActiveTagFragment(option.dataset.tag);
+      return true;
+    }
+  }
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    hideTagSuggestions();
+    return true;
+  }
+
+  return false;
+}
+
+function updateTagSuggestionActive(options) {
+  options.forEach((option, index) => {
+    option.classList.toggle('active', index === tagSuggestionIndex);
+  });
+}
+
+function hideTagSuggestions() {
+  tagSuggestionIndex = -1;
+  if (El.tagSuggestions) {
+    El.tagSuggestions.innerHTML = '';
+    El.tagSuggestions.classList.add('hide');
+  }
+}
+
+function getCurrentEditorTags() {
+  const tags = new Set();
+  El.tagEditorCurrent?.querySelectorAll('.tag-editable[data-tag]').forEach(el => {
+    if (el.dataset.tag) tags.add(el.dataset.tag);
+  });
+  return tags;
+}
+
+function getActiveTagFragment(value) {
+  const text = String(value || '');
+  const match = text.match(/^(.*?)([^\s　]*)$/u);
+  if (!match) return { prefix: '', value: text };
+  return { prefix: match[1], value: match[2] };
+}
+
+function replaceActiveTagFragment(tag) {
+  const input = El.newTagInput;
+  if (!input) return;
+  const fragment = getActiveTagFragment(input.value);
+  input.value = fragment.prefix + tag;
+  hideTagSuggestions();
+  input.focus();
+}
+
+function tagSuggestionScore(tag, query) {
+  const normalized = normalizeTagCandidate(tag);
+  if (normalized === query) return 0;
+  if (normalized.startsWith(query)) return 1;
+  if (normalized.includes(query)) return 2;
+  return -1;
+}
+
+function normalizeTagCandidate(value) {
+  return toHiragana(String(value || '').normalize('NFKC').toLowerCase()).replace(/\s+/gu, '');
+}
+
+function toHiragana(value) {
+  return value.replace(/[\u30a1-\u30f6]/g, ch =>
+    String.fromCharCode(ch.charCodeAt(0) - 0x60)
+  );
 }
 
 /* ===== Notepad ===== */

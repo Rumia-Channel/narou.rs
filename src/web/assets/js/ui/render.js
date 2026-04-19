@@ -185,15 +185,41 @@ function parseFilterToken(rawToken) {
   const body = negate ? token.slice(1) : token;
   const colon = body.indexOf(':');
   const field = colon > 0 ? body.slice(0, colon).toLowerCase() : '';
-  const value = stripFilterQuotes((colon > 0 ? body.slice(colon + 1) : body).trim()).toLowerCase();
+  const value = (colon > 0 ? body.slice(colon + 1) : body).trim().toLowerCase();
   return { negate, field, value };
 }
 
 function stripFilterQuotes(value) {
-  if (value.startsWith('"') && value.endsWith('"')) {
+  if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
     return value.slice(1, -1);
   }
   return value;
+}
+
+function splitOrValues(value) {
+  const values = [];
+  let current = '';
+  let quoted = false;
+
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (ch === '"') {
+      quoted = !quoted;
+      current += ch;
+      continue;
+    }
+    if (ch === '|' && !quoted) {
+      const trimmed = stripFilterQuotes(current.trim());
+      if (trimmed) values.push(trimmed);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+
+  const trimmed = stripFilterQuotes(current.trim());
+  if (trimmed) values.push(trimmed);
+  return values;
 }
 
 function matchFilterToken(novel, token) {
@@ -203,7 +229,7 @@ function matchFilterToken(novel, token) {
   const novelTypeText = target(getNovelTypeText(novel));
   const averageLength = getAverageLengthValue(novel);
   let matched = false;
-  const values = token.value.split('|').map(v => v.trim()).filter(Boolean);
+  const values = splitOrValues(token.value);
   const matchAny = (predicate) => values.some(predicate);
   const plainText = [
     target(novel.title),
@@ -254,6 +280,111 @@ function matchFilterToken(novel, token) {
   }
 
   return token.negate ? !matched : matched;
+}
+
+function applyFilterFromClick(kind, value, event) {
+  const normalizedKind = kind === 'site' ? 'sitename' : kind;
+  const normalizedValue = String(value || '').trim();
+  if (!normalizedKind || !normalizedValue) return;
+
+  const next = buildStructuredFilter(
+    State.filterText || '',
+    normalizedKind,
+    normalizedValue,
+    {
+      negate: !!event.shiftKey,
+      mode: event.ctrlKey || event.metaKey ? 'or' : 'and',
+    },
+  );
+
+  State.filterText = next;
+  State.currentPage = 1;
+  if (El.filterInput) El.filterInput.value = next;
+  El.filterClear?.classList.toggle('hide', !next);
+  renderNovelList();
+}
+
+function buildStructuredFilter(currentFilter, field, value, options) {
+  const terms = splitRawFilterTerms(String(currentFilter || '').trim());
+  const newTerm = formatFilterTerm(field, value, options.negate);
+
+  if (terms.some(term => filterTermContainsValue(term, field, value, options.negate))) {
+    return terms.join(' ');
+  }
+
+  if (options.mode === 'or') {
+    for (let i = terms.length - 1; i >= 0; i--) {
+      const parsed = parseRawFieldToken(terms[i]);
+      if (!parsed || parsed.field !== field || parsed.negate !== options.negate) continue;
+      parsed.values.push(value);
+      terms[i] = formatFilterTerm(field, parsed.values, options.negate);
+      return terms.join(' ');
+    }
+  }
+
+  terms.push(newTerm);
+  return terms.join(' ');
+}
+
+function splitRawFilterTerms(query) {
+  if (!query) return [];
+  const terms = [];
+  let current = '';
+  let quoted = false;
+
+  for (let i = 0; i < query.length; i++) {
+    const ch = query[i];
+    if (ch === '"') {
+      quoted = !quoted;
+      current += ch;
+      continue;
+    }
+    if (/\s/.test(ch) && !quoted) {
+      if (current.trim()) terms.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+
+  if (current.trim()) terms.push(current.trim());
+  return terms;
+}
+
+function parseRawFieldToken(rawTerm) {
+  const term = String(rawTerm || '').trim();
+  const negate = term.startsWith('-') || term.startsWith('!');
+  const body = negate ? term.slice(1) : term;
+  const colon = body.indexOf(':');
+  if (colon <= 0) return null;
+  const field = body.slice(0, colon).toLowerCase();
+  const values = splitOrValues(body.slice(colon + 1)).map(stripFilterQuotes);
+  return { negate, field, values };
+}
+
+function filterTermContainsValue(term, field, value, negate) {
+  const parsed = parseRawFieldToken(term);
+  if (!parsed || parsed.field !== field || parsed.negate !== negate) return false;
+  const needle = normalizeFilterValue(value);
+  return parsed.values.some(existing => normalizeFilterValue(existing) === needle);
+}
+
+function formatFilterTerm(field, values, negate) {
+  const parts = Array.isArray(values) ? values : [values];
+  const value = parts.map(formatFilterValue).join('|');
+  return `${negate ? '-' : ''}${field}:${value}`;
+}
+
+function formatFilterValue(value) {
+  const text = String(value || '').trim();
+  if (/[\s|"]/u.test(text)) {
+    return `"${text.replace(/"/g, '')}"`;
+  }
+  return text;
+}
+
+function normalizeFilterValue(value) {
+  return String(value || '').trim().toLowerCase();
 }
 
 function sortNovels(novels) {
@@ -370,8 +501,8 @@ function createRow(novel, rowIndex) {
     <td class="col-general-lastup">${glCell}</td>
     <td class="col-last-check">${checkCell}</td>
     <td class="col-title">${esc(novel.title || '')}</td>
-    <td class="col-author"><span class="filterable" data-filter="${esc(novel.author || '')}">${esc(novel.author || '')}</span></td>
-    <td class="col-site"><span class="filterable" data-filter="${esc(novel.sitename || '')}">${esc(novel.sitename || '')}</span></td>
+    <td class="col-author"><span class="filterable" data-filter-kind="author" data-filter-value="${escAttr(novel.author || '')}">${esc(novel.author || '')}</span></td>
+    <td class="col-site"><span class="filterable" data-filter-kind="sitename" data-filter-value="${escAttr(novel.sitename || '')}">${esc(novel.sitename || '')}</span></td>
     <td class="col-novel-type" style="text-align:center">${novelTypeText}</td>
     <td class="col-tags">${tagsHtml}</td>
     <td class="col-episodes" style="text-align:center">${episodesText}</td>
@@ -457,33 +588,19 @@ function createRow(novel, rowIndex) {
     });
   }
 
-  // Bind filterable clicks (author/site → filter)
+  // Bind filterable clicks (author/site → structured filter)
   tr.querySelectorAll('.filterable').forEach(el => {
     el.addEventListener('click', (e) => {
       e.stopPropagation();
-      const val = el.dataset.filter;
-      if (val) {
-        State.filterText = val;
-        State.currentPage = 1;
-        if (El.filterInput) El.filterInput.value = val;
-        if (El.filterClear) El.filterClear.classList.remove('hide');
-        renderNovelList();
-      }
+      applyFilterFromClick(el.dataset.filterKind, el.dataset.filterValue, e);
     });
   });
 
-  // Bind tag click filtering (click tag in row → filter by that tag)
+  // Bind tag click filtering (click tag in row → structured filter by that tag)
   tr.querySelectorAll('.tag-label').forEach(el => {
     el.addEventListener('click', (e) => {
       e.stopPropagation();
-      const tag = el.dataset.tag;
-      if (tag) {
-        State.filterText = 'tag:' + tag;
-        State.currentPage = 1;
-        if (El.filterInput) El.filterInput.value = 'tag:' + tag;
-        if (El.filterClear) El.filterClear.classList.remove('hide');
-        renderNovelList();
-      }
+      applyFilterFromClick('tag', el.dataset.tag, e);
     });
   });
 
@@ -517,7 +634,7 @@ function getRowIndexFromElement(row) {
 }
 
 function bindRowSelection(tr, novel, rowIndex) {
-  const interactiveSelector = '.tag-label, .row-action-btn, a[href], button, input, textarea, select';
+  const interactiveSelector = '.tag-label, .filterable, .row-action-btn, a[href], button, input, textarea, select';
 
   tr.addEventListener('mousedown', (e) => {
     if (e.button !== 0 || e.target.closest(interactiveSelector)) return;
@@ -660,7 +777,7 @@ function renderTags(tags) {
   return tags.map(tag => {
     const colorName = State.tagColors[tag] || 'default';
     const cls = TAG_COLOR_MAP[colorName] || 'tag-default';
-    return `<span class="tag-label ${cls}" data-tag="${esc(tag)}">${esc(tag)}</span>`;
+    return `<span class="tag-label ${cls}" data-tag="${escAttr(tag)}">${esc(tag)}</span>`;
   }).join('');
 }
 
@@ -676,12 +793,9 @@ export function renderTagList() {
     span.className = `tag-label ${cls}`;
     span.textContent = tag;
     span.dataset.tag = tag;
-    // Left-click: filter by tag
-    span.addEventListener('click', () => {
-      State.filterText = 'tag:' + tag;
-      if (El.filterInput) El.filterInput.value = 'tag:' + tag;
-      if (El.filterClear) El.filterClear.classList.remove('hide');
-      renderNovelList();
+    // Left-click: filter by tag. Ctrl/Shift mirror narou.rb's tag search modes.
+    span.addEventListener('click', (e) => {
+      applyFilterFromClick('tag', tag, e);
     });
     // Right-click: color picker
     span.addEventListener('contextmenu', (e) => {
@@ -1121,6 +1235,10 @@ function esc(s) {
   const div = document.createElement('div');
   div.textContent = String(s);
   return div.innerHTML;
+}
+
+function escAttr(s) {
+  return esc(s).replace(/"/g, '&quot;');
 }
 
 function renderMultilineHtml(value, fallback) {

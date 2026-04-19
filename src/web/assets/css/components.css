@@ -628,6 +628,32 @@ li.enable-selected.disabled a {
   color: var(--text-color);
 }
 
+.tag-suggestions {
+  margin-top: 0.35em;
+  border: 0.05em solid var(--dropdown-border);
+  border-radius: var(--btn-border-radius);
+  background: var(--dropdown-bg);
+  box-shadow: var(--dropdown-shadow);
+  max-height: 12em;
+  overflow-y: auto;
+}
+
+.tag-suggestion-option {
+  display: block;
+  width: 100%;
+  padding: 0.35em 0.60em;
+  border: 0;
+  background: transparent;
+  color: var(--dropdown-text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.tag-suggestion-option:hover,
+.tag-suggestion-option.active {
+  background: var(--dropdown-hover-bg);
+}
+
 .tag-fixed-width {
   display: inline-block;
   min-width: 5em;

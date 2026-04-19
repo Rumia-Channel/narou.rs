@@ -91,6 +91,7 @@ const ELEMENT_IDS = [
   'tag-list-canvas',
   'tag-edit-modal', 'tag-edit-close', 'tag-edit-cancel',
   'tag-editor-current', 'new-tag-input', 'add-tag-button',
+  'tag-suggestions',
   'about-modal', 'about-close', 'about-ok', 'about-version',
   'about-latest-version', 'about-check-latest',
   'confirm-modal', 'confirm-title', 'confirm-message',
