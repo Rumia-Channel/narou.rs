@@ -1119,9 +1119,14 @@ function escAttr(s) {
 
 function showRemoveModal(ids) {
   if (!ids || ids.length === 0) return;
+  const numericIds = ids.map(id => Number(id)).filter(id => Number.isFinite(id));
+  if (numericIds.length === 0) {
+    showNotification('削除対象のIDが不正です', 'error');
+    return;
+  }
   // Build novel title list
-  const items = ids.map(id => {
-    const n = State.novels.find(n => n.id === id);
+  const items = numericIds.map(id => {
+    const n = State.novels.find(n => String(n.id) === String(id));
     return '<li>' + escHtml(n?.title || String(id)) + '</li>';
   }).join('');
   El.removeNovelList.innerHTML = '<ul>' + items + '</ul>';
@@ -1137,8 +1142,12 @@ function showRemoveModal(ids) {
   const onOk = async () => {
     const withFile = El.removeWithFile.checked;
     cleanup();
-    await postJson('/api/novels/remove', { ids: ids, with_file: withFile });
-    await refreshList();
+    try {
+      await postJson('/api/novels/remove', { ids: numericIds, with_file: withFile });
+      await refreshList();
+    } catch (e) {
+      showNotification('削除に失敗しました: ' + e.message, 'error');
+    }
   };
   const onCancel = () => cleanup();
   El.removeOk.addEventListener('click', onOk);

@@ -341,14 +341,16 @@ hr.console-hr {
   z-index: 1050;
   background: var(--modal-backdrop);
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
-  padding: 1rem;
+  padding: var(--modal-padding);
+  overflow-y: auto;
 }
 
 .modal-dialog {
   width: 100%;
-  max-width: 36rem;
+  max-width: var(--modal-dialog-max-width);
+  margin: var(--modal-dialog-margin-block) var(--modal-dialog-margin-inline);
 }
 
 .modal-content {
@@ -356,6 +358,9 @@ hr.console-hr {
   border-radius: 0.40em;
   box-shadow: 0 0.30em 1em rgba(0, 0, 0, 0.30);
   overflow: hidden;
+  max-height: calc(100vh - var(--modal-max-height-offset));
+  display: flex;
+  flex-direction: column;
 }
 
 .modal-header {
@@ -364,6 +369,7 @@ hr.console-hr {
   justify-content: space-between;
   padding: 0.70em 1em;
   border-bottom: 0.05em solid var(--border-color);
+  flex: 0 0 auto;
 }
 
 .modal-title {
@@ -387,6 +393,8 @@ hr.console-hr {
 
 .modal-body {
   padding: 1em;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 .modal-footer {
@@ -395,6 +403,7 @@ hr.console-hr {
   gap: 0.5em;
   padding: 0.70em 1em;
   border-top: 0.05em solid var(--border-color);
+  flex: 0 0 auto;
 }
 
 .notepad-textarea {

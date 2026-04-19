@@ -276,8 +276,8 @@ fn execute_job(
 
 fn console_target_for_job(job_type: JobType) -> &'static str {
     match job_type {
-        JobType::Convert | JobType::Send | JobType::Mail => "stdout2",
-        _ => "stdout",
+        JobType::Download | JobType::Update | JobType::AutoUpdate => "stdout",
+        JobType::Convert | JobType::Send | JobType::Backup | JobType::Mail => "stdout2",
     }
 }
 
@@ -316,12 +316,14 @@ mod tests {
     }
 
     #[test]
-    fn console_target_for_convert_jobs_is_stdout2() {
+    fn console_target_splits_external_site_jobs_from_local_jobs() {
+        assert_eq!(console_target_for_job(JobType::Download), "stdout");
+        assert_eq!(console_target_for_job(JobType::Update), "stdout");
+        assert_eq!(console_target_for_job(JobType::AutoUpdate), "stdout");
         assert_eq!(console_target_for_job(JobType::Convert), "stdout2");
         assert_eq!(console_target_for_job(JobType::Send), "stdout2");
+        assert_eq!(console_target_for_job(JobType::Backup), "stdout2");
         assert_eq!(console_target_for_job(JobType::Mail), "stdout2");
-        assert_eq!(console_target_for_job(JobType::Download), "stdout");
-        assert_eq!(console_target_for_job(JobType::AutoUpdate), "stdout");
     }
 
     #[test]

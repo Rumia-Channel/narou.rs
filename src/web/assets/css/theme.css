@@ -95,6 +95,11 @@
 
   /* Modal */
   --modal-backdrop: rgba(0, 0, 0, 0.5);
+  --modal-padding: 1rem;
+  --modal-dialog-max-width: 36rem;
+  --modal-max-height-offset: 2rem;
+  --modal-dialog-margin-block: auto;
+  --modal-dialog-margin-inline: 0;
 
   /* Settings page aliases */
   --primary-color: #2fa4e7;

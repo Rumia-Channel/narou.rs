@@ -40,8 +40,10 @@ pub enum QueueLane {
 impl JobType {
     pub fn lane(self) -> QueueLane {
         match self {
-            JobType::Convert | JobType::Send | JobType::Mail => QueueLane::Secondary,
-            _ => QueueLane::Default,
+            JobType::Download | JobType::Update | JobType::AutoUpdate => QueueLane::Default,
+            JobType::Convert | JobType::Send | JobType::Backup | JobType::Mail => {
+                QueueLane::Secondary
+            }
         }
     }
 }
@@ -351,11 +353,11 @@ mod tests {
         let queue_path = temp.path().join("queue.yaml");
         let queue = PersistentQueue::new(&queue_path).unwrap();
         queue.push(JobType::Download, "1").unwrap();
-        queue.push(JobType::Convert, "2").unwrap();
+        queue.push(JobType::Backup, "2").unwrap();
         queue.push(JobType::Update, "3").unwrap();
 
         let popped = queue.pop_for_lane(QueueLane::Secondary).unwrap();
-        assert!(matches!(popped.job_type, JobType::Convert));
+        assert!(matches!(popped.job_type, JobType::Backup));
         assert_eq!(queue.pending_count_for_lane(QueueLane::Secondary), 0);
 
         let remaining = queue.get_pending_tasks();

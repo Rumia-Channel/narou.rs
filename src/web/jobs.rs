@@ -45,6 +45,19 @@ fn html_escape(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn tag_color_class(color: &str) -> &'static str {
+    match color {
+        "green" => "tag-green",
+        "yellow" => "tag-yellow",
+        "blue" => "tag-blue",
+        "magenta" => "tag-magenta",
+        "cyan" => "tag-cyan",
+        "red" => "tag-red",
+        "white" => "tag-white",
+        _ => "tag-default",
+    }
+}
+
 fn validate_download_targets(targets: &[String]) -> Result<(), String> {
     if targets.iter().any(|target| target.trim_start().starts_with('-')) {
         return Err("invalid download target".to_string());
@@ -1379,13 +1392,13 @@ pub async fn api_taginfo(
 
     let tag_info = with_database(|db| {
         let tag_index = db.tag_index();
-        let tag_colors = {
-            let inv = db.inventory();
-            let colors: std::collections::HashMap<String, String> = inv
-                .load("tag_colors", crate::db::inventory::InventoryScope::Local)
-                .unwrap_or_default();
-            colors
-        };
+        let inventory = db.inventory();
+        let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
+        let tag_names = tag_index.keys().map(String::as_str);
+        if super::tag_colors::ensure_tag_colors(&mut tag_colors, tag_names) {
+            super::tag_colors::save_tag_colors(inventory, &tag_colors)?;
+        }
+        let tag_colors = tag_colors.into_map();
 
         let mut result: Vec<serde_json::Value> = Vec::new();
         let mut sorted_tags: Vec<(&String, &Vec<i64>)> = tag_index.iter().collect();
@@ -1393,15 +1406,11 @@ pub async fn api_taginfo(
 
         for (tag, ids) in sorted_tags {
             let color = tag_colors.get(tag).map(|c| c.as_str()).unwrap_or("");
-            let style = if color.is_empty() {
-                String::new()
-            } else {
-                format!(" style=\"background-color:{}\"", color)
-            };
+            let class = tag_color_class(color);
             let escaped_tag = html_escape(tag);
             let html = format!(
-                "<span class=\"tag-label\"{}>{}({})</span>",
-                style, escaped_tag, ids.len()
+                "<span class=\"tag-label {}\">{}({})</span>",
+                class, escaped_tag, ids.len()
             );
             let mut entry = serde_json::json!({
                 "tag": tag,
@@ -1410,8 +1419,8 @@ pub async fn api_taginfo(
             });
             if with_exclusion {
                 let exc_html = format!(
-                    "<span class=\"tag-label tag-exclusion\"{}>{}({})</span>",
-                    style, escaped_tag, ids.len()
+                    "<span class=\"tag-label {} tag-exclusion\">{}({})</span>",
+                    class, escaped_tag, ids.len()
                 );
                 entry["exclusion_html"] = serde_json::json!(exc_html);
             }
@@ -1620,7 +1629,8 @@ mod tests {
     use super::{
         encode_convert_job_target, existing_update_job_id, push_update_job_if_needed,
         normalize_update_targets, reboot_args_with_no_browser, restorable_tasks_available,
-        validate_diff_number, validate_download_targets, validate_general_lastup_option,
+        tag_color_class, validate_diff_number, validate_download_targets,
+        validate_general_lastup_option,
     };
 
     #[test]
@@ -1690,6 +1700,13 @@ mod tests {
         assert_eq!(validate_general_lastup_option("narou").unwrap(), Some("narou"));
         assert_eq!(validate_general_lastup_option("other").unwrap(), Some("other"));
         assert!(validate_general_lastup_option("--force").is_err());
+    }
+
+    #[test]
+    fn tag_color_class_uses_existing_webui_tag_classes() {
+        assert_eq!(tag_color_class("green"), "tag-green");
+        assert_eq!(tag_color_class("yellow"), "tag-yellow");
+        assert_eq!(tag_color_class("unknown"), "tag-default");
     }
 
     #[test]

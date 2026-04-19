@@ -131,7 +131,7 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | ゴミ箱ボタン | `.console-trash` | `#console-trash` (🗑) | ✅ |
 | 拡大/縮小ボタン | `.console-expand` (full/small切替) | `#console-expand` (⤢/⤣) | ✅ |
 | サブプロセス出力ストリーミング | `StreamingLogger`で$stdoutをキャプチャ→echo WS | `Stdio::piped()`+BufRead→echo WS | ✅ |
-| デュアルコンソール | `concurrency`設定時に`$stdout2`で左右分割 | `#console-stdout2` + `#console-col-right` | ✅ |
+| デュアルコンソール | `concurrency`設定時に`$stdout2`で左右分割 | 外部通信あり(download/update/auto_update)は`#console`、その他(convert/send/backup/mail)は`#console-stdout2` | ✅ |
 
 ---
 
