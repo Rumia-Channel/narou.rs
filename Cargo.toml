@@ -41,6 +41,7 @@ csv = "1.4"
 ctrlc = "3.5"
 fancy-regex = "0.17"
 socket2 = "0.6"
+chrono-tz = { version = "0.10.4", features = ["case-insensitive"] }
 
 [build-dependencies]
 base64 = "0.22"

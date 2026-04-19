@@ -84,18 +84,20 @@ impl NovelInfo {
             info.end = Some(is_end);
         }
 
+        let timezone = setting.site_timezone();
+
         info.general_firstup = info
             .raw_captures
             .get("gf")
-            .and_then(|s| parse_narou_date(s));
+            .and_then(|s| parse_narou_date_with_timezone(s, timezone));
         info.general_lastup = info
             .raw_captures
             .get("gl")
-            .and_then(|s| parse_narou_date(s));
+            .and_then(|s| parse_narou_date_with_timezone(s, timezone));
         info.novelupdated_at = info
             .raw_captures
             .get("nu")
-            .and_then(|s| parse_narou_date(s));
+            .and_then(|s| parse_narou_date_with_timezone(s, timezone));
         info.length = info.raw_captures.get("l").and_then(|s| {
             s.replace(',', "").trim().parse().ok()
         });
@@ -115,40 +117,16 @@ impl NovelInfo {
     }
 }
 
+#[cfg(test)]
 fn parse_narou_date(s: &str) -> Option<DateTime<Utc>> {
-    let s = super::normalize_narou_datetime(s);
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
+    parse_narou_date_with_timezone(s, super::site_timezone(None))
+}
 
-    if let Ok(ts) = s.parse::<i64>() {
-        return DateTime::from_timestamp(ts, 0);
-    }
-
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Some(dt.with_timezone(&Utc));
-    }
-
-    let formats = [
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y/%m/%d %H:%M",
-        "%Y/%m/%d",
-    ];
-
-    for fmt in &formats {
-        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
-            return Some(dt.and_utc());
-        }
-        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, fmt) {
-            return d.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
-        }
-    }
-
-    None
+fn parse_narou_date_with_timezone(
+    s: &str,
+    timezone: super::SiteTimezone,
+) -> Option<DateTime<Utc>> {
+    super::parse_loose_datetime_with_timezone(s, timezone)
 }
 
 #[cfg(test)]
@@ -171,12 +149,17 @@ mod tests {
     #[test]
     fn parse_narou_date_accepts_japanese_datetime_with_weekday() {
         let date = parse_narou_date("2026年04月17日(金) 07:00").expect("date");
+        let local = date.with_timezone(&chrono_tz::Asia::Tokyo);
 
         assert_eq!(date.year(), 2026);
         assert_eq!(date.month(), 4);
-        assert_eq!(date.day(), 17);
-        assert_eq!(date.hour(), 7);
+        assert_eq!(date.day(), 16);
+        assert_eq!(date.hour(), 22);
         assert_eq!(date.minute(), 0);
         assert_eq!(date.second(), 0);
+        assert_eq!(local.year(), 2026);
+        assert_eq!(local.month(), 4);
+        assert_eq!(local.day(), 17);
+        assert_eq!(local.hour(), 7);
     }
 }

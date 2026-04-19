@@ -118,7 +118,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `--path` | `-p` | string | — | AozoraEpub3 フォルダ指定。`:keep` で既存再利用 |
 | `--line-height` | `-l` | float | 1.8 | 行の高さ (em) |
 
-**Rust 実装**: `src/commands/init.rs`。AozoraEpub3 設定に加え、`.narou/local_setting.yaml` には Ruby 互換の実効初期値として `download.interval`, `download.wait-steps`, `folder-length-limit`, `filename-length-limit`, `convert.dc-subject-exclude-tags`, `user-agent=auto` を不足分のみ補完する。AozoraEpub3 / mail 用の preset は repo 直下 `preset/` に同梱し、`init` / `mail` が `sample/narou/preset` に依存せず自己完結で動くようにした。
+**Rust 実装**: `src/commands/init.rs`。AozoraEpub3 設定に加え、`.narou/local_setting.yaml` には Ruby 互換の実効初期値として `download.interval`, `download.wait-steps`, `folder-length-limit`, `filename-length-limit`, `time-zone=Asia/Tokyo`, `convert.dc-subject-exclude-tags`, `user-agent=auto` を不足分のみ補完する。AozoraEpub3 / mail 用の preset は repo 直下 `preset/` に同梱し、`init` / `mail` が `sample/narou/preset` に依存せず自己完結で動くようにした。
 
 ---
 
@@ -181,6 +181,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 標準入力からのターゲット読み取りに対応。Ruby版同様 `narou tag ... | narou u` や `narou l -t "foo bar" | narou u` のようなパイプ入力を解決
 - ターゲット解決: Ruby版 `tagname_to_ids`/`Downloader.get_data_by_target` 相当に合わせ、ID、URL、Nコード、タイトル、`.narou/alias.yaml` 別名、通常タグ名、`tag:NAME`、`^tag:NAME` を解決
 - 既存小説更新時は Ruby版同様に DB の `toc_url` から `ncode` などのURLキャプチャを復元し、DB上の `sitename` を保存先決定で優先する
+- サイト/API由来のタイムゾーン表記なし日時は `webnovel/*.yaml` の `timezone`、未指定時は local `time-zone`（既定 `Asia/Tokyo`）で解釈し、DB には正しい UTC epoch として保存する。なろう API の `YYYY-MM-DD HH:MM:SS` は JST 扱い
 - あらすじ比較は `<br>`/`<br/>`/`<br />` と改行・行末空白を正規化し、実質同一なら更新扱いにしない
 - 既存小説で実変更が無い場合は `last_update` を保持し、更新確認だけで Web UI の `new-update` 表示が再点灯しないようにする
 - 凍結チェック: Ruby版と同じ `.narou/freeze.yaml` を参照（既存Rustデータ移行用に `frozen` タグも補助的に認識）
@@ -345,6 +346,7 @@ narou setting name         # 読み取り
 | `economy` | multiple | 省容量設定 (cleanup_temp/send_delete/nosave_diff/nosave_raw) |
 | `guard-spoiler` | boolean | DL時の話名非表示 |
 | `auto-add-tags` | boolean | サイトタグ自動追加 |
+| `time-zone` | string | YAML に timezone がないサイト日時の既定タイムゾーン |
 | `user-agent` | string | カスタム User-Agent |
 | `webui.theme` | select | WebUI テーマ |
 
@@ -378,6 +380,7 @@ narou setting name         # 読み取り
 - エラー数を終了コードとして返す
 - `apply_force_and_default_settings` で変換時の `force.*/default.*` をフラットキーから正しく解決
 - `device` 変更時の関連設定の自動反映（Ruby の `RELATED_VARIABLES` に合わせて `default.enable_half_indent_bracket` を変更）
+- `time-zone` をローカル設定として追加。`webnovel/*.yaml` の `timezone` がないサイトで、タイムゾーン表記なしの日時を UTC 保存値へ変換する際の既定値として使う
 
 ---
 

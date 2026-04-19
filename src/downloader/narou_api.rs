@@ -1,4 +1,4 @@
-use chrono::{NaiveDate, NaiveDateTime, Utc, DateTime};
+use chrono::{DateTime, Utc};
 
 use crate::error::Result;
 
@@ -7,26 +7,7 @@ use super::fetch::HttpFetcher;
 /// Parse a date/time string from the Syosetu API.
 /// The API returns dates as `"YYYY-MM-DD HH:MM:SS"` (not RFC 3339).
 fn parse_api_datetime(value: &str) -> Option<DateTime<Utc>> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
-        return Some(dt.with_timezone(&Utc));
-    }
-    for fmt in [
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
-    ] {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(value, fmt) {
-            return Some(dt.and_utc());
-        }
-        if let Ok(date) = NaiveDate::parse_from_str(value, fmt) {
-            return date.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
-        }
-    }
-    None
+    super::parse_datetime_with_timezone(value, Some("Asia/Tokyo"))
 }
 
 /// Parse Syosetu API JSON response.

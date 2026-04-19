@@ -41,6 +41,7 @@ pub fn default_local_setting_value(name: &str) -> Option<serde_yaml::Value> {
         "folder-length-limit" | "filename-length-limit" => {
             Some(serde_yaml::Value::Number(serde_yaml::Number::from(50)))
         }
+        "time-zone" => Some(serde_yaml::Value::String("Asia/Tokyo".to_string())),
         "user-agent" => Some(serde_yaml::Value::String("auto".to_string())),
         _ => None,
     }
@@ -91,7 +92,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "download.choices-of-digest-options" | "send.backup-bookmark"
         | "multiple-delimiter" | "economy" | "guard-spoiler" | "normalize-filename"
         | "convert.inspect" | "folder-length-limit" | "filename-length-limit"
-        | "ebook-filename-length-limit" | "user-agent" => Some("detail"),
+        | "ebook-filename-length-limit" | "time-zone" | "user-agent" => Some("detail"),
 
         // local → webui
         "webui.theme" | "webui.table.reload-timing" | "webui.performance-mode" => Some("webui"),
@@ -753,6 +754,13 @@ pub fn setting_variables() -> SettingVariables {
             vis(
                 VarType::String,
                 "User-Agent 設定\n未指定時 auto",
+            ),
+        ),
+        (
+            "time-zone",
+            vis(
+                VarType::String,
+                "サイト側日時にタイムゾーン表記がない場合の既定タイムゾーン。例: Asia/Tokyo",
             ),
         ),
         (

@@ -98,6 +98,7 @@ fn ensure_default_local_settings(path: &Path) -> Result<bool> {
         "download.wait-steps",
         "folder-length-limit",
         "filename-length-limit",
+        "time-zone",
         "user-agent",
     ];
 
@@ -442,6 +443,10 @@ mod tests {
         assert_eq!(
             settings.get("download.wait-steps"),
             Some(&serde_yaml::Value::Number(serde_yaml::Number::from(0)))
+        );
+        assert_eq!(
+            settings.get("time-zone"),
+            Some(&serde_yaml::Value::String("Asia/Tokyo".to_string()))
         );
     }
 

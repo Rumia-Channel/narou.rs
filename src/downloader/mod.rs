@@ -16,7 +16,10 @@ use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
+use chrono::{
+    DateTime, Datelike, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc,
+};
+use chrono_tz::Tz;
 use regex::Regex;
 
 use crate::db::DATABASE;
@@ -45,6 +48,45 @@ pub use self::types::{
 pub use self::util::pretreatment_source;
 
 const SECTION_HASH_CACHE_NAME: &str = "section_hash_cache";
+const DEFAULT_SITE_TIMEZONE: &str = "Asia/Tokyo";
+
+#[derive(Clone, Copy)]
+pub(crate) enum SiteTimezone {
+    Named(Tz),
+    Fixed(FixedOffset),
+}
+
+impl SiteTimezone {
+    fn from_local_datetime(self, dt: NaiveDateTime) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Named(tz) => match tz.from_local_datetime(&dt) {
+                LocalResult::Single(local) | LocalResult::Ambiguous(local, _) => {
+                    Some(local.with_timezone(&Utc))
+                }
+                LocalResult::None => None,
+            },
+            Self::Fixed(offset) => match offset.from_local_datetime(&dt) {
+                LocalResult::Single(local) | LocalResult::Ambiguous(local, _) => {
+                    Some(local.with_timezone(&Utc))
+                }
+                LocalResult::None => None,
+            },
+        }
+    }
+
+    fn ymd(self, dt: DateTime<Utc>) -> String {
+        match self {
+            Self::Named(tz) => {
+                let local = dt.with_timezone(&tz);
+                format!("{:04}{:02}{:02}", local.year(), local.month(), local.day())
+            }
+            Self::Fixed(offset) => {
+                let local = dt.with_timezone(&offset);
+                format!("{:04}{:02}{:02}", local.year(), local.month(), local.day())
+            }
+        }
+    }
+}
 
 pub struct Downloader {
     fetcher: HttpFetcher,
@@ -93,6 +135,10 @@ fn normalize_story_for_compare(story: &str) -> String {
 
 fn load_local_setting_bool(key: &str) -> bool {
     crate::compat::load_local_setting_bool(key)
+}
+
+fn load_local_setting_string(key: &str) -> Option<String> {
+    crate::compat::load_local_setting_string(key)
 }
 
 fn load_global_setting_bool(key: &str) -> bool {
@@ -176,10 +222,11 @@ fn remove_cache_dir_if_empty(cache_dir: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn sections_latest_update_time(
+fn sections_latest_update_time_with_timezone(
     subtitles: &[SubtitleInfo],
     key: &str,
     subkey: Option<&str>,
+    timezone: SiteTimezone,
 ) -> Option<DateTime<Utc>> {
     let mut latest: Option<DateTime<Utc>> = None;
     for subtitle in subtitles {
@@ -193,7 +240,7 @@ fn sections_latest_update_time(
             }),
             _ => subtitle.subdate.as_str(),
         };
-        let Some(parsed) = parse_loose_datetime(value) else {
+        let Some(parsed) = parse_loose_datetime_with_timezone(value, timezone) else {
             continue;
         };
         if latest.is_none_or(|current| parsed > current) {
@@ -232,7 +279,10 @@ pub(crate) fn normalize_narou_datetime(value: &str) -> String {
         .to_string()
 }
 
-fn parse_loose_datetime(value: &str) -> Option<DateTime<Utc>> {
+fn parse_loose_datetime_with_timezone(
+    value: &str,
+    timezone: SiteTimezone,
+) -> Option<DateTime<Utc>> {
     let value = normalize_narou_datetime(value);
     if value.is_empty() {
         return None;
@@ -259,14 +309,73 @@ fn parse_loose_datetime(value: &str) -> Option<DateTime<Utc>> {
 
     for fmt in &formats {
         if let Ok(dt) = NaiveDateTime::parse_from_str(&value, fmt) {
-            return Some(dt.and_utc());
+            return timezone.from_local_datetime(dt);
         }
         if let Ok(date) = NaiveDate::parse_from_str(&value, fmt) {
-            return date.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+            return date
+                .and_hms_opt(0, 0, 0)
+                .and_then(|dt| timezone.from_local_datetime(dt));
         }
     }
 
     None
+}
+
+pub(crate) fn site_timezone(timezone: Option<&str>) -> SiteTimezone {
+    let configured = timezone
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| load_local_setting_string("time-zone"))
+        .unwrap_or_else(|| DEFAULT_SITE_TIMEZONE.to_string());
+    parse_site_timezone(&configured).unwrap_or_else(default_site_timezone)
+}
+
+fn default_site_timezone() -> SiteTimezone {
+    SiteTimezone::Named(chrono_tz::Asia::Tokyo)
+}
+
+fn parse_site_timezone(value: &str) -> Option<SiteTimezone> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let upper = value.to_ascii_uppercase();
+    let timezone_name = match upper.as_str() {
+        "JST" | "ASIA/TOKYO/JST" => "Asia/Tokyo",
+        "UTC" | "GMT" | "Z" => "UTC",
+        _ => value,
+    };
+    if let Ok(tz) = timezone_name.parse::<Tz>() {
+        return Some(SiteTimezone::Named(tz));
+    }
+
+    let (sign, rest) = match value.as_bytes().first().copied() {
+        Some(b'+') => (1, &value[1..]),
+        Some(b'-') => (-1, &value[1..]),
+        _ => return None,
+    };
+    let compact = rest.replace(':', "");
+    let (hours, minutes) = match compact.len() {
+        2 => (compact.parse::<i32>().ok()?, 0),
+        4 => (
+            compact[..2].parse::<i32>().ok()?,
+            compact[2..].parse::<i32>().ok()?,
+        ),
+        _ => return None,
+    };
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60)).map(SiteTimezone::Fixed)
+}
+
+pub fn parse_datetime_with_timezone(
+    value: &str,
+    timezone: Option<&str>,
+) -> Option<DateTime<Utc>> {
+    parse_loose_datetime_with_timezone(value, site_timezone(timezone))
 }
 
 fn resolve_user_agent(user_agent: Option<&str>, saved_user_agent: Option<String>) -> String {
@@ -291,16 +400,29 @@ fn resolve_user_agent(user_agent: Option<&str>, saved_user_agent: Option<String>
     }
 }
 
+#[cfg(test)]
 fn date_string_is_newer(latest: &str, old: &str) -> bool {
-    match (parse_loose_datetime(latest), parse_loose_datetime(old)) {
+    date_string_is_newer_with_timezone(latest, old, site_timezone(None))
+}
+
+fn date_string_is_newer_with_timezone(latest: &str, old: &str, timezone: SiteTimezone) -> bool {
+    match (
+        parse_loose_datetime_with_timezone(latest, timezone),
+        parse_loose_datetime_with_timezone(old, timezone),
+    ) {
         (Some(latest_dt), Some(old_dt)) => latest_dt > old_dt,
         _ => latest > old,
     }
 }
 
+#[cfg(test)]
 fn date_string_to_ymd(value: &str) -> Option<String> {
-    let dt = parse_loose_datetime(value)?;
-    Some(format!("{:04}{:02}{:02}", dt.year(), dt.month(), dt.day()))
+    date_string_to_ymd_with_timezone(value, site_timezone(None))
+}
+
+fn date_string_to_ymd_with_timezone(value: &str, timezone: SiteTimezone) -> Option<String> {
+    let dt = parse_loose_datetime_with_timezone(value, timezone)?;
+    Some(timezone.ymd(dt))
 }
 
 fn resolve_download_status(
@@ -345,16 +467,20 @@ fn sanitize_site_tags(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn section_timestamp_ymd(path: &PathBuf, download_time: Option<&str>) -> Option<String> {
+fn section_timestamp_ymd(
+    path: &PathBuf,
+    download_time: Option<&str>,
+    timezone: SiteTimezone,
+) -> Option<String> {
     if let Some(download_time) = download_time
-        && let Some(ymd) = date_string_to_ymd(download_time)
+        && let Some(ymd) = date_string_to_ymd_with_timezone(download_time, timezone)
     {
         return Some(ymd);
     }
 
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     let dt = DateTime::<Utc>::from(modified);
-    Some(format!("{:04}{:02}{:02}", dt.year(), dt.month(), dt.day()))
+    Some(timezone.ymd(dt))
 }
 
 impl Downloader {
@@ -558,6 +684,7 @@ impl Downloader {
         let mut novelupdated_at = info.novelupdated_at;
         let mut general_lastup = info.general_lastup;
         if novelupdated_at.is_none() || general_lastup.is_none() {
+            let site_timezone = setting.site_timezone();
             let subtitles = if novel_type == 2 {
                 create_short_story_subtitles(&setting, &toc_source, &info).ok()
             } else {
@@ -574,11 +701,20 @@ impl Downloader {
             };
             if let Some(subs) = &subtitles {
                 if novelupdated_at.is_none() {
-                    novelupdated_at =
-                        sections_latest_update_time(subs, "subupdate", Some("subdate"));
+                    novelupdated_at = sections_latest_update_time_with_timezone(
+                        subs,
+                        "subupdate",
+                        Some("subdate"),
+                        site_timezone,
+                    );
                 }
                 if general_lastup.is_none() {
-                    general_lastup = sections_latest_update_time(subs, "subdate", None);
+                    general_lastup = sections_latest_update_time_with_timezone(
+                        subs,
+                        "subdate",
+                        None,
+                        site_timezone,
+                    );
                 }
             }
         }
@@ -917,6 +1053,7 @@ impl Downloader {
         let mut new_arrival_subtitles = Vec::new();
         let mut final_subtitles = Vec::with_capacity(subtitles.len());
         let strong_update = load_local_setting_bool("update.strong");
+        let site_timezone = setting.site_timezone();
         let mut cache_dir: Option<PathBuf> = None;
         let mut pending_section_hashes: HashMap<String, String> = HashMap::new();
         let display_id = provisional_id;
@@ -938,6 +1075,7 @@ impl Downloader {
                     &section_dir,
                     &toc_url,
                     strong_update,
+                    site_timezone,
                 )?
             };
             if needs_download {
@@ -1156,9 +1294,23 @@ impl Downloader {
             use_subdirectory,
             general_firstup: info.general_firstup,
             novelupdated_at: info.novelupdated_at
-                .or_else(|| sections_latest_update_time(&subtitles, "subupdate", Some("subdate"))),
+                .or_else(|| {
+                    sections_latest_update_time_with_timezone(
+                        &subtitles,
+                        "subupdate",
+                        Some("subdate"),
+                        site_timezone,
+                    )
+                }),
             general_lastup: info.general_lastup
-                .or_else(|| sections_latest_update_time(&subtitles, "subdate", None)),
+                .or_else(|| {
+                    sections_latest_update_time_with_timezone(
+                        &subtitles,
+                        "subdate",
+                        None,
+                        site_timezone,
+                    )
+                }),
             last_mail_date: None,
             tags: Vec::new(),
             ncode,
@@ -1290,6 +1442,7 @@ impl Downloader {
         section_dir: &PathBuf,
         toc_url: &str,
         strong_update: bool,
+        timezone: SiteTimezone,
     ) -> Result<(bool, Option<(SectionElement, String)>)> {
         let Some(old) = old else {
             return Ok((true, None));
@@ -1319,7 +1472,7 @@ impl Downloader {
                 return Ok((!latest_subupdate.is_empty(), None));
             }
             (
-                date_string_is_newer(latest_subupdate, old_subupdate),
+                date_string_is_newer_with_timezone(latest_subupdate, old_subupdate, timezone),
                 Some(old_subupdate),
             )
         } else {
@@ -1327,7 +1480,7 @@ impl Downloader {
                 return Ok((true, None));
             }
             (
-                date_string_is_newer(&latest.subdate, &old.subdate),
+                date_string_is_newer_with_timezone(&latest.subdate, &old.subdate, timezone),
                 Some(old.subdate.as_str()),
             )
         };
@@ -1338,8 +1491,8 @@ impl Downloader {
 
         if strong_update
             && let Some(basis_date) = strong_basis_date
-            && date_string_to_ymd(basis_date)
-                == section_timestamp_ymd(&old_section_path, old.download_time.as_deref())
+            && date_string_to_ymd_with_timezone(basis_date, timezone)
+                == section_timestamp_ymd(&old_section_path, old.download_time.as_deref(), timezone)
         {
             let downloaded = download_section(
                 &mut self.fetcher,
@@ -1729,6 +1882,37 @@ mod tests {
     }
 
     #[test]
+    fn timezone_less_site_datetime_is_interpreted_in_site_timezone() {
+        let parsed =
+            super::parse_datetime_with_timezone("2026年04月19日 12時00分", Some("Asia/Tokyo"))
+                .expect("datetime");
+
+        assert_eq!(
+            parsed.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-04-19 03:00:00"
+        );
+        assert_eq!(
+            parsed
+                .with_timezone(&chrono_tz::Asia::Tokyo)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+            "2026-04-19 12:00:00"
+        );
+    }
+
+    #[test]
+    fn timezone_less_site_datetime_accepts_fixed_offset_setting() {
+        let parsed =
+            super::parse_datetime_with_timezone("2026-04-19 12:00:00", Some("+09:00"))
+                .expect("datetime");
+
+        assert_eq!(
+            parsed.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-04-19 03:00:00"
+        );
+    }
+
+    #[test]
     fn forced_redownload_never_reports_no_updates() {
         assert!(matches!(
             super::resolve_download_status(false, 0, Some(1), false, false, false, false),
@@ -1875,6 +2059,21 @@ mod tests {
     }
 
     #[test]
+    fn bundled_japanese_site_definitions_set_jst_timezone() {
+        let settings = SiteSetting::load_all().unwrap();
+        for domain in [
+            "ncode.syosetu.com",
+            "novel18.syosetu.com",
+            "syosetu.org",
+            "www.akatsuki-novels.com",
+            "www.mai-net.net",
+        ] {
+            let setting = settings.iter().find(|s| s.domain == domain).unwrap();
+            assert_eq!(setting.timezone.as_deref(), Some("Asia/Tokyo"));
+        }
+    }
+
+    #[test]
     fn r18_narou_extracts_sitename_from_info_html() {
         let settings = SiteSetting::load_all().unwrap();
         let setting = settings
@@ -1916,11 +2115,19 @@ mod tests {
         assert_eq!(info.author.as_deref(), Some("鉄鋼怪人"));
         assert_eq!(info.novel_type, Some(1));
         assert_eq!(
-            info.general_firstup.map(|dt| dt.format("%Y-%m-%d %H:%M").to_string()),
+            info.general_firstup
+                .map(|dt| dt
+                    .with_timezone(&chrono_tz::Asia::Tokyo)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()),
             Some("2020-08-01 00:33".to_string())
         );
         assert_eq!(
-            info.general_lastup.map(|dt| dt.format("%Y-%m-%d %H:%M").to_string()),
+            info.general_lastup
+                .map(|dt| dt
+                    .with_timezone(&chrono_tz::Asia::Tokyo)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()),
             Some("2026-04-17 07:00".to_string())
         );
     }

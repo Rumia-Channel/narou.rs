@@ -30,6 +30,8 @@ pub struct SiteSetting {
     pub url: Option<SiteSettingValue>,
     #[serde(default)]
     pub encoding: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     #[serde(default, deserialize_with = "deserialize_yes_no_bool")]
     pub confirm_over18: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,6 +194,10 @@ impl SiteSetting {
             .toc_page_max
             .as_deref()
             .and_then(|s| Regex::new(s).ok());
+    }
+
+    pub(crate) fn site_timezone(&self) -> super::SiteTimezone {
+        super::site_timezone(self.timezone.as_deref())
     }
 
     fn compile_value(&self, value: &SiteSettingValue) -> Option<Regex> {

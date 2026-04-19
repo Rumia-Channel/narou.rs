@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 
 use narou_rs::compat::{
     convert_existing_novel, current_device, load_local_setting_bool, load_local_setting_string,
@@ -1319,36 +1319,7 @@ fn parse_narou_api_entries(body: &str) -> Vec<narou_rs::downloader::NarouApiEntr
 }
 
 fn parse_api_datetime(value: &str) -> Option<DateTime<Utc>> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    if let Ok(ts) = value.parse::<i64>() {
-        return DateTime::from_timestamp(ts, 0);
-    }
-
-    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
-        return Some(dt.with_timezone(&Utc));
-    }
-
-    for fmt in [
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y/%m/%d %H:%M",
-        "%Y/%m/%d",
-    ] {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(value, fmt) {
-            return Some(dt.and_utc());
-        }
-        if let Ok(date) = NaiveDate::parse_from_str(value, fmt) {
-            return date.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
-        }
-    }
-
-    None
+    narou_rs::downloader::parse_datetime_with_timezone(value, Some("Asia/Tokyo"))
 }
 
 #[cfg(test)]
@@ -1402,6 +1373,16 @@ mod tests {
         assert_eq!(value["type"], "progressbar.step");
         assert_eq!(value["target_console"], "stdout2");
         assert_eq!(value["data"]["current"], 3);
+    }
+
+    #[test]
+    fn narou_api_datetime_is_interpreted_as_jst() {
+        let parsed = super::parse_api_datetime("2026-04-19 12:00:00").expect("datetime");
+
+        assert_eq!(
+            parsed.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-04-19 03:00:00"
+        );
     }
 
     fn sample_record(last_update: chrono::DateTime<Utc>) -> NovelRecord {

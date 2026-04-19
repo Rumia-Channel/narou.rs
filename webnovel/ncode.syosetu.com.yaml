@@ -5,6 +5,7 @@ domain: ncode.syosetu.com
 top_url: https://\\k<domain>
 url: https?://\\k<domain>/(?<ncode>n\d+[a-z]+)
 encoding: UTF-8
+timezone: Asia/Tokyo
 confirm_over18: no
 append_title_to_folder_name: yes
 title_strip_pattern: null

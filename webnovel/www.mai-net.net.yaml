@@ -8,6 +8,7 @@ url:
   - https?://\\k<domain>/bbs/sst/sst.php\?act=dump&cate=(?<category>.+?)&all=(?<ncode>\d+)
   - https?://\\k<domain>/bbs/sst/sst.php\?act=dump&cate=&all=(?<ncode>\d+)
 confirm_over18: no
+timezone: Asia/Tokyo
 append_title_to_folder_name: yes
 title_strip_pattern: (【.+?】|\(.+?\)|（.+?）)
 sitename: *name
