@@ -481,9 +481,9 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/freeze` | POST | ✅ (トグル) |
 | `/api/freeze_on` | POST | ✅ |
 | `/api/freeze_off` | POST | ✅ |
-| `/api/novels/remove` | POST | ✅ (with_file: falseがデフォルト) |
-| `/api/remove` | POST | ✅ (with_file パラメータ対応) |
-| `/api/remove_with_file` | POST | ✅ (常にファイル削除) |
+| `/api/novels/remove` | POST | ✅ (with_file: falseがデフォルト、削除ログをconsoleへ出力) |
+| `/api/remove` | POST | ✅ (with_file パラメータ対応、削除ログをconsoleへ出力) |
+| `/api/remove_with_file` | POST | ✅ (常にファイル削除、削除ログをconsoleへ出力) |
 | `/api/novels/{id}/freeze` | POST | ✅ (個別) |
 | `/api/novels/{id}/unfreeze` | POST | ✅ |
 

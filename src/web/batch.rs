@@ -106,23 +106,30 @@ pub async fn batch_remove(
     Json(body): Json<BatchIdsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     let with_file = body.with_file.unwrap_or(false);
-    let count = with_database_mut(|db| {
-        let mut count = 0usize;
+    let removed_titles = with_database_mut(|db| {
+        let mut titles = Vec::new();
         for id in &body.ids {
             if let Some(record) = db.remove(*id) {
                 if with_file {
                     let dir = crate::db::existing_novel_dir_for_record(db.archive_root(), &record);
                     let _ = std::fs::remove_dir_all(&dir);
                 }
-                count += 1;
+                titles.push(record.title);
             }
         }
         db.save()?;
-        Ok::<usize, NarouError>(count)
+        Ok::<Vec<String>, NarouError>(titles)
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let count = removed_titles.len();
 
     state.push_server.broadcast_event("table.reload", "");
+    if count > 0 {
+        state.push_server.broadcast_echo(
+            &super::removal_log_message(&removed_titles, with_file),
+            super::non_external_console_target(),
+        );
+    }
     Ok(Json(ApiResponse {
         success: true,
         message: format!("Removed {} novels", count),

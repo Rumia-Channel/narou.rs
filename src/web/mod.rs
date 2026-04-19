@@ -35,6 +35,42 @@ pub struct AppState {
     pub auto_update_scheduler: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
 }
 
+pub(crate) fn non_external_console_target() -> &'static str {
+    if crate::compat::load_local_setting_bool("concurrency") {
+        "stdout2"
+    } else {
+        "stdout"
+    }
+}
+
+pub(crate) fn removal_log_message(titles: &[String], with_file: bool) -> String {
+    let suffix = if with_file {
+        "（保存フォルダも削除）"
+    } else {
+        ""
+    };
+    match titles {
+        [] => format!("削除対象の小説はありません{}", suffix),
+        [title] => format!("小説を削除しました{}: {}", suffix, title),
+        _ => {
+            let shown = titles
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let tail = if titles.len() > 5 { ", ..." } else { "" };
+            format!(
+                "小説を{}件削除しました{}: {}{}",
+                titles.len(),
+                suffix,
+                shown,
+                tail
+            )
+        }
+    }
+}
+
 pub fn create_router(state: AppState) -> Router {
     let auth_state = state.clone();
     Router::new()
@@ -161,4 +197,25 @@ async fn basic_auth_middleware(
         header::HeaderValue::from_static("Basic realm=\"narou.rs\""),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::removal_log_message;
+
+    #[test]
+    fn removal_log_message_formats_single_title() {
+        assert_eq!(
+            removal_log_message(&["title".to_string()], false),
+            "小説を削除しました: title"
+        );
+    }
+
+    #[test]
+    fn removal_log_message_formats_multiple_titles_with_file_suffix() {
+        assert_eq!(
+            removal_log_message(&["a".to_string(), "b".to_string()], true),
+            "小説を2件削除しました（保存フォルダも削除）: a, b"
+        );
+    }
 }
