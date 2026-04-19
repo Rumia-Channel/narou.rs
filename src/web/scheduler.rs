@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{ChildStderr, ChildStdout, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,11 +10,12 @@ use serde_yaml::Value;
 use tokio::task::JoinHandle;
 
 use crate::compat::{load_local_setting_bool, load_local_setting_string};
-use crate::termcolor::colored;
 use crate::db;
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::downloader::site_setting::SiteSetting;
+use crate::progress::WS_LINE_PREFIX;
 use crate::queue::{JobType, PersistentQueue, QueueJob};
+use crate::termcolor::colored;
 
 use super::push::PushServer;
 
@@ -182,69 +185,105 @@ async fn sleep_until(target_time: chrono::DateTime<Local>) {
     }
 }
 
-pub fn execute_auto_update(root_dir: &Path, push_server: &PushServer) -> bool {
-    println!(
-        "自動アップデートを実行中... ({})",
-        Local::now().format("%Y/%m/%d %H:%M:%S")
+pub fn execute_auto_update(
+    root_dir: &Path,
+    push_server: Arc<PushServer>,
+    job_id: &str,
+    running_pids: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+) -> bool {
+    auto_update_echo(
+        push_server.as_ref(),
+        &format!(
+            "自動アップデートを実行中... ({})",
+            Local::now().format("%Y/%m/%d %H:%M:%S")
+        ),
     );
-    push_server.broadcast_echo("自動アップデートを開始します", "stdout");
 
-    let sort_args = build_auto_update_sort_args();
-    if !run_update_phase(root_dir, &["--gl", "narou"], "なろうAPIによる更新確認") {
-        push_server.broadcast_echo("自動アップデート失敗: なろうAPI更新確認", "stdout");
+    let sort_args = build_auto_update_sort_args(push_server.as_ref());
+    if !run_update_phase(
+        root_dir,
+        &["--gl", "narou"],
+        "なろうAPIによる更新確認",
+        &push_server,
+        job_id,
+        &running_pids,
+    ) {
+        auto_update_echo(push_server.as_ref(), "自動アップデート失敗: なろうAPI更新確認");
         return false;
     }
 
     let (modified_ids, other_ids) = collect_auto_update_target_ids();
 
     if modified_ids.is_empty() {
-        println!("自動アップデート: modified タグの付いた小説はありません");
+        auto_update_echo(push_server.as_ref(), "自動アップデート: modified タグの付いた小説はありません");
     } else {
-        push_server.broadcast_echo(
+        auto_update_echo(
+            push_server.as_ref(),
             &colored("modified タグの付いた小説を更新します", "yellow"),
-            "stdout",
         );
-        println!(
-            "自動アップデート: modified タグの付いた小説を更新します ({}件)",
-            modified_ids.len()
+        auto_update_echo(
+            push_server.as_ref(),
+            &format!(
+                "自動アップデート: modified タグの付いた小説を更新します ({}件)",
+                modified_ids.len()
+            ),
         );
         let mut args = sort_args.clone();
         args.extend(modified_ids.iter().map(String::as_str));
-        if !run_update_phase(root_dir, &args, "modified タグ更新") {
-            push_server.broadcast_echo("自動アップデート失敗: modified タグ更新", "stdout");
+        if !run_update_phase(
+            root_dir,
+            &args,
+            "modified タグ更新",
+            &push_server,
+            job_id,
+            &running_pids,
+        ) {
+            auto_update_echo(push_server.as_ref(), "自動アップデート失敗: modified タグ更新");
             return false;
         }
     }
 
     if other_ids.is_empty() {
-        println!("自動アップデート: 通常更新の対象となるその他小説はありません");
+        auto_update_echo(push_server.as_ref(), "自動アップデート: 通常更新の対象となるその他小説はありません");
     } else {
-        println!(
-            "自動アップデート: その他小説を通常更新します ({}件)",
-            other_ids.len()
+        auto_update_echo(
+            push_server.as_ref(),
+            &format!(
+                "自動アップデート: その他小説を通常更新します ({}件)",
+                other_ids.len()
+            ),
         );
         let mut args = sort_args;
         args.extend(other_ids.iter().map(String::as_str));
-        if !run_update_phase(root_dir, &args, "その他小説更新") {
-            push_server.broadcast_echo("自動アップデート失敗: その他小説更新", "stdout");
+        if !run_update_phase(
+            root_dir,
+            &args,
+            "その他小説更新",
+            &push_server,
+            job_id,
+            &running_pids,
+        ) {
+            auto_update_echo(push_server.as_ref(), "自動アップデート失敗: その他小説更新");
             return false;
         }
     }
 
-    println!("自動アップデートが正常に完了しました");
-    push_server.broadcast_echo("自動アップデートが正常に完了しました", "stdout");
+    auto_update_echo(push_server.as_ref(), "自動アップデートが正常に完了しました");
     push_server.broadcast_event("table.reload", "");
     push_server.broadcast_event("tag.updateCanvas", "");
     true
 }
 
-fn build_auto_update_sort_args() -> Vec<&'static str> {
+fn build_auto_update_sort_args(push_server: &PushServer) -> Vec<&'static str> {
     let Some(sort_key) = read_auto_update_sort_key() else {
-        println!("自動アップデート: デフォルトソート順序で実行");
+        auto_update_echo(push_server, "自動アップデート: デフォルトソート順序で実行");
         return Vec::new();
     };
 
-    println!("自動アップデート: WebUIソート設定を適用 ({})", sort_key);
+    auto_update_echo(
+        push_server,
+        &format!("自動アップデート: WebUIソート設定を適用 ({})", sort_key),
+    );
     match sort_key {
         "id" => vec!["--sort-by", "id"],
         "last_update" => vec!["--sort-by", "last_update"],
@@ -361,53 +400,148 @@ fn queue_auto_update_job_if_needed(
         .map_err(|e| e.to_string())
 }
 
-fn run_update_phase(root_dir: &Path, args: &[&str], label: &str) -> bool {
+fn run_update_phase(
+    root_dir: &Path,
+    args: &[&str],
+    label: &str,
+    push_server: &Arc<PushServer>,
+    job_id: &str,
+    running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+) -> bool {
     let Ok(exe) = std::env::current_exe() else {
-        println!("{} で重大なエラーが発生しました（実行ファイルを取得できません）", label);
+        auto_update_echo(push_server.as_ref(), &format!("{} で重大なエラーが発生しました（実行ファイルを取得できません）", label));
         return false;
     };
 
-    let status = std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .current_dir(root_dir)
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("NAROU_RS_WEB_MODE", "1")
         .arg("update")
-        .args(args)
-        .status();
+        .args(args);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            auto_update_echo(
+                push_server.as_ref(),
+                &format!("{} で重大なエラーが発生しました（update を起動できません: {}）", label, e),
+            );
+            return false;
+        }
+    };
+
+    running_pids
+        .lock()
+        .insert(job_id.to_string(), child.id());
+    let stdout_thread = relay_child_stdout(child.stdout.take(), Arc::clone(push_server));
+    let stderr_thread = relay_child_stderr(child.stderr.take(), Arc::clone(push_server));
+
+    let status = child.wait();
+    running_pids.lock().remove(job_id);
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
 
     let Ok(status) = status else {
-        println!("{} で重大なエラーが発生しました（update を起動できません）", label);
+        auto_update_echo(push_server.as_ref(), &format!("{} で重大なエラーが発生しました（update の終了待機に失敗しました）", label));
         return false;
     };
 
     let Some(code) = status.code() else {
-        println!("{} で重大なエラーが発生しました（終了コード不明）", label);
+        auto_update_echo(push_server.as_ref(), &format!("{} で重大なエラーが発生しました（終了コード不明）", label));
         return false;
     };
 
     match code {
         0 => {
-            println!("{} が完了しました", label);
-            refresh_database_after_phase(label)
+            auto_update_echo(push_server.as_ref(), &format!("{} が完了しました", label));
+            refresh_database_after_phase(label, push_server.as_ref())
         }
         1..=9 => {
-            println!("{} が完了しました（{}件の小説でエラーがありました）", label, code);
-            refresh_database_after_phase(label)
+            auto_update_echo(
+                push_server.as_ref(),
+                &format!("{} が完了しました（{}件の小説でエラーがありました）", label, code),
+            );
+            refresh_database_after_phase(label, push_server.as_ref())
         }
         _ => {
-            println!("{} で重大なエラーが発生しました（終了コード: {}）", label, code);
+            auto_update_echo(
+                push_server.as_ref(),
+                &format!("{} で重大なエラーが発生しました（終了コード: {}）", label, code),
+            );
             false
         }
     }
 }
 
-fn refresh_database_after_phase(label: &str) -> bool {
+fn refresh_database_after_phase(label: &str, push_server: &PushServer) -> bool {
     match db::with_database_mut(|db| db.refresh()) {
         Ok(()) => true,
         Err(e) => {
-            println!("{} 後のDB再読み込みに失敗しました: {}", label, e);
+            auto_update_echo(
+                push_server,
+                &format!("{} 後のDB再読み込みに失敗しました: {}", label, e),
+            );
             false
         }
     }
+}
+
+fn relay_child_stdout(
+    stdout: Option<ChildStdout>,
+    push_server: Arc<PushServer>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let Some(out) = stdout else {
+            return;
+        };
+
+        let reader = std::io::BufReader::new(out);
+        for line in reader.lines() {
+            let Ok(text) = line else {
+                break;
+            };
+            relay_stdout_line(push_server.as_ref(), &text);
+        }
+    })
+}
+
+fn relay_child_stderr(
+    stderr: Option<ChildStderr>,
+    push_server: Arc<PushServer>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let Some(err) = stderr else {
+            return;
+        };
+
+        let reader = std::io::BufReader::new(err);
+        for line in reader.lines() {
+            match line {
+                Ok(text) => auto_update_echo(push_server.as_ref(), &text),
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn relay_stdout_line(push_server: &PushServer, text: &str) {
+    let Some(json_str) = text.strip_prefix(WS_LINE_PREFIX) else {
+        auto_update_echo(push_server, text);
+        return;
+    };
+
+    match serde_json::from_str::<serde_json::Value>(json_str) {
+        Ok(message) => push_server.broadcast_raw(&message),
+        Err(_) => auto_update_echo(push_server, text),
+    }
+}
+
+fn auto_update_echo(push_server: &PushServer, body: &str) {
+    push_server.broadcast_echo(body, "stdout");
 }
 
 #[cfg(test)]

@@ -137,7 +137,12 @@ fn execute_job(
     running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
 ) -> bool {
     if matches!(job.job_type, JobType::AutoUpdate) {
-        return crate::web::scheduler::execute_auto_update(root_dir, push_server.as_ref());
+        return crate::web::scheduler::execute_auto_update(
+            root_dir,
+            Arc::clone(push_server),
+            &job.id,
+            Arc::clone(running_pids),
+        );
     }
 
     let target_console = console_target_for_job(job.job_type);
