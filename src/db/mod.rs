@@ -3,6 +3,7 @@ pub mod index_store;
 pub mod inventory;
 pub mod novel_record;
 pub mod paths;
+pub mod ruby_time;
 
 pub use database::Database;
 pub use novel_record::NovelRecord;

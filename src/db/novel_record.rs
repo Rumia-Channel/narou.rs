@@ -13,19 +13,19 @@ pub struct NovelRecord {
     pub novel_type: u8,
     #[serde(default)]
     pub end: bool,
-    #[serde(with = "chrono::serde::ts_seconds")]
+    #[serde(with = "crate::db::ruby_time")]
     pub last_update: DateTime<Utc>,
-    #[serde(with = "chrono::serde::ts_seconds_option", default)]
+    #[serde(with = "crate::db::ruby_time::option", default)]
     pub new_arrivals_date: Option<DateTime<Utc>>,
     #[serde(default)]
     pub use_subdirectory: bool,
-    #[serde(with = "chrono::serde::ts_seconds_option", default)]
+    #[serde(with = "crate::db::ruby_time::option", default)]
     pub general_firstup: Option<DateTime<Utc>>,
-    #[serde(with = "chrono::serde::ts_seconds_option", default)]
+    #[serde(with = "crate::db::ruby_time::option", default)]
     pub novelupdated_at: Option<DateTime<Utc>>,
-    #[serde(with = "chrono::serde::ts_seconds_option", default)]
+    #[serde(with = "crate::db::ruby_time::option", default)]
     pub general_lastup: Option<DateTime<Utc>>,
-    #[serde(with = "chrono::serde::ts_seconds_option", default)]
+    #[serde(with = "crate::db::ruby_time::option", default)]
     pub last_mail_date: Option<DateTime<Utc>>,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -41,7 +41,7 @@ pub struct NovelRecord {
     pub suspend: bool,
     #[serde(default)]
     pub is_narou: bool,
-    #[serde(with = "chrono::serde::ts_seconds_option", default)]
+    #[serde(with = "crate::db::ruby_time::option", default)]
     pub last_check_date: Option<DateTime<Utc>>,
     #[serde(
         default,

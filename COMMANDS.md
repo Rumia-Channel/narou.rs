@@ -181,7 +181,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 標準入力からのターゲット読み取りに対応。Ruby版同様 `narou tag ... | narou u` や `narou l -t "foo bar" | narou u` のようなパイプ入力を解決
 - ターゲット解決: Ruby版 `tagname_to_ids`/`Downloader.get_data_by_target` 相当に合わせ、ID、URL、Nコード、タイトル、`.narou/alias.yaml` 別名、通常タグ名、`tag:NAME`、`^tag:NAME` を解決
 - 既存小説更新時は Ruby版同様に DB の `toc_url` から `ncode` などのURLキャプチャを復元し、DB上の `sitename` を保存先決定で優先する
-- サイト/API由来のタイムゾーン表記なし日時は `webnovel/*.yaml` の `timezone`、未指定時は local `time-zone`（既定 `Asia/Tokyo`）で解釈し、DB には正しい UTC epoch として保存する。なろう API の `YYYY-MM-DD HH:MM:SS` は JST 扱い
+- サイト/API由来のタイムゾーン表記なし日時は `webnovel/*.yaml` の `timezone`、未指定時は local `time-zone`（既定 `Asia/Tokyo`）で解釈する。DB の YAML には narou.rb 互換の `YYYY-MM-DD HH:MM:SS.nnnnnnnnn +09:00` 形式で保存し、既存 Rust 版の epoch 秒も読み込める。なろう API の `YYYY-MM-DD HH:MM:SS` は JST 扱い
 - あらすじ比較は `<br>`/`<br/>`/`<br />` と改行・行末空白を正規化し、実質同一なら更新扱いにしない
 - 既存小説で実変更が無い場合は `last_update` を保持し、更新確認だけで Web UI の `new-update` 表示が再点灯しないようにする
 - 凍結チェック: Ruby版と同じ `.narou/freeze.yaml` を参照（既存Rustデータ移行用に `frozen` タグも補助的に認識）
@@ -380,7 +380,7 @@ narou setting name         # 読み取り
 - エラー数を終了コードとして返す
 - `apply_force_and_default_settings` で変換時の `force.*/default.*` をフラットキーから正しく解決
 - `device` 変更時の関連設定の自動反映（Ruby の `RELATED_VARIABLES` に合わせて `default.enable_half_indent_bracket` を変更）
-- `time-zone` をローカル設定として追加。`webnovel/*.yaml` の `timezone` がないサイトで、タイムゾーン表記なしの日時を UTC 保存値へ変換する際の既定値として使う
+- `time-zone` をローカル設定として追加。`webnovel/*.yaml` の `timezone` がないサイトで、タイムゾーン表記なしの日時を内部時刻へ変換する際の既定値として使う。DB YAML への日時保存は narou.rb 互換の JST timestamp 形式を維持する
 
 ---
 
