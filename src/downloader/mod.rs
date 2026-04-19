@@ -327,6 +327,10 @@ fn resolve_download_status(
     }
 }
 
+fn should_replace_last_update(status: types::UpdateStatus) -> bool {
+    matches!(status, types::UpdateStatus::Ok)
+}
+
 fn sanitize_site_tags(raw: &str) -> Vec<String> {
     let cleaned = crate::downloader::html::sanitize_text(raw)
         .replace("キーワードが設定されていません", "")
@@ -1186,6 +1190,16 @@ impl Downloader {
             }
         }
 
+        let status = resolve_download_status(
+            force,
+            updated_count,
+            existing_id,
+            title_changed,
+            author_changed,
+            story_changed,
+            sections_deleted,
+        );
+
         let id = crate::db::with_database_mut(|db| {
             let id = if let Some(eid) = existing_id {
                 if let Some(existing) = db.get(eid) {
@@ -1200,7 +1214,9 @@ impl Downloader {
                     updated.toc_url = record.toc_url.clone();
                     updated.sitename = record.sitename.clone();
                     updated.end = record.end;
-                    updated.last_update = record.last_update;
+                    if should_replace_last_update(status) {
+                        updated.last_update = record.last_update;
+                    }
                     if updated_count > 0 {
                         updated.new_arrivals_date = record.new_arrivals_date;
                     }
@@ -1246,16 +1262,6 @@ impl Downloader {
             }
         }
         self.flush_section_hash_cache()?;
-
-        let status = resolve_download_status(
-            force,
-            updated_count,
-            existing_id,
-            title_changed,
-            author_changed,
-            story_changed,
-            sections_deleted,
-        );
 
         Ok(DownloadResult {
             id,
@@ -1732,6 +1738,12 @@ mod tests {
             super::resolve_download_status(true, 0, Some(1), false, false, false, false),
             super::types::UpdateStatus::Ok
         ));
+    }
+
+    #[test]
+    fn no_update_preserves_last_update_timestamp() {
+        assert!(!super::should_replace_last_update(super::types::UpdateStatus::None));
+        assert!(super::should_replace_last_update(super::types::UpdateStatus::Ok));
     }
 
     #[test]
