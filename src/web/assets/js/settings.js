@@ -17,6 +17,7 @@
       const resp = await fetch('/api/global_setting');
       if (!resp.ok) throw new Error('Failed to load settings');
       settingsData = await resp.json();
+      applyLoadedTheme();
       renderTabs();
       renderTabContent();
       restoreActiveTab();
@@ -276,6 +277,7 @@
       });
       const result = await resp.json();
       if (result.success) {
+        applySavedWebUiSettings(settings);
         showToast(result.message || '設定を保存しました', 'success');
       } else {
         showToast(result.message || '保存に失敗しました', 'error');
@@ -331,6 +333,42 @@
     });
 
     return data;
+  }
+
+  function applyLoadedTheme() {
+    const setting = findSetting('webui.theme');
+    if (setting) {
+      applyThemeValue(setting.value);
+    }
+  }
+
+  function applySavedWebUiSettings(settings) {
+    if (Object.prototype.hasOwnProperty.call(settings, 'webui.theme')) {
+      applyThemeValue(settings['webui.theme']);
+    }
+  }
+
+  function applyThemeValue(value) {
+    const theme = normalizeTheme(value);
+    try {
+      if (theme === 'default') {
+        localStorage.removeItem('narou-rs-webui-theme');
+      } else {
+        localStorage.setItem('narou-rs-webui-theme', theme);
+      }
+    } catch(e) {}
+    document.documentElement.dataset.theme = theme === 'default' ? '' : theme;
+  }
+
+  function normalizeTheme(value) {
+    return (!value || value === 'Cerulean' || value === 'default') ? 'default' : value;
+  }
+
+  function findSetting(name) {
+    if (!settingsData || !Array.isArray(settingsData.settings)) return null;
+    return settingsData.settings.find(function(setting) {
+      return setting.name === name;
+    }) || null;
   }
 
   // ─── Helpers ───────────────────────────────────────────

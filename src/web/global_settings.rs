@@ -72,9 +72,6 @@ pub async fn get_global_settings(
 
     // Local settings
     for (name, info) in &vars.local {
-        if info.invisible {
-            continue;
-        }
         let tab = tab_for_setting(name);
         if tab.is_none() {
             continue;
@@ -88,9 +85,6 @@ pub async fn get_global_settings(
 
     // Global settings
     for (name, info) in &vars.global {
-        if info.invisible {
-            continue;
-        }
         let tab = tab_for_setting(name);
         if tab.is_none() {
             continue;
@@ -177,6 +171,7 @@ pub async fn save_global_settings(
     let mut deletes_local: Vec<String> = Vec::new();
     let mut deletes_global: Vec<String> = Vec::new();
     let mut auto_schedule_changed = false;
+    let webui_config_changed = entries.keys().any(|name| is_live_webui_config_name(name));
 
     for (name, json_val) in entries {
         // Determine scope
@@ -291,6 +286,9 @@ pub async fn save_global_settings(
         };
         state.push_server.broadcast_echo(message, "stdout");
     }
+    if webui_config_changed {
+        state.push_server.broadcast_event("webui.config.reload", "");
+    }
 
     Json(ApiResponse {
         success: true,
@@ -325,8 +323,15 @@ fn build_setting_entry(
         "value": yaml_to_json(value),
         "select_keys": info.select_keys,
         "select_summaries": select_summaries_for_setting(name, info),
-        "invisible": info.invisible,
+        "invisible": false,
     })
+}
+
+fn is_live_webui_config_name(name: &str) -> bool {
+    matches!(
+        name,
+        "webui.theme" | "webui.table.reload-timing" | "webui.performance-mode"
+    )
 }
 
 fn select_summaries_for_setting(name: &str, info: &VarInfo) -> Option<Vec<String>> {
@@ -669,5 +674,25 @@ mod tests {
                 "iBooks".to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn tabbed_invisible_settings_are_visible_on_web_settings_page() {
+        let vars = setting_variables();
+        let info = vars.get("webui.theme").expect("webui.theme metadata");
+        assert!(info.invisible);
+
+        let entry = build_setting_entry("webui.theme", info, "local", "webui", None);
+
+        assert_eq!(entry["tab"], "webui");
+        assert_eq!(entry["invisible"], false);
+    }
+
+    #[test]
+    fn live_webui_config_names_are_detected() {
+        assert!(is_live_webui_config_name("webui.theme"));
+        assert!(is_live_webui_config_name("webui.table.reload-timing"));
+        assert!(is_live_webui_config_name("webui.performance-mode"));
+        assert!(!is_live_webui_config_name("server-port"));
     }
 }

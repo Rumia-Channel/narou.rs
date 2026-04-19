@@ -248,6 +248,11 @@ export function bindActions() {
     State.theme = theme;
     lsSet('theme', theme);
     document.documentElement.dataset.theme = theme === 'default' ? '' : theme;
+    postJson('/api/global_setting', {
+      settings: { 'webui.theme': theme === 'default' ? null : theme },
+    }).catch(() => {
+      showNotification('テーマ設定の保存に失敗しました', 'error');
+    });
   });
 
   // --- Queue display ---

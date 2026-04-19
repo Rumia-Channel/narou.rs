@@ -1,0 +1,6 @@
+# Web settings parity notes (2026-04-19)
+
+- Ruby Web settings display variables that have a `tab:` assignment even if their metadata has `invisible: true`; `invisible` only hides them from normal CLI setting lists. Rust previously filtered `info.invisible` in `/api/global_setting` and the frontend, so `webui.theme`, `webui.table.reload-timing`, `server-bind`, `server-basic-auth.*`, `server-ws-add-accepted-domains`, and `over18` were missing from the Web settings page.
+- Rust `/api/global_setting` now includes all tabbed local/global settings and marks returned entries as Web-visible. No-tab settings remain omitted from the form; backend save preserves existing values because it applies only submitted changes/deletes.
+- Saving live Web UI settings (`webui.theme`, `webui.table.reload-timing`, `webui.performance-mode`) broadcasts `webui.config.reload`; the main Web UI reloads `/api/webui/config` and reapplies theme/performance/reload settings without a full page reload.
+- Theme semantics are normalized: server-side `Cerulean` and UI-side `default` both mean the base Cerulean theme. The main theme selector now displays `default` for `Cerulean`, and the toolbar theme selector persists changes back to `webui.theme` through `/api/global_setting`.

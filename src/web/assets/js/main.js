@@ -127,16 +127,31 @@ function connectWebSocket() {
 }
 
 function applyWebConfig(config) {
-  if (config.theme && !localStorage.getItem('narou-rs-webui-theme')) {
-    State.theme = config.theme;
-    document.documentElement.dataset.theme = config.theme === 'default' ? '' : config.theme;
+  if (config.theme) {
+    const theme = normalizeTheme(config.theme);
+    State.theme = theme;
+    document.documentElement.dataset.theme = theme === 'default' ? '' : theme;
     const sel = El.themeSelect;
-    if (sel) sel.value = config.theme;
+    if (sel) sel.value = theme;
   }
   if (config.ws_port) State.wsPort = config.ws_port;
   if (config.performance_mode) State.performanceMode = config.performance_mode;
   if (config.reload_timing) State.tableReloadTiming = config.reload_timing;
   setConcurrencyEnabled(Boolean(config.concurrency_enabled));
+}
+
+function normalizeTheme(theme) {
+  return (theme === 'Cerulean' || theme === 'default') ? 'default' : theme;
+}
+
+async function reloadWebConfig() {
+  try {
+    const config = await fetchJson('/api/webui/config');
+    if (config) {
+      applyWebConfig(config);
+      applyPerformanceMode();
+    }
+  } catch { /* keep current config */ }
 }
 
 function setConcurrencyEnabled(enabled) {
@@ -164,6 +179,9 @@ function handleWsMessage(msg) {
       break;
     case 'tag.updateCanvas':
       refreshTags();
+      break;
+    case 'webui.config.reload':
+      reloadWebConfig();
       break;
     case 'notepad.change':
       if (El.notepad && El.notepad.value !== (msg.data || '')) {
