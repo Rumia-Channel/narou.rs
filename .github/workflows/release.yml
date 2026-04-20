@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "[0-9]*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tag matches Cargo.toml version
+        id: version
+        shell: pwsh
+        run: |
+          $cargoToml = Get-Content Cargo.toml -Raw
+          if ($cargoToml -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
+            throw "Could not find package version in Cargo.toml."
+          }
+
+          $version = $Matches[1]
+          $tag = "${{ github.ref_name }}"
+          if ($tag -ne $version -and $tag -ne "v$version") {
+            throw "Tag '$tag' does not match Cargo.toml version '$version' or 'v$version'."
+          }
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            platform: win
+            arch: x64
+            binary: narou_rs.exe
+          - name: macOS x64
+            os: macos-13
+            platform: mac
+            arch: x64
+            binary: narou_rs
+          - name: Linux x64
+            os: ubuntu-latest
+            platform: linux
+            arch: x64
+            binary: narou_rs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: Build release binary
+        shell: pwsh
+        run: cargo build --locked --release
+
+      - name: Package release asset
+        id: package
+        shell: pwsh
+        run: |
+          $archivePath = & .\scripts\package-release.ps1 `
+            -BinaryPath "target/release/${{ matrix.binary }}" `
+            -Platform "${{ matrix.platform }}" `
+            -Arch "${{ matrix.arch }}" `
+            -PackageRoot "narou" `
+            -CommitVersion "${{ github.ref_name }}" `
+            -OutputDir "dist"
+
+          "archive_path=$archivePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "archive_name=$([System.IO.Path]::GetFileName($archivePath))" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive_name }}
+          path: ${{ steps.package.outputs.archive_path }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          $tag = $env:TAG_NAME
+          $assets = Get-ChildItem -Path "release-assets" -File | Sort-Object Name
+          if ($assets.Count -eq 0) {
+            throw "No release assets were downloaded."
+          }
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title $tag --verify-tag --generate-notes
+          }
+
+          foreach ($asset in $assets) {
+            gh release upload $tag $asset.FullName --clobber
+          }

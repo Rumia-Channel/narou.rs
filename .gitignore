@@ -41,3 +41,4 @@ errors.txt
 !preset/custom_chuki_tag.txt
 # CocoIndex Code (ccc)
 /.cocoindex_code/
+/dist/
