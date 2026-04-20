@@ -3,7 +3,7 @@ param(
     [string]$BinaryPath,
 
     [Parameter(Mandatory = $true)]
-    [ValidateSet("win", "mac", "linux")]
+    [ValidateSet("win", "mac", "linux", "rpi24", "rpi0")]
     [string]$Platform,
 
     [string]$Arch = "x64",
