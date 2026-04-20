@@ -14,13 +14,26 @@ pub mod worker;
 
 use axum::{
     Router,
-    http::{StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
+use std::net::IpAddr;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 use tokio::task::JoinHandle;
+
+pub(crate) const MAX_WEB_TARGETS_PER_REQUEST: usize = 512;
+pub(crate) const MAX_WEB_TAGS_PER_REQUEST: usize = 128;
+pub(crate) const MAX_WEB_TARGET_LENGTH: usize = 4096;
+pub(crate) const MAX_WEB_TAG_LENGTH: usize = 255;
+pub(crate) const MAX_WEB_TEXT_INPUT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_WEB_CSV_IMPORT_BYTES: usize = 5 * 1024 * 1024;
+pub(crate) const MAX_WEB_LOG_COUNT: usize = 1000;
+pub(crate) const MAX_WEB_PAGE_LENGTH: u64 = 500;
+pub(crate) const MAX_WEB_SEARCH_BYTES: usize = 4096;
+pub const INTERNAL_CONTROL_HEADER: &str = "x-narou-internal-token";
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -28,6 +41,7 @@ pub struct AppState {
     pub ws_port: u16,
     pub push_server: Arc<push::PushServer>,
     pub basic_auth_header: Option<String>,
+    pub control_token: String,
     pub queue: Arc<crate::queue::PersistentQueue>,
     pub restore_prompt_pending: Arc<AtomicBool>,
     pub running_jobs: Arc<parking_lot::Mutex<Vec<crate::queue::QueueJob>>>,
@@ -71,8 +85,253 @@ pub(crate) fn removal_log_message(titles: &[String], with_file: bool) -> String 
     }
 }
 
+pub(crate) fn validate_web_target_value(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("target is required".to_string());
+    }
+    if trimmed.len() > MAX_WEB_TARGET_LENGTH {
+        return Err("target is too long".to_string());
+    }
+    if trimmed.starts_with('-') {
+        return Err("invalid target".to_string());
+    }
+    if trimmed.chars().any(|ch| ch.is_control()) {
+        return Err("target contains invalid characters".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+pub(crate) fn validate_web_tag_name(tag: &str) -> Result<String, String> {
+    let trimmed = tag.trim();
+    if trimmed.is_empty() {
+        return Err("tag is required".to_string());
+    }
+    if trimmed.starts_with('-') {
+        return Err("tag contains invalid characters".to_string());
+    }
+    if trimmed.len() > MAX_WEB_TAG_LENGTH {
+        return Err("tag is too long".to_string());
+    }
+    if trimmed.chars().any(|ch| ch.is_control()) {
+        return Err("tag contains invalid characters".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+pub(crate) fn validate_web_text_size(
+    value: &str,
+    max_bytes: usize,
+    label: &str,
+) -> Result<(), String> {
+    if value.len() > max_bytes {
+        return Err(format!("{} is too large", label));
+    }
+    Ok(())
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+fn normalize_fs_path_for_comparison(path: &Path) -> PathBuf {
+    let normalized = if cfg!(windows) {
+        let raw = path.to_string_lossy();
+        if raw.starts_with(r"\\?\") {
+            PathBuf::from(raw.trim_start_matches(r"\\?\"))
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    };
+    normalize_path(&normalized)
+}
+
+pub(crate) fn safe_existing_novel_dir(
+    archive_root: &Path,
+    record: &crate::db::novel_record::NovelRecord,
+) -> Result<PathBuf, String> {
+    let canonical_archive_root = std::fs::canonicalize(archive_root)
+        .map(|path| normalize_fs_path_for_comparison(&path))
+        .unwrap_or_else(|_| normalize_fs_path_for_comparison(archive_root));
+    let candidate = crate::db::existing_novel_dir_for_record(archive_root, record);
+    let normalized_candidate = normalize_fs_path_for_comparison(&candidate);
+    if !normalized_candidate.starts_with(&canonical_archive_root) {
+        return Err("invalid novel storage path".to_string());
+    }
+    if candidate.exists() {
+        let canonical_candidate = std::fs::canonicalize(&candidate)
+            .map(|path| normalize_fs_path_for_comparison(&path))
+            .map_err(|e| e.to_string())?;
+        if !canonical_candidate.starts_with(&canonical_archive_root) {
+            return Err("invalid novel storage path".to_string());
+        }
+        Ok(canonical_candidate)
+    } else {
+        Ok(normalized_candidate)
+    }
+}
+
+pub(crate) fn remove_novel_storage_dir(
+    archive_root: &Path,
+    record: &crate::db::novel_record::NovelRecord,
+) -> Result<(), String> {
+    let dir = safe_existing_novel_dir(archive_root, record)?;
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn basic_auth_matches(headers: &HeaderMap, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        == Some(expected)
+}
+
+pub(crate) fn request_host_allowed(headers: &HeaderMap, state: &AppState, expected_port: u16) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    authority_matches_state(host, state, expected_port, false)
+}
+
+pub(crate) fn origin_allowed(headers: &HeaderMap, state: &AppState, expected_port: u16) -> bool {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            headers
+                .get(header::REFERER)
+                .and_then(|value| value.to_str().ok())
+        });
+    let Some(origin) = origin else {
+        return false;
+    };
+    authority_matches_state(origin, state, expected_port, true)
+}
+
+fn internal_control_token_matches(headers: &HeaderMap, state: &AppState) -> bool {
+    headers
+        .get(INTERNAL_CONTROL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(state.control_token.as_str())
+}
+
+fn authority_matches_state(
+    value: &str,
+    state: &AppState,
+    expected_port: u16,
+    is_url: bool,
+) -> bool {
+    let Some((host, port)) = parse_authority_host_and_port(value, is_url) else {
+        return false;
+    };
+    if !host_allowed(host.as_str(), state) {
+        return false;
+    }
+    match port {
+        Some(port) => port == expected_port,
+        None => true,
+    }
+}
+
+fn parse_authority_host_and_port(value: &str, is_url: bool) -> Option<(String, Option<u16>)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        return None;
+    }
+    let authority = if is_url {
+        let (_, rest) = trimmed.split_once("://")?;
+        rest.split(['/', '?', '#']).next()?
+    } else {
+        trimmed
+    };
+    split_host_and_port(authority)
+}
+
+fn split_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
+    let trimmed = authority.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = rest[..end].to_ascii_lowercase();
+        let tail = &rest[end + 1..];
+        let port = tail
+            .strip_prefix(':')
+            .and_then(|value| value.parse::<u16>().ok());
+        return Some((host, port));
+    }
+    if let Some((host, port)) = trimmed.rsplit_once(':') {
+        if !host.contains(':') {
+            let host = host.trim().to_ascii_lowercase();
+            if host.is_empty() {
+                return None;
+            }
+            let port = port.parse::<u16>().ok();
+            return Some((host, port));
+        }
+    }
+    Some((trimmed.to_ascii_lowercase(), None))
+}
+
+fn host_allowed(host: &str, state: &AppState) -> bool {
+    let normalized = host.trim().trim_matches('.').to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    state.push_server.accepted_domains().iter().any(|pattern| {
+        wildcard_host_match(
+            pattern.trim().trim_matches('.').to_ascii_lowercase().as_str(),
+            normalized.as_str(),
+        )
+    }) || (state.push_server.allow_ip_literals() && normalized.parse::<IpAddr>().is_ok())
+}
+
+fn wildcard_host_match(pattern: &str, text: &str) -> bool {
+    wildcard_host_match_bytes(pattern.as_bytes(), text.as_bytes())
+}
+
+fn wildcard_host_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+    match pattern[0] {
+        b'*' => {
+            wildcard_host_match_bytes(&pattern[1..], text)
+                || (!text.is_empty() && wildcard_host_match_bytes(pattern, &text[1..]))
+        }
+        b'?' => !text.is_empty() && wildcard_host_match_bytes(&pattern[1..], &text[1..]),
+        c => !text.is_empty() && c == text[0] && wildcard_host_match_bytes(&pattern[1..], &text[1..]),
+    }
+}
+
+fn is_state_changing_method(method: &Method) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
 pub fn create_router(state: AppState) -> Router {
     let auth_state = state.clone();
+    let guard_state = state.clone();
     Router::new()
         .route("/", get(frontend::index))
         .route("/assets/{*path}", get(frontend::asset))
@@ -170,7 +429,28 @@ pub fn create_router(state: AppState) -> Router {
             auth_state,
             basic_auth_middleware,
         ))
+        .layer(middleware::from_fn_with_state(
+            guard_state,
+            request_guard_middleware,
+        ))
         .with_state(state)
+}
+
+async fn request_guard_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if !request_host_allowed(request.headers(), &state, state.port) {
+        return (StatusCode::BAD_REQUEST, "Invalid Host").into_response();
+    }
+    if is_state_changing_method(request.method())
+        && !internal_control_token_matches(request.headers(), &state)
+        && !origin_allowed(request.headers(), &state, state.port)
+    {
+        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
+    next.run(request).await
 }
 
 async fn basic_auth_middleware(
@@ -178,16 +458,10 @@ async fn basic_auth_middleware(
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
-    let Some(expected) = state.basic_auth_header.as_deref() else {
+    if state.basic_auth_header.is_none() {
         return next.run(request).await;
-    };
-
-    let authorized = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        == Some(expected);
-    if authorized {
+    }
+    if basic_auth_matches(request.headers(), state.basic_auth_header.as_deref()) {
         return next.run(request).await;
     }
 
@@ -201,7 +475,74 @@ async fn basic_auth_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::removal_log_message;
+    use chrono::Utc;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    use super::{
+        AppState, basic_auth_matches, origin_allowed, removal_log_message, request_host_allowed,
+        safe_existing_novel_dir, validate_web_tag_name,
+    };
+
+    fn sample_record(file_title: &str) -> crate::db::novel_record::NovelRecord {
+        crate::db::novel_record::NovelRecord {
+            id: 1,
+            author: "author".to_string(),
+            title: "title".to_string(),
+            file_title: file_title.to_string(),
+            toc_url: "https://example.com".to_string(),
+            sitename: "site".to_string(),
+            novel_type: 0,
+            end: false,
+            last_update: Utc::now(),
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: None,
+            general_lastup: None,
+            last_mail_date: None,
+            tags: Vec::new(),
+            ncode: None,
+            domain: None,
+            general_all_no: None,
+            length: None,
+            suspend: false,
+            is_narou: false,
+            last_check_date: None,
+            convert_failure: false,
+        }
+    }
+
+    fn test_artifact_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-artifacts")
+            .join(format!("web-mod-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_state() -> AppState {
+        let queue_dir = test_artifact_dir("security-state");
+        let mut push_server = crate::web::push::PushServer::new();
+        push_server.set_accepted_domains(["127.0.0.1", "localhost", "*.example.com"]);
+        push_server.set_allow_ip_literals(true);
+        AppState {
+            port: 8080,
+            ws_port: 8081,
+            push_server: Arc::new(push_server),
+            basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
+            control_token: "control-token".to_string(),
+            queue: Arc::new(
+                crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
+            ),
+            restore_prompt_pending: Arc::new(AtomicBool::new(false)),
+            running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            auto_update_scheduler: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
 
     #[test]
     fn removal_log_message_formats_single_title() {
@@ -217,5 +558,75 @@ mod tests {
             removal_log_message(&["a".to_string(), "b".to_string()], true),
             "小説を2件削除しました（保存フォルダも削除）: a, b"
         );
+    }
+
+    #[test]
+    fn validate_web_tag_name_rejects_control_characters() {
+        assert!(validate_web_tag_name("tag").is_ok());
+        assert!(validate_web_tag_name("bad\ttag").is_err());
+    }
+
+    #[test]
+    fn safe_existing_novel_dir_keeps_suspicious_names_inside_archive_root() {
+        let archive_root = test_artifact_dir("safe-existing-novel-dir");
+        let path = safe_existing_novel_dir(&archive_root, &sample_record("..\\..\\escape"))
+            .unwrap();
+        assert!(path.starts_with(&archive_root));
+        assert!(path.ends_with(".._.._escape"));
+        let _ = std::fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn basic_auth_matching_requires_expected_header() {
+        let headers = axum::http::HeaderMap::new();
+        assert!(basic_auth_matches(&headers, None));
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert!(basic_auth_matches(&headers, Some("Basic dXNlcjpwYXNz")));
+        assert!(!basic_auth_matches(&headers, Some("Basic other")));
+    }
+
+    #[test]
+    fn request_host_validation_rejects_unexpected_domains() {
+        let state = test_state();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("127.0.0.1:8080"),
+        );
+        assert!(request_host_allowed(&headers, &state, state.port));
+
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("evil.test:8080"),
+        );
+        assert!(!request_host_allowed(&headers, &state, state.port));
+    }
+
+    #[test]
+    fn origin_validation_requires_same_host_and_port() {
+        let state = test_state();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://localhost:8080"),
+        );
+        assert!(origin_allowed(&headers, &state, state.port));
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://localhost:9090"),
+        );
+        assert!(!origin_allowed(&headers, &state, state.port));
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://evil.test:8080"),
+        );
+        assert!(!origin_allowed(&headers, &state, state.port));
     }
 }

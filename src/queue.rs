@@ -5,7 +5,11 @@ use std::path::{Path, PathBuf};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::db::inventory::atomic_write;
 use crate::error::{NarouError, Result};
+
+const MAX_PENDING_JOBS: usize = 10_000;
+const MAX_JOB_TARGET_CHARS: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueJob {
@@ -90,6 +94,7 @@ impl PersistentQueue {
         if self.path.exists() {
             let content = fs::read_to_string(&self.path)?;
             let state: QueueState = serde_yaml::from_str(&content)?;
+            validate_queue_state(&state)?;
             *self.state.lock() = state;
         }
         Ok(())
@@ -100,28 +105,37 @@ impl PersistentQueue {
             fs::create_dir_all(parent)?;
         }
         let content = serde_yaml::to_string(&*self.state.lock())?;
-        fs::write(&self.path, content)?;
+        atomic_write(&self.path, &content)?;
         Ok(())
     }
 
     pub fn push(&self, job_type: JobType, target: &str) -> Result<String> {
+        validate_job_target(target)?;
         let id = generate_job_id(job_type, target);
-        let job = QueueJob {
-            id: id.clone(),
-            job_type,
-            target: target.to_string(),
-            created_at: chrono::Utc::now().timestamp(),
-            retry_count: 0,
-            max_retries: 3,
-        };
-        self.state.lock().jobs.push_back(job);
+        {
+            let mut state = self.state.lock();
+            ensure_queue_capacity(state.jobs.len(), 1)?;
+            let job = QueueJob {
+                id: id.clone(),
+                job_type,
+                target: target.to_string(),
+                created_at: chrono::Utc::now().timestamp(),
+                retry_count: 0,
+                max_retries: 3,
+            };
+            state.jobs.push_back(job);
+        }
         self.save()?;
         Ok(id)
     }
 
     pub fn push_batch(&self, jobs: &[(JobType, String)]) -> Result<Vec<String>> {
+        for (_, target) in jobs {
+            validate_job_target(target)?;
+        }
         let mut ids = Vec::new();
         let mut state = self.state.lock();
+        ensure_queue_capacity(state.jobs.len(), jobs.len())?;
         for (job_type, target) in jobs {
             let id = generate_job_id(*job_type, target);
             state.jobs.push_back(QueueJob {
@@ -184,6 +198,7 @@ impl PersistentQueue {
 
     pub fn requeue_failed(&self) -> Result<usize> {
         let mut state = self.state.lock();
+        ensure_queue_capacity(state.jobs.len(), state.failed.len())?;
         let failed = std::mem::take(&mut state.failed);
         let count = failed.len();
         for job_id in failed {
@@ -293,6 +308,44 @@ impl PersistentQueue {
     }
 }
 
+fn validate_job_target(target: &str) -> Result<()> {
+    if target.chars().count() > MAX_JOB_TARGET_CHARS {
+        return Err(NarouError::Database(format!(
+            "queue target exceeds {} characters",
+            MAX_JOB_TARGET_CHARS
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_queue_capacity(current_len: usize, incoming: usize) -> Result<()> {
+    if incoming == 0 {
+        return Ok(());
+    }
+    let remaining = MAX_PENDING_JOBS.saturating_sub(current_len);
+    if incoming > remaining {
+        return Err(NarouError::Database(format!(
+            "queue exceeds maximum of {} pending jobs",
+            MAX_PENDING_JOBS
+        )));
+    }
+    Ok(())
+}
+
+fn validate_queue_state(state: &QueueState) -> Result<()> {
+    if state.jobs.len() > MAX_PENDING_JOBS {
+        return Err(NarouError::Database(format!(
+            "queue.yaml contains {} pending jobs, exceeding limit {}",
+            state.jobs.len(),
+            MAX_PENDING_JOBS
+        )));
+    }
+    for job in &state.jobs {
+        validate_job_target(&job.target)?;
+    }
+    Ok(())
+}
+
 fn generate_job_id(job_type: JobType, target: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -364,5 +417,40 @@ mod tests {
         assert_eq!(remaining.len(), 2);
         assert!(matches!(remaining[0].job_type, JobType::Download));
         assert!(matches!(remaining[1].job_type, JobType::Update));
+    }
+
+    #[test]
+    fn push_rejects_oversized_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+
+        let err = queue
+            .push(JobType::Download, &"a".repeat(16 * 1024 + 1))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("queue target exceeds"));
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn load_rejects_tampered_queue_with_too_many_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let mut jobs = Vec::new();
+        for index in 0..10_001 {
+            jobs.push(format!(
+                "- id: job-{index}\n  job_type: download\n  target: target-{index}\n  created_at: 0\n  retry_count: 0\n  max_retries: 3"
+            ));
+        }
+        let yaml = format!(
+            "jobs:\n{}\ncompleted: []\nfailed: []\n",
+            jobs.join("\n")
+        );
+        std::fs::write(&queue_path, yaml).unwrap();
+
+        let err = PersistentQueue::new(&queue_path).unwrap_err();
+
+        assert!(err.to_string().contains("exceeding limit"));
     }
 }

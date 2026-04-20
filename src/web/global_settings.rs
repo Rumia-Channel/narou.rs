@@ -264,6 +264,14 @@ pub async fn save_global_settings(
 
     // Save replace.txt if provided
     if let Some(content) = body["replace_content"].as_str() {
+        if let Err(message) =
+            super::validate_web_text_size(content, super::MAX_WEB_TEXT_INPUT_BYTES, "replace.txt")
+        {
+            return Json(ApiResponse {
+                success: false,
+                message,
+            });
+        }
         if let Err(e) = std::fs::write("replace.txt", content) {
             return Json(ApiResponse {
                 success: false,

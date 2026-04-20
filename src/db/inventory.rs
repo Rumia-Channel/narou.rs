@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -155,38 +156,51 @@ pub enum InventoryScope {
     Global,
 }
 
-fn atomic_write(path: &Path, content: &str) -> Result<()> {
-    let tmp_path = format!("{}.{}.tmp", path.display(), std::process::id());
-    let backup_path = format!("{}.backup", path.display());
-
-    {
-        let mut file = fs::File::create(&tmp_path)?;
-        file.write_all(content.as_bytes())?;
-    }
-
-    if path.exists() {
-        let _ = fs::copy(path, &backup_path);
-    }
-
+pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    let tmp_path = temporary_write_path(path);
     let retries = 20u32;
-    for _ in 0..retries {
+    let mut last_error = None;
+
+    for attempt in 0..retries {
+        let _ = fs::remove_file(&tmp_path);
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+        }
+
         match fs::rename(&tmp_path, path) {
             Ok(_) => return Ok(()),
             Err(e) => {
-                if cfg!(windows) {
+                last_error = Some(e);
+                let _ = fs::remove_file(&tmp_path);
+                if cfg!(windows) && attempt + 1 < retries {
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                    let _ = fs::remove_file(&tmp_path);
-                    let mut file = fs::File::create(&tmp_path)?;
-                    file.write_all(content.as_bytes())?;
-                } else {
-                    return Err(NarouError::Io(e));
+                    continue;
                 }
+                break;
             }
         }
     }
 
-    let _ = fs::remove_file(&tmp_path);
-    Ok(())
+    Err(NarouError::Io(last_error.unwrap_or_else(|| {
+        std::io::Error::other(format!("failed to atomically write {}", path.display()))
+    })))
+}
+
+fn temporary_write_path(path: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or("inventory");
+    let tmp_name = format!(".{}.{}.{}.tmp", filename, std::process::id(), stamp);
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(tmp_name)
 }
 
 fn find_narou_root() -> Result<PathBuf> {

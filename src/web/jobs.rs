@@ -59,8 +59,12 @@ fn tag_color_class(color: &str) -> &'static str {
 }
 
 fn validate_download_targets(targets: &[String]) -> Result<(), String> {
-    if targets.iter().any(|target| target.trim_start().starts_with('-')) {
-        return Err("invalid download target".to_string());
+    if targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+        return Err("too many targets".to_string());
+    }
+    for target in targets {
+        super::validate_web_target_value(target)
+            .map_err(|_| "invalid download target".to_string())?;
     }
     Ok(())
 }
@@ -112,10 +116,12 @@ fn queue_bookmarklet_download(
     target: &str,
     mail: bool,
 ) -> Result<String, String> {
+    let target = super::validate_web_target_value(target)
+        .map_err(|_| "invalid download target".to_string())?;
     let job_target = if mail {
         format!("--mail\t{}", target)
     } else {
-        target.to_string()
+        target
     };
     queue
         .push(JobType::Download, &job_target)
@@ -309,7 +315,10 @@ fn render_diff_list_html_for_target(target: &str) -> String {
         return String::new();
     };
 
-    let cache_root = crate::db::existing_novel_dir_for_record(&archive_root, &record)
+    let Ok(base_dir) = super::safe_existing_novel_dir(&archive_root, &record) else {
+        return String::new();
+    };
+    let cache_root = base_dir
         .join(SECTION_SAVE_DIR)
         .join(CACHE_SAVE_DIR);
     let Ok(cache_dirs) = read_sorted_cache_dirs(&cache_root) else {
@@ -482,14 +491,16 @@ pub async fn api_update(
 }
 
 fn normalize_update_targets(targets: &[String]) -> Result<Vec<String>, String> {
+    if targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+        return Err("too many targets".to_string());
+    }
     let mut normalized = Vec::with_capacity(targets.len());
     let mut i = 0usize;
     while i < targets.len() {
         let target = &targets[i];
         if let Some(tag) = target.strip_prefix("--tag=") {
-            if tag.is_empty() {
-                return Err("--tag requires a tag name".to_string());
-            }
+            let tag = super::validate_web_tag_name(tag)
+                .map_err(|_| "--tag requires a tag name".to_string())?;
             normalized.push(format!("tag:{}", tag));
             i += 1;
             continue;
@@ -498,14 +509,16 @@ fn normalize_update_targets(targets: &[String]) -> Result<Vec<String>, String> {
             let Some(tag) = targets.get(i + 1) else {
                 return Err("--tag requires a tag name".to_string());
             };
-            if tag.starts_with('-') {
-                return Err("--tag requires a tag name".to_string());
-            }
+            let tag = super::validate_web_tag_name(tag)
+                .map_err(|_| "--tag requires a tag name".to_string())?;
             normalized.push(format!("tag:{}", tag));
             i += 2;
             continue;
         }
-        normalized.push(target.clone());
+        normalized.push(
+            super::validate_web_target_value(target)
+                .map_err(|_| "invalid target".to_string())?,
+        );
         i += 1;
     }
     Ok(normalized)
@@ -515,16 +528,51 @@ pub async fn api_convert(
     State(state): State<AppState>,
     Json(body): Json<ConvertBody>,
 ) -> Json<serde_json::Value> {
+    if body.targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+        return serde_json::json!({
+            "success": false,
+            "message": "too many targets",
+            "results": []
+        })
+        .into();
+    }
+    let targets: Vec<String> = match body
+        .targets
+        .iter()
+        .map(|target| super::validate_web_target_value(target))
+        .collect()
+    {
+        Ok(targets) => targets,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+                "results": []
+            })
+            .into();
+        }
+    };
     let device = body
         .device
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    if let Some(device) = device.as_deref() {
+        if device.len() > super::MAX_WEB_TARGET_LENGTH || device.chars().any(|ch| ch.is_control()) {
+            return serde_json::json!({
+                "success": false,
+                "message": "invalid device",
+                "results": []
+            })
+            .into();
+        }
+    }
     let jobs: Vec<(JobType, String)> = body
         .targets
         .iter()
-        .map(|target| {
+        .zip(targets.iter())
+        .map(|(_raw_target, target)| {
             (
                 JobType::Convert,
                 encode_convert_job_target(target, device.as_deref()),
@@ -547,7 +595,8 @@ pub async fn api_convert(
         .targets
         .iter()
         .zip(ids.iter())
-        .map(|(target, job_id)| {
+        .zip(targets.iter())
+        .map(|((_raw_target, job_id), target)| {
             serde_json::json!({
                 "target": target,
                 "device": device,
@@ -626,7 +675,28 @@ pub async fn api_send(
     State(state): State<AppState>,
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
-    let targets = targets_to_strings(&body.targets);
+    let raw_targets = targets_to_strings(&body.targets);
+    if raw_targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+        return serde_json::json!({
+            "success": false,
+            "message": "too many targets",
+        })
+        .into();
+    }
+    let targets: Vec<String> = match raw_targets
+        .iter()
+        .map(|target| super::validate_web_target_value(target))
+        .collect()
+    {
+        Ok(targets) => targets,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+            })
+            .into();
+        }
+    };
     let jobs: Vec<(JobType, String)> = targets
         .iter()
         .map(|t| (JobType::Send, t.clone()))
@@ -656,7 +726,26 @@ pub async fn api_inspect(
     State(state): State<AppState>,
     Json(body): Json<TargetsBody>,
 ) -> Json<ApiResponse> {
-    let targets = targets_to_strings(&body.targets);
+    let raw_targets = targets_to_strings(&body.targets);
+    if raw_targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+        return Json(ApiResponse {
+            success: false,
+            message: "too many targets".to_string(),
+        });
+    }
+    let targets: Vec<String> = match raw_targets
+        .iter()
+        .map(|target| super::validate_web_target_value(target))
+        .collect()
+    {
+        Ok(targets) => targets,
+        Err(message) => {
+            return Json(ApiResponse {
+                success: false,
+                message,
+            });
+        }
+    };
     let mut args: Vec<&str> = vec!["inspect"];
     let target_refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
     args.extend(&target_refs);
@@ -688,7 +777,26 @@ pub async fn api_folder(
     State(_state): State<AppState>,
     Json(body): Json<TargetsBody>,
 ) -> Json<ApiResponse> {
-    let targets = targets_to_strings(&body.targets);
+    let raw_targets = targets_to_strings(&body.targets);
+    if raw_targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+        return Json(ApiResponse {
+            success: false,
+            message: "too many targets".to_string(),
+        });
+    }
+    let targets: Vec<String> = match raw_targets
+        .iter()
+        .map(|target| super::validate_web_target_value(target))
+        .collect()
+    {
+        Ok(targets) => targets,
+        Err(message) => {
+            return Json(ApiResponse {
+                success: false,
+                message,
+            });
+        }
+    };
     let mut args: Vec<&str> = vec!["folder"];
     let target_refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
     args.extend(&target_refs);
@@ -710,7 +818,28 @@ pub async fn api_backup(
     State(state): State<AppState>,
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
-    let targets = targets_to_strings(&body.targets);
+    let raw_targets = targets_to_strings(&body.targets);
+    if raw_targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+        return serde_json::json!({
+            "success": false,
+            "message": "too many targets",
+        })
+        .into();
+    }
+    let targets: Vec<String> = match raw_targets
+        .iter()
+        .map(|target| super::validate_web_target_value(target))
+        .collect()
+    {
+        Ok(targets) => targets,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+            })
+            .into();
+        }
+    };
     let jobs: Vec<(JobType, String)> = targets
         .iter()
         .map(|t| (JobType::Backup, t.clone()))
@@ -764,7 +893,28 @@ pub async fn api_mail(
     State(state): State<AppState>,
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
-    let targets = targets_to_strings(&body.targets);
+    let raw_targets = targets_to_strings(&body.targets);
+    if raw_targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+        return serde_json::json!({
+            "success": false,
+            "message": "too many targets",
+        })
+        .into();
+    }
+    let targets: Vec<String> = match raw_targets
+        .iter()
+        .map(|target| super::validate_web_target_value(target))
+        .collect()
+    {
+        Ok(targets) => targets,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+            })
+            .into();
+        }
+    };
     let jobs: Vec<(JobType, String)> = targets
         .iter()
         .map(|t| (JobType::Mail, t.clone()))
@@ -794,7 +944,26 @@ pub async fn api_setting_burn(
     State(state): State<AppState>,
     Json(body): Json<TargetsBody>,
 ) -> Json<ApiResponse> {
-    let targets = targets_to_strings(&body.targets);
+    let raw_targets = targets_to_strings(&body.targets);
+    if raw_targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+        return Json(ApiResponse {
+            success: false,
+            message: "too many targets".to_string(),
+        });
+    }
+    let targets: Vec<String> = match raw_targets
+        .iter()
+        .map(|target| super::validate_web_target_value(target))
+        .collect()
+    {
+        Ok(targets) => targets,
+        Err(message) => {
+            return Json(ApiResponse {
+                success: false,
+                message,
+            });
+        }
+    };
     let mut args: Vec<&str> = vec!["setting", "--burn"];
     let target_refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
     args.extend(&target_refs);
@@ -827,6 +996,9 @@ pub async fn api_diff_list(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let targets = targets_to_strings(&body.targets);
+    if targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+        return serde_json::json!({ "error": "too many targets" }).into();
+    }
     let mut diffs = Vec::new();
 
     for target in &targets {
@@ -853,8 +1025,17 @@ pub async fn api_diff_list(
             }
         };
 
-        let novel_dir =
-            crate::db::existing_novel_dir_for_record(&archive_root, &record);
+        let novel_dir = match super::safe_existing_novel_dir(&archive_root, &record) {
+            Ok(dir) => dir,
+            Err(_) => {
+                diffs.push(serde_json::json!({
+                    "id": id,
+                    "title": record.title,
+                    "content": "Invalid novel storage path",
+                }));
+                continue;
+            }
+        };
         let diff_path = novel_dir.join("diff.txt");
 
         let content = if diff_path.exists() {
@@ -959,7 +1140,13 @@ pub async fn api_diff(
             });
         }
     };
-    let ids: Vec<String> = body
+    if body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+        return Json(ApiResponse {
+            success: false,
+            message: "too many ids".to_string(),
+        });
+    }
+    let ids: Vec<String> = match body
         .ids
         .iter()
         .map(|v| match v {
@@ -967,7 +1154,17 @@ pub async fn api_diff(
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         })
-        .collect();
+        .map(|target| super::validate_web_target_value(&target))
+        .collect()
+    {
+        Ok(ids) => ids,
+        Err(message) => {
+            return Json(ApiResponse {
+                success: false,
+                message,
+            });
+        }
+    };
 
     for id in &ids {
         let args = vec!["diff", "--no-tool", id, "--number", &diff_number];
@@ -1007,6 +1204,16 @@ pub async fn api_diff_clean(
         other => other.to_string(),
     };
 
+    let target = match super::validate_web_target_value(&target) {
+        Ok(target) => target,
+        Err(message) => {
+            return Json(ApiResponse {
+                success: false,
+                message,
+            });
+        }
+    };
+
     let args = vec!["diff", "--clean", &target];
     match run_immediate(&args) {
         Ok(output) => {
@@ -1035,6 +1242,14 @@ pub async fn api_csv_import(
     State(state): State<AppState>,
     Json(body): Json<CsvImportBody>,
 ) -> Json<ApiResponse> {
+    if let Err(message) =
+        super::validate_web_text_size(&body.csv, super::MAX_WEB_CSV_IMPORT_BYTES, "csv")
+    {
+        return Json(ApiResponse {
+            success: false,
+            message,
+        });
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
@@ -1299,13 +1514,46 @@ pub async fn api_update_by_tag(
     State(state): State<AppState>,
     Json(body): Json<UpdateByTagBody>,
 ) -> Json<serde_json::Value> {
-    let mut tag_params: Vec<String> = body
+    if body.tags.len() + body.exclusion_tags.len() > super::MAX_WEB_TAGS_PER_REQUEST {
+        return serde_json::json!({
+            "success": false,
+            "message": "too many tags",
+        })
+        .into();
+    }
+    let tags: Vec<String> = match body
         .tags
         .iter()
-        .map(|t| format!("tag:{}", t))
-        .collect();
+        .map(|tag| super::validate_web_tag_name(tag))
+        .collect()
+    {
+        Ok(tags) => tags,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+            })
+            .into();
+        }
+    };
+    let exclusion_tags: Vec<String> = match body
+        .exclusion_tags
+        .iter()
+        .map(|tag| super::validate_web_tag_name(tag))
+        .collect()
+    {
+        Ok(tags) => tags,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+            })
+            .into();
+        }
+    };
+    let mut tag_params: Vec<String> = tags.iter().map(|t| format!("tag:{}", t)).collect();
     tag_params.extend(
-        body.exclusion_tags
+        exclusion_tags
             .iter()
             .map(|t| format!("^tag:{}", t)),
     );
@@ -1328,19 +1576,19 @@ pub async fn api_update_by_tag(
             let mut include = false;
             let mut exclude = false;
 
-            for tag in &body.tags {
+            for tag in &tags {
                 if record_tags.contains(&tag.as_str()) {
                     include = true;
                 }
             }
-            for tag in &body.exclusion_tags {
+            for tag in &exclusion_tags {
                 if record_tags.contains(&tag.as_str()) {
                     exclude = true;
                 }
             }
 
             // Include if matches any inclusion tag and no exclusion tag
-            if (body.tags.is_empty() || include) && !exclude {
+            if (tags.is_empty() || include) && !exclude {
                 matching_ids.push(id);
             }
         }
@@ -1685,6 +1933,7 @@ mod tests {
                 .is_ok()
         );
         assert!(validate_download_targets(&["--remove".to_string()]).is_err());
+        assert!(validate_download_targets(&["1\t2".to_string()]).is_err());
     }
 
     #[test]
@@ -1762,6 +2011,12 @@ mod tests {
     }
 
     #[test]
+    fn normalize_update_targets_rejects_unexpected_flags() {
+        assert!(normalize_update_targets(&["--remove".to_string()]).is_err());
+        assert!(normalize_update_targets(&["bad\ttarget".to_string()]).is_err());
+    }
+
+    #[test]
     fn restorable_tasks_are_only_available_while_startup_prompt_is_pending() {
         let temp = tempfile::tempdir().unwrap();
         let queue = Arc::new(PersistentQueue::new(&temp.path().join("queue.yaml")).unwrap());
@@ -1771,6 +2026,7 @@ mod tests {
             ws_port: 0,
             push_server: Arc::new(crate::web::push::PushServer::new()),
             basic_auth_header: None,
+            control_token: "control-token".to_string(),
             queue,
             restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             running_jobs: Arc::new(Mutex::new(Vec::new())),

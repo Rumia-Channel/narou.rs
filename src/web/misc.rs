@@ -174,15 +174,17 @@ pub async fn tag_change_color(
     State(_state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
-    let tag = body["tag"].as_str().unwrap_or("");
+    let tag = match super::validate_web_tag_name(body["tag"].as_str().unwrap_or("")) {
+        Ok(tag) => tag,
+        Err(message) => {
+            return Json(ApiResponse {
+                success: false,
+                message,
+            });
+        }
+    };
     let color = body["color"].as_str().unwrap_or("");
 
-    if tag.is_empty() {
-        return Json(ApiResponse {
-            success: false,
-            message: "tag is required".to_string(),
-        });
-    }
     if !color.is_empty() && !super::tag_colors::is_valid_tag_color(color) {
         return Json(ApiResponse {
             success: false,
@@ -194,9 +196,9 @@ pub async fn tag_change_color(
         let inv = db.inventory();
         let mut colors = super::tag_colors::load_tag_colors(inv)?;
         if color.is_empty() {
-            colors.remove(tag);
+            colors.remove(&tag);
         } else {
-            colors.set(tag, color);
+            colors.set(&tag, color);
         }
         super::tag_colors::save_tag_colors(inv, &colors)?;
         Ok(())
@@ -236,6 +238,14 @@ pub async fn notepad_save(
         .as_str()
         .or_else(|| body["text"].as_str())
         .unwrap_or("");
+    if let Err(message) =
+        super::validate_web_text_size(content, super::MAX_WEB_TEXT_INPUT_BYTES, "notepad content")
+    {
+        return Json(ApiResponse {
+            success: false,
+            message,
+        });
+    }
     let result = std::fs::write(".narou/notepad.txt", content);
 
     match result {
@@ -257,7 +267,10 @@ pub async fn recent_logs(
     State(state): State<AppState>,
     Query(params): Query<LogsParams>,
 ) -> Json<serde_json::Value> {
-    let count = params.count.unwrap_or(100);
+    let count = params
+        .count
+        .unwrap_or(100)
+        .min(super::MAX_WEB_LOG_COUNT);
     let logs = state.push_server.recent_logs(count);
     Json(serde_json::json!({ "logs": logs }))
 }

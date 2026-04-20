@@ -39,10 +39,8 @@ pub async fn get_settings(
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     let novel_dir = with_database(|db| {
-        Ok(crate::db::existing_novel_dir_for_record(
-            db.archive_root(),
-            &record,
-        ))
+        super::safe_existing_novel_dir(db.archive_root(), &record)
+            .map_err(NarouError::Database)
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -77,10 +75,8 @@ pub async fn save_settings(
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     let novel_dir = with_database(|db| {
-        Ok(crate::db::existing_novel_dir_for_record(
-            db.archive_root(),
-            &record,
-        ))
+        super::safe_existing_novel_dir(db.archive_root(), &record)
+            .map_err(NarouError::Database)
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -322,6 +318,12 @@ fn save_replace_patterns(
     path: &FsPath,
     patterns: &[serde_json::Value],
 ) -> std::io::Result<()> {
+    if patterns.len() > super::MAX_WEB_TAGS_PER_REQUEST {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "too many replace patterns",
+        ));
+    }
     let mut lines = Vec::new();
     for pattern in patterns {
         let Some(left) = pattern.get("left").and_then(|v| v.as_str()) else {
@@ -331,11 +333,23 @@ fn save_replace_patterns(
         if left.is_empty() {
             continue;
         }
+        if left.len() > super::MAX_WEB_TAG_LENGTH {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "replace pattern is too long",
+            ));
+        }
         let right = pattern
             .get("right")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
+        if right.len() > super::MAX_WEB_TEXT_INPUT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "replace pattern replacement is too long",
+            ));
+        }
         lines.push(format!("{}\t{}", left, right));
     }
     std::fs::write(path, lines.join("\n"))
@@ -387,10 +401,12 @@ mod tests {
 
     #[test]
     fn replace_patterns_skip_blank_left_side() {
-        let dir = std::env::temp_dir().join(format!(
-            "narou-rs-replace-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-artifacts")
+            .join(format!("narou-rs-replace-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         save_replace_patterns(
             &dir.join("replace.txt"),
@@ -402,6 +418,23 @@ mod tests {
         .unwrap();
         let content = std::fs::read_to_string(dir.join("replace.txt")).unwrap();
         assert_eq!(content, "a\tb");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn replace_patterns_reject_too_many_entries() {
+        let patterns: Vec<serde_json::Value> = (0..=super::super::MAX_WEB_TAGS_PER_REQUEST)
+            .map(|index| serde_json::json!({"left": format!("k{}", index), "right": "v"}))
+            .collect();
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-artifacts")
+            .join(format!("narou-rs-replace-overflow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = save_replace_patterns(&dir.join("replace.txt"), &patterns).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

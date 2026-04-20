@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    http::{HeaderMap, header},
+    http::{HeaderMap, StatusCode, header},
     extract::State,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::{IntoResponse, Response},
@@ -43,6 +43,7 @@ pub struct PushServer {
     console_history: Mutex<Vec<(String, String)>>,
     max_history: usize,
     accepted_domains: Vec<String>,
+    allow_ip_literals: bool,
 }
 
 impl PushServer {
@@ -53,7 +54,8 @@ impl PushServer {
             next_client_id: Mutex::new(1),
             console_history: Mutex::new(Vec::new()),
             max_history: 10000,
-            accepted_domains: vec!["*".to_string()],
+            accepted_domains: vec!["127.0.0.1".to_string(), "localhost".to_string()],
+            allow_ip_literals: false,
         }
     }
 
@@ -83,12 +85,23 @@ impl PushServer {
         &self.accepted_domains
     }
 
+    pub fn set_allow_ip_literals(&mut self, allow: bool) {
+        self.allow_ip_literals = allow;
+    }
+
+    pub fn allow_ip_literals(&self) -> bool {
+        self.allow_ip_literals
+    }
+
     pub fn accepts_origin(&self, origin: &str) -> bool {
         let domain = origin_to_domain(origin);
+        if domain == "null" {
+            return false;
+        }
         self.accepted_domains.iter().any(|pattern| {
             pattern == "*"
                 || wildcard_match(&pattern.to_ascii_lowercase(), &domain.to_ascii_lowercase())
-        })
+        }) || (self.allow_ip_literals && domain.parse::<std::net::IpAddr>().is_ok())
     }
 
     pub fn client_count(&self) -> usize {
@@ -255,15 +268,40 @@ pub async fn ws_handler_with_app_state(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
+    if let Err(status) = validate_ws_request(&headers, &state) {
+        let body = if status == StatusCode::UNAUTHORIZED {
+            "Unauthorized"
+        } else {
+            "Forbidden"
+        };
+        let mut response = (status, body).into_response();
+        if status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Basic realm=\"narou.rs\""),
+            );
+        }
+        return response;
+    }
+    ws.on_upgrade(move |socket| handle_socket(socket, state.push_server))
+        .into_response()
+}
+
+fn validate_ws_request(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
+    if !super::request_host_allowed(headers, state, state.ws_port) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if !super::basic_auth_matches(headers, state.basic_auth_header.as_deref()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    if !state.push_server.accepts_origin(origin) {
-        return (axum::http::StatusCode::FORBIDDEN, "Forbidden").into_response();
+    if !state.push_server.accepts_origin(origin) || !super::origin_allowed(headers, state, state.port) {
+        return Err(StatusCode::FORBIDDEN);
     }
-    ws.on_upgrade(move |socket| handle_socket(socket, state.push_server))
-        .into_response()
+    Ok(())
 }
 
 async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>) {
@@ -361,6 +399,60 @@ mod tests {
         assert_eq!(origin_to_domain("null"), "null");
         assert_eq!(origin_to_domain("file://"), "null");
         assert_eq!(origin_to_domain("https://Example.com:8080/path"), "Example.com");
+    }
+
+    #[test]
+    fn accepts_origin_allows_ip_literals_only_when_enabled() {
+        let mut server = PushServer::new();
+        server.set_accepted_domains(["localhost"]);
+        assert!(!server.accepts_origin("http://192.168.1.10:4001"));
+        server.set_allow_ip_literals(true);
+        assert!(server.accepts_origin("http://192.168.1.10:4001"));
+    }
+
+    #[test]
+    fn ws_request_requires_basic_auth_and_valid_origin() {
+        let queue_dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-artifacts")
+            .join(format!("push-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&queue_dir);
+        std::fs::create_dir_all(&queue_dir).unwrap();
+
+        let mut push_server = PushServer::new();
+        push_server.set_accepted_domains(["localhost"]);
+        let state = AppState {
+            port: 4000,
+            ws_port: 4001,
+            push_server: Arc::new(push_server),
+            basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
+            control_token: "control-token".to_string(),
+            queue: Arc::new(
+                crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
+            ),
+            restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            auto_update_scheduler: Arc::new(parking_lot::Mutex::new(None)),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, header::HeaderValue::from_static("localhost:4001"));
+        headers.insert(header::ORIGIN, header::HeaderValue::from_static("http://localhost:4000"));
+        assert_eq!(validate_ws_request(&headers, &state), Err(StatusCode::UNAUTHORIZED));
+
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(validate_ws_request(&headers, &state), Ok(()));
+
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("http://evil.test:4000"),
+        );
+        assert_eq!(validate_ws_request(&headers, &state), Err(StatusCode::FORBIDDEN));
     }
 }
 

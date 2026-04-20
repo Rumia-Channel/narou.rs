@@ -10,19 +10,30 @@ use crate::error::NarouError;
 use super::AppState;
 use super::state::{ApiResponse, EditTagBody, IdPath, TagBody, TagsBody};
 
+fn validate_tags(tags: &[String]) -> Result<Vec<String>, String> {
+    if tags.len() > super::MAX_WEB_TAGS_PER_REQUEST {
+        return Err("too many tags".to_string());
+    }
+    tags.iter()
+        .map(|tag| super::validate_web_tag_name(tag))
+        .collect()
+}
+
 pub async fn add_tag(
     State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
     Json(body): Json<TagBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
+    let tag = super::validate_web_tag_name(&body.tag)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     with_database_mut(|db| {
         let record = db
             .get(id)
             .cloned()
             .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
         let mut updated = record;
-        if !updated.tags.contains(&body.tag) {
-            updated.tags.push(body.tag.clone());
+        if !updated.tags.contains(&tag) {
+            updated.tags.push(tag.clone());
         }
         {
             let inventory = db.inventory();
@@ -52,13 +63,15 @@ pub async fn remove_tag(
     Path(IdPath { id }): Path<IdPath>,
     Json(body): Json<TagBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
+    let tag = super::validate_web_tag_name(&body.tag)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     with_database_mut(|db| {
         let record = db
             .get(id)
             .cloned()
             .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
         let mut updated = record;
-        updated.tags.retain(|t| t != &body.tag);
+        updated.tags.retain(|t| t != &tag);
         db.insert(updated);
         db.save()
     })
@@ -78,13 +91,14 @@ pub async fn add_tags(
     Path(IdPath { id }): Path<IdPath>,
     Json(body): Json<TagsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
+    let tags = validate_tags(&body.tags).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     with_database_mut(|db| {
         let record = db
             .get(id)
             .cloned()
             .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
         let mut updated = record;
-        for tag in &body.tags {
+        for tag in &tags {
             if !updated.tags.contains(tag) {
                 updated.tags.push(tag.clone());
             }
@@ -118,13 +132,14 @@ pub async fn remove_tags(
     Path(IdPath { id }): Path<IdPath>,
     Json(body): Json<TagsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
+    let tags = validate_tags(&body.tags).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     with_database_mut(|db| {
         let record = db
             .get(id)
             .cloned()
             .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
         let mut updated = record;
-        updated.tags.retain(|t| !body.tags.contains(t));
+        updated.tags.retain(|t| !tags.contains(t));
         db.insert(updated);
         db.save()
     })
@@ -143,13 +158,14 @@ pub async fn update_tags(
     Path(IdPath { id }): Path<IdPath>,
     Json(body): Json<TagsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
+    let tags = validate_tags(&body.tags).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     with_database_mut(|db| {
         let record = db
             .get(id)
             .cloned()
             .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
         let mut updated = record;
-        updated.tags = body.tags;
+        updated.tags = tags;
         {
             let inventory = db.inventory();
             let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
@@ -179,6 +195,12 @@ pub async fn edit_tag(
     State(state): State<AppState>,
     Json(body): Json<EditTagBody>,
 ) -> Json<serde_json::Value> {
+    if body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+        return serde_json::json!({ "success": false, "error": "too many ids" }).into();
+    }
+    if body.states.len() > super::MAX_WEB_TAGS_PER_REQUEST {
+        return serde_json::json!({ "success": false, "error": "too many tags" }).into();
+    }
     let ids: Vec<i64> = body
         .ids
         .iter()
@@ -198,6 +220,12 @@ pub async fn edit_tag(
     let mut tags_to_delete: Vec<String> = Vec::new();
 
     for (tag, state_val) in &body.states {
+        let tag = match super::validate_web_tag_name(tag) {
+            Ok(tag) => tag,
+            Err(error) => {
+                return serde_json::json!({ "success": false, "error": error }).into();
+            }
+        };
         let s = match state_val {
             serde_json::Value::Number(n) => n.as_i64().unwrap_or(1),
             serde_json::Value::String(s) => s.parse::<i64>().unwrap_or(1),

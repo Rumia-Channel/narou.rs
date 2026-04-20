@@ -51,8 +51,14 @@ pub async fn api_list_post(
 fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (StatusCode, String)> {
     let draw = params.draw.unwrap_or(1);
     let start = params.start.unwrap_or(0);
-    let length = params.length.unwrap_or(50);
+    let length = params
+        .length
+        .unwrap_or(50)
+        .min(super::MAX_WEB_PAGE_LENGTH);
     let search = params.search_value.unwrap_or_default();
+    if search.len() > super::MAX_WEB_SEARCH_BYTES {
+        return Err((StatusCode::BAD_REQUEST, "search query is too long".to_string()));
+    }
     let order_col = params.order_column.unwrap_or(0);
     let order_dir = params.order_dir.unwrap_or_else(|| "asc".to_string());
     let frozen_ids = with_database(|db| load_frozen_ids_from_inventory(db.inventory())).unwrap_or_default();
@@ -249,10 +255,8 @@ pub async fn get_story(
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     let novel_dir = with_database(|db| {
-        Ok(crate::db::existing_novel_dir_for_record(
-            db.archive_root(),
-            &record,
-        ))
+        super::safe_existing_novel_dir(db.archive_root(), &record)
+            .map_err(NarouError::Database)
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -279,8 +283,8 @@ pub async fn remove_novel(
     let result = with_database_mut(|db| {
         if let Some(record) = db.remove(id) {
             if with_file {
-                let dir = crate::db::existing_novel_dir_for_record(db.archive_root(), &record);
-                let _ = std::fs::remove_dir_all(&dir);
+                super::remove_novel_storage_dir(db.archive_root(), &record)
+                    .map_err(NarouError::Database)?;
             }
             db.save()?;
             Ok::<String, NarouError>(record.title)
@@ -339,10 +343,8 @@ pub async fn author_comments(
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     let novel_dir = with_database(|db| {
-        Ok(crate::db::existing_novel_dir_for_record(
-            db.archive_root(),
-            &record,
-        ))
+        super::safe_existing_novel_dir(db.archive_root(), &record)
+            .map_err(NarouError::Database)
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -430,10 +432,8 @@ pub async fn download_ebook(
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     let novel_dir = with_database(|db| {
-        Ok(crate::db::existing_novel_dir_for_record(
-            db.archive_root(),
-            &record,
-        ))
+        super::safe_existing_novel_dir(db.archive_root(), &record)
+            .map_err(NarouError::Database)
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

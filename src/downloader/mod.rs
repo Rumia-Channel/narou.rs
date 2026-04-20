@@ -1683,18 +1683,12 @@ impl Downloader {
         file_title: &str,
         use_subdirectory: bool,
     ) -> PathBuf {
-        let mut dir = PathBuf::from(types::ARCHIVE_ROOT_DIR);
-        dir.push(sitename);
-
-        if use_subdirectory {
-            let subdirectory = crate::db::create_subdirectory_name(file_title);
-            if !subdirectory.is_empty() {
-                dir.push(subdirectory);
-            }
-        }
-
-        dir.push(file_title);
-        dir
+        crate::db::paths::novel_dir_from_components(
+            Path::new(types::ARCHIVE_ROOT_DIR),
+            sitename,
+            file_title,
+            use_subdirectory,
+        )
     }
 
     fn download_use_subdirectory(&self, existing_id: Option<i64>) -> bool {

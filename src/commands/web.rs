@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use narou_rs::db::inventory::{Inventory, InventoryScope};
 use serde_yaml::{Number, Value};
+use sha2::Digest;
 use tracing::info;
 
 #[derive(Debug, Clone)]
@@ -51,6 +52,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
         }
     };
     push_server.set_accepted_domains(domains);
+    push_server.set_allow_ip_literals(is_wildcard_bind_host(&address.host));
     let push_server = Arc::new(push_server);
     let basic_auth_header = match load_basic_auth_header() {
         Ok(header) => header,
@@ -59,6 +61,13 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
             std::process::exit(1);
         }
     };
+    if requires_basic_auth_for_bind(&address.host) && basic_auth_header.is_none() {
+        eprintln!(
+            "Error: server-bind が外部公開設定のため、server-basic-auth を有効にして user/password を設定して下さい"
+        );
+        std::process::exit(1);
+    }
+    let control_token = generate_control_token();
     let root_dir = match Inventory::with_default_root() {
         Ok(inventory) => inventory.root_dir().to_path_buf(),
         Err(e) => {
@@ -82,6 +91,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
         ws_port: address.ws_port,
         push_server: push_server.clone(),
         basic_auth_header,
+        control_token: control_token.clone(),
         queue: queue.clone(),
         restore_prompt_pending: restore_prompt_pending.clone(),
         running_jobs: running_jobs.clone(),
@@ -111,7 +121,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
         bind_or_shutdown_and_retry(ws_addr, &address.host, address.ws_port, "WebSocket").await;
 
     // Write PID file for restart recovery
-    write_pid_file();
+    write_pid_file(&control_token);
 
     let worker_tasks = web::worker::start_queue_workers(
         root_dir.clone(),
@@ -286,9 +296,9 @@ fn pid_file_path() -> Option<std::path::PathBuf> {
     Some(std::env::current_dir().ok()?.join(".narou").join("server.pid"))
 }
 
-fn write_pid_file() {
+fn write_pid_file(control_token: &str) {
     if let Some(path) = pid_file_path() {
-        let _ = std::fs::write(&path, std::process::id().to_string());
+        let _ = std::fs::write(&path, format!("{} {}", std::process::id(), control_token));
     }
 }
 
@@ -298,10 +308,13 @@ fn remove_pid_file() {
     }
 }
 
-fn read_pid_file() -> Option<u32> {
+fn read_pid_file() -> Option<(u32, Option<String>)> {
     let path = pid_file_path()?;
     let content = std::fs::read_to_string(&path).ok()?;
-    content.trim().parse().ok()
+    let mut parts = content.split_whitespace();
+    let pid = parts.next()?.trim().parse().ok()?;
+    let token = parts.next().map(ToString::to_string);
+    Some((pid, token))
 }
 
 // --- Shutdown strategies ---
@@ -313,6 +326,7 @@ fn try_shutdown_via_http(host: &str, port: u16) {
     use std::net::TcpStream;
 
     let display = if host == "127.0.0.1" { "localhost" } else { host };
+    let control_token = read_pid_file().and_then(|(_, token)| token);
     let addr: SocketAddr = match format!("{}:{}", host, port).parse() {
         Ok(a) => a,
         Err(_) => return,
@@ -327,14 +341,21 @@ fn try_shutdown_via_http(host: &str, port: u16) {
         port
     );
 
+    let control_header = control_token
+        .as_deref()
+        .map(|token| format!("{}: {}\r\n", narou_rs::web::INTERNAL_CONTROL_HEADER, token))
+        .unwrap_or_default();
     let request = format!(
         "POST /api/shutdown HTTP/1.1\r\n\
          Host: {}:{}\r\n\
          Content-Type: application/json\r\n\
+         {}\
          Content-Length: 2\r\n\
          Connection: close\r\n\r\n\
          {{}}",
-        display, port
+        display,
+        port,
+        control_header
     );
     if stream.write_all(request.as_bytes()).is_err() {
         return;
@@ -356,7 +377,7 @@ fn try_shutdown_via_http(host: &str, port: u16) {
 
 /// Best-effort kill of the old server process via PID file.
 fn try_kill_via_pid_file(port: u16) {
-    let Some(pid) = read_pid_file() else {
+    let Some((pid, _)) = read_pid_file() else {
         return;
     };
 
@@ -418,20 +439,31 @@ fn load_basic_auth_header() -> Result<Option<String>, String> {
     Ok(Some(format!("Basic {}", token)))
 }
 
+fn is_wildcard_bind_host(host: &str) -> bool {
+    matches!(host, "0.0.0.0" | "::")
+}
+
+fn requires_basic_auth_for_bind(host: &str) -> bool {
+    !matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+fn default_ws_accepted_domains(host: &str) -> Vec<String> {
+    match host {
+        "0.0.0.0" | "::" => {
+            vec!["127.0.0.1".to_string(), "localhost".to_string(), "::1".to_string()]
+        }
+        "127.0.0.1" => vec!["127.0.0.1".to_string(), "localhost".to_string()],
+        value if !value.trim().is_empty() => vec![value.trim().to_string()],
+        _ => vec!["127.0.0.1".to_string(), "localhost".to_string()],
+    }
+}
+
 fn load_ws_accepted_domains(host: &str) -> Result<Vec<String>, String> {
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
     let global_setting: HashMap<String, Value> = inventory
         .load("global_setting", InventoryScope::Global)
         .unwrap_or_default();
-    let mut accepted_domains = match host {
-        "0.0.0.0" => vec!["*".to_string()],
-        "127.0.0.1" => vec!["127.0.0.1".to_string(), "localhost".to_string()],
-        value if !value.trim().is_empty() => vec![value.trim().to_string()],
-        _ => vec!["127.0.0.1".to_string(), "localhost".to_string()],
-    };
-    if accepted_domains.first().is_some_and(|domain| domain == "*") {
-        return Ok(accepted_domains);
-    }
+    let mut accepted_domains = default_ws_accepted_domains(host);
     if let Some(extra) = yaml_string(global_setting.get("server-ws-add-accepted-domains")) {
         accepted_domains.extend(
             extra
@@ -442,6 +474,17 @@ fn load_ws_accepted_domains(host: &str) -> Result<Vec<String>, String> {
         );
     }
     Ok(accepted_domains)
+}
+
+fn generate_control_token() -> String {
+    let seed = format!(
+        "{}:{}:{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        std::thread::current().name().unwrap_or("main")
+    );
+    let digest = sha2::Sha256::digest(seed.as_bytes());
+    hex::encode(&digest[..16])
 }
 
 fn confirm_first_web_boot(no_browser: bool) -> Result<bool, String> {
@@ -568,7 +611,10 @@ fn encode_base64(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_host, encode_base64, normalize_bind_host};
+    use super::{
+        default_ws_accepted_domains, display_host, encode_base64, generate_control_token,
+        is_wildcard_bind_host, normalize_bind_host, requires_basic_auth_for_bind,
+    };
 
     #[test]
     fn normalize_bind_host_defaults_to_loopback() {
@@ -589,5 +635,24 @@ mod tests {
     fn encode_base64_matches_basic_examples() {
         assert_eq!(encode_base64(b"user:pass"), "dXNlcjpwYXNz");
         assert_eq!(encode_base64(b"ab"), "YWI=");
+    }
+
+    #[test]
+    fn wildcard_bind_hosts_require_explicit_auth() {
+        assert!(is_wildcard_bind_host("0.0.0.0"));
+        assert!(requires_basic_auth_for_bind("0.0.0.0"));
+        assert!(!requires_basic_auth_for_bind("127.0.0.1"));
+    }
+
+    #[test]
+    fn control_token_generation_is_non_empty() {
+        assert!(!generate_control_token().is_empty());
+    }
+
+    #[test]
+    fn wildcard_bind_defaults_do_not_accept_arbitrary_ws_domains() {
+        let domains = default_ws_accepted_domains("0.0.0.0");
+        assert!(domains.contains(&"127.0.0.1".to_string()));
+        assert!(!domains.iter().any(|domain| domain == "*"));
     }
 }
