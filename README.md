@@ -139,6 +139,7 @@ narou_rs convert .\input.txt --enc shift_jis
 ```powershell
 narou_rs web
 narou_rs web --port 8888 --no-browser
+narou_rs web --hide-console
 ```
 
 ## グローバルオプション
@@ -165,6 +166,7 @@ narou_rs web --port 8888 --no-browser
 - 変換結果は青空文庫向け整形を基準にし、設定や device 指定に応じて追加出力を行います。
 - `update` は `general_lastup`、差分 cache、strong update、freeze などの挙動を持ちます。
 - `web` は localhost 利用を基本にしています。非 loopback で公開する場合は認証設定を行ってください。
+- Windows では `narou_rs web --hide-console` でコンソールを出さずに起動し、タスクトレイから `終了` / `再起動` を選べます。
 
 ## 注意点
 

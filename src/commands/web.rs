@@ -10,6 +10,10 @@ use serde_yaml::{Number, Value};
 use sha2::Digest;
 use tracing::info;
 
+#[cfg(windows)]
+#[path = "web_tray.rs"]
+mod web_tray;
+
 #[derive(Debug, Clone)]
 struct WebAddress {
     host: String,
@@ -17,8 +21,13 @@ struct WebAddress {
     ws_port: u16,
 }
 
-pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
+pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: bool) {
     use narou_rs::web;
+
+    #[cfg(not(windows))]
+    if hide_console {
+        eprintln!("warning: --hide-console は現在 Windows のみ対応です。通常モードで起動します。");
+    }
 
     if let Err(e) = narou_rs::db::init_database() {
         eprintln!("Error initializing database: {}", e);
@@ -36,7 +45,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
             std::process::exit(1);
         }
     };
-    let _ = confirm_first_web_boot(no_browser);
+    let _ = confirm_first_web_boot(no_browser, hide_console);
 
     info!(
         "Starting narou.rs web server on {}:{} (ws:{})",
@@ -75,13 +84,14 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
             std::process::exit(1);
         }
     };
-    let queue = match narou_rs::queue::PersistentQueue::new(&root_dir.join(".narou").join("queue.yaml")) {
-        Ok(queue) => Arc::new(queue),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let queue =
+        match narou_rs::queue::PersistentQueue::new(&root_dir.join(".narou").join("queue.yaml")) {
+            Ok(queue) => Arc::new(queue),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
     let restore_prompt_pending = Arc::new(AtomicBool::new(queue.pending_count() > 0));
     let running_jobs = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let running_child_pids = Arc::new(parking_lot::Mutex::new(HashMap::new()));
@@ -108,9 +118,11 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
         .parse()
         .unwrap();
     let url = format!("http://{}:{}/", display_host(&address.host), address.port);
-    println!("{}", url);
-    println!("サーバを止めるには Ctrl+C を入力");
-    println!();
+    if !hide_console {
+        println!("{}", url);
+        println!("サーバを止めるには {}", web_stop_hint(hide_console));
+        println!();
+    }
 
     if !no_browser {
         let _ = open::that(&url);
@@ -122,6 +134,15 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
 
     // Write PID file for restart recovery
     write_pid_file(&control_token);
+
+    #[cfg(windows)]
+    if hide_console {
+        web_tray::spawn_web_tray(
+            control_request_host(&address.host).to_string(),
+            address.port,
+            control_token.clone(),
+        );
+    }
 
     let worker_tasks = web::worker::start_queue_workers(
         root_dir.clone(),
@@ -142,13 +163,22 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool) {
     {
         use narou_rs::termcolor::colored;
         let ver = narou_rs::version::create_version_string();
-        push_server.broadcast_echo(&colored(&format!("Narou.rs version {}", ver), "white"), "stdout");
+        push_server.broadcast_echo(
+            &colored(&format!("Narou.rs version {}", ver), "white"),
+            "stdout",
+        );
 
         if let Ok(queue) = narou_rs::queue::PersistentQueue::with_default() {
             let count = queue.pending_count();
             if count > 0 {
                 push_server.broadcast_echo(
-                    &colored(&format!("前回未完了のタスクが{}件見つかりました。WEB UI から再開できます。", count), "yellow"),
+                    &colored(
+                        &format!(
+                            "前回未完了のタスクが{}件見つかりました。WEB UI から再開できます。",
+                            count
+                        ),
+                        "yellow",
+                    ),
                     "stdout",
                 );
             }
@@ -279,7 +309,11 @@ async fn bind_or_shutdown_and_retry(
 fn create_reusable_listener(addr: SocketAddr) -> io::Result<tokio::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
 
-    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
@@ -293,7 +327,12 @@ fn create_reusable_listener(addr: SocketAddr) -> io::Result<tokio::net::TcpListe
 // --- PID file management ---
 
 fn pid_file_path() -> Option<std::path::PathBuf> {
-    Some(std::env::current_dir().ok()?.join(".narou").join("server.pid"))
+    Some(
+        std::env::current_dir()
+            .ok()?
+            .join(".narou")
+            .join("server.pid"),
+    )
 }
 
 fn write_pid_file(control_token: &str) {
@@ -322,57 +361,85 @@ fn read_pid_file() -> Option<(u32, Option<String>)> {
 /// Best-effort HTTP shutdown of a running narou server.
 /// May fail if the server is in graceful-shutdown mode (Ctrl+C already pressed).
 fn try_shutdown_via_http(host: &str, port: u16) {
-    use std::io::{Read, Write};
     use std::net::TcpStream;
 
-    let display = if host == "127.0.0.1" { "localhost" } else { host };
+    let request_host = control_request_host(host);
     let control_token = read_pid_file().and_then(|(_, token)| token);
-    let addr: SocketAddr = match format!("{}:{}", host, port).parse() {
-        Ok(a) => a,
-        Err(_) => return,
-    };
-
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
-        return;
-    };
 
     eprintln!(
         "ポート {} で稼働中のサーバへシャットダウンを要求しています...",
         port
     );
 
-    let control_header = control_token
-        .as_deref()
-        .map(|token| format!("{}: {}\r\n", narou_rs::web::INTERNAL_CONTROL_HEADER, token))
-        .unwrap_or_default();
-    let request = format!(
-        "POST /api/shutdown HTTP/1.1\r\n\
-         Host: {}:{}\r\n\
-         Content-Type: application/json\r\n\
-         {}\
-         Content-Length: 2\r\n\
-         Connection: close\r\n\r\n\
-         {{}}",
-        display,
-        port,
-        control_header
-    );
-    if stream.write_all(request.as_bytes()).is_err() {
+    if !send_control_request(host, port, control_token.as_deref(), "/api/shutdown") {
         return;
     }
 
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let mut buf = [0u8; 512];
-    let _ = stream.read(&mut buf);
-    drop(stream);
-
     // Brief wait for the old server to exit
+    let addr: SocketAddr = match format!("{}:{}", request_host, port).parse() {
+        Ok(a) => a,
+        Err(_) => return,
+    };
     for _ in 0..8 {
         std::thread::sleep(Duration::from_millis(250));
         if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_err() {
             return;
         }
     }
+}
+
+fn control_request_host(host: &str) -> &str {
+    match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        _ => host,
+    }
+}
+
+pub(crate) fn send_control_request(
+    host: &str,
+    port: u16,
+    control_token: Option<&str>,
+    endpoint: &str,
+) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let request_host = control_request_host(host);
+    let display = if request_host == "127.0.0.1" {
+        "localhost"
+    } else {
+        request_host
+    };
+    let addr: SocketAddr = match format!("{}:{}", request_host, port).parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+        return false;
+    };
+
+    let control_header = control_token
+        .map(|token| format!("{}: {}\r\n", narou_rs::web::INTERNAL_CONTROL_HEADER, token))
+        .unwrap_or_default();
+    let request = format!(
+        "POST {} HTTP/1.1\r\n\
+         Host: {}:{}\r\n\
+         Content-Type: application/json\r\n\
+         {}\
+         Content-Length: 2\r\n\
+         Connection: close\r\n\r\n\
+         {{}}",
+        endpoint, display, port, control_header
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut buf = [0u8; 512];
+    let _ = stream.read(&mut buf);
+    true
 }
 
 /// Best-effort kill of the old server process via PID file.
@@ -450,7 +517,11 @@ fn requires_basic_auth_for_bind(host: &str) -> bool {
 fn default_ws_accepted_domains(host: &str) -> Vec<String> {
     match host {
         "0.0.0.0" | "::" => {
-            vec!["127.0.0.1".to_string(), "localhost".to_string(), "::1".to_string()]
+            vec![
+                "127.0.0.1".to_string(),
+                "localhost".to_string(),
+                "::1".to_string(),
+            ]
         }
         "127.0.0.1" => vec!["127.0.0.1".to_string(), "localhost".to_string()],
         value if !value.trim().is_empty() => vec![value.trim().to_string()],
@@ -487,7 +558,7 @@ fn generate_control_token() -> String {
     hex::encode(&digest[..16])
 }
 
-fn confirm_first_web_boot(no_browser: bool) -> Result<bool, String> {
+fn confirm_first_web_boot(no_browser: bool, hide_console: bool) -> Result<bool, String> {
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
     let mut server_setting: HashMap<String, Value> = inventory
         .load("server_setting", InventoryScope::Global)
@@ -500,7 +571,10 @@ fn confirm_first_web_boot(no_browser: bool) -> Result<bool, String> {
     println!(
         "初めてサーバを起動します。ファイアウォールのアクセス許可を尋ねられた場合、許可をして下さい。"
     );
-    println!("また、起動したサーバを止めるにはコンソール上で Ctrl+C を入力して下さい。");
+    println!(
+        "また、起動したサーバを止めるには {}。",
+        web_stop_hint(hide_console)
+    );
     println!();
     if io::stdin().is_terminal() {
         if no_browser {
@@ -553,6 +627,15 @@ fn display_host(host: &str) -> &str {
     } else {
         host
     }
+}
+
+fn web_stop_hint(hide_console: bool) -> &'static str {
+    #[cfg(windows)]
+    if hide_console {
+        return "タスクトレイのアイコンを右クリックして「終了」または「再起動」を選んで下さい";
+    }
+
+    "コンソール上で Ctrl+C を入力して下さい"
 }
 
 fn yaml_string(value: Option<&Value>) -> Option<String> {
@@ -612,8 +695,9 @@ fn encode_base64(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_ws_accepted_domains, display_host, encode_base64, generate_control_token,
-        is_wildcard_bind_host, normalize_bind_host, requires_basic_auth_for_bind,
+        control_request_host, default_ws_accepted_domains, display_host, encode_base64,
+        generate_control_token, is_wildcard_bind_host, normalize_bind_host,
+        requires_basic_auth_for_bind,
     };
 
     #[test]
@@ -654,5 +738,12 @@ mod tests {
         let domains = default_ws_accepted_domains("0.0.0.0");
         assert!(domains.contains(&"127.0.0.1".to_string()));
         assert!(!domains.iter().any(|domain| domain == "*"));
+    }
+
+    #[test]
+    fn wildcard_bind_control_requests_use_loopback() {
+        assert_eq!(control_request_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(control_request_host("::"), "::1");
+        assert_eq!(control_request_host("127.0.0.1"), "127.0.0.1");
     }
 }

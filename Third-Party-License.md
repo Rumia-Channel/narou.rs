@@ -79,10 +79,12 @@ the time of this audit.
 | tokio | ^1 | MIT |
 | tokio-stream | ^0.1 | MIT |
 | tower-http | ^0.6 | MIT |
+| tray-icon | ^0.22.0 | MIT OR Apache-2.0 |
 | tracing | ^0.1 | MIT |
 | tracing-subscriber | ^0.3 | MIT |
 | ua_generator | ^0.5 | MIT |
 | unicode-normalization | ^0.1 | MIT OR Apache-2.0 |
+| windows-sys | ^0.61.2 | MIT OR Apache-2.0 |
 | zip | ^8.5 | MIT |
 
 

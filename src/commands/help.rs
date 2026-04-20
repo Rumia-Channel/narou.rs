@@ -564,10 +564,12 @@ const WEB_HELP: CmdHelp = CmdHelp {
     (以降同じ設定を引き継ぎます)
   ・サーバ起動後にブラウザを立ち上げます
   ・サーバの停止はコンソールで Ctrl+C を入力します
+  ・Windows では --hide-console でコンソールを出さずにタスクトレイ常駐できます
 
   Examples:
     narou web   # サーバ起動(ポートはランダム。ポート設定保存)
     narou web -p 4567   # ポート4567で起動(保存はされない)
+    narou web --hide-console   # Windows のタスクトレイに常駐
 
     # 先に決めておく
     narou s server-port=8000
@@ -579,6 +581,12 @@ const WEB_HELP: CmdHelp = CmdHelp {
             "--no-browser",
             None,
             "起動時にブラウザは開かない",
+        ),
+        opt(
+            None,
+            "--hide-console",
+            None,
+            "Windows でコンソールを隠し、タスクトレイ常駐で起動",
         ),
     ],
 };

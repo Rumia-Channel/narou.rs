@@ -575,6 +575,19 @@ mod tests {
 
         assert_eq!(args, vec!["convert", "--make-zip", "1"]);
     }
+
+    #[test]
+    fn web_hide_console_flag_is_parsed() {
+        let cli = Cli::try_parse_from(["narou", "web", "--hide-console", "--no-browser"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Web {
+                no_browser: true,
+                hide_console: true,
+                ..
+            }
+        ));
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -599,6 +612,8 @@ pub enum Commands {
         port: Option<u16>,
         #[arg(short, long, default_value_t = false)]
         no_browser: bool,
+        #[arg(long, default_value_t = false)]
+        hide_console: bool,
     },
     Download {
         targets: Vec<String>,

@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 #[macro_use]
 mod output_macros;
 mod backtracer;
@@ -15,8 +17,49 @@ use futures::FutureExt;
 
 use cli::{Cli, Commands};
 
+#[cfg(windows)]
+fn prepare_windows_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole};
+
+    if raw_hide_console_requested() {
+        return;
+    }
+
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            let _ = AllocConsole();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn prepare_windows_console() {}
+
+#[cfg(windows)]
+fn raw_hide_console_requested() -> bool {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--no-color" | "--multiple" | "--time" | "--backtrace" => {}
+            "--user-agent" => {
+                let _ = args.next();
+            }
+            value if value.starts_with("--user-agent=") => {}
+            "-h" | "--help" | "-v" | "--version" => return false,
+            value if value.starts_with('-') => {}
+            command => {
+                let is_web = matches!(command.to_ascii_lowercase().as_str(), "web" | "w" | "we");
+                return is_web && args.any(|value| value == "--hide-console");
+            }
+        }
+    }
+    false
+}
+
 #[tokio::main]
 async fn main() {
+    prepare_windows_console();
+
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
     let global_flags = cli::preprocess_args(&mut args);
@@ -113,8 +156,12 @@ async fn run_command(
     logger::use_convert_log_postfix(matches!(&cli.command, Commands::Convert { .. }));
 
     match cli.command {
-        Commands::Web { port, no_browser } => {
-            commands::web::run_web_server(port, no_browser).await;
+        Commands::Web {
+            port,
+            no_browser,
+            hide_console,
+        } => {
+            commands::web::run_web_server(port, no_browser, hide_console).await;
             0
         }
         other => run_sync_command(other, trace_args, ua, backtrace),
