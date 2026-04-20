@@ -24,7 +24,6 @@ const PROTECTED_KEYS: &[&str] = &[
 #[derive(Debug)]
 struct CacheEntry {
     data: String,
-    access_order: usize,
 }
 
 pub struct Inventory {
@@ -34,7 +33,6 @@ pub struct Inventory {
 
 struct InventoryCache {
     entries: HashMap<String, CacheEntry>,
-    access_counter: usize,
     access_order: Vec<String>,
 }
 
@@ -42,22 +40,27 @@ impl InventoryCache {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
-            access_counter: 0,
             access_order: Vec::new(),
         }
     }
 
     fn touch(&mut self, name: &str) {
-        if let Some(entry) = self.entries.get_mut(name) {
-            entry.access_order = self.access_counter;
-            self.access_counter += 1;
+        if self.entries.contains_key(name) {
             self.access_order.retain(|k| k != name);
             self.access_order.push(name.to_string());
         }
     }
 
+    fn remember(&mut self, name: &str, data: String) {
+        if !self.entries.contains_key(name) && self.entries.len() >= CACHE_MAX_SIZE {
+            self.evict_if_needed();
+        }
+        self.entries.insert(name.to_string(), CacheEntry { data });
+        self.touch(name);
+    }
+
     fn evict_if_needed(&mut self) {
-        if self.entries.len() > CACHE_MAX_SIZE {
+        if self.entries.len() >= CACHE_MAX_SIZE {
             while self.entries.len() > CACHE_TARGET_SIZE {
                 if let Some(evict_key) = self.access_order.first() {
                     if PROTECTED_KEYS.contains(&evict_key.as_str()) {
@@ -103,11 +106,24 @@ impl Inventory {
     }
 
     pub fn load_raw(&self, name: &str, scope: InventoryScope) -> Result<String> {
-        let path = self.inventory_path(name, scope);
-        if !path.exists() {
-            return Ok(String::new());
+        {
+            let mut cache = self.cache.lock();
+            if let Some(entry) = cache.entries.get(name) {
+                let data = entry.data.clone();
+                cache.touch(name);
+                return Ok(data);
+            }
         }
-        Ok(fs::read_to_string(&path)?)
+
+        let path = self.inventory_path(name, scope);
+        let content = if path.exists() {
+            fs::read_to_string(&path)?
+        } else {
+            String::new()
+        };
+
+        self.cache.lock().remember(name, content.clone());
+        Ok(content)
     }
 
     pub fn save_raw(&self, name: &str, scope: InventoryScope, content: &str) -> Result<()> {
@@ -115,7 +131,9 @@ impl Inventory {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        atomic_write(&path, content)
+        atomic_write(&path, content)?;
+        self.cache.lock().remember(name, content.to_string());
+        Ok(())
     }
 
     pub fn load<T: DeserializeOwned>(&self, name: &str, scope: InventoryScope) -> Result<T> {
@@ -136,7 +154,6 @@ impl Inventory {
         let mut cache = self.cache.lock();
         cache.entries.clear();
         cache.access_order.clear();
-        cache.access_counter = 0;
     }
 
     pub fn unload(&self, name: &str) {
@@ -225,4 +242,64 @@ fn dirs_home() -> PathBuf {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/"))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CACHE_MAX_SIZE, CACHE_TARGET_SIZE, Inventory, InventoryScope};
+
+    #[test]
+    fn load_raw_uses_cache_until_unload() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let narou_dir = root.join(".narou");
+        std::fs::create_dir_all(&narou_dir).unwrap();
+        let path = narou_dir.join("local_setting.yaml");
+        std::fs::write(&path, "foo: 1\n").unwrap();
+
+        let inventory = Inventory::new(root);
+        assert_eq!(
+            inventory
+                .load_raw("local_setting", InventoryScope::Local)
+                .unwrap(),
+            "foo: 1\n"
+        );
+
+        std::fs::write(&path, "foo: 2\n").unwrap();
+        assert_eq!(
+            inventory
+                .load_raw("local_setting", InventoryScope::Local)
+                .unwrap(),
+            "foo: 1\n"
+        );
+
+        inventory.unload("local_setting");
+        assert_eq!(
+            inventory
+                .load_raw("local_setting", InventoryScope::Local)
+                .unwrap(),
+            "foo: 2\n"
+        );
+    }
+
+    #[test]
+    fn eviction_keeps_protected_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".narou")).unwrap();
+        let inventory = Inventory::new(root);
+
+        inventory
+            .load_raw("local_setting", InventoryScope::Local)
+            .unwrap();
+        for index in 0..CACHE_MAX_SIZE {
+            inventory
+                .load_raw(&format!("cache-{index}"), InventoryScope::Local)
+                .unwrap();
+        }
+
+        let cache = inventory.cache.lock();
+        assert_eq!(cache.entries.len(), CACHE_TARGET_SIZE + 1);
+        assert!(cache.entries.contains_key("local_setting"));
+    }
 }

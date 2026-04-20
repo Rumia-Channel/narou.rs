@@ -16,15 +16,6 @@ macro_rules! println {
     }};
 }
 
-macro_rules! eprint {
-    () => {{
-        $crate::logger::emit_stderr("", false);
-    }};
-    ($($arg:tt)*) => {{
-        $crate::logger::emit_stderr(&format!("{}", format_args!($($arg)*)), false);
-    }};
-}
-
 macro_rules! eprintln {
     () => {{
         $crate::logger::emit_stderr("", true);

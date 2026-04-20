@@ -12,20 +12,25 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use settings::NovelSettings;
 use user_converter::UserConverter;
 
 use crate::downloader::{SectionElement, SectionFile, TocObject};
+use crate::db::inventory::InventoryScope;
 use crate::error::{NarouError, Result};
 use crate::progress::ProgressReporter;
 use crate::termcolor::bold_colored;
 
+const SECTION_CONVERT_CACHE_NAME: &str = "section_convert_cache";
+
 pub struct NovelConverter {
     settings: NovelSettings,
     user_converter: Option<UserConverter>,
-    section_cache: HashMap<String, CacheEntry>,
+    section_cache: HashMap<String, render::ConvertedSection>,
+    section_convert_cache: HashMap<String, HashMap<String, CacheEntry>>,
     cache_dirty: bool,
     progress: Option<Box<dyn ProgressReporter>>,
     inspector: Rc<RefCell<inspector::Inspector>>,
@@ -33,6 +38,7 @@ pub struct NovelConverter {
     last_inspection_output: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct CacheEntry {
     digest: String,
     converted_section: render::ConvertedSection,
@@ -45,6 +51,7 @@ impl NovelConverter {
             settings,
             user_converter: None,
             section_cache: HashMap::new(),
+            section_convert_cache: load_section_convert_cache(),
             cache_dirty: false,
             progress: None,
             inspector,
@@ -59,6 +66,7 @@ impl NovelConverter {
             settings,
             user_converter: Some(user_converter),
             section_cache: HashMap::new(),
+            section_convert_cache: load_section_convert_cache(),
             cache_dirty: false,
             progress: None,
             inspector,
@@ -80,6 +88,15 @@ impl NovelConverter {
     }
 
     pub fn convert_novel(&mut self, toc: &TocObject, sections: &[SectionFile]) -> Result<String> {
+        self.convert_novel_with_id(None, toc, sections)
+    }
+
+    fn convert_novel_with_id(
+        &mut self,
+        novel_id: Option<i64>,
+        toc: &TocObject,
+        sections: &[SectionFile],
+    ) -> Result<String> {
         let mut erased_intro_count = 0usize;
         let mut erased_post_count = 0usize;
         let mut converted_story = String::new();
@@ -128,10 +145,19 @@ impl NovelConverter {
             } else {
                 section.element.clone()
             };
-            let digest = self.compute_digest(&resolved_element, i);
+            let digest = self.compute_digest(&resolved_element, &section.index);
 
             if let Some(cached) = self.section_cache.get(&digest) {
-                converted_sections.push(cached.converted_section.clone());
+                converted_sections.push(cached.clone());
+                if let Some(ref p) = self.progress {
+                    p.inc(1);
+                }
+                continue;
+            }
+
+            if let Some(cached) = self.fetch_cached_section(novel_id, &section.index, &digest) {
+                self.section_cache.insert(digest.clone(), cached.clone());
+                converted_sections.push(cached);
                 if let Some(ref p) = self.progress {
                     p.inc(1);
                 }
@@ -227,14 +253,8 @@ impl NovelConverter {
                 postscript: conv_post,
             };
 
-            self.section_cache.insert(
-                digest.clone(),
-                CacheEntry {
-                    digest,
-                    converted_section: cs.clone(),
-                },
-            );
-            self.cache_dirty = true;
+            self.section_cache.insert(digest.clone(), cs.clone());
+            self.store_cached_section(novel_id, &section.index, &digest, &cs);
 
             converted_sections.push(cs);
             if let Some(ref p) = self.progress {
@@ -305,13 +325,13 @@ impl NovelConverter {
         }
     }
 
-    fn compute_digest(&self, section: &SectionElement, index: usize) -> String {
+    fn compute_digest(&self, section: &SectionElement, section_index: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(section.body.as_bytes());
         hasher.update(section.introduction.as_bytes());
         hasher.update(section.postscript.as_bytes());
         hasher.update(section.data_type.as_bytes());
-        hasher.update(index.to_le_bytes());
+        hasher.update(section_index.as_bytes());
         hasher.update(self.compute_settings_signature().as_bytes());
         if let Some(ref uc) = self.user_converter {
             hasher.update(uc.signature().as_bytes());
@@ -482,7 +502,6 @@ impl NovelConverter {
 
     pub fn clear_cache(&mut self) {
         self.section_cache.clear();
-        self.cache_dirty = false;
     }
 
     pub fn convert_text_file(&mut self, text: &str) -> Result<String> {
@@ -553,7 +572,8 @@ impl NovelConverter {
 
         let sections = load_sections_from_dir(novel_dir, &toc_object.subtitles)?;
 
-        let aozora_text = self.convert_novel(&toc_object, &sections)?;
+        let aozora_text = self.convert_novel_with_id(Some(id), &toc_object, &sections)?;
+        self.flush_section_convert_cache()?;
         let txt_path = output::create_output_text_path(&self.settings, id, novel_dir, &toc_object);
         std::fs::write(&txt_path, &aozora_text)?;
         save_latest_convert(id)?;
@@ -592,7 +612,8 @@ impl NovelConverter {
 
         let sections = load_sections_from_dir(novel_dir, &toc_object.subtitles)?;
 
-        let aozora_text = self.convert_novel(&toc_object, &sections)?;
+        let aozora_text = self.convert_novel_with_id(Some(_id), &toc_object, &sections)?;
+        self.flush_section_convert_cache()?;
         let txt_path = output::create_output_text_path(&self.settings, _id, novel_dir, &toc_object);
         std::fs::write(&txt_path, &aozora_text)?;
         save_latest_convert(_id)?;
@@ -645,6 +666,64 @@ impl NovelConverter {
     fn display_footer(&self) {
         println!("縦書用の変換が終了しました");
     }
+
+    fn fetch_cached_section(
+        &self,
+        novel_id: Option<i64>,
+        section_key: &str,
+        digest: &str,
+    ) -> Option<render::ConvertedSection> {
+        let bucket = self.section_convert_cache.get(&novel_id?.to_string())?;
+        let entry = bucket.get(section_key)?;
+        if entry.digest != digest {
+            return None;
+        }
+        Some(entry.converted_section.clone())
+    }
+
+    fn store_cached_section(
+        &mut self,
+        novel_id: Option<i64>,
+        section_key: &str,
+        digest: &str,
+        converted_section: &render::ConvertedSection,
+    ) {
+        let Some(novel_id) = novel_id else {
+            return;
+        };
+        let entry = CacheEntry {
+            digest: digest.to_string(),
+            converted_section: converted_section.clone(),
+        };
+        let bucket = self.section_convert_cache.entry(novel_id.to_string()).or_default();
+        if bucket.get(section_key) != Some(&entry) {
+            bucket.insert(section_key.to_string(), entry);
+            self.cache_dirty = true;
+        }
+    }
+
+    fn flush_section_convert_cache(&mut self) -> Result<()> {
+        if !self.cache_dirty {
+            return Ok(());
+        }
+        crate::db::with_database(|db| {
+            db.inventory().save(
+                SECTION_CONVERT_CACHE_NAME,
+                InventoryScope::Local,
+                &self.section_convert_cache,
+            )
+        })?;
+        self.cache_dirty = false;
+        Ok(())
+    }
+}
+
+fn load_section_convert_cache() -> HashMap<String, HashMap<String, CacheEntry>> {
+    crate::db::with_database(|db| {
+        db.inventory()
+            .load(SECTION_CONVERT_CACHE_NAME, InventoryScope::Local)
+    })
+    .unwrap_or_default()
 }
 
 fn load_sections_from_dir(

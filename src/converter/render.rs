@@ -1,8 +1,10 @@
+use serde::{Deserialize, Serialize};
+
 use crate::downloader::TocObject;
 
 use super::settings::NovelSettings;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ConvertedSection {
     pub chapter: String,
     pub subchapter: String,
