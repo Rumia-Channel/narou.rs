@@ -12,7 +12,7 @@ param(
 
     [string]$PackageRoot = "narou",
 
-    [string[]]$ExtraFiles = @("LICENSE"),
+    [string[]]$ExtraFiles = @("LICENSE", "README.md", "Third-Party-License.md"),
 
     [string[]]$ResourceDirectories = @("webnovel", "preset"),
 

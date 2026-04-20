@@ -362,13 +362,7 @@ fn yaml_string(value: Option<&serde_yaml::Value>) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn cwd_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -412,7 +406,6 @@ mod tests {
 
     #[test]
     fn convert_commands_use_convert_log_postfix_when_concurrency_is_enabled() {
-        let _guard = cwd_lock().lock().unwrap();
         let dir = temp_dir("logger_convert_postfix");
         let narou_dir = dir.join(".narou");
         fs::create_dir_all(&narou_dir).unwrap();
@@ -422,14 +415,13 @@ mod tests {
         )
         .unwrap();
 
-        let current = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
+        let path = {
+            let _guard = crate::test_support::set_current_dir_for_test(&dir);
+            init();
+            use_convert_log_postfix(true);
+            state().lock().unwrap().current_log_path().unwrap()
+        };
 
-        init();
-        use_convert_log_postfix(true);
-        let path = state().lock().unwrap().current_log_path().unwrap();
-
-        std::env::set_current_dir(current).unwrap();
         let _ = fs::remove_dir_all(dir);
 
         assert!(path.file_name().unwrap().to_string_lossy().contains("_convert"));

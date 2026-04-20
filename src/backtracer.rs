@@ -71,10 +71,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -87,12 +84,8 @@ mod tests {
     }
 
     fn with_current_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
-        let _guard = CWD_LOCK.lock().unwrap();
-        let current = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir).unwrap();
-        let result = f();
-        std::env::set_current_dir(current).unwrap();
-        result
+        let _guard = crate::test_support::set_current_dir_for_test(dir);
+        f()
     }
 
     #[test]

@@ -1,5 +1,7 @@
 #[macro_use]
 mod output_macros;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub mod compat;
 pub mod converter;

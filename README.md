@@ -6,7 +6,7 @@ narou_rs は、日本の Web 小説を取得・管理・変換する CLI / Web U
 詳細なコマンド互換性や未完了項目は `COMMANDS.md` を参照してください。README では、普段使うコマンド、動作、注意点をまとめます。
 
 ## 謝辞
-このソフトウェアは [whiteleaf氏](https://github.com/whiteleaf7) が作成した [narou.rb](https://github.com/whiteleaf7/narou) の [narou.rb](https://github.com/whiteleaf7/narou) 及び [ponpon.USA氏](https://github.com/ponponusa) の [フォーク版](https://github.com/ponponusa/narou-mod) をベースに作成されています。
+このソフトウェアは [whiteleaf氏](https://github.com/whiteleaf7) が作成した [narou.rb](https://github.com/whiteleaf7/narou) 及び [ponpon.USA氏](https://github.com/ponponusa) の [フォーク版](https://github.com/ponponusa/narou-mod) をベースに作成されています。
 
 素晴らしいソフトウェアを開発していただいたお二方に感謝を。
 

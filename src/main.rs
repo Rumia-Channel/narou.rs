@@ -4,6 +4,8 @@ mod backtracer;
 mod cli;
 mod commands;
 mod logger;
+#[cfg(test)]
+mod test_support;
 
 use std::io::IsTerminal;
 use std::time::Instant;

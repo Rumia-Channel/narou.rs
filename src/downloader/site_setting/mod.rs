@@ -4,6 +4,7 @@ mod loader;
 mod serde_helpers;
 
 use std::collections::HashMap;
+#[cfg(debug_assertions)]
 use std::path::PathBuf;
 
 use regex::{Regex, RegexBuilder};

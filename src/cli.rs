@@ -341,12 +341,6 @@ fn is_terminal_stdin() -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-
-    fn cwd_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[test]
     fn version_flag_becomes_version_command() {
@@ -386,7 +380,6 @@ mod tests {
 
     #[test]
     fn convert_no_open_is_injected_from_local_setting() {
-        let _guard = cwd_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "narou-rs-cli-no-open-{}",
             std::time::SystemTime::now()
@@ -406,13 +399,12 @@ mod tests {
             )
             .unwrap();
 
-        let current = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&root).unwrap();
-
         let mut args = vec!["convert".to_string(), "1".to_string()];
-        inject_command_defaults(&mut args);
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&root);
+            inject_command_defaults(&mut args);
+        }
 
-        std::env::set_current_dir(current).unwrap();
         let _ = std::fs::remove_dir_all(root);
 
         assert_eq!(args, vec!["convert", "--no-open", "1"]);
@@ -420,7 +412,6 @@ mod tests {
 
     #[test]
     fn convert_no_epub_is_injected_from_local_setting() {
-        let _guard = cwd_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "narou-rs-cli-no-epub-{}",
             std::time::SystemTime::now()
@@ -440,13 +431,12 @@ mod tests {
             )
             .unwrap();
 
-        let current = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&root).unwrap();
-
         let mut args = vec!["convert".to_string(), "1".to_string()];
-        inject_command_defaults(&mut args);
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&root);
+            inject_command_defaults(&mut args);
+        }
 
-        std::env::set_current_dir(current).unwrap();
         let _ = std::fs::remove_dir_all(root);
 
         assert_eq!(args, vec!["convert", "--no-epub", "1"]);
@@ -454,7 +444,6 @@ mod tests {
 
     #[test]
     fn convert_no_mobi_is_injected_from_local_setting() {
-        let _guard = cwd_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "narou-rs-cli-no-mobi-{}",
             std::time::SystemTime::now()
@@ -474,13 +463,12 @@ mod tests {
             )
             .unwrap();
 
-        let current = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&root).unwrap();
-
         let mut args = vec!["convert".to_string(), "1".to_string()];
-        inject_command_defaults(&mut args);
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&root);
+            inject_command_defaults(&mut args);
+        }
 
-        std::env::set_current_dir(current).unwrap();
         let _ = std::fs::remove_dir_all(root);
 
         assert_eq!(args, vec!["convert", "--no-mobi", "1"]);
@@ -488,7 +476,6 @@ mod tests {
 
     #[test]
     fn convert_no_strip_is_injected_from_local_setting() {
-        let _guard = cwd_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "narou-rs-cli-no-strip-{}",
             std::time::SystemTime::now()
@@ -511,13 +498,12 @@ mod tests {
             )
             .unwrap();
 
-        let current = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&root).unwrap();
-
         let mut args = vec!["convert".to_string(), "1".to_string()];
-        inject_command_defaults(&mut args);
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&root);
+            inject_command_defaults(&mut args);
+        }
 
-        std::env::set_current_dir(current).unwrap();
         let _ = std::fs::remove_dir_all(root);
 
         assert_eq!(args, vec!["convert", "--no-strip", "1"]);
@@ -525,7 +511,6 @@ mod tests {
 
     #[test]
     fn convert_no_zip_is_injected_from_local_setting() {
-        let _guard = cwd_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "narou-rs-cli-no-zip-{}",
             std::time::SystemTime::now()
@@ -545,13 +530,12 @@ mod tests {
             )
             .unwrap();
 
-        let current = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&root).unwrap();
-
         let mut args = vec!["convert".to_string(), "1".to_string()];
-        inject_command_defaults(&mut args);
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&root);
+            inject_command_defaults(&mut args);
+        }
 
-        std::env::set_current_dir(current).unwrap();
         let _ = std::fs::remove_dir_all(root);
 
         assert_eq!(args, vec!["convert", "--no-zip", "1"]);
@@ -559,7 +543,6 @@ mod tests {
 
     #[test]
     fn convert_make_zip_is_injected_from_local_setting() {
-        let _guard = cwd_lock().lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "narou-rs-cli-make-zip-{}",
             std::time::SystemTime::now()
@@ -582,13 +565,12 @@ mod tests {
             )
             .unwrap();
 
-        let current = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&root).unwrap();
-
         let mut args = vec!["convert".to_string(), "1".to_string()];
-        inject_command_defaults(&mut args);
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&root);
+            inject_command_defaults(&mut args);
+        }
 
-        std::env::set_current_dir(current).unwrap();
         let _ = std::fs::remove_dir_all(root);
 
         assert_eq!(args, vec!["convert", "--make-zip", "1"]);
