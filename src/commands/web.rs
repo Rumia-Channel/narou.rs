@@ -635,6 +635,9 @@ fn web_stop_hint(hide_console: bool) -> &'static str {
         return "タスクトレイのアイコンを右クリックして「終了」または「再起動」を選んで下さい";
     }
 
+    #[cfg(not(windows))]
+    let _ = hide_console;
+
     "コンソール上で Ctrl+C を入力して下さい"
 }
 

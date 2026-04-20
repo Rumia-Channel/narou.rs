@@ -167,10 +167,12 @@ jobs:
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           TAG_NAME: ${{ github.ref_name }}
           IS_PRERELEASE: ${{ needs.validate.outputs.prerelease }}
         shell: pwsh
         run: |
+          $repo = $env:REPOSITORY
           $tag = $env:TAG_NAME
           $assets = Get-ChildItem -Path "release-assets" -File | Sort-Object Name
           if ($assets.Count -eq 0) {
@@ -182,13 +184,13 @@ jobs:
             $releaseArgs += "--prerelease"
           }
 
-          gh release view $tag *> $null
+          gh release view $tag --repo $repo *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag @releaseArgs
+            gh release create $tag --repo $repo @releaseArgs
           } elseif ($env:IS_PRERELEASE -eq "true") {
-            gh release edit $tag --prerelease
+            gh release edit $tag --repo $repo --prerelease
           }
 
           foreach ($asset in $assets) {
-            gh release upload $tag $asset.FullName --clobber
+            gh release upload $tag $asset.FullName --repo $repo --clobber
           }
