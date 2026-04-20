@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use serde_yaml::{Mapping, Value};
 
 use crate::db::inventory::atomic_write;
 use crate::error::{NarouError, Result};
@@ -59,6 +60,43 @@ pub struct QueueState {
     pub failed: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct QueueStateFile {
+    #[serde(default)]
+    jobs: VecDeque<QueueJob>,
+    #[serde(default)]
+    completed: Vec<String>,
+    #[serde(default)]
+    failed: Vec<String>,
+    #[serde(default)]
+    pending: Vec<LegacyQueueTask>,
+    #[serde(default)]
+    running: Vec<LegacyQueueTask>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyQueueFile {
+    pending: Vec<LegacyQueueTask>,
+    running: Vec<LegacyQueueTask>,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyQueueTask {
+    id: String,
+    cmd: String,
+    #[serde(default)]
+    args: Vec<Value>,
+    #[serde(default)]
+    meta: Mapping,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    created_at: Option<Value>,
+    #[serde(default)]
+    started_at: Option<Value>,
+}
+
 impl Default for QueueState {
     fn default() -> Self {
         Self {
@@ -93,7 +131,7 @@ impl PersistentQueue {
     fn load(&mut self) -> Result<()> {
         if self.path.exists() {
             let content = fs::read_to_string(&self.path)?;
-            let state: QueueState = serde_yaml::from_str(&content)?;
+            let state = load_queue_state(&content)?;
             validate_queue_state(&state)?;
             *self.state.lock() = state;
         }
@@ -104,7 +142,7 @@ impl PersistentQueue {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let content = serde_yaml::to_string(&*self.state.lock())?;
+        let content = serde_yaml::to_string(&queue_state_to_legacy_file(&self.state.lock()))?;
         atomic_write(&self.path, &content)?;
         Ok(())
     }
@@ -346,6 +384,178 @@ fn validate_queue_state(state: &QueueState) -> Result<()> {
     Ok(())
 }
 
+fn load_queue_state(content: &str) -> Result<QueueState> {
+    let file: QueueStateFile = serde_yaml::from_str(content)?;
+    let mut jobs = file.jobs;
+    jobs.extend(
+        file.pending
+            .into_iter()
+            .chain(file.running)
+            .filter_map(legacy_task_to_queue_job),
+    );
+    Ok(QueueState {
+        jobs,
+        completed: file.completed,
+        failed: file.failed,
+    })
+}
+
+fn queue_state_to_legacy_file(state: &QueueState) -> LegacyQueueFile {
+    let pending = state
+        .jobs
+        .iter()
+        .filter_map(queue_job_to_legacy_task)
+        .collect();
+    LegacyQueueFile {
+        pending,
+        running: Vec::new(),
+        updated_at: chrono::Local::now().to_rfc3339(),
+    }
+}
+
+fn legacy_task_to_queue_job(task: LegacyQueueTask) -> Option<QueueJob> {
+    let args = legacy_args_to_strings(task.args);
+    let (job_type, target) = match task.cmd.as_str() {
+        "download" => (JobType::Download, args.join("\t")),
+        "download_force" => (JobType::Download, join_job_target(["--force"], args)),
+        "update" | "update_by_tag" | "update_general_lastup" => (JobType::Update, args.join("\t")),
+        "convert" => (JobType::Convert, args.join("\t")),
+        "send" => (JobType::Send, args.join("\t")),
+        "backup_bookmark" => (JobType::Send, "--backup-bookmark".to_string()),
+        "backup" => (JobType::Backup, args.join("\t")),
+        "mail" => (JobType::Mail, args.join("\t")),
+        "auto_update" => (JobType::AutoUpdate, String::new()),
+        other => {
+            eprintln!(
+                "Warning: skipping unsupported legacy queue task '{}' ({})",
+                other, task.id
+            );
+            return None;
+        }
+    };
+    Some(QueueJob {
+        id: task.id,
+        job_type,
+        target,
+        created_at: legacy_timestamp_to_unix(task.created_at),
+        retry_count: 0,
+        max_retries: 3,
+    })
+}
+
+fn queue_job_to_legacy_task(job: &QueueJob) -> Option<LegacyQueueTask> {
+    let (cmd, args) = match job.job_type {
+        JobType::Download => {
+            let parts = split_job_target(&job.target);
+            if let Some(rest) = parts.strip_prefix(&["--force"]) {
+                ("download_force", rest.iter().map(|part| Value::String((*part).to_string())).collect())
+            } else {
+                ("download", parts.iter().map(|part| Value::String((*part).to_string())).collect())
+            }
+        }
+        JobType::Update => (
+            "update",
+            split_job_target(&job.target)
+                .into_iter()
+                .map(|part| Value::String(part.to_string()))
+                .collect(),
+        ),
+        JobType::Convert => (
+            "convert",
+            split_job_target(&job.target)
+                .into_iter()
+                .map(|part| Value::String(part.to_string()))
+                .collect(),
+        ),
+        JobType::Send => {
+            if job.target == "--backup-bookmark" {
+                ("backup_bookmark", Vec::new())
+            } else {
+                (
+                    "send",
+                    split_job_target(&job.target)
+                        .into_iter()
+                        .map(|part| Value::String(part.to_string()))
+                        .collect(),
+                )
+            }
+        }
+        JobType::Backup => (
+            "backup",
+            split_job_target(&job.target)
+                .into_iter()
+                .map(|part| Value::String(part.to_string()))
+                .collect(),
+        ),
+        JobType::Mail => (
+            "mail",
+            split_job_target(&job.target)
+                .into_iter()
+                .map(|part| Value::String(part.to_string()))
+                .collect(),
+        ),
+        JobType::AutoUpdate => ("auto_update", Vec::new()),
+    };
+    Some(LegacyQueueTask {
+        id: job.id.clone(),
+        cmd: cmd.to_string(),
+        args,
+        meta: Mapping::new(),
+        status: Some("pending".to_string()),
+        created_at: Some(Value::String(unix_to_rfc3339(job.created_at))),
+        started_at: None,
+    })
+}
+
+fn split_job_target(target: &str) -> Vec<&str> {
+    target.split('\t').filter(|part| !part.is_empty()).collect()
+}
+
+fn join_job_target<const N: usize>(prefix: [&str; N], mut args: Vec<String>) -> String {
+    let mut parts: Vec<String> = prefix.into_iter().map(str::to_string).collect();
+    parts.append(&mut args);
+    parts.join("\t")
+}
+
+fn legacy_args_to_strings(args: Vec<Value>) -> Vec<String> {
+    args.into_iter()
+        .map(|value| match value {
+            Value::String(s) => s,
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Null => String::new(),
+            other => serde_yaml::to_string(&other)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        })
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn legacy_timestamp_to_unix(value: Option<Value>) -> i64 {
+    match value {
+        Some(Value::String(s)) => chrono::DateTime::parse_from_rfc3339(&s)
+            .map(|dt| dt.timestamp())
+            .unwrap_or_else(|_| chrono::Utc::now().timestamp()),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+        _ => chrono::Utc::now().timestamp(),
+    }
+}
+
+fn unix_to_rfc3339(timestamp: i64) -> String {
+    use chrono::TimeZone;
+
+    chrono::Utc
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .unwrap_or_else(chrono::Utc::now)
+        .with_timezone(&chrono::Local)
+        .to_rfc3339()
+}
+
 fn generate_job_id(job_type: JobType, target: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -452,5 +662,42 @@ mod tests {
         let err = PersistentQueue::new(&queue_path).unwrap_err();
 
         assert!(err.to_string().contains("exceeding limit"));
+    }
+
+    #[test]
+    fn load_accepts_legacy_ruby_queue_yaml() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        std::fs::write(
+            &queue_path,
+            "---\npending:\n  - id: task-1\n    cmd: download_force\n    args:\n      - n0001\n    meta: {}\n    status: pending\n    created_at: '2026-04-19T15:13:58+09:00'\nrunning:\n  - id: task-2\n    cmd: auto_update\n    args: []\n    meta: {}\n    status: running\n    created_at: '2026-04-19T15:14:58+09:00'\nupdated_at: '2026-04-19T15:15:58+09:00'\n",
+        )
+        .unwrap();
+
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let pending = queue.get_pending_tasks();
+
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(pending[0].job_type, JobType::Download));
+        assert_eq!(pending[0].target, "--force\tn0001");
+        assert!(matches!(pending[1].job_type, JobType::AutoUpdate));
+        assert_eq!(pending[1].target, "");
+    }
+
+    #[test]
+    fn save_writes_legacy_ruby_queue_yaml_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        queue.push(JobType::Download, "--force\tn0001").unwrap();
+        queue.push(JobType::AutoUpdate, "").unwrap();
+
+        let saved = std::fs::read_to_string(&queue_path).unwrap();
+
+        assert!(saved.contains("pending:"));
+        assert!(saved.contains("running: []"));
+        assert!(saved.contains("cmd: download_force"));
+        assert!(saved.contains("cmd: auto_update"));
+        assert!(!saved.contains("jobs:"));
     }
 }

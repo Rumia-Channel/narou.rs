@@ -73,7 +73,7 @@ fn ensure_dot_narou_files(root: &Path) -> Result<usize> {
         ("freeze.yaml", "--- {}\n"),
         ("tag_colors.yaml", "--- {}\n"),
         ("latest_convert.yaml", "--- {}\n"),
-        ("queue.yaml", "---\njobs: []\ncompleted: []\nfailed: []\n"),
+        ("queue.yaml", "---\npending: []\nrunning: []\nupdated_at:\n"),
         ("notepad.txt", ""),
     ];
 
