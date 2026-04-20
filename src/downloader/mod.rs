@@ -1321,6 +1321,7 @@ impl Downloader {
             is_narou: setting.is_narou,
             last_check_date: None,
             convert_failure: false,
+            extra_fields: Default::default(),
         };
 
         let auto_add_tags = load_local_setting_bool("auto-add-tags");

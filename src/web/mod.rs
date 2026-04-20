@@ -7,6 +7,7 @@ pub mod novel_settings;
 pub mod novels;
 pub mod push;
 pub mod scheduler;
+mod sort_state;
 pub mod state;
 mod tag_colors;
 pub mod tags;
@@ -44,6 +45,7 @@ pub struct AppState {
     pub control_token: String,
     pub queue: Arc<crate::queue::PersistentQueue>,
     pub restore_prompt_pending: Arc<AtomicBool>,
+    pub restorable_tasks_available: Arc<AtomicBool>,
     pub running_jobs: Arc<parking_lot::Mutex<Vec<crate::queue::QueueJob>>>,
     pub running_child_pids: Arc<parking_lot::Mutex<std::collections::HashMap<String, u32>>>,
     pub auto_update_scheduler: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
@@ -509,6 +511,7 @@ mod tests {
             is_narou: false,
             last_check_date: None,
             convert_failure: false,
+            extra_fields: Default::default(),
         }
     }
 
@@ -538,6 +541,7 @@ mod tests {
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
             restore_prompt_pending: Arc::new(AtomicBool::new(false)),
+            restorable_tasks_available: Arc::new(AtomicBool::new(false)),
             running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
             running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             auto_update_scheduler: Arc::new(parking_lot::Mutex::new(None)),

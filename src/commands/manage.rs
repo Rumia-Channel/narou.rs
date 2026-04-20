@@ -1287,6 +1287,7 @@ mod tests {
             is_narou: false,
             last_check_date: None,
             convert_failure: false,
+            extra_fields: Default::default(),
         }
     }
 }

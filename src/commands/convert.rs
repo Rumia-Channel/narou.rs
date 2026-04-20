@@ -162,10 +162,17 @@ pub fn cmd_convert(
                     NovelConverter::with_user_converter(settings, user_converter)
                 } else {
                     NovelConverter::new(settings)
-                };
+            };
             converter.set_progress(progress);
             converter.set_display_inspector(inspect);
 
+            let _lock = match narou_rs::compat::NovelLockGuard::acquire(Some(id)) {
+                Ok(lock) => lock,
+                Err(e) => {
+                    println!("  Error: {}", e);
+                    continue;
+                }
+            };
             let result = match output_device {
                 Some(device) => converter
                     .convert_novel_by_id_with_device(id, &novel_dir, device, no_strip, verbose)

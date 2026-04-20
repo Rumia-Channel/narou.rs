@@ -432,6 +432,7 @@ mod tests {
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
             restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
             running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             auto_update_scheduler: Arc::new(parking_lot::Mutex::new(None)),

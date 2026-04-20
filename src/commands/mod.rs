@@ -53,3 +53,18 @@ fn latest_convert_target() -> Option<String> {
         .ok()?;
     latest.get("id").and_then(yaml_value_to_string)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::latest_convert_target;
+
+    #[test]
+    fn database_parity_latest_convert_target_reads_zero_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        std::fs::write(temp.path().join(".narou").join("latest_convert.yaml"), "id: 0\n").unwrap();
+
+        assert_eq!(latest_convert_target().as_deref(), Some("0"));
+    }
+}

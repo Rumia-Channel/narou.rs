@@ -144,6 +144,59 @@ pub fn load_frozen_ids_from_inventory(inventory: &Inventory) -> Result<HashSet<i
     Ok(frozen.into_keys().collect())
 }
 
+pub fn load_locked_ids_from_inventory(inventory: &Inventory) -> Result<HashSet<i64>> {
+    let locked: HashMap<i64, serde_yaml::Value> = inventory.load("lock", InventoryScope::Local)?;
+    Ok(locked.into_keys().collect())
+}
+
+pub struct NovelLockGuard {
+    inventory: Option<Inventory>,
+    id: Option<i64>,
+}
+
+impl NovelLockGuard {
+    pub fn acquire(id: Option<i64>) -> Result<Self> {
+        let Some(id) = id else {
+            return Ok(Self {
+                inventory: None,
+                id: None,
+            });
+        };
+
+        let inventory = Inventory::with_default_root()?;
+        let mut locked: HashMap<i64, serde_yaml::Value> =
+            inventory.load("lock", InventoryScope::Local)?;
+        locked.insert(id, current_lock_timestamp());
+        inventory.save("lock", InventoryScope::Local, &locked)?;
+
+        Ok(Self {
+            inventory: Some(inventory),
+            id: Some(id),
+        })
+    }
+}
+
+impl Drop for NovelLockGuard {
+    fn drop(&mut self) {
+        let (Some(inventory), Some(id)) = (&self.inventory, self.id) else {
+            return;
+        };
+        let mut locked: HashMap<i64, serde_yaml::Value> =
+            inventory.load("lock", InventoryScope::Local).unwrap_or_default();
+        if locked.remove(&id).is_some() {
+            let _ = inventory.save("lock", InventoryScope::Local, &locked);
+        }
+    }
+}
+
+fn current_lock_timestamp() -> serde_yaml::Value {
+    serde_yaml::Value::String(
+        chrono::Local::now()
+            .format("%Y-%m-%d %H:%M:%S%.9f %:z")
+            .to_string(),
+    )
+}
+
 pub fn record_is_frozen(record: &crate::db::NovelRecord, frozen_ids: &HashSet<i64>) -> bool {
     frozen_ids.contains(&record.id) || record.tags.iter().any(|tag| tag == "frozen")
 }
@@ -319,6 +372,7 @@ pub fn convert_existing_novel(
     novel_dir: &Path,
     no_open: bool,
 ) -> std::result::Result<PathBuf, String> {
+    let _lock = NovelLockGuard::acquire(Some(id)).map_err(|e| e.to_string())?;
     let settings = NovelSettings::load_for_novel(id, title, author, novel_dir);
     let mut converter =
         if let Some(user_converter) = UserConverter::load_with_title(novel_dir, title) {
@@ -410,7 +464,6 @@ fn get_copy_to_directory(
     if grouping
         .iter()
         .any(|value| value.eq_ignore_ascii_case("site"))
-        && novel_id > 0
     {
         let sitename =
             crate::db::with_database(|db| Ok(db.get(novel_id).map(|r| r.sitename.clone())))
@@ -545,7 +598,8 @@ mod tests {
     use crate::progress::WS_LINE_PREFIX;
 
     use super::{
-        load_frozen_ids_from_inventory, record_is_frozen, reroute_web_line_to_console,
+        NovelLockGuard, get_copy_to_directory, load_frozen_ids_from_inventory,
+        load_locked_ids_from_inventory, record_is_frozen, reroute_web_line_to_console,
         sanitize_backup_name,
     };
     use crate::db::NovelRecord;
@@ -576,6 +630,7 @@ mod tests {
             is_narou: false,
             last_check_date: None,
             convert_failure: false,
+            extra_fields: Default::default(),
         }
     }
 
@@ -642,16 +697,95 @@ mod tests {
     }
 
     #[test]
-    fn load_frozen_ids_from_inventory_reads_freeze_yaml_without_database_lock() {
+    fn database_parity_load_frozen_ids_from_inventory_reads_zero_id() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
-        std::fs::write(temp.path().join(".narou").join("freeze.yaml"), "1: true\n3: true\n").unwrap();
+        std::fs::write(
+            temp.path().join(".narou").join("freeze.yaml"),
+            "0: true\n3: true\n",
+        )
+        .unwrap();
 
         let inventory = Inventory::new(temp.path().to_path_buf());
         let frozen_ids = load_frozen_ids_from_inventory(&inventory).unwrap();
 
-        assert!(frozen_ids.contains(&1));
+        assert!(frozen_ids.contains(&0));
         assert!(frozen_ids.contains(&3));
         assert_eq!(frozen_ids.len(), 2);
+    }
+
+    #[test]
+    fn novel_lock_guard_writes_and_clears_lock_yaml() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+
+        {
+            let _lock = NovelLockGuard::acquire(Some(7)).unwrap();
+            let inventory = Inventory::new(temp.path().to_path_buf());
+            let locked_ids = load_locked_ids_from_inventory(&inventory).unwrap();
+            assert_eq!(locked_ids, std::collections::HashSet::from([7]));
+            let raw = std::fs::read_to_string(temp.path().join(".narou").join("lock.yaml")).unwrap();
+            assert!(raw.contains("7:"));
+            assert!(raw.contains(" +"));
+            assert!(!raw.contains('T'));
+        }
+
+        let inventory = Inventory::new(temp.path().to_path_buf());
+        let locked_ids = load_locked_ids_from_inventory(&inventory).unwrap();
+        assert!(locked_ids.is_empty());
+    }
+
+    #[test]
+    fn novel_lock_guard_preserves_other_locked_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        std::fs::write(
+            temp.path().join(".narou").join("lock.yaml"),
+            "3: 2026-04-20T00:00:00+09:00\n",
+        )
+        .unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+
+        {
+            let _lock = NovelLockGuard::acquire(Some(7)).unwrap();
+            let inventory = Inventory::new(temp.path().to_path_buf());
+            let locked_ids = load_locked_ids_from_inventory(&inventory).unwrap();
+            assert_eq!(locked_ids, std::collections::HashSet::from([3, 7]));
+        }
+
+        let inventory = Inventory::new(temp.path().to_path_buf());
+        let locked_ids = load_locked_ids_from_inventory(&inventory).unwrap();
+        assert_eq!(locked_ids, std::collections::HashSet::from([3]));
+    }
+
+    #[test]
+    fn database_parity_get_copy_to_directory_includes_site_for_zero_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let copy_to = temp.path().join("copy-to");
+        std::fs::create_dir_all(&copy_to).unwrap();
+        std::fs::write(
+            temp.path().join(".narou").join("local_setting.yaml"),
+            format!(
+                "convert.copy-to: \"{}\"\nconvert.copy-to-grouping:\n  - site\n",
+                copy_to.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+        crate::db::with_database_mut(|db| {
+            db.insert(sample_record(0, &[]));
+            Ok(())
+        })
+        .unwrap();
+
+        let dir = get_copy_to_directory(None, 0).unwrap().unwrap();
+        assert_eq!(dir, copy_to.join("site"));
+
+        *crate::db::DATABASE.lock() = None;
     }
 }

@@ -2,7 +2,6 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use narou_rs::error::Result;
-use narou_rs::setting_info::default_local_setting_value;
 
 pub fn cmd_init(aozora_path: Option<&str>, line_height: Option<f64>) -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -29,13 +28,7 @@ pub fn cmd_init(aozora_path: Option<&str>, line_height: Option<f64>) -> Result<(
         println!("既に初期化済みです: {}", root.display());
     }
 
-    let created_inventory = ensure_dot_narou_files(&root)?;
-    if created_inventory > 0 {
-        println!(
-            ".narou/ に初期ファイルを作成しました ({} files)",
-            created_inventory
-        );
-    }
+    ensure_dot_narou_files(&root)?;
 
     init_aozoraepub3_settings(aozora_path, line_height, already_root.is_some())?;
 
@@ -61,72 +54,7 @@ fn find_existing_narou_root(start: &Path) -> Option<PathBuf> {
 fn ensure_dot_narou_files(root: &Path) -> Result<usize> {
     let dir = root.join(".narou");
     std::fs::create_dir_all(&dir)?;
-
-    let files = [
-        ("local_setting.yaml", "--- {}\n"),
-        ("database.yaml", "--- {}\n"),
-        (
-            "database_index.yaml",
-            "---\nby_toc_url: {}\nby_title: {}\nmeta: {}\n",
-        ),
-        ("alias.yaml", "--- {}\n"),
-        ("freeze.yaml", "--- {}\n"),
-        ("tag_colors.yaml", "--- {}\n"),
-        ("latest_convert.yaml", "--- {}\n"),
-        ("queue.yaml", "---\npending: []\nrunning: []\nupdated_at:\n"),
-        ("notepad.txt", ""),
-    ];
-
-    let mut created = 0usize;
-    for (name, content) in files {
-        let path = dir.join(name);
-        if !path.exists() {
-            std::fs::write(path, content)?;
-            created += 1;
-        }
-    }
-    if ensure_default_local_settings(&dir.join("local_setting.yaml"))? {
-        created += 1;
-    }
-    Ok(created)
-}
-
-fn ensure_default_local_settings(path: &Path) -> Result<bool> {
-    const DEFAULT_KEYS: &[&str] = &[
-        "convert.dc-subject-exclude-tags",
-        "download.interval",
-        "download.wait-steps",
-        "folder-length-limit",
-        "filename-length-limit",
-        "time-zone",
-        "user-agent",
-    ];
-
-    let mut settings = if path.exists() {
-        let raw = std::fs::read_to_string(path)?;
-        serde_yaml::from_str::<std::collections::BTreeMap<String, serde_yaml::Value>>(&raw)
-            .unwrap_or_default()
-    } else {
-        std::collections::BTreeMap::new()
-    };
-
-    let mut changed = false;
-    for key in DEFAULT_KEYS {
-        if settings.contains_key(*key) {
-            continue;
-        }
-        if let Some(value) = default_local_setting_value(key) {
-            settings.insert((*key).to_string(), value);
-            changed = true;
-        }
-    }
-
-    if changed {
-        let content = serde_yaml::to_string(&settings)?;
-        std::fs::write(path, content)?;
-    }
-
-    Ok(changed)
+    Ok(0)
 }
 
 fn copy_bundled_webnovel_files(destination: &Path) -> Result<usize> {
@@ -421,49 +349,29 @@ fn format_line_height(line_height: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_default_local_settings, rewrite_aozoraepub3_files};
+    use super::{ensure_dot_narou_files, rewrite_aozoraepub3_files};
 
     #[test]
-    fn ensure_default_local_settings_writes_expected_defaults() {
+    fn ensure_dot_narou_files_keeps_inventory_files_lazy() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("local_setting.yaml");
+        let narou_dir = temp.path().join(".narou");
 
-        assert!(ensure_default_local_settings(&path).unwrap());
-
-        let settings: std::collections::BTreeMap<String, serde_yaml::Value> =
-            serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(
-            settings.get("user-agent"),
-            Some(&serde_yaml::Value::String("auto".to_string()))
-        );
-        assert_eq!(
-            settings.get("download.interval"),
-            Some(&serde_yaml::to_value(0.7f64).unwrap())
-        );
-        assert_eq!(
-            settings.get("download.wait-steps"),
-            Some(&serde_yaml::Value::Number(serde_yaml::Number::from(0)))
-        );
-        assert_eq!(
-            settings.get("time-zone"),
-            Some(&serde_yaml::Value::String("Asia/Tokyo".to_string()))
-        );
-    }
-
-    #[test]
-    fn ensure_default_local_settings_preserves_existing_values() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("local_setting.yaml");
-        std::fs::write(&path, "---\nuser-agent: custom-agent\n").unwrap();
-
-        assert!(ensure_default_local_settings(&path).unwrap());
-
-        let settings: std::collections::BTreeMap<String, serde_yaml::Value> =
-            serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(
-            settings.get("user-agent"),
-            Some(&serde_yaml::Value::String("custom-agent".to_string()))
-        );
+        assert_eq!(ensure_dot_narou_files(temp.path()).unwrap(), 0);
+        assert!(narou_dir.is_dir());
+        for name in [
+            "local_setting.yaml",
+            "database.yaml",
+            "database_index.yaml",
+            "alias.yaml",
+            "freeze.yaml",
+            "lock.yaml",
+            "tag_colors.yaml",
+            "latest_convert.yaml",
+            "queue.yaml",
+            "notepad.txt",
+        ] {
+            assert!(!narou_dir.join(name).exists(), "{name} should stay lazy");
+        }
     }
 
     #[test]

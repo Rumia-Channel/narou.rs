@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::de;
 use serde::{Deserialize, Serialize};
@@ -51,6 +53,8 @@ pub struct NovelRecord {
         rename = "_convert_failure"
     )]
     pub convert_failure: bool,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_fields: BTreeMap<String, serde_yaml::Value>,
 }
 
 fn deserialize_nilable_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
@@ -145,5 +149,32 @@ tags: []
 "#;
         let record: NovelRecord = serde_yaml::from_str(yaml).unwrap();
         assert!(!record.end);
+    }
+
+    #[test]
+    fn database_parity_preserves_unknown_fields_during_round_trip() {
+        let yaml = r#"---
+id: 0
+author: author
+title: title
+file_title: file title
+toc_url: https://example.com/0/
+sitename: Example
+last_update: 2026-04-20 00:00:00.000000000 +09:00
+custom_flag: true
+custom_map:
+  answer: 42
+"#;
+        let record: NovelRecord = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            record.extra_fields.get("custom_flag"),
+            Some(&serde_yaml::Value::Bool(true))
+        );
+        let nested = record.extra_fields.get("custom_map").unwrap();
+        assert_eq!(nested["answer"].as_i64(), Some(42));
+
+        let dumped = serde_yaml::to_string(&record).unwrap();
+        assert!(dumped.contains("custom_flag: true"));
+        assert!(dumped.contains("answer: 42"));
     }
 }

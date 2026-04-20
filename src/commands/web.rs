@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use narou_rs::db::inventory::{Inventory, InventoryScope};
@@ -92,7 +92,10 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
                 std::process::exit(1);
             }
         };
-    let restore_prompt_pending = Arc::new(AtomicBool::new(queue.pending_count() > 0));
+    let restorable_tasks_available = Arc::new(AtomicBool::new(queue.has_restorable_tasks()));
+    let restore_prompt_pending = Arc::new(AtomicBool::new(
+        restorable_tasks_available.load(Ordering::Relaxed),
+    ));
     let running_jobs = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let running_child_pids = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let auto_update_scheduler = Arc::new(parking_lot::Mutex::new(None));
@@ -104,6 +107,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         control_token: control_token.clone(),
         queue: queue.clone(),
         restore_prompt_pending: restore_prompt_pending.clone(),
+        restorable_tasks_available: restorable_tasks_available.clone(),
         running_jobs: running_jobs.clone(),
         running_child_pids: running_child_pids.clone(),
         auto_update_scheduler: auto_update_scheduler.clone(),
@@ -169,7 +173,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         );
 
         if let Ok(queue) = narou_rs::queue::PersistentQueue::with_default() {
-            let count = queue.pending_count();
+            let count = queue.pending_count() + queue.running_count();
             if count > 0 {
                 push_server.broadcast_echo(
                     &colored(

@@ -13,6 +13,9 @@ use crate::db::with_database;
 use crate::version;
 
 use super::AppState;
+use super::sort_state::{
+    current_sort_from_server_setting, default_current_sort_state, normalize_current_sort_request,
+};
 use super::state::{ApiResponse, LogsParams};
 
 #[derive(Debug, Deserialize)]
@@ -60,11 +63,7 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
         .build()
         .expect("reqwest client");
 
-    let resp = client
-        .get(url)
-        .header(USER_AGENT, "narou.rs")
-        .send()
-        .await;
+    let resp = client.get(url).header(USER_AGENT, "narou.rs").send().await;
 
     match resp {
         Ok(resp) if resp.status().is_success() => {
@@ -160,7 +159,12 @@ pub async fn tag_list(
     );
     for tag in &tags {
         let escaped_tag = html_escape(tag);
-        let class = tag_color_class(tag_colors.get(tag).map(|value| value.as_str()).unwrap_or("default"));
+        let class = tag_color_class(
+            tag_colors
+                .get(tag)
+                .map(|value| value.as_str())
+                .unwrap_or("default"),
+        );
         html.push_str(&format!(
             "<div><span class=\"tag-label {}\" data-tag=\"{}\">{}</span> \
 <span class=\"select-color-button\" data-target-tag=\"{}\"><span class=\"tag-label {} tag-fixed-width\">a</span></span></div>",
@@ -267,10 +271,7 @@ pub async fn recent_logs(
     State(state): State<AppState>,
     Query(params): Query<LogsParams>,
 ) -> Json<serde_json::Value> {
-    let count = params
-        .count
-        .unwrap_or(100)
-        .min(super::MAX_WEB_LOG_COUNT);
+    let count = params.count.unwrap_or(100).min(super::MAX_WEB_LOG_COUNT);
     let logs = state.push_server.recent_logs(count);
     Json(serde_json::json!({ "logs": logs }))
 }
@@ -301,14 +302,14 @@ pub async fn clear_history(State(state): State<AppState>) -> Json<ApiResponse> {
 pub async fn get_sort_state(State(_state): State<AppState>) -> Json<serde_json::Value> {
     let sort_state = (|| -> Option<serde_json::Value> {
         let inv = Inventory::with_default_root().ok()?;
-        let server_setting: serde_json::Value =
+        let server_setting: serde_yaml::Value =
             inv.load("server_setting", InventoryScope::Global).ok()?;
-        server_setting.get("current_sort").cloned()
+        current_sort_from_server_setting(&server_setting).map(|state| state.to_json_value())
     })();
 
     match sort_state {
         Some(state) => Json(state),
-        None => Json(serde_json::json!({"column": 2, "dir": "desc"})),
+        None => Json(default_current_sort_state().to_json_value()),
     }
 }
 
@@ -316,32 +317,27 @@ pub async fn save_sort_state(
     State(_state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
-    let column = body.get("column");
-    let dir = body.get("dir");
-
-    if column.is_none() || dir.is_none() {
+    let Some(sort_state) = normalize_current_sort_request(&body) else {
         return Json(ApiResponse {
             success: false,
-            message: "column and dir are required".to_string(),
+            message: "valid column and dir are required".to_string(),
         });
-    }
+    };
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let inv = Inventory::with_default_root()?;
-        let mut server_setting: serde_json::Map<String, serde_json::Value> = inv
-            .load("server_setting", InventoryScope::Global)
-            .unwrap_or_default();
+        let mut server_setting = match inv.load("server_setting", InventoryScope::Global) {
+            Ok(serde_yaml::Value::Mapping(mapping)) => mapping,
+            _ => serde_yaml::Mapping::new(),
+        };
         server_setting.insert(
-            "current_sort".to_string(),
-            serde_json::json!({
-                "column": column.unwrap(),
-                "dir": dir.unwrap(),
-            }),
+            serde_yaml::Value::String("current_sort".to_string()),
+            sort_state.to_yaml_value(),
         );
         inv.save(
             "server_setting",
             InventoryScope::Global,
-            &serde_json::Value::Object(server_setting),
+            &serde_yaml::Value::Mapping(server_setting),
         )?;
         Ok(())
     })();
@@ -358,9 +354,7 @@ pub async fn save_sort_state(
     }
 }
 
-pub async fn validate_url_regexp_list(
-    State(_state): State<AppState>,
-) -> Json<serde_json::Value> {
+pub async fn validate_url_regexp_list(State(_state): State<AppState>) -> Json<serde_json::Value> {
     use crate::downloader::site_setting::SiteSetting;
 
     let patterns: Vec<String> = SiteSetting::load_all()

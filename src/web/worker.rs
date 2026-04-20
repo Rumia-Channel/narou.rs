@@ -72,10 +72,12 @@ fn start_queue_worker_for_lane(
             let job_for_run = job.clone();
             let ps = Arc::clone(&push_server);
             let pid_ref = Arc::clone(&running_child_pids);
-            let success =
-                tokio::task::spawn_blocking(move || execute_job(&root_dir, &job_for_run, &ps, &pid_ref))
-                    .await
-                    .unwrap_or(false);
+            let queue_for_run = Arc::clone(&queue);
+            let success = tokio::task::spawn_blocking(move || {
+                execute_job(&root_dir, queue_for_run.as_ref(), &job_for_run, &ps, &pid_ref)
+            })
+            .await
+            .unwrap_or(false);
 
             // Refresh in-memory database from disk (subprocess may have modified it)
             if let Err(e) = with_database_mut(|db| db.refresh()) {
@@ -125,13 +127,14 @@ fn should_reload_table_after_job(
         .as_deref()
         .unwrap_or("every")
     {
-        "queue" => queue.pending_count() == 0 && running_jobs.lock().is_empty(),
+        "queue" => queue.active_pending_count() == 0 && running_jobs.lock().is_empty(),
         _ => true,
     }
 }
 
 fn execute_job(
     root_dir: &Path,
+    queue: &PersistentQueue,
     job: &QueueJob,
     push_server: &Arc<PushServer>,
     running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
@@ -151,7 +154,7 @@ fn execute_job(
         return false;
     };
 
-    let mut command = std::process::Command::new(exe);
+    let mut command = std::process::Command::new(&exe);
     command
         .current_dir(root_dir)
         .stdin(Stdio::null())
@@ -159,60 +162,225 @@ fn execute_job(
         .stderr(Stdio::piped())
         .env("NAROU_RS_WEB_MODE", "1");
 
-    match job.job_type {
-        JobType::Download => {
-            command.arg("download");
-            for part in job.target.split('\t') {
-                if !part.is_empty() {
-                    command.arg(part);
+    if let Some(spec) = queue.execution_spec(&job.id) {
+        match spec.cmd.as_str() {
+            "download" => {
+                command.arg("download");
+                for arg in spec.args {
+                    command.arg(arg);
                 }
             }
-        }
-        JobType::Update => {
-            command.arg("update");
-            if !job.target.is_empty() {
-                let mut parts = job.target.split('\t');
-                if let Some(first) = parts.next() {
-                    if let Some(message) = first.strip_prefix(WEBUI_UPDATE_START_PREFIX) {
-                        push_server.broadcast_echo(
-                            &format!("<span style=\"color:#bbb\">{}</span>", message),
-                            target_console,
-                        );
-                    } else if !first.is_empty() {
-                        command.arg(first);
-                    }
+            "download_force" => {
+                command.arg("download").arg("--force");
+                for arg in spec.args {
+                    command.arg(arg);
                 }
-                for part in parts {
+            }
+            "update" | "update_by_tag" => {
+                command.arg("update");
+                append_update_args(&mut command, push_server, target_console, &spec.args);
+            }
+            "update_general_lastup" => {
+                command.arg("update").arg("--gl");
+                append_update_args(&mut command, push_server, target_console, &spec.args);
+            }
+            "convert" => {
+                let convert_target = spec.args.join("\t");
+                let (target, device) = parse_convert_job_target(&convert_target);
+                command.arg("convert").arg("--no-open").arg(target);
+                if let Some(device) = device {
+                    command.env("NAROU_RS_WEB_DEVICE", device);
+                }
+            }
+            "send" => {
+                command.arg("send");
+                for arg in spec.args {
+                    command.arg(arg);
+                }
+            }
+            "backup_bookmark" => {
+                command.arg("send").arg("--backup-bookmark");
+            }
+            "backup" => {
+                command.arg("backup");
+                for arg in spec.args {
+                    command.arg(arg);
+                }
+            }
+            "mail" => {
+                command.arg("mail");
+                for arg in spec.args {
+                    command.arg(arg);
+                }
+            }
+            "freeze" => {
+                command.arg("freeze");
+                for arg in spec.args {
+                    command.arg(arg);
+                }
+            }
+            "remove" => {
+                command.arg("remove");
+                for arg in spec.args {
+                    command.arg(arg);
+                }
+            }
+            "inspect" => {
+                command.arg("inspect");
+                for arg in spec.args {
+                    command.arg(arg);
+                }
+            }
+            "diff" => {
+                if spec.args.is_empty() {
+                    push_server.broadcast_echo("diff task has no arguments", target_console);
+                    return false;
+                }
+                return execute_diff_job(
+                    root_dir,
+                    &exe,
+                    &spec.args,
+                    push_server,
+                    running_pids,
+                    &job.id,
+                    target_console,
+                );
+            }
+            "diff_clean" => {
+                command.arg("diff").arg("--clean");
+                for arg in spec.args {
+                    command.arg(arg);
+                }
+            }
+            "setting_burn" => {
+                command.arg("setting").arg("--burn");
+                for arg in spec.args {
+                    command.arg(arg);
+                }
+            }
+            "auto_update" => unreachable!(),
+            unsupported => {
+                push_server.broadcast_echo(
+                    &format!("未対応の復元キューコマンドです: {}", unsupported),
+                    target_console,
+                );
+                return false;
+            }
+        }
+    } else {
+        match job.job_type {
+            JobType::Download => {
+                command.arg("download");
+                for part in job.target.split('\t') {
                     if !part.is_empty() {
                         command.arg(part);
                     }
                 }
             }
-        }
-        JobType::Convert => {
-            let (target, device) = parse_convert_job_target(&job.target);
-            command.arg("convert").arg("--no-open").arg(target);
-            if let Some(device) = device {
-                command.env("NAROU_RS_WEB_DEVICE", device);
-            }
-        }
-        JobType::Send => {
-            command.arg("send").arg(&job.target);
-        }
-        JobType::Backup => {
-            command.arg("backup").arg(&job.target);
-        }
-        JobType::Mail => {
-            command.arg("send").arg("--mail");
-            for part in job.target.split('\t') {
-                if !part.is_empty() {
-                    command.arg(part);
+            JobType::Update => {
+                command.arg("update");
+                if !job.target.is_empty() {
+                    let parts: Vec<String> =
+                        job.target.split('\t').map(|part| part.to_string()).collect();
+                    append_update_args(&mut command, push_server, target_console, &parts);
                 }
             }
+            JobType::Convert => {
+                let (target, device) = parse_convert_job_target(&job.target);
+                command.arg("convert").arg("--no-open").arg(target);
+                if let Some(device) = device {
+                    command.env("NAROU_RS_WEB_DEVICE", device);
+                }
+            }
+            JobType::Send => {
+                command.arg("send").arg(&job.target);
+            }
+            JobType::Backup => {
+                command.arg("backup").arg(&job.target);
+            }
+            JobType::Mail => {
+                command.arg("mail");
+                for part in job.target.split('\t') {
+                    if !part.is_empty() {
+                        command.arg(part);
+                    }
+                }
+            }
+            JobType::AutoUpdate => unreachable!(),
         }
-        JobType::AutoUpdate => unreachable!(),
     }
+    spawn_and_stream_command(command, push_server, running_pids, &job.id, target_console)
+}
 
+fn append_update_args(
+    command: &mut std::process::Command,
+    push_server: &Arc<PushServer>,
+    target_console: &str,
+    args: &[String],
+) {
+    if let Some((first, rest)) = args.split_first() {
+        if let Some(message) = first.strip_prefix(WEBUI_UPDATE_START_PREFIX) {
+            push_server.broadcast_echo(
+                &format!("<span style=\"color:#bbb\">{}</span>", message),
+                target_console,
+            );
+        } else if !first.is_empty() {
+            command.arg(first);
+        }
+        for part in rest {
+            if !part.is_empty() {
+                command.arg(part);
+            }
+        }
+    }
+}
+
+fn execute_diff_job(
+    root_dir: &Path,
+    exe: &Path,
+    args: &[String],
+    push_server: &Arc<PushServer>,
+    running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    job_id: &str,
+    target_console: &str,
+) -> bool {
+    if args.len() < 2 {
+        push_server.broadcast_echo("diff task is missing the diff number", target_console);
+        return false;
+    }
+    let (ids, number) = args.split_at(args.len() - 1);
+    let Some(number) = number.first() else {
+        push_server.broadcast_echo("diff task is missing the diff number", target_console);
+        return false;
+    };
+    let mut success = true;
+    for id in ids {
+        let mut command = std::process::Command::new(exe);
+        command
+            .current_dir(root_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("NAROU_RS_WEB_MODE", "1")
+            .arg("diff")
+            .arg("--no-tool")
+            .arg(id)
+            .arg("--number")
+            .arg(number);
+        if !spawn_and_stream_command(command, push_server, running_pids, job_id, target_console) {
+            success = false;
+        }
+    }
+    success
+}
+
+fn spawn_and_stream_command(
+    mut command: std::process::Command,
+    push_server: &Arc<PushServer>,
+    running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    job_id: &str,
+    target_console: &str,
+) -> bool {
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -221,13 +389,11 @@ fn execute_job(
         }
     };
 
-    // Store child PID for external cancellation
-    running_pids.lock().insert(job.id.clone(), child.id());
+    running_pids.lock().insert(job_id.to_string(), child.id());
 
-    // Stream stdout in a separate thread
     let stdout = child.stdout.take();
     let ps_out = Arc::clone(push_server);
-    let stdout_target_console = target_console;
+    let stdout_target_console = target_console.to_string();
     let stdout_thread = std::thread::spawn(move || {
         if let Some(out) = stdout {
             let reader = std::io::BufReader::new(out);
@@ -235,14 +401,13 @@ fn execute_job(
                 match line {
                     Ok(text) => {
                         if let Some(json_str) = text.strip_prefix(WS_LINE_PREFIX) {
-                            // Structured WS event from child process — send directly
                             if let Ok(msg) = serde_json::from_str::<serde_json::Value>(json_str) {
                                 let routed =
-                                    route_structured_web_message(msg, stdout_target_console);
+                                    route_structured_web_message(msg, &stdout_target_console);
                                 ps_out.broadcast_raw(&routed);
                             }
                         } else {
-                            ps_out.broadcast_echo(&text, stdout_target_console);
+                            ps_out.broadcast_echo(&text, &stdout_target_console);
                         }
                     }
                     Err(_) => break,
@@ -251,16 +416,15 @@ fn execute_job(
         }
     });
 
-    // Stream stderr in a separate thread
     let stderr = child.stderr.take();
     let ps_err = Arc::clone(push_server);
-    let stderr_target_console = target_console;
+    let stderr_target_console = target_console.to_string();
     let stderr_thread = std::thread::spawn(move || {
         if let Some(err) = stderr {
             let reader = std::io::BufReader::new(err);
             for line in reader.lines() {
                 match line {
-                    Ok(text) => ps_err.broadcast_echo(&text, stderr_target_console),
+                    Ok(text) => ps_err.broadcast_echo(&text, &stderr_target_console),
                     Err(_) => break,
                 }
             }
@@ -268,7 +432,7 @@ fn execute_job(
     });
 
     let status = child.wait().map(|s| s.success()).unwrap_or(false);
-    running_pids.lock().remove(&job.id);
+    running_pids.lock().remove(job_id);
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     status

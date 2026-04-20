@@ -570,6 +570,8 @@ fn auto_convert(
     };
     converter.set_progress(progress);
 
+    let _lock = narou_rs::compat::NovelLockGuard::acquire(Some(dl.id))
+        .map_err(|e| e.to_string())?;
     match converter.convert_novel_by_id(dl.id, &dl.novel_dir) {
         Ok(path) => {
             println!("  Converted: {}", path);

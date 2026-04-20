@@ -49,9 +49,6 @@ pub fn load_tag_colors(inventory: &Inventory) -> Result<TagColors> {
         let (Some(tag), Some(color)) = (tag.as_str(), color.as_str()) else {
             continue;
         };
-        if !is_valid_tag_color(color) {
-            continue;
-        }
         tag_colors.order.push(tag.to_string());
         tag_colors.colors.insert(tag.to_string(), color.to_string());
     }
@@ -143,9 +140,18 @@ mod tests {
         assert!(ensure_tag_colors(&mut tag_colors, ["fav"]));
         assert!(ensure_tag_colors(&mut tag_colors, ["later"]));
         assert!(ensure_tag_colors(&mut tag_colors, ["todo"]));
-        assert_eq!(tag_colors.colors.get("fav").map(String::as_str), Some("green"));
-        assert_eq!(tag_colors.colors.get("later").map(String::as_str), Some("yellow"));
-        assert_eq!(tag_colors.colors.get("todo").map(String::as_str), Some("blue"));
+        assert_eq!(
+            tag_colors.colors.get("fav").map(String::as_str),
+            Some("green")
+        );
+        assert_eq!(
+            tag_colors.colors.get("later").map(String::as_str),
+            Some("yellow")
+        );
+        assert_eq!(
+            tag_colors.colors.get("todo").map(String::as_str),
+            Some("blue")
+        );
     }
 
     #[test]
@@ -158,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn load_tag_colors_skips_invalid_colors() {
+    fn load_tag_colors_preserves_unknown_colors() {
         let root = temp_dir("tag-colors");
         fs::create_dir_all(root.join(".narou")).unwrap();
         fs::write(
@@ -170,8 +176,32 @@ mod tests {
         let inventory = Inventory::new(root.clone());
         let tag_colors = load_tag_colors(&inventory).unwrap();
 
-        assert_eq!(tag_colors.colors.get("fav"), None);
-        assert_eq!(tag_colors.colors.get("later").map(String::as_str), Some("green"));
+        assert_eq!(
+            tag_colors.colors.get("fav").map(String::as_str),
+            Some("purple")
+        );
+        assert_eq!(
+            tag_colors.colors.get("later").map(String::as_str),
+            Some("green")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_tag_colors_keeps_unknown_colors() {
+        let root = temp_dir("tag-colors-save");
+        fs::create_dir_all(root.join(".narou")).unwrap();
+
+        let inventory = Inventory::new(root.clone());
+        let mut tag_colors = TagColors::default();
+        tag_colors.set("fav", "purple");
+        tag_colors.set("later", "green");
+        save_tag_colors(&inventory, &tag_colors).unwrap();
+
+        let raw = fs::read_to_string(root.join(".narou").join("tag_colors.yaml")).unwrap();
+        assert!(raw.contains("fav: purple"));
+        assert!(raw.contains("later: green"));
 
         fs::remove_dir_all(root).unwrap();
     }

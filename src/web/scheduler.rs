@@ -18,24 +18,10 @@ use crate::queue::{JobType, PersistentQueue, QueueJob};
 use crate::termcolor::colored;
 
 use super::push::PushServer;
+use super::sort_state::{current_sort_from_server_setting, sort_column_key};
 
-const AUTO_UPDATE_SORT_COLUMNS: &[&str] = &["id", "last_update", "general_lastup", "last_check_date"];
-const SORT_COLUMN_KEYS: &[&str] = &[
-    "id",
-    "last_update",
-    "general_lastup",
-    "last_check_date",
-    "title",
-    "author",
-    "sitename",
-    "novel_type",
-    "tags",
-    "general_all_no",
-    "length",
-    "status",
-    "toc_url",
-];
-
+const AUTO_UPDATE_SORT_COLUMNS: &[&str] =
+    &["id", "last_update", "general_lastup", "last_check_date"];
 pub fn start_auto_update_scheduler(
     queue: Arc<PersistentQueue>,
     running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
@@ -49,9 +35,15 @@ pub fn start_auto_update_scheduler(
 
     let times = parse_schedule_times(&schedule_string);
     if times.is_empty() {
-        eprintln!("自動アップデートスケジューラーの時刻指定が不正です: {}", schedule_string);
+        eprintln!(
+            "自動アップデートスケジューラーの時刻指定が不正です: {}",
+            schedule_string
+        );
         push_server.broadcast_echo(
-            &format!("自動アップデートスケジューラーの時刻指定が不正です: {}", schedule_string),
+            &format!(
+                "自動アップデートスケジューラーの時刻指定が不正です: {}",
+                schedule_string
+            ),
             "stdout",
         );
         return None;
@@ -66,7 +58,10 @@ pub fn start_auto_update_scheduler(
 
             sleep_until(next_run).await;
             push_server.broadcast_echo(
-                &format!("自動アップデートが予定されています: {}", next_run.format("%Y/%m/%d %H:%M:%S")),
+                &format!(
+                    "自動アップデートが予定されています: {}",
+                    next_run.format("%Y/%m/%d %H:%M:%S")
+                ),
                 "stdout",
             );
 
@@ -111,9 +106,7 @@ pub fn restart_auto_update_scheduler(
     started
 }
 
-pub fn stop_auto_update_scheduler(
-    scheduler_task: &parking_lot::Mutex<Option<JoinHandle<()>>>,
-) {
+pub fn stop_auto_update_scheduler(scheduler_task: &parking_lot::Mutex<Option<JoinHandle<()>>>) {
     if let Some(task) = scheduler_task.lock().take() {
         task.abort();
     }
@@ -208,14 +201,20 @@ pub fn execute_auto_update(
         job_id,
         &running_pids,
     ) {
-        auto_update_echo(push_server.as_ref(), "自動アップデート失敗: なろうAPI更新確認");
+        auto_update_echo(
+            push_server.as_ref(),
+            "自動アップデート失敗: なろうAPI更新確認",
+        );
         return false;
     }
 
     let (modified_ids, other_ids) = collect_auto_update_target_ids();
 
     if modified_ids.is_empty() {
-        auto_update_echo(push_server.as_ref(), "自動アップデート: modified タグの付いた小説はありません");
+        auto_update_echo(
+            push_server.as_ref(),
+            "自動アップデート: modified タグの付いた小説はありません",
+        );
     } else {
         auto_update_echo(
             push_server.as_ref(),
@@ -238,13 +237,19 @@ pub fn execute_auto_update(
             job_id,
             &running_pids,
         ) {
-            auto_update_echo(push_server.as_ref(), "自動アップデート失敗: modified タグ更新");
+            auto_update_echo(
+                push_server.as_ref(),
+                "自動アップデート失敗: modified タグ更新",
+            );
             return false;
         }
     }
 
     if other_ids.is_empty() {
-        auto_update_echo(push_server.as_ref(), "自動アップデート: 通常更新の対象となるその他小説はありません");
+        auto_update_echo(
+            push_server.as_ref(),
+            "自動アップデート: 通常更新の対象となるその他小説はありません",
+        );
     } else {
         auto_update_echo(
             push_server.as_ref(),
@@ -295,50 +300,21 @@ fn build_auto_update_sort_args(push_server: &PushServer) -> Vec<&'static str> {
 
 fn read_auto_update_sort_key() -> Option<&'static str> {
     let inventory = Inventory::with_default_root().ok()?;
-    let server_setting: Value = inventory.load("server_setting", InventoryScope::Global).ok()?;
+    let server_setting: Value = inventory
+        .load("server_setting", InventoryScope::Global)
+        .ok()?;
     auto_update_sort_key_from_value(&server_setting)
 }
 
 fn auto_update_sort_key_from_value(server_setting: &Value) -> Option<&'static str> {
-    let current_sort = server_setting
-        .as_mapping()?
-        .get(Value::String("current_sort".to_string()))?;
-    let current_sort = current_sort.as_mapping()?;
-    let column_index = current_sort
-        .get(Value::String("column".to_string()))
-        .and_then(value_as_usize)
-        .or_else(|| {
-            current_sort
-                .get(Value::String(":column".to_string()))
-                .and_then(value_as_usize)
-        })?;
-    let direction = current_sort
-        .get(Value::String("dir".to_string()))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            current_sort
-                .get(Value::String(":dir".to_string()))
-                .and_then(Value::as_str)
-        })?;
-    if !matches!(direction, "asc" | "desc") {
-        return None;
-    }
-
-    let key = *SORT_COLUMN_KEYS.get(column_index)?;
+    let current_sort = current_sort_from_server_setting(server_setting)?;
+    let key = sort_column_key(&current_sort)?;
     AUTO_UPDATE_SORT_COLUMNS.contains(&key).then_some(key)
 }
 
-fn value_as_usize(value: &Value) -> Option<usize> {
-    match value {
-        Value::Number(number) => number.as_u64().map(|value| value as usize),
-        Value::String(text) => text.parse::<usize>().ok(),
-        _ => None,
-    }
-}
-
 fn collect_auto_update_target_ids() -> (Vec<String>, Vec<String>) {
-    let tag_index =
-        db::with_database(|db| Ok::<_, crate::error::NarouError>(db.tag_index())).unwrap_or_default();
+    let tag_index = db::with_database(|db| Ok::<_, crate::error::NarouError>(db.tag_index()))
+        .unwrap_or_default();
     let modified_ids: Vec<String> = tag_index
         .get("modified")
         .into_iter()
@@ -348,8 +324,10 @@ fn collect_auto_update_target_ids() -> (Vec<String>, Vec<String>) {
         .map(|id| id.to_string())
         .collect();
 
-    let modified_set: std::collections::HashSet<i64> =
-        modified_ids.iter().filter_map(|id| id.parse::<i64>().ok()).collect();
+    let modified_set: std::collections::HashSet<i64> = modified_ids
+        .iter()
+        .filter_map(|id| id.parse::<i64>().ok())
+        .collect();
     let site_settings = SiteSetting::load_all().unwrap_or_default();
     let other_ids = db::with_database(|db| {
         Ok::<_, crate::error::NarouError>(
@@ -409,7 +387,13 @@ fn run_update_phase(
     running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
 ) -> bool {
     let Ok(exe) = std::env::current_exe() else {
-        auto_update_echo(push_server.as_ref(), &format!("{} で重大なエラーが発生しました（実行ファイルを取得できません）", label));
+        auto_update_echo(
+            push_server.as_ref(),
+            &format!(
+                "{} で重大なエラーが発生しました（実行ファイルを取得できません）",
+                label
+            ),
+        );
         return false;
     };
 
@@ -428,15 +412,16 @@ fn run_update_phase(
         Err(e) => {
             auto_update_echo(
                 push_server.as_ref(),
-                &format!("{} で重大なエラーが発生しました（update を起動できません: {}）", label, e),
+                &format!(
+                    "{} で重大なエラーが発生しました（update を起動できません: {}）",
+                    label, e
+                ),
             );
             return false;
         }
     };
 
-    running_pids
-        .lock()
-        .insert(job_id.to_string(), child.id());
+    running_pids.lock().insert(job_id.to_string(), child.id());
     let stdout_thread = relay_child_stdout(child.stdout.take(), Arc::clone(push_server));
     let stderr_thread = relay_child_stderr(child.stderr.take(), Arc::clone(push_server));
 
@@ -446,12 +431,21 @@ fn run_update_phase(
     let _ = stderr_thread.join();
 
     let Ok(status) = status else {
-        auto_update_echo(push_server.as_ref(), &format!("{} で重大なエラーが発生しました（update の終了待機に失敗しました）", label));
+        auto_update_echo(
+            push_server.as_ref(),
+            &format!(
+                "{} で重大なエラーが発生しました（update の終了待機に失敗しました）",
+                label
+            ),
+        );
         return false;
     };
 
     let Some(code) = status.code() else {
-        auto_update_echo(push_server.as_ref(), &format!("{} で重大なエラーが発生しました（終了コード不明）", label));
+        auto_update_echo(
+            push_server.as_ref(),
+            &format!("{} で重大なエラーが発生しました（終了コード不明）", label),
+        );
         return false;
     };
 
@@ -463,14 +457,20 @@ fn run_update_phase(
         1..=9 => {
             auto_update_echo(
                 push_server.as_ref(),
-                &format!("{} が完了しました（{}件の小説でエラーがありました）", label, code),
+                &format!(
+                    "{} が完了しました（{}件の小説でエラーがありました）",
+                    label, code
+                ),
             );
             refresh_database_after_phase(label, push_server.as_ref())
         }
         _ => {
             auto_update_echo(
                 push_server.as_ref(),
-                &format!("{} で重大なエラーが発生しました（終了コード: {}）", label, code),
+                &format!(
+                    "{} で重大なエラーが発生しました（終了コード: {}）",
+                    label, code
+                ),
             );
             false
         }
@@ -550,8 +550,8 @@ mod tests {
         auto_update_sort_key_from_value, calculate_next_run_time, parse_schedule_times,
         queue_auto_update_job_if_needed,
     };
-    use parking_lot::Mutex;
     use crate::queue::{JobType, PersistentQueue, QueueJob};
+    use parking_lot::Mutex;
 
     #[test]
     fn parse_schedule_times_accepts_four_digit_times() {
@@ -567,12 +567,13 @@ mod tests {
 
     #[test]
     fn auto_update_sort_key_accepts_supported_current_sort() {
-        let server_setting: serde_yaml::Value = serde_yaml::from_str(
-            "current_sort:\n  column: 3\n  dir: asc\n",
-        )
-        .unwrap();
+        let server_setting: serde_yaml::Value =
+            serde_yaml::from_str("current_sort:\n  column: \"3\"\n  dir: asc\n").unwrap();
 
-        assert_eq!(auto_update_sort_key_from_value(&server_setting), Some("last_check_date"));
+        assert_eq!(
+            auto_update_sort_key_from_value(&server_setting),
+            Some("last_check_date")
+        );
     }
 
     #[test]

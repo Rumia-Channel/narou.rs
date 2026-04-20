@@ -118,7 +118,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `--path` | `-p` | string | — | AozoraEpub3 フォルダ指定。`:keep` で既存再利用 |
 | `--line-height` | `-l` | float | 1.8 | 行の高さ (em) |
 
-**Rust 実装**: `src/commands/init.rs`。AozoraEpub3 設定に加え、`.narou/local_setting.yaml` には Ruby 互換の実効初期値として `download.interval`, `download.wait-steps`, `folder-length-limit`, `filename-length-limit`, `time-zone=Asia/Tokyo`, `convert.dc-subject-exclude-tags`, `user-agent=auto` を不足分のみ補完する。AozoraEpub3 / mail 用の preset は repo 直下 `preset/` に同梱し、`init` / `mail` が `sample/narou/preset` に依存せず自己完結で動くようにした。
+**Rust 実装**: `src/commands/init.rs`。Ruby版同様、初期化時は `.narou/`・`小説データ/`・ユーザー編集用 `webnovel/` を作成し、`webnovel/*.yaml` を初回コピーする。`.narou/local_setting.yaml` や `queue.yaml` などの inventory ファイルは init 時に eager 生成せず、各機能が必要になった時点で作る。AozoraEpub3 / mail 用の preset は repo 直下 `preset/` に同梱し、`init` / `mail` が `sample/narou/preset` に依存せず自己完結で動くようにした。
 
 ---
 
@@ -539,11 +539,11 @@ narou setting name         # 読み取り
 - 初回起動時は Ruby版同様にファイアウォール許可と停止方法の案内を表示し、`server_setting.yaml` に起動済みフラグを保存する
 - global `server-basic-auth.*` が有効な場合は HTTP/WS の両ルータで Basic 認証を要求する
 - API の凍結/解凍操作と一覧上の `frozen` 判定は CLI と同じ `.narou/freeze.yaml` を優先し、`frozen` タグは補助的に扱う
-- queue worker が `.narou/queue.yaml` 永続キューを読み書きし、download / update / auto_update / convert / send / backup / mail の queued job を別プロセスまたは worker 内処理で実行する。`concurrency` 有効時は外部通信あり(download/update/auto_update)とその他(convert/send/backup/mail)を別 lane で並列実行し、無効時は全 job を投入順に逐次実行する
+- queue worker が `.narou/queue.yaml` 永続キューを読み書きし、download / update / auto_update / convert / send / backup / mail の queued job を別プロセスまたは worker 内処理で実行する。Ruby版同様 `pending` / `running` を分けて保持し、legacy `cmd` / `args` / `meta` / `status` / `created_at` / `started_at` を維持したまま復元できる。`concurrency` 有効時は外部通信あり(download/update/auto_update)とその他(convert/send/backup/mail)を別 lane で並列実行し、無効時は全 job を投入順に逐次実行する
 - Web 経由の convert job は `--no-open` で非対話化し、API 指定 device は worker 専用 override で child process に渡す
 - `queue_clear` は deadlock しないように永続キュー保存順を修正済み
 - local `update.auto-schedule.enable` / `update.auto-schedule` が有効なら、Ruby版同様に時刻指定で自動アップデートを Web queue に投入する。設定保存時は Ruby版同様に scheduler を stop/start し、サーバ再起動なしで変更を反映する
-- 自動アップデートは `--gl narou` → `modified` タグ対象 → その他小説の順に child `update` を実行し、child stdout/stderr と Web 用構造化進捗を Web UI コンソールへ中継する。実行中 phase の child PID は通常 job と同じ中止処理へ登録する。各 phase 後に Web サーバ側 DB を再読み込みして `modified` タグ検出漏れを防ぐ。`server_setting.current_sort` が有効なら対応する `--sort-by` も引き継ぐ
+- 自動アップデートは `--gl narou` → `modified` タグ対象 → その他小説の順に child `update` を実行し、child stdout/stderr と Web 用構造化進捗を Web UI コンソールへ中継する。実行中 phase の child PID は通常 job と同じ中止処理へ登録する。各 phase 後に Web サーバ側 DB を再読み込みして `modified` タグ検出漏れを防ぐ。`server_setting.current_sort` は Ruby互換に `column` 数値/数値文字列の両方を受理し、対応する `--sort-by` へ引き継ぐ
 - Web UI からのサーバ再起動では replacement process に `--no-browser` を付与し、再起動待機ページから同じタブで元ページへ戻る
 - Windows の `narou web --hide-console` は GUI subsystem で起動し、通常 CLI 実行時は親コンソールへ再接続、hidden 実行時はタスクトレイの右クリックメニューから `終了` / `再起動` を呼べる
 - Web 設定画面は Ruby版同様、`tab` がある設定を `invisible` 指定でも表示する。`webui.theme` / `webui.table.reload-timing` / `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `over18` も設定画面に出る
