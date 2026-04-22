@@ -1,6 +1,6 @@
 [package]
 name = "narou_rs"
-version = "0.11.1-beta"
+version = "0.1.12-beta"
 edition = "2024"
 license = "BSD-2-Clause"
 readme = "README.md"
