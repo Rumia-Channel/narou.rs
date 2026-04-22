@@ -66,7 +66,7 @@ impl ConverterBase {
     }
 
     pub(super) fn hankaku_num_to_zenkaku(&self, text: &str) -> String {
-        let re = Regex::new(r"\d+").unwrap();
+        let re = Regex::new(r"[0-9]+").unwrap();
         re.replace_all(text, |caps: &regex::Captures| {
             let num = &caps[0];
             let m = caps.get(0).unwrap();
@@ -262,5 +262,53 @@ fn to_fullwidth_katakana(ch: char) -> char {
 }
 
 fn to_fullwidth_digit(ch: char) -> char {
-    char::from_u32(ch as u32 - '0' as u32 + 0xFF10).unwrap_or(ch)
+    match ch {
+        '0'..='9' => char::from_u32(ch as u32 - '0' as u32 + 0xFF10).unwrap_or(ch),
+        _ => ch,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{ConverterBase, TextType};
+    use crate::converter::settings::NovelSettings;
+
+    fn run(text: &str, ty: TextType) -> String {
+        let settings = NovelSettings::default();
+        let mut cb = ConverterBase::new(settings);
+        cb.text_type = ty;
+        cb.hankaku_num_to_zenkaku(text)
+    }
+
+    #[test]
+    fn ruby_parity_halfwidth_two_digits_in_subtitle_become_tcy() {
+        // Ruby: \d (ASCII) matches "10" → tcy("10")
+        let out = run("第四章10　『知識欲の権化』", TextType::Subtitle);
+        assert_eq!(out, "第四章［＃縦中横］10［＃縦中横終わり］　『知識欲の権化』");
+    }
+
+    #[test]
+    fn ruby_parity_fullwidth_digits_pass_through_unchanged() {
+        // Ruby: \d does NOT match ０-９ (ASCII-only) → stays as-is, no tcy, no garbage codepoints
+        let out = run("第四章１０　『知識欲の権化』", TextType::Subtitle);
+        assert_eq!(out, "第四章１０　『知識欲の権化』");
+    }
+
+    #[test]
+    fn ruby_parity_single_digit_becomes_fullwidth() {
+        let out = run("第1章", TextType::Subtitle);
+        assert_eq!(out, "第１章");
+    }
+
+    #[test]
+    fn ruby_parity_three_digit_subtitle_at_line_start_becomes_tcy() {
+        let out = run("100話", TextType::Subtitle);
+        assert_eq!(out, "［＃縦中横］100［＃縦中横終わり］話");
+    }
+
+    #[test]
+    fn ruby_parity_three_digit_mid_line_becomes_fullwidth() {
+        let out = run("第100章", TextType::Subtitle);
+        assert_eq!(out, "第１００章");
+    }
 }
