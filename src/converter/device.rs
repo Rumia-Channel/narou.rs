@@ -350,9 +350,33 @@ impl OutputManager {
             cmd.stderr(Stdio::null());
         }
 
-        let status = cmd
-            .status()
+        let mut child = cmd
+            .spawn()
             .map_err(|e| NarouError::Conversion(format!("Failed to run AozoraEpub3: {}", e)))?;
+
+        let status = if self.verbose {
+            eprintln!("AozoraEpub3でEPUBに変換しています");
+            child
+                .wait()
+                .map_err(|e| NarouError::Conversion(format!("Failed to run AozoraEpub3: {}", e)))?
+        } else {
+            eprint!("AozoraEpub3でEPUBに変換しています");
+            let _ = std::io::stderr().flush();
+            let status = loop {
+                match child.try_wait().map_err(|e| {
+                    NarouError::Conversion(format!("Failed to wait for AozoraEpub3: {}", e))
+                })? {
+                    Some(status) => break status,
+                    None => {
+                        eprint!(".");
+                        let _ = std::io::stderr().flush();
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+            };
+            eprintln!();
+            status
+        };
 
         if !status.success() {
             return Err(NarouError::Conversion(format!(
@@ -368,10 +392,12 @@ impl OutputManager {
             )));
         }
 
+        eprintln!("変換しました");
         Ok(output_path)
     }
 
     fn create_ibunko_zip(&self, input_txt: &Path, include_illust: bool) -> Result<PathBuf> {
+        eprintln!("zipファイルを作成中です...");
         let mut data = std::fs::read_to_string(input_txt)?;
         let html_re = Regex::new(r"</?[^>]+>").unwrap();
         loop {
@@ -460,6 +486,7 @@ impl OutputManager {
         }
 
         let _ = std::fs::remove_file(sanitized_txt_path);
+        eprintln!("作成しました");
         Ok(zipfile_path)
     }
 
