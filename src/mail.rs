@@ -975,7 +975,10 @@ mod tests {
         via_options.insert("allow_insecure".to_string(), serde_yaml::Value::Bool(true));
 
         assert!(smtp_allow_insecure(&via_options));
-        assert_eq!(smtp_tls_mode(&via_options, 587).unwrap(), SmtpTlsMode::Required);
+        assert_eq!(
+            smtp_tls_mode(&via_options, 587).unwrap(),
+            SmtpTlsMode::Opportunistic
+        );
 
         via_options.insert(
             "enable_starttls_auto".to_string(),

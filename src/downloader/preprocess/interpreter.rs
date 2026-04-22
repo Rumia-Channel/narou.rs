@@ -149,11 +149,11 @@ fn eval_expr(ctx: &mut Ctx, expr: &Expr) -> PreprocessResult<Value> {
             val
         }
         Expr::Array(items) => {
+            validate_array_len(items.len())?;
             let mut values = Vec::with_capacity(items.len());
             for item in items {
                 values.push(eval_expr(ctx, item)?);
             }
-            validate_array_len(values.len())?;
             Value::Array(values)
         }
         Expr::ExtractJson(_, _) | Expr::Regex(_, _) => Value::Null,
