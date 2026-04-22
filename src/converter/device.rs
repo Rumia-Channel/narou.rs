@@ -290,6 +290,14 @@ impl OutputManager {
                 .file_name()
                 .ok_or_else(|| NarouError::Conversion("Invalid AozoraEpub3 path".into()))?;
             let mut cmd = Command::new(java_path);
+            // narou.rb 互換: JVM の文字コードを UTF-8 に固定する。
+            // これがないと Windows 既定 (Shift-JIS) で読み書きされ、
+            // UTF-8 の入力 txt 内の全角文字 (例: "１０") が文字化けする。
+            cmd.arg("-Dfile.encoding=UTF-8");
+            cmd.arg("-Dstdout.encoding=UTF-8");
+            cmd.arg("-Dstderr.encoding=UTF-8");
+            cmd.arg("-Dsun.stdout.encoding=UTF-8");
+            cmd.arg("-Dsun.stderr.encoding=UTF-8");
             cmd.arg("-cp").arg(jar_name);
             cmd.arg("AozoraEpub3");
             cmd
@@ -324,6 +332,10 @@ impl OutputManager {
 
         cmd.arg("-d").arg(output_dir);
         cmd.arg("-ext").arg(output_ext);
+        // narou.rb 互換: 入力 txt の文字コードを UTF-8 として明示する。
+        // 省略すると AozoraEpub3 既定の Shift-JIS で解釈され、全角数字等が
+        // 文字化けする (例: "１０" → 別の Unicode に化ける)。
+        cmd.arg("-enc").arg("UTF-8");
         cmd.arg("-of");
         cmd.arg(input_txt);
         if !self.verbose {
