@@ -407,7 +407,7 @@ fn build_transport(setting: &MailSetting) -> std::result::Result<SmtpTransport, 
     let password = yaml_string(via_options.get("password")).unwrap_or_default();
     let authentication = smtp_auth_mechanisms(via_options.get("authentication"));
     let domain = yaml_string(via_options.get("domain")).filter(|value| !value.is_empty());
-    let tls_mode = smtp_tls_mode(via_options, port);
+    let tls_mode = smtp_tls_mode(via_options, port)?;
 
     let mut builder = SmtpTransport::builder_dangerous(&host).port(port);
     if let Some(tls) = smtp_tls(via_options, tls_mode, domain.as_deref().unwrap_or(&host))? {
@@ -426,23 +426,44 @@ fn build_transport(setting: &MailSetting) -> std::result::Result<SmtpTransport, 
         builder = builder.authentication(authentication);
     }
 
+    if tls_mode == SmtpTlsMode::None {
+        eprintln!("WARN: insecure plain SMTP is enabled by explicit opt-in");
+    }
+
     Ok(builder.build())
 }
 
-fn smtp_tls_mode(via_options: &HashMap<String, serde_yaml::Value>, port: u16) -> SmtpTlsMode {
+fn smtp_tls_mode(
+    via_options: &HashMap<String, serde_yaml::Value>,
+    port: u16,
+) -> std::result::Result<SmtpTlsMode, String> {
     if yaml_bool(via_options.get("ssl")).unwrap_or(false)
         || yaml_bool(via_options.get("tls")).unwrap_or(false)
         || port == 465
     {
-        return SmtpTlsMode::Wrapper;
+        return Ok(SmtpTlsMode::Wrapper);
     }
     if yaml_bool(via_options.get("enable_starttls")).unwrap_or(false) {
-        return SmtpTlsMode::Required;
+        return Ok(SmtpTlsMode::Required);
     }
     if yaml_bool(via_options.get("enable_starttls_auto")).unwrap_or(true) {
-        return SmtpTlsMode::Opportunistic;
+        if smtp_allow_insecure(via_options) {
+            eprintln!("WARN: opportunistic STARTTLS is enabled by explicit opt-in");
+            return Ok(SmtpTlsMode::Opportunistic);
+        }
+        return Ok(SmtpTlsMode::Required);
     }
-    SmtpTlsMode::None
+    if smtp_allow_insecure(via_options) {
+        return Ok(SmtpTlsMode::None);
+    }
+
+    eprintln!(
+        "WARN: plain SMTP / STARTTLS disabled in mail_setting.yaml without explicit opt-in"
+    );
+    Err(
+        "安全でない SMTP 設定です。via_options.allow_insecure: true または local_setting の mail.smtp.allow_insecure: true を明示してください"
+            .to_string(),
+    )
 }
 
 fn smtp_tls(
@@ -456,6 +477,7 @@ fn smtp_tls(
 
     let mut builder = TlsParametersBuilder::new(tls_domain.to_string());
     if smtp_accept_invalid_certs(via_options) {
+        eprintln!("WARN: SMTP certificate verification is disabled by explicit opt-in");
         builder = builder
             .dangerous_accept_invalid_certs(true)
             .dangerous_accept_invalid_hostnames(true);
@@ -471,14 +493,21 @@ fn smtp_tls(
 }
 
 fn smtp_accept_invalid_certs(via_options: &HashMap<String, serde_yaml::Value>) -> bool {
-    yaml_string(via_options.get("openssl_verify_mode"))
-        .map(|mode| {
-            matches!(
-                mode.trim_start_matches(':').to_ascii_lowercase().as_str(),
-                "none" | "verify_none"
-            )
-        })
-        .unwrap_or(false)
+    yaml_bool(via_options.get("tls_skip_verify")).unwrap_or(false)
+        || crate::compat::load_local_setting_bool("mail.smtp.tls_skip_verify")
+        || yaml_string(via_options.get("openssl_verify_mode"))
+            .map(|mode| {
+                matches!(
+                    mode.trim_start_matches(':').to_ascii_lowercase().as_str(),
+                    "none" | "verify_none"
+                )
+            })
+            .unwrap_or(false)
+}
+
+fn smtp_allow_insecure(via_options: &HashMap<String, serde_yaml::Value>) -> bool {
+    yaml_bool(via_options.get("allow_insecure")).unwrap_or(false)
+        || crate::compat::load_local_setting_bool("mail.smtp.allow_insecure")
 }
 
 fn resolve_record(target: &str) -> std::result::Result<Option<NovelRecord>, String> {
@@ -808,8 +837,8 @@ fn preset_dir() -> Result<PathBuf> {
 mod tests {
     use super::{
         MAIL_INTERRUPTED_MESSAGE, MailSetting, SmtpTlsMode, attachment_name, build_message,
-        build_transport, send_mail_with_progress, smtp_accept_invalid_certs, smtp_auth_mechanisms,
-        smtp_tls_mode,
+        build_transport, send_mail_with_progress, smtp_accept_invalid_certs, smtp_allow_insecure,
+        smtp_auth_mechanisms, smtp_tls_mode,
     };
     use lettre::transport::smtp::authentication::Mechanism;
     use std::collections::HashMap;
@@ -871,7 +900,7 @@ mod tests {
             serde_yaml::Value::Number(serde_yaml::Number::from(587)),
         );
         via_options.insert(
-            "enable_starttls_auto".to_string(),
+            "enable_starttls".to_string(),
             serde_yaml::Value::Bool(false),
         );
         via_options.insert(
@@ -906,16 +935,16 @@ mod tests {
     #[test]
     fn smtp_tls_mode_matches_pony_style_flags() {
         let mut via_options = HashMap::new();
-        assert_eq!(smtp_tls_mode(&via_options, 587), SmtpTlsMode::Opportunistic);
+        assert_eq!(smtp_tls_mode(&via_options, 587).unwrap(), SmtpTlsMode::Required);
 
         via_options.insert("enable_starttls".to_string(), serde_yaml::Value::Bool(true));
-        assert_eq!(smtp_tls_mode(&via_options, 587), SmtpTlsMode::Required);
+        assert_eq!(smtp_tls_mode(&via_options, 587).unwrap(), SmtpTlsMode::Required);
 
         via_options.remove("enable_starttls");
         via_options.insert("ssl".to_string(), serde_yaml::Value::Bool(true));
-        assert_eq!(smtp_tls_mode(&via_options, 587), SmtpTlsMode::Wrapper);
+        assert_eq!(smtp_tls_mode(&via_options, 587).unwrap(), SmtpTlsMode::Wrapper);
 
-        assert_eq!(smtp_tls_mode(&HashMap::new(), 465), SmtpTlsMode::Wrapper);
+        assert_eq!(smtp_tls_mode(&HashMap::new(), 465).unwrap(), SmtpTlsMode::Wrapper);
     }
 
     #[test]
@@ -927,6 +956,32 @@ mod tests {
         );
 
         assert!(smtp_accept_invalid_certs(&via_options));
+    }
+
+    #[test]
+    fn smtp_tls_mode_rejects_plain_without_opt_in() {
+        let mut via_options = HashMap::new();
+        via_options.insert(
+            "enable_starttls_auto".to_string(),
+            serde_yaml::Value::Bool(false),
+        );
+
+        assert!(smtp_tls_mode(&via_options, 587).is_err());
+    }
+
+    #[test]
+    fn smtp_allow_insecure_accepts_explicit_opt_in() {
+        let mut via_options = HashMap::new();
+        via_options.insert("allow_insecure".to_string(), serde_yaml::Value::Bool(true));
+
+        assert!(smtp_allow_insecure(&via_options));
+        assert_eq!(smtp_tls_mode(&via_options, 587).unwrap(), SmtpTlsMode::Required);
+
+        via_options.insert(
+            "enable_starttls_auto".to_string(),
+            serde_yaml::Value::Bool(false),
+        );
+        assert_eq!(smtp_tls_mode(&via_options, 587).unwrap(), SmtpTlsMode::None);
     }
 
     #[test]

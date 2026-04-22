@@ -7,7 +7,10 @@ use super::fetch::HttpFetcher;
 use super::novel_info::NovelInfo;
 use super::site_setting::SiteSetting;
 use super::types::SubtitleInfo;
-use super::util::{load_length_limit, pretreatment_source, sanitize_filename, sanitize_filename_with_limit};
+use super::util::{
+    compile_html_pattern, load_length_limit, pretreatment_source, sanitize_filename,
+    sanitize_filename_with_limit,
+};
 
 pub fn fetch_toc(
     fetcher: &mut HttpFetcher,
@@ -21,7 +24,7 @@ pub fn fetch_toc(
     pretreatment_source(&mut body, setting.encoding(), Some(setting));
 
     if let Some(error_pattern) = setting.error_message() {
-        if let Ok(re) = regex::Regex::new(error_pattern) {
+        if let Ok(re) = compile_html_pattern(error_pattern) {
             if re.is_match(&body) {
                 return Err(NarouError::NotFound("Novel deleted or private".into()));
             }

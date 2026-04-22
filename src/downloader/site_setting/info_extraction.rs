@@ -3,6 +3,35 @@ use std::collections::HashMap;
 use regex::RegexBuilder;
 
 use super::{SiteSetting, SiteSettingEntry, SiteSettingValue};
+use crate::downloader::security::{MAX_REGEX_INPUT_LEN, MAX_YAML_REGEX_PATTERN_LEN};
+use crate::downloader::util::DEFAULT_REGEX_SIZE_LIMIT;
+
+fn build_standard_regex(pattern: &str) -> std::result::Result<regex::Regex, regex::Error> {
+    if pattern.len() > MAX_YAML_REGEX_PATTERN_LEN {
+        return Err(regex::Error::Syntax(format!(
+            "YAML regex pattern exceeds {} bytes",
+            MAX_YAML_REGEX_PATTERN_LEN
+        )));
+    }
+
+    RegexBuilder::new(pattern)
+        .dot_matches_new_line(true)
+        .multi_line(true)
+        .size_limit(DEFAULT_REGEX_SIZE_LIMIT)
+        .build()
+}
+
+fn fancy_regex_allowed(pattern: &str, source: &str, key: &str) -> bool {
+    if pattern.len() > MAX_YAML_REGEX_PATTERN_LEN {
+        eprintln!("WARN: skipping fancy-regex for {key}: pattern is too large");
+        return false;
+    }
+    if source.len() > MAX_REGEX_INPUT_LEN {
+        eprintln!("WARN: skipping fancy-regex for {key}: input is too large");
+        return false;
+    }
+    true
+}
 
 /// Try matching with the standard regex crate first; fall back to fancy-regex
 /// for patterns that use lookahead/lookbehind (unsupported by the regex crate).
@@ -11,10 +40,7 @@ fn try_regex_captures(
     source: &str,
     key: &str,
 ) -> Option<String> {
-    let re = RegexBuilder::new(pattern)
-        .dot_matches_new_line(true)
-        .multi_line(true)
-        .build();
+    let re = build_standard_regex(pattern);
 
     if let Ok(re) = re {
         if let Some(caps) = re.captures(source) {
@@ -33,6 +59,9 @@ fn try_regex_captures(
     }
 
     // Fallback to fancy-regex for lookahead/lookbehind patterns
+    if !fancy_regex_allowed(pattern, source, key) {
+        return None;
+    }
     let fre = fancy_regex::RegexBuilder::new(pattern)
         .dot_matches_new_line(true)
         .multi_line(true)
@@ -55,10 +84,7 @@ fn try_regex_captures(
 }
 
 fn try_regex_captures_all(pattern: &str, source: &str, key: &str) -> Vec<String> {
-    let re = RegexBuilder::new(pattern)
-        .dot_matches_new_line(true)
-        .multi_line(true)
-        .build();
+    let re = build_standard_regex(pattern);
 
     if let Ok(re) = re {
         let mut values: Vec<String> = Vec::new();
@@ -82,6 +108,9 @@ fn try_regex_captures_all(pattern: &str, source: &str, key: &str) -> Vec<String>
         return values;
     }
 
+    if !fancy_regex_allowed(pattern, source, key) {
+        return Vec::new();
+    }
     let fre = fancy_regex::RegexBuilder::new(pattern)
         .dot_matches_new_line(true)
         .multi_line(true)

@@ -35,6 +35,11 @@
   :address              : smtp.gmail.com
   :port                 : 587
   :enable_starttls_auto : true
+                        # narou.rs は既定で TLS 必須です。
+                        # 平文SMTPや opportunistic STARTTLS が必要な場合だけ
+                        # :allow_insecure : true を明示してください。
+                        # 証明書検証を無効化する必要がある場合だけ
+                        # :tls_skip_verify : true を明示してください。
   :user_name            : your_gmail_account
   :password             : password
                         # ２段階認証の場合はアプリケーション固有のパスワード
@@ -59,6 +64,8 @@
 #   :address              : smtp.mail.yahoo.co.jp
 #   :port                 : 587
 #   :enable_starttls_auto : true
+#                         # :allow_insecure    : true
+#                         # :tls_skip_verify   : true
 #   :user_name            : ヤフーID
 #   :password             : パスワード
 #   :authentication       : :plain

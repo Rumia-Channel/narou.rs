@@ -118,7 +118,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `--path` | `-p` | string | — | AozoraEpub3 フォルダ指定。`:keep` で既存再利用 |
 | `--line-height` | `-l` | float | 1.8 | 行の高さ (em) |
 
-**Rust 実装**: `src/commands/init.rs`。Ruby版同様、初期化時は `.narou/`・`小説データ/`・ユーザー編集用 `webnovel/` を作成し、`webnovel/*.yaml` を初回コピーする。`.narou/local_setting.yaml` や `queue.yaml` などの inventory ファイルは init 時に eager 生成せず、各機能が必要になった時点で作る。AozoraEpub3 / mail 用の preset は repo 直下 `preset/` に同梱し、`init` / `mail` が `sample/narou/preset` に依存せず自己完結で動くようにした。
+**Rust 実装**: `src/commands/init.rs`。Ruby版同様、初期化時は `.narou/`・`小説データ/`・ユーザー編集用 `webnovel/` を作成し、`webnovel/*.yaml` を初回コピーする。`.narou/local_setting.yaml` や `queue.yaml` などの inventory ファイルは init 時に eager 生成せず、各機能が必要になった時点で作る。AozoraEpub3 / mail 用の preset は repo 直下 `preset/` に同梱し、`init` / `mail` が `sample/narou/preset` に依存せず自己完結で動くようにした。2026-04 の FS hardening で `--path` / `:keep` は絶対パスのみ受け付け、UNC・drive-relative・`\\?\` 形式を拒否した上で canonicalize 後も `AozoraEpub3.jar` の親ディレクトリ一致を再確認する。
 
 ---
 
@@ -513,7 +513,7 @@ narou setting name         # 読み取り
 - `hotentry` 特別扱い、tag 展開、alias / タイトル / URL / Nコード解決に対応
 - 送信中は `メールを送信しています...` の進捗表示を行い、成功時に `last_mail_date` を更新する
 - `smtp` 経路では preset に含まれる `via_options.domain` を EHLO 名へ反映し、`authentication` は `:plain` / `:login` / `:xoauth2` を受理する
-- `smtp` の TLS 解釈は Ruby/Pony 寄りに拡張し、`ssl` / `tls` / `enable_starttls` / `enable_starttls_auto` と `openssl_verify_mode: :none` を受理する
+- `smtp` の TLS 解釈は Ruby/Pony 寄りに拡張しつつ、narou.rs では既定で TLS 必須にした。`ssl` / `tls` / `enable_starttls` / `enable_starttls_auto` は継続受理し、`allow_insecure: true` / `mail.smtp.allow_insecure` と `tls_skip_verify: true` / `mail.smtp.tls_skip_verify` を明示した場合だけ平文SMTP・opportunistic STARTTLS・証明書検証無効化を許可する
 - message 生成では `reply_to` / `cc` / `bcc` を受理し、複数宛先は YAML sequence またはカンマ区切り文字列で解釈する
 
 **完了扱いにしない理由 / 不足動作**:

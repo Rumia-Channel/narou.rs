@@ -6,6 +6,7 @@ pub mod novel_info;
 pub mod persistence;
 pub mod preprocess;
 pub mod rate_limit;
+pub mod security;
 pub mod section;
 pub mod site_setting;
 pub mod toc;
@@ -38,7 +39,10 @@ use self::persistence::{
 use self::section::{SectionCache, download_section};
 use self::site_setting::SiteSetting;
 use self::toc::{create_short_story_subtitles, fetch_toc, parse_subtitles_multipage};
-use self::util::{load_length_limit, mask_spoiler_text, sanitize_filename_with_limit};
+use self::security::is_safe_public_url;
+use self::util::{
+    compile_html_pattern, load_length_limit, mask_spoiler_text, sanitize_filename_with_limit,
+};
 
 pub use self::types::{
     ARCHIVE_ROOT_DIR, DownloadResult, NarouApiEntry, NarouApiResult, RAW_DATA_DIR,
@@ -800,7 +804,7 @@ impl Downloader {
             None => return Ok(()),
         };
 
-        let re = regex::Regex::new(illust_url_pattern).map_err(|e| NarouError::Regex(e))?;
+        let re = compile_html_pattern(illust_url_pattern).map_err(NarouError::Regex)?;
 
         let intro_text = section.introduction.as_str();
         let post_text = section.postscript.as_str();
@@ -817,6 +821,11 @@ impl Downloader {
                 if let Some(url_match) = caps.get(1) {
                     let url = url_match.as_str();
                     if url.is_empty() {
+                        continue;
+                    }
+                    if !is_safe_public_url(url) {
+                        eprintln!("WARN: skipping unsafe illustration URL: {url}");
+                        illust_count += 1;
                         continue;
                     }
 
@@ -839,15 +848,13 @@ impl Downloader {
                     }
 
                     self.fetcher.rate_limiter.wait();
-                    match self.fetcher.client.get(url).send() {
-                        Ok(resp) => {
-                            if resp.status().is_success() {
-                                if let Ok(bytes) = resp.bytes() {
-                                    let _ = std::fs::write(&save_path, &bytes);
-                                }
-                            }
+                    match self.fetcher.fetch_bytes(url, None) {
+                        Ok(bytes) => {
+                            let _ = std::fs::write(&save_path, &bytes);
                         }
-                        Err(_) => {}
+                        Err(err) => {
+                            eprintln!("WARN: failed to download illustration {url}: {err}");
+                        }
                     }
 
                     illust_count += 1;

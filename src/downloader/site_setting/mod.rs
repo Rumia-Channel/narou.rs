@@ -215,9 +215,14 @@ impl SiteSetting {
             }
         };
         let resolved = self.interpolate(&pattern);
+        if resolved.len() > crate::downloader::security::MAX_YAML_REGEX_PATTERN_LEN {
+            return None;
+        }
+
         RegexBuilder::new(&resolved)
             .dot_matches_new_line(true)
             .multi_line(true)
+            .size_limit(crate::downloader::util::DEFAULT_REGEX_SIZE_LIMIT)
             .build()
             .ok()
     }
@@ -228,7 +233,11 @@ impl SiteSetting {
             match url_val {
                 SiteSettingValue::Single(s) => {
                     let resolved = self.interpolate(s);
-                    if let Ok(re) = Regex::new(&resolved) {
+                    if resolved.len() <= crate::downloader::security::MAX_YAML_REGEX_PATTERN_LEN
+                        && let Ok(re) = RegexBuilder::new(&resolved)
+                            .size_limit(crate::downloader::util::DEFAULT_REGEX_SIZE_LIMIT)
+                            .build()
+                    {
                         patterns.push(re);
                     }
                 }
@@ -236,7 +245,12 @@ impl SiteSetting {
                     for entry in entries {
                         if let SiteSettingEntry::Plain(s) = entry {
                             let resolved = self.interpolate(s);
-                            if let Ok(re) = Regex::new(&resolved) {
+                            if resolved.len()
+                                <= crate::downloader::security::MAX_YAML_REGEX_PATTERN_LEN
+                                && let Ok(re) = RegexBuilder::new(&resolved)
+                                    .size_limit(crate::downloader::util::DEFAULT_REGEX_SIZE_LIMIT)
+                                    .build()
+                            {
                                 patterns.push(re);
                             }
                         }

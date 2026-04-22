@@ -1,5 +1,8 @@
 use super::preprocess;
 use super::site_setting::SiteSetting;
+use super::security::MAX_YAML_REGEX_PATTERN_LEN;
+
+pub const DEFAULT_REGEX_SIZE_LIMIT: usize = 1_000_000;
 
 pub fn build_section_url(setting: &SiteSetting, toc_url: &str, href: &str) -> String {
     let href = decode_html_href(href);
@@ -29,9 +32,16 @@ fn decode_html_href(href: &str) -> String {
 }
 
 pub fn compile_html_pattern(pattern: &str) -> std::result::Result<regex::Regex, regex::Error> {
+    if pattern.len() > MAX_YAML_REGEX_PATTERN_LEN {
+        return Err(regex::Error::Syntax(format!(
+            "YAML regex pattern exceeds {} bytes",
+            MAX_YAML_REGEX_PATTERN_LEN
+        )));
+    }
+
     regex::RegexBuilder::new(pattern)
         .dot_matches_new_line(true)
-        .size_limit(10_000_000)
+        .size_limit(DEFAULT_REGEX_SIZE_LIMIT)
         .build()
 }
 
@@ -76,16 +86,7 @@ pub fn load_length_limit(key: &str, default: Option<usize>) -> Option<usize> {
 }
 
 pub fn sanitize_filename_with_limit(name: &str, limit: Option<usize>) -> String {
-    let invalid = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
-    let sanitized = name
-        .chars()
-        .map(|c| if invalid.contains(&c) { '_' } else { c })
-        .collect::<String>();
-    let truncated = match limit {
-        Some(limit) => sanitized.chars().take(limit).collect::<String>(),
-        None => sanitized,
-    };
-    truncated.trim_end_matches([' ', '.']).to_string()
+    crate::db::paths::sanitize_windows_filename_component_with_limit(name, limit, Some('_'), "_")
 }
 
 pub fn sanitize_filename(name: &str) -> String {
@@ -126,6 +127,13 @@ mod tests {
     #[test]
     fn sanitize_filename_with_limit_truncates_after_sanitizing() {
         assert_eq!(sanitize_filename_with_limit("ab/cd", Some(4)), "ab_c");
+    }
+
+    #[test]
+    fn sanitize_filename_with_limit_rejects_reserved_and_control_names() {
+        assert_eq!(sanitize_filename_with_limit("CON.txt", None), "_CON.txt");
+        assert_eq!(sanitize_filename_with_limit("bad\0name\x7F", None), "badname");
+        assert_eq!(sanitize_filename_with_limit("trail. ", None), "trail");
     }
 
     #[test]
