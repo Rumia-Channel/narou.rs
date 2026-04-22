@@ -420,6 +420,13 @@ export function bindActions() {
 
   on('gl-update-close', () => document.getElementById('gl-update-modal')?.classList.add('hide'));
   on('gl-update-cancel', () => document.getElementById('gl-update-modal')?.classList.add('hide'));
+  const queueGeneralLastupUpdate = (option, isUpdateModified = false) => {
+    postJson('/api/update_general_lastup', {
+      option,
+      is_update_modified: isUpdateModified
+    });
+  };
+
   on('gl-update-submit', () => {
     const glNarou = document.getElementById('gl-update-narou')?.checked;
     const glOther = document.getElementById('gl-update-other')?.checked;
@@ -433,10 +440,7 @@ export function bindActions() {
       return;
     }
     let option = (glNarou && glOther) ? 'all' : (glNarou ? 'narou' : 'other');
-    postJson('/api/update_general_lastup', {
-      option: option,
-      is_update_modified: isUpdateModified
-    });
+    queueGeneralLastupUpdate(option, isUpdateModified);
     document.getElementById('gl-update-modal')?.classList.add('hide');
   });
 
@@ -501,11 +505,11 @@ export function bindActions() {
   });
 
   on('btn-gl-narou', () => {
-    postJson('/api/update', { targets: ['--gl', 'narou'] });
+    queueGeneralLastupUpdate('narou');
   });
 
   on('btn-gl-other', () => {
-    postJson('/api/update', { targets: ['--gl', 'other'] });
+    queueGeneralLastupUpdate('other');
   });
 
   on('btn-gl-modified', () => {
