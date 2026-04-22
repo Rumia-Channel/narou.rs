@@ -83,17 +83,12 @@ fn convert_filename_to_ncode() -> bool {
 }
 
 fn sanitize_filename_for_output(name: &str) -> String {
-    let invalid = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '\0'];
-    let cleaned: String = name.chars().filter(|c| !invalid.contains(c)).collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        "output".to_string()
-    } else {
-        match output_filename_length_limit() {
-            Some(limit) => trimmed.chars().take(limit).collect(),
-            None => trimmed.to_string(),
-        }
-    }
+    crate::db::paths::sanitize_windows_filename_component_with_limit(
+        name,
+        output_filename_length_limit(),
+        None,
+        "output",
+    )
 }
 
 fn output_filename_length_limit() -> Option<usize> {
@@ -159,7 +154,7 @@ fn extract_ncode_like(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::create_output_text_path_for_textfile;
+    use super::{create_output_text_path_for_textfile, sanitize_filename_for_output};
     use crate::converter::settings::NovelSettings;
 
     #[test]
@@ -183,5 +178,14 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sanitize_filename_for_output_handles_reserved_names_and_controls() {
+        assert_eq!(sanitize_filename_for_output("CON.txt"), "_CON.txt");
+        assert_eq!(sanitize_filename_for_output("bad\0name\x1F"), "badname");
+        assert_eq!(sanitize_filename_for_output("trail. "), "trail");
+        assert_eq!(sanitize_filename_for_output("　全角 title "), "　全角 title");
+        assert_eq!(sanitize_filename_for_output(""), "output");
     }
 }

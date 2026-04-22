@@ -74,6 +74,8 @@ pub fn save_section_file(
     subtitle: &SubtitleInfo,
     section: &SectionElement,
 ) -> Result<()> {
+    let section_dir = validate_archive_write_dir(section_dir, 2)?;
+    std::fs::create_dir_all(&section_dir)?;
     let safe_subtitle = crate::downloader::util::sanitize_filename(&subtitle.file_subtitle);
     let filename = format!("{} {}.yaml", subtitle.index, safe_subtitle);
     let path = section_dir.join(filename);
@@ -96,6 +98,8 @@ pub fn save_section_file(
 }
 
 pub fn save_raw_file(raw_dir: &PathBuf, subtitle: &SubtitleInfo, raw_html: &str) -> Result<()> {
+    let raw_dir = validate_archive_write_dir(raw_dir, 2)?;
+    std::fs::create_dir_all(&raw_dir)?;
     let safe_subtitle = crate::downloader::util::sanitize_filename(&subtitle.file_subtitle);
     let filename = format!("{} {}.html", subtitle.index, safe_subtitle);
     let path = raw_dir.join(filename);
@@ -135,6 +139,8 @@ pub fn fix_yaml_block_scalar(yaml: &str) -> String {
 }
 
 pub fn save_toc_file(novel_dir: &PathBuf, toc: &TocFile) -> Result<()> {
+    let novel_dir = validate_archive_write_dir(novel_dir, 1)?;
+    std::fs::create_dir_all(&novel_dir)?;
     let path = novel_dir.join("toc.yaml");
     let yaml_body = serde_yaml::to_string(toc)?;
     let content = format!("---\n{}\n", fix_yaml_block_scalar(&yaml_body));
@@ -143,6 +149,10 @@ pub fn save_toc_file(novel_dir: &PathBuf, toc: &TocFile) -> Result<()> {
 }
 
 pub fn ensure_default_files(novel_dir: &PathBuf, title: &str, author: &str, toc_url: &str) {
+    let Ok(novel_dir) = validate_archive_write_dir(novel_dir, 1) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&novel_dir);
     let setting_path = novel_dir.join("setting.ini");
     if !setting_path.exists() {
         let default_ini = crate::converter::ini::IniData::new();
@@ -158,4 +168,22 @@ pub fn ensure_default_files(novel_dir: &PathBuf, title: &str, author: &str, toc_
         );
         let _ = std::fs::write(&replace_path, content);
     }
+}
+
+fn validate_archive_write_dir(path: &Path, fallback_depth: usize) -> Result<PathBuf> {
+    let archive_root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .unwrap_or_else(|_| infer_archive_root(path, fallback_depth));
+    crate::db::paths::ensure_within_archive_root(path, &archive_root)
+}
+
+fn infer_archive_root(path: &Path, fallback_depth: usize) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..fallback_depth {
+        if let Some(parent) = current.parent() {
+            current = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+    current
 }

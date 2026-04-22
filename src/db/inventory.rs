@@ -3,7 +3,9 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
+use fs2::FileExt;
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -12,6 +14,7 @@ use crate::error::{NarouError, Result};
 
 const CACHE_MAX_SIZE: usize = 200;
 const CACHE_TARGET_SIZE: usize = 160;
+pub(crate) const MAX_YAML_SIZE_BYTES: u64 = 32 * 1024 * 1024;
 
 const PROTECTED_KEYS: &[&str] = &[
     "local_setting",
@@ -117,6 +120,7 @@ impl Inventory {
 
         let path = self.inventory_path(name, scope);
         let content = if path.exists() {
+            ensure_yaml_size_limit(&path)?;
             fs::read_to_string(&path)?
         } else {
             String::new()
@@ -176,6 +180,8 @@ impl Inventory {
     }
 }
 
+static PROCESS_WRITE_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Arc<StdMutex<()>>>>> = OnceLock::new();
+
 #[derive(Debug, Clone, Copy)]
 pub enum InventoryScope {
     Local,
@@ -183,20 +189,26 @@ pub enum InventoryScope {
 }
 
 pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
-    let tmp_path = temporary_write_path(path);
+    let process_lock = process_write_lock_for(path);
+    let _process_guard = process_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let lock_path = lock_file_path(path);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)?;
+    lock_file.lock_exclusive()?;
     let retries = 20u32;
     let mut last_error = None;
 
     for attempt in 0..retries {
-        let _ = fs::remove_file(&tmp_path);
-        {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)?;
-            file.write_all(content.as_bytes())?;
-            file.sync_all()?;
-        }
+        let (mut file, tmp_path) = temporary_write_file(path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
 
         match fs::rename(&tmp_path, path) {
             Ok(_) => return Ok(()),
@@ -217,16 +229,51 @@ pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
     })))
 }
 
-fn temporary_write_path(path: &Path) -> PathBuf {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
+pub(crate) fn ensure_yaml_size_limit(path: &Path) -> Result<()> {
+    let size = fs::metadata(path)?.len();
+    if size > MAX_YAML_SIZE_BYTES {
+        return Err(NarouError::Database(format!(
+            "{} exceeds maximum supported YAML size ({} bytes)",
+            path.display(),
+            MAX_YAML_SIZE_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn temporary_write_file(path: &Path) -> Result<(fs::File, PathBuf)> {
     let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or("inventory");
-    let tmp_name = format!(".{}.{}.{}.tmp", filename, std::process::id(), stamp);
+    let tempfile = tempfile::Builder::new()
+        .prefix(&format!(".{filename}."))
+        .suffix(".tmp")
+        .rand_bytes(16)
+        .tempfile_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    tempfile.keep().map_err(|e| NarouError::Io(e.error))
+}
+
+fn lock_file_path(path: &Path) -> PathBuf {
+    let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or("inventory");
     path.parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(tmp_name)
+        .join(format!("{filename}.lock"))
+}
+
+fn process_write_lock_for(path: &Path) -> Arc<StdMutex<()>> {
+    let key = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut locks = PROCESS_WRITE_LOCKS
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    locks
+        .entry(key)
+        .or_insert_with(|| Arc::new(StdMutex::new(())))
+        .clone()
 }
 
 fn find_narou_root() -> Result<PathBuf> {
@@ -255,7 +302,9 @@ fn dirs_home() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{CACHE_MAX_SIZE, CACHE_TARGET_SIZE, Inventory, InventoryScope};
+    use super::{
+        CACHE_MAX_SIZE, CACHE_TARGET_SIZE, Inventory, InventoryScope, MAX_YAML_SIZE_BYTES,
+    };
 
     #[test]
     fn load_raw_uses_cache_until_unload() {
@@ -310,5 +359,23 @@ mod tests {
         let cache = inventory.cache.lock();
         assert_eq!(cache.entries.len(), CACHE_TARGET_SIZE + 1);
         assert!(cache.entries.contains_key("local_setting"));
+    }
+
+    #[test]
+    fn load_raw_rejects_yaml_larger_than_32mb() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let narou_dir = root.join(".narou");
+        std::fs::create_dir_all(&narou_dir).unwrap();
+        let path = narou_dir.join("local_setting.yaml");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_YAML_SIZE_BYTES + 1).unwrap();
+
+        let inventory = Inventory::new(root);
+        let err = inventory
+            .load_raw("local_setting", InventoryScope::Local)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("maximum supported YAML size"));
     }
 }

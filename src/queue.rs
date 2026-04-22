@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
-use crate::db::inventory::atomic_write;
+use crate::db::inventory::{atomic_write, ensure_yaml_size_limit};
 use crate::error::{NarouError, Result};
 
 const MAX_PENDING_JOBS: usize = 10_000;
@@ -163,6 +163,7 @@ impl PersistentQueue {
 
     fn load(&mut self) -> Result<()> {
         if self.path.exists() {
+            ensure_yaml_size_limit(&self.path)?;
             let content = fs::read_to_string(&self.path)?;
             let state = load_queue_state(&content)?;
             validate_queue_state(&state)?;
@@ -946,6 +947,7 @@ mod tests {
     use serde_yaml::{Mapping, Value};
 
     use super::{JobType, PersistentQueue, QueueLane};
+    use crate::db::inventory::MAX_YAML_SIZE_BYTES;
 
     #[test]
     fn clear_saves_without_relocking_deadlock() {
@@ -1019,6 +1021,18 @@ mod tests {
         let err = PersistentQueue::new(&queue_path).unwrap_err();
 
         assert!(err.to_string().contains("exceeding limit"));
+    }
+
+    #[test]
+    fn load_rejects_queue_yaml_larger_than_32mb() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let file = std::fs::File::create(&queue_path).unwrap();
+        file.set_len(MAX_YAML_SIZE_BYTES + 1).unwrap();
+
+        let err = PersistentQueue::new(&queue_path).unwrap_err();
+
+        assert!(err.to_string().contains("maximum supported YAML size"));
     }
 
     #[test]

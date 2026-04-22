@@ -257,12 +257,24 @@ fn ask_line_height(
 }
 
 fn validate_aozoraepub3_path(path: &str) -> Option<String> {
-    let normalized = normalize_path_string(path);
-    if PathBuf::from(&normalized).join("AozoraEpub3.jar").exists() {
-        Some(normalized)
-    } else {
-        None
+    let trimmed = normalize_path_string(path);
+    if trimmed.is_empty() || is_disallowed_aozora_path(&trimmed) {
+        return None;
     }
+    let candidate = PathBuf::from(&trimmed);
+    if !candidate.is_absolute() {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(&candidate).ok()?;
+    let jar_path = canonical.join("AozoraEpub3.jar");
+    if !jar_path.is_file() {
+        return None;
+    }
+    let jar_parent = std::fs::canonicalize(jar_path.parent()?).ok()?;
+    if jar_parent != canonical {
+        return None;
+    }
+    Some(canonical.display().to_string())
 }
 
 fn rewrite_aozoraepub3_files(aozora_path: &str, line_height: f64) -> Result<()> {
@@ -349,7 +361,7 @@ fn format_line_height(line_height: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_dot_narou_files, rewrite_aozoraepub3_files};
+    use super::{ensure_dot_narou_files, rewrite_aozoraepub3_files, validate_aozoraepub3_path};
 
     #[test]
     fn ensure_dot_narou_files_keeps_inventory_files_lazy() {
@@ -432,14 +444,49 @@ mod tests {
         assert!(path.join("custom_chuki_tag.txt").exists());
         assert!(path.join("vertical_font.css").exists());
     }
+
+    #[test]
+    fn validate_aozoraepub3_path_accepts_existing_absolute_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let aozora_dir = temp.path().join("Aozora");
+        std::fs::create_dir_all(&aozora_dir).unwrap();
+        std::fs::write(aozora_dir.join("AozoraEpub3.jar"), "").unwrap();
+
+        let validated = validate_aozoraepub3_path(aozora_dir.to_str().unwrap()).unwrap();
+
+        assert_eq!(std::path::PathBuf::from(validated), std::fs::canonicalize(aozora_dir).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_aozoraepub3_path_rejects_unc_and_drive_relative_paths() {
+        assert!(validate_aozoraepub3_path(r"\\server\share\Aozora").is_none());
+        assert!(validate_aozoraepub3_path(r"\\?\C:\Aozora").is_none());
+        assert!(validate_aozoraepub3_path(r"C:relative\Aozora").is_none());
+        assert!(validate_aozoraepub3_path("C:").is_none());
+    }
 }
 
 fn normalize_path_string(path: &str) -> String {
-    let path = path.trim_matches('"');
-    std::fs::canonicalize(path)
-        .unwrap_or_else(|_| PathBuf::from(path))
-        .display()
-        .to_string()
+    path.trim().trim_matches('"').to_string()
+}
+
+fn is_disallowed_aozora_path(path: &str) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    path.starts_with("\\\\?\\")
+        || path.starts_with("\\\\")
+        || path
+            .as_bytes()
+            .get(1)
+            .copied()
+            .filter(|byte| *byte == b':')
+            .map(|_| {
+                let rest = &path[2..];
+                rest.is_empty() || !(rest.starts_with('\\') || rest.starts_with('/'))
+            })
+            .unwrap_or(false)
 }
 
 fn home_dir() -> PathBuf {

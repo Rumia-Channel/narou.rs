@@ -46,6 +46,7 @@ socket2 = "0.6"
 chrono-tz = { version = "0.10.4", features = ["case-insensitive"] }
 subtle = "2.6.1"
 getrandom = "0.4.2"
+fs2 = "0.4.3"
 
 [build-dependencies]
 base64 = "0.22"
@@ -53,4 +54,4 @@ sha3 = "0.11"
 
 [target."cfg(windows)".dependencies]
 tray-icon = "0.22"
-windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
