@@ -69,7 +69,9 @@ impl ConverterBase {
         let re = Regex::new(r"\d+").unwrap();
         re.replace_all(text, |caps: &regex::Captures| {
             let num = &caps[0];
-            if num.len() == 2 || (num.len() == 3 && self.text_type == TextType::Subtitle) {
+            let m = caps.get(0).unwrap();
+            let is_line_start = m.start() == 0 || text[..m.start()].ends_with('\n');
+            if num.len() == 2 || (num.len() == 3 && self.text_type == TextType::Subtitle && is_line_start) {
                 tcy(num)
             } else {
                 num.chars().map(to_fullwidth_digit).collect::<String>()
