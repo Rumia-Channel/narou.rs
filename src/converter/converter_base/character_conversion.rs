@@ -311,4 +311,15 @@ mod tests {
         let out = run("第100章", TextType::Subtitle);
         assert_eq!(out, "第１００章");
     }
+
+    #[test]
+    fn ruby_parity_n2267be_chapter_subtitle_with_fullwidth_digits() {
+        // Real source from https://ncode.syosetu.com/n2267be/176/
+        // Title is already fullwidth: 第四章１０　『知識欲の権化』
+        // Ruby \d (ASCII-only) does not match ０-９ → digits stay untouched, no tcy.
+        let settings = NovelSettings::default();
+        let mut cb = ConverterBase::new(settings);
+        let out = cb.convert("第四章１０　『知識欲の権化』", TextType::Subtitle);
+        assert_eq!(out, "第四章１０　『知識欲の権化』");
+    }
 }
