@@ -144,7 +144,7 @@ pub fn cmd_list(options: ListOptions) -> i32 {
 
     if let Err(e) = db::init_database() {
         eprintln!("Error initializing database: {}", e);
-        return 1;
+        return 127;
     }
 
     let mut exit_code = 0;
@@ -195,7 +195,7 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         Ok(records) => records,
         Err(err) => {
             log::report_error(&err.to_string());
-            return 1;
+            return 127;
         }
     };
 
@@ -203,7 +203,7 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         Ok(colors) => colors,
         Err(err) => {
             log::report_error(&err);
-            return 1;
+            return 127;
         }
     };
 
@@ -251,7 +251,7 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
     if colors_changed {
         if let Err(err) = save_tag_colors(&tag_colors) {
             log::report_error(&err);
-            return 1;
+            return 127;
         }
     }
 
@@ -266,7 +266,7 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
 
     if let Err(e) = db::init_database() {
         eprintln!("Error initializing database: {}", e);
-        return 1;
+        return 127;
     }
 
     let mode = match build_tag_mode(&options) {
@@ -281,7 +281,7 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         Ok(colors) => colors,
         Err(err) => {
             log::report_error(&err);
-            return 1;
+            return 127;
         }
     };
 
@@ -305,7 +305,7 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
     if explicit_color_changed {
         if let Err(err) = save_tag_colors(&tag_colors) {
             log::report_error(&err);
-            return 1;
+            return 127;
         }
     }
 
@@ -393,7 +393,7 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         Ok(result) => result,
         Err(err) => {
             log::report_error(&err.to_string());
-            return 1;
+            return 127;
         }
     };
 
@@ -402,7 +402,7 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
     if auto_color_changed {
         if let Err(err) = save_tag_colors(&tag_colors) {
             log::report_error(&err);
-            return 1;
+            return 127;
         }
     }
 
@@ -681,7 +681,7 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
         Ok(tag_list) => tag_list,
         Err(err) => {
             log::report_error(&err);
-            return 1;
+            return 127;
         }
     };
 
@@ -689,7 +689,7 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
     if changed {
         if let Err(err) = save_tag_colors(tag_colors) {
             log::report_error(&err);
-            return 1;
+            return 127;
         }
     }
 
@@ -963,7 +963,7 @@ pub fn cmd_remove(targets: &[String], yes: bool, with_file: bool, all_ss: bool) 
 
     if let Err(e) = db::init_database() {
         eprintln!("Error initializing database: {}", e);
-        return 1;
+        return 127;
     }
 
     let mut targets = targets.to_vec();

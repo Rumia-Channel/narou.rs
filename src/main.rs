@@ -152,7 +152,7 @@ async fn run_command(
                     eprintln!("{}", line);
                 }
             }
-            return 1;
+            return 127;
         }
     };
 
@@ -200,7 +200,7 @@ fn run_sync_command(
         } => {
             if targets.is_empty() && !std::io::stdin().is_terminal() {
                 eprintln!("Usage: narou download <url|ncode|id>...");
-                return 1;
+                return 127;
             }
             commands::download::cmd_download(commands::download::DownloadOptions {
                 targets,

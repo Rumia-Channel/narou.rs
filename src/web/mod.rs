@@ -304,6 +304,7 @@ fn host_allowed(host: &str, state: &AppState) -> bool {
     state.push_server.accepted_domains().iter().any(|pattern| {
         let pattern = pattern.trim().trim_matches('.').to_ascii_lowercase();
         is_safe_wildcard_pattern(&pattern)
+            && is_exact_subdomain_wildcard_match(pattern.as_str(), normalized.as_str())
             && wildcard_host_match(pattern.as_str(), normalized.as_str())
     }) || (state.push_server.allow_ip_literals() && normalized.parse::<IpAddr>().is_ok())
 }
@@ -327,7 +328,8 @@ fn wildcard_host_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
 }
 
 /// Validates that a wildcard pattern is safe against domain-boundary bypasses.
-/// Returns false for patterns like `*.com` or `*` that would match any domain.
+/// Returns false for patterns like `*.com`, `*`, or `example.com*` that would
+/// match unintended domains.
 fn is_safe_wildcard_pattern(pattern: &str) -> bool {
     let trimmed = pattern.trim();
     if trimmed.is_empty() {
@@ -337,15 +339,34 @@ fn is_safe_wildcard_pattern(pattern: &str) -> bool {
     if trimmed == "*" {
         return false;
     }
-    // Reject patterns ending with a wildcard after a TLD-like component (e.g. `*.com`, `*.co.jp`)
-    // We require at least one dot before the wildcard to ensure it's a subdomain pattern.
-    if let Some(pos) = trimmed.rfind('*') {
-        let before = &trimmed[..pos];
-        if !before.contains('.') {
+    // Reject patterns containing `*` anywhere except as a leading subdomain wildcard.
+    // Safe: `*.example.com`
+    // Unsafe: `example.com*`, `*example.com`, `sub*.example.com`
+    if let Some(pos) = trimmed.find('*') {
+        if pos != 0 {
+            return false;
+        }
+        // `*.example.com` is only safe if there are at least two dot-separated
+        // labels after the `*` (e.g. `.example.com`). `*.com` has only one.
+        let after = &trimmed[1..];
+        let dot_count = after.chars().filter(|&c| c == '.').count();
+        if dot_count < 2 {
             return false;
         }
     }
     true
+}
+
+/// Ensures that a `*.domain` wildcard matches exactly one subdomain level.
+/// `*.example.com` matches `sub.example.com` but NOT `sub.sub.example.com`
+/// nor `evil.example.com.attacker.com`.
+fn is_exact_subdomain_wildcard_match(pattern: &str, text: &str) -> bool {
+    if !pattern.starts_with("*.") {
+        return true;
+    }
+    let pattern_labels = pattern.split('.').count();
+    let text_labels = text.split('.').count();
+    text_labels == pattern_labels
 }
 
 fn is_state_changing_method(method: &Method) -> bool {
@@ -502,8 +523,9 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
 
     use super::{
-        AppState, basic_auth_matches, is_safe_wildcard_pattern, origin_allowed, removal_log_message,
-        request_host_allowed, safe_existing_novel_dir, validate_web_tag_name, wildcard_host_match,
+        AppState, basic_auth_matches, is_exact_subdomain_wildcard_match,
+        is_safe_wildcard_pattern, origin_allowed, removal_log_message, request_host_allowed,
+        safe_existing_novel_dir, validate_web_tag_name, wildcard_host_match,
     };
 
     fn sample_record(file_title: &str) -> crate::db::novel_record::NovelRecord {
@@ -663,10 +685,20 @@ mod tests {
         assert!(wildcard_host_match("*.example.com", "sub.example.com"));
         // Bare `*` must be rejected by is_safe_wildcard_pattern
         assert!(!is_safe_wildcard_pattern("*"));
-        // `*.com` must be rejected
+        // `*.com` must be rejected (only one label after `*.`)
         assert!(!is_safe_wildcard_pattern("*.com"));
+        // `*.co.jp` is accepted (two labels after `*.`)
+        assert!(is_safe_wildcard_pattern("*.co.jp"));
+        // Trailing wildcard (`example.com*`) must be rejected
+        assert!(!is_safe_wildcard_pattern("example.com*"));
+        // Embedded wildcard (`sub*.example.com`) must be rejected
+        assert!(!is_safe_wildcard_pattern("sub*.example.com"));
         // Exact match still works
         assert!(is_safe_wildcard_pattern("localhost"));
         assert!(wildcard_host_match("localhost", "localhost"));
+        // Exact subdomain level enforcement
+        assert!(!is_exact_subdomain_wildcard_match("*.example.com", "sub.sub.example.com"));
+        assert!(!is_exact_subdomain_wildcard_match("*.example.com", "evil.example.com.attacker.com"));
+        assert!(is_exact_subdomain_wildcard_match("*.example.com", "sub.example.com"));
     }
 }

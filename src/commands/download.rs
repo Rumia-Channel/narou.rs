@@ -34,14 +34,14 @@ pub fn cmd_download(opts: DownloadOptions) -> i32 {
 fn cmd_download_inner(opts: DownloadOptions) -> i32 {
     if let Err(e) = narou_rs::db::init_database() {
         eprintln!("Error initializing database: {}", e);
-        return 1;
+        return 127;
     }
 
     let mut downloader = match Downloader::with_user_agent(opts.user_agent.as_deref()) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Error creating downloader: {}", e);
-            return 1;
+            return 127;
         }
     };
 
