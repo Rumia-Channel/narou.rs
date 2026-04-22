@@ -1,17 +1,17 @@
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use std::collections::HashMap;
 
 use tokio::task::JoinHandle;
 
-use crate::compat::load_local_setting_string;
+use super::push::PushServer;
+use crate::compat::{configure_hidden_console_command, load_local_setting_string};
 use crate::db::with_database_mut;
 use crate::progress::WS_LINE_PREFIX;
-use crate::queue::{JobType, PersistentQueue, QueueLane, QueueJob};
-use super::push::PushServer;
+use crate::queue::{JobType, PersistentQueue, QueueJob, QueueLane};
 
 const WEBUI_UPDATE_START_PREFIX: &str = "__webui_update_start__=";
 
@@ -74,7 +74,13 @@ fn start_queue_worker_for_lane(
             let pid_ref = Arc::clone(&running_child_pids);
             let queue_for_run = Arc::clone(&queue);
             let success = tokio::task::spawn_blocking(move || {
-                execute_job(&root_dir, queue_for_run.as_ref(), &job_for_run, &ps, &pid_ref)
+                execute_job(
+                    &root_dir,
+                    queue_for_run.as_ref(),
+                    &job_for_run,
+                    &ps,
+                    &pid_ref,
+                )
             })
             .await
             .unwrap_or(false);
@@ -161,6 +167,7 @@ fn execute_job(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("NAROU_RS_WEB_MODE", "1");
+    configure_hidden_console_command(&mut command);
 
     if let Some(spec) = queue.execution_spec(&job.id) {
         match spec.cmd.as_str() {
@@ -280,8 +287,11 @@ fn execute_job(
             JobType::Update => {
                 command.arg("update");
                 if !job.target.is_empty() {
-                    let parts: Vec<String> =
-                        job.target.split('\t').map(|part| part.to_string()).collect();
+                    let parts: Vec<String> = job
+                        .target
+                        .split('\t')
+                        .map(|part| part.to_string())
+                        .collect();
                     append_update_args(&mut command, push_server, target_console, &parts);
                 }
             }
@@ -367,6 +377,7 @@ fn execute_diff_job(
             .arg(id)
             .arg("--number")
             .arg(number);
+        configure_hidden_console_command(&mut command);
         if !spawn_and_stream_command(command, push_server, running_pids, job_id, target_console) {
             success = false;
         }

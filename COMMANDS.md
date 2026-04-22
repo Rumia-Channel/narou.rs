@@ -544,8 +544,8 @@ narou setting name         # 読み取り
 - `queue_clear` は deadlock しないように永続キュー保存順を修正済み
 - local `update.auto-schedule.enable` / `update.auto-schedule` が有効なら、Ruby版同様に時刻指定で自動アップデートを Web queue に投入する。設定保存時は Ruby版同様に scheduler を stop/start し、サーバ再起動なしで変更を反映する
 - 自動アップデートは `--gl narou` → `modified` タグ対象 → その他小説の順に child `update` を実行し、child stdout/stderr と Web 用構造化進捗を Web UI コンソールへ中継する。実行中 phase の child PID は通常 job と同じ中止処理へ登録する。各 phase 後に Web サーバ側 DB を再読み込みして `modified` タグ検出漏れを防ぐ。`server_setting.current_sort` は Ruby互換に `column` 数値/数値文字列の両方を受理し、対応する `--sort-by` へ引き継ぐ
-- Web UI からのサーバ再起動では replacement process に `--no-browser` を付与し、再起動待機ページから同じタブで元ページへ戻る
-- Windows の `narou web --hide-console` は GUI subsystem で起動し、通常 CLI 実行時は親コンソールへ再接続、hidden 実行時はタスクトレイの右クリックメニューから `終了` / `再起動` を呼べる
+- Web UI からのサーバ再起動では replacement process に `--no-browser` を付与し、hidden 起動中は `--hide-console` も維持したまま再起動待機ページから同じタブで元ページへ戻る
+- Windows の `narou web --hide-console` は GUI subsystem で起動し、通常 CLI 実行時は親コンソールへ再接続、hidden 実行時はタスクトレイの右クリックメニューから `終了` / `再起動` を呼べる。Web worker / auto-update / 即時 API 実行が起動する child process も hidden 状態を引き継ぎ、空のコンソールを開かない
 - Web 設定画面は Ruby版同様、`tab` がある設定を `invisible` 指定でも表示する。`webui.theme` / `webui.table.reload-timing` / `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `over18` も設定画面に出る
 - `webui.theme` / `webui.table.reload-timing` / `webui.performance-mode` 保存時は、開いている Web UI に設定再読み込みイベントを送り、テーマメニューの変更も `webui.theme` へ保存する
 - Web UI のタグ編集は既存タグ一覧から入力中タグ名に一致する候補を表示し、タグ名クリック検索は `tag:`、作者名クリック検索は `author:`、掲載サイトクリック検索は `sitename:` を生成する。通常クリックは AND、Ctrl クリックは同一フィールド内 OR、Shift クリックは除外 AND、Shift+Ctrl クリックは除外 OR として検索文字列を更新する

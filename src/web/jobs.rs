@@ -218,16 +218,19 @@ fn push_update_job_with_legacy_if_needed(
         return Ok((vec![existing_id], false));
     }
     queue
-        .push_with_legacy(JobType::Update, &target, legacy_cmd, legacy_args, Mapping::new())
+        .push_with_legacy(
+            JobType::Update,
+            &target,
+            legacy_cmd,
+            legacy_args,
+            Mapping::new(),
+        )
         .map(|id| (vec![id], true))
         .map_err(|e| e.to_string())
 }
 
 fn restorable_tasks_available(state: &AppState) -> bool {
-    state
-        .restorable_tasks_available
-        .load(Ordering::Relaxed)
-        && state.queue.has_restorable_tasks()
+    state.restorable_tasks_available.load(Ordering::Relaxed) && state.queue.has_restorable_tasks()
 }
 
 fn running_job_by_id(state: &AppState, task_id: &str) -> Option<QueueJob> {
@@ -263,11 +266,13 @@ fn kill_running_child_for_job(state: &AppState, job_id: &str) -> bool {
 
 fn kill_process_tree(pid: u32, push_server: &std::sync::Arc<super::push::PushServer>) {
     let result = if cfg!(windows) {
-        std::process::Command::new("taskkill")
+        let mut command = std::process::Command::new("taskkill");
+        command
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .stderr(std::process::Stdio::null());
+        crate::compat::configure_hidden_console_command(&mut command);
+        command.status()
     } else {
         std::process::Command::new("kill")
             .args(["-TERM", &format!("-{}", pid)])
@@ -694,12 +699,13 @@ fn encode_convert_job_target(target: &str, device: Option<&str>) -> String {
 /// Helper: spawn an immediate child process with the given args
 fn run_immediate(args: &[&str]) -> Result<std::process::Output, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .args(args)
         .current_dir(std::env::current_dir().unwrap_or_default())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())
+        .stdin(std::process::Stdio::null());
+    crate::compat::configure_hidden_console_command(&mut command);
+    command.output().map_err(|e| e.to_string())
 }
 
 // POST /api/send
@@ -1304,20 +1310,21 @@ pub async fn api_csv_import(
         }
     };
 
-    let result = std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .args(["csv", "--import", "-"])
         .current_dir(std::env::current_dir().unwrap_or_default())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(body.csv.as_bytes());
-            }
-            child.wait_with_output()
-        });
+        .stderr(std::process::Stdio::piped());
+    crate::compat::configure_hidden_console_command(&mut command);
+    let result = command.spawn().and_then(|mut child| {
+        use std::io::Write;
+        if let Some(ref mut stdin) = child.stdin {
+            let _ = stdin.write_all(body.csv.as_bytes());
+        }
+        child.wait_with_output()
+    });
 
     match result {
         Ok(output) => {
@@ -1649,22 +1656,18 @@ pub async fn api_update_by_tag(
         &state.running_jobs,
         target.clone(),
         "update_by_tag",
-        tag_params
-            .iter()
-            .cloned()
-            .map(Value::String)
-            .collect(),
+        tag_params.iter().cloned().map(Value::String).collect(),
     ) {
-            Ok(result) => result,
-            Err(message) => {
-                return serde_json::json!({
-                    "success": false,
-                    "message": message,
-                    "count": 0,
-                })
-                .into();
-            }
-        };
+        Ok(result) => result,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+                "count": 0,
+            })
+            .into();
+        }
+    };
 
     if queued {
         state.push_server.broadcast_event("notification.queue", "");
@@ -1889,15 +1892,18 @@ pub async fn api_reboot(
             });
         }
     };
-    let args = reboot_args_with_no_browser(std::env::args().skip(1).collect());
+    let hide_console = crate::compat::inherited_hide_console_requested();
+    let args = reboot_args_with_no_browser(std::env::args().skip(1).collect(), hide_console);
     // Spawn replacement process, then exit
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let _ = std::process::Command::new(exe)
+        let mut command = std::process::Command::new(exe);
+        command
             .args(&args)
             .current_dir(std::env::current_dir().unwrap_or_default())
-            .stdin(std::process::Stdio::null())
-            .spawn();
+            .stdin(std::process::Stdio::null());
+        crate::compat::configure_hidden_console_command(&mut command);
+        let _ = command.spawn();
         std::process::exit(0);
     });
     Json(ApiResponse {
@@ -1906,11 +1912,13 @@ pub async fn api_reboot(
     })
 }
 
-fn reboot_args_with_no_browser(mut args: Vec<String>) -> Vec<String> {
-    if args.iter().any(|arg| arg == "-n" || arg == "--no-browser") {
-        return args;
+fn reboot_args_with_no_browser(mut args: Vec<String>, hide_console: bool) -> Vec<String> {
+    if !args.iter().any(|arg| arg == "-n" || arg == "--no-browser") {
+        args.push("--no-browser".to_string());
     }
-    args.push("--no-browser".to_string());
+    if hide_console && !args.iter().any(|arg| arg == "--hide-console") {
+        args.push("--hide-console".to_string());
+    }
     args
 }
 
@@ -2043,15 +2051,14 @@ mod tests {
     #[test]
     fn reboot_args_adds_no_browser_to_prevent_new_tab() {
         assert_eq!(
-            reboot_args_with_no_browser(vec!["web".to_string()]),
+            reboot_args_with_no_browser(vec!["web".to_string()], false),
             vec!["web".to_string(), "--no-browser".to_string()]
         );
         assert_eq!(
-            reboot_args_with_no_browser(vec![
-                "web".to_string(),
-                "--port".to_string(),
-                "33000".to_string()
-            ]),
+            reboot_args_with_no_browser(
+                vec!["web".to_string(), "--port".to_string(), "33000".to_string()],
+                false
+            ),
             vec![
                 "web".to_string(),
                 "--port".to_string(),
@@ -2064,12 +2071,43 @@ mod tests {
     #[test]
     fn reboot_args_preserves_existing_no_browser() {
         assert_eq!(
-            reboot_args_with_no_browser(vec!["web".to_string(), "--no-browser".to_string()]),
+            reboot_args_with_no_browser(vec!["web".to_string(), "--no-browser".to_string()], false),
             vec!["web".to_string(), "--no-browser".to_string()]
         );
         assert_eq!(
-            reboot_args_with_no_browser(vec!["web".to_string(), "-n".to_string()]),
+            reboot_args_with_no_browser(vec!["web".to_string(), "-n".to_string()], false),
             vec!["web".to_string(), "-n".to_string()]
+        );
+    }
+
+    #[test]
+    fn reboot_args_adds_hide_console_for_hidden_web_restart() {
+        assert_eq!(
+            reboot_args_with_no_browser(vec!["web".to_string()], true),
+            vec![
+                "web".to_string(),
+                "--no-browser".to_string(),
+                "--hide-console".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn reboot_args_preserves_existing_hide_console() {
+        assert_eq!(
+            reboot_args_with_no_browser(
+                vec![
+                    "web".to_string(),
+                    "--hide-console".to_string(),
+                    "--no-browser".to_string()
+                ],
+                true
+            ),
+            vec![
+                "web".to_string(),
+                "--hide-console".to_string(),
+                "--no-browser".to_string()
+            ]
         );
     }
 

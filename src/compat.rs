@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::converter::NovelConverter;
 use crate::converter::device::Device;
@@ -22,6 +23,7 @@ const DIGEST_CHOICES: &[(&str, &str)] = &[
     ("8", "変換する"),
 ];
 const DIGEST_DEFAULT: &str = "2";
+pub const HIDE_CONSOLE_ENV: &str = "NAROU_RS_HIDE_CONSOLE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DigestChoice {
@@ -33,6 +35,29 @@ pub enum DigestChoice {
     OpenBrowser,
     OpenFolder,
     Convert,
+}
+
+pub fn inherited_hide_console_requested() -> bool {
+    matches!(
+        std::env::var(HIDE_CONSOLE_ENV).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    ) || std::env::args().any(|arg| arg == "--hide-console")
+}
+
+pub fn configure_hidden_console_command(command: &mut Command) {
+    if !inherited_hide_console_requested() {
+        return;
+    }
+
+    command.env(HIDE_CONSOLE_ENV, "1");
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
 }
 
 pub fn load_local_setting_value(key: &str) -> Option<serde_yaml::Value> {
@@ -134,13 +159,12 @@ pub fn current_device() -> Option<Device> {
 }
 
 pub fn load_frozen_ids() -> Result<HashSet<i64>> {
-    crate::db::with_database(|db| {
-        load_frozen_ids_from_inventory(db.inventory())
-    })
+    crate::db::with_database(|db| load_frozen_ids_from_inventory(db.inventory()))
 }
 
 pub fn load_frozen_ids_from_inventory(inventory: &Inventory) -> Result<HashSet<i64>> {
-    let frozen: HashMap<i64, serde_yaml::Value> = inventory.load("freeze", InventoryScope::Local)?;
+    let frozen: HashMap<i64, serde_yaml::Value> =
+        inventory.load("freeze", InventoryScope::Local)?;
     Ok(frozen.into_keys().collect())
 }
 
@@ -181,8 +205,9 @@ impl Drop for NovelLockGuard {
         let (Some(inventory), Some(id)) = (&self.inventory, self.id) else {
             return;
         };
-        let mut locked: HashMap<i64, serde_yaml::Value> =
-            inventory.load("lock", InventoryScope::Local).unwrap_or_default();
+        let mut locked: HashMap<i64, serde_yaml::Value> = inventory
+            .load("lock", InventoryScope::Local)
+            .unwrap_or_default();
         if locked.remove(&id).is_some() {
             let _ = inventory.save("lock", InventoryScope::Local, &locked);
         }
@@ -593,9 +618,9 @@ fn sanitize_backup_name(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
     use crate::db::inventory::Inventory;
     use crate::progress::WS_LINE_PREFIX;
+    use chrono::{TimeZone, Utc};
 
     use super::{
         NovelLockGuard, get_copy_to_directory, load_frozen_ids_from_inventory,
@@ -725,7 +750,8 @@ mod tests {
             let inventory = Inventory::new(temp.path().to_path_buf());
             let locked_ids = load_locked_ids_from_inventory(&inventory).unwrap();
             assert_eq!(locked_ids, std::collections::HashSet::from([7]));
-            let raw = std::fs::read_to_string(temp.path().join(".narou").join("lock.yaml")).unwrap();
+            let raw =
+                std::fs::read_to_string(temp.path().join(".narou").join("lock.yaml")).unwrap();
             assert!(raw.contains("7:"));
             assert!(raw.contains(" +"));
             assert!(!raw.contains('T'));

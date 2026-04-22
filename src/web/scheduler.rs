@@ -9,7 +9,9 @@ use chrono::{Datelike, Local, LocalResult, TimeZone};
 use serde_yaml::Value;
 use tokio::task::JoinHandle;
 
-use crate::compat::{load_local_setting_bool, load_local_setting_string};
+use crate::compat::{
+    configure_hidden_console_command, load_local_setting_bool, load_local_setting_string,
+};
 use crate::db;
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::downloader::site_setting::SiteSetting;
@@ -406,6 +408,7 @@ fn run_update_phase(
         .env("NAROU_RS_WEB_MODE", "1")
         .arg("update")
         .args(args);
+    configure_hidden_console_command(&mut command);
 
     let mut child = match command.spawn() {
         Ok(child) => child,

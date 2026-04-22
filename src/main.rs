@@ -37,6 +37,10 @@ fn prepare_windows_console() {}
 
 #[cfg(windows)]
 fn raw_hide_console_requested() -> bool {
+    if narou_rs::compat::inherited_hide_console_requested() {
+        return true;
+    }
+
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
