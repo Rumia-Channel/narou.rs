@@ -130,6 +130,14 @@ pub struct OutputManager {
     kindlegen_path: Option<PathBuf>,
     verbose: bool,
     no_strip: bool,
+    use_dakuten_font: bool,
+}
+
+fn file_contains_dakuten_chuki(path: &Path) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(s) => s.contains("［＃濁点］"),
+        Err(_) => false,
+    }
 }
 
 impl OutputManager {
@@ -140,6 +148,7 @@ impl OutputManager {
             kindlegen_path: Self::find_external_tool("kindlegen"),
             verbose: false,
             no_strip: false,
+            use_dakuten_font: false,
         }
     }
 
@@ -150,6 +159,11 @@ impl OutputManager {
 
     pub fn with_no_strip(mut self, no_strip: bool) -> Self {
         self.no_strip = no_strip;
+        self
+    }
+
+    pub fn with_use_dakuten_font(mut self, use_dakuten_font: bool) -> Self {
+        self.use_dakuten_font = use_dakuten_font;
         self
     }
 
@@ -295,7 +309,13 @@ impl OutputManager {
         output_dir: &Path,
         output_ext: &str,
     ) -> Result<PathBuf> {
-        let (mut cmd, _) = self.build_aozora_command()?;
+        let (mut cmd, working_dir) = self.build_aozora_command()?;
+        let needs_dakuten = self.use_dakuten_font || file_contains_dakuten_chuki(input_txt);
+        let _dakuten_guard = if needs_dakuten {
+            Some(super::dakuten_font::DakutenFontGuard::activate(&working_dir)?)
+        } else {
+            None
+        };
         let base_name = input_txt
             .file_stem()
             .and_then(|stem| stem.to_str())

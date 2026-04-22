@@ -1,4 +1,5 @@
 pub mod converter_base;
+pub mod dakuten_font;
 pub mod device;
 pub mod ini;
 pub mod inspector;
@@ -36,12 +37,15 @@ pub struct NovelConverter {
     inspector: Rc<RefCell<inspector::Inspector>>,
     display_inspector: bool,
     last_inspection_output: Option<String>,
+    use_dakuten_font: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct CacheEntry {
     digest: String,
     converted_section: render::ConvertedSection,
+    #[serde(default)]
+    use_dakuten_font: bool,
 }
 
 impl NovelConverter {
@@ -57,6 +61,7 @@ impl NovelConverter {
             inspector,
             display_inspector: false,
             last_inspection_output: None,
+            use_dakuten_font: false,
         }
     }
 
@@ -72,6 +77,7 @@ impl NovelConverter {
             inspector,
             display_inspector: false,
             last_inspection_output: None,
+            use_dakuten_font: false,
         }
     }
 
@@ -87,6 +93,10 @@ impl NovelConverter {
         self.last_inspection_output.take()
     }
 
+    pub fn use_dakuten_font(&self) -> bool {
+        self.use_dakuten_font
+    }
+
     pub fn convert_novel(&mut self, toc: &TocObject, sections: &[SectionFile]) -> Result<String> {
         self.convert_novel_with_id(None, toc, sections)
     }
@@ -97,6 +107,7 @@ impl NovelConverter {
         toc: &TocObject,
         sections: &[SectionFile],
     ) -> Result<String> {
+        self.use_dakuten_font = false;
         let mut erased_intro_count = 0usize;
         let mut erased_post_count = 0usize;
         let mut converted_story = String::new();
@@ -105,6 +116,7 @@ impl NovelConverter {
                 let mut converter = self.make_converter();
                 let story_text = render::normalize_story_source(story);
                 converted_story = converter.convert(&story_text, converter_base::TextType::Story);
+                self.use_dakuten_font |= converter.use_dakuten_font;
             }
         }
 
@@ -155,8 +167,9 @@ impl NovelConverter {
                 continue;
             }
 
-            if let Some(cached) = self.fetch_cached_section(novel_id, &section.index, &digest) {
+            if let Some((cached, dakuten)) = self.fetch_cached_section(novel_id, &section.index, &digest) {
                 self.section_cache.insert(digest.clone(), cached.clone());
+                self.use_dakuten_font |= dakuten;
                 converted_sections.push(cached);
                 if let Some(ref p) = self.progress {
                     p.inc(1);
@@ -212,6 +225,8 @@ impl NovelConverter {
             }
 
             let results = converter.convert_multi(&batch_inputs);
+            let section_dakuten = converter.use_dakuten_font;
+            self.use_dakuten_font |= section_dakuten;
 
             let mut ri = 0;
             let conv_chapter = if !chapter.is_empty() {
@@ -254,7 +269,7 @@ impl NovelConverter {
             };
 
             self.section_cache.insert(digest.clone(), cs.clone());
-            self.store_cached_section(novel_id, &section.index, &digest, &cs);
+            self.store_cached_section(novel_id, &section.index, &digest, &cs, section_dakuten);
 
             converted_sections.push(cs);
             if let Some(ref p) = self.progress {
@@ -507,9 +522,11 @@ impl NovelConverter {
     pub fn convert_text_file(&mut self, text: &str) -> Result<String> {
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();
+        self.use_dakuten_font = false;
 
         let mut converter = self.make_converter();
         let mut aozora_text = converter.convert(text, converter_base::TextType::TextFile);
+        self.use_dakuten_font |= converter.use_dakuten_font;
         if !self.settings.enable_enchant_midashi {
             self.inspector.borrow_mut().info(
                 "テキストファイルの処理を実行しましたが、改行直後の見出し付与は有効になっていません。setting.ini の enable_enchant_midashi を true にすることをお薦めします。".to_string(),
@@ -542,6 +559,7 @@ impl NovelConverter {
         let final_path = device::OutputManager::new(device)
             .with_verbose(verbose)
             .with_no_strip(no_strip)
+            .with_use_dakuten_font(self.use_dakuten_font)
             .convert_file(
                 &txt_path,
                 &self.settings.archive_path,
@@ -623,7 +641,8 @@ impl NovelConverter {
 
         let output_manager = device::OutputManager::new(device)
             .with_verbose(verbose)
-            .with_no_strip(no_strip);
+            .with_no_strip(no_strip)
+            .with_use_dakuten_font(self.use_dakuten_font);
         let base_name = txt_path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -672,13 +691,13 @@ impl NovelConverter {
         novel_id: Option<i64>,
         section_key: &str,
         digest: &str,
-    ) -> Option<render::ConvertedSection> {
+    ) -> Option<(render::ConvertedSection, bool)> {
         let bucket = self.section_convert_cache.get(&novel_id?.to_string())?;
         let entry = bucket.get(section_key)?;
         if entry.digest != digest {
             return None;
         }
-        Some(entry.converted_section.clone())
+        Some((entry.converted_section.clone(), entry.use_dakuten_font))
     }
 
     fn store_cached_section(
@@ -687,6 +706,7 @@ impl NovelConverter {
         section_key: &str,
         digest: &str,
         converted_section: &render::ConvertedSection,
+        use_dakuten_font: bool,
     ) {
         let Some(novel_id) = novel_id else {
             return;
@@ -694,6 +714,7 @@ impl NovelConverter {
         let entry = CacheEntry {
             digest: digest.to_string(),
             converted_section: converted_section.clone(),
+            use_dakuten_font,
         };
         let bucket = self.section_convert_cache.entry(novel_id.to_string()).or_default();
         if bucket.get(section_key) != Some(&entry) {
