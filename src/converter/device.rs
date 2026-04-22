@@ -330,13 +330,17 @@ impl OutputManager {
             .ok_or_else(|| NarouError::Conversion("Invalid input filename".into()))?;
         let output_path = output_dir.join(format!("{}{}", base_name, output_ext));
 
-        cmd.arg("-d").arg(output_dir);
-        cmd.arg("-ext").arg(output_ext);
-        // narou.rb 互換: 入力 txt の文字コードを UTF-8 として明示する。
-        // 省略すると AozoraEpub3 既定の Shift-JIS で解釈され、全角数字等が
-        // 文字化けする (例: "１０" → 別の Unicode に化ける)。
+        // narou.rb と同一の引数順序で AozoraEpub3 を呼び出す。
+        // Ruby: -enc UTF-8 -of <device_option> <cover_option> <dst_option> <ext_option> <yokogaki_option> <file>
+        // Rust は <device_option> と <yokogaki_option> を未実装なので、互換性のある最小形式で対応:
+        // -enc UTF-8 -of <dst_option> <ext_option> <file>
         cmd.arg("-enc").arg("UTF-8");
         cmd.arg("-of");
+        // dst_option: -dst <output_dir>
+        cmd.arg("-dst").arg(output_dir);
+        // ext_option: -ext <ext>
+        cmd.arg("-ext").arg(output_ext);
+        // input file (最後に指定)
         cmd.arg(input_txt);
         if !self.verbose {
             cmd.stdout(Stdio::null());
