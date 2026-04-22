@@ -20,9 +20,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
-use std::net::IpAddr;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
+use subtle::ConstantTimeEq;
 use tokio::task::JoinHandle;
 
 pub(crate) const MAX_WEB_TARGETS_PER_REQUEST: usize = 512;
@@ -43,6 +43,7 @@ pub struct AppState {
     pub push_server: Arc<push::PushServer>,
     pub basic_auth_header: Option<String>,
     pub control_token: String,
+    pub allowed_request_hosts: Vec<String>,
     pub queue: Arc<crate::queue::PersistentQueue>,
     pub restore_prompt_pending: Arc<AtomicBool>,
     pub restorable_tasks_available: Arc<AtomicBool>,
@@ -132,58 +133,48 @@ pub(crate) fn validate_web_text_size(
     Ok(())
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized
-}
-
-fn normalize_fs_path_for_comparison(path: &Path) -> PathBuf {
-    let normalized = if cfg!(windows) {
-        let raw = path.to_string_lossy();
-        if raw.starts_with(r"\\?\") {
-            PathBuf::from(raw.trim_start_matches(r"\\?\"))
-        } else {
-            path.to_path_buf()
-        }
-    } else {
-        path.to_path_buf()
-    };
-    normalize_path(&normalized)
-}
-
 pub(crate) fn safe_existing_novel_dir(
     archive_root: &Path,
     record: &crate::db::novel_record::NovelRecord,
 ) -> Result<PathBuf, String> {
-    let canonical_archive_root = std::fs::canonicalize(archive_root)
-        .map(|path| normalize_fs_path_for_comparison(&path))
-        .unwrap_or_else(|_| normalize_fs_path_for_comparison(archive_root));
     let candidate = crate::db::existing_novel_dir_for_record(archive_root, record);
-    let normalized_candidate = normalize_fs_path_for_comparison(&candidate);
-    if !normalized_candidate.starts_with(&canonical_archive_root) {
+    reject_symlink_ancestors(&candidate, archive_root)?;
+    crate::db::paths::ensure_within_archive_root(&candidate, archive_root)
+        .map_err(|_| "invalid novel storage path".to_string())
+}
+
+fn reject_symlink_ancestors(path: &Path, root: &Path) -> Result<(), String> {
+    let mut current = root.to_path_buf();
+    if current.exists() && is_symlink_like(&current)? {
         return Err("invalid novel storage path".to_string());
     }
-    if candidate.exists() {
-        let canonical_candidate = std::fs::canonicalize(&candidate)
-            .map(|path| normalize_fs_path_for_comparison(&path))
-            .map_err(|e| e.to_string())?;
-        if !canonical_candidate.starts_with(&canonical_archive_root) {
+    let remainder = path
+        .strip_prefix(root)
+        .map_err(|_| "invalid novel storage path".to_string())?;
+    for component in remainder.components() {
+        current.push(component.as_os_str());
+        if !current.exists() {
+            break;
+        }
+        if is_symlink_like(&current)? {
             return Err("invalid novel storage path".to_string());
         }
-        Ok(canonical_candidate)
-    } else {
-        Ok(normalized_candidate)
+    }
+    Ok(())
+}
+
+fn is_symlink_like(path: &Path) -> Result<bool, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(metadata.file_type().is_symlink())
     }
 }
 
@@ -202,10 +193,13 @@ pub(crate) fn basic_auth_matches(headers: &HeaderMap, expected: Option<&str>) ->
     let Some(expected) = expected else {
         return true;
     };
-    headers
+    let Some(actual) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        == Some(expected)
+    else {
+        return false;
+    };
+    constant_time_str_eq(actual, expected)
 }
 
 pub(crate) fn request_host_allowed(headers: &HeaderMap, state: &AppState, expected_port: u16) -> bool {
@@ -231,10 +225,13 @@ pub(crate) fn origin_allowed(headers: &HeaderMap, state: &AppState, expected_por
 }
 
 fn internal_control_token_matches(headers: &HeaderMap, state: &AppState) -> bool {
-    headers
+    let Some(actual) = headers
         .get(INTERNAL_CONTROL_HEADER)
         .and_then(|value| value.to_str().ok())
-        == Some(state.control_token.as_str())
+    else {
+        return false;
+    };
+    constant_time_str_eq(actual, state.control_token.as_str())
 }
 
 fn authority_matches_state(
@@ -297,16 +294,47 @@ fn split_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
 }
 
 fn host_allowed(host: &str, state: &AppState) -> bool {
-    let normalized = host.trim().trim_matches('.').to_ascii_lowercase();
-    if normalized.is_empty() {
-        return false;
+    let normalized = normalize_host_name(host);
+    !normalized.is_empty()
+        && state
+            .allowed_request_hosts
+            .iter()
+            .any(|allowed| normalize_host_name(allowed) == normalized)
+}
+
+fn normalize_host_name(host: &str) -> String {
+    host.trim().trim_matches('.').to_ascii_lowercase()
+}
+
+fn constant_time_str_eq(actual: &str, expected: &str) -> bool {
+    bool::from(actual.as_bytes().ct_eq(expected.as_bytes()))
+}
+
+fn current_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .map(|name| normalize_host_name(&name))
+        .filter(|name| !name.is_empty())
+}
+
+pub fn default_allowed_request_hosts(bind_host: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    let normalized_bind = normalize_host_name(bind_host);
+    if !normalized_bind.is_empty() && !matches!(normalized_bind.as_str(), "0.0.0.0" | "::") {
+        hosts.push(normalized_bind);
     }
-    state.push_server.accepted_domains().iter().any(|pattern| {
-        let pattern = pattern.trim().trim_matches('.').to_ascii_lowercase();
-        is_safe_wildcard_pattern(&pattern)
-            && is_exact_subdomain_wildcard_match(pattern.as_str(), normalized.as_str())
-            && wildcard_host_match(pattern.as_str(), normalized.as_str())
-    }) || (state.push_server.allow_ip_literals() && normalized.parse::<IpAddr>().is_ok())
+    hosts.extend([
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+        "::1".to_string(),
+    ]);
+    if let Some(hostname) = current_hostname() {
+        hosts.push(hostname);
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 
 fn wildcard_host_match(pattern: &str, text: &str) -> bool {
@@ -449,9 +477,15 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/update_by_tag", post(jobs::api_update_by_tag))
         .route("/api/taginfo.json", post(jobs::api_taginfo))
         .route("/api/update_general_lastup", post(jobs::api_update_general_lastup))
-        .route("/api/download_request", get(jobs::api_download_request))
+        .route(
+            "/api/download_request",
+            get(jobs::bookmarklet_download_request_post_required).post(jobs::api_download_request),
+        )
         .route("/api/downloadable.gif", get(jobs::api_downloadable_gif))
-        .route("/api/download4ssl", get(jobs::api_download4ssl))
+        .route(
+            "/api/download4ssl",
+            get(jobs::bookmarklet_download4ssl_post_required).post(jobs::api_download4ssl),
+        )
         .route("/api/restore_pending_tasks", post(jobs::restore_pending_tasks))
         .route("/api/defer_restore_pending_tasks", post(jobs::defer_restore_pending_tasks))
         .route("/api/confirm_running_tasks", post(jobs::confirm_running_tasks))
@@ -573,13 +607,13 @@ mod tests {
         let queue_dir = test_artifact_dir("security-state");
         let mut push_server = crate::web::push::PushServer::new();
         push_server.set_accepted_domains(["127.0.0.1", "localhost", "*.example.com"]);
-        push_server.set_allow_ip_literals(true);
         AppState {
             port: 8080,
             ws_port: 8081,
             push_server: Arc::new(push_server),
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
+            allowed_request_hosts: vec!["127.0.0.1".to_string(), "localhost".to_string()],
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -650,6 +684,12 @@ mod tests {
         headers.insert(
             axum::http::header::HOST,
             axum::http::HeaderValue::from_static("evil.test:8080"),
+        );
+        assert!(!request_host_allowed(&headers, &state, state.port));
+
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("192.168.1.50:8080"),
         );
         assert!(!request_host_allowed(&headers, &state, state.port));
     }

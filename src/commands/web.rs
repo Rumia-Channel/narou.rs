@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use narou_rs::db::inventory::{Inventory, InventoryScope};
 use serde_yaml::{Number, Value};
-use sha2::Digest;
 use tracing::info;
 
 #[cfg(windows)]
@@ -61,7 +60,6 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         }
     };
     push_server.set_accepted_domains(domains);
-    push_server.set_allow_ip_literals(is_wildcard_bind_host(&address.host));
     let push_server = Arc::new(push_server);
     let basic_auth_header = match load_basic_auth_header() {
         Ok(header) => header,
@@ -105,6 +103,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         push_server: push_server.clone(),
         basic_auth_header,
         control_token: control_token.clone(),
+        allowed_request_hosts: narou_rs::web::default_allowed_request_hosts(&address.host),
         queue: queue.clone(),
         restore_prompt_pending: restore_prompt_pending.clone(),
         restorable_tasks_available: restorable_tasks_available.clone(),
@@ -519,18 +518,7 @@ fn requires_basic_auth_for_bind(host: &str) -> bool {
 }
 
 fn default_ws_accepted_domains(host: &str) -> Vec<String> {
-    match host {
-        "0.0.0.0" | "::" => {
-            vec![
-                "127.0.0.1".to_string(),
-                "localhost".to_string(),
-                "::1".to_string(),
-            ]
-        }
-        "127.0.0.1" => vec!["127.0.0.1".to_string(), "localhost".to_string()],
-        value if !value.trim().is_empty() => vec![value.trim().to_string()],
-        _ => vec!["127.0.0.1".to_string(), "localhost".to_string()],
-    }
+    narou_rs::web::default_allowed_request_hosts(host)
 }
 
 fn load_ws_accepted_domains(host: &str) -> Result<Vec<String>, String> {
@@ -552,14 +540,9 @@ fn load_ws_accepted_domains(host: &str) -> Result<Vec<String>, String> {
 }
 
 fn generate_control_token() -> String {
-    let seed = format!(
-        "{}:{}:{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
-        std::thread::current().name().unwrap_or("main")
-    );
-    let digest = sha2::Sha256::digest(seed.as_bytes());
-    hex::encode(&digest[..16])
+    let mut token = [0u8; 16];
+    getrandom::fill(&mut token).expect("failed to generate control token");
+    hex::encode(token)
 }
 
 fn confirm_first_web_boot(no_browser: bool, hide_console: bool) -> Result<bool, String> {
@@ -737,7 +720,9 @@ mod tests {
 
     #[test]
     fn control_token_generation_is_non_empty() {
-        assert!(!generate_control_token().is_empty());
+        let token = generate_control_token();
+        assert_eq!(token.len(), 32);
+        assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 
     #[test]

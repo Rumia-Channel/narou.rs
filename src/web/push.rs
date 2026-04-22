@@ -12,8 +12,17 @@ use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
+use tokio::time::{Duration, Instant};
 
 use super::AppState;
+
+const MAX_WS_CLIENTS: usize = 64;
+const MAX_WS_HISTORY_LINES: usize = 1000;
+const MAX_WS_HISTORY_BYTES: usize = 1024 * 1024;
+const MAX_WS_FRAME_SIZE: usize = 64 * 1024;
+const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024;
+const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 pub struct BroadcastChannel {
@@ -42,8 +51,8 @@ pub struct PushServer {
     next_client_id: Mutex<usize>,
     console_history: Mutex<Vec<(String, String)>>,
     max_history: usize,
+    max_clients: usize,
     accepted_domains: Vec<String>,
-    allow_ip_literals: bool,
 }
 
 impl PushServer {
@@ -54,8 +63,8 @@ impl PushServer {
             next_client_id: Mutex::new(1),
             console_history: Mutex::new(Vec::new()),
             max_history: 10000,
+            max_clients: MAX_WS_CLIENTS,
             accepted_domains: vec!["127.0.0.1".to_string(), "localhost".to_string()],
-            allow_ip_literals: false,
         }
     }
 
@@ -85,14 +94,6 @@ impl PushServer {
         &self.accepted_domains
     }
 
-    pub fn set_allow_ip_literals(&mut self, allow: bool) {
-        self.allow_ip_literals = allow;
-    }
-
-    pub fn allow_ip_literals(&self) -> bool {
-        self.allow_ip_literals
-    }
-
     pub fn accepts_origin(&self, origin: &str) -> bool {
         let domain = origin_to_domain(origin);
         if domain == "null" {
@@ -101,7 +102,7 @@ impl PushServer {
         self.accepted_domains.iter().any(|pattern| {
             pattern == "*"
                 || wildcard_match(&pattern.to_ascii_lowercase(), &domain.to_ascii_lowercase())
-        }) || (self.allow_ip_literals && domain.parse::<std::net::IpAddr>().is_ok())
+        })
     }
 
     pub fn client_count(&self) -> usize {
@@ -207,16 +208,37 @@ impl PushServer {
         self.channel.send(&payload.to_string());
     }
 
-    pub fn register_client(&self, sender: broadcast::Sender<String>) -> usize {
+    pub fn try_register_client(&self, sender: broadcast::Sender<String>) -> Option<usize> {
+        if self.client_count() >= self.max_clients {
+            return None;
+        }
         let mut id_guard = self.next_client_id.lock();
         let id = *id_guard;
         *id_guard += 1;
         self.clients.insert(id, sender);
-        id
+        Some(id)
     }
 
     pub fn unregister_client(&self, id: usize) {
         self.clients.remove(&id);
+    }
+
+    fn history_snapshot(&self) -> Vec<(String, String)> {
+        let history = self.console_history.lock();
+        let mut selected = Vec::new();
+        let mut total_bytes = 0usize;
+        for (message, target_console) in history.iter().rev() {
+            let entry_bytes = message.len() + target_console.len();
+            if selected.len() >= MAX_WS_HISTORY_LINES
+                || total_bytes.saturating_add(entry_bytes) > MAX_WS_HISTORY_BYTES
+            {
+                break;
+            }
+            total_bytes += entry_bytes;
+            selected.push((message.clone(), target_console.clone()));
+        }
+        selected.reverse();
+        selected
     }
 
     fn append_history(&self, message: &str, target_console: &str) {
@@ -283,7 +305,9 @@ pub async fn ws_handler_with_app_state(
         }
         return response;
     }
-    ws.on_upgrade(move |socket| handle_socket(socket, state.push_server))
+    ws.max_frame_size(MAX_WS_FRAME_SIZE)
+        .max_message_size(MAX_WS_MESSAGE_SIZE)
+        .on_upgrade(move |socket| handle_socket(socket, state.push_server))
         .into_response()
 }
 
@@ -305,48 +329,74 @@ fn validate_ws_request(headers: &HeaderMap, state: &AppState) -> Result<(), Stat
 }
 
 async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>) {
+    let Some(client_id) = push_server.try_register_client(push_server.channel().sender.clone()) else {
+        let (mut sender, _) = socket.split();
+        let _ = sender.send(Message::Close(None)).await;
+        return;
+    };
+
     let mut rx = push_server.channel().subscribe();
+    let history = push_server.history_snapshot();
+    let (mut sender, mut receiver) = socket.split();
+    let mut ping_interval = tokio::time::interval(WS_PING_INTERVAL);
+    let mut last_activity = Instant::now();
 
-    let (mut sender, mut _receiver) = socket.split();
+    for (body, target_console) in history {
+        let payload = serde_json::json!({
+            "type": "echo",
+            "body": body,
+            "target_console": target_console,
+        });
+        if sender.send(Message::Text(payload.to_string().into())).await.is_err() {
+            push_server.unregister_client(client_id);
+            return;
+        }
+    }
 
-    let client_id = push_server.register_client(push_server.channel().sender.clone());
-
-    // Send console history to new client (Ruby parity: pushserver.rb lines 76-78)
-    {
-        let history = push_server.console_history.lock().clone();
-        for (body, target_console) in history {
-            let payload = serde_json::json!({
-                "type": "echo",
-                "body": body,
-                "target_console": target_console,
-            });
-            if sender.send(Message::Text(payload.to_string().into())).await.is_err() {
-                push_server.unregister_client(client_id);
-                return;
+    loop {
+        tokio::select! {
+            message = rx.recv() => {
+                match message {
+                    Ok(msg) => {
+                        if sender.send(Message::Text(msg.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!("WebSocket client lagged, skipped {} messages", n);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            incoming = receiver.next() => {
+                match incoming {
+                    Some(Ok(Message::Ping(payload))) => {
+                        last_activity = Instant::now();
+                        if sender.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_)))
+                    | Some(Ok(Message::Text(_)))
+                    | Some(Ok(Message::Binary(_))) => {
+                        last_activity = Instant::now();
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                }
+            }
+            _ = ping_interval.tick() => {
+                if last_activity.elapsed() >= WS_IDLE_TIMEOUT {
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
+                }
+                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
             }
         }
     }
 
-    let result = tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(msg) => {
-                    if sender.send(Message::Text(msg.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    eprintln!("WebSocket client lagged, skipped {} messages", n);
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    })
-    .await;
-
     push_server.unregister_client(client_id);
-    let _ = result;
 }
 
 fn origin_to_domain(origin: &str) -> String {
@@ -406,7 +456,7 @@ mod tests {
         let mut server = PushServer::new();
         server.set_accepted_domains(["localhost"]);
         assert!(!server.accepts_origin("http://192.168.1.10:4001"));
-        server.set_allow_ip_literals(true);
+        server.set_accepted_domains(["localhost", "192.168.1.10"]);
         assert!(server.accepts_origin("http://192.168.1.10:4001"));
     }
 
@@ -428,6 +478,7 @@ mod tests {
             push_server: Arc::new(push_server),
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
+            allowed_request_hosts: vec!["localhost".to_string()],
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),

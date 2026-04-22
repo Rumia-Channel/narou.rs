@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use axum::{
-    extract::{Query, State},
+    extract::{Form, Query, State},
     http::{StatusCode, header},
     response::{Html, IntoResponse, Json, Response},
 };
@@ -92,6 +92,24 @@ fn query_to_bool(value: Option<&str>) -> bool {
     matches!(value, Some("1" | "true" | "yes" | "on"))
 }
 
+fn log_web_failure(context: &str, error: impl std::fmt::Display) {
+    eprintln!("web {} failed: {}", context, error);
+}
+
+fn log_immediate_command_failure(context: &str, output: &std::process::Output) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.trim().is_empty() {
+        eprintln!("web {} failed with status {}", context, output.status);
+    } else {
+        eprintln!(
+            "web {} failed with status {}: {}",
+            context,
+            output.status,
+            stderr.trim()
+        );
+    }
+}
+
 fn queue_download_jobs(
     queue: &PersistentQueue,
     targets: &[String],
@@ -131,6 +149,52 @@ fn queue_bookmarklet_download(
     queue
         .push(JobType::Download, &job_target)
         .map_err(|e| e.to_string())
+}
+
+fn bookmarklet_download_response(state: &AppState, params: &BookmarkletDownloadQuery) -> serde_json::Value {
+    let Some(target) = params
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    else {
+        return serde_json::json!({ "status": 2, "id": null });
+    };
+    if let Some(id) = resolve_existing_id_for_target(target) {
+        return serde_json::json!({ "status": 1, "id": id });
+    }
+    match queue_bookmarklet_download(
+        state.queue.as_ref(),
+        target,
+        query_to_bool(params.mail.as_deref()),
+    ) {
+        Ok(_) => {
+            state.push_server.broadcast_event("notification.queue", "");
+            serde_json::json!({ "status": 0, "id": null })
+        }
+        Err(error) => {
+            log_web_failure("bookmarklet download", error);
+            serde_json::json!({ "status": 2, "id": null })
+        }
+    }
+}
+
+fn render_post_only_notice(path: &str) -> Html<String> {
+    let escaped_path = html_escape(path);
+    Html(format!(
+        r#"<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>narou.rs</title>
+</head>
+<body>
+  <p>{escaped_path} は POST 専用になりました。古いブックマークレットは利用できません。</p>
+  <p><a href="/bookmarklet">/bookmarklet</a> から最新版を再登録してください。</p>
+</body>
+</html>"#
+    ))
 }
 
 fn resolve_existing_id_for_target(target: &str) -> Option<i64> {
@@ -796,14 +860,18 @@ pub async fn api_inspect(
                 message: if output.status.success() {
                     "OK".to_string()
                 } else {
-                    String::from_utf8_lossy(&output.stderr).to_string()
+                    log_immediate_command_failure("inspect", &output);
+                    "inspect の実行に失敗しました".to_string()
                 },
             })
         }
-        Err(e) => Json(ApiResponse {
-            success: false,
-            message: e,
-        }),
+        Err(e) => {
+            log_web_failure("inspect", &e);
+            Json(ApiResponse {
+                success: false,
+                message: "inspect の実行に失敗しました".to_string(),
+            })
+        }
     }
 }
 
@@ -1015,14 +1083,18 @@ pub async fn api_setting_burn(
                 message: if output.status.success() {
                     "設定を焼き込みました".to_string()
                 } else {
-                    String::from_utf8_lossy(&output.stderr).to_string()
+                    log_immediate_command_failure("setting --burn", &output);
+                    "設定の焼き込みに失敗しました".to_string()
                 },
             })
         }
-        Err(e) => Json(ApiResponse {
-            success: false,
-            message: e,
-        }),
+        Err(e) => {
+            log_web_failure("setting --burn", &e);
+            Json(ApiResponse {
+                success: false,
+                message: "設定の焼き込みに失敗しました".to_string(),
+            })
+        }
     }
 }
 
@@ -1105,32 +1177,25 @@ pub async fn api_diff_list_get(
 }
 
 // GET /api/download_request
+pub async fn bookmarklet_download_request_post_required(
+    Query(_params): Query<BookmarkletDownloadQuery>,
+) -> Html<String> {
+    render_post_only_notice("/api/download_request")
+}
+
+// GET /api/download4ssl
+pub async fn bookmarklet_download4ssl_post_required(
+    Query(_params): Query<BookmarkletDownloadQuery>,
+) -> Html<String> {
+    render_post_only_notice("/api/download4ssl")
+}
+
+// POST /api/download_request
 pub async fn api_download_request(
     State(state): State<AppState>,
-    Query(params): Query<BookmarkletDownloadQuery>,
+    Form(params): Form<BookmarkletDownloadQuery>,
 ) -> Json<serde_json::Value> {
-    let Some(target) = params
-        .target
-        .as_deref()
-        .map(str::trim)
-        .filter(|target| !target.is_empty())
-    else {
-        return Json(serde_json::json!({ "status": 2, "id": null }));
-    };
-    if let Some(id) = resolve_existing_id_for_target(target) {
-        return Json(serde_json::json!({ "status": 1, "id": id }));
-    }
-    match queue_bookmarklet_download(
-        state.queue.as_ref(),
-        target,
-        query_to_bool(params.mail.as_deref()),
-    ) {
-        Ok(_) => {
-            state.push_server.broadcast_event("notification.queue", "");
-            Json(serde_json::json!({ "status": 0, "id": null }))
-        }
-        Err(_) => Json(serde_json::json!({ "status": 2, "id": null })),
-    }
+    Json(bookmarklet_download_response(&state, &params))
 }
 
 // GET /api/downloadable.gif
@@ -1151,28 +1216,12 @@ pub async fn api_downloadable_gif(
     gif_response()
 }
 
-// GET /api/download4ssl
+// POST /api/download4ssl
 pub async fn api_download4ssl(
     State(state): State<AppState>,
-    Query(params): Query<BookmarkletDownloadQuery>,
+    Form(params): Form<BookmarkletDownloadQuery>,
 ) -> Response {
-    let Some(target) = params
-        .target
-        .as_deref()
-        .map(str::trim)
-        .filter(|target| !target.is_empty())
-    else {
-        return gif_response();
-    };
-    if queue_bookmarklet_download(
-        state.queue.as_ref(),
-        target,
-        query_to_bool(params.mail.as_deref()),
-    )
-    .is_ok()
-    {
-        state.push_server.broadcast_event("notification.queue", "");
-    }
+    let _ = bookmarklet_download_response(&state, &params);
     gif_response()
 }
 
@@ -1276,14 +1325,18 @@ pub async fn api_diff_clean(
                 message: if output.status.success() {
                     format!("Diff cleaned for {}", target)
                 } else {
-                    String::from_utf8_lossy(&output.stderr).to_string()
+                    log_immediate_command_failure("diff --clean", &output);
+                    "差分の削除に失敗しました".to_string()
                 },
             })
         }
-        Err(e) => Json(ApiResponse {
-            success: false,
-            message: e,
-        }),
+        Err(e) => {
+            log_web_failure("diff --clean", &e);
+            Json(ApiResponse {
+                success: false,
+                message: "差分の削除に失敗しました".to_string(),
+            })
+        }
     }
 }
 
@@ -1303,9 +1356,10 @@ pub async fn api_csv_import(
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
+            log_web_failure("csv import", &e);
             return Json(ApiResponse {
                 success: false,
-                message: e.to_string(),
+                message: "CSVインポートに失敗しました".to_string(),
             });
         }
     };
@@ -1338,14 +1392,18 @@ pub async fn api_csv_import(
                 message: if output.status.success() {
                     "CSVインポート完了".to_string()
                 } else {
-                    String::from_utf8_lossy(&output.stderr).to_string()
+                    log_immediate_command_failure("csv import", &output);
+                    "CSVインポートに失敗しました".to_string()
                 },
             })
         }
-        Err(e) => Json(ApiResponse {
-            success: false,
-            message: e.to_string(),
-        }),
+        Err(e) => {
+            log_web_failure("csv import", &e);
+            Json(ApiResponse {
+                success: false,
+                message: "CSVインポートに失敗しました".to_string(),
+            })
+        }
     }
 }
 
@@ -2152,6 +2210,7 @@ mod tests {
             push_server: Arc::new(crate::web::push::PushServer::new()),
             basic_auth_header: None,
             control_token: "control-token".to_string(),
+            allowed_request_hosts: vec!["localhost".to_string()],
             queue,
             restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(true)),

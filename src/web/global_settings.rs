@@ -228,9 +228,10 @@ pub async fn save_global_settings(
                 auto_schedule_changed = changed;
             }
             Err(e) => {
+                eprintln!("web save local settings failed: {}", e);
                 return Json(ApiResponse {
                     success: false,
-                    message: format!("Failed to save local settings: {}", e),
+                    message: "ローカル設定の保存に失敗しました".to_string(),
                 });
             }
         }
@@ -255,9 +256,10 @@ pub async fn save_global_settings(
             Ok(())
         })();
         if let Err(e) = result {
+            eprintln!("web save global settings failed: {}", e);
             return Json(ApiResponse {
                 success: false,
-                message: format!("Failed to save global settings: {}", e),
+                message: "グローバル設定の保存に失敗しました".to_string(),
             });
         }
     }
@@ -273,9 +275,10 @@ pub async fn save_global_settings(
             });
         }
         if let Err(e) = std::fs::write("replace.txt", content) {
+            eprintln!("web save replace.txt failed: {}", e);
             return Json(ApiResponse {
                 success: false,
-                message: format!("Failed to save replace.txt: {}", e),
+                message: "replace.txt の保存に失敗しました".to_string(),
             });
         }
     }

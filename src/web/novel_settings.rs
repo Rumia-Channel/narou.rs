@@ -42,11 +42,23 @@ pub async fn get_settings(
         super::safe_existing_novel_dir(db.archive_root(), &record)
             .map_err(NarouError::Database)
     })
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| {
+        eprintln!("web load novel settings directory failed for {}: {}", id, e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "設定の読み込みに失敗しました".to_string(),
+        )
+    })?;
 
     let ini_path = novel_dir.join("setting.ini");
     let ini = IniData::load_file(&ini_path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            eprintln!("web load setting.ini failed for {}: {}", id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "設定の読み込みに失敗しました".to_string(),
+            )
+        })?;
     let replace_patterns: Vec<serde_json::Value> = load_replace_patterns(&novel_dir.join("replace.txt"))
         .into_iter()
         .map(|(left, right)| serde_json::json!({ "left": left, "right": right }))
@@ -78,10 +90,22 @@ pub async fn save_settings(
         super::safe_existing_novel_dir(db.archive_root(), &record)
             .map_err(NarouError::Database)
     })
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| {
+        eprintln!("web resolve novel settings directory failed for {}: {}", id, e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "設定の保存に失敗しました".to_string(),
+        )
+    })?;
 
     let mut ini = IniData::load_file(&novel_dir.join("setting.ini"))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            eprintln!("web load setting.ini for save failed for {}: {}", id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "設定の保存に失敗しました".to_string(),
+            )
+        })?;
     let setting_map = body
         .get("settings")
         .and_then(|v| v.as_array())
@@ -103,11 +127,23 @@ pub async fn save_settings(
     }
 
     ini.save(&novel_dir.join("setting.ini"))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            eprintln!("web save setting.ini failed for {}: {}", id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "設定の保存に失敗しました".to_string(),
+            )
+        })?;
 
     if let Some(patterns) = body.get("replace_patterns").and_then(|v| v.as_array()) {
         save_replace_patterns(&novel_dir.join("replace.txt"), patterns)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| {
+                eprintln!("web save replace.txt failed for {}: {}", id, e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "replace.txt の保存に失敗しました".to_string(),
+                )
+            })?;
     }
 
     Ok(Json(ApiResponse {
