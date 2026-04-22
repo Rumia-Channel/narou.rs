@@ -1,5 +1,8 @@
 use std::process::Command;
 
+use narou_rs::compat::{
+    configure_hidden_console_command, resolve_java_command_path, sanitize_java_command,
+};
 use narou_rs::version;
 
 pub fn cmd_version(more: bool) {
@@ -13,7 +16,7 @@ fn version_more() {
     println!("  on {}", version::runtime_description());
     println!();
 
-    let aozoraepub3_jar = version::aozoraepub3_jar_path();
+    let aozoraepub3_jar = version::aozoraepub3_jar_path().and_then(|path| std::fs::canonicalize(path).ok());
     let working_dir = aozoraepub3_jar
         .as_ref()
         .and_then(|path| path.parent().map(|dir| dir.to_path_buf()));
@@ -93,7 +96,7 @@ fn print_stream(text: &str) {
 fn run_java_command(
     current_dir: Option<&std::path::Path>,
 ) -> std::io::Result<std::process::Output> {
-    let mut command = java_command();
+    let mut command = java_command()?;
     if let Some(dir) = current_dir {
         command.current_dir(dir);
     }
@@ -111,7 +114,7 @@ fn run_aozora_command(
     current_dir: Option<&std::path::Path>,
     classpath: &str,
 ) -> std::io::Result<std::process::Output> {
-    let mut command = java_command();
+    let mut command = java_command()?;
     if let Some(dir) = current_dir {
         command.current_dir(dir);
     }
@@ -128,12 +131,11 @@ fn run_aozora_command(
         .output()
 }
 
-fn java_command() -> Command {
-    if cfg!(windows) {
-        let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg("java");
-        cmd
-    } else {
-        Command::new("java")
-    }
+fn java_command() -> std::io::Result<Command> {
+    let java_path = resolve_java_command_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "java not found"))?;
+    let mut command = Command::new(java_path);
+    configure_hidden_console_command(&mut command);
+    sanitize_java_command(&mut command);
+    Ok(command)
 }

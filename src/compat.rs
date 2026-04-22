@@ -60,6 +60,69 @@ pub fn configure_hidden_console_command(command: &mut Command) {
     }
 }
 
+pub fn sanitize_java_command(command: &mut Command) -> &mut Command {
+    command
+        .env_remove("JAVA_TOOL_OPTIONS")
+        .env_remove("_JAVA_OPTIONS")
+        .env_remove("JDK_JAVA_OPTIONS")
+        .env_remove("CLASSPATH")
+}
+
+pub fn canonicalize_existing_path(path: impl AsRef<Path>) -> Option<PathBuf> {
+    fs::canonicalize(path).ok()
+}
+
+pub fn canonicalize_aozoraepub3_jar_dir(dir: &str) -> Option<PathBuf> {
+    let canonical_dir = canonicalize_existing_path(PathBuf::from(dir))?;
+    let jar = canonical_dir.join("AozoraEpub3.jar");
+    canonicalize_existing_path(jar)
+}
+
+pub fn resolve_java_command_path() -> Option<PathBuf> {
+    if let Some(path) =
+        load_global_setting_string_with_aliases(&["java_path", "java-path", "javapath"])
+    {
+        if let Some(canonical) = canonicalize_existing_path(PathBuf::from(path)) {
+            return Some(canonical);
+        }
+    }
+
+    if let Some(java_home) = std::env::var_os("JAVA_HOME") {
+        let java_name = if cfg!(windows) { "java.exe" } else { "java" };
+        let java_path = PathBuf::from(java_home).join("bin").join(java_name);
+        if let Some(canonical) = canonicalize_existing_path(java_path) {
+            return Some(canonical);
+        }
+    }
+
+    let locator = if cfg!(windows) { "where" } else { "which" };
+    let output = Command::new(locator).arg("java").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .and_then(|line| canonicalize_existing_path(PathBuf::from(line)))
+}
+
+pub fn load_global_setting_value(key: &str) -> Option<serde_yaml::Value> {
+    let path = global_setting_path()?;
+    let raw = fs::read_to_string(path).ok()?;
+    let settings: HashMap<String, serde_yaml::Value> = serde_yaml::from_str(&raw).ok()?;
+    settings.get(key).cloned()
+}
+
+pub fn load_global_setting_string(key: &str) -> Option<String> {
+    load_global_setting_value(key).and_then(|v| yaml_value_to_string(&v))
+}
+
+pub fn load_global_setting_string_with_aliases(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| load_global_setting_string(key))
+}
+
 pub fn load_local_setting_value(key: &str) -> Option<serde_yaml::Value> {
     crate::db::with_database(|db| {
         let settings: HashMap<String, serde_yaml::Value> = db
@@ -69,6 +132,26 @@ pub fn load_local_setting_value(key: &str) -> Option<serde_yaml::Value> {
     })
     .ok()
     .flatten()
+}
+
+fn global_setting_path() -> Option<PathBuf> {
+    if let Ok(inv) = Inventory::with_default_root() {
+        let dir = inv.root_dir().join(".narousetting");
+        if dir.is_dir() {
+            return Some(dir.join("global_setting.yaml"));
+        }
+    }
+
+    let home = home_dir()?;
+    Some(home.join(".narousetting").join("global_setting.yaml"))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var("USERPROFILE").ok().map(PathBuf::from)
+    } else {
+        std::env::var("HOME").ok().map(PathBuf::from)
+    }
 }
 
 pub fn load_local_setting_string(key: &str) -> Option<String> {

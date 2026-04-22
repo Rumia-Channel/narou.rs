@@ -7,8 +7,29 @@ use regex::Regex;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+use crate::compat::{
+    canonicalize_aozoraepub3_jar_dir, canonicalize_existing_path, configure_hidden_console_command,
+    load_global_setting_string, resolve_java_command_path, sanitize_java_command,
+};
 use crate::downloader::util::decode_numeric_entities;
 use crate::error::{NarouError, Result};
+
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn GetVolumeInformationW(
+        lp_root_path_name: *const u16,
+        lp_volume_name_buffer: *mut u16,
+        n_volume_name_size: u32,
+        lp_volume_serial_number: *mut u32,
+        lp_maximum_component_length: *mut u32,
+        lp_file_system_flags: *mut u32,
+        lp_file_system_name_buffer: *mut u16,
+        n_file_system_name_size: u32,
+    ) -> i32;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Device {
@@ -137,6 +158,10 @@ impl OutputManager {
     }
 
     fn find_external_tool(name: &str) -> Option<PathBuf> {
+        if name.eq_ignore_ascii_case("java") {
+            return resolve_java_command_path();
+        }
+
         if name.eq_ignore_ascii_case("AozoraEpub3") {
             if let Some(path) = Self::find_aozora_epub3_from_settings() {
                 return Some(path);
@@ -152,12 +177,17 @@ impl OutputManager {
             }
         }
 
-        if let Ok(output) = Command::new("where").arg(name).output() {
+        let locator = if cfg!(windows) { "where" } else { "which" };
+        if let Ok(output) = Command::new(locator).arg(name).output() {
             if output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout);
                 if let Some(first_line) = path.lines().next() {
                     if !first_line.trim().is_empty() {
-                        return Some(PathBuf::from(first_line.trim()));
+                        if let Some(canonical) =
+                            canonicalize_existing_path(PathBuf::from(first_line.trim()))
+                        {
+                            return Some(canonical);
+                        }
                     }
                 }
             }
@@ -171,7 +201,9 @@ impl OutputManager {
             for candidate in &candidates {
                 let p = PathBuf::from(candidate);
                 if p.exists() {
-                    return Some(p);
+                    if let Some(canonical) = canonicalize_existing_path(&p) {
+                        return Some(canonical);
+                    }
                 }
             }
         }
@@ -183,7 +215,10 @@ impl OutputManager {
         let aozora = Self::find_aozora_epub3_from_settings()?;
         let suffix = if cfg!(windows) { ".exe" } else { "" };
         let candidate = aozora.parent()?.join(format!("kindlegen{suffix}"));
-        candidate.exists().then_some(candidate)
+        candidate
+            .exists()
+            .then(|| canonicalize_existing_path(candidate))
+            .flatten()
     }
 
     fn find_kindlegen_from_kindle_previewer() -> Option<PathBuf> {
@@ -209,20 +244,17 @@ impl OutputManager {
             candidates.push(PathBuf::from(program_files_x86).join(&relative));
         }
 
-        candidates.into_iter().find(|candidate| candidate.exists())
+        candidates.into_iter().find_map(|candidate| {
+            candidate
+                .exists()
+                .then(|| canonicalize_existing_path(candidate))
+                .flatten()
+        })
     }
 
     fn find_aozora_epub3_from_settings() -> Option<PathBuf> {
-        let settings_path = home_dir()?
-            .join(".narousetting")
-            .join("global_setting.yaml");
-        let raw = std::fs::read_to_string(settings_path).ok()?;
-        let settings =
-            serde_yaml::from_str::<std::collections::BTreeMap<String, serde_yaml::Value>>(&raw)
-                .ok()?;
-        let dir = settings.get("aozoraepub3dir")?.as_str()?;
-        let jar = PathBuf::from(dir).join("AozoraEpub3.jar");
-        jar.exists().then_some(jar)
+        let dir = load_global_setting_string("aozoraepub3dir")?;
+        canonicalize_aozoraepub3_jar_dir(&dir)
     }
 
     fn build_aozora_command(&self) -> Result<(Command, PathBuf)> {
@@ -238,8 +270,8 @@ impl OutputManager {
             .unwrap_or_else(|| PathBuf::from("."));
 
         let mut cmd = if tool_path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
-            let java_path =
-                Self::find_external_tool("java").unwrap_or_else(|| PathBuf::from("java"));
+            let java_path = resolve_java_command_path()
+                .ok_or_else(|| NarouError::Conversion("java not found".into()))?;
             let jar_name = tool_path
                 .file_name()
                 .ok_or_else(|| NarouError::Conversion("Invalid AozoraEpub3 path".into()))?;
@@ -251,6 +283,8 @@ impl OutputManager {
             Command::new(&tool_path)
         };
 
+        sanitize_java_command(&mut cmd);
+        configure_hidden_console_command(&mut cmd);
         cmd.current_dir(&working_dir);
         Ok((cmd, working_dir))
     }
@@ -793,6 +827,7 @@ fn decode_ibunko_html_entities(text: &str) -> String {
     data
 }
 
+#[cfg(windows)]
 fn find_windows_volume_root(volume_name: &str) -> Option<PathBuf> {
     for letter in b'A'..=b'Z' {
         let drive = format!("{}:\\", letter as char);
@@ -801,19 +836,50 @@ fn find_windows_volume_root(volume_name: &str) -> Option<PathBuf> {
             continue;
         }
 
-        let output = Command::new("cmd")
-            .args(["/C", "vol", &drive])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            continue;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.to_lowercase().contains(&volume_name.to_lowercase()) {
+        if volume_matches(&drive, volume_name) {
             return Some(path);
         }
     }
     None
+}
+
+#[cfg(not(windows))]
+fn find_windows_volume_root(_volume_name: &str) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(windows)]
+fn volume_matches(root: &str, expected: &str) -> bool {
+    let mut root_wide = std::ffi::OsStr::new(root)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    let mut name_buffer = vec![0u16; 261];
+    let mut serial = 0u32;
+
+    let ok = unsafe {
+        GetVolumeInformationW(
+            root_wide.as_mut_ptr(),
+            name_buffer.as_mut_ptr(),
+            name_buffer.len() as u32,
+            &mut serial,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return false;
+    }
+
+    let name_len = name_buffer
+        .iter()
+        .position(|ch| *ch == 0)
+        .unwrap_or(name_buffer.len());
+    let label = String::from_utf16_lossy(&name_buffer[..name_len]);
+    let serial_text = format!("{:04X}-{:04X}", serial >> 16, serial & 0xFFFF);
+    label.eq_ignore_ascii_case(expected) || serial_text.eq_ignore_ascii_case(expected)
 }
 
 fn find_unix_volume_root(volume_name: &str) -> Option<PathBuf> {
