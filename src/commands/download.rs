@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use indicatif::MultiProgress;
 
+use narou_rs::compat::configure_hidden_console_command;
 use narou_rs::converter::NovelConverter;
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
@@ -586,6 +587,7 @@ fn auto_convert_via_web_subprocess(id: i64) -> Result<(), String> {
     let mut command = Command::new(exe_path);
     command.arg("convert").arg("--no-open").arg(id.to_string());
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_hidden_console_command(&mut command);
 
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     let stdout = child

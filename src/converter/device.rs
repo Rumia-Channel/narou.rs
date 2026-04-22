@@ -192,7 +192,10 @@ impl OutputManager {
         }
 
         let locator = if cfg!(windows) { "where" } else { "which" };
-        if let Ok(output) = Command::new(locator).arg(name).output() {
+        let mut lookup = Command::new(locator);
+        lookup.arg(name);
+        configure_hidden_console_command(&mut lookup);
+        if let Ok(output) = lookup.output() {
             if output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout);
                 if let Some(first_line) = path.lines().next() {
@@ -502,6 +505,7 @@ impl OutputManager {
                         .and_then(|name| name.to_str())
                         .ok_or_else(|| NarouError::Conversion("Invalid output filename".into()))?,
                 );
+                configure_hidden_console_command(&mut cmd2);
                 if !self.verbose {
                     cmd2.stdout(Stdio::null());
                     cmd2.stderr(Stdio::null());

@@ -536,6 +536,7 @@ fn run_difftool(
         command.arg(&old_path).arg(&new_path);
     }
 
+    compat::configure_hidden_console_command(&mut command);
     let output = command.output().map_err(|e| e.to_string())?;
     Ok(DiffOutput {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),

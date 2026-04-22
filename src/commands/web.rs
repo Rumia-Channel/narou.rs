@@ -462,11 +462,13 @@ fn try_kill_via_pid_file(port: u16) {
 
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
+        let mut command = std::process::Command::new("taskkill");
+        command
             .args(["/PID", &pid.to_string(), "/F"])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+            .stderr(std::process::Stdio::null());
+        narou_rs::compat::configure_hidden_console_command(&mut command);
+        let _ = command.status();
     }
     #[cfg(not(windows))]
     {

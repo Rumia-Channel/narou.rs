@@ -9,8 +9,9 @@ use std::sync::{Arc, OnceLock};
 use chrono::{DateTime, Utc};
 
 use narou_rs::compat::{
-    convert_existing_novel, current_device, load_local_setting_bool, load_local_setting_string,
-    load_local_setting_value, relay_web_stream_to_console, yaml_value_to_string,
+    configure_hidden_console_command, convert_existing_novel, current_device,
+    load_local_setting_bool, load_local_setting_string, load_local_setting_value,
+    relay_web_stream_to_console, yaml_value_to_string,
 };
 use narou_rs::converter::NovelConverter;
 use narou_rs::converter::device::{Device, OutputManager};
@@ -803,6 +804,7 @@ fn auto_convert_via_web_subprocess(id: i64, no_open: bool) -> Result<(), String>
     }
     command.arg(id.to_string());
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_hidden_console_command(&mut command);
 
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     let stdout = child.stdout.take().ok_or_else(|| "convert stdout を取得できません".to_string())?;

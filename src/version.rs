@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
+use crate::compat::configure_hidden_console_command;
 use crate::db::inventory::Inventory;
 
 pub const NAME: &str = "narou.rs";
@@ -23,10 +25,10 @@ pub fn version_json() -> serde_json::Value {
 }
 
 pub fn runtime_description() -> String {
-    if let Ok(output) = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-    {
+    let mut command = Command::new("rustc");
+    command.arg("--version");
+    configure_hidden_console_command(&mut command);
+    if let Ok(output) = command.output() {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !text.is_empty() {

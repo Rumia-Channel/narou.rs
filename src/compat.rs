@@ -96,7 +96,10 @@ pub fn resolve_java_command_path() -> Option<PathBuf> {
     }
 
     let locator = if cfg!(windows) { "where" } else { "which" };
-    let output = Command::new(locator).arg("java").output().ok()?;
+    let mut command = Command::new(locator);
+    command.arg("java");
+    configure_hidden_console_command(&mut command);
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -360,9 +363,10 @@ pub fn open_directory(path: &Path, confirm_message: Option<&str>) {
 
     let path = path.to_string_lossy().to_string();
     if cfg!(windows) {
-        let _ = std::process::Command::new("explorer")
-            .arg(format!("file:///{}", path.replace('\\', "/")))
-            .spawn();
+        let mut command = std::process::Command::new("explorer");
+        command.arg(format!("file:///{}", path.replace('\\', "/")));
+        configure_hidden_console_command(&mut command);
+        let _ = command.spawn();
     } else if cfg!(target_os = "macos") {
         let _ = std::process::Command::new("open").arg(&path).spawn();
     } else {

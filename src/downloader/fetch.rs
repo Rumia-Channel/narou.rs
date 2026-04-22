@@ -10,6 +10,7 @@ use reqwest::header::{
     LOCATION,
 };
 
+use crate::compat::configure_hidden_console_command;
 use crate::error::{NarouError, Result};
 
 use super::rate_limit::RateLimiter;
@@ -328,6 +329,7 @@ fn read_response_bytes(mut response: reqwest::blocking::Response) -> Result<Vec<
 }
 
 fn run_command_with_timeout(mut cmd: Command, timeout: Duration) -> std::io::Result<Output> {
+    configure_hidden_console_command(&mut cmd);
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let stdout = child
         .stdout
