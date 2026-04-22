@@ -80,6 +80,34 @@ impl ConverterBase {
         .to_string()
     }
 
+    /// 濁点合成 (`か゛` 等) を `［＃濁点］か［＃濁点終わり］` に変換し、
+    /// 1件でも変換が起きたら `use_dakuten_font = true` を立てる。Ruby の
+    /// `convert_dakuten_char_to_font` (lib/converterbase.rb) と等価。
+    pub(super) fn convert_dakuten_char_to_font(&mut self, text: &str) -> String {
+        if !self.settings.enable_dakuten_font {
+            return text.to_string();
+        }
+        // [ぁ-んァ-ヶι] と続く濁点記号 (U+309B 全角濁点 / U+FF9E 半角濁点)。
+        let re = Regex::new(
+            "([\u{3041}-\u{3093}\u{30A1}-\u{30F6}\u{03B9}])[\u{309B}\u{FF9E}]",
+        )
+        .unwrap();
+        let mut hit = false;
+        let result = re
+            .replace_all(text, |caps: &regex::Captures| {
+                hit = true;
+                format!(
+                    "\u{FF3B}\u{FF03}\u{6FC1}\u{70B9}\u{FF3D}{}\u{FF3B}\u{FF03}\u{6FC1}\u{70B9}\u{7D42}\u{308F}\u{308A}\u{FF3D}",
+                    &caps[1]
+                )
+            })
+            .to_string();
+        if hit {
+            self.use_dakuten_font = true;
+        }
+        result
+    }
+
     pub(super) fn alphabet_to_zenkaku(&self, text: &str) -> String {
         let re = Regex::new(r"[A-Za-z]+").unwrap();
         re.replace_all(text, |caps: &regex::Captures| {
@@ -321,5 +349,46 @@ mod tests {
         let mut cb = ConverterBase::new(settings);
         let out = cb.convert("第四章１０　『知識欲の権化』", TextType::Subtitle);
         assert_eq!(out, "第四章１０　『知識欲の権化』");
+    }
+
+    #[test]
+    fn ruby_parity_dakuten_font_off_does_not_convert() {
+        let mut settings = NovelSettings::default();
+        settings.enable_dakuten_font = false;
+        let mut cb = ConverterBase::new(settings);
+        let out = cb.convert_dakuten_char_to_font("あ\u{309B}い");
+        assert_eq!(out, "あ\u{309B}い");
+        assert!(!cb.use_dakuten_font);
+    }
+
+    #[test]
+    fn ruby_parity_dakuten_font_fullwidth_mark_replaced() {
+        let mut settings = NovelSettings::default();
+        settings.enable_dakuten_font = true;
+        let mut cb = ConverterBase::new(settings);
+        let out = cb.convert_dakuten_char_to_font("あ\u{309B}い");
+        assert_eq!(out, "［＃濁点］あ［＃濁点終わり］い");
+        assert!(cb.use_dakuten_font);
+    }
+
+    #[test]
+    fn ruby_parity_dakuten_font_halfwidth_mark_replaced() {
+        let mut settings = NovelSettings::default();
+        settings.enable_dakuten_font = true;
+        let mut cb = ConverterBase::new(settings);
+        // U+FF9E (halfwidth katakana voiced sound mark) on katakana ヴ-base char.
+        let out = cb.convert_dakuten_char_to_font("カ\u{FF9E}");
+        assert_eq!(out, "［＃濁点］カ［＃濁点終わり］");
+        assert!(cb.use_dakuten_font);
+    }
+
+    #[test]
+    fn ruby_parity_dakuten_font_no_match_keeps_flag_false() {
+        let mut settings = NovelSettings::default();
+        settings.enable_dakuten_font = true;
+        let mut cb = ConverterBase::new(settings);
+        let out = cb.convert_dakuten_char_to_font("あいうえお");
+        assert_eq!(out, "あいうえお");
+        assert!(!cb.use_dakuten_font);
     }
 }

@@ -24,6 +24,7 @@ pub struct ConverterBase {
     pub hankaku_num_comma_stash: Vec<String>,
     pub force_indent_chapter_stash: Vec<String>,
     pub text_type: TextType,
+    pub use_dakuten_font: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -50,6 +51,7 @@ impl ConverterBase {
             hankaku_num_comma_stash: Vec::new(),
             force_indent_chapter_stash: Vec::new(),
             text_type: TextType::Body,
+            use_dakuten_font: false,
         }
     }
 
@@ -65,6 +67,7 @@ impl ConverterBase {
             hankaku_num_comma_stash: Vec::new(),
             force_indent_chapter_stash: Vec::new(),
             text_type: TextType::Body,
+            use_dakuten_font: false,
         }
     }
 
@@ -80,6 +83,7 @@ impl ConverterBase {
             hankaku_num_comma_stash: Vec::new(),
             force_indent_chapter_stash: Vec::new(),
             text_type: TextType::Body,
+            use_dakuten_font: false,
         }
     }
 
@@ -99,6 +103,7 @@ impl ConverterBase {
             hankaku_num_comma_stash: Vec::new(),
             force_indent_chapter_stash: Vec::new(),
             text_type: TextType::Body,
+            use_dakuten_font: false,
         }
     }
 
@@ -193,6 +198,8 @@ impl ConverterBase {
         result = self.convert_novel_rule(&result);
         result = self.convert_head_half_spaces(&result);
         result = self.modify_kana_ni_to_kanji_ni(&result);
+
+        result = self.convert_dakuten_char_to_font(&result);
 
         if self.settings.enable_prolonged_sound_mark_to_dash {
             result = self.convert_prolonged_sound_mark_to_dash(&result);
