@@ -337,10 +337,12 @@ pub fn default_allowed_request_hosts(bind_host: &str) -> Vec<String> {
     hosts
 }
 
+#[cfg(test)]
 fn wildcard_host_match(pattern: &str, text: &str) -> bool {
     wildcard_host_match_bytes(pattern.as_bytes(), text.as_bytes())
 }
 
+#[cfg(test)]
 fn wildcard_host_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
     if pattern.is_empty() {
         return text.is_empty();
@@ -358,6 +360,7 @@ fn wildcard_host_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
 /// Validates that a wildcard pattern is safe against domain-boundary bypasses.
 /// Returns false for patterns like `*.com`, `*`, or `example.com*` that would
 /// match unintended domains.
+#[cfg(test)]
 fn is_safe_wildcard_pattern(pattern: &str) -> bool {
     let trimmed = pattern.trim();
     if trimmed.is_empty() {
@@ -388,6 +391,7 @@ fn is_safe_wildcard_pattern(pattern: &str) -> bool {
 /// Ensures that a `*.domain` wildcard matches exactly one subdomain level.
 /// `*.example.com` matches `sub.example.com` but NOT `sub.sub.example.com`
 /// nor `evil.example.com.attacker.com`.
+#[cfg(test)]
 fn is_exact_subdomain_wildcard_match(pattern: &str, text: &str) -> bool {
     if !pattern.starts_with("*.") {
         return true;

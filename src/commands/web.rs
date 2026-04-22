@@ -511,6 +511,7 @@ fn load_basic_auth_header() -> Result<Option<String>, String> {
     Ok(Some(format!("Basic {}", token)))
 }
 
+#[cfg(test)]
 fn is_wildcard_bind_host(host: &str) -> bool {
     matches!(host, "0.0.0.0" | "::")
 }
