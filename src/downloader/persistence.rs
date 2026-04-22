@@ -15,13 +15,17 @@ pub fn compute_section_hash(section: &SectionElement) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn section_filename(subtitle: &SubtitleInfo) -> String {
+    let safe_subtitle = crate::downloader::util::sanitize_filename(&subtitle.file_subtitle);
+    format!("{} {}.yaml", subtitle.index, safe_subtitle)
+}
+
 pub fn section_needs_update(
     section_dir: &PathBuf,
     subtitle: &SubtitleInfo,
     new_section: &SectionElement,
 ) -> bool {
-    let filename = format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle);
-    let path = section_dir.join(&filename);
+    let path = section_dir.join(section_filename(subtitle));
     if !path.exists() {
         return true;
     }
@@ -37,8 +41,7 @@ pub fn resolve_section_file_path(
     section_dir: &Path,
     subtitle: &SubtitleInfo,
 ) -> Option<PathBuf> {
-    let filename = format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle);
-    let exact = section_dir.join(&filename);
+    let exact = section_dir.join(section_filename(subtitle));
     if exact.exists() {
         return Some(exact);
     }
@@ -71,7 +74,8 @@ pub fn save_section_file(
     subtitle: &SubtitleInfo,
     section: &SectionElement,
 ) -> Result<()> {
-    let filename = format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle);
+    let safe_subtitle = crate::downloader::util::sanitize_filename(&subtitle.file_subtitle);
+    let filename = format!("{} {}.yaml", subtitle.index, safe_subtitle);
     let path = section_dir.join(filename);
     let file_data = SectionFile {
         index: subtitle.index.clone(),
@@ -92,7 +96,8 @@ pub fn save_section_file(
 }
 
 pub fn save_raw_file(raw_dir: &PathBuf, subtitle: &SubtitleInfo, raw_html: &str) -> Result<()> {
-    let filename = format!("{} {}.html", subtitle.index, subtitle.file_subtitle);
+    let safe_subtitle = crate::downloader::util::sanitize_filename(&subtitle.file_subtitle);
+    let filename = format!("{} {}.html", subtitle.index, safe_subtitle);
     let path = raw_dir.join(filename);
     std::fs::write(&path, raw_html)?;
     Ok(())

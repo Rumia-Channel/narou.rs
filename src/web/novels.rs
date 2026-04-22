@@ -473,7 +473,7 @@ pub async fn download_ebook(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("ebook.epub");
-    let disposition = format!("attachment; filename=\"{}\"", filename);
+    let disposition = sanitize_content_disposition(filename);
 
     Ok((
         StatusCode::OK,
@@ -484,4 +484,20 @@ pub async fn download_ebook(
         data,
     )
         .into_response())
+}
+
+/// Sanitizes a filename for use in Content-Disposition header.
+/// Replaces quotes and control characters, then wraps in `filename="..."`.
+fn sanitize_content_disposition(filename: &str) -> String {
+    let sanitized: String = filename
+        .chars()
+        .map(|c| {
+            if c == '"' || c.is_ascii_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    format!("attachment; filename=\"{}\"", sanitized)
 }

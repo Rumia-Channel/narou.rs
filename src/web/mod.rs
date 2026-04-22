@@ -302,10 +302,9 @@ fn host_allowed(host: &str, state: &AppState) -> bool {
         return false;
     }
     state.push_server.accepted_domains().iter().any(|pattern| {
-        wildcard_host_match(
-            pattern.trim().trim_matches('.').to_ascii_lowercase().as_str(),
-            normalized.as_str(),
-        )
+        let pattern = pattern.trim().trim_matches('.').to_ascii_lowercase();
+        is_safe_wildcard_pattern(&pattern)
+            && wildcard_host_match(pattern.as_str(), normalized.as_str())
     }) || (state.push_server.allow_ip_literals() && normalized.parse::<IpAddr>().is_ok())
 }
 
@@ -325,6 +324,28 @@ fn wildcard_host_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
         b'?' => !text.is_empty() && wildcard_host_match_bytes(&pattern[1..], &text[1..]),
         c => !text.is_empty() && c == text[0] && wildcard_host_match_bytes(&pattern[1..], &text[1..]),
     }
+}
+
+/// Validates that a wildcard pattern is safe against domain-boundary bypasses.
+/// Returns false for patterns like `*.com` or `*` that would match any domain.
+fn is_safe_wildcard_pattern(pattern: &str) -> bool {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Reject bare `*` — would match every domain
+    if trimmed == "*" {
+        return false;
+    }
+    // Reject patterns ending with a wildcard after a TLD-like component (e.g. `*.com`, `*.co.jp`)
+    // We require at least one dot before the wildcard to ensure it's a subdomain pattern.
+    if let Some(pos) = trimmed.rfind('*') {
+        let before = &trimmed[..pos];
+        if !before.contains('.') {
+            return false;
+        }
+    }
+    true
 }
 
 fn is_state_changing_method(method: &Method) -> bool {
@@ -481,8 +502,8 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
 
     use super::{
-        AppState, basic_auth_matches, origin_allowed, removal_log_message, request_host_allowed,
-        safe_existing_novel_dir, validate_web_tag_name,
+        AppState, basic_auth_matches, is_safe_wildcard_pattern, origin_allowed, removal_log_message,
+        request_host_allowed, safe_existing_novel_dir, validate_web_tag_name, wildcard_host_match,
     };
 
     fn sample_record(file_title: &str) -> crate::db::novel_record::NovelRecord {
@@ -632,5 +653,20 @@ mod tests {
             axum::http::HeaderValue::from_static("http://evil.test:8080"),
         );
         assert!(!origin_allowed(&headers, &state, state.port));
+    }
+
+    #[test]
+    fn wildcard_host_match_rejects_subdomain_bypass() {
+        // `*.example.com` must NOT match `evil.example.com.attacker.com`
+        assert!(!wildcard_host_match("*.example.com", "evil.example.com.attacker.com"));
+        // `*.example.com` must match `sub.example.com`
+        assert!(wildcard_host_match("*.example.com", "sub.example.com"));
+        // Bare `*` must be rejected by is_safe_wildcard_pattern
+        assert!(!is_safe_wildcard_pattern("*"));
+        // `*.com` must be rejected
+        assert!(!is_safe_wildcard_pattern("*.com"));
+        // Exact match still works
+        assert!(is_safe_wildcard_pattern("localhost"));
+        assert!(wildcard_host_match("localhost", "localhost"));
     }
 }

@@ -146,7 +146,16 @@ impl Inventory {
     }
 
     pub fn save<T: Serialize>(&self, name: &str, scope: InventoryScope, data: &T) -> Result<()> {
-        let content = serde_yaml::to_string(data)?;
+        let mut content = serde_yaml::to_string(data)?;
+        // Strip the `---` document-start header that serde_yaml emits by default,
+        // to match Ruby Psych output and keep files byte-compatible with narou.rb.
+        if content.starts_with("---\n") {
+            content.drain(..4);
+        } else if content.starts_with("---") {
+            // Handle `---` without trailing newline (unlikely but safe)
+            let after = content[3..].trim_start_matches('\r').trim_start_matches('\n');
+            content = after.to_string();
+        }
         self.save_raw(name, scope, &content)
     }
 

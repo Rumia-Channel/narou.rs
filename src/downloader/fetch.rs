@@ -120,6 +120,11 @@ impl HttpFetcher {
         headers.append("Accept-Charset: utf-8").ok()?;
         headers.append("Connection: keep-alive").ok()?;
         if let Some(cookie) = cookie {
+            // Sanitize cookie value to prevent HTTP header injection.
+            // Reject any cookie containing control characters, newlines, or CR.
+            if cookie.bytes().any(|b| b.is_ascii_control()) {
+                return None;
+            }
             headers.append(&format!("Cookie: {cookie}")).ok()?;
         }
         handle.http_headers(headers).ok()?;
