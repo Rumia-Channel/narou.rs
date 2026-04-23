@@ -680,15 +680,21 @@ fn apply_general_lastup_check_result(
     now: DateTime<Utc>,
 ) {
     let last_check = record.last_check_date.or(Some(record.last_update));
+    let previous_general_lastup = record.general_lastup;
+    let changed_general_lastup = general_lastup.zip(previous_general_lastup).is_some_and(|(new_gl, old_gl)| new_gl != old_gl);
+    let mut should_mark_modified = changed_general_lastup;
 
     if let Some(nu) = novelupdated_at {
         if let Some(lc) = last_check
             && nu > lc
-            && !record.tags.iter().any(|tag| tag == MODIFIED_TAG)
         {
-            record.tags.push(MODIFIED_TAG.to_string());
+            should_mark_modified = true;
         }
         record.novelupdated_at = Some(nu);
+    }
+
+    if should_mark_modified && !record.tags.iter().any(|tag| tag == MODIFIED_TAG) {
+        record.tags.push(MODIFIED_TAG.to_string());
     }
 
     if let Some(gl) = general_lastup {
@@ -1464,5 +1470,30 @@ mod tests {
         assert_eq!(record.novelupdated_at, stale_after_update);
         assert_eq!(record.last_check_date, Some(now));
         assert!(!record.tags.iter().any(|tag| tag == MODIFIED_TAG));
+    }
+
+    #[test]
+    fn general_lastup_check_marks_modified_when_latest_published_episode_date_changes() {
+        let last_update = Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap();
+        let mut record = sample_record(last_update);
+        record.last_check_date = Some(last_update + Duration::hours(4));
+        record.general_lastup = Some(last_update + Duration::hours(1));
+        let stale_after_update = Some(last_update + Duration::hours(2));
+        let changed_general_lastup = Some(last_update + Duration::hours(3));
+        let now = last_update + Duration::hours(5);
+
+        apply_general_lastup_check_result(
+            &mut record,
+            stale_after_update,
+            changed_general_lastup,
+            None,
+            None,
+            now,
+        );
+
+        assert_eq!(record.novelupdated_at, stale_after_update);
+        assert_eq!(record.general_lastup, changed_general_lastup);
+        assert_eq!(record.last_check_date, Some(now));
+        assert!(record.tags.iter().any(|tag| tag == MODIFIED_TAG));
     }
 }
