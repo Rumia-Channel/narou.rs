@@ -209,9 +209,12 @@ impl SiteSetting {
         prev_captures: &HashMap<String, String>,
     ) -> Option<String> {
         let value = match key {
-            "t" | "title" => self.t.as_ref().or(self.title.as_ref()),
-            "w" | "author" => self.w.as_ref().or(self.author.as_ref()),
-            "s" | "story" => self.s.as_ref().or(self.story.as_ref()),
+            "t" => self.t.as_ref().or(self.title.as_ref()),
+            "title" => self.title.as_ref().or(self.t.as_ref()),
+            "w" => self.w.as_ref().or(self.author.as_ref()),
+            "author" => self.author.as_ref().or(self.w.as_ref()),
+            "s" => self.s.as_ref().or(self.story.as_ref()),
+            "story" => self.story.as_ref().or(self.s.as_ref()),
             "nt" => self.nt.as_ref(),
             "ga" => self.ga.as_ref(),
             "gf" => self.gf.as_ref(),

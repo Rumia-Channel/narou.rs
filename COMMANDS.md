@@ -199,7 +199,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `SuspendDownload` 発生時は通常失敗ではなくバッチ全体の中断として扱うように修正
 - `auto-add-tags` 設定対応。site YAML の `tags` パターンから取得したタグをDBタグへ自動追加
 - `hotentry` / `hotentry.auto-mail` 設定のうち、hotentry の新着話収集・統合テキスト生成・device に応じた変換・`copy-to`・端末送信・mail までは実装済み
-- `confirm_over18?` 相当として、R18 サイトで承諾した場合は global `over18: true` を保存し、以後は再確認しない
+- `confirm_over18?` 相当として、R18 サイトで承諾した場合は global `over18: true` を保存し、以後は再確認しない。`over18: false` を明示設定した場合は Ruby版同様に再確認せず中止し、ハーメルンは site YAML の R18 マーカー検出でも同じ分岐を通す
 - ソートキーバリデーション（不正キーでエラー+終了コード127）
 - `setting update.sort-by` の select 値を Ruby版 `Narou::UPDATE_SORT_KEYS` と同期済み
 - 小説間インターバル（Ruby版 `Interval` クラス互換）
@@ -362,7 +362,7 @@ narou setting name         # 読み取り
 | `server-port` | integer | Web サーバポート (+1 は WebSocket) |
 | `server-bind` | string | Web サーババインドアドレス |
 | `server-basic-auth.*` | bool/str | Basic 認証設定 |
-| `over18` | boolean | 18+ フラグ |
+| `over18` | boolean | 18+ フラグ（未設定時は初回のみ確認、`false` 明示時はR18取得を中止） |
 
 **実装済み (Rust)**:
 - `local_setting.yaml` / `global_setting.yaml` の読み書き (`Inventory`)

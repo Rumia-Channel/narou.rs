@@ -37,6 +37,8 @@ pub struct SiteSetting {
     pub confirm_over18: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over18_pattern: Option<SiteSettingValue>,
     pub sitename: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sitename_pattern: Option<SiteSettingValue>,
@@ -122,6 +124,8 @@ pub struct SiteSetting {
     #[serde(skip)]
     pub(super) compiled_error_message: Option<Regex>,
     #[serde(skip)]
+    pub(super) compiled_over18_pattern: Option<Regex>,
+    #[serde(skip)]
     pub(super) compiled_next_toc: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_toc_page_max: Option<Regex>,
@@ -190,6 +194,10 @@ impl SiteSetting {
             .error_message
             .as_deref()
             .and_then(|s| Regex::new(s).ok());
+        self.compiled_over18_pattern = self
+            .over18_pattern
+            .as_ref()
+            .and_then(|v| self.compile_value(v));
         self.compiled_next_toc = self.next_toc.as_deref().and_then(|s| Regex::new(s).ok());
         self.compiled_toc_page_max = self
             .toc_page_max
@@ -334,6 +342,10 @@ impl SiteSetting {
 
     pub fn error_message(&self) -> Option<&str> {
         self.error_message.as_deref()
+    }
+
+    pub fn over18_pattern(&self) -> Option<&Regex> {
+        self.compiled_over18_pattern.as_ref()
     }
 
     pub fn body_pattern(&self) -> Option<&str> {

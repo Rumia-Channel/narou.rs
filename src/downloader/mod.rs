@@ -145,7 +145,7 @@ fn load_local_setting_string(key: &str) -> Option<String> {
     crate::compat::load_local_setting_string(key)
 }
 
-fn load_global_setting_bool(key: &str) -> bool {
+fn load_global_setting_optional_bool(key: &str) -> Option<bool> {
     crate::db::with_database(|db| {
         let settings: HashMap<String, serde_yaml::Value> = db.inventory().load(
             "global_setting",
@@ -160,7 +160,6 @@ fn load_global_setting_bool(key: &str) -> bool {
     })
     .ok()
     .flatten()
-    .unwrap_or(false)
 }
 
 fn save_global_setting_bool(key: &str, value: bool) -> Result<()> {
@@ -180,6 +179,36 @@ fn save_global_setting_bool(key: &str, value: bool) -> Result<()> {
         )?;
         Ok(())
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Over18AccessDecision {
+    Allow,
+    Prompt,
+    Deny,
+}
+
+fn requires_over18_confirmation(setting: &SiteSetting, toc_source: &str) -> bool {
+    setting.confirm_over18
+        || setting
+            .over18_pattern()
+            .is_some_and(|pattern| pattern.is_match(toc_source))
+}
+
+fn over18_access_decision(
+    setting: &SiteSetting,
+    toc_source: &str,
+    stored_over18: Option<bool>,
+) -> Over18AccessDecision {
+    if !requires_over18_confirmation(setting, toc_source) {
+        return Over18AccessDecision::Allow;
+    }
+
+    match stored_over18 {
+        Some(true) => Over18AccessDecision::Allow,
+        Some(false) => Over18AccessDecision::Deny,
+        None => Over18AccessDecision::Prompt,
+    }
 }
 
 fn section_filename(subtitle: &SubtitleInfo) -> String {
@@ -919,13 +948,40 @@ impl Downloader {
             setting.interpolate_with_captures(&setting.toc_url, &url_captures)
         };
         let toc_source = fetch_toc(&mut self.fetcher, &setting, &toc_url)?;
-        if setting.confirm_over18 && !load_global_setting_bool("over18") {
-            if !crate::compat::confirm("年齢認証：あなたは18歳以上ですか", false, false)
-            {
+        let toc_preview_info = NovelInfo::from_toc_source(&setting, &toc_source);
+        match over18_access_decision(
+            &setting,
+            &toc_source,
+            load_global_setting_optional_bool("over18"),
+        ) {
+            Over18AccessDecision::Allow => {}
+            Over18AccessDecision::Prompt => {
+                if !crate::compat::confirm("年齢認証：あなたは18歳以上ですか", false, false)
+                {
+                    return Ok(DownloadResult {
+                        id: provisional_id,
+                        title: toc_preview_info.title.clone().unwrap_or_default(),
+                        author: toc_preview_info.author.clone().unwrap_or_default(),
+                        novel_dir: PathBuf::new(),
+                        new_novel: existing_id.is_none(),
+                        new_arrivals: false,
+                        new_arrival_subtitles: Vec::new(),
+                        updated_count: 0,
+                        total_count: 0,
+                        status: UpdateStatus::Canceled,
+                        title_changed: false,
+                        author_changed: false,
+                        story_changed: false,
+                        sections_deleted: false,
+                    });
+                }
+                save_global_setting_bool("over18", true)?;
+            }
+            Over18AccessDecision::Deny => {
                 return Ok(DownloadResult {
                     id: provisional_id,
-                    title: String::new(),
-                    author: String::new(),
+                    title: toc_preview_info.title.clone().unwrap_or_default(),
+                    author: toc_preview_info.author.clone().unwrap_or_default(),
                     novel_dir: PathBuf::new(),
                     new_novel: existing_id.is_none(),
                     new_arrivals: false,
@@ -939,7 +995,6 @@ impl Downloader {
                     sections_deleted: false,
                 });
             }
-            save_global_setting_bool("over18", true)?;
         }
 
         let info = self.load_novel_info(&setting, &toc_source, &url_captures)?;
@@ -1818,7 +1873,10 @@ impl Downloader {
 
 #[cfg(test)]
 mod tests {
-    use super::{Downloader, resolve_user_agent};
+    use super::{
+        Downloader, Over18AccessDecision, over18_access_decision,
+        requires_over18_confirmation, resolve_user_agent,
+    };
     use super::novel_info::NovelInfo;
     use super::site_setting::SiteSetting;
     use chrono::TimeZone;
@@ -2214,6 +2272,69 @@ mod tests {
         assert_eq!(
             super::sanitize_site_tags(&tags),
             vec!["和風ファンタジー", "妖", "ヤンデレ", "闇夜の蛍"]
+        );
+    }
+
+    #[test]
+    fn syosetu_org_r18_marker_uses_global_over18_setting() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "ハーメルン").unwrap();
+        let html = r#"
+<div class="ss">
+<strong><span class="alert_color">※この作品はR-18です。</span></strong><BR>
+</div>
+"#;
+
+        assert!(requires_over18_confirmation(setting, html));
+        assert_eq!(
+            over18_access_decision(setting, html, None),
+            Over18AccessDecision::Prompt
+        );
+        assert_eq!(
+            over18_access_decision(setting, html, Some(true)),
+            Over18AccessDecision::Allow
+        );
+        assert_eq!(
+            over18_access_decision(setting, html, Some(false)),
+            Over18AccessDecision::Deny
+        );
+    }
+
+    #[test]
+    fn syosetu_org_r18_toc_extracts_title_and_author() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "ハーメルン").unwrap();
+        let html = r#"
+<div class="ss">
+<strong><span class="alert_color">※この作品はR-18です。</span></strong><BR>
+<span style="font-size:150%" itemprop="name">一次創作キャットファイトとかレズバトルもの</span>
+<div align="right">作者：<span itemprop="author"><a href="//syosetu.org/user/178289/">就活をするゴミ箱の魂</a></span></div>
+</div>
+"#;
+
+        let info = NovelInfo::from_toc_source(setting, html);
+
+        assert_eq!(
+            info.title.as_deref(),
+            Some("一次創作キャットファイトとかレズバトルもの")
+        );
+        assert_eq!(info.author.as_deref(), Some("就活をするゴミ箱の魂"));
+    }
+
+    #[test]
+    fn non_r18_toc_does_not_require_over18_setting() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "ハーメルン").unwrap();
+        let html = r#"
+<div class="ss">
+<span style="font-size:150%" itemprop="name">全年齢作品</span>
+</div>
+"#;
+
+        assert!(!requires_over18_confirmation(setting, html));
+        assert_eq!(
+            over18_access_decision(setting, html, Some(false)),
+            Over18AccessDecision::Allow
         );
     }
 

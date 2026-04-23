@@ -12,8 +12,9 @@ confirm_over18: no
 append_title_to_folder_name: yes
 title_strip_pattern: null
 cookie: over18=off
+over18_pattern: ※この作品はR-18です。
 sitename: *name
-version: 1.4
+version: 1.5
 
 # ------------------------------------------------------------
 # 目次取得設定
@@ -38,6 +39,10 @@ postscript_pattern: null
 
 illust_current_url: null
 illust_grep_pattern: <a href="(?<src>.+?)" alt="挿絵" name='img'>【挿絵表示】</a>
+
+# 目次ページから直接拾える基本情報
+title: <[^>]+itemprop="name">(?<title>.+?)</span>
+author: 作者：<span itemprop="author">(?:<a [^>]+>)?(?<author>.+?)(?:</a>)?</span>
 
 # ------------------------------------------------------------
 # 小説情報からパースするための設定
