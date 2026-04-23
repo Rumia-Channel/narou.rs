@@ -60,6 +60,11 @@ pub fn configure_hidden_console_command(command: &mut Command) {
     }
 }
 
+pub fn configure_web_subprocess_command(command: &mut Command) {
+    command.env("NAROU_RS_WEB_MODE", "1");
+    configure_hidden_console_command(command);
+}
+
 pub fn sanitize_java_command(command: &mut Command) -> &mut Command {
     command
         .env_remove("JAVA_TOOL_OPTIONS")
@@ -705,12 +710,15 @@ fn sanitize_backup_name(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use crate::db::inventory::Inventory;
     use crate::progress::WS_LINE_PREFIX;
     use chrono::{TimeZone, Utc};
 
     use super::{
-        NovelLockGuard, get_copy_to_directory, load_frozen_ids_from_inventory,
+        NovelLockGuard, configure_web_subprocess_command, get_copy_to_directory,
+        load_frozen_ids_from_inventory,
         load_locked_ids_from_inventory, record_is_frozen, reroute_web_line_to_console,
         sanitize_backup_name,
     };
@@ -764,6 +772,24 @@ mod tests {
     #[test]
     fn sanitize_backup_name_falls_back_when_empty() {
         assert_eq!(sanitize_backup_name(""), "");
+    }
+
+    #[test]
+    fn configure_web_subprocess_command_sets_web_mode_env() {
+        let mut command = Command::new("cmd");
+        configure_web_subprocess_command(&mut command);
+
+        let envs: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+
+        assert_eq!(envs.get("NAROU_RS_WEB_MODE"), Some(&Some("1".to_string())));
     }
 
     #[test]

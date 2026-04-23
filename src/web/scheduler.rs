@@ -10,7 +10,7 @@ use serde_yaml::Value;
 use tokio::task::JoinHandle;
 
 use crate::compat::{
-    configure_hidden_console_command, load_local_setting_bool, load_local_setting_string,
+    configure_web_subprocess_command, load_local_setting_bool, load_local_setting_string,
 };
 use crate::db;
 use crate::db::inventory::{Inventory, InventoryScope};
@@ -405,10 +405,9 @@ fn run_update_phase(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("NAROU_RS_WEB_MODE", "1")
         .arg("update")
         .args(args);
-    configure_hidden_console_command(&mut command);
+    configure_web_subprocess_command(&mut command);
 
     let mut child = match command.spawn() {
         Ok(child) => child,

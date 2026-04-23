@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 use super::push::PushServer;
-use crate::compat::{configure_hidden_console_command, load_local_setting_string};
+use crate::compat::{configure_web_subprocess_command, load_local_setting_string};
 use crate::db::with_database_mut;
 use crate::progress::WS_LINE_PREFIX;
 use crate::queue::{JobType, PersistentQueue, QueueJob, QueueLane};
@@ -165,9 +165,8 @@ fn execute_job(
         .current_dir(root_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("NAROU_RS_WEB_MODE", "1");
-    configure_hidden_console_command(&mut command);
+        .stderr(Stdio::piped());
+    configure_web_subprocess_command(&mut command);
 
     if let Some(spec) = queue.execution_spec(&job.id) {
         match spec.cmd.as_str() {
@@ -371,13 +370,12 @@ fn execute_diff_job(
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("NAROU_RS_WEB_MODE", "1")
             .arg("diff")
             .arg("--no-tool")
             .arg(id)
             .arg("--number")
             .arg(number);
-        configure_hidden_console_command(&mut command);
+        configure_web_subprocess_command(&mut command);
         if !spawn_and_stream_command(command, push_server, running_pids, job_id, target_console) {
             success = false;
         }
