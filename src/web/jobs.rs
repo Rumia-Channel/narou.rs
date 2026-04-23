@@ -13,7 +13,7 @@ use crate::db::with_database;
 use crate::downloader::site_setting::SiteSetting;
 use crate::downloader::types::{CACHE_SAVE_DIR, SECTION_SAVE_DIR, SectionFile};
 use crate::downloader::{Downloader, TargetType};
-use crate::queue::{JobType, PersistentQueue, QueueJob, QueueLane};
+use crate::queue::{JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane};
 
 use super::AppState;
 use super::sort_state::{current_sort_from_server_setting, sort_column_label};
@@ -108,6 +108,87 @@ fn log_immediate_command_failure(context: &str, output: &std::process::Output) {
             stderr.trim()
         );
     }
+}
+
+fn queue_target_fallback_text(target: &str) -> String {
+    target
+        .split('\t')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+fn describe_update_targets(targets: &[String]) -> String {
+    match targets {
+        [] => "全ての小説".to_string(),
+        [target] => {
+            if let Some(tag) = target.strip_prefix("tag:") {
+                format!("タグ「{}」の小説", tag)
+            } else if target.chars().all(|ch| ch.is_ascii_digit()) {
+                format!("ID {} の小説", target)
+            } else {
+                target.to_string()
+            }
+        }
+        _ => format!("{}件の小説", targets.len()),
+    }
+}
+
+fn format_update_queue_target(args: &[String]) -> String {
+    if let Some(message) = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix(WEBUI_UPDATE_START_PREFIX))
+    {
+        return message.to_string();
+    }
+
+    if args.first().map(String::as_str) == Some("--gl") {
+        return format_general_lastup_queue_target(&args[1..]);
+    }
+
+    let mut force = false;
+    let mut targets = Vec::new();
+    for arg in args {
+        if arg == "--force" {
+            force = true;
+            continue;
+        }
+        if arg.starts_with(WEBUI_UPDATE_START_PREFIX) {
+            continue;
+        }
+        targets.push(arg.clone());
+    }
+
+    let target_text = describe_update_targets(&targets);
+    if force {
+        format!("{}を凍結済みも含めて更新", target_text)
+    } else {
+        format!("{}を更新", target_text)
+    }
+}
+
+fn format_general_lastup_queue_target(args: &[String]) -> String {
+    match args.first().map(String::as_str) {
+        Some("narou") => "なろうAPIで最新話掲載日を確認".to_string(),
+        Some("other") => "その他サイトの最新話掲載日を確認".to_string(),
+        _ => "最新話掲載日を確認".to_string(),
+    }
+}
+
+fn format_queue_job_target(job: &QueueJob, spec: Option<&QueueExecutionSpec>) -> String {
+    let Some(spec) = spec else {
+        return queue_target_fallback_text(&job.target);
+    };
+
+    match spec.cmd.as_str() {
+        "update_general_lastup" => format_general_lastup_queue_target(&spec.args),
+        "update" | "update_by_tag" => format_update_queue_target(&spec.args),
+        _ => queue_target_fallback_text(&job.target),
+    }
+}
+
+fn queue_display_target(queue: &PersistentQueue, job: &QueueJob) -> String {
+    format_queue_job_target(job, queue.execution_spec(&job.id).as_ref())
 }
 
 fn queue_download_jobs(
@@ -710,7 +791,7 @@ pub async fn queue_status(State(state): State<AppState>) -> Json<serde_json::Val
     let running_count = running_jobs.len();
     let running_label = match running_jobs.as_slice() {
         [] => serde_json::Value::Null,
-        [job] => serde_json::Value::String(job.target.clone()),
+        [job] => serde_json::Value::String(queue_display_target(state.queue.as_ref(), job)),
         jobs => serde_json::Value::String(format!("{} 件実行中", jobs.len())),
     };
     Json(serde_json::json!({
@@ -1534,6 +1615,7 @@ pub async fn get_pending_tasks(State(state): State<AppState>) -> Json<serde_json
                 "id": j.id,
                 "type": j.job_type,
                 "target": j.target,
+                "display_target": queue_display_target(state.queue.as_ref(), j),
                 "created_at": j.created_at,
             })
         })
@@ -1548,6 +1630,7 @@ pub async fn get_pending_tasks(State(state): State<AppState>) -> Json<serde_json
                 "id": job.id,
                 "type": job.job_type,
                 "target": job.target,
+                "display_target": queue_display_target(state.queue.as_ref(), job),
                 "created_at": job.created_at,
             })
         })
@@ -2015,10 +2098,10 @@ mod tests {
     use crate::queue::{JobType, PersistentQueue, QueueJob};
 
     use super::{
-        encode_convert_job_target, existing_update_job_id, normalize_update_targets,
-        push_update_job_if_needed, reboot_args_with_no_browser, restorable_tasks_available,
-        tag_color_class, validate_diff_number, validate_download_targets,
-        validate_general_lastup_option,
+        encode_convert_job_target, existing_update_job_id, format_general_lastup_queue_target,
+        format_update_queue_target, normalize_update_targets, push_update_job_if_needed,
+        reboot_args_with_no_browser, restorable_tasks_available, tag_color_class,
+        validate_diff_number, validate_download_targets, validate_general_lastup_option,
     };
 
     #[test]
@@ -2097,6 +2180,45 @@ mod tests {
             Some("other")
         );
         assert!(validate_general_lastup_option("--force").is_err());
+    }
+
+    #[test]
+    fn general_lastup_queue_target_uses_human_readable_labels() {
+        assert_eq!(
+            format_general_lastup_queue_target(&["narou".to_string()]),
+            "なろうAPIで最新話掲載日を確認"
+        );
+        assert_eq!(
+            format_general_lastup_queue_target(&["other".to_string()]),
+            "その他サイトの最新話掲載日を確認"
+        );
+        assert_eq!(format_general_lastup_queue_target(&[]), "最新話掲載日を確認");
+    }
+
+    #[test]
+    fn update_queue_target_prefers_webui_start_message() {
+        assert_eq!(
+            format_update_queue_target(&[
+                "__webui_update_start__=全ての小説の更新を開始します（3件をID順で処理）"
+                    .to_string(),
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+            ]),
+            "全ての小説の更新を開始します（3件をID順で処理）"
+        );
+    }
+
+    #[test]
+    fn update_queue_target_describes_tag_and_force_jobs() {
+        assert_eq!(
+            format_update_queue_target(&["tag:modified".to_string()]),
+            "タグ「modified」の小説を更新"
+        );
+        assert_eq!(
+            format_update_queue_target(&["--force".to_string(), "tag:modified".to_string()]),
+            "タグ「modified」の小説を凍結済みも含めて更新"
+        );
     }
 
     #[test]

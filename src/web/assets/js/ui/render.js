@@ -895,7 +895,7 @@ function renderTaskItem(task, isRunning, idx, total) {
   return `<div class="queue-task-item${isRunning ? ' queue-running' : ''}" data-task-id="${esc(task.id)}"${isRunning ? '' : ' draggable="true"'}>
     <span class="queue-task-icon">${icon}</span>
     <span class="queue-task-label">${esc(label)}</span>
-    <span class="queue-task-target">${esc(task.target)}</span>
+    <span class="queue-task-target">${esc(task.display_target || task.target || '')}</span>
     <span class="queue-task-time">${time}</span>
     <span class="queue-task-actions">${actionBtns}</span>
   </div>`;
