@@ -38,7 +38,7 @@ use self::persistence::{
 };
 use self::section::{SectionCache, download_section};
 use self::site_setting::SiteSetting;
-use self::toc::{create_short_story_subtitles, fetch_toc, parse_subtitles_multipage};
+use self::toc::{create_short_story_subtitles, fetch_toc, parse_subtitles, parse_subtitles_multipage};
 use self::security::is_safe_public_url;
 use self::util::{
     compile_html_pattern, load_length_limit, mask_spoiler_text, sanitize_filename_with_limit,
@@ -209,6 +209,64 @@ fn over18_access_decision(
         Some(false) => Over18AccessDecision::Deny,
         None => Over18AccessDecision::Prompt,
     }
+}
+
+fn toc_title_for_type_inference(setting: &SiteSetting, toc_source: &str, info: &NovelInfo) -> String {
+    info.title
+        .clone()
+        .or_else(|| setting.resolve_info_pattern("t", toc_source))
+        .unwrap_or_default()
+}
+
+fn toc_subtitles_imply_series(
+    setting: &SiteSetting,
+    toc_source: &str,
+    url_captures: &HashMap<String, String>,
+    title: &str,
+) -> bool {
+    let Ok(subtitles) = parse_subtitles(setting, toc_source, url_captures) else {
+        return false;
+    };
+    if subtitles.len() > 1 {
+        return true;
+    }
+    subtitles.into_iter().any(|subtitle| {
+        !subtitle.href.is_empty()
+            || !subtitle.chapter.is_empty()
+            || !subtitle.subchapter.is_empty()
+            || subtitle.subtitle != title
+    })
+}
+
+fn resolve_novel_type(
+    setting: &SiteSetting,
+    toc_source: &str,
+    url_captures: &HashMap<String, String>,
+    info: &NovelInfo,
+) -> (u8, bool) {
+    let title = toc_title_for_type_inference(setting, toc_source, info);
+    let toc_implies_series = toc_subtitles_imply_series(setting, toc_source, url_captures, &title);
+
+    if let Some(nt) = info.novel_type {
+        if nt == 2 && toc_implies_series {
+            return (1u8, false);
+        }
+        return (nt, info.end.unwrap_or(false));
+    }
+
+    if let Some(text) = setting.resolve_info_pattern("nt", toc_source) {
+        let resolved = setting.get_novel_type_from_string(&text);
+        if resolved.0 == 2 && toc_implies_series {
+            return (1u8, false);
+        }
+        return resolved;
+    }
+
+    if toc_implies_series {
+        return (1u8, false);
+    }
+
+    (1u8, false)
 }
 
 fn section_filename(subtitle: &SubtitleInfo) -> String {
@@ -709,20 +767,9 @@ impl Downloader {
         let toc_source = fetch_toc(&mut self.fetcher, &setting, &toc_url)?;
         let info = self.load_novel_info(&setting, &toc_source, &url_captures)?;
 
-        let is_end = if info.novel_type.is_some() {
-            info.end
-        } else {
-            setting
-                .resolve_info_pattern("nt", &toc_source)
-                .map(|text| setting.get_novel_type_from_string(&text).1)
-        };
-
-        let novel_type = info.novel_type.unwrap_or_else(|| {
-            setting
-                .resolve_info_pattern("nt", &toc_source)
-                .map(|text| setting.get_novel_type_from_string(&text).0)
-                .unwrap_or(1u8)
-        });
+        let (novel_type, inferred_is_end) =
+            resolve_novel_type(&setting, &toc_source, &url_captures, &info);
+        let is_end = Some(inferred_is_end);
 
         // Ruby: get_general_lastup / get_novelupdated_at fall back to subtitle dates
         // when novel_info_url is unavailable (e.g. Arcadia)
@@ -1007,16 +1054,7 @@ impl Downloader {
                 .flatten()
         });
 
-        let (novel_type, is_end) = match info.novel_type {
-            Some(nt) => (nt, info.end.unwrap_or(false)),
-            None => {
-                let nt_text = setting.resolve_info_pattern("nt", &toc_source);
-                match nt_text {
-                    Some(text) => setting.get_novel_type_from_string(&text),
-                    None => (1u8, false),
-                }
-            }
-        };
+        let (novel_type, is_end) = resolve_novel_type(&setting, &toc_source, &url_captures, &info);
 
         let subtitles = if novel_type == 2 {
             create_short_story_subtitles(&setting, &toc_source, &info)?
@@ -1875,10 +1913,11 @@ impl Downloader {
 mod tests {
     use super::{
         Downloader, Over18AccessDecision, over18_access_decision,
-        requires_over18_confirmation, resolve_user_agent,
+        requires_over18_confirmation, resolve_novel_type, resolve_user_agent,
     };
     use super::novel_info::NovelInfo;
     use super::site_setting::SiteSetting;
+    use std::collections::HashMap;
     use chrono::TimeZone;
 
     #[test]
@@ -2319,6 +2358,70 @@ mod tests {
             Some("一次創作キャットファイトとかレズバトルもの")
         );
         assert_eq!(info.author.as_deref(), Some("就活をするゴミ箱の魂"));
+    }
+
+    #[test]
+    fn syosetu_org_multi_episode_toc_overrides_short_story_type() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "ハーメルン").unwrap();
+        let toc_source = r##"
+<div class="ss">
+<span style="font-size:150%" itemprop="name">一次創作キャットファイトとかレズバトルもの</span>
+<table width=100%>
+<tr bgcolor="#FFFFFF" class="bgcolor3"><td width=60%><span id="1">　</span> <a href=./1.html style="text-decoration:none;">ソープランドがレズバトルで抗争するようです</a></td><td><NOBR>2020年05月31日(日) 20:38</NOBR></td></tr>
+<tr bgcolor="#F5F5F5" class="bgcolor2"><td width=60%><span id="2">　</span> <a href=./2.html style="text-decoration:none;">北の王女と西の王女</a></td><td><NOBR>2021年02月21日(日) 09:31</NOBR></td></tr>
+</table>
+</div>
+"##;
+        let info = NovelInfo {
+            title: Some("一次創作キャットファイトとかレズバトルもの".to_string()),
+            author: None,
+            story: None,
+            novel_type: Some(2),
+            end: Some(false),
+            general_firstup: None,
+            general_lastup: None,
+            novelupdated_at: None,
+            length: None,
+            tags: None,
+            sitename: None,
+            raw_captures: HashMap::new(),
+        };
+
+        let (novel_type, is_end) = resolve_novel_type(setting, toc_source, &HashMap::new(), &info);
+
+        assert_eq!(novel_type, 1);
+        assert!(!is_end);
+    }
+
+    #[test]
+    fn short_story_type_is_preserved_when_toc_has_no_episode_list() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "ハーメルン").unwrap();
+        let toc_source = r#"
+<div class="ss">
+<span style="font-size:150%" itemprop="name">短編タイトル</span>
+</div>
+"#;
+        let info = NovelInfo {
+            title: Some("短編タイトル".to_string()),
+            author: None,
+            story: None,
+            novel_type: Some(2),
+            end: Some(false),
+            general_firstup: None,
+            general_lastup: None,
+            novelupdated_at: None,
+            length: None,
+            tags: None,
+            sitename: None,
+            raw_captures: HashMap::new(),
+        };
+
+        let (novel_type, is_end) = resolve_novel_type(setting, toc_source, &HashMap::new(), &info);
+
+        assert_eq!(novel_type, 2);
+        assert!(!is_end);
     }
 
     #[test]
