@@ -457,6 +457,18 @@ fn should_replace_last_update(status: types::UpdateStatus) -> bool {
     matches!(status, types::UpdateStatus::Ok)
 }
 
+fn merge_update_timestamps(
+    updated: &mut NovelRecord,
+    record: &NovelRecord,
+    status: types::UpdateStatus,
+) {
+    if should_replace_last_update(status) {
+        updated.last_update = record.last_update;
+        updated.novelupdated_at = record.novelupdated_at.or(updated.novelupdated_at);
+        updated.general_lastup = record.general_lastup.or(updated.general_lastup);
+    }
+}
+
 fn sanitize_site_tags(raw: &str) -> Vec<String> {
     let cleaned = crate::downloader::html::sanitize_text(raw)
         .replace("キーワードが設定されていません", "")
@@ -1374,16 +1386,12 @@ impl Downloader {
                     updated.toc_url = record.toc_url.clone();
                     updated.sitename = record.sitename.clone();
                     updated.end = record.end;
-                    if should_replace_last_update(status) {
-                        updated.last_update = record.last_update;
-                    }
+                    merge_update_timestamps(&mut updated, &record, status);
                     if updated_count > 0 {
                         updated.new_arrivals_date = record.new_arrivals_date;
                     }
                     updated.use_subdirectory = record.use_subdirectory;
                     updated.general_firstup = record.general_firstup.or(updated.general_firstup);
-                    updated.novelupdated_at = record.novelupdated_at.or(updated.novelupdated_at);
-                    updated.general_lastup = record.general_lastup.or(updated.general_lastup);
                     updated.general_all_no = record.general_all_no;
                     updated.length = record.length.or(updated.length);
                     updated.domain = record.domain.clone();
@@ -1813,6 +1821,7 @@ mod tests {
     use super::{Downloader, resolve_user_agent};
     use super::novel_info::NovelInfo;
     use super::site_setting::SiteSetting;
+    use chrono::TimeZone;
 
     #[test]
     fn sanitize_filename_removes_windows_trailing_dots_and_spaces() {
@@ -1927,9 +1936,67 @@ mod tests {
     }
 
     #[test]
-    fn no_update_preserves_last_update_timestamp() {
+    fn no_update_preserves_update_timestamps() {
         assert!(!super::should_replace_last_update(super::types::UpdateStatus::None));
         assert!(super::should_replace_last_update(super::types::UpdateStatus::Ok));
+    }
+
+    fn sample_record(timestamp: chrono::DateTime<chrono::Utc>) -> crate::db::novel_record::NovelRecord {
+        crate::db::novel_record::NovelRecord {
+            id: 1,
+            author: "author".to_string(),
+            title: "title".to_string(),
+            file_title: "file-title".to_string(),
+            toc_url: "https://example.com".to_string(),
+            sitename: "site".to_string(),
+            novel_type: 1,
+            end: false,
+            last_update: timestamp,
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: Some(timestamp),
+            general_lastup: Some(timestamp),
+            last_mail_date: None,
+            tags: Vec::new(),
+            ncode: None,
+            domain: Some("example.com".to_string()),
+            general_all_no: Some(1),
+            length: Some(100),
+            suspend: false,
+            is_narou: false,
+            last_check_date: None,
+            convert_failure: false,
+            extra_fields: Default::default(),
+        }
+    }
+
+    #[test]
+    fn none_status_keeps_last_update_and_general_lastup_in_sync() {
+        let original = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap();
+        let fetched = original + chrono::Duration::hours(2);
+        let mut updated = sample_record(original);
+        let record = sample_record(fetched);
+
+        super::merge_update_timestamps(&mut updated, &record, super::types::UpdateStatus::None);
+
+        assert_eq!(updated.last_update, original);
+        assert_eq!(updated.novelupdated_at, Some(original));
+        assert_eq!(updated.general_lastup, Some(original));
+    }
+
+    #[test]
+    fn ok_status_refreshes_last_update_and_general_lastup_together() {
+        let original = chrono::Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap();
+        let fetched = original + chrono::Duration::hours(2);
+        let mut updated = sample_record(original);
+        let record = sample_record(fetched);
+
+        super::merge_update_timestamps(&mut updated, &record, super::types::UpdateStatus::Ok);
+
+        assert_eq!(updated.last_update, fetched);
+        assert_eq!(updated.novelupdated_at, Some(fetched));
+        assert_eq!(updated.general_lastup, Some(fetched));
     }
 
     #[test]

@@ -28,7 +28,7 @@ fn is_new_arrivals_marker(
 ) -> bool {
     new_arrivals_date.is_some_and(|nad| {
         let limit = chrono::Duration::seconds(ANNOTATION_COLOR_TIME_LIMIT_SECS);
-        nad >= last_update && (nad + limit) > now
+        nad >= last_update && (nad + limit) >= now
     })
 }
 
@@ -381,6 +381,9 @@ mod tests {
         let last_update = Utc.with_ymd_and_hms(2026, 4, 17, 0, 0, 0).unwrap();
         let now = last_update + Duration::hours(5);
         assert!(is_new_arrivals_marker(Some(last_update), last_update, now));
+
+        let boundary = last_update + Duration::hours(6);
+        assert!(is_new_arrivals_marker(Some(last_update), last_update, boundary));
 
         let expired = last_update + Duration::hours(7);
         assert!(!is_new_arrivals_marker(Some(last_update), last_update, expired));
