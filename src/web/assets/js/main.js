@@ -226,7 +226,7 @@ function handleWsMessage(msg) {
       appendConsole('[エラー] ' + (msg.data || msg.message || ''));
       break;
     case 'progressbar.init':
-      initProgressBar(msg.data?.topic, msg.target_console);
+      initProgressBar(msg.data?.topic, msg.target_console, msg.data?.scope);
       break;
     case 'progressbar.step':
       setProgressBar(
@@ -234,11 +234,12 @@ function handleWsMessage(msg) {
         msg.data?.current,
         msg.data?.total,
         msg.data?.topic,
-        msg.target_console
+        msg.target_console,
+        msg.data?.scope
       );
       break;
     case 'progressbar.clear':
-      removeProgressBar(msg.data?.topic, msg.target_console);
+      removeProgressBar(msg.data?.topic, msg.target_console, msg.data?.scope);
       break;
     default:
       console.debug('Unknown WS event:', msg);
@@ -330,9 +331,13 @@ function updateProgressHostVisibility(targetConsole) {
   syncPinnedConsole(consoleEl);
 }
 
-function initProgressBar(topic, targetConsole) {
-  var key = (targetConsole || 'stdout') + ':' + (topic || 'default');
-  removeProgressBar(topic, targetConsole);
+function progressBarKey(topic, targetConsole, scope) {
+  return (targetConsole || 'stdout') + ':' + (scope || topic || 'default');
+}
+
+function initProgressBar(topic, targetConsole, scope) {
+  var key = progressBarKey(topic, targetConsole, scope);
+  removeProgressBar(topic, targetConsole, scope);
   var host = getProgressHost(targetConsole);
   if (!host) return;
   var wrapper = document.createElement('div');
@@ -354,15 +359,15 @@ function initProgressBar(topic, targetConsole) {
   updateProgressHostVisibility(targetConsole);
 }
 
-function setProgressBar(percent, current, total, topic, targetConsole) {
-  var key = (targetConsole || 'stdout') + ':' + (topic || 'default');
-  if (!progressBars[key]) initProgressBar(topic, targetConsole);
+function setProgressBar(percent, current, total, topic, targetConsole, scope) {
+  var key = progressBarKey(topic, targetConsole, scope);
+  if (!progressBars[key]) initProgressBar(topic, targetConsole, scope);
   progressBars[key].bar.style.width = (percent || 0) + '%';
   progressBars[key].label.textContent = formatProgressLabel(current, total, percent);
 }
 
-function removeProgressBar(topic, targetConsole) {
-  var key = (targetConsole || 'stdout') + ':' + (topic || 'default');
+function removeProgressBar(topic, targetConsole, scope) {
+  var key = progressBarKey(topic, targetConsole, scope);
   if (!progressBars[key]) return;
   var wrapper = progressBars[key].wrapper;
   if (wrapper) wrapper.remove();

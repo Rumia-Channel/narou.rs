@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use super::push::PushServer;
 use crate::compat::{configure_web_subprocess_command, load_local_setting_string};
 use crate::db::with_database_mut;
-use crate::progress::WS_LINE_PREFIX;
+use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
 use crate::queue::{JobType, PersistentQueue, QueueJob, QueueLane};
 
 const WEBUI_UPDATE_START_PREFIX: &str = "__webui_update_start__=";
@@ -98,6 +98,7 @@ fn start_queue_worker_for_lane(
                 let _ = queue.fail(&job.id);
                 push_server.broadcast_event("queue_failed", &job.id);
             }
+            clear_progress_for_job(&push_server, &job.id);
             if should_reload_table_after_job(queue.as_ref(), &running_jobs) {
                 push_server.broadcast_event("table.reload", "");
                 push_server.broadcast_event("tag.updateCanvas", "");
@@ -138,6 +139,16 @@ fn should_reload_table_after_job(
     }
 }
 
+fn clear_progress_for_job(push_server: &Arc<PushServer>, job_id: &str) {
+    for target_console in ["stdout", "stdout2"] {
+        push_server.broadcast_raw(&serde_json::json!({
+            "type": "progressbar.clear",
+            "data": { "scope": job_id },
+            "target_console": target_console,
+        }));
+    }
+}
+
 fn execute_job(
     root_dir: &Path,
     queue: &PersistentQueue,
@@ -167,6 +178,7 @@ fn execute_job(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_web_subprocess_command(&mut command);
+    command.env(WEB_PROGRESS_SCOPE_ENV, &job.id);
 
     if let Some(spec) = queue.execution_spec(&job.id) {
         match spec.cmd.as_str() {
@@ -376,6 +388,7 @@ fn execute_diff_job(
             .arg("--number")
             .arg(number);
         configure_web_subprocess_command(&mut command);
+        command.env(WEB_PROGRESS_SCOPE_ENV, job_id);
         if !spawn_and_stream_command(command, push_server, running_pids, job_id, target_console) {
             success = false;
         }
@@ -479,7 +492,10 @@ fn parse_convert_job_target(value: &str) -> (&str, Option<&str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{console_target_for_job, parse_convert_job_target, route_structured_web_message};
+    use super::{
+        clear_progress_for_job, console_target_for_job, parse_convert_job_target,
+        route_structured_web_message,
+    };
     use crate::queue::JobType;
 
     #[test]
@@ -507,5 +523,24 @@ mod tests {
         });
         let routed = route_structured_web_message(message, "stdout2");
         assert_eq!(routed["target_console"], "stdout2");
+    }
+
+    #[test]
+    fn clear_progress_for_job_targets_both_consoles_with_scope() {
+        let push_server = std::sync::Arc::new(crate::web::push::PushServer::new());
+        let mut receiver = push_server.channel().subscribe();
+
+        clear_progress_for_job(&push_server, "job-123");
+
+        let first: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+        let targets = [first["target_console"].as_str().unwrap(), second["target_console"].as_str().unwrap()];
+
+        assert_eq!(first["type"], "progressbar.clear");
+        assert_eq!(second["type"], "progressbar.clear");
+        assert!(targets.contains(&"stdout"));
+        assert!(targets.contains(&"stdout2"));
+        assert_eq!(first["data"]["scope"], "job-123");
+        assert_eq!(second["data"]["scope"], "job-123");
     }
 }

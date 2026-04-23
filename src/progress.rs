@@ -7,6 +7,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 /// Lines starting with this prefix are intercepted by the web worker
 /// and sent as WebSocket events instead of being echoed to the console.
 pub const WS_LINE_PREFIX: &str = "__NAROU_WS__:";
+pub const WEB_PROGRESS_SCOPE_ENV: &str = "NAROU_RS_WEB_PROGRESS_SCOPE";
 
 /// Check if running under the web server (subprocess mode)
 pub fn is_web_mode() -> bool {
@@ -142,6 +143,7 @@ impl Drop for CliProgress {
 /// that the web worker intercepts and converts to WebSocket events.
 pub struct WebProgress {
     topic: String,
+    scope: String,
     length: AtomicU64,
     position: AtomicU64,
 }
@@ -150,10 +152,14 @@ impl WebProgress {
     pub fn new(topic: &str) -> Self {
         let wp = Self {
             topic: topic.to_string(),
+            scope: current_web_progress_scope(topic),
             length: AtomicU64::new(0),
             position: AtomicU64::new(0),
         };
-        wp.send("progressbar.init", serde_json::json!({ "topic": topic }));
+        wp.send(
+            "progressbar.init",
+            serde_json::json!({ "topic": topic, "scope": wp.scope }),
+        );
         wp
     }
 
@@ -173,7 +179,8 @@ impl WebProgress {
                     "current": pos,
                     "total": len,
                     "percent": percent,
-                    "topic": self.topic
+                    "topic": self.topic,
+                    "scope": self.scope
                 }),
             );
         }
@@ -202,7 +209,7 @@ impl ProgressReporter for WebProgress {
     fn finish_with_message(&self, _msg: &str) {
         self.send(
             "progressbar.clear",
-            serde_json::json!({ "topic": self.topic }),
+            serde_json::json!({ "topic": self.topic, "scope": self.scope }),
         );
     }
 
@@ -215,7 +222,33 @@ impl Drop for WebProgress {
     fn drop(&mut self) {
         self.send(
             "progressbar.clear",
-            serde_json::json!({ "topic": self.topic }),
+            serde_json::json!({ "topic": self.topic, "scope": self.scope }),
         );
+    }
+}
+
+fn current_web_progress_scope(topic: &str) -> String {
+    std::env::var(WEB_PROGRESS_SCOPE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| topic.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WEB_PROGRESS_SCOPE_ENV, current_web_progress_scope};
+
+    #[test]
+    fn web_progress_scope_uses_env_override_when_present() {
+        unsafe { std::env::set_var(WEB_PROGRESS_SCOPE_ENV, "job-123"); }
+        assert_eq!(current_web_progress_scope("convert"), "job-123");
+        unsafe { std::env::remove_var(WEB_PROGRESS_SCOPE_ENV); }
+    }
+
+    #[test]
+    fn web_progress_scope_falls_back_to_topic() {
+        unsafe { std::env::remove_var(WEB_PROGRESS_SCOPE_ENV); }
+        assert_eq!(current_web_progress_scope("convert"), "convert");
     }
 }

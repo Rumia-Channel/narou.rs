@@ -15,7 +15,7 @@ use crate::compat::{
 use crate::db;
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::downloader::site_setting::SiteSetting;
-use crate::progress::WS_LINE_PREFIX;
+use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
 use crate::queue::{JobType, PersistentQueue, QueueJob};
 use crate::termcolor::colored;
 
@@ -408,6 +408,7 @@ fn run_update_phase(
         .arg("update")
         .args(args);
     configure_web_subprocess_command(&mut command);
+    command.env(WEB_PROGRESS_SCOPE_ENV, job_id);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
