@@ -1,3 +1,4 @@
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::downloader::TocObject;
@@ -46,7 +47,7 @@ pub(crate) fn render_novel_text(
 
     if !story.is_empty() {
         output.push_str("あらすじ：\n");
-        output.push_str(story);
+        output.push_str(&normalize_story_markup(story));
         if !story.ends_with('\n') {
             output.push('\n');
         }
@@ -204,12 +205,27 @@ pub(crate) fn trim_author_comment_text(text: &str) -> String {
 }
 
 fn normalize_subtitle_markup(text: &str) -> String {
-    text.replace("幕間［＃縦中横］１［＃縦中横終わり］", "幕間１")
+    let text = text
+        .replace("幕間［＃縦中横］１［＃縦中横終わり］", "幕間１")
         .replace("幕間［＃縦中横］２［＃縦中横終わり］", "幕間２")
         .replace("幕間［＃縦中横］３［＃縦中横終わり］", "幕間３")
         .replace("（［＃縦中横］１［＃縦中横終わり］）", "（１）")
         .replace("（［＃縦中横］２［＃縦中横終わり］）", "（２）")
-        .replace("（［＃縦中横］３［＃縦中横終わり］）", "（３）")
+        .replace("（［＃縦中横］３［＃縦中横終わり］）", "（３）");
+
+    let episode_re = Regex::new(r"\A([０-９])話").unwrap();
+    let text = episode_re
+        .replace(&text, |caps: &regex::Captures| {
+            format!("［＃縦中横］{}［＃縦中横終わり］話", &caps[1])
+        })
+        .to_string();
+
+    let side_re = Regex::new(r"－([０-９])－").unwrap();
+    side_re
+        .replace_all(&text, |caps: &regex::Captures| {
+            format!("－［＃縦中横］{}［＃縦中横終わり］－", &caps[1])
+        })
+        .to_string()
 }
 
 pub(crate) fn normalize_story_source(story: &str) -> String {
@@ -227,4 +243,61 @@ fn looks_like_html(text: &str) -> bool {
         || text.contains("</P>")
         || text.contains("<ruby")
         || text.contains("<RUBY")
+}
+
+fn normalize_story_markup(text: &str) -> String {
+    let re = Regex::new(r"年([０-９])月([０-９])日").unwrap();
+    re.replace_all(text, |caps: &regex::Captures| {
+        format!(
+            "年{}月{}日",
+            segmented_digit(&caps[1]),
+            segmented_digit(&caps[2])
+        )
+    })
+    .to_string()
+}
+
+fn segmented_digit(text: &str) -> char {
+    match text {
+        "０" => '\u{1FDF0}',
+        "１" => '\u{1FDF1}',
+        "２" => '\u{1FDF2}',
+        "３" => '\u{1FDF3}',
+        "４" => '\u{1FDF4}',
+        "５" => '\u{1FDF5}',
+        "６" => '\u{1FDF6}',
+        "７" => '\u{1FDF7}',
+        "８" => '\u{1FDF8}',
+        "９" => '\u{1FDF9}',
+        _ => text.chars().next().unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_story_markup, normalize_subtitle_markup};
+
+    #[test]
+    fn subtitle_single_digit_episode_keeps_tcy_markup() {
+        assert_eq!(
+            normalize_subtitle_markup("１話　　味噌汁"),
+            "［＃縦中横］１［＃縦中横終わり］話　　味噌汁"
+        );
+    }
+
+    #[test]
+    fn subtitle_side_number_keeps_tcy_markup() {
+        assert_eq!(
+            normalize_subtitle_markup("［＃縦中横］11［＃縦中横終わり］話　　後藤愛依梨　－１－"),
+            "［＃縦中横］11［＃縦中横終わり］話　　後藤愛依梨　－［＃縦中横］１［＃縦中横終わり］－"
+        );
+    }
+
+    #[test]
+    fn story_single_digit_month_day_become_segmented_digits() {
+        assert_eq!(
+            normalize_story_markup("２０１８年２月１日に発売します。"),
+            "２０１８年🷲月🷱日に発売します。"
+        );
+    }
 }
