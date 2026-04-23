@@ -437,6 +437,17 @@ mod tests {
         assert!(is_known_default_arg_name("default_args.convert"));
         assert!(!is_known_default_arg_name("default_args.not_exists"));
     }
+
+    #[test]
+    fn external_bind_auth_override_has_no_webui_tab() {
+        assert_eq!(
+            tab_for_setting("server-basic-auth.require-for-external-bind"),
+            None
+        );
+        assert!(setting_variables()
+            .get("server-basic-auth.require-for-external-bind")
+            .is_some());
+    }
 }
 
 /// Local setting variable metadata
@@ -833,6 +844,13 @@ pub fn setting_variables() -> SettingVariables {
         (
             "server-basic-auth.password",
             invis(VarType::String, "WEBサーバのBasic認証のパスワード"),
+        ),
+        (
+            "server-basic-auth.require-for-external-bind",
+            invis(
+                VarType::Boolean,
+                "外部公開bind時にBasic認証未設定での起動を拒否するかどうか",
+            ),
         ),
         (
             "server-ws-add-accepted-domains",

@@ -61,14 +61,17 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
     };
     push_server.set_accepted_domains(domains);
     let push_server = Arc::new(push_server);
-    let basic_auth_header = match load_basic_auth_header() {
-        Ok(header) => header,
+    let security_settings = match load_web_security_settings() {
+        Ok(settings) => settings,
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     };
-    if requires_basic_auth_for_bind(&address.host) && basic_auth_header.is_none() {
+    if requires_basic_auth_for_bind(&address.host)
+        && security_settings.require_basic_auth_for_external_bind
+        && security_settings.basic_auth_header.is_none()
+    {
         eprintln!(
             "Error: server-bind が外部公開設定のため、server-basic-auth を有効にして user/password を設定して下さい"
         );
@@ -101,7 +104,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         port: address.port,
         ws_port: address.ws_port,
         push_server: push_server.clone(),
-        basic_auth_header,
+        basic_auth_header: security_settings.basic_auth_header,
         control_token: control_token.clone(),
         allowed_request_hosts: narou_rs::web::default_allowed_request_hosts(&address.host),
         queue: queue.clone(),
@@ -492,23 +495,42 @@ fn try_kill_via_pid_file(port: u16) {
     }
 }
 
-fn load_basic_auth_header() -> Result<Option<String>, String> {
+struct WebSecuritySettings {
+    basic_auth_header: Option<String>,
+    require_basic_auth_for_external_bind: bool,
+}
+
+fn load_web_security_settings() -> Result<WebSecuritySettings, String> {
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
     let global_setting: HashMap<String, Value> = inventory
         .load("global_setting", InventoryScope::Global)
         .unwrap_or_default();
+    Ok(WebSecuritySettings {
+        basic_auth_header: basic_auth_header_from_settings(&global_setting),
+        require_basic_auth_for_external_bind:
+            require_basic_auth_for_external_bind_from_settings(&global_setting),
+    })
+}
+
+fn basic_auth_header_from_settings(global_setting: &HashMap<String, Value>) -> Option<String> {
     let enabled = yaml_bool(global_setting.get("server-basic-auth.enable")).unwrap_or(false);
     if !enabled {
-        return Ok(None);
+        return None;
     }
     let user = yaml_string(global_setting.get("server-basic-auth.user")).unwrap_or_default();
     let password =
         yaml_string(global_setting.get("server-basic-auth.password")).unwrap_or_default();
     if user.is_empty() || password.is_empty() {
-        return Ok(None);
+        return None;
     }
     let token = encode_base64(format!("{}:{}", user, password).as_bytes());
-    Ok(Some(format!("Basic {}", token)))
+    Some(format!("Basic {}", token))
+}
+
+fn require_basic_auth_for_external_bind_from_settings(
+    global_setting: &HashMap<String, Value>,
+) -> bool {
+    yaml_bool(global_setting.get("server-basic-auth.require-for-external-bind")).unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -687,9 +709,14 @@ fn encode_base64(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use serde_yaml::Value;
+
     use super::{
-        control_request_host, default_ws_accepted_domains, display_host, encode_base64,
-        generate_control_token, is_wildcard_bind_host, normalize_bind_host,
+        basic_auth_header_from_settings, control_request_host, default_ws_accepted_domains,
+        display_host, encode_base64, generate_control_token, is_wildcard_bind_host,
+        normalize_bind_host, require_basic_auth_for_external_bind_from_settings,
         requires_basic_auth_for_bind,
     };
 
@@ -719,6 +746,41 @@ mod tests {
         assert!(is_wildcard_bind_host("0.0.0.0"));
         assert!(requires_basic_auth_for_bind("0.0.0.0"));
         assert!(!requires_basic_auth_for_bind("127.0.0.1"));
+    }
+
+    #[test]
+    fn external_bind_auth_guard_defaults_to_enabled() {
+        let settings = HashMap::new();
+        assert!(require_basic_auth_for_external_bind_from_settings(&settings));
+    }
+
+    #[test]
+    fn external_bind_auth_guard_can_be_disabled() {
+        let mut settings = HashMap::new();
+        settings.insert(
+            "server-basic-auth.require-for-external-bind".to_string(),
+            Value::Bool(false),
+        );
+        assert!(!require_basic_auth_for_external_bind_from_settings(&settings));
+    }
+
+    #[test]
+    fn basic_auth_header_uses_setting_values() {
+        let mut settings = HashMap::new();
+        settings.insert("server-basic-auth.enable".to_string(), Value::Bool(true));
+        settings.insert(
+            "server-basic-auth.user".to_string(),
+            Value::String("user".to_string()),
+        );
+        settings.insert(
+            "server-basic-auth.password".to_string(),
+            Value::String("pass".to_string()),
+        );
+
+        assert_eq!(
+            basic_auth_header_from_settings(&settings).as_deref(),
+            Some("Basic dXNlcjpwYXNz")
+        );
     }
 
     #[test]
