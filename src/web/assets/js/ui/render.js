@@ -181,7 +181,7 @@ function splitFilterTerms(group) {
 
 function parseFilterToken(rawToken) {
   const token = rawToken.trim();
-  const negate = token.startsWith('-') || token.startsWith('!');
+  const negate = token.startsWith('-') || token.startsWith('^') || token.startsWith('!');
   const body = negate ? token.slice(1) : token;
   const colon = body.indexOf(':');
   const field = colon > 0 ? body.slice(0, colon).toLowerCase() : '';
@@ -226,8 +226,6 @@ function matchFilterToken(novel, token) {
   const target = (text) => String(text || '').toLowerCase();
   const tags = (novel.tags || []).map(tag => target(tag));
   const statusText = target(getStatusText(novel));
-  const novelTypeText = target(getNovelTypeText(novel));
-  const averageLength = getAverageLengthValue(novel);
   let matched = false;
   const values = splitOrValues(token.value);
   const matchAny = (predicate) => values.some(predicate);
@@ -235,12 +233,7 @@ function matchFilterToken(novel, token) {
     target(novel.title),
     target(novel.author),
     target(novel.sitename),
-    novelTypeText,
     statusText,
-    String(novel.id),
-    String(getEpisodeCount(novel)),
-    String(novel.length || ''),
-    String(averageLength || ''),
     ...tags,
   ].join(' ');
 
@@ -264,13 +257,7 @@ function matchFilterToken(novel, token) {
       matched = matchAny(v => String(novel.id) === v);
       break;
     case 'status':
-      matched = matchAny(v => {
-        if (v === 'frozen') return !!novel.frozen;
-        if (v === 'unfrozen' || v === 'active') return !novel.frozen;
-        if (v === 'ongoing') return novel.end === false || novel.end === 0;
-        if (v === 'finished' || v === 'complete') return novel.end === true || novel.end === 1;
-        return false;
-      });
+      matched = matchAny(v => statusText.includes(v));
       break;
     default:
       matched = values.length > 0
@@ -353,7 +340,7 @@ function splitRawFilterTerms(query) {
 
 function parseRawFieldToken(rawTerm) {
   const term = String(rawTerm || '').trim();
-  const negate = term.startsWith('-') || term.startsWith('!');
+  const negate = term.startsWith('-') || term.startsWith('^') || term.startsWith('!');
   const body = negate ? term.slice(1) : term;
   const colon = body.indexOf(':');
   if (colon <= 0) return null;

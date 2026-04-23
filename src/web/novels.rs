@@ -14,6 +14,13 @@ use super::state::{ApiResponse, IdPath, ListParams, NovelListItem, NovelListResp
 
 const ANNOTATION_COLOR_TIME_LIMIT_SECS: i64 = 6 * 60 * 60;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchToken {
+    negated: bool,
+    field: Option<String>,
+    values: Vec<String>,
+}
+
 fn is_new_arrivals_marker(
     new_arrivals_date: Option<DateTime<Utc>>,
     last_update: DateTime<Utc>,
@@ -25,15 +32,161 @@ fn is_new_arrivals_marker(
     })
 }
 
-fn record_matches_search(record: &crate::db::novel_record::NovelRecord, search: &str) -> bool {
-    let search_lower = search.to_lowercase();
-    record.title.to_lowercase().contains(&search_lower)
-        || record.author.to_lowercase().contains(&search_lower)
-        || record.sitename.to_lowercase().contains(&search_lower)
-        || record
-            .tags
+fn split_search_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+
+    for ch in query.chars() {
+        if ch == '"' {
+            quoted = !quoted;
+            current.push(ch);
+            continue;
+        }
+        if ch.is_whitespace() && !quoted {
+            if !current.trim().is_empty() {
+                terms.push(current.trim().to_string());
+            }
+            current.clear();
+            continue;
+        }
+        current.push(ch);
+    }
+
+    if !current.trim().is_empty() {
+        terms.push(current.trim().to_string());
+    }
+
+    terms
+}
+
+fn strip_search_quotes(value: &str) -> &str {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
+fn split_search_values(value: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+
+    for ch in value.chars() {
+        if ch == '"' {
+            quoted = !quoted;
+            current.push(ch);
+            continue;
+        }
+        if ch == '|' && !quoted {
+            let trimmed = strip_search_quotes(current.trim()).trim().to_lowercase();
+            if !trimmed.is_empty() {
+                values.push(trimmed);
+            }
+            current.clear();
+            continue;
+        }
+        current.push(ch);
+    }
+
+    let trimmed = strip_search_quotes(current.trim()).trim().to_lowercase();
+    if !trimmed.is_empty() {
+        values.push(trimmed);
+    }
+
+    values
+}
+
+fn parse_search_token(raw_term: &str) -> SearchToken {
+    let term = raw_term.trim();
+    let negated = matches!(term.chars().next(), Some('-' | '^' | '!'));
+    let body = if negated { &term[1..] } else { term };
+    let (field, value) = if let Some(colon) = body.find(':') {
+        let field = body[..colon].trim();
+        if field.is_empty() {
+            (None, body)
+        } else {
+            (Some(field.to_lowercase()), body[colon + 1..].trim())
+        }
+    } else {
+        (None, body)
+    };
+
+    SearchToken {
+        negated,
+        field,
+        values: split_search_values(value),
+    }
+}
+
+fn collect_search_tokens(filter: Option<&str>, search_value: Option<&str>) -> Vec<SearchToken> {
+    [filter, search_value]
+        .into_iter()
+        .flatten()
+        .flat_map(split_search_terms)
+        .map(|term| parse_search_token(&term))
+        .filter(|token| !token.values.is_empty())
+        .collect()
+}
+
+fn record_status_text(record: &crate::db::novel_record::NovelRecord, frozen: bool) -> String {
+    let mut status = Vec::new();
+    if frozen {
+        status.push("凍結");
+    }
+    if record.tags.iter().any(|tag| tag == "end") || record.end {
+        status.push("完結");
+    }
+    if record.tags.iter().any(|tag| tag == "404") {
+        status.push("削除");
+    }
+    if record.suspend {
+        status.push("中断");
+    }
+    status.join(", ").to_lowercase()
+}
+
+fn record_matches_token(
+    record: &crate::db::novel_record::NovelRecord,
+    token: &SearchToken,
+    frozen: bool,
+) -> bool {
+    let title = record.title.to_lowercase();
+    let author = record.author.to_lowercase();
+    let sitename = record.sitename.to_lowercase();
+    let status = record_status_text(record, frozen);
+    let tags: Vec<String> = record.tags.iter().map(|tag| tag.to_lowercase()).collect();
+
+    let matched = match token.field.as_deref() {
+        Some("tag") => token
+            .values
             .iter()
-            .any(|tag| tag.to_lowercase().contains(&search_lower))
+            .any(|value| tags.iter().any(|tag| tag.contains(value))),
+        Some("author") => token.values.iter().any(|value| author.contains(value)),
+        Some("site") | Some("sitename") => token.values.iter().any(|value| sitename.contains(value)),
+        Some("title") => token.values.iter().any(|value| title.contains(value)),
+        Some("status") => token.values.iter().any(|value| status.contains(value)),
+        _ => token.values.iter().any(|value| {
+            title.contains(value)
+                || author.contains(value)
+                || sitename.contains(value)
+                || status.contains(value)
+                || tags.iter().any(|tag| tag.contains(value))
+        }),
+    };
+
+    if token.negated { !matched } else { matched }
+}
+
+fn record_matches_search(
+    record: &crate::db::novel_record::NovelRecord,
+    tokens: &[SearchToken],
+    frozen: bool,
+) -> bool {
+    tokens
+        .iter()
+        .all(|token| record_matches_token(record, token, frozen))
 }
 
 pub async fn index() -> &'static str {
@@ -77,10 +230,13 @@ fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (Status
                 .min(super::MAX_WEB_PAGE_LENGTH) as usize,
         )
     };
-    let search = params.search_value.unwrap_or_default();
-    if search.len() > super::MAX_WEB_SEARCH_BYTES {
+    let total_query_bytes =
+        params.filter.as_ref().map_or(0, |filter| filter.len())
+            + params.search_value.as_ref().map_or(0, |search| search.len());
+    if total_query_bytes > super::MAX_WEB_SEARCH_BYTES {
         return Err((StatusCode::BAD_REQUEST, "search query is too long".to_string()));
     }
+    let search_tokens = collect_search_tokens(params.filter.as_deref(), params.search_value.as_deref());
     let order_col = params.order_column.unwrap_or(0);
     let order_dir = params.order_dir.unwrap_or_else(|| "asc".to_string());
     let frozen_ids = with_database(|db| load_frozen_ids_from_inventory(db.inventory())).unwrap_or_default();
@@ -88,12 +244,14 @@ fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (Status
     let response = with_database(|db| {
         let all_records: Vec<_> = db.all_records().values().collect();
 
-        let mut filtered: Vec<_> = if search.is_empty() {
+        let mut filtered: Vec<_> = if search_tokens.is_empty() {
             all_records
         } else {
             all_records
                 .into_iter()
-                .filter(|record| record_matches_search(record, &search))
+                .filter(|record| {
+                    record_matches_search(record, &search_tokens, record_is_frozen(record, &frozen_ids))
+                })
                 .collect()
         };
 
@@ -268,8 +426,59 @@ mod tests {
     #[test]
     fn record_matches_search_finds_site_name_for_non_narou_records() {
         let record = sample_record();
-        assert!(super::record_matches_search(&record, "カクヨム"));
-        assert!(!super::record_matches_search(&record, "narou"));
+        let tokens = super::collect_search_tokens(Some("カクヨム"), None);
+        assert!(super::record_matches_search(&record, &tokens, false));
+        let tokens = super::collect_search_tokens(Some("narou"), None);
+        assert!(!super::record_matches_search(&record, &tokens, false));
+    }
+
+    #[test]
+    fn collect_search_tokens_combines_filter_and_search_value_as_and_terms() {
+        let record = sample_record();
+        let tokens = super::collect_search_tokens(Some("title"), Some("author"));
+        assert!(super::record_matches_search(&record, &tokens, false));
+
+        let tokens = super::collect_search_tokens(Some("title"), Some("missing"));
+        assert!(!super::record_matches_search(&record, &tokens, false));
+    }
+
+    #[test]
+    fn record_matches_search_unqualified_terms_use_ruby_field_subset() {
+        let mut record = sample_record();
+        record.length = Some(1234);
+        record.general_all_no = Some(99);
+        let tokens = super::collect_search_tokens(Some("1234"), None);
+        assert!(!super::record_matches_search(&record, &tokens, false));
+
+        let tokens = super::collect_search_tokens(Some("sf"), None);
+        assert!(super::record_matches_search(&record, &tokens, false));
+    }
+
+    #[test]
+    fn record_matches_search_supports_tag_or_and_negation() {
+        let mut record = sample_record();
+        record.tags = vec!["sf".to_string(), "coffee".to_string()];
+
+        let tokens = super::collect_search_tokens(Some("tag:coffee|mystery"), None);
+        assert!(super::record_matches_search(&record, &tokens, false));
+
+        let tokens = super::collect_search_tokens(Some("-tag:coffee"), None);
+        assert!(!super::record_matches_search(&record, &tokens, false));
+
+        let tokens = super::collect_search_tokens(Some("^tag:mystery"), None);
+        assert!(super::record_matches_search(&record, &tokens, false));
+    }
+
+    #[test]
+    fn record_matches_search_includes_status_text() {
+        let mut record = sample_record();
+        record.tags.push("404".to_string());
+
+        let tokens = super::collect_search_tokens(Some("削除"), None);
+        assert!(super::record_matches_search(&record, &tokens, false));
+
+        let tokens = super::collect_search_tokens(Some("凍結"), None);
+        assert!(super::record_matches_search(&record, &tokens, true));
     }
 }
 
