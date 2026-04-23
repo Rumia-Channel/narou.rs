@@ -25,6 +25,17 @@ fn is_new_arrivals_marker(
     })
 }
 
+fn record_matches_search(record: &crate::db::novel_record::NovelRecord, search: &str) -> bool {
+    let search_lower = search.to_lowercase();
+    record.title.to_lowercase().contains(&search_lower)
+        || record.author.to_lowercase().contains(&search_lower)
+        || record.sitename.to_lowercase().contains(&search_lower)
+        || record
+            .tags
+            .iter()
+            .any(|tag| tag.to_lowercase().contains(&search_lower))
+}
+
 pub async fn index() -> &'static str {
     "narou.rs API server"
 }
@@ -50,11 +61,22 @@ pub async fn api_list_post(
 
 fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (StatusCode, String)> {
     let draw = params.draw.unwrap_or(1);
-    let start = params.start.unwrap_or(0);
-    let length = params
-        .length
-        .unwrap_or(50)
-        .min(super::MAX_WEB_PAGE_LENGTH);
+    let return_all = params.all.unwrap_or(false);
+    let start = if return_all {
+        0
+    } else {
+        params.start.unwrap_or(0)
+    };
+    let length = if return_all {
+        None
+    } else {
+        Some(
+            params
+                .length
+                .unwrap_or(50)
+                .min(super::MAX_WEB_PAGE_LENGTH) as usize,
+        )
+    };
     let search = params.search_value.unwrap_or_default();
     if search.len() > super::MAX_WEB_SEARCH_BYTES {
         return Err((StatusCode::BAD_REQUEST, "search query is too long".to_string()));
@@ -69,16 +91,9 @@ fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (Status
         let mut filtered: Vec<_> = if search.is_empty() {
             all_records
         } else {
-            let search_lower = search.to_lowercase();
             all_records
                 .into_iter()
-                .filter(|r| {
-                    r.title.to_lowercase().contains(&search_lower)
-                        || r.author.to_lowercase().contains(&search_lower)
-                        || r.tags
-                            .iter()
-                            .any(|t| t.to_lowercase().contains(&search_lower))
-                })
+                .filter(|record| record_matches_search(record, &search))
                 .collect()
         };
 
@@ -129,7 +144,7 @@ fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (Status
         let data: Vec<NovelListItem> = filtered
             .into_iter()
             .skip(start as usize)
-            .take(length as usize)
+            .take(length.unwrap_or(usize::MAX))
             .map(|r| {
                 let now = chrono::Utc::now();
                 let is_new = is_new_arrivals_marker(r.new_arrivals_date, r.last_update, now);
@@ -172,6 +187,36 @@ mod tests {
     use super::{NovelListItem, is_new_arrivals_marker};
     use chrono::{Duration, TimeZone, Utc};
     use serde_json::json;
+
+    fn sample_record() -> crate::db::novel_record::NovelRecord {
+        crate::db::novel_record::NovelRecord {
+            id: 1,
+            author: "author".to_string(),
+            title: "title".to_string(),
+            file_title: "file title".to_string(),
+            toc_url: "https://example.com".to_string(),
+            sitename: "カクヨム".to_string(),
+            novel_type: 1,
+            end: false,
+            last_update: Utc.with_ymd_and_hms(2026, 4, 17, 0, 0, 0).unwrap(),
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: None,
+            general_lastup: None,
+            last_mail_date: None,
+            tags: vec!["sf".to_string()],
+            ncode: None,
+            domain: None,
+            general_all_no: None,
+            length: None,
+            suspend: false,
+            is_narou: false,
+            last_check_date: None,
+            convert_failure: false,
+            extra_fields: Default::default(),
+        }
+    }
 
     #[test]
     fn new_arrivals_marker_uses_ruby_six_hour_window() {
@@ -218,6 +263,13 @@ mod tests {
         assert_eq!(value["general_lastup"], json!(1_776_470_400));
         assert_eq!(value["last_check_date"], json!(1_776_556_800));
         assert_eq!(value["new_arrivals_date"], json!(1_776_384_000));
+    }
+
+    #[test]
+    fn record_matches_search_finds_site_name_for_non_narou_records() {
+        let record = sample_record();
+        assert!(super::record_matches_search(&record, "カクヨム"));
+        assert!(!super::record_matches_search(&record, "narou"));
     }
 }
 

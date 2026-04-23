@@ -1323,7 +1323,7 @@ function closeMenuStyleModal() {
 
 export async function refreshList() {
   try {
-    const resp = await fetchJson('/api/list');
+    const resp = await fetchJson('/api/list?all=true');
     if (resp && Array.isArray(resp.data)) {
       State.novels = resp.data;
       State.frozenIds = new Set(

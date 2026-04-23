@@ -16,6 +16,7 @@ pub struct ListParams {
     pub draw: Option<u64>,
     pub start: Option<u64>,
     pub length: Option<u64>,
+    pub all: Option<bool>,
     #[serde(rename = "search[value]")]
     pub search_value: Option<String>,
     #[serde(rename = "order[0][column]")]
