@@ -143,6 +143,7 @@ pub async fn batch_remove(
     let count = removed_titles.len();
 
     state.push_server.broadcast_event("table.reload", "");
+    state.push_server.broadcast_event("tag.updateCanvas", "");
     if count > 0 {
         state.push_server.broadcast_echo(
             &super::removal_log_message(&removed_titles, with_file),

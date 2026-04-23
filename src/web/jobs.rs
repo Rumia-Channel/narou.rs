@@ -9,7 +9,7 @@ use axum::{
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
-use crate::db::with_database;
+use crate::db::{with_database, with_database_mut};
 use crate::downloader::site_setting::SiteSetting;
 use crate::downloader::types::{CACHE_SAVE_DIR, SECTION_SAVE_DIR, SectionFile};
 use crate::downloader::{Downloader, TargetType};
@@ -571,7 +571,7 @@ pub async fn api_download(
         })
         .collect();
 
-    state.push_server.broadcast_event("notification.queue", "");
+    notify_queue_changed(&state);
     serde_json::json!({ "success": true, "results": results }).into()
 }
 
@@ -782,7 +782,7 @@ pub async fn api_convert(
         })
         .collect();
 
-    state.push_server.broadcast_event("notification.queue", "");
+    notify_queue_changed(&state);
     serde_json::json!({ "success": true, "results": results }).into()
 }
 
@@ -849,8 +849,27 @@ fn run_immediate(args: &[&str]) -> Result<std::process::Output, String> {
         .args(args)
         .current_dir(std::env::current_dir().unwrap_or_default())
         .stdin(std::process::Stdio::null());
-    crate::compat::configure_hidden_console_command(&mut command);
+    crate::compat::configure_web_subprocess_command(&mut command);
     command.output().map_err(|e| e.to_string())
+}
+
+fn broadcast_captured_web_output(
+    push_server: &std::sync::Arc<super::push::PushServer>,
+    output: &[u8],
+    target_console: &str,
+) {
+    for line in String::from_utf8_lossy(output).lines() {
+        let routed = crate::compat::reroute_web_line_to_console(line, target_console);
+        if let Some(json) = routed.strip_prefix(crate::progress::WS_LINE_PREFIX)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(json)
+        {
+            push_server.broadcast_raw(&value);
+        }
+    }
+}
+
+fn notify_queue_changed(state: &AppState) {
+    state.push_server.broadcast_event("notification.queue", "");
 }
 
 // POST /api/send
@@ -932,10 +951,16 @@ pub async fn api_inspect(
 
     match run_immediate(&args) {
         Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.is_empty() {
-                state.push_server.broadcast_echo(&stdout, "stdout");
-            }
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                super::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                super::non_external_console_target(),
+            );
             Json(ApiResponse {
                 success: output.status.success(),
                 message: if output.status.success() {
@@ -1155,10 +1180,16 @@ pub async fn api_setting_burn(
 
     match run_immediate(&args) {
         Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.is_empty() {
-                state.push_server.broadcast_echo(&stdout, "stdout");
-            }
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                super::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                super::non_external_console_target(),
+            );
             Json(ApiResponse {
                 success: output.status.success(),
                 message: if output.status.success() {
@@ -1350,19 +1381,24 @@ pub async fn api_diff(
         let args = vec!["diff", "--no-tool", id, "--number", &diff_number];
         match run_immediate(&args) {
             Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if !stdout.is_empty() {
-                    state.push_server.broadcast_echo(&stdout, "stdout");
-                }
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stderr.is_empty() {
-                    state.push_server.broadcast_echo(&stderr, "stdout");
-                }
+                broadcast_captured_web_output(
+                    &state.push_server,
+                    &output.stdout,
+                    super::non_external_console_target(),
+                );
+                broadcast_captured_web_output(
+                    &state.push_server,
+                    &output.stderr,
+                    super::non_external_console_target(),
+                );
             }
             Err(e) => {
                 state
                     .push_server
-                    .broadcast_echo(&format!("diff error: {}", e), "stdout");
+                    .broadcast_echo(
+                        &format!("diff error: {}", e),
+                        super::non_external_console_target(),
+                    );
             }
         }
     }
@@ -1397,10 +1433,16 @@ pub async fn api_diff_clean(
     let args = vec!["diff", "--clean", &target];
     match run_immediate(&args) {
         Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.is_empty() {
-                state.push_server.broadcast_echo(&stdout, "stdout");
-            }
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                super::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                super::non_external_console_target(),
+            );
             Json(ApiResponse {
                 success: output.status.success(),
                 message: if output.status.success() {
@@ -1452,31 +1494,53 @@ pub async fn api_csv_import(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    crate::compat::configure_hidden_console_command(&mut command);
+    crate::compat::configure_web_subprocess_command(&mut command);
     let result = command.spawn().and_then(|mut child| {
         use std::io::Write;
         if let Some(ref mut stdin) = child.stdin {
             let _ = stdin.write_all(body.csv.as_bytes());
         }
+        drop(child.stdin.take());
         child.wait_with_output()
     });
 
     match result {
         Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.is_empty() {
-                state.push_server.broadcast_echo(&stdout, "stdout");
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                super::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                super::non_external_console_target(),
+            );
+            if output.status.success() {
+                match with_database_mut(|db| db.refresh()) {
+                    Ok(()) => {
+                        state.push_server.broadcast_event("table.reload", "");
+                        state.push_server.broadcast_event("tag.updateCanvas", "");
+                        Json(ApiResponse {
+                            success: true,
+                            message: "CSVインポート完了".to_string(),
+                        })
+                    }
+                    Err(e) => {
+                        state.push_server.broadcast_error(&format!("DB更新エラー: {}", e));
+                        Json(ApiResponse {
+                            success: false,
+                            message: "CSVインポート後のDB更新に失敗しました".to_string(),
+                        })
+                    }
+                }
+            } else {
+                log_immediate_command_failure("csv import", &output);
+                Json(ApiResponse {
+                    success: false,
+                    message: "CSVインポートに失敗しました".to_string(),
+                })
             }
-            state.push_server.broadcast_event("table.reload", "");
-            Json(ApiResponse {
-                success: output.status.success(),
-                message: if output.status.success() {
-                    "CSVインポート完了".to_string()
-                } else {
-                    log_immediate_command_failure("csv import", &output);
-                    "CSVインポートに失敗しました".to_string()
-                },
-            })
         }
         Err(e) => {
             log_web_failure("csv import", &e);
@@ -1560,7 +1624,7 @@ pub async fn queue_cancel(State(state): State<AppState>) -> Json<ApiResponse> {
 // POST /api/cancel — cancel running task (Ruby parity: does NOT clear queue)
 pub async fn api_cancel(State(state): State<AppState>) -> Json<ApiResponse> {
     kill_running_child(&state);
-    state.push_server.broadcast_event("notification.queue", "");
+    notify_queue_changed(&state);
     Json(ApiResponse {
         success: true,
         message: "キャンセルしました".to_string(),
@@ -1598,6 +1662,7 @@ pub async fn cancel_running_task(
     if running_job_by_id(&state, &body.task_id).is_some()
         && kill_running_child_for_job(&state, &body.task_id)
     {
+        notify_queue_changed(&state);
         return serde_json::json!({ "status": "ok" }).into();
     }
     serde_json::json!({ "error": "実行中の処理を中断できませんでした" }).into()
@@ -1656,6 +1721,7 @@ pub async fn remove_pending_task(
             state
                 .restorable_tasks_available
                 .store(state.queue.has_restorable_tasks(), Ordering::Relaxed);
+            notify_queue_changed(&state);
             Json(ApiResponse {
                 success: true,
                 message: "Task removed".to_string(),
@@ -1678,10 +1744,13 @@ pub async fn reorder_pending_tasks(
     Json(body): Json<ReorderBody>,
 ) -> Json<ApiResponse> {
     match state.queue.reorder_pending(&body.task_ids) {
-        Ok(_) => Json(ApiResponse {
-            success: true,
-            message: "タスクの並び替えが完了しました".to_string(),
-        }),
+        Ok(_) => {
+            notify_queue_changed(&state);
+            Json(ApiResponse {
+                success: true,
+                message: "タスクの並び替えが完了しました".to_string(),
+            })
+        }
         Err(e) => Json(ApiResponse {
             success: false,
             message: e.to_string(),
@@ -1897,6 +1966,7 @@ pub async fn defer_restore_pending_tasks(State(state): State<AppState>) -> Json<
             state
                 .restorable_tasks_available
                 .store(state.queue.has_restorable_tasks(), Ordering::Relaxed);
+            notify_queue_changed(&state);
             serde_json::json!({ "status": "ok" }).into()
         }
         Err(e) => serde_json::json!({ "error": e.to_string() }).into(),
@@ -1917,7 +1987,7 @@ pub async fn confirm_running_tasks(
             Ok(count) => count,
             Err(e) => return serde_json::json!({ "error": e.to_string() }).into(),
         };
-        state.push_server.broadcast_event("notification.queue", "");
+        notify_queue_changed(&state);
         serde_json::json!({ "status": "ok", "count": count }).into()
     } else {
         state.restore_prompt_pending.store(false, Ordering::Relaxed);
@@ -1926,6 +1996,7 @@ pub async fn confirm_running_tasks(
                 state
                     .restorable_tasks_available
                     .store(state.queue.has_restorable_tasks(), Ordering::Relaxed);
+                notify_queue_changed(&state);
                 serde_json::json!({ "status": "ok" }).into()
             }
             Err(e) => serde_json::json!({ "error": e.to_string() }).into(),
@@ -2098,10 +2169,11 @@ mod tests {
     use crate::queue::{JobType, PersistentQueue, QueueJob};
 
     use super::{
-        encode_convert_job_target, existing_update_job_id, format_general_lastup_queue_target,
-        format_update_queue_target, normalize_update_targets, push_update_job_if_needed,
-        reboot_args_with_no_browser, restorable_tasks_available, tag_color_class,
-        validate_diff_number, validate_download_targets, validate_general_lastup_option,
+        broadcast_captured_web_output, encode_convert_job_target, existing_update_job_id,
+        format_general_lastup_queue_target, format_update_queue_target, normalize_update_targets,
+        push_update_job_if_needed, reboot_args_with_no_browser, restorable_tasks_available,
+        tag_color_class, validate_diff_number, validate_download_targets,
+        validate_general_lastup_option,
     };
 
     #[test]
@@ -2295,6 +2367,42 @@ mod tests {
     fn modified_followup_target_matches_ruby_tag_selector() {
         let target = "tag:modified".to_string();
         assert_eq!(target, "tag:modified");
+    }
+
+    #[test]
+    fn broadcast_captured_web_output_wraps_plain_text_as_echo() {
+        let push_server = Arc::new(crate::web::push::PushServer::new());
+        let mut receiver = push_server.channel().subscribe();
+
+        broadcast_captured_web_output(&push_server, b"hello\n", "stdout2");
+
+        let message = receiver.try_recv().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(value["type"], "echo");
+        assert_eq!(value["body"], "hello");
+        assert_eq!(value["target_console"], "stdout2");
+    }
+
+    #[test]
+    fn broadcast_captured_web_output_retargets_structured_messages() {
+        let push_server = Arc::new(crate::web::push::PushServer::new());
+        let mut receiver = push_server.channel().subscribe();
+        let line = format!(
+            "{}{}",
+            crate::progress::WS_LINE_PREFIX,
+            serde_json::json!({
+                "type": "progressbar.step",
+                "data": { "topic": "download", "current": 1, "total": 2, "percent": 50.0 }
+            })
+        );
+
+        broadcast_captured_web_output(&push_server, line.as_bytes(), "stdout2");
+
+        let message = receiver.try_recv().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(value["type"], "progressbar.step");
+        assert_eq!(value["target_console"], "stdout2");
+        assert_eq!(value["data"]["topic"], "download");
     }
 
     #[test]

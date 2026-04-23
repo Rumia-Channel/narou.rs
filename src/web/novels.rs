@@ -559,6 +559,7 @@ pub async fn remove_novel(
     .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     state.push_server.broadcast_event("table.reload", "");
+    state.push_server.broadcast_event("tag.updateCanvas", "");
     state.push_server.broadcast_echo(
         &super::removal_log_message(std::slice::from_ref(&result), with_file),
         super::non_external_console_target(),
