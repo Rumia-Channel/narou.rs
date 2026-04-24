@@ -60,6 +60,10 @@ pub struct BatchIdsBody {
     pub ids: Vec<i64>,
     #[serde(default)]
     pub with_file: Option<bool>,
+    #[serde(default)]
+    pub sort_state: Option<serde_json::Value>,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,12 +93,20 @@ pub struct UpdateBody {
     pub force: bool,
     #[serde(default)]
     pub update_all: bool,
+    #[serde(default)]
+    pub sort_state: Option<serde_json::Value>,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ConvertBody {
     pub targets: Vec<String>,
     pub device: Option<String>,
+    #[serde(default)]
+    pub sort_state: Option<serde_json::Value>,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +117,10 @@ pub struct LogsParams {
 #[derive(Debug, Deserialize)]
 pub struct TargetsBody {
     pub targets: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub sort_state: Option<serde_json::Value>,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +132,10 @@ pub struct IdsBody {
 pub struct EditTagBody {
     pub ids: Vec<serde_json::Value>,
     pub states: std::collections::HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub sort_state: Option<serde_json::Value>,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +182,10 @@ pub struct TagInfoBody {
     pub ids: Vec<serde_json::Value>,
     #[serde(default)]
     pub with_exclusion: Option<bool>,
+    #[serde(default)]
+    pub sort_state: Option<serde_json::Value>,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

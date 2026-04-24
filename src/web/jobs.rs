@@ -17,8 +17,8 @@ use crate::queue::{JobType, PersistentQueue, QueueExecutionSpec, QueueJob, Queue
 
 use super::AppState;
 use super::sort_state::{
-    CurrentSortState, current_sort_from_server_setting, default_current_sort_state, sort_column_key,
-    sort_column_label,
+    CurrentSortState, current_sort_from_server_setting, load_current_sort_state, request_sort_state,
+    sort_column_key, sort_column_label, sort_ids_for_request, sort_records,
 };
 use super::state::{
     ApiResponse, ConfirmRunningTasksBody, ConvertBody, CsvImportBody, DiffBody, DiffCleanBody,
@@ -233,52 +233,20 @@ fn queue_lane_sizes(queue: &PersistentQueue) -> [usize; 2] {
 }
 
 fn sort_records_for_web_update(records: &mut Vec<&crate::db::NovelRecord>, sort_state: &CurrentSortState) {
-    let sort_key = sort_column_key(sort_state).unwrap_or("id");
-    let reverse = sort_state.dir == "desc";
-    records.sort_by(|a, b| {
-        let ordering = match sort_key {
-            "id" => a.id.cmp(&b.id),
-            "title" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-            "author" => a.author.to_lowercase().cmp(&b.author.to_lowercase()),
-            "last_update" => a.last_update.cmp(&b.last_update),
-            "general_lastup" => a
-                .general_lastup
-                .unwrap_or_default()
-                .cmp(&b.general_lastup.unwrap_or_default()),
-            "last_check_date" => a
-                .last_check_date
-                .unwrap_or_default()
-                .cmp(&b.last_check_date.unwrap_or_default()),
-            "sitename" => a.sitename.cmp(&b.sitename),
-            "novel_type" => a.novel_type.cmp(&b.novel_type),
-            "general_all_no" => a
-                .general_all_no
-                .unwrap_or(0)
-                .cmp(&b.general_all_no.unwrap_or(0)),
-            "length" => a.length.unwrap_or(0).cmp(&b.length.unwrap_or(0)),
-            _ => a.id.cmp(&b.id),
-        };
-        if reverse { ordering.reverse() } else { ordering }
-    });
+    sort_records(records, sort_state);
 }
 
 fn current_web_update_sort_state() -> CurrentSortState {
-    let sort_state = (|| {
-        let inv = crate::db::inventory::Inventory::with_default_root().ok()?;
-        let server_setting: serde_yaml::Value = inv
-            .load(
-                "server_setting",
-                crate::db::inventory::InventoryScope::Global,
-            )
-            .ok()?;
-        current_sort_from_server_setting(&server_setting)
-    })();
-    sort_state.unwrap_or_else(default_current_sort_state)
+    load_current_sort_state()
 }
 
 fn web_update_sort_key_for_cli(sort_state: &CurrentSortState) -> Option<&'static str> {
     let key = sort_column_key(sort_state)?;
-    matches!(key, "id" | "last_update" | "title" | "author" | "general_lastup").then_some(key)
+    matches!(
+        key,
+        "id" | "last_update" | "title" | "author" | "general_lastup" | "last_check_date"
+    )
+    .then_some(key)
 }
 
 fn current_web_update_sort_key_for_cli() -> Option<&'static str> {
@@ -293,6 +261,25 @@ fn sorted_update_all_ids() -> Vec<String> {
         Ok(records.into_iter().map(|record| record.id.to_string()).collect())
     })
     .unwrap_or_default()
+}
+
+fn sort_numeric_targets_for_request(
+    targets: &[String],
+    sort_state: Option<&serde_json::Value>,
+    timestamp: Option<u64>,
+) -> Vec<String> {
+    let Some(ids) = targets
+        .iter()
+        .map(|target| target.parse::<i64>().ok())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return targets.to_vec();
+    };
+    let sorted_ids = sort_ids_for_request(&ids, sort_state, timestamp);
+    sorted_ids
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect()
 }
 
 fn build_webui_update_start_message(is_update_all: bool, count: usize, sort_display: &str) -> String {
@@ -726,7 +713,7 @@ pub async fn api_update(
         let mut args = if is_update_all {
             sorted_update_all_ids()
         } else {
-            targets.clone()
+            sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp)
         };
         count = args.len();
         if count == 0 {
@@ -741,7 +728,11 @@ pub async fn api_update(
         if body.force {
             args.insert(0, "--force".to_string());
         }
-        let sort_display = current_sort_display_string();
+        let sort_display = if is_update_all {
+            current_sort_display_string()
+        } else {
+            requested_sort_display_string(body.sort_state.as_ref(), body.timestamp)
+        };
         let start_message = build_webui_update_start_message(is_update_all, count, &sort_display);
         let mut parts = Vec::with_capacity(args.len() + 1);
         parts.push(format!("{}{}", WEBUI_UPDATE_START_PREFIX, start_message));
@@ -850,10 +841,12 @@ pub async fn api_convert(
             .into();
         }
     }
+    let ordered_targets =
+        sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp);
     let jobs: Vec<(JobType, String)> = body
         .targets
         .iter()
-        .zip(targets.iter())
+        .zip(ordered_targets.iter())
         .map(|(_raw_target, target)| {
             (
                 JobType::Convert,
@@ -877,7 +870,7 @@ pub async fn api_convert(
         .targets
         .iter()
         .zip(ids.iter())
-        .zip(targets.iter())
+        .zip(ordered_targets.iter())
         .map(|((_raw_target, job_id), target)| {
             serde_json::json!({
                 "target": target,
@@ -2269,6 +2262,24 @@ fn current_sort_display_string() -> String {
     }
 }
 
+fn requested_sort_display_string(
+    sort_state: Option<&serde_json::Value>,
+    timestamp: Option<u64>,
+) -> String {
+    match request_sort_state(sort_state, timestamp) {
+        Some(sort_state) => {
+            let label = sort_column_label(&sort_state).unwrap_or("不明");
+            let dir_label = if sort_state.dir == "desc" {
+                "降順"
+            } else {
+                "昇順"
+            };
+            format!("{}{}", label, dir_label)
+        }
+        None => current_sort_display_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use parking_lot::Mutex;
@@ -2458,7 +2469,7 @@ mod tests {
                 column: 3,
                 dir: "desc".to_string(),
             }),
-            None
+            Some("last_check_date")
         );
     }
 

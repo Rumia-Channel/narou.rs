@@ -1,5 +1,7 @@
 use serde_yaml::{Mapping, Value};
 
+use crate::db::{NovelRecord, inventory::{Inventory, InventoryScope}, with_database};
+
 pub(crate) const SORT_COLUMN_KEYS: &[&str] = &[
     "id",
     "last_update",
@@ -70,6 +72,15 @@ pub(crate) fn default_current_sort_state() -> CurrentSortState {
     }
 }
 
+pub(crate) fn load_current_sort_state() -> CurrentSortState {
+    let sort_state = (|| {
+        let inventory = Inventory::with_default_root().ok()?;
+        let server_setting: Value = inventory.load("server_setting", InventoryScope::Global).ok()?;
+        current_sort_from_server_setting(&server_setting)
+    })();
+    sort_state.unwrap_or_else(default_current_sort_state)
+}
+
 pub(crate) fn current_sort_from_server_setting(server_setting: &Value) -> Option<CurrentSortState> {
     server_setting
         .as_mapping()?
@@ -82,12 +93,71 @@ pub(crate) fn normalize_current_sort_request(body: &serde_json::Value) -> Option
     normalize_current_sort_value(&value)
 }
 
+pub(crate) fn request_sort_state(
+    sort_state: Option<&serde_json::Value>,
+    timestamp: Option<u64>,
+) -> Option<CurrentSortState> {
+    timestamp?;
+    sort_state.and_then(normalize_current_sort_request)
+}
+
+pub(crate) fn requested_or_current_sort_state(
+    sort_state: Option<&serde_json::Value>,
+    timestamp: Option<u64>,
+) -> CurrentSortState {
+    request_sort_state(sort_state, timestamp).unwrap_or_else(load_current_sort_state)
+}
+
 pub(crate) fn sort_column_key(sort_state: &CurrentSortState) -> Option<&'static str> {
     SORT_COLUMN_KEYS.get(sort_state.column).copied()
 }
 
 pub(crate) fn sort_column_label(sort_state: &CurrentSortState) -> Option<&'static str> {
     SORT_COLUMN_LABELS.get(sort_state.column).copied()
+}
+
+pub(crate) fn sort_records(records: &mut Vec<&NovelRecord>, sort_state: &CurrentSortState) {
+    let sort_key = sort_column_key(sort_state).unwrap_or("id");
+    let reverse = sort_state.dir == "desc";
+    records.sort_by(|a, b| {
+        let ordering = match sort_key {
+            "id" => a.id.cmp(&b.id),
+            "title" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+            "author" => a.author.to_lowercase().cmp(&b.author.to_lowercase()),
+            "last_update" => a.last_update.cmp(&b.last_update),
+            "general_lastup" => a
+                .general_lastup
+                .unwrap_or_default()
+                .cmp(&b.general_lastup.unwrap_or_default()),
+            "last_check_date" => a
+                .last_check_date
+                .unwrap_or_default()
+                .cmp(&b.last_check_date.unwrap_or_default()),
+            "sitename" => a.sitename.cmp(&b.sitename),
+            "novel_type" => a.novel_type.cmp(&b.novel_type),
+            "general_all_no" => a
+                .general_all_no
+                .unwrap_or(0)
+                .cmp(&b.general_all_no.unwrap_or(0)),
+            "length" => a.length.unwrap_or(0).cmp(&b.length.unwrap_or(0)),
+            _ => a.id.cmp(&b.id),
+        };
+        if reverse { ordering.reverse() } else { ordering }
+    });
+}
+
+pub(crate) fn sort_ids_for_request(
+    ids: &[i64],
+    sort_state: Option<&serde_json::Value>,
+    timestamp: Option<u64>,
+) -> Vec<i64> {
+    let sort_state = requested_or_current_sort_state(sort_state, timestamp);
+    with_database(|db| {
+        let mut records: Vec<_> = ids.iter().filter_map(|id| db.get(*id)).collect();
+        sort_records(&mut records, &sort_state);
+        Ok(records.into_iter().map(|record| record.id).collect())
+    })
+    .unwrap_or_else(|_| ids.to_vec())
 }
 
 fn normalize_current_sort_value(sort_state: &Value) -> Option<CurrentSortState> {
@@ -129,9 +199,42 @@ fn normalize_sort_dir(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CURRENT_SORT_COLUMN, DEFAULT_CURRENT_SORT_DIR, current_sort_from_server_setting,
-        default_current_sort_state, normalize_current_sort_request,
+        DEFAULT_CURRENT_SORT_COLUMN, DEFAULT_CURRENT_SORT_DIR, CurrentSortState,
+        current_sort_from_server_setting, default_current_sort_state, normalize_current_sort_request,
+        request_sort_state, sort_records,
     };
+    use crate::db::NovelRecord;
+    use chrono::{TimeZone, Utc};
+
+    fn sample_record(id: i64, last_check_ts: i64) -> NovelRecord {
+        NovelRecord {
+            id,
+            author: format!("author-{id}"),
+            title: format!("title-{id}"),
+            file_title: format!("file-{id}"),
+            toc_url: format!("https://example.com/{id}/"),
+            sitename: "site".to_string(),
+            novel_type: 1,
+            end: false,
+            last_update: Utc.timestamp_opt(1_700_000_000 + id, 0).unwrap(),
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: None,
+            general_lastup: None,
+            last_mail_date: None,
+            tags: Vec::new(),
+            ncode: None,
+            domain: None,
+            general_all_no: Some(id),
+            length: Some(id),
+            suspend: false,
+            is_narou: true,
+            last_check_date: Some(Utc.timestamp_opt(last_check_ts, 0).unwrap()),
+            convert_failure: false,
+            extra_fields: Default::default(),
+        }
+    }
 
     #[test]
     fn current_sort_from_server_setting_accepts_integer_and_numeric_string_columns() {
@@ -165,6 +268,44 @@ mod tests {
                 "dir": "asc",
             }))
             .is_none()
+        );
+    }
+
+    #[test]
+    fn fixed_sort_state_requires_timestamp() {
+        assert!(request_sort_state(
+            Some(&serde_json::json!({ "column": 2, "dir": "desc" })),
+            None
+        )
+        .is_none());
+        assert_eq!(
+            request_sort_state(
+                Some(&serde_json::json!({ "column": 2, "dir": "desc" })),
+                Some(123)
+            ),
+            Some(CurrentSortState {
+                column: 2,
+                dir: "desc".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn sort_records_supports_last_check_date_descending() {
+        let first = sample_record(1, 1_700_000_100);
+        let second = sample_record(2, 1_700_000_300);
+        let third = sample_record(3, 1_700_000_200);
+        let sort_state = CurrentSortState {
+            column: 3,
+            dir: "desc".to_string(),
+        };
+        let mut records = vec![&first, &second, &third];
+
+        sort_records(&mut records, &sort_state);
+
+        assert_eq!(
+            records.into_iter().map(|record| record.id).collect::<Vec<_>>(),
+            vec![2, 3, 1]
         );
     }
 

@@ -43,6 +43,7 @@ struct UpdateInterrupted;
 const UPDATE_SORT_KEYS: &[(&str, &str)] = &[
     ("id", "ID"),
     ("last_update", "更新日"),
+    ("last_check_date", "最終確認日"),
     ("title", "タイトル"),
     ("author", "作者名"),
     ("new_arrivals_date", "新着日"),
@@ -557,6 +558,7 @@ fn sort_update_ids_by_key(ids: &mut [i64], key: &str) {
                 .to_lowercase()
                 .cmp(&b_record.author.to_lowercase()),
             "last_update" => b_record.last_update.cmp(&a_record.last_update),
+            "last_check_date" => b_record.last_check_date.cmp(&a_record.last_check_date),
             "new_arrivals_date" => b_record.new_arrivals_date.cmp(&a_record.new_arrivals_date),
             "general_lastup" => b_record.general_lastup.cmp(&a_record.general_lastup),
             _ => Ordering::Equal,

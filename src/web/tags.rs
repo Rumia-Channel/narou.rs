@@ -8,6 +8,7 @@ use crate::db::with_database_mut;
 use crate::error::NarouError;
 
 use super::AppState;
+use super::sort_state::sort_ids_for_request;
 use super::state::{ApiResponse, EditTagBody, IdPath, TagBody, TagsBody};
 
 fn validate_tags(tags: &[String]) -> Result<Vec<String>, String> {
@@ -210,6 +211,7 @@ pub async fn edit_tag(
             _ => None,
         })
         .collect();
+    let ids = sort_ids_for_request(&ids, body.sort_state.as_ref(), body.timestamp);
 
     if ids.is_empty() {
         return serde_json::json!({ "success": false, "error": "No valid IDs" }).into();

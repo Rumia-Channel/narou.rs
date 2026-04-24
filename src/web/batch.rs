@@ -5,6 +5,7 @@ use crate::db::{with_database, with_database_mut};
 use crate::error::NarouError;
 
 use super::AppState;
+use super::sort_state::sort_ids_for_request;
 use super::state::{ApiResponse, BatchIdsBody, TagBody};
 
 pub async fn batch_tag(
@@ -125,9 +126,10 @@ pub async fn batch_remove(
         return Err((StatusCode::BAD_REQUEST, "too many ids".to_string()));
     }
     let with_file = body.with_file.unwrap_or(false);
+    let sorted_ids = sort_ids_for_request(&body.ids, body.sort_state.as_ref(), body.timestamp);
     let removed_titles = with_database_mut(|db| {
         let mut titles = Vec::new();
-        for id in &body.ids {
+        for id in &sorted_ids {
             if let Some(record) = db.remove(*id) {
                 if with_file {
                     super::remove_novel_storage_dir(db.archive_root(), &record)
@@ -163,6 +165,8 @@ pub async fn batch_remove_with_file(
     let body = BatchIdsBody {
         ids: body.ids,
         with_file: Some(true),
+        sort_state: body.sort_state,
+        timestamp: body.timestamp,
     };
     batch_remove(State(state), Json(body)).await
 }

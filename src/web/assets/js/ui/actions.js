@@ -18,6 +18,21 @@ import {
 
 const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
 let tagSuggestionIndex = -1;
+const SORT_STATE_COLUMN_INDEX = {
+  id: 0,
+  last_update: 1,
+  general_lastup: 2,
+  last_check_date: 3,
+  title: 4,
+  author: 5,
+  sitename: 6,
+  novel_type: 7,
+  tags: 8,
+  general_all_no: 9,
+  length: 10,
+  status: 11,
+  toc_url: 12,
+};
 
 export function bindActions() {
   applyColumnVisibility();
@@ -400,7 +415,10 @@ export function bindActions() {
 
   on('btn-update', () => {
     if (State.selectedIds.size > 0) {
-      postJson('/api/update', { targets: [...State.selectedIds] });
+      postJson('/api/update', {
+        targets: [...State.selectedIds],
+        ...currentSortStatePayload(),
+      });
     } else {
       postJson('/api/update', { update_all: true });
     }
@@ -497,7 +515,7 @@ export function bindActions() {
 
   on('action-update-view', () => {
     const ids = getVisibleIds();
-    postJson('/api/update', { targets: ids });
+    postJson('/api/update', { targets: ids, ...currentSortStatePayload() });
   });
 
   on('action-update-force', () => {
@@ -538,7 +556,7 @@ export function bindActions() {
   on('btn-convert', () => {
     const ids = requireSelectedIds();
     if (!ids) return;
-    postJson('/api/convert', { targets: ids });
+    postJson('/api/convert', { targets: ids, ...currentSortStatePayload() });
   });
 
   on('action-other-diff', () => {
@@ -610,10 +628,7 @@ export function bindActions() {
       renderNovelList();
 
       // Persist sort state to server
-      const reverseColMap = { id: 0, last_update: 1, general_lastup: 2, last_check_date: 3,
-        title: 4, author: 5, sitename: 6, novel_type: 7, general_all_no: 9, length: 10 };
-      const colIdx = reverseColMap[State.sortCol] ?? 2;
-      postJson('/api/sort_state', { column: colIdx, dir: State.sortAsc ? 'asc' : 'desc' }).catch(() => {});
+      postJson('/api/sort_state', currentSortStatePayload().sort_state).catch(() => {});
     });
   });
 
@@ -796,6 +811,16 @@ function requireSelectedIds() {
   if (ids.length > 0) return ids;
   showNotification('小説を選択してください', 'warning');
   return null;
+}
+
+function currentSortStatePayload() {
+  return {
+    sort_state: {
+      column: SORT_STATE_COLUMN_INDEX[State.sortCol] ?? 2,
+      dir: State.sortAsc ? 'asc' : 'desc',
+    },
+    timestamp: Date.now(),
+  };
 }
 
 /* ===== Tag editor ===== */
@@ -1144,13 +1169,17 @@ function showRemoveModal(ids) {
     El.removeCancel.removeEventListener('click', onCancel);
   };
   const onOk = async () => {
-    const withFile = El.removeWithFile.checked;
-    cleanup();
-    try {
-      await postJson('/api/novels/remove', { ids: numericIds, with_file: withFile });
-      await refreshList();
-    } catch (e) {
-      showNotification('削除に失敗しました: ' + e.message, 'error');
+      const withFile = El.removeWithFile.checked;
+      cleanup();
+      try {
+        await postJson('/api/novels/remove', {
+          ids: numericIds,
+          with_file: withFile,
+          ...currentSortStatePayload(),
+        });
+        await refreshList();
+      } catch (e) {
+        showNotification('削除に失敗しました: ' + e.message, 'error');
     }
   };
   const onCancel = () => cleanup();
