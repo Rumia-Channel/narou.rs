@@ -228,9 +228,18 @@ fn execute_job(
                     command.arg(arg);
                 }
             }
-            "update" | "update_by_tag" => {
+            "update" => {
                 command.arg("update");
                 append_update_args(&mut command, push_server, target_console, &spec.args);
+            }
+            "update_by_tag" => {
+                command.arg("update");
+                let resolved_ids = execution_spec_meta_strings(&spec, "resolved_ids");
+                if resolved_ids.is_empty() {
+                    append_update_args(&mut command, push_server, target_console, &spec.args);
+                } else {
+                    append_update_args(&mut command, push_server, target_console, &resolved_ids);
+                }
             }
             "convert" => {
                 let convert_target = spec.args.join("\t");
@@ -393,6 +402,20 @@ fn execution_spec_meta_string(spec: &QueueExecutionSpec, key: &str) -> Option<St
     match spec.meta.get(Value::String(key.to_string())) {
         Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
         _ => None,
+    }
+}
+
+fn execution_spec_meta_strings(spec: &QueueExecutionSpec, key: &str) -> Vec<String> {
+    match spec.meta.get(Value::String(key.to_string())) {
+        Some(Value::Sequence(values)) => values
+            .iter()
+            .filter_map(|value| match value {
+                Value::String(value) if !value.is_empty() => Some(value.clone()),
+                Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -664,8 +687,8 @@ mod tests {
     use super::{
         MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, clear_progress_for_job,
         console_target_for_job, execution_spec_meta_bool, execution_spec_meta_string,
-        parse_convert_job_target, remember_failure_line, route_structured_web_message,
-        summarize_failure_details,
+        execution_spec_meta_strings, parse_convert_job_target, remember_failure_line,
+        route_structured_web_message, summarize_failure_details,
     };
     use crate::queue::JobType;
 
@@ -767,5 +790,25 @@ mod tests {
             execution_spec_meta_string(&string_spec, "update_modified").as_deref(),
             Some("true")
         );
+    }
+
+    #[test]
+    fn execution_spec_meta_strings_accepts_string_sequences() {
+        let mut meta = serde_yaml::Mapping::new();
+        meta.insert(
+            serde_yaml::Value::String("resolved_ids".to_string()),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("12".to_string()),
+                serde_yaml::Value::Number(serde_yaml::Number::from(34)),
+            ]),
+        );
+        let spec = crate::queue::QueueExecutionSpec {
+            cmd: "update_by_tag".to_string(),
+            args: Vec::new(),
+            meta,
+        };
+
+        assert_eq!(execution_spec_meta_strings(&spec, "resolved_ids"), vec!["12", "34"]);
+        assert!(execution_spec_meta_strings(&spec, "missing").is_empty());
     }
 }

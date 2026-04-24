@@ -282,6 +282,29 @@ fn sort_numeric_targets_for_request(
         .collect()
 }
 
+fn build_update_by_tag_queue_payload(ids: &[i64], tag_params: &[String]) -> (String, Vec<Value>, Mapping) {
+    let target = ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join("\t");
+    let legacy_args = tag_params
+        .iter()
+        .cloned()
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    let mut meta = Mapping::new();
+    meta.insert(
+        Value::String("resolved_ids".to_string()),
+        Value::Sequence(
+            ids.iter()
+                .map(|id| Value::String(id.to_string()))
+                .collect::<Vec<_>>(),
+        ),
+    );
+    (target, legacy_args, meta)
+}
+
 fn build_webui_update_start_message(is_update_all: bool, count: usize, sort_display: &str) -> String {
     if is_update_all {
         format!("全ての小説の更新を開始します（{}件を{}で処理）", count, sort_display)
@@ -1957,28 +1980,16 @@ pub async fn api_update_by_tag(
         .into();
     }
 
+    let ids = sort_ids_for_request(&ids, body.sort_state.as_ref(), body.timestamp);
     let count = ids.len();
-    let mut legacy_args: Vec<Value> = Vec::new();
-    if let Some(sort_key) = current_web_update_sort_key_for_cli() {
-        legacy_args.push(Value::String("--sort-by".to_string()));
-        legacy_args.push(Value::String(sort_key.to_string()));
-    }
-    legacy_args.extend(tag_params.iter().cloned().map(Value::String));
-    let target = legacy_args
-        .iter()
-        .filter_map(|value| match value {
-            Value::String(value) => Some(value.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("	");
+    let (target, legacy_args, meta) = build_update_by_tag_queue_payload(&ids, &tag_params);
     let (_job_ids, queued) = match push_update_job_with_legacy_if_needed(
         state.queue.as_ref(),
         &state.running_jobs,
         target.clone(),
         "update_by_tag",
         legacy_args,
-        Mapping::new(),
+        meta,
     ) {
         Ok(result) => result,
         Err(message) => {
@@ -2292,13 +2303,14 @@ mod tests {
     use crate::web::sort_state::CurrentSortState;
 
     use super::{
-        broadcast_captured_web_output, build_update_general_lastup_meta,
-        build_webui_update_start_message, encode_convert_job_target, existing_update_job_id,
-        format_general_lastup_queue_target, format_queue_job_type, format_update_queue_target,
-        normalize_update_targets, push_update_job_if_needed, queue_lane_sizes,
-        reboot_args_with_no_browser, restorable_tasks_available, sort_records_for_web_update,
-        tag_color_class, validate_diff_number, validate_download_targets,
-        validate_general_lastup_option, web_update_sort_key_for_cli,
+        broadcast_captured_web_output, build_update_by_tag_queue_payload,
+        build_update_general_lastup_meta, build_webui_update_start_message,
+        encode_convert_job_target, existing_update_job_id, format_general_lastup_queue_target,
+        format_queue_job_type, format_update_queue_target, normalize_update_targets,
+        push_update_job_if_needed, queue_lane_sizes, reboot_args_with_no_browser,
+        restorable_tasks_available, sort_records_for_web_update, tag_color_class,
+        validate_diff_number, validate_download_targets, validate_general_lastup_option,
+        web_update_sort_key_for_cli,
     };
 
     fn sample_record(id: i64, general_lastup_ts: i64) -> NovelRecord {
@@ -2551,6 +2563,30 @@ mod tests {
         assert_eq!(
             format_update_queue_target(&["--force".to_string(), "tag:modified".to_string()]),
             "タグ「modified」の小説を凍結済みも含めて更新"
+        );
+    }
+
+    #[test]
+    fn update_by_tag_queue_payload_keeps_label_args_but_freezes_resolved_ids() {
+        let (target, legacy_args, meta) = build_update_by_tag_queue_payload(
+            &[42, 9],
+            &["tag:modified".to_string(), "^tag:end".to_string()],
+        );
+
+        assert_eq!(target, "42\t9");
+        assert_eq!(
+            legacy_args,
+            vec![
+                Value::String("tag:modified".to_string()),
+                Value::String("^tag:end".to_string())
+            ]
+        );
+        assert_eq!(
+            meta.get(Value::String("resolved_ids".to_string())),
+            Some(&Value::Sequence(vec![
+                Value::String("42".to_string()),
+                Value::String("9".to_string())
+            ]))
         );
     }
 

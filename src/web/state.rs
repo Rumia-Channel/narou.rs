@@ -175,6 +175,10 @@ pub struct UpdateByTagBody {
     pub tags: Vec<String>,
     #[serde(default)]
     pub exclusion_tags: Vec<String>,
+    #[serde(default)]
+    pub sort_state: Option<serde_json::Value>,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

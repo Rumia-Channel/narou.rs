@@ -509,7 +509,7 @@ export function bindActions() {
       showNotification('タグを選択してください', 'warning');
       return;
     }
-    postJson('/api/update_by_tag', { tags, exclusion_tags });
+    postJson('/api/update_by_tag', { tags, exclusion_tags, ...currentSortStatePayload() });
     document.getElementById('update-by-tag-modal')?.classList.add('hide');
   });
 
@@ -531,7 +531,11 @@ export function bindActions() {
   });
 
   on('btn-gl-modified', () => {
-    postJson('/api/update_by_tag', { tags: ['modified'], exclusion_tags: [] });
+    postJson('/api/update_by_tag', {
+      tags: ['modified'],
+      exclusion_tags: [],
+      ...currentSortStatePayload(),
+    });
   });
 
   on('btn-send', () => {
