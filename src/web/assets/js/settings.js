@@ -8,19 +8,14 @@
 
   let settingsData = null;
   let activeTab = null;
+  let saveInFlight = false;
 
   // ─── Init ──────────────────────────────────────────────
   document.addEventListener('DOMContentLoaded', init);
 
   async function init() {
     try {
-      const resp = await fetch('/api/global_setting');
-      if (!resp.ok) throw new Error('Failed to load settings');
-      settingsData = await resp.json();
-      applyLoadedTheme();
-      renderTabs();
-      renderTabContent();
-      restoreActiveTab();
+      await reloadSettingsView();
       bindEvents();
     } catch (e) {
       console.error('Settings load error:', e);
@@ -249,19 +244,30 @@
     try { localStorage.setItem('narou_settings_active_tab', tabId); } catch(e) {}
   }
 
-  function restoreActiveTab() {
+  function restoreActiveTab(preferredTabId) {
+    if (preferredTabId && document.querySelector('#settings-tabs a[data-tab="' + preferredTabId + '"]')) {
+      switchTab(preferredTabId);
+      return;
+    }
     try {
       const saved = localStorage.getItem('narou_settings_active_tab');
       if (saved && document.querySelector('#settings-tabs a[data-tab="' + saved + '"]')) {
         switchTab(saved);
+        return;
       }
     } catch(e) {}
+    const firstTab = document.querySelector('#settings-tabs a[data-tab]');
+    if (firstTab) {
+      switchTab(firstTab.dataset.tab);
+    }
   }
 
   // ─── Save ──────────────────────────────────────────────
   async function saveSettings() {
+    if (saveInFlight) return;
     const settings = collectFormData();
     const body = { settings: settings };
+    const tabToRestore = activeTab || getCurrentTabId();
 
     // Include replace content
     const replaceEl = document.getElementById('replace-content');
@@ -270,20 +276,32 @@
     }
 
     try {
+      saveInFlight = true;
+      setSaveButtonsDisabled(true);
       const resp = await fetch('/api/global_setting', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
+      if (!resp.ok) {
+        throw new Error('設定の保存に失敗しました');
+      }
       const result = await resp.json();
-      if (result.success) {
-        applySavedWebUiSettings(settings);
+      if (!result || result.success !== true) {
+        showToast(result?.message || '保存に失敗しました', 'error');
+        return;
+      }
+      try {
+        await reloadSettingsView(tabToRestore);
         showToast(result.message || '設定を保存しました', 'success');
-      } else {
-        showToast(result.message || '保存に失敗しました', 'error');
+      } catch (reloadError) {
+        showToast((result.message || '設定を保存しました') + '（画面の再読み込みに失敗しました: ' + reloadError.message + '）', 'error');
       }
     } catch(e) {
       showToast('保存に失敗しました: ' + e.message, 'error');
+    } finally {
+      saveInFlight = false;
+      setSaveButtonsDisabled(false);
     }
   }
 
@@ -342,12 +360,6 @@
     }
   }
 
-  function applySavedWebUiSettings(settings) {
-    if (Object.prototype.hasOwnProperty.call(settings, 'webui.theme')) {
-      applyThemeValue(settings['webui.theme']);
-    }
-  }
-
   function applyThemeValue(value) {
     const theme = normalizeTheme(value);
     try {
@@ -369,6 +381,37 @@
     return settingsData.settings.find(function(setting) {
       return setting.name === name;
     }) || null;
+  }
+
+  async function reloadSettingsView(preferredTabId) {
+    settingsData = await fetchSettingsData();
+    applyLoadedTheme();
+    renderTabs();
+    renderTabContent();
+    restoreActiveTab(preferredTabId);
+  }
+
+  async function fetchSettingsData() {
+    const resp = await fetch('/api/global_setting');
+    if (!resp.ok) {
+      throw new Error('Failed to load settings');
+    }
+    return resp.json();
+  }
+
+  function getCurrentTabId() {
+    return document.querySelector('#settings-tabs li.active a[data-tab]')?.dataset.tab || activeTab;
+  }
+
+  function setSaveButtonsDisabled(disabled) {
+    [
+      document.getElementById('btn-save-settings'),
+      document.getElementById('btn-save-settings-bottom')
+    ].forEach(function(button) {
+      if (!button) return;
+      button.disabled = disabled;
+      button.setAttribute('aria-busy', disabled ? 'true' : 'false');
+    });
   }
 
   // ─── Helpers ───────────────────────────────────────────

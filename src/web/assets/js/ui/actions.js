@@ -7,7 +7,8 @@ import { fetchJson, postJson } from '../core/http.js';
 import { toggleLanguage } from './i18n.js';
 import {
   renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed,
-  selectVisible, selectAll, clearSelection, updateEnableSelected,
+  selectVisible, selectAll, clearSelection, getSelectedIdsInDisplayOrder,
+  pruneSelectedIdsToCurrentList, updateEnableSelected,
   syncViewChecks, showNotification,
 } from './render.js';
 import { setShortcutHandlers, initShortcuts } from './shortcuts.js';
@@ -27,11 +28,8 @@ const SORT_STATE_COLUMN_INDEX = {
   author: 5,
   sitename: 6,
   novel_type: 7,
-  tags: 8,
   general_all_no: 9,
   length: 10,
-  status: 11,
-  toc_url: 12,
 };
 
 export function bindActions() {
@@ -44,18 +42,14 @@ export function bindActions() {
 
   // --- Console buttons ---
   El.consoleTrash?.addEventListener('click', async () => {
-    if (El.console) {
-      var lines = El.console.querySelectorAll('.console-line');
-      lines.forEach(function(el) { el.remove(); });
-      State.consolePinned.main = true;
+    try {
+      const result = await postJson('/api/clear_history', {});
+      assertApiSuccess(result, '履歴のクリアに失敗しました');
+      clearConsoleHistoryUi();
+      showNotification(result.message || '履歴を消去しました', 'success');
+    } catch (error) {
+      showNotification(error.message || '履歴のクリアに失敗しました', 'error');
     }
-    if (El.consoleStdout2) {
-      var lines2 = El.consoleStdout2.querySelectorAll('.console-line');
-      lines2.forEach(function(el) { el.remove(); });
-      State.consolePinned.stdout2 = true;
-    }
-    State.consoleHistory = [];
-    try { await postJson('/api/clear_history', {}); } catch { /* ignore */ }
   });
 
   El.consoleExpand?.addEventListener('click', () => {
@@ -76,16 +70,21 @@ export function bindActions() {
   El.consoleHistory?.addEventListener('click', async () => {
     try {
       const mainData = await fetchJson('/api/history?format=json');
-      if (mainData?.history !== undefined && El.console) {
+      assertHistoryPayload(mainData);
+      let subData = null;
+      if (State.concurrencyEnabled && El.consoleStdout2) {
+        subData = await fetchJson('/api/history?format=json&stream=stdout2');
+        assertHistoryPayload(subData);
+      }
+      if (El.console) {
         replaceConsoleHistory(El.console, mainData.history);
       }
-      if (State.concurrencyEnabled && El.consoleStdout2) {
-        const subData = await fetchJson('/api/history?format=json&stream=stdout2');
-        if (subData?.history !== undefined) {
-          replaceConsoleHistory(El.consoleStdout2, subData.history);
-        }
+      if (subData && El.consoleStdout2) {
+        replaceConsoleHistory(El.consoleStdout2, subData.history);
       }
-    } catch { /* ignore */ }
+    } catch (error) {
+      showNotification(error.message || '履歴の取得に失敗しました', 'error');
+    }
   });
 
   // --- Filter ---
@@ -254,21 +253,36 @@ export function bindActions() {
   on('action-option-server-reboot', async () => {
     if (!confirm('サーバを再起動しますか？')) return;
     rememberRebootReturnTo();
-    await postJson('/api/reboot', {});
-    window.location.href = '/_rebooting';
+    try {
+      const result = await postJson('/api/reboot', {});
+      assertApiSuccess(result, 'サーバの再起動に失敗しました');
+      showNotification(result.message || 'サーバを再起動しています', 'success');
+      window.location.href = '/_rebooting';
+    } catch (error) {
+      clearRebootReturnTo();
+      showNotification(error.message || 'サーバの再起動に失敗しました', 'error');
+    }
   });
 
   // Theme selection
-  El.themeSelect?.addEventListener('change', () => {
+  El.themeSelect?.addEventListener('change', async () => {
+    const previousTheme = State.theme || 'default';
     const theme = El.themeSelect.value;
     State.theme = theme;
     lsSet('theme', theme);
     document.documentElement.dataset.theme = theme === 'default' ? '' : theme;
-    postJson('/api/global_setting', {
-      settings: { 'webui.theme': theme === 'default' ? null : theme },
-    }).catch(() => {
-      showNotification('テーマ設定の保存に失敗しました', 'error');
-    });
+    try {
+      const result = await postJson('/api/global_setting', {
+        settings: { 'webui.theme': theme === 'default' ? null : theme },
+      });
+      assertApiSuccess(result, 'テーマ設定の保存に失敗しました');
+    } catch (error) {
+      State.theme = previousTheme;
+      lsSet('theme', previousTheme);
+      document.documentElement.dataset.theme = previousTheme === 'default' ? '' : previousTheme;
+      if (El.themeSelect) El.themeSelect.value = previousTheme;
+      showNotification(error.message || 'テーマ設定の保存に失敗しました', 'error');
+    }
   });
 
   // --- Queue display ---
@@ -289,10 +303,15 @@ export function bindActions() {
   // --- Notepad modal ---
   on('notepad-close', () => El.notepadModal?.classList.add('hide'));
   on('save-notepad-button', async () => {
-    const text = El.notepad?.value || '';
-    await postJson('/api/notepad/save', { text, content: text });
-    El.notepadModal?.classList.add('hide');
-    showNotification('メモ帳を保存しました', 'success');
+    try {
+      const text = El.notepad?.value || '';
+      const result = await postJson('/api/notepad/save', { text, content: text });
+      assertApiSuccess(result, 'メモ帳の保存に失敗しました');
+      El.notepadModal?.classList.add('hide');
+      showNotification(result.message || 'メモ帳を保存しました', 'success');
+    } catch (error) {
+      showNotification(error.message || 'メモ帳の保存に失敗しました', 'error');
+    }
   });
 
   // --- Tag edit modal ---
@@ -578,7 +597,7 @@ export function bindActions() {
   on('action-other-folder', () => {
     const ids = requireSelectedIds();
     if (!ids) return;
-    postJson('/api/folder', { targets: ids });
+    void openFolderTargets(ids);
   });
 
   on('action-other-backup', () => {
@@ -632,7 +651,10 @@ export function bindActions() {
       renderNovelList();
 
       // Persist sort state to server
-      postJson('/api/sort_state', currentSortStatePayload().sort_state).catch(() => {});
+      const { sort_state } = currentSortStatePayload();
+      if (sort_state) {
+        postJson('/api/sort_state', sort_state).catch(() => {});
+      }
     });
   });
 
@@ -685,9 +707,7 @@ export function bindActions() {
     showDiff: (id) => openDiffList([id]),
     tagEditSingle: (id) => openTagEditor([id]),
     freezeToggle: async (id) => {
-      const novel = State.novels.find(n => n.id === id);
-      const endpoint = novel?.frozen ? '/api/novels/unfreeze' : '/api/novels/freeze';
-      await postJson(endpoint, { ids: [Number(id)] });
+      await postJson('/api/freeze', { ids: [Number(id)] });
       await refreshList();
     },
     updateSingle: (id) => postJson('/api/update', { targets: [String(id)] }),
@@ -698,7 +718,7 @@ export function bindActions() {
     },
     convertSingle: (id) => postJson('/api/convert', { targets: [String(id)] }),
     inspectSingle: (id) => postJson('/api/inspect', { targets: [String(id)] }),
-    folderSingle: (id) => postJson('/api/folder', { targets: [String(id)] }),
+    folderSingle: (id) => openFolderTargets([String(id)]),
     backupSingle: (id) => postJson('/api/backup', { targets: [String(id)] }),
     downloadForceSingle: (id) => postJson('/api/download', { targets: [String(id)], force: true }),
     mailSingle: (id) => postJson('/api/mail', { targets: [String(id)] }),
@@ -742,6 +762,20 @@ function on(id, handler) {
   });
 }
 
+function assertApiSuccess(result, fallbackMessage) {
+  if (result && result.success === false) {
+    throw new Error(result.message || fallbackMessage);
+  }
+  return result;
+}
+
+function assertHistoryPayload(result) {
+  if (!result || typeof result.history !== 'string') {
+    throw new Error('履歴の取得結果が不正です');
+  }
+  return result;
+}
+
 function rememberRebootReturnTo() {
   if (window.location.pathname === '/_rebooting') return;
   try {
@@ -752,6 +786,42 @@ function rememberRebootReturnTo() {
   } catch {
     // Ignore storage errors and fall back to root.
   }
+}
+
+function clearRebootReturnTo() {
+  try {
+    sessionStorage.removeItem(REBOOT_RETURN_TO_KEY);
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+async function openFolderTargets(ids) {
+  try {
+    const result = await postJson('/api/folder', { targets: ids });
+    assertApiSuccess(result, '保存フォルダを開けませんでした');
+    if (result?.message) {
+      showNotification(result.message, 'success');
+    }
+    return result;
+  } catch (error) {
+    showNotification(error.message || '保存フォルダを開けませんでした', 'error');
+    throw error;
+  }
+}
+
+function clearConsoleHistoryUi() {
+  if (El.console) {
+    var lines = El.console.querySelectorAll('.console-line');
+    lines.forEach(function(el) { el.remove(); });
+    State.consolePinned.main = true;
+  }
+  if (El.consoleStdout2) {
+    var lines2 = El.consoleStdout2.querySelectorAll('.console-line');
+    lines2.forEach(function(el) { el.remove(); });
+    State.consolePinned.stdout2 = true;
+  }
+  State.consoleHistory = [];
 }
 
 function populateFooterPanel() {
@@ -811,16 +881,22 @@ async function batchAction(endpoint) {
 }
 
 function requireSelectedIds() {
-  const ids = [...State.selectedIds];
+  const ids = getSelectedIdsInDisplayOrder();
   if (ids.length > 0) return ids;
   showNotification('小説を選択してください', 'warning');
   return null;
 }
 
 function currentSortStatePayload() {
+  const column = SORT_STATE_COLUMN_INDEX[State.sortCol];
+  if (column == null) {
+    return {
+      timestamp: Date.now(),
+    };
+  }
   return {
     sort_state: {
-      column: SORT_STATE_COLUMN_INDEX[State.sortCol] ?? 2,
+      column,
       dir: State.sortAsc ? 'asc' : 'desc',
     },
     timestamp: Date.now(),
@@ -1060,9 +1136,13 @@ async function openNotepad() {
     return;
   }
 
-  const data = await fetchJson('/api/notepad/read');
-  if (El.notepad) El.notepad.value = data?.text || data?.content || '';
-  El.notepadModal?.classList.remove('hide');
+  try {
+    const data = await fetchJson('/api/notepad/read');
+    if (El.notepad) El.notepad.value = data?.text || data?.content || '';
+    El.notepadModal?.classList.remove('hide');
+  } catch (error) {
+    showNotification(error.message || 'メモ帳の読み込みに失敗しました', 'error');
+  }
 }
 
 /* ===== About ===== */
@@ -1109,7 +1189,10 @@ async function openDiffList(ids) {
 
   try {
     const data = await postJson('/api/diff_list', { targets: ids });
-    if (data?.diffs) {
+    if (data?.error) {
+      throw new Error(data.error);
+    }
+    if (Array.isArray(data?.diffs)) {
       container.innerHTML = data.diffs.map(d =>
         `<div class="diff-entry" data-diff-id="${escHtml(String(d.id))}">
           <div class="diff-header">
@@ -1122,19 +1205,25 @@ async function openDiffList(ids) {
       container.querySelectorAll('.btn-diff-clean').forEach(btn => {
         btn.addEventListener('click', async () => {
           const id = btn.dataset.id;
-          await postJson('/api/diff_clean', { target: id });
-          const entry = btn.closest('.diff-entry');
-          if (entry) {
-            const pre = entry.querySelector('.diff-content');
-            if (pre) pre.textContent = 'No diff';
+          try {
+            const result = await postJson('/api/diff_clean', { target: id });
+            assertApiSuccess(result, '差分キャッシュの削除に失敗しました');
+            const entry = btn.closest('.diff-entry');
+            if (entry) {
+              const pre = entry.querySelector('.diff-content');
+              if (pre) pre.textContent = 'No diff';
+            }
+            showNotification(result.message || '差分キャッシュを削除しました', 'success');
+          } catch (error) {
+            showNotification(error.message || '差分キャッシュの削除に失敗しました', 'error');
           }
         });
       });
     } else {
       container.innerHTML = '<p>差分データがありません</p>';
     }
-  } catch {
-    container.innerHTML = '<p>差分の取得に失敗しました</p>';
+  } catch (error) {
+    container.innerHTML = '<p>' + escHtml(error.message || '差分の取得に失敗しました') + '</p>';
   }
 }
 
@@ -1362,6 +1451,7 @@ export async function refreshList() {
       State.frozenIds = new Set(
         resp.data.filter(n => n.frozen).map(n => String(n.id))
       );
+      pruneSelectedIdsToCurrentList();
     }
   } catch { /* ignore */ }
   renderNovelList();

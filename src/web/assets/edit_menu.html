@@ -148,6 +148,8 @@
       border-radius: 0.2em;
     }
     .notepad-hint { color: var(--text-muted); font-size: 0.8em; display: inline-block; margin-left: 0.5em; }
+    .notepad-status { color: var(--text-muted); font-size: 0.8em; display: inline-block; margin-left: 0.5em; }
+    .notepad-status.error { color: var(--danger-color); }
   </style>
 </head>
 <body>
@@ -190,6 +192,7 @@
     <div class="notepad-section">
       <span class="panel-label">メモ帳</span>
       <span class="notepad-hint">※自動でサーバに保存されます</span>
+      <span class="notepad-status" id="notepad-status"></span>
       <textarea id="notepad-area"></textarea>
     </div>
   </div>
@@ -332,8 +335,37 @@
 
     // Notepad — auto-save to server
     var notepadArea = document.getElementById('notepad-area');
-    fetch('/api/notepad/read').then(function(r) { return r.json(); }).then(function(data) {
-      notepadArea.value = data.content || '';
+    var notepadStatus = document.getElementById('notepad-status');
+    var notepadStatusTimer = null;
+    function showNotepadStatus(message, isError) {
+      notepadStatus.classList.toggle('error', Boolean(isError));
+      notepadStatus.textContent = message;
+      if (notepadStatusTimer) clearTimeout(notepadStatusTimer);
+      notepadStatusTimer = setTimeout(function() {
+        if (notepadStatus.textContent === message) {
+          notepadStatus.textContent = '';
+          notepadStatus.classList.remove('error');
+        }
+      }, 2000);
+    }
+    function requestJson(url, options) {
+      return fetch(url, options).then(function(response) {
+        if (!response.ok) {
+          throw new Error('HTTP ' + response.status);
+        }
+        return response.json();
+      });
+    }
+    function assertApiSuccess(data, fallbackMessage) {
+      if (!data || data.success === false) {
+        throw new Error((data && data.message) || fallbackMessage);
+      }
+      return data;
+    }
+    requestJson('/api/notepad/read').then(function(data) {
+      notepadArea.value = data.content || data.text || '';
+    }).catch(function(error) {
+      showNotepadStatus('読み込みに失敗しました: ' + error.message, true);
     });
     function connectNotepadSocket(wsPort) {
       var url = new URL('/ws', location.href);
@@ -355,11 +387,18 @@
     var notepadTimer = null;
     notepadArea.addEventListener('input', function() {
       clearTimeout(notepadTimer);
+      notepadStatus.textContent = '';
+      notepadStatus.classList.remove('error');
       notepadTimer = setTimeout(function() {
-        fetch('/api/notepad/save', {
+        requestJson('/api/notepad/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content: notepadArea.value })
+        }).then(function(data) {
+          data = assertApiSuccess(data, '保存に失敗しました');
+          showNotepadStatus(data.message || '保存しました');
+        }).catch(function(error) {
+          showNotepadStatus('保存に失敗しました: ' + error.message, true);
         });
       }, 1000);
     });

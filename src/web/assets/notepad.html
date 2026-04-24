@@ -42,6 +42,9 @@
       font-size: 0.85em;
       color: var(--text-muted);
     }
+    .notepad-status.error {
+      color: var(--danger-color);
+    }
   </style>
 </head>
 <body>
@@ -64,19 +67,43 @@
       var textarea = document.getElementById('notepad');
       var status = document.getElementById('notepad-status');
       var saveTimer = null;
+      var statusTimer = null;
 
-      fetch('/api/notepad/read')
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-          textarea.value = data.content || '';
-        });
-
-      function showStatus(message) {
+      function showStatus(message, isError) {
+        status.classList.toggle('error', Boolean(isError));
         status.textContent = message;
-        setTimeout(function() {
-          if (status.textContent === message) status.textContent = '';
+        if (statusTimer) clearTimeout(statusTimer);
+        statusTimer = setTimeout(function() {
+          if (status.textContent === message) {
+            status.textContent = '';
+            status.classList.remove('error');
+          }
         }, 2000);
       }
+
+      function requestJson(url, options) {
+        return fetch(url, options).then(function(response) {
+          if (!response.ok) {
+            throw new Error('HTTP ' + response.status);
+          }
+          return response.json();
+        });
+      }
+
+      function assertApiSuccess(data, fallbackMessage) {
+        if (!data || data.success === false) {
+          throw new Error((data && data.message) || fallbackMessage);
+        }
+        return data;
+      }
+
+      requestJson('/api/notepad/read')
+        .then(function(data) {
+          textarea.value = data.content || data.text || '';
+        })
+        .catch(function(error) {
+          showStatus('読み込みに失敗しました: ' + error.message, true);
+        });
 
       function connectWebSocket(wsPort) {
         var url = new URL('/ws', location.href);
@@ -103,13 +130,17 @@
       textarea.addEventListener('input', function() {
         if (saveTimer) clearTimeout(saveTimer);
         status.textContent = '';
+        status.classList.remove('error');
         saveTimer = setTimeout(function() {
-          fetch('/api/notepad/save', {
+          requestJson('/api/notepad/save', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text: textarea.value })
-          }).then(function() {
-            showStatus('保存しました');
+          }).then(function(data) {
+            data = assertApiSuccess(data, '保存に失敗しました');
+            showStatus(data.message || '保存しました');
+          }).catch(function(error) {
+            showStatus('保存に失敗しました: ' + error.message, true);
           });
         }, 500);
       });
