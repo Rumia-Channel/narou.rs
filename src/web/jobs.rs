@@ -151,9 +151,18 @@ fn format_update_queue_target(args: &[String]) -> String {
 
     let mut force = false;
     let mut targets = Vec::new();
+    let mut skip_next = false;
     for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
         if arg == "--force" {
             force = true;
+            continue;
+        }
+        if arg == "--sort-by" {
+            skip_next = true;
             continue;
         }
         if arg.starts_with(WEBUI_UPDATE_START_PREFIX) {
@@ -265,6 +274,15 @@ fn current_web_update_sort_state() -> CurrentSortState {
         current_sort_from_server_setting(&server_setting)
     })();
     sort_state.unwrap_or_else(default_current_sort_state)
+}
+
+fn web_update_sort_key_for_cli(sort_state: &CurrentSortState) -> Option<&'static str> {
+    let key = sort_column_key(sort_state)?;
+    matches!(key, "id" | "last_update" | "title" | "author" | "general_lastup").then_some(key)
+}
+
+fn current_web_update_sort_key_for_cli() -> Option<&'static str> {
+    web_update_sort_key_for_cli(&current_web_update_sort_state())
 }
 
 fn sorted_update_all_ids() -> Vec<String> {
@@ -479,6 +497,12 @@ fn build_update_general_lastup_meta(is_update_modified: bool) -> Mapping {
             Value::String("update_modified".to_string()),
             Value::Bool(true),
         );
+        if let Some(sort_key) = current_web_update_sort_key_for_cli() {
+            meta.insert(
+                Value::String("sort_by".to_string()),
+                Value::String(sort_key.to_string()),
+            );
+        }
     }
     meta
 }
@@ -1941,13 +1965,26 @@ pub async fn api_update_by_tag(
     }
 
     let count = ids.len();
-    let target = tag_params.join("	");
+    let mut legacy_args: Vec<Value> = Vec::new();
+    if let Some(sort_key) = current_web_update_sort_key_for_cli() {
+        legacy_args.push(Value::String("--sort-by".to_string()));
+        legacy_args.push(Value::String(sort_key.to_string()));
+    }
+    legacy_args.extend(tag_params.iter().cloned().map(Value::String));
+    let target = legacy_args
+        .iter()
+        .filter_map(|value| match value {
+            Value::String(value) => Some(value.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("	");
     let (_job_ids, queued) = match push_update_job_with_legacy_if_needed(
         state.queue.as_ref(),
         &state.running_jobs,
         target.clone(),
         "update_by_tag",
-        tag_params.iter().cloned().map(Value::String).collect(),
+        legacy_args,
         Mapping::new(),
     ) {
         Ok(result) => result,
@@ -2250,7 +2287,7 @@ mod tests {
         normalize_update_targets, push_update_job_if_needed, queue_lane_sizes,
         reboot_args_with_no_browser, restorable_tasks_available, sort_records_for_web_update,
         tag_color_class, validate_diff_number, validate_download_targets,
-        validate_general_lastup_option,
+        validate_general_lastup_option, web_update_sort_key_for_cli,
     };
 
     fn sample_record(id: i64, general_lastup_ts: i64) -> NovelRecord {
@@ -2408,6 +2445,24 @@ mod tests {
     }
 
     #[test]
+    fn web_update_sort_key_for_cli_accepts_only_update_supported_columns() {
+        assert_eq!(
+            web_update_sort_key_for_cli(&CurrentSortState {
+                column: 2,
+                dir: "desc".to_string(),
+            }),
+            Some("general_lastup")
+        );
+        assert_eq!(
+            web_update_sort_key_for_cli(&CurrentSortState {
+                column: 3,
+                dir: "desc".to_string(),
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn validate_download_targets_rejects_flag_like_values() {
         assert!(
             validate_download_targets(&["1".to_string(), "https://example.com".to_string()])
@@ -2472,6 +2527,14 @@ mod tests {
     fn update_queue_target_describes_tag_and_force_jobs() {
         assert_eq!(
             format_update_queue_target(&["tag:modified".to_string()]),
+            "タグ「modified」の小説を更新"
+        );
+        assert_eq!(
+            format_update_queue_target(&[
+                "--sort-by".to_string(),
+                "general_lastup".to_string(),
+                "tag:modified".to_string(),
+            ]),
             "タグ「modified」の小説を更新"
         );
         assert_eq!(

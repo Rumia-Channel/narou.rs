@@ -389,6 +389,13 @@ fn execution_spec_meta_bool(spec: &QueueExecutionSpec, key: &str) -> bool {
     }
 }
 
+fn execution_spec_meta_string(spec: &QueueExecutionSpec, key: &str) -> Option<String> {
+    match spec.meta.get(Value::String(key.to_string())) {
+        Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+        _ => None,
+    }
+}
+
 fn refresh_web_state(push_server: &Arc<PushServer>) {
     if let Err(e) = with_database_mut(|db| db.refresh()) {
         push_server.broadcast_error(&format!("DB更新エラー: {}", e));
@@ -421,7 +428,11 @@ fn execute_update_general_lastup_job(
     );
 
     let mut followup = new_web_subprocess_command(exe, root_dir, job_id);
-    followup.arg("update").arg("tag:modified");
+    followup.arg("update");
+    if let Some(sort_key) = execution_spec_meta_string(spec, "sort_by") {
+        followup.arg("--sort-by").arg(sort_key);
+    }
+    followup.arg("tag:modified");
     spawn_and_stream_command(followup, push_server, running_pids, job_id, target_console)
 }
 
@@ -652,8 +663,9 @@ fn parse_convert_job_target(value: &str) -> (&str, Option<&str>) {
 mod tests {
     use super::{
         MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, clear_progress_for_job,
-        console_target_for_job, execution_spec_meta_bool, parse_convert_job_target,
-        remember_failure_line, route_structured_web_message, summarize_failure_details,
+        console_target_for_job, execution_spec_meta_bool, execution_spec_meta_string,
+        parse_convert_job_target, remember_failure_line, route_structured_web_message,
+        summarize_failure_details,
     };
     use crate::queue::JobType;
 
@@ -751,5 +763,9 @@ mod tests {
         };
         assert!(execution_spec_meta_bool(&string_spec, "update_modified"));
         assert!(!execution_spec_meta_bool(&string_spec, "missing"));
+        assert_eq!(
+            execution_spec_meta_string(&string_spec, "update_modified").as_deref(),
+            Some("true")
+        );
     }
 }

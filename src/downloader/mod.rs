@@ -1218,7 +1218,7 @@ impl Downloader {
         let mut started_download = false;
         let mut downloaded_index = 0usize;
 
-        for (si, (subtitle, plan)) in subtitles.iter().zip(section_plans.into_iter()).enumerate() {
+        for (subtitle, plan) in subtitles.iter().zip(section_plans.into_iter()) {
             let latest_section_path = plan.latest_section_path;
             let is_new_arrival = plan.is_new_arrival;
             let needs_download = plan.needs_download;
@@ -1323,7 +1323,10 @@ impl Downloader {
                 } else {
                     subtitle.subtitle.clone()
                 };
-                line.push_str(&format!("{} ({}/{})", printable_subtitle, si + 1, subtitles.len()));
+                line.push_str(&format!(
+                    "{} ({}/{})",
+                    printable_subtitle, downloaded_index, download_count
+                ));
                 if needs_download {
                     if is_new_arrival && (existing_id.is_some() || force) {
                         line.push_str(&bold_colored(" (新着)", "magenta"));
