@@ -142,6 +142,19 @@ narou_rs web --port 8888 --no-browser
 narou_rs web --hide-console
 ```
 
+### Web 公開時の上級者向け設定
+
+通常の `web` 利用は localhost 前提です。外部公開や reverse proxy 配下で使う場合だけ、CLI から hidden 設定を変更してください。
+
+```powershell
+narou_rs setting server-basic-auth.require-for-external-bind=false
+narou_rs setting server-reverse-proxy.enable=true
+```
+
+- `server-basic-auth.require-for-external-bind` は、`server-bind=0.0.0.0` など外部公開 bind のときに Basic 認証未設定での起動を拒否する narou_rs 独自ガードです。既定値は `true` です。
+- `server-reverse-proxy.enable` は nginx などの前段 proxy が付ける外側の `Host` / `Origin` を受け入れるモードです。既定値は `false` で、reverse proxy 越しに公開するときだけ `true` にしてください。
+- どちらも Web UI の設定画面には表示されません。`narou_rs setting <name>=<value>` でのみ変更します。
+
 ## グローバルオプション
 
 主なグローバルオプションは以下です。
