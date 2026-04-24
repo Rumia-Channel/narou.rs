@@ -465,24 +465,7 @@ fn try_kill_via_pid_file(port: u16) {
         pid
     );
 
-    #[cfg(windows)]
-    {
-        let mut command = std::process::Command::new("taskkill");
-        command
-            .args(["/PID", &pid.to_string(), "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        narou_rs::compat::configure_hidden_console_command(&mut command);
-        let _ = command.status();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
+    let _ = narou_rs::compat::terminate_process(pid);
 
     // Wait for the process to die and port to free, regardless of kill exit code
     let addr: SocketAddr = match format!("127.0.0.1:{}", port).parse() {

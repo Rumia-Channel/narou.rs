@@ -413,21 +413,7 @@ fn kill_running_child_for_job(state: &AppState, job_id: &str) -> bool {
 }
 
 fn kill_process_tree(pid: u32, push_server: &std::sync::Arc<super::push::PushServer>) {
-    let result = if cfg!(windows) {
-        let mut command = std::process::Command::new("taskkill");
-        command
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        crate::compat::configure_hidden_console_command(&mut command);
-        command.status()
-    } else {
-        std::process::Command::new("kill")
-            .args(["-TERM", &format!("-{}", pid)])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-    };
+    let result = crate::compat::terminate_process(pid);
     if let Err(e) = result {
         push_server.broadcast_echo(&format!("プロセス終了に失敗: {}", e), "stdout");
     }

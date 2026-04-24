@@ -65,6 +65,82 @@ pub fn configure_web_subprocess_command(command: &mut Command) {
     configure_hidden_console_command(command);
 }
 
+pub fn terminate_process(pid: u32) -> io::Result<()> {
+    terminate_process_tree(pid)
+}
+
+#[cfg(unix)]
+fn terminate_process_tree(pid: u32) -> io::Result<()> {
+    let pid = i32::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid is out of range"))?;
+
+    unsafe {
+        if libc::kill(-pid, libc::SIGTERM) == 0 {
+            return Ok(());
+        }
+        let group_err = io::Error::last_os_error();
+        if group_err.raw_os_error() != Some(libc::ESRCH) {
+            return Err(group_err);
+        }
+
+        if libc::kill(pid, libc::SIGTERM) == 0 {
+            return Ok(());
+        }
+        let process_err = io::Error::last_os_error();
+        if process_err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        Err(process_err)
+    }
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(pid: u32) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+        WaitForSingleObject,
+    };
+
+    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+
+    unsafe {
+        let handle: HANDLE = OpenProcess(
+            PROCESS_TERMINATE | SYNCHRONIZE_ACCESS | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        );
+        if handle.is_null() {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(87) {
+                return Ok(());
+            }
+            return Err(err);
+        }
+
+        let terminate_result = TerminateProcess(handle, 1);
+        if terminate_result == 0 {
+            let err = io::Error::last_os_error();
+            let _ = CloseHandle(handle);
+            if err.raw_os_error() == Some(87) {
+                return Ok(());
+            }
+            return Err(err);
+        }
+
+        let wait_result = WaitForSingleObject(handle, 2_000);
+        let _ = CloseHandle(handle);
+        if wait_result == WAIT_OBJECT_0 {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for process exit",
+            ))
+        }
+    }
+}
+
 pub fn sanitize_java_command(command: &mut Command) -> &mut Command {
     command
         .env_remove("JAVA_TOOL_OPTIONS")
@@ -720,7 +796,7 @@ mod tests {
         NovelLockGuard, configure_web_subprocess_command, get_copy_to_directory,
         load_frozen_ids_from_inventory,
         load_locked_ids_from_inventory, record_is_frozen, reroute_web_line_to_console,
-        sanitize_backup_name,
+        sanitize_backup_name, terminate_process,
     };
     use crate::db::NovelRecord;
 
@@ -790,6 +866,11 @@ mod tests {
             .collect();
 
         assert_eq!(envs.get("NAROU_RS_WEB_MODE"), Some(&Some("1".to_string())));
+    }
+
+    #[test]
+    fn terminate_process_treats_missing_pid_as_success() {
+        assert!(terminate_process(i32::MAX as u32).is_ok());
     }
 
     #[test]
