@@ -190,8 +190,29 @@ fn format_queue_job_target(job: &QueueJob, spec: Option<&QueueExecutionSpec>) ->
     }
 }
 
+fn job_type_key(job_type: JobType) -> &'static str {
+    match job_type {
+        JobType::Download => "download",
+        JobType::Update => "update",
+        JobType::AutoUpdate => "auto_update",
+        JobType::Convert => "convert",
+        JobType::Send => "send",
+        JobType::Backup => "backup",
+        JobType::Mail => "mail",
+    }
+}
+
+fn format_queue_job_type(job: &QueueJob, spec: Option<&QueueExecutionSpec>) -> String {
+    spec.map(|spec| spec.cmd.clone())
+        .unwrap_or_else(|| job_type_key(job.job_type).to_string())
+}
+
 fn queue_display_target(queue: &PersistentQueue, job: &QueueJob) -> String {
     format_queue_job_target(job, queue.execution_spec(&job.id).as_ref())
+}
+
+fn queue_display_type(queue: &PersistentQueue, job: &QueueJob) -> String {
+    format_queue_job_type(job, queue.execution_spec(&job.id).as_ref())
 }
 
 fn queue_lane_sizes(queue: &PersistentQueue) -> [usize; 2] {
@@ -434,6 +455,7 @@ fn push_update_job_with_legacy_if_needed(
     target: String,
     legacy_cmd: &str,
     legacy_args: Vec<Value>,
+    meta: Mapping,
 ) -> Result<(Vec<String>, bool), String> {
     if let Some(existing_id) = existing_update_job_id(queue, running_jobs, &target) {
         return Ok((vec![existing_id], false));
@@ -444,10 +466,21 @@ fn push_update_job_with_legacy_if_needed(
             &target,
             legacy_cmd,
             legacy_args,
-            Mapping::new(),
+            meta,
         )
         .map(|id| (vec![id], true))
         .map_err(|e| e.to_string())
+}
+
+fn build_update_general_lastup_meta(is_update_modified: bool) -> Mapping {
+    let mut meta = Mapping::new();
+    if is_update_modified {
+        meta.insert(
+            Value::String("update_modified".to_string()),
+            Value::Bool(true),
+        );
+    }
+    meta
 }
 
 fn restorable_tasks_available(state: &AppState) -> bool {
@@ -1729,7 +1762,7 @@ pub async fn get_pending_tasks(State(state): State<AppState>) -> Json<serde_json
         .map(|j| {
             serde_json::json!({
                 "id": j.id,
-                "type": j.job_type,
+                "type": queue_display_type(state.queue.as_ref(), j),
                 "target": j.target,
                 "display_target": queue_display_target(state.queue.as_ref(), j),
                 "created_at": j.created_at,
@@ -1744,7 +1777,7 @@ pub async fn get_pending_tasks(State(state): State<AppState>) -> Json<serde_json
         .map(|job| {
             serde_json::json!({
                 "id": job.id,
-                "type": job.job_type,
+                "type": queue_display_type(state.queue.as_ref(), job),
                 "target": job.target,
                 "display_target": queue_display_target(state.queue.as_ref(), job),
                 "created_at": job.created_at,
@@ -1915,6 +1948,7 @@ pub async fn api_update_by_tag(
         target.clone(),
         "update_by_tag",
         tag_params.iter().cloned().map(Value::String).collect(),
+        Mapping::new(),
     ) {
         Ok(result) => result,
         Err(message) => {
@@ -2080,28 +2114,17 @@ pub async fn api_update_general_lastup(
         .into_iter()
         .map(|value| Value::String(value.to_string()))
         .collect();
+    let meta = build_update_general_lastup_meta(is_update_modified);
     match push_update_job_with_legacy_if_needed(
         state.queue.as_ref(),
         &state.running_jobs,
         target,
         "update_general_lastup",
         legacy_args,
+        meta,
     ) {
         Ok((job_ids, queued)) => {
-            let mut enqueued_any = queued;
-
-            // Ruby parity: if is_update_modified, chain a second update for tag:modified
-            if is_update_modified {
-                if let Ok((_, modified_queued)) = push_update_job_if_needed(
-                    state.queue.as_ref(),
-                    &state.running_jobs,
-                    "tag:modified".to_string(),
-                ) {
-                    enqueued_any |= modified_queued;
-                }
-            }
-
-            if enqueued_any {
+            if queued {
                 state.push_server.broadcast_event("notification.queue", "");
             }
 
@@ -2215,16 +2238,19 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::{TimeZone, Utc};
+    use serde_yaml::{Mapping, Value};
     use crate::db::NovelRecord;
-    use crate::queue::{JobType, PersistentQueue, QueueJob};
+    use crate::queue::{JobType, PersistentQueue, QueueExecutionSpec, QueueJob};
     use crate::web::sort_state::CurrentSortState;
 
     use super::{
-        broadcast_captured_web_output, build_webui_update_start_message, encode_convert_job_target,
-        existing_update_job_id, format_general_lastup_queue_target, format_update_queue_target,
+        broadcast_captured_web_output, build_update_general_lastup_meta,
+        build_webui_update_start_message, encode_convert_job_target, existing_update_job_id,
+        format_general_lastup_queue_target, format_queue_job_type, format_update_queue_target,
         normalize_update_targets, push_update_job_if_needed, queue_lane_sizes,
         reboot_args_with_no_browser, restorable_tasks_available, sort_records_for_web_update,
-        tag_color_class, validate_diff_number, validate_download_targets, validate_general_lastup_option,
+        tag_color_class, validate_diff_number, validate_download_targets,
+        validate_general_lastup_option,
     };
 
     fn sample_record(id: i64, general_lastup_ts: i64) -> NovelRecord {
@@ -2344,6 +2370,41 @@ mod tests {
             build_webui_update_start_message(false, 1, "最新話掲載日降順"),
             "更新を開始します（1件を最新話掲載日降順で処理）"
         );
+    }
+
+    #[test]
+    fn build_update_general_lastup_meta_sets_followup_flag_only_when_enabled() {
+        let disabled = build_update_general_lastup_meta(false);
+        assert!(disabled.is_empty());
+
+        let enabled = build_update_general_lastup_meta(true);
+        assert_eq!(
+            enabled.get(Value::String("update_modified".to_string())),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn format_queue_job_type_prefers_legacy_command_name() {
+        let job = QueueJob {
+            id: "task-1".to_string(),
+            job_type: JobType::Update,
+            target: "narou".to_string(),
+            created_at: 0,
+            retry_count: 0,
+            max_retries: 0,
+        };
+        let spec = QueueExecutionSpec {
+            cmd: "update_general_lastup".to_string(),
+            args: vec!["narou".to_string()],
+            meta: Mapping::new(),
+        };
+
+        assert_eq!(
+            format_queue_job_type(&job, Some(&spec)),
+            "update_general_lastup"
+        );
+        assert_eq!(format_queue_job_type(&job, None), "update");
     }
 
     #[test]

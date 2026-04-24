@@ -513,7 +513,7 @@ export function bindActions() {
   });
 
   on('btn-gl-modified', () => {
-    postJson('/api/update', { targets: ['tag:modified'] });
+    postJson('/api/update_by_tag', { tags: ['modified'], exclusion_tags: [] });
   });
 
   on('btn-send', () => {

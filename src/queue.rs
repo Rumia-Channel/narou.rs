@@ -64,6 +64,8 @@ pub struct QueueState {
 pub(crate) struct QueueExecutionSpec {
     pub cmd: String,
     pub args: Vec<String>,
+    #[serde(default)]
+    pub meta: Mapping,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +128,7 @@ impl StoredQueueJob {
         QueueExecutionSpec {
             cmd: self.legacy.cmd.clone(),
             args: flatten_values(&self.legacy.args),
+            meta: self.legacy.meta.clone(),
         }
     }
 }

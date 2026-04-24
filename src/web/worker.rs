@@ -5,6 +5,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde_yaml::Value;
 use tokio::task::JoinHandle;
 
 use super::push::PushServer;
@@ -13,7 +14,7 @@ use crate::compat::{
 };
 use crate::db::with_database_mut;
 use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
-use crate::queue::{JobType, PersistentQueue, QueueJob, QueueLane};
+use crate::queue::{JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane};
 
 const WEBUI_UPDATE_START_PREFIX: &str = "__webui_update_start__=";
 const MAX_FAILURE_DETAIL_LINES: usize = 8;
@@ -196,16 +197,24 @@ fn execute_job(
         };
     };
 
-    let mut command = std::process::Command::new(&exe);
-    command
-        .current_dir(root_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_web_subprocess_command(&mut command);
-    command.env(WEB_PROGRESS_SCOPE_ENV, &job.id);
+    let spec = queue.execution_spec(&job.id);
+    if let Some(spec) = spec.as_ref()
+        && spec.cmd == "update_general_lastup"
+    {
+        return execute_update_general_lastup_job(
+            root_dir,
+            &exe,
+            spec,
+            push_server,
+            running_pids,
+            &job.id,
+            target_console,
+        );
+    }
 
-    if let Some(spec) = queue.execution_spec(&job.id) {
+    let mut command = new_web_subprocess_command(&exe, root_dir, &job.id);
+
+    if let Some(spec) = spec {
         match spec.cmd.as_str() {
             "download" => {
                 command.arg("download");
@@ -221,10 +230,6 @@ fn execute_job(
             }
             "update" | "update_by_tag" => {
                 command.arg("update");
-                append_update_args(&mut command, push_server, target_console, &spec.args);
-            }
-            "update_general_lastup" => {
-                command.arg("update").arg("--gl");
                 append_update_args(&mut command, push_server, target_console, &spec.args);
             }
             "convert" => {
@@ -362,6 +367,62 @@ fn execute_job(
         }
     }
     spawn_and_stream_command(command, push_server, running_pids, &job.id, target_console)
+}
+
+fn new_web_subprocess_command(exe: &Path, root_dir: &Path, job_id: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(exe);
+    command
+        .current_dir(root_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_web_subprocess_command(&mut command);
+    command.env(WEB_PROGRESS_SCOPE_ENV, job_id);
+    command
+}
+
+fn execution_spec_meta_bool(spec: &QueueExecutionSpec, key: &str) -> bool {
+    match spec.meta.get(Value::String(key.to_string())) {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) => matches!(value.as_str(), "1" | "true" | "yes" | "on"),
+        _ => false,
+    }
+}
+
+fn refresh_web_state(push_server: &Arc<PushServer>) {
+    if let Err(e) = with_database_mut(|db| db.refresh()) {
+        push_server.broadcast_error(&format!("DB更新エラー: {}", e));
+    }
+    push_server.broadcast_event("table.reload", "");
+    push_server.broadcast_event("tag.updateCanvas", "");
+}
+
+fn execute_update_general_lastup_job(
+    root_dir: &Path,
+    exe: &Path,
+    spec: &QueueExecutionSpec,
+    push_server: &Arc<PushServer>,
+    running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    job_id: &str,
+    target_console: &str,
+) -> JobRunResult {
+    let mut command = new_web_subprocess_command(exe, root_dir, job_id);
+    command.arg("update").arg("--gl");
+    append_update_args(&mut command, push_server, target_console, &spec.args);
+    let result = spawn_and_stream_command(command, push_server, running_pids, job_id, target_console);
+    if !result.success || !execution_spec_meta_bool(spec, "update_modified") {
+        return result;
+    }
+
+    refresh_web_state(push_server);
+    push_server.broadcast_echo(
+        "<span style=\"color:#d7ba7d\">modified タグの付いた小説を更新します</span>",
+        target_console,
+    );
+
+    let mut followup = new_web_subprocess_command(exe, root_dir, job_id);
+    followup.arg("update").arg("tag:modified");
+    spawn_and_stream_command(followup, push_server, running_pids, job_id, target_console)
 }
 
 fn append_update_args(
@@ -591,8 +652,8 @@ fn parse_convert_job_target(value: &str) -> (&str, Option<&str>) {
 mod tests {
     use super::{
         MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, clear_progress_for_job,
-        console_target_for_job, parse_convert_job_target, remember_failure_line,
-        route_structured_web_message, summarize_failure_details,
+        console_target_for_job, execution_spec_meta_bool, parse_convert_job_target,
+        remember_failure_line, route_structured_web_message, summarize_failure_details,
     };
     use crate::queue::JobType;
 
@@ -662,5 +723,33 @@ mod tests {
         assert!(targets.contains(&"stdout2"));
         assert_eq!(first["data"]["scope"], "job-123");
         assert_eq!(second["data"]["scope"], "job-123");
+    }
+
+    #[test]
+    fn execution_spec_meta_bool_accepts_boolean_and_string_values() {
+        let mut bool_meta = serde_yaml::Mapping::new();
+        bool_meta.insert(
+            serde_yaml::Value::String("update_modified".to_string()),
+            serde_yaml::Value::Bool(true),
+        );
+        let bool_spec = crate::queue::QueueExecutionSpec {
+            cmd: "update_general_lastup".to_string(),
+            args: Vec::new(),
+            meta: bool_meta,
+        };
+        assert!(execution_spec_meta_bool(&bool_spec, "update_modified"));
+
+        let mut string_meta = serde_yaml::Mapping::new();
+        string_meta.insert(
+            serde_yaml::Value::String("update_modified".to_string()),
+            serde_yaml::Value::String("true".to_string()),
+        );
+        let string_spec = crate::queue::QueueExecutionSpec {
+            cmd: "update_general_lastup".to_string(),
+            args: Vec::new(),
+            meta: string_meta,
+        };
+        assert!(execution_spec_meta_bool(&string_spec, "update_modified"));
+        assert!(!execution_spec_meta_bool(&string_spec, "missing"));
     }
 }
