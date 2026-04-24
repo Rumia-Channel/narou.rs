@@ -34,8 +34,7 @@ export function renderNovelList() {
   const tbody = El.novelListBody;
   if (!tbody) return;
 
-  const filtered = getFilteredNovels();
-  const sorted = sortNovels(filtered);
+  const sorted = getFilteredSortedNovels();
   const pageLength = normalizePageLength(State.pageLength);
   const totalCount = sorted.length;
   const totalPages = pageLength === -1 ? 1 : Math.max(1, Math.ceil(totalCount / pageLength));
@@ -149,6 +148,10 @@ function getFilteredNovels() {
   }
 
   return list;
+}
+
+function getFilteredSortedNovels() {
+  return sortNovels(getFilteredNovels());
 }
 
 function splitFilterGroups(query) {
@@ -713,6 +716,31 @@ export function selectAll() {
 export function clearSelection() {
   State.selectedIds.clear();
   syncSelectionClasses();
+}
+
+export function getSelectedIdsInDisplayOrder() {
+  const orderedIds = [];
+  const seen = new Set();
+  for (const novel of getFilteredSortedNovels()) {
+    const id = String(novel.id);
+    if (!State.selectedIds.has(id)) continue;
+    orderedIds.push(id);
+    seen.add(id);
+  }
+  for (const id of State.selectedIds) {
+    if (seen.has(id)) continue;
+    orderedIds.push(id);
+  }
+  return orderedIds;
+}
+
+export function pruneSelectedIdsToCurrentList() {
+  const visibleIds = new Set(getFilteredNovels().map(novel => String(novel.id)));
+  for (const id of [...State.selectedIds]) {
+    if (!visibleIds.has(id)) {
+      State.selectedIds.delete(id);
+    }
+  }
 }
 
 function updateSelectionBadge() {

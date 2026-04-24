@@ -101,6 +101,13 @@ pub(crate) fn request_sort_state(
     sort_state.and_then(normalize_current_sort_request)
 }
 
+pub(crate) fn request_preserves_input_order(
+    sort_state: Option<&serde_json::Value>,
+    timestamp: Option<u64>,
+) -> bool {
+    timestamp.is_some() && request_sort_state(sort_state, timestamp).is_none()
+}
+
 pub(crate) fn requested_or_current_sort_state(
     sort_state: Option<&serde_json::Value>,
     timestamp: Option<u64>,
@@ -151,6 +158,9 @@ pub(crate) fn sort_ids_for_request(
     sort_state: Option<&serde_json::Value>,
     timestamp: Option<u64>,
 ) -> Vec<i64> {
+    if request_preserves_input_order(sort_state, timestamp) {
+        return ids.to_vec();
+    }
     let sort_state = requested_or_current_sort_state(sort_state, timestamp);
     with_database(|db| {
         let mut records: Vec<_> = ids.iter().filter_map(|id| db.get(*id)).collect();
@@ -201,7 +211,7 @@ mod tests {
     use super::{
         DEFAULT_CURRENT_SORT_COLUMN, DEFAULT_CURRENT_SORT_DIR, CurrentSortState,
         current_sort_from_server_setting, default_current_sort_state, normalize_current_sort_request,
-        request_sort_state, sort_records,
+        request_preserves_input_order, request_sort_state, sort_records,
     };
     use crate::db::NovelRecord;
     use chrono::{TimeZone, Utc};
@@ -288,6 +298,20 @@ mod tests {
                 dir: "desc".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn timestamp_without_supported_sort_preserves_input_order() {
+        assert!(request_preserves_input_order(None, Some(123)));
+        assert!(request_preserves_input_order(
+            Some(&serde_json::json!({ "column": "average_length", "dir": "desc" })),
+            Some(123)
+        ));
+        assert!(!request_preserves_input_order(
+            Some(&serde_json::json!({ "column": 2, "dir": "desc" })),
+            Some(123)
+        ));
+        assert!(!request_preserves_input_order(None, None));
     }
 
     #[test]
