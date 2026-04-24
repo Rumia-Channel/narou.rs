@@ -70,6 +70,9 @@
   /* Status indicators */
   --new-arrival-color: #e478e1;
   --new-update-color: green;
+  --hint-new-arrival-dot-size: 0.85em;
+  --hint-new-arrival-dot-top: -0.50em;
+  --hint-new-arrival-dot-left: -0.05em;
   --gl-1h-bg: #d9534f;
   --gl-6h-bg: #5cb85c;
   --gl-24h-bg: #5487d9;

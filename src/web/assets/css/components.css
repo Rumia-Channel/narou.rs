@@ -491,8 +491,10 @@ li.enable-selected.disabled a {
   content: "●";
   color: var(--new-arrival-color);
   opacity: 0.6;
-  top: -0.35em;
-  left: -0.05em;
+  top: var(--hint-new-arrival-dot-top);
+  left: var(--hint-new-arrival-dot-left);
+  font-size: var(--hint-new-arrival-dot-size);
+  line-height: 1;
 }
 
 /* narou.rb parity: general-lastup time-ago pill is injected via pseudo-element
