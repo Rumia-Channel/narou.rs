@@ -16,7 +16,10 @@ use crate::downloader::{Downloader, TargetType};
 use crate::queue::{JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane};
 
 use super::AppState;
-use super::sort_state::{current_sort_from_server_setting, sort_column_label};
+use super::sort_state::{
+    CurrentSortState, current_sort_from_server_setting, default_current_sort_state, sort_column_key,
+    sort_column_label,
+};
 use super::state::{
     ApiResponse, ConfirmRunningTasksBody, ConvertBody, CsvImportBody, DiffBody, DiffCleanBody,
     DownloadBody, ReorderBody, TagInfoBody, TargetsBody, TaskIdBody, UpdateBody, UpdateByTagBody,
@@ -197,6 +200,68 @@ fn queue_lane_sizes(queue: &PersistentQueue) -> [usize; 2] {
         queue.pending_count_for_lane(QueueLane::Secondary)
             + queue.running_count_for_lane(QueueLane::Secondary),
     ]
+}
+
+fn sort_records_for_web_update(records: &mut Vec<&crate::db::NovelRecord>, sort_state: &CurrentSortState) {
+    let sort_key = sort_column_key(sort_state).unwrap_or("id");
+    let reverse = sort_state.dir == "desc";
+    records.sort_by(|a, b| {
+        let ordering = match sort_key {
+            "id" => a.id.cmp(&b.id),
+            "title" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+            "author" => a.author.to_lowercase().cmp(&b.author.to_lowercase()),
+            "last_update" => a.last_update.cmp(&b.last_update),
+            "general_lastup" => a
+                .general_lastup
+                .unwrap_or_default()
+                .cmp(&b.general_lastup.unwrap_or_default()),
+            "last_check_date" => a
+                .last_check_date
+                .unwrap_or_default()
+                .cmp(&b.last_check_date.unwrap_or_default()),
+            "sitename" => a.sitename.cmp(&b.sitename),
+            "novel_type" => a.novel_type.cmp(&b.novel_type),
+            "general_all_no" => a
+                .general_all_no
+                .unwrap_or(0)
+                .cmp(&b.general_all_no.unwrap_or(0)),
+            "length" => a.length.unwrap_or(0).cmp(&b.length.unwrap_or(0)),
+            _ => a.id.cmp(&b.id),
+        };
+        if reverse { ordering.reverse() } else { ordering }
+    });
+}
+
+fn current_web_update_sort_state() -> CurrentSortState {
+    let sort_state = (|| {
+        let inv = crate::db::inventory::Inventory::with_default_root().ok()?;
+        let server_setting: serde_yaml::Value = inv
+            .load(
+                "server_setting",
+                crate::db::inventory::InventoryScope::Global,
+            )
+            .ok()?;
+        current_sort_from_server_setting(&server_setting)
+    })();
+    sort_state.unwrap_or_else(default_current_sort_state)
+}
+
+fn sorted_update_all_ids() -> Vec<String> {
+    let sort_state = current_web_update_sort_state();
+    with_database(|db| {
+        let mut records: Vec<_> = db.all_records().values().collect();
+        sort_records_for_web_update(&mut records, &sort_state);
+        Ok(records.into_iter().map(|record| record.id.to_string()).collect())
+    })
+    .unwrap_or_default()
+}
+
+fn build_webui_update_start_message(is_update_all: bool, count: usize, sort_display: &str) -> String {
+    if is_update_all {
+        format!("全ての小説の更新を開始します（{}件を{}で処理）", count, sort_display)
+    } else {
+        format!("更新を開始します（{}件を{}で処理）", count, sort_display)
+    }
 }
 
 fn queue_download_jobs(
@@ -576,7 +641,8 @@ pub async fn api_update(
     State(state): State<AppState>,
     Json(body): Json<UpdateBody>,
 ) -> Json<serde_json::Value> {
-    let targets = match normalize_update_targets(&targets_to_strings(&body.targets)) {
+    let raw_targets = targets_to_strings(&body.targets);
+    let targets = match normalize_update_targets(&raw_targets) {
         Ok(targets) => targets,
         Err(message) => {
             return serde_json::json!({
@@ -594,21 +660,14 @@ pub async fn api_update(
     // e.g. [] → update all (empty target)
     let has_flags = targets.iter().any(|t| t.starts_with("--"));
 
-    let is_update_all = targets.is_empty();
+    let is_update_all = body.update_all || targets.is_empty();
     let count;
     let combined = if has_flags {
         count = 1;
         targets.join("\t")
     } else {
         let mut args = if is_update_all {
-            with_database(|db| {
-                Ok(db
-                    .ids()
-                    .into_iter()
-                    .map(|id| id.to_string())
-                    .collect::<Vec<_>>())
-            })
-            .unwrap_or_default()
+            sorted_update_all_ids()
         } else {
             targets.clone()
         };
@@ -626,14 +685,7 @@ pub async fn api_update(
             args.insert(0, "--force".to_string());
         }
         let sort_display = current_sort_display_string();
-        let start_message = if is_update_all {
-            format!(
-                "全ての小説の更新を開始します（{}件を{}で処理）",
-                count, sort_display
-            )
-        } else {
-            format!("更新を開始します（{}件を{}で処理）", count, sort_display)
-        };
+        let start_message = build_webui_update_start_message(is_update_all, count, &sort_display);
         let mut parts = Vec::with_capacity(args.len() + 1);
         parts.push(format!("{}{}", WEBUI_UPDATE_START_PREFIX, start_message));
         parts.extend(args);
@@ -2162,15 +2214,48 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::Arc;
 
+    use chrono::{TimeZone, Utc};
+    use crate::db::NovelRecord;
     use crate::queue::{JobType, PersistentQueue, QueueJob};
+    use crate::web::sort_state::CurrentSortState;
 
     use super::{
-        broadcast_captured_web_output, encode_convert_job_target, existing_update_job_id,
-        format_general_lastup_queue_target, format_update_queue_target, normalize_update_targets,
-        push_update_job_if_needed, queue_lane_sizes, reboot_args_with_no_browser,
-        restorable_tasks_available, tag_color_class, validate_diff_number, validate_download_targets,
-        validate_general_lastup_option,
+        broadcast_captured_web_output, build_webui_update_start_message, encode_convert_job_target,
+        existing_update_job_id, format_general_lastup_queue_target, format_update_queue_target,
+        normalize_update_targets, push_update_job_if_needed, queue_lane_sizes,
+        reboot_args_with_no_browser, restorable_tasks_available, sort_records_for_web_update,
+        tag_color_class, validate_diff_number, validate_download_targets, validate_general_lastup_option,
     };
+
+    fn sample_record(id: i64, general_lastup_ts: i64) -> NovelRecord {
+        NovelRecord {
+            id,
+            author: format!("author-{id}"),
+            title: format!("title-{id}"),
+            file_title: format!("file-{id}"),
+            toc_url: format!("https://example.com/{id}/"),
+            sitename: "site".to_string(),
+            novel_type: 1,
+            end: false,
+            last_update: Utc.timestamp_opt(1_700_000_000 + id, 0).unwrap(),
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: None,
+            general_lastup: Some(Utc.timestamp_opt(general_lastup_ts, 0).unwrap()),
+            last_mail_date: None,
+            tags: Vec::new(),
+            ncode: None,
+            domain: None,
+            general_all_no: Some(id),
+            length: Some(id),
+            suspend: false,
+            is_narou: true,
+            last_check_date: None,
+            convert_failure: false,
+            extra_fields: Default::default(),
+        }
+    }
 
     #[test]
     fn encode_convert_job_target_omits_default_override() {
@@ -2228,6 +2313,37 @@ mod tests {
         queue.push(JobType::Convert, "2").unwrap();
 
         assert_eq!(queue_lane_sizes(&queue), [1, 1]);
+    }
+
+    #[test]
+    fn sort_records_for_web_update_matches_general_lastup_descending() {
+        let first = sample_record(1, 1_700_000_100);
+        let second = sample_record(2, 1_700_000_300);
+        let third = sample_record(3, 1_700_000_200);
+        let sort_state = CurrentSortState {
+            column: 2,
+            dir: "desc".to_string(),
+        };
+        let mut records = vec![&first, &second, &third];
+
+        sort_records_for_web_update(&mut records, &sort_state);
+
+        assert_eq!(
+            records.into_iter().map(|record| record.id).collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+    }
+
+    #[test]
+    fn update_start_message_uses_all_novels_label_for_update_all() {
+        assert_eq!(
+            build_webui_update_start_message(true, 1, "最新話掲載日降順"),
+            "全ての小説の更新を開始します（1件を最新話掲載日降順で処理）"
+        );
+        assert_eq!(
+            build_webui_update_start_message(false, 1, "最新話掲載日降順"),
+            "更新を開始します（1件を最新話掲載日降順で処理）"
+        );
     }
 
     #[test]

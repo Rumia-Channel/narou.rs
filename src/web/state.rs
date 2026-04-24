@@ -83,9 +83,12 @@ pub struct DownloadBody {
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateBody {
+    #[serde(default)]
     pub targets: Vec<serde_json::Value>,
     #[serde(default)]
     pub force: bool,
+    #[serde(default)]
+    pub update_all: bool,
 }
 
 #[derive(Debug, Deserialize)]

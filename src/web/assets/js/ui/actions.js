@@ -402,7 +402,7 @@ export function bindActions() {
     if (State.selectedIds.size > 0) {
       postJson('/api/update', { targets: [...State.selectedIds] });
     } else {
-      postJson('/api/update', { targets: [] });
+      postJson('/api/update', { update_all: true });
     }
   });
 
@@ -501,7 +501,7 @@ export function bindActions() {
   });
 
   on('action-update-force', () => {
-    postJson('/api/update', { targets: [], force: true });
+    postJson('/api/update', { update_all: true, force: true });
   });
 
   on('btn-gl-narou', () => {
