@@ -2098,7 +2098,7 @@ dependencies = [
 
 [[package]]
 name = "narou_rs"
-version = "0.1.18-beta"
+version = "0.1.19-beta"
 dependencies = [
  "askama",
  "axum",
