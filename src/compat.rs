@@ -69,26 +69,6 @@ pub fn terminate_process(pid: u32) -> io::Result<()> {
     terminate_process_tree(pid)
 }
 
-fn descendant_pids_from_parent_pairs(root_pid: u32, parent_pairs: &[(u32, u32)]) -> Vec<u32> {
-    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
-    for &(pid, parent_pid) in parent_pairs {
-        children_by_parent.entry(parent_pid).or_default().push(pid);
-    }
-    for children in children_by_parent.values_mut() {
-        children.sort_unstable();
-    }
-
-    let mut descendants = Vec::new();
-    let mut stack = children_by_parent.remove(&root_pid).unwrap_or_default();
-    while let Some(pid) = stack.pop() {
-        descendants.push(pid);
-        if let Some(mut children) = children_by_parent.remove(&pid) {
-            stack.append(&mut children);
-        }
-    }
-    descendants
-}
-
 #[cfg(unix)]
 fn terminate_process_tree(pid: u32) -> io::Result<()> {
     let pid = i32::try_from(pid)
@@ -116,95 +96,13 @@ fn terminate_process_tree(pid: u32) -> io::Result<()> {
 
 #[cfg(windows)]
 fn terminate_process_tree(pid: u32) -> io::Result<()> {
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    };
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-        TH32CS_SNAPPROCESS,
-    };
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
-        WaitForSingleObject,
-    };
-
-    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
-
-    fn terminate_single_process(pid: u32) -> io::Result<()> {
-        unsafe {
-            let handle: HANDLE = OpenProcess(
-                PROCESS_TERMINATE | SYNCHRONIZE_ACCESS | PROCESS_QUERY_LIMITED_INFORMATION,
-                0,
-                pid,
-            );
-            if handle.is_null() {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
-                    return Ok(());
-                }
-                return Err(err);
-            }
-
-            let terminate_result = TerminateProcess(handle, 1);
-            if terminate_result == 0 {
-                let err = io::Error::last_os_error();
-                let _ = CloseHandle(handle);
-                if err.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
-                    return Ok(());
-                }
-                return Err(err);
-            }
-
-            let wait_result = WaitForSingleObject(handle, 2_000);
-            let _ = CloseHandle(handle);
-            if wait_result == WAIT_OBJECT_0 {
-                Ok(())
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for process exit",
-                ))
-            }
-        }
-    }
-
-    fn snapshot_process_parent_pairs() -> io::Result<Vec<(u32, u32)>> {
-        unsafe {
-            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snapshot == INVALID_HANDLE_VALUE {
-                return Err(io::Error::last_os_error());
-            }
-
-            let mut entry = PROCESSENTRY32W {
-                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-                ..Default::default()
-            };
-            let mut parent_pairs = Vec::new();
-
-            if Process32FirstW(snapshot, &mut entry) != 0 {
-                loop {
-                    parent_pairs.push((entry.th32ProcessID, entry.th32ParentProcessID));
-                    if Process32NextW(snapshot, &mut entry) == 0 {
-                        break;
-                    }
-                }
-            }
-
-            let _ = CloseHandle(snapshot);
-            Ok(parent_pairs)
-        }
-    }
-
-    if let Ok(parent_pairs) = snapshot_process_parent_pairs() {
-        for child_pid in descendant_pids_from_parent_pairs(pid, &parent_pairs)
-            .into_iter()
-            .rev()
-        {
-            terminate_single_process(child_pid)?;
-        }
-    }
-
-    terminate_single_process(pid)
+    let mut command = Command::new("taskkill");
+    command
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    configure_hidden_console_command(&mut command);
+    command.status().map(|_| ())
 }
 
 pub fn sanitize_java_command(command: &mut Command) -> &mut Command {
@@ -859,8 +757,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        NovelLockGuard, configure_web_subprocess_command, descendant_pids_from_parent_pairs,
-        get_copy_to_directory,
+        NovelLockGuard, configure_web_subprocess_command, get_copy_to_directory,
         load_frozen_ids_from_inventory,
         load_locked_ids_from_inventory, record_is_frozen, reroute_web_line_to_console,
         sanitize_backup_name, terminate_process,
@@ -938,15 +835,6 @@ mod tests {
     #[test]
     fn terminate_process_treats_missing_pid_as_success() {
         assert!(terminate_process(i32::MAX as u32).is_ok());
-    }
-
-    #[test]
-    fn descendant_pid_collection_finds_nested_children() {
-        let descendants = descendant_pids_from_parent_pairs(
-            10,
-            &[(11, 10), (12, 10), (13, 11), (14, 13), (90, 1)],
-        );
-        assert_eq!(descendants, vec![12, 11, 13, 14]);
     }
 
     #[test]
