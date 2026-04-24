@@ -91,7 +91,7 @@ const ELEMENT_IDS = [
   'queue-restore-modal', 'queue-restore-yes', 'queue-restore-no',
   'tag-list-canvas',
   'tag-edit-modal', 'tag-edit-close', 'tag-edit-cancel',
-  'tag-editor-current', 'new-tag-input', 'add-tag-button',
+  'tag-editor-summary', 'tag-editor-current', 'new-tag-input', 'add-tag-button',
   'tag-suggestions',
   'about-modal', 'about-close', 'about-ok', 'about-version',
   'about-latest-version', 'about-check-latest',

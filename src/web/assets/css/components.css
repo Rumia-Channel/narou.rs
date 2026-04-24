@@ -588,6 +588,13 @@ li.enable-selected.disabled a {
 }
 
 /* ========== Tag Editor ========== */
+.tag-editor-summary {
+  margin: 0 0 0.80em;
+  color: var(--text-muted);
+  font-size: 0.90em;
+  line-height: 1.5;
+}
+
 .tag-editor-current {
   display: flex;
   flex-wrap: wrap;
@@ -596,9 +603,25 @@ li.enable-selected.disabled a {
   min-height: 2em;
 }
 
+.tag-editor-empty {
+  color: var(--text-muted);
+  font-size: 0.90em;
+}
+
 .tag-editable {
   position: relative;
   padding-right: 1.40em;
+}
+
+.tag-editable-partial {
+  outline: 0.05em dashed var(--border-color);
+  outline-offset: 0.05em;
+}
+
+.tag-edit-count {
+  margin-left: 0.35em;
+  font-size: 0.85em;
+  opacity: 0.80;
 }
 
 .tag-remove {

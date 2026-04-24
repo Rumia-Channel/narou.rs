@@ -19,6 +19,15 @@ import {
 
 const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
 let tagSuggestionIndex = -1;
+const TAG_COLOR_MAP = {
+  green: 'tag-green',
+  yellow: 'tag-yellow',
+  blue: 'tag-blue',
+  magenta: 'tag-magenta',
+  cyan: 'tag-cyan',
+  red: 'tag-red',
+  white: 'tag-white',
+};
 const SORT_STATE_COLUMN_INDEX = {
   id: 0,
   last_update: 1,
@@ -910,47 +919,29 @@ function closeTagEditor() {
   El.tagEditModal?.classList.add('hide');
 }
 
-function openTagEditor(ids) {
+async function openTagEditor(ids) {
   const targetIds = ids || requireSelectedIds();
   if (!targetIds || targetIds.length === 0) return;
 
   El.tagEditModal?.classList.remove('hide');
   El.tagEditModal.dataset.ids = JSON.stringify(targetIds);
-
-  // Show current tags of first selected novel
-  const firstId = targetIds[0];
-  const novel = State.novels.find(n => String(n.id) === String(firstId));
-  const currentTags = novel?.tags || [];
-
-  const container = El.tagEditorCurrent;
-  if (container) {
-    container.innerHTML = '';
-    for (const tag of currentTags) {
-      const span = document.createElement('span');
-      span.className = 'tag-label tag-default tag-editable';
-      span.dataset.tag = tag;
-      span.textContent = tag;
-      const removeBtn = document.createElement('span');
-      removeBtn.className = 'tag-remove';
-      removeBtn.textContent = '×';
-      removeBtn.addEventListener('click', async () => {
-        for (const id of targetIds) {
-          await postJson(`/api/novels/${id}/tags/remove`, { tags: [tag] });
-        }
-        span.remove();
-        await refreshList();
-        await refreshTags();
-      });
-      span.appendChild(removeBtn);
-      container.appendChild(span);
-    }
-  }
+  El.tagEditModal.dataset.selectedCount = String(targetIds.length);
+  renderTagEditorSummary(targetIds.length, { loading: true });
+  renderTagEditorTags(targetIds, []);
 
   if (El.newTagInput) {
     El.newTagInput.value = '';
     El.newTagInput.focus();
   }
   hideTagSuggestions();
+
+  try {
+    await refreshTagEditor(targetIds);
+  } catch (error) {
+    renderTagEditorSummary(targetIds.length, { error: true });
+    renderTagEditorTags(targetIds, []);
+    showNotification(error.message || 'タグ情報の取得に失敗しました', 'error');
+  }
 }
 
 async function addTagFromInput() {
@@ -961,18 +952,18 @@ async function addTagFromInput() {
 
   const idsJson = El.tagEditModal?.dataset.ids;
   const ids = idsJson ? JSON.parse(idsJson) : [...State.selectedIds];
+  const states = Object.fromEntries(tags.map(tag => [tag, 2]));
 
-  for (const id of ids) {
-    await postJson(`/api/novels/${id}/tags`, { tags });
+  try {
+    await applyBulkTagEdit(ids, states, 'タグの追加に失敗しました');
+    input.value = '';
+    hideTagSuggestions();
+    await refreshList();
+    await refreshTags();
+    await refreshTagEditor(ids);
+  } catch (error) {
+    showNotification(error.message || 'タグの追加に失敗しました', 'error');
   }
-
-  input.value = '';
-  hideTagSuggestions();
-  await refreshList();
-  await refreshTags();
-
-  // Re-open to refresh display
-  openTagEditor(ids);
 }
 
 function splitTagInput(value) {
@@ -1084,9 +1075,121 @@ function hideTagSuggestions() {
 function getCurrentEditorTags() {
   const tags = new Set();
   El.tagEditorCurrent?.querySelectorAll('.tag-editable[data-tag]').forEach(el => {
-    if (el.dataset.tag) tags.add(el.dataset.tag);
+    const presentCount = Number.parseInt(el.dataset.presentCount || '0', 10);
+    const selectedCount = Number.parseInt(el.dataset.selectedCount || '1', 10);
+    if (el.dataset.tag && presentCount >= selectedCount) {
+      tags.add(el.dataset.tag);
+    }
   });
   return tags;
+}
+
+async function refreshTagEditor(ids) {
+  const selectionCount = ids.length;
+  const taginfo = await postJson('/api/taginfo.json', {
+    ids,
+    ...currentSortStatePayload(),
+  });
+  const selectedTagInfo = Array.isArray(taginfo)
+    ? taginfo.filter(info => Number(info?.count || 0) > 0)
+    : [];
+  renderTagEditorSummary(selectionCount);
+  renderTagEditorTags(ids, selectedTagInfo);
+}
+
+function renderTagEditorSummary(selectionCount, options = {}) {
+  if (!El.tagEditorSummary) return;
+  if (options.loading) {
+    El.tagEditorSummary.textContent = 'タグ情報を読み込み中です...';
+    return;
+  }
+  if (options.error) {
+    El.tagEditorSummary.textContent =
+      selectionCount > 1
+        ? `${selectionCount}件選択中。追加・削除は選択中すべてに反映されます。`
+        : 'この小説のタグを編集できます。';
+    return;
+  }
+  El.tagEditorSummary.textContent =
+    selectionCount > 1
+      ? `${selectionCount}件選択中。表示中のタグは付与済み件数を n/${selectionCount} で示し、追加・削除は選択中すべてに反映されます。`
+      : 'この小説の現在のタグです。';
+}
+
+function renderTagEditorTags(ids, taginfo) {
+  const container = El.tagEditorCurrent;
+  if (!container) return;
+  const selectionCount = ids.length;
+  container.innerHTML = '';
+
+  if (!Array.isArray(taginfo) || taginfo.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'tag-editor-empty';
+    empty.textContent =
+      selectionCount > 1
+        ? '選択中の小説に付いているタグはありません。下の入力欄から追加できます。'
+        : 'この小説にはタグがありません。下の入力欄から追加できます。';
+    container.appendChild(empty);
+    return;
+  }
+
+  taginfo.forEach(info => {
+    if (!info?.tag) return;
+    const presentCount = Number(info.count || 0);
+    const chip = document.createElement('span');
+    chip.className = `tag-label ${tagColorClass(info.tag)} tag-editable`;
+    if (selectionCount > 1 && presentCount < selectionCount) {
+      chip.classList.add('tag-editable-partial');
+    }
+    chip.dataset.tag = info.tag;
+    chip.dataset.presentCount = String(presentCount);
+    chip.dataset.selectedCount = String(selectionCount);
+    chip.textContent = info.tag;
+
+    if (selectionCount > 1) {
+      const count = document.createElement('span');
+      count.className = 'tag-edit-count';
+      count.textContent = ` ${presentCount}/${selectionCount}`;
+      chip.appendChild(count);
+    }
+
+    const removeBtn = document.createElement('span');
+    removeBtn.className = 'tag-remove';
+    removeBtn.textContent = '×';
+    removeBtn.title =
+      selectionCount > 1
+        ? `選択中の${selectionCount}件から「${info.tag}」を外す`
+        : `「${info.tag}」を外す`;
+    removeBtn.addEventListener('click', async () => {
+      try {
+        await applyBulkTagEdit(ids, { [info.tag]: 0 }, 'タグの削除に失敗しました');
+        await refreshList();
+        await refreshTags();
+        await refreshTagEditor(ids);
+      } catch (error) {
+        showNotification(error.message || 'タグの削除に失敗しました', 'error');
+      }
+    });
+    chip.appendChild(removeBtn);
+    container.appendChild(chip);
+  });
+}
+
+function tagColorClass(tag) {
+  const colorName = State.tagColors?.[tag] || 'default';
+  return TAG_COLOR_MAP[colorName] || 'tag-default';
+}
+
+async function applyBulkTagEdit(ids, states, fallbackMessage) {
+  const result = await postJson('/api/edit_tag', {
+    ids,
+    states,
+    ...currentSortStatePayload(),
+  });
+  if (!result || result.success !== true) {
+    throw new Error(result?.error || result?.message || fallbackMessage);
+  }
+  return result;
 }
 
 function getActiveTagFragment(value) {
