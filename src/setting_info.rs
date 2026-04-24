@@ -120,7 +120,10 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "user-agent" => Some("detail"),
 
         // local → webui
-        "webui.theme" | "webui.table.reload-timing" | "webui.performance-mode" => Some("webui"),
+        "webui.theme"
+        | "webui.table.reload-timing"
+        | "webui.performance-mode"
+        | "webui.debug-mode" => Some("webui"),
 
         // global → global
         "difftool"
@@ -492,6 +495,12 @@ mod tests {
                 .is_some()
         );
     }
+
+    #[test]
+    fn webui_debug_mode_is_visible_on_webui_tab() {
+        assert_eq!(tab_for_setting("webui.debug-mode"), Some("webui"));
+        assert!(setting_variables().get("webui.debug-mode").is_some());
+    }
 }
 
 /// Local setting variable metadata
@@ -831,6 +840,13 @@ pub fn setting_variables() -> SettingVariables {
             sel(
                 "パフォーマンスモードを設定。autoの場合は小説数2000件以上で自動的に有効になります",
                 vec!["auto", "on", "off"],
+            ),
+        ),
+        (
+            "webui.debug-mode",
+            vis(
+                VarType::Boolean,
+                "WEB UI 上で失敗ジョブの詳細エラー表示を有効にする。ON のときだけ通知とコンソールに詳細を出す",
             ),
         ),
     ];

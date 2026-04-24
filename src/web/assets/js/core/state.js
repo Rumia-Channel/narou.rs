@@ -64,6 +64,7 @@ export const State = {
   // Config from server
   performanceMode: 'auto',
   tableReloadTiming: 'every',
+  debugMode: false,
   wsPort: null,
   theme: lsGet('theme', 'default'),
   pollIntervalSeconds: 600,

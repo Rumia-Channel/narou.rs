@@ -5,7 +5,7 @@ import { State, El, initElements } from './core/state.js';
 import { fetchJson } from './core/http.js';
 import { applyI18n } from './ui/i18n.js';
 import { initDropdowns } from './ui/dropdown.js';
-import { renderNovelList, renderQueueStatus, renderTagList, syncViewChecks } from './ui/render.js';
+import { renderNovelList, renderQueueStatus, renderTagList, showNotification, syncViewChecks } from './ui/render.js';
 import { bindActions, refreshList, refreshQueue, refreshTags } from './ui/actions.js';
 
 let ws = null;
@@ -136,6 +136,7 @@ function applyWebConfig(config) {
   if (config.ws_port) State.wsPort = config.ws_port;
   if (config.performance_mode) State.performanceMode = config.performance_mode;
   if (config.reload_timing) State.tableReloadTiming = config.reload_timing;
+  State.debugMode = Boolean(config.debug_mode);
   setConcurrencyEnabled(Boolean(config.concurrency_enabled));
 }
 
@@ -198,6 +199,7 @@ function handleWsMessage(msg) {
       break;
     case 'queue_failed':
       refreshQueue();
+      notifyQueueFailure(msg.data);
       break;
     case 'shutdown':
       appendConsole('サーバーをシャットダウンしています...');
@@ -244,6 +246,27 @@ function handleWsMessage(msg) {
       console.debug('Unknown WS event:', msg);
       break;
   }
+}
+
+function notifyQueueFailure(data) {
+  const payload = (data && typeof data === 'object') ? data : {};
+  const detail = formatFailureDetail(payload.detail);
+  const baseMessage = detail ? '処理に失敗しました' : '処理に失敗しました。詳細はコンソールを確認してください';
+  if (State.debugMode && detail) {
+    showNotification(`${baseMessage}: ${detail}`, 'error');
+    return;
+  }
+  showNotification(baseMessage, 'error');
+}
+
+function formatFailureDetail(detail) {
+  if (!State.debugMode || typeof detail !== 'string') return '';
+  return detail
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .join(' | ')
+    .slice(0, 320);
 }
 
 function rememberRebootReturnTo() {

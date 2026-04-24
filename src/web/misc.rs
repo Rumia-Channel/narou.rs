@@ -116,6 +116,7 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
         load_local_setting_string("webui.performance-mode").unwrap_or_else(|| "auto".to_string());
     let reload_timing = load_local_setting_string("webui.table.reload-timing")
         .unwrap_or_else(|| "every".to_string());
+    let debug_mode = load_local_setting_bool("webui.debug-mode");
 
     let concurrency_enabled = load_local_setting_bool("concurrency");
 
@@ -123,6 +124,7 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
         "theme": theme,
         "performance_mode": performance_mode,
         "reload_timing": reload_timing,
+        "debug_mode": debug_mode,
         "ws_port": state.ws_port,
         "port": state.port,
         "concurrency_enabled": concurrency_enabled,

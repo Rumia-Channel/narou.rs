@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -8,12 +8,22 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 use super::push::PushServer;
-use crate::compat::{configure_web_subprocess_command, load_local_setting_string};
+use crate::compat::{
+    configure_web_subprocess_command, load_local_setting_bool, load_local_setting_string,
+};
 use crate::db::with_database_mut;
 use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
 use crate::queue::{JobType, PersistentQueue, QueueJob, QueueLane};
 
 const WEBUI_UPDATE_START_PREFIX: &str = "__webui_update_start__=";
+const MAX_FAILURE_DETAIL_LINES: usize = 8;
+const MAX_FAILURE_DETAIL_CHARS: usize = 600;
+
+#[derive(Debug, Clone, Default)]
+struct JobRunResult {
+    success: bool,
+    detail: Option<String>,
+}
 
 #[derive(Clone, Copy)]
 enum WorkerLane {
@@ -73,7 +83,7 @@ fn start_queue_worker_for_lane(
             let ps = Arc::clone(&push_server);
             let pid_ref = Arc::clone(&running_child_pids);
             let queue_for_run = Arc::clone(&queue);
-            let success = tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 execute_job(
                     &root_dir,
                     queue_for_run.as_ref(),
@@ -83,7 +93,7 @@ fn start_queue_worker_for_lane(
                 )
             })
             .await
-            .unwrap_or(false);
+            .unwrap_or_default();
 
             // Refresh in-memory database from disk (subprocess may have modified it)
             if let Err(e) = with_database_mut(|db| db.refresh()) {
@@ -91,12 +101,21 @@ fn start_queue_worker_for_lane(
             }
 
             unregister_running_job(&running_jobs, &job.id);
-            if success {
+            if result.success {
                 let _ = queue.complete(&job.id);
                 push_server.broadcast_event("queue_complete", &job.id);
             } else {
                 let _ = queue.fail(&job.id);
-                push_server.broadcast_event("queue_failed", &job.id);
+                let mut data = serde_json::json!({ "job_id": job.id });
+                if load_local_setting_bool("webui.debug-mode")
+                    && let Some(detail) = result.detail.as_deref()
+                {
+                    data["detail"] = serde_json::Value::String(detail.to_string());
+                }
+                push_server.broadcast_raw(&serde_json::json!({
+                    "type": "queue_failed",
+                    "data": data,
+                }));
             }
             clear_progress_for_job(&push_server, &job.id);
             if should_reload_table_after_job(queue.as_ref(), &running_jobs) {
@@ -155,20 +174,26 @@ fn execute_job(
     job: &QueueJob,
     push_server: &Arc<PushServer>,
     running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
-) -> bool {
+) -> JobRunResult {
     if matches!(job.job_type, JobType::AutoUpdate) {
-        return crate::web::scheduler::execute_auto_update(
+        return JobRunResult {
+            success: crate::web::scheduler::execute_auto_update(
             root_dir,
             Arc::clone(push_server),
             &job.id,
             Arc::clone(running_pids),
-        );
+            ),
+            detail: None,
+        };
     }
 
     let target_console = console_target_for_job(job.job_type);
     let Ok(exe) = std::env::current_exe() else {
         push_server.broadcast_echo("エラー: 実行ファイルパスを取得できません", target_console);
-        return false;
+        return JobRunResult {
+            success: false,
+            detail: Some("エラー: 実行ファイルパスを取得できません".to_string()),
+        };
     };
 
     let mut command = std::process::Command::new(&exe);
@@ -252,7 +277,10 @@ fn execute_job(
             "diff" => {
                 if spec.args.is_empty() {
                     push_server.broadcast_echo("diff task has no arguments", target_console);
-                    return false;
+                    return JobRunResult {
+                        success: false,
+                        detail: Some("diff task has no arguments".to_string()),
+                    };
                 }
                 return execute_diff_job(
                     root_dir,
@@ -282,7 +310,10 @@ fn execute_job(
                     &format!("未対応の復元キューコマンドです: {}", unsupported),
                     target_console,
                 );
-                return false;
+                return JobRunResult {
+                    success: false,
+                    detail: Some(format!("未対応の復元キューコマンドです: {}", unsupported)),
+                };
             }
         }
     } else {
@@ -364,17 +395,24 @@ fn execute_diff_job(
     running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
     job_id: &str,
     target_console: &str,
-) -> bool {
+) -> JobRunResult {
     if args.len() < 2 {
         push_server.broadcast_echo("diff task is missing the diff number", target_console);
-        return false;
+        return JobRunResult {
+            success: false,
+            detail: Some("diff task is missing the diff number".to_string()),
+        };
     }
     let (ids, number) = args.split_at(args.len() - 1);
     let Some(number) = number.first() else {
         push_server.broadcast_echo("diff task is missing the diff number", target_console);
-        return false;
+        return JobRunResult {
+            success: false,
+            detail: Some("diff task is missing the diff number".to_string()),
+        };
     };
     let mut success = true;
+    let mut details = Vec::new();
     for id in ids {
         let mut command = std::process::Command::new(exe);
         command
@@ -389,11 +427,19 @@ fn execute_diff_job(
             .arg(number);
         configure_web_subprocess_command(&mut command);
         command.env(WEB_PROGRESS_SCOPE_ENV, job_id);
-        if !spawn_and_stream_command(command, push_server, running_pids, job_id, target_console) {
+        let result =
+            spawn_and_stream_command(command, push_server, running_pids, job_id, target_console);
+        if !result.success {
             success = false;
+            if let Some(detail) = result.detail {
+                details.push(detail);
+            }
         }
     }
-    success
+    JobRunResult {
+        success,
+        detail: summarize_failure_details(&details),
+    }
 }
 
 fn spawn_and_stream_command(
@@ -402,20 +448,25 @@ fn spawn_and_stream_command(
     running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
     job_id: &str,
     target_console: &str,
-) -> bool {
+) -> JobRunResult {
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             push_server.broadcast_echo(&format!("プロセス起動失敗: {}", e), target_console);
-            return false;
+            return JobRunResult {
+                success: false,
+                detail: Some(format!("プロセス起動失敗: {}", e)),
+            };
         }
     };
 
     running_pids.lock().insert(job_id.to_string(), child.id());
+    let recent_output = Arc::new(parking_lot::Mutex::new(VecDeque::new()));
 
     let stdout = child.stdout.take();
     let ps_out = Arc::clone(push_server);
     let stdout_target_console = target_console.to_string();
+    let stdout_recent = Arc::clone(&recent_output);
     let stdout_thread = std::thread::spawn(move || {
         if let Some(out) = stdout {
             let reader = std::io::BufReader::new(out);
@@ -429,6 +480,7 @@ fn spawn_and_stream_command(
                                 ps_out.broadcast_raw(&routed);
                             }
                         } else {
+                            remember_failure_line(stdout_recent.as_ref(), &text);
                             ps_out.broadcast_echo(&text, &stdout_target_console);
                         }
                     }
@@ -441,12 +493,16 @@ fn spawn_and_stream_command(
     let stderr = child.stderr.take();
     let ps_err = Arc::clone(push_server);
     let stderr_target_console = target_console.to_string();
+    let stderr_recent = Arc::clone(&recent_output);
     let stderr_thread = std::thread::spawn(move || {
         if let Some(err) = stderr {
             let reader = std::io::BufReader::new(err);
             for line in reader.lines() {
                 match line {
-                    Ok(text) => ps_err.broadcast_echo(&text, &stderr_target_console),
+                    Ok(text) => {
+                        remember_failure_line(stderr_recent.as_ref(), &text);
+                        ps_err.broadcast_echo(&text, &stderr_target_console);
+                    }
                     Err(_) => break,
                 }
             }
@@ -457,7 +513,48 @@ fn spawn_and_stream_command(
     running_pids.lock().remove(job_id);
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
-    status
+    JobRunResult {
+        success: status,
+        detail: (!status).then(|| summarize_failure_output(recent_output.as_ref())).flatten(),
+    }
+}
+
+fn remember_failure_line(lines: &parking_lot::Mutex<VecDeque<String>>, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "<hr>" || trimmed.starts_with('\u{2015}') {
+        return;
+    }
+
+    let mut guard = lines.lock();
+    if guard.back().is_some_and(|line| line == trimmed) {
+        return;
+    }
+    guard.push_back(trimmed.to_string());
+    if guard.len() > MAX_FAILURE_DETAIL_LINES {
+        guard.pop_front();
+    }
+}
+
+fn summarize_failure_output(lines: &parking_lot::Mutex<VecDeque<String>>) -> Option<String> {
+    let entries: Vec<String> = lines.lock().iter().cloned().collect();
+    summarize_failure_details(&entries)
+}
+
+fn summarize_failure_details(lines: &[String]) -> Option<String> {
+    let mut text = lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        return None;
+    }
+    if text.chars().count() > MAX_FAILURE_DETAIL_CHARS {
+        text = text.chars().take(MAX_FAILURE_DETAIL_CHARS).collect::<String>();
+        text.push('…');
+    }
+    Some(text)
 }
 
 fn console_target_for_job(job_type: JobType) -> &'static str {
@@ -493,8 +590,9 @@ fn parse_convert_job_target(value: &str) -> (&str, Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_progress_for_job, console_target_for_job, parse_convert_job_target,
-        route_structured_web_message,
+        MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, clear_progress_for_job,
+        console_target_for_job, parse_convert_job_target, remember_failure_line,
+        route_structured_web_message, summarize_failure_details,
     };
     use crate::queue::JobType;
 
@@ -523,6 +621,28 @@ mod tests {
         });
         let routed = route_structured_web_message(message, "stdout2");
         assert_eq!(routed["target_console"], "stdout2");
+    }
+
+    #[test]
+    fn remember_failure_line_deduplicates_and_limits_recent_lines() {
+        let lines = parking_lot::Mutex::new(std::collections::VecDeque::new());
+        remember_failure_line(&lines, "first");
+        remember_failure_line(&lines, "first");
+        for index in 0..MAX_FAILURE_DETAIL_LINES {
+            remember_failure_line(&lines, &format!("line-{index}"));
+        }
+        let collected: Vec<String> = lines.lock().iter().cloned().collect();
+        assert_eq!(collected.len(), MAX_FAILURE_DETAIL_LINES);
+        assert!(!collected.iter().any(|line| line == "first"));
+        assert_eq!(collected.last().map(String::as_str), Some("line-7"));
+    }
+
+    #[test]
+    fn summarize_failure_details_truncates_long_output() {
+        let detail = summarize_failure_details(&[String::from("x".repeat(MAX_FAILURE_DETAIL_CHARS + 10))])
+            .expect("detail");
+        assert!(detail.ends_with('…'));
+        assert!(detail.chars().count() <= MAX_FAILURE_DETAIL_CHARS + 1);
     }
 
     #[test]

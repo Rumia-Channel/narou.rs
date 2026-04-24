@@ -86,6 +86,7 @@ pub fn cmd_update(opts: UpdateOptions) {
         let convert_only_new_arrival = opts.convert_only_new_arrival
             || load_local_setting_bool("update.convert-only-new-arrival");
         let interval_secs = load_setting_float("update.interval", INTERVAL_MIN_SECS);
+        let web_debug_mode = is_web_mode() && load_local_setting_bool("webui.debug-mode");
 
         let stdin_targets = read_targets_from_stdin();
         let merged_ids = merge_cli_and_stdin_targets(opts.ids, stdin_targets);
@@ -234,6 +235,9 @@ pub fn cmd_update(opts: UpdateOptions) {
                     }
                     let title = get_novel_title(id);
                     println!("ID:{}　{} の更新は失敗しました", id, title);
+                    if web_debug_mode {
+                        println!("  Error detail: {}", e);
+                    }
                     mistook += 1;
                 }
             }

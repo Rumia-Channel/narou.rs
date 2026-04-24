@@ -341,7 +341,10 @@ fn build_setting_entry(
 fn is_live_webui_config_name(name: &str) -> bool {
     matches!(
         name,
-        "webui.theme" | "webui.table.reload-timing" | "webui.performance-mode"
+        "webui.theme"
+            | "webui.table.reload-timing"
+            | "webui.performance-mode"
+            | "webui.debug-mode"
     )
 }
 
@@ -704,6 +707,7 @@ mod tests {
         assert!(is_live_webui_config_name("webui.theme"));
         assert!(is_live_webui_config_name("webui.table.reload-timing"));
         assert!(is_live_webui_config_name("webui.performance-mode"));
+        assert!(is_live_webui_config_name("webui.debug-mode"));
         assert!(!is_live_webui_config_name("server-port"));
     }
 }
