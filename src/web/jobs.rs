@@ -113,6 +113,34 @@ fn log_immediate_command_failure(context: &str, output: &std::process::Output) {
     }
 }
 
+fn update_job_requests_modified(meta: &Mapping) -> bool {
+    matches!(
+        meta.get(Value::String("update_modified".to_string())),
+        Some(Value::Bool(true))
+    )
+}
+
+fn update_job_matches_request(
+    queue: &PersistentQueue,
+    job: &QueueJob,
+    target: &str,
+    legacy_cmd: &str,
+    update_modified: bool,
+) -> bool {
+    if !matches!(job.job_type, JobType::Update) || job.target != target {
+        return false;
+    }
+
+    let Some(spec) = queue.execution_spec(&job.id) else {
+        return legacy_cmd != "update_general_lastup" || !update_modified;
+    };
+    if spec.cmd != legacy_cmd {
+        return false;
+    }
+
+    legacy_cmd != "update_general_lastup" || update_job_requests_modified(&spec.meta) == update_modified
+}
+
 fn queue_target_fallback_text(target: &str) -> String {
     target
         .split('\t')
@@ -445,11 +473,13 @@ fn existing_update_job_id(
     queue: &PersistentQueue,
     running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
     target: &str,
+    legacy_cmd: &str,
+    update_modified: bool,
 ) -> Option<String> {
     if let Some(job) = running_jobs
         .lock()
         .iter()
-        .find(|job| matches!(job.job_type, JobType::Update) && job.target == target)
+        .find(|job| update_job_matches_request(queue, job, target, legacy_cmd, update_modified))
     {
         return Some(job.id.clone());
     }
@@ -458,7 +488,7 @@ fn existing_update_job_id(
         .get_running_tasks()
         .into_iter()
         .chain(queue.get_pending_tasks())
-        .find(|job| matches!(job.job_type, JobType::Update) && job.target == target)
+        .find(|job| update_job_matches_request(queue, job, target, legacy_cmd, update_modified))
         .map(|job| job.id)
 }
 
@@ -467,7 +497,8 @@ fn push_update_job_if_needed(
     running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
     target: String,
 ) -> Result<(Vec<String>, bool), String> {
-    if let Some(existing_id) = existing_update_job_id(queue, running_jobs, &target) {
+    if let Some(existing_id) = existing_update_job_id(queue, running_jobs, &target, "update", false)
+    {
         return Ok((vec![existing_id], false));
     }
 
@@ -485,7 +516,10 @@ fn push_update_job_with_legacy_if_needed(
     legacy_args: Vec<Value>,
     meta: Mapping,
 ) -> Result<(Vec<String>, bool), String> {
-    if let Some(existing_id) = existing_update_job_id(queue, running_jobs, &target) {
+    let update_modified = update_job_requests_modified(&meta);
+    if let Some(existing_id) =
+        existing_update_job_id(queue, running_jobs, &target, legacy_cmd, update_modified)
+    {
         return Ok((vec![existing_id], false));
     }
     queue
@@ -928,15 +962,20 @@ pub async fn queue_status(State(state): State<AppState>) -> Json<serde_json::Val
 }
 
 pub async fn queue_clear(State(state): State<AppState>) -> Json<ApiResponse> {
-    match state.queue.clear() {
+    match state.queue.clear_non_running() {
         Ok(_) => {
             state.restore_prompt_pending.store(false, Ordering::Relaxed);
             state
                 .restorable_tasks_available
                 .store(false, Ordering::Relaxed);
+            notify_queue_changed(&state);
             Json(ApiResponse {
                 success: true,
-                message: "Queue cleared".to_string(),
+                message: if state.queue.running_count() > 0 {
+                    "Queue cleared (running tasks kept)".to_string()
+                } else {
+                    "Queue cleared".to_string()
+                },
             })
         }
         Err(e) => Json(ApiResponse {
@@ -1107,7 +1146,7 @@ pub async fn api_inspect(
 
 // POST /api/folder
 pub async fn api_folder(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<TargetsBody>,
 ) -> Json<ApiResponse> {
     let raw_targets = targets_to_strings(&body.targets);
@@ -1135,14 +1174,34 @@ pub async fn api_folder(
     args.extend(&target_refs);
 
     match run_immediate(&args) {
-        Ok(output) => Json(ApiResponse {
-            success: output.status.success(),
-            message: "OK".to_string(),
-        }),
-        Err(e) => Json(ApiResponse {
-            success: false,
-            message: e,
-        }),
+        Ok(output) => {
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                super::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                super::non_external_console_target(),
+            );
+            Json(ApiResponse {
+                success: output.status.success(),
+                message: if output.status.success() {
+                    "OK".to_string()
+                } else {
+                    log_immediate_command_failure("folder", &output);
+                    "folder の実行に失敗しました".to_string()
+                },
+            })
+        }
+        Err(e) => {
+            log_web_failure("folder", &e);
+            Json(ApiResponse {
+                success: false,
+                message: "folder の実行に失敗しました".to_string(),
+            })
+        }
     }
 }
 
@@ -1515,12 +1574,24 @@ pub async fn api_diff(
                     &output.stderr,
                     super::non_external_console_target(),
                 );
+                if !output.status.success() {
+                    log_immediate_command_failure("diff", &output);
+                    return Json(ApiResponse {
+                        success: false,
+                        message: format!("diff の実行に失敗しました ({id})"),
+                    });
+                }
             }
             Err(e) => {
+                log_web_failure("diff", &e);
                 state.push_server.broadcast_echo(
                     &format!("diff error: {}", e),
                     super::non_external_console_target(),
                 );
+                return Json(ApiResponse {
+                    success: false,
+                    message: format!("diff の実行に失敗しました ({id})"),
+                });
             }
         }
     }
@@ -1868,13 +1939,17 @@ pub async fn reorder_pending_tasks(
     Json(body): Json<ReorderBody>,
 ) -> Json<ApiResponse> {
     match state.queue.reorder_pending(&body.task_ids) {
-        Ok(_) => {
+        Ok(true) => {
             notify_queue_changed(&state);
             Json(ApiResponse {
                 success: true,
                 message: "タスクの並び替えが完了しました".to_string(),
             })
         }
+        Ok(false) => Json(ApiResponse {
+            success: false,
+            message: "キューの並び替えに失敗しました".to_string(),
+        }),
         Err(e) => Json(ApiResponse {
             success: false,
             message: e.to_string(),
@@ -2019,6 +2094,16 @@ pub async fn api_taginfo(
     Json(body): Json<TagInfoBody>,
 ) -> Json<serde_json::Value> {
     let with_exclusion = body.with_exclusion.unwrap_or(false);
+    let selected_ids: Vec<i64> = body
+        .ids
+        .iter()
+        .filter_map(|value| match value {
+            serde_json::Value::Number(n) => n.as_i64(),
+            serde_json::Value::String(s) => s.parse::<i64>().ok(),
+            _ => None,
+        })
+        .collect();
+    let selected_ids = sort_ids_for_request(&selected_ids, body.sort_state.as_ref(), body.timestamp);
 
     let tag_info = with_database(|db| {
         let tag_index = db.tag_index();
@@ -2030,31 +2115,39 @@ pub async fn api_taginfo(
         }
         let tag_colors = tag_colors.into_map();
 
-        let mut result: Vec<serde_json::Value> = Vec::new();
-        let mut sorted_tags: Vec<(&String, &Vec<i64>)> = tag_index.iter().collect();
-        sorted_tags.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        let mut selected_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for id in selected_ids.iter().copied() {
+            let Some(record) = db.get(id) else {
+                continue;
+            };
+            for tag in &record.tags {
+                *selected_counts.entry(tag.clone()).or_insert(0) += 1;
+            }
+        }
 
+        let mut sorted_tags: Vec<(&String, &Vec<i64>)> = tag_index.iter().collect();
+        sorted_tags.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut result: Vec<serde_json::Value> = Vec::with_capacity(sorted_tags.len());
         for (tag, ids) in sorted_tags {
             let color = tag_colors.get(tag).map(|c| c.as_str()).unwrap_or("");
             let class = tag_color_class(color);
             let escaped_tag = html_escape(tag);
             let html = format!(
-                "<span class=\"tag-label {}\">{}({})</span>",
-                class,
-                escaped_tag,
-                ids.len()
+                "<span class=\"tag-label {}\">{}</span>",
+                class, escaped_tag
             );
             let mut entry = serde_json::json!({
                 "tag": tag,
-                "count": ids.len(),
+                "count": selected_counts.get(tag.as_str()).copied().unwrap_or(0),
+                "total_count": ids.len(),
                 "html": html,
             });
             if with_exclusion {
                 let exc_html = format!(
-                    "<span class=\"tag-label {} tag-exclusion\">{}({})</span>",
-                    class,
-                    escaped_tag,
-                    ids.len()
+                    "<span class=\"tag-label {} tag-exclusion\">{}</span>",
+                    class, escaped_tag
                 );
                 entry["exclusion_html"] = serde_json::json!(exc_html);
             }
@@ -2069,14 +2162,14 @@ pub async fn api_taginfo(
 
 // POST /api/restore_pending_tasks
 pub async fn restore_pending_tasks(State(state): State<AppState>) -> Json<serde_json::Value> {
-    state.restore_prompt_pending.store(false, Ordering::Relaxed);
-    state
-        .restorable_tasks_available
-        .store(false, Ordering::Relaxed);
     let count = match state.queue.activate_restorable_tasks() {
         Ok(count) => count,
         Err(e) => return serde_json::json!({ "error": e.to_string() }).into(),
     };
+    state.restore_prompt_pending.store(false, Ordering::Relaxed);
+    state
+        .restorable_tasks_available
+        .store(false, Ordering::Relaxed);
     state.push_server.broadcast_event("notification.queue", "");
     serde_json::json!({ "status": "ok", "count": count }).into()
 }
@@ -2102,14 +2195,14 @@ pub async fn confirm_running_tasks(
     Json(body): Json<ConfirmRunningTasksBody>,
 ) -> Json<serde_json::Value> {
     if body.rerun.as_deref() == Some("true") {
-        state.restore_prompt_pending.store(false, Ordering::Relaxed);
-        state
-            .restorable_tasks_available
-            .store(false, Ordering::Relaxed);
         let count = match state.queue.activate_restorable_tasks() {
             Ok(count) => count,
             Err(e) => return serde_json::json!({ "error": e.to_string() }).into(),
         };
+        state.restore_prompt_pending.store(false, Ordering::Relaxed);
+        state
+            .restorable_tasks_available
+            .store(false, Ordering::Relaxed);
         notify_queue_changed(&state);
         serde_json::json!({ "status": "ok", "count": count }).into()
     } else {
@@ -2206,7 +2299,6 @@ pub async fn api_reboot(
     State(state): State<AppState>,
     Json(_body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
-    state.push_server.broadcast_event("reboot", "");
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
@@ -2216,24 +2308,51 @@ pub async fn api_reboot(
             });
         }
     };
+    let current_dir = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            return Json(ApiResponse {
+                success: false,
+                message: e.to_string(),
+            });
+        }
+    };
     let hide_console = crate::compat::inherited_hide_console_requested();
     let args = reboot_args_with_no_browser(std::env::args().skip(1).collect(), hide_console);
-    // Spawn replacement process, then exit
+    let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let mut command = std::process::Command::new(exe);
         command
             .args(&args)
-            .current_dir(std::env::current_dir().unwrap_or_default())
+            .current_dir(current_dir)
             .stdin(std::process::Stdio::null());
         crate::compat::configure_hidden_console_command(&mut command);
-        let _ = command.spawn();
-        std::process::exit(0);
+        let result = command.spawn().map(|_| ()).map_err(|e| e.to_string());
+        let should_exit = result.is_ok();
+        let _ = tx.send(result);
+        if should_exit {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            std::process::exit(0);
+        }
     });
-    Json(ApiResponse {
-        success: true,
-        message: "Rebooting".to_string(),
-    })
+    match rx.await {
+        Ok(Ok(())) => {
+            state.push_server.broadcast_event("reboot", "");
+            Json(ApiResponse {
+                success: true,
+                message: "Rebooting".to_string(),
+            })
+        }
+        Ok(Err(message)) => Json(ApiResponse {
+            success: false,
+            message,
+        }),
+        Err(_) => Json(ApiResponse {
+            success: false,
+            message: "failed to schedule reboot".to_string(),
+        }),
+    }
 }
 
 fn reboot_args_with_no_browser(mut args: Vec<String>, hide_console: bool) -> Vec<String> {
@@ -2307,10 +2426,10 @@ mod tests {
         build_update_general_lastup_meta, build_webui_update_start_message,
         encode_convert_job_target, existing_update_job_id, format_general_lastup_queue_target,
         format_queue_job_type, format_update_queue_target, normalize_update_targets,
-        push_update_job_if_needed, queue_lane_sizes, reboot_args_with_no_browser,
-        restorable_tasks_available, sort_records_for_web_update, tag_color_class,
-        validate_diff_number, validate_download_targets, validate_general_lastup_option,
-        web_update_sort_key_for_cli,
+        push_update_job_if_needed, push_update_job_with_legacy_if_needed, queue_lane_sizes,
+        reboot_args_with_no_browser, restorable_tasks_available, sort_records_for_web_update,
+        tag_color_class, validate_diff_number, validate_download_targets,
+        validate_general_lastup_option, web_update_sort_key_for_cli,
     };
 
     fn sample_record(id: i64, general_lastup_ts: i64) -> NovelRecord {
@@ -2385,9 +2504,51 @@ mod tests {
             max_retries: 3,
         }]);
 
-        let existing = existing_update_job_id(&queue, &running_jobs, "tag:modified");
+        let existing = existing_update_job_id(&queue, &running_jobs, "tag:modified", "update", false);
 
         assert_eq!(existing.as_deref(), Some("running-job"));
+    }
+
+    #[test]
+    fn update_general_lastup_dedupe_distinguishes_modified_followup() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = PersistentQueue::new(&temp.path().join("queue.yaml")).unwrap();
+        let running_jobs = Mutex::new(Vec::new());
+
+        let first = push_update_job_with_legacy_if_needed(
+            &queue,
+            &running_jobs,
+            "--gl".to_string(),
+            "update_general_lastup",
+            Vec::new(),
+            Mapping::new(),
+        )
+        .unwrap();
+        let modified = push_update_job_with_legacy_if_needed(
+            &queue,
+            &running_jobs,
+            "--gl".to_string(),
+            "update_general_lastup",
+            Vec::new(),
+            build_update_general_lastup_meta(true),
+        )
+        .unwrap();
+        let modified_duplicate = push_update_job_with_legacy_if_needed(
+            &queue,
+            &running_jobs,
+            "--gl".to_string(),
+            "update_general_lastup",
+            Vec::new(),
+            build_update_general_lastup_meta(true),
+        )
+        .unwrap();
+
+        assert!(first.1);
+        assert!(modified.1);
+        assert_ne!(first.0, modified.0);
+        assert!(!modified_duplicate.1);
+        assert_eq!(modified.0, modified_duplicate.0);
+        assert_eq!(queue.pending_count(), 2);
     }
 
     #[test]

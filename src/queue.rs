@@ -512,6 +512,18 @@ impl PersistentQueue {
         self.save()
     }
 
+    pub fn clear_non_running(&self) -> Result<()> {
+        {
+            let mut state = self.state.lock();
+            state.active_pending.clear();
+            state.deferred_pending.clear();
+            state.deferred_running.clear();
+            state.completed.clear();
+            state.failed.clear();
+        }
+        self.save()
+    }
+
     pub fn activate_restorable_tasks(&self) -> Result<usize> {
         let count = {
             let mut state = self.state.lock();
@@ -967,6 +979,26 @@ mod tests {
         let reloaded = PersistentQueue::new(&queue_path).unwrap();
         assert_eq!(reloaded.pending_count(), 0);
         assert_eq!(reloaded.running_count(), 0);
+        assert_eq!(reloaded.completed_count(), 0);
+        assert_eq!(reloaded.failed_count(), 0);
+    }
+
+    #[test]
+    fn clear_non_running_preserves_active_running_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        queue.push(JobType::Download, "1").unwrap();
+        queue.push(JobType::Backup, "2").unwrap();
+        let running = queue.pop().unwrap();
+        queue.fail("failed").unwrap();
+
+        queue.clear_non_running().unwrap();
+
+        let reloaded = PersistentQueue::new(&queue_path).unwrap();
+        assert_eq!(reloaded.pending_count(), 0);
+        assert_eq!(reloaded.running_count(), 1);
+        assert_eq!(reloaded.get_running_tasks()[0].id, running.id);
         assert_eq!(reloaded.completed_count(), 0);
         assert_eq!(reloaded.failed_count(), 0);
     }
