@@ -794,15 +794,37 @@ export function renderTagList() {
 
 /* ===== Queue ===== */
 
-export function renderQueueStatus() {
-  const qs = State.queueStatus;
+function queueLaneSizes(qs) {
+  if (Array.isArray(qs.lane_sizes) && qs.lane_sizes.length >= 2) {
+    return [
+      Number(qs.lane_sizes[0]) || 0,
+      Number(qs.lane_sizes[1]) || 0,
+    ];
+  }
   const runningCount = typeof qs.running_count === 'number'
     ? qs.running_count
     : (qs.running ? 1 : 0);
+  return [
+    (qs.pending || 0) + runningCount,
+    0,
+  ];
+}
+
+export function renderQueueStatus() {
+  const qs = State.queueStatus;
+  const [defaultCount, secondaryCount] = queueLaneSizes(qs);
+  const showSecondary = State.concurrencyEnabled;
   if (El.queueCount) {
-    const total = (qs.pending || 0) + runningCount;
-    El.queueCount.textContent = String(total);
-    El.queueCount.classList.toggle('queue-size-active', total > 0);
+    El.queueCount.textContent = String(defaultCount);
+    El.queueCount.classList.toggle('queue-size-active', defaultCount > 0);
+  }
+  if (El.queueCountDivider) {
+    El.queueCountDivider.hidden = !showSecondary;
+  }
+  if (El.queueCountConvert) {
+    El.queueCountConvert.hidden = !showSecondary;
+    El.queueCountConvert.textContent = String(secondaryCount);
+    El.queueCountConvert.classList.toggle('queue-size-active', secondaryCount > 0);
   }
 
   // Queue modal lists

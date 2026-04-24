@@ -159,6 +159,7 @@ function setConcurrencyEnabled(enabled) {
   if (El.consoleColRight) {
     El.consoleColRight.classList.toggle('hide', !enabled);
   }
+  renderQueueStatus();
 }
 
 function handleWsMessage(msg) {

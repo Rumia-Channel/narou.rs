@@ -961,6 +961,11 @@ li.enable-selected.disabled a {
 }
 
 /* ========== Queue badge active ========== */
+.queue-size {
+  display: inline-flex;
+  align-items: center;
+}
+
 .queue-size-active {
   background-color: var(--btn-warning-bg);
   color: var(--btn-text);
@@ -971,6 +976,17 @@ li.enable-selected.disabled a {
 }
 
 .queue-size-default {
+  font-size: 0.90em;
+  color: var(--navbar-text);
+}
+
+.queue-size-divider {
+  padding-right: 0.10em;
+  padding-left: 0.10em;
+  color: var(--navbar-text);
+}
+
+.queue-size-convert {
   font-size: 0.90em;
   color: var(--navbar-text);
 }

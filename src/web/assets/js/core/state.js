@@ -76,7 +76,7 @@ export const El = {};
 
 const ELEMENT_IDS = [
   'header-navbar', 'navbar-toggle-btn', 'navbar-collapse',
-  'badge-selecting', 'queue-count', 'queue-display', 'queue-sizes',
+  'badge-selecting', 'queue-count', 'queue-count-divider', 'queue-count-convert', 'queue-display', 'queue-sizes',
   'filter-input', 'filter-clear', 'filter-search-icon',
   'console', 'console-stdout2', 'console-col-right',
   'console-cancel', 'console-history',

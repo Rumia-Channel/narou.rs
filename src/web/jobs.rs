@@ -191,6 +191,14 @@ fn queue_display_target(queue: &PersistentQueue, job: &QueueJob) -> String {
     format_queue_job_target(job, queue.execution_spec(&job.id).as_ref())
 }
 
+fn queue_lane_sizes(queue: &PersistentQueue) -> [usize; 2] {
+    [
+        queue.pending_count_for_lane(QueueLane::Default) + queue.running_count_for_lane(QueueLane::Default),
+        queue.pending_count_for_lane(QueueLane::Secondary)
+            + queue.running_count_for_lane(QueueLane::Secondary),
+    ]
+}
+
 fn queue_download_jobs(
     queue: &PersistentQueue,
     targets: &[String],
@@ -778,6 +786,7 @@ pub async fn api_convert(
 pub async fn queue_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let running_jobs = state.queue.get_running_tasks();
     let running_count = running_jobs.len();
+    let lane_sizes = queue_lane_sizes(state.queue.as_ref());
     let running_label = match running_jobs.as_slice() {
         [] => serde_json::Value::Null,
         [job] => serde_json::Value::String(queue_display_target(state.queue.as_ref(), job)),
@@ -789,6 +798,7 @@ pub async fn queue_status(State(state): State<AppState>) -> Json<serde_json::Val
         "failed": state.queue.failed_count(),
         "running": running_label,
         "running_count": running_count,
+        "lane_sizes": lane_sizes,
     }))
 }
 
@@ -1749,10 +1759,7 @@ pub async fn reorder_pending_tasks(
 
 // GET /api/get_queue_size
 pub async fn get_queue_size(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let default_count = state.queue.pending_count_for_lane(QueueLane::Default)
-        + state.queue.running_count_for_lane(QueueLane::Default);
-    let secondary_count = state.queue.pending_count_for_lane(QueueLane::Secondary)
-        + state.queue.running_count_for_lane(QueueLane::Secondary);
+    let [default_count, secondary_count] = queue_lane_sizes(state.queue.as_ref());
     Json(serde_json::json!([default_count, secondary_count]))
 }
 
@@ -2160,8 +2167,8 @@ mod tests {
     use super::{
         broadcast_captured_web_output, encode_convert_job_target, existing_update_job_id,
         format_general_lastup_queue_target, format_update_queue_target, normalize_update_targets,
-        push_update_job_if_needed, reboot_args_with_no_browser, restorable_tasks_available,
-        tag_color_class, validate_diff_number, validate_download_targets,
+        push_update_job_if_needed, queue_lane_sizes, reboot_args_with_no_browser,
+        restorable_tasks_available, tag_color_class, validate_diff_number, validate_download_targets,
         validate_general_lastup_option,
     };
 
@@ -2210,6 +2217,17 @@ mod tests {
         let existing = existing_update_job_id(&queue, &running_jobs, "tag:modified");
 
         assert_eq!(existing.as_deref(), Some("running-job"));
+    }
+
+    #[test]
+    fn queue_lane_sizes_split_default_and_secondary_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = PersistentQueue::new(&temp.path().join("queue.yaml")).unwrap();
+
+        queue.push(JobType::Download, "1").unwrap();
+        queue.push(JobType::Convert, "2").unwrap();
+
+        assert_eq!(queue_lane_sizes(&queue), [1, 1]);
     }
 
     #[test]

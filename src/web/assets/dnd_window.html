@@ -48,13 +48,20 @@
       color: var(--text-muted, #aaa);
       font-size: 0.9em;
     }
+    .queue-sizes {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.15em;
+    }
     .queue-indicator .badge {
       background: var(--btn-primary-bg, #2196F3);
       color: #fff;
       padding: 0.15em 0.4em;
       border-radius: 0.6em;
       font-size: 0.85em;
-      margin-left: 0.3em;
+    }
+    .queue-divider {
+      color: var(--text-muted, #aaa);
     }
     #link-drop-overlay {
       display: none;
@@ -93,7 +100,12 @@
     小説のリンクをドラッグ＆ドロップ
   </div>
   <div class="queue-indicator">
-    <span class="material-symbols-outlined icon-only" aria-hidden="true">move_to_inbox</span><span id="queue-count" class="badge">0</span>
+    <span class="material-symbols-outlined icon-only" aria-hidden="true">move_to_inbox</span>
+    <span class="queue-sizes">
+      <span id="queue-count" class="badge">0</span>
+      <span id="queue-count-divider" class="queue-divider" hidden>:</span>
+      <span id="queue-count-convert" class="badge" hidden>0</span>
+    </span>
   </div>
   <div id="link-drop-overlay">
     <span class="drop-icon"><span class="material-symbols-outlined icon-only" aria-hidden="true">download</span></span>
@@ -106,7 +118,10 @@
       var overlay = document.getElementById('link-drop-overlay');
       var dropCover = document.getElementById('drop-cover');
       var queueCount = document.getElementById('queue-count');
+      var queueCountDivider = document.getElementById('queue-count-divider');
+      var queueCountConvert = document.getElementById('queue-count-convert');
       var information = document.getElementById('information');
+      var concurrencyEnabled = false;
 
       var ws;
       var reconnectTimer = null;
@@ -182,7 +197,11 @@
       fetch('/api/webui/config')
         .then(function(r) { return r.json(); })
         .then(function(config) {
+          concurrencyEnabled = Boolean(config && config.concurrency_enabled);
+          queueCountDivider.hidden = !concurrencyEnabled;
+          queueCountConvert.hidden = !concurrencyEnabled;
           connectWs((config && config.ws_port) || defaultWsPort());
+          refreshQueueCount();
         })
         .catch(function() {
           connectWs(defaultWsPort());
@@ -202,7 +221,13 @@
         fetch('/api/get_queue_size')
           .then(function(r) { return r.json(); })
           .then(function(data) {
-            queueCount.textContent = data.total || 0;
+            var sizes = Array.isArray(data) ? data : [Number(data && data.total) || 0, 0];
+            queueCount.textContent = String(Number(sizes[0]) || 0);
+            queueCountDivider.hidden = !concurrencyEnabled;
+            queueCountConvert.hidden = !concurrencyEnabled;
+            if (concurrencyEnabled) {
+              queueCountConvert.textContent = String(Number(sizes[1]) || 0);
+            }
           })
           .catch(function() {});
       }
