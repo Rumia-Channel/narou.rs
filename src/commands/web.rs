@@ -51,16 +51,6 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         address.host, address.port, address.ws_port
     );
 
-    let mut push_server = web::push::PushServer::new();
-    let domains = match load_ws_accepted_domains(&address.host) {
-        Ok(domains) => domains,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
-    push_server.set_accepted_domains(domains);
-    let push_server = Arc::new(push_server);
     let security_settings = match load_web_security_settings() {
         Ok(settings) => settings,
         Err(e) => {
@@ -68,6 +58,17 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
             std::process::exit(1);
         }
     };
+    let mut push_server = web::push::PushServer::new();
+    let domains =
+        match load_ws_accepted_domains(&address.host, security_settings.reverse_proxy_mode) {
+            Ok(domains) => domains,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
+    push_server.set_accepted_domains(domains);
+    let push_server = Arc::new(push_server);
     if requires_basic_auth_for_bind(&address.host)
         && security_settings.require_basic_auth_for_external_bind
         && security_settings.basic_auth_header.is_none()
@@ -107,6 +108,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         basic_auth_header: security_settings.basic_auth_header,
         control_token: control_token.clone(),
         allowed_request_hosts: narou_rs::web::default_allowed_request_hosts(&address.host),
+        reverse_proxy_mode: security_settings.reverse_proxy_mode,
         queue: queue.clone(),
         restore_prompt_pending: restore_prompt_pending.clone(),
         restorable_tasks_available: restorable_tasks_available.clone(),
@@ -498,6 +500,7 @@ fn try_kill_via_pid_file(port: u16) {
 struct WebSecuritySettings {
     basic_auth_header: Option<String>,
     require_basic_auth_for_external_bind: bool,
+    reverse_proxy_mode: bool,
 }
 
 fn load_web_security_settings() -> Result<WebSecuritySettings, String> {
@@ -507,8 +510,10 @@ fn load_web_security_settings() -> Result<WebSecuritySettings, String> {
         .unwrap_or_default();
     Ok(WebSecuritySettings {
         basic_auth_header: basic_auth_header_from_settings(&global_setting),
-        require_basic_auth_for_external_bind:
-            require_basic_auth_for_external_bind_from_settings(&global_setting),
+        require_basic_auth_for_external_bind: require_basic_auth_for_external_bind_from_settings(
+            &global_setting,
+        ),
+        reverse_proxy_mode: reverse_proxy_mode_from_settings(&global_setting),
     })
 }
 
@@ -533,6 +538,10 @@ fn require_basic_auth_for_external_bind_from_settings(
     yaml_bool(global_setting.get("server-basic-auth.require-for-external-bind")).unwrap_or(true)
 }
 
+fn reverse_proxy_mode_from_settings(global_setting: &HashMap<String, Value>) -> bool {
+    yaml_bool(global_setting.get("server-reverse-proxy.enable")).unwrap_or(false)
+}
+
 #[cfg(test)]
 fn is_wildcard_bind_host(host: &str) -> bool {
     matches!(host, "0.0.0.0" | "::")
@@ -546,7 +555,10 @@ fn default_ws_accepted_domains(host: &str) -> Vec<String> {
     narou_rs::web::default_allowed_request_hosts(host)
 }
 
-fn load_ws_accepted_domains(host: &str) -> Result<Vec<String>, String> {
+fn load_ws_accepted_domains(host: &str, reverse_proxy_mode: bool) -> Result<Vec<String>, String> {
+    if reverse_proxy_mode {
+        return Ok(Vec::new());
+    }
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
     let global_setting: HashMap<String, Value> = inventory
         .load("global_setting", InventoryScope::Global)
@@ -717,7 +729,7 @@ mod tests {
         basic_auth_header_from_settings, control_request_host, default_ws_accepted_domains,
         display_host, encode_base64, generate_control_token, is_wildcard_bind_host,
         normalize_bind_host, require_basic_auth_for_external_bind_from_settings,
-        requires_basic_auth_for_bind,
+        requires_basic_auth_for_bind, reverse_proxy_mode_from_settings,
     };
 
     #[test]
@@ -751,7 +763,9 @@ mod tests {
     #[test]
     fn external_bind_auth_guard_defaults_to_enabled() {
         let settings = HashMap::new();
-        assert!(require_basic_auth_for_external_bind_from_settings(&settings));
+        assert!(require_basic_auth_for_external_bind_from_settings(
+            &settings
+        ));
     }
 
     #[test]
@@ -761,7 +775,22 @@ mod tests {
             "server-basic-auth.require-for-external-bind".to_string(),
             Value::Bool(false),
         );
-        assert!(!require_basic_auth_for_external_bind_from_settings(&settings));
+        assert!(!require_basic_auth_for_external_bind_from_settings(
+            &settings
+        ));
+    }
+
+    #[test]
+    fn reverse_proxy_mode_defaults_to_disabled() {
+        let settings = HashMap::new();
+        assert!(!reverse_proxy_mode_from_settings(&settings));
+    }
+
+    #[test]
+    fn reverse_proxy_mode_can_be_enabled() {
+        let mut settings = HashMap::new();
+        settings.insert("server-reverse-proxy.enable".to_string(), Value::Bool(true));
+        assert!(reverse_proxy_mode_from_settings(&settings));
     }
 
     #[test]

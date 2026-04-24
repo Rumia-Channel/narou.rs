@@ -84,12 +84,11 @@ async function init() {
 }
 
 function connectWebSocket() {
-  if (!State.wsPort) return;
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const url = `${proto}//${location.hostname}:${State.wsPort}/ws`;
+  const url = new URL('/ws', location.href);
+  url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 
   try {
-    ws = new WebSocket(url);
+    ws = new WebSocket(url.toString());
   } catch {
     return;
   }

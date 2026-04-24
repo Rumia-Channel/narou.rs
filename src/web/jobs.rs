@@ -232,7 +232,10 @@ fn queue_bookmarklet_download(
         .map_err(|e| e.to_string())
 }
 
-fn bookmarklet_download_response(state: &AppState, params: &BookmarkletDownloadQuery) -> serde_json::Value {
+fn bookmarklet_download_response(
+    state: &AppState,
+    params: &BookmarkletDownloadQuery,
+) -> serde_json::Value {
     let Some(target) = params
         .target
         .as_deref()
@@ -1393,12 +1396,10 @@ pub async fn api_diff(
                 );
             }
             Err(e) => {
-                state
-                    .push_server
-                    .broadcast_echo(
-                        &format!("diff error: {}", e),
-                        super::non_external_console_target(),
-                    );
+                state.push_server.broadcast_echo(
+                    &format!("diff error: {}", e),
+                    super::non_external_console_target(),
+                );
             }
         }
     }
@@ -1527,7 +1528,9 @@ pub async fn api_csv_import(
                         })
                     }
                     Err(e) => {
-                        state.push_server.broadcast_error(&format!("DB更新エラー: {}", e));
+                        state
+                            .push_server
+                            .broadcast_error(&format!("DB更新エラー: {}", e));
                         Json(ApiResponse {
                             success: false,
                             message: "CSVインポート後のDB更新に失敗しました".to_string(),
@@ -2264,7 +2267,10 @@ mod tests {
             format_general_lastup_queue_target(&["other".to_string()]),
             "その他サイトの最新話掲載日を確認"
         );
-        assert_eq!(format_general_lastup_queue_target(&[]), "最新話掲載日を確認");
+        assert_eq!(
+            format_general_lastup_queue_target(&[]),
+            "最新話掲載日を確認"
+        );
     }
 
     #[test]
@@ -2441,6 +2447,7 @@ mod tests {
             basic_auth_header: None,
             control_token: "control-token".to_string(),
             allowed_request_hosts: vec!["localhost".to_string()],
+            reverse_proxy_mode: false,
             queue,
             restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(true)),

@@ -77,31 +77,63 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
     }
     match name {
         // local → general
-        "device" | "hotentry" | "concurrency" | "logging"
-        | "update.interval" | "update.strong" | "update.convert-only-new-arrival"
-        | "update.sort-by" | "update.auto-schedule.enable" | "update.auto-schedule"
-        | "convert.copy-to" | "convert.copy-zip-to" | "convert.copy-to-grouping"
-        | "convert.make-zip" | "convert.no-open" | "convert.multi-device"
-        | "convert.filename-to-ncode" | "convert.add-dc-subject-to-epub"
+        "device"
+        | "hotentry"
+        | "concurrency"
+        | "logging"
+        | "update.interval"
+        | "update.strong"
+        | "update.convert-only-new-arrival"
+        | "update.sort-by"
+        | "update.auto-schedule.enable"
+        | "update.auto-schedule"
+        | "convert.copy-to"
+        | "convert.copy-zip-to"
+        | "convert.copy-to-grouping"
+        | "convert.make-zip"
+        | "convert.no-open"
+        | "convert.multi-device"
+        | "convert.filename-to-ncode"
+        | "convert.add-dc-subject-to-epub"
         | "convert.dc-subject-exclude-tags"
-        | "send.without-freeze" | "auto-add-tags" => Some("general"),
+        | "send.without-freeze"
+        | "auto-add-tags" => Some("general"),
 
         // local → detail
-        "hotentry.auto-mail" | "logging.format-filename" | "logging.format-timestamp"
-        | "download.interval" | "download.wait-steps" | "download.use-subdirectory"
-        | "download.choices-of-digest-options" | "send.backup-bookmark"
-        | "multiple-delimiter" | "economy" | "guard-spoiler" | "normalize-filename"
-        | "convert.inspect" | "folder-length-limit" | "filename-length-limit"
-        | "ebook-filename-length-limit" | "time-zone" | "user-agent" => Some("detail"),
+        "hotentry.auto-mail"
+        | "logging.format-filename"
+        | "logging.format-timestamp"
+        | "download.interval"
+        | "download.wait-steps"
+        | "download.use-subdirectory"
+        | "download.choices-of-digest-options"
+        | "send.backup-bookmark"
+        | "multiple-delimiter"
+        | "economy"
+        | "guard-spoiler"
+        | "normalize-filename"
+        | "convert.inspect"
+        | "folder-length-limit"
+        | "filename-length-limit"
+        | "ebook-filename-length-limit"
+        | "time-zone"
+        | "user-agent" => Some("detail"),
 
         // local → webui
         "webui.theme" | "webui.table.reload-timing" | "webui.performance-mode" => Some("webui"),
 
         // global → global
-        "difftool" | "difftool.arg" | "no-color" | "color-parser"
-        | "server-port" | "server-bind"
-        | "server-basic-auth.enable" | "server-basic-auth.user" | "server-basic-auth.password"
-        | "server-ws-add-accepted-domains" | "over18" => Some("global"),
+        "difftool"
+        | "difftool.arg"
+        | "no-color"
+        | "color-parser"
+        | "server-port"
+        | "server-bind"
+        | "server-basic-auth.enable"
+        | "server-basic-auth.user"
+        | "server-basic-auth.password"
+        | "server-ws-add-accepted-domains"
+        | "over18" => Some("global"),
 
         _ => None,
     }
@@ -423,7 +455,7 @@ pub fn original_setting_var_infos() -> Vec<(&'static str, VarInfo)> {
                 "出力ファイル名を任意の文字列に変更する。convert.filename-to-ncode の設定よりも優先される。※拡張子を含めないで下さい",
             ),
         ),
-        ]
+    ]
 }
 
 #[cfg(test)]
@@ -444,9 +476,21 @@ mod tests {
             tab_for_setting("server-basic-auth.require-for-external-bind"),
             None
         );
-        assert!(setting_variables()
-            .get("server-basic-auth.require-for-external-bind")
-            .is_some());
+        assert!(
+            setting_variables()
+                .get("server-basic-auth.require-for-external-bind")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_mode_has_no_webui_tab() {
+        assert_eq!(tab_for_setting("server-reverse-proxy.enable"), None);
+        assert!(
+            setting_variables()
+                .get("server-reverse-proxy.enable")
+                .is_some()
+        );
     }
 }
 
@@ -762,10 +806,7 @@ pub fn setting_variables() -> SettingVariables {
         ),
         (
             "user-agent",
-            vis(
-                VarType::String,
-                "User-Agent 設定\n未指定時 auto",
-            ),
+            vis(VarType::String, "User-Agent 設定\n未指定時 auto"),
         ),
         (
             "time-zone",
@@ -831,7 +872,10 @@ pub fn setting_variables() -> SettingVariables {
         ),
         (
             "server-bind",
-            invis(VarType::String, "WEBサーバのホスト制限(未設定時:起動PCのIP)。頻繁にローカルIPが変わってしまう場合は127.0.0.1の指定を推奨"),
+            invis(
+                VarType::String,
+                "WEBサーバのホスト制限(未設定時:起動PCのIP)。頻繁にローカルIPが変わってしまう場合は127.0.0.1の指定を推奨",
+            ),
         ),
         (
             "server-basic-auth.enable",
@@ -850,6 +894,13 @@ pub fn setting_variables() -> SettingVariables {
             invis(
                 VarType::Boolean,
                 "外部公開bind時にBasic認証未設定での起動を拒否するかどうか",
+            ),
+        ),
+        (
+            "server-reverse-proxy.enable",
+            invis(
+                VarType::Boolean,
+                "reverse proxy 経由の Host / Origin を受け入れるモードを有効にするかどうか",
             ),
         ),
         (
@@ -873,24 +924,36 @@ pub fn setting_variables() -> SettingVariables {
 /// `%%ORIG%%` is replaced with the base help text at lookup time.
 pub fn webui_help_override(name: &str, base_help: &str) -> Option<String> {
     let raw = match name {
-        "convert.multi-device" => "複数の端末用に同時に変換する。deviceよりも優先される。\nただのEPUBを出力したい場合はepubを指定",
+        "convert.multi-device" => {
+            "複数の端末用に同時に変換する。deviceよりも優先される。\nただのEPUBを出力したい場合はepubを指定"
+        }
         "device" => "変換、送信対象の端末",
         "difftool" => "%%ORIG%%。※WEB UIでは使われません",
         "update.sort-by" => "アップデートを指定した項目順で行う",
         "default.title_date_align" => "enable_add_date_to_title で付与する日付の位置",
         "force.title_date_align" => "enable_add_date_to_title で付与する日付の位置",
-        "difftool.arg" => "difftoolで使う引数(指定しなければ単純に新旧ファイルを引数に呼び出す)\n特殊な変数\n<b>%NEW</b> : 最新データの差分用ファイルパス\n<b>%OLD</b> : 古い方の差分用ファイルパス",
+        "difftool.arg" => {
+            "difftoolで使う引数(指定しなければ単純に新旧ファイルを引数に呼び出す)\n特殊な変数\n<b>%NEW</b> : 最新データの差分用ファイルパス\n<b>%OLD</b> : 古い方の差分用ファイルパス"
+        }
         "no-color" => "コンソールのカラー表示を無効にする\n※要サーバ再起動",
         "economy" => "容量節約に関する設定",
-        "send.without-freeze" => "一括送信時に凍結された小説は対象外にする。（個別送信時は凍結済みでも送信可能）",
-        "server-basic-auth.enable" => "%%ORIG%%\n※basic-auth関連の設定を変更した場合サーバの再起動が必要",
+        "send.without-freeze" => {
+            "一括送信時に凍結された小説は対象外にする。（個別送信時は凍結済みでも送信可能）"
+        }
+        "server-basic-auth.enable" => {
+            "%%ORIG%%\n※basic-auth関連の設定を変更した場合サーバの再起動が必要"
+        }
         "concurrency" => "%%ORIG%% ※要サーバ再起動",
         "logging" => "%%ORIG%%\n※要サーバ再起動",
         "logging.format-filename" => "%%ORIG%%\n※要サーバ再起動",
         "logging.format-timestamp" => "%%ORIG%%\n※要サーバ再起動",
         "auto-add-tags" => "小説サイトから取得したタグを自動的に小説データに追加する",
-        "convert.add-dc-subject-to-epub" => "EPUB変換時にstandard.opfファイルにdc:subject要素を追加する。\n小説のタグ情報がdc:subjectとして埋め込まれ、\n電子書籍リーダーでの検索やカテゴリ分類に活用できます。\n除外するタグは下の設定で指定できます",
-        "convert.dc-subject-exclude-tags" => "dc:subjectに埋め込まないタグをカンマ区切りで指定します。\n<b>初期値:</b> 404,end（初回実行時に自動設定）\n<b>404:</b> 削除された小説に付くタグ\n<b>end:</b> 完結を示すタグ\n※すべてのタグを埋め込みたい場合は空欄にしてください",
+        "convert.add-dc-subject-to-epub" => {
+            "EPUB変換時にstandard.opfファイルにdc:subject要素を追加する。\n小説のタグ情報がdc:subjectとして埋め込まれ、\n電子書籍リーダーでの検索やカテゴリ分類に活用できます。\n除外するタグは下の設定で指定できます"
+        }
+        "convert.dc-subject-exclude-tags" => {
+            "dc:subjectに埋め込まないタグをカンマ区切りで指定します。\n<b>初期値:</b> 404,end（初回実行時に自動設定）\n<b>404:</b> 削除された小説に付くタグ\n<b>end:</b> 完結を示すタグ\n※すべてのタグを埋め込みたい場合は空欄にしてください"
+        }
         "convert.copy-zip-to" => "i文庫用などで生成したZIPを、変換完了時にコピーするフォルダを指定",
         "convert.make-zip" => "ZIPファイルを出力するかどうか（対応端末: i文庫）",
         _ => return None,

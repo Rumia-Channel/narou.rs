@@ -119,9 +119,6 @@
       function buildWsUrl(wsPort) {
         var url = new URL('/ws', location.href);
         url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        if (wsPort) {
-          url.port = String(wsPort);
-        }
         return url.toString();
       }
 

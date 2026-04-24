@@ -336,8 +336,9 @@
       notepadArea.value = data.content || '';
     });
     function connectNotepadSocket(wsPort) {
-      var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      var ws = new WebSocket(proto + '//' + location.hostname + ':' + wsPort + '/ws');
+      var url = new URL('/ws', location.href);
+      url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      var ws = new WebSocket(url.toString());
       ws.onmessage = function(event) {
         try {
           var msg = JSON.parse(event.data);

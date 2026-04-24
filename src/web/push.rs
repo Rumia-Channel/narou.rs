@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    http::{HeaderMap, StatusCode, header},
     extract::State,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -269,7 +269,10 @@ impl PushServer {
     pub fn recent_logs(&self, count: usize) -> Vec<String> {
         let history = self.console_history.lock();
         let start = history.len().saturating_sub(count);
-        history[start..].iter().map(|(msg, _)| msg.clone()).collect()
+        history[start..]
+            .iter()
+            .map(|(msg, _)| msg.clone())
+            .collect()
     }
 }
 
@@ -312,7 +315,9 @@ pub async fn ws_handler_with_app_state(
 }
 
 fn validate_ws_request(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
-    if !super::request_host_allowed(headers, state, state.ws_port) {
+    if !super::request_host_allowed(headers, state, state.ws_port)
+        && !super::request_host_allowed(headers, state, state.port)
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
     if !super::basic_auth_matches(headers, state.basic_auth_header.as_deref()) {
@@ -322,14 +327,17 @@ fn validate_ws_request(headers: &HeaderMap, state: &AppState) -> Result<(), Stat
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    if !state.push_server.accepts_origin(origin) || !super::origin_allowed(headers, state, state.port) {
+    if !state.push_server.accepts_origin(origin)
+        || !super::origin_allowed(headers, state, state.port)
+    {
         return Err(StatusCode::FORBIDDEN);
     }
     Ok(())
 }
 
 async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>) {
-    let Some(client_id) = push_server.try_register_client(push_server.channel().sender.clone()) else {
+    let Some(client_id) = push_server.try_register_client(push_server.channel().sender.clone())
+    else {
         let (mut sender, _) = socket.split();
         let _ = sender.send(Message::Close(None)).await;
         return;
@@ -347,7 +355,11 @@ async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>) {
             "body": body,
             "target_console": target_console,
         });
-        if sender.send(Message::Text(payload.to_string().into())).await.is_err() {
+        if sender
+            .send(Message::Text(payload.to_string().into()))
+            .await
+            .is_err()
+        {
             push_server.unregister_client(client_id);
             return;
         }
@@ -404,7 +416,10 @@ fn origin_to_domain(origin: &str) -> String {
     if trimmed.is_empty() || trimmed == "null" || trimmed == "file://" {
         return "null".to_string();
     }
-    let without_scheme = trimmed.split_once("://").map(|(_, rest)| rest).unwrap_or(trimmed);
+    let without_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
     let host_port = without_scheme
         .split(['/', '?', '#'])
         .next()
@@ -448,7 +463,10 @@ mod tests {
     fn origin_to_domain_handles_null_and_file() {
         assert_eq!(origin_to_domain("null"), "null");
         assert_eq!(origin_to_domain("file://"), "null");
-        assert_eq!(origin_to_domain("https://Example.com:8080/path"), "Example.com");
+        assert_eq!(
+            origin_to_domain("https://Example.com:8080/path"),
+            "Example.com"
+        );
     }
 
     #[test]
@@ -479,6 +497,7 @@ mod tests {
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
             allowed_request_hosts: vec!["localhost".to_string()],
+            reverse_proxy_mode: false,
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -490,9 +509,18 @@ mod tests {
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, header::HeaderValue::from_static("localhost:4001"));
-        headers.insert(header::ORIGIN, header::HeaderValue::from_static("http://localhost:4000"));
-        assert_eq!(validate_ws_request(&headers, &state), Err(StatusCode::UNAUTHORIZED));
+        headers.insert(
+            header::HOST,
+            header::HeaderValue::from_static("localhost:4001"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("http://localhost:4000"),
+        );
+        assert_eq!(
+            validate_ws_request(&headers, &state),
+            Err(StatusCode::UNAUTHORIZED)
+        );
 
         headers.insert(
             header::AUTHORIZATION,
@@ -504,7 +532,56 @@ mod tests {
             header::ORIGIN,
             header::HeaderValue::from_static("http://evil.test:4000"),
         );
-        assert_eq!(validate_ws_request(&headers, &state), Err(StatusCode::FORBIDDEN));
+        assert_eq!(
+            validate_ws_request(&headers, &state),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn ws_request_accepts_same_origin_proxy_mode() {
+        let queue_dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-artifacts")
+            .join(format!("push-proxy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&queue_dir);
+        std::fs::create_dir_all(&queue_dir).unwrap();
+
+        let mut push_server = PushServer::new();
+        push_server.set_accepted_domains(Vec::<String>::new());
+        let state = AppState {
+            port: 4000,
+            ws_port: 4001,
+            push_server: Arc::new(push_server),
+            basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
+            control_token: "control-token".to_string(),
+            allowed_request_hosts: vec!["localhost".to_string()],
+            reverse_proxy_mode: true,
+            queue: Arc::new(
+                crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
+            ),
+            restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            auto_update_scheduler: Arc::new(parking_lot::Mutex::new(None)),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            header::HeaderValue::from_static("narou.example.com:8443"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("https://narou.example.com:8443"),
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(validate_ws_request(&headers, &state), Ok(()));
     }
 }
 
@@ -536,7 +613,8 @@ impl StreamingLogger {
         let entry = StreamingLogEntry {
             timestamp: chrono::Utc::now()
                 .with_timezone(&chrono::FixedOffset::east_opt(9 * 3600).unwrap())
-                .format("%Y-%m-%d %H:%M:%S").to_string(),
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
             level: level.to_string(),
             message: message.to_string(),
         };

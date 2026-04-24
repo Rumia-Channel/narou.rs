@@ -44,6 +44,7 @@ pub struct AppState {
     pub basic_auth_header: Option<String>,
     pub control_token: String,
     pub allowed_request_hosts: Vec<String>,
+    pub reverse_proxy_mode: bool,
     pub queue: Arc<crate::queue::PersistentQueue>,
     pub restore_prompt_pending: Arc<AtomicBool>,
     pub restorable_tasks_available: Arc<AtomicBool>,
@@ -202,10 +203,20 @@ pub(crate) fn basic_auth_matches(headers: &HeaderMap, expected: Option<&str>) ->
     constant_time_str_eq(actual, expected)
 }
 
-pub(crate) fn request_host_allowed(headers: &HeaderMap, state: &AppState, expected_port: u16) -> bool {
-    let Some(host) = headers.get(header::HOST).and_then(|value| value.to_str().ok()) else {
+pub(crate) fn request_host_allowed(
+    headers: &HeaderMap,
+    state: &AppState,
+    expected_port: u16,
+) -> bool {
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
         return false;
     };
+    if state.reverse_proxy_mode {
+        return parse_authority_host_and_port(host, false).is_some();
+    }
     authority_matches_state(host, state, expected_port, false)
 }
 
@@ -221,6 +232,9 @@ pub(crate) fn origin_allowed(headers: &HeaderMap, state: &AppState, expected_por
     let Some(origin) = origin else {
         return false;
     };
+    if state.reverse_proxy_mode {
+        return origin_matches_forwarded_host(headers, origin);
+    }
     authority_matches_state(origin, state, expected_port, true)
 }
 
@@ -306,6 +320,28 @@ fn normalize_host_name(host: &str) -> String {
     host.trim().trim_matches('.').to_ascii_lowercase()
 }
 
+fn origin_matches_forwarded_host(headers: &HeaderMap, origin: &str) -> bool {
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Some((origin_host, origin_port)) = parse_authority_host_and_port(origin, true) else {
+        return false;
+    };
+    let Some((host_name, host_port)) = parse_authority_host_and_port(host, false) else {
+        return false;
+    };
+    if normalize_host_name(&origin_host) != normalize_host_name(&host_name) {
+        return false;
+    }
+    match (origin_port, host_port) {
+        (Some(origin_port), Some(host_port)) => origin_port == host_port,
+        _ => true,
+    }
+}
+
 fn constant_time_str_eq(actual: &str, expected: &str) -> bool {
     bool::from(actual.as_bytes().ct_eq(expected.as_bytes()))
 }
@@ -353,7 +389,9 @@ fn wildcard_host_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
                 || (!text.is_empty() && wildcard_host_match_bytes(pattern, &text[1..]))
         }
         b'?' => !text.is_empty() && wildcard_host_match_bytes(&pattern[1..], &text[1..]),
-        c => !text.is_empty() && c == text[0] && wildcard_host_match_bytes(&pattern[1..], &text[1..]),
+        c => {
+            !text.is_empty() && c == text[0] && wildcard_host_match_bytes(&pattern[1..], &text[1..])
+        }
     }
 }
 
@@ -410,9 +448,13 @@ pub fn create_router(state: AppState) -> Router {
     let guard_state = state.clone();
     Router::new()
         .route("/", get(frontend::index))
+        .route("/ws", get(push::ws_handler_with_app_state))
         .route("/assets/{*path}", get(frontend::asset))
         .route("/api/novels/count", get(novels::novels_count))
-        .route("/api/list", get(novels::api_list).post(novels::api_list_post))
+        .route(
+            "/api/list",
+            get(novels::api_list).post(novels::api_list_post),
+        )
         .route("/api/version/current.json", get(misc::version_current))
         .route("/api/version/latest.json", get(misc::version_latest))
         .route("/api/webui/config", get(misc::webui_config))
@@ -454,7 +496,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/cancel_running_task", post(jobs::cancel_running_task))
         .route("/api/get_pending_tasks", get(jobs::get_pending_tasks))
         .route("/api/remove_pending_task", post(jobs::remove_pending_task))
-        .route("/api/reorder_pending_tasks", post(jobs::reorder_pending_tasks))
+        .route(
+            "/api/reorder_pending_tasks",
+            post(jobs::reorder_pending_tasks),
+        )
         .route("/api/get_queue_size", get(jobs::get_queue_size))
         .route("/api/log/recent", get(misc::recent_logs))
         .route("/api/history", get(misc::console_history))
@@ -462,8 +507,14 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/sort_state", get(misc::get_sort_state))
         .route("/api/sort_state", post(misc::save_sort_state))
         .route("/api/story", get(novels::get_story))
-        .route("/api/global_setting", get(global_settings::get_global_settings))
-        .route("/api/global_setting", post(global_settings::save_global_settings))
+        .route(
+            "/api/global_setting",
+            get(global_settings::get_global_settings),
+        )
+        .route(
+            "/api/global_setting",
+            post(global_settings::save_global_settings),
+        )
         .route("/api/send", post(jobs::api_send))
         .route("/api/inspect", post(jobs::api_inspect))
         .route("/api/folder", post(jobs::api_folder))
@@ -471,16 +522,25 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/backup_bookmark", post(jobs::api_backup_bookmark))
         .route("/api/mail", post(jobs::api_mail))
         .route("/api/setting_burn", post(jobs::api_setting_burn))
-        .route("/api/diff_list", get(jobs::api_diff_list_get).post(jobs::api_diff_list))
+        .route(
+            "/api/diff_list",
+            get(jobs::api_diff_list_get).post(jobs::api_diff_list),
+        )
         .route("/api/diff", post(jobs::api_diff))
         .route("/api/diff_clean", post(jobs::api_diff_clean))
         .route("/api/csv/import", post(jobs::api_csv_import))
         .route("/api/csv/download", get(jobs::api_csv_download))
-        .route("/api/validate_url_regexp_list", get(misc::validate_url_regexp_list))
+        .route(
+            "/api/validate_url_regexp_list",
+            get(misc::validate_url_regexp_list),
+        )
         .route("/api/edit_tag", post(tags::edit_tag))
         .route("/api/update_by_tag", post(jobs::api_update_by_tag))
         .route("/api/taginfo.json", post(jobs::api_taginfo))
-        .route("/api/update_general_lastup", post(jobs::api_update_general_lastup))
+        .route(
+            "/api/update_general_lastup",
+            post(jobs::api_update_general_lastup),
+        )
         .route(
             "/api/download_request",
             get(jobs::bookmarklet_download_request_post_required).post(jobs::api_download_request),
@@ -490,9 +550,18 @@ pub fn create_router(state: AppState) -> Router {
             "/api/download4ssl",
             get(jobs::bookmarklet_download4ssl_post_required).post(jobs::api_download4ssl),
         )
-        .route("/api/restore_pending_tasks", post(jobs::restore_pending_tasks))
-        .route("/api/defer_restore_pending_tasks", post(jobs::defer_restore_pending_tasks))
-        .route("/api/confirm_running_tasks", post(jobs::confirm_running_tasks))
+        .route(
+            "/api/restore_pending_tasks",
+            post(jobs::restore_pending_tasks),
+        )
+        .route(
+            "/api/defer_restore_pending_tasks",
+            post(jobs::defer_restore_pending_tasks),
+        )
+        .route(
+            "/api/confirm_running_tasks",
+            post(jobs::confirm_running_tasks),
+        )
         .route("/api/shutdown", post(jobs::api_shutdown))
         .route("/api/reboot", post(jobs::api_reboot))
         .route("/settings", get(frontend::settings_page))
@@ -504,9 +573,15 @@ pub fn create_router(state: AppState) -> Router {
         .route("/notepad", get(frontend::notepad_page))
         .route("/widget/drag_and_drop", get(frontend::dnd_window_page))
         .route("/edit_menu", get(frontend::edit_menu_page))
-        .route("/novels/{id}/author_comments", get(frontend::author_comments_page))
+        .route(
+            "/novels/{id}/author_comments",
+            get(frontend::author_comments_page),
+        )
         .route("/novels/{id}/download", get(novels::download_ebook))
-        .route("/api/novels/{id}/author_comments", get(novels::author_comments))
+        .route(
+            "/api/novels/{id}/author_comments",
+            get(novels::author_comments),
+        )
         .layer(middleware::from_fn_with_state(
             auth_state,
             basic_auth_middleware,
@@ -561,9 +636,9 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
 
     use super::{
-        AppState, basic_auth_matches, is_exact_subdomain_wildcard_match,
-        is_safe_wildcard_pattern, origin_allowed, removal_log_message, request_host_allowed,
-        safe_existing_novel_dir, validate_web_tag_name, wildcard_host_match,
+        AppState, basic_auth_matches, is_exact_subdomain_wildcard_match, is_safe_wildcard_pattern,
+        origin_allowed, removal_log_message, request_host_allowed, safe_existing_novel_dir,
+        validate_web_tag_name, wildcard_host_match,
     };
 
     fn sample_record(file_title: &str) -> crate::db::novel_record::NovelRecord {
@@ -618,6 +693,7 @@ mod tests {
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
             allowed_request_hosts: vec!["127.0.0.1".to_string(), "localhost".to_string()],
+            reverse_proxy_mode: false,
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -654,8 +730,8 @@ mod tests {
     #[test]
     fn safe_existing_novel_dir_keeps_suspicious_names_inside_archive_root() {
         let archive_root = test_artifact_dir("safe-existing-novel-dir");
-        let path = safe_existing_novel_dir(&archive_root, &sample_record("..\\..\\escape"))
-            .unwrap();
+        let path =
+            safe_existing_novel_dir(&archive_root, &sample_record("..\\..\\escape")).unwrap();
         assert!(path.starts_with(&archive_root));
         assert!(path.ends_with(".._.._escape"));
         let _ = std::fs::remove_dir_all(archive_root);
@@ -722,9 +798,35 @@ mod tests {
     }
 
     #[test]
+    fn reverse_proxy_mode_accepts_forwarded_same_origin_hosts() {
+        let mut state = test_state();
+        state.reverse_proxy_mode = true;
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_static("narou.example.com:8443"),
+        );
+        assert!(request_host_allowed(&headers, &state, state.port));
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("https://narou.example.com:8443"),
+        );
+        assert!(origin_allowed(&headers, &state, state.port));
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("https://evil.example.com:8443"),
+        );
+        assert!(!origin_allowed(&headers, &state, state.port));
+    }
+
+    #[test]
     fn wildcard_host_match_rejects_subdomain_bypass() {
         // `*.example.com` must NOT match `evil.example.com.attacker.com`
-        assert!(!wildcard_host_match("*.example.com", "evil.example.com.attacker.com"));
+        assert!(!wildcard_host_match(
+            "*.example.com",
+            "evil.example.com.attacker.com"
+        ));
         // `*.example.com` must match `sub.example.com`
         assert!(wildcard_host_match("*.example.com", "sub.example.com"));
         // Bare `*` must be rejected by is_safe_wildcard_pattern
@@ -741,8 +843,17 @@ mod tests {
         assert!(is_safe_wildcard_pattern("localhost"));
         assert!(wildcard_host_match("localhost", "localhost"));
         // Exact subdomain level enforcement
-        assert!(!is_exact_subdomain_wildcard_match("*.example.com", "sub.sub.example.com"));
-        assert!(!is_exact_subdomain_wildcard_match("*.example.com", "evil.example.com.attacker.com"));
-        assert!(is_exact_subdomain_wildcard_match("*.example.com", "sub.example.com"));
+        assert!(!is_exact_subdomain_wildcard_match(
+            "*.example.com",
+            "sub.sub.example.com"
+        ));
+        assert!(!is_exact_subdomain_wildcard_match(
+            "*.example.com",
+            "evil.example.com.attacker.com"
+        ));
+        assert!(is_exact_subdomain_wildcard_match(
+            "*.example.com",
+            "sub.example.com"
+        ));
     }
 }
