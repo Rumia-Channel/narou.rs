@@ -833,8 +833,14 @@ impl Downloader {
             old_count, latest_count
         );
 
+        let mut auto_choices = crate::compat::load_digest_auto_choices();
+
         loop {
-            match crate::compat::choose_digest_action(title, &message) {
+            match crate::compat::choose_digest_action_with_auto_choices(
+                title,
+                &message,
+                &mut auto_choices,
+            ) {
                 crate::compat::DigestChoice::Update => return Ok(false),
                 crate::compat::DigestChoice::Cancel => return Ok(true),
                 crate::compat::DigestChoice::CancelAndFreeze => {

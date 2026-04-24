@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -441,21 +441,28 @@ pub fn confirm(message: &str, default: bool, nontty_default: bool) -> bool {
     matches!(input.as_str(), "y" | "yes")
 }
 
-pub fn choose_digest_action(title: &str, message: &str) -> DigestChoice {
-    let auto_choices = load_local_setting_string("download.choices-of-digest-options")
-        .map(|s| {
-            s.split(',')
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+fn parse_digest_auto_choices(value: Option<&str>) -> Option<VecDeque<String>> {
+    value.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+            .collect()
+    })
+}
 
-    let mut queue = auto_choices;
+pub fn load_digest_auto_choices() -> Option<VecDeque<String>> {
+    parse_digest_auto_choices(load_local_setting_string("download.choices-of-digest-options").as_deref())
+}
+
+fn choose_digest_action_inner(
+    title: &str,
+    message: &str,
+    auto_choices: &mut Option<VecDeque<String>>,
+) -> DigestChoice {
     loop {
-        let choice = if !queue.is_empty() {
-            let choice = queue.remove(0);
+        let choice = if let Some(queue) = auto_choices.as_mut() {
+            let choice = queue.pop_front().unwrap_or_else(|| DIGEST_DEFAULT.to_string());
             println!("{}", title);
             println!("{}", message);
             for (key, label) in DIGEST_CHOICES {
@@ -491,15 +498,29 @@ pub fn choose_digest_action(title: &str, message: &str) -> DigestChoice {
             "7" => return DigestChoice::OpenFolder,
             "8" => return DigestChoice::Convert,
             _ => {
-                if queue.is_empty() && !io::stdin().is_terminal() {
+                if auto_choices.is_some() {
+                    continue;
+                }
+                if !io::stdin().is_terminal() {
                     return DigestChoice::Cancel;
                 }
-                if queue.is_empty() {
-                    println!("選択肢の中にありません。もう一度入力して下さい");
-                }
+                println!("選択肢の中にありません。もう一度入力して下さい");
             }
         }
     }
+}
+
+pub fn choose_digest_action_with_auto_choices(
+    title: &str,
+    message: &str,
+    auto_choices: &mut Option<VecDeque<String>>,
+) -> DigestChoice {
+    choose_digest_action_inner(title, message, auto_choices)
+}
+
+pub fn choose_digest_action(title: &str, message: &str) -> DigestChoice {
+    let mut auto_choices = load_digest_auto_choices();
+    choose_digest_action_inner(title, message, &mut auto_choices)
 }
 
 pub fn create_backup(novel_dir: &Path, title: &str) -> Result<String> {
@@ -757,10 +778,10 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        NovelLockGuard, configure_web_subprocess_command, get_copy_to_directory,
-        load_frozen_ids_from_inventory,
-        load_locked_ids_from_inventory, record_is_frozen, reroute_web_line_to_console,
-        sanitize_backup_name, terminate_process,
+        DigestChoice, NovelLockGuard, choose_digest_action_with_auto_choices,
+        configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
+        load_locked_ids_from_inventory, parse_digest_auto_choices, record_is_frozen,
+        reroute_web_line_to_console, sanitize_backup_name, terminate_process,
     };
     use crate::db::NovelRecord;
 
@@ -835,6 +856,37 @@ mod tests {
     #[test]
     fn terminate_process_treats_missing_pid_as_success() {
         assert!(terminate_process(i32::MAX as u32).is_ok());
+    }
+
+    #[test]
+    fn parse_digest_auto_choices_splits_comma_separated_values() {
+        let queue = parse_digest_auto_choices(Some("8, 4,1")).unwrap();
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec!["8".to_string(), "4".to_string(), "1".to_string()]
+        );
+    }
+
+    #[test]
+    fn digest_auto_choices_advance_across_repeated_prompts() {
+        let mut auto_choices = parse_digest_auto_choices(Some("8,4,1"));
+
+        assert_eq!(
+            choose_digest_action_with_auto_choices("title", "message", &mut auto_choices),
+            DigestChoice::Convert
+        );
+        assert_eq!(
+            choose_digest_action_with_auto_choices("title", "message", &mut auto_choices),
+            DigestChoice::Backup
+        );
+        assert_eq!(
+            choose_digest_action_with_auto_choices("title", "message", &mut auto_choices),
+            DigestChoice::Update
+        );
+        assert_eq!(
+            choose_digest_action_with_auto_choices("title", "message", &mut auto_choices),
+            DigestChoice::Cancel
+        );
     }
 
     #[test]

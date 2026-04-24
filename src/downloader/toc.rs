@@ -120,16 +120,40 @@ pub fn parse_subtitles(
 pub fn parse_subtitles_multipage(
     fetcher: &mut HttpFetcher,
     setting: &SiteSetting,
-    mut toc_source: &str,
+    toc_source: &str,
     url_captures: &HashMap<String, String>,
     title: &str,
     progress: Option<&dyn ProgressReporter>,
 ) -> Result<Vec<SubtitleInfo>> {
+    parse_subtitles_multipage_with(
+        fetcher,
+        setting,
+        toc_source,
+        url_captures,
+        title,
+        progress,
+        fetch_toc,
+    )
+}
+
+fn parse_subtitles_multipage_with<F>(
+    fetcher: &mut HttpFetcher,
+    setting: &SiteSetting,
+    toc_source: &str,
+    url_captures: &HashMap<String, String>,
+    title: &str,
+    progress: Option<&dyn ProgressReporter>,
+    mut fetch_next_toc: F,
+) -> Result<Vec<SubtitleInfo>>
+where
+    F: FnMut(&mut HttpFetcher, &SiteSetting, &str) -> Result<String>,
+{
     let mut all_subtitles = Vec::new();
+    let mut current_toc_source = toc_source.to_string();
     let mut page = 0;
     let max_pages = if let Some(pattern) = setting.toc_page_max_pattern() {
         pattern
-            .captures(toc_source)
+            .captures(&current_toc_source)
             .and_then(|caps| caps.get(1))
             .and_then(|m| m.as_str().parse::<usize>().ok())
             .unwrap_or(1)
@@ -147,7 +171,7 @@ pub fn parse_subtitles_multipage(
     }
 
     loop {
-        let page_subs = parse_subtitles(setting, toc_source, url_captures)?;
+        let page_subs = parse_subtitles(setting, &current_toc_source, url_captures)?;
         all_subtitles.extend(page_subs);
 
         page += 1;
@@ -165,7 +189,7 @@ pub fn parse_subtitles_multipage(
             None => break,
         };
 
-        let caps = match next_toc_pattern.captures(toc_source) {
+        let caps = match next_toc_pattern.captures(&current_toc_source) {
             Some(c) => c,
             None => break,
         };
@@ -183,14 +207,7 @@ pub fn parse_subtitles_multipage(
         };
         let next_url = setting.get_next_url_with_captures(&next_url_val, &next_captures);
 
-        fetcher.rate_limiter.wait();
-        let response = fetcher.client.get(&next_url).send()?;
-        if !response.status().is_success() {
-            break;
-        }
-        let mut body = response.text()?;
-        pretreatment_source(&mut body, setting.encoding(), Some(setting));
-        toc_source = Box::leak(body.into_boxed_str());
+        current_toc_source = fetch_next_toc(fetcher, setting, &next_url)?;
     }
 
     if show_progress {
@@ -277,6 +294,64 @@ mod tests {
             vec!["目次 テスト作品".to_string()]
         );
         assert_eq!(*progress.positions.lock().unwrap(), vec![0, 0]);
+    }
+
+    #[test]
+    fn r18_multipage_toc_fetches_following_pages_via_next_url() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "novel18.syosetu.com")
+            .unwrap();
+        let first_page = r#"
+<a href="/n1234aa/?p=2" class="c-pager__item c-pager__item--last">2</a>
+<div class="p-eplist__sublist">
+<a href="/n1234aa/1/" class="p-eplist__subtitle">
+第1話
+</a>
+
+<div class="p-eplist__update">
+2024年01月01日 00時00分
+</div>
+</div>
+<a href="/n1234aa/?p=2" class="c-pager__item c-pager__item--next">
+"#;
+        let second_page = r#"
+<div class="p-eplist__sublist">
+<a href="/n1234aa/2/" class="p-eplist__subtitle">
+第2話
+</a>
+
+<div class="p-eplist__update">
+2024年01月02日 00時00分
+</div>
+</div>
+"#;
+        let mut fetcher = HttpFetcher::new("test-agent").unwrap();
+        let mut fetched_urls = Vec::new();
+
+        let subtitles = parse_subtitles_multipage_with(
+            &mut fetcher,
+            setting,
+            first_page,
+            &HashMap::new(),
+            "",
+            None,
+            |_, _, next_url| {
+                fetched_urls.push(next_url.to_string());
+                Ok(second_page.to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fetched_urls,
+            vec!["https://novel18.syosetu.com/n1234aa/?p=2".to_string()]
+        );
+        assert_eq!(subtitles.len(), 2);
+        assert_eq!(subtitles[0].index, "1");
+        assert_eq!(subtitles[1].index, "2");
+        assert_eq!(subtitles[1].href, "/n1234aa/2/");
     }
 
     #[test]
