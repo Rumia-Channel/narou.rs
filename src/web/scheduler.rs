@@ -10,7 +10,8 @@ use serde_yaml::Value;
 use tokio::task::JoinHandle;
 
 use crate::compat::{
-    configure_web_subprocess_command, load_local_setting_bool, load_local_setting_string,
+    configure_web_subprocess_command, load_frozen_ids_from_inventory, load_local_setting_bool,
+    load_local_setting_string, record_is_frozen,
 };
 use crate::db;
 use crate::db::inventory::{Inventory, InventoryScope};
@@ -315,41 +316,57 @@ fn auto_update_sort_key_from_value(server_setting: &Value) -> Option<&'static st
 }
 
 fn collect_auto_update_target_ids() -> (Vec<String>, Vec<String>) {
-    let tag_index = db::with_database(|db| Ok::<_, crate::error::NarouError>(db.tag_index()))
-        .unwrap_or_default();
-    let modified_ids: Vec<String> = tag_index
-        .get("modified")
-        .into_iter()
-        .flat_map(|ids| ids.iter().copied())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .map(|id| id.to_string())
-        .collect();
-
-    let modified_set: std::collections::HashSet<i64> = modified_ids
-        .iter()
-        .filter_map(|id| id.parse::<i64>().ok())
-        .collect();
     let site_settings = SiteSetting::load_all().unwrap_or_default();
-    let other_ids = db::with_database(|db| {
-        Ok::<_, crate::error::NarouError>(
-            db.all_records()
-                .values()
-                .filter(|record| !modified_set.contains(&record.id))
-                .filter(|record| {
-                    !site_settings
-                        .iter()
-                        .find(|setting| setting.matches_url(&record.toc_url))
-                        .and_then(|setting| setting.narou_api_url.as_ref())
-                        .is_some()
-                })
-                .map(|record| record.id.to_string())
-                .collect::<Vec<_>>(),
-        )
+    db::with_database(|db| {
+        let frozen_ids = load_frozen_ids_from_inventory(db.inventory()).unwrap_or_default();
+        let modified_ids = db
+            .tag_index()
+            .get("modified")
+            .into_iter()
+            .flat_map(|ids| ids.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        Ok::<_, crate::error::NarouError>(split_auto_update_target_ids(
+            db.all_records().values(),
+            &modified_ids,
+            &frozen_ids,
+            |record| {
+                site_settings
+                    .iter()
+                    .find(|setting| setting.matches_url(&record.toc_url))
+                    .and_then(|setting| setting.narou_api_url.as_ref())
+                    .is_some()
+            },
+        ))
     })
-    .unwrap_or_default();
+    .unwrap_or_default()
+}
 
-    (modified_ids, other_ids)
+fn split_auto_update_target_ids<'a, I, F>(
+    records: I,
+    modified_ids: &std::collections::BTreeSet<i64>,
+    frozen_ids: &std::collections::HashSet<i64>,
+    mut api_supported: F,
+) -> (Vec<String>, Vec<String>)
+where
+    I: IntoIterator<Item = &'a crate::db::NovelRecord>,
+    F: FnMut(&crate::db::NovelRecord) -> bool,
+{
+    let mut modified = Vec::new();
+    let mut other = Vec::new();
+    for record in records {
+        if record_is_frozen(record, frozen_ids) {
+            continue;
+        }
+        if modified_ids.contains(&record.id) {
+            modified.push(record.id.to_string());
+            continue;
+        }
+        if api_supported(record) {
+            continue;
+        }
+        other.push(record.id.to_string());
+    }
+    (modified, other)
 }
 
 fn queue_auto_update_job_if_needed(
@@ -551,10 +568,43 @@ fn auto_update_echo(push_server: &PushServer, body: &str) {
 mod tests {
     use super::{
         auto_update_sort_key_from_value, calculate_next_run_time, parse_schedule_times,
-        queue_auto_update_job_if_needed,
+        queue_auto_update_job_if_needed, split_auto_update_target_ids,
     };
+    use crate::db::NovelRecord;
     use crate::queue::{JobType, PersistentQueue, QueueJob};
+    use chrono::Utc;
     use parking_lot::Mutex;
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+    fn sample_record(id: i64, toc_url: &str, tags: &[&str]) -> NovelRecord {
+        NovelRecord {
+            id,
+            author: "author".to_string(),
+            title: format!("title-{id}"),
+            file_title: format!("{id} title-{id}"),
+            toc_url: toc_url.to_string(),
+            sitename: "site".to_string(),
+            novel_type: 1,
+            end: false,
+            last_update: Utc::now(),
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: None,
+            general_lastup: None,
+            last_mail_date: None,
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            ncode: None,
+            domain: None,
+            general_all_no: None,
+            length: None,
+            suspend: false,
+            is_narou: false,
+            last_check_date: None,
+            convert_failure: false,
+            extra_fields: BTreeMap::new(),
+        }
+    }
 
     #[test]
     fn parse_schedule_times_accepts_four_digit_times() {
@@ -614,5 +664,26 @@ mod tests {
         assert!(!queued);
         assert_eq!(job_id, "running-auto");
         assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn auto_update_target_split_skips_frozen_records() {
+        let records = vec![
+            sample_record(1, "https://example.com/1", &[]),
+            sample_record(2, "https://example.com/2", &[]),
+            sample_record(3, "https://example.com/3", &["frozen"]),
+            sample_record(4, "https://example.com/4", &[]),
+            sample_record(5, "https://example.com/5", &[]),
+        ];
+        let modified_ids = BTreeSet::from([1, 3]);
+        let frozen_ids = HashSet::from([4]);
+
+        let (modified, other) =
+            split_auto_update_target_ids(records.iter(), &modified_ids, &frozen_ids, |record| {
+                record.id == 2
+            });
+
+        assert_eq!(modified, vec!["1".to_string()]);
+        assert_eq!(other, vec!["5".to_string()]);
     }
 }
