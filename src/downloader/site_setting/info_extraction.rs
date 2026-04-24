@@ -4,7 +4,7 @@ use regex::RegexBuilder;
 
 use super::{SiteSetting, SiteSettingEntry, SiteSettingValue};
 use crate::downloader::security::{MAX_REGEX_INPUT_LEN, MAX_YAML_REGEX_PATTERN_LEN};
-use crate::downloader::util::DEFAULT_REGEX_SIZE_LIMIT;
+use crate::downloader::util::{DEFAULT_REGEX_SIZE_LIMIT, decode_html_text};
 
 fn build_standard_regex(pattern: &str) -> std::result::Result<regex::Regex, regex::Error> {
     if pattern.len() > MAX_YAML_REGEX_PATTERN_LEN {
@@ -47,12 +47,12 @@ fn try_regex_captures(
             for name in re.capture_names().flatten() {
                 if capture_name_matches_key(key, name) {
                     if let Some(m) = caps.name(name) {
-                        return Some(m.as_str().to_string());
+                        return Some(decode_html_text(m.as_str()));
                     }
                 }
             }
             if let Some(m) = caps.get(1) {
-                return Some(m.as_str().to_string());
+                return Some(decode_html_text(m.as_str()));
             }
         }
         return None;
@@ -71,12 +71,12 @@ fn try_regex_captures(
             for name in fre.capture_names().flatten() {
                 if capture_name_matches_key(key, name) {
                     if let Some(m) = caps.name(name) {
-                        return Some(m.as_str().to_string());
+                        return Some(decode_html_text(m.as_str()));
                     }
                 }
             }
             if let Some(m) = caps.get(1) {
-                return Some(m.as_str().to_string());
+                return Some(decode_html_text(m.as_str()));
             }
         }
     }
@@ -94,7 +94,7 @@ fn try_regex_captures_all(pattern: &str, source: &str, key: &str) -> Vec<String>
                 if capture_name_matches_key(key, name)
                     && let Some(m) = caps.name(name)
                 {
-                    values.push(m.as_str().to_string());
+                    values.push(decode_html_text(m.as_str()));
                     matched = true;
                     break;
                 }
@@ -102,7 +102,7 @@ fn try_regex_captures_all(pattern: &str, source: &str, key: &str) -> Vec<String>
             if !matched
                 && let Some(m) = caps.get(1)
             {
-                values.push(m.as_str().to_string());
+                values.push(decode_html_text(m.as_str()));
             }
         }
         return values;
@@ -126,7 +126,7 @@ fn try_regex_captures_all(pattern: &str, source: &str, key: &str) -> Vec<String>
                 if capture_name_matches_key(key, name)
                     && let Some(m) = caps.name(name)
                 {
-                    values.push(m.as_str().to_string());
+                    values.push(decode_html_text(m.as_str()));
                     matched = true;
                     break;
                 }
@@ -134,7 +134,7 @@ fn try_regex_captures_all(pattern: &str, source: &str, key: &str) -> Vec<String>
             if !matched
                 && let Some(m) = caps.get(1)
             {
-                values.push(m.as_str().to_string());
+                values.push(decode_html_text(m.as_str()));
             }
         }
         return values;
@@ -295,6 +295,7 @@ fn capture_name_matches_key(key: &str, capture_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::downloader::site_setting::SiteSetting;
 
     #[test]
     fn test_ncode_tags_regex_match() {
@@ -315,5 +316,25 @@ mod tests {
         let source = "tag::tag-a\ntag::tag-b\ntag::tag-c";
         let result = try_regex_captures_all(pattern, source, "tags");
         assert_eq!(result, vec!["tag-a", "tag-b", "tag-c"]);
+    }
+
+    #[test]
+    fn multi_match_decodes_html_entities_in_story_capture() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "novel18.syosetu.com")
+            .unwrap();
+        let html = r#"
+<dt class="p-infotop-data__title">あらすじ</dt>
+<dd class="p-infotop-data__value">&quot;氷の令嬢&quot; &amp; 隣人 &#39;test&#39;</dd>
+"#;
+
+        let values = setting.multi_match(html, &["s"]);
+
+        assert_eq!(
+            values.get("s").map(String::as_str),
+            Some("\"氷の令嬢\" & 隣人 'test'")
+        );
     }
 }

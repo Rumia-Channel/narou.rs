@@ -17,18 +17,22 @@ pub fn build_section_url(setting: &SiteSetting, toc_url: &str, href: &str) -> St
     }
 }
 
-fn decode_html_href(href: &str) -> String {
-    let mut decoded = href
-        .split('#')
-        .next()
-        .unwrap_or("")
+pub fn decode_html_text(text: &str) -> String {
+    let mut decoded = text
         .replace("&amp;", "&")
         .replace("&quot;", "\"")
+        .replace("&apos;", "'")
         .replace("&#39;", "'")
         .replace("&lt;", "<")
-        .replace("&gt;", ">");
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .replace("&copy;", "(c)");
     decode_numeric_entities(&mut decoded);
-    decoded
+    decoded.replace('\u{00A0}', " ")
+}
+
+fn decode_html_href(href: &str) -> String {
+    decode_html_text(href.split('#').next().unwrap_or(""))
 }
 
 pub fn compile_html_pattern(pattern: &str) -> std::result::Result<regex::Regex, regex::Error> {
