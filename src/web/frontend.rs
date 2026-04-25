@@ -140,27 +140,29 @@ pub async fn asset(Path(path): Path<String>) -> Response {
     let (content_type, body): (&'static str, Cow<'static, [u8]>) = match path.as_str() {
         "css/theme.css" => (
             "text/css; charset=utf-8",
-            Cow::Borrowed(include_str!("assets/css/theme.css").as_bytes()),
+            Cow::Owned(apply_asset_versions(include_str!("assets/css/theme.css")).into_bytes()),
         ),
         "css/base.css" => (
             "text/css; charset=utf-8",
-            Cow::Borrowed(include_str!("assets/css/base.css").as_bytes()),
+            Cow::Owned(apply_asset_versions(include_str!("assets/css/base.css")).into_bytes()),
         ),
         "css/layout.css" => (
             "text/css; charset=utf-8",
-            Cow::Borrowed(include_str!("assets/css/layout.css").as_bytes()),
+            Cow::Owned(apply_asset_versions(include_str!("assets/css/layout.css")).into_bytes()),
         ),
         "css/components.css" => (
             "text/css; charset=utf-8",
-            Cow::Borrowed(include_str!("assets/css/components.css").as_bytes()),
+            Cow::Owned(
+                apply_asset_versions(include_str!("assets/css/components.css")).into_bytes(),
+            ),
         ),
         "css/responsive.css" => (
             "text/css; charset=utf-8",
-            Cow::Borrowed(include_str!("assets/css/responsive.css").as_bytes()),
+            Cow::Owned(apply_asset_versions(include_str!("assets/css/responsive.css")).into_bytes()),
         ),
         "css/settings.css" => (
             "text/css; charset=utf-8",
-            Cow::Borrowed(include_str!("assets/css/settings.css").as_bytes()),
+            Cow::Owned(apply_asset_versions(include_str!("assets/css/settings.css")).into_bytes()),
         ),
         "js/main.js" => (
             "application/javascript; charset=utf-8",
@@ -304,6 +306,15 @@ mod tests {
         let rendered_render =
             apply_js_module_versions("js/ui/render.js", include_str!("assets/js/ui/render.js"));
         assert!(rendered_render.contains(&format!("import('./actions.js?v={actions_version}')")));
+    }
+
+    #[test]
+    fn css_asset_versions_append_query_hashes_to_font_urls() {
+        let font_version = asset_version("fonts/FORMUDPGothic/FORMUDPGothic-Regular.ttf").unwrap();
+        let rendered = apply_asset_versions(include_str!("assets/css/base.css"));
+        assert!(rendered.contains(&format!(
+            "/assets/fonts/FORMUDPGothic/FORMUDPGothic-Regular.ttf?v={font_version}"
+        )));
     }
 
     #[tokio::test]
