@@ -27,7 +27,7 @@ use std::sync::{Arc, atomic::AtomicBool};
 use subtle::ConstantTimeEq;
 use tokio::task::JoinHandle;
 
-pub(crate) const MAX_WEB_TARGETS_PER_REQUEST: usize = 512;
+pub(crate) const MAX_WEB_TARGETS_PER_REQUEST: usize = 100_000;
 pub(crate) const MAX_WEB_TAGS_PER_REQUEST: usize = 128;
 pub(crate) const MAX_WEB_TARGET_LENGTH: usize = 4096;
 pub(crate) const MAX_WEB_TAG_LENGTH: usize = 255;
