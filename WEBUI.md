@@ -306,6 +306,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 |------|--------|--------|------|
 | バージョン表示 | あり | `#about-version` (APIから取得) | ✅ |
 | 最新バージョンチェック | `/api/version/latest.json` | あり | ✅ |
+| ワンクリック自動アップデート | なし | `#about-update` → `POST /api/update/start` (同梱 `narou_rs_updater(.exe)` がファイル置換+再起動) | ✅ |
 | ブックマークレット案内 | あり | `/bookmarklet` | ✅ |
 | ライセンス情報 | あり | 簡易テキスト | 🟡 |
 
@@ -557,6 +558,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 |-------------|--------|------|
 | `/api/shutdown` | POST | ✅ |
 | `/api/reboot` | POST | ✅ |
+| `/api/update/start` | POST | ✅ (Rust拡張: 同梱 updater による自動アップデート) |
 
 ### 6.10 未実装 API (Ruby版にあるが Rust版未実装)
 

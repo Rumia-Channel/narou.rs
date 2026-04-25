@@ -11,6 +11,7 @@ pub mod sort_state;
 pub mod state;
 mod tag_colors;
 pub mod tags;
+pub mod update;
 pub mod worker;
 
 use axum::{
@@ -603,6 +604,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/shutdown", post(jobs::api_shutdown))
         .route("/api/reboot", post(jobs::api_reboot))
+        .route("/api/update/start", post(update::api_update_start))
         .route("/settings", get(frontend::settings_page))
         .route("/help", get(frontend::help_page))
         .route("/about", get(frontend::about_page))

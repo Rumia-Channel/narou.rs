@@ -80,11 +80,13 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
                 .trim_start_matches('v')
                 .to_string();
             let current_plain = normalize_version(&current);
+            let develop = !version::commit_version_exists();
             Json(serde_json::json!({
                 "success": true,
                 "current_version": current,
                 "latest_version": latest,
                 "update_available": !latest.is_empty() && latest != current_plain,
+                "develop": develop,
                 "url": json["html_url"].as_str().unwrap_or("https://github.com/Rumia-Channel/narou.rs/releases/latest"),
             }))
         }

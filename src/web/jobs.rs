@@ -1133,7 +1133,7 @@ fn notify_queue_changed(state: &AppState) {
     state.push_server.broadcast_event("notification.queue", "");
 }
 
-async fn prepare_process_shutdown(state: &AppState) {
+pub(super) async fn prepare_process_shutdown(state: &AppState) {
     kill_running_child(state);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
     while state.queue.running_count() > 0 && tokio::time::Instant::now() < deadline {

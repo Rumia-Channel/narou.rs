@@ -366,6 +366,32 @@ export function bindActions() {
   on('about-check-latest', async () => {
     await updateLatestVersionInfo();
   });
+  on('about-update', async () => {
+    if (!confirm('最新バージョンへ更新します。WEBサーバーは一旦停止し、自動的に再起動します。よろしいですか？')) return;
+    const btn = El.aboutUpdate;
+    if (btn) btn.disabled = true;
+    if (El.aboutUpdateStatus) {
+      El.aboutUpdateStatus.classList.remove('hide');
+      El.aboutUpdateStatus.textContent = 'アップデートを開始しています...';
+    }
+    try {
+      const result = await postJson('/api/update/start', {});
+      if (!result?.success) {
+        throw new Error(result?.message || 'アップデート開始に失敗しました');
+      }
+      if (El.aboutUpdateStatus) {
+        El.aboutUpdateStatus.textContent = 'ダウンロード中... 完了後に再起動します';
+      }
+      // Server triggers reboot; the existing /_rebooting page handles reconnection.
+      setTimeout(() => { window.location.href = '/_rebooting'; }, 1500);
+    } catch (error) {
+      if (El.aboutUpdateStatus) {
+        El.aboutUpdateStatus.textContent = `アップデート失敗: ${error.message || error}`;
+      }
+      if (btn) btn.disabled = false;
+      showNotification(error.message || 'アップデートに失敗しました', 'error');
+    }
+  });
 
   on('queue-restore-yes', async () => {
     El.queueRestoreModal?.classList.add('hide');
@@ -1434,6 +1460,14 @@ async function openAbout() {
   if (El.aboutLatestVersion) {
     El.aboutLatestVersion.textContent = '最新バージョン: 確認中...';
   }
+  if (El.aboutUpdate) {
+    El.aboutUpdate.classList.add('hide');
+    El.aboutUpdate.disabled = false;
+  }
+  if (El.aboutUpdateStatus) {
+    El.aboutUpdateStatus.classList.add('hide');
+    El.aboutUpdateStatus.textContent = '';
+  }
   void updateLatestVersionInfo();
 }
 
@@ -1446,6 +1480,14 @@ async function updateLatestVersionInfo() {
       const current = data.current_version || '-';
       El.aboutLatestVersion.textContent =
         `最新バージョン: ${latest}${data.update_available ? ' (更新あり)' : ' (最新)'} / 現在: ${current}`;
+      if (El.aboutUpdate) {
+        if (data.update_available && !data.develop) {
+          El.aboutUpdate.classList.remove('hide');
+          El.aboutUpdate.disabled = false;
+        } else {
+          El.aboutUpdate.classList.add('hide');
+        }
+      }
       return;
     }
     El.aboutLatestVersion.textContent =

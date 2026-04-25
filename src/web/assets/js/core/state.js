@@ -97,6 +97,7 @@ const ELEMENT_IDS = [
   'tag-suggestions',
   'about-modal', 'about-close', 'about-ok', 'about-version',
   'about-latest-version', 'about-check-latest',
+  'about-update', 'about-update-status',
   'confirm-modal', 'confirm-title', 'confirm-message',
   'confirm-cancel', 'confirm-ok',
   'remove-modal', 'remove-novel-list', 'remove-with-file',

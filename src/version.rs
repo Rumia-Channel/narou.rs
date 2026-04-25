@@ -21,6 +21,7 @@ pub fn version_json() -> serde_json::Value {
     serde_json::json!({
         "version": create_version_string(),
         "name": NAME,
+        "develop": !commit_version_exists(),
     })
 }
 
@@ -57,7 +58,7 @@ pub fn aozoraepub3_jar_path() -> Option<PathBuf> {
     aozoraepub3_jar_next_to_exe()
 }
 
-fn commit_version_exists() -> bool {
+pub fn commit_version_exists() -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };

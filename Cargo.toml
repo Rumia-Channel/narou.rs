@@ -53,6 +53,14 @@ libc = "0.2.186"
 base64 = "0.22"
 sha3 = "0.11"
 
+[[bin]]
+name = "narou_rs"
+path = "src/main.rs"
+
+[[bin]]
+name = "narou_rs_updater"
+path = "src/bin/updater.rs"
+
 [target."cfg(windows)".dependencies]
 tray-icon = "0.22"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

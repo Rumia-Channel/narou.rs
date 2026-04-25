@@ -135,8 +135,15 @@ jobs:
         id: package
         shell: pwsh
         run: |
+          $binary = "${{ matrix.binary }}"
+          if ($binary.EndsWith(".exe")) {
+            $updaterBinary = "narou_rs_updater.exe"
+          } else {
+            $updaterBinary = "narou_rs_updater"
+          }
           $archivePath = & .\scripts\package-release.ps1 `
             -BinaryPath "target/${{ matrix.target }}/release/${{ matrix.binary }}" `
+            -UpdaterBinaryPath "target/${{ matrix.target }}/release/$updaterBinary" `
             -Platform "${{ matrix.platform }}" `
             -Arch "${{ matrix.arch }}" `
             -PackageRoot "narou" `

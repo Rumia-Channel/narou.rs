@@ -3,6 +3,9 @@ param(
     [string]$BinaryPath,
 
     [Parameter(Mandatory = $true)]
+    [string]$UpdaterBinaryPath,
+
+    [Parameter(Mandatory = $true)]
     [ValidateSet("win", "mac", "linux", "rpi24", "rpi0")]
     [string]$Platform,
 
@@ -25,10 +28,14 @@ $ErrorActionPreference = "Stop"
 if (-not (Test-Path -Path $BinaryPath -PathType Leaf)) {
     throw "Binary not found: $BinaryPath"
 }
+if (-not (Test-Path -Path $UpdaterBinaryPath -PathType Leaf)) {
+    throw "Updater binary not found: $UpdaterBinaryPath"
+}
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
 $resolvedBinary = (Resolve-Path -Path $BinaryPath).Path
+$resolvedUpdaterBinary = (Resolve-Path -Path $UpdaterBinaryPath).Path
 $resolvedOutputDir = (Resolve-Path -Path $OutputDir).Path
 $archiveName = "narou_rs_{0}_{1}.zip" -f $Platform, $Arch
 $archivePath = Join-Path -Path $resolvedOutputDir -ChildPath $archiveName
@@ -118,6 +125,11 @@ try {
         -Archive $archive `
         -SourcePath $resolvedBinary `
         -EntryPath (Join-Path -Path $PackageRoot -ChildPath ([System.IO.Path]::GetFileName($resolvedBinary)))
+
+    Add-FileToArchive `
+        -Archive $archive `
+        -SourcePath $resolvedUpdaterBinary `
+        -EntryPath (Join-Path -Path $PackageRoot -ChildPath ([System.IO.Path]::GetFileName($resolvedUpdaterBinary)))
 
     foreach ($resourceDir in $ResourceDirectories) {
         if ([string]::IsNullOrWhiteSpace($resourceDir)) {
