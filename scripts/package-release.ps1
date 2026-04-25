@@ -5,10 +5,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$UpdaterBinaryPath,
 
-    [Parameter(Mandatory = $false)]
-    [AllowEmptyString()]
-    [ValidateSet("", "win", "mac", "linux")]
-    [string]$Platform = "",
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("win", "mac", "linux")]
+    [string]$Platform,
 
     [string]$Arch = "x64",
 
@@ -38,11 +37,7 @@ New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $resolvedBinary = (Resolve-Path -Path $BinaryPath).Path
 $resolvedUpdaterBinary = (Resolve-Path -Path $UpdaterBinaryPath).Path
 $resolvedOutputDir = (Resolve-Path -Path $OutputDir).Path
-if ([string]::IsNullOrEmpty($Platform)) {
-    $archiveName = "narou_rs_{0}.zip" -f $Arch
-} else {
-    $archiveName = "narou_rs_{0}_{1}.zip" -f $Platform, $Arch
-}
+$archiveName = "narou_rs_{0}_{1}.zip" -f $Platform, $Arch
 $archivePath = Join-Path -Path $resolvedOutputDir -ChildPath $archiveName
 
 if (Test-Path -Path $archivePath -PathType Leaf) {

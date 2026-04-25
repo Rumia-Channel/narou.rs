@@ -91,14 +91,14 @@ jobs:
             builder: cargo
           - name: Raspberry Pi 2/3/4
             os: ubuntu-24.04
-            platform: ""
+            platform: linux
             arch: armv7
             binary: narou_rs
             target: armv7-unknown-linux-gnueabihf
             builder: cross
           - name: Raspberry Pi Zero
             os: ubuntu-24.04
-            platform: ""
+            platform: linux
             arch: armv6
             binary: narou_rs
             target: arm-unknown-linux-gnueabihf
