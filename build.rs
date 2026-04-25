@@ -6,6 +6,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=NAROU_RS_VERSION_OVERRIDE");
+    if let Ok(override_version) = std::env::var("NAROU_RS_VERSION_OVERRIDE") {
+        let trimmed = override_version.trim();
+        if !trimmed.is_empty() {
+            println!("cargo:rustc-env=NAROU_RS_VERSION_OVERRIDE={}", trimmed);
+        }
+    }
+
     let asset_root = PathBuf::from("src").join("web").join("assets");
     println!("cargo:rerun-if-changed={}", asset_root.display());
 

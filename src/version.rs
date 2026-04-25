@@ -7,7 +7,10 @@ use crate::compat::configure_hidden_console_command;
 use crate::db::inventory::Inventory;
 
 pub const NAME: &str = "narou.rs";
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION: &str = match option_env!("NAROU_RS_VERSION_OVERRIDE") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 pub fn create_version_string() -> String {
     if commit_version_exists() {
