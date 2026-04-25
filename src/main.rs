@@ -106,6 +106,8 @@ fn raw_hide_console_requested() -> bool {
 async fn main() {
     prepare_windows_console();
 
+    narou_rs::updater_promote::try_promote_pending_updater();
+
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
     let global_flags = cli::preprocess_args(&mut args);

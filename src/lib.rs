@@ -14,5 +14,6 @@ pub mod progress;
 pub mod queue;
 pub mod setting_info;
 pub mod termcolor;
+pub mod updater_promote;
 pub mod version;
 pub mod web;

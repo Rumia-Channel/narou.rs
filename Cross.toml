@@ -1,5 +1,5 @@
 [build.env]
-passthrough = ["NAROU_RS_RELEASE_BUILD", "NAROU_RS_VERSION_OVERRIDE"]
+passthrough = ["NAROU_RS_RELEASE_BUILD", "NAROU_RS_VERSION_OVERRIDE", "NAROU_RS_UPDATER_SHA256"]
 
 [target.armv7-unknown-linux-gnueabihf]
 pre-build = [

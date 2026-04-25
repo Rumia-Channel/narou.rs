@@ -22,6 +22,14 @@ fn main() {
         }
     }
 
+    println!("cargo:rerun-if-env-changed=NAROU_RS_UPDATER_SHA256");
+    if let Ok(hash) = std::env::var("NAROU_RS_UPDATER_SHA256") {
+        let trimmed = hash.trim().to_ascii_lowercase();
+        if !trimmed.is_empty() {
+            println!("cargo:rustc-env=NAROU_RS_UPDATER_SHA256={}", trimmed);
+        }
+    }
+
     let asset_root = PathBuf::from("src").join("web").join("assets");
     println!("cargo:rerun-if-changed={}", asset_root.display());
 
