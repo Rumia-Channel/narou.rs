@@ -20,6 +20,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 use subtle::ConstantTimeEq;
@@ -50,6 +51,7 @@ pub struct AppState {
     pub restorable_tasks_available: Arc<AtomicBool>,
     pub running_jobs: Arc<parking_lot::Mutex<Vec<crate::queue::QueueJob>>>,
     pub running_child_pids: Arc<parking_lot::Mutex<std::collections::HashMap<String, u32>>>,
+    pub cancelled_job_ids: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub auto_update_scheduler: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -709,6 +711,7 @@ mod tests {
             restorable_tasks_available: Arc::new(AtomicBool::new(false)),
             running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
             running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cancelled_job_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             auto_update_scheduler: Arc::new(parking_lot::Mutex::new(None)),
         }
     }

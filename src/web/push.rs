@@ -695,6 +695,7 @@ mod tests {
             restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
             running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cancelled_job_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             auto_update_scheduler: Arc::new(parking_lot::Mutex::new(None)),
         };
 
@@ -755,6 +756,7 @@ mod tests {
             restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
             running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cancelled_job_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             auto_update_scheduler: Arc::new(parking_lot::Mutex::new(None)),
         };
 

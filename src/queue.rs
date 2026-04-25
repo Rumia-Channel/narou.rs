@@ -57,7 +57,9 @@ impl JobType {
 pub struct QueueState {
     pub jobs: VecDeque<QueueJob>,
     pub completed: Vec<String>,
+    pub partial: Vec<String>,
     pub failed: Vec<String>,
+    pub cancelled: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,7 +77,11 @@ struct QueueStateFile {
     #[serde(default)]
     completed: Vec<StoredQueueJob>,
     #[serde(default)]
+    partial: Vec<StoredQueueJob>,
+    #[serde(default)]
     failed: Vec<StoredQueueJob>,
+    #[serde(default)]
+    cancelled: Vec<StoredQueueJob>,
     #[serde(default, rename = "deferred_pending")]
     deferred_pending_flag: bool,
     #[serde(default)]
@@ -89,7 +95,9 @@ struct LegacyQueueFile {
     pending: Vec<LegacyQueueTask>,
     running: Vec<LegacyQueueTask>,
     completed: Vec<StoredQueueJob>,
+    partial: Vec<StoredQueueJob>,
     failed: Vec<StoredQueueJob>,
+    cancelled: Vec<StoredQueueJob>,
     #[serde(rename = "deferred_pending")]
     deferred_pending_flag: bool,
     updated_at: String,
@@ -146,7 +154,9 @@ struct PersistentQueueState {
     active_running: Vec<StoredQueueJob>,
     deferred_running: Vec<StoredQueueJob>,
     completed: Vec<StoredQueueJob>,
+    partial: Vec<StoredQueueJob>,
     failed: Vec<StoredQueueJob>,
+    cancelled: Vec<StoredQueueJob>,
     deferred_pending_flag: bool,
 }
 
@@ -189,6 +199,10 @@ impl PersistentQueue {
         let content = serde_yaml::to_string(&queue_state_to_legacy_file(&self.state.lock()))?;
         atomic_write(&self.path, &content)?;
         Ok(())
+    }
+
+    pub fn flush(&self) -> Result<()> {
+        self.save()
     }
 
     pub fn push(&self, job_type: JobType, target: &str) -> Result<String> {
@@ -310,6 +324,26 @@ impl PersistentQueue {
         self.save()
     }
 
+    pub fn partial(&self, job_id: &str) -> Result<()> {
+        {
+            let mut state = self.state.lock();
+            if let Some(job) = remove_running_job(&mut state.active_running, job_id) {
+                push_history_entry(&mut state.partial, job);
+            }
+        }
+        self.save()
+    }
+
+    pub fn cancel(&self, job_id: &str) -> Result<()> {
+        {
+            let mut state = self.state.lock();
+            if let Some(job) = remove_running_job(&mut state.active_running, job_id) {
+                push_history_entry(&mut state.cancelled, job);
+            }
+        }
+        self.save()
+    }
+
     pub fn requeue_failed(&self) -> Result<usize> {
         let mut state = self.state.lock();
         ensure_queue_capacity(total_pending_len(&state), state.failed.len())?;
@@ -374,6 +408,14 @@ impl PersistentQueue {
         self.state.lock().failed.len()
     }
 
+    pub fn partial_count(&self) -> usize {
+        self.state.lock().partial.len()
+    }
+
+    pub fn cancelled_count(&self) -> usize {
+        self.state.lock().cancelled.len()
+    }
+
     pub fn snapshot(&self) -> QueueState {
         let state = self.state.lock();
         QueueState {
@@ -388,7 +430,9 @@ impl PersistentQueue {
                 .iter()
                 .map(|job| job.job.id.clone())
                 .collect(),
+            partial: state.partial.iter().map(|job| job.job.id.clone()).collect(),
             failed: state.failed.iter().map(|job| job.job.id.clone()).collect(),
+            cancelled: state.cancelled.iter().map(|job| job.job.id.clone()).collect(),
         }
     }
 
@@ -512,7 +556,9 @@ impl PersistentQueue {
             state.active_running.clear();
             state.deferred_running.clear();
             state.completed.clear();
+            state.partial.clear();
             state.failed.clear();
+            state.cancelled.clear();
             state.deferred_pending_flag = false;
         }
         self.save()
@@ -525,7 +571,9 @@ impl PersistentQueue {
             state.deferred_pending.clear();
             state.deferred_running.clear();
             state.completed.clear();
+            state.partial.clear();
             state.failed.clear();
+            state.cancelled.clear();
             state.deferred_pending_flag = false;
         }
         self.save()
@@ -650,7 +698,9 @@ fn validate_queue_state(state: &PersistentQueueState) -> Result<()> {
         .chain(state.deferred_running.iter())
         .chain(state.active_running.iter())
         .chain(state.completed.iter())
+        .chain(state.partial.iter())
         .chain(state.failed.iter())
+        .chain(state.cancelled.iter())
     {
         validate_job_target(&job.job.target)?;
     }
@@ -681,7 +731,9 @@ fn load_queue_state(content: &str) -> Result<PersistentQueueState> {
         active_running: Vec::new(),
         deferred_running,
         completed: file.completed,
+        partial: file.partial,
         failed: file.failed,
+        cancelled: file.cancelled,
         deferred_pending_flag: file.deferred_pending_flag,
     })
 }
@@ -703,7 +755,9 @@ fn queue_state_to_legacy_file(state: &PersistentQueueState) -> LegacyQueueFile {
         pending,
         running,
         completed: state.completed.clone(),
+        partial: state.partial.clone(),
         failed: state.failed.clone(),
+        cancelled: state.cancelled.clone(),
         deferred_pending_flag: has_deferred_jobs(state) && state.deferred_pending_flag,
         updated_at: now_rfc3339(),
     }
@@ -1258,6 +1312,33 @@ mod tests {
         assert!(saved.contains("failed:"));
         assert!(saved.contains("target: n0001"));
         assert!(saved.contains("target: tag:modified"));
+    }
+
+    #[test]
+    fn partial_and_cancelled_history_survive_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+
+        queue.push(JobType::Download, "n0002").unwrap();
+        let partial = queue.pop().unwrap();
+        queue.partial(&partial.id).unwrap();
+
+        queue.push(JobType::Update, "tag:end").unwrap();
+        let cancelled = queue.pop().unwrap();
+        queue.cancel(&cancelled.id).unwrap();
+
+        let reloaded = PersistentQueue::new(&queue_path).unwrap();
+        assert_eq!(reloaded.partial_count(), 1);
+        assert_eq!(reloaded.cancelled_count(), 1);
+
+        let snapshot = reloaded.snapshot();
+        assert_eq!(snapshot.partial, vec![partial.id]);
+        assert_eq!(snapshot.cancelled, vec![cancelled.id]);
+
+        let saved = std::fs::read_to_string(&queue_path).unwrap();
+        assert!(saved.contains("partial:"));
+        assert!(saved.contains("cancelled:"));
     }
 
     #[test]

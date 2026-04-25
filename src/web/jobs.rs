@@ -566,13 +566,14 @@ fn running_job_by_id(state: &AppState, task_id: &str) -> Option<QueueJob> {
 }
 
 fn kill_running_child(state: &AppState) {
-    let pids: Vec<u32> = {
+    let jobs: Vec<(String, u32)> = {
         let mut guard = state.running_child_pids.lock();
-        let values = guard.values().copied().collect();
+        let values = guard.iter().map(|(job_id, pid)| (job_id.clone(), *pid)).collect();
         guard.clear();
         values
     };
-    for pid in pids {
+    for (job_id, pid) in jobs {
+        state.cancelled_job_ids.lock().insert(job_id);
         kill_process_tree(pid, &state.push_server);
     }
 }
@@ -580,6 +581,7 @@ fn kill_running_child(state: &AppState) {
 fn kill_running_child_for_job(state: &AppState, job_id: &str) -> bool {
     let pid = state.running_child_pids.lock().remove(job_id);
     if let Some(pid) = pid {
+        state.cancelled_job_ids.lock().insert(job_id.to_string());
         kill_process_tree(pid, &state.push_server);
         true
     } else {
@@ -959,7 +961,9 @@ pub async fn queue_status(State(state): State<AppState>) -> Json<serde_json::Val
     Json(serde_json::json!({
         "pending": state.queue.pending_count(),
         "completed": state.queue.completed_count(),
+        "partial": state.queue.partial_count(),
         "failed": state.queue.failed_count(),
+        "cancelled": state.queue.cancelled_count(),
         "running": running_label,
         "running_count": running_count,
         "lane_sizes": lane_sizes,
@@ -1051,6 +1055,19 @@ fn broadcast_captured_web_output(
 
 fn notify_queue_changed(state: &AppState) {
     state.push_server.broadcast_event("notification.queue", "");
+}
+
+async fn prepare_process_shutdown(state: &AppState) {
+    kill_running_child(state);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while state.queue.running_count() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    if let Err(e) = state.queue.flush() {
+        state
+            .push_server
+            .broadcast_echo(&format!("キュー保存に失敗: {}", e), "stdout");
+    }
 }
 
 // POST /api/send
@@ -2266,7 +2283,10 @@ pub async fn api_shutdown(
 ) -> Json<ApiResponse> {
     state.push_server.broadcast_event("shutdown", "");
     // Schedule exit after brief delay to allow response
-    tokio::spawn(async {
+    let shutdown_state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        prepare_process_shutdown(&shutdown_state).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         std::process::exit(0);
     });
@@ -2302,14 +2322,17 @@ pub async fn api_reboot(
     let hide_console = crate::compat::inherited_hide_console_requested();
     let args = reboot_args_with_no_browser(std::env::args().skip(1).collect(), hide_console);
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let reboot_state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        prepare_process_shutdown(&reboot_state).await;
         let mut command = std::process::Command::new(exe);
         command
             .args(&args)
             .current_dir(current_dir)
             .stdin(std::process::Stdio::null());
         crate::compat::configure_hidden_console_command(&mut command);
+        crate::compat::configure_process_group_command(&mut command);
         let result = command.spawn().map(|_| ()).map_err(|e| e.to_string());
         let should_exit = result.is_ok();
         let _ = tx.send(result);
@@ -2888,6 +2911,7 @@ mod tests {
             restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             running_jobs: Arc::new(Mutex::new(Vec::new())),
             running_child_pids: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            cancelled_job_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),
             auto_update_scheduler: Arc::new(Mutex::new(None)),
         };
 

@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::SystemTime;
 
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -27,6 +28,13 @@ const PROTECTED_KEYS: &[&str] = &[
 #[derive(Debug)]
 struct CacheEntry {
     data: String,
+    origin_mtime: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    name: String,
+    scope: InventoryScope,
 }
 
 pub struct Inventory {
@@ -35,8 +43,8 @@ pub struct Inventory {
 }
 
 struct InventoryCache {
-    entries: HashMap<String, CacheEntry>,
-    access_order: Vec<String>,
+    entries: HashMap<CacheKey, CacheEntry>,
+    access_order: Vec<CacheKey>,
 }
 
 impl InventoryCache {
@@ -47,26 +55,26 @@ impl InventoryCache {
         }
     }
 
-    fn touch(&mut self, name: &str) {
-        if self.entries.contains_key(name) {
-            self.access_order.retain(|k| k != name);
-            self.access_order.push(name.to_string());
+    fn touch(&mut self, key: &CacheKey) {
+        if self.entries.contains_key(key) {
+            self.access_order.retain(|existing| existing != key);
+            self.access_order.push(key.clone());
         }
     }
 
-    fn remember(&mut self, name: &str, data: String) {
-        if !self.entries.contains_key(name) && self.entries.len() >= CACHE_MAX_SIZE {
+    fn remember(&mut self, key: CacheKey, data: String, origin_mtime: Option<SystemTime>) {
+        if !self.entries.contains_key(&key) && self.entries.len() >= CACHE_MAX_SIZE {
             self.evict_if_needed();
         }
-        self.entries.insert(name.to_string(), CacheEntry { data });
-        self.touch(name);
+        self.entries.insert(key.clone(), CacheEntry { data, origin_mtime });
+        self.touch(&key);
     }
 
     fn evict_if_needed(&mut self) {
         if self.entries.len() >= CACHE_MAX_SIZE {
             while self.entries.len() > CACHE_TARGET_SIZE {
                 if let Some(evict_key) = self.access_order.first() {
-                    if PROTECTED_KEYS.contains(&evict_key.as_str()) {
+                    if PROTECTED_KEYS.contains(&evict_key.name.as_str()) {
                         if self.access_order.len() <= 1 {
                             break;
                         }
@@ -108,17 +116,28 @@ impl Inventory {
         dir.join(format!("{}.yaml", name))
     }
 
+    fn cache_key(name: &str, scope: InventoryScope) -> CacheKey {
+        CacheKey {
+            name: name.to_string(),
+            scope,
+        }
+    }
+
     pub fn load_raw(&self, name: &str, scope: InventoryScope) -> Result<String> {
+        let path = self.inventory_path(name, scope);
+        let cache_key = Self::cache_key(name, scope);
+        let current_mtime = file_mtime(&path);
         {
             let mut cache = self.cache.lock();
-            if let Some(entry) = cache.entries.get(name) {
+            if let Some(entry) = cache.entries.get(&cache_key)
+                && entry.origin_mtime == current_mtime
+            {
                 let data = entry.data.clone();
-                cache.touch(name);
+                cache.touch(&cache_key);
                 return Ok(data);
             }
         }
 
-        let path = self.inventory_path(name, scope);
         let content = if path.exists() {
             ensure_yaml_size_limit(&path)?;
             fs::read_to_string(&path)?
@@ -126,7 +145,9 @@ impl Inventory {
             String::new()
         };
 
-        self.cache.lock().remember(name, content.clone());
+        self.cache
+            .lock()
+            .remember(cache_key, content.clone(), current_mtime);
         Ok(content)
     }
 
@@ -136,7 +157,9 @@ impl Inventory {
             fs::create_dir_all(parent)?;
         }
         atomic_write(&path, content)?;
-        self.cache.lock().remember(name, content.to_string());
+        self.cache
+            .lock()
+            .remember(Self::cache_key(name, scope), content.to_string(), file_mtime(&path));
         Ok(())
     }
 
@@ -164,7 +187,9 @@ impl Inventory {
             fs::create_dir_all(parent)?;
         }
         let (content, result) = update_locked_yaml_file::<T, D, _>(&path, update)?;
-        self.cache.lock().remember(name, content);
+        self.cache
+            .lock()
+            .remember(Self::cache_key(name, scope), content, file_mtime(&path));
         Ok(result)
     }
 
@@ -176,8 +201,8 @@ impl Inventory {
 
     pub fn unload(&self, name: &str) {
         let mut cache = self.cache.lock();
-        cache.entries.remove(name);
-        cache.access_order.retain(|k| k != name);
+        cache.entries.retain(|key, _| key.name != name);
+        cache.access_order.retain(|key| key.name != name);
     }
 
     pub fn root_dir(&self) -> &Path {
@@ -187,10 +212,14 @@ impl Inventory {
 
 static PROCESS_WRITE_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Arc<StdMutex<()>>>>> = OnceLock::new();
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InventoryScope {
     Local,
     Global,
+}
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
 }
 
 pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
@@ -367,13 +396,20 @@ fn dirs_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
 
     use super::{
         CACHE_MAX_SIZE, CACHE_TARGET_SIZE, Inventory, InventoryScope, MAX_YAML_SIZE_BYTES,
     };
 
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
-    fn load_raw_uses_cache_until_unload() {
+    fn load_raw_reloads_when_file_mtime_changes() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let narou_dir = root.join(".narou");
@@ -389,21 +425,56 @@ mod tests {
             "foo: 1\n"
         );
 
+        std::thread::sleep(Duration::from_millis(20));
         std::fs::write(&path, "foo: 2\n").unwrap();
-        assert_eq!(
-            inventory
-                .load_raw("local_setting", InventoryScope::Local)
-                .unwrap(),
-            "foo: 1\n"
-        );
-
-        inventory.unload("local_setting");
         assert_eq!(
             inventory
                 .load_raw("local_setting", InventoryScope::Local)
                 .unwrap(),
             "foo: 2\n"
         );
+    }
+
+    #[test]
+    fn unload_drops_cached_entry_for_all_scopes_with_same_name() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let narou_dir = root.join(".narou");
+        let global_dir = root.join(".narousetting");
+        std::fs::create_dir_all(&narou_dir).unwrap();
+        std::fs::create_dir_all(&global_dir).unwrap();
+        let old_userprofile = std::env::var_os("USERPROFILE");
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("USERPROFILE", &root);
+            std::env::set_var("HOME", &root);
+        }
+        std::fs::write(narou_dir.join("local_setting.yaml"), "foo: local\n").unwrap();
+        std::fs::write(global_dir.join("local_setting.yaml"), "foo: global\n").unwrap();
+
+        let inventory = Inventory::new(root);
+        inventory.unload("local_setting");
+        assert_eq!(
+            inventory
+                .load_raw("local_setting", InventoryScope::Local)
+                .unwrap(),
+            "foo: local\n"
+        );
+        assert_eq!(
+            inventory
+                .load_raw("local_setting", InventoryScope::Global)
+                .unwrap(),
+            "foo: global\n"
+        );
+        match old_userprofile {
+            Some(value) => unsafe { std::env::set_var("USERPROFILE", value) },
+            None => unsafe { std::env::remove_var("USERPROFILE") },
+        }
+        match old_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
     }
 
     #[test]
@@ -424,7 +495,10 @@ mod tests {
 
         let cache = inventory.cache.lock();
         assert_eq!(cache.entries.len(), CACHE_TARGET_SIZE + 1);
-        assert!(cache.entries.contains_key("local_setting"));
+        assert!(cache
+            .entries
+            .keys()
+            .any(|key| key.name == "local_setting" && key.scope == InventoryScope::Local));
     }
 
     #[test]

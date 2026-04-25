@@ -3,6 +3,8 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
+use std::time::Duration;
 
 use crate::converter::NovelConverter;
 use crate::converter::device::Device;
@@ -61,8 +63,18 @@ pub fn configure_hidden_console_command(command: &mut Command) {
 }
 
 pub fn configure_web_subprocess_command(command: &mut Command) {
+    configure_process_group_command(command);
     command.env("NAROU_RS_WEB_MODE", "1");
     configure_hidden_console_command(command);
+}
+
+pub fn configure_process_group_command(_command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        _command.process_group(0);
+    }
 }
 
 pub fn terminate_process(pid: u32) -> io::Result<()> {
@@ -74,21 +86,70 @@ fn terminate_process_tree(pid: u32) -> io::Result<()> {
     let pid = i32::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid is out of range"))?;
 
+    if !send_signal_to_process_group_or_process(pid, libc::SIGTERM)? {
+        return Ok(());
+    }
+    if wait_for_process_group_or_process_exit(pid, Duration::from_secs(2))? {
+        return Ok(());
+    }
+    send_signal_to_process_group_or_process(pid, libc::SIGKILL)?;
+    let _ = wait_for_process_group_or_process_exit(pid, Duration::from_millis(500));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn send_signal_to_process_group_or_process(pid: i32, signal: i32) -> io::Result<bool> {
     unsafe {
-        if libc::kill(-pid, libc::SIGTERM) == 0 {
-            return Ok(());
+        if libc::kill(-pid, signal) == 0 {
+            return Ok(true);
         }
         let group_err = io::Error::last_os_error();
         if group_err.raw_os_error() != Some(libc::ESRCH) {
             return Err(group_err);
         }
 
-        if libc::kill(pid, libc::SIGTERM) == 0 {
-            return Ok(());
+        if libc::kill(pid, signal) == 0 {
+            return Ok(true);
         }
         let process_err = io::Error::last_os_error();
         if process_err.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
+            return Ok(false);
+        }
+        Err(process_err)
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_process_group_or_process_exit(pid: i32, timeout: Duration) -> io::Result<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match process_group_or_process_exists(pid)? {
+            true if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            true => return Ok(false),
+            false => return Ok(true),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_group_or_process_exists(pid: i32) -> io::Result<bool> {
+    unsafe {
+        if libc::kill(-pid, 0) == 0 {
+            return Ok(true);
+        }
+        let group_err = io::Error::last_os_error();
+        if group_err.raw_os_error() != Some(libc::ESRCH) {
+            return Err(group_err);
+        }
+
+        if libc::kill(pid, 0) == 0 {
+            return Ok(true);
+        }
+        let process_err = io::Error::last_os_error();
+        if process_err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(false);
         }
         Err(process_err)
     }

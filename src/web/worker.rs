@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -22,8 +22,18 @@ const MAX_FAILURE_DETAIL_CHARS: usize = 600;
 
 #[derive(Debug, Clone, Default)]
 struct JobRunResult {
-    success: bool,
+    outcome: JobOutcome,
     detail: Option<String>,
+    exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum JobOutcome {
+    #[default]
+    Failed,
+    Completed,
+    Partial,
+    Cancelled,
 }
 
 #[derive(Clone, Copy)]
@@ -39,6 +49,7 @@ pub fn start_queue_workers(
     push_server: Arc<PushServer>,
     running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
     running_child_pids: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    cancelled_job_ids: Arc<parking_lot::Mutex<HashSet<String>>>,
     concurrency_enabled: bool,
 ) -> Vec<JoinHandle<()>> {
     let lanes = if concurrency_enabled {
@@ -55,6 +66,7 @@ pub fn start_queue_workers(
                 Arc::clone(&push_server),
                 Arc::clone(&running_jobs),
                 Arc::clone(&running_child_pids),
+                Arc::clone(&cancelled_job_ids),
                 lane,
             )
         })
@@ -67,6 +79,7 @@ fn start_queue_worker_for_lane(
     push_server: Arc<PushServer>,
     running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
     running_child_pids: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    cancelled_job_ids: Arc<parking_lot::Mutex<HashSet<String>>>,
     lane: WorkerLane,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -83,6 +96,7 @@ fn start_queue_worker_for_lane(
             let job_for_run = job.clone();
             let ps = Arc::clone(&push_server);
             let pid_ref = Arc::clone(&running_child_pids);
+            let cancelled_ref = Arc::clone(&cancelled_job_ids);
             let queue_for_run = Arc::clone(&queue);
             let result = tokio::task::spawn_blocking(move || {
                 execute_job(
@@ -91,6 +105,7 @@ fn start_queue_worker_for_lane(
                     &job_for_run,
                     &ps,
                     &pid_ref,
+                    &cancelled_ref,
                 )
             })
             .await
@@ -102,21 +117,42 @@ fn start_queue_worker_for_lane(
             }
 
             unregister_running_job(&running_jobs, &job.id);
-            if result.success {
-                let _ = queue.complete(&job.id);
-                push_server.broadcast_event("queue_complete", &job.id);
-            } else {
-                let _ = queue.fail(&job.id);
-                let mut data = serde_json::json!({ "job_id": job.id });
-                if load_local_setting_bool("webui.debug-mode")
-                    && let Some(detail) = result.detail.as_deref()
-                {
-                    data["detail"] = serde_json::Value::String(detail.to_string());
+            match result.outcome {
+                JobOutcome::Completed => {
+                    let _ = queue.complete(&job.id);
+                    push_server.broadcast_event("queue_complete", &job.id);
                 }
-                push_server.broadcast_raw(&serde_json::json!({
-                    "type": "queue_failed",
-                    "data": data,
-                }));
+                JobOutcome::Partial => {
+                    let _ = queue.partial(&job.id);
+                    let mut data = serde_json::json!({ "job_id": job.id });
+                    if let Some(exit_code) = result.exit_code {
+                        data["exit_code"] = serde_json::json!(exit_code);
+                    }
+                    push_server.broadcast_raw(&serde_json::json!({
+                        "type": "queue_partial",
+                        "data": data,
+                    }));
+                }
+                JobOutcome::Cancelled => {
+                    let _ = queue.cancel(&job.id);
+                    push_server.broadcast_raw(&serde_json::json!({
+                        "type": "queue_cancelled",
+                        "data": { "job_id": job.id },
+                    }));
+                }
+                JobOutcome::Failed => {
+                    let _ = queue.fail(&job.id);
+                    let mut data = serde_json::json!({ "job_id": job.id });
+                    if load_local_setting_bool("webui.debug-mode")
+                        && let Some(detail) = result.detail.as_deref()
+                    {
+                        data["detail"] = serde_json::Value::String(detail.to_string());
+                    }
+                    push_server.broadcast_raw(&serde_json::json!({
+                        "type": "queue_failed",
+                        "data": data,
+                    }));
+                }
             }
             clear_progress_for_job(&push_server, &job.id);
             if should_reload_table_after_job(queue.as_ref(), &running_jobs) {
@@ -175,16 +211,23 @@ fn execute_job(
     job: &QueueJob,
     push_server: &Arc<PushServer>,
     running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    cancelled_job_ids: &Arc<parking_lot::Mutex<HashSet<String>>>,
 ) -> JobRunResult {
     if matches!(job.job_type, JobType::AutoUpdate) {
-        return JobRunResult {
-            success: crate::web::scheduler::execute_auto_update(
+        let success = crate::web::scheduler::execute_auto_update(
             root_dir,
             Arc::clone(push_server),
             &job.id,
             Arc::clone(running_pids),
-            ),
+        );
+        return JobRunResult {
+            outcome: if success {
+                JobOutcome::Completed
+            } else {
+                JobOutcome::Failed
+            },
             detail: None,
+            exit_code: None,
         };
     }
 
@@ -192,8 +235,9 @@ fn execute_job(
     let Ok(exe) = std::env::current_exe() else {
         push_server.broadcast_echo("エラー: 実行ファイルパスを取得できません", target_console);
         return JobRunResult {
-            success: false,
+            outcome: JobOutcome::Failed,
             detail: Some("エラー: 実行ファイルパスを取得できません".to_string()),
+            exit_code: None,
         };
     };
 
@@ -207,6 +251,7 @@ fn execute_job(
             spec,
             push_server,
             running_pids,
+            cancelled_job_ids,
             &job.id,
             target_console,
         );
@@ -289,8 +334,9 @@ fn execute_job(
                 if spec.args.is_empty() {
                     push_server.broadcast_echo("diff task has no arguments", target_console);
                     return JobRunResult {
-                        success: false,
+                        outcome: JobOutcome::Failed,
                         detail: Some("diff task has no arguments".to_string()),
+                        exit_code: None,
                     };
                 }
                 return execute_diff_job(
@@ -299,6 +345,7 @@ fn execute_job(
                     &spec.args,
                     push_server,
                     running_pids,
+                    cancelled_job_ids,
                     &job.id,
                     target_console,
                 );
@@ -322,8 +369,9 @@ fn execute_job(
                     target_console,
                 );
                 return JobRunResult {
-                    success: false,
+                    outcome: JobOutcome::Failed,
                     detail: Some(format!("未対応の復元キューコマンドです: {}", unsupported)),
+                    exit_code: None,
                 };
             }
         }
@@ -372,7 +420,14 @@ fn execute_job(
             JobType::AutoUpdate => unreachable!(),
         }
     }
-    spawn_and_stream_command(command, push_server, running_pids, &job.id, target_console)
+    spawn_and_stream_command(
+        command,
+        push_server,
+        running_pids,
+        cancelled_job_ids,
+        &job.id,
+        target_console,
+    )
 }
 
 fn new_web_subprocess_command(exe: &Path, root_dir: &Path, job_id: &str) -> std::process::Command {
@@ -448,14 +503,24 @@ fn execute_update_general_lastup_job(
     spec: &QueueExecutionSpec,
     push_server: &Arc<PushServer>,
     running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    cancelled_job_ids: &Arc<parking_lot::Mutex<HashSet<String>>>,
     job_id: &str,
     target_console: &str,
 ) -> JobRunResult {
     let mut command = new_web_subprocess_command(exe, root_dir, job_id);
     command.arg("update").arg("--gl");
     append_update_args(&mut command, push_server, target_console, &spec.args);
-    let result = spawn_and_stream_command(command, push_server, running_pids, job_id, target_console);
-    if !result.success || !execution_spec_meta_bool(spec, "update_modified") {
+    let result = spawn_and_stream_command(
+        command,
+        push_server,
+        running_pids,
+        cancelled_job_ids,
+        job_id,
+        target_console,
+    );
+    if !matches!(result.outcome, JobOutcome::Completed | JobOutcome::Partial)
+        || !execution_spec_meta_bool(spec, "update_modified")
+    {
         return result;
     }
 
@@ -471,7 +536,14 @@ fn execute_update_general_lastup_job(
         followup.arg("--sort-by").arg(sort_key);
     }
     followup.arg("tag:modified");
-    spawn_and_stream_command(followup, push_server, running_pids, job_id, target_console)
+    spawn_and_stream_command(
+        followup,
+        push_server,
+        running_pids,
+        cancelled_job_ids,
+        job_id,
+        target_console,
+    )
 }
 
 fn append_update_args(
@@ -503,25 +575,30 @@ fn execute_diff_job(
     args: &[String],
     push_server: &Arc<PushServer>,
     running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    cancelled_job_ids: &Arc<parking_lot::Mutex<HashSet<String>>>,
     job_id: &str,
     target_console: &str,
 ) -> JobRunResult {
     if args.len() < 2 {
         push_server.broadcast_echo("diff task is missing the diff number", target_console);
         return JobRunResult {
-            success: false,
+            outcome: JobOutcome::Failed,
             detail: Some("diff task is missing the diff number".to_string()),
+            exit_code: None,
         };
     }
     let (ids, number) = args.split_at(args.len() - 1);
     let Some(number) = number.first() else {
         push_server.broadcast_echo("diff task is missing the diff number", target_console);
         return JobRunResult {
-            success: false,
+            outcome: JobOutcome::Failed,
             detail: Some("diff task is missing the diff number".to_string()),
+            exit_code: None,
         };
     };
-    let mut success = true;
+    let mut saw_failure = false;
+    let mut saw_partial = false;
+    let mut saw_cancelled = false;
     let mut details = Vec::new();
     for id in ids {
         let mut command = std::process::Command::new(exe);
@@ -537,18 +614,36 @@ fn execute_diff_job(
             .arg(number);
         configure_web_subprocess_command(&mut command);
         command.env(WEB_PROGRESS_SCOPE_ENV, job_id);
-        let result =
-            spawn_and_stream_command(command, push_server, running_pids, job_id, target_console);
-        if !result.success {
-            success = false;
-            if let Some(detail) = result.detail {
-                details.push(detail);
-            }
+        let result = spawn_and_stream_command(
+            command,
+            push_server,
+            running_pids,
+            cancelled_job_ids,
+            job_id,
+            target_console,
+        );
+        match result.outcome {
+            JobOutcome::Completed => {}
+            JobOutcome::Partial => saw_partial = true,
+            JobOutcome::Cancelled => saw_cancelled = true,
+            JobOutcome::Failed => saw_failure = true,
+        }
+        if let Some(detail) = result.detail {
+            details.push(detail);
         }
     }
     JobRunResult {
-        success,
+        outcome: if saw_cancelled {
+            JobOutcome::Cancelled
+        } else if saw_failure {
+            JobOutcome::Failed
+        } else if saw_partial {
+            JobOutcome::Partial
+        } else {
+            JobOutcome::Completed
+        },
         detail: summarize_failure_details(&details),
+        exit_code: None,
     }
 }
 
@@ -556,6 +651,7 @@ fn spawn_and_stream_command(
     mut command: std::process::Command,
     push_server: &Arc<PushServer>,
     running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    cancelled_job_ids: &Arc<parking_lot::Mutex<HashSet<String>>>,
     job_id: &str,
     target_console: &str,
 ) -> JobRunResult {
@@ -564,8 +660,9 @@ fn spawn_and_stream_command(
         Err(e) => {
             push_server.broadcast_echo(&format!("プロセス起動失敗: {}", e), target_console);
             return JobRunResult {
-                success: false,
+                outcome: JobOutcome::Failed,
                 detail: Some(format!("プロセス起動失敗: {}", e)),
+                exit_code: None,
             };
         }
     };
@@ -619,13 +716,44 @@ fn spawn_and_stream_command(
         }
     });
 
-    let status = child.wait().map(|s| s.success()).unwrap_or(false);
+    let status = child.wait();
     running_pids.lock().remove(job_id);
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
-    JobRunResult {
-        success: status,
-        detail: (!status).then(|| summarize_failure_output(recent_output.as_ref())).flatten(),
+    let cancelled = cancelled_job_ids.lock().remove(job_id);
+    if cancelled {
+        return JobRunResult {
+            outcome: JobOutcome::Cancelled,
+            detail: None,
+            exit_code: status.ok().and_then(|value| value.code()),
+        };
+    }
+    match status {
+        Ok(status) => {
+            let outcome = classify_job_outcome(&status);
+            let exit_code = status.code();
+            let detail = matches!(outcome, JobOutcome::Failed)
+                .then(|| summarize_failure_output(recent_output.as_ref()))
+                .flatten();
+            JobRunResult {
+                outcome,
+                detail,
+                exit_code,
+            }
+        }
+        Err(error) => JobRunResult {
+            outcome: JobOutcome::Failed,
+            detail: Some(format!("終了待機失敗: {}", error)),
+            exit_code: None,
+        },
+    }
+}
+
+fn classify_job_outcome(status: &std::process::ExitStatus) -> JobOutcome {
+    match status.code() {
+        Some(0) => JobOutcome::Completed,
+        Some(1..=127) => JobOutcome::Partial,
+        _ => JobOutcome::Failed,
     }
 }
 
@@ -699,11 +827,17 @@ fn parse_convert_job_target(value: &str) -> (&str, Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+
     use super::{
-        MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, clear_progress_for_job,
-        console_target_for_job, convert_targets_and_device, execution_spec_meta_bool, execution_spec_meta_string,
-        execution_spec_meta_strings, parse_convert_job_target, remember_failure_line,
-        route_structured_web_message, summarize_failure_details,
+        MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, JobOutcome, classify_job_outcome,
+        clear_progress_for_job, console_target_for_job, convert_targets_and_device,
+        execution_spec_meta_bool, execution_spec_meta_string, execution_spec_meta_strings,
+        parse_convert_job_target, remember_failure_line, route_structured_web_message,
+        summarize_failure_details,
     };
     use crate::queue::JobType;
 
@@ -750,6 +884,32 @@ mod tests {
         });
         let routed = route_structured_web_message(message, "stdout2");
         assert_eq!(routed["target_console"], "stdout2");
+    }
+
+    #[test]
+    fn classify_job_outcome_distinguishes_complete_partial_and_failed() {
+        assert_eq!(
+            classify_job_outcome(&std::process::ExitStatus::from_raw(0)),
+            JobOutcome::Completed
+        );
+        assert_eq!(
+            classify_job_outcome(&std::process::ExitStatus::from_raw(exit_status_raw(1))),
+            JobOutcome::Partial
+        );
+        assert_eq!(
+            classify_job_outcome(&std::process::ExitStatus::from_raw(exit_status_raw(128))),
+            JobOutcome::Failed
+        );
+    }
+
+    #[cfg(unix)]
+    fn exit_status_raw(code: i32) -> i32 {
+        code << 8
+    }
+
+    #[cfg(windows)]
+    fn exit_status_raw(code: u32) -> u32 {
+        code
     }
 
     #[test]

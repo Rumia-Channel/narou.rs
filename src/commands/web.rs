@@ -98,6 +98,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
     let restore_prompt_pending = Arc::new(AtomicBool::new(queue.restore_prompt_pending()));
     let running_jobs = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let running_child_pids = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let cancelled_job_ids = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
     let auto_update_scheduler = Arc::new(parking_lot::Mutex::new(None));
     let app_state = web::AppState {
         port: address.port,
@@ -112,6 +113,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         restorable_tasks_available: restorable_tasks_available.clone(),
         running_jobs: running_jobs.clone(),
         running_child_pids: running_child_pids.clone(),
+        cancelled_job_ids: cancelled_job_ids.clone(),
         auto_update_scheduler: auto_update_scheduler.clone(),
     };
     let app = web::create_router(app_state.clone());
@@ -156,6 +158,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         push_server.clone(),
         running_jobs.clone(),
         running_child_pids,
+        cancelled_job_ids,
         narou_rs::compat::load_local_setting_bool("concurrency"),
     );
     web::scheduler::restart_auto_update_scheduler(

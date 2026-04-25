@@ -474,7 +474,7 @@ fn run_update_phase(
             auto_update_echo(push_server.as_ref(), &format!("{} が完了しました", label));
             refresh_database_after_phase(label, push_server.as_ref())
         }
-        1..=9 => {
+        1..=127 => {
             auto_update_echo(
                 push_server.as_ref(),
                 &format!(
