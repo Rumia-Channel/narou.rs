@@ -26,7 +26,7 @@ use narou_rs::downloader::{
 use narou_rs::mail::{
     MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
 };
-use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
+use narou_rs::progress::{CliProgress, ProgressReporter, WebProgress, is_web_mode};
 use narou_rs::termcolor::{bold_colored, colored};
 use narou_rs::web::sort_state::{SORT_COLUMN_KEYS, sort_column_label_for_key, sort_record_ordering};
 
@@ -1152,6 +1152,10 @@ fn update_general_lastup(gl_opt: Option<&str>, user_agent: Option<&str>) {
     let site_settings = SiteSetting::load_all().unwrap_or_default();
 
     let (narou_novels, other_novels) = partition_novels_by_api_support(&site_settings);
+    let progress = general_lastup_progress();
+    let mut total_work_units =
+        initial_general_lastup_work_units(gl_opt, &narou_novels, &other_novels);
+    progress.set_length(total_work_units);
     let mut other_targets = Vec::new();
     let run_other_phase = gl_opt.is_none() || gl_opt == Some("other");
     if run_other_phase {
@@ -1160,8 +1164,10 @@ fn update_general_lastup(gl_opt: Option<&str>, user_agent: Option<&str>) {
     let mut had_api_error = false;
 
     if gl_opt.is_none() || gl_opt == Some("narou") {
-        let outcome = update_general_lastup_narou(&narou_novels, user_agent);
+        let outcome = update_general_lastup_narou(&narou_novels, user_agent, progress.as_ref());
         had_api_error |= outcome.had_api_error;
+        total_work_units = total_work_units.saturating_add(outcome.fallback_ids.len() as u64);
+        progress.set_length(total_work_units);
         other_targets.extend(outcome.fallback_ids);
     }
 
@@ -1171,7 +1177,7 @@ fn update_general_lastup(gl_opt: Option<&str>, user_agent: Option<&str>) {
         }
         let mut seen = HashSet::new();
         other_targets.retain(|id| seen.insert(*id));
-        update_general_lastup_other(&other_targets, user_agent);
+        update_general_lastup_other(&other_targets, user_agent, progress.as_ref());
     }
 
     let _ = narou_rs::db::with_database_mut(|db| db.save());
@@ -1224,9 +1230,42 @@ fn partition_novels_by_api_support(
     (narou, other)
 }
 
+fn general_lastup_progress() -> Box<dyn ProgressReporter> {
+    if is_web_mode() {
+        Box::new(WebProgress::new("update"))
+    } else {
+        Box::new(CliProgress::new("最新話掲載日を確認"))
+    }
+}
+
+fn count_general_lastup_narou_targets(
+    novels_by_api: &HashMap<String, Vec<(i64, String)>>,
+) -> u64 {
+    novels_by_api.values().map(|novels| novels.len() as u64).sum()
+}
+
+fn initial_general_lastup_work_units(
+    gl_opt: Option<&str>,
+    narou_novels: &HashMap<String, Vec<(i64, String)>>,
+    other_novels: &[i64],
+) -> u64 {
+    let narou_units = if gl_opt == Some("other") {
+        0
+    } else {
+        count_general_lastup_narou_targets(narou_novels)
+    };
+    let other_units = if gl_opt.is_none() || gl_opt == Some("other") {
+        other_novels.len() as u64
+    } else {
+        0
+    };
+    narou_units.saturating_add(other_units)
+}
+
 fn update_general_lastup_narou(
     novels_by_api: &HashMap<String, Vec<(i64, String)>>,
     user_agent: Option<&str>,
+    progress: &dyn ProgressReporter,
 ) -> GeneralLastupNarouOutcome {
     let mut outcome = GeneralLastupNarouOutcome::default();
     if novels_by_api.is_empty() {
@@ -1259,12 +1298,14 @@ fn update_general_lastup_narou(
                 Ok(r) => r,
                 Err(_) => {
                     outcome.had_api_error = true;
+                    progress.inc(chunk.len() as u64);
                     continue;
                 }
             };
 
             if !response.status().is_success() {
                 outcome.had_api_error = true;
+                progress.inc(chunk.len() as u64);
                 continue;
             }
 
@@ -1272,6 +1313,7 @@ fn update_general_lastup_narou(
                 Ok(b) => b,
                 Err(_) => {
                     outcome.had_api_error = true;
+                    progress.inc(chunk.len() as u64);
                     continue;
                 }
             };
@@ -1298,6 +1340,7 @@ fn update_general_lastup_narou(
                     Ok(())
                 });
             }
+            progress.inc(chunk.len() as u64);
         }
     }
 
@@ -1306,7 +1349,11 @@ fn update_general_lastup_narou(
     outcome
 }
 
-fn update_general_lastup_other(novels: &[i64], user_agent: Option<&str>) {
+fn update_general_lastup_other(
+    novels: &[i64],
+    user_agent: Option<&str>,
+    progress: &dyn ProgressReporter,
+) {
     if novels.is_empty() {
         return;
     }
@@ -1319,9 +1366,9 @@ fn update_general_lastup_other(novels: &[i64], user_agent: Option<&str>) {
     for &id in novels {
         std::thread::sleep(std::time::Duration::from_secs_f64(INTERVAL_MIN_SECS));
 
-        let Ok((novelupdated_at, general_lastup, length, is_end)) =
-            downloader.fetch_latest_status_by_id(id)
-        else {
+        let latest_status = downloader.fetch_latest_status_by_id(id);
+        let Ok((novelupdated_at, general_lastup, length, is_end)) = latest_status else {
+            progress.inc(1);
             continue;
         };
 
@@ -1342,6 +1389,7 @@ fn update_general_lastup_other(novels: &[i64], user_agent: Option<&str>) {
         });
 
         sync_end_tag(id);
+        progress.inc(1);
     }
 }
 
@@ -1418,12 +1466,14 @@ fn classify_narou_api_chunk(
 mod tests {
     use super::{
         MODIFIED_TAG, abort_if_interrupted, apply_general_lastup_check_result,
-        classify_narou_api_chunk, sleep_with_interrupt,
+        classify_narou_api_chunk, count_general_lastup_narou_targets,
+        initial_general_lastup_work_units, sleep_with_interrupt,
     };
     use chrono::{Duration, TimeZone, Utc};
     use narou_rs::db::NovelRecord;
     use narou_rs::compat::reroute_web_line_to_console;
     use narou_rs::progress::WS_LINE_PREFIX;
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -1474,6 +1524,44 @@ mod tests {
         assert_eq!(
             parsed.format("%Y-%m-%d %H:%M:%S").to_string(),
             "2026-04-19 03:00:00"
+        );
+    }
+
+    #[test]
+    fn count_general_lastup_narou_targets_sums_all_api_groups() {
+        let novels_by_api = HashMap::from([
+            (
+                "https://api.syosetu.com/novelapi/api/".to_string(),
+                vec![(1, "n0001aa".to_string()), (2, "n0002aa".to_string())],
+            ),
+            (
+                "https://api.kakuyomu.jp/".to_string(),
+                vec![(3, "k0003aa".to_string())],
+            ),
+        ]);
+
+        assert_eq!(count_general_lastup_narou_targets(&novels_by_api), 3);
+    }
+
+    #[test]
+    fn initial_general_lastup_work_units_respects_requested_phase() {
+        let novels_by_api = HashMap::from([(
+            "https://api.syosetu.com/novelapi/api/".to_string(),
+            vec![(1, "n0001aa".to_string()), (2, "n0002aa".to_string())],
+        )]);
+        let other_novels = vec![10, 11, 12];
+
+        assert_eq!(
+            initial_general_lastup_work_units(None, &novels_by_api, &other_novels),
+            5
+        );
+        assert_eq!(
+            initial_general_lastup_work_units(Some("narou"), &novels_by_api, &other_novels),
+            2
+        );
+        assert_eq!(
+            initial_general_lastup_work_units(Some("other"), &novels_by_api, &other_novels),
+            3
         );
     }
 
