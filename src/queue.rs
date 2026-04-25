@@ -73,9 +73,11 @@ struct QueueStateFile {
     #[serde(default)]
     jobs: VecDeque<QueueJob>,
     #[serde(default)]
-    completed: Vec<String>,
+    completed: Vec<StoredQueueJob>,
     #[serde(default)]
-    failed: Vec<String>,
+    failed: Vec<StoredQueueJob>,
+    #[serde(default, rename = "deferred_pending")]
+    deferred_pending_flag: bool,
     #[serde(default)]
     pending: Vec<LegacyQueueTask>,
     #[serde(default)]
@@ -86,6 +88,10 @@ struct QueueStateFile {
 struct LegacyQueueFile {
     pending: Vec<LegacyQueueTask>,
     running: Vec<LegacyQueueTask>,
+    completed: Vec<StoredQueueJob>,
+    failed: Vec<StoredQueueJob>,
+    #[serde(rename = "deferred_pending")]
+    deferred_pending_flag: bool,
     updated_at: String,
 }
 
@@ -105,7 +111,7 @@ struct LegacyQueueTask {
     started_at: Option<Value>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredQueueJob {
     job: QueueJob,
     legacy: LegacyQueueTask,
@@ -139,8 +145,9 @@ struct PersistentQueueState {
     deferred_pending: VecDeque<StoredQueueJob>,
     active_running: Vec<StoredQueueJob>,
     deferred_running: Vec<StoredQueueJob>,
-    completed: Vec<String>,
-    failed: Vec<String>,
+    completed: Vec<StoredQueueJob>,
+    failed: Vec<StoredQueueJob>,
+    deferred_pending_flag: bool,
 }
 
 #[derive(Debug)]
@@ -286,13 +293,8 @@ impl PersistentQueue {
     pub fn complete(&self, job_id: &str) -> Result<()> {
         {
             let mut state = self.state.lock();
-            remove_running_job(&mut state.active_running, job_id);
-            if !state.completed.iter().any(|id| id == job_id) {
-                state.completed.push(job_id.to_string());
-            }
-            if state.completed.len() > 1000 {
-                let drain_count = state.completed.len() - 500;
-                state.completed.drain(..drain_count);
+            if let Some(job) = remove_running_job(&mut state.active_running, job_id) {
+                push_history_entry(&mut state.completed, job);
             }
         }
         self.save()
@@ -301,13 +303,8 @@ impl PersistentQueue {
     pub fn fail(&self, job_id: &str) -> Result<()> {
         {
             let mut state = self.state.lock();
-            remove_running_job(&mut state.active_running, job_id);
-            if !state.failed.iter().any(|id| id == job_id) {
-                state.failed.push(job_id.to_string());
-            }
-            if state.failed.len() > 1000 {
-                let drain_count = state.failed.len() - 500;
-                state.failed.drain(..drain_count);
+            if let Some(job) = remove_running_job(&mut state.active_running, job_id) {
+                push_history_entry(&mut state.failed, job);
             }
         }
         self.save()
@@ -318,15 +315,9 @@ impl PersistentQueue {
         ensure_queue_capacity(total_pending_len(&state), state.failed.len())?;
         let failed = std::mem::take(&mut state.failed);
         let count = failed.len();
-        for job_id in failed {
-            let created_at = chrono::Utc::now().timestamp();
-            state.active_pending.push_back(build_stored_job(
-                job_id,
-                JobType::Update,
-                String::new(),
-                created_at,
-                None,
-            ));
+        for mut job in failed {
+            job.mark_pending();
+            state.active_pending.push_back(job);
         }
         drop(state);
         self.save()?;
@@ -392,8 +383,12 @@ impl PersistentQueue {
                 .chain(state.active_pending.iter())
                 .map(|job| job.job.clone())
                 .collect(),
-            completed: state.completed.clone(),
-            failed: state.failed.clone(),
+            completed: state
+                .completed
+                .iter()
+                .map(|job| job.job.id.clone())
+                .collect(),
+            failed: state.failed.iter().map(|job| job.job.id.clone()).collect(),
         }
     }
 
@@ -419,14 +414,23 @@ impl PersistentQueue {
 
     pub fn has_restorable_tasks(&self) -> bool {
         let state = self.state.lock();
-        !state.deferred_pending.is_empty() || !state.deferred_running.is_empty()
+        has_deferred_jobs(&state)
+    }
+
+    pub fn restore_prompt_pending(&self) -> bool {
+        let state = self.state.lock();
+        has_deferred_jobs(&state) && !state.deferred_pending_flag
     }
 
     pub fn remove_pending(&self, task_id: &str) -> Result<bool> {
         let removed = {
             let mut state = self.state.lock();
-            remove_pending_job(&mut state.active_pending, task_id)
-                || remove_pending_job(&mut state.deferred_pending, task_id)
+            let removed = remove_pending_job(&mut state.active_pending, task_id)
+                || remove_pending_job(&mut state.deferred_pending, task_id);
+            if !has_deferred_jobs(&state) {
+                state.deferred_pending_flag = false;
+            }
+            removed
         };
         if removed {
             self.save()?;
@@ -495,6 +499,7 @@ impl PersistentQueue {
             let mut state = self.state.lock();
             state.active_pending.clear();
             state.deferred_pending.clear();
+            state.deferred_pending_flag = false;
         }
         self.save()
     }
@@ -508,6 +513,7 @@ impl PersistentQueue {
             state.deferred_running.clear();
             state.completed.clear();
             state.failed.clear();
+            state.deferred_pending_flag = false;
         }
         self.save()
     }
@@ -520,6 +526,7 @@ impl PersistentQueue {
             state.deferred_running.clear();
             state.completed.clear();
             state.failed.clear();
+            state.deferred_pending_flag = false;
         }
         self.save()
     }
@@ -538,6 +545,7 @@ impl PersistentQueue {
                 job.mark_pending();
                 state.active_pending.push_back(job);
             }
+            state.deferred_pending_flag = false;
             count
         };
         self.save()?;
@@ -553,6 +561,7 @@ impl PersistentQueue {
                 job.mark_pending();
                 state.deferred_pending.push_back(job);
             }
+            state.deferred_pending_flag = has_deferred_jobs(&state);
             count
         };
         self.save()?;
@@ -572,8 +581,9 @@ impl PersistentQueue {
     }
 }
 
-fn remove_running_job(jobs: &mut Vec<StoredQueueJob>, job_id: &str) {
-    jobs.retain(|job| job.job.id != job_id);
+fn remove_running_job(jobs: &mut Vec<StoredQueueJob>, job_id: &str) -> Option<StoredQueueJob> {
+    let index = jobs.iter().position(|job| job.job.id == job_id)?;
+    Some(jobs.remove(index))
 }
 
 fn remove_pending_job(jobs: &mut VecDeque<StoredQueueJob>, job_id: &str) -> bool {
@@ -584,6 +594,21 @@ fn remove_pending_job(jobs: &mut VecDeque<StoredQueueJob>, job_id: &str) -> bool
 
 fn total_pending_len(state: &PersistentQueueState) -> usize {
     state.active_pending.len() + state.deferred_pending.len()
+}
+
+fn has_deferred_jobs(state: &PersistentQueueState) -> bool {
+    !state.deferred_pending.is_empty() || !state.deferred_running.is_empty()
+}
+
+fn push_history_entry(history: &mut Vec<StoredQueueJob>, job: StoredQueueJob) {
+    if history.iter().any(|entry| entry.job.id == job.job.id) {
+        return;
+    }
+    history.push(job);
+    if history.len() > 1000 {
+        let drain_count = history.len() - 500;
+        history.drain(..drain_count);
+    }
 }
 
 fn validate_job_target(target: &str) -> Result<()> {
@@ -624,6 +649,8 @@ fn validate_queue_state(state: &PersistentQueueState) -> Result<()> {
         .chain(state.active_pending.iter())
         .chain(state.deferred_running.iter())
         .chain(state.active_running.iter())
+        .chain(state.completed.iter())
+        .chain(state.failed.iter())
     {
         validate_job_target(&job.job.target)?;
     }
@@ -655,6 +682,7 @@ fn load_queue_state(content: &str) -> Result<PersistentQueueState> {
         deferred_running,
         completed: file.completed,
         failed: file.failed,
+        deferred_pending_flag: file.deferred_pending_flag,
     })
 }
 
@@ -674,6 +702,9 @@ fn queue_state_to_legacy_file(state: &PersistentQueueState) -> LegacyQueueFile {
     LegacyQueueFile {
         pending,
         running,
+        completed: state.completed.clone(),
+        failed: state.failed.clone(),
+        deferred_pending_flag: has_deferred_jobs(state) && state.deferred_pending_flag,
         updated_at: now_rfc3339(),
     }
 }
@@ -970,9 +1001,11 @@ mod tests {
         let queue_path = temp.path().join("queue.yaml");
         let queue = PersistentQueue::new(&queue_path).unwrap();
         queue.push(JobType::Download, "1").unwrap();
-        let job = queue.pop().unwrap();
-        queue.complete(&job.id).unwrap();
-        queue.fail("failed").unwrap();
+        let completed_job = queue.pop().unwrap();
+        queue.complete(&completed_job.id).unwrap();
+        queue.push(JobType::Update, "2").unwrap();
+        let failed_job = queue.pop().unwrap();
+        queue.fail(&failed_job.id).unwrap();
 
         queue.clear().unwrap();
 
@@ -990,8 +1023,10 @@ mod tests {
         let queue = PersistentQueue::new(&queue_path).unwrap();
         queue.push(JobType::Download, "1").unwrap();
         queue.push(JobType::Backup, "2").unwrap();
+        let failed = queue.pop().unwrap();
+        queue.fail(&failed.id).unwrap();
+        queue.push(JobType::Update, "3").unwrap();
         let running = queue.pop().unwrap();
-        queue.fail("failed").unwrap();
 
         queue.clear_non_running().unwrap();
 
@@ -1153,6 +1188,102 @@ mod tests {
         assert!(saved.contains("source: ruby"));
         assert!(saved.contains("status: running"));
         assert!(saved.contains("started_at:"));
+    }
+
+    #[test]
+    fn requeue_failed_restores_original_job_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let mut meta = Mapping::new();
+        meta.insert(
+            Value::String("source".to_string()),
+            Value::String("web".to_string()),
+        );
+        let id = queue
+            .push_with_legacy(
+                JobType::Update,
+                "tag:modified",
+                "update_by_tag",
+                vec![Value::String("tag:modified".to_string())],
+                meta,
+            )
+            .unwrap();
+
+        let running = queue.pop().unwrap();
+        assert_eq!(running.id, id);
+        queue.fail(&running.id).unwrap();
+
+        let saved = std::fs::read_to_string(&queue_path).unwrap();
+        assert!(saved.contains("failed:"));
+        assert!(saved.contains("cmd: update_by_tag"));
+        assert!(saved.contains("source: web"));
+
+        assert_eq!(queue.requeue_failed().unwrap(), 1);
+        let pending = queue.get_pending_tasks();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+        assert!(matches!(pending[0].job_type, JobType::Update));
+        assert_eq!(pending[0].target, "tag:modified");
+
+        let spec = queue.execution_spec(&id).unwrap();
+        assert_eq!(spec.cmd, "update_by_tag");
+        assert_eq!(spec.args, vec!["tag:modified".to_string()]);
+        assert_eq!(
+            spec.meta.get(&Value::String("source".to_string())),
+            Some(&Value::String("web".to_string()))
+        );
+    }
+
+    #[test]
+    fn completed_and_failed_history_survive_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+
+        queue.push(JobType::Download, "n0001").unwrap();
+        let completed = queue.pop().unwrap();
+        queue.complete(&completed.id).unwrap();
+
+        queue.push(JobType::Update, "tag:modified").unwrap();
+        let failed = queue.pop().unwrap();
+        queue.fail(&failed.id).unwrap();
+
+        let reloaded = PersistentQueue::new(&queue_path).unwrap();
+        assert_eq!(reloaded.completed_count(), 1);
+        assert_eq!(reloaded.failed_count(), 1);
+
+        let saved = std::fs::read_to_string(&queue_path).unwrap();
+        assert!(saved.contains("completed:"));
+        assert!(saved.contains("failed:"));
+        assert!(saved.contains("target: n0001"));
+        assert!(saved.contains("target: tag:modified"));
+    }
+
+    #[test]
+    fn deferred_restore_prompt_state_persists_across_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        std::fs::write(
+            &queue_path,
+            "---\npending:\n  - id: pending-1\n    cmd: update\n    args:\n      - '12'\n    meta: {}\n    status: pending\n    created_at: '2026-04-19T15:13:58+09:00'\nrunning:\n  - id: running-1\n    cmd: auto_update\n    args: []\n    meta: {}\n    status: running\n    created_at: '2026-04-19T15:14:58+09:00'\n    started_at: '2026-04-19T15:15:58+09:00'\nupdated_at: '2026-04-19T15:16:58+09:00'\n",
+        )
+        .unwrap();
+
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        assert!(queue.has_restorable_tasks());
+        assert!(queue.restore_prompt_pending());
+
+        assert_eq!(queue.defer_restorable_tasks().unwrap(), 1);
+        assert!(queue.has_restorable_tasks());
+        assert!(!queue.restore_prompt_pending());
+
+        let reloaded = PersistentQueue::new(&queue_path).unwrap();
+        assert!(reloaded.has_restorable_tasks());
+        assert!(!reloaded.restore_prompt_pending());
+
+        let saved = std::fs::read_to_string(&queue_path).unwrap();
+        assert!(saved.contains("deferred_pending: true"));
     }
 
     #[test]

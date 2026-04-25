@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use narou_rs::db::inventory::{Inventory, InventoryScope};
@@ -95,9 +95,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
             }
         };
     let restorable_tasks_available = Arc::new(AtomicBool::new(queue.has_restorable_tasks()));
-    let restore_prompt_pending = Arc::new(AtomicBool::new(
-        restorable_tasks_available.load(Ordering::Relaxed),
-    ));
+    let restore_prompt_pending = Arc::new(AtomicBool::new(queue.restore_prompt_pending()));
     let running_jobs = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let running_child_pids = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let auto_update_scheduler = Arc::new(parking_lot::Mutex::new(None));
