@@ -496,7 +496,10 @@ export function bindActions() {
 
   on('btn-update', (e) => {
     void runGuardedAction(e.currentTarget, async () => {
-      const result = State.selectedIds.size > 0
+      const total = Array.isArray(State.novels) ? State.novels.length : 0;
+      const selectedCount = State.selectedIds.size;
+      const allSelected = total > 0 && selectedCount >= total;
+      const result = (selectedCount > 0 && !allSelected)
         ? await postJson('/api/update', {
           targets: [...State.selectedIds],
           ...currentSortStatePayload(),
@@ -601,7 +604,11 @@ export function bindActions() {
   on('action-update-view', (e) => {
     const ids = getVisibleIds();
     void runGuardedAction(e.currentTarget, async () => {
-      const result = await postJson('/api/update', { targets: ids, ...currentSortStatePayload() });
+      const total = Array.isArray(State.novels) ? State.novels.length : 0;
+      const allVisible = total > 0 && ids.length >= total;
+      const result = allVisible
+        ? await postJson('/api/update', { update_all: true, ...currentSortStatePayload() })
+        : await postJson('/api/update', { targets: ids, ...currentSortStatePayload() });
       assertApiSuccess(result, '表示中小説のアップデート要求に失敗しました');
     }, '表示中小説のアップデート要求に失敗しました');
   });
