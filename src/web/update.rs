@@ -380,8 +380,8 @@ pub fn current_asset_name() -> Option<String> {
         ("macos", "aarch64") => "mac_arm64",
         ("linux", "x86_64") => "linux_x64",
         ("linux", "aarch64") => "linux_arm64",
-        ("linux", "arm") => "rpi0_armv6",
-        ("linux", "armv7") => "rpi24_armv7",
+        ("linux", "arm") => "armv6",
+        ("linux", "armv7") => "armv7",
         _ => return None,
     };
     Some(format!("narou_rs_{key}.zip"))
