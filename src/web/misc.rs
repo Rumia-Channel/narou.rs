@@ -6,6 +6,8 @@ use axum::{
 use reqwest::header::USER_AGENT;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::compat::{load_local_setting_bool, load_local_setting_string};
@@ -109,6 +111,21 @@ fn normalize_version(version: &str) -> String {
         .next()
         .unwrap_or("")
         .to_string()
+}
+
+fn notepad_path() -> crate::error::Result<PathBuf> {
+    Ok(Inventory::with_default_root()?
+        .root_dir()
+        .join(".narou")
+        .join("notepad.txt"))
+}
+
+fn read_notepad_content(path: &Path) -> std::io::Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -233,7 +250,10 @@ pub async fn all_novel_ids(State(_state): State<AppState>) -> Json<serde_json::V
 }
 
 pub async fn notepad_read(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let content = std::fs::read_to_string(".narou/notepad.txt").unwrap_or_default();
+    let content = notepad_path()
+        .ok()
+        .and_then(|path| read_notepad_content(&path).ok())
+        .unwrap_or_default();
     Json(notepad_response_value(&content))
 }
 
@@ -253,7 +273,24 @@ pub async fn notepad_save(
             "message": message,
         }));
     }
-    let current_content = std::fs::read_to_string(".narou/notepad.txt").unwrap_or_default();
+    let path = match notepad_path() {
+        Ok(path) => path,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "success": false,
+                "message": e.to_string(),
+            }));
+        }
+    };
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return Json(serde_json::json!({
+            "success": false,
+            "message": e.to_string(),
+        }));
+    }
+    let current_content = read_notepad_content(&path).unwrap_or_default();
     let current_object_id = notepad_object_id(&current_content);
     let request_object_id = body["object_id"].as_str().unwrap_or("");
 
@@ -268,7 +305,7 @@ pub async fn notepad_save(
         }));
     }
 
-    let result = std::fs::write(".narou/notepad.txt", content);
+    let result = crate::db::inventory::atomic_write(&path, content);
     let object_id = notepad_object_id(content);
     let response = serde_json::json!({
         "content": content,
@@ -408,4 +445,22 @@ pub async fn validate_url_regexp_list(State(_state): State<AppState>) -> Json<se
         .collect();
 
     Json(serde_json::json!(patterns))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::notepad_path;
+
+    #[test]
+    fn notepad_path_uses_narou_root_instead_of_current_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let nested = root.join("subdir").join("inner");
+        std::fs::create_dir_all(root.join(".narou")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let _guard = crate::test_support::set_current_dir_for_test(&nested);
+
+        assert_eq!(notepad_path().unwrap(), root.join(".narou").join("notepad.txt"));
+    }
 }

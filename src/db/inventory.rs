@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -16,6 +17,7 @@ use crate::error::{NarouError, Result};
 const CACHE_MAX_SIZE: usize = 200;
 const CACHE_TARGET_SIZE: usize = 160;
 pub(crate) const MAX_YAML_SIZE_BYTES: u64 = 32 * 1024 * 1024;
+const STALE_LOCK_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 const PROTECTED_KEYS: &[&str] = &[
     "local_setting",
@@ -138,12 +140,7 @@ impl Inventory {
             }
         }
 
-        let content = if path.exists() {
-            ensure_yaml_size_limit(&path)?;
-            fs::read_to_string(&path)?
-        } else {
-            String::new()
-        };
+        let content = read_optional_yaml_file(&path)?;
 
         self.cache
             .lock()
@@ -248,12 +245,7 @@ where
     F: FnOnce(String) -> Result<(String, T)>,
 {
     with_exclusive_file_lock(path, || {
-        let current = if path.exists() {
-            ensure_yaml_size_limit(path)?;
-            fs::read_to_string(path)?
-        } else {
-            String::new()
-        };
+        let current = read_optional_yaml_file(path)?;
         let (new_content, result) = update(current)?;
         atomic_write_locked(path, &new_content)?;
         Ok((new_content, result))
@@ -270,6 +262,7 @@ where
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    prune_stale_lock_file(&lock_path)?;
     let lock_file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -290,7 +283,10 @@ fn atomic_write_locked(path: &Path, content: &str) -> Result<()> {
         drop(file);
 
         match fs::rename(&tmp_path, path) {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                crate::compat::fsync_parent_dir(path)?;
+                return Ok(());
+            }
             Err(e) => {
                 last_error = Some(e);
                 let _ = fs::remove_file(&tmp_path);
@@ -322,6 +318,27 @@ fn serialize_yaml_content<T: Serialize>(data: &T) -> Result<String> {
     Ok(content)
 }
 
+fn read_optional_yaml_file(path: &Path) -> Result<String> {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            if metadata.len() > MAX_YAML_SIZE_BYTES {
+                return Err(NarouError::Database(format!(
+                    "{} exceeds maximum supported YAML size ({} bytes)",
+                    path.display(),
+                    MAX_YAML_SIZE_BYTES
+                )));
+            }
+            match fs::read_to_string(path) {
+                Ok(content) => Ok(content),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(String::new()),
+                Err(e) => Err(NarouError::Io(e)),
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(NarouError::Io(e)),
+    }
+}
+
 pub(crate) fn ensure_yaml_size_limit(path: &Path) -> Result<()> {
     let size = fs::metadata(path)?.len();
     if size > MAX_YAML_SIZE_BYTES {
@@ -349,6 +366,41 @@ fn lock_file_path(path: &Path) -> PathBuf {
     path.parent()
         .unwrap_or_else(|| Path::new("."))
         .join(format!("{filename}.lock"))
+}
+
+fn prune_stale_lock_file(lock_path: &Path) -> Result<()> {
+    let metadata = match fs::metadata(lock_path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(NarouError::Io(e)),
+    };
+    let Ok(modified) = metadata.modified() else {
+        return Ok(());
+    };
+    let Ok(age) = SystemTime::now().duration_since(modified) else {
+        return Ok(());
+    };
+    if age < STALE_LOCK_MAX_AGE {
+        return Ok(());
+    }
+
+    let lock_file = match OpenOptions::new().read(true).write(true).open(lock_path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(NarouError::Io(e)),
+    };
+
+    if lock_file.try_lock_exclusive().is_ok() {
+        let _ = lock_file.unlock();
+        drop(lock_file);
+        match fs::remove_file(lock_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(NarouError::Io(e)),
+        }
+    }
+
+    Ok(())
 }
 
 fn process_write_lock_for(path: &Path) -> Arc<StdMutex<()>> {
@@ -396,11 +448,13 @@ fn dirs_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs::OpenOptions;
     use std::sync::{Mutex, OnceLock};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     use super::{
         CACHE_MAX_SIZE, CACHE_TARGET_SIZE, Inventory, InventoryScope, MAX_YAML_SIZE_BYTES,
+        STALE_LOCK_MAX_AGE,
     };
 
     fn env_lock() -> &'static Mutex<()> {
@@ -544,5 +598,39 @@ mod tests {
         assert!(!raw.contains("1:"));
         assert!(raw.contains("2: true"));
         assert!(narou_dir.join("freeze.yaml.lock").exists());
+    }
+
+    #[test]
+    fn stale_lock_file_is_pruned_before_reuse() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let narou_dir = root.join(".narou");
+        std::fs::create_dir_all(&narou_dir).unwrap();
+        let lock_path = narou_dir.join("freeze.yaml.lock");
+        std::fs::write(&lock_path, "").unwrap();
+        let lock_file = OpenOptions::new().write(true).open(&lock_path).unwrap();
+        lock_file
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::now() - STALE_LOCK_MAX_AGE - Duration::from_secs(1)),
+            )
+            .unwrap();
+        drop(lock_file);
+
+        let inventory = Inventory::new(root);
+        inventory
+            .update_yaml::<(), HashMap<i64, serde_yaml::Value>, _>(
+                "freeze",
+                InventoryScope::Local,
+                |mut frozen| {
+                    frozen.insert(1, serde_yaml::Value::Bool(true));
+                    Ok((frozen, ()))
+                },
+            )
+            .unwrap();
+
+        assert!(lock_path.exists());
+        let raw = std::fs::read_to_string(narou_dir.join("freeze.yaml")).unwrap();
+        assert!(raw.contains("1: true"));
     }
 }

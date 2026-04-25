@@ -14,6 +14,11 @@ use narou_rs::mail::{
 };
 use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
 
+const EXIT_INTERRUPT: i32 = 126;
+
+#[derive(Debug, Clone, Copy)]
+struct DownloadInterrupted;
+
 pub struct DownloadOptions {
     pub targets: Vec<String>,
     pub force: bool,
@@ -27,22 +32,26 @@ pub struct DownloadOptions {
 
 pub fn cmd_download(opts: DownloadOptions) -> i32 {
     match std::thread::spawn(move || cmd_download_inner(opts)).join() {
-        Ok(code) => code,
+        Ok(Ok(code)) => code,
+        Ok(Err(DownloadInterrupted)) => {
+            println!("ダウンロードを中断しました");
+            EXIT_INTERRUPT
+        }
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }
 
-fn cmd_download_inner(opts: DownloadOptions) -> i32 {
+fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, DownloadInterrupted> {
     if let Err(e) = narou_rs::db::init_database() {
         eprintln!("Error initializing database: {}", e);
-        return 127;
+        return Ok(127);
     }
 
     let mut downloader = match Downloader::with_user_agent(opts.user_agent.as_deref()) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Error creating downloader: {}", e);
-            return 127;
+            return Ok(127);
         }
     };
 
@@ -51,7 +60,7 @@ fn cmd_download_inner(opts: DownloadOptions) -> i32 {
     if targets.is_empty() {
         targets = interactive_mode(&downloader);
         if targets.is_empty() {
-            return 0;
+            return Ok(0);
         }
     }
 
@@ -138,7 +147,7 @@ fn cmd_download_inner(opts: DownloadOptions) -> i32 {
                 }
                 Err(e) => {
                     if matches!(e, narou_rs::error::NarouError::SuspendDownload(_)) {
-                        std::panic::resume_unwind(Box::new(e.to_string()));
+                        return Err(DownloadInterrupted);
                     }
                     println!("  Error: {}", e);
                     mistook += 1;
@@ -150,11 +159,11 @@ fn cmd_download_inner(opts: DownloadOptions) -> i32 {
 
     drop(multi);
 
-    if mistook > 0 {
+    Ok(if mistook > 0 {
         mistook.min(127) as i32
     } else {
         0
-    }
+    })
 }
 
 fn interactive_mode(downloader: &Downloader) -> Vec<String> {
@@ -627,7 +636,7 @@ fn auto_convert_via_web_subprocess(id: i64) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_confirm_input;
+    use super::{EXIT_INTERRUPT, parse_confirm_input};
 
     #[test]
     fn parse_confirm_input_accepts_yes_and_no() {
@@ -646,5 +655,10 @@ mod tests {
     #[test]
     fn parse_confirm_input_rejects_invalid_values() {
         assert_eq!(parse_confirm_input("maybe", false), None);
+    }
+
+    #[test]
+    fn suspend_download_exit_code_matches_ruby() {
+        assert_eq!(EXIT_INTERRUPT, 126);
     }
 }

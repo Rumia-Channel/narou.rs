@@ -178,6 +178,19 @@ pub fn canonicalize_existing_path(path: impl AsRef<Path>) -> Option<PathBuf> {
     fs::canonicalize(path).ok()
 }
 
+#[cfg(unix)]
+pub fn fsync_parent_dir(path: &Path) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+pub fn fsync_parent_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 pub fn canonicalize_aozoraepub3_jar_dir(dir: &str) -> Option<PathBuf> {
     let canonical_dir = canonicalize_existing_path(PathBuf::from(dir))?;
     let jar = canonical_dir.join("AozoraEpub3.jar");

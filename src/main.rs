@@ -9,7 +9,9 @@ mod logger;
 #[cfg(test)]
 mod test_support;
 
+use std::any::Any;
 use std::io::IsTerminal;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use clap::Parser;
@@ -34,6 +36,46 @@ fn prepare_windows_console() {
 
 #[cfg(not(windows))]
 fn prepare_windows_console() {}
+
+fn last_panic_detail() -> &'static Mutex<Option<String>> {
+    static LAST_PANIC_DETAIL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    LAST_PANIC_DETAIL.get_or_init(|| Mutex::new(None))
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown error".to_string()
+    }
+}
+
+fn panic_detail_message(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = panic_payload_message(info.payload());
+    if let Some(location) = info.location() {
+        format!(
+            "panic: {} (at {}:{}:{})",
+            payload,
+            location.file(),
+            location.line(),
+            location.column()
+        )
+    } else {
+        format!("panic: {}", payload)
+    }
+}
+
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let detail = panic_detail_message(info);
+        if let Ok(mut slot) = last_panic_detail().lock() {
+            *slot = Some(detail.clone());
+        }
+        eprintln!("{}", detail);
+    }));
+}
 
 #[cfg(windows)]
 fn raw_hide_console_requested() -> bool {
@@ -78,6 +120,8 @@ async fn main() {
         }
     }
 
+    install_panic_hook();
+
     logger::init();
     logger::init_tracing(no_color);
 
@@ -110,13 +154,7 @@ async fn main() {
         Err(panic_info) => {
             backtracer::save_log(&trace_args, panic_info.as_ref());
             if backtrace {
-                if let Some(s) = panic_info.downcast_ref::<&str>() {
-                    eprintln!("panic: {}", s);
-                } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                    eprintln!("panic: {}", s);
-                } else {
-                    eprintln!("panic: unknown error");
-                }
+                let _ = last_panic_detail().lock().map(|mut slot| slot.take());
             } else {
                 eprintln!("エラーが発生したため終了しました。");
                 eprintln!("詳細なエラーログは --backtrace オプションを付けて再度実行して下さい。");
@@ -423,13 +461,7 @@ fn run_sync_command(
         Err(panic_info) => {
             backtracer::save_log(&trace_args, panic_info.as_ref());
             if backtrace {
-                if let Some(s) = panic_info.downcast_ref::<&str>() {
-                    eprintln!("panic: {}", s);
-                } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                    eprintln!("panic: {}", s);
-                } else {
-                    eprintln!("panic: unknown error");
-                }
+                let _ = last_panic_detail().lock().map(|mut slot| slot.take());
             } else {
                 eprintln!("エラーが発生したため終了しました。");
                 eprintln!("詳細なエラーログは --backtrace オプションを付けて再度実行して下さい。");

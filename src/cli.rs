@@ -92,7 +92,12 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
         args.push("help".to_string());
     }
 
-    if args.len() > 1 && args[1..].iter().any(|a| a == "-h" || a == "--help") {
+    let args_before_double_dash = args_before_double_dash(args);
+    if args_before_double_dash.len() > 1
+        && args_before_double_dash[1..]
+            .iter()
+            .any(|a| a == "-h" || a == "--help")
+    {
         let cmd_name = args[0].clone();
         if crate::commands::help::display_command_help(&cmd_name) {
             std::process::exit(0);
@@ -183,6 +188,21 @@ fn load_global_no_color() -> bool {
         .unwrap_or(false)
 }
 
+fn args_before_double_dash(args: &[String]) -> &[String] {
+    match args.iter().position(|arg| arg == "--") {
+        Some(index) => &args[..index],
+        None => args,
+    }
+}
+
+fn has_explicit_positional_args(args: &[String]) -> bool {
+    let rest = args.get(1..).unwrap_or(&[]);
+    match rest.iter().position(|arg| arg == "--") {
+        Some(index) => rest.get(index + 1).is_some(),
+        None => rest.iter().any(|arg| !arg.starts_with('-')),
+    }
+}
+
 pub fn inject_default_args(args: &mut Vec<String>) {
     if args.len() < 2 {
         return;
@@ -191,8 +211,7 @@ pub fn inject_default_args(args: &mut Vec<String>) {
     if cmd_name.starts_with('-') {
         return;
     }
-    let has_positional_args = args[1..].iter().any(|a| !a.starts_with('-'));
-    if has_positional_args {
+    if has_explicit_positional_args(args) {
         return;
     }
     if !is_terminal_stdin() {
@@ -586,6 +605,19 @@ mod tests {
                 hide_console: true,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn download_targets_after_double_dash_are_not_treated_as_help() {
+        let mut args = vec!["download".to_string(), "--".to_string(), "-h".to_string()];
+        let _flags = preprocess_args(&mut args);
+        assert_eq!(args, vec!["download", "--", "-h"]);
+
+        let cli = Cli::try_parse_from(["narou", "download", "--", "-h"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Download { targets, .. } if targets == vec!["-h".to_string()]
         ));
     }
 }
