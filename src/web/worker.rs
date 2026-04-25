@@ -305,6 +305,9 @@ fn execute_job(
             }
             "update_by_tag" => {
                 command.arg("update");
+                if let Some(sort_key) = execution_spec_meta_string(&spec, "sort_by") {
+                    command.arg("--sort-by").arg(sort_key);
+                }
                 append_update_args(&mut command, push_server, target_console, &spec);
             }
             "convert" => {

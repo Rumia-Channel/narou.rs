@@ -320,7 +320,11 @@ fn sort_numeric_targets_for_request(
         .collect()
 }
 
-fn build_update_by_tag_queue_payload(tag_params: &[String], snapshot_ids: &[i64]) -> (String, Vec<Value>, Mapping) {
+fn build_update_by_tag_queue_payload(
+    tag_params: &[String],
+    snapshot_ids: &[i64],
+    sort_by: Option<&str>,
+) -> (String, Vec<Value>, Mapping) {
     let target = tag_params.join("\t");
     let legacy_args = tag_params
         .iter()
@@ -341,6 +345,12 @@ fn build_update_by_tag_queue_payload(tag_params: &[String], snapshot_ids: &[i64]
         Value::String("snapshot_count".to_string()),
         Value::Number(serde_yaml::Number::from(snapshot_ids.len() as u64)),
     );
+    if let Some(key) = sort_by {
+        meta.insert(
+            Value::String("sort_by".to_string()),
+            Value::String(key.to_string()),
+        );
+    }
     (target, legacy_args, meta)
 }
 
@@ -2087,11 +2097,14 @@ pub async fn api_update_by_tag(
     }
 
     // Snapshot current matching novel IDs for UI feedback only.
+    // Sort using server-stored sort state (single source of truth).
+    let server_sort_state = current_web_update_sort_state();
+    let sort_key = web_update_sort_key_for_cli(&server_sort_state);
     let snapshot_ids = with_database(|db| {
         let all = db.all_records();
-        let mut matching_ids: Vec<i64> = Vec::new();
+        let mut matching: Vec<&crate::db::NovelRecord> = Vec::new();
 
-        for (&id, record) in all {
+        for (_id, record) in all {
             let record_tags: Vec<&str> = record.tags.iter().map(|s| s.as_str()).collect();
             let mut include = false;
             let mut exclude = false;
@@ -2109,18 +2122,17 @@ pub async fn api_update_by_tag(
 
             // Include if matches any inclusion tag and no exclusion tag
             if (tags.is_empty() || include) && !exclude {
-                matching_ids.push(id);
+                matching.push(record);
             }
         }
-        Ok(matching_ids)
+        sort_records_for_web_update(&mut matching, &server_sort_state);
+        Ok(matching.into_iter().map(|r| r.id).collect::<Vec<i64>>())
     })
     .unwrap_or_default();
 
-    let snapshot_ids =
-        sort_ids_for_request(&snapshot_ids, body.sort_state.as_ref(), body.timestamp);
     let count = snapshot_ids.len();
     let (target, legacy_args, meta) =
-        build_update_by_tag_queue_payload(&tag_params, &snapshot_ids);
+        build_update_by_tag_queue_payload(&tag_params, &snapshot_ids, sort_key);
     let (_job_ids, queued) = match push_update_job_with_legacy_if_needed(
         state.queue.as_ref(),
         &state.running_jobs,
@@ -2805,6 +2817,7 @@ mod tests {
         let (target, legacy_args, meta) = build_update_by_tag_queue_payload(
             &["tag:modified".to_string(), "^tag:end".to_string()],
             &[42, 9],
+            Some("general_lastup"),
         );
 
         assert_eq!(target, "tag:modified\t^tag:end");
@@ -2821,6 +2834,10 @@ mod tests {
                 Value::String("42".to_string()),
                 Value::String("9".to_string())
             ]))
+        );
+        assert_eq!(
+            meta.get(Value::String("sort_by".to_string())),
+            Some(&Value::String("general_lastup".to_string()))
         );
     }
 
