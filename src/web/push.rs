@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
 
 use axum::{
@@ -88,6 +88,12 @@ struct ConsoleHistoryEntry {
     payload: String,
 }
 
+#[derive(Debug, Default)]
+struct ConsoleHistoryState {
+    next_message_id: u64,
+    entries: Vec<ConsoleHistoryEntry>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct WsClientQuery {
     #[serde(default)]
@@ -117,8 +123,7 @@ pub struct PushServer {
     clients: DashMap<usize, ClientHandle>,
     connected_clients: AtomicUsize,
     next_client_id: AtomicUsize,
-    next_message_id: AtomicU64,
-    console_history: Mutex<Vec<ConsoleHistoryEntry>>,
+    console_history: Mutex<ConsoleHistoryState>,
     max_history: usize,
     max_clients: usize,
     accepted_domains: Vec<String>,
@@ -131,8 +136,7 @@ impl PushServer {
             clients: DashMap::new(),
             connected_clients: AtomicUsize::new(0),
             next_client_id: AtomicUsize::new(1),
-            next_message_id: AtomicU64::new(0),
-            console_history: Mutex::new(Vec::new()),
+            console_history: Mutex::new(ConsoleHistoryState::default()),
             max_history: 10000,
             max_clients: MAX_WS_CLIENTS,
             accepted_domains: vec!["127.0.0.1".to_string(), "localhost".to_string()],
@@ -146,8 +150,7 @@ impl PushServer {
             clients: DashMap::new(),
             connected_clients: AtomicUsize::new(0),
             next_client_id: AtomicUsize::new(1),
-            next_message_id: AtomicU64::new(0),
-            console_history: Mutex::new(Vec::new()),
+            console_history: Mutex::new(ConsoleHistoryState::default()),
             max_history,
             max_clients,
             accepted_domains: vec!["127.0.0.1".to_string(), "localhost".to_string()],
@@ -284,15 +287,20 @@ impl PushServer {
 
     fn publish_json(&self, value: serde_json::Value) {
         let payload = value.to_string();
-        let id = self.next_message_id.fetch_add(1, Ordering::Relaxed) + 1;
         let target_console = message_target_console(&value);
         let scope = message_scope(&value);
-        let replayed_by_history = history_entry_from_value(id, &value, scope.clone(), payload.clone())
-            .map(|entry| {
-                self.append_history(entry);
-                true
-            })
-            .unwrap_or(false);
+        let (id, replayed_by_history) = {
+            let mut history = self.console_history.lock();
+            history.next_message_id += 1;
+            let id = history.next_message_id;
+            let replayed_by_history = history_entry_from_value(id, &value, scope.clone(), payload.clone())
+                .map(|entry| {
+                    Self::append_history_locked(&mut history.entries, self.max_history, entry);
+                    true
+                })
+                .unwrap_or(false);
+            (id, replayed_by_history)
+        };
         self.channel.send(&payload);
         self.dispatch_to_clients(ClientMessage {
             id,
@@ -362,7 +370,7 @@ impl PushServer {
         let history = self.console_history.lock();
         let mut selected = Vec::new();
         let mut total_bytes = 0usize;
-        for entry in history.iter().rev() {
+        for entry in history.entries.iter().rev() {
             let entry_bytes = entry.payload.len();
             if selected.len() >= MAX_WS_HISTORY_LINES
                 || total_bytes.saturating_add(entry_bytes) > MAX_WS_HISTORY_BYTES
@@ -376,11 +384,14 @@ impl PushServer {
         selected
     }
 
-    fn append_history(&self, entry: ConsoleHistoryEntry) {
-        let mut history = self.console_history.lock();
+    fn append_history_locked(
+        history: &mut Vec<ConsoleHistoryEntry>,
+        max_history: usize,
+        entry: ConsoleHistoryEntry,
+    ) {
         history.push(entry);
-        if history.len() > self.max_history {
-            let drain_count = history.len() - self.max_history + 500;
+        if history.len() > max_history {
+            let drain_count = history.len() - max_history + 500;
             history.drain(..drain_count);
         }
     }
@@ -405,6 +416,7 @@ impl PushServer {
         let history = self.console_history.lock();
         let target_stream = stream.unwrap_or("stdout");
         history
+            .entries
             .iter()
             .filter(|entry| entry.target_console.as_deref() == Some(target_stream))
             .filter_map(|entry| entry.body.as_deref())
@@ -414,13 +426,13 @@ impl PushServer {
 
     pub fn clear_history(&self) {
         let mut history = self.console_history.lock();
-        history.clear();
+        history.entries.clear();
     }
 
     pub fn recent_logs(&self, count: usize) -> Vec<String> {
         let history = self.console_history.lock();
-        let start = history.len().saturating_sub(count);
-        history[start..]
+        let start = history.entries.len().saturating_sub(count);
+        history.entries[start..]
             .iter()
             .map(|entry| entry.body.clone().unwrap_or_else(|| entry.payload.clone()))
             .collect()
@@ -883,6 +895,38 @@ mod tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(second_live.payload.as_str()).unwrap()["type"], "table.reload");
 
         server.unregister_client(client_id);
+    }
+
+    #[test]
+    fn concurrent_publish_preserves_history_id_order() {
+        let server = Arc::new(PushServer::new_with_limits(4, 512));
+        let start = Arc::new(std::sync::Barrier::new(3));
+
+        let first_server = Arc::clone(&server);
+        let first_start = Arc::clone(&start);
+        let first = std::thread::spawn(move || {
+            first_start.wait();
+            for idx in 0..100 {
+                first_server.broadcast_echo(&format!("first-{idx}"), "stdout");
+            }
+        });
+
+        let second_server = Arc::clone(&server);
+        let second_start = Arc::clone(&start);
+        let second = std::thread::spawn(move || {
+            second_start.wait();
+            for idx in 0..100 {
+                second_server.broadcast_echo(&format!("second-{idx}"), "stdout");
+            }
+        });
+
+        start.wait();
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let history = server.history_snapshot();
+        let history_ids: Vec<u64> = history.iter().map(|entry| entry.id).collect();
+        assert_eq!(history_ids, (1..=200).collect::<Vec<_>>());
     }
 
     #[test]
