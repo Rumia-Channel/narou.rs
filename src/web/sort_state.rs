@@ -96,25 +96,26 @@ pub(crate) fn normalize_current_sort_request(body: &serde_json::Value) -> Option
 }
 
 pub(crate) fn request_sort_state(
-    sort_state: Option<&serde_json::Value>,
-    timestamp: Option<u64>,
+    _sort_state: Option<&serde_json::Value>,
+    _timestamp: Option<u64>,
 ) -> Option<CurrentSortState> {
-    timestamp?;
-    sort_state.and_then(normalize_current_sort_request)
+    // Single source of truth: never honor request-supplied sort state.
+    None
 }
 
 pub(crate) fn request_preserves_input_order(
-    sort_state: Option<&serde_json::Value>,
-    timestamp: Option<u64>,
+    _sort_state: Option<&serde_json::Value>,
+    _timestamp: Option<u64>,
 ) -> bool {
-    timestamp.is_some() && request_sort_state(sort_state, timestamp).is_none()
+    // Server-stored sort is always authoritative.
+    false
 }
 
 pub(crate) fn requested_or_current_sort_state(
-    sort_state: Option<&serde_json::Value>,
-    timestamp: Option<u64>,
+    _sort_state: Option<&serde_json::Value>,
+    _timestamp: Option<u64>,
 ) -> CurrentSortState {
-    request_sort_state(sort_state, timestamp).unwrap_or_else(load_current_sort_state)
+    load_current_sort_state()
 }
 
 pub(crate) fn sort_column_key(sort_state: &CurrentSortState) -> Option<&'static str> {
@@ -324,31 +325,20 @@ mod tests {
     }
 
     #[test]
-    fn fixed_sort_state_requires_timestamp() {
+    fn request_sort_state_is_always_ignored() {
+        // Server-stored current_sort is the single source of truth; request
+        // payloads (sort_state/timestamp) must never be honored.
         assert!(request_sort_state(
             Some(&serde_json::json!({ "column": 2, "dir": "desc" })),
-            None
+            Some(123)
         )
         .is_none());
-        assert_eq!(
-            request_sort_state(
-                Some(&serde_json::json!({ "column": 2, "dir": "desc" })),
-                Some(123)
-            ),
-            Some(CurrentSortState {
-                column: 2,
-                dir: "desc".to_string(),
-            })
-        );
+        assert!(request_sort_state(None, None).is_none());
     }
 
     #[test]
-    fn timestamp_without_supported_sort_preserves_input_order() {
-        assert!(request_preserves_input_order(None, Some(123)));
-        assert!(request_preserves_input_order(
-            Some(&serde_json::json!({ "column": "average_length", "dir": "desc" })),
-            Some(123)
-        ));
+    fn request_never_preserves_input_order() {
+        assert!(!request_preserves_input_order(None, Some(123)));
         assert!(!request_preserves_input_order(
             Some(&serde_json::json!({ "column": 2, "dir": "desc" })),
             Some(123)
