@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -11,6 +13,10 @@ use crate::error::{NarouError, Result};
 
 const MAX_PENDING_JOBS: usize = 10_000;
 const MAX_JOB_TARGET_CHARS: usize = 16 * 1024;
+pub const WEBUI_MESSAGE_TYPE_META_KEY: &str = "webui_message_type";
+pub const WEBUI_MESSAGE_TEXT_META_KEY: &str = "webui_message_text";
+pub const WEBUI_UPDATE_START_MESSAGE_TYPE: &str = "update_start";
+static JOB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueJob {
@@ -24,7 +30,7 @@ pub struct QueueJob {
     pub max_retries: u32,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobType {
     Download,
@@ -232,10 +238,15 @@ impl PersistentQueue {
     ) -> Result<String> {
         validate_job_target(target)?;
         let id = generate_job_id(job_type, target);
-        let created_at = chrono::Utc::now().timestamp();
         {
             let mut state = self.state.lock();
+            if let Some(existing_id) =
+                find_active_job_id(&state, job_type, target, legacy_override.as_ref())
+            {
+                return Ok(existing_id);
+            }
             ensure_queue_capacity(total_pending_len(&state), 1)?;
+            let created_at = chrono::Utc::now().timestamp();
             state.active_pending.push_back(build_stored_job(
                 id.clone(),
                 job_type,
@@ -244,6 +255,7 @@ impl PersistentQueue {
                 legacy_override,
             ));
         }
+        self.clear_backup_completion_sentinel(&id);
         self.save()?;
         Ok(id)
     }
@@ -256,6 +268,10 @@ impl PersistentQueue {
         let mut state = self.state.lock();
         ensure_queue_capacity(total_pending_len(&state), jobs.len())?;
         for (job_type, target) in jobs {
+            if let Some(existing_id) = find_active_job_id(&state, *job_type, target, None) {
+                ids.push(existing_id);
+                continue;
+            }
             let id = generate_job_id(*job_type, target);
             let created_at = chrono::Utc::now().timestamp();
             state.active_pending.push_back(build_stored_job(
@@ -268,6 +284,9 @@ impl PersistentQueue {
             ids.push(id);
         }
         drop(state);
+        for id in &ids {
+            self.clear_backup_completion_sentinel(id);
+        }
         self.save()?;
         Ok(ids)
     }
@@ -307,7 +326,8 @@ impl PersistentQueue {
     pub fn complete(&self, job_id: &str) -> Result<()> {
         {
             let mut state = self.state.lock();
-            if let Some(job) = remove_running_job(&mut state.active_running, job_id) {
+            if let Some(job) = take_running_job(&mut state, job_id) {
+                self.mark_backup_completion_sentinel(&job)?;
                 push_history_entry(&mut state.completed, job);
             }
         }
@@ -317,7 +337,7 @@ impl PersistentQueue {
     pub fn fail(&self, job_id: &str) -> Result<()> {
         {
             let mut state = self.state.lock();
-            if let Some(job) = remove_running_job(&mut state.active_running, job_id) {
+            if let Some(job) = take_running_job(&mut state, job_id) {
                 push_history_entry(&mut state.failed, job);
             }
         }
@@ -327,7 +347,7 @@ impl PersistentQueue {
     pub fn partial(&self, job_id: &str) -> Result<()> {
         {
             let mut state = self.state.lock();
-            if let Some(job) = remove_running_job(&mut state.active_running, job_id) {
+            if let Some(job) = take_running_job(&mut state, job_id) {
                 push_history_entry(&mut state.partial, job);
             }
         }
@@ -337,11 +357,37 @@ impl PersistentQueue {
     pub fn cancel(&self, job_id: &str) -> Result<()> {
         {
             let mut state = self.state.lock();
-            if let Some(job) = remove_running_job(&mut state.active_running, job_id) {
+            if let Some(job) = take_running_job(&mut state, job_id) {
                 push_history_entry(&mut state.cancelled, job);
             }
         }
         self.save()
+    }
+
+    pub fn cancel_pending_in_lane(&self, lane: QueueLane) -> Result<Vec<String>> {
+        let cancelled = {
+            let mut state = self.state.lock();
+            let mut cancelled = Vec::new();
+            let mut active_pending = std::mem::take(&mut state.active_pending);
+            let mut deferred_pending = std::mem::take(&mut state.deferred_pending);
+            cancel_pending_jobs_for_lane(&mut active_pending, lane, &mut state.cancelled, &mut cancelled);
+            cancel_pending_jobs_for_lane(
+                &mut deferred_pending,
+                lane,
+                &mut state.cancelled,
+                &mut cancelled,
+            );
+            state.active_pending = active_pending;
+            state.deferred_pending = deferred_pending;
+            if !has_deferred_jobs(&state) {
+                state.deferred_pending_flag = false;
+            }
+            cancelled
+        };
+        if !cancelled.is_empty() {
+            self.save()?;
+        }
+        Ok(cancelled)
     }
 
     pub fn requeue_failed(&self) -> Result<usize> {
@@ -543,7 +589,7 @@ impl PersistentQueue {
             let mut state = self.state.lock();
             state.active_pending.clear();
             state.deferred_pending.clear();
-            state.deferred_pending_flag = false;
+            normalize_deferred_pending_flag(&mut state);
         }
         self.save()
     }
@@ -555,11 +601,8 @@ impl PersistentQueue {
             state.deferred_pending.clear();
             state.active_running.clear();
             state.deferred_running.clear();
-            state.completed.clear();
-            state.partial.clear();
-            state.failed.clear();
             state.cancelled.clear();
-            state.deferred_pending_flag = false;
+            normalize_deferred_pending_flag(&mut state);
         }
         self.save()
     }
@@ -569,12 +612,8 @@ impl PersistentQueue {
             let mut state = self.state.lock();
             state.active_pending.clear();
             state.deferred_pending.clear();
-            state.deferred_running.clear();
-            state.completed.clear();
-            state.partial.clear();
-            state.failed.clear();
             state.cancelled.clear();
-            state.deferred_pending_flag = false;
+            normalize_deferred_pending_flag(&mut state);
         }
         self.save()
     }
@@ -584,14 +623,15 @@ impl PersistentQueue {
             let mut state = self.state.lock();
             let deferred_running = std::mem::take(&mut state.deferred_running);
             let deferred_pending = std::mem::take(&mut state.deferred_pending);
-            let count = deferred_running.len() + deferred_pending.len();
-            for mut job in deferred_running {
+            let mut count = 0usize;
+            for mut job in deferred_running.into_iter().chain(deferred_pending) {
+                if self.consume_backup_completion_sentinel(&job)? {
+                    push_history_entry(&mut state.completed, job);
+                    continue;
+                }
                 job.mark_pending();
                 state.active_pending.push_back(job);
-            }
-            for mut job in deferred_pending {
-                job.mark_pending();
-                state.active_pending.push_back(job);
+                count += 1;
             }
             state.deferred_pending_flag = false;
             count
@@ -627,11 +667,53 @@ impl PersistentQueue {
             .find(|job| job.job.id == job_id)
             .map(StoredQueueJob::execution_spec)
     }
+
+    fn backup_completion_sentinel_path(&self, job_id: &str) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("backup-bookmark-{}.done", job_id))
+    }
+
+    fn clear_backup_completion_sentinel(&self, job_id: &str) {
+        let path = self.backup_completion_sentinel_path(job_id);
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+
+    fn mark_backup_completion_sentinel(&self, job: &StoredQueueJob) -> Result<()> {
+        if !job_needs_backup_completion_sentinel(job) {
+            return Ok(());
+        }
+        let path = self.backup_completion_sentinel_path(&job.job.id);
+        fs::write(path, unix_to_rfc3339(job.job.created_at))?;
+        Ok(())
+    }
+
+    fn consume_backup_completion_sentinel(&self, job: &StoredQueueJob) -> Result<bool> {
+        if !job_needs_backup_completion_sentinel(job) {
+            return Ok(false);
+        }
+        let path = self.backup_completion_sentinel_path(&job.job.id);
+        if !path.exists() {
+            return Ok(false);
+        }
+        fs::remove_file(path)?;
+        Ok(true)
+    }
 }
 
 fn remove_running_job(jobs: &mut Vec<StoredQueueJob>, job_id: &str) -> Option<StoredQueueJob> {
     let index = jobs.iter().position(|job| job.job.id == job_id)?;
     Some(jobs.remove(index))
+}
+
+fn take_running_job(state: &mut PersistentQueueState, job_id: &str) -> Option<StoredQueueJob> {
+    remove_running_job(&mut state.active_running, job_id)
+        .or_else(|| remove_running_job(&mut state.deferred_running, job_id))
 }
 
 fn remove_pending_job(jobs: &mut VecDeque<StoredQueueJob>, job_id: &str) -> bool {
@@ -640,12 +722,62 @@ fn remove_pending_job(jobs: &mut VecDeque<StoredQueueJob>, job_id: &str) -> bool
     jobs.len() < before
 }
 
+fn find_active_job_id(
+    state: &PersistentQueueState,
+    job_type: JobType,
+    target: &str,
+    legacy_override: Option<&(String, Vec<Value>, Mapping)>,
+) -> Option<String> {
+    state
+        .active_pending
+        .iter()
+        .chain(state.deferred_pending.iter())
+        .chain(state.active_running.iter())
+        .chain(state.deferred_running.iter())
+        .find(|job| {
+            job.job.job_type == job_type
+                && job.job.target == target
+                && legacy_override.is_none_or(|(cmd, args, meta)| {
+                    job.legacy.cmd == *cmd && job.legacy.args == *args && job.legacy.meta == *meta
+                })
+        })
+        .map(|job| job.job.id.clone())
+}
+
+fn cancel_pending_jobs_for_lane(
+    queue: &mut VecDeque<StoredQueueJob>,
+    lane: QueueLane,
+    cancelled_history: &mut Vec<StoredQueueJob>,
+    cancelled_ids: &mut Vec<String>,
+) {
+    let mut retained = VecDeque::with_capacity(queue.len());
+    while let Some(job) = queue.pop_front() {
+        if job.job.job_type.lane() == lane {
+            cancelled_ids.push(job.job.id.clone());
+            push_history_entry(cancelled_history, job);
+        } else {
+            retained.push_back(job);
+        }
+    }
+    *queue = retained;
+}
+
+fn job_needs_backup_completion_sentinel(job: &StoredQueueJob) -> bool {
+    matches!(job.job.job_type, JobType::Backup) || job.legacy.cmd == "backup_bookmark"
+}
+
 fn total_pending_len(state: &PersistentQueueState) -> usize {
     state.active_pending.len() + state.deferred_pending.len()
 }
 
 fn has_deferred_jobs(state: &PersistentQueueState) -> bool {
     !state.deferred_pending.is_empty() || !state.deferred_running.is_empty()
+}
+
+fn normalize_deferred_pending_flag(state: &mut PersistentQueueState) {
+    if !has_deferred_jobs(state) {
+        state.deferred_pending_flag = false;
+    }
 }
 
 fn push_history_entry(history: &mut Vec<StoredQueueJob>, job: StoredQueueJob) {
@@ -777,6 +909,7 @@ fn stored_job_from_queue_job(job: QueueJob) -> StoredQueueJob {
 }
 
 fn legacy_task_to_stored_job(task: LegacyQueueTask, running: bool) -> Option<StoredQueueJob> {
+    let task = normalize_legacy_update_task(task);
     let (job_type, target) = legacy_cmd_to_job_type_and_target(&task.cmd, &task.args)?;
     let created_at = legacy_timestamp_to_unix(task.created_at.clone());
     let job = QueueJob {
@@ -794,6 +927,31 @@ fn legacy_task_to_stored_job(task: LegacyQueueTask, running: bool) -> Option<Sto
         stored.mark_pending();
     }
     Some(stored)
+}
+
+fn normalize_legacy_update_task(mut task: LegacyQueueTask) -> LegacyQueueTask {
+    let Some(first) = task.args.first().and_then(|value| match value {
+        Value::String(value) => Some(value.clone()),
+        _ => None,
+    }) else {
+        return task;
+    };
+    if !matches!(task.cmd.as_str(), "update" | "update_by_tag") {
+        return task;
+    }
+    let Some(message) = first.strip_prefix("__webui_update_start__=") else {
+        return task;
+    };
+    task.args.remove(0);
+    task.meta.insert(
+        Value::String(WEBUI_MESSAGE_TYPE_META_KEY.to_string()),
+        Value::String(WEBUI_UPDATE_START_MESSAGE_TYPE.to_string()),
+    );
+    task.meta.insert(
+        Value::String(WEBUI_MESSAGE_TEXT_META_KEY.to_string()),
+        Value::String(message.to_string()),
+    );
+    task
 }
 
 fn stored_job_to_pending_legacy_task(job: &StoredQueueJob) -> LegacyQueueTask {
@@ -1012,6 +1170,7 @@ fn now_rfc3339() -> String {
 fn generate_job_id(job_type: JobType, target: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+
     let mut hasher = DefaultHasher::new();
     match job_type {
         JobType::Download => "dl".hash(&mut hasher),
@@ -1023,9 +1182,15 @@ fn generate_job_id(job_type: JobType, target: &str) -> String {
         JobType::Mail => "ml".hash(&mut hasher),
     }
     target.hash(&mut hasher);
+    let counter = JOB_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let timestamp_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    counter.hash(&mut hasher);
     std::process::id().hash(&mut hasher);
-    chrono::Utc::now().timestamp_millis().hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    timestamp_nanos.hash(&mut hasher);
+    format!("{counter:016x}-{:016x}", hasher.finish())
 }
 
 fn find_narou_root() -> Result<PathBuf> {
@@ -1044,9 +1209,12 @@ fn find_narou_root() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
     use serde_yaml::{Mapping, Value};
 
-    use super::{JobType, PersistentQueue, QueueLane};
+    use super::{JobType, PersistentQueue, QueueJob, QueueLane, stored_job_from_queue_job};
     use crate::db::inventory::MAX_YAML_SIZE_BYTES;
 
     #[test]
@@ -1066,8 +1234,8 @@ mod tests {
         let reloaded = PersistentQueue::new(&queue_path).unwrap();
         assert_eq!(reloaded.pending_count(), 0);
         assert_eq!(reloaded.running_count(), 0);
-        assert_eq!(reloaded.completed_count(), 0);
-        assert_eq!(reloaded.failed_count(), 0);
+        assert_eq!(reloaded.completed_count(), 1);
+        assert_eq!(reloaded.failed_count(), 1);
     }
 
     #[test]
@@ -1079,6 +1247,9 @@ mod tests {
         queue.push(JobType::Backup, "2").unwrap();
         let failed = queue.pop().unwrap();
         queue.fail(&failed.id).unwrap();
+        queue.push(JobType::Convert, "4").unwrap();
+        let cancelled = queue.pop().unwrap();
+        queue.cancel(&cancelled.id).unwrap();
         queue.push(JobType::Update, "3").unwrap();
         let running = queue.pop().unwrap();
 
@@ -1089,7 +1260,8 @@ mod tests {
         assert_eq!(reloaded.running_count(), 1);
         assert_eq!(reloaded.get_running_tasks()[0].id, running.id);
         assert_eq!(reloaded.completed_count(), 0);
-        assert_eq!(reloaded.failed_count(), 0);
+        assert_eq!(reloaded.failed_count(), 1);
+        assert_eq!(reloaded.cancelled_count(), 0);
     }
 
     #[test]
@@ -1339,6 +1511,155 @@ mod tests {
         let saved = std::fs::read_to_string(&queue_path).unwrap();
         assert!(saved.contains("partial:"));
         assert!(saved.contains("cancelled:"));
+    }
+
+    #[test]
+    fn push_dedupes_matching_pending_and_running_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+
+        let first = queue.push(JobType::Download, "n0001").unwrap();
+        let duplicate_pending = queue.push(JobType::Download, "n0001").unwrap();
+        assert_eq!(first, duplicate_pending);
+        assert_eq!(queue.pending_count(), 1);
+
+        let running = queue.pop().unwrap();
+        assert_eq!(running.id, first);
+
+        let duplicate_running = queue.push(JobType::Download, "n0001").unwrap();
+        assert_eq!(first, duplicate_running);
+        assert_eq!(queue.pending_count(), 0);
+        assert_eq!(queue.running_count(), 1);
+    }
+
+    #[test]
+    fn cancel_pending_in_lane_moves_matching_jobs_to_cancelled_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+
+        let download = queue.push(JobType::Download, "1").unwrap();
+        let convert = queue.push(JobType::Convert, "2").unwrap();
+        let backup = queue.push(JobType::Backup, "3").unwrap();
+
+        let cancelled = queue.cancel_pending_in_lane(QueueLane::Secondary).unwrap();
+
+        assert_eq!(cancelled, vec![convert.clone(), backup.clone()]);
+        assert_eq!(queue.pending_count_for_lane(QueueLane::Default), 1);
+        assert_eq!(queue.pending_count_for_lane(QueueLane::Secondary), 0);
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.jobs.len(), 1);
+        assert_eq!(snapshot.jobs.front().map(|job| job.id.as_str()), Some(download.as_str()));
+        assert_eq!(snapshot.cancelled.len(), 2);
+    }
+
+    #[test]
+    fn completed_backup_sentinel_skips_restore_rerun() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+
+        let backup_id = queue.push(JobType::Backup, "1").unwrap();
+        let backup = queue.pop().unwrap();
+        assert_eq!(backup.id, backup_id);
+        queue.complete(&backup.id).unwrap();
+
+        let sentinel = temp.path().join(format!("backup-bookmark-{}.done", backup_id));
+        assert!(sentinel.exists());
+
+        let reloaded = PersistentQueue::new(&queue_path).unwrap();
+        {
+            let mut state = reloaded.state.lock();
+            state.deferred_running.push(stored_job_from_queue_job(QueueJob {
+                id: backup_id.clone(),
+                job_type: JobType::Backup,
+                target: "1".to_string(),
+                created_at: chrono::Utc::now().timestamp(),
+                retry_count: 0,
+                max_retries: 3,
+            }));
+        }
+        reloaded.flush().unwrap();
+
+        assert_eq!(reloaded.activate_restorable_tasks().unwrap(), 0);
+        assert!(!sentinel.exists());
+        assert_eq!(reloaded.pending_count(), 0);
+        assert!(reloaded.snapshot().completed.contains(&backup_id));
+    }
+
+    #[test]
+    fn clear_preserves_non_cancelled_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+
+        queue.push(JobType::Download, "n0003").unwrap();
+        let completed = queue.pop().unwrap();
+        queue.complete(&completed.id).unwrap();
+
+        queue.push(JobType::Backup, "backup-target").unwrap();
+        let partial = queue.pop().unwrap();
+        queue.partial(&partial.id).unwrap();
+
+        queue.push(JobType::Update, "tag:keep").unwrap();
+        let failed = queue.pop().unwrap();
+        queue.fail(&failed.id).unwrap();
+
+        queue.push(JobType::Convert, "5").unwrap();
+        let cancelled = queue.pop().unwrap();
+        queue.cancel(&cancelled.id).unwrap();
+
+        queue.clear().unwrap();
+
+        let reloaded = PersistentQueue::new(&queue_path).unwrap();
+        assert_eq!(reloaded.pending_count(), 0);
+        assert_eq!(reloaded.running_count(), 0);
+        assert_eq!(reloaded.completed_count(), 1);
+        assert_eq!(reloaded.partial_count(), 1);
+        assert_eq!(reloaded.failed_count(), 1);
+        assert_eq!(reloaded.cancelled_count(), 0);
+    }
+
+    #[test]
+    fn complete_can_drain_deferred_running_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        std::fs::write(
+            &queue_path,
+            "---\nrunning:\n  - id: running-1\n    cmd: auto_update\n    args: []\n    meta: {}\n    status: running\n    created_at: '2026-04-19T15:14:58+09:00'\n    started_at: '2026-04-19T15:15:58+09:00'\nupdated_at: '2026-04-19T15:16:58+09:00'\n",
+        )
+        .unwrap();
+
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        assert_eq!(queue.running_count(), 1);
+
+        queue.complete("running-1").unwrap();
+
+        let reloaded = PersistentQueue::new(&queue_path).unwrap();
+        assert_eq!(reloaded.running_count(), 0);
+        assert_eq!(reloaded.completed_count(), 1);
+    }
+
+    #[test]
+    fn parallel_enqueue_dedupes_matching_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = Arc::new(PersistentQueue::new(&temp.path().join("queue.yaml")).unwrap());
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let queue = Arc::clone(&queue);
+            handles.push(std::thread::spawn(move || {
+                queue.push(JobType::Update, "tag:modified").unwrap()
+            }));
+        }
+
+        let ids: Vec<String> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let unique = ids.iter().cloned().collect::<HashSet<_>>();
+        assert_eq!(unique.len(), 1);
+        assert_eq!(queue.pending_count(), 1);
     }
 
     #[test]

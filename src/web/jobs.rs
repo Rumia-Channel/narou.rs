@@ -13,7 +13,10 @@ use crate::db::{with_database, with_database_mut};
 use crate::downloader::site_setting::SiteSetting;
 use crate::downloader::types::{CACHE_SAVE_DIR, SECTION_SAVE_DIR, SectionFile};
 use crate::downloader::{Downloader, TargetType};
-use crate::queue::{JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane};
+use crate::queue::{
+    JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane,
+    WEBUI_MESSAGE_TEXT_META_KEY, WEBUI_MESSAGE_TYPE_META_KEY, WEBUI_UPDATE_START_MESSAGE_TYPE,
+};
 
 use super::AppState;
 use super::sort_state::{
@@ -25,7 +28,6 @@ use super::state::{
     DownloadBody, ReorderBody, TagInfoBody, TargetsBody, TaskIdBody, UpdateBody, UpdateByTagBody,
 };
 
-const WEBUI_UPDATE_START_PREFIX: &str = "__webui_update_start__=";
 const TRANSPARENT_GIF: &[u8] = &[
     71, 73, 70, 56, 57, 97, 1, 0, 1, 0, 128, 0, 0, 0, 0, 0, 255, 255, 255, 33, 249, 4, 1, 0, 0, 0,
     0, 44, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 68, 1, 0, 59,
@@ -88,6 +90,20 @@ fn validate_general_lastup_option(option: &str) -> Result<Option<&'static str>, 
         "narou" => Ok(Some("narou")),
         "other" => Ok(Some("other")),
         _ => Err("invalid general_lastup option".to_string()),
+    }
+}
+
+fn update_start_message(meta: &Mapping) -> Option<String> {
+    match (
+        meta.get(Value::String(WEBUI_MESSAGE_TYPE_META_KEY.to_string())),
+        meta.get(Value::String(WEBUI_MESSAGE_TEXT_META_KEY.to_string())),
+    ) {
+        (Some(Value::String(message_type)), Some(Value::String(message)))
+            if message_type == WEBUI_UPDATE_START_MESSAGE_TYPE && !message.is_empty() =>
+        {
+            Some(message.clone())
+        }
+        _ => None,
     }
 }
 
@@ -165,12 +181,9 @@ fn describe_update_targets(targets: &[String]) -> String {
     }
 }
 
-fn format_update_queue_target(args: &[String]) -> String {
-    if let Some(message) = args
-        .iter()
-        .find_map(|arg| arg.strip_prefix(WEBUI_UPDATE_START_PREFIX))
-    {
-        return message.to_string();
+fn format_update_queue_target(args: &[String], meta: Option<&Mapping>) -> String {
+    if let Some(message) = meta.and_then(update_start_message) {
+        return message;
     }
 
     if args.first().map(String::as_str) == Some("--gl") {
@@ -191,9 +204,6 @@ fn format_update_queue_target(args: &[String]) -> String {
         }
         if arg == "--sort-by" {
             skip_next = true;
-            continue;
-        }
-        if arg.starts_with(WEBUI_UPDATE_START_PREFIX) {
             continue;
         }
         targets.push(arg.clone());
@@ -222,7 +232,7 @@ fn format_queue_job_target(job: &QueueJob, spec: Option<&QueueExecutionSpec>) ->
 
     match spec.cmd.as_str() {
         "update_general_lastup" => format_general_lastup_queue_target(&spec.args),
-        "update" | "update_by_tag" => format_update_queue_target(&spec.args),
+        "update" | "update_by_tag" => format_update_queue_target(&spec.args, Some(&spec.meta)),
         _ => queue_target_fallback_text(&job.target),
     }
 }
@@ -340,6 +350,19 @@ fn build_webui_update_start_message(is_update_all: bool, count: usize, sort_disp
     } else {
         format!("更新を開始します（{}件を{}で処理）", count, sort_display)
     }
+}
+
+fn build_update_start_message_meta(message: String) -> Mapping {
+    let mut meta = Mapping::new();
+    meta.insert(
+        Value::String(WEBUI_MESSAGE_TYPE_META_KEY.to_string()),
+        Value::String(WEBUI_UPDATE_START_MESSAGE_TYPE.to_string()),
+    );
+    meta.insert(
+        Value::String(WEBUI_MESSAGE_TEXT_META_KEY.to_string()),
+        Value::String(message),
+    );
+    meta
 }
 
 fn queue_download_jobs(
@@ -556,15 +579,6 @@ fn restorable_tasks_available(state: &AppState) -> bool {
     state.restorable_tasks_available.load(Ordering::Relaxed) && state.queue.has_restorable_tasks()
 }
 
-fn running_job_by_id(state: &AppState, task_id: &str) -> Option<QueueJob> {
-    state
-        .running_jobs
-        .lock()
-        .iter()
-        .find(|job| job.id == task_id)
-        .cloned()
-}
-
 fn kill_running_child(state: &AppState) {
     let jobs: Vec<(String, u32)> = {
         let mut guard = state.running_child_pids.lock();
@@ -579,14 +593,49 @@ fn kill_running_child(state: &AppState) {
 }
 
 fn kill_running_child_for_job(state: &AppState, job_id: &str) -> bool {
-    let pid = state.running_child_pids.lock().remove(job_id);
-    if let Some(pid) = pid {
-        state.cancelled_job_ids.lock().insert(job_id.to_string());
-        kill_process_tree(pid, &state.push_server);
-        true
-    } else {
-        false
+    let Some(lane) = state
+        .running_jobs
+        .lock()
+        .iter()
+        .find(|job| job.id == job_id)
+        .map(|job| job.job_type.lane())
+    else {
+        return false;
+    };
+    let lane_job_ids = state
+        .running_jobs
+        .lock()
+        .iter()
+        .filter(|running| running.job_type.lane() == lane)
+        .map(|running| running.id.clone())
+        .collect::<Vec<_>>();
+    let running_pids = {
+        let mut guard = state.running_child_pids.lock();
+        let lane_job_ids_set = lane_job_ids.iter().cloned().collect::<std::collections::HashSet<_>>();
+        let running = guard
+            .iter()
+            .filter(|(running_job_id, _)| lane_job_ids_set.contains(*running_job_id))
+            .map(|(running_job_id, pid)| (running_job_id.clone(), *pid))
+            .collect::<Vec<_>>();
+        for (running_job_id, _) in &running {
+            guard.remove(running_job_id);
+        }
+        running
+    };
+    let cancelled_pending = state
+        .queue
+        .cancel_pending_in_lane(lane)
+        .map(|ids| !ids.is_empty())
+        .unwrap_or(false);
+    if running_pids.is_empty() {
+        return cancelled_pending;
     }
+    let mut cancelled_job_ids = state.cancelled_job_ids.lock();
+    for (running_job_id, pid) in running_pids {
+        cancelled_job_ids.insert(running_job_id);
+        kill_process_tree(pid, &state.push_server);
+    }
+    true
 }
 
 fn kill_process_tree(pid: u32, push_server: &std::sync::Arc<super::push::PushServer>) {
@@ -766,9 +815,9 @@ pub async fn api_update(
 
     let is_update_all = body.update_all || targets.is_empty();
     let count;
-    let combined = if has_flags {
+    let (combined, update_start_meta) = if has_flags {
         count = 1;
-        targets.join("\t")
+        (targets.join("\t"), None)
     } else {
         let mut args = if is_update_all {
             sorted_update_all_ids()
@@ -793,24 +842,44 @@ pub async fn api_update(
         } else {
             requested_sort_display_string(body.sort_state.as_ref(), body.timestamp)
         };
-        let start_message = build_webui_update_start_message(is_update_all, count, &sort_display);
-        let mut parts = Vec::with_capacity(args.len() + 1);
-        parts.push(format!("{}{}", WEBUI_UPDATE_START_PREFIX, start_message));
-        parts.extend(args);
-        parts.join("\t")
+        (
+            args.join("\t"),
+            Some(build_update_start_message_meta(build_webui_update_start_message(
+                is_update_all,
+                count,
+                &sort_display,
+            ))),
+        )
     };
-    let (job_ids, queued) =
-        match push_update_job_if_needed(state.queue.as_ref(), &state.running_jobs, combined) {
-            Ok(result) => result,
-            Err(message) => {
-                return serde_json::json!({
-                    "success": false,
-                    "message": message,
-                    "count": 0
-                })
-                .into();
-            }
-        };
+    let queued_result = match update_start_meta {
+        Some(meta) => {
+            let legacy_args = combined
+                .split('\t')
+                .filter(|arg| !arg.is_empty())
+                .map(|arg| Value::String(arg.to_string()))
+                .collect::<Vec<_>>();
+            push_update_job_with_legacy_if_needed(
+                state.queue.as_ref(),
+                &state.running_jobs,
+                combined,
+                "update",
+                legacy_args,
+                meta,
+            )
+        }
+        None => push_update_job_if_needed(state.queue.as_ref(), &state.running_jobs, combined),
+    };
+    let (job_ids, queued) = match queued_result {
+        Ok(result) => result,
+        Err(message) => {
+            return serde_json::json!({
+                "success": false,
+                "message": message,
+                "count": 0
+            })
+            .into();
+        }
+    };
 
     if queued {
         state.push_server.broadcast_event("notification.queue", "");
@@ -885,22 +954,17 @@ pub async fn api_convert(
             .into();
         }
     };
-    let device = body
-        .device
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    if let Some(device) = device.as_deref() {
-        if device.len() > super::MAX_WEB_TARGET_LENGTH || device.chars().any(|ch| ch.is_control()) {
+    let device = match super::normalize_web_device_override(body.device.as_deref()) {
+        Ok(device) => device,
+        Err(message) => {
             return serde_json::json!({
                 "success": false,
-                "message": "invalid device",
+                "message": message,
                 "results": []
             })
             .into();
         }
-    }
+    };
     let ordered_targets =
         sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp);
     let mut meta = Mapping::new();
@@ -973,10 +1037,12 @@ pub async fn queue_status(State(state): State<AppState>) -> Json<serde_json::Val
 pub async fn queue_clear(State(state): State<AppState>) -> Json<ApiResponse> {
     match state.queue.clear_non_running() {
         Ok(_) => {
-            state.restore_prompt_pending.store(false, Ordering::Relaxed);
+            state
+                .restore_prompt_pending
+                .store(state.queue.restore_prompt_pending(), Ordering::Relaxed);
             state
                 .restorable_tasks_available
-                .store(false, Ordering::Relaxed);
+                .store(state.queue.has_restorable_tasks(), Ordering::Relaxed);
             notify_queue_changed(&state);
             Json(ApiResponse {
                 success: true,
@@ -1860,9 +1926,7 @@ pub async fn cancel_running_task(
     State(state): State<AppState>,
     Json(body): Json<TaskIdBody>,
 ) -> Json<serde_json::Value> {
-    if running_job_by_id(&state, &body.task_id).is_some()
-        && kill_running_child_for_job(&state, &body.task_id)
-    {
+    if kill_running_child_for_job(&state, &body.task_id) {
         notify_queue_changed(&state);
         return serde_json::json!({ "status": "ok" }).into();
     }
@@ -2428,13 +2492,13 @@ mod tests {
 
     use super::{
         broadcast_captured_web_output, build_update_by_tag_queue_payload,
-        build_update_general_lastup_meta, build_webui_update_start_message,
-        encode_convert_job_target, existing_update_job_id, format_general_lastup_queue_target,
-        format_queue_job_type, format_update_queue_target, normalize_update_targets,
-        push_update_job_if_needed, push_update_job_with_legacy_if_needed, queue_lane_sizes,
-        reboot_args_with_no_browser, restorable_tasks_available, sort_records_for_web_update,
-        tag_color_class, validate_diff_number, validate_download_targets,
-        validate_general_lastup_option, web_update_sort_key_for_cli,
+        build_update_general_lastup_meta, build_update_start_message_meta,
+        build_webui_update_start_message, encode_convert_job_target, existing_update_job_id,
+        format_general_lastup_queue_target, format_queue_job_type, format_update_queue_target,
+        normalize_update_targets, push_update_job_if_needed, push_update_job_with_legacy_if_needed,
+        queue_lane_sizes, reboot_args_with_no_browser, restorable_tasks_available,
+        sort_records_for_web_update, tag_color_class, validate_diff_number,
+        validate_download_targets, validate_general_lastup_option, web_update_sort_key_for_cli,
     };
 
     fn sample_record(id: i64, general_lastup_ts: i64) -> NovelRecord {
@@ -2701,14 +2765,14 @@ mod tests {
 
     #[test]
     fn update_queue_target_prefers_webui_start_message() {
+        let meta = build_update_start_message_meta(
+            "全ての小説の更新を開始します（3件をID順で処理）".to_string(),
+        );
         assert_eq!(
-            format_update_queue_target(&[
-                "__webui_update_start__=全ての小説の更新を開始します（3件をID順で処理）"
-                    .to_string(),
-                "1".to_string(),
-                "2".to_string(),
-                "3".to_string(),
-            ]),
+            format_update_queue_target(
+                &["1".to_string(), "2".to_string(), "3".to_string()],
+                Some(&meta)
+            ),
             "全ての小説の更新を開始します（3件をID順で処理）"
         );
     }
@@ -2716,19 +2780,22 @@ mod tests {
     #[test]
     fn update_queue_target_describes_tag_and_force_jobs() {
         assert_eq!(
-            format_update_queue_target(&["tag:modified".to_string()]),
+            format_update_queue_target(&["tag:modified".to_string()], None),
             "タグ「modified」の小説を更新"
         );
         assert_eq!(
-            format_update_queue_target(&[
-                "--sort-by".to_string(),
-                "general_lastup".to_string(),
-                "tag:modified".to_string(),
-            ]),
+            format_update_queue_target(
+                &[
+                    "--sort-by".to_string(),
+                    "general_lastup".to_string(),
+                    "tag:modified".to_string(),
+                ],
+                None
+            ),
             "タグ「modified」の小説を更新"
         );
         assert_eq!(
-            format_update_queue_target(&["--force".to_string(), "tag:modified".to_string()]),
+            format_update_queue_target(&["--force".to_string(), "tag:modified".to_string()], None),
             "タグ「modified」の小説を凍結済みも含めて更新"
         );
     }

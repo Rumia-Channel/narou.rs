@@ -63,6 +63,19 @@ pub(crate) fn non_external_console_target() -> &'static str {
     }
 }
 
+pub(crate) fn normalize_web_device_override(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let normalized = value.to_ascii_lowercase();
+    match normalized.as_str() {
+        "text" | "kindle" | "kobo" | "epub" | "ibunko" | "reader" | "ibooks" => {
+            Ok(Some(normalized))
+        }
+        _ => Err("invalid device".to_string()),
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn removal_log_message(titles: &[String], with_file: bool) -> String {
     let suffix = if with_file {

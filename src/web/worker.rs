@@ -14,9 +14,11 @@ use crate::compat::{
 };
 use crate::db::with_database_mut;
 use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
-use crate::queue::{JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane};
+use crate::queue::{
+    JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane,
+    WEBUI_MESSAGE_TEXT_META_KEY, WEBUI_MESSAGE_TYPE_META_KEY, WEBUI_UPDATE_START_MESSAGE_TYPE,
+};
 
-const WEBUI_UPDATE_START_PREFIX: &str = "__webui_update_start__=";
 const MAX_FAILURE_DETAIL_LINES: usize = 8;
 const MAX_FAILURE_DETAIL_CHARS: usize = 600;
 
@@ -52,6 +54,7 @@ pub fn start_queue_workers(
     cancelled_job_ids: Arc<parking_lot::Mutex<HashSet<String>>>,
     concurrency_enabled: bool,
 ) -> Vec<JoinHandle<()>> {
+    let job_transition_lock = Arc::new(parking_lot::Mutex::new(()));
     let lanes = if concurrency_enabled {
         vec![WorkerLane::Default, WorkerLane::Secondary]
     } else {
@@ -67,6 +70,7 @@ pub fn start_queue_workers(
                 Arc::clone(&running_jobs),
                 Arc::clone(&running_child_pids),
                 Arc::clone(&cancelled_job_ids),
+                Arc::clone(&job_transition_lock),
                 lane,
             )
         })
@@ -80,16 +84,25 @@ fn start_queue_worker_for_lane(
     running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
     running_child_pids: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
     cancelled_job_ids: Arc<parking_lot::Mutex<HashSet<String>>>,
+    job_transition_lock: Arc<parking_lot::Mutex<()>>,
     lane: WorkerLane,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let Some(job) = pop_next_job(queue.as_ref(), lane) else {
+            let job = {
+                let _guard = job_transition_lock.lock();
+                let job = pop_next_job(queue.as_ref(), lane);
+                if let Some(job_ref) = job.as_ref() {
+                    register_running_job(&running_jobs, job_ref);
+                }
+                job
+            };
+
+            let Some(job) = job else {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             };
 
-            register_running_job(&running_jobs, &job);
             push_server.broadcast_event("queue_start", &job.id);
 
             let root_dir = root_dir.clone();
@@ -116,14 +129,24 @@ fn start_queue_worker_for_lane(
                 push_server.broadcast_error(&format!("DB更新エラー: {}", e));
             }
 
-            unregister_running_job(&running_jobs, &job.id);
+            let queue_result = {
+                let _guard = job_transition_lock.lock();
+                let result = match result.outcome {
+                    JobOutcome::Completed => queue.complete(&job.id),
+                    JobOutcome::Partial => queue.partial(&job.id),
+                    JobOutcome::Cancelled => queue.cancel(&job.id),
+                    JobOutcome::Failed => queue.fail(&job.id),
+                };
+                unregister_running_job(&running_jobs, &job.id);
+                result
+            };
             match result.outcome {
                 JobOutcome::Completed => {
-                    let _ = queue.complete(&job.id);
+                    let _ = queue_result;
                     push_server.broadcast_event("queue_complete", &job.id);
                 }
                 JobOutcome::Partial => {
-                    let _ = queue.partial(&job.id);
+                    let _ = queue_result;
                     let mut data = serde_json::json!({ "job_id": job.id });
                     if let Some(exit_code) = result.exit_code {
                         data["exit_code"] = serde_json::json!(exit_code);
@@ -134,15 +157,18 @@ fn start_queue_worker_for_lane(
                     }));
                 }
                 JobOutcome::Cancelled => {
-                    let _ = queue.cancel(&job.id);
+                    let _ = queue_result;
                     push_server.broadcast_raw(&serde_json::json!({
                         "type": "queue_cancelled",
                         "data": { "job_id": job.id },
                     }));
                 }
                 JobOutcome::Failed => {
-                    let _ = queue.fail(&job.id);
-                    let mut data = serde_json::json!({ "job_id": job.id });
+                    let _ = queue_result;
+                    let mut data = serde_json::json!({
+                        "job_id": job.id,
+                        "reason": failure_reason(&result),
+                    });
                     if load_local_setting_bool("webui.debug-mode")
                         && let Some(detail) = result.detail.as_deref()
                     {
@@ -275,14 +301,24 @@ fn execute_job(
             }
             "update" => {
                 command.arg("update");
-                append_update_args(&mut command, push_server, target_console, &spec.args);
+                append_update_args(&mut command, push_server, target_console, &spec);
             }
             "update_by_tag" => {
                 command.arg("update");
-                append_update_args(&mut command, push_server, target_console, &spec.args);
+                append_update_args(&mut command, push_server, target_console, &spec);
             }
             "convert" => {
-                let (targets, device) = convert_targets_and_device(&spec);
+                let (targets, device) = match convert_targets_and_device(&spec) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        push_server.broadcast_echo(&message, target_console);
+                        return JobRunResult {
+                            outcome: JobOutcome::Failed,
+                            detail: Some(message),
+                            exit_code: None,
+                        };
+                    }
+                };
                 command.arg("convert").arg("--no-open");
                 for target in targets {
                     command.arg(target);
@@ -388,16 +424,30 @@ fn execute_job(
             JobType::Update => {
                 command.arg("update");
                 if !job.target.is_empty() {
-                    let parts: Vec<String> = job
+                    let spec = QueueExecutionSpec {
+                        cmd: "update".to_string(),
+                        args: job
                         .target
                         .split('\t')
                         .map(|part| part.to_string())
-                        .collect();
-                    append_update_args(&mut command, push_server, target_console, &parts);
+                        .collect(),
+                        meta: serde_yaml::Mapping::new(),
+                    };
+                    append_update_args(&mut command, push_server, target_console, &spec);
                 }
             }
             JobType::Convert => {
-                let (target, device) = parse_convert_job_target(&job.target);
+                let (target, device) = match parse_convert_job_target(&job.target) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        push_server.broadcast_echo(&message, target_console);
+                        return JobRunResult {
+                            outcome: JobOutcome::Failed,
+                            detail: Some(message),
+                            exit_code: None,
+                        };
+                    }
+                };
                 command.arg("convert").arg("--no-open").arg(target);
                 if let Some(device) = device {
                     command.env("NAROU_RS_WEB_DEVICE", device);
@@ -457,6 +507,22 @@ fn execution_spec_meta_string(spec: &QueueExecutionSpec, key: &str) -> Option<St
     }
 }
 
+fn execution_spec_update_start_message(spec: &QueueExecutionSpec) -> Option<String> {
+    match (
+        spec.meta
+            .get(Value::String(WEBUI_MESSAGE_TYPE_META_KEY.to_string())),
+        spec.meta
+            .get(Value::String(WEBUI_MESSAGE_TEXT_META_KEY.to_string())),
+    ) {
+        (Some(Value::String(message_type)), Some(Value::String(message)))
+            if message_type == WEBUI_UPDATE_START_MESSAGE_TYPE && !message.is_empty() =>
+        {
+            Some(message.clone())
+        }
+        _ => None,
+    }
+}
+
 #[allow(dead_code)]
 fn execution_spec_meta_strings(spec: &QueueExecutionSpec, key: &str) -> Vec<String> {
     match spec.meta.get(Value::String(key.to_string())) {
@@ -472,21 +538,20 @@ fn execution_spec_meta_strings(spec: &QueueExecutionSpec, key: &str) -> Vec<Stri
     }
 }
 
-fn convert_targets_and_device(spec: &QueueExecutionSpec) -> (Vec<String>, Option<String>) {
-    let device = execution_spec_meta_string(spec, "device");
+fn convert_targets_and_device(spec: &QueueExecutionSpec) -> Result<(Vec<String>, Option<String>), String> {
+    let device = super::normalize_web_device_override(execution_spec_meta_string(spec, "device").as_deref())?;
     if device.is_some() {
-        return (spec.args.clone(), device);
+        return Ok((spec.args.clone(), device));
     }
     if spec.args.len() > 1
         && let Some(last) = spec.args.last()
-        && matches!(
-            last.to_ascii_lowercase().as_str(),
-            "text" | "kindle" | "kobo" | "epub" | "ibunko" | "reader" | "ibooks"
-        )
     {
-        return (spec.args[..spec.args.len() - 1].to_vec(), Some(last.clone()));
+        let device = super::normalize_web_device_override(Some(last.as_str()))?;
+        if device.is_some() {
+            return Ok((spec.args[..spec.args.len() - 1].to_vec(), device));
+        }
     }
-    (spec.args.clone(), None)
+    Ok((spec.args.clone(), None))
 }
 
 fn refresh_web_state(push_server: &Arc<PushServer>) {
@@ -509,7 +574,7 @@ fn execute_update_general_lastup_job(
 ) -> JobRunResult {
     let mut command = new_web_subprocess_command(exe, root_dir, job_id);
     command.arg("update").arg("--gl");
-    append_update_args(&mut command, push_server, target_console, &spec.args);
+    append_update_args(&mut command, push_server, target_console, spec);
     let result = spawn_and_stream_command(
         command,
         push_server,
@@ -550,21 +615,17 @@ fn append_update_args(
     command: &mut std::process::Command,
     push_server: &Arc<PushServer>,
     target_console: &str,
-    args: &[String],
+    spec: &QueueExecutionSpec,
 ) {
-    if let Some((first, rest)) = args.split_first() {
-        if let Some(message) = first.strip_prefix(WEBUI_UPDATE_START_PREFIX) {
-            push_server.broadcast_echo(
-                &format!("<span style=\"color:#bbb\">{}</span>", message),
-                target_console,
-            );
-        } else if !first.is_empty() {
-            command.arg(first);
-        }
-        for part in rest {
-            if !part.is_empty() {
-                command.arg(part);
-            }
+    if let Some(message) = execution_spec_update_start_message(spec) {
+        push_server.broadcast_echo(
+            &format!("<span style=\"color:#bbb\">{}</span>", message),
+            target_console,
+        );
+    }
+    for part in &spec.args {
+        if !part.is_empty() {
+            command.arg(part);
         }
     }
 }
@@ -795,10 +856,30 @@ fn summarize_failure_details(lines: &[String]) -> Option<String> {
     Some(text)
 }
 
+fn failure_reason(result: &JobRunResult) -> String {
+    if let Some(detail) = result.detail.as_deref() {
+        let reason = detail
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or(detail)
+            .trim();
+        if !reason.is_empty() {
+            return reason.to_string();
+        }
+    }
+    match result.exit_code {
+        Some(code) => format!("終了コード {}", code),
+        None => "終了コード不明".to_string(),
+    }
+}
+
 fn console_target_for_job(job_type: JobType) -> &'static str {
     match job_type {
         JobType::Download | JobType::Update | JobType::AutoUpdate => "stdout",
-        JobType::Convert | JobType::Send | JobType::Backup | JobType::Mail => "stdout2",
+        JobType::Convert | JobType::Send | JobType::Backup | JobType::Mail => {
+            super::non_external_console_target()
+        }
     }
 }
 
@@ -818,11 +899,11 @@ fn route_structured_web_message(
     message
 }
 
-fn parse_convert_job_target(value: &str) -> (&str, Option<&str>) {
+fn parse_convert_job_target(value: &str) -> Result<(&str, Option<String>), String> {
     let mut parts = value.splitn(2, '\t');
     let target = parts.next().unwrap_or(value);
-    let device = parts.next().filter(|device| !device.is_empty());
-    (target, device)
+    let device = super::normalize_web_device_override(parts.next())?;
+    Ok((target, device))
 }
 
 #[cfg(test)]
@@ -836,15 +917,23 @@ mod tests {
         MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, JobOutcome, classify_job_outcome,
         clear_progress_for_job, console_target_for_job, convert_targets_and_device,
         execution_spec_meta_bool, execution_spec_meta_string, execution_spec_meta_strings,
-        parse_convert_job_target, remember_failure_line, route_structured_web_message,
-        summarize_failure_details,
+        failure_reason, parse_convert_job_target, remember_failure_line,
+        route_structured_web_message, summarize_failure_details,
     };
     use crate::queue::JobType;
 
     #[test]
     fn parse_convert_job_target_splits_device_override() {
-        assert_eq!(parse_convert_job_target("1\tkindle"), ("1", Some("kindle")));
-        assert_eq!(parse_convert_job_target("1"), ("1", None));
+        assert_eq!(
+            parse_convert_job_target("1\tkindle").unwrap(),
+            ("1", Some("kindle".to_string()))
+        );
+        assert_eq!(parse_convert_job_target("1").unwrap(), ("1", None));
+    }
+
+    #[test]
+    fn parse_convert_job_target_rejects_invalid_device_override() {
+        assert!(parse_convert_job_target("1\tunknown").is_err());
     }
 
     #[test]
@@ -860,7 +949,7 @@ mod tests {
             meta,
         };
         assert_eq!(
-            convert_targets_and_device(&spec),
+            convert_targets_and_device(&spec).unwrap(),
             (vec!["1".to_string(), "2".to_string()], Some("kindle".to_string()))
         );
     }
@@ -870,10 +959,22 @@ mod tests {
         assert_eq!(console_target_for_job(JobType::Download), "stdout");
         assert_eq!(console_target_for_job(JobType::Update), "stdout");
         assert_eq!(console_target_for_job(JobType::AutoUpdate), "stdout");
-        assert_eq!(console_target_for_job(JobType::Convert), "stdout2");
-        assert_eq!(console_target_for_job(JobType::Send), "stdout2");
-        assert_eq!(console_target_for_job(JobType::Backup), "stdout2");
-        assert_eq!(console_target_for_job(JobType::Mail), "stdout2");
+        assert_eq!(
+            console_target_for_job(JobType::Convert),
+            crate::web::non_external_console_target()
+        );
+        assert_eq!(
+            console_target_for_job(JobType::Send),
+            crate::web::non_external_console_target()
+        );
+        assert_eq!(
+            console_target_for_job(JobType::Backup),
+            crate::web::non_external_console_target()
+        );
+        assert_eq!(
+            console_target_for_job(JobType::Mail),
+            crate::web::non_external_console_target()
+        );
     }
 
     #[test]
@@ -932,6 +1033,26 @@ mod tests {
             .expect("detail");
         assert!(detail.ends_with('…'));
         assert!(detail.chars().count() <= MAX_FAILURE_DETAIL_CHARS + 1);
+    }
+
+    #[test]
+    fn failure_reason_prefers_detail_then_exit_code() {
+        assert_eq!(
+            failure_reason(&super::JobRunResult {
+                outcome: JobOutcome::Failed,
+                detail: Some(" first line \nsecond line".to_string()),
+                exit_code: Some(12),
+            }),
+            "first line"
+        );
+        assert_eq!(
+            failure_reason(&super::JobRunResult {
+                outcome: JobOutcome::Failed,
+                detail: None,
+                exit_code: Some(9),
+            }),
+            "終了コード 9"
+        );
     }
 
     #[test]
