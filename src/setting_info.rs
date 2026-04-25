@@ -946,6 +946,13 @@ pub fn setting_variables() -> SettingVariables {
             ),
         ),
         (
+            "server-max-targets-per-request",
+            invis(
+                VarType::Integer,
+                "WEB UI が 1 リクエストで送れる小説 ID の最大数（既定 100000）",
+            ),
+        ),
+        (
             "server-ws-add-accepted-domains",
             invis(
                 VarType::String,

@@ -164,7 +164,7 @@ pub async fn edit_tag(
     State(state): State<AppState>,
     Json(body): Json<EditTagBody>,
 ) -> Json<serde_json::Value> {
-    if body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if body.ids.len() > super::max_web_targets_per_request() {
         return serde_json::json!({ "success": false, "error": "too many ids" }).into();
     }
     if body.states.len() > super::MAX_WEB_TAGS_PER_REQUEST {

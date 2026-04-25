@@ -66,7 +66,7 @@ fn tag_color_class(color: &str) -> &'static str {
 }
 
 fn validate_download_targets(targets: &[String]) -> Result<(), String> {
-    if targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if targets.len() > super::max_web_targets_per_request() {
         return Err("too many targets".to_string());
     }
     for target in targets {
@@ -904,7 +904,7 @@ pub async fn api_update(
 }
 
 fn normalize_update_targets(targets: &[String]) -> Result<Vec<String>, String> {
-    if targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if targets.len() > super::max_web_targets_per_request() {
         return Err("too many targets".to_string());
     }
     let mut normalized = Vec::with_capacity(targets.len());
@@ -940,7 +940,7 @@ pub async fn api_convert(
     State(state): State<AppState>,
     Json(body): Json<ConvertBody>,
 ) -> Json<serde_json::Value> {
-    if body.targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if body.targets.len() > super::max_web_targets_per_request() {
         return serde_json::json!({
             "success": false,
             "message": "too many targets",
@@ -1152,7 +1152,7 @@ pub async fn api_send(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if raw_targets.len() > super::max_web_targets_per_request() {
         return serde_json::json!({
             "success": false,
             "message": "too many targets",
@@ -1212,7 +1212,7 @@ pub async fn api_inspect(
     Json(body): Json<TargetsBody>,
 ) -> Json<ApiResponse> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if raw_targets.len() > super::max_web_targets_per_request() {
         return Json(ApiResponse {
             success: false,
             message: "too many targets".to_string(),
@@ -1261,7 +1261,7 @@ pub async fn api_folder(
     Json(body): Json<TargetsBody>,
 ) -> Json<ApiResponse> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if raw_targets.len() > super::max_web_targets_per_request() {
         return Json(ApiResponse {
             success: false,
             message: "too many targets".to_string(),
@@ -1310,7 +1310,7 @@ pub async fn api_backup(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if raw_targets.len() > super::max_web_targets_per_request() {
         return serde_json::json!({
             "success": false,
             "message": "too many targets",
@@ -1398,7 +1398,7 @@ pub async fn api_mail(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if raw_targets.len() > super::max_web_targets_per_request() {
         return serde_json::json!({
             "success": false,
             "message": "too many targets",
@@ -1446,7 +1446,7 @@ pub async fn api_setting_burn(
     Json(body): Json<TargetsBody>,
 ) -> Json<ApiResponse> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if raw_targets.len() > super::max_web_targets_per_request() {
         return Json(ApiResponse {
             success: false,
             message: "too many targets".to_string(),
@@ -1495,7 +1495,7 @@ pub async fn api_diff_list(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let targets = targets_to_strings(&body.targets);
-    if targets.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if targets.len() > super::max_web_targets_per_request() {
         return serde_json::json!({ "error": "too many targets" }).into();
     }
     let mut diffs = Vec::new();
@@ -1630,7 +1630,7 @@ pub async fn api_diff(
             });
         }
     };
-    if body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if body.ids.len() > super::max_web_targets_per_request() {
         return Json(ApiResponse {
             success: false,
             message: "too many ids".to_string(),

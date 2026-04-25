@@ -31,7 +31,7 @@ pub async fn batch_tag(
     Json(body): Json<(BatchIdsBody, TagBody)>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     let (ids_body, tag_body) = body;
-    if ids_body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if ids_body.ids.len() > super::max_web_targets_per_request() {
         return Err((StatusCode::BAD_REQUEST, "too many ids".to_string()));
     }
     let ids = sort_ids_for_request(&ids_body.ids, ids_body.sort_state.as_ref(), ids_body.timestamp);
@@ -52,7 +52,7 @@ pub async fn batch_untag(
     Json(body): Json<(BatchIdsBody, TagBody)>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     let (ids_body, tag_body) = body;
-    if ids_body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if ids_body.ids.len() > super::max_web_targets_per_request() {
         return Err((StatusCode::BAD_REQUEST, "too many ids".to_string()));
     }
     let ids = sort_ids_for_request(&ids_body.ids, ids_body.sort_state.as_ref(), ids_body.timestamp);
@@ -72,7 +72,7 @@ pub async fn batch_freeze(
     State(state): State<AppState>,
     Json(body): Json<BatchIdsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
-    if body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if body.ids.len() > super::max_web_targets_per_request() {
         return Err((StatusCode::BAD_REQUEST, "too many ids".to_string()));
     }
     let ids = sort_ids_for_request(&body.ids, body.sort_state.as_ref(), body.timestamp);
@@ -90,7 +90,7 @@ pub async fn batch_unfreeze(
     State(state): State<AppState>,
     Json(body): Json<BatchIdsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
-    if body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if body.ids.len() > super::max_web_targets_per_request() {
         return Err((StatusCode::BAD_REQUEST, "too many ids".to_string()));
     }
     let ids = sort_ids_for_request(&body.ids, body.sort_state.as_ref(), body.timestamp);
@@ -108,7 +108,7 @@ pub async fn batch_remove(
     State(state): State<AppState>,
     Json(body): Json<BatchIdsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
-    if body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if body.ids.len() > super::max_web_targets_per_request() {
         return Err((StatusCode::BAD_REQUEST, "too many ids".to_string()));
     }
     let with_file = body.with_file.unwrap_or(false);
@@ -143,7 +143,7 @@ pub async fn batch_freeze_toggle(
     State(state): State<AppState>,
     Json(body): Json<BatchIdsBody>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
+    if body.ids.len() > super::max_web_targets_per_request() {
         return Err((StatusCode::BAD_REQUEST, "too many ids".to_string()));
     }
     let ids = sort_ids_for_request(&body.ids, body.sort_state.as_ref(), body.timestamp);

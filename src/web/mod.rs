@@ -28,6 +28,17 @@ use subtle::ConstantTimeEq;
 use tokio::task::JoinHandle;
 
 pub(crate) const MAX_WEB_TARGETS_PER_REQUEST: usize = 100_000;
+
+/// Effective per-request target cap. Reads `server-max-targets-per-request`
+/// from `~/.narousetting/global_setting.yaml` if present (must be > 0),
+/// otherwise falls back to [`MAX_WEB_TARGETS_PER_REQUEST`].
+pub(crate) fn max_web_targets_per_request() -> usize {
+    crate::compat::load_global_setting_value("server-max-targets-per-request")
+        .and_then(|v| v.as_u64())
+        .filter(|&n| n > 0)
+        .map(|n| n as usize)
+        .unwrap_or(MAX_WEB_TARGETS_PER_REQUEST)
+}
 pub(crate) const MAX_WEB_TAGS_PER_REQUEST: usize = 128;
 pub(crate) const MAX_WEB_TARGET_LENGTH: usize = 4096;
 pub(crate) const MAX_WEB_TAG_LENGTH: usize = 255;
