@@ -234,17 +234,14 @@ fn execute_job(
             }
             "update_by_tag" => {
                 command.arg("update");
-                let resolved_ids = execution_spec_meta_strings(&spec, "resolved_ids");
-                if resolved_ids.is_empty() {
-                    append_update_args(&mut command, push_server, target_console, &spec.args);
-                } else {
-                    append_update_args(&mut command, push_server, target_console, &resolved_ids);
-                }
+                append_update_args(&mut command, push_server, target_console, &spec.args);
             }
             "convert" => {
-                let convert_target = spec.args.join("\t");
-                let (target, device) = parse_convert_job_target(&convert_target);
-                command.arg("convert").arg("--no-open").arg(target);
+                let (targets, device) = convert_targets_and_device(&spec);
+                command.arg("convert").arg("--no-open");
+                for target in targets {
+                    command.arg(target);
+                }
                 if let Some(device) = device {
                     command.env("NAROU_RS_WEB_DEVICE", device);
                 }
@@ -405,6 +402,7 @@ fn execution_spec_meta_string(spec: &QueueExecutionSpec, key: &str) -> Option<St
     }
 }
 
+#[allow(dead_code)]
 fn execution_spec_meta_strings(spec: &QueueExecutionSpec, key: &str) -> Vec<String> {
     match spec.meta.get(Value::String(key.to_string())) {
         Some(Value::Sequence(values)) => values
@@ -417,6 +415,23 @@ fn execution_spec_meta_strings(spec: &QueueExecutionSpec, key: &str) -> Vec<Stri
             .collect(),
         _ => Vec::new(),
     }
+}
+
+fn convert_targets_and_device(spec: &QueueExecutionSpec) -> (Vec<String>, Option<String>) {
+    let device = execution_spec_meta_string(spec, "device");
+    if device.is_some() {
+        return (spec.args.clone(), device);
+    }
+    if spec.args.len() > 1
+        && let Some(last) = spec.args.last()
+        && matches!(
+            last.to_ascii_lowercase().as_str(),
+            "text" | "kindle" | "kobo" | "epub" | "ibunko" | "reader" | "ibooks"
+        )
+    {
+        return (spec.args[..spec.args.len() - 1].to_vec(), Some(last.clone()));
+    }
+    (spec.args.clone(), None)
 }
 
 fn refresh_web_state(push_server: &Arc<PushServer>) {
@@ -686,7 +701,7 @@ fn parse_convert_job_target(value: &str) -> (&str, Option<&str>) {
 mod tests {
     use super::{
         MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, clear_progress_for_job,
-        console_target_for_job, execution_spec_meta_bool, execution_spec_meta_string,
+        console_target_for_job, convert_targets_and_device, execution_spec_meta_bool, execution_spec_meta_string,
         execution_spec_meta_strings, parse_convert_job_target, remember_failure_line,
         route_structured_web_message, summarize_failure_details,
     };
@@ -696,6 +711,24 @@ mod tests {
     fn parse_convert_job_target_splits_device_override() {
         assert_eq!(parse_convert_job_target("1\tkindle"), ("1", Some("kindle")));
         assert_eq!(parse_convert_job_target("1"), ("1", None));
+    }
+
+    #[test]
+    fn convert_targets_and_device_reads_batched_targets_and_meta_override() {
+        let mut meta = serde_yaml::Mapping::new();
+        meta.insert(
+            serde_yaml::Value::String("device".to_string()),
+            serde_yaml::Value::String("kindle".to_string()),
+        );
+        let spec = crate::queue::QueueExecutionSpec {
+            cmd: "convert".to_string(),
+            args: vec!["1".to_string(), "2".to_string()],
+            meta,
+        };
+        assert_eq!(
+            convert_targets_and_device(&spec),
+            (vec!["1".to_string(), "2".to_string()], Some("kindle".to_string()))
+        );
     }
 
     #[test]
@@ -796,7 +829,7 @@ mod tests {
     fn execution_spec_meta_strings_accepts_string_sequences() {
         let mut meta = serde_yaml::Mapping::new();
         meta.insert(
-            serde_yaml::Value::String("resolved_ids".to_string()),
+            serde_yaml::Value::String("snapshot_ids".to_string()),
             serde_yaml::Value::Sequence(vec![
                 serde_yaml::Value::String("12".to_string()),
                 serde_yaml::Value::Number(serde_yaml::Number::from(34)),
@@ -808,7 +841,7 @@ mod tests {
             meta,
         };
 
-        assert_eq!(execution_spec_meta_strings(&spec, "resolved_ids"), vec!["12", "34"]);
+        assert_eq!(execution_spec_meta_strings(&spec, "snapshot_ids"), vec!["12", "34"]);
         assert!(execution_spec_meta_strings(&spec, "missing").is_empty());
     }
 }

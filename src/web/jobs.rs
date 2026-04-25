@@ -310,12 +310,8 @@ fn sort_numeric_targets_for_request(
         .collect()
 }
 
-fn build_update_by_tag_queue_payload(ids: &[i64], tag_params: &[String]) -> (String, Vec<Value>, Mapping) {
-    let target = ids
-        .iter()
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>()
-        .join("\t");
+fn build_update_by_tag_queue_payload(tag_params: &[String], snapshot_ids: &[i64]) -> (String, Vec<Value>, Mapping) {
+    let target = tag_params.join("\t");
     let legacy_args = tag_params
         .iter()
         .cloned()
@@ -323,12 +319,17 @@ fn build_update_by_tag_queue_payload(ids: &[i64], tag_params: &[String]) -> (Str
         .collect::<Vec<_>>();
     let mut meta = Mapping::new();
     meta.insert(
-        Value::String("resolved_ids".to_string()),
+        Value::String("snapshot_ids".to_string()),
         Value::Sequence(
-            ids.iter()
+            snapshot_ids
+                .iter()
                 .map(|id| Value::String(id.to_string()))
                 .collect::<Vec<_>>(),
         ),
+    );
+    meta.insert(
+        Value::String("snapshot_count".to_string()),
+        Value::Number(serde_yaml::Number::from(snapshot_ids.len() as u64)),
     );
     (target, legacy_args, meta)
 }
@@ -900,19 +901,26 @@ pub async fn api_convert(
     }
     let ordered_targets =
         sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp);
-    let jobs: Vec<(JobType, String)> = body
-        .targets
+    let mut meta = Mapping::new();
+    if let Some(device) = device.as_deref() {
+        meta.insert(
+            Value::String("device".to_string()),
+            Value::String(device.to_string()),
+        );
+    }
+    let legacy_args = ordered_targets
         .iter()
-        .zip(ordered_targets.iter())
-        .map(|(_raw_target, target)| {
-            (
-                JobType::Convert,
-                encode_convert_job_target(target, device.as_deref()),
-            )
-        })
-        .collect();
-    let ids = match state.queue.push_batch(&jobs) {
-        Ok(ids) => ids,
+        .cloned()
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    let job_id = match state.queue.push_with_legacy(
+        JobType::Convert,
+        &encode_convert_job_target(&ordered_targets),
+        "convert",
+        legacy_args,
+        meta,
+    ) {
+        Ok(id) => id,
         Err(e) => {
             return serde_json::json!({
                 "success": false,
@@ -923,12 +931,9 @@ pub async fn api_convert(
         }
     };
 
-    let results: Vec<serde_json::Value> = body
-        .targets
+    let results: Vec<serde_json::Value> = ordered_targets
         .iter()
-        .zip(ids.iter())
-        .zip(ordered_targets.iter())
-        .map(|((_raw_target, job_id), target)| {
+        .map(|target| {
             serde_json::json!({
                 "target": target,
                 "device": device,
@@ -997,15 +1002,11 @@ fn targets_to_strings(targets: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-fn encode_convert_job_target(target: &str, device: Option<&str>) -> String {
-    match device.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(device) => format!("{}\t{}", target, device),
-        None => target.to_string(),
-    }
+fn encode_convert_job_target(targets: &[String]) -> String {
+    targets.join("\t")
 }
 
-/// Helper: spawn an immediate child process with the given args
-fn run_immediate(args: &[&str]) -> Result<std::process::Output, String> {
+fn run_immediate_blocking(args: &[String]) -> Result<std::process::Output, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut command = std::process::Command::new(exe);
     command
@@ -1014,6 +1015,23 @@ fn run_immediate(args: &[&str]) -> Result<std::process::Output, String> {
         .stdin(std::process::Stdio::null());
     crate::compat::configure_web_subprocess_command(&mut command);
     command.output().map_err(|e| e.to_string())
+}
+
+async fn run_immediate(args: Vec<String>) -> Result<std::process::Output, String> {
+    tokio::task::spawn_blocking(move || run_immediate_blocking(&args))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+pub(crate) async fn run_cli_and_broadcast(
+    state: &AppState,
+    args: Vec<String>,
+    target_console: &str,
+) -> Result<std::process::Output, String> {
+    let output = run_immediate(args).await?;
+    broadcast_captured_web_output(&state.push_server, &output.stdout, target_console);
+    broadcast_captured_web_output(&state.push_server, &output.stderr, target_console);
+    Ok(output)
 }
 
 fn broadcast_captured_web_output(
@@ -1062,9 +1080,21 @@ pub async fn api_send(
             .into();
         }
     };
-    let jobs: Vec<(JobType, String)> = targets.iter().map(|t| (JobType::Send, t.clone())).collect();
-    let ids = match state.queue.push_batch(&jobs) {
-        Ok(ids) => ids,
+    let ordered_targets =
+        sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp);
+    let legacy_args = ordered_targets
+        .iter()
+        .cloned()
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    let job_id = match state.queue.push_with_legacy(
+        JobType::Send,
+        &ordered_targets.join("\t"),
+        "send",
+        legacy_args,
+        Mapping::new(),
+    ) {
+        Ok(id) => id,
         Err(e) => {
             return serde_json::json!({
                 "success": false,
@@ -1077,8 +1107,8 @@ pub async fn api_send(
     state.push_server.broadcast_event("notification.queue", "");
     serde_json::json!({
         "success": true,
-        "count": ids.len(),
-        "job_ids": ids,
+        "count": ordered_targets.len(),
+        "job_ids": [job_id],
     })
     .into()
 }
@@ -1108,22 +1138,10 @@ pub async fn api_inspect(
             });
         }
     };
-    let mut args: Vec<&str> = vec!["inspect"];
-    let target_refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
-    args.extend(&target_refs);
-
-    match run_immediate(&args) {
+    let mut args = vec!["inspect".to_string()];
+    args.extend(targets);
+    match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
         Ok(output) => {
-            broadcast_captured_web_output(
-                &state.push_server,
-                &output.stdout,
-                super::non_external_console_target(),
-            );
-            broadcast_captured_web_output(
-                &state.push_server,
-                &output.stderr,
-                super::non_external_console_target(),
-            );
             Json(ApiResponse {
                 success: output.status.success(),
                 message: if output.status.success() {
@@ -1169,22 +1187,10 @@ pub async fn api_folder(
             });
         }
     };
-    let mut args: Vec<&str> = vec!["folder"];
-    let target_refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
-    args.extend(&target_refs);
-
-    match run_immediate(&args) {
+    let mut args = vec!["folder".to_string()];
+    args.extend(targets);
+    match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
         Ok(output) => {
-            broadcast_captured_web_output(
-                &state.push_server,
-                &output.stdout,
-                super::non_external_console_target(),
-            );
-            broadcast_captured_web_output(
-                &state.push_server,
-                &output.stderr,
-                super::non_external_console_target(),
-            );
             Json(ApiResponse {
                 success: output.status.success(),
                 message: if output.status.success() {
@@ -1232,12 +1238,21 @@ pub async fn api_backup(
             .into();
         }
     };
-    let jobs: Vec<(JobType, String)> = targets
+    let ordered_targets =
+        sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp);
+    let legacy_args = ordered_targets
         .iter()
-        .map(|t| (JobType::Backup, t.clone()))
-        .collect();
-    let ids = match state.queue.push_batch(&jobs) {
-        Ok(ids) => ids,
+        .cloned()
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    let job_id = match state.queue.push_with_legacy(
+        JobType::Backup,
+        &ordered_targets.join("\t"),
+        "backup",
+        legacy_args,
+        Mapping::new(),
+    ) {
+        Ok(id) => id,
         Err(e) => {
             return serde_json::json!({
                 "success": false,
@@ -1250,8 +1265,8 @@ pub async fn api_backup(
     state.push_server.broadcast_event("notification.queue", "");
     serde_json::json!({
         "success": true,
-        "count": ids.len(),
-        "job_ids": ids,
+        "count": ordered_targets.len(),
+        "job_ids": [job_id],
     })
     .into()
 }
@@ -1357,22 +1372,10 @@ pub async fn api_setting_burn(
             });
         }
     };
-    let mut args: Vec<&str> = vec!["setting", "--burn"];
-    let target_refs: Vec<&str> = targets.iter().map(|s| s.as_str()).collect();
-    args.extend(&target_refs);
-
-    match run_immediate(&args) {
+    let mut args = vec!["setting".to_string(), "--burn".to_string()];
+    args.extend(targets);
+    match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
         Ok(output) => {
-            broadcast_captured_web_output(
-                &state.push_server,
-                &output.stdout,
-                super::non_external_console_target(),
-            );
-            broadcast_captured_web_output(
-                &state.push_server,
-                &output.stderr,
-                super::non_external_console_target(),
-            );
             Json(ApiResponse {
                 success: output.status.success(),
                 message: if output.status.success() {
@@ -1561,19 +1564,15 @@ pub async fn api_diff(
     };
 
     for id in &ids {
-        let args = vec!["diff", "--no-tool", id, "--number", &diff_number];
-        match run_immediate(&args) {
+        let args = vec![
+            "diff".to_string(),
+            "--no-tool".to_string(),
+            id.clone(),
+            "--number".to_string(),
+            diff_number.clone(),
+        ];
+        match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
             Ok(output) => {
-                broadcast_captured_web_output(
-                    &state.push_server,
-                    &output.stdout,
-                    super::non_external_console_target(),
-                );
-                broadcast_captured_web_output(
-                    &state.push_server,
-                    &output.stderr,
-                    super::non_external_console_target(),
-                );
                 if !output.status.success() {
                     log_immediate_command_failure("diff", &output);
                     return Json(ApiResponse {
@@ -1623,19 +1622,9 @@ pub async fn api_diff_clean(
         }
     };
 
-    let args = vec!["diff", "--clean", &target];
-    match run_immediate(&args) {
+    let args = vec!["diff".to_string(), "--clean".to_string(), target.clone()];
+    match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
         Ok(output) => {
-            broadcast_captured_web_output(
-                &state.push_server,
-                &output.stdout,
-                super::non_external_console_target(),
-            );
-            broadcast_captured_web_output(
-                &state.push_server,
-                &output.stderr,
-                super::non_external_console_target(),
-            );
             Json(ApiResponse {
                 success: output.status.success(),
                 message: if output.status.success() {
@@ -2016,8 +2005,8 @@ pub async fn api_update_by_tag(
         .into();
     }
 
-    // Resolve matching novel IDs from database
-    let ids = with_database(|db| {
+    // Snapshot current matching novel IDs for UI feedback only.
+    let snapshot_ids = with_database(|db| {
         let all = db.all_records();
         let mut matching_ids: Vec<i64> = Vec::new();
 
@@ -2046,18 +2035,11 @@ pub async fn api_update_by_tag(
     })
     .unwrap_or_default();
 
-    if ids.is_empty() {
-        return serde_json::json!({
-            "success": true,
-            "message": "対象の小説がありません",
-            "count": 0,
-        })
-        .into();
-    }
-
-    let ids = sort_ids_for_request(&ids, body.sort_state.as_ref(), body.timestamp);
-    let count = ids.len();
-    let (target, legacy_args, meta) = build_update_by_tag_queue_payload(&ids, &tag_params);
+    let snapshot_ids =
+        sort_ids_for_request(&snapshot_ids, body.sort_state.as_ref(), body.timestamp);
+    let count = snapshot_ids.len();
+    let (target, legacy_args, meta) =
+        build_update_by_tag_queue_payload(&tag_params, &snapshot_ids);
     let (_job_ids, queued) = match push_update_job_with_legacy_if_needed(
         state.queue.as_ref(),
         &state.running_jobs,
@@ -2464,14 +2446,15 @@ mod tests {
 
     #[test]
     fn encode_convert_job_target_omits_default_override() {
-        assert_eq!(encode_convert_job_target("12", None), "12");
-        assert_eq!(encode_convert_job_target("12", Some("   ")), "12");
+        assert_eq!(encode_convert_job_target(&["12".to_string()]), "12");
     }
 
     #[test]
-    fn encode_convert_job_target_keeps_explicit_device() {
-        assert_eq!(encode_convert_job_target("12", Some("epub")), "12\tepub");
-        assert_eq!(encode_convert_job_target("12", Some("text")), "12\ttext");
+    fn encode_convert_job_target_batches_targets() {
+        assert_eq!(
+            encode_convert_job_target(&["12".to_string(), "9".to_string()]),
+            "12\t9"
+        );
     }
 
     #[test]
@@ -2728,13 +2711,13 @@ mod tests {
     }
 
     #[test]
-    fn update_by_tag_queue_payload_keeps_label_args_but_freezes_resolved_ids() {
+    fn update_by_tag_queue_payload_keeps_runtime_tag_args_with_snapshot_meta() {
         let (target, legacy_args, meta) = build_update_by_tag_queue_payload(
-            &[42, 9],
             &["tag:modified".to_string(), "^tag:end".to_string()],
+            &[42, 9],
         );
 
-        assert_eq!(target, "42\t9");
+        assert_eq!(target, "tag:modified\t^tag:end");
         assert_eq!(
             legacy_args,
             vec![
@@ -2743,7 +2726,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            meta.get(Value::String("resolved_ids".to_string())),
+            meta.get(Value::String("snapshot_ids".to_string())),
             Some(&Value::Sequence(vec![
                 Value::String("42".to_string()),
                 Value::String("9".to_string())

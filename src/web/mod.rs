@@ -61,6 +61,7 @@ pub(crate) fn non_external_console_target() -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn removal_log_message(titles: &[String], with_file: bool) -> String {
     let suffix = if with_file {
         "（保存フォルダも削除）"
@@ -123,6 +124,12 @@ pub(crate) fn validate_web_tag_name(tag: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+pub(crate) fn normalize_web_tag_name(tag: &str) -> Result<String, String> {
+    let trimmed = tag.trim();
+    let stripped = trimmed.strip_prefix("tag:").unwrap_or(trimmed);
+    validate_web_tag_name(stripped)
+}
+
 pub(crate) fn validate_web_text_size(
     value: &str,
     max_bytes: usize,
@@ -179,6 +186,7 @@ fn is_symlink_like(path: &Path) -> Result<bool, String> {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn remove_novel_storage_dir(
     archive_root: &Path,
     record: &crate::db::novel_record::NovelRecord,

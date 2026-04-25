@@ -1,12 +1,30 @@
 use axum::{extract::State, http::StatusCode, response::Json};
 
-use crate::compat::{load_frozen_ids_from_inventory, set_frozen_state};
-use crate::db::{with_database, with_database_mut};
-use crate::error::NarouError;
+use crate::db::with_database_mut;
 
 use super::AppState;
 use super::sort_state::sort_ids_for_request;
 use super::state::{ApiResponse, BatchIdsBody, TagBody};
+
+async fn run_batch_cli(
+    state: &AppState,
+    args: Vec<String>,
+    reload_tags: bool,
+) -> Result<(), (StatusCode, String)> {
+    let output = super::jobs::run_cli_and_broadcast(state, args, super::non_external_console_target())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if !output.status.success() {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "CLI command failed".to_string()));
+    }
+    with_database_mut(|db| db.refresh())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state.push_server.broadcast_event("table.reload", "");
+    if reload_tags {
+        state.push_server.broadcast_event("tag.updateCanvas", "");
+    }
+    Ok(())
+}
 
 pub async fn batch_tag(
     State(state): State<AppState>,
@@ -16,30 +34,16 @@ pub async fn batch_tag(
     if ids_body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
         return Err((StatusCode::BAD_REQUEST, "too many ids".to_string()));
     }
-    let tag = super::validate_web_tag_name(&tag_body.tag)
+    let ids = sort_ids_for_request(&ids_body.ids, ids_body.sort_state.as_ref(), ids_body.timestamp);
+    let tag = super::normalize_web_tag_name(&tag_body.tag)
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    let count = with_database_mut(|db| {
-        let mut count = 0usize;
-        for id in &ids_body.ids {
-            if let Some(record) = db.get(*id).cloned() {
-                let mut updated = record;
-                if !updated.tags.contains(&tag) {
-                    updated.tags.push(tag.clone());
-                }
-                db.insert(updated);
-                count += 1;
-            }
-        }
-        db.save()?;
-        Ok::<usize, NarouError>(count)
-    })
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut args = vec!["tag".to_string(), "--add".to_string(), tag];
+    args.extend(ids.iter().map(ToString::to_string));
+    run_batch_cli(&state, args, true).await?;
 
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
-        message: format!("Tagged {} novels", count),
+        message: format!("Tagged {} novels", ids.len()),
     }))
 }
 
@@ -51,28 +55,16 @@ pub async fn batch_untag(
     if ids_body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
         return Err((StatusCode::BAD_REQUEST, "too many ids".to_string()));
     }
-    let tag = super::validate_web_tag_name(&tag_body.tag)
+    let ids = sort_ids_for_request(&ids_body.ids, ids_body.sort_state.as_ref(), ids_body.timestamp);
+    let tag = super::normalize_web_tag_name(&tag_body.tag)
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    let count = with_database_mut(|db| {
-        let mut count = 0usize;
-        for id in &ids_body.ids {
-            if let Some(record) = db.get(*id).cloned() {
-                let mut updated = record;
-                updated.tags.retain(|t| t != &tag);
-                db.insert(updated);
-                count += 1;
-            }
-        }
-        db.save()?;
-        Ok::<usize, NarouError>(count)
-    })
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut args = vec!["tag".to_string(), "--delete".to_string(), tag];
+    args.extend(ids.iter().map(ToString::to_string));
+    run_batch_cli(&state, args, true).await?;
 
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
-        message: format!("Untagged {} novels", count),
+        message: format!("Untagged {} novels", ids.len()),
     }))
 }
 
@@ -83,17 +75,14 @@ pub async fn batch_freeze(
     if body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
         return Err((StatusCode::BAD_REQUEST, "too many ids".to_string()));
     }
-    let mut count = 0usize;
-    for id in &body.ids {
-        if set_frozen_state(*id, true).is_ok() {
-            count += 1;
-        }
-    }
+    let ids = sort_ids_for_request(&body.ids, body.sort_state.as_ref(), body.timestamp);
+    let mut args = vec!["freeze".to_string(), "--on".to_string()];
+    args.extend(ids.iter().map(ToString::to_string));
+    run_batch_cli(&state, args, false).await?;
 
-    state.push_server.broadcast_event("table.reload", "");
     Ok(Json(ApiResponse {
         success: true,
-        message: format!("Froze {} novels", count),
+        message: format!("Froze {} novels", ids.len()),
     }))
 }
 
@@ -104,17 +93,14 @@ pub async fn batch_unfreeze(
     if body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
         return Err((StatusCode::BAD_REQUEST, "too many ids".to_string()));
     }
-    let mut count = 0usize;
-    for id in &body.ids {
-        if set_frozen_state(*id, false).is_ok() {
-            count += 1;
-        }
-    }
+    let ids = sort_ids_for_request(&body.ids, body.sort_state.as_ref(), body.timestamp);
+    let mut args = vec!["freeze".to_string(), "--off".to_string()];
+    args.extend(ids.iter().map(ToString::to_string));
+    run_batch_cli(&state, args, false).await?;
 
-    state.push_server.broadcast_event("table.reload", "");
     Ok(Json(ApiResponse {
         success: true,
-        message: format!("Unfroze {} novels", count),
+        message: format!("Unfroze {} novels", ids.len()),
     }))
 }
 
@@ -126,35 +112,17 @@ pub async fn batch_remove(
         return Err((StatusCode::BAD_REQUEST, "too many ids".to_string()));
     }
     let with_file = body.with_file.unwrap_or(false);
-    let sorted_ids = sort_ids_for_request(&body.ids, body.sort_state.as_ref(), body.timestamp);
-    let removed_titles = with_database_mut(|db| {
-        let mut titles = Vec::new();
-        for id in &sorted_ids {
-            if let Some(record) = db.remove(*id) {
-                if with_file {
-                    super::remove_novel_storage_dir(db.archive_root(), &record)
-                        .map_err(NarouError::Database)?;
-                }
-                titles.push(record.title);
-            }
-        }
-        db.save()?;
-        Ok::<Vec<String>, NarouError>(titles)
-    })
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let count = removed_titles.len();
-
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
-    if count > 0 {
-        state.push_server.broadcast_echo(
-            &super::removal_log_message(&removed_titles, with_file),
-            super::non_external_console_target(),
-        );
+    let ids = sort_ids_for_request(&body.ids, body.sort_state.as_ref(), body.timestamp);
+    let mut args = vec!["remove".to_string(), "--yes".to_string()];
+    if with_file {
+        args.push("--with-file".to_string());
     }
+    args.extend(ids.iter().map(ToString::to_string));
+    run_batch_cli(&state, args, true).await?;
+
     Ok(Json(ApiResponse {
         success: true,
-        message: format!("Removed {} novels", count),
+        message: format!("Removed {} novels", ids.len()),
     }))
 }
 
@@ -178,22 +146,14 @@ pub async fn batch_freeze_toggle(
     if body.ids.len() > super::MAX_WEB_TARGETS_PER_REQUEST {
         return Err((StatusCode::BAD_REQUEST, "too many ids".to_string()));
     }
-    let frozen_ids = with_database(|db| load_frozen_ids_from_inventory(db.inventory()))
-        .unwrap_or_default();
-    let mut count = 0usize;
-    for id in &body.ids {
-        let is_frozen = frozen_ids.contains(id);
-        if set_frozen_state(*id, !is_frozen).is_ok() {
-            count += 1;
-        }
-    }
+    let ids = sort_ids_for_request(&body.ids, body.sort_state.as_ref(), body.timestamp);
+    let mut args = vec!["freeze".to_string()];
+    args.extend(ids.iter().map(ToString::to_string));
+    run_batch_cli(&state, args, false).await?;
 
-    state
-        .push_server
-        .broadcast_event("table.reload", "");
     Ok(Json(serde_json::json!({
         "success": true,
         "message": "凍結状態を切り替えました",
-        "count": count,
+        "count": ids.len(),
     })))
 }

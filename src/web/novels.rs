@@ -5,7 +5,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 
-use crate::compat::{load_frozen_ids_from_inventory, record_is_frozen, set_frozen_state};
+use crate::compat::{load_frozen_ids_from_inventory, record_is_frozen};
 use crate::db::{with_database, with_database_mut};
 use crate::error::NarouError;
 
@@ -544,29 +544,26 @@ pub async fn remove_novel(
     let with_file = body
         .and_then(|b| b.get("with_file").and_then(|v| v.as_bool()))
         .unwrap_or(false);
-    let result = with_database_mut(|db| {
-        if let Some(record) = db.remove(id) {
-            if with_file {
-                super::remove_novel_storage_dir(db.archive_root(), &record)
-                    .map_err(NarouError::Database)?;
-            }
-            db.save()?;
-            Ok::<String, NarouError>(record.title)
-        } else {
-            Err(NarouError::NotFound(format!("ID: {}", id)))
-        }
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let mut args = vec!["remove".to_string(), "--yes".to_string()];
+    if with_file {
+        args.push("--with-file".to_string());
+    }
+    args.push(id.to_string());
+    let output =
+        super::jobs::run_cli_and_broadcast(&state, args, super::non_external_console_target())
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if !output.status.success() {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "remove の実行に失敗しました".to_string()));
+    }
+    with_database_mut(|db| db.refresh())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     state.push_server.broadcast_event("table.reload", "");
     state.push_server.broadcast_event("tag.updateCanvas", "");
-    state.push_server.broadcast_echo(
-        &super::removal_log_message(std::slice::from_ref(&result), with_file),
-        super::non_external_console_target(),
-    );
     Ok(Json(ApiResponse {
         success: true,
-        message: result,
+        message: format!("Removed {}", id),
     }))
 }
 
@@ -574,7 +571,18 @@ pub async fn freeze_novel(
     State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
-    set_frozen_state(id, true).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let output = super::jobs::run_cli_and_broadcast(
+        &state,
+        vec!["freeze".to_string(), "--on".to_string(), id.to_string()],
+        super::non_external_console_target(),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if !output.status.success() {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "freeze の実行に失敗しました".to_string()));
+    }
+    with_database_mut(|db| db.refresh())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     state.push_server.broadcast_event("table.reload", "");
     Ok(Json(ApiResponse {
@@ -587,7 +595,18 @@ pub async fn unfreeze_novel(
     State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
-    set_frozen_state(id, false).map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let output = super::jobs::run_cli_and_broadcast(
+        &state,
+        vec!["freeze".to_string(), "--off".to_string(), id.to_string()],
+        super::non_external_console_target(),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if !output.status.success() {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "freeze の実行に失敗しました".to_string()));
+    }
+    with_database_mut(|db| db.refresh())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     state.push_server.broadcast_event("table.reload", "");
     Ok(Json(ApiResponse {

@@ -975,7 +975,7 @@ mod tests {
     #[test]
     fn load_for_novel_reads_project_local_setting_defaults() {
         let _guard = CWD_LOCK.lock().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
+        let original_dir = std::env::current_dir().ok();
         let root = std::env::temp_dir().join(format!(
             "narou-rs-settings-test-{}-{}",
             TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -995,7 +995,13 @@ mod tests {
 
         std::env::set_current_dir(&archive_path).unwrap();
         let settings = NovelSettings::load_for_novel(1, "title", "author", &archive_path);
-        std::env::set_current_dir(original_dir).unwrap();
+        if let Some(dir) = original_dir.as_deref() {
+            if std::env::set_current_dir(dir).is_err() {
+                let _ = std::env::set_current_dir(std::env::temp_dir());
+            }
+        } else {
+            let _ = std::env::set_current_dir(std::env::temp_dir());
+        }
 
         assert!(settings.enable_inspect);
         assert!(settings.enable_erase_introduction);
@@ -1006,7 +1012,7 @@ mod tests {
     #[test]
     fn load_for_novel_with_options_ignores_force_and_default_settings() {
         let _guard = CWD_LOCK.lock().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
+        let original_dir = std::env::current_dir().ok();
         let root = std::env::temp_dir().join(format!(
             "narou-rs-settings-ignore-test-{}-{}",
             TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -1041,7 +1047,13 @@ mod tests {
             true,
             false,
         );
-        std::env::set_current_dir(original_dir).unwrap();
+        if let Some(dir) = original_dir.as_deref() {
+            if std::env::set_current_dir(dir).is_err() {
+                let _ = std::env::set_current_dir(std::env::temp_dir());
+            }
+        } else {
+            let _ = std::env::set_current_dir(std::env::temp_dir());
+        }
 
         assert!(!ignore_default.enable_inspect);
         assert!(!ignore_force.enable_erase_introduction);

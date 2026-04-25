@@ -5,7 +5,6 @@ use axum::{
 };
 
 use crate::db::with_database_mut;
-use crate::error::NarouError;
 
 use super::AppState;
 use super::sort_state::sort_ids_for_request;
@@ -16,8 +15,31 @@ fn validate_tags(tags: &[String]) -> Result<Vec<String>, String> {
         return Err("too many tags".to_string());
     }
     tags.iter()
-        .map(|tag| super::validate_web_tag_name(tag))
+        .map(|tag| super::normalize_web_tag_name(tag))
         .collect()
+}
+
+async fn run_tag_commands(
+    state: &AppState,
+    commands: Vec<Vec<String>>,
+) -> Result<(), (StatusCode, String)> {
+    for args in commands {
+        let output = super::jobs::run_cli_and_broadcast(
+            state,
+            args,
+            super::non_external_console_target(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        if !output.status.success() {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "tag の実行に失敗しました".to_string()));
+        }
+    }
+    with_database_mut(|db| db.refresh())
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    state.push_server.broadcast_event("table.reload", "");
+    state.push_server.broadcast_event("tag.updateCanvas", "");
+    Ok(())
 }
 
 pub async fn add_tag(
@@ -25,34 +47,19 @@ pub async fn add_tag(
     Path(IdPath { id }): Path<IdPath>,
     Json(body): Json<TagBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
-    let tag = super::validate_web_tag_name(&body.tag)
+    let tag = super::normalize_web_tag_name(&body.tag)
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
-        if !updated.tags.contains(&tag) {
-            updated.tags.push(tag.clone());
-        }
-        {
-            let inventory = db.inventory();
-            let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
-            if super::tag_colors::ensure_tag_colors(
-                &mut tag_colors,
-                updated.tags.iter().map(String::as_str),
-            ) {
-                super::tag_colors::save_tag_colors(inventory, &tag_colors)?;
-            }
-        }
-        db.insert(updated);
-        db.save()
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    run_tag_commands(
+        &state,
+        vec![vec![
+            "tag".to_string(),
+            "--add".to_string(),
+            tag,
+            id.to_string(),
+        ]],
+    )
+    .await?;
 
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
         message: "Tag added".to_string(),
@@ -64,22 +71,19 @@ pub async fn remove_tag(
     Path(IdPath { id }): Path<IdPath>,
     Json(body): Json<TagBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
-    let tag = super::validate_web_tag_name(&body.tag)
+    let tag = super::normalize_web_tag_name(&body.tag)
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
-        updated.tags.retain(|t| t != &tag);
-        db.insert(updated);
-        db.save()
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    run_tag_commands(
+        &state,
+        vec![vec![
+            "tag".to_string(),
+            "--delete".to_string(),
+            tag,
+            id.to_string(),
+        ]],
+    )
+    .await?;
 
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
         message: "Tag removed".to_string(),
@@ -93,34 +97,16 @@ pub async fn add_tags(
     Json(body): Json<TagsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     let tags = validate_tags(&body.tags).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
-        for tag in &tags {
-            if !updated.tags.contains(tag) {
-                updated.tags.push(tag.clone());
-            }
-        }
-        {
-            let inventory = db.inventory();
-            let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
-            if super::tag_colors::ensure_tag_colors(
-                &mut tag_colors,
-                updated.tags.iter().map(String::as_str),
-            ) {
-                super::tag_colors::save_tag_colors(inventory, &tag_colors)?;
-            }
-        }
-        db.insert(updated);
-        db.save()
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    run_tag_commands(
+        &state,
+        vec![{
+            let mut args = vec!["tag".to_string(), "--add".to_string(), tags.join(" ")];
+            args.push(id.to_string());
+            args
+        }],
+    )
+    .await?;
 
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
         message: "Tags added".to_string(),
@@ -134,20 +120,16 @@ pub async fn remove_tags(
     Json(body): Json<TagsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     let tags = validate_tags(&body.tags).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
-        updated.tags.retain(|t| !tags.contains(t));
-        db.insert(updated);
-        db.save()
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    run_tag_commands(
+        &state,
+        vec![{
+            let mut args = vec!["tag".to_string(), "--delete".to_string(), tags.join(" ")];
+            args.push(id.to_string());
+            args
+        }],
+    )
+    .await?;
 
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
         message: "Tags removed".to_string(),
@@ -160,30 +142,16 @@ pub async fn update_tags(
     Json(body): Json<TagsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     let tags = validate_tags(&body.tags).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
-        updated.tags = tags;
-        {
-            let inventory = db.inventory();
-            let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
-            if super::tag_colors::ensure_tag_colors(
-                &mut tag_colors,
-                updated.tags.iter().map(String::as_str),
-            ) {
-                super::tag_colors::save_tag_colors(inventory, &tag_colors)?;
-            }
-        }
-        db.insert(updated);
-        db.save()
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let mut commands = vec![vec!["tag".to_string(), "--clear".to_string(), id.to_string()]];
+    if !tags.is_empty() {
+        commands.push({
+            let mut args = vec!["tag".to_string(), "--add".to_string(), tags.join(" ")];
+            args.push(id.to_string());
+            args
+        });
+    }
+    run_tag_commands(&state, commands).await?;
 
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
     Ok(Json(ApiResponse {
         success: true,
         message: "Tags updated".to_string(),
@@ -217,12 +185,11 @@ pub async fn edit_tag(
         return serde_json::json!({ "success": false, "error": "No valid IDs" }).into();
     }
 
-    // Group tags by state: 0=delete, 2=add (1=keep is no-op)
     let mut tags_to_add: Vec<String> = Vec::new();
     let mut tags_to_delete: Vec<String> = Vec::new();
 
     for (tag, state_val) in &body.states {
-        let tag = match super::validate_web_tag_name(tag) {
+        let tag = match super::normalize_web_tag_name(tag) {
             Ok(tag) => tag,
             Err(error) => {
                 return serde_json::json!({ "success": false, "error": error }).into();
@@ -234,49 +201,35 @@ pub async fn edit_tag(
             _ => 1,
         };
         match s {
-            0 => tags_to_delete.push(tag.clone()),
-            2 => tags_to_add.push(tag.clone()),
-            _ => {} // 1 = keep, no-op
+            0 => tags_to_delete.push(tag),
+            2 => tags_to_add.push(tag),
+            _ => {}
         }
     }
 
-    let result = with_database_mut(|db| {
-        let mut touched_tags: Vec<String> = Vec::new();
-        for &id in &ids {
-            if let Some(record) = db.get(id).cloned() {
-                let mut updated = record;
-                // Delete tags
-                if !tags_to_delete.is_empty() {
-                    updated.tags.retain(|t| !tags_to_delete.contains(t));
-                }
-                // Add tags
-                for tag in &tags_to_add {
-                    if !updated.tags.contains(tag) {
-                        updated.tags.push(tag.clone());
-                    }
-                }
-                touched_tags.extend(updated.tags.iter().cloned());
-                db.insert(updated);
-            }
-        }
-        {
-            let inventory = db.inventory();
-            let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
-            if super::tag_colors::ensure_tag_colors(
-                &mut tag_colors,
-                touched_tags.iter().map(String::as_str),
-            ) {
-                super::tag_colors::save_tag_colors(inventory, &tag_colors)?;
-            }
-        }
-        db.save()
-    });
-
-    if let Err(e) = result {
-        return serde_json::json!({ "success": false, "error": e.to_string() }).into();
+    let mut commands = Vec::new();
+    if !tags_to_delete.is_empty() {
+        let mut args = vec![
+            "tag".to_string(),
+            "--delete".to_string(),
+            tags_to_delete.join(" "),
+        ];
+        args.extend(ids.iter().map(ToString::to_string));
+        commands.push(args);
+    }
+    if !tags_to_add.is_empty() {
+        let mut args = vec![
+            "tag".to_string(),
+            "--add".to_string(),
+            tags_to_add.join(" "),
+        ];
+        args.extend(ids.iter().map(ToString::to_string));
+        commands.push(args);
     }
 
-    state.push_server.broadcast_event("table.reload", "");
-    state.push_server.broadcast_event("tag.updateCanvas", "");
+    if let Err((_, error)) = run_tag_commands(&state, commands).await {
+        return serde_json::json!({ "success": false, "error": error }).into();
+    }
+
     serde_json::json!({ "success": true }).into()
 }
