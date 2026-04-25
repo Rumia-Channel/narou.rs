@@ -319,10 +319,14 @@ impl NovelLockGuard {
         };
 
         let inventory = Inventory::with_default_root()?;
-        let mut locked: HashMap<i64, serde_yaml::Value> =
-            inventory.load("lock", InventoryScope::Local)?;
-        locked.insert(id, current_lock_timestamp());
-        inventory.save("lock", InventoryScope::Local, &locked)?;
+        inventory.update_yaml::<(), HashMap<i64, serde_yaml::Value>, _>(
+            "lock",
+            InventoryScope::Local,
+            |mut locked| {
+                locked.insert(id, current_lock_timestamp());
+                Ok((locked, ()))
+            },
+        )?;
 
         Ok(Self {
             inventory: Some(inventory),
@@ -336,12 +340,14 @@ impl Drop for NovelLockGuard {
         let (Some(inventory), Some(id)) = (&self.inventory, self.id) else {
             return;
         };
-        let mut locked: HashMap<i64, serde_yaml::Value> = inventory
-            .load("lock", InventoryScope::Local)
-            .unwrap_or_default();
-        if locked.remove(&id).is_some() {
-            let _ = inventory.save("lock", InventoryScope::Local, &locked);
-        }
+        let _ = inventory.update_yaml::<(), HashMap<i64, serde_yaml::Value>, _>(
+            "lock",
+            InventoryScope::Local,
+            |mut locked| {
+                locked.remove(&id);
+                Ok((locked, ()))
+            },
+        );
     }
 }
 
@@ -374,27 +380,31 @@ pub fn is_frozen_id(id: i64) -> bool {
 
 pub fn set_frozen_state(id: i64, frozen: bool) -> Result<()> {
     crate::db::with_database_mut(|db| {
-        let mut frozen_list: HashMap<i64, serde_yaml::Value> =
-            db.inventory().load("freeze", InventoryScope::Local)?;
         let record = db
             .get(id)
             .cloned()
             .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
         let mut updated = record;
 
-        if frozen {
-            frozen_list.insert(id, serde_yaml::Value::Bool(true));
-            if !updated.tags.iter().any(|tag| tag == "frozen") {
-                updated.tags.push("frozen".to_string());
+        let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
+        let _ = crate::db::inventory::update_locked_yaml_file::<
+            (),
+            HashMap<i64, serde_yaml::Value>,
+            _,
+        >(&freeze_path, |mut frozen_list| {
+            if frozen {
+                frozen_list.insert(id, serde_yaml::Value::Bool(true));
+                if !updated.tags.iter().any(|tag| tag == "frozen") {
+                    updated.tags.push("frozen".to_string());
+                }
+            } else {
+                frozen_list.remove(&id);
+                updated.tags.retain(|tag| tag != "frozen" && tag != "404");
             }
-        } else {
-            frozen_list.remove(&id);
-            updated.tags.retain(|tag| tag != "frozen" && tag != "404");
-        }
 
-        db.insert(updated);
-        db.inventory()
-            .save("freeze", InventoryScope::Local, &frozen_list)?;
+            db.insert(updated.clone());
+            Ok((frozen_list, ()))
+        })?;
         db.save()
     })
 }

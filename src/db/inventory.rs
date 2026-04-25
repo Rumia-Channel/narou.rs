@@ -150,17 +150,22 @@ impl Inventory {
     }
 
     pub fn save<T: Serialize>(&self, name: &str, scope: InventoryScope, data: &T) -> Result<()> {
-        let mut content = serde_yaml::to_string(data)?;
-        // Strip the `---` document-start header that serde_yaml emits by default,
-        // to match Ruby Psych output and keep files byte-compatible with narou.rb.
-        if content.starts_with("---\n") {
-            content.drain(..4);
-        } else if content.starts_with("---") {
-            // Handle `---` without trailing newline (unlikely but safe)
-            let after = content[3..].trim_start_matches('\r').trim_start_matches('\n');
-            content = after.to_string();
-        }
+        let content = serialize_yaml_content(data)?;
         self.save_raw(name, scope, &content)
+    }
+
+    pub fn update_yaml<T, D, F>(&self, name: &str, scope: InventoryScope, update: F) -> Result<T>
+    where
+        D: DeserializeOwned + Default + Serialize,
+        F: FnOnce(D) -> Result<(D, T)>,
+    {
+        let path = self.inventory_path(name, scope);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let (content, result) = update_locked_yaml_file::<T, D, _>(&path, update)?;
+        self.cache.lock().remember(name, content);
+        Ok(result)
     }
 
     pub fn clear_cache(&self) {
@@ -189,6 +194,47 @@ pub enum InventoryScope {
 }
 
 pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    with_exclusive_file_lock(path, || atomic_write_locked(path, content))
+}
+
+pub fn update_locked_yaml_file<T, D, F>(path: &Path, update: F) -> Result<(String, T)>
+where
+    D: DeserializeOwned + Default + Serialize,
+    F: FnOnce(D) -> Result<(D, T)>,
+{
+    with_locked_file_update(path, |raw| {
+        let current = if raw.is_empty() {
+            D::default()
+        } else {
+            serde_yaml::from_str(&raw)?
+        };
+        let (updated, result) = update(current)?;
+        let content = serialize_yaml_content(&updated)?;
+        Ok((content, result))
+    })
+}
+
+pub(crate) fn with_locked_file_update<T, F>(path: &Path, update: F) -> Result<(String, T)>
+where
+    F: FnOnce(String) -> Result<(String, T)>,
+{
+    with_exclusive_file_lock(path, || {
+        let current = if path.exists() {
+            ensure_yaml_size_limit(path)?;
+            fs::read_to_string(path)?
+        } else {
+            String::new()
+        };
+        let (new_content, result) = update(current)?;
+        atomic_write_locked(path, &new_content)?;
+        Ok((new_content, result))
+    })
+}
+
+fn with_exclusive_file_lock<T, F>(path: &Path, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
     let process_lock = process_write_lock_for(path);
     let _process_guard = process_lock.lock().unwrap_or_else(|e| e.into_inner());
     let lock_path = lock_file_path(path);
@@ -201,6 +247,10 @@ pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
         .create(true)
         .open(&lock_path)?;
     lock_file.lock_exclusive()?;
+    operation()
+}
+
+fn atomic_write_locked(path: &Path, content: &str) -> Result<()> {
     let retries = 20u32;
     let mut last_error = None;
 
@@ -227,6 +277,20 @@ pub(crate) fn atomic_write(path: &Path, content: &str) -> Result<()> {
     Err(NarouError::Io(last_error.unwrap_or_else(|| {
         std::io::Error::other(format!("failed to atomically write {}", path.display()))
     })))
+}
+
+fn serialize_yaml_content<T: Serialize>(data: &T) -> Result<String> {
+    let mut content = serde_yaml::to_string(data)?;
+    // Strip the `---` document-start header that serde_yaml emits by default,
+    // to match Ruby Psych output and keep files byte-compatible with narou.rb.
+    if content.starts_with("---\n") {
+        content.drain(..4);
+    } else if content.starts_with("---") {
+        // Handle `---` without trailing newline (unlikely but safe)
+        let after = content[3..].trim_start_matches('\r').trim_start_matches('\n');
+        content = after.to_string();
+    }
+    Ok(content)
 }
 
 pub(crate) fn ensure_yaml_size_limit(path: &Path) -> Result<()> {
@@ -302,6 +366,8 @@ fn dirs_home() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
         CACHE_MAX_SIZE, CACHE_TARGET_SIZE, Inventory, InventoryScope, MAX_YAML_SIZE_BYTES,
     };
@@ -377,5 +443,32 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("maximum supported YAML size"));
+    }
+
+    #[test]
+    fn update_yaml_performs_read_modify_write_under_same_helper() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let narou_dir = root.join(".narou");
+        std::fs::create_dir_all(&narou_dir).unwrap();
+        std::fs::write(narou_dir.join("freeze.yaml"), "1: true\n").unwrap();
+
+        let inventory = Inventory::new(root.clone());
+        inventory
+            .update_yaml::<(), HashMap<i64, serde_yaml::Value>, _>(
+                "freeze",
+                InventoryScope::Local,
+                |mut frozen| {
+                    frozen.insert(2, serde_yaml::Value::Bool(true));
+                    frozen.remove(&1);
+                    Ok((frozen, ()))
+                },
+            )
+            .unwrap();
+
+        let raw = std::fs::read_to_string(narou_dir.join("freeze.yaml")).unwrap();
+        assert!(!raw.contains("1:"));
+        assert!(raw.contains("2: true"));
+        assert!(narou_dir.join("freeze.yaml.lock").exists());
     }
 }

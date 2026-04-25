@@ -898,56 +898,50 @@ pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
         let id = data.id;
 
         let result = db::with_database_mut(|db| {
-            let mut frozen_list: std::collections::HashMap<i64, serde_yaml::Value> = db
-                .inventory()
-                .load("freeze", narou_rs::db::inventory::InventoryScope::Local)?;
             let record = db
                 .get(id)
                 .cloned()
                 .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
             let title = record.title.clone();
-            let is_frozen = frozen_list.contains_key(&id);
-
             let mut updated = record;
+            let mut frozen_state = false;
 
-            let should_freeze = if on {
-                true
-            } else if off {
-                false
-            } else {
-                !is_frozen
-            };
+            let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
+            let _ = narou_rs::db::inventory::update_locked_yaml_file::<
+                (),
+                std::collections::HashMap<i64, serde_yaml::Value>,
+                _,
+            >(&freeze_path, |mut frozen_list| {
+                    let is_frozen = frozen_list.contains_key(&id);
+                    let should_freeze = if on {
+                        true
+                    } else if off {
+                        false
+                    } else {
+                        !is_frozen
+                    };
 
-            if should_freeze {
-                if !is_frozen {
-                    updated.tags.push("frozen".to_string());
-                }
-                frozen_list.insert(id, serde_yaml::Value::Bool(true));
-                db.insert(updated);
-                db.inventory().save(
-                    "freeze",
-                    narou_rs::db::inventory::InventoryScope::Local,
-                    &frozen_list,
-                )?;
-                db.save()?;
-                Ok::<(String, bool), narou_rs::error::NarouError>((title, true))
-            } else {
-                if is_frozen {
-                    updated.tags.retain(|t| t != "frozen");
-                }
-                if updated.tags.contains(&"404".to_string()) {
-                    updated.tags.retain(|t| t != "404");
-                }
-                frozen_list.remove(&id);
-                db.insert(updated);
-                db.inventory().save(
-                    "freeze",
-                    narou_rs::db::inventory::InventoryScope::Local,
-                    &frozen_list,
-                )?;
-                db.save()?;
-                Ok::<(String, bool), narou_rs::error::NarouError>((title, false))
-            }
+                    if should_freeze {
+                        if !is_frozen {
+                            updated.tags.push("frozen".to_string());
+                        }
+                        frozen_list.insert(id, serde_yaml::Value::Bool(true));
+                    } else {
+                        if is_frozen {
+                            updated.tags.retain(|t| t != "frozen");
+                        }
+                        if updated.tags.contains(&"404".to_string()) {
+                            updated.tags.retain(|t| t != "404");
+                        }
+                        frozen_list.remove(&id);
+                    }
+
+                    frozen_state = should_freeze;
+                    db.insert(updated.clone());
+                    Ok((frozen_list, ()))
+            })?;
+            db.save()?;
+            Ok::<(String, bool), narou_rs::error::NarouError>((title, frozen_state))
         });
 
         match result {
@@ -1039,24 +1033,24 @@ pub fn freeze_by_target(target: &str) {
     let id = data.id;
 
     let result = db::with_database_mut(|db| {
-        let mut frozen_list: std::collections::HashMap<i64, serde_yaml::Value> = db
-            .inventory()
-            .load("freeze", narou_rs::db::inventory::InventoryScope::Local)?;
         let record = db
             .get(id)
             .cloned()
             .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
         let mut updated = record;
-        if !updated.tags.contains(&"frozen".to_string()) {
-            updated.tags.push("frozen".to_string());
-        }
-        frozen_list.insert(id, serde_yaml::Value::Bool(true));
-        db.insert(updated);
-        db.inventory().save(
-            "freeze",
-            narou_rs::db::inventory::InventoryScope::Local,
-            &frozen_list,
-        )?;
+        let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
+        let _ = narou_rs::db::inventory::update_locked_yaml_file::<
+            (),
+            std::collections::HashMap<i64, serde_yaml::Value>,
+            _,
+        >(&freeze_path, |mut frozen_list| {
+                if !updated.tags.contains(&"frozen".to_string()) {
+                    updated.tags.push("frozen".to_string());
+                }
+                frozen_list.insert(id, serde_yaml::Value::Bool(true));
+                db.insert(updated.clone());
+                Ok((frozen_list, ()))
+        })?;
         db.save()
     });
 
