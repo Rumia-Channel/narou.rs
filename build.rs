@@ -14,6 +14,14 @@ fn main() {
         }
     }
 
+    println!("cargo:rerun-if-env-changed=NAROU_RS_RELEASE_BUILD");
+    if let Ok(flag) = std::env::var("NAROU_RS_RELEASE_BUILD") {
+        let trimmed = flag.trim();
+        if matches!(trimmed, "1" | "true" | "TRUE" | "yes" | "YES") {
+            println!("cargo:rustc-env=NAROU_RS_RELEASE_BUILD=1");
+        }
+    }
+
     let asset_root = PathBuf::from("src").join("web").join("assets");
     println!("cargo:rerun-if-changed={}", asset_root.display());
 

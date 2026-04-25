@@ -61,7 +61,12 @@ pub fn aozoraepub3_jar_path() -> Option<PathBuf> {
     aozoraepub3_jar_next_to_exe()
 }
 
+pub const IS_RELEASE_BUILD: bool = option_env!("NAROU_RS_RELEASE_BUILD").is_some();
+
 pub fn commit_version_exists() -> bool {
+    if IS_RELEASE_BUILD {
+        return true;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
