@@ -3,12 +3,12 @@ mod setting_override;
 use std::path::Path;
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::converter_base::TextType;
 use super::settings::NovelSettings;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct UserConverter {
     #[serde(default)]
     pub title: String,
@@ -22,7 +22,7 @@ pub struct UserConverter {
     pub after_settings: Vec<SettingOverride>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReplaceRule {
     pub pattern: String,
     pub replacement: String,
@@ -38,7 +38,7 @@ pub struct ReplaceRule {
     pub multiline: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SettingOverride {
     pub key: String,
     pub value: serde_yaml::Value,
@@ -186,15 +186,10 @@ impl UserConverter {
     pub fn signature(&self) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(self.title.as_bytes());
-        for rule in &self.before {
-            hasher.update(rule.pattern.as_bytes());
-            hasher.update(rule.replacement.as_bytes());
-        }
-        for rule in &self.after {
-            hasher.update(rule.pattern.as_bytes());
-            hasher.update(rule.replacement.as_bytes());
-        }
+        hasher.update(
+            serde_json::to_vec(self)
+                .expect("user converter signature serialization should succeed"),
+        );
         hex::encode(hasher.finalize())
     }
 }

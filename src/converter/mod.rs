@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use settings::NovelSettings;
 use user_converter::UserConverter;
 
-use crate::downloader::{SectionElement, SectionFile, TocObject};
+use crate::downloader::{SectionElement, SectionFile, TocObject, SECTION_SAVE_DIR};
 use crate::db::inventory::InventoryScope;
 use crate::error::{NarouError, Result};
 use crate::progress::ProgressReporter;
@@ -46,6 +46,54 @@ struct CacheEntry {
     converted_section: render::ConvertedSection,
     #[serde(default)]
     use_dakuten_font: bool,
+}
+
+#[derive(Serialize)]
+struct CacheSettingsSignature<'a> {
+    enable_yokogaki: bool,
+    enable_inspect: bool,
+    enable_convert_num_to_kanji: bool,
+    enable_kanji_num_with_units: bool,
+    kanji_num_with_units_lower_digit_zero: i64,
+    enable_alphabet_force_zenkaku: bool,
+    disable_alphabet_word_to_zenkaku: bool,
+    enable_half_indent_bracket: bool,
+    enable_auto_indent: bool,
+    enable_force_indent: bool,
+    enable_auto_join_in_brackets: bool,
+    enable_auto_join_line: bool,
+    enable_enchant_midashi: bool,
+    enable_author_comments: bool,
+    enable_erase_introduction: bool,
+    enable_erase_postscript: bool,
+    enable_ruby: bool,
+    enable_illust: bool,
+    enable_transform_fraction: bool,
+    enable_transform_date: bool,
+    date_format: &'a str,
+    enable_convert_horizontal_ellipsis: bool,
+    enable_convert_page_break: bool,
+    to_page_break_threshold: i64,
+    enable_dakuten_font: bool,
+    enable_display_end_of_book: bool,
+    enable_add_date_to_title: bool,
+    title_date_format: &'a str,
+    title_date_align: &'a str,
+    title_date_target: &'a str,
+    enable_ruby_youon_to_big: bool,
+    enable_pack_blank_line: bool,
+    enable_kana_ni_to_kanji_ni: bool,
+    enable_insert_word_separator: bool,
+    enable_insert_char_separator: bool,
+    enable_strip_decoration_tag: bool,
+    enable_add_end_to_title: bool,
+    enable_prolonged_sound_mark_to_dash: bool,
+    cut_old_subtitles: i64,
+    slice_size: i64,
+    author_comment_style: &'a str,
+    novel_author: &'a str,
+    novel_title: &'a str,
+    output_filename: &'a str,
 }
 
 impl NovelConverter {
@@ -157,7 +205,7 @@ impl NovelConverter {
             } else {
                 section.element.clone()
             };
-            let digest = self.compute_digest(&resolved_element, &section.index);
+            let digest = self.compute_digest(section);
 
             if let Some(cached) = self.section_cache.get(&digest) {
                 converted_sections.push(cached.clone());
@@ -340,61 +388,105 @@ impl NovelConverter {
         }
     }
 
-    fn compute_digest(&self, section: &SectionElement, section_index: &str) -> String {
+    fn compute_digest(&self, section: &SectionFile) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(section.body.as_bytes());
-        hasher.update(section.introduction.as_bytes());
-        hasher.update(section.postscript.as_bytes());
-        hasher.update(section.data_type.as_bytes());
-        hasher.update(section_index.as_bytes());
+        hasher.update(Self::section_cache_relative_path(section).as_bytes());
+        hasher.update(
+            serde_json::to_vec(section).expect("section cache digest serialization should succeed"),
+        );
+        hasher.update(self.compute_conversion_context_signature().as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    fn compute_conversion_context_signature(&self) -> String {
+        let mut hasher = Sha256::new();
         hasher.update(self.compute_settings_signature().as_bytes());
-        if let Some(ref uc) = self.user_converter {
-            hasher.update(uc.signature().as_bytes());
-        }
+        hasher.update(self.compute_replace_signature().as_bytes());
+        hasher.update(self.compute_converter_signature().as_bytes());
         hex::encode(hasher.finalize())
     }
 
     fn compute_settings_signature(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(self.settings.enable_yokogaki.to_string().as_bytes());
+        let settings_signature = CacheSettingsSignature {
+            enable_yokogaki: self.settings.enable_yokogaki,
+            enable_inspect: self.settings.enable_inspect,
+            enable_convert_num_to_kanji: self.settings.enable_convert_num_to_kanji,
+            enable_kanji_num_with_units: self.settings.enable_kanji_num_with_units,
+            kanji_num_with_units_lower_digit_zero: self.settings.kanji_num_with_units_lower_digit_zero,
+            enable_alphabet_force_zenkaku: self.settings.enable_alphabet_force_zenkaku,
+            disable_alphabet_word_to_zenkaku: self.settings.disable_alphabet_word_to_zenkaku,
+            enable_half_indent_bracket: self.settings.enable_half_indent_bracket,
+            enable_auto_indent: self.settings.enable_auto_indent,
+            enable_force_indent: self.settings.enable_force_indent,
+            enable_auto_join_in_brackets: self.settings.enable_auto_join_in_brackets,
+            enable_auto_join_line: self.settings.enable_auto_join_line,
+            enable_enchant_midashi: self.settings.enable_enchant_midashi,
+            enable_author_comments: self.settings.enable_author_comments,
+            enable_erase_introduction: self.settings.enable_erase_introduction,
+            enable_erase_postscript: self.settings.enable_erase_postscript,
+            enable_ruby: self.settings.enable_ruby,
+            enable_illust: self.settings.enable_illust,
+            enable_transform_fraction: self.settings.enable_transform_fraction,
+            enable_transform_date: self.settings.enable_transform_date,
+            date_format: &self.settings.date_format,
+            enable_convert_horizontal_ellipsis: self.settings.enable_convert_horizontal_ellipsis,
+            enable_convert_page_break: self.settings.enable_convert_page_break,
+            to_page_break_threshold: self.settings.to_page_break_threshold,
+            enable_dakuten_font: self.settings.enable_dakuten_font,
+            enable_display_end_of_book: self.settings.enable_display_end_of_book,
+            enable_add_date_to_title: self.settings.enable_add_date_to_title,
+            title_date_format: &self.settings.title_date_format,
+            title_date_align: &self.settings.title_date_align,
+            title_date_target: &self.settings.title_date_target,
+            enable_ruby_youon_to_big: self.settings.enable_ruby_youon_to_big,
+            enable_pack_blank_line: self.settings.enable_pack_blank_line,
+            enable_kana_ni_to_kanji_ni: self.settings.enable_kana_ni_to_kanji_ni,
+            enable_insert_word_separator: self.settings.enable_insert_word_separator,
+            enable_insert_char_separator: self.settings.enable_insert_char_separator,
+            enable_strip_decoration_tag: self.settings.enable_strip_decoration_tag,
+            enable_add_end_to_title: self.settings.enable_add_end_to_title,
+            enable_prolonged_sound_mark_to_dash: self.settings.enable_prolonged_sound_mark_to_dash,
+            cut_old_subtitles: self.settings.cut_old_subtitles,
+            slice_size: self.settings.slice_size,
+            author_comment_style: &self.settings.author_comment_style,
+            novel_author: &self.settings.novel_author,
+            novel_title: &self.settings.novel_title,
+            output_filename: &self.settings.output_filename,
+        };
         hasher.update(
-            self.settings
-                .enable_convert_num_to_kanji
-                .to_string()
-                .as_bytes(),
+            serde_json::to_vec(&settings_signature)
+            .expect("settings signature serialization should succeed"),
         );
-        hasher.update(self.settings.enable_auto_indent.to_string().as_bytes());
-        hasher.update(
-            self.settings
-                .enable_erase_introduction
-                .to_string()
-                .as_bytes(),
-        );
-        hasher.update(self.settings.enable_erase_postscript.to_string().as_bytes());
-        hasher.update(self.settings.enable_ruby.to_string().as_bytes());
-        hasher.update(
-            self.settings
-                .enable_convert_horizontal_ellipsis
-                .to_string()
-                .as_bytes(),
-        );
-        hasher.update(self.settings.date_format.as_bytes());
-        hasher.update(self.settings.enable_pack_blank_line.to_string().as_bytes());
-        hasher.update(
-            self.settings
-                .enable_auto_join_in_brackets
-                .to_string()
-                .as_bytes(),
-        );
-        hasher.update(self.settings.enable_auto_join_line.to_string().as_bytes());
-        hasher.update(
-            self.settings
-                .enable_half_indent_bracket
-                .to_string()
-                .as_bytes(),
-        );
-        hasher.update(self.settings.author_comment_style.as_bytes());
         hex::encode(hasher.finalize())
+    }
+
+    fn compute_replace_signature(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(
+            serde_json::to_vec(&self.settings.replace_patterns)
+                .expect("replace signature serialization should succeed"),
+        );
+        hex::encode(hasher.finalize())
+    }
+
+    fn compute_converter_signature(&self) -> String {
+        if let Some(ref uc) = self.user_converter {
+            uc.signature()
+        } else {
+            let mut hasher = Sha256::new();
+            hasher.update(b"blank");
+            hex::encode(hasher.finalize())
+        }
+    }
+
+    fn section_cache_relative_path(section: &SectionFile) -> String {
+        format!(
+            "{}\\{} {}.yaml",
+            SECTION_SAVE_DIR,
+            section.index,
+            crate::downloader::util::sanitize_filename(&section.file_subtitle)
+        )
     }
 
     fn resolve_section_html_illustrations(
@@ -941,7 +1033,7 @@ mod tests {
         illustration_extension_from_content_type, normalize_illustration_url,
     };
     use crate::{
-        converter::settings::NovelSettings,
+        converter::{settings::NovelSettings, user_converter::UserConverter},
         downloader::{SectionElement, SectionFile, TocObject},
     };
 
@@ -972,6 +1064,26 @@ mod tests {
                 postscript: String::new(),
                 body: r#"<p>前</p><p><a href="//29644.mitemin.net/i422674/" target="_blank"><img src="//29644.mitemin.net/userpageimage/viewimagebig/icode/i422674/" alt="挿絵(By みてみん)" border="0" /></a></p><p>後</p>"#
                     .to_string(),
+            },
+        }
+    }
+
+    fn make_digest_test_section() -> SectionFile {
+        SectionFile {
+            index: "1".to_string(),
+            href: "1 第一話.html".to_string(),
+            chapter: "第一章".to_string(),
+            subchapter: "その1".to_string(),
+            subtitle: "第一話".to_string(),
+            file_subtitle: "第一話".to_string(),
+            subdate: "2024-01-01 00:00:00".to_string(),
+            subupdate: Some("2024-01-02 00:00:00".to_string()),
+            download_time: Some("2024-01-03 00:00:00 +0900".to_string()),
+            element: SectionElement {
+                data_type: "text".to_string(),
+                introduction: "前書き".to_string(),
+                postscript: "後書き".to_string(),
+                body: "本文".to_string(),
             },
         }
     }
@@ -1058,5 +1170,77 @@ mod tests {
         assert!(saved_log.contains("改行直後の見出し付与は有効になっていません"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn section_cache_digest_changes_when_section_metadata_changes() {
+        let converter = NovelConverter::new(NovelSettings::default());
+        let section = make_digest_test_section();
+        let original = converter.compute_digest(&section);
+
+        let mut subtitle_changed = section.clone();
+        subtitle_changed.subtitle = "改題".to_string();
+        assert_ne!(original, converter.compute_digest(&subtitle_changed));
+
+        let mut chapter_changed = section.clone();
+        chapter_changed.chapter = "第二章".to_string();
+        assert_ne!(original, converter.compute_digest(&chapter_changed));
+
+        let mut subchapter_changed = section.clone();
+        subchapter_changed.subchapter = "その2".to_string();
+        assert_ne!(original, converter.compute_digest(&subchapter_changed));
+    }
+
+    #[test]
+    fn section_cache_digest_changes_when_conversion_context_changes() {
+        let section = make_digest_test_section();
+
+        let baseline = NovelConverter::new(NovelSettings::default()).compute_digest(&section);
+
+        let mut settings_changed = NovelSettings::default();
+        settings_changed.enable_strip_decoration_tag = true;
+        let settings_digest = NovelConverter::new(settings_changed).compute_digest(&section);
+        assert_ne!(baseline, settings_digest);
+
+        let mut replace_changed = NovelSettings::default();
+        replace_changed.replace_patterns = vec![("本文".to_string(), "置換本文".to_string())];
+        let replace_digest = NovelConverter::new(replace_changed).compute_digest(&section);
+        assert_ne!(baseline, replace_digest);
+
+        let user_converter: UserConverter = serde_yaml::from_str(
+            r#"
+title: テスト
+before:
+  - pattern: 本文
+    replacement: 変換本文
+    prepend_blank: true
+before_settings:
+  - key: enable_auto_indent
+    value: false
+"#,
+        )
+        .unwrap();
+        let user_converter_digest =
+            NovelConverter::with_user_converter(NovelSettings::default(), user_converter)
+                .compute_digest(&section);
+        assert_ne!(baseline, user_converter_digest);
+
+        let user_converter_variant: UserConverter = serde_yaml::from_str(
+            r#"
+title: テスト
+before:
+  - pattern: 本文
+    replacement: 変換本文
+    prepend_blank: false
+before_settings:
+  - key: enable_auto_indent
+    value: true
+"#,
+        )
+        .unwrap();
+        let user_converter_variant_digest =
+            NovelConverter::with_user_converter(NovelSettings::default(), user_converter_variant)
+                .compute_digest(&section);
+        assert_ne!(user_converter_digest, user_converter_variant_digest);
     }
 }
