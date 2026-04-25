@@ -560,6 +560,7 @@ impl NovelConverter {
             .with_verbose(verbose)
             .with_no_strip(no_strip)
             .with_use_dakuten_font(self.use_dakuten_font)
+            .with_yokogaki(self.settings.enable_yokogaki)
             .convert_file(
                 &txt_path,
                 &self.settings.archive_path,
@@ -642,7 +643,8 @@ impl NovelConverter {
         let output_manager = device::OutputManager::new(device)
             .with_verbose(verbose)
             .with_no_strip(no_strip)
-            .with_use_dakuten_font(self.use_dakuten_font);
+            .with_use_dakuten_font(self.use_dakuten_font)
+            .with_yokogaki(self.settings.enable_yokogaki);
         let base_name = txt_path
             .file_stem()
             .and_then(|stem| stem.to_str())

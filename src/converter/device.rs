@@ -1,7 +1,9 @@
+use std::ffi::OsString;
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::SystemTime;
 
 use regex::Regex;
 use zip::write::SimpleFileOptions;
@@ -131,6 +133,7 @@ pub struct OutputManager {
     verbose: bool,
     no_strip: bool,
     use_dakuten_font: bool,
+    yokogaki: bool,
 }
 
 fn file_contains_dakuten_chuki(path: &Path) -> bool {
@@ -149,6 +152,7 @@ impl OutputManager {
             verbose: false,
             no_strip: false,
             use_dakuten_font: false,
+            yokogaki: false,
         }
     }
 
@@ -164,6 +168,11 @@ impl OutputManager {
 
     pub fn with_use_dakuten_font(mut self, use_dakuten_font: bool) -> Self {
         self.use_dakuten_font = use_dakuten_font;
+        self
+    }
+
+    pub fn with_yokogaki(mut self, yokogaki: bool) -> Self {
+        self.yokogaki = yokogaki;
         self
     }
 
@@ -274,6 +283,58 @@ impl OutputManager {
         canonicalize_aozoraepub3_jar_dir(&dir)
     }
 
+    fn aozora_device_name(&self) -> Option<&'static str> {
+        match self.device {
+            Device::Mobi => Some("kindle"),
+            _ => None,
+        }
+    }
+
+    fn aozora_ext_option<'a>(&self, output_ext: &'a str) -> Option<&'a str> {
+        match self.device {
+            Device::Kobo => Some(output_ext),
+            _ => None,
+        }
+    }
+
+    fn build_aozora_epub3_args(
+        &self,
+        input_txt: &Path,
+        output_dir: &Path,
+        output_ext: &str,
+    ) -> Vec<OsString> {
+        let mut args = vec![
+            OsString::from("-enc"),
+            OsString::from("UTF-8"),
+            OsString::from("-of"),
+        ];
+
+        if let Some(device_name) = self.aozora_device_name() {
+            args.push(OsString::from("-device"));
+            args.push(OsString::from(device_name));
+        }
+
+        if input_txt.parent().is_some_and(has_cover_image) {
+            args.push(OsString::from("-c"));
+            args.push(OsString::from("0"));
+        }
+
+        args.push(OsString::from("-dst"));
+        args.push(absolutize_path(output_dir).into_os_string());
+
+        if let Some(ext_option) = self.aozora_ext_option(output_ext) {
+            args.push(OsString::from("-ext"));
+            args.push(OsString::from(ext_option));
+        }
+
+        if self.yokogaki {
+            args.push(OsString::from("-hor"));
+        }
+
+        args.push(absolutize_path(input_txt).into_os_string());
+        args
+    }
+
     fn build_aozora_command(&self) -> Result<(Command, PathBuf)> {
         let tool_path = normalize_windows_verbatim_path(
             self.aozora_epub3_path
@@ -332,24 +393,27 @@ impl OutputManager {
             .and_then(|stem| stem.to_str())
             .ok_or_else(|| NarouError::Conversion("Invalid input filename".into()))?;
         let output_path = output_dir.join(format!("{}{}", base_name, output_ext));
+        let actual_output_path = absolutize_path(&output_path);
 
-        // narou.rb と同一の引数順序で AozoraEpub3 を呼び出す。
-        // Ruby: -enc UTF-8 -of <device_option> <cover_option> <dst_option> <ext_option> <yokogaki_option> <file>
-        // Rust は <device_option> と <yokogaki_option> を未実装なので、互換性のある最小形式で対応:
-        // -enc UTF-8 -of <dst_option> <ext_option> <file>
-        cmd.arg("-enc").arg("UTF-8");
-        cmd.arg("-of");
-        // dst_option: -dst <output_dir>
-        cmd.arg("-dst").arg(output_dir);
-        // ext_option: -ext <ext>
-        cmd.arg("-ext").arg(output_ext);
-        // input file (最後に指定)
-        cmd.arg(input_txt);
+        if actual_output_path.exists() {
+            std::fs::remove_file(&actual_output_path).map_err(|e| {
+                NarouError::Conversion(format!(
+                    "Failed to remove existing output file {}: {}",
+                    output_path.display(),
+                    e
+                ))
+            })?;
+        }
+
+        for arg in self.build_aozora_epub3_args(input_txt, output_dir, output_ext) {
+            cmd.arg(arg);
+        }
         if !self.verbose {
             cmd.stdout(Stdio::null());
             cmd.stderr(Stdio::null());
         }
 
+        let started_at = SystemTime::now();
         let mut child = cmd
             .spawn()
             .map_err(|e| NarouError::Conversion(format!("Failed to run AozoraEpub3: {}", e)))?;
@@ -385,9 +449,16 @@ impl OutputManager {
             )));
         }
 
-        if !output_path.exists() {
+        if !actual_output_path.exists() {
             return Err(NarouError::Conversion(format!(
                 "AozoraEpub3 did not create expected output: {}",
+                output_path.display()
+            )));
+        }
+
+        if !aozora_output_looks_generated(&actual_output_path, started_at)? {
+            return Err(NarouError::Conversion(format!(
+                "AozoraEpub3 did not update expected output: {}",
                 output_path.display()
             )));
         }
@@ -883,6 +954,32 @@ fn normalize_windows_verbatim_path(path: &Path) -> PathBuf {
     }
 }
 
+fn absolutize_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return normalize_windows_verbatim_path(path);
+    }
+
+    match std::env::current_dir() {
+        Ok(cwd) => normalize_windows_verbatim_path(&cwd.join(path)),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+fn has_cover_image(dir: &Path) -> bool {
+    [".jpg", ".png", ".jpeg"]
+        .iter()
+        .any(|ext| dir.join(format!("cover{}", ext)).is_file())
+}
+
+fn aozora_output_looks_generated(output_path: &Path, started_at: SystemTime) -> Result<bool> {
+    let metadata = std::fs::metadata(output_path)?;
+    let modified_is_newer = metadata
+        .modified()
+        .map(|modified| modified > started_at)
+        .unwrap_or(false);
+    Ok(modified_is_newer || metadata.len() > 0)
+}
+
 fn decode_ibunko_html_entities(text: &str) -> String {
     let mut data = text
         .replace("&quot;", "\"")
@@ -969,12 +1066,49 @@ fn find_unix_volume_root(volume_name: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        Device, StripError, decode_ibunko_html_entities, normalize_windows_verbatim_path,
-        strip_mobi_sources,
+        Device, OutputManager, StripError, absolutize_path, decode_ibunko_html_entities,
+        normalize_windows_verbatim_path, strip_mobi_sources,
     };
+
+    fn test_output_manager(device: Device) -> OutputManager {
+        OutputManager {
+            device,
+            aozora_epub3_path: None,
+            kindlegen_path: None,
+            verbose: false,
+            no_strip: false,
+            use_dakuten_font: false,
+            yokogaki: false,
+        }
+    }
+
+    fn create_test_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-artifacts")
+            .join("converter-device")
+            .join(format!("{name}-{unique}"));
+        if dir.exists() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn stringify_args(args: Vec<std::ffi::OsString>) -> Vec<String> {
+        args.into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
 
     #[test]
     fn kobo_matches_kepub_output_suffix() {
@@ -994,6 +1128,40 @@ mod tests {
     fn decode_ibunko_html_entities_decodes_ampersand_last() {
         assert_eq!(decode_ibunko_html_entities("&amp;lt;"), "&lt;");
         assert_eq!(decode_ibunko_html_entities("&lt;tag&gt;"), "<tag>");
+    }
+
+    #[test]
+    fn kindle_aozora_args_match_ruby_flags() {
+        let dir = create_test_dir("kindle-args");
+        let input = dir.join("novel.txt");
+        fs::write(&input, "test").unwrap();
+        fs::write(dir.join("cover.jpg"), b"cover").unwrap();
+
+        let manager = test_output_manager(Device::Mobi).with_yokogaki(true);
+        let args = stringify_args(manager.build_aozora_epub3_args(&input, &dir, ".epub"));
+
+        assert_eq!(args[0], "-enc");
+        assert_eq!(args[1], "UTF-8");
+        assert_eq!(args[2], "-of");
+        assert!(args.windows(2).any(|pair| pair == ["-device", "kindle"]));
+        assert!(args.windows(2).any(|pair| pair == ["-c", "0"]));
+        assert!(args.contains(&"-hor".to_string()));
+        assert!(!args.contains(&"-ext".to_string()));
+        assert_eq!(PathBuf::from(args.last().unwrap()), absolutize_path(&input));
+    }
+
+    #[test]
+    fn kobo_aozora_args_use_kepub_extension_only() {
+        let dir = create_test_dir("kobo-args");
+        let input = dir.join("novel.txt");
+        fs::write(&input, "test").unwrap();
+
+        let manager = test_output_manager(Device::Kobo);
+        let args = stringify_args(manager.build_aozora_epub3_args(&input, &dir, ".kepub.epub"));
+
+        assert!(args.windows(2).any(|pair| pair == ["-ext", ".kepub.epub"]));
+        assert!(!args.contains(&"-device".to_string()));
+        assert!(!args.contains(&"-hor".to_string()));
     }
 
     #[test]
