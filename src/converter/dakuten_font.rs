@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::compat::load_global_setting_value;
-use crate::error::Result;
+use crate::error::{NarouError, Result};
 
 const DAKUTEN_CSS_NAME: &str = "vertical_font_with_dakuten.css";
 const NORMAL_CSS_NAME: &str = "vertical_font.css";
@@ -66,6 +66,68 @@ fn dst_font(aozora_dir: &Path) -> PathBuf {
         .join(DAKUTEN_FONT_NAME)
 }
 
+fn restore_normal_css(aozora_dir: &Path) -> Result<()> {
+    let preset = preset_dir()?;
+    let src_normal_css = preset.join(NORMAL_CSS_NAME);
+
+    let dst_css_path = dst_css(aozora_dir);
+    if let Some(parent) = dst_css_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let css_text = std::fs::read_to_string(&src_normal_css)?
+        .replace("<%= line_height %>", &format_line_height(current_line_height()));
+    std::fs::write(&dst_css_path, css_text)?;
+    Ok(())
+}
+
+fn remove_dakuten_font(aozora_dir: &Path) -> Result<()> {
+    let dst_font_path = dst_font(aozora_dir);
+    if dst_font_path.exists() {
+        std::fs::remove_file(&dst_font_path)?;
+    }
+    Ok(())
+}
+
+fn cleanup_errors(aozora_dir: &Path) -> (Option<NarouError>, Option<NarouError>) {
+    (
+        restore_normal_css(aozora_dir).err(),
+        remove_dakuten_font(aozora_dir).err(),
+    )
+}
+
+fn warn_cleanup_errors(aozora_dir: &Path, css_error: Option<&NarouError>, font_error: Option<&NarouError>) {
+    if let Some(err) = css_error {
+        tracing::warn!(
+            path = %dst_css(aozora_dir).display(),
+            error = %err,
+            "failed to restore dakuten font CSS"
+        );
+    }
+    if let Some(err) = font_error {
+        tracing::warn!(
+            path = %dst_font(aozora_dir).display(),
+            error = %err,
+            "failed to remove dakuten font file"
+        );
+    }
+}
+
+fn combine_cleanup_errors(
+    css_error: Option<NarouError>,
+    font_error: Option<NarouError>,
+) -> Result<()> {
+    match (css_error, font_error) {
+        (None, None) => Ok(()),
+        (Some(err), None) | (None, Some(err)) => Err(err),
+        (Some(css_err), Some(font_err)) => Err(std::io::Error::other(format!(
+            "dakuten font cleanup failed: css restore error: {}; font removal error: {}",
+            css_err, font_err
+        ))
+        .into()),
+    }
+}
+
 fn current_line_height() -> f64 {
     load_global_setting_value("line-height")
         .and_then(|v| match v {
@@ -101,23 +163,9 @@ pub fn activate(aozora_dir: &Path) -> Result<()> {
 
 /// 通常 vertical_font.css を再書き込みし、DMincho.ttf を削除する。
 pub fn inactivate(aozora_dir: &Path) -> Result<()> {
-    let preset = preset_dir()?;
-    let src_normal_css = preset.join(NORMAL_CSS_NAME);
-
-    let dst_css_path = dst_css(aozora_dir);
-    if let Some(parent) = dst_css_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let css_text = std::fs::read_to_string(&src_normal_css)?
-        .replace("<%= line_height %>", &format_line_height(current_line_height()));
-    std::fs::write(&dst_css_path, css_text)?;
-
-    let dst_font_path = dst_font(aozora_dir);
-    if dst_font_path.exists() {
-        let _ = std::fs::remove_file(&dst_font_path);
-    }
-    Ok(())
+    let (css_error, font_error) = cleanup_errors(aozora_dir);
+    warn_cleanup_errors(aozora_dir, css_error.as_ref(), font_error.as_ref());
+    combine_cleanup_errors(css_error, font_error)
 }
 
 /// activate を呼び出し、Drop で必ず inactivate する RAII ガード。
@@ -139,7 +187,8 @@ impl DakutenFontGuard {
 impl Drop for DakutenFontGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = inactivate(&self.aozora_dir);
+            let (css_error, font_error) = cleanup_errors(&self.aozora_dir);
+            warn_cleanup_errors(&self.aozora_dir, css_error.as_ref(), font_error.as_ref());
         }
     }
 }
@@ -148,6 +197,41 @@ impl Drop for DakutenFontGuard {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{self, Write};
+    use std::panic;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct SharedWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_warnings<F: FnOnce()>(f: F) -> String {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = SharedWriter {
+            buffer: buffer.clone(),
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
 
     #[test]
     fn activate_writes_dakuten_css_and_font() {
@@ -191,5 +275,54 @@ mod tests {
             assert!(dst_font(aozora_dir).exists());
         }
         assert!(!dst_font(aozora_dir).exists());
+    }
+
+    #[test]
+    fn inactivate_warns_for_css_and_font_cleanup_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let aozora_dir = tmp.path();
+        activate(aozora_dir).unwrap();
+
+        let css_dir = dst_css(aozora_dir).parent().unwrap().to_path_buf();
+        fs::remove_dir_all(&css_dir).unwrap();
+        fs::write(&css_dir, "not a directory").unwrap();
+
+        let font_path = dst_font(aozora_dir);
+        fs::remove_file(&font_path).unwrap();
+        fs::create_dir(&font_path).unwrap();
+
+        let output = capture_warnings(|| {
+            let err = inactivate(aozora_dir).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("css restore error"));
+            assert!(message.contains("font removal error"));
+        });
+
+        assert!(output.contains("failed to restore dakuten font CSS"));
+        assert!(output.contains("failed to remove dakuten font file"));
+    }
+
+    #[test]
+    fn drop_warns_on_cleanup_failures_without_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let aozora_dir = tmp.path().to_path_buf();
+
+        let output = capture_warnings(|| {
+            let result = panic::catch_unwind(|| {
+                let _guard = DakutenFontGuard::activate(&aozora_dir).unwrap();
+
+                let css_dir = dst_css(&aozora_dir).parent().unwrap().to_path_buf();
+                fs::remove_dir_all(&css_dir).unwrap();
+                fs::write(&css_dir, "not a directory").unwrap();
+
+                let font_path = dst_font(&aozora_dir);
+                fs::remove_file(&font_path).unwrap();
+                fs::create_dir(&font_path).unwrap();
+            });
+            assert!(result.is_ok(), "Drop must not panic on cleanup failure");
+        });
+
+        assert!(output.contains("failed to restore dakuten font CSS"));
+        assert!(output.contains("failed to remove dakuten font file"));
     }
 }
