@@ -1251,12 +1251,12 @@ fn update_general_lastup_narou(
             let ncodes: Vec<&str> = chunk.iter().map(|(_, nc)| nc.as_str()).collect();
             let ncode_param = ncodes.join("-");
 
-            fetcher.rate_limiter.wait();
             let url = format!(
                 "{}?of=n-nu-gl-l&out=json&ncode={}",
                 api_url, ncode_param
             );
 
+            fetcher.rate_limiter.wait_for_url(&url);
             let response = match fetcher.client.get(&url).send() {
                 Ok(r) => r,
                 Err(_) => {

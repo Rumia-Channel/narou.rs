@@ -941,7 +941,7 @@ impl Downloader {
                         continue;
                     }
 
-                    self.fetcher.rate_limiter.wait();
+                    self.fetcher.rate_limiter.wait_for_url(url);
                     match self.fetcher.fetch_bytes(url, None) {
                         Ok(bytes) => {
                             let _ = std::fs::write(&save_path, &bytes);

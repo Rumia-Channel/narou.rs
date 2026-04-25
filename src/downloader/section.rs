@@ -43,8 +43,8 @@ pub fn download_section(
         return Ok((cached.clone(), String::new()));
     }
 
-    fetcher.rate_limiter.wait();
     let url = build_section_url(setting, toc_url, &subtitle.href);
+    fetcher.rate_limiter.wait_for_url(&url);
 
     let html_source = fetcher.fetch_text(&url, setting.cookie(), Some(setting.encoding()))?;
     let mut html_source = html_source;

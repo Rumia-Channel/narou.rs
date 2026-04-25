@@ -17,7 +17,7 @@ pub fn fetch_toc(
     setting: &SiteSetting,
     toc_url: &str,
 ) -> Result<String> {
-    fetcher.rate_limiter.wait();
+    fetcher.rate_limiter.wait_for_url(toc_url);
 
     let body = fetcher.fetch_text(toc_url, setting.cookie(), Some(setting.encoding()))?;
     let mut body = body;

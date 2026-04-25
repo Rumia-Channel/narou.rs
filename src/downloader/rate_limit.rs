@@ -1,18 +1,26 @@
+use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
 const DEFAULT_INTERVAL_SECS: f64 = 0.7;
 const STEPS_WAIT_TIME: Duration = Duration::from_secs(5);
+const GLOBAL_HOST_KEY: &str = "__global__";
 
-static STATE: Mutex<RateLimitState> = parking_lot::const_mutex(RateLimitState {
-    counter: 0,
-    last_download: None,
-});
+static STATE: LazyLock<Mutex<RateLimitState>> =
+    LazyLock::new(|| Mutex::new(RateLimitState::default()));
 
+#[derive(Default)]
 struct RateLimitState {
+    hosts: HashMap<String, HostRateLimitState>,
+}
+
+#[derive(Default)]
+struct HostRateLimitState {
     counter: u32,
     last_download: Option<Instant>,
+    next_allowed: Option<Instant>,
 }
 
 pub struct RateLimiter {
@@ -38,28 +46,73 @@ impl RateLimiter {
     }
 
     pub fn wait(&self) {
-        let mut state = STATE.lock();
-        let now = Instant::now();
+        self.wait_for_host(GLOBAL_HOST_KEY);
+    }
 
-        if let Some(last) = state.last_download {
-            let elapsed = now.duration_since(last);
-            if elapsed > self.max_steps_wait_time {
-                state.counter = 0;
+    pub fn wait_for_url(&self, url: &str) {
+        self.wait_for_host(&host_key_from_url(url));
+    }
+
+    pub async fn wait_async_for_url(&self, url: &str) {
+        let duration = self.reserve_wait_duration(&host_key_from_url(url));
+        if !duration.is_zero() {
+            tokio::time::sleep(duration).await;
+        }
+    }
+
+    fn wait_for_host(&self, host: &str) {
+        let duration = self.reserve_wait_duration(host);
+        if !duration.is_zero() {
+            std::thread::sleep(duration);
+        }
+    }
+
+    fn reserve_wait_duration(&self, host: &str) -> Duration {
+        let now = Instant::now();
+        let mut state = STATE.lock();
+        let host_state = state.hosts.entry(host.to_string()).or_default();
+
+        let no_pending_slot = host_state
+            .next_allowed
+            .map(|next_allowed| now >= next_allowed)
+            .unwrap_or(true);
+        if let Some(last_download) = host_state.last_download {
+            let elapsed = now.checked_duration_since(last_download).unwrap_or_default();
+            if elapsed > self.max_steps_wait_time && no_pending_slot {
+                host_state.counter = 0;
+                host_state.last_download = None;
+                host_state.next_allowed = None;
             }
         }
 
-        if self.wait_steps > 0
-            && state.counter % self.wait_steps == 0
-            && state.counter >= self.wait_steps
-        {
-            std::thread::sleep(self.max_steps_wait_time);
-        } else if state.counter > 0 {
-            std::thread::sleep(self.interval);
-        }
+        let allowed_at = host_state
+            .next_allowed
+            .map(|next_allowed| next_allowed.max(now))
+            .unwrap_or(now);
 
-        state.counter += 1;
-        state.last_download = Some(Instant::now());
+        host_state.counter += 1;
+        host_state.last_download = Some(allowed_at);
+        host_state.next_allowed = Some(allowed_at + self.delay_after_request(host_state.counter));
+
+        allowed_at.checked_duration_since(now).unwrap_or_default()
     }
+
+    fn delay_after_request(&self, counter: u32) -> Duration {
+        if self.wait_steps > 0 && counter % self.wait_steps == 0 && counter >= self.wait_steps {
+            self.max_steps_wait_time
+        } else if counter > 0 {
+            self.interval
+        } else {
+            Duration::ZERO
+        }
+    }
+}
+
+fn host_key_from_url(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+        .unwrap_or_else(|| GLOBAL_HOST_KEY.to_string())
 }
 
 fn load_interval_secs() -> f64 {
@@ -99,7 +152,19 @@ fn normalize_wait_steps(raw_wait_steps: i64, is_narou: bool) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_INTERVAL_SECS, RateLimiter, normalize_wait_steps};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use parking_lot::Mutex;
+
+    use super::{DEFAULT_INTERVAL_SECS, RateLimiter, STATE, normalize_wait_steps};
+
+    static TEST_MUTEX: Mutex<()> = parking_lot::const_mutex(());
+
+    fn reset_state() {
+        STATE.lock().hosts.clear();
+    }
 
     #[test]
     fn narou_wait_steps_defaults_to_ten() {
@@ -133,5 +198,72 @@ mod tests {
         let limiter = RateLimiter::from_values(DEFAULT_INTERVAL_SECS, 0);
         assert_eq!(limiter.interval, std::time::Duration::from_millis(700));
         assert_eq!(limiter.max_steps_wait_time, std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn same_host_requests_keep_their_reserved_order() {
+        let _guard = TEST_MUTEX.lock();
+        reset_state();
+
+        let limiter = Arc::new(RateLimiter::from_values(0.08, 0));
+        limiter.wait_for_host("same.example");
+
+        let started = Instant::now();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+
+        for _ in 0..2 {
+            let limiter = Arc::clone(&limiter);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                limiter.wait_for_host("same.example");
+                started.elapsed()
+            }));
+        }
+
+        barrier.wait();
+
+        let mut elapsed = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker should finish"))
+            .collect::<Vec<_>>();
+        elapsed.sort();
+
+        assert!(elapsed[0] >= Duration::from_millis(60), "first wait was {:?}", elapsed[0]);
+        assert!(elapsed[1] >= Duration::from_millis(140), "second wait was {:?}", elapsed[1]);
+
+        reset_state();
+    }
+
+    #[test]
+    fn different_hosts_do_not_block_each_other() {
+        let _guard = TEST_MUTEX.lock();
+        reset_state();
+
+        let limiter = Arc::new(RateLimiter::from_values(0.08, 0));
+        limiter.wait_for_host("alpha.example");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let sleeping_worker = {
+            let limiter = Arc::clone(&limiter);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                limiter.wait_for_host("alpha.example");
+            })
+        };
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(10));
+
+        let started = Instant::now();
+        limiter.wait_for_host("beta.example");
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < Duration::from_millis(40), "different host waited {:?}", elapsed);
+
+        sleeping_worker.join().expect("worker should finish");
+        reset_state();
     }
 }

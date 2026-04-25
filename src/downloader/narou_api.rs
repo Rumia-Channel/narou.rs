@@ -51,12 +51,12 @@ pub fn narou_api_batch_update(fetcher: &mut HttpFetcher) -> Result<(usize, usize
         let ncodes: Vec<&str> = chunk.iter().map(|(_, nc)| nc.as_str()).collect();
         let ncode_param = ncodes.join("-");
 
-        fetcher.rate_limiter.wait();
         let url = format!(
             "{}?of=n-t-nt-ga-gf-nu-gl-l-w-s-e&out=json&ncode={}",
             api_url, ncode_param
         );
 
+        fetcher.rate_limiter.wait_for_url(&url);
         let response = match fetcher.client.get(&url).send() {
             Ok(r) => r,
             Err(_e) => {
