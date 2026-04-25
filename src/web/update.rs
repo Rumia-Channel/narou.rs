@@ -341,9 +341,9 @@ fn validate_zip(path: &Path) -> Result<(), String> {
         "narou/narou_rs"
     };
     let updater_with_ext = if cfg!(windows) {
-        "narou/narou_rs_updater.exe"
+        "narou/narou_rs_updater.exe.new"
     } else {
-        "narou/narou_rs_updater"
+        "narou/narou_rs_updater.new"
     };
     let mut has_exe = false;
     let mut has_updater = false;
@@ -453,7 +453,7 @@ mod tests {
         let mut writer = zip::ZipWriter::new(file);
         let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
         let main_name = if cfg!(windows) { "narou/narou_rs.exe" } else { "narou/narou_rs" };
-        let upd_name = if cfg!(windows) { "narou/narou_rs_updater.exe" } else { "narou/narou_rs_updater" };
+        let upd_name = if cfg!(windows) { "narou/narou_rs_updater.exe.new" } else { "narou/narou_rs_updater.new" };
         writer.start_file(main_name, opts).unwrap();
         writer.write_all(b"main").unwrap();
         writer.start_file(upd_name, opts).unwrap();
@@ -473,6 +473,24 @@ mod tests {
         let main_name = if cfg!(windows) { "narou/narou_rs.exe" } else { "narou/narou_rs" };
         writer.start_file(main_name, opts).unwrap();
         writer.write_all(b"main").unwrap();
+        writer.finish().unwrap();
+        assert!(validate_zip(&zip_path).is_err());
+    }
+
+    #[test]
+    fn validate_zip_fails_when_old_style_updater_present() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("rel.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+        let main_name = if cfg!(windows) { "narou/narou_rs.exe" } else { "narou/narou_rs" };
+        let old_upd = if cfg!(windows) { "narou/narou_rs_updater.exe" } else { "narou/narou_rs_updater" };
+        writer.start_file(main_name, opts).unwrap();
+        writer.write_all(b"main").unwrap();
+        writer.start_file(old_upd, opts).unwrap();
+        writer.write_all(b"updater").unwrap();
         writer.finish().unwrap();
         assert!(validate_zip(&zip_path).is_err());
     }

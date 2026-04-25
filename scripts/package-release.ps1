@@ -126,10 +126,15 @@ try {
         -SourcePath $resolvedBinary `
         -EntryPath (Join-Path -Path $PackageRoot -ChildPath ([System.IO.Path]::GetFileName($resolvedBinary)))
 
+    # Updater は本体プロセス起動中に自分自身を上書きできないので、
+    # 必ず ".new" 拡張子付きで同梱する。新本体の起動時に
+    # コンパイル時埋込みハッシュと比較して通常名へ昇格する。
+    $updaterFileName = [System.IO.Path]::GetFileName($resolvedUpdaterBinary)
+    $updaterEntryName = "{0}.new" -f $updaterFileName
     Add-FileToArchive `
         -Archive $archive `
         -SourcePath $resolvedUpdaterBinary `
-        -EntryPath (Join-Path -Path $PackageRoot -ChildPath ([System.IO.Path]::GetFileName($resolvedUpdaterBinary)))
+        -EntryPath (Join-Path -Path $PackageRoot -ChildPath $updaterEntryName)
 
     foreach ($resourceDir in $ResourceDirectories) {
         if ([string]::IsNullOrWhiteSpace($resourceDir)) {

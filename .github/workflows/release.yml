@@ -121,16 +121,47 @@ jobs:
         shell: bash
         run: cargo install cross --locked
 
-      - name: Build release binary
+      - name: Build updater binary
         shell: pwsh
         env:
           NAROU_RS_RELEASE_BUILD: "1"
         run: |
           if ("${{ matrix.builder }}" -eq "cross") {
             $env:PKG_CONFIG_ALLOW_CROSS = "1"
-            cross build --locked --release --target "${{ matrix.target }}"
+            cross build --locked --release --target "${{ matrix.target }}" --bin narou_rs_updater
           } else {
-            cargo build --locked --release --target "${{ matrix.target }}"
+            cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_updater
+          }
+
+      - name: Compute updater SHA-256
+        id: updater_hash
+        shell: pwsh
+        run: |
+          $binary = "${{ matrix.binary }}"
+          if ($binary.EndsWith(".exe")) {
+            $updaterBinary = "narou_rs_updater.exe"
+          } else {
+            $updaterBinary = "narou_rs_updater"
+          }
+          $updaterPath = "target/${{ matrix.target }}/release/$updaterBinary"
+          if (-not (Test-Path -Path $updaterPath -PathType Leaf)) {
+            throw "Updater binary not found: $updaterPath"
+          }
+          $hash = (Get-FileHash -Path $updaterPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "hash=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Output "updater SHA-256: $hash"
+
+      - name: Build release binary
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+          NAROU_RS_UPDATER_SHA256: ${{ steps.updater_hash.outputs.hash }}
+        run: |
+          if ("${{ matrix.builder }}" -eq "cross") {
+            $env:PKG_CONFIG_ALLOW_CROSS = "1"
+            cross build --locked --release --target "${{ matrix.target }}" --bin narou_rs
+          } else {
+            cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs
           }
 
       - name: Package release asset

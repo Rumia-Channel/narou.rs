@@ -149,6 +149,9 @@ fn main() {
     if let Some(pid) = args.pid {
         wait_for_process_exit(pid, Duration::from_secs(30), &mut logger);
     }
+    // 親プロセスのファイルハンドル解放を確実にするための余裕。
+    // (Win では rename が使えるので必須ではないが、安全側に倒す)。
+    std::thread::sleep(Duration::from_secs(2));
 
     let backups = match apply_update(&zip_path, &install_dir, &mut logger) {
         Ok(backups) => backups,
@@ -161,6 +164,8 @@ fn main() {
     let _ = fs::remove_file(&zip_path);
 
     if !args.restart.is_empty() {
+        // updater 自身が exit しきってから新本体が起きるように小休止。
+        std::thread::sleep(Duration::from_secs(2));
         if let Err(e) = spawn_restart(&args.restart, &install_dir, &mut logger) {
             logger.log(format!("restart failed: {e}"));
             rollback(&backups, &mut logger);
