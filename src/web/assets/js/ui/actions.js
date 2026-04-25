@@ -725,8 +725,8 @@ export function bindActions() {
       if (State.sortAsc) th.classList.add('sort-asc');
       renderNovelList();
 
-      // Persist sort state to server
-      const { sort_state } = currentSortStatePayload();
+      // Persist sort state to server (single source of truth for actions).
+      const sort_state = currentSortStateFromUI();
       if (sort_state) {
         postJson('/api/sort_state', sort_state).catch(() => {});
       }
@@ -1067,18 +1067,20 @@ function requireSelectedIds() {
   return null;
 }
 
-function currentSortStatePayload() {
+function currentSortStateFromUI() {
   const column = SORT_STATE_COLUMN_INDEX[State.sortCol];
-  if (column == null) {
-    return {
-      timestamp: Date.now(),
-    };
-  }
+  if (column == null) return null;
   return {
-    sort_state: {
-      column,
-      dir: State.sortAsc ? 'asc' : 'desc',
-    },
+    column,
+    dir: State.sortAsc ? 'asc' : 'desc',
+  };
+}
+
+// Action endpoints rely on the server-stored sort state as the single
+// source of truth. Only a timestamp is sent so the server can detect
+// stale callers; the actual ordering is taken from /api/sort_state.
+function currentSortStatePayload() {
+  return {
     timestamp: Date.now(),
   };
 }
