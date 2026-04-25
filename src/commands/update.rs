@@ -28,6 +28,7 @@ use narou_rs::mail::{
 };
 use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
 use narou_rs::termcolor::{bold_colored, colored};
+use narou_rs::web::sort_state::{SORT_COLUMN_KEYS, sort_column_label_for_key, sort_record_ordering};
 
 const MODIFIED_TAG: &str = "modified";
 const INTERVAL_MIN_SECS: f64 = 2.5;
@@ -39,16 +40,6 @@ static UPDATE_INTERRUPT_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
 struct UpdateInterrupted;
-
-const UPDATE_SORT_KEYS: &[(&str, &str)] = &[
-    ("id", "ID"),
-    ("last_update", "更新日"),
-    ("last_check_date", "最終確認日"),
-    ("title", "タイトル"),
-    ("author", "作者名"),
-    ("new_arrivals_date", "新着日"),
-    ("general_lastup", "最新話掲載日"),
-];
 
 pub struct UpdateOptions {
     pub ids: Option<Vec<String>>,
@@ -400,12 +391,23 @@ fn merge_cli_and_stdin_targets(
 fn resolve_sort_key(key: Option<&str>) -> Option<String> {
     let key = key?;
     let key_lower = key.to_lowercase();
-    if UPDATE_SORT_KEYS.iter().any(|(k, _)| *k == key_lower) {
+    if SORT_COLUMN_KEYS
+        .iter()
+        .any(|candidate| *candidate == key_lower.as_str())
+        || key_lower == "new_arrivals_date"
+    {
         return Some(key_lower);
     }
-    let summaries = UPDATE_SORT_KEYS
+    let summaries = SORT_COLUMN_KEYS
         .iter()
-        .map(|(k, v)| format!("  {:>20}   {}", k, v))
+        .map(|k| {
+            let label = sort_column_label_for_key(k).unwrap_or(*k);
+            format!("  {:>20}   {}", k, label)
+        })
+        .chain(std::iter::once(format!(
+            "  {:>20}   {}",
+            "new_arrivals_date", "新着日"
+        )))
         .collect::<Vec<_>>()
         .join("\n");
     eprintln!(
@@ -547,21 +549,17 @@ fn sort_update_ids_by_key(ids: &mut [i64], key: &str) {
         let Some(b_record) = records.get(b) else {
             return Ordering::Less;
         };
-        match key {
-            "id" => a_record.id.cmp(&b_record.id),
-            "title" => a_record
-                .title
-                .to_lowercase()
-                .cmp(&b_record.title.to_lowercase()),
-            "author" => a_record
-                .author
-                .to_lowercase()
-                .cmp(&b_record.author.to_lowercase()),
-            "last_update" => b_record.last_update.cmp(&a_record.last_update),
-            "last_check_date" => b_record.last_check_date.cmp(&a_record.last_check_date),
-            "new_arrivals_date" => b_record.new_arrivals_date.cmp(&a_record.new_arrivals_date),
-            "general_lastup" => b_record.general_lastup.cmp(&a_record.general_lastup),
-            _ => Ordering::Equal,
+        let ordering = match key {
+            "new_arrivals_date" => a_record.new_arrivals_date.cmp(&b_record.new_arrivals_date),
+            key => sort_record_ordering(a_record, b_record, key),
+        };
+        if matches!(
+            key,
+            "last_update" | "last_check_date" | "general_lastup" | "new_arrivals_date"
+        ) {
+            ordering.reverse()
+        } else {
+            ordering
         }
     });
 }

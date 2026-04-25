@@ -1,8 +1,10 @@
+use std::cmp::Ordering;
+
 use serde_yaml::{Mapping, Value};
 
 use crate::db::{NovelRecord, inventory::{Inventory, InventoryScope}, with_database};
 
-pub(crate) const SORT_COLUMN_KEYS: &[&str] = &[
+pub const SORT_COLUMN_KEYS: &[&str] = &[
     "id",
     "last_update",
     "general_lastup",
@@ -18,7 +20,7 @@ pub(crate) const SORT_COLUMN_KEYS: &[&str] = &[
     "toc_url",
 ];
 
-pub(crate) const SORT_COLUMN_LABELS: &[&str] = &[
+pub const SORT_COLUMN_LABELS: &[&str] = &[
     "ID",
     "最終更新日",
     "最新話掲載日",
@@ -123,32 +125,48 @@ pub(crate) fn sort_column_label(sort_state: &CurrentSortState) -> Option<&'stati
     SORT_COLUMN_LABELS.get(sort_state.column).copied()
 }
 
+pub fn normalize_sort_key(key: &str) -> Option<&'static str> {
+    SORT_COLUMN_KEYS.iter().copied().find(|candidate| *candidate == key)
+}
+
+pub fn sort_column_label_for_key(key: &str) -> Option<&'static str> {
+    let index = SORT_COLUMN_KEYS.iter().position(|candidate| *candidate == key)?;
+    SORT_COLUMN_LABELS.get(index).copied()
+}
+
+pub fn sort_record_ordering(a: &NovelRecord, b: &NovelRecord, sort_key: &str) -> Ordering {
+    match sort_key {
+        "id" => a.id.cmp(&b.id),
+        "title" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+        "author" => a.author.to_lowercase().cmp(&b.author.to_lowercase()),
+        "last_update" => a.last_update.cmp(&b.last_update),
+        "general_lastup" => a
+            .general_lastup
+            .unwrap_or_default()
+            .cmp(&b.general_lastup.unwrap_or_default()),
+        "last_check_date" => a
+            .last_check_date
+            .unwrap_or_default()
+            .cmp(&b.last_check_date.unwrap_or_default()),
+        "sitename" => a.sitename.cmp(&b.sitename),
+        "novel_type" => a.novel_type.cmp(&b.novel_type),
+        "tags" => record_tags_key(a).cmp(&record_tags_key(b)),
+        "general_all_no" => a
+            .general_all_no
+            .unwrap_or(0)
+            .cmp(&b.general_all_no.unwrap_or(0)),
+        "length" => a.length.unwrap_or(0).cmp(&b.length.unwrap_or(0)),
+        "status" => record_status_key(a).cmp(&record_status_key(b)),
+        "toc_url" => a.toc_url.cmp(&b.toc_url),
+        _ => a.id.cmp(&b.id),
+    }
+}
+
 pub(crate) fn sort_records(records: &mut Vec<&NovelRecord>, sort_state: &CurrentSortState) {
     let sort_key = sort_column_key(sort_state).unwrap_or("id");
     let reverse = sort_state.dir == "desc";
     records.sort_by(|a, b| {
-        let ordering = match sort_key {
-            "id" => a.id.cmp(&b.id),
-            "title" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-            "author" => a.author.to_lowercase().cmp(&b.author.to_lowercase()),
-            "last_update" => a.last_update.cmp(&b.last_update),
-            "general_lastup" => a
-                .general_lastup
-                .unwrap_or_default()
-                .cmp(&b.general_lastup.unwrap_or_default()),
-            "last_check_date" => a
-                .last_check_date
-                .unwrap_or_default()
-                .cmp(&b.last_check_date.unwrap_or_default()),
-            "sitename" => a.sitename.cmp(&b.sitename),
-            "novel_type" => a.novel_type.cmp(&b.novel_type),
-            "general_all_no" => a
-                .general_all_no
-                .unwrap_or(0)
-                .cmp(&b.general_all_no.unwrap_or(0)),
-            "length" => a.length.unwrap_or(0).cmp(&b.length.unwrap_or(0)),
-            _ => a.id.cmp(&b.id),
-        };
+        let ordering = sort_record_ordering(a, b, sort_key);
         if reverse { ordering.reverse() } else { ordering }
     });
 }
@@ -206,15 +224,39 @@ fn normalize_sort_dir(value: &Value) -> Option<String> {
     }
 }
 
+fn record_tags_key(record: &NovelRecord) -> String {
+    record
+        .tags
+        .iter()
+        .map(|tag| tag.to_lowercase())
+        .collect::<Vec<_>>()
+        .join("\u{0}")
+}
+
+fn record_status_key(record: &NovelRecord) -> String {
+    let mut status = Vec::new();
+    if record.tags.iter().any(|tag| tag == "end") || record.end {
+        status.push("完結");
+    }
+    if record.tags.iter().any(|tag| tag == "404") {
+        status.push("削除");
+    }
+    if record.suspend {
+        status.push("中断");
+    }
+    status.join(", ").to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_CURRENT_SORT_COLUMN, DEFAULT_CURRENT_SORT_DIR, CurrentSortState,
         current_sort_from_server_setting, default_current_sort_state, normalize_current_sort_request,
-        request_preserves_input_order, request_sort_state, sort_records,
+        request_preserves_input_order, request_sort_state, sort_record_ordering, sort_records,
     };
     use crate::db::NovelRecord;
     use chrono::{TimeZone, Utc};
+    use std::cmp::Ordering;
 
     fn sample_record(id: i64, last_check_ts: i64) -> NovelRecord {
         NovelRecord {
@@ -339,5 +381,20 @@ mod tests {
 
         assert_eq!(default_sort.column, DEFAULT_CURRENT_SORT_COLUMN);
         assert_eq!(default_sort.dir, DEFAULT_CURRENT_SORT_DIR);
+    }
+
+    #[test]
+    fn sort_record_ordering_supports_tags_status_and_url_columns() {
+        let mut first = sample_record(1, 1_700_000_100);
+        first.tags = vec!["zeta".to_string()];
+        first.toc_url = "https://example.com/z".to_string();
+        let mut second = sample_record(2, 1_700_000_200);
+        second.tags = vec!["alpha".to_string()];
+        second.end = true;
+        second.toc_url = "https://example.com/a".to_string();
+
+        assert_eq!(sort_record_ordering(&first, &second, "tags"), Ordering::Greater);
+        assert_eq!(sort_record_ordering(&first, &second, "status"), Ordering::Less);
+        assert_eq!(sort_record_ordering(&first, &second, "toc_url"), Ordering::Greater);
     }
 }

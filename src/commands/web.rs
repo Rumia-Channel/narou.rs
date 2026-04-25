@@ -161,7 +161,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         cancelled_job_ids,
         narou_rs::compat::load_local_setting_bool("concurrency"),
     );
-    web::scheduler::restart_auto_update_scheduler(
+    web::scheduler::start_or_restart_auto_update_scheduler(
         queue,
         running_jobs,
         push_server.clone(),

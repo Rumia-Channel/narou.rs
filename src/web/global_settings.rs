@@ -12,6 +12,7 @@ use crate::db::inventory::{Inventory, InventoryScope};
 use crate::db::with_database;
 
 use super::AppState;
+use super::sort_state::sort_column_label_for_key;
 use super::state::ApiResponse;
 
 /// Tab metadata matching narou.rb SETTING_TAB_NAMES / SETTING_TAB_INFO
@@ -284,7 +285,7 @@ pub async fn save_global_settings(
     }
 
     if auto_schedule_changed {
-        let started = crate::web::scheduler::restart_auto_update_scheduler(
+        let started = crate::web::scheduler::start_or_restart_auto_update_scheduler(
             state.queue.clone(),
             state.running_jobs.clone(),
             state.push_server.clone(),
@@ -361,16 +362,11 @@ fn select_summaries_for_setting(name: &str, info: &VarInfo) -> Option<Vec<String
             .collect(),
         "update.sort-by" => keys
             .iter()
-            .map(|key| match key.as_str() {
-                "id" => "ID".to_string(),
-                "last_update" => "更新日".to_string(),
-                "title" => "タイトル".to_string(),
-                "author" => "作者".to_string(),
-                "site" => "掲載サイト".to_string(),
-                "keyword" => "キーワード".to_string(),
-                "general_lastup" => "掲載日".to_string(),
-                "new_arrivals_date" => "新着日".to_string(),
-                _ => key.clone(),
+            .map(|key| {
+                sort_column_label_for_key(key)
+                    .map(str::to_string)
+                    .or_else(|| (key == "new_arrivals_date").then(|| "新着日".to_string()))
+                    .unwrap_or_else(|| key.clone())
             })
             .collect(),
         "convert.copy-to-grouping" => vec![

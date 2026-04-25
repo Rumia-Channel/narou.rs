@@ -5,13 +5,13 @@ use std::process::{ChildStderr, ChildStdout, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{Datelike, Local, LocalResult, TimeZone};
-use serde_yaml::Value;
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, LocalResult, NaiveDate, TimeZone, Utc};
+use serde_yaml::{Number, Value};
 use tokio::task::JoinHandle;
 
 use crate::compat::{
     configure_web_subprocess_command, load_frozen_ids_from_inventory, load_local_setting_bool,
-    load_local_setting_string, record_is_frozen,
+    load_local_setting_string, load_local_setting_value, record_is_frozen,
 };
 use crate::db;
 use crate::db::inventory::{Inventory, InventoryScope};
@@ -21,10 +21,9 @@ use crate::queue::{JobType, PersistentQueue, QueueJob};
 use crate::termcolor::colored;
 
 use super::push::PushServer;
-use super::sort_state::{current_sort_from_server_setting, sort_column_key};
+use super::sort_state::{current_sort_from_server_setting, normalize_sort_key, sort_column_key};
 
-const AUTO_UPDATE_SORT_COLUMNS: &[&str] =
-    &["id", "last_update", "general_lastup", "last_check_date"];
+const AUTO_UPDATE_LAST_RUN_KEY: &str = "update.auto-schedule.last-run";
 pub fn start_auto_update_scheduler(
     queue: Arc<PersistentQueue>,
     running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
@@ -52,7 +51,18 @@ pub fn start_auto_update_scheduler(
         return None;
     }
 
+    let catch_up_run = missed_run_time(&times, load_last_auto_update_run(), Local::now());
     Some(tokio::spawn(async move {
+        if let Some(missed_run) = catch_up_run {
+            run_scheduled_auto_update(
+                queue.as_ref(),
+                &running_jobs,
+                push_server.as_ref(),
+                missed_run,
+                true,
+            );
+        }
+
         loop {
             let Some(next_run) = calculate_next_run_time(&times) else {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -60,40 +70,18 @@ pub fn start_auto_update_scheduler(
             };
 
             sleep_until(next_run).await;
-            push_server.broadcast_echo(
-                &format!(
-                    "自動アップデートが予定されています: {}",
-                    next_run.format("%Y/%m/%d %H:%M:%S")
-                ),
-                "stdout",
+            run_scheduled_auto_update(
+                queue.as_ref(),
+                &running_jobs,
+                push_server.as_ref(),
+                next_run,
+                false,
             );
-
-            match queue_auto_update_job_if_needed(queue.as_ref(), &running_jobs) {
-                Ok((job_id, true)) => {
-                    push_server.broadcast_echo(
-                        &format!("自動アップデートをキューに追加しました ({})", job_id),
-                        "stdout",
-                    );
-                    push_server.broadcast_event("notification.queue", "");
-                }
-                Ok((_, false)) => {
-                    push_server.broadcast_echo(
-                        "自動アップデートは既にキューまたは実行中に存在します",
-                        "stdout",
-                    );
-                }
-                Err(message) => {
-                    push_server.broadcast_echo(
-                        &format!("自動アップデートのキュー追加に失敗しました: {}", message),
-                        "stdout",
-                    );
-                }
-            }
         }
     }))
 }
 
-pub fn restart_auto_update_scheduler(
+pub fn start_or_restart_auto_update_scheduler(
     queue: Arc<PersistentQueue>,
     running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
     push_server: Arc<PushServer>,
@@ -107,6 +95,66 @@ pub fn restart_auto_update_scheduler(
     let started = task.is_some();
     *scheduler_task.lock() = task;
     started
+}
+
+pub fn restart_auto_update_scheduler(
+    queue: Arc<PersistentQueue>,
+    running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
+    push_server: Arc<PushServer>,
+    scheduler_task: &parking_lot::Mutex<Option<JoinHandle<()>>>,
+) -> bool {
+    start_or_restart_auto_update_scheduler(queue, running_jobs, push_server, scheduler_task)
+}
+
+fn run_scheduled_auto_update(
+    queue: &PersistentQueue,
+    running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
+    push_server: &PushServer,
+    scheduled_time: chrono::DateTime<Local>,
+    catch_up: bool,
+) {
+    let now = Local::now();
+    if let Err(message) = persist_last_auto_update_run(now) {
+        push_server.broadcast_echo(
+            &format!("自動アップデート最終実行時刻の保存に失敗しました: {}", message),
+            "stdout",
+        );
+    }
+
+    let heading = if catch_up {
+        format!(
+            "自動アップデートを catch-up 実行します: {}",
+            scheduled_time.format("%Y/%m/%d %H:%M:%S")
+        )
+    } else {
+        format!(
+            "自動アップデートが予定されています: {}",
+            scheduled_time.format("%Y/%m/%d %H:%M:%S")
+        )
+    };
+    push_server.broadcast_echo(&heading, "stdout");
+
+    match queue_auto_update_job_if_needed(queue, running_jobs) {
+        Ok((job_id, true)) => {
+            push_server.broadcast_echo(
+                &format!("自動アップデートをキューに追加しました ({})", job_id),
+                "stdout",
+            );
+            push_server.broadcast_event("notification.queue", "");
+        }
+        Ok((_, false)) => {
+            push_server.broadcast_echo(
+                "自動アップデートは既にキューまたは実行中に存在します",
+                "stdout",
+            );
+        }
+        Err(message) => {
+            push_server.broadcast_echo(
+                &format!("自動アップデートのキュー追加に失敗しました: {}", message),
+                "stdout",
+            );
+        }
+    }
 }
 
 pub fn stop_auto_update_scheduler(scheduler_task: &parking_lot::Mutex<Option<JoinHandle<()>>>) {
@@ -135,18 +183,35 @@ fn parse_schedule_times(schedule_string: &str) -> Vec<(u32, u32)> {
 }
 
 fn calculate_next_run_time(times: &[(u32, u32)]) -> Option<chrono::DateTime<Local>> {
-    let now = Local::now();
+    calculate_next_run_time_after(times, Local::now())
+}
 
+fn calculate_next_run_time_after<Tz>(
+    times: &[(u32, u32)],
+    after: DateTime<Tz>,
+) -> Option<DateTime<Tz>>
+where
+    Tz: TimeZone,
+    Tz::Offset: Copy,
+{
     for &(hour, minute) in times {
-        let candidate = local_datetime(now.year(), now.month(), now.day(), hour, minute)?;
-        if candidate > now {
+        let candidate = local_datetime_in_timezone(
+            &after.timezone(),
+            after.year(),
+            after.month(),
+            after.day(),
+            hour,
+            minute,
+        )?;
+        if candidate > after {
             return Some(candidate);
         }
     }
 
-    let tomorrow = now.date_naive().succ_opt()?;
+    let tomorrow = after.date_naive().succ_opt()?;
     let (hour, minute) = *times.first()?;
-    local_datetime(
+    local_datetime_in_timezone(
+        &after.timezone(),
         tomorrow.year(),
         tomorrow.month(),
         tomorrow.day(),
@@ -155,18 +220,70 @@ fn calculate_next_run_time(times: &[(u32, u32)]) -> Option<chrono::DateTime<Loca
     )
 }
 
-fn local_datetime(
+fn local_datetime_in_timezone<Tz>(
+    timezone: &Tz,
     year: i32,
     month: u32,
     day: u32,
     hour: u32,
     minute: u32,
-) -> Option<chrono::DateTime<Local>> {
-    match Local.with_ymd_and_hms(year, month, day, hour, minute, 0) {
-        LocalResult::Single(value) => Some(value),
-        LocalResult::Ambiguous(first, _) => Some(first),
-        LocalResult::None => None,
+) -> Option<DateTime<Tz>>
+where
+    Tz: TimeZone,
+    Tz::Offset: Copy,
+{
+    let mut candidate = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, 0)?;
+    let start_date = candidate.date();
+    let max_date = start_date.succ_opt()?;
+
+    loop {
+        match timezone.from_local_datetime(&candidate) {
+            LocalResult::Single(value) => return Some(value),
+            LocalResult::Ambiguous(first, _) => return Some(first),
+            LocalResult::None => {
+                candidate = candidate.checked_add_signed(ChronoDuration::minutes(1))?;
+                if candidate.date() > max_date {
+                    return None;
+                }
+            }
+        }
     }
+}
+
+fn missed_run_time(
+    times: &[(u32, u32)],
+    last_run: Option<DateTime<Local>>,
+    now: DateTime<Local>,
+) -> Option<DateTime<Local>> {
+    let last_run = last_run?;
+    if last_run >= now {
+        return None;
+    }
+    let missed = calculate_next_run_time_after(times, last_run)?;
+    (missed < now).then_some(missed)
+}
+
+fn load_last_auto_update_run() -> Option<DateTime<Local>> {
+    let timestamp = match load_local_setting_value(AUTO_UPDATE_LAST_RUN_KEY)? {
+        Value::Number(value) => value.as_i64()?,
+        Value::String(text) => text.parse::<i64>().ok()?,
+        _ => return None,
+    };
+    Utc.timestamp_opt(timestamp, 0).single().map(|value| value.with_timezone(&Local))
+}
+
+fn persist_last_auto_update_run(timestamp: DateTime<Local>) -> Result<(), String> {
+    let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
+    let mut settings: HashMap<String, Value> = inventory
+        .load("local_setting", InventoryScope::Local)
+        .unwrap_or_default();
+    settings.insert(
+        AUTO_UPDATE_LAST_RUN_KEY.to_string(),
+        Value::Number(Number::from(timestamp.timestamp())),
+    );
+    inventory
+        .save("local_setting", InventoryScope::Local, &settings)
+        .map_err(|e| e.to_string())
 }
 
 async fn sleep_until(target_time: chrono::DateTime<Local>) {
@@ -292,13 +409,7 @@ fn build_auto_update_sort_args(push_server: &PushServer) -> Vec<&'static str> {
         push_server,
         &format!("自動アップデート: WebUIソート設定を適用 ({})", sort_key),
     );
-    match sort_key {
-        "id" => vec!["--sort-by", "id"],
-        "last_update" => vec!["--sort-by", "last_update"],
-        "general_lastup" => vec!["--sort-by", "general_lastup"],
-        "last_check_date" => vec!["--sort-by", "last_check_date"],
-        _ => Vec::new(),
-    }
+    vec!["--sort-by", sort_key]
 }
 
 fn read_auto_update_sort_key() -> Option<&'static str> {
@@ -312,7 +423,7 @@ fn read_auto_update_sort_key() -> Option<&'static str> {
 fn auto_update_sort_key_from_value(server_setting: &Value) -> Option<&'static str> {
     let current_sort = current_sort_from_server_setting(server_setting)?;
     let key = sort_column_key(&current_sort)?;
-    AUTO_UPDATE_SORT_COLUMNS.contains(&key).then_some(key)
+    normalize_sort_key(key)
 }
 
 fn collect_auto_update_target_ids() -> (Vec<String>, Vec<String>) {
@@ -567,12 +678,15 @@ fn auto_update_echo(push_server: &PushServer, body: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_update_sort_key_from_value, calculate_next_run_time, parse_schedule_times,
+        auto_update_sort_key_from_value, calculate_next_run_time, calculate_next_run_time_after,
+        local_datetime_in_timezone, missed_run_time, parse_schedule_times,
         queue_auto_update_job_if_needed, split_auto_update_target_ids,
     };
+    use crate::web::sort_state::SORT_COLUMN_KEYS;
     use crate::db::NovelRecord;
     use crate::queue::{JobType, PersistentQueue, QueueJob};
-    use chrono::Utc;
+    use chrono::{Local, TimeZone, Timelike, Utc};
+    use chrono_tz::America::New_York;
     use parking_lot::Mutex;
     use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -619,14 +733,45 @@ mod tests {
     }
 
     #[test]
-    fn auto_update_sort_key_accepts_supported_current_sort() {
-        let server_setting: serde_yaml::Value =
-            serde_yaml::from_str("current_sort:\n  column: \"3\"\n  dir: asc\n").unwrap();
+    fn auto_update_sort_key_accepts_all_current_sort_columns() {
+        for (index, key) in SORT_COLUMN_KEYS.iter().enumerate() {
+            let server_setting: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "current_sort:\n  column: \"{}\"\n  dir: asc\n",
+                index
+            ))
+            .unwrap();
+            assert_eq!(auto_update_sort_key_from_value(&server_setting), Some(*key));
+        }
+    }
 
-        assert_eq!(
-            auto_update_sort_key_from_value(&server_setting),
-            Some("last_check_date")
-        );
+    #[test]
+    fn missed_run_time_triggers_single_catch_up_after_downtime() {
+        let last_run = Local.with_ymd_and_hms(2026, 4, 20, 8, 0, 0).single().unwrap();
+        let now = Local.with_ymd_and_hms(2026, 4, 20, 12, 0, 0).single().unwrap();
+        let missed = missed_run_time(&[(9, 0), (18, 0)], Some(last_run), now).unwrap();
+
+        assert_eq!(missed.hour(), 9);
+        assert_eq!(missed.minute(), 0);
+    }
+
+    #[test]
+    fn local_datetime_in_timezone_rounds_dst_gap_forward() {
+        let rounded = local_datetime_in_timezone(&New_York, 2024, 3, 10, 2, 30).unwrap();
+
+        assert_eq!(rounded.hour(), 3);
+        assert_eq!(rounded.minute(), 0);
+    }
+
+    #[test]
+    fn calculate_next_run_time_after_uses_rounded_dst_gap() {
+        let before_gap = New_York
+            .with_ymd_and_hms(2024, 3, 10, 1, 45, 0)
+            .single()
+            .unwrap();
+        let next = calculate_next_run_time_after(&[(2, 30)], before_gap).unwrap();
+
+        assert_eq!(next.hour(), 3);
+        assert_eq!(next.minute(), 0);
     }
 
     #[test]
