@@ -8,7 +8,27 @@ use std::borrow::Cow;
 include!(concat!(env!("OUT_DIR"), "/web_asset_versions.rs"));
 
 fn render_page(source: &'static str) -> Html<String> {
-    Html(apply_asset_versions(source))
+    Html(inject_build_info(&apply_asset_versions(source)))
+}
+
+fn inject_build_info(source: &str) -> String {
+    let main_js_version = asset_version("js/main.js").unwrap_or("unknown");
+    let build_script = format!(
+        r#"<script>
+window.__NAROU_RS_WEBUI_BUILD__ = Object.freeze({{
+  appVersion: "{app_version}",
+  mainJsVersion: "{main_js_version}"
+}});
+console.info("[narou_rs webui build]", window.__NAROU_RS_WEBUI_BUILD__);
+</script>"#,
+        app_version = crate::version::VERSION,
+        main_js_version = main_js_version,
+    );
+    if source.contains("<head>") {
+        source.replacen("<head>", &format!("<head>\n    {build_script}"), 1)
+    } else {
+        format!("{build_script}{source}")
+    }
 }
 
 fn apply_asset_versions(source: &'static str) -> String {
@@ -271,7 +291,7 @@ pub async fn asset(Path(path): Path<String>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_asset_versions, apply_js_module_versions, asset_version};
+    use super::{apply_asset_versions, apply_js_module_versions, asset_version, inject_build_info};
     use axum::{
         extract::Path,
         http::{StatusCode, header},
@@ -283,6 +303,14 @@ mod tests {
         let rendered = apply_asset_versions(html);
         assert!(rendered.contains("/assets/js/main.js?v="));
         assert!(rendered.contains("/assets/css/base.css?v="));
+    }
+
+    #[test]
+    fn inject_build_info_adds_bootstrap_console_log_to_head() {
+        let rendered = inject_build_info("<html><head></head><body></body></html>");
+        assert!(rendered.contains("window.__NAROU_RS_WEBUI_BUILD__"));
+        assert!(rendered.contains(crate::version::VERSION));
+        assert!(rendered.contains("console.info(\"[narou_rs webui build]\""));
     }
 
     #[test]
