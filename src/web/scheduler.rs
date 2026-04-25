@@ -666,7 +666,13 @@ fn relay_stdout_line(push_server: &PushServer, text: &str) {
     };
 
     match serde_json::from_str::<serde_json::Value>(json_str) {
-        Ok(message) => push_server.broadcast_raw(&message),
+        Ok(message) => {
+            if super::worker::is_novel_refresh_event(&message) {
+                super::worker::refresh_db_and_broadcast_table_reload(push_server);
+                return;
+            }
+            push_server.broadcast_raw(&message)
+        }
         Err(_) => auto_update_echo(push_server, text),
     }
 }

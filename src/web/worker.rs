@@ -746,6 +746,10 @@ fn spawn_and_stream_command(
                     Ok(text) => {
                         if let Some(json_str) = text.strip_prefix(WS_LINE_PREFIX) {
                             if let Ok(msg) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                if is_novel_refresh_event(&msg) {
+                                    refresh_db_and_broadcast_table_reload(ps_out.as_ref());
+                                    continue;
+                                }
                                 let routed =
                                     route_structured_web_message(msg, &stdout_target_console);
                                 ps_out.broadcast_raw(&routed);
@@ -900,6 +904,23 @@ fn route_structured_web_message(
         );
     }
     message
+}
+
+/// Returns `true` for the per-novel refresh event emitted by child CLI
+/// subprocesses (see [`crate::progress::emit_novel_refresh`]). The web server
+/// reloads its DB cache and broadcasts a `table.reload` so the UI reflects
+/// per-novel state changes (e.g. modified-tag removal) the moment they happen.
+pub(crate) fn is_novel_refresh_event(message: &serde_json::Value) -> bool {
+    message
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t == "novel.refresh")
+}
+
+pub(crate) fn refresh_db_and_broadcast_table_reload(push_server: &PushServer) {
+    let _ = with_database_mut(|db| db.refresh());
+    push_server.broadcast_event("table.reload", "");
+    push_server.broadcast_event("tag.updateCanvas", "");
 }
 
 fn parse_convert_job_target(value: &str) -> Result<(&str, Option<String>), String> {

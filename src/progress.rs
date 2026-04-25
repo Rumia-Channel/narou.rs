@@ -14,6 +14,26 @@ pub fn is_web_mode() -> bool {
     std::env::var("NAROU_RS_WEB_MODE").is_ok()
 }
 
+/// Emit a structured WebSocket event from a CLI subprocess running under the
+/// web server. Lines are intercepted by the parent and forwarded to clients.
+/// No-op when not running under the web server.
+pub fn emit_web_event(event_type: &str, data: serde_json::Value) {
+    if !is_web_mode() {
+        return;
+    }
+    let msg = serde_json::json!({ "type": event_type, "data": data });
+    println!("{}{}", WS_LINE_PREFIX, msg);
+}
+
+/// Notify the parent web server that a single novel's DB record was just
+/// updated (e.g. modified-tag removed, last_check_date refreshed). The parent
+/// will reload its in-memory DB and broadcast a `table.reload` event so the
+/// UI reflects the change immediately, without waiting for the whole job to
+/// finish.
+pub fn emit_novel_refresh(id: i64) {
+    emit_web_event("novel.refresh", serde_json::json!({ "id": id }));
+}
+
 pub trait ProgressReporter: Send + Sync {
     fn set_length(&self, len: u64);
     fn set_position(&self, pos: u64);

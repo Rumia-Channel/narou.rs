@@ -662,6 +662,7 @@ fn remove_modified_tag(id: i64) {
         }
         Ok(())
     });
+    narou_rs::progress::emit_novel_refresh(id);
 }
 
 fn update_last_check_date(id: i64) {
