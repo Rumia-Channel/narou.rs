@@ -68,6 +68,7 @@
       var status = document.getElementById('notepad-status');
       var saveTimer = null;
       var statusTimer = null;
+      var notepadObjectId = null;
 
       function showStatus(message, isError) {
         status.classList.toggle('error', Boolean(isError));
@@ -97,9 +98,38 @@
         return data;
       }
 
+      function readNotepadPayload(data) {
+        return {
+          text: (data && (data.text || data.content)) || '',
+          objectId: (data && typeof data.object_id === 'string') ? data.object_id : null
+        };
+      }
+
+      function applyNotepadPayload(data, keepLocalEdits) {
+        var payload = readNotepadPayload(data);
+        var hasLocalEdits = keepLocalEdits
+          && document.activeElement === textarea
+          && textarea.value !== payload.text;
+        if (!hasLocalEdits) {
+          textarea.value = payload.text;
+          notepadObjectId = payload.objectId;
+        }
+        return !hasLocalEdits;
+      }
+
+      function reloadNotepad(message) {
+        return requestJson('/api/notepad/read')
+          .then(function(data) {
+            applyNotepadPayload(data, false);
+            if (message) {
+              showStatus(message, true);
+            }
+          });
+      }
+
       requestJson('/api/notepad/read')
         .then(function(data) {
-          textarea.value = data.content || data.text || '';
+          applyNotepadPayload(data, false);
         })
         .catch(function(error) {
           showStatus('読み込みに失敗しました: ' + error.message, true);
@@ -112,9 +142,13 @@
         ws.onmessage = function(event) {
           try {
             var msg = JSON.parse(event.data);
-            if (msg.type === 'notepad.change' && document.activeElement !== textarea) {
-              textarea.value = msg.data || '';
-              showStatus('他の画面の変更を反映しました');
+            if (msg.type === 'notepad.change') {
+              var applied = applyNotepadPayload(msg.data, true);
+              if (applied) {
+                showStatus('他の画面の変更を反映しました');
+              } else {
+                showStatus('他の画面で更新されました。保存時に再読み込みします', true);
+              }
             }
           } catch (_) {}
         };
@@ -135,9 +169,13 @@
           requestJson('/api/notepad/save', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: textarea.value })
+            body: JSON.stringify({ text: textarea.value, object_id: notepadObjectId })
           }).then(function(data) {
+            if (data && data.conflict) {
+              return reloadNotepad(data.message || '他の画面で変更されたため再読み込みしました');
+            }
             data = assertApiSuccess(data, '保存に失敗しました');
+            applyNotepadPayload(data, false);
             showStatus(data.message || '保存しました');
           }).catch(function(error) {
             showStatus('保存に失敗しました: ' + error.message, true);

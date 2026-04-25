@@ -73,7 +73,9 @@ export function bindActions() {
   });
 
   El.consoleCancel?.addEventListener('click', async () => {
-    await postJson('/api/cancel', {});
+    await runGuardedAction(El.consoleCancel, async () => {
+      await postJson('/api/cancel', {});
+    }, '処理の中断に失敗しました');
   });
 
   El.consoleHistory?.addEventListener('click', async () => {
@@ -304,9 +306,13 @@ export function bindActions() {
   });
 
   on('queue-modal-close', () => El.queueModal?.classList.add('hide'));
-  on('queue-clear-button', async () => {
-    await postJson('/api/queue/clear', {});
-    await refreshQueueDetailed();
+  on('queue-clear-button', (e) => {
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/queue/clear', {});
+      assertApiSuccess(result, 'キューの消去に失敗しました');
+      await refreshQueue();
+      await refreshQueueDetailed();
+    }, 'キューの消去に失敗しました');
   });
   on('queue-reload-button', async () => {
     await refreshQueueDetailed();
@@ -314,16 +320,27 @@ export function bindActions() {
 
   // --- Notepad modal ---
   on('notepad-close', () => El.notepadModal?.classList.add('hide'));
-  on('save-notepad-button', async () => {
-    try {
+  on('save-notepad-button', (e) => {
+    void runGuardedAction(e.currentTarget, async () => {
       const text = El.notepad?.value || '';
-      const result = await postJson('/api/notepad/save', { text, content: text });
+      const result = await postJson('/api/notepad/save', {
+        text,
+        content: text,
+        object_id: State.notepadObjectId,
+      });
+      if (result?.conflict) {
+        await reloadNotepadFromServer(
+          result.message || '他の画面で変更されたため、メモ帳を再読み込みしました',
+          'warning'
+        );
+        return null;
+      }
       assertApiSuccess(result, 'メモ帳の保存に失敗しました');
+      applyNotepadSnapshot(result);
       El.notepadModal?.classList.add('hide');
       showNotification(result.message || 'メモ帳を保存しました', 'success');
-    } catch (error) {
-      showNotification(error.message || 'メモ帳の保存に失敗しました', 'error');
-    }
+      return result;
+    }, 'メモ帳の保存に失敗しました');
   });
 
   // --- Tag edit modal ---
@@ -874,7 +891,7 @@ async function withButtonGuard(buttonEl, action) {
   }
 }
 
-async function runGuardedAction(buttonEl, action, errorMessage) {
+export async function runGuardedAction(buttonEl, action, errorMessage) {
   try {
     return await withButtonGuard(buttonEl, action);
   } catch (error) {
@@ -907,6 +924,45 @@ function rememberRebootReturnTo() {
   } catch {
     // Ignore storage errors and fall back to root.
   }
+}
+
+function getNotepadText(data) {
+  if (data && typeof data === 'object') {
+    return data.text || data.content || '';
+  }
+  return typeof data === 'string' ? data : '';
+}
+
+function getNotepadObjectId(data) {
+  if (!data || typeof data !== 'object') return null;
+  return typeof data.object_id === 'string' ? data.object_id : null;
+}
+
+export function applyNotepadSnapshot(data, options = {}) {
+  const text = getNotepadText(data);
+  const objectId = getNotepadObjectId(data);
+  const keepLocalEdits = options.keepLocalEdits === true
+    && El.notepad instanceof HTMLTextAreaElement
+    && document.activeElement === El.notepad
+    && El.notepad.value !== text;
+
+  if (!keepLocalEdits && El.notepad) {
+    El.notepad.value = text;
+  }
+  if (!keepLocalEdits || !El.notepad || El.notepad.value === text) {
+    State.notepadObjectId = objectId;
+  }
+
+  return { text, objectId, keptLocalEdits: keepLocalEdits };
+}
+
+async function reloadNotepadFromServer(message, type = 'warning') {
+  const data = await fetchJson('/api/notepad/read');
+  applyNotepadSnapshot(data);
+  if (message) {
+    showNotification(message, type);
+  }
+  return data;
 }
 
 function clearRebootReturnTo() {
@@ -1356,7 +1412,7 @@ async function openNotepad() {
 
   try {
     const data = await fetchJson('/api/notepad/read');
-    if (El.notepad) El.notepad.value = data?.text || data?.content || '';
+    applyNotepadSnapshot(data);
     El.notepadModal?.classList.remove('hide');
   } catch (error) {
     showNotification(error.message || 'メモ帳の読み込みに失敗しました', 'error');

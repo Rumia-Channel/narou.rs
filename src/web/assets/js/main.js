@@ -6,7 +6,14 @@ import { fetchJson } from './core/http.js';
 import { applyI18n } from './ui/i18n.js';
 import { initDropdowns } from './ui/dropdown.js';
 import { renderNovelList, renderQueueStatus, renderTagList, showNotification, syncViewChecks } from './ui/render.js';
-import { bindActions, refreshList, refreshQueue, refreshQueueDetailed, refreshTags } from './ui/actions.js';
+import {
+  applyNotepadSnapshot,
+  bindActions,
+  refreshList,
+  refreshQueue,
+  refreshQueueDetailed,
+  refreshTags,
+} from './ui/actions.js';
 
 let ws = null;
 const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
@@ -185,8 +192,11 @@ function handleWsMessage(msg) {
       reloadWebConfig();
       break;
     case 'notepad.change':
-      if (El.notepad && El.notepad.value !== (msg.data || '')) {
-        El.notepad.value = msg.data || '';
+      if (msg.data) {
+        const result = applyNotepadSnapshot(msg.data, { keepLocalEdits: true });
+        if (result.keptLocalEdits) {
+          showNotification('他の画面でメモ帳が更新されました。保存時に再読み込みされます', 'warning');
+        }
       }
       break;
     case 'echo':
@@ -201,6 +211,18 @@ function handleWsMessage(msg) {
     case 'queue_failed':
       refreshQueue();
       notifyQueueFailure(msg.data);
+      break;
+    case 'queue_partial':
+    case 'queue.partial':
+      refreshQueue();
+      refreshQueueDetailed();
+      notifyQueuePartial(msg.data);
+      break;
+    case 'queue_cancelled':
+    case 'queue.cancelled':
+      refreshQueue();
+      refreshQueueDetailed();
+      notifyQueueCancelled(msg.data);
       break;
     case 'shutdown':
       appendConsole('サーバーをシャットダウンしています...');
@@ -252,12 +274,33 @@ function handleWsMessage(msg) {
 function notifyQueueFailure(data) {
   const payload = (data && typeof data === 'object') ? data : {};
   const detail = formatFailureDetail(payload.detail);
-  const baseMessage = detail ? '処理に失敗しました' : '処理に失敗しました。詳細はコンソールを確認してください';
+  const reason = (typeof payload.reason === 'string') ? payload.reason.trim() : '';
+  const baseMessage = detail
+    ? '処理に失敗しました'
+    : (reason ? `処理に失敗しました: ${reason}` : '処理に失敗しました。詳細はコンソールを確認してください');
   if (State.debugMode && detail) {
     showNotification(`${baseMessage}: ${detail}`, 'error');
     return;
   }
   showNotification(baseMessage, 'error');
+}
+
+function notifyQueuePartial(data) {
+  const jobLabel = formatQueueJobLabel(data);
+  showNotification(`${jobLabel}は一部未完了で終了しました。詳細はコンソールを確認してください`, 'warning');
+}
+
+function notifyQueueCancelled(data) {
+  const jobLabel = formatQueueJobLabel(data);
+  showNotification(`${jobLabel}を中断しました`, 'warning');
+}
+
+function formatQueueJobLabel(data) {
+  const jobId = data && typeof data === 'object' ? data.job_id : null;
+  if (typeof jobId === 'string' && jobId) {
+    return `処理 (${jobId})`;
+  }
+  return '処理';
 }
 
 function formatFailureDetail(detail) {

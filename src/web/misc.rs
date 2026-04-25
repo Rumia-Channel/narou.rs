@@ -5,6 +5,7 @@ use axum::{
 };
 use reqwest::header::USER_AGENT;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 use crate::compat::{load_local_setting_bool, load_local_setting_string};
@@ -233,13 +234,13 @@ pub async fn all_novel_ids(State(_state): State<AppState>) -> Json<serde_json::V
 
 pub async fn notepad_read(State(_state): State<AppState>) -> Json<serde_json::Value> {
     let content = std::fs::read_to_string(".narou/notepad.txt").unwrap_or_default();
-    Json(serde_json::json!({ "content": content, "text": content }))
+    Json(notepad_response_value(&content))
 }
 
 pub async fn notepad_save(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
-) -> Json<ApiResponse> {
+) -> Json<serde_json::Value> {
     let content = body["content"]
         .as_str()
         .or_else(|| body["text"].as_str())
@@ -247,26 +248,67 @@ pub async fn notepad_save(
     if let Err(message) =
         super::validate_web_text_size(content, super::MAX_WEB_TEXT_INPUT_BYTES, "notepad content")
     {
-        return Json(ApiResponse {
-            success: false,
-            message,
-        });
+        return Json(serde_json::json!({
+            "success": false,
+            "message": message,
+        }));
     }
+    let current_content = std::fs::read_to_string(".narou/notepad.txt").unwrap_or_default();
+    let current_object_id = notepad_object_id(&current_content);
+    let request_object_id = body["object_id"].as_str().unwrap_or("");
+
+    if request_object_id != current_object_id {
+        return Json(serde_json::json!({
+            "success": false,
+            "conflict": true,
+            "message": "他の画面でメモ帳が更新されたため再読み込みしました。内容を確認してからもう一度保存してください",
+            "content": current_content,
+            "text": current_content,
+            "object_id": current_object_id,
+        }));
+    }
+
     let result = std::fs::write(".narou/notepad.txt", content);
+    let object_id = notepad_object_id(content);
+    let response = serde_json::json!({
+        "content": content,
+        "text": content,
+        "object_id": object_id,
+    });
 
     match result {
         Ok(_) => {
-            state.push_server.broadcast_event("notepad.change", content);
-            Json(ApiResponse {
-                success: true,
-                message: "Saved".to_string(),
-            })
+            state.push_server.broadcast_raw(&serde_json::json!({
+                "type": "notepad.change",
+                "data": response.clone(),
+            }));
+            Json(serde_json::json!({
+                "success": true,
+                "message": "Saved",
+                "content": content,
+                "text": content,
+                "object_id": response["object_id"].clone(),
+            }))
         }
-        Err(e) => Json(ApiResponse {
-            success: false,
-            message: e.to_string(),
-        }),
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "message": e.to_string(),
+        })),
     }
+}
+
+fn notepad_object_id(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn notepad_response_value(content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "content": content,
+        "text": content,
+        "object_id": notepad_object_id(content),
+    })
 }
 
 pub async fn recent_logs(

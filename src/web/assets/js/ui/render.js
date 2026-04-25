@@ -380,6 +380,16 @@ function normalizeFilterValue(value) {
 function sortNovels(novels) {
   const col = State.sortCol;
   const asc = State.sortAsc;
+  const numericColumns = new Set([
+    'id',
+    'last_update',
+    'general_lastup',
+    'last_check_date',
+    'novel_type',
+    'general_all_no',
+    'length',
+    'average_length',
+  ]);
 
   const keyFn = (n) => {
     switch (col) {
@@ -402,8 +412,12 @@ function sortNovels(novels) {
     const ka = keyFn(a);
     const kb = keyFn(b);
     let cmp = 0;
-    if (ka < kb) cmp = -1;
+    if (numericColumns.has(col)) {
+      cmp = (Number(ka) || 0) - (Number(kb) || 0);
+    } else if (ka < kb) cmp = -1;
     else if (ka > kb) cmp = 1;
+    if (cmp < 0) cmp = -1;
+    else if (cmp > 0) cmp = 1;
     return asc ? cmp : -cmp;
   });
 }
@@ -877,6 +891,14 @@ export function renderQueueStatus() {
   if (El.queuePendingCount) {
     El.queuePendingCount.textContent = `(${qs.pending || 0})`;
   }
+  if (El.queueResultSummary) {
+    const resultParts = [];
+    if ((qs.completed || 0) > 0) resultParts.push(`完了 ${qs.completed}件`);
+    if ((qs.partial || 0) > 0) resultParts.push(`一部未完了 ${qs.partial}件`);
+    if ((qs.cancelled || 0) > 0) resultParts.push(`中断 ${qs.cancelled}件`);
+    if ((qs.failed || 0) > 0) resultParts.push(`失敗 ${qs.failed}件`);
+    El.queueResultSummary.textContent = resultParts.join(' / ');
+  }
 }
 
 /* ===== Queue Detailed ===== */
@@ -938,6 +960,13 @@ function renderTaskItem(task, isRunning, idx, total) {
   </div>`;
 }
 
+function assertQueueActionSuccess(result, fallbackMessage) {
+  if (result && result.success === false) {
+    throw new Error(result.message || fallbackMessage);
+  }
+  return result;
+}
+
 export function renderQueueDetailed() {
   const qd = State.queueDetailed;
   if (El.queueModalRunningList) {
@@ -945,9 +974,13 @@ export function renderQueueDetailed() {
       El.queueModalRunningList.innerHTML = qd.running.map((t, i) => renderTaskItem(t, true, i, qd.running.length)).join('');
       El.queueModalRunningList.querySelectorAll('.queue-task-cancel').forEach(btn => {
         btn.addEventListener('click', async () => {
-          await postJson('/api/cancel_running_task', { task_id: btn.dataset.taskId });
-          const { refreshQueueDetailed } = await import('./actions.js');
-          await refreshQueueDetailed();
+          const { refreshQueue, refreshQueueDetailed, runGuardedAction } = await import('./actions.js');
+          await runGuardedAction(btn, async () => {
+            const result = await postJson('/api/cancel_running_task', { task_id: btn.dataset.taskId });
+            assertQueueActionSuccess(result, '実行中の処理を中断できませんでした');
+            await refreshQueue();
+            await refreshQueueDetailed();
+          }, '実行中の処理を中断できませんでした');
         });
       });
     } else {
