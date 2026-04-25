@@ -1495,6 +1495,17 @@ async function updateLatestVersionInfo() {
           El.aboutUpdate.classList.add('hide');
         }
       }
+      if (El.aboutUpdateStatus) {
+        if (data.update_available && data.develop) {
+          El.aboutUpdateStatus.classList.remove('hide');
+          El.aboutUpdateStatus.textContent =
+            'develop ビルド扱いのためアップデートボタンは表示されません。' +
+            ' (実行ファイルと同じフォルダに commitversion ファイルが無い場合に発生します)';
+        } else {
+          El.aboutUpdateStatus.classList.add('hide');
+          El.aboutUpdateStatus.textContent = '';
+        }
+      }
       return;
     }
     El.aboutLatestVersion.textContent =
