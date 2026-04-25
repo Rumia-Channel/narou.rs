@@ -940,10 +940,10 @@ function renderTaskItem(task, isRunning, idx, total) {
 
 export function renderQueueDetailed() {
   const qd = State.queueDetailed;
-  if (El.queueRunningList) {
+  if (El.queueModalRunningList) {
     if (qd.running && qd.running.length > 0) {
-      El.queueRunningList.innerHTML = qd.running.map((t, i) => renderTaskItem(t, true, i, qd.running.length)).join('');
-      El.queueRunningList.querySelectorAll('.queue-task-cancel').forEach(btn => {
+      El.queueModalRunningList.innerHTML = qd.running.map((t, i) => renderTaskItem(t, true, i, qd.running.length)).join('');
+      El.queueModalRunningList.querySelectorAll('.queue-task-cancel').forEach(btn => {
         btn.addEventListener('click', async () => {
           await postJson('/api/cancel_running_task', { task_id: btn.dataset.taskId });
           const { refreshQueueDetailed } = await import('./actions.js');
@@ -951,13 +951,13 @@ export function renderQueueDetailed() {
         });
       });
     } else {
-      El.queueRunningList.textContent = 'なし';
+      El.queueModalRunningList.textContent = 'なし';
     }
   }
-  if (El.queuePendingList) {
+  if (El.queueModalPendingList) {
     if (qd.pending && qd.pending.length > 0) {
-      El.queuePendingList.innerHTML = qd.pending.map((t, i) => renderTaskItem(t, false, i, qd.pending.length)).join('');
-      El.queuePendingList.querySelectorAll('.queue-task-delete').forEach(btn => {
+      El.queueModalPendingList.innerHTML = qd.pending.map((t, i) => renderTaskItem(t, false, i, qd.pending.length)).join('');
+      El.queueModalPendingList.querySelectorAll('.queue-task-delete').forEach(btn => {
         btn.addEventListener('click', async () => {
           const taskId = btn.dataset.taskId;
           await postJson('/api/remove_pending_task', { task_id: taskId });
@@ -967,7 +967,7 @@ export function renderQueueDetailed() {
       });
       // Up/down reorder buttons
       const wireReorder = (selector, direction) => {
-        El.queuePendingList.querySelectorAll(selector).forEach(btn => {
+        El.queueModalPendingList.querySelectorAll(selector).forEach(btn => {
           btn.addEventListener('click', async () => {
             const idx = parseInt(btn.dataset.taskIdx, 10);
             const ids = qd.pending.map(t => t.id);
@@ -985,7 +985,7 @@ export function renderQueueDetailed() {
       wireReorder('.queue-task-down', 1);
       wireQueueDragDrop();
     } else {
-      El.queuePendingList.textContent = 'なし';
+      El.queueModalPendingList.textContent = 'なし';
     }
   }
   if (El.queuePendingCount) {
@@ -1001,8 +1001,8 @@ export function renderQueueDetailed() {
 }
 
 function wireQueueDragDrop() {
-  if (!El.queuePendingList) return;
-  const rows = Array.from(El.queuePendingList.querySelectorAll('.queue-task-item[data-task-id]'));
+  if (!El.queueModalPendingList) return;
+  const rows = Array.from(El.queueModalPendingList.querySelectorAll('.queue-task-item[data-task-id]'));
 
   rows.forEach(row => {
     row.addEventListener('dragstart', (e) => {
@@ -1014,7 +1014,7 @@ function wireQueueDragDrop() {
     row.addEventListener('dragend', () => {
       queueDragTaskId = null;
       row.classList.remove('queue-drag-source');
-      El.queuePendingList?.querySelectorAll('.queue-drop-before, .queue-drop-after')
+      El.queueModalPendingList?.querySelectorAll('.queue-drop-before, .queue-drop-after')
         .forEach(el => el.classList.remove('queue-drop-before', 'queue-drop-after'));
     });
     row.addEventListener('dragover', (e) => {
@@ -1037,13 +1037,13 @@ function wireQueueDragDrop() {
     });
   });
 
-  if (El.queuePendingList.dataset.dragParentBound !== 'true') {
-    El.queuePendingList.dataset.dragParentBound = 'true';
-    El.queuePendingList.addEventListener('dragover', (e) => {
+  if (El.queueModalPendingList.dataset.dragParentBound !== 'true') {
+    El.queueModalPendingList.dataset.dragParentBound = 'true';
+    El.queueModalPendingList.addEventListener('dragover', (e) => {
       if (!queueDragTaskId) return;
       e.preventDefault();
     });
-    El.queuePendingList.addEventListener('drop', async (e) => {
+    El.queueModalPendingList.addEventListener('drop', async (e) => {
       if (!queueDragTaskId) return;
       const target = e.target.closest?.('.queue-task-item[data-task-id]');
       if (target) return;

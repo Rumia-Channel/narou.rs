@@ -6,7 +6,7 @@ import { fetchJson } from './core/http.js';
 import { applyI18n } from './ui/i18n.js';
 import { initDropdowns } from './ui/dropdown.js';
 import { renderNovelList, renderQueueStatus, renderTagList, showNotification, syncViewChecks } from './ui/render.js';
-import { bindActions, refreshList, refreshQueue, refreshTags } from './ui/actions.js';
+import { bindActions, refreshList, refreshQueue, refreshQueueDetailed, refreshTags } from './ui/actions.js';
 
 let ws = null;
 const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
@@ -67,7 +67,7 @@ async function init() {
   } catch { /* use defaults */ }
 
   // Initial data load
-  await Promise.all([refreshListWithUiState(), refreshQueue(), refreshTags()]);
+  await Promise.all([refreshListWithUiState(), refreshQueue(), refreshQueueDetailed(), refreshTags()]);
 
   // Sync UI state (check marks, wide mode, footer)
   syncViewChecks();

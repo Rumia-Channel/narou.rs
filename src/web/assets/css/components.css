@@ -180,6 +180,13 @@ li.enable-selected.disabled a {
   background-color: var(--dropdown-hover-bg);
   text-decoration: none;
 }
+.dropdown-menu > li > a.disabled,
+.dropdown-menu > li > a[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
 
 .dropdown-menu > li.divider {
   height: 0;

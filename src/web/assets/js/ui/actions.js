@@ -206,14 +206,18 @@ export function bindActions() {
   on('action-select-mode-hybrid', () => setSelectMode('hybrid'));
 
   // --- Tag edit ---
-  on('action-tag-edit', () => openTagEditor());
+  on('action-tag-edit', (e) => {
+    void withButtonGuard(e.currentTarget, async () => {
+      await openTagEditor();
+    });
+  });
 
   // --- Tool menu ---
   on('action-tool-notepad', () => { window.location.href = '/notepad'; });
   on('action-tool-notepad-popup', openNotepad);
   on('action-tool-csv-download', downloadCsv);
-  on('action-tool-csv-import', () => {
-    // Trigger hidden file input
+  on('action-tool-csv-import', (e) => {
+    const triggerEl = e.currentTarget;
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.csv';
@@ -221,13 +225,12 @@ export function bindActions() {
       const file = input.files?.[0];
       if (!file) return;
       const text = await file.text();
-      try {
-        await postJson('/api/csv/import', { csv: text });
-        showNotification('CSVインポート完了', 'success');
+      await runGuardedAction(triggerEl, async () => {
+        const result = await postJson('/api/csv/import', { csv: text });
+        assertApiSuccess(result, 'CSVインポートに失敗しました');
+        showNotification(result.message || 'CSVインポート完了', 'success');
         await refreshList();
-      } catch (e) {
-        showNotification('CSVインポート失敗: ' + e.message, 'error');
-      }
+      }, 'CSVインポートに失敗しました');
     });
     input.click();
   });
@@ -400,14 +403,18 @@ export function bindActions() {
   on('download-modal-close', () => downloadModal?.classList.add('hide'));
   on('download-cancel', () => downloadModal?.classList.add('hide'));
 
-  on('download-submit', () => {
+  on('download-submit', (e) => {
+    const triggerEl = e.currentTarget;
     const text = downloadInput?.value?.trim();
     if (!text) return;
     const targets = text.split(/[\s\n]+/).filter(Boolean);
     if (targets.length === 0) return;
     const mail = document.getElementById('download-mail')?.checked || false;
-    postJson('/api/download', { targets, mail });
-    downloadModal?.classList.add('hide');
+    void runGuardedAction(triggerEl, async () => {
+      const result = await postJson('/api/download', { targets, mail });
+      assertApiSuccess(result, 'ダウンロード要求の送信に失敗しました');
+      downloadModal?.classList.add('hide');
+    }, 'ダウンロード要求の送信に失敗しました');
   });
 
   // D&D support for download modal
@@ -435,21 +442,25 @@ export function bindActions() {
     });
   }
 
-  on('action-download-force', () => {
+  on('action-download-force', (e) => {
     const ids = requireSelectedIds();
     if (!ids) return;
-    postJson('/api/download', { targets: ids, force: true });
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/download', { targets: ids, force: true });
+      assertApiSuccess(result, '強制ダウンロード要求の送信に失敗しました');
+    }, '強制ダウンロード要求の送信に失敗しました');
   });
 
-  on('btn-update', () => {
-    if (State.selectedIds.size > 0) {
-      postJson('/api/update', {
-        targets: [...State.selectedIds],
-        ...currentSortStatePayload(),
-      });
-    } else {
-      postJson('/api/update', { update_all: true });
-    }
+  on('btn-update', (e) => {
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = State.selectedIds.size > 0
+        ? await postJson('/api/update', {
+          targets: [...State.selectedIds],
+          ...currentSortStatePayload(),
+        })
+        : await postJson('/api/update', { update_all: true });
+      assertApiSuccess(result, 'アップデート要求の送信に失敗しました');
+    }, 'アップデート要求の送信に失敗しました');
   });
 
   on('action-update-general-lastup', () => {
@@ -466,11 +477,12 @@ export function bindActions() {
 
   on('gl-update-close', () => document.getElementById('gl-update-modal')?.classList.add('hide'));
   on('gl-update-cancel', () => document.getElementById('gl-update-modal')?.classList.add('hide'));
-  const queueGeneralLastupUpdate = (option, isUpdateModified = false) => {
-    postJson('/api/update_general_lastup', {
+  const queueGeneralLastupUpdate = async (option, isUpdateModified = false) => {
+    const result = await postJson('/api/update_general_lastup', {
       option,
       is_update_modified: isUpdateModified
     });
+    assertApiSuccess(result, '最新話掲載日確認の要求送信に失敗しました');
   };
 
   on('gl-update-submit', () => {
@@ -490,36 +502,38 @@ export function bindActions() {
     document.getElementById('gl-update-modal')?.classList.add('hide');
   });
 
-  on('action-update-by-tag', async () => {
-    try {
-      const taginfo = await postJson('/api/taginfo.json', { ids: [0], with_exclusion: true });
-      if (!Array.isArray(taginfo) || taginfo.length === 0) {
-        showNotification('タグが登録されていません', 'warning');
-        return;
+  on('action-update-by-tag', (e) => {
+    void withButtonGuard(e.currentTarget, async () => {
+      try {
+        const taginfo = await postJson('/api/taginfo.json', { ids: [0], with_exclusion: true });
+        if (!Array.isArray(taginfo) || taginfo.length === 0) {
+          showNotification('タグが登録されていません', 'warning');
+          return;
+        }
+        const includeDiv = document.getElementById('update-by-tag-include');
+        const excludeDiv = document.getElementById('update-by-tag-exclude');
+        includeDiv.innerHTML = '';
+        excludeDiv.innerHTML = '';
+        taginfo.forEach(info => {
+          const lbl = document.createElement('label');
+          lbl.style.cssText = 'display:inline-block;margin:0.2em 0.5em;cursor:pointer';
+          lbl.innerHTML = '<input type="checkbox" data-tagname="' +
+            escAttr(info.tag) + '"> ' + info.html + '&nbsp;&nbsp;';
+          includeDiv.appendChild(lbl);
+        });
+        taginfo.forEach(info => {
+          const lbl = document.createElement('label');
+          lbl.style.cssText = 'display:inline-block;margin:0.2em 0.5em;cursor:pointer';
+          lbl.innerHTML = '<input type="checkbox" data-exclusion-tagname="' +
+            escAttr(info.tag) + '"> ' +
+            (info.exclusion_html || info.html) + '&nbsp;&nbsp;';
+          excludeDiv.appendChild(lbl);
+        });
+        document.getElementById('update-by-tag-modal').classList.remove('hide');
+      } catch {
+        showNotification('タグ情報の取得に失敗しました', 'error');
       }
-      const includeDiv = document.getElementById('update-by-tag-include');
-      const excludeDiv = document.getElementById('update-by-tag-exclude');
-      includeDiv.innerHTML = '';
-      excludeDiv.innerHTML = '';
-      taginfo.forEach(info => {
-        const lbl = document.createElement('label');
-        lbl.style.cssText = 'display:inline-block;margin:0.2em 0.5em;cursor:pointer';
-        lbl.innerHTML = '<input type="checkbox" data-tagname="' +
-          escAttr(info.tag) + '"> ' + info.html + '&nbsp;&nbsp;';
-        includeDiv.appendChild(lbl);
-      });
-      taginfo.forEach(info => {
-        const lbl = document.createElement('label');
-        lbl.style.cssText = 'display:inline-block;margin:0.2em 0.5em;cursor:pointer';
-        lbl.innerHTML = '<input type="checkbox" data-exclusion-tagname="' +
-          escAttr(info.tag) + '"> ' +
-          (info.exclusion_html || info.html) + '&nbsp;&nbsp;';
-        excludeDiv.appendChild(lbl);
-      });
-      document.getElementById('update-by-tag-modal').classList.remove('hide');
-    } catch (e) {
-      showNotification('タグ情報の取得に失敗しました', 'error');
-    }
+    });
   });
 
   on('update-by-tag-close', () => document.getElementById('update-by-tag-modal')?.classList.add('hide'));
@@ -541,43 +555,66 @@ export function bindActions() {
     document.getElementById('update-by-tag-modal')?.classList.add('hide');
   });
 
-  on('action-update-view', () => {
+  on('action-update-view', (e) => {
     const ids = getVisibleIds();
-    postJson('/api/update', { targets: ids, ...currentSortStatePayload() });
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/update', { targets: ids, ...currentSortStatePayload() });
+      assertApiSuccess(result, '表示中小説のアップデート要求に失敗しました');
+    }, '表示中小説のアップデート要求に失敗しました');
   });
 
-  on('action-update-force', () => {
-    postJson('/api/update', { update_all: true, force: true });
+  on('action-update-force', (e) => {
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/update', { update_all: true, force: true });
+      assertApiSuccess(result, '強制アップデート要求の送信に失敗しました');
+    }, '強制アップデート要求の送信に失敗しました');
   });
 
-  on('btn-gl-narou', () => {
-    queueGeneralLastupUpdate('narou');
+  on('btn-gl-narou', (e) => {
+    void runGuardedAction(e.currentTarget, async () => {
+      await queueGeneralLastupUpdate('narou');
+    }, '最新話掲載日確認の要求送信に失敗しました');
   });
 
-  on('btn-gl-other', () => {
-    queueGeneralLastupUpdate('other');
+  on('btn-gl-other', (e) => {
+    void runGuardedAction(e.currentTarget, async () => {
+      await queueGeneralLastupUpdate('other');
+    }, '最新話掲載日確認の要求送信に失敗しました');
   });
 
-  on('btn-gl-modified', () => {
-    postJson('/api/update_by_tag', {
-      tags: ['modified'],
-      exclusion_tags: [],
-      ...currentSortStatePayload(),
-    });
+  on('btn-gl-modified', (e) => {
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/update_by_tag', {
+        tags: ['modified'],
+        exclusion_tags: [],
+        ...currentSortStatePayload(),
+      });
+      assertApiSuccess(result, 'modifiedタグ更新の要求送信に失敗しました');
+    }, 'modifiedタグ更新の要求送信に失敗しました');
   });
 
-  on('btn-send', () => {
+  on('btn-send', (e) => {
     const ids = requireSelectedIds();
     if (!ids) return;
-    postJson('/api/send', { targets: ids });
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/send', { targets: ids });
+      assertApiSuccess(result, '送信要求の送信に失敗しました');
+    }, '送信要求の送信に失敗しました');
   });
 
-  on('action-send-backup-bookmark', () => {
-    postJson('/api/backup_bookmark', {});
+  on('action-send-backup-bookmark', (e) => {
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/backup_bookmark', {});
+      assertApiSuccess(result, 'しおりバックアップ要求の送信に失敗しました');
+    }, 'しおりバックアップ要求の送信に失敗しました');
   });
 
-  on('action-freeze-on', () => batchAction('/api/novels/freeze'));
-  on('action-freeze-off', () => batchAction('/api/novels/unfreeze'));
+  on('action-freeze-on', (e) => {
+    void batchAction('/api/novels/freeze', e.currentTarget, '凍結に失敗しました');
+  });
+  on('action-freeze-off', (e) => {
+    void batchAction('/api/novels/unfreeze', e.currentTarget, '凍結解除に失敗しました');
+  });
 
   on('btn-remove', async () => {
     const ids = requireSelectedIds();
@@ -585,10 +622,13 @@ export function bindActions() {
     showRemoveModal(ids);
   });
 
-  on('btn-convert', () => {
+  on('btn-convert', (e) => {
     const ids = requireSelectedIds();
     if (!ids) return;
-    postJson('/api/convert', { targets: ids, ...currentSortStatePayload() });
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/convert', { targets: ids, ...currentSortStatePayload() });
+      assertApiSuccess(result, '変換要求の送信に失敗しました');
+    }, '変換要求の送信に失敗しました');
   });
 
   on('action-other-diff', () => {
@@ -609,22 +649,31 @@ export function bindActions() {
     void openFolderTargets(ids);
   });
 
-  on('action-other-backup', () => {
+  on('action-other-backup', (e) => {
     const ids = requireSelectedIds();
     if (!ids) return;
-    postJson('/api/backup', { targets: ids });
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/backup', { targets: ids });
+      assertApiSuccess(result, 'バックアップ要求の送信に失敗しました');
+    }, 'バックアップ要求の送信に失敗しました');
   });
 
-  on('action-other-setting-burn', () => {
+  on('action-other-setting-burn', (e) => {
     const ids = requireSelectedIds();
     if (!ids) return;
-    postJson('/api/setting_burn', { targets: ids });
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/setting_burn', { targets: ids });
+      assertApiSuccess(result, '設定焼き込み要求の送信に失敗しました');
+    }, '設定焼き込み要求の送信に失敗しました');
   });
 
-  on('action-other-mail', () => {
+  on('action-other-mail', (e) => {
     const ids = requireSelectedIds();
     if (!ids) return;
-    postJson('/api/mail', { targets: ids });
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/mail', { targets: ids });
+      assertApiSuccess(result, 'メール送信要求の送信に失敗しました');
+    }, 'メール送信要求の送信に失敗しました');
   });
 
   on('action-view-link-to-edit-menu', () => {
@@ -771,6 +820,69 @@ function on(id, handler) {
   });
 }
 
+async function withButtonGuard(buttonEl, action) {
+  if (!(buttonEl instanceof HTMLElement)) {
+    return action();
+  }
+  const supportsDisabled = 'disabled' in buttonEl;
+  if (
+    buttonEl.dataset.busy === 'true'
+    || buttonEl.classList.contains('disabled')
+    || buttonEl.getAttribute('aria-disabled') === 'true'
+    || (supportsDisabled && buttonEl.disabled)
+  ) {
+    return null;
+  }
+
+  const hadDisabledClass = buttonEl.classList.contains('disabled');
+  const previousAriaDisabled = buttonEl.getAttribute('aria-disabled');
+  const previousTabIndex = buttonEl.getAttribute('tabindex');
+  const previousDisabled = supportsDisabled ? buttonEl.disabled : false;
+
+  buttonEl.dataset.busy = 'true';
+  buttonEl.classList.add('disabled');
+  buttonEl.setAttribute('aria-disabled', 'true');
+  if (supportsDisabled) {
+    buttonEl.disabled = true;
+  }
+  if (buttonEl.tagName === 'A') {
+    buttonEl.setAttribute('tabindex', '-1');
+  }
+
+  try {
+    return await action();
+  } finally {
+    delete buttonEl.dataset.busy;
+    if (supportsDisabled) {
+      buttonEl.disabled = previousDisabled;
+    }
+    if (!hadDisabledClass) {
+      buttonEl.classList.remove('disabled');
+    }
+    if (previousAriaDisabled === null) {
+      buttonEl.removeAttribute('aria-disabled');
+    } else {
+      buttonEl.setAttribute('aria-disabled', previousAriaDisabled);
+    }
+    if (buttonEl.tagName === 'A') {
+      if (previousTabIndex === null) {
+        buttonEl.removeAttribute('tabindex');
+      } else {
+        buttonEl.setAttribute('tabindex', previousTabIndex);
+      }
+    }
+  }
+}
+
+async function runGuardedAction(buttonEl, action, errorMessage) {
+  try {
+    return await withButtonGuard(buttonEl, action);
+  } catch (error) {
+    showNotification(error.message || errorMessage, 'error');
+    return null;
+  }
+}
+
 function assertApiSuccess(result, fallbackMessage) {
   if (result && result.success === false) {
     throw new Error(result.message || fallbackMessage);
@@ -882,11 +994,14 @@ function setSelectMode(mode) {
   syncViewChecks();
 }
 
-async function batchAction(endpoint) {
+async function batchAction(endpoint, triggerEl, errorMessage = '操作に失敗しました') {
   const ids = requireSelectedIds();
   if (!ids) return;
-  await postJson(endpoint, { ids: ids.map(Number) });
-  await refreshList();
+  await runGuardedAction(triggerEl, async () => {
+    const result = await postJson(endpoint, { ids: ids.map(Number) });
+    assertApiSuccess(result, errorMessage);
+    await refreshList();
+  }, errorMessage);
 }
 
 function requireSelectedIds() {
@@ -1365,18 +1480,17 @@ function showRemoveModal(ids) {
     El.removeCancel.removeEventListener('click', onCancel);
   };
   const onOk = async () => {
+    await runGuardedAction(El.removeOk, async () => {
       const withFile = El.removeWithFile.checked;
+      const result = await postJson('/api/novels/remove', {
+        ids: numericIds,
+        with_file: withFile,
+        ...currentSortStatePayload(),
+      });
+      assertApiSuccess(result, '削除に失敗しました');
       cleanup();
-      try {
-        await postJson('/api/novels/remove', {
-          ids: numericIds,
-          with_file: withFile,
-          ...currentSortStatePayload(),
-        });
-        await refreshList();
-      } catch (e) {
-        showNotification('削除に失敗しました: ' + e.message, 'error');
-    }
+      await refreshList();
+    }, '削除に失敗しました');
   };
   const onCancel = () => cleanup();
   El.removeOk.addEventListener('click', onOk);

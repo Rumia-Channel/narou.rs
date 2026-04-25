@@ -87,7 +87,7 @@ const ELEMENT_IDS = [
   'control-panel',
   'notepad-modal', 'notepad', 'notepad-close', 'save-notepad-button',
   'queue-modal', 'queue-modal-close', 'queue-clear-button', 'queue-reload-button',
-  'queue-running-list', 'queue-pending-list', 'queue-pending-count',
+  'queue-running-list', 'queue-pending-list', 'queue-modal-running-list', 'queue-modal-pending-list', 'queue-pending-count',
   'queue-restore-modal', 'queue-restore-yes', 'queue-restore-no',
   'tag-list-canvas',
   'tag-edit-modal', 'tag-edit-close', 'tag-edit-cancel',
