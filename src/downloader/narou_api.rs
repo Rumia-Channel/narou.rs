@@ -3,6 +3,38 @@ use chrono::{DateTime, Utc};
 use crate::error::Result;
 
 use super::fetch::HttpFetcher;
+use super::rate_limit::RateLimiter;
+
+const NAROU_API_DEFAULT_USER_AGENT: &str = "Narou RS";
+const NAROU_API_DEFAULT_INTERVAL_SECS: f64 = 1.0;
+
+/// User-Agent used for なろうAPI requests.
+/// Configured via the `download.narou-api.user-agent` local setting.
+pub fn narou_api_user_agent() -> String {
+    crate::compat::load_local_setting_string("download.narou-api.user-agent")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| NAROU_API_DEFAULT_USER_AGENT.to_string())
+}
+
+/// Minimum wait time (seconds) between なろうAPI requests.
+/// Configured via the `download.narou-api.interval` local setting.
+pub fn narou_api_interval_secs() -> f64 {
+    crate::compat::load_local_setting_value("download.narou-api.interval")
+        .and_then(|value| match value {
+            serde_yaml::Value::Number(number) => number.as_f64(),
+            serde_yaml::Value::String(raw) => raw.parse::<f64>().ok(),
+            _ => None,
+        })
+        .unwrap_or(NAROU_API_DEFAULT_INTERVAL_SECS)
+        .max(0.0)
+}
+
+/// Rate limiter dedicated to なろうAPI calls. Independent of the
+/// `download.interval` / `download.wait-steps` settings used by per-episode
+/// downloads.
+pub fn narou_api_rate_limiter() -> RateLimiter {
+    RateLimiter::with_settings(narou_api_interval_secs(), 0)
+}
 
 /// Parse a date/time string from the Syosetu API.
 /// The API returns dates as `"YYYY-MM-DD HH:MM:SS"` (not RFC 3339).
@@ -40,6 +72,8 @@ pub fn narou_api_batch_update(fetcher: &mut HttpFetcher) -> Result<(usize, usize
     }
 
     let api_url = "https://api.syosetu.com/novelapi/api/";
+    let api_user_agent = narou_api_user_agent();
+    let api_rate_limiter = narou_api_rate_limiter();
     let mut total_updated = 0usize;
     let mut total_failed = 0usize;
 
@@ -56,8 +90,13 @@ pub fn narou_api_batch_update(fetcher: &mut HttpFetcher) -> Result<(usize, usize
             api_url, ncode_param
         );
 
-        fetcher.rate_limiter.wait_for_url(&url);
-        let response = match fetcher.client.get(&url).send() {
+        api_rate_limiter.wait_for_url(&url);
+        let response = match fetcher
+            .client
+            .get(&url)
+            .header(reqwest::header::USER_AGENT, &api_user_agent)
+            .send()
+        {
             Ok(r) => r,
             Err(_e) => {
                 total_failed += chunk.len();

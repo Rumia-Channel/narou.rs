@@ -45,6 +45,14 @@ impl RateLimiter {
         }
     }
 
+    /// Build a rate limiter with explicit interval/wait-steps, bypassing the
+    /// default `download.interval` / `download.wait-steps` settings.
+    /// Used by code paths (e.g. なろうAPI) that have their own dedicated
+    /// rate-limit configuration.
+    pub fn with_settings(interval_secs: f64, wait_steps: u32) -> Self {
+        Self::from_values(interval_secs, wait_steps)
+    }
+
     pub fn wait(&self) {
         self.wait_for_host(GLOBAL_HOST_KEY);
     }

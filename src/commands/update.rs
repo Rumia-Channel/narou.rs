@@ -1272,10 +1272,10 @@ fn update_general_lastup_narou(
         return outcome;
     }
 
-    let ua = user_agent
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| ua_generator::ua::spoof_firefox_ua().to_string());
-    let fetcher = match narou_rs::downloader::fetch::HttpFetcher::new(&ua) {
+    let _ = user_agent; // The dedicated なろうAPI UA overrides the per-request UA.
+    let api_user_agent = narou_rs::downloader::narou_api::narou_api_user_agent();
+    let api_rate_limiter = narou_rs::downloader::narou_api::narou_api_rate_limiter();
+    let fetcher = match narou_rs::downloader::fetch::HttpFetcher::new(&api_user_agent) {
         Ok(f) => f,
         Err(_) => {
             outcome.had_api_error = true;
@@ -1293,8 +1293,13 @@ fn update_general_lastup_narou(
                 api_url, ncode_param
             );
 
-            fetcher.rate_limiter.wait_for_url(&url);
-            let response = match fetcher.client.get(&url).send() {
+            api_rate_limiter.wait_for_url(&url);
+            let response = match fetcher
+                .client
+                .get(&url)
+                .header(reqwest::header::USER_AGENT, &api_user_agent)
+                .send()
+            {
                 Ok(r) => r,
                 Err(_) => {
                     outcome.had_api_error = true;

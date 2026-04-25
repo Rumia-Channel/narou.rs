@@ -38,6 +38,8 @@ pub fn default_local_setting_value(name: &str) -> Option<serde_yaml::Value> {
         "convert.dc-subject-exclude-tags" => Some(serde_yaml::Value::String("404,end".to_string())),
         "download.interval" => serde_yaml::to_value(0.7f64).ok(),
         "download.wait-steps" => Some(serde_yaml::Value::Number(serde_yaml::Number::from(0))),
+        "download.narou-api.interval" => serde_yaml::to_value(1.0f64).ok(),
+        "download.narou-api.user-agent" => Some(serde_yaml::Value::String("Narou RS".to_string())),
         "folder-length-limit" | "filename-length-limit" => {
             Some(serde_yaml::Value::Number(serde_yaml::Number::from(50)))
         }
@@ -105,6 +107,8 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "logging.format-timestamp"
         | "download.interval"
         | "download.wait-steps"
+        | "download.narou-api.interval"
+        | "download.narou-api.user-agent"
         | "download.use-subdirectory"
         | "download.choices-of-digest-options"
         | "send.backup-bookmark"
@@ -741,6 +745,20 @@ pub fn setting_variables() -> SettingVariables {
             vis(
                 VarType::Integer,
                 "指定した話数ごとに長めのウェイトが入る\n      ※注意：11以上を設定してもなろうの場合は10話ごとにウェイトが入ります",
+            ),
+        ),
+        (
+            "download.narou-api.interval",
+            vis(
+                VarType::Float,
+                "なろうAPI（小説情報の一括更新等）リクエスト時の最小ウェイト秒数。未設定時 1.0",
+            ),
+        ),
+        (
+            "download.narou-api.user-agent",
+            vis(
+                VarType::String,
+                "なろうAPI リクエスト時に使用する User-Agent。未設定時 Narou RS",
             ),
         ),
         (
