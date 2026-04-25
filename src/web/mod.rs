@@ -7,7 +7,7 @@ pub mod novel_settings;
 pub mod novels;
 pub mod push;
 pub mod scheduler;
-mod sort_state;
+pub mod sort_state;
 pub mod state;
 mod tag_colors;
 pub mod tags;
@@ -218,6 +218,14 @@ pub(crate) fn request_host_allowed(
     state: &AppState,
     expected_port: u16,
 ) -> bool {
+    request_host_allowed_for_ports(headers, state, &[expected_port])
+}
+
+pub(crate) fn request_host_allowed_for_ports(
+    headers: &HeaderMap,
+    state: &AppState,
+    expected_ports: &[u16],
+) -> bool {
     let Some(host) = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
@@ -227,10 +235,18 @@ pub(crate) fn request_host_allowed(
     if state.reverse_proxy_mode {
         return parse_authority_host_and_port(host, false).is_some();
     }
-    authority_matches_state(host, state, expected_port, false)
+    authority_matches_state(host, state, expected_ports, false)
 }
 
 pub(crate) fn origin_allowed(headers: &HeaderMap, state: &AppState, expected_port: u16) -> bool {
+    origin_allowed_for_ports(headers, state, &[expected_port])
+}
+
+pub(crate) fn origin_allowed_for_ports(
+    headers: &HeaderMap,
+    state: &AppState,
+    expected_ports: &[u16],
+) -> bool {
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
@@ -245,7 +261,7 @@ pub(crate) fn origin_allowed(headers: &HeaderMap, state: &AppState, expected_por
     if state.reverse_proxy_mode {
         return origin_matches_forwarded_host(headers, origin);
     }
-    authority_matches_state(origin, state, expected_port, true)
+    authority_matches_state(origin, state, expected_ports, true)
 }
 
 fn internal_control_token_matches(headers: &HeaderMap, state: &AppState) -> bool {
@@ -261,7 +277,7 @@ fn internal_control_token_matches(headers: &HeaderMap, state: &AppState) -> bool
 fn authority_matches_state(
     value: &str,
     state: &AppState,
-    expected_port: u16,
+    expected_ports: &[u16],
     is_url: bool,
 ) -> bool {
     let Some((host, port)) = parse_authority_host_and_port(value, is_url) else {
@@ -271,7 +287,7 @@ fn authority_matches_state(
         return false;
     }
     match port {
-        Some(port) => port == expected_port,
+        Some(port) => expected_ports.contains(&port),
         None => true,
     }
 }
@@ -647,7 +663,7 @@ mod tests {
 
     use super::{
         AppState, basic_auth_matches, is_exact_subdomain_wildcard_match, is_safe_wildcard_pattern,
-        origin_allowed, removal_log_message, request_host_allowed, safe_existing_novel_dir,
+        origin_allowed, origin_allowed_for_ports, removal_log_message, request_host_allowed, safe_existing_novel_dir,
         validate_web_tag_name, wildcard_host_match,
     };
 
@@ -805,6 +821,22 @@ mod tests {
             axum::http::header::ORIGIN,
             axum::http::HeaderValue::from_static("http://evil.test:8080"),
         );
+        assert!(!origin_allowed(&headers, &state, state.port));
+    }
+
+    #[test]
+    fn multi_port_origin_validation_accepts_ws_port() {
+        let state = test_state();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("http://localhost:8081"),
+        );
+        assert!(origin_allowed_for_ports(
+            &headers,
+            &state,
+            &[state.port, state.ws_port]
+        ));
         assert!(!origin_allowed(&headers, &state, state.port));
     }
 

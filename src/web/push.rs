@@ -19,6 +19,7 @@ use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Duration, Instant};
 
 use super::AppState;
@@ -30,6 +31,8 @@ const MAX_WS_FRAME_SIZE: usize = 64 * 1024;
 const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024;
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const WS_CLIENT_QUEUE_CAPACITY: usize = 1024;
+const WS_MAX_CONSECUTIVE_FULL_SENDS: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct BroadcastChannel {
@@ -60,11 +63,27 @@ struct ClientMessage {
     replayed_by_history: bool,
 }
 
+#[derive(Debug)]
+struct ClientHandle {
+    sender: mpsc::Sender<ClientMessage>,
+    consecutive_full_send_count: AtomicUsize,
+}
+
+impl ClientHandle {
+    fn new(sender: mpsc::Sender<ClientMessage>) -> Self {
+        Self {
+            sender,
+            consecutive_full_send_count: AtomicUsize::new(0),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ConsoleHistoryEntry {
     id: u64,
-    body: String,
-    target_console: String,
+    message_type: String,
+    body: Option<String>,
+    target_console: Option<String>,
     scope: Option<String>,
     payload: String,
 }
@@ -95,7 +114,7 @@ impl From<WsClientQuery> for ClientFilter {
 #[derive(Debug)]
 pub struct PushServer {
     channel: BroadcastChannel,
-    clients: DashMap<usize, mpsc::UnboundedSender<ClientMessage>>,
+    clients: DashMap<usize, ClientHandle>,
     connected_clients: AtomicUsize,
     next_client_id: AtomicUsize,
     next_message_id: AtomicU64,
@@ -177,65 +196,50 @@ impl PushServer {
     }
 
     pub fn broadcast(&self, event_type: &str, data: &str) {
-        self.publish_json(
-            serde_json::json!({
-                "type": event_type,
-                "data": data,
-            }),
-            Some((data, "stdout")),
-        );
+        self.publish_json(serde_json::json!({
+            "type": event_type,
+            "data": data,
+        }));
     }
 
     /// Send a control event (table.reload, queue_start, etc.) without polluting console history.
     pub fn broadcast_event(&self, event_type: &str, data: &str) {
-        self.publish_json(
-            serde_json::json!({
-                "type": event_type,
-                "data": data,
-            }),
-            None,
-        );
+        self.publish_json(serde_json::json!({
+            "type": event_type,
+            "data": data,
+        }));
     }
 
     /// Send an echo event to stream subprocess output to the browser console.
     /// Matches Ruby's `{echo: {target_console: "stdout", body: "...", no_history: false}}`.
     pub fn broadcast_echo(&self, body: &str, target_console: &str) {
-        self.publish_json(
-            serde_json::json!({
-                "type": "echo",
-                "body": body,
-                "target_console": target_console,
-            }),
-            Some((body, target_console)),
-        );
+        self.publish_json(serde_json::json!({
+            "type": "echo",
+            "body": body,
+            "target_console": target_console,
+        }));
     }
 
     /// Send a pre-built JSON message directly (used by WebProgress interception in worker).
     pub fn broadcast_raw(&self, value: &serde_json::Value) {
-        self.publish_json(value.clone(), None);
+        self.publish_json(value.clone());
     }
 
     pub fn broadcast_progress(&self, current: usize, total: usize, message: &str) {
-        self.publish_json(
-            serde_json::json!({
-                "type": "progress",
-                "current": current,
-                "total": total,
-                "message": message,
-            }),
-            None,
-        );
+        self.publish_json(serde_json::json!({
+            "type": "progress",
+            "current": current,
+            "total": total,
+            "message": message,
+        }));
     }
 
     pub fn broadcast_log(&self, level: &str, message: &str) {
-        self.publish_json(
-            serde_json::json!({
-                "type": "log",
-                "level": level,
-                "message": message,
-            }),
-            Some((message, "stdout")),
-        );
+        self.publish_json(serde_json::json!({
+            "type": "log",
+            "level": level,
+            "message": message,
+        }));
     }
 
     pub fn broadcast_error(&self, message: &str) {
@@ -247,14 +251,11 @@ impl PushServer {
     }
 
     pub fn broadcast_progressbar_init_to(&self, topic: &str, target_console: &str) {
-        self.publish_json(
-            serde_json::json!({
-                "type": "progressbar.init",
-                "data": { "topic": topic },
-                "target_console": target_console,
-            }),
-            None,
-        );
+        self.publish_json(serde_json::json!({
+            "type": "progressbar.init",
+            "data": { "topic": topic },
+            "target_console": target_console,
+        }));
     }
 
     pub fn broadcast_progressbar_step(&self, percent: f64, topic: &str) {
@@ -262,14 +263,11 @@ impl PushServer {
     }
 
     pub fn broadcast_progressbar_step_to(&self, percent: f64, topic: &str, target_console: &str) {
-        self.publish_json(
-            serde_json::json!({
-                "type": "progressbar.step",
-                "data": { "percent": percent, "topic": topic },
-                "target_console": target_console,
-            }),
-            None,
-        );
+        self.publish_json(serde_json::json!({
+            "type": "progressbar.step",
+            "data": { "percent": percent, "topic": topic },
+            "target_console": target_console,
+        }));
     }
 
     pub fn broadcast_progressbar_clear(&self, topic: &str) {
@@ -277,39 +275,57 @@ impl PushServer {
     }
 
     pub fn broadcast_progressbar_clear_to(&self, topic: &str, target_console: &str) {
-        self.publish_json(
-            serde_json::json!({
-                "type": "progressbar.clear",
-                "data": { "topic": topic },
-                "target_console": target_console,
-            }),
-            None,
-        );
+        self.publish_json(serde_json::json!({
+            "type": "progressbar.clear",
+            "data": { "topic": topic },
+            "target_console": target_console,
+        }));
     }
 
-    fn publish_json(&self, value: serde_json::Value, history: Option<(&str, &str)>) {
+    fn publish_json(&self, value: serde_json::Value) {
         let payload = value.to_string();
         let id = self.next_message_id.fetch_add(1, Ordering::Relaxed) + 1;
         let target_console = message_target_console(&value);
         let scope = message_scope(&value);
-        if let Some((body, history_target_console)) = history {
-            self.append_history(id, body, history_target_console, scope.clone());
-        }
+        let replayed_by_history = history_entry_from_value(id, &value, scope.clone(), payload.clone())
+            .map(|entry| {
+                self.append_history(entry);
+                true
+            })
+            .unwrap_or(false);
         self.channel.send(&payload);
         self.dispatch_to_clients(ClientMessage {
             id,
             payload: Arc::new(payload),
             target_console,
             scope,
-            replayed_by_history: history.is_some(),
+            replayed_by_history,
         });
     }
 
     fn dispatch_to_clients(&self, message: ClientMessage) {
         let mut stale_client_ids = Vec::new();
         for client in self.clients.iter() {
-            if client.value().send(message.clone()).is_err() {
-                stale_client_ids.push(*client.key());
+            match client.value().sender.try_send(message.clone()) {
+                Ok(()) => {
+                    client
+                        .value()
+                        .consecutive_full_send_count
+                        .store(0, Ordering::Release);
+                }
+                Err(TrySendError::Full(_)) => {
+                    let full_send_count = client
+                        .value()
+                        .consecutive_full_send_count
+                        .fetch_add(1, Ordering::AcqRel)
+                        + 1;
+                    if full_send_count >= WS_MAX_CONSECUTIVE_FULL_SENDS {
+                        stale_client_ids.push(*client.key());
+                    }
+                }
+                Err(TrySendError::Closed(_)) => {
+                    stale_client_ids.push(*client.key());
+                }
             }
         }
         for client_id in stale_client_ids {
@@ -317,7 +333,7 @@ impl PushServer {
         }
     }
 
-    fn try_register_client(&self, sender: mpsc::UnboundedSender<ClientMessage>) -> Option<usize> {
+    fn try_register_client(&self, sender: mpsc::Sender<ClientMessage>) -> Option<usize> {
         loop {
             let current = self.connected_clients.load(Ordering::Acquire);
             if current >= self.max_clients {
@@ -332,7 +348,7 @@ impl PushServer {
             }
         }
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
-        self.clients.insert(id, sender);
+        self.clients.insert(id, ClientHandle::new(sender));
         Some(id)
     }
 
@@ -360,15 +376,9 @@ impl PushServer {
         selected
     }
 
-    fn append_history(&self, id: u64, message: &str, target_console: &str, scope: Option<String>) {
+    fn append_history(&self, entry: ConsoleHistoryEntry) {
         let mut history = self.console_history.lock();
-        history.push(ConsoleHistoryEntry {
-            id,
-            body: message.to_string(),
-            target_console: target_console.to_string(),
-            scope,
-            payload: history_payload(message, target_console),
-        });
+        history.push(entry);
         if history.len() > self.max_history {
             let drain_count = history.len() - self.max_history + 500;
             history.drain(..drain_count);
@@ -396,8 +406,8 @@ impl PushServer {
         let target_stream = stream.unwrap_or("stdout");
         history
             .iter()
-            .filter(|entry| entry.target_console == target_stream)
-            .map(|entry| entry.body.as_str())
+            .filter(|entry| entry.target_console.as_deref() == Some(target_stream))
+            .filter_map(|entry| entry.body.as_deref())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -412,7 +422,7 @@ impl PushServer {
         let start = history.len().saturating_sub(count);
         history[start..]
             .iter()
-            .map(|entry| entry.body.clone())
+            .map(|entry| entry.body.clone().unwrap_or_else(|| entry.payload.clone()))
             .collect()
     }
 }
@@ -458,9 +468,8 @@ pub async fn ws_handler_with_app_state(
 }
 
 fn validate_ws_request(headers: &HeaderMap, state: &AppState) -> Result<(), StatusCode> {
-    if !super::request_host_allowed(headers, state, state.ws_port)
-        && !super::request_host_allowed(headers, state, state.port)
-    {
+    let allowed_ports = [state.port, state.ws_port];
+    if !super::request_host_allowed_for_ports(headers, state, &allowed_ports) {
         return Err(StatusCode::BAD_REQUEST);
     }
     if !super::basic_auth_matches(headers, state.basic_auth_header.as_deref()) {
@@ -471,7 +480,7 @@ fn validate_ws_request(headers: &HeaderMap, state: &AppState) -> Result<(), Stat
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     if !state.push_server.accepts_origin(origin)
-        || !super::origin_allowed(headers, state, state.port)
+        || !super::origin_allowed_for_ports(headers, state, &allowed_ports)
     {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -479,7 +488,7 @@ fn validate_ws_request(headers: &HeaderMap, state: &AppState) -> Result<(), Stat
 }
 
 async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>, client_filter: ClientFilter) {
-    let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+    let (client_tx, mut client_rx) = mpsc::channel(WS_CLIENT_QUEUE_CAPACITY);
     let Some(client_id) = push_server.try_register_client(client_tx) else {
         let (mut sender, _) = socket.split();
         let _ = sender.send(Message::Close(None)).await;
@@ -495,7 +504,7 @@ async fn handle_socket(socket: WebSocket, push_server: Arc<PushServer>, client_f
     for entry in history {
         if !PushServer::client_matches_filter(
             &client_filter,
-            Some(entry.target_console.as_str()),
+            entry.target_console.as_deref(),
             entry.scope.as_deref(),
         ) {
             continue;
@@ -592,13 +601,71 @@ fn message_scope(value: &serde_json::Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn history_payload(body: &str, target_console: &str) -> String {
-    serde_json::json!({
-        "type": "echo",
-        "body": body,
-        "target_console": target_console,
+fn history_entry_from_value(
+    id: u64,
+    value: &serde_json::Value,
+    scope: Option<String>,
+    payload: String,
+) -> Option<ConsoleHistoryEntry> {
+    let message_type = value.get("type").and_then(serde_json::Value::as_str)?;
+    if !history_type_replayable(message_type) {
+        return None;
+    }
+    let body = history_body(value, message_type);
+    let target_console = message_target_console(value)
+        .or_else(|| default_history_target_console(message_type).map(ToOwned::to_owned));
+    Some(ConsoleHistoryEntry {
+        id,
+        message_type: message_type.to_string(),
+        body,
+        target_console,
+        scope,
+        payload,
     })
-    .to_string()
+}
+
+fn history_type_replayable(message_type: &str) -> bool {
+    matches!(
+        message_type,
+        "echo"
+            | "error"
+            | "log"
+            | "progress"
+            | "progressbar.init"
+            | "progressbar.step"
+            | "progressbar.clear"
+    )
+}
+
+fn history_body(value: &serde_json::Value, message_type: &str) -> Option<String> {
+    match message_type {
+        "echo" => value
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        "error" => value
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+            .map(ToOwned::to_owned),
+        "log" => value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("text").and_then(serde_json::Value::as_str))
+            .map(ToOwned::to_owned),
+        "progress" => value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn default_history_target_console(message_type: &str) -> Option<&'static str> {
+    match message_type {
+        "echo" | "error" | "log" => Some("stdout"),
+        _ => None,
+    }
 }
 
 fn origin_to_domain(origin: &str) -> String {
@@ -779,8 +846,8 @@ mod tests {
     #[test]
     fn register_client_respects_max_clients_limit() {
         let server = PushServer::new_with_limits(1, 16);
-        let (tx1, _rx1) = mpsc::unbounded_channel();
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (tx2, _rx2) = mpsc::channel(1);
 
         let first_id = server.try_register_client(tx1).expect("first client");
         assert_eq!(server.client_count(), 1);
@@ -789,14 +856,14 @@ mod tests {
         server.unregister_client(first_id);
         assert_eq!(server.client_count(), 0);
 
-        let (tx3, _rx3) = mpsc::unbounded_channel();
+        let (tx3, _rx3) = mpsc::channel(1);
         assert!(server.try_register_client(tx3).is_some());
     }
 
     #[test]
     fn history_snapshot_ids_allow_live_dedup_without_dropping_control_events() {
         let server = PushServer::new_with_limits(4, 16);
-        let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+        let (client_tx, mut client_rx) = mpsc::channel(8);
         let client_id = server.try_register_client(client_tx).expect("client");
 
         server.broadcast_echo("history line", "stdout");
@@ -816,6 +883,129 @@ mod tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(second_live.payload.as_str()).unwrap()["type"], "table.reload");
 
         server.unregister_client(client_id);
+    }
+
+    #[test]
+    fn slow_clients_are_dropped_after_consecutive_queue_overflows() {
+        let server = PushServer::new_with_limits(4, 16);
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        let client_id = server.try_register_client(client_tx).expect("client");
+
+        server.broadcast_raw(&serde_json::json!({ "type": "table.reload" }));
+        for _ in 0..(WS_MAX_CONSECUTIVE_FULL_SENDS - 1) {
+            server.broadcast_raw(&serde_json::json!({ "type": "queue.start" }));
+        }
+        assert_eq!(server.client_count(), 1);
+
+        server.broadcast_raw(&serde_json::json!({ "type": "queue.stop" }));
+        assert_eq!(server.client_count(), 0);
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                client_rx.try_recv().expect("queued message").payload.as_str()
+            )
+            .unwrap()["type"],
+            "table.reload"
+        );
+        assert!(matches!(
+            client_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+
+        server.unregister_client(client_id);
+    }
+
+    #[test]
+    fn closed_clients_are_removed_on_next_dispatch() {
+        let server = PushServer::new_with_limits(4, 16);
+        let (client_tx, client_rx) = mpsc::channel(1);
+        let client_id = server.try_register_client(client_tx).expect("client");
+        drop(client_rx);
+
+        server.broadcast_raw(&serde_json::json!({ "type": "table.reload" }));
+        assert_eq!(server.client_count(), 0);
+
+        server.unregister_client(client_id);
+    }
+
+    #[test]
+    fn history_snapshot_preserves_message_types_and_structured_progress() {
+        let server = PushServer::new_with_limits(4, 16);
+
+        server.broadcast_error("boom");
+        server.broadcast_log("warn", "careful");
+        server.broadcast_raw(&serde_json::json!({
+            "type": "progressbar.step",
+            "data": { "percent": 42.0, "topic": "convert", "scope": "job-1" },
+            "target_console": "stdout2",
+        }));
+
+        let history = server.history_snapshot();
+        let history_types: Vec<&str> = history.iter().map(|entry| entry.message_type.as_str()).collect();
+        assert_eq!(history_types, vec!["error", "log", "progressbar.step"]);
+        assert_eq!(history[0].body.as_deref(), Some("boom"));
+        assert_eq!(history[1].body.as_deref(), Some("careful"));
+        assert_eq!(history[2].target_console.as_deref(), Some("stdout2"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&history[2].payload).unwrap()["type"],
+            "progressbar.step"
+        );
+
+        let recent_logs = server.recent_logs(3);
+        assert_eq!(recent_logs[0], "boom");
+        assert_eq!(recent_logs[1], "careful");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recent_logs[2]).unwrap()["type"],
+            "progressbar.step"
+        );
+    }
+
+    #[test]
+    fn ws_request_accepts_same_origin_ws_port() {
+        let queue_dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-artifacts")
+            .join(format!("push-ws-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&queue_dir);
+        std::fs::create_dir_all(&queue_dir).unwrap();
+
+        let mut push_server = PushServer::new();
+        push_server.set_accepted_domains(["localhost"]);
+        let state = AppState {
+            port: 4000,
+            ws_port: 4001,
+            push_server: Arc::new(push_server),
+            basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
+            control_token: "control-token".to_string(),
+            allowed_request_hosts: vec!["localhost".to_string()],
+            reverse_proxy_mode: false,
+            queue: Arc::new(
+                crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
+            ),
+            restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cancelled_job_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            auto_update_scheduler: Arc::new(parking_lot::Mutex::new(None)),
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            header::HeaderValue::from_static("localhost:4001"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("http://localhost:4001"),
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+
+        assert_eq!(validate_ws_request(&headers, &state), Ok(()));
     }
 
     #[test]
