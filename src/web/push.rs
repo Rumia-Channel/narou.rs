@@ -81,7 +81,6 @@ impl ClientHandle {
 #[derive(Debug, Clone)]
 struct ConsoleHistoryEntry {
     id: u64,
-    message_type: String,
     body: Option<String>,
     target_console: Option<String>,
     scope: Option<String>,
@@ -628,7 +627,6 @@ fn history_entry_from_value(
         .or_else(|| default_history_target_console(message_type).map(ToOwned::to_owned));
     Some(ConsoleHistoryEntry {
         id,
-        message_type: message_type.to_string(),
         body,
         target_console,
         scope,
@@ -985,7 +983,15 @@ mod tests {
         }));
 
         let history = server.history_snapshot();
-        let history_types: Vec<&str> = history.iter().map(|entry| entry.message_type.as_str()).collect();
+        let history_types: Vec<String> = history
+            .iter()
+            .map(|entry| {
+                serde_json::from_str::<serde_json::Value>(&entry.payload).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
         assert_eq!(history_types, vec!["error", "log", "progressbar.step"]);
         assert_eq!(history[0].body.as_deref(), Some("boom"));
         assert_eq!(history[1].body.as_deref(), Some("careful"));
