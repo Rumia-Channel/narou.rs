@@ -540,8 +540,7 @@ fn create_ibunko_epub_output(
 }
 
 fn load_dc_subjects_for_novel(novel_id: i64) -> std::result::Result<Option<Vec<String>>, String> {
-    if novel_id <= 0 || !narou_rs::compat::load_local_setting_bool("convert.add-dc-subject-to-epub")
-    {
+    if !narou_rs::compat::load_local_setting_bool("convert.add-dc-subject-to-epub") {
         return Ok(None);
     }
 

@@ -118,7 +118,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `--path` | `-p` | string | — | AozoraEpub3 フォルダ指定。`:keep` で既存再利用 |
 | `--line-height` | `-l` | float | 1.8 | 行の高さ (em) |
 
-**Rust 実装**: `src/commands/init.rs`。Ruby版同様、初期化時は `.narou/`・`小説データ/`・ユーザー編集用 `webnovel/` を作成し、`webnovel/*.yaml` を初回コピーする。`.narou/local_setting.yaml` や `queue.yaml` などの inventory ファイルは init 時に eager 生成せず、各機能が必要になった時点で作る。AozoraEpub3 / mail 用の preset は repo 直下 `preset/` に同梱し、`init` / `mail` が `sample/narou/preset` に依存せず自己完結で動くようにした。2026-04 の FS hardening で `--path` / `:keep` は絶対パスのみ受け付け、UNC・drive-relative・`\\?\` 形式を拒否した上で canonicalize 後も `AozoraEpub3.jar` の親ディレクトリ一致を再確認する。
+**Rust 実装**: `src/commands/init.rs`。Ruby版同様、初期化時は `.narou/`・`小説データ/`・ユーザー編集用 `webnovel/` を作成し、`webnovel/*.yaml` を初回コピーする。`.narou/local_setting.yaml` や `queue.yaml` などの inventory ファイルは init 時に eager 生成せず、各機能が必要になった時点で作る。AozoraEpub3 / mail 用の preset は repo 直下 `preset/` に同梱し、`init` / `mail` が `sample/narou/preset` に依存せず自己完結で動くようにした。2026-04 の FS hardening で `--path` は `./AozoraEpub3` のような相対パスも一度 absolute/canonicalize へ展開してから検証・保存しつつ、UNC・drive-relative・`\\?\` 形式は引き続き拒否する。`:keep` は既存挙動のまま有効な保存済みパスだけを再利用する。
 
 ---
 
@@ -174,7 +174,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 **実装済み動作**:
 - `-n`/`--no-convert`: 変換スキップ
 - `-a`/`--convert-only-new-arrival`: 新着がある場合のみ変換（設定 `update.convert-only-new-arrival` にも対応）
-- `--gl [OPT]`: なろう API バッチで `general_lastup` を更新し、変更のあった小説に `modified` タグを付与。OPT省略=全、`narou`=なろうAPI対応のみ、`other`=非なろうのみ
+- `--gl [OPT]`: なろう API バッチで `general_lastup` を更新し、API が title を返さない/返せない小説は Ruby版同様 individual TOC 取得へフォールバックする。`modified` タグは Ruby版に合わせて `novelupdated_at` が手元の `last_check_date` / `last_update` より新しい時だけ付与し、修正が無い時は外す。`novelupdated_at` 未取得サイトは従来どおり `general_lastup` 差分ベースを維持する。OPT省略=全、`narou`=なろうAPI対応のみ、`other`=非なろうのみ
 - `-f`/`--force`: 凍結小説も更新
 - `-s`/`--sort-by KEY`: 更新順ソート（設定 `update.sort-by` にも対応）。有効キー: `id`, `last_update`, `title`, `author`, `new_arrivals_date`, `general_lastup`
 - `-i`/`--ignore-all`: 引数なし時の全更新を無効化
@@ -247,7 +247,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `--make-zip` / `convert.make-zip=true` と `device=ibunko` を direct convert に接続し、i文庫 ZIP を生成できるようにした。ZIP には本文 `.txt`・`挿絵/*`・`cover.*` を同梱し、`sample\\novel` で ZIP/EPUB 併産を確認済み
 - `--no-zip` / `convert.no-zip=true` も direct convert に反映し、`sample\\novel` で `--make-zip --no-zip 3` 実行時は EPUB のみ残ることを確認済み
 - `--verbose` 未指定時は AozoraEpub3 / kindlegen の標準出力を抑止し、指定時のみ透過表示する。`sample\\novel` で `device: epub` の通常変換では AozoraEpub3 行が出ず、`--verbose` 付きでは `Detected encoding = UTF-8` / `変換開始` が表示されることを確認済み
-- `convert.add-dc-subject-to-epub=true` 時は DB タグから `convert.dc-subject-exclude-tags` を除いた値を EPUB 内 `standard.opf` の `<dc:subject>` へ埋め込む。除外設定未作成時は Ruby版同様 `404,end` を自動保存し、`sample\\novel` で `alpha` タグだけが埋め込まれ `end` は除外されることを確認済み
+- `convert.add-dc-subject-to-epub=true` 時は DB タグから `convert.dc-subject-exclude-tags` を除いた値を EPUB 内 `standard.opf` の `<dc:subject>` へ埋め込む。DB lookup のみで判定するため小説 ID `0` でも Ruby版同様に tags を拾える。除外設定未作成時は Ruby版同様 `404,end` を自動保存し、`sample\\novel` で `alpha` タグだけが埋め込まれ `end` は除外されることを確認済み
 - direct `convert` 後の端末送信は従来の compat 経路と同じ `send_file_to_device` helper へ揃えた。`sample\\novel` の `device: epub` 経路では副作用なく通ることを確認したが、Kindle/Kobo/Reader 実機での最終検証までは未了
 - `convert.copy-to` / `convert.copy_to` と `convert.copy-to-grouping` の device/site グルーピングも direct convert へ接続し、`sample\\novel` で `device=epub` + `copy-to-grouping=device,site` のコピー先生成を確認済み
 - `convert.copy-zip-to` も direct convert へ接続し、`sample\\novel` で `--make-zip 3` 実行時に ZIP のコピー出力を確認済み
@@ -694,7 +694,7 @@ narou setting name         # 読み取り
 
 **互換メモ**:
 - list 表示は `alias=title` 形式
-- 別名解決は `src/commands/mod.rs` / `src/commands/download.rs` の共通ターゲット解決へ統合済みで、`folder`, `browser`, `clean`, `convert`, `update`, `setting` などの既存 target 解決でも使える
+- 別名解決は `src/commands/mod.rs` / `src/commands/download.rs` の共通ターゲット解決へ統合済みで、`folder`, `browser`, `clean`, `convert`, `update`, `setting` などの既存 target 解決でも ID/タイトルに加えて Nコード・URL をそのまま受け付ける
 - `sample\\novel` で `alias testalias=1`, `alias --list`, `alias testalias=` を確認済み
 
 ---

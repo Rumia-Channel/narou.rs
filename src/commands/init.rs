@@ -262,9 +262,11 @@ fn validate_aozoraepub3_path(path: &str) -> Option<String> {
         return None;
     }
     let candidate = PathBuf::from(&trimmed);
-    if !candidate.is_absolute() {
-        return None;
-    }
+    let candidate = if candidate.is_absolute() {
+        candidate
+    } else {
+        std::env::current_dir().ok()?.join(candidate)
+    };
     let canonical = std::fs::canonicalize(&candidate).ok()?;
     let jar_path = canonical.join("AozoraEpub3.jar");
     if !jar_path.is_file() {
@@ -453,6 +455,19 @@ mod tests {
         std::fs::write(aozora_dir.join("AozoraEpub3.jar"), "").unwrap();
 
         let validated = validate_aozoraepub3_path(aozora_dir.to_str().unwrap()).unwrap();
+
+        assert_eq!(std::path::PathBuf::from(validated), std::fs::canonicalize(aozora_dir).unwrap());
+    }
+
+    #[test]
+    fn validate_aozoraepub3_path_accepts_existing_relative_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        let aozora_dir = temp.path().join("Aozora");
+        std::fs::create_dir_all(&aozora_dir).unwrap();
+        std::fs::write(aozora_dir.join("AozoraEpub3.jar"), "").unwrap();
+
+        let validated = validate_aozoraepub3_path("Aozora").unwrap();
 
         assert_eq!(std::path::PathBuf::from(validated), std::fs::canonicalize(aozora_dir).unwrap());
     }

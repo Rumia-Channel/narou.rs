@@ -686,20 +686,26 @@ fn apply_general_lastup_check_result(
     now: DateTime<Utc>,
 ) {
     let last_check = record.last_check_date.or(Some(record.last_update));
-    let previous_general_lastup = record.general_lastup;
-    let changed_general_lastup = general_lastup.zip(previous_general_lastup).is_some_and(|(new_gl, old_gl)| new_gl != old_gl);
-    let mut should_mark_modified = changed_general_lastup;
+    let changed_general_lastup = general_lastup
+        .zip(record.general_lastup)
+        .is_some_and(|(new_gl, old_gl)| new_gl != old_gl);
+    let should_mark_modified = novelupdated_at
+        .zip(last_check)
+        .is_some_and(|(nu, lc)| nu > lc);
 
     if let Some(nu) = novelupdated_at {
-        if let Some(lc) = last_check
-            && nu > lc
-        {
-            should_mark_modified = true;
-        }
         record.novelupdated_at = Some(nu);
     }
 
-    if should_mark_modified && !record.tags.iter().any(|tag| tag == MODIFIED_TAG) {
+    if novelupdated_at.is_some() {
+        if should_mark_modified {
+            if !record.tags.iter().any(|tag| tag == MODIFIED_TAG) {
+                record.tags.push(MODIFIED_TAG.to_string());
+            }
+        } else {
+            record.tags.retain(|tag| tag != MODIFIED_TAG);
+        }
+    } else if changed_general_lastup && !record.tags.iter().any(|tag| tag == MODIFIED_TAG) {
         record.tags.push(MODIFIED_TAG.to_string());
     }
 
@@ -716,6 +722,12 @@ fn apply_general_lastup_check_result(
     }
 
     record.last_check_date = Some(now);
+}
+
+#[derive(Default)]
+struct GeneralLastupNarouOutcome {
+    fallback_ids: Vec<i64>,
+    had_api_error: bool,
 }
 
 fn sync_end_tag(id: i64) {
@@ -1142,19 +1154,34 @@ fn update_general_lastup(gl_opt: Option<&str>, user_agent: Option<&str>) {
     let site_settings = SiteSetting::load_all().unwrap_or_default();
 
     let (narou_novels, other_novels) = partition_novels_by_api_support(&site_settings);
+    let mut other_targets = Vec::new();
+    let run_other_phase = gl_opt.is_none() || gl_opt == Some("other");
+    if run_other_phase {
+        other_targets.extend(other_novels);
+    }
+    let mut had_api_error = false;
 
     if gl_opt.is_none() || gl_opt == Some("narou") {
-        update_general_lastup_narou(&narou_novels, user_agent);
+        let outcome = update_general_lastup_narou(&narou_novels, user_agent);
+        had_api_error |= outcome.had_api_error;
+        other_targets.extend(outcome.fallback_ids);
     }
 
-    if gl_opt.is_none() || gl_opt == Some("other") {
+    if run_other_phase || (gl_opt == Some("narou") && !other_targets.is_empty()) {
         if gl_opt.is_none() {
             std::thread::sleep(std::time::Duration::from_millis(1000));
         }
-        update_general_lastup_other(&other_novels, user_agent);
+        let mut seen = HashSet::new();
+        other_targets.retain(|id| seen.insert(*id));
+        update_general_lastup_other(&other_targets, user_agent);
     }
 
     let _ = narou_rs::db::with_database_mut(|db| db.save());
+
+    if had_api_error {
+        eprintln!("最新話掲載日の確認に失敗しました");
+        std::process::exit(1);
+    }
 
     println!("確認が完了しました");
 }
@@ -1202,9 +1229,10 @@ fn partition_novels_by_api_support(
 fn update_general_lastup_narou(
     novels_by_api: &HashMap<String, Vec<(i64, String)>>,
     user_agent: Option<&str>,
-) {
+) -> GeneralLastupNarouOutcome {
+    let mut outcome = GeneralLastupNarouOutcome::default();
     if novels_by_api.is_empty() {
-        return;
+        return outcome;
     }
 
     let ua = user_agent
@@ -1212,7 +1240,10 @@ fn update_general_lastup_narou(
         .unwrap_or_else(|| ua_generator::ua::spoof_firefox_ua().to_string());
     let fetcher = match narou_rs::downloader::fetch::HttpFetcher::new(&ua) {
         Ok(f) => f,
-        Err(_) => return,
+        Err(_) => {
+            outcome.had_api_error = true;
+            return outcome;
+        }
     };
 
     for (api_url, novels) in novels_by_api {
@@ -1228,45 +1259,53 @@ fn update_general_lastup_narou(
 
             let response = match fetcher.client.get(&url).send() {
                 Ok(r) => r,
-                Err(_) => continue,
+                Err(_) => {
+                    outcome.had_api_error = true;
+                    continue;
+                }
             };
 
             if !response.status().is_success() {
+                outcome.had_api_error = true;
                 continue;
             }
 
             let body = match response.text() {
                 Ok(b) => b,
-                Err(_) => continue,
+                Err(_) => {
+                    outcome.had_api_error = true;
+                    continue;
+                }
             };
 
             let entries = parse_narou_api_entries(&body);
+            let (updates, fallback_ids) = classify_narou_api_chunk(chunk, &entries);
+            outcome.fallback_ids.extend(fallback_ids);
 
-            for entry in &entries {
-                if let Some((id, _)) = chunk
-                    .iter()
-                    .find(|(_, nc)| nc.eq_ignore_ascii_case(&entry.ncode))
-                {
-                    let _ = narou_rs::db::with_database_mut(|db| {
-                        if let Some(record) = db.get(*id).cloned() {
-                            let mut r = record;
-                            apply_general_lastup_check_result(
-                                &mut r,
-                                parse_api_datetime(&entry.novelupdated_at),
-                                parse_api_datetime(&entry.general_lastup),
-                                Some(entry.length),
-                                None,
-                                Utc::now(),
-                            );
+            for (id, entry) in updates {
+                let _ = narou_rs::db::with_database_mut(|db| {
+                    if let Some(record) = db.get(id).cloned() {
+                        let mut r = record;
+                        apply_general_lastup_check_result(
+                            &mut r,
+                            parse_api_datetime(&entry.novelupdated_at),
+                            parse_api_datetime(&entry.general_lastup),
+                            Some(entry.length),
+                            None,
+                            Utc::now(),
+                        );
 
-                            db.insert(r);
-                        }
-                        Ok(())
-                    });
-                }
+                        db.insert(r);
+                    }
+                    Ok(())
+                });
             }
         }
     }
+
+    outcome.fallback_ids.sort_unstable();
+    outcome.fallback_ids.dedup();
+    outcome
 }
 
 fn update_general_lastup_other(novels: &[i64], user_agent: Option<&str>) {
@@ -1339,11 +1378,49 @@ fn parse_api_datetime(value: &str) -> Option<DateTime<Utc>> {
     narou_rs::downloader::parse_datetime_with_timezone(value, Some("Asia/Tokyo"))
 }
 
+fn classify_narou_api_chunk(
+    chunk: &[(i64, String)],
+    entries: &[narou_rs::downloader::NarouApiEntry],
+) -> (
+    Vec<(i64, narou_rs::downloader::NarouApiEntry)>,
+    Vec<i64>,
+) {
+    let mut updates = Vec::new();
+    let mut fallback_ids = Vec::new();
+    let mut seen_ncodes = HashSet::new();
+
+    for entry in entries {
+        let Some((id, _)) = chunk
+            .iter()
+            .find(|(_, ncode)| ncode.eq_ignore_ascii_case(&entry.ncode))
+        else {
+            continue;
+        };
+
+        seen_ncodes.insert(entry.ncode.to_ascii_lowercase());
+        if entry.title.trim().is_empty() {
+            fallback_ids.push(*id);
+        } else {
+            updates.push((*id, entry.clone()));
+        }
+    }
+
+    for (id, ncode) in chunk {
+        if !seen_ncodes.contains(&ncode.to_ascii_lowercase()) {
+            fallback_ids.push(*id);
+        }
+    }
+
+    fallback_ids.sort_unstable();
+    fallback_ids.dedup();
+    (updates, fallback_ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         MODIFIED_TAG, abort_if_interrupted, apply_general_lastup_check_result,
-        sleep_with_interrupt,
+        classify_narou_api_chunk, sleep_with_interrupt,
     };
     use chrono::{Duration, TimeZone, Utc};
     use narou_rs::db::NovelRecord;
@@ -1503,6 +1580,48 @@ mod tests {
         assert_eq!(record.novelupdated_at, stale_after_update);
         assert_eq!(record.general_lastup, changed_general_lastup);
         assert_eq!(record.last_check_date, Some(now));
-        assert!(record.tags.iter().any(|tag| tag == MODIFIED_TAG));
+        assert!(!record.tags.iter().any(|tag| tag == MODIFIED_TAG));
+    }
+
+    #[test]
+    fn general_lastup_check_clears_modified_when_novelupdated_at_is_not_newer() {
+        let last_update = Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap();
+        let mut record = sample_record(last_update);
+        record.tags.push(MODIFIED_TAG.to_string());
+        record.last_check_date = Some(last_update + Duration::hours(4));
+
+        apply_general_lastup_check_result(
+            &mut record,
+            Some(last_update + Duration::hours(2)),
+            Some(last_update + Duration::hours(3)),
+            None,
+            None,
+            last_update + Duration::hours(5),
+        );
+
+        assert!(!record.tags.iter().any(|tag| tag == MODIFIED_TAG));
+    }
+
+    #[test]
+    fn classify_narou_api_chunk_routes_blank_or_missing_titles_to_html_fallback() {
+        let chunk = vec![(1, "n0001aa".to_string()), (2, "n0002aa".to_string())];
+        let entries = vec![narou_rs::downloader::NarouApiEntry {
+            ncode: "n0001aa".to_string(),
+            title: String::new(),
+            writer: String::new(),
+            story: String::new(),
+            novel_type: 0,
+            end: 0,
+            general_all_no: 0,
+            general_firstup: String::new(),
+            general_lastup: String::new(),
+            novelupdated_at: String::new(),
+            length: 0,
+        }];
+
+        let (updates, fallback_ids) = classify_narou_api_chunk(&chunk, &entries);
+
+        assert!(updates.is_empty());
+        assert_eq!(fallback_ids, vec![1, 2]);
     }
 }
