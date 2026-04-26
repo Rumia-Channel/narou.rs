@@ -41,7 +41,8 @@ use self::site_setting::SiteSetting;
 use self::toc::{create_short_story_subtitles, fetch_toc, parse_subtitles, parse_subtitles_multipage};
 use self::security::is_safe_public_url;
 use self::util::{
-    compile_html_pattern, load_length_limit, mask_spoiler_text, sanitize_filename_with_limit,
+    build_section_url, compile_html_pattern, load_length_limit, mask_spoiler_text,
+    sanitize_filename_with_limit,
 };
 
 pub use self::types::{
@@ -892,6 +893,7 @@ impl Downloader {
         section: &SectionElement,
         section_dir: &PathBuf,
         subtitle: &SubtitleInfo,
+        toc_url: &str,
     ) -> Result<()> {
         let illust_url_pattern = match &setting.illust_grep_pattern {
             Some(p) => p,
@@ -913,10 +915,12 @@ impl Downloader {
         for source in &sources {
             for caps in re.captures_iter(source) {
                 if let Some(url_match) = caps.get(1) {
-                    let url = url_match.as_str();
-                    if url.is_empty() {
+                    let raw_url = url_match.as_str();
+                    if raw_url.is_empty() {
                         continue;
                     }
+                    let resolved = build_section_url(setting, toc_url, raw_url);
+                    let url = resolved.as_str();
                     if !is_safe_public_url(url) {
                         eprintln!("WARN: skipping unsafe illustration URL: {url}");
                         illust_count += 1;
@@ -1278,7 +1282,7 @@ impl Downloader {
                     pending_section_hashes.insert(relative_path, digest);
                 }
                 save_raw_file(&raw_dir, subtitle, &raw_html)?;
-                self.download_illustration(&setting, &section, &section_dir, subtitle)?;
+                self.download_illustration(&setting, &section, &section_dir, subtitle, &toc_url)?;
                 updated_count += 1;
                 downloaded_index += 1;
                 Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string())
@@ -1291,6 +1295,7 @@ impl Downloader {
                                 &section_file.element,
                                 &section_dir,
                                 subtitle,
+                                &toc_url,
                             )?;
                         }
                     }
