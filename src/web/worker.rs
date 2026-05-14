@@ -548,11 +548,9 @@ fn convert_targets_and_device(spec: &QueueExecutionSpec) -> Result<(Vec<String>,
     }
     if spec.args.len() > 1
         && let Some(last) = spec.args.last()
+        && let Ok(Some(device)) = super::normalize_web_device_override(Some(last.as_str()))
     {
-        let device = super::normalize_web_device_override(Some(last.as_str()))?;
-        if device.is_some() {
-            return Ok((spec.args[..spec.args.len() - 1].to_vec(), device));
-        }
+        return Ok((spec.args[..spec.args.len() - 1].to_vec(), Some(device)));
     }
     Ok((spec.args.clone(), None))
 }
@@ -975,6 +973,32 @@ mod tests {
         assert_eq!(
             convert_targets_and_device(&spec).unwrap(),
             (vec!["1".to_string(), "2".to_string()], Some("kindle".to_string()))
+        );
+    }
+
+    #[test]
+    fn convert_targets_and_device_keeps_numeric_last_arg_as_target() {
+        let spec = crate::queue::QueueExecutionSpec {
+            cmd: "convert".to_string(),
+            args: vec!["1".to_string(), "2".to_string()],
+            meta: serde_yaml::Mapping::new(),
+        };
+        assert_eq!(
+            convert_targets_and_device(&spec).unwrap(),
+            (vec!["1".to_string(), "2".to_string()], None)
+        );
+    }
+
+    #[test]
+    fn convert_targets_and_device_reads_legacy_trailing_device() {
+        let spec = crate::queue::QueueExecutionSpec {
+            cmd: "convert".to_string(),
+            args: vec!["1".to_string(), "kindle".to_string()],
+            meta: serde_yaml::Mapping::new(),
+        };
+        assert_eq!(
+            convert_targets_and_device(&spec).unwrap(),
+            (vec!["1".to_string()], Some("kindle".to_string()))
         );
     }
 
