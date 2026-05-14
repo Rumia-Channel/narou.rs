@@ -483,6 +483,35 @@ pub fn set_frozen_state(id: i64, frozen: bool) -> Result<()> {
     })
 }
 
+pub fn mark_not_found_and_freeze(id: i64) -> Result<()> {
+    crate::db::with_database_mut(|db| {
+        let record = db
+            .get(id)
+            .cloned()
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
+        let mut updated = record;
+
+        let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
+        let _ = crate::db::inventory::update_locked_yaml_file::<
+            (),
+            HashMap<i64, serde_yaml::Value>,
+            _,
+        >(&freeze_path, |mut frozen_list| {
+            frozen_list.insert(id, serde_yaml::Value::Bool(true));
+            if !updated.tags.iter().any(|tag| tag == "frozen") {
+                updated.tags.push("frozen".to_string());
+            }
+            if !updated.tags.iter().any(|tag| tag == "404") {
+                updated.tags.push("404".to_string());
+            }
+
+            db.insert(updated.clone());
+            Ok((frozen_list, ()))
+        })?;
+        db.save()
+    })
+}
+
 pub fn open_directory(path: &Path, confirm_message: Option<&str>) {
     if let Some(message) = confirm_message {
         if !confirm(message, false, false) {
@@ -864,8 +893,8 @@ mod tests {
     use super::{
         DigestChoice, NovelLockGuard, choose_digest_action_with_auto_choices,
         configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
-        load_locked_ids_from_inventory, parse_digest_auto_choices, record_is_frozen,
-        reroute_web_line_to_console, sanitize_backup_name, terminate_process,
+        load_locked_ids_from_inventory, mark_not_found_and_freeze, parse_digest_auto_choices,
+        record_is_frozen, reroute_web_line_to_console, sanitize_backup_name, terminate_process,
     };
     use crate::db::NovelRecord;
 
@@ -1031,6 +1060,33 @@ mod tests {
         assert!(frozen_ids.contains(&0));
         assert!(frozen_ids.contains(&3));
         assert_eq!(frozen_ids.len(), 2);
+    }
+
+    #[test]
+    fn mark_not_found_and_freeze_adds_404_tag_and_freeze_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+        crate::db::with_database_mut(|db| {
+            db.insert(sample_record(7, &[]));
+            Ok(())
+        })
+        .unwrap();
+
+        mark_not_found_and_freeze(7).unwrap();
+
+        let record = crate::db::with_database(|db| Ok(db.get(7).cloned().unwrap())).unwrap();
+        assert!(record.tags.contains(&"404".to_string()));
+        assert!(record.tags.contains(&"frozen".to_string()));
+
+        let inventory = Inventory::new(temp.path().to_path_buf());
+        let frozen_ids = load_frozen_ids_from_inventory(&inventory).unwrap();
+        assert!(frozen_ids.contains(&7));
+
+        *crate::db::DATABASE.lock() = None;
     }
 
     #[test]

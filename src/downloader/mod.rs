@@ -1004,7 +1004,48 @@ impl Downloader {
         } else {
             setting.interpolate_with_captures(&setting.toc_url, &url_captures)
         };
-        let toc_source = fetch_toc(&mut self.fetcher, &setting, &toc_url)?;
+        let toc_source = match fetch_toc(&mut self.fetcher, &setting, &toc_url) {
+            Ok(source) => source,
+            Err(NarouError::NotFound(_)) if existing_id.is_some() => {
+                let id = existing_id.unwrap();
+                println!("小説が削除されているか非公開な可能性があります");
+                let _ = crate::compat::mark_not_found_and_freeze(id);
+                let (title, author, novel_dir) = crate::db::with_database(|db| {
+                    let record = db.get(id).cloned();
+                    let title = record
+                        .as_ref()
+                        .map(|record| record.title.clone())
+                        .unwrap_or_default();
+                    let author = record
+                        .as_ref()
+                        .map(|record| record.author.clone())
+                        .unwrap_or_default();
+                    let novel_dir = record
+                        .as_ref()
+                        .map(|record| crate::db::novel_dir_for_record(db.archive_root(), record))
+                        .unwrap_or_default();
+                    Ok((title, author, novel_dir))
+                })
+                .unwrap_or_default();
+                return Ok(DownloadResult {
+                    id,
+                    title,
+                    author,
+                    novel_dir,
+                    new_novel: false,
+                    new_arrivals: false,
+                    new_arrival_subtitles: Vec::new(),
+                    updated_count: 0,
+                    total_count: 0,
+                    status: UpdateStatus::Failed,
+                    title_changed: false,
+                    author_changed: false,
+                    story_changed: false,
+                    sections_deleted: false,
+                });
+            }
+            Err(err) => return Err(err),
+        };
         let toc_preview_info = NovelInfo::from_toc_source(&setting, &toc_source);
         match over18_access_decision(
             &setting,
