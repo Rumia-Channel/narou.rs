@@ -1,0 +1,2 @@
+[alias]
+local-build = "run --bin cargo-local-build --"

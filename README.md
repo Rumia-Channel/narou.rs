@@ -3,7 +3,7 @@
 narou_rs は、日本の Web 小説を取得・管理・変換する CLI / Web UI ツールです。 
 外部から観測できる挙動、設定ファイル、YAML、出力形式について [narou.rb](https://github.com/whiteleaf7/narou) との互換性を重視しつつ、Rust で保守しやすく安全に実装しています。
 
-詳細なコマンド互換性や未完了項目は `COMMANDS.md` を参照してください。README では、普段使うコマンド、動作、注意点をまとめます。
+README では、導入方法、基本操作、主な注意点をまとめます。詳細なコマンド互換性や未完了項目は `COMMANDS.md` を参照してください。
 
 ## 謝辞
 このソフトウェアは [whiteleaf氏](https://github.com/whiteleaf7) が作成した [narou.rb](https://github.com/whiteleaf7/narou) 及び [ponpon.USA氏](https://github.com/ponponusa) の [フォーク版](https://github.com/ponponusa/narou-mod) をベースに作成されています。
@@ -20,33 +20,94 @@ narou_rs は、日本の Web 小説を取得・管理・変換する CLI / Web U
 
 ## セットアップ
 
-### リポジトリから実行する場合
+セットアップ方法は 2 つあります。通常利用では Release 版を使ってください。Rust 環境があり、自分でビルドしたい場合はリポジトリから実行できます。
 
-```powershell
-cargo build
-cargo run -- init
-```
+### 1. Release からダウンロードして使う
 
-初期化後は、必要に応じて AozoraEpub3 の場所を設定します。
-
-```powershell
-cargo run -- init -p "C:\path\to\AozoraEpub3" -l 1.8
-```
-
-### 配布バイナリを使う場合
+[GitHub Releases](https://github.com/Rumia-Channel/narou.rs/releases) から利用環境に合う配布 zip をダウンロードし、任意の場所に展開してください。
 
 配布 zip は `narou/` ディレクトリをルートに持つ構成です。実行に必要なファイルはその中にまとまっています。
 
 ```text
 narou/
   narou_rs(.exe)
+  narou_rs_updater(.exe).new
   webnovel/
   preset/
   LICENSE
+  README.md
+  Third-Party-License.md
   commitversion
 ```
 
 `narou_rs` は、実行ファイルの近くにある `webnovel/`、`preset/`、`commitversion` を参照します。これらを分離しないでください。
+
+Windows では、PowerShell で展開した `narou/` に移動してから実行します。
+
+```powershell
+cd narou
+.\narou_rs.exe init
+```
+
+どのフォルダからでも `narou_rs` を実行したい場合は、展開した `narou/` をユーザー環境変数の `Path` に追加します。次の例は、現在の PowerShell で開いている `narou/` フォルダを `Path` に追加します。実行後は PowerShell を開き直してください。
+
+```powershell
+$narouPath = (Resolve-Path .).Path
+$currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
+[Environment]::SetEnvironmentVariable("Path", "$currentPath;$narouPath", "User")
+```
+
+PowerShell を開き直した後は、次のように実行できます。
+
+```powershell
+narou_rs init
+```
+
+Linux / macOS では、展開した `narou/` に移動してから実行します。
+
+```bash
+cd narou
+./narou_rs init
+```
+
+どのディレクトリからでも実行したい場合は、展開した `narou/` を `PATH` に追加します。
+
+```bash
+echo 'export PATH="$PATH:/absolute/path/to/narou"' >> ~/.bashrc
+source ~/.bashrc
+narou_rs init
+```
+
+Windows 向けの配布バイナリで `VCRUNTIME140.dll` が見つからない場合は、Microsoft 公式の [最新の Visual C++ 再配布可能パッケージ](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) から `Microsoft Visual C++ Redistributable 2015-2022 x64` をインストールしてください。
+
+Linux 向けの配布バイナリは GitHub Actions の Ubuntu 24.04 上で `*-unknown-linux-gnu` ターゲットとしてビルドしています。古い glibc の環境では `GLIBC_2.xx not found` のようなエラーで起動できない場合があるため、その場合は利用環境上で `cargo build --release` して実行してください。
+
+### 2. リポジトリを clone して Rust で実行する
+
+Rust のビルド環境を用意し、リポジトリを clone してからビルドします。
+
+```powershell
+git clone https://github.com/Rumia-Channel/narou.rs.git
+cd narou.rs
+cargo build
+cargo run -- init
+```
+
+Release と同じ構成の `narou/` フォルダをリポジトリ直下に作る場合は、`cargo local-build` を使います。
+
+```powershell
+cargo local-build
+cd narou
+.\narou_rs.exe init
+```
+
+`cargo local-build` は GitHub Actions の release と同じ構成の `narou/` フォルダを作成します。release ビルドした `narou_rs(.exe)`、`narou_rs_updater(.exe).new`、`webnovel/`、`preset/`、`LICENSE`、`README.md`、`Third-Party-License.md`、`commitversion` を `narou/` に配置します。
+
+初期化時に AozoraEpub3 の場所も指定する場合は、次のように実行します。
+
+```powershell
+cargo run -- init -p "C:\path\to\AozoraEpub3" -l 1.8
+```
 
 ## 初期化後のディレクトリ
 
@@ -60,22 +121,19 @@ webnovel/               ユーザー編集用のサイト定義 YAML
 
 あわせて、ホームディレクトリ側の `~/.narousetting/global_setting.yaml` をグローバル設定として使います。
 
-## よく使う流れ
+## 基本操作
+
+Release 版や `cargo local-build` で作った `narou/` を使う場合は、`narou_rs` コマンドで操作します。
 
 ```powershell
-cargo run -- init
-cargo run -- download "https://ncode.syosetu.com/n9669bk/"
-cargo run -- update
-cargo run -- convert 1
-cargo run -- web
+narou_rs init
+narou_rs download "https://ncode.syosetu.com/n9669bk/"
+narou_rs update
+narou_rs convert 1
+narou_rs web
 ```
 
-サンプルデータ付きの検証環境を使う場合は、`sample/novel/` をカレントディレクトリにして実行してください。
-
-```powershell
-Set-Location .\sample\novel
-cargo run -- convert 1
-```
+リポジトリから直接実行する場合は、`narou_rs` の代わりに `cargo run --` を使います。例: `cargo run -- download "https://ncode.syosetu.com/n9669bk/"`。
 
 ## 主要コマンド
 
@@ -186,10 +244,8 @@ narou_rs setting server-reverse-proxy.enable=true
 - `narou init` 前に多くのコマンドを実行しても、初期化を促す表示になります。
 - `webnovel/*.yaml` を Rust 側のハードコードより優先する方針です。サイト追従が必要な場合は、まず YAML の更新を検討してください。
 - 配布物を移動するときは、実行ファイルだけでなく `webnovel/` と `preset/` も一緒に配置してください。
-- Linux 向けの配布バイナリは GitHub Actions の Ubuntu 24.04 上で `*-unknown-linux-gnu` ターゲットとしてビルドしています。古い glibc の環境では `GLIBC_2.xx not found` のようなエラーで起動できない場合があるため、その場合は利用環境上で `cargo build --release` して実行してください。
 - `send`、`mail`、AozoraEpub3 連携は、端末や SMTP の実環境設定が前提です。
 - `mail` 機能と Kindle / Kobo などの実機送信は、開発者の手元に端末が無いため十分な実地確認ができていません。動作確認や不具合報告、再現情報、修正提案に協力してもらえると助かります。
-- `cargo run` でサンプル小説を扱うときは、`sample/novel/` をカレントディレクトリにしないと `.narou/` が見つかりません。
 
 ## 開発用コマンド
 
