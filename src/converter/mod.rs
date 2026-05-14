@@ -20,19 +20,18 @@ use settings::NovelSettings;
 use user_converter::UserConverter;
 
 use crate::downloader::{SectionElement, SectionFile, TocObject, SECTION_SAVE_DIR};
-use crate::db::inventory::InventoryScope;
 use crate::error::{NarouError, Result};
 use crate::progress::ProgressReporter;
 use crate::termcolor::bold_colored;
 
 const SECTION_CONVERT_CACHE_NAME: &str = "section_convert_cache";
+const SECTION_CONVERT_CACHE_DIR_NAME: &str = "section_convert_cache";
 
 pub struct NovelConverter {
     settings: NovelSettings,
     user_converter: Option<UserConverter>,
     section_cache: HashMap<String, render::ConvertedSection>,
-    section_convert_cache: HashMap<String, HashMap<String, CacheEntry>>,
-    cache_dirty: bool,
+    section_convert_cache: SectionConvertCache,
     progress: Option<Box<dyn ProgressReporter>>,
     inspector: Rc<RefCell<inspector::Inspector>>,
     display_inspector: bool,
@@ -46,6 +45,12 @@ struct CacheEntry {
     converted_section: render::ConvertedSection,
     #[serde(default)]
     use_dakuten_font: bool,
+}
+
+#[derive(Default)]
+struct SectionConvertCache {
+    buckets: HashMap<String, HashMap<String, CacheEntry>>,
+    dirty_ids: std::collections::HashSet<String>,
 }
 
 #[derive(Serialize)]
@@ -103,8 +108,7 @@ impl NovelConverter {
             settings,
             user_converter: None,
             section_cache: HashMap::new(),
-            section_convert_cache: load_section_convert_cache(),
-            cache_dirty: false,
+            section_convert_cache: SectionConvertCache::default(),
             progress: None,
             inspector,
             display_inspector: false,
@@ -119,8 +123,7 @@ impl NovelConverter {
             settings,
             user_converter: Some(user_converter),
             section_cache: HashMap::new(),
-            section_convert_cache: load_section_convert_cache(),
-            cache_dirty: false,
+            section_convert_cache: SectionConvertCache::default(),
             progress: None,
             inspector,
             display_inspector: false,
@@ -215,7 +218,9 @@ impl NovelConverter {
                 continue;
             }
 
-            if let Some((cached, dakuten)) = self.fetch_cached_section(novel_id, &section.index, &digest) {
+            if let Some((cached, dakuten)) =
+                self.fetch_cached_section(novel_id, &section.index, &digest)
+            {
                 self.section_cache.insert(digest.clone(), cached.clone());
                 self.use_dakuten_font |= dakuten;
                 converted_sections.push(cached);
@@ -781,12 +786,13 @@ impl NovelConverter {
     }
 
     fn fetch_cached_section(
-        &self,
+        &mut self,
         novel_id: Option<i64>,
         section_key: &str,
         digest: &str,
     ) -> Option<(render::ConvertedSection, bool)> {
-        let bucket = self.section_convert_cache.get(&novel_id?.to_string())?;
+        let novel_id = novel_id?;
+        let bucket = self.section_convert_cache.bucket(novel_id).ok()?;
         let entry = bucket.get(section_key)?;
         if entry.digest != digest {
             return None;
@@ -810,35 +816,151 @@ impl NovelConverter {
             converted_section: converted_section.clone(),
             use_dakuten_font,
         };
-        let bucket = self.section_convert_cache.entry(novel_id.to_string()).or_default();
+        let bucket = match self.section_convert_cache.bucket_mut(novel_id) {
+            Ok(bucket) => bucket,
+            Err(_) => return,
+        };
         if bucket.get(section_key) != Some(&entry) {
             bucket.insert(section_key.to_string(), entry);
-            self.cache_dirty = true;
+            self.section_convert_cache.mark_dirty(novel_id);
         }
     }
 
     fn flush_section_convert_cache(&mut self) -> Result<()> {
-        if !self.cache_dirty {
+        self.section_convert_cache.flush()
+    }
+}
+
+impl SectionConvertCache {
+    fn bucket(&mut self, novel_id: i64) -> Result<&HashMap<String, CacheEntry>> {
+        self.load_bucket_if_needed(novel_id)?;
+        let key = novel_id.to_string();
+        Ok(self.buckets.entry(key).or_default())
+    }
+
+    fn bucket_mut(&mut self, novel_id: i64) -> Result<&mut HashMap<String, CacheEntry>> {
+        self.load_bucket_if_needed(novel_id)?;
+        let key = novel_id.to_string();
+        Ok(self.buckets.entry(key).or_default())
+    }
+
+    fn mark_dirty(&mut self, novel_id: i64) {
+        self.dirty_ids.insert(novel_id.to_string());
+    }
+
+    fn load_bucket_if_needed(&mut self, novel_id: i64) -> Result<()> {
+        let key = novel_id.to_string();
+        if self.buckets.contains_key(&key) {
             return Ok(());
         }
-        crate::db::with_database(|db| {
-            db.inventory().save(
-                SECTION_CONVERT_CACHE_NAME,
-                InventoryScope::Local,
-                &self.section_convert_cache,
-            )
-        })?;
-        self.cache_dirty = false;
+        migrate_legacy_section_convert_cache()?;
+        let bucket = load_section_convert_bucket(novel_id)?;
+        self.buckets.insert(key, bucket);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.dirty_ids.is_empty() {
+            return Ok(());
+        }
+        let dirty_ids = std::mem::take(&mut self.dirty_ids);
+        for id in dirty_ids {
+            if let Some(bucket) = self.buckets.get(&id) {
+                save_section_convert_bucket(&id, bucket)?;
+            }
+        }
         Ok(())
     }
 }
 
-fn load_section_convert_cache() -> HashMap<String, HashMap<String, CacheEntry>> {
+pub fn clear_section_convert_cache(id: i64) -> Result<()> {
+    migrate_legacy_section_convert_cache()?;
+    let path = section_convert_cache_file_path(&id.to_string())?;
+    let lock_path = path.with_extension("yaml.lock");
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(NarouError::Io(e)),
+    }
+    match std::fs::remove_file(lock_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(NarouError::Io(e)),
+    }
+    Ok(())
+}
+
+fn section_convert_cache_dir() -> Result<PathBuf> {
     crate::db::with_database(|db| {
-        db.inventory()
-            .load(SECTION_CONVERT_CACHE_NAME, InventoryScope::Local)
+        Ok(db
+            .inventory()
+            .root_dir()
+            .join(".narou")
+            .join(SECTION_CONVERT_CACHE_DIR_NAME))
     })
-    .unwrap_or_default()
+}
+
+fn section_convert_cache_file_path(id: &str) -> Result<PathBuf> {
+    Ok(section_convert_cache_dir()?.join(format!("{}.yaml", id)))
+}
+
+fn load_section_convert_bucket(novel_id: i64) -> Result<HashMap<String, CacheEntry>> {
+    let path = section_convert_cache_file_path(&novel_id.to_string())?;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(NarouError::Io(e)),
+    };
+    if raw.trim().is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(serde_yaml::from_str(&raw)?)
+}
+
+fn save_section_convert_bucket(id: &str, bucket: &HashMap<String, CacheEntry>) -> Result<()> {
+    let path = section_convert_cache_file_path(id)?;
+    crate::db::inventory::update_locked_yaml_file::<
+        (),
+        HashMap<String, CacheEntry>,
+        _,
+    >(&path, |_| Ok((bucket.clone(), ())))?;
+    Ok(())
+}
+
+fn migrate_legacy_section_convert_cache() -> Result<()> {
+    let legacy_path = crate::db::with_database(|db| {
+        Ok(db
+            .inventory()
+            .root_dir()
+            .join(".narou")
+            .join(format!("{}.yaml", SECTION_CONVERT_CACHE_NAME)))
+    })?;
+    if !legacy_path.is_file() {
+        return Ok(());
+    }
+
+    let raw = std::fs::read_to_string(&legacy_path)?;
+    if raw.trim().is_empty() {
+        rename_legacy_section_convert_cache(&legacy_path)?;
+        return Ok(());
+    }
+    let legacy: HashMap<String, HashMap<String, CacheEntry>> = serde_yaml::from_str(&raw)?;
+    for (id, bucket) in legacy {
+        save_section_convert_bucket(&id, &bucket)?;
+    }
+    rename_legacy_section_convert_cache(&legacy_path)
+}
+
+fn rename_legacy_section_convert_cache(path: &Path) -> Result<()> {
+    let migrated_path = path.with_extension("yaml.migrated");
+    match std::fs::rename(path, &migrated_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+        Err(e) => Err(NarouError::Io(e)),
+    }
 }
 
 fn load_sections_from_dir(
@@ -1029,11 +1151,14 @@ fn fetch_illustration_bytes(url: &str) -> std::result::Result<(Vec<u8>, String),
 #[cfg(test)]
 mod tests {
     use super::{
-        NovelConverter, find_saved_section_illustration_filename,
-        illustration_extension_from_content_type, normalize_illustration_url,
+        CacheEntry, NovelConverter, clear_section_convert_cache,
+        find_saved_section_illustration_filename, illustration_extension_from_content_type,
+        normalize_illustration_url, save_section_convert_bucket,
     };
     use crate::{
-        converter::{settings::NovelSettings, user_converter::UserConverter},
+        converter::{
+            render::ConvertedSection, settings::NovelSettings, user_converter::UserConverter,
+        },
         downloader::{SectionElement, SectionFile, TocObject},
     };
 
@@ -1086,6 +1211,107 @@ mod tests {
                 body: "本文".to_string(),
             },
         }
+    }
+
+    fn make_cache_entry(body: &str) -> CacheEntry {
+        CacheEntry {
+            digest: format!("digest-{body}"),
+            converted_section: ConvertedSection {
+                chapter: String::new(),
+                subchapter: String::new(),
+                subtitle: "subtitle".to_string(),
+                introduction: String::new(),
+                body: body.to_string(),
+                postscript: String::new(),
+            },
+            use_dakuten_font: false,
+        }
+    }
+
+    #[test]
+    fn legacy_section_convert_cache_is_split_by_novel_id_on_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+
+        let mut legacy = std::collections::HashMap::new();
+        legacy.insert(
+            "1".to_string(),
+            std::collections::HashMap::from([(
+                "本文\\1.yaml".to_string(),
+                make_cache_entry("one"),
+            )]),
+        );
+        legacy.insert(
+            "2".to_string(),
+            std::collections::HashMap::from([(
+                "本文\\1.yaml".to_string(),
+                make_cache_entry("two"),
+            )]),
+        );
+        std::fs::write(
+            temp.path().join(".narou").join("section_convert_cache.yaml"),
+            serde_yaml::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        let mut cache = super::SectionConvertCache::default();
+        let bucket = cache.bucket(1).unwrap();
+        assert_eq!(bucket["本文\\1.yaml"].converted_section.body, "one");
+        assert!(temp
+            .path()
+            .join(".narou")
+            .join("section_convert_cache")
+            .join("1.yaml")
+            .is_file());
+        assert!(temp
+            .path()
+            .join(".narou")
+            .join("section_convert_cache")
+            .join("2.yaml")
+            .is_file());
+        assert!(!temp.path().join(".narou").join("section_convert_cache.yaml").exists());
+        assert!(temp
+            .path()
+            .join(".narou")
+            .join("section_convert_cache.yaml.migrated")
+            .is_file());
+
+        *crate::db::DATABASE.lock() = None;
+    }
+
+    #[test]
+    fn clear_section_convert_cache_removes_per_novel_cache_and_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        let bucket = std::collections::HashMap::from([(
+            "本文\\1.yaml".to_string(),
+            make_cache_entry("one"),
+        )]);
+        save_section_convert_bucket("12", &bucket).unwrap();
+        let path = temp
+            .path()
+            .join(".narou")
+            .join("section_convert_cache")
+            .join("12.yaml");
+        let lock_path = path.with_extension("yaml.lock");
+        std::fs::write(&lock_path, "").unwrap();
+        assert!(path.is_file());
+        assert!(lock_path.is_file());
+
+        clear_section_convert_cache(12).unwrap();
+        assert!(!path.exists());
+        assert!(!lock_path.exists());
+
+        *crate::db::DATABASE.lock() = None;
     }
 
     #[test]

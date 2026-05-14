@@ -1094,7 +1094,9 @@ fn remove_novel_by_id(id: i64, with_file: bool) -> Result<RemoveOutcome, String>
         })
     });
 
-    result.map_err(|e| e.to_string())
+    let outcome = result.map_err(|e| e.to_string())?;
+    let _ = narou_rs::converter::clear_section_convert_cache(id);
+    Ok(outcome)
 }
 
 fn collect_all_short_story_ids() -> Vec<String> {
