@@ -1,5 +1,3 @@
-#![cfg_attr(windows, windows_subsystem = "windows")]
-
 #[macro_use]
 mod output_macros;
 mod backtracer;
@@ -36,6 +34,40 @@ fn prepare_windows_console() {
 
 #[cfg(not(windows))]
 fn prepare_windows_console() {}
+
+#[cfg(windows)]
+fn relaunch_hidden_console_if_requested() -> bool {
+    if matches!(
+        std::env::var(narou_rs::compat::HIDE_CONSOLE_ENV)
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    ) {
+        return false;
+    }
+    if !std::env::args().any(|arg| arg == "--hide-console") {
+        return false;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut command = std::process::Command::new(exe);
+    command.args(std::env::args_os().skip(1));
+    narou_rs::compat::configure_hidden_console_command(&mut command);
+    match command.spawn() {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("warning: failed to relaunch without console: {}", error);
+            false
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn relaunch_hidden_console_if_requested() -> bool {
+    false
+}
 
 fn last_panic_detail() -> &'static Mutex<Option<String>> {
     static LAST_PANIC_DETAIL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -104,6 +136,10 @@ fn raw_hide_console_requested() -> bool {
 
 #[tokio::main]
 async fn main() {
+    if relaunch_hidden_console_if_requested() {
+        return;
+    }
+
     prepare_windows_console();
 
     narou_rs::updater_promote::try_promote_pending_updater();
