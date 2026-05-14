@@ -20,20 +20,9 @@ narou_rs は、日本の Web 小説を取得・管理・変換する CLI / Web U
 
 ## セットアップ
 
-### リポジトリから実行する場合
+### Release からダウンロードして使う場合
 
-```powershell
-cargo build
-cargo run -- init
-```
-
-初期化後は、必要に応じて AozoraEpub3 の場所を設定します。
-
-```powershell
-cargo run -- init -p "C:\path\to\AozoraEpub3" -l 1.8
-```
-
-### 配布バイナリを使う場合
+[GitHub Releases](https://github.com/Rumia-Channel/narou.rs/releases) から利用環境に合う配布 zip をダウンロードし、任意の場所に展開してください。
 
 配布 zip は `narou/` ディレクトリをルートに持つ構成です。実行に必要なファイルはその中にまとまっています。
 
@@ -47,6 +36,27 @@ narou/
 ```
 
 `narou_rs` は、実行ファイルの近くにある `webnovel/`、`preset/`、`commitversion` を参照します。これらを分離しないでください。
+
+Windows 向けの配布バイナリで `VCRUNTIME140.dll` が見つからない場合は、Microsoft 公式の [最新の Visual C++ 再配布可能パッケージ](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) から `Microsoft Visual C++ Redistributable 2015-2022 x64` をインストールしてください。
+
+Linux 向けの配布バイナリは GitHub Actions の Ubuntu 24.04 上で `*-unknown-linux-gnu` ターゲットとしてビルドしています。古い glibc の環境では `GLIBC_2.xx not found` のようなエラーで起動できない場合があるため、その場合は利用環境上で `cargo build --release` して実行してください。
+
+### リポジトリを clone して Rust で実行する場合
+
+Rust のビルド環境を用意し、リポジトリを clone してからビルドします。
+
+```powershell
+git clone https://github.com/Rumia-Channel/narou.rs.git
+cd narou.rs
+cargo build
+cargo run -- init
+```
+
+初期化後は、必要に応じて AozoraEpub3 の場所を設定します。
+
+```powershell
+cargo run -- init -p "C:\path\to\AozoraEpub3" -l 1.8
+```
 
 ## 初期化後のディレクトリ
 
@@ -186,8 +196,6 @@ narou_rs setting server-reverse-proxy.enable=true
 - `narou init` 前に多くのコマンドを実行しても、初期化を促す表示になります。
 - `webnovel/*.yaml` を Rust 側のハードコードより優先する方針です。サイト追従が必要な場合は、まず YAML の更新を検討してください。
 - 配布物を移動するときは、実行ファイルだけでなく `webnovel/` と `preset/` も一緒に配置してください。
-- Windows 向けの配布バイナリで `VCRUNTIME140.dll` が見つからない場合は、Microsoft 公式の [最新の Visual C++ 再配布可能パッケージ](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) から `Microsoft Visual C++ Redistributable 2015-2022 x64` をインストールしてください。
-- Linux 向けの配布バイナリは GitHub Actions の Ubuntu 24.04 上で `*-unknown-linux-gnu` ターゲットとしてビルドしています。古い glibc の環境では `GLIBC_2.xx not found` のようなエラーで起動できない場合があるため、その場合は利用環境上で `cargo build --release` して実行してください。
 - `send`、`mail`、AozoraEpub3 連携は、端末や SMTP の実環境設定が前提です。
 - `mail` 機能と Kindle / Kobo などの実機送信は、開発者の手元に端末が無いため十分な実地確認ができていません。動作確認や不具合報告、再現情報、修正提案に協力してもらえると助かります。
 - `cargo run` でサンプル小説を扱うときは、`sample/novel/` をカレントディレクトリにしないと `.narou/` が見つかりません。
