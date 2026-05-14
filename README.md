@@ -29,13 +29,52 @@ narou_rs は、日本の Web 小説を取得・管理・変換する CLI / Web U
 ```text
 narou/
   narou_rs(.exe)
+  narou_rs_updater(.exe).new
   webnovel/
   preset/
   LICENSE
+  README.md
+  Third-Party-License.md
   commitversion
 ```
 
 `narou_rs` は、実行ファイルの近くにある `webnovel/`、`preset/`、`commitversion` を参照します。これらを分離しないでください。
+
+Windows では、展開した `narou/` に移動してから実行します。
+
+```powershell
+cd narou
+.\narou_rs.exe init
+```
+
+どのフォルダからでも `narou_rs` を実行したい場合は、展開した `narou/` をユーザー環境変数の `Path` に追加します。次の例は、現在の PowerShell で開いている `narou/` フォルダを `Path` に追加します。
+
+```powershell
+$narouPath = (Resolve-Path .).Path
+$currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
+[Environment]::SetEnvironmentVariable("Path", "$currentPath;$narouPath", "User")
+```
+
+設定後は PowerShell を開き直すと、次のように実行できます。
+
+```powershell
+narou_rs init
+```
+
+Linux / macOS では、展開した `narou/` に移動してから実行します。
+
+```bash
+cd narou
+./narou_rs init
+```
+
+どのディレクトリからでも実行したい場合は、展開した `narou/` を `PATH` に追加します。
+
+```bash
+echo 'export PATH="$PATH:/path/to/narou"' >> ~/.bashrc
+source ~/.bashrc
+narou_rs init
+```
 
 Windows 向けの配布バイナリで `VCRUNTIME140.dll` が見つからない場合は、Microsoft 公式の [最新の Visual C++ 再配布可能パッケージ](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist) から `Microsoft Visual C++ Redistributable 2015-2022 x64` をインストールしてください。
 
@@ -51,6 +90,16 @@ cd narou.rs
 cargo build
 cargo run -- init
 ```
+
+Release と同じ構成の `narou/` フォルダをリポジトリ直下に作る場合は、次のコマンドを使います。
+
+```powershell
+cargo local-build
+cd narou
+.\narou_rs.exe init
+```
+
+`cargo local-build` は GitHub Actions の release と同じ構成の `narou/` フォルダを作成します。release ビルドした `narou_rs(.exe)`、`narou_rs_updater(.exe).new`、`webnovel/`、`preset/`、`LICENSE`、`README.md`、`Third-Party-License.md`、`commitversion` を `narou/` に配置します。
 
 初期化後は、必要に応じて AozoraEpub3 の場所を設定します。
 
