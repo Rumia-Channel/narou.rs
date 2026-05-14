@@ -269,7 +269,17 @@ where
         .create(true)
         .open(&lock_path)?;
     lock_file.lock_exclusive()?;
-    operation()
+    let result = operation();
+    let _ = lock_file.unlock();
+    drop(lock_file);
+    if result.is_ok() {
+        match fs::remove_file(&lock_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+    result
 }
 
 fn atomic_write_locked(path: &Path, content: &str) -> Result<()> {
@@ -454,7 +464,7 @@ mod tests {
 
     use super::{
         CACHE_MAX_SIZE, CACHE_TARGET_SIZE, Inventory, InventoryScope, MAX_YAML_SIZE_BYTES,
-        STALE_LOCK_MAX_AGE,
+        NarouError, STALE_LOCK_MAX_AGE,
     };
 
     fn env_lock() -> &'static Mutex<()> {
@@ -597,7 +607,7 @@ mod tests {
         let raw = std::fs::read_to_string(narou_dir.join("freeze.yaml")).unwrap();
         assert!(!raw.contains("1:"));
         assert!(raw.contains("2: true"));
-        assert!(narou_dir.join("freeze.yaml.lock").exists());
+        assert!(!narou_dir.join("freeze.yaml.lock").exists());
     }
 
     #[test]
@@ -629,8 +639,26 @@ mod tests {
             )
             .unwrap();
 
-        assert!(lock_path.exists());
+        assert!(!lock_path.exists());
         let raw = std::fs::read_to_string(narou_dir.join("freeze.yaml")).unwrap();
         assert!(raw.contains("1: true"));
+    }
+
+    #[test]
+    fn lock_file_remains_when_update_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let narou_dir = root.join(".narou");
+        std::fs::create_dir_all(&narou_dir).unwrap();
+
+        let inventory = Inventory::new(root);
+        let result = inventory.update_yaml::<(), HashMap<i64, serde_yaml::Value>, _>(
+            "freeze",
+            InventoryScope::Local,
+            |_frozen| Err(NarouError::Database("boom".to_string())),
+        );
+
+        assert!(result.is_err());
+        assert!(narou_dir.join("freeze.yaml.lock").exists());
     }
 }
