@@ -2211,6 +2211,7 @@ mod tests {
                             "lastEpisodePublishedAt": "2021-01-12T16:13:02Z",
                             "totalCharacterCount": 1234,
                             "tagLabels": ["tag-a", "tag-b"],
+                            "tableOfContents": [],
                             "tableOfContentsV2": [{"__ref": "TableOfContentsChapter:10"}]
                         },
                         "UserAccount:1": {

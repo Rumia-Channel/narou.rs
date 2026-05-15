@@ -25,7 +25,11 @@ preprocess: |-
   let work = data["Work:${work_id}"]
 
   # TOC: resolve refs → extract chapter/episode pairs → resolve again → format
-  let toc = work.tableOfContents || work.tableOfContentsV2
+  if work.tableOfContentsV2 && !work.tableOfContentsV2.empty
+    let toc = work.tableOfContentsV2
+  else
+    let toc = work.tableOfContents || []
+  end
   let toc = toc.map { |item| data[item.__ref] }
   let toc = toc.flat_map { |item| [item.chapter, item.episodeUnions] }
   let toc = toc.compact
