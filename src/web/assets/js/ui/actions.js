@@ -1488,7 +1488,7 @@ async function updateLatestVersionInfo() {
       El.aboutLatestVersion.textContent =
         `最新バージョン: ${latest}${data.update_available ? ' (更新あり)' : ' (最新)'} / 現在: ${current}`;
       if (El.aboutUpdate) {
-        if (data.update_available && !data.develop) {
+        if (data.update_available && !data.develop && !data.local_build) {
           El.aboutUpdate.classList.remove('hide');
           El.aboutUpdate.disabled = false;
         } else {
@@ -1496,7 +1496,12 @@ async function updateLatestVersionInfo() {
         }
       }
       if (El.aboutUpdateStatus) {
-        if (data.update_available && data.develop) {
+        if (data.update_available && data.local_build) {
+          El.aboutUpdateStatus.classList.remove('hide');
+          El.aboutUpdateStatus.textContent =
+            'local-build 版のためアップデートボタンは表示されません。' +
+            ' GitHub Release 版へ上書き更新せず、必要に応じて手元で再ビルドしてください。';
+        } else if (data.update_available && data.develop) {
           El.aboutUpdateStatus.classList.remove('hide');
           El.aboutUpdateStatus.textContent =
             'develop ビルド扱いのためアップデートボタンは表示されません。' +
