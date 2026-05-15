@@ -5,6 +5,8 @@ scheme: https
 domain: kakuyomu.jp
 top_url: \\k<scheme>://\\k<domain>
 url: \\k<top_url>/works/(?<ncode>\d+)
+series_url: \\k<top_url>/users/[^/]+/collections/(?<series>\d+)
+series_item_url: (?:"|')(?<href>/works/\d+)(?:"|')
 encoding: UTF-8
 confirm_over18: no
 append_title_to_folder_name: yes

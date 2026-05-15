@@ -151,6 +151,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 複数ターゲット間の水平線セパレータ
 - 有効ターゲット検証: Nコード or URL(サイト設定マッチ)
 - Nコード指定時は `https://ncode.syosetu.com/<ncode>/` からURLキャプチャを作り、サイト定義の `\k<ncode>` を展開してDLする
+- `webnovel/*.yaml` の `series_url` / `series_item_url` に一致するシリーズ URL は、個別小説 URL に展開してから通常の download 処理に渡す。小説家になろう、R18 なろう、カクヨムのシリーズ/コレクション URL に対応
 
 **完了扱いにしない理由 / 不足動作**:
 - `--mail` の最終的な実SMTP end-to-end 検証は `mail` コマンド側の未了項目と共通
