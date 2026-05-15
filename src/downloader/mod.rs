@@ -1017,8 +1017,7 @@ impl Downloader {
         target: &str,
         force: bool,
     ) -> Result<DownloadResult> {
-        let (existing_id, setting) = self.resolve_target_for_download(target)?;
-        self.fetcher.configure_rate_limiter(setting.is_narou);
+        let (existing_id, mut setting) = self.resolve_target_for_download(target)?;
         let provisional_id = match existing_id {
             Some(id) => id,
             None => crate::db::with_database(|db| Ok(db.create_new_id()))?,
@@ -1045,6 +1044,23 @@ impl Downloader {
         } else {
             setting.interpolate_with_captures(&setting.toc_url, &url_captures)
         };
+        let toc_url = Self::ageauth_redirect_target(&toc_url).unwrap_or(toc_url);
+        let toc_url = match self.fetcher.resolve_final_url(&toc_url, setting.cookie()) {
+            Ok(final_url) if final_url != toc_url => {
+                let final_url = Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
+                if let Some(final_setting) = self.find_site_setting(&final_url) {
+                    setting = final_setting;
+                    setting
+                        .toc_url_with_url_captures(&final_url)
+                        .unwrap_or(final_url)
+                } else {
+                    final_url
+                }
+            }
+            _ => toc_url,
+        };
+        let url_captures = setting.extract_url_captures(&toc_url).unwrap_or(url_captures);
+        self.fetcher.configure_rate_limiter(setting.is_narou);
         let toc_source = match fetch_toc(&mut self.fetcher, &setting, &toc_url) {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
@@ -1145,6 +1161,9 @@ impl Downloader {
                 .ok()
                 .flatten()
         });
+        let previous_novel_dir = existing_record
+            .as_ref()
+            .map(|record| crate::db::novel_dir_for_record(Path::new(types::ARCHIVE_ROOT_DIR), record));
 
         let (novel_type, is_end) = resolve_novel_type(&setting, &toc_source, &url_captures, &info);
 
@@ -1171,16 +1190,21 @@ impl Downloader {
             setting.append_title_to_folder_name,
             existing_id,
         );
-        let sitename = existing_record
-            .as_ref()
-            .and_then(|r| {
-                if r.sitename.is_empty() {
-                    None
-                } else {
-                    Some(r.sitename.clone())
-                }
+        let sitename = info
+            .sitename
+            .clone()
+            .or_else(|| {
+                existing_record
+                    .as_ref()
+                    .filter(|r| r.domain.as_deref() == Some(setting.domain.as_str()))
+                    .and_then(|r| {
+                        if r.sitename.is_empty() {
+                            None
+                        } else {
+                            Some(r.sitename.clone())
+                        }
+                    })
             })
-            .or_else(|| info.sitename.clone())
             .unwrap_or_else(|| setting.sitename.clone());
 
         let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory);
@@ -1611,6 +1635,8 @@ impl Downloader {
             Ok::<i64, NarouError>(id)
         })?;
 
+        self.remove_migrated_novel_dir(previous_novel_dir.as_deref(), &novel_dir);
+
         if let Some(old_id) = existing_id {
             self.move_section_hash_bucket(old_id, id);
         } else {
@@ -1733,6 +1759,17 @@ impl Downloader {
         Ok((true, None))
     }
 
+    fn ageauth_redirect_target(url: &str) -> Option<String> {
+        let parsed = reqwest::Url::parse(url).ok()?;
+        if parsed.host_str() != Some("nl.syosetu.com") || parsed.path() != "/redirect/ageauth/" {
+            return None;
+        }
+        let target = parsed.query_pairs().find_map(|(key, value)| {
+            (key == "url").then(|| value.into_owned())
+        })?;
+        is_safe_public_url(&target).then_some(target)
+    }
+
     fn resolve_target_for_download(&self, target: &str) -> Result<(Option<i64>, SiteSetting)> {
         let target_type = Self::get_target_type(target);
 
@@ -1799,7 +1836,12 @@ impl Downloader {
                     .parse()
                     .map_err(|_| NarouError::InvalidTarget(target.to_string()))?;
                 let setting = crate::db::with_database(|db| {
-                    Ok(db.get(id).and_then(|r| self.find_site_setting(&r.toc_url)))
+                    Ok(db.get(id).and_then(|r| {
+                        self.find_site_setting(&r.toc_url).or_else(|| {
+                            Self::ageauth_redirect_target(&r.toc_url)
+                                .and_then(|url| self.find_site_setting(&url))
+                        })
+                    }))
                 })
                 .ok()
                 .flatten();
@@ -1860,7 +1902,16 @@ impl Downloader {
         if let Some(id) = existing_id {
             if let Ok(Some(record)) = crate::db::with_database(|db| Ok(db.get(id).cloned())) {
                 if !record.file_title.is_empty() {
-                    return record.file_title;
+                    if append_title
+                        && ncode
+                            .as_deref()
+                            .is_some_and(|ncode| record.file_title.eq_ignore_ascii_case(ncode))
+                        && !title.is_empty()
+                    {
+                        // Recover records created before the correct site/title was known.
+                    } else {
+                        return record.file_title;
+                    }
                 }
             }
         }
@@ -1894,6 +1945,25 @@ impl Downloader {
             file_title,
             use_subdirectory,
         )
+    }
+
+    fn remove_migrated_novel_dir(&self, previous: Option<&Path>, current: &Path) {
+        let Some(previous) = previous else {
+            return;
+        };
+        if previous == current || !previous.exists() {
+            return;
+        }
+        let still_referenced = crate::db::with_database(|db| {
+            Ok(db
+                .all_records()
+                .values()
+                .any(|record| crate::db::novel_dir_for_record(Path::new(types::ARCHIVE_ROOT_DIR), record) == previous))
+        })
+        .unwrap_or(true);
+        if !still_referenced {
+            let _ = std::fs::remove_dir_all(previous);
+        }
     }
 
     fn download_use_subdirectory(&self, existing_id: Option<i64>) -> bool {
@@ -2013,8 +2083,32 @@ mod tests {
     };
     use super::novel_info::NovelInfo;
     use super::site_setting::SiteSetting;
+    use crate::db::{self, Database};
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
     use chrono::TimeZone;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct TestDirGuard(PathBuf);
+
+    impl Drop for TestDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    struct DatabaseGuard(Option<Database>);
+
+    impl Drop for DatabaseGuard {
+        fn drop(&mut self) {
+            *db::DATABASE.lock() = self.0.take();
+        }
+    }
 
     #[test]
     fn sanitize_filename_removes_windows_trailing_dots_and_spaces() {
@@ -2028,6 +2122,72 @@ mod tests {
             resolve_user_agent(Some("cli-agent"), Some("saved-agent".to_string())),
             "cli-agent"
         );
+    }
+
+    #[test]
+    fn ageauth_redirect_target_extracts_original_novel18_url() {
+        assert_eq!(
+            Downloader::ageauth_redirect_target(
+                "https://nl.syosetu.com/redirect/ageauth/?url=https%3A%2F%2Fnovel18.syosetu.com%2Fn7274mc%2F&hash=abc"
+            )
+            .as_deref(),
+            Some("https://novel18.syosetu.com/n7274mc/")
+        );
+    }
+
+    #[test]
+    fn remove_migrated_novel_dir_keeps_previous_dir_when_still_referenced() {
+        let _guard = env_lock().lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        let _dir_guard = TestDirGuard(original_dir);
+
+        std::env::set_current_dir(temp.path()).unwrap();
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+
+        let db = Database::new().unwrap();
+        let mut db_slot = db::DATABASE.lock();
+        let previous_db = db_slot.take();
+        *db_slot = Some(db);
+        drop(db_slot);
+        let _db_guard = DatabaseGuard(previous_db);
+
+        let downloader = Downloader::with_user_agent(None).unwrap();
+        let timestamp = chrono::Utc::now();
+        let mut previous_record = sample_record(timestamp);
+        previous_record.id = 1;
+        previous_record.sitename = "site".to_string();
+        previous_record.file_title = "old".to_string();
+        let mut referenced_record = sample_record(timestamp);
+        referenced_record.id = 2;
+        referenced_record.sitename = "site".to_string();
+        referenced_record.file_title = "old".to_string();
+        let mut current_record = sample_record(timestamp);
+        current_record.id = 3;
+        current_record.sitename = "site".to_string();
+        current_record.file_title = "new".to_string();
+
+        let previous = db::paths::novel_dir_for_record(
+            &PathBuf::from(super::types::ARCHIVE_ROOT_DIR),
+            &previous_record,
+        );
+        let current = db::paths::novel_dir_for_record(
+            &PathBuf::from(super::types::ARCHIVE_ROOT_DIR),
+            &current_record,
+        );
+        std::fs::create_dir_all(&previous).unwrap();
+        std::fs::create_dir_all(&current).unwrap();
+
+        {
+            let mut db_slot = db::DATABASE.lock();
+            let db = db_slot.as_mut().unwrap();
+            db.insert(previous_record);
+            db.insert(referenced_record);
+            db.insert(current_record);
+        }
+
+        downloader.remove_migrated_novel_dir(Some(&previous), &current);
+        assert!(previous.exists());
     }
 
     #[test]
