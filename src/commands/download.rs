@@ -69,6 +69,9 @@ fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, Downloa
     let multi = CliProgress::multi();
     let multi_clone = multi.clone();
     let mut mistook = 0usize;
+    let (expanded_targets, series_mistook) = expand_series_targets(&mut downloader, &targets);
+    targets = expanded_targets;
+    mistook += series_mistook;
 
     for (i, target) in targets.iter().enumerate() {
         if i > 0 {
@@ -164,6 +167,25 @@ fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, Downloa
     } else {
         0
     })
+}
+
+fn expand_series_targets(downloader: &mut Downloader, targets: &[String]) -> (Vec<String>, usize) {
+    let mut expanded = Vec::new();
+    let mut mistook = 0usize;
+    for target in targets {
+        match downloader.expand_series_target(target) {
+            Ok(Some(items)) => {
+                println!("{} を {} 件の小説URLに展開しました", target, items.len());
+                expanded.extend(items);
+            }
+            Ok(None) => expanded.push(target.clone()),
+            Err(err) => {
+                println!("  Error: {}", err);
+                mistook += 1;
+            }
+        }
+    }
+    (expanded, mistook)
 }
 
 fn interactive_mode(downloader: &Downloader) -> Vec<String> {

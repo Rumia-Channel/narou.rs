@@ -5,12 +5,14 @@ scheme: https
 domain: kakuyomu.jp
 top_url: \\k<scheme>://\\k<domain>
 url: \\k<top_url>/works/(?<ncode>\d+)
+series_url: \\k<top_url>/users/[^/]+/collections/(?<series>\d+)
+series_item_url: (?:"|')(?<href>/works/\d+)(?:"|')
 encoding: UTF-8
 confirm_over18: no
 append_title_to_folder_name: yes
 title_strip_pattern: null
 sitename: *name
-version: 2.2
+version: 2.3
 
 # ------------------------------------------------------------
 # 前処理設定 (DSL — pest parser で実行)
@@ -25,7 +27,11 @@ preprocess: |-
   let work = data["Work:${work_id}"]
 
   # TOC: resolve refs → extract chapter/episode pairs → resolve again → format
-  let toc = work.tableOfContents || work.tableOfContentsV2
+  if work.tableOfContentsV2 && !work.tableOfContentsV2.empty
+    let toc = work.tableOfContentsV2
+  else
+    let toc = work.tableOfContents || []
+  end
   let toc = toc.map { |item| data[item.__ref] }
   let toc = toc.flat_map { |item| [item.chapter, item.episodeUnions] }
   let toc = toc.compact

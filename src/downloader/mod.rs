@@ -963,6 +963,47 @@ impl Downloader {
         Ok(())
     }
 
+    pub fn expand_series_target(&mut self, target: &str) -> Result<Option<Vec<String>>> {
+        if !matches!(Self::get_target_type(target), TargetType::Url) {
+            return Ok(None);
+        }
+        let setting = self
+            .site_settings
+            .iter()
+            .find(|setting| setting.matches_series_url(target))
+            .cloned();
+        let Some(setting) = setting else {
+            return Ok(None);
+        };
+        let pattern = setting.compile_series_item_pattern().ok_or_else(|| {
+            NarouError::SiteSetting(format!("No series_item_url pattern defined: {}", setting.name))
+        })?;
+
+        self.fetcher.configure_rate_limiter(setting.is_narou);
+        let mut body = self
+            .fetcher
+            .fetch_text(target, setting.cookie(), Some(setting.encoding()))?;
+        crate::downloader::util::pretreatment_source(&mut body, setting.encoding(), None);
+
+        let mut targets = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for caps in pattern.captures_iter(&body) {
+            if let Some(url) = setting.series_item_url_from_captures(target, &pattern, &caps)
+                && seen.insert(url.clone())
+            {
+                targets.push(url);
+            }
+        }
+
+        if targets.is_empty() {
+            return Err(NarouError::NotFound(format!(
+                "No novels found in series URL: {}",
+                target
+            )));
+        }
+        Ok(Some(targets))
+    }
+
     pub fn get_novel_data_dir(&self, record: &NovelRecord) -> PathBuf {
         crate::db::novel_dir_for_record(&PathBuf::from(types::ARCHIVE_ROOT_DIR), record)
     }
@@ -2211,6 +2252,7 @@ mod tests {
                             "lastEpisodePublishedAt": "2021-01-12T16:13:02Z",
                             "totalCharacterCount": 1234,
                             "tagLabels": ["tag-a", "tag-b"],
+                            "tableOfContents": [],
                             "tableOfContentsV2": [{"__ref": "TableOfContentsChapter:10"}]
                         },
                         "UserAccount:1": {
