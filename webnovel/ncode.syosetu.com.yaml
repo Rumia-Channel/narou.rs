@@ -5,7 +5,7 @@ domain: ncode.syosetu.com
 top_url: https://\\k<domain>
 url: https?://\\k<domain>/(?<ncode>n\d+[a-z]+)
 series_url: https?://\\k<domain>/(?<series>s\d+[a-z]+)
-series_item_url: <a href="(?<href>/n\d+[a-z]+/?)"
+series_item_url: (?:"|')(?<href>(?:https?://\\k<domain>)?/n\d+[a-z]+/?)(?:"|')
 encoding: UTF-8
 timezone: Asia/Tokyo
 confirm_over18: no
@@ -13,7 +13,7 @@ append_title_to_folder_name: yes
 title_strip_pattern: null
 cookie: over18=yes
 sitename: *name
-version: 2.2
+version: 2.3
 
 # ------------------------------------------------------------
 # 目次取得設定

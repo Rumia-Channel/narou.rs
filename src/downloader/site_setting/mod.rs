@@ -573,7 +573,7 @@ toc_url: https://example.com/works/\\k<ncode>
         ));
         let pattern = setting.compile_series_item_pattern().unwrap();
         let caps = pattern
-            .captures(r#"<a href="/works/67890">title</a>"#)
+            .captures(r#"<a class="item" href="/works/67890">title</a>"#)
             .unwrap();
         assert_eq!(
             setting
@@ -607,5 +607,17 @@ toc_url: https://example.com/works/\\k<ncode>
         assert!(kakuyomu.matches_series_url(
             "https://kakuyomu.jp/users/bottyan_1129/collections/16816452219618328030"
         ));
+
+        let narou_pattern = narou.compile_series_item_pattern().unwrap();
+        assert!(
+            narou_pattern
+                .is_match(r#"<a href="https://ncode.syosetu.com/n7826bd/">title</a>"#)
+        );
+        let novel18_pattern = novel18.compile_series_item_pattern().unwrap();
+        assert!(
+            novel18_pattern
+                .is_match(r#"<a href="https://novel18.syosetu.com/n0001aa/">title</a>"#)
+        );
+        assert!(novel18_pattern.is_match(r#"<a href="/n3412lp/">title</a>"#));
     }
 }
