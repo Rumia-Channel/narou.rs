@@ -1017,8 +1017,7 @@ impl Downloader {
         target: &str,
         force: bool,
     ) -> Result<DownloadResult> {
-        let (existing_id, setting) = self.resolve_target_for_download(target)?;
-        self.fetcher.configure_rate_limiter(setting.is_narou);
+        let (existing_id, mut setting) = self.resolve_target_for_download(target)?;
         let provisional_id = match existing_id {
             Some(id) => id,
             None => crate::db::with_database(|db| Ok(db.create_new_id()))?,
@@ -1045,6 +1044,23 @@ impl Downloader {
         } else {
             setting.interpolate_with_captures(&setting.toc_url, &url_captures)
         };
+        let toc_url = Self::ageauth_redirect_target(&toc_url).unwrap_or(toc_url);
+        let toc_url = match self.fetcher.resolve_final_url(&toc_url, setting.cookie()) {
+            Ok(final_url) if final_url != toc_url => {
+                let final_url = Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
+                if let Some(final_setting) = self.find_site_setting(&final_url) {
+                    setting = final_setting;
+                    setting
+                        .toc_url_with_url_captures(&final_url)
+                        .unwrap_or(final_url)
+                } else {
+                    final_url
+                }
+            }
+            _ => toc_url,
+        };
+        let url_captures = setting.extract_url_captures(&toc_url).unwrap_or(url_captures);
+        self.fetcher.configure_rate_limiter(setting.is_narou);
         let toc_source = match fetch_toc(&mut self.fetcher, &setting, &toc_url) {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
@@ -1171,16 +1187,21 @@ impl Downloader {
             setting.append_title_to_folder_name,
             existing_id,
         );
-        let sitename = existing_record
-            .as_ref()
-            .and_then(|r| {
-                if r.sitename.is_empty() {
-                    None
-                } else {
-                    Some(r.sitename.clone())
-                }
+        let sitename = info
+            .sitename
+            .clone()
+            .or_else(|| {
+                existing_record
+                    .as_ref()
+                    .filter(|r| r.domain.as_deref() == Some(setting.domain.as_str()))
+                    .and_then(|r| {
+                        if r.sitename.is_empty() {
+                            None
+                        } else {
+                            Some(r.sitename.clone())
+                        }
+                    })
             })
-            .or_else(|| info.sitename.clone())
             .unwrap_or_else(|| setting.sitename.clone());
 
         let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory);
@@ -1733,6 +1754,17 @@ impl Downloader {
         Ok((true, None))
     }
 
+    fn ageauth_redirect_target(url: &str) -> Option<String> {
+        let parsed = reqwest::Url::parse(url).ok()?;
+        if parsed.host_str() != Some("nl.syosetu.com") || parsed.path() != "/redirect/ageauth/" {
+            return None;
+        }
+        let target = parsed.query_pairs().find_map(|(key, value)| {
+            (key == "url").then(|| value.into_owned())
+        })?;
+        is_safe_public_url(&target).then_some(target)
+    }
+
     fn resolve_target_for_download(&self, target: &str) -> Result<(Option<i64>, SiteSetting)> {
         let target_type = Self::get_target_type(target);
 
@@ -1799,7 +1831,12 @@ impl Downloader {
                     .parse()
                     .map_err(|_| NarouError::InvalidTarget(target.to_string()))?;
                 let setting = crate::db::with_database(|db| {
-                    Ok(db.get(id).and_then(|r| self.find_site_setting(&r.toc_url)))
+                    Ok(db.get(id).and_then(|r| {
+                        self.find_site_setting(&r.toc_url).or_else(|| {
+                            Self::ageauth_redirect_target(&r.toc_url)
+                                .and_then(|url| self.find_site_setting(&url))
+                        })
+                    }))
                 })
                 .ok()
                 .flatten();
@@ -2027,6 +2064,17 @@ mod tests {
         assert_eq!(
             resolve_user_agent(Some("cli-agent"), Some("saved-agent".to_string())),
             "cli-agent"
+        );
+    }
+
+    #[test]
+    fn ageauth_redirect_target_extracts_original_novel18_url() {
+        assert_eq!(
+            Downloader::ageauth_redirect_target(
+                "https://nl.syosetu.com/redirect/ageauth/?url=https%3A%2F%2Fnovel18.syosetu.com%2Fn7274mc%2F&hash=abc"
+            )
+            .as_deref(),
+            Some("https://novel18.syosetu.com/n7274mc/")
         );
     }
 
