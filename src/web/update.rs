@@ -40,6 +40,15 @@ pub async fn api_update_start(
             }),
         ));
     }
+    if version::is_local_build() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse {
+                success: false,
+                message: "local-build 版では GitHub Release 版への自動アップデートはできません".to_string(),
+            }),
+        ));
+    }
 
     let install_dir = match resolve_install_dir() {
         Ok(d) => d,

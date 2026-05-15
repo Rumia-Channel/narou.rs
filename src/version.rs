@@ -13,7 +13,9 @@ pub const VERSION: &str = match option_env!("NAROU_RS_VERSION_OVERRIDE") {
 };
 
 pub fn create_version_string() -> String {
-    if commit_version_exists() {
+    if is_local_build() {
+        format!("{} (local-build)", VERSION)
+    } else if commit_version_exists() {
         VERSION.to_string()
     } else {
         format!("{} (develop)", VERSION)
@@ -25,6 +27,7 @@ pub fn version_json() -> serde_json::Value {
         "version": create_version_string(),
         "name": NAME,
         "develop": !commit_version_exists(),
+        "local_build": is_local_build(),
     })
 }
 
@@ -62,6 +65,7 @@ pub fn aozoraepub3_jar_path() -> Option<PathBuf> {
 }
 
 pub const IS_RELEASE_BUILD: bool = option_env!("NAROU_RS_RELEASE_BUILD").is_some();
+pub const IS_LOCAL_BUILD: bool = option_env!("NAROU_RS_LOCAL_BUILD").is_some();
 
 pub fn commit_version_exists() -> bool {
     if IS_RELEASE_BUILD {
@@ -74,6 +78,10 @@ pub fn commit_version_exists() -> bool {
         return false;
     };
     dir.join("commitversion").exists()
+}
+
+pub fn is_local_build() -> bool {
+    IS_LOCAL_BUILD
 }
 
 fn aozoraepub3_jar_from_global_setting() -> Option<PathBuf> {
