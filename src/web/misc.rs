@@ -81,12 +81,19 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
                 .to_string();
             let current_plain = normalize_version(&current);
             let develop = !version::commit_version_exists();
+            let local_build = version::is_local_build();
+            let container = version::is_container_runtime();
+            let self_update_supported = version::self_update_unavailable_reason().is_none();
             Json(serde_json::json!({
                 "success": true,
                 "current_version": current,
                 "latest_version": latest,
                 "update_available": !latest.is_empty() && latest != current_plain,
                 "develop": develop,
+                "local_build": local_build,
+                "container": container,
+                "self_update_supported": self_update_supported,
+                "self_update_unavailable_reason": version::self_update_unavailable_reason(),
                 "url": json["html_url"].as_str().unwrap_or("https://github.com/Rumia-Channel/narou.rs/releases/latest"),
             }))
         }

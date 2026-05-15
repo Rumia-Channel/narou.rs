@@ -1488,7 +1488,7 @@ async function updateLatestVersionInfo() {
       El.aboutLatestVersion.textContent =
         `最新バージョン: ${latest}${data.update_available ? ' (更新あり)' : ' (最新)'} / 現在: ${current}`;
       if (El.aboutUpdate) {
-        if (data.update_available && !data.develop) {
+        if (data.update_available && data.self_update_supported !== false) {
           El.aboutUpdate.classList.remove('hide');
           El.aboutUpdate.disabled = false;
         } else {
@@ -1496,7 +1496,11 @@ async function updateLatestVersionInfo() {
         }
       }
       if (El.aboutUpdateStatus) {
-        if (data.update_available && data.develop) {
+        if (data.update_available && data.self_update_supported === false) {
+          El.aboutUpdateStatus.classList.remove('hide');
+          El.aboutUpdateStatus.textContent = data.self_update_unavailable_reason ||
+            'この実行環境ではアップデートボタンは表示されません。';
+        } else if (data.update_available && data.develop) {
           El.aboutUpdateStatus.classList.remove('hide');
           El.aboutUpdateStatus.textContent =
             'develop ビルド扱いのためアップデートボタンは表示されません。' +

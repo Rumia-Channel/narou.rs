@@ -90,6 +90,7 @@ fn build_app_binary(options: &Options, updater_hash: &str) -> Result<(), String>
     let mut command = cargo_build_command(options);
     command.args(["--bin", "narou_rs"]);
     command.env("NAROU_RS_RELEASE_BUILD", "1");
+    command.env("NAROU_RS_LOCAL_BUILD", "1");
     command.env("NAROU_RS_UPDATER_SHA256", updater_hash);
     run_command(&mut command, "failed to build narou_rs")
 }

@@ -62,6 +62,7 @@ impl HttpFetcher {
         if self.prefer_curl {
             match self.fetch_tier_curl(url, cookie, encoding) {
                 Ok(body) => return Ok(body),
+                Err(err) if should_stop_fetch_fallback(&err) => return Err(err),
                 Err(err) => last_error = Some(err),
             }
         }
@@ -86,6 +87,9 @@ impl HttpFetcher {
                     return Ok(body);
                 }
                 Err(err) => {
+                    if should_stop_fetch_fallback(&err) {
+                        return Err(err);
+                    }
                     last_error = Some(err);
                     self.tier_failures.entry(domain.clone()).or_insert([0; 3])[0] += 1;
                 }
@@ -96,6 +100,9 @@ impl HttpFetcher {
             match self.fetch_tier_reqwest(url, cookie, encoding) {
                 Ok(body) => return Ok(body),
                 Err(err) => {
+                    if should_stop_fetch_fallback(&err) {
+                        return Err(err);
+                    }
                     last_error = Some(err);
                     self.tier_failures.entry(domain.clone()).or_insert([0; 3])[1] += 1;
                 }
@@ -106,6 +113,9 @@ impl HttpFetcher {
             match self.fetch_tier_wget(url, cookie, encoding) {
                 Ok(body) => return Ok(body),
                 Err(err) => {
+                    if should_stop_fetch_fallback(&err) {
+                        return Err(err);
+                    }
                     last_error = Some(err);
                     self.tier_failures.entry(domain.clone()).or_insert([0; 3])[2] += 1;
                 }
@@ -198,6 +208,12 @@ impl HttpFetcher {
         let code = handle
             .response_code()
             .map_err(|e| io_error(e.to_string()))?;
+        if code == 404 {
+            return Err(NarouError::NotFound(url.to_string()));
+        }
+        if code == 503 {
+            return Err(NarouError::SuspendDownload("Rate limited (503)".into()));
+        }
         if code >= 400 {
             return Err(io_error(format!("HTTP {code} while fetching {url}")));
         }
@@ -383,6 +399,13 @@ fn io_error(message: impl Into<String>) -> NarouError {
     std::io::Error::other(message.into()).into()
 }
 
+fn should_stop_fetch_fallback(err: &NarouError) -> bool {
+    matches!(
+        err,
+        NarouError::NotFound(_) | NarouError::SuspendDownload(_)
+    )
+}
+
 impl HttpFetcher {
     fn send_reqwest(
         &self,
@@ -479,4 +502,43 @@ pub fn default_request_headers() -> HeaderMap {
     headers.insert(ACCEPT_CHARSET, HeaderValue::from_static("utf-8"));
     headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
     headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_stop_fetch_fallback, HttpFetcher};
+    use crate::error::NarouError;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn curl_404_is_not_found() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/missing", listener.local_addr().unwrap());
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let fetcher = HttpFetcher::new("narou_rs-test").unwrap();
+        let err = fetcher.fetch_tier_curl(&url, None, None).unwrap_err();
+        server.join().unwrap();
+
+        assert!(matches!(err, NarouError::NotFound(found_url) if found_url == url));
+    }
+
+    #[test]
+    fn not_found_stops_fetch_fallback() {
+        assert!(should_stop_fetch_fallback(&NarouError::NotFound(
+            "https://example.com/missing".into()
+        )));
+    }
 }
