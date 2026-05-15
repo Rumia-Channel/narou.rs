@@ -132,6 +132,45 @@ impl HttpFetcher {
         read_response_bytes(response)
     }
 
+    pub fn resolve_final_url(&self, url: &str, cookie: Option<&str>) -> Result<String> {
+        validate_public_url(url).map_err(io_error)?;
+        let mut current = reqwest::Url::parse(url).map_err(|e| io_error(e.to_string()))?;
+        let mut current_cookie = cookie.map(ToString::to_string);
+
+        for _ in 0..=MAX_REDIRECTS {
+            validate_public_url(current.as_str()).map_err(io_error)?;
+            let mut request = self.manual_redirect_client.get(current.clone());
+            if let Some(cookie) = current_cookie.as_deref() {
+                if !is_safe_header_value(cookie) {
+                    return Err(io_error("unsafe Cookie header value"));
+                }
+                request = request.header("Cookie", cookie);
+            }
+
+            let response = request.send()?;
+            if response.status().is_redirection() {
+                let Some(location) = response.headers().get(LOCATION) else {
+                    return Ok(current.to_string());
+                };
+                let location = location
+                    .to_str()
+                    .map_err(|e| io_error(format!("invalid redirect location: {e}")))?;
+                let next = current.join(location).map_err(|e| io_error(e.to_string()))?;
+                if next.host_str() != current.host_str() {
+                    current_cookie = None;
+                }
+                current = next;
+                continue;
+            }
+            return Ok(current.to_string());
+        }
+
+        Err(io_error(format!(
+            "redirect limit exceeded for {url} after {} hops",
+            MAX_REDIRECTS
+        )))
+    }
+
     pub fn fetch_tier_curl(
         &self,
         url: &str,
