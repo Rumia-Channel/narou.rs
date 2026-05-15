@@ -749,8 +749,11 @@ fn print_copy_to_result(
     device: Option<narou_rs::converter::device::Device>,
     novel_id: i64,
 ) -> std::result::Result<(), String> {
+    let Some(device) = device else {
+        return Ok(());
+    };
     if let Some(path) =
-        narou_rs::compat::copy_to_converted_file(Path::new(output_path), device, novel_id)?
+        narou_rs::compat::copy_to_converted_file(Path::new(output_path), Some(device), novel_id)?
     {
         println!("{} へコピーしました", path.display());
     }
@@ -902,7 +905,7 @@ mod tests {
     use super::{
         build_output_filename, decode_text_file_as_utf8, decode_text_file_with_encoding,
         normalize_text_file_encoding_name, parse_device_name, parse_web_worker_device_name,
-        split_output_name,
+        print_copy_to_result, split_output_name,
     };
 
     #[test]
@@ -961,5 +964,29 @@ mod tests {
     #[test]
     fn parse_web_worker_device_name_accepts_text_override() {
         assert_eq!(parse_web_worker_device_name("text"), Some(None));
+    }
+
+    #[test]
+    fn copy_to_result_skips_when_device_is_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        let narou_dir = temp.path().join(".narou");
+        let copy_to = temp.path().join("copy-to");
+        std::fs::create_dir_all(&narou_dir).unwrap();
+        std::fs::create_dir_all(&copy_to).unwrap();
+        std::fs::write(
+            narou_dir.join("local_setting.yaml"),
+            format!(
+                "convert.copy-to: \"{}\"\n",
+                copy_to.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        let output = temp.path().join("novel.txt");
+        std::fs::write(&output, "text").unwrap();
+
+        print_copy_to_result(output.to_str().unwrap(), None, 0).unwrap();
+
+        assert!(!copy_to.join("novel.txt").exists());
     }
 }
