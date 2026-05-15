@@ -31,21 +31,12 @@ pub async fn api_update_start(
 ) -> Result<Json<ApiResponse>, (StatusCode, Json<ApiResponse>)> {
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
-    if !version::commit_version_exists() {
+    if let Some(reason) = version::self_update_unavailable_reason() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ApiResponse {
                 success: false,
-                message: "develop ビルドではアップデートできません".to_string(),
-            }),
-        ));
-    }
-    if version::is_local_build() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse {
-                success: false,
-                message: "local-build 版では GitHub Release 版への自動アップデートはできません".to_string(),
+                message: reason.to_string(),
             }),
         ));
     }

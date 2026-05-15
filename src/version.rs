@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::compat::configure_hidden_console_command;
@@ -28,6 +28,8 @@ pub fn version_json() -> serde_json::Value {
         "name": NAME,
         "develop": !commit_version_exists(),
         "local_build": is_local_build(),
+        "container": is_container_runtime(),
+        "self_update_supported": self_update_unavailable_reason().is_none(),
     })
 }
 
@@ -66,6 +68,7 @@ pub fn aozoraepub3_jar_path() -> Option<PathBuf> {
 
 pub const IS_RELEASE_BUILD: bool = option_env!("NAROU_RS_RELEASE_BUILD").is_some();
 pub const IS_LOCAL_BUILD: bool = option_env!("NAROU_RS_LOCAL_BUILD").is_some();
+const DISABLE_SELF_UPDATE_ENV: &str = "NAROU_RS_DISABLE_SELF_UPDATE";
 
 pub fn commit_version_exists() -> bool {
     if IS_RELEASE_BUILD {
@@ -82,6 +85,35 @@ pub fn commit_version_exists() -> bool {
 
 pub fn is_local_build() -> bool {
     IS_LOCAL_BUILD
+}
+
+pub fn is_container_runtime() -> bool {
+    if std::env::var_os(DISABLE_SELF_UPDATE_ENV).is_some() {
+        return true;
+    }
+    if cfg!(windows) {
+        return false;
+    }
+    Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
+}
+
+pub fn self_update_unavailable_reason() -> Option<&'static str> {
+    if !commit_version_exists() {
+        return Some(
+            "develop ビルド扱いのためアップデートボタンは表示されません。実行ファイルと同じフォルダに commitversion ファイルが無い場合に発生します",
+        );
+    }
+    if is_local_build() {
+        return Some(
+            "local-build 版のためアップデートボタンは表示されません。GitHub Release 版へ上書き更新せず、必要に応じて手元で再ビルドしてください",
+        );
+    }
+    if is_container_runtime() {
+        return Some(
+            "Docker / Podman コンテナ内では自動アップデートできません。イメージを更新してコンテナを再作成してください",
+        );
+    }
+    None
 }
 
 fn aozoraepub3_jar_from_global_setting() -> Option<PathBuf> {
