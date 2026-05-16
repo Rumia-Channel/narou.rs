@@ -179,8 +179,15 @@ impl SiteSetting {
             self.sitename = self.name.clone();
         }
         if let Some(ref src) = self.preprocess {
-            let result = crate::downloader::preprocess::PreprocessPipeline::compile(src);
-            self.compiled_preprocess = result.ok();
+            match crate::downloader::preprocess::PreprocessPipeline::compile(src) {
+                Ok(pipeline) => self.compiled_preprocess = Some(pipeline),
+                Err(err) => {
+                    tracing::warn!(
+                        "preprocess compile failed for {}: {err}",
+                        self.name
+                    );
+                }
+            }
         }
         self.compiled_url = self.compile_url_patterns();
         self.compiled_series_url = self.compile_url_patterns_for(self.series_url.as_ref());
