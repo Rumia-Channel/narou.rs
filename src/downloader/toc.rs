@@ -379,6 +379,69 @@ mod tests {
         assert_eq!(subtitles[1].chapter, "");
         assert_eq!(subtitles[1].index, "313729");
     }
+
+    #[test]
+    fn akatsuki_multipage_toc_fetches_all_pages() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "暁").unwrap();
+        let first_page = r#"
+<span class="prev disabled">&lt; previous</span><span class="current">1</span><span><a href="/stories/index/novel_id~27990/page~2">2</a></span>
+<span class="next"><a href="/stories/index/novel_id~27990/page~2" rel="next">next &gt;</a></span>
+<span class="table_of_contents"><a href="/stories/index/page~3/novel_id~27990" rel="table_of_contents">最終ページ</a></span>
+<tr><td><a href="/stories/view/280978/novel_id~27990">第一話</a>&nbsp;</td><td class="font-s">2022年 12月30日 23時41分&nbsp;</td></tr>
+<tr><td><a href="/stories/view/281155/novel_id~27990">第二話</a>&nbsp;</td><td class="font-s">2023年 01月03日 20時09分&nbsp;</td></tr>
+"#;
+        let second_page = r#"
+<span class="prev"><a href="/stories/index/page~1/novel_id~27990" rel="prev">&lt; previous</a></span><span class="current">2</span>
+<span class="next"><a href="/stories/index/page~3/novel_id~27990" rel="next">next &gt;</a></span>
+<span class="table_of_contents"><a href="/stories/index/page~3/novel_id~27990" rel="table_of_contents">最終ページ</a></span>
+<tr><td><a href="/stories/view/281288/novel_id~27990">第三話</a>&nbsp;</td><td class="font-s">2023年 01月05日 22時41分&nbsp;</td></tr>
+"#;
+        let third_page = r#"
+<span class="prev"><a href="/stories/index/page~2/novel_id~27990" rel="prev">&lt; previous</a></span><span class="current">3</span>
+<span class="table_of_contents"><a href="/stories/index/page~3/novel_id~27990" rel="table_of_contents">最終ページ</a></span>
+<tr><td><a href="/stories/view/281445/novel_id~27990">第四話</a>&nbsp;</td><td class="font-s">2023年 01月09日 23時23分&nbsp;</td></tr>
+"#;
+        let mut fetcher = HttpFetcher::new("test-agent").unwrap();
+        let mut fetched_urls = Vec::new();
+
+        let subtitles = parse_subtitles_multipage_with(
+            &mut fetcher,
+            setting,
+            first_page,
+            &HashMap::new(),
+            "",
+            None,
+            |_, _, next_url| {
+                fetched_urls.push(next_url.to_string());
+                if fetched_urls.len() == 1 {
+                    Ok(second_page.to_string())
+                } else {
+                    Ok(third_page.to_string())
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fetched_urls.len(), 2);
+        assert_eq!(
+            fetched_urls[0],
+            "https://www.akatsuki-novels.com/stories/index/novel_id~27990/page~2"
+        );
+        assert_eq!(
+            fetched_urls[1],
+            "https://www.akatsuki-novels.com/stories/index/page~3/novel_id~27990"
+        );
+        assert_eq!(subtitles.len(), 4);
+        assert_eq!(subtitles[0].index, "280978");
+        assert_eq!(subtitles[0].subtitle, "第一話");
+        assert_eq!(subtitles[1].index, "281155");
+        assert_eq!(subtitles[1].subtitle, "第二話");
+        assert_eq!(subtitles[2].index, "281288");
+        assert_eq!(subtitles[2].subtitle, "第三話");
+        assert_eq!(subtitles[3].index, "281445");
+        assert_eq!(subtitles[3].subtitle, "第四話");
+    }
 }
 
 pub fn create_short_story_subtitles(

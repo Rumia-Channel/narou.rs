@@ -2391,7 +2391,7 @@ mod tests {
     }
 
     #[test]
-    fn kakuyomu_preprocess_yaml_supports_table_of_contents_v2_and_tags() {
+    fn kakuyomu_yaml_preprocess_supports_table_of_contents_v2_and_tags() {
         let settings = SiteSetting::load_all().unwrap();
         let setting = settings.iter().find(|s| s.name == "カクヨム").unwrap();
         assert!(setting.preprocess_pipeline().is_some());

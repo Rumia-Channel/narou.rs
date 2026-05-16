@@ -819,6 +819,11 @@ fn auto_convert(
 }
 
 fn auto_convert_via_web_subprocess(id: i64, no_open: bool) -> Result<(), String> {
+    if narou_rs::compat::load_local_setting_bool("concurrency") {
+        super::enqueue_web_convert_job(id)?;
+        return Ok(());
+    }
+
     let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut command = Command::new(exe_path);
     command.arg("convert");

@@ -1150,10 +1150,12 @@ fn fetch_illustration_bytes(url: &str) -> std::result::Result<(Vec<u8>, String),
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
-        CacheEntry, NovelConverter, clear_section_convert_cache,
-        find_saved_section_illustration_filename, illustration_extension_from_content_type,
-        normalize_illustration_url, save_section_convert_bucket,
+        CacheEntry, NovelConverter, clear_section_convert_cache, find_saved_section_illustration_filename,
+        illustration_extension_from_content_type, normalize_illustration_url,
+        save_section_convert_bucket,
     };
     use crate::{
         converter::{
@@ -1279,6 +1281,35 @@ mod tests {
             .join(".narou")
             .join("section_convert_cache.yaml.migrated")
             .is_file());
+
+        *crate::db::DATABASE.lock() = None;
+    }
+
+    #[test]
+    fn section_convert_cache_supports_large_per_novel_files() {
+        const OLD_SECTION_CACHE_LIMIT: usize = 32 * 1024 * 1024;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        let body = "a".repeat(32 * 1024 * 1024 + 1024);
+        let bucket = HashMap::from([("本文\\1.yaml".to_string(), make_cache_entry(&body))]);
+        save_section_convert_bucket("3062", &bucket).unwrap();
+
+        let path = temp
+            .path()
+            .join(".narou")
+            .join("section_convert_cache")
+            .join("3062.yaml");
+        assert!(path.metadata().unwrap().len() > OLD_SECTION_CACHE_LIMIT as u64);
+
+        let mut cache = super::SectionConvertCache::default();
+        let loaded = cache.bucket(3062).unwrap();
+        assert_eq!(loaded["本文\\1.yaml"].converted_section.body, body);
 
         *crate::db::DATABASE.lock() = None;
     }

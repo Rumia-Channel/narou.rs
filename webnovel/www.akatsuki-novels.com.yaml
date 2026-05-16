@@ -11,7 +11,7 @@ append_title_to_folder_name: yes
 title_strip_pattern: null
 cookie: CakeCookie[ALLOWED_ADULT_NOVEL]=on
 sitename: *name
-version: 1.1
+version: 1.2
 
 # ------------------------------------------------------------
 # 書籍情報取得設定
@@ -24,7 +24,10 @@ story: |-
 # 目次取得設定
 toc_url: \\k<top_url>/stories/index/novel_id~\\k<ncode>
 subtitles: |-
-  (?:<tr><td[^>]*colspan=\\"2\\"[^>]*><b>(?<chapter>.+?)</b></td></tr>)?<tr><td>(?:&nbsp;|\s)*<a href="(?<href>/stories/view/(?<index>\d+)/novel_id\~\d+)">(?<subtitle>.+?)</a>(?:&nbsp;|\s)*</td><td class="font-s">(?<subupdate>.+?)(?:&nbsp;|\s)*</td></tr>
+  (?:<tr><td[^>]*colspan=\\"2\\"[^>]*><b>(?<chapter>.+?)</b></td></tr>)*<tr><td>(?:&nbsp;|\s)*<a href="(?<href>/stories/view/(?<index>\d+)/novel_id\~\d+)">(?<subtitle>.+?)</a>(?:&nbsp;|\s)*</td><td class="font-s">(?<subupdate>.+?)(?:&nbsp;|\s)*</td></tr>
+next_toc: <span class="next"><a href="(?<next_page>[^"]+)" rel="next">
+next_url: \\k<top_url>\\k<next_page>
+toc_page_max: <span class="table_of_contents"><a href="/stories/index/page~(?<toc_page_max>\d+)/novel_id~\d+" rel="table_of_contents">
 
 # subdate(初投稿日)がない場合、一番最初のsubupdateで代用する
 subdate: no

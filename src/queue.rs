@@ -1320,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_queue_yaml_larger_than_32mb() {
+    fn load_rejects_queue_yaml_larger_than_size_limit() {
         let temp = tempfile::tempdir().unwrap();
         let queue_path = temp.path().join("queue.yaml");
         let file = std::fs::File::create(&queue_path).unwrap();

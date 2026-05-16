@@ -614,6 +614,11 @@ fn auto_convert(
 }
 
 fn auto_convert_via_web_subprocess(id: i64) -> Result<(), String> {
+    if narou_rs::compat::load_local_setting_bool("concurrency") {
+        super::enqueue_web_convert_job(id)?;
+        return Ok(());
+    }
+
     let exe_path = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut command = Command::new(exe_path);
     command.arg("convert").arg("--no-open").arg(id.to_string());
@@ -659,6 +664,7 @@ fn auto_convert_via_web_subprocess(id: i64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{EXIT_INTERRUPT, parse_confirm_input};
+    use narou_rs::queue::{JobType, PersistentQueue};
 
     #[test]
     fn parse_confirm_input_accepts_yes_and_no() {
@@ -682,5 +688,28 @@ mod tests {
     #[test]
     fn suspend_download_exit_code_matches_ruby() {
         assert_eq!(EXIT_INTERRUPT, 126);
+    }
+
+    #[test]
+    fn enqueue_web_convert_job_pushes_convert_job_when_concurrency_is_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        std::fs::write(
+            temp.path().join(".narou").join("local_setting.yaml"),
+            "concurrency: true\n",
+        )
+        .unwrap();
+        *narou_rs::db::DATABASE.lock() = None;
+        narou_rs::db::init_database().unwrap();
+
+        crate::commands::enqueue_web_convert_job(3062).unwrap();
+
+        let queue = PersistentQueue::new(&temp.path().join(".narou").join("queue.yaml")).unwrap();
+        assert_eq!(queue.pending_count(), 1);
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.jobs.front().map(|job| job.job_type), Some(JobType::Convert));
+        assert_eq!(snapshot.jobs.front().map(|job| job.target.as_str()), Some("3062"));
+        *narou_rs::db::DATABASE.lock() = None;
     }
 }
