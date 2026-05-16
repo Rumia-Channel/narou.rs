@@ -16,7 +16,7 @@ use crate::error::{NarouError, Result};
 
 const CACHE_MAX_SIZE: usize = 200;
 const CACHE_TARGET_SIZE: usize = 160;
-pub(crate) const MAX_YAML_SIZE_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_YAML_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 const STALE_LOCK_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 const PROTECTED_KEYS: &[&str] = &[
@@ -566,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn load_raw_rejects_yaml_larger_than_32mb() {
+    fn load_raw_rejects_yaml_larger_than_size_limit() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let narou_dir = root.join(".narou");
