@@ -4,6 +4,7 @@ use narou_rs::compat::yaml_value_to_string;
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::downloader::{Downloader, TargetType};
 use narou_rs::db::inventory::{Inventory, InventoryScope};
+use narou_rs::queue::{JobType, PersistentQueue};
 
 pub mod alias;
 pub mod backup;
@@ -89,6 +90,18 @@ fn latest_convert_target() -> Option<String> {
         .load("latest_convert", InventoryScope::Local)
         .ok()?;
     latest.get("id").and_then(yaml_value_to_string)
+}
+
+pub(crate) fn enqueue_web_convert_job(id: i64) -> Result<(), String> {
+    let queue_path = std::env::current_dir()
+        .map_err(|e| e.to_string())?
+        .join(".narou")
+        .join("queue.yaml");
+    let queue = PersistentQueue::new(&queue_path).map_err(|e| e.to_string())?;
+    queue
+        .push(JobType::Convert, &id.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]
