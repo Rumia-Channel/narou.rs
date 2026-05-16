@@ -478,6 +478,458 @@ fn cached_extract_json_regex(pattern: &str, flags: &str) -> PreprocessResult<reg
 mod tests {
     use super::*;
 
+    fn run(stmts: &[Stmt], source: &mut String) -> Result<(), String> {
+        run_stmts_checked(stmts, source)
+    }
+
+    #[test]
+    fn basic_string_interpolation_and_chain_access() {
+        let stmts = vec![
+            Stmt::Let {
+                var: "json".to_string(),
+                expr: Expr::ExtractJson(
+                    r#"<script[^>]*type="application/json"[^>]*>(.+?)</script>"#.to_string(),
+                    "s".to_string(),
+                ),
+            },
+            Stmt::Let {
+                var: "title".to_string(),
+                expr: Expr::Chain {
+                    base: Accessor {
+                        base: "json".to_string(),
+                        path: vec![AccessPart::Dot("title".to_string())],
+                    },
+                    methods: vec![],
+                },
+            },
+            Stmt::Emit(Expr::String(vec![
+                StrPart::Lit("title::".to_string()),
+                StrPart::Interp(Accessor {
+                    base: "title".to_string(),
+                    path: vec![],
+                }),
+            ])),
+            Stmt::InsertAtMatch,
+        ];
+        let mut source =
+            r#"before<script id="x" type="application/json">{"title":"test"}</script>after"#
+                .to_string();
+        run(&stmts, &mut source).unwrap();
+        assert!(source.contains("title::test"));
+    }
+
+    #[test]
+    fn guard_stops_reprocessing_when_magic_word_present() {
+        let stmts = vec![
+            Stmt::Guard("MagicWord".to_string()),
+            Stmt::Emit(Expr::String(vec![StrPart::Lit("should_not_appear".to_string())])),
+            Stmt::InsertAtMatch,
+        ];
+        let mut source = "MagicWord is here".to_string();
+        run(&stmts, &mut source).unwrap();
+        assert!(!source.contains("should_not_appear"));
+    }
+
+    #[test]
+    fn guard_allows_processing_when_magic_word_absent() {
+        let stmts = vec![
+            Stmt::Guard("MagicWord".to_string()),
+            Stmt::Emit(Expr::String(vec![StrPart::Lit("processed".to_string())])),
+            Stmt::InsertAtMatch,
+        ];
+        let mut source = "clean source".to_string();
+        run(&stmts, &mut source).unwrap();
+        assert!(source.contains("processed"));
+    }
+
+    #[test]
+    fn if_else_branches_evaluate_correctly() {
+        let stmts = vec![
+            Stmt::Let {
+                var: "json".to_string(),
+                expr: Expr::ExtractJson(
+                    r#"<script[^>]*type="application/json"[^>]*>(.+?)</script>"#.to_string(),
+                    "s".to_string(),
+                ),
+            },
+            Stmt::If {
+                cond: Expr::And(
+                    Box::new(Expr::Chain {
+                        base: Accessor {
+                            base: "json".to_string(),
+                            path: vec![AccessPart::Dot("tocV2".to_string())],
+                        },
+                        methods: vec![],
+                    }),
+                    Box::new(Expr::Not(Box::new(Expr::Chain {
+                        base: Accessor {
+                            base: "json".to_string(),
+                            path: vec![AccessPart::Dot("tocV2".to_string())],
+                        },
+                        methods: vec![Method::Empty],
+                    }))),
+                ),
+                body: vec![Stmt::Emit(Expr::String(vec![StrPart::Lit(
+                    "used_v2".to_string(),
+                )]))],
+                else_body: Some(vec![Stmt::Emit(Expr::String(vec![StrPart::Lit(
+                    "used_fallback".to_string(),
+                )]))]),
+            },
+            Stmt::InsertAtMatch,
+        ];
+        let mut source =
+            r#"before<script id="x" type="application/json">{"tocV2":[]}</script>after"#
+                .to_string();
+        run(&stmts, &mut source).unwrap();
+        assert!(source.contains("used_fallback"));
+        assert!(!source.contains("used_v2"));
+    }
+
+    #[test]
+    fn bracket_access_with_interpolated_key() {
+        let stmts = vec![
+            Stmt::Let {
+                var: "json".to_string(),
+                expr: Expr::ExtractJson(
+                    r#"<script id="x" type="application/json">.*?</script>"#.to_string(),
+                    "s".to_string(),
+                ),
+            },
+            Stmt::Let {
+                var: "key".to_string(),
+                expr: Expr::Access(Accessor {
+                    base: "json".to_string(),
+                    path: vec![AccessPart::Dot("targetKey".to_string())],
+                }),
+            },
+            Stmt::Let {
+                var: "result".to_string(),
+                expr: Expr::Chain {
+                    base: Accessor {
+                        base: "json".to_string(),
+                        path: vec![AccessPart::Dot("items".to_string())],
+                    },
+                    methods: vec![],
+                },
+            },
+            Stmt::Let {
+                var: "result".to_string(),
+                expr: Expr::Chain {
+                    base: Accessor {
+                        base: "result".to_string(),
+                        path: vec![AccessPart::Bracket(BracketKey::Accessor(Accessor {
+                            base: "key".to_string(),
+                            path: vec![],
+                        }))],
+                    },
+                    methods: vec![],
+                },
+            },
+            Stmt::Emit(Expr::Chain {
+                base: Accessor {
+                    base: "result".to_string(),
+                    path: vec![],
+                },
+                methods: vec![],
+            }),
+            Stmt::InsertAtMatch,
+        ];
+        let mut source =
+            r#"<script id="x" type="application/json">{"targetKey":"K1","items":{"K1":"found"}}</script>"#.to_string();
+        run(&stmts, &mut source).unwrap();
+        assert!(source.contains("found"));
+    }
+
+    #[test]
+    fn flat_map_flattens_single_level() {
+        let stmts = vec![
+            Stmt::Let {
+                var: "arr".to_string(),
+                expr: Expr::ExtractJson(
+                    r#"<script id="x" type="application/json">.*?</script>"#.to_string(),
+                    "s".to_string(),
+                ),
+            },
+            Stmt::Let {
+                var: "flat".to_string(),
+                expr: Expr::ValueChain {
+                    base: Box::new(Expr::Chain {
+                        base: Accessor {
+                            base: "arr".to_string(),
+                            path: vec![AccessPart::Dot("items".to_string())],
+                        },
+                        methods: vec![],
+                    }),
+                    methods: vec![Method::FlatMap {
+                        var: "x".to_string(),
+                        body: Box::new(Expr::Array(vec![
+                            Expr::Access(Accessor {
+                                base: "x".to_string(),
+                                path: vec![AccessPart::Dot("a".to_string())],
+                            }),
+                            Expr::Access(Accessor {
+                                base: "x".to_string(),
+                                path: vec![AccessPart::Dot("b".to_string())],
+                            }),
+                        ])),
+                    }],
+                },
+            },
+            Stmt::For {
+                var: "item".to_string(),
+                iter: Expr::Access(Accessor {
+                    base: "flat".to_string(),
+                    path: vec![],
+                }),
+                body: vec![Stmt::Emit(Expr::Chain {
+                    base: Accessor {
+                        base: "item".to_string(),
+                        path: vec![],
+                    },
+                    methods: vec![],
+                })],
+            },
+            Stmt::InsertAtMatch,
+        ];
+        let mut source =
+            r#"<script id="x" type="application/json">{"items":[{"a":1,"b":[2,3]}]}</script>"#.to_string();
+        run(&stmts, &mut source).unwrap();
+        assert!(source.contains("1"));
+        assert!(source.contains("2"));
+        assert!(source.contains("3"));
+    }
+
+    #[test]
+    fn map_then_join_chain_on_array_value() {
+        let stmts = vec![
+            Stmt::Let {
+                var: "tags".to_string(),
+                expr: Expr::ExtractJson(
+                    r#"<script[^>]*type="application/json"[^>]*>(.+?)</script>"#.to_string(),
+                    "s".to_string(),
+                ),
+            },
+            Stmt::Let {
+                var: "result".to_string(),
+                expr: Expr::ValueChain {
+                    base: Box::new(Expr::Chain {
+                        base: Accessor {
+                            base: "tags".to_string(),
+                            path: vec![AccessPart::Dot("labels".to_string())],
+                        },
+                        methods: vec![],
+                    }),
+                    methods: vec![
+                        Method::Map {
+                            var: "tag".to_string(),
+                            body: Box::new(Expr::String(vec![
+                                StrPart::Lit("tag::".to_string()),
+                                StrPart::Interp(Accessor {
+                                    base: "tag".to_string(),
+                                    path: vec![],
+                                }),
+                            ])),
+                        },
+                        Method::Join(vec![StrPart::Lit("\n".to_string())]),
+                    ],
+                },
+            },
+            Stmt::Emit(Expr::Chain {
+                base: Accessor {
+                    base: "result".to_string(),
+                    path: vec![],
+                },
+                methods: vec![],
+            }),
+            Stmt::InsertAtMatch,
+        ];
+        let mut source =
+            r#"before<script id="x" type="application/json">{"labels":["a","b"]}</script>after"#
+                .to_string();
+        run(&stmts, &mut source).unwrap();
+        assert!(source.contains("tag::a"));
+        assert!(source.contains("tag::b"));
+    }
+
+    #[test]
+    fn set_mutates_object_field() {
+        let stmts = vec![
+            Stmt::Let {
+                var: "json".to_string(),
+                expr: Expr::ExtractJson(
+                    r#"<script id="x" type="application/json">.*?</script>"#.to_string(),
+                    "s".to_string(),
+                ),
+            },
+            Stmt::Let {
+                var: "work".to_string(),
+                expr: Expr::Chain {
+                    base: Accessor {
+                        base: "json".to_string(),
+                        path: vec![AccessPart::Dot("work".to_string())],
+                    },
+                    methods: vec![],
+                },
+            },
+            Stmt::Set {
+                target: LValue::Hash {
+                    base: "work".to_string(),
+                    keys: vec![vec![StrPart::Lit("title".to_string())]],
+                },
+                expr: Expr::String(vec![StrPart::Lit("new_title".to_string())]),
+            },
+            Stmt::Emit(Expr::String(vec![
+                StrPart::Lit("title::".to_string()),
+                StrPart::Interp(Accessor {
+                    base: "work".to_string(),
+                    path: vec![AccessPart::Dot("title".to_string())],
+                }),
+            ])),
+            Stmt::InsertAtMatch,
+        ];
+        let mut source =
+            r#"<script id="x" type="application/json">{"work":{"title":"old"}}</script>"#.to_string();
+        run(&stmts, &mut source).unwrap();
+        assert!(source.contains("title::new_title"));
+    }
+
+    #[test]
+    fn or_operator_falls_back_to_default() {
+        let stmts = vec![
+            Stmt::Let {
+                var: "json".to_string(),
+                expr: Expr::ExtractJson(
+                    r#"<script id="x" type="application/json">.*?</script>"#.to_string(),
+                    "s".to_string(),
+                ),
+            },
+            Stmt::Let {
+                var: "toc".to_string(),
+                expr: Expr::Or(
+                    Box::new(Expr::Chain {
+                        base: Accessor {
+                            base: "json".to_string(),
+                            path: vec![AccessPart::Dot("missing".to_string())],
+                        },
+                        methods: vec![],
+                    }),
+                    Box::new(Expr::Array(vec![])),
+                ),
+            },
+            Stmt::Emit(Expr::String(vec![StrPart::Lit("fallback_ok".to_string())])),
+            Stmt::InsertAtMatch,
+        ];
+        let mut source = r#"<script id="x" type="application/json">{}</script>"#.to_string();
+        run(&stmts, &mut source).unwrap();
+        assert!(source.contains("fallback_ok"));
+    }
+
+    #[test]
+    fn extract_json_not_found_returns_null_gracefully() {
+        let stmts = vec![
+            Stmt::Let {
+                var: "json".to_string(),
+                expr: Expr::ExtractJson(
+                    r#"<script id="x" type="application/json">(.+?)</script>"#.to_string(),
+                    "s".to_string(),
+                ),
+            },
+            Stmt::Let {
+                var: "title".to_string(),
+                expr: Expr::Chain {
+                    base: Accessor {
+                        base: "json".to_string(),
+                        path: vec![AccessPart::Dot("title".to_string())],
+                    },
+                    methods: vec![],
+                },
+            },
+            Stmt::Emit(Expr::String(vec![StrPart::Lit("title::".to_string())])),
+            Stmt::InsertAtMatch,
+        ];
+        let mut source = "no json here".to_string();
+        run(&stmts, &mut source).unwrap();
+        assert!(source.contains("title::"));
+    }
+
+    #[test]
+    fn and_operator_short_circuits_on_falsy() {
+        let stmts = vec![
+            Stmt::Let {
+                var: "json".to_string(),
+                expr: Expr::ExtractJson(
+                    r#"<script id="x" type="application/json">.*?</script>"#.to_string(),
+                    "s".to_string(),
+                ),
+            },
+            Stmt::If {
+                cond: Expr::And(
+                    Box::new(Expr::Chain {
+                        base: Accessor {
+                            base: "json".to_string(),
+                            path: vec![AccessPart::Dot("empty_arr".to_string())],
+                        },
+                        methods: vec![Method::Empty],
+                    }),
+                    Box::new(Expr::Chain {
+                        base: Accessor {
+                            base: "json".to_string(),
+                            path: vec![AccessPart::Dot("has_toc".to_string())],
+                        },
+                        methods: vec![],
+                    }),
+                ),
+                body: vec![Stmt::Emit(Expr::String(vec![StrPart::Lit(
+                    "in_then".to_string(),
+                )]))],
+                else_body: Some(vec![Stmt::Emit(Expr::String(vec![StrPart::Lit(
+                    "in_else".to_string(),
+                )]))]),
+            },
+            Stmt::InsertAtMatch,
+        ];
+        let mut source =
+            r#"<script id="x" type="application/json">{"empty_arr":[],"has_toc":true}</script>"#.to_string();
+        run(&stmts, &mut source).unwrap();
+        assert!(source.contains("in_else"));
+        assert!(!source.contains("in_then"));
+    }
+
+    #[test]
+    fn for_loop_iterates_and_emits_each_item() {
+        let stmts = vec![
+            Stmt::Let {
+                var: "json".to_string(),
+                expr: Expr::ExtractJson(
+                    r#"<script id="x" type="application/json">.*?</script>"#.to_string(),
+                    "s".to_string(),
+                ),
+            },
+            Stmt::For {
+                var: "item".to_string(),
+                iter: Expr::Chain {
+                    base: Accessor {
+                        base: "json".to_string(),
+                        path: vec![AccessPart::Dot("items".to_string())],
+                    },
+                    methods: vec![],
+                },
+                body: vec![Stmt::Emit(Expr::String(vec![StrPart::Interp(Accessor {
+                    base: "item".to_string(),
+                    path: vec![],
+                })]))],
+            },
+            Stmt::InsertAtMatch,
+        ];
+        let mut source =
+            r#"<script id="x" type="application/json">{"items":["a","b","c"]}</script>"#.to_string();
+        run(&stmts, &mut source).unwrap();
+        assert!(source.contains("a"));
+        assert!(source.contains("b"));
+        assert!(source.contains("c"));
+    }
+
     #[test]
     fn preprocess_step_budget_is_enforced() {
         let stmts = vec![
