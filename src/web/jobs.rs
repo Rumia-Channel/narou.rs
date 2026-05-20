@@ -1114,6 +1114,10 @@ pub(crate) async fn run_cli_and_broadcast(
     Ok(output)
 }
 
+fn csv_download_args() -> Vec<String> {
+    vec!["csv".to_string()]
+}
+
 fn broadcast_captured_web_output(
     push_server: &std::sync::Arc<super::push::PushServer>,
     output: &[u8],
@@ -1834,39 +1838,25 @@ pub async fn api_csv_download(State(_state): State<AppState>) -> axum::response:
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
 
-    let records = with_database(|db| {
-        let all = db.all_records();
-        let mut items: Vec<serde_json::Value> = Vec::new();
-        for (id, record) in all {
-            items.push(serde_json::json!({
-                "id": id,
-                "title": record.title,
-                "author": record.author,
-                "sitename": record.sitename,
-                "toc_url": record.toc_url,
-            }));
-        }
-        Ok(items)
-    });
-
-    let records = match records {
-        Ok(records) => records,
+    let output = match run_immediate(csv_download_args()).await {
+        Ok(output) => output,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            log_web_failure("csv download", &e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CSVエクスポートに失敗しました",
+            )
+                .into_response();
         }
     };
 
-    let mut csv = String::from("ID,タイトル,著者,サイト,URL\n");
-    for r in &records {
-        let id = r["id"].as_i64().unwrap_or(0);
-        let title = r["title"].as_str().unwrap_or("").replace('"', "\"\"");
-        let author = r["author"].as_str().unwrap_or("").replace('"', "\"\"");
-        let sitename = r["sitename"].as_str().unwrap_or("").replace('"', "\"\"");
-        let toc_url = r["toc_url"].as_str().unwrap_or("");
-        csv.push_str(&format!(
-            "{},\"{}\",\"{}\",\"{}\",{}\n",
-            id, title, author, sitename, toc_url
-        ));
+    if !output.status.success() {
+        log_immediate_command_failure("csv download", &output);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CSVエクスポートに失敗しました",
+        )
+            .into_response();
     }
 
     (
@@ -1878,7 +1868,7 @@ pub async fn api_csv_download(State(_state): State<AppState>) -> axum::response:
                 "attachment; filename=\"novels.csv\"",
             ),
         ],
-        csv,
+        output.stdout,
     )
         .into_response()
 }
@@ -2506,9 +2496,10 @@ mod tests {
         broadcast_captured_web_output, build_update_by_tag_queue_payload,
         build_update_general_lastup_meta, build_update_start_message_meta,
         build_webui_update_start_message, encode_convert_job_target, existing_update_job_id,
-        format_general_lastup_queue_target, format_queue_job_type, format_update_queue_target,
-        normalize_update_targets, push_update_job_if_needed, push_update_job_with_legacy_if_needed,
-        queue_lane_sizes, reboot_args_with_no_browser, restorable_tasks_available,
+        csv_download_args, format_general_lastup_queue_target, format_queue_job_type,
+        format_update_queue_target, normalize_update_targets, push_update_job_if_needed,
+        push_update_job_with_legacy_if_needed, queue_lane_sizes, reboot_args_with_no_browser,
+        restorable_tasks_available,
         sort_records_for_web_update, tag_color_class, validate_diff_number,
         validate_download_targets, validate_general_lastup_option, web_update_sort_key_for_cli,
     };
@@ -2554,6 +2545,11 @@ mod tests {
             encode_convert_job_target(&["12".to_string(), "9".to_string()]),
             "12\t9"
         );
+    }
+
+    #[test]
+    fn csv_download_uses_cli_csv_command() {
+        assert_eq!(csv_download_args(), vec!["csv".to_string()]);
     }
 
     #[test]

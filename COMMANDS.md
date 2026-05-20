@@ -141,6 +141,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `-z`/`--freeze`: DL完了後に自動凍結 (`--freeze` は `--remove` より優先)
 - `-r`/`--remove`: DL+変換後にDBから削除（ファイルは残る）
 - `-m`/`--mail`: 変換後に `mail` コマンドと同じ helper で送信。設定未作成時は `mail_setting.yaml` を生成し、注意メッセージも Ruby版に寄せた
+- DL後の自動変換は `update` と同じ共通変換経路を使い、`convert.multi-device` / `convert.copy-to` / `convert.copy-to-grouping` を反映する
 - 引数なしでインタラクティブモード (stdin から URL 入力、TTY時のみ)
 - 凍結チェック: Ruby版と同じ `.narou/freeze.yaml` を優先し、移行互換として `frozen` タグも補助的に認識した上で凍結済み小説をスキップ
 - ダウンロード済みチェック: 既存小説はスキップ（`--force`で上書き）
@@ -557,6 +558,7 @@ narou setting name         # 読み取り
 - `webui.debug-mode` が ON のときは、Web worker が失敗 child process の直近 stdout/stderr を要約して `queue_failed` イベントに載せ、Web UI 通知とコンソールに詳細エラーを出す。OFF のときは従来どおり簡潔な失敗通知だけにする
 - Web UI のタグ編集は既存タグ一覧から入力中タグ名に一致する候補を表示し、タグ名クリック検索は `tag:`、作者名クリック検索は `author:`、掲載サイトクリック検索は `sitename:` を生成する。通常クリックは AND、Ctrl クリックは同一フィールド内 OR、Shift クリックは除外 AND、Shift+Ctrl クリックは除外 OR として検索文字列を更新する
 - Web UI の単体/一括削除 API は削除成功時に console history へ削除ログを出力する。`concurrency` 有効時は非外部通信として `#console-stdout2`、無効時は `#console` を使う
+- Web UI の CSV ダウンロードは CLI `csv` の stdout を返し、export 項目を CLI と一致させる
 - Web サーバ起動時は Ruby版 `fill_general_all_no_in_database` 相当に、`general_all_no` 未設定レコードの `toc.yaml` を読んで話数をDBへ補完する
 - `/` では pure JS / pure CSS の分割 asset frontend を配信し、navbar / console / control panel / list + sidebar の構成で一覧操作できる
 - UI は日本語既定で、JP/EN トグルによる切替と `localStorage` 永続化に対応する
