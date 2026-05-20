@@ -664,44 +664,103 @@ pub fn convert_existing_novel(
     no_open: bool,
 ) -> std::result::Result<PathBuf, String> {
     let _lock = NovelLockGuard::acquire(Some(id)).map_err(|e| e.to_string())?;
-    let settings = NovelSettings::load_for_novel(id, title, author, novel_dir);
-    let mut converter =
-        if let Some(user_converter) = UserConverter::load_with_title(novel_dir, title) {
-            NovelConverter::with_user_converter(settings, user_converter)
-        } else {
-            NovelConverter::new(settings)
-        };
-    converter.set_progress(Box::new(crate::progress::NoProgress));
+    let devices = resolve_auto_convert_devices()?;
+    let mut last_output_path = None;
+    for device in devices {
+        let mut settings = NovelSettings::load_for_novel(id, title, author, novel_dir);
+        apply_auto_convert_device_settings(&mut settings, device);
+        let mut converter =
+            if let Some(user_converter) = UserConverter::load_with_title(novel_dir, title) {
+                NovelConverter::with_user_converter(settings, user_converter)
+            } else {
+                NovelConverter::new(settings)
+            };
+        converter.set_progress(Box::new(crate::progress::NoProgress));
 
-    let device = current_device();
-    let output_path = match device {
-        Some(device) => converter
-            .convert_novel_by_id_with_device(id, novel_dir, device, false, false)
-            .map_err(|e| e.to_string())?,
-        None => PathBuf::from(
-            converter
-                .convert_novel_by_id(id, novel_dir)
+        let output_path = match device {
+            Some(device) => converter
+                .convert_novel_by_id_with_device(id, novel_dir, device, false, false)
                 .map_err(|e| e.to_string())?,
-        ),
-    };
+            None => PathBuf::from(
+                converter
+                    .convert_novel_by_id(id, novel_dir)
+                    .map_err(|e| e.to_string())?,
+            ),
+        };
 
-    println!("  Converted: {}", output_path.display());
-    if let Some(inspection) = converter.take_inspection_output() {
-        println!("{}", inspection);
-    }
-
-    if let Some(device) = device {
-        if let Ok(Some(path)) = copy_to_converted_file(&output_path, Some(device), id) {
-            println!("{} へコピーしました", path.display());
+        println!("  Converted: {}", output_path.display());
+        if let Some(inspection) = converter.take_inspection_output() {
+            println!("{}", inspection);
         }
-        let _ = send_file_to_device(&output_path, device);
+
+        if let Some(device) = device {
+            match copy_to_converted_file(&output_path, Some(device), id) {
+                Ok(Some(path)) => println!("{} へコピーしました", path.display()),
+                Ok(None) => {}
+                Err(err) => println!("{}", err),
+            }
+            let _ = send_file_to_device(&output_path, device);
+        }
+        last_output_path = Some(output_path);
     }
+
+    let output_path = last_output_path.ok_or_else(|| "有効な端末名がひとつもありませんでした".to_string())?;
 
     if !no_open && !load_local_setting_bool("convert.no-open") {
         open_directory(novel_dir, Some("小説の保存フォルダを開きますか"));
     }
 
     Ok(output_path)
+}
+
+fn resolve_auto_convert_devices() -> std::result::Result<Vec<Option<Device>>, String> {
+    let Some(raw) = load_local_setting_string("convert.multi-device") else {
+        return Ok(vec![current_device()]);
+    };
+
+    let mut devices = Vec::new();
+    for name in raw.split(',').map(str::trim) {
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(device) = parse_convert_device_name(name) {
+            devices.push(Some(device));
+        } else {
+            println!("[convert.multi-device] {} は有効な端末名ではありません", name);
+        }
+    }
+
+    if devices.is_empty() {
+        return Err("有効な端末名がひとつもありませんでした".to_string());
+    }
+
+    if let Some(index) = devices
+        .iter()
+        .position(|device| matches!(device, Some(Device::Mobi)))
+    {
+        let kindle = devices.remove(index);
+        devices.insert(0, kindle);
+    }
+
+    Ok(devices)
+}
+
+fn parse_convert_device_name(name: &str) -> Option<Device> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "kindle" | "mobi" => Some(Device::Mobi),
+        "kobo" => Some(Device::Kobo),
+        "epub" => Some(Device::Epub),
+        "ibunko" => Some(Device::Ibunko),
+        "reader" => Some(Device::Reader),
+        "ibooks" => Some(Device::Ibooks),
+        _ => None,
+    }
+}
+
+fn apply_auto_convert_device_settings(settings: &mut NovelSettings, device: Option<Device>) {
+    if matches!(device, Some(Device::Mobi)) {
+        settings.enable_half_indent_bracket = true;
+    }
 }
 
 pub fn copy_to_converted_file(
@@ -894,8 +953,10 @@ mod tests {
         DigestChoice, NovelLockGuard, choose_digest_action_with_auto_choices,
         configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
         load_locked_ids_from_inventory, mark_not_found_and_freeze, parse_digest_auto_choices,
-        record_is_frozen, reroute_web_line_to_console, sanitize_backup_name, terminate_process,
+        record_is_frozen, reroute_web_line_to_console, resolve_auto_convert_devices,
+        sanitize_backup_name, terminate_process,
     };
+    use crate::converter::device::Device;
     use crate::db::NovelRecord;
 
     fn sample_record(id: i64, tags: &[&str]) -> NovelRecord {
@@ -1161,6 +1222,25 @@ mod tests {
 
         let dir = get_copy_to_directory(None, 0).unwrap().unwrap();
         assert_eq!(dir, copy_to.join("site"));
+
+        *crate::db::DATABASE.lock() = None;
+    }
+
+    #[test]
+    fn update_auto_convert_uses_convert_multi_device_before_device_setting() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        std::fs::write(
+            temp.path().join(".narou").join("local_setting.yaml"),
+            "convert.multi-device: epub\ndevice: text\n",
+        )
+        .unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        assert_eq!(resolve_auto_convert_devices().unwrap(), vec![Some(Device::Epub)]);
 
         *crate::db::DATABASE.lock() = None;
     }
