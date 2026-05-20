@@ -5,6 +5,7 @@ import { State, El, initElements } from './core/state.js';
 import { fetchJson } from './core/http.js';
 import { applyI18n } from './ui/i18n.js';
 import { initDropdowns } from './ui/dropdown.js';
+import { initFeatureTour, maybeShowPendingFeatureTour } from './ui/feature_tour.js';
 import { renderNovelList, renderQueueStatus, renderTagList, showNotification, syncViewChecks } from './ui/render.js';
 import {
   applyNotepadSnapshot,
@@ -48,6 +49,7 @@ async function refreshListAndTags() {
 async function init() {
   initElements();
   initDropdowns();
+  initFeatureTour();
   applyI18n();
   bindActions();
   bindConsoleAutoScroll(El.console);
@@ -78,6 +80,7 @@ async function init() {
 
   // Sync UI state (check marks, wide mode, footer)
   syncViewChecks();
+  void maybeShowPendingFeatureTour();
 
   // WebSocket
   connectWebSocket();

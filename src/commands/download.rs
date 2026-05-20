@@ -1,14 +1,8 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 
-use indicatif::MultiProgress;
-
-use narou_rs::compat::configure_web_subprocess_command;
-use narou_rs::converter::NovelConverter;
-use narou_rs::converter::settings::NovelSettings;
-use narou_rs::converter::user_converter::UserConverter;
-use narou_rs::downloader::{Downloader, TargetType, UpdateStatus};
+use narou_rs::compat::{configure_web_subprocess_command, convert_existing_novel};
+use narou_rs::downloader::{DownloadResult, Downloader, TargetType, UpdateStatus};
 use narou_rs::mail::{
     MailSettingLoadError, ensure_mail_setting_file, load_mail_setting, send_target_with_setting,
 };
@@ -142,7 +136,7 @@ fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, Downloa
                     if opts.no_convert {
                         after_process(&download_target, &opts);
                     } else {
-                        if let Err(e) = auto_convert(&multi_clone, &dl) {
+                        if let Err(e) = auto_convert(&dl) {
                             println!("  Convert error: {}", e);
                         }
                         after_process(&download_target, &opts);
@@ -580,37 +574,15 @@ fn after_process(target: &str, opts: &DownloadOptions) {
     }
 }
 
-fn auto_convert(
-    multi: &Arc<MultiProgress>,
-    dl: &narou_rs::downloader::DownloadResult,
-) -> Result<(), String> {
+fn auto_convert(dl: &DownloadResult) -> Result<(), String> {
     if is_web_mode() {
         return auto_convert_via_web_subprocess(dl.id);
     }
+    auto_convert_existing_download(dl)
+}
 
-    let settings = NovelSettings::load_for_novel(dl.id, &dl.title, &dl.author, &dl.novel_dir);
-    let mut converter = if let Some(uc) = UserConverter::load_with_title(&dl.novel_dir, &dl.title) {
-        NovelConverter::with_user_converter(settings, uc)
-    } else {
-        NovelConverter::new(settings)
-    };
-
-    let progress: Box<dyn narou_rs::progress::ProgressReporter> = if is_web_mode() {
-        Box::new(WebProgress::new("convert"))
-    } else {
-        Box::new(CliProgress::with_multi(&format!("Convert {}", dl.title), multi.clone()))
-    };
-    converter.set_progress(progress);
-
-    let _lock = narou_rs::compat::NovelLockGuard::acquire(Some(dl.id))
-        .map_err(|e| e.to_string())?;
-    match converter.convert_novel_by_id(dl.id, &dl.novel_dir) {
-        Ok(path) => {
-            println!("  Converted: {}", path);
-            Ok(())
-        }
-        Err(e) => Err(e.to_string()),
-    }
+fn auto_convert_existing_download(dl: &DownloadResult) -> Result<(), String> {
+    convert_existing_novel(dl.id, &dl.title, &dl.author, &dl.novel_dir, true).map(|_| ())
 }
 
 fn auto_convert_via_web_subprocess(id: i64) -> Result<(), String> {
@@ -663,7 +635,8 @@ fn auto_convert_via_web_subprocess(id: i64) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EXIT_INTERRUPT, parse_confirm_input};
+    use super::{EXIT_INTERRUPT, auto_convert_existing_download, parse_confirm_input};
+    use narou_rs::downloader::{DownloadResult, UpdateStatus};
     use narou_rs::queue::{JobType, PersistentQueue};
 
     #[test]
@@ -688,6 +661,44 @@ mod tests {
     #[test]
     fn suspend_download_exit_code_matches_ruby() {
         assert_eq!(EXIT_INTERRUPT, 126);
+    }
+
+    #[test]
+    fn download_auto_convert_uses_shared_auto_convert_device_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        std::fs::create_dir_all(temp.path().join("novel")).unwrap();
+        std::fs::write(
+            temp.path().join(".narou").join("local_setting.yaml"),
+            "convert.multi-device: invalid-device\n",
+        )
+        .unwrap();
+        *narou_rs::db::DATABASE.lock() = None;
+        narou_rs::db::init_database().unwrap();
+
+        let result = auto_convert_existing_download(&DownloadResult {
+            id: 1,
+            title: "title".to_string(),
+            author: "author".to_string(),
+            novel_dir: temp.path().join("novel"),
+            new_novel: true,
+            new_arrivals: true,
+            new_arrival_subtitles: Vec::new(),
+            updated_count: 1,
+            total_count: 1,
+            status: UpdateStatus::Ok,
+            title_changed: false,
+            author_changed: false,
+            story_changed: false,
+            sections_deleted: false,
+        });
+
+        assert_eq!(
+            result.unwrap_err(),
+            "有効な端末名がひとつもありませんでした"
+        );
+        *narou_rs::db::DATABASE.lock() = None;
     }
 
     #[test]

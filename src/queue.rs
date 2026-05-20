@@ -198,6 +198,23 @@ impl PersistentQueue {
         Ok(())
     }
 
+    fn merge_external_pending_jobs(&self) -> Result<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        ensure_yaml_size_limit(&self.path)?;
+        let content = fs::read_to_string(&self.path)?;
+        let disk_state = load_queue_state(&content)?;
+        validate_queue_state(&disk_state)?;
+        let mut state = self.state.lock();
+        for job in disk_state.deferred_pending.into_iter().chain(disk_state.active_pending) {
+            if !state_contains_job(&state, &job.job.id) {
+                state.active_pending.push_back(job);
+            }
+        }
+        Ok(())
+    }
+
     fn save(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -237,6 +254,7 @@ impl PersistentQueue {
         legacy_override: Option<(String, Vec<Value>, Mapping)>,
     ) -> Result<String> {
         validate_job_target(target)?;
+        self.merge_external_pending_jobs()?;
         let id = generate_job_id(job_type, target);
         {
             let mut state = self.state.lock();
@@ -264,6 +282,7 @@ impl PersistentQueue {
         for (_, target) in jobs {
             validate_job_target(target)?;
         }
+        self.merge_external_pending_jobs()?;
         let mut ids = Vec::new();
         let mut state = self.state.lock();
         ensure_queue_capacity(total_pending_len(&state), jobs.len())?;
@@ -292,6 +311,9 @@ impl PersistentQueue {
     }
 
     pub fn pop(&self) -> Option<QueueJob> {
+        if self.state.lock().active_pending.is_empty() {
+            let _ = self.merge_external_pending_jobs();
+        }
         let job = {
             let mut state = self.state.lock();
             let mut stored = state.active_pending.pop_front()?;
@@ -306,6 +328,15 @@ impl PersistentQueue {
     }
 
     pub fn pop_for_lane(&self, lane: QueueLane) -> Option<QueueJob> {
+        if !self
+            .state
+            .lock()
+            .active_pending
+            .iter()
+            .any(|job| job.job.job_type.lane() == lane)
+        {
+            let _ = self.merge_external_pending_jobs();
+        }
         let job = {
             let mut state = self.state.lock();
             let index = state
@@ -324,6 +355,7 @@ impl PersistentQueue {
     }
 
     pub fn complete(&self, job_id: &str) -> Result<()> {
+        self.merge_external_pending_jobs()?;
         {
             let mut state = self.state.lock();
             if let Some(job) = take_running_job(&mut state, job_id) {
@@ -335,6 +367,7 @@ impl PersistentQueue {
     }
 
     pub fn fail(&self, job_id: &str) -> Result<()> {
+        self.merge_external_pending_jobs()?;
         {
             let mut state = self.state.lock();
             if let Some(job) = take_running_job(&mut state, job_id) {
@@ -345,6 +378,7 @@ impl PersistentQueue {
     }
 
     pub fn partial(&self, job_id: &str) -> Result<()> {
+        self.merge_external_pending_jobs()?;
         {
             let mut state = self.state.lock();
             if let Some(job) = take_running_job(&mut state, job_id) {
@@ -355,6 +389,7 @@ impl PersistentQueue {
     }
 
     pub fn cancel(&self, job_id: &str) -> Result<()> {
+        self.merge_external_pending_jobs()?;
         {
             let mut state = self.state.lock();
             if let Some(job) = take_running_job(&mut state, job_id) {
@@ -742,6 +777,20 @@ fn find_active_job_id(
                 })
         })
         .map(|job| job.job.id.clone())
+}
+
+fn state_contains_job(state: &PersistentQueueState, job_id: &str) -> bool {
+    state
+        .active_pending
+        .iter()
+        .chain(state.deferred_pending.iter())
+        .chain(state.active_running.iter())
+        .chain(state.deferred_running.iter())
+        .chain(state.completed.iter())
+        .chain(state.partial.iter())
+        .chain(state.failed.iter())
+        .chain(state.cancelled.iter())
+        .any(|job| job.job.id == job_id)
 }
 
 fn cancel_pending_jobs_for_lane(
@@ -1639,6 +1688,51 @@ mod tests {
         let reloaded = PersistentQueue::new(&queue_path).unwrap();
         assert_eq!(reloaded.running_count(), 0);
         assert_eq!(reloaded.completed_count(), 1);
+    }
+
+    #[test]
+    fn complete_preserves_jobs_enqueued_by_external_queue_instance() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let parent = PersistentQueue::new(&queue_path).unwrap();
+        parent.push(JobType::Download, "n0001").unwrap();
+        let running = parent.pop().unwrap();
+
+        let child = PersistentQueue::new(&queue_path).unwrap();
+        let convert_id = child.push(JobType::Convert, "1").unwrap();
+
+        parent.complete(&running.id).unwrap();
+
+        let reloaded = PersistentQueue::new(&queue_path).unwrap();
+        let pending = reloaded.get_pending_tasks();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, convert_id);
+        assert!(matches!(pending[0].job_type, JobType::Convert));
+        assert_eq!(reloaded.running_count(), 0);
+        assert_eq!(reloaded.completed_count(), 1);
+    }
+
+    #[test]
+    fn pop_for_lane_can_pick_up_jobs_enqueued_by_external_queue_instance() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let parent = PersistentQueue::new(&queue_path).unwrap();
+        parent.push(JobType::Update, "1").unwrap();
+        let running = parent.pop_for_lane(QueueLane::Default).unwrap();
+
+        let child = PersistentQueue::new(&queue_path).unwrap();
+        let convert_id = child.push(JobType::Convert, "1").unwrap();
+
+        let convert = parent.pop_for_lane(QueueLane::Secondary).unwrap();
+        assert_eq!(convert.id, convert_id);
+        assert!(matches!(convert.job_type, JobType::Convert));
+
+        parent.complete(&running.id).unwrap();
+        parent.complete(&convert.id).unwrap();
+        let reloaded = PersistentQueue::new(&queue_path).unwrap();
+        assert_eq!(reloaded.running_count(), 0);
+        assert_eq!(reloaded.pending_count(), 0);
+        assert_eq!(reloaded.completed_count(), 2);
     }
 
     #[test]
