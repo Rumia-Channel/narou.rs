@@ -1065,6 +1065,70 @@ li.enable-selected.disabled a {
   max-width: 50rem;
 }
 
+/* ========== Feature tour ========== */
+.feature-tour-lead {
+  margin: 0 0 1em;
+  color: var(--text-color);
+}
+
+.feature-tour-empty {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.feature-tour-list {
+  display: grid;
+  gap: 0.75em;
+}
+
+.feature-tour-entry {
+  border: 0.05em solid var(--border-color);
+  border-left: 0.25em solid var(--btn-primary-bg);
+  border-radius: var(--border-radius);
+  padding: 0.85em;
+  background: var(--body-bg);
+}
+
+.feature-tour-entry-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1em;
+  margin-bottom: 0.35em;
+}
+
+.feature-tour-entry-header h5 {
+  margin: 0;
+  font-size: 1.05em;
+}
+
+.feature-tour-version {
+  color: var(--text-muted);
+  font-size: 0.90em;
+  white-space: nowrap;
+}
+
+.feature-tour-body-text {
+  margin: 0.35em 0 0.55em;
+}
+
+.feature-tour-items {
+  margin: 0;
+  padding-left: 1.4em;
+}
+
+.feature-tour-items li + li {
+  margin-top: 0.25em;
+}
+
+.feature-tour-disable {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  margin-right: auto;
+  color: var(--text-muted);
+}
+
 /* ========== Filter search icon ========== */
 .filter-search-icon {
   position: absolute;

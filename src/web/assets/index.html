@@ -49,6 +49,8 @@
                 <li><a href="#" id="action-view-link-to-edit-menu">個別メニューを編集...</a></li>
                 <li><a href="#" id="action-view-select-menu-style">個別メニューの表示スタイルを選択</a></li>
                 <li class="divider"></li>
+                <li><a href="#" id="action-view-feature-tour"><span class="material-symbols-outlined icon-leading" aria-hidden="true">new_releases</span>新機能ツアーを表示</a></li>
+                <li class="divider"></li>
                 <li><a href="#" id="action-view-reset">表示設定を全てリセット</a></li>
               </ul>
             </li>
@@ -618,6 +620,25 @@
           <div class="modal-footer">
             <button class="btn" id="gl-update-cancel">キャンセル</button>
             <button class="btn btn-primary" id="gl-update-submit">確認する</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Feature Tour Modal -->
+    <div class="modal-overlay hide" id="feature-tour-modal">
+      <div class="modal-dialog modal-dialog-lg">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="feature-tour-close" type="button">&times;</button>
+            <h4 class="modal-title">新機能ツアー</h4>
+          </div>
+          <div class="modal-body" id="feature-tour-body"></div>
+          <div class="modal-footer">
+            <label class="feature-tour-disable">
+              <input type="checkbox" id="feature-tour-disable-auto"> 以降新機能ツアーは表示しない
+            </label>
+            <button class="btn btn-primary" id="feature-tour-ok" type="button"><span class="material-symbols-outlined icon-leading" aria-hidden="true">done</span>確認した</button>
           </div>
         </div>
       </div>

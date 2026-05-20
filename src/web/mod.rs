@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod feature_tour;
 pub mod frontend;
 pub mod global_settings;
 pub mod jobs;
@@ -508,6 +509,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/version/current.json", get(misc::version_current))
         .route("/api/version/latest.json", get(misc::version_latest))
+        .route("/api/feature_tour/pending", get(feature_tour::pending))
+        .route("/api/feature_tour/all", get(feature_tour::all))
+        .route("/api/feature_tour/seen", post(feature_tour::mark_seen))
+        .route("/api/feature_tour/config", post(feature_tour::configure))
         .route("/api/webui/config", get(misc::webui_config))
         .route("/api/tag_list", get(misc::tag_list))
         .route("/api/tag/change_color", post(misc::tag_change_color))

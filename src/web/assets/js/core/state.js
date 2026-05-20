@@ -98,6 +98,8 @@ const ELEMENT_IDS = [
   'about-modal', 'about-close', 'about-ok', 'about-version',
   'about-latest-version', 'about-check-latest',
   'about-update', 'about-update-status',
+  'feature-tour-modal', 'feature-tour-close', 'feature-tour-body',
+  'feature-tour-disable-auto', 'feature-tour-ok',
   'confirm-modal', 'confirm-title', 'confirm-message',
   'confirm-cancel', 'confirm-ok',
   'remove-modal', 'remove-novel-list', 'remove-with-file',

@@ -5,6 +5,7 @@
 import { State, El, lsSet, lsBool } from '../core/state.js';
 import { fetchJson, postJson } from '../core/http.js';
 import { toggleLanguage } from './i18n.js';
+import { openFeatureTour } from './feature_tour.js';
 import {
   renderNovelList, renderTagList, renderQueueStatus, renderQueueDetailed,
   selectVisible, selectAll, clearSelection, getSelectedIdsInDisplayOrder,
@@ -731,6 +732,7 @@ export function bindActions() {
   });
 
   on('action-view-select-menu-style', openMenuStyleModal);
+  on('action-view-feature-tour', openFeatureTour);
   on('menu-style-close', closeMenuStyleModal);
   on('menu-style-cancel', closeMenuStyleModal);
   on('menu-style-save', () => {
