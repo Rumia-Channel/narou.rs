@@ -250,6 +250,16 @@ pub async fn asset(Path(path): Path<String>) -> Response {
                 .into_bytes(),
             ),
         ),
+        "js/ui/feature_tour.js" => (
+            "application/javascript; charset=utf-8",
+            Cow::Owned(
+                apply_js_module_versions(
+                    "js/ui/feature_tour.js",
+                    include_str!("assets/js/ui/feature_tour.js"),
+                )
+                .into_bytes(),
+            ),
+        ),
         "js/settings.js" => (
             "application/javascript; charset=utf-8",
             Cow::Owned(
@@ -291,7 +301,10 @@ pub async fn asset(Path(path): Path<String>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_asset_versions, apply_js_module_versions, asset_version, inject_build_info};
+    use super::{
+        ASSET_PATHS, apply_asset_versions, apply_js_module_versions, asset_version,
+        inject_build_info,
+    };
     use axum::{
         extract::Path,
         http::{StatusCode, header},
@@ -354,5 +367,16 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "font/ttf");
+    }
+
+    #[tokio::test]
+    async fn all_versioned_assets_are_served() {
+        for path in ASSET_PATHS {
+            if path.ends_with(".html") {
+                continue;
+            }
+            let response = super::asset(Path((*path).to_string())).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
     }
 }
