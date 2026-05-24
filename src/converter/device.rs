@@ -405,7 +405,12 @@ impl OutputManager {
             })?;
         }
 
-        for arg in self.build_aozora_epub3_args(input_txt, output_dir, output_ext) {
+        let invocation = prepare_aozora_invocation(input_txt, output_dir, output_ext, &output_path)?;
+        let actual_aozora_output_path = absolutize_path(&invocation.expected_output_path);
+
+        for arg in
+            self.build_aozora_epub3_args(&invocation.input_txt, &invocation.output_dir, output_ext)
+        {
             cmd.arg(arg);
         }
         if !self.verbose {
@@ -449,18 +454,22 @@ impl OutputManager {
             )));
         }
 
-        if !actual_output_path.exists() {
+        if !actual_aozora_output_path.exists() {
             return Err(NarouError::Conversion(format!(
                 "AozoraEpub3 did not create expected output: {}",
                 output_path.display()
             )));
         }
 
-        if !aozora_output_looks_generated(&actual_output_path, started_at)? {
+        if !aozora_output_looks_generated(&actual_aozora_output_path, started_at)? {
             return Err(NarouError::Conversion(format!(
                 "AozoraEpub3 did not update expected output: {}",
                 output_path.display()
             )));
+        }
+
+        if invocation.needs_final_copy() {
+            move_aozora_output(&actual_aozora_output_path, &actual_output_path)?;
         }
 
         eprintln!("変換しました");
@@ -945,6 +954,142 @@ fn slice_from(data: &[u8], start: usize) -> std::result::Result<&[u8], StripErro
     data.get(start..).ok_or_else(StripError::invalid_format)
 }
 
+struct AozoraInvocation {
+    _temp_dir: Option<tempfile::TempDir>,
+    input_txt: PathBuf,
+    output_dir: PathBuf,
+    expected_output_path: PathBuf,
+    final_output_path: PathBuf,
+}
+
+impl AozoraInvocation {
+    fn direct(input_txt: &Path, output_dir: &Path, final_output_path: &Path) -> Self {
+        Self {
+            _temp_dir: None,
+            input_txt: input_txt.to_path_buf(),
+            output_dir: output_dir.to_path_buf(),
+            expected_output_path: final_output_path.to_path_buf(),
+            final_output_path: final_output_path.to_path_buf(),
+        }
+    }
+
+    fn temporary(input_txt: &Path, output_ext: &str, final_output_path: &Path) -> Result<Self> {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("narou-rs-aozora-")
+            .tempdir()?;
+        let temp_root = temp_dir.path().to_path_buf();
+        let temp_input = temp_root.join("input.txt");
+        std::fs::copy(input_txt, &temp_input)?;
+        copy_aozora_companion_files(input_txt, &temp_root)?;
+
+        Ok(Self {
+            _temp_dir: Some(temp_dir),
+            input_txt: temp_input,
+            output_dir: temp_root.clone(),
+            expected_output_path: temp_root.join(format!("input{}", output_ext)),
+            final_output_path: final_output_path.to_path_buf(),
+        })
+    }
+
+    fn needs_final_copy(&self) -> bool {
+        self.expected_output_path != self.final_output_path
+    }
+}
+
+fn prepare_aozora_invocation(
+    input_txt: &Path,
+    output_dir: &Path,
+    output_ext: &str,
+    final_output_path: &Path,
+) -> Result<AozoraInvocation> {
+    if should_use_aozora_temp_workspace(input_txt, output_dir) {
+        AozoraInvocation::temporary(input_txt, output_ext, final_output_path)
+    } else {
+        Ok(AozoraInvocation::direct(
+            input_txt,
+            output_dir,
+            final_output_path,
+        ))
+    }
+}
+
+fn should_use_aozora_temp_workspace(input_txt: &Path, output_dir: &Path) -> bool {
+    cfg!(windows)
+        && (path_contains_windows_aozora_risky_chars(input_txt)
+            || path_contains_windows_aozora_risky_chars(output_dir))
+}
+
+fn path_contains_windows_aozora_risky_chars(path: &Path) -> bool {
+    path.to_string_lossy().chars().any(|ch| {
+        matches!(
+            ch,
+            '\u{301C}'
+                | '\u{FF5E}'
+                | '\u{2212}'
+                | '\u{FF0D}'
+                | '\u{00A2}'
+                | '\u{FFE0}'
+                | '\u{00A3}'
+                | '\u{FFE1}'
+                | '\u{00AC}'
+                | '\u{FFE2}'
+        )
+    })
+}
+
+fn copy_aozora_companion_files(input_txt: &Path, temp_root: &Path) -> Result<()> {
+    let Some(src_dir) = input_txt.parent() else {
+        return Ok(());
+    };
+
+    for ext in [".jpg", ".png", ".jpeg"] {
+        let name = format!("cover{}", ext);
+        let src = src_dir.join(&name);
+        if src.is_file() {
+            std::fs::copy(&src, temp_root.join(name))?;
+        }
+    }
+
+    copy_dir_contents_if_exists(&src_dir.join("挿絵"), &temp_root.join("挿絵"))
+}
+
+fn copy_dir_contents_if_exists(src: &Path, dst: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_contents_if_exists(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = dst_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn move_aozora_output(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            std::fs::copy(src, dst)?;
+            std::fs::remove_file(src)?;
+            Ok(())
+        }
+    }
+}
+
 fn normalize_windows_verbatim_path(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     if cfg!(windows) && raw.starts_with(r"\\?\") {
@@ -1072,6 +1217,7 @@ mod tests {
 
     use super::{
         Device, OutputManager, StripError, absolutize_path, decode_ibunko_html_entities,
+        path_contains_windows_aozora_risky_chars, prepare_aozora_invocation,
         normalize_windows_verbatim_path, strip_mobi_sources,
     };
 
@@ -1128,6 +1274,52 @@ mod tests {
     fn decode_ibunko_html_entities_decodes_ampersand_last() {
         assert_eq!(decode_ibunko_html_entities("&amp;lt;"), "&lt;");
         assert_eq!(decode_ibunko_html_entities("&lt;tag&gt;"), "<tag>");
+    }
+
+    #[test]
+    fn windows_aozora_risky_chars_are_detected() {
+        assert!(path_contains_windows_aozora_risky_chars(Path::new(
+            "title〜.txt"
+        )));
+        assert!(path_contains_windows_aozora_risky_chars(Path::new(
+            "title～.txt"
+        )));
+        assert!(path_contains_windows_aozora_risky_chars(Path::new(
+            "price¢.txt"
+        )));
+        assert!(!path_contains_windows_aozora_risky_chars(Path::new(
+            "普通のタイトル.txt"
+        )));
+    }
+
+    #[test]
+    fn aozora_temp_workspace_copies_assets_for_risky_windows_paths() {
+        let dir = create_test_dir("aozora-temp");
+        let input = dir.join("title〜.txt");
+        fs::write(&input, "title\nauthor\n［＃挿絵（cover.jpg）入る］").unwrap();
+        fs::write(dir.join("cover.jpg"), b"cover").unwrap();
+        let illust_dir = dir.join("挿絵");
+        fs::create_dir_all(&illust_dir).unwrap();
+        fs::write(illust_dir.join("1-0.jpg"), b"illust").unwrap();
+
+        let final_output = dir.join("title〜.epub");
+        let invocation = prepare_aozora_invocation(&input, &dir, ".epub", &final_output).unwrap();
+
+        if cfg!(windows) {
+            assert_ne!(invocation.input_txt, input);
+            assert_eq!(
+                invocation.expected_output_path.file_name().unwrap().to_str().unwrap(),
+                "input.epub"
+            );
+            assert!(invocation.input_txt.exists());
+            assert!(invocation.output_dir.join("cover.jpg").exists());
+            assert!(invocation.output_dir.join("挿絵").join("1-0.jpg").exists());
+            assert!(invocation.needs_final_copy());
+        } else {
+            assert_eq!(invocation.input_txt, input);
+            assert_eq!(invocation.expected_output_path, final_output);
+            assert!(!invocation.needs_final_copy());
+        }
     }
 
     #[test]
