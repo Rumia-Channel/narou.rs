@@ -12,7 +12,7 @@ pub(crate) struct CurrentDirGuard {
 }
 
 pub(crate) fn set_current_dir_for_test(dir: &Path) -> CurrentDirGuard {
-    let lock = cwd_lock().lock().unwrap();
+    let lock = cwd_lock().lock().unwrap_or_else(|e| e.into_inner());
     let original_dir = std::env::current_dir().unwrap();
     std::env::set_current_dir(dir).unwrap();
     CurrentDirGuard {
