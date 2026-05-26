@@ -2086,21 +2086,7 @@ mod tests {
     use crate::db::{self, Database};
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
     use chrono::TimeZone;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct TestDirGuard(PathBuf);
-
-    impl Drop for TestDirGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
-        }
-    }
 
     struct DatabaseGuard(Option<Database>);
 
@@ -2137,12 +2123,9 @@ mod tests {
 
     #[test]
     fn remove_migrated_novel_dir_keeps_previous_dir_when_still_referenced() {
-        let _guard = env_lock().lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let original_dir = std::env::current_dir().unwrap();
-        let _dir_guard = TestDirGuard(original_dir);
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
 
-        std::env::set_current_dir(temp.path()).unwrap();
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
 
         let db = Database::new().unwrap();

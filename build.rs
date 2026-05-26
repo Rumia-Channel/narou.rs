@@ -77,9 +77,19 @@ fn collect_assets(root: &Path, dir: &Path, output: &mut Vec<(String, String)>) {
             .expect("asset under root")
             .to_string_lossy()
             .replace('\\', "/");
+        if !is_versioned_asset(&relative) {
+            continue;
+        }
         let bytes = fs::read(&path).expect("read asset bytes");
         output.push((relative, sha3_256_base64_url(&bytes)));
     }
+}
+
+fn is_versioned_asset(path: &str) -> bool {
+    matches!(
+        Path::new(path).extension().and_then(|ext| ext.to_str()),
+        Some("html" | "css" | "js" | "ttf")
+    )
 }
 
 fn sha3_256_base64_url(bytes: &[u8]) -> String {
