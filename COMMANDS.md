@@ -233,7 +233,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `--verbose` | `-v` | flag | false | AozoraEpub3/kindlegen 標準出力表示 | ✅ |
 | `--ignore-default` | — | flag | false | default.* 設定を無視 | ✅ |
 | `--ignore-force` | — | flag | false | force.* 設定を無視 | ✅ |
-| targets | | Vec\<String\> | — | ID/タイトル/ファイルパス | ✅ |
+| targets | | Vec\<String\> | — | ID/タイトル/ファイルパス/標準入力 | ✅ |
 
 **不足動作**:
 - 変換後の端末送信の実機最終検証
@@ -256,6 +256,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `convert.multi-device` があれば `device` より優先して複数端末へ順に変換する。Ruby版同様 `kindle` を先頭へ寄せ、無効な端末名は警告し、`sample\\novel` で `convert.multi-device: epub,ibunko` により EPUB + ZIP 出力を確認済み
 - `--ignore-default` / `--ignore-force` を `NovelSettings::load_for_novel_with_options` に渡し、`default.*` / `force.*` の適用を個別に無効化できるようにした
 - DB 管理小説だけでなくファイルパス指定の textfile 変換も `commands::convert` に接続し、`--enc` による UTF-8 / Shift_JIS / EUC-JP 系のデコードと `enable_enchant_midashi` 推奨 INFO を追加した
+- `narou list ... | narou convert` のようなパイプ入力に対応し、非TTYの標準入力から空白区切りの target を読み取って CLI 指定 target の末尾へ追加する
 - 変換後に `調査ログ.txt` を常に保存し、`enable_inspect` が有効なときは行末読点状況とカギ括弧内改行状況を記録する
 - `--inspect` 指定時は full display、未指定時は Ruby版同様に summary だけを出す
 - `enable_erase_introduction` / `enable_erase_postscript` を section 変換に反映し、`enable_auto_indent` は Ruby版 `Inspector#inspect_indent` 相当の比率判定でのみ有効化する

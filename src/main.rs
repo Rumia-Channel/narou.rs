@@ -8,7 +8,7 @@ mod logger;
 mod test_support;
 
 use std::any::Any;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -107,6 +107,39 @@ fn install_panic_hook() {
         }
         eprintln!("{}", detail);
     }));
+}
+
+fn parse_stdin_targets(input: &str) -> Vec<String> {
+    input
+        .split_whitespace()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect()
+}
+
+fn read_targets_from_stdin() -> Vec<String> {
+    if std::io::stdin().is_terminal() {
+        return Vec::new();
+    }
+
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return Vec::new();
+    }
+    parse_stdin_targets(&input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_stdin_targets;
+
+    #[test]
+    fn parse_stdin_targets_splits_piped_ids_like_ruby_argv() {
+        assert_eq!(
+            parse_stdin_targets("3 2\r\n1\t4\n"),
+            vec!["3", "2", "1", "4"]
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -334,7 +367,7 @@ fn run_sync_command(
             0
         }
         Commands::Convert {
-            targets,
+            mut targets,
             output,
             encoding,
             no_epub,
@@ -348,6 +381,7 @@ fn run_sync_command(
             verbose,
             no_open,
         } => {
+            targets.extend(read_targets_from_stdin());
             if targets.is_empty() {
                 eprintln!("Usage: narou convert <url|ncode|id>...");
                 1
