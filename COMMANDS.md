@@ -262,7 +262,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `enable_erase_introduction` / `enable_erase_postscript` を section 変換に反映し、`enable_auto_indent` は Ruby版 `Inspector#inspect_indent` 相当の比率判定でのみ有効化する
 - 保存済み `挿絵/<section-index>-<count>.<ext>` があれば HTML `<img>` を対応する青空文庫注記へローカルパスで復元する。`sample\\novel` の n8858hb section 16 で `［＃挿絵（挿絵/16-0.jpg）入る］` を確認済み
 - Windows の `\\?\\C:\\...\\AozoraEpub3.jar` 形式パスは Java classpath にそのまま渡すと失敗するため、Ruby版同様に jar の basename を current_dir 基準で渡すよう修正した。`sample\\novel` で `device=epub` 実変換と `--no-epub` 抑止を確認済み
-- Windows で `〜` / `～` / `−` など Java のコマンドライン引数で化けやすい文字を含む小説パスは、AozoraEpub3 に本文・表紙・`挿絵/` を安全な一時ファイル名で渡し、生成後に本来の Unicode ファイル名へ戻す。`C:\\Users\\rumia\\Documents\\Narou` の n5853lh で EPUB 生成を確認済み
+- Windows で `〜` / `～` / `−` / `‼` / `⁇` / `⁈` / `⁉` / variation selector など Java/AozoraEpub3 側で出力名がずれやすい文字を含む小説パスは、AozoraEpub3 に本文・表紙・`挿絵/` を安全な一時ファイル名で渡し、生成後に本来の Unicode ファイル名へ戻す。`C:\\Users\\rumia\\Documents\\Narou` の n5853lh で EPUB 生成を確認済み
 
 **注**: EPUB/MOBI 生成は AozoraEpub3.jar と kindlegen への依存がある。Rust 側のテキスト変換 (`novel.txt` 生成) は完了しているが、AozoraEpub3 の呼び出しパイプラインは別途必要。
 

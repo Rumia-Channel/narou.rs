@@ -1033,6 +1033,12 @@ fn path_contains_windows_aozora_risky_chars(path: &Path) -> bool {
                 | '\u{FFE1}'
                 | '\u{00AC}'
                 | '\u{FFE2}'
+                | '\u{203C}'
+                | '\u{2047}'
+                | '\u{2048}'
+                | '\u{2049}'
+                | '\u{FE0E}'
+                | '\u{FE0F}'
         )
     })
 }
@@ -1286,6 +1292,15 @@ mod tests {
         )));
         assert!(path_contains_windows_aozora_risky_chars(Path::new(
             "price¢.txt"
+        )));
+        assert!(path_contains_windows_aozora_risky_chars(Path::new(
+            "救世主って誰ですかっ⁉.txt"
+        )));
+        assert!(path_contains_windows_aozora_risky_chars(Path::new(
+            "救世主って誰ですかっ⁉︎.txt"
+        )));
+        assert!(path_contains_windows_aozora_risky_chars(Path::new(
+            "title‼⁇⁈.txt"
         )));
         assert!(!path_contains_windows_aozora_risky_chars(Path::new(
             "普通のタイトル.txt"
