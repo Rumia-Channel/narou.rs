@@ -351,11 +351,17 @@ impl NovelConverter {
             ));
         }
 
+        let record = novel_id
+            .or(self.settings.id)
+            .and_then(|id| crate::db::with_database(|db| Ok(db.get(id).cloned())).ok())
+            .flatten();
+
         Ok(render::render_novel_text(
             &self.settings,
             toc,
             &converted_story,
             &converted_sections,
+            record.as_ref(),
         ))
     }
 

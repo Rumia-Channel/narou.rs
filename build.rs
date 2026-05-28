@@ -88,7 +88,7 @@ fn collect_assets(root: &Path, dir: &Path, output: &mut Vec<(String, String)>) {
 fn is_versioned_asset(path: &str) -> bool {
     matches!(
         Path::new(path).extension().and_then(|ext| ext.to_str()),
-        Some("html" | "css" | "js" | "ttf")
+        Some("html" | "css" | "js" | "woff2")
     )
 }
 

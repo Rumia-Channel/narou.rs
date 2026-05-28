@@ -267,23 +267,23 @@ pub async fn asset(Path(path): Path<String>) -> Response {
                     .into_bytes(),
             ),
         ),
-        "fonts/Material_Symbols/MaterialSymbolsOutlined-VariableFont_FILL,GRAD,opsz,wght.ttf" => (
-            "font/ttf",
+        "fonts/Material_Symbols/MaterialSymbolsOutlined-VariableFont_FILL,GRAD,opsz,wght.woff2" => (
+            "font/woff2",
             Cow::Borrowed(include_bytes!(
-                "assets/fonts/Material_Symbols/MaterialSymbolsOutlined-VariableFont_FILL,GRAD,opsz,wght.ttf"
+                "assets/fonts/Material_Symbols/MaterialSymbolsOutlined-VariableFont_FILL,GRAD,opsz,wght.woff2"
             )
             .as_slice()),
         ),
-        "fonts/FORMUDPGothic/FORMUDPGothic-Regular.ttf" => (
-            "font/ttf",
+        "fonts/FORMUDPGothic/FORMUDPGothic-Regular.woff2" => (
+            "font/woff2",
             Cow::Borrowed(
-                include_bytes!("assets/fonts/FORMUDPGothic/FORMUDPGothic-Regular.ttf").as_slice(),
+                include_bytes!("assets/fonts/FORMUDPGothic/FORMUDPGothic-Regular.woff2").as_slice(),
             ),
         ),
-        "fonts/FORMUDPGothic/FORMUDPGothic-Bold.ttf" => (
-            "font/ttf",
+        "fonts/FORMUDPGothic/FORMUDPGothic-Bold.woff2" => (
+            "font/woff2",
             Cow::Borrowed(
-                include_bytes!("assets/fonts/FORMUDPGothic/FORMUDPGothic-Bold.ttf").as_slice(),
+                include_bytes!("assets/fonts/FORMUDPGothic/FORMUDPGothic-Bold.woff2").as_slice(),
             ),
         ),
         _ => {
@@ -351,22 +351,22 @@ mod tests {
 
     #[test]
     fn css_asset_versions_append_query_hashes_to_font_urls() {
-        let font_version = asset_version("fonts/FORMUDPGothic/FORMUDPGothic-Regular.ttf").unwrap();
+        let font_version = asset_version("fonts/FORMUDPGothic/FORMUDPGothic-Regular.woff2").unwrap();
         let rendered = apply_asset_versions(include_str!("assets/css/base.css"));
         assert!(rendered.contains(&format!(
-            "/assets/fonts/FORMUDPGothic/FORMUDPGothic-Regular.ttf?v={font_version}"
+            "/assets/fonts/FORMUDPGothic/FORMUDPGothic-Regular.woff2?v={font_version}"
         )));
     }
 
     #[tokio::test]
     async fn font_asset_is_served() {
         let response = super::asset(Path(
-            "fonts/Material_Symbols/MaterialSymbolsOutlined-VariableFont_FILL,GRAD,opsz,wght.ttf"
+            "fonts/Material_Symbols/MaterialSymbolsOutlined-VariableFont_FILL,GRAD,opsz,wght.woff2"
                 .to_string(),
         ))
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[header::CONTENT_TYPE], "font/ttf");
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "font/woff2");
     }
 
     #[tokio::test]
