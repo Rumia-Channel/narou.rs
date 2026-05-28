@@ -1,6 +1,7 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::db::NovelRecord;
 use crate::downloader::TocObject;
 
 use super::settings::NovelSettings;
@@ -20,6 +21,7 @@ pub(crate) fn render_novel_text(
     toc: &TocObject,
     story: &str,
     sections: &[ConvertedSection],
+    record: Option<&NovelRecord>,
 ) -> String {
     let mut output = String::new();
 
@@ -33,8 +35,9 @@ pub(crate) fn render_novel_text(
     } else {
         &settings.novel_author
     };
+    let processed_title = decorate_title(settings, title, record);
 
-    output.push_str(title);
+    output.push_str(&processed_title);
     output.push('\n');
     output.push_str(author);
     output.push('\n');
@@ -166,6 +169,127 @@ pub(crate) fn render_novel_text(
     output
 }
 
+fn decorate_title(settings: &NovelSettings, title: &str, record: Option<&NovelRecord>) -> String {
+    let mut processed_title = add_date_to_title(settings, title, record);
+    if settings.enable_add_end_to_title
+        && record.is_some_and(|record| record.tags.iter().any(|tag| tag == "end"))
+    {
+        processed_title.push_str(" (完結)");
+    }
+    processed_title
+        .replace("《", "※［＃始め二重山括弧］")
+        .replace("》", "※［＃終わり二重山括弧］")
+}
+
+fn add_date_to_title(
+    settings: &NovelSettings,
+    title: &str,
+    record: Option<&NovelRecord>,
+) -> String {
+    if !settings.enable_add_date_to_title {
+        return title.to_string();
+    }
+
+    let title_time = title_date_target_time(settings, record);
+    let mut date_str = title_time.format(&settings.title_date_format).to_string();
+    let dollar_t_included = date_str.contains("$t");
+    let replacements = [
+        ("$s", calc_reverse_short_time(title_time.timestamp())),
+        (
+            "$ns",
+            record
+                .map(|record| record.sitename.clone())
+                .unwrap_or_default(),
+        ),
+        ("$ntag", tags_join_comma(record)),
+        (
+            "$nt",
+            novel_type_text(record.map(|record| record.novel_type)),
+        ),
+        ("$t", title.to_string()),
+    ];
+    for (symbol, replacement) in replacements {
+        date_str = date_str.replace(symbol, &replacement);
+    }
+
+    if dollar_t_included {
+        date_str
+    } else if settings.title_date_align == "left" {
+        format!("{date_str}{title}")
+    } else {
+        format!("{title}{date_str}")
+    }
+}
+
+fn title_date_target_time(
+    settings: &NovelSettings,
+    record: Option<&NovelRecord>,
+) -> chrono::DateTime<chrono::FixedOffset> {
+    let selected = match settings.title_date_target.as_str() {
+        "general_lastup" => record.and_then(|record| record.general_lastup),
+        "last_update" => record.map(|record| record.last_update),
+        "new_arrivals_date" => record.and_then(|record| record.new_arrivals_date),
+        "convert" => None,
+        _ => None,
+    };
+    selected
+        .map(|time| time.with_timezone(&jst_offset()))
+        .unwrap_or_else(|| chrono::Local::now().with_timezone(&jst_offset()))
+}
+
+fn calc_reverse_short_time(timestamp: i64) -> String {
+    let value = (2_091_149_000_i64 - timestamp).div_euclid(10 * 60);
+    let encoded = to_base36(value);
+    if encoded.len() < 4 {
+        format!("{}{}", "0".repeat(4 - encoded.len()), encoded)
+    } else {
+        encoded
+    }
+}
+
+fn to_base36(value: i64) -> String {
+    let negative = value < 0;
+    let mut remaining = if negative {
+        -(value as i128)
+    } else {
+        value as i128
+    };
+    let mut digits = Vec::new();
+    loop {
+        let digit = (remaining % 36) as u8;
+        digits.push(match digit {
+            0..=9 => (b'0' + digit) as char,
+            _ => (b'a' + (digit - 10)) as char,
+        });
+        remaining /= 36;
+        if remaining == 0 {
+            break;
+        }
+    }
+    if negative {
+        digits.push('-');
+    }
+    digits.iter().rev().collect()
+}
+
+fn jst_offset() -> chrono::FixedOffset {
+    chrono::FixedOffset::east_opt(9 * 3600).expect("valid JST offset")
+}
+
+fn tags_join_comma(record: Option<&NovelRecord>) -> String {
+    let mut tags = record.map(|record| record.tags.clone()).unwrap_or_default();
+    tags.sort();
+    tags.join(",")
+}
+
+fn novel_type_text(novel_type: Option<u8>) -> String {
+    if novel_type == Some(2) {
+        "短編".to_string()
+    } else {
+        "連載".to_string()
+    }
+}
+
 fn create_cover_chuki(settings: &NovelSettings) -> String {
     let archive_path = &settings.archive_path;
     for ext in &[".jpg", ".png", ".jpeg"] {
@@ -275,7 +399,99 @@ fn segmented_digit(text: &str) -> char {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_story_markup, normalize_subtitle_markup};
+    use chrono::{TimeZone, Utc};
+
+    use super::{
+        decorate_title, normalize_story_markup, normalize_subtitle_markup, render_novel_text,
+    };
+    use crate::db::NovelRecord;
+    use crate::{converter::settings::NovelSettings, downloader::TocObject};
+
+    fn sample_record() -> NovelRecord {
+        NovelRecord {
+            id: 1,
+            author: "作者".to_string(),
+            title: "作品".to_string(),
+            file_title: "file".to_string(),
+            toc_url: "https://example.com/novel/".to_string(),
+            sitename: "Example".to_string(),
+            novel_type: 1,
+            end: false,
+            last_update: Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: None,
+            general_lastup: Some(Utc.with_ymd_and_hms(2026, 5, 16, 0, 0, 0).unwrap()),
+            last_mail_date: None,
+            tags: Vec::new(),
+            ncode: None,
+            domain: None,
+            general_all_no: None,
+            length: None,
+            suspend: false,
+            is_narou: false,
+            last_check_date: None,
+            convert_failure: false,
+            extra_fields: Default::default(),
+        }
+    }
+
+    #[test]
+    fn rendered_title_uses_title_date_format_with_title_placeholder() {
+        let mut settings = NovelSettings::default();
+        settings.enable_add_date_to_title = true;
+        settings.title_date_format = "$t (%F) $ns".to_string();
+        settings.title_date_target = "general_lastup".to_string();
+        let toc = TocObject {
+            title: "作品".to_string(),
+            author: "作者".to_string(),
+            toc_url: String::new(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(1),
+        };
+        let text = render_novel_text(&settings, &toc, "", &[], Some(&sample_record()));
+
+        assert!(
+            text.starts_with("作品 (2026-05-16) Example\n作者\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn decorate_title_applies_left_align_end_marker_and_ruby_escape() {
+        let mut settings = NovelSettings::default();
+        settings.enable_add_date_to_title = true;
+        settings.title_date_format = "%F ".to_string();
+        settings.title_date_align = "left".to_string();
+        settings.enable_add_end_to_title = true;
+        let mut record = sample_record();
+        record.tags = vec!["end".to_string()];
+
+        assert_eq!(
+            decorate_title(&settings, "作品《仮》", Some(&record)),
+            "2026-05-16 作品※［＃始め二重山括弧］仮※［＃終わり二重山括弧］ (完結)"
+        );
+    }
+
+    #[test]
+    fn decorate_title_replaces_all_narou_rb_extended_format_symbols() {
+        let mut settings = NovelSettings::default();
+        settings.enable_add_date_to_title = true;
+        settings.title_date_format = "$t $s $ns $ntag $nt".to_string();
+        settings.title_date_target = "general_lastup".to_string();
+        let mut record = sample_record();
+        record.sitename = "Site".to_string();
+        record.novel_type = 2;
+        record.tags = vec!["end".to_string(), "alpha".to_string()];
+        record.general_lastup = Some(Utc.timestamp_opt(2_091_149_000, 0).unwrap());
+
+        assert_eq!(
+            decorate_title(&settings, "作品", Some(&record)),
+            "作品 0000 Site alpha,end 短編"
+        );
+    }
 
     #[test]
     fn subtitle_single_digit_episode_keeps_tcy_markup() {

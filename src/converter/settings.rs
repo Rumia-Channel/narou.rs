@@ -985,7 +985,7 @@ mod tests {
         std::fs::create_dir_all(&archive_path).unwrap();
         std::fs::write(
             root.join(".narou").join("local_setting.yaml"),
-            "default.enable_inspect: true\ndefault.enable_erase_introduction: true\n",
+            "default.enable_inspect: true\ndefault.enable_erase_introduction: true\ndefault.enable_add_date_to_title: true\ndefault.title_date_format: \"$t (%F) $ns\"\ndefault.title_date_target: general_lastup\n",
         )
         .unwrap();
 
@@ -996,6 +996,9 @@ mod tests {
 
         assert!(settings.enable_inspect);
         assert!(settings.enable_erase_introduction);
+        assert!(settings.enable_add_date_to_title);
+        assert_eq!(settings.title_date_format, "$t (%F) $ns");
+        assert_eq!(settings.title_date_target, "general_lastup");
 
         let _ = std::fs::remove_dir_all(root);
     }
