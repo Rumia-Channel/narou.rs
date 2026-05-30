@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
+use encoding_rs::SHIFT_JIS;
 use regex::Regex;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -1020,27 +1021,36 @@ fn should_use_aozora_temp_workspace(input_txt: &Path, output_dir: &Path) -> bool
 }
 
 fn path_contains_windows_aozora_risky_chars(path: &Path) -> bool {
-    path.to_string_lossy().chars().any(|ch| {
-        matches!(
-            ch,
-            '\u{301C}'
-                | '\u{FF5E}'
-                | '\u{2212}'
-                | '\u{FF0D}'
-                | '\u{00A2}'
-                | '\u{FFE0}'
-                | '\u{00A3}'
-                | '\u{FFE1}'
-                | '\u{00AC}'
-                | '\u{FFE2}'
-                | '\u{203C}'
-                | '\u{2047}'
-                | '\u{2048}'
-                | '\u{2049}'
-                | '\u{FE0E}'
-                | '\u{FE0F}'
-        )
-    })
+    let path_text = path.to_string_lossy();
+    windows_31j_encode_has_errors(&path_text)
+        || path_text.chars().any(is_windows_aozora_mapping_risky_char)
+}
+
+fn windows_31j_encode_has_errors(text: &str) -> bool {
+    let (_, _, had_errors) = SHIFT_JIS.encode(text);
+    had_errors
+}
+
+fn is_windows_aozora_mapping_risky_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{301C}'
+            | '\u{FF5E}'
+            | '\u{2212}'
+            | '\u{FF0D}'
+            | '\u{00A2}'
+            | '\u{FFE0}'
+            | '\u{00A3}'
+            | '\u{FFE1}'
+            | '\u{00AC}'
+            | '\u{FFE2}'
+            | '\u{203C}'
+            | '\u{2047}'
+            | '\u{2048}'
+            | '\u{2049}'
+            | '\u{FE0E}'
+            | '\u{FE0F}'
+    )
 }
 
 fn copy_aozora_companion_files(input_txt: &Path, temp_root: &Path) -> Result<()> {
@@ -1302,6 +1312,15 @@ mod tests {
         assert!(path_contains_windows_aozora_risky_chars(Path::new(
             "title‼⁇⁈.txt"
         )));
+        assert!(path_contains_windows_aozora_risky_chars(Path::new(
+            "title♠♡♢♣.txt"
+        )));
+        assert!(path_contains_windows_aozora_risky_chars(Path::new(
+            "title\u{20bb7}.txt"
+        )));
+        assert!(!path_contains_windows_aozora_risky_chars(Path::new(
+            "title①.txt"
+        )));
         assert!(!path_contains_windows_aozora_risky_chars(Path::new(
             "普通のタイトル.txt"
         )));
@@ -1329,6 +1348,29 @@ mod tests {
             assert!(invocation.input_txt.exists());
             assert!(invocation.output_dir.join("cover.jpg").exists());
             assert!(invocation.output_dir.join("挿絵").join("1-0.jpg").exists());
+            assert!(invocation.needs_final_copy());
+        } else {
+            assert_eq!(invocation.input_txt, input);
+            assert_eq!(invocation.expected_output_path, final_output);
+            assert!(!invocation.needs_final_copy());
+        }
+    }
+
+    #[test]
+    fn aozora_temp_workspace_is_used_for_windows_31j_unencodable_paths() {
+        let dir = create_test_dir("aozora-temp-cp932");
+        let input = dir.join("title♠.txt");
+        fs::write(&input, "title\nauthor\nbody").unwrap();
+
+        let final_output = dir.join("title♠.epub");
+        let invocation = prepare_aozora_invocation(&input, &dir, ".epub", &final_output).unwrap();
+
+        if cfg!(windows) {
+            assert_ne!(invocation.input_txt, input);
+            assert_eq!(
+                invocation.expected_output_path.file_name().unwrap().to_str().unwrap(),
+                "input.epub"
+            );
             assert!(invocation.needs_final_copy());
         } else {
             assert_eq!(invocation.input_txt, input);
