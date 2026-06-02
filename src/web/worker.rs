@@ -21,6 +21,7 @@ use crate::queue::{
 
 const MAX_FAILURE_DETAIL_LINES: usize = 8;
 const MAX_FAILURE_DETAIL_CHARS: usize = 600;
+const IDLE_EXTERNAL_QUEUE_POLL_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Default)]
 struct JobRunResult {
@@ -99,7 +100,10 @@ fn start_queue_worker_for_lane(
             };
 
             let Some(job) = job else {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::select! {
+                    _ = queue.wait_for_change() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(IDLE_EXTERNAL_QUEUE_POLL_SECS)) => {}
+                }
                 continue;
             };
 

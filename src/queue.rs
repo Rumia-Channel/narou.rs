@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
+use tokio::sync::Notify;
 
 use crate::db::inventory::{atomic_write, ensure_yaml_size_limit};
 use crate::error::{NarouError, Result};
@@ -170,6 +171,7 @@ struct PersistentQueueState {
 pub struct PersistentQueue {
     path: PathBuf,
     state: Mutex<PersistentQueueState>,
+    change_notify: Notify,
 }
 
 impl PersistentQueue {
@@ -177,6 +179,7 @@ impl PersistentQueue {
         let mut queue = Self {
             path: path.to_path_buf(),
             state: Mutex::new(PersistentQueueState::default()),
+            change_notify: Notify::new(),
         };
         queue.load()?;
         Ok(queue)
@@ -221,7 +224,17 @@ impl PersistentQueue {
         }
         let content = serde_yaml::to_string(&queue_state_to_legacy_file(&self.state.lock()))?;
         atomic_write(&self.path, &content)?;
+        self.notify_changed();
         Ok(())
+    }
+
+    pub async fn wait_for_change(&self) {
+        self.change_notify.notified().await;
+    }
+
+    fn notify_changed(&self) {
+        self.change_notify.notify_waiters();
+        self.change_notify.notify_one();
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -1580,6 +1593,20 @@ mod tests {
         assert_eq!(first, duplicate_running);
         assert_eq!(queue.pending_count(), 0);
         assert_eq!(queue.running_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn push_notifies_idle_queue_workers() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let notified = queue.wait_for_change();
+
+        queue.push(JobType::Download, "n0001").unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), notified)
+            .await
+            .unwrap();
     }
 
     #[test]
