@@ -562,6 +562,7 @@ narou setting name         # 読み取り
 - `webui.theme` / `webui.table.reload-timing` / `webui.performance-mode` / `webui.debug-mode` 保存時は、開いている Web UI に設定再読み込みイベントを送り、テーマメニューの変更も `webui.theme` へ保存する
 - `webui.debug-mode` が ON のときは、Web worker が失敗 child process の直近 stdout/stderr を要約して `queue_failed` イベントに載せ、Web UI 通知とコンソールに詳細エラーを出す。OFF のときは従来どおり簡潔な失敗通知だけにする
 - Web UI のタグ編集は既存タグ一覧から入力中タグ名に一致する候補を表示し、タグ名クリック検索は `tag:`、作者名クリック検索は `author:`、掲載サイトクリック検索は `sitename:` を生成する。通常クリックは AND、Ctrl クリックは同一フィールド内 OR、Shift クリックは除外 AND、Shift+Ctrl クリックは除外 OR として検索文字列を更新する
+- Web UI の `update_by_tag` / modified followup 更新は、実行時にタグ条件を再解決せず、受付時または followup 開始時に確定した ID snapshot を通常の `update ID...` として実行する
 - Web UI の単体/一括削除 API は削除成功時に console history へ削除ログを出力する。`concurrency` 有効時は非外部通信として `#console-stdout2`、無効時は `#console` を使う
 - Web UI の CSV ダウンロードは CLI `csv` の stdout を返し、export 項目を CLI と一致させる
 - Web サーバ起動時は Ruby版 `fill_general_all_no_in_database` 相当に、`general_all_no` 未設定レコードの `toc.yaml` を読んで話数をDBへ補完する

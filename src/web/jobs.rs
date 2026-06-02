@@ -2908,12 +2908,6 @@ mod tests {
     }
 
     #[test]
-    fn modified_followup_target_matches_ruby_tag_selector() {
-        let target = "tag:modified".to_string();
-        assert_eq!(target, "tag:modified");
-    }
-
-    #[test]
     fn broadcast_captured_web_output_wraps_plain_text_as_echo() {
         let push_server = Arc::new(crate::web::push::PushServer::new());
         let mut receiver = push_server.channel().subscribe();
