@@ -262,6 +262,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `enable_erase_introduction` / `enable_erase_postscript` を section 変換に反映し、`enable_auto_indent` は Ruby版 `Inspector#inspect_indent` 相当の比率判定でのみ有効化する
 - 表紙タイトル生成で Ruby版 `decorate_title` 相当を実装し、`enable_add_date_to_title` / `title_date_format` / `title_date_align` / `title_date_target` / `enable_add_end_to_title` を反映する。`$t` / `$s` / `$ns` / `$nt` / `$ntag` の拡張書式、`general_lastup` / `last_update` / `new_arrivals_date` / `convert` の日付対象、完結タグによる ` (完結)` 付与も対応
 - 保存済み `挿絵/<section-index>-<count>.<ext>` があれば HTML `<img>` を対応する青空文庫注記へローカルパスで復元する。`sample\\novel` の n8858hb section 16 で `［＃挿絵（挿絵/16-0.jpg）入る］` を確認済み
+- HTML 由来の story / section では Ruby版同様に `()` の暗黙ルビ推測を行わず、HTML `<ruby>` は `to_aozora` 経由の明示ルビとして保持する。`text` / `text/plain` / textfile では従来どおり `()` 暗黙ルビを処理する
 - Windows の `\\?\\C:\\...\\AozoraEpub3.jar` 形式パスは Java classpath にそのまま渡すと失敗するため、Ruby版同様に jar の basename を current_dir 基準で渡すよう修正した。`sample\\novel` で `device=epub` 実変換と `--no-epub` 抑止を確認済み
 - Windows で `〜` / `～` / `−` / `‼` / `⁇` / `⁈` / `⁉` / variation selector や CP932/Windows-31J 未定義文字 (`♠` / `♡` / `♢` / `♣` / `𠮷` など) を含み、Java/AozoraEpub3 側で出力名がずれやすい小説パスは、AozoraEpub3 に本文・表紙・`挿絵/` を安全な一時ファイル名で渡し、生成後に本来の Unicode ファイル名へ戻す。`C:\\Users\\rumia\\Documents\\Narou` の n5853lh で EPUB 生成を確認済み
 

@@ -360,7 +360,7 @@ pub(crate) fn normalize_story_source(story: &str) -> String {
     }
 }
 
-fn looks_like_html(text: &str) -> bool {
+pub(crate) fn looks_like_html(text: &str) -> bool {
     text.contains("<br")
         || text.contains("<BR")
         || text.contains("</p>")

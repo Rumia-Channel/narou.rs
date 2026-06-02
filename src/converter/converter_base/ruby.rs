@@ -41,6 +41,10 @@ impl ConverterBase {
             })
             .to_string();
 
+        if !self.enable_parenthesized_ruby {
+            return;
+        }
+
         let paren_re = Regex::new(r"\u{FF08}(.+?)\u{FF09}").unwrap();
         let ruby_re = Regex::new(r"^[ぁ-んァ-ヶーゝゞ・]+[ 　]?[ぁ-んァ-ヶーゝゞ・]*$").unwrap();
         let original = data.clone();

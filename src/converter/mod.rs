@@ -164,7 +164,8 @@ impl NovelConverter {
         let mut converted_story = String::new();
         if let Some(ref story) = toc.story {
             if !story.is_empty() {
-                let mut converter = self.make_converter();
+                let mut converter =
+                    self.make_converter_with_parenthesized_ruby(!render::looks_like_html(story));
                 let story_text = render::normalize_story_source(story);
                 converted_story = converter.convert(&story_text, converter_base::TextType::Story);
                 self.use_dakuten_font |= converter.use_dakuten_font;
@@ -230,7 +231,7 @@ impl NovelConverter {
                 continue;
             }
 
-            let mut converter = self.make_converter();
+            let mut converter = self.make_converter_for_section(section);
 
             let mut batch_inputs = Vec::new();
 
@@ -399,14 +400,43 @@ impl NovelConverter {
         }
     }
 
+    fn make_converter_with_parenthesized_ruby(
+        &self,
+        enable_parenthesized_ruby: bool,
+    ) -> converter_base::ConverterBase {
+        let mut converter = self.make_converter();
+        converter.enable_parenthesized_ruby = enable_parenthesized_ruby;
+        converter
+    }
+
+    fn make_converter_for_section(&self, section: &SectionFile) -> converter_base::ConverterBase {
+        self.make_converter_with_parenthesized_ruby(
+            Self::parenthesized_ruby_enabled_for_data_type(&section.element.data_type),
+        )
+    }
+
     fn compute_digest(&self, section: &SectionFile) -> String {
         let mut hasher = Sha256::new();
         hasher.update(Self::section_cache_relative_path(section).as_bytes());
         hasher.update(
             serde_json::to_vec(section).expect("section cache digest serialization should succeed"),
         );
+        let parenthesized_ruby_marker: &[u8] =
+            if Self::parenthesized_ruby_enabled_for_data_type(&section.element.data_type) {
+                b"parenthesized-ruby:on"
+            } else {
+                b"parenthesized-ruby:off"
+            };
+        hasher.update(parenthesized_ruby_marker);
         hasher.update(self.compute_conversion_context_signature().as_bytes());
         hex::encode(hasher.finalize())
+    }
+
+    fn parenthesized_ruby_enabled_for_data_type(data_type: &str) -> bool {
+        matches!(
+            data_type.trim().to_ascii_lowercase().as_str(),
+            "" | "text" | "text/plain"
+        )
     }
 
     fn compute_conversion_context_signature(&self) -> String {
@@ -1221,6 +1251,57 @@ mod tests {
         }
     }
 
+    fn make_parenthesized_kana_html_section() -> SectionFile {
+        SectionFile {
+            index: "1".to_string(),
+            href: "1.html".to_string(),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: "第一話".to_string(),
+            file_subtitle: "第一話".to_string(),
+            subdate: String::new(),
+            subupdate: None,
+            download_time: None,
+            element: SectionElement {
+                data_type: "html".to_string(),
+                introduction: String::new(),
+                postscript: String::new(),
+                body: "<p>おじいちゃんが錬金術師(あるけみすと)さんだったの、ちゃんとわかるもん</p>"
+                    .to_string(),
+            },
+        }
+    }
+
+    fn make_explicit_ruby_html_section() -> SectionFile {
+        SectionFile {
+            index: "1".to_string(),
+            href: "1.html".to_string(),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: "第一話".to_string(),
+            file_subtitle: "第一話".to_string(),
+            subdate: String::new(),
+            subupdate: None,
+            download_time: None,
+            element: SectionElement {
+                data_type: "html".to_string(),
+                introduction: String::new(),
+                postscript: String::new(),
+                body: "<p>おじいちゃんが<ruby>錬金術師<rt>あるけみすと</rt></ruby>さんだった</p>"
+                    .to_string(),
+            },
+        }
+    }
+
+    fn make_parenthesized_kana_text_section() -> SectionFile {
+        let mut section = make_parenthesized_kana_html_section();
+        section.element.data_type = "text".to_string();
+        section.element.body =
+            "おじいちゃんが錬金術師(あるけみすと)さんだったの、ちゃんとわかるもん"
+                .to_string();
+        section
+    }
+
     fn make_cache_entry(body: &str) -> CacheEntry {
         CacheEntry {
             digest: format!("digest-{body}"),
@@ -1407,6 +1488,81 @@ mod tests {
         assert!(text.contains("［＃挿絵（挿絵/16-0.jpg）入る］"), "{text}");
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn html_sections_keep_parenthesized_kana_literal() {
+        let toc = TocObject {
+            title: "title".to_string(),
+            author: "author".to_string(),
+            toc_url: String::new(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(1),
+        };
+        let mut converter = NovelConverter::new(NovelSettings::default());
+        let text = converter
+            .convert_novel(&toc, &[make_parenthesized_kana_html_section()])
+            .unwrap();
+
+        assert!(text.contains("錬金術師（あるけみすと）さんだったの"), "{text}");
+        assert!(!text.contains("錬金術師｜"), "{text}");
+        assert!(!text.contains("「あるけみすと」"), "{text}");
+    }
+
+    #[test]
+    fn html_sections_keep_explicit_ruby() {
+        let toc = TocObject {
+            title: "title".to_string(),
+            author: "author".to_string(),
+            toc_url: String::new(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(1),
+        };
+        let mut converter = NovelConverter::new(NovelSettings::default());
+        let text = converter
+            .convert_novel(&toc, &[make_explicit_ruby_html_section()])
+            .unwrap();
+
+        assert!(text.contains("｜錬金術師《あるけみすと》さんだった"), "{text}");
+    }
+
+    #[test]
+    fn html_story_keeps_parenthesized_kana_literal() {
+        let toc = TocObject {
+            title: "title".to_string(),
+            author: "author".to_string(),
+            toc_url: String::new(),
+            story: Some("<p>店主は香笛 春風(かふえ はるかぜ)、17歳。</p>".to_string()),
+            subtitles: Vec::new(),
+            novel_type: Some(1),
+        };
+        let mut converter = NovelConverter::new(NovelSettings::default());
+        let text = converter.convert_novel(&toc, &[]).unwrap();
+
+        assert!(text.contains("香笛 春風（かふえ はるかぜ）"), "{text}");
+        assert!(!text.contains("春風｜"), "{text}");
+        assert!(!text.contains("「かふえ はるかぜ」"), "{text}");
+    }
+
+    #[test]
+    fn text_sections_still_apply_parenthesized_kana_ruby() {
+        let toc = TocObject {
+            title: "title".to_string(),
+            author: "author".to_string(),
+            toc_url: String::new(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(1),
+        };
+        let mut converter = NovelConverter::new(NovelSettings::default());
+        let text = converter
+            .convert_novel(&toc, &[make_parenthesized_kana_text_section()])
+            .unwrap();
+
+        assert!(text.contains("「あるけみすと」"), "{text}");
+        assert!(!text.contains("錬金術師（あるけみすと）さんだったの"), "{text}");
     }
 
     #[test]
