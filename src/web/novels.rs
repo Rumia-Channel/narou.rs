@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     extract::{Form, Path, Query, State},
     http::StatusCode,
@@ -6,7 +8,11 @@ use axum::{
 use chrono::{DateTime, Utc};
 
 use crate::compat::{load_frozen_ids_from_inventory, record_is_frozen};
+use crate::db::novel_record::NovelRecord;
 use crate::db::{with_database, with_database_mut};
+use crate::downloader::fetch::domain_of;
+use crate::downloader::site_setting::SiteSetting;
+use crate::downloader::{site_timezone, SiteTimezone};
 use crate::error::NarouError;
 
 use super::AppState;
@@ -25,11 +31,51 @@ fn is_new_arrivals_marker(
     new_arrivals_date: Option<DateTime<Utc>>,
     last_update: DateTime<Utc>,
     now: DateTime<Utc>,
+    timezone: SiteTimezone,
 ) -> bool {
     new_arrivals_date.is_some_and(|nad| {
         let limit = chrono::Duration::seconds(ANNOTATION_COLOR_TIME_LIMIT_SECS);
+        let nad = timezone.local_naive_datetime(nad);
+        let last_update = timezone.local_naive_datetime(last_update);
+        let now = timezone.local_naive_datetime(now);
         nad >= last_update && (nad + limit) >= now
     })
+}
+
+fn load_site_timezones_by_domain() -> HashMap<String, SiteTimezone> {
+    SiteSetting::load_all()
+        .map(|settings| {
+            settings
+                .into_iter()
+                .map(|setting| {
+                    let timezone = setting.site_timezone();
+                    (setting.domain, timezone)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn record_domain(record: &NovelRecord) -> Option<&str> {
+    record
+        .domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|domain| !domain.is_empty())
+        .or_else(|| {
+            let domain = domain_of(&record.toc_url).trim();
+            (!domain.is_empty()).then_some(domain)
+        })
+}
+
+fn record_site_timezone(
+    record: &NovelRecord,
+    timezones: &HashMap<String, SiteTimezone>,
+    fallback: SiteTimezone,
+) -> SiteTimezone {
+    record_domain(record)
+        .and_then(|domain| timezones.get(domain).copied())
+        .unwrap_or(fallback)
 }
 
 fn split_search_terms(query: &str) -> Vec<String> {
@@ -240,6 +286,9 @@ fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (Status
     let order_col = params.order_column.unwrap_or(0);
     let order_dir = params.order_dir.unwrap_or_else(|| "asc".to_string());
     let frozen_ids = with_database(|db| load_frozen_ids_from_inventory(db.inventory())).unwrap_or_default();
+    let site_timezones = load_site_timezones_by_domain();
+    let fallback_timezone = site_timezone(None);
+    let now = chrono::Utc::now();
 
     let response = with_database(|db| {
         let all_records: Vec<_> = db.all_records().values().collect();
@@ -304,8 +353,9 @@ fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (Status
             .skip(start as usize)
             .take(length.unwrap_or(usize::MAX))
             .map(|r| {
-                let now = chrono::Utc::now();
-                let is_new = is_new_arrivals_marker(r.new_arrivals_date, r.last_update, now);
+                let timezone = record_site_timezone(r, &site_timezones, fallback_timezone);
+                let is_new =
+                    is_new_arrivals_marker(r.new_arrivals_date, r.last_update, now, timezone);
                 NovelListItem {
                     id: r.id,
                     title: r.title.clone(),
@@ -343,6 +393,7 @@ fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (Status
 #[cfg(test)]
 mod tests {
     use super::{NovelListItem, is_new_arrivals_marker};
+    use crate::downloader::site_timezone;
     use chrono::{Duration, TimeZone, Utc};
     use serde_json::json;
 
@@ -380,13 +431,29 @@ mod tests {
     fn new_arrivals_marker_uses_ruby_six_hour_window() {
         let last_update = Utc.with_ymd_and_hms(2026, 4, 17, 0, 0, 0).unwrap();
         let now = last_update + Duration::hours(5);
-        assert!(is_new_arrivals_marker(Some(last_update), last_update, now));
+        let timezone = site_timezone(Some("Asia/Tokyo"));
+        assert!(is_new_arrivals_marker(
+            Some(last_update),
+            last_update,
+            now,
+            timezone
+        ));
 
         let boundary = last_update + Duration::hours(6);
-        assert!(is_new_arrivals_marker(Some(last_update), last_update, boundary));
+        assert!(is_new_arrivals_marker(
+            Some(last_update),
+            last_update,
+            boundary,
+            timezone
+        ));
 
         let expired = last_update + Duration::hours(7);
-        assert!(!is_new_arrivals_marker(Some(last_update), last_update, expired));
+        assert!(!is_new_arrivals_marker(
+            Some(last_update),
+            last_update,
+            expired,
+            timezone
+        ));
     }
 
     #[test]
@@ -394,7 +461,47 @@ mod tests {
         let last_update = Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap();
         let earlier = last_update - Duration::minutes(1);
         let now = last_update + Duration::minutes(30);
-        assert!(!is_new_arrivals_marker(Some(earlier), last_update, now));
+        assert!(!is_new_arrivals_marker(
+            Some(earlier),
+            last_update,
+            now,
+            site_timezone(Some("Asia/Tokyo"))
+        ));
+    }
+
+    #[test]
+    fn new_arrivals_marker_uses_site_timezone_for_local_order() {
+        let last_update = Utc.with_ymd_and_hms(2024, 11, 3, 5, 50, 0).unwrap();
+        let new_arrivals = Utc.with_ymd_and_hms(2024, 11, 3, 6, 30, 0).unwrap();
+        let now = new_arrivals + Duration::minutes(30);
+
+        assert!(is_new_arrivals_marker(
+            Some(new_arrivals),
+            last_update,
+            now,
+            site_timezone(Some("UTC"))
+        ));
+        assert!(!is_new_arrivals_marker(
+            Some(new_arrivals),
+            last_update,
+            now,
+            site_timezone(Some("America/New_York"))
+        ));
+    }
+
+    #[test]
+    fn record_site_timezone_falls_back_to_toc_url_domain() {
+        let mut record = sample_record();
+        record.toc_url = "https://example.com/works/1".to_string();
+        let mut timezones = std::collections::HashMap::new();
+        timezones.insert("example.com".to_string(), site_timezone(Some("UTC")));
+
+        let dt = Utc.with_ymd_and_hms(2026, 4, 17, 0, 0, 0).unwrap();
+        assert_eq!(
+            super::record_site_timezone(&record, &timezones, site_timezone(Some("Asia/Tokyo")))
+                .local_naive_datetime(dt),
+            dt.naive_utc()
+        );
     }
 
     #[test]

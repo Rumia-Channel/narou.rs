@@ -91,6 +91,13 @@ impl SiteTimezone {
             }
         }
     }
+
+    pub(crate) fn local_naive_datetime(self, dt: DateTime<Utc>) -> NaiveDateTime {
+        match self {
+            Self::Named(tz) => dt.with_timezone(&tz).naive_local(),
+            Self::Fixed(offset) => dt.with_timezone(&offset).naive_local(),
+        }
+    }
 }
 
 pub struct Downloader {

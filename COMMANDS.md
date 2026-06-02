@@ -570,6 +570,7 @@ narou setting name         # 読み取り
 - `webui.theme` / `webui.performance-mode` / `webui.table.reload-timing` を `/api/webui/config` と worker 側設定参照経由で反映し、theme 初期値、performance auto/on/off 判定、table reload の every/queue 挙動へ接続する
 - レスポンシブ CSS を分離し、スマートフォン幅でも一覧・キュー・メモ帳を同じ asset 構成で表示できる
 - 一覧 API の `frozen` 取得は DB 再入ロックによる deadlock を避けるよう修正済み
+- 一覧 API の `new_arrivals` 判定は `webnovel/*.yaml` の `timezone` に合わせたサイト現地時刻で行い、`domain` 未保存の既存データは `toc_url` のドメインからサイト定義を解決する
 - favicon は data URL で埋め込み、追加 route なしでブラウザ 404 を出さない
 
 **不足動作**:
