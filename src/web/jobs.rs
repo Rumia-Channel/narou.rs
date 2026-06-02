@@ -323,21 +323,30 @@ fn sort_numeric_targets_for_request(
 fn build_update_by_tag_queue_payload(
     tag_params: &[String],
     snapshot_ids: &[i64],
-    sort_by: Option<&str>,
+    sort_display: &str,
 ) -> (String, Vec<Value>, Mapping) {
-    let target = tag_params.join("\t");
-    let legacy_args = tag_params
+    let target_args = snapshot_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>();
+    let target = target_args.join("\t");
+    let legacy_args = target_args
         .iter()
         .cloned()
         .map(Value::String)
         .collect::<Vec<_>>();
-    let mut meta = Mapping::new();
+    let mut meta = build_update_start_message_meta(build_webui_update_start_message(
+        false,
+        snapshot_ids.len(),
+        sort_display,
+    ));
     meta.insert(
-        Value::String("snapshot_ids".to_string()),
+        Value::String("tag_params".to_string()),
         Value::Sequence(
-            snapshot_ids
+            tag_params
                 .iter()
-                .map(|id| Value::String(id.to_string()))
+                .cloned()
+                .map(Value::String)
                 .collect::<Vec<_>>(),
         ),
     );
@@ -345,12 +354,6 @@ fn build_update_by_tag_queue_payload(
         Value::String("snapshot_count".to_string()),
         Value::Number(serde_yaml::Number::from(snapshot_ids.len() as u64)),
     );
-    if let Some(key) = sort_by {
-        meta.insert(
-            Value::String("sort_by".to_string()),
-            Value::String(key.to_string()),
-        );
-    }
     (target, legacy_args, meta)
 }
 
@@ -2086,10 +2089,9 @@ pub async fn api_update_by_tag(
         .into();
     }
 
-    // Snapshot current matching novel IDs for UI feedback only.
-    // Sort using server-stored sort state (single source of truth).
+    // Snapshot current matching novel IDs before queuing, then run through the
+    // same update worker path used by normal selected-ID updates.
     let server_sort_state = current_web_update_sort_state();
-    let sort_key = web_update_sort_key_for_cli(&server_sort_state);
     let snapshot_ids = with_database(|db| {
         let all = db.all_records();
         let mut matching: Vec<&crate::db::NovelRecord> = Vec::new();
@@ -2121,13 +2123,22 @@ pub async fn api_update_by_tag(
     .unwrap_or_default();
 
     let count = snapshot_ids.len();
+    if snapshot_ids.is_empty() {
+        return serde_json::json!({
+            "success": true,
+            "count": count,
+            "status": "no_targets",
+        })
+        .into();
+    }
+    let sort_display = current_sort_display_string();
     let (target, legacy_args, meta) =
-        build_update_by_tag_queue_payload(&tag_params, &snapshot_ids, sort_key);
+        build_update_by_tag_queue_payload(&tag_params, &snapshot_ids, &sort_display);
     let (_job_ids, queued) = match push_update_job_with_legacy_if_needed(
         state.queue.as_ref(),
         &state.running_jobs,
         target.clone(),
-        "update_by_tag",
+        "update",
         legacy_args,
         meta,
     ) {
@@ -2809,31 +2820,31 @@ mod tests {
     }
 
     #[test]
-    fn update_by_tag_queue_payload_keeps_runtime_tag_args_with_snapshot_meta() {
+    fn update_by_tag_queue_payload_uses_common_update_args() {
         let (target, legacy_args, meta) = build_update_by_tag_queue_payload(
             &["tag:modified".to_string(), "^tag:end".to_string()],
             &[42, 9],
-            Some("general_lastup"),
+            "最新話掲載日降順",
         );
 
-        assert_eq!(target, "tag:modified\t^tag:end");
+        assert_eq!(target, "42\t9");
         assert_eq!(
             legacy_args,
             vec![
-                Value::String("tag:modified".to_string()),
-                Value::String("^tag:end".to_string())
+                Value::String("42".to_string()),
+                Value::String("9".to_string())
             ]
         );
         assert_eq!(
-            meta.get(Value::String("snapshot_ids".to_string())),
+            meta.get(Value::String("tag_params".to_string())),
             Some(&Value::Sequence(vec![
-                Value::String("42".to_string()),
-                Value::String("9".to_string())
+                Value::String("tag:modified".to_string()),
+                Value::String("^tag:end".to_string())
             ]))
         );
         assert_eq!(
-            meta.get(Value::String("sort_by".to_string())),
-            Some(&Value::String("general_lastup".to_string()))
+            meta.get(Value::String("snapshot_count".to_string())),
+            Some(&Value::Number(serde_yaml::Number::from(2)))
         );
     }
 
