@@ -9,10 +9,11 @@ use serde_yaml::Value;
 use tokio::task::JoinHandle;
 
 use super::push::PushServer;
+use super::sort_state::sort_ids_for_request;
 use crate::compat::{
     configure_web_subprocess_command, load_local_setting_bool, load_local_setting_string,
 };
-use crate::db::with_database_mut;
+use crate::db::{with_database, with_database_mut};
 use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
 use crate::queue::{
     JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane,
@@ -21,6 +22,7 @@ use crate::queue::{
 
 const MAX_FAILURE_DETAIL_LINES: usize = 8;
 const MAX_FAILURE_DETAIL_CHARS: usize = 600;
+const IDLE_EXTERNAL_QUEUE_POLL_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Default)]
 struct JobRunResult {
@@ -99,7 +101,10 @@ fn start_queue_worker_for_lane(
             };
 
             let Some(job) = job else {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::select! {
+                    _ = queue.wait_for_change() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(IDLE_EXTERNAL_QUEUE_POLL_SECS)) => {}
+                }
                 continue;
             };
 
@@ -305,10 +310,7 @@ fn execute_job(
             }
             "update_by_tag" => {
                 command.arg("update");
-                if let Some(sort_key) = execution_spec_meta_string(&spec, "sort_by") {
-                    command.arg("--sort-by").arg(sort_key);
-                }
-                append_update_args(&mut command, push_server, target_console, &spec);
+                append_update_by_tag_args(&mut command, &spec);
             }
             "convert" => {
                 let (targets, device) = match convert_targets_and_device(&spec) {
@@ -596,12 +598,17 @@ fn execute_update_general_lastup_job(
         target_console,
     );
 
+    let modified_ids = current_modified_update_target_ids();
+    if modified_ids.is_empty() {
+        push_server.broadcast_echo("modified タグの付いた小説はありません", target_console);
+        return result;
+    }
+
     let mut followup = new_web_subprocess_command(exe, root_dir, job_id);
     followup.arg("update");
-    if let Some(sort_key) = execution_spec_meta_string(spec, "sort_by") {
-        followup.arg("--sort-by").arg(sort_key);
+    for id in modified_ids {
+        followup.arg(id);
     }
-    followup.arg("tag:modified");
     spawn_and_stream_command(
         followup,
         push_server,
@@ -610,6 +617,44 @@ fn execute_update_general_lastup_job(
         job_id,
         target_console,
     )
+}
+
+fn update_by_tag_update_args(spec: &QueueExecutionSpec) -> Vec<String> {
+    let snapshot_ids = execution_spec_meta_strings(spec, "snapshot_ids");
+    if !snapshot_ids.is_empty() {
+        return snapshot_ids;
+    }
+
+    let mut args = Vec::new();
+    if let Some(sort_key) = execution_spec_meta_string(spec, "sort_by") {
+        args.push("--sort-by".to_string());
+        args.push(sort_key);
+    }
+    args.extend(spec.args.clone());
+    args
+}
+
+fn append_update_by_tag_args(command: &mut std::process::Command, spec: &QueueExecutionSpec) {
+    for part in update_by_tag_update_args(spec) {
+        if !part.is_empty() {
+            command.arg(part);
+        }
+    }
+}
+
+fn current_modified_update_target_ids() -> Vec<String> {
+    let ids = with_database(|db| {
+        Ok(db
+            .tag_index()
+            .get("modified")
+            .map(|ids| ids.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default())
+    })
+    .unwrap_or_default();
+    sort_ids_for_request(&ids, None, None)
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect()
 }
 
 fn append_update_args(
@@ -940,7 +985,7 @@ mod tests {
         clear_progress_for_job, console_target_for_job, convert_targets_and_device,
         execution_spec_meta_bool, execution_spec_meta_string, execution_spec_meta_strings,
         failure_reason, parse_convert_job_target, remember_failure_line,
-        route_structured_web_message, summarize_failure_details,
+        route_structured_web_message, summarize_failure_details, update_by_tag_update_args,
     };
     use crate::queue::JobType;
 
@@ -1172,5 +1217,47 @@ mod tests {
 
         assert_eq!(execution_spec_meta_strings(&spec, "snapshot_ids"), vec!["12", "34"]);
         assert!(execution_spec_meta_strings(&spec, "missing").is_empty());
+    }
+
+    #[test]
+    fn update_by_tag_args_use_snapshot_ids_like_selected_update() {
+        let mut meta = serde_yaml::Mapping::new();
+        meta.insert(
+            serde_yaml::Value::String("snapshot_ids".to_string()),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("42".to_string()),
+                serde_yaml::Value::String("9".to_string()),
+            ]),
+        );
+        meta.insert(
+            serde_yaml::Value::String("sort_by".to_string()),
+            serde_yaml::Value::String("general_lastup".to_string()),
+        );
+        let spec = crate::queue::QueueExecutionSpec {
+            cmd: "update_by_tag".to_string(),
+            args: vec!["tag:modified".to_string()],
+            meta,
+        };
+
+        assert_eq!(update_by_tag_update_args(&spec), vec!["42", "9"]);
+    }
+
+    #[test]
+    fn update_by_tag_args_fall_back_to_tag_selector_for_legacy_queue() {
+        let mut meta = serde_yaml::Mapping::new();
+        meta.insert(
+            serde_yaml::Value::String("sort_by".to_string()),
+            serde_yaml::Value::String("general_lastup".to_string()),
+        );
+        let spec = crate::queue::QueueExecutionSpec {
+            cmd: "update_by_tag".to_string(),
+            args: vec!["tag:modified".to_string()],
+            meta,
+        };
+
+        assert_eq!(
+            update_by_tag_update_args(&spec),
+            vec!["--sort-by", "general_lastup", "tag:modified"]
+        );
     }
 }

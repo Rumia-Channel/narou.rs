@@ -262,8 +262,9 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `enable_erase_introduction` / `enable_erase_postscript` を section 変換に反映し、`enable_auto_indent` は Ruby版 `Inspector#inspect_indent` 相当の比率判定でのみ有効化する
 - 表紙タイトル生成で Ruby版 `decorate_title` 相当を実装し、`enable_add_date_to_title` / `title_date_format` / `title_date_align` / `title_date_target` / `enable_add_end_to_title` を反映する。`$t` / `$s` / `$ns` / `$nt` / `$ntag` の拡張書式、`general_lastup` / `last_update` / `new_arrivals_date` / `convert` の日付対象、完結タグによる ` (完結)` 付与も対応
 - 保存済み `挿絵/<section-index>-<count>.<ext>` があれば HTML `<img>` を対応する青空文庫注記へローカルパスで復元する。`sample\\novel` の n8858hb section 16 で `［＃挿絵（挿絵/16-0.jpg）入る］` を確認済み
+- HTML 由来の story / section では Ruby版同様に `()` の暗黙ルビ推測を行わず、HTML `<ruby>` は `to_aozora` 経由の明示ルビとして保持する。`text` / `text/plain` / textfile では従来どおり `()` 暗黙ルビを処理する
 - Windows の `\\?\\C:\\...\\AozoraEpub3.jar` 形式パスは Java classpath にそのまま渡すと失敗するため、Ruby版同様に jar の basename を current_dir 基準で渡すよう修正した。`sample\\novel` で `device=epub` 実変換と `--no-epub` 抑止を確認済み
-- Windows で `〜` / `～` / `−` / `‼` / `⁇` / `⁈` / `⁉` / variation selector など Java/AozoraEpub3 側で出力名がずれやすい文字を含む小説パスは、AozoraEpub3 に本文・表紙・`挿絵/` を安全な一時ファイル名で渡し、生成後に本来の Unicode ファイル名へ戻す。`C:\\Users\\rumia\\Documents\\Narou` の n5853lh で EPUB 生成を確認済み
+- Windows で `〜` / `～` / `−` / `‼` / `⁇` / `⁈` / `⁉` / variation selector や CP932/Windows-31J 未定義文字 (`♠` / `♡` / `♢` / `♣` / `𠮷` など) を含み、Java/AozoraEpub3 側で出力名がずれやすい小説パスは、AozoraEpub3 に本文・表紙・`挿絵/` を安全な一時ファイル名で渡し、生成後に本来の Unicode ファイル名へ戻す。`C:\\Users\\rumia\\Documents\\Narou` の n5853lh で EPUB 生成を確認済み
 
 **注**: EPUB/MOBI 生成は AozoraEpub3.jar と kindlegen への依存がある。Rust 側のテキスト変換 (`novel.txt` 生成) は完了しているが、AozoraEpub3 の呼び出しパイプラインは別途必要。
 
@@ -548,6 +549,7 @@ narou setting name         # 読み取り
 - hidden global `server-max-targets-per-request` は WEB UI が 1 リクエストで送れる小説 ID の最大数。既定値 `100000`、未設定または 0 以下は既定にフォールバック（Web UI には表示しない）。蔵書数が極端に多い環境で `narou setting --global server-max-targets-per-request=200000` のように上書きできる
 - API の凍結/解凍操作と一覧上の `frozen` 判定は CLI と同じ `.narou/freeze.yaml` を優先し、`frozen` タグは補助的に扱う
 - queue worker が `.narou/queue.yaml` 永続キューを読み書きし、download / update / auto_update / convert / send / backup / mail の queued job を別プロセスまたは worker 内処理で実行する。Ruby版同様 `pending` / `running` を分けて保持し、legacy `cmd` / `args` / `meta` / `status` / `created_at` / `started_at` を維持したまま復元できる。`concurrency` 有効時は外部通信あり(download/update/auto_update)とその他(convert/send/backup/mail)を別 lane で並列実行し、無効時は全 job を投入順に逐次実行する
+- idle 中の queue worker は同一プロセス内の queue 更新通知で起床し、外部プロセスが `queue.yaml` を更新した場合だけ低頻度フォールバックで検出する。空キュー時に `.narou/queue.yaml` を 500ms ごとに読み続けない
 - Web 経由の convert job は `--no-open` で非対話化し、API 指定 device は worker 専用 override で child process に渡す
 - `queue_clear` は deadlock しないように永続キュー保存順を修正済み
 - local `update.auto-schedule.enable` / `update.auto-schedule` が有効なら、Ruby版同様に時刻指定で自動アップデートを Web queue に投入する。設定保存時は Ruby版同様に scheduler を stop/start し、サーバ再起動なしで変更を反映する
@@ -560,6 +562,8 @@ narou setting name         # 読み取り
 - `webui.theme` / `webui.table.reload-timing` / `webui.performance-mode` / `webui.debug-mode` 保存時は、開いている Web UI に設定再読み込みイベントを送り、テーマメニューの変更も `webui.theme` へ保存する
 - `webui.debug-mode` が ON のときは、Web worker が失敗 child process の直近 stdout/stderr を要約して `queue_failed` イベントに載せ、Web UI 通知とコンソールに詳細エラーを出す。OFF のときは従来どおり簡潔な失敗通知だけにする
 - Web UI のタグ編集は既存タグ一覧から入力中タグ名に一致する候補を表示し、タグ名クリック検索は `tag:`、作者名クリック検索は `author:`、掲載サイトクリック検索は `sitename:` を生成する。通常クリックは AND、Ctrl クリックは同一フィールド内 OR、Shift クリックは除外 AND、Shift+Ctrl クリックは除外 OR として検索文字列を更新する
+- Web UI の update 系は、ID 選択・タグ条件・modified followup など入口の違いに関わらず、最終的に通常の `update ID...` 実行経路へ合流する。タグ条件は受付時に ID snapshot を確定し、条件自体は queue meta に残す
+- Web UI の `tag` / `freeze` / `remove` 相当操作は、単体・一括とも child CLI の `tag` / `freeze` / `remove` を実行する経路へ合流し、target 解決、`tag_colors.yaml`、`freeze.yaml`、lock チェック等を CLI と同じ処理で扱う。Web の global settings API は複数設定保存・`replace.txt`・スケジューラ再起動を API 側でまとめつつ、設定名スコープ判定・値キャスト・`device` 変更時の派生設定補正を CLI `setting` と共有する `setting_core` に合流する
 - Web UI の単体/一括削除 API は削除成功時に console history へ削除ログを出力する。`concurrency` 有効時は非外部通信として `#console-stdout2`、無効時は `#console` を使う
 - Web UI の CSV ダウンロードは CLI `csv` の stdout を返し、export 項目を CLI と一致させる
 - Web サーバ起動時は Ruby版 `fill_general_all_no_in_database` 相当に、`general_all_no` 未設定レコードの `toc.yaml` を読んで話数をDBへ補完する
@@ -568,6 +572,7 @@ narou setting name         # 読み取り
 - `webui.theme` / `webui.performance-mode` / `webui.table.reload-timing` を `/api/webui/config` と worker 側設定参照経由で反映し、theme 初期値、performance auto/on/off 判定、table reload の every/queue 挙動へ接続する
 - レスポンシブ CSS を分離し、スマートフォン幅でも一覧・キュー・メモ帳を同じ asset 構成で表示できる
 - 一覧 API の `frozen` 取得は DB 再入ロックによる deadlock を避けるよう修正済み
+- 一覧 API の `new_arrivals` 判定は `webnovel/*.yaml` の `timezone` に合わせたサイト現地時刻で行い、`domain` 未保存の既存データは `toc_url` のドメインからサイト定義を解決する
 - favicon は data URL で埋め込み、追加 route なしでブラウザ 404 を出さない
 
 **不足動作**:

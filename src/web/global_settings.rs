@@ -1,12 +1,13 @@
 use axum::{extract::State, response::Json};
 use std::collections::HashMap;
-use std::path::Path;
 
 use crate::converter::device::Device;
+use crate::setting_core::{
+    SettingScope, apply_device_related_settings, coerce_json_setting_value, setting_scope,
+};
 use crate::setting_info::{
-    SettingVariables, VarInfo, VarType, default_arg_command_names, is_known_default_arg_name,
-    default_local_setting_value, original_setting_var_infos, setting_variables, tab_for_setting,
-    webui_help_override,
+    VarInfo, VarType, default_arg_command_names, default_local_setting_value,
+    original_setting_var_infos, setting_variables, tab_for_setting, webui_help_override,
 };
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::db::with_database;
@@ -160,12 +161,6 @@ pub async fn save_global_settings(
         });
     };
 
-    let vars = setting_variables();
-    let novel_vars: HashMap<String, VarInfo> = original_setting_var_infos()
-        .into_iter()
-        .map(|(name, info)| (name.to_string(), info))
-        .collect();
-
     // Separate into local and global
     let mut local_changes: HashMap<String, serde_yaml::Value> = HashMap::new();
     let mut global_changes: HashMap<String, serde_yaml::Value> = HashMap::new();
@@ -176,18 +171,23 @@ pub async fn save_global_settings(
 
     for (name, json_val) in entries {
         // Determine scope
-        let is_global = vars.global.iter().any(|(n, _)| *n == name.as_str());
+        let scope = setting_scope(name);
 
         if json_val.is_null() {
-            if is_global {
-                deletes_global.push(name.clone());
-            } else {
-                deletes_local.push(name.clone());
+            match scope {
+                Some(SettingScope::Global) => deletes_global.push(name.clone()),
+                Some(SettingScope::Local) => deletes_local.push(name.clone()),
+                None => {
+                    return Json(ApiResponse {
+                        success: false,
+                        message: format!("{}: 不明な設定名です", name),
+                    });
+                }
             }
             continue;
         }
 
-        let yaml_val = match coerce_setting_value(name, json_val, &vars, &novel_vars) {
+        let yaml_val = match coerce_json_setting_value(name, json_val) {
             Ok(value) => value,
             Err(message) => {
                 return Json(ApiResponse {
@@ -196,10 +196,19 @@ pub async fn save_global_settings(
                 });
             }
         };
-        if is_global {
-            global_changes.insert(name.clone(), yaml_val);
-        } else {
-            local_changes.insert(name.clone(), yaml_val);
+        match scope {
+            Some(SettingScope::Global) => {
+                global_changes.insert(name.clone(), yaml_val);
+            }
+            Some(SettingScope::Local) => {
+                local_changes.insert(name.clone(), yaml_val);
+            }
+            None => {
+                return Json(ApiResponse {
+                    success: false,
+                    message: format!("{}: 不明な設定名です", name),
+                });
+            }
         }
     }
 
@@ -219,7 +228,7 @@ pub async fn save_global_settings(
                 settings.remove(k);
             }
             if setting_string(settings.get("device")) != previous_device {
-                apply_device_related_settings(&mut settings);
+                let _ = apply_device_related_settings(&mut settings);
             }
             inv.save("local_setting", InventoryScope::Local, &settings)?;
             Ok(auto_schedule_before != auto_schedule_snapshot(&settings))
@@ -420,187 +429,11 @@ fn yaml_to_json(value: Option<serde_yaml::Value>) -> serde_json::Value {
     }
 }
 
-fn coerce_setting_value(
-    name: &str,
-    value: &serde_json::Value,
-    vars: &SettingVariables,
-    novel_vars: &HashMap<String, VarInfo>,
-) -> Result<serde_yaml::Value, String> {
-    if let Some(info) = vars.get(name) {
-        return coerce_value_for_type(info, value);
-    }
-    if let Some(base_name) = name
-        .strip_prefix("default.")
-        .or_else(|| name.strip_prefix("force."))
-    {
-        if let Some(info) = novel_vars.get(base_name) {
-            return coerce_value_for_type(info, value);
-        }
-    }
-    if is_known_default_arg_name(name) {
-        return coerce_string_value(value);
-    }
-    Err("不明な設定名です".to_string())
-}
-
-fn coerce_value_for_type(info: &VarInfo, value: &serde_json::Value) -> Result<serde_yaml::Value, String> {
-    match info.var_type {
-        VarType::Boolean => coerce_bool_value(value),
-        VarType::Integer => coerce_integer_value(value),
-        VarType::Float => coerce_float_value(value),
-        VarType::String => coerce_string_value(value),
-        VarType::Select => coerce_select_value(value, info.select_keys.as_deref()),
-        VarType::Multiple => coerce_multiple_value(value, info.select_keys.as_deref()),
-        VarType::Directory => coerce_directory_value(value),
-    }
-}
-
-fn coerce_bool_value(value: &serde_json::Value) -> Result<serde_yaml::Value, String> {
-    match value {
-        serde_json::Value::Bool(flag) => Ok(serde_yaml::Value::Bool(*flag)),
-        serde_json::Value::String(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-            "true" => Ok(serde_yaml::Value::Bool(true)),
-            "false" => Ok(serde_yaml::Value::Bool(false)),
-            _ => Err("true か false を指定して下さい".to_string()),
-        },
-        _ => Err("true か false を指定して下さい".to_string()),
-    }
-}
-
-fn coerce_integer_value(value: &serde_json::Value) -> Result<serde_yaml::Value, String> {
-    let number = match value {
-        serde_json::Value::Number(raw) => raw
-            .as_i64()
-            .ok_or_else(|| "整数を指定して下さい".to_string())?,
-        serde_json::Value::String(raw) => raw
-            .trim()
-            .parse::<i64>()
-            .map_err(|_| "整数を指定して下さい".to_string())?,
-        _ => return Err("整数を指定して下さい".to_string()),
-    };
-    Ok(serde_yaml::Value::Number(serde_yaml::Number::from(number)))
-}
-
-fn coerce_float_value(value: &serde_json::Value) -> Result<serde_yaml::Value, String> {
-    let number = match value {
-        serde_json::Value::Number(raw) => raw
-            .as_f64()
-            .ok_or_else(|| "数値を指定して下さい".to_string())?,
-        serde_json::Value::String(raw) => raw
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| "数値を指定して下さい".to_string())?,
-        _ => return Err("数値を指定して下さい".to_string()),
-    };
-    Ok(serde_yaml::Value::Number(serde_yaml::Number::from(number)))
-}
-
-fn coerce_string_value(value: &serde_json::Value) -> Result<serde_yaml::Value, String> {
-    match value {
-        serde_json::Value::String(raw) => Ok(serde_yaml::Value::String(raw.clone())),
-        serde_json::Value::Number(raw) => Ok(serde_yaml::Value::String(raw.to_string())),
-        serde_json::Value::Bool(raw) => Ok(serde_yaml::Value::String(raw.to_string())),
-        _ => Err("文字列を指定して下さい".to_string()),
-    }
-}
-
-fn coerce_select_value(
-    value: &serde_json::Value,
-    select_keys: Option<&[String]>,
-) -> Result<serde_yaml::Value, String> {
-    let selected = match value {
-        serde_json::Value::String(raw) => raw.clone(),
-        _ => return Err("選択肢の中から指定して下さい".to_string()),
-    };
-    if let Some(keys) = select_keys {
-        if !keys.iter().any(|key| key == &selected) {
-            return Err(format!(
-                "不明な値です。{} の中から指定して下さい",
-                keys.join(", ")
-            ));
-        }
-    }
-    Ok(serde_yaml::Value::String(selected))
-}
-
-fn coerce_multiple_value(
-    value: &serde_json::Value,
-    select_keys: Option<&[String]>,
-) -> Result<serde_yaml::Value, String> {
-    let raw = match value {
-        serde_json::Value::String(raw) => raw.clone(),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .map(|item| match item {
-                serde_json::Value::String(text) => Ok(text.clone()),
-                _ => Err("複数選択の値が不正です".to_string()),
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .join(","),
-        _ => return Err("複数選択の値が不正です".to_string()),
-    };
-    if let Some(keys) = select_keys {
-        for part in raw.split(',').map(str::trim).filter(|part| !part.is_empty()) {
-            if !keys.iter().any(|key| key == part) {
-                return Err(format!(
-                    "不明な値です。{} の中から指定して下さい",
-                    keys.join(", ")
-                ));
-            }
-        }
-    }
-    Ok(serde_yaml::Value::String(raw))
-}
-
-fn coerce_directory_value(value: &serde_json::Value) -> Result<serde_yaml::Value, String> {
-    let raw = match value {
-        serde_json::Value::String(raw) => raw.trim(),
-        _ => return Err("存在するフォルダを指定して下さい".to_string()),
-    };
-    let path = Path::new(raw);
-    if !path.is_dir() {
-        return Err("存在するフォルダを指定して下さい".to_string());
-    }
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|_| "存在するフォルダを指定して下さい".to_string())?;
-    Ok(serde_yaml::Value::String(
-        strip_extended_path_prefix(canonical)
-            .to_string_lossy()
-            .to_string(),
-    ))
-}
-
-fn strip_extended_path_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
-    #[cfg(windows)]
-    {
-        let raw = path.to_string_lossy();
-        if let Some(rest) = raw.strip_prefix(r"\\?\") {
-            return std::path::PathBuf::from(rest);
-        }
-    }
-    path
-}
-
 fn setting_string(value: Option<&serde_yaml::Value>) -> Option<String> {
     match value {
         Some(serde_yaml::Value::String(raw)) => Some(raw.clone()),
         _ => None,
     }
-}
-
-fn apply_device_related_settings(settings: &mut HashMap<String, serde_yaml::Value>) {
-    let Some(device) = setting_string(settings.get("device")) else {
-        return;
-    };
-    let desired_half_indent = match device.to_ascii_lowercase().as_str() {
-        "kindle" => true,
-        "kobo" | "epub" | "ibunko" | "reader" | "ibooks" => false,
-        _ => return,
-    };
-    settings.insert(
-        "default.enable_half_indent_bracket".to_string(),
-        serde_yaml::Value::Bool(desired_half_indent),
-    );
 }
 
 #[cfg(test)]
@@ -609,35 +442,17 @@ mod tests {
 
     #[test]
     fn coerce_float_setting_from_string() {
-        let vars = setting_variables();
-        let novel_vars: HashMap<String, VarInfo> = original_setting_var_infos()
-            .into_iter()
-            .map(|(name, info)| (name.to_string(), info))
-            .collect();
-        let value = coerce_setting_value(
-            "update.interval",
-            &serde_json::json!("1.5"),
-            &vars,
-            &novel_vars,
-        )
-        .unwrap();
+        let value =
+            coerce_json_setting_value("update.interval", &serde_json::json!("1.5")).unwrap();
         assert_eq!(value, serde_yaml::Value::Number(serde_yaml::Number::from(1.5)));
     }
 
     #[test]
     fn coerce_select_setting_rejects_unknown_value() {
-        let vars = setting_variables();
-        let novel_vars: HashMap<String, VarInfo> = original_setting_var_infos()
-            .into_iter()
-            .map(|(name, info)| (name.to_string(), info))
-            .collect();
-        assert!(coerce_setting_value(
-            "webui.table.reload-timing",
-            &serde_json::json!("invalid"),
-            &vars,
-            &novel_vars,
-        )
-        .is_err());
+        assert!(
+            coerce_json_setting_value("webui.table.reload-timing", &serde_json::json!("invalid"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -646,7 +461,7 @@ mod tests {
             "device".to_string(),
             serde_yaml::Value::String("kobo".to_string()),
         )]);
-        apply_device_related_settings(&mut settings);
+        let _ = apply_device_related_settings(&mut settings);
         assert_eq!(
             settings.get("default.enable_half_indent_bracket"),
             Some(&serde_yaml::Value::Bool(false))

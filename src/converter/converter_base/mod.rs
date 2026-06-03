@@ -25,6 +25,7 @@ pub struct ConverterBase {
     pub force_indent_chapter_stash: Vec<String>,
     pub text_type: TextType,
     pub use_dakuten_font: bool,
+    pub(crate) enable_parenthesized_ruby: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -52,6 +53,7 @@ impl ConverterBase {
             force_indent_chapter_stash: Vec::new(),
             text_type: TextType::Body,
             use_dakuten_font: false,
+            enable_parenthesized_ruby: true,
         }
     }
 
@@ -68,6 +70,7 @@ impl ConverterBase {
             force_indent_chapter_stash: Vec::new(),
             text_type: TextType::Body,
             use_dakuten_font: false,
+            enable_parenthesized_ruby: true,
         }
     }
 
@@ -84,6 +87,7 @@ impl ConverterBase {
             force_indent_chapter_stash: Vec::new(),
             text_type: TextType::Body,
             use_dakuten_font: false,
+            enable_parenthesized_ruby: true,
         }
     }
 
@@ -104,6 +108,7 @@ impl ConverterBase {
             force_indent_chapter_stash: Vec::new(),
             text_type: TextType::Body,
             use_dakuten_font: false,
+            enable_parenthesized_ruby: true,
         }
     }
 
