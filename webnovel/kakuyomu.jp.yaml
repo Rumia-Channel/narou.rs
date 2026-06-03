@@ -13,7 +13,7 @@ confirm_over18: no
 append_title_to_folder_name: yes
 title_strip_pattern: null
 sitename: *name
-version: 2.3
+version: 2.4
 
 # ------------------------------------------------------------
 # 前処理設定 (DSL — pest parser で実行)
@@ -37,7 +37,7 @@ preprocess: |-
   let toc = toc.flat_map { |item| [item.chapter, item.episodeUnions] }
   let toc = toc.compact
   let toc = toc.map { |item| data[item.__ref] }
-  let toc = toc.map { |item| [item.__typename, item.level, item.id, item.publishedAt, item.title].compact.join(";") }
+  let toc = toc.map { |item| [item.__typename, item.level, item.id, item.publishedAt, item.editedAt || item.publishedAt, item.title].compact.join(";") }
 
   # Author: resolve __ref → activityName
   let author_ref = work.author.__ref
@@ -92,7 +92,7 @@ subtitles: |-
   (?x)
   ^(?:Chapter;1;\d+;(?<chapter>.+?)\n)?
   (?:Chapter;2;\d+;(?<subchapter>.+?)\n)?
-  Episode;(?<index>\d+);(?<subupdate>.+?);(?<subtitle>.+?)$
+  Episode;(?<index>\d+);(?<subdate>.+?);(?<subupdate>.+?);(?<subtitle>.+?)$
 href: /works/\\k<ncode>/episodes/\\k<index>
 
 # ------------------------------------------------------------
