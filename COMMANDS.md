@@ -563,6 +563,7 @@ narou setting name         # 読み取り
 - `webui.debug-mode` が ON のときは、Web worker が失敗 child process の直近 stdout/stderr を要約して `queue_failed` イベントに載せ、Web UI 通知とコンソールに詳細エラーを出す。OFF のときは従来どおり簡潔な失敗通知だけにする
 - Web UI のタグ編集は既存タグ一覧から入力中タグ名に一致する候補を表示し、タグ名クリック検索は `tag:`、作者名クリック検索は `author:`、掲載サイトクリック検索は `sitename:` を生成する。通常クリックは AND、Ctrl クリックは同一フィールド内 OR、Shift クリックは除外 AND、Shift+Ctrl クリックは除外 OR として検索文字列を更新する
 - Web UI の update 系は、ID 選択・タグ条件・modified followup など入口の違いに関わらず、最終的に通常の `update ID...` 実行経路へ合流する。タグ条件は受付時に ID snapshot を確定し、条件自体は queue meta に残す
+- Web UI の `tag` / `freeze` / `remove` 相当操作は、単体・一括とも child CLI の `tag` / `freeze` / `remove` を実行する経路へ合流し、target 解決、`tag_colors.yaml`、`freeze.yaml`、lock チェック等を CLI と同じ処理で扱う。Web の global settings API は複数設定保存・`replace.txt`・スケジューラ再起動を API 側でまとめつつ、設定名スコープ判定・値キャスト・`device` 変更時の派生設定補正を CLI `setting` と共有する `setting_core` に合流する
 - Web UI の単体/一括削除 API は削除成功時に console history へ削除ログを出力する。`concurrency` 有効時は非外部通信として `#console-stdout2`、無効時は `#console` を使う
 - Web UI の CSV ダウンロードは CLI `csv` の stdout を返し、export 項目を CLI と一致させる
 - Web サーバ起動時は Ruby版 `fill_general_all_no_in_database` 相当に、`general_all_no` 未設定レコードの `toc.yaml` を読んで話数をDBへ補完する

@@ -1,17 +1,15 @@
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
 
 use narou_rs::compat::confirm;
 use narou_rs::converter::ini::{IniData, IniValue};
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::db::inventory::{Inventory, InventoryScope};
 use narou_rs::db::{novel_dir_for_record, with_database};
-use narou_rs::setting_info::{
-    self, default_arg_command_names,
-    is_known_default_arg_name as shared_is_known_default_arg_name, SettingVariables, VarInfo,
-    VarType,
+use narou_rs::setting_core::{
+    SettingScope as Scope, apply_device_related_settings, cast_setting_value, setting_scope,
+    var_type_description, yaml_value_display,
 };
+use narou_rs::setting_info::{self, SettingVariables, VarInfo, VarType, default_arg_command_names};
 
 use super::download::{get_data_by_target, tagname_to_ids};
 
@@ -149,150 +147,12 @@ fn split_arg(arg: &str) -> (String, Option<String>) {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Scope {
-    Local,
-    Global,
-}
-
 fn get_scope_of_variable_name(name: &str) -> Option<Scope> {
-    let vars = setting_variables();
-    if vars.local.iter().any(|(n, _)| *n == name) {
-        return Some(Scope::Local);
-    }
-    if vars.global.iter().any(|(n, _)| *n == name) {
-        return Some(Scope::Global);
-    }
-    if name
-        .strip_prefix("default.")
-        .or_else(|| name.strip_prefix("force."))
-        .is_some_and(|rest| original_setting_var_info(rest).is_some())
-    {
-        return Some(Scope::Local);
-    }
-    if is_known_default_arg_name(name) {
-        return Some(Scope::Local);
-    }
-    None
-}
-
-fn is_known_default_arg_name(name: &str) -> bool {
-    shared_is_known_default_arg_name(name)
+    setting_scope(name)
 }
 
 fn cast_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> {
-    if let Some(info) = setting_variables().get(name) {
-        return cast_value_for_type(info.var_type, value_str, info.select_keys.as_deref());
-    }
-
-    if let Some(rest) = name
-        .strip_prefix("default.")
-        .or_else(|| name.strip_prefix("force."))
-    {
-        if let Some(info) = original_setting_var_info(rest) {
-            return cast_value_for_type(info.var_type, value_str, info.select_keys.as_deref());
-        }
-    }
-
-    if is_known_default_arg_name(name) {
-        return Ok(serde_yaml::Value::String(value_str.to_string()));
-    }
-
-    Err(format!("{} は不明な名前です", name))
-}
-
-fn cast_value_for_type(
-    var_type: VarType,
-    value_str: &str,
-    select_keys: Option<&[String]>,
-) -> Result<serde_yaml::Value, String> {
-    match var_type {
-        VarType::Select => {
-            if let Some(keys) = select_keys {
-                if !keys.iter().any(|k| k == value_str) {
-                    return Err(format!(
-                        "不明な値です。{} の中から指定して下さい",
-                        keys.join(", ")
-                    ));
-                }
-            }
-            Ok(serde_yaml::Value::String(value_str.to_string()))
-        }
-        VarType::Multiple => {
-            if let Some(keys) = select_keys {
-                for part in value_str.split(',') {
-                    if !keys.iter().any(|k| k == part) {
-                        return Err(format!(
-                            "不明な値です。{} の中から指定して下さい",
-                            keys.join(", ")
-                        ));
-                    }
-                }
-            }
-            Ok(serde_yaml::Value::String(value_str.to_string()))
-        }
-        VarType::Boolean => {
-            let lower = value_str.trim().to_ascii_lowercase();
-            match lower.as_str() {
-                "true" => Ok(serde_yaml::Value::Bool(true)),
-                "false" => Ok(serde_yaml::Value::Bool(false)),
-                _ => Err(format!(
-                    "値が {} ではありません",
-                    var_type_description(VarType::Boolean).trim_end()
-                )),
-            }
-        }
-        VarType::Integer => value_str
-            .parse::<i64>()
-            .map(|i| serde_yaml::Value::Number(i.into()))
-            .map_err(|_| {
-                format!(
-                    "値が {} ではありません",
-                    var_type_description(VarType::Integer).trim_end()
-                )
-            }),
-        VarType::Float => value_str
-            .parse::<f64>()
-            .map(|f| serde_yaml::Value::Number(serde_yaml::Number::from(f)))
-            .map_err(|_| {
-                format!(
-                    "値が {} ではありません",
-                    var_type_description(VarType::Float).trim_end()
-                )
-            }),
-        VarType::String => Ok(serde_yaml::Value::String(value_str.to_string())),
-        VarType::Directory => {
-            let path = Path::new(value_str);
-            if !path.is_dir() {
-                return Err(format!(
-                    "値が {} ではありません",
-                    var_type_description(VarType::Directory).trim_end()
-                ));
-            }
-            let expanded = fs::canonicalize(path).map_err(|_| {
-                format!(
-                    "値が {} ではありません",
-                    var_type_description(VarType::Directory).trim_end()
-                )
-            })?;
-            Ok(serde_yaml::Value::String(
-                strip_extended_path_prefix(expanded)
-                    .to_string_lossy()
-                    .to_string(),
-            ))
-        }
-    }
-}
-
-fn strip_extended_path_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
-    #[cfg(windows)]
-    {
-        let s = path.to_string_lossy();
-        if let Some(rest) = s.strip_prefix(r"\\?\") {
-            return std::path::PathBuf::from(rest);
-        }
-    }
-    path
+    cast_setting_value(name, value_str)
 }
 
 fn output_setting_list(inv: &Inventory) {
@@ -500,47 +360,18 @@ fn burn_default_settings(
 }
 
 fn modify_settings_when_device_changed(settings: &mut HashMap<String, serde_yaml::Value>) {
-    let Some(device) = settings.get("device").and_then(|value| match value {
-        serde_yaml::Value::String(s) => Some(s.to_string()),
-        _ => None,
-    }) else {
+    let Some(changed) = apply_device_related_settings(settings) else {
         return;
     };
-
-    let device_key = device.to_ascii_lowercase();
-    let display_name = match device_key.as_str() {
-        "kindle" => "Kindle",
-        "kobo" => "Kobo",
-        "epub" => "EPUB",
-        "ibunko" => "i文庫",
-        "reader" => "SonyReader",
-        "ibooks" => "iBooks",
-        _ => return,
-    };
-
-    let desired_half_indent = device_key == "kindle";
-    let related = [(
-        "default.enable_half_indent_bracket",
-        serde_yaml::Value::Bool(desired_half_indent),
-    )];
-
-    let mut changed = Vec::new();
-    for (name, new_value) in related {
-        if settings.get(name) != Some(&new_value) {
-            settings.insert(name.to_string(), new_value.clone());
-            changed.push((name, new_value));
-        }
-    }
-
-    if changed.is_empty() {
+    if changed.changes.is_empty() {
         return;
     }
 
     println!(
         "端末を{}に指定したことで、以下の関連設定が変更されました",
-        display_name
+        changed.device_display_name
     );
-    for (name, value) in changed {
+    for (name, value) in changed.changes {
         println!(
             "  → {} が {} に変更されました",
             name,
@@ -743,39 +574,15 @@ fn yaml_to_ini_value(v: &serde_yaml::Value) -> IniValue {
 }
 
 fn format_yaml_value(v: &serde_yaml::Value) -> String {
-    match v {
-        serde_yaml::Value::Bool(b) => b.to_string(),
-        serde_yaml::Value::Number(n) => n.to_string(),
-        serde_yaml::Value::String(s) => s.clone(),
-        serde_yaml::Value::Null => String::new(),
-        other => format!("{:?}", other),
-    }
+    yaml_value_display(v)
 }
 
 fn original_setting_var_infos() -> Vec<(&'static str, VarInfo)> {
     setting_info::original_setting_var_infos()
 }
 
-fn original_setting_var_info(name: &str) -> Option<VarInfo> {
-    original_setting_var_infos()
-        .into_iter()
-        .find(|(setting_name, _)| *setting_name == name)
-        .map(|(_, info)| info)
-}
-
 fn setting_variables() -> SettingVariables {
     setting_info::setting_variables()
-}
-
-fn var_type_description(vt: VarType) -> &'static str {
-    match vt {
-        VarType::Boolean => "true/false  ",
-        VarType::Integer => "整数        ",
-        VarType::Float => "小数点数    ",
-        VarType::String | VarType::Select => "文字列      ",
-        VarType::Directory => "フォルダパス",
-        VarType::Multiple => "文字列(複数)",
-    }
 }
 
 #[cfg(test)]
