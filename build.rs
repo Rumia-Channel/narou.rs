@@ -6,6 +6,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    configure_windows_uac_manifest();
+
     println!("cargo:rerun-if-env-changed=NAROU_RS_VERSION_OVERRIDE");
     if let Ok(override_version) = std::env::var("NAROU_RS_VERSION_OVERRIDE") {
         let trimmed = override_version.trim();
@@ -61,6 +63,21 @@ fn main() {
     writeln!(file, "        _ => None,").expect("write asset version default");
     writeln!(file, "    }}").expect("write asset version footer");
     writeln!(file, "}}").expect("write asset version end");
+}
+
+fn configure_windows_uac_manifest() {
+    if std::env::var_os("CARGO_CFG_WINDOWS").is_none() {
+        return;
+    }
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+        return;
+    }
+
+    // Avoid Windows installer/updater heuristics for test harness names such as narou_rs_updater.
+    for target in ["bins", "tests"] {
+        println!("cargo:rustc-link-arg-{target}=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg-{target}=/MANIFESTUAC:level='asInvoker' uiAccess='false'");
+    }
 }
 
 fn collect_assets(root: &Path, dir: &Path, output: &mut Vec<(String, String)>) {
