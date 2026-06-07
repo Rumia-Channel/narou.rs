@@ -73,16 +73,44 @@ fn kakuyomu_sample_matches_narou_rb_reference_byte_for_byte() {
         let mut converter = NovelConverter::new(settings);
         let output = convert_sample_to_string(&mut converter, &path);
         let reference_bytes = fs::read(&reference).unwrap();
+        let output_bytes = output.into_bytes();
         assert_eq!(
-            output.into_bytes(),
+            output_bytes,
             reference_bytes,
-            "reference mismatch for {}",
-            path.display()
+            "{}",
+            first_mismatch_report(&path, &output_bytes, &reference_bytes)
         );
         checked += 1;
     }
 
     assert!(checked > 0, "reference output fixture");
+}
+
+fn first_mismatch_report(path: &Path, output: &[u8], reference: &[u8]) -> String {
+    let output_text = String::from_utf8_lossy(output);
+    let reference_text = String::from_utf8_lossy(reference);
+    let output_lines = output_text.lines().collect::<Vec<_>>();
+    let reference_lines = reference_text.lines().collect::<Vec<_>>();
+    let max_lines = output_lines.len().max(reference_lines.len());
+    for idx in 0..max_lines {
+        let out = output_lines.get(idx).copied().unwrap_or("<missing>");
+        let expected = reference_lines.get(idx).copied().unwrap_or("<missing>");
+        if out != expected {
+            return format!(
+                "reference mismatch for {}\nline {}\noutput:   {:?}\nexpected: {:?}",
+                path.display(),
+                idx + 1,
+                out,
+                expected
+            );
+        }
+    }
+    format!(
+        "reference mismatch for {}\nbytes differ only outside line text: output={} reference={}",
+        path.display(),
+        output.len(),
+        reference.len()
+    )
 }
 
 fn convert_sample_to_string(converter: &mut NovelConverter, novel_dir: &Path) -> String {
