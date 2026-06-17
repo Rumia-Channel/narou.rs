@@ -1,8 +1,10 @@
 use std::ffi::OsString;
 use std::fmt;
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::SystemTime;
 
 use encoding_rs::SHIFT_JIS;
@@ -336,6 +338,26 @@ impl OutputManager {
         args
     }
 
+    /// AozoraEpub3 がコマンドライン引数の日本語パスを正しく解釈できるよう、
+    /// 子プロセスのロケールを UTF-8 系に固定する。
+    /// 親プロセスが非 UTF-8 ロケール (例: LC_ALL=C) だと、Java が受け取るパスが
+    /// 文字化けし「dst path not exist」で失敗するため。
+    fn configure_aozora_locale(cmd: &mut Command) {
+        if cfg!(windows) {
+            return;
+        }
+        let current = std::env::var("LC_ALL")
+            .or_else(|_| std::env::var("LC_CTYPE"))
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_default();
+        let lower = current.to_lowercase();
+        let is_utf8 = lower.contains("utf-8") || lower.contains("utf8");
+        if !is_utf8 {
+            cmd.env("LC_ALL", "C.UTF-8");
+            cmd.env("LANG", "C.UTF-8");
+        }
+    }
+
     fn build_aozora_command(&self) -> Result<(Command, PathBuf)> {
         let tool_path = normalize_windows_verbatim_path(
             self.aozora_epub3_path
@@ -372,6 +394,7 @@ impl OutputManager {
 
         sanitize_java_command(&mut cmd);
         configure_hidden_console_command(&mut cmd);
+        Self::configure_aozora_locale(&mut cmd);
         cmd.current_dir(&working_dir);
         Ok((cmd, working_dir))
     }
@@ -415,8 +438,8 @@ impl OutputManager {
             cmd.arg(arg);
         }
         if !self.verbose {
-            cmd.stdout(Stdio::null());
-            cmd.stderr(Stdio::null());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
         }
 
         let started_at = SystemTime::now();
@@ -424,12 +447,33 @@ impl OutputManager {
             .spawn()
             .map_err(|e| NarouError::Conversion(format!("Failed to run AozoraEpub3: {}", e)))?;
 
-        let status = if self.verbose {
+        let (status, captured_stdout, captured_stderr) = if self.verbose {
             eprintln!("AozoraEpub3でEPUBに変換しています");
-            child
+            let status = child
                 .wait()
-                .map_err(|e| NarouError::Conversion(format!("Failed to run AozoraEpub3: {}", e)))?
+                .map_err(|e| NarouError::Conversion(format!("Failed to run AozoraEpub3: {}", e)))?;
+            (status, None, None)
         } else {
+            let stdout = child.stdout.take().ok_or_else(|| {
+                NarouError::Conversion("Failed to capture AozoraEpub3 stdout".into())
+            })?;
+            let stderr = child.stderr.take().ok_or_else(|| {
+                NarouError::Conversion("Failed to capture AozoraEpub3 stderr".into())
+            })?;
+
+            let (stdout_tx, stdout_rx) = mpsc::channel();
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = BufReader::new(stdout).read_to_end(&mut buf);
+                let _ = stdout_tx.send(buf);
+            });
+            let (stderr_tx, stderr_rx) = mpsc::channel();
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = BufReader::new(stderr).read_to_end(&mut buf);
+                let _ = stderr_tx.send(buf);
+            });
+
             eprint!("AozoraEpub3でEPUBに変換しています");
             let _ = std::io::stderr().flush();
             let status = loop {
@@ -445,27 +489,34 @@ impl OutputManager {
                 }
             };
             eprintln!();
-            status
+
+            let stdout_bytes = stdout_rx.recv().unwrap_or_default();
+            let stderr_bytes = stderr_rx.recv().unwrap_or_default();
+            (status, Some(stdout_bytes), Some(stderr_bytes))
         };
+
+        let captured_output_summary = build_aozora_output_summary(captured_stdout, captured_stderr);
 
         if !status.success() {
             return Err(NarouError::Conversion(format!(
-                "AozoraEpub3 exited with status: {}",
-                status
+                "AozoraEpub3 exited with status: {}{}",
+                status, captured_output_summary
             )));
         }
 
         if !actual_aozora_output_path.exists() {
             return Err(NarouError::Conversion(format!(
-                "AozoraEpub3 did not create expected output: {}",
-                output_path.display()
+                "AozoraEpub3 did not create expected output: {}{}",
+                output_path.display(),
+                captured_output_summary
             )));
         }
 
         if !aozora_output_looks_generated(&actual_aozora_output_path, started_at)? {
             return Err(NarouError::Conversion(format!(
-                "AozoraEpub3 did not update expected output: {}",
-                output_path.display()
+                "AozoraEpub3 did not update expected output: {}{}",
+                output_path.display(),
+                captured_output_summary
             )));
         }
 
@@ -1141,6 +1192,48 @@ fn aozora_output_looks_generated(output_path: &Path, started_at: SystemTime) -> 
     Ok(modified_is_newer || metadata.len() > 0)
 }
 
+fn build_aozora_output_summary(stdout: Option<Vec<u8>>, stderr: Option<Vec<u8>>) -> String {
+    let stdout_text = stdout
+        .filter(|b| !b.is_empty())
+        .map(|b| String::from_utf8_lossy(&b).into_owned());
+    let stderr_text = stderr
+        .filter(|b| !b.is_empty())
+        .map(|b| String::from_utf8_lossy(&b).into_owned());
+
+    let mut summary = String::new();
+    if let Some(text) = stdout_text {
+        summary.push_str("\nAozoraEpub3 stdout:\n");
+        summary.push_str(&truncate_output_for_error(&text));
+    }
+    if let Some(text) = stderr_text {
+        summary.push_str("\nAozoraEpub3 stderr:\n");
+        summary.push_str(&truncate_output_for_error(&text));
+    }
+    summary
+}
+
+fn truncate_output_for_error(text: &str) -> String {
+    const MAX_LINES: usize = 80;
+    const MAX_BYTES: usize = 16 * 1024;
+
+    let mut lines: Vec<&str> = text.lines().collect();
+    let mut suffix = String::new();
+    if lines.len() > MAX_LINES {
+        let dropped = lines.len() - MAX_LINES;
+        lines.truncate(MAX_LINES);
+        suffix.push('\n');
+        suffix.push_str(&format!("... ({} earlier lines omitted)", dropped));
+    }
+
+    let mut result = lines.join("\n");
+    result.push_str(&suffix);
+    if result.len() > MAX_BYTES {
+        result.truncate(MAX_BYTES);
+        result.push_str("\n... (output truncated)");
+    }
+    result
+}
+
 fn decode_ibunko_html_entities(text: &str) -> String {
     let mut data = text
         .replace("&quot;", "\"")
@@ -1232,9 +1325,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        Device, OutputManager, StripError, absolutize_path, decode_ibunko_html_entities,
-        path_contains_windows_aozora_risky_chars, prepare_aozora_invocation,
-        normalize_windows_verbatim_path, strip_mobi_sources,
+        Device, OutputManager, StripError, absolutize_path, build_aozora_output_summary,
+        decode_ibunko_html_entities, path_contains_windows_aozora_risky_chars,
+        prepare_aozora_invocation, normalize_windows_verbatim_path, strip_mobi_sources,
+        truncate_output_for_error,
     };
 
     fn test_output_manager(device: Device) -> OutputManager {
@@ -1434,5 +1528,39 @@ mod tests {
             err.to_string(),
             StripError::no_sources_section().to_string()
         );
+    }
+
+    #[test]
+    fn aozora_output_summary_includes_stdout_and_stderr() {
+        let summary = build_aozora_output_summary(
+            Some(b"stdout line\n".to_vec()),
+            Some(b"stderr line\n".to_vec()),
+        );
+        assert!(summary.contains("AozoraEpub3 stdout"));
+        assert!(summary.contains("stdout line"));
+        assert!(summary.contains("AozoraEpub3 stderr"));
+        assert!(summary.contains("stderr line"));
+    }
+
+    #[test]
+    fn aozora_output_summary_omits_empty_streams() {
+        let summary = build_aozora_output_summary(Some(b"only stdout".to_vec()), Some(Vec::new()));
+        assert!(summary.contains("only stdout"));
+        assert!(!summary.contains("stderr"));
+    }
+
+    #[test]
+    fn aozora_output_summary_is_empty_when_nothing_captured() {
+        let summary = build_aozora_output_summary(None, None);
+        assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn truncate_output_for_error_limits_lines_and_bytes() {
+        let many_lines: String = (0..100).map(|i| format!("line {}\n", i)).collect();
+        let truncated = truncate_output_for_error(&many_lines);
+        assert!(truncated.contains("... (20 earlier lines omitted)"));
+        let line_count = truncated.lines().count();
+        assert!(line_count <= 82, "expected <= 82, got {}", line_count);
     }
 }
