@@ -338,6 +338,26 @@ impl OutputManager {
         args
     }
 
+    /// AozoraEpub3 がコマンドライン引数の日本語パスを正しく解釈できるよう、
+    /// 子プロセスのロケールを UTF-8 系に固定する。
+    /// 親プロセスが非 UTF-8 ロケール (例: LC_ALL=C) だと、Java が受け取るパスが
+    /// 文字化けし「dst path not exist」で失敗するため。
+    fn configure_aozora_locale(cmd: &mut Command) {
+        if cfg!(windows) {
+            return;
+        }
+        let current = std::env::var("LC_ALL")
+            .or_else(|_| std::env::var("LC_CTYPE"))
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_default();
+        let lower = current.to_lowercase();
+        let is_utf8 = lower.contains("utf-8") || lower.contains("utf8");
+        if !is_utf8 {
+            cmd.env("LC_ALL", "C.UTF-8");
+            cmd.env("LANG", "C.UTF-8");
+        }
+    }
+
     fn build_aozora_command(&self) -> Result<(Command, PathBuf)> {
         let tool_path = normalize_windows_verbatim_path(
             self.aozora_epub3_path
@@ -374,6 +394,7 @@ impl OutputManager {
 
         sanitize_java_command(&mut cmd);
         configure_hidden_console_command(&mut cmd);
+        Self::configure_aozora_locale(&mut cmd);
         cmd.current_dir(&working_dir);
         Ok((cmd, working_dir))
     }
