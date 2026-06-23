@@ -657,13 +657,11 @@ fn alias_to_target(target: &str) -> String {
     .unwrap_or_else(|| target.to_string())
 }
 
-fn attachment_name(id: &str, path: &Path) -> String {
-    let ext = path
-        .file_name()
+fn attachment_name(_id: &str, path: &Path) -> String {
+    path.file_name()
         .and_then(|name| name.to_str())
-        .and_then(|name| name.find('.').map(|idx| &name[idx..]))
-        .unwrap_or("");
-    format!("{}{}", id, ext)
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| _id.to_string())
 }
 
 fn green_bold(text: &str) -> String {
@@ -846,9 +844,15 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn attachment_name_reuses_original_extension() {
+    fn attachment_name_keeps_original_filename() {
         let path = std::path::Path::new("example.kepub.epub");
-        assert_eq!(attachment_name("hotentry", path), "hotentry.kepub.epub");
+        assert_eq!(attachment_name("hotentry", path), "example.kepub.epub");
+    }
+
+    #[test]
+    fn attachment_name_falls_back_to_id_when_path_has_no_name() {
+        let path = std::path::Path::new("");
+        assert_eq!(attachment_name("1", path), "1");
     }
 
     #[test]
