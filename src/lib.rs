@@ -8,6 +8,7 @@ pub mod converter;
 pub mod db;
 pub mod downloader;
 pub mod error;
+pub mod illustration_store;
 pub mod logger;
 pub mod mail;
 pub mod progress;

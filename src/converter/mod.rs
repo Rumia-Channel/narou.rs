@@ -21,11 +21,16 @@ use user_converter::UserConverter;
 
 use crate::downloader::{SectionElement, SectionFile, TocObject, SECTION_SAVE_DIR};
 use crate::error::{NarouError, Result};
+use crate::illustration_store::{
+    IllustrationStore, find_saved_illustration_filename, is_remote_illustration_source,
+    legacy_basename_from_source, normalize_illustration_url,
+};
 use crate::progress::ProgressReporter;
 use crate::termcolor::bold_colored;
 
 const SECTION_CONVERT_CACHE_NAME: &str = "section_convert_cache";
 const SECTION_CONVERT_CACHE_DIR_NAME: &str = "section_convert_cache";
+const ILLUSTRATION_LOCALIZATION_VERSION: &str = "illustration-localization:v4";
 
 pub struct NovelConverter {
     settings: NovelSettings,
@@ -37,6 +42,7 @@ pub struct NovelConverter {
     display_inspector: bool,
     last_inspection_output: Option<String>,
     use_dakuten_font: bool,
+    illustration_store: IllustrationStore,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +110,8 @@ struct CacheSettingsSignature<'a> {
 impl NovelConverter {
     pub fn new(settings: NovelSettings) -> Self {
         let inspector = Rc::new(RefCell::new(inspector::Inspector::new(&settings)));
+        let illustration_store = IllustrationStore::load(&settings.archive_path)
+            .unwrap_or_else(|_| IllustrationStore::default());
         Self {
             settings,
             user_converter: None,
@@ -114,11 +122,14 @@ impl NovelConverter {
             display_inspector: false,
             last_inspection_output: None,
             use_dakuten_font: false,
+            illustration_store,
         }
     }
 
     pub fn with_user_converter(settings: NovelSettings, user_converter: UserConverter) -> Self {
         let inspector = Rc::new(RefCell::new(inspector::Inspector::new(&settings)));
+        let illustration_store = IllustrationStore::load(&settings.archive_path)
+            .unwrap_or_else(|_| IllustrationStore::default());
         Self {
             settings,
             user_converter: Some(user_converter),
@@ -129,6 +140,7 @@ impl NovelConverter {
             display_inspector: false,
             last_inspection_output: None,
             use_dakuten_font: false,
+            illustration_store,
         }
     }
 
@@ -204,7 +216,7 @@ impl NovelConverter {
 
             let is_html =
                 section.element.data_type != "text" && section.element.data_type != "text/plain";
-            let resolved_element = if is_html {
+            let resolved_element = if is_html && self.settings.enable_illust {
                 self.resolve_section_html_illustrations(section)
             } else {
                 section.element.clone()
@@ -357,6 +369,8 @@ impl NovelConverter {
             .and_then(|id| crate::db::with_database(|db| Ok(db.get(id).cloned())).ok())
             .flatten();
 
+        self.flush_illustration_store()?;
+
         Ok(render::render_novel_text(
             &self.settings,
             toc,
@@ -444,6 +458,7 @@ impl NovelConverter {
         hasher.update(self.compute_settings_signature().as_bytes());
         hasher.update(self.compute_replace_signature().as_bytes());
         hasher.update(self.compute_converter_signature().as_bytes());
+        hasher.update(ILLUSTRATION_LOCALIZATION_VERSION.as_bytes());
         hex::encode(hasher.finalize())
     }
 
@@ -591,24 +606,42 @@ impl NovelConverter {
         illust_index: usize,
         source: &str,
     ) -> Option<String> {
-        if let Some(filename) =
-            find_saved_section_illustration_filename(illust_dir, section_index, illust_index)
-        {
-            return Some(format!("挿絵/{}", filename));
-        }
-
         if !is_remote_illustration_source(source) {
             return Some(source.to_string());
         }
 
-        self.download_section_illustration(illust_dir, section_index, illust_index, source)
+        if let Some(filename) = self
+            .illustration_store
+            .cached_filename_for_source(source, illust_dir)
+        {
+            return Some(format!("挿絵/{}", filename));
+        }
+
+        let basename = legacy_basename_from_source(source)
+            .unwrap_or_else(|| format!("{}-{}", section_index, illust_index));
+        if let Some(filename) = find_saved_illustration_filename(illust_dir, &basename) {
+            return match self
+                .illustration_store
+                .store_existing_file(illust_dir, source, &filename)
+            {
+                Ok(stored) => {
+                    if stored.created {
+                        self.inspector
+                            .borrow_mut()
+                            .info(format!("挿絵「{}」を保存しました。", stored.filename));
+                    }
+                    Some(format!("挿絵/{}", stored.filename))
+                }
+                Err(_) => Some(format!("挿絵/{}", filename)),
+            };
+        }
+
+        self.download_section_illustration(illust_dir, source)
     }
 
     fn download_section_illustration(
         &mut self,
         illust_dir: &Path,
-        section_index: &str,
-        illust_index: usize,
         source: &str,
     ) -> Option<String> {
         let url = normalize_illustration_url(source);
@@ -633,19 +666,20 @@ impl NovelConverter {
             }
         };
 
-        if std::fs::create_dir_all(illust_dir).is_err() {
-            return None;
+        match self
+            .illustration_store
+            .store_bytes(illust_dir, source, &bytes, ext)
+        {
+            Ok(stored) => {
+                if stored.created {
+                    self.inspector
+                        .borrow_mut()
+                        .info(format!("挿絵「{}」を保存しました。", stored.filename));
+                }
+                Some(format!("挿絵/{}", stored.filename))
+            }
+            Err(_) => None,
         }
-
-        let filename = format!("{}-{}.{}", section_index, illust_index, ext);
-        if std::fs::write(illust_dir.join(&filename), &bytes).is_err() {
-            return None;
-        }
-
-        self.inspector
-            .borrow_mut()
-            .info(format!("挿絵「{}」を保存しました。", filename));
-        Some(format!("挿絵/{}", filename))
     }
 
     pub fn clear_cache(&mut self) {
@@ -865,6 +899,10 @@ impl NovelConverter {
     fn flush_section_convert_cache(&mut self) -> Result<()> {
         self.section_convert_cache.flush()
     }
+
+    fn flush_illustration_store(&mut self) -> Result<()> {
+        self.illustration_store.flush(&self.settings.archive_path)
+    }
 }
 
 impl SectionConvertCache {
@@ -1074,34 +1112,14 @@ fn strip_book_header_and_footer(text: &str) -> String {
     lines[start..end].join("\n")
 }
 
+#[cfg(test)]
 fn find_saved_section_illustration_filename(
     illust_dir: &Path,
     section_index: &str,
     illust_index: usize,
 ) -> Option<String> {
-    let prefix = format!("{}-{}.", section_index, illust_index);
-    std::fs::read_dir(illust_dir)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .find(|filename| filename.starts_with(&prefix))
-}
-
-fn normalize_illustration_url(source: &str) -> String {
-    let prefixed = if source.starts_with("//") {
-        format!("https:{}", source)
-    } else {
-        source.to_string()
-    };
-    if prefixed.contains(".mitemin.net") {
-        prefixed.replace("viewimagebig", "viewimage")
-    } else {
-        prefixed
-    }
-}
-
-fn is_remote_illustration_source(source: &str) -> bool {
-    source.starts_with("http://") || source.starts_with("https://") || source.starts_with("//")
+    let basename = format!("{}-{}", section_index, illust_index);
+    find_saved_illustration_filename(illust_dir, &basename)
 }
 
 fn illustration_extension_from_content_type(content_type: &str) -> Option<&'static str> {
@@ -1189,8 +1207,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        CacheEntry, NovelConverter, clear_section_convert_cache, find_saved_section_illustration_filename,
-        illustration_extension_from_content_type, normalize_illustration_url,
+        CacheEntry, NovelConverter, clear_section_convert_cache,
+        find_saved_section_illustration_filename, illustration_extension_from_content_type,
         save_section_convert_bucket,
     };
     use crate::{
@@ -1198,6 +1216,10 @@ mod tests {
             render::ConvertedSection, settings::NovelSettings, user_converter::UserConverter,
         },
         downloader::{SectionElement, SectionFile, TocObject},
+        illustration_store::{
+            find_saved_illustration_filename, hash_bytes, legacy_basename_from_source,
+            normalize_illustration_url,
+        },
     };
 
     fn make_temp_illustration_root() -> std::path::PathBuf {
@@ -1437,14 +1459,35 @@ mod tests {
         let root = make_temp_illustration_root();
         let illust_dir = root.join("挿絵");
         std::fs::create_dir_all(&illust_dir).unwrap();
-        std::fs::write(illust_dir.join("16-0.png"), b"dummy").unwrap();
+        std::fs::write(illust_dir.join("i422674.png"), b"dummy").unwrap();
+        let hash = hash_bytes(b"dummy");
 
         let mut settings = NovelSettings::default();
         settings.archive_path = root.clone();
         let section = make_illustration_section();
         let mut converter = NovelConverter::new(settings);
         let resolved = converter.resolve_section_html_illustrations(&section);
-        assert!(resolved.body.contains(r#"src="挿絵/16-0.png""#));
+        assert!(resolved.body.contains(r#"src="挿絵/i422674.png""#));
+        assert_eq!(
+            converter.illustration_store.filename_for_mitemin_id("i422674"),
+            Some("i422674.png")
+        );
+        assert_eq!(
+            converter.illustration_store.hash_for_mitemin_id("i422674"),
+            Some(hash.as_str())
+        );
+        assert_eq!(
+            find_saved_illustration_filename(&illust_dir, "i422674").as_deref(),
+            Some("i422674.png")
+        );
+        assert_eq!(
+            legacy_basename_from_source(
+                "https://29644.mitemin.net/userpageimage/viewimagebig/icode/i422674/"
+            )
+            .as_deref(),
+            Some("i422674")
+        );
+        std::fs::write(illust_dir.join("16-0.png"), b"legacy").unwrap();
         assert_eq!(
             find_saved_section_illustration_filename(&illust_dir, "16", 0).as_deref(),
             Some("16-0.png")
@@ -1464,11 +1507,30 @@ mod tests {
     }
 
     #[test]
+    fn localize_section_html_illustrations_reuses_same_remote_basename() {
+        let root = make_temp_illustration_root();
+        let illust_dir = root.join("挿絵");
+        std::fs::create_dir_all(&illust_dir).unwrap();
+        std::fs::write(illust_dir.join("i422674.jpg"), b"dummy").unwrap();
+
+        let mut settings = NovelSettings::default();
+        settings.archive_path = root.clone();
+        let mut section = make_illustration_section();
+        section.element.body = format!("{}{}", section.element.body, section.element.body);
+        let mut converter = NovelConverter::new(settings);
+        let resolved = converter.resolve_section_html_illustrations(&section);
+
+        assert_eq!(resolved.body.matches(r#"src="挿絵/i422674.jpg""#).count(), 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn convert_novel_keeps_localized_illustration_annotation() {
         let root = make_temp_illustration_root();
         let illust_dir = root.join("挿絵");
         std::fs::create_dir_all(&illust_dir).unwrap();
-        std::fs::write(illust_dir.join("16-0.jpg"), b"dummy").unwrap();
+        std::fs::write(illust_dir.join("i422674.jpg"), b"dummy").unwrap();
 
         let mut settings = NovelSettings::default();
         settings.archive_path = root.clone();
@@ -1485,7 +1547,9 @@ mod tests {
             .convert_novel(&toc, &[make_illustration_section()])
             .unwrap();
 
-        assert!(text.contains("［＃挿絵（挿絵/16-0.jpg）入る］"), "{text}");
+        assert!(text.contains("［＃挿絵（挿絵/i422674.jpg）入る］"), "{text}");
+        let cache_path = crate::illustration_store::cache_path(&root);
+        assert!(cache_path.is_file());
 
         let _ = std::fs::remove_dir_all(root);
     }

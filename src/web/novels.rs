@@ -812,8 +812,9 @@ pub async fn author_comments(
 pub async fn download_ebook(
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Response, (StatusCode, String)> {
-    use axum::http::header;
-    use axum::response::IntoResponse;
+    use axum::body::Body;
+    use axum::http::{HeaderValue, header};
+    use tokio::io::AsyncReadExt;
 
     let record = with_database(|db| {
         db.get(id)
@@ -858,23 +859,49 @@ pub async fn download_ebook(
             )
         })?;
 
-    let data = std::fs::read(&file_path)
+    let file = tokio::fs::File::open(&file_path)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let content_length = file
+        .metadata()
+        .await
+        .map(|metadata| metadata.len())
+        .ok();
     let filename = file_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("ebook.epub");
     let disposition = sanitize_content_disposition(filename);
 
-    Ok((
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-            (header::CONTENT_DISPOSITION, disposition),
-        ],
-        data,
-    )
-        .into_response())
+    let stream = futures::stream::try_unfold(file, |mut file| async move {
+        let mut buf = vec![0; 64 * 1024];
+        let read = file.read(&mut buf).await?;
+        if read == 0 {
+            Ok::<Option<(Vec<u8>, tokio::fs::File)>, std::io::Error>(None)
+        } else {
+            buf.truncate(read);
+            Ok(Some((buf, file)))
+        }
+    });
+
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    let disposition_value = HeaderValue::from_bytes(disposition.as_bytes())
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"ebook.epub\""));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_DISPOSITION, disposition_value);
+    if let Some(len) = content_length
+        && let Ok(value) = HeaderValue::from_str(&len.to_string())
+    {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+
+    Ok(response)
 }
 
 /// Sanitizes a filename for use in Content-Disposition header.

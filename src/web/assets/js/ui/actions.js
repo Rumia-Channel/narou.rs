@@ -44,6 +44,8 @@ const SORT_STATE_COLUMN_INDEX = {
 
 export function bindActions() {
   applyColumnVisibility();
+  if (El.filterInput) El.filterInput.value = State.filterText || '';
+  El.filterClear?.classList.toggle('hide', !State.filterText);
 
   // --- Navbar toggle (mobile) ---
   El.navbarToggleBtn?.addEventListener('click', () => {

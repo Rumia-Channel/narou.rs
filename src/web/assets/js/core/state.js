@@ -3,6 +3,8 @@
  */
 
 const LS_PREFIX = 'narou-rs-webui-';
+const LIST_STATE_KEY = 'list-state';
+const LIST_STATE_TTL_MS = 6 * 60 * 60 * 1000;
 
 function lsGet(key, fallback) {
   try { const v = localStorage.getItem(LS_PREFIX + key); return v !== null ? v : fallback; }
@@ -11,6 +13,10 @@ function lsGet(key, fallback) {
 
 function lsSet(key, value) {
   try { localStorage.setItem(LS_PREFIX + key, value); } catch { /* quota */ }
+}
+
+function lsRemove(key) {
+  try { localStorage.removeItem(LS_PREFIX + key); } catch { /* ignore */ }
 }
 
 function lsBool(key, fallback) {
@@ -22,6 +28,37 @@ function lsInt(key, fallback) {
   const raw = lsGet(key, '');
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function loadListState() {
+  const raw = lsGet(LIST_STATE_KEY, '');
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return {};
+    if (Number(parsed.expiresAt || 0) <= Date.now()) {
+      lsRemove(LIST_STATE_KEY);
+      return {};
+    }
+    return parsed;
+  } catch {
+    lsRemove(LIST_STATE_KEY);
+    return {};
+  }
+}
+
+const savedListState = loadListState();
+
+export function persistListState() {
+  const payload = {
+    filterText: State.filterText || '',
+    currentPage: Math.max(Number(State.currentPage || 1), 1),
+    sortCol: State.sortCol || 'last_update',
+    sortAsc: !!State.sortAsc,
+    savedAt: Date.now(),
+    expiresAt: Date.now() + LIST_STATE_TTL_MS,
+  };
+  lsSet(LIST_STATE_KEY, JSON.stringify(payload));
 }
 
 export { lsGet, lsSet, lsBool, lsInt };
@@ -37,7 +74,7 @@ export const State = {
   queueDetailed: { pending: [], running: [], pending_count: 0, running_count: 0 },
   queueRestorePrompted: false,
   queueRestoreCheckPending: true,
-  filterText: '',
+  filterText: typeof savedListState.filterText === 'string' ? savedListState.filterText : '',
 
   // View flags (persisted to localStorage)
   viewFrozen: lsBool('view-frozen', true),
@@ -51,10 +88,10 @@ export const State = {
   selectMode: lsGet('select-mode', 'hybrid'),
 
   // Sort
-  sortCol: 'last_update',
-  sortAsc: false,
+  sortCol: typeof savedListState.sortCol === 'string' ? savedListState.sortCol : 'last_update',
+  sortAsc: typeof savedListState.sortAsc === 'boolean' ? savedListState.sortAsc : false,
   pageLength: lsInt('page-length', 50),
-  currentPage: 1,
+  currentPage: Math.max(Number.parseInt(savedListState.currentPage || '1', 10) || 1, 1),
 
   // Console
   consoleExpanded: false,
