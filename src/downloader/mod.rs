@@ -899,7 +899,7 @@ impl Downloader {
         setting: &SiteSetting,
         section: &SectionElement,
         section_dir: &PathBuf,
-        subtitle: &SubtitleInfo,
+        _subtitle: &SubtitleInfo,
         toc_url: &str,
     ) -> Result<()> {
         let illust_url_pattern = match &setting.illust_grep_pattern {
@@ -913,12 +913,13 @@ impl Downloader {
         let post_text = section.postscript.as_str();
         let sources = [&section.body, intro_text, post_text];
 
-        let mut illust_dir = section_dir.clone();
-        illust_dir.pop();
-        illust_dir.push("挿絵");
+        let mut archive_dir = section_dir.clone();
+        archive_dir.pop();
+        let illust_dir = archive_dir.join("挿絵");
         std::fs::create_dir_all(&illust_dir)?;
+        let mut illustration_store =
+            crate::illustration_store::IllustrationStore::load(&archive_dir).unwrap_or_default();
 
-        let mut illust_count = 0usize;
         for source in &sources {
             for caps in re.captures_iter(source) {
                 if let Some(url_match) = caps.get(1) {
@@ -930,43 +931,35 @@ impl Downloader {
                     let url = resolved.as_str();
                     if !is_safe_public_url(url) {
                         eprintln!("WARN: skipping unsafe illustration URL: {url}");
-                        illust_count += 1;
                         continue;
                     }
 
-                    let ext = if url.contains(".png") {
-                        "png"
-                    } else if url.contains(".gif") {
-                        "gif"
-                    } else if url.contains(".webp") {
-                        "webp"
-                    } else {
-                        "jpg"
-                    };
-
-                    let filename = format!("{}-{}.{}", subtitle.index, illust_count, ext);
-                    let save_path = illust_dir.join(&filename);
-
-                    if save_path.exists() {
-                        illust_count += 1;
+                    if illustration_store
+                        .cached_filename_for_source(url, &illust_dir)
+                        .is_some()
+                    {
                         continue;
                     }
 
+                    let ext = crate::illustration_store::guessed_extension_from_url(url);
                     self.fetcher.rate_limiter.wait_for_url(url);
                     match self.fetcher.fetch_bytes(url, None) {
                         Ok(bytes) => {
-                            let _ = std::fs::write(&save_path, &bytes);
+                            if let Err(err) =
+                                illustration_store.store_bytes(&illust_dir, url, &bytes, ext)
+                            {
+                                eprintln!("WARN: failed to save illustration {url}: {err}");
+                            }
                         }
                         Err(err) => {
                             eprintln!("WARN: failed to download illustration {url}: {err}");
                         }
                     }
-
-                    illust_count += 1;
                 }
             }
         }
 
+        illustration_store.flush(&archive_dir)?;
         Ok(())
     }
 
