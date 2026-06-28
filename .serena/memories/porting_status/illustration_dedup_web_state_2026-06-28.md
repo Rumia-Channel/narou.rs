@@ -1,0 +1,10 @@
+# 2026-06-28: n3352gq EPUB bloat / Web list state
+
+- Reproduced `https://ncode.syosetu.com/n3352gq/` in a temp narou root: `download -n` saved 351 sections, section YAML total ~4.7 MB and raw HTML ~16.9 MB, but `convert --no-epub` created 547 files under `挿絵/` totaling ~696 MB. The bloat was in conversion-time illustration localization, not TOC duplication or EPUB packaging.
+- Cause: Rust localized HTML `<img>` as `挿絵/<section-index>-<count>.<ext>`, so repeated mitemin images across many sections were downloaded and embedded repeatedly. Ruby `Illustration#download_image` derives the image basename from the URL (e.g. `i618380`) and reuses an existing `i618380.*` file.
+- Fix: `src/converter/mod.rs` now derives remote illustration filenames from URL basename, normalizes mitemin `viewimagebig` to `viewimage`, reuses existing `basename.*`, and records section cache context version `illustration-localization:v2` to avoid stale converted sections. HTML image localization is skipped when `enable_illust=false` so disabled illustrations do not trigger downloads.
+- Web ebook download fix: `src/web/novels.rs::download_ebook` streams generated ebook files from `tokio::fs::File` in 64 KiB chunks instead of reading the entire file into memory, while preserving `Content-Length` and `Content-Disposition`.
+- Web UI usability: list `filterText`, current page, and initial sort state are persisted to browser `localStorage` for 6 hours and restored on reload. The filter input is initialized from restored state.
+- `COMMANDS.md` was updated under `convert` and `web` implementation notes for these behavior changes.
+
+Verification performed: `cargo test localize_section --lib`, `cargo test convert_novel_keeps_localized_illustration_annotation --lib`, `cargo check`, and `node --check` for changed JS files.

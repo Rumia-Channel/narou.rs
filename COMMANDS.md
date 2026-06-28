@@ -262,7 +262,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `--inspect` 指定時は full display、未指定時は Ruby版同様に summary だけを出す
 - `enable_erase_introduction` / `enable_erase_postscript` を section 変換に反映し、`enable_auto_indent` は Ruby版 `Inspector#inspect_indent` 相当の比率判定でのみ有効化する
 - 表紙タイトル生成で Ruby版 `decorate_title` 相当を実装し、`enable_add_date_to_title` / `title_date_format` / `title_date_align` / `title_date_target` / `enable_add_end_to_title` を反映する。`$t` / `$s` / `$ns` / `$nt` / `$ntag` の拡張書式、`general_lastup` / `last_update` / `new_arrivals_date` / `convert` の日付対象、完結タグによる ` (完結)` 付与も対応
-- 保存済み `挿絵/<section-index>-<count>.<ext>` があれば HTML `<img>` を対応する青空文庫注記へローカルパスで復元する。`sample\\novel` の n8858hb section 16 で `［＃挿絵（挿絵/16-0.jpg）入る］` を確認済み
+- HTML `<img>` の挿絵は Ruby版 `Illustration#download_image` と同じく URL basename（mitemin の `i618380` など）を保存名にし、同一画像を複数話で再利用する。`n3352gq` で発生した `section-index-count` 名による重複保存・EPUB肥大化を修正し、古い section 変換 cache は `illustration-localization:v2` で無効化する
 - HTML 由来の story / section では Ruby版同様に `()` の暗黙ルビ推測を行わず、HTML `<ruby>` は `to_aozora` 経由の明示ルビとして保持する。`text` / `text/plain` / textfile では従来どおり `()` 暗黙ルビを処理する
 - Windows の `\\?\\C:\\...\\AozoraEpub3.jar` 形式パスは Java classpath にそのまま渡すと失敗するため、Ruby版同様に jar の basename を current_dir 基準で渡すよう修正した。`sample\\novel` で `device=epub` 実変換と `--no-epub` 抑止を確認済み
 - Windows で `〜` / `～` / `−` / `‼` / `⁇` / `⁈` / `⁉` / variation selector や CP932/Windows-31J 未定義文字 (`♠` / `♡` / `♢` / `♣` / `𠮷` など) を含み、Java/AozoraEpub3 側で出力名がずれやすい小説パスは、AozoraEpub3 に本文・表紙・`挿絵/` を安全な一時ファイル名で渡し、生成後に本来の Unicode ファイル名へ戻す。`C:\\Users\\rumia\\Documents\\Narou` の n5853lh で EPUB 生成を確認済み
@@ -562,6 +562,8 @@ narou setting name         # 読み取り
 - Web 設定画面は Ruby版同様、`tab` がある設定を `invisible` 指定でも表示する。`webui.theme` / `webui.table.reload-timing` / `webui.debug-mode` / `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `over18` も設定画面に出る
 - `webui.theme` / `webui.table.reload-timing` / `webui.performance-mode` / `webui.debug-mode` 保存時は、開いている Web UI に設定再読み込みイベントを送り、テーマメニューの変更も `webui.theme` へ保存する
 - `webui.debug-mode` が ON のときは、Web worker が失敗 child process の直近 stdout/stderr を要約して `queue_failed` イベントに載せ、Web UI 通知とコンソールに詳細エラーを出す。OFF のときは従来どおり簡潔な失敗通知だけにする
+- `/novels/{id}/download` は生成済み ebook を全量メモリへ読み込まず、`tokio::fs::File` から 64KiB チャンクでストリーミングする。大きい EPUB でも `Content-Length` / `Content-Disposition` を付けたまま返す
+- 一覧の検索文字列・現在ページ・ソート初期値はブラウザ `localStorage` に 6 時間の有効期限付きで保存し、リロード後に検索欄とページ位置を復元する
 - Web UI のタグ編集は既存タグ一覧から入力中タグ名に一致する候補を表示し、タグ名クリック検索は `tag:`、作者名クリック検索は `author:`、掲載サイトクリック検索は `sitename:` を生成する。通常クリックは AND、Ctrl クリックは同一フィールド内 OR、Shift クリックは除外 AND、Shift+Ctrl クリックは除外 OR として検索文字列を更新する
 - Web UI の update 系は、ID 選択・タグ条件・modified followup など入口の違いに関わらず、最終的に通常の `update ID...` 実行経路へ合流する。タグ条件は受付時に ID snapshot を確定し、条件自体は queue meta に残す
 - Web UI の `tag` / `freeze` / `remove` 相当操作は、単体・一括とも child CLI の `tag` / `freeze` / `remove` を実行する経路へ合流し、target 解決、`tag_colors.yaml`、`freeze.yaml`、lock チェック等を CLI と同じ処理で扱う。Web の global settings API は複数設定保存・`replace.txt`・スケジューラ再起動を API 側でまとめつつ、設定名スコープ判定・値キャスト・`device` 変更時の派生設定補正を CLI `setting` と共有する `setting_core` に合流する
