@@ -18,6 +18,10 @@ pub struct IllustrationStore {
     #[serde(default)]
     mitemin_ids: BTreeMap<String, String>,
     #[serde(default)]
+    mitemin_hashes: BTreeMap<String, String>,
+    #[serde(default)]
+    source_hashes: BTreeMap<String, String>,
+    #[serde(default)]
     hashes: BTreeMap<String, String>,
     #[serde(skip)]
     dirty: bool,
@@ -36,6 +40,8 @@ impl Default for IllustrationStore {
             version: STORE_VERSION,
             sources: BTreeMap::new(),
             mitemin_ids: BTreeMap::new(),
+            mitemin_hashes: BTreeMap::new(),
+            source_hashes: BTreeMap::new(),
             hashes: BTreeMap::new(),
             dirty: false,
         }
@@ -81,8 +87,13 @@ impl IllustrationStore {
         if let Some(id) = mitemin_illustration_id(source)
             && let Some(filename) = self.mitemin_ids.get(&id)
             && saved_filename_exists(illust_dir, filename)
+            && filename_has_basename(filename, &id)
         {
             return Some(filename.clone());
+        }
+
+        if mitemin_illustration_id(source).is_some() {
+            return None;
         }
 
         let normalized = normalize_illustration_url(source);
@@ -109,8 +120,35 @@ impl IllustrationStore {
         ext: &str,
     ) -> Result<StoredIllustration> {
         let hash = hash_bytes(bytes);
+        if let Some(id) = mitemin_illustration_id(source) {
+            if let Some(filename) = find_saved_illustration_filename(illust_dir, &id) {
+                self.remember_mitemin(source, &id, &hash, &filename);
+                return Ok(StoredIllustration {
+                    filename,
+                    hash,
+                    created: false,
+                });
+            }
+
+            std::fs::create_dir_all(illust_dir)?;
+            let filename = format!("{}.{}", id, normalize_extension(ext));
+            let path = illust_dir.join(&filename);
+            let created = if path.exists() {
+                false
+            } else {
+                std::fs::write(&path, bytes)?;
+                true
+            };
+            self.remember_mitemin(source, &id, &hash, &filename);
+            return Ok(StoredIllustration {
+                filename,
+                hash,
+                created,
+            });
+        }
+
         if let Some(filename) = self.cached_filename_for_hash(&hash, illust_dir) {
-            self.remember(source, &hash, &filename);
+            self.remember_hash_source(source, &hash, &filename);
             return Ok(StoredIllustration {
                 filename,
                 hash,
@@ -127,7 +165,7 @@ impl IllustrationStore {
             std::fs::write(&path, bytes)?;
             true
         };
-        self.remember(source, &hash, &filename);
+        self.remember_hash_source(source, &hash, &filename);
         Ok(StoredIllustration {
             filename,
             hash,
@@ -135,7 +173,7 @@ impl IllustrationStore {
         })
     }
 
-    pub fn store_existing_file_as_hash(
+    pub fn store_existing_file(
         &mut self,
         illust_dir: &Path,
         source: &str,
@@ -146,17 +184,35 @@ impl IllustrationStore {
             .extension()
             .and_then(|ext| ext.to_str())
             .unwrap_or("bin");
+        let hash = hash_bytes(&bytes);
+        if let Some(id) = mitemin_illustration_id(source)
+            && filename_has_basename(filename, &id)
+        {
+            self.remember_mitemin(source, &id, &hash, filename);
+            return Ok(StoredIllustration {
+                filename: filename.to_string(),
+                hash,
+                created: false,
+            });
+        }
         self.store_bytes(illust_dir, source, &bytes, ext)
     }
 
-    pub fn remember(&mut self, source: &str, hash: &str, filename: &str) {
+    pub fn remember_hash_source(&mut self, source: &str, hash: &str, filename: &str) {
         self.version = STORE_VERSION;
         let normalized = normalize_illustration_url(source);
         self.remember_source(&normalized, filename);
-        if let Some(id) = mitemin_illustration_id(source) {
-            self.remember_mitemin_id(&id, filename);
-        }
+        self.remember_source_hash(&normalized, hash);
         self.remember_hash(hash, filename);
+    }
+
+    pub fn remember_mitemin(&mut self, source: &str, id: &str, hash: &str, filename: &str) {
+        self.version = STORE_VERSION;
+        let normalized = normalize_illustration_url(source);
+        self.remember_source(&normalized, filename);
+        self.remember_source_hash(&normalized, hash);
+        self.remember_mitemin_id(id, filename);
+        self.remember_mitemin_hash(id, hash);
     }
 
     pub fn filename_for_source(&self, source: &str) -> Option<&str> {
@@ -167,6 +223,10 @@ impl IllustrationStore {
 
     pub fn filename_for_mitemin_id(&self, id: &str) -> Option<&str> {
         self.mitemin_ids.get(id).map(String::as_str)
+    }
+
+    pub fn hash_for_mitemin_id(&self, id: &str) -> Option<&str> {
+        self.mitemin_hashes.get(id).map(String::as_str)
     }
 
     pub fn filename_for_hash(&self, hash: &str) -> Option<&str> {
@@ -183,6 +243,21 @@ impl IllustrationStore {
     fn remember_mitemin_id(&mut self, id: &str, filename: &str) {
         if self.mitemin_ids.get(id).map(String::as_str) != Some(filename) {
             self.mitemin_ids.insert(id.to_string(), filename.to_string());
+            self.dirty = true;
+        }
+    }
+
+    fn remember_mitemin_hash(&mut self, id: &str, hash: &str) {
+        if self.mitemin_hashes.get(id).map(String::as_str) != Some(hash) {
+            self.mitemin_hashes.insert(id.to_string(), hash.to_string());
+            self.dirty = true;
+        }
+    }
+
+    fn remember_source_hash(&mut self, source: &str, hash: &str) {
+        if self.source_hashes.get(source).map(String::as_str) != Some(hash) {
+            self.source_hashes
+                .insert(source.to_string(), hash.to_string());
             self.dirty = true;
         }
     }
@@ -297,6 +372,13 @@ fn saved_filename_exists(illust_dir: &Path, filename: &str) -> bool {
         && illust_dir.join(filename).is_file()
 }
 
+fn filename_has_basename(filename: &str, basename: &str) -> bool {
+    Path::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        == Some(basename)
+}
+
 fn normalize_extension(ext: &str) -> String {
     let normalized: String = ext
         .chars()
@@ -315,7 +397,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn store_bytes_uses_hash_filename_and_mitemin_id_table() {
+    fn store_bytes_uses_mitemin_id_filename_and_hash_table() {
         let temp = tempfile::tempdir().unwrap();
         let illust_dir = temp.path().join("挿絵");
         let source = "https://29644.mitemin.net/userpageimage/viewimagebig/icode/i422674/";
@@ -324,16 +406,17 @@ mod tests {
         let stored = store
             .store_bytes(&illust_dir, source, b"dummy", "jpg")
             .unwrap();
-        let expected = format!("{}.jpg", hash_bytes(b"dummy"));
+        let hash = hash_bytes(b"dummy");
+        let expected = "i422674.jpg";
 
         assert_eq!(stored.filename, expected);
         assert!(stored.created);
-        assert!(illust_dir.join(&expected).is_file());
-        assert_eq!(store.filename_for_mitemin_id("i422674"), Some(expected.as_str()));
-        assert_eq!(store.filename_for_hash(&hash_bytes(b"dummy")), Some(expected.as_str()));
+        assert!(illust_dir.join(expected).is_file());
+        assert_eq!(store.filename_for_mitemin_id("i422674"), Some(expected));
+        assert_eq!(store.hash_for_mitemin_id("i422674"), Some(hash.as_str()));
         assert_eq!(
             store.cached_filename_for_source(source, &illust_dir).as_deref(),
-            Some(expected.as_str())
+            Some(expected)
         );
     }
 

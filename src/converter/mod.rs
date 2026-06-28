@@ -30,7 +30,7 @@ use crate::termcolor::bold_colored;
 
 const SECTION_CONVERT_CACHE_NAME: &str = "section_convert_cache";
 const SECTION_CONVERT_CACHE_DIR_NAME: &str = "section_convert_cache";
-const ILLUSTRATION_LOCALIZATION_VERSION: &str = "illustration-localization:v3";
+const ILLUSTRATION_LOCALIZATION_VERSION: &str = "illustration-localization:v4";
 
 pub struct NovelConverter {
     settings: NovelSettings,
@@ -622,7 +622,7 @@ impl NovelConverter {
         if let Some(filename) = find_saved_illustration_filename(illust_dir, &basename) {
             return match self
                 .illustration_store
-                .store_existing_file_as_hash(illust_dir, source, &filename)
+                .store_existing_file(illust_dir, source, &filename)
             {
                 Ok(stored) => {
                     if stored.created {
@@ -1461,24 +1461,20 @@ mod tests {
         std::fs::create_dir_all(&illust_dir).unwrap();
         std::fs::write(illust_dir.join("i422674.png"), b"dummy").unwrap();
         let hash = hash_bytes(b"dummy");
-        let hashed_filename = format!("{hash}.png");
 
         let mut settings = NovelSettings::default();
         settings.archive_path = root.clone();
         let section = make_illustration_section();
         let mut converter = NovelConverter::new(settings);
         let resolved = converter.resolve_section_html_illustrations(&section);
-        assert!(resolved
-            .body
-            .contains(&format!(r#"src="挿絵/{hashed_filename}""#)));
-        assert!(illust_dir.join(&hashed_filename).is_file());
+        assert!(resolved.body.contains(r#"src="挿絵/i422674.png""#));
         assert_eq!(
             converter.illustration_store.filename_for_mitemin_id("i422674"),
-            Some(hashed_filename.as_str())
+            Some("i422674.png")
         );
         assert_eq!(
-            converter.illustration_store.filename_for_hash(&hash),
-            Some(hashed_filename.as_str())
+            converter.illustration_store.hash_for_mitemin_id("i422674"),
+            Some(hash.as_str())
         );
         assert_eq!(
             find_saved_illustration_filename(&illust_dir, "i422674").as_deref(),
@@ -1516,7 +1512,6 @@ mod tests {
         let illust_dir = root.join("挿絵");
         std::fs::create_dir_all(&illust_dir).unwrap();
         std::fs::write(illust_dir.join("i422674.jpg"), b"dummy").unwrap();
-        let hashed_filename = format!("{}.jpg", hash_bytes(b"dummy"));
 
         let mut settings = NovelSettings::default();
         settings.archive_path = root.clone();
@@ -1525,13 +1520,7 @@ mod tests {
         let mut converter = NovelConverter::new(settings);
         let resolved = converter.resolve_section_html_illustrations(&section);
 
-        assert_eq!(
-            resolved
-                .body
-                .matches(&format!(r#"src="挿絵/{hashed_filename}""#))
-                .count(),
-            2
-        );
+        assert_eq!(resolved.body.matches(r#"src="挿絵/i422674.jpg""#).count(), 2);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1542,7 +1531,6 @@ mod tests {
         let illust_dir = root.join("挿絵");
         std::fs::create_dir_all(&illust_dir).unwrap();
         std::fs::write(illust_dir.join("i422674.jpg"), b"dummy").unwrap();
-        let hashed_filename = format!("{}.jpg", hash_bytes(b"dummy"));
 
         let mut settings = NovelSettings::default();
         settings.archive_path = root.clone();
@@ -1559,10 +1547,7 @@ mod tests {
             .convert_novel(&toc, &[make_illustration_section()])
             .unwrap();
 
-        assert!(
-            text.contains(&format!("［＃挿絵（挿絵/{hashed_filename}）入る］")),
-            "{text}"
-        );
+        assert!(text.contains("［＃挿絵（挿絵/i422674.jpg）入る］"), "{text}");
         let cache_path = crate::illustration_store::cache_path(&root);
         assert!(cache_path.is_file());
 
