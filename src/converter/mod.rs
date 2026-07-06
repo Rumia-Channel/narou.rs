@@ -22,8 +22,8 @@ use user_converter::UserConverter;
 use crate::downloader::{SectionElement, SectionFile, TocObject, SECTION_SAVE_DIR};
 use crate::error::{NarouError, Result};
 use crate::illustration_store::{
-    IllustrationStore, find_saved_illustration_filename, is_remote_illustration_source,
-    legacy_basename_from_source, normalize_illustration_url,
+    IllustrationStore, find_saved_illustration_filename, illustration_extension_from_content_type,
+    is_remote_illustration_source, legacy_basename_from_source, normalize_illustration_url,
 };
 use crate::progress::ProgressReporter;
 use crate::termcolor::bold_colored;
@@ -1120,16 +1120,6 @@ fn find_saved_section_illustration_filename(
 ) -> Option<String> {
     let basename = format!("{}-{}", section_index, illust_index);
     find_saved_illustration_filename(illust_dir, &basename)
-}
-
-fn illustration_extension_from_content_type(content_type: &str) -> Option<&'static str> {
-    match content_type {
-        "image/jpeg" => Some("jpg"),
-        "image/png" => Some("png"),
-        "image/gif" => Some("gif"),
-        "image/bmp" => Some("bmp"),
-        _ => None,
-    }
 }
 
 fn fetch_illustration_bytes(url: &str) -> std::result::Result<(Vec<u8>, String), String> {

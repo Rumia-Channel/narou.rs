@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::error::Result;
 
@@ -9,12 +9,14 @@ use super::util::{build_section_url, compile_html_pattern, pretreatment_source};
 
 pub struct SectionCache {
     cache: HashMap<String, SectionElement>,
+    order: VecDeque<String>,
 }
 
 impl SectionCache {
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            order: VecDeque::new(),
         }
     }
 
@@ -23,10 +25,14 @@ impl SectionCache {
     }
 
     pub fn insert(&mut self, key: String, element: SectionElement) {
-        if self.cache.len() >= MAX_SECTION_CACHE {
-            if let Some(oldest_key) = self.cache.keys().next().cloned() {
+        if !self.cache.contains_key(&key) {
+            while self.cache.len() >= MAX_SECTION_CACHE {
+                let Some(oldest_key) = self.order.pop_front() else {
+                    break;
+                };
                 self.cache.remove(&oldest_key);
             }
+            self.order.push_back(key.clone());
         }
         self.cache.insert(key, element);
     }

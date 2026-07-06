@@ -15,9 +15,16 @@ pub fn compute_section_hash(section: &SectionElement) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn section_filename(subtitle: &SubtitleInfo) -> String {
-    let safe_subtitle = crate::downloader::util::sanitize_filename(&subtitle.file_subtitle);
+pub fn section_filename(subtitle: &SubtitleInfo) -> String {
+    let safe_subtitle =
+        crate::downloader::util::sanitize_filename_with_limit(&subtitle.file_subtitle, None);
     format!("{} {}.yaml", subtitle.index, safe_subtitle)
+}
+
+fn raw_filename(subtitle: &SubtitleInfo) -> String {
+    let section = section_filename(subtitle);
+    let stem = section.strip_suffix(".yaml").unwrap_or(&section);
+    format!("{stem}.html")
 }
 
 pub fn section_needs_update(
@@ -76,9 +83,7 @@ pub fn save_section_file(
 ) -> Result<()> {
     let section_dir = validate_archive_write_dir(section_dir, 2)?;
     std::fs::create_dir_all(&section_dir)?;
-    let safe_subtitle = crate::downloader::util::sanitize_filename(&subtitle.file_subtitle);
-    let filename = format!("{} {}.yaml", subtitle.index, safe_subtitle);
-    let path = section_dir.join(filename);
+    let path = section_dir.join(section_filename(subtitle));
     let file_data = SectionFile {
         index: subtitle.index.clone(),
         href: subtitle.href.clone(),
@@ -93,17 +98,18 @@ pub fn save_section_file(
     };
     let yaml_body = serde_yaml::to_string(&file_data)?;
     let content = format!("---\n{}\n", yaml_body);
-    std::fs::write(&path, content)?;
+    crate::db::inventory::atomic_write(&path, &content)?;
     Ok(())
 }
 
 pub fn save_raw_file(raw_dir: &PathBuf, subtitle: &SubtitleInfo, raw_html: &str) -> Result<()> {
+    if raw_html.is_empty() {
+        return Ok(());
+    }
     let raw_dir = validate_archive_write_dir(raw_dir, 2)?;
     std::fs::create_dir_all(&raw_dir)?;
-    let safe_subtitle = crate::downloader::util::sanitize_filename(&subtitle.file_subtitle);
-    let filename = format!("{} {}.html", subtitle.index, safe_subtitle);
-    let path = raw_dir.join(filename);
-    std::fs::write(&path, raw_html)?;
+    let path = raw_dir.join(raw_filename(subtitle));
+    crate::db::inventory::atomic_write(&path, raw_html)?;
     Ok(())
 }
 
@@ -144,7 +150,7 @@ pub fn save_toc_file(novel_dir: &PathBuf, toc: &TocFile) -> Result<()> {
     let path = novel_dir.join("toc.yaml");
     let yaml_body = serde_yaml::to_string(toc)?;
     let content = format!("---\n{}\n", fix_yaml_block_scalar(&yaml_body));
-    std::fs::write(&path, content)?;
+    crate::db::inventory::atomic_write(&path, &content)?;
     Ok(())
 }
 

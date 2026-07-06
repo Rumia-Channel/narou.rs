@@ -341,12 +341,19 @@ impl PersistentQueue {
     }
 
     pub fn pop_for_lane(&self, lane: QueueLane) -> Option<QueueJob> {
+        self.pop_for_lane_excluding(lane, |_| false)
+    }
+
+    pub fn pop_for_lane_excluding<F>(&self, lane: QueueLane, is_blocked: F) -> Option<QueueJob>
+    where
+        F: Fn(&QueueJob) -> bool,
+    {
         if !self
             .state
             .lock()
             .active_pending
             .iter()
-            .any(|job| job.job.job_type.lane() == lane)
+            .any(|job| job.job.job_type.lane() == lane && !is_blocked(&job.job))
         {
             let _ = self.merge_external_pending_jobs();
         }
@@ -355,7 +362,7 @@ impl PersistentQueue {
             let index = state
                 .active_pending
                 .iter()
-                .position(|job| job.job.job_type.lane() == lane)?;
+                .position(|job| job.job.job_type.lane() == lane && !is_blocked(&job.job))?;
             let mut stored = state.active_pending.remove(index)?;
             stored.mark_running();
             let job = stored.job.clone();
@@ -1344,6 +1351,24 @@ mod tests {
         assert_eq!(remaining.len(), 2);
         assert!(matches!(remaining[0].job_type, JobType::Download));
         assert!(matches!(remaining[1].job_type, JobType::Update));
+    }
+
+    #[test]
+    fn pop_for_lane_excluding_skips_blocked_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let blocked = queue.push(JobType::Convert, "1").unwrap();
+        let allowed = queue.push(JobType::Backup, "2").unwrap();
+
+        let popped = queue
+            .pop_for_lane_excluding(QueueLane::Secondary, |job| job.target == "1")
+            .unwrap();
+
+        assert_eq!(popped.id, allowed);
+        let remaining = queue.get_pending_tasks();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, blocked);
     }
 
     #[test]

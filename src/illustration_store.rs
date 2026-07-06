@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 use crate::error::Result;
 
 const CACHE_FILE_NAME: &str = ".illustration_cache.yaml";
-const STORE_VERSION: u32 = 1;
+const LEGACY_STORE_VERSION: u32 = 1;
+const STORE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IllustrationStore {
@@ -55,18 +56,26 @@ impl IllustrationStore {
             Ok(raw) if !raw.trim().is_empty() => {
                 let mut store: Self = serde_yaml::from_str(&raw)?;
                 if store.version == 0 {
-                    store.version = STORE_VERSION;
+                    store.version = LEGACY_STORE_VERSION;
                 }
                 store.dirty = false;
                 store
             }
-            Ok(_) => Self::default(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Ok(_) => Self::legacy_default(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::legacy_default(),
             Err(err) => return Err(err.into()),
         };
         let _ = store.migrate_mitemin_id_filenames(archive_path);
         let _ = store.flush(archive_path);
         Ok(store)
+    }
+
+    fn legacy_default() -> Self {
+        Self {
+            version: LEGACY_STORE_VERSION,
+            dirty: true,
+            ..Self::default()
+        }
     }
 
     pub fn flush(&mut self, archive_path: &Path) -> Result<()> {
@@ -237,31 +246,37 @@ impl IllustrationStore {
     }
 
     pub fn migrate_mitemin_id_filenames(&mut self, archive_path: &Path) -> Result<usize> {
-        let illust_dir = archive_path.join("挿絵");
-        if !illust_dir.is_dir() {
+        if self.version >= STORE_VERSION {
             return Ok(0);
         }
 
+        let illust_dir = archive_path.join("挿絵");
         let mut migrated = 0usize;
-        let cached_sources: Vec<(String, String)> = self
-            .sources
-            .iter()
-            .map(|(source, filename)| (source.clone(), filename.clone()))
-            .collect();
-        for (source, filename) in cached_sources {
-            if let Some((target, hash)) =
-                migrate_mitemin_filename(&illust_dir, &source, &filename)?
-            {
-                if target != filename {
-                    migrated += 1;
-                }
-                if let Some(id) = mitemin_illustration_id(&source) {
-                    self.remember_mitemin(&source, &id, &hash, &target);
+        if illust_dir.is_dir() {
+            let cached_sources: Vec<(String, String)> = self
+                .sources
+                .iter()
+                .map(|(source, filename)| (source.clone(), filename.clone()))
+                .collect();
+            for (source, filename) in cached_sources {
+                if let Some((target, hash)) =
+                    migrate_mitemin_filename(&illust_dir, &source, &filename)?
+                {
+                    if target != filename {
+                        migrated += 1;
+                    }
+                    if let Some(id) = mitemin_illustration_id(&source) {
+                        self.remember_mitemin(&source, &id, &hash, &target);
+                    }
                 }
             }
+            migrated += self.migrate_mitemin_filenames_from_raw(archive_path, &illust_dir)?;
         }
 
-        migrated += self.migrate_mitemin_filenames_from_raw(archive_path, &illust_dir)?;
+        if self.version != STORE_VERSION {
+            self.version = STORE_VERSION;
+            self.dirty = true;
+        }
         Ok(migrated)
     }
 
@@ -340,7 +355,10 @@ impl IllustrationStore {
                         self.remember_mitemin(&source, &id, &hash, &target);
                     }
                 } else if let Some(filename) = find_saved_illustration_filename(illust_dir, &id) {
-                    let hash = hash_file(&illust_dir.join(&filename))?;
+                    let hash = match self.mitemin_hashes.get(&id) {
+                        Some(hash) => hash.clone(),
+                        None => hash_file(&illust_dir.join(&filename))?,
+                    };
                     self.remember_mitemin(&source, &id, &hash, &filename);
                 }
             }
@@ -420,17 +438,44 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 }
 
 pub fn guessed_extension_from_url(url: &str) -> &'static str {
-    let lower = url.to_ascii_lowercase();
-    if lower.contains(".png") {
-        "png"
-    } else if lower.contains(".gif") {
-        "gif"
-    } else if lower.contains(".webp") {
-        "webp"
-    } else if lower.contains(".bmp") {
-        "bmp"
-    } else {
-        "jpg"
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .path_segments()?
+                .next_back()
+                .and_then(extension_from_path_segment)
+        })
+        .unwrap_or("jpg")
+}
+
+pub fn illustration_extension_from_content_type(content_type: &str) -> Option<&'static str> {
+    match content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/jpeg" | "image/jpg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/gif" => Some("gif"),
+        "image/bmp" => Some("bmp"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+fn extension_from_path_segment(segment: &str) -> Option<&'static str> {
+    let ext = segment.rsplit_once('.')?.1.to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => Some("jpg"),
+        "png" => Some("png"),
+        "gif" => Some("gif"),
+        "webp" => Some("webp"),
+        "bmp" => Some("bmp"),
+        _ => None,
     }
 }
 
@@ -599,7 +644,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut store = IllustrationStore::default();
+        let mut store = IllustrationStore {
+            version: LEGACY_STORE_VERSION,
+            ..IllustrationStore::default()
+        };
         let migrated = store.migrate_mitemin_id_filenames(temp.path()).unwrap();
 
         assert_eq!(migrated, 1);
@@ -631,5 +679,42 @@ mod tests {
         assert!(illust_dir.join("i422674.jpg").is_file());
         assert_eq!(store.filename_for_mitemin_id("i422674"), Some("i422674.jpg"));
         assert_eq!(store.hash_for_mitemin_id("i422674"), Some(hash.as_str()));
+    }
+
+    #[test]
+    fn load_skips_raw_migration_after_store_version_is_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let illust_dir = temp.path().join("挿絵");
+        let raw_dir = temp.path().join(crate::downloader::RAW_DATA_DIR);
+        std::fs::create_dir_all(&illust_dir).unwrap();
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        std::fs::write(illust_dir.join("16-0.jpg"), b"dummy").unwrap();
+        std::fs::write(
+            raw_dir.join("16 subtitle.html"),
+            r#"<p><img src="//29644.mitemin.net/userpageimage/viewimagebig/icode/i422674/" /></p>"#,
+        )
+        .unwrap();
+        std::fs::write(cache_path(temp.path()), "version: 2\n").unwrap();
+
+        let store = IllustrationStore::load(temp.path()).unwrap();
+
+        assert!(illust_dir.join("16-0.jpg").is_file());
+        assert_eq!(store.filename_for_mitemin_id("i422674"), None);
+    }
+
+    #[test]
+    fn extension_detection_prefers_content_type_and_url_path() {
+        assert_eq!(
+            illustration_extension_from_content_type("image/png; charset=binary"),
+            Some("png")
+        );
+        assert_eq!(
+            guessed_extension_from_url("https://example.com/image.jpg?format=.png"),
+            "jpg"
+        );
+        assert_eq!(
+            guessed_extension_from_url("https://example.com/view/without-extension"),
+            "jpg"
+        );
     }
 }

@@ -93,7 +93,7 @@ fn start_queue_worker_for_lane(
         loop {
             let job = {
                 let _guard = job_transition_lock.lock();
-                let job = pop_next_job(queue.as_ref(), lane);
+                let job = pop_next_job(queue.as_ref(), lane, &running_jobs);
                 if let Some(job_ref) = job.as_ref() {
                     register_running_job(&running_jobs, job_ref);
                 }
@@ -195,12 +195,46 @@ fn start_queue_worker_for_lane(
     })
 }
 
-fn pop_next_job(queue: &PersistentQueue, lane: WorkerLane) -> Option<QueueJob> {
+fn pop_next_job(
+    queue: &PersistentQueue,
+    lane: WorkerLane,
+    running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
+) -> Option<QueueJob> {
     match lane {
         WorkerLane::All => queue.pop(),
-        WorkerLane::Default => queue.pop_for_lane(QueueLane::Default),
-        WorkerLane::Secondary => queue.pop_for_lane(QueueLane::Secondary),
+        WorkerLane::Default => {
+            let running = running_jobs.lock().clone();
+            queue.pop_for_lane_excluding(QueueLane::Default, |candidate| {
+                job_conflicts_with_running(candidate, &running)
+            })
+        }
+        WorkerLane::Secondary => {
+            let running = running_jobs.lock().clone();
+            queue.pop_for_lane_excluding(QueueLane::Secondary, |candidate| {
+                job_conflicts_with_running(candidate, &running)
+            })
+        }
     }
+}
+
+fn job_conflicts_with_running(candidate: &QueueJob, running_jobs: &[QueueJob]) -> bool {
+    let candidate_ids = numeric_job_targets(candidate);
+    if candidate_ids.is_empty() {
+        return false;
+    }
+    running_jobs.iter().any(|running| {
+        running.job_type.lane() != candidate.job_type.lane()
+            && numeric_job_targets(running)
+                .iter()
+                .any(|id| candidate_ids.contains(id))
+    })
+}
+
+fn numeric_job_targets(job: &QueueJob) -> HashSet<i64> {
+    job.target
+        .split('\t')
+        .filter_map(|part| part.parse::<i64>().ok())
+        .collect()
 }
 
 fn register_running_job(running_jobs: &parking_lot::Mutex<Vec<QueueJob>>, job: &QueueJob) {
@@ -984,10 +1018,11 @@ mod tests {
         MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, JobOutcome, classify_job_outcome,
         clear_progress_for_job, console_target_for_job, convert_targets_and_device,
         execution_spec_meta_bool, execution_spec_meta_string, execution_spec_meta_strings,
-        failure_reason, parse_convert_job_target, remember_failure_line,
-        route_structured_web_message, summarize_failure_details, update_by_tag_update_args,
+        failure_reason, job_conflicts_with_running, parse_convert_job_target,
+        remember_failure_line, route_structured_web_message, summarize_failure_details,
+        update_by_tag_update_args,
     };
-    use crate::queue::JobType;
+    use crate::queue::{JobType, QueueJob};
 
     #[test]
     fn parse_convert_job_target_splits_device_override() {
@@ -1068,6 +1103,51 @@ mod tests {
             console_target_for_job(JobType::Mail),
             crate::web::non_external_console_target()
         );
+    }
+
+    #[test]
+    fn job_conflict_blocks_same_novel_across_lanes_only() {
+        let running_update = QueueJob {
+            id: "running-update".to_string(),
+            job_type: JobType::Update,
+            target: "12".to_string(),
+            created_at: 0,
+            retry_count: 0,
+            max_retries: 3,
+        };
+        let same_novel_convert = QueueJob {
+            id: "convert".to_string(),
+            job_type: JobType::Convert,
+            target: "12\tkindle".to_string(),
+            created_at: 0,
+            retry_count: 0,
+            max_retries: 3,
+        };
+        let other_novel_convert = QueueJob {
+            target: "13".to_string(),
+            ..same_novel_convert.clone()
+        };
+        let same_lane_download = QueueJob {
+            id: "download".to_string(),
+            job_type: JobType::Download,
+            target: "12".to_string(),
+            created_at: 0,
+            retry_count: 0,
+            max_retries: 3,
+        };
+
+        assert!(job_conflicts_with_running(
+            &same_novel_convert,
+            &[running_update.clone()]
+        ));
+        assert!(!job_conflicts_with_running(
+            &other_novel_convert,
+            &[running_update.clone()]
+        ));
+        assert!(!job_conflicts_with_running(
+            &same_lane_download,
+            &[running_update]
+        ));
     }
 
     #[test]

@@ -75,6 +75,29 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_records<T, F>(&mut self, update: F) -> Result<T>
+    where
+        F: FnOnce(BTreeMap<i64, NovelRecord>) -> Result<(BTreeMap<i64, NovelRecord>, T)>,
+    {
+        let result = self.inventory.update_yaml(
+            DATABASE_NAME,
+            InventoryScope::Local,
+            |mut current: BTreeMap<i64, NovelRecord>| {
+                for (id, record) in current.iter_mut() {
+                    record.id = *id;
+                }
+                let (mut updated, result) = update(current)?;
+                for (id, record) in updated.iter_mut() {
+                    record.id = *id;
+                }
+                Ok((updated, result))
+            },
+        )?;
+        self.refresh()?;
+        self.index.flush(&self.inventory)?;
+        Ok(result)
+    }
+
     pub fn get(&self, id: i64) -> Option<&NovelRecord> {
         self.data.get(&id)
     }
@@ -141,37 +164,11 @@ impl Database {
     pub fn sort_by(&self, key: &str, reverse: bool) -> Vec<&NovelRecord> {
         let mut records: Vec<&NovelRecord> = self.data.values().collect();
         records.sort_by(|a, b| {
-            let va = match key {
-                "id" => Some(format!("{}", a.id)),
-                "title" => Some(a.title.to_lowercase()),
-                "author" => Some(a.author.to_lowercase()),
-                "last_update" => Some(format!("{}", a.last_update.timestamp())),
-                "general_lastup" => a.general_lastup.map(|d| format!("{}", d.timestamp())),
-                "sitename" => Some(a.sitename.clone()),
-                "novel_type" => Some(format!("{}", a.novel_type)),
-                "length" => a.length.map(|l| format!("{}", l)),
-                _ => None,
-            };
-            let vb = match key {
-                "id" => Some(format!("{}", b.id)),
-                "title" => Some(b.title.to_lowercase()),
-                "author" => Some(b.author.to_lowercase()),
-                "last_update" => Some(format!("{}", b.last_update.timestamp())),
-                "general_lastup" => b.general_lastup.map(|d| format!("{}", d.timestamp())),
-                "sitename" => Some(b.sitename.clone()),
-                "novel_type" => Some(format!("{}", b.novel_type)),
-                "length" => b.length.map(|l| format!("{}", l)),
-                _ => None,
-            };
-            match (va, vb) {
-                (Some(a), Some(b_val)) => {
-                    if reverse {
-                        b_val.cmp(&a)
-                    } else {
-                        a.cmp(&b_val)
-                    }
-                }
-                _ => std::cmp::Ordering::Equal,
+            let ordering = compare_records_by_key(a, b, key).then_with(|| a.id.cmp(&b.id));
+            if reverse {
+                ordering.reverse()
+            } else {
+                ordering
             }
         });
         records
@@ -196,10 +193,35 @@ impl Database {
     }
 }
 
+fn compare_records_by_key(a: &NovelRecord, b: &NovelRecord, key: &str) -> std::cmp::Ordering {
+    match key {
+        "id" => a.id.cmp(&b.id),
+        "title" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+        "author" => a.author.to_lowercase().cmp(&b.author.to_lowercase()),
+        "last_update" => a.last_update.cmp(&b.last_update),
+        "general_lastup" => compare_optional(a.general_lastup, b.general_lastup),
+        "sitename" => a.sitename.cmp(&b.sitename),
+        "novel_type" => a.novel_type.cmp(&b.novel_type),
+        "length" => compare_optional(a.length, b.length),
+        _ => a.id.cmp(&b.id),
+    }
+}
+
+fn compare_optional<T: Ord>(a: Option<T>, b: Option<T>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Database;
     use crate::db::inventory::{Inventory, InventoryScope};
+    use crate::db::novel_record::NovelRecord;
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn database_parity_create_new_id_starts_at_zero() {
@@ -256,5 +278,86 @@ mod tests {
         assert!(saved.contains("custom_flag: true"));
         assert!(saved.contains("answer: 42"));
         assert_eq!(db.create_new_id(), 1);
+    }
+
+    #[test]
+    fn update_records_merges_against_current_database_yaml() {
+        let temp = tempfile::tempdir().unwrap();
+        let narou_dir = temp.path().join(".narou");
+        std::fs::create_dir_all(&narou_dir).unwrap();
+        let inventory = Inventory::new(temp.path().to_path_buf());
+        let mut db = Database::with_inventory(inventory).unwrap();
+
+        db.insert(sample_record(1, Some(10), &["old"]));
+        db.save().unwrap();
+        std::fs::write(
+            narou_dir.join("database.yaml"),
+            std::fs::read_to_string(narou_dir.join("database.yaml"))
+                .unwrap()
+                .replace("- old", "- edited"),
+        )
+        .unwrap();
+
+        db.update_records(|mut records| {
+            let record = records.get_mut(&1).unwrap();
+            record.length = Some(20);
+            Ok((records, ()))
+        })
+        .unwrap();
+
+        let record = db.get(1).unwrap();
+        assert_eq!(record.tags, vec!["edited"]);
+        assert_eq!(record.length, Some(20));
+    }
+
+    #[test]
+    fn sort_by_uses_typed_ordering_and_stable_none_order() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let inventory = Inventory::new(temp.path().to_path_buf());
+        let mut db = Database::with_inventory(inventory).unwrap();
+
+        db.insert(sample_record(10, Some(2), &[]));
+        db.insert(sample_record(9, Some(10), &[]));
+        db.insert(sample_record(1, None, &[]));
+
+        let by_id = db.sort_by("id", false).iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(by_id, vec![1, 9, 10]);
+        let by_length = db
+            .sort_by("length", false)
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>();
+        assert_eq!(by_length, vec![10, 9, 1]);
+    }
+
+    fn sample_record(id: i64, length: Option<i64>, tags: &[&str]) -> NovelRecord {
+        NovelRecord {
+            id,
+            author: "author".to_string(),
+            title: format!("title {id}"),
+            file_title: format!("title {id}"),
+            toc_url: format!("https://example.com/{id}/"),
+            sitename: "Example".to_string(),
+            novel_type: 1,
+            end: false,
+            last_update: Utc.timestamp_opt(1_700_000_000 + id, 0).unwrap(),
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: None,
+            general_lastup: None,
+            last_mail_date: None,
+            tags: tags.iter().map(|tag| tag.to_string()).collect(),
+            ncode: None,
+            domain: None,
+            general_all_no: None,
+            length,
+            suspend: false,
+            is_narou: true,
+            last_check_date: None,
+            convert_failure: false,
+            extra_fields: Default::default(),
+        }
     }
 }

@@ -13,7 +13,7 @@ pub mod toc;
 pub mod types;
 pub mod util;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -34,7 +34,7 @@ use self::narou_api::narou_api_batch_update;
 use self::novel_info::NovelInfo;
 use self::persistence::{
     compute_section_hash, ensure_default_files, load_section_file, load_toc_file, move_file_to_dir,
-    remove_dir_if_empty, save_raw_file, save_section_file, save_toc_file,
+    remove_dir_if_empty, save_raw_file, save_section_file, save_toc_file, section_filename,
 };
 use self::section::{SectionCache, download_section};
 use self::site_setting::SiteSetting;
@@ -275,10 +275,6 @@ fn resolve_novel_type(
     }
 
     (1u8, false)
-}
-
-fn section_filename(subtitle: &SubtitleInfo) -> String {
-    format!("{} {}.yaml", subtitle.index, subtitle.file_subtitle)
 }
 
 fn section_relative_path(subtitle: &SubtitleInfo) -> String {
@@ -898,8 +894,8 @@ impl Downloader {
         &mut self,
         setting: &SiteSetting,
         section: &SectionElement,
-        section_dir: &PathBuf,
-        _subtitle: &SubtitleInfo,
+        illust_dir: &Path,
+        illustration_store: &mut crate::illustration_store::IllustrationStore,
         toc_url: &str,
     ) -> Result<()> {
         let illust_url_pattern = match &setting.illust_grep_pattern {
@@ -913,12 +909,7 @@ impl Downloader {
         let post_text = section.postscript.as_str();
         let sources = [&section.body, intro_text, post_text];
 
-        let mut archive_dir = section_dir.clone();
-        archive_dir.pop();
-        let illust_dir = archive_dir.join("挿絵");
-        std::fs::create_dir_all(&illust_dir)?;
-        let mut illustration_store =
-            crate::illustration_store::IllustrationStore::load(&archive_dir).unwrap_or_default();
+        std::fs::create_dir_all(illust_dir)?;
 
         for source in &sources {
             for caps in re.captures_iter(source) {
@@ -935,18 +926,24 @@ impl Downloader {
                     }
 
                     if illustration_store
-                        .cached_filename_for_source(url, &illust_dir)
+                        .cached_filename_for_source(url, illust_dir)
                         .is_some()
                     {
                         continue;
                     }
 
-                    let ext = crate::illustration_store::guessed_extension_from_url(url);
                     self.fetcher.rate_limiter.wait_for_url(url);
                     match self.fetcher.fetch_bytes(url, None) {
-                        Ok(bytes) => {
+                        Ok((bytes, content_type)) => {
+                            let ext =
+                                crate::illustration_store::illustration_extension_from_content_type(
+                                    &content_type,
+                                )
+                                .unwrap_or_else(|| {
+                                    crate::illustration_store::guessed_extension_from_url(url)
+                                });
                             if let Err(err) =
-                                illustration_store.store_bytes(&illust_dir, url, &bytes, ext)
+                                illustration_store.store_bytes(illust_dir, url, &bytes, ext)
                             {
                                 eprintln!("WARN: failed to save illustration {url}: {err}");
                             }
@@ -959,7 +956,6 @@ impl Downloader {
             }
         }
 
-        illustration_store.flush(&archive_dir)?;
         Ok(())
     }
 
@@ -1045,11 +1041,13 @@ impl Downloader {
             setting.interpolate_with_captures(&setting.toc_url, &url_captures)
         };
         let toc_url = Self::ageauth_redirect_target(&toc_url).unwrap_or(toc_url);
+        self.fetcher.configure_rate_limiter(setting.is_narou);
         let toc_url = match self.fetcher.resolve_final_url(&toc_url, setting.cookie()) {
             Ok(final_url) if final_url != toc_url => {
                 let final_url = Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
                 if let Some(final_setting) = self.find_site_setting(&final_url) {
                     setting = final_setting;
+                    self.fetcher.configure_rate_limiter(setting.is_narou);
                     setting
                         .toc_url_with_url_captures(&final_url)
                         .unwrap_or(final_url)
@@ -1060,7 +1058,6 @@ impl Downloader {
             _ => toc_url,
         };
         let url_captures = setting.extract_url_captures(&toc_url).unwrap_or(url_captures);
-        self.fetcher.configure_rate_limiter(setting.is_narou);
         let toc_source = match fetch_toc(&mut self.fetcher, &setting, &toc_url) {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
@@ -1269,6 +1266,16 @@ impl Downloader {
             }
         }
 
+        let illust_dir = novel_dir.join("挿絵");
+        let mut illustration_store = if setting.illust_grep_pattern.is_some() {
+            Some(
+                crate::illustration_store::IllustrationStore::load(&novel_dir)
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
+
         struct SectionPlan {
             latest_section_path: PathBuf,
             is_new_arrival: bool,
@@ -1388,19 +1395,21 @@ impl Downloader {
                     pending_section_hashes.insert(relative_path, digest);
                 }
                 save_raw_file(&raw_dir, subtitle, &raw_html)?;
-                self.download_illustration(&setting, &section, &section_dir, subtitle, &toc_url)?;
+                if let Some(store) = illustration_store.as_mut() {
+                    self.download_illustration(&setting, &section, &illust_dir, store, &toc_url)?;
+                }
                 updated_count += 1;
                 downloaded_index += 1;
                 Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string())
             } else {
-                if setting.illust_grep_pattern.is_some() {
+                if let Some(store) = illustration_store.as_mut() {
                     if let Ok(content) = std::fs::read_to_string(&latest_section_path) {
                         if let Ok(section_file) = serde_yaml::from_str::<SectionFile>(&content) {
                             self.download_illustration(
                                 &setting,
                                 &section_file.element,
-                                &section_dir,
-                                subtitle,
+                                &illust_dir,
+                                store,
                                 &toc_url,
                             )?;
                         }
@@ -1453,6 +1462,9 @@ impl Downloader {
         }
 
         remove_cache_dir_if_empty(cache_dir.as_deref())?;
+        if let Some(store) = illustration_store.as_mut() {
+            store.flush(&novel_dir)?;
+        }
 
         if let Some(ref p) = self.progress {
             p.finish_with_message(&format!(
@@ -1557,23 +1569,15 @@ impl Downloader {
         };
 
         let auto_add_tags = load_local_setting_bool("auto-add-tags");
-        let mut merged_tags = existing_record
-            .as_ref()
-            .map(|record| record.tags.clone())
-            .unwrap_or_default();
-        if auto_add_tags {
-            let raw_tags_opt = info
-                .tags
+        let auto_tags = if auto_add_tags {
+            info.tags
                 .clone()
-                .or_else(|| setting.resolve_info_pattern("tags", &toc_source));
-            if let Some(raw_tags) = raw_tags_opt {
-                for tag in sanitize_site_tags(&raw_tags) {
-                    if !merged_tags.contains(&tag) {
-                        merged_tags.push(tag);
-                    }
-                }
-            }
-        }
+                .or_else(|| setting.resolve_info_pattern("tags", &toc_source))
+                .map(|raw_tags| sanitize_site_tags(&raw_tags))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let status = resolve_download_status(
             force,
@@ -1586,8 +1590,9 @@ impl Downloader {
         );
 
         let id = crate::db::with_database_mut(|db| {
-            let id = if let Some(eid) = existing_id {
-                if let Some(existing) = db.get(eid) {
+            db.update_records(|mut records: BTreeMap<i64, NovelRecord>| {
+                let id = if let Some(eid) = existing_id {
+                    if let Some(existing) = records.get(&eid) {
                     let mut updated = existing.clone();
                     if !record.author.is_empty() {
                         updated.author = record.author.clone();
@@ -1610,29 +1615,31 @@ impl Downloader {
                     updated.domain = record.domain.clone();
                     updated.suspend = false;
                     updated.is_narou = record.is_narou;
-                    if !merged_tags.is_empty() {
-                        updated.tags = merged_tags.clone();
+                    for tag in &auto_tags {
+                        if !updated.tags.contains(tag) {
+                            updated.tags.push(tag.clone());
+                        }
                     }
-                    db.insert(updated);
+                    records.insert(eid, updated);
                     eid
                 } else {
                     let new_id = provisional_id;
-                    let mut rec = record;
+                    let mut rec = record.clone();
                     rec.id = new_id;
-                    rec.tags = merged_tags.clone();
-                    db.insert(rec);
+                    rec.tags = auto_tags.clone();
+                    records.insert(new_id, rec);
                     new_id
                 }
             } else {
-                let new_id = db.create_new_id();
-                let mut rec = record;
+                let new_id = records.keys().copied().max().map(|id| id + 1).unwrap_or(0);
+                let mut rec = record.clone();
                 rec.id = new_id;
-                rec.tags = merged_tags.clone();
-                db.insert(rec);
+                rec.tags = auto_tags.clone();
+                records.insert(new_id, rec);
                 new_id
             };
-            db.save()?;
-            Ok::<i64, NarouError>(id)
+                Ok((records, id))
+            })
         })?;
 
         self.remove_migrated_novel_dir(previous_novel_dir.as_deref(), &novel_dir);
