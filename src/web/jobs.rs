@@ -2184,10 +2184,10 @@ pub async fn api_taginfo(
     let tag_info = with_database(|db| {
         let tag_index = db.tag_index();
         let inventory = db.inventory();
-        let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
+        let mut tag_colors = crate::tag_colors::load_tag_colors(inventory)?;
         let tag_names = tag_index.keys().map(String::as_str);
-        if super::tag_colors::ensure_tag_colors(&mut tag_colors, tag_names) {
-            super::tag_colors::save_tag_colors(inventory, &tag_colors)?;
+        if crate::tag_colors::ensure_tag_colors(&mut tag_colors, tag_names) {
+            crate::tag_colors::save_tag_colors(inventory, &tag_colors)?;
         }
         let tag_colors = tag_colors.into_map();
 

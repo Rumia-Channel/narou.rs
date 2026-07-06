@@ -127,6 +127,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         "webui.theme"
         | "webui.table.reload-timing"
         | "webui.performance-mode"
+        | "webui.new-tag-color"
         | "webui.debug-mode" => Some("webui"),
 
         // global → global
@@ -505,6 +506,12 @@ mod tests {
         assert_eq!(tab_for_setting("webui.debug-mode"), Some("webui"));
         assert!(setting_variables().get("webui.debug-mode").is_some());
     }
+
+    #[test]
+    fn webui_new_tag_color_is_visible_on_webui_tab() {
+        assert_eq!(tab_for_setting("webui.new-tag-color"), Some("webui"));
+        assert!(setting_variables().get("webui.new-tag-color").is_some());
+    }
 }
 
 /// Local setting variable metadata
@@ -866,6 +873,15 @@ pub fn setting_variables() -> SettingVariables {
             sel(
                 "パフォーマンスモードを設定。autoの場合は小説数2000件以上で自動的に有効になります",
                 vec!["auto", "on", "off"],
+            ),
+        ),
+        (
+            "webui.new-tag-color",
+            sel(
+                "新規タグに自動割り当てする色。defaultの場合は従来どおりタグ追加順に巡回します",
+                vec![
+                    "default", "green", "yellow", "blue", "magenta", "cyan", "red", "white",
+                ],
             ),
         ),
         (

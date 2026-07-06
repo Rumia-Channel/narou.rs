@@ -10,7 +10,6 @@ pub mod push;
 pub mod scheduler;
 pub mod sort_state;
 pub mod state;
-mod tag_colors;
 pub mod tags;
 pub mod update;
 pub mod worker;
