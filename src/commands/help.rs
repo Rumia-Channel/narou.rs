@@ -106,6 +106,10 @@ const COMMANDS: &[CmdInfo] = &[
         name: "init",
         oneline: "現在のフォルダを小説用に初期化します",
     },
+    CmdInfo {
+        name: "illust",
+        oneline: "挿絵ハッシュストアの運用補助 (orphan/migrate/fix-ext/rebuild)",
+    },
 ];
 
 const HEADER: &str = "Narou.rb ― 小説家になろうダウンローダ＆縦書き用整形スクリプト";
@@ -853,6 +857,33 @@ const CLEAN_HELP: CmdHelp = CmdHelp {
     ],
 };
 
+const ILLUST_HELP: CmdHelp = CmdHelp {
+    banner: "<sub> [<target> ...] [options]",
+    description: "\
+  ・挿絵ハッシュストア (.illustration_cache.yaml) の運用補助コマンドです。
+  ・<sub> に次のいずれかを指定します。サブコマンド省略時はこの help を表示します。
+      orphan   到達不能な 挿絵/* を列挙する。-f で実際に削除。
+      migrate  legacy なファイル名 (<話数>-<連番>.ext や URL basename) を
+               ハッシュ名 / ソースマップへ一括移行。
+      fix-ext  マジックバイト判定で .jpg/.png 等を実体に合わせて改名。
+      rebuild  挿絵/ と raw/*.html から .illustration_cache.yaml を再構築。
+  ・<target> を省略した場合、直前に変換した小説が対象になります。
+  ・全小説を対象にしたい場合は --all を使います。
+  ・削除・改名・移行はいずれも既定で dry-run (-f を付けると実行)。
+
+  Examples:
+    narou illust orphan
+    narou illust orphan --all
+    narou illust orphan 1 -f       # 実際に削除
+    narou illust migrate 1
+    narou illust fix-ext --all -f
+    narou illust rebuild --all",
+    options: &[
+        opt(Some("-f"), "--force", None, "実際に変更する (削除/改名/移行)"),
+        opt(Some("-a"), "--all", None, "全小説を対象にする"),
+    ],
+};
+
 const LOG_HELP: CmdHelp = CmdHelp {
     banner: "[options] [<path>]",
     description: "\
@@ -986,6 +1017,10 @@ const ALL_COMMAND_HELP: &[CommandHelpEntry] = &[
     CommandHelpEntry {
         name: "clean",
         help: &CLEAN_HELP,
+    },
+    CommandHelpEntry {
+        name: "illust",
+        help: &ILLUST_HELP,
     },
     CommandHelpEntry {
         name: "log",

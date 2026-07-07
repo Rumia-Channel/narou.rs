@@ -7,7 +7,7 @@ use clap::Parser;
 const COMMAND_NAMES: &[&str] = &[
     "download", "update", "list", "convert", "diff", "setting", "alias", "inspect", "send",
     "folder", "browser", "remove", "freeze", "tag", "web", "mail", "backup", "csv", "clean", "log",
-    "trace", "help", "version", "init",
+    "trace", "help", "version", "init", "illust",
 ];
 
 fn build_shortcuts() -> HashMap<String, &'static str> {
@@ -851,4 +851,20 @@ pub enum Commands {
         #[arg(short = 'm', long)]
         more: bool,
     },
+    Illust {
+        #[arg(short = 'f', long)]
+        force: bool,
+        #[arg(short = 'a', long)]
+        all: bool,
+        sub: Option<IllustSubcommand>,
+        targets: Vec<String>,
+    },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IllustSubcommand {
+    Orphan,
+    Migrate,
+    FixExt,
+    Rebuild,
 }

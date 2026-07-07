@@ -1,6 +1,6 @@
 # narou.rs コマンド互換性ドキュメント
 
-narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状況・要件を整理する。
+narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状況・要件を整理する。Rust 拡張の `illust` (挿絵メンテナンス) を含む 25 コマンドを網羅する。
 
 ---
 
@@ -95,6 +95,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `mail` | ✅ | ✅ 完了 | `mail_setting.yaml` bootstrap / 不完全設定 path 表示 / spinner / hotentry / `last_mail_date` 差分送信、Pony寄りの SMTP/TLS オプション受理まで実装。`smtp` 経路は `tests/mail_e2e.rs` の end-to-end テストで sender 側・受信側ヘッダまで自動確認済み |
 | `backup` | ✅ | ✅ 完了 | `narou backup`/複数 target、`backup/` 除外、180バイト切り詰めまで対応 |
 | `clean` | ✅ | ✅ 完了 | `latest_convert` 既定値、`--all`、`--force`/`--dry-run`、freeze スキップ、`raw/*.txt|*.html` と `本文/*.yaml` の orphan 判定を実装 |
+| `illust` | ✅ | ✅ 完了 | v0.2.11 で導入した `.illustration_cache.yaml` 運用のための `narou illust <sub>` 新設。サブコマンド `orphan`/`migrate`/`fix-ext`/`rebuild` を実装し、削除/改名/移行はいずれも既定 dry-run (`-f` で実行) |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
 | `version` | ✅ | ✅ 完了 | `-v`/`--version` と `--more` を実装。出力順序、help 文言、AozoraEpub3 探索、失敗時メッセージを Ruby 版に揃えた |
 | `log` | ✅ | ✅ 完了 | `--num`, `--tail`, `--source-convert`, `<path>` を実装。最新ログ選択、`.narou/local_setting.yaml` の `log.*` 既定値、`*_convert` フィルタも対応 |
@@ -621,13 +622,39 @@ narou setting name         # 読み取り
 
 ---
 
-### 16. `help` — ✅ 完了
+### 16. `illust` — ✅ 完了
+
+> 挿絵ハッシュストアの運用補助 (orphan/migrate/fix-ext/rebuild)
+
+| オプション | 短縮 | 型 | デフォルト | 説明 |
+|-----------|------|-----|-----------|------|
+| `--force` | `-f` | flag | false | 実際に変更する (削除/改名/移行) |
+| `--all` | `-a` | flag | false | 全小説を対象にする |
+| `<sub>` | — | enum | — | `orphan` / `migrate` / `fix-ext` / `rebuild` |
+| target | | string | — | 小説指定 (省略時=最終変換) |
+
+**サブコマンド**:
+- `orphan` — `.illustration_cache.yaml` の `sources`/`mitemin_ids`/`hashes` と `raw/*.html` の `<img src>` の双方から到達不能な `挿絵/*` を列挙。既定 dry-run、`-f` で削除。
+- `migrate` — レガシー名 (`<話数>-<連番>.ext` / URL basename) をハッシュ名へ一括移行し、ソースマップも更新。非 mitemin も対象。
+- `fix-ext` — マジックバイト判定 (JPEG/PNG/GIF/WEBP/BMP) で拡張子を実体に合わせて改名。
+- `rebuild` — `挿絵/` + `raw/*.html` から `.illustration_cache.yaml` を再構築し永続化。
+
+**Rust 実装**: メンテナンスヘルパー (`find_orphan_illustrations`, `plan_legacy_illustration_migrations` / `apply_legacy_illustration_migrations`, `plan_extension_fixes` / `apply_extension_fixes`, `rebuild_illustration_cache`, `detect_image_extension`) を `src/illustration_store.rs` (crate 側) に集約。`src/commands/illust.rs` は CLI オプション解決と dry-run / `-f` の振り分けに専念し、将来 Web UI から同じ crate 関数を直接呼べる形を維持する。削除系・改名系・移行系はすべて既定 dry-run。`-f` 指定時も本文参照・cache 参照の双方から到達不能 / 移行計画を厳密判定してから実際に変更する (BUG-7/15 と整合)。対象小説の解決は clean と同じく ID / URL / Nコード / タイトル / alias / tag 展開の共通パイプラインを使い、`--all` は凍結済み小説をスキップする。
+
+**互換メモ**:
+- ハッシュ名 (`<64-hex>.ext`) と mitemin ID 名 (`iNNNN.ext`) は canonical とみなし、cache の対応表に既に載っていれば自動的に "到達可能" として orphan 判定から除外する
+- 移行 (`migrate`) 後の cache 更新は、同ルーチン内で `IllustrationStore::remember_hash_source` / `remember_mitemin` を直接呼んで反映する。`rebuild` は store を白紙から組み立てる
+- `sample\\novel` で orphan/migrate/fix-ext/rebuild の dry-run を実行し、作為的 legacy ファイルと孤児ファイルの検出を確認
+
+---
+
+### 18. `help` — ✅ 完了
 
 > このヘルプを表示します
 
 **実装** (`src/commands/help.rs`):
 - 未初期化時: `narou init` を促すメッセージ（`.narou/` ディレクトリ存在チェック）
-- 初期化済み: 全24コマンド一覧 + oneline_help（narou.rb と同一順序・同一テキスト）
+- 初期化済み: 全25コマンド一覧 + oneline_help（narou.rb の24コマンド + Rust 拡張の `illust`、narou.rb と同一順序・同一テキスト）
 - グローバルオプション表示（`--no-color`, `--multiple`, `--time`, `--backtrace`）
 - ショートカット説明（`d`, `fr` 等の例示付き）
 - `NO_COLOR` 環境変数対応（ANSIエスケープコード条件付き出力）
@@ -635,13 +662,13 @@ narou setting name         # 読み取り
 
 **Rust 実装**:
 - 未初期化時 / 初期化済み時のトップレベル help を Ruby版相当に表示
-- 全24コマンドの oneline help、グローバルオプション、ショートカット説明を同一順序で表示
+- 全25コマンドの oneline help、グローバルオプション、ショートカット説明を同一順序で表示
 - `narou <command> -h` の banner、説明文、Examples、Options を Ruby版各 command に合わせて整備
 - `convert` の `Configuration:` 節、`setting -h` の Variable List、`update --gl` の詳細説明表も表示
 
 ---
 
-### 17. `version` — ✅ 完了
+### 19. `version` — ✅ 完了
 
 > バージョンを表示します
 
@@ -653,7 +680,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 18. `log` — ✅ 完了
+### 20. `log` — ✅ 完了
 
 > 保存したログを表示します
 
@@ -668,7 +695,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 19. `folder` — ✅ 完了
+### 21. `folder` — ✅ 完了
 
 > 小説の保存フォルダを開きます
 
@@ -686,7 +713,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 20. `browser` — ✅ 完了
+### 22. `browser` — ✅ 完了
 
 > 小説の掲載ページをブラウザで開きます
 
@@ -703,7 +730,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 21. `alias` — ✅ 完了
+### 23. `alias` — ✅ 完了
 
 > 小説のIDに紐付けた別名を作成します
 
@@ -721,7 +748,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 22. `inspect` — ✅ 完了
+### 24. `inspect` — ✅ 完了
 
 > 小説状態の調査状況ログを表示します
 
@@ -737,7 +764,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 23. `csv` — ✅ 完了
+### 25. `csv` — ✅ 完了
 
 > 小説リストをCSV形式で出力したりインポートしたりします
 
@@ -754,7 +781,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 24. `trace` — ✅ 完了
+### 26. `trace` — ✅ 完了
 
 > 直前のバックトレースを表示します
 

@@ -16,6 +16,7 @@ use clap::Parser;
 use futures::FutureExt;
 
 use cli::{Cli, Commands};
+use commands::illust::IllustSubcommand;
 
 #[cfg(windows)]
 fn prepare_windows_console() {
@@ -527,6 +528,26 @@ fn run_sync_command(
             commands::version::cmd_version(more);
             0
         }
+        Commands::Illust {
+            force,
+            all,
+            sub,
+            targets,
+        } => match sub {
+            Some(resolved) => {
+                let sub = match resolved {
+                    cli::IllustSubcommand::Orphan => IllustSubcommand::Orphan,
+                    cli::IllustSubcommand::Migrate => IllustSubcommand::Migrate,
+                    cli::IllustSubcommand::FixExt => IllustSubcommand::FixExt,
+                    cli::IllustSubcommand::Rebuild => IllustSubcommand::Rebuild,
+                };
+                commands::illust::cmd_illust(sub, &targets, force, all)
+            }
+            None => {
+                commands::help::display_command_help("illust");
+                0
+            }
+        },
         Commands::Web { .. } => unreachable!(),
     }));
 
