@@ -81,7 +81,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | コマンド | narou.rb | Rust 完了度 | 備考 |
 |---------|:--------:|:-----------:|------|
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
-| `download` | ✅ | 🟡 部分 | `--mail` と保存フォルダ欠落時の再DL確認まで実装。`mail` 系の最終 end-to-end 確認待ちで保留 |
+| `download` | ✅ | 🟡 部分 | `--mail` と保存フォルダ欠落時の再DL確認まで実装。`mail` 系の end-to-end は `tests/mail_e2e.rs` で完了済み |
 | `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、section hash cache 永続化、digest選択肢、差分cache退避、Ctrl+C 中断、hotentryのcopy/send/mailまでは実装済み。hotentry 周辺の細部が残る |
 | `convert` | ✅ | 🟡 部分 | `--output` / `--enc` / テキストファイル入力 / `--inspect` / `convert.inspect` / `--no-open` / `--no-epub` / `--no-mobi` / `--no-strip` / `--make-zip` / `--no-zip` / `--verbose` / `device` 設定反映 / `convert.multi-device` / `convert.copy-to` / `convert.copy-zip-to` / `convert.copy-to-grouping` / `--ignore-default` / `--ignore-force` / `dc:subject` 埋め込み / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript`、表紙タイトルの `title_date` / 完結装飾反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFOまでは実装。実機 send 最終確認が残る |
 | `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--echo` と pipe 時ID出力まで実装 |
@@ -92,7 +92,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `setting` | ✅ | ✅ 完了 | 基本読み書き、`--burn`、dynamic `default/force/default_args`、hidden select 値検証、`setting -a` の全変数一覧まで Ruby 互換に揃えた |
 | `diff` | ✅ | ✅ 完了 | 外部 diff ツール、raw データ管理 |
 | `send` | ✅ | ✅ 完了 | Kindle/Kobo/Reader 送信、`--without-freeze`、栞 backup/restore、hotentry を実装 |
-| `mail` | ✅ | 🟡 部分 | `mail_setting.yaml` bootstrap / 不完全設定 path 表示 / spinner / hotentry / `last_mail_date` 差分送信、Pony寄りの SMTP/TLS オプション受理までは実装。実SMTP の最終確認が残る |
+| `mail` | ✅ | ✅ 完了 | `mail_setting.yaml` bootstrap / 不完全設定 path 表示 / spinner / hotentry / `last_mail_date` 差分送信、Pony寄りの SMTP/TLS オプション受理まで実装。`smtp` 経路は `tests/mail_e2e.rs` の end-to-end テストで sender 側・受信側ヘッダまで自動確認済み |
 | `backup` | ✅ | ✅ 完了 | `narou backup`/複数 target、`backup/` 除外、180バイト切り詰めまで対応 |
 | `clean` | ✅ | ✅ 完了 | `latest_convert` 既定値、`--all`、`--force`/`--dry-run`、freeze スキップ、`raw/*.txt|*.html` と `本文/*.yaml` の orphan 判定を実装 |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
@@ -153,9 +153,6 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 有効ターゲット検証: Nコード or URL(サイト設定マッチ)
 - Nコード指定時は `https://ncode.syosetu.com/<ncode>/` からURLキャプチャを作り、サイト定義の `\k<ncode>` を展開してDLする
 - `webnovel/*.yaml` の `series_url` / `series_item_url` に一致するシリーズ URL は、個別小説 URL に展開してから通常の download 処理に渡す。小説家になろう、R18 なろう、カクヨムのシリーズ/コレクション URL に対応
-
-**完了扱いにしない理由 / 不足動作**:
-- `--mail` の最終的な実SMTP end-to-end 検証は `mail` コマンド側の未了項目と共通
 
 ---
 
@@ -505,7 +502,7 @@ narou setting name         # 読み取り
 
 ---
 
-### 12. `mail` — 🟡 部分
+### 12. `mail` — ✅ 完了
 
 > 変換したEPUB/MOBIをメールで送信します
 
@@ -523,10 +520,14 @@ narou setting name         # 読み取り
 - `smtp` 経路では preset に含まれる `via_options.domain` を EHLO 名へ反映し、`authentication` は `:plain` / `:login` / `:xoauth2` を受理する
 - `smtp` の TLS 解釈は Ruby/Pony 寄りに拡張しつつ、narou.rs では既定で TLS 必須にした。`ssl` / `tls` / `enable_starttls` / `enable_starttls_auto` は継続受理し、`allow_insecure: true` / `mail.smtp.allow_insecure` と `tls_skip_verify: true` / `mail.smtp.tls_skip_verify` を明示した場合だけ平文SMTP・opportunistic STARTTLS・証明書検証無効化を許可する
 - message 生成では `reply_to` / `cc` / `bcc` を受理し、複数宛先は YAML sequence またはカンマ区切り文字列で解釈する
+- `tests/mail_e2e.rs` でローカル SMTP listener を使った end-to-end 検証を行う
+  - `smtp` 経路で送受信双方が期待どおり動くことを確認 (From / To / Subject / body / Content-Type / 添付ファイル名)
+  - `Content-Disposition` の `filename*0*=` / `filename*1*=` 分割を含む RFC 2231 / RFC 5987 エンコード下でも元ファイル名が保持されることを検証
+  - CC / 複数宛先の分割、`last_mail_date` 差分送信、既定の安全既定 (平文 SMTP は `allow_insecure: true` 明示 opt-in が必須) も網羅
 
-**完了扱いにしない理由 / 不足動作**:
-- Ruby版 Mailer/Pony 設定のうち `smtp` 以外の経路や周辺オプションは未確認
-- 実SMTP を使った sender-side / arrival-side の end-to-end 検証がまだ不足
+**補注 (完了一覧の「不足動作」ではなく実装上の事実)**:
+- narou.rs の `mail` 実装は `via: smtp` のみ対応で、Ruby版 Mailer/Pony が持つ sendmail 等の代替経路は未対応。`mail_setting.yaml` の `via` に smtp 以外を指定すると明示的にエラーを返す
+- 実 SMTP end-to-end は `tests/mail_e2e.rs` で自動検証済み。TLS ハンドシェイク (STARTTLS / Wrapper / 証明書検証) は再現に自己署名証明書が必要なため、平文経路のみ自動テストでカバーしている
 
 ---
 
@@ -769,7 +770,7 @@ narou setting name         # 読み取り
 | download `--force`, `--no-convert`, `--freeze` | download | DL フラグ互換 |
 | update の残互換実装 | update | Ruby版ターゲット解決・`--gl`主要挙動・`update.strong`・section hash cache 永続化・digest選択肢・差分用 cache 退避・Ctrl+C 中断・hotentry の copy/send/mail までは実装済み。hotentry 周辺の細部が残る |
 | convert send | convert | `--no-strip` まで実装済み。残りは実機 send 最終確認 |
-| download の残互換実装 | download | command 固有の欠落はほぼ解消。残りは `mail` と共有の実SMTP end-to-end 確認 |
+| download の残互換実装 | download | command 固有の欠落はほぼ解消。`mail` 系の end-to-end は `tests/mail_e2e.rs` で別途完了済み |
 
 ### P1: 設定管理基盤
 多くのコマンドが `local_setting` / `global_setting` に依存する。
