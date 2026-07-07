@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,7 +48,7 @@ pub enum JobType {
     Mail,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QueueLane {
     Default,
     Secondary,
@@ -613,6 +613,45 @@ impl PersistentQueue {
             .chain(state.active_running.iter())
             .map(|job| job.job.clone())
             .collect()
+    }
+
+    /// Collect the set of novel IDs currently held by running jobs across both
+    /// the active and deferred running queues. Used by the web worker to apply
+    /// per-novel exclusion so that, for example, a `convert` job for novel X
+    /// does not start while an `update` for X is still running on the Default
+    /// lane. Non-numeric tokens in a target string (e.g. `--force` or
+    /// `tag:modified`) are ignored.
+    pub fn running_novel_ids(&self) -> HashSet<i64> {
+        let state = self.state.lock();
+        state
+            .deferred_running
+            .iter()
+            .chain(state.active_running.iter())
+            .flat_map(|stored| extract_novel_ids(&stored.job.target).into_iter())
+            .collect()
+    }
+
+    /// Collect running novel IDs grouped by lane. Lets the web worker apply
+    /// per-novel exclusion with lane awareness: a candidate on lane L should
+    /// only be blocked by running jobs on the *other* lane, so concurrent
+    /// updates on the Default lane for different novels do not stall each
+    /// other. See [`PersistentQueue::running_novel_ids`] for the lane-blind
+    /// variant.
+    pub fn running_novel_ids_by_lane(&self) -> std::collections::HashMap<QueueLane, HashSet<i64>> {
+        use std::collections::HashMap;
+        let mut by_lane: HashMap<QueueLane, HashSet<i64>> = HashMap::new();
+        let state = self.state.lock();
+        for stored in state
+            .deferred_running
+            .iter()
+            .chain(state.active_running.iter())
+        {
+            by_lane
+                .entry(stored.job.job_type.lane())
+                .or_default()
+                .extend(extract_novel_ids(&stored.job.target));
+        }
+        by_lane
     }
 
     pub fn has_restorable_tasks(&self) -> bool {
@@ -1238,6 +1277,21 @@ fn queue_job_to_legacy_parts(job_type: JobType, target: &str) -> (String, Vec<Va
 
 fn split_job_target(target: &str) -> Vec<&str> {
     target.split('\t').filter(|part| !part.is_empty()).collect()
+}
+
+/// Extract the set of numeric novel IDs from a queue job target string.
+///
+/// Targets are tab-separated lists of arguments (see [`split_job_target`])
+/// and may include non-numeric tokens such as `--force` or `tag:modified`.
+/// Only tokens that parse as `i64` are returned, so callers can use the
+/// resulting set to compare novel identities without worrying about flag
+/// or tag prefixes. An empty result means the job is not tied to any
+/// specific novel ID (e.g. `AutoUpdate` jobs that broadcast to the queue).
+pub fn extract_novel_ids(target: &str) -> HashSet<i64> {
+    target
+        .split('\t')
+        .filter_map(|part| part.parse::<i64>().ok())
+        .collect()
 }
 
 fn flatten_values(values: &[Value]) -> Vec<String> {
@@ -2104,5 +2158,106 @@ updated_at: "2026-05-01T00:00:00Z"
         assert!(saved.contains("source: ruby"));
         assert!(saved.contains("- - '12'"));
         assert!(saved.contains("- - '56'"));
+    }
+
+    #[test]
+    fn extract_novel_ids_picks_numeric_tokens_only() {
+        assert!(super::extract_novel_ids("").is_empty());
+        assert!(super::extract_novel_ids("tag:modified").is_empty());
+        assert!(super::extract_novel_ids("--backup-bookmark").is_empty());
+        assert_eq!(
+            super::extract_novel_ids("12"),
+            HashSet::from([12i64])
+        );
+        assert_eq!(
+            super::extract_novel_ids("12\tkindle"),
+            HashSet::from([12i64])
+        );
+        assert_eq!(
+            super::extract_novel_ids("1\t2\t3"),
+            HashSet::from([1i64, 2, 3])
+        );
+        assert_eq!(
+            super::extract_novel_ids("--force\t12\ttag:modified"),
+            HashSet::from([12i64])
+        );
+        // empty tabs and non-numeric tokens are ignored
+        assert_eq!(
+            super::extract_novel_ids("12\t\t34\tabc\t1.5"),
+            HashSet::from([12i64, 34])
+        );
+        // negative numbers are kept (legacy ids may carry a sign on some sites)
+        assert_eq!(
+            super::extract_novel_ids("-7"),
+            HashSet::from([-7i64])
+        );
+    }
+
+    #[test]
+    fn running_novel_ids_collects_from_active_and_deferred_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+
+        // Empty state -> empty set
+        assert!(queue.running_novel_ids().is_empty());
+        assert!(queue.running_novel_ids_by_lane().is_empty());
+
+        // Pop a Default-lane update for novel 12 to put it in active_running.
+        queue.push(JobType::Update, "12").unwrap();
+        let running_update = queue.pop_for_lane(QueueLane::Default).unwrap();
+        assert_eq!(running_update.target, "12");
+
+        // Pop a Secondary-lane convert for novel 34 to put it in active_running.
+        queue.push(JobType::Convert, "34").unwrap();
+        let running_convert = queue.pop_for_lane(QueueLane::Secondary).unwrap();
+        assert_eq!(running_convert.target, "34");
+
+        // At this point the in-process queue has both 12 (Default) and 34
+        // (Secondary) running.
+        let active_novel_ids = queue.running_novel_ids();
+        assert_eq!(active_novel_ids, HashSet::from([12i64, 34i64]));
+        let active_by_lane = queue.running_novel_ids_by_lane();
+        assert!(active_by_lane.get(&QueueLane::Default).unwrap().contains(&12i64));
+        assert!(active_by_lane.get(&QueueLane::Secondary).unwrap().contains(&34i64));
+
+        // Now seed a YAML file with both lanes running so we can verify the
+        // helper also reaches deferred_running.
+        std::fs::write(
+            &queue_path,
+            "---\npending: []\nrunning:\n  - id: deferred-running-default\n    cmd: update\n    args:\n      - '99'\n    meta: {}\n    status: running\n    created_at: '2026-07-07T00:00:00+09:00'\n    started_at: '2026-07-07T00:01:00+09:00'\n  - id: deferred-running-secondary\n    cmd: convert\n    args:\n      - '34'\n    meta: {}\n    status: running\n    created_at: '2026-07-07T00:02:00+09:00'\n    started_at: '2026-07-07T00:03:00+09:00'\ncompleted: []\nfailed: []\ncancelled: []\nupdated_at: '2026-07-07T00:04:00+09:00'\n",
+        )
+        .unwrap();
+        let queue_with_deferred = PersistentQueue::new(&queue_path).unwrap();
+
+        // running_novel_ids picks up novels across both default and secondary
+        // lanes after the reload.
+        let novel_ids = queue_with_deferred.running_novel_ids();
+        assert!(novel_ids.contains(&34i64));
+        assert!(novel_ids.contains(&99i64));
+        assert!(!novel_ids.contains(&12i64));
+
+        // running_novel_ids_by_lane separates by lane.
+        let by_lane = queue_with_deferred.running_novel_ids_by_lane();
+        let default_novels = by_lane.get(&QueueLane::Default).cloned().unwrap_or_default();
+        let secondary_novels = by_lane.get(&QueueLane::Secondary).cloned().unwrap_or_default();
+        assert!(default_novels.contains(&99i64));
+        assert!(!default_novels.contains(&34i64));
+        assert!(secondary_novels.contains(&34i64));
+        assert!(!secondary_novels.contains(&99i64));
+    }
+
+    #[test]
+    fn running_novel_ids_ignores_non_numeric_target_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+
+        // A target that mixes a numeric ID with a tag and a flag should still
+        // surface the numeric ID.
+        queue.push(JobType::Update, "42\ttag:modified\t--force").unwrap();
+        queue.pop_for_lane(QueueLane::Default).unwrap();
+
+        assert_eq!(queue.running_novel_ids(), HashSet::from([42i64]));
     }
 }

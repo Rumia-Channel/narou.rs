@@ -16,7 +16,7 @@ use crate::compat::{
 use crate::db::{with_database, with_database_mut};
 use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
 use crate::queue::{
-    JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane,
+    extract_novel_ids, JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane,
     WEBUI_MESSAGE_TEXT_META_KEY, WEBUI_MESSAGE_TYPE_META_KEY, WEBUI_UPDATE_START_MESSAGE_TYPE,
 };
 
@@ -312,37 +312,65 @@ fn pop_next_job(
         WorkerLane::All => queue.pop(),
         WorkerLane::Default => {
             let running = running_jobs.lock().clone();
+            let queue_running = queue.running_novel_ids_by_lane();
             queue.pop_for_lane_excluding(QueueLane::Default, |candidate| {
-                job_conflicts_with_running(candidate, &running)
+                job_conflicts_with_running(candidate, &running, &queue_running)
             })
         }
         WorkerLane::Secondary => {
             let running = running_jobs.lock().clone();
+            let queue_running = queue.running_novel_ids_by_lane();
             queue.pop_for_lane_excluding(QueueLane::Secondary, |candidate| {
-                job_conflicts_with_running(candidate, &running)
+                job_conflicts_with_running(candidate, &running, &queue_running)
             })
         }
     }
 }
 
-fn job_conflicts_with_running(candidate: &QueueJob, running_jobs: &[QueueJob]) -> bool {
-    let candidate_ids = numeric_job_targets(candidate);
+/// Decide whether `candidate` should be skipped because the same novel is
+/// already being processed by a running job on the *other* lane.
+///
+/// Two data sources are consulted so the lock survives worker restarts and
+/// external enqueues:
+///
+/// 1. The in-process `running_jobs` Vec the worker maintains locally while a
+///    job is being executed (registered on pop, unregistered on completion).
+/// 2. The shared `PersistentQueue::active_running` / `deferred_running`
+///    snapshots, exposed via [`PersistentQueue::running_novel_ids_by_lane`].
+///
+/// Jobs without a numeric novel ID in their target (e.g. `AutoUpdate`,
+/// `Backup`, `--backup-bookmark`, `tag:modified`) never trigger the lock so
+/// that broadcasts and tag-wide operations can still proceed.
+fn job_conflicts_with_running(
+    candidate: &QueueJob,
+    running_jobs: &[QueueJob],
+    queue_running_by_lane: &HashMap<QueueLane, HashSet<i64>>,
+) -> bool {
+    let candidate_ids = extract_novel_ids(&candidate.target);
     if candidate_ids.is_empty() {
         return false;
     }
-    running_jobs.iter().any(|running| {
+    // In-process running set: cheap snapshot, covers the case where the same
+    // worker just popped a conflicting job but the PersistentQueue's own
+    // running snapshot is slightly stale.
+    let local_conflict = running_jobs.iter().any(|running| {
         running.job_type.lane() != candidate.job_type.lane()
-            && numeric_job_targets(running)
+            && extract_novel_ids(&running.target)
                 .iter()
                 .any(|id| candidate_ids.contains(id))
-    })
-}
-
-fn numeric_job_targets(job: &QueueJob) -> HashSet<i64> {
-    job.target
-        .split('\t')
-        .filter_map(|part| part.parse::<i64>().ok())
-        .collect()
+    });
+    if local_conflict {
+        return true;
+    }
+    // Persistent queue snapshot: catches running jobs that originated from
+    // other workers, an external queue instance, or were restored from disk.
+    let other_lane = match candidate.job_type.lane() {
+        QueueLane::Default => QueueLane::Secondary,
+        QueueLane::Secondary => QueueLane::Default,
+    };
+    queue_running_by_lane
+        .get(&other_lane)
+        .is_some_and(|other_novels| candidate_ids.iter().any(|id| other_novels.contains(id)))
 }
 
 fn register_running_job(running_jobs: &parking_lot::Mutex<Vec<QueueJob>>, job: &QueueJob) {
@@ -1191,16 +1219,17 @@ mod tests {
     use std::os::windows::process::ExitStatusExt;
 
     use super::{
-        MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, JobOutcome, JobRunResult,
+        MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, JobOutcome, JobRunResult, WorkerLane,
         classify_job_outcome, clear_progress_for_job, compute_retry_backoff_secs,
         console_target_for_job, convert_targets_and_device, execution_spec_meta_bool,
         execution_spec_meta_string, execution_spec_meta_strings, failure_reason,
         is_transient_failure, job_conflicts_with_running, parse_backoff_spec,
-        parse_backoff_value, parse_convert_job_target, remember_failure_line,
+        parse_backoff_value, parse_convert_job_target, pop_next_job, remember_failure_line,
         route_structured_web_message, should_retry_job, summarize_failure_details,
         update_by_tag_update_args,
     };
-    use crate::queue::{JobType, QueueJob};
+    use crate::queue::{JobType, PersistentQueue, QueueJob, QueueLane};
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn parse_convert_job_target_splits_device_override() {
@@ -1316,19 +1345,84 @@ mod tests {
             max_retries: 3,
             available_at: None,
         };
+        let empty_running_by_lane = HashMap::<QueueLane, HashSet<i64>>::new();
 
         assert!(job_conflicts_with_running(
             &same_novel_convert,
-            &[running_update.clone()]
+            &[running_update.clone()],
+            &empty_running_by_lane,
         ));
         assert!(!job_conflicts_with_running(
             &other_novel_convert,
-            &[running_update.clone()]
+            &[running_update.clone()],
+            &empty_running_by_lane,
         ));
         assert!(!job_conflicts_with_running(
             &same_lane_download,
-            &[running_update]
+            &[running_update],
+            &empty_running_by_lane,
         ));
+    }
+
+    /// When an `update` for novel 12 is running on the Default lane, a
+    /// pending `convert` for the same novel must be skipped even though it
+    /// belongs to the Secondary lane. A `convert` for a different novel
+    /// should still be poppable. This locks in the cross-lane per-novel
+    /// exclusion that protects the on-disk queue.yaml from a Default-lane
+    /// update and a Secondary-lane convert touching the same novel at the
+    /// same time.
+    #[test]
+    fn pop_next_job_blocks_secondary_lane_convert_for_novel_running_on_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let running_jobs: parking_lot::Mutex<Vec<QueueJob>> = parking_lot::Mutex::new(Vec::new());
+
+        // Pop an update for novel 12 from the Default lane so it lives in
+        // both the local running_jobs Vec and PersistentQueue's active_running.
+        queue.push(JobType::Update, "12").unwrap();
+        let running = queue.pop_for_lane(QueueLane::Default).unwrap();
+        assert_eq!(running.target, "12");
+        running_jobs.lock().push(running);
+
+        // Queue two converts: novel 12 (blocked) and novel 99 (free).
+        queue.push(JobType::Convert, "12").unwrap();
+        queue.push(JobType::Convert, "99").unwrap();
+
+        let first = pop_next_job(&queue, WorkerLane::Secondary, &running_jobs)
+            .expect("unblocked novel 99 convert should pop");
+        assert_eq!(first.target, "99");
+
+        // The second candidate (novel 12) is blocked by the Default-lane
+        // running update for novel 12, so pop_next_job returns None.
+        assert!(pop_next_job(&queue, WorkerLane::Secondary, &running_jobs).is_none());
+
+        // Sanity: the blocked convert is still pending on disk.
+        assert_eq!(queue.active_pending_count(), 1);
+    }
+
+    /// Even when the local running_jobs Vec is empty, the PersistentQueue's
+    /// own active_running snapshot must still trigger the per-novel lock.
+    /// This covers the case where a sibling worker (or an external queue
+    /// instance) has popped a running job for the same novel, so the local
+    /// worker should defer the convert to avoid a race.
+    #[test]
+    fn pop_next_job_consults_persistent_queue_running_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let running_jobs: parking_lot::Mutex<Vec<QueueJob>> = parking_lot::Mutex::new(Vec::new());
+
+        // Pop an update for novel 12 from the Default lane. The local
+        // running_jobs Vec stays empty on purpose so only the persistent
+        // snapshot is consulted by pop_next_job.
+        queue.push(JobType::Update, "12").unwrap();
+        let _running = queue.pop_for_lane(QueueLane::Default).unwrap();
+
+        queue.push(JobType::Convert, "12").unwrap();
+
+        assert!(pop_next_job(&queue, WorkerLane::Secondary, &running_jobs).is_none());
+        assert_eq!(queue.active_pending_count(), 1);
     }
 
     #[test]
