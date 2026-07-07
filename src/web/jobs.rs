@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use axum::{
-    extract::{Form, Query, State},
+    extract::{Query, State},
     http::{StatusCode, header},
     response::{Html, IntoResponse, Json, Response},
 };
@@ -105,10 +105,6 @@ fn update_start_message(meta: &Mapping) -> Option<String> {
         }
         _ => None,
     }
-}
-
-fn query_to_bool(value: Option<&str>) -> bool {
-    matches!(value, Some("1" | "true" | "yes" | "on"))
 }
 
 fn log_web_failure(context: &str, error: impl std::fmt::Display) {
@@ -400,72 +396,6 @@ fn queue_download_jobs(
         })
         .collect();
     queue.push_batch(&jobs).map_err(|e| e.to_string())
-}
-
-fn queue_bookmarklet_download(
-    queue: &PersistentQueue,
-    target: &str,
-    mail: bool,
-) -> Result<String, String> {
-    let target = super::validate_web_target_value(target)
-        .map_err(|_| "invalid download target".to_string())?;
-    let job_target = if mail {
-        format!("--mail\t{}", target)
-    } else {
-        target
-    };
-    queue
-        .push(JobType::Download, &job_target)
-        .map_err(|e| e.to_string())
-}
-
-fn bookmarklet_download_response(
-    state: &AppState,
-    params: &BookmarkletDownloadQuery,
-) -> serde_json::Value {
-    let Some(target) = params
-        .target
-        .as_deref()
-        .map(str::trim)
-        .filter(|target| !target.is_empty())
-    else {
-        return serde_json::json!({ "status": 2, "id": null });
-    };
-    if let Some(id) = resolve_existing_id_for_target(target) {
-        return serde_json::json!({ "status": 1, "id": id });
-    }
-    match queue_bookmarklet_download(
-        state.queue.as_ref(),
-        target,
-        query_to_bool(params.mail.as_deref()),
-    ) {
-        Ok(_) => {
-            state.push_server.broadcast_event("notification.queue", "");
-            serde_json::json!({ "status": 0, "id": null })
-        }
-        Err(error) => {
-            log_web_failure("bookmarklet download", error);
-            serde_json::json!({ "status": 2, "id": null })
-        }
-    }
-}
-
-fn render_post_only_notice(path: &str) -> Html<String> {
-    let escaped_path = html_escape(path);
-    Html(format!(
-        r#"<!DOCTYPE html>
-<html lang="ja">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>narou.rs</title>
-</head>
-<body>
-  <p>{escaped_path} は POST 専用になりました。古いブックマークレットは利用できません。</p>
-  <p><a href="/bookmarklet">/bookmarklet</a> から最新版を再登録してください。</p>
-</body>
-</html>"#
-    ))
 }
 
 fn resolve_existing_id_for_target(target: &str) -> Option<i64> {
@@ -1574,28 +1504,6 @@ pub async fn api_diff_list_get(
     )
 }
 
-// GET /api/download_request
-pub async fn bookmarklet_download_request_post_required(
-    Query(_params): Query<BookmarkletDownloadQuery>,
-) -> Html<String> {
-    render_post_only_notice("/api/download_request")
-}
-
-// GET /api/download4ssl
-pub async fn bookmarklet_download4ssl_post_required(
-    Query(_params): Query<BookmarkletDownloadQuery>,
-) -> Html<String> {
-    render_post_only_notice("/api/download4ssl")
-}
-
-// POST /api/download_request
-pub async fn api_download_request(
-    State(state): State<AppState>,
-    Form(params): Form<BookmarkletDownloadQuery>,
-) -> Json<serde_json::Value> {
-    Json(bookmarklet_download_response(&state, &params))
-}
-
 // GET /api/downloadable.gif
 pub async fn api_downloadable_gif(
     State(_state): State<AppState>,
@@ -1611,15 +1519,6 @@ pub async fn api_downloadable_gif(
         }
         _ => 2,
     };
-    gif_response()
-}
-
-// POST /api/download4ssl
-pub async fn api_download4ssl(
-    State(state): State<AppState>,
-    Form(params): Form<BookmarkletDownloadQuery>,
-) -> Response {
-    let _ = bookmarklet_download_response(&state, &params);
     gif_response()
 }
 
@@ -2184,10 +2083,10 @@ pub async fn api_taginfo(
     let tag_info = with_database(|db| {
         let tag_index = db.tag_index();
         let inventory = db.inventory();
-        let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
+        let mut tag_colors = crate::tag_colors::load_tag_colors(inventory)?;
         let tag_names = tag_index.keys().map(String::as_str);
-        if super::tag_colors::ensure_tag_colors(&mut tag_colors, tag_names) {
-            super::tag_colors::save_tag_colors(inventory, &tag_colors)?;
+        if crate::tag_colors::ensure_tag_colors(&mut tag_colors, tag_names) {
+            crate::tag_colors::save_tag_colors(inventory, &tag_colors)?;
         }
         let tag_colors = tag_colors.into_map();
 
@@ -2591,6 +2490,7 @@ mod tests {
             created_at: 0,
             retry_count: 0,
             max_retries: 3,
+            available_at: None,
         }]);
 
         let existing = existing_update_job_id(&queue, &running_jobs, "tag:modified", "update", false);
@@ -2703,6 +2603,7 @@ mod tests {
             created_at: 0,
             retry_count: 0,
             max_retries: 0,
+            available_at: None,
         };
         let spec = QueueExecutionSpec {
             cmd: "update_general_lastup".to_string(),

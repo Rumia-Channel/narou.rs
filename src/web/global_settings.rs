@@ -354,6 +354,7 @@ fn is_live_webui_config_name(name: &str) -> bool {
         "webui.theme"
             | "webui.table.reload-timing"
             | "webui.performance-mode"
+            | "webui.new-tag-color"
             | "webui.debug-mode"
     )
 }
@@ -395,6 +396,16 @@ fn select_summaries_for_setting(name: &str, info: &VarInfo) -> Option<Vec<String
             "自動判定".to_string(),
             "常に有効".to_string(),
             "常に無効".to_string(),
+        ],
+        "webui.new-tag-color" => vec![
+            "自動 (巡回)".to_string(),
+            "緑".to_string(),
+            "黄".to_string(),
+            "青".to_string(),
+            "紫".to_string(),
+            "水色".to_string(),
+            "赤".to_string(),
+            "白".to_string(),
         ],
         _ => keys.clone(),
     })
@@ -485,6 +496,27 @@ mod tests {
     }
 
     #[test]
+    fn select_summaries_include_new_tag_color_labels() {
+        let vars = setting_variables();
+        let info = vars
+            .get("webui.new-tag-color")
+            .expect("webui.new-tag-color metadata");
+        assert_eq!(
+            select_summaries_for_setting("webui.new-tag-color", info),
+            Some(vec![
+                "自動 (巡回)".to_string(),
+                "緑".to_string(),
+                "黄".to_string(),
+                "青".to_string(),
+                "紫".to_string(),
+                "水色".to_string(),
+                "赤".to_string(),
+                "白".to_string(),
+            ])
+        );
+    }
+
+    #[test]
     fn select_summaries_support_default_prefixed_settings() {
         let vars = setting_variables();
         let info = vars.get("device").expect("device metadata");
@@ -518,6 +550,7 @@ mod tests {
         assert!(is_live_webui_config_name("webui.theme"));
         assert!(is_live_webui_config_name("webui.table.reload-timing"));
         assert!(is_live_webui_config_name("webui.performance-mode"));
+        assert!(is_live_webui_config_name("webui.new-tag-color"));
         assert!(is_live_webui_config_name("webui.debug-mode"));
         assert!(!is_live_webui_config_name("server-port"));
     }

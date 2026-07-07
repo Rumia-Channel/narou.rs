@@ -274,15 +274,18 @@ fn load_last_auto_update_run() -> Option<DateTime<Local>> {
 
 fn persist_last_auto_update_run(timestamp: DateTime<Local>) -> Result<(), String> {
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let mut settings: HashMap<String, Value> = inventory
-        .load("local_setting", InventoryScope::Local)
-        .unwrap_or_default();
-    settings.insert(
-        AUTO_UPDATE_LAST_RUN_KEY.to_string(),
-        Value::Number(Number::from(timestamp.timestamp())),
-    );
     inventory
-        .save("local_setting", InventoryScope::Local, &settings)
+        .update_yaml::<(), HashMap<String, Value>, _>(
+            "local_setting",
+            InventoryScope::Local,
+            |mut settings| {
+                settings.insert(
+                    AUTO_UPDATE_LAST_RUN_KEY.to_string(),
+                    Value::Number(Number::from(timestamp.timestamp())),
+                );
+                Ok((settings, ()))
+            },
+        )
         .map_err(|e| e.to_string())
 }
 
@@ -808,6 +811,7 @@ mod tests {
             created_at: 0,
             retry_count: 0,
             max_retries: 3,
+            available_at: None,
         }]);
 
         let (job_id, queued) = queue_auto_update_job_if_needed(&queue, &running_jobs).unwrap();

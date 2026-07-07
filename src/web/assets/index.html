@@ -529,6 +529,26 @@
       </div>
     </div>
 
+    <!-- Bookmarklet Register Modal (bookmarklet same-origin registration) -->
+    <div class="modal-overlay hide" id="register-modal">
+      <div class="modal-dialog modal-dialog-sm">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="register-modal-close" type="button">&times;</button>
+            <h4 class="modal-title">ブックマークレット登録の確認</h4>
+          </div>
+          <div class="modal-body">
+            <p>表示中のページを小説として登録しますか？</p>
+            <p class="register-url-wrap"><code id="register-url" class="register-url"></code></p>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="register-cancel" type="button">キャンセル</button>
+            <button class="btn btn-primary" id="register-ok" type="button">登録</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Remove Confirm Modal -->
     <div class="modal-overlay hide" id="remove-modal">
       <div class="modal-dialog modal-dialog-sm">

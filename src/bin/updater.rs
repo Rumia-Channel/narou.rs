@@ -141,6 +141,28 @@ fn main() {
         .unwrap_or_else(|| install_dir.join("update.log"));
     let mut logger = Logger::open(Some(&log_path));
 
+    // Unix では本体 (親) のセッションが終了すると SIGHUP が届く。
+    // 親が exit するのを待つ間も updater が生き残るよう、デフォルト
+    // の SIGHUP 終了動作を無効化する。spawn される側で setsid が
+    // 効いていれば本来ここでの IGN は不要だが、多重防御として入れる。
+    #[cfg(not(windows))]
+    {
+        let prev = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        logger.log(format!(
+            "session: updater pid={} getsid={} SIGHUP prev_handler={:?}",
+            std::process::id(),
+            unsafe { libc::getsid(0) },
+            prev,
+        ));
+    }
+    #[cfg(windows)]
+    {
+        logger.log(format!(
+            "session: updater pid={} (Windows; no setsid)",
+            std::process::id()
+        ));
+    }
+
     logger.log(format!(
         "updater start: pid={:?} zip={:?} install_dir={:?} restart={:?}",
         args.pid, zip_path, install_dir, args.restart
@@ -409,6 +431,7 @@ fn spawn_restart(
     let child = command
         .spawn()
         .map_err(|e| format!("spawn {program_path:?}: {e}"))?;
+    logger.log(format!("restart pid={}", child.id()));
     drop(child);
     Ok(())
 }
@@ -430,8 +453,22 @@ fn detach_command(command: &mut Command) {
 }
 
 #[cfg(not(windows))]
-fn detach_command(_command: &mut Command) {
-    // Best-effort: rely on the OS to keep the child alive after we exit.
+fn detach_command(command: &mut Command) {
+    // Unix では setsid(2) で新セッションリーダ化して SIGHUP から
+    // 切り離す。stdin/stdout/stderr は呼び出し側で null 化済みの前提。
+    use std::io;
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // 万一 setsid 後に制御端末を獲得しても SIGHUP で死なないよう
+            // 明示的に無視しておく。
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
 }
 
 #[cfg(test)]

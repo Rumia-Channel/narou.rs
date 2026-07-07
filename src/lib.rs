@@ -15,6 +15,7 @@ pub mod progress;
 pub mod queue;
 pub mod setting_core;
 pub mod setting_info;
+pub mod tag_colors;
 pub mod termcolor;
 pub mod updater_promote;
 pub mod version;

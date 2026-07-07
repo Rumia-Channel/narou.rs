@@ -1,12 +1,14 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use indicatif::MultiProgress;
 
 use narou_rs::compat::{
     configure_web_subprocess_command, convert_existing_novel, current_device,
@@ -29,18 +31,25 @@ use narou_rs::mail::{
 use narou_rs::progress::{CliProgress, ProgressReporter, WebProgress, is_web_mode};
 use narou_rs::termcolor::{bold_colored, colored};
 use narou_rs::web::sort_state::{SORT_COLUMN_KEYS, sort_column_label_for_key, sort_record_ordering};
+use narou_rs::progress::safe_println as safe_println_fn;
 
 const MODIFIED_TAG: &str = "modified";
 const INTERVAL_MIN_SECS: f64 = 2.5;
 const FORCE_WAIT_SECS: f64 = 2.0;
 const HOTENTRY_DIR_NAME: &str = "hotentry";
 const HOTENTRY_FOOTER: &str = "［＃ここから地付き］［＃小書き］（本を読み終わりました）［＃小書き終わり］［＃ここで地付き終わり］";
+/// Placeholder bucket for novels whose site domain isn't known yet
+/// (e.g. brand-new record without a downloaded toc.yaml). Grouping
+/// these together ensures they still run serially while the rest of
+/// the library can run in parallel.
+const UNKNOWN_DOMAIN_KEY: &str = "__unknown__";
 
 static UPDATE_INTERRUPT_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
 struct UpdateInterrupted;
 
+#[derive(Clone)]
 pub struct UpdateOptions {
     pub ids: Option<Vec<String>>,
     pub force: bool,
@@ -50,6 +59,42 @@ pub struct UpdateOptions {
     pub sort_by: Option<String>,
     pub ignore_all: bool,
     pub user_agent: Option<String>,
+}
+
+/// Shared per-update context. Cloned into each parallel worker so a
+/// worker has everything it needs without further dependencies on
+/// the original `cmd_update` closure (which cannot be sent across
+/// threads anyway).
+#[derive(Clone)]
+struct UpdateContext {
+    opts: UpdateOptions,
+    interval_secs: f64,
+    hotentry_enabled: bool,
+    is_bulk: bool,
+    convert_only_new_arrival: bool,
+    web_debug_mode: bool,
+    multi: Arc<MultiProgress>,
+}
+
+/// Outcome of a parallel dispatch so the caller knows whether to
+/// surface an error exit or carry on normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParallelUpdateOutcome {
+    Completed,
+    Aborted,
+}
+
+impl UpdateContext {
+    fn make_progress(&self, id: i64) -> Box<dyn ProgressReporter> {
+        if is_web_mode() {
+            Box::new(WebProgress::new("update"))
+        } else {
+            Box::new(CliProgress::with_multi(
+                &format!("DL {}", id),
+                self.multi.clone(),
+            ))
+        }
+    }
 }
 
 pub fn cmd_update(opts: UpdateOptions) {
@@ -81,7 +126,7 @@ pub fn cmd_update(opts: UpdateOptions) {
         let web_debug_mode = is_web_mode() && load_local_setting_bool("webui.debug-mode");
 
         let stdin_targets = read_targets_from_stdin();
-        let merged_ids = merge_cli_and_stdin_targets(opts.ids, stdin_targets);
+        let merged_ids = merge_cli_and_stdin_targets(opts.ids.clone(), stdin_targets);
         let is_bulk = merged_ids.is_none();
         let (target_ids, unresolved_count) =
             resolve_targets(merged_ids.as_deref(), opts.ignore_all, sort_by.as_deref());
@@ -95,144 +140,80 @@ pub fn cmd_update(opts: UpdateOptions) {
         let _total = target_ids.len();
         let mut mistook = unresolved_count;
 
-        let mut downloader = match Downloader::with_user_agent(opts.user_agent.as_deref()) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Error creating downloader: {}", e);
-                std::process::exit(1);
-            }
-        };
-
         let multi = CliProgress::multi();
-        let multi_clone = multi.clone();
         let hotentry_enabled = load_local_setting_bool("hotentry");
         let mut hotentries: HashMap<i64, Vec<SubtitleInfo>> = HashMap::new();
 
-        let mut last_time = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs_f64(interval_secs))
-            .unwrap_or_else(std::time::Instant::now);
+        // Build the shared context once so the per-novel helper and any
+        // parallel workers can clone it cheaply.
+        let ctx = UpdateContext {
+            opts: opts.clone(),
+            interval_secs,
+            hotentry_enabled,
+            is_bulk,
+            convert_only_new_arrival,
+            web_debug_mode,
+            multi: multi.clone(),
+        };
 
-        for (i, &id) in target_ids.iter().enumerate() {
-            abort_if_interrupted(interrupted.as_ref())?;
+        // -- Decide between serial and per-domain parallel dispatch --
+        // Parallel mode spawns one worker thread per `update.max-parallel-domains`
+        // (capped by the number of unique domains). Workers process
+        // their assigned domain serially so per-site etiquette is
+        // preserved. The serial path remains for cases where:
+        //   * the user pinned `update.max-parallel-domains: 1`
+        //   * the DB has no domain info yet
+        //   * we're inside the web server (force=なし
+        //                                      web mode requires single-stream
+        //                                      progress to keep the WS
+        //                                      stream coherent)
+        //   * we're forcing a re-download (digest prompt is interactive)
+        let max_parallel_domains = load_update_max_parallel_domains();
+        let parallel_eligible = max_parallel_domains > 1
+            && !is_web_mode()
+            && !opts.force;
 
-            if i > 0 {
-                println!("{}", "\u{2015}".repeat(35));
-            }
+        let domain_records = match collect_record_domains(&target_ids) {
+            Ok(map) => map,
+            Err(_) => HashMap::new(),
+        };
 
-            let frozen = !opts.force && is_novel_frozen(id);
-            if frozen {
-                if is_bulk {
-                    continue;
-                }
-                let title = get_novel_title(id);
-                println!("ID:{}　{} は凍結中です", id, title);
-                mistook += 1;
-                continue;
-            }
-
-            let elapsed = last_time.elapsed().as_secs_f64();
-            if elapsed < interval_secs {
-                sleep_with_interrupt(interval_secs - elapsed, interrupted.as_ref())?;
-            }
-            last_time = std::time::Instant::now();
-
-            let progress: Box<dyn narou_rs::progress::ProgressReporter> = if is_web_mode() {
-                Box::new(WebProgress::new("update"))
+        if parallel_eligible {
+            let domain_groups = build_domain_groups(
+                target_ids
+                    .iter()
+                    .map(|&id| (id, domain_records.get(&id).cloned())),
+            );
+            if domain_groups.len() <= 1 {
+                run_serial_update(
+                    &target_ids,
+                    &ctx,
+                    &mut mistook,
+                    &mut hotentries,
+                    interrupted.as_ref(),
+                )?;
             } else {
-                Box::new(CliProgress::with_multi(&format!("DL {}", id), multi_clone.clone()))
-            };
-            downloader.set_progress(progress);
-
-            match downloader.download_novel(&id.to_string()) {
-                Ok(dl) => {
-                    print_status_messages(&dl);
-
-                    if hotentry_enabled && !dl.new_arrival_subtitles.is_empty() {
-                        hotentries
-                            .entry(dl.id)
-                            .or_default()
-                            .extend(dl.new_arrival_subtitles.clone());
-                    }
-
-                    let new_arrivals = dl.new_arrivals;
-                    let has_convert_failure = narou_rs::db::with_database(|db| {
-                        Ok(db.get(dl.id).map(|r| r.convert_failure).unwrap_or(false))
-                    })
-                    .unwrap_or(false);
-
-                    match dl.status {
-                        UpdateStatus::Ok => {
-                            remove_modified_tag(dl.id);
-                            update_last_check_date(dl.id);
-                            sync_end_tag(dl.id);
-                            if opts.no_convert {
-                                std::thread::sleep(std::time::Duration::from_secs_f64(
-                                    FORCE_WAIT_SECS,
-                                ));
-                                continue;
-                            }
-
-                            if convert_only_new_arrival && !new_arrivals {
-                                std::thread::sleep(std::time::Duration::from_secs_f64(
-                                    FORCE_WAIT_SECS,
-                                ));
-                                continue;
-                            }
-                        }
-                        UpdateStatus::None => {
-                            remove_modified_tag(dl.id);
-                            update_last_check_date(dl.id);
-                            sync_end_tag(dl.id);
-                            if !has_convert_failure {
-                                continue;
-                            }
-                        }
-                        UpdateStatus::Failed => {
-                            mistook += 1;
-                            continue;
-                        }
-                        UpdateStatus::Canceled => {
-                            let title = if dl.title.is_empty() {
-                                get_novel_title(id)
-                            } else {
-                                dl.title.clone()
-                            };
-                            println!(
-                                "ID:{}　{} の更新はキャンセルされました",
-                                id, title
-                            );
-                            mistook += 1;
-                            continue;
-                        }
-                    }
-
-                    if has_convert_failure {
-                        println!("{}", colored("前回変換できなかったので再変換します", "yellow"));
-                    }
-
-                    match auto_convert(&dl, is_bulk) {
-                        Ok(()) => {
-                            clear_convert_failure(dl.id);
-                        }
-                        Err(e) => {
-                            println!("  Convert error: {}", e);
-                            set_convert_failure(dl.id);
-                            mistook += 1;
-                        }
-                    }
-                }
-                Err(e) => {
-                    if matches!(e, narou_rs::error::NarouError::SuspendDownload(_)) {
-                        return Err(UpdateInterrupted);
-                    }
-                    let title = get_novel_title(id);
-                    println!("ID:{}　{} の更新は失敗しました", id, title);
-                    if web_debug_mode {
-                        println!("  Error detail: {}", e);
-                    }
-                    mistook += 1;
+                let outcome = run_parallel_per_domain_update(
+                    &target_ids,
+                    &domain_groups,
+                    &ctx,
+                    max_parallel_domains,
+                    interrupted.clone(),
+                    &mut mistook,
+                    &mut hotentries,
+                )?;
+                if outcome == ParallelUpdateOutcome::Aborted {
+                    return Err(UpdateInterrupted);
                 }
             }
+        } else {
+            run_serial_update(
+                &target_ids,
+                &ctx,
+                &mut mistook,
+                &mut hotentries,
+                interrupted.as_ref(),
+            )?;
         }
 
         let _ = narou_rs::db::with_database_mut(|db| db.save());
@@ -1455,11 +1436,7 @@ fn classify_narou_api_chunk(
         };
 
         seen_ncodes.insert(entry.ncode.to_ascii_lowercase());
-        if entry.title.trim().is_empty() {
-            fallback_ids.push(*id);
-        } else {
-            updates.push((*id, entry.clone()));
-        }
+        updates.push((*id, entry.clone()));
     }
 
     for (id, ncode) in chunk {
@@ -1473,12 +1450,378 @@ fn classify_narou_api_chunk(
     (updates, fallback_ids)
 }
 
+// ---------------------------------------------------------------------
+// Per-domain parallel update dispatch (E: "update の並列ダウンロード")
+// ---------------------------------------------------------------------
+
+/// Read `update.max-parallel-domains` from the local settings. The
+/// value is clamped to `[1, 256]`. A missing or invalid entry falls
+/// back to the registry default of `4`.
+fn load_update_max_parallel_domains() -> usize {
+    let raw = load_local_setting_value("update.max-parallel-domains");
+    let parsed = raw.and_then(|v| match v {
+        serde_yaml::Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64)),
+        serde_yaml::Value::String(s) => s.parse::<i64>().ok(),
+        _ => None,
+    });
+    parsed
+        .map(|n| n.clamp(1, 256) as usize)
+        .unwrap_or(4)
+}
+
+/// Look up each target's `record.domain` from the global DB. A
+/// missing record (e.g. unresolved alias) returns `None` and ends up
+/// in the [`UNKNOWN_DOMAIN_KEY`] bucket — that bucket still runs
+/// serially within whichever worker claims it, so safety is not
+/// compromised.
+fn collect_record_domains(target_ids: &[i64]) -> Result<HashMap<i64, String>, String> {
+    let mut map = HashMap::new();
+    narou_rs::db::with_database(|db| {
+        for &id in target_ids {
+            if let Some(record) = db.get(id) {
+                if let Some(domain) = record.domain.as_ref().filter(|d| !d.is_empty()) {
+                    map.insert(id, domain.clone());
+                }
+            }
+        }
+        Ok(())
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(map)
+}
+
+/// Group targets by their site domain so each group can be processed
+/// in parallel without affecting per-site etiquette.
+///
+/// `records` is an iterator of `(id, domain)` tuples where `domain`
+/// is `Option<String>` (the value recorded by the previous download
+/// or `None` for fresh records). The result preserves input order
+/// within each group via the domain-owned `Vec<i64>` push order.
+pub(crate) fn build_domain_groups<I, S>(
+    records: I,
+) -> Vec<(String, Vec<i64>)>
+where
+    I: IntoIterator<Item = (i64, Option<S>)>,
+    S: AsRef<str>,
+{
+    let mut groups: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    for (id, domain) in records {
+        let key = domain
+            .as_ref()
+            .map(|s| s.as_ref().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| UNKNOWN_DOMAIN_KEY.to_string());
+        groups.entry(key).or_default().push(id);
+    }
+    groups.into_iter().collect()
+}
+
+/// Run the original single-threaded serial loop. Used when
+/// `update.max-parallel-domains` is 1 or when conditions force a
+/// fallback to single-stream execution.
+fn run_serial_update(
+    target_ids: &[i64],
+    ctx: &UpdateContext,
+    mistook: &mut usize,
+    hotentries: &mut HashMap<i64, Vec<SubtitleInfo>>,
+    interrupted: &AtomicBool,
+) -> std::result::Result<(), UpdateInterrupted> {
+    let mut downloader = match Downloader::with_user_agent(ctx.opts.user_agent.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error creating downloader: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let mut last_time = Instant::now()
+        .checked_sub(std::time::Duration::from_secs_f64(ctx.interval_secs))
+        .unwrap_or_else(Instant::now);
+
+    for (i, &id) in target_ids.iter().enumerate() {
+        if interrupted.load(AtomicOrdering::SeqCst) {
+            return Err(UpdateInterrupted);
+        }
+        if i > 0 {
+            println!("{}", "\u{2015}".repeat(35));
+        }
+        let inc = process_novel_for_update(
+            &mut downloader,
+            id,
+            ctx,
+            &mut last_time,
+            hotentries,
+            interrupted,
+        )?;
+        *mistook += inc;
+    }
+    Ok(())
+}
+
+/// Drive the parallel dispatch. Workers process one domain at a time
+/// (so each worker always runs at most one downloader per domain),
+/// keeping per-site etiquette intact even while several sites are
+/// being updated simultaneously.
+fn run_parallel_per_domain_update(
+    target_ids: &[i64],
+    domain_groups: &[(String, Vec<i64>)],
+    ctx: &UpdateContext,
+    max_parallel_domains: usize,
+    interrupted: Arc<AtomicBool>,
+    mistook: &mut usize,
+    hotentries: &mut HashMap<i64, Vec<SubtitleInfo>>,
+) -> std::result::Result<ParallelUpdateOutcome, UpdateInterrupted> {
+    let group_lookup: HashMap<String, Vec<i64>> = domain_groups
+        .iter()
+        .cloned()
+        .collect();
+    let _ = target_ids; // documentation: future use if we add fine-grained stats.
+
+    // Build a shared queue of domains. We keep the natural ordering
+    // from `build_domain_groups` (BTreeMap) so the dispatch is
+    // deterministic across runs.
+    let pending: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(
+        domain_groups.iter().map(|(d, _)| d.clone()).collect(),
+    ));
+
+    // cap by number of unique domains (already <= max_parallel_domains given the gating above,
+    // but stay defensive)
+    let num_workers = max_parallel_domains
+        .min(domain_groups.len())
+        .max(1);
+
+    let mut handles = Vec::with_capacity(num_workers);
+    for worker_idx in 0..num_workers {
+        let pending = Arc::clone(&pending);
+        let group_lookup = Arc::new(group_lookup.clone());
+        let ctx = ctx.clone();
+        let interrupted = Arc::clone(&interrupted);
+        handles.push(std::thread::spawn(move || -> std::result::Result<
+            (usize, HashMap<i64, Vec<SubtitleInfo>>),
+            UpdateInterrupted,
+        > {
+            let mut downloader = match Downloader::with_user_agent(ctx.opts.user_agent.as_deref())
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    safe_println_fn(&format!(
+                        "[worker {}] Error creating downloader: {}",
+                        worker_idx, e
+                    ));
+                    return Ok((0, HashMap::new()));
+                }
+            };
+            let mut last_time = Instant::now()
+                .checked_sub(std::time::Duration::from_secs_f64(ctx.interval_secs))
+                .unwrap_or_else(Instant::now);
+            let mut local_mistook = 0usize;
+            let mut local_hotentries: HashMap<i64, Vec<SubtitleInfo>> = HashMap::new();
+
+            loop {
+                if interrupted.load(AtomicOrdering::SeqCst) {
+                    break;
+                }
+                let next_domain = {
+                    let mut q = pending.lock().expect("domain queue poisoned");
+                    q.pop_front()
+                };
+                let Some(domain) = next_domain else {
+                    break;
+                };
+                let Some(ids) = group_lookup.get(&domain) else {
+                    continue;
+                };
+                safe_println_fn(&format!("[{}] starting ({} novel(s))", domain, ids.len()));
+                for &id in ids {
+                    if interrupted.load(AtomicOrdering::SeqCst) {
+                        break;
+                    }
+                    match process_novel_for_update(
+                        &mut downloader,
+                        id,
+                        &ctx,
+                        &mut last_time,
+                        &mut local_hotentries,
+                        interrupted.as_ref(),
+                    ) {
+                        Ok(inc) => local_mistook += inc,
+                        Err(UpdateInterrupted) => break,
+                    }
+                }
+                safe_println_fn(&format!("[{}] done", domain));
+            }
+            Ok((local_mistook, local_hotentries))
+        }));
+    }
+
+    let mut aborted = false;
+    for handle in handles {
+        match handle.join().expect("worker panicked") {
+            Ok((inc, h)) => {
+                *mistook += inc;
+                for (id, subtitles) in h {
+                    hotentries.entry(id).or_default().extend(subtitles);
+                }
+            }
+            Err(UpdateInterrupted) => {
+                aborted = true;
+            }
+        }
+    }
+    if aborted {
+        Ok(ParallelUpdateOutcome::Aborted)
+    } else {
+        Ok(ParallelUpdateOutcome::Completed)
+    }
+}
+
+/// Run one iteration of the update pipeline for a single novel. This
+/// was inlined in the original serial loop; extracting it lets the
+/// parallel dispatcher share the exact same logic. Side effects
+/// (DB mutations, hotentry aggregation) flow through the caller's
+/// references; the return value is the increment to the local
+/// `mistook` counter.
+fn process_novel_for_update(
+    downloader: &mut Downloader,
+    id: i64,
+    ctx: &UpdateContext,
+    last_time: &mut Instant,
+    hotentries: &mut HashMap<i64, Vec<SubtitleInfo>>,
+    interrupted: &AtomicBool,
+) -> std::result::Result<usize, UpdateInterrupted> {
+    if interrupted.load(AtomicOrdering::SeqCst) {
+        return Err(UpdateInterrupted);
+    }
+
+    let frozen = !ctx.opts.force && is_novel_frozen(id);
+    if frozen {
+        if ctx.is_bulk {
+            return Ok(0);
+        }
+        let title = get_novel_title(id);
+        safe_println_fn(&format!("ID:{}　{} は凍結中です", id, title));
+        return Ok(1);
+    }
+
+    let elapsed = last_time.elapsed().as_secs_f64();
+    if elapsed < ctx.interval_secs {
+        sleep_with_interrupt(ctx.interval_secs - elapsed, interrupted)?;
+    }
+    *last_time = Instant::now();
+
+    downloader.set_progress(ctx.make_progress(id));
+
+    let mut new_mistook = 0usize;
+
+    match downloader.download_novel(&id.to_string()) {
+        Ok(dl) => {
+            print_status_messages(&dl);
+
+            if ctx.hotentry_enabled && !dl.new_arrival_subtitles.is_empty() {
+                hotentries
+                    .entry(dl.id)
+                    .or_default()
+                    .extend(dl.new_arrival_subtitles.clone());
+            }
+
+            let new_arrivals = dl.new_arrivals;
+            let has_convert_failure = narou_rs::db::with_database(|db| {
+                Ok(db.get(dl.id).map(|r| r.convert_failure).unwrap_or(false))
+            })
+            .unwrap_or(false);
+
+            // Decide whether to call `auto_convert` after this
+            // DownloadResult. Doing the decision via a single value
+            // avoids the "assign twice / read once" anti-pattern and
+            // keeps the structure flat.
+            let needs_convert: bool = match dl.status {
+                UpdateStatus::Ok => {
+                    remove_modified_tag(dl.id);
+                    update_last_check_date(dl.id);
+                    sync_end_tag(dl.id);
+                    if ctx.opts.no_convert {
+                        std::thread::sleep(std::time::Duration::from_secs_f64(
+                            FORCE_WAIT_SECS,
+                        ));
+                        return Ok(new_mistook);
+                    }
+                    if ctx.convert_only_new_arrival && !new_arrivals {
+                        std::thread::sleep(std::time::Duration::from_secs_f64(
+                            FORCE_WAIT_SECS,
+                        ));
+                        return Ok(new_mistook);
+                    }
+                    true
+                }
+                UpdateStatus::None => {
+                    remove_modified_tag(dl.id);
+                    update_last_check_date(dl.id);
+                    sync_end_tag(dl.id);
+                    if !has_convert_failure {
+                        return Ok(new_mistook);
+                    }
+                    true
+                }
+                UpdateStatus::Failed => {
+                    new_mistook += 1;
+                    return Ok(new_mistook);
+                }
+                UpdateStatus::Canceled => {
+                    let title = if dl.title.is_empty() {
+                        get_novel_title(id)
+                    } else {
+                        dl.title.clone()
+                    };
+                    safe_println_fn(&format!("ID:{}　{} の更新はキャンセルされました", id, title));
+                    new_mistook += 1;
+                    return Ok(new_mistook);
+                }
+            };
+
+            if needs_convert && has_convert_failure {
+                safe_println_fn(&format!(
+                    "{}",
+                    colored("前回変換できなかったので再変換します", "yellow")
+                ));
+            }
+
+            if needs_convert {
+                match auto_convert(&dl, ctx.is_bulk) {
+                    Ok(()) => {
+                        clear_convert_failure(dl.id);
+                    }
+                    Err(e) => {
+                        safe_println_fn(&format!("  Convert error: {}", e));
+                        set_convert_failure(dl.id);
+                        new_mistook += 1;
+                    }
+                }
+            }
+            Ok(new_mistook)
+        }
+        Err(e) => {
+            if matches!(e, narou_rs::error::NarouError::SuspendDownload(_)) {
+                return Err(UpdateInterrupted);
+            }
+            let title = get_novel_title(id);
+            safe_println_fn(&format!("ID:{}　{} の更新は失敗しました", id, title));
+            if ctx.web_debug_mode {
+                safe_println_fn(&format!("  Error detail: {}", e));
+            }
+            new_mistook += 1;
+            Ok(new_mistook)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        MODIFIED_TAG, abort_if_interrupted, apply_general_lastup_check_result,
-        classify_narou_api_chunk, count_general_lastup_narou_targets,
-        initial_general_lastup_work_units, sleep_with_interrupt,
+        MODIFIED_TAG, UNKNOWN_DOMAIN_KEY, abort_if_interrupted,
+        apply_general_lastup_check_result, build_domain_groups, classify_narou_api_chunk,
+        count_general_lastup_narou_targets, initial_general_lastup_work_units,
+        load_update_max_parallel_domains, sleep_with_interrupt,
     };
     use chrono::{Duration, TimeZone, Utc};
     use narou_rs::db::NovelRecord;
@@ -1700,7 +2043,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_narou_api_chunk_routes_blank_or_missing_titles_to_html_fallback() {
+    fn classify_narou_api_chunk_accepts_gl_entries_without_title() {
         let chunk = vec![(1, "n0001aa".to_string()), (2, "n0002aa".to_string())];
         let entries = vec![narou_rs::downloader::NarouApiEntry {
             ncode: "n0001aa".to_string(),
@@ -1718,7 +2061,87 @@ mod tests {
 
         let (updates, fallback_ids) = classify_narou_api_chunk(&chunk, &entries);
 
-        assert!(updates.is_empty());
-        assert_eq!(fallback_ids, vec![1, 2]);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, 1);
+        assert_eq!(fallback_ids, vec![2]);
+    }
+
+    /// The partition is the heart of the parallel dispatch:
+    /// every novel must end up in exactly one bucket, and the
+    /// bucket keys are the per-site domain strings (or the
+    /// `UNKNOWN_DOMAIN_KEY` sentinel for fresh records). Verifies
+    /// the basic invariants the parallel workers rely on.
+    #[test]
+    fn build_domain_groups_partitions_by_domain() {
+        let records = vec![
+            (1, Some("ncode.syosetu.com")),
+            (2, Some("ncode.syosetu.com")),
+            (3, Some("novel18.syosetu.com")),
+            (4, None),               // unknown / fresh record
+            (5, Some("")),            // treated as unknown
+            (6, Some("kakuyomu.jp")),
+        ];
+
+        let groups = build_domain_groups(records.into_iter());
+
+        let mut by_name: HashMap<String, Vec<i64>> = HashMap::new();
+        for (key, ids) in groups {
+            by_name.insert(key, ids);
+        }
+
+        // Each known domain keeps the input order so behaviour stays
+        // deterministic across runs.
+        assert_eq!(by_name["ncode.syosetu.com"], vec![1, 2]);
+        assert_eq!(by_name["novel18.syosetu.com"], vec![3]);
+        assert_eq!(by_name["kakuyomu.jp"], vec![6]);
+
+        // Unknown-domain records collapse into a single bucket that
+        // the serial fallback can drain safely.
+        let unknown = by_name
+            .remove(UNKNOWN_DOMAIN_KEY)
+            .expect("unknown bucket present");
+        assert_eq!(unknown, vec![4, 5]);
+
+        // Every input id must appear in exactly one bucket (no
+        // double-processing across domains).
+        let flat: Vec<i64> = by_name
+            .values()
+            .chain(std::iter::once(&unknown))
+            .flat_map(|v| v.iter().copied())
+            .collect();
+        assert_eq!(flat.len(), 6);
+        let mut sorted = flat.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    /// When all targets share a single domain, the partition yields
+    /// exactly one bucket. The orchestrator should fall back to the
+    /// serial path; here we just verify the helper does not produce
+    /// empty or pathological partitions.
+    #[test]
+    fn build_domain_groups_collapses_single_domain() {
+        let records = vec![
+            (10, Some("syosetu.org")),
+            (11, Some("syosetu.org")),
+        ];
+        let groups = build_domain_groups(records.into_iter());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "syosetu.org");
+        assert_eq!(groups[0].1, vec![10, 11]);
+    }
+
+    /// `load_update_max_parallel_domains` must always be at least 1
+    /// (clamping protects against accidental 0) and at most the
+    /// registry cap. We do not exercise the YAML reader here; we
+    /// just sanity-check the clamping behaviour exists.
+    #[test]
+    fn max_parallel_domains_setting_loads_with_safe_default() {
+        // We can't easily redirect the local_settings file reader in
+        // a unit test, but we can confirm the function is callable
+        // and returns a value in the [1, 256] range (the cap).
+        let v = load_update_max_parallel_domains();
+        assert!((1..=256).contains(&v));
     }
 }

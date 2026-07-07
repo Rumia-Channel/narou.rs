@@ -560,15 +560,36 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/reboot` | POST | ✅ |
 | `/api/update/start` | POST | ✅ (Rust拡張: 同梱 updater による自動アップデート) |
 
-### 6.10 未実装 API (Ruby版にあるが Rust版未実装)
+### 6.10 削除済み / 未実装 API (Ruby版にあったが Rust版では廃止)
 
 | エンドポイント | 説明 |
 |-------------|------|
-| `/api/version/latest.json` | 最新バージョンチェック (外部API依存) |
+| `/api/version/latest.json` | 最新バージョンチェック (外部API依存, narou.rb と同等実装) |
 | `/api/eject` | 端末取出し (実機検証必要) |
-| `/api/download4ssl` | SSL互換DL (レガシー) |
-| `/api/download_request` | DL済みチェック (D&Dウィジェット向け) |
-| `/api/downloadable.gif` | DL状態GIF画像 (レガシー) |
+| `/api/download4ssl` | **削除済み** (旧ブックマークレットのクロスオリジン POST 用。CSRF ガード導入により使用不可となり、`/?register=<url>` same-origin 方式へ移行) |
+| `/api/download_request` | **削除済み** (同上。旧 D&D ウィジェット互換の名残。`/?register=<url>` 経由で代替可能) |
+| `/api/downloadable.gif` | DL状態GIF画像 (レガシー, narou.rb 同等実装) |
+
+### 6.11 ブックマークレット (same-origin 登録フロー)
+
+旧ブックマークレットはクロスオリジンで `POST /api/download_request` を叩く方式だったが、`request_guard_middleware` の Origin チェックにより常に 403 となっていた (BUG-17)。
+
+Rust版では以下のように CSRF ガードと両立する same-origin 方式を採用:
+
+1. **`/bookmarklet` ページのブックマークレット** は現在表示中の URL を取得し、`window.open(<webui-origin> + '/?register=' + encodeURIComponent(location.href))` で WEB UI を別ウィンドウで開く
+2. WEB UI 側 (`main.js` の `handleBookmarkletRegisterParam`) が `?register=` パラメータを検出
+3. 確認ダイアログ (`#register-modal`) を表示し、対象 URL を明示
+4. 承認時に既存の same-origin エンドポイント `POST /api/download` を JS から呼ぶ (`postJson('/api/download', { targets: [url] })`)
+5. ブラウザは `Origin: <webui-origin>` を付与するため、`request_guard_middleware` の Origin チェックを通過する
+6. 承認後に `history.replaceState` で URL から `register` パラメータを除去 (リロード時の再プロンプト防止)
+
+| 要素 | 役割 |
+|------|------|
+| `/bookmarklet` | ブックマークレット取得ページ。`src/web/assets/bookmarklet.html` |
+| `#register-modal` | 確認ダイアログ。URL表示 + キャンセル/登録ボタン |
+| `handleRegisterParam(url)` (actions.js) | URL を検証してモーダルに表示 (http(s) のみ, 2048 文字以内) |
+| `handleBookmarkletRegisterParam()` (main.js) | 起動時に `?register=` を検出して `handleRegisterParam` へ引き渡し |
+| `POST /api/download` | 既存の same-origin DL キュー投入エンドポイントを流用 |
 
 ---
 
@@ -582,7 +603,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `table.reload` / `refresh` / `list_updated` | S→C | ✅ (refreshList+refreshTags) | ✅ |
 | `tag.updateCanvas` | S→C | ✅ (refreshTags) | ✅ |
 | `status` / `queue` / `notification.queue` | S→C | ✅ (refreshQueue) | ✅ |
-| `queue_start` / `queue_complete` / `queue_failed` | S→C | ✅ (refreshQueue) | ✅ |
+| `queue_start` / `queue_complete` / `queue_failed` / `queue_retry` | S→C | ✅ (`queue_retry` は失敗 job が `queue.max-retries` / `queue.retry-backoff` に従い `available_at` 付きで `active_pending` へ自動再投入されたタイミングで送出) | ✅ |
 | `error` | S→C | ✅ (appendConsole) | ✅ |
 | 再接続 | 5秒リトライ | ✅ (5s setTimeout) | ✅ |
 | 接続時履歴送信 | 直近60件を接続時にプッシュ | ✅ (history_on_connect) | ✅ |
@@ -608,6 +629,17 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | グローバル設定保存 | あり | POST `/api/global_setting` | ✅ |
 | 個別小説設定ページ | `/novels/:id/setting` | GET/POST `/api/settings/{id}` | ✅ |
 | デバイス一覧 | あり | GET `/api/devices` | ✅ |
+
+### 8.1 リバースプロキシ / 追加ホスト
+
+外部公開や別ドメインからの `Host` ヘッダを許可するために、以下の設定キーを併用します。`s` は `setting` サブコマンドの短縮です（`web` の短縮ではありません）。
+
+- `server-bind` — LAN 公開時は `0.0.0.0` か LAN IP を指定（既定 `127.0.0.1`）。
+- `server-reverse-proxy.enable` — nginx 等の前段 proxy が付与する外側 Host / Origin を許可（既定 `false`）。`true` の間は固定許可リストではなく外側 Host の構文妥当性だけで判定する。
+- `server-basic-auth.require-for-external-bind` — `0.0.0.0` など外部 bind 時に Basic 認証必須にする narou.rs 独自ガード（既定 `true`）。
+- `server-add-accepted-hosts` — HTTP `Host` ヘッダに追加で許可するホストのリスト（カンマ区切り）。`*.example.com` のような安全なワイルドカードに対応。unsafe なパターン（`*` 単独、`*.com`、末尾ワイルドなど）は警告ログを出して無視。既定の許可集合は bind host + loopback + 自ホスト名のまま据え置き、追加ホストだけを opt-in で広げる。
+
+Web UI 設定画面に出る関連項目: `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `server-add-accepted-hosts` / `over18`。`server-reverse-proxy.enable` と `server-basic-auth.require-for-external-bind` は hidden のため CLI からのみ変更します。
 
 ---
 
@@ -663,7 +695,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 **テーマ**: 6/6 ✅ (全ページCSS変数化、hardcoded色・px値なし)
 **API**: 71 実装済み / 4 未実装 (eject, download4ssl, download_request, downloadable.gif)
 **WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, TermColorLight色付き出力 ✅, 進捗バー ✅, DB自動更新+table.reload+tag.updateCanvas ✅, 履歴on-connect ✅, console.clear ✅, shutdown/reboot ✅, 起動時バージョン表示+未完了タスク警告 ✅, モーダル/メモ帳同期 ❌
-**設定ページ**: ✅ (`webui.performance-mode` / `webui.table.reload-timing` に加え、`download.interval` / `download.wait-steps` / `user-agent` / `guard-spoiler` / 各種 length-limit を runtime 反映。Ruby版相当の `select_summaries` 表示と help HTML 表示にも対応)
+**設定ページ**: ✅ (`webui.performance-mode` / `webui.table.reload-timing` に加え、`download.interval` / `download.wait-steps` / `user-agent` / `guard-spoiler` / 各種 length-limit を runtime 反映。Ruby版相当の `select_summaries` 表示と help HTML 表示にも対応。`queue.max-retries` / `queue.retry-backoff` も detail タブに表示され、夜間更新で一時的なネットワーク失敗があった場合に指数バックオフで自動リトライする)
 **言語切替**: ✅ (Rust独自)
 **レスポンシブ**: ✅
 **i18n 監査**: ✅ (JOB_TYPE_LABELS を Ruby版と完全一致に修正済み)

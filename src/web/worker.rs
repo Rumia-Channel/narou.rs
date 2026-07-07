@@ -16,13 +16,39 @@ use crate::compat::{
 use crate::db::{with_database, with_database_mut};
 use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
 use crate::queue::{
-    JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane,
+    extract_novel_ids, JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane,
     WEBUI_MESSAGE_TEXT_META_KEY, WEBUI_MESSAGE_TYPE_META_KEY, WEBUI_UPDATE_START_MESSAGE_TYPE,
 };
 
 const MAX_FAILURE_DETAIL_LINES: usize = 8;
 const MAX_FAILURE_DETAIL_CHARS: usize = 600;
 const IDLE_EXTERNAL_QUEUE_POLL_SECS: u64 = 30;
+/// Default exponential backoff schedule (seconds) for failed jobs.
+const DEFAULT_RETRY_BACKOFF_SECS: &[i64] = &[60, 300, 900];
+/// Detail substrings that mark a job outcome as a *permanent* failure which
+/// must not be retried even when retries remain. Matching is case-insensitive.
+const PERMANENT_FAILURE_KEYWORDS: &[&str] = &[
+    "not found",
+    "invalid argument",
+    "invalidargument",
+    "no such file",
+    "permanent failure",
+    "永久失敗",
+    "恒久失敗",
+];
+
+/// Outcome of a failed-job transition: when `scheduled` is `true`, the worker
+/// has already pushed the job back to the active pending queue with an
+/// `available_at`; the broadcast step will emit `queue_retry`. Otherwise the
+/// job has been moved to the failed history and `queue_failed` is broadcast.
+#[derive(Debug, Clone, Default)]
+struct RetrySchedule {
+    scheduled: bool,
+    retry_count: u32,
+    max_retries: u32,
+    backoff_secs: i64,
+    available_at: i64,
+}
 
 #[derive(Debug, Clone, Default)]
 struct JobRunResult {
@@ -93,7 +119,7 @@ fn start_queue_worker_for_lane(
         loop {
             let job = {
                 let _guard = job_transition_lock.lock();
-                let job = pop_next_job(queue.as_ref(), lane);
+                let job = pop_next_job(queue.as_ref(), lane, &running_jobs);
                 if let Some(job_ref) = job.as_ref() {
                     register_running_job(&running_jobs, job_ref);
                 }
@@ -134,16 +160,44 @@ fn start_queue_worker_for_lane(
                 push_server.broadcast_error(&format!("DB更新エラー: {}", e));
             }
 
-            let queue_result = {
+            let (queue_result, retry_scheduled) = {
                 let _guard = job_transition_lock.lock();
+                let mut retry_scheduled = RetrySchedule::default();
                 let result = match result.outcome {
                     JobOutcome::Completed => queue.complete(&job.id),
                     JobOutcome::Partial => queue.partial(&job.id),
                     JobOutcome::Cancelled => queue.cancel(&job.id),
-                    JobOutcome::Failed => queue.fail(&job.id),
+                    JobOutcome::Failed => {
+                        if should_retry_job(&result, &job) {
+                            let schedule = load_retry_backoff_schedule();
+                            let backoff_secs =
+                                compute_retry_backoff_secs(job.retry_count, &schedule);
+                            let available_at = Some(chrono::Utc::now().timestamp() + backoff_secs);
+                            match queue.requeue(&job.id, available_at) {
+                                Ok(true) => {
+                                    retry_scheduled = RetrySchedule {
+                                        scheduled: true,
+                                        retry_count: job.retry_count + 1,
+                                        max_retries: job.max_retries,
+                                        backoff_secs,
+                                        available_at: available_at.unwrap_or(0),
+                                    };
+                                    Ok(())
+                                }
+                                Ok(false) => {
+                                    // Lost the running slot to a concurrent worker; treat as
+                                    // a permanent failure for this attempt.
+                                    queue.fail(&job.id)
+                                }
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            queue.fail(&job.id)
+                        }
+                    }
                 };
                 unregister_running_job(&running_jobs, &job.id);
-                result
+                (result, retry_scheduled)
             };
             match result.outcome {
                 JobOutcome::Completed => {
@@ -170,19 +224,33 @@ fn start_queue_worker_for_lane(
                 }
                 JobOutcome::Failed => {
                     let _ = queue_result;
-                    let mut data = serde_json::json!({
-                        "job_id": job.id,
-                        "reason": failure_reason(&result),
-                    });
-                    if load_local_setting_bool("webui.debug-mode")
-                        && let Some(detail) = result.detail.as_deref()
-                    {
-                        data["detail"] = serde_json::Value::String(detail.to_string());
+                    if retry_scheduled.scheduled {
+                        push_server.broadcast_raw(&serde_json::json!({
+                            "type": "queue_retry",
+                            "data": {
+                                "job_id": job.id,
+                                "retry_count": retry_scheduled.retry_count,
+                                "max_retries": retry_scheduled.max_retries,
+                                "backoff_secs": retry_scheduled.backoff_secs,
+                                "available_at": retry_scheduled.available_at,
+                                "reason": failure_reason(&result),
+                            },
+                        }));
+                    } else {
+                        let mut data = serde_json::json!({
+                            "job_id": job.id,
+                            "reason": failure_reason(&result),
+                        });
+                        if load_local_setting_bool("webui.debug-mode")
+                            && let Some(detail) = result.detail.as_deref()
+                        {
+                            data["detail"] = serde_json::Value::String(detail.to_string());
+                        }
+                        push_server.broadcast_raw(&serde_json::json!({
+                            "type": "queue_failed",
+                            "data": data,
+                        }));
                     }
-                    push_server.broadcast_raw(&serde_json::json!({
-                        "type": "queue_failed",
-                        "data": data,
-                    }));
                 }
             }
             clear_progress_for_job(&push_server, &job.id);
@@ -195,12 +263,74 @@ fn start_queue_worker_for_lane(
     })
 }
 
-fn pop_next_job(queue: &PersistentQueue, lane: WorkerLane) -> Option<QueueJob> {
+fn pop_next_job(
+    queue: &PersistentQueue,
+    lane: WorkerLane,
+    running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
+) -> Option<QueueJob> {
     match lane {
         WorkerLane::All => queue.pop(),
-        WorkerLane::Default => queue.pop_for_lane(QueueLane::Default),
-        WorkerLane::Secondary => queue.pop_for_lane(QueueLane::Secondary),
+        WorkerLane::Default => {
+            let running = running_jobs.lock().clone();
+            let queue_running = queue.running_novel_ids_by_lane();
+            queue.pop_for_lane_excluding(QueueLane::Default, |candidate| {
+                job_conflicts_with_running(candidate, &running, &queue_running)
+            })
+        }
+        WorkerLane::Secondary => {
+            let running = running_jobs.lock().clone();
+            let queue_running = queue.running_novel_ids_by_lane();
+            queue.pop_for_lane_excluding(QueueLane::Secondary, |candidate| {
+                job_conflicts_with_running(candidate, &running, &queue_running)
+            })
+        }
     }
+}
+
+/// Decide whether `candidate` should be skipped because the same novel is
+/// already being processed by a running job on the *other* lane.
+///
+/// Two data sources are consulted so the lock survives worker restarts and
+/// external enqueues:
+///
+/// 1. The in-process `running_jobs` Vec the worker maintains locally while a
+///    job is being executed (registered on pop, unregistered on completion).
+/// 2. The shared `PersistentQueue::active_running` / `deferred_running`
+///    snapshots, exposed via [`PersistentQueue::running_novel_ids_by_lane`].
+///
+/// Jobs without a numeric novel ID in their target (e.g. `AutoUpdate`,
+/// `Backup`, `--backup-bookmark`, `tag:modified`) never trigger the lock so
+/// that broadcasts and tag-wide operations can still proceed.
+fn job_conflicts_with_running(
+    candidate: &QueueJob,
+    running_jobs: &[QueueJob],
+    queue_running_by_lane: &HashMap<QueueLane, HashSet<i64>>,
+) -> bool {
+    let candidate_ids = extract_novel_ids(&candidate.target);
+    if candidate_ids.is_empty() {
+        return false;
+    }
+    // In-process running set: cheap snapshot, covers the case where the same
+    // worker just popped a conflicting job but the PersistentQueue's own
+    // running snapshot is slightly stale.
+    let local_conflict = running_jobs.iter().any(|running| {
+        running.job_type.lane() != candidate.job_type.lane()
+            && extract_novel_ids(&running.target)
+                .iter()
+                .any(|id| candidate_ids.contains(id))
+    });
+    if local_conflict {
+        return true;
+    }
+    // Persistent queue snapshot: catches running jobs that originated from
+    // other workers, an external queue instance, or were restored from disk.
+    let other_lane = match candidate.job_type.lane() {
+        QueueLane::Default => QueueLane::Secondary,
+        QueueLane::Secondary => QueueLane::Default,
+    };
+    queue_running_by_lane
+        .get(&other_lane)
+        .is_some_and(|other_novels| candidate_ids.iter().any(|id| other_novels.contains(id)))
 }
 
 fn register_running_job(running_jobs: &parking_lot::Mutex<Vec<QueueJob>>, job: &QueueJob) {
@@ -924,6 +1054,74 @@ fn failure_reason(result: &JobRunResult) -> String {
     }
 }
 
+fn should_retry_job(result: &JobRunResult, job: &QueueJob) -> bool {
+    is_transient_failure(result) && job.retry_count < job.max_retries
+}
+
+fn is_transient_failure(result: &JobRunResult) -> bool {
+    if let Some(detail) = result.detail.as_deref() {
+        let lower = detail.to_lowercase();
+        for keyword in PERMANENT_FAILURE_KEYWORDS {
+            if lower.contains(keyword) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn compute_retry_backoff_secs(retry_count: u32, schedule: &[i64]) -> i64 {
+    if schedule.is_empty() {
+        return DEFAULT_RETRY_BACKOFF_SECS[0];
+    }
+    let idx = (retry_count as usize).min(schedule.len() - 1);
+    schedule[idx]
+}
+
+fn load_retry_backoff_schedule() -> Vec<i64> {
+    match crate::compat::load_local_setting_string("queue.retry-backoff") {
+        Some(spec) => {
+            let parsed = parse_backoff_spec(&spec);
+            if parsed.is_empty() {
+                DEFAULT_RETRY_BACKOFF_SECS.to_vec()
+            } else {
+                parsed
+            }
+        }
+        None => DEFAULT_RETRY_BACKOFF_SECS.to_vec(),
+    }
+}
+
+fn parse_backoff_spec(spec: &str) -> Vec<i64> {
+    spec.split(',')
+        .map(str::trim)
+        .filter_map(parse_backoff_value)
+        .collect()
+}
+
+fn parse_backoff_value(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (num_str, multiplier): (&str, i64) =
+        if let Some(rest) = raw.strip_suffix(['s', 'S']) {
+            (rest, 1)
+        } else if let Some(rest) = raw.strip_suffix(['m', 'M']) {
+            (rest, 60)
+        } else if let Some(rest) = raw.strip_suffix(['h', 'H']) {
+            (rest, 3600)
+        } else {
+            (raw, 1)
+        };
+    let num_str = num_str.trim();
+    let parsed = num_str.parse::<i64>().ok()?;
+    if parsed < 0 {
+        return None;
+    }
+    Some(parsed * multiplier)
+}
+
 fn console_target_for_job(job_type: JobType) -> &'static str {
     match job_type {
         JobType::Download | JobType::Update | JobType::AutoUpdate => "stdout",
@@ -981,13 +1179,17 @@ mod tests {
     use std::os::windows::process::ExitStatusExt;
 
     use super::{
-        MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, JobOutcome, classify_job_outcome,
-        clear_progress_for_job, console_target_for_job, convert_targets_and_device,
-        execution_spec_meta_bool, execution_spec_meta_string, execution_spec_meta_strings,
-        failure_reason, parse_convert_job_target, remember_failure_line,
-        route_structured_web_message, summarize_failure_details, update_by_tag_update_args,
+        MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, JobOutcome, JobRunResult, WorkerLane,
+        classify_job_outcome, clear_progress_for_job, compute_retry_backoff_secs,
+        console_target_for_job, convert_targets_and_device, execution_spec_meta_bool,
+        execution_spec_meta_string, execution_spec_meta_strings, failure_reason,
+        is_transient_failure, job_conflicts_with_running, parse_backoff_spec,
+        parse_backoff_value, parse_convert_job_target, pop_next_job, remember_failure_line,
+        route_structured_web_message, should_retry_job, summarize_failure_details,
+        update_by_tag_update_args,
     };
-    use crate::queue::JobType;
+    use crate::queue::{JobType, PersistentQueue, QueueJob, QueueLane};
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn parse_convert_job_target_splits_device_override() {
@@ -1071,6 +1273,119 @@ mod tests {
     }
 
     #[test]
+    fn job_conflict_blocks_same_novel_across_lanes_only() {
+        let running_update = QueueJob {
+            id: "running-update".to_string(),
+            job_type: JobType::Update,
+            target: "12".to_string(),
+            created_at: 0,
+            retry_count: 0,
+            max_retries: 3,
+            available_at: None,
+        };
+        let same_novel_convert = QueueJob {
+            id: "convert".to_string(),
+            job_type: JobType::Convert,
+            target: "12\tkindle".to_string(),
+            created_at: 0,
+            retry_count: 0,
+            max_retries: 3,
+            available_at: None,
+        };
+        let other_novel_convert = QueueJob {
+            target: "13".to_string(),
+            ..same_novel_convert.clone()
+        };
+        let same_lane_download = QueueJob {
+            id: "download".to_string(),
+            job_type: JobType::Download,
+            target: "12".to_string(),
+            created_at: 0,
+            retry_count: 0,
+            max_retries: 3,
+            available_at: None,
+        };
+        let empty_running_by_lane = HashMap::<QueueLane, HashSet<i64>>::new();
+
+        assert!(job_conflicts_with_running(
+            &same_novel_convert,
+            &[running_update.clone()],
+            &empty_running_by_lane,
+        ));
+        assert!(!job_conflicts_with_running(
+            &other_novel_convert,
+            &[running_update.clone()],
+            &empty_running_by_lane,
+        ));
+        assert!(!job_conflicts_with_running(
+            &same_lane_download,
+            &[running_update],
+            &empty_running_by_lane,
+        ));
+    }
+
+    /// When an `update` for novel 12 is running on the Default lane, a
+    /// pending `convert` for the same novel must be skipped even though it
+    /// belongs to the Secondary lane. A `convert` for a different novel
+    /// should still be poppable. This locks in the cross-lane per-novel
+    /// exclusion that protects the on-disk queue.yaml from a Default-lane
+    /// update and a Secondary-lane convert touching the same novel at the
+    /// same time.
+    #[test]
+    fn pop_next_job_blocks_secondary_lane_convert_for_novel_running_on_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let running_jobs: parking_lot::Mutex<Vec<QueueJob>> = parking_lot::Mutex::new(Vec::new());
+
+        // Pop an update for novel 12 from the Default lane so it lives in
+        // both the local running_jobs Vec and PersistentQueue's active_running.
+        queue.push(JobType::Update, "12").unwrap();
+        let running = queue.pop_for_lane(QueueLane::Default).unwrap();
+        assert_eq!(running.target, "12");
+        running_jobs.lock().push(running);
+
+        // Queue two converts: novel 12 (blocked) and novel 99 (free).
+        queue.push(JobType::Convert, "12").unwrap();
+        queue.push(JobType::Convert, "99").unwrap();
+
+        let first = pop_next_job(&queue, WorkerLane::Secondary, &running_jobs)
+            .expect("unblocked novel 99 convert should pop");
+        assert_eq!(first.target, "99");
+
+        // The second candidate (novel 12) is blocked by the Default-lane
+        // running update for novel 12, so pop_next_job returns None.
+        assert!(pop_next_job(&queue, WorkerLane::Secondary, &running_jobs).is_none());
+
+        // Sanity: the blocked convert is still pending on disk.
+        assert_eq!(queue.active_pending_count(), 1);
+    }
+
+    /// Even when the local running_jobs Vec is empty, the PersistentQueue's
+    /// own active_running snapshot must still trigger the per-novel lock.
+    /// This covers the case where a sibling worker (or an external queue
+    /// instance) has popped a running job for the same novel, so the local
+    /// worker should defer the convert to avoid a race.
+    #[test]
+    fn pop_next_job_consults_persistent_queue_running_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let running_jobs: parking_lot::Mutex<Vec<QueueJob>> = parking_lot::Mutex::new(Vec::new());
+
+        // Pop an update for novel 12 from the Default lane. The local
+        // running_jobs Vec stays empty on purpose so only the persistent
+        // snapshot is consulted by pop_next_job.
+        queue.push(JobType::Update, "12").unwrap();
+        let _running = queue.pop_for_lane(QueueLane::Default).unwrap();
+
+        queue.push(JobType::Convert, "12").unwrap();
+
+        assert!(pop_next_job(&queue, WorkerLane::Secondary, &running_jobs).is_none());
+        assert_eq!(queue.active_pending_count(), 1);
+    }
+
+    #[test]
     fn route_structured_web_message_adds_target_console() {
         let message = serde_json::json!({
             "type": "progressbar.init",
@@ -1146,6 +1461,98 @@ mod tests {
             }),
             "終了コード 9"
         );
+    }
+
+    fn make_failed_result(detail: Option<&str>, exit_code: Option<i32>) -> JobRunResult {
+        JobRunResult {
+            outcome: JobOutcome::Failed,
+            detail: detail.map(|value| value.to_string()),
+            exit_code,
+        }
+    }
+
+    #[test]
+    fn is_transient_failure_treats_missing_detail_as_transient() {
+        assert!(is_transient_failure(&make_failed_result(None, Some(128))));
+        assert!(is_transient_failure(&make_failed_result(Some(""), Some(2))));
+    }
+
+    #[test]
+    fn is_transient_failure_flags_permanent_keywords() {
+        assert!(!is_transient_failure(&make_failed_result(
+            Some("HTTP 404 Not Found"),
+            None
+        )));
+        assert!(!is_transient_failure(&make_failed_result(
+            Some("error: Invalid argument"),
+            None
+        )));
+        assert!(!is_transient_failure(&make_failed_result(
+            Some("恒久失敗: 認証情報が不正です"),
+            None
+        )));
+        // Permanent keywords only match if they appear in the detail; a generic
+        // network error must stay transient.
+        assert!(is_transient_failure(&make_failed_result(
+            Some("connection reset by peer"),
+            None
+        )));
+    }
+
+    #[test]
+    fn compute_retry_backoff_secs_indexes_schedule_and_clamps_tail() {
+        let schedule = [60, 300, 900];
+        assert_eq!(compute_retry_backoff_secs(0, &schedule), 60);
+        assert_eq!(compute_retry_backoff_secs(1, &schedule), 300);
+        assert_eq!(compute_retry_backoff_secs(2, &schedule), 900);
+        // retry_count beyond schedule length uses the last entry.
+        assert_eq!(compute_retry_backoff_secs(5, &schedule), 900);
+    }
+
+    #[test]
+    fn compute_retry_backoff_secs_falls_back_when_schedule_empty() {
+        let empty: [i64; 0] = [];
+        assert_eq!(compute_retry_backoff_secs(0, &empty), 60);
+    }
+
+    #[test]
+    fn parse_backoff_value_handles_units() {
+        assert_eq!(parse_backoff_value("30"), Some(30));
+        assert_eq!(parse_backoff_value("1m"), Some(60));
+        assert_eq!(parse_backoff_value("5m"), Some(300));
+        assert_eq!(parse_backoff_value("2H"), Some(7_200));
+        assert_eq!(parse_backoff_value(" 45s "), Some(45));
+        assert_eq!(parse_backoff_value(""), None);
+        assert_eq!(parse_backoff_value("-5"), None);
+        assert_eq!(parse_backoff_value("abc"), None);
+    }
+
+    #[test]
+    fn parse_backoff_spec_splits_csv() {
+        assert_eq!(parse_backoff_spec("30,1m,2h"), vec![30, 60, 7_200]);
+        assert_eq!(parse_backoff_spec("  10s , 5m , 15m  "), vec![10, 300, 900]);
+        assert_eq!(parse_backoff_spec(""), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn should_retry_job_combines_transient_and_retry_budget() {
+        let transient = make_failed_result(Some("connection reset"), Some(128));
+        let permanent = make_failed_result(Some("HTTP 404 Not Found"), None);
+
+        let mut job = QueueJob {
+            id: "j1".to_string(),
+            job_type: JobType::Download,
+            target: "1".to_string(),
+            created_at: 0,
+            retry_count: 0,
+            max_retries: 3,
+            available_at: None,
+        };
+        assert!(should_retry_job(&transient, &job));
+        assert!(!should_retry_job(&permanent, &job));
+
+        job.retry_count = 3;
+        assert!(!should_retry_job(&transient, &job));
     }
 
     #[test]

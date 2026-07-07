@@ -430,6 +430,31 @@ export function bindActions() {
   // --- Confirm modal ---
   on('confirm-cancel', () => El.confirmModal?.classList.add('hide'));
 
+  // --- Bookmarklet register modal ---
+  function clearRegisterUrl() {
+    if (El.registerModal) delete El.registerModal.dataset.registerUrl;
+  }
+  function hideRegisterModal() {
+    clearRegisterUrl();
+    El.registerModal?.classList.add('hide');
+  }
+  on('register-modal-close', hideRegisterModal);
+  on('register-cancel', hideRegisterModal);
+  on('register-ok', (e) => {
+    const triggerEl = e.currentTarget;
+    const url = El.registerModal?.dataset?.registerUrl || '';
+    if (!url) {
+      hideRegisterModal();
+      return;
+    }
+    void runGuardedAction(triggerEl, async () => {
+      const result = await postJson('/api/download', { targets: [url] });
+      assertApiSuccess(result, 'ブックマークレット登録に失敗しました');
+      hideRegisterModal();
+      showNotification('ブックマークレットから登録しました', 'success');
+    }, 'ブックマークレット登録に失敗しました');
+  });
+
   // --- Diff modal ---
   on('diff-close', () => El.diffModal?.classList.add('hide'));
 
@@ -863,6 +888,39 @@ export function bindActions() {
     document.documentElement.dataset.theme = State.theme;
     if (El.themeSelect) El.themeSelect.value = State.theme;
   }
+}
+
+/**
+ * Handle `?register=<url>` query parameter for the bookmarklet same-origin flow.
+ *
+ * When the user clicks the bookmarklet on a target site, it opens the WEB UI in a
+ * new window with the URL passed as `?register=...`. We show a confirmation dialog
+ * and, on approval, call the existing same-origin `/api/download` POST endpoint.
+ * The Origin header is then the WEB UI itself, so the CSRF guard permits it.
+ *
+ * Caller (main.js) is expected to strip the `register` param from the URL after
+ * dismissal (cancel or success) so refreshes do not re-prompt.
+ */
+export function handleRegisterParam(url) {
+  if (!url || typeof url !== 'string') return false;
+  if (!El.registerModal || !El.registerUrl) return false;
+  // Defensive: only http(s) schemes are accepted. javascript:/data:/file: would
+  // either be rejected by the API or, worse, trick the user. Reject anything else.
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  if (url.length > 2048) return false;
+
+  // Stash the URL on the modal element so the OK handler (bound in bindActions)
+  // can read it without sharing a closure over module-local state.
+  El.registerModal.dataset.registerUrl = url;
+  El.registerUrl.textContent = url;
+  El.registerModal.classList.remove('hide');
+  return true;
 }
 
 /* ===== Helpers ===== */

@@ -45,6 +45,13 @@ pub fn default_local_setting_value(name: &str) -> Option<serde_yaml::Value> {
         }
         "time-zone" => Some(serde_yaml::Value::String("Asia/Tokyo".to_string())),
         "user-agent" => Some(serde_yaml::Value::String("auto".to_string())),
+        "queue.max-retries" => Some(serde_yaml::Value::Number(serde_yaml::Number::from(3))),
+        "queue.retry-backoff" => {
+            Some(serde_yaml::Value::String("1m,5m,15m".to_string()))
+        }
+        "update.max-parallel-domains" => {
+            Some(serde_yaml::Value::Number(serde_yaml::Number::from(4)))
+        }
         _ => None,
     }
 }
@@ -89,6 +96,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "update.sort-by"
         | "update.auto-schedule.enable"
         | "update.auto-schedule"
+        | "update.max-parallel-domains"
         | "convert.copy-to"
         | "convert.copy-zip-to"
         | "convert.copy-to-grouping"
@@ -121,12 +129,15 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "filename-length-limit"
         | "ebook-filename-length-limit"
         | "time-zone"
-        | "user-agent" => Some("detail"),
+        | "user-agent"
+        | "queue.max-retries"
+        | "queue.retry-backoff" => Some("detail"),
 
         // local → webui
         "webui.theme"
         | "webui.table.reload-timing"
         | "webui.performance-mode"
+        | "webui.new-tag-color"
         | "webui.debug-mode" => Some("webui"),
 
         // global → global
@@ -140,6 +151,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "server-basic-auth.user"
         | "server-basic-auth.password"
         | "server-ws-add-accepted-domains"
+        | "server-add-accepted-hosts"
         | "over18" => Some("global"),
 
         _ => None,
@@ -505,6 +517,70 @@ mod tests {
         assert_eq!(tab_for_setting("webui.debug-mode"), Some("webui"));
         assert!(setting_variables().get("webui.debug-mode").is_some());
     }
+
+    #[test]
+    fn webui_new_tag_color_is_visible_on_webui_tab() {
+        assert_eq!(tab_for_setting("webui.new-tag-color"), Some("webui"));
+        assert!(setting_variables().get("webui.new-tag-color").is_some());
+    }
+
+    #[test]
+    fn server_add_accepted_hosts_has_global_tab() {
+        assert_eq!(tab_for_setting("server-add-accepted-hosts"), Some("global"));
+        let vars = setting_variables();
+        let info = vars
+            .get("server-add-accepted-hosts")
+            .expect("server-add-accepted-hosts must be registered as a global var");
+        assert!(matches!(info.var_type, VarType::String));
+        assert!(info.invisible, "global-only setting should stay invisible on webui tab");
+    }
+
+    #[test]
+    fn queue_retry_settings_have_detail_tab_and_defaults() {
+        assert_eq!(tab_for_setting("queue.max-retries"), Some("detail"));
+        assert_eq!(tab_for_setting("queue.retry-backoff"), Some("detail"));
+
+        let vars = setting_variables();
+        let max = vars
+            .get("queue.max-retries")
+            .expect("queue.max-retries must be registered as a local var");
+        assert!(matches!(max.var_type, VarType::Integer));
+        assert!(max.invisible, "queue settings stay invisible on webui tab");
+
+        let backoff = vars
+            .get("queue.retry-backoff")
+            .expect("queue.retry-backoff must be registered as a local var");
+        assert!(matches!(backoff.var_type, VarType::String));
+        assert!(backoff.invisible);
+
+        // Default values must surface through `default_local_setting_value` so
+        // the user does not have to write them by hand.
+        let max_default = default_local_setting_value("queue.max-retries")
+            .expect("queue.max-retries default");
+        assert_eq!(max_default.as_i64(), Some(3));
+        let backoff_default = default_local_setting_value("queue.retry-backoff")
+            .expect("queue.retry-backoff default");
+        assert_eq!(
+            backoff_default.as_str(),
+            Some("1m,5m,15m"),
+        );
+    }
+
+    #[test]
+    fn update_max_parallel_domains_has_general_tab_and_default() {
+        assert_eq!(tab_for_setting("update.max-parallel-domains"), Some("general"));
+
+        let vars = setting_variables();
+        let info = vars
+            .get("update.max-parallel-domains")
+            .expect("update.max-parallel-domains must be registered as a local var");
+        assert!(matches!(info.var_type, VarType::Integer));
+        assert!(!info.invisible);
+
+        let default = default_local_setting_value("update.max-parallel-domains")
+            .expect("update.max-parallel-domains default");
+        assert_eq!(default.as_i64(), Some(4));
+    }
 }
 
 /// Local setting variable metadata
@@ -650,6 +726,13 @@ pub fn setting_variables() -> SettingVariables {
             vis(
                 VarType::String,
                 "自動アップデートする時間を指定する。カンマ区切りで複数指定可能。\n      書式：HHMM (例: 0800,1200,1800 = 8時、12時、18時)",
+            ),
+        ),
+        (
+            "update.max-parallel-domains",
+            vis(
+                VarType::Integer,
+                "アップデート時にドメインごとにダウンロードワーカーを並列化する数。同一ドメイン内は常に直列で処理されるため対サイト礼儀は崩れない。1で従来の逐次動作。デフォルトは 4",
             ),
         ),
         (
@@ -869,10 +952,33 @@ pub fn setting_variables() -> SettingVariables {
             ),
         ),
         (
+            "webui.new-tag-color",
+            sel(
+                "新規タグに自動割り当てする色。defaultの場合は従来どおりタグ追加順に巡回します",
+                vec![
+                    "default", "green", "yellow", "blue", "magenta", "cyan", "red", "white",
+                ],
+            ),
+        ),
+        (
             "webui.debug-mode",
             vis(
                 VarType::Boolean,
                 "WEB UI 上で失敗ジョブの詳細エラー表示を有効にする。ON のときだけ通知とコンソールに詳細を出す",
+            ),
+        ),
+        (
+            "queue.max-retries",
+            invis(
+                VarType::Integer,
+                "ジョブが失敗したときに自動リトライする最大回数。0 でリトライ無効。既定は 3",
+            ),
+        ),
+        (
+            "queue.retry-backoff",
+            invis(
+                VarType::String,
+                "リトライ時の待機秒数をカンマ区切りで指定（s/m/h 単位可、例: 1m,5m,15m）。要素数より多く失敗したときは最後の値を再利用",
             ),
         ),
     ];
@@ -957,6 +1063,13 @@ pub fn setting_variables() -> SettingVariables {
             invis(
                 VarType::String,
                 "PushServer の accepted_domains に追加するホストのリスト（カンマ区切り）",
+            ),
+        ),
+        (
+            "server-add-accepted-hosts",
+            invis(
+                VarType::String,
+                "HTTP の Host ヘッダに追加で許可するホストのリスト（カンマ区切り、*.example.com 形式のワイルドカード対応）",
             ),
         ),
         ("over18", invis(VarType::Boolean, "18歳以上かどうか")),

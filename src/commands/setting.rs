@@ -621,6 +621,9 @@ mod tests {
         assert!(cast_value("webui.table.reload-timing", "every").is_ok());
         assert!(cast_value("webui.theme", "unknown").is_err());
         assert!(cast_value("webui.theme", "Cerulean").is_ok());
+        assert!(cast_value("webui.new-tag-color", "purple").is_err());
+        assert!(cast_value("webui.new-tag-color", "default").is_ok());
+        assert!(cast_value("webui.new-tag-color", "white").is_ok());
         assert!(cast_value("default.title_date_align", "middle").is_err());
         assert!(cast_value("default.title_date_align", "left").is_ok());
     }

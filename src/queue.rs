@@ -1,8 +1,6 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -14,10 +12,10 @@ use crate::error::{NarouError, Result};
 
 const MAX_PENDING_JOBS: usize = 10_000;
 const MAX_JOB_TARGET_CHARS: usize = 16 * 1024;
+const DEFAULT_MAX_RETRIES: u32 = 3;
 pub const WEBUI_MESSAGE_TYPE_META_KEY: &str = "webui_message_type";
 pub const WEBUI_MESSAGE_TEXT_META_KEY: &str = "webui_message_text";
 pub const WEBUI_UPDATE_START_MESSAGE_TYPE: &str = "update_start";
-static JOB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueJob {
@@ -29,6 +27,11 @@ pub struct QueueJob {
     pub retry_count: u32,
     #[serde(default)]
     pub max_retries: u32,
+    /// Earliest Unix timestamp (seconds) at which the job may be popped.
+    /// `None` or a past timestamp means the job is immediately runnable.
+    /// Used to implement exponential backoff between retries without sleeping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,7 +46,7 @@ pub enum JobType {
     Mail,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QueueLane {
     Default,
     Secondary,
@@ -222,7 +225,8 @@ impl PersistentQueue {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let content = serde_yaml::to_string(&queue_state_to_legacy_file(&self.state.lock()))?;
+        let content =
+            crate::db::inventory::serialize_yaml_content(&queue_state_to_legacy_file(&self.state.lock()))?;
         atomic_write(&self.path, &content)?;
         self.notify_changed();
         Ok(())
@@ -235,6 +239,25 @@ impl PersistentQueue {
     fn notify_changed(&self) {
         self.change_notify.notify_waiters();
         self.change_notify.notify_one();
+    }
+
+    /// Returns true if at least one active pending job is currently runnable
+    /// (its `available_at` is `None` or at or before "now"). `lane` is a
+    /// hint used by `pop`; pass `Default` to inspect any lane.
+    fn has_runnable_pending(&self, lane: QueueLane) -> bool {
+        self.has_runnable_pending_for_lane(lane)
+    }
+
+    fn has_runnable_pending_for_lane(&self, lane: QueueLane) -> bool {
+        let state = self.state.lock();
+        let now = chrono::Utc::now().timestamp();
+        state
+            .active_pending
+            .iter()
+            .any(|job| {
+                job.job.job_type.lane() == lane
+                    && job.job.available_at.map_or(true, |at| at <= now)
+            })
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -324,12 +347,17 @@ impl PersistentQueue {
     }
 
     pub fn pop(&self) -> Option<QueueJob> {
-        if self.state.lock().active_pending.is_empty() {
+        if !self.has_runnable_pending(QueueLane::Default) {
             let _ = self.merge_external_pending_jobs();
         }
         let job = {
             let mut state = self.state.lock();
-            let mut stored = state.active_pending.pop_front()?;
+            let now = chrono::Utc::now().timestamp();
+            let index = state
+                .active_pending
+                .iter()
+                .position(|job| job.job.available_at.map_or(true, |at| at <= now))?;
+            let mut stored = state.active_pending.remove(index)?;
             stored.mark_running();
             let job = stored.job.clone();
             state.active_running.retain(|running| running.job.id != job.id);
@@ -341,21 +369,27 @@ impl PersistentQueue {
     }
 
     pub fn pop_for_lane(&self, lane: QueueLane) -> Option<QueueJob> {
-        if !self
-            .state
-            .lock()
-            .active_pending
-            .iter()
-            .any(|job| job.job.job_type.lane() == lane)
-        {
+        self.pop_for_lane_excluding(lane, |_| false)
+    }
+
+    pub fn pop_for_lane_excluding<F>(&self, lane: QueueLane, is_blocked: F) -> Option<QueueJob>
+    where
+        F: Fn(&QueueJob) -> bool,
+    {
+        if !self.has_runnable_pending_for_lane(lane) {
             let _ = self.merge_external_pending_jobs();
         }
         let job = {
             let mut state = self.state.lock();
+            let now = chrono::Utc::now().timestamp();
             let index = state
                 .active_pending
                 .iter()
-                .position(|job| job.job.job_type.lane() == lane)?;
+                .position(|job| {
+                    job.job.job_type.lane() == lane
+                        && !is_blocked(&job.job)
+                        && job.job.available_at.map_or(true, |at| at <= now)
+                })?;
             let mut stored = state.active_pending.remove(index)?;
             stored.mark_running();
             let job = stored.job.clone();
@@ -450,6 +484,36 @@ impl PersistentQueue {
         drop(state);
         self.save()?;
         Ok(count)
+    }
+
+    /// Move a currently-running job back to the active pending queue,
+    /// incrementing its `retry_count` and recording the earliest timestamp
+    /// at which it may be popped again. Returns `true` if the job was
+    /// found and requeued, `false` if it was not in the running set.
+    ///
+    /// `available_at` is a Unix timestamp in seconds. Pass `None` to make
+    /// the job immediately runnable; pass a future timestamp to schedule
+    /// exponential backoff between retries. Callers are responsible for
+    /// checking `job.retry_count < job.max_retries` before invoking.
+    pub fn requeue(&self, job_id: &str, available_at: Option<i64>) -> Result<bool> {
+        self.merge_external_pending_jobs()?;
+        let requeued = {
+            let mut state = self.state.lock();
+            if let Some(mut job) = take_running_job(&mut state, job_id) {
+                ensure_queue_capacity(total_pending_len(&state), 1)?;
+                job.job.retry_count = job.job.retry_count.saturating_add(1);
+                job.job.available_at = available_at;
+                job.mark_pending();
+                state.active_pending.push_back(job);
+                true
+            } else {
+                false
+            }
+        };
+        if requeued {
+            self.save()?;
+        }
+        Ok(requeued)
     }
 
     pub fn len(&self) -> usize {
@@ -548,6 +612,45 @@ impl PersistentQueue {
             .chain(state.active_running.iter())
             .map(|job| job.job.clone())
             .collect()
+    }
+
+    /// Collect the set of novel IDs currently held by running jobs across both
+    /// the active and deferred running queues. Used by the web worker to apply
+    /// per-novel exclusion so that, for example, a `convert` job for novel X
+    /// does not start while an `update` for X is still running on the Default
+    /// lane. Non-numeric tokens in a target string (e.g. `--force` or
+    /// `tag:modified`) are ignored.
+    pub fn running_novel_ids(&self) -> HashSet<i64> {
+        let state = self.state.lock();
+        state
+            .deferred_running
+            .iter()
+            .chain(state.active_running.iter())
+            .flat_map(|stored| extract_novel_ids(&stored.job.target).into_iter())
+            .collect()
+    }
+
+    /// Collect running novel IDs grouped by lane. Lets the web worker apply
+    /// per-novel exclusion with lane awareness: a candidate on lane L should
+    /// only be blocked by running jobs on the *other* lane, so concurrent
+    /// updates on the Default lane for different novels do not stall each
+    /// other. See [`PersistentQueue::running_novel_ids`] for the lane-blind
+    /// variant.
+    pub fn running_novel_ids_by_lane(&self) -> std::collections::HashMap<QueueLane, HashSet<i64>> {
+        use std::collections::HashMap;
+        let mut by_lane: HashMap<QueueLane, HashSet<i64>> = HashMap::new();
+        let state = self.state.lock();
+        for stored in state
+            .deferred_running
+            .iter()
+            .chain(state.active_running.iter())
+        {
+            by_lane
+                .entry(stored.job.job_type.lane())
+                .or_default()
+                .extend(extract_novel_ids(&stored.job.target));
+        }
+        by_lane
     }
 
     pub fn has_restorable_tasks(&self) -> bool {
@@ -980,7 +1083,8 @@ fn legacy_task_to_stored_job(task: LegacyQueueTask, running: bool) -> Option<Sto
         target,
         created_at,
         retry_count: 0,
-        max_retries: 3,
+        max_retries: configured_max_retries(),
+        available_at: None,
     };
     let mut stored = StoredQueueJob { job, legacy: task };
     if running {
@@ -1045,7 +1149,8 @@ fn build_stored_job(
         target: target.clone(),
         created_at,
         retry_count: 0,
-        max_retries: 3,
+        max_retries: configured_max_retries(),
+        available_at: None,
     };
     let mut stored = StoredQueueJob {
         job,
@@ -1053,6 +1158,23 @@ fn build_stored_job(
     };
     stored.mark_pending();
     stored
+}
+
+fn configured_max_retries() -> u32 {
+    crate::compat::load_local_setting_value("queue.max-retries")
+        .and_then(parse_max_retries_value)
+        .unwrap_or(DEFAULT_MAX_RETRIES)
+}
+
+fn parse_max_retries_value(value: Value) -> Option<u32> {
+    let parsed = match value {
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
+        Value::String(raw) => raw.trim().parse::<i64>().ok(),
+        _ => None,
+    }?;
+    Some(parsed.clamp(0, u32::MAX as i64) as u32)
 }
 
 fn build_legacy_task(
@@ -1173,6 +1295,21 @@ fn split_job_target(target: &str) -> Vec<&str> {
     target.split('\t').filter(|part| !part.is_empty()).collect()
 }
 
+/// Extract the set of numeric novel IDs from a queue job target string.
+///
+/// Targets are tab-separated lists of arguments (see [`split_job_target`])
+/// and may include non-numeric tokens such as `--force` or `tag:modified`.
+/// Only tokens that parse as `i64` are returned, so callers can use the
+/// resulting set to compare novel identities without worrying about flag
+/// or tag prefixes. An empty result means the job is not tied to any
+/// specific novel ID (e.g. `AutoUpdate` jobs that broadcast to the queue).
+pub fn extract_novel_ids(target: &str) -> HashSet<i64> {
+    target
+        .split('\t')
+        .filter_map(|part| part.parse::<i64>().ok())
+        .collect()
+}
+
 fn flatten_values(values: &[Value]) -> Vec<String> {
     let mut flattened = Vec::new();
     for value in values {
@@ -1215,23 +1352,48 @@ fn legacy_timestamp_to_unix(value: Option<Value>) -> i64 {
 }
 
 fn unix_to_rfc3339(timestamp: i64) -> String {
-    use chrono::TimeZone;
+    use chrono::{SecondsFormat, TimeZone};
 
     chrono::Utc
         .timestamp_opt(timestamp, 0)
         .single()
         .unwrap_or_else(chrono::Utc::now)
         .with_timezone(&chrono::Local)
-        .to_rfc3339()
+        .to_rfc3339_opts(SecondsFormat::Secs, false)
 }
 
 fn now_rfc3339() -> String {
-    chrono::Local::now().to_rfc3339()
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
 fn generate_job_id(job_type: JobType, target: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_ok() {
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        return format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+            bytes[4],
+            bytes[5],
+            bytes[6],
+            bytes[7],
+            bytes[8],
+            bytes[9],
+            bytes[10],
+            bytes[11],
+            bytes[12],
+            bytes[13],
+            bytes[14],
+            bytes[15]
+        );
+    }
 
     let mut hasher = DefaultHasher::new();
     match job_type {
@@ -1244,15 +1406,9 @@ fn generate_job_id(job_type: JobType, target: &str) -> String {
         JobType::Mail => "ml".hash(&mut hasher),
     }
     target.hash(&mut hasher);
-    let counter = JOB_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let timestamp_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    counter.hash(&mut hasher);
     std::process::id().hash(&mut hasher);
-    timestamp_nanos.hash(&mut hasher);
-    format!("{counter:016x}-{:016x}", hasher.finish())
+    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default().hash(&mut hasher);
+    format!("narou-rs-{:016x}", hasher.finish())
 }
 
 fn find_narou_root() -> Result<PathBuf> {
@@ -1344,6 +1500,71 @@ mod tests {
         assert_eq!(remaining.len(), 2);
         assert!(matches!(remaining[0].job_type, JobType::Download));
         assert!(matches!(remaining[1].job_type, JobType::Update));
+    }
+
+    #[test]
+    fn pop_for_lane_excluding_skips_blocked_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let blocked = queue.push(JobType::Convert, "1").unwrap();
+        let allowed = queue.push(JobType::Backup, "2").unwrap();
+
+        let popped = queue
+            .pop_for_lane_excluding(QueueLane::Secondary, |job| job.target == "1")
+            .unwrap();
+
+        assert_eq!(popped.id, allowed);
+        let remaining = queue.get_pending_tasks();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, blocked);
+    }
+
+    #[test]
+    fn push_uses_queue_max_retries_local_setting() {
+        let temp = tempfile::tempdir().unwrap();
+        let narou_dir = temp.path().join(".narou");
+        std::fs::create_dir_all(&narou_dir).unwrap();
+        std::fs::write(narou_dir.join("local_setting.yaml"), "queue.max-retries: 0\n").unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        let queue = PersistentQueue::new(&narou_dir.join("queue.yaml")).unwrap();
+        let id = queue.push(JobType::Download, "1").unwrap();
+        let pending = queue.get_pending_tasks();
+
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].max_retries, 0);
+
+        *crate::db::DATABASE.lock() = None;
+    }
+
+    #[test]
+    fn save_omits_yaml_document_start_header_like_inventory_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+
+        queue.push(JobType::Download, "1").unwrap();
+        let saved = std::fs::read_to_string(&queue_path).unwrap();
+
+        assert!(!saved.starts_with("---"), "{saved}");
+        assert!(saved.starts_with("pending:"), "{saved}");
+        assert!(
+            regex::Regex::new(
+                r"(?m)^- id: [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            )
+            .unwrap()
+            .is_match(&saved),
+            "{saved}"
+        );
+        assert!(
+            !regex::Regex::new(r"T\d{2}:\d{2}:\d{2}\.\d")
+                .unwrap()
+                .is_match(&saved),
+            "{saved}"
+        );
     }
 
     #[test]
@@ -1524,6 +1745,189 @@ mod tests {
     }
 
     #[test]
+    fn requeue_increments_retry_count_and_schedules_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let id = queue.push(JobType::Download, "n0001").unwrap();
+
+        let running = queue.pop().unwrap();
+        assert_eq!(running.id, id);
+        assert_eq!(running.retry_count, 0);
+
+        let available_at = chrono::Utc::now().timestamp() + 60;
+        let requeued = queue.requeue(&id, Some(available_at)).unwrap();
+        assert!(requeued);
+
+        let pending = queue.get_pending_tasks();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].retry_count, 1);
+        assert_eq!(pending[0].available_at, Some(available_at));
+        assert_eq!(queue.running_count(), 0);
+    }
+
+    #[test]
+    fn requeue_returns_false_for_unknown_job_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        assert!(!queue.requeue("does-not-exist", None).unwrap());
+    }
+
+    #[test]
+    fn requeue_does_not_increment_when_running_slot_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let id = queue.push(JobType::Download, "n0001").unwrap();
+
+        // Job is still pending; requeue should not move it.
+        let requeued = queue.requeue(&id, None).unwrap();
+        assert!(!requeued);
+        let pending = queue.get_pending_tasks();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].retry_count, 0);
+        assert_eq!(pending[0].available_at, None);
+    }
+
+    #[test]
+    fn pop_skips_jobs_with_future_available_at() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let first = queue.push(JobType::Download, "1").unwrap();
+        let second = queue.push(JobType::Download, "2").unwrap();
+
+        // Pop the first, fail it, requeue with a far-future timestamp.
+        let running = queue.pop().unwrap();
+        assert_eq!(running.id, first);
+        let future = chrono::Utc::now().timestamp() + 86_400;
+        assert!(queue.requeue(&running.id, Some(future)).unwrap());
+
+        // Now the only immediately-runnable pending job is the second one.
+        let next = queue.pop().unwrap();
+        assert_eq!(next.id, second);
+        assert_eq!(queue.get_pending_tasks().len(), 1);
+        assert_eq!(queue.get_pending_tasks()[0].id, first);
+        assert_eq!(queue.get_pending_tasks()[0].available_at, Some(future));
+    }
+
+    #[test]
+    fn pop_runs_jobs_with_past_available_at() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let id = queue.push(JobType::Download, "1").unwrap();
+
+        let running = queue.pop().unwrap();
+        let past = chrono::Utc::now().timestamp() - 1;
+        assert!(queue.requeue(&running.id, Some(past)).unwrap());
+
+        let next = queue.pop().unwrap();
+        assert_eq!(next.id, id);
+        assert_eq!(next.retry_count, 1);
+    }
+
+    #[test]
+    fn pop_for_lane_skips_jobs_with_future_available_at() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let blocked = queue.push(JobType::Download, "10").unwrap();
+        let ready = queue.push(JobType::Download, "11").unwrap();
+
+        // Run the blocked job, then requeue it with a far-future timestamp.
+        let running = queue.pop().unwrap();
+        assert_eq!(running.id, blocked);
+        let future = chrono::Utc::now().timestamp() + 86_400;
+        assert!(queue.requeue(&running.id, Some(future)).unwrap());
+
+        // Lane-aware pop should skip the still-blocked job and pick the ready one.
+        let next = queue.pop_for_lane(QueueLane::Default).unwrap();
+        assert_eq!(next.id, ready);
+        assert_eq!(queue.get_pending_tasks()[0].id, blocked);
+    }
+
+    #[test]
+    fn queue_yaml_backward_compatible_when_available_at_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+
+        // Hand-written YAML mimicking a queue produced before the retry field
+        // existed. No `available_at` key on any job.
+        let legacy_yaml = r#"
+pending:
+  - id: legacy-pending
+    cmd: download
+    args: ["n0099"]
+running: []
+completed: []
+partial: []
+failed: []
+cancelled: []
+deferred_pending: false
+updated_at: "2026-05-01T00:00:00Z"
+"#;
+        std::fs::write(&queue_path, legacy_yaml).unwrap();
+
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        // The pre-retry pending jobs are loaded as deferred (so the user can be
+        // prompted to restore them); activate them for the test and ensure the
+        // missing `available_at` field is back-filled to `None`.
+        assert_eq!(queue.activate_restorable_tasks().unwrap(), 1);
+
+        let pending = queue.get_pending_tasks();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "legacy-pending");
+        assert_eq!(pending[0].available_at, None);
+        assert_eq!(pending[0].retry_count, 0);
+        assert_eq!(pending[0].max_retries, 3);
+
+        // The pending job should still be poppable.
+        let popped = queue.pop().unwrap();
+        assert_eq!(popped.id, "legacy-pending");
+        assert_eq!(popped.available_at, None);
+    }
+
+    #[test]
+    fn requeue_up_to_max_retries_keeps_retrying_then_stops() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let id = queue.push(JobType::Download, "1").unwrap();
+
+        // Manually clamp max_retries to 2 so the test stays short.
+        {
+            let mut state = queue.state.lock();
+            if let Some(job) = state.active_running.iter_mut().find(|job| job.job.id == id) {
+                job.job.max_retries = 2;
+            }
+            if let Some(job) = state
+                .active_pending
+                .iter_mut()
+                .find(|job| job.job.id == id)
+            {
+                job.job.max_retries = 2;
+            }
+        }
+
+        // First failure → retry_count 1 (still < max_retries 2)
+        let running = queue.pop().unwrap();
+        assert!(queue.requeue(&running.id, None).unwrap());
+        let pending = queue.get_pending_tasks();
+        assert_eq!(pending[0].retry_count, 1);
+        assert!(pending[0].retry_count <= pending[0].max_retries);
+
+        // Second failure → retry_count 2 (== max_retries 2; worker would no-op retry)
+        let running = queue.pop().unwrap();
+        assert!(queue.requeue(&running.id, None).unwrap());
+        let pending = queue.get_pending_tasks();
+        assert_eq!(pending[0].retry_count, 2);
+        assert_eq!(pending[0].retry_count, pending[0].max_retries);
+    }
+
+    #[test]
     fn completed_and_failed_history_survive_reload() {
         let temp = tempfile::tempdir().unwrap();
         let queue_path = temp.path().join("queue.yaml");
@@ -1654,6 +2058,7 @@ mod tests {
                 created_at: chrono::Utc::now().timestamp(),
                 retry_count: 0,
                 max_retries: 3,
+                available_at: None,
             }));
         }
         reloaded.flush().unwrap();
@@ -1835,5 +2240,106 @@ mod tests {
         assert!(saved.contains("source: ruby"));
         assert!(saved.contains("- - '12'"));
         assert!(saved.contains("- - '56'"));
+    }
+
+    #[test]
+    fn extract_novel_ids_picks_numeric_tokens_only() {
+        assert!(super::extract_novel_ids("").is_empty());
+        assert!(super::extract_novel_ids("tag:modified").is_empty());
+        assert!(super::extract_novel_ids("--backup-bookmark").is_empty());
+        assert_eq!(
+            super::extract_novel_ids("12"),
+            HashSet::from([12i64])
+        );
+        assert_eq!(
+            super::extract_novel_ids("12\tkindle"),
+            HashSet::from([12i64])
+        );
+        assert_eq!(
+            super::extract_novel_ids("1\t2\t3"),
+            HashSet::from([1i64, 2, 3])
+        );
+        assert_eq!(
+            super::extract_novel_ids("--force\t12\ttag:modified"),
+            HashSet::from([12i64])
+        );
+        // empty tabs and non-numeric tokens are ignored
+        assert_eq!(
+            super::extract_novel_ids("12\t\t34\tabc\t1.5"),
+            HashSet::from([12i64, 34])
+        );
+        // negative numbers are kept (legacy ids may carry a sign on some sites)
+        assert_eq!(
+            super::extract_novel_ids("-7"),
+            HashSet::from([-7i64])
+        );
+    }
+
+    #[test]
+    fn running_novel_ids_collects_from_active_and_deferred_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+
+        // Empty state -> empty set
+        assert!(queue.running_novel_ids().is_empty());
+        assert!(queue.running_novel_ids_by_lane().is_empty());
+
+        // Pop a Default-lane update for novel 12 to put it in active_running.
+        queue.push(JobType::Update, "12").unwrap();
+        let running_update = queue.pop_for_lane(QueueLane::Default).unwrap();
+        assert_eq!(running_update.target, "12");
+
+        // Pop a Secondary-lane convert for novel 34 to put it in active_running.
+        queue.push(JobType::Convert, "34").unwrap();
+        let running_convert = queue.pop_for_lane(QueueLane::Secondary).unwrap();
+        assert_eq!(running_convert.target, "34");
+
+        // At this point the in-process queue has both 12 (Default) and 34
+        // (Secondary) running.
+        let active_novel_ids = queue.running_novel_ids();
+        assert_eq!(active_novel_ids, HashSet::from([12i64, 34i64]));
+        let active_by_lane = queue.running_novel_ids_by_lane();
+        assert!(active_by_lane.get(&QueueLane::Default).unwrap().contains(&12i64));
+        assert!(active_by_lane.get(&QueueLane::Secondary).unwrap().contains(&34i64));
+
+        // Now seed a YAML file with both lanes running so we can verify the
+        // helper also reaches deferred_running.
+        std::fs::write(
+            &queue_path,
+            "---\npending: []\nrunning:\n  - id: deferred-running-default\n    cmd: update\n    args:\n      - '99'\n    meta: {}\n    status: running\n    created_at: '2026-07-07T00:00:00+09:00'\n    started_at: '2026-07-07T00:01:00+09:00'\n  - id: deferred-running-secondary\n    cmd: convert\n    args:\n      - '34'\n    meta: {}\n    status: running\n    created_at: '2026-07-07T00:02:00+09:00'\n    started_at: '2026-07-07T00:03:00+09:00'\ncompleted: []\nfailed: []\ncancelled: []\nupdated_at: '2026-07-07T00:04:00+09:00'\n",
+        )
+        .unwrap();
+        let queue_with_deferred = PersistentQueue::new(&queue_path).unwrap();
+
+        // running_novel_ids picks up novels across both default and secondary
+        // lanes after the reload.
+        let novel_ids = queue_with_deferred.running_novel_ids();
+        assert!(novel_ids.contains(&34i64));
+        assert!(novel_ids.contains(&99i64));
+        assert!(!novel_ids.contains(&12i64));
+
+        // running_novel_ids_by_lane separates by lane.
+        let by_lane = queue_with_deferred.running_novel_ids_by_lane();
+        let default_novels = by_lane.get(&QueueLane::Default).cloned().unwrap_or_default();
+        let secondary_novels = by_lane.get(&QueueLane::Secondary).cloned().unwrap_or_default();
+        assert!(default_novels.contains(&99i64));
+        assert!(!default_novels.contains(&34i64));
+        assert!(secondary_novels.contains(&34i64));
+        assert!(!secondary_novels.contains(&99i64));
+    }
+
+    #[test]
+    fn running_novel_ids_ignores_non_numeric_target_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+
+        // A target that mixes a numeric ID with a tag and a flag should still
+        // surface the numeric ID.
+        queue.push(JobType::Update, "42\ttag:modified\t--force").unwrap();
+        queue.pop_for_lane(QueueLane::Default).unwrap();
+
+        assert_eq!(queue.running_novel_ids(), HashSet::from([42i64]));
     }
 }

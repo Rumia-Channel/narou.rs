@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::compat;
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::error::Result;
 
 const TAG_COLOR_ORDER: [&str; 7] = ["green", "yellow", "blue", "magenta", "cyan", "red", "white"];
+pub const NEW_TAG_COLOR_SETTING: &str = "webui.new-tag-color";
+pub const TAG_COLOR_DEFAULT: &str = "default";
 
 #[derive(Debug, Clone, Default)]
 pub struct TagColors {
@@ -14,6 +17,14 @@ pub struct TagColors {
 impl TagColors {
     pub fn into_map(self) -> HashMap<String, String> {
         self.colors
+    }
+
+    pub fn color_for(&self, tag: &str) -> Option<&str> {
+        self.colors.get(tag).map(String::as_str)
+    }
+
+    pub fn contains(&self, tag: &str) -> bool {
+        self.colors.contains_key(tag)
     }
 
     pub fn remove(&mut self, tag: &str) {
@@ -27,10 +38,34 @@ impl TagColors {
         }
         self.colors.insert(tag.to_string(), color.to_string());
     }
+
+    pub fn set_color(&mut self, tag: &str, color: &str, no_overwrite_color: bool) -> bool {
+        if no_overwrite_color && self.colors.contains_key(tag) {
+            return false;
+        }
+
+        if !self.colors.contains_key(tag) {
+            self.order.push(tag.to_string());
+        }
+
+        if self.colors.get(tag).is_some_and(|current| current == color) {
+            return false;
+        }
+        self.colors.insert(tag.to_string(), color.to_string());
+        true
+    }
 }
 
 pub fn is_valid_tag_color(color: &str) -> bool {
     TAG_COLOR_ORDER.contains(&color)
+}
+
+pub fn is_valid_new_tag_color_value(color: &str) -> bool {
+    color == TAG_COLOR_DEFAULT || is_valid_tag_color(color)
+}
+
+pub fn tag_color_names() -> &'static [&'static str] {
+    &TAG_COLOR_ORDER
 }
 
 pub fn load_tag_colors(inventory: &Inventory) -> Result<TagColors> {
@@ -92,16 +127,42 @@ pub fn ensure_tag_colors<'a>(
     tag_colors: &mut TagColors,
     tags: impl IntoIterator<Item = &'a str>,
 ) -> bool {
+    let configured_color = configured_new_tag_color();
+    ensure_tag_colors_with_default_color(tag_colors, tags, configured_color.as_deref())
+}
+
+pub fn ensure_tag_colors_with_default_color<'a>(
+    tag_colors: &mut TagColors,
+    tags: impl IntoIterator<Item = &'a str>,
+    default_color: Option<&str>,
+) -> bool {
+    let default_color = default_color.filter(|color| is_valid_tag_color(color));
     let mut changed = false;
     for tag in tags {
         if tag_colors.colors.contains_key(tag) {
             continue;
         }
-        let next_color = next_tag_color(tag_colors).to_string();
+        let next_color = default_color
+            .unwrap_or_else(|| next_tag_color(tag_colors))
+            .to_string();
         tag_colors.set(tag, &next_color);
         changed = true;
     }
     changed
+}
+
+pub fn configured_new_tag_color() -> Option<String> {
+    compat::load_local_setting_string(NEW_TAG_COLOR_SETTING)
+        .and_then(|raw| normalize_default_color(&raw))
+}
+
+fn normalize_default_color(raw: &str) -> Option<String> {
+    let color = raw.trim().to_ascii_lowercase();
+    if is_valid_tag_color(&color) {
+        Some(color)
+    } else {
+        None
+    }
 }
 
 fn next_tag_color(tag_colors: &TagColors) -> &str {
@@ -137,9 +198,21 @@ mod tests {
     #[test]
     fn ensure_tag_colors_rotates_in_insertion_order() {
         let mut tag_colors = TagColors::default();
-        assert!(ensure_tag_colors(&mut tag_colors, ["fav"]));
-        assert!(ensure_tag_colors(&mut tag_colors, ["later"]));
-        assert!(ensure_tag_colors(&mut tag_colors, ["todo"]));
+        assert!(ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["fav"],
+            None
+        ));
+        assert!(ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["later"],
+            None
+        ));
+        assert!(ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["todo"],
+            None
+        ));
         assert_eq!(
             tag_colors.colors.get("fav").map(String::as_str),
             Some("green")
@@ -152,6 +225,62 @@ mod tests {
             tag_colors.colors.get("todo").map(String::as_str),
             Some("blue")
         );
+    }
+
+    #[test]
+    fn ensure_tag_colors_uses_configured_default_color() {
+        let mut tag_colors = TagColors::default();
+        assert!(ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["auto", "manual"],
+            Some("white")
+        ));
+        assert_eq!(
+            tag_colors.colors.get("auto").map(String::as_str),
+            Some("white")
+        );
+        assert_eq!(
+            tag_colors.colors.get("manual").map(String::as_str),
+            Some("white")
+        );
+    }
+
+    #[test]
+    fn ensure_tag_colors_falls_back_to_rotation_for_invalid_default_color() {
+        let mut tag_colors = TagColors::default();
+        assert!(ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["fav", "later"],
+            Some("default")
+        ));
+        assert_eq!(
+            tag_colors.colors.get("fav").map(String::as_str),
+            Some("green")
+        );
+        assert_eq!(
+            tag_colors.colors.get("later").map(String::as_str),
+            Some("yellow")
+        );
+    }
+
+    #[test]
+    fn new_tag_color_validation_accepts_default_and_colors() {
+        assert!(is_valid_new_tag_color_value(TAG_COLOR_DEFAULT));
+        for color in tag_color_names() {
+            assert!(is_valid_new_tag_color_value(color));
+        }
+        assert!(!is_valid_new_tag_color_value(""));
+        assert!(!is_valid_new_tag_color_value("purple"));
+    }
+
+    #[test]
+    fn normalize_default_color_accepts_case_and_ignores_default() {
+        assert_eq!(
+            normalize_default_color(" White "),
+            Some("white".to_string())
+        );
+        assert_eq!(normalize_default_color(TAG_COLOR_DEFAULT), None);
+        assert_eq!(normalize_default_color(""), None);
     }
 
     #[test]

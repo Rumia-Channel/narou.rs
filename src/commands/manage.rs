@@ -6,13 +6,13 @@ use chrono::{DateTime, Duration, Local, Utc};
 use narou_rs::compat::confirm;
 use narou_rs::db::inventory::{Inventory, InventoryScope};
 use narou_rs::db::novel_record::NovelRecord;
+use narou_rs::tag_colors::{self, TagColors};
 
 use super::{download, help, log};
 
 use crate::logger;
 
 const ANNOTATION_COLOR_TIME_LIMIT: i64 = 6 * 60 * 60;
-const TAG_COLOR_ORDER: [&str; 7] = ["green", "yellow", "blue", "magenta", "cyan", "red", "white"];
 const FILTER_TYPE_HELP: &str = "series(連載),ss(短編),frozen(凍結),nonfrozen(非凍結)";
 
 #[derive(Debug, Clone, Default)]
@@ -29,6 +29,8 @@ pub struct ListOptions {
     pub grep: Option<String>,
     pub tag: Option<Option<String>>,
     pub echo: bool,
+    /// CLI `--sort-by` で指定されたキー。`db::sort_keys()` で検証する。
+    pub sort_by: Option<String>,
     pub frozen: bool,
 }
 
@@ -103,12 +105,6 @@ pub struct TagOptions {
     pub targets: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct TagColors {
-    order: Vec<String>,
-    colors: HashMap<String, String>,
-}
-
 #[derive(Debug, Clone)]
 struct DecoratedNovel {
     id: i64,
@@ -176,9 +172,22 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
     let stdout_is_tty = std::io::stdout().is_terminal();
     let frozen_ids = load_inventory_ids("freeze");
 
+    // `--sort-by` の検証。無効キーは update.rb と同じく
+    // "正しいキーではありません。次の中から選択して下さい" を出して 127 で終了。
+    let sort_key: Option<&'static str> = match resolve_list_sort_key(options.sort_by.as_deref()) {
+        Ok(key) => key,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 127;
+        }
+    };
+
     let records = match db::with_database(|db| {
-        let mut values = if options.latest {
-            db.sort_by(options.view_date_type(), false)
+        let mut values = if let Some(key) = sort_key {
+            // 明示的な --sort-by が指定された場合: db::sort_by の型付き比較を使う。
+            db.sort_by(key, false).into_iter().cloned().collect::<Vec<_>>()
+        } else if options.latest {
+            db.sort_by(options.view_date_type(), true)
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>()
@@ -199,10 +208,17 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         }
     };
 
-    let mut tag_colors = match load_tag_colors() {
+    let inventory = match Inventory::with_default_root() {
+        Ok(inventory) => inventory,
+        Err(err) => {
+            log::report_error(&err.to_string());
+            return 127;
+        }
+    };
+    let mut tag_colors = match tag_colors::load_tag_colors(&inventory) {
         Ok(colors) => colors,
         Err(err) => {
-            log::report_error(&err);
+            log::report_error(&err.to_string());
             return 127;
         }
     };
@@ -225,7 +241,7 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
     }
 
     let colors_changed = if options.show_tags() {
-        ensure_tag_colors(
+        tag_colors::ensure_tag_colors(
             &mut tag_colors,
             selected
                 .iter()
@@ -249,8 +265,8 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         .collect::<Vec<_>>();
 
     if colors_changed {
-        if let Err(err) = save_tag_colors(&tag_colors) {
-            log::report_error(&err);
+        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
+            log::report_error(&err.to_string());
             return 127;
         }
     }
@@ -277,34 +293,38 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         }
     };
 
-    let mut tag_colors = match load_tag_colors() {
+    let inventory = match Inventory::with_default_root() {
+        Ok(inventory) => inventory,
+        Err(err) => {
+            log::report_error(&err.to_string());
+            return 127;
+        }
+    };
+    let mut tag_colors = match tag_colors::load_tag_colors(&inventory) {
         Ok(colors) => colors,
         Err(err) => {
-            log::report_error(&err);
+            log::report_error(&err.to_string());
             return 127;
         }
     };
 
     let mut explicit_color_changed = false;
     if let Some(color) = normalize_color(options.color.as_deref()) {
-        match color.as_str() {
-            "green" | "yellow" | "blue" | "magenta" | "cyan" | "red" | "white" => {
-                if let Some(tags) = mode.tag_names() {
-                    for tag in tags {
-                        explicit_color_changed |=
-                            set_tag_color(&mut tag_colors, tag, &color, options.no_overwrite_color);
-                    }
+        if tag_colors::is_valid_tag_color(&color) {
+            if let Some(tags) = mode.tag_names() {
+                for tag in tags {
+                    explicit_color_changed |=
+                        tag_colors.set_color(tag, &color, options.no_overwrite_color);
                 }
             }
-            _ => {
-                eprintln!("{}という色は存在しません。色指定は無視されます", color);
-            }
+        } else {
+            eprintln!("{}という色は存在しません。色指定は無視されます", color);
         }
     }
 
     if explicit_color_changed {
-        if let Err(err) = save_tag_colors(&tag_colors) {
-            log::report_error(&err);
+        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
+            log::report_error(&err.to_string());
             return 127;
         }
     }
@@ -380,8 +400,10 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
             }
 
             if !updated.tags.is_empty() {
-                auto_color_changed |=
-                    ensure_tag_colors(&mut tag_colors, updated.tags.iter().map(String::as_str));
+                auto_color_changed |= tag_colors::ensure_tag_colors(
+                    &mut tag_colors,
+                    updated.tags.iter().map(String::as_str),
+                );
                 outputs.push(TagOutput::Current(updated.tags.clone()));
             }
 
@@ -400,8 +422,8 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
     let (outputs, auto_color_changed) = outputs;
 
     if auto_color_changed {
-        if let Err(err) = save_tag_colors(&tag_colors) {
-            log::report_error(&err);
+        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
+            log::report_error(&err.to_string());
             return 127;
         }
     }
@@ -428,6 +450,29 @@ fn split_words(value: Option<&str>) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+/// `narou list --sort-by` のキー文字列を検証し、内部表現に変換する。
+/// `None` のときはソートキー未指定 (現状の `view_date_type` / `latest` ロジック) を表す。
+/// 無効キーの場合は update.rb 互換のエラーメッセージを返す。
+fn resolve_list_sort_key(raw: Option<&str>) -> Result<Option<&'static str>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match narou_rs::db::sort_keys().iter().find(|k| **k == raw) {
+        Some(key) => Ok(Some(*key)),
+        None => {
+            let summaries = narou_rs::db::sort_keys()
+                .iter()
+                .map(|k| format!("  {:>20}", k))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(format!(
+                "{} は正しいキーではありません。次の中から選択して下さい\n{}",
+                raw, summaries
+            ))
+        }
+    }
 }
 
 fn valid_tags(record: &NovelRecord, tags: &[String]) -> bool {
@@ -685,10 +730,20 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
         }
     };
 
-    let changed = ensure_tag_colors(tag_colors, tag_list.iter().map(|(tag, _)| tag.as_str()));
+    let inventory = match Inventory::with_default_root() {
+        Ok(inventory) => inventory,
+        Err(err) => {
+            log::report_error(&err.to_string());
+            return 127;
+        }
+    };
+    let changed = tag_colors::ensure_tag_colors(
+        tag_colors,
+        tag_list.iter().map(|(tag, _)| tag.as_str()),
+    );
     if changed {
-        if let Err(err) = save_tag_colors(tag_colors) {
-            log::report_error(&err);
+        if let Err(err) = tag_colors::save_tag_colors(&inventory, tag_colors) {
+            log::report_error(&err.to_string());
             return 127;
         }
     }
@@ -737,7 +792,7 @@ fn get_tag_list() -> Result<Vec<(String, usize)>, String> {
 fn render_tag_count(tag: &str, count: usize, tag_colors: &TagColors) -> String {
     let text = format!("{}({})", tag, count);
     if std::io::stdout().is_terminal() {
-        if let Some(color) = tag_colors.colors.get(tag) {
+        if let Some(color) = tag_colors.color_for(tag) {
             return paint(&text, color, true);
         }
     }
@@ -748,7 +803,7 @@ fn render_tags(tags: &[String], tag_colors: &TagColors, separator: &str, colored
     tags.iter()
         .map(|tag| {
             if colored && std::io::stdout().is_terminal() {
-                if let Some(color) = tag_colors.colors.get(tag) {
+                if let Some(color) = tag_colors.color_for(tag) {
                     return paint(tag, color, true);
                 }
             }
@@ -756,117 +811,6 @@ fn render_tags(tags: &[String], tag_colors: &TagColors, separator: &str, colored
         })
         .collect::<Vec<_>>()
         .join(separator)
-}
-
-fn load_tag_colors() -> Result<TagColors, String> {
-    let inventory = Inventory::with_default_root().map_err(|err| err.to_string())?;
-    let raw = inventory
-        .load_raw("tag_colors", InventoryScope::Local)
-        .map_err(|err| err.to_string())?;
-    if raw.trim().is_empty() {
-        return Ok(TagColors::default());
-    }
-
-    let value: serde_yaml::Value = serde_yaml::from_str(&raw).map_err(|err| err.to_string())?;
-    let Some(mapping) = value.as_mapping() else {
-        return Ok(TagColors::default());
-    };
-
-    let mut tag_colors = TagColors::default();
-    for (tag, color) in mapping {
-        let (Some(tag), Some(color)) = (tag.as_str(), color.as_str()) else {
-            continue;
-        };
-        tag_colors.order.push(tag.to_string());
-        tag_colors.colors.insert(tag.to_string(), color.to_string());
-    }
-    Ok(tag_colors)
-}
-
-fn save_tag_colors(tag_colors: &TagColors) -> Result<(), String> {
-    let inventory = Inventory::with_default_root().map_err(|err| err.to_string())?;
-    let mut mapping = serde_yaml::Mapping::new();
-    let mut written = HashSet::new();
-
-    for tag in &tag_colors.order {
-        let Some(color) = tag_colors.colors.get(tag) else {
-            continue;
-        };
-        mapping.insert(
-            serde_yaml::Value::String(tag.clone()),
-            serde_yaml::Value::String(color.clone()),
-        );
-        written.insert(tag.clone());
-    }
-
-    for (tag, color) in &tag_colors.colors {
-        if written.contains(tag) {
-            continue;
-        }
-        mapping.insert(
-            serde_yaml::Value::String(tag.clone()),
-            serde_yaml::Value::String(color.clone()),
-        );
-    }
-
-    inventory
-        .save(
-            "tag_colors",
-            InventoryScope::Local,
-            &serde_yaml::Value::Mapping(mapping),
-        )
-        .map_err(|err| err.to_string())
-}
-
-fn ensure_tag_colors<'a>(
-    tag_colors: &mut TagColors,
-    tags: impl IntoIterator<Item = &'a str>,
-) -> bool {
-    let mut changed = false;
-    for tag in tags {
-        if tag_colors.colors.contains_key(tag) {
-            continue;
-        }
-        changed |= set_tag_color(tag_colors, tag, next_tag_color(tag_colors), false);
-    }
-    changed
-}
-
-fn set_tag_color(
-    tag_colors: &mut TagColors,
-    tag: &str,
-    color: impl Into<String>,
-    no_overwrite_color: bool,
-) -> bool {
-    if no_overwrite_color && tag_colors.colors.contains_key(tag) {
-        return false;
-    }
-
-    if !tag_colors.colors.contains_key(tag) {
-        tag_colors.order.push(tag.to_string());
-    }
-
-    let color = color.into();
-    if tag_colors.colors.get(tag) == Some(&color) {
-        return false;
-    }
-    tag_colors.colors.insert(tag.to_string(), color);
-    true
-}
-
-fn next_tag_color(tag_colors: &TagColors) -> String {
-    let last_color = tag_colors
-        .order
-        .iter()
-        .rev()
-        .find_map(|tag| tag_colors.colors.get(tag))
-        .map(String::as_str)
-        .unwrap_or(TAG_COLOR_ORDER[TAG_COLOR_ORDER.len() - 1]);
-    let current_index = TAG_COLOR_ORDER
-        .iter()
-        .position(|color| *color == last_color)
-        .unwrap_or(TAG_COLOR_ORDER.len() - 1);
-    TAG_COLOR_ORDER[(current_index + 1) % TAG_COLOR_ORDER.len()].to_string()
 }
 
 pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
@@ -1165,10 +1109,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        TagColors, TagOptions, build_tag_mode, ensure_tag_colors, matches_filters, matches_grep,
-        remove_novel_files,
+        ListOptions, TagColors, TagOptions, build_tag_mode, matches_filters, matches_grep,
+        remove_novel_files, resolve_list_sort_key,
     };
     use narou_rs::db::novel_record::NovelRecord;
+    use narou_rs::tag_colors;
 
     #[test]
     fn remove_without_with_file_only_deletes_toc() {
@@ -1211,22 +1156,25 @@ mod tests {
     #[test]
     fn ensure_tag_colors_rotates_in_insertion_order() {
         let mut tag_colors = TagColors::default();
-        assert!(ensure_tag_colors(&mut tag_colors, ["fav"]));
-        assert!(ensure_tag_colors(&mut tag_colors, ["later"]));
-        assert!(ensure_tag_colors(&mut tag_colors, ["todo"]));
+        assert!(tag_colors::ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["fav"],
+            None,
+        ));
+        assert!(tag_colors::ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["later"],
+            None,
+        ));
+        assert!(tag_colors::ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["todo"],
+            None,
+        ));
 
-        assert_eq!(
-            tag_colors.colors.get("fav").map(String::as_str),
-            Some("green")
-        );
-        assert_eq!(
-            tag_colors.colors.get("later").map(String::as_str),
-            Some("yellow")
-        );
-        assert_eq!(
-            tag_colors.colors.get("todo").map(String::as_str),
-            Some("blue")
-        );
+        assert_eq!(tag_colors.color_for("fav"), Some("green"));
+        assert_eq!(tag_colors.color_for("later"), Some("yellow"));
+        assert_eq!(tag_colors.color_for("todo"), Some("blue"));
     }
 
     #[test]
@@ -1285,5 +1233,35 @@ mod tests {
             convert_failure: false,
             extra_fields: Default::default(),
         }
+    }
+
+    #[test]
+    fn resolve_list_sort_key_accepts_db_supported_keys() {
+        // `narou_rs::db::sort_keys()` の各値をそのまま受理する。
+        for key in narou_rs::db::sort_keys() {
+            let result = resolve_list_sort_key(Some(*key)).unwrap();
+            assert_eq!(result, Some(*key), "resolve_list_sort_key({key})");
+        }
+    }
+
+    #[test]
+    fn resolve_list_sort_key_returns_none_for_unspecified() {
+        assert_eq!(resolve_list_sort_key(None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_list_sort_key_rejects_unknown_key() {
+        let err = resolve_list_sort_key(Some("not_a_key")).unwrap_err();
+        assert!(err.contains("not_a_key は正しいキーではありません"));
+        // 候補一覧も一緒に表示する (update.rb 互換の挙動)。
+        for key in narou_rs::db::sort_keys() {
+            assert!(err.contains(key), "expected error to list {key}: {err}");
+        }
+    }
+
+    #[test]
+    fn list_options_default_has_sort_by_unset() {
+        let opts = ListOptions::default();
+        assert!(opts.sort_by.is_none());
     }
 }

@@ -22,8 +22,8 @@ use user_converter::UserConverter;
 use crate::downloader::{SectionElement, SectionFile, TocObject, SECTION_SAVE_DIR};
 use crate::error::{NarouError, Result};
 use crate::illustration_store::{
-    IllustrationStore, find_saved_illustration_filename, is_remote_illustration_source,
-    legacy_basename_from_source, normalize_illustration_url,
+    IllustrationStore, find_saved_illustration_filename, illustration_extension_from_content_type,
+    is_remote_illustration_source, legacy_basename_from_source, normalize_illustration_url,
 };
 use crate::progress::ProgressReporter;
 use crate::termcolor::bold_colored;
@@ -43,6 +43,7 @@ pub struct NovelConverter {
     last_inspection_output: Option<String>,
     use_dakuten_font: bool,
     illustration_store: IllustrationStore,
+    target_device: Option<device::Device>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +124,7 @@ impl NovelConverter {
             last_inspection_output: None,
             use_dakuten_font: false,
             illustration_store,
+            target_device: None,
         }
     }
 
@@ -141,6 +143,7 @@ impl NovelConverter {
             last_inspection_output: None,
             use_dakuten_font: false,
             illustration_store,
+            target_device: None,
         }
     }
 
@@ -377,6 +380,7 @@ impl NovelConverter {
             &converted_story,
             &converted_sections,
             record.as_ref(),
+            self.target_device,
         ))
     }
 
@@ -400,7 +404,7 @@ impl NovelConverter {
     }
 
     fn make_converter(&self) -> converter_base::ConverterBase {
-        if let Some(ref uc) = self.user_converter {
+        let mut converter = if let Some(ref uc) = self.user_converter {
             converter_base::ConverterBase::with_user_converter_and_inspector(
                 self.settings.clone(),
                 uc.clone(),
@@ -411,7 +415,9 @@ impl NovelConverter {
                 self.settings.clone(),
                 self.inspector.clone(),
             )
-        }
+        };
+        converter.target_device = self.target_device;
+        converter
     }
 
     fn make_converter_with_parenthesized_ruby(
@@ -458,6 +464,7 @@ impl NovelConverter {
         hasher.update(self.compute_settings_signature().as_bytes());
         hasher.update(self.compute_replace_signature().as_bytes());
         hasher.update(self.compute_converter_signature().as_bytes());
+        hasher.update(target_device_cache_key(self.target_device).as_bytes());
         hasher.update(ILLUSTRATION_LOCALIZATION_VERSION.as_bytes());
         hex::encode(hasher.finalize())
     }
@@ -718,7 +725,11 @@ impl NovelConverter {
         no_strip: bool,
         verbose: bool,
     ) -> Result<String> {
-        let txt_path = PathBuf::from(self.convert_text_file(text)?);
+        let previous_device = self.target_device;
+        self.target_device = Some(device);
+        let converted = self.convert_text_file(text);
+        self.target_device = previous_device;
+        let txt_path = PathBuf::from(converted?);
         let base_name = txt_path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -798,7 +809,11 @@ impl NovelConverter {
 
         let sections = load_sections_from_dir(novel_dir, &toc_object.subtitles)?;
 
-        let aozora_text = self.convert_novel_with_id(Some(_id), &toc_object, &sections)?;
+        let previous_device = self.target_device;
+        self.target_device = Some(device);
+        let converted = self.convert_novel_with_id(Some(_id), &toc_object, &sections);
+        self.target_device = previous_device;
+        let aozora_text = converted?;
         self.flush_section_convert_cache()?;
         let txt_path = output::create_output_text_path(&self.settings, _id, novel_dir, &toc_object);
         std::fs::write(&txt_path, &aozora_text)?;
@@ -902,6 +917,19 @@ impl NovelConverter {
 
     fn flush_illustration_store(&mut self) -> Result<()> {
         self.illustration_store.flush(&self.settings.archive_path)
+    }
+}
+
+fn target_device_cache_key(device: Option<device::Device>) -> &'static str {
+    match device {
+        Some(device::Device::Text) => "device:text",
+        Some(device::Device::Epub) => "device:epub",
+        Some(device::Device::Mobi) => "device:kindle",
+        Some(device::Device::Kobo) => "device:kobo",
+        Some(device::Device::Ibunko) => "device:ibunko",
+        Some(device::Device::Reader) => "device:reader",
+        Some(device::Device::Ibooks) => "device:ibooks",
+        None => "device:none",
     }
 }
 
@@ -1120,16 +1148,6 @@ fn find_saved_section_illustration_filename(
 ) -> Option<String> {
     let basename = format!("{}-{}", section_index, illust_index);
     find_saved_illustration_filename(illust_dir, &basename)
-}
-
-fn illustration_extension_from_content_type(content_type: &str) -> Option<&'static str> {
-    match content_type {
-        "image/jpeg" => Some("jpg"),
-        "image/png" => Some("png"),
-        "image/gif" => Some("gif"),
-        "image/bmp" => Some("bmp"),
-        _ => None,
-    }
 }
 
 fn fetch_illustration_bytes(url: &str) -> std::result::Result<(Vec<u8>, String), String> {
@@ -1651,6 +1669,7 @@ mod tests {
 
         let saved_log = std::fs::read_to_string(root.join("調査ログ.txt")).unwrap();
         assert!(saved_log.contains("改行直後の見出し付与は有効になっていません"));
+        assert!(!crate::illustration_store::cache_path(&root).exists());
 
         let _ = std::fs::remove_dir_all(root);
     }

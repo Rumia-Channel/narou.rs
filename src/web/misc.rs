@@ -169,9 +169,9 @@ pub async fn tag_list(
         let tags = list.into_iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
 
         let inventory = db.inventory();
-        let mut tag_colors = super::tag_colors::load_tag_colors(inventory)?;
-        if super::tag_colors::ensure_tag_colors(&mut tag_colors, tags.iter().map(String::as_str)) {
-            super::tag_colors::save_tag_colors(inventory, &tag_colors)?;
+        let mut tag_colors = crate::tag_colors::load_tag_colors(inventory)?;
+        if crate::tag_colors::ensure_tag_colors(&mut tag_colors, tags.iter().map(String::as_str)) {
+            crate::tag_colors::save_tag_colors(inventory, &tag_colors)?;
         }
 
         Ok((tags, tag_colors.into_map()))
@@ -218,7 +218,7 @@ pub async fn tag_change_color(
     };
     let color = body["color"].as_str().unwrap_or("");
 
-    if !color.is_empty() && !super::tag_colors::is_valid_tag_color(color) {
+    if !color.is_empty() && !crate::tag_colors::is_valid_tag_color(color) {
         return Json(ApiResponse {
             success: false,
             message: format!("{}という色は存在しません", color),
@@ -227,13 +227,13 @@ pub async fn tag_change_color(
 
     let result = with_database(|db| {
         let inv = db.inventory();
-        let mut colors = super::tag_colors::load_tag_colors(inv)?;
+        let mut colors = crate::tag_colors::load_tag_colors(inv)?;
         if color.is_empty() {
             colors.remove(&tag);
         } else {
             colors.set(&tag, color);
         }
-        super::tag_colors::save_tag_colors(inv, &colors)?;
+        crate::tag_colors::save_tag_colors(inv, &colors)?;
         Ok(())
     });
 

@@ -1065,6 +1065,23 @@ li.enable-selected.disabled a {
   max-width: 50rem;
 }
 
+/* ========== Bookmarklet register modal ========== */
+.register-url-wrap {
+  margin: 0.6em 0 0;
+  word-break: break-all;
+}
+
+.register-url {
+  display: inline-block;
+  max-width: 100%;
+  padding: 0.4em 0.6em;
+  background: var(--bg-secondary);
+  border-radius: var(--border-radius);
+  font-size: 0.9em;
+  color: var(--text-color);
+  word-break: break-all;
+}
+
 /* ========== Feature tour ========== */
 .feature-tour-lead {
   margin: 0 0 1em;

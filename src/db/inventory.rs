@@ -271,14 +271,6 @@ where
     lock_file.lock_exclusive()?;
     let result = operation();
     let _ = lock_file.unlock();
-    drop(lock_file);
-    if result.is_ok() {
-        match fs::remove_file(&lock_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(_) => {}
-        }
-    }
     result
 }
 
@@ -314,7 +306,7 @@ fn atomic_write_locked(path: &Path, content: &str) -> Result<()> {
     })))
 }
 
-fn serialize_yaml_content<T: Serialize>(data: &T) -> Result<String> {
+pub(crate) fn serialize_yaml_content<T: Serialize>(data: &T) -> Result<String> {
     let mut content = serde_yaml::to_string(data)?;
     // Strip the `---` document-start header that serde_yaml emits by default,
     // to match Ruby Psych output and keep files byte-compatible with narou.rb.
@@ -607,7 +599,7 @@ mod tests {
         let raw = std::fs::read_to_string(narou_dir.join("freeze.yaml")).unwrap();
         assert!(!raw.contains("1:"));
         assert!(raw.contains("2: true"));
-        assert!(!narou_dir.join("freeze.yaml.lock").exists());
+        assert!(narou_dir.join("freeze.yaml.lock").exists());
     }
 
     #[test]
@@ -639,7 +631,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!lock_path.exists());
+        assert!(lock_path.exists());
         let raw = std::fs::read_to_string(narou_dir.join("freeze.yaml")).unwrap();
         assert!(raw.contains("1: true"));
     }

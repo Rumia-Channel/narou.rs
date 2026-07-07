@@ -158,7 +158,10 @@
   function renderSelect(name, value, keys, summaries) {
     let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '">';
     const isTheme = (name === 'webui.theme');
-    html += '<option value="">' + (isTheme ? 'デフォルト' : '未設定') + '</option>';
+    const isNewTagColor = (name === 'webui.new-tag-color');
+    if (!isNewTagColor) {
+      html += '<option value="">' + (isTheme ? 'デフォルト' : '未設定') + '</option>';
+    }
     keys.forEach(function(key, index) {
       const selected = (value === key) ? ' selected' : '';
       const label = summaries[index] || key;

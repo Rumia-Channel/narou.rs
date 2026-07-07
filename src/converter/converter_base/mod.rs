@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use regex::Regex;
 
+use super::device::Device;
 use super::inspector::Inspector;
 use super::settings::NovelSettings;
 use super::user_converter::UserConverter;
@@ -26,6 +27,7 @@ pub struct ConverterBase {
     pub text_type: TextType,
     pub use_dakuten_font: bool,
     pub(crate) enable_parenthesized_ruby: bool,
+    pub(crate) target_device: Option<Device>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,6 +56,7 @@ impl ConverterBase {
             text_type: TextType::Body,
             use_dakuten_font: false,
             enable_parenthesized_ruby: true,
+            target_device: None,
         }
     }
 
@@ -71,6 +74,7 @@ impl ConverterBase {
             text_type: TextType::Body,
             use_dakuten_font: false,
             enable_parenthesized_ruby: true,
+            target_device: None,
         }
     }
 
@@ -88,6 +92,7 @@ impl ConverterBase {
             text_type: TextType::Body,
             use_dakuten_font: false,
             enable_parenthesized_ruby: true,
+            target_device: None,
         }
     }
 
@@ -109,6 +114,7 @@ impl ConverterBase {
             text_type: TextType::Body,
             use_dakuten_font: false,
             enable_parenthesized_ruby: true,
+            target_device: None,
         }
     }
 
@@ -148,6 +154,7 @@ impl ConverterBase {
         }
 
         result = self.replace_by_replace_txt(&result);
+        result = self.insert_separator_for_selection(&result);
 
         result
     }
@@ -194,14 +201,29 @@ impl ConverterBase {
         result = self.replace_narou_tag(&result);
         result = self.convert_numbers(&mut result);
         result = self.exception_reconvert_kanji_to_num(&result);
+        if self.settings.enable_convert_num_to_kanji
+            && self.text_type != TextType::Subtitle
+            && self.text_type != TextType::Chapter
+            && self.settings.enable_kanji_num_with_units
+            && self.settings.enable_kanji_num_with_units_explicit
+        {
+            result = self.convert_kanji_num_with_unit(
+                &result,
+                self.settings.kanji_num_with_units_lower_digit_zero,
+            );
+        }
+        self.rebuild_kanji_num(&mut result);
         result = self.insert_separate_space(&result);
         result = self.stash_kome(&result);
         result = self.convert_double_angle_quotation_to_gaiji(&result);
+        result = self.convert_rome_numeric(&result);
         result = self.alphabet_to_zenkaku(&result);
         result = self.symbols_to_zenkaku(&result);
         result = self.convert_tatechuyoko(&result);
         result = self.convert_novel_rule(&result);
+        result = self.convert_arrow(&result);
         result = self.convert_head_half_spaces(&result);
+        result = self.convert_fraction_and_date(&result);
         result = self.modify_kana_ni_to_kanji_ni(&result);
 
         result = self.convert_dakuten_char_to_font(&result);
@@ -276,6 +298,7 @@ impl ConverterBase {
 
         self.rebuild_illust(&mut data);
         self.rebuild_url(&mut data);
+        self.rebuild_english_sentences(&mut data);
         self.rebuild_hankaku_num_comma(&mut data);
         self.rebuild_kome_to_gaiji(&mut data);
 

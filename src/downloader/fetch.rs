@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::header::{
     ACCEPT, ACCEPT_CHARSET, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONNECTION, HeaderMap, HeaderValue,
-    LOCATION,
+    CONTENT_TYPE, LOCATION,
 };
 
 use crate::compat::configure_hidden_console_command;
@@ -125,11 +125,20 @@ impl HttpFetcher {
         Err(last_error.unwrap_or_else(|| NarouError::NotFound(url.to_string())))
     }
 
-    pub fn fetch_bytes(&self, url: &str, cookie: Option<&str>) -> Result<Vec<u8>> {
+    pub fn fetch_bytes(&self, url: &str, cookie: Option<&str>) -> Result<(Vec<u8>, String)> {
         validate_public_url(url).map_err(io_error)?;
         let response = self.send_reqwest(url, cookie)?;
         let response = ensure_success_status(url, response)?;
-        read_response_bytes(response)
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let bytes = read_response_bytes(response)?;
+        Ok((bytes, content_type))
     }
 
     pub fn resolve_final_url(&self, url: &str, cookie: Option<&str>) -> Result<String> {
@@ -139,6 +148,7 @@ impl HttpFetcher {
 
         for _ in 0..=MAX_REDIRECTS {
             validate_public_url(current.as_str()).map_err(io_error)?;
+            self.rate_limiter.wait_for_url(current.as_str());
             let mut request = self.manual_redirect_client.get(current.clone());
             if let Some(cookie) = current_cookie.as_deref() {
                 if !is_safe_header_value(cookie) {
@@ -183,10 +193,10 @@ impl HttpFetcher {
             .useragent(&self.user_agent)
             .map_err(|e| io_error(e.to_string()))?;
         handle
-            .follow_location(cookie.is_none())
+            .follow_location(false)
             .map_err(|e| io_error(e.to_string()))?;
         handle
-            .max_redirections(MAX_REDIRECTS as u32)
+            .max_redirections(0)
             .map_err(|e| io_error(e.to_string()))?;
         handle
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
@@ -223,30 +233,34 @@ impl HttpFetcher {
 
         let mut body = Vec::new();
         let mut response_too_large = false;
-        {
+        let perform_result = {
             let mut transfer = handle.transfer();
             transfer
                 .write_function(|data| {
                     if body.len() + data.len() > MAX_RESPONSE_BYTES {
                         response_too_large = true;
-                        return Err(curl::easy::WriteError::Pause);
+                        return Ok(0);
                     }
                     body.extend_from_slice(data);
                     Ok(data.len())
                 })
                 .map_err(|e| io_error(e.to_string()))?;
-            transfer.perform().map_err(|e| io_error(e.to_string()))?;
-        }
+            transfer.perform()
+        };
         if response_too_large {
             return Err(io_error(format!(
                 "response body exceeded {} bytes while fetching {url}",
                 MAX_RESPONSE_BYTES
             )));
         }
+        perform_result.map_err(|e| io_error(e.to_string()))?;
 
         let code = handle
             .response_code()
             .map_err(|e| io_error(e.to_string()))?;
+        if (300..400).contains(&code) {
+            return Err(io_error(format!("HTTP redirect {code} while fetching {url}")));
+        }
         if code == 404 {
             return Err(NarouError::NotFound(url.to_string()));
         }
@@ -279,14 +293,13 @@ impl HttpFetcher {
         encoding: Option<&str>,
     ) -> Result<String> {
         let mut cmd = Command::new("wget");
-        let max_redirects = if cookie.is_some() { 0 } else { MAX_REDIRECTS };
         cmd.arg("--quiet")
             .arg("--output-document=-")
             .arg("--tries=1")
             .arg(format!("--connect-timeout={CONNECT_TIMEOUT_SECS}"))
             .arg(format!("--read-timeout={READ_TIMEOUT_SECS}"))
             .arg(format!("--timeout={TOTAL_TIMEOUT_SECS}"))
-            .arg(format!("--max-redirect={max_redirects}"))
+            .arg("--max-redirect=0")
             .arg(format!("--max-filesize={MAX_RESPONSE_BYTES}"))
             .arg(format!("--user-agent={}", &self.user_agent))
             .arg("--header=Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
@@ -572,6 +585,29 @@ mod tests {
         server.join().unwrap();
 
         assert!(matches!(err, NarouError::NotFound(found_url) if found_url == url));
+    }
+
+    #[test]
+    fn curl_redirect_is_not_returned_as_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/redirect", listener.local_addr().unwrap());
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let fetcher = HttpFetcher::new("narou_rs-test").unwrap();
+        let err = fetcher.fetch_tier_curl(&url, Some("over18=yes"), None).unwrap_err();
+        server.join().unwrap();
+
+        assert!(err.to_string().contains("HTTP redirect 302"));
     }
 
     #[test]

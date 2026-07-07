@@ -190,6 +190,18 @@ pub async fn api_update_start(
     crate::compat::configure_hidden_console_command(&mut cmd);
     crate::compat::configure_process_group_command(&mut cmd);
 
+    // updater 側の update.log に「親が detach 付きで spawn した」事実を
+    // 残しておくと、Linux 環境で SIGHUP 連鎖が起きた際の切り分けに役立つ。
+    // (updater 自身は session/ getsid を別途記録する。)
+    append_update_session_marker(
+        &install_dir.join("update.log"),
+        &format!(
+            "session: parent pid={} spawning updater (Unix detach via setsid; \
+             SIGHUP relayed only if signal is explicitly sent to updater pid)",
+            pid
+        ),
+    );
+
     state
         .push_server
         .broadcast_echo("アップデート: 適用処理を開始します。本体を再起動します...", "stdout");
@@ -225,6 +237,33 @@ fn resolve_install_dir() -> Result<PathBuf, String> {
     exe.parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| "no parent".to_string())
+}
+
+/// update.log に簡易的な追記を行う。updater 側 Logger と同じ
+/// `epoch.millis` タイムスタンプ + 改行フォーマットで揃える。
+/// 失敗しても致命ではない (ログが取れないだけ) ので Result を返さない。
+fn append_update_session_marker(path: &Path, msg: &str) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::time::SystemTime;
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    let millis = now.subsec_millis();
+    let line = format!("[{secs}.{millis:03}] {msg}\n");
+
+    let open = OpenOptions::new().create(true).append(true).open(path);
+    match open {
+        Ok(mut file) => {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.flush();
+        }
+        Err(e) => {
+            eprintln!("update.log append failed: {e}");
+        }
+    }
 }
 
 fn updater_binary_path(install_dir: &Path) -> PathBuf {

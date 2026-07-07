@@ -5,7 +5,7 @@ pub mod novel_record;
 pub mod paths;
 pub mod ruby_time;
 
-pub use database::Database;
+pub use database::{compare_records_by_key, sort_key_valid, sort_keys, Database, SORT_KEYS};
 pub use novel_record::NovelRecord;
 pub use paths::{create_subdirectory_name, existing_novel_dir_for_record, novel_dir_for_record};
 
