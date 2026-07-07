@@ -137,6 +137,27 @@ fn strip_tags(text: &str) -> String {
     re.replace_all(text, "").to_string()
 }
 
+/// narou.rb 互換の `HTML#delete_ruby_tag`。
+///
+/// `<ruby>` `<rb>` `<rp>` `<rt>` の開始タグと閉じタグだけを `""` に置換する。
+/// 中身（base + ルビ読み + rp 括弧）はそのまま残すため、
+/// `<ruby><rb>2人</rb><rp>(</rp><rt>兄妹</rt><rp>)</rp></ruby>` は
+/// `2人(兄妹)` になる。`to_aozora` のように `｜base《ruby》` 形式へは
+/// 変換しない。`strip_tags` のように全タグを消すわけでもない。
+pub fn delete_ruby_tag(text: &str) -> String {
+    let re = Regex::new(r"(?i)</?(?:ruby|rb|rp|rt)>").unwrap();
+    re.replace_all(text, "").to_string()
+}
+
+/// narou.rb 互換の `Downloader#slim_subtitle`。
+///
+/// `delete_ruby_tag` を適用し、改行を全て除去したものを返す。
+/// 各話 subtitle を永続化する前に通すことで、生 HTML や複数行が
+/// section の `subtitle` フィールドに残らないようにする。
+pub fn slim_subtitle(text: &str) -> String {
+    delete_ruby_tag(text).replace('\n', "")
+}
+
 fn restore_entities(text: &str) -> String {
     let mut result = text.to_string();
     let entities: &[(&str, &str)] = &[
@@ -182,7 +203,7 @@ pub fn sanitize_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::to_aozora;
+    use super::{delete_ruby_tag, slim_subtitle, to_aozora};
 
     #[test]
     fn to_aozora_keeps_img_as_illustration_not_italic() {
@@ -192,5 +213,37 @@ mod tests {
 
         assert!(text.contains("［＃挿絵（挿絵/16-0.jpg）入る］"));
         assert!(!text.contains("［＃斜体］"));
+    }
+
+    #[test]
+    fn delete_ruby_tag_removes_ruby_rt_rb_rp_open_and_close() {
+        let input = "<ruby><rb>2人</rb><rp>(</rp><rt>兄妹</rt><rp>)</rp></ruby>";
+        assert_eq!(delete_ruby_tag(input), "2人(兄妹)");
+    }
+
+    #[test]
+    fn delete_ruby_tag_keeps_other_tags_untouched() {
+        let input = "<p><b>太字</b><ruby><rb>漢字</rb><rt>かんじ</rt></ruby> <i>斜体</i></p>";
+        assert_eq!(
+            delete_ruby_tag(input),
+            "<p><b>太字</b>漢字かんじ <i>斜体</i></p>"
+        );
+    }
+
+    #[test]
+    fn delete_ruby_tag_is_case_insensitive() {
+        let input = "<RUBY><RB>base</RB><RP>(</RP><RT>ruby</RT><RP>)</RP></RUBY>";
+        assert_eq!(delete_ruby_tag(input), "base(ruby)");
+    }
+
+    #[test]
+    fn slim_subtitle_removes_ruby_tags_and_newlines() {
+        let input = "<ruby><rb>2人</rb><rp>(</rp><rt>兄妹</rt><rp>)</rp></ruby>\n第2話";
+        assert_eq!(slim_subtitle(input), "2人(兄妹)第2話");
+    }
+
+    #[test]
+    fn slim_subtitle_passes_through_plain_text() {
+        assert_eq!(slim_subtitle("第一話"), "第一話");
     }
 }
