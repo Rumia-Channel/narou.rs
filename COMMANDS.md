@@ -256,6 +256,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `convert.multi-device` があれば `device` より優先して複数端末へ順に変換する。Ruby版同様 `kindle` を先頭へ寄せ、無効な端末名は警告し、`sample\\novel` で `convert.multi-device: epub,ibunko` により EPUB + ZIP 出力を確認済み
 - `--ignore-default` / `--ignore-force` を `NovelSettings::load_for_novel_with_options` に渡し、`default.*` / `force.*` の適用を個別に無効化できるようにした
 - DB 管理小説だけでなくファイルパス指定の textfile 変換も `commands::convert` に接続し、`--enc` による UTF-8 / Shift_JIS / EUC-JP 系のデコードと `enable_enchant_midashi` 推奨 INFO を追加した
+- `report.txt` の互換監査で出た変換差分のうち、ローマ数字変換、分数/日付変換、明示設定時の漢数字+単位変換、`disable_alphabet_word_to_zenkaku`、root `replace.txt` の追加適用、Kindle 向け矢印/ZWS、iBooks 章見出し前 6 改行を実装済み。既存のカクヨム byte-for-byte fixture は維持している
 - `narou list ... | narou convert` のようなパイプ入力に対応し、非TTYの標準入力から空白区切りの target を読み取って CLI 指定 target の末尾へ追加する
 - 変換後に `調査ログ.txt` を常に保存し、`enable_inspect` が有効なときは行末読点状況とカギ括弧内改行状況を記録する
 - `--inspect` 指定時は full display、未指定時は Ruby版同様に summary だけを出す
@@ -560,6 +561,7 @@ narou setting name         # 読み取り
 - queue worker が `.narou/queue.yaml` 永続キューを読み書きし、download / update / auto_update / convert / send / backup / mail の queued job を別プロセスまたは worker 内処理で実行する。Ruby版同様 `pending` / `running` を分けて保持し、legacy `cmd` / `args` / `meta` / `status` / `created_at` / `started_at` を維持したまま復元できる。`concurrency` 有効時は外部通信あり(download/update/auto_update)とその他(convert/send/backup/mail)を別 lane で並列実行し、無効時は全 job を投入順に逐次実行する
 - 一時的なネットワーク失敗で夜間更新全体が止まらないよう、queue worker は失敗した job を `JobOutcome::Failed` 時に判定し、`retry_count < max_retries` かつ恒久失敗 (detail に "not found" / "invalid argument" / "no such file" / "permanent failure" / "永久失敗" / "恒久失敗" を含む) でなければ `available_at` 付きで `active_pending` へ自動再投入する。`available_at` 経過後の job だけが `pop` 系で取り出されるためスリープを挟まない。Web UI には `queue_retry` イベントを、追加試行なしで `failed` へ落ちた場合は従来どおり `queue_failed` イベントを通知する
 - リトライ挙動は `narou setting` の `queue.max-retries`（既定 3、`0` で無効）と `queue.retry-backoff`（既定 `1m,5m,15m`、カンマ区切り、`s`/`m`/`h` 単位可、要素数を超えて失敗したときは最後の値を再利用）で調整できる。`QueueJob` の `available_at` フィールドは `#[serde(default, skip_serializing_if = "Option::is_none")]` 付きで読み書きされ、リトライ機能導入前の旧 `queue.yaml` もそのまま再ロード可能
+- `queue.yaml` 保存時は Ruby版に寄せ、先頭 `---` を出さず、job id は UUIDv4 形式、`created_at` / `started_at` / `updated_at` は秒精度の ISO8601 で出力する
 - idle 中の queue worker は同一プロセス内の queue 更新通知で起床し、外部プロセスが `queue.yaml` を更新した場合だけ低頻度フォールバックで検出する。空キュー時に `.narou/queue.yaml` を 500ms ごとに読み続けない
 - Web 経由の convert job は `--no-open` で非対話化し、API 指定 device は worker 専用 override で child process に渡す
 - `queue_clear` は deadlock しないように永続キュー保存順を修正済み

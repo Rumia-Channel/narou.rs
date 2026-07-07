@@ -306,7 +306,7 @@ fn atomic_write_locked(path: &Path, content: &str) -> Result<()> {
     })))
 }
 
-fn serialize_yaml_content<T: Serialize>(data: &T) -> Result<String> {
+pub(crate) fn serialize_yaml_content<T: Serialize>(data: &T) -> Result<String> {
     let mut content = serde_yaml::to_string(data)?;
     // Strip the `---` document-start header that serde_yaml emits by default,
     // to match Ruby Psych output and keep files byte-compatible with narou.rb.

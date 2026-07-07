@@ -1,8 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -18,7 +16,6 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 pub const WEBUI_MESSAGE_TYPE_META_KEY: &str = "webui_message_type";
 pub const WEBUI_MESSAGE_TEXT_META_KEY: &str = "webui_message_text";
 pub const WEBUI_UPDATE_START_MESSAGE_TYPE: &str = "update_start";
-static JOB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueJob {
@@ -228,7 +225,8 @@ impl PersistentQueue {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let content = serde_yaml::to_string(&queue_state_to_legacy_file(&self.state.lock()))?;
+        let content =
+            crate::db::inventory::serialize_yaml_content(&queue_state_to_legacy_file(&self.state.lock()))?;
         atomic_write(&self.path, &content)?;
         self.notify_changed();
         Ok(())
@@ -1354,23 +1352,48 @@ fn legacy_timestamp_to_unix(value: Option<Value>) -> i64 {
 }
 
 fn unix_to_rfc3339(timestamp: i64) -> String {
-    use chrono::TimeZone;
+    use chrono::{SecondsFormat, TimeZone};
 
     chrono::Utc
         .timestamp_opt(timestamp, 0)
         .single()
         .unwrap_or_else(chrono::Utc::now)
         .with_timezone(&chrono::Local)
-        .to_rfc3339()
+        .to_rfc3339_opts(SecondsFormat::Secs, false)
 }
 
 fn now_rfc3339() -> String {
-    chrono::Local::now().to_rfc3339()
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
 
 fn generate_job_id(job_type: JobType, target: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_ok() {
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        return format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+            bytes[4],
+            bytes[5],
+            bytes[6],
+            bytes[7],
+            bytes[8],
+            bytes[9],
+            bytes[10],
+            bytes[11],
+            bytes[12],
+            bytes[13],
+            bytes[14],
+            bytes[15]
+        );
+    }
 
     let mut hasher = DefaultHasher::new();
     match job_type {
@@ -1383,15 +1406,9 @@ fn generate_job_id(job_type: JobType, target: &str) -> String {
         JobType::Mail => "ml".hash(&mut hasher),
     }
     target.hash(&mut hasher);
-    let counter = JOB_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let timestamp_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    counter.hash(&mut hasher);
     std::process::id().hash(&mut hasher);
-    timestamp_nanos.hash(&mut hasher);
-    format!("{counter:016x}-{:016x}", hasher.finish())
+    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default().hash(&mut hasher);
+    format!("narou-rs-{:016x}", hasher.finish())
 }
 
 fn find_narou_root() -> Result<PathBuf> {
@@ -1521,6 +1538,33 @@ mod tests {
         assert_eq!(pending[0].max_retries, 0);
 
         *crate::db::DATABASE.lock() = None;
+    }
+
+    #[test]
+    fn save_omits_yaml_document_start_header_like_inventory_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+
+        queue.push(JobType::Download, "1").unwrap();
+        let saved = std::fs::read_to_string(&queue_path).unwrap();
+
+        assert!(!saved.starts_with("---"), "{saved}");
+        assert!(saved.starts_with("pending:"), "{saved}");
+        assert!(
+            regex::Regex::new(
+                r"(?m)^- id: [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            )
+            .unwrap()
+            .is_match(&saved),
+            "{saved}"
+        );
+        assert!(
+            !regex::Regex::new(r"T\d{2}:\d{2}:\d{2}\.\d")
+                .unwrap()
+                .is_match(&saved),
+            "{saved}"
+        );
     }
 
     #[test]

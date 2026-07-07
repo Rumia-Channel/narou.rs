@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::NovelRecord;
 use crate::downloader::TocObject;
 
+use super::device::Device;
 use super::settings::NovelSettings;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +23,7 @@ pub(crate) fn render_novel_text(
     story: &str,
     sections: &[ConvertedSection],
     record: Option<&NovelRecord>,
+    device: Option<Device>,
 ) -> String {
     let mut output = String::new();
 
@@ -77,6 +79,9 @@ pub(crate) fn render_novel_text(
                 "\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{67F1}\u{FF3D}{}\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{67F1}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n",
                 title
             ));
+            if device == Some(Device::Ibooks) {
+                output.push_str("\n\n\n\n\n\n");
+            }
             output.push_str(&format!(
                 "\u{FF3B}\u{FF03}\u{FF13}\u{5B57}\u{4E0B}\u{3052}\u{FF3D}\u{FF3B}\u{FF03}\u{5927}\u{898B}\u{51FA}\u{3057}\u{FF3D}{}\u{FF3B}\u{FF03}\u{5927}\u{898B}\u{51FA}\u{3057}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n",
                 section.chapter
@@ -402,8 +407,10 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        decorate_title, normalize_story_markup, normalize_subtitle_markup, render_novel_text,
+        ConvertedSection, decorate_title, normalize_story_markup, normalize_subtitle_markup,
+        render_novel_text,
     };
+    use crate::converter::device::Device;
     use crate::db::NovelRecord;
     use crate::{converter::settings::NovelSettings, downloader::TocObject};
 
@@ -451,7 +458,7 @@ mod tests {
             subtitles: Vec::new(),
             novel_type: Some(1),
         };
-        let text = render_novel_text(&settings, &toc, "", &[], Some(&sample_record()));
+        let text = render_novel_text(&settings, &toc, "", &[], Some(&sample_record()), None);
 
         assert!(
             text.starts_with("作品 (2026-05-16) Example\n作者\n"),
@@ -472,6 +479,34 @@ mod tests {
         assert_eq!(
             decorate_title(&settings, "作品《仮》", Some(&record)),
             "2026-05-16 作品※［＃始め二重山括弧］仮※［＃終わり二重山括弧］ (完結)"
+        );
+    }
+
+    #[test]
+    fn render_inserts_ibooks_chapter_spacing_like_ruby_template() {
+        let settings = NovelSettings::default();
+        let toc = TocObject {
+            title: "作品".to_string(),
+            author: "作者".to_string(),
+            toc_url: String::new(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(1),
+        };
+        let section = ConvertedSection {
+            chapter: "第一章".to_string(),
+            subchapter: String::new(),
+            subtitle: "第一話".to_string(),
+            introduction: String::new(),
+            body: "本文".to_string(),
+            postscript: String::new(),
+        };
+
+        let text = render_novel_text(&settings, &toc, "", &[section], None, Some(Device::Ibooks));
+
+        assert!(
+            text.contains("［＃ここで柱終わり］\n\n\n\n\n\n\n［＃３字下げ］"),
+            "{text}"
         );
     }
 

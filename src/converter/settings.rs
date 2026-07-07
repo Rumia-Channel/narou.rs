@@ -18,6 +18,8 @@ pub struct NovelSettings {
     pub enable_inspect: bool,
     pub enable_convert_num_to_kanji: bool,
     pub enable_kanji_num_with_units: bool,
+    #[serde(skip)]
+    pub(crate) enable_kanji_num_with_units_explicit: bool,
     pub kanji_num_with_units_lower_digit_zero: i64,
     pub enable_alphabet_force_zenkaku: bool,
     pub disable_alphabet_word_to_zenkaku: bool,
@@ -73,6 +75,7 @@ impl Default for NovelSettings {
             enable_inspect: false,
             enable_convert_num_to_kanji: true,
             enable_kanji_num_with_units: true,
+            enable_kanji_num_with_units_explicit: false,
             kanji_num_with_units_lower_digit_zero: 3,
             enable_alphabet_force_zenkaku: false,
             disable_alphabet_word_to_zenkaku: false,
@@ -158,7 +161,7 @@ impl NovelSettings {
         settings.title = Some(novel_title.to_string());
         settings.author = Some(novel_author.to_string());
         settings.archive_path = archive_path.to_path_buf();
-        settings.replace_patterns = load_replace_patterns(&replace_path);
+        settings.replace_patterns = load_replace_patterns_with_global(&replace_path, archive_path);
 
         settings = Self::apply_ini_defaults(&settings, &ini);
         settings = Self::apply_ini_novel(&settings, &ini, novel_id);
@@ -202,7 +205,7 @@ impl NovelSettings {
         settings.title = Some(source_name.to_string());
         settings.author = Some(String::new());
         settings.archive_path = archive_path.to_path_buf();
-        settings.replace_patterns = load_replace_patterns(&replace_path);
+        settings.replace_patterns = load_replace_patterns_with_global(&replace_path, archive_path);
 
         settings = Self::apply_ini_defaults(&settings, &ini);
         settings = Self::apply_force_and_default_settings(
@@ -556,6 +559,7 @@ impl NovelSettings {
             "enable_kanji_num_with_units" => {
                 if let Some(b) = to_bool(value) {
                     settings.enable_kanji_num_with_units = b;
+                    settings.enable_kanji_num_with_units_explicit = true;
                 }
             }
             "kanji_num_with_units_lower_digit_zero" => {
@@ -799,6 +803,7 @@ impl NovelSettings {
         }
         if let Some(v) = g("enable_kanji_num_with_units") {
             settings.enable_kanji_num_with_units = v;
+            settings.enable_kanji_num_with_units_explicit = true;
         }
         if let Some(v) = gi("kanji_num_with_units_lower_digit_zero") {
             settings.kanji_num_with_units_lower_digit_zero = v;
@@ -1049,6 +1054,35 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn load_for_novel_appends_global_replace_patterns_after_local_patterns() {
+        let root = std::env::temp_dir().join(format!(
+            "narou-rs-settings-global-replace-{}-{}",
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive_path = root.join("小説データ").join("test-novel");
+        std::fs::create_dir_all(root.join(".narou")).unwrap();
+        std::fs::create_dir_all(&archive_path).unwrap();
+        std::fs::write(root.join("replace.txt"), "GLOBAL\tglobal\n").unwrap();
+        std::fs::write(archive_path.join("replace.txt"), "LOCAL\tlocal\n").unwrap();
+
+        let settings = NovelSettings::load_for_novel(1, "title", "author", &archive_path);
+
+        assert_eq!(
+            settings.replace_patterns,
+            vec![
+                ("LOCAL".to_string(), "local".to_string()),
+                ("GLOBAL".to_string(), "global".to_string()),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 pub fn load_replace_patterns(path: &Path) -> Vec<(String, String)> {
@@ -1071,4 +1105,35 @@ pub fn load_replace_patterns(path: &Path) -> Vec<(String, String)> {
         }
     }
     patterns
+}
+
+fn load_replace_patterns_with_global(
+    local_path: &Path,
+    archive_path: &Path,
+) -> Vec<(String, String)> {
+    let mut patterns = load_replace_patterns(local_path);
+    let Some(root) = find_narou_root_from(archive_path) else {
+        return patterns;
+    };
+    let global_path = root.join("replace.txt");
+    if global_path != local_path {
+        patterns.extend(load_replace_patterns(&global_path));
+    }
+    patterns
+}
+
+fn find_narou_root_from(start: &Path) -> Option<PathBuf> {
+    let mut current = if start.is_file() {
+        start.parent()?.to_path_buf()
+    } else {
+        start.to_path_buf()
+    };
+    loop {
+        if current.join(".narou").is_dir() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
 }

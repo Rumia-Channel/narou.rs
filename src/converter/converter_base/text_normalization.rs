@@ -1,6 +1,7 @@
 use regex::Regex;
 
-use super::ConverterBase;
+use super::{ConverterBase, TextType};
+use crate::converter::device::Device;
 
 impl ConverterBase {
     pub(super) fn rstrip_all_lines(&self, text: &str) -> String {
@@ -170,6 +171,195 @@ impl ConverterBase {
         }
         result
     }
+
+    pub(super) fn convert_arrow(&self, text: &str) -> String {
+        if self.target_device != Some(Device::Mobi) {
+            return text.to_string();
+        }
+        text.replace('⇒', "→").replace('⇐', "←")
+    }
+
+    pub(super) fn insert_separator_for_selection(&self, text: &str) -> String {
+        if !matches!(self.text_type, TextType::Body | TextType::TextFile) {
+            return text.to_string();
+        }
+        if self.target_device != Some(Device::Mobi) {
+            return text.to_string();
+        }
+        if self.settings.enable_insert_word_separator {
+            insert_word_separator(text, self.text_type == TextType::TextFile)
+        } else if self.settings.enable_insert_char_separator {
+            insert_char_separator(text)
+        } else {
+            text.to_string()
+        }
+    }
+}
+
+const WORD_SEPARATOR: &str = "［＃zws］";
+
+fn insert_word_separator(text: &str, skip_textfile_header: bool) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::new();
+    let mut index = 0;
+    let mut before_symbol = false;
+
+    if skip_textfile_header {
+        let mut newlines = 0;
+        while index < chars.len() && newlines < 2 {
+            let ch = chars[index];
+            output.push(ch);
+            index += 1;
+            if ch == '\n' {
+                newlines += 1;
+            }
+        }
+    }
+
+    while index < chars.len() {
+        if let Some((token, next)) = take_annotation_or_tag(&chars, index) {
+            append_word_token(&mut output, &mut before_symbol, &token);
+            index = next;
+            continue;
+        }
+
+        let ch = chars[index];
+        if is_opening_no_separator(ch) {
+            output.push(ch);
+            before_symbol = false;
+            index += 1;
+            continue;
+        }
+
+        if let Some((token, next)) = take_word_group(&chars, index) {
+            append_word_token(&mut output, &mut before_symbol, &token);
+            index = next;
+            continue;
+        }
+
+        output.push(ch);
+        before_symbol = true;
+        index += 1;
+    }
+
+    output
+}
+
+fn append_word_token(output: &mut String, before_symbol: &mut bool, token: &str) {
+    if *before_symbol {
+        output.push_str(WORD_SEPARATOR);
+    }
+    output.push_str(token);
+    output.push_str(WORD_SEPARATOR);
+    *before_symbol = false;
+}
+
+fn insert_char_separator(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::new();
+    let mut index = 0;
+    let mut before_symbol = false;
+
+    while index < chars.len() {
+        if let Some((token, next)) = take_annotation_or_tag(&chars, index) {
+            output.push_str(&token);
+            before_symbol = false;
+            index = next;
+            continue;
+        }
+
+        let ch = chars[index];
+        if is_opening_no_separator(ch) {
+            output.push(ch);
+            before_symbol = false;
+        } else if is_separator_symbol(ch) {
+            output.push(ch);
+            before_symbol = true;
+        } else {
+            if before_symbol {
+                output.push_str(WORD_SEPARATOR);
+            }
+            output.push(ch);
+            output.push_str(WORD_SEPARATOR);
+            before_symbol = false;
+        }
+        index += 1;
+    }
+
+    output
+}
+
+fn take_annotation_or_tag(chars: &[char], index: usize) -> Option<(String, usize)> {
+    match chars.get(index).copied()? {
+        '｜' => take_until(chars, index, '》'),
+        '［' if chars.get(index + 1) == Some(&'＃') => take_until(chars, index, '］'),
+        '<' => take_until(chars, index, '>'),
+        _ => None,
+    }
+}
+
+fn take_until(chars: &[char], index: usize, close: char) -> Option<(String, usize)> {
+    let mut token = String::new();
+    let mut cursor = index;
+    while let Some(&ch) = chars.get(cursor) {
+        token.push(ch);
+        cursor += 1;
+        if ch == close {
+            return Some((token, cursor));
+        }
+    }
+    None
+}
+
+fn take_word_group(chars: &[char], index: usize) -> Option<(String, usize)> {
+    let ch = *chars.get(index)?;
+    let kind = word_kind(ch)?;
+    let mut token = String::new();
+    let mut cursor = index;
+    while let Some(&current) = chars.get(cursor) {
+        if word_kind(current) == Some(kind) || is_word_connector(current, kind) {
+            token.push(current);
+            cursor += 1;
+        } else {
+            break;
+        }
+    }
+    Some((token, cursor))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WordKind {
+    Hiragana,
+    Katakana,
+    Alphabet,
+    Kanji,
+}
+
+fn word_kind(ch: char) -> Option<WordKind> {
+    match ch {
+        'ぁ'..='ん' | 'ゝ' | 'ゞ' => Some(WordKind::Hiragana),
+        'ァ'..='ヶ' => Some(WordKind::Katakana),
+        'Ａ'..='Ｚ' | 'ａ'..='ｚ' | 'A'..='Z' | 'a'..='z' => Some(WordKind::Alphabet),
+        '一'..='龥' | '朗'..='鶴' => Some(WordKind::Kanji),
+        _ => None,
+    }
+}
+
+fn is_word_connector(ch: char, kind: WordKind) -> bool {
+    match kind {
+        WordKind::Hiragana => ch == 'ー',
+        WordKind::Katakana => ch == 'ー' || ch == '・',
+        WordKind::Alphabet => ch == ' ',
+        WordKind::Kanji => false,
+    }
+}
+
+fn is_opening_no_separator(ch: char) -> bool {
+    matches!(ch, '〔' | '「' | '『' | '(' | '（' | '【' | '〈' | '《' | '≪' | '〝')
+}
+
+fn is_separator_symbol(ch: char) -> bool {
+    matches!(ch, '―' | '…' | '!' | '?' | '！' | '？' | '※')
 }
 
 fn join_inner_bracket(text: &str) -> Option<String> {
