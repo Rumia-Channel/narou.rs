@@ -759,6 +759,8 @@ pub enum Commands {
         tag: Option<Option<String>>,
         #[arg(short = 'e', long)]
         echo: bool,
+        #[arg(long = "sort-by", value_name = "KEY")]
+        sort_by: Option<String>,
         #[arg(long, hide = true)]
         frozen: bool,
     },

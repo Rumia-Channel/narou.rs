@@ -413,6 +413,7 @@ const LIST_HELP: CmdHelp = CmdHelp {
     narou list 5 -l        # 最近更新のあった5件表示
     narou list 10 -rl      # 古い順に10件表示
     narou list -f ss       # 短編小説だけ表示
+    narou list --sort-by length         # 文字数でソート
 
     # 小説家になろうの小説のみを表示
     narou list --site --grep 小説家になろう
@@ -449,6 +450,12 @@ const LIST_HELP: CmdHelp = CmdHelp {
         ),
         opt(Some("-t"), "--tag", Some("[TAGS]"), "タグ表示/フィルタ"),
         opt(Some("-e"), "--echo", None, "パイプ時も人間可読出力"),
+        opt(
+            None,
+            "--sort-by",
+            Some("KEY"),
+            "ソートキーを指定する(id/title/author/last_update/general_lastup/sitename/novel_type/length/last_check_date/tags/general_all_no/status/toc_url/new_arrivals_date)",
+        ),
     ],
 };
 

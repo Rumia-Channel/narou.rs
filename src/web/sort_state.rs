@@ -2,38 +2,33 @@ use std::cmp::Ordering;
 
 use serde_yaml::{Mapping, Value};
 
-use crate::db::{NovelRecord, inventory::{Inventory, InventoryScope}, with_database};
+use crate::db::{
+    NovelRecord, compare_records_by_key, inventory::{Inventory, InventoryScope}, sort_keys,
+    with_database,
+};
 
-pub const SORT_COLUMN_KEYS: &[&str] = &[
-    "id",
-    "last_update",
-    "general_lastup",
-    "last_check_date",
-    "title",
-    "author",
-    "sitename",
-    "novel_type",
-    "tags",
-    "general_all_no",
-    "length",
-    "status",
-    "toc_url",
-];
+/// Web UI / CLI 共通のソートキー一覧。`db::SORT_KEYS` を再エクスポートして
+/// 単一の真実源から派生させる。新規キーを追加するときは `db::SORT_KEYS` 側を
+/// 編集するだけで `SORT_COLUMN_LABELS` の並びも合わせて調整すること。
+pub use crate::db::SORT_KEYS as SORT_COLUMN_KEYS;
 
+/// Web UI の表示ラベル。`SORT_COLUMN_KEYS` (≒ `db::sort_keys()`) と長さを揃え、
+/// 同じインデックスで日本語ラベルを参照できるようにする。
 pub const SORT_COLUMN_LABELS: &[&str] = &[
-    "ID",
-    "最終更新日",
-    "最新話掲載日",
-    "最終確認日",
-    "タイトル",
-    "作者",
-    "サイト名",
-    "小説種別",
-    "タグ",
-    "話数",
-    "文字数",
-    "状態",
-    "URL",
+    "ID",             // 0  id
+    "最終更新日",     // 1  last_update
+    "最新話掲載日",   // 2  general_lastup
+    "最終確認日",     // 3  last_check_date
+    "タイトル",       // 4  title
+    "作者",           // 5  author
+    "サイト名",       // 6  sitename
+    "小説種別",       // 7  novel_type
+    "タグ",           // 8  tags
+    "話数",           // 9  general_all_no
+    "文字数",         // 10 length
+    "状態",           // 11 status
+    "URL",            // 12 toc_url
+    "新着日",         // 13 new_arrivals_date
 ];
 
 pub(crate) const DEFAULT_CURRENT_SORT_COLUMN: usize = 2;
@@ -119,7 +114,7 @@ pub(crate) fn requested_or_current_sort_state(
 }
 
 pub(crate) fn sort_column_key(sort_state: &CurrentSortState) -> Option<&'static str> {
-    SORT_COLUMN_KEYS.get(sort_state.column).copied()
+    sort_keys().get(sort_state.column).copied()
 }
 
 pub(crate) fn sort_column_label(sort_state: &CurrentSortState) -> Option<&'static str> {
@@ -127,48 +122,36 @@ pub(crate) fn sort_column_label(sort_state: &CurrentSortState) -> Option<&'stati
 }
 
 pub fn normalize_sort_key(key: &str) -> Option<&'static str> {
-    SORT_COLUMN_KEYS.iter().copied().find(|candidate| *candidate == key)
+    sort_keys().iter().copied().find(|candidate| *candidate == key)
 }
 
 pub fn sort_column_label_for_key(key: &str) -> Option<&'static str> {
-    let index = SORT_COLUMN_KEYS.iter().position(|candidate| *candidate == key)?;
+    let index = sort_keys().iter().position(|candidate| *candidate == key)?;
     SORT_COLUMN_LABELS.get(index).copied()
 }
 
+/// `db::compare_records_by_key` の薄いラッパ。CLI / Web 双方から共有される
+/// 「ソートキー 1 個分の比較」であり、BUG-9 で導入された型付き + None 安定順の
+/// セマンティクス (`compare_optional` を経由) をそのまま使う。
+///
+/// 未知のキーは `db::compare_records_by_key` と同じく id 比較へフォールバックする。
 pub fn sort_record_ordering(a: &NovelRecord, b: &NovelRecord, sort_key: &str) -> Ordering {
-    match sort_key {
-        "id" => a.id.cmp(&b.id),
-        "title" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-        "author" => a.author.to_lowercase().cmp(&b.author.to_lowercase()),
-        "last_update" => a.last_update.cmp(&b.last_update),
-        "general_lastup" => a
-            .general_lastup
-            .unwrap_or_default()
-            .cmp(&b.general_lastup.unwrap_or_default()),
-        "last_check_date" => a
-            .last_check_date
-            .unwrap_or_default()
-            .cmp(&b.last_check_date.unwrap_or_default()),
-        "sitename" => a.sitename.cmp(&b.sitename),
-        "novel_type" => a.novel_type.cmp(&b.novel_type),
-        "tags" => record_tags_key(a).cmp(&record_tags_key(b)),
-        "general_all_no" => a
-            .general_all_no
-            .unwrap_or(0)
-            .cmp(&b.general_all_no.unwrap_or(0)),
-        "length" => a.length.unwrap_or(0).cmp(&b.length.unwrap_or(0)),
-        "status" => record_status_key(a).cmp(&record_status_key(b)),
-        "toc_url" => a.toc_url.cmp(&b.toc_url),
-        _ => a.id.cmp(&b.id),
-    }
+    compare_records_by_key(a, b, sort_key)
 }
 
 pub(crate) fn sort_records(records: &mut Vec<&NovelRecord>, sort_state: &CurrentSortState) {
     let sort_key = sort_column_key(sort_state).unwrap_or("id");
     let reverse = sort_state.dir == "desc";
     records.sort_by(|a, b| {
-        let ordering = sort_record_ordering(a, b, sort_key);
-        if reverse { ordering.reverse() } else { ordering }
+        // 安定ソート: 主キーが Equal の場合は id で順序を決める。これにより
+        // 同じ general_lastup / length / タグなどを共有するレコード間の順序が
+        // db::sort_by と一致する。
+        let ordering = sort_record_ordering(a, b, sort_key).then_with(|| a.id.cmp(&b.id));
+        if reverse {
+            ordering.reverse()
+        } else {
+            ordering
+        }
     });
 }
 
@@ -210,7 +193,7 @@ fn normalize_sort_column(value: &Value) -> Option<usize> {
         }
         _ => return None,
     };
-    SORT_COLUMN_KEYS.get(column).map(|_| column)
+    sort_keys().get(column).map(|_| column)
 }
 
 fn normalize_sort_dir(value: &Value) -> Option<String> {
@@ -225,37 +208,16 @@ fn normalize_sort_dir(value: &Value) -> Option<String> {
     }
 }
 
-fn record_tags_key(record: &NovelRecord) -> String {
-    record
-        .tags
-        .iter()
-        .map(|tag| tag.to_lowercase())
-        .collect::<Vec<_>>()
-        .join("\u{0}")
-}
-
-fn record_status_key(record: &NovelRecord) -> String {
-    let mut status = Vec::new();
-    if record.tags.iter().any(|tag| tag == "end") || record.end {
-        status.push("完結");
-    }
-    if record.tags.iter().any(|tag| tag == "404") {
-        status.push("削除");
-    }
-    if record.suspend {
-        status.push("中断");
-    }
-    status.join(", ").to_lowercase()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_CURRENT_SORT_COLUMN, DEFAULT_CURRENT_SORT_DIR, CurrentSortState,
         current_sort_from_server_setting, default_current_sort_state, normalize_current_sort_request,
-        request_preserves_input_order, request_sort_state, sort_record_ordering, sort_records,
+        normalize_sort_key, request_preserves_input_order, request_sort_state, sort_column_key,
+        sort_column_label, sort_column_label_for_key, sort_record_ordering, sort_records,
     };
     use crate::db::NovelRecord;
+    use crate::web::sort_state::SORT_COLUMN_KEYS;
     use chrono::{TimeZone, Utc};
     use std::cmp::Ordering;
 
@@ -352,7 +314,7 @@ mod tests {
         let second = sample_record(2, 1_700_000_300);
         let third = sample_record(3, 1_700_000_200);
         let sort_state = CurrentSortState {
-            column: 3,
+            column: 3, // last_check_date
             dir: "desc".to_string(),
         };
         let mut records = vec![&first, &second, &third];
@@ -371,6 +333,9 @@ mod tests {
 
         assert_eq!(default_sort.column, DEFAULT_CURRENT_SORT_COLUMN);
         assert_eq!(default_sort.dir, DEFAULT_CURRENT_SORT_DIR);
+        // デフォルト (general_lastup desc) がインデックス 4 を指していること。
+        assert_eq!(sort_column_key(&default_sort), Some("general_lastup"));
+        assert_eq!(sort_column_label(&default_sort), Some("最新話掲載日"));
     }
 
     #[test]
@@ -386,5 +351,72 @@ mod tests {
         assert_eq!(sort_record_ordering(&first, &second, "tags"), Ordering::Greater);
         assert_eq!(sort_record_ordering(&first, &second, "status"), Ordering::Less);
         assert_eq!(sort_record_ordering(&first, &second, "toc_url"), Ordering::Greater);
+    }
+
+    #[test]
+    fn sort_column_keys_come_from_db_layer() {
+        // SORT_COLUMN_KEYS は db::sort_keys() と同じ slice を参照する。
+        assert_eq!(SORT_COLUMN_KEYS, crate::db::sort_keys());
+        // `normalize_sort_key` も db::sort_keys() と同じ受理集合を持つ。
+        for key in crate::db::sort_keys() {
+            assert_eq!(normalize_sort_key(key), Some(*key));
+        }
+        assert_eq!(normalize_sort_key("not_a_key"), None);
+    }
+
+    #[test]
+    fn sort_column_label_for_key_tracks_db_sort_keys() {
+        // 既知キーはラベルが返る。
+        assert_eq!(sort_column_label_for_key("id"), Some("ID"));
+        assert_eq!(
+            sort_column_label_for_key("new_arrivals_date"),
+            Some("新着日")
+        );
+        // 未知キーは None。
+        assert_eq!(sort_column_label_for_key("not_a_key"), None);
+    }
+
+    #[test]
+    fn sort_records_breaks_ties_with_id_for_typed_keys() {
+        // general_all_no / length / tags などで値が完全に一致しても、id で安定
+        // 順序が決まることを保証する (BUG-9 で導入された安定フォールバック)。
+        let mut first = sample_record(1, 1_700_000_100);
+        first.general_all_no = Some(5);
+        first.length = Some(5);
+        first.tags.clear();
+        let mut second = sample_record(2, 1_700_000_200);
+        second.general_all_no = Some(5);
+        second.length = Some(5);
+        second.tags.clear();
+
+        // column=9 は general_all_no (compare_optional 経由) だが、両方 Some(5) で
+        // Equal になるため、id 安定順序 [1, 2] を期待する。
+        let sort_state = CurrentSortState {
+            column: 9, // general_all_no
+            dir: "asc".to_string(),
+        };
+        let mut records = vec![&second, &first];
+        sort_records(&mut records, &sort_state);
+        assert_eq!(
+            records.into_iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn sort_records_uses_compare_optional_for_missing_general_lastup() {
+        // 全レコードが general_lastup=None でも id で安定順序になる。
+        let first = sample_record(1, 1_700_000_100);
+        let second = sample_record(2, 1_700_000_200);
+        let sort_state = CurrentSortState {
+            column: 2, // general_lastup
+            dir: "asc".to_string(),
+        };
+        let mut records = vec![&second, &first];
+        sort_records(&mut records, &sort_state);
+        assert_eq!(
+            records.into_iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 }

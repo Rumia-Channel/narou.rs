@@ -29,6 +29,8 @@ pub struct ListOptions {
     pub grep: Option<String>,
     pub tag: Option<Option<String>>,
     pub echo: bool,
+    /// CLI `--sort-by` で指定されたキー。`db::sort_keys()` で検証する。
+    pub sort_by: Option<String>,
     pub frozen: bool,
 }
 
@@ -170,8 +172,21 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
     let stdout_is_tty = std::io::stdout().is_terminal();
     let frozen_ids = load_inventory_ids("freeze");
 
+    // `--sort-by` の検証。無効キーは update.rb と同じく
+    // "正しいキーではありません。次の中から選択して下さい" を出して 127 で終了。
+    let sort_key: Option<&'static str> = match resolve_list_sort_key(options.sort_by.as_deref()) {
+        Ok(key) => key,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 127;
+        }
+    };
+
     let records = match db::with_database(|db| {
-        let mut values = if options.latest {
+        let mut values = if let Some(key) = sort_key {
+            // 明示的な --sort-by が指定された場合: db::sort_by の型付き比較を使う。
+            db.sort_by(key, false).into_iter().cloned().collect::<Vec<_>>()
+        } else if options.latest {
             db.sort_by(options.view_date_type(), false)
                 .into_iter()
                 .cloned()
@@ -435,6 +450,29 @@ fn split_words(value: Option<&str>) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+/// `narou list --sort-by` のキー文字列を検証し、内部表現に変換する。
+/// `None` のときはソートキー未指定 (現状の `view_date_type` / `latest` ロジック) を表す。
+/// 無効キーの場合は update.rb 互換のエラーメッセージを返す。
+fn resolve_list_sort_key(raw: Option<&str>) -> Result<Option<&'static str>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match narou_rs::db::sort_keys().iter().find(|k| **k == raw) {
+        Some(key) => Ok(Some(*key)),
+        None => {
+            let summaries = narou_rs::db::sort_keys()
+                .iter()
+                .map(|k| format!("  {:>20}", k))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(format!(
+                "{} は正しいキーではありません。次の中から選択して下さい\n{}",
+                raw, summaries
+            ))
+        }
+    }
 }
 
 fn valid_tags(record: &NovelRecord, tags: &[String]) -> bool {
@@ -1071,8 +1109,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        TagColors, TagOptions, build_tag_mode, matches_filters, matches_grep,
-        remove_novel_files,
+        ListOptions, TagColors, TagOptions, build_tag_mode, matches_filters, matches_grep,
+        remove_novel_files, resolve_list_sort_key,
     };
     use narou_rs::db::novel_record::NovelRecord;
     use narou_rs::tag_colors;
@@ -1195,5 +1233,35 @@ mod tests {
             convert_failure: false,
             extra_fields: Default::default(),
         }
+    }
+
+    #[test]
+    fn resolve_list_sort_key_accepts_db_supported_keys() {
+        // `narou_rs::db::sort_keys()` の各値をそのまま受理する。
+        for key in narou_rs::db::sort_keys() {
+            let result = resolve_list_sort_key(Some(*key)).unwrap();
+            assert_eq!(result, Some(*key), "resolve_list_sort_key({key})");
+        }
+    }
+
+    #[test]
+    fn resolve_list_sort_key_returns_none_for_unspecified() {
+        assert_eq!(resolve_list_sort_key(None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_list_sort_key_rejects_unknown_key() {
+        let err = resolve_list_sort_key(Some("not_a_key")).unwrap_err();
+        assert!(err.contains("not_a_key は正しいキーではありません"));
+        // 候補一覧も一緒に表示する (update.rb 互換の挙動)。
+        for key in narou_rs::db::sort_keys() {
+            assert!(err.contains(key), "expected error to list {key}: {err}");
+        }
+    }
+
+    #[test]
+    fn list_options_default_has_sort_by_unset() {
+        let opts = ListOptions::default();
+        assert!(opts.sort_by.is_none());
     }
 }

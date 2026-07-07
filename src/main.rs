@@ -434,6 +434,7 @@ fn run_sync_command(
             grep,
             tag,
             echo,
+            sort_by,
             frozen,
         } => commands::manage::cmd_list(commands::manage::ListOptions {
             limit,
@@ -448,6 +449,7 @@ fn run_sync_command(
             grep,
             tag,
             echo,
+            sort_by,
             frozen,
         }),
         Commands::Tag {
