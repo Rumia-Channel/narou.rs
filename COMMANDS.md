@@ -354,6 +354,8 @@ narou setting name         # 読み取り
 | `user-agent` | string | カスタム User-Agent |
 | `webui.theme` | select | WebUI テーマ |
 | `webui.new-tag-color` | select | 新規タグの既定色。`default`/未設定時は自動色ローテーション |
+| `queue.max-retries` | integer | 失敗 job を `available_at` 付きで自動再投入する最大回数。`0` でリトライ無効。既定 `3` |
+| `queue.retry-backoff` | string | リトライ時の待機秒数をカンマ区切りで指定（`s`/`m`/`h` 単位可、例: `1m,5m,15m`）。要素数を超えて失敗したときは最後の値を再利用。既定 `1m,5m,15m` |
 
 **主要 global_setting 項目**:
 
@@ -553,6 +555,8 @@ narou setting name         # 読み取り
 - hidden global `server-max-targets-per-request` は WEB UI が 1 リクエストで送れる小説 ID の最大数。既定値 `100000`、未設定または 0 以下は既定にフォールバック（Web UI には表示しない）。蔵書数が極端に多い環境で `narou setting --global server-max-targets-per-request=200000` のように上書きできる
 - API の凍結/解凍操作と一覧上の `frozen` 判定は CLI と同じ `.narou/freeze.yaml` を優先し、`frozen` タグは補助的に扱う
 - queue worker が `.narou/queue.yaml` 永続キューを読み書きし、download / update / auto_update / convert / send / backup / mail の queued job を別プロセスまたは worker 内処理で実行する。Ruby版同様 `pending` / `running` を分けて保持し、legacy `cmd` / `args` / `meta` / `status` / `created_at` / `started_at` を維持したまま復元できる。`concurrency` 有効時は外部通信あり(download/update/auto_update)とその他(convert/send/backup/mail)を別 lane で並列実行し、無効時は全 job を投入順に逐次実行する
+- 一時的なネットワーク失敗で夜間更新全体が止まらないよう、queue worker は失敗した job を `JobOutcome::Failed` 時に判定し、`retry_count < max_retries` かつ恒久失敗 (detail に "not found" / "invalid argument" / "no such file" / "permanent failure" / "永久失敗" / "恒久失敗" を含む) でなければ `available_at` 付きで `active_pending` へ自動再投入する。`available_at` 経過後の job だけが `pop` 系で取り出されるためスリープを挟まない。Web UI には `queue_retry` イベントを、追加試行なしで `failed` へ落ちた場合は従来どおり `queue_failed` イベントを通知する
+- リトライ挙動は `narou setting` の `queue.max-retries`（既定 3、`0` で無効）と `queue.retry-backoff`（既定 `1m,5m,15m`、カンマ区切り、`s`/`m`/`h` 単位可、要素数を超えて失敗したときは最後の値を再利用）で調整できる。`QueueJob` の `available_at` フィールドは `#[serde(default, skip_serializing_if = "Option::is_none")]` 付きで読み書きされ、リトライ機能導入前の旧 `queue.yaml` もそのまま再ロード可能
 - idle 中の queue worker は同一プロセス内の queue 更新通知で起床し、外部プロセスが `queue.yaml` を更新した場合だけ低頻度フォールバックで検出する。空キュー時に `.narou/queue.yaml` を 500ms ごとに読み続けない
 - Web 経由の convert job は `--no-open` で非対話化し、API 指定 device は worker 専用 override で child process に渡す
 - `queue_clear` は deadlock しないように永続キュー保存順を修正済み

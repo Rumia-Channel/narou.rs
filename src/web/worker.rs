@@ -23,6 +23,32 @@ use crate::queue::{
 const MAX_FAILURE_DETAIL_LINES: usize = 8;
 const MAX_FAILURE_DETAIL_CHARS: usize = 600;
 const IDLE_EXTERNAL_QUEUE_POLL_SECS: u64 = 30;
+/// Default exponential backoff schedule (seconds) for failed jobs.
+const DEFAULT_RETRY_BACKOFF_SECS: &[i64] = &[60, 300, 900];
+/// Detail substrings that mark a job outcome as a *permanent* failure which
+/// must not be retried even when retries remain. Matching is case-insensitive.
+const PERMANENT_FAILURE_KEYWORDS: &[&str] = &[
+    "not found",
+    "invalid argument",
+    "invalidargument",
+    "no such file",
+    "permanent failure",
+    "永久失敗",
+    "恒久失敗",
+];
+
+/// Outcome of a failed-job transition: when `scheduled` is `true`, the worker
+/// has already pushed the job back to the active pending queue with an
+/// `available_at`; the broadcast step will emit `queue_retry`. Otherwise the
+/// job has been moved to the failed history and `queue_failed` is broadcast.
+#[derive(Debug, Clone, Default)]
+struct RetrySchedule {
+    scheduled: bool,
+    retry_count: u32,
+    max_retries: u32,
+    backoff_secs: i64,
+    available_at: i64,
+}
 
 #[derive(Debug, Clone, Default)]
 struct JobRunResult {
@@ -134,17 +160,99 @@ fn start_queue_worker_for_lane(
                 push_server.broadcast_error(&format!("DB更新エラー: {}", e));
             }
 
-            let queue_result = {
+            let (queue_result, retry_scheduled) = {
                 let _guard = job_transition_lock.lock();
+                let mut retry_scheduled = RetrySchedule::default();
                 let result = match result.outcome {
                     JobOutcome::Completed => queue.complete(&job.id),
                     JobOutcome::Partial => queue.partial(&job.id),
                     JobOutcome::Cancelled => queue.cancel(&job.id),
-                    JobOutcome::Failed => queue.fail(&job.id),
+                    JobOutcome::Failed => {
+                        if should_retry_job(&result, &job) {
+                            let schedule = load_retry_backoff_schedule();
+                            let backoff_secs =
+                                compute_retry_backoff_secs(job.retry_count, &schedule);
+                            let available_at = Some(chrono::Utc::now().timestamp() + backoff_secs);
+                            match queue.requeue(&job.id, available_at) {
+                                Ok(true) => {
+                                    retry_scheduled = RetrySchedule {
+                                        scheduled: true,
+                                        retry_count: job.retry_count + 1,
+                                        max_retries: job.max_retries,
+                                        backoff_secs,
+                                        available_at: available_at.unwrap_or(0),
+                                    };
+                                    Ok(())
+                                }
+                                Ok(false) => {
+                                    // Lost the running slot to a concurrent worker; treat as
+                                    // a permanent failure for this attempt.
+                                    queue.fail(&job.id)
+                                }
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            queue.fail(&job.id)
+                        }
+                    }
                 };
                 unregister_running_job(&running_jobs, &job.id);
-                result
+                (result, retry_scheduled)
             };
+            match result.outcome {
+                JobOutcome::Completed => {
+                    let _ = queue_result;
+                    push_server.broadcast_event("queue_complete", &job.id);
+                }
+                JobOutcome::Partial => {
+                    let _ = queue_result;
+                    let mut data = serde_json::json!({ "job_id": job.id });
+                    if let Some(exit_code) = result.exit_code {
+                        data["exit_code"] = serde_json::json!(exit_code);
+                    }
+                    push_server.broadcast_raw(&serde_json::json!({
+                        "type": "queue_partial",
+                        "data": data,
+                    }));
+                }
+                JobOutcome::Cancelled => {
+                    let _ = queue_result;
+                    push_server.broadcast_raw(&serde_json::json!({
+                        "type": "queue_cancelled",
+                        "data": { "job_id": job.id },
+                    }));
+                }
+                JobOutcome::Failed => {
+                    let _ = queue_result;
+                    if retry_scheduled.scheduled {
+                        push_server.broadcast_raw(&serde_json::json!({
+                            "type": "queue_retry",
+                            "data": {
+                                "job_id": job.id,
+                                "retry_count": retry_scheduled.retry_count,
+                                "max_retries": retry_scheduled.max_retries,
+                                "backoff_secs": retry_scheduled.backoff_secs,
+                                "available_at": retry_scheduled.available_at,
+                                "reason": failure_reason(&result),
+                            },
+                        }));
+                    } else {
+                        let mut data = serde_json::json!({
+                            "job_id": job.id,
+                            "reason": failure_reason(&result),
+                        });
+                        if load_local_setting_bool("webui.debug-mode")
+                            && let Some(detail) = result.detail.as_deref()
+                        {
+                            data["detail"] = serde_json::Value::String(detail.to_string());
+                        }
+                        push_server.broadcast_raw(&serde_json::json!({
+                            "type": "queue_failed",
+                            "data": data,
+                        }));
+                    }
+                }
+            }
             match result.outcome {
                 JobOutcome::Completed => {
                     let _ = queue_result;
@@ -958,6 +1066,74 @@ fn failure_reason(result: &JobRunResult) -> String {
     }
 }
 
+fn should_retry_job(result: &JobRunResult, job: &QueueJob) -> bool {
+    is_transient_failure(result) && job.retry_count < job.max_retries
+}
+
+fn is_transient_failure(result: &JobRunResult) -> bool {
+    if let Some(detail) = result.detail.as_deref() {
+        let lower = detail.to_lowercase();
+        for keyword in PERMANENT_FAILURE_KEYWORDS {
+            if lower.contains(keyword) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn compute_retry_backoff_secs(retry_count: u32, schedule: &[i64]) -> i64 {
+    if schedule.is_empty() {
+        return DEFAULT_RETRY_BACKOFF_SECS[0];
+    }
+    let idx = (retry_count as usize).min(schedule.len() - 1);
+    schedule[idx]
+}
+
+fn load_retry_backoff_schedule() -> Vec<i64> {
+    match crate::compat::load_local_setting_string("queue.retry-backoff") {
+        Some(spec) => {
+            let parsed = parse_backoff_spec(&spec);
+            if parsed.is_empty() {
+                DEFAULT_RETRY_BACKOFF_SECS.to_vec()
+            } else {
+                parsed
+            }
+        }
+        None => DEFAULT_RETRY_BACKOFF_SECS.to_vec(),
+    }
+}
+
+fn parse_backoff_spec(spec: &str) -> Vec<i64> {
+    spec.split(',')
+        .map(str::trim)
+        .filter_map(parse_backoff_value)
+        .collect()
+}
+
+fn parse_backoff_value(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (num_str, multiplier): (&str, i64) =
+        if let Some(rest) = raw.strip_suffix(['s', 'S']) {
+            (rest, 1)
+        } else if let Some(rest) = raw.strip_suffix(['m', 'M']) {
+            (rest, 60)
+        } else if let Some(rest) = raw.strip_suffix(['h', 'H']) {
+            (rest, 3600)
+        } else {
+            (raw, 1)
+        };
+    let num_str = num_str.trim();
+    let parsed = num_str.parse::<i64>().ok()?;
+    if parsed < 0 {
+        return None;
+    }
+    Some(parsed * multiplier)
+}
+
 fn console_target_for_job(job_type: JobType) -> &'static str {
     match job_type {
         JobType::Download | JobType::Update | JobType::AutoUpdate => "stdout",
@@ -1015,11 +1191,13 @@ mod tests {
     use std::os::windows::process::ExitStatusExt;
 
     use super::{
-        MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, JobOutcome, classify_job_outcome,
-        clear_progress_for_job, console_target_for_job, convert_targets_and_device,
-        execution_spec_meta_bool, execution_spec_meta_string, execution_spec_meta_strings,
-        failure_reason, job_conflicts_with_running, parse_convert_job_target,
-        remember_failure_line, route_structured_web_message, summarize_failure_details,
+        MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, JobOutcome, JobRunResult,
+        classify_job_outcome, clear_progress_for_job, compute_retry_backoff_secs,
+        console_target_for_job, convert_targets_and_device, execution_spec_meta_bool,
+        execution_spec_meta_string, execution_spec_meta_strings, failure_reason,
+        is_transient_failure, job_conflicts_with_running, parse_backoff_spec,
+        parse_backoff_value, parse_convert_job_target, remember_failure_line,
+        route_structured_web_message, should_retry_job, summarize_failure_details,
         update_by_tag_update_args,
     };
     use crate::queue::{JobType, QueueJob};
@@ -1114,6 +1292,7 @@ mod tests {
             created_at: 0,
             retry_count: 0,
             max_retries: 3,
+            available_at: None,
         };
         let same_novel_convert = QueueJob {
             id: "convert".to_string(),
@@ -1122,6 +1301,7 @@ mod tests {
             created_at: 0,
             retry_count: 0,
             max_retries: 3,
+            available_at: None,
         };
         let other_novel_convert = QueueJob {
             target: "13".to_string(),
@@ -1134,6 +1314,7 @@ mod tests {
             created_at: 0,
             retry_count: 0,
             max_retries: 3,
+            available_at: None,
         };
 
         assert!(job_conflicts_with_running(
@@ -1226,6 +1407,98 @@ mod tests {
             }),
             "終了コード 9"
         );
+    }
+
+    fn make_failed_result(detail: Option<&str>, exit_code: Option<i32>) -> JobRunResult {
+        JobRunResult {
+            outcome: JobOutcome::Failed,
+            detail: detail.map(|value| value.to_string()),
+            exit_code,
+        }
+    }
+
+    #[test]
+    fn is_transient_failure_treats_missing_detail_as_transient() {
+        assert!(is_transient_failure(&make_failed_result(None, Some(128))));
+        assert!(is_transient_failure(&make_failed_result(Some(""), Some(2))));
+    }
+
+    #[test]
+    fn is_transient_failure_flags_permanent_keywords() {
+        assert!(!is_transient_failure(&make_failed_result(
+            Some("HTTP 404 Not Found"),
+            None
+        )));
+        assert!(!is_transient_failure(&make_failed_result(
+            Some("error: Invalid argument"),
+            None
+        )));
+        assert!(!is_transient_failure(&make_failed_result(
+            Some("恒久失敗: 認証情報が不正です"),
+            None
+        )));
+        // Permanent keywords only match if they appear in the detail; a generic
+        // network error must stay transient.
+        assert!(is_transient_failure(&make_failed_result(
+            Some("connection reset by peer"),
+            None
+        )));
+    }
+
+    #[test]
+    fn compute_retry_backoff_secs_indexes_schedule_and_clamps_tail() {
+        let schedule = [60, 300, 900];
+        assert_eq!(compute_retry_backoff_secs(0, &schedule), 60);
+        assert_eq!(compute_retry_backoff_secs(1, &schedule), 300);
+        assert_eq!(compute_retry_backoff_secs(2, &schedule), 900);
+        // retry_count beyond schedule length uses the last entry.
+        assert_eq!(compute_retry_backoff_secs(5, &schedule), 900);
+    }
+
+    #[test]
+    fn compute_retry_backoff_secs_falls_back_when_schedule_empty() {
+        let empty: [i64; 0] = [];
+        assert_eq!(compute_retry_backoff_secs(0, &empty), 60);
+    }
+
+    #[test]
+    fn parse_backoff_value_handles_units() {
+        assert_eq!(parse_backoff_value("30"), Some(30));
+        assert_eq!(parse_backoff_value("1m"), Some(60));
+        assert_eq!(parse_backoff_value("5m"), Some(300));
+        assert_eq!(parse_backoff_value("2H"), Some(7_200));
+        assert_eq!(parse_backoff_value(" 45s "), Some(45));
+        assert_eq!(parse_backoff_value(""), None);
+        assert_eq!(parse_backoff_value("-5"), None);
+        assert_eq!(parse_backoff_value("abc"), None);
+    }
+
+    #[test]
+    fn parse_backoff_spec_splits_csv() {
+        assert_eq!(parse_backoff_spec("30,1m,2h"), vec![30, 60, 7_200]);
+        assert_eq!(parse_backoff_spec("  10s , 5m , 15m  "), vec![10, 300, 900]);
+        assert_eq!(parse_backoff_spec(""), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn should_retry_job_combines_transient_and_retry_budget() {
+        let transient = make_failed_result(Some("connection reset"), Some(128));
+        let permanent = make_failed_result(Some("HTTP 404 Not Found"), None);
+
+        let mut job = QueueJob {
+            id: "j1".to_string(),
+            job_type: JobType::Download,
+            target: "1".to_string(),
+            created_at: 0,
+            retry_count: 0,
+            max_retries: 3,
+            available_at: None,
+        };
+        assert!(should_retry_job(&transient, &job));
+        assert!(!should_retry_job(&permanent, &job));
+
+        job.retry_count = 3;
+        assert!(!should_retry_job(&transient, &job));
     }
 
     #[test]

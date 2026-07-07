@@ -582,7 +582,7 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `table.reload` / `refresh` / `list_updated` | S→C | ✅ (refreshList+refreshTags) | ✅ |
 | `tag.updateCanvas` | S→C | ✅ (refreshTags) | ✅ |
 | `status` / `queue` / `notification.queue` | S→C | ✅ (refreshQueue) | ✅ |
-| `queue_start` / `queue_complete` / `queue_failed` | S→C | ✅ (refreshQueue) | ✅ |
+| `queue_start` / `queue_complete` / `queue_failed` / `queue_retry` | S→C | ✅ (`queue_retry` は失敗 job が `queue.max-retries` / `queue.retry-backoff` に従い `available_at` 付きで `active_pending` へ自動再投入されたタイミングで送出) | ✅ |
 | `error` | S→C | ✅ (appendConsole) | ✅ |
 | 再接続 | 5秒リトライ | ✅ (5s setTimeout) | ✅ |
 | 接続時履歴送信 | 直近60件を接続時にプッシュ | ✅ (history_on_connect) | ✅ |
@@ -674,7 +674,7 @@ Web UI 設定画面に出る関連項目: `server-bind` / `server-basic-auth.*` 
 **テーマ**: 6/6 ✅ (全ページCSS変数化、hardcoded色・px値なし)
 **API**: 71 実装済み / 4 未実装 (eject, download4ssl, download_request, downloadable.gif)
 **WebSocket**: 基本イベント ✅, echo出力ストリーミング ✅, TermColorLight色付き出力 ✅, 進捗バー ✅, DB自動更新+table.reload+tag.updateCanvas ✅, 履歴on-connect ✅, console.clear ✅, shutdown/reboot ✅, 起動時バージョン表示+未完了タスク警告 ✅, モーダル/メモ帳同期 ❌
-**設定ページ**: ✅ (`webui.performance-mode` / `webui.table.reload-timing` に加え、`download.interval` / `download.wait-steps` / `user-agent` / `guard-spoiler` / 各種 length-limit を runtime 反映。Ruby版相当の `select_summaries` 表示と help HTML 表示にも対応)
+**設定ページ**: ✅ (`webui.performance-mode` / `webui.table.reload-timing` に加え、`download.interval` / `download.wait-steps` / `user-agent` / `guard-spoiler` / 各種 length-limit を runtime 反映。Ruby版相当の `select_summaries` 表示と help HTML 表示にも対応。`queue.max-retries` / `queue.retry-backoff` も detail タブに表示され、夜間更新で一時的なネットワーク失敗があった場合に指数バックオフで自動リトライする)
 **言語切替**: ✅ (Rust独自)
 **レスポンシブ**: ✅
 **i18n 監査**: ✅ (JOB_TYPE_LABELS を Ruby版と完全一致に修正済み)

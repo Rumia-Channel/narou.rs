@@ -2591,6 +2591,7 @@ mod tests {
             created_at: 0,
             retry_count: 0,
             max_retries: 3,
+            available_at: None,
         }]);
 
         let existing = existing_update_job_id(&queue, &running_jobs, "tag:modified", "update", false);
@@ -2703,6 +2704,7 @@ mod tests {
             created_at: 0,
             retry_count: 0,
             max_retries: 0,
+            available_at: None,
         };
         let spec = QueueExecutionSpec {
             cmd: "update_general_lastup".to_string(),

@@ -29,6 +29,11 @@ pub struct QueueJob {
     pub retry_count: u32,
     #[serde(default)]
     pub max_retries: u32,
+    /// Earliest Unix timestamp (seconds) at which the job may be popped.
+    /// `None` or a past timestamp means the job is immediately runnable.
+    /// Used to implement exponential backoff between retries without sleeping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +242,25 @@ impl PersistentQueue {
         self.change_notify.notify_one();
     }
 
+    /// Returns true if at least one active pending job is currently runnable
+    /// (its `available_at` is `None` or at or before "now"). `lane` is a
+    /// hint used by `pop`; pass `Default` to inspect any lane.
+    fn has_runnable_pending(&self, lane: QueueLane) -> bool {
+        self.has_runnable_pending_for_lane(lane)
+    }
+
+    fn has_runnable_pending_for_lane(&self, lane: QueueLane) -> bool {
+        let state = self.state.lock();
+        let now = chrono::Utc::now().timestamp();
+        state
+            .active_pending
+            .iter()
+            .any(|job| {
+                job.job.job_type.lane() == lane
+                    && job.job.available_at.map_or(true, |at| at <= now)
+            })
+    }
+
     pub fn flush(&self) -> Result<()> {
         self.save()
     }
@@ -324,12 +348,17 @@ impl PersistentQueue {
     }
 
     pub fn pop(&self) -> Option<QueueJob> {
-        if self.state.lock().active_pending.is_empty() {
+        if !self.has_runnable_pending(QueueLane::Default) {
             let _ = self.merge_external_pending_jobs();
         }
         let job = {
             let mut state = self.state.lock();
-            let mut stored = state.active_pending.pop_front()?;
+            let now = chrono::Utc::now().timestamp();
+            let index = state
+                .active_pending
+                .iter()
+                .position(|job| job.job.available_at.map_or(true, |at| at <= now))?;
+            let mut stored = state.active_pending.remove(index)?;
             stored.mark_running();
             let job = stored.job.clone();
             state.active_running.retain(|running| running.job.id != job.id);
@@ -348,21 +377,20 @@ impl PersistentQueue {
     where
         F: Fn(&QueueJob) -> bool,
     {
-        if !self
-            .state
-            .lock()
-            .active_pending
-            .iter()
-            .any(|job| job.job.job_type.lane() == lane && !is_blocked(&job.job))
-        {
+        if !self.has_runnable_pending_for_lane(lane) {
             let _ = self.merge_external_pending_jobs();
         }
         let job = {
             let mut state = self.state.lock();
+            let now = chrono::Utc::now().timestamp();
             let index = state
                 .active_pending
                 .iter()
-                .position(|job| job.job.job_type.lane() == lane && !is_blocked(&job.job))?;
+                .position(|job| {
+                    job.job.job_type.lane() == lane
+                        && !is_blocked(&job.job)
+                        && job.job.available_at.map_or(true, |at| at <= now)
+                })?;
             let mut stored = state.active_pending.remove(index)?;
             stored.mark_running();
             let job = stored.job.clone();
@@ -457,6 +485,36 @@ impl PersistentQueue {
         drop(state);
         self.save()?;
         Ok(count)
+    }
+
+    /// Move a currently-running job back to the active pending queue,
+    /// incrementing its `retry_count` and recording the earliest timestamp
+    /// at which it may be popped again. Returns `true` if the job was
+    /// found and requeued, `false` if it was not in the running set.
+    ///
+    /// `available_at` is a Unix timestamp in seconds. Pass `None` to make
+    /// the job immediately runnable; pass a future timestamp to schedule
+    /// exponential backoff between retries. Callers are responsible for
+    /// checking `job.retry_count < job.max_retries` before invoking.
+    pub fn requeue(&self, job_id: &str, available_at: Option<i64>) -> Result<bool> {
+        self.merge_external_pending_jobs()?;
+        let requeued = {
+            let mut state = self.state.lock();
+            if let Some(mut job) = take_running_job(&mut state, job_id) {
+                ensure_queue_capacity(total_pending_len(&state), 1)?;
+                job.job.retry_count = job.job.retry_count.saturating_add(1);
+                job.job.available_at = available_at;
+                job.mark_pending();
+                state.active_pending.push_back(job);
+                true
+            } else {
+                false
+            }
+        };
+        if requeued {
+            self.save()?;
+        }
+        Ok(requeued)
     }
 
     pub fn len(&self) -> usize {
@@ -988,6 +1046,7 @@ fn legacy_task_to_stored_job(task: LegacyQueueTask, running: bool) -> Option<Sto
         created_at,
         retry_count: 0,
         max_retries: 3,
+        available_at: None,
     };
     let mut stored = StoredQueueJob { job, legacy: task };
     if running {
@@ -1053,6 +1112,7 @@ fn build_stored_job(
         created_at,
         retry_count: 0,
         max_retries: 3,
+        available_at: None,
     };
     let mut stored = StoredQueueJob {
         job,
@@ -1549,6 +1609,189 @@ mod tests {
     }
 
     #[test]
+    fn requeue_increments_retry_count_and_schedules_pending() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let id = queue.push(JobType::Download, "n0001").unwrap();
+
+        let running = queue.pop().unwrap();
+        assert_eq!(running.id, id);
+        assert_eq!(running.retry_count, 0);
+
+        let available_at = chrono::Utc::now().timestamp() + 60;
+        let requeued = queue.requeue(&id, Some(available_at)).unwrap();
+        assert!(requeued);
+
+        let pending = queue.get_pending_tasks();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].retry_count, 1);
+        assert_eq!(pending[0].available_at, Some(available_at));
+        assert_eq!(queue.running_count(), 0);
+    }
+
+    #[test]
+    fn requeue_returns_false_for_unknown_job_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        assert!(!queue.requeue("does-not-exist", None).unwrap());
+    }
+
+    #[test]
+    fn requeue_does_not_increment_when_running_slot_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let id = queue.push(JobType::Download, "n0001").unwrap();
+
+        // Job is still pending; requeue should not move it.
+        let requeued = queue.requeue(&id, None).unwrap();
+        assert!(!requeued);
+        let pending = queue.get_pending_tasks();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].retry_count, 0);
+        assert_eq!(pending[0].available_at, None);
+    }
+
+    #[test]
+    fn pop_skips_jobs_with_future_available_at() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let first = queue.push(JobType::Download, "1").unwrap();
+        let second = queue.push(JobType::Download, "2").unwrap();
+
+        // Pop the first, fail it, requeue with a far-future timestamp.
+        let running = queue.pop().unwrap();
+        assert_eq!(running.id, first);
+        let future = chrono::Utc::now().timestamp() + 86_400;
+        assert!(queue.requeue(&running.id, Some(future)).unwrap());
+
+        // Now the only immediately-runnable pending job is the second one.
+        let next = queue.pop().unwrap();
+        assert_eq!(next.id, second);
+        assert_eq!(queue.get_pending_tasks().len(), 1);
+        assert_eq!(queue.get_pending_tasks()[0].id, first);
+        assert_eq!(queue.get_pending_tasks()[0].available_at, Some(future));
+    }
+
+    #[test]
+    fn pop_runs_jobs_with_past_available_at() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let id = queue.push(JobType::Download, "1").unwrap();
+
+        let running = queue.pop().unwrap();
+        let past = chrono::Utc::now().timestamp() - 1;
+        assert!(queue.requeue(&running.id, Some(past)).unwrap());
+
+        let next = queue.pop().unwrap();
+        assert_eq!(next.id, id);
+        assert_eq!(next.retry_count, 1);
+    }
+
+    #[test]
+    fn pop_for_lane_skips_jobs_with_future_available_at() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let blocked = queue.push(JobType::Download, "10").unwrap();
+        let ready = queue.push(JobType::Download, "11").unwrap();
+
+        // Run the blocked job, then requeue it with a far-future timestamp.
+        let running = queue.pop().unwrap();
+        assert_eq!(running.id, blocked);
+        let future = chrono::Utc::now().timestamp() + 86_400;
+        assert!(queue.requeue(&running.id, Some(future)).unwrap());
+
+        // Lane-aware pop should skip the still-blocked job and pick the ready one.
+        let next = queue.pop_for_lane(QueueLane::Default).unwrap();
+        assert_eq!(next.id, ready);
+        assert_eq!(queue.get_pending_tasks()[0].id, blocked);
+    }
+
+    #[test]
+    fn queue_yaml_backward_compatible_when_available_at_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+
+        // Hand-written YAML mimicking a queue produced before the retry field
+        // existed. No `available_at` key on any job.
+        let legacy_yaml = r#"
+pending:
+  - id: legacy-pending
+    cmd: download
+    args: ["n0099"]
+running: []
+completed: []
+partial: []
+failed: []
+cancelled: []
+deferred_pending: false
+updated_at: "2026-05-01T00:00:00Z"
+"#;
+        std::fs::write(&queue_path, legacy_yaml).unwrap();
+
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        // The pre-retry pending jobs are loaded as deferred (so the user can be
+        // prompted to restore them); activate them for the test and ensure the
+        // missing `available_at` field is back-filled to `None`.
+        assert_eq!(queue.activate_restorable_tasks().unwrap(), 1);
+
+        let pending = queue.get_pending_tasks();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "legacy-pending");
+        assert_eq!(pending[0].available_at, None);
+        assert_eq!(pending[0].retry_count, 0);
+        assert_eq!(pending[0].max_retries, 3);
+
+        // The pending job should still be poppable.
+        let popped = queue.pop().unwrap();
+        assert_eq!(popped.id, "legacy-pending");
+        assert_eq!(popped.available_at, None);
+    }
+
+    #[test]
+    fn requeue_up_to_max_retries_keeps_retrying_then_stops() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join("queue.yaml");
+        let queue = PersistentQueue::new(&queue_path).unwrap();
+        let id = queue.push(JobType::Download, "1").unwrap();
+
+        // Manually clamp max_retries to 2 so the test stays short.
+        {
+            let mut state = queue.state.lock();
+            if let Some(job) = state.active_running.iter_mut().find(|job| job.job.id == id) {
+                job.job.max_retries = 2;
+            }
+            if let Some(job) = state
+                .active_pending
+                .iter_mut()
+                .find(|job| job.job.id == id)
+            {
+                job.job.max_retries = 2;
+            }
+        }
+
+        // First failure → retry_count 1 (still < max_retries 2)
+        let running = queue.pop().unwrap();
+        assert!(queue.requeue(&running.id, None).unwrap());
+        let pending = queue.get_pending_tasks();
+        assert_eq!(pending[0].retry_count, 1);
+        assert!(pending[0].retry_count <= pending[0].max_retries);
+
+        // Second failure → retry_count 2 (== max_retries 2; worker would no-op retry)
+        let running = queue.pop().unwrap();
+        assert!(queue.requeue(&running.id, None).unwrap());
+        let pending = queue.get_pending_tasks();
+        assert_eq!(pending[0].retry_count, 2);
+        assert_eq!(pending[0].retry_count, pending[0].max_retries);
+    }
+
+    #[test]
     fn completed_and_failed_history_survive_reload() {
         let temp = tempfile::tempdir().unwrap();
         let queue_path = temp.path().join("queue.yaml");
@@ -1679,6 +1922,7 @@ mod tests {
                 created_at: chrono::Utc::now().timestamp(),
                 retry_count: 0,
                 max_retries: 3,
+                available_at: None,
             }));
         }
         reloaded.flush().unwrap();

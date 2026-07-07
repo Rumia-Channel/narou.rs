@@ -811,6 +811,7 @@ mod tests {
             created_at: 0,
             retry_count: 0,
             max_retries: 3,
+            available_at: None,
         }]);
 
         let (job_id, queued) = queue_auto_update_job_if_needed(&queue, &running_jobs).unwrap();

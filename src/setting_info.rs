@@ -45,6 +45,10 @@ pub fn default_local_setting_value(name: &str) -> Option<serde_yaml::Value> {
         }
         "time-zone" => Some(serde_yaml::Value::String("Asia/Tokyo".to_string())),
         "user-agent" => Some(serde_yaml::Value::String("auto".to_string())),
+        "queue.max-retries" => Some(serde_yaml::Value::Number(serde_yaml::Number::from(3))),
+        "queue.retry-backoff" => {
+            Some(serde_yaml::Value::String("1m,5m,15m".to_string()))
+        }
         _ => None,
     }
 }
@@ -121,7 +125,9 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "filename-length-limit"
         | "ebook-filename-length-limit"
         | "time-zone"
-        | "user-agent" => Some("detail"),
+        | "user-agent"
+        | "queue.max-retries"
+        | "queue.retry-backoff" => Some("detail"),
 
         // local → webui
         "webui.theme"
@@ -524,6 +530,37 @@ mod tests {
         assert!(matches!(info.var_type, VarType::String));
         assert!(info.invisible, "global-only setting should stay invisible on webui tab");
     }
+
+    #[test]
+    fn queue_retry_settings_have_detail_tab_and_defaults() {
+        assert_eq!(tab_for_setting("queue.max-retries"), Some("detail"));
+        assert_eq!(tab_for_setting("queue.retry-backoff"), Some("detail"));
+
+        let vars = setting_variables();
+        let max = vars
+            .get("queue.max-retries")
+            .expect("queue.max-retries must be registered as a local var");
+        assert!(matches!(max.var_type, VarType::Integer));
+        assert!(max.invisible, "queue settings stay invisible on webui tab");
+
+        let backoff = vars
+            .get("queue.retry-backoff")
+            .expect("queue.retry-backoff must be registered as a local var");
+        assert!(matches!(backoff.var_type, VarType::String));
+        assert!(backoff.invisible);
+
+        // Default values must surface through `default_local_setting_value` so
+        // the user does not have to write them by hand.
+        let max_default = default_local_setting_value("queue.max-retries")
+            .expect("queue.max-retries default");
+        assert_eq!(max_default.as_i64(), Some(3));
+        let backoff_default = default_local_setting_value("queue.retry-backoff")
+            .expect("queue.retry-backoff default");
+        assert_eq!(
+            backoff_default.as_str(),
+            Some("1m,5m,15m"),
+        );
+    }
 }
 
 /// Local setting variable metadata
@@ -901,6 +938,20 @@ pub fn setting_variables() -> SettingVariables {
             vis(
                 VarType::Boolean,
                 "WEB UI 上で失敗ジョブの詳細エラー表示を有効にする。ON のときだけ通知とコンソールに詳細を出す",
+            ),
+        ),
+        (
+            "queue.max-retries",
+            invis(
+                VarType::Integer,
+                "ジョブが失敗したときに自動リトライする最大回数。0 でリトライ無効。既定は 3",
+            ),
+        ),
+        (
+            "queue.retry-backoff",
+            invis(
+                VarType::String,
+                "リトライ時の待機秒数をカンマ区切りで指定（s/m/h 単位可、例: 1m,5m,15m）。要素数より多く失敗したときは最後の値を再利用",
             ),
         ),
     ];
