@@ -10,7 +10,7 @@
 <style>
 .bookmarklet-container { max-width: 44em; margin: 1.5em auto; padding: 0 var(--container-padding); line-height: 1.6; }
 .bookmarklet-container h1 { border-bottom: 0.15em solid var(--btn-primary-bg); padding-bottom: .3em; }
-.bookmarklet-container code { background: var(--table-stripe-bg); padding: .15em .3em; border-radius: var(--border-radius); }
+.bookmarklet-container code { background: var(--table-stripe-bg); padding: .15em .3em; border-radius: var(--border-radius); word-break: break-all; }
 .bookmarklet-container .bookmarklet {
   display: inline-block;
   padding: .5em .8em;
@@ -22,6 +22,13 @@
   margin: .5em 0;
 }
 .bookmarklet-container a { color: var(--link-color); }
+.bookmarklet-container .note {
+  background: var(--bg-secondary);
+  border-radius: var(--border-radius);
+  padding: 0.8em 1em;
+  margin: 1em 0;
+}
+.bookmarklet-container .note ul { margin: 0.4em 0 0; padding-left: 1.4em; }
 </style>
 </head>
 <body>
@@ -32,18 +39,32 @@
 </nav>
 <div class="bookmarklet-container">
   <h1>ブックマークレット</h1>
-  <p>下のリンクをブックマークバーへドラッグして使います。</p>
-  <p><a id="bookmarklet-link" class="bookmarklet" href="#">Narou.rs を開く</a></p>
-  <p>ブックマークレットは、現在のタブから narou.rs を別ウィンドウで開きます。</p>
-  <p>古いブックマークレットを使っている場合は、WEB API の安全性向上のため再登録してください。</p>
+  <p>下のリンクをブックマークバーへドラッグして登録します。なろう・カクヨム・小説家等のページでブックマークレットを開くと、表示中の小説 URL をこの WEB UI に持ち帰り、登録確認のダイアログを出します。</p>
+  <p><a id="bookmarklet-link" class="bookmarklet" href="#">Narou.rs に登録</a></p>
+  <p>ブックマークレットは現在のタブから <code id="bookmarklet-origin">narou.rs</code> を別ウィンドウで開き、表示中のページ URL を <code>?register=...</code> パラメータとして渡します。承認時に既存の <code>/api/download</code> を same-origin で呼び出すため、クロスオリジン CSRF ガードの影響を受けません。</p>
+  <div class="note">
+    <p><strong>使い方</strong></p>
+    <ul>
+      <li>なろう/カクヨム/Arcadia 等の小説ページを開く</li>
+      <li>登録したブックマークレットをクリック</li>
+      <li>別ウィンドウで開いた WEB UI の確認ダイアログで「登録」を押す</li>
+      <li>ダウンロードキューに追加され、通常通り処理されます</li>
+    </ul>
+  </div>
+  <p>古いブックマークレット（クロスオリジン POST 用）をお使いの場合は、WEB API の CSRF ガードにより動作しないため、上記のリンクから再登録してください。</p>
   <p><a href="/about">About</a> / <a href="/help">Help</a></p>
 </div>
 <script>
 (function() {
+  var origin = (location.origin || (location.protocol + '//' + location.host)).replace(/'/g, "%27");
   var link = document.getElementById('bookmarklet-link');
-  var code = "javascript:(function(){window.open('" + location.origin.replace(/'/g, "%27") + "/','narou_rs','width=1200,height=800,resizable=yes,scrollbars=yes');})();";
+  var originLabel = document.getElementById('bookmarklet-origin');
+  if (originLabel) originLabel.textContent = origin;
+  // 同じブックマークレットをブックマークバーへドラッグして使う。クリック時ではなく
+  // 「javascript:」プロトコルとして評価された際に location.href を取得して WEB UI を開く。
+  var code = "javascript:(function(){try{var u=location.href;window.open('" + origin + "/?register='+encodeURIComponent(u),'narou_rs','width=1200,height=800,resizable=yes,scrollbars=yes');}catch(e){window.open('" + origin + "/','narou_rs','width=1200,height=800,resizable=yes,scrollbars=yes');}})();";
   link.href = code;
-  link.textContent = 'Narou.rs を開く';
+  link.textContent = 'Narou.rs に登録';
 })();
 </script>
 </body>

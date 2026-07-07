@@ -10,6 +10,7 @@ import { renderNovelList, renderQueueStatus, renderTagList, showNotification, sy
 import {
   applyNotepadSnapshot,
   bindActions,
+  handleRegisterParam,
   refreshList,
   refreshQueue,
   refreshQueueDetailed,
@@ -54,6 +55,12 @@ async function init() {
   bindActions();
   bindConsoleAutoScroll(El.console);
   bindConsoleAutoScroll(El.consoleStdout2);
+
+  // Bookmarklet same-origin register flow: handle `?register=<url>` before
+  // kicking off async data loads so the user sees the confirmation dialog
+  // promptly. We strip the param from the URL after handing it off so a
+  // refresh of the page does not re-prompt with the same URL.
+  handleBookmarkletRegisterParam();
 
   // Load config from server
   try {
@@ -133,6 +140,40 @@ function connectWebSocket() {
   ws.onerror = () => {
     ws?.close();
   };
+}
+
+/**
+ * Detect `?register=<url>` on initial load and hand it off to the register
+ * confirmation modal. We strip the param from the address bar after a successful
+ * hand-off so a manual refresh does not re-prompt. This is the same-origin
+ * counterpart to the legacy `/api/download_request` POST, which is now blocked
+ * by the request_guard_middleware Origin check.
+ */
+function handleBookmarkletRegisterParam() {
+  let search;
+  try {
+    search = new URLSearchParams(location.search);
+  } catch {
+    return;
+  }
+  const target = search.get('register');
+  if (!target) return;
+  if (handleRegisterParam(target)) {
+    stripRegisterParamFromUrl();
+  }
+}
+
+function stripRegisterParamFromUrl() {
+  try {
+    const url = new URL(location.href);
+    url.searchParams.delete('register');
+    const next = url.pathname + (url.searchParams.toString() ? '?' + url.searchParams.toString() : '') + url.hash;
+    history.replaceState(null, '', next);
+  } catch {
+    // If the URL API is unavailable for some reason, leave the URL alone;
+    // the modal still works and a refresh will simply re-prompt, which is
+    // a degraded but acceptable state.
+  }
 }
 
 function applyWebConfig(config) {

@@ -560,15 +560,36 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | `/api/reboot` | POST | ✅ |
 | `/api/update/start` | POST | ✅ (Rust拡張: 同梱 updater による自動アップデート) |
 
-### 6.10 未実装 API (Ruby版にあるが Rust版未実装)
+### 6.10 削除済み / 未実装 API (Ruby版にあったが Rust版では廃止)
 
 | エンドポイント | 説明 |
 |-------------|------|
-| `/api/version/latest.json` | 最新バージョンチェック (外部API依存) |
+| `/api/version/latest.json` | 最新バージョンチェック (外部API依存, narou.rb と同等実装) |
 | `/api/eject` | 端末取出し (実機検証必要) |
-| `/api/download4ssl` | SSL互換DL (レガシー) |
-| `/api/download_request` | DL済みチェック (D&Dウィジェット向け) |
-| `/api/downloadable.gif` | DL状態GIF画像 (レガシー) |
+| `/api/download4ssl` | **削除済み** (旧ブックマークレットのクロスオリジン POST 用。CSRF ガード導入により使用不可となり、`/?register=<url>` same-origin 方式へ移行) |
+| `/api/download_request` | **削除済み** (同上。旧 D&D ウィジェット互換の名残。`/?register=<url>` 経由で代替可能) |
+| `/api/downloadable.gif` | DL状態GIF画像 (レガシー, narou.rb 同等実装) |
+
+### 6.11 ブックマークレット (same-origin 登録フロー)
+
+旧ブックマークレットはクロスオリジンで `POST /api/download_request` を叩く方式だったが、`request_guard_middleware` の Origin チェックにより常に 403 となっていた (BUG-17)。
+
+Rust版では以下のように CSRF ガードと両立する same-origin 方式を採用:
+
+1. **`/bookmarklet` ページのブックマークレット** は現在表示中の URL を取得し、`window.open(<webui-origin> + '/?register=' + encodeURIComponent(location.href))` で WEB UI を別ウィンドウで開く
+2. WEB UI 側 (`main.js` の `handleBookmarkletRegisterParam`) が `?register=` パラメータを検出
+3. 確認ダイアログ (`#register-modal`) を表示し、対象 URL を明示
+4. 承認時に既存の same-origin エンドポイント `POST /api/download` を JS から呼ぶ (`postJson('/api/download', { targets: [url] })`)
+5. ブラウザは `Origin: <webui-origin>` を付与するため、`request_guard_middleware` の Origin チェックを通過する
+6. 承認後に `history.replaceState` で URL から `register` パラメータを除去 (リロード時の再プロンプト防止)
+
+| 要素 | 役割 |
+|------|------|
+| `/bookmarklet` | ブックマークレット取得ページ。`src/web/assets/bookmarklet.html` |
+| `#register-modal` | 確認ダイアログ。URL表示 + キャンセル/登録ボタン |
+| `handleRegisterParam(url)` (actions.js) | URL を検証してモーダルに表示 (http(s) のみ, 2048 文字以内) |
+| `handleBookmarkletRegisterParam()` (main.js) | 起動時に `?register=` を検出して `handleRegisterParam` へ引き渡し |
+| `POST /api/download` | 既存の same-origin DL キュー投入エンドポイントを流用 |
 
 ---
 

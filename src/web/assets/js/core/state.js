@@ -139,6 +139,8 @@ const ELEMENT_IDS = [
   'feature-tour-disable-auto', 'feature-tour-ok',
   'confirm-modal', 'confirm-title', 'confirm-message',
   'confirm-cancel', 'confirm-ok',
+  'register-modal', 'register-modal-close', 'register-url',
+  'register-cancel', 'register-ok',
   'remove-modal', 'remove-novel-list', 'remove-with-file',
   'remove-cancel', 'remove-ok',
   'diff-modal', 'diff-close', 'diff-list-container',

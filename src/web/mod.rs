@@ -601,15 +601,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/update_general_lastup",
             post(jobs::api_update_general_lastup),
         )
-        .route(
-            "/api/download_request",
-            get(jobs::bookmarklet_download_request_post_required).post(jobs::api_download_request),
-        )
         .route("/api/downloadable.gif", get(jobs::api_downloadable_gif))
-        .route(
-            "/api/download4ssl",
-            get(jobs::bookmarklet_download4ssl_post_required).post(jobs::api_download4ssl),
-        )
         .route(
             "/api/restore_pending_tasks",
             post(jobs::restore_pending_tasks),
