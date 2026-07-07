@@ -193,10 +193,17 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         }
     };
 
-    let mut tag_colors = match load_tag_colors() {
+    let inventory = match Inventory::with_default_root() {
+        Ok(inventory) => inventory,
+        Err(err) => {
+            log::report_error(&err.to_string());
+            return 127;
+        }
+    };
+    let mut tag_colors = match tag_colors::load_tag_colors(&inventory) {
         Ok(colors) => colors,
         Err(err) => {
-            log::report_error(&err);
+            log::report_error(&err.to_string());
             return 127;
         }
     };
@@ -219,7 +226,7 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
     }
 
     let colors_changed = if options.show_tags() {
-        ensure_tag_colors(
+        tag_colors::ensure_tag_colors(
             &mut tag_colors,
             selected
                 .iter()
@@ -243,8 +250,8 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         .collect::<Vec<_>>();
 
     if colors_changed {
-        if let Err(err) = save_tag_colors(&tag_colors) {
-            log::report_error(&err);
+        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
+            log::report_error(&err.to_string());
             return 127;
         }
     }
@@ -271,10 +278,17 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         }
     };
 
-    let mut tag_colors = match load_tag_colors() {
+    let inventory = match Inventory::with_default_root() {
+        Ok(inventory) => inventory,
+        Err(err) => {
+            log::report_error(&err.to_string());
+            return 127;
+        }
+    };
+    let mut tag_colors = match tag_colors::load_tag_colors(&inventory) {
         Ok(colors) => colors,
         Err(err) => {
-            log::report_error(&err);
+            log::report_error(&err.to_string());
             return 127;
         }
     };
@@ -294,8 +308,8 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
     }
 
     if explicit_color_changed {
-        if let Err(err) = save_tag_colors(&tag_colors) {
-            log::report_error(&err);
+        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
+            log::report_error(&err.to_string());
             return 127;
         }
     }
@@ -371,8 +385,10 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
             }
 
             if !updated.tags.is_empty() {
-                auto_color_changed |=
-                    ensure_tag_colors(&mut tag_colors, updated.tags.iter().map(String::as_str));
+                auto_color_changed |= tag_colors::ensure_tag_colors(
+                    &mut tag_colors,
+                    updated.tags.iter().map(String::as_str),
+                );
                 outputs.push(TagOutput::Current(updated.tags.clone()));
             }
 
@@ -391,8 +407,8 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
     let (outputs, auto_color_changed) = outputs;
 
     if auto_color_changed {
-        if let Err(err) = save_tag_colors(&tag_colors) {
-            log::report_error(&err);
+        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
+            log::report_error(&err.to_string());
             return 127;
         }
     }
@@ -676,10 +692,20 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
         }
     };
 
-    let changed = ensure_tag_colors(tag_colors, tag_list.iter().map(|(tag, _)| tag.as_str()));
+    let inventory = match Inventory::with_default_root() {
+        Ok(inventory) => inventory,
+        Err(err) => {
+            log::report_error(&err.to_string());
+            return 127;
+        }
+    };
+    let changed = tag_colors::ensure_tag_colors(
+        tag_colors,
+        tag_list.iter().map(|(tag, _)| tag.as_str()),
+    );
     if changed {
-        if let Err(err) = save_tag_colors(tag_colors) {
-            log::report_error(&err);
+        if let Err(err) = tag_colors::save_tag_colors(&inventory, tag_colors) {
+            log::report_error(&err.to_string());
             return 127;
         }
     }
@@ -747,23 +773,6 @@ fn render_tags(tags: &[String], tag_colors: &TagColors, separator: &str, colored
         })
         .collect::<Vec<_>>()
         .join(separator)
-}
-
-fn load_tag_colors() -> Result<TagColors, String> {
-    let inventory = Inventory::with_default_root().map_err(|err| err.to_string())?;
-    tag_colors::load_tag_colors(&inventory).map_err(|err| err.to_string())
-}
-
-fn save_tag_colors(tag_colors: &TagColors) -> Result<(), String> {
-    let inventory = Inventory::with_default_root().map_err(|err| err.to_string())?;
-    tag_colors::save_tag_colors(&inventory, tag_colors).map_err(|err| err.to_string())
-}
-
-fn ensure_tag_colors<'a>(
-    tag_colors: &mut TagColors,
-    tags: impl IntoIterator<Item = &'a str>,
-) -> bool {
-    tag_colors::ensure_tag_colors(tag_colors, tags)
 }
 
 pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
@@ -1062,10 +1071,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        TagColors, TagOptions, build_tag_mode, ensure_tag_colors, matches_filters, matches_grep,
+        TagColors, TagOptions, build_tag_mode, matches_filters, matches_grep,
         remove_novel_files,
     };
     use narou_rs::db::novel_record::NovelRecord;
+    use narou_rs::tag_colors;
 
     #[test]
     fn remove_without_with_file_only_deletes_toc() {
@@ -1108,9 +1118,21 @@ mod tests {
     #[test]
     fn ensure_tag_colors_rotates_in_insertion_order() {
         let mut tag_colors = TagColors::default();
-        assert!(ensure_tag_colors(&mut tag_colors, ["fav"]));
-        assert!(ensure_tag_colors(&mut tag_colors, ["later"]));
-        assert!(ensure_tag_colors(&mut tag_colors, ["todo"]));
+        assert!(tag_colors::ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["fav"],
+            None,
+        ));
+        assert!(tag_colors::ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["later"],
+            None,
+        ));
+        assert!(tag_colors::ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["todo"],
+            None,
+        ));
 
         assert_eq!(tag_colors.color_for("fav"), Some("green"));
         assert_eq!(tag_colors.color_for("later"), Some("yellow"));

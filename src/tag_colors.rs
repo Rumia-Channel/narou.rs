@@ -198,9 +198,21 @@ mod tests {
     #[test]
     fn ensure_tag_colors_rotates_in_insertion_order() {
         let mut tag_colors = TagColors::default();
-        assert!(ensure_tag_colors(&mut tag_colors, ["fav"]));
-        assert!(ensure_tag_colors(&mut tag_colors, ["later"]));
-        assert!(ensure_tag_colors(&mut tag_colors, ["todo"]));
+        assert!(ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["fav"],
+            None
+        ));
+        assert!(ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["later"],
+            None
+        ));
+        assert!(ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            ["todo"],
+            None
+        ));
         assert_eq!(
             tag_colors.colors.get("fav").map(String::as_str),
             Some("green")

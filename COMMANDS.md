@@ -85,7 +85,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、section hash cache 永続化、digest選択肢、差分cache退避、Ctrl+C 中断、hotentryのcopy/send/mailまでは実装済み。hotentry 周辺の細部が残る |
 | `convert` | ✅ | 🟡 部分 | `--output` / `--enc` / テキストファイル入力 / `--inspect` / `convert.inspect` / `--no-open` / `--no-epub` / `--no-mobi` / `--no-strip` / `--make-zip` / `--no-zip` / `--verbose` / `device` 設定反映 / `convert.multi-device` / `convert.copy-to` / `convert.copy-zip-to` / `convert.copy-to-grouping` / `--ignore-default` / `--ignore-force` / `dc:subject` 埋め込み / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript`、表紙タイトルの `title_date` / 完結装飾反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFOまでは実装。実機 send 最終確認が残る |
 | `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--echo` と pipe 時ID出力まで実装 |
-| `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションまで実装 |
+| `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションと `webui.new-tag-color` 既定色まで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
 | `remove` | ✅ | ✅ 完了 | `--yes`, `--with-file`, `--all-ss`、確認、freeze/lock チェックを実装 |
 | `web` | ✅ | 🟡 部分 | API / queue worker / auto-scheduler に加え、pure JS / pure CSS の分割 frontend、JP/EN 切替、theme/performance/reload 設定反映までは実装済み。frontend は全件取得+client-side 描画のため narou.rb 細部 parity は継続中 |
@@ -356,6 +356,7 @@ narou setting name         # 読み取り
 | `time-zone` | string | YAML に timezone がないサイト日時の既定タイムゾーン |
 | `user-agent` | string | カスタム User-Agent |
 | `webui.theme` | select | WebUI テーマ |
+| `webui.new-tag-color` | select | 新規タグの既定色。`default`/未設定時は自動色ローテーション |
 
 **主要 global_setting 項目**:
 
@@ -376,7 +377,7 @@ narou setting name         # 読み取り
 - 設定値のバリデーション (型チェック、選択肢チェック、boolean の true/false 厳密化)
 - `default.*` / `force.*` / `default_args.*` は既知の original setting / command 名だけ受理し、未知名を拒否
 - `default_args.trace` / `default_args.console` を含む Ruby 由来の command 名を受理
-- `webui.table.reload-timing` / `webui.theme` など hidden select 項目でも選択肢チェックを実施
+- `webui.table.reload-timing` / `webui.theme` / `webui.new-tag-color` など hidden select 項目でも選択肢チェックを実施
 - `--list` 現在値一覧表示
 - `--all` 全変数表示
 - `setting -a` では hidden 項目に加え、`default.*` / `force.*` / `default_args.*` を型・説明付きで Local Variable List に列挙
@@ -431,7 +432,7 @@ narou setting name         # 読み取り
 - 引数なしでタグ一覧表示、タグ名のみ指定時は Ruby版同様 `list --tag` 相当の検索へ委譲
 - `--add` / `--delete` はスペース区切り複数タグを処理し、`--clear` は対象小説のタグを全削除する
 - `--color` は `green/yellow/blue/magenta/cyan/red/white` を受け付け、無効色は Ruby版同様に警告して無視する
-- `tag_colors.yaml` の保存順を保持しつつ、自動色ローテーション (green→yellow→blue→magenta→cyan→red→white) を実装
+- `tag_colors.yaml` の保存順を保持しつつ、`webui.new-tag-color` 未設定または `default` 時は自動色ローテーション (green→yellow→blue→magenta→cyan→red→white)、色名指定時は新規タグへ固定色を割り当てる
 - 追加タグの禁止文字 `:;"'><$@&^\\\|%/\`` と禁止語 `hotentry` を Ruby版相当に検証する
 - 編集後は `現在のタグは ... です` を表示し、タグ名/`tag:NAME`/ID/URL/Nコード/タイトル/alias のターゲット解決に対応
 
@@ -559,8 +560,8 @@ narou setting name         # 読み取り
 - Web UI からのサーバ再起動では replacement process に `--no-browser` を付与し、hidden 起動中は `--hide-console` も維持したまま再起動待機ページから同じタブで元ページへ戻る
 - Windows の `narou web --hide-console` は GUI subsystem で起動し、通常 CLI 実行時は親コンソールへ再接続、hidden 実行時はタスクトレイの右クリックメニューから `終了` / `再起動` を呼べる。Web worker / auto-update / 即時 API 実行が起動する child process も hidden 状態を引き継ぎ、空のコンソールを開かない
 - 即時実行の `diff` / `folder` / `reboot` API は child command の失敗や replacement process 起動失敗を success=false として返し、false success を出さない
-- Web 設定画面は Ruby版同様、`tab` がある設定を `invisible` 指定でも表示する。`webui.theme` / `webui.table.reload-timing` / `webui.debug-mode` / `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `over18` も設定画面に出る
-- `webui.theme` / `webui.table.reload-timing` / `webui.performance-mode` / `webui.debug-mode` 保存時は、開いている Web UI に設定再読み込みイベントを送り、テーマメニューの変更も `webui.theme` へ保存する
+- Web 設定画面は Ruby版同様、`tab` がある設定を `invisible` 指定でも表示する。`webui.theme` / `webui.table.reload-timing` / `webui.new-tag-color` / `webui.debug-mode` / `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `over18` も設定画面に出る
+- `webui.theme` / `webui.table.reload-timing` / `webui.performance-mode` / `webui.new-tag-color` / `webui.debug-mode` 保存時は、開いている Web UI に設定再読み込みイベントを送り、テーマメニューの変更も `webui.theme` へ保存する
 - `webui.debug-mode` が ON のときは、Web worker が失敗 child process の直近 stdout/stderr を要約して `queue_failed` イベントに載せ、Web UI 通知とコンソールに詳細エラーを出す。OFF のときは従来どおり簡潔な失敗通知だけにする
 - `/novels/{id}/download` は生成済み ebook を全量メモリへ読み込まず、`tokio::fs::File` から 64KiB チャンクでストリーミングする。大きい EPUB でも `Content-Length` / `Content-Disposition` を付けたまま返す
 - 一覧の検索文字列・現在ページ・ソート初期値はブラウザ `localStorage` に 6 時間の有効期限付きで保存し、リロード後に検索欄とページ位置を復元する
@@ -572,7 +573,7 @@ narou setting name         # 読み取り
 - Web サーバ起動時は Ruby版 `fill_general_all_no_in_database` 相当に、`general_all_no` 未設定レコードの `toc.yaml` を読んで話数をDBへ補完する
 - `/` では pure JS / pure CSS の分割 asset frontend を配信し、navbar / console / control panel / list + sidebar の構成で一覧操作できる
 - UI は日本語既定で、JP/EN トグルによる切替と `localStorage` 永続化に対応する
-- `webui.theme` / `webui.performance-mode` / `webui.table.reload-timing` を `/api/webui/config` と worker 側設定参照経由で反映し、theme 初期値、performance auto/on/off 判定、table reload の every/queue 挙動へ接続する
+- `webui.theme` / `webui.performance-mode` / `webui.table.reload-timing` / `webui.new-tag-color` を設定画面と worker 側設定参照経由で反映し、theme 初期値、performance auto/on/off 判定、table reload の every/queue 挙動、新規タグ既定色へ接続する
 - レスポンシブ CSS を分離し、スマートフォン幅でも一覧・キュー・メモ帳を同じ asset 構成で表示できる
 - 一覧 API の `frozen` 取得は DB 再入ロックによる deadlock を避けるよう修正済み
 - 一覧 API の `new_arrivals` 判定は `webnovel/*.yaml` の `timezone` に合わせたサイト現地時刻で行い、`domain` 未保存の既存データは `toc_url` のドメインからサイト定義を解決する
