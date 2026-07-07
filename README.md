@@ -213,16 +213,29 @@ narou_rs web --hide-console
 
 ### Web 公開時の上級者向け設定
 
-通常の `web` 利用は localhost 前提です。外部公開や reverse proxy 配下で使う場合だけ、CLI から hidden 設定を変更してください。
+通常の `web` 利用は localhost 前提です。外部公開や reverse proxy 配下で使う場合だけ、CLI から hidden 設定を変更してください。なお `s` は `setting` サブコマンドの短縮であり、`web` の短縮ではありません（`web` の短縮は未定義です）。
 
 ```powershell
-narou_rs setting server-basic-auth.require-for-external-bind=false
+# LAN から直接アクセスさせたいとき（どちらでも可）
+narou_rs setting server-bind=0.0.0.0
+narou_rs setting server-bind=192.168.1.10
+
+# reverse proxy 経由の外側 Host / Origin を許可するとき
 narou_rs setting server-reverse-proxy.enable=true
+
+# Basic 認証ガードを明示的に外す場合のみ
+narou_rs setting server-basic-auth.require-for-external-bind=false
 ```
 
-- `server-basic-auth.require-for-external-bind` は、`server-bind=0.0.0.0` など外部公開 bind のときに Basic 認証未設定での起動を拒否する narou_rs 独自ガードです。既定値は `true` です。
+- `server-bind` は Web サーバのバインドアドレスです。LAN に直接公開する場合は `0.0.0.0` か LAN 側の IP を指定してください。IP が頻繁に変わる環境では `127.0.0.1` のまま reverse proxy 経由での公開を推奨します。
 - `server-reverse-proxy.enable` は nginx などの前段 proxy が付ける外側の `Host` / `Origin` を受け入れるモードです。既定値は `false` で、reverse proxy 越しに公開するときだけ `true` にしてください。
-- どちらも Web UI の設定画面には表示されません。`narou_rs setting <name>=<value>` でのみ変更します。
+- `server-basic-auth.require-for-external-bind` は、`server-bind=0.0.0.0` など外部公開 bind のときに Basic 認証未設定での起動を拒否する narou_rs 独自ガードです。既定値は `true` です。
+- リバースプロキシや別ドメインから `Host` ヘッダでアクセスさせたいときは、`server-add-accepted-hosts`（カンマ区切り）に追加ホストを列挙してください。`*.example.com` 形式のワイルドカードも利用可能です（最低 2 ラベル: `*.example.com` は可、`*.com` は不可）。
+  ```powershell
+  narou_rs setting server-add-accepted-hosts=narou.example.com,*.lan.example
+  ```
+  unsafe なワイルドカードパターン（`*` 単独、`*.com`、末尾ワイルドなど）は警告ログを出して無視されます。
+- これらのうち Web UI の設定画面に出るのは `server-bind` だけで、それ以外は hidden のまま CLI からのみ変更します。
 
 ## グローバルオプション
 

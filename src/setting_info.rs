@@ -141,6 +141,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "server-basic-auth.user"
         | "server-basic-auth.password"
         | "server-ws-add-accepted-domains"
+        | "server-add-accepted-hosts"
         | "over18" => Some("global"),
 
         _ => None,
@@ -511,6 +512,17 @@ mod tests {
     fn webui_new_tag_color_is_visible_on_webui_tab() {
         assert_eq!(tab_for_setting("webui.new-tag-color"), Some("webui"));
         assert!(setting_variables().get("webui.new-tag-color").is_some());
+    }
+
+    #[test]
+    fn server_add_accepted_hosts_has_global_tab() {
+        assert_eq!(tab_for_setting("server-add-accepted-hosts"), Some("global"));
+        let vars = setting_variables();
+        let info = vars
+            .get("server-add-accepted-hosts")
+            .expect("server-add-accepted-hosts must be registered as a global var");
+        assert!(matches!(info.var_type, VarType::String));
+        assert!(info.invisible, "global-only setting should stay invisible on webui tab");
     }
 }
 
@@ -973,6 +985,13 @@ pub fn setting_variables() -> SettingVariables {
             invis(
                 VarType::String,
                 "PushServer の accepted_domains に追加するホストのリスト（カンマ区切り）",
+            ),
+        ),
+        (
+            "server-add-accepted-hosts",
+            invis(
+                VarType::String,
+                "HTTP の Host ヘッダに追加で許可するホストのリスト（カンマ区切り、*.example.com 形式のワイルドカード対応）",
             ),
         ),
         ("over18", invis(VarType::Boolean, "18歳以上かどうか")),

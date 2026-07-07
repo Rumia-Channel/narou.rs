@@ -360,11 +360,20 @@ fn split_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
 
 fn host_allowed(host: &str, state: &AppState) -> bool {
     let normalized = normalize_host_name(host);
-    !normalized.is_empty()
-        && state
-            .allowed_request_hosts
-            .iter()
-            .any(|allowed| normalize_host_name(allowed) == normalized)
+    if normalized.is_empty() {
+        return false;
+    }
+    state.allowed_request_hosts.iter().any(|allowed| {
+        let pattern = normalize_host_name(allowed);
+        if pattern == normalized {
+            return true;
+        }
+        if !is_safe_wildcard_pattern(&pattern) {
+            return false;
+        }
+        is_exact_subdomain_wildcard_match(&pattern, &normalized)
+            && wildcard_host_match(&pattern, &normalized)
+    })
 }
 
 fn normalize_host_name(host: &str) -> String {
@@ -424,12 +433,10 @@ pub fn default_allowed_request_hosts(bind_host: &str) -> Vec<String> {
     hosts
 }
 
-#[cfg(test)]
 fn wildcard_host_match(pattern: &str, text: &str) -> bool {
     wildcard_host_match_bytes(pattern.as_bytes(), text.as_bytes())
 }
 
-#[cfg(test)]
 fn wildcard_host_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
     if pattern.is_empty() {
         return text.is_empty();
@@ -449,8 +456,7 @@ fn wildcard_host_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
 /// Validates that a wildcard pattern is safe against domain-boundary bypasses.
 /// Returns false for patterns like `*.com`, `*`, or `example.com*` that would
 /// match unintended domains.
-#[cfg(test)]
-fn is_safe_wildcard_pattern(pattern: &str) -> bool {
+pub fn is_safe_wildcard_pattern(pattern: &str) -> bool {
     let trimmed = pattern.trim();
     if trimmed.is_empty() {
         return false;
@@ -480,8 +486,7 @@ fn is_safe_wildcard_pattern(pattern: &str) -> bool {
 /// Ensures that a `*.domain` wildcard matches exactly one subdomain level.
 /// `*.example.com` matches `sub.example.com` but NOT `sub.sub.example.com`
 /// nor `evil.example.com.attacker.com`.
-#[cfg(test)]
-fn is_exact_subdomain_wildcard_match(pattern: &str, text: &str) -> bool {
+pub fn is_exact_subdomain_wildcard_match(pattern: &str, text: &str) -> bool {
     if !pattern.starts_with("*.") {
         return true;
     }
@@ -692,9 +697,10 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
 
     use super::{
-        AppState, basic_auth_matches, is_exact_subdomain_wildcard_match, is_safe_wildcard_pattern,
-        origin_allowed, origin_allowed_for_ports, removal_log_message, request_host_allowed, safe_existing_novel_dir,
-        validate_web_tag_name, wildcard_host_match,
+        AppState, basic_auth_matches, host_allowed, is_exact_subdomain_wildcard_match,
+        is_safe_wildcard_pattern, origin_allowed, origin_allowed_for_ports, removal_log_message,
+        request_host_allowed, safe_existing_novel_dir, validate_web_tag_name,
+        wildcard_host_match,
     };
 
     fn sample_record(file_title: &str) -> crate::db::novel_record::NovelRecord {
@@ -749,6 +755,30 @@ mod tests {
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
             allowed_request_hosts: vec!["127.0.0.1".to_string(), "localhost".to_string()],
+            reverse_proxy_mode: false,
+            queue: Arc::new(
+                crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
+            ),
+            restore_prompt_pending: Arc::new(AtomicBool::new(false)),
+            restorable_tasks_available: Arc::new(AtomicBool::new(false)),
+            running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            cancelled_job_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            auto_update_scheduler: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    fn test_state_with_allowed_hosts(extra_hosts: Vec<String>) -> AppState {
+        let queue_dir = test_artifact_dir("host-allowed");
+        let mut push_server = crate::web::push::PushServer::new();
+        push_server.set_accepted_domains(["127.0.0.1", "localhost"]);
+        AppState {
+            port: 8080,
+            ws_port: 8081,
+            push_server: Arc::new(push_server),
+            basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
+            control_token: "control-token".to_string(),
+            allowed_request_hosts: extra_hosts,
             reverse_proxy_mode: false,
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
@@ -928,5 +958,46 @@ mod tests {
             "*.example.com",
             "sub.example.com"
         ));
+    }
+
+    #[test]
+    fn host_allowed_supports_safe_wildcard_patterns() {
+        let state = test_state_with_allowed_hosts(vec![
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+            "*.example.com".to_string(),
+        ]);
+
+        // Exact match still works.
+        assert!(host_allowed("127.0.0.1", &state));
+        assert!(host_allowed("LOCALHOST", &state));
+
+        // Safe subdomain wildcard matches exactly one label.
+        assert!(host_allowed("sub.example.com", &state));
+
+        // Sub-sub domains must not be allowed even if the simple wildcard
+        // engine would otherwise match.
+        assert!(!host_allowed("deep.sub.example.com", &state));
+
+        // Domain boundary bypass must be rejected.
+        assert!(!host_allowed("evil.example.com.attacker.com", &state));
+
+        // Empty / unknown hosts are rejected.
+        assert!(!host_allowed("", &state));
+        assert!(!host_allowed("not-allowed.example.org", &state));
+    }
+
+    #[test]
+    fn host_allowed_ignores_unsafe_wildcard_patterns() {
+        // A pattern that fails `is_safe_wildcard_pattern` should never grant
+        // access, even when present in `allowed_request_hosts`.
+        let state = test_state_with_allowed_hosts(vec![
+            "*.com".to_string(),       // too few labels after `*.`
+            "example.com*".to_string(), // trailing wildcard
+            "*".to_string(),            // bare wildcard
+        ]);
+        assert!(!host_allowed("foo.com", &state));
+        assert!(!host_allowed("example.com", &state));
+        assert!(!host_allowed("attacker.example.com", &state));
     }
 }

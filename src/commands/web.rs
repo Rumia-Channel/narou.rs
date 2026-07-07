@@ -58,6 +58,16 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
             std::process::exit(1);
         }
     };
+    let allowed_request_hosts = match load_http_allowed_request_hosts(
+        &address.host,
+        security_settings.reverse_proxy_mode,
+    ) {
+        Ok(hosts) => hosts,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
     let mut push_server = web::push::PushServer::new();
     let domains =
         match load_ws_accepted_domains(&address.host, security_settings.reverse_proxy_mode) {
@@ -106,7 +116,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         push_server: push_server.clone(),
         basic_auth_header: security_settings.basic_auth_header,
         control_token: control_token.clone(),
-        allowed_request_hosts: narou_rs::web::default_allowed_request_hosts(&address.host),
+        allowed_request_hosts,
         reverse_proxy_mode: security_settings.reverse_proxy_mode,
         queue: queue.clone(),
         restore_prompt_pending: restore_prompt_pending.clone(),
@@ -560,6 +570,55 @@ fn load_ws_accepted_domains(host: &str, reverse_proxy_mode: bool) -> Result<Vec<
     Ok(accepted_domains)
 }
 
+/// Parses the user-supplied `server-add-accepted-hosts` value (comma
+/// separated) into a vector of trimmed, non-empty host entries. Unsafe
+/// wildcard patterns (bare `*`, `*.com`, trailing wildcards, etc.) are
+/// rejected and skipped with a warning.
+fn parse_extra_allowed_hosts(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| {
+            if s.contains('*') && !narou_rs::web::is_safe_wildcard_pattern(s) {
+                tracing::warn!(
+                    "server-add-accepted-hosts: '{}' は安全なワイルドカードパターンではないため無視します",
+                    s
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Loads the HTTP `Host` header allow-list: defaults from
+/// `default_allowed_request_hosts` plus the user-supplied
+/// `server-add-accepted-hosts` (comma-separated). Wildcard patterns such as
+/// `*.example.com` are kept verbatim here and validated at request time by
+/// `narou_rs::web::is_safe_wildcard_pattern`. Unsafe patterns are dropped with
+/// a warning log so the server still starts.
+fn load_http_allowed_request_hosts(
+    host: &str,
+    reverse_proxy_mode: bool,
+) -> Result<Vec<String>, String> {
+    if reverse_proxy_mode {
+        return Ok(Vec::new());
+    }
+    let mut allowed = narou_rs::web::default_allowed_request_hosts(host);
+    let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
+    let global_setting: HashMap<String, Value> = inventory
+        .load("global_setting", InventoryScope::Global)
+        .unwrap_or_default();
+    if let Some(extra) = yaml_string(global_setting.get("server-add-accepted-hosts")) {
+        allowed.extend(parse_extra_allowed_hosts(&extra));
+    }
+    allowed.sort();
+    allowed.dedup();
+    Ok(allowed)
+}
+
 fn generate_control_token() -> String {
     let mut token = [0u8; 16];
     getrandom::fill(&mut token).expect("failed to generate control token");
@@ -712,8 +771,9 @@ mod tests {
     use super::{
         basic_auth_header_from_settings, control_request_host, default_ws_accepted_domains,
         display_host, encode_base64, generate_control_token, is_wildcard_bind_host,
-        normalize_bind_host, require_basic_auth_for_external_bind_from_settings,
-        requires_basic_auth_for_bind, reverse_proxy_mode_from_settings,
+        normalize_bind_host, parse_extra_allowed_hosts,
+        require_basic_auth_for_external_bind_from_settings, requires_basic_auth_for_bind,
+        reverse_proxy_mode_from_settings,
     };
 
     #[test]
@@ -815,5 +875,44 @@ mod tests {
         assert_eq!(control_request_host("0.0.0.0"), "127.0.0.1");
         assert_eq!(control_request_host("::"), "::1");
         assert_eq!(control_request_host("127.0.0.1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn parse_extra_allowed_hosts_splits_and_trims() {
+        let parsed = parse_extra_allowed_hosts("narou.example.com, *.lan.example ,,  , foo");
+        assert_eq!(
+            parsed,
+            vec![
+                "narou.example.com".to_string(),
+                "*.lan.example".to_string(),
+                "foo".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_extra_allowed_hosts_drops_empty_input() {
+        assert!(parse_extra_allowed_hosts("").is_empty());
+        assert!(parse_extra_allowed_hosts("  , , ").is_empty());
+    }
+
+    #[test]
+    fn parse_extra_allowed_hosts_drops_unsafe_wildcards() {
+        // Unsafe patterns: bare *, *.com (too few labels), trailing wildcard, mid wildcard
+        let parsed =
+            parse_extra_allowed_hosts("*, *.com, *.example.com, example.com*, sub*.example.com");
+        assert_eq!(parsed, vec!["*.example.com".to_string()]);
+    }
+
+    #[test]
+    fn parse_extra_allowed_hosts_preserves_safe_wildcard() {
+        let parsed = parse_extra_allowed_hosts("*.example.com, foo.bar.example.com");
+        assert_eq!(
+            parsed,
+            vec![
+                "*.example.com".to_string(),
+                "foo.bar.example.com".to_string(),
+            ]
+        );
     }
 }

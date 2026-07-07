@@ -609,6 +609,17 @@ API: POST `/api/tag/change_color` → `tag_colors.yaml` に永続化
 | 個別小説設定ページ | `/novels/:id/setting` | GET/POST `/api/settings/{id}` | ✅ |
 | デバイス一覧 | あり | GET `/api/devices` | ✅ |
 
+### 8.1 リバースプロキシ / 追加ホスト
+
+外部公開や別ドメインからの `Host` ヘッダを許可するために、以下の設定キーを併用します。`s` は `setting` サブコマンドの短縮です（`web` の短縮ではありません）。
+
+- `server-bind` — LAN 公開時は `0.0.0.0` か LAN IP を指定（既定 `127.0.0.1`）。
+- `server-reverse-proxy.enable` — nginx 等の前段 proxy が付与する外側 Host / Origin を許可（既定 `false`）。`true` の間は固定許可リストではなく外側 Host の構文妥当性だけで判定する。
+- `server-basic-auth.require-for-external-bind` — `0.0.0.0` など外部 bind 時に Basic 認証必須にする narou.rs 独自ガード（既定 `true`）。
+- `server-add-accepted-hosts` — HTTP `Host` ヘッダに追加で許可するホストのリスト（カンマ区切り）。`*.example.com` のような安全なワイルドカードに対応。unsafe なパターン（`*` 単独、`*.com`、末尾ワイルドなど）は警告ログを出して無視。既定の許可集合は bind host + loopback + 自ホスト名のまま据え置き、追加ホストだけを opt-in で広げる。
+
+Web UI 設定画面に出る関連項目: `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `server-add-accepted-hosts` / `over18`。`server-reverse-proxy.enable` と `server-basic-auth.require-for-external-bind` は hidden のため CLI からのみ変更します。
+
 ---
 
 ## 9. JP/EN 言語切替

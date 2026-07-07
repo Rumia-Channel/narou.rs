@@ -548,6 +548,7 @@ narou setting name         # 読み取り
 - global `server-basic-auth.*` が有効な場合は HTTP/WS の両ルータで Basic 認証を要求する
 - hidden global `server-basic-auth.require-for-external-bind` は narou.rs 独自の外部公開ガード。既定値 `true` の間は `0.0.0.0` / 公開bindで Basic 認証未設定の起動を拒否し、`false` にするとこのガードだけ解除する（Web UI には表示しない）
 - hidden global `server-reverse-proxy.enable` は narou.rs 独自の reverse proxy モード。既定値 `false` で、`true` にすると nginx 等の前段 proxy が付ける外側の Host / Origin を受け入れ、same-origin の `/ws` 接続を使う（Web UI には表示しない）
+- global `server-add-accepted-hosts` は HTTP の `Host` ヘッダに追加で許可するホストのリスト（カンマ区切り）。`*.example.com` 形式の安全なワイルドカードに対応し、unsafe なパターン（`*` 単独、`*.com`、末尾ワイルドなど）は警告ログを出して無視。既定の許可集合（bind host + loopback + 自ホスト名）はそのまま残り、追加ホストだけを opt-in で広げる
 - hidden global `server-max-targets-per-request` は WEB UI が 1 リクエストで送れる小説 ID の最大数。既定値 `100000`、未設定または 0 以下は既定にフォールバック（Web UI には表示しない）。蔵書数が極端に多い環境で `narou setting --global server-max-targets-per-request=200000` のように上書きできる
 - API の凍結/解凍操作と一覧上の `frozen` 判定は CLI と同じ `.narou/freeze.yaml` を優先し、`frozen` タグは補助的に扱う
 - queue worker が `.narou/queue.yaml` 永続キューを読み書きし、download / update / auto_update / convert / send / backup / mail の queued job を別プロセスまたは worker 内処理で実行する。Ruby版同様 `pending` / `running` を分けて保持し、legacy `cmd` / `args` / `meta` / `status` / `created_at` / `started_at` を維持したまま復元できる。`concurrency` 有効時は外部通信あり(download/update/auto_update)とその他(convert/send/backup/mail)を別 lane で並列実行し、無効時は全 job を投入順に逐次実行する
@@ -560,7 +561,7 @@ narou setting name         # 読み取り
 - Web UI からのサーバ再起動では replacement process に `--no-browser` を付与し、hidden 起動中は `--hide-console` も維持したまま再起動待機ページから同じタブで元ページへ戻る
 - Windows の `narou web --hide-console` は GUI subsystem で起動し、通常 CLI 実行時は親コンソールへ再接続、hidden 実行時はタスクトレイの右クリックメニューから `終了` / `再起動` を呼べる。Web worker / auto-update / 即時 API 実行が起動する child process も hidden 状態を引き継ぎ、空のコンソールを開かない
 - 即時実行の `diff` / `folder` / `reboot` API は child command の失敗や replacement process 起動失敗を success=false として返し、false success を出さない
-- Web 設定画面は Ruby版同様、`tab` がある設定を `invisible` 指定でも表示する。`webui.theme` / `webui.table.reload-timing` / `webui.new-tag-color` / `webui.debug-mode` / `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `over18` も設定画面に出る
+- Web 設定画面は Ruby版同様、`tab` がある設定を `invisible` 指定でも表示する。`webui.theme` / `webui.table.reload-timing` / `webui.new-tag-color` / `webui.debug-mode` / `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `server-add-accepted-hosts` / `over18` も設定画面に出る
 - `webui.theme` / `webui.table.reload-timing` / `webui.performance-mode` / `webui.new-tag-color` / `webui.debug-mode` 保存時は、開いている Web UI に設定再読み込みイベントを送り、テーマメニューの変更も `webui.theme` へ保存する
 - `webui.debug-mode` が ON のときは、Web worker が失敗 child process の直近 stdout/stderr を要約して `queue_failed` イベントに載せ、Web UI 通知とコンソールに詳細エラーを出す。OFF のときは従来どおり簡潔な失敗通知だけにする
 - `/novels/{id}/download` は生成済み ebook を全量メモリへ読み込まず、`tokio::fs::File` から 64KiB チャンクでストリーミングする。大きい EPUB でも `Content-Length` / `Content-Disposition` を付けたまま返す
