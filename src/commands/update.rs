@@ -1436,11 +1436,7 @@ fn classify_narou_api_chunk(
         };
 
         seen_ncodes.insert(entry.ncode.to_ascii_lowercase());
-        if entry.title.trim().is_empty() {
-            fallback_ids.push(*id);
-        } else {
-            updates.push((*id, entry.clone()));
-        }
+        updates.push((*id, entry.clone()));
     }
 
     for (id, ncode) in chunk {
@@ -2047,7 +2043,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_narou_api_chunk_routes_blank_or_missing_titles_to_html_fallback() {
+    fn classify_narou_api_chunk_accepts_gl_entries_without_title() {
         let chunk = vec![(1, "n0001aa".to_string()), (2, "n0002aa".to_string())];
         let entries = vec![narou_rs::downloader::NarouApiEntry {
             ncode: "n0001aa".to_string(),
@@ -2065,8 +2061,9 @@ mod tests {
 
         let (updates, fallback_ids) = classify_narou_api_chunk(&chunk, &entries);
 
-        assert!(updates.is_empty());
-        assert_eq!(fallback_ids, vec![1, 2]);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, 1);
+        assert_eq!(fallback_ids, vec![2]);
     }
 
     /// The partition is the heart of the parallel dispatch:

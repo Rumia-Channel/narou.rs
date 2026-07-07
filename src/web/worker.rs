@@ -253,46 +253,6 @@ fn start_queue_worker_for_lane(
                     }
                 }
             }
-            match result.outcome {
-                JobOutcome::Completed => {
-                    let _ = queue_result;
-                    push_server.broadcast_event("queue_complete", &job.id);
-                }
-                JobOutcome::Partial => {
-                    let _ = queue_result;
-                    let mut data = serde_json::json!({ "job_id": job.id });
-                    if let Some(exit_code) = result.exit_code {
-                        data["exit_code"] = serde_json::json!(exit_code);
-                    }
-                    push_server.broadcast_raw(&serde_json::json!({
-                        "type": "queue_partial",
-                        "data": data,
-                    }));
-                }
-                JobOutcome::Cancelled => {
-                    let _ = queue_result;
-                    push_server.broadcast_raw(&serde_json::json!({
-                        "type": "queue_cancelled",
-                        "data": { "job_id": job.id },
-                    }));
-                }
-                JobOutcome::Failed => {
-                    let _ = queue_result;
-                    let mut data = serde_json::json!({
-                        "job_id": job.id,
-                        "reason": failure_reason(&result),
-                    });
-                    if load_local_setting_bool("webui.debug-mode")
-                        && let Some(detail) = result.detail.as_deref()
-                    {
-                        data["detail"] = serde_json::Value::String(detail.to_string());
-                    }
-                    push_server.broadcast_raw(&serde_json::json!({
-                        "type": "queue_failed",
-                        "data": data,
-                    }));
-                }
-            }
             clear_progress_for_job(&push_server, &job.id);
             if should_reload_table_after_job(queue.as_ref(), &running_jobs) {
                 push_server.broadcast_event("table.reload", "");

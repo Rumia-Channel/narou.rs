@@ -14,6 +14,7 @@ use crate::error::{NarouError, Result};
 
 const MAX_PENDING_JOBS: usize = 10_000;
 const MAX_JOB_TARGET_CHARS: usize = 16 * 1024;
+const DEFAULT_MAX_RETRIES: u32 = 3;
 pub const WEBUI_MESSAGE_TYPE_META_KEY: &str = "webui_message_type";
 pub const WEBUI_MESSAGE_TEXT_META_KEY: &str = "webui_message_text";
 pub const WEBUI_UPDATE_START_MESSAGE_TYPE: &str = "update_start";
@@ -1084,7 +1085,7 @@ fn legacy_task_to_stored_job(task: LegacyQueueTask, running: bool) -> Option<Sto
         target,
         created_at,
         retry_count: 0,
-        max_retries: 3,
+        max_retries: configured_max_retries(),
         available_at: None,
     };
     let mut stored = StoredQueueJob { job, legacy: task };
@@ -1150,7 +1151,7 @@ fn build_stored_job(
         target: target.clone(),
         created_at,
         retry_count: 0,
-        max_retries: 3,
+        max_retries: configured_max_retries(),
         available_at: None,
     };
     let mut stored = StoredQueueJob {
@@ -1159,6 +1160,23 @@ fn build_stored_job(
     };
     stored.mark_pending();
     stored
+}
+
+fn configured_max_retries() -> u32 {
+    crate::compat::load_local_setting_value("queue.max-retries")
+        .and_then(parse_max_retries_value)
+        .unwrap_or(DEFAULT_MAX_RETRIES)
+}
+
+fn parse_max_retries_value(value: Value) -> Option<u32> {
+    let parsed = match value {
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
+        Value::String(raw) => raw.trim().parse::<i64>().ok(),
+        _ => None,
+    }?;
+    Some(parsed.clamp(0, u32::MAX as i64) as u32)
 }
 
 fn build_legacy_task(
@@ -1483,6 +1501,26 @@ mod tests {
         let remaining = queue.get_pending_tasks();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, blocked);
+    }
+
+    #[test]
+    fn push_uses_queue_max_retries_local_setting() {
+        let temp = tempfile::tempdir().unwrap();
+        let narou_dir = temp.path().join(".narou");
+        std::fs::create_dir_all(&narou_dir).unwrap();
+        std::fs::write(narou_dir.join("local_setting.yaml"), "queue.max-retries: 0\n").unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        let queue = PersistentQueue::new(&narou_dir.join("queue.yaml")).unwrap();
+        let id = queue.push(JobType::Download, "1").unwrap();
+        let pending = queue.get_pending_tasks();
+
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].max_retries, 0);
+
+        *crate::db::DATABASE.lock() = None;
     }
 
     #[test]

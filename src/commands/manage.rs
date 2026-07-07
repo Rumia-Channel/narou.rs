@@ -187,7 +187,7 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
             // 明示的な --sort-by が指定された場合: db::sort_by の型付き比較を使う。
             db.sort_by(key, false).into_iter().cloned().collect::<Vec<_>>()
         } else if options.latest {
-            db.sort_by(options.view_date_type(), false)
+            db.sort_by(options.view_date_type(), true)
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>()

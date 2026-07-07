@@ -1337,7 +1337,6 @@ mod tests {
         // 親のセッションが畳まれるシナリオの厳密再現は cgroup 単位など
         // が必要になるが、ここでは「sid が分離された」事実と「子プロセスが
         // 独立した lifecycle を持つ」事実を検証する。
-        use std::io::Write;
         use std::process::Stdio;
         use std::time::Duration;
 
@@ -1347,23 +1346,27 @@ mod tests {
 
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
-            .arg(format!(
+            .arg(
                 r#"
                 set -e
-                echo $$ > {pidfile}
-                echo hello > {marker}
-                exit 0
+                echo $$ > "$PIDFILE"
+                echo hello > "$MARKER"
+                sleep 2
                 "#,
-                pidfile = pidfile.display(),
-                marker = marker.display(),
-            ))
+            )
+            .env("PIDFILE", &pidfile)
+            .env("MARKER", &marker)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         configure_process_group_command(&mut cmd);
 
-        let status = cmd.status().expect("spawn child");
-        assert!(status.success(), "child failed: {status:?}");
+        let mut child = cmd.spawn().expect("spawn child");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         let pid_str = std::fs::read_to_string(&pidfile).expect("pidfile");
         let pid: i32 = pid_str.trim().parse().expect("parse pid");
@@ -1372,14 +1375,15 @@ mod tests {
         let marker_content = std::fs::read_to_string(&marker).expect("marker");
         assert_eq!(marker_content.trim(), "hello");
 
-        // setsid 後は同じセッションではないので、kill -0 で生存確認が
-        // できる。プロセスは既に終了しているが、 zombie の間も PID は
-        // 生存している。
-        std::thread::sleep(Duration::from_millis(50));
+        // setsid 後は親とは別セッションで実行中のため、wait 前に
+        // kill -0 で生存確認できる。
         let alive = unsafe { libc::kill(pid, 0) };
         assert_eq!(
             alive, 0,
-            "setsid'd child pid should still be observable to parent via kill -0 (even as zombie)"
+            "setsid'd child pid should be observable to parent via kill -0 while running"
         );
+
+        let status = child.wait().expect("wait child");
+        assert!(status.success(), "child failed: {status:?}");
     }
 }

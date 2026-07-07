@@ -1641,6 +1641,7 @@ mod tests {
 
         let saved_log = std::fs::read_to_string(root.join("調査ログ.txt")).unwrap();
         assert!(saved_log.contains("改行直後の見出し付与は有効になっていません"));
+        assert!(!crate::illustration_store::cache_path(&root).exists());
 
         let _ = std::fs::remove_dir_all(root);
     }

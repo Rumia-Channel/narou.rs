@@ -62,7 +62,13 @@ impl IllustrationStore {
                 store
             }
             Ok(_) => Self::legacy_default(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::legacy_default(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if has_legacy_illustration_inputs(archive_path) {
+                    Self::legacy_default()
+                } else {
+                    return Ok(Self::default());
+                }
+            }
             Err(err) => return Err(err.into()),
         };
         let _ = store.migrate_mitemin_id_filenames(archive_path);
@@ -369,6 +375,10 @@ impl IllustrationStore {
 
 pub fn cache_path(archive_path: &Path) -> std::path::PathBuf {
     archive_path.join(CACHE_FILE_NAME)
+}
+
+fn has_legacy_illustration_inputs(archive_path: &Path) -> bool {
+    archive_path.join("挿絵").is_dir() || archive_path.join(crate::downloader::RAW_DATA_DIR).is_dir()
 }
 
 /// Find files in `挿絵/` not reachable from the cache or `raw/*.html` references.
@@ -1255,6 +1265,16 @@ mod tests {
         assert!(illust_dir.join("i422674.jpg").is_file());
         assert_eq!(store.filename_for_mitemin_id("i422674"), Some("i422674.jpg"));
         assert_eq!(store.hash_for_mitemin_id("i422674"), Some(hash.as_str()));
+    }
+
+    #[test]
+    fn load_without_cache_or_illustration_inputs_does_not_create_cache_file() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let store = IllustrationStore::load(temp.path()).unwrap();
+
+        assert_eq!(store.version, STORE_VERSION);
+        assert!(!cache_path(temp.path()).exists());
     }
 
     #[test]
