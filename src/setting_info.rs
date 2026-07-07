@@ -49,6 +49,9 @@ pub fn default_local_setting_value(name: &str) -> Option<serde_yaml::Value> {
         "queue.retry-backoff" => {
             Some(serde_yaml::Value::String("1m,5m,15m".to_string()))
         }
+        "update.max-parallel-domains" => {
+            Some(serde_yaml::Value::Number(serde_yaml::Number::from(4)))
+        }
         _ => None,
     }
 }
@@ -93,6 +96,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "update.sort-by"
         | "update.auto-schedule.enable"
         | "update.auto-schedule"
+        | "update.max-parallel-domains"
         | "convert.copy-to"
         | "convert.copy-zip-to"
         | "convert.copy-to-grouping"
@@ -561,6 +565,22 @@ mod tests {
             Some("1m,5m,15m"),
         );
     }
+
+    #[test]
+    fn update_max_parallel_domains_has_general_tab_and_default() {
+        assert_eq!(tab_for_setting("update.max-parallel-domains"), Some("general"));
+
+        let vars = setting_variables();
+        let info = vars
+            .get("update.max-parallel-domains")
+            .expect("update.max-parallel-domains must be registered as a local var");
+        assert!(matches!(info.var_type, VarType::Integer));
+        assert!(!info.invisible);
+
+        let default = default_local_setting_value("update.max-parallel-domains")
+            .expect("update.max-parallel-domains default");
+        assert_eq!(default.as_i64(), Some(4));
+    }
 }
 
 /// Local setting variable metadata
@@ -706,6 +726,13 @@ pub fn setting_variables() -> SettingVariables {
             vis(
                 VarType::String,
                 "自動アップデートする時間を指定する。カンマ区切りで複数指定可能。\n      書式：HHMM (例: 0800,1200,1800 = 8時、12時、18時)",
+            ),
+        ),
+        (
+            "update.max-parallel-domains",
+            vis(
+                VarType::Integer,
+                "アップデート時にドメインごとにダウンロードワーカーを並列化する数。同一ドメイン内は常に直列で処理されるため対サイト礼儀は崩れない。1で従来の逐次動作。デフォルトは 4",
             ),
         ),
         (

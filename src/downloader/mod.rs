@@ -38,6 +38,7 @@ use self::persistence::{
 };
 use self::section::{SectionCache, download_section};
 use self::site_setting::SiteSetting;
+use crate::progress::safe_println as safe_println_fn;
 use self::toc::{create_short_story_subtitles, fetch_toc, parse_subtitles, parse_subtitles_multipage};
 use self::security::is_safe_public_url;
 use self::util::{
@@ -919,11 +920,13 @@ impl Downloader {
                         continue;
                     }
                     let resolved = build_section_url(setting, toc_url, raw_url);
-                    let url = resolved.as_str();
-                    if !is_safe_public_url(url) {
-                        eprintln!("WARN: skipping unsafe illustration URL: {url}");
-                        continue;
-                    }
+                        let url = resolved.as_str();
+                        if !is_safe_public_url(url) {
+                            crate::progress::safe_stderr_println(&format!(
+                                "WARN: skipping unsafe illustration URL: {url}"
+                            ));
+                            continue;
+                        }
 
                     if illustration_store
                         .cached_filename_for_source(url, illust_dir)
@@ -945,11 +948,15 @@ impl Downloader {
                             if let Err(err) =
                                 illustration_store.store_bytes(illust_dir, url, &bytes, ext)
                             {
-                                eprintln!("WARN: failed to save illustration {url}: {err}");
+                                crate::progress::safe_stderr_println(&format!(
+                                    "WARN: failed to save illustration {url}: {err}"
+                                ));
                             }
                         }
                         Err(err) => {
-                            eprintln!("WARN: failed to download illustration {url}: {err}");
+                            crate::progress::safe_stderr_println(&format!(
+                                "WARN: failed to download illustration {url}: {err}"
+                            ));
                         }
                     }
                 }
@@ -1062,7 +1069,7 @@ impl Downloader {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
                 let id = existing_id.unwrap();
-                println!("小説が削除されているか非公開な可能性があります");
+                safe_println_fn("小説が削除されているか非公開な可能性があります");
                 let _ = crate::compat::mark_not_found_and_freeze(id);
                 let (title, author, novel_dir) = crate::db::with_database(|db| {
                     let record = db.get(id).cloned();
@@ -1342,10 +1349,10 @@ impl Downloader {
 
             let download_time = if needs_download {
                 if !started_download {
-                    println!(
-                        "{}",
-                        bold_colored(&format!("ID:{}　{} のDL開始", display_id, title), "green")
-                    );
+                    safe_println_fn(&bold_colored(
+                        &format!("ID:{}　{} のDL開始", display_id, title),
+                        "green",
+                    ));
                     started_download = true;
                 }
                 if let Some(ref p) = self.progress {
@@ -1358,11 +1365,11 @@ impl Downloader {
                 }
 
                 if !subtitle.chapter.is_empty() && subtitle.chapter != last_chapter {
-                    println!("{}", subtitle.chapter);
+                    safe_println_fn(&subtitle.chapter);
                     last_chapter = subtitle.chapter.clone();
                 }
                 if !subtitle.subchapter.is_empty() && subtitle.subchapter != last_subchapter {
-                    println!("{}", subtitle.subchapter);
+                    safe_println_fn(&subtitle.subchapter);
                     last_subchapter = subtitle.subchapter.clone();
                 }
 
@@ -1454,7 +1461,7 @@ impl Downloader {
                         line.push_str(" (更新あり)");
                     }
                 }
-                println!("{}", line);
+                safe_println_fn(&line);
                 if let Some(ref p) = self.progress {
                     p.inc(1);
                 }

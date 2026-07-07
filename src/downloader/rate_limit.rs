@@ -274,4 +274,94 @@ mod tests {
         sleeping_worker.join().expect("worker should finish");
         reset_state();
     }
+
+    /// Mirrors the parallel-update scenario: several workers process
+    /// the same host while other workers process unrelated hosts. We
+    /// assert that the unrelated-host workers do not have to wait
+    /// while a same-host burst is being drained. This is the key
+    /// invariant that lets `update.max-parallel-domains > 1` honour
+    /// the per-domain etiquette guarantee from the task spec.
+    #[test]
+    fn parallel_workers_on_different_domains_do_not_block() {
+        let _guard = TEST_MUTEX.lock();
+        reset_state();
+
+        // Slow down same-host requests so the parallel worker has
+        // a meaningful opportunity to outlive the wait it ignored.
+        let limiter = Arc::new(RateLimiter::from_values(0.12, 0));
+        let started = Instant::now();
+        limiter.wait_for_host("alpha.example");
+        let (alpha_waited, beta_waited, gamma_waited) = {
+            let limiter_alpha = Arc::clone(&limiter);
+            let limiter_beta = Arc::clone(&limiter);
+            let limiter_gamma = Arc::clone(&limiter);
+            let barrier = Arc::new(Barrier::new(4));
+            let barrier_a = Arc::clone(&barrier);
+            let barrier_b = Arc::clone(&barrier);
+            let barrier_c = Arc::clone(&barrier);
+            let barrier_main = Arc::clone(&barrier);
+
+            let alpha_handle = thread::spawn(move || {
+                barrier_a.wait();
+                let local = Instant::now();
+                limiter_alpha.wait_for_host("alpha.example");
+                local.elapsed()
+            });
+            let beta_handle = thread::spawn(move || {
+                barrier_b.wait();
+                let local = Instant::now();
+                limiter_beta.wait_for_host("beta.example");
+                local.elapsed()
+            });
+            let gamma_handle = thread::spawn(move || {
+                barrier_c.wait();
+                let local = Instant::now();
+                limiter_gamma.wait_for_host("gamma.example");
+                local.elapsed()
+            });
+
+            barrier_main.wait();
+            // Give the other threads a moment to settle.
+            thread::sleep(Duration::from_millis(5));
+            // Take the priming-host slot again from the main thread
+            // so another same-host caller has to wait for it.
+            limiter.wait_for_host("delta.example");
+
+            (
+                alpha_handle.join().expect("alpha"),
+                beta_handle.join().expect("beta"),
+                gamma_handle.join().expect("gamma"),
+            )
+        };
+
+        // Same-host (alpha) worker had to wait for the slot that was
+        // already taken by the priming call at the top of the test.
+        assert!(
+            alpha_waited + Duration::from_millis(20) >= Duration::from_millis(100),
+            "alpha (same host) should wait at least ~120ms, got {:?}",
+            alpha_waited
+        );
+        // Different-host (beta/gamma) workers must proceed without
+        // waiting on alpha's slot. Even on a heavily loaded CI box a
+        // sub-80ms gate is comfortably wide enough.
+        assert!(
+            beta_waited < Duration::from_millis(80),
+            "beta (different host) blocked unexpectedly: {:?}",
+            beta_waited
+        );
+        assert!(
+            gamma_waited < Duration::from_millis(80),
+            "gamma (different host) blocked unexpectedly: {:?}",
+            gamma_waited
+        );
+
+        // Total runtime should be dominated by alpha's queued wait,
+        // not by stacking all the cross-domain traffic behind it.
+        let total = started.elapsed();
+        assert!(
+            total < Duration::from_millis(400),
+            "overall took too long: {total:?}"
+        );
+        reset_state();
+    }
 }

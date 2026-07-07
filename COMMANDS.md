@@ -204,6 +204,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - ソートキーバリデーション（不正キーでエラー+終了コード127）
 - `setting update.sort-by` の select 値を Ruby版 `Narou::UPDATE_SORT_KEYS` と同期済み
 - 小説間インターバル（Ruby版 `Interval` クラス互換）
+- `update.max-parallel-domains` 設定対応（既定4）。対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列にダウンロードする。同一ドメイン内は常に直列のまま処理されるため対サイト礼儀は崩れない。1で従来通りの逐次動作、フォース指定・ウェブモード・ドメインが1種類しかない時は自動的に逐次処理にフォールバック
 - 全件更新時の凍結スキップ、個別指定時の凍結メッセージ
 - 終了コード: エラー数（最大127）、中断時126
 - Ctrl+C 割り込み時はフラグを検知して `アップデートを中断しました` を表示し、終了コード126で終了
@@ -334,6 +335,7 @@ narou setting name         # 読み取り
 | `update.strong` | boolean | 同日更新時の内容チェック |
 | `update.convert-only-new-arrival` | boolean | 新着時のみ変換 |
 | `update.sort-by` | select | 更新順ソートキー |
+| `update.max-parallel-domains` | integer | ドメイン別並列DLのワーカー数 (既定4、1で逐次) |
 | `update.auto-schedule.enable` | boolean | 自動更新スケジューラ有効 |
 | `update.auto-schedule` | string | スケジュール時刻 (HHMM, カンマ区切り) |
 | `convert.copy-to` | directory | 変換ファイルのコピー先 |
