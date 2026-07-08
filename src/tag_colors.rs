@@ -123,6 +123,22 @@ pub fn save_tag_colors(inventory: &Inventory, tag_colors: &TagColors) -> Result<
     Ok(())
 }
 
+/// Assigns colors to any `tags` not already present in `tag_colors`, using the
+/// user-configured default color (falling back to rotation through
+/// `TAG_COLOR_ORDER` when unset or invalid).
+///
+/// # Warning: do not call while holding the `DATABASE` lock
+///
+/// This function calls [`configured_new_tag_color`], which reads settings via
+/// `crate::db::with_database`. `db::DATABASE` is a `parking_lot::Mutex`,
+/// which is NOT reentrant, so calling this function from inside a
+/// `with_database` / `with_database_mut` closure will deadlock the current
+/// thread (and, since the lock is never released, every subsequent
+/// operation that touches the database).
+///
+/// If you already hold the database lock, fetch the color *before* entering
+/// the closure with `let color = configured_new_tag_color();` and call
+/// [`ensure_tag_colors_with_default_color`] with `color.as_deref()` instead.
 pub fn ensure_tag_colors<'a>(
     tag_colors: &mut TagColors,
     tags: impl IntoIterator<Item = &'a str>,
@@ -290,6 +306,44 @@ mod tests {
         tag_colors.remove("fav");
         assert!(!tag_colors.colors.contains_key("fav"));
         assert!(!tag_colors.order.iter().any(|tag| tag == "fav"));
+    }
+
+    #[test]
+    fn ensure_tag_colors_with_default_color_inside_with_database_does_not_deadlock() {
+        // Regression test for a576208 / "Add configurable new tag color":
+        // `configured_new_tag_color` reads settings through
+        // `crate::db::with_database`, which uses a non-reentrant
+        // `parking_lot::Mutex`. Calling `ensure_tag_colors` (which internally
+        // calls `configured_new_tag_color`) from inside a `with_database` /
+        // `with_database_mut` closure deadlocks the current thread forever.
+        // Web handlers and `commands::manage` now fetch the configured color
+        // *before* entering the closure and pass it to
+        // `ensure_tag_colors_with_default_color` instead. This test mirrors
+        // that pattern and would hang (rather than fail cleanly) if that
+        // invariant were ever broken again.
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        fs::write(
+            temp.path().join(".narou").join("local_setting.yaml"),
+            "webui.new-tag-color: white\n",
+        )
+        .unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        let new_tag_color = configured_new_tag_color();
+        let result = crate::db::with_database(|_db| {
+            let mut tag_colors = TagColors::default();
+            ensure_tag_colors_with_default_color(&mut tag_colors, ["fresh"], new_tag_color.as_deref());
+            Ok(tag_colors.color_for("fresh").map(|color| color.to_string()))
+        })
+        .unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+
+        assert_eq!(result.as_deref(), Some("white"));
     }
 
     #[test]

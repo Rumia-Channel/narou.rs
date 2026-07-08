@@ -358,6 +358,7 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         })
         .collect::<Vec<_>>();
 
+    let new_tag_color = tag_colors::configured_new_tag_color();
     let outputs = match db::with_database_mut(|db| {
         let mut outputs = Vec::new();
         let mut auto_color_changed = false;
@@ -400,9 +401,10 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
             }
 
             if !updated.tags.is_empty() {
-                auto_color_changed |= tag_colors::ensure_tag_colors(
+                auto_color_changed |= tag_colors::ensure_tag_colors_with_default_color(
                     &mut tag_colors,
                     updated.tags.iter().map(String::as_str),
+                    new_tag_color.as_deref(),
                 );
                 outputs.push(TagOutput::Current(updated.tags.clone()));
             }
