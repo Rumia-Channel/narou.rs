@@ -47,6 +47,16 @@ async function refreshListAndTags() {
   await refreshTags();
 }
 
+function isQueueModalOpen() {
+  return Boolean(El.queueModal && !El.queueModal.classList.contains('hide'));
+}
+
+function refreshQueueDetailedIfOpen() {
+  if (isQueueModalOpen()) {
+    void refreshQueueDetailed();
+  }
+}
+
 async function init() {
   initElements();
   initDropdowns();
@@ -97,6 +107,9 @@ async function init() {
   setInterval(async () => {
     await refreshListWithUiState();
     await refreshQueue();
+    if (isQueueModalOpen()) {
+      await refreshQueueDetailed();
+    }
   }, interval);
 }
 
@@ -223,6 +236,7 @@ function handleWsMessage(msg) {
     case 'queue':
     case 'notification.queue':
       refreshQueue();
+      refreshQueueDetailedIfOpen();
       break;
     case 'refresh':
     case 'list_updated':
@@ -248,13 +262,20 @@ function handleWsMessage(msg) {
       break;
     case 'queue_start':
       refreshQueue();
+      refreshQueueDetailedIfOpen();
       break;
     case 'queue_complete':
       refreshQueue();
+      refreshQueueDetailedIfOpen();
       break;
     case 'queue_failed':
       refreshQueue();
+      refreshQueueDetailedIfOpen();
       notifyQueueFailure(msg.data);
+      break;
+    case 'queue_retry':
+      refreshQueue();
+      refreshQueueDetailedIfOpen();
       break;
     case 'queue_partial':
     case 'queue.partial':
