@@ -251,7 +251,7 @@ sample/
 ### ダウンロード互換性
 - なろう (n8858hb, 24セクション) DL完走確認済み
 - カクヨム (ID=2, 294セクション) DL完走確認済み
-- syosetu.org（ハーメルン）: UAランダム化、HTTP/1.1/Cookie/圧縮/curl fallback による403回避対応済み。フルDL未検証
+- syosetu.org（ハーメルン）: UAランダム化、HTTP/1.1/Cookie/圧縮/curl fallback による403回避対応済み。R18 分離ドメイン h.syosetu.org も同一サイトとして対応（412369=44セクション、405366=5セクションで h あり/なし双方向の DL・重複防止を実機確認済み）
 - Arcadia: `href` の `&amp;` デコード修正により本文取得修正済み
 
 ### YAML駆動サイト定義

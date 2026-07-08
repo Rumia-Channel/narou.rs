@@ -158,19 +158,31 @@ impl HttpFetcher {
             }
 
             let response = request.send()?;
-            if response.status().is_redirection() {
+            let status = response.status();
+            if status.is_redirection() {
                 let Some(location) = response.headers().get(LOCATION) else {
                     return Ok(current.to_string());
                 };
                 let location = location
                     .to_str()
-                    .map_err(|e| io_error(format!("invalid redirect location: {e}")))?;
-                let next = current.join(location).map_err(|e| io_error(e.to_string()))?;
-                if next.host_str() != current.host_str() {
-                    current_cookie = None;
-                }
-                current = next;
+                    .map_err(|e| io_error(format!("invalid redirect location: {e}")))?
+                    .to_string();
+                self.advance_redirect(&mut current, &mut current_cookie, &location)?;
                 continue;
+            }
+            if status.is_client_error() || status.is_server_error() {
+                // CDN (e.g. Cloudflare) may challenge this HTTP client while
+                // letting curl through, hiding the origin's real redirect.
+                // Probe the same hop via libcurl so redirect chains can still
+                // be resolved; on a non-redirect probe result keep `current`.
+                self.rate_limiter.wait_for_url(current.as_str());
+                if let Ok((code, Some(location))) =
+                    self.curl_probe_redirect(current.as_str(), current_cookie.as_deref())
+                    && (300..400).contains(&code)
+                {
+                    self.advance_redirect(&mut current, &mut current_cookie, &location)?;
+                    continue;
+                }
             }
             return Ok(current.to_string());
         }
@@ -181,12 +193,23 @@ impl HttpFetcher {
         )))
     }
 
-    pub fn fetch_tier_curl(
+    /// Advance a manual redirect chain to `location`, dropping the Cookie
+    /// header when the hop leaves the current site (see [`same_site_hosts`]).
+    fn advance_redirect(
         &self,
-        url: &str,
-        cookie: Option<&str>,
-        encoding: Option<&str>,
-    ) -> Result<String> {
+        current: &mut reqwest::Url,
+        current_cookie: &mut Option<String>,
+        location: &str,
+    ) -> Result<()> {
+        let next = current.join(location).map_err(|e| io_error(e.to_string()))?;
+        if !same_site_hosts(next.host_str(), current.host_str()) {
+            *current_cookie = None;
+        }
+        *current = next;
+        Ok(())
+    }
+
+    fn configured_curl_handle(&self, url: &str, cookie: Option<&str>) -> Result<curl::easy::Easy> {
         let mut handle = curl::easy::Easy::new();
         handle.url(url).map_err(|e| io_error(e.to_string()))?;
         handle
@@ -230,6 +253,51 @@ impl HttpFetcher {
         handle
             .http_headers(headers)
             .map_err(|e| io_error(e.to_string()))?;
+        Ok(handle)
+    }
+
+    /// Perform a single non-following GET via libcurl and report the response
+    /// status code plus the redirect target (when the status is 3xx). Used as
+    /// a fallback by [`HttpFetcher::resolve_final_url`] when the reqwest hop is
+    /// blocked (e.g. a CDN challenge that passes curl but rejects reqwest), so
+    /// redirect chains can still be observed. The response body is discarded.
+    fn curl_probe_redirect(&self, url: &str, cookie: Option<&str>) -> Result<(u32, Option<String>)> {
+        let mut handle = self.configured_curl_handle(url, cookie)?;
+
+        let mut received = 0usize;
+        let perform_result = {
+            let mut transfer = handle.transfer();
+            transfer
+                .write_function(move |data| {
+                    received += data.len();
+                    if received > MAX_RESPONSE_BYTES {
+                        return Ok(0);
+                    }
+                    Ok(data.len())
+                })
+                .map_err(|e| io_error(e.to_string()))?;
+            transfer.perform()
+        };
+        perform_result.map_err(|e| io_error(e.to_string()))?;
+
+        let code = handle
+            .response_code()
+            .map_err(|e| io_error(e.to_string()))?;
+        let redirect = handle
+            .redirect_url()
+            .ok()
+            .flatten()
+            .map(str::to_string);
+        Ok((code, redirect))
+    }
+
+    pub fn fetch_tier_curl(
+        &self,
+        url: &str,
+        cookie: Option<&str>,
+        encoding: Option<&str>,
+    ) -> Result<String> {
+        let mut handle = self.configured_curl_handle(url, cookie)?;
 
         let mut body = Vec::new();
         let mut response_too_large = false;
@@ -451,6 +519,22 @@ fn io_error(message: impl Into<String>) -> NarouError {
     std::io::Error::other(message.into()).into()
 }
 
+/// Returns true when two hosts belong to the same site for cookie purposes:
+/// identical, or one is a subdomain of the other (e.g. `h.syosetu.org` and
+/// `syosetu.org`). Browsers share domain-scoped cookies (`Domain=.example.com`)
+/// across such hosts, so redirects within one site must keep the configured
+/// Cookie header while cross-site redirects still drop it.
+fn same_site_hosts(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            a == b
+                || a.strip_suffix(b).is_some_and(|prefix| prefix.ends_with('.'))
+                || b.strip_suffix(a).is_some_and(|prefix| prefix.ends_with('.'))
+        }
+        _ => false,
+    }
+}
+
 fn should_stop_fetch_fallback(err: &NarouError) -> bool {
     matches!(
         err,
@@ -498,7 +582,7 @@ impl HttpFetcher {
                     .to_str()
                     .map_err(|e| io_error(format!("invalid redirect location: {e}")))?;
                 let next = current.join(location).map_err(|e| io_error(e.to_string()))?;
-                if next.host_str() != current.host_str() {
+                if !same_site_hosts(next.host_str(), current.host_str()) {
                     current_cookie = None;
                 }
                 current = next;
@@ -558,7 +642,7 @@ pub fn default_request_headers() -> HeaderMap {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_stop_fetch_fallback, HttpFetcher};
+    use super::{same_site_hosts, should_stop_fetch_fallback, HttpFetcher};
     use crate::error::NarouError;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -615,5 +699,22 @@ mod tests {
         assert!(should_stop_fetch_fallback(&NarouError::NotFound(
             "https://example.com/missing".into()
         )));
+    }
+
+    #[test]
+    fn same_site_hosts_keeps_cookie_within_subdomains() {
+        assert!(same_site_hosts(Some("syosetu.org"), Some("syosetu.org")));
+        assert!(same_site_hosts(Some("h.syosetu.org"), Some("syosetu.org")));
+        assert!(same_site_hosts(Some("syosetu.org"), Some("h.syosetu.org")));
+    }
+
+    #[test]
+    fn same_site_hosts_rejects_cross_site_and_lookalike_hosts() {
+        assert!(!same_site_hosts(Some("syosetu.org"), Some("example.com")));
+        // "hsyosetu.org" is not a subdomain of "syosetu.org"; the label
+        // boundary dot is required so lookalike domains never share cookies.
+        assert!(!same_site_hosts(Some("hsyosetu.org"), Some("syosetu.org")));
+        assert!(!same_site_hosts(Some("syosetu.org"), None));
+        assert!(!same_site_hosts(None, None));
     }
 }

@@ -1065,6 +1065,15 @@ impl Downloader {
             _ => toc_url,
         };
         let url_captures = setting.extract_url_captures(&toc_url).unwrap_or(url_captures);
+        // リダイレクト解決で toc_url が入力時と変わった場合、解決後の URL で
+        // 既存レコードを再照合して ID を引き継ぐ。別ドメインへ転送されるサイト
+        // (例: ハーメルンの h.syosetu.org 分離)で同じ小説が重複登録されるのを防ぐ。
+        let existing_id = existing_id.or_else(|| {
+            crate::db::with_database(|db| Ok(db.get_by_toc_url(&toc_url).map(|record| record.id)))
+                .ok()
+                .flatten()
+        });
+        let provisional_id = existing_id.unwrap_or(provisional_id);
         let toc_source = match fetch_toc(&mut self.fetcher, &setting, &toc_url) {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
@@ -2590,6 +2599,39 @@ mod tests {
         assert_eq!(
             super::sanitize_site_tags(&tags),
             vec!["和風ファンタジー", "妖", "ヤンデレ", "闇夜の蛍"]
+        );
+    }
+
+    #[test]
+    fn syosetu_org_accepts_h_domain_and_keeps_domain_in_toc_url() {
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings.iter().find(|s| s.name == "ハーメルン").unwrap();
+
+        // R18 は h.syosetu.org に分離されたが同一サイト扱い(単一定義):
+        // どちらのドメインの URL も受け付け、toc_url は実際に取得可能な
+        // ドメインを保持する(フェッチ層はリダイレクトを追わないため)。
+        assert!(setting.matches_url("https://h.syosetu.org/novel/412369/"));
+        assert!(setting.matches_url("https://syosetu.org/novel/405366/"));
+        assert!(!setting.matches_url("https://hsyosetu.org/novel/1/"));
+
+        assert_eq!(
+            setting
+                .toc_url_with_url_captures("https://h.syosetu.org/novel/412369/")
+                .as_deref(),
+            Some("https://h.syosetu.org/novel/412369/")
+        );
+        assert_eq!(
+            setting
+                .toc_url_with_url_captures("https://syosetu.org/novel/405366/")
+                .as_deref(),
+            Some("https://syosetu.org/novel/405366/")
+        );
+        // ドメインをキャプチャしない旧 novel.syosetu.org 形式はフィールド既定値に落ちる
+        assert_eq!(
+            setting
+                .toc_url_with_url_captures("https://novel.syosetu.org/12345")
+                .as_deref(),
+            Some("https://syosetu.org/novel/12345/")
         );
     }
 
