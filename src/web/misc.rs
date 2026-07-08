@@ -162,6 +162,7 @@ pub async fn tag_list(
     State(_state): State<AppState>,
     Query(params): Query<TagListParams>,
 ) -> Response {
+    let new_tag_color = crate::tag_colors::configured_new_tag_color();
     let (tags, tag_colors) = with_database(|db| {
         let index = db.tag_index();
         let mut list: Vec<(&String, &Vec<i64>)> = index.iter().collect();
@@ -170,7 +171,11 @@ pub async fn tag_list(
 
         let inventory = db.inventory();
         let mut tag_colors = crate::tag_colors::load_tag_colors(inventory)?;
-        if crate::tag_colors::ensure_tag_colors(&mut tag_colors, tags.iter().map(String::as_str)) {
+        if crate::tag_colors::ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            tags.iter().map(String::as_str),
+            new_tag_color.as_deref(),
+        ) {
             crate::tag_colors::save_tag_colors(inventory, &tag_colors)?;
         }
 

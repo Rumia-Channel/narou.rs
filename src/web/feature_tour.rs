@@ -61,6 +61,36 @@ const FEATURE_TOURS: &[FeatureTourEntry] = &[
             "ツアー項目が追加されないバージョンでは何も表示しない",
         ],
     },
+    FeatureTourEntry {
+        version: "0.3.0",
+        title: "ハーメルン R18 作品に対応",
+        body: "h.syosetu.org に分離されたハーメルンの R18 作品を、h あり・なしどちらの URL からでも登録・ダウンロードできます。",
+        items: &[
+            "h.syosetu.org と syosetu.org を同一サイトとして扱い、重複登録を防止",
+            "R18 作品の取得時は h ドメインへの転送を自動で追跡",
+            "R18 作品は over18(18歳以上確認)設定が有効な場合のみ取得",
+        ],
+    },
+    FeatureTourEntry {
+        version: "0.3.0",
+        title: "新規タグの既定色設定",
+        body: "新しく作られるタグに割り当てる色を webui.new-tag-color 設定で固定できます。",
+        items: &[
+            "設定画面の WebUI タブから色を選択",
+            "default のままなら従来どおりタグの追加順に色を巡回",
+            "Web UI と CLI のどちらでタグを追加しても同じ色を適用",
+        ],
+    },
+    FeatureTourEntry {
+        version: "0.3.0",
+        title: "失敗したジョブの自動リトライ",
+        body: "キューのジョブが一時的なエラーで失敗した場合、間隔を広げながら自動で再試行します。",
+        items: &[
+            "再試行回数は queue.max-retries 設定で調整(既定 3 回)",
+            "再試行間隔は queue.retry-backoff 設定で調整(既定 1m,5m,15m)",
+            "再試行の予定は queue_retry 通知として Web UI に配信",
+        ],
+    },
 ];
 
 pub async fn pending(State(_state): State<AppState>) -> Json<serde_json::Value> {

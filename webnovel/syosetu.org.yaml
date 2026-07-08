@@ -1,10 +1,16 @@
 # ------------------------------------------------------------
 # 小説サイト定義
+# R18 作品は h.syosetu.org に分離されているが同一サイト(サイト名・
+# domain とも syosetu.org として扱う)。URL パターンで実ドメインを
+# キャプチャして toc_url / novel_info_url に反映し、h あり/なしの
+# どちらの URL でも登録・取得できるようにする。誤ったドメインで
+# アクセスした場合は正しいドメインへ 302 転送されるため、ダウンローダ
+# のリダイレクト解決で toc_url が正しいドメインに更新される。
 name: &name ハーメルン
 domain: syosetu.org
 top_url: https?://\\k<domain>
 url:
-  - \\k<top_url>/novel/(?<ncode>\d+)
+  - https?://(?<domain>h\.syosetu\.org|syosetu\.org)/novel/(?<ncode>\d+)
   - https?://novel.syosetu.org/(?<ncode>\d+)
 encoding: UTF-8
 timezone: Asia/Tokyo
@@ -14,11 +20,11 @@ title_strip_pattern: null
 cookie: over18=off
 over18_pattern: ※この作品はR-18です。
 sitename: *name
-version: 1.5
+version: 1.6
 
 # ------------------------------------------------------------
 # 目次取得設定
-toc_url: https://syosetu.org/novel/\\k<ncode>/
+toc_url: https://\\k<domain>/novel/\\k<ncode>/
 subtitles: |-
   (?:<tr><td colspan=2><strong>(?<chapter>.+?)</strong></td></tr>)?<tr bgcolor="#.+?" class="bgcolor\d"><td width=60%><span id="(?<index>\d+?)">　</span> <a href=.+? style="text-decoration:none;">(?<subtitle>.+?)</a></td><td><NOBR>(?:<time itemprop=".+?" datetime=".+?">)?(?<subdate>.+?)(?:</time>)?(?:<span title="(?<subupdate>.+?)改稿">\(<u>改</u>\)</span>)?</NOBR></td></tr>
 
@@ -46,7 +52,7 @@ author: 作者：<span itemprop="author">(?:<a [^>]+>)?(?<author>.+?)(?:</a>)?</
 
 # ------------------------------------------------------------
 # 小説情報からパースするための設定
-novel_info_url: https://syosetu.org/?mode=ss_detail&nid=\\k<ncode>
+novel_info_url: https://\\k<domain>/?mode=ss_detail&nid=\\k<ncode>
 
 # タイトル
 t: タイトル</td><td.*?><a href=.+?>(?<title>.+?)</a>

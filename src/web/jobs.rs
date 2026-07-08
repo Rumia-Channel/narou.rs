@@ -2080,12 +2080,17 @@ pub async fn api_taginfo(
         .collect();
     let selected_ids = sort_ids_for_request(&selected_ids, body.sort_state.as_ref(), body.timestamp);
 
+    let new_tag_color = crate::tag_colors::configured_new_tag_color();
     let tag_info = with_database(|db| {
         let tag_index = db.tag_index();
         let inventory = db.inventory();
         let mut tag_colors = crate::tag_colors::load_tag_colors(inventory)?;
         let tag_names = tag_index.keys().map(String::as_str);
-        if crate::tag_colors::ensure_tag_colors(&mut tag_colors, tag_names) {
+        if crate::tag_colors::ensure_tag_colors_with_default_color(
+            &mut tag_colors,
+            tag_names,
+            new_tag_color.as_deref(),
+        ) {
             crate::tag_colors::save_tag_colors(inventory, &tag_colors)?;
         }
         let tag_colors = tag_colors.into_map();
