@@ -92,7 +92,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `setting` | ✅ | ✅ 完了 | 基本読み書き、`--burn`、dynamic `default/force/default_args`、hidden select 値検証、`setting -a` の全変数一覧まで Ruby 互換に揃えた |
 | `diff` | ✅ | ✅ 完了 | 外部 diff ツール、raw データ管理 |
 | `send` | ✅ | ✅ 完了 | Kindle/Kobo/Reader 送信、`--without-freeze`、栞 backup/restore、hotentry を実装 |
-| `mail` | ✅ | ✅ 完了 | `mail_setting.yaml` bootstrap / 不完全設定 path 表示 / spinner / hotentry / `last_mail_date` 差分送信、Pony寄りの SMTP/TLS オプション受理まで実装。`smtp` 経路は `tests/mail_e2e.rs` の end-to-end テストで sender 側・受信側ヘッダまで自動確認済み |
+| `mail` | ✅ | ✅ 完了 | `mail_setting.yaml` bootstrap / 不完全設定 path 表示 / spinner / hotentry / `last_mail_date` 差分送信、Pony寄りの SMTP/TLS オプション受理、添付ファイル名の正規表現置換まで実装。`smtp` 経路は `tests/mail_e2e.rs` の end-to-end テストで sender 側・受信側ヘッダまで自動確認済み |
 | `backup` | ✅ | ✅ 完了 | `narou backup`/複数 target、`backup/` 除外、180バイト切り詰めまで対応 |
 | `clean` | ✅ | ✅ 完了 | `latest_convert` 既定値、`--all`、`--force`/`--dry-run`、freeze スキップ、`raw/*.txt|*.html` と `本文/*.yaml` の orphan 判定を実装 |
 | `illust` | ✅ | ✅ 完了 | v0.2.11 で導入した `.illustration_cache.yaml` 運用のための `narou illust <sub>` 新設。サブコマンド `orphan`/`migrate`/`fix-ext`/`rebuild` を実装し、削除/改名/移行はいずれも既定 dry-run (`-f` で実行) |
@@ -526,9 +526,10 @@ narou setting name         # 読み取り
 - `smtp` 経路では preset に含まれる `via_options.domain` を EHLO 名へ反映し、`authentication` は `:plain` / `:login` / `:xoauth2` を受理する
 - `smtp` の TLS 解釈は Ruby/Pony 寄りに拡張しつつ、narou.rs では既定で TLS 必須にした。`ssl` / `tls` / `enable_starttls` / `enable_starttls_auto` は継続受理し、`allow_insecure: true` / `mail.smtp.allow_insecure` と `tls_skip_verify: true` / `mail.smtp.tls_skip_verify` を明示した場合だけ平文SMTP・opportunistic STARTTLS・証明書検証無効化を許可する
 - message 生成では `reply_to` / `cc` / `bcc` を受理し、複数宛先は YAML sequence またはカンマ区切り文字列で解釈する
+- 添付ファイル名は `mail_setting.yaml` の `attachment_filename_pattern` / `attachment_filename_replacement`、または local setting の `mail.attachment-filename-pattern` / `mail.attachment-filename-replacement` で正規表現置換できる。`mail_setting.yaml` 側を優先し、未設定時は従来どおり変換済みファイル名をそのまま使う
 - `tests/mail_e2e.rs` でローカル SMTP listener を使った end-to-end 検証を行う
   - `smtp` 経路で送受信双方が期待どおり動くことを確認 (From / To / Subject / body / Content-Type / 添付ファイル名)
-  - `Content-Disposition` の `filename*0*=` / `filename*1*=` 分割を含む RFC 2231 / RFC 5987 エンコード下でも元ファイル名が保持されることを検証
+  - `Content-Disposition` の `filename*0*=` / `filename*1*=` 分割を含む RFC 2231 / RFC 5987 エンコード下でも元ファイル名が保持されること、および添付ファイル名の正規表現置換が反映されることを検証
   - CC / 複数宛先の分割、`last_mail_date` 差分送信、既定の安全既定 (平文 SMTP は `allow_insecure: true` 明示 opt-in が必須) も網羅
 
 **補注 (完了一覧の「不足動作」ではなく実装上の事実)**:

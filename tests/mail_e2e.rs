@@ -259,6 +259,48 @@ fn send_mail_keeps_original_filename_for_attachments() {
 }
 
 #[test]
+fn send_mail_applies_attachment_filename_regex_replacement() {
+    let stub = start_stub_smtp();
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let attachment = tmp.path().join("[very-long-author]ReadableTitle.epub");
+    std::fs::write(&attachment, b"PK\x03\x04 renamed-fixture").expect("write attachment");
+
+    let mut extras = HashMap::new();
+    extras.insert(
+        "attachment_filename_pattern".to_string(),
+        serde_yaml::Value::String(r"^\[[^\]]+\](.*)$".to_string()),
+    );
+    extras.insert(
+        "attachment_filename_replacement".to_string(),
+        serde_yaml::Value::String("$1".to_string()),
+    );
+    let setting = plain_smtp_setting(stub.port, extras);
+
+    send_mail(&setting, "1", "body", &attachment).expect("send_mail");
+
+    let raw = stub
+        .received
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("smtp data payload");
+
+    let parsed = parse_mail(raw.as_bytes()).expect("parse_mail");
+    let attachment_part = find_attachment(&parsed).expect("application/epub+zip part");
+    let disposition = header_text(attachment_part, "Content-Disposition");
+    let content_type = header_text(attachment_part, "Content-Type");
+    let combined = format!("{disposition}\n{content_type}");
+
+    assert!(
+        combined.contains("ReadableTitle.epub"),
+        "renamed attachment filename missing\n--- disposition ---\n{disposition}\n--- content-type ---\n{content_type}"
+    );
+    assert!(
+        !combined.contains("very-long-author"),
+        "original author prefix should be removed\n--- disposition ---\n{disposition}\n--- content-type ---\n{content_type}"
+    );
+}
+
+#[test]
 fn send_mail_splits_multiple_recipients() {
     let stub = start_stub_smtp();
 

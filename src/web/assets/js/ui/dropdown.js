@@ -9,6 +9,10 @@ export function initDropdowns() {
 }
 
 function handleClick(e) {
+  if (e.target.closest('#select-color-menu')) {
+    return;
+  }
+
   const toggle = e.target.closest('[data-dropdown]');
 
   if (toggle) {
@@ -49,5 +53,5 @@ function closeAll() {
     openDropdown.classList.remove('open');
     openDropdown = null;
   }
-  document.querySelectorAll('.open').forEach(el => el.classList.remove('open'));
+  document.querySelectorAll('.dropdown.open, .btn-group.open, li.open').forEach(el => el.classList.remove('open'));
 }

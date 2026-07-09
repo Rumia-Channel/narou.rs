@@ -12,6 +12,7 @@ use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{Tls, TlsParametersBuilder};
 use lettre::transport::smtp::extension::ClientId;
 use lettre::{SmtpTransport, Transport};
+use regex::Regex;
 
 use crate::converter::output::create_output_text_filename;
 use crate::converter::settings::NovelSettings;
@@ -23,6 +24,18 @@ use crate::error::Result;
 
 pub const MAIL_SETTING_FILE: &str = "mail_setting.yaml";
 pub const MAIL_INTERRUPTED_MESSAGE: &str = "メール送信を中断しました";
+const MAIL_ATTACHMENT_PATTERN_SETTING: &str = "mail.attachment-filename-pattern";
+const MAIL_ATTACHMENT_REPLACEMENT_SETTING: &str = "mail.attachment-filename-replacement";
+const MAIL_ATTACHMENT_PATTERN_KEYS: &[&str] = &[
+    "attachment_filename_pattern",
+    "attachment-filename-pattern",
+    MAIL_ATTACHMENT_PATTERN_SETTING,
+];
+const MAIL_ATTACHMENT_REPLACEMENT_KEYS: &[&str] = &[
+    "attachment_filename_replacement",
+    "attachment-filename-replacement",
+    MAIL_ATTACHMENT_REPLACEMENT_SETTING,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SmtpTlsMode {
@@ -324,7 +337,7 @@ fn build_message(
 ) -> std::result::Result<Message, String> {
     let from = parse_mailbox(&setting.from)?;
     let to = parse_mailboxes(&setting.to)?;
-    let attachment_name = attachment_name(id, attachment_path);
+    let attachment_name = attachment_name(setting, id, attachment_path)?;
     let attachment_bytes = std::fs::read(attachment_path).map_err(|e| e.to_string())?;
 
     let mut builder = Message::builder()
@@ -657,11 +670,52 @@ fn alias_to_target(target: &str) -> String {
     .unwrap_or_else(|| target.to_string())
 }
 
-fn attachment_name(_id: &str, path: &Path) -> String {
+fn attachment_name(
+    setting: &MailSetting,
+    id: &str,
+    path: &Path,
+) -> std::result::Result<String, String> {
+    let original = original_attachment_name(id, path);
+    let Some(pattern) = mail_attachment_pattern(setting) else {
+        return Ok(original);
+    };
+    let replacement = mail_attachment_replacement(setting).unwrap_or_default();
+    let regex = Regex::new(&pattern).map_err(|e| {
+        format!(
+            "{} の正規表現が不正です: {}",
+            MAIL_ATTACHMENT_PATTERN_SETTING, e
+        )
+    })?;
+    let replaced = regex.replace_all(&original, replacement.as_str()).to_string();
+    if replaced.is_empty() {
+        Ok(original)
+    } else {
+        Ok(replaced)
+    }
+}
+
+fn original_attachment_name(id: &str, path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
         .map(|name| name.to_string())
-        .unwrap_or_else(|| _id.to_string())
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn mail_attachment_pattern(setting: &MailSetting) -> Option<String> {
+    mail_extra_string(setting, MAIL_ATTACHMENT_PATTERN_KEYS)
+        .or_else(|| crate::compat::load_local_setting_string(MAIL_ATTACHMENT_PATTERN_SETTING))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn mail_attachment_replacement(setting: &MailSetting) -> Option<String> {
+    mail_extra_string(setting, MAIL_ATTACHMENT_REPLACEMENT_KEYS)
+        .or_else(|| crate::compat::load_local_setting_string(MAIL_ATTACHMENT_REPLACEMENT_SETTING))
+}
+
+fn mail_extra_string(setting: &MailSetting, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| yaml_string(setting.extras.get(*key)))
 }
 
 fn green_bold(text: &str) -> String {
@@ -843,16 +897,66 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
+    fn test_mail_setting(extras: HashMap<String, serde_yaml::Value>) -> MailSetting {
+        MailSetting {
+            from: "sender@example.com".to_string(),
+            to: "receiver@example.com".to_string(),
+            subject: "subject".to_string(),
+            via: "smtp".to_string(),
+            via_options: HashMap::new(),
+            extras,
+        }
+    }
+
     #[test]
     fn attachment_name_keeps_original_filename() {
+        let setting = test_mail_setting(HashMap::new());
         let path = std::path::Path::new("example.kepub.epub");
-        assert_eq!(attachment_name("hotentry", path), "example.kepub.epub");
+        assert_eq!(
+            attachment_name(&setting, "hotentry", path).unwrap(),
+            "example.kepub.epub"
+        );
     }
 
     #[test]
     fn attachment_name_falls_back_to_id_when_path_has_no_name() {
+        let setting = test_mail_setting(HashMap::new());
         let path = std::path::Path::new("");
-        assert_eq!(attachment_name("1", path), "1");
+        assert_eq!(attachment_name(&setting, "1", path).unwrap(), "1");
+    }
+
+    #[test]
+    fn attachment_name_applies_regex_replacement() {
+        let mut extras = HashMap::new();
+        extras.insert(
+            "attachment_filename_pattern".to_string(),
+            serde_yaml::Value::String(r"^\[[^\]]+\](.*)$".to_string()),
+        );
+        extras.insert(
+            "attachment_filename_replacement".to_string(),
+            serde_yaml::Value::String("$1".to_string()),
+        );
+        let setting = test_mail_setting(extras);
+        let path = std::path::Path::new("[very long author]ReadableTitle.epub");
+
+        assert_eq!(
+            attachment_name(&setting, "1", path).unwrap(),
+            "ReadableTitle.epub"
+        );
+    }
+
+    #[test]
+    fn attachment_name_reports_invalid_regex() {
+        let mut extras = HashMap::new();
+        extras.insert(
+            "attachment_filename_pattern".to_string(),
+            serde_yaml::Value::String("[".to_string()),
+        );
+        let setting = test_mail_setting(extras);
+        let path = std::path::Path::new("example.epub");
+
+        let err = attachment_name(&setting, "1", path).unwrap_err();
+        assert!(err.contains("mail.attachment-filename-pattern"));
     }
 
     #[test]
