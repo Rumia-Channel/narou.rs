@@ -715,6 +715,8 @@ const MAIL_HELP: CmdHelp = CmdHelp {
   ・<target>を省略した場合、新着があった小説を全て送信します。
   ・メールの送信設定は、mail_setting.yamlファイルを編集します。
     (初めてコマンドを使うときに自動で作成されます)
+  ・添付ファイル名は mail_setting.yaml の attachment_filename_pattern / attachment_filename_replacement、
+    または narou setting の mail.attachment-filename-pattern / mail.attachment-filename-replacement で正規表現置換できます。
   ・<target>にhotentryを指定した場合、最新のhotentryを送信します。
 
   Examples:

@@ -814,6 +814,8 @@ function renderTags(tags) {
 export function renderTagList() {
   const canvas = El.tagListCanvas;
   if (!canvas) return;
+  const scrollContainer = canvas.closest('.dropdown-menu');
+  const scrollTop = scrollContainer ? scrollContainer.scrollTop : 0;
   canvas.textContent = '';
 
   for (const tag of State.tags) {
@@ -832,6 +834,13 @@ export function renderTagList() {
       showTagColorMenu(e, tag);
     });
     canvas.appendChild(span);
+  }
+
+  if (scrollContainer) {
+    scrollContainer.scrollTop = scrollTop;
+    requestAnimationFrame(() => {
+      scrollContainer.scrollTop = scrollTop;
+    });
   }
 }
 

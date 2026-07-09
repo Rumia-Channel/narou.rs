@@ -47,6 +47,11 @@
   :authentication       : :plain
   :domain               : gmail.com
 
+# 添付ファイル名は正規表現置換で変更できます。
+# 例: [作者名]タイトル.epub -> タイトル.epub
+# :attachment_filename_pattern : '^\[[^\]]+\](.*)$'
+# :attachment_filename_replacement : '$1'
+
 # 設定が終わったらこの項目を true にして下さい
 :complete : false
 

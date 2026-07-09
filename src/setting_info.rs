@@ -111,6 +111,8 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
 
         // local → detail
         "hotentry.auto-mail"
+        | "mail.attachment-filename-pattern"
+        | "mail.attachment-filename-replacement"
         | "logging.format-filename"
         | "logging.format-timestamp"
         | "download.interval"
@@ -581,6 +583,28 @@ mod tests {
             .expect("update.max-parallel-domains default");
         assert_eq!(default.as_i64(), Some(4));
     }
+
+    #[test]
+    fn mail_attachment_filename_settings_are_visible_on_detail_tab() {
+        assert_eq!(
+            tab_for_setting("mail.attachment-filename-pattern"),
+            Some("detail")
+        );
+        assert_eq!(
+            tab_for_setting("mail.attachment-filename-replacement"),
+            Some("detail")
+        );
+
+        let vars = setting_variables();
+        for name in [
+            "mail.attachment-filename-pattern",
+            "mail.attachment-filename-replacement",
+        ] {
+            let info = vars.get(name).expect("mail attachment filename setting");
+            assert!(matches!(info.var_type, VarType::String));
+            assert!(!info.invisible);
+        }
+    }
 }
 
 /// Local setting variable metadata
@@ -633,6 +657,20 @@ pub fn setting_variables() -> SettingVariables {
             vis(
                 VarType::Boolean,
                 "hotentryをメールで送る(mail設定済みの場合)",
+            ),
+        ),
+        (
+            "mail.attachment-filename-pattern",
+            vis(
+                VarType::String,
+                "メール送信時の添付ファイル名に適用する正規表現。未設定なら変換済みファイル名をそのまま使う",
+            ),
+        ),
+        (
+            "mail.attachment-filename-replacement",
+            vis(
+                VarType::String,
+                "mail.attachment-filename-pattern に一致した部分の置換文字列。捕捉は $1 や $name で指定する",
             ),
         ),
         (
