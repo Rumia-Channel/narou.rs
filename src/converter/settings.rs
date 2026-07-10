@@ -188,18 +188,14 @@ impl NovelSettings {
         settings
     }
 
-    /// Derive the generated-artifact title without changing the canonical raw title.
+    /// Derive the generated-artifact title without mutating the stored setting values.
     pub(crate) fn title_for_output(&self, fallback: &str) -> String {
         let title = if self.novel_title.is_empty() {
             fallback
         } else {
             &self.novel_title
         };
-        if self.enable_strip_title_prefix {
-            strip_title_prefix(title).to_string()
-        } else {
-            title.to_string()
-        }
+        crate::title::project_title(title, self.enable_strip_title_prefix)
     }
 
     pub fn create_for_text_file_with_options(
@@ -995,28 +991,13 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{NovelSettings, strip_title_prefix};
+    use super::NovelSettings;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn default_enables_half_indent_bracket_like_ruby() {
         assert!(NovelSettings::default().enable_half_indent_bracket);
-    }
-
-    #[test]
-    fn strips_consecutive_bracketed_title_prefixes() {
-        assert_eq!(
-            strip_title_prefix("【3/17第1巻発売】《コミカライズ企画進行中》 悪役令息が破滅フラグ"),
-            "悪役令息が破滅フラグ"
-        );
-        assert_eq!(strip_title_prefix("［書籍化］ 作品名"), "作品名");
-    }
-
-    #[test]
-    fn keeps_unclosed_or_entirely_bracketed_titles() {
-        assert_eq!(strip_title_prefix("【本当のタイトル】"), "【本当のタイトル】");
-        assert_eq!(strip_title_prefix("【未閉じの作品名"), "【未閉じの作品名");
     }
 
     #[test]
@@ -1140,30 +1121,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
-}
-
-fn strip_title_prefix(title: &str) -> &str {
-    let mut rest = title.trim_start();
-
-    loop {
-        let Some(open) = rest.chars().next() else {
-            return title;
-        };
-        let close = match open {
-            '【' => '】',
-            '《' => '》',
-            '〈' => '〉',
-            '［' => '］',
-            '[' => ']',
-            _ => break,
-        };
-        let Some(close_offset) = rest.find(close) else {
-            break;
-        };
-        rest = rest[close_offset + close.len_utf8()..].trim_start();
-    }
-
-    if rest.is_empty() { title } else { rest }
 }
 
 pub fn load_replace_patterns(path: &Path) -> Vec<(String, String)> {

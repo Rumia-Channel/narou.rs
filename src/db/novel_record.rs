@@ -57,6 +57,32 @@ pub struct NovelRecord {
     pub extra_fields: BTreeMap<String, serde_yaml::Value>,
 }
 
+impl NovelRecord {
+    pub const RAW_TITLE_KEY: &'static str = "raw_title";
+
+    pub fn raw_title(&self) -> &str {
+        self.extra_fields
+            .get(Self::RAW_TITLE_KEY)
+            .and_then(serde_yaml::Value::as_str)
+            .filter(|title| !title.is_empty())
+            .unwrap_or(&self.title)
+    }
+
+    pub fn has_raw_title(&self) -> bool {
+        self.extra_fields
+            .get(Self::RAW_TITLE_KEY)
+            .and_then(serde_yaml::Value::as_str)
+            .is_some()
+    }
+
+    pub fn set_raw_title(&mut self, raw_title: impl Into<String>) {
+        self.extra_fields.insert(
+            Self::RAW_TITLE_KEY.to_string(),
+            serde_yaml::Value::String(raw_title.into()),
+        );
+    }
+}
+
 fn deserialize_nilable_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -176,5 +202,25 @@ custom_map:
         let dumped = serde_yaml::to_string(&record).unwrap();
         assert!(dumped.contains("custom_flag: true"));
         assert!(dumped.contains("answer: 42"));
+    }
+
+    #[test]
+    fn raw_title_uses_compatible_flattened_field() {
+        let yaml = r#"---
+id: 0
+author: author
+title: 作品名
+raw_title: 【書籍化】作品名
+file_title: file title
+toc_url: https://example.com/0/
+sitename: Example
+last_update: 2026-04-20 00:00:00.000000000 +09:00
+"#;
+        let mut record: NovelRecord = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(record.raw_title(), "【書籍化】作品名");
+
+        record.set_raw_title("【発売中】作品名");
+        let dumped = serde_yaml::to_string(&record).unwrap();
+        assert!(dumped.contains("raw_title: 【発売中】作品名"));
     }
 }

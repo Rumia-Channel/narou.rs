@@ -59,10 +59,7 @@ pub(crate) fn create_output_text_filename(
         &settings.novel_author
     };
     let title = settings.title_for_output(&toc.title);
-    ensure_txt_extension(&sanitize_filename_for_output(&format!(
-        "[{}] {}",
-        author, title
-    )))
+    ensure_txt_extension(&default_output_basename(author, &title))
 }
 
 fn convert_filename_to_ncode() -> bool {
@@ -85,6 +82,10 @@ fn sanitize_filename_for_output(name: &str) -> String {
         None,
         "output",
     )
+}
+
+pub(crate) fn default_output_basename(author: &str, title: &str) -> String {
+    sanitize_filename_for_output(&format!("[{author}] {title}"))
 }
 
 fn output_filename_length_limit() -> Option<usize> {
