@@ -27,17 +27,13 @@ pub(crate) fn render_novel_text(
 ) -> String {
     let mut output = String::new();
 
-    let title = if settings.novel_title.is_empty() {
-        &toc.title
-    } else {
-        &settings.novel_title
-    };
+    let title = settings.title_for_output(&toc.title);
     let author = if settings.novel_author.is_empty() {
         &toc.author
     } else {
         &settings.novel_author
     };
-    let processed_title = decorate_title(settings, title, record);
+    let processed_title = decorate_title(settings, &title, record);
 
     output.push_str(&processed_title);
     output.push('\n');
@@ -526,6 +522,24 @@ mod tests {
             decorate_title(&settings, "作品", Some(&record)),
             "作品 0000 Site alpha,end 短編"
         );
+    }
+
+    #[test]
+    fn rendered_title_strips_prefix_when_enabled() {
+        let mut settings = NovelSettings::default();
+        settings.enable_strip_title_prefix = true;
+        let toc = TocObject {
+            title: "《コミカライズ企画進行中》マジカル".to_string(),
+            author: "作者".to_string(),
+            toc_url: "https://example.com/works/1".to_string(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(1),
+        };
+
+        let text = render_novel_text(&settings, &toc, "", &[], None, None);
+
+        assert!(text.starts_with("マジカル\n作者\n"), "{text}");
     }
 
     #[test]

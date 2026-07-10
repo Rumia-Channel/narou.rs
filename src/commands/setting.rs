@@ -531,6 +531,10 @@ fn get_original_settings() -> Vec<(String, IniValue)> {
             IniValue::Boolean(d.enable_strip_decoration_tag),
         ),
         (
+            "enable_strip_title_prefix".into(),
+            IniValue::Boolean(d.enable_strip_title_prefix),
+        ),
+        (
             "enable_add_end_to_title".into(),
             IniValue::Boolean(d.enable_add_end_to_title),
         ),

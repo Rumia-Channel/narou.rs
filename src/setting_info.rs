@@ -424,6 +424,13 @@ pub fn original_setting_var_infos() -> Vec<(&'static str, VarInfo)> {
             ),
         ),
         (
+            "enable_strip_title_prefix",
+            info(
+                VarType::Boolean,
+                "タイトル先頭の【…】《…》〈…〉［…］[...]を連続して削除し、作品内タイトルと出力ファイル名に反映する",
+            ),
+        ),
+        (
             "enable_add_end_to_title",
             info(VarType::Boolean, "完結済み小説のタイトルに(完結)と表示する"),
         ),
