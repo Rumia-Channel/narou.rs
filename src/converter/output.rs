@@ -169,11 +169,13 @@ mod tests {
             subtitles: Vec::new(),
             novel_type: Some(1),
         };
+        let raw_title = toc.title.clone();
 
         assert_eq!(
             create_output_text_filename(&settings, 1, &toc),
             "[作者] 悪役令息が破滅フラグ.txt"
         );
+        assert_eq!(toc.title, raw_title);
     }
 
     #[test]

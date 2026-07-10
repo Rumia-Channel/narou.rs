@@ -188,6 +188,7 @@ impl NovelSettings {
         settings
     }
 
+    /// Derive the generated-artifact title without changing the canonical raw title.
     pub(crate) fn title_for_output(&self, fallback: &str) -> String {
         let title = if self.novel_title.is_empty() {
             fallback
@@ -1016,6 +1017,19 @@ mod tests {
     fn keeps_unclosed_or_entirely_bracketed_titles() {
         assert_eq!(strip_title_prefix("【本当のタイトル】"), "【本当のタイトル】");
         assert_eq!(strip_title_prefix("【未閉じの作品名"), "【未閉じの作品名");
+    }
+
+    #[test]
+    fn output_title_projection_preserves_raw_title_fields() {
+        let raw_title = "【書籍化】作品名";
+        let mut settings = NovelSettings::default();
+        settings.title = Some(raw_title.to_string());
+        settings.novel_title = raw_title.to_string();
+        settings.enable_strip_title_prefix = true;
+
+        assert_eq!(settings.title_for_output(raw_title), "作品名");
+        assert_eq!(settings.title.as_deref(), Some(raw_title));
+        assert_eq!(settings.novel_title, raw_title);
     }
 
     #[test]

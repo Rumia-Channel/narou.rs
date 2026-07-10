@@ -427,7 +427,7 @@ pub fn original_setting_var_infos() -> Vec<(&'static str, VarInfo)> {
             "enable_strip_title_prefix",
             info(
                 VarType::Boolean,
-                "タイトル先頭の【…】《…》〈…〉［…］[...]を連続して削除し、作品内タイトルと出力ファイル名に反映する",
+                "タイトル先頭の【…】《…》〈…〉［…］[...]を連続して削除し、作品内タイトルと出力ファイル名に反映する。取得した元タイトルは保持する",
             ),
         ),
         (
