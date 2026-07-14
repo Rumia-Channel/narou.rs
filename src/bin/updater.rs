@@ -175,15 +175,13 @@ fn main() {
     // (Win では rename が使えるので必須ではないが、安全側に倒す)。
     std::thread::sleep(Duration::from_secs(2));
 
-    let backups = match apply_update(&zip_path, &install_dir, &mut logger) {
+    let backups = match apply_update_and_remove_download(&zip_path, &install_dir, &mut logger) {
         Ok(backups) => backups,
         Err(e) => {
             logger.log(format!("update failed: {e}"));
             std::process::exit(1);
         }
     };
-
-    let _ = fs::remove_file(&zip_path);
 
     if !args.restart.is_empty() {
         // updater 自身が exit しきってから新本体が起きるように小休止。
@@ -264,13 +262,16 @@ fn apply_update(
     }
     fs::create_dir_all(&temp_root).map_err(|e| format!("create temp dir: {e}"))?;
 
-    let extract_root = extract_zip(zip_path, &temp_root, logger)?;
-    logger.log(format!("extracted to {extract_root:?}"));
-
     let mut backups: Vec<BackupEntry> = Vec::new();
-    let result = copy_tree_overwrite(&extract_root, install_dir, &mut backups, logger);
+    let result = (|| {
+        let extract_root = extract_zip(zip_path, &temp_root, logger)?;
+        logger.log(format!("extracted to {extract_root:?}"));
+        copy_tree_overwrite(&extract_root, install_dir, &mut backups, logger)
+    })();
 
-    let _ = fs::remove_dir_all(&temp_root);
+    if let Err(err) = fs::remove_dir_all(&temp_root) {
+        logger.log(format!("cleanup: cannot remove {temp_root:?}: {err}"));
+    }
 
     match result {
         Ok(()) => Ok(backups),
@@ -280,6 +281,18 @@ fn apply_update(
             Err(e)
         }
     }
+}
+
+fn apply_update_and_remove_download(
+    zip_path: &Path,
+    install_dir: &Path,
+    logger: &mut Logger,
+) -> Result<Vec<BackupEntry>, String> {
+    let result = apply_update(zip_path, install_dir, logger);
+    if let Err(err) = fs::remove_file(zip_path) {
+        logger.log(format!("cleanup: cannot remove {zip_path:?}: {err}"));
+    }
+    result
 }
 
 /// zip を展開し、`narou/` ディレクトリ (またはトップレベル) を返す。
@@ -556,5 +569,21 @@ mod tests {
         rollback(&backups, &mut logger);
         assert_eq!(fs::read(&target).unwrap(), b"original");
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn failed_update_removes_download_and_extract_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path().join("install");
+        fs::create_dir_all(&install_dir).unwrap();
+        let zip_path = install_dir.join("update_download_test.zip.tmp");
+        fs::write(&zip_path, b"not a zip").unwrap();
+        let mut logger = Logger { file: None };
+
+        let result = apply_update_and_remove_download(&zip_path, &install_dir, &mut logger);
+
+        assert!(result.is_err());
+        assert!(!zip_path.exists());
+        assert!(!install_dir.join("update_extract.tmp").exists());
     }
 }
