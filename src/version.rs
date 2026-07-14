@@ -84,7 +84,22 @@ pub fn commit_version_exists() -> bool {
 }
 
 pub fn is_local_build() -> bool {
-    IS_LOCAL_BUILD
+    IS_LOCAL_BUILD || is_source_checkout_build()
+}
+
+fn is_source_checkout_build() -> bool {
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| is_cargo_target_executable(&exe))
+}
+
+fn is_cargo_target_executable(exe: &Path) -> bool {
+    exe.ancestors().any(|ancestor| {
+        ancestor.file_name().is_some_and(|name| name == "target")
+            && ancestor
+                .parent()
+                .is_some_and(|root| root.join("Cargo.toml").is_file())
+    })
 }
 
 pub fn is_container_runtime() -> bool {
@@ -98,14 +113,19 @@ pub fn is_container_runtime() -> bool {
 }
 
 pub fn self_update_unavailable_reason() -> Option<&'static str> {
+    if is_source_checkout_build() {
+        return Some(
+            "ソースツリーの target 配下でビルドした local-build 版は自動更新できません。git pull 後に cargo build --release を実行するか、GitHub Release 版を別のディレクトリへ展開してください",
+        );
+    }
+    if IS_LOCAL_BUILD {
+        return Some(
+            "local-build 版のためアップデートボタンは表示されません。GitHub Release 版へ上書き更新せず、必要に応じて手元で再ビルドしてください",
+        );
+    }
     if !commit_version_exists() {
         return Some(
             "develop ビルド扱いのためアップデートボタンは表示されません。実行ファイルと同じフォルダに commitversion ファイルが無い場合に発生します",
-        );
-    }
-    if is_local_build() {
-        return Some(
-            "local-build 版のためアップデートボタンは表示されません。GitHub Release 版へ上書き更新せず、必要に応じて手元で再ビルドしてください",
         );
     }
     if is_container_runtime() {
@@ -179,5 +199,23 @@ mod tests {
     #[test]
     fn runtime_description_is_not_empty() {
         assert!(!runtime_description().is_empty());
+    }
+
+    #[test]
+    fn cargo_target_executable_is_treated_as_local_build() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("Cargo.toml"), "[package]\n").unwrap();
+
+        assert!(is_cargo_target_executable(
+            &temp.path().join("target/release/narou_rs")
+        ));
+        assert!(is_cargo_target_executable(
+            &temp
+                .path()
+                .join("target/x86_64-unknown-linux-gnu/release/narou_rs")
+        ));
+        assert!(!is_cargo_target_executable(
+            &temp.path().join("narou/narou_rs")
+        ));
     }
 }

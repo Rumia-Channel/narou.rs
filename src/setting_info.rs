@@ -424,6 +424,13 @@ pub fn original_setting_var_infos() -> Vec<(&'static str, VarInfo)> {
             ),
         ),
         (
+            "enable_strip_title_prefix",
+            info(
+                VarType::Boolean,
+                "タイトル先頭の【…】《…》〈…〉［…］[...]を連続して削除し、一覧表示・作品内タイトル・出力ファイル名に反映する。設定後の新規取得ではフォルダ名にも反映し、既存フォルダ名は維持する。取得元タイトルは raw_title として内部保持する",
+            ),
+        ),
+        (
             "enable_add_end_to_title",
             info(VarType::Boolean, "完結済み小説のタイトルに(完結)と表示する"),
         ),
@@ -605,6 +612,28 @@ mod tests {
             assert!(!info.invisible);
         }
     }
+
+    #[test]
+    fn mail_attachment_filename_webui_help_includes_usage_notes() {
+        let vars = setting_variables();
+        let pattern = vars
+            .get("mail.attachment-filename-pattern")
+            .expect("mail attachment filename pattern setting");
+        let replacement = vars
+            .get("mail.attachment-filename-replacement")
+            .expect("mail attachment filename replacement setting");
+
+        let pattern_help =
+            webui_help_override("mail.attachment-filename-pattern", pattern.help).unwrap();
+        let replacement_help =
+            webui_help_override("mail.attachment-filename-replacement", replacement.help).unwrap();
+
+        assert!(pattern_help.contains(r"^\[[^\]]+\](.*)$"));
+        assert!(pattern_help.contains("フォルダ名は含みません"));
+        assert!(replacement_help.contains("$1"));
+        assert!(replacement_help.contains("mail_setting.yaml"));
+        assert!(replacement_help.contains("優先"));
+    }
 }
 
 /// Local setting variable metadata
@@ -663,14 +692,14 @@ pub fn setting_variables() -> SettingVariables {
             "mail.attachment-filename-pattern",
             vis(
                 VarType::String,
-                "メール送信時の添付ファイル名に適用する正規表現。未設定なら変換済みファイル名をそのまま使う",
+                "メール添付ファイル名だけに適用する正規表現。例: ^\\[[^\\]]+\\](.*)$",
             ),
         ),
         (
             "mail.attachment-filename-replacement",
             vis(
                 VarType::String,
-                "mail.attachment-filename-pattern に一致した部分の置換文字列。捕捉は $1 や $name で指定する",
+                "一致部分の置換文字列。捕捉は $1 や $name で指定する。例: $1",
             ),
         ),
         (
@@ -1156,6 +1185,12 @@ pub fn webui_help_override(name: &str, base_help: &str) -> Option<String> {
         }
         "convert.copy-zip-to" => "i文庫用などで生成したZIPを、変換完了時にコピーするフォルダを指定",
         "convert.make-zip" => "ZIPファイルを出力するかどうか（対応端末: i文庫）",
+        "mail.attachment-filename-pattern" => {
+            "メール送信時の添付ファイル名だけに適用する正規表現。\n対象は変換済み電子書籍のファイル名部分のみで、フォルダ名は含みません。\n未設定なら元の添付ファイル名をそのまま使います。\n<b>例:</b> ^\\[[^\\]]+\\](.*)$"
+        }
+        "mail.attachment-filename-replacement" => {
+            "mail.attachment-filename-pattern に一致した部分の置換文字列。\n捕捉は $1 や $name で指定できます。置換結果が空文字になる場合は元のファイル名に戻します。\n<b>例:</b> $1\n※ mail_setting.yaml の attachment_filename_pattern / attachment_filename_replacement がある場合はそちらが優先されます"
+        }
         _ => return None,
     };
     Some(raw.replace("%%ORIG%%", base_help))

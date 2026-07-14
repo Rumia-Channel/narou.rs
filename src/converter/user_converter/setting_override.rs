@@ -122,6 +122,11 @@ pub fn apply_setting_override(settings: &mut NovelSettings, key: &str, value: &s
                 settings.enable_strip_decoration_tag = b;
             }
         }
+        "enable_strip_title_prefix" => {
+            if let Some(b) = value.as_bool() {
+                settings.enable_strip_title_prefix = b;
+            }
+        }
         "enable_add_end_to_title" => {
             if let Some(b) = value.as_bool() {
                 settings.enable_add_end_to_title = b;

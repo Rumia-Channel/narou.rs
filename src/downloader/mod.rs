@@ -1167,16 +1167,44 @@ impl Downloader {
 
         let info = self.load_novel_info(&setting, &toc_source, &url_captures)?;
 
-        let title = info.title.clone().unwrap_or_default();
         let author = info.author.clone().unwrap_or_default();
         let existing_record = existing_id.and_then(|eid| {
             crate::db::with_database(|db| Ok(db.get(eid).cloned()))
                 .ok()
                 .flatten()
         });
+        let fetched_raw_title = info.title.clone().unwrap_or_default();
+        let raw_title = if fetched_raw_title.is_empty() {
+            existing_record
+                .as_ref()
+                .map(|record| record.raw_title().to_string())
+                .unwrap_or_default()
+        } else {
+            fetched_raw_title
+        };
         let previous_novel_dir = existing_record
             .as_ref()
-            .map(|record| crate::db::novel_dir_for_record(Path::new(types::ARCHIVE_ROOT_DIR), record));
+            .map(|record| {
+                crate::db::existing_novel_dir_for_record(
+                    Path::new(types::ARCHIVE_ROOT_DIR),
+                    record,
+                )
+            });
+        let settings_dir = previous_novel_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(types::ARCHIVE_ROOT_DIR).join(".new-novel-settings"));
+        let title_settings = crate::converter::settings::NovelSettings::load_for_novel(
+            provisional_id,
+            &raw_title,
+            &author,
+            &settings_dir,
+        );
+        let strip_title_prefix = title_settings.enable_strip_title_prefix;
+        let track_raw_title = strip_title_prefix
+            || existing_record
+                .as_ref()
+                .is_some_and(NovelRecord::has_raw_title);
+        let title = crate::title::project_title(&raw_title, strip_title_prefix);
 
         let (novel_type, is_end) = resolve_novel_type(&setting, &toc_source, &url_captures, &info);
 
@@ -1221,6 +1249,14 @@ impl Downloader {
             .unwrap_or_else(|| setting.sitename.clone());
 
         let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory);
+        if let Some(existing) = existing_record.as_ref() {
+            crate::title::rename_projected_outputs(
+                &novel_dir,
+                &author,
+                &existing.title,
+                &title,
+            )?;
+        }
         std::fs::create_dir_all(&novel_dir)?;
 
         let section_dir = novel_dir.join(types::SECTION_SAVE_DIR);
@@ -1540,7 +1576,7 @@ impl Downloader {
         save_toc_file(&novel_dir, &toc_file)?;
         ensure_default_files(&novel_dir, &toc_title, &toc_author, &toc_url);
 
-        let record = NovelRecord {
+        let mut record = NovelRecord {
             id: provisional_id,
             author: toc_author.clone(),
             title: toc_title.clone(),
@@ -1583,6 +1619,9 @@ impl Downloader {
             convert_failure: false,
             extra_fields: Default::default(),
         };
+        if track_raw_title {
+            record.set_raw_title(raw_title);
+        }
 
         let auto_add_tags = load_local_setting_bool("auto-add-tags");
         let auto_tags = if auto_add_tags {
@@ -1615,6 +1654,9 @@ impl Downloader {
                     }
                     if !record.title.is_empty() {
                         updated.title = record.title.clone();
+                    }
+                    if record.has_raw_title() {
+                        updated.set_raw_title(record.raw_title().to_string());
                     }
                     updated.file_title = record.file_title.clone();
                     updated.toc_url = record.toc_url.clone();

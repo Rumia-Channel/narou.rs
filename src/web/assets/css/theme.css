@@ -148,6 +148,15 @@
   --table-col-update-action-width: 3em;
   --table-col-story-width: 3em;
   --table-col-menu-width: 3em;
+  --tag-edit-padding-right: 3.10em;
+  --tag-color-edit-right: 1.20em;
+  --tag-color-edit-top: 50%;
+  --tag-color-edit-translate-y: -50%;
+  --tag-color-edit-padding-y: 0;
+  --tag-color-edit-padding-x: 0.15em;
+  --tag-color-edit-font-size: 0.85em;
+  --tag-color-edit-opacity: 0.65;
+  --tag-color-edit-active-opacity: 1;
 }
 
 /* Dark themes */

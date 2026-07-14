@@ -58,15 +58,8 @@ pub(crate) fn create_output_text_filename(
     } else {
         &settings.novel_author
     };
-    let title = if settings.novel_title.is_empty() {
-        &toc.title
-    } else {
-        &settings.novel_title
-    };
-    ensure_txt_extension(&sanitize_filename_for_output(&format!(
-        "[{}] {}",
-        author, title
-    )))
+    let title = settings.title_for_output(&toc.title);
+    ensure_txt_extension(&default_output_basename(author, &title))
 }
 
 fn convert_filename_to_ncode() -> bool {
@@ -89,6 +82,10 @@ fn sanitize_filename_for_output(name: &str) -> String {
         None,
         "output",
     )
+}
+
+pub(crate) fn default_output_basename(author: &str, title: &str) -> String {
+    sanitize_filename_for_output(&format!("[{author}] {title}"))
 }
 
 fn output_filename_length_limit() -> Option<usize> {
@@ -154,8 +151,33 @@ fn extract_ncode_like(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_output_text_path_for_textfile, sanitize_filename_for_output};
+    use super::{
+        create_output_text_filename, create_output_text_path_for_textfile,
+        sanitize_filename_for_output,
+    };
     use crate::converter::settings::NovelSettings;
+    use crate::downloader::TocObject;
+
+    #[test]
+    fn output_filename_strips_title_prefix_when_enabled() {
+        let mut settings = NovelSettings::default();
+        settings.enable_strip_title_prefix = true;
+        let toc = TocObject {
+            title: "【3/17第1巻発売】《コミカライズ企画進行中》悪役令息が破滅フラグ".to_string(),
+            author: "作者".to_string(),
+            toc_url: "https://example.com/works/1".to_string(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(1),
+        };
+        let raw_title = toc.title.clone();
+
+        assert_eq!(
+            create_output_text_filename(&settings, 1, &toc),
+            "[作者] 悪役令息が破滅フラグ.txt"
+        );
+        assert_eq!(toc.title, raw_title);
+    }
 
     #[test]
     fn textfile_output_path_uses_title_and_author_from_text() {

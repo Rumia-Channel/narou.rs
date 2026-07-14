@@ -52,6 +52,7 @@ pub struct NovelSettings {
     pub enable_insert_word_separator: bool,
     pub enable_insert_char_separator: bool,
     pub enable_strip_decoration_tag: bool,
+    pub enable_strip_title_prefix: bool,
     pub enable_add_end_to_title: bool,
     pub enable_prolonged_sound_mark_to_dash: bool,
     pub cut_old_subtitles: i64,
@@ -108,6 +109,7 @@ impl Default for NovelSettings {
             enable_insert_word_separator: false,
             enable_insert_char_separator: false,
             enable_strip_decoration_tag: false,
+            enable_strip_title_prefix: false,
             enable_add_end_to_title: false,
             enable_prolonged_sound_mark_to_dash: false,
             cut_old_subtitles: 0,
@@ -184,6 +186,16 @@ impl NovelSettings {
         };
 
         settings
+    }
+
+    /// Derive the generated-artifact title without mutating the stored setting values.
+    pub(crate) fn title_for_output(&self, fallback: &str) -> String {
+        let title = if self.novel_title.is_empty() {
+            fallback
+        } else {
+            &self.novel_title
+        };
+        crate::title::project_title(title, self.enable_strip_title_prefix)
     }
 
     pub fn create_for_text_file_with_options(
@@ -356,6 +368,7 @@ impl NovelSettings {
             "enable_insert_word_separator" => IniValue::Boolean(s.enable_insert_word_separator),
             "enable_insert_char_separator" => IniValue::Boolean(s.enable_insert_char_separator),
             "enable_strip_decoration_tag" => IniValue::Boolean(s.enable_strip_decoration_tag),
+            "enable_strip_title_prefix" => IniValue::Boolean(s.enable_strip_title_prefix),
             "enable_add_end_to_title" => IniValue::Boolean(s.enable_add_end_to_title),
             "enable_prolonged_sound_mark_to_dash" => {
                 IniValue::Boolean(s.enable_prolonged_sound_mark_to_dash)
@@ -506,6 +519,10 @@ impl NovelSettings {
             (
                 "enable_strip_decoration_tag",
                 IniValue::Boolean(defaults.enable_strip_decoration_tag),
+            ),
+            (
+                "enable_strip_title_prefix",
+                IniValue::Boolean(defaults.enable_strip_title_prefix),
             ),
             (
                 "enable_add_end_to_title",
@@ -702,6 +719,11 @@ impl NovelSettings {
                     settings.enable_strip_decoration_tag = b;
                 }
             }
+            "enable_strip_title_prefix" => {
+                if let Some(b) = to_bool(value) {
+                    settings.enable_strip_title_prefix = b;
+                }
+            }
             "enable_add_end_to_title" => {
                 if let Some(b) = to_bool(value) {
                     settings.enable_add_end_to_title = b;
@@ -889,6 +911,9 @@ impl NovelSettings {
         if let Some(v) = g("enable_strip_decoration_tag") {
             settings.enable_strip_decoration_tag = v;
         }
+        if let Some(v) = g("enable_strip_title_prefix") {
+            settings.enable_strip_title_prefix = v;
+        }
         if let Some(v) = g("enable_add_end_to_title") {
             settings.enable_add_end_to_title = v;
         }
@@ -973,6 +998,19 @@ mod tests {
     #[test]
     fn default_enables_half_indent_bracket_like_ruby() {
         assert!(NovelSettings::default().enable_half_indent_bracket);
+    }
+
+    #[test]
+    fn output_title_projection_preserves_raw_title_fields() {
+        let raw_title = "【書籍化】作品名";
+        let mut settings = NovelSettings::default();
+        settings.title = Some(raw_title.to_string());
+        settings.novel_title = raw_title.to_string();
+        settings.enable_strip_title_prefix = true;
+
+        assert_eq!(settings.title_for_output(raw_title), "作品名");
+        assert_eq!(settings.title.as_deref(), Some(raw_title));
+        assert_eq!(settings.novel_title, raw_title);
     }
 
     #[test]

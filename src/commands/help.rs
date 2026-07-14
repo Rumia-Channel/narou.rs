@@ -717,6 +717,12 @@ const MAIL_HELP: CmdHelp = CmdHelp {
     (初めてコマンドを使うときに自動で作成されます)
   ・添付ファイル名は mail_setting.yaml の attachment_filename_pattern / attachment_filename_replacement、
     または narou setting の mail.attachment-filename-pattern / mail.attachment-filename-replacement で正規表現置換できます。
+    置換対象は添付する電子書籍のファイル名だけです。フォルダ名は含みません。
+    mail_setting.yaml 側の設定が narou setting 側より優先されます。
+    置換結果が空文字になる場合は、元のファイル名をそのまま使います。
+    例: [作者名]タイトル.epub -> タイトル.epub
+      narou setting mail.attachment-filename-pattern='^\\[[^\\]]+\\](.*)$'
+      narou setting mail.attachment-filename-replacement='$1'
   ・<target>にhotentryを指定した場合、最新のhotentryを送信します。
 
   Examples:

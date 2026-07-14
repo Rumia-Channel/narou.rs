@@ -120,6 +120,11 @@ pub fn cmd_convert(
                 }
             };
 
+            if let Err(err) = narou_rs::title::sync_title_projection(id) {
+                println!("  Error: {}", err);
+                continue;
+            }
+
             let (novel_dir, title, author) = match narou_rs::db::with_database(|db| {
                 let record = db
                     .get(id)

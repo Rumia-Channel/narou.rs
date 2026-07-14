@@ -617,7 +617,7 @@ li.enable-selected.disabled a {
 
 .tag-editable {
   position: relative;
-  padding-right: 1.40em;
+  padding-right: var(--tag-edit-padding-right);
 }
 
 .tag-editable-partial {
@@ -643,6 +643,26 @@ li.enable-selected.disabled a {
 
 .tag-remove:hover {
   opacity: 1;
+}
+
+.tag-color-edit {
+  position: absolute;
+  right: var(--tag-color-edit-right);
+  top: var(--tag-color-edit-top);
+  transform: translateY(var(--tag-color-edit-translate-y));
+  padding: var(--tag-color-edit-padding-y) var(--tag-color-edit-padding-x);
+  border: none;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--tag-color-edit-font-size);
+  opacity: var(--tag-color-edit-opacity);
+}
+
+.tag-color-edit:hover,
+.tag-color-edit:focus-visible {
+  opacity: var(--tag-color-edit-active-opacity);
 }
 
 .tag-editor-input {
