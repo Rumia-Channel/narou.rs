@@ -15,7 +15,7 @@ import {
 import { setShortcutHandlers, initShortcuts } from './shortcuts.js';
 import {
   setContextHandlers, initContextMenu, initTagColorMenu,
-  getStoredMenuStyle, setStoredMenuStyle,
+  getStoredMenuStyle, setStoredMenuStyle, showTagColorMenu,
 } from './context_menu.js';
 
 const REBOOT_RETURN_TO_KEY = 'narou-rs-webui-reboot-return-to';
@@ -868,6 +868,7 @@ export function bindActions() {
       if (!popup) window.location.href = '/novels/' + id + '/author_comments';
     },
     refreshTags: () => refreshTags(),
+    tagColorChanged: () => refreshOpenTagEditor(),
     refreshList: () => refreshList(),
   };
 
@@ -1187,6 +1188,16 @@ function closeTagEditor() {
   El.tagEditModal?.classList.add('hide');
 }
 
+async function refreshOpenTagEditor() {
+  if (!El.tagEditModal || El.tagEditModal.classList.contains('hide')) return;
+  const idsJson = El.tagEditModal.dataset.ids;
+  if (!idsJson) return;
+  const ids = JSON.parse(idsJson);
+  if (Array.isArray(ids) && ids.length > 0) {
+    await refreshTagEditor(ids);
+  }
+}
+
 async function openTagEditor(ids) {
   const targetIds = ids || requireSelectedIds();
   if (!targetIds || targetIds.length === 0) return;
@@ -1420,6 +1431,20 @@ function renderTagEditorTags(ids, taginfo) {
       count.textContent = ` ${presentCount}/${selectionCount}`;
       chip.appendChild(count);
     }
+
+    const colorBtn = document.createElement('button');
+    colorBtn.type = 'button';
+    colorBtn.className = 'tag-color-edit';
+    colorBtn.textContent = '色';
+    colorBtn.title = `「${info.tag}」の色を変更`;
+    colorBtn.setAttribute('aria-label', colorBtn.title);
+    colorBtn.addEventListener('click', (event) => {
+      showTagColorMenu(event, info.tag);
+    });
+    chip.appendChild(colorBtn);
+    chip.addEventListener('contextmenu', (event) => {
+      showTagColorMenu(event, info.tag);
+    });
 
     const removeBtn = document.createElement('span');
     removeBtn.className = 'tag-remove';

@@ -149,6 +149,7 @@ export function initTagColorMenu() {
 
 export function showTagColorMenu(e, tagName) {
   e.preventDefault();
+  e.stopPropagation();
   const menu = El.selectColorMenu;
   if (!menu) return;
 
@@ -163,9 +164,11 @@ export function showTagColorMenu(e, tagName) {
 
 async function changeTagColor(tagName, color) {
   try {
-    await postJson('/api/tag/change_color', { tag: tagName, color });
-    actionHandlers.refreshTags?.();
-    actionHandlers.refreshList?.();
+    const result = await postJson('/api/tag/change_color', { tag: tagName, color });
+    if (!result || result.success !== true) return;
+    await actionHandlers.refreshTags?.();
+    await actionHandlers.refreshList?.();
+    await actionHandlers.tagColorChanged?.(tagName);
   } catch { /* ignore */ }
 }
 
