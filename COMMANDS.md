@@ -154,6 +154,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 有効ターゲット検証: Nコード or URL(サイト設定マッチ)
 - Nコード指定時は `https://ncode.syosetu.com/<ncode>/` からURLキャプチャを作り、サイト定義の `\k<ncode>` を展開してDLする
 - `webnovel/*.yaml` の `series_url` / `series_item_url` に一致するシリーズ URL は、個別小説 URL に展開してから通常の download 処理に渡す。小説家になろう、R18 なろう、カクヨムのシリーズ/コレクション URL に対応
+- 新規取得したセクションは解析済みの本文・前書き・後書きに加えて raw HTML も `illust_grep_pattern` の検索対象にし、本文として保存しないサイト固有マークアップ内の挿絵を先取り保存する。未更新セクションは従来どおり保存済み section のみを検索する
 
 ---
 
