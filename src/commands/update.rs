@@ -187,6 +187,7 @@ pub fn cmd_update(opts: UpdateOptions) {
             if domain_groups.len() <= 1 {
                 run_serial_update(
                     &target_ids,
+                    &domain_records,
                     &ctx,
                     &mut mistook,
                     &mut hotentries,
@@ -209,6 +210,7 @@ pub fn cmd_update(opts: UpdateOptions) {
         } else {
             run_serial_update(
                 &target_ids,
+                &domain_records,
                 &ctx,
                 &mut mistook,
                 &mut hotentries,
@@ -1523,6 +1525,7 @@ where
 /// fallback to single-stream execution.
 fn run_serial_update(
     target_ids: &[i64],
+    domain_records: &HashMap<i64, String>,
     ctx: &UpdateContext,
     mistook: &mut usize,
     hotentries: &mut HashMap<i64, Vec<SubtitleInfo>>,
@@ -1535,9 +1538,7 @@ fn run_serial_update(
             std::process::exit(1);
         }
     };
-    let mut last_time = Instant::now()
-        .checked_sub(std::time::Duration::from_secs_f64(ctx.interval_secs))
-        .unwrap_or_else(Instant::now);
+    let mut last_started_by_domain = HashMap::new();
 
     for (i, &id) in target_ids.iter().enumerate() {
         if interrupted.load(AtomicOrdering::SeqCst) {
@@ -1549,14 +1550,30 @@ fn run_serial_update(
         let inc = process_novel_for_update(
             &mut downloader,
             id,
+            domain_records
+                .get(&id)
+                .map(String::as_str)
+                .unwrap_or(UNKNOWN_DOMAIN_KEY),
             ctx,
-            &mut last_time,
+            &mut last_started_by_domain,
             hotentries,
             interrupted,
         )?;
         *mistook += inc;
     }
     Ok(())
+}
+
+fn remaining_update_interval_secs(
+    last_started_by_domain: &HashMap<String, Instant>,
+    domain: &str,
+    now: Instant,
+    interval_secs: f64,
+) -> Option<f64> {
+    let elapsed = now
+        .saturating_duration_since(*last_started_by_domain.get(domain)?)
+        .as_secs_f64();
+    (elapsed < interval_secs).then_some(interval_secs - elapsed)
 }
 
 /// Drive the parallel dispatch. Workers process one domain at a time
@@ -1612,9 +1629,7 @@ fn run_parallel_per_domain_update(
                     return Ok((0, HashMap::new()));
                 }
             };
-            let mut last_time = Instant::now()
-                .checked_sub(std::time::Duration::from_secs_f64(ctx.interval_secs))
-                .unwrap_or_else(Instant::now);
+            let mut last_started_by_domain = HashMap::new();
             let mut local_mistook = 0usize;
             let mut local_hotentries: HashMap<i64, Vec<SubtitleInfo>> = HashMap::new();
 
@@ -1640,8 +1655,9 @@ fn run_parallel_per_domain_update(
                     match process_novel_for_update(
                         &mut downloader,
                         id,
+                        &domain,
                         &ctx,
-                        &mut last_time,
+                        &mut last_started_by_domain,
                         &mut local_hotentries,
                         interrupted.as_ref(),
                     ) {
@@ -1685,8 +1701,9 @@ fn run_parallel_per_domain_update(
 fn process_novel_for_update(
     downloader: &mut Downloader,
     id: i64,
+    domain: &str,
     ctx: &UpdateContext,
-    last_time: &mut Instant,
+    last_started_by_domain: &mut HashMap<String, Instant>,
     hotentries: &mut HashMap<i64, Vec<SubtitleInfo>>,
     interrupted: &AtomicBool,
 ) -> std::result::Result<usize, UpdateInterrupted> {
@@ -1704,11 +1721,15 @@ fn process_novel_for_update(
         return Ok(1);
     }
 
-    let elapsed = last_time.elapsed().as_secs_f64();
-    if elapsed < ctx.interval_secs {
-        sleep_with_interrupt(ctx.interval_secs - elapsed, interrupted)?;
+    if let Some(wait_secs) = remaining_update_interval_secs(
+        last_started_by_domain,
+        domain,
+        Instant::now(),
+        ctx.interval_secs,
+    ) {
+        sleep_with_interrupt(wait_secs, interrupted)?;
     }
-    *last_time = Instant::now();
+    last_started_by_domain.insert(domain.to_string(), Instant::now());
 
     downloader.set_progress(ctx.make_progress(id));
 
@@ -1821,7 +1842,7 @@ mod tests {
         MODIFIED_TAG, UNKNOWN_DOMAIN_KEY, abort_if_interrupted,
         apply_general_lastup_check_result, build_domain_groups, classify_narou_api_chunk,
         count_general_lastup_narou_targets, initial_general_lastup_work_units,
-        load_update_max_parallel_domains, sleep_with_interrupt,
+        load_update_max_parallel_domains, remaining_update_interval_secs, sleep_with_interrupt,
     };
     use chrono::{Duration, TimeZone, Utc};
     use narou_rs::db::NovelRecord;
@@ -1840,6 +1861,41 @@ mod tests {
     fn sleep_with_interrupt_returns_immediately_for_zero_duration() {
         let interrupted = AtomicBool::new(false);
         sleep_with_interrupt(0.0, &interrupted).unwrap();
+    }
+
+    #[test]
+    fn update_interval_wait_is_scoped_to_the_same_domain() {
+        let started = std::time::Instant::now();
+        let mut last_started_by_domain = HashMap::new();
+        last_started_by_domain.insert("alpha.example".to_string(), started);
+        let now = started + std::time::Duration::from_secs(1);
+
+        let same_domain = remaining_update_interval_secs(
+            &last_started_by_domain,
+            "alpha.example",
+            now,
+            2.5,
+        )
+        .unwrap();
+        assert!((same_domain - 1.5).abs() < f64::EPSILON);
+        assert_eq!(
+            remaining_update_interval_secs(
+                &last_started_by_domain,
+                "beta.example",
+                now,
+                2.5,
+            ),
+            None
+        );
+        assert_eq!(
+            remaining_update_interval_secs(
+                &last_started_by_domain,
+                "alpha.example",
+                started + std::time::Duration::from_secs(3),
+                2.5,
+            ),
+            None
+        );
     }
 
     #[test]

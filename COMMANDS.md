@@ -189,7 +189,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `modified` タグ管理: 更新成功時に自動削除、`--gl` で変更検出時に自動付与
 - `end` タグ管理: 更新・`--gl other` で完結状態に合わせて `end` タグを同期
 - `_convert_failure` フラグ: 変換失敗時に記録、次回更新で再変換を試行
-- `update.interval` 設定対応（最低2.5秒、YAMLの数値/文字列を許容）
+- `update.interval` 設定対応（最低2.5秒、YAMLの数値/文字列を許容）。直近の更新開始時刻をサイトドメイン単位で保持し、同一ドメインへの連続更新時だけ待機する。Web UI などの直列更新でも異なるドメイン間では待機時間を引き継がず、ドメイン不明の小説は共通の安全側バケットとして扱う
 - `update.strong` 設定対応。同日更新時は保存済み `本文/*.yaml` の本文要素と取得本文をハッシュ比較し、実質同一なら更新扱いにしない
 - Ruby版同様 `.narou/section_hash_cache.yaml` を永続化し、strong update 時の既存 section digest を再利用する
 - カクヨムは各話の `publishedAt` を初回掲載日時、`editedAt`（無い場合は `publishedAt`）を `subupdate` として扱い、本文改稿のみの通常 Update でも対象話を更新する
@@ -335,7 +335,7 @@ narou setting name         # 読み取り
 | `hotentry` | boolean | hotentry 自動生成 |
 | `concurrency` | boolean | 並列DL+変換 |
 | `logging` | boolean | ログ保存 |
-| `update.interval` | float | 小説間ウェイト (秒、最小2.5) |
+| `update.interval` | float | 同一サイトドメインの小説間ウェイト (秒、最小2.5) |
 | `update.strong` | boolean | 同日更新時の内容チェック |
 | `update.convert-only-new-arrival` | boolean | 新着時のみ変換 |
 | `update.sort-by` | select | 更新順ソートキー |
