@@ -591,6 +591,19 @@ fn section_timestamp_ymd(
     Some(timezone.ymd(dt))
 }
 
+fn illustration_sources<'a>(
+    section: &'a SectionElement,
+    raw_html: Option<&'a str>,
+) -> impl Iterator<Item = &'a str> {
+    [
+        section.body.as_str(),
+        section.introduction.as_str(),
+        section.postscript.as_str(),
+    ]
+    .into_iter()
+    .chain(raw_html)
+}
+
 impl Downloader {
     pub fn new() -> Result<Self> {
         Self::with_user_agent(None)
@@ -898,6 +911,7 @@ impl Downloader {
         illust_dir: &Path,
         illustration_store: &mut crate::illustration_store::IllustrationStore,
         toc_url: &str,
+        raw_html: Option<&str>,
     ) -> Result<()> {
         let illust_url_pattern = match &setting.illust_grep_pattern {
             Some(p) => p,
@@ -906,13 +920,11 @@ impl Downloader {
 
         let re = compile_html_pattern(illust_url_pattern).map_err(NarouError::Regex)?;
 
-        let intro_text = section.introduction.as_str();
-        let post_text = section.postscript.as_str();
-        let sources = [&section.body, intro_text, post_text];
-
         std::fs::create_dir_all(illust_dir)?;
 
-        for source in &sources {
+        // 解析済みセクションには、本文として保存しないサイト固有マークアップが含まれないことがある。
+        // 保存済みデータや変換結果を変えずにその中の挿絵も取得できるよう、今回取得した raw HTML も検索する。
+        for source in illustration_sources(section, raw_html) {
             for caps in re.captures_iter(source) {
                 if let Some(url_match) = caps.get(1) {
                     let raw_url = url_match.as_str();
@@ -1448,7 +1460,14 @@ impl Downloader {
                 }
                 save_raw_file(&raw_dir, subtitle, &raw_html)?;
                 if let Some(store) = illustration_store.as_mut() {
-                    self.download_illustration(&setting, &section, &illust_dir, store, &toc_url)?;
+                    self.download_illustration(
+                        &setting,
+                        &section,
+                        &illust_dir,
+                        store,
+                        &toc_url,
+                        Some(raw_html.as_str()),
+                    )?;
                 }
                 updated_count += 1;
                 downloaded_index += 1;
@@ -1463,6 +1482,7 @@ impl Downloader {
                                 &illust_dir,
                                 store,
                                 &toc_url,
+                                None,
                             )?;
                         }
                     }
@@ -2143,11 +2163,13 @@ impl Downloader {
 #[cfg(test)]
 mod tests {
     use super::{
-        Downloader, Over18AccessDecision, over18_access_decision,
+        Downloader, Over18AccessDecision, illustration_sources, over18_access_decision,
         requires_over18_confirmation, resolve_novel_type, resolve_user_agent,
     };
     use super::novel_info::NovelInfo;
     use super::site_setting::SiteSetting;
+    use super::types::SectionElement;
+    use super::util::compile_html_pattern;
     use crate::db::{self, Database};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -2159,6 +2181,36 @@ mod tests {
         fn drop(&mut self) {
             *db::DATABASE.lock() = self.0.take();
         }
+    }
+
+    #[test]
+    fn syosetu_org_illustration_pattern_uses_new_raw_html_without_crossing_links() {
+        let setting: SiteSetting =
+            serde_yaml::from_str(include_str!("../../webnovel/syosetu.org.yaml")).unwrap();
+        let re = compile_html_pattern(setting.illust_grep_pattern.as_deref().unwrap()).unwrap();
+        let section = SectionElement {
+            data_type: "html".to_string(),
+            body: "本文".to_string(),
+            introduction: String::new(),
+            postscript: String::new(),
+        };
+        let raw_html = r#"<a href="https://syosetu.org/?mode=url_jump&amp;url=https%3A%2F%2Fexample.com">通販サイト</a>
+<span>後書き</span>
+<a href="http://syosetu.org/img/user/10193/110088.jpg" alt="挿絵" name='img'>【挿絵表示】</a>"#;
+
+        assert!(!illustration_sources(&section, None).any(|source| re.is_match(source)));
+        let mut urls = Vec::new();
+        for source in illustration_sources(&section, Some(raw_html)) {
+            for caps in re.captures_iter(source) {
+                if let Some(url_match) = caps.get(1) {
+                    urls.push(url_match.as_str());
+                }
+            }
+        }
+        assert_eq!(
+            urls,
+            vec!["http://syosetu.org/img/user/10193/110088.jpg"]
+        );
     }
 
     #[test]

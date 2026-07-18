@@ -44,7 +44,7 @@ introduction_pattern: <div id="maegaki">(?<introduction>.+)<br><hr><br></div><
 postscript_pattern: null
 
 illust_current_url: null
-illust_grep_pattern: <a href="(?<src>.+?)" alt="挿絵" name='img'>【挿絵表示】</a>
+illust_grep_pattern: <a href="(?<src>[^"]+)" alt="挿絵" name='img'>【挿絵表示】</a>
 
 # 目次ページから直接拾える基本情報
 title: <[^>]+itemprop="name">(?<title>.+?)</span>
