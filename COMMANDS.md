@@ -384,6 +384,7 @@ narou setting name         # 読み取り
 - `default.*` / `force.*` / `default_args.*` は既知の original setting / command 名だけ受理し、未知名を拒否
 - `default_args.trace` / `default_args.console` を含む Ruby 由来の command 名を受理
 - `webui.table.reload-timing` / `webui.theme` / `webui.new-tag-color` など hidden select 項目でも選択肢チェックを実施
+- Windows の WEB UI で directory 設定を保存する際、`fs::canonicalize` が返す `\\?\UNC\` を通常の `\\server\share` 形式へ戻し、`convert.copy-to` などの UNC パスを保持
 - `--list` 現在値一覧表示
 - `--all` 全変数表示
 - `setting -a` では hidden 項目に加え、`default.*` / `force.*` / `default_args.*` を型・説明付きで Local Variable List に列挙
