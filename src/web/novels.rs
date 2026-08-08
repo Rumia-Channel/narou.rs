@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use crate::compat::{load_frozen_ids_from_inventory, record_is_frozen};
 use crate::db::novel_record::NovelRecord;
 use crate::db::{with_database, with_database_mut};
-use crate::downloader::fetch::domain_of;
+use crate::downloader::http_policy::domain_of;
 use crate::downloader::site_setting::SiteSetting;
 use crate::downloader::{site_timezone, SiteTimezone};
 use crate::error::NarouError;

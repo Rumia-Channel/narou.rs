@@ -11,6 +11,7 @@ pub mod error;
 pub mod illustration_store;
 pub mod logger;
 pub mod mail;
+pub mod native;
 pub mod platform;
 pub mod progress;
 pub mod queue;
