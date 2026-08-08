@@ -48,6 +48,7 @@ subtle = "2.6"
 getrandom = "0.4"
 fs2 = "0.4"
 libc = "0.2"
+url = "2"
 
 [build-dependencies]
 base64 = "0.22"

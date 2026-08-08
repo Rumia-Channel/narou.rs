@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use futures::future::BoxFuture;
 use parking_lot::Mutex;
 
 use crate::db::NovelRecord;
@@ -60,15 +61,17 @@ impl MockHttpClient {
 }
 
 impl HttpClient for MockHttpClient {
-    fn send(&self, request: HttpRequest<'_>) -> Result<HttpResponse> {
-        self.requests.lock().push(format!("{} {}", method_name(request.method), request.url));
-        self.responses
-            .lock()
-            .get(request.url)
-            .cloned()
-            .ok_or_else(|| {
-                NarouError::Http(format!("no canned response for {}", request.url))
-            })
+    fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, Result<HttpResponse>> {
+        Box::pin(async move {
+            self.requests.lock().push(format!("{} {}", method_name(request.method), request.url));
+            self.responses
+                .lock()
+                .get(&request.url)
+                .cloned()
+                .ok_or_else(|| {
+                    NarouError::Http(format!("no canned response for {}", request.url))
+                })
+        })
     }
 }
 
@@ -248,9 +251,14 @@ impl FakeRateLimiter {
 }
 
 impl RateLimiter for FakeRateLimiter {
-    fn acquire(&self, _scope: &RateLimitScope) -> Result<()> {
-        self.acquisitions.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+    fn acquire<'a>(
+        &'a self,
+        _scope: &'a RateLimitScope,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.acquisitions.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
     }
 }
 
@@ -295,10 +303,15 @@ mod tests {
         let client = MockHttpClient::new();
         client.add_text("https://example.com/toc", 200, "<html>toc</html>");
 
-        let body = client.get_text("https://example.com/toc").unwrap();
+        let body = futures::executor::block_on(async {
+            let resp = client.send(HttpRequest::get("https://example.com/toc")).await.unwrap();
+            String::from_utf8_lossy(&resp.body).into_owned()
+        });
         assert_eq!(body, "<html>toc</html>");
 
-        let err = client.get_text("https://example.com/missing").unwrap_err();
+        let err = futures::executor::block_on(async {
+            client.send(HttpRequest::get("https://example.com/missing")).await.unwrap_err()
+        });
         assert!(err.to_string().contains("no canned response"));
 
         let urls = client.requested_urls();
@@ -366,8 +379,10 @@ mod tests {
     fn fake_rate_limiter_counts_acquisitions() {
         let limiter = FakeRateLimiter::new();
         let scope = RateLimitScope::site("example.com");
-        limiter.acquire(&scope).unwrap();
-        limiter.acquire(&scope).unwrap();
+        futures::executor::block_on(async {
+            limiter.acquire(&scope).await.unwrap();
+            limiter.acquire(&scope).await.unwrap();
+        });
         assert_eq!(limiter.acquisition_count(), 2);
     }
 
