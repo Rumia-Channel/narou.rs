@@ -116,6 +116,13 @@ impl RateLimiter {
     }
 }
 
+impl crate::platform::RateLimiter for RateLimiter {
+    fn acquire(&self, scope: &crate::platform::RateLimitScope) -> Result<(), crate::error::NarouError> {
+        self.wait_for_host(&scope.site);
+        Ok(())
+    }
+}
+
 fn host_key_from_url(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()

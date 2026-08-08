@@ -12,6 +12,7 @@ use reqwest::header::{
 
 use crate::compat::configure_hidden_console_command;
 use crate::error::{NarouError, Result};
+use crate::platform::{HttpClient, HttpMethod, HttpRequest, HttpResponse};
 
 use super::rate_limit::RateLimiter;
 use super::security::{
@@ -25,9 +26,9 @@ pub struct HttpFetcher {
     pub client: reqwest::blocking::Client,
     pub manual_redirect_client: reqwest::blocking::Client,
     pub user_agent: String,
-    pub tier_failures: HashMap<String, [u8; 3]>,
+    tier_failures: parking_lot::Mutex<HashMap<String, [u8; 3]>>,
     pub rate_limiter: RateLimiter,
-    pub prefer_curl: bool,
+    prefer_curl: std::sync::atomic::AtomicBool,
 }
 
 impl HttpFetcher {
@@ -39,9 +40,9 @@ impl HttpFetcher {
             client,
             manual_redirect_client,
             user_agent: user_agent.to_string(),
-            tier_failures: HashMap::new(),
+            tier_failures: parking_lot::Mutex::new(HashMap::new()),
             rate_limiter: RateLimiter::new(false),
-            prefer_curl: false,
+            prefer_curl: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -50,7 +51,7 @@ impl HttpFetcher {
     }
 
     pub fn fetch_text(
-        &mut self,
+        &self,
         url: &str,
         cookie: Option<&str>,
         encoding: Option<&str>,
@@ -59,7 +60,7 @@ impl HttpFetcher {
         let domain = domain_of(url).to_string();
         let mut last_error = None;
 
-        if self.prefer_curl {
+        if self.prefer_curl.load(std::sync::atomic::Ordering::Relaxed) {
             match self.fetch_tier_curl(url, cookie, encoding) {
                 Ok(body) => return Ok(body),
                 Err(err) if should_stop_fetch_fallback(&err) => return Err(err),
@@ -67,23 +68,22 @@ impl HttpFetcher {
             }
         }
 
-        let skip_curl = self
-            .tier_failures
+        let tier_failures = self.tier_failures.lock();
+        let skip_curl = tier_failures
             .get(&domain)
-            .map_or(false, |f| f[0] >= FAIL_THRESHOLD);
-        let skip_reqwest = self
-            .tier_failures
+            .is_some_and(|f| f[0] >= FAIL_THRESHOLD);
+        let skip_reqwest = tier_failures
             .get(&domain)
-            .map_or(false, |f| f[1] >= FAIL_THRESHOLD);
-        let skip_wget = self
-            .tier_failures
+            .is_some_and(|f| f[1] >= FAIL_THRESHOLD);
+        let skip_wget = tier_failures
             .get(&domain)
-            .map_or(false, |f| f[2] >= FAIL_THRESHOLD);
+            .is_some_and(|f| f[2] >= FAIL_THRESHOLD);
+        drop(tier_failures);
 
-        if !skip_curl && !self.prefer_curl {
+        if !skip_curl && !self.prefer_curl.load(std::sync::atomic::Ordering::Relaxed) {
             match self.fetch_tier_curl(url, cookie, encoding) {
                 Ok(body) => {
-                    self.prefer_curl = true;
+                    self.prefer_curl.store(true, std::sync::atomic::Ordering::Relaxed);
                     return Ok(body);
                 }
                 Err(err) => {
@@ -91,7 +91,7 @@ impl HttpFetcher {
                         return Err(err);
                     }
                     last_error = Some(err);
-                    self.tier_failures.entry(domain.clone()).or_insert([0; 3])[0] += 1;
+                    self.tier_failures.lock().entry(domain.clone()).or_insert([0; 3])[0] += 1;
                 }
             }
         }
@@ -104,7 +104,7 @@ impl HttpFetcher {
                         return Err(err);
                     }
                     last_error = Some(err);
-                    self.tier_failures.entry(domain.clone()).or_insert([0; 3])[1] += 1;
+                    self.tier_failures.lock().entry(domain.clone()).or_insert([0; 3])[1] += 1;
                 }
             }
         }
@@ -117,7 +117,7 @@ impl HttpFetcher {
                         return Err(err);
                     }
                     last_error = Some(err);
-                    self.tier_failures.entry(domain.clone()).or_insert([0; 3])[2] += 1;
+                    self.tier_failures.lock().entry(domain.clone()).or_insert([0; 3])[2] += 1;
                 }
             }
         }
@@ -157,7 +157,9 @@ impl HttpFetcher {
                 request = request.header("Cookie", cookie);
             }
 
-            let response = request.send()?;
+            let response = request
+                .send()
+                .map_err(|e| NarouError::Http(e.to_string()))?;
             let status = response.status();
             if status.is_redirection() {
                 let Some(location) = response.headers().get(LOCATION) else {
@@ -399,6 +401,37 @@ impl HttpFetcher {
     }
 }
 
+impl HttpClient for HttpFetcher {
+    fn send(&self, request: HttpRequest<'_>) -> Result<HttpResponse> {
+        match request.method {
+            HttpMethod::Get => {
+                let cookie = request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, value)| value.as_str());
+                // The tiered fetcher consumes the rate limiter internally
+                // (curl/reqwest/wget all call `wait_for_url`), so a fetch here
+                // is already spaced out per host. Encode the body as UTF-8
+                // lossy: the domain layer re-decodes with the site encoding.
+                let body = self.fetch_text(request.url, cookie, None)?;
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
+                    body: body.into_bytes(),
+                })
+            }
+            HttpMethod::Post => Err(NarouError::Platform(
+                "HttpFetcher transport does not support POST".into(),
+            )),
+        }
+    }
+
+    fn get_text(&self, url: &str) -> Result<String> {
+        self.fetch_text(url, None, None)
+    }
+}
+
 fn build_reqwest_client(user_agent: &str, follow_redirects: bool) -> Result<reqwest::blocking::Client> {
     let redirect_policy = if follow_redirects {
         reqwest::redirect::Policy::custom(|attempt| {
@@ -414,7 +447,7 @@ fn build_reqwest_client(user_agent: &str, follow_redirects: bool) -> Result<reqw
         reqwest::redirect::Policy::none()
     };
 
-    Ok(reqwest::blocking::Client::builder()
+    reqwest::blocking::Client::builder()
         .user_agent(user_agent)
         .default_headers(default_request_headers())
         .cookie_store(true)
@@ -425,7 +458,8 @@ fn build_reqwest_client(user_agent: &str, follow_redirects: bool) -> Result<reqw
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(TOTAL_TIMEOUT_SECS))
         .redirect(redirect_policy)
-        .build()?)
+        .build()
+        .map_err(|e| NarouError::Http(e.to_string()))
 }
 
 fn ensure_success_status(
@@ -440,7 +474,9 @@ fn ensure_success_status(
         return Err(NarouError::NotFound(url.to_string()));
     }
     if !status.is_success() {
-        return Err(response.error_for_status().unwrap_err().into());
+        return Err(NarouError::Http(
+            response.error_for_status().unwrap_err().to_string(),
+        ));
     }
     Ok(response)
 }
@@ -555,7 +591,10 @@ impl HttpFetcher {
             return self.send_reqwest_with_manual_cookie_redirects(url, cookie);
         }
 
-        Ok(self.client.get(url).send()?)
+        self.client
+            .get(url)
+            .send()
+            .map_err(|e| NarouError::Http(e.to_string()))
     }
 
     fn send_reqwest_with_manual_cookie_redirects(
@@ -573,7 +612,9 @@ impl HttpFetcher {
                 request = request.header("Cookie", cookie);
             }
 
-            let response = request.send()?;
+            let response = request
+                .send()
+                .map_err(|e| NarouError::Http(e.to_string()))?;
             if response.status().is_redirection() {
                 let Some(location) = response.headers().get(LOCATION) else {
                     return Ok(response);

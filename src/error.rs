@@ -9,7 +9,10 @@ pub enum NarouError {
     Yaml(#[from] serde_yaml::Error),
 
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
+
+    #[error("Platform error: {0}")]
+    Platform(String),
 
     #[error("Regex error: {0}")]
     Regex(#[from] regex::Error),

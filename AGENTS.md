@@ -131,6 +131,14 @@ src/
   error.rs                         - NarouError enum + Result type
   queue.rs                         - PersistentQueue (YAMLベース永続化ジョブキュー)
   lib.rs                           - クレートルート (pub mod定義)
+  platform/
+    mod.rs                         - プラットフォーム抽象層 (traits re-export, 設計: docs/platform-abstraction.md)
+    http.rs                        - HttpClient trait + HttpRequest/HttpResponse (coreはreqwest/curlを直接呼ばない)
+    clock.rs                       - Clock trait + SystemClock
+    rate_limiter.rs                - RateLimiter trait + RateLimitScope
+    object_store.rs                - ObjectStore trait + ObjectKey/ObjectMetadata
+    repository.rs                  - NovelRepository trait + NovelId/NovelQuery
+    mocks.rs                       - MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter
   commands/
     mod.rs                         - pub mod + resolve_target_to_id, resolve_alias_target
     init.rs                        - narou init (ディレクトリ作成, AozoraEpub3設定)
@@ -234,6 +242,14 @@ sample/
 - `sample/narou/lib/command/*.rb` — 各コマンド実装 (help/CLI挙動の参照元)
 
 ## Current Status (2026-07)
+
+### プラットフォーム抽象化 (Phase 1: 2026-08)
+- **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。依存調査結果、module 構成、trait 一覧、migration phases (1-8) を定義。
+- **Phase 1 完了**: `src/platform/` に traits（HttpClient / Clock / RateLimiter / ObjectStore / NovelRepository）+ テスト用 mock（MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter / SystemClock）を導入。
+- `NarouError::Http` は `reqwest::Error` の直接 `#[from]` をやめ String 化。`Platform(String)` variant 追加。core から reqwest 型が error 経由で漏れるのを防止。
+- `HttpFetcher` は interior mutability（`Mutex<HashMap>` + `AtomicBool`）化し `&self` ベースの `HttpClient` impl を追加。既存 `fetch_text` 等の公開 API は `&self` 化（外部挙動変化なし）。
+- native `RateLimiter` に `platform::RateLimiter` の `acquire` を実装（サイト別スコープ対応の土台）。
+- 今後の phase: 2=downloader の trait 利用化、3=Database の Repository 化、4=converter/illustration の FS 除去、5=Web UI の service 層化、6=Worker skeleton、7=D1/Wasabi/Worker fetch、8=Queues/crawler/scheduler。
 
 ### 最近の追加 (2026-05〜07)
 - **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1 で従来の逐次動作、フォース指定・ウェブモード・ドメインが1種類のときは自動的に逐次にフォールバック

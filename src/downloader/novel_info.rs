@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::error::Result;
+use crate::error::{NarouError, Result};
 
 use super::site_setting::SiteSetting;
 
@@ -49,11 +49,16 @@ impl NovelInfo {
             let resolved_url = setting
                 .novel_info_url_with_captures(url_captures)
                 .unwrap_or_else(|| setting.interpolate(novel_info_url));
-            let response = client.get(&resolved_url).send()?;
+            let response = client
+                .get(&resolved_url)
+                .send()
+                .map_err(|e| NarouError::Http(e.to_string()))?;
             if !response.status().is_success() {
                 return Ok(Self::empty());
             }
-            let mut body = response.text()?;
+            let mut body = response
+                .text()
+                .map_err(|e| NarouError::Http(e.to_string()))?;
             crate::downloader::pretreatment_source(&mut body, setting.encoding(), Some(setting));
 
             Ok(Self::from_novel_info_source(setting, &body))
