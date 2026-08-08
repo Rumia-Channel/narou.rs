@@ -1,9 +1,11 @@
 use chrono::{DateTime, Utc};
 
-use crate::error::Result;
+use crate::error::{NarouError, Result};
+use crate::platform::{HttpClient, HttpRequest, RateLimitScope, RateLimiter};
 
-use super::fetch::HttpFetcher;
-use super::rate_limit::RateLimiter;
+use super::http_policy::{ensure_success_response, host_of};
+use super::rate_limit::RateLimiter as NativeRateLimiter;
+use super::security::validate_public_url;
 
 const NAROU_API_DEFAULT_USER_AGENT: &str = "Narou RS";
 const NAROU_API_DEFAULT_INTERVAL_SECS: f64 = 1.0;
@@ -32,8 +34,27 @@ pub fn narou_api_interval_secs() -> f64 {
 /// Rate limiter dedicated to なろうAPI calls. Independent of the
 /// `download.interval` / `download.wait-steps` settings used by per-episode
 /// downloads.
-pub fn narou_api_rate_limiter() -> RateLimiter {
-    RateLimiter::with_settings(narou_api_interval_secs(), 0)
+pub fn narou_api_rate_limiter() -> NativeRateLimiter {
+    NativeRateLimiter::with_settings(narou_api_interval_secs(), 0)
+}
+
+/// Fetch one なろうAPI JSON response: rate-limit with the dedicated API
+/// limiter, send with the API user-agent, and map non-success statuses to
+/// errors. The body is decoded as UTF-8 (the API always returns JSON).
+pub async fn fetch_narou_api_json(
+    http: &dyn HttpClient,
+    rate_limiter: &dyn RateLimiter,
+    url: &str,
+    user_agent: &str,
+) -> Result<String> {
+    validate_public_url(url).map_err(|e| NarouError::Http(e.to_string()))?;
+    rate_limiter
+        .acquire(&RateLimitScope::site(host_of(url)))
+        .await?;
+    let request = HttpRequest::get(url).with_header("User-Agent", user_agent);
+    let response = http.send(request).await?;
+    let response = ensure_success_response(url, response)?;
+    Ok(String::from_utf8_lossy(&response.body).into_owned())
 }
 
 /// Parse a date/time string from the Syosetu API.
@@ -56,7 +77,7 @@ fn parse_api_entries(body: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-pub fn narou_api_batch_update(fetcher: &mut HttpFetcher) -> Result<(usize, usize)> {
+pub async fn narou_api_batch_update(http: &dyn HttpClient) -> Result<(usize, usize)> {
     let narou_ids: Vec<(i64, String)> = crate::db::with_database(|db| {
         Ok(db
             .all_records()
@@ -90,26 +111,8 @@ pub fn narou_api_batch_update(fetcher: &mut HttpFetcher) -> Result<(usize, usize
             api_url, ncode_param
         );
 
-        api_rate_limiter.wait_for_url(&url);
-        let response = match fetcher
-            .client
-            .get(&url)
-            .header(reqwest::header::USER_AGENT, &api_user_agent)
-            .send()
+        let body = match fetch_narou_api_json(http, &api_rate_limiter, &url, &api_user_agent).await
         {
-            Ok(r) => r,
-            Err(_e) => {
-                total_failed += chunk.len();
-                continue;
-            }
-        };
-
-        if !response.status().is_success() {
-            total_failed += chunk.len();
-            continue;
-        }
-
-        let body = match response.text() {
             Ok(b) => b,
             Err(_) => {
                 total_failed += chunk.len();

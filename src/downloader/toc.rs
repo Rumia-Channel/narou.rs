@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 
+use futures::future::BoxFuture;
+
 use crate::error::{NarouError, Result};
+use crate::platform::{HttpClient, RateLimiter};
 use crate::progress::ProgressReporter;
 
-use super::fetch::HttpFetcher;
 use super::html::{delete_ruby_tag, slim_subtitle};
+use super::http_policy;
 use super::novel_info::NovelInfo;
 use super::site_setting::SiteSetting;
 use super::types::SubtitleInfo;
@@ -13,23 +16,28 @@ use super::util::{
     sanitize_filename_with_limit,
 };
 
-pub fn fetch_toc(
-    fetcher: &mut HttpFetcher,
+pub async fn fetch_toc(
+    http: &dyn HttpClient,
+    rate_limiter: &dyn RateLimiter,
     setting: &SiteSetting,
     toc_url: &str,
 ) -> Result<String> {
-    fetcher.rate_limiter.wait_for_url(toc_url);
-
-    let body = fetcher.fetch_text(toc_url, setting.cookie(), Some(setting.encoding()))?;
-    let mut body = body;
+    let mut body = http_policy::fetch_text(
+        http,
+        rate_limiter,
+        toc_url,
+        setting.cookie(),
+        Some(setting.encoding()),
+        setting.is_narou,
+    )
+    .await?;
     pretreatment_source(&mut body, setting.encoding(), Some(setting));
 
-    if let Some(error_pattern) = setting.error_message() {
-        if let Ok(re) = compile_html_pattern(error_pattern) {
-            if re.is_match(&body) {
-                return Err(NarouError::NotFound("Novel deleted or private".into()));
-            }
-        }
+    if let Some(error_pattern) = setting.error_message()
+        && let Ok(re) = compile_html_pattern(error_pattern)
+        && re.is_match(&body)
+    {
+        return Err(NarouError::NotFound("Novel deleted or private".into()));
     }
 
     Ok(body)
@@ -124,8 +132,9 @@ pub fn parse_subtitles(
     Ok(subtitles)
 }
 
-pub fn parse_subtitles_multipage(
-    fetcher: &mut HttpFetcher,
+pub async fn parse_subtitles_multipage(
+    http: &dyn HttpClient,
+    rate_limiter: &dyn RateLimiter,
     setting: &SiteSetting,
     toc_source: &str,
     url_captures: &HashMap<String, String>,
@@ -133,102 +142,118 @@ pub fn parse_subtitles_multipage(
     progress: Option<&dyn ProgressReporter>,
 ) -> Result<Vec<SubtitleInfo>> {
     parse_subtitles_multipage_with(
-        fetcher,
+        http,
+        rate_limiter,
         setting,
         toc_source,
         url_captures,
         title,
         progress,
-        fetch_toc,
+        |http, rate_limiter, setting, url| {
+            Box::pin(async move { fetch_toc(http, rate_limiter, setting, &url).await })
+        },
     )
+    .await
 }
 
-fn parse_subtitles_multipage_with<F>(
-    fetcher: &mut HttpFetcher,
-    setting: &SiteSetting,
-    toc_source: &str,
-    url_captures: &HashMap<String, String>,
-    title: &str,
-    progress: Option<&dyn ProgressReporter>,
+fn parse_subtitles_multipage_with<'a, F>(
+    http: &'a dyn HttpClient,
+    rate_limiter: &'a dyn RateLimiter,
+    setting: &'a SiteSetting,
+    toc_source: &'a str,
+    url_captures: &'a HashMap<String, String>,
+    title: &'a str,
+    progress: Option<&'a dyn ProgressReporter>,
     mut fetch_next_toc: F,
-) -> Result<Vec<SubtitleInfo>>
+) -> BoxFuture<'a, Result<Vec<SubtitleInfo>>>
 where
-    F: FnMut(&mut HttpFetcher, &SiteSetting, &str) -> Result<String>,
+    F: FnMut(
+            &'a dyn HttpClient,
+            &'a dyn RateLimiter,
+            &'a SiteSetting,
+            String,
+        ) -> BoxFuture<'a, Result<String>>
+        + Send
+        + 'a,
 {
-    let mut all_subtitles = Vec::new();
-    let mut current_toc_source = toc_source.to_string();
-    let mut page = 0;
-    let max_pages = if let Some(pattern) = setting.toc_page_max_pattern() {
-        pattern
-            .captures(&current_toc_source)
-            .and_then(|caps| caps.get(1))
-            .and_then(|m| m.as_str().parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1)
-    } else {
-        50
-    };
-    let show_progress = max_pages >= 5 && !title.is_empty();
-    if show_progress {
-        if let Some(progress) = progress {
-            progress.set_position(0);
-            progress.set_length(max_pages as u64);
-            progress.set_message(&format!("目次 {}", title));
-        }
-    }
-
-    loop {
-        let page_subs = parse_subtitles(setting, &current_toc_source, url_captures)?;
-        all_subtitles.extend(page_subs);
-
-        page += 1;
+    Box::pin(async move {
+        let mut all_subtitles = Vec::new();
+        let mut current_toc_source = toc_source.to_string();
+        let mut page = 0;
+        let max_pages = if let Some(pattern) = setting.toc_page_max_pattern() {
+            pattern
+                .captures(&current_toc_source)
+                .and_then(|caps| caps.get(1))
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1)
+        } else {
+            50
+        };
+        let show_progress = max_pages >= 5 && !title.is_empty();
         if show_progress {
             if let Some(progress) = progress {
-                progress.inc(1);
-            }
-        }
-        if page >= max_pages {
-            break;
-        }
-
-        let next_toc_pattern = match setting.next_toc_pattern() {
-            Some(p) => p,
-            None => break,
-        };
-
-        let caps = match next_toc_pattern.captures(&current_toc_source) {
-            Some(c) => c,
-            None => break,
-        };
-
-        let mut next_captures: HashMap<String, String> = HashMap::new();
-        for name in next_toc_pattern.capture_names().flatten() {
-            if let Some(m) = caps.name(name) {
-                next_captures.insert(name.to_string(), m.as_str().to_string());
+                progress.set_position(0);
+                progress.set_length(max_pages as u64);
+                progress.set_message(&format!("目次 {}", title));
             }
         }
 
-        let next_url_val = match &setting.next_url {
-            Some(u) => u.clone(),
-            None => break,
-        };
-        let next_url = setting.get_next_url_with_captures(&next_url_val, &next_captures);
+        loop {
+            let page_subs = parse_subtitles(setting, &current_toc_source, url_captures)?;
+            all_subtitles.extend(page_subs);
 
-        current_toc_source = fetch_next_toc(fetcher, setting, &next_url)?;
-    }
+            page += 1;
+            if show_progress {
+                if let Some(progress) = progress {
+                    progress.inc(1);
+                }
+            }
+            if page >= max_pages {
+                break;
+            }
 
-    if show_progress {
-        if let Some(progress) = progress {
-            progress.set_position(0);
+            let next_toc_pattern = match setting.next_toc_pattern() {
+                Some(p) => p,
+                None => break,
+            };
+
+            let caps = match next_toc_pattern.captures(&current_toc_source) {
+                Some(c) => c,
+                None => break,
+            };
+
+            let mut next_captures: HashMap<String, String> = HashMap::new();
+            for name in next_toc_pattern.capture_names().flatten() {
+                if let Some(m) = caps.name(name) {
+                    next_captures.insert(name.to_string(), m.as_str().to_string());
+                }
+            }
+
+            let next_url_val = match &setting.next_url {
+                Some(u) => u.clone(),
+                None => break,
+            };
+            let next_url = setting.get_next_url_with_captures(&next_url_val, &next_captures);
+
+            current_toc_source = fetch_next_toc(http, rate_limiter, setting, next_url).await?;
         }
-    }
 
-    Ok(all_subtitles)
+        if show_progress {
+            if let Some(progress) = progress {
+                progress.set_position(0);
+            }
+        }
+
+        Ok(all_subtitles)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+
+    use crate::platform::mocks::{FakeRateLimiter, MockHttpClient};
 
     use super::*;
 
@@ -280,17 +305,19 @@ mod tests {
 </div>
 </div>
 "#;
-        let mut fetcher = HttpFetcher::new("test-agent").unwrap();
+        let http = MockHttpClient::new();
+        let rate_limiter = FakeRateLimiter::new();
         let progress = MockProgress::default();
 
-        let subtitles = parse_subtitles_multipage(
-            &mut fetcher,
+        let subtitles = futures::executor::block_on(parse_subtitles_multipage(
+            &http,
+            &rate_limiter,
             setting,
             toc_source,
             &HashMap::new(),
             "テスト作品",
             Some(&progress),
-        )
+        ))
         .unwrap();
 
         assert!(subtitles.is_empty() || subtitles.len() == 1);
@@ -334,25 +361,31 @@ mod tests {
 </div>
 </div>
 "#;
-        let mut fetcher = HttpFetcher::new("test-agent").unwrap();
-        let mut fetched_urls = Vec::new();
+        let http = MockHttpClient::new();
+        let rate_limiter = FakeRateLimiter::new();
+        let fetched_urls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        let subtitles = parse_subtitles_multipage_with(
-            &mut fetcher,
+        let subtitles = futures::executor::block_on(parse_subtitles_multipage_with(
+            &http,
+            &rate_limiter,
             setting,
             first_page,
             &HashMap::new(),
             "",
             None,
-            |_, _, next_url| {
-                fetched_urls.push(next_url.to_string());
-                Ok(second_page.to_string())
+            {
+                let fetched_urls = std::sync::Arc::clone(&fetched_urls);
+                move |_, _, _, next_url| {
+                    fetched_urls.lock().unwrap().push(next_url.clone());
+                    let page = second_page.to_string();
+                    Box::pin(async move { Ok(page) })
+                }
             },
-        )
+        ))
         .unwrap();
 
         assert_eq!(
-            fetched_urls,
+            *fetched_urls.lock().unwrap(),
             vec!["https://novel18.syosetu.com/n1234aa/?p=2".to_string()]
         );
         assert_eq!(subtitles.len(), 2);
@@ -409,27 +442,34 @@ mod tests {
 <span class="table_of_contents"><a href="/stories/index/page~3/novel_id~27990" rel="table_of_contents">最終ページ</a></span>
 <tr><td><a href="/stories/view/281445/novel_id~27990">第四話</a>&nbsp;</td><td class="font-s">2023年 01月09日 23時23分&nbsp;</td></tr>
 "#;
-        let mut fetcher = HttpFetcher::new("test-agent").unwrap();
-        let mut fetched_urls = Vec::new();
+        let http = MockHttpClient::new();
+        let rate_limiter = FakeRateLimiter::new();
+        let fetched_urls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        let subtitles = parse_subtitles_multipage_with(
-            &mut fetcher,
+        let subtitles = futures::executor::block_on(parse_subtitles_multipage_with(
+            &http,
+            &rate_limiter,
             setting,
             first_page,
             &HashMap::new(),
             "",
             None,
-            |_, _, next_url| {
-                fetched_urls.push(next_url.to_string());
-                if fetched_urls.len() == 1 {
-                    Ok(second_page.to_string())
-                } else {
-                    Ok(third_page.to_string())
+            {
+                let fetched_urls = std::sync::Arc::clone(&fetched_urls);
+                move |_, _, _, next_url| {
+                    fetched_urls.lock().unwrap().push(next_url.clone());
+                    let page = if fetched_urls.lock().unwrap().len() == 1 {
+                        second_page.to_string()
+                    } else {
+                        third_page.to_string()
+                    };
+                    Box::pin(async move { Ok(page) })
                 }
             },
-        )
+        ))
         .unwrap();
 
+        let fetched_urls = fetched_urls.lock().unwrap();
         assert_eq!(fetched_urls.len(), 2);
         assert_eq!(
             fetched_urls[0],

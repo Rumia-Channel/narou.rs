@@ -1,8 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::error::Result;
+use crate::platform::{HttpClient, RateLimiter};
 
-use super::fetch::HttpFetcher;
+use super::http_policy;
 use super::site_setting::SiteSetting;
 use super::types::{MAX_SECTION_CACHE, SectionElement, SubtitleInfo};
 use super::util::{build_section_url, compile_html_pattern, pretreatment_source};
@@ -42,8 +43,9 @@ fn section_cache_key(setting: &SiteSetting, toc_url: &str, subtitle: &SubtitleIn
     build_section_url(setting, toc_url, &subtitle.href)
 }
 
-pub fn download_section(
-    fetcher: &mut HttpFetcher,
+pub async fn download_section(
+    http: &dyn HttpClient,
+    rate_limiter: &dyn RateLimiter,
     cache: &mut SectionCache,
     setting: &SiteSetting,
     subtitle: &SubtitleInfo,
@@ -54,10 +56,15 @@ pub fn download_section(
         return Ok((cached.clone(), String::new()));
     }
 
-    fetcher.rate_limiter.wait_for_url(&url);
-
-    let html_source = fetcher.fetch_text(&url, setting.cookie(), Some(setting.encoding()))?;
-    let mut html_source = html_source;
+    let mut html_source = http_policy::fetch_text(
+        http,
+        rate_limiter,
+        &url,
+        setting.cookie(),
+        Some(setting.encoding()),
+        setting.is_narou,
+    )
+    .await?;
     pretreatment_source(&mut html_source, setting.encoding(), Some(setting));
     let (element, raw_html) = parse_section_html(setting, html_source)?;
     cache.insert(url, element.clone());
