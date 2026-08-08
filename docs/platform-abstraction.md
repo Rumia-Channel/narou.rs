@@ -1,6 +1,6 @@
 # Platform Abstraction & Cloudflare Workers 対応設計
 
-> ステータス: 進行中（Phase 1 実装中）
+> ステータス: 進行中（Phase 1・2 完了、Phase 3 以降は未着手）
 > 対象: narou.rs v0.3.6 以降（2026-08-08 時点の develop）
 > 方針の一次資料: ユーザー提供リファクタリング指示（最重要原則・禁止事項・設計上の優先順位に従う）
 
@@ -139,36 +139,44 @@ worker_entry ──> platform traits <── native (NativeHttpClient, LocalObje
 ### HttpClient
 
 ```rust
-pub struct HttpRequest<'a> {
-    pub url: &'a str,
+pub struct HttpRequest {
+    pub url: String,
     pub method: HttpMethod,          // Get | Post
     pub headers: Vec<(String, String)>,
-    pub body: Option<&'a [u8]>,      // POST 用
+    pub body: Option<Vec<u8>>,       // POST 用
+    pub redirect: RedirectMode,      // Follow (default) | Manual
 }
 
 pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,               // Phase 1 は bytes 完結（streaming は必要な経路から Phase 7 以降）
+    pub body: Vec<u8>,               // bytes 完結（デコードは core 側）
+}
+
+pub trait HttpClient: Send + Sync {
+    fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, Result<HttpResponse>>;
 }
 ```
 
 - 「reqwest API のコピー」にしない。narou.rs が必要とする最小仕様（GET/POST + headers + body + status + timeout + size limit）。
-- redirect は native 実装が reqwest policy / 手動追跡で対応（現行 fetch.rs の `resolve_final_url` 相当は native 側に残す。ただし URL 検証は core の `downloader::security::validate_public_url` を native から呼ぶ形で維持）。
-- `decode_with_encoding`（文字コード判定）は core 側の共通ユーティリティとして残し、native 実装が bytes を返した後 core がデコードする構成を目指す。Phase 1 では native 実装内で従来どおりデコードしてよい（後で移す）。
+- `HttpRequest` は所有型（`spawn_blocking` へ move できる）。`RedirectMode::Manual` は 3xx をそのまま返し、`resolve_final_url` が `Location` を追跡する。
+- `HttpResponse` は bytes のみ。文字デコード（Shift_JIS 等）は core の `downloader::http_policy::decode_with_encoding` が行う。
+- ステータス→ドメインエラー変換（404→NotFound / 503→SuspendDownload）は `http_policy::ensure_success_response` に一元化。transport は生ステータスを返す。
+- 将来の future は `Send`（`tokio::spawn` で並列 update を駆動するため）。wasm32 では全型が自動 Send なので Workers は影響なし。
 
 ### RateLimiter
 
 ```rust
-pub struct RateLimitScope { pub site: String }  // サイトキー（ホスト名）
+pub struct RateLimitScope { pub site: String, pub narou: bool }  // サイトキー（ホスト名）+ なろう系フラグ
 
 pub trait RateLimiter: Send + Sync {
-    async fn acquire(&self, scope: &RateLimitScope) -> Result<()>;
+    fn acquire<'a>(&'a self, scope: &'a RateLimitScope) -> BoxFuture<'a, Result<()>>;
 }
 ```
 
-- 現行 `RateLimiter::wait_for_url` / `wait_async_for_url` / `wait` を `acquire` に写像する。native 実装は現行 STATE（ホスト別 next_allowed）を内部に保持。
-- core の downloader は今後 `self.rate_limiter.wait_for_url(url)` を直接呼ばず、注入された trait 経由にする（Phase 2）。
+- 現行 `RateLimiter::wait_for_url` / `wait_async_for_url` / `wait` を `acquire` に写像した。native 実装は現行 STATE（ホスト別 next_allowed）を内部に保持。
+- `scope.narou` が true のとき native 実装は `normalize_wait_steps(.., true)`（既定 10）を適用する。なろう系サイトの礼儀を維持するため、downloader は `setting.is_narou` を http_policy ヘルパーへ渡す。
+- core の downloader は `self.rate_limiter.wait_for_url(url)` を直接呼ばず、注入された trait 経由にする（Phase 2 で完了）。
 
 ### Clock
 
@@ -220,17 +228,17 @@ pub trait NovelRepository: Send + Sync {
 - Phase 1 では型定義のみ。既存 `db::DATABASE` + `with_database` は native 側の実装ディテールとして残し、`YamlNovelRepository` を被せる（Phase 3）。
 - 全件ロード前提の `all_records()` は Repository 実装内部に閉じ込め、core からは query 経由にする。
 
-## 5. native implementation（Phase 1 で作るもの）
+## 5. native implementation（Phase 1・2 で作成済み）
 
 | 実装 | 元コード | 内容 |
 |---|---|---|
-| `NativeHttpClient` | `downloader/fetch.rs` の HttpFetcher の transport 部分 | `HttpClient` trait を実装。内部で現行の 3-tier（curl→reqwest→wget）・redirect・UA・cookie を維持。fetch_text 相当は core 側のポリシー（tier fallback 判定）と分離する方針だが、Phase 1 では `HttpFetcher` をそのままラップし、`trait HttpClient` を実装する形が最小 |
-| `NativeRateLimiter` | `downloader/rate_limit.rs` | 現行 `RateLimiter` の `wait_async_for_url` を trait の `acquire` へ写像 |
+| `NativeHttpClient` | `downloader/fetch.rs` の HttpFetcher の transport 部分（`src/native/http.rs`） | `HttpClient` trait を実装。内部で現行の 3-tier（curl→reqwest→wget）・redirect・UA・cookie を維持。`send` は `tokio::task::spawn_blocking` で blocking トランスポートを隔離。`RedirectMode::Manual` では 4xx/5xx 時に curl probe（CDN チャレンジ対策）を実行 |
+| `RateLimiter`（`downloader/rate_limit.rs` 内の `impl platform::RateLimiter`） | `downloader/rate_limit.rs` | 現行 `RateLimiter` の `reserve_wait_duration` を async `acquire` へ写像。`tokio::time::sleep` で待機 |
 | `SystemClock` | — | `chrono::Utc::now()` を返すだけ |
 | `LocalObjectStore` | `db/inventory.rs` 等 | Phase 4 で。Phase 1 では型定義と `MemoryObjectStore` のみ |
 | `YamlNovelRepository` | `db/database.rs` | Phase 3 で |
 
-**Phase 1 の注意**: `HttpFetcher` は `&mut self` で rate limiter と tier_failures を持っている。trait を実装するには `HttpFetcher` 自体に `impl HttpClient for HttpFetcher` を生やすのが最小（既存呼び出しはそのまま通る）。ただし trait の async 化は Phase 2 で downloader を移行するときに同期ラッパを経由して行う。
+**Phase 2 の注意**: `HttpFetcher`（`src/downloader/fetch.rs`）は削除済み。tier fallback のステート（`tier_failures` / `prefer_curl`）は `NativeHttpClient` の `Arc` 共有フィールドとして native 側に残る。core の downloader は `Arc<dyn HttpClient>` + `Arc<dyn RateLimiter>` を注入され、`http_policy` ヘルパー（`fetch_text` / `fetch_bytes` / `resolve_final_url`）経由でのみ HTTP に触れる。
 
 ## 6. Worker implementation（Phase 6-8 の予定）
 
@@ -280,8 +288,8 @@ Worker (worker_entry)
 
 | Phase | 内容 | 完了条件 |
 |---|---|---|
-| 1（今回） | `src/platform/`（traits + mocks）作成、`NarouError` の reqwest 直依存除去、`HttpFetcher` に `HttpClient` 実装、native ラッパ | build / test / clippy 通過。外部挙動変化なし |
-| 2 | downloader を trait 利用へ（fetch_text/fetch_bytes/resolve_final_url を HttpClient 経由に） | downloader から blocking HTTP 直呼びを排除（native 実装内部を除く） |
+| 1（完了） | `src/platform/`（traits + mocks）作成、`NarouError` の reqwest 直依存除去、`HttpFetcher` に `HttpClient` 実装、native ラッパ | build / test / clippy 通過。外部挙動変化なし |
+| 2（完了） | downloader を trait 利用へ（fetch_text/fetch_bytes/resolve_final_url を HttpClient 経由に） | downloader から blocking HTTP 直呼びを排除（native 実装内部を除く） |
 | 3 | database を Repository 化。`with_database`/`all_records` 依存を core から除去 | 主要コマンドが Repository 経由 |
 | 4 | converter / illustration / command から直接 FS アクセス除去（ObjectStore / TempStorage 経由） | core から主要 FS 依存が除去 |
 | 5 | Web UI を service 層経由に | web から DB/FS 直アクセスが service 経由に |
@@ -310,12 +318,14 @@ Worker (worker_entry)
 
 ## 12. unresolved issues
 
-1. **`HttpFetcher` の tier fallback をどこに置くか**: transport（trait 実装）と policy（core）の分離は理想だが、tier_failures のステートと「curl を先に試す」挙動は transport 密結合。Phase 1 では `HttpFetcher` ごと native 実装にし、core は `HttpClient` の最小 interface しか見ない。policy 分離は Phase 2 で判断。
+1. **~~`HttpFetcher` の tier fallback をどこに置くか~~（解決）**: transport（trait 実装）と policy（core）を分離した。tier fallback のステート（`tier_failures` / `prefer_curl`）は `NativeHttpClient`（`src/native/http.rs`）の `Arc` 共有フィールドとして native 側に残る。core は `http_policy` ヘルパー経由でしか HTTP に触れない。
 2. **`NarouError` の variant 追加方針**: `reqwest::Error` を String 化すると原因追跡が落ちる。`Platform { context: String, source: Option<String> }` 的な形を検討。curl の `Error` / wget の `io::Error` も同様に String 化してよいか要判断。
-3. **`std::thread` / `mpsc` の扱い**: core からは排除するが、native の並列ダウンロード（update.rs の domain 別 worker thread）と mail.rs は native 専用として残す。async 化（tokio::spawn）は必須ではない。
+3. **~~`std::thread` / `mpsc` の扱い~~（一部解決）**: core からは排除した。update.rs の domain 別並列 worker は `tokio::spawn` に移行済み。mail.rs は native 専用として残す。
 4. **`Clock` の導入範囲**: 全 `chrono::Utc::now()` を置き換えると変更が膨大になる。テスト容易性が必要な箇所（crawler / scheduler / 更新判定）から段階的に注入する。
 5. **wasm32 での chrono**: `chrono` は wasm32-unknown-unknown でデフォルト機能だと `std::time` に依存する箇所があるため、Worker build 時に feature 調整（`wasmbind` or `clock` feature 無効）が必要になる可能性。Phase 6 で検証。
 6. **`webnovel/*.yaml` の loader**: `site_setting/loader.rs` は `read_dir` + `read_to_string` で native のファイル探索（exe parent / CARGO_MANIFEST_DIR / current_dir）をしている。Worker ではバンドル or D1 等から読むことになる。loader を trait 化するかは Phase 4-6 で判断。
 7. **`illustration_store.rs` の扱い**: 論理キー化の単位。現行は `挿絵/` ディレクトリ直書き + `.illustration_cache.yaml`。native 互換を保ちつつ ObjectStore に被せるのは Phase 4。
 8. **queue.yaml の atomic write**: `db::inventory` の atomic write は native の fs2 lock + tempfile に依存。Worker では D1 + Queues が置き換えるため、queue 永続化層は Phase 8 で再設計。
 9. **logger**: tracing subscriber は native / worker で切り替える。`logger.rs` のファイル出力は native 専用にできる。Phase 1 では触らない。
+10. **`converter/mod.rs` の curl 直接使用**: 挿絵 fetch は Phase 4 で `HttpClient` 経由に移行予定（Phase 2 の対象外として残置）。
+11. **`web/misc.rs` / `web/update.rs` の async reqwest**: 自己更新・GitHub API は native 専用パスとして残置（Phase 2 の対象外）。

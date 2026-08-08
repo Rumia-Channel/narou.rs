@@ -139,6 +139,9 @@ src/
     object_store.rs                - ObjectStore trait + ObjectKey/ObjectMetadata
     repository.rs                  - NovelRepository trait + NovelId/NovelQuery
     mocks.rs                       - MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter
+  native/
+    mod.rs                         - native 実装 (core から参照しない)
+    http.rs                        - NativeHttpClient (3-tier: curl crate → reqwest → wget fallback, spawn_blocking 隔離)
   commands/
     mod.rs                         - pub mod + resolve_target_to_id, resolve_alias_target
     init.rs                        - narou init (ディレクトリ作成, AozoraEpub3設定)
@@ -165,9 +168,9 @@ src/
     paths.rs                       - novel_dir_for_record, create_subdirectory_name
     ruby_time.rs                   - Ruby互換日時フォーマット
   downloader/
-    mod.rs                         - Downloader struct (DL pipeline orchestrator, 2497行)
+    mod.rs                         - Downloader struct (DL pipeline orchestrator, Arc<dyn HttpClient> + Arc<dyn RateLimiter> 注入)
     types.rs                       - SectionElement, SectionFile, TocObject, DownloadResult 等
-    fetch.rs                       - HttpFetcher (3-tier: curl crate → reqwest → wget fallback)
+    http_policy.rs                 - プラットフォーム中立 HTTP ポリシー (decode/status mapping/redirect/fetch_text/fetch_bytes)
     toc.rs                         - fetch_toc, parse_subtitles, parse_subtitles_multipage
     section.rs                     - download_section, parse_section_html, section cache
     persistence.rs                 - save_section_file, save_raw_file, save_toc_file, ensure_default_files
@@ -243,13 +246,18 @@ sample/
 
 ## Current Status (2026-07)
 
-### プラットフォーム抽象化 (Phase 1: 2026-08)
+### プラットフォーム抽象化 (Phase 1-2: 2026-08)
 - **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。依存調査結果、module 構成、trait 一覧、migration phases (1-8) を定義。
 - **Phase 1 完了**: `src/platform/` に traits（HttpClient / Clock / RateLimiter / ObjectStore / NovelRepository）+ テスト用 mock（MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter / SystemClock）を導入。
 - `NarouError::Http` は `reqwest::Error` の直接 `#[from]` をやめ String 化。`Platform(String)` variant 追加。core から reqwest 型が error 経由で漏れるのを防止。
-- `HttpFetcher` は interior mutability（`Mutex<HashMap>` + `AtomicBool`）化し `&self` ベースの `HttpClient` impl を追加。既存 `fetch_text` 等の公開 API は `&self` 化（外部挙動変化なし）。
-- native `RateLimiter` に `platform::RateLimiter` の `acquire` を実装（サイト別スコープ対応の土台）。
-- 今後の phase: 2=downloader の trait 利用化、3=Database の Repository 化、4=converter/illustration の FS 除去、5=Web UI の service 層化、6=Worker skeleton、7=D1/Wasabi/Worker fetch、8=Queues/crawler/scheduler。
+- **Phase 2 完了**: downloader を trait 利用へ全面移行。
+  - `HttpClient::send` / `RateLimiter::acquire` は boxed future の async trait（`Send`）。`HttpRequest` は所有型 + `RedirectMode`（Follow/Manual）、`HttpResponse` は bytes のみ。
+  - `src/downloader/fetch.rs`（HttpFetcher）は削除。transport は `src/native/http.rs` の `NativeHttpClient`（curl→reqwest→wget tier fallback、`tokio::task::spawn_blocking` で隔離）。
+  - デコード・ステータス→ドメインエラー変換・リダイレクト解決は `src/downloader/http_policy.rs`（プラットフォーム中立）に集約。
+  - `Downloader` は `Arc<dyn HttpClient>` + `Arc<dyn RateLimiter>` を保持。`with_platform(http, rate_limiter)` で注入、`with_user_agent` は native 実装を組み立てる。
+  - `cmd_download` / `cmd_update` は async 化。update の domain 別並列 worker は `tokio::spawn` に移行。
+  - なろう系サイトの wait-steps 既定 10 は `RateLimitScope::narou` フラグで維持。
+- 今後の phase: 3=Database の Repository 化、4=converter/illustration の FS 除去、5=Web UI の service 層化、6=Worker skeleton、7=D1/Wasabi/Worker fetch、8=Queues/crawler/scheduler。
 
 ### 最近の追加 (2026-05〜07)
 - **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1 で従来の逐次動作、フォース指定・ウェブモード・ドメインが1種類のときは自動的に逐次にフォールバック
