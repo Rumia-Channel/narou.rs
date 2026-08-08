@@ -1,5 +1,5 @@
-pub mod fetch;
 pub mod html;
+pub mod http_policy;
 pub mod info_cache;
 pub mod narou_api;
 pub mod novel_info;
@@ -16,6 +16,7 @@ pub mod util;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{
     DateTime, Datelike, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc,
@@ -26,10 +27,10 @@ use regex::Regex;
 use crate::db::DATABASE;
 use crate::db::novel_record::NovelRecord;
 use crate::error::{NarouError, Result};
+use crate::platform::{HttpClient, RateLimiter};
 use crate::progress::ProgressReporter;
 use crate::termcolor::bold_colored;
 
-use self::fetch::HttpFetcher;
 use self::narou_api::narou_api_batch_update;
 use self::novel_info::NovelInfo;
 use self::persistence::{
@@ -102,7 +103,8 @@ impl SiteTimezone {
 }
 
 pub struct Downloader {
-    fetcher: HttpFetcher,
+    http: Arc<dyn HttpClient>,
+    rate_limiter: Arc<dyn RateLimiter>,
     site_settings: Vec<SiteSetting>,
     section_cache: SectionCache,
     section_hash_cache: HashMap<String, HashMap<String, String>>,
@@ -609,13 +611,13 @@ impl Downloader {
         Self::with_user_agent(None)
     }
 
-    pub fn with_user_agent(user_agent: Option<&str>) -> Result<Self> {
-        let ua = resolve_user_agent(
-            user_agent,
-            crate::compat::load_local_setting_string("user-agent"),
-        );
-
-        let fetcher = HttpFetcher::new(&ua)?;
+    /// Build a downloader with explicit platform implementations. Used by
+    /// tests (mocks) and by the Cloudflare Workers entrypoint; the native
+    /// CLI path goes through [`Self::with_user_agent`].
+    pub fn with_platform(
+        http: Arc<dyn HttpClient>,
+        rate_limiter: Arc<dyn RateLimiter>,
+    ) -> Result<Self> {
         let site_settings = SiteSetting::load_all()?;
         let section_hash_cache = crate::db::with_database(|db| {
             db.inventory().load(
@@ -626,13 +628,25 @@ impl Downloader {
         .unwrap_or_default();
 
         Ok(Self {
-            fetcher,
+            http,
+            rate_limiter,
             site_settings,
             section_cache: SectionCache::new(),
             section_hash_cache,
             section_hash_cache_dirty: false,
             progress: None,
         })
+    }
+
+    pub fn with_user_agent(user_agent: Option<&str>) -> Result<Self> {
+        let ua = resolve_user_agent(
+            user_agent,
+            crate::compat::load_local_setting_string("user-agent"),
+        );
+
+        let http = Arc::new(crate::native::http::NativeHttpClient::new(&ua)?);
+        let rate_limiter = Arc::new(crate::downloader::rate_limit::RateLimiter::new(false));
+        Self::with_platform(http, rate_limiter)
     }
 
     pub fn get_target_type(target: &str) -> TargetType {
@@ -733,33 +747,23 @@ impl Downloader {
         None
     }
 
-    fn load_novel_info(
-        &mut self,
+    async fn load_novel_info(
+        &self,
         setting: &SiteSetting,
         toc_source: &str,
         url_captures: &HashMap<String, String>,
     ) -> Result<NovelInfo> {
-        let Some(novel_info_url) = &setting.novel_info_url else {
-            return Ok(NovelInfo::from_toc_source(setting, toc_source));
-        };
-
-        let resolved_url = setting
-            .novel_info_url_with_captures(url_captures)
-            .unwrap_or_else(|| setting.interpolate(novel_info_url));
-
-        match self
-            .fetcher
-            .fetch_text(&resolved_url, setting.cookie(), Some(setting.encoding()))
-        {
-            Ok(mut body) => {
-                pretreatment_source(&mut body, setting.encoding(), Some(setting));
-                Ok(NovelInfo::from_novel_info_source(setting, &body))
-            }
-            Err(_) => Ok(NovelInfo::from_toc_source(setting, toc_source)),
-        }
+        NovelInfo::load(
+            self.http.as_ref(),
+            self.rate_limiter.as_ref(),
+            setting,
+            toc_source,
+            url_captures,
+        )
+        .await
     }
 
-    pub fn fetch_latest_status_by_id(
+    pub async fn fetch_latest_status_by_id(
         &mut self,
         id: i64,
     ) -> Result<(
@@ -782,8 +786,8 @@ impl Downloader {
             url_captures.entry("ncode".to_string()).or_insert(ncode);
         }
 
-        let toc_source = fetch_toc(&mut self.fetcher, &setting, &toc_url)?;
-        let info = self.load_novel_info(&setting, &toc_source, &url_captures)?;
+        let toc_source = fetch_toc(self.http.as_ref(), self.rate_limiter.as_ref(), &setting, &toc_url).await?;
+        let info = self.load_novel_info(&setting, &toc_source, &url_captures).await?;
 
         let (novel_type, inferred_is_end) =
             resolve_novel_type(&setting, &toc_source, &url_captures, &info);
@@ -800,13 +804,15 @@ impl Downloader {
             } else {
                 let title = info.title.as_deref().unwrap_or("");
                 parse_subtitles_multipage(
-                    &mut self.fetcher,
+                    self.http.as_ref(),
+                    self.rate_limiter.as_ref(),
                     &setting,
                     &toc_source,
                     &url_captures,
                     title,
                     self.progress.as_deref(),
                 )
+                .await
                 .ok()
             };
             if let Some(subs) = &subtitles {
@@ -904,7 +910,7 @@ impl Downloader {
         }
     }
 
-    fn download_illustration(
+    async fn download_illustration(
         &mut self,
         setting: &SiteSetting,
         section: &SectionElement,
@@ -947,9 +953,20 @@ impl Downloader {
                         continue;
                     }
 
-                    self.fetcher.rate_limiter.wait_for_url(url);
-                    match self.fetcher.fetch_bytes(url, None) {
-                        Ok((bytes, content_type)) => {
+                    match crate::downloader::http_policy::fetch_bytes(
+                        self.http.as_ref(),
+                        self.rate_limiter.as_ref(),
+                        url,
+                        None,
+                        setting.is_narou,
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            let content_type = response
+                                .header("Content-Type")
+                                .unwrap_or("")
+                                .to_string();
                             let ext =
                                 crate::illustration_store::illustration_extension_from_content_type(
                                     &content_type,
@@ -957,9 +974,12 @@ impl Downloader {
                                 .unwrap_or_else(|| {
                                     crate::illustration_store::guessed_extension_from_url(url)
                                 });
-                            if let Err(err) =
-                                illustration_store.store_bytes(illust_dir, url, &bytes, ext)
-                            {
+                            if let Err(err) = illustration_store.store_bytes(
+                                illust_dir,
+                                url,
+                                &response.body,
+                                ext,
+                            ) {
                                 crate::progress::safe_stderr_println(&format!(
                                     "WARN: failed to save illustration {url}: {err}"
                                 ));
@@ -978,7 +998,7 @@ impl Downloader {
         Ok(())
     }
 
-    pub fn expand_series_target(&mut self, target: &str) -> Result<Option<Vec<String>>> {
+    pub async fn expand_series_target(&mut self, target: &str) -> Result<Option<Vec<String>>> {
         if !matches!(Self::get_target_type(target), TargetType::Url) {
             return Ok(None);
         }
@@ -994,10 +1014,15 @@ impl Downloader {
             NarouError::SiteSetting(format!("No series_item_url pattern defined: {}", setting.name))
         })?;
 
-        self.fetcher.configure_rate_limiter(setting.is_narou);
-        let mut body = self
-            .fetcher
-            .fetch_text(target, setting.cookie(), Some(setting.encoding()))?;
+        let mut body = crate::downloader::http_policy::fetch_text(
+            self.http.as_ref(),
+            self.rate_limiter.as_ref(),
+            target,
+            setting.cookie(),
+            Some(setting.encoding()),
+            setting.is_narou,
+        )
+        .await?;
         crate::downloader::util::pretreatment_source(&mut body, setting.encoding(), None);
 
         let mut targets = Vec::new();
@@ -1023,11 +1048,11 @@ impl Downloader {
         crate::db::novel_dir_for_record(&PathBuf::from(types::ARCHIVE_ROOT_DIR), record)
     }
 
-    pub fn download_novel(&mut self, target: &str) -> Result<DownloadResult> {
-        self.download_novel_with_force(target, false)
+    pub async fn download_novel(&mut self, target: &str) -> Result<DownloadResult> {
+        self.download_novel_with_force(target, false).await
     }
 
-    pub fn download_novel_with_force(
+    pub async fn download_novel_with_force(
         &mut self,
         target: &str,
         force: bool,
@@ -1060,13 +1085,19 @@ impl Downloader {
             setting.interpolate_with_captures(&setting.toc_url, &url_captures)
         };
         let toc_url = Self::ageauth_redirect_target(&toc_url).unwrap_or(toc_url);
-        self.fetcher.configure_rate_limiter(setting.is_narou);
-        let toc_url = match self.fetcher.resolve_final_url(&toc_url, setting.cookie()) {
+        let toc_url = match crate::downloader::http_policy::resolve_final_url(
+            self.http.as_ref(),
+            self.rate_limiter.as_ref(),
+            &toc_url,
+            setting.cookie(),
+            setting.is_narou,
+        )
+        .await
+        {
             Ok(final_url) if final_url != toc_url => {
                 let final_url = Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
                 if let Some(final_setting) = self.find_site_setting(&final_url) {
                     setting = final_setting;
-                    self.fetcher.configure_rate_limiter(setting.is_narou);
                     setting
                         .toc_url_with_url_captures(&final_url)
                         .unwrap_or(final_url)
@@ -1086,7 +1117,7 @@ impl Downloader {
                 .flatten()
         });
         let provisional_id = existing_id.unwrap_or(provisional_id);
-        let toc_source = match fetch_toc(&mut self.fetcher, &setting, &toc_url) {
+        let toc_source = match fetch_toc(self.http.as_ref(), self.rate_limiter.as_ref(), &setting, &toc_url).await {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
                 let id = existing_id.unwrap();
@@ -1177,7 +1208,7 @@ impl Downloader {
             }
         }
 
-        let info = self.load_novel_info(&setting, &toc_source, &url_captures)?;
+        let info = self.load_novel_info(&setting, &toc_source, &url_captures).await?;
 
         let author = info.author.clone().unwrap_or_default();
         let existing_record = existing_id.and_then(|eid| {
@@ -1224,13 +1255,15 @@ impl Downloader {
             create_short_story_subtitles(&setting, &toc_source, &info)?
         } else {
             parse_subtitles_multipage(
-                &mut self.fetcher,
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
                 &setting,
                 &toc_source,
                 &url_captures,
                 &title,
                 self.progress.as_deref(),
-            )?
+            )
+            .await?
         };
 
         let use_subdirectory = self.download_use_subdirectory(existing_id);
@@ -1375,7 +1408,8 @@ impl Downloader {
                     &toc_url,
                     strong_update,
                     site_timezone,
-                )?
+                )
+                .await?
             };
             if needs_download {
                 download_count += 1;
@@ -1434,12 +1468,14 @@ impl Downloader {
                     downloaded
                 } else {
                     download_section(
-                        &mut self.fetcher,
+                        self.http.as_ref(),
+                        self.rate_limiter.as_ref(),
                         &mut self.section_cache,
                         &setting,
                         subtitle,
                         &toc_url,
-                    )?
+                    )
+                    .await?
                 };
                 if latest_section_path.exists() {
                     if cache_dir.is_none() {
@@ -1467,7 +1503,8 @@ impl Downloader {
                         store,
                         &toc_url,
                         Some(raw_html.as_str()),
-                    )?;
+                    )
+                    .await?;
                 }
                 updated_count += 1;
                 downloaded_index += 1;
@@ -1483,7 +1520,8 @@ impl Downloader {
                                 store,
                                 &toc_url,
                                 None,
-                            )?;
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -1749,7 +1787,7 @@ impl Downloader {
         })
     }
 
-    fn section_needs_download(
+    async fn section_needs_download(
         &mut self,
         setting: &SiteSetting,
         latest: &SubtitleInfo,
@@ -1811,12 +1849,14 @@ impl Downloader {
                 == section_timestamp_ymd(&old_section_path, old.download_time.as_deref(), timezone)
         {
             let downloaded = download_section(
-                &mut self.fetcher,
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
                 &mut self.section_cache,
                 setting,
                 latest,
                 toc_url,
-            )?;
+            )
+            .await?;
             let new_hash = compute_section_hash(&downloaded.0);
             let relative_path = section_relative_path(old);
             let old_hash = existing_id
@@ -1845,7 +1885,7 @@ impl Downloader {
     }
 
     fn ageauth_redirect_target(url: &str) -> Option<String> {
-        let parsed = reqwest::Url::parse(url).ok()?;
+        let parsed = url::Url::parse(url).ok()?;
         if parsed.host_str() != Some("nl.syosetu.com") || parsed.path() != "/redirect/ageauth/" {
             return None;
         }
@@ -2154,9 +2194,8 @@ impl Downloader {
         self.find_site_setting(url).is_some()
     }
 
-    pub fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
-        self.fetcher.configure_rate_limiter(true);
-        narou_api_batch_update(&mut self.fetcher)
+    pub async fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
+        narou_api_batch_update(self.http.as_ref()).await
     }
 }
 

@@ -24,18 +24,17 @@ pub struct DownloadOptions {
     pub user_agent: Option<String>,
 }
 
-pub fn cmd_download(opts: DownloadOptions) -> i32 {
-    match std::thread::spawn(move || cmd_download_inner(opts)).join() {
-        Ok(Ok(code)) => code,
-        Ok(Err(DownloadInterrupted)) => {
+pub async fn cmd_download(opts: DownloadOptions) -> i32 {
+    match cmd_download_inner(opts).await {
+        Ok(code) => code,
+        Err(DownloadInterrupted) => {
             println!("ダウンロードを中断しました");
             EXIT_INTERRUPT
         }
-        Err(payload) => std::panic::resume_unwind(payload),
     }
 }
 
-fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, DownloadInterrupted> {
+async fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, DownloadInterrupted> {
     if let Err(e) = narou_rs::db::init_database() {
         eprintln!("Error initializing database: {}", e);
         return Ok(127);
@@ -63,7 +62,7 @@ fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, Downloa
     let multi = CliProgress::multi();
     let multi_clone = multi.clone();
     let mut mistook = 0usize;
-    let (expanded_targets, series_mistook) = expand_series_targets(&mut downloader, &targets);
+    let (expanded_targets, series_mistook) = expand_series_targets(&mut downloader, &targets).await;
     targets = expanded_targets;
     mistook += series_mistook;
 
@@ -121,7 +120,7 @@ fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, Downloa
             };
             downloader.set_progress(progress);
 
-            match downloader.download_novel_with_force(&download_target, opts.force) {
+            match downloader.download_novel_with_force(&download_target, opts.force).await {
                 Ok(dl) => {
                     print_download_status(&dl);
 
@@ -163,11 +162,11 @@ fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, Downloa
     })
 }
 
-fn expand_series_targets(downloader: &mut Downloader, targets: &[String]) -> (Vec<String>, usize) {
+async fn expand_series_targets(downloader: &mut Downloader, targets: &[String]) -> (Vec<String>, usize) {
     let mut expanded = Vec::new();
     let mut mistook = 0usize;
     for target in targets {
-        match downloader.expand_series_target(target) {
+        match downloader.expand_series_target(target).await {
             Ok(Some(items)) => {
                 println!("{} を {} 件の小説URLに展開しました", target, items.len());
                 expanded.extend(items);
