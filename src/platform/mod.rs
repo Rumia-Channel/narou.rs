@@ -24,4 +24,36 @@ pub use clock::{Clock, SystemClock};
 pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
 pub use object_store::{ObjectKey, ObjectMetadata, ObjectStore};
 pub use rate_limiter::{RateLimitScope, RateLimiter};
-pub use repository::{NovelId, NovelQuery, NovelRepository};
+pub use repository::{
+    NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, NovelSort, NovelSortKey,
+    SearchField, SearchTerm,
+};
+
+/// Target-aware future type used by every async platform trait.
+///
+/// Native implementations drive blocking transports through
+/// `tokio::task::spawn_blocking` and parallel updates through `tokio::spawn`,
+/// so the future must be `Send`. Cloudflare Workers' JS bindings are not
+/// guaranteed to be `Send`, so on `wasm32` we relax the bound.
+#[cfg(not(target_arch = "wasm32"))]
+pub type PlatformFuture<'a, T> = futures::future::BoxFuture<'a, T>;
+
+#[cfg(target_arch = "wasm32")]
+pub type PlatformFuture<'a, T> = futures::future::LocalBoxFuture<'a, T>;
+
+/// Marker for services that live on the platform side of the abstraction.
+///
+/// On native, services are shared across threads (`Send + Sync`, required by
+/// `tokio::spawn` and the axum `State`); on `wasm32` every type is `Send`
+/// automatically, so no bound is needed.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait PlatformService: Send + Sync {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync + ?Sized> PlatformService for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait PlatformService {}
+
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> PlatformService for T {}

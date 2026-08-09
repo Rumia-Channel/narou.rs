@@ -14,7 +14,7 @@
 //! URL safety validation lives in `downloader::security` (domain layer) and is
 //! applied by callers before handing a URL to an implementation.
 
-use futures::future::BoxFuture;
+use super::PlatformFuture;
 
 /// HTTP method used by [`HttpRequest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,19 +120,25 @@ impl HttpResponse {
 /// Transport for HTTP(S) requests.
 ///
 /// Implementations decide redirect handling, cookies, timeouts, size limits,
-/// and fallback strategies. The returned future is `Send` so domain services
-/// can be driven on a multi-threaded executor (native `tokio::spawn` for
-/// parallel updates); on `wasm32` every type is `Send` automatically, so a
-/// Workers implementation is unaffected.
+/// and fallback strategies. The returned future is `Send` on native (so
+/// domain services can be driven on a multi-threaded executor, e.g.
+/// `tokio::spawn` for parallel updates) and relaxed on `wasm32`, via
+/// [`PlatformFuture`].
 pub trait HttpClient: Send + Sync {
     /// Perform one request and return the full response.
-    fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, crate::error::Result<HttpResponse>>;
+    fn send<'a>(
+        &'a self,
+        request: HttpRequest,
+    ) -> PlatformFuture<'a, crate::error::Result<HttpResponse>>;
 }
 
 /// Convenience blanket impl: any `&T` where `T: HttpClient` is itself an
 /// `HttpClient` (so `&client` can be passed around without cloning).
 impl<T: HttpClient + ?Sized> HttpClient for &T {
-    fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, crate::error::Result<HttpResponse>> {
+    fn send<'a>(
+        &'a self,
+        request: HttpRequest,
+    ) -> PlatformFuture<'a, crate::error::Result<HttpResponse>> {
         (*self).send(request)
     }
 }

@@ -7,14 +7,14 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use futures::future::BoxFuture;
 use parking_lot::Mutex;
 
 use crate::db::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::platform::{
-    HttpClient, HttpMethod, HttpRequest, HttpResponse, NovelId, NovelQuery, NovelRepository,
-    ObjectKey, ObjectMetadata, ObjectStore, RateLimitScope, RateLimiter,
+    HttpClient, HttpMethod, HttpRequest, HttpResponse, NovelFilter, NovelId, NovelMutation,
+    NovelQuery, NovelRepository, ObjectKey, ObjectMetadata, ObjectStore, PlatformFuture,
+    RateLimitScope, RateLimiter,
 };
 
 /// HTTP client backed by a caller-provided responder closure.
@@ -61,7 +61,10 @@ impl MockHttpClient {
 }
 
 impl HttpClient for MockHttpClient {
-    fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, Result<HttpResponse>> {
+    fn send<'a>(
+        &'a self,
+        request: HttpRequest,
+    ) -> PlatformFuture<'a, Result<HttpResponse>> {
         Box::pin(async move {
             self.requests.lock().push(format!("{} {}", method_name(request.method), request.url));
             self.responses
@@ -136,22 +139,34 @@ impl ObjectStore for MemoryObjectStore {
 }
 
 /// In-memory novel repository seeded from a map of records.
+///
+/// Implements the full [`NovelRepository`] contract with no filesystem,
+/// network, or sleeping — the basis for downloader/update integration tests.
 #[derive(Debug, Default)]
 pub struct MemoryNovelRepository {
     records: Mutex<BTreeMap<i64, NovelRecord>>,
+    next_id: AtomicU64,
 }
 
 impl MemoryNovelRepository {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            records: Mutex::new(BTreeMap::new()),
+            next_id: AtomicU64::new(0),
+        }
     }
 
     pub fn from_records(records: Vec<NovelRecord>) -> Self {
         let repo = Self::new();
+        let mut max_id: Option<i64> = None;
         for record in records {
             let id = record.id;
+            max_id = Some(max_id.map_or(id, |current| current.max(id)));
             repo.records.lock().insert(id, record);
         }
+        // Native semantics: next id is max + 1, or 0 for an empty database.
+        let next = max_id.map(|m| m + 1).unwrap_or(0);
+        repo.next_id.store(next as u64, Ordering::SeqCst);
         repo
     }
 
@@ -165,71 +180,156 @@ impl MemoryNovelRepository {
 }
 
 impl NovelRepository for MemoryNovelRepository {
-    fn get(&self, id: NovelId) -> Result<Option<NovelRecord>> {
-        Ok(self.records.lock().get(&id.0).cloned())
+    fn get<'a>(
+        &'a self,
+        id: NovelId,
+    ) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
+        Box::pin(async move { Ok(self.records.lock().get(&id.0).cloned()) })
     }
 
-    fn find_by_toc_url(&self, url: &str) -> Result<Option<NovelRecord>> {
-        Ok(self
-            .records
-            .lock()
-            .values()
-            .find(|r| r.toc_url == url)
-            .cloned())
+    fn find_by_toc_url<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
+        let needle = url.trim().to_lowercase();
+        Box::pin(async move {
+            Ok(self
+                .records
+                .lock()
+                .values()
+                .find(|r| r.toc_url.trim().to_lowercase() == needle)
+                .cloned())
+        })
     }
 
-    fn find_by_title(&self, title: &str) -> Result<Option<NovelRecord>> {
-        Ok(self
-            .records
-            .lock()
-            .values()
-            .find(|r| r.title == title)
-            .cloned())
+    fn find_by_title<'a>(
+        &'a self,
+        title: &'a str,
+    ) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
+        let needle = title.trim().to_lowercase();
+        Box::pin(async move {
+            let records = self.records.lock();
+            // Exact (index) lookup first, then case-insensitive fallback,
+            // matching the native `Database::find_by_title` semantics.
+            Ok(records
+                .values()
+                .find(|r| r.title.trim().to_lowercase() == needle)
+                .cloned())
+        })
     }
 
-    fn insert(&self, record: &NovelRecord) -> Result<()> {
-        self.records.lock().insert(record.id, record.clone());
-        Ok(())
+    fn find_by_ncode<'a>(
+        &'a self,
+        ncode: &'a str,
+    ) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
+        let ncode = ncode.to_lowercase();
+        Box::pin(async move {
+            Ok(self
+                .records
+                .lock()
+                .values()
+                .find(|r| {
+                    r.ncode.as_deref().is_some_and(|nc| nc.eq_ignore_ascii_case(&ncode))
+                        || r.toc_url
+                            .to_lowercase()
+                            .trim_end_matches('/')
+                            .ends_with(&format!("/{ncode}"))
+                })
+                .cloned())
+        })
     }
 
-    fn update(&self, record: &NovelRecord) -> Result<()> {
-        self.records.lock().insert(record.id, record.clone());
-        Ok(())
+    fn count<'a>(
+        &'a self,
+        filter: &'a NovelFilter,
+    ) -> PlatformFuture<'a, Result<u64>> {
+        let filter = filter.clone();
+        Box::pin(async move {
+            Ok(self
+                .records
+                .lock()
+                .values()
+                .filter(|r| crate::platform::repository::record_matches_filter(r, &filter))
+                .count() as u64)
+        })
     }
 
-    fn remove(&self, id: NovelId) -> Result<()> {
-        self.records.lock().remove(&id.0);
-        Ok(())
-    }
-
-    fn query(&self, query: &NovelQuery) -> Result<Vec<NovelRecord>> {
-        let mut records: Vec<NovelRecord> = self
-            .records
-            .lock()
-            .values()
-            .filter(|r| {
-                query
-                    .keyword
-                    .as_ref()
-                    .map(|kw| r.title.contains(kw) || r.author.contains(kw))
-                    .unwrap_or(true)
-            })
-            .cloned()
-            .collect();
-        if let Some(sort_by) = &query.sort_by {
+    fn query<'a>(
+        &'a self,
+        query: &'a NovelQuery,
+    ) -> PlatformFuture<'a, Result<Vec<NovelRecord>>> {
+        let query = query.clone();
+        Box::pin(async move {
+            let mut records: Vec<NovelRecord> = self
+                .records
+                .lock()
+                .values()
+                .filter(|r| crate::platform::repository::record_matches_filter(r, &query.filter))
+                .cloned()
+                .collect();
             records.sort_by(|a, b| {
-                crate::db::compare_records_by_key(a, b, sort_by)
+                crate::platform::repository::compare_records_by_sort_key(a, b, query.sort.key)
+                    .then_with(|| a.id.cmp(&b.id))
             });
-        }
+            if query.sort.reverse {
+                records.reverse();
+            }
+            let start = query.offset.min(records.len());
+            let end = (start + query.limit).min(records.len());
+            Ok(records[start..end].to_vec())
+        })
+    }
 
-        let start = query.offset.min(records.len());
-        let end = (start + query.limit).min(records.len());
-        let limited = if query.limit > 0 {
-            records[start..end].to_vec()
-        } else {
-            records
-        };
-        Ok(limited)
+    fn scan_ids<'a>(
+        &'a self,
+        filter: &'a NovelFilter,
+        after_id: Option<NovelId>,
+        limit: usize,
+    ) -> PlatformFuture<'a, Result<Vec<NovelId>>> {
+        let filter = filter.clone();
+        let after_id = after_id.map(|id| id.0).unwrap_or(i64::MIN);
+        Box::pin(async move {
+            let ids: Vec<NovelId> = self
+                .records
+                .lock()
+                .values()
+                .filter(|r| {
+                    r.id > after_id
+                        && crate::platform::repository::record_matches_filter(r, &filter)
+                })
+                .take(limit)
+                .map(|r| NovelId::from(r.id))
+                .collect();
+            Ok(ids)
+        })
+    }
+
+    fn allocate_id(&self) -> PlatformFuture<'_, Result<NovelId>> {
+        Box::pin(async move {
+            // Atomic reservation: unique even under concurrent tasks.
+            Ok(NovelId::from(self.next_id.fetch_add(1, Ordering::SeqCst) as i64))
+        })
+    }
+
+    fn apply_batch<'a>(
+        &'a self,
+        mutations: Vec<NovelMutation>,
+    ) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let mut records = self.records.lock();
+            for mutation in mutations {
+                match mutation {
+                    NovelMutation::Upsert(record) => {
+                        let id = record.id;
+                        records.insert(id, record);
+                    }
+                    NovelMutation::Remove(id) => {
+                        records.remove(&id.0);
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 }
 
@@ -254,7 +354,7 @@ impl RateLimiter for FakeRateLimiter {
     fn acquire<'a>(
         &'a self,
         _scope: &'a RateLimitScope,
-    ) -> BoxFuture<'a, Result<()>> {
+    ) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
             self.acquisitions.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -265,6 +365,7 @@ impl RateLimiter for FakeRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::{NovelSort, NovelSortKey};
     use crate::platform::clock::Clock;
     use crate::platform::SystemClock;
 
@@ -350,29 +451,108 @@ mod tests {
         record2.author = "別作者".into();
         record2.title = "なろう作品".into();
 
-        repo.insert(&record).unwrap();
-        repo.insert(&record2).unwrap();
+        futures::executor::block_on(repo.apply_batch(vec![
+            NovelMutation::Upsert(record.clone()),
+            NovelMutation::Upsert(record2.clone()),
+        ]))
+        .unwrap();
         assert_eq!(repo.len(), 2);
 
-        let found = repo.get(NovelId::from(1)).unwrap().unwrap();
+        let found = futures::executor::block_on(repo.get(NovelId::from(1)))
+            .unwrap()
+            .unwrap();
         assert_eq!(found.title, "テスト小説");
 
-        record.title = "更新後タイトル".into();
-        repo.update(&record).unwrap();
-        assert_eq!(repo.get(NovelId::from(1)).unwrap().unwrap().title, "更新後タイトル");
+        let mut updated = record.clone();
+        updated.title = "更新後タイトル".into();
+        futures::executor::block_on(repo.apply_batch(vec![NovelMutation::Upsert(updated)]))
+            .unwrap();
+        assert_eq!(
+            futures::executor::block_on(repo.get(NovelId::from(1)))
+                .unwrap()
+                .unwrap()
+                .title,
+            "更新後タイトル"
+        );
 
-        let query = NovelQuery {
-            keyword: Some("なろう".into()),
-            sort_by: Some("id".into()),
-            offset: 0,
-            limit: 10,
-        };
-        let results = repo.query(&query).unwrap();
+        let query = NovelQuery::page(
+            NovelFilter {
+                keyword: Some("なろう".into()),
+                ..Default::default()
+            },
+            NovelSort::by(NovelSortKey::Id),
+            0,
+            10,
+        );
+        let results = futures::executor::block_on(repo.query(&query)).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, 2);
 
-        repo.remove(NovelId::from(1)).unwrap();
+        futures::executor::block_on(repo.apply_batch(vec![NovelMutation::Remove(
+            NovelId::from(1),
+        )]))
+        .unwrap();
         assert_eq!(repo.len(), 1);
+    }
+
+    #[test]
+    fn memory_repository_allocates_unique_ids() {
+        let repo = MemoryNovelRepository::from_records(vec![sample_record(5)]);
+        let ids: Vec<i64> = (0..10)
+            .map(|_| {
+                futures::executor::block_on(repo.allocate_id())
+                    .unwrap()
+                    .0
+            })
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 10, "allocated ids must be unique");
+        assert!(ids.iter().all(|id| *id > 5));
+    }
+
+    #[test]
+    fn memory_repository_scan_ids_uses_keyset_pagination() {
+        let repo = MemoryNovelRepository::from_records(vec![
+            sample_record(1),
+            sample_record(2),
+            sample_record(3),
+            sample_record(4),
+            sample_record(5),
+        ]);
+        let filter = NovelFilter::all();
+
+        let page1 = futures::executor::block_on(repo.scan_ids(&filter, None, 2))
+            .unwrap();
+        assert_eq!(page1, vec![NovelId::from(1), NovelId::from(2)]);
+
+        let page2 = futures::executor::block_on(repo.scan_ids(&filter, page1.last().copied(), 2))
+            .unwrap();
+        assert_eq!(page2, vec![NovelId::from(3), NovelId::from(4)]);
+
+        let page3 = futures::executor::block_on(repo.scan_ids(&filter, page2.last().copied(), 2))
+            .unwrap();
+        assert_eq!(page3, vec![NovelId::from(5)]);
+    }
+
+    #[test]
+    fn memory_repository_count_and_find_by_ncode() {
+        let mut record = sample_record(1);
+        record.ncode = Some("n1234ab".into());
+        record.toc_url = "https://ncode.syosetu.com/n1234ab/".into();
+        let repo = MemoryNovelRepository::from_records(vec![record]);
+
+        let filter = NovelFilter {
+            is_narou: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(futures::executor::block_on(repo.count(&filter)).unwrap(), 0);
+
+        let found = futures::executor::block_on(repo.find_by_ncode("N1234AB"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, 1);
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use futures::future::BoxFuture;
+use super::PlatformFuture;
 
 /// Which site/scope a request belongs to. Rate limiting is per site so that
 /// parallel work against different domains does not share one global slot.
@@ -44,13 +44,14 @@ impl fmt::Display for RateLimitScope {
 }
 
 /// Async rate limiter. `acquire` blocks (asynchronously) until the next slot
-/// for the scope is available, then returns. The future is `Send` so domain
-/// services can run on a multi-threaded executor.
+/// for the scope is available, then returns. The future follows
+/// [`PlatformFuture`]: `Send` on native so parallel domain workers can run on
+/// a multi-threaded executor.
 pub trait RateLimiter: Send + Sync {
     fn acquire<'a>(
         &'a self,
         scope: &'a RateLimitScope,
-    ) -> BoxFuture<'a, crate::error::Result<()>>;
+    ) -> PlatformFuture<'a, crate::error::Result<()>>;
 }
 
 #[cfg(test)]
