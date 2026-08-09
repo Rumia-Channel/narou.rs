@@ -13,7 +13,7 @@ use super::sort_state::sort_ids_for_request;
 use crate::compat::{
     configure_web_subprocess_command, load_local_setting_bool, load_local_setting_string,
 };
-use crate::db::{with_database, with_database_mut};
+use crate::db::with_database_mut;
 use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
 use crate::queue::{
     extract_novel_ids, JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane,
@@ -773,14 +773,17 @@ fn append_update_by_tag_args(command: &mut std::process::Command, spec: &QueueEx
 }
 
 fn current_modified_update_target_ids() -> Vec<String> {
-    let ids = with_database(|db| {
-        Ok(db
-            .tag_index()
-            .get("modified")
-            .map(|ids| ids.iter().copied().collect::<Vec<_>>())
-            .unwrap_or_default())
-    })
-    .unwrap_or_default();
+    let novels = crate::native::novel_repository::NativeNovelRepository::new();
+    let filter = crate::platform::NovelFilter {
+        tag: Some("modified".to_string()),
+        ..Default::default()
+    };
+    let ids: Vec<i64> = novels
+        .scan_ids_sync(&filter, None, usize::MAX)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
     sort_ids_for_request(&ids, None, None)
         .into_iter()
         .map(|id| id.to_string())

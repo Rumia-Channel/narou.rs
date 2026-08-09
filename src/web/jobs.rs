@@ -9,7 +9,7 @@ use axum::{
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
-use crate::db::{with_database, with_database_mut};
+use crate::db::with_database_mut;
 use crate::downloader::site_setting::SiteSetting;
 use crate::downloader::types::{CACHE_SAVE_DIR, SECTION_SAVE_DIR, SectionFile};
 use crate::downloader::{Downloader, TargetType};
@@ -266,7 +266,7 @@ fn queue_lane_sizes(queue: &PersistentQueue) -> [usize; 2] {
     ]
 }
 
-fn sort_records_for_web_update(records: &mut Vec<&crate::db::NovelRecord>, sort_state: &CurrentSortState) {
+fn sort_records_for_web_update(records: &mut Vec<crate::db::NovelRecord>, sort_state: &CurrentSortState) {
     sort_records(records, sort_state);
 }
 
@@ -289,12 +289,16 @@ fn current_web_update_sort_key_for_cli() -> Option<&'static str> {
 
 fn sorted_update_all_ids() -> Vec<String> {
     let sort_state = current_web_update_sort_state();
-    with_database(|db| {
-        let mut records: Vec<_> = db.all_records().values().collect();
-        sort_records_for_web_update(&mut records, &sort_state);
-        Ok(records.into_iter().map(|record| record.id.to_string()).collect())
-    })
-    .unwrap_or_default()
+    let novels = crate::native::novel_repository::NativeNovelRepository::new();
+    let ids = novels
+        .scan_ids_sync(&crate::platform::NovelFilter::all(), None, usize::MAX)
+        .unwrap_or_default();
+    let mut records: Vec<_> = ids
+        .iter()
+        .filter_map(|id| novels.get_sync(*id).ok().flatten())
+        .collect();
+    sort_records_for_web_update(&mut records, &sort_state);
+    records.into_iter().map(|record| record.id.to_string()).collect()
 }
 
 fn sort_numeric_targets_for_request(
@@ -399,12 +403,11 @@ fn queue_download_jobs(
 }
 
 fn resolve_existing_id_for_target(target: &str) -> Option<i64> {
+    let novels = crate::native::novel_repository::NativeNovelRepository::new();
     match Downloader::get_target_type(target) {
         TargetType::Id => {
             let id = target.parse::<i64>().ok()?;
-            with_database(|db| Ok(db.get(id).map(|record| record.id)))
-                .ok()
-                .flatten()
+            novels.get_sync(id.into()).ok().flatten().map(|record| record.id)
         }
         TargetType::Url => {
             let settings = SiteSetting::load_all().ok()?;
@@ -414,25 +417,10 @@ fn resolve_existing_id_for_target(target: &str) -> Option<i64> {
             let toc_url = setting
                 .toc_url_with_url_captures(target)
                 .unwrap_or_else(|| setting.toc_url());
-            with_database(|db| Ok(db.get_by_toc_url(&toc_url).map(|record| record.id)))
-                .ok()
-                .flatten()
+            novels.find_by_toc_url_sync(&toc_url).ok().flatten().map(|record| record.id)
         }
-        TargetType::Ncode => {
-            let ncode = target.to_lowercase();
-            with_database(|db| {
-                Ok(db
-                    .all_records()
-                    .values()
-                    .find(|record| record.ncode.as_deref() == Some(ncode.as_str()))
-                    .map(|record| record.id))
-            })
-            .ok()
-            .flatten()
-        }
-        _ => with_database(|db| Ok(db.find_by_title(target).map(|record| record.id)))
-            .ok()
-            .flatten(),
+        TargetType::Ncode => novels.find_by_ncode_sync(target).ok().flatten().map(|record| record.id),
+        _ => novels.find_by_title_sync(target).ok().flatten().map(|record| record.id),
     }
 }
 
@@ -634,12 +622,13 @@ fn render_diff_list_html_for_target(target: &str) -> String {
     let Some(id) = resolve_existing_id_for_target(target) else {
         return String::new();
     };
-    let Ok((record, archive_root)) =
-        with_database(|db| Ok((db.get(id).cloned(), db.archive_root().to_path_buf())))
-    else {
+    let novels = crate::native::novel_repository::NativeNovelRepository::new();
+    let Ok(Some(record)) = novels.get_sync(id.into()) else {
         return String::new();
     };
-    let Some(record) = record else {
+    let Ok(archive_root) =
+        crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+    else {
         return String::new();
     };
 
@@ -1443,14 +1432,13 @@ pub async fn api_diff_list(
             Err(_) => continue,
         };
 
-        let result = with_database(|db| {
-            let record = db.get(id).cloned();
-            let archive_root = db.archive_root().to_path_buf();
-            Ok((record, archive_root))
-        });
+        let novels = crate::native::novel_repository::NativeNovelRepository::new();
+        let record = novels.get_sync(id.into()).ok().flatten();
+        let archive_root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+            .ok();
 
-        let (record, archive_root) = match result {
-            Ok((Some(record), root)) => (record, root),
+        let (record, archive_root) = match (record, archive_root) {
+            (Some(record), Some(root)) => (record, root),
             _ => {
                 diffs.push(serde_json::json!({
                     "id": id,
@@ -1991,11 +1979,17 @@ pub async fn api_update_by_tag(
     // Snapshot current matching novel IDs before queuing, then run through the
     // same update worker path used by normal selected-ID updates.
     let server_sort_state = current_web_update_sort_state();
-    let snapshot_ids = with_database(|db| {
-        let all = db.all_records();
-        let mut matching: Vec<&crate::db::NovelRecord> = Vec::new();
+    let novels = crate::native::novel_repository::NativeNovelRepository::new();
+    let ids = novels
+        .scan_ids_sync(&crate::platform::NovelFilter::all(), None, usize::MAX)
+        .unwrap_or_default();
+    let snapshot_ids: Vec<i64> = {
+        let mut matching: Vec<crate::db::NovelRecord> = Vec::new();
 
-        for (_id, record) in all {
+        for id in ids {
+            let Ok(Some(record)) = novels.get_sync(id) else {
+                continue;
+            };
             let record_tags: Vec<&str> = record.tags.iter().map(|s| s.as_str()).collect();
             let mut include = false;
             let mut exclude = false;
@@ -2017,9 +2011,8 @@ pub async fn api_update_by_tag(
             }
         }
         sort_records_for_web_update(&mut matching, &server_sort_state);
-        Ok(matching.into_iter().map(|r| r.id).collect::<Vec<i64>>())
-    })
-    .unwrap_or_default();
+        matching.into_iter().map(|r| r.id).collect::<Vec<i64>>()
+    };
 
     let count = snapshot_ids.len();
     if snapshot_ids.is_empty() {
@@ -2081,24 +2074,40 @@ pub async fn api_taginfo(
     let selected_ids = sort_ids_for_request(&selected_ids, body.sort_state.as_ref(), body.timestamp);
 
     let new_tag_color = crate::tag_colors::configured_new_tag_color();
-    let tag_info = with_database(|db| {
-        let tag_index = db.tag_index();
-        let inventory = db.inventory();
-        let mut tag_colors = crate::tag_colors::load_tag_colors(inventory)?;
+    let tag_info = (|| -> crate::error::Result<Vec<serde_json::Value>> {
+        let novels = crate::native::novel_repository::NativeNovelRepository::new();
+        let inventory = crate::db::inventory::Inventory::with_default_root().map_err(|e| {
+            crate::error::NarouError::Database(e.to_string())
+        })?;
+        let mut tag_colors = crate::tag_colors::load_tag_colors(&inventory)?;
+        let ids = novels
+            .scan_ids_sync(&crate::platform::NovelFilter::all(), None, usize::MAX)
+            .map_err(|e| crate::error::NarouError::Database(e.to_string()))?;
+        // tag -> id list (D1 では novel_tags join で置き換え可能)。
+        let mut tag_index: std::collections::HashMap<String, Vec<i64>> =
+            std::collections::HashMap::new();
+        for id in ids {
+            let Ok(Some(record)) = novels.get_sync(id) else {
+                continue;
+            };
+            for tag in &record.tags {
+                tag_index.entry(tag.clone()).or_default().push(record.id);
+            }
+        }
         let tag_names = tag_index.keys().map(String::as_str);
         if crate::tag_colors::ensure_tag_colors_with_default_color(
             &mut tag_colors,
             tag_names,
             new_tag_color.as_deref(),
         ) {
-            crate::tag_colors::save_tag_colors(inventory, &tag_colors)?;
+            crate::tag_colors::save_tag_colors(&inventory, &tag_colors)?;
         }
         let tag_colors = tag_colors.into_map();
 
         let mut selected_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         for id in selected_ids.iter().copied() {
-            let Some(record) = db.get(id) else {
+            let Some(record) = novels.get_sync(id.into()).ok().flatten() else {
                 continue;
             };
             for tag in &record.tags {
@@ -2110,7 +2119,7 @@ pub async fn api_taginfo(
         sorted_tags.sort_by(|a, b| a.0.cmp(b.0));
 
         let mut result: Vec<serde_json::Value> = Vec::with_capacity(sorted_tags.len());
-        for (tag, ids) in sorted_tags {
+        for (tag, tag_ids) in sorted_tags {
             let color = tag_colors.get(tag).map(|c| c.as_str()).unwrap_or("");
             let class = tag_color_class(color);
             let escaped_tag = html_escape(tag);
@@ -2121,7 +2130,7 @@ pub async fn api_taginfo(
             let mut entry = serde_json::json!({
                 "tag": tag,
                 "count": selected_counts.get(tag.as_str()).copied().unwrap_or(0),
-                "total_count": ids.len(),
+                "total_count": tag_ids.len(),
                 "html": html,
             });
             if with_exclusion {
@@ -2134,7 +2143,7 @@ pub async fn api_taginfo(
             result.push(entry);
         }
         Ok(result)
-    })
+    })()
     .unwrap_or_default();
 
     Json(serde_json::json!(tag_info))
@@ -2565,7 +2574,7 @@ mod tests {
             column: 2,
             dir: "desc".to_string(),
         };
-        let mut records = vec![&first, &second, &third];
+        let mut records = vec![first.clone(), second.clone(), third.clone()];
 
         sort_records_for_web_update(&mut records, &sort_state);
 
@@ -2893,6 +2902,9 @@ mod tests {
             port: 0,
             ws_port: 0,
             push_server: Arc::new(crate::web::push::PushServer::new()),
+            novels: Arc::new(
+                crate::native::novel_repository::NativeNovelRepository::new(),
+            ),
             basic_auth_header: None,
             control_token: "control-token".to_string(),
             allowed_request_hosts: vec!["localhost".to_string()],

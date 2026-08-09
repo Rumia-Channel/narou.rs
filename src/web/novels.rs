@@ -176,6 +176,7 @@ fn collect_search_tokens(filter: Option<&str>, search_value: Option<&str>) -> Ve
         .collect()
 }
 
+#[cfg(test)]
 fn record_status_text(record: &crate::db::novel_record::NovelRecord, frozen: bool) -> String {
     let mut status = Vec::new();
     if frozen {
@@ -193,6 +194,7 @@ fn record_status_text(record: &crate::db::novel_record::NovelRecord, frozen: boo
     status.join(", ").to_lowercase()
 }
 
+#[cfg(test)]
 fn record_matches_token(
     record: &crate::db::novel_record::NovelRecord,
     token: &SearchToken,
@@ -225,6 +227,7 @@ fn record_matches_token(
     if token.negated { !matched } else { matched }
 }
 
+#[cfg(test)]
 fn record_matches_search(
     record: &crate::db::novel_record::NovelRecord,
     tokens: &[SearchToken],
@@ -239,8 +242,12 @@ pub async fn index() -> &'static str {
     "narou.rs API server"
 }
 
-pub async fn novels_count(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let count = with_database(|db| Ok(db.all_records().len() as u64)).unwrap_or(0);
+pub async fn novels_count(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let count = state
+        .novels
+        .count(&crate::platform::NovelFilter::all())
+        .await
+        .unwrap_or(0);
     Json(serde_json::json!({ "count": count }))
 }
 
@@ -259,6 +266,10 @@ pub async fn api_list_post(
 }
 
 fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (StatusCode, String)> {
+    use crate::platform::{
+        NovelFilter, NovelQuery, NovelSort, NovelSortKey, SearchField, SearchTerm,
+    };
+
     let draw = params.draw.unwrap_or(1);
     let return_all = params.all.unwrap_or(false);
     let start = if return_all {
@@ -290,104 +301,90 @@ fn api_list_inner(params: ListParams) -> Result<Json<NovelListResponse>, (Status
     let fallback_timezone = site_timezone(None);
     let now = chrono::Utc::now();
 
-    let response = with_database(|db| {
-        let all_records: Vec<_> = db.all_records().values().collect();
-
-        let mut filtered: Vec<_> = if search_tokens.is_empty() {
-            all_records
-        } else {
-            all_records
-                .into_iter()
-                .filter(|record| {
-                    record_matches_search(record, &search_tokens, record_is_frozen(record, &frozen_ids))
-                })
-                .collect()
-        };
-
-        let sort_key = match order_col {
-            0 => "id",
-            1 => "last_update",
-            2 => "general_lastup",
-            3 => "last_check_date",
-            4 => "title",
-            5 => "author",
-            6 => "sitename",
-            7 => "novel_type",
-            9 => "general_all_no",
-            10 => "length",
-            _ => "id",
-        };
-
-        let reverse = order_dir == "desc";
-        filtered.sort_by(|a, b| {
-            let va = match sort_key {
-                "id" => a.id.cmp(&b.id),
-                "title" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-                "author" => a.author.to_lowercase().cmp(&b.author.to_lowercase()),
-                "last_update" => a.last_update.cmp(&b.last_update),
-                "general_lastup" => a
-                    .general_lastup
-                    .unwrap_or_default()
-                    .cmp(&b.general_lastup.unwrap_or_default()),
-                "last_check_date" => a
-                    .last_check_date
-                    .unwrap_or_default()
-                    .cmp(&b.last_check_date.unwrap_or_default()),
-                "sitename" => a.sitename.cmp(&b.sitename),
-                "novel_type" => a.novel_type.cmp(&b.novel_type),
-                "general_all_no" => a
-                    .general_all_no
-                    .unwrap_or(0)
-                    .cmp(&b.general_all_no.unwrap_or(0)),
-                "length" => a.length.unwrap_or(0).cmp(&b.length.unwrap_or(0)),
-                _ => std::cmp::Ordering::Equal,
+    // 検索トークン → repository の SearchTerm (D1 では SQL へ変換可能)。
+    let terms = search_tokens
+        .iter()
+        .map(|token| {
+            let field = match token.field.as_deref() {
+                Some("tag") => SearchField::Tag,
+                Some("author") => SearchField::Author,
+                Some("site") | Some("sitename") => SearchField::Site,
+                Some("title") => SearchField::Title,
+                Some("status") => SearchField::Status,
+                _ => SearchField::Any,
             };
-            if reverse { va.reverse() } else { va }
-        });
-
-        let records_total = db.all_records().len() as u64;
-        let records_filtered = filtered.len() as u64;
-
-        let data: Vec<NovelListItem> = filtered
-            .into_iter()
-            .skip(start as usize)
-            .take(length.unwrap_or(usize::MAX))
-            .map(|r| {
-                let timezone = record_site_timezone(r, &site_timezones, fallback_timezone);
-                let is_new =
-                    is_new_arrivals_marker(r.new_arrivals_date, r.last_update, now, timezone);
-                NovelListItem {
-                    id: r.id,
-                    title: r.title.clone(),
-                    author: r.author.clone(),
-                    sitename: r.sitename.clone(),
-                    novel_type: r.novel_type,
-                    end: r.end,
-                    last_update: r.last_update.timestamp(),
-                    general_lastup: r.general_lastup.map(|dt| dt.timestamp()),
-                    last_check_date: r.last_check_date.map(|dt| dt.timestamp()),
-                    new_arrivals_date: r.new_arrivals_date.map(|dt| dt.timestamp()),
-                    tags: r.tags.clone(),
-                    new_arrivals: is_new,
-                    frozen: record_is_frozen(r, &frozen_ids),
-                    suspend: r.suspend,
-                    length: r.length,
-                    toc_url: r.toc_url.clone(),
-                    general_all_no: r.general_all_no,
-                }
-            })
-            .collect();
-
-        Ok(NovelListResponse {
-            draw,
-            records_total,
-            records_filtered,
-            data,
+            SearchTerm::new(field, token.negated, token.values.clone())
         })
-    })
-    .map_err(|e: NarouError| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .collect::<Vec<_>>();
+    let filter = NovelFilter {
+        terms,
+        frozen_ids: Some(frozen_ids.clone()),
+        ..Default::default()
+    };
 
-    Ok(Json(response))
+    let sort_key = match order_col {
+        0 => NovelSortKey::Id,
+        1 => NovelSortKey::LastUpdate,
+        2 => NovelSortKey::GeneralLastup,
+        3 => NovelSortKey::LastCheckDate,
+        4 => NovelSortKey::Title,
+        5 => NovelSortKey::Author,
+        6 => NovelSortKey::SiteName,
+        7 => NovelSortKey::NovelType,
+        9 => NovelSortKey::GeneralAllNo,
+        10 => NovelSortKey::Length,
+        _ => NovelSortKey::Id,
+    };
+    let sort = NovelSort {
+        key: sort_key,
+        reverse: order_dir == "desc",
+    };
+
+    let novels = crate::native::novel_repository::NativeNovelRepository::new();
+    let records_total = novels
+        .count_sync(&NovelFilter::all())
+        .unwrap_or(0);
+    let records_filtered = novels.count_sync(&filter).unwrap_or(0);
+
+    let query = NovelQuery::page(filter, sort, start as usize, length.unwrap_or(usize::MAX));
+    let filtered = novels.query_sync(&query).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    let data: Vec<NovelListItem> = filtered
+        .into_iter()
+        .map(|r| {
+            let timezone = record_site_timezone(&r, &site_timezones, fallback_timezone);
+            let is_new = is_new_arrivals_marker(r.new_arrivals_date, r.last_update, now, timezone);
+            let is_frozen = record_is_frozen(&r, &frozen_ids);
+            NovelListItem {
+                id: r.id,
+                title: r.title,
+                author: r.author,
+                sitename: r.sitename,
+                novel_type: r.novel_type,
+                end: r.end,
+                last_update: r.last_update.timestamp(),
+                general_lastup: r.general_lastup.map(|dt| dt.timestamp()),
+                last_check_date: r.last_check_date.map(|dt| dt.timestamp()),
+                new_arrivals_date: r.new_arrivals_date.map(|dt| dt.timestamp()),
+                tags: r.tags,
+                new_arrivals: is_new,
+                frozen: is_frozen,
+                suspend: r.suspend,
+                length: r.length,
+                toc_url: r.toc_url,
+                general_all_no: r.general_all_no,
+            }
+        })
+        .collect();
+
+    Ok(Json(NovelListResponse {
+        draw,
+        records_total,
+        records_filtered,
+        data,
+    }))
 }
 
 #[cfg(test)]
@@ -593,22 +590,22 @@ mod tests {
 }
 
 pub async fn get_novel(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let record = with_database(|db| {
-        db.get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let record = state
+        .novels
+        .get(id.into())
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("ID: {}", id)))?;
 
     let value = serde_json::to_value(&record).unwrap_or_default();
     Ok(Json(value))
 }
 
 pub async fn get_story(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let id_str = params
@@ -618,12 +615,12 @@ pub async fn get_story(
         .parse()
         .map_err(|_| (StatusCode::BAD_REQUEST, "invalid id".to_string()))?;
 
-    let record = with_database(|db| {
-        db.get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let record = state
+        .novels
+        .get(id.into())
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("ID: {}", id)))?;
 
     let novel_dir = with_database(|db| {
         super::safe_existing_novel_dir(db.archive_root(), &record)
@@ -723,15 +720,15 @@ pub async fn unfreeze_novel(
 }
 
 pub async fn author_comments(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let record = with_database(|db| {
-        db.get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let record = state
+        .novels
+        .get(id.into())
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("ID: {}", id)))?;
 
     let novel_dir = with_database(|db| {
         super::safe_existing_novel_dir(db.archive_root(), &record)
@@ -810,18 +807,19 @@ pub async fn author_comments(
 }
 
 pub async fn download_ebook(
+    State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Response, (StatusCode, String)> {
     use axum::body::Body;
     use axum::http::{HeaderValue, header};
     use tokio::io::AsyncReadExt;
 
-    let record = with_database(|db| {
-        db.get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let record = state
+        .novels
+        .get(id.into())
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("ID: {}", id)))?;
 
     let novel_dir = with_database(|db| {
         super::safe_existing_novel_dir(db.archive_root(), &record)

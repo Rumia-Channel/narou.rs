@@ -28,15 +28,15 @@ struct NovelSettingEntry {
 }
 
 pub async fn get_settings(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let record = with_database(|db| {
-        db.get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let record = state
+        .novels
+        .get(id.into())
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("ID: {}", id)))?;
 
     let novel_dir = with_database(|db| {
         super::safe_existing_novel_dir(db.archive_root(), &record)
@@ -75,16 +75,16 @@ pub async fn get_settings(
 }
 
 pub async fn save_settings(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
-    let record = with_database(|db| {
-        db.get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))
-    })
-    .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let record = state
+        .novels
+        .get(id.into())
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("ID: {}", id)))?;
 
     let novel_dir = with_database(|db| {
         super::safe_existing_novel_dir(db.archive_root(), &record)

@@ -163,24 +163,38 @@ pub async fn tag_list(
     Query(params): Query<TagListParams>,
 ) -> Response {
     let new_tag_color = crate::tag_colors::configured_new_tag_color();
-    let (tags, tag_colors) = with_database(|db| {
-        let index = db.tag_index();
-        let mut list: Vec<(&String, &Vec<i64>)> = index.iter().collect();
-        list.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-        let tags = list.into_iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+    let (tags, tag_colors) = (|| -> crate::error::Result<(Vec<String>, std::collections::HashMap<String, String>)> {
+        let novels = crate::native::novel_repository::NativeNovelRepository::new();
+        let ids = novels
+            .scan_ids_sync(&crate::platform::NovelFilter::all(), None, usize::MAX)
+            .map_err(|e| crate::error::NarouError::Database(e.to_string()))?;
+        // tag -> count (D1 では novel_tags GROUP BY で置き換え可能)。
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for id in ids {
+            let Ok(Some(record)) = novels.get_sync(id) else {
+                continue;
+            };
+            for tag in &record.tags {
+                *counts.entry(tag.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut list: Vec<(String, usize)> = counts.into_iter().collect();
+        list.sort_by(|a, b| b.1.cmp(&a.1));
+        let tags = list.into_iter().map(|(k, _)| k).collect::<Vec<_>>();
 
-        let inventory = db.inventory();
-        let mut tag_colors = crate::tag_colors::load_tag_colors(inventory)?;
+        let inventory = crate::db::inventory::Inventory::with_default_root()
+            .map_err(|e| crate::error::NarouError::Database(e.to_string()))?;
+        let mut tag_colors = crate::tag_colors::load_tag_colors(&inventory)?;
         if crate::tag_colors::ensure_tag_colors_with_default_color(
             &mut tag_colors,
             tags.iter().map(String::as_str),
             new_tag_color.as_deref(),
         ) {
-            crate::tag_colors::save_tag_colors(inventory, &tag_colors)?;
+            crate::tag_colors::save_tag_colors(&inventory, &tag_colors)?;
         }
 
         Ok((tags, tag_colors.into_map()))
-    })
+    })()
     .unwrap_or_default();
 
     if params.format.as_deref() == Some("json") {
@@ -193,12 +207,7 @@ pub async fn tag_list(
     );
     for tag in &tags {
         let escaped_tag = html_escape(tag);
-        let class = tag_color_class(
-            tag_colors
-                .get(tag)
-                .map(|value| value.as_str())
-                .unwrap_or("default"),
-        );
+        let class = tag_color_class(tag_colors.get(tag).map(String::as_str).unwrap_or("default"));
         html.push_str(&format!(
             "<div><span class=\"tag-label {}\" data-tag=\"{}\">{}</span> \
 <span class=\"select-color-button\" data-target-tag=\"{}\"><span class=\"tag-label {} tag-fixed-width\">a</span></span></div>",
@@ -254,12 +263,19 @@ pub async fn tag_change_color(
     }
 }
 
-pub async fn all_novel_ids(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let ids = with_database(|db| {
-        let ids: Vec<i64> = db.all_records().keys().copied().collect();
-        Ok(ids)
-    })
-    .unwrap_or_default();
+pub async fn all_novel_ids(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let ids = state
+        .novels
+        .scan_ids(
+            &crate::platform::NovelFilter::all(),
+            None,
+            usize::MAX,
+        )
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect::<Vec<i64>>();
     Json(serde_json::json!({ "ids": ids }))
 }
 

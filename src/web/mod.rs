@@ -49,11 +49,12 @@ pub(crate) const MAX_WEB_PAGE_LENGTH: u64 = 500;
 pub(crate) const MAX_WEB_SEARCH_BYTES: usize = 4096;
 pub const INTERNAL_CONTROL_HEADER: &str = "x-narou-internal-token";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
     pub port: u16,
     pub ws_port: u16,
     pub push_server: Arc<push::PushServer>,
+    pub novels: Arc<dyn crate::platform::NovelRepository>,
     pub basic_auth_header: Option<String>,
     pub control_token: String,
     pub allowed_request_hosts: Vec<String>,
@@ -744,6 +745,7 @@ mod tests {
             port: 8080,
             ws_port: 8081,
             push_server: Arc::new(push_server),
+            novels: Arc::new(crate::platform::mocks::MemoryNovelRepository::new()),
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
             allowed_request_hosts: vec!["127.0.0.1".to_string(), "localhost".to_string()],
@@ -768,6 +770,7 @@ mod tests {
             port: 8080,
             ws_port: 8081,
             push_server: Arc::new(push_server),
+            novels: Arc::new(crate::platform::mocks::MemoryNovelRepository::new()),
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
             allowed_request_hosts: extra_hosts,

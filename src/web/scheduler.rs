@@ -431,28 +431,45 @@ fn auto_update_sort_key_from_value(server_setting: &Value) -> Option<&'static st
 
 fn collect_auto_update_target_ids() -> (Vec<String>, Vec<String>) {
     let site_settings = SiteSetting::load_all().unwrap_or_default();
-    db::with_database(|db| {
-        let frozen_ids = load_frozen_ids_from_inventory(db.inventory()).unwrap_or_default();
-        let modified_ids = db
-            .tag_index()
-            .get("modified")
+    let novels = crate::native::novel_repository::NativeNovelRepository::new();
+    let frozen_ids = load_frozen_ids_from_inventory(
+        &crate::db::inventory::Inventory::with_default_root().unwrap_or_else(|_| {
+            // fallback: empty inventory (should not happen in practice)
+            crate::db::inventory::Inventory::new(std::path::PathBuf::from("."))
+        }),
+    )
+    .unwrap_or_default();
+    let modified_ids = {
+        let filter = crate::platform::NovelFilter {
+            tag: Some("modified".to_string()),
+            ..Default::default()
+        };
+        novels
+            .scan_ids_sync(&filter, None, usize::MAX)
+            .unwrap_or_default()
             .into_iter()
-            .flat_map(|ids| ids.iter().copied())
-            .collect::<std::collections::BTreeSet<_>>();
-        Ok::<_, crate::error::NarouError>(split_auto_update_target_ids(
-            db.all_records().values(),
-            &modified_ids,
-            &frozen_ids,
-            |record| {
-                site_settings
-                    .iter()
-                    .find(|setting| setting.matches_url(&record.toc_url))
-                    .and_then(|setting| setting.narou_api_url.as_ref())
-                    .is_some()
-            },
-        ))
-    })
-    .unwrap_or_default()
+            .map(|id| id.0)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let ids = novels
+        .scan_ids_sync(&crate::platform::NovelFilter::all(), None, usize::MAX)
+        .unwrap_or_default();
+    let records: Vec<crate::db::NovelRecord> = ids
+        .iter()
+        .filter_map(|id| novels.get_sync(*id).ok().flatten())
+        .collect();
+    split_auto_update_target_ids(
+        records.iter(),
+        &modified_ids,
+        &frozen_ids,
+        |record| {
+            site_settings
+                .iter()
+                .find(|setting| setting.matches_url(&record.toc_url))
+                .and_then(|setting| setting.narou_api_url.as_ref())
+                .is_some()
+        },
+    )
 }
 
 fn split_auto_update_target_ids<'a, I, F>(
