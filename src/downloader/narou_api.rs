@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::error::{NarouError, Result};
-use crate::platform::{HttpClient, HttpRequest, RateLimitScope, RateLimiter};
+use crate::platform::{HttpClient, HttpRequest, NovelRepository, RateLimitScope, RateLimiter};
 
 use super::http_policy::{ensure_success_response, host_of};
 use super::rate_limit::RateLimiter as NativeRateLimiter;
@@ -77,16 +77,37 @@ fn parse_api_entries(body: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-pub async fn narou_api_batch_update(http: &dyn HttpClient) -> Result<(usize, usize)> {
-    let narou_ids: Vec<(i64, String)> = crate::db::with_database(|db| {
-        Ok(db
-            .all_records()
-            .values()
-            .filter(|r| r.is_narou && r.ncode.is_some())
-            .filter_map(|r| r.ncode.as_ref().map(|nc| (r.id, nc.clone())))
-            .collect())
-    })
-    .unwrap_or_default();
+pub async fn narou_api_batch_update(
+    http: &dyn HttpClient,
+    novels: &dyn NovelRepository,
+) -> Result<(usize, usize)> {
+    // なろう対象の一覧を keyset scan で取得する (D1: `WHERE is_narou = 1
+    // AND ncode IS NOT NULL ORDER BY id LIMIT ?`)。`ncode` のないレコードは
+    // スキップしてからバッチ処理する。
+    let mut narou_ids: Vec<(i64, String)> = Vec::new();
+    let filter = crate::platform::NovelFilter {
+        is_narou: Some(true),
+        ..Default::default()
+    };
+    const SCAN_PAGE: usize = 500;
+    let mut after_id = None;
+    loop {
+        let page = novels.scan_ids(&filter, after_id, SCAN_PAGE).await?;
+        if page.is_empty() {
+            break;
+        }
+        for id in &page {
+            if let Some(record) = novels.get(*id).await? {
+                if let Some(ncode) = record.ncode {
+                    narou_ids.push((record.id, ncode));
+                }
+            }
+        }
+        after_id = page.last().copied();
+        if page.len() < SCAN_PAGE {
+            break;
+        }
+    }
 
     if narou_ids.is_empty() {
         return Ok((0, 0));
@@ -133,8 +154,8 @@ pub async fn narou_api_batch_update(http: &dyn HttpClient) -> Result<(usize, usi
                 .find(|(_, nc)| nc.eq_ignore_ascii_case(entry_ncode))
                 .map(|(id, _)| *id)
             {
-                let updated = crate::db::with_database_mut(|db| {
-                    if let Some(record) = db.get(id).cloned() {
+                let updated = match novels.get(id.into()).await? {
+                    Some(record) => {
                         let mut r = record;
 
                         if let Some(s) = entry.get("title").and_then(|v| v.as_str()) {
@@ -167,13 +188,13 @@ pub async fn narou_api_batch_update(http: &dyn HttpClient) -> Result<(usize, usi
                             r.novel_type = if nt == 2 { 2 } else { 1 };
                         }
 
-                        db.insert(r);
-                        Ok(true)
-                    } else {
-                        Ok(false)
+                        novels
+                            .apply_batch(vec![crate::platform::NovelMutation::Upsert(r)])
+                            .await?;
+                        true
                     }
-                })
-                .unwrap_or(false);
+                    None => false,
+                };
 
                 if updated {
                     total_updated += 1;
@@ -182,6 +203,5 @@ pub async fn narou_api_batch_update(http: &dyn HttpClient) -> Result<(usize, usi
         }
     }
 
-    let _ = crate::db::with_database_mut(|db| db.save());
     Ok((total_updated, total_failed))
 }

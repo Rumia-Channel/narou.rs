@@ -13,7 +13,7 @@ pub mod toc;
 pub mod types;
 pub mod util;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,10 +24,9 @@ use chrono::{
 use chrono_tz::Tz;
 use regex::Regex;
 
-use crate::db::DATABASE;
 use crate::db::novel_record::NovelRecord;
 use crate::error::{NarouError, Result};
-use crate::platform::{HttpClient, RateLimiter};
+use crate::platform::{HttpClient, NovelMutation, NovelRepository, RateLimiter};
 use crate::progress::ProgressReporter;
 use crate::termcolor::bold_colored;
 
@@ -105,6 +104,7 @@ impl SiteTimezone {
 pub struct Downloader {
     http: Arc<dyn HttpClient>,
     rate_limiter: Arc<dyn RateLimiter>,
+    novels: Arc<dyn NovelRepository>,
     site_settings: Vec<SiteSetting>,
     section_cache: SectionCache,
     section_hash_cache: HashMap<String, HashMap<String, String>>,
@@ -617,6 +617,7 @@ impl Downloader {
     pub fn with_platform(
         http: Arc<dyn HttpClient>,
         rate_limiter: Arc<dyn RateLimiter>,
+        novels: Arc<dyn NovelRepository>,
     ) -> Result<Self> {
         let site_settings = SiteSetting::load_all()?;
         let section_hash_cache = crate::db::with_database(|db| {
@@ -630,6 +631,7 @@ impl Downloader {
         Ok(Self {
             http,
             rate_limiter,
+            novels,
             site_settings,
             section_cache: SectionCache::new(),
             section_hash_cache,
@@ -646,7 +648,8 @@ impl Downloader {
 
         let http = Arc::new(crate::native::http::NativeHttpClient::new(&ua)?);
         let rate_limiter = Arc::new(crate::downloader::rate_limit::RateLimiter::new(false));
-        Self::with_platform(http, rate_limiter)
+        let novels = Arc::new(crate::native::novel_repository::NativeNovelRepository::new());
+        Self::with_platform(http, rate_limiter, novels)
     }
 
     pub fn get_target_type(target: &str) -> TargetType {
@@ -664,81 +667,7 @@ impl Downloader {
         }
     }
 
-    pub fn resolve_target(&self, target: &str) -> Result<(i64, SiteSetting)> {
-        let target_type = Self::get_target_type(target);
-
-        match target_type {
-            TargetType::Url => {
-                let setting = self.find_site_setting(target).ok_or_else(|| {
-                    NarouError::InvalidTarget(format!("No site setting found for URL: {}", target))
-                })?;
-                let toc_url = setting
-                    .toc_url_with_url_captures(target)
-                    .unwrap_or_else(|| setting.toc_url());
-                let db = DATABASE.lock();
-                if let Some(db) = db.as_ref() {
-                    if let Some(record) = db.get_by_toc_url(&toc_url) {
-                        return Ok((record.id, setting));
-                    }
-                }
-                Err(NarouError::NotFound(format!(
-                    "Novel not found for URL: {}",
-                    target
-                )))
-            }
-            TargetType::Ncode => {
-                let ncode = target.to_lowercase();
-                let db = DATABASE.lock();
-                if let Some(db) = db.as_ref() {
-                    for record in db.all_records().values() {
-                        if record.ncode.as_deref() == Some(&ncode) {
-                            let setting =
-                                self.find_site_setting(&record.toc_url).ok_or_else(|| {
-                                    NarouError::SiteSetting("No matching site setting".into())
-                                })?;
-                            return Ok((record.id, setting));
-                        }
-                    }
-                }
-                Err(NarouError::NotFound(format!(
-                    "Novel not found for ncode: {}",
-                    ncode
-                )))
-            }
-            TargetType::Id => {
-                let id: i64 = target
-                    .parse()
-                    .map_err(|_| NarouError::InvalidTarget(target.to_string()))?;
-                let db = DATABASE.lock();
-                if let Some(db) = db.as_ref() {
-                    if let Some(record) = db.get(id) {
-                        let setting = self.find_site_setting(&record.toc_url).ok_or_else(|| {
-                            NarouError::SiteSetting("No matching site setting".into())
-                        })?;
-                        return Ok((record.id, setting));
-                    }
-                }
-                Err(NarouError::NotFound(format!(
-                    "Novel not found for ID: {}",
-                    id
-                )))
-            }
-            TargetType::Other => {
-                let db = DATABASE.lock();
-                if let Some(db) = db.as_ref() {
-                    if let Some(record) = db.find_by_title(target) {
-                        let setting = self.find_site_setting(&record.toc_url).ok_or_else(|| {
-                            NarouError::SiteSetting("No matching site setting".into())
-                        })?;
-                        return Ok((record.id, setting));
-                    }
-                }
-                Err(NarouError::NotFound(format!("Novel not found: {}", target)))
-            }
-        }
-    }
-
-    fn find_site_setting(&self, url: &str) -> Option<SiteSetting> {
+    pub fn find_site_setting(&self, url: &str) -> Option<SiteSetting> {
         for setting in &self.site_settings {
             if setting.matches_url(url) {
                 return Some(setting.clone());
@@ -772,10 +701,12 @@ impl Downloader {
         Option<i64>,
         Option<bool>,
     )> {
-        let (toc_url, ncode) = crate::db::with_database(|db| {
-            Ok(db.get(id).map(|r| (r.toc_url.clone(), r.ncode.clone())))
-        })?
-        .ok_or_else(|| NarouError::NotFound(format!("Novel not found for ID: {}", id)))?;
+        let record = self
+            .novels
+            .get(id.into())
+            .await?
+            .ok_or_else(|| NarouError::NotFound(format!("Novel not found for ID: {}", id)))?;
+        let (toc_url, ncode) = (record.toc_url, record.ncode);
 
         let setting = self
             .find_site_setting(&toc_url)
@@ -838,7 +769,7 @@ impl Downloader {
         Ok((novelupdated_at, general_lastup, info.length, is_end))
     }
 
-    fn process_digest(
+    async fn process_digest(
         &self,
         existing_id: Option<i64>,
         toc_url: &str,
@@ -889,13 +820,14 @@ impl Downloader {
                 }
                 crate::compat::DigestChoice::Convert => {
                     if let Some(id) = existing_id {
-                        let author = crate::db::with_database(|db| {
-                            Ok(db
-                                .get(id)
-                                .map(|record| record.author.clone())
-                                .unwrap_or_default())
-                        })
-                        .unwrap_or_default();
+                        let author = self
+                            .novels
+                            .get(id.into())
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|record| record.author)
+                            .unwrap_or_default();
                         let _ = crate::compat::convert_existing_novel(
                             id, title, &author, novel_dir, false,
                         );
@@ -1057,16 +989,19 @@ impl Downloader {
         target: &str,
         force: bool,
     ) -> Result<DownloadResult> {
-        let (existing_id, mut setting) = self.resolve_target_for_download(target)?;
+        let (existing_id, mut setting) = self.resolve_target_for_download(target).await?;
         let provisional_id = match existing_id {
             Some(id) => id,
-            None => crate::db::with_database(|db| Ok(db.create_new_id()))?,
+            None => self.novels.allocate_id().await?.0,
         };
 
         let db_toc_url = if let Some(id) = existing_id {
-            crate::db::with_database(|db| Ok(db.get(id).map(|r| r.toc_url.clone())))
+            self.novels
+                .get(id.into())
+                .await
                 .ok()
                 .flatten()
+                .map(|record| record.toc_url)
         } else {
             None
         };
@@ -1111,11 +1046,16 @@ impl Downloader {
         // リダイレクト解決で toc_url が入力時と変わった場合、解決後の URL で
         // 既存レコードを再照合して ID を引き継ぐ。別ドメインへ転送されるサイト
         // (例: ハーメルンの h.syosetu.org 分離)で同じ小説が重複登録されるのを防ぐ。
-        let existing_id = existing_id.or_else(|| {
-            crate::db::with_database(|db| Ok(db.get_by_toc_url(&toc_url).map(|record| record.id)))
+        let existing_id = match existing_id {
+            Some(id) => Some(id),
+            None => self
+                .novels
+                .find_by_toc_url(&toc_url)
+                .await
                 .ok()
                 .flatten()
-        });
+                .map(|record| record.id),
+        };
         let provisional_id = existing_id.unwrap_or(provisional_id);
         let toc_source = match fetch_toc(self.http.as_ref(), self.rate_limiter.as_ref(), &setting, &toc_url).await {
             Ok(source) => source,
@@ -1123,23 +1063,25 @@ impl Downloader {
                 let id = existing_id.unwrap();
                 safe_println_fn("小説が削除されているか非公開な可能性があります");
                 let _ = crate::compat::mark_not_found_and_freeze(id);
-                let (title, author, novel_dir) = crate::db::with_database(|db| {
-                    let record = db.get(id).cloned();
-                    let title = record
+                let record = self.novels.get(id.into()).await.ok().flatten();
+                let title = record
+                    .as_ref()
+                    .map(|record| record.title.clone())
+                    .unwrap_or_default();
+                let author = record
+                    .as_ref()
+                    .map(|record| record.author.clone())
+                    .unwrap_or_default();
+                let novel_dir = {
+                    // archive_root は Inventory 依存 (Phase 4 対象) のため
+                    // 従来どおり Database 経由で取得する。
+                    let archive_root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+                        .unwrap_or_else(|_| PathBuf::from(types::ARCHIVE_ROOT_DIR));
+                    record
                         .as_ref()
-                        .map(|record| record.title.clone())
-                        .unwrap_or_default();
-                    let author = record
-                        .as_ref()
-                        .map(|record| record.author.clone())
-                        .unwrap_or_default();
-                    let novel_dir = record
-                        .as_ref()
-                        .map(|record| crate::db::novel_dir_for_record(db.archive_root(), record))
-                        .unwrap_or_default();
-                    Ok((title, author, novel_dir))
-                })
-                .unwrap_or_default();
+                        .map(|record| crate::db::novel_dir_for_record(&archive_root, record))
+                        .unwrap_or_default()
+                };
                 return Ok(DownloadResult {
                     id,
                     title,
@@ -1211,11 +1153,10 @@ impl Downloader {
         let info = self.load_novel_info(&setting, &toc_source, &url_captures).await?;
 
         let author = info.author.clone().unwrap_or_default();
-        let existing_record = existing_id.and_then(|eid| {
-            crate::db::with_database(|db| Ok(db.get(eid).cloned()))
-                .ok()
-                .flatten()
-        });
+        let existing_record = match existing_id {
+            Some(eid) => self.novels.get(eid.into()).await.ok().flatten(),
+            None => None,
+        };
         let fetched_raw_title = info.title.clone().unwrap_or_default();
         let raw_title = if fetched_raw_title.is_empty() {
             existing_record
@@ -1266,7 +1207,7 @@ impl Downloader {
             .await?
         };
 
-        let use_subdirectory = self.download_use_subdirectory(existing_id);
+        let use_subdirectory = self.download_use_subdirectory(existing_record.as_ref());
         let ncode = self
             .extract_ncode(&setting, &toc_source)
             .or_else(|| url_captures.get("ncode").cloned());
@@ -1274,7 +1215,7 @@ impl Downloader {
             &ncode,
             &title,
             setting.append_title_to_folder_name,
-            existing_id,
+            existing_record.as_ref(),
         );
         let sitename = info
             .sitename
@@ -1331,15 +1272,18 @@ impl Downloader {
             } else {
                 title.clone()
             };
-            if self.process_digest(
-                existing_id,
-                &toc_url,
-                &novel_dir,
-                &title_for_digest,
-                &digest_story,
-                old_section_count,
-                subtitles.len(),
-            )? {
+            if self
+                .process_digest(
+                    existing_id,
+                    &toc_url,
+                    &novel_dir,
+                    &title_for_digest,
+                    &digest_story,
+                    old_section_count,
+                    subtitles.len(),
+                )
+                .await?
+            {
                 return Ok(DownloadResult {
                     id: provisional_id,
                     title: title_for_digest,
@@ -1702,10 +1646,9 @@ impl Downloader {
             sections_deleted,
         );
 
-        let id = crate::db::with_database_mut(|db| {
-            db.update_records(|mut records: BTreeMap<i64, NovelRecord>| {
-                let id = if let Some(eid) = existing_id {
-                    if let Some(existing) = records.get(&eid) {
+        let id = if let Some(eid) = existing_id {
+            match self.novels.get(eid.into()).await? {
+                Some(existing) => {
                     let mut updated = existing.clone();
                     if !record.author.is_empty() {
                         updated.author = record.author.clone();
@@ -1736,29 +1679,38 @@ impl Downloader {
                             updated.tags.push(tag.clone());
                         }
                     }
-                    records.insert(eid, updated);
-                    eid
-                } else {
-                    let new_id = provisional_id;
-                    let mut rec = record.clone();
-                    rec.id = new_id;
-                    rec.tags = auto_tags.clone();
-                    records.insert(new_id, rec);
-                    new_id
+                    let merged_id = updated.id;
+                    self.novels
+                        .apply_batch(vec![NovelMutation::Upsert(updated)])
+                        .await?;
+                    merged_id
                 }
-            } else {
-                let new_id = records.keys().copied().max().map(|id| id + 1).unwrap_or(0);
-                let mut rec = record.clone();
-                rec.id = new_id;
-                rec.tags = auto_tags.clone();
-                records.insert(new_id, rec);
-                new_id
-            };
-                Ok((records, id))
-            })
-        })?;
+                None => {
+                    // レコードが消えていた場合: 先頭で確保した provisional_id を使う
+                    // (従来の update_records 分岐と同挙動)。
+                    let mut rec = record.clone();
+                    rec.id = provisional_id;
+                    rec.tags = auto_tags.clone();
+                    self.novels
+                        .apply_batch(vec![NovelMutation::Upsert(rec)])
+                        .await?;
+                    provisional_id
+                }
+            }
+        } else {
+            // 新規: コミット時点で一意 ID を予約する (従来の max+1 と同セマンティクス)。
+            let new_id = self.novels.allocate_id().await?.0;
+            let mut rec = record.clone();
+            rec.id = new_id;
+            rec.tags = auto_tags.clone();
+            self.novels
+                .apply_batch(vec![NovelMutation::Upsert(rec)])
+                .await?;
+            new_id
+        };
 
-        self.remove_migrated_novel_dir(previous_novel_dir.as_deref(), &novel_dir);
+        self.remove_migrated_novel_dir(previous_novel_dir.as_deref(), &novel_dir)
+            .await;
 
         if let Some(old_id) = existing_id {
             self.move_section_hash_bucket(old_id, id);
@@ -1895,7 +1847,10 @@ impl Downloader {
         is_safe_public_url(&target).then_some(target)
     }
 
-    fn resolve_target_for_download(&self, target: &str) -> Result<(Option<i64>, SiteSetting)> {
+    async fn resolve_target_for_download(
+        &self,
+        target: &str,
+    ) -> Result<(Option<i64>, SiteSetting)> {
         let target_type = Self::get_target_type(target);
 
         match target_type {
@@ -1906,53 +1861,41 @@ impl Downloader {
                 let toc_url = setting
                     .toc_url_with_url_captures(target)
                     .unwrap_or_else(|| setting.toc_url());
-                let existing_id =
-                    crate::db::with_database(|db| Ok(db.get_by_toc_url(&toc_url).map(|r| r.id)))
-                        .ok()
-                        .flatten();
+                let existing_id = self
+                    .novels
+                    .find_by_toc_url(&toc_url)
+                    .await?
+                    .map(|record| record.id);
                 Ok((existing_id, setting))
             }
             TargetType::Ncode => {
                 let ncode = target.to_lowercase();
-                let existing_id = crate::db::with_database(|db| {
-                    Ok(db
-                        .all_records()
-                        .values()
-                        .find(|r| r.ncode.as_deref() == Some(ncode.as_str()))
-                        .map(|r| r.id))
-                })
-                .ok()
-                .flatten();
+                let existing_id = self
+                    .novels
+                    .find_by_ncode(&ncode)
+                    .await?
+                    .map(|record| record.id);
                 if let Some(id) = existing_id {
-                    let toc_url =
-                        crate::db::with_database(|db| Ok(db.get(id).map(|r| r.toc_url.clone())))
-                            .ok()
-                            .flatten();
-                    let setting = match toc_url {
-                        Some(ref url) => self.find_site_setting(url).ok_or_else(|| {
-                            NarouError::SiteSetting("No matching site setting".into())
-                        })?,
-                        None => {
-                            return Err(NarouError::NotFound(format!(
-                                "Novel record {} has no toc_url",
-                                id
-                            )));
-                        }
-                    };
+                    let record = self.novels.get(id.into()).await?.ok_or_else(|| {
+                        NarouError::NotFound(format!("Novel record {} has no toc_url", id))
+                    })?;
+                    let setting = self.find_site_setting(&record.toc_url).ok_or_else(|| {
+                        NarouError::SiteSetting("No matching site setting".into())
+                    })?;
                     Ok((Some(id), setting))
                 } else {
                     let narou_url = format!("https://ncode.syosetu.com/{}/", ncode);
                     let setting = self.find_site_setting(&narou_url).ok_or_else(|| {
                         NarouError::InvalidTarget(format!("対応外のncodeです({})", ncode))
                     })?;
-                    let existing_id = crate::db::with_database(|db| {
-                        let toc_url = setting
-                            .toc_url_with_url_captures(&narou_url)
-                            .unwrap_or_else(|| setting.toc_url());
-                        Ok(db.get_by_toc_url(&toc_url).map(|r| r.id))
-                    })
-                    .ok()
-                    .flatten();
+                    let toc_url = setting
+                        .toc_url_with_url_captures(&narou_url)
+                        .unwrap_or_else(|| setting.toc_url());
+                    let existing_id = self
+                        .novels
+                        .find_by_toc_url(&toc_url)
+                        .await?
+                        .map(|record| record.id);
                     Ok((existing_id, setting))
                 }
             }
@@ -1960,42 +1903,34 @@ impl Downloader {
                 let id: i64 = target
                     .parse()
                     .map_err(|_| NarouError::InvalidTarget(target.to_string()))?;
-                let setting = crate::db::with_database(|db| {
-                    Ok(db.get(id).and_then(|r| {
-                        self.find_site_setting(&r.toc_url).or_else(|| {
-                            Self::ageauth_redirect_target(&r.toc_url)
+                let setting = self
+                    .novels
+                    .get(id.into())
+                    .await?
+                    .and_then(|record| {
+                        self.find_site_setting(&record.toc_url).or_else(|| {
+                            Self::ageauth_redirect_target(&record.toc_url)
                                 .and_then(|url| self.find_site_setting(&url))
                         })
-                    }))
-                })
-                .ok()
-                .flatten();
+                    });
                 let setting = setting.ok_or_else(|| {
                     NarouError::NotFound(format!("Novel not found for ID: {}", id))
                 })?;
                 Ok((Some(id), setting))
             }
             TargetType::Other => {
-                let existing_id =
-                    crate::db::with_database(|db| Ok(db.find_by_title(target).map(|r| r.id)))
-                        .ok()
-                        .flatten();
+                let existing_id = self
+                    .novels
+                    .find_by_title(target)
+                    .await?
+                    .map(|record| record.id);
                 if let Some(id) = existing_id {
-                    let toc_url =
-                        crate::db::with_database(|db| Ok(db.get(id).map(|r| r.toc_url.clone())))
-                            .ok()
-                            .flatten();
-                    let setting = match toc_url {
-                        Some(ref url) => self.find_site_setting(url).ok_or_else(|| {
-                            NarouError::SiteSetting("No matching site setting".into())
-                        })?,
-                        None => {
-                            return Err(NarouError::NotFound(format!(
-                                "Novel record {} has no toc_url",
-                                id
-                            )));
-                        }
-                    };
+                    let record = self.novels.get(id.into()).await?.ok_or_else(|| {
+                        NarouError::NotFound(format!("Novel record {} has no toc_url", id))
+                    })?;
+                    let setting = self.find_site_setting(&record.toc_url).ok_or_else(|| {
+                        NarouError::SiteSetting("No matching site setting".into())
+                    })?;
                     Ok((Some(id), setting))
                 } else {
                     Err(NarouError::NotFound(format!(
@@ -2022,21 +1957,19 @@ impl Downloader {
         ncode: &Option<String>,
         title: &str,
         append_title: bool,
-        existing_id: Option<i64>,
+        existing_record: Option<&NovelRecord>,
     ) -> String {
-        if let Some(id) = existing_id {
-            if let Ok(Some(record)) = crate::db::with_database(|db| Ok(db.get(id).cloned())) {
-                if !record.file_title.is_empty() {
-                    if append_title
-                        && ncode
-                            .as_deref()
-                            .is_some_and(|ncode| record.file_title.eq_ignore_ascii_case(ncode))
-                        && !title.is_empty()
-                    {
-                        // Recover records created before the correct site/title was known.
-                    } else {
-                        return record.file_title;
-                    }
+        if let Some(record) = existing_record {
+            if !record.file_title.is_empty() {
+                if append_title
+                    && ncode
+                        .as_deref()
+                        .is_some_and(|ncode| record.file_title.eq_ignore_ascii_case(ncode))
+                    && !title.is_empty()
+                {
+                    // Recover records created before the correct site/title was known.
+                } else {
+                    return record.file_title.clone();
                 }
             }
         }
@@ -2072,30 +2005,60 @@ impl Downloader {
         )
     }
 
-    fn remove_migrated_novel_dir(&self, previous: Option<&Path>, current: &Path) {
+    async fn remove_migrated_novel_dir(&self, previous: Option<&Path>, current: &Path) {
         let Some(previous) = previous else {
             return;
         };
         if previous == current || !previous.exists() {
             return;
         }
-        let still_referenced = crate::db::with_database(|db| {
-            Ok(db
-                .all_records()
-                .values()
-                .any(|record| crate::db::novel_dir_for_record(Path::new(types::ARCHIVE_ROOT_DIR), record) == previous))
-        })
-        .unwrap_or(true);
+
+        let filter = crate::platform::NovelFilter::all();
+        let mut after_id = None;
+        let mut still_referenced = false;
+        loop {
+            let ids = match self.novels.scan_ids(&filter, after_id, 256).await {
+                Ok(ids) => ids,
+                Err(_) => {
+                    still_referenced = true;
+                    break;
+                }
+            };
+            if ids.is_empty() {
+                break;
+            }
+            after_id = ids.last().copied();
+            for id in ids {
+                match self.novels.get(id).await {
+                    Ok(Some(record)) => {
+                        if crate::db::novel_dir_for_record(
+                            Path::new(types::ARCHIVE_ROOT_DIR),
+                            &record,
+                        ) == previous
+                        {
+                            still_referenced = true;
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        still_referenced = true;
+                        break;
+                    }
+                }
+            }
+            if still_referenced {
+                break;
+            }
+        }
         if !still_referenced {
             let _ = std::fs::remove_dir_all(previous);
         }
     }
 
-    fn download_use_subdirectory(&self, existing_id: Option<i64>) -> bool {
-        if let Some(id) = existing_id {
-            if let Ok(Some(record)) = crate::db::with_database(|db| Ok(db.get(id).cloned())) {
-                return record.use_subdirectory;
-            }
+    fn download_use_subdirectory(&self, existing_record: Option<&NovelRecord>) -> bool {
+        if let Some(record) = existing_record {
+            return record.use_subdirectory;
         }
 
         crate::db::with_database(|db| {
@@ -2195,7 +2158,7 @@ impl Downloader {
     }
 
     pub async fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
-        narou_api_batch_update(self.http.as_ref()).await
+        narou_api_batch_update(self.http.as_ref(), self.novels.as_ref()).await
     }
 }
 
@@ -2213,6 +2176,8 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use chrono::TimeZone;
+    use crate::platform::mocks::{FakeRateLimiter, MemoryNovelRepository, MockHttpClient};
+    use std::sync::Arc;
 
     struct DatabaseGuard(Option<Database>);
 
@@ -2278,6 +2243,30 @@ mod tests {
     }
 
     #[test]
+    fn repository_injection_resolves_existing_ncode_without_database_global() {
+        let mut record = sample_record(chrono::Utc::now());
+        record.id = 42;
+        record.toc_url = "https://ncode.syosetu.com/n1234ab/".to_string();
+        record.ncode = Some("n1234ab".to_string());
+        record.is_narou = true;
+
+        let repository = Arc::new(MemoryNovelRepository::from_records(vec![record]));
+        let downloader = Downloader::with_platform(
+            Arc::new(MockHttpClient::new()),
+            Arc::new(FakeRateLimiter::new()),
+            repository,
+        )
+        .unwrap();
+
+        let (id, setting) = futures::executor::block_on(
+            downloader.resolve_target_for_download("N1234AB"),
+        )
+        .unwrap();
+        assert_eq!(id, Some(42));
+        assert_eq!(setting.domain, "ncode.syosetu.com");
+    }
+
+    #[test]
     fn remove_migrated_novel_dir_keeps_previous_dir_when_still_referenced() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
@@ -2325,7 +2314,9 @@ mod tests {
             db.insert(current_record);
         }
 
-        downloader.remove_migrated_novel_dir(Some(&previous), &current);
+        futures::executor::block_on(
+            downloader.remove_migrated_novel_dir(Some(&previous), &current),
+        );
         assert!(previous.exists());
     }
 
