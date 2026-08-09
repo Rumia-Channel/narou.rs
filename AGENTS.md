@@ -246,7 +246,7 @@ sample/
 
 ## Current Status (2026-07)
 
-### プラットフォーム抽象化 (Phase 1-2: 2026-08)
+### プラットフォーム抽象化 (Phase 1-3: 2026-08)
 - **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。依存調査結果、module 構成、trait 一覧、migration phases (1-8) を定義。
 - **Phase 1 完了**: `src/platform/` に traits（HttpClient / Clock / RateLimiter / ObjectStore / NovelRepository）+ テスト用 mock（MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter / SystemClock）を導入。
 - `NarouError::Http` は `reqwest::Error` の直接 `#[from]` をやめ String 化。`Platform(String)` variant 追加。core から reqwest 型が error 経由で漏れるのを防止。
@@ -254,10 +254,14 @@ sample/
   - `HttpClient::send` / `RateLimiter::acquire` は boxed future の async trait（`Send`）。`HttpRequest` は所有型 + `RedirectMode`（Follow/Manual）、`HttpResponse` は bytes のみ。
   - `src/downloader/fetch.rs`（HttpFetcher）は削除。transport は `src/native/http.rs` の `NativeHttpClient`（curl→reqwest→wget tier fallback、`tokio::task::spawn_blocking` で隔離）。
   - デコード・ステータス→ドメインエラー変換・リダイレクト解決は `src/downloader/http_policy.rs`（プラットフォーム中立）に集約。
-  - `Downloader` は `Arc<dyn HttpClient>` + `Arc<dyn RateLimiter>` を保持。`with_platform(http, rate_limiter)` で注入、`with_user_agent` は native 実装を組み立てる。
+  - Downloader は `Arc<dyn HttpClient>` + `Arc<dyn RateLimiter>` + `Arc<dyn NovelRepository>` を保持。`with_platform(http, rate_limiter, novels)` で注入し、`with_user_agent` は native 実装を組み立てる。
   - `cmd_download` / `cmd_update` は async 化。update の domain 別並列 worker は `tokio::spawn` に移行。
   - なろう系サイトの wait-steps 既定 10 は `RateLimitScope::narou` フラグで維持。
-- 今後の phase: 3=Database の Repository 化、4=converter/illustration の FS 除去、5=Web UI の service 層化、6=Worker skeleton、7=D1/Wasabi/Worker fetch、8=Queues/crawler/scheduler。
+- **Phase 3 完了**: `NovelRepository` を async 化し、typed `NovelFilter` / `SearchTerm` / `NovelSortKey` / `NovelQuery` / `NovelMutation`、keyset `scan_ids`、atomic `allocate_id`、一回保存の `apply_batch` を実装。
+  - `src/native/novel_repository.rs` は共有 `db::DATABASE` を使う stateless adapter。async 経路は `spawn_blocking`、CLI は `_sync` 経路で実行し、YAML を二重ロードしない。
+  - Downloader / narou API / CLI / Web の NovelRecord 操作を repository 経由へ移行。Web 一覧は `count` + paginated `query`、一括処理は `scan_ids`。
+  - Native YAML round-trip、unknown fields / raw_title / nilable bool / 日時、Memory repository、並列 ID reservation、Downloader injection をテストで固定。
+- 今後の phase: 4=converter/illustration の FS 除去、5=Web UI の service 層化、6=Worker skeleton、7=D1/Wasabi/Worker fetch、8=Queues/crawler/scheduler。
 
 ### 最近の追加 (2026-05〜07)
 - **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1 で従来の逐次動作、フォース指定・ウェブモード・ドメインが1種類のときは自動的に逐次にフォールバック

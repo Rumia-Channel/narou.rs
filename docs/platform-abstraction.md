@@ -1,7 +1,7 @@
 # Platform Abstraction & Cloudflare Workers 対応設計
 
-> ステータス: 進行中（Phase 1・2 完了、Phase 3 以降は未着手）
-> 対象: narou.rs v0.3.6 以降（2026-08-08 時点の develop）
+> ステータス: 進行中（Phase 1・2・3 完了、Phase 4 以降は未着手）
+> 対象: narou.rs v0.3.6 以降（2026-08-09 時点の develop）
 > 方針の一次資料: ユーザー提供リファクタリング指示（最重要原則・禁止事項・設計上の優先順位に従う）
 
 ## 0. 設計判断の前提
@@ -208,37 +208,88 @@ pub trait ObjectStore: Send + Sync {
 - native 実装は `LocalObjectStore`（ルートパスを注入）。key→パス変換は `db::paths` のロジックを利用。
 - streaming は必要な経路（画像・epub・backup）から Phase 4 以降に `stream_read` / `stream_write` を追加する。最初から複雑にしない。
 
-### NovelRepository
+### NovelRepository（Phase 3 完了）
+
+`NovelRepository` は `PlatformService` を継承し、target-aware な `PlatformFuture` を返す。検索条件はクロージャではなく値として表現するため、将来の D1 実装で SQL の `WHERE` / `ORDER BY` に直接変換できる。
 
 ```rust
-pub struct NovelId(pub i64);
-pub struct NovelQuery { pub keyword: Option<String>, pub sort_by: Option<String>, pub offset: usize, pub limit: usize, ... }
+pub struct NovelFilter {
+    pub ids: Option<Vec<NovelId>>,
+    pub keyword: Option<String>,
+    pub site: Option<String>,
+    pub domain: Option<String>,
+    pub tag: Option<String>,
+    pub ncode: Option<String>,
+    pub is_narou: Option<bool>,
+    pub suspend: Option<bool>,
+    pub novel_type: Option<u8>,
+    pub end: Option<bool>,
+    pub terms: Vec<SearchTerm>,       // AND; values は OR
+    pub frozen_ids: Option<HashSet<i64>>, // native の freeze inventory hint
+}
 
-pub trait NovelRepository: Send + Sync {
-    async fn get(&self, id: NovelId) -> Result<Option<NovelRecord>>;
-    async fn find_by_toc_url(&self, url: &str) -> Result<Option<NovelRecord>>;
-    async fn find_by_title(&self, title: &str) -> Result<Option<NovelRecord>>;
-    async fn insert(&self, record: &NovelRecord) -> Result<()>;
-    async fn update(&self, record: &NovelRecord) -> Result<()>;
-    async fn remove(&self, id: NovelId) -> Result<()>;
-    async fn query(&self, query: NovelQuery) -> Result<Vec<NovelRecord>>;
+pub enum NovelSortKey {
+    Id, LastUpdate, GeneralLastup, LastCheckDate, Title, Author,
+    SiteName, NovelType, Tags, GeneralAllNo, Length, Status, TocUrl,
+    NewArrivalsDate,
+}
+
+pub struct NovelQuery {
+    pub filter: NovelFilter,
+    pub sort: NovelSort,
+    pub offset: usize,
+    pub limit: usize,                // 0 は無効。全件 sentinel には使わない
+}
+
+pub enum NovelMutation {
+    Upsert(NovelRecord),
+    Remove(NovelId),
+}
+
+pub trait NovelRepository: PlatformService {
+    fn get(&self, id: NovelId) -> PlatformFuture<Result<Option<NovelRecord>>>;
+    fn find_by_toc_url(&self, url: &str)
+        -> PlatformFuture<Result<Option<NovelRecord>>>;
+    fn find_by_title(&self, title: &str)
+        -> PlatformFuture<Result<Option<NovelRecord>>>;
+    fn find_by_ncode(&self, ncode: &str)
+        -> PlatformFuture<Result<Option<NovelRecord>>>;
+    fn count(&self, filter: &NovelFilter) -> PlatformFuture<Result<u64>>;
+    fn query(&self, query: &NovelQuery)
+        -> PlatformFuture<Result<Vec<NovelRecord>>>;
+    fn scan_ids(&self, filter: &NovelFilter, after_id: Option<NovelId>, limit: usize)
+        -> PlatformFuture<Result<Vec<NovelId>>>;
+    fn allocate_id(&self) -> PlatformFuture<Result<NovelId>>;
+    fn apply_batch(&self, mutations: Vec<NovelMutation>)
+        -> PlatformFuture<Result<()>>;
 }
 ```
 
-- Phase 1 では型定義のみ。既存 `db::DATABASE` + `with_database` は native 側の実装ディテールとして残し、`YamlNovelRepository` を被せる（Phase 3）。
-- 全件ロード前提の `all_records()` は Repository 実装内部に閉じ込め、core からは query 経由にする。
+- 表示系は `NovelQuery::page(filter, sort, offset, limit)` を使う。`scan_ids` は `id > after_id ORDER BY id LIMIT n` の keyset pagination で、バックグラウンド一括処理のために使う。
+- `allocate_id` は共有 DB ロック内で単調増加カーソルを予約する。呼び出し側が `max(id) + 1` を計算することは禁止。予約された ID の間隔は許容する。
+- `apply_batch` は複数の upsert/remove を一回の YAML 更新として永続化する。
+- `find_by_title` は IndexStore の完全一致を先に使い、見つからない場合は大文字小文字を無視した完全一致へフォールバックする。`find_by_ncode` は `ncode` と legacy な `toc_url` suffix の双方を受理する。
+- Web の検索トークンは `SearchTerm`（field / negated / OR values）へ変換し、AND 条件として repository へ渡す。任意 predicate や `serde_yaml::Value` 条件は使わない。
 
-## 5. native implementation（Phase 1・2 で作成済み）
+## 5. native implementation（Phase 1-3 完了）
 
-| 実装 | 元コード | 内容 |
+| 実装 | ファイル | 内容 |
 |---|---|---|
-| `NativeHttpClient` | `downloader/fetch.rs` の HttpFetcher の transport 部分（`src/native/http.rs`） | `HttpClient` trait を実装。内部で現行の 3-tier（curl→reqwest→wget）・redirect・UA・cookie を維持。`send` は `tokio::task::spawn_blocking` で blocking トランスポートを隔離。`RedirectMode::Manual` では 4xx/5xx 時に curl probe（CDN チャレンジ対策）を実行 |
-| `RateLimiter`（`downloader/rate_limit.rs` 内の `impl platform::RateLimiter`） | `downloader/rate_limit.rs` | 現行 `RateLimiter` の `reserve_wait_duration` を async `acquire` へ写像。`tokio::time::sleep` で待機 |
-| `SystemClock` | — | `chrono::Utc::now()` を返すだけ |
-| `LocalObjectStore` | `db/inventory.rs` 等 | Phase 4 で。Phase 1 では型定義と `MemoryObjectStore` のみ |
-| `YamlNovelRepository` | `db/database.rs` | Phase 3 で |
+| `NativeHttpClient` | `src/native/http.rs` | `HttpClient` trait。3-tier（curl→reqwest→wget）・redirect・UA・cookie を維持し、blocking transport は `spawn_blocking` へ隔離 |
+| `RateLimiter` | `src/downloader/rate_limit.rs` | `platform::RateLimiter::acquire` を実装。なろう系の既定 wait-steps も維持 |
+| `NativeNovelRepository` | `src/native/novel_repository.rs` | stateless adapter。`db::DATABASE` 内の単一 `Database` を共有し、YAML を二重ロードしない。async trait は runtime 内で `spawn_blocking`、CLI は `_sync` entry point を使う |
 
-**Phase 2 の注意**: `HttpFetcher`（`src/downloader/fetch.rs`）は削除済み。tier fallback のステート（`tier_failures` / `prefer_curl`）は `NativeHttpClient` の `Arc` 共有フィールドとして native 側に残る。core の downloader は `Arc<dyn HttpClient>` + `Arc<dyn RateLimiter>` を注入され、`http_policy` ヘルパー（`fetch_text` / `fetch_bytes` / `resolve_final_url`）経由でのみ HTTP に触れる。
+`NativeNovelRepository` の record 操作は `get` / `find_*` / `count` / `query` / `scan_ids` / `allocate_id` / `apply_batch` に限定する。`IndexStore` の toc URL・タイトル索引は既存 `Database` 経由で維持する。`apply_batch` は一回の `database.yaml` 更新と index flush を行い、unknown fields、`raw_title`、nilable bool、日時型をそのまま保存する。
+
+`Database::next_id` はロード済み最大 ID と現在の予約値の最大値を保持する。`allocate_id` は共有 DB ロック内で cursor を increment して予約するため、並列 task が同じ ID を受け取らない。`refresh` は未コミット予約を巻き戻さない。
+
+**Phase 2 の注意**: `HttpFetcher`（`src/downloader/fetch.rs`）は削除済み。core の downloader は `Arc<dyn HttpClient>`、`Arc<dyn RateLimiter>`、`Arc<dyn NovelRepository>` を注入され、`http_policy` と repository trait 経由でのみ platform 実装へ触れる。
+
+### Phase 3 で native-only に残したもの
+
+- `Inventory` の設定ファイル、`archive_root`、freeze/lock YAML との atomic 複合更新は Phase 4 の設定/ObjectStore 抽象化対象。`compat::set_frozen_state`、`mark_not_found_and_freeze`、`commands/manage.rs` の freeze 操作は、freeze YAML と record を同時更新するため現時点では native-only のまま。
+- `db::refresh()` は Web の subprocess 実行後に native の共有メモリを再読込するため残す。
+- `remove_migrated_novel_dir` の path 参照判定は `scan_ids` と `get` を使うが、実ファイル削除自体は Phase 4 の ObjectStore 対象。
 
 ## 6. Worker implementation（Phase 6-8 の予定）
 
@@ -290,7 +341,7 @@ Worker (worker_entry)
 |---|---|---|
 | 1（完了） | `src/platform/`（traits + mocks）作成、`NarouError` の reqwest 直依存除去、`HttpFetcher` に `HttpClient` 実装、native ラッパ | build / test / clippy 通過。外部挙動変化なし |
 | 2（完了） | downloader を trait 利用へ（fetch_text/fetch_bytes/resolve_final_url を HttpClient 経由に） | downloader から blocking HTTP 直呼びを排除（native 実装内部を除く） |
-| 3 | database を Repository 化。`with_database`/`all_records` 依存を core から除去 | 主要コマンドが Repository 経由 |
+| 3（完了） | async `NovelRepository`、typed filter/sort/query、keyset `scan_ids`、atomic ID reservation、batch mutation を導入。Downloader / CLI / Web の NovelRecord 操作を repository 経由へ移行 | native YAML compatibility、Memory/mock、Downloader repository injection、Web list pagination-ready、全テスト通過 |
 | 4 | converter / illustration / command から直接 FS アクセス除去（ObjectStore / TempStorage 経由） | core から主要 FS 依存が除去 |
 | 5 | Web UI を service 層経由に | web から DB/FS 直アクセスが service 経由に |
 | 6 | Worker backend skeleton（worker_entry + feature 分離） | `cargo build --features worker-runtime` が通る |
@@ -303,7 +354,7 @@ Worker (worker_entry)
 
 - `NarouError::Http(#[from] reqwest::Error)` → 廃止。`Platform(String)` 等へ。`#[from]` を外すため `?` での暗黙変換は消え、`map_err` が必要になる箇所が増える。
 - `HttpFetcher` の public フィールド（`client` / `manual_redirect_client` 等）は維持しつつ、将来的に private 化。
-- `db::with_database` / `with_database_mut` / `all_records` は Phase 3 で廃止予定（現時点では維持）。
+- `db::with_database` / `with_database_mut` / `all_records` は core の NovelRecord 操作では使わない。native repository 内部、Inventory/settings、archive-root、freeze YAML との atomic 複合操作、テスト fixture のみ残る。
 - `RateLimiter::wait()` 等の同期メソッドは native 内部用として維持し、core は async trait 経由にする。
 
 ## 11. preserved external compatibility（守るもの）
