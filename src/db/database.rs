@@ -15,6 +15,7 @@ pub struct Database {
     index: IndexStore,
     inventory: Inventory,
     archive_root: PathBuf,
+    next_id: i64,
 }
 
 impl Database {
@@ -32,6 +33,7 @@ impl Database {
             index: IndexStore::load(&inventory)?,
             inventory,
             archive_root,
+            next_id: 0,
         };
         db.refresh()?;
         Ok(db)
@@ -52,6 +54,9 @@ impl Database {
                 .collect();
         } else {
             self.data.clear();
+        }
+        if let Some(max_id) = self.data.keys().max().copied() {
+            self.next_id = self.next_id.max(max_id.saturating_add(1));
         }
         self.index.reconcile(&self.data);
         Ok(())
@@ -106,6 +111,7 @@ impl Database {
         let id = record.id;
         let toc_url = Some(record.toc_url.clone());
         let title = Some(record.title.clone());
+        self.next_id = self.next_id.max(id.saturating_add(1));
         self.data.insert(id, record);
         self.index.upsert(id, toc_url.as_deref(), title.as_deref());
     }
@@ -157,8 +163,16 @@ impl Database {
         None
     }
 
+    /// Legacy read-only candidate; repository callers must use `allocate_id`.
     pub fn create_new_id(&self) -> i64 {
-        self.data.keys().copied().max().map(|m| m + 1).unwrap_or(0)
+        self.next_id
+    }
+
+    /// Reserve the next novel ID while the shared database lock is held.
+    pub fn allocate_id(&mut self) -> i64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        id
     }
 
     pub fn sort_by(&self, key: &str, reverse: bool) -> Vec<&NovelRecord> {

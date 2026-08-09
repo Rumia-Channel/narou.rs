@@ -7,3 +7,4 @@
 //! (`Downloader::with_user_agent` etc.) wire it in.
 
 pub mod http;
+pub mod novel_repository;
