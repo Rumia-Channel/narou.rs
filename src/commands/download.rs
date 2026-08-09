@@ -240,19 +240,30 @@ fn valid_target(downloader: &Downloader, target: &str) -> bool {
 
 pub(crate) fn tagname_to_ids(targets: &[String]) -> Vec<String> {
     let mut expanded = Vec::new();
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+
+    // tag index 相当: 完全一致タグで絞った ID 一覧 (D1 では novel_tags join)。
+    let tag_ids = |tag_name: &str| -> Vec<i64> {
+        let filter = narou_rs::platform::NovelFilter {
+            tag: Some(tag_name.to_string()),
+            ..Default::default()
+        };
+        novels
+            .scan_ids_sync(&filter, None, usize::MAX)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| id.0)
+            .collect()
+    };
 
     for target in targets {
         if target.starts_with("tag:") {
             let tag_name = &target[4..];
-            let tag_ids = narou_rs::db::with_database(|db| {
-                let index = db.tag_index();
-                Ok(index.get(tag_name).cloned().unwrap_or_default())
-            })
-            .unwrap_or_default();
-            if tag_ids.is_empty() {
+            let ids = tag_ids(tag_name);
+            if ids.is_empty() {
                 expanded.push(tag_name.to_string());
             } else {
-                for id in tag_ids {
+                for id in ids {
                     let s = id.to_string();
                     if !expanded.contains(&s) {
                         expanded.push(s);
@@ -261,13 +272,15 @@ pub(crate) fn tagname_to_ids(targets: &[String]) -> Vec<String> {
             }
         } else if target.starts_with("^tag:") {
             let tag_name = &target[5..];
-            let exclude_ids = narou_rs::db::with_database(|db| {
-                let index = db.tag_index();
-                Ok(index.get(tag_name).cloned().unwrap_or_default())
-            })
-            .unwrap_or_default();
-            let mut all_ids = narou_rs::db::with_database(|db| Ok(db.ids())).unwrap_or_default();
-            all_ids.sort_unstable();
+            let exclude_ids: std::collections::HashSet<i64> =
+                tag_ids(tag_name).into_iter().collect();
+            let filter = narou_rs::platform::NovelFilter::all();
+            let all_ids: Vec<i64> = novels
+                .scan_ids_sync(&filter, None, usize::MAX)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| id.0)
+                .collect();
             for id in all_ids {
                 if !exclude_ids.contains(&id) {
                     let s = id.to_string();
@@ -277,22 +290,17 @@ pub(crate) fn tagname_to_ids(targets: &[String]) -> Vec<String> {
                 }
             }
         } else if let Ok(id) = target.parse::<i64>() {
-            let exists =
-                narou_rs::db::with_database(|db| Ok(db.get(id).is_some())).unwrap_or(false);
+            let exists = novels.get_sync(id.into()).ok().flatten().is_some();
             if exists {
                 if !expanded.contains(&target.clone()) {
                     expanded.push(target.clone());
                 }
             } else {
-                let tag_ids = narou_rs::db::with_database(|db| {
-                    let index = db.tag_index();
-                    Ok(index.get(target).cloned().unwrap_or_default())
-                })
-                .unwrap_or_default();
-                if tag_ids.is_empty() {
+                let ids = tag_ids(target);
+                if ids.is_empty() {
                     expanded.push(target.clone());
                 } else {
-                    for id in tag_ids {
+                    for id in ids {
                         let s = id.to_string();
                         if !expanded.contains(&s) {
                             expanded.push(s);
@@ -301,15 +309,11 @@ pub(crate) fn tagname_to_ids(targets: &[String]) -> Vec<String> {
                 }
             }
         } else {
-            let tag_ids = narou_rs::db::with_database(|db| {
-                let index = db.tag_index();
-                Ok(index.get(target).cloned().unwrap_or_default())
-            })
-            .unwrap_or_default();
-            if tag_ids.is_empty() {
+            let ids = tag_ids(target);
+            if ids.is_empty() {
                 expanded.push(target.clone());
             } else {
-                for id in tag_ids {
+                for id in ids {
                     let s = id.to_string();
                     if !expanded.contains(&s) {
                         expanded.push(s);
@@ -338,61 +342,50 @@ enum ExistingDownloadState {
 
 pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
     let target = super::resolve_alias_target(target);
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     let target_type = Downloader::get_target_type(&target);
     match target_type {
         TargetType::Id => {
             if let Ok(id) = target.parse::<i64>() {
-                narou_rs::db::with_database(|db| {
-                    Ok(db.get(id).map(|r| RecordInfo {
-                        id: r.id,
-                        title: r.title.clone(),
-                        toc_url: r.toc_url.clone(),
-                    }))
+                novels.get_sync(id.into()).ok().flatten().map(|r| RecordInfo {
+                    id: r.id,
+                    title: r.title,
+                    toc_url: r.toc_url,
                 })
-                .ok()
-                .flatten()
             } else {
                 None
             }
         }
         TargetType::Url => {
             let toc_url = resolve_toc_url_from_url(&target)?;
-            narou_rs::db::with_database(|db| {
-                Ok(db.get_by_toc_url(&toc_url).map(|r| RecordInfo {
+            novels
+                .find_by_toc_url_sync(&toc_url)
+                .ok()
+                .flatten()
+                .map(|r| RecordInfo {
                     id: r.id,
-                    title: r.title.clone(),
-                    toc_url: r.toc_url.clone(),
-                }))
-            })
+                    title: r.title,
+                    toc_url: r.toc_url,
+                })
+        }
+        TargetType::Ncode => novels
+            .find_by_ncode_sync(&target)
             .ok()
             .flatten()
-        }
-        TargetType::Ncode => {
-            let ncode = target.to_lowercase();
-            narou_rs::db::with_database(|db| {
-                for r in db.all_records().values() {
-                    if r.ncode.as_deref() == Some(ncode.as_str()) {
-                        return Ok(Some(RecordInfo {
-                            id: r.id,
-                            title: r.title.clone(),
-                            toc_url: r.toc_url.clone(),
-                        }));
-                    }
-                }
-                Ok::<Option<RecordInfo>, narou_rs::error::NarouError>(None)
-            })
-            .ok()
-            .flatten()
-        }
-        _ => narou_rs::db::with_database(|db| {
-            Ok(db.find_by_title(&target).map(|r| RecordInfo {
+            .map(|r| RecordInfo {
                 id: r.id,
-                title: r.title.clone(),
-                toc_url: r.toc_url.clone(),
-            }))
-        })
-        .ok()
-        .flatten(),
+                title: r.title,
+                toc_url: r.toc_url,
+            }),
+        _ => novels
+            .find_by_title_sync(&target)
+            .ok()
+            .flatten()
+            .map(|r| RecordInfo {
+                id: r.id,
+                title: r.title,
+                toc_url: r.toc_url,
+            }),
     }
 }
 
@@ -411,12 +404,14 @@ fn resolve_toc_url_from_url(target: &str) -> Option<String> {
 }
 
 fn inspect_existing_download(target: &str) -> Option<ExistingDownloadState> {
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     let record = get_record_for_target(target)?;
     let info = RecordInfo {
         id: record.id,
         title: record.title.clone(),
         toc_url: record.toc_url.clone(),
     };
+    // archive_root は Inventory 依存 (Phase 4 対象)。
     let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
         .unwrap_or_else(|_| std::path::PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR));
     let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
@@ -424,10 +419,9 @@ fn inspect_existing_download(target: &str) -> Option<ExistingDownloadState> {
         return Some(ExistingDownloadState::Present(info));
     }
 
-    if let Err(err) = narou_rs::db::with_database_mut(|db| {
-        db.remove(record.id);
-        db.save()
-    }) {
+    if let Err(err) = novels
+        .apply_batch_sync(vec![narou_rs::platform::NovelMutation::Remove(record.id.into())])
+    {
         eprintln!("Warning: stale database index cleanup failed: {}", err);
     }
 
@@ -438,21 +432,18 @@ fn inspect_existing_download(target: &str) -> Option<ExistingDownloadState> {
 }
 
 fn get_record_for_target(target: &str) -> Option<narou_rs::db::NovelRecord> {
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     let target_type = Downloader::get_target_type(target);
     match target_type {
         TargetType::Id => {
             if let Ok(id) = target.parse::<i64>() {
-                narou_rs::db::with_database(|db| Ok(db.get(id).cloned()))
-                    .ok()
-                    .flatten()
+                novels.get_sync(id.into()).ok().flatten()
             } else {
                 None
             }
         }
         _ => get_data_by_target(target).and_then(|info| {
-            narou_rs::db::with_database(|db| Ok(db.get(info.id).cloned()))
-                .ok()
-                .flatten()
+            novels.get_sync(info.id.into()).ok().flatten()
         }),
     }
 }

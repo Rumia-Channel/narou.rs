@@ -37,7 +37,8 @@ pub(crate) fn create_output_text_filename(
     }
 
     if convert_filename_to_ncode() {
-        let record = crate::db::with_database(|db| Ok(db.get(id).cloned()))
+        let record = crate::native::novel_repository::NativeNovelRepository::new()
+            .get_sync(id.into())
             .ok()
             .flatten();
         let domain = record

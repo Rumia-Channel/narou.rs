@@ -45,12 +45,9 @@ fn cmd_folder_inner(targets: &[String], no_open: bool) -> Result<(), String> {
 
 fn resolve_novel_dir(target: &str) -> Option<PathBuf> {
     let id = super::resolve_target_to_id(target)?;
-    db::with_database(|db| {
-        let archive_root = db.archive_root().to_path_buf();
-        Ok(db
-            .get(id)
-            .map(|record| novel_dir_for_record(&archive_root, record)))
-    })
-    .ok()
-    .flatten()
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let record = novels.get_sync(id.into()).ok().flatten()?;
+    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .unwrap_or_else(|_| PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR));
+    Some(novel_dir_for_record(&archive_root, &record))
 }

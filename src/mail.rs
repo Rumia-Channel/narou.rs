@@ -118,15 +118,24 @@ pub fn ensure_mail_setting_file() -> Result<PathBuf> {
 }
 
 pub fn seed_last_mail_dates() -> Result<()> {
-    crate::db::with_database_mut(|db| -> Result<()> {
-        let now = chrono::Utc::now();
-        for record in db.all_records_mut().values_mut() {
-            if record.last_mail_date.is_none() {
-                record.last_mail_date = Some(now);
-            }
+    let novels = crate::native::novel_repository::NativeNovelRepository::new();
+    let ids = novels
+        .scan_ids_sync(&crate::platform::NovelFilter::all(), None, usize::MAX)?;
+    let now = chrono::Utc::now();
+    let mut mutations = Vec::new();
+    for id in ids {
+        let Ok(Some(mut record)) = novels.get_sync(id) else {
+            continue;
+        };
+        if record.last_mail_date.is_none() {
+            record.last_mail_date = Some(now);
+            mutations.push(crate::platform::NovelMutation::Upsert(record));
         }
-        db.save()
-    })
+    }
+    if !mutations.is_empty() {
+        novels.apply_batch_sync(mutations)?;
+    }
+    Ok(())
 }
 
 pub fn load_mail_setting() -> std::result::Result<MailSetting, MailSettingLoadError> {
@@ -524,11 +533,9 @@ fn smtp_allow_insecure(via_options: &HashMap<String, serde_yaml::Value>) -> bool
 }
 
 fn resolve_record(target: &str) -> std::result::Result<Option<NovelRecord>, String> {
+    let novels = crate::native::novel_repository::NativeNovelRepository::new();
     if let Ok(id) = target.parse::<i64>() {
-        let record = crate::db::with_database(|db| -> Result<Option<NovelRecord>> {
-            Ok(db.get(id).cloned())
-        })
-        .map_err(|e| e.to_string())?;
+        let record = novels.get_sync(id.into()).map_err(|e| e.to_string())?;
         if record.is_some() {
             return Ok(record);
         }
@@ -542,10 +549,9 @@ fn resolve_record(target: &str) -> std::result::Result<Option<NovelRecord>, Stri
                     let toc_url = setting
                         .toc_url_with_url_captures(target)
                         .unwrap_or_else(|| setting.toc_url());
-                    let record = crate::db::with_database(|db| -> Result<Option<NovelRecord>> {
-                        Ok(db.get_by_toc_url(&toc_url).cloned())
-                    })
-                    .map_err(|e| e.to_string())?;
+                    let record = novels
+                        .find_by_toc_url_sync(&toc_url)
+                        .map_err(|e| e.to_string())?;
                     if record.is_some() {
                         return Ok(record);
                     }
@@ -554,28 +560,15 @@ fn resolve_record(target: &str) -> std::result::Result<Option<NovelRecord>, Stri
             Ok(None)
         }
         TargetType::Ncode => {
-            let ncode = target.to_lowercase();
-            let record = crate::db::with_database(|db| -> Result<Option<NovelRecord>> {
-                Ok(db
-                    .all_records()
-                    .values()
-                    .find(|r| {
-                        r.ncode.as_deref() == Some(ncode.as_str())
-                            || r.toc_url
-                                .to_lowercase()
-                                .trim_end_matches('/')
-                                .ends_with(&format!("/{}", ncode))
-                    })
-                    .cloned())
-            })
-            .map_err(|e| e.to_string())?;
+            let record = novels
+                .find_by_ncode_sync(target)
+                .map_err(|e| e.to_string())?;
             Ok(record)
         }
         TargetType::Other => {
-            let record = crate::db::with_database(|db| -> Result<Option<NovelRecord>> {
-                Ok(db.find_by_title(target).cloned())
-            })
-            .map_err(|e| e.to_string())?;
+            let record = novels
+                .find_by_title_sync(target)
+                .map_err(|e| e.to_string())?;
             Ok(record)
         }
         TargetType::Id => Ok(None),
@@ -640,16 +633,14 @@ pub fn newest_hotentry_file_path(ext: &str) -> std::result::Result<Option<PathBu
 }
 
 fn update_last_mail_date(id: i64) -> std::result::Result<(), String> {
-    crate::db::with_database_mut(|db| -> Result<()> {
-        if let Some(record) = db.get(id).cloned() {
-            let mut updated = record;
-            updated.last_mail_date = Some(chrono::Utc::now());
-            db.insert(updated);
-            db.save()?;
-        }
-        Ok(())
-    })
-    .map_err(|e| e.to_string())
+    let novels = crate::native::novel_repository::NativeNovelRepository::new();
+    if let Ok(Some(mut record)) = novels.get_sync(id.into()) {
+        record.last_mail_date = Some(chrono::Utc::now());
+        novels
+            .apply_batch_sync(vec![crate::platform::NovelMutation::Upsert(record)])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn current_device_ext() -> Option<String> {

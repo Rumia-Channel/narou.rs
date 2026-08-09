@@ -4,7 +4,7 @@ use narou_rs::compat::confirm;
 use narou_rs::converter::ini::{IniData, IniValue};
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::db::inventory::{Inventory, InventoryScope};
-use narou_rs::db::{novel_dir_for_record, with_database};
+use narou_rs::db::novel_dir_for_record;
 use narou_rs::setting_core::{
     SettingScope as Scope, apply_device_related_settings, cast_setting_value, setting_scope,
     var_type_description, yaml_value_display,
@@ -329,7 +329,9 @@ fn burn_default_settings(
                 continue;
             }
         };
-        let record = match with_database(|db| Ok(db.get(data.id).cloned())) {
+        let record = match narou_rs::native::novel_repository::NativeNovelRepository::new()
+            .get_sync(data.id.into())
+        {
             Ok(Some(r)) => r,
             _ => {
                 eprintln!("{} は存在しません", target);

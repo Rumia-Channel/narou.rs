@@ -90,30 +90,32 @@ fn resolve_target_dirs(targets: &[String], all: bool) -> Result<Vec<PathBuf>, St
 
 fn collect_all_novel_dirs() -> Result<Vec<PathBuf>, String> {
     let frozen_ids = narou_rs::compat::load_frozen_ids().map_err(|e| e.to_string())?;
-    db::with_database(|db| {
-        let archive_root = db.archive_root().to_path_buf();
-        let mut dirs = Vec::new();
-        for record in db.all_records().values() {
-            if narou_rs::compat::record_is_frozen(record, &frozen_ids) {
-                continue;
-            }
-            dirs.push(novel_dir_for_record(&archive_root, record));
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let ids = novels
+        .scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX)
+        .map_err(|e| e.to_string())?;
+    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .map_err(|e| e.to_string())?;
+    let mut dirs = Vec::new();
+    for id in ids {
+        let Ok(Some(record)) = novels.get_sync(id) else {
+            continue;
+        };
+        if narou_rs::compat::record_is_frozen(&record, &frozen_ids) {
+            continue;
         }
-        Ok::<Vec<PathBuf>, narou_rs::error::NarouError>(dirs)
-    })
-    .map_err(|e| e.to_string())
+        dirs.push(novel_dir_for_record(&archive_root, &record));
+    }
+    Ok(dirs)
 }
 
 fn resolve_novel_dir(target: &str) -> Option<PathBuf> {
     let id = super::resolve_target_to_id(target)?;
-    db::with_database(|db| {
-        let archive_root = db.archive_root().to_path_buf();
-        Ok(db
-            .get(id)
-            .map(|record| novel_dir_for_record(&archive_root, record)))
-    })
-    .ok()
-    .flatten()
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let record = novels.get_sync(id.into()).ok().flatten()?;
+    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .unwrap_or_else(|_| PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR));
+    Some(novel_dir_for_record(&archive_root, &record))
 }
 
 fn run_orphan(archive_path: &Path, force: bool) -> Result<(), String> {

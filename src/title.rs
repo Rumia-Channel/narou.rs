@@ -35,13 +35,12 @@ pub fn project_title(raw_title: &str, strip_prefix: bool) -> String {
 }
 
 pub fn sync_title_projection(id: i64) -> Result<()> {
-    let (record, archive_root) = crate::db::with_database(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
-        Ok((record, db.archive_root().to_path_buf()))
-    })?;
+    let novels = crate::native::novel_repository::NativeNovelRepository::new();
+    let record = novels
+        .get_sync(id.into())?
+        .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
+    let archive_root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .unwrap_or_else(|_| std::path::PathBuf::from(crate::downloader::ARCHIVE_ROOT_DIR));
     let previous_dir = crate::db::existing_novel_dir_for_record(&archive_root, &record);
     let raw_title = record.raw_title().to_string();
     let settings = crate::converter::settings::NovelSettings::load_for_novel(
@@ -59,10 +58,7 @@ pub fn sync_title_projection(id: i64) -> Result<()> {
     projected.title = display_title.clone();
     projected.set_raw_title(raw_title);
 
-    crate::db::with_database_mut(|db| {
-        db.insert(projected);
-        db.save()
-    })?;
+    novels.apply_batch_sync(vec![crate::platform::NovelMutation::Upsert(projected)])?;
     rename_projected_outputs(&previous_dir, &record.author, &record.title, &display_title)?;
 
     if let Some(mut toc) = crate::downloader::persistence::load_toc_file(&previous_dir) {

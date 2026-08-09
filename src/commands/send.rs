@@ -225,26 +225,29 @@ narou setting device=デバイス名 で指定出来ます。\n\
 fn collect_all_targets(
     hotentry_enabled: bool,
 ) -> Result<(Vec<String>, HashMap<String, String>), String> {
-    db::with_database(|db| {
-        let mut ids = db.ids();
-        ids.sort_unstable();
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let mut ids: Vec<i64> = novels
+        .scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
+    ids.sort_unstable();
 
-        let mut targets = Vec::with_capacity(ids.len() + usize::from(hotentry_enabled));
-        let mut titles = HashMap::new();
-        for id in ids {
-            let key = id.to_string();
-            targets.push(key.clone());
-            if let Some(record) = db.get(id) {
-                titles.insert(key, record.title.clone());
-            }
+    let mut targets = Vec::with_capacity(ids.len() + usize::from(hotentry_enabled));
+    let mut titles = HashMap::new();
+    for id in ids {
+        let key = id.to_string();
+        targets.push(key.clone());
+        if let Ok(Some(record)) = novels.get_sync(id.into()) {
+            titles.insert(key, record.title);
         }
-        if hotentry_enabled {
-            targets.push("hotentry".to_string());
-            titles.insert("hotentry".to_string(), "hotentry".to_string());
-        }
-        Ok((targets, titles))
-    })
-    .map_err(|e| e.to_string())
+    }
+    if hotentry_enabled {
+        targets.push("hotentry".to_string());
+        titles.insert("hotentry".to_string(), "hotentry".to_string());
+    }
+    Ok((targets, titles))
 }
 
 fn load_frozen_ids() -> Result<HashSet<i64>, String> {
@@ -289,7 +292,8 @@ fn resolve_send_target(
 }
 
 fn load_record(id: i64) -> Result<NovelRecord, String> {
-    db::with_database(|db| Ok(db.get(id).cloned()))
+    narou_rs::native::novel_repository::NativeNovelRepository::new()
+        .get_sync(id.into())
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("{} は存在しません", id))
 }

@@ -836,10 +836,11 @@ fn get_copy_to_directory(
         .iter()
         .any(|value| value.eq_ignore_ascii_case("site"))
     {
-        let sitename =
-            crate::db::with_database(|db| Ok(db.get(novel_id).map(|r| r.sitename.clone())))
-                .ok()
-                .flatten();
+        let sitename = crate::native::novel_repository::NativeNovelRepository::new()
+            .get_sync(novel_id.into())
+            .ok()
+            .flatten()
+            .map(|record| record.sitename);
         if let Some(sitename) = sitename.filter(|value| !value.is_empty()) {
             dir.push(sitename);
         }
