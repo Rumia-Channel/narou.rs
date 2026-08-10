@@ -680,7 +680,7 @@ mod tests {
         assert_eq!(keys.prefix().as_ref(), "novels/example/12/n1234ab");
         assert_eq!(
             keys.toc(),
-            ObjectKey::new("novels/example/12/n1234ab/toc.yaml")
+            ObjectKey::try_new("novels/example/12/n1234ab/toc.yaml").unwrap()
         );
     }
 }

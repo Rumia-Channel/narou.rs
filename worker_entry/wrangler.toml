@@ -1,0 +1,11 @@
+name = "narou-rs"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-08-10"
+
+[build]
+command = "worker-build --release"
+
+[[queues.consumers]]
+queue = "narou-rs-jobs"
+max_batch_size = 10
+max_batch_timeout = 30

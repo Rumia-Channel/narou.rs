@@ -325,16 +325,19 @@ impl NativeAppServices {
             crate::platform::clock::SystemClock,
         )));
         let services = Arc::new(crate::application::AppServices::new(
-            library,
-            actions,
-            novel_settings,
-            content,
-            settings,
-            tag_colors,
-            scheduler,
-            site_provider.clone(),
-            Arc::new(crate::native::self_update::NativeSelfUpdateService),
-            Arc::new(crate::native::web_actions::NativeWebActionService),
+            crate::application::AppServiceDependencies {
+                library,
+                novel_actions: actions,
+                novel_settings,
+                content,
+                settings,
+                tag_colors,
+                jobs: Arc::new(crate::application::JobService),
+                scheduler,
+                site_definitions: site_provider.clone(),
+                self_update: Arc::new(crate::native::self_update::NativeSelfUpdateService),
+                web_actions: Arc::new(crate::native::web_actions::NativeWebActionService),
+            },
         ));
         Ok(Self {
             novels,

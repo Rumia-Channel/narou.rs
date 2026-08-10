@@ -1897,7 +1897,7 @@ before_settings:
         capabilities.objects = Some(objects_trait);
         capabilities.illustration_index =
             Some(crate::illustration_store::IllustrationIndex::default());
-        capabilities.illustration_prefix = Some(ObjectKey::new("novels"));
+        capabilities.illustration_prefix = Some(ObjectKey::try_new("novels").unwrap());
 
         let mut settings = NovelSettings::default();
         settings.archive_path = Path::new("not-a-native-path").to_path_buf();
@@ -1911,7 +1911,9 @@ before_settings:
         assert_eq!(objects.len(), 2);
         assert!(
             futures::executor::block_on(
-                objects.read_small(&ObjectKey::new("novels/.illustration_cache.yaml"))
+                objects.read_small(
+                    &ObjectKey::try_new("novels/.illustration_cache.yaml").unwrap()
+                )
             )
             .unwrap()
             .is_some()

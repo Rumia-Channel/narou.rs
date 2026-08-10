@@ -125,10 +125,6 @@ impl NativeObjectStore {
             .parent()
             .ok_or_else(|| NarouError::Platform(format!("object has no parent: {key}")))?;
         fs::create_dir_all(parent)?;
-        if let Ok(content) = std::str::from_utf8(&data) {
-            crate::db::inventory::atomic_write(&path, content)?;
-            return Ok(());
-        }
         atomic_write_bytes(&path, &data)
     }
 
@@ -292,14 +288,20 @@ impl ObjectStore for NativeObjectStore {
             let start = request
                 .cursor
                 .as_deref()
-                .and_then(|cursor| objects.iter().position(|item| item.key.as_ref() == cursor))
-                .map(|index| index + 1)
+                .map(|cursor| {
+                    objects
+                        .iter()
+                        .position(|item| item.key.as_ref() > cursor)
+                        .unwrap_or(objects.len())
+                })
                 .unwrap_or(0);
             let end = (start + request.limit.get()).min(objects.len());
             let page = objects[start.min(objects.len())..end].to_vec();
-            let next_cursor = (end < objects.len())
-                .then(|| page.last().map(|item| item.key.0.clone()))
-                .flatten();
+            let next_cursor = if end < objects.len() {
+                page.last().map(|item| item.key.as_ref().to_string())
+            } else {
+                None
+            };
             Ok(ObjectListPage {
                 objects: page,
                 next_cursor,
@@ -474,9 +476,8 @@ mod tests {
     #[test]
     fn native_store_rejects_escape_keys() {
         let root = tempfile::tempdir().unwrap();
-        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
-        let key = ObjectKey::new("novels/../escape");
-        assert!(futures::executor::block_on(store.read_small(&key)).is_err());
+        let _store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        assert!(ObjectKey::try_new("novels/../escape").is_err());
     }
 
     #[test]
@@ -530,7 +531,7 @@ mod tests {
     fn native_store_lists_non_novel_logical_objects() {
         let root = tempfile::tempdir().unwrap();
         let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
-        let key = ObjectKey::new("generated/epub/book.epub");
+        let key = ObjectKey::try_new("generated/epub/book.epub").unwrap();
         futures::executor::block_on(store.write_small(&key, b"epub".to_vec())).unwrap();
         let prefix = crate::platform::ObjectPrefix::new("generated").unwrap();
         let page =
@@ -551,6 +552,42 @@ mod tests {
             .unwrap(),
             b"epub"
         );
+    }
+
+    #[test]
+    fn native_store_cursor_skips_deleted_cursor_object() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let first = ObjectKey::try_new("generated/a.bin").unwrap();
+        let second = ObjectKey::try_new("generated/b.bin").unwrap();
+        let third = ObjectKey::try_new("generated/c.bin").unwrap();
+        futures::executor::block_on(async {
+            for key in [&first, &second, &third] {
+                store.write_small(key, b"data".to_vec()).await.unwrap();
+            }
+            let prefix = crate::platform::ObjectPrefix::new("generated").unwrap();
+            let page = store
+                .list_page(&crate::platform::ObjectListRequest::new(
+                    prefix.clone(),
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let cursor = page.next_cursor.clone().unwrap();
+            assert_eq!(page.objects[0].key, first);
+            ObjectStore::delete(&store, &first).await.unwrap();
+            let page = store
+                .list_page(
+                    &crate::platform::ObjectListRequest::new(
+                        prefix,
+                        std::num::NonZeroUsize::new(1).unwrap(),
+                    )
+                    .after(cursor),
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.objects[0].key, second);
+        });
     }
 
     #[test]

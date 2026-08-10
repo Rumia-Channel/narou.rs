@@ -109,7 +109,7 @@ impl ObjectStore for MemoryObjectStore {
     ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
         Box::pin(async move {
             let objects = self.objects.lock();
-            Ok(objects.get(&key.0).map(|data| ObjectMetadata {
+            Ok(objects.get(key.as_ref()).map(|data| ObjectMetadata {
                 key: key.clone(),
                 size: data.len() as u64,
                 etag: None,
@@ -120,7 +120,7 @@ impl ObjectStore for MemoryObjectStore {
     }
 
     fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
-        Box::pin(async move { Ok(self.objects.lock().get(&key.0).cloned()) })
+        Box::pin(async move { Ok(self.objects.lock().get(key.as_ref()).cloned()) })
     }
 
     fn write_small<'a>(
@@ -129,14 +129,14 @@ impl ObjectStore for MemoryObjectStore {
         data: Vec<u8>,
     ) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
-            self.objects.lock().insert(key.0.clone(), data);
+            self.objects.lock().insert(key.as_ref().to_string(), data);
             Ok(())
         })
     }
 
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
-            self.objects.lock().remove(&key.0);
+            self.objects.lock().remove(key.as_ref());
             Ok(())
         })
     }
@@ -151,21 +151,23 @@ impl ObjectStore for MemoryObjectStore {
             let mut started = request.cursor.is_none();
             let mut next_cursor = None;
             for (key, data) in objects.iter() {
-                if !request.prefix.matches(&ObjectKey::new(key.clone())) {
+                let object_key = ObjectKey::try_new(key.clone())?;
+                if !request.prefix.matches(&object_key) {
                     continue;
                 }
                 if !started {
-                    if request.cursor.as_deref() == Some(key.as_str()) {
+                    if request.cursor.as_deref().is_some_and(|cursor| key.as_str() > cursor) {
                         started = true;
+                    } else {
+                        continue;
                     }
-                    continue;
                 }
                 if page.len() == request.limit.get() {
-                    next_cursor = page.last().map(|item: &ObjectMetadata| item.key.0.clone());
+                    next_cursor = page.last().map(|item: &ObjectMetadata| item.key.as_ref().to_string());
                     break;
                 }
                 page.push(ObjectMetadata {
-                    key: ObjectKey::new(key.clone()),
+                    key: object_key,
                     size: data.len() as u64,
                     etag: None,
                     content_type: None,
@@ -193,7 +195,7 @@ impl AssetStore for MemoryObjectStore {
         key: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<Option<crate::platform::AssetStream>>> {
         Box::pin(async move {
-            let Some(bytes) = self.objects.lock().get(&key.0).cloned() else {
+            let Some(bytes) = self.objects.lock().get(key.as_ref()).cloned() else {
                 return Ok(None);
             };
             let stream: crate::platform::AssetStream = Box::pin(futures::stream::iter(
@@ -217,7 +219,7 @@ impl AssetStore for MemoryObjectStore {
             while let Some(chunk) = stream.next().await {
                 data.extend(chunk?);
             }
-            self.objects.lock().insert(key.0.clone(), data);
+            self.objects.lock().insert(key.as_ref().to_string(), data);
             Ok(())
         })
     }
@@ -232,10 +234,12 @@ impl AssetStore for MemoryObjectStore {
         destination: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
-            let Some(data) = self.objects.lock().get(&source.0).cloned() else {
+            let Some(data) = self.objects.lock().get(source.as_ref()).cloned() else {
                 return Ok(());
             };
-            self.objects.lock().insert(destination.0.clone(), data);
+            self.objects
+                .lock()
+                .insert(destination.as_ref().to_string(), data);
             Ok(())
         })
     }
@@ -246,9 +250,11 @@ impl AssetStore for MemoryObjectStore {
         destination: &'a ObjectKey,
     ) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
-            let data = self.objects.lock().remove(&source.0);
+            let data = self.objects.lock().remove(source.as_ref());
             if let Some(data) = data {
-                self.objects.lock().insert(destination.0.clone(), data);
+                self.objects
+                    .lock()
+                    .insert(destination.as_ref().to_string(), data);
             }
             Ok(())
         })
@@ -535,7 +541,7 @@ mod tests {
     #[test]
     fn memory_store_roundtrip() {
         let store = MemoryObjectStore::new();
-        let key = ObjectKey::new("novel/1/toc.yaml");
+        let key = ObjectKey::try_new("novel/1/toc.yaml").unwrap();
         futures::executor::block_on(async {
             assert!(!store.exists(&key).await.unwrap());
             assert!(store.read_small(&key).await.unwrap().is_none());
@@ -560,7 +566,7 @@ mod tests {
     #[test]
     fn memory_asset_stream_preserves_chunk_boundaries_and_bytes() {
         let store = MemoryObjectStore::new();
-        let key = ObjectKey::new("assets/large.bin");
+        let key = ObjectKey::try_new("assets/large.bin").unwrap();
         let input: Vec<u8> = (0..(64 * 1024 + 17))
             .map(|value| (value % 251) as u8)
             .collect();

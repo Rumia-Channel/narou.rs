@@ -67,6 +67,7 @@ pub struct AppState {
     pub auto_update_scheduler: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
 }
 
+#[cfg(test)]
 pub(crate) fn default_app_services(
     novels: Arc<dyn crate::platform::NovelRepository>,
 ) -> Arc<crate::application::AppServices> {
@@ -104,16 +105,19 @@ pub(crate) fn default_app_services(
         crate::platform::clock::SystemClock,
     )));
     Arc::new(crate::application::AppServices::new(
-        library,
-        actions,
-        novel_settings,
-        content,
-        settings,
-        tag_colors,
-        scheduler,
-        Arc::new(crate::application::EmptySiteDefinitionProvider),
-        Arc::new(crate::application::NoopSelfUpdateService),
-        Arc::new(crate::application::EmptyWebActionService),
+        crate::application::AppServiceDependencies {
+            library,
+            novel_actions: actions,
+            novel_settings,
+            content,
+            settings,
+            tag_colors,
+            jobs: Arc::new(crate::application::JobService),
+            scheduler,
+            site_definitions: Arc::new(crate::application::EmptySiteDefinitionProvider),
+            self_update: Arc::new(crate::application::NoopSelfUpdateService),
+            web_actions: Arc::new(crate::application::EmptyWebActionService),
+        },
     ))
 }
 pub(crate) async fn configured_tag_color(state: &AppState) -> Option<String> {

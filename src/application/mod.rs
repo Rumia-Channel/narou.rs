@@ -65,6 +65,24 @@ pub use library::{
 
 use std::sync::Arc;
 
+/// Dependencies required to compose the application services.
+///
+/// Keeping the composition input as a named value makes native and Worker
+/// roots readable and avoids an argument-count lint without suppressing it.
+pub struct AppServiceDependencies {
+    pub library: Arc<LibraryService>,
+    pub novel_actions: Arc<NovelActionService>,
+    pub novel_settings: Arc<NovelSettingsService>,
+    pub content: Arc<NovelContentService>,
+    pub settings: Arc<SettingsService>,
+    pub tag_colors: Arc<TagColorService>,
+    pub jobs: Arc<JobService>,
+    pub scheduler: Arc<SchedulerService>,
+    pub site_definitions: Arc<dyn SiteDefinitionProvider>,
+    pub self_update: Arc<dyn SelfUpdateService>,
+    pub web_actions: Arc<dyn WebActionService>,
+}
+
 /// Composition root for platform-neutral application use cases.
 ///
 /// Native and Worker entrypoints construct this once with their adapters;
@@ -83,30 +101,19 @@ pub struct AppServices {
 }
 
 impl AppServices {
-    pub fn new(
-        library: Arc<LibraryService>,
-        novel_actions: Arc<NovelActionService>,
-        novel_settings: Arc<NovelSettingsService>,
-        content: Arc<NovelContentService>,
-        settings: Arc<SettingsService>,
-        tag_colors: Arc<TagColorService>,
-        scheduler: Arc<SchedulerService>,
-        site_definitions: Arc<dyn SiteDefinitionProvider>,
-        self_update: Arc<dyn SelfUpdateService>,
-        web_actions: Arc<dyn WebActionService>,
-    ) -> Self {
+    pub fn new(deps: AppServiceDependencies) -> Self {
         Self {
-            library,
-            novel_actions,
-            novel_settings,
-            content,
-            settings,
-            tag_colors,
-            jobs: Arc::new(JobService),
-            scheduler,
-            site_definitions,
-            self_update,
-            web_actions,
+            library: deps.library,
+            novel_actions: deps.novel_actions,
+            novel_settings: deps.novel_settings,
+            content: deps.content,
+            settings: deps.settings,
+            tag_colors: deps.tag_colors,
+            jobs: deps.jobs,
+            scheduler: deps.scheduler,
+            site_definitions: deps.site_definitions,
+            self_update: deps.self_update,
+            web_actions: deps.web_actions,
         }
     }
 }

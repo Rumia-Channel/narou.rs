@@ -16,21 +16,20 @@ use super::{PlatformFuture, PlatformService};
 
 /// Logical object key. It is not an operating-system path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ObjectKey(pub String);
+pub struct ObjectKey(String);
 
 impl ObjectKey {
-    /// Construct a key at an existing call site.
-    ///
-    /// New external input should use [`Self::try_new`] so invalid traversal
-    /// components are rejected at the boundary.
-    pub fn new(key: impl Into<String>) -> Self {
-        Self(key.into())
-    }
-
+    /// Construct a validated logical object key from external input.
     pub fn try_new(key: impl Into<String>) -> Result<Self> {
         let key = Self(key.into());
         key.validate()?;
         Ok(key)
+    }
+
+    /// Construct a key from an internal generator that already enforces the
+    /// logical-key invariant.
+    pub(crate) fn new_unchecked(key: impl Into<String>) -> Self {
+        Self(key.into())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -47,6 +46,7 @@ impl ObjectKey {
         Self::try_new(format!("{}/{}", self.0.trim_end_matches('/'), component))
     }
 }
+
 
 impl fmt::Display for ObjectKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -304,7 +304,7 @@ impl NovelObjectKeys {
     }
 
     fn child(&self, component: &str) -> ObjectKey {
-        ObjectKey::new(format!("{}/{}", self.prefix.0, component))
+        ObjectKey::new_unchecked(format!("{}/{}", self.prefix.0, component))
     }
 
     fn child_checked(&self, component: &str) -> Result<ObjectKey> {
@@ -414,10 +414,10 @@ mod tests {
     #[test]
     fn object_key_display_and_validation() {
         assert_eq!(
-            ObjectKey::new("novels/123/toc.yaml").to_string(),
+            ObjectKey::try_new("novels/123/toc.yaml").unwrap().to_string(),
             "novels/123/toc.yaml"
         );
-        assert_eq!(ObjectKey::new("a").as_ref(), "a");
+        assert_eq!(ObjectKey::try_new("a").unwrap().as_ref(), "a");
         assert!(ObjectKey::try_new("../escape").is_err());
         assert!(ObjectKey::try_new(r"C:\escape").is_err());
     }
@@ -428,11 +428,11 @@ mod tests {
         assert_eq!(keys.prefix().as_ref(), "novels/site/12/n1234ab");
         assert_eq!(
             keys.section("1", "第1話"),
-            ObjectKey::new("novels/site/12/n1234ab/本文/1 第1話.yaml")
+            ObjectKey::try_new("novels/site/12/n1234ab/本文/1 第1話.yaml").unwrap()
         );
         assert_eq!(
             keys.raw_section("1", "第1話"),
-            ObjectKey::new("novels/site/12/n1234ab/raw/1 第1話.html")
+            ObjectKey::try_new("novels/site/12/n1234ab/raw/1 第1話.html").unwrap()
         );
     }
 
@@ -456,8 +456,10 @@ mod tests {
     #[test]
     fn object_prefix_matches_components_not_string_prefixes() {
         let prefix = ObjectPrefix::new("novels/site").unwrap();
-        assert!(prefix.matches(&ObjectKey::new("novels/site/book/toc.yaml")));
-        assert!(prefix.matches(&ObjectKey::new("novels/site")));
-        assert!(!prefix.matches(&ObjectKey::new("novels/site-archive/book/toc.yaml")));
+        assert!(prefix.matches(&ObjectKey::try_new("novels/site/book/toc.yaml").unwrap()));
+        assert!(prefix.matches(&ObjectKey::try_new("novels/site").unwrap()));
+        assert!(!prefix.matches(
+            &ObjectKey::try_new("novels/site-archive/book/toc.yaml").unwrap()
+        ));
     }
 }
