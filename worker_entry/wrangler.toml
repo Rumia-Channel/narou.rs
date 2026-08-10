@@ -2,6 +2,15 @@ name = "narou-rs"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-08-10"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "narou-rs"
+migrations_dir = "migrations"
+
+# Set the remote database_id before deployment (or in an environment-specific
+# Wrangler config). Keep Wasabi endpoint/bucket/region/prefix vars and
+# Wasabi/NAROU_ADMIN_TOKEN secrets outside this file.
+
 [build]
 command = "worker-build --release"
 

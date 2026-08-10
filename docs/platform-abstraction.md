@@ -1,6 +1,6 @@
 # Platform Abstraction & Cloudflare Workers 対応設計
 
-> ステータス: Phase 1・2・3・4 完了、Phase 5 アプリケーションサービス移行（2026-08-10 時点）
+> ステータス: Phase 1〜7 完了、Phase 8（Queues / crawler / scheduling）未着手（2026-08-10 時点）
 > 対象: narou.rs v0.3.6 以降（2026-08-10 時点の refactor-platform-abstraction）
 > 方針の一次資料: ユーザー提供リファクタリング指示（最重要原則・禁止事項・設計上の優先順位に従う）
 
@@ -314,22 +314,27 @@ pub trait NovelRepository: PlatformService {
 - `db::refresh()` は Web の subprocess 実行後に native の共有メモリを再読込するため残す。
 - `remove_migrated_novel_dir` の path 参照判定は `scan_ids` と `get` を使うが、実ファイル削除自体は Phase 4 の ObjectStore 対象。
 
-## 6. Worker implementation（Phase 6 skeleton）
+## 6. Worker implementation（Phase 6 skeleton / Phase 7 adapters）
 
 | 実装 | 技術 | 状態 |
 |---|---|---|
 | portable core crate | `narou_rs` の `worker-runtime` feature | 完了。native-only modules は feature gate |
-| `worker_entry` composition root | `AppServices` + in-memory platform mocks | 完了。D1/Wasabi adapterへ差し替え可能な境界を固定 |
-| fetch / scheduled / queue handlers | `workers-rs` `0.8.5` event macros | 完了。business logic は composition root の core serviceへ委譲 |
+| `worker_entry` composition root | `AppServices` + D1/Wasabi adapters | 完了。production bindings are required |
+| fetch / scheduled / queue handlers | `workers-rs` `0.8.5` event macros | 完了。queue executionはPhase 8 |
 | `worker-build` / Wrangler | `worker_entry/wrangler.toml` | 完了。queue consumer設定を含む |
-| `WorkerHttpClient` / `WasabiObjectStore` / `D1NovelRepository` | Workers bindings | Phase 7。今回の skeleton では未実装 |
+| `WorkerHttpClient` | Workers Fetch API | 完了。bounded response body、trait future、redirect policyを維持 |
+| `WasabiObjectStore` / `AssetStore` | SigV4 + S3 multipart | 完了。logical key、paged LIST、small/streaming境界を維持 |
+| `D1NovelRepository` | D1 prepared statements + migrations | 完了。typed filter/sort、keyset scan、batch mutationをSQLへ変換 |
+| authenticated read-only API | `/health/*`, `/api/novels*` | 完了。`NAROU_ADMIN_TOKEN`をconstant-time比較 |
+
+Production binding setup keeps credentials out of the repository. `worker_entry/wrangler.toml` declares the `DB` binding and `migrations_dir`; set the remote D1 `database_id` in an environment-specific Wrangler configuration before deployment. Define `WASABI_ENDPOINT`, `WASABI_BUCKET`, `WASABI_REGION`, and optional `WASABI_PREFIX` as variables, and `WASABI_ACCESS_KEY`, `WASABI_SECRET_KEY`, and `NAROU_ADMIN_TOKEN` as secrets.
 
 `worker_entry/` は fetch / scheduled / queue の3エントリだけを持つ。`composition.rs` が唯一のサービス構成点であり、Worker固有型を application/platform coreへ持ち込まない。
-Queue payload は `WorkerJobEnvelope { version: 1, job: ... }` とし、未知 version は処理せず retry する。D1/Wasabiや実ジョブ実行は Phase 7-8へ残す。
+Queue payload は `WorkerJobEnvelope { version: 1, job: ... }` とし、未知 version は処理せず retry する。D1/Wasabiはproduction bindingとして構成し、実ジョブ実行はPhase 8へ残す。
 
-`worker-build --release` の今回の出力は `index_bg.wasm` 492.9 KB、`index.js` 21.8 KB。生成物は `worker_entry/build/` 以下でgit管理しない。
-- Panic policy: application/platform APIs return `Result`; `worker_entry` does not add a blanket `catch_unwind` or convert panics into success. Runtime event wrappers own rejected-event behavior; explicit HTTP error mapping is Phase 7 work.
-- `.github/workflows/platform.yml` では native check/test/clippy、worker-runtime の wasm check、`worker-build --release` を分離して実行する。Clippy は既存コードに多数の警告が残るため、警告は Phase 6 の既存 baseline として扱い、段階的に解消する。
+`worker-build --release` の今回の出力は `index_bg.wasm` 1,831,053 bytes、`index.js` 27,134 bytes。生成物は `worker_entry/build/` 以下でgit管理しない。
+- Panic policy: application/platform APIs return `Result`; `worker_entry` does not add a blanket `catch_unwind` or convert panics into success. Runtime event wrappers own rejected-event behavior; HTTP handlers reserve explicit 401/404/405/503 responses for boundary failures.
+- `.github/workflows/platform.yml` は native check/test/clippy、worker-runtime の wasm check、`worker-build --release` を分離して実行する。Clippy は既存コードに多数の警告が残るため、警告は既存 baseline として扱い、段階的に解消する。
 
 検証コマンド:
 
@@ -373,13 +378,13 @@ Worker (worker_entry)
 ## 9. migration phases
 
 | Phase | 内容 | 完了条件 |
-| 1（完了） | `src/platform/`（traits + mocks）作成、`NarouError` の reqwest 直依存除去、`HttpFetcher` に `HttpClient` 実装、native ラッパ | build / test / clippy 通過。外部挙動変化なし |
+| 1（完了） | `src/platform/`（traits + mocks）作成、`NarouError` の reqwest 直依存除去、native ラッパ | build / test / clippy 通過。外部挙動変化なし |
 | 2（完了） | downloader を trait 利用へ（fetch_text/fetch_bytes/resolve_final_url を HttpClient 経由に） | downloader から blocking HTTP 直呼びを排除（native 実装内部を除く） |
-| 3（完了） | async `NovelRepository`、typed filter/sort/query、keyset `scan_ids`、atomic ID reservation、batch mutation を導入。Downloader / CLI / Web の NovelRecord 操作を repository 経由へ移行 | native YAML compatibility、Memory/mock、Downloader repository injection、Web list pagination-ready、全テスト通過 |
-| 4（完了） | async ObjectStore/AssetStore、logical key、NativeObjectStore、downloader persistence、illustration binary境界、converter HttpClient注入 | native compatibility、Memory/native persistence tests、core主要content FS除去 |
-| 5 | Web UI を service 層経由に | web から DB/FS 直アクセスが service 経由に |
+| 3（完了） | async `NovelRepository`、typed filter/sort/query、keyset `scan_ids`、atomic ID reservation、batch mutation | native YAML compatibility、Memory/mock、Downloader injection、Web list pagination-ready |
+| 4（完了） | async `ObjectStore`/`AssetStore`、logical key、NativeObjectStore、downloader persistence、illustration/converter境界 | native compatibility、Memory/native persistence tests、core主要content FS除去 |
+| 5（完了） | Web UI service 層化 | Web固有のDB/FSアクセスがapplication service経由 |
 | 6（skeleton 完了） | Worker backend skeleton（`worker_entry` + feature 分離 + Wrangler） | workspace native check、portable wasm check、`worker-build --release` が通る |
-| 7 | D1 NovelRepository / Wasabi ObjectStore / Worker fetch | Worker で単純 HTTP fetch + D1 + Wasabi が動作 |
+| 7（完了） | D1 NovelRepository / Wasabi ObjectStore / Worker fetch | authenticated read-only API、D1 prepared query/mutation、Wasabi small/streaming storage |
 | 8 | Queues / crawler / scheduling（Cron + Durable Object） | 外部サイト 5 秒間隔制御が Worker で動作 |
 
 各 Phase 終了時: `cargo build && cargo test && cargo clippy`。

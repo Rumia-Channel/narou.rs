@@ -13,7 +13,7 @@ use crate::application::error::ApplicationError;
 use crate::platform::NovelId;
 
 /// The kind of work a job performs. Mirrors the queue's `JobType` set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum JobKind {
     Download,
     Update,
@@ -49,7 +49,7 @@ impl JobTarget {
 }
 
 /// A request to plan one or more jobs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JobRequest {
     pub kind: JobKind,
     /// Target novels. Each target is either a numeric id or an ncode
