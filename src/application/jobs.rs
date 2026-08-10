@@ -1004,6 +1004,13 @@ mod tests {
             classify_failure(&NarouError::SuspendDownload("slow down".into())),
             JobFailureClass::Retryable
         );
+
+        assert_eq!(
+            classify_failure(&NarouError::DownloadBudgetExpired {
+                next_section_index: 4,
+            }),
+            JobFailureClass::Retryable
+        );
         assert_eq!(
             classify_failure(&NarouError::NotFound("gone".into())),
             JobFailureClass::Permanent
