@@ -2,17 +2,18 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::db::NovelRecord;
 use crate::downloader::TocObject;
 
 use super::settings::NovelSettings;
-
 pub(crate) fn create_output_text_path(
     settings: &NovelSettings,
     id: i64,
     novel_dir: &Path,
     toc: &TocObject,
+    record: Option<&NovelRecord>,
 ) -> PathBuf {
-    novel_dir.join(create_output_text_filename(settings, id, toc))
+    novel_dir.join(create_output_text_filename(settings, id, toc, record))
 }
 
 pub(crate) fn create_output_text_path_for_textfile(
@@ -29,25 +30,20 @@ pub(crate) fn create_output_text_path_for_textfile(
 
 pub(crate) fn create_output_text_filename(
     settings: &NovelSettings,
-    id: i64,
+    _id: i64,
     toc: &TocObject,
+    record: Option<&NovelRecord>,
 ) -> String {
     if !settings.output_filename.trim().is_empty() {
         return ensure_txt_extension(&sanitize_filename_for_output(&settings.output_filename));
     }
 
     if convert_filename_to_ncode() {
-        let record = crate::native::novel_repository::NativeNovelRepository::new()
-            .get_sync(id.into())
-            .ok()
-            .flatten();
         let domain = record
-            .as_ref()
             .and_then(|r| r.domain.clone())
             .or_else(|| extract_domain(&toc.toc_url))
             .unwrap_or_else(|| "unknown".to_string());
         let ncode = record
-            .as_ref()
             .and_then(|r| r.ncode.clone())
             .or_else(|| extract_ncode_like(&toc.toc_url))
             .unwrap_or_else(|| sanitize_filename_for_output(&toc.title));
@@ -174,12 +170,11 @@ mod tests {
         let raw_title = toc.title.clone();
 
         assert_eq!(
-            create_output_text_filename(&settings, 1, &toc),
+            create_output_text_filename(&settings, 1, &toc, None),
             "[作者] 悪役令息が破滅フラグ.txt"
         );
         assert_eq!(toc.title, raw_title);
     }
-
     #[test]
     fn textfile_output_path_uses_title_and_author_from_text() {
         let root = std::env::temp_dir().join(format!(
@@ -208,7 +203,10 @@ mod tests {
         assert_eq!(sanitize_filename_for_output("CON.txt"), "_CON.txt");
         assert_eq!(sanitize_filename_for_output("bad\0name\x1F"), "badname");
         assert_eq!(sanitize_filename_for_output("trail. "), "trail");
-        assert_eq!(sanitize_filename_for_output("　全角 title "), "　全角 title");
+        assert_eq!(
+            sanitize_filename_for_output("　全角 title "),
+            "　全角 title"
+        );
         assert_eq!(sanitize_filename_for_output(""), "output");
     }
 }

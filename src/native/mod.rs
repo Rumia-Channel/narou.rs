@@ -6,5 +6,9 @@
 //! this module; only the binary entrypoints and the native constructors
 //! (`Downloader::with_user_agent` etc.) wire it in.
 
+pub mod converter;
+pub mod downloader;
 pub mod http;
+pub mod legacy_persistence;
 pub mod novel_repository;
+pub mod object_store;

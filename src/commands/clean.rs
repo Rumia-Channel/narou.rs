@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use narou_rs::db;
 use narou_rs::db::paths::novel_dir_for_record;
-use narou_rs::downloader::persistence::{load_toc_file, section_filename};
+use narou_rs::downloader::persistence::section_filename;
 use narou_rs::downloader::{RAW_DATA_DIR, SECTION_SAVE_DIR};
+use narou_rs::native::legacy_persistence::load_toc_file;
 
 use super::download;
 use super::log;
@@ -115,7 +116,10 @@ fn find_orphan_files(novel_dir: &Path) -> Result<Vec<PathBuf>, String> {
         .iter()
         .map(|subtitle| {
             let filename = section_filename(subtitle);
-            filename.strip_suffix(".yaml").unwrap_or(&filename).to_string()
+            filename
+                .strip_suffix(".yaml")
+                .unwrap_or(&filename)
+                .to_string()
         })
         .collect::<HashSet<_>>();
 
@@ -170,8 +174,8 @@ fn collect_orphans(
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use narou_rs::downloader::persistence::save_toc_file;
     use narou_rs::downloader::{SubtitleInfo, TocFile};
+    use narou_rs::native::legacy_persistence::save_toc_file;
 
     use super::find_orphan_files;
 

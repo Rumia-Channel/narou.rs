@@ -1,7 +1,7 @@
 # Platform Abstraction & Cloudflare Workers 対応設計
 
-> ステータス: 進行中（Phase 1・2・3 完了、Phase 4 以降は未着手）
-> 対象: narou.rs v0.3.6 以降（2026-08-09 時点の develop）
+> ステータス: Phase 1・2・3・4 完了（Phase 5 は未着手）
+> 対象: narou.rs v0.3.6 以降（2026-08-09 時点の refactor-platform-abstraction）
 > 方針の一次資料: ユーザー提供リファクタリング指示（最重要原則・禁止事項・設計上の優先順位に従う）
 
 ## 0. 設計判断の前提
@@ -28,13 +28,13 @@
 | native 専用として残す | `src/commands/{web,log,convert,csv,manage,clean,illust,send,diff,update}.rs` | cwd 起点の pid / hotentry / ログ / CSV / キャッシュ操作 |
 | 抽象化対象 | `src/db/inventory.rs` | 設定 YAML の atomic write / lock（fs2）/ metadata（~12 sites） |
 | 抽象化対象 | `src/db/database.rs` | `小説データ/` archive root の create_dir_all 等 |
-| 抽象化対象 | `src/downloader/persistence.rs` | section/raw/toc ファイル read/write/rename/read_dir（~13 sites） |
-| 抽象化対象 | `src/downloader/mod.rs` | novel データ dir 作成・cache dir 移動・toc 読込 |
-| 抽象化対象 | `src/downloader/info_cache.rs` | `.narou/` 下の小説情報キャッシュ |
-| 抽象化対象 | `src/illustration_store.rs` | 挿絵ファイル read/write/rename/read_dir/cache YAML（~21 sites） |
-| 抽象化対象 | `src/downloader/site_setting/loader.rs` | `webnovel/*.yaml` 読込 |
-| 抽象化対象 | `src/converter/mod.rs` | 変換結果 txt 書込・変換キャッシュ・illustration cache 読込 |
-| 抽象化対象 | `src/converter/{ini,settings,dakuten_font,output,inspector}.rs` | ini / replace.txt / CSS 読込書込 |
+| Phase 4 完了 | `src/downloader/persistence.rs` | codec + `PersistenceService` は logical `ObjectKey` / async `ObjectStore` 経由。旧 Path API は `src/native/legacy_persistence.rs` の互換ラッパー |
+| Phase 4 完了 | `src/downloader/mod.rs` | TOC・section・raw・cache・illustration保存は注入された store。`DownloadResult.novel_dir` とタイトル移行は native互換境界 |
+| Phase 4 完了 | `src/illustration_store.rs` | pure index操作と `IllustrationStorageService`（AssetStore）を追加。legacy scan/migration API は当面 native CLI互換呼び出し |
+| Phase 4 残存 | `src/downloader/info_cache.rs` | 未使用のnative cache。Worker pathへは持ち込まない |
+| Phase 4 残存 | `src/downloader/site_setting/loader.rs` | bundled/user `webnovel/*.yaml` のnative loader。Phase 5以降にsource abstractionを検討 |
+| Phase 4 残存 | `src/converter/mod.rs` | pure変換は維持。生成txt、section convert cache、既存画像legacy localizationはnative presentation |
+| Phase 4 残存 | `src/converter/{ini,settings,dakuten_font,output,inspector}.rs` | converter設定・外部出力・診断ログのnative I/O |
 | 抽象化対象 | `src/mail.rs` | メール設定 YAML / preset コピー / 添付読込 |
 | 抽象化対象 | `src/queue.rs` | queue.yaml 読込書込（sentinel / atomic write） |
 | 抽象化対象 | `src/logger.rs` | ログファイル append（native のみで良い可能性が高い） |
@@ -189,24 +189,47 @@ pub trait Clock: Send + Sync {
 - 既存の `chrono::Utc::now()` をすべて置き換えるわけではない（Phase 1 では trait を定義し、テスト容易性が必要な箇所から注入）。
 - `SystemClock` は native / worker 共通で使える（chrono は wasm32 でも動作する）。
 
-### ObjectStore
+### ObjectStore / AssetStore（Phase 4 完了）
 
 ```rust
-pub struct ObjectKey(pub String);      // 論理キー。native では PathBuf へ変換、worker では S3 key へ変換
-pub struct ObjectMetadata { pub key: ObjectKey, pub size: u64 }
+pub trait ObjectStore: PlatformService {
+    fn stat<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<Option<ObjectMetadata>>>;
+    fn exists<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<bool>>;
+    fn read_small<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<Option<Vec<u8>>>>;
+    fn write_small<'a>(&'a self, key: &'a ObjectKey, data: Vec<u8>)
+        -> PlatformFuture<'a, Result<()>>;
+    fn delete<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<()>>;
+    fn list_page<'a>(&'a self, request: &'a ObjectListRequest)
+        -> PlatformFuture<'a, Result<ObjectListPage>>;
+}
 
-pub trait ObjectStore: Send + Sync {
-    async fn exists(&self, key: &ObjectKey) -> Result<bool>;
-    async fn read(&self, key: &ObjectKey) -> Result<Option<Vec<u8>>>;
-    async fn write(&self, key: &ObjectKey, data: &[u8]) -> Result<()>;
-    async fn delete(&self, key: &ObjectKey) -> Result<()>;
-    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>>;
+pub trait AssetStore: PlatformService {
+    fn stat<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<Option<ObjectMetadata>>>;
+    fn read_stream<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<Option<AssetStream>>>;
+    fn write_stream<'a>(&'a self, key: &'a ObjectKey, body: AssetStream)
+        -> PlatformFuture<'a, Result<()>>;
+    fn delete<'a>(&'a self, key: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<()>>;
+    fn copy<'a>(&'a self, source: &'a ObjectKey, destination: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<()>>;
+    fn move_or_copy<'a>(&'a self, source: &'a ObjectKey, destination: &'a ObjectKey)
+        -> PlatformFuture<'a, Result<()>>;
 }
 ```
 
-- 「1 つの巨大 Storage trait」にしない。設定・DB・本文・挿絵・生成物は用途ごとに個別の store を作ってもよい（Phase 4 で判断）。
-- native 実装は `LocalObjectStore`（ルートパスを注入）。key→パス変換は `db::paths` のロジックを利用。
-- streaming は必要な経路（画像・epub・backup）から Phase 4 以降に `stream_read` / `stream_write` を追加する。最初から複雑にしない。
+- `ObjectKey` は `/` 区切りのUTF-8 logical key。`Path` / `PathBuf` / Windows drive / UNC は入れない。
+- `read_small` / `write_small` は制御ファイル専用。画像、EPUB、ZIP、PDF等は `AssetStore` の bounded chunk stream を使う。
+- `ObjectListRequest` は prefix + cursor + bounded limit。Novel一覧のsource of truthは `NovelRepository` であり、LIST/HEADをmetadata DBの代わりに使わない。
+- `NativeObjectStore` は `novels/<site>/<subdir>/<title>/...` を既存 `小説データ/<site>/<subdir>/<title>/...` へ写像する。`.narou` Inventoryは対象外。
+- native adapterは `ensure_within_archive_root`、canonicalization、reparse-point検査を維持する。atomic writeとtemp/renameはadapter内部だけで行う。
+- Worker実装は同じlogical keyをS3-compatible keyへ写像できる。moveはcopy+deleteへ実装可能。
+- `GeneratedAssetKey` は将来のtxt/EPUB等の論理identityであり、native subprocess outputのPathをdomain identityにしない。
 
 ### NovelRepository（Phase 3 完了）
 
@@ -342,7 +365,7 @@ Worker (worker_entry)
 | 1（完了） | `src/platform/`（traits + mocks）作成、`NarouError` の reqwest 直依存除去、`HttpFetcher` に `HttpClient` 実装、native ラッパ | build / test / clippy 通過。外部挙動変化なし |
 | 2（完了） | downloader を trait 利用へ（fetch_text/fetch_bytes/resolve_final_url を HttpClient 経由に） | downloader から blocking HTTP 直呼びを排除（native 実装内部を除く） |
 | 3（完了） | async `NovelRepository`、typed filter/sort/query、keyset `scan_ids`、atomic ID reservation、batch mutation を導入。Downloader / CLI / Web の NovelRecord 操作を repository 経由へ移行 | native YAML compatibility、Memory/mock、Downloader repository injection、Web list pagination-ready、全テスト通過 |
-| 4 | converter / illustration / command から直接 FS アクセス除去（ObjectStore / TempStorage 経由） | core から主要 FS 依存が除去 |
+| 4（完了） | async ObjectStore/AssetStore、logical key、NativeObjectStore、downloader persistence、illustration binary境界、converter HttpClient注入 | native compatibility、Memory/native persistence tests、core主要content FS除去 |
 | 5 | Web UI を service 層経由に | web から DB/FS 直アクセスが service 経由に |
 | 6 | Worker backend skeleton（worker_entry + feature 分離） | `cargo build --features worker-runtime` が通る |
 | 7 | D1 NovelRepository / Wasabi ObjectStore / Worker fetch | Worker で単純 HTTP fetch + D1 + Wasabi が動作 |
@@ -350,10 +373,23 @@ Worker (worker_entry)
 
 各 Phase 終了時: `cargo build && cargo test && cargo clippy`。
 
+### Phase 4 実装メモ
+
+- `src/downloader/persistence.rs`: pure codec (`serialize_*` / `deserialize_*` / hash / default text) と `PersistenceService` に分離。section、TOC、raw、setting、replace、cacheをObjectStoreへ保存する。保存時刻は `Clock` 注入。
+- `src/native/object_store.rs`: `novels/<site>/<subdir>/<title>/...` を既存 archive root 以下へ写像。small objectは16 MiB上限、assetは64 KiB chunkのstream。root traversal、絶対/UNC、reparse-point escapeを拒否する。
+- `src/native/legacy_persistence.rs`: CLI/WebのPath互換API、legacy filename scan、atomic file wrapperをnative-onlyへ隔離。既存layoutの移行は不要。
+- `src/illustration_store.rs`: `IllustrationIndex`（透明serdeでlegacy cacheをbyte-compatibleに保つpure metadata型）と `IllustrationStorageService` を追加。blob write成功後にcache indexを更新し、未知画像ごとのexists/HEAD loopを要求しない。既知cache mappingは欠損blobをrepairするため単一statを許可する。legacy `IllustrationStore` のmigration/orphan scanはnative compatibility APIとして残る。
+- `src/converter/mod.rs`: pure変換は維持。生成txt、section convert cache、既存画像legacy localizationはnative presentation。illustration localizationを使う場合は`ConverterCapabilities`へ`HttpClient`、`RateLimiter`、`ObjectStore`、`AssetStore`、pure `IllustrationIndex`、logical prefix、必要なら`NovelRecord` resolverを明示注入する。
+- `src/native/converter.rs`: zero-argument `NovelConverter::new` / `with_user_converter` のnative capability wiringを隔離。converter coreからNativeHttpClientを参照しない。
+- `src/native/downloader.rs`: `Downloader::new` / `with_user_agent` / `with_platform` のnative HTTP、repository、ObjectStore wiringを隔離。coreのfilesystem-free constructorは`with_platform_and_storage_and_settings`。
+- 通常download/update pathのObjectStore callsiteは `PersistenceService::{load_toc,save_toc,load_section,save_section,save_raw}` と `IllustrationStorageService::store_bytes`。`exists`をsection loopの判定に使わず、TOC metadata + section readで解決する。`list_page`はNative compatibility testと将来のmaintenance用途のみ。
+- `MemoryObjectStore` はasync small API、paged list、delete、chunked AssetStore fakeを提供する。`NativeObjectStore` compatibility testsはTOC/section/raw/setting/replace/cache/illustrationと既存legacy sectionを確認する。
+- Inventory/settings、site definition loader、Web固有Path API、downloader info cache、converter/settings/ini/inspector/user-converter/section-convert-cache、converter/device subprocess/tempdir、backup/update/loggerはObjectStoreへ統合しない。これらはconfigurationまたはnative-only capabilityであり、Phase 5/6の境界として明示する。
+
 ## 10. breaking internal APIs（許可された破壊的変更）
 
 - `NarouError::Http(#[from] reqwest::Error)` → 廃止。`Platform(String)` 等へ。`#[from]` を外すため `?` での暗黙変換は消え、`map_err` が必要になる箇所が増える。
-- `HttpFetcher` の public フィールド（`client` / `manual_redirect_client` 等）は維持しつつ、将来的に private 化。
+- `NativeHttpClient` のcurl/reqwest/wget tier fallback stateはnative transport内に閉じ、coreから直接参照しない。
 - `db::with_database` / `with_database_mut` / `all_records` は core の NovelRecord 操作では使わない。native repository 内部、Inventory/settings、archive-root、freeze YAML との atomic 複合操作、テスト fixture のみ残る。
 - `RateLimiter::wait()` 等の同期メソッドは native 内部用として維持し、core は async trait 経由にする。
 
@@ -375,8 +411,8 @@ Worker (worker_entry)
 4. **`Clock` の導入範囲**: 全 `chrono::Utc::now()` を置き換えると変更が膨大になる。テスト容易性が必要な箇所（crawler / scheduler / 更新判定）から段階的に注入する。
 5. **wasm32 での chrono**: `chrono` は wasm32-unknown-unknown でデフォルト機能だと `std::time` に依存する箇所があるため、Worker build 時に feature 調整（`wasmbind` or `clock` feature 無効）が必要になる可能性。Phase 6 で検証。
 6. **`webnovel/*.yaml` の loader**: `site_setting/loader.rs` は `read_dir` + `read_to_string` で native のファイル探索（exe parent / CARGO_MANIFEST_DIR / current_dir）をしている。Worker ではバンドル or D1 等から読むことになる。loader を trait 化するかは Phase 4-6 で判断。
-7. **`illustration_store.rs` の扱い**: 論理キー化の単位。現行は `挿絵/` ディレクトリ直書き + `.illustration_cache.yaml`。native 互換を保ちつつ ObjectStore に被せるのは Phase 4。
+7. **`illustration_store.rs` の扱い**: 現行legacy filesystem APIはnative互換層として維持し、新規binary保存は`IllustrationStorageService` + `AssetStore`へ移行した。pure index型の完全分離は既存cache APIとの互換制約が残るため、後続で段階的に分離する。
 8. **queue.yaml の atomic write**: `db::inventory` の atomic write は native の fs2 lock + tempfile に依存。Worker では D1 + Queues が置き換えるため、queue 永続化層は Phase 8 で再設計。
 9. **logger**: tracing subscriber は native / worker で切り替える。`logger.rs` のファイル出力は native 専用にできる。Phase 1 では触らない。
-10. **`converter/mod.rs` の curl 直接使用**: 挿絵 fetch は Phase 4 で `HttpClient` 経由に移行予定（Phase 2 の対象外として残置）。
+10. **`converter/mod.rs` のcurl直接使用**: 解消済み。挿絵fetchは`ConverterCapabilities`の`HttpClient` / `RateLimiter`経由へ移行し、native wiringは`src/native/converter.rs`に隔離した。
 11. **`web/misc.rs` / `web/update.rs` の async reqwest**: 自己更新・GitHub API は native 専用パスとして残置（Phase 2 の対象外）。

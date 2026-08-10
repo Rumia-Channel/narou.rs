@@ -628,7 +628,7 @@ pub async fn get_story(
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let toc = crate::downloader::persistence::load_toc_file(&novel_dir);
+    let toc = crate::native::legacy_persistence::load_toc_file(&novel_dir);
     let (title, story) = match toc {
         Some(t) => {
             let story = t.story.unwrap_or_default().trim().to_string();
@@ -736,7 +736,7 @@ pub async fn author_comments(
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let toc = crate::downloader::persistence::load_toc_file(&novel_dir)
+    let toc = crate::native::legacy_persistence::load_toc_file(&novel_dir)
         .ok_or_else(|| (StatusCode::NOT_FOUND, "TOC not found".to_string()))?;
 
     let section_dir = novel_dir.join(crate::downloader::SECTION_SAVE_DIR);
@@ -746,11 +746,11 @@ pub async fn author_comments(
 
     for sub in &toc.subtitles {
         let Some(path) =
-            crate::downloader::persistence::resolve_section_file_path(&section_dir, sub)
+            crate::native::legacy_persistence::resolve_section_file_path(&section_dir, sub)
         else {
             continue;
         };
-        let sf = match crate::downloader::persistence::load_section_file(&path) {
+        let sf = match crate::native::legacy_persistence::load_section_file(&path) {
             Some(sf) => sf,
             None => continue,
         };

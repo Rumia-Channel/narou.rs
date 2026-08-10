@@ -12,9 +12,9 @@ use parking_lot::Mutex;
 use crate::db::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::platform::{
-    HttpClient, HttpMethod, HttpRequest, HttpResponse, NovelFilter, NovelId, NovelMutation,
-    NovelQuery, NovelRepository, ObjectKey, ObjectMetadata, ObjectStore, PlatformFuture,
-    RateLimitScope, RateLimiter,
+    AssetStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, NovelFilter, NovelId,
+    NovelMutation, NovelQuery, NovelRepository, ObjectKey, ObjectListPage, ObjectListRequest,
+    ObjectMetadata, ObjectStore, PlatformFuture, RateLimitScope, RateLimiter,
 };
 
 /// HTTP client backed by a caller-provided responder closure.
@@ -61,19 +61,16 @@ impl MockHttpClient {
 }
 
 impl HttpClient for MockHttpClient {
-    fn send<'a>(
-        &'a self,
-        request: HttpRequest,
-    ) -> PlatformFuture<'a, Result<HttpResponse>> {
+    fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
         Box::pin(async move {
-            self.requests.lock().push(format!("{} {}", method_name(request.method), request.url));
+            self.requests
+                .lock()
+                .push(format!("{} {}", method_name(request.method), request.url));
             self.responses
                 .lock()
                 .get(&request.url)
                 .cloned()
-                .ok_or_else(|| {
-                    NarouError::Http(format!("no canned response for {}", request.url))
-                })
+                .ok_or_else(|| NarouError::Http(format!("no canned response for {}", request.url)))
         })
     }
 }
@@ -106,35 +103,155 @@ impl MemoryObjectStore {
 }
 
 impl ObjectStore for MemoryObjectStore {
-    fn exists(&self, key: &ObjectKey) -> Result<bool> {
-        Ok(self.objects.lock().contains_key(&key.0))
+    fn stat<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+        Box::pin(async move {
+            let objects = self.objects.lock();
+            Ok(objects.get(&key.0).map(|data| ObjectMetadata {
+                key: key.clone(),
+                size: data.len() as u64,
+                etag: None,
+                content_type: None,
+                last_modified: None,
+            }))
+        })
     }
 
-    fn read(&self, key: &ObjectKey) -> Result<Option<Vec<u8>>> {
-        Ok(self.objects.lock().get(&key.0).cloned())
+    fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+        Box::pin(async move { Ok(self.objects.lock().get(&key.0).cloned()) })
     }
 
-    fn write(&self, key: &ObjectKey, data: &[u8]) -> Result<()> {
-        self.objects.lock().insert(key.0.clone(), data.to_vec());
-        Ok(())
+    fn write_small<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        data: Vec<u8>,
+    ) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.objects.lock().insert(key.0.clone(), data);
+            Ok(())
+        })
     }
 
-    fn delete(&self, key: &ObjectKey) -> Result<()> {
-        self.objects.lock().remove(&key.0);
-        Ok(())
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.objects.lock().remove(&key.0);
+            Ok(())
+        })
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>> {
-        Ok(self
-            .objects
-            .lock()
-            .iter()
-            .filter(|(k, _)| k.starts_with(prefix))
-            .map(|(k, v)| ObjectMetadata {
-                key: ObjectKey::new(k.clone()),
-                size: v.len() as u64,
+    fn list_page<'a>(
+        &'a self,
+        request: &'a ObjectListRequest,
+    ) -> PlatformFuture<'a, Result<ObjectListPage>> {
+        Box::pin(async move {
+            let objects = self.objects.lock();
+            let mut page = Vec::with_capacity(request.limit.get());
+            let mut started = request.cursor.is_none();
+            let mut next_cursor = None;
+            for (key, data) in objects.iter() {
+                if !request.prefix.matches(&ObjectKey::new(key.clone())) {
+                    continue;
+                }
+                if !started {
+                    if request.cursor.as_deref() == Some(key.as_str()) {
+                        started = true;
+                    }
+                    continue;
+                }
+                if page.len() == request.limit.get() {
+                    next_cursor = page.last().map(|item: &ObjectMetadata| item.key.0.clone());
+                    break;
+                }
+                page.push(ObjectMetadata {
+                    key: ObjectKey::new(key.clone()),
+                    size: data.len() as u64,
+                    etag: None,
+                    content_type: None,
+                    last_modified: None,
+                });
+            }
+            Ok(ObjectListPage {
+                objects: page,
+                next_cursor,
             })
-            .collect())
+        })
+    }
+}
+
+impl AssetStore for MemoryObjectStore {
+    fn stat<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+        ObjectStore::stat(self, key)
+    }
+
+    fn read_stream<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<crate::platform::AssetStream>>> {
+        Box::pin(async move {
+            let Some(bytes) = self.objects.lock().get(&key.0).cloned() else {
+                return Ok(None);
+            };
+            let stream: crate::platform::AssetStream = Box::pin(futures::stream::iter(
+                bytes
+                    .chunks(64 * 1024)
+                    .map(|chunk| Ok(chunk.to_vec()))
+                    .collect::<Vec<_>>(),
+            ));
+            Ok(Some(stream))
+        })
+    }
+
+    fn write_stream<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        mut stream: crate::platform::AssetStream,
+    ) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            use futures::StreamExt;
+            let mut data = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                data.extend(chunk?);
+            }
+            self.objects.lock().insert(key.0.clone(), data);
+            Ok(())
+        })
+    }
+
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+        ObjectStore::delete(self, key)
+    }
+
+    fn copy<'a>(
+        &'a self,
+        source: &'a ObjectKey,
+        destination: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let Some(data) = self.objects.lock().get(&source.0).cloned() else {
+                return Ok(());
+            };
+            self.objects.lock().insert(destination.0.clone(), data);
+            Ok(())
+        })
+    }
+
+    fn move_or_copy<'a>(
+        &'a self,
+        source: &'a ObjectKey,
+        destination: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let data = self.objects.lock().remove(&source.0);
+            if let Some(data) = data {
+                self.objects.lock().insert(destination.0.clone(), data);
+            }
+            Ok(())
+        })
     }
 }
 
@@ -180,10 +297,7 @@ impl MemoryNovelRepository {
 }
 
 impl NovelRepository for MemoryNovelRepository {
-    fn get<'a>(
-        &'a self,
-        id: NovelId,
-    ) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
+    fn get<'a>(&'a self, id: NovelId) -> PlatformFuture<'a, Result<Option<NovelRecord>>> {
         Box::pin(async move { Ok(self.records.lock().get(&id.0).cloned()) })
     }
 
@@ -229,7 +343,9 @@ impl NovelRepository for MemoryNovelRepository {
                 .lock()
                 .values()
                 .find(|r| {
-                    r.ncode.as_deref().is_some_and(|nc| nc.eq_ignore_ascii_case(&ncode))
+                    r.ncode
+                        .as_deref()
+                        .is_some_and(|nc| nc.eq_ignore_ascii_case(&ncode))
                         || r.toc_url
                             .to_lowercase()
                             .trim_end_matches('/')
@@ -239,10 +355,7 @@ impl NovelRepository for MemoryNovelRepository {
         })
     }
 
-    fn count<'a>(
-        &'a self,
-        filter: &'a NovelFilter,
-    ) -> PlatformFuture<'a, Result<u64>> {
+    fn count<'a>(&'a self, filter: &'a NovelFilter) -> PlatformFuture<'a, Result<u64>> {
         let filter = filter.clone();
         Box::pin(async move {
             Ok(self
@@ -254,10 +367,7 @@ impl NovelRepository for MemoryNovelRepository {
         })
     }
 
-    fn query<'a>(
-        &'a self,
-        query: &'a NovelQuery,
-    ) -> PlatformFuture<'a, Result<Vec<NovelRecord>>> {
+    fn query<'a>(&'a self, query: &'a NovelQuery) -> PlatformFuture<'a, Result<Vec<NovelRecord>>> {
         let query = query.clone();
         Box::pin(async move {
             let mut records: Vec<NovelRecord> = self
@@ -307,14 +417,13 @@ impl NovelRepository for MemoryNovelRepository {
     fn allocate_id(&self) -> PlatformFuture<'_, Result<NovelId>> {
         Box::pin(async move {
             // Atomic reservation: unique even under concurrent tasks.
-            Ok(NovelId::from(self.next_id.fetch_add(1, Ordering::SeqCst) as i64))
+            Ok(NovelId::from(
+                self.next_id.fetch_add(1, Ordering::SeqCst) as i64
+            ))
         })
     }
 
-    fn apply_batch<'a>(
-        &'a self,
-        mutations: Vec<NovelMutation>,
-    ) -> PlatformFuture<'a, Result<()>> {
+    fn apply_batch<'a>(&'a self, mutations: Vec<NovelMutation>) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
             let mut records = self.records.lock();
             for mutation in mutations {
@@ -351,10 +460,7 @@ impl FakeRateLimiter {
 }
 
 impl RateLimiter for FakeRateLimiter {
-    fn acquire<'a>(
-        &'a self,
-        _scope: &'a RateLimitScope,
-    ) -> PlatformFuture<'a, Result<()>> {
+    fn acquire<'a>(&'a self, _scope: &'a RateLimitScope) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
             self.acquisitions.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -365,9 +471,9 @@ impl RateLimiter for FakeRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::{NovelSort, NovelSortKey};
-    use crate::platform::clock::Clock;
     use crate::platform::SystemClock;
+    use crate::platform::clock::Clock;
+    use crate::platform::{NovelSort, NovelSortKey};
 
     fn sample_record(id: i64) -> NovelRecord {
         NovelRecord {
@@ -405,13 +511,19 @@ mod tests {
         client.add_text("https://example.com/toc", 200, "<html>toc</html>");
 
         let body = futures::executor::block_on(async {
-            let resp = client.send(HttpRequest::get("https://example.com/toc")).await.unwrap();
+            let resp = client
+                .send(HttpRequest::get("https://example.com/toc"))
+                .await
+                .unwrap();
             String::from_utf8_lossy(&resp.body).into_owned()
         });
         assert_eq!(body, "<html>toc</html>");
 
         let err = futures::executor::block_on(async {
-            client.send(HttpRequest::get("https://example.com/missing")).await.unwrap_err()
+            client
+                .send(HttpRequest::get("https://example.com/missing"))
+                .await
+                .unwrap_err()
         });
         assert!(err.to_string().contains("no canned response"));
 
@@ -424,21 +536,54 @@ mod tests {
     fn memory_store_roundtrip() {
         let store = MemoryObjectStore::new();
         let key = ObjectKey::new("novel/1/toc.yaml");
-        assert!(!store.exists(&key).unwrap());
-        assert!(store.read(&key).unwrap().is_none());
+        futures::executor::block_on(async {
+            assert!(!store.exists(&key).await.unwrap());
+            assert!(store.read_small(&key).await.unwrap().is_none());
 
-        store.write(&key, b"data").unwrap();
-        assert!(store.exists(&key).unwrap());
-        assert_eq!(store.read(&key).unwrap().unwrap(), b"data");
-        assert_eq!(store.len(), 1);
+            store.write_small(&key, b"data".to_vec()).await.unwrap();
+            assert!(store.exists(&key).await.unwrap());
+            assert_eq!(store.read_small(&key).await.unwrap().unwrap(), b"data");
 
-        let listed = store.list("novel/1/").unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].key, key);
-        assert_eq!(listed[0].size, 4);
+            let prefix = crate::platform::ObjectPrefix::new("novel/1").unwrap();
+            let request = ObjectListRequest::new(prefix, std::num::NonZeroUsize::new(10).unwrap());
+            let listed = store.list_page(&request).await.unwrap().objects;
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].key, key);
+            assert_eq!(listed[0].size, 4);
 
-        store.delete(&key).unwrap();
-        assert!(!store.exists(&key).unwrap());
+            ObjectStore::delete(&store, &key).await.unwrap();
+            assert!(!store.exists(&key).await.unwrap());
+        });
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn memory_asset_stream_preserves_chunk_boundaries_and_bytes() {
+        let store = MemoryObjectStore::new();
+        let key = ObjectKey::new("assets/large.bin");
+        let input: Vec<u8> = (0..(64 * 1024 + 17))
+            .map(|value| (value % 251) as u8)
+            .collect();
+        futures::executor::block_on(async {
+            let stream: crate::platform::AssetStream =
+                Box::pin(futures::stream::iter(vec![Ok(input.clone())]));
+            AssetStore::write_stream(&store, &key, stream)
+                .await
+                .unwrap();
+            let mut stream = AssetStore::read_stream(&store, &key)
+                .await
+                .unwrap()
+                .unwrap();
+            use futures::StreamExt;
+            let mut output = Vec::new();
+            let mut chunks = 0;
+            while let Some(chunk) = stream.next().await {
+                chunks += 1;
+                output.extend(chunk.unwrap());
+            }
+            assert!(chunks >= 2);
+            assert_eq!(output, input);
+        });
     }
 
     #[test]
@@ -488,9 +633,9 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, 2);
 
-        futures::executor::block_on(repo.apply_batch(vec![NovelMutation::Remove(
-            NovelId::from(1),
-        )]))
+        futures::executor::block_on(
+            repo.apply_batch(vec![NovelMutation::Remove(NovelId::from(1))]),
+        )
         .unwrap();
         assert_eq!(repo.len(), 1);
     }
@@ -499,11 +644,7 @@ mod tests {
     fn memory_repository_allocates_unique_ids() {
         let repo = MemoryNovelRepository::from_records(vec![sample_record(5)]);
         let ids: Vec<i64> = (0..10)
-            .map(|_| {
-                futures::executor::block_on(repo.allocate_id())
-                    .unwrap()
-                    .0
-            })
+            .map(|_| futures::executor::block_on(repo.allocate_id()).unwrap().0)
             .collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
@@ -523,16 +664,15 @@ mod tests {
         ]);
         let filter = NovelFilter::all();
 
-        let page1 = futures::executor::block_on(repo.scan_ids(&filter, None, 2))
-            .unwrap();
+        let page1 = futures::executor::block_on(repo.scan_ids(&filter, None, 2)).unwrap();
         assert_eq!(page1, vec![NovelId::from(1), NovelId::from(2)]);
 
-        let page2 = futures::executor::block_on(repo.scan_ids(&filter, page1.last().copied(), 2))
-            .unwrap();
+        let page2 =
+            futures::executor::block_on(repo.scan_ids(&filter, page1.last().copied(), 2)).unwrap();
         assert_eq!(page2, vec![NovelId::from(3), NovelId::from(4)]);
 
-        let page3 = futures::executor::block_on(repo.scan_ids(&filter, page2.last().copied(), 2))
-            .unwrap();
+        let page3 =
+            futures::executor::block_on(repo.scan_ids(&filter, page2.last().copied(), 2)).unwrap();
         assert_eq!(page3, vec![NovelId::from(5)]);
     }
 

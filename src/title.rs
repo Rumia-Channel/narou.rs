@@ -61,10 +61,10 @@ pub fn sync_title_projection(id: i64) -> Result<()> {
     novels.apply_batch_sync(vec![crate::platform::NovelMutation::Upsert(projected)])?;
     rename_projected_outputs(&previous_dir, &record.author, &record.title, &display_title)?;
 
-    if let Some(mut toc) = crate::downloader::persistence::load_toc_file(&previous_dir) {
+    if let Some(mut toc) = crate::native::legacy_persistence::load_toc_file(&previous_dir) {
         if toc.title != display_title {
             toc.title = display_title;
-            crate::downloader::persistence::save_toc_file(&previous_dir, &toc)?;
+            crate::native::legacy_persistence::save_toc_file(&previous_dir, &toc)?;
         }
     }
     Ok(())
@@ -145,7 +145,7 @@ mod tests {
             "epub",
         )
         .unwrap();
-        crate::downloader::persistence::save_toc_file(
+        crate::native::legacy_persistence::save_toc_file(
             &raw_dir,
             &TocFile {
                 title: "【書籍化】作品名".to_string(),
@@ -198,7 +198,7 @@ last_update: 2026-04-20 00:00:00.000000000 +09:00
                 .join("[author] 【書籍化】作品名.epub")
                 .exists()
         );
-        let toc = crate::downloader::persistence::load_toc_file(&raw_dir).unwrap();
+        let toc = crate::native::legacy_persistence::load_toc_file(&raw_dir).unwrap();
         assert_eq!(toc.title, "作品名");
 
         std::fs::write(
@@ -214,7 +214,7 @@ last_update: 2026-04-20 00:00:00.000000000 +09:00
         assert!(raw_dir.exists());
         assert!(!projected_dir.exists());
         assert!(raw_dir.join("[author] 【書籍化】作品名.epub").exists());
-        let toc = crate::downloader::persistence::load_toc_file(&raw_dir).unwrap();
+        let toc = crate::native::legacy_persistence::load_toc_file(&raw_dir).unwrap();
         assert_eq!(toc.title, "【書籍化】作品名");
     }
 }

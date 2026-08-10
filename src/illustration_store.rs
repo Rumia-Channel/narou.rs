@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::Result;
+use crate::platform::{AssetStore, AssetStream, NovelObjectKeys, ObjectKey};
 
 const CACHE_FILE_NAME: &str = ".illustration_cache.yaml";
 const LEGACY_STORE_VERSION: u32 = 1;
@@ -28,11 +30,158 @@ pub struct IllustrationStore {
     dirty: bool,
 }
 
+/// Pure metadata index for illustration URL/hash-to-filename mappings.
+///
+/// The transparent representation preserves the legacy flat
+/// `.illustration_cache.yaml` schema. Filesystem compatibility methods remain
+/// on `IllustrationStore`; this type exposes only metadata operations to core
+/// storage services.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct IllustrationIndex(IllustrationStore);
+
+impl Default for IllustrationIndex {
+    fn default() -> Self {
+        Self(IllustrationStore::default())
+    }
+}
+
+impl IllustrationIndex {
+    pub fn filename_for_source(&self, source: &str) -> Option<&str> {
+        self.0.filename_for_source(source)
+    }
+
+    pub fn filename_for_mitemin_id(&self, id: &str) -> Option<&str> {
+        self.0.filename_for_mitemin_id(id)
+    }
+
+    pub fn filename_for_hash(&self, hash: &str) -> Option<&str> {
+        self.0.filename_for_hash(hash)
+    }
+
+    pub fn hash_for_mitemin_id(&self, id: &str) -> Option<&str> {
+        self.0.hash_for_mitemin_id(id)
+    }
+
+    pub fn remember_hash_source(&mut self, source: &str, hash: &str, filename: &str) {
+        self.0.remember_hash_source(source, hash, filename);
+    }
+
+    pub fn remember_mitemin(&mut self, source: &str, id: &str, hash: &str, filename: &str) {
+        self.0.remember_mitemin(source, id, hash, filename);
+    }
+
+    pub fn to_cache_yaml(&self) -> Result<Vec<u8>> {
+        let mut content = serde_yaml::to_string(self)?;
+        if content.starts_with("---\n") {
+            content.drain(..4);
+        }
+        Ok(content.into_bytes())
+    }
+
+    pub fn mark_clean(&mut self) {
+        self.0.mark_clean();
+    }
+
+    pub(crate) fn from_store(store: IllustrationStore) -> Self {
+        Self(store)
+    }
+
+    pub(crate) fn legacy(&self) -> &IllustrationStore {
+        &self.0
+    }
+
+    pub(crate) fn legacy_mut(&mut self) -> &mut IllustrationStore {
+        &mut self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredIllustration {
     pub filename: String,
     pub hash: String,
     pub created: bool,
+}
+
+/// Platform-neutral illustration binary storage boundary.
+///
+/// The index decides canonical filenames without probing the backing store.
+/// The storage service writes the asset first and updates the index only after
+/// that write succeeds.
+#[derive(Clone)]
+pub struct IllustrationStorageService {
+    assets: Arc<dyn AssetStore>,
+}
+
+impl IllustrationStorageService {
+    pub fn new(assets: Arc<dyn AssetStore>) -> Self {
+        Self { assets }
+    }
+
+    pub async fn store_bytes(
+        &self,
+        keys: &NovelObjectKeys,
+        index: &mut IllustrationIndex,
+        source: &str,
+        bytes: &[u8],
+        ext: &str,
+    ) -> Result<StoredIllustration> {
+        self.store_bytes_at(keys.prefix(), index, source, bytes, ext)
+            .await
+    }
+
+    pub async fn store_bytes_at(
+        &self,
+        prefix: &ObjectKey,
+        index: &mut IllustrationIndex,
+        source: &str,
+        bytes: &[u8],
+        ext: &str,
+    ) -> Result<StoredIllustration> {
+        let hash = hash_bytes(bytes);
+        let normalized_ext = normalize_extension(ext);
+        let id = mitemin_illustration_id(source);
+        let filename = id
+            .as_deref()
+            .and_then(|id| index.filename_for_mitemin_id(id))
+            .or_else(|| index.filename_for_source(source))
+            .or_else(|| index.filename_for_hash(&hash))
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}.{}", id.as_deref().unwrap_or(&hash), normalized_ext));
+        let key = prefix.join("挿絵")?.join(filename.as_str())?;
+        let known_mapping = id
+            .as_deref()
+            .and_then(|id| index.filename_for_mitemin_id(id))
+            .or_else(|| index.filename_for_source(source))
+            .or_else(|| index.filename_for_hash(&hash))
+            .is_some();
+        let created = if known_mapping {
+            if self.assets.stat(&key).await?.is_some() {
+                false
+            } else {
+                let body = bytes.to_vec();
+                let stream: AssetStream = Box::pin(futures::stream::once(async move { Ok(body) }));
+                self.assets.write_stream(&key, stream).await?;
+                true
+            }
+        } else {
+            let body = bytes.to_vec();
+            let stream: AssetStream = Box::pin(futures::stream::once(async move { Ok(body) }));
+            self.assets.write_stream(&key, stream).await?;
+            true
+        };
+
+        if let Some(id) = id {
+            index.remember_mitemin(source, &id, &hash, &filename);
+        } else {
+            index.remember_hash_source(source, &hash, &filename);
+        }
+        Ok(StoredIllustration {
+            filename,
+            hash,
+            created,
+        })
+    }
 }
 
 impl Default for IllustrationStore {
@@ -99,6 +248,18 @@ impl IllustrationStore {
         crate::db::inventory::atomic_write(&path, &content)?;
         self.dirty = false;
         Ok(())
+    }
+
+    pub fn to_cache_yaml(&self) -> Result<Vec<u8>> {
+        let mut content = serde_yaml::to_string(self)?;
+        if content.starts_with("---\n") {
+            content.drain(..4);
+        }
+        Ok(content.into_bytes())
+    }
+
+    pub fn mark_clean(&mut self) {
+        self.dirty = false;
     }
 
     pub fn cached_filename_for_source(&self, source: &str, illust_dir: &Path) -> Option<String> {
@@ -288,14 +449,16 @@ impl IllustrationStore {
 
     fn remember_source(&mut self, source: &str, filename: &str) {
         if self.sources.get(source).map(String::as_str) != Some(filename) {
-            self.sources.insert(source.to_string(), filename.to_string());
+            self.sources
+                .insert(source.to_string(), filename.to_string());
             self.dirty = true;
         }
     }
 
     fn remember_mitemin_id(&mut self, id: &str, filename: &str) {
         if self.mitemin_ids.get(id).map(String::as_str) != Some(filename) {
-            self.mitemin_ids.insert(id.to_string(), filename.to_string());
+            self.mitemin_ids
+                .insert(id.to_string(), filename.to_string());
             self.dirty = true;
         }
     }
@@ -378,7 +541,8 @@ pub fn cache_path(archive_path: &Path) -> std::path::PathBuf {
 }
 
 fn has_legacy_illustration_inputs(archive_path: &Path) -> bool {
-    archive_path.join("挿絵").is_dir() || archive_path.join(crate::downloader::RAW_DATA_DIR).is_dir()
+    archive_path.join("挿絵").is_dir()
+        || archive_path.join(crate::downloader::RAW_DATA_DIR).is_dir()
 }
 
 /// Find files in `挿絵/` not reachable from the cache or `raw/*.html` references.
@@ -639,7 +803,10 @@ pub fn plan_extension_fixes(illust_dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>
         if current_ext.eq_ignore_ascii_case(detected) {
             continue;
         }
-        let stem = Path::new(filename).file_stem().and_then(|s| s.to_str()).unwrap_or(filename);
+        let stem = Path::new(filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(filename);
         let new_path = illust_dir.join(format!("{}.{}", stem, detected));
         if new_path == path {
             continue;
@@ -651,10 +818,7 @@ pub fn plan_extension_fixes(illust_dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>
 }
 
 /// Apply planned extension fixes: rename files. Returns count actually renamed.
-pub fn apply_extension_fixes(
-    illust_dir: &Path,
-    fixes: &[(PathBuf, PathBuf)],
-) -> Result<usize> {
+pub fn apply_extension_fixes(illust_dir: &Path, fixes: &[(PathBuf, PathBuf)]) -> Result<usize> {
     if !illust_dir.is_dir() {
         return Ok(0);
     }
@@ -761,8 +925,7 @@ pub fn rebuild_illustration_cache(archive_path: &Path) -> Result<usize> {
         }
     }
 
-    let entry_count =
-        store.sources.len() + store.mitemin_ids.len() + store.hashes.len();
+    let entry_count = store.sources.len() + store.mitemin_ids.len() + store.hashes.len();
     store.flush(archive_path)?;
     Ok(entry_count)
 }
@@ -816,8 +979,7 @@ fn is_canonical_illustration_filename(filename: &str) -> bool {
         return false;
     };
     // 64-char hex (SHA-256) or mitemin ID like i12345.
-    (stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit()))
-        || is_mitemin_id(stem)
+    (stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit())) || is_mitemin_id(stem)
 }
 
 fn looks_like_section_index_count(stem: &str) -> bool {
@@ -900,14 +1062,14 @@ fn plan_section_index_count_migration(
     }
     // Try to find a raw HTML source whose stem matches the legacy basename, so the
     // cache can be updated after migration.
-    let source = raw_sources.stem_to_source.get(stem).map(|e| e.source.clone());
+    let source = raw_sources
+        .stem_to_source
+        .get(stem)
+        .map(|e| e.source.clone());
     Ok(Some((new_path, source)))
 }
 
-fn plan_url_basename_migration(
-    old_path: &Path,
-    illust_dir: &Path,
-) -> Result<Option<PathBuf>> {
+fn plan_url_basename_migration(old_path: &Path, illust_dir: &Path) -> Result<Option<PathBuf>> {
     let Ok(bytes) = std::fs::read(old_path) else {
         return Ok(None);
     };
@@ -972,7 +1134,7 @@ pub fn normalize_illustration_url(source: &str) -> String {
 
 pub fn mitemin_illustration_id(source: &str) -> Option<String> {
     let normalized = normalize_illustration_url(source);
-    let parsed = reqwest::Url::parse(&normalized).ok()?;
+    let parsed = url::Url::parse(&normalized).ok()?;
     let host = parsed.host_str()?;
     if !host.ends_with(".mitemin.net") {
         return None;
@@ -988,7 +1150,7 @@ pub fn legacy_basename_from_source(source: &str) -> Option<String> {
         return Some(id);
     }
     let normalized = normalize_illustration_url(source);
-    let parsed = reqwest::Url::parse(&normalized).ok()?;
+    let parsed = url::Url::parse(&normalized).ok()?;
     let segment = parsed
         .path_segments()?
         .filter(|part| !part.is_empty())
@@ -1024,7 +1186,7 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 }
 
 pub fn guessed_extension_from_url(url: &str) -> &'static str {
-    reqwest::Url::parse(url)
+    url::Url::parse(url)
         .ok()
         .and_then(|parsed| {
             parsed
@@ -1167,6 +1329,7 @@ fn normalize_extension(ext: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::ObjectStore;
 
     #[test]
     fn store_bytes_uses_mitemin_id_filename_and_hash_table() {
@@ -1187,7 +1350,9 @@ mod tests {
         assert_eq!(store.filename_for_mitemin_id("i422674"), Some(expected));
         assert_eq!(store.hash_for_mitemin_id("i422674"), Some(hash.as_str()));
         assert_eq!(
-            store.cached_filename_for_source(source, &illust_dir).as_deref(),
+            store
+                .cached_filename_for_source(source, &illust_dir)
+                .as_deref(),
             Some(expected)
         );
     }
@@ -1239,8 +1404,14 @@ mod tests {
         assert_eq!(migrated, 1);
         assert!(!illust_dir.join("16-0.jpg").exists());
         assert!(illust_dir.join("i422674.jpg").is_file());
-        assert_eq!(store.filename_for_mitemin_id("i422674"), Some("i422674.jpg"));
-        assert_eq!(store.hash_for_mitemin_id("i422674"), Some(hash_bytes(b"dummy").as_str()));
+        assert_eq!(
+            store.filename_for_mitemin_id("i422674"),
+            Some("i422674.jpg")
+        );
+        assert_eq!(
+            store.hash_for_mitemin_id("i422674"),
+            Some(hash_bytes(b"dummy").as_str())
+        );
     }
 
     #[test]
@@ -1263,7 +1434,10 @@ mod tests {
 
         assert!(!illust_dir.join(&hash_filename).exists());
         assert!(illust_dir.join("i422674.jpg").is_file());
-        assert_eq!(store.filename_for_mitemin_id("i422674"), Some("i422674.jpg"));
+        assert_eq!(
+            store.filename_for_mitemin_id("i422674"),
+            Some("i422674.jpg")
+        );
         assert_eq!(store.hash_for_mitemin_id("i422674"), Some(hash.as_str()));
     }
 
@@ -1375,12 +1549,24 @@ mod tests {
         assert!(stems.contains(&"16-0".to_string()));
         assert!(stems.contains(&"image001".to_string()));
         for plan in &plans {
-            let ext = plan.old_path.extension().unwrap().to_string_lossy().to_string();
+            let ext = plan
+                .old_path
+                .extension()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
             assert_eq!(
-                plan.new_path.extension().unwrap().to_string_lossy().to_string(),
+                plan.new_path
+                    .extension()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
                 ext
             );
-            assert_eq!(plan.new_path.file_name().unwrap().to_string_lossy().len(), 64 + 1 + ext.len());
+            assert_eq!(
+                plan.new_path.file_name().unwrap().to_string_lossy().len(),
+                64 + 1 + ext.len()
+            );
         }
     }
 
@@ -1480,5 +1666,52 @@ mod tests {
         assert!(count > 0);
         let cache_file = cache_path(temp.path());
         assert!(cache_file.is_file());
+    }
+
+    #[test]
+    fn storage_service_writes_assets_and_repairs_missing_cached_blob() {
+        let assets = Arc::new(crate::platform::mocks::MemoryObjectStore::new());
+        let service = IllustrationStorageService::new(assets.clone());
+        let keys = NovelObjectKeys::new("site", "n1234ab", true).unwrap();
+        let source = "https://example.com/image.png";
+        let bytes = b"image bytes";
+        let mut index = IllustrationIndex::default();
+
+        futures::executor::block_on(async {
+            let first = service
+                .store_bytes(&keys, &mut index, source, bytes, "png")
+                .await
+                .unwrap();
+            assert!(first.created);
+            let second = service
+                .store_bytes(&keys, &mut index, source, bytes, "png")
+                .await
+                .unwrap();
+            assert!(!second.created);
+            let key = keys.illustration(&first.filename).unwrap();
+            AssetStore::delete(assets.as_ref(), &key).await.unwrap();
+            let repaired = service
+                .store_bytes(&keys, &mut index, source, bytes, "png")
+                .await
+                .unwrap();
+            assert!(repaired.created);
+            assert_eq!(
+
+                ObjectStore::read_small(assets.as_ref(), &key)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                bytes
+            );
+        });
+    }
+
+    #[test]
+    fn pure_index_keeps_legacy_cache_serialization() {
+        let source = "https://example.com/image.png";
+        let mut legacy = IllustrationStore::default();
+        legacy.remember_hash_source(source, "abc123", "abc123.png");
+        let index = IllustrationIndex::from_store(legacy.clone());
+        assert_eq!(index.to_cache_yaml().unwrap(), legacy.to_cache_yaml().unwrap());
     }
 }

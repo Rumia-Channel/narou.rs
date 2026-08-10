@@ -246,8 +246,8 @@ sample/
 
 ## Current Status (2026-07)
 
-### プラットフォーム抽象化 (Phase 1-3: 2026-08)
-- **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。依存調査結果、module 構成、trait 一覧、migration phases (1-8) を定義。
+### プラットフォーム抽象化 (Phase 1-4: 2026-08)
+- **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。Phase 4のsmall object / large asset境界、logical key、native mapping、remaining native FSも記録。
 - **Phase 1 完了**: `src/platform/` に traits（HttpClient / Clock / RateLimiter / ObjectStore / NovelRepository）+ テスト用 mock（MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter / SystemClock）を導入。
 - `NarouError::Http` は `reqwest::Error` の直接 `#[from]` をやめ String 化。`Platform(String)` variant 追加。core から reqwest 型が error 経由で漏れるのを防止。
 - **Phase 2 完了**: downloader を trait 利用へ全面移行。
@@ -261,7 +261,16 @@ sample/
   - `src/native/novel_repository.rs` は共有 `db::DATABASE` を使う stateless adapter。async 経路は `spawn_blocking`、CLI は `_sync` 経路で実行し、YAML を二重ロードしない。
   - Downloader / narou API / CLI / Web の NovelRecord 操作を repository 経由へ移行。Web 一覧は `count` + paginated `query`、一括処理は `scan_ids`。
   - Native YAML round-trip、unknown fields / raw_title / nilable bool / 日時、Memory repository、並列 ID reservation、Downloader injection をテストで固定。
-- 今後の phase: 4=converter/illustration の FS 除去、5=Web UI の service 層化、6=Worker skeleton、7=D1/Wasabi/Worker fetch、8=Queues/crawler/scheduler。
+- **Phase 4 完了**:
+  - `ObjectStore` は `PlatformFuture` async API（`stat` / bounded `read_small`・`write_small` / `delete` / cursor付き `list_page`）、`AssetStore` は bounded chunk streamとcopy/move semanticsを提供。
+  - `ObjectKey` は `/`区切りlogical UTF-8 key。`NovelObjectKeys` / `GeneratedAssetKey` がキー生成を集約し、OS `Path`をcore identityにしない。
+  - `NativeObjectStore` は既存の `小説データ/` layoutへ写像し、atomic write、archive-root / symlink / reparse-point escape対策、legacy section filename fallbackをnative adapter内で維持。
+  - downloaderのTOC/section/raw/setting/replace/cache persistenceは`PersistenceService`経由。codecはpureで、`Clock`を注入可能。旧Path APIは`src/native/legacy_persistence.rs`へ隔離。
+  - illustrationはmetadata indexと`IllustrationStorageService`を分離し、blob write成功後にcache indexを更新。既存`.illustration_cache.yaml`形式とnative migration/orphan CLI互換を維持。
+  - converterのdirect `curl::Easy`を除去し、illustration localizationの`ConverterCapabilities`へ`HttpClient` / `RateLimiter` / `ObjectStore` / `AssetStore` / index / logical prefix / 必要時の`NovelRecord` resolverを注入可能にした。zero-argument native constructorsは`src/native/converter.rs`へ隔離し、pure converter pipelineへplatform traitを逆流させない。
+  - `src/native/converter.rs` / `src/native/downloader.rs` にzero-argument native constructorsを隔離し、coreからNativeHttpClient / NativeObjectStore / NativeNovelRepositoryを直接参照しない。
+  - `MemoryObjectStore` async/paged/chunked fake、PersistenceService fixed-clock、NativeObjectStore layout/existing-data compatibility testsを追加。
+- **Phase 5開始条件**: Inventory/settings、site definition loader、downloader info cache、Web固有FS、converter/settings/ini/inspector/user-converter/section-convert-cache、converter/deviceのsubprocess/tempdirはnative-only境界として残し、Web service層化で再設計する。content blobをLISTでmetadata DB化しない。
 
 ### 最近の追加 (2026-05〜07)
 - **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1 で従来の逐次動作、フォース指定・ウェブモード・ドメインが1種類のときは自動的に逐次にフォールバック

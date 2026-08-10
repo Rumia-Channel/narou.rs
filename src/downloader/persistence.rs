@@ -1,11 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-use crate::error::Result;
-
 use super::types::{SectionElement, SectionFile, SubtitleInfo, TocFile};
+use crate::error::Result;
+use crate::platform::{AssetStore, Clock, NovelObjectKeys, ObjectStore, SystemClock};
 
 pub fn compute_section_hash(section: &SectionElement) -> String {
     let mut hasher = Sha256::new();
@@ -21,175 +20,323 @@ pub fn section_filename(subtitle: &SubtitleInfo) -> String {
     format!("{} {}.yaml", subtitle.index, safe_subtitle)
 }
 
-fn raw_filename(subtitle: &SubtitleInfo) -> String {
+pub fn raw_filename(subtitle: &SubtitleInfo) -> String {
     let section = section_filename(subtitle);
     let stem = section.strip_suffix(".yaml").unwrap_or(&section);
     format!("{stem}.html")
 }
 
-pub fn section_needs_update(
-    section_dir: &PathBuf,
-    subtitle: &SubtitleInfo,
-    new_section: &SectionElement,
-) -> bool {
-    let path = section_dir.join(section_filename(subtitle));
-    if !path.exists() {
-        return true;
-    }
-    if let Some(existing) = load_section_file(&path) {
-        let old_hash = compute_section_hash(&existing.element);
-        let new_hash = compute_section_hash(new_section);
-        return old_hash != new_hash;
-    }
-    true
+/// Storage-backed downloader persistence.
+///
+/// The codec functions below remain pure; this service owns only the
+/// ObjectStore/AssetStore calls and the injected clock.
+#[derive(Clone)]
+pub struct PersistenceService {
+    objects: Arc<dyn ObjectStore>,
+    assets: Arc<dyn AssetStore>,
+    clock: Arc<dyn Clock>,
 }
 
-pub fn resolve_section_file_path(
-    section_dir: &Path,
-    subtitle: &SubtitleInfo,
-) -> Option<PathBuf> {
-    let exact = section_dir.join(section_filename(subtitle));
-    if exact.exists() {
-        return Some(exact);
+impl PersistenceService {
+    pub fn new(objects: Arc<dyn ObjectStore>, assets: Arc<dyn AssetStore>) -> Self {
+        Self::with_clock(objects, assets, Arc::new(SystemClock))
     }
-    find_section_file_by_index(section_dir, &subtitle.index)
-}
 
-pub fn find_section_file_by_index(section_dir: &Path, index: &str) -> Option<PathBuf> {
-    let prefix = format!("{} ", index);
-    let entries = std::fs::read_dir(section_dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".yaml") {
-            continue;
-        }
-        let stem = &name[..name.len() - 5];
-        if stem == index || stem.starts_with(&prefix) {
-            return Some(entry.path());
+    pub fn with_clock(
+        objects: Arc<dyn ObjectStore>,
+        assets: Arc<dyn AssetStore>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self {
+            objects,
+            assets,
+            clock,
         }
     }
-    None
-}
 
-pub fn load_section_file(path: &PathBuf) -> Option<SectionFile> {
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_yaml::from_str(&content).ok()
-}
-
-pub fn save_section_file(
-    section_dir: &PathBuf,
-    subtitle: &SubtitleInfo,
-    section: &SectionElement,
-) -> Result<()> {
-    let section_dir = validate_archive_write_dir(section_dir, 2)?;
-    std::fs::create_dir_all(&section_dir)?;
-    let path = section_dir.join(section_filename(subtitle));
-    let file_data = SectionFile {
-        index: subtitle.index.clone(),
-        href: subtitle.href.clone(),
-        chapter: subtitle.chapter.clone(),
-        subchapter: subtitle.subchapter.clone(),
-        subtitle: subtitle.subtitle.clone(),
-        file_subtitle: subtitle.file_subtitle.clone(),
-        subdate: subtitle.subdate.clone(),
-        subupdate: subtitle.subupdate.clone(),
-        download_time: Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string()),
-        element: section.clone(),
-    };
-    let yaml_body = serde_yaml::to_string(&file_data)?;
-    let content = format!("---\n{}\n", yaml_body);
-    crate::db::inventory::atomic_write(&path, &content)?;
-    Ok(())
-}
-
-pub fn save_raw_file(raw_dir: &PathBuf, subtitle: &SubtitleInfo, raw_html: &str) -> Result<()> {
-    if raw_html.is_empty() {
-        return Ok(());
+    pub fn objects(&self) -> &Arc<dyn ObjectStore> {
+        &self.objects
     }
-    let raw_dir = validate_archive_write_dir(raw_dir, 2)?;
-    std::fs::create_dir_all(&raw_dir)?;
-    let path = raw_dir.join(raw_filename(subtitle));
-    crate::db::inventory::atomic_write(&path, raw_html)?;
-    Ok(())
-}
 
-pub fn move_file_to_dir(path: &Path, dst_dir: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
+    pub async fn load_toc(&self, keys: &NovelObjectKeys) -> Result<Option<TocFile>> {
+        let Some(bytes) = self.objects.read_small(&keys.toc()).await? else {
+            return Ok(None);
+        };
+        Ok(Some(deserialize_toc(&bytes)?))
     }
-    std::fs::create_dir_all(dst_dir)?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| crate::error::NarouError::Io(std::io::Error::other("invalid file name")))?;
-    std::fs::rename(path, dst_dir.join(file_name))?;
-    Ok(())
-}
 
-pub fn remove_dir_if_empty(path: &Path) -> Result<()> {
-    if path.is_dir() && std::fs::read_dir(path)?.next().is_none() {
-        std::fs::remove_dir_all(path)?;
+    pub async fn save_toc(&self, keys: &NovelObjectKeys, toc: &TocFile) -> Result<()> {
+        self.objects
+            .write_small(&keys.toc(), serialize_toc(toc)?.into_bytes())
+            .await
     }
-    Ok(())
+
+    pub async fn load_section(
+        &self,
+        keys: &NovelObjectKeys,
+        subtitle: &SubtitleInfo,
+    ) -> Result<Option<SectionFile>> {
+        let Some(bytes) = self
+            .objects
+            .read_small(&keys.section(&subtitle.index, &subtitle.file_subtitle))
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(deserialize_section(&bytes)?))
+    }
+
+    pub async fn save_section(
+        &self,
+        keys: &NovelObjectKeys,
+        subtitle: &SubtitleInfo,
+        section: &SectionElement,
+    ) -> Result<String> {
+        let download_time = self
+            .clock
+            .now_utc()
+            .format("%Y-%m-%d %H:%M:%S%.6f %z")
+            .to_string();
+        let file_data = SectionFile {
+            index: subtitle.index.clone(),
+            href: subtitle.href.clone(),
+            chapter: subtitle.chapter.clone(),
+            subchapter: subtitle.subchapter.clone(),
+            subtitle: subtitle.subtitle.clone(),
+            file_subtitle: subtitle.file_subtitle.clone(),
+            subdate: subtitle.subdate.clone(),
+            subupdate: subtitle.subupdate.clone(),
+            download_time: Some(download_time.clone()),
+            element: section.clone(),
+        };
+        self.objects
+            .write_small(
+                &keys.section(&subtitle.index, &subtitle.file_subtitle),
+                serialize_section(&file_data)?.into_bytes(),
+            )
+            .await?;
+        Ok(download_time)
+    }
+
+    pub async fn section_needs_update(
+        &self,
+        keys: &NovelObjectKeys,
+        subtitle: &SubtitleInfo,
+        new_section: &SectionElement,
+    ) -> Result<bool> {
+        let Some(existing) = self.load_section(keys, subtitle).await? else {
+            return Ok(true);
+        };
+        Ok(compute_section_hash(&existing.element) != compute_section_hash(new_section))
+    }
+
+    pub async fn save_raw(
+        &self,
+        keys: &NovelObjectKeys,
+        subtitle: &SubtitleInfo,
+        raw_html: &str,
+    ) -> Result<()> {
+        if raw_html.is_empty() {
+            return Ok(());
+        }
+        self.objects
+            .write_small(
+                &keys.raw_section(&subtitle.index, &subtitle.file_subtitle),
+                raw_html.as_bytes().to_vec(),
+            )
+            .await
+    }
+
+    pub async fn move_section_to_cache(
+        &self,
+        keys: &NovelObjectKeys,
+        timestamp: &str,
+        subtitle: &SubtitleInfo,
+    ) -> Result<()> {
+        let source = keys.section(&subtitle.index, &subtitle.file_subtitle);
+        let destination = keys.cached_section(timestamp, &subtitle.index, &subtitle.file_subtitle);
+        self.assets.move_or_copy(&source, &destination).await
+    }
+
+    pub async fn ensure_default_files(
+        &self,
+        keys: &NovelObjectKeys,
+        title: &str,
+        author: &str,
+        toc_url: &str,
+    ) -> Result<()> {
+        if self.objects.read_small(&keys.setting()).await?.is_none() {
+            self.objects
+                .write_small(&keys.setting(), default_setting_ini().into_bytes())
+                .await?;
+        }
+        if self.objects.read_small(&keys.replace()).await?.is_none() {
+            self.objects
+                .write_small(
+                    &keys.replace(),
+                    default_replace_txt(title, author, toc_url).into_bytes(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn load_cache(
+        &self,
+        keys: &NovelObjectKeys,
+    ) -> Result<Option<crate::illustration_store::IllustrationIndex>> {
+        let Some(bytes) = self.objects.read_small(&keys.illustration_cache()).await? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_yaml::from_slice(&bytes)?))
+    }
+
+    pub async fn save_cache(
+        &self,
+        keys: &NovelObjectKeys,
+        index: &crate::illustration_store::IllustrationIndex,
+    ) -> Result<()> {
+        let body = index.to_cache_yaml()?;
+        self.objects
+            .write_small(&keys.illustration_cache(), body)
+            .await
+    }
 }
 
-pub fn load_toc_file(novel_dir: &PathBuf) -> Option<TocFile> {
-    let path = novel_dir.join("toc.yaml");
-    let content = std::fs::read_to_string(&path).ok()?;
-    serde_yaml::from_str(&content).ok()
+pub fn default_setting_ini() -> String {
+    crate::converter::ini::IniData::new().to_ini_string()
+}
+
+pub fn default_replace_txt(title: &str, author: &str, toc_url: &str) -> String {
+    format!(
+        "; 単純置換用ファイル\n;\n; 対象小説情報\n; タイトル: {}\n; 作者: {}\n; URL: {}\n;\n; 書式\n; 置換対象<tab>置換文字\n;\n; サンプル\n; 一〇歳\t十歳\n; 第一章\t［＃ゴシック体］第一章［＃ゴシック体終わり］\n;\n; 正規表現での置換などは converter.yaml で対応して下さい\n",
+        title, author, toc_url
+    )
+}
+
+pub fn serialize_section(section: &SectionFile) -> Result<String> {
+    let yaml_body = serde_yaml::to_string(section)?;
+    Ok(format!("---\n{}\n", yaml_body))
+}
+
+pub fn deserialize_section(bytes: &[u8]) -> Result<SectionFile> {
+    Ok(serde_yaml::from_slice(bytes)?)
+}
+
+pub fn serialize_toc(toc: &TocFile) -> Result<String> {
+    let yaml_body = serde_yaml::to_string(toc)?;
+    Ok(format!("---\n{}\n", fix_yaml_block_scalar(&yaml_body)))
+}
+
+pub fn deserialize_toc(bytes: &[u8]) -> Result<TocFile> {
+    Ok(serde_yaml::from_slice(bytes)?)
 }
 
 pub fn fix_yaml_block_scalar(yaml: &str) -> String {
     let re = regex::Regex::new(r"(?m)^story:\s*\|[-+]?\s*$").unwrap();
-    let result = re.replace_all(yaml, "story: |-").to_string();
-    result
+    re.replace_all(yaml, "story: |-").to_string()
 }
 
-pub fn save_toc_file(novel_dir: &PathBuf, toc: &TocFile) -> Result<()> {
-    let novel_dir = validate_archive_write_dir(novel_dir, 1)?;
-    std::fs::create_dir_all(&novel_dir)?;
-    let path = novel_dir.join("toc.yaml");
-    let yaml_body = serde_yaml::to_string(toc)?;
-    let content = format!("---\n{}\n", fix_yaml_block_scalar(&yaml_body));
-    crate::db::inventory::atomic_write(&path, &content)?;
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::downloader::types::SectionElement;
+    use crate::platform::mocks::MemoryObjectStore;
+    use crate::platform::{AssetStore, Clock, ObjectStore};
+    use chrono::{DateTime, Utc};
+    use std::sync::Arc;
 
-pub fn ensure_default_files(novel_dir: &PathBuf, title: &str, author: &str, toc_url: &str) {
-    let Ok(novel_dir) = validate_archive_write_dir(novel_dir, 1) else {
-        return;
-    };
-    let _ = std::fs::create_dir_all(&novel_dir);
-    let setting_path = novel_dir.join("setting.ini");
-    if !setting_path.exists() {
-        let default_ini = crate::converter::ini::IniData::new();
-        let content = default_ini.to_ini_string();
-        let _ = std::fs::write(&setting_path, content);
-    }
+    struct FixedClock(DateTime<Utc>);
 
-    let replace_path = novel_dir.join("replace.txt");
-    if !replace_path.exists() {
-        let content = format!(
-            "; 単純置換用ファイル\n;\n; 対象小説情報\n; タイトル: {}\n; 作者: {}\n; URL: {}\n;\n; 書式\n; 置換対象<tab>置換文字\n;\n; サンプル\n; 一〇歳\t十歳\n; 第一章\t［＃ゴシック体］第一章［＃ゴシック体終わり］\n;\n; 正規表現での置換などは converter.yaml で対応して下さい\n",
-            title, author, toc_url
-        );
-        let _ = std::fs::write(&replace_path, content);
-    }
-}
-
-fn validate_archive_write_dir(path: &Path, fallback_depth: usize) -> Result<PathBuf> {
-    let archive_root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-        .unwrap_or_else(|_| infer_archive_root(path, fallback_depth));
-    crate::db::paths::ensure_within_archive_root(path, &archive_root)
-}
-
-fn infer_archive_root(path: &Path, fallback_depth: usize) -> PathBuf {
-    let mut current = path.to_path_buf();
-    for _ in 0..fallback_depth {
-        if let Some(parent) = current.parent() {
-            current = parent.to_path_buf();
-        } else {
-            break;
+    impl Clock for FixedClock {
+        fn now_utc(&self) -> DateTime<Utc> {
+            self.0
         }
     }
-    current
+
+    fn subtitle() -> SubtitleInfo {
+        SubtitleInfo {
+            index: "1".to_string(),
+            href: "https://example.test/1".to_string(),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: "第一話".to_string(),
+            file_subtitle: "第一話".to_string(),
+            subdate: "2026-08-01".to_string(),
+            subupdate: None,
+            download_time: None,
+        }
+    }
+
+    #[test]
+    fn persistence_roundtrip_uses_logical_keys_and_fixed_clock() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let objects: Arc<dyn ObjectStore> = store.clone();
+        let assets: Arc<dyn AssetStore> = store;
+        let clock = Arc::new(FixedClock(
+            DateTime::parse_from_rfc3339("2026-08-09T01:02:03Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ));
+        let service = PersistenceService::with_clock(objects.clone(), assets, clock);
+        let keys = NovelObjectKeys::new("example.test", "n1234ab", true).unwrap();
+        let subtitle = subtitle();
+        let section = SectionElement {
+            data_type: "text".to_string(),
+            introduction: String::new(),
+            postscript: String::new(),
+            body: "本文".to_string(),
+        };
+
+        futures::executor::block_on(async {
+            let time = service
+                .save_section(&keys, &subtitle, &section)
+                .await
+                .unwrap();
+            assert_eq!(time, "2026-08-09 01:02:03.000000 +0000");
+            let loaded = service
+                .load_section(&keys, &subtitle)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.element.body, "本文");
+            assert_eq!(loaded.download_time.as_deref(), Some(time.as_str()));
+
+            service
+                .save_raw(&keys, &subtitle, "<p>raw</p>")
+                .await
+                .unwrap();
+            service
+                .save_toc(
+                    &keys,
+                    &TocFile {
+                        title: "題名".to_string(),
+                        author: "作者".to_string(),
+                        toc_url: "https://example.test".to_string(),
+                        story: None,
+                        subtitles: vec![subtitle.clone()],
+                        novel_type: Some(1),
+                    },
+                )
+                .await
+                .unwrap();
+            service
+                .ensure_default_files(&keys, "題名", "作者", "https://example.test")
+                .await
+                .unwrap();
+        });
+
+        let section_key = keys.section(&subtitle.index, &subtitle.file_subtitle);
+        assert!(
+            futures::executor::block_on(objects.read_small(&section_key))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            futures::executor::block_on(objects.read_small(&keys.setting()))
+                .unwrap()
+                .unwrap(),
+            default_setting_ini().into_bytes()
+        );
+    }
 }

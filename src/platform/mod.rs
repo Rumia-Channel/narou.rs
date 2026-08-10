@@ -22,7 +22,10 @@ pub mod repository;
 
 pub use clock::{Clock, SystemClock};
 pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
-pub use object_store::{ObjectKey, ObjectMetadata, ObjectStore};
+pub use object_store::{
+    AssetChunk, AssetStore, AssetStream, GeneratedAssetKey, NovelObjectKeys, ObjectKey,
+    ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectStore,
+};
 pub use rate_limiter::{RateLimitScope, RateLimiter};
 pub use repository::{
     NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, NovelSort, NovelSortKey,

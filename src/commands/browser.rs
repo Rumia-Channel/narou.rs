@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use narou_rs::compat::open_browser;
 use narou_rs::db;
 use narou_rs::db::paths::novel_dir_for_record;
-use narou_rs::downloader::persistence::load_toc_file;
+use narou_rs::native::legacy_persistence::load_toc_file;
 
 use super::download;
 use super::help;

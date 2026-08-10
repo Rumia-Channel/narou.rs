@@ -17,7 +17,7 @@ pub fn is_safe_public_url(url: &str) -> bool {
 }
 
 pub fn validate_public_url(url: &str) -> std::result::Result<(), String> {
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!("unsupported URL scheme: {}", parsed.scheme()));
     }

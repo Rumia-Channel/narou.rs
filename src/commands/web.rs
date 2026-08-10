@@ -243,7 +243,7 @@ fn fill_general_all_no_in_database() -> Result<(), String> {
             continue;
         }
         let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
-        let Some(toc) = narou_rs::downloader::persistence::load_toc_file(&novel_dir) else {
+        let Some(toc) = narou_rs::native::legacy_persistence::load_toc_file(&novel_dir) else {
             continue;
         };
         record.general_all_no = Some(toc.subtitles.len() as i64);

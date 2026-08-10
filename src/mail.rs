@@ -590,7 +590,7 @@ pub fn get_ebook_file_paths(
         subtitles: Vec::new(),
         novel_type: Some(record.novel_type),
     };
-    let txt_name = create_output_text_filename(&settings, record.id, &toc);
+    let txt_name = create_output_text_filename(&settings, record.id, &toc, Some(&record));
     let base = PathBuf::from(txt_name)
         .file_stem()
         .and_then(|s| s.to_str())
