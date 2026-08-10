@@ -135,7 +135,7 @@ impl NovelRepository for D1NovelRepository {
         let mut built = build_where(&query.filter);
         built.sql.push_str(" ORDER BY ");
         built.sql.push_str(sort_expression(query.sort.key));
-        built.sql.push_str(if query.sort.reverse { " DESC" } else { " ASC" });
+        built.sql.push_str(if query.sort.reverse { " DESC NULLS FIRST" } else { " ASC NULLS LAST" });
         built.sql.push_str(if query.sort.reverse { ", n.id DESC" } else { ", n.id ASC" });
         built.sql.push_str(" LIMIT ? OFFSET ?");
         built.binds.push(BindValue::Int(query.limit as i64));

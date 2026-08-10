@@ -13,8 +13,3 @@ migrations_dir = "migrations"
 
 [build]
 command = "worker-build --release"
-
-[[queues.consumers]]
-queue = "narou-rs-jobs"
-max_batch_size = 10
-max_batch_timeout = 30

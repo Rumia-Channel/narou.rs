@@ -321,7 +321,7 @@ pub trait NovelRepository: PlatformService {
 | portable core crate | `narou_rs` の `worker-runtime` feature | 完了。native-only modules は feature gate |
 | `worker_entry` composition root | `AppServices` + D1/Wasabi adapters | 完了。production bindings are required |
 | fetch / scheduled / queue handlers | `workers-rs` `0.8.5` event macros | 完了。queue executionはPhase 8 |
-| `worker-build` / Wrangler | `worker_entry/wrangler.toml` | 完了。queue consumer設定を含む |
+| `worker-build` / Wrangler | `worker_entry/wrangler.toml` | 完了。D1 binding/migrationsを定義。Queue consumer登録はPhase 8へ延期 |
 | `WorkerHttpClient` | Workers Fetch API | 完了。bounded response body、trait future、redirect policyを維持 |
 | `WasabiObjectStore` / `AssetStore` | SigV4 + S3 multipart | 完了。logical key、paged LIST、small/streaming境界を維持 |
 | `D1NovelRepository` | D1 prepared statements + migrations | 完了。typed filter/sort、keyset scan、batch mutationをSQLへ変換 |
