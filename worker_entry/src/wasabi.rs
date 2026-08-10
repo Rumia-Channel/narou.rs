@@ -328,7 +328,7 @@ impl AssetStore for WasabiObjectStore {
                     .await?;
                 let mut response = Self::check_response(response).await?;
                 let body = response.bytes().await.map_err(worker_error)?;
-                let id = xml_text(&body, "UploadId")
+                let id = xml_text(&body, "UploadId")?
                     .ok_or_else(|| NarouError::Platform("Wasabi multipart response omitted UploadId".to_string()))?;
                 upload_id = Some(id.clone());
                 let mut parts = Vec::new();
@@ -533,23 +533,61 @@ fn percent_encode(value: &str) -> String {
     output
 }
 
-fn xml_text(body: &[u8], tag: &str) -> Option<String> {
-    let text = std::str::from_utf8(body).ok()?;
-    let start = format!("<{tag}>");
-    let end = format!("</{tag}>");
-    let start = text.find(&start)? + start.len();
-    let end = text[start..].find(&end)? + start;
-    Some(text[start..end].to_string())
+fn xml_text(body: &[u8], tag: &str) -> Result<Option<String>> {
+    let text = std::str::from_utf8(body)
+        .map_err(|error| NarouError::Platform(format!("invalid Wasabi XML response: {error}")))?;
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let Some(start) = text.find(&start_tag) else {
+        return Ok(None);
+    };
+    let value_start = start + start_tag.len();
+    let end = text[value_start..]
+        .find(&end_tag)
+        .map(|offset| value_start + offset)
+        .ok_or_else(|| NarouError::Platform(format!("Wasabi XML tag <{tag}> is not closed")))?;
+    let value = &text[value_start..end];
+    if value.contains('<') {
+        return Err(NarouError::Platform(format!("Wasabi XML tag <{tag}> contains nested markup")));
+    }
+    Ok(Some(xml_unescape(value)?))
 }
 
-fn xml_unescape(value: &str) -> String {
-    value
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
+fn xml_unescape(value: &str) -> Result<String> {
+    let mut output = String::with_capacity(value.len());
+    let mut remainder = value;
+    while let Some(ampersand) = remainder.find('&') {
+        output.push_str(&remainder[..ampersand]);
+        let entity = remainder
+            .get(ampersand + 1..)
+            .and_then(|tail| tail.find(';').map(|end| &tail[..end]))
+            .ok_or_else(|| NarouError::Platform("unterminated XML entity in Wasabi response".to_string()))?;
+        let decoded = match entity {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            entity if let Some(value) = entity.strip_prefix("#x") => char::from_u32(
+                u32::from_str_radix(value, 16)
+                    .map_err(|_| NarouError::Platform("invalid hexadecimal XML entity".to_string()))?,
+            )
+            .ok_or_else(|| NarouError::Platform("invalid hexadecimal XML entity".to_string()))?,
+            entity if let Some(value) = entity.strip_prefix('#') => char::from_u32(
+                value
+                    .parse::<u32>()
+                    .map_err(|_| NarouError::Platform("invalid decimal XML entity".to_string()))?,
+            )
+            .ok_or_else(|| NarouError::Platform("invalid decimal XML entity".to_string()))?,
+            _ => return Err(NarouError::Platform("unknown XML entity in Wasabi response".to_string())),
+        };
+        output.push(decoded);
+        remainder = &remainder[ampersand + entity.len() + 2..];
+    }
+    output.push_str(remainder);
+    Ok(output)
 }
+
 fn parse_list_page(
     body: &[u8],
     storage_prefix: &str,
@@ -559,40 +597,42 @@ fn parse_list_page(
         .map_err(|error| NarouError::Platform(format!("invalid Wasabi list response: {error}")))?;
     let mut objects = Vec::new();
     let mut cursor = 0;
-    while let Some(start) = text[cursor..].find("<Contents>") {
-        let start = cursor + start;
-        let end = text[start..]
+    while let Some(offset) = text[cursor..].find("<Contents>") {
+        let start = cursor + offset;
+        let value_start = start + "<Contents>".len();
+        let end = text[value_start..]
             .find("</Contents>")
-            .map(|offset| start + offset)
-            .unwrap_or(text.len());
-        let entry = &text[start..end];
-        if let Some(key) = xml_text(entry.as_bytes(), "Key") {
-            let key = xml_unescape(&key);
-            let key = key
-                .strip_prefix(storage_prefix)
-                .unwrap_or(&key)
-                .trim_start_matches('/');
-            if let Ok(key) = ObjectKey::try_new(key)
-                && prefix.matches(&key)
-            {
-                let size = xml_text(entry.as_bytes(), "Size")
-                    .and_then(|size| size.parse().ok())
-                    .unwrap_or_default();
-                let etag = xml_text(entry.as_bytes(), "ETag").map(|value| xml_unescape(&value));
-                objects.push(ObjectMetadata {
-                    key,
-                    size,
-                    etag,
-                    content_type: None,
-                    last_modified: None,
-                });
-            }
+            .map(|offset| value_start + offset)
+            .ok_or_else(|| NarouError::Platform("Wasabi list entry is not closed".to_string()))?;
+        let entry = &text[start..end + "</Contents>".len()];
+        let Some(key) = xml_text(entry.as_bytes(), "Key")? else {
+            return Err(NarouError::Platform("Wasabi list entry omitted Key".to_string()));
+        };
+        let key = key
+            .strip_prefix(storage_prefix)
+            .unwrap_or(&key)
+            .trim_start_matches('/');
+        if let Ok(key) = ObjectKey::try_new(key)
+            && prefix.matches(&key)
+        {
+            let size = xml_text(entry.as_bytes(), "Size")?
+                .ok_or_else(|| NarouError::Platform("Wasabi list entry omitted Size".to_string()))?
+                .parse()
+                .map_err(|_| NarouError::Platform("Wasabi list entry has invalid Size".to_string()))?;
+            let etag = xml_text(entry.as_bytes(), "ETag")?;
+            objects.push(ObjectMetadata {
+                key,
+                size,
+                etag,
+                content_type: None,
+                last_modified: None,
+            });
         }
         cursor = end + "</Contents>".len();
     }
     Ok(ObjectListPage {
         objects,
-        next_cursor: xml_text(body, "NextContinuationToken").map(|value| xml_unescape(&value)),
+        next_cursor: xml_text(body, "NextContinuationToken")?,
     })
 }
 
@@ -620,5 +660,48 @@ mod tests {
         assert_eq!(page.objects[0].size, 12);
         assert_eq!(page.objects[0].etag.as_deref(), Some("\"etag\""));
         assert_eq!(page.next_cursor.as_deref(), Some("next&cursor"));
+    }
+
+    #[test]
+    fn list_page_rejects_unclosed_contents() {
+        let body = br#"<ListBucketResult><Contents><Key>novels/a</Key><Size>1</Size></ListBucketResult>"#;
+        let prefix = narou_rs::platform::ObjectPrefix::new("novels").unwrap();
+        assert!(parse_list_page(body, "", &prefix).is_err());
+    }
+
+    #[test]
+    fn xml_unescape_does_not_decode_nested_entities_twice() {
+        assert_eq!(xml_unescape("&amp;lt;").unwrap(), "&lt;");
+        assert_eq!(xml_unescape("&#x65;&#101;").unwrap(), "ee");
+    }
+    #[test]
+    fn authorization_header_matches_aws_get_vector() {
+        let mut headers = BTreeMap::new();
+        headers.insert("host".to_string(), "examplebucket.s3.amazonaws.com".to_string());
+        headers.insert("range".to_string(), "bytes=0-9".to_string());
+        headers.insert(
+            "x-amz-content-sha256".to_string(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+        );
+        headers.insert("x-amz-date".to_string(), "20130524T000000Z".to_string());
+        let header = authorization_header(
+            "GET",
+            &Url::parse("https://examplebucket.s3.amazonaws.com/test.txt").unwrap(),
+            &[],
+            &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "20130524T000000Z",
+            "20130524",
+            "us-east-1",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        )
+        .unwrap();
+        assert_eq!(
+            header,
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
+SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
+Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+        );
     }
 }

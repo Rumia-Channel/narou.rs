@@ -221,6 +221,13 @@ impl NovelRepository for D1NovelRepository {
                                 ],
                             )?);
                         }
+                        let refresh_status = format!(
+                            "UPDATE novels AS n SET status_sort = {STATUS_SORT_EXPRESSION} WHERE n.id = ?"
+                        );
+                        statements.push(self.prepare(
+                            &refresh_status,
+                            vec![BindValue::Int(record.id)],
+                        )?);
                         statements.push(self.prepare(
                             "UPDATE novel_id_sequence SET next_id = CASE WHEN next_id < ? THEN ? ELSE next_id END WHERE id = 1",
                             vec![BindValue::Int(max_id), BindValue::Int(max_id)],
@@ -286,6 +293,13 @@ impl FreezeMutationStore for D1FreezeStore {
                 };
                 statements.push(bind_statement(
                     self.db.prepare(sql),
+                    vec![BindValue::Int(id.0)],
+                )?);
+                let refresh_status = format!(
+                    "UPDATE novels AS n SET status_sort = {STATUS_SORT_EXPRESSION} WHERE n.id = ?"
+                );
+                statements.push(bind_statement(
+                    self.db.prepare(&refresh_status),
                     vec![BindValue::Int(id.0)],
                 )?);
             }
@@ -764,7 +778,7 @@ fn sort_expression(key: NovelSortKey) -> &'static str {
         NovelSortKey::Tags => "n.tags_sort",
         NovelSortKey::GeneralAllNo => "n.general_all_no",
         NovelSortKey::Length => "n.length",
-        NovelSortKey::Status => STATUS_SORT_EXPRESSION,
+        NovelSortKey::Status => "n.status_sort",
         NovelSortKey::TocUrl => "n.toc_url_fold",
         NovelSortKey::NewArrivalsDate => "n.new_arrivals_date",
     }

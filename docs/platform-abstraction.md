@@ -332,6 +332,32 @@ Production binding setup keeps credentials out of the repository. `worker_entry/
 `worker_entry/` は fetch / scheduled / queue の3エントリだけを持つ。`composition.rs` が唯一のサービス構成点であり、Worker固有型を application/platform coreへ持ち込まない。
 Queue payload は `WorkerJobEnvelope { version: 1, job: ... }` とし、未知 version は処理せず retry する。D1/Wasabiはproduction bindingとして構成し、実ジョブ実行はPhase 8へ残す。
 
+D1 supports SQLite FTS5, but this adapter intentionally keeps the current
+`instr`-based folded-column search. Native compatibility requires substring,
+field, negation, and status semantics that are not a direct FTS5 mapping, and
+Cloudflare database export requires virtual FTS tables to be recreated. FTS5
+remains an optional later index, not the metadata source of truth.
+
+Shared Downloader portability is preserved at the capability boundary:
+`Downloader::with_platform` consumes the same `HttpClient`, `RateLimiter`,
+`NovelRepository`, and storage traits on native and Worker targets. The current
+Worker fetch API is intentionally read-only; downloader execution and bundled
+site definitions remain separate deployment work rather than a second HTTP
+stack.
+
+Local D1 verification (`wrangler d1 migrations apply narou-rs --local`) applies
+both migrations. `EXPLAIN QUERY PLAN` uses
+`novels_sitenames_fold_idx` for site filters and `novels_ncode_fold_idx` for
+ncode lookup; status search still performs a correlated tag subquery by design.
+This keeps the current search semantics explicit until a derived status key is
+introduced.
+
+Status sorting now uses the derived `novels.status_sort` column from
+`0003_status_sort.sql`; upsert and freeze mutations refresh it in the same D1
+batch. A local `EXPLAIN QUERY PLAN` confirms `novels_status_sort_idx` is used
+for status ordering, while status text search intentionally retains its
+correlated compatibility expression.
+
 `worker-build --release` の今回の出力は `index_bg.wasm` 1,831,053 bytes、`index.js` 27,134 bytes。生成物は `worker_entry/build/` 以下でgit管理しない。
 - Panic policy: application/platform APIs return `Result`; `worker_entry` does not add a blanket `catch_unwind` or convert panics into success. Runtime event wrappers own rejected-event behavior; HTTP handlers reserve explicit 401/404/405/503 responses for boundary failures.
 - `.github/workflows/platform.yml` は native check/test/clippy、worker-runtime の wasm check、`worker-build --release` を分離して実行する。Clippy は既存コードに多数の警告が残るため、警告は既存 baseline として扱い、段階的に解消する。
