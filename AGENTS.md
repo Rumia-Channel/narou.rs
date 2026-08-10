@@ -244,9 +244,9 @@ sample/
 - `sample/narou/lib/novelsetting.rb` — 設定定義
 - `sample/narou/lib/command/*.rb` — 各コマンド実装 (help/CLI挙動の参照元)
 
-## Current Status (2026-07)
+## Current Status (2026-08-10)
 
-### プラットフォーム抽象化 (Phase 1-4: 2026-08)
+### プラットフォーム抽象化 (Phase 1-5 完了、Phase 6 skeleton: 2026-08)
 - **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。Phase 4のsmall object / large asset境界、logical key、native mapping、remaining native FSも記録。
 - **Phase 1 完了**: `src/platform/` に traits（HttpClient / Clock / RateLimiter / ObjectStore / NovelRepository）+ テスト用 mock（MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter / SystemClock）を導入。
 - `NarouError::Http` は `reqwest::Error` の直接 `#[from]` をやめ String 化。`Platform(String)` variant 追加。core から reqwest 型が error 経由で漏れるのを防止。
@@ -271,6 +271,13 @@ sample/
   - `src/native/converter.rs` / `src/native/downloader.rs` にzero-argument native constructorsを隔離し、coreからNativeHttpClient / NativeObjectStore / NativeNovelRepositoryを直接参照しない。
   - `MemoryObjectStore` async/paged/chunked fake、PersistenceService fixed-clock、NativeObjectStore layout/existing-data compatibility testsを追加。
 - **Phase 5開始条件**: Inventory/settings、site definition loader、downloader info cache、Web固有FS、converter/settings/ini/inspector/user-converter/section-convert-cache、converter/deviceのsubprocess/tempdirはnative-only境界として残し、Web service層化で再設計する。content blobをLISTでmetadata DB化しない。
+
+### Phase 6 Worker skeleton (2026-08-10)
+- `narou_rs` の `worker-runtime` feature は `application`、`platform`、portable `db`/`converter::ini` のみを公開する。CLI、Web、native HTTP、filesystem、process、settings adapters は `native-runtime` gate の内側に置く。
+- `worker_entry/` は `workers-rs 0.8.5` の `fetch` / `scheduled` / `queue` eventだけを公開する。`composition.rs` が `AppServices` を構成し、Worker固有型をcoreへ逆流させない。
+- Worker skeleton の capability は in-memory repository/object store、empty site/settings providers、no-op self-updateに限定する。D1 / Wasabi / HTTP fetch /実ジョブ実行を偽装しない。Phase 7でnative-independent adapterを追加する。
+- Queue payloadはversioned `WorkerJobEnvelope`（現行version `1`）。未知versionは処理せずretryする。panicを成功へ変換するcatch-allは置かず、application/platform errorは`Result`で返す。
+- Workerのnative依存監査ではrootの`reqwest` / `curl` / `axum` / `tokio`とCLI crateを`worker-runtime`から除外する。`workers-rs`自身のwasm-compatible transitive dependencyはSDK更新時に再確認する。
 
 ### 最近の追加 (2026-05〜07)
 - **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1 で従来の逐次動作、フォース指定・ウェブモード・ドメインが1種類のときは自動的に逐次にフォールバック

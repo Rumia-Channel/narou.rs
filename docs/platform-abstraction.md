@@ -314,19 +314,31 @@ pub trait NovelRepository: PlatformService {
 - `db::refresh()` は Web の subprocess 実行後に native の共有メモリを再読込するため残す。
 - `remove_migrated_novel_dir` の path 参照判定は `scan_ids` と `get` を使うが、実ファイル削除自体は Phase 4 の ObjectStore 対象。
 
-## 6. Worker implementation（Phase 6-8 の予定）
+## 6. Worker implementation（Phase 6 skeleton）
 
-| 実装 | 技術 | 備考 |
+| 実装 | 技術 | 状態 |
 |---|---|---|
-| `WorkerHttpClient` | `worker::Fetch`（Web Fetch API） | redirect は Fetch API のデフォルト（follow）を使い、必要なら手動追跡。UA/header は FetchInit |
-| `WasabiObjectStore` | S3-compatible（WebARENA Wasabi） | `aws` 系クレート or 手書き SigV4。bucket/endpoint/region/keys は Worker binding / secrets から注入し、core へ漏らさない |
-| `D1NovelRepository` | `worker::D1` | novels / tags / novel_tags / settings / jobs / crawl_state テーブル + index（Phase 7） |
-| `WorkerRateLimiter` | Durable Object / D1 永続化 | サイト別間隔を永続化（crawl_state） |
-| `WorkerClock` | `Date::now()` を chrono に変換 | SystemClock で足りる可能性が高い |
-| `WorkerJobQueue` | Cloudflare Queues | Job enum を JSON 化して enqueue |
-| `CronScheduler` | `#[event(scheduled)]` + Durable Object Alarm | 5 秒間隔の外部アクセス制御は scheduler 側で |
+| portable core crate | `narou_rs` の `worker-runtime` feature | 完了。native-only modules は feature gate |
+| `worker_entry` composition root | `AppServices` + in-memory platform mocks | 完了。D1/Wasabi adapterへ差し替え可能な境界を固定 |
+| fetch / scheduled / queue handlers | `workers-rs` `0.8.5` event macros | 完了。business logic は composition root の core serviceへ委譲 |
+| `worker-build` / Wrangler | `worker_entry/wrangler.toml` | 完了。queue consumer設定を含む |
+| `WorkerHttpClient` / `WasabiObjectStore` / `D1NovelRepository` | Workers bindings | Phase 7。今回の skeleton では未実装 |
 
-Worker entrypoint（`worker_entry/`）は fetch / scheduled / queue の 3 エントリだけを持ち、business logic は core service を呼ぶだけにする。
+`worker_entry/` は fetch / scheduled / queue の3エントリだけを持つ。`composition.rs` が唯一のサービス構成点であり、Worker固有型を application/platform coreへ持ち込まない。
+Queue payload は `WorkerJobEnvelope { version: 1, job: ... }` とし、未知 version は処理せず retry する。D1/Wasabiや実ジョブ実行は Phase 7-8へ残す。
+
+`worker-build --release` の今回の出力は `index_bg.wasm` 492.9 KB、`index.js` 21.8 KB。生成物は `worker_entry/build/` 以下でgit管理しない。
+- Panic policy: application/platform APIs return `Result`; `worker_entry` does not add a blanket `catch_unwind` or convert panics into success. Runtime event wrappers own rejected-event behavior; explicit HTTP error mapping is Phase 7 work.
+- `.github/workflows/platform.yml` では native check/test/clippy、worker-runtime の wasm check、`worker-build --release` を分離して実行する。Clippy は既存コードに多数の警告が残るため、警告は Phase 6 の既存 baseline として扱い、段階的に解消する。
+
+検証コマンド:
+
+```text
+npx wrangler dev（cwd: worker_entry、ローカル確認時）
+cargo check --workspace --all-targets
+cargo check -p narou_worker --target wasm32-unknown-unknown
+worker-build --release（cwd: worker_entry）
+```
 
 ## 7. data flow（目標形）
 
@@ -361,13 +373,12 @@ Worker (worker_entry)
 ## 9. migration phases
 
 | Phase | 内容 | 完了条件 |
-|---|---|---|
 | 1（完了） | `src/platform/`（traits + mocks）作成、`NarouError` の reqwest 直依存除去、`HttpFetcher` に `HttpClient` 実装、native ラッパ | build / test / clippy 通過。外部挙動変化なし |
 | 2（完了） | downloader を trait 利用へ（fetch_text/fetch_bytes/resolve_final_url を HttpClient 経由に） | downloader から blocking HTTP 直呼びを排除（native 実装内部を除く） |
 | 3（完了） | async `NovelRepository`、typed filter/sort/query、keyset `scan_ids`、atomic ID reservation、batch mutation を導入。Downloader / CLI / Web の NovelRecord 操作を repository 経由へ移行 | native YAML compatibility、Memory/mock、Downloader repository injection、Web list pagination-ready、全テスト通過 |
 | 4（完了） | async ObjectStore/AssetStore、logical key、NativeObjectStore、downloader persistence、illustration binary境界、converter HttpClient注入 | native compatibility、Memory/native persistence tests、core主要content FS除去 |
 | 5 | Web UI を service 層経由に | web から DB/FS 直アクセスが service 経由に |
-| 6 | Worker backend skeleton（worker_entry + feature 分離） | `cargo build --features worker-runtime` が通る |
+| 6（skeleton 完了） | Worker backend skeleton（`worker_entry` + feature 分離 + Wrangler） | workspace native check、portable wasm check、`worker-build --release` が通る |
 | 7 | D1 NovelRepository / Wasabi ObjectStore / Worker fetch | Worker で単純 HTTP fetch + D1 + Wasabi が動作 |
 | 8 | Queues / crawler / scheduling（Cron + Durable Object） | 外部サイト 5 秒間隔制御が Worker で動作 |
 
