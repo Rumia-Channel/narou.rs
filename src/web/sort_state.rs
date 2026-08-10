@@ -154,8 +154,9 @@ pub(crate) fn sort_records(records: &mut Vec<NovelRecord>, sort_state: &CurrentS
     });
 }
 
-pub(crate) fn sort_ids_for_request(
+pub(crate) fn sort_ids_from_records(
     ids: &[i64],
+    records: &[NovelRecord],
     sort_state: Option<&serde_json::Value>,
     timestamp: Option<u64>,
 ) -> Vec<i64> {
@@ -163,11 +164,12 @@ pub(crate) fn sort_ids_for_request(
         return ids.to_vec();
     }
     let sort_state = requested_or_current_sort_state(sort_state, timestamp);
-    let novels = crate::native::novel_repository::NativeNovelRepository::new();
-    let mut records: Vec<NovelRecord> = ids
+    let selected = ids.iter().copied().collect::<std::collections::HashSet<_>>();
+    let mut records = records
         .iter()
-        .filter_map(|id| novels.get_sync((*id).into()).ok().flatten())
-        .collect();
+        .filter(|record| selected.contains(&record.id))
+        .cloned()
+        .collect::<Vec<_>>();
     sort_records(&mut records, &sort_state);
     records.into_iter().map(|record| record.id).collect()
 }

@@ -3,6 +3,7 @@ mod output_macros;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub mod application;
 pub mod compat;
 pub mod converter;
 pub mod db;

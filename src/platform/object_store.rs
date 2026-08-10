@@ -282,6 +282,10 @@ impl NovelObjectKeys {
         self.child("replace.txt")
     }
 
+    pub fn diff(&self) -> ObjectKey {
+        self.child("diff.txt")
+    }
+
     pub fn illustration(&self, filename: &str) -> Result<ObjectKey> {
         let filename = sanitize_key_component(filename);
         self.child_checked(&format!("挿絵/{filename}"))

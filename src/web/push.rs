@@ -761,7 +761,9 @@ mod tests {
             port: 4000,
             ws_port: 4001,
             push_server: Arc::new(push_server),
-            novels: Arc::new(crate::platform::mocks::MemoryNovelRepository::new()),
+            services: crate::web::default_app_services(Arc::new(
+                crate::platform::mocks::MemoryNovelRepository::new(),
+            )),
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
             allowed_request_hosts: vec!["localhost".to_string()],
@@ -823,7 +825,9 @@ mod tests {
             port: 4000,
             ws_port: 4001,
             push_server: Arc::new(push_server),
-            novels: Arc::new(crate::platform::mocks::MemoryNovelRepository::new()),
+            services: crate::web::default_app_services(Arc::new(
+                crate::platform::mocks::MemoryNovelRepository::new(),
+            )),
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
             allowed_request_hosts: vec!["localhost".to_string()],
@@ -1028,7 +1032,9 @@ mod tests {
             port: 4000,
             ws_port: 4001,
             push_server: Arc::new(push_server),
-            novels: Arc::new(crate::platform::mocks::MemoryNovelRepository::new()),
+            services: crate::web::default_app_services(Arc::new(
+                crate::platform::mocks::MemoryNovelRepository::new(),
+            )),
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
             allowed_request_hosts: vec!["localhost".to_string()],

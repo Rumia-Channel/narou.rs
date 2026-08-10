@@ -1,7 +1,7 @@
 # Platform Abstraction & Cloudflare Workers 対応設計
 
-> ステータス: Phase 1・2・3・4 完了（Phase 5 は未着手）
-> 対象: narou.rs v0.3.6 以降（2026-08-09 時点の refactor-platform-abstraction）
+> ステータス: Phase 1・2・3・4 完了、Phase 5 アプリケーションサービス移行（2026-08-10 時点）
+> 対象: narou.rs v0.3.6 以降（2026-08-10 時点の refactor-platform-abstraction）
 > 方針の一次資料: ユーザー提供リファクタリング指示（最重要原則・禁止事項・設計上の優先順位に従う）
 
 ## 0. 設計判断の前提
@@ -24,8 +24,8 @@
 | native 専用として残す | `src/bin/updater.rs`, `src/updater_promote.rs` | 自己更新: ファイル置換・rename・permissions（Windows rename 問題、unix PermissionsExt） |
 | native 専用として残す | `src/converter/device.rs` | AozoraEpub3 / kindlegen 実行、epub/zip 組立、tempdir（~17 sites） |
 | native 専用として残す | `src/compat.rs` | dir fsync、backup zip、copy-to、java 解決（~12 sites） |
-| native 専用として残す | `src/web/*.rs`（update/worker/scheduler/jobs） | self-reexec、updater spawn、server.pid |
-| native 専用として残す | `src/commands/{web,log,convert,csv,manage,clean,illust,send,diff,update}.rs` | cwd 起点の pid / hotentry / ログ / CSV / キャッシュ操作 |
+| native 専用として残す | `src/web/{update,worker,scheduler,jobs}.rs` | self-reexec、updater spawn、queue worker、filesystem diff compatibility、server.pid |
+| Phase 5 完了 | `src/application/*` | Web use-case、validation、schedule policy、job planning、settings effects、event ports。web/native/framework型を参照しない |
 | 抽象化対象 | `src/db/inventory.rs` | 設定 YAML の atomic write / lock（fs2）/ metadata（~12 sites） |
 | 抽象化対象 | `src/db/database.rs` | `小説データ/` archive root の create_dir_all 等 |
 | Phase 4 完了 | `src/downloader/persistence.rs` | codec + `PersistenceService` は logical `ObjectKey` / async `ObjectStore` 経由。旧 Path API は `src/native/legacy_persistence.rs` の互換ラッパー |
@@ -38,20 +38,20 @@
 | 抽象化対象 | `src/mail.rs` | メール設定 YAML / preset コピー / 添付読込 |
 | 抽象化対象 | `src/queue.rs` | queue.yaml 読込書込（sentinel / atomic write） |
 | 抽象化対象 | `src/logger.rs` | ログファイル append（native のみで良い可能性が高い） |
-| 抽象化対象 | `src/web/{global_settings,novel_settings,misc,jobs}.rs` | replace.txt / notepad.txt 読込書込 |
+| Phase 5 残存 | `src/web/{global_settings,novel_settings,misc,jobs}.rs` | replace.txt / notepad.txt と差分表示の既存 layout 互換。application settings/content serviceへ段階移行中 |
 | 論理キー化 | `src/db/paths.rs` | `novel_dir_from_components` / `novel_dir_for_record` / `ensure_within_archive_root` |
 
 ### 1.2 ネットワーク / プロセス / 並行性
 
 | 分類 | 箇所 | 内容 |
 |---|---|---|
-| 抽象化対象 | `src/downloader/fetch.rs` | `HttpFetcher`: `reqwest::blocking::Client` x2、curl crate、wget subprocess、redirect policy、tier fallback、rate limiter、timeout |
-| 抽象化対象 | `src/downloader/narou_api.rs` | なろう API batch（blocking GET） |
-| 抽象化対象 | `src/downloader/novel_info.rs` | 小説情報 GET（blocking client を受け取る） |
-| 抽象化対象 | `src/downloader/rate_limit.rs` | `sleep()` による blocking rate limit + async 版（tokio） |
-| 抽象化対象 | `src/commands/update.rs` | general_lastup API 用 blocking GET |
-| 抽象化対象 | `src/converter/mod.rs` | 挿絵 fetch（curl crate 直接使用） |
-| native 専用 | `src/web/misc.rs`, `src/web/update.rs` | GitHub API / 自己更新ダウンロード（async reqwest） |
+| Phase 2 完了 | `src/downloader/http_policy.rs`, `src/native/http.rs` | HTTP policy と native transport を分離。旧 `fetch.rs` は削除済み |
+| Phase 2 完了 | `src/downloader/narou_api.rs` | 注入 `HttpClient` 経由のなろう API batch |
+| Phase 2 完了 | `src/downloader/novel_info.rs` | 注入 transport 経由の小説情報取得 |
+| Phase 2 完了 | `src/downloader/rate_limit.rs` | platform `RateLimiter` 経由の async rate limit |
+| Phase 5 残存 | `src/commands/update.rs` | CLI互換の general_lastup API 実行は native command boundary |
+| Phase 4 完了 | `src/converter/mod.rs` | 挿絵 fetchは `ConverterCapabilities` の `HttpClient` / `RateLimiter` 経由。native wiringは `src/native/converter.rs` |
+| native 専用 | `src/web/misc.rs`, `src/web/update.rs` | GitHub API / 自己更新ダウンロード（async reqwest）。Worker capabilityは後続フェーズ |
 | native 専用 | `src/compat.rs` | taskkill / where / explorer / xdg-open |
 | native 専用 | `src/commands/{download,update}.rs`, `src/web/{worker,scheduler,jobs}.rs` | 自己 re-exec、relay thread、spawn |
 | native 専用 | `src/mail.rs` | SMTP（lettre）、mpsc による結果受信 |

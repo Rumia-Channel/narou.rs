@@ -1,72 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::compat;
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::error::Result;
 
-const TAG_COLOR_ORDER: [&str; 7] = ["green", "yellow", "blue", "magenta", "cyan", "red", "white"];
-pub const NEW_TAG_COLOR_SETTING: &str = "webui.new-tag-color";
-pub const TAG_COLOR_DEFAULT: &str = "default";
-
-#[derive(Debug, Clone, Default)]
-pub struct TagColors {
-    order: Vec<String>,
-    colors: HashMap<String, String>,
-}
-
-impl TagColors {
-    pub fn into_map(self) -> HashMap<String, String> {
-        self.colors
-    }
-
-    pub fn color_for(&self, tag: &str) -> Option<&str> {
-        self.colors.get(tag).map(String::as_str)
-    }
-
-    pub fn contains(&self, tag: &str) -> bool {
-        self.colors.contains_key(tag)
-    }
-
-    pub fn remove(&mut self, tag: &str) {
-        self.colors.remove(tag);
-        self.order.retain(|name| name != tag);
-    }
-
-    pub fn set(&mut self, tag: &str, color: &str) {
-        if !self.colors.contains_key(tag) {
-            self.order.push(tag.to_string());
-        }
-        self.colors.insert(tag.to_string(), color.to_string());
-    }
-
-    pub fn set_color(&mut self, tag: &str, color: &str, no_overwrite_color: bool) -> bool {
-        if no_overwrite_color && self.colors.contains_key(tag) {
-            return false;
-        }
-
-        if !self.colors.contains_key(tag) {
-            self.order.push(tag.to_string());
-        }
-
-        if self.colors.get(tag).is_some_and(|current| current == color) {
-            return false;
-        }
-        self.colors.insert(tag.to_string(), color.to_string());
-        true
-    }
-}
-
-pub fn is_valid_tag_color(color: &str) -> bool {
-    TAG_COLOR_ORDER.contains(&color)
-}
-
-pub fn is_valid_new_tag_color_value(color: &str) -> bool {
-    color == TAG_COLOR_DEFAULT || is_valid_tag_color(color)
-}
-
-pub fn tag_color_names() -> &'static [&'static str] {
-    &TAG_COLOR_ORDER
-}
+pub use crate::application::tag_colors::{
+    ensure_tag_colors_with_default_color, is_valid_new_tag_color_value, is_valid_tag_color,
+    tag_color_names, MemoryTagColorStore, TagColorService, TagColorStore, TagColors,
+    NEW_TAG_COLOR_SETTING, TAG_COLOR_DEFAULT,
+};
 
 pub fn load_tag_colors(inventory: &Inventory) -> Result<TagColors> {
     let raw = inventory.load_raw("tag_colors", InventoryScope::Local)?;
@@ -124,47 +66,16 @@ pub fn save_tag_colors(inventory: &Inventory, tag_colors: &TagColors) -> Result<
 }
 
 /// Assigns colors to any `tags` not already present in `tag_colors`, using the
-/// user-configured default color (falling back to rotation through
-/// `TAG_COLOR_ORDER` when unset or invalid).
+/// user-configured default color (falling back to rotation through the
+/// standard color order when unset or invalid).
 ///
 /// # Warning: do not call while holding the `DATABASE` lock
-///
-/// This function calls [`configured_new_tag_color`], which reads settings via
-/// `crate::db::with_database`. `db::DATABASE` is a `parking_lot::Mutex`,
-/// which is NOT reentrant, so calling this function from inside a
-/// `with_database` / `with_database_mut` closure will deadlock the current
-/// thread (and, since the lock is never released, every subsequent
-/// operation that touches the database).
-///
-/// If you already hold the database lock, fetch the color *before* entering
-/// the closure with `let color = configured_new_tag_color();` and call
-/// [`ensure_tag_colors_with_default_color`] with `color.as_deref()` instead.
 pub fn ensure_tag_colors<'a>(
     tag_colors: &mut TagColors,
     tags: impl IntoIterator<Item = &'a str>,
 ) -> bool {
     let configured_color = configured_new_tag_color();
     ensure_tag_colors_with_default_color(tag_colors, tags, configured_color.as_deref())
-}
-
-pub fn ensure_tag_colors_with_default_color<'a>(
-    tag_colors: &mut TagColors,
-    tags: impl IntoIterator<Item = &'a str>,
-    default_color: Option<&str>,
-) -> bool {
-    let default_color = default_color.filter(|color| is_valid_tag_color(color));
-    let mut changed = false;
-    for tag in tags {
-        if tag_colors.colors.contains_key(tag) {
-            continue;
-        }
-        let next_color = default_color
-            .unwrap_or_else(|| next_tag_color(tag_colors))
-            .to_string();
-        tag_colors.set(tag, &next_color);
-        changed = true;
-    }
-    changed
 }
 
 pub fn configured_new_tag_color() -> Option<String> {
@@ -179,21 +90,6 @@ fn normalize_default_color(raw: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-fn next_tag_color(tag_colors: &TagColors) -> &str {
-    let last_color = tag_colors
-        .order
-        .iter()
-        .rev()
-        .find_map(|tag| tag_colors.colors.get(tag))
-        .map(String::as_str)
-        .unwrap_or(TAG_COLOR_ORDER[TAG_COLOR_ORDER.len() - 1]);
-    let current_index = TAG_COLOR_ORDER
-        .iter()
-        .position(|color| *color == last_color)
-        .unwrap_or(TAG_COLOR_ORDER.len() - 1);
-    TAG_COLOR_ORDER[(current_index + 1) % TAG_COLOR_ORDER.len()]
 }
 
 #[cfg(test)]

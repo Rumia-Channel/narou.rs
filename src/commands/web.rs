@@ -89,13 +89,24 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         std::process::exit(1);
     }
     let control_token = generate_control_token();
-    let root_dir = match Inventory::with_default_root() {
-        Ok(inventory) => inventory.root_dir().to_path_buf(),
+    let inventory = match Inventory::with_default_root() {
+        Ok(inventory) => Arc::new(inventory),
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     };
+    let root_dir = inventory.root_dir().to_path_buf();
+    let native_services =
+        match narou_rs::native::application::NativeAppServices::new(inventory.clone()) {
+            Ok(services) => services,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
+    let site_updates = native_services.site_updates;
+    let services = native_services.services;
     let queue =
         match narou_rs::queue::PersistentQueue::new(&root_dir.join(".narou").join("queue.yaml")) {
             Ok(queue) => Arc::new(queue),
@@ -114,7 +125,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         port: address.port,
         ws_port: address.ws_port,
         push_server: push_server.clone(),
-        novels: Arc::new(narou_rs::native::novel_repository::NativeNovelRepository::new()),
+        services: services.clone(),
         basic_auth_header: security_settings.basic_auth_header,
         control_token: control_token.clone(),
         allowed_request_hosts,
@@ -167,6 +178,8 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         root_dir.clone(),
         queue.clone(),
         push_server.clone(),
+        services.library.clone(),
+        site_updates,
         running_jobs.clone(),
         running_child_pids,
         cancelled_job_ids,

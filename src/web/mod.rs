@@ -29,15 +29,14 @@ use tokio::task::JoinHandle;
 
 pub(crate) const MAX_WEB_TARGETS_PER_REQUEST: usize = 100_000;
 
-/// Effective per-request target cap. Reads `server-max-targets-per-request`
-/// from `~/.narousetting/global_setting.yaml` if present (must be > 0),
-/// otherwise falls back to [`MAX_WEB_TARGETS_PER_REQUEST`].
-pub(crate) fn max_web_targets_per_request() -> usize {
-    crate::compat::load_global_setting_value("server-max-targets-per-request")
-        .and_then(|v| v.as_u64())
-        .filter(|&n| n > 0)
-        .map(|n| n as usize)
-        .unwrap_or(MAX_WEB_TARGETS_PER_REQUEST)
+/// Effective per-request target cap, resolved through the application
+/// settings port.
+pub(crate) async fn max_web_targets_per_request(state: &AppState) -> usize {
+    state
+        .services
+        .settings
+        .web_target_limit(MAX_WEB_TARGETS_PER_REQUEST)
+        .await
 }
 pub(crate) const MAX_WEB_TAGS_PER_REQUEST: usize = 128;
 pub(crate) const MAX_WEB_TARGET_LENGTH: usize = 4096;
@@ -54,7 +53,7 @@ pub struct AppState {
     pub port: u16,
     pub ws_port: u16,
     pub push_server: Arc<push::PushServer>,
-    pub novels: Arc<dyn crate::platform::NovelRepository>,
+    pub services: Arc<crate::application::AppServices>,
     pub basic_auth_header: Option<String>,
     pub control_token: String,
     pub allowed_request_hosts: Vec<String>,
@@ -68,13 +67,68 @@ pub struct AppState {
     pub auto_update_scheduler: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
 }
 
-pub(crate) fn non_external_console_target() -> &'static str {
-    if crate::compat::load_local_setting_bool("concurrency") {
-        "stdout2"
-    } else {
-        "stdout"
-    }
+pub(crate) fn default_app_services(
+    novels: Arc<dyn crate::platform::NovelRepository>,
+) -> Arc<crate::application::AppServices> {
+    let objects: Arc<dyn crate::platform::ObjectStore> =
+        Arc::new(crate::platform::mocks::MemoryObjectStore::new());
+    let freeze_store: Arc<dyn crate::application::FreezeStore> =
+        Arc::new(crate::application::SystemFreezeStore);
+    let library = Arc::new(crate::application::LibraryService::new(
+        novels.clone(),
+        Arc::new(crate::platform::clock::SystemClock),
+        freeze_store.clone(),
+        Arc::new(crate::application::EmptySiteTimezoneProvider),
+    ));
+    let actions = Arc::new(crate::application::NovelActionService::new(
+        novels.clone(),
+        freeze_store,
+        Arc::new(crate::application::NoopFreezeMutationStore),
+        Some(objects.clone()),
+    ));
+    let settings_store: Arc<dyn crate::application::SettingsStore> =
+        Arc::new(crate::application::MemorySettingsStore::new());
+    let settings = Arc::new(crate::application::SettingsService::new(settings_store));
+    let novel_settings = Arc::new(crate::application::NovelSettingsService::new(
+        novels.clone(),
+        objects.clone(),
+    ));
+    let content = Arc::new(crate::application::NovelContentService::new(
+        novels,
+        objects,
+    ));
+    let tag_colors = Arc::new(crate::application::TagColorService::new(Arc::new(
+        crate::application::MemoryTagColorStore::default(),
+    )));
+    let scheduler = Arc::new(crate::application::SchedulerService::new(Arc::new(
+        crate::platform::clock::SystemClock,
+    )));
+    Arc::new(crate::application::AppServices::new(
+        library,
+        actions,
+        novel_settings,
+        content,
+        settings,
+        tag_colors,
+        scheduler,
+        Arc::new(crate::application::EmptySiteDefinitionProvider),
+        Arc::new(crate::application::NoopSelfUpdateService),
+        Arc::new(crate::application::EmptyWebActionService),
+    ))
 }
+pub(crate) async fn configured_tag_color(state: &AppState) -> Option<String> {
+    state
+        .services
+        .settings
+        .get(crate::tag_colors::NEW_TAG_COLOR_SETTING)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| crate::tag_colors::is_valid_tag_color(value))
+}
+
 
 pub(crate) fn normalize_web_device_override(value: Option<&str>) -> Result<Option<String>, String> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -745,7 +799,9 @@ mod tests {
             port: 8080,
             ws_port: 8081,
             push_server: Arc::new(push_server),
-            novels: Arc::new(crate::platform::mocks::MemoryNovelRepository::new()),
+            services: super::default_app_services(Arc::new(
+                crate::platform::mocks::MemoryNovelRepository::new(),
+            )),
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
             allowed_request_hosts: vec!["127.0.0.1".to_string(), "localhost".to_string()],
@@ -770,7 +826,9 @@ mod tests {
             port: 8080,
             ws_port: 8081,
             push_server: Arc::new(push_server),
-            novels: Arc::new(crate::platform::mocks::MemoryNovelRepository::new()),
+            services: super::default_app_services(Arc::new(
+                crate::platform::mocks::MemoryNovelRepository::new(),
+            )),
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
             allowed_request_hosts: extra_hosts,

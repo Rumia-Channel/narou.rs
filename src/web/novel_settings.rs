@@ -1,74 +1,65 @@
 use std::collections::HashMap;
-use std::path::Path as FsPath;
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Json,
 };
-use serde::Serialize;
 
 use crate::converter::ini::{IniData, IniValue};
-use crate::converter::settings::load_replace_patterns;
-use crate::db::with_database;
-use crate::error::NarouError;
 use crate::setting_info::{VarInfo, VarType, original_setting_var_infos};
 
 use super::AppState;
 use super::state::{ApiResponse, IdPath};
 
-#[derive(Debug, Serialize)]
-struct NovelSettingEntry {
-    name: String,
-    help: String,
-    var_type: VarType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    select_keys: Option<Vec<String>>,
-    value: serde_json::Value,
+
+fn map_application_error(error: crate::application::ApplicationError) -> (StatusCode, String) {
+    match error {
+        crate::application::ApplicationError::InvalidRequest(message) => {
+            (StatusCode::BAD_REQUEST, message)
+        }
+        crate::application::ApplicationError::NotFound(message) => {
+            (StatusCode::NOT_FOUND, message)
+        }
+        crate::application::ApplicationError::Platform(message) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, message)
+        }
+    }
 }
 
 pub async fn get_settings(
     State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let record = state
-        .novels
-        .get(id.into())
+    let view = state
+        .services
+        .novel_settings
+        .load(id.into())
         .await
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("ID: {}", id)))?;
-
-    let novel_dir = with_database(|db| {
-        super::safe_existing_novel_dir(db.archive_root(), &record)
-            .map_err(NarouError::Database)
-    })
-    .map_err(|e| {
-        eprintln!("web load novel settings directory failed for {}: {}", id, e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "設定の読み込みに失敗しました".to_string(),
-        )
-    })?;
-
-    let ini_path = novel_dir.join("setting.ini");
-    let ini = IniData::load_file(&ini_path)
-        .map_err(|e| {
-            eprintln!("web load setting.ini failed for {}: {}", id, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "設定の読み込みに失敗しました".to_string(),
-            )
-        })?;
-    let replace_patterns: Vec<serde_json::Value> = load_replace_patterns(&novel_dir.join("replace.txt"))
-        .into_iter()
-        .map(|(left, right)| serde_json::json!({ "left": left, "right": right }))
+        .map_err(map_application_error)?;
+    let settings: Vec<serde_json::Value> = view
+        .settings
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "name": entry.name,
+                "help": entry.help,
+                "var_type": entry.var_type,
+                "select_keys": entry.select_keys,
+                "value": ini_value_to_json(entry.value.as_ref()),
+            })
+        })
         .collect();
-    let settings = build_setting_entries(&ini);
+    let replace_patterns: Vec<serde_json::Value> = view
+        .replace_patterns
+        .iter()
+        .map(|pattern| serde_json::json!({ "left": pattern.left, "right": pattern.right }))
+        .collect();
 
     Ok(Json(serde_json::json!({
-        "id": id,
-        "title": record.title,
-        "author": record.author,
+        "id": view.id,
+        "title": view.title,
+        "author": view.author,
         "settings": settings,
         "replace_patterns": replace_patterns,
     })))
@@ -79,72 +70,69 @@ pub async fn save_settings(
     Path(IdPath { id }): Path<IdPath>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
-    let record = state
-        .novels
-        .get(id.into())
-        .await
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("ID: {}", id)))?;
-
-    let novel_dir = with_database(|db| {
-        super::safe_existing_novel_dir(db.archive_root(), &record)
-            .map_err(NarouError::Database)
-    })
-    .map_err(|e| {
-        eprintln!("web resolve novel settings directory failed for {}: {}", id, e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "設定の保存に失敗しました".to_string(),
-        )
-    })?;
-
-    let mut ini = IniData::load_file(&novel_dir.join("setting.ini"))
-        .map_err(|e| {
-            eprintln!("web load setting.ini for save failed for {}: {}", id, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "設定の保存に失敗しました".to_string(),
-            )
-        })?;
     let setting_map = body
         .get("settings")
         .and_then(|v| v.as_array())
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "settings array required".to_string()))?;
-    let known_vars: HashMap<&'static str, VarInfo> = original_setting_var_infos()
-        .into_iter()
-        .collect();
-
+    let known_vars: HashMap<&'static str, VarInfo> =
+        original_setting_var_infos().into_iter().collect();
+    let mut settings = HashMap::new();
     for item in setting_map {
         let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
             continue;
         };
         let Some(info) = known_vars.get(name) else {
-            continue;
+            return Err((StatusCode::BAD_REQUEST, format!("不明な設定名です: {name}")));
         };
         let value = item.get("value").unwrap_or(&serde_json::Value::Null);
-        apply_setting_value(&mut ini, name, info, value)
+        let mut parsed = IniData::new();
+        apply_setting_value(&mut parsed, name, info, value)
             .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+        settings.insert(name.to_string(), parsed.get_global(name).cloned());
     }
 
-    ini.save(&novel_dir.join("setting.ini"))
-        .map_err(|e| {
-            eprintln!("web save setting.ini failed for {}: {}", id, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "設定の保存に失敗しました".to_string(),
-            )
-        })?;
-
-    if let Some(patterns) = body.get("replace_patterns").and_then(|v| v.as_array()) {
-        save_replace_patterns(&novel_dir.join("replace.txt"), patterns)
-            .map_err(|e| {
-                eprintln!("web save replace.txt failed for {}: {}", id, e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "replace.txt の保存に失敗しました".to_string(),
-                )
+    let replace_patterns = body
+        .get("replace_patterns")
+        .map(|value| {
+            let values = value.as_array().ok_or_else(|| {
+                (StatusCode::BAD_REQUEST, "replace_patterns must be an array".to_string())
             })?;
-    }
+            values
+                .iter()
+                .map(|value| {
+                    let left = value
+                        .get("left")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| {
+                            (StatusCode::BAD_REQUEST, "replace pattern left is required".to_string())
+                        })?;
+                    let right = value
+                        .get("right")
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| {
+                            (StatusCode::BAD_REQUEST, "replace pattern right is required".to_string())
+                        })?;
+                    Ok(crate::application::ReplacePattern {
+                        left: left.to_string(),
+                        right: right.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, (StatusCode, String)>>()
+        })
+        .transpose()?;
+
+    state
+        .services
+        .novel_settings
+        .save(
+            id.into(),
+            &crate::application::NovelSettingsPatch {
+                settings,
+                replace_patterns,
+            },
+        )
+        .await
+        .map_err(map_application_error)?;
 
     Ok(Json(ApiResponse {
         success: true,
@@ -161,19 +149,6 @@ pub async fn list_devices(State(_state): State<AppState>) -> Json<serde_json::Va
     Json(serde_json::json!({ "devices": list }))
 }
 
-fn build_setting_entries(ini: &IniData) -> Vec<NovelSettingEntry> {
-    let global = ini.global_section();
-    original_setting_var_infos()
-        .into_iter()
-        .map(|(name, info)| NovelSettingEntry {
-            name: name.to_string(),
-            help: info.help.to_string(),
-            var_type: info.var_type,
-            select_keys: info.select_keys,
-            value: ini_value_to_json(global.get(name)),
-        })
-        .collect()
-}
 
 fn ini_value_to_json(value: Option<&IniValue>) -> serde_json::Value {
     match value {
@@ -350,46 +325,6 @@ fn parse_multiple_value(
     }
 }
 
-fn save_replace_patterns(
-    path: &FsPath,
-    patterns: &[serde_json::Value],
-) -> std::io::Result<()> {
-    if patterns.len() > super::MAX_WEB_TAGS_PER_REQUEST {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "too many replace patterns",
-        ));
-    }
-    let mut lines = Vec::new();
-    for pattern in patterns {
-        let Some(left) = pattern.get("left").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let left = left.trim();
-        if left.is_empty() {
-            continue;
-        }
-        if left.len() > super::MAX_WEB_TAG_LENGTH {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "replace pattern is too long",
-            ));
-        }
-        let right = pattern
-            .get("right")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
-        if right.len() > super::MAX_WEB_TEXT_INPUT_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "replace pattern replacement is too long",
-            ));
-        }
-        lines.push(format!("{}\t{}", left, right));
-    }
-    std::fs::write(path, lines.join("\n"))
-}
 
 #[cfg(test)]
 mod tests {
@@ -435,42 +370,4 @@ mod tests {
         assert!(ini.get_global("novel_title").is_none());
     }
 
-    #[test]
-    fn replace_patterns_skip_blank_left_side() {
-        let dir = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join("test-artifacts")
-            .join(format!("narou-rs-replace-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        save_replace_patterns(
-            &dir.join("replace.txt"),
-            &[
-                serde_json::json!({"left": "  ", "right": "x"}),
-                serde_json::json!({"left": "a", "right": "b"}),
-            ],
-        )
-        .unwrap();
-        let content = std::fs::read_to_string(dir.join("replace.txt")).unwrap();
-        assert_eq!(content, "a\tb");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn replace_patterns_reject_too_many_entries() {
-        let patterns: Vec<serde_json::Value> = (0..=super::super::MAX_WEB_TAGS_PER_REQUEST)
-            .map(|index| serde_json::json!({"left": format!("k{}", index), "right": "v"}))
-            .collect();
-        let dir = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join("test-artifacts")
-            .join(format!("narou-rs-replace-overflow-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let err = save_replace_patterns(&dir.join("replace.txt"), &patterns).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        let _ = std::fs::remove_dir_all(dir);
-    }
 }

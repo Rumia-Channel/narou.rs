@@ -11,4 +11,9 @@ pub mod downloader;
 pub mod http;
 pub mod legacy_persistence;
 pub mod novel_repository;
+pub mod application;
 pub mod object_store;
+pub mod web_actions;
+pub mod self_update;
+
+pub use application::non_external_console_target;
