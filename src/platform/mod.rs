@@ -17,6 +17,7 @@ pub mod clock;
 pub mod http;
 pub mod mocks;
 pub mod object_store;
+pub mod progress;
 pub mod rate_limiter;
 pub mod repository;
 
@@ -26,7 +27,8 @@ pub use object_store::{
     AssetChunk, AssetStore, AssetStream, GeneratedAssetKey, NovelObjectKeys, ObjectKey,
     ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectStore,
 };
-pub use rate_limiter::{RateLimitScope, RateLimiter};
+pub use progress::ProgressReporter;
+pub use rate_limiter::{normalize_site_key, RateLimitScope, RateLimiter};
 pub use repository::{
     NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, NovelSort, NovelSortKey,
     SearchField, SearchTerm,

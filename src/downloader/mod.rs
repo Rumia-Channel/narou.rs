@@ -1,21 +1,26 @@
 pub mod html;
 pub mod http_policy;
+#[cfg(feature = "native-runtime")]
 pub mod info_cache;
 pub mod narou_api;
 pub mod novel_info;
 pub mod persistence;
 pub mod preprocess;
+#[cfg(feature = "native-runtime")]
 pub mod rate_limit;
 pub mod section;
 pub mod security;
+pub mod settings;
 pub mod site_setting;
 pub mod toc;
 pub mod types;
 pub mod util;
 
 use std::collections::HashMap;
+#[cfg(feature = "native-runtime")]
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{
@@ -24,12 +29,14 @@ use chrono::{
 use chrono_tz::Tz;
 use regex::Regex;
 
+#[cfg(feature = "native-runtime")]
 use self::narou_api::narou_api_batch_update;
 use self::novel_info::NovelInfo;
 use self::persistence::section_filename;
 use self::persistence::{PersistenceService, compute_section_hash};
 use self::section::{SectionCache, download_section};
 use self::security::is_safe_public_url;
+use self::settings::DownloaderSettings;
 use self::site_setting::SiteSetting;
 use self::toc::{
     create_short_story_subtitles, fetch_toc, parse_subtitles, parse_subtitles_multipage,
@@ -42,11 +49,8 @@ use crate::db::novel_record::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::platform::{
     AssetStore, Clock, HttpClient, NovelMutation, NovelObjectKeys, NovelRepository, ObjectStore,
-    RateLimiter,
+    ProgressReporter, RateLimiter,
 };
-use crate::progress::ProgressReporter;
-use crate::progress::safe_println as safe_println_fn;
-use crate::termcolor::bold_colored;
 
 pub use self::types::{
     ARCHIVE_ROOT_DIR, DownloadResult, NarouApiEntry, NarouApiResult, RAW_DATA_DIR,
@@ -55,7 +59,8 @@ pub use self::types::{
 };
 pub use self::util::pretreatment_source;
 
-const SECTION_HASH_CACHE_NAME: &str = "section_hash_cache";
+#[cfg(feature = "native-runtime")]
+pub(crate) const SECTION_HASH_CACHE_NAME: &str = "section_hash_cache";
 const DEFAULT_SITE_TIMEZONE: &str = "Asia/Tokyo";
 
 #[derive(Clone, Copy)]
@@ -108,7 +113,44 @@ pub struct Downloader {
     section_cache: SectionCache,
     section_hash_cache: HashMap<String, HashMap<String, String>>,
     section_hash_cache_dirty: bool,
+    settings: Arc<dyn DownloaderSettings>,
     progress: Option<Box<dyn ProgressReporter>>,
+}
+
+/// Report a status line. Native prints to stdout atomically; Worker routes to
+/// the trace log (no terminal on the platform).
+#[cfg(feature = "native-runtime")]
+fn report_line(line: &str) {
+    crate::progress::safe_println(line);
+}
+
+#[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+fn report_line(line: &str) {
+    tracing::debug!("{line}");
+}
+
+/// Report a warning line. Native prints to stderr; Worker routes to the trace
+/// log.
+#[cfg(feature = "native-runtime")]
+fn report_warn(line: &str) {
+    crate::progress::safe_stderr_println(line);
+}
+
+#[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+fn report_warn(line: &str) {
+    tracing::warn!("{line}");
+}
+
+/// Bold-colored text. Native renders terminal/Web colors; Worker keeps the
+/// plain text so messages are not lost.
+#[cfg(feature = "native-runtime")]
+fn colorize(text: &str, color: &str) -> String {
+    crate::termcolor::bold_colored(text, color)
+}
+
+#[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+fn colorize(text: &str, _color: &str) -> String {
+    text.to_string()
 }
 
 fn ncode_target_url(target: &str) -> Option<String> {
@@ -145,50 +187,6 @@ fn normalize_story_for_compare(story: &str) -> String {
         .join("\n")
         .trim()
         .to_string()
-}
-
-fn load_local_setting_bool(key: &str) -> bool {
-    crate::compat::load_local_setting_bool(key)
-}
-
-fn load_local_setting_string(key: &str) -> Option<String> {
-    crate::compat::load_local_setting_string(key)
-}
-
-fn load_global_setting_optional_bool(key: &str) -> Option<bool> {
-    crate::db::with_database(|db| {
-        let settings: HashMap<String, serde_yaml::Value> = db.inventory().load(
-            "global_setting",
-            crate::db::inventory::InventoryScope::Global,
-        )?;
-        Ok(settings.get(key).and_then(|value| match value {
-            serde_yaml::Value::Bool(v) => Some(*v),
-            serde_yaml::Value::String(v) => Some(matches!(v.as_str(), "true" | "yes" | "on" | "1")),
-            serde_yaml::Value::Number(v) => Some(v.as_i64().unwrap_or(0) != 0),
-            _ => None,
-        }))
-    })
-    .ok()
-    .flatten()
-}
-
-fn save_global_setting_bool(key: &str, value: bool) -> Result<()> {
-    crate::db::with_database_mut(|db| {
-        let mut settings: HashMap<String, serde_yaml::Value> = db
-            .inventory()
-            .load(
-                "global_setting",
-                crate::db::inventory::InventoryScope::Global,
-            )
-            .unwrap_or_default();
-        settings.insert(key.to_string(), serde_yaml::Value::Bool(value));
-        db.inventory().save(
-            "global_setting",
-            crate::db::inventory::InventoryScope::Global,
-            &settings,
-        )?;
-        Ok(())
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,11 +286,14 @@ fn section_relative_path(subtitle: &SubtitleInfo) -> String {
 }
 
 fn cache_timestamp(clock: &dyn Clock) -> Option<String> {
-    if crate::compat::load_local_setting_list("economy")
-        .iter()
-        .any(|v| v == "nosave_diff")
+    #[cfg(feature = "native-runtime")]
     {
-        return None;
+        if crate::compat::load_local_setting_list("economy")
+            .iter()
+            .any(|v| v == "nosave_diff")
+        {
+            return None;
+        }
     }
     Some(
         clock
@@ -407,9 +408,22 @@ pub(crate) fn site_timezone(timezone: Option<&str>) -> SiteTimezone {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .or_else(|| load_local_setting_string("time-zone"))
+        .or_else(local_timezone_setting)
         .unwrap_or_else(|| DEFAULT_SITE_TIMEZONE.to_string());
     parse_site_timezone(&configured).unwrap_or_else(default_site_timezone)
+}
+
+/// `time-zone` local setting override (`.narou/local_setting.yaml`).
+#[cfg(feature = "native-runtime")]
+fn local_timezone_setting() -> Option<String> {
+    crate::compat::load_local_setting_string("time-zone")
+}
+
+/// Worker builds have no local settings; the site's own timezone default
+/// applies.
+#[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+fn local_timezone_setting() -> Option<String> {
+    None
 }
 
 fn default_site_timezone() -> SiteTimezone {
@@ -456,6 +470,10 @@ pub fn parse_datetime_with_timezone(value: &str, timezone: Option<&str>) -> Opti
     parse_loose_datetime_with_timezone(value, site_timezone(timezone))
 }
 
+/// Resolve the CLI/saved user-agent, randomizing the value for `auto`/
+/// `random`. Native-only: requires the `ua_generator` randomizer; Worker
+/// builds inject their own user agent through the platform `HttpClient`.
+#[cfg(feature = "native-runtime")]
 pub(crate) fn resolve_user_agent(
     user_agent: Option<&str>,
     saved_user_agent: Option<String>,
@@ -574,6 +592,10 @@ fn illustration_sources<'a>(
 }
 
 impl Downloader {
+    /// Native constructor: loads site definitions from the filesystem and the
+    /// section hash cache from the Inventory. Worker builds use
+    /// [`Self::with_platform_and_storage_and_settings`] with bundled values.
+    #[cfg(feature = "native-runtime")]
     pub fn with_platform_and_storage(
         http: Arc<dyn HttpClient>,
         rate_limiter: Arc<dyn RateLimiter>,
@@ -583,13 +605,8 @@ impl Downloader {
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
         let site_settings = SiteSetting::load_all()?;
-        let section_hash_cache = crate::db::with_database(|db| {
-            db.inventory().load(
-                SECTION_HASH_CACHE_NAME,
-                crate::db::inventory::InventoryScope::Local,
-            )
-        })
-        .unwrap_or_default();
+        let settings = crate::downloader::settings::default_settings();
+        let section_hash_cache = settings.load_section_hash_cache();
         Self::with_platform_and_storage_and_settings(
             http,
             rate_limiter,
@@ -615,6 +632,34 @@ impl Downloader {
         site_settings: Vec<SiteSetting>,
         section_hash_cache: HashMap<String, HashMap<String, String>>,
     ) -> Result<Self> {
+        Self::with_platform_and_storage_and_settings_and_support(
+            http,
+            rate_limiter,
+            novels,
+            objects,
+            assets,
+            clock,
+            site_settings,
+            section_hash_cache,
+            crate::downloader::settings::default_settings(),
+        )
+    }
+
+    /// Full constructor: additionally injects the settings/interactive
+    /// capability (the platform default is used when building through the
+    /// shorter constructor). Worker callers can supply bundled settings here
+    /// without any filesystem access.
+    pub fn with_platform_and_storage_and_settings_and_support(
+        http: Arc<dyn HttpClient>,
+        rate_limiter: Arc<dyn RateLimiter>,
+        novels: Arc<dyn NovelRepository>,
+        objects: Arc<dyn ObjectStore>,
+        assets: Arc<dyn AssetStore>,
+        clock: Arc<dyn Clock>,
+        site_settings: Vec<SiteSetting>,
+        section_hash_cache: HashMap<String, HashMap<String, String>>,
+        settings: Arc<dyn DownloaderSettings>,
+    ) -> Result<Self> {
         let persistence =
             PersistenceService::with_clock(objects.clone(), assets.clone(), clock.clone());
 
@@ -629,6 +674,7 @@ impl Downloader {
             section_cache: SectionCache::new(),
             section_hash_cache,
             section_hash_cache_dirty: false,
+            settings,
             progress: None,
         })
     }
@@ -768,66 +814,88 @@ impl Downloader {
         old_count: usize,
         latest_count: usize,
     ) -> Result<bool> {
-        if latest_count >= old_count {
-            return Ok(false);
+        #[cfg(feature = "native-runtime")]
+        {
+            if latest_count >= old_count {
+                return Ok(false);
+            }
+
+            let mut message = format!(
+                "更新後の話数が保存されている話数より減少していることを検知しました。\nダイジェスト化されている可能性があるので、更新に関しての処理を選択して下さい。\n\n保存済み話数: {}\n更新後の話数: {}\n\n",
+                old_count, latest_count
+            );
+
+            let mut auto_choices = crate::compat::load_digest_auto_choices();
+
+            loop {
+                match crate::compat::choose_digest_action_with_auto_choices(
+                    title,
+                    &message,
+                    &mut auto_choices,
+                ) {
+                    crate::compat::DigestChoice::Update => return Ok(false),
+                    crate::compat::DigestChoice::Cancel => return Ok(true),
+                    crate::compat::DigestChoice::CancelAndFreeze => {
+                        if let Some(id) = existing_id {
+                            let _ = crate::compat::set_frozen_state(id, true);
+                        }
+                        return Ok(true);
+                    }
+                    crate::compat::DigestChoice::Backup => {
+                        let backup_name = crate::compat::create_backup(novel_dir, title)?;
+                        println!("{} を作成しました", backup_name);
+                    }
+                    crate::compat::DigestChoice::ShowStory => {
+                        println!("あらすじ");
+                        println!("{}", latest_story);
+                    }
+                    crate::compat::DigestChoice::OpenBrowser => {
+                        crate::compat::open_browser(toc_url);
+                    }
+                    crate::compat::DigestChoice::OpenFolder => {
+                        crate::compat::open_directory(novel_dir, None);
+                    }
+                    crate::compat::DigestChoice::Convert => {
+                        if let Some(id) = existing_id {
+                            let author = self
+                                .novels
+                                .get(id.into())
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|record| record.author)
+                                .unwrap_or_default();
+                            let _ = crate::compat::convert_existing_novel(
+                                id, title, &author, novel_dir, false,
+                            );
+                        }
+                    }
+                }
+
+                if std::io::stdin().is_terminal() {
+                    message.clear();
+                }
+                let _ = std::io::stdout().flush();
+            }
         }
 
-        let mut message = format!(
-            "更新後の話数が保存されている話数より減少していることを検知しました。\nダイジェスト化されている可能性があるので、更新に関しての処理を選択して下さい。\n\n保存済み話数: {}\n更新後の話数: {}\n\n",
-            old_count, latest_count
-        );
-
-        let mut auto_choices = crate::compat::load_digest_auto_choices();
-
-        loop {
-            match crate::compat::choose_digest_action_with_auto_choices(
+        // Worker: no interactive terminal. Return an explicit domain error
+        // instead of silently continuing or deleting sections.
+        #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+        {
+            let _ = (
+                existing_id,
+                toc_url,
+                novel_dir,
                 title,
-                &message,
-                &mut auto_choices,
-            ) {
-                crate::compat::DigestChoice::Update => return Ok(false),
-                crate::compat::DigestChoice::Cancel => return Ok(true),
-                crate::compat::DigestChoice::CancelAndFreeze => {
-                    if let Some(id) = existing_id {
-                        let _ = crate::compat::set_frozen_state(id, true);
-                    }
-                    return Ok(true);
-                }
-                crate::compat::DigestChoice::Backup => {
-                    let backup_name = crate::compat::create_backup(novel_dir, title)?;
-                    println!("{} を作成しました", backup_name);
-                }
-                crate::compat::DigestChoice::ShowStory => {
-                    println!("あらすじ");
-                    println!("{}", latest_story);
-                }
-                crate::compat::DigestChoice::OpenBrowser => {
-                    crate::compat::open_browser(toc_url);
-                }
-                crate::compat::DigestChoice::OpenFolder => {
-                    crate::compat::open_directory(novel_dir, None);
-                }
-                crate::compat::DigestChoice::Convert => {
-                    if let Some(id) = existing_id {
-                        let author = self
-                            .novels
-                            .get(id.into())
-                            .await
-                            .ok()
-                            .flatten()
-                            .map(|record| record.author)
-                            .unwrap_or_default();
-                        let _ = crate::compat::convert_existing_novel(
-                            id, title, &author, novel_dir, false,
-                        );
-                    }
-                }
-            }
-
-            if std::io::stdin().is_terminal() {
-                message.clear();
-            }
-            let _ = std::io::stdout().flush();
+                latest_story,
+                old_count,
+                latest_count,
+            );
+            Err(NarouError::Unsupported(
+                "digest handling requires an interactive terminal; not supported on this platform"
+                    .to_string(),
+            ))
         }
     }
 
@@ -863,9 +931,7 @@ impl Downloader {
                 let resolved = build_section_url(setting, toc_url, raw_url);
                 let url = resolved.as_str();
                 if !is_safe_public_url(url) {
-                    crate::progress::safe_stderr_println(&format!(
-                        "WARN: skipping unsafe illustration URL: {url}"
-                    ));
+                    report_warn(&format!("WARN: skipping unsafe illustration URL: {url}"));
                     continue;
                 }
 
@@ -900,13 +966,13 @@ impl Downloader {
                             .store_bytes(object_keys, illustration_store, url, &response.body, ext)
                             .await
                         {
-                            crate::progress::safe_stderr_println(&format!(
+                            report_warn(&format!(
                                 "WARN: failed to save illustration {url}: {err}"
                             ));
                         }
                     }
                     Err(err) => {
-                        crate::progress::safe_stderr_println(&format!(
+                        report_warn(&format!(
                             "WARN: failed to download illustration {url}: {err}"
                         ));
                     }
@@ -1060,8 +1126,11 @@ impl Downloader {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
                 let id = existing_id.unwrap();
-                safe_println_fn("小説が削除されているか非公開な可能性があります");
-                let _ = crate::compat::mark_not_found_and_freeze(id);
+                report_line("小説が削除されているか非公開な可能性があります");
+                #[cfg(feature = "native-runtime")]
+                {
+                    let _ = crate::compat::mark_not_found_and_freeze(id);
+                }
                 let record = self.novels.get(id.into()).await.ok().flatten();
                 let title = record
                     .as_ref()
@@ -1073,10 +1142,14 @@ impl Downloader {
                     .unwrap_or_default();
                 let novel_dir = {
                     // archive_root は Inventory 依存 (Phase 4 対象) のため
-                    // 従来どおり Database 経由で取得する。
+                    // 従来どおり Database 経由で取得する。Worker は論理パスを
+                    // そのまま使う (freeze は native Inventory の責務)。
+                    #[cfg(feature = "native-runtime")]
                     let archive_root =
                         crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
                             .unwrap_or_else(|_| PathBuf::from(types::ARCHIVE_ROOT_DIR));
+                    #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+                    let archive_root = PathBuf::from(types::ARCHIVE_ROOT_DIR);
                     record
                         .as_ref()
                         .map(|record| crate::db::novel_dir_for_record(&archive_root, record))
@@ -1105,11 +1178,13 @@ impl Downloader {
         match over18_access_decision(
             &setting,
             &toc_source,
-            load_global_setting_optional_bool("over18"),
+            self.settings.global_setting_optional_bool("over18"),
         ) {
             Over18AccessDecision::Allow => {}
             Over18AccessDecision::Prompt => {
-                if !crate::compat::confirm("年齢認証：あなたは18歳以上ですか", false, false)
+                if !self
+                    .settings
+                    .confirm("年齢認証：あなたは18歳以上ですか", false, false)?
                 {
                     return Ok(DownloadResult {
                         id: provisional_id,
@@ -1128,7 +1203,7 @@ impl Downloader {
                         sections_deleted: false,
                     });
                 }
-                save_global_setting_bool("over18", true)?;
+                self.settings.save_global_setting_bool("over18", true)?;
             }
             Over18AccessDecision::Deny => {
                 return Ok(DownloadResult {
@@ -1168,19 +1243,13 @@ impl Downloader {
         } else {
             fetched_raw_title
         };
+        #[cfg(feature = "native-runtime")]
         let previous_novel_dir = existing_record.as_ref().map(|record| {
             crate::db::existing_novel_dir_for_record(Path::new(types::ARCHIVE_ROOT_DIR), record)
         });
-        let settings_dir = previous_novel_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(types::ARCHIVE_ROOT_DIR).join(".new-novel-settings"));
-        let title_settings = crate::converter::settings::NovelSettings::load_for_novel(
-            provisional_id,
-            &raw_title,
-            &author,
-            &settings_dir,
-        );
-        let strip_title_prefix = title_settings.enable_strip_title_prefix;
+        let strip_title_prefix = self
+            .settings
+            .strip_title_prefix_for(provisional_id, &raw_title, &author);
         let track_raw_title = strip_title_prefix
             || existing_record
                 .as_ref()
@@ -1234,6 +1303,7 @@ impl Downloader {
         let object_keys = NovelObjectKeys::new(&sitename, &file_title, use_subdirectory)
             .map_err(|error| NarouError::Platform(error.to_string()))?;
         let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory);
+        #[cfg(feature = "native-runtime")]
         if let Some(existing) = existing_record.as_ref() {
             crate::title::rename_projected_outputs(&novel_dir, &author, &existing.title, &title)?;
         }
@@ -1320,14 +1390,14 @@ impl Downloader {
         let mut new_arrivals = existing_id.is_none();
         let mut new_arrival_subtitles = Vec::new();
         let mut final_subtitles = Vec::with_capacity(subtitles.len());
-        let strong_update = load_local_setting_bool("update.strong");
+        let strong_update = self.settings.local_setting_bool("update.strong");
         let site_timezone = setting.site_timezone();
         let mut cache_dir: Option<String> = None;
         let mut pending_section_hashes: HashMap<String, String> = HashMap::new();
         let display_id = provisional_id;
         let mut section_plans = Vec::with_capacity(subtitles.len());
         let mut download_count = 0usize;
-        let guard_spoiler = load_local_setting_bool("guard-spoiler");
+        let guard_spoiler = self.settings.local_setting_bool("guard-spoiler");
         for subtitle in &subtitles {
             let is_new_arrival = old_subtitles.get(&subtitle.index).is_none();
             let (needs_download, predownloaded) = if force {
@@ -1372,8 +1442,8 @@ impl Downloader {
 
             let download_time = if needs_download {
                 if !started_download {
-                    safe_println_fn(&bold_colored(
-                        &format!("ID:{}　{} のDL開始", display_id, title),
+                    report_line(&colorize(
+                        &format!("ID:{display_id}　{title} のDL開始"),
                         "green",
                     ));
                     started_download = true;
@@ -1388,11 +1458,11 @@ impl Downloader {
                 }
 
                 if !subtitle.chapter.is_empty() && subtitle.chapter != last_chapter {
-                    safe_println_fn(&subtitle.chapter);
+                    report_line(&subtitle.chapter);
                     last_chapter = subtitle.chapter.clone();
                 }
                 if !subtitle.subchapter.is_empty() && subtitle.subchapter != last_subchapter {
-                    safe_println_fn(&subtitle.subchapter);
+                    report_line(&subtitle.subchapter);
                     last_subchapter = subtitle.subchapter.clone();
                 }
 
@@ -1506,12 +1576,12 @@ impl Downloader {
                 ));
                 if needs_download {
                     if is_new_arrival && (existing_id.is_some() || force) {
-                        line.push_str(&bold_colored(" (新着)", "magenta"));
+                        line.push_str(&colorize(" (新着)", "magenta"));
                     } else if !is_new_arrival && force {
                         line.push_str(" (更新あり)");
                     }
                 }
-                safe_println_fn(&line);
+                report_line(&line);
                 if let Some(ref p) = self.progress {
                     p.inc(1);
                 }
@@ -1628,7 +1698,7 @@ impl Downloader {
             record.set_raw_title(raw_title);
         }
 
-        let auto_add_tags = load_local_setting_bool("auto-add-tags");
+        let auto_add_tags = self.settings.local_setting_bool("auto-add-tags");
         let auto_tags = if auto_add_tags {
             info.tags
                 .clone()
@@ -1712,6 +1782,7 @@ impl Downloader {
             new_id
         };
 
+        #[cfg(feature = "native-runtime")]
         self.remove_migrated_novel_dir(previous_novel_dir.as_deref(), &novel_dir)
             .await;
 
@@ -1994,14 +2065,19 @@ impl Downloader {
         file_title: &str,
         use_subdirectory: bool,
     ) -> PathBuf {
+        let root = PathBuf::from(types::ARCHIVE_ROOT_DIR);
         crate::db::paths::novel_dir_from_components(
-            Path::new(types::ARCHIVE_ROOT_DIR),
+            &root,
             sitename,
             file_title,
             use_subdirectory,
         )
     }
 
+    /// Remove the previous novel directory after a title change, but only when
+    /// no other record still references it. Native filesystem compatibility;
+    /// Worker builds have no filesystem to migrate.
+    #[cfg(feature = "native-runtime")]
     async fn remove_migrated_novel_dir(&self, previous: Option<&Path>, current: &Path) {
         let Some(previous) = previous else {
             return;
@@ -2058,16 +2134,7 @@ impl Downloader {
             return record.use_subdirectory;
         }
 
-        crate::db::with_database(|db| {
-            let settings: HashMap<String, serde_yaml::Value> = db
-                .inventory()
-                .load("local_setting", crate::db::inventory::InventoryScope::Local)?;
-            Ok(settings
-                .get("download.use-subdirectory")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false))
-        })
-        .unwrap_or(false)
+        self.settings.download_use_subdirectory()
     }
 
     fn cached_section_digest(&self, id: i64, relative_path: &str) -> Option<&str> {
@@ -2118,14 +2185,8 @@ impl Downloader {
         if !self.section_hash_cache_dirty {
             return Ok(());
         }
-        crate::db::with_database(|db| {
-            db.inventory().save(
-                SECTION_HASH_CACHE_NAME,
-                crate::db::inventory::InventoryScope::Local,
-                &self.section_hash_cache,
-            )?;
-            Ok(())
-        })?;
+        self.settings
+            .save_section_hash_cache(&self.section_hash_cache)?;
         self.section_hash_cache_dirty = false;
         Ok(())
     }
@@ -2138,6 +2199,10 @@ impl Downloader {
         self.find_site_setting(url).is_some()
     }
 
+    /// Batch-refresh なろうAPI metadata for all なろう records. Uses the
+    /// native dedicated API rate limiter; Worker builds schedule their own
+    /// batch jobs.
+    #[cfg(feature = "native-runtime")]
     pub async fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
         narou_api_batch_update(self.http.as_ref(), self.novels.as_ref()).await
     }

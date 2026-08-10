@@ -34,6 +34,9 @@ pub enum NarouError {
 
     #[error("Site setting error: {0}")]
     SiteSetting(String),
+
+    #[error("Unsupported on this platform: {0}")]
+    Unsupported(String),
 }
 
 pub type Result<T> = std::result::Result<T, NarouError>;

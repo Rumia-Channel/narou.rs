@@ -428,6 +428,16 @@ Worker (worker_entry)
 - `MemoryObjectStore` はasync small API、paged list、delete、chunked AssetStore fakeを提供する。`NativeObjectStore` compatibility testsはTOC/section/raw/setting/replace/cache/illustrationと既存legacy sectionを確認する。
 - Inventory/settings、site definition loader、Web固有Path API、downloader info cache、converter/settings/ini/inspector/user-converter/section-convert-cache、converter/device subprocess/tempdir、backup/update/loggerはObjectStoreへ統合しない。これらはconfigurationまたはnative-only capabilityであり、Phase 5/6の境界として明示する。
 
+### Phase 8 実装境界（Worker Queue / crawler / scheduler）
+
+- Queue payloadは`WorkerJobEnvelope`（version付き）で、1メッセージを1つの`JobPlan`として扱う。複数小説を1 payloadへ詰めず、サイズ上限と再試行回数を明示する。
+- D1のjob ledgerをsource of truthとし、enqueue前にidempotency keyを確定する。`pending` / `running` / `succeeded` / `retryable` / `failed` / `blocked` を永続化し、再配信はledger遷移で冪等化する。
+- Queue consumerは、成功またはledgerへ永続化した恒久失敗・blockedだけをackする。一時失敗はbounded retryへ送り、未知のenvelope version・未対応JobKind・認証必須サイトは成功扱いにしない。
+- 同一サイトの取得間隔はサイト単位のDurable Objectへ集約する。permit発行を直列化し、`Clock`による次回実行時刻とalarmで遅延を表現する。別サイトのpermitは独立して進める。
+- Cronはplannerに限定し、D1をbounded pageで走査して個別Update jobをenqueueする。大規模一覧をメモリへ全展開せず、cursor/checkpointで再開可能にする。
+- Worker crawlerは実行予算を超える前にsection単位のcheckpointを保存して終了する。section結果はcontent hashとjob idで重複書込みを抑止し、再実行で修復可能にする。
+- `Convert` / `Send` / `Mail` / `Backup` の重いnative処理はWorkerで実行せず、blockedとしてledgerへ記録する。Worker APIは既存read APIと分離し、認証・binding readiness・失敗分類を明示する。
+
 ## 10. breaking internal APIs（許可された破壊的変更）
 
 - `NarouError::Http(#[from] reqwest::Error)` → 廃止。`Platform(String)` 等へ。`#[from]` を外すため `?` での暗黙変換は消え、`map_err` が必要になる箇所が増える。

@@ -25,7 +25,11 @@ pub mod settings;
 pub mod tag_colors;
 pub mod web_actions;
 pub use jobs::{
-    JobKind, JobPlan, JobPlanResult, JobRequest, JobService, JobTarget,
+    CheckpointClaim, CheckpointState, ExecutionPhase, JobFailureClass, JobId, JobKind,
+    JobLedgerStatus, JobPlan, JobPlanResult, JobQueue, JobRequest, JobService, JobTarget,
+    LegacyEnvelopeOutcome, QueuedJob, QueuedJobView, SchedulerCheckpoint, UpdateScanPage,
+    WorkerExecutionCheckpoint, WorkerJobEnvelope, WORKER_JOB_ENVELOPE_VERSION, classify_failure,
+    decode_legacy_envelope, envelope_bytes, job_limits, validate_request_limits,
 };
 pub use novel_actions::{
     FileDeletionStatus, FreezeMutationStore, FreezeRequest, FreezeResult,

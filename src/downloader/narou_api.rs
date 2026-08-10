@@ -1,9 +1,13 @@
+#[cfg(feature = "native-runtime")]
 use chrono::{DateTime, Utc};
 
 use crate::error::{NarouError, Result};
-use crate::platform::{HttpClient, HttpRequest, NovelRepository, RateLimitScope, RateLimiter};
+use crate::platform::{HttpClient, HttpRequest, RateLimitScope, RateLimiter};
+#[cfg(feature = "native-runtime")]
+use crate::platform::NovelRepository;
 
 use super::http_policy::{ensure_success_response, host_of};
+#[cfg(feature = "native-runtime")]
 use super::rate_limit::RateLimiter as NativeRateLimiter;
 use super::security::validate_public_url;
 
@@ -12,28 +16,47 @@ const NAROU_API_DEFAULT_INTERVAL_SECS: f64 = 1.0;
 
 /// User-Agent used for なろうAPI requests.
 /// Configured via the `download.narou-api.user-agent` local setting.
+/// Worker builds use the default (no local settings on the platform).
 pub fn narou_api_user_agent() -> String {
-    crate::compat::load_local_setting_string("download.narou-api.user-agent")
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| NAROU_API_DEFAULT_USER_AGENT.to_string())
+    #[cfg(feature = "native-runtime")]
+    {
+        crate::compat::load_local_setting_string("download.narou-api.user-agent")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| NAROU_API_DEFAULT_USER_AGENT.to_string())
+    }
+    #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+    {
+        NAROU_API_DEFAULT_USER_AGENT.to_string()
+    }
 }
 
 /// Minimum wait time (seconds) between なろうAPI requests.
 /// Configured via the `download.narou-api.interval` local setting.
+/// Worker builds use the default (no local settings on the platform).
 pub fn narou_api_interval_secs() -> f64 {
-    crate::compat::load_local_setting_value("download.narou-api.interval")
-        .and_then(|value| match value {
-            serde_yaml::Value::Number(number) => number.as_f64(),
-            serde_yaml::Value::String(raw) => raw.parse::<f64>().ok(),
-            _ => None,
-        })
-        .unwrap_or(NAROU_API_DEFAULT_INTERVAL_SECS)
-        .max(0.0)
+    #[cfg(feature = "native-runtime")]
+    {
+        crate::compat::load_local_setting_value("download.narou-api.interval")
+            .and_then(|value| match value {
+                serde_yaml::Value::Number(number) => number.as_f64(),
+                serde_yaml::Value::String(raw) => raw.parse::<f64>().ok(),
+                _ => None,
+            })
+            .unwrap_or(NAROU_API_DEFAULT_INTERVAL_SECS)
+            .max(0.0)
+    }
+    #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+    {
+        NAROU_API_DEFAULT_INTERVAL_SECS
+    }
 }
 
 /// Rate limiter dedicated to なろうAPI calls. Independent of the
 /// `download.interval` / `download.wait-steps` settings used by per-episode
-/// downloads.
+/// downloads. Native-only: the concrete limiter is the native rate-limit
+/// implementation; Worker builds schedule batch updates with their own
+/// injected platform `RateLimiter`.
+#[cfg(feature = "native-runtime")]
 pub fn narou_api_rate_limiter() -> NativeRateLimiter {
     NativeRateLimiter::with_settings(narou_api_interval_secs(), 0)
 }
@@ -59,12 +82,14 @@ pub async fn fetch_narou_api_json(
 
 /// Parse a date/time string from the Syosetu API.
 /// The API returns dates as `"YYYY-MM-DD HH:MM:SS"` (not RFC 3339).
+#[cfg(feature = "native-runtime")]
 fn parse_api_datetime(value: &str) -> Option<DateTime<Utc>> {
     super::parse_datetime_with_timezone(value, Some("Asia/Tokyo"))
 }
 
 /// Parse Syosetu API JSON response.
 /// The API returns a flat array: `[{"allcount":N}, {entry1}, {entry2}, ...]`.
+#[cfg(feature = "native-runtime")]
 fn parse_api_entries(body: &str) -> Vec<serde_json::Value> {
     let arr: Vec<serde_json::Value> = match serde_json::from_str(body) {
         Ok(a) => a,
@@ -77,6 +102,13 @@ fn parse_api_entries(body: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Batch-refresh なろうAPI metadata for all なろう records.
+///
+/// Native-only orchestration: it uses the native dedicated API rate limiter
+/// (`download.narou-api.*` settings). Worker builds schedule their own batch
+/// jobs with an injected platform `RateLimiter`; the portable request/parse
+/// helpers (`fetch_narou_api_json` and friends) remain available to both.
+#[cfg(feature = "native-runtime")]
 pub async fn narou_api_batch_update(
     http: &dyn HttpClient,
     novels: &dyn NovelRepository,

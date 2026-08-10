@@ -1,5 +1,7 @@
+#[cfg(feature = "native-runtime")]
 use std::path::Path;
 
+#[cfg(feature = "native-runtime")]
 use crate::error::{NarouError, Result};
 
 pub fn strip_title_prefix(title: &str) -> &str {
@@ -34,6 +36,9 @@ pub fn project_title(raw_title: &str, strip_prefix: bool) -> String {
     }
 }
 
+/// Native-only: rewrites the stored record and renames generated output files
+/// on disk after a title-prefix setting change.
+#[cfg(feature = "native-runtime")]
 pub fn sync_title_projection(id: i64) -> Result<()> {
     let novels = crate::native::novel_repository::NativeNovelRepository::new();
     let record = novels
@@ -70,6 +75,9 @@ pub fn sync_title_projection(id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Native-only: renames generated output files (txt/epub/mobi/kepub/zip)
+/// when the projected title changes. Worker builds have no generated files.
+#[cfg(feature = "native-runtime")]
 pub fn rename_projected_outputs(
     novel_dir: &Path,
     author: &str,

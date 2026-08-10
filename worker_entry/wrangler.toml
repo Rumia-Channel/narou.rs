@@ -13,3 +13,56 @@ migrations_dir = "migrations"
 
 [build]
 command = "worker-build --release"
+
+# --- Phase 8: jobs queue ------------------------------------------------
+# Producer: POST /api/jobs and the cron planner send version-2 envelopes
+# (WorkerJobEnvelope {version, job_id, job}) here.
+
+[[queues.producers]]
+binding = "NAROU_JOBS"
+queue = "narou-jobs"
+
+# Consumer: the queue handler claims each job against the D1 ledger and acks
+# only after a durable terminal state. Conservative settings: one message at
+# a time. max_retries must be >= the ledger's attempt cap, because Cloudflare
+# counts *explicit* `retry_with_options` calls against max_retries too; the
+# ledger cap (3 attempts, then durable permanent) is what actually stops
+# retries, and crashed messages land in the DLQ for operator inspection.
+
+[[queues.consumers]]
+queue = "narou-jobs"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "narou-jobs-dlq"
+max_concurrency = 1
+
+# DLQ consumer config: recovers crashed messages (the same job id re-claims
+# idempotently against the ledger — Running rows older than the stale lease
+# are crash-recovered, terminal rows are acked). Bounded retries, then the
+# message is dropped by the runtime; nothing loops forever.
+
+[[queues.consumers]]
+queue = "narou-jobs-dlq"
+max_batch_size = 10
+max_retries = 3
+max_concurrency = 1
+
+# --- Phase 8: per-site rate limiting Durable Object ----------------------
+# One SiteRateLimiter instance per normalized site key; the runtime
+# serializes permit allocation per instance.
+
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "SiteRateLimiter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SiteRateLimiter"]
+
+# --- Phase 8: scheduled auto-update planner ------------------------------
+# Conservative trigger: four daily probes. The planner's catch-up decision
+# (SchedulerService::decide) gates actual runs, and the checkpoint's
+# generation dedupe prevents double planning of one trigger.
+
+[triggers]
+crons = ["0 0 * * *", "0 6 * * *", "0 12 * * *", "0 18 * * *"]

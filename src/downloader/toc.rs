@@ -1,10 +1,7 @@
 use std::collections::HashMap;
 
-use futures::future::BoxFuture;
-
 use crate::error::{NarouError, Result};
-use crate::platform::{HttpClient, RateLimiter};
-use crate::progress::ProgressReporter;
+use crate::platform::{HttpClient, PlatformFuture, ProgressReporter, RateLimiter};
 
 use super::html::{delete_ruby_tag, slim_subtitle};
 use super::http_policy;
@@ -165,14 +162,14 @@ fn parse_subtitles_multipage_with<'a, F>(
     title: &'a str,
     progress: Option<&'a dyn ProgressReporter>,
     mut fetch_next_toc: F,
-) -> BoxFuture<'a, Result<Vec<SubtitleInfo>>>
+) -> PlatformFuture<'a, Result<Vec<SubtitleInfo>>>
 where
     F: FnMut(
             &'a dyn HttpClient,
             &'a dyn RateLimiter,
             &'a SiteSetting,
             String,
-        ) -> BoxFuture<'a, Result<String>>
+        ) -> PlatformFuture<'a, Result<String>>
         + Send
         + 'a,
 {

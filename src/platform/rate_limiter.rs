@@ -54,6 +54,30 @@ pub trait RateLimiter: Send + Sync {
     ) -> PlatformFuture<'a, crate::error::Result<()>>;
 }
 
+/// Normalize a site key for rate-limit scoping and Durable Object naming.
+///
+/// The Durable Object id is derived from this key, so two spellings of the
+/// same site must collapse to one key or they would get independent rate
+/// buckets (and an attacker-supplied target could fragment the limiter).
+/// Returns `None` for keys that have no usable host form.
+pub fn normalize_site_key(site: &str) -> Option<String> {
+    let key = site.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return None;
+    }
+    // Strip a default port so `syosetu.com:443` and `syosetu.com` share a
+    // bucket, while keeping non-default ports (or bare IPv6) distinct.
+    for port in [":443", ":80"] {
+        if let Some(stripped) = key.strip_suffix(port) {
+            if !stripped.contains(':') {
+                return Some(stripped.to_string());
+            }
+            break;
+        }
+    }
+    Some(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +90,20 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.to_string(), "syosetu.com");
+    }
+
+    #[test]
+    fn site_key_normalizes_case_and_default_port() {
+        assert_eq!(normalize_site_key("syosetu.com").as_deref(), Some("syosetu.com"));
+        assert_eq!(normalize_site_key("  Syosetu.COM  ").as_deref(), Some("syosetu.com"));
+        assert_eq!(normalize_site_key("syosetu.com:443").as_deref(), Some("syosetu.com"));
+        assert_eq!(normalize_site_key("syosetu.com:80").as_deref(), Some("syosetu.com"));
+        // Non-default ports stay distinct buckets.
+        assert_eq!(normalize_site_key("syosetu.com:8080").as_deref(), Some("syosetu.com:8080"));
+        // Bare IPv6 must not be mangled by port stripping.
+        assert_eq!(normalize_site_key("[::1]:80").as_deref(), Some("[::1]:80"));
+        // Empty keys are unusable.
+        assert_eq!(normalize_site_key("   "), None);
+        assert_eq!(normalize_site_key(""), None);
     }
 }

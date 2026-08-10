@@ -23,7 +23,13 @@ use super::{PlatformFuture, PlatformService};
 use crate::db::NovelRecord;
 
 /// Novel identifier (the numeric record id used across the codebase).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// `transparent` serde keeps the on-the-wire form a plain number so job
+/// payloads (`JobTarget::Id`) stay compact and readable.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
 pub struct NovelId(pub i64);
 
 impl From<i64> for NovelId {

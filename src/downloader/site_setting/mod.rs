@@ -173,6 +173,25 @@ impl SiteSetting {
         Ok(loader::load_all_from_dirs(load_dirs))
     }
 
+    /// Parse and compile bundled site definitions from YAML strings.
+    ///
+    /// Worker callers embed the `webnovel/*.yaml` files as static strings
+    /// (e.g. from `build.rs`) and supply them here; no filesystem access is
+    /// involved. User/bundled merge semantics are not applied — the caller
+    /// supplies the effective list. Fails loudly on any malformed definition
+    /// so a Worker never silently shrinks the supported site set.
+    pub fn load_bundled(contents: &[&str]) -> Result<Vec<Self>> {
+        let mut settings = Vec::new();
+        for content in contents {
+            let raw_yaml: serde_yaml::Value = serde_yaml::from_str(content)?;
+            settings.push(serde_yaml::from_value::<SiteSetting>(raw_yaml)?);
+        }
+        for setting in &mut settings {
+            setting.compile();
+        }
+        Ok(settings)
+    }
+
     pub(super) fn compile(&mut self) {
         if looks_like_pattern(&self.sitename) && self.sitename_pattern.is_none() {
             self.sitename_pattern = Some(SiteSettingValue::Single(self.sitename.clone()));

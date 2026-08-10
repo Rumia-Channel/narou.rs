@@ -15,10 +15,10 @@ pub mod converter {
     pub mod ini;
 }
 pub mod db;
-#[cfg(feature = "native-runtime")]
+#[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub mod downloader;
 pub mod error;
-#[cfg(feature = "native-runtime")]
+#[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub mod illustration_store;
 #[cfg(feature = "native-runtime")]
 pub mod logger;
@@ -37,7 +37,7 @@ pub mod setting_info;
 pub mod tag_colors;
 #[cfg(feature = "native-runtime")]
 pub mod termcolor;
-#[cfg(feature = "native-runtime")]
+#[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub mod title;
 #[cfg(feature = "native-runtime")]
 pub mod updater_promote;
