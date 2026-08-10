@@ -1,26 +1,15 @@
 //! Scheduled auto-update planner (Phase 8).
 //!
-//! The cron handler only *plans and enqueues* discrete `Update` jobs; it
-//! never crawls anything itself. The decision comes from the shared
-//! [`SchedulerService`] catch-up logic; the D1 checkpoint
-//! (`app_state`, scope `scheduler`, key `auto_update`) records the
-//! generation, keyset cursor, and run timestamps so a duplicate delivery of
-//! the same cron generation never enqueues twice.
-//!
-//! Crash semantics (explicit, not claimed as true resume): if a run crashes
-//! mid-scan, the *same* generation is never re-executed (duplicate delivery
-//! is skipped) and the *next* generation re-scans from the start. This is
-//! safe and duplicate-free because enqueueing goes through the ledger's
-//! active dedupe key — already-active jobs return their existing id — so a
-//! full rescan fills only the gaps. The `cursor` field is therefore
-//! informational progress within a generation, not a cross-generation
-//! resumption point.
+//! Cron only plans bounded pages and sends discrete `Update` jobs through the
+//! shared Worker dispatcher. The D1 checkpoint is a resumable cursor: the
+//! current generation is deduplicated, while a later generation takes over a
+//! stale running claim and repairs pending ledger rows from the beginning.
 
 use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use narou_rs::application::{
-    events::FreezeStore, CheckpointClaim, JobKind, JobPlan, JobQueue, JobTarget,
+    events::FreezeStore, CheckpointClaim, JobKind, JobPlan, JobTarget,
 };
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{NovelFilter, NovelId};
@@ -29,8 +18,8 @@ use worker::{console_log, Env, ScheduledEvent};
 
 use crate::composition::WorkerRuntime;
 
-/// Bounded D1 scan page size for auto-update planning.
-pub const AUTO_UPDATE_PAGE_SIZE: usize = 500;
+/// Bounded D1 scan page for one planner invocation.
+pub const AUTO_UPDATE_PAGE_SIZE: usize = 100;
 
 /// Cron entry point: decide, claim the generation, plan pages, enqueue.
 pub async fn run_scheduled_plan(event: ScheduledEvent, env: &Env) -> Result<()> {
@@ -44,91 +33,118 @@ pub async fn run_scheduled_plan(event: ScheduledEvent, env: &Env) -> Result<()> 
     plan_auto_update(&runtime, generation).await
 }
 
-/// Plan + enqueue one auto-update run (pure policy, bounded scans).
+/// Plan + enqueue one bounded auto-update page.
 pub async fn plan_auto_update(runtime: &WorkerRuntime, generation: u64) -> Result<()> {
-    let services = &runtime.services;
-    let enabled = settings_bool(services, "update.auto-schedule.enable").await?;
-    let schedule_string = settings_string(services, "update.auto-schedule").await?;
-    let interval_secs = settings_f64(services, "update.interval").await?;
-
-    let policy = services
-        .scheduler
-        .policy(enabled, &schedule_string, interval_secs, Vec::new());
-
-    let checkpoint = runtime.checkpoint.load().await?;
-    let last_run = checkpoint
-        .last_run
-        .as_deref()
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.with_timezone(&Utc));
-    let decision = services.scheduler.decide(&policy, last_run);
-    if !decision.run_now {
-        return Ok(());
-    }
-
-    let now = runtime.now_rfc3339();
-    match runtime.checkpoint.claim(generation, &now).await? {
-        CheckpointClaim::Duplicate => {
-            console_log!("auto-update generation {generation} already planned; skipping");
-            Ok(())
+    let loaded = runtime.checkpoint.load().await?;
+    let mut checkpoint = if loaded.state
+        == narou_rs::application::CheckpointState::Running
+    {
+        if loaded.generation == generation {
+            // A redelivered cron event must not plan the same page twice. The
+            // next minute's generation will repair any pending rows that were
+            // left behind by a crash before the checkpoint save.
+            console_log!("auto-update generation {generation} already running; skipping");
+            return Ok(());
         }
-        CheckpointClaim::Claimed(mut checkpoint) => {
-            plan_pages(runtime, &mut checkpoint).await?;
-            // Release the generation regardless of how many pages completed:
-            // already-enqueued jobs stay active in the ledger (dedupe), and
-            // the next scheduled event re-scans and fills the gaps.
-            runtime.checkpoint.save(&checkpoint.finish(&runtime.now_rfc3339())).await?;
-            Ok(())
+        // A previous generation crashed after claiming its run. A new
+        // generation takes over with a fresh cursor; active ledger dedupe
+        // prevents already-dispatched jobs from stacking duplicates.
+        match runtime
+            .checkpoint
+            .claim(generation, &runtime.now_rfc3339())
+            .await?
+        {
+            CheckpointClaim::Duplicate => return Ok(()),
+            CheckpointClaim::Claimed(checkpoint) => checkpoint,
         }
+    } else {
+        let services = &runtime.services;
+        let enabled = settings_bool(services, "update.auto-schedule.enable").await?;
+        let schedule_string = settings_string(services, "update.auto-schedule").await?;
+        let interval_secs = settings_f64(services, "update.interval").await?;
+        let timezone = settings_timezone(services, "update.auto-schedule.timezone").await?;
+        let policy = services
+            .scheduler
+            .policy(enabled, &schedule_string, interval_secs, Vec::new());
+        let last_run = loaded
+            .last_run
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        let decision = services
+            .scheduler
+            .decide_in_timezone(&policy, last_run, timezone);
+        if !decision.run_now {
+            return Ok(());
+        }
+        let now = runtime.now_rfc3339();
+        match runtime.checkpoint.claim(generation, &now).await? {
+            CheckpointClaim::Duplicate => {
+                console_log!("auto-update generation {generation} already claimed; skipping");
+                return Ok(());
+            }
+            CheckpointClaim::Claimed(checkpoint) => checkpoint,
+        }
+    };
+
+    let done = plan_page(runtime, &mut checkpoint).await?;
+    if done {
+        checkpoint = checkpoint.finish(&runtime.now_rfc3339());
     }
+    runtime.checkpoint.save(&checkpoint).await
 }
 
-/// Scan bounded pages of novel ids (excluding frozen novels) and enqueue one
-/// `Update` plan per novel.
-async fn plan_pages(runtime: &WorkerRuntime, checkpoint: &mut narou_rs::application::SchedulerCheckpoint) -> Result<()> {
+/// Scan and dispatch at most one bounded page. The cursor is advanced only
+/// after every plan in the page has been sent or durably blocked.
+async fn plan_page(
+    runtime: &WorkerRuntime,
+    checkpoint: &mut narou_rs::application::SchedulerCheckpoint,
+) -> Result<bool> {
     let frozen_ids: HashSet<i64> = runtime.freeze.frozen_ids().await?;
-    let mut after_id: Option<NovelId> = checkpoint.cursor.map(NovelId);
-
-    loop {
-        let ids = runtime
-            .novels
-            .scan_ids(&NovelFilter::default(), after_id, AUTO_UPDATE_PAGE_SIZE)
-            .await?;
-        if ids.is_empty() {
-            break;
-        }
-        let page_full = ids.len() >= AUTO_UPDATE_PAGE_SIZE;
-        after_id = ids.last().map(|id| NovelId(id.0));
-
-        let mut enqueued_any = false;
-        for id in ids {
-            if frozen_ids.contains(&id.0) {
-                continue;
-            }
-            let plan = JobPlan {
-                kind: JobKind::Update,
-                target: JobTarget::Id(id),
-                options: Vec::new(),
-            };
-            runtime.ledger.enqueue(plan).await?;
-            enqueued_any = true;
-        }
-        console_log!(
-            "auto-update: planned page up to id {:?} (full: {page_full}, enqueued: {enqueued_any})",
-            after_id
-        );
-
-        // Persist the cursor after every full page so a crash mid-run resumes
-        // (or a fresh generation re-scans — dedupe keeps it duplicate-free).
-        if let Some(cursor) = after_id {
-            *checkpoint = checkpoint.advance(cursor.0);
-            runtime.checkpoint.save(checkpoint).await?;
-        }
-        if !page_full {
-            break;
-        }
+    let after_id = checkpoint.cursor.map(NovelId);
+    let ids = runtime
+        .novels
+        .scan_ids(&NovelFilter::default(), after_id, AUTO_UPDATE_PAGE_SIZE)
+        .await?;
+    if ids.is_empty() {
+        return Ok(true);
     }
-    Ok(())
+    let page_full = ids.len() == AUTO_UPDATE_PAGE_SIZE;
+    let next_cursor = ids.last().map(|id| id.0);
+    let plans: Vec<JobPlan> = ids
+        .into_iter()
+        .filter(|id| !frozen_ids.contains(&id.0))
+        .map(|id| JobPlan {
+            kind: JobKind::Update,
+            target: JobTarget::Id(id),
+            options: Vec::new(),
+        })
+        .collect();
+    runtime.enqueue_batch(&plans).await?;
+    if let Some(cursor) = next_cursor {
+        *checkpoint = checkpoint.advance(cursor);
+    }
+    console_log!(
+        "auto-update: dispatched page up to id {:?} (full: {page_full}, jobs: {})",
+        next_cursor,
+        plans.len()
+    );
+    Ok(!page_full)
+}
+
+async fn settings_timezone(
+    services: &narou_rs::application::AppServices,
+    name: &str,
+) -> Result<chrono_tz::Tz> {
+    let value = settings_string(services, name).await?;
+    if value.trim().is_empty() {
+        return Ok(chrono_tz::Asia::Tokyo);
+    }
+    value.parse().map_err(|_| {
+        NarouError::Platform(format!(
+            "invalid scheduler timezone {value:?}; expected an IANA timezone"
+        ))
+    })
 }
 
 async fn settings_bool(services: &narou_rs::application::AppServices, name: &str) -> Result<bool> {

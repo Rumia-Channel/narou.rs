@@ -2164,6 +2164,7 @@ name = "narou_worker"
 version = "0.3.6"
 dependencies = [
  "chrono",
+ "chrono-tz",
  "futures",
  "hex",
  "hmac",

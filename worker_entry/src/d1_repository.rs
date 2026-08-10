@@ -354,13 +354,16 @@ impl SettingsStore for D1SettingsStore {
         scope: SettingScope,
         settings: &'a HashMap<String, YamlValue>,
     ) -> PlatformFuture<'a, Result<()>> {
-        let entries: Vec<(String, String)> = match settings
+        let entries: Vec<(String, String, String)> = match settings
             .iter()
             .map(|(key, value)| {
                 let yaml = serde_yaml::to_string(value).map_err(|error| {
                     NarouError::Platform(format!("cannot serialize D1 setting {key}: {error}"))
                 })?;
-                Ok((key.clone(), yaml))
+                let json = serde_json::to_string(value).map_err(|error| {
+                    NarouError::Platform(format!("cannot serialize D1 setting JSON {key}: {error}"))
+                })?;
+                Ok((key.clone(), yaml, json))
             })
             .collect::<Result<_>>()
         {
@@ -373,14 +376,16 @@ impl SettingsStore for D1SettingsStore {
                 self.db.prepare("DELETE FROM app_state WHERE scope = ?"),
                 vec![BindValue::Text(scope_name.to_string())],
             )?];
-            for (key, value) in entries {
+            for (key, yaml, json) in entries {
                 statements.push(bind_statement(
-                    self.db
-                        .prepare("INSERT INTO app_state (scope, key, value_yaml) VALUES (?, ?, ?)"),
+                    self.db.prepare(
+                        "INSERT INTO app_state (scope, key, value_yaml, value_json) VALUES (?, ?, ?, ?)",
+                    ),
                     vec![
                         BindValue::Text(scope_name.to_string()),
                         BindValue::Text(key),
-                        BindValue::Text(value),
+                        BindValue::Text(yaml),
+                        BindValue::Text(json),
                     ],
                 )?);
             }

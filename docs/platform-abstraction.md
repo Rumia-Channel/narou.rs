@@ -438,6 +438,26 @@ Worker (worker_entry)
 - Worker crawlerは実行予算を超える前にsection単位のcheckpointを保存して終了する。section結果はcontent hashとjob idで重複書込みを抑止し、再実行で修復可能にする。
 - `Convert` / `Send` / `Mail` / `Backup` の重いnative処理はWorkerで実行せず、blockedとしてledgerへ記録する。Worker APIは既存read APIと分離し、認証・binding readiness・失敗分類を明示する。
 
+### Phase 8 運用ポリシー
+
+- Queue consumer は `succeeded`、`blocked`、`permanent`、retry 上限到達後の
+  `permanent` を記録してから ack する。`running` の lease が有効な再配信は
+  `Busy` として ack せず、Queue の再配信/DLQ経路へ返す。
+- 一時エラーは ledger の `attempts` を増やし、最大 3 回まで 5/10/20 秒の
+  bounded retry を行う。上限後は `permanent` として ack するため、無限 retry
+  ループや暗黙の DLQ 再投入は行わない。DLQ は Queue binding の運用設定で保持し、
+  `worker_jobs` の `last_error` と attempt 数を調査の source of truth とする。
+- Worker のサイト単位 rate limiter は Durable Object 1 instance をサイトごとに
+  使用し、permit の発行間隔と alarm を DO 内で直列化する。別サイトのキーは
+  独立して進む。設定の `download.interval` / `download.wait-steps` は native
+  downloader の既定値として保持し、Worker は DO の permit を crawler の
+  唯一の待機境界として利用する。
+- Worker の `Downloader` は `DownloaderSettings` を Inventory から読めないため、
+  `with_platform_and_storage_and_settings` に bundled site definitions と空の
+  hash cache を注入する。`download.use-subdirectory`、`guard-spoiler` などの
+  利用者設定を Worker へ移植する場合は、D1 settings の明示的な読み取りと
+  composition 層での注入を追加し、native の global/local 設定を暗黙に参照しない。
+
 ## 10. breaking internal APIs（許可された破壊的変更）
 
 - `NarouError::Http(#[from] reqwest::Error)` → 廃止。`Platform(String)` 等へ。`#[from]` を外すため `?` での暗黙変換は消え、`map_err` が必要になる箇所が増える。

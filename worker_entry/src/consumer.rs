@@ -17,7 +17,7 @@
 //! DLQ); there is no `catch_unwind` and no silent acknowledgment.
 
 use narou_rs::application::{
-    decode_legacy_envelope, JobId, JobLedgerStatus, JobPlan, JobQueue, JobRequest,
+    decode_legacy_envelope, JobClaim, JobId, JobLedgerStatus, JobPlan, JobQueue, JobRequest,
     LegacyEnvelopeOutcome, WorkerJobEnvelope, WORKER_JOB_ENVELOPE_VERSION,
 };
 use narou_rs::downloader::Downloader;
@@ -142,19 +142,31 @@ async fn process_discrete(
     job: &JobPlan,
     message: &Message<serde_json::Value>,
 ) -> Result<()> {
-    // Idempotent claim: a redelivery of an already-terminal job acks without
-    // re-executing; an unknown id is durably ledgered as blocked.
-    if !runtime.ledger.claim(&job_id).await? {
-        message.ack();
-        return Ok(());
-    }
+    let claim = runtime.ledger.claim(&job_id).await?;
+    let execution_token = match claim {
+        JobClaim::Claimed { execution_token } => execution_token,
+        JobClaim::AlreadyTerminal | JobClaim::Unknown => {
+            message.ack();
+            return Ok(());
+        }
+        JobClaim::Busy => {
+            return Err(NarouError::Platform(format!(
+                "job {job_id} has a live execution lease; redelivery must not be acknowledged"
+            )));
+        }
+    };
 
     let outcome = execute_job(downloader, job, &job_id).await;
     match outcome {
         JobOutcome::Succeeded => {
             runtime
                 .ledger
-                .mark_terminal(&job_id, JobLedgerStatus::Succeeded, None)
+                .mark_terminal(
+                    &job_id,
+                    &execution_token,
+                    JobLedgerStatus::Succeeded,
+                    None,
+                )
                 .await?;
             message.ack();
         }
@@ -162,20 +174,25 @@ async fn process_discrete(
             reason,
             checkpoint,
         } => {
-            runtime
-                .ledger
-                .mark_terminal(&job_id, JobLedgerStatus::Partial, Some(&reason))
-                .await?;
-            console_log!(
-                "job {job_id} finished partial (checkpoint {:?}): {reason}",
-                checkpoint
-            );
-            message.ack();
+            retry_or_ack(
+                runtime,
+                &job_id,
+                &execution_token,
+                message,
+                reason,
+                Some(&checkpoint),
+            )
+            .await?;
         }
         JobOutcome::Blocked { reason } => {
             runtime
                 .ledger
-                .mark_terminal(&job_id, JobLedgerStatus::Blocked, Some(&reason))
+                .mark_terminal(
+                    &job_id,
+                    &execution_token,
+                    JobLedgerStatus::Blocked,
+                    Some(&reason),
+                )
                 .await?;
             console_log!("job {job_id} blocked: {reason}");
             message.ack();
@@ -183,34 +200,71 @@ async fn process_discrete(
         JobOutcome::Permanent { reason } => {
             runtime
                 .ledger
-                .mark_terminal(&job_id, JobLedgerStatus::Permanent, Some(&reason))
+                .mark_terminal(
+                    &job_id,
+                    &execution_token,
+                    JobLedgerStatus::Permanent,
+                    Some(&reason),
+                )
                 .await?;
             console_log!("job {job_id} failed permanently: {reason}");
             message.ack();
         }
         JobOutcome::Retryable { reason } => {
-            let attempts = runtime.ledger.record_attempt(&job_id, &reason).await?;
-            if attempts >= MAX_RETRYABLE_ATTEMPTS {
-                let exhausted = format!(
-                    "retries exhausted after {attempts} attempts: {reason}"
-                );
-                runtime
-                    .ledger
-                    .mark_terminal(&job_id, JobLedgerStatus::Permanent, Some(&exhausted))
-                    .await?;
-                console_log!("job {job_id} permanently failed: {exhausted}");
-                message.ack();
-            } else {
-                let delay = retry_delay_secs(attempts);
-                console_log!(
-                    "job {job_id} retryable (attempt {attempts}), re-queueing in {delay}s: {reason}"
-                );
-                let options = QueueRetryOptionsBuilder::new()
-                    .with_delay_seconds(delay)
-                    .build();
-                message.retry_with_options(&options);
-            }
+            retry_or_ack(
+                runtime,
+                &job_id,
+                &execution_token,
+                message,
+                reason,
+                None,
+            )
+            .await?;
         }
+    }
+    Ok(())
+}
+
+async fn retry_or_ack(
+    runtime: &WorkerRuntime,
+    job_id: &JobId,
+    execution_token: &str,
+    message: &Message<serde_json::Value>,
+    reason: String,
+    checkpoint: Option<&narou_rs::application::WorkerExecutionCheckpoint>,
+) -> Result<()> {
+    if let Some(checkpoint) = checkpoint {
+        runtime
+            .ledger
+            .save_checkpoint(job_id, execution_token, checkpoint)
+            .await?;
+    }
+    let attempts = runtime
+        .ledger
+        .record_attempt(job_id, execution_token, &reason)
+        .await?;
+    if attempts >= MAX_RETRYABLE_ATTEMPTS {
+        let exhausted = format!("retries exhausted after {attempts} attempts: {reason}");
+        runtime
+            .ledger
+            .mark_terminal(
+                job_id,
+                execution_token,
+                JobLedgerStatus::Permanent,
+                Some(&exhausted),
+            )
+            .await?;
+        console_log!("job {job_id} permanently failed: {exhausted}");
+        message.ack();
+    } else {
+        let delay = retry_delay_secs(attempts);
+        console_log!(
+            "job {job_id} retryable (attempt {attempts}), re-queueing in {delay}s: {reason}"
+        );
+        let options = QueueRetryOptionsBuilder::new()
+            .with_delay_seconds(delay)
+            .build();
+        message.retry_with_options(&options);
     }
     Ok(())
 }

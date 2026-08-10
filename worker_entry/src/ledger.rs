@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use narou_rs::application::{
-    CheckpointClaim, JobId, JobKind, JobLedgerStatus, JobPlan, JobQueue, JobTarget, QueuedJob,
-    QueuedJobView, SchedulerCheckpoint,
+    CheckpointClaim, JobClaim, JobId, JobKind, JobLedgerStatus, JobPlan, JobQueue, JobTarget,
+    QueuedJob, QueuedJobView, SchedulerCheckpoint,
 };
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{Clock, PlatformFuture};
@@ -21,10 +21,10 @@ use serde::Deserialize;
 use wasm_bindgen::JsValue;
 use worker::{D1Database, D1PreparedStatement, D1Result};
 
-/// A `running` row older than this is a crashed execution (the bounded
-/// per-job time guard is far below this) and may be re-claimed by a
-/// redelivery for idempotent crash recovery.
-const STALE_RUNNING_THRESHOLD: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
+/// A running claim remains owned until this lease expires. The bounded
+/// execution guard is shorter than the lease, so a live redelivery is never
+/// allowed to execute concurrently with the original invocation.
+const JOB_LEASE: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 
 /// D1-backed [`JobQueue`] adapter.
 pub struct D1JobLedger {
@@ -62,10 +62,22 @@ impl D1JobLedger {
             .to_rfc3339_opts(SecondsFormat::Nanos, true)
     }
 
+    fn lease_until_rfc3339(&self) -> String {
+        (self.clock.now_utc() + JOB_LEASE)
+            .to_rfc3339_opts(SecondsFormat::Nanos, true)
+    }
+
+    fn new_execution_token() -> String {
+        let now = js_sys::Date::now() as u64;
+        let random = (js_sys::Math::random() * 18_446_744_073_709_551_616.0) as u64;
+        format!("e{now:016x}{random:016x}")
+    }
+
     /// Read one job row by id.
     async fn select_row(&self, job_id: &str) -> Result<Option<JobRow>> {
         let statement = self.prepare(
-            "SELECT job_id, kind, target, options, status, attempts, last_error, created_at, updated_at
+            "SELECT job_id, kind, target, options, status, attempts, last_error, created_at, updated_at,
+                    lease_until, execution_token
              FROM worker_jobs WHERE job_id = ? LIMIT 1",
             vec![BindValue::Text(job_id.to_string())],
         )?;
@@ -76,7 +88,8 @@ impl D1JobLedger {
     /// Find an active row with the same dedupe key.
     async fn select_active_by_dedupe(&self, dedupe_key: &str) -> Result<Option<JobRow>> {
         let statement = self.prepare(
-            "SELECT job_id, kind, target, options, status, attempts, last_error, created_at, updated_at
+            "SELECT job_id, kind, target, options, status, attempts, last_error, created_at, updated_at,
+                    lease_until, execution_token
              FROM worker_jobs WHERE dedupe_key = ? AND status IN ('pending', 'running', 'retryable') LIMIT 1",
             vec![BindValue::Text(dedupe_key.to_string())],
         )?;
@@ -195,78 +208,105 @@ impl JobQueue for D1JobLedger {
         })
     }
 
-    fn claim<'a>(&'a self, job_id: &'a JobId) -> PlatformFuture<'a, Result<bool>> {
+    fn claim<'a>(&'a self, job_id: &'a JobId) -> PlatformFuture<'a, Result<JobClaim>> {
         Box::pin(async move {
-            // Exactly-one-claim: the conditional UPDATE is the guard, so two
-            // concurrent redeliveries can never both claim a pending job.
             let now = self.now_rfc3339();
+            let lease_until = self.lease_until_rfc3339();
+            let execution_token = Self::new_execution_token();
             let fresh = self.prepare(
-                "UPDATE worker_jobs SET status = 'running', updated_at = ?
+                "UPDATE worker_jobs
+                 SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ?
                  WHERE job_id = ? AND status IN ('pending', 'retryable')",
                 vec![
                     BindValue::Text(now.clone()),
+                    BindValue::Text(lease_until),
+                    BindValue::Text(execution_token.clone()),
                     BindValue::Text(job_id.as_str().to_string()),
                 ],
             )?;
             if changed_rows(&fresh.run().await.map_err(worker_error)?)? > 0 {
-                return Ok(true);
+                return Ok(JobClaim::Claimed { execution_token });
             }
 
             let Some(row) = self.select_row(job_id.as_str()).await? else {
-                // The envelope references a job this ledger has never seen.
-                // Durably record the rejection (blocked) rather than acking a
-                // silently lost message.
                 self.record_rejected(job_id.as_str(), "job id not found in ledger")
                     .await?;
-                return Ok(false);
+                return Ok(JobClaim::Unknown);
             };
             let status = JobLedgerStatus::parse(&row.status)?;
             match status {
-                status if status.is_terminal() => Ok(false),
+                status if status.is_terminal() => Ok(JobClaim::AlreadyTerminal),
                 JobLedgerStatus::Running => {
-                    // A running row that is recent belongs to a live execution
-                    // whose outcome this redelivery must not duplicate. A row
-                    // older than the stale threshold (well above the bounded
-                    // execution budget) is a crashed run: claim it so the
-                    // redelivery re-executes idempotently (the downloader
-                    // persists sections as it fetches them).
-                    let stale_before = (self.clock.now_utc() - STALE_RUNNING_THRESHOLD)
-                        .to_rfc3339_opts(SecondsFormat::Nanos, true);
-                    let stale = self.prepare(
-                        "UPDATE worker_jobs SET status = 'running', updated_at = ?
-                         WHERE job_id = ? AND status = 'running' AND updated_at < ?",
+                    let reclaim = self.prepare(
+                        "UPDATE worker_jobs
+                         SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ?
+                         WHERE job_id = ? AND status = 'running'
+                           AND (lease_until IS NULL OR lease_until <= ?)",
                         vec![
                             BindValue::Text(now),
+                            BindValue::Text(self.lease_until_rfc3339()),
+                            BindValue::Text(execution_token.clone()),
                             BindValue::Text(job_id.as_str().to_string()),
-                            BindValue::Text(stale_before),
+                            BindValue::Text(self.now_rfc3339()),
                         ],
                     )?;
-                    if changed_rows(&stale.run().await.map_err(worker_error)?)? > 0 {
-                        Ok(true)
+                    if changed_rows(&reclaim.run().await.map_err(worker_error)?)? > 0 {
+                        Ok(JobClaim::Claimed { execution_token })
                     } else {
-                        Ok(false)
+                        Ok(JobClaim::Busy)
                     }
                 }
-                // Fresh claim covers pending + retryable, so this arm is only
-                // reachable if a retryable row raced into running between the
-                // fresh UPDATE and the SELECT — treat as not claimed.
-                _ => Ok(false),
+                _ => Ok(JobClaim::Busy),
             }
+        })
+    }
+
+    fn save_checkpoint<'a>(
+        &'a self,
+        job_id: &'a JobId,
+        execution_token: &'a str,
+        checkpoint: &'a narou_rs::application::WorkerExecutionCheckpoint,
+    ) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let value = serde_json::to_string(checkpoint).map_err(|error| {
+                NarouError::Platform(format!("execution checkpoint serialization: {error}"))
+            })?;
+            let statement = self.prepare(
+                "UPDATE worker_jobs SET checkpoint_json = ?, updated_at = ?
+                 WHERE job_id = ? AND status = 'running' AND execution_token = ?",
+                vec![
+                    BindValue::Text(value),
+                    BindValue::Text(self.now_rfc3339()),
+                    BindValue::Text(job_id.as_str().to_string()),
+                    BindValue::Text(execution_token.to_string()),
+                ],
+            )?;
+            if changed_rows(&statement.run().await.map_err(worker_error)?)? == 0 {
+                return Err(NarouError::Platform(format!(
+                    "execution claim for job {job_id} is no longer valid"
+                )));
+            }
+            Ok(())
         })
     }
 
     fn record_attempt<'a>(
         &'a self,
         job_id: &'a JobId,
+        execution_token: &'a str,
         error: &'a str,
     ) -> PlatformFuture<'a, Result<u32>> {
         Box::pin(async move {
             let update = self.prepare(
-                "UPDATE worker_jobs SET attempts = attempts + 1, status = 'retryable', last_error = ?, updated_at = ? WHERE job_id = ?",
+                "UPDATE worker_jobs
+                 SET attempts = attempts + 1, status = 'retryable', last_error = ?,
+                     updated_at = ?, lease_until = NULL
+                 WHERE job_id = ? AND status = 'running' AND execution_token = ?",
                 vec![
                     BindValue::Text(error.to_string()),
                     BindValue::Text(self.now_rfc3339()),
                     BindValue::Text(job_id.as_str().to_string()),
+                    BindValue::Text(execution_token.to_string()),
                 ],
             )?;
             let select = self.prepare(
@@ -275,6 +315,13 @@ impl JobQueue for D1JobLedger {
             )?;
             let results = self.db.batch(vec![update, select]).await.map_err(worker_error)?;
             ensure_batch_success(&results)?;
+            if changed_rows(results.first().ok_or_else(|| {
+                NarouError::Platform("D1 attempt update returned no result".to_string())
+            })?)? == 0 {
+                return Err(NarouError::Platform(format!(
+                    "execution claim for job {job_id} is no longer valid"
+                )));
+            }
             let row: AttemptRow = results
                 .get(1)
                 .ok_or_else(|| NarouError::Platform("D1 attempt read returned no row".to_string()))?
@@ -292,6 +339,7 @@ impl JobQueue for D1JobLedger {
     fn mark_terminal<'a>(
         &'a self,
         job_id: &'a JobId,
+        execution_token: &'a str,
         status: JobLedgerStatus,
         error: Option<&'a str>,
     ) -> PlatformFuture<'a, Result<()>> {
@@ -303,31 +351,37 @@ impl JobQueue for D1JobLedger {
             }
             let (sql, values) = match error {
                 Some(error) => (
-                    "UPDATE worker_jobs SET status = ?, last_error = ?, updated_at = ? WHERE job_id = ?",
+                    "UPDATE worker_jobs
+                     SET status = ?, last_error = ?, updated_at = ?,
+                         lease_until = NULL, execution_token = NULL, checkpoint_json = NULL
+                     WHERE job_id = ? AND status IN ('running', 'retryable') AND execution_token = ?",
                     vec![
                         BindValue::Text(status_str(status).to_string()),
                         BindValue::Text(error.to_string()),
                         BindValue::Text(self.now_rfc3339()),
                         BindValue::Text(job_id.as_str().to_string()),
+                        BindValue::Text(execution_token.to_string()),
                     ],
                 ),
                 None => (
-                    "UPDATE worker_jobs SET status = ?, last_error = NULL, updated_at = ? WHERE job_id = ?",
+                    "UPDATE worker_jobs
+                     SET status = ?, last_error = NULL, updated_at = ?,
+                         lease_until = NULL, execution_token = NULL, checkpoint_json = NULL
+                     WHERE job_id = ? AND status IN ('running', 'retryable') AND execution_token = ?",
                     vec![
                         BindValue::Text(status_str(status).to_string()),
                         BindValue::Text(self.now_rfc3339()),
                         BindValue::Text(job_id.as_str().to_string()),
+                        BindValue::Text(execution_token.to_string()),
                     ],
                 ),
             };
             let statement = self.prepare(sql, values)?;
             let result = statement.run().await.map_err(worker_error)?;
-            if !result.success() {
-                return Err(NarouError::Platform(
-                    result
-                        .error()
-                        .unwrap_or_else(|| "D1 terminal transition failed".to_string()),
-                ));
+            if changed_rows(&result)? == 0 {
+                return Err(NarouError::Platform(format!(
+                    "execution claim for job {job_id} is no longer valid"
+                )));
             }
             Ok(())
         })
@@ -355,35 +409,48 @@ impl D1SchedulerCheckpoint {
     /// Load the stored checkpoint, or the default when no run ever happened.
     pub async fn load(&self) -> Result<SchedulerCheckpoint> {
         let statement = self.prepare(
-            "SELECT value_json FROM app_state WHERE scope = ? AND key = ?",
+            "SELECT value_yaml, value_json FROM app_state WHERE scope = ? AND key = ?",
             vec![
                 BindValue::Text(Self::SCOPE.to_string()),
                 BindValue::Text(Self::KEY.to_string()),
             ],
         )?;
         let row = statement.first::<CheckpointRow>(None).await.map_err(worker_error)?;
-        match row {
-            Some(row) => serde_json::from_str(&row.value_json).map_err(|error| {
-                NarouError::Platform(format!(
-                    "scheduler checkpoint is corrupt: {error}"
-                ))
-            }),
-            None => Ok(SchedulerCheckpoint::default()),
+        let Some(row) = row else {
+            return Ok(SchedulerCheckpoint::default());
+        };
+        if let Some(value) = row.value_yaml.as_deref() {
+            if let Ok(checkpoint) = serde_yaml::from_str(value) {
+                return Ok(checkpoint);
+            }
         }
+        if let Some(value) = row.value_json.as_deref() {
+            return serde_json::from_str(value).map_err(|error| {
+                NarouError::Platform(format!("scheduler checkpoint is corrupt: {error}"))
+            });
+        }
+        Err(NarouError::Platform(
+            "scheduler checkpoint has no YAML or JSON value".to_string(),
+        ))
     }
 
     /// Persist the checkpoint (upsert on the `(scope, key)` primary key).
     pub async fn save(&self, checkpoint: &SchedulerCheckpoint) -> Result<()> {
-        let value = serde_json::to_string(checkpoint).map_err(|error| {
-            NarouError::Platform(format!("scheduler checkpoint serialization: {error}"))
+        let value_json = serde_json::to_string(checkpoint).map_err(|error| {
+            NarouError::Platform(format!("scheduler checkpoint JSON serialization: {error}"))
+        })?;
+        let value_yaml = serde_yaml::to_string(checkpoint).map_err(|error| {
+            NarouError::Platform(format!("scheduler checkpoint YAML serialization: {error}"))
         })?;
         let statement = self.prepare(
-            "INSERT INTO app_state (scope, key, value_json) VALUES (?, ?, ?)
-             ON CONFLICT (scope, key) DO UPDATE SET value_json = excluded.value_json",
+            "INSERT INTO app_state (scope, key, value_yaml, value_json) VALUES (?, ?, ?, ?)
+             ON CONFLICT (scope, key) DO UPDATE SET
+               value_yaml = excluded.value_yaml, value_json = excluded.value_json",
             vec![
                 BindValue::Text(Self::SCOPE.to_string()),
                 BindValue::Text(Self::KEY.to_string()),
-                BindValue::Text(value),
+                BindValue::Text(value_yaml),
+                BindValue::Text(value_json),
             ],
         )?;
         let result = statement.run().await.map_err(worker_error)?;
@@ -397,8 +464,10 @@ impl D1SchedulerCheckpoint {
         Ok(())
     }
 
-    /// Load-checkpoint and claim a generation atomically-ish (single-writer
-    /// cron plus the ledger's active dedupe guard against races).
+
+    /// Load-checkpoint and claim a generation atomically against the
+    /// currently persisted generation. Concurrent cron invocations race on
+    /// one conditional D1 update; only one observes a changed row.
     pub async fn claim(
         &self,
         generation: u64,
@@ -408,7 +477,35 @@ impl D1SchedulerCheckpoint {
         match current.begin(generation, started_at) {
             CheckpointClaim::Duplicate => Ok(CheckpointClaim::Duplicate),
             CheckpointClaim::Claimed(next) => {
-                self.save(&next).await?;
+                let expected = current.generation.to_string();
+                let value_json = serde_json::to_string(&next).map_err(|error| {
+                    NarouError::Platform(format!("scheduler checkpoint serialization: {error}"))
+                })?;
+                let value_yaml = serde_yaml::to_string(&next).map_err(|error| {
+                    NarouError::Platform(format!("scheduler checkpoint YAML serialization: {error}"))
+                })?;
+                let statement = self.prepare(
+                    "INSERT INTO app_state (scope, key, value_yaml, value_json)
+                     VALUES (?, ?, ?, ?)
+                     ON CONFLICT (scope, key) DO UPDATE SET
+                       value_yaml = excluded.value_yaml,
+                       value_json = excluded.value_json
+                     WHERE json_extract(app_state.value_json, '$.generation') = ?",
+                    vec![
+                        BindValue::Text(Self::SCOPE.to_string()),
+                        BindValue::Text(Self::KEY.to_string()),
+                        BindValue::Text(value_yaml),
+                        BindValue::Text(value_json),
+                        BindValue::Text(expected),
+                    ],
+                )?;
+                if changed_rows(&statement.run().await.map_err(worker_error)?)? == 0 {
+                    let latest = self.load().await?;
+                    return Ok(match latest.begin(generation, started_at) {
+                        CheckpointClaim::Duplicate => CheckpointClaim::Duplicate,
+                        CheckpointClaim::Claimed(_) => CheckpointClaim::Duplicate,
+                    });
+                }
                 Ok(CheckpointClaim::Claimed(next))
             }
         }
@@ -472,7 +569,8 @@ struct AttemptRow {
 
 #[derive(Debug, Deserialize)]
 struct CheckpointRow {
-    value_json: String,
+    value_yaml: Option<String>,
+    value_json: Option<String>,
 }
 
 fn parse_rfc3339(value: &str) -> Result<DateTime<Utc>> {

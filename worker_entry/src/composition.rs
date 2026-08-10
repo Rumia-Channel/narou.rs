@@ -3,9 +3,11 @@ use std::sync::Arc;
 
 use chrono::SecondsFormat;
 use narou_rs::application::{
+    envelope_bytes, job_limits, JobClaim, JobLedgerStatus, JobPlan, JobQueue,
     AppServiceDependencies, AppServices, EmptySiteDefinitionProvider, EmptySiteTimezoneProvider,
     EmptyWebActionService, JobService, NoopSelfUpdateService, NovelActionService,
     NovelContentService, NovelSettingsService, SchedulerService, SettingsService, TagColorService,
+    WorkerJobEnvelope,
 };
 use narou_rs::downloader::Downloader;
 use narou_rs::downloader::site_setting::SiteSetting;
@@ -23,6 +25,14 @@ use crate::ledger::{D1JobLedger, D1SchedulerCheckpoint};
 use crate::rate_limiter::WorkerRateLimiter;
 use crate::wasabi::{WasabiConfig, WasabiObjectStore};
 
+
+/// Result of the complete ledger + Queue producer operation for one plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchOutcome {
+    pub job_id: String,
+    pub sent: bool,
+    pub blocked: Option<String>,
+}
 /// Queue producer binding that carries version-2 job envelopes.
 pub const JOB_QUEUE_BINDING: &str = "NAROU_JOBS";
 
@@ -120,6 +130,110 @@ impl WorkerRuntime {
             self.site_settings.clone(),
             HashMap::new(),
         )
+    }
+
+    /// Enqueue one plan through the ledger and Queue binding as one operation.
+    /// Pending/retryable rows are sent; a live running row is not duplicated.
+    pub async fn enqueue_plan(&self, plan: JobPlan) -> Result<DispatchOutcome> {
+        let queued = self.ledger.enqueue(plan.clone()).await?;
+        let view = self
+            .ledger
+            .get(&queued.job_id)
+            .await?
+            .ok_or_else(|| {
+                narou_rs::error::NarouError::Platform("queued job disappeared".to_string())
+            })?;
+        let unsupported = if !plan.kind.is_worker_executable() {
+            Some(format!(
+                "unsupported job kind {:?} on the worker (no subprocess support)",
+                plan.kind
+            ))
+        } else if plan.target == narou_rs::application::JobTarget::All {
+            Some("auto-update must be planned into discrete per-novel jobs".to_string())
+        } else {
+            None
+        };
+        let oversized = envelope_bytes(&WorkerJobEnvelope::v2(
+            queued.job_id.clone(),
+            queued.job.clone(),
+        ))
+        .map(|size| size > job_limits::MAX_ENVELOPE_BYTES)
+        .unwrap_or(true);
+        let blocked_reason = unsupported.or_else(|| {
+            oversized.then(|| {
+                format!(
+                    "envelope exceeds queue payload limit (max {} bytes)",
+                    job_limits::MAX_ENVELOPE_BYTES
+                )
+            })
+        });
+        if let Some(reason) = blocked_reason {
+            match self.ledger.claim(&queued.job_id).await? {
+                JobClaim::Claimed { execution_token } => {
+                    self.ledger
+                        .mark_terminal(
+                            &queued.job_id,
+                            &execution_token,
+                            JobLedgerStatus::Blocked,
+                            Some(&reason),
+                        )
+                        .await?;
+                }
+                JobClaim::AlreadyTerminal | JobClaim::Unknown => {}
+                JobClaim::Busy => {
+                    return Err(narou_rs::error::NarouError::Platform(
+                        "cannot block a job with a live execution lease".to_string(),
+                    ));
+                }
+            }
+            return Ok(DispatchOutcome {
+                job_id: queued.job_id.as_str().to_string(),
+                sent: false,
+                blocked: Some(reason),
+            });
+        }
+        if !matches!(
+            view.status,
+            narou_rs::application::JobLedgerStatus::Pending
+                | narou_rs::application::JobLedgerStatus::Retryable
+        ) {
+            return Ok(DispatchOutcome {
+                job_id: queued.job_id.as_str().to_string(),
+                sent: false,
+                blocked: None,
+            });
+        }
+        let envelope = WorkerJobEnvelope::v2(queued.job_id.clone(), queued.job);
+        self.queue.send(&envelope).await.map_err(|error| {
+            narou_rs::error::NarouError::Platform(format!("queue send failed: {error}"))
+        })?;
+        Ok(DispatchOutcome {
+            job_id: envelope.job_id.as_str().to_string(),
+            sent: true,
+            blocked: None,
+        })
+    }
+
+    /// Dispatch a bounded page, attempting every plan before returning a
+    /// partial failure. Failed sends remain active in the ledger for repair.
+    pub async fn enqueue_batch(&self, plans: &[JobPlan]) -> Result<Vec<DispatchOutcome>> {
+        let mut outcomes = Vec::with_capacity(plans.len());
+        let mut failures = Vec::new();
+        for plan in plans {
+            match self.enqueue_plan(plan.clone()).await {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if failures.is_empty() {
+            Ok(outcomes)
+        } else {
+            Err(narou_rs::error::NarouError::Platform(format!(
+                "queue page partially failed ({}): {}",
+                failures.len(),
+                failures.join("; ")
+            )))
+        }
     }
 }
 

@@ -63,6 +63,14 @@ pub use self::util::pretreatment_source;
 pub(crate) const SECTION_HASH_CACHE_NAME: &str = "section_hash_cache";
 const DEFAULT_SITE_TIMEZONE: &str = "Asia/Tokyo";
 
+/// A platform-neutral budget checked only at safe section boundaries.
+///
+/// Implementations must be cheap and side-effect free: the downloader calls
+/// this before starting the next section, never while a section is in flight.
+pub trait SectionBudget: Send {
+    fn should_yield(&mut self, next_section_index: usize) -> bool;
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum SiteTimezone {
     Named(Tz),
@@ -1045,6 +1053,20 @@ impl Downloader {
         target: &str,
         force: bool,
     ) -> Result<DownloadResult> {
+        self.download_novel_with_force_budget(target, force, None).await
+    }
+
+    /// Download a novel while yielding only before a new section starts.
+    ///
+    /// Existing callers keep the unbounded API above. Worker callers provide a
+    /// short-lived budget so a timeout cannot cancel an in-flight section
+    /// between its fetch and persistence steps.
+    pub async fn download_novel_with_force_budget(
+        &mut self,
+        target: &str,
+        force: bool,
+        mut budget: Option<&mut dyn SectionBudget>,
+    ) -> Result<DownloadResult> {
         let (existing_id, mut setting) = self.resolve_target_for_download(target).await?;
         let provisional_id = match existing_id {
             Some(id) => id,
@@ -1436,7 +1458,19 @@ impl Downloader {
         let mut started_download = false;
         let mut downloaded_index = 0usize;
 
-        for (subtitle, plan) in subtitles.iter().zip(section_plans.into_iter()) {
+        for (section_index, (subtitle, plan)) in subtitles
+            .iter()
+            .zip(section_plans.into_iter())
+            .enumerate()
+        {
+            if budget
+                .as_deref_mut()
+                .is_some_and(|budget| budget.should_yield(section_index))
+            {
+                return Err(NarouError::DownloadBudgetExpired {
+                    next_section_index: section_index,
+                });
+            }
             let is_new_arrival = plan.is_new_arrival;
             let needs_download = plan.needs_download;
 

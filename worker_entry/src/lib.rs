@@ -18,7 +18,6 @@ use worker::*;
 use narou_rs::application::JobQueue as _JobQueueTrait;
 
 use crate::composition::{WorkerRuntime, check_ready};
-use crate::executor::unsupported_reason;
 
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -156,66 +155,28 @@ async fn api_jobs(mut req: Request, env: Env) -> Result<Response> {
         }
     };
     let planned = runtime.services.jobs.plan(&request);
+    let invalid = planned.invalid.clone();
+    let duplicates = planned.duplicates.clone();
     let mut ids = Vec::new();
     let mut blocked = Vec::new();
     for plan in planned.plans {
-        let queued = match runtime.ledger.enqueue(plan.clone()).await {
-            Ok(queued) => queued,
+        let outcome = match runtime.enqueue_plan(plan).await {
+            Ok(outcome) => outcome,
             Err(error) => {
-                return Response::error(format!("enqueue failed: {error}"), 500);
+                return Response::error(format!("enqueue failed: {error}"), 502);
             }
         };
-        if let Some(reason) = unsupported_reason(&plan) {
-            // Durable blocked state; no execution, no subprocess.
-            if let Err(error) = runtime
-                .ledger
-                .mark_terminal(
-                    &queued.job_id,
-                    narou_rs::application::JobLedgerStatus::Blocked,
-                    Some(&reason),
-                )
-                .await
-            {
-                return Response::error(format!("blocked recording failed: {error}"), 500);
-            }
-            blocked.push(queued.job_id.as_str().to_string());
+        if let Some(reason) = outcome.blocked {
+            console_log!("job {} blocked: {}", outcome.job_id, reason);
+            blocked.push(outcome.job_id);
         } else {
-            let envelope =
-                narou_rs::application::WorkerJobEnvelope::v2(queued.job_id.clone(), queued.job);
-            // Never send an oversized envelope: durably block it instead.
-            let within_limits = narou_rs::application::envelope_bytes(&envelope)
-                .is_ok_and(|size| size <= narou_rs::application::job_limits::MAX_ENVELOPE_BYTES);
-            if !within_limits {
-                let reason = format!(
-                    "envelope exceeds queue payload limit (max {} bytes)",
-                    narou_rs::application::job_limits::MAX_ENVELOPE_BYTES
-                );
-                if let Err(error) = runtime
-                    .ledger
-                    .mark_terminal(
-                        &queued.job_id,
-                        narou_rs::application::JobLedgerStatus::Blocked,
-                        Some(&reason),
-                    )
-                    .await
-                {
-                    return Response::error(format!("blocked recording failed: {error}"), 500);
-                }
-                blocked.push(queued.job_id.as_str().to_string());
-                continue;
-            }
-            if let Err(error) = runtime.queue.send(&envelope).await {
-                // The ledger row stays active, so a client retry of the same
-                // request returns the same id (dedupe) and re-sends cleanly.
-                return Response::error(format!("queue send failed: {error}"), 502);
-            }
-            ids.push(queued.job_id.as_str().to_string());
+            ids.push(outcome.job_id);
         }
     }
     Response::from_json(&json!({
         "ids": ids,
-        "invalid": planned.invalid,
-        "duplicates": planned.duplicates,
+        "invalid": invalid,
+        "duplicates": duplicates,
         "blocked": blocked,
     }))
 }

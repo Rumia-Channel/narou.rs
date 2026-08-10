@@ -7,36 +7,51 @@
 //! - interactive decision required (auth/adult/digest) → `Blocked`
 //! - novel gone / invalid → `Permanent`
 //! - transient transport failure → `Retryable` (bounded by the consumer)
-//! - bounded time guard tripped → `Partial` (the shared Downloader cannot
-//!   yet yield at section boundaries, so a partial result is recorded
-//!   explicitly instead of running unbounded)
+//! - section-boundary budget expiration → `Partial` with the next section
+//!   cursor (the in-flight section is never cancelled)
 //!
 //! No blanket retry-to-success and no `catch_unwind`: a panic propagates to
 //! the queue runtime, which redelivers / dead-letters the message.
 
 use std::time::Duration;
 
-use futures::future::Either;
 use narou_rs::application::{
     classify_failure, ExecutionPhase, JobFailureClass, JobId, JobPlan, JobTarget,
     WorkerExecutionCheckpoint,
 };
-use narou_rs::downloader::{DownloadResult, Downloader, UpdateStatus};
-use narou_rs::error::Result;
+use narou_rs::downloader::{DownloadResult, Downloader, SectionBudget, UpdateStatus};
+use narou_rs::error::{NarouError, Result};
 
-/// Bounded wall-clock guard per job. The shared Downloader has no section
-/// boundary yield yet, so a job that outlives this budget is recorded as an
-/// explicit partial outcome instead of running unbounded.
+/// Bounded wall-clock budget per job. It is checked only before starting the
+/// next section, so a section's fetch and persistence remain atomic from the
+/// worker's point of view.
 pub const JOB_TIME_BUDGET: Duration = Duration::from_secs(60 * 10);
+
+struct DeadlineBudget {
+    deadline_ms: f64,
+}
+
+impl DeadlineBudget {
+    fn new(budget: Duration) -> Self {
+        Self {
+            deadline_ms: js_sys::Date::now() + budget.as_secs_f64() * 1_000.0,
+        }
+    }
+}
+
+impl SectionBudget for DeadlineBudget {
+    fn should_yield(&mut self, _next_section_index: usize) -> bool {
+        js_sys::Date::now() >= self.deadline_ms
+    }
+}
 
 /// Typed outcome of executing one job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobOutcome {
     Succeeded,
-    /// Soft-budget checkpoint shape: the shared Downloader cannot yield at
-    /// safe section boundaries yet, so the bounded time guard recorded an
-    /// explicit partial outcome. Continuation is idempotent re-execution
-    /// (sections are persisted as they are fetched and overwritten on rerun).
+    /// Soft-budget checkpoint produced before the next section starts. The
+    /// checkpoint is resumable because preceding sections are already
+    /// persisted and the next section index is explicit.
     Partial {
         reason: String,
         checkpoint: WorkerExecutionCheckpoint,
@@ -77,25 +92,26 @@ pub async fn execute_job(downloader: &mut Downloader, job: &JobPlan, job_id: &Jo
         .iter()
         .any(|option| option == "--force" || option == "-f");
     let target = job.target.as_str();
-
-    let download = Box::pin(downloader.download_novel_with_force(&target, force));
-    let guard = Box::pin(worker::Delay::from(JOB_TIME_BUDGET));
-    match futures::future::select(download, guard).await {
-        Either::Left((result, _guard)) => classify_result(result, job),
-        Either::Right(((), _download)) => {
-            let novel_id = match job.target {
-                JobTarget::Id(id) => Some(id),
-                _ => None,
-            };
-            JobOutcome::Partial {
-                reason: format!(
-                    "bounded time guard tripped after {}s; shared downloader has no section-boundary yield yet",
-                    JOB_TIME_BUDGET.as_secs()
-                ),
-                checkpoint: WorkerExecutionCheckpoint::planned(job_id.clone(), novel_id)
-                    .advance(ExecutionPhase::Fetching, None),
-            }
-        }
+    let novel_id = match job.target {
+        JobTarget::Id(id) => Some(id),
+        _ => None,
+    };
+    let mut budget = DeadlineBudget::new(JOB_TIME_BUDGET);
+    match downloader
+        .download_novel_with_force_budget(&target, force, Some(&mut budget))
+        .await
+    {
+        Err(NarouError::DownloadBudgetExpired {
+            next_section_index,
+        }) => JobOutcome::Partial {
+            reason: format!(
+                "section-boundary budget expired after {}s before section {next_section_index}",
+                JOB_TIME_BUDGET.as_secs()
+            ),
+            checkpoint: WorkerExecutionCheckpoint::planned(job_id.clone(), novel_id)
+                .advance(ExecutionPhase::Fetching, Some(next_section_index as u64)),
+        },
+        result => classify_result(result, job),
     }
 }
 

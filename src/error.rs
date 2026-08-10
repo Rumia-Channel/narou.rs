@@ -35,6 +35,9 @@ pub enum NarouError {
     #[error("Site setting error: {0}")]
     SiteSetting(String),
 
+    #[error("download budget expired before section {next_section_index}")]
+    DownloadBudgetExpired { next_section_index: usize },
+
     #[error("Unsupported on this platform: {0}")]
     Unsupported(String),
 }

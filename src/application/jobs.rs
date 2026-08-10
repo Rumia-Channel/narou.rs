@@ -397,7 +397,8 @@ pub fn classify_failure(error: &NarouError) -> JobFailureClass {
         NarouError::Http(_)
         | NarouError::Io(_)
         | NarouError::Platform(_)
-        | NarouError::SuspendDownload(_) => JobFailureClass::Retryable,
+        | NarouError::SuspendDownload(_)
+        | NarouError::DownloadBudgetExpired { .. } => JobFailureClass::Retryable,
         NarouError::SiteSetting(_) | NarouError::Yaml(_) | NarouError::Regex(_) => {
             JobFailureClass::Blocked
         }
@@ -562,21 +563,16 @@ pub enum ExecutionPhase {
 
 /// Worker execution soft-budget / checkpoint shape (Phase 8).
 ///
-/// Describes how far a job got: which novel, which phase, and (when the
-/// shared Downloader can yield at safe section boundaries) which section
-/// comes next. It deliberately contains no Downloader state — continuation
-/// is *not* implemented by serializing the downloader. Today the shared
-/// Downloader cannot yield mid-run, so `next_section_index` stays `None` and
-/// a bounded time guard records an explicit `partial` outcome; durable
-/// continuation happens through idempotent re-execution (the downloader
-/// persists each section as it fetches it, and a rerun overwrites it).
+/// Describes how far a job got: which novel, which phase, and the next section
+/// index when the downloader yielded at a safe boundary. It deliberately
+/// contains no Downloader state; persisted section data plus this cursor make
+/// continuation idempotent.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkerExecutionCheckpoint {
     pub job_id: JobId,
     pub novel_id: Option<NovelId>,
     pub phase: ExecutionPhase,
-    /// `Some` only when the underlying downloader yielded at a section
-    /// boundary; `None` means the guard-based partial path was used.
+    /// `Some` when the downloader yielded before starting this section.
     pub next_section_index: Option<u64>,
 }
 
@@ -660,6 +656,22 @@ pub enum CheckpointClaim {
     Claimed(SchedulerCheckpoint),
 }
 
+/// Outcome of trying to claim a queued job for execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobClaim {
+    /// The caller owns this execution token until it expires or is completed.
+    Claimed { execution_token: String },
+    /// The row is terminal and a redelivered message can be acknowledged.
+    AlreadyTerminal,
+    /// Another invocation owns a still-valid lease. The message must not be
+    /// acknowledged or executed concurrently.
+    Busy,
+    /// No ledger row exists for the id carried by the envelope. The adapter
+    /// durably records a blocked rejection before returning this outcome.
+    Unknown,
+}
+
+
 impl SchedulerCheckpoint {
     /// Claim a generation for planning.
     ///
@@ -728,24 +740,33 @@ pub trait JobQueue: Send + Sync {
 
     /// Atomically claim a job for execution.
     ///
-    /// Returns `Ok(true)` when the job was claimed (pending/retryable, or a
-    /// crash-recovery redelivery of a running job); `Ok(false)` when the job
-    /// is already terminal and the redelivery should just be acked.
-    fn claim<'a>(&'a self, job_id: &'a JobId) -> PlatformFuture<'a, crate::error::Result<bool>>;
+    /// `Busy` is intentionally distinct from `AlreadyTerminal`: a valid
+    /// running lease must cause redelivery, never an acknowledgement.
+    fn claim<'a>(&'a self, job_id: &'a JobId) -> PlatformFuture<'a, crate::error::Result<JobClaim>>;
 
-    /// Durably record one retryable attempt; returns the new attempt count.
-    /// The caller schedules the queue retry only after this succeeds.
+    /// Persist a resumable execution checkpoint while retaining the claim.
+    fn save_checkpoint<'a>(
+        &'a self,
+        job_id: &'a JobId,
+        execution_token: &'a str,
+        checkpoint: &'a WorkerExecutionCheckpoint,
+    ) -> PlatformFuture<'a, crate::error::Result<()>>;
+
+    /// Durably record one retryable attempt for the current execution token;
+    /// returns the new attempt count. A stale token is an error.
     fn record_attempt<'a>(
         &'a self,
         job_id: &'a JobId,
+        execution_token: &'a str,
         error: &'a str,
     ) -> PlatformFuture<'a, crate::error::Result<u32>>;
 
-    /// Durably record a terminal state (succeeded/partial/blocked/permanent).
+    /// Durably record a terminal state for the current execution token.
     /// The queue message is acked only after this succeeds.
     fn mark_terminal<'a>(
         &'a self,
         job_id: &'a JobId,
+        execution_token: &'a str,
         status: JobLedgerStatus,
         error: Option<&'a str>,
     ) -> PlatformFuture<'a, crate::error::Result<()>>;

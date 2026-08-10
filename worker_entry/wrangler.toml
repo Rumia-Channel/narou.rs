@@ -59,10 +59,7 @@ class_name = "SiteRateLimiter"
 tag = "v1"
 new_sqlite_classes = ["SiteRateLimiter"]
 
-# --- Phase 8: scheduled auto-update planner ------------------------------
-# Conservative trigger: four daily probes. The planner's catch-up decision
-# (SchedulerService::decide) gates actual runs, and the checkpoint's
-# generation dedupe prevents double planning of one trigger.
-
+# Run every minute; the planner's D1 checkpoint decides whether the configured
+# HHMM wall-clock schedule is due and bounds each invocation to one page.
 [triggers]
-crons = ["0 0 * * *", "0 6 * * *", "0 12 * * *", "0 18 * * *"]
+crons = ["* * * * *"]

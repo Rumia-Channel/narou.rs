@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc};
 
 use crate::platform::clock::Clock;
 
@@ -164,17 +164,23 @@ impl SchedulerService {
         }
     }
 
-    /// Decide whether an auto-update run is due now.
-    ///
-    /// For daily schedules, a run is due when the next run time after
-    /// `last_run` is at or before `now` (catch-up semantics). For interval
-    /// schedules, a run is due when `now - last_run >= interval`. When
-    /// `last_run` is `None`, a daily schedule runs at the next fixed time
-    /// and an interval schedule runs immediately.
+    /// Decide whether an auto-update run is due using UTC wall-clock time.
     pub fn decide(
         &self,
         policy: &AutoUpdatePolicy,
         last_run: Option<DateTime<Utc>>,
+    ) -> ScheduleDecision {
+        self.decide_in_timezone(policy, last_run, chrono_tz::UTC)
+    }
+
+    /// Decide using the configured IANA timezone for daily HHMM schedules.
+    /// Interval schedules remain absolute durations and therefore ignore the
+    /// timezone argument.
+    pub fn decide_in_timezone(
+        &self,
+        policy: &AutoUpdatePolicy,
+        last_run: Option<DateTime<Utc>>,
+        timezone: chrono_tz::Tz,
     ) -> ScheduleDecision {
         let now = self.clock.now_utc();
         if !policy.enabled {
@@ -187,11 +193,13 @@ impl SchedulerService {
 
         let (run_now, next_run) = match &policy.schedule {
             AutoUpdateSchedule::Daily(schedule) => {
-                let next = schedule.next_run_after(now);
-                let missed = last_run
-                    .and_then(|last| schedule.next_run_after(last))
-                    .is_some_and(|candidate| candidate <= now);
-                (missed, next)
+                let next = next_run_after_timezone(schedule, now, timezone);
+                let run_now = match last_run {
+                    Some(last) => next_run_after_timezone(schedule, last, timezone)
+                        .is_some_and(|candidate| candidate <= now),
+                    None => latest_run_at_or_before(schedule, now, timezone).is_some(),
+                };
+                (run_now, next)
             }
             AutoUpdateSchedule::Interval(interval) => {
                 let interval_delta = chrono::TimeDelta::from_std(*interval)
@@ -199,7 +207,8 @@ impl SchedulerService {
                 let due = last_run.is_none_or(|last| now - last >= interval_delta);
                 let next = last_run.map(|last| last + *interval);
                 (due, next)
-            }        };
+            }
+        };
 
         ScheduleDecision {
             run_now,
@@ -207,6 +216,54 @@ impl SchedulerService {
             last_run,
         }
     }
+}
+fn latest_run_at_or_before(
+    schedule: &Schedule,
+    now: DateTime<Utc>,
+    timezone: chrono_tz::Tz,
+) -> Option<DateTime<Utc>> {
+    let local = now.with_timezone(&timezone);
+    let mut latest = None;
+    for day_offset in 0..=1 {
+        let date = local.date_naive() - chrono::TimeDelta::days(day_offset);
+        for &(hour, minute) in &schedule.times {
+            let naive = date.and_time(NaiveTime::from_hms_opt(hour, minute, 0)?);
+            let candidate = match timezone.from_local_datetime(&naive) {
+                LocalResult::Single(value) | LocalResult::Ambiguous(value, _) => {
+                    value.with_timezone(&Utc)
+                }
+                LocalResult::None => continue,
+            };
+            if candidate <= now && latest.is_none_or(|value| candidate > value) {
+                latest = Some(candidate);
+            }
+        }
+    }
+    latest
+}
+
+fn next_run_after_timezone(
+    schedule: &Schedule,
+    after: DateTime<Utc>,
+    timezone: chrono_tz::Tz,
+) -> Option<DateTime<Utc>> {
+    let local = after.with_timezone(&timezone);
+    for day_offset in 0..=1 {
+        let date = local.date_naive() + chrono::TimeDelta::days(day_offset);
+        for &(hour, minute) in &schedule.times {
+            let naive = date.and_time(NaiveTime::from_hms_opt(hour, minute, 0)?);
+            let candidate = match timezone.from_local_datetime(&naive) {
+                LocalResult::Single(value) | LocalResult::Ambiguous(value, _) => {
+                    value.with_timezone(&Utc)
+                }
+                LocalResult::None => continue,
+            };
+            if candidate > after {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// Build a `DateTime<Utc>` for `(hour, minute)` on the same day as `after`.
@@ -366,6 +423,42 @@ mod tests {
         let decision = service.decide(&policy, None);
         assert!(!decision.run_now);
         assert_eq!(decision.next_run, None);
+    }
+
+    #[test]
+    fn daily_schedule_runs_when_never_run_and_time_has_passed() {
+        let policy = AutoUpdatePolicy {
+            enabled: true,
+            targets: AutoUpdateTargets::All,
+            schedule: AutoUpdateSchedule::Daily(Schedule::parse("0900")),
+        };
+        let service = service_at(utc(2026, 1, 2, 1, 0).timestamp());
+        let decision = service.decide_in_timezone(
+            &policy,
+            None,
+            "Asia/Tokyo".parse().unwrap(),
+        );
+        assert!(decision.run_now);
+        assert_eq!(decision.next_run, Some(utc(2026, 1, 3, 0, 0)));
+    }
+
+    #[test]
+    fn daily_schedule_uses_configured_wall_clock_timezone() {
+        let policy = AutoUpdatePolicy {
+            enabled: true,
+            targets: AutoUpdateTargets::All,
+            schedule: AutoUpdateSchedule::Daily(Schedule::parse("0900")),
+        };
+        // 00:30 UTC is 09:30 in Tokyo; a previous Tokyo 09:00 run is due.
+        let service = service_at(utc(2026, 1, 2, 0, 30).timestamp());
+        let last_run = utc(2026, 1, 1, 0, 0);
+        let decision = service.decide_in_timezone(
+            &policy,
+            Some(last_run),
+            "Asia/Tokyo".parse().unwrap(),
+        );
+        assert!(decision.run_now);
+        assert_eq!(decision.next_run, Some(utc(2026, 1, 3, 0, 0)));
     }
 
     #[test]

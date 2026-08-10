@@ -25,7 +25,7 @@ pub mod settings;
 pub mod tag_colors;
 pub mod web_actions;
 pub use jobs::{
-    CheckpointClaim, CheckpointState, ExecutionPhase, JobFailureClass, JobId, JobKind,
+    CheckpointClaim, CheckpointState, ExecutionPhase, JobClaim, JobFailureClass, JobId, JobKind,
     JobLedgerStatus, JobPlan, JobPlanResult, JobQueue, JobRequest, JobService, JobTarget,
     LegacyEnvelopeOutcome, QueuedJob, QueuedJobView, SchedulerCheckpoint, UpdateScanPage,
     WorkerExecutionCheckpoint, WorkerJobEnvelope, WORKER_JOB_ENVELOPE_VERSION, classify_failure,

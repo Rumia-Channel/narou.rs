@@ -12,6 +12,7 @@ default = []
 
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = { version = "0.10.4", features = ["case-insensitive"] }
 futures = "0.3.33"
 hex = "0.4.3"
 hmac = "0.13.0"
