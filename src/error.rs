@@ -38,6 +38,9 @@ pub enum NarouError {
     #[error("download budget expired before section {next_section_index}")]
     DownloadBudgetExpired { next_section_index: usize },
 
+    #[error("download resume checkpoint is corrupt: {0}")]
+    DownloadResumeCorrupt(String),
+
     #[error("Unsupported on this platform: {0}")]
     Unsupported(String),
 }

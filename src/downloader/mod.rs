@@ -71,6 +71,17 @@ pub trait SectionBudget: Send {
     fn should_yield(&mut self, next_section_index: usize) -> bool;
 }
 
+/// Execution options for a resumable download.
+///
+/// `resume_from_section` identifies the first section that still needs
+/// network work. The downloader restores every preceding persisted section
+/// from the object store before fetching anything after that boundary.
+pub struct DownloadExecutionOptions<'a> {
+    pub force: bool,
+    pub budget: Option<&'a mut dyn SectionBudget>,
+    pub resume_from_section: Option<usize>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum SiteTimezone {
     Named(Tz),
@@ -1065,8 +1076,28 @@ impl Downloader {
         &mut self,
         target: &str,
         force: bool,
-        mut budget: Option<&mut dyn SectionBudget>,
+        budget: Option<&mut dyn SectionBudget>,
     ) -> Result<DownloadResult> {
+        self.download_novel_with_execution_options(
+            target,
+            DownloadExecutionOptions {
+                force,
+                budget,
+                resume_from_section: None,
+            },
+        )
+        .await
+    }
+
+    /// Download with an optional durable section resume cursor.
+    pub async fn download_novel_with_execution_options(
+        &mut self,
+        target: &str,
+        mut options: DownloadExecutionOptions<'_>,
+    ) -> Result<DownloadResult> {
+        let force = options.force;
+        let resume_from_section = options.resume_from_section;
+        let mut budget = options.budget.take();
         let (existing_id, mut setting) = self.resolve_target_for_download(target).await?;
         let provisional_id = match existing_id {
             Some(id) => id,
@@ -1402,10 +1433,33 @@ impl Downloader {
             None
         };
 
+        let resume_from = resume_from_section.unwrap_or(0);
+        if resume_from > subtitles.len() {
+            return Err(NarouError::DownloadResumeCorrupt(format!(
+                "resume section {resume_from} exceeds TOC length {}",
+                subtitles.len()
+            )));
+        }
+        let mut resumed_sections = HashMap::new();
+        for (section_index, subtitle) in subtitles.iter().enumerate().take(resume_from) {
+            let section = self
+                .persistence
+                .load_section(&object_keys, subtitle)
+                .await?
+                .ok_or_else(|| {
+                    NarouError::DownloadResumeCorrupt(format!(
+                        "persisted section {section_index} ({}) is missing",
+                        subtitle.index
+                    ))
+                })?;
+            resumed_sections.insert(section_index, section);
+        }
+
         struct SectionPlan {
             is_new_arrival: bool,
             needs_download: bool,
             predownloaded: Option<(SectionElement, String)>,
+            resumed: Option<SectionFile>,
         }
 
         let mut updated_count = 0usize;
@@ -1420,9 +1474,13 @@ impl Downloader {
         let mut section_plans = Vec::with_capacity(subtitles.len());
         let mut download_count = 0usize;
         let guard_spoiler = self.settings.local_setting_bool("guard-spoiler");
-        for subtitle in &subtitles {
-            let is_new_arrival = old_subtitles.get(&subtitle.index).is_none();
-            let (needs_download, predownloaded) = if force {
+        for (section_index, subtitle) in subtitles.iter().enumerate() {
+            let resumed = resumed_sections.remove(&section_index);
+            let is_new_arrival =
+                resumed.is_none() && old_subtitles.get(&subtitle.index).is_none();
+            let (needs_download, predownloaded) = if resumed.is_some() {
+                (false, None)
+            } else if force {
                 (true, None)
             } else {
                 self.section_needs_download(
@@ -1444,6 +1502,7 @@ impl Downloader {
                 is_new_arrival,
                 needs_download,
                 predownloaded,
+                resumed,
             });
         }
 
@@ -1463,9 +1522,10 @@ impl Downloader {
             .zip(section_plans.into_iter())
             .enumerate()
         {
-            if budget
-                .as_deref_mut()
-                .is_some_and(|budget| budget.should_yield(section_index))
+            if section_index >= resume_from
+                && budget
+                    .as_deref_mut()
+                    .is_some_and(|budget| budget.should_yield(section_index))
             {
                 return Err(NarouError::DownloadBudgetExpired {
                     next_section_index: section_index,
@@ -1474,7 +1534,9 @@ impl Downloader {
             let is_new_arrival = plan.is_new_arrival;
             let needs_download = plan.needs_download;
 
-            let download_time = if needs_download {
+            let download_time = if let Some(resumed) = plan.resumed {
+                resumed.download_time
+            } else if needs_download {
                 if !started_download {
                     report_line(&colorize(
                         &format!("ID:{display_id}　{title} のDL開始"),
@@ -2250,8 +2312,9 @@ mod tests {
     use super::types::{SectionElement, TocFile};
     use super::util::compile_html_pattern;
     use super::{
-        Downloader, Over18AccessDecision, illustration_sources, over18_access_decision,
-        requires_over18_confirmation, resolve_novel_type, resolve_user_agent,
+        DownloadExecutionOptions, Downloader, Over18AccessDecision, SectionBudget,
+        illustration_sources, over18_access_decision, requires_over18_confirmation,
+        resolve_novel_type, resolve_user_agent,
     };
     use crate::db::{self, Database};
     use crate::platform::NovelRepository;
@@ -2474,6 +2537,140 @@ mod tests {
             "テスト作品"
         );
         assert_eq!(http.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn resumable_download_reuses_persisted_prefix_without_refetching() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let db = Database::new().unwrap();
+        let mut db_slot = db::DATABASE.lock();
+        let previous_db = db_slot.take();
+        *db_slot = Some(db);
+        drop(db_slot);
+        let _db_guard = DatabaseGuard(previous_db);
+
+        struct YieldBeforeSection(usize);
+
+        impl SectionBudget for YieldBeforeSection {
+            fn should_yield(&mut self, next_section_index: usize) -> bool {
+                next_section_index >= self.0
+            }
+        }
+
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            r#"
+name: Resume Test
+domain: example.com
+top_url: https://example.com
+url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+sitename: Resume Test
+toc_url: 'https://example.com/\k<ncode>/'
+subtitles: |-
+  <a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a>
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+is_narou: false
+"#,
+        )
+        .unwrap();
+        setting.compile();
+
+        let target = "https://example.com/n1234ab/";
+        let toc_url = target;
+        let section_1 = "https://example.com/n1234ab/1/";
+        let section_2 = "https://example.com/n1234ab/2/";
+        let toc = r#"
+<h1>Resume Test</h1><span>Author</span>
+<a href="/n1234ab/1/">第1話</a>
+<a href="/n1234ab/2/">第2話</a>
+"#;
+        let http = Arc::new(MockHttpClient::new());
+        http.add_text(toc_url, 200, toc);
+        http.add_text(section_1, 200, r#"<div class="body">本文1</div>"#);
+        http.add_text(section_2, 200, r#"<div class="body">本文2</div>"#);
+        let store = Arc::new(MemoryObjectStore::new());
+        let objects: Arc<dyn ObjectStore> = store.clone();
+        let assets: Arc<dyn AssetStore> = store;
+        let mut downloader = Downloader::with_platform_and_storage_and_settings(
+            http.clone(),
+            Arc::new(FakeRateLimiter::new()),
+            Arc::new(MemoryNovelRepository::new()),
+            objects,
+            assets,
+            Arc::new(SystemClock),
+            vec![setting],
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let mut budget = YieldBeforeSection(1);
+        let partial = downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: true,
+                    budget: Some(&mut budget),
+                    resume_from_section: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                partial,
+                crate::error::NarouError::DownloadBudgetExpired {
+                    next_section_index: 1
+                }
+            ),
+            "unexpected partial result: {partial:?}; requests={:?}",
+            http.requested_urls()
+        );
+        let first_requests = http.requested_urls();
+        assert_eq!(
+            first_requests
+                .iter()
+                .filter(|url| url.ends_with(section_1))
+                .count(),
+            1
+        );
+        assert_eq!(
+            first_requests
+                .iter()
+                .filter(|url| url.ends_with(section_2))
+                .count(),
+            0
+        );
+
+        downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: false,
+                    budget: None,
+                    resume_from_section: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        let requests = http.requested_urls();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|url| url.ends_with(section_1))
+                .count(),
+            1,
+            "the persisted prefix must not be fetched again"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|url| url.ends_with(section_2))
+                .count(),
+            1
+        );
     }
 
     #[test]

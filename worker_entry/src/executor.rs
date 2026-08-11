@@ -14,12 +14,15 @@
 //! the queue runtime, which redelivers / dead-letters the message.
 
 use std::time::Duration;
+use worker::console_log;
 
 use narou_rs::application::{
     classify_failure, ExecutionPhase, JobFailureClass, JobId, JobPlan, JobTarget,
     WorkerExecutionCheckpoint,
 };
-use narou_rs::downloader::{DownloadResult, Downloader, SectionBudget, UpdateStatus};
+use narou_rs::downloader::{
+    DownloadExecutionOptions, DownloadResult, Downloader, SectionBudget, UpdateStatus,
+};
 use narou_rs::error::{NarouError, Result};
 
 /// Bounded wall-clock budget per job. It is checked only before starting the
@@ -82,7 +85,12 @@ pub fn unsupported_reason(job: &JobPlan) -> Option<String> {
 /// `downloader` is owned by the caller for the duration of a queue batch —
 /// one consumer invocation never shares a mutable Downloader across
 /// concurrent executions.
-pub async fn execute_job(downloader: &mut Downloader, job: &JobPlan, job_id: &JobId) -> JobOutcome {
+pub async fn execute_job(
+    downloader: &mut Downloader,
+    job: &JobPlan,
+    job_id: &JobId,
+    checkpoint: Option<&WorkerExecutionCheckpoint>,
+) -> JobOutcome {
     if let Some(reason) = unsupported_reason(job) {
         return JobOutcome::Blocked { reason };
     }
@@ -96,11 +104,77 @@ pub async fn execute_job(downloader: &mut Downloader, job: &JobPlan, job_id: &Jo
         JobTarget::Id(id) => Some(id),
         _ => None,
     };
+    let resume_from_section = match checkpoint {
+        None => None,
+        Some(checkpoint) if checkpoint.job_id != *job_id => {
+            return JobOutcome::Permanent {
+                reason: format!(
+                    "execution checkpoint belongs to job {}, not {}",
+                    checkpoint.job_id, job_id
+                ),
+            };
+        }
+        Some(checkpoint)
+            if checkpoint.novel_id.is_some()
+                && checkpoint.novel_id != novel_id =>
+        {
+            return JobOutcome::Permanent {
+                reason: "execution checkpoint belongs to a different novel".to_string(),
+            };
+        }
+        Some(checkpoint) => match checkpoint.phase {
+            ExecutionPhase::Planned | ExecutionPhase::Finished => None,
+            ExecutionPhase::Fetching | ExecutionPhase::Persisting => {
+                let Some(index) = checkpoint.next_section_index else {
+                    return JobOutcome::Permanent {
+                        reason: "execution checkpoint has no section cursor".to_string(),
+                    };
+                };
+                match usize::try_from(index) {
+                    Ok(index) => Some(index),
+                    Err(_) => {
+                        return JobOutcome::Permanent {
+                            reason: format!(
+                                "execution checkpoint section index {index} is not representable"
+                            ),
+                        };
+                    }
+                }
+            }
+        },
+    };
+
     let mut budget = DeadlineBudget::new(JOB_TIME_BUDGET);
-    match downloader
-        .download_novel_with_force_budget(&target, force, Some(&mut budget))
-        .await
-    {
+    let result = downloader
+        .download_novel_with_execution_options(
+            &target,
+            DownloadExecutionOptions {
+                force,
+                budget: Some(&mut budget),
+                resume_from_section,
+            },
+        )
+        .await;
+    let result = match result {
+        Err(NarouError::DownloadResumeCorrupt(reason)) if resume_from_section.is_some() => {
+            console_log!(
+                "job {job_id}: invalid resume checkpoint ({reason}); restarting from section 0"
+            );
+            let mut restart_budget = DeadlineBudget::new(JOB_TIME_BUDGET);
+            downloader
+                .download_novel_with_execution_options(
+                    &target,
+                    DownloadExecutionOptions {
+                        force,
+                        budget: Some(&mut restart_budget),
+                        resume_from_section: None,
+                    },
+                )
+                .await
+        }
+        other => other,
+    };
+    match result {
         Err(NarouError::DownloadBudgetExpired {
             next_section_index,
         }) => JobOutcome::Partial {
