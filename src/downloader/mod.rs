@@ -3373,6 +3373,16 @@ is_narou: false
 
     #[test]
     fn section_hash_cache_store_and_clear_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let db = Database::new().unwrap();
+        let mut db_slot = db::DATABASE.lock();
+        let previous_db = db_slot.take();
+        *db_slot = Some(db);
+        drop(db_slot);
+        let _db_guard = DatabaseGuard(previous_db);
+
         let mut downloader = Downloader::with_user_agent(None).unwrap();
         downloader.store_section_digest(42, "本文\\1 test.yaml", "digest-1");
 
