@@ -435,9 +435,10 @@ Worker (worker_entry)
 - D1のjob ledgerをsource of truthとし、enqueue前にidempotency keyを確定する。`pending` / `running` / `succeeded` / `retryable` / `partial` / `permanent` / `blocked` を永続化し、再配信はledger遷移で冪等化する。
 - Queue consumerは、成功またはledgerへ永続化した恒久失敗・blockedだけをackする。一時失敗はbounded retryへ送り、未知のenvelope version・未対応JobKind・認証必須サイトは成功扱いにしない。
 - `running` leaseの有効期限内に同じjobが再配信された場合は`Busy { retry_after }`として明示的に遅延再配信し、ackしない。DLQはruntimeの運用経路であり、通常consumerが直接drainしない。
-- 同一サイトの取得間隔はサイト単位のDurable Objectへ集約する。permit発行を直列化し、`Clock`による次回実行時刻とalarmで遅延を表現する。別サイトのpermitは独立して進める。
+- 同一サイトの取得間隔はサイト単位のDurable Objectへ集約する。DO内でpermit timestampを予約し、caller側が`worker::Delay`で待機する。`SiteRateLimiter`自身はalarmを使用しない。別サイトのpermitは独立して進める。
 - Cronはplannerに限定し、D1をbounded pageで走査して個別Update jobをenqueueする。Cron発火時刻をgenerationとして保存せず、D1が管理する論理generationとkeyset cursorをplanner lease付きで再開する。
 - Worker crawlerは実行予算を超える前にsection単位のcheckpointを保存して終了する。次回claim時にcheckpointのjob/novel identityを検証し、保存済みprefixをObjectStoreから復元してHTTP再取得を避ける。prefixが欠損する場合はsection 0から安全に再開する。
+- Budgetによるsection-boundary yieldは失敗retryではない。checkpointをD1へ保存してjobを`pending`へ戻し、同じjobの新しいv2 envelopeをQueueへ送信し、送信成功後に現在messageをackする。正常経路では`attempts`とQueue retry回数を消費しない。送信後ack前のクラッシュは通常の再配信に任せ、lease/dedupeで二重実行を防ぐ。
 - `Convert` / `Send` / `Mail` / `Backup` の重いnative処理はWorkerで実行せず、blockedとしてledgerへ記録する。Worker APIは既存read APIと分離し、認証・binding readiness・失敗分類を明示する。
 
 ### Phase 8 運用ポリシー
@@ -450,10 +451,10 @@ Worker (worker_entry)
   ループや暗黙の DLQ 再投入は行わない。DLQ は Queue binding の運用設定で保持し、
   `worker_jobs` の `last_error` と attempt 数を調査の source of truth とする。
 - Worker のサイト単位 rate limiter は Durable Object 1 instance をサイトごとに
-  使用し、permit の発行間隔と alarm を DO 内で直列化する。別サイトのキーは
-  独立して進む。設定の `download.interval` / `download.wait-steps` は native
-  downloader の既定値として保持し、Worker は DO の permit を crawler の
-  唯一の待機境界として利用する。
+  使用する。DO内でpermit timestampを予約し、callerが`worker::Delay`で待機する。
+  `SiteRateLimiter`はalarmを使わない。設定の `download.interval` /
+  `download.wait-steps` は native downloader の既定値として保持し、Worker は
+  DO の permit を crawler の唯一の待機境界として利用する。
 - Worker の `Downloader` は `DownloaderSettings` を Inventory から読めないため、
   `with_platform_and_storage_and_settings` に bundled site definitions と空の
   hash cache を注入する。`download.use-subdirectory`、`guard-spoiler` などの
