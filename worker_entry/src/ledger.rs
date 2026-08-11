@@ -9,11 +9,12 @@
 //! `d1_repository.rs` (RFC3339 nanosecond TEXT timestamps, bound parameters).
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use narou_rs::application::{
     CheckpointClaim, JobClaim, JobId, JobKind, JobLedgerStatus, JobPlan, JobQueue, JobTarget,
-    QueuedJob, QueuedJobView, SchedulerCheckpoint,
+    QueuedJob, QueuedJobView, SchedulerCheckpoint, WorkerExecutionCheckpoint,
 };
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{Clock, PlatformFuture};
@@ -136,6 +137,41 @@ impl D1JobLedger {
         let random = (js_sys::Math::random() * 4_294_967_296.0) as u64;
         format!("j{now:016x}{random:08x}")
     }
+    fn checkpoint_from_row(row: &JobRow) -> Result<Option<WorkerExecutionCheckpoint>> {
+        row.checkpoint_json
+            .as_deref()
+            .map(|value| {
+                serde_json::from_str(value).map_err(|error| {
+                    NarouError::Platform(format!(
+                        "execution checkpoint for job {} is corrupt: {error}",
+                        row.job_id
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    fn claimed_from_row(row: &JobRow, execution_token: String) -> Result<JobClaim> {
+        Ok(JobClaim::Claimed {
+            execution_token,
+            checkpoint: Self::checkpoint_from_row(row)?,
+        })
+    }
+
+    fn busy_retry_after(&self, row: &JobRow) -> Duration {
+        let fallback = Duration::from_secs(60);
+        let Some(lease_until) = row.lease_until.as_deref() else {
+            return fallback;
+        };
+        let Ok(lease_until) = DateTime::parse_from_rfc3339(lease_until) else {
+            return fallback;
+        };
+        let now = self.clock.now_utc();
+        let remaining = lease_until.with_timezone(&Utc) - now;
+        let seconds = remaining.num_seconds().max(0).saturating_add(5);
+        Duration::from_secs(u64::try_from(seconds).unwrap_or(60).max(1))
+    }
+
 
     /// Durably record an envelope that could not be mapped to a job
     /// (malformed payload, unsupported version, unknown job id) as `blocked`.
@@ -225,7 +261,10 @@ impl JobQueue for D1JobLedger {
                 ],
             )?;
             if changed_rows(&fresh.run().await.map_err(worker_error)?)? > 0 {
-                return Ok(JobClaim::Claimed { execution_token });
+                let row = self.select_row(job_id.as_str()).await?.ok_or_else(|| {
+                    NarouError::Platform(format!("claimed job {job_id} disappeared"))
+                })?;
+                return Self::claimed_from_row(&row, execution_token);
             }
 
             let Some(row) = self.select_row(job_id.as_str()).await? else {
@@ -243,20 +282,27 @@ impl JobQueue for D1JobLedger {
                          WHERE job_id = ? AND status = 'running'
                            AND (lease_until IS NULL OR lease_until <= ?)",
                         vec![
-                            BindValue::Text(now),
+                            BindValue::Text(now.clone()),
                             BindValue::Text(self.lease_until_rfc3339()),
                             BindValue::Text(execution_token.clone()),
                             BindValue::Text(job_id.as_str().to_string()),
-                            BindValue::Text(self.now_rfc3339()),
+                            BindValue::Text(now),
                         ],
                     )?;
                     if changed_rows(&reclaim.run().await.map_err(worker_error)?)? > 0 {
-                        Ok(JobClaim::Claimed { execution_token })
+                        let row = self.select_row(job_id.as_str()).await?.ok_or_else(|| {
+                            NarouError::Platform(format!("reclaimed job {job_id} disappeared"))
+                        })?;
+                        Self::claimed_from_row(&row, execution_token)
                     } else {
-                        Ok(JobClaim::Busy)
+                        Ok(JobClaim::Busy {
+                            retry_after: self.busy_retry_after(&row),
+                        })
                     }
                 }
-                _ => Ok(JobClaim::Busy),
+                _ => Ok(JobClaim::Busy {
+                    retry_after: self.busy_retry_after(&row),
+                }),
             }
         })
     }
@@ -403,7 +449,17 @@ impl D1SchedulerCheckpoint {
     }
 
     fn prepare(&self, sql: &str, values: Vec<BindValue>) -> Result<D1PreparedStatement> {
+
         bind_statement(self.db.prepare(sql), values)
+    }
+    fn generation_bind(generation: u64) -> Result<BindValue> {
+        i64::try_from(generation)
+            .map(BindValue::Int)
+            .map_err(|_| {
+                NarouError::Platform(format!(
+                    "scheduler generation {generation} exceeds D1 INTEGER range"
+                ))
+            })
     }
 
     /// Load the stored checkpoint, or the default when no run ever happened.
@@ -465,54 +521,175 @@ impl D1SchedulerCheckpoint {
     }
 
 
-    /// Load-checkpoint and claim a generation atomically against the
-    /// currently persisted generation. Concurrent cron invocations race on
-    /// one conditional D1 update; only one observes a changed row.
+    /// Persist a claimed checkpoint only while the planner still owns its
+    /// generation and token. A stale cron cannot overwrite a reclaimed run.
+    async fn persist_claim(
+        &self,
+        current: &SchedulerCheckpoint,
+        next: &SchedulerCheckpoint,
+        now: &str,
+        running_claim: bool,
+    ) -> Result<bool> {
+        let value_json = serde_json::to_string(next).map_err(|error| {
+            NarouError::Platform(format!("scheduler checkpoint serialization: {error}"))
+        })?;
+        let value_yaml = serde_yaml::to_string(next).map_err(|error| {
+            NarouError::Platform(format!("scheduler checkpoint YAML serialization: {error}"))
+        })?;
+        let _next_generation = Self::generation_bind(next.generation)?;
+        let condition = if running_claim {
+            "AND json_extract(app_state.value_json, '$.state') = 'running'
+             AND (json_extract(app_state.value_json, '$.planner_lease_until') IS NULL
+                  OR json_extract(app_state.value_json, '$.planner_lease_until') <= ?)"
+        } else {
+            "AND json_extract(app_state.value_json, '$.state') = 'done'"
+        };
+        let mut values = vec![
+            BindValue::Text(Self::SCOPE.to_string()),
+            BindValue::Text(Self::KEY.to_string()),
+            BindValue::Text(value_yaml),
+            BindValue::Text(value_json),
+            Self::generation_bind(current.generation)?,
+        ];
+        if running_claim {
+            values.push(BindValue::Text(now.to_string()));
+        }
+        let statement = self.prepare(
+            &format!(
+                "INSERT INTO app_state (scope, key, value_yaml, value_json)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT (scope, key) DO UPDATE SET
+                   value_yaml = excluded.value_yaml, value_json = excluded.value_json
+                 WHERE CAST(json_extract(app_state.value_json, '$.generation') AS INTEGER) = ?
+                   {condition}"
+            ),
+            values,
+        )?;
+        Ok(changed_rows(&statement.run().await.map_err(worker_error)?)? > 0)
+    }
+
+    fn planner_lease_until(now: &str) -> Result<String> {
+        let now = DateTime::parse_from_rfc3339(now).map_err(|error| {
+            NarouError::Platform(format!("invalid planner timestamp {now:?}: {error}"))
+        })?;
+        Ok((now + TimeDelta::minutes(2)).to_rfc3339_opts(SecondsFormat::Nanos, true))
+    }
+
+    fn new_planner_token() -> String {
+        let now = js_sys::Date::now() as u64;
+        let random = (js_sys::Math::random() * 18_446_744_073_709_551_616.0) as u64;
+        format!("p{now:016x}{random:016x}")
+    }
+
+    /// Claim the existing running generation for this probe, preserving its
+    /// cursor. An active lease is a normal skip, not a new generation.
+    pub async fn claim_running_probe(&self, now: &str) -> Result<CheckpointClaim> {
+        let current = self.load().await?;
+        if current.state != narou_rs::application::CheckpointState::Running {
+            return Ok(CheckpointClaim::Duplicate);
+        }
+        let token = Self::new_planner_token();
+        let lease_until = Self::planner_lease_until(now)?;
+        let next = match current.begin_with_lease(
+            current.generation,
+            now,
+            token,
+            lease_until,
+        ) {
+            CheckpointClaim::Busy => return Ok(CheckpointClaim::Busy),
+            CheckpointClaim::Duplicate => return Ok(CheckpointClaim::Duplicate),
+            CheckpointClaim::Claimed(next) => next,
+        };
+        if self.persist_claim(&current, &next, now, true).await? {
+            Ok(CheckpointClaim::Claimed(next))
+        } else {
+            Ok(CheckpointClaim::Busy)
+        }
+    }
+
+    /// Atomically start one new logical generation from a completed
+    /// checkpoint. `expected_generation` is bound as an integer in D1.
+    pub async fn claim_new_generation(
+        &self,
+        expected_generation: u64,
+        generation: u64,
+        now: &str,
+    ) -> Result<CheckpointClaim> {
+        let current = self.load().await?;
+        if current.state != narou_rs::application::CheckpointState::Done
+            || current.generation != expected_generation
+        {
+            return Ok(CheckpointClaim::Busy);
+        }
+        let next = match current.begin_with_lease(
+            generation,
+            now,
+            Self::new_planner_token(),
+            Self::planner_lease_until(now)?,
+        ) {
+            CheckpointClaim::Busy => return Ok(CheckpointClaim::Busy),
+            CheckpointClaim::Duplicate => return Ok(CheckpointClaim::Duplicate),
+            CheckpointClaim::Claimed(next) => next,
+        };
+        if self.persist_claim(&current, &next, now, false).await? {
+            Ok(CheckpointClaim::Claimed(next))
+        } else {
+            Ok(CheckpointClaim::Busy)
+        }
+    }
+
+    /// Save a page transition or finish only while `planner_token` still owns
+    /// the generation. This is the write-side half of the planner lease.
+    pub async fn save_owned(
+        &self,
+        checkpoint: &SchedulerCheckpoint,
+        planner_token: &str,
+    ) -> Result<()> {
+        let value_json = serde_json::to_string(checkpoint).map_err(|error| {
+            NarouError::Platform(format!("scheduler checkpoint JSON serialization: {error}"))
+        })?;
+        let value_yaml = serde_yaml::to_string(checkpoint).map_err(|error| {
+            NarouError::Platform(format!("scheduler checkpoint YAML serialization: {error}"))
+        })?;
+        let generation = Self::generation_bind(checkpoint.generation)?;
+        let statement = self.prepare(
+            "UPDATE app_state SET value_yaml = ?, value_json = ?
+             WHERE scope = ? AND key = ?
+               AND CAST(json_extract(value_json, '$.generation') AS INTEGER) = ?
+               AND json_extract(value_json, '$.planner_token') = ?",
+            vec![
+                BindValue::Text(value_yaml),
+                BindValue::Text(value_json),
+                BindValue::Text(Self::SCOPE.to_string()),
+                BindValue::Text(Self::KEY.to_string()),
+                generation,
+                BindValue::Text(planner_token.to_string()),
+            ],
+        )?;
+        if changed_rows(&statement.run().await.map_err(worker_error)?)? == 0 {
+            return Err(NarouError::Platform(
+                "scheduler planner lease is no longer valid".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compatibility wrapper for callers that still provide a generation.
     pub async fn claim(
         &self,
         generation: u64,
         started_at: &str,
     ) -> Result<CheckpointClaim> {
         let current = self.load().await?;
-        match current.begin(generation, started_at) {
-            CheckpointClaim::Duplicate => Ok(CheckpointClaim::Duplicate),
-            CheckpointClaim::Claimed(next) => {
-                let expected = current.generation.to_string();
-                let value_json = serde_json::to_string(&next).map_err(|error| {
-                    NarouError::Platform(format!("scheduler checkpoint serialization: {error}"))
-                })?;
-                let value_yaml = serde_yaml::to_string(&next).map_err(|error| {
-                    NarouError::Platform(format!("scheduler checkpoint YAML serialization: {error}"))
-                })?;
-                let statement = self.prepare(
-                    "INSERT INTO app_state (scope, key, value_yaml, value_json)
-                     VALUES (?, ?, ?, ?)
-                     ON CONFLICT (scope, key) DO UPDATE SET
-                       value_yaml = excluded.value_yaml,
-                       value_json = excluded.value_json
-                     WHERE json_extract(app_state.value_json, '$.generation') = ?",
-                    vec![
-                        BindValue::Text(Self::SCOPE.to_string()),
-                        BindValue::Text(Self::KEY.to_string()),
-                        BindValue::Text(value_yaml),
-                        BindValue::Text(value_json),
-                        BindValue::Text(expected),
-                    ],
-                )?;
-                if changed_rows(&statement.run().await.map_err(worker_error)?)? == 0 {
-                    let latest = self.load().await?;
-                    return Ok(match latest.begin(generation, started_at) {
-                        CheckpointClaim::Duplicate => CheckpointClaim::Duplicate,
-                        CheckpointClaim::Claimed(_) => CheckpointClaim::Duplicate,
-                    });
-                }
-                Ok(CheckpointClaim::Claimed(next))
-            }
+        if current.state == narou_rs::application::CheckpointState::Running {
+            self.claim_running_probe(started_at).await
+        } else {
+            self.claim_new_generation(current.generation, generation, started_at)
+                .await
         }
     }
 }
 
-// ---------------------------------------------------------------------------
 // Row types and helpers
 // ---------------------------------------------------------------------------
 
@@ -527,6 +704,9 @@ struct JobRow {
     last_error: Option<String>,
     created_at: String,
     updated_at: String,
+    lease_until: Option<String>,
+    execution_token: Option<String>,
+    checkpoint_json: Option<String>,
 }
 
 impl JobRow {
@@ -594,6 +774,7 @@ fn status_str(status: JobLedgerStatus) -> &'static str {
 #[derive(Debug, Clone)]
 enum BindValue {
     Text(String),
+    Int(i64),
 }
 
 fn bind_statement(
@@ -604,6 +785,7 @@ fn bind_statement(
         .into_iter()
         .map(|value| match value {
             BindValue::Text(value) => JsValue::from_str(&value),
+            BindValue::Int(value) => JsValue::from_f64(value as f64),
         })
         .collect();
     statement.bind(&values).map_err(worker_error)

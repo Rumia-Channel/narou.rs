@@ -169,7 +169,10 @@ impl WorkerRuntime {
         });
         if let Some(reason) = blocked_reason {
             match self.ledger.claim(&queued.job_id).await? {
-                JobClaim::Claimed { execution_token } => {
+                JobClaim::Claimed {
+                    execution_token,
+                    ..
+                } => {
                     self.ledger
                         .mark_terminal(
                             &queued.job_id,
@@ -180,10 +183,11 @@ impl WorkerRuntime {
                         .await?;
                 }
                 JobClaim::AlreadyTerminal | JobClaim::Unknown => {}
-                JobClaim::Busy => {
-                    return Err(narou_rs::error::NarouError::Platform(
-                        "cannot block a job with a live execution lease".to_string(),
-                    ));
+                JobClaim::Busy { retry_after } => {
+                    return Err(narou_rs::error::NarouError::Platform(format!(
+                        "cannot block a job with a live execution lease; retry after {}s",
+                        retry_after.as_secs()
+                    )));
                 }
             }
             return Ok(DispatchOutcome {

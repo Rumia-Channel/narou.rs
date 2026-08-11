@@ -36,16 +36,9 @@ max_retries = 3
 dead_letter_queue = "narou-jobs-dlq"
 max_concurrency = 1
 
-# DLQ consumer config: recovers crashed messages (the same job id re-claims
-# idempotently against the ledger — Running rows older than the stale lease
-# are crash-recovered, terminal rows are acked). Bounded retries, then the
-# message is dropped by the runtime; nothing loops forever.
-
-[[queues.consumers]]
-queue = "narou-jobs-dlq"
-max_batch_size = 10
-max_retries = 3
-max_concurrency = 1
+# There is intentionally no DLQ consumer binding. DLQ messages remain
+# operator-inspection artifacts; ordinary execution never drains or re-enqueues
+# them. A later operator action can replay a selected envelope explicitly.
 
 # --- Phase 8: per-site rate limiting Durable Object ----------------------
 # One SiteRateLimiter instance per normalized site key; the runtime

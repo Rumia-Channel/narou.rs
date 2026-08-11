@@ -143,20 +143,29 @@ async fn process_discrete(
     message: &Message<serde_json::Value>,
 ) -> Result<()> {
     let claim = runtime.ledger.claim(&job_id).await?;
-    let execution_token = match claim {
-        JobClaim::Claimed { execution_token } => execution_token,
+    let (execution_token, checkpoint) = match claim {
+        JobClaim::Claimed {
+            execution_token,
+            checkpoint,
+        } => (execution_token, checkpoint),
         JobClaim::AlreadyTerminal | JobClaim::Unknown => {
             message.ack();
             return Ok(());
         }
-        JobClaim::Busy => {
-            return Err(NarouError::Platform(format!(
-                "job {job_id} has a live execution lease; redelivery must not be acknowledged"
-            )));
+        JobClaim::Busy { retry_after } => {
+            let delay = retry_after.as_secs().clamp(1, u64::from(u32::MAX)) as u32;
+            let options = QueueRetryOptionsBuilder::new()
+                .with_delay_seconds(delay)
+                .build();
+            console_log!(
+                "job {job_id} is leased; retrying after {delay}s instead of acknowledging"
+            );
+            message.retry_with_options(&options);
+            return Ok(());
         }
     };
 
-    let outcome = execute_job(downloader, job, &job_id).await;
+    let outcome = execute_job(downloader, job, &job_id, checkpoint.as_ref()).await;
     match outcome {
         JobOutcome::Succeeded => {
             runtime
@@ -271,4 +280,17 @@ async fn retry_or_ack(
 
 fn worker_error(error: impl std::fmt::Display) -> NarouError {
     NarouError::Platform(format!("Worker runtime error: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_RETRYABLE_ATTEMPTS, retry_delay_secs};
+
+    #[test]
+    fn retry_backoff_is_one_based_and_bounded() {
+        assert_eq!(retry_delay_secs(1), 5);
+        assert_eq!(retry_delay_secs(2), 10);
+        assert_eq!(retry_delay_secs(MAX_RETRYABLE_ATTEMPTS), 20);
+        assert_eq!(retry_delay_secs(20), 60);
+    }
 }
