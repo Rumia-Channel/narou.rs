@@ -1,6 +1,6 @@
 # Platform Abstraction & Cloudflare Workers 対応設計
 
-> ステータス: Phase 1〜7 完了、Phase 8（Queues / crawler / scheduling）未着手（2026-08-10 時点）
+> ステータス: Phase 1〜8 実装完了（ローカル D1 / Worker wasm check / release build 検証済み、production binding と実運用 Cron / Queue は未検証、2026-08-10 時点）
 > 対象: narou.rs v0.3.6 以降（2026-08-10 時点の refactor-platform-abstraction）
 > 方針の一次資料: ユーザー提供リファクタリング指示（最重要原則・禁止事項・設計上の優先順位に従う）
 
@@ -314,14 +314,14 @@ pub trait NovelRepository: PlatformService {
 - `db::refresh()` は Web の subprocess 実行後に native の共有メモリを再読込するため残す。
 - `remove_migrated_novel_dir` の path 参照判定は `scan_ids` と `get` を使うが、実ファイル削除自体は Phase 4 の ObjectStore 対象。
 
-## 6. Worker implementation（Phase 6 skeleton / Phase 7 adapters）
+## 6. Worker implementation（Phase 6 skeleton / Phase 7 adapters / Phase 8 execution）
 
 | 実装 | 技術 | 状態 |
 |---|---|---|
 | portable core crate | `narou_rs` の `worker-runtime` feature | 完了。native-only modules は feature gate |
 | `worker_entry` composition root | `AppServices` + D1/Wasabi adapters | 完了。production bindings are required |
-| fetch / scheduled / queue handlers | `workers-rs` `0.8.5` event macros | 完了。queue executionはPhase 8 |
-| `worker-build` / Wrangler | `worker_entry/wrangler.toml` | 完了。D1 binding/migrationsを定義。Queue consumer登録はPhase 8へ延期 |
+| fetch / scheduled / queue handlers | `workers-rs` `0.8.5` event macros | 完了。queue consumerはD1 ledgerとbounded retryを使用 |
+| `worker-build` / Wrangler | `worker_entry/wrangler.toml` | 完了。D1 migrations / Queue producer・consumer / DLQを定義 |
 | `WorkerHttpClient` | Workers Fetch API | 完了。bounded response body、trait future、redirect policyを維持 |
 | `WasabiObjectStore` / `AssetStore` | SigV4 + S3 multipart | 完了。logical key、paged LIST、small/streaming境界を維持 |
 | `D1NovelRepository` | D1 prepared statements + migrations | 完了。typed filter/sort、keyset scan、batch mutationをSQLへ変換 |
@@ -330,7 +330,7 @@ pub trait NovelRepository: PlatformService {
 Production binding setup keeps credentials out of the repository. `worker_entry/wrangler.toml` declares the `DB` binding and `migrations_dir`; set the remote D1 `database_id` in an environment-specific Wrangler configuration before deployment. Define `WASABI_ENDPOINT`, `WASABI_BUCKET`, `WASABI_REGION`, and optional `WASABI_PREFIX` as variables, and `WASABI_ACCESS_KEY`, `WASABI_SECRET_KEY`, and `NAROU_ADMIN_TOKEN` as secrets.
 
 `worker_entry/` は fetch / scheduled / queue の3エントリだけを持つ。`composition.rs` が唯一のサービス構成点であり、Worker固有型を application/platform coreへ持ち込まない。
-Queue payload は `WorkerJobEnvelope { version: 1, job: ... }` とし、未知 version は処理せず retry する。D1/Wasabiはproduction bindingとして構成し、実ジョブ実行はPhase 8へ残す。
+Queue payload は `WorkerJobEnvelope { version: 2, job_id, job }` とし、未知 version・不正payloadはledgerへ記録して安全にackする。D1/Wasabiはproduction bindingとして構成し、Download/Updateはbounded execution + checkpoint resume、native-only jobはblockedとして処理する。
 
 D1 supports SQLite FTS5, but this adapter intentionally keeps the current
 `instr`-based folded-column search. Native compatibility requires substring,
@@ -340,15 +340,15 @@ remains an optional later index, not the metadata source of truth.
 
 Shared Downloader portability is preserved at the capability boundary:
 `Downloader::with_platform` consumes the same `HttpClient`, `RateLimiter`,
-`NovelRepository`, and storage traits on native and Worker targets. The current
-Worker fetch API is intentionally read-only; downloader execution and bundled
-site definitions remain separate deployment work rather than a second HTTP
-stack.
+`NovelRepository`, and storage traits on native and Worker targets. Worker queue
+execution constructs a fresh Downloader per invocation; bundled site definitions
+are loaded from the Worker bundle rather than a second HTTP stack.
 
 Local D1 verification (`wrangler d1 migrations apply narou-rs --local`) applies
-both migrations. `EXPLAIN QUERY PLAN` uses
-`novels_sitenames_fold_idx` for site filters and `novels_ncode_fold_idx` for
-ncode lookup; status search still performs a correlated tag subquery by design.
+all six migrations. Local smoke checks cover atomic job claiming, retryable
+transition clearing the lease, scheduler generation ownership, and rejection of
+`EXPLAIN QUERY PLAN` uses `novels_ncode_fold_idx` for ncode lookup; status
+search still performs a correlated tag subquery by design.
 This keeps the current search semantics explicit until a derived status key is
 introduced.
 
@@ -358,7 +358,8 @@ batch. A local `EXPLAIN QUERY PLAN` confirms `novels_status_sort_idx` is used
 for status ordering, while status text search intentionally retains its
 correlated compatibility expression.
 
-`worker-build --release` の今回の出力は `index_bg.wasm` 1,831,053 bytes、`index.js` 27,134 bytes。生成物は `worker_entry/build/` 以下でgit管理しない。
+`worker-build --release` completes successfully; generated artifacts under
+`worker_entry/build/` are not git-managed.
 - Panic policy: application/platform APIs return `Result`; `worker_entry` does not add a blanket `catch_unwind` or convert panics into success. Runtime event wrappers own rejected-event behavior; HTTP handlers reserve explicit 401/404/405/503 responses for boundary failures.
 - `.github/workflows/platform.yml` は native check/test/clippy、worker-runtime の wasm check、`worker-build --release` を分離して実行する。Clippy は既存コードに多数の警告が残るため、警告は既存 baseline として扱い、段階的に解消する。
 
@@ -411,7 +412,7 @@ Worker (worker_entry)
 | 5（完了） | Web UI service 層化 | Web固有のDB/FSアクセスがapplication service経由 |
 | 6（skeleton 完了） | Worker backend skeleton（`worker_entry` + feature 分離 + Wrangler） | workspace native check、portable wasm check、`worker-build --release` が通る |
 | 7（完了） | D1 NovelRepository / Wasabi ObjectStore / Worker fetch | authenticated read-only API、D1 prepared query/mutation、Wasabi small/streaming storage |
-| 8 | Queues / crawler / scheduling（Cron + Durable Object） | 外部サイト 5 秒間隔制御が Worker で動作 |
+| 8（実装完了） | Queues / crawler / scheduling（Cron + Durable Object） | D1 ledger lease、bounded retry、論理 generation cursor、section checkpoint resume、サイト単位 rate limit |
 
 各 Phase 終了時: `cargo build && cargo test && cargo clippy`。
 
@@ -431,11 +432,12 @@ Worker (worker_entry)
 ### Phase 8 実装境界（Worker Queue / crawler / scheduler）
 
 - Queue payloadは`WorkerJobEnvelope`（version付き）で、1メッセージを1つの`JobPlan`として扱う。複数小説を1 payloadへ詰めず、サイズ上限と再試行回数を明示する。
-- D1のjob ledgerをsource of truthとし、enqueue前にidempotency keyを確定する。`pending` / `running` / `succeeded` / `retryable` / `failed` / `blocked` を永続化し、再配信はledger遷移で冪等化する。
+- D1のjob ledgerをsource of truthとし、enqueue前にidempotency keyを確定する。`pending` / `running` / `succeeded` / `retryable` / `partial` / `permanent` / `blocked` を永続化し、再配信はledger遷移で冪等化する。
 - Queue consumerは、成功またはledgerへ永続化した恒久失敗・blockedだけをackする。一時失敗はbounded retryへ送り、未知のenvelope version・未対応JobKind・認証必須サイトは成功扱いにしない。
+- `running` leaseの有効期限内に同じjobが再配信された場合は`Busy { retry_after }`として明示的に遅延再配信し、ackしない。DLQはruntimeの運用経路であり、通常consumerが直接drainしない。
 - 同一サイトの取得間隔はサイト単位のDurable Objectへ集約する。permit発行を直列化し、`Clock`による次回実行時刻とalarmで遅延を表現する。別サイトのpermitは独立して進める。
-- Cronはplannerに限定し、D1をbounded pageで走査して個別Update jobをenqueueする。大規模一覧をメモリへ全展開せず、cursor/checkpointで再開可能にする。
-- Worker crawlerは実行予算を超える前にsection単位のcheckpointを保存して終了する。section結果はcontent hashとjob idで重複書込みを抑止し、再実行で修復可能にする。
+- Cronはplannerに限定し、D1をbounded pageで走査して個別Update jobをenqueueする。Cron発火時刻をgenerationとして保存せず、D1が管理する論理generationとkeyset cursorをplanner lease付きで再開する。
+- Worker crawlerは実行予算を超える前にsection単位のcheckpointを保存して終了する。次回claim時にcheckpointのjob/novel identityを検証し、保存済みprefixをObjectStoreから復元してHTTP再取得を避ける。prefixが欠損する場合はsection 0から安全に再開する。
 - `Convert` / `Send` / `Mail` / `Backup` の重いnative処理はWorkerで実行せず、blockedとしてledgerへ記録する。Worker APIは既存read APIと分離し、認証・binding readiness・失敗分類を明示する。
 
 ### Phase 8 運用ポリシー
