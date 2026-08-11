@@ -80,6 +80,36 @@ pub fn unsupported_reason(job: &JobPlan) -> Option<String> {
     None
 }
 
+fn resume_section_for_checkpoint(
+    job_id: &JobId,
+    novel_id: Option<narou_rs::platform::NovelId>,
+    checkpoint: Option<&WorkerExecutionCheckpoint>,
+) -> std::result::Result<Option<usize>, String> {
+    let Some(checkpoint) = checkpoint else {
+        return Ok(None);
+    };
+    if checkpoint.job_id != *job_id {
+        return Err(format!(
+            "execution checkpoint belongs to job {}, not {}",
+            checkpoint.job_id, job_id
+        ));
+    }
+    if checkpoint.novel_id.is_some() && checkpoint.novel_id != novel_id {
+        return Err("execution checkpoint belongs to a different novel".to_string());
+    }
+    match checkpoint.phase {
+        ExecutionPhase::Planned | ExecutionPhase::Finished => Ok(None),
+        ExecutionPhase::Fetching | ExecutionPhase::Persisting => {
+            let Some(index) = checkpoint.next_section_index else {
+                return Err("execution checkpoint has no section cursor".to_string());
+            };
+            usize::try_from(index).map(Some).map_err(|_| {
+                format!("execution checkpoint section index {index} is not representable")
+            })
+        }
+    }
+}
+
 /// Execute one job and classify the outcome.
 ///
 /// `downloader` is owned by the caller for the duration of a queue batch —
@@ -104,45 +134,11 @@ pub async fn execute_job(
         JobTarget::Id(id) => Some(id),
         _ => None,
     };
-    let resume_from_section = match checkpoint {
-        None => None,
-        Some(checkpoint) if checkpoint.job_id != *job_id => {
-            return JobOutcome::Permanent {
-                reason: format!(
-                    "execution checkpoint belongs to job {}, not {}",
-                    checkpoint.job_id, job_id
-                ),
-            };
-        }
-        Some(checkpoint)
-            if checkpoint.novel_id.is_some()
-                && checkpoint.novel_id != novel_id =>
-        {
-            return JobOutcome::Permanent {
-                reason: "execution checkpoint belongs to a different novel".to_string(),
-            };
-        }
-        Some(checkpoint) => match checkpoint.phase {
-            ExecutionPhase::Planned | ExecutionPhase::Finished => None,
-            ExecutionPhase::Fetching | ExecutionPhase::Persisting => {
-                let Some(index) = checkpoint.next_section_index else {
-                    return JobOutcome::Permanent {
-                        reason: "execution checkpoint has no section cursor".to_string(),
-                    };
-                };
-                match usize::try_from(index) {
-                    Ok(index) => Some(index),
-                    Err(_) => {
-                        return JobOutcome::Permanent {
-                            reason: format!(
-                                "execution checkpoint section index {index} is not representable"
-                            ),
-                        };
-                    }
-                }
-            }
-        },
-    };
+    let resume_from_section =
+        match resume_section_for_checkpoint(job_id, novel_id, checkpoint) {
+            Ok(index) => index,
+            Err(reason) => return JobOutcome::Permanent { reason },
+        };
 
     let mut budget = DeadlineBudget::new(JOB_TIME_BUDGET);
     let result = downloader
@@ -214,5 +210,38 @@ fn classify_result(result: Result<DownloadResult>, job: &JobPlan) -> JobOutcome 
                 reason: error.to_string(),
             },
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resume_section_for_checkpoint;
+    use narou_rs::application::{
+        ExecutionPhase, JobId, WorkerExecutionCheckpoint,
+    };
+    use narou_rs::platform::NovelId;
+
+    #[test]
+    fn checkpoint_claim_data_resolves_to_downloader_resume_index() {
+        let job_id = JobId("job-1".into());
+        let checkpoint = WorkerExecutionCheckpoint::planned(
+            job_id.clone(),
+            Some(NovelId(42)),
+        )
+        .advance(ExecutionPhase::Fetching, Some(3));
+        assert_eq!(
+            resume_section_for_checkpoint(&job_id, Some(NovelId(42)), Some(&checkpoint))
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            resume_section_for_checkpoint(
+                &JobId("other-job".into()),
+                Some(NovelId(42)),
+                Some(&checkpoint),
+            )
+            .unwrap_err(),
+            "execution checkpoint belongs to job job-1, not other-job"
+        );
     }
 }

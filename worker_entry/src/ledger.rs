@@ -78,7 +78,7 @@ impl D1JobLedger {
     async fn select_row(&self, job_id: &str) -> Result<Option<JobRow>> {
         let statement = self.prepare(
             "SELECT job_id, kind, target, options, status, attempts, last_error, created_at, updated_at,
-                    lease_until, execution_token
+                    lease_until, execution_token, checkpoint_json
              FROM worker_jobs WHERE job_id = ? LIMIT 1",
             vec![BindValue::Text(job_id.to_string())],
         )?;
@@ -90,7 +90,7 @@ impl D1JobLedger {
     async fn select_active_by_dedupe(&self, dedupe_key: &str) -> Result<Option<JobRow>> {
         let statement = self.prepare(
             "SELECT job_id, kind, target, options, status, attempts, last_error, created_at, updated_at,
-                    lease_until, execution_token
+                    lease_until, execution_token, checkpoint_json
              FROM worker_jobs WHERE dedupe_key = ? AND status IN ('pending', 'running', 'retryable') LIMIT 1",
             vec![BindValue::Text(dedupe_key.to_string())],
         )?;
@@ -307,7 +307,8 @@ impl JobQueue for D1JobLedger {
         })
     }
 
-    fn save_checkpoint<'a>(
+
+    fn yield_for_continuation<'a>(
         &'a self,
         job_id: &'a JobId,
         execution_token: &'a str,
@@ -318,7 +319,9 @@ impl JobQueue for D1JobLedger {
                 NarouError::Platform(format!("execution checkpoint serialization: {error}"))
             })?;
             let statement = self.prepare(
-                "UPDATE worker_jobs SET checkpoint_json = ?, updated_at = ?
+                "UPDATE worker_jobs
+                 SET status = 'pending', last_error = NULL, checkpoint_json = ?,
+                     updated_at = ?, lease_until = NULL, execution_token = NULL
                  WHERE job_id = ? AND status = 'running' AND execution_token = ?",
                 vec![
                     BindValue::Text(value),
@@ -791,6 +794,43 @@ fn bind_statement(
     statement.bind(&values).map_err(worker_error)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::{D1JobLedger, JobRow};
+    use narou_rs::application::{
+        ExecutionPhase, JobId, WorkerExecutionCheckpoint,
+    };
+    use narou_rs::platform::NovelId;
+
+    #[test]
+    fn job_row_checkpoint_round_trips_from_d1_shape() {
+        let checkpoint = WorkerExecutionCheckpoint::planned(
+            JobId("job-1".into()),
+            Some(NovelId(42)),
+        )
+        .advance(ExecutionPhase::Fetching, Some(3));
+        let row_json = serde_json::json!({
+            "job_id": "job-1",
+            "kind": "update",
+            "target": "42",
+            "options": "[]",
+            "status": "pending",
+            "attempts": 0,
+            "last_error": null,
+            "created_at": "2026-08-10T00:00:00Z",
+            "updated_at": "2026-08-10T00:00:00Z",
+            "lease_until": null,
+            "execution_token": null,
+            "checkpoint_json": serde_json::to_string(&checkpoint).unwrap(),
+        });
+        let row: JobRow = serde_json::from_value(row_json).unwrap();
+        assert_eq!(
+            D1JobLedger::checkpoint_from_row(&row).unwrap(),
+            Some(checkpoint)
+        );
+    }
+}
 fn worker_error(error: impl std::fmt::Display) -> NarouError {
     NarouError::Platform(format!("Worker storage error: {error}"))
 }

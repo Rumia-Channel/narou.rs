@@ -183,15 +183,13 @@ async fn process_discrete(
             reason,
             checkpoint,
         } => {
-            retry_or_ack(
-                runtime,
-                &job_id,
-                &execution_token,
-                message,
-                reason,
-                Some(&checkpoint),
-            )
-            .await?;
+            console_log!("job {job_id} yielded for continuation: {reason}");
+            runtime
+                .ledger
+                .yield_for_continuation(&job_id, &execution_token, &checkpoint)
+                .await?;
+            runtime.enqueue_plan(job.clone()).await?;
+            message.ack();
         }
         JobOutcome::Blocked { reason } => {
             runtime
@@ -220,15 +218,7 @@ async fn process_discrete(
             message.ack();
         }
         JobOutcome::Retryable { reason } => {
-            retry_or_ack(
-                runtime,
-                &job_id,
-                &execution_token,
-                message,
-                reason,
-                None,
-            )
-            .await?;
+            retry_or_ack(runtime, &job_id, &execution_token, message, reason).await?;
         }
     }
     Ok(())
@@ -240,14 +230,7 @@ async fn retry_or_ack(
     execution_token: &str,
     message: &Message<serde_json::Value>,
     reason: String,
-    checkpoint: Option<&narou_rs::application::WorkerExecutionCheckpoint>,
 ) -> Result<()> {
-    if let Some(checkpoint) = checkpoint {
-        runtime
-            .ledger
-            .save_checkpoint(job_id, execution_token, checkpoint)
-            .await?;
-    }
     let attempts = runtime
         .ledger
         .record_attempt(job_id, execution_token, &reason)
@@ -284,7 +267,7 @@ fn worker_error(error: impl std::fmt::Display) -> NarouError {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_RETRYABLE_ATTEMPTS, retry_delay_secs};
+    use super::{JobOutcome, MAX_RETRYABLE_ATTEMPTS, retry_delay_secs};
 
     #[test]
     fn retry_backoff_is_one_based_and_bounded() {
@@ -292,5 +275,36 @@ mod tests {
         assert_eq!(retry_delay_secs(2), 10);
         assert_eq!(retry_delay_secs(MAX_RETRYABLE_ATTEMPTS), 20);
         assert_eq!(retry_delay_secs(20), 60);
+    }
+
+    #[test]
+    fn four_budget_yields_do_not_consume_failure_attempts() {
+        use narou_rs::application::{
+            ExecutionPhase, JobId, WorkerExecutionCheckpoint,
+        };
+        use narou_rs::platform::NovelId;
+
+        let job_id = JobId("job-1".into());
+        let mut checkpoint =
+            WorkerExecutionCheckpoint::planned(job_id.clone(), Some(NovelId(42)));
+        for next_section_index in 1..=4 {
+            let outcome = JobOutcome::Partial {
+                reason: format!("budget yield {next_section_index}"),
+                checkpoint: checkpoint.advance(
+                    ExecutionPhase::Fetching,
+                    Some(next_section_index),
+                ),
+            };
+            checkpoint = match outcome {
+                JobOutcome::Partial { checkpoint, .. } => checkpoint,
+                JobOutcome::Retryable { .. } => {
+                    panic!("budget yields must not be retryable")
+                }
+                _ => unreachable!("budget yields must be partial"),
+            };
+        }
+        assert_eq!(checkpoint.job_id, job_id);
+        assert_eq!(checkpoint.next_section_index, Some(4));
+        assert_eq!(checkpoint.phase, ExecutionPhase::Fetching);
     }
 }

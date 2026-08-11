@@ -816,8 +816,12 @@ pub trait JobQueue: Send + Sync {
     /// running lease must cause redelivery, never an acknowledgement.
     fn claim<'a>(&'a self, job_id: &'a JobId) -> PlatformFuture<'a, crate::error::Result<JobClaim>>;
 
-    /// Persist a resumable execution checkpoint while retaining the claim.
-    fn save_checkpoint<'a>(
+
+    /// Persist a budget-yielded checkpoint and release the execution claim.
+    ///
+    /// The next queue envelope is a continuation, not a failed attempt, so
+    /// implementations must not increment `attempts`.
+    fn yield_for_continuation<'a>(
         &'a self,
         job_id: &'a JobId,
         execution_token: &'a str,
