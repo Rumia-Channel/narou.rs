@@ -72,6 +72,9 @@ impl NativeObjectStore {
         if parent.file_name().and_then(|name| name.to_str()) != Some("本文") {
             return Ok(exact);
         }
+        if !parent.exists() {
+            return Ok(exact);
+        }
         let Some(filename) = exact.file_name().and_then(|name| name.to_str()) else {
             return Ok(exact);
         };
@@ -615,5 +618,16 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(loaded, b"legacy");
+    }
+
+    #[test]
+    fn missing_section_parent_is_a_cache_miss() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let keys = crate::platform::NovelObjectKeys::new("site", "n1234ab", true).unwrap();
+        let section = keys.section("1", "第一話");
+
+        let result = futures::executor::block_on(store.read_small(&section)).unwrap();
+        assert!(result.is_none());
     }
 }

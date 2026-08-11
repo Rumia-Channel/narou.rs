@@ -60,6 +60,19 @@ pub struct NativeHttpClient {
 
 impl NativeHttpClient {
     pub fn new(user_agent: &str) -> Result<Self> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let user_agent = user_agent.to_string();
+            return std::thread::Builder::new()
+                .name("narou-native-http-init".to_string())
+                .spawn(move || Self::new_inner(&user_agent))
+                .map_err(|error| NarouError::Platform(error.to_string()))?
+                .join()
+                .map_err(|_| NarouError::Platform("native HTTP initialization thread panicked".into()))?;
+        }
+        Self::new_inner(user_agent)
+    }
+
+    fn new_inner(user_agent: &str) -> Result<Self> {
         let client = build_reqwest_client(user_agent, true)?;
         let manual_redirect_client = build_reqwest_client(user_agent, false)?;
 
@@ -778,5 +791,12 @@ mod tests {
             crate::downloader::http_policy::ensure_success_response(&url, response),
             Err(NarouError::SuspendDownload(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn constructor_is_safe_inside_async_runtime() {
+        let client = NativeHttpClient::new("narou_rs-test").unwrap();
+        assert_eq!(client.user_agent, "narou_rs-test");
+        drop(client);
     }
 }
