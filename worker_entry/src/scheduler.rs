@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use narou_rs::application::{
-    events::FreezeStore, CheckpointClaim, JobKind, JobPlan, JobTarget,
+    events::FreezeStore, CheckpointClaim, JobKind, JobPlan, JobTarget, SchedulerCheckpoint,
 };
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{NovelFilter, NovelId};
@@ -21,40 +21,28 @@ use crate::composition::WorkerRuntime;
 /// Bounded D1 scan page for one planner invocation.
 pub const AUTO_UPDATE_PAGE_SIZE: usize = 100;
 
-/// Cron entry point: decide, claim the generation, plan pages, enqueue.
+/// Cron is only a probe. The persisted checkpoint owns the logical
+/// generation and cursor, so every minute does not reset an in-flight run.
 pub async fn run_scheduled_plan(event: ScheduledEvent, env: &Env) -> Result<()> {
     let runtime = WorkerRuntime::build(env).map_err(|error| {
         NarouError::Platform(format!("Worker runtime error: {error}"))
     })?;
-    // The cron trigger time in milliseconds is the run generation: Cloudflare
-    // redelivers the *same* scheduled event on retries, so equal generations
-    // mean "already planned this run".
-    let generation = event.schedule() as u64;
-    plan_auto_update(&runtime, generation).await
+    plan_auto_update(&runtime, event.schedule() as u64).await
 }
 
 /// Plan + enqueue one bounded auto-update page.
-pub async fn plan_auto_update(runtime: &WorkerRuntime, generation: u64) -> Result<()> {
+///
+/// `probe_generation` is retained only for source compatibility with the
+/// previous helper signature. It is deliberately not persisted or compared
+/// with the scheduler checkpoint.
+pub async fn plan_auto_update(runtime: &WorkerRuntime, _probe_generation: u64) -> Result<()> {
     let loaded = runtime.checkpoint.load().await?;
+    let now = runtime.now_rfc3339();
     let mut checkpoint = if loaded.state
         == narou_rs::application::CheckpointState::Running
     {
-        if loaded.generation == generation {
-            // A redelivered cron event must not plan the same page twice. The
-            // next minute's generation will repair any pending rows that were
-            // left behind by a crash before the checkpoint save.
-            console_log!("auto-update generation {generation} already running; skipping");
-            return Ok(());
-        }
-        // A previous generation crashed after claiming its run. A new
-        // generation takes over with a fresh cursor; active ledger dedupe
-        // prevents already-dispatched jobs from stacking duplicates.
-        match runtime
-            .checkpoint
-            .claim(generation, &runtime.now_rfc3339())
-            .await?
-        {
-            CheckpointClaim::Duplicate => return Ok(()),
+        match runtime.checkpoint.claim_running_probe(&now).await? {
+            CheckpointClaim::Busy | CheckpointClaim::Duplicate => return Ok(()),
             CheckpointClaim::Claimed(checkpoint) => checkpoint,
         }
     } else {
@@ -77,21 +65,27 @@ pub async fn plan_auto_update(runtime: &WorkerRuntime, generation: u64) -> Resul
         if !decision.run_now {
             return Ok(());
         }
-        let now = runtime.now_rfc3339();
-        match runtime.checkpoint.claim(generation, &now).await? {
-            CheckpointClaim::Duplicate => {
-                console_log!("auto-update generation {generation} already claimed; skipping");
-                return Ok(());
-            }
+        match runtime
+            .checkpoint
+            .claim_new_generation(loaded.generation, loaded.generation.saturating_add(1), &now)
+            .await?
+        {
+            CheckpointClaim::Busy | CheckpointClaim::Duplicate => return Ok(()),
             CheckpointClaim::Claimed(checkpoint) => checkpoint,
         }
     };
 
+    let planner_token = checkpoint.planner_token.clone().ok_or_else(|| {
+        NarouError::Platform("claimed scheduler checkpoint has no planner token".to_string())
+    })?;
     let done = plan_page(runtime, &mut checkpoint).await?;
     if done {
         checkpoint = checkpoint.finish(&runtime.now_rfc3339());
     }
-    runtime.checkpoint.save(&checkpoint).await
+    runtime
+        .checkpoint
+        .save_owned(&checkpoint, &planner_token)
+        .await
 }
 
 /// Scan and dispatch at most one bounded page. The cursor is advanced only
@@ -120,16 +114,30 @@ async fn plan_page(
             options: Vec::new(),
         })
         .collect();
-    runtime.enqueue_batch(&plans).await?;
-    if let Some(cursor) = next_cursor {
-        *checkpoint = checkpoint.advance(cursor);
-    }
+    let dispatch = runtime.enqueue_batch(&plans).await.map(|_| ());
+    apply_page_dispatch(checkpoint, next_cursor, dispatch)?;
     console_log!(
         "auto-update: dispatched page up to id {:?} (full: {page_full}, jobs: {})",
         next_cursor,
         plans.len()
     );
     Ok(!page_full)
+}
+
+/// Commit a successful queue page and only then advance the durable cursor.
+///
+/// A failed dispatch leaves the cursor untouched so the next planner run can
+/// repair the pending ledger rows from the same page.
+fn apply_page_dispatch(
+    checkpoint: &mut SchedulerCheckpoint,
+    next_cursor: Option<i64>,
+    dispatch: Result<()>,
+) -> Result<()> {
+    dispatch?;
+    if let Some(cursor) = next_cursor {
+        *checkpoint = checkpoint.advance(cursor);
+    }
+    Ok(())
 }
 
 async fn settings_timezone(
@@ -181,4 +189,25 @@ async fn settings_value(
     services.settings.get(name).await.map_err(|error| {
         NarouError::Platform(format!("cannot read setting {name:?}: {error}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_page_dispatch, SchedulerCheckpoint};
+    use narou_rs::error::NarouError;
+
+    #[test]
+    fn failed_page_dispatch_preserves_cursor_for_pending_repair() {
+        let mut checkpoint = SchedulerCheckpoint::default().advance(100);
+        let result = apply_page_dispatch(
+            &mut checkpoint,
+            Some(200),
+            Err(NarouError::Platform("queue unavailable".into())),
+        );
+        assert!(result.is_err());
+        assert_eq!(checkpoint.cursor, Some(100));
+
+        apply_page_dispatch(&mut checkpoint, Some(200), Ok(())).unwrap();
+        assert_eq!(checkpoint.cursor, Some(200));
+    }
 }

@@ -8,6 +8,9 @@
 //! [`JobPlan`] values and does the actual work.
 
 use std::collections::HashSet;
+use std::time::Duration;
+
+use chrono::DateTime;
 
 use crate::application::error::ApplicationError;
 use crate::error::NarouError;
@@ -399,9 +402,10 @@ pub fn classify_failure(error: &NarouError) -> JobFailureClass {
         | NarouError::Platform(_)
         | NarouError::SuspendDownload(_)
         | NarouError::DownloadBudgetExpired { .. } => JobFailureClass::Retryable,
-        NarouError::SiteSetting(_) | NarouError::Yaml(_) | NarouError::Regex(_) => {
-            JobFailureClass::Blocked
-        }
+        NarouError::DownloadResumeCorrupt(_)
+        | NarouError::SiteSetting(_)
+        | NarouError::Yaml(_)
+        | NarouError::Regex(_) => JobFailureClass::Blocked,
         // Interactive decisions (age verification, digest choice) have no
         // terminal on the Worker; the downloader reports them explicitly.
         NarouError::Unsupported(_) => JobFailureClass::Blocked,
@@ -622,16 +626,22 @@ pub enum CheckpointState {
 /// on the host.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchedulerCheckpoint {
-    /// Monotonic run generation (the cron trigger time in ms). Duplicate
-    /// deliveries of the same generation are skipped.
+    /// Monotonic logical run generation. Cron probe timestamps are not
+    /// generations; a generation changes only when a due run starts.
     pub generation: u64,
     pub state: CheckpointState,
     /// Last novel id already enqueued by the current generation.
     pub cursor: Option<i64>,
-    /// When the current generation was claimed.
+    /// When the current logical generation was claimed.
     pub started_at: Option<String>,
     /// When the last completed generation finished (drives catch-up).
     pub last_run: Option<String>,
+    /// Lease held by the planner that owns the current page.
+    #[serde(default)]
+    pub planner_lease_until: Option<String>,
+    /// Ownership token for the current planner lease.
+    #[serde(default)]
+    pub planner_token: Option<String>,
 }
 
 impl Default for SchedulerCheckpoint {
@@ -642,15 +652,18 @@ impl Default for SchedulerCheckpoint {
             cursor: None,
             started_at: None,
             last_run: None,
+            planner_lease_until: None,
+            planner_token: None,
         }
     }
 }
 
-/// Outcome of trying to claim a planner generation.
+/// Outcome of trying to claim a planner generation or probe lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckpointClaim {
-    /// This exact generation is already running (duplicate cron delivery or
-    /// overlapping retry): the planner must not enqueue again.
+    /// Another planner currently owns the lease.
+    Busy,
+    /// The probe or generation was already handled.
     Duplicate,
     /// The planner may proceed with the returned checkpoint.
     Claimed(SchedulerCheckpoint),
@@ -660,40 +673,94 @@ pub enum CheckpointClaim {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobClaim {
     /// The caller owns this execution token until it expires or is completed.
-    Claimed { execution_token: String },
+    Claimed {
+        execution_token: String,
+        checkpoint: Option<WorkerExecutionCheckpoint>,
+    },
     /// The row is terminal and a redelivered message can be acknowledged.
     AlreadyTerminal,
-    /// Another invocation owns a still-valid lease. The message must not be
-    /// acknowledged or executed concurrently.
-    Busy,
+    /// Another invocation owns a still-valid lease. The message must be
+    /// delayed until that lease expires; it must not be acknowledged.
+    Busy { retry_after: Duration },
     /// No ledger row exists for the id carried by the envelope. The adapter
     /// durably records a blocked rejection before returning this outcome.
     Unknown,
 }
 
 
+
 impl SchedulerCheckpoint {
-    /// Claim a generation for planning.
+    /// Claim a logical generation without a planner lease.
     ///
-    /// A claim for the *same* generation is always rejected — whether the
-    /// generation is still running (overlapping delivery) or already
-    /// completed (redelivery after a crash or retry) — so a duplicate cron
-    /// event never enqueues twice. A *new* generation takes over even when
-    /// the previous one crashed mid-run (recovery happens at the next
-    /// scheduled event); the ledger's active dedupe key keeps the re-enqueue
-    /// from stacking duplicates.
+    /// This compatibility helper is used by pure host tests. Worker
+    /// scheduling uses [`Self::begin_with_lease`] so a minute probe cannot
+    /// create a new generation while a page is still running.
     pub fn begin(&self, generation: u64, started_at: &str) -> CheckpointClaim {
-        if self.generation == generation {
+        if self.generation >= generation {
             CheckpointClaim::Duplicate
         } else {
-            CheckpointClaim::Claimed(SchedulerCheckpoint {
+            CheckpointClaim::Claimed(Self {
                 generation,
                 state: CheckpointState::Running,
                 cursor: None,
                 started_at: Some(started_at.to_string()),
                 last_run: self.last_run.clone(),
+                planner_lease_until: None,
+                planner_token: None,
             })
         }
+    }
+
+    /// Claim either a new logical generation or the existing running
+    /// generation. An active planner lease returns `Busy`; an expired lease
+    /// preserves the generation and cursor while replacing its owner token.
+    pub fn begin_with_lease(
+        &self,
+        generation: u64,
+        now: &str,
+        planner_token: String,
+        planner_lease_until: String,
+    ) -> CheckpointClaim {
+        if self.state == CheckpointState::Running {
+            if self.planner_lease_active(now) {
+                return CheckpointClaim::Busy;
+            }
+            return CheckpointClaim::Claimed(Self {
+                generation: self.generation,
+                state: CheckpointState::Running,
+                cursor: self.cursor,
+                started_at: self.started_at.clone().or_else(|| Some(now.to_string())),
+                last_run: self.last_run.clone(),
+                planner_lease_until: Some(planner_lease_until),
+                planner_token: Some(planner_token),
+            });
+        }
+        if self.generation >= generation {
+            return CheckpointClaim::Duplicate;
+        }
+        CheckpointClaim::Claimed(Self {
+            generation,
+            state: CheckpointState::Running,
+            cursor: None,
+            started_at: Some(now.to_string()),
+            last_run: self.last_run.clone(),
+            planner_lease_until: Some(planner_lease_until),
+            planner_token: Some(planner_token),
+        })
+    }
+
+    /// Whether the planner lease is still valid at `now`.
+    pub fn planner_lease_active(&self, now: &str) -> bool {
+        let Some(lease_until) = self.planner_lease_until.as_deref() else {
+            return false;
+        };
+        let Ok(now) = DateTime::parse_from_rfc3339(now) else {
+            return false;
+        };
+        let Ok(lease_until) = DateTime::parse_from_rfc3339(lease_until) else {
+            return false;
+        };
+        lease_until > now
     }
 
     /// Advance the keyset cursor after enqueueing a full page.
@@ -704,10 +771,13 @@ impl SchedulerCheckpoint {
             cursor: Some(cursor),
             started_at: self.started_at.clone(),
             last_run: self.last_run.clone(),
+            planner_lease_until: self.planner_lease_until.clone(),
+            planner_token: self.planner_token.clone(),
         }
     }
 
-    /// Complete the generation: record the finish time and release the run.
+    /// Complete the generation: record the finish time and release the run
+    /// and its planner ownership.
     pub fn finish(&self, finished_at: &str) -> Self {
         Self {
             generation: self.generation,
@@ -715,6 +785,8 @@ impl SchedulerCheckpoint {
             cursor: None,
             started_at: None,
             last_run: Some(finished_at.to_string()),
+            planner_lease_until: None,
+            planner_token: None,
         }
     }
 }
@@ -1029,6 +1101,10 @@ mod tests {
             )),
             JobFailureClass::Blocked
         );
+        assert_eq!(
+            classify_failure(&NarouError::DownloadResumeCorrupt("missing section".into())),
+            JobFailureClass::Blocked
+        );
     }
 
     #[test]
@@ -1058,6 +1134,7 @@ mod tests {
         let claimed = match start.begin(7, "2026-08-10T00:00:00Z") {
             CheckpointClaim::Claimed(checkpoint) => checkpoint,
             CheckpointClaim::Duplicate => panic!("fresh checkpoint must claim"),
+            CheckpointClaim::Busy => panic!("compatibility begin cannot be busy"),
         };
         assert_eq!(claimed.state, CheckpointState::Running);
         assert_eq!(claimed.generation, 7);
@@ -1074,10 +1151,52 @@ mod tests {
         let next = match claimed.begin(8, "2026-08-10T00:30:00Z") {
             CheckpointClaim::Claimed(checkpoint) => checkpoint,
             CheckpointClaim::Duplicate => panic!("new generation must claim"),
+            CheckpointClaim::Busy => panic!("compatibility begin cannot be busy"),
         };
         assert_eq!(next.generation, 8);
         assert_eq!(next.cursor, None);
         assert_eq!(next.last_run, claimed.last_run);
+    }
+
+    #[test]
+    fn planner_lease_blocks_duplicate_probe_and_preserves_cursor_on_reclaim() {
+        let checkpoint = SchedulerCheckpoint::default();
+        let claimed = match checkpoint.begin_with_lease(
+            1,
+            "2026-08-10T00:00:00Z",
+            "planner-a".into(),
+            "2026-08-10T00:02:00Z".into(),
+        ) {
+            CheckpointClaim::Claimed(value) => value,
+            CheckpointClaim::Duplicate | CheckpointClaim::Busy => {
+                panic!("initial planner claim must succeed")
+            }
+        };
+        let advanced = claimed.advance(42);
+        assert_eq!(
+            advanced.begin_with_lease(
+                1,
+                "2026-08-10T00:01:00Z",
+                "planner-b".into(),
+                "2026-08-10T00:03:00Z".into(),
+            ),
+            CheckpointClaim::Busy
+        );
+
+        let reclaimed = match advanced.begin_with_lease(
+            1,
+            "2026-08-10T00:03:00Z",
+            "planner-b".into(),
+            "2026-08-10T00:05:00Z".into(),
+        ) {
+            CheckpointClaim::Claimed(value) => value,
+            CheckpointClaim::Duplicate | CheckpointClaim::Busy => {
+                panic!("expired planner lease must be reclaimable")
+            }
+        };
+        assert_eq!(reclaimed.generation, 1);
+        assert_eq!(reclaimed.cursor, Some(42));
+        assert_eq!(reclaimed.planner_token.as_deref(), Some("planner-b"));
     }
 
     #[test]
@@ -1086,6 +1205,7 @@ mod tests {
         let claimed = match checkpoint.begin(1, "2026-08-10T00:00:00Z") {
             CheckpointClaim::Claimed(value) => value,
             CheckpointClaim::Duplicate => unreachable!(),
+            CheckpointClaim::Busy => unreachable!(),
         };
         let advanced = claimed.advance(500);
         assert_eq!(advanced.cursor, Some(500));
@@ -1199,5 +1319,34 @@ mod tests {
         assert!(page.done);
         assert_eq!(page.next_cursor, None);
         assert!(page.plans.is_empty());
+    }
+
+    #[test]
+    fn bounded_auto_update_page_walks_300_novels_without_resetting_cursor() {
+        let ids: Vec<_> = (1..=300).map(NovelId).collect();
+        let mut after = 0usize;
+        let mut seen = Vec::new();
+
+        for expected_cursor in [100usize, 200, 300] {
+            let start = after;
+            let end = start + 100;
+            let page = service().plan_auto_update_page(
+                &ids[start..end],
+                &[],
+                100,
+            );
+            assert!(!page.done);
+            assert_eq!(page.next_cursor, Some(expected_cursor as i64));
+            seen.extend(page.plans.into_iter().map(|job| match job.target {
+                JobTarget::Id(id) => id.0,
+                _ => panic!("scheduler emitted a non-novel target"),
+            }));
+            after = end;
+        }
+
+        let final_page = service().plan_auto_update_page(&[], &[], 100);
+        assert!(final_page.done);
+        assert_eq!(final_page.next_cursor, None);
+        assert_eq!(seen, ids.iter().map(|id| id.0).collect::<Vec<_>>());
     }
 }
