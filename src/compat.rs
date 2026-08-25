@@ -212,10 +212,23 @@ pub fn fsync_parent_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn canonicalize_aozoraepub3_jar_dir(dir: &str) -> Option<PathBuf> {
+/// `aozoraepub3dir` 設定が指すディレクトリから変換ツールの実体を解決する。
+/// Java 版 (`AozoraEpub3.jar`) を優先し、無ければ Rust 製 Lite のバイナリ
+/// (`AozoraEpub3_Lite.exe` / `AozoraEpub3.exe`、非 Windows は拡張子なし) を受け付ける。
+pub fn canonicalize_aozoraepub3_tool_path(dir: &str) -> Option<PathBuf> {
     let canonical_dir = canonicalize_existing_path(PathBuf::from(dir))?;
     let jar = canonical_dir.join("AozoraEpub3.jar");
-    canonicalize_existing_path(jar)
+    if let Some(jar) = canonicalize_existing_path(jar) {
+        return Some(jar);
+    }
+    [
+        "AozoraEpub3_Lite.exe",
+        "AozoraEpub3.exe",
+        "AozoraEpub3_Lite",
+        "AozoraEpub3",
+    ]
+    .into_iter()
+    .find_map(|name| canonicalize_existing_path(canonical_dir.join(name)))
 }
 
 pub fn resolve_java_command_path() -> Option<PathBuf> {
@@ -971,7 +984,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        DigestChoice, NovelLockGuard, choose_digest_action_with_auto_choices,
+        DigestChoice, NovelLockGuard, canonicalize_aozoraepub3_tool_path,
+        canonicalize_existing_path, choose_digest_action_with_auto_choices,
         configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
         load_locked_ids_from_inventory, mark_not_found_and_freeze, parse_digest_auto_choices,
         record_is_frozen, reroute_web_line_to_console, resolve_auto_convert_devices,
@@ -1385,5 +1399,41 @@ mod tests {
 
         let status = child.wait().expect("wait child");
         assert!(status.success(), "child failed: {status:?}");
+    }
+
+    #[test]
+    fn aozora_tool_path_requires_existing_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+        assert_eq!(canonicalize_aozoraepub3_tool_path(&dir), None);
+    }
+
+    #[test]
+    fn aozora_tool_path_accepts_lite_binary_when_jar_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("AozoraEpub3_Lite.exe"), b"stub").unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+
+        let resolved = canonicalize_aozoraepub3_tool_path(&dir).expect("lite binary resolved");
+
+        assert_eq!(
+            Some(resolved),
+            canonicalize_existing_path(temp.path().join("AozoraEpub3_Lite.exe"))
+        );
+    }
+
+    #[test]
+    fn aozora_tool_path_prefers_jar_over_lite_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("AozoraEpub3.jar"), b"stub jar").unwrap();
+        std::fs::write(temp.path().join("AozoraEpub3_Lite.exe"), b"stub lite").unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+
+        let resolved = canonicalize_aozoraepub3_tool_path(&dir).expect("jar resolved");
+
+        assert_eq!(
+            Some(resolved),
+            canonicalize_existing_path(temp.path().join("AozoraEpub3.jar"))
+        );
     }
 }

@@ -7,9 +7,9 @@ Java 版 AozoraEpub3 の代替として [AozoraEpub3_Lite](https://github.com/Ru
 **代替として使用可能。** narou.rs の CLI 引数 (`-enc UTF-8 -of [-c 0] -dst <dir> [-ext .kepub.epub] [-hor] <txt>`) をそのまま受理し、エンドツーエンドの `convert` もコード無変更で動作する。ただし以下の注意がある。
 
 1. Java 版と出力は完全一致ではない。差分は5系統 (下記)。実質的な問題は全角マイナス `－`(U+FF0D) を `―`(U+2015) へ勝手に変換する点のみ。
-2. **`aozoraepub3dir` 設定経由では選択できない。** `src/compat.rs:215` の `canonicalize_aozoraepub3_jar_dir` が `AozoraEpub3.jar` の存在を要求する。jar があれば java 経路が優先されるため、設定で Lite を指すことは不可能。
-3. 動作した経路: 設定の `aozoraepub3dir` を無効化 → Lite 実行ファイルを **`AozoraEpub3.exe` にリネーム**して PATH 配置 → `OutputManager::find_external_tool` (`src/converter/device.rs:206`) の `where` フォールバックで発見・実行。直接 CLI 実行と byte 等価の出力を確認。
-4. 正式対応するなら compat.rs / device.rs の小改修 (settings から非 jar バイナリを許容) が妥当。
+2. ~~`aozoraepub3dir` 設定経由では選択できない~~ → **実装済み (2026-08-25)**: `canonicalize_aozoraepub3_tool_path` (`src/compat.rs`) が jar を優先しつつ `AozoraEpub3_Lite.exe` / `AozoraEpub3.exe` / 拡張子なしバイナリを受理する。設定で Lite ディレクトリを直接指定可能。
+3. 実装前の暫定経路: 設定の `aozoraepub3dir` を無効化 → Lite 実行ファイルを **`AozoraEpub3.exe` にリネーム**して PATH 配置 → `OutputManager::find_external_tool` の `where` フォールバックで発見・実行。
+4. ~~正式対応するなら compat.rs / device.rs の小改修が妥当~~ → 実装完了。E2E (`convert n8021mo`, 設定→deploy ディレクトリ) で直接 CLI 実行と byte 等価を再確認。
 
 ## テスト環境
 
@@ -109,11 +109,12 @@ cp -r assets/aozora C:/path/to/tools/
 
 注意: MSYS/git-bash の `PATH="/c/...:$PATH"` (コロン区切り) だと Rust 側 `where` が解決しない。Windows 形式 (`C:/...;%PATH%`) で渡すこと。
 
-## 正式対応案 (要コード変更)
+## 正式対応 (実装済み 2026-08-25)
 
-- `canonicalize_aozoraepub3_jar_dir` を「jar があれば jar、なければ同名 exe (例: `AozoraEpub3_Lite.exe` / `AozoraEpub3.exe`)」に緩和する
-- `build_aozora_command` は既に非 jar を直接 spawn するため変更不要の可能性が高い
-- kindlegen 探索 (`find_kindlegen_next_to_aozora`) は settings 経路前提。PATH 経由時に mobi デバイスが探索不能になる点は要調整
+- `canonicalize_aozoraepub3_jar_dir` を `canonicalize_aozoraepub3_tool_path` に改称し、「jar があれば jar、なければ `AozoraEpub3_Lite.exe` / `AozoraEpub3.exe` / 拡張子なしバイナリ」の解決を実装。単体テスト3件追加 (`src/compat.rs` tests)
+- `build_aozora_command` は変更不要だった (非 jar を直接 spawn 済み)。device.rs は呼び出し名の更新のみ
+- kindlegen 探索 (`find_kindlegen_next_to_aozora`) はツールパスの親ディレクトリを見るため jar/exe 両対応。PATH 経由時のみ Kindle Previewer フォールバックに依存
+- E2E: `aozoraepub3dir` → Lite deploy ディレクトリを指定して `convert n8021mo` が成功、出力は Lite 直接実行と byte 等価
 
 ## 未検証リスク
 

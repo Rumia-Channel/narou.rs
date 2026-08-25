@@ -13,7 +13,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use crate::compat::{
-    canonicalize_aozoraepub3_jar_dir, canonicalize_existing_path, configure_hidden_console_command,
+    canonicalize_aozoraepub3_tool_path, canonicalize_existing_path, configure_hidden_console_command,
     load_global_setting_string, resolve_java_command_path, sanitize_java_command,
 };
 use crate::downloader::util::decode_numeric_entities;
@@ -283,7 +283,7 @@ impl OutputManager {
 
     fn find_aozora_epub3_from_settings() -> Option<PathBuf> {
         let dir = load_global_setting_string("aozoraepub3dir")?;
-        canonicalize_aozoraepub3_jar_dir(&dir)
+        canonicalize_aozoraepub3_tool_path(&dir)
     }
 
     fn aozora_device_name(&self) -> Option<&'static str> {
