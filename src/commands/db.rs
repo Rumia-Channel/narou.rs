@@ -22,6 +22,9 @@ pub enum DbAction {
 }
 
 pub fn cmd_db(action: DbAction) -> narou_rs::error::Result<()> {
+    // Every action operates on the live handle; this also triggers the
+    // legacy import on first run.
+    narou_rs::db::init_database()?;
     match action {
         DbAction::Verify => cmd_verify(),
         DbAction::ExportYaml { out } => cmd_export_yaml(out),
