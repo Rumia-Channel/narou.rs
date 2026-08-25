@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 const COMMAND_NAMES: &[&str] = &[
+    "db",
     "download", "update", "list", "convert", "diff", "setting", "alias", "inspect", "send",
     "folder", "browser", "remove", "freeze", "tag", "web", "mail", "backup", "csv", "clean", "log",
     "trace", "help", "version", "init", "illust",
@@ -633,6 +634,11 @@ pub struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Commands {
+    /// Maintenance operations for the SQLite management database (P2).
+    Db {
+        #[command(subcommand)]
+        action: crate::commands::db::DbAction,
+    },
     Init {
         #[arg(short = 'p', long = "path")]
         aozora_path: Option<String>,

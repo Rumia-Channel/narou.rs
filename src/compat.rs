@@ -252,6 +252,21 @@ pub fn resolve_java_command_path() -> Option<PathBuf> {
 }
 
 pub fn load_global_setting_value(key: &str) -> Option<serde_yaml::Value> {
+    // P2: when the SQLite state backend is active, the payload of
+    // `global_setting.yaml` lives in app_state('global', 'global_setting').
+    #[cfg(feature = "native-runtime")]
+    if !crate::native::sqlite::state::legacy_yaml_active() {
+        if let Some(state) = crate::native::sqlite::state::shared() {
+            if let Ok(Some(raw)) = state.get_raw("global", "global_setting") {
+                if let Ok(settings) =
+                    serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(&raw)
+                {
+                    return settings.get(key).cloned();
+                }
+            }
+            return None;
+        }
+    }
     let path = global_setting_path()?;
     let raw = fs::read_to_string(path).ok()?;
     let settings: HashMap<String, serde_yaml::Value> = serde_yaml::from_str(&raw).ok()?;

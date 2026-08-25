@@ -127,6 +127,56 @@ fn notepad_path() -> crate::error::Result<PathBuf> {
         .join("notepad.txt"))
 }
 
+
+/// P2: notepad text lives in app_state('inv','notepad'); the file under
+/// `.narou/` remains only as a legacy import source / pre-DB fallback.
+fn notepad_state() -> Option<crate::native::sqlite::state::StateDb> {
+    #[cfg(feature = "native-runtime")]
+    {
+        if crate::native::sqlite::state::legacy_yaml_active() {
+            return None;
+        }
+        crate::native::sqlite::state::shared().filter(|state| {
+            Inventory::with_default_root()
+                .map(|inventory| {
+                    state.matches_root(&inventory.root_dir().join(".narou"))
+                })
+                .unwrap_or(false)
+        })
+    }
+    #[cfg(not(feature = "native-runtime"))]
+    {
+        None
+    }
+}
+
+fn read_notepad() -> String {
+    if let Some(state) = notepad_state() {
+        return state
+            .get_raw("inv", "notepad")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+    }
+    notepad_path()
+        .ok()
+        .and_then(|path| read_notepad_content(&path).ok())
+        .unwrap_or_default()
+}
+
+fn write_notepad(content: &str) -> std::io::Result<()> {
+    if let Some(state) = notepad_state() {
+        return state
+            .set_raw("inv", "notepad", content)
+            .map_err(|error| std::io::Error::other(error.to_string()));
+    }
+    let path = notepad_path().map_err(|error| std::io::Error::other(error.to_string()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)
+}
+
 fn read_notepad_content(path: &Path) -> std::io::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(content) => Ok(content),
@@ -263,15 +313,13 @@ pub async fn all_novel_ids(State(state): State<AppState>) -> Json<serde_json::Va
 }
 
 pub async fn notepad_read(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let content = notepad_path()
-        .ok()
-        .and_then(|path| read_notepad_content(&path).ok())
-        .unwrap_or_default();
+    let content = read_notepad();
     Json(notepad_response_value(&content))
 }
 
 pub async fn notepad_save(
     State(state): State<AppState>,
+    #[allow(unused_variables)]
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let content = body["content"]
@@ -286,24 +334,28 @@ pub async fn notepad_save(
             "message": message,
         }));
     }
-    let path = match notepad_path() {
-        Ok(path) => path,
-        Err(e) => {
+    let state_db = notepad_state();
+    if state_db.is_none() {
+        // Legacy file flow (pre-DB libraries / legacy escape hatch).
+        let path = match notepad_path() {
+            Ok(path) => path,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "success": false,
+                    "message": e.to_string(),
+                }));
+            }
+        };
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
             return Json(serde_json::json!({
                 "success": false,
                 "message": e.to_string(),
             }));
         }
-    };
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        return Json(serde_json::json!({
-            "success": false,
-            "message": e.to_string(),
-        }));
     }
-    let current_content = read_notepad_content(&path).unwrap_or_default();
+    let current_content = read_notepad();
     let current_object_id = notepad_object_id(&current_content);
     let request_object_id = body["object_id"].as_str().unwrap_or("");
 
@@ -318,7 +370,12 @@ pub async fn notepad_save(
         }));
     }
 
-    let result = crate::db::inventory::atomic_write(&path, content);
+    let result = if let Some(ref db) = state_db {
+        db.set_raw("inv", "notepad", content)
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    } else {
+        write_notepad(content)
+    };
     let object_id = notepad_object_id(content);
     let response = serde_json::json!({
         "content": content,

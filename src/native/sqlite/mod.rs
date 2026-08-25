@@ -10,7 +10,9 @@
 //! Every trait call runs on a blocking thread (`tokio::task::spawn_blocking`)
 //! because the trait is async only for D1 symmetry.
 
+pub mod bulk;
 mod migrations;
+pub mod state;
 mod query;
 mod record_map;
 mod repository;

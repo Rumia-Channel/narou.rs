@@ -42,7 +42,24 @@ struct CacheKey {
 pub struct Inventory {
     root_dir: PathBuf,
     cache: Mutex<InventoryCache>,
+    /// SQLite-backed management state (P2). `Some` only when the instance's
+    /// root owns the process-wide `.narou/db.sqlite` and no legacy escape
+    /// hatch is active.
+    #[cfg(feature = "native-runtime")]
+    state: Option<crate::native::sqlite::state::StateDb>,
 }
+
+/// Names whose raw payloads live in `app_state` instead of files while the
+/// SQLite backend is active.
+#[cfg(feature = "native-runtime")]
+const SQLITE_MANAGED_NAMES: &[&str] = &[
+    "freeze",
+    "alias",
+    "tag_colors",
+    "latest_convert",
+    "local_setting",
+    "global_setting",
+];
 
 struct InventoryCache {
     entries: HashMap<CacheKey, CacheEntry>,
@@ -96,9 +113,13 @@ impl InventoryCache {
 
 impl Inventory {
     pub fn new(root_dir: PathBuf) -> Self {
+        #[cfg(feature = "native-runtime")]
+        let state = crate::native::sqlite::state::StateDb::shared_for(&root_dir);
         Self {
             root_dir,
             cache: Mutex::new(InventoryCache::new()),
+            #[cfg(feature = "native-runtime")]
+            state,
         }
     }
 
@@ -107,7 +128,7 @@ impl Inventory {
         Ok(Self::new(root))
     }
 
-    fn inventory_path(&self, name: &str, scope: InventoryScope) -> PathBuf {
+    pub(crate) fn inventory_path(&self, name: &str, scope: InventoryScope) -> PathBuf {
         let dir = match scope {
             InventoryScope::Local => self.root_dir.join(".narou"),
             InventoryScope::Global => {
@@ -126,6 +147,10 @@ impl Inventory {
     }
 
     pub fn load_raw(&self, name: &str, scope: InventoryScope) -> Result<String> {
+        #[cfg(feature = "native-runtime")]
+        if let Some(payload) = self.state_load_raw(name, scope)? {
+            return Ok(payload);
+        }
         let path = self.inventory_path(name, scope);
         let cache_key = Self::cache_key(name, scope);
         let current_mtime = file_mtime(&path);
@@ -149,6 +174,10 @@ impl Inventory {
     }
 
     pub fn save_raw(&self, name: &str, scope: InventoryScope, content: &str) -> Result<()> {
+        #[cfg(feature = "native-runtime")]
+        if self.state_save_raw(name, scope, content)? {
+            return Ok(());
+        }
         let path = self.inventory_path(name, scope);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -179,6 +208,21 @@ impl Inventory {
         D: DeserializeOwned + Default + Serialize,
         F: FnOnce(D) -> Result<(D, T)>,
     {
+        #[cfg(feature = "native-runtime")]
+        if self.state_managed(name) {
+            // File-locking is unnecessary for the SQLite backend: writes are
+            // serialized through the guarded connection (single-writer).
+            let current_raw = self.load_raw(name, scope)?;
+            let current: D = if current_raw.trim().is_empty() {
+                D::default()
+            } else {
+                serde_yaml::from_str(&current_raw)?
+            };
+            let (next, result) = update(current)?;
+            let content = serialize_yaml_content(&next)?;
+            self.save_raw(name, scope, &content)?;
+            return Ok(result);
+        }
         let path = self.inventory_path(name, scope);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -188,6 +232,59 @@ impl Inventory {
             .lock()
             .remember(Self::cache_key(name, scope), content, file_mtime(&path));
         Ok(result)
+    }
+
+    #[cfg(feature = "native-runtime")]
+    fn state_managed(&self, name: &str) -> bool {
+        self.state.is_some() && SQLITE_MANAGED_NAMES.contains(&name)
+    }
+
+    #[cfg(feature = "native-runtime")]
+    fn state_scope(scope: InventoryScope) -> &'static str {
+        match scope {
+            InventoryScope::Global => "global",
+            InventoryScope::Local => "inv",
+        }
+    }
+
+    #[cfg(feature = "native-runtime")]
+    fn state_load_raw(
+        &self,
+        name: &str,
+        scope: InventoryScope,
+    ) -> Result<Option<String>> {
+        if !self.state_managed(name) {
+            return Ok(None);
+        }
+        let Some(state) = &self.state else {
+            return Ok(None);
+        };
+        match state.get_raw(Self::state_scope(scope), name)? {
+            Some(payload) => Ok(Some(payload)),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "native-runtime")]
+    fn state_save_raw(
+        &self,
+        name: &str,
+        scope: InventoryScope,
+        content: &str,
+    ) -> Result<bool> {
+        if !self.state_managed(name) {
+            return Ok(false);
+        }
+        let Some(state) = &self.state else {
+            return Ok(false);
+        };
+        state.set_raw(Self::state_scope(scope), name, content)?;
+        self.cache.lock().remember(
+            Self::cache_key(name, scope),
+            content.to_string(),
+            None,
+        );
+        Ok(true)
     }
 
     pub fn clear_cache(&self) {
@@ -423,7 +520,7 @@ fn process_write_lock_for(path: &Path) -> Arc<StdMutex<()>> {
         .clone()
 }
 
-fn find_narou_root() -> Result<PathBuf> {
+pub(crate) fn find_narou_root() -> Result<PathBuf> {
     let mut current = std::env::current_dir()?;
     loop {
         if current.join(".narou").exists() {

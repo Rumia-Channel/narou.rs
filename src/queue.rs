@@ -193,10 +193,39 @@ impl PersistentQueue {
         Self::new(&path)
     }
 
-    fn load(&mut self) -> Result<()> {
+
+    /// P2: when the queue file lives in the active library root and the
+    /// SQLite state backend owns that root, persist the serialized payload
+    /// through `app_state('inv','queue')` instead of the file.
+    fn sqlite_state(&self) -> Option<crate::native::sqlite::state::StateDb> {
+        #[cfg(feature = "native-runtime")]
+        {
+            if crate::native::sqlite::state::legacy_yaml_active() {
+                return None;
+            }
+            let dir = self.path.parent()?;
+            crate::native::sqlite::state::shared().filter(|state| state.matches_root(dir))
+        }
+        #[cfg(not(feature = "native-runtime"))]
+        {
+            None
+        }
+    }
+
+    fn read_payload(&self) -> Result<Option<String>> {
+        if let Some(state) = self.sqlite_state() {
+            return state.get_raw("inv", "queue");
+        }
         if self.path.exists() {
             ensure_yaml_size_limit(&self.path)?;
-            let content = fs::read_to_string(&self.path)?;
+            Ok(Some(fs::read_to_string(&self.path)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn load(&mut self) -> Result<()> {
+        if let Some(content) = self.read_payload()? {
             let state = load_queue_state(&content)?;
             validate_queue_state(&state)?;
             *self.state.lock() = state;
@@ -205,11 +234,9 @@ impl PersistentQueue {
     }
 
     fn merge_external_pending_jobs(&self) -> Result<()> {
-        if !self.path.exists() {
+        let Some(content) = self.read_payload()? else {
             return Ok(());
-        }
-        ensure_yaml_size_limit(&self.path)?;
-        let content = fs::read_to_string(&self.path)?;
+        };
         let disk_state = load_queue_state(&content)?;
         validate_queue_state(&disk_state)?;
         let mut state = self.state.lock();
@@ -222,12 +249,22 @@ impl PersistentQueue {
     }
 
     fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let content =
             crate::db::inventory::serialize_yaml_content(&queue_state_to_legacy_file(&self.state.lock()))?;
-        atomic_write(&self.path, &content)?;
+        if (content.len() as u64) > crate::db::inventory::MAX_YAML_SIZE_BYTES {
+            return Err(NarouError::Database(format!(
+                "queue state exceeds maximum supported size ({} bytes)",
+                crate::db::inventory::MAX_YAML_SIZE_BYTES
+            )));
+        }
+        if let Some(state) = self.sqlite_state() {
+            state.set_raw("inv", "queue", &content)?;
+        } else {
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            atomic_write(&self.path, &content)?;
+        }
         self.notify_changed();
         Ok(())
     }

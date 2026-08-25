@@ -1,6 +1,6 @@
 # Golden fixture library A (synthetic). Canonical metadata snapshot used by
 # dual-run repository tests. Keep byte-stable; regenerate only with review.
-"1":
+1:
   id: 1
   title: "Alpha物語"
   author: "作者壱"
@@ -18,7 +18,7 @@
   domain: "ncode.syosetu.com"
   general_all_no: 101
   length: 1000
-"2":
+2:
   id: 2
   title: "beta行"
   author: "作者弐"

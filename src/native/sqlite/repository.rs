@@ -48,7 +48,7 @@ where
 
 const SELECT_COLUMNS: usize = 26;
 
-fn record_from_row(row: &Row<'_>) -> Result<NovelRecord> {
+pub(crate) fn record_from_row(row: &Row<'_>) -> Result<NovelRecord> {
     let tags_json: String = row.get(16).map_err(|error| NarouError::Platform(error.to_string()))?;
     let extra_yaml: String =
         row.get(SELECT_COLUMNS - 1).map_err(|error| NarouError::Platform(error.to_string()))?;
@@ -99,6 +99,11 @@ fn int_flag(row: &Row<'_>, index: usize) -> Result<bool> {
 }
 
 impl SqliteNovelRepository {
+    /// Raw connection handle for `bulk` persistence helpers.
+    pub(crate) fn conn_handle(&self) -> Arc<Mutex<Connection>> {
+        self.conn.clone()
+    }
+
     fn one(&self, sql: String, params: Vec<rusqlite::types::Value>) -> impl Future<Output = Result<Option<NovelRecord>>> + Send {
         let sql_clone = sql;
         blocking(self.conn.clone(), move |conn| {
@@ -128,33 +133,34 @@ impl SqliteNovelRepository {
         })
     }
 
-    fn upsert_record(conn: &Connection, record: &NovelRecord) -> Result<()> {
-        let params = record_params(record)?;
-        conn.execute(UPSERT_SQL, params_from_iter(params.values.iter()))
-            .map_err(super::sqlite_error)?;
-        conn.execute(
-            "DELETE FROM novel_tags WHERE novel_id = ?",
-            [record.id],
-        )
-        .map_err(super::sqlite_error)?;
-        for (position, tag) in record.tags.iter().enumerate() {
-            conn.execute(
-                "INSERT INTO novel_tags (novel_id, position, tag, tag_fold) VALUES (?, ?, ?, ?)",
-                rusqlite::params![record.id, position as i64, tag, fold(tag)],
-            )
-            .map_err(super::sqlite_error)?;
-        }
-        refresh_status_sort(conn, record.id)?;
-        conn.execute(
-            "UPDATE novel_id_sequence SET next_id = CASE WHEN next_id < ? THEN ? ELSE next_id END WHERE id = 1",
-            rusqlite::params![record.id.saturating_add(1), record.id.saturating_add(1)],
-        )
-        .map_err(super::sqlite_error)?;
-        Ok(())
-    }
 }
 
-fn refresh_status_sort(conn: &Connection, id: i64) -> Result<()> {
+pub(crate) fn upsert_record_conn(conn: &Connection, record: &NovelRecord) -> Result<()> {
+    let params = record_params(record)?;
+    conn.execute(UPSERT_SQL, params_from_iter(params.values.iter()))
+        .map_err(super::sqlite_error)?;
+    conn.execute(
+        "DELETE FROM novel_tags WHERE novel_id = ?",
+        [record.id],
+    )
+    .map_err(super::sqlite_error)?;
+    for (position, tag) in record.tags.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO novel_tags (novel_id, position, tag, tag_fold) VALUES (?, ?, ?, ?)",
+            rusqlite::params![record.id, position as i64, tag, fold(tag)],
+        )
+        .map_err(super::sqlite_error)?;
+    }
+    refresh_status_sort(conn, record.id)?;
+    conn.execute(
+        "UPDATE novel_id_sequence SET next_id = CASE WHEN next_id < ? THEN ? ELSE next_id END WHERE id = 1",
+        rusqlite::params![record.id.saturating_add(1), record.id.saturating_add(1)],
+    )
+    .map_err(super::sqlite_error)?;
+    Ok(())
+}
+
+pub(crate) fn refresh_status_sort(conn: &Connection, id: i64) -> Result<()> {
     conn.execute(
         "UPDATE novels AS n SET status_sort = (CASE WHEN n.end <> 0 OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = 'end') THEN '完結' ELSE '' END || CASE WHEN (n.end <> 0 OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = 'end')) AND EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = '404') THEN ', ' ELSE '' END || CASE WHEN EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = '404') THEN '削除' ELSE '' END || CASE WHEN (n.end <> 0 OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = 'end') OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = '404')) AND n.suspend <> 0 THEN ', ' ELSE '' END || CASE WHEN n.suspend <> 0 THEN '中断' ELSE '' END) WHERE n.id = ?",
         [id],
@@ -306,7 +312,7 @@ impl NovelRepository for SqliteNovelRepository {
             let mut tx = conn.transaction().map_err(super::sqlite_error)?;
             for mutation in mutations {
                 match mutation {
-                    NovelMutation::Upsert(record) => Self::upsert_record(&tx, &record)?,
+                    NovelMutation::Upsert(record) => upsert_record_conn(&tx, &record)?,
                     NovelMutation::Remove(id) => {
                         tx.execute("DELETE FROM novels WHERE id = ?", [id.0])
                             .map_err(super::sqlite_error)?;
