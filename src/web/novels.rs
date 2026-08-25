@@ -547,10 +547,10 @@ async fn generate_epub_on_demand(
 ) -> Result<(Vec<u8>, String), (StatusCode, String)> {
     // P4a: prefer the SQLite mirror of the converted text when present.
     if !crate::native::sqlite::state::legacy_yaml_active()
-        && let Some(state) = crate::native::sqlite::state::shared()
-        && let Ok(narou_dir) =
-            crate::db::inventory::Inventory::with_default_root().map(|inventory| inventory.root_dir().join(".narou"))
-        && state.matches_root(&narou_dir)
+        && let Some(narou_dir) = crate::db::inventory::Inventory::with_default_root()
+            .ok()
+            .map(|inventory| inventory.root_dir().join(".narou"))
+        && let Some(state) = crate::native::sqlite::state::active_for(&narou_dir)
         && let Some(payload) = (|| {
             let conn = state.conn_ref();
             conn.lock()

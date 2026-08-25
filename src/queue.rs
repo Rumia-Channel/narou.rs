@@ -204,7 +204,7 @@ impl PersistentQueue {
                 return None;
             }
             let dir = self.path.parent()?;
-            crate::native::sqlite::state::shared().filter(|state| state.matches_root(dir))
+            crate::native::sqlite::state::active_for(dir)
         }
         #[cfg(not(feature = "native-runtime"))]
         {

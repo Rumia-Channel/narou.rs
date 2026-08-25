@@ -256,7 +256,10 @@ pub fn load_global_setting_value(key: &str) -> Option<serde_yaml::Value> {
     // `global_setting.yaml` lives in app_state('global', 'global_setting').
     #[cfg(feature = "native-runtime")]
     if !crate::native::sqlite::state::legacy_yaml_active() {
-        if let Some(state) = crate::native::sqlite::state::shared() {
+        let narou_dir = crate::db::inventory::Inventory::with_default_root()
+            .ok()
+            .map(|inventory| inventory.root_dir().join(".narou"));
+        if let Some(state) = narou_dir.as_deref().and_then(crate::native::sqlite::state::active_for) {
             if let Ok(Some(raw)) = state.get_raw("global", "global_setting") {
                 if let Ok(settings) =
                     serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(&raw)

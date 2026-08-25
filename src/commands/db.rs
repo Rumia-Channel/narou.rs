@@ -67,7 +67,13 @@ fn cmd_export_yaml(out: Option<String>) -> narou_rs::error::Result<()> {
 
     // 2. Management states verbatim from app_state (freeze, alias, ...).
     #[cfg(feature = "native-runtime")]
-    if let Some(state) = narou_rs::native::sqlite::state::shared() {
+    if let Some(state) = (|| {
+        let narou_dir = narou_rs::db::inventory::Inventory::with_default_root()
+            .ok()?
+            .root_dir()
+            .join(".narou");
+        narou_rs::native::sqlite::state::active_for(&narou_dir)
+    })() {
         for entry in [
             ("freeze", "freeze.yaml"),
             ("alias", "alias.yaml"),
@@ -95,7 +101,10 @@ fn cmd_export_yaml(out: Option<String>) -> narou_rs::error::Result<()> {
 fn cmd_vacuum() -> narou_rs::error::Result<()> {
     #[cfg(feature = "native-runtime")]
     if !narou_rs::native::sqlite::state::legacy_yaml_active() {
-        if let Some(state) = narou_rs::native::sqlite::state::shared() {
+        let narou_dir = narou_rs::db::inventory::Inventory::with_default_root()?
+            .root_dir()
+            .join(".narou");
+        if let Some(state) = narou_rs::native::sqlite::state::active_for(&narou_dir) {
             let conn = state.conn();
             let guard = conn.lock().expect("sqlite mutex poisoned");
             guard.execute_batch("VACUUM").map_err(|error| {

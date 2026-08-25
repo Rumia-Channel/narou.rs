@@ -114,7 +114,7 @@ impl InventoryCache {
 impl Inventory {
     pub fn new(root_dir: PathBuf) -> Self {
         #[cfg(feature = "native-runtime")]
-        let state = crate::native::sqlite::state::StateDb::shared_for(&root_dir);
+        let state = crate::native::sqlite::state::active_for(&root_dir.join(".narou"));
         Self {
             root_dir,
             cache: Mutex::new(InventoryCache::new()),

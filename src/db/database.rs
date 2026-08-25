@@ -35,48 +35,45 @@ impl Database {
 
         #[cfg(feature = "native-runtime")]
         let sqlite = {
-            if crate::native::sqlite::state::legacy_yaml_active() {
-                None
-            } else {
-                match crate::native::sqlite::state::configure(
-                    &inventory.root_dir().join(".narou"),
-                ) {
-                    Ok(state) => {
-                        crate::native::sqlite::state::StateDb::install_shared(&state);
-                        let repo =
-                            crate::native::sqlite::SqliteNovelRepository::new(state.conn_ref().clone());
-                        // Backward compatibility: a fresh database adopts an
-                        // existing legacy database.yaml once.
-                        let empty = {
-                            let conn = repo.conn_handle();
-                            crate::native::sqlite::bulk::load_all_records(&conn.lock().expect("sqlite mutex poisoned"))?
-                                .is_empty()
-                        };
-                        if empty {
-                            let yaml_path =
-                                inventory.inventory_path("database", InventoryScope::Local);
-                            if let Ok(content) = std::fs::read_to_string(&yaml_path) {
-                                if !content.trim().is_empty() {
-                                    let parsed: BTreeMap<i64, NovelRecord> =
-                                        serde_yaml::from_str(&content)?;
-                                    let mut conn = repo.conn_handle();
-                                    {
-                                        let mut guard = conn.lock().expect("sqlite mutex poisoned");
-                                        crate::native::sqlite::bulk::replace_all_records(
-                                            &mut guard, &parsed,
-                                        )?;
-                                    }
-                                    rename_imported_file(&yaml_path);
-                                    let index_path = inventory
-                                        .inventory_path("database_index", InventoryScope::Local);
-                                    rename_imported_file(&index_path);
+            let narou_dir = inventory.root_dir().join(".narou");
+            match crate::native::sqlite::state::active_for(&narou_dir) {
+                Some(state) => {
+                    let repo =
+                        crate::native::sqlite::SqliteNovelRepository::new(state.conn_ref().clone());
+                    // Backward compatibility: a fresh database adopts an
+                    // existing legacy database.yaml once.
+                    let empty = {
+                        let conn = repo.conn_handle();
+                        crate::native::sqlite::bulk::load_all_records(
+                            &conn.lock().expect("sqlite mutex poisoned"),
+                        )?
+                        .is_empty()
+                    };
+                    if empty {
+                        let yaml_path =
+                            inventory.inventory_path("database", InventoryScope::Local);
+                        if let Ok(content) = std::fs::read_to_string(&yaml_path) {
+                            if !content.trim().is_empty() {
+                                let parsed: BTreeMap<i64, NovelRecord> =
+                                    serde_yaml::from_str(&content)?;
+                                let mut conn = repo.conn_handle();
+                                {
+                                    let mut guard =
+                                        conn.lock().expect("sqlite mutex poisoned");
+                                    crate::native::sqlite::bulk::replace_all_records(
+                                        &mut guard, &parsed,
+                                    )?;
                                 }
+                                rename_imported_file(&yaml_path);
+                                let index_path = inventory
+                                    .inventory_path("database_index", InventoryScope::Local);
+                                rename_imported_file(&index_path);
                             }
                         }
-                        Some(repo)
                     }
-                    Err(_) => None,
+                    Some(repo)
                 }
+                None => None,
             }
         };
 

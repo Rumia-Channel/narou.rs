@@ -251,7 +251,7 @@ sample/
 
 ### SQLite 管理基盤移行 (P0-P4 完了、詳細: docs/sqlite-storage-migration-plan.md)
 - P1 `src/native/sqlite/` エンジン + dual-run テスト、P2 メタデータ全面移行 (database/freeze/alias/tag_colors/local+global_setting/queue/notepad/latest_convert → db.sqlite)、レガシー自動import(元ファイルは *.imported-* 退避)、`narou db verify|export-yaml|vacuum`
-- P3 SQLite 既定化 (`NAROU_RS_LEGACY_YAML=1` で旧動作)。既定フローはYAML非書込をテストで担保
+- P3 デュアルモード化: **既定は従来どおり YAML 管理**。`.narou/storage-backend` マーカー(`sqlite`)または Web UI ツアーの選択で Lite(SQLite) へ切替。`NAROU_RS_LEGACY_YAML=1` は強制レガシー。API: `GET/POST /api/storage/mode`
 - P4a コンテンツミラー (novel_sections/novel_outputs) — convert時に書込み、Web DL時EPUBはDB優先
 - P4b バージョン履歴 (novel_versions/_sections/_diffs) + `narou diff --history|--show|--restore|--merge-from`。update時自動snapshotはconvertフック経由
 - 後方互換: 旧ライブラリからの自動取込と export-yaml によるロールバックを保証。前方互換(narou.rb読影響)は破棄

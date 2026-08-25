@@ -219,7 +219,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 
 ### 3.x `db` — 追加サブコマンド (narou.rs 独自, Ruby版対応外)
 
-SQLite 管理データベースの保守。P2以降の既定バックエンドに対して使用する。
+SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のまま**で、Web UI 初回ツアー(または `.narou/storage-backend` マーカーファイル=`sqlite`)で選択したときのみ有効化される。Web API は `GET/POST /api/storage/mode`。
 
 | サブコマンド | 内容 |
 |---|---|

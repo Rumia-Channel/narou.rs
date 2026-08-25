@@ -889,7 +889,14 @@ impl NovelConverter {
             // per-title output naming rules.
             let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
             if !crate::native::sqlite::state::legacy_yaml_active() {
-                if let Some(state) = crate::native::sqlite::state::shared() {
+                let narou_dir = novel_dir
+                    .ancestors()
+                    .find(|candidate| candidate.join(".narou").is_dir())
+                    .map(|found| found.join(".narou"));
+                if let Some(narou_dir) = narou_dir
+                    && let Some(state) =
+                        crate::native::sqlite::state::active_for(&narou_dir)
+                {
                     let conn = state.conn();
                     let mut guard = conn.lock().expect("sqlite mutex poisoned");
                     let mut sections_map = std::collections::BTreeMap::new();
@@ -975,7 +982,14 @@ impl NovelConverter {
             // P4a/P4b mirror: converted text + mirrored working set + version
             // snapshot live in the SQLite backend when active.
             if !crate::native::sqlite::state::legacy_yaml_active() {
-                if let Some(state) = crate::native::sqlite::state::shared() {
+                let narou_dir = novel_dir
+                    .ancestors()
+                    .find(|candidate| candidate.join(".narou").is_dir())
+                    .map(|found| found.join(".narou"));
+                if let Some(narou_dir) = narou_dir
+                    && let Some(state) =
+                        crate::native::sqlite::state::active_for(&narou_dir)
+                {
                     let conn = state.conn();
                     let mut guard = conn.lock().expect("sqlite mutex poisoned");
                     let mut sections_map = std::collections::BTreeMap::new();

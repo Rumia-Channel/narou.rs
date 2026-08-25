@@ -136,13 +136,10 @@ fn notepad_state() -> Option<crate::native::sqlite::state::StateDb> {
         if crate::native::sqlite::state::legacy_yaml_active() {
             return None;
         }
-        crate::native::sqlite::state::shared().filter(|state| {
-            Inventory::with_default_root()
-                .map(|inventory| {
-                    state.matches_root(&inventory.root_dir().join(".narou"))
-                })
-                .unwrap_or(false)
-        })
+        let narou_dir = Inventory::with_default_root()
+            .ok()
+            .map(|inventory| inventory.root_dir().join(".narou"));
+        narou_dir.as_deref().and_then(crate::native::sqlite::state::active_for)
     }
     #[cfg(not(feature = "native-runtime"))]
     {

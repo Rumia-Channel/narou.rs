@@ -665,8 +665,14 @@ fn version_conn() -> std::result::Result<std::sync::Arc<std::sync::Mutex<rusqlit
     if state::legacy_yaml_active() {
         return Err("SQLiteバックエンドが無効です (NAROU_RS_LEGACY_YAML)".to_string());
     }
-    let shared = state::shared().ok_or_else(|| "データベースが初期化されていません".to_string())?;
-    Ok(shared.conn_ref().clone())
+    let narou_dir = narou_rs::db::inventory::Inventory::with_default_root()
+        .map_err(|error| error.to_string())?
+        .root_dir()
+        .join(".narou")
+        ;
+    let handle = state::active_for(&narou_dir)
+        .ok_or_else(|| "SQLiteバックエンドが有効ではありません".to_string())?;
+    Ok(handle.conn_ref().clone())
 }
 
 #[cfg(feature = "native-runtime")]

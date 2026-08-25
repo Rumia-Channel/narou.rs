@@ -14,6 +14,8 @@
 //! environment variable `NAROU_RS_LEGACY_YAML=1` disables SQLite entirely and
 //! restores the pure-file behavior (debug / rollback escape hatch).
 
+use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -121,37 +123,57 @@ impl StateDb {
         &self.conn
     }
 
-    /// True when this handle owns `<root>/.narou/db.sqlite`.
-    pub fn matches_root(&self, narou_dir: &Path) -> bool {
-        self.narou_dir == narou_dir
-    }
+}
 
-    /// Returns a clone of the shared handle when it was configured for
-    /// exactly this narou root (temp-root tests must never touch the real
-    /// library database).
-    pub fn shared_for(root_dir: &Path) -> Option<StateDb> {
-        let candidate = SHARED.read().ok()?.clone()?;
-        if candidate.narou_dir == root_dir.join(".narou") {
-            Some(candidate)
-        } else {
-            None
-        }
-    }
+static OPEN_HANDLES: LazyLock<Mutex<HashMap<PathBuf, StateDb>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-    /// Explicitly install (or re-point) the process-wide handle.
-    pub fn install_shared(&self) {
-        if let Ok(mut slot) = SHARED.write() {
-            *slot = Some(self.clone());
-        }
+/// Which management backend owns `<root>/.narou`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageMode {
+    /// Legacy `.narou/*.yaml` files (default; full forward file format).
+    Yaml,
+    /// SQLite (`db.sqlite`) managed library ("Lite" mode).
+    Sqlite,
+}
+
+pub const MARKER_FILE: &str = "storage-backend";
+
+pub fn read_mode(narou_dir: &Path) -> StorageMode {
+    match std::fs::read_to_string(narou_dir.join(MARKER_FILE)) {
+        Ok(text) if text.trim().eq_ignore_ascii_case("sqlite") => StorageMode::Sqlite,
+        _ => StorageMode::Yaml,
     }
 }
 
-static SHARED: std::sync::RwLock<Option<StateDb>> = std::sync::RwLock::new(None);
+pub fn write_mode(narou_dir: &Path, mode: StorageMode) -> Result<()> {
+    std::fs::create_dir_all(narou_dir)
+        .map_err(|error| NarouError::Platform(format!("sqlite dir: {error}")))?;
+    let text = match mode {
+        StorageMode::Sqlite => "sqlite",
+        StorageMode::Yaml => "yaml",
+    };
+    crate::db::inventory::atomic_write(&narou_dir.join(MARKER_FILE), &format!("{text}\n"))
+}
 
-/// Shared-handle lookup used by `Inventory`/compat readers before any
-/// explicit configuration happened (lazy bootstrap against the real root).
-pub fn shared() -> Option<StateDb> {
-    SHARED.read().ok().and_then(|slot| slot.clone())
+/// Active handle for this narou root, opening the database on first use.
+/// `None` unless the user opted into SQLite (`storage-backend` marker).
+pub fn active_for(narou_dir: &Path) -> Option<StateDb> {
+    if legacy_yaml_active() || read_mode(narou_dir) != StorageMode::Sqlite {
+        return None;
+    }
+    let mut cache = OPEN_HANDLES.lock().expect("state cache poisoned");
+    let dir = narou_dir.to_path_buf();
+    if let Some(handle) = cache.get(&dir) {
+        return Some(handle.clone());
+    }
+    match configure(&dir) {
+        Ok(handle) => {
+            cache.insert(dir, handle.clone());
+            Some(handle)
+        }
+        Err(_) => None,
+    }
 }
 
 pub fn legacy_yaml_active() -> bool {

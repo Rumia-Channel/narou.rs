@@ -215,3 +215,12 @@ update 実行 → 差分検出 (既存ロジック)
 - rollback → 本文が対象版と一致、かつ新 version が作られていること
 - merge (--section) → 非指定 section が不変であること
 - history-limit 超過で最古 version が削除され、残存 diff 表示が壊れないこと
+
+## P6: 0.4.0 デュアルモード + 移行ツアー (2026-08-25 追加実装)
+
+ユーザー要件により P3 の「SQLite 既定」を改変:
+
+- **既定 = 従来どおり YAML 管理**。Lite(SQLite) は完全なオプトイン
+- 切替は `.narou/storage-backend` マーカーファイル(`sqlite`/`yaml`)で表現され、抽象化層 `state::active_for(narou_dir)` が全経路(database/inventory/queue/notepad/compat/EPUB-DL/converter hook)の単一判定点となる
+- **移行プロンプト**: Web UI 機能ツアー(0.4.0 エントリ)表示時に一度だけ「Lite版へ移行 / YAML継続」を問う。`GET/POST /api/storage/mode` が状態照会・切替(marker書込+即時再init+自動import)を担う。CLI でもマーカー作成で同等
+- `POST mode=sqlite` はその場で `init_database()` をやり直し、レガシー import(元ファイル rename 退避)まで完了する

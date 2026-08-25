@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use narou_rs::db::{Database, NovelRecord};
-use narou_rs::native::sqlite::state::{StateDb, legacy_yaml_active};
+use narou_rs::native::sqlite::state::{StorageMode, legacy_yaml_active};
 use narou_rs::platform::{NovelFilter, NovelId};
 
 static SERIES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -28,11 +28,12 @@ let temp = tempfile::tempdir().unwrap();
     copy_fixture_library(&root);
 
     // Bootstrap: fresh DB imports the legacy database.yaml and states.
-    let state: StateDb = {
-        assert!(!legacy_yaml_active());
-        narou_rs::native::sqlite::state::configure(&root.join(".narou")).unwrap()
-    };
-    state.install_shared();
+    narou_rs::native::sqlite::state::write_mode(
+        &root.join(".narou"),
+        StorageMode::Sqlite,
+    )
+    .unwrap();
+    let state = narou_rs::native::sqlite::state::active_for(&root.join(".narou")).unwrap();
 
     let mut db = Database::with_root(root.clone()).unwrap();
     assert_eq!(db.all_records().len(), 2, "imported both fixture records");
@@ -121,9 +122,12 @@ async fn filter_still_matches_after_import() {
 let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     copy_fixture_library(&root);
-    let state =
-        narou_rs::native::sqlite::state::configure(&root.join(".narou")).unwrap();
-    state.install_shared();
+    narou_rs::native::sqlite::state::write_mode(
+        &root.join(".narou"),
+        StorageMode::Sqlite,
+    )
+    .unwrap();
+    let state = narou_rs::native::sqlite::state::active_for(&root.join(".narou")).unwrap();
     let db = Database::with_root(root).unwrap();
 
     let mut filter = NovelFilter::all();
@@ -140,9 +144,12 @@ fn p3_default_flow_never_writes_yaml() {
 let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     copy_fixture_library(&root);
-    let state =
-        narou_rs::native::sqlite::state::configure(&root.join(".narou")).unwrap();
-    state.install_shared();
+    narou_rs::native::sqlite::state::write_mode(
+        &root.join(".narou"),
+        StorageMode::Sqlite,
+    )
+    .unwrap();
+    let state = narou_rs::native::sqlite::state::active_for(&root.join(".narou")).unwrap();
 
     let mut db = Database::with_root(root.clone()).unwrap();
     db.update_records(|records| Ok((records, ()))).unwrap();
@@ -167,9 +174,12 @@ fn p3_perf_smoke_1000_records() {
     let _series = SERIES_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
-    let state =
-        narou_rs::native::sqlite::state::configure(&root.join(".narou")).unwrap();
-    state.install_shared();
+    narou_rs::native::sqlite::state::write_mode(
+        &root.join(".narou"),
+        StorageMode::Sqlite,
+    )
+    .unwrap();
+    let state = narou_rs::native::sqlite::state::active_for(&root.join(".narou")).unwrap();
     let mut db = Database::with_root(root.clone()).unwrap();
 
     let started = Instant::now();
@@ -220,9 +230,12 @@ fn p4b_version_snapshot_restore_merge_prune() {
     let _series = SERIES_LOCK.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
-    let state =
-        narou_rs::native::sqlite::state::configure(&root.join(".narou")).unwrap();
-    state.install_shared();
+    narou_rs::native::sqlite::state::write_mode(
+        &root.join(".narou"),
+        StorageMode::Sqlite,
+    )
+    .unwrap();
+    let state = narou_rs::native::sqlite::state::active_for(&root.join(".narou")).unwrap();
 
     // Seed a minimal novel row so FK constraints hold.
     {
@@ -295,4 +308,28 @@ fn fixture_record_defaults(id: i64) -> NovelRecord {
     };
     record.id = id;
     record
+}
+
+#[test]
+fn dual_mode_defaults_to_yaml_until_opted_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+
+    // No marker: 0.4.0 keeps the classic YAML management flow.
+    let mut db = Database::with_root(root.clone()).unwrap();
+    db.update_records(|records| Ok((records, ()))).unwrap();
+    db.save().unwrap();
+
+    let database_yaml = root.join(".narou/database.yaml");
+    assert!(database_yaml.exists(), "yaml backend writes database.yaml");
+    assert!(!root.join(".narou/db.sqlite").exists(), "no sqlite file without opt-in");
+
+    // Opt-in via the tour equivalent: marker + re-init migrates once.
+    narou_rs::native::sqlite::state::write_mode(
+        &root.join(".narou"),
+        StorageMode::Sqlite,
+    )
+    .unwrap();
+    let db2 = Database::with_root(root.clone()).unwrap();
+    assert_eq!(db2.all_records().len(), 0); // fresh DB (nothing to import yet)
 }
