@@ -1,5 +1,22 @@
 # SQLite 管理基盤移行計画 (2026-08-25)
 
+## 実装状況 (2026-08-25): **P0〜P4b 完了 / P5 一部**
+
+| Phase | 状態 |
+|---|---|
+| P0 監査 | ✅ docs/sqlite-p0-record-mapping.md + tests/golden |
+| P1 エンジン | ✅ src/native/sqlite/ dual-run テスト9件 |
+| P2 メタデータ切替 | ✅ 自動import+rename退避 / narou db verify\|export-yaml\|vacuum / queue・notepad・settings 経由化 |
+| P3 既定化 | ✅ Database::new が db.sqlite を既定使用。YAML非書込テスト & perf smoke(1000件) 追加 |
+| P4a コンテンツ | ✅ novel_sections/novel_outputs ミラー (convert時)。Web DL時EPUBはDB優先。sectionsの全経路DB化は段階継続 |
+| P4b 差分履歴 | ✅ §11テーブル実装 + diff CLI拡張 (--history/--show/--restore/--merge-from/--merge-sections) + prune。**update時自動snapshotはconvertフック経由**、Web api_diff拡張と行レベル3-wayマージは未着手 |
+| P5 清算 | ◐ AGENTS/COMMANDS更新・version bump。Inventory削減は残置(legacy import用に維持) |
+
+### 計画からの逸脱 (意図的)
+1. `queue.yaml` → worker_jobs 型テーブルではなく app_state('inv','queue') へペイロード格納 (単一ライブラリ前提で十分・既存ロジック無変更)
+2. `latest_convert` → novels.last_convert_at 列ではなく app_state マップ
+3. HTTPレスポンスは全体バッファ後返却 (Lite自体はチャンク書出対応)
+
 ## 0. ポリシー変更の定義
 
 本計画はプロジェクトの互換性ポリシーを以下のように変更する (**AGENTS.md の Porting Policy / 互換性要件の改訂を含む**)。

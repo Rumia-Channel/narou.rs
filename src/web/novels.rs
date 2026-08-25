@@ -545,6 +545,28 @@ async fn generate_epub_on_demand(
     record: &crate::db::novel_record::NovelRecord,
     novel_dir: &std::path::Path,
 ) -> Result<(Vec<u8>, String), (StatusCode, String)> {
+    // P4a: prefer the SQLite mirror of the converted text when present.
+    if !crate::native::sqlite::state::legacy_yaml_active()
+        && let Some(state) = crate::native::sqlite::state::shared()
+        && let Ok(narou_dir) =
+            crate::db::inventory::Inventory::with_default_root().map(|inventory| inventory.root_dir().join(".narou"))
+        && state.matches_root(&narou_dir)
+        && let Some(payload) = (|| {
+            let conn = state.conn_ref();
+            conn.lock()
+                .expect("sqlite mutex poisoned")
+                .query_row(
+                    "SELECT payload FROM novel_outputs WHERE novel_id = ? AND kind = 'converted_text'",
+                    rusqlite::params![id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .ok()
+        })()
+        && !payload.is_empty()
+    {
+        let filename = format!("novel-{id}.epub");
+        return Ok((payload, filename));
+    }
 
     let settings = crate::converter::settings::NovelSettings::load_for_novel(
         id,

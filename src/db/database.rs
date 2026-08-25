@@ -471,6 +471,7 @@ mod tests {
 
     #[test]
     fn database_parity_save_preserves_unknown_fields_and_zero_id() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let narou_dir = temp.path().join(".narou");
         std::fs::create_dir_all(&narou_dir).unwrap();
@@ -520,6 +521,7 @@ mod tests {
 
     #[test]
     fn update_records_merges_against_current_database_yaml() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let narou_dir = temp.path().join(".narou");
         std::fs::create_dir_all(&narou_dir).unwrap();

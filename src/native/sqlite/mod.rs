@@ -11,6 +11,8 @@
 //! because the trait is async only for D1 symmetry.
 
 pub mod bulk;
+pub mod content;
+pub mod versions;
 mod migrations;
 pub mod state;
 mod query;

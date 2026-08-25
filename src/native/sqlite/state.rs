@@ -130,7 +130,7 @@ impl StateDb {
     /// exactly this narou root (temp-root tests must never touch the real
     /// library database).
     pub fn shared_for(root_dir: &Path) -> Option<StateDb> {
-        let candidate = SHARED.get()?.clone()?;
+        let candidate = SHARED.read().ok()?.clone()?;
         if candidate.narou_dir == root_dir.join(".narou") {
             Some(candidate)
         } else {
@@ -138,18 +138,20 @@ impl StateDb {
         }
     }
 
-    /// Explicitly install the process-wide handle for this root.
+    /// Explicitly install (or re-point) the process-wide handle.
     pub fn install_shared(&self) {
-        let _ = SHARED.set(Some(self.clone()));
+        if let Ok(mut slot) = SHARED.write() {
+            *slot = Some(self.clone());
+        }
     }
 }
 
-static SHARED: OnceLock<Option<StateDb>> = OnceLock::new();
+static SHARED: std::sync::RwLock<Option<StateDb>> = std::sync::RwLock::new(None);
 
 /// Shared-handle lookup used by `Inventory`/compat readers before any
 /// explicit configuration happened (lazy bootstrap against the real root).
 pub fn shared() -> Option<StateDb> {
-    SHARED.get().and_then(|slot| slot.clone())
+    SHARED.read().ok().and_then(|slot| slot.clone())
 }
 
 pub fn legacy_yaml_active() -> bool {

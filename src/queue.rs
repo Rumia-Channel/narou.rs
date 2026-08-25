@@ -1559,6 +1559,7 @@ mod tests {
 
     #[test]
     fn push_uses_queue_max_retries_local_setting() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let narou_dir = temp.path().join(".narou");
         std::fs::create_dir_all(&narou_dir).unwrap();

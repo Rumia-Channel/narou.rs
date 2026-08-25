@@ -7,8 +7,6 @@
 
 use clap::Subcommand;
 
-use narou_rs::error::Result;
-
 #[derive(Subcommand, Debug)]
 pub enum DbAction {
     /// Check database integrity.

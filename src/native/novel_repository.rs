@@ -388,6 +388,7 @@ mod tests {
 
     #[test]
     fn yaml_round_trip_preserves_record_shape_and_unknown_fields() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let (temp, _cwd_guard, _db_guard) = isolated_database();
         std::fs::write(
             temp.path().join(".narou").join("database.yaml"),

@@ -1235,6 +1235,7 @@ mod tests {
 
     #[test]
     fn database_parity_get_copy_to_directory_includes_site_for_zero_id() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
@@ -1265,6 +1266,7 @@ mod tests {
 
     #[test]
     fn update_auto_convert_uses_convert_multi_device_before_device_setting() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();

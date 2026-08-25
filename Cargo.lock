@@ -2260,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "narou_rs"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "aozora_epub3_lite",
  "askama",
@@ -2316,7 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "narou_worker"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "chrono-tz",

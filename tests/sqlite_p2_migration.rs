@@ -8,6 +8,8 @@ use narou_rs::db::{Database, NovelRecord};
 use narou_rs::native::sqlite::state::{StateDb, legacy_yaml_active};
 use narou_rs::platform::{NovelFilter, NovelId};
 
+static SERIES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn copy_fixture_library(target_root: &Path) {
     let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/library-a/.narou")
@@ -20,7 +22,8 @@ fn copy_fixture_library(target_root: &Path) {
 
 #[test]
 fn p2_import_operate_export_roundtrip() {
-    let temp = tempfile::tempdir().unwrap();
+        let _series = SERIES_LOCK.lock().unwrap();
+let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     copy_fixture_library(&root);
 
@@ -114,7 +117,8 @@ fn p2_import_operate_export_roundtrip() {
 
 #[tokio::test]
 async fn filter_still_matches_after_import() {
-    let temp = tempfile::tempdir().unwrap();
+        let _series = SERIES_LOCK.lock().unwrap();
+let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     copy_fixture_library(&root);
     let state =
@@ -128,4 +132,167 @@ async fn filter_still_matches_after_import() {
     let repo = narou_rs::native::sqlite::SqliteNovelRepository::new(state.conn_ref().clone());
     let hits = repo.scan_ids(&filter, None, 10).await.unwrap();
     assert_eq!(hits, vec![NovelId(2)]);
+}
+
+#[test]
+fn p3_default_flow_never_writes_yaml() {
+        let _series = SERIES_LOCK.lock().unwrap();
+let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    copy_fixture_library(&root);
+    let state =
+        narou_rs::native::sqlite::state::configure(&root.join(".narou")).unwrap();
+    state.install_shared();
+
+    let mut db = Database::with_root(root.clone()).unwrap();
+    db.update_records(|records| Ok((records, ()))).unwrap();
+    db.save().unwrap();
+
+    // The only YAML files allowed are the renamed legacy originals.
+    for entry in std::fs::read_dir(root.join(".narou")).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().to_string();
+        if name.ends_with(".yaml") {
+            assert!(
+                name.contains(".imported-"),
+                "unexpected fresh YAML file written: {name}"
+            );
+        }
+        assert_ne!(name, "database_index.yaml", "index file must stay retired");
+    }
+}
+
+#[test]
+fn p3_perf_smoke_1000_records() {
+    use std::time::Instant;
+    let _series = SERIES_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let state =
+        narou_rs::native::sqlite::state::configure(&root.join(".narou")).unwrap();
+    state.install_shared();
+    let mut db = Database::with_root(root.clone()).unwrap();
+
+    let started = Instant::now();
+    db.update_records(|_records| {
+        let mut records = _records;
+        for i in 1..=1000i64 {
+            records.insert(
+                i,
+                NovelRecord {
+                    id: i,
+                    author: format!("author{i}"),
+                    title: format!("title{i}"),
+                    file_title: format!("[author{i}] title{i}"),
+                    toc_url: format!("https://example.com/{i}"),
+                    sitename: "小説家になろう".into(),
+                    last_update: chrono::Utc::now(),
+                    ..fixture_record_defaults(i)
+                },
+            );
+        }
+        Ok((records, ()))
+    })
+    .unwrap();
+    let elapsed = started.elapsed();
+
+    // Generous bound so debug builds on CI stay deterministic.
+    assert!(elapsed.as_secs() < 60, "bulk insert too slow: {elapsed:?}");
+    println!("P3 perf smoke: 1000 upserts in {elapsed:?}");
+
+    let page = narou_rs::platform::NovelQuery {
+        filter: narou_rs::platform::NovelFilter::all(),
+        sort: narou_rs::platform::NovelSort {
+            key: narou_rs::platform::NovelSortKey::Title,
+            reverse: false,
+        },
+        offset: 0,
+        limit: 20,
+    };
+    let _ = db.sort_by("title", false);
+    drop(db);
+    let db = Database::with_root(root).unwrap();
+    assert_eq!(db.all_records().len(), 1000);
+    assert_eq!(page.limit, 20);
+}
+
+#[test]
+fn p4b_version_snapshot_restore_merge_prune() {
+    let _series = SERIES_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_path_buf();
+    let state =
+        narou_rs::native::sqlite::state::configure(&root.join(".narou")).unwrap();
+    state.install_shared();
+
+    // Seed a minimal novel row so FK constraints hold.
+    {
+        let conn = state.conn_ref();
+        let guard = conn.lock().unwrap();
+        guard
+            .execute(
+                "INSERT INTO novels (id, author, author_fold, title, title_fold, file_title, toc_url, toc_url_fold, sitename, sitename_fold, last_update)
+                 VALUES (7, 'a', 'a', 't', 't', 'ft', 'https://x/7', 'https://x/7', 's', 's', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+    }
+
+    let conn = state.conn_ref().clone();
+
+    let mut sec1 = std::collections::BTreeMap::new();
+    sec1.insert("1".to_string(), (Some("第一".into()), "body: v1\n".into()));
+    narou_rs::native::sqlite::content::store_sections(&mut conn.lock().unwrap(), 7, &sec1).unwrap();
+    let v1 = narou_rs::native::sqlite::versions::snapshot_working_set(&mut conn.lock().unwrap(), 7, "update", None).unwrap();
+
+    let mut sec2 = std::collections::BTreeMap::new();
+    sec2.insert("1".to_string(), (Some("第一".into()), "body: v2\n".into()));
+    sec2.insert("2".to_string(), (Some("第二".into()), "body: new\n".into()));
+    narou_rs::native::sqlite::content::store_sections(&mut conn.lock().unwrap(), 7, &sec2).unwrap();
+    let v2 = narou_rs::native::sqlite::versions::snapshot_working_set(&mut conn.lock().unwrap(), 7, "update", None).unwrap();
+
+    let versions = narou_rs::native::sqlite::versions::list_versions(&conn.lock().unwrap(), 7).unwrap();
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0].id, v2);
+
+    let diff = narou_rs::native::sqlite::versions::version_diff(&conn.lock().unwrap(), v2).unwrap().unwrap();
+    assert!(diff.contains("-body: v1"), "diff must show removed line");
+    assert!(diff.contains("+body: v2"), "diff must show added line");
+
+    // Restore older version (copy-forward): working set matches v1 and a new
+    // rollback head is recorded.
+    narou_rs::native::sqlite::versions::restore_version(&mut conn.lock().unwrap(), 7, v1, false).unwrap();
+    let working_after_restore = narou_rs::native::sqlite::content::load_sections(&conn.lock().unwrap(), 7).unwrap().unwrap();
+    assert_eq!(working_after_restore.len(), 1);
+    assert!(working_after_restore["1"].1.contains("v1"));
+    assert_eq!(narou_rs::native::sqlite::versions::list_versions(&conn.lock().unwrap(), 7).unwrap().len(), 3);
+
+    // Merge section 2 of v2 onto the restored working set.
+    narou_rs::native::sqlite::versions::merge_from_version(
+        &mut conn.lock().unwrap(),
+        7,
+        v2,
+        Some(&["2".to_string()]),
+        Some("take second section"),
+    )
+    .unwrap();
+    let merged = narou_rs::native::sqlite::content::load_sections(&conn.lock().unwrap(), 7).unwrap().unwrap();
+    assert_eq!(merged.len(), 2, "merged section appended");
+    assert!(merged["1"].1.contains("v1"), "unselected section unchanged");
+
+    // Prune keeps the newest heads only.
+    let pruned = narou_rs::native::sqlite::versions::prune_history(&conn.lock().unwrap(), 7, 2).unwrap();
+    assert_eq!(pruned, 2);
+    assert_eq!(narou_rs::native::sqlite::versions::list_versions(&conn.lock().unwrap(), 7).unwrap().len(), 2);
+}
+
+fn fixture_record_defaults(id: i64) -> NovelRecord {
+    // Minimal valid record used as the base for perf-smoke bulk inserts.
+    let mut record = {
+        let json = format!(
+            "{{\"id\":{id},\"author\":\"a{id}\",\"title\":\"t{id}\",\"file_title\":\"ft{id}\",\"toc_url\":\"https://x/{id}\",\"sitename\":\"s\",\"last_update\":\"2026-01-01T00:00:00Z\"}}"
+        );
+        serde_json::from_str::<NovelRecord>(&json).unwrap()
+    };
+    record.id = id;
+    record
 }

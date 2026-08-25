@@ -418,6 +418,11 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             clean,
             all_clean,
             no_tool,
+            history,
+            show,
+            restore,
+            merge_from,
+            merge_sections,
         } => commands::diff::cmd_diff(commands::diff::DiffOptions {
             target,
             view_diff_version,
@@ -426,6 +431,11 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             clean,
             all_clean,
             no_tool,
+            history,
+            show,
+            restore,
+            merge_from,
+            merge_sections,
         }),
         Commands::List {
             limit,
