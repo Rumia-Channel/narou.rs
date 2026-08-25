@@ -5,6 +5,8 @@ mod output_macros;
 pub(crate) mod test_support;
 
 pub mod application;
+#[cfg(feature = "lite")]
+pub mod epub_lite;
 #[cfg(feature = "native-runtime")]
 pub mod compat;
 #[cfg(feature = "native-runtime")]

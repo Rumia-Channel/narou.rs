@@ -38,7 +38,11 @@ native-runtime = [
     "dep:fs2",
     "dep:libc",
 ]
-worker-runtime = []
+# `lite`: embed AozoraEpub3_Lite (GPL-3.0-only) as the in-process EPUB
+# engine. Binaries built with this feature are distributed under GPL-3.0;
+# see assets/aozora_lite/LICENSE.md. The Worker runtime enables it always.
+lite = ["dep:aozora_epub3_lite"]
+worker-runtime = ["lite"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -84,6 +88,7 @@ getrandom = { version = "0.4", optional = true }
 fs2 = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
 url = "2"
+aozora_epub3_lite = { git = "https://github.com/Rumia-Channel/AozoraEpub3_Lite", rev = "8e0e3f68124de4782505dcad31e1e2eefaf11462", optional = true }
 
 [build-dependencies]
 base64 = "0.22"

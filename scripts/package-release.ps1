@@ -19,7 +19,10 @@ param(
 
     [string[]]$ResourceDirectories = @("webnovel", "preset"),
 
-    [string]$CommitVersion
+    [string]$CommitVersion,
+
+    # Optional build variant tag appended to the archive name (e.g. "GPL").
+    [string]$Variant = ""
 )
 
 Set-StrictMode -Version Latest
@@ -37,7 +40,8 @@ New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $resolvedBinary = (Resolve-Path -Path $BinaryPath).Path
 $resolvedUpdaterBinary = (Resolve-Path -Path $UpdaterBinaryPath).Path
 $resolvedOutputDir = (Resolve-Path -Path $OutputDir).Path
-$archiveName = "narou_rs_{0}_{1}.zip" -f $Platform, $Arch
+$variantSuffix = if ([string]::IsNullOrWhiteSpace($Variant)) { "" } else { "_$Variant" }
+$archiveName = "narou_rs_{0}_{1}{2}.zip" -f $Platform, $Arch, $variantSuffix
 $archivePath = Join-Path -Path $resolvedOutputDir -ChildPath $archiveName
 
 if (Test-Path -Path $archivePath -PathType Leaf) {

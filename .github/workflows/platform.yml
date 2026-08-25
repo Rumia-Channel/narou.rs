@@ -22,6 +22,18 @@ jobs:
       - run: cargo test --workspace --all-targets
       - run: cargo clippy --workspace --all-targets --all-features
 
+  native-gpl:
+    name: Native check (lite/GPL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gpl
+      - run: cargo check -p narou_rs --all-targets --features lite
+      - run: cargo test -p narou_rs --lib --features lite
+
   wasm:
     name: Portable wasm check
     runs-on: ubuntu-latest

@@ -54,6 +54,17 @@ jobs:
             binary: narou_rs.exe
             target: x86_64-pc-windows-msvc
             builder: cargo
+            features: ""
+            variant: ""
+          - name: Windows x64 (GPL)
+            os: windows-2025
+            platform: win
+            arch: x64
+            binary: narou_rs.exe
+            target: x86_64-pc-windows-msvc
+            builder: cargo
+            features: lite
+            variant: GPL
           - name: Windows ARM64
             os: windows-11-arm
             platform: win
@@ -61,6 +72,17 @@ jobs:
             binary: narou_rs.exe
             target: aarch64-pc-windows-msvc
             builder: cargo
+            features: ""
+            variant: ""
+          - name: Windows ARM64 (GPL)
+            os: windows-11-arm
+            platform: win
+            arch: arm64
+            binary: narou_rs.exe
+            target: aarch64-pc-windows-msvc
+            builder: cargo
+            features: lite
+            variant: GPL
           - name: macOS x64
             os: macos-15-intel
             platform: mac
@@ -68,6 +90,17 @@ jobs:
             binary: narou_rs
             target: x86_64-apple-darwin
             builder: cargo
+            features: ""
+            variant: ""
+          - name: macOS x64 (GPL)
+            os: macos-15-intel
+            platform: mac
+            arch: x64
+            binary: narou_rs
+            target: x86_64-apple-darwin
+            builder: cargo
+            features: lite
+            variant: GPL
           - name: macOS ARM64
             os: macos-15
             platform: mac
@@ -75,6 +108,17 @@ jobs:
             binary: narou_rs
             target: aarch64-apple-darwin
             builder: cargo
+            features: ""
+            variant: ""
+          - name: macOS ARM64 (GPL)
+            os: macos-15
+            platform: mac
+            arch: arm64
+            binary: narou_rs
+            target: aarch64-apple-darwin
+            builder: cargo
+            features: lite
+            variant: GPL
           - name: Linux x64
             os: ubuntu-24.04
             platform: linux
@@ -82,6 +126,17 @@ jobs:
             binary: narou_rs
             target: x86_64-unknown-linux-gnu
             builder: cargo
+            features: ""
+            variant: ""
+          - name: Linux x64 (GPL)
+            os: ubuntu-24.04
+            platform: linux
+            arch: x64
+            binary: narou_rs
+            target: x86_64-unknown-linux-gnu
+            builder: cargo
+            features: lite
+            variant: GPL
           - name: Linux ARM64
             os: ubuntu-24.04-arm
             platform: linux
@@ -89,6 +144,17 @@ jobs:
             binary: narou_rs
             target: aarch64-unknown-linux-gnu
             builder: cargo
+            features: ""
+            variant: ""
+          - name: Linux ARM64 (GPL)
+            os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+            binary: narou_rs
+            target: aarch64-unknown-linux-gnu
+            builder: cargo
+            features: lite
+            variant: GPL
           - name: Raspberry Pi 2/3/4
             os: ubuntu-24.04
             platform: linux
@@ -96,6 +162,17 @@ jobs:
             binary: narou_rs
             target: armv7-unknown-linux-gnueabihf
             builder: cross
+            features: ""
+            variant: ""
+          - name: Raspberry Pi 2/3/4 (GPL)
+            os: ubuntu-24.04
+            platform: linux
+            arch: armv7
+            binary: narou_rs
+            target: armv7-unknown-linux-gnueabihf
+            builder: cross
+            features: lite
+            variant: GPL
           - name: Raspberry Pi Zero
             os: ubuntu-24.04
             platform: linux
@@ -103,6 +180,17 @@ jobs:
             binary: narou_rs
             target: arm-unknown-linux-gnueabihf
             builder: cross
+            features: ""
+            variant: ""
+          - name: Raspberry Pi Zero (GPL)
+            os: ubuntu-24.04
+            platform: linux
+            arch: armv6
+            binary: narou_rs
+            target: arm-unknown-linux-gnueabihf
+            builder: cross
+            features: lite
+            variant: GPL
     steps:
       - uses: actions/checkout@v4
 
@@ -110,7 +198,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.os }}-${{ matrix.target }}
+          key: release-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.variant }}
 
       - name: Add Rust target
         shell: pwsh
@@ -157,11 +245,16 @@ jobs:
           NAROU_RS_RELEASE_BUILD: "1"
           NAROU_RS_UPDATER_SHA256: ${{ steps.updater_hash.outputs.hash }}
         run: |
+          $featureArgs = @()
+          if ("${{ matrix.features }}" -ne "") {
+            $featureArgs += "--features"
+            $featureArgs += "${{ matrix.features }}"
+          }
           if ("${{ matrix.builder }}" -eq "cross") {
             $env:PKG_CONFIG_ALLOW_CROSS = "1"
-            cross build --locked --release --target "${{ matrix.target }}" --bin narou_rs
+            cross build --locked --release --target "${{ matrix.target }}" --bin narou_rs @featureArgs
           } else {
-            cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs
+            cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs @featureArgs
           }
 
       - name: Package release asset
@@ -181,6 +274,7 @@ jobs:
             -Arch "${{ matrix.arch }}" `
             -PackageRoot "narou" `
             -CommitVersion "${{ github.ref_name }}" `
+            -Variant "${{ matrix.variant }}" `
             -OutputDir "dist"
 
           "archive_path=$archivePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
