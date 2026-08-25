@@ -37,7 +37,7 @@
 | 現行 | 方針 |
 |---|---|
 | `toc.yaml` / `本文/*.yaml` (section) | `novel_sections(novel_id, index, subtitle, body_yaml)` へ段階移行。per-novel lazy migration |
-| `raw/` 生 HTML | FS/ObjectStore 維持 (diff 用途、体積大) |
+| `diff.txt` (単一最新差分) | **バージョン履歴へ置換** → §11 `novel_versions` / `novel_version_sections` / `novel_version_diffs`。既存 diff コマンド出力は互換維持 |
 | `novel.txt` ミラー / 生成 txt | `novel_outputs` (BLOB) — lite DL 経路の `converted_text()` キーと統合 |
 | 挿絵画像 / 表紙 | FS 維持 (AssetStore 契約は不変) |
 | `setting.ini` / `replace.txt` / `cookies-ingest.yaml` / `server.pid` | FS 維持 (ユーザー編集・ランタイム固有) |
@@ -96,7 +96,8 @@ src/native/sqlite/                (NEW: rusqlite ラッパ)
 | **P1 エンジン導入** | rusqlite 追加、schema migrations、`NativeNovelRepository` の SQLite 実装を trait の裏側として追加 (切替はしない) | 既存全テストが YAML 経由で pass、新実装が同じ golden で同一結果 (dual-run テスト) |
 | **P2 メタデータ切替** | settings/freeze/alias/tag colors/queue/notepad/latest_convert も SQLite 化、auto-import 実装、`narou db` サブコマンド (verify/export-yaml/vacuum) | golden library で import → 全コマンド操作 → export が元 YAML と意味論一致。Web UI 全 API の結合テスト pass |
 | **P3 既定化** | 新規 `narou init` は SQLite を既定に。YAML writer を export 専用へ。perf 計測 (list/sort/tag 一括 1000 件) | 既定フローで YAML を書かないことが assert され、性能劣化なし (目標: 全操作 YAML 比 2x 以内) |
-| **P4 コンテンツ** | sections/toc/novel_outputs の DB 化 (lazy migration)、lite EPUB DL 経路を DB 直読みへ | per-novel 移行が中断再開可能。EPUB byte 等価テスト維持 |
+| **P4a コンテンツ** | sections/toc/novel_outputs の DB 化 (lazy migration)、lite EPUB DL 経路を DB 直読みへ | per-novel 移行が中断再開可能。EPUB byte 等価テスト維持 |
+| **P4b 差分履歴** | §11 のバージョン管理実装: update 時の自動 snapshot + unified diff 保存、`narou diff` の履歴/復元/マージ拡張、Web API (`api_diff` 履歴化、restore/merge エンドポイント追加) | 更新→差分→rollback→merge の一連操作が golden 上で可逆。既定 `diff` 出力は現行と同一 |
 | **P5 清算** | Inventory/IndexStore/legacy_persistence の縮小、AGENTS.md・COMMANDS.md・memory 更新、minor version bump (0.4.0) | cargo check/test/clippy 全 green、docs 整合 |
 
 各 Phase は独立 commit 単位。P2 完了までは既定動作を一切変えない (リスクゼロ着地)。
@@ -108,8 +109,7 @@ src/native/sqlite/                (NEW: rusqlite ラッパ)
 | Windows の AV/索引による db ファイル掴み | WAL + busy_timeout、open retry (既存 Windows retry ロジックを接続層へ移植) |
 | DB 破損 | migrate 前自動 backup (`novels.db.bak-<ts>` 1 世代)、`narou db verify` (=integrity_check)、export-yaml による脱出路 |
 | 複数プロセス (tray/web/queue 子プロセス) の書込競合 | 単一 writer 原則 (queue lane 直列を利用) + BEGIN IMMEDIATE |
-| D1 方言差で SQL 共有が破綻 | 共有 SQL は両 runtime の CI で dual-execute テスト |
-| bundled sqlite の cross compile (armv6/7) | release CI の cross ビルドで早期検出、失敗時は `libsqlite3-sys` の系统調整 |
+| bundled sqlite の cross compile (armv6/7) | release CI の cross ビルドで早期検出、失敗時は `libsqlite3-sys` の系統調整 |
 | 大規模ライブラリでの移行時間 | import は prepared batch + 単一 tx。10k 件 < 30s 目標、超えたら chunked commit に切替 |
 
 ## 9. テスト計画
@@ -123,3 +123,78 @@ src/native/sqlite/                (NEW: rusqlite ラッパ)
 ## 10. 影響ファイル (主要)
 
 `src/db/*` (大幅縮小), `src/native/{novel_repository,legacy_persistence}.rs`, `src/queue.rs`, `src/web/{global_settings,misc,jobs}.rs`, `src/application/jobs.rs`, `worker_entry/d1_repository.rs` (SQL 共有化), `Cargo.toml`, `AGENTS.md`, `COMMANDS.md`
+
+P4b 追加分: `src/commands/diff.rs` (--list/--show/--restore/--merge-from), `src/commands/update.rs` + `src/downloader/mod.rs` (snapshot フック), `src/web/jobs.rs` (api_diff 拡張・restore/merge エンドポイント), D1 migration 追加
+
+## 11. 差分履歴・マージ・ロールバック (P4b 詳細設計)
+
+### 11.1 スキーマ (native 0009 / D1 migration 同時追加)
+
+```sql
+CREATE TABLE novel_versions (
+  id          INTEGER PRIMARY KEY,
+  novel_id    INTEGER NOT NULL REFERENCES novels(id),
+  parent_id   INTEGER REFERENCES novel_versions(id),
+  origin      TEXT NOT NULL CHECK (origin IN ('update','manual','rollback','import')),
+  note        TEXT,
+  section_count INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX novel_versions_novel_idx ON novel_versions(novel_id, id DESC);
+
+CREATE TABLE novel_version_sections (
+  version_id INTEGER NOT NULL REFERENCES novel_versions(id) ON DELETE CASCADE,
+  idx        TEXT NOT NULL,
+  subtitle   TEXT,
+  body_yaml  TEXT NOT NULL,           -- 既存 SectionFile codec を再利用
+  PRIMARY KEY (version_id, idx)
+) WITHOUT ROWID;
+
+CREATE TABLE novel_version_diffs (
+  version_id     INTEGER PRIMARY KEY REFERENCES novel_versions(id) ON DELETE CASCADE,
+  prev_version_id INTEGER,
+  unified_diff   TEXT NOT NULL         -- `similar` の unified 出力をそのまま保存 (diff コマンド互換)
+) WITHOUT ROWID;
+```
+
+- 作業セットは P4a の `novel_sections` (現行の「今の本文」)。version 行は**イミュータブル**な過去スナップショット。
+- **保持数上限**: 設定 `diff.history-limit` (既定 10)。新規 version 挿入時に超過分を古い方から削除。`unified_diff` は自己完結しているため参照先 version が消えても表示可能。
+- サイズ感: 小説 1 本の section 総量 ≈ 0.1〜5 MB、既定 10 版で最大 ~50 MB/本。上限設定と `narou db vacuum` で管理。
+
+### 11.2 更新フロー (downloader 統合)
+
+```text
+update 実行 → 差分検出 (既存ロジック)
+  └─ 変更あり:
+       BEGIN IMMEDIATE
+         1. 現行作業セットを snapshot として INSERT (origin='update', parent=前回head)
+         2. 新 sections を作業セットへ適用
+         3. unified diff を計算して novel_version_diffs へ
+       COMMIT            -- diff.txt への書き出しは廃止 (読み取りは DB)
+```
+
+### 11.3 CLI / Web 表面 (後方互換)
+
+| 操作 | 従来 | 変更後 |
+|---|---|---|
+| `narou diff <id>` | diff.txt の最新差分表示 | **同一出力**を head version の unified_diff から表示 |
+| `narou diff <id> --list` | (なし・追加) | version 一覧 (`id, origin, created_at, sections, summary`) |
+| `narou diff <id> --show <ver>` | (追加) | 指定版の unified diff 表示 |
+| `narou diff <id> --restore <ver>` | (追加) rollback | 対象版の sections を**コピーして新 head にする** (非破壊。`--drop-newer` で後続版 pruning を明示指定時のみ) |
+| `narou diff <id> --merge-from <ver> [--section N,...]` | (追加) merge | 指定版 (省略時は全指定 section) を現行へ上書き複写し新 head 作成 |
+| Web `POST api_diff` | 単一差分 JSON | 最新差分 + 履歴リスト (フィールド追加のみ・既存キー不変) |
+| Web `api_diff_clean` | diff.txt 削除 | 履歴全削除 (= prune all)。挙動名は維持 |
+
+- **マージの粒度**: v1 は section 単位の選択的複写 (競合概念なし・常に新 head 生成で取り消し可能)。行レベル 3-way マージ (`similar::merge` 等) は v2 検討項目。
+- **ロールバックも copy-forward**: head を付け替える破壊的移動は行わないため、誤操作は直ちに再 rollback で復元できる。
+
+### 11.4 Worker / D1
+
+同じ 3 テーブルを D1 migration として追加。Worker crawler が update 時に自動 snapshot (§11.2 と同フロー) を書き、Web DL 時 EPUB は head version を使えるため「DL するだけで過去版 EPUB」も可能になる (`?version=` クエリ拡張は任意)。
+
+### 11.5 追加テスト
+
+- 更新 2 回 → versions=2、head diff が旧 `diff.txt` 生成物と文字列一致
+- rollback → 本文が対象版と一致、かつ新 version が作られていること
+- merge (--section) → 非指定 section が不変であること
+- history-limit 超過で最古 version が削除され、残存 diff 表示が壊れないこと
