@@ -65,14 +65,14 @@ impl JobKind {
 
 /// A normalized job target.
 ///
-/// Numeric ids are used directly; ncodes are kept as strings because
-/// resolving an ncode to an id requires a repository lookup, which this pure
-/// planning service does not perform. The queue layer resolves ncodes at
-/// enqueue time. Auto-update is a targetless job and uses [`JobTarget::All`].
+/// Numeric ids are used directly; ncodes are normalized to lowercase, and
+/// HTTP(S) URLs are normalized before they enter the durable queue. Auto-update
+/// is a targetless job and uses [`JobTarget::All`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum JobTarget {
     Id(NovelId),
     Ncode(String),
+    Url(String),
     All,
 }
 
@@ -82,19 +82,25 @@ impl JobTarget {
         match self {
             Self::Id(id) => id.0.to_string(),
             Self::Ncode(ncode) => ncode.clone(),
+            Self::Url(url) => url.clone(),
             Self::All => "*".to_string(),
         }
     }
 
     /// Inverse of [`Self::as_str`]; `None` for values a ledger could not
-    /// have produced. Numeric strings are ids, `n…` strings are ncodes, and
-    /// `*` is the targetless auto-update marker.
+    /// have produced. Numeric strings are ids, `n…` strings are ncodes,
+    /// HTTP(S) URLs are URL targets, and `*` is the auto-update marker.
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "*" => Some(Self::All),
-            value if is_valid_ncode(value) => Some(Self::Ncode(value.to_string())),
-            value => value.parse::<i64>().ok().map(|id| Self::Id(NovelId(id))),
+        if value == "*" {
+            return Some(Self::All);
         }
+        if is_valid_ncode(value) {
+            return Some(Self::Ncode(value.to_string()));
+        }
+        if let Ok(id) = value.parse::<i64>() {
+            return Some(Self::Id(NovelId(id)));
+        }
+        normalize_url_target(value).map(Self::Url)
     }
 }
 
@@ -102,9 +108,9 @@ impl JobTarget {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JobRequest {
     pub kind: JobKind,
-    /// Target novels. Each target is either a numeric id or an ncode
-    /// (`n1234ab`); mixed forms are normalized and deduplicated. Auto-update
-    /// accepts an empty list because it operates on the whole library.
+    /// Target novels. Each target is a numeric id, an ncode (`n1234ab`), or
+    /// an HTTP(S) novel URL. Mixed forms are normalized and deduplicated.
+    /// Auto-update accepts an empty list because it operates on the library.
     pub targets: Vec<String>,
     /// Extra kind-specific options (e.g. `--force` for update).
     pub options: Vec<String>,
@@ -153,7 +159,7 @@ impl JobPlan {
 pub struct JobPlanResult {
     /// The deduplicated, normalized plans in input order.
     pub plans: Vec<JobPlan>,
-    /// Targets that are neither a valid id nor a valid ncode.
+    /// Targets that are neither a valid id, ncode, nor HTTP(S) URL.
     pub invalid: Vec<String>,
     /// Duplicate targets that were dropped (kept for reporting).
     pub duplicates: Vec<String>,
@@ -162,8 +168,8 @@ pub struct JobPlanResult {
 /// Concrete job planning service.
 ///
 /// Pure and deterministic: no clock, no repository, no queue. Target
-/// normalization accepts numeric ids and ncode strings; anything else is
-/// reported as invalid.
+/// normalization accepts numeric ids, ncodes, and HTTP(S) URLs; anything else
+/// is reported as invalid.
 pub struct JobService;
 impl JobService {
     /// Plan a request into deduplicated [`JobPlan`]s.
@@ -252,8 +258,9 @@ impl JobService {
 
 /// Normalize a target string to a [`JobTarget`].
 ///
-/// Accepts a plain numeric id (`123`) or an ncode (`n1234ab`, case
-/// insensitive, normalized to lowercase). Returns `None` for anything else.
+/// Accepts a plain numeric id (`123`), an ncode (`n1234ab`, case-insensitive),
+/// or an absolute HTTP(S) URL. URL fragments are removed because they are not
+/// sent in HTTP requests and must not create distinct queue jobs.
 fn normalize_target(target: &str) -> Option<JobTarget> {
     let trimmed = target.trim();
     if trimmed.is_empty() {
@@ -266,7 +273,19 @@ fn normalize_target(target: &str) -> Option<JobTarget> {
     if is_valid_ncode(&lower) {
         return Some(JobTarget::Ncode(lower));
     }
-    None
+    normalize_url_target(trimmed).map(JobTarget::Url)
+}
+
+fn normalize_url_target(value: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
 }
 
 /// True for a well-formed ncode: `n` followed by 4–8 alphanumerics
@@ -687,8 +706,6 @@ pub enum JobClaim {
     Unknown,
 }
 
-
-
 impl SchedulerCheckpoint {
     /// Claim a logical generation without a planner lease.
     ///
@@ -816,7 +833,6 @@ pub trait JobQueue: Send + Sync {
     /// running lease must cause redelivery, never an acknowledgement.
     fn claim<'a>(&'a self, job_id: &'a JobId) -> PlatformFuture<'a, crate::error::Result<JobClaim>>;
 
-
     /// Persist a budget-yielded checkpoint and release the execution claim.
     ///
     /// The next queue envelope is a continuation, not a failed attempt, so
@@ -902,8 +918,31 @@ mod tests {
                 options: Vec::new(),
             }]
         );
-        // Both later occurrences are duplicates (reported per occurrence).
         assert_eq!(result.duplicates, vec!["n1234ab".to_string(), "n1234ab".to_string()]);
+    }
+
+    #[test]
+    fn plan_normalizes_urls_and_deduplicates_fragments() {
+        let result = service().plan(&JobRequest {
+            kind: JobKind::Download,
+            targets: vec![
+                " https://EXAMPLE.com/novel/42#chapter-1 ".into(),
+                "https://example.com/novel/42#chapter-2".into(),
+            ],
+            options: Vec::new(),
+        });
+        assert_eq!(
+            result.plans,
+            vec![JobPlan {
+                kind: JobKind::Download,
+                target: JobTarget::Url("https://example.com/novel/42".into()),
+                options: Vec::new(),
+            }]
+        );
+        assert_eq!(
+            result.duplicates,
+            vec!["https://example.com/novel/42#chapter-2".to_string()]
+        );
     }
 
     #[test]
@@ -918,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_target_accepts_ids_and_ncodes() {
+    fn validate_target_accepts_ids_ncodes_and_urls() {
         assert_eq!(
             service().validate_target("42").unwrap(),
             JobTarget::Id(NovelId(42))
@@ -927,8 +966,20 @@ mod tests {
             service().validate_target("N1234AB").unwrap(),
             JobTarget::Ncode("n1234ab".into())
         );
+        assert_eq!(
+            service()
+                .validate_target("https://Example.com/work/1#fragment")
+                .unwrap(),
+            JobTarget::Url("https://example.com/work/1".into())
+        );
+        assert_eq!(
+            JobTarget::parse("https://example.com/work/1"),
+            Some(JobTarget::Url("https://example.com/work/1".into()))
+        );
         assert!(service().validate_target("").is_err());
         assert!(service().validate_target("n12").is_err());
+        assert!(service().validate_target("file:///tmp/novel").is_err());
+        assert!(service().validate_target("https://user:pass@example.com/novel").is_err());
     }
 
     #[test]
@@ -978,8 +1029,6 @@ mod tests {
         let b = plan(JobKind::Update, JobTarget::Id(NovelId(7)), &["--verbose", " --force "]);
         assert_eq!(a.dedupe_key(), b.dedupe_key());
         assert_eq!(a.dedupe_key(), "update:7:--force,--verbose");
-
-        // Different kinds or targets produce different keys.
         assert_ne!(
             a.dedupe_key(),
             plan(JobKind::Download, JobTarget::Id(NovelId(7)), &["--force"]).dedupe_key()
@@ -991,6 +1040,15 @@ mod tests {
         assert_ne!(
             a.dedupe_key(),
             plan(JobKind::Update, JobTarget::Ncode("n1234ab".into()), &["--force"]).dedupe_key()
+        );
+        assert_ne!(
+            a.dedupe_key(),
+            plan(
+                JobKind::Update,
+                JobTarget::Url("https://example.com/novel/7".into()),
+                &["--force"],
+            )
+            .dedupe_key()
         );
     }
 
@@ -1007,6 +1065,15 @@ mod tests {
         let back: WorkerJobEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back, envelope);
         assert_eq!(back.version, WORKER_JOB_ENVELOPE_VERSION);
+
+        let url_job = plan(
+            JobKind::Download,
+            JobTarget::Url("https://example.com/novel/42".into()),
+            &[],
+        );
+        let json = serde_json::to_string(&url_job).unwrap();
+        let back: JobPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, url_job);
     }
 
     #[test]
@@ -1023,7 +1090,6 @@ mod tests {
             LegacyEnvelopeOutcome::Reject { reason } => panic!("expected plan, got reject: {reason}"),
         }
 
-        // Auto-update with no targets is one unambiguous plan.
         let request = JobRequest {
             kind: JobKind::AutoUpdate,
             targets: Vec::new(),
@@ -1034,7 +1100,6 @@ mod tests {
             LegacyEnvelopeOutcome::Plan(_)
         ));
 
-        // Multi-target requests must be rejected, never split silently.
         let request = JobRequest {
             kind: JobKind::Download,
             targets: vec!["1".into(), "2".into()],
@@ -1045,7 +1110,6 @@ mod tests {
             LegacyEnvelopeOutcome::Reject { .. }
         ));
 
-        // Invalid targets are rejected.
         let request = JobRequest {
             kind: JobKind::Download,
             targets: vec!["not-a-target".into()],
@@ -1056,8 +1120,6 @@ mod tests {
             LegacyEnvelopeOutcome::Reject { .. }
         ));
 
-        // Unsupported kinds still decode (the executor blocks them later);
-        // what must never happen is an empty request being treated as a job.
         let request = JobRequest {
             kind: JobKind::Backup,
             targets: Vec::new(),
@@ -1080,7 +1142,6 @@ mod tests {
             classify_failure(&NarouError::SuspendDownload("slow down".into())),
             JobFailureClass::Retryable
         );
-
         assert_eq!(
             classify_failure(&NarouError::DownloadBudgetExpired {
                 next_section_index: 4,
@@ -1142,16 +1203,9 @@ mod tests {
         };
         assert_eq!(claimed.state, CheckpointState::Running);
         assert_eq!(claimed.generation, 7);
-
-        // A duplicate delivery of the same generation is rejected.
         assert_eq!(claimed.begin(7, "2026-08-10T00:00:01Z"), CheckpointClaim::Duplicate);
-
-        // A redelivery of an already-completed generation is also rejected
-        // (never re-execute the same cron event).
         let finished = claimed.finish("2026-08-10T00:05:00Z");
         assert_eq!(finished.begin(7, "2026-08-10T00:06:00Z"), CheckpointClaim::Duplicate);
-
-        // A new generation takes over (crash recovery) with a fresh cursor.
         let next = match claimed.begin(8, "2026-08-10T00:30:00Z") {
             CheckpointClaim::Claimed(checkpoint) => checkpoint,
             CheckpointClaim::Duplicate => panic!("new generation must claim"),
@@ -1225,7 +1279,7 @@ mod tests {
 
         let ok = JobRequest {
             kind: JobKind::Download,
-            targets: vec!["123".into(), "n1234ab".into()],
+            targets: vec!["123".into(), "n1234ab".into(), "https://example.com/novel/1".into()],
             options: vec!["--force".into()],
         };
         assert_eq!(validate_request_limits(&ok), None);
@@ -1262,7 +1316,6 @@ mod tests {
         };
         assert!(validate_request_limits(&long_option).is_some());
 
-        // A normal envelope is well under the byte cap.
         let envelope = WorkerJobEnvelope::v2(
             JobId("j1".into()),
             plan(JobKind::Update, JobTarget::Id(NovelId(42)), &["--force"]),
@@ -1295,7 +1348,6 @@ mod tests {
 
     #[test]
     fn bounded_auto_update_page_plans_one_job_per_novel() {
-        // A full page (ids == page_size) is not done and carries the cursor.
         let page = service().plan_auto_update_page(
             &[NovelId(1), NovelId(2), NovelId(3)],
             &["--force".into()],
@@ -1312,13 +1364,11 @@ mod tests {
             ]
         );
 
-        // A short (final) page is marked done with no cursor.
         let page = service().plan_auto_update_page(&[NovelId(9)], &[], 3);
         assert!(page.done);
         assert_eq!(page.next_cursor, None);
         assert_eq!(page.plans.len(), 1);
 
-        // An empty page is done.
         let page = service().plan_auto_update_page(&[], &[], 3);
         assert!(page.done);
         assert_eq!(page.next_cursor, None);
