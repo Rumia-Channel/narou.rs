@@ -94,11 +94,30 @@ pub async fn resolve_final_url(
     cookie: Option<&str>,
     narou: bool,
 ) -> Result<String> {
+    Ok(
+        resolve_final_url_with_body(http, rate_limiter, url, cookie, narou)
+            .await?
+            .0,
+    )
+}
+
+/// Same redirect-chain resolution as [`resolve_final_url`], additionally
+/// returning the terminal response when the *first* request already reached
+/// a non-redirect answer. Callers may reuse that body instead of issuing a
+/// second GET for the same URL; a redirected chain returns `None` because
+/// the cookie scope may have changed between hops.
+pub async fn resolve_final_url_with_body(
+    http: &dyn HttpClient,
+    rate_limiter: &dyn RateLimiter,
+    url: &str,
+    cookie: Option<&str>,
+    narou: bool,
+) -> Result<(String, Option<HttpResponse>)> {
     validate_public_url(url).map_err(|e| NarouError::Http(e.to_string()))?;
     let mut current = url::Url::parse(url).map_err(|e| NarouError::Http(e.to_string()))?;
     let mut current_cookie = cookie.map(ToString::to_string);
 
-    for _ in 0..=MAX_REDIRECTS {
+    for hop in 0..=MAX_REDIRECTS {
         validate_public_url(current.as_str()).map_err(|e| NarouError::Http(e.to_string()))?;
         rate_limiter
             .acquire(&scope_for(host_of(current.as_str()), narou))
@@ -115,7 +134,7 @@ pub async fn resolve_final_url(
         let response = http.send(request).await?;
         if response.is_redirection() {
             let Some(location) = response.header("Location") else {
-                return Ok(current.to_string());
+                return Ok((current.to_string(), None));
             };
             let next = current
                 .join(location)
@@ -126,7 +145,10 @@ pub async fn resolve_final_url(
             current = next;
             continue;
         }
-        return Ok(current.to_string());
+        // Only the first hop's body is reusable: later hops may have run with
+        // a different cookie scope than the caller's `fetch_text` would use.
+        let body = (hop == 0).then_some(response);
+        return Ok((current.to_string(), body));
     }
 
     Err(NarouError::Http(format!(

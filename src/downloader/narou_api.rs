@@ -113,33 +113,37 @@ pub async fn narou_api_batch_update(
     http: &dyn HttpClient,
     novels: &dyn NovelRepository,
 ) -> Result<(usize, usize)> {
-    // なろう対象の一覧を keyset scan で取得する (D1: `WHERE is_narou = 1
-    // AND ncode IS NOT NULL ORDER BY id LIMIT ?`)。`ncode` のないレコードは
-    // スキップしてからバッチ処理する。
-    let mut narou_ids: Vec<(i64, String)> = Vec::new();
+    // なろう対象の一覧をページング query で一括取得する。scan_ids + get の
+    // N+1 (ID 一覧 → 1 件ずつ get) ではなく、フィルタ済みレコードを直接
+    // ページ取得して `ncode` のないレコードはスキップする。
+    let mut narou_records: Vec<crate::db::novel_record::NovelRecord> = Vec::new();
     let filter = crate::platform::NovelFilter {
         is_narou: Some(true),
         ..Default::default()
     };
     const SCAN_PAGE: usize = 500;
-    let mut after_id = None;
+    let mut offset = 0usize;
     loop {
-        let page = novels.scan_ids(&filter, after_id, SCAN_PAGE).await?;
-        if page.is_empty() {
+        let page = novels
+            .query(&crate::platform::NovelQuery::page(
+                filter.clone(),
+                crate::platform::NovelSort::default(),
+                offset,
+                SCAN_PAGE,
+            ))
+            .await?;
+        let page_len = page.len();
+        narou_records.extend(page.into_iter().filter(|record| record.ncode.is_some()));
+        if page_len < SCAN_PAGE {
             break;
         }
-        for id in &page {
-            if let Some(record) = novels.get(*id).await? {
-                if let Some(ncode) = record.ncode {
-                    narou_ids.push((record.id, ncode));
-                }
-            }
-        }
-        after_id = page.last().copied();
-        if page.len() < SCAN_PAGE {
-            break;
-        }
+        offset += page_len;
     }
+    let narou_ids: Vec<(i64, String)> = narou_records
+        .iter()
+        .map(|record| (record.id, record.ncode.clone().unwrap()))
+        .collect();
+
 
     if narou_ids.is_empty() {
         return Ok((0, 0));
@@ -175,64 +179,66 @@ pub async fn narou_api_batch_update(
 
         let entries = parse_api_entries(&body);
 
+        // Apply the whole chunk in one `apply_batch` instead of a get +
+        // per-entry upsert: native saves the YAML once, D1 issues one
+        // transaction per 50-novel chunk.
+        let mut mutations = Vec::new();
         for entry in &entries {
             let entry_ncode = entry
                 .get("ncode")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            if let Some(id) = chunk
+            if let Some(record) = narou_records
                 .iter()
-                .find(|(_, nc)| nc.eq_ignore_ascii_case(entry_ncode))
-                .map(|(id, _)| *id)
+                .find(|record| {
+                    record
+                        .ncode
+                        .as_deref()
+                        .is_some_and(|nc| nc.eq_ignore_ascii_case(entry_ncode))
+                })
+                .cloned()
             {
-                let updated = match novels.get(id.into()).await? {
-                    Some(record) => {
-                        let mut r = record;
+                let mut r = record;
 
-                        if let Some(s) = entry.get("title").and_then(|v| v.as_str()) {
-                            r.title = s.to_string();
-                        }
-                        if let Some(s) = entry.get("writer").and_then(|v| v.as_str()) {
-                            r.author = s.to_string();
-                        }
-                        if let Some(n) = entry.get("end").and_then(|v| v.as_i64()) {
-                            r.end = n == 1;
-                        }
-                        if let Some(n) = entry.get("general_all_no").and_then(|v| v.as_i64()) {
-                            r.general_all_no = Some(n);
-                        }
-                        if let Some(n) = entry.get("length").and_then(|v| v.as_i64()) {
-                            r.length = Some(n);
-                        }
-
-                        if let Some(s) = entry.get("general_firstup").and_then(|v| v.as_str()) {
-                            r.general_firstup = parse_api_datetime(s);
-                        }
-                        if let Some(s) = entry.get("general_lastup").and_then(|v| v.as_str()) {
-                            r.general_lastup = parse_api_datetime(s);
-                        }
-                        if let Some(s) = entry.get("novelupdated_at").and_then(|v| v.as_str()) {
-                            r.novelupdated_at = parse_api_datetime(s);
-                        }
-
-                        if let Some(nt) = entry.get("novel_type").and_then(|v| v.as_i64()) {
-                            r.novel_type = if nt == 2 { 2 } else { 1 };
-                        }
-
-                        novels
-                            .apply_batch(vec![crate::platform::NovelMutation::Upsert(r)])
-                            .await?;
-                        true
-                    }
-                    None => false,
-                };
-
-                if updated {
-                    total_updated += 1;
+                if let Some(s) = entry.get("title").and_then(|v| v.as_str()) {
+                    r.title = s.to_string();
                 }
+                if let Some(s) = entry.get("writer").and_then(|v| v.as_str()) {
+                    r.author = s.to_string();
+                }
+                if let Some(n) = entry.get("end").and_then(|v| v.as_i64()) {
+                    r.end = n == 1;
+                }
+                if let Some(n) = entry.get("general_all_no").and_then(|v| v.as_i64()) {
+                    r.general_all_no = Some(n);
+                }
+                if let Some(n) = entry.get("length").and_then(|v| v.as_i64()) {
+                    r.length = Some(n);
+                }
+
+                if let Some(s) = entry.get("general_firstup").and_then(|v| v.as_str()) {
+                    r.general_firstup = parse_api_datetime(s);
+                }
+                if let Some(s) = entry.get("general_lastup").and_then(|v| v.as_str()) {
+                    r.general_lastup = parse_api_datetime(s);
+                }
+                if let Some(s) = entry.get("novelupdated_at").and_then(|v| v.as_str()) {
+                    r.novelupdated_at = parse_api_datetime(s);
+                }
+
+                if let Some(nt) = entry.get("novel_type").and_then(|v| v.as_i64()) {
+                    r.novel_type = if nt == 2 { 2 } else { 1 };
+                }
+
+                mutations.push(crate::platform::NovelMutation::Upsert(r));
             }
         }
+        let updated = mutations.len();
+        if !mutations.is_empty() {
+            novels.apply_batch(mutations).await?;
+        }
+        total_updated += updated;
     }
 
     Ok((total_updated, total_failed))

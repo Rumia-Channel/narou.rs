@@ -6,7 +6,7 @@ use crate::platform::{HttpClient, RateLimiter};
 use super::http_policy;
 use super::site_setting::SiteSetting;
 use super::types::{MAX_SECTION_CACHE, SectionElement, SubtitleInfo};
-use super::util::{build_section_url, compile_html_pattern, pretreatment_source};
+use super::util::{build_section_url, pretreatment_source};
 
 pub struct SectionCache {
     cache: HashMap<String, SectionElement>,
@@ -82,36 +82,30 @@ pub fn parse_section_html(
         body: String::new(),
     };
 
-    if let Some(pattern) = setting.introduction_pattern() {
-        if let Ok(re) = compile_html_pattern(pattern) {
-            if let Some(caps) = re.captures(&html_source) {
-                element.introduction = caps
-                    .name("introduction")
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default();
-            }
+    if let Some(re) = setting.compiled_introduction_pattern() {
+        if let Some(caps) = re.captures(&html_source) {
+            element.introduction = caps
+                .name("introduction")
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
         }
     }
 
-    if let Some(pattern) = setting.postscript_pattern() {
-        if let Ok(re) = compile_html_pattern(pattern) {
-            if let Some(caps) = re.captures(&html_source) {
-                element.postscript = caps
-                    .name("postscript")
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default();
-            }
+    if let Some(re) = setting.compiled_postscript_pattern() {
+        if let Some(caps) = re.captures(&html_source) {
+            element.postscript = caps
+                .name("postscript")
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
         }
     }
 
-    if let Some(pattern) = setting.body_pattern() {
-        if let Ok(re) = compile_html_pattern(pattern) {
-            if let Some(caps) = re.captures(&html_source) {
-                element.body = caps
-                    .name("body")
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default();
-            }
+    if let Some(re) = setting.compiled_body_pattern() {
+        if let Some(caps) = re.captures(&html_source) {
+            element.body = caps
+                .name("body")
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
         }
     }
 

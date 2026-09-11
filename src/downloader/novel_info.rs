@@ -44,12 +44,17 @@ impl NovelInfo {
     /// Fetch the novel-info page (when the site defines `novel_info_url`)
     /// and parse it. Any fetch failure falls back to the TOC source, matching
     /// the old `NovelInfo::load` behaviour.
+    ///
+    /// When `novel_info_url` resolves to the already-fetched `toc_url`
+    /// (e.g. Kakuyomu's `\k<toc_url>`), the pre-treated TOC source is parsed
+    /// directly instead of issuing a second request for identical bytes.
     pub async fn load(
         http: &dyn HttpClient,
         rate_limiter: &dyn RateLimiter,
         setting: &SiteSetting,
         toc_source: &str,
         url_captures: &HashMap<String, String>,
+        toc_url: &str,
     ) -> Result<Self> {
         let Some(novel_info_url) = &setting.novel_info_url else {
             return Ok(Self::from_toc_source(setting, toc_source));
@@ -57,6 +62,12 @@ impl NovelInfo {
         let resolved_url = setting
             .novel_info_url_with_captures(url_captures)
             .unwrap_or_else(|| setting.interpolate(novel_info_url));
+        if resolved_url == toc_url {
+            // The TOC fetch already ran `pretreatment_source`; parsing it with
+            // the novel-info rules is identical to re-fetching the same URL
+            // and pre-treating it again.
+            return Ok(Self::from_novel_info_source(setting, toc_source));
+        }
         match http_policy::fetch_text(
             http,
             rate_limiter,

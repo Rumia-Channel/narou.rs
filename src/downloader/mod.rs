@@ -1,7 +1,6 @@
 pub mod html;
 pub mod http_policy;
 #[cfg(feature = "native-runtime")]
-pub mod info_cache;
 pub mod narou_api;
 pub mod novel_info;
 pub mod persistence;
@@ -727,6 +726,7 @@ impl Downloader {
         setting: &SiteSetting,
         toc_source: &str,
         url_captures: &HashMap<String, String>,
+        toc_url: &str,
     ) -> Result<NovelInfo> {
         NovelInfo::load(
             self.http.as_ref(),
@@ -734,6 +734,7 @@ impl Downloader {
             setting,
             toc_source,
             url_captures,
+            toc_url,
         )
         .await
     }
@@ -771,7 +772,7 @@ impl Downloader {
         )
         .await?;
         let info = self
-            .load_novel_info(&setting, &toc_source, &url_captures)
+            .load_novel_info(&setting, &toc_source, &url_captures, &toc_url)
             .await?;
 
         let (novel_type, inferred_is_end) =
@@ -1129,28 +1130,35 @@ impl Downloader {
             setting.interpolate_with_captures(&setting.toc_url, &url_captures)
         };
         let toc_url = Self::ageauth_redirect_target(&toc_url).unwrap_or(toc_url);
-        let toc_url = match crate::downloader::http_policy::resolve_final_url(
-            self.http.as_ref(),
-            self.rate_limiter.as_ref(),
-            &toc_url,
-            setting.cookie(),
-            setting.is_narou,
-        )
-        .await
-        {
-            Ok(final_url) if final_url != toc_url => {
-                let final_url = Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
-                if let Some(final_setting) = self.find_site_setting(&final_url) {
-                    setting = final_setting;
-                    setting
-                        .toc_url_with_url_captures(&final_url)
-                        .unwrap_or(final_url)
-                } else {
-                    final_url
+        let (resolved_toc_url, prefetched_toc) =
+            match crate::downloader::http_policy::resolve_final_url_with_body(
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
+                &toc_url,
+                setting.cookie(),
+                setting.is_narou,
+            )
+            .await
+            {
+                Ok((final_url, _body)) if final_url != toc_url => {
+                    let final_url =
+                        Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
+                    if let Some(final_setting) = self.find_site_setting(&final_url) {
+                        setting = final_setting;
+                        (
+                            setting
+                                .toc_url_with_url_captures(&final_url)
+                                .unwrap_or(final_url),
+                            None,
+                        )
+                    } else {
+                        (final_url, None)
+                    }
                 }
-            }
-            _ => toc_url,
-        };
+                Ok((final_url, body)) => (final_url, body),
+                Err(_) => (toc_url, None),
+            };
+        let toc_url = resolved_toc_url;
         let url_captures = setting
             .extract_url_captures(&toc_url)
             .unwrap_or(url_captures);
@@ -1168,14 +1176,41 @@ impl Downloader {
                 .map(|record| record.id),
         };
         let provisional_id = existing_id.unwrap_or(provisional_id);
-        let toc_source = match fetch_toc(
-            self.http.as_ref(),
-            self.rate_limiter.as_ref(),
-            &setting,
-            &toc_url,
-        )
-        .await
-        {
+        let toc_source = match prefetched_toc {
+            // The redirect probe already fetched the final URL with the same
+            // cookie scope; reuse the body instead of a second GET.
+            Some(response) => {
+                let response = crate::downloader::http_policy::ensure_success_response(
+                    &toc_url, response,
+                );
+                match response {
+                    Ok(response) => {
+                        let mut body = crate::downloader::http_policy::decode_with_encoding(
+                            &response.body,
+                            Some(setting.encoding()),
+                        );
+                        pretreatment_source(&mut body, setting.encoding(), Some(&setting));
+                        if let Some(re) = setting.compiled_error_message_pattern()
+                            && re.is_match(&body)
+                        {
+                            return Err(NarouError::NotFound(
+                                "Novel deleted or private".into(),
+                            ));
+                        }
+                        Ok(body)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            None => fetch_toc(
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
+                &setting,
+                &toc_url,
+            )
+            .await,
+        };
+        let toc_source = match toc_source {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
                 let id = existing_id.unwrap();
@@ -1279,7 +1314,7 @@ impl Downloader {
         }
 
         let info = self
-            .load_novel_info(&setting, &toc_source, &url_captures)
+            .load_novel_info(&setting, &toc_source, &url_captures, &toc_url)
             .await?;
 
         let author = info.author.clone().unwrap_or_default();
@@ -1455,9 +1490,22 @@ impl Downloader {
             resumed_sections.insert(section_index, section);
         }
 
+        // One listing pass replaces a per-section existence read. On the
+        // Worker this is the difference between ⌈N/1000⌉ LIST subrequests
+        // and N GETs; on native it avoids N read+parse round trips.
+        let existing_names = self
+            .persistence
+            .list_novel_object_names(&object_keys)
+            .await?;
+        let existing_sections =
+            PersistenceService::existing_section_indices(&existing_names);
+
         struct SectionPlan {
             is_new_arrival: bool,
             needs_download: bool,
+            /// The section file existed before this run (canonical or legacy
+            /// name). Drives the cache move without a second read.
+            existed: bool,
             predownloaded: Option<(SectionElement, String)>,
             resumed: Option<SectionFile>,
         }
@@ -1478,6 +1526,7 @@ impl Downloader {
             let resumed = resumed_sections.remove(&section_index);
             let is_new_arrival =
                 resumed.is_none() && old_subtitles.get(&subtitle.index).is_none();
+            let existed = existing_sections.contains(&subtitle.index);
             let (needs_download, predownloaded) = if resumed.is_some() {
                 (false, None)
             } else if force {
@@ -1492,6 +1541,7 @@ impl Downloader {
                     &toc_url,
                     strong_update,
                     site_timezone,
+                    existed,
                 )
                 .await?
             };
@@ -1501,6 +1551,7 @@ impl Downloader {
             section_plans.push(SectionPlan {
                 is_new_arrival,
                 needs_download,
+                existed,
                 predownloaded,
                 resumed,
             });
@@ -1575,11 +1626,7 @@ impl Downloader {
                     )
                     .await?
                 };
-                let had_existing = self
-                    .persistence
-                    .load_section(&object_keys, subtitle)
-                    .await?
-                    .is_some();
+                let had_existing = plan.existed;
                 if had_existing {
                     if cache_dir.is_none() {
                         cache_dir = cache_timestamp(self.clock.as_ref());
@@ -1745,7 +1792,13 @@ impl Downloader {
         };
         self.persistence.save_toc(&object_keys, &toc_file).await?;
         self.persistence
-            .ensure_default_files(&object_keys, &toc_title, &toc_author, &toc_url)
+            .ensure_default_files(
+                &object_keys,
+                &toc_title,
+                &toc_author,
+                &toc_url,
+                Some(&existing_names),
+            )
             .await?;
 
         let now = self.clock.now_utc();
@@ -1919,6 +1972,7 @@ impl Downloader {
         toc_url: &str,
         strong_update: bool,
         timezone: SiteTimezone,
+        existed: bool,
     ) -> Result<(bool, Option<(SectionElement, String)>)> {
         let Some(old) = old else {
             return Ok((true, None));
@@ -1928,9 +1982,12 @@ impl Downloader {
             return Ok((true, None));
         }
 
-        let Some(old_section) = self.persistence.load_section(keys, old).await? else {
+        // A missing section file forces a re-download even when the dates say
+        // otherwise. Existence comes from the pre-computed listing set, so the
+        // common path performs no storage I/O at all.
+        if !existed {
             return Ok((true, None));
-        };
+        }
 
         let latest_subupdate = latest.subupdate.as_deref();
         let mut old_subupdate = old.subupdate.as_deref();
@@ -1966,39 +2023,44 @@ impl Downloader {
 
         if strong_update
             && let Some(basis_date) = strong_basis_date
-            && date_string_to_ymd_with_timezone(basis_date, timezone)
-                == section_timestamp_ymd(old_section.download_time.as_deref(), timezone)
         {
-            let downloaded = download_section(
-                self.http.as_ref(),
-                self.rate_limiter.as_ref(),
-                &mut self.section_cache,
-                setting,
-                latest,
-                toc_url,
-            )
-            .await?;
-            let new_hash = compute_section_hash(&downloaded.0);
-            let relative_path = section_relative_path(old);
-            let old_hash = existing_id
-                .and_then(|id| {
-                    self.cached_section_digest(id, &relative_path)
-                        .map(str::to_string)
-                })
-                .or_else(|| {
-                    let digest = compute_section_hash(&old_section.element);
+            let Some(old_section) = self.persistence.load_section(keys, old).await? else {
+                return Ok((true, None));
+            };
+            if date_string_to_ymd_with_timezone(basis_date, timezone)
+                == section_timestamp_ymd(old_section.download_time.as_deref(), timezone)
+            {
+                let downloaded = download_section(
+                    self.http.as_ref(),
+                    self.rate_limiter.as_ref(),
+                    &mut self.section_cache,
+                    setting,
+                    latest,
+                    toc_url,
+                )
+                .await?;
+                let new_hash = compute_section_hash(&downloaded.0);
+                let relative_path = section_relative_path(old);
+                let old_hash = existing_id
+                    .and_then(|id| {
+                        self.cached_section_digest(id, &relative_path)
+                            .map(str::to_string)
+                    })
+                    .or_else(|| {
+                        let digest = compute_section_hash(&old_section.element);
+                        if let Some(id) = existing_id {
+                            self.store_section_digest(id, &relative_path, &digest);
+                        }
+                        Some(digest)
+                    });
+                if old_hash.as_deref() == Some(new_hash.as_str()) {
                     if let Some(id) = existing_id {
-                        self.store_section_digest(id, &relative_path, &digest);
+                        self.store_section_digest(id, &relative_path, &new_hash);
                     }
-                    Some(digest)
-                });
-            if old_hash.as_deref() == Some(new_hash.as_str()) {
-                if let Some(id) = existing_id {
-                    self.store_section_digest(id, &relative_path, &new_hash);
+                    return Ok((false, None));
                 }
-                return Ok((false, None));
+                return Ok((true, Some(downloaded)));
             }
-            return Ok((true, Some(downloaded)));
         }
 
         Ok((true, None))

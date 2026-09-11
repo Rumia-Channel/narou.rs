@@ -9,8 +9,7 @@ use super::novel_info::NovelInfo;
 use super::site_setting::SiteSetting;
 use super::types::SubtitleInfo;
 use super::util::{
-    compile_html_pattern, load_length_limit, pretreatment_source, sanitize_filename,
-    sanitize_filename_with_limit,
+    load_length_limit, pretreatment_source, sanitize_filename, sanitize_filename_with_limit,
 };
 
 pub async fn fetch_toc(
@@ -30,8 +29,7 @@ pub async fn fetch_toc(
     .await?;
     pretreatment_source(&mut body, setting.encoding(), Some(setting));
 
-    if let Some(error_pattern) = setting.error_message()
-        && let Ok(re) = compile_html_pattern(error_pattern)
+    if let Some(re) = setting.compiled_error_message_pattern()
         && re.is_match(&body)
     {
         return Err(NarouError::NotFound("Novel deleted or private".into()));

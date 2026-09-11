@@ -1,10 +1,15 @@
+use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use super::types::{SectionElement, SectionFile, SubtitleInfo, TocFile};
 use crate::error::Result;
-use crate::platform::{AssetStore, Clock, NovelObjectKeys, ObjectStore, SystemClock};
+use crate::platform::{
+    AssetStore, Clock, NovelObjectKeys, ObjectListRequest, ObjectPrefix, ObjectStore, SystemClock,
+};
+
+use super::types::{SectionElement, SectionFile, SubtitleInfo, TocFile};
 
 pub fn compute_section_hash(section: &SectionElement) -> String {
     let mut hasher = Sha256::new();
@@ -130,6 +135,62 @@ impl PersistenceService {
         Ok(compute_section_hash(&existing.element) != compute_section_hash(new_section))
     }
 
+    /// List every object name under the novel prefix in one listing pass.
+    ///
+    /// One `list_page` round trip (or one bounded directory walk on native)
+    /// replaces a per-section `read_small`/`stat` probe. Callers that only
+    /// need existence should prefer this over N individual reads.
+    pub async fn list_novel_object_names(
+        &self,
+        keys: &NovelObjectKeys,
+    ) -> Result<HashSet<String>> {
+        let prefix = ObjectPrefix::from(keys.prefix().clone());
+        let mut names = HashSet::new();
+        let mut request = ObjectListRequest::new(prefix, NonZeroUsize::new(1000).unwrap());
+        loop {
+            let page = self.objects.list_page(&request).await?;
+            for object in &page.objects {
+                if let Some(name) = object
+                    .key
+                    .as_ref()
+                    .strip_prefix(keys.prefix().as_ref())
+                    .and_then(|rest| rest.strip_prefix('/'))
+                {
+                    names.insert(name.to_string());
+                }
+            }
+            match page.next_cursor {
+                Some(cursor) => request = request.after(cursor),
+                None => break,
+            }
+        }
+        Ok(names)
+    }
+
+    /// Section indices that already have a persisted `本文/` file.
+    ///
+    /// Matches both the canonical `<index> <file_subtitle>.yaml` name and the
+    /// legacy `<index>.yaml` / `<index> <old subtitle>.yaml` fallback that
+    /// `resolve_read_path` accepts on native.
+    pub fn existing_section_indices(names: &HashSet<String>) -> HashSet<String> {
+        names
+            .iter()
+            .filter_map(|name| {
+                let file = name.strip_prefix("本文/")?;
+                if file.starts_with('.') || !file.ends_with(".yaml") {
+                    return None;
+                }
+                let stem = file.strip_suffix(".yaml")?;
+                let index = stem.split_once(' ').map(|(index, _)| index).unwrap_or(stem);
+                if index.is_empty() {
+                    None
+                } else {
+                    Some(index.to_string())
+                }
+            })
+            .collect()
+    }
+
     pub async fn save_raw(
         &self,
         keys: &NovelObjectKeys,
@@ -158,19 +219,33 @@ impl PersistenceService {
         self.assets.move_or_copy(&source, &destination).await
     }
 
+    /// Write `setting.ini` / `replace.txt` defaults for files that do not yet
+    /// exist. When `existing_names` is provided (from
+    /// [`Self::list_novel_object_names`]) existence is decided from the set
+    /// with no extra storage round trips; otherwise each file is probed with
+    /// `stat`.
     pub async fn ensure_default_files(
         &self,
         keys: &NovelObjectKeys,
         title: &str,
         author: &str,
         toc_url: &str,
+        existing_names: Option<&HashSet<String>>,
     ) -> Result<()> {
-        if self.objects.read_small(&keys.setting()).await?.is_none() {
+        let setting_exists = match existing_names {
+            Some(names) => names.contains("setting.ini"),
+            None => self.objects.stat(&keys.setting()).await?.is_some(),
+        };
+        if !setting_exists {
             self.objects
                 .write_small(&keys.setting(), default_setting_ini().into_bytes())
                 .await?;
         }
-        if self.objects.read_small(&keys.replace()).await?.is_none() {
+        let replace_exists = match existing_names {
+            Some(names) => names.contains("replace.txt"),
+            None => self.objects.stat(&keys.replace()).await?.is_some(),
+        };
+        if !replace_exists {
             self.objects
                 .write_small(
                     &keys.replace(),
@@ -303,7 +378,7 @@ mod tests {
             assert_eq!(loaded.download_time.as_deref(), Some(time.as_str()));
 
             service
-                .save_raw(&keys, &subtitle, "<p>raw</p>")
+                .ensure_default_files(&keys, "題名", "作者", "https://example.test", None)
                 .await
                 .unwrap();
             service
@@ -321,7 +396,7 @@ mod tests {
                 .await
                 .unwrap();
             service
-                .ensure_default_files(&keys, "題名", "作者", "https://example.test")
+                .ensure_default_files(&keys, "題名", "作者", "https://example.test", None)
                 .await
                 .unwrap();
         });

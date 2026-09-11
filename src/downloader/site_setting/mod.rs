@@ -214,19 +214,19 @@ impl SiteSetting {
         self.compiled_body = self
             .body_pattern
             .as_deref()
-            .and_then(|s| Regex::new(s).ok());
+            .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_introduction = self
             .introduction_pattern
             .as_deref()
-            .and_then(|s| Regex::new(s).ok());
+            .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_postscript = self
             .postscript_pattern
             .as_deref()
-            .and_then(|s| Regex::new(s).ok());
+            .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_error_message = self
             .error_message
             .as_deref()
-            .and_then(|s| Regex::new(s).ok());
+            .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_over18_pattern = self
             .over18_pattern
             .as_ref()
@@ -430,6 +430,25 @@ impl SiteSetting {
 
     pub fn postscript_pattern(&self) -> Option<&str> {
         self.postscript_pattern.as_deref()
+    }
+
+    /// Section-extraction patterns compiled once at load with the same flags
+    /// `compile_html_pattern` applies (dot-matches-newline + size limit).
+    /// These replace per-section `compile_html_pattern` calls.
+    pub fn compiled_body_pattern(&self) -> Option<&Regex> {
+        self.compiled_body.as_ref()
+    }
+
+    pub fn compiled_introduction_pattern(&self) -> Option<&Regex> {
+        self.compiled_introduction.as_ref()
+    }
+
+    pub fn compiled_postscript_pattern(&self) -> Option<&Regex> {
+        self.compiled_postscript.as_ref()
+    }
+
+    pub fn compiled_error_message_pattern(&self) -> Option<&Regex> {
+        self.compiled_error_message.as_ref()
     }
 
     pub fn subtitles_pattern(&self) -> Option<&Regex> {

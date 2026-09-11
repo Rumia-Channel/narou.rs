@@ -60,22 +60,31 @@ pub fn pretreatment_source(src: &mut String, _encoding: &str, setting: Option<&S
 }
 
 pub fn decode_numeric_entities(src: &mut String) {
-    let hex_re = regex::Regex::new(r"&#x([0-9a-fA-F]+);").unwrap();
-    let dec_re = regex::Regex::new(r"&#(\d+);").unwrap();
+    if !src.contains("&#") {
+        return;
+    }
+    static HEX_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"&#x([0-9a-fA-F]+);").unwrap());
+    static DEC_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"&#(\d+);").unwrap());
 
-    *src = hex_re
-        .replace_all(src, |caps: &regex::Captures| {
-            let code = u32::from_str_radix(&caps[1], 16).unwrap_or(0xFFFD);
-            char::from_u32(code).unwrap_or('\u{FFFD}').to_string()
-        })
-        .to_string();
+    if HEX_RE.is_match(src) {
+        *src = HEX_RE
+            .replace_all(src, |caps: &regex::Captures| {
+                let code = u32::from_str_radix(&caps[1], 16).unwrap_or(0xFFFD);
+                char::from_u32(code).unwrap_or('\u{FFFD}').to_string()
+            })
+            .to_string();
+    }
 
-    *src = dec_re
-        .replace_all(src, |caps: &regex::Captures| {
-            let code: u32 = caps[1].parse().unwrap_or(0xFFFD);
-            char::from_u32(code).unwrap_or('\u{FFFD}').to_string()
-        })
-        .to_string();
+    if DEC_RE.is_match(src) {
+        *src = DEC_RE
+            .replace_all(src, |caps: &regex::Captures| {
+                let code: u32 = caps[1].parse().unwrap_or(0xFFFD);
+                char::from_u32(code).unwrap_or('\u{FFFD}').to_string()
+            })
+            .to_string();
+    }
 }
 
 /// Length limit for generated filenames (`folder-length-limit` /
