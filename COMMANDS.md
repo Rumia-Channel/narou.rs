@@ -217,6 +217,18 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 
 ---
 
+### 3.x `db` — 追加サブコマンド (narou.rs 独自, Ruby版対応外)
+
+SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のまま**で、Web UI 初回ツアー(または `.narou/storage-backend` マーカーファイル=`sqlite`)で選択したときのみ有効化される。Web API は `GET/POST /api/storage/mode`。
+
+| サブコマンド | 内容 |
+|---|---|
+| `verify` | `PRAGMA integrity_check` を実行 |
+| `export-yaml [--out DIR]` | レガシー YAML/TXT バンドルを再生成 (旧バージョンへのロールバック用) |
+| `vacuum` | VACUUM で容量回収 |
+
+---
+
 ### 4. `convert` — 🟡 部分
 
 > 小説を変換します。管理小説以外にテキストファイルも変換可能
@@ -478,6 +490,13 @@ narou setting name         # 読み取り
 | `--all-clean` | — | flag | false | 凍結以外の全差分削除 |
 | `--no-tool` | — | flag | false | 外部 diff ツールを使わない |
 | `-N` (数値) | — | int | — | `-n N` の短縮形 |
+| `--history` | — | flag | false | (P4b) SQLite版バージョン履歴一覧 |
+| `--show ID` | — | int | — | (P4b) 指定バージョンの保存済み差分表示 |
+| `--restore ID` | — | int | — | (P4b) 指定バージョンへ復元 (copy-forward・新ヘッド記録) |
+| `--merge-from ID` | — | int | — | (P4b) 指定バージョンを作業セットへマージ |
+| `--merge-sections LIST` | — | str | — | (P4b) `--merge-from` の対象話制限 (カンマ区切り) |
+
+> P4b オプションは SQLite バックエンド有効時のみ動作する。履歴は convert 実行時に自動スナップショットされ、保持数は将来 `diff.history-limit` で制御予定。
 | target | | string | — | 小説指定 (省略時=最終更新) |
 
 **実装状況**:

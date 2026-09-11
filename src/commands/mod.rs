@@ -22,6 +22,7 @@ pub mod inspect;
 pub mod log;
 pub mod mail;
 pub mod manage;
+pub mod db;
 pub mod send;
 pub mod setting;
 pub mod trace;

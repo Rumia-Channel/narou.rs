@@ -206,6 +206,7 @@ mod tests {
 
     #[test]
     fn ensure_tag_colors_with_default_color_inside_with_database_does_not_deadlock() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         // Regression test for a576208 / "Add configurable new tag color":
         // `configured_new_tag_color` reads settings through
         // `crate::db::with_database`, which uses a non-reentrant

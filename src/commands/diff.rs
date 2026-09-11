@@ -25,6 +25,16 @@ pub struct DiffOptions {
     pub clean: bool,
     pub all_clean: bool,
     pub no_tool: bool,
+    /// P4b: list SQLite version history (newest first).
+    pub history: bool,
+    /// P4b: show the unified diff stored for one version id.
+    pub show: Option<i64>,
+    /// P4b: copy-forward restore of one version into the working set.
+    pub restore: Option<i64>,
+    /// P4b: merge sections of one version into the working set.
+    pub merge_from: Option<i64>,
+    /// P4b: restrict --merge-from to these section indexes (comma separated).
+    pub merge_sections: Option<String>,
 }
 
 #[derive(Clone)]
@@ -66,6 +76,10 @@ fn cmd_diff_inner(opts: DiffOptions) -> std::result::Result<(), String> {
         Some(context) => context,
         None => return Ok(()),
     };
+
+    if opts.history || opts.show.is_some() || opts.restore.is_some() || opts.merge_from.is_some() {
+        return run_version_ops(&context, opts);
+    }
 
     if let Some(version) = opts.view_diff_version.as_deref() {
         if invalid_diff_version_string(version) {
@@ -643,4 +657,84 @@ mod tests {
         assert!(invalid_diff_version_string("2024-01-03@04.05.06"));
         assert!(invalid_diff_version_string("2024.01.03 04.05.06"));
     }
+}
+
+#[cfg(feature = "native-runtime")]
+fn version_conn() -> std::result::Result<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>, String> {
+    use narou_rs::native::sqlite::state;
+    if state::legacy_yaml_active() {
+        return Err("SQLiteバックエンドが無効です (NAROU_RS_LEGACY_YAML)".to_string());
+    }
+    let narou_dir = narou_rs::db::inventory::Inventory::with_default_root()
+        .map_err(|error| error.to_string())?
+        .root_dir()
+        .join(".narou")
+        ;
+    let handle = state::active_for(&narou_dir)
+        .ok_or_else(|| "SQLiteバックエンドが有効ではありません".to_string())?;
+    Ok(handle.conn_ref().clone())
+}
+
+#[cfg(feature = "native-runtime")]
+fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Result<(), String> {
+    use narou_rs::native::sqlite::versions;
+
+    let conn = version_conn()?;
+    let mut guard = conn.lock().expect("sqlite mutex poisoned");
+    let novel_id = context.record.id;
+
+    if opts.history {
+        let versions = versions::list_versions(&guard, novel_id).map_err(|e| e.to_string())?;
+        if versions.is_empty() {
+            println!("バージョン履歴はありません");
+            return Ok(());
+        }
+        println!("{:>6}  {:<8}  {:<24}  {:>8}  {}", "ID", "ORIGIN", "CREATED", "SECTIONS", "NOTE");
+        for version in versions {
+            println!(
+                "{:>6}  {:<8}  {:<24}  {:>8}  {}",
+                version.id,
+                version.origin,
+                version.created_at,
+                version.section_count,
+                version.note.as_deref().unwrap_or("")
+            );
+        }
+        return Ok(());
+    }
+
+    if let Some(version_id) = opts.show {
+        let diff = versions::version_diff(&guard, version_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("バージョン{version_id}の差分はありません"))?;
+        print!("{diff}");
+        return Ok(());
+    }
+
+    if let Some(version_id) = opts.restore {
+        versions::restore_version(&mut guard, novel_id, version_id, false)
+            .map_err(|e| e.to_string())?;
+        println!("バージョン{version_id}から復元しました (新しいヘッドとして記録)");
+        return Ok(());
+    }
+
+    if let Some(version_id) = opts.merge_from {
+        let only = opts.merge_sections.as_ref().map(|raw| {
+            raw.split(',')
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+        });
+        versions::merge_from_version(&mut guard, novel_id, version_id, only.as_deref(), None)
+            .map_err(|e| e.to_string())?;
+        println!("バージョン{version_id}からマージしました");
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+#[cfg(not(feature = "native-runtime"))]
+fn run_version_ops(_context: &NovelContext, _opts: DiffOptions) -> std::result::Result<(), String> {
+    Err("SQLiteバージョン管理はネイティブビルドでのみ利用できます".to_string())
 }

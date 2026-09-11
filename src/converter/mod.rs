@@ -888,6 +888,42 @@ impl NovelConverter {
             // Worker's download-time EPUB) can address the text without the
             // per-title output naming rules.
             let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
+            if !crate::native::sqlite::state::legacy_yaml_active() {
+                let narou_dir = novel_dir
+                    .ancestors()
+                    .find(|candidate| candidate.join(".narou").is_dir())
+                    .map(|found| found.join(".narou"));
+                if let Some(narou_dir) = narou_dir
+                    && let Some(state) =
+                        crate::native::sqlite::state::active_for(&narou_dir)
+                {
+                    let conn = state.conn();
+                    let mut guard = conn.lock().expect("sqlite mutex poisoned");
+                    let mut sections_map = std::collections::BTreeMap::new();
+                    for section in &sections {
+                        let body =
+                            serde_yaml::to_string(section).unwrap_or_else(|_| String::new());
+                        sections_map.insert(
+                            section.index.clone(),
+                            (Some(section.subtitle.clone()), body),
+                        );
+                    }
+                    let _ =
+                        crate::native::sqlite::content::store_sections(&mut guard, id, &sections_map);
+                    let _ = crate::native::sqlite::content::store_output(
+                        &mut guard,
+                        id,
+                        "converted_text",
+                        aozora_text.as_bytes(),
+                    );
+                    let _ = crate::native::sqlite::versions::snapshot_working_set(
+                        &mut guard,
+                        id,
+                        "update",
+                        Some("convert"),
+                    );
+                }
+            }
         }
         save_latest_convert(id)?;
         self.inspect_converted_text(&aozora_text)?;
@@ -943,6 +979,47 @@ impl NovelConverter {
         #[cfg(feature = "lite")]
         {
             let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
+            // P4a/P4b mirror: converted text + mirrored working set + version
+            // snapshot live in the SQLite backend when active.
+            if !crate::native::sqlite::state::legacy_yaml_active() {
+                let narou_dir = novel_dir
+                    .ancestors()
+                    .find(|candidate| candidate.join(".narou").is_dir())
+                    .map(|found| found.join(".narou"));
+                if let Some(narou_dir) = narou_dir
+                    && let Some(state) =
+                        crate::native::sqlite::state::active_for(&narou_dir)
+                {
+                    let conn = state.conn();
+                    let mut guard = conn.lock().expect("sqlite mutex poisoned");
+                    let mut sections_map = std::collections::BTreeMap::new();
+                    for section in &sections {
+                        let body =
+                            serde_yaml::to_string(section).unwrap_or_else(|_| String::new());
+                        sections_map.insert(
+                            section.index.clone(),
+                            (Some(section.subtitle.clone()), body),
+                        );
+                    }
+                    let _ = crate::native::sqlite::content::store_sections(
+                        &mut guard,
+                        _id,
+                        &sections_map,
+                    );
+                    let _ = crate::native::sqlite::content::store_output(
+                        &mut guard,
+                        _id,
+                        "converted_text",
+                        aozora_text.as_bytes(),
+                    );
+                    let _ = crate::native::sqlite::versions::snapshot_working_set(
+                        &mut guard,
+                        _id,
+                        "update",
+                        Some("convert"),
+                    );
+                }
+            }
         }
         save_latest_convert(_id)?;
         self.inspect_converted_text(&aozora_text)?;

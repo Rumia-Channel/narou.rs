@@ -142,6 +142,7 @@ src/
     repository.rs                  - NovelRepository trait + NovelId/NovelQuery
     mocks.rs                       - MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter
   native/
+    sqlite/                        - SQLite管理基盤 (P1-P4: repository/state/bulk/content/versions)
     mod.rs                         - native 実装 (core から参照しない)
     http.rs                        - NativeHttpClient (3-tier: curl crate → reqwest → wget fallback, spawn_blocking 隔離)
   commands/
@@ -246,7 +247,14 @@ sample/
 - `sample/narou/lib/novelsetting.rb` — 設定定義
 - `sample/narou/lib/command/*.rb` — 各コマンド実装 (help/CLI挙動の参照元)
 
-## Current Status (2026-08-10)
+## Current Status (2026-08-25)
+
+### SQLite 管理基盤移行 (P0-P4 完了、詳細: docs/sqlite-storage-migration-plan.md)
+- P1 `src/native/sqlite/` エンジン + dual-run テスト、P2 メタデータ全面移行 (database/freeze/alias/tag_colors/local+global_setting/queue/notepad/latest_convert → db.sqlite)、レガシー自動import(元ファイルは *.imported-* 退避)、`narou db verify|export-yaml|vacuum`
+- P3 デュアルモード化: **既定は従来どおり YAML 管理**。`.narou/storage-backend` マーカー(`sqlite`)または Web UI ツアーの選択で Lite(SQLite) へ切替。`NAROU_RS_LEGACY_YAML=1` は強制レガシー。API: `GET/POST /api/storage/mode`
+- P4a コンテンツミラー (novel_sections/novel_outputs) — convert時に書込み、Web DL時EPUBはDB優先
+- P4b バージョン履歴 (novel_versions/_sections/_diffs) + `narou diff --history|--show|--restore|--merge-from`。update時自動snapshotはconvertフック経由
+- 後方互換: 旧ライブラリからの自動取込と export-yaml によるロールバックを保証。前方互換(narou.rb読影響)は破棄
 
 ### プラットフォーム抽象化 (Phase 1-7 完了、Phase 8: 2026-08)
 - **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。Phase 4のsmall object / large asset境界、logical key、native mapping、remaining native FSも記録。Phase 7のD1/Wasabi/Worker read-only adapterも記録。
@@ -415,4 +423,5 @@ For each section:
 - **WebSocket**: tokio-tungstenite
 - **HTTP client (low-level)**: curl crate
 - **Random UA**: ua_generator
+- **管理DB**: SQLite (`rusqlite` bundled, optional dep / native-runtime)。`NAROU_RS_LEGACY_YAML=1` でレガシーYAML運用に切替
 - **EPUB エンジン (オプション)**: `aozora_epub3_lite` (git 依存, rev pin) — cargo feature `lite` で有効化。`worker-runtime` は自動的に `lite` を含む。`lite` ビルドは GPL-3.0-only (assets/aozora_lite/LICENSE.md)、無しは従来どおり BSD-2-Clause + 外部 AozoraEpub3 プロセス。

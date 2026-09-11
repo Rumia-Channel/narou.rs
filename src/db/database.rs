@@ -16,6 +16,11 @@ pub struct Database {
     inventory: Inventory,
     archive_root: PathBuf,
     next_id: i64,
+    /// SQLite backend (P2). `None` when `NAROU_RS_LEGACY_YAML` is set or the
+    /// database directory cannot host `db.sqlite`; then the legacy YAML path
+    /// below runs unchanged.
+    #[cfg(feature = "native-runtime")]
+    sqlite: Option<crate::native::sqlite::SqliteNovelRepository>,
 }
 
 impl Database {
@@ -28,18 +33,108 @@ impl Database {
         let archive_root = inventory.root_dir().join(ARCHIVE_ROOT_DIR);
         std::fs::create_dir_all(&archive_root)?;
 
+        #[cfg(feature = "native-runtime")]
+        let sqlite = {
+            let narou_dir = inventory.root_dir().join(".narou");
+            match crate::native::sqlite::state::active_for(&narou_dir) {
+                Some(state) => {
+                    let repo =
+                        crate::native::sqlite::SqliteNovelRepository::new(state.conn_ref().clone());
+                    // Backward compatibility: a fresh database adopts an
+                    // existing legacy database.yaml once.
+                    let empty = {
+                        let conn = repo.conn_handle();
+                        crate::native::sqlite::bulk::load_all_records(
+                            &conn.lock().expect("sqlite mutex poisoned"),
+                        )?
+                        .is_empty()
+                    };
+                    if empty {
+                        let yaml_path =
+                            inventory.inventory_path("database", InventoryScope::Local);
+                        if let Ok(content) = std::fs::read_to_string(&yaml_path) {
+                            if !content.trim().is_empty() {
+                                let parsed: BTreeMap<i64, NovelRecord> =
+                                    serde_yaml::from_str(&content)?;
+                                let mut conn = repo.conn_handle();
+                                {
+                                    let mut guard =
+                                        conn.lock().expect("sqlite mutex poisoned");
+                                    crate::native::sqlite::bulk::replace_all_records(
+                                        &mut guard, &parsed,
+                                    )?;
+                                }
+                                rename_imported_file(&yaml_path);
+                                let index_path = inventory
+                                    .inventory_path("database_index", InventoryScope::Local);
+                                rename_imported_file(&index_path);
+                            }
+                        }
+                    }
+                    Some(repo)
+                }
+                None => None,
+            }
+        };
+
         let mut db = Self {
             data: HashMap::new(),
             index: IndexStore::load(&inventory)?,
             inventory,
             archive_root,
             next_id: 0,
+            #[cfg(feature = "native-runtime")]
+            sqlite,
         };
         db.refresh()?;
         Ok(db)
     }
 
+    /// Test/CLI helper: construct against an explicit narou root instead of
+    /// walking up from the current directory.
+    pub fn with_root(root: PathBuf) -> Result<Self> {
+        Self::with_inventory(Inventory::new(root))
+    }
+
+    /// `PRAGMA integrity_check` result when the SQLite backend is active.
+    pub fn sqlite_integrity(&self) -> Result<Option<String>> {
+        #[cfg(feature = "native-runtime")]
+        if let Some(repo) = &self.sqlite {
+            let conn = repo.conn_handle();
+            let guard = conn.lock().expect("sqlite mutex poisoned");
+            let status: String = guard
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .map_err(|error| crate::native::sqlite::sqlite_error(error))?;
+            return Ok(Some(status));
+        }
+        #[allow(unreachable_code)]
+        Ok(None)
+    }
+
+    fn using_sqlite(&self) -> bool {
+        #[cfg(feature = "native-runtime")]
+        {
+            self.sqlite.is_some()
+        }
+        #[cfg(not(feature = "native-runtime"))]
+        {
+            false
+        }
+    }
+
     pub fn refresh(&mut self) -> Result<()> {
+        #[cfg(feature = "native-runtime")]
+        if let Some(repo) = &self.sqlite {
+            let conn = repo.conn_handle();
+            let loaded = crate::native::sqlite::bulk::load_all_records(
+                &conn.lock().expect("sqlite mutex poisoned"),
+            )?;
+            self.data = loaded.into_iter().collect();
+            if let Some(max_id) = self.data.keys().max().copied() {
+                self.next_id = self.next_id.max(max_id.saturating_add(1));
+            }
+            return Ok(());
+        }
         let raw = self
             .inventory
             .load_raw(DATABASE_NAME, InventoryScope::Local)?;
@@ -58,11 +153,31 @@ impl Database {
         if let Some(max_id) = self.data.keys().max().copied() {
             self.next_id = self.next_id.max(max_id.saturating_add(1));
         }
-        self.index.reconcile(&self.data);
+        if !self.using_sqlite() {
+            self.index.reconcile(&self.data);
+        }
         Ok(())
     }
 
     pub fn save(&mut self) -> Result<()> {
+        #[cfg(feature = "native-runtime")]
+        if let Some(repo) = &self.sqlite {
+            let normalized: BTreeMap<i64, NovelRecord> = self
+                .data
+                .iter()
+                .map(|(&id, record)| {
+                    let mut normalized = record.clone();
+                    normalized.id = id;
+                    (id, normalized)
+                })
+                .collect();
+            let conn = repo.conn_handle();
+            crate::native::sqlite::bulk::replace_all_records(
+                &mut conn.lock().expect("sqlite mutex poisoned"),
+                &normalized,
+            )?;
+            return Ok(());
+        }
         let content = serde_yaml::to_string(
             &self
                 .data
@@ -76,7 +191,9 @@ impl Database {
         )?;
         self.inventory
             .save_raw(DATABASE_NAME, InventoryScope::Local, &content)?;
-        self.index.flush(&self.inventory)?;
+        if !self.using_sqlite() {
+            self.index.flush(&self.inventory)?;
+        }
         Ok(())
     }
 
@@ -84,6 +201,31 @@ impl Database {
     where
         F: FnOnce(BTreeMap<i64, NovelRecord>) -> Result<(BTreeMap<i64, NovelRecord>, T)>,
     {
+        #[cfg(feature = "native-runtime")]
+        if self.sqlite.is_some() {
+            let mut current: BTreeMap<i64, NovelRecord> = self
+                .data
+                .iter()
+                .map(|(&id, record)| {
+                    let mut normalized = record.clone();
+                    normalized.id = id;
+                    (id, normalized)
+                })
+                .collect();
+            let (mut updated, result) = update(current)?;
+            for (id, record) in updated.iter_mut() {
+                record.id = *id;
+            }
+            if let Some(repo) = &self.sqlite {
+                let conn = repo.conn_handle();
+                crate::native::sqlite::bulk::replace_all_records(
+                    &mut conn.lock().expect("sqlite mutex poisoned"),
+                    &updated,
+                )?;
+            }
+            self.data = updated.into_iter().collect();
+            return Ok(result);
+        }
         let result = self.inventory.update_yaml(
             DATABASE_NAME,
             InventoryScope::Local,
@@ -99,7 +241,9 @@ impl Database {
             },
         )?;
         self.refresh()?;
-        self.index.flush(&self.inventory)?;
+        if !self.using_sqlite() {
+            self.index.flush(&self.inventory)?;
+        }
         Ok(result)
     }
 
@@ -324,6 +468,7 @@ mod tests {
 
     #[test]
     fn database_parity_save_preserves_unknown_fields_and_zero_id() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let narou_dir = temp.path().join(".narou");
         std::fs::create_dir_all(&narou_dir).unwrap();
@@ -373,6 +518,7 @@ mod tests {
 
     #[test]
     fn update_records_merges_against_current_database_yaml() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let narou_dir = temp.path().join(".narou");
         std::fs::create_dir_all(&narou_dir).unwrap();
@@ -627,4 +773,20 @@ mod tests {
             extra_fields: Default::default(),
         }
     }
+}
+
+#[cfg(feature = "native-runtime")]
+fn rename_imported_file(path: &std::path::Path) {
+    if !path.exists() {
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let name = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => format!("{name}.imported-{stamp}"),
+        None => return,
+    };
+    let _ = std::fs::rename(path, path.with_file_name(name));
 }

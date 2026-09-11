@@ -265,6 +265,24 @@ pub fn resolve_java_command_path() -> Option<PathBuf> {
 }
 
 pub fn load_global_setting_value(key: &str) -> Option<serde_yaml::Value> {
+    // P2: when the SQLite state backend is active, the payload of
+    // `global_setting.yaml` lives in app_state('global', 'global_setting').
+    #[cfg(feature = "native-runtime")]
+    if !crate::native::sqlite::state::legacy_yaml_active() {
+        let narou_dir = crate::db::inventory::Inventory::with_default_root()
+            .ok()
+            .map(|inventory| inventory.root_dir().join(".narou"));
+        if let Some(state) = narou_dir.as_deref().and_then(crate::native::sqlite::state::active_for) {
+            if let Ok(Some(raw)) = state.get_raw("global", "global_setting") {
+                if let Ok(settings) =
+                    serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(&raw)
+                {
+                    return settings.get(key).cloned();
+                }
+            }
+            return None;
+        }
+    }
     let path = global_setting_path()?;
     let raw = fs::read_to_string(path).ok()?;
     let settings: HashMap<String, serde_yaml::Value> = serde_yaml::from_str(&raw).ok()?;
@@ -1234,6 +1252,7 @@ mod tests {
 
     #[test]
     fn database_parity_get_copy_to_directory_includes_site_for_zero_id() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
@@ -1264,6 +1283,7 @@ mod tests {
 
     #[test]
     fn update_auto_convert_uses_convert_multi_device_before_device_setting() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
