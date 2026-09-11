@@ -23,7 +23,7 @@ use crate::d1_repository::{D1FreezeStore, D1NovelRepository, D1SettingsStore, D1
 use crate::http::WorkerHttpClient;
 use crate::ledger::{D1JobLedger, D1SchedulerCheckpoint};
 use crate::rate_limiter::WorkerRateLimiter;
-use crate::wasabi::{WasabiConfig, WasabiObjectStore};
+use crate::d1_object_store::D1ObjectStore;
 
 
 /// Result of the complete ledger + Queue producer operation for one plan.
@@ -63,15 +63,12 @@ pub struct WorkerRuntime {
 }
 
 impl WorkerRuntime {
-    /// Build the runtime from the production bindings. Missing bindings or
-    /// an invalid Wasabi configuration fail composition (readiness 503),
-    /// never an empty/partial service set.
+    /// Build the runtime from the production bindings. Missing bindings fail
+    /// composition (readiness 503), never an empty/partial service set.
     pub fn build(env: &Env) -> worker::Result<Self> {
         let db = Arc::new(env.d1("DB")?);
-        let config = WasabiConfig::from_env(env)
-            .map_err(|error| worker::Error::RustError(error.to_string()))?;
         let subrequests = crate::budget::SubrequestBudget::new();
-        let store = Arc::new(WasabiObjectStore::new(config, subrequests.clone()));
+        let store = Arc::new(D1ObjectStore::new(db.clone()));
         let objects: Arc<dyn ObjectStore> = store.clone();
         let assets: Arc<dyn AssetStore> = store;
         let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
@@ -261,12 +258,7 @@ pub fn build_services(env: &Env) -> worker::Result<AppServices> {
 
 pub fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
     let db = Arc::new(env.d1("DB")?);
-    let config = WasabiConfig::from_env(env)
-        .map_err(|error| worker::Error::RustError(error.to_string()))?;
-    let objects: Arc<dyn ObjectStore> = Arc::new(WasabiObjectStore::new(
-        config,
-        crate::budget::SubrequestBudget::new(),
-    ));
+    let objects: Arc<dyn ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
     let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::new(db.clone()));
@@ -318,8 +310,6 @@ fn services_from(
 /// Readiness probe: every required binding and configuration must be real.
 ///
 /// - D1 answers `SELECT 1`
-/// - Wasabi endpoint/bucket/region and credentials are present and the
-///   endpoint parses as a URL
 /// - `NAROU_JOBS` queue producer and `RATE_LIMITER` Durable Object
 ///   namespace are bound
 /// - full composition (bundled site definitions parse and compile)
@@ -340,14 +330,6 @@ pub async fn check_ready(env: &Env) -> worker::Result<()> {
                 "D1 readiness returned no row".to_string(),
             ));
         }
-    }
-    let config = WasabiConfig::from_env(env)
-        .map_err(|error| worker::Error::RustError(error.to_string()))?;
-    if url::Url::parse(&config.endpoint).is_err() {
-        return Err(worker::Error::RustError(format!(
-            "Wasabi endpoint is not a valid URL: {:?}",
-            config.endpoint
-        )));
     }
     env.queue(JOB_QUEUE_BINDING)?;
     env.durable_object("RATE_LIMITER")?;

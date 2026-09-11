@@ -22,10 +22,8 @@ impl Downloader {
         rate_limiter: Arc<dyn RateLimiter>,
         novels: Arc<dyn NovelRepository>,
     ) -> crate::error::Result<Self> {
-        let store = crate::native::object_store::NativeObjectStore::new().or_else(|_| {
-            crate::native::object_store::NativeObjectStore::from_root(PathBuf::from(
-                types::ARCHIVE_ROOT_DIR,
-            ))
+        let store = crate::native::object_store::NativeStore::for_current_root().or_else(|_| {
+            crate::native::object_store::NativeStore::for_narou_root(&PathBuf::from("."))
         })?;
         let store = Arc::new(store);
         let objects: Arc<dyn ObjectStore> = store.clone();
@@ -48,7 +46,7 @@ impl Downloader {
         let http = Arc::new(crate::native::http::NativeHttpClient::new(&ua)?);
         let rate_limiter = Arc::new(crate::downloader::rate_limit::RateLimiter::new(false));
         let novels = Arc::new(crate::native::novel_repository::NativeNovelRepository::new());
-        let store = Arc::new(crate::native::object_store::NativeObjectStore::new()?);
+        let store = Arc::new(crate::native::object_store::NativeStore::for_current_root()?);
         let objects: Arc<dyn ObjectStore> = store.clone();
         let assets: Arc<dyn AssetStore> = store;
         Self::with_platform_and_storage(

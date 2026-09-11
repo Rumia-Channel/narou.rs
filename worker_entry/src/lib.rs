@@ -4,6 +4,7 @@ mod budget;
 mod bundled_sites;
 mod composition;
 mod consumer;
+mod d1_object_store;
 mod d1_repository;
 mod executor;
 pub mod http;
@@ -11,7 +12,6 @@ mod ledger;
 mod rate_limiter;
 mod scheduler;
 mod site_rate_limiter;
-mod wasabi;
 use subtle::ConstantTimeEq;
 
 use serde_json::json;

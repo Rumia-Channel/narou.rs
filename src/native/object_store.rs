@@ -17,7 +17,7 @@ use crate::platform::{
     ObjectStore, PlatformFuture,
 };
 
-const MAX_SMALL_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_SMALL_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -49,7 +49,7 @@ impl NativeObjectStore {
         &self.root
     }
 
-    fn resolve_path(&self, key: &ObjectKey) -> Result<PathBuf> {
+    pub(crate) fn resolve_path(&self, key: &ObjectKey) -> Result<PathBuf> {
         key.validate()?;
         let relative = key
             .as_ref()
@@ -66,7 +66,7 @@ impl NativeObjectStore {
         crate::db::paths::ensure_within_archive_root(&candidate, &self.root)
     }
 
-    fn resolve_read_path(&self, key: &ObjectKey) -> Result<PathBuf> {
+    pub(crate) fn resolve_read_path(&self, key: &ObjectKey) -> Result<PathBuf> {
         let exact = self.resolve_path(key)?;
         if exact.exists() {
             return Ok(exact);
@@ -109,7 +109,7 @@ impl NativeObjectStore {
     /// matching object. `novels` alone covers the whole archive root;
     /// `novels/<rest>` maps to `<root>/<rest>`; any other prefix lives under
     /// `<root>/.objects/<prefix>` mirroring `resolve_path`.
-    fn resolve_prefix_dir(&self, prefix: &str) -> Result<PathBuf> {
+    pub(crate) fn resolve_prefix_dir(&self, prefix: &str) -> Result<PathBuf> {
         let trimmed = prefix.trim_end_matches('/');
         let relative = if trimmed.is_empty() || trimmed == "novels" {
             String::new()
@@ -127,7 +127,7 @@ impl NativeObjectStore {
         crate::db::paths::ensure_within_archive_root(&candidate, &self.root)
     }
 
-    fn metadata_for_path(&self, key: &ObjectKey, path: &Path) -> Result<Option<ObjectMetadata>> {
+    pub(crate) fn metadata_for_path(&self, key: &ObjectKey, path: &Path) -> Result<Option<ObjectMetadata>> {
         let metadata = match fs::metadata(path) {
             Ok(metadata) if metadata.is_file() => metadata,
             Ok(_) => return Ok(None),
@@ -150,7 +150,7 @@ impl NativeObjectStore {
     /// `create_dir_all` with a per-store memo: the first write under a novel
     /// directory pays the syscall, subsequent writes to the same parent skip
     /// it entirely.
-    fn ensure_parent_dir(&self, path: &Path) -> Result<()> {
+    pub(crate) fn ensure_parent_dir(&self, path: &Path) -> Result<()> {
         let parent = path
             .parent()
             .ok_or_else(|| NarouError::Platform(format!("object has no parent: {}", path.display())))?;
@@ -175,7 +175,16 @@ impl NativeObjectStore {
     }
 
 
-    fn recursive_files(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
+    /// Write without the small-object cap. Used by the SQLite store's
+    /// filesystem mirror and by the one-shot legacy import, where payloads
+    /// (EPUB, large sections) may exceed `MAX_SMALL_OBJECT_BYTES`.
+    pub(crate) fn write_bytes_blocking(&self, key: &ObjectKey, data: &[u8]) -> Result<()> {
+        let path = self.resolve_path(key)?;
+        self.ensure_parent_dir(&path)?;
+        atomic_write_bytes(&path, data)
+    }
+
+    pub(crate) fn recursive_files(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
         for entry in fs::read_dir(current)? {
             let entry = entry?;
             let path = entry.path();
@@ -190,7 +199,7 @@ impl NativeObjectStore {
     }
 }
 
-fn logical_key_for_native_path(root: &Path, path: &Path) -> Option<ObjectKey> {
+pub(crate) fn logical_key_for_native_path(root: &Path, path: &Path) -> Option<ObjectKey> {
     let relative = path
         .strip_prefix(root)
         .ok()?
@@ -203,7 +212,7 @@ fn logical_key_for_native_path(root: &Path, path: &Path) -> Option<ObjectKey> {
     }
 }
 
-fn run_blocking<T, F>(operation: F) -> PlatformFuture<'static, Result<T>>
+pub(crate) fn run_blocking<T, F>(operation: F) -> PlatformFuture<'static, Result<T>>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -219,7 +228,7 @@ where
     }
 }
 
-fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| NarouError::Platform(format!("object has no parent: {}", path.display())))?;
@@ -245,7 +254,7 @@ fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn content_type_for_path(path: &Path) -> Option<String> {
+pub(crate) fn content_type_for_path(path: &Path) -> Option<String> {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("yaml" | "yml") => Some("application/yaml".to_string()),
         Some("ini" | "txt") => Some("text/plain; charset=utf-8".to_string()),
@@ -528,6 +537,157 @@ impl AssetStore for NativeObjectStore {
                 }
             }
         })
+    }
+}
+
+/// Native object storage selected by the storage backend marker.
+///
+/// `Yaml` mode keeps the pure-filesystem store; `Sqlite` mode wraps the
+/// `objects`/`object_chunks` tables with a filesystem mirror so rollback and
+/// narou.rb reads keep working without an export step.
+#[derive(Debug, Clone)]
+pub enum NativeStore {
+    Fs(NativeObjectStore),
+    Sqlite(crate::native::sqlite::object_store::SqliteObjectStore),
+}
+
+impl NativeStore {
+    /// Resolve the store for the library rooted at `narou_root` (the
+    /// directory that contains `.narou`). Falls back to the filesystem store
+    /// when SQLite is unavailable or not opted in.
+    pub fn for_narou_root(narou_root: &Path) -> Result<Self> {
+        let archive_root = narou_root.join(crate::downloader::types::ARCHIVE_ROOT_DIR);
+        let mirror = NativeObjectStore::from_root(archive_root)?;
+        let narou_dir = narou_root.join(".narou");
+        if let Some(state) = crate::native::sqlite::state::active_for(&narou_dir) {
+            return Ok(Self::Sqlite(
+                crate::native::sqlite::object_store::SqliteObjectStore::new(
+                    state.conn_ref().clone(),
+                    mirror,
+                ),
+            ));
+        }
+        Ok(Self::Fs(mirror))
+    }
+
+    /// Resolve using the process-wide database root (same lookup
+    /// `NativeObjectStore::new` performs).
+    pub fn for_current_root() -> Result<Self> {
+        let root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))?;
+        let narou_root = root
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::for_narou_root(&narou_root)
+    }
+}
+
+impl ObjectStore for NativeStore {
+    fn stat<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+        match self {
+            NativeStore::Fs(store) => ObjectStore::stat(store, key),
+            NativeStore::Sqlite(store) => ObjectStore::stat(store, key),
+        }
+    }
+
+    fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+        match self {
+            NativeStore::Fs(store) => store.read_small(key),
+            NativeStore::Sqlite(store) => store.read_small(key),
+        }
+    }
+
+    fn write_small<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        data: Vec<u8>,
+    ) -> PlatformFuture<'a, Result<()>> {
+        match self {
+            NativeStore::Fs(store) => store.write_small(key, data),
+            NativeStore::Sqlite(store) => store.write_small(key, data),
+        }
+    }
+
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+        match self {
+            NativeStore::Fs(store) => ObjectStore::delete(store, key),
+            NativeStore::Sqlite(store) => ObjectStore::delete(store, key),
+        }
+    }
+
+    fn list_page<'a>(
+        &'a self,
+        request: &'a ObjectListRequest,
+    ) -> PlatformFuture<'a, Result<ObjectListPage>> {
+        match self {
+            NativeStore::Fs(store) => store.list_page(request),
+            NativeStore::Sqlite(store) => store.list_page(request),
+        }
+    }
+}
+
+impl AssetStore for NativeStore {
+    fn stat<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+        match self {
+            NativeStore::Fs(store) => AssetStore::stat(store, key),
+            NativeStore::Sqlite(store) => AssetStore::stat(store, key),
+        }
+    }
+
+    fn read_stream<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
+        match self {
+            NativeStore::Fs(store) => store.read_stream(key),
+            NativeStore::Sqlite(store) => store.read_stream(key),
+        }
+    }
+
+    fn write_stream<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        stream: AssetStream,
+    ) -> PlatformFuture<'a, Result<()>> {
+        match self {
+            NativeStore::Fs(store) => store.write_stream(key, stream),
+            NativeStore::Sqlite(store) => store.write_stream(key, stream),
+        }
+    }
+
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+        match self {
+            NativeStore::Fs(store) => AssetStore::delete(store, key),
+            NativeStore::Sqlite(store) => AssetStore::delete(store, key),
+        }
+    }
+
+    fn copy<'a>(
+        &'a self,
+        source: &'a ObjectKey,
+        destination: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<()>> {
+        match self {
+            NativeStore::Fs(store) => store.copy(source, destination),
+            NativeStore::Sqlite(store) => store.copy(source, destination),
+        }
+    }
+
+    fn move_or_copy<'a>(
+        &'a self,
+        source: &'a ObjectKey,
+        destination: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<()>> {
+        match self {
+            NativeStore::Fs(store) => store.move_or_copy(source, destination),
+            NativeStore::Sqlite(store) => store.move_or_copy(source, destination),
+        }
     }
 }
 

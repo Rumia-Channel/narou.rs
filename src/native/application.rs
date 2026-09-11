@@ -291,8 +291,9 @@ impl NativeAppServices {
         let root_dir = inventory.root_dir().to_path_buf();
         let novels: Arc<dyn crate::platform::NovelRepository> =
             Arc::new(crate::native::novel_repository::NativeNovelRepository::new());
-        let objects: Arc<dyn crate::platform::ObjectStore> =
-            Arc::new(crate::native::object_store::NativeObjectStore::from_root(root_dir)?);
+        let objects: Arc<dyn crate::platform::ObjectStore> = Arc::new(
+            crate::native::object_store::NativeStore::for_narou_root(&root_dir)?,
+        );
         let freeze_native = Arc::new(Self::freeze_store(inventory.clone()));
         let site_provider = Arc::new(NativeSiteTimezoneProvider::load());
         let library = Arc::new(crate::application::LibraryService::new(

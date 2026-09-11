@@ -119,6 +119,16 @@ impl StateDb {
         Ok(novels == 0 && states == 0)
     }
 
+    /// True when no object rows exist yet (first opt-in before the archive
+    /// import, or an empty library).
+    pub fn objects_empty(&self) -> Result<bool> {
+        let conn = self.conn.lock().expect("state db mutex poisoned");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM objects", [], |row| row.get(0))
+            .map_err(super::sqlite_error)?;
+        Ok(count == 0)
+    }
+
     pub fn conn_ref(&self) -> &Arc<Mutex<Connection>> {
         &self.conn
     }
@@ -213,6 +223,19 @@ pub fn configure(narou_dir: &Path) -> Result<StateDb> {
     };
     if state.is_fresh()? {
         import_legacy_states(&state, narou_dir)?;
+    }
+    if state.objects_empty()? {
+        // One-shot import of the existing 小説データ/ tree so listings and
+        // reads are DB-complete from the start. The filesystem mirror keeps
+        // the files in place; nothing is removed.
+        let archive_root = narou_dir
+            .parent()
+            .map(|root| root.join(crate::downloader::types::ARCHIVE_ROOT_DIR))
+            .unwrap_or_else(|| narou_dir.join(crate::downloader::types::ARCHIVE_ROOT_DIR));
+        if let Ok(mirror) = crate::native::object_store::NativeObjectStore::from_root(archive_root)
+        {
+            let _ = super::object_store::import_archive_into_objects(state.conn_ref(), &mirror);
+        }
     }
     Ok(state)
 }

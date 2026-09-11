@@ -257,7 +257,7 @@ sample/
 - 後方互換: 旧ライブラリからの自動取込と export-yaml によるロールバックを保証。前方互換(narou.rb読影響)は破棄
 
 ### プラットフォーム抽象化 (Phase 1-7 完了、Phase 8: 2026-08)
-- **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。Phase 4のsmall object / large asset境界、logical key、native mapping、remaining native FSも記録。Phase 7のD1/Wasabi/Worker read-only adapterも記録。
+- **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。Phase 4のsmall object / large asset境界、logical key、native mapping、remaining native FSも記録。Phase 7のD1/Worker read-only adapterも記録。
 - **Phase 1 完了**: `src/platform/` に traits（HttpClient / Clock / RateLimiter / ObjectStore / NovelRepository）+ テスト用 mock（MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter / SystemClock）を導入。
 - `NarouError::Http` は `reqwest::Error` の直接 `#[from]` をやめ String 化。`Platform(String)` variant 追加。core から reqwest 型が error 経由で漏れるのを防止。
 - **Phase 2 完了**: downloader を trait 利用へ全面移行。
@@ -284,11 +284,11 @@ sample/
 
 ### Phase 6-7 Worker backend (2026-08-10)
 - `narou_rs` の `worker-runtime` feature は `application`、`platform`、portable `db`/`converter::ini` のみを公開する。CLI、Web、native HTTP、filesystem、process、settings adapters は `native-runtime` gate の内側に置く。
-- `worker_entry/` は `workers-rs 0.8.5` の `fetch` / `scheduled` / `queue` eventを公開する。`composition.rs` は D1 novel/freeze/settings/tag-color adapters と Wasabi `ObjectStore` を構成し、Worker固有型をcoreへ逆流させない。
-- `WorkerHttpClient` は Fetch APIを既存 `HttpClient` traitへ接続し、request/response body上限を強制する。`WasabiObjectStore` はSigV4、logical-key prefix、paged LIST、bounded small read/write、streaming/multipart AssetStoreを実装する。
+- `worker_entry/` は `workers-rs 0.8.5` の `fetch` / `scheduled` / `queue` eventを公開する。`composition.rs` は D1 novel/freeze/settings/tag-color adapters と D1 `ObjectStore`(`objects`/`object_chunks` テーブル) を構成し、Worker固有型をcoreへ逆流させない。
+- `WorkerHttpClient` は Fetch APIを既存 `HttpClient` traitへ接続し、request/response body上限を強制する。`D1ObjectStore` は logical-key prefix、paged LIST、bounded small read/write、streaming AssetStore を D1 上に実装する。
 - `D1NovelRepository` はprepared statements/migrationsでtyped filter/sort、keyset `scan_ids`、atomic sequence allocation、batch mutationをSQL化する。settings、freeze、tag colorsもD1 state/tableへ接続する。
 - `/health/live`、`/health/ready`、認証付きread-only `/api/novels`/`/api/novels/:id`を公開する。`NAROU_ADMIN_TOKEN`はconstant-time比較し、未知queue envelopeはretryする。Queue実ジョブ実行はPhase 8へ残す。
-- Worker production readinessはD1 `DB` binding、Wasabi endpoint/bucket/region/prefix variables、Wasabi/admin secretsを要求する。秘密値はリポジトリへ置かない。
+- Worker production readinessはD1 `DB` bindingと `NAROU_ADMIN_TOKEN` secretを要求する。秘密値はリポジトリへ置かない。
 
 ### 最近の追加 (2026-05〜07)
 - **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1 で従来の逐次動作、フォース指定・ウェブモード・ドメインが1種類のときは自動的に逐次にフォールバック

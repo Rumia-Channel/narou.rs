@@ -13,6 +13,7 @@
 pub mod bulk;
 pub mod content;
 pub mod versions;
+pub mod object_store;
 mod migrations;
 pub mod state;
 mod query;
