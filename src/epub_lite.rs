@@ -15,7 +15,10 @@
 
 use std::io::Write;
 
-use aozora_epub3_lite::{AozoraConfig, EpubAsset, EpubBook, EpubMetadata, aozora_text_to_xhtml_sections_with_config};
+use aozora_epub3_lite::{
+    AozoraConfig, EpubAsset, EpubBook, EpubMetadata, NavChapter, TitleType,
+    aozora_text_to_xhtml_sections_with_chapters, detect_meta_with_gaiji, remove_metadata_lines,
+};
 use sha2::{Digest, Sha256};
 
 use crate::error::{NarouError, Result};
@@ -32,7 +35,8 @@ mod embedded {
     pub const REPLACE: &str = include_str!("../assets/aozora_lite/replace.txt");
 }
 
-/// `AozoraConfig` equivalent to running the Lite CLI with its bundled assets.
+/// `AozoraConfig` equivalent to running the Lite CLI with its bundled assets
+/// plus the narou `AozoraEpub3.ini` chapter/TOC flags (`preset/AozoraEpub3.ini`).
 ///
 /// Built from strings on every call; cheap relative to text conversion and
 /// keeps the config free of shared mutable state.
@@ -45,6 +49,16 @@ pub fn embedded_config() -> AozoraConfig {
     config.load_alt_text(embedded::CHUKI_ALT);
     config.load_latin_text(embedded::CHUKI_LATIN);
     config.load_replace_text(embedded::REPLACE);
+    // narou.rb `preset/AozoraEpub3.ini`: TocPage/NavNest/NcxNest/TitleToc=1,
+    // ChapterSection empty (off), ChapterH1/H2/H3=1.
+    config.toc_page = true;
+    config.nav_nest = true;
+    config.ncx_nest = true;
+    config.title_toc = true;
+    config.chapter_section = false;
+    config.chapter_h1 = true;
+    config.chapter_h2 = true;
+    config.chapter_h3 = true;
     config
 }
 
@@ -107,7 +121,7 @@ fn stable_identifier(source_id: &str) -> String {
     let digest = Sha256::digest(source_id.as_bytes());
     let hex = hex::encode(&digest[..16]);
     format!(
-        "urn:uuid:{}-{}-{}-{}-{}",
+        "{:8}-{:4}-{:4}-{:4}-{:12}",
         &hex[0..8],
         &hex[8..12],
         &hex[12..16],
@@ -116,23 +130,46 @@ fn stable_identifier(source_id: &str) -> String {
     )
 }
 
-/// Build the in-memory [`EpubBook`] for a converted 青空文庫 text.
-///
-/// Images are registered as lazy assets: their bytes are requested from the
-/// resolver passed to [`stream_epub`] only when the ZIP writer reaches them,
-/// so peak memory stays near "text + one image".
+/// Convert converted-novel text into an [`EpubBook`], mirroring the Lite CLI
+/// pipeline: metadata strip, section split, chapter records → nav/ncx.
 pub fn build_book(text: &str, options: &EpubBuildOptions, images: &[EpubImage]) -> Result<EpubBook> {
     let config = embedded_config();
-    let sections = aozora_text_to_xhtml_sections_with_config(text, &config)
-        .map_err(|error| NarouError::Conversion(format!("EPUB変換に失敗しました: {error}")))?;
+    // narou convert output is title-then-author, like the Lite CLI default.
+    let detected = detect_meta_with_gaiji(text, TitleType::TitleAuthor, false, &config.gaiji);
+    let body = remove_metadata_lines(text, &detected);
+    // The reference pre-read consumes the first-chapter slot at the title
+    // line; the body scan starts without a pending chapter then.
+    let (sections, records) =
+        aozora_text_to_xhtml_sections_with_chapters(&body, &config, detected.title_line.is_none())
+            .map_err(|error| NarouError::Conversion(format!("EPUB変換に失敗しました: {error}")))?;
+    let chapters = records
+        .into_iter()
+        .map(|record| {
+            let mut chapter = NavChapter::new(
+                record.label,
+                format!("xhtml/{:04}.xhtml", record.section_index + 1),
+            )
+            .with_level(record.level);
+            if let Some(anchor) = record.anchor {
+                chapter = chapter.with_anchor(anchor);
+            }
+            chapter
+        })
+        .collect::<Vec<_>>();
 
     let metadata = EpubMetadata::new(options.title.clone(), stable_identifier(&options.source_id));
-    let mut book = EpubBook::from_sections(metadata, sections).with_vertical(options.vertical).with_assets(
-        images
-            .iter()
-            .map(|image| EpubAsset::lazy(image.epub_path.clone(), image.media_type))
-            .collect::<Vec<_>>(),
-    );
+    let mut book = EpubBook::from_sections(metadata, sections)
+        .with_vertical(options.vertical)
+        .with_toc_page(config.toc_page)
+        .with_toc_nest(config.nav_nest, config.ncx_nest)
+        .with_title_toc(config.title_toc)
+        .with_chapters(chapters)
+        .with_assets(
+            images
+                .iter()
+                .map(|image| EpubAsset::lazy(image.epub_path.clone(), image.media_type))
+                .collect::<Vec<_>>(),
+        );
     if options.cover_from_first_image
         && let Some(first) = images.first()
     {

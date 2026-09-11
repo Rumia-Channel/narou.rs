@@ -105,7 +105,7 @@ dependencies = [
 [[package]]
 name = "aozora_epub3_lite"
 version = "0.1.0"
-source = "git+https://github.com/Rumia-Channel/AozoraEpub3_Lite?rev=8e0e3f68124de4782505dcad31e1e2eefaf11462#8e0e3f68124de4782505dcad31e1e2eefaf11462"
+source = "git+https://github.com/Rumia-Channel/AozoraEpub3_Lite?rev=69f6904#69f690411b8027b9d26838d09061968bf1aef64c"
 dependencies = [
  "encoding_rs",
  "image",
