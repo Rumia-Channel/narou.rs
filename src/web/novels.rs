@@ -448,22 +448,32 @@ pub async fn download_ebook(
         paths.iter().find(|p| p.exists()).cloned()
     };
 
-    let file_path = find_existing(&paths)
-        .or_else(|| {
-            if ext != ".epub" {
-                crate::mail::get_ebook_file_paths(&record, &novel_dir, ".epub")
-                    .ok()
-                    .and_then(|eps| find_existing(&eps))
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Ebook not found for ID={}", id),
-            )
-        })?;
+    let existing = find_existing(&paths).or_else(|| {
+        if ext != ".epub" {
+            crate::mail::get_ebook_file_paths(&record, &novel_dir, ".epub")
+                .ok()
+                .and_then(|eps| find_existing(&eps))
+        } else {
+            None
+        }
+    });
+
+    #[cfg(feature = "lite")]
+    let file_path = match existing {
+        Some(path) => path,
+        None => {
+            let (bytes, filename) = generate_epub_on_demand(id, &record, &novel_dir).await?;
+            return serve_epub_bytes(bytes, &filename);
+        }
+    };
+
+    #[cfg(not(feature = "lite"))]
+    let file_path = existing.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Ebook not found for ID={}", id),
+        )
+    })?;
 
     let file = tokio::fs::File::open(&file_path)
         .await
@@ -524,4 +534,97 @@ fn sanitize_content_disposition(filename: &str) -> String {
         })
         .collect();
     format!("attachment; filename=\"{}\"", sanitized)
+}
+
+/// Build an EPUB from the converted 青空文庫 text at request time
+/// (`lite` feature). Reads the same output txt the CLI converter writes and
+/// resolves illustrations from the novel's `挿絵/` directory.
+#[cfg(feature = "lite")]
+async fn generate_epub_on_demand(
+    id: i64,
+    record: &crate::db::novel_record::NovelRecord,
+    novel_dir: &std::path::Path,
+) -> Result<(Vec<u8>, String), (StatusCode, String)> {
+
+    let settings = crate::converter::settings::NovelSettings::load_for_novel(
+        id,
+        &record.title,
+        &record.author,
+        novel_dir,
+    );
+    let toc_content = std::fs::read_to_string(novel_dir.join("toc.yaml"))
+        .map_err(|e| (StatusCode::CONFLICT, format!("toc.yaml: {e}")))?;
+    let toc: crate::downloader::TocFile = serde_yaml::from_str(&toc_content)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("toc.yaml: {e}")))?;
+    let toc_object = crate::downloader::TocObject {
+        title: toc.title,
+        author: toc.author,
+        toc_url: toc.toc_url,
+        story: toc.story,
+        subtitles: toc.subtitles,
+        novel_type: toc.novel_type,
+    };
+    let txt_path = crate::converter::output::create_output_text_path(
+        &settings,
+        id,
+        novel_dir,
+        &toc_object,
+        Some(record),
+    );
+    let text = std::fs::read_to_string(&txt_path).map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "Converted text not found: run convert first".to_string(),
+        )
+    })?;
+
+    let images_dir = novel_dir.join("挿絵");
+    let images = crate::epub_lite::image_entries(&text);
+    let options = crate::epub_lite::EpubBuildOptions {
+        title: record.title.clone(),
+        author: record.author.clone(),
+        source_id: record.toc_url.clone(),
+        vertical: !settings.enable_yokogaki,
+        cover_from_first_image: !images.is_empty() && settings.enable_illust,
+    };
+    let book = tokio::task::spawn_blocking(move || {
+        crate::epub_lite::build_book(&text, &options, &images)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut bytes = Vec::new();
+    crate::epub_lite::stream_epub(&book, &mut bytes, |epub_path| {
+        let name = epub_path.strip_prefix("image/")?;
+        std::fs::read(images_dir.join(name)).ok()
+    })
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let filename = txt_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| format!("{}.epub", n.trim_end_matches(".txt")))
+        .unwrap_or_else(|| format!("novel-{id}.epub"));
+    Ok((bytes, filename))
+}
+
+/// Wrap generated EPUB bytes into a download response.
+#[cfg(feature = "lite")]
+fn serve_epub_bytes(bytes: Vec<u8>, filename: &str) -> Result<Response, (StatusCode, String)> {
+    use axum::body::Body;
+    use axum::http::{HeaderValue, header};
+
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/epub+zip"),
+    );
+    let disposition_value = HeaderValue::from_bytes(sanitize_content_disposition(filename).as_bytes())
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"ebook.epub\""));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_DISPOSITION, disposition_value);
+    Ok(response)
 }

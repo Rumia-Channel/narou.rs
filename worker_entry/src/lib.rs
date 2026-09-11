@@ -104,11 +104,15 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
     if !authorized(&req, &env) {
         return Response::error("Unauthorized", 401);
     }
-    let id = req
-        .path()
-        .strip_prefix("/api/novels/")
-        .and_then(|value| value.parse::<i64>().ok());
-    let Some(id) = id else {
+    let path = req.path();
+    let rest = path.strip_prefix("/api/novels/").unwrap_or_default();
+    if let Some(id) = rest.strip_suffix("/download.epub") {
+        return match id.parse::<i64>() {
+            Ok(id) => api_novel_download_epub(req, env, id).await,
+            Err(_) => Response::error("Not Found", 404),
+        };
+    }
+    let Some(id) = rest.parse::<i64>().ok() else {
         return Response::error("Not Found", 404);
     };
     let services = match composition::build_services(&env) {
@@ -125,6 +129,130 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
     };
     let value = serde_json::to_value(record).map_err(|error| Error::RustError(error.to_string()))?;
     Response::from_json(&value)
+}
+
+/// GET /api/novels/:id/download.epub — build the EPUB from the stored
+/// converted text (`novel.txt` object) at download time and return it as the
+/// response body. Illustrations are read from the object store through a
+/// bounded prefetch so peak memory stays capped.
+async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Response> {
+    if !authorized(&req, &env) {
+        return Response::error("Unauthorized", 401);
+    }
+    let services = match composition::build_read_services(&env) {
+        Ok(services) => services,
+        Err(_) => return Response::error("Service unavailable", 503),
+    };
+    let record = match services
+        .app
+        .library
+        .get(narou_rs::platform::NovelId(id))
+        .await
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => return Response::error("Not Found", 404),
+        Err(error) => return Response::error(&format!("Repository error: {error}"), 500),
+    };
+    let keys = match narou_rs::platform::NovelObjectKeys::new(
+        &record.sitename,
+        &record.file_title,
+        record.use_subdirectory,
+    ) {
+        Ok(keys) => keys,
+        Err(error) => return Response::error(&format!("Invalid key: {error}"), 500),
+    };
+
+    let text_key = keys.converted_text();
+    let text_bytes = match services.objects.read_small(&text_key).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return Response::error(
+                "Converted text not found: run convert (text-only) for this novel first",
+                409,
+            );
+        }
+        Err(error) => return Response::error(&format!("Object store error: {error}"), 500),
+    };
+    let text = match String::from_utf8(text_bytes) {
+        Ok(text) => text,
+        Err(_) => return Response::error("Stored text is not valid UTF-8", 500),
+    };
+
+    // Prefetch illustrations with hard caps; the EPUB writer then resolves
+    // them from memory without touching storage mid-stream.
+    const MAX_IMAGES: usize = 512;
+    const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+    let mut prefetched: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    let mut total = 0usize;
+    let Ok(illust_prefix) = narou_rs::platform::ObjectPrefix::new(format!(
+        "{}/挿絵",
+        keys.prefix()
+    )) else {
+        return Response::error("Invalid illustration prefix", 500);
+    };
+    let mut cursor = None;
+    loop {
+        let mut request =
+            narou_rs::platform::ObjectListRequest::new(illust_prefix.clone(), 100.try_into().unwrap());
+        request.cursor = cursor.take();
+        let page = match services.objects.list_page(&request).await {
+            Ok(page) => page,
+            Err(_) => break,
+        };
+        for meta in page.objects {
+            if prefetched.len() >= MAX_IMAGES {
+                break;
+            }
+            let key = meta.key;
+            let name = key.as_ref().rsplit('/').next().unwrap_or_default().to_string();
+            if narou_rs::epub_lite::media_type_for(&name).is_none() {
+                continue;
+            }
+            if let Ok(Some(bytes)) = services.objects.read_small(&key).await {
+                total += bytes.len();
+                prefetched.insert(format!("image/{name}"), bytes);
+                if total > MAX_IMAGE_BYTES {
+                    break;
+                }
+            }
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    let images = narou_rs::epub_lite::image_entries(&text)
+        .into_iter()
+        .filter(|image| prefetched.contains_key(&image.epub_path))
+        .collect::<Vec<_>>();
+    let options = narou_rs::epub_lite::EpubBuildOptions {
+        title: record.title.clone(),
+        author: record.author.clone(),
+        source_id: format!("narou:{id}"),
+        vertical: true,
+        cover_from_first_image: !images.is_empty(),
+    };
+    let book = match narou_rs::epub_lite::build_book(&text, &options, &images) {
+        Ok(book) => book,
+        Err(error) => return Response::error(&format!("EPUB build failed: {error}"), 500),
+    };
+    let mut body = Vec::new();
+    if let Err(error) = narou_rs::epub_lite::stream_epub(&book, &mut body, |path| {
+        prefetched.get(path).cloned()
+    }) {
+        return Response::error(&format!("EPUB write failed: {error}"), 500);
+    }
+
+    Ok(
+        worker::ResponseBuilder::new()
+            .with_header("Content-Type", "application/epub+zip")?
+            .with_header(
+                "Content-Disposition",
+                &format!("attachment; filename=\"novel-{id}.epub\""),
+            )?
+            .from_bytes(body)?,
+    )
 }
 
 /// POST /api/jobs — plan a request, enqueue each discrete plan separately,

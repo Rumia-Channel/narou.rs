@@ -130,6 +130,8 @@ src/
   cli.rs                           - clap定義 (Cli struct + Commands enum, 引数前処理)
   error.rs                         - NarouError enum + Result type
   queue.rs                         - PersistentQueue (YAMLベース永続化ジョブキュー)
+  epub_lite.rs                     - AozoraEpub3_Lite 組み込み EPUB 生成 (feature "lite", ストリーミング書き出し)
+  assets/aozora_lite/              - 同梱 chuki テーブル (GPL-3.0-only, Lite由来)
   lib.rs                           - クレートルート (pub mod定義)
   platform/
     mod.rs                         - プラットフォーム抽象層 (traits re-export, 設計: docs/platform-abstraction.md)
@@ -413,3 +415,4 @@ For each section:
 - **WebSocket**: tokio-tungstenite
 - **HTTP client (low-level)**: curl crate
 - **Random UA**: ua_generator
+- **EPUB エンジン (オプション)**: `aozora_epub3_lite` (git 依存, rev pin) — cargo feature `lite` で有効化。`worker-runtime` は自動的に `lite` を含む。`lite` ビルドは GPL-3.0-only (assets/aozora_lite/LICENSE.md)、無しは従来どおり BSD-2-Clause + 外部 AozoraEpub3 プロセス。

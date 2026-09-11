@@ -882,6 +882,13 @@ impl NovelConverter {
             record.as_ref(),
         );
         std::fs::write(&txt_path, &aozora_text)?;
+        #[cfg(feature = "lite")]
+        {
+            // Fixed-name mirror so the portable object-store layout (and the
+            // Worker's download-time EPUB) can address the text without the
+            // per-title output naming rules.
+            let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
+        }
         save_latest_convert(id)?;
         self.inspect_converted_text(&aozora_text)?;
 
@@ -933,6 +940,10 @@ impl NovelConverter {
             record.as_ref(),
         );
         std::fs::write(&txt_path, &aozora_text)?;
+        #[cfg(feature = "lite")]
+        {
+            let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
+        }
         save_latest_convert(_id)?;
         self.inspect_converted_text(&aozora_text)?;
 

@@ -241,17 +241,30 @@ impl WorkerRuntime {
     }
 }
 
+/// Application services plus direct access to the novel object store, for
+/// handlers that stream content (download-time EPUB).
+pub struct ReadServices {
+    pub app: AppServices,
+    pub objects: Arc<dyn ObjectStore>,
+}
+
 /// Build the application services (read-only API surface).
 pub fn build_services(env: &Env) -> worker::Result<AppServices> {
+    Ok(build_read_services(env)?.app)
+}
+
+pub fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
     let db = Arc::new(env.d1("DB")?);
     let config = WasabiConfig::from_env(env)
         .map_err(|error| worker::Error::RustError(error.to_string()))?;
-    let store = Arc::new(WasabiObjectStore::new(config));
-    let objects: Arc<dyn ObjectStore> = store;
+    let objects: Arc<dyn ObjectStore> = Arc::new(WasabiObjectStore::new(config));
     let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::new(db.clone()));
-    Ok(services_from(novels, objects, freeze, db, clock))
+    Ok(ReadServices {
+        app: services_from(novels, objects.clone(), freeze, db, clock),
+        objects,
+    })
 }
 
 fn services_from(

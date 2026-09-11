@@ -286,6 +286,13 @@ impl NovelObjectKeys {
         self.child("diff.txt")
     }
 
+    /// Fully converted 青空文庫 text produced by a text-only convert run
+    /// (Worker path). Native layouts keep their per-title output file names;
+    /// this fixed key is the portable download-time EPUB source.
+    pub fn converted_text(&self) -> ObjectKey {
+        self.child("novel.txt")
+    }
+
     pub fn illustration(&self, filename: &str) -> Result<ObjectKey> {
         let filename = sanitize_key_component(filename);
         self.child_checked(&format!("挿絵/{filename}"))

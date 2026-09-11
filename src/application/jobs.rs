@@ -56,8 +56,11 @@ impl JobKind {
         }
     }
 
-    /// Kinds the Worker queue consumer can execute with the shared
-    /// Downloader. Anything else is routed to a durable blocked state.
+    /// Kinds the Worker queue consumer can execute with the shared portable
+    /// [`crate::downloader::Downloader`]. Anything else is routed to a durable
+    /// blocked state. Convert becomes executable once section→text assembly
+    /// is ported; download-time EPUB already reads the `novel.txt` object
+    /// ([`crate::platform::NovelObjectKeys::converted_text`]) instead.
     pub fn is_worker_executable(self) -> bool {
         matches!(self, Self::Download | Self::Update)
     }
