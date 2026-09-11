@@ -40,35 +40,78 @@ impl Database {
                 Some(state) => {
                     let repo =
                         crate::native::sqlite::SqliteNovelRepository::new(state.conn_ref().clone());
-                    // Backward compatibility: a fresh database adopts an
-                    // existing legacy database.yaml once.
-                    let empty = {
-                        let conn = repo.conn_handle();
-                        crate::native::sqlite::bulk::load_all_records(
-                            &conn.lock().expect("sqlite mutex poisoned"),
-                        )?
-                        .is_empty()
-                    };
-                    if empty {
-                        let yaml_path =
-                            inventory.inventory_path("database", InventoryScope::Local);
-                        if let Ok(content) = std::fs::read_to_string(&yaml_path) {
-                            if !content.trim().is_empty() {
-                                let parsed: BTreeMap<i64, NovelRecord> =
-                                    serde_yaml::from_str(&content)?;
-                                let mut conn = repo.conn_handle();
-                                {
-                                    let mut guard =
-                                        conn.lock().expect("sqlite mutex poisoned");
-                                    crate::native::sqlite::bulk::replace_all_records(
-                                        &mut guard, &parsed,
-                                    )?;
+                    let yaml_path =
+                        inventory.inventory_path("database", InventoryScope::Local);
+                    let index_path =
+                        inventory.inventory_path("database_index", InventoryScope::Local);
+                    let file_content = std::fs::read_to_string(&yaml_path).ok();
+                    let stored_sha = state
+                        .get_raw_db("meta", "database_yaml_sha")
+                        .ok()
+                        .flatten();
+                    let file_sha = file_content
+                        .as_ref()
+                        .map(|content| sha256_hex(content.as_bytes()));
+                    if state.compat_now() {
+                        // Compat mode: database.yaml is authoritative.
+                        match file_content {
+                            Some(content) => {
+                                if file_sha.as_deref() != stored_sha.as_deref() {
+                                    if !content.trim().is_empty() {
+                                        let parsed: BTreeMap<i64, NovelRecord> =
+                                            serde_yaml::from_str(&content)?;
+                                        let conn = repo.conn_handle();
+                                        crate::native::sqlite::bulk::replace_all_records(
+                                            &mut conn.lock().expect("sqlite mutex poisoned"),
+                                            &parsed,
+                                        )?;
+                                    }
+                                    let _ = state.set_raw_db(
+                                        "meta",
+                                        "database_yaml_sha",
+                                        &file_sha.clone().unwrap_or_default(),
+                                    );
                                 }
-                                rename_imported_file(&yaml_path);
-                                let index_path = inventory
-                                    .inventory_path("database_index", InventoryScope::Local);
-                                rename_imported_file(&index_path);
                             }
+                            None => {
+                                // File deleted externally: recreate it from
+                                // the database so narou.rb still sees the
+                                // library.
+                                mirror_records_yaml(&state, &repo, &yaml_path)?;
+                            }
+                        }
+                    } else {
+                        // Non-compat: import the file when it carries data the
+                        // DB has not mirrored yet, then retire it.
+                        let should_import = match (&file_content, &stored_sha) {
+                            (Some(content), Some(sha)) => {
+                                file_sha.as_deref() != Some(sha.as_str())
+                                    && !content.trim().is_empty()
+                            }
+                            (Some(content), None) => {
+                                let conn = repo.conn_handle();
+                                crate::native::sqlite::bulk::load_all_records(
+                                    &conn.lock().expect("sqlite mutex poisoned"),
+                                )?
+                                .is_empty()
+                                    && !content.trim().is_empty()
+                            }
+                            (None, _) => false,
+                        };
+                        if should_import {
+                            let parsed: BTreeMap<i64, NovelRecord> =
+                                serde_yaml::from_str(file_content.as_deref().unwrap_or(""))?;
+                            let conn = repo.conn_handle();
+                            crate::native::sqlite::bulk::replace_all_records(
+                                &mut conn.lock().expect("sqlite mutex poisoned"),
+                                &parsed,
+                            )?;
+                        }
+                        if yaml_path.exists() {
+                            rename_imported_file(&yaml_path);
+                        }
+                        if index_path.exists() {
+                            rename_imported_file(&index_path);
                         }
                     }
                     Some(repo)
@@ -76,7 +119,6 @@ impl Database {
                 None => None,
             }
         };
-
         let mut db = Self {
             data: HashMap::new(),
             index: IndexStore::load(&inventory)?,
@@ -87,6 +129,15 @@ impl Database {
             sqlite,
         };
         db.refresh()?;
+        #[cfg(feature = "native-runtime")]
+        if db.compat_active() {
+            let index_path = db
+                .inventory
+                .inventory_path("database_index", InventoryScope::Local);
+            if !index_path.exists() {
+                db.index.mark_dirty();
+            }
+        }
         Ok(db)
     }
 
@@ -94,6 +145,27 @@ impl Database {
     /// walking up from the current directory.
     pub fn with_root(root: PathBuf) -> Result<Self> {
         Self::with_inventory(Inventory::new(root))
+    }
+
+    /// True when the SQLite backend is active AND `narou-compat` is on:
+    /// `.narou/*.yaml` files stay authoritative and every write is mirrored.
+    #[cfg(feature = "native-runtime")]
+    fn compat_active(&self) -> bool {
+        self.state_handle()
+            .map(|state| state.compat_now())
+            .unwrap_or(false)
+    }
+
+    /// Serialized `database_index.yaml` payload for `db export-yaml`.
+    pub fn index_yaml(&self) -> Result<String> {
+        self.index.to_yaml()
+    }
+
+    #[cfg(feature = "native-runtime")]
+    fn state_handle(&self) -> Option<crate::native::sqlite::state::StateDb> {
+        crate::native::sqlite::state::active_for(
+            &self.inventory.root_dir().join(".narou"),
+        )
     }
 
     /// `PRAGMA integrity_check` result when the SQLite backend is active.
@@ -191,6 +263,21 @@ impl Database {
                 &mut conn.lock().expect("sqlite mutex poisoned"),
                 &normalized,
             )?;
+            if self.compat_active() {
+                let yaml_path = self
+                    .inventory
+                    .inventory_path(DATABASE_NAME, InventoryScope::Local);
+                let content = serde_yaml::to_string(&normalized)?;
+                crate::db::inventory::atomic_write(&yaml_path, &content)?;
+                if let Some(state) = self.state_handle() {
+                    let _ = state.set_raw_db(
+                        "meta",
+                        "database_yaml_sha",
+                        &sha256_hex(content.as_bytes()),
+                    );
+                }
+                self.index.flush(&self.inventory)?;
+            }
             return Ok(());
         }
         let content = serde_yaml::to_string(
@@ -218,7 +305,7 @@ impl Database {
     {
         #[cfg(feature = "native-runtime")]
         if self.sqlite.is_some() {
-            let mut current: BTreeMap<i64, NovelRecord> = self
+            let current: BTreeMap<i64, NovelRecord> = self
                 .data
                 .iter()
                 .map(|(&id, record)| {
@@ -238,7 +325,24 @@ impl Database {
                     &updated,
                 )?;
             }
+            if self.compat_active() {
+                let yaml_path = self
+                    .inventory
+                    .inventory_path(DATABASE_NAME, InventoryScope::Local);
+                let content = serde_yaml::to_string(&updated)?;
+                crate::db::inventory::atomic_write(&yaml_path, &content)?;
+                if let Some(state) = self.state_handle() {
+                    let _ = state.set_raw_db(
+                        "meta",
+                        "database_yaml_sha",
+                        &sha256_hex(content.as_bytes()),
+                    );
+                }
+            }
             self.data = updated.into_iter().collect();
+            if self.compat_active() {
+                self.index.flush(&self.inventory)?;
+            }
             return Ok(result);
         }
         let result = self.inventory.update_yaml(
@@ -804,4 +908,33 @@ fn rename_imported_file(path: &std::path::Path) {
         None => return,
     };
     let _ = std::fs::rename(path, path.with_file_name(name));
+}
+
+
+#[cfg(feature = "native-runtime")]
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(data);
+    hex::encode(digest)
+}
+
+/// Write `database.yaml` from the current SQLite records and remember its
+/// SHA-256 in `app_state` so the next open can detect external edits.
+#[cfg(feature = "native-runtime")]
+fn mirror_records_yaml(
+    state: &crate::native::sqlite::state::StateDb,
+    repo: &crate::native::sqlite::SqliteNovelRepository,
+    yaml_path: &std::path::Path,
+) -> Result<()> {
+    let conn = repo.conn_handle();
+    let records = crate::native::sqlite::bulk::load_all_records(
+        &conn.lock().expect("sqlite mutex poisoned"),
+    )?;
+    let content = serde_yaml::to_string(&records)?;
+    if let Some(parent) = yaml_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::db::inventory::atomic_write(yaml_path, &content)?;
+    let _ = state.set_raw_db("meta", "database_yaml_sha", &sha256_hex(content.as_bytes()));
+    Ok(())
 }

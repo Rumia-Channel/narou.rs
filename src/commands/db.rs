@@ -16,10 +16,16 @@ pub enum DbAction {
         /// Output directory (default: `narou-yaml-export` under the archive root).
         #[arg(long)]
         out: Option<String>,
+        /// Write the files back to their real locations (`.narou/*.yaml`,
+        /// `~/.narousetting/global_setting.yaml`) and switch the storage
+        /// marker back to `yaml`, restoring full narou.rb compatibility.
+        #[arg(long)]
+        in_place: bool,
     },
     /// Rebuild the database file to reclaim free space.
     Vacuum,
 }
+
 
 pub fn cmd_db(action: DbAction) -> narou_rs::error::Result<()> {
     // Every action operates on the live handle; this also triggers the
@@ -27,7 +33,7 @@ pub fn cmd_db(action: DbAction) -> narou_rs::error::Result<()> {
     narou_rs::db::init_database()?;
     match action {
         DbAction::Verify => cmd_verify(),
-        DbAction::ExportYaml { out } => cmd_export_yaml(out),
+        DbAction::ExportYaml { out, in_place } => cmd_export_yaml(out, in_place),
         DbAction::Vacuum => cmd_vacuum(),
     }
 }
@@ -48,14 +54,20 @@ fn cmd_verify() -> narou_rs::error::Result<()> {
     Ok(())
 }
 
-fn cmd_export_yaml(out: Option<String>) -> narou_rs::error::Result<()> {
+fn cmd_export_yaml(out: Option<String>, in_place: bool) -> narou_rs::error::Result<()> {
     use std::collections::BTreeMap;
 
     let inventory = narou_rs::db::inventory::Inventory::with_default_root()?;
     let root = inventory.root_dir().to_path_buf();
-    let out_dir = out
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| root.join("narou-yaml-export"));
+    let narou_dir = root.join(".narou");
+    // In-place export writes to the real locations; a plain export goes to a
+    // staging directory so nothing is overwritten.
+    let out_dir = if in_place {
+        narou_dir.clone()
+    } else {
+        out.map(std::path::PathBuf::from)
+            .unwrap_or_else(|| root.join("narou-yaml-export"))
+    };
     std::fs::create_dir_all(&out_dir)?;
 
     // 1. database.yaml from live records.
@@ -73,15 +85,18 @@ fn cmd_export_yaml(out: Option<String>) -> narou_rs::error::Result<()> {
     let yaml = serde_yaml::to_string(&records)?;
     std::fs::write(out_dir.join("database.yaml"), yaml)?;
 
-    // 2. Management states verbatim from app_state (freeze, alias, ...).
+    // 2. database_index.yaml (derived cache; narou.rb rebuilds it when
+    //    absent, but exporting it keeps the bundle complete).
+    narou_rs::db::with_database(|db| {
+        if let Ok(content) = db.index_yaml() {
+            std::fs::write(out_dir.join("database_index.yaml"), content)?;
+        }
+        Ok(())
+    })?;
+
+    // 3. Management states verbatim from app_state (freeze, alias, ...).
     #[cfg(feature = "native-runtime")]
-    if let Some(state) = (|| {
-        let narou_dir = narou_rs::db::inventory::Inventory::with_default_root()
-            .ok()?
-            .root_dir()
-            .join(".narou");
-        narou_rs::native::sqlite::state::active_for(&narou_dir)
-    })() {
+    if let Some(state) = narou_rs::native::sqlite::state::active_for(&narou_dir) {
         for entry in [
             ("freeze", "freeze.yaml"),
             ("alias", "alias.yaml"),
@@ -96,14 +111,36 @@ fn cmd_export_yaml(out: Option<String>) -> narou_rs::error::Result<()> {
             }
         }
         if let Some(payload) = state.get_raw("global", "global_setting")? {
-            let global_dir = out_dir.join(".narousetting");
+            let global_dir = if in_place {
+                dirs_home().join(".narousetting")
+            } else {
+                out_dir.join(".narousetting")
+            };
             std::fs::create_dir_all(&global_dir)?;
             std::fs::write(global_dir.join("global_setting.yaml"), payload)?;
         }
     }
 
-    println!("エクスポートしました: {}", out_dir.display());
+    if in_place {
+        // Switch the storage marker back so the next launch runs in legacy
+        // YAML mode and narou.rb sees the full library.
+        narou_rs::native::sqlite::state::write_mode(
+            &narou_dir,
+            narou_rs::native::sqlite::state::StorageMode::Yaml,
+        )?;
+        println!("前方互換ファイルを .narou/ に書き戻し、YAML モードへ切り替えました");
+    } else {
+        println!("エクスポートしました: {}", out_dir.display());
+    }
     Ok(())
+}
+
+#[cfg(feature = "native-runtime")]
+fn dirs_home() -> std::path::PathBuf {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
 }
 
 fn cmd_vacuum() -> narou_rs::error::Result<()> {

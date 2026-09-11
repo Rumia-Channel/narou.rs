@@ -223,9 +223,12 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 | サブコマンド | 内容 |
 |---|---|
-| `verify` | `PRAGMA integrity_check` を実行 |
+| `verify` | `PRAGMA integrity_check` + 全 payload の CRC-32 検査 |
 | `export-yaml [--out DIR]` | レガシー YAML/TXT バンドルを再生成 (旧バージョンへのロールバック用) |
+| `export-yaml --in-place` | `.narou/*.yaml`・`~/.narousetting/global_setting.yaml` を実位置へ書き戻し、`storage-backend` を `yaml` に戻す。narou.rb への完全復帰用 |
 | `vacuum` | VACUUM で容量回収 |
+
+**前方互換モード**: `narou setting narou-compat=true` で `.narou/*.yaml` (database.yaml, freeze.yaml, alias.yaml, tag_colors.yaml, latest_convert.yaml, local_setting.yaml, queue.yaml, notepad.txt) と `~/.narousetting/global_setting.yaml` をファイルとして維持し、narou.rb がそのまま読める状態を保つ。ファイルが正で SQLite はミラー。OFF(既定) ではファイルを `*.imported-*` へ退避し SQLite のみで管理する。
 
 ---
 

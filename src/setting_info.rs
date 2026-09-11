@@ -134,7 +134,8 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "time-zone"
         | "user-agent"
         | "queue.max-retries"
-        | "queue.retry-backoff" => Some("detail"),
+        | "queue.retry-backoff"
+        | "narou-compat" => Some("detail"),
 
         // local → webui
         "webui.theme"
@@ -1054,6 +1055,13 @@ pub fn setting_variables() -> SettingVariables {
             invis(
                 VarType::String,
                 "リトライ時の待機秒数をカンマ区切りで指定（s/m/h 単位可、例: 1m,5m,15m）。要素数より多く失敗したときは最後の値を再利用",
+            ),
+        ),
+        (
+            "narou-compat",
+            invis(
+                VarType::Boolean,
+                "SQLite 管理時も .narou/*.yaml を維持し narou.rb との前方互換を保つ。OFF(既定) で完全 SQLite 移行",
             ),
         ),
     ];

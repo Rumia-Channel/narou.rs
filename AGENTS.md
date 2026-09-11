@@ -254,7 +254,7 @@ sample/
 - P3 デュアルモード化: **既定は従来どおり YAML 管理**。`.narou/storage-backend` マーカー(`sqlite`)または Web UI ツアーの選択で Lite(SQLite) へ切替。`NAROU_RS_LEGACY_YAML=1` は強制レガシー。API: `GET/POST /api/storage/mode`
 - P4a コンテンツミラー (novel_sections/novel_outputs) — convert時に書込み、Web DL時EPUBはDB優先
 - P4b バージョン履歴 (novel_versions/_sections/_diffs) + `narou diff --history|--show|--restore|--merge-from`。update時自動snapshotはconvertフック経由
-- 後方互換: 旧ライブラリからの自動取込と export-yaml によるロールバックを保証。前方互換(narou.rb読影響)は破棄
+- 後方互換: 旧ライブラリからの自動取込と `narou db export-yaml` によるロールバックを保証。`narou setting narou-compat=true` で `.narou/*.yaml` を維持する前方互換モードあり (既定 OFF)。`export-yaml --in-place` は実位置へ書き戻して YAML モードへ復帰する
 
 ### プラットフォーム抽象化 (Phase 1-7 完了、Phase 8: 2026-08)
 - **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。Phase 4のsmall object / large asset境界、logical key、native mapping、remaining native FSも記録。Phase 7のD1/Worker read-only adapterも記録。

@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
@@ -45,12 +45,76 @@ pub struct StateDb {
     pub(crate) narou_dir: PathBuf,
 }
 
+/// `narou-compat` local_setting key: when true, `.narou/*.yaml` (and the
+/// global setting file) stay on disk and remain authoritative, with SQLite
+/// kept in sync as a mirror. When false (default), SQLite owns the state
+/// and legacy files are imported once then renamed away.
+pub const COMPAT_SETTING_KEY: &str = "narou-compat";
+
+/// Parse the `narou-compat` flag out of a local_setting YAML payload.
+/// Accepts `true`/`yes`/`on`/`1` (case-insensitive) as enabled.
+fn compat_flag_in_yaml(yaml: &str) -> Option<bool> {
+    let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+    match parsed.get(COMPAT_SETTING_KEY)? {
+        serde_yaml::Value::Bool(value) => Some(*value),
+        serde_yaml::Value::String(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "true" | "yes" | "on" | "1" => Some(true),
+                "false" | "no" | "off" | "0" => Some(false),
+                _ => None,
+            }
+        }
+        serde_yaml::Value::Number(number) => number.as_i64().map(|value| value != 0),
+        _ => None,
+    }
+}
+
 impl StateDb {
     pub fn conn(&self) -> Arc<Mutex<Connection>> {
         self.conn.clone()
     }
 
-    pub fn get_raw(&self, scope: &str, key: &str) -> Result<Option<String>> {
+    /// Legacy file path backing an `app_state` entry, if one exists.
+    /// `meta`-scope keys are internal and have no file mapping.
+    fn legacy_path(&self, scope: &str, key: &str) -> Option<PathBuf> {
+        match scope {
+            "inv" => {
+                let ext = if key == "notepad" { "txt" } else { "yaml" };
+                Some(self.narou_dir.join(format!("{key}.{ext}")))
+            }
+            "global" if key == "global_setting" => dirs_home()
+                .map(|home| home.join(".narousetting").join("global_setting.yaml")),
+            _ => None,
+        }
+    }
+
+    /// Resolve the `narou-compat` flag. A `local_setting.yaml` file on disk
+    /// wins when it carries the key (it is authoritative in compat mode and
+    /// may predate the database); otherwise the imported `app_state` value
+    /// decides. Direct SQL — never routed through `get_raw`/`set_raw`.
+    pub fn compat_now(&self) -> bool {
+        let file_value = self
+            .legacy_path("inv", "local_setting")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|content| compat_flag_in_yaml(&content));
+        if let Some(value) = file_value {
+            return value;
+        }
+        let conn = self.conn.lock().expect("state db mutex poisoned");
+        conn.query_row(
+            "SELECT value_yaml FROM app_state WHERE scope = 'inv' AND key = 'local_setting'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|yaml| compat_flag_in_yaml(&yaml))
+        .unwrap_or(false)
+    }
+
+    /// `app_state` read that bypasses the compat file layer. Used by
+    /// reconciliation and for `meta` keys.
+    pub(crate) fn get_raw_db(&self, scope: &str, key: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().expect("state db mutex poisoned");
         let mut statement = conn
             .prepare("SELECT value_yaml FROM app_state WHERE scope = ? AND key = ?")
@@ -69,7 +133,8 @@ impl StateDb {
         }
     }
 
-    pub fn set_raw(&self, scope: &str, key: &str, value_yaml: &str) -> Result<()> {
+    /// `app_state` write that bypasses the compat file layer.
+    pub(crate) fn set_raw_db(&self, scope: &str, key: &str, value_yaml: &str) -> Result<()> {
         let conn = self.conn.lock().expect("state db mutex poisoned");
         conn.execute(
             "INSERT INTO app_state (scope, key, value_json, value_yaml) VALUES (?, ?, '{}', ?)
@@ -80,7 +145,41 @@ impl StateDb {
         Ok(())
     }
 
+    pub fn get_raw(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        // Compat mode: the legacy file is authoritative when present.
+        if self.compat_now()
+            && let Some(path) = self.legacy_path(scope, key)
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            return Ok(Some(content));
+        }
+        self.get_raw_db(scope, key)
+    }
+
+    pub fn set_raw(&self, scope: &str, key: &str, value_yaml: &str) -> Result<()> {
+        // Compat mode: write the legacy file first (authoritative), then
+        // mirror into app_state so DB-side consumers stay in sync.
+        if self.compat_now()
+            && let Some(path) = self.legacy_path(scope, key)
+        {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            crate::db::inventory::atomic_write(&path, value_yaml)?;
+        }
+        self.set_raw_db(scope, key, value_yaml)
+    }
+
     pub fn delete_raw(&self, scope: &str, key: &str) -> Result<()> {
+        if self.compat_now()
+            && let Some(path) = self.legacy_path(scope, key)
+        {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         let conn = self.conn.lock().expect("state db mutex poisoned");
         conn.execute(
             "DELETE FROM app_state WHERE scope = ? AND key = ?",
@@ -89,6 +188,7 @@ impl StateDb {
         .map_err(super::sqlite_error)?;
         Ok(())
     }
+
 
     /// Every `(key, payload)` pair of one scope, ordered by key.
     pub fn scope_entries(&self, scope: &str) -> Result<Vec<(String, String)>> {
@@ -221,9 +321,7 @@ pub fn configure(narou_dir: &Path) -> Result<StateDb> {
         conn: Arc::new(Mutex::new(conn)),
         narou_dir: narou_dir.to_path_buf(),
     };
-    if state.is_fresh()? {
-        import_legacy_states(&state, narou_dir)?;
-    }
+    reconcile_managed_files(&state)?;
     if state.objects_empty()? {
         // One-shot import of the existing 小説データ/ tree so listings and
         // reads are DB-complete from the start. The filesystem mirror keeps
@@ -240,26 +338,55 @@ pub fn configure(narou_dir: &Path) -> Result<StateDb> {
     Ok(state)
 }
 
-fn import_legacy_states(state: &StateDb, narou_dir: &Path) -> Result<()> {
+/// Reconcile `app_state` with the legacy files on every open.
+///
+/// - `narou-compat` ON: files are authoritative — file content refreshes
+///   `app_state`, and missing files are recreated from `app_state`.
+/// - `narou-compat` OFF (default): files are imported into `app_state` and
+///   renamed to `<name>.imported-<unix_ts>` (never deleted).
+///
+/// Runs unconditionally (not only on a fresh database) so toggling the flag
+/// in either direction converges on the next launch.
+fn reconcile_managed_files(state: &StateDb) -> Result<()> {
+    let compat = state.compat_now();
     let mut imported: Vec<PathBuf> = Vec::new();
     for (key, file_name) in MANAGED_LOCAL {
-        let path = narou_dir.join(file_name);
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        // A placeholder-empty legacy file carries no information.
-        if content.trim().is_empty() {
+        let path = state.narou_dir.join(file_name);
+        let file_content = std::fs::read_to_string(&path).ok();
+        if compat {
+            match file_content {
+                Some(content) => state.set_raw_db("inv", key, &content)?,
+                None => {
+                    if let Some(payload) = state.get_raw_db("inv", key)? {
+                        crate::db::inventory::atomic_write(&path, &payload)?;
+                    }
+                }
+            }
+        } else if let Some(content) = file_content {
+            if !content.trim().is_empty() {
+                state.set_raw_db("inv", key, &content)?;
+            }
             imported.push(path);
-            continue;
         }
-        state.set_raw("inv", key, &content)?;
-        imported.push(path);
     }
     if let Some(home) = dirs_home() {
         let global = home.join(".narousetting").join("global_setting.yaml");
-        if let Ok(content) = std::fs::read_to_string(&global) {
+        let file_content = std::fs::read_to_string(&global).ok();
+        if compat {
+            match file_content {
+                Some(content) => state.set_raw_db("global", "global_setting", &content)?,
+                None => {
+                    if let Some(payload) = state.get_raw_db("global", "global_setting")? {
+                        if let Some(parent) = global.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        crate::db::inventory::atomic_write(&global, &payload)?;
+                    }
+                }
+            }
+        } else if let Some(content) = file_content {
             if !content.trim().is_empty() {
-                state.set_raw("global", "global_setting", &content)?;
+                state.set_raw_db("global", "global_setting", &content)?;
             }
             imported.push(global);
         }
