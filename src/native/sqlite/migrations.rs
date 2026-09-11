@@ -16,7 +16,9 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, include_str!("migrations/0005_content.sql")),
     (6, include_str!("migrations/0006_versions.sql")),
     (7, include_str!("migrations/0007_toc_url_not_unique.sql")),
-    (8, include_str!("migrations/0008_objects.sql")),
+ (8, include_str!("migrations/0008_objects.sql")),
+ (9, include_str!("migrations/0009_section_bodies.sql")),
+ (10, include_str!("migrations/0010_drop_body_yaml.sql")),
 ];
 
 pub(crate) fn apply(conn: &mut Connection) -> Result<()> {
@@ -26,6 +28,14 @@ pub(crate) fn apply(conn: &mut Connection) -> Result<()> {
     for &(version, sql) in MIGRATIONS {
         if version <= current {
             continue;
+        }
+        // Before 0010 drops the legacy body_yaml columns, move existing
+        // bodies into the content-addressed section_bodies table. Runs here
+        // (not after 0009) so a crash between 0009 and 0010 still migrates:
+        // the function is idempotent and skips rows already carrying
+        // body_hash.
+        if version == 10 {
+            super::object_store::migrate_section_bodies(conn)?;
         }
         let tx = conn
             .transaction()
@@ -51,7 +61,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 10);
     }
 
     #[test]

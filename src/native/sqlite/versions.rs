@@ -69,27 +69,13 @@ pub fn snapshot_working_set(
     )
     .map_err(sqlite_error)?;
     let version_id = tx.last_insert_rowid();
-    for (idx, (subtitle, body)) in &current {
-        tx.execute(
-            "INSERT INTO novel_version_sections (version_id, idx, subtitle, body_yaml) VALUES (?, ?, ?, ?)",
-            params![version_id, idx, subtitle, body],
-        )
-        .map_err(sqlite_error)?;
-    }
+    write_version_sections(&tx, version_id, &current)?;
     if let Some(prev_id) = prev_head {
         let old = load_sections_text(&tx, prev_id)?;
         let diff = unified_diff(&old, &render_for_diff(&current));
-        tx.execute(
-            "INSERT INTO novel_version_diffs (version_id, prev_version_id, unified_diff) VALUES (?, ?, ?)",
-            params![version_id, prev_id, diff],
-        )
-        .map_err(sqlite_error)?;
+        store_diff(&tx, version_id, Some(prev_id), &diff)?;
     } else {
-        tx.execute(
-            "INSERT INTO novel_version_diffs (version_id, prev_version_id, unified_diff) VALUES (?, NULL, '')",
-            [version_id],
-        )
-        .map_err(sqlite_error)?;
+        store_diff(&tx, version_id, None, "")?;
     }
     tx.commit().map_err(sqlite_error)?;
     Ok(version_id)
@@ -118,24 +104,42 @@ fn load_sections_text(
     conn: &Connection,
     version_id: i64,
 ) -> Result<String> {
-    let mut statement = conn
-        .prepare("SELECT idx, subtitle, body_yaml FROM novel_version_sections WHERE version_id = ? ORDER BY idx")
+    let sections = version_sections(conn, version_id)?.unwrap_or_default();
+    Ok(render_for_diff(&sections))
+}
+
+/// Insert one version's section rows, storing each body once in
+/// `section_bodies` and linking by hash.
+fn write_version_sections(
+    tx: &Connection,
+    version_id: i64,
+    sections: &BTreeMap<String, (Option<String>, String)>,
+) -> Result<()> {
+    for (idx, (subtitle, body)) in sections {
+        let hash = super::content::store_body(tx, body)?;
+        tx.execute(
+            "INSERT INTO novel_version_sections (version_id, idx, subtitle, body_hash) VALUES (?, ?, ?, ?)",
+            params![version_id, idx, subtitle, hash],
+        )
         .map_err(sqlite_error)?;
-    let rows = statement
-        .query_map([version_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(sqlite_error)?;
-    let mut map = BTreeMap::new();
-    for row in rows {
-        let (idx, subtitle, body) = row.map_err(|error| NarouError::Platform(error.to_string()))?;
-        map.insert(idx, (subtitle, body));
     }
-    Ok(render_for_diff(&map))
+    Ok(())
+}
+
+/// Store a unified diff, compressed when brotli shrinks it.
+fn store_diff(
+    tx: &Connection,
+    version_id: i64,
+    prev_version_id: Option<i64>,
+    diff: &str,
+) -> Result<()> {
+    let (stored, encoding) = crate::platform::compress_object_payload(diff.as_bytes());
+    tx.execute(
+        "INSERT INTO novel_version_diffs (version_id, prev_version_id, unified_diff, encoding) VALUES (?, ?, ?, ?)",
+        params![version_id, prev_version_id, stored, encoding.as_str()],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
 }
 
 /// Version headers, newest first.
@@ -169,39 +173,50 @@ pub fn list_versions(conn: &Connection, novel_id: i64) -> Result<Vec<VersionInfo
 /// Stored unified diff for one version (empty for the initial snapshot).
 pub fn version_diff(conn: &Connection, version_id: i64) -> Result<Option<String>> {
     let mut statement = conn
-        .prepare("SELECT unified_diff FROM novel_version_diffs WHERE version_id = ?")
+        .prepare("SELECT unified_diff, encoding FROM novel_version_diffs WHERE version_id = ?")
         .map_err(sqlite_error)?;
     let mut rows = statement.query([version_id]).map_err(sqlite_error)?;
     match rows.next().map_err(sqlite_error)? {
         Some(row) => {
-            let diff: String =
+            let stored: Vec<u8> =
                 row.get(0).map_err(|error| NarouError::Platform(error.to_string()))?;
-            Ok(Some(diff))
+            let encoding: String = row
+                .get(1)
+                .map_err(|error| NarouError::Platform(error.to_string()))?;
+            let encoding = crate::platform::ObjectEncoding::parse(&encoding)?;
+            let data = crate::platform::decompress_object_payload(&stored, encoding)?;
+            String::from_utf8(data)
+                .map(Some)
+                .map_err(|error| NarouError::Platform(format!("diff is not UTF-8: {error}")))
         }
         None => Ok(None),
     }
 }
-
 /// Sections stored in one version; `None` when the version does not exist.
 pub fn version_sections(
     conn: &Connection,
     version_id: i64,
 ) -> Result<Option<BTreeMap<String, (Option<String>, String)>>> {
     let mut statement = conn
-        .prepare("SELECT idx, subtitle, body_yaml FROM novel_version_sections WHERE version_id = ? ORDER BY idx")
+        .prepare("SELECT idx, subtitle, body_hash FROM novel_version_sections WHERE version_id = ? ORDER BY idx")
         .map_err(sqlite_error)?;
     let rows = statement
         .query_map([version_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
             ))
         })
         .map_err(sqlite_error)?;
     let mut map = BTreeMap::new();
     for row in rows {
-        let (idx, subtitle, body) = row.map_err(|error| NarouError::Platform(error.to_string()))?;
+        let (idx, subtitle, hash) =
+            row.map_err(|error| NarouError::Platform(error.to_string()))?;
+        let Some(hash) = hash else { continue };
+        let Some(body) = super::content::load_body(conn, &hash)? else {
+            continue;
+        };
         map.insert(idx, (subtitle, body));
     }
     if map.is_empty() {
@@ -271,18 +286,8 @@ pub fn restore_version(
     )
     .map_err(sqlite_error)?;
     let new_id = tx.last_insert_rowid();
-    for (idx, (subtitle, body)) in &target {
-        tx.execute(
-            "INSERT INTO novel_version_sections (version_id, idx, subtitle, body_yaml) VALUES (?, ?, ?, ?)",
-            params![new_id, idx, subtitle, body],
-        )
-        .map_err(sqlite_error)?;
-    }
-    tx.execute(
-        "INSERT INTO novel_version_diffs (version_id, prev_version_id, unified_diff) VALUES (?, NULL, '')",
-        [new_id],
-    )
-    .map_err(sqlite_error)?;
+    write_version_sections(&tx, new_id, &target)?;
+    store_diff(&tx, new_id, None, "")?;
     tx.commit().map_err(sqlite_error)?;
     let _ = prev_head;
     Ok(new_id)
@@ -329,27 +334,13 @@ pub fn merge_from_version(
     )
     .map_err(sqlite_error)?;
     let new_id = tx.last_insert_rowid();
-    for (idx, (subtitle, body)) in &current {
-        tx.execute(
-            "INSERT INTO novel_version_sections (version_id, idx, subtitle, body_yaml) VALUES (?, ?, ?, ?)",
-            params![new_id, idx, subtitle, body],
-        )
-        .map_err(sqlite_error)?;
-    }
+    write_version_sections(&tx, new_id, &current)?;
     if let Some(prev_id) = prev_head {
         let old = load_sections_text(&tx, prev_id)?;
         let diff = unified_diff(&old, &render_for_diff(&current));
-        tx.execute(
-            "INSERT INTO novel_version_diffs (version_id, prev_version_id, unified_diff) VALUES (?, ?, ?)",
-            params![new_id, prev_id, diff],
-        )
-        .map_err(sqlite_error)?;
+        store_diff(&tx, new_id, Some(prev_id), &diff)?;
     } else {
-        tx.execute(
-            "INSERT INTO novel_version_diffs (version_id, prev_version_id, unified_diff) VALUES (?, NULL, '')",
-            [new_id],
-        )
-        .map_err(sqlite_error)?;
+        store_diff(&tx, new_id, None, "")?;
     }
     tx.commit().map_err(sqlite_error)?;
     Ok(new_id)

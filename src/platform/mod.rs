@@ -26,7 +26,7 @@ pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
 pub use object_store::{
     AssetChunk, AssetStore, AssetStream, GeneratedAssetKey, NovelObjectKeys, ObjectEncoding,
     ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectStore,
-    compress_object_payload, decompress_object_payload,
+    compress_object_payload, decompress_object_payload, object_crc32, verify_object_crc32,
 };
 pub use progress::ProgressReporter;
 pub use rate_limiter::{normalize_site_key, RateLimitScope, RateLimiter};

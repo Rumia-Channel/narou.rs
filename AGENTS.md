@@ -284,7 +284,7 @@ sample/
 
 ### Phase 6-7 Worker backend (2026-08-10)
 - `narou_rs` の `worker-runtime` feature は `application`、`platform`、portable `db`/`converter::ini` のみを公開する。CLI、Web、native HTTP、filesystem、process、settings adapters は `native-runtime` gate の内側に置く。
-- `worker_entry/` は `workers-rs 0.8.5` の `fetch` / `scheduled` / `queue` eventを公開する。`composition.rs` は D1 novel/freeze/settings/tag-color adapters と D1 `ObjectStore`(`objects`/`object_chunks` テーブル) を構成し、Worker固有型をcoreへ逆流させない。
+- `worker_entry/` は `workers-rs 0.8.5` の `fetch` / `scheduled` / `queue` eventを公開する。`composition.rs` は D1 novel/freeze/settings/tag-color adapters と D1 `ObjectStore`(`objects`/`object_chunks` BLOB+brotli+crc32 テーブル) を構成し、Worker固有型をcoreへ逆流させない。
 - `WorkerHttpClient` は Fetch APIを既存 `HttpClient` traitへ接続し、request/response body上限を強制する。`D1ObjectStore` は logical-key prefix、paged LIST、bounded small read/write、streaming AssetStore を D1 上に実装する。
 - `D1NovelRepository` はprepared statements/migrationsでtyped filter/sort、keyset `scan_ids`、atomic sequence allocation、batch mutationをSQL化する。settings、freeze、tag colorsもD1 state/tableへ接続する。
 - `/health/live`、`/health/ready`、認証付きread-only `/api/novels`/`/api/novels/:id`を公開する。`NAROU_ADMIN_TOKEN`はconstant-time比較し、未知queue envelopeはretryする。Queue実ジョブ実行はPhase 8へ残す。

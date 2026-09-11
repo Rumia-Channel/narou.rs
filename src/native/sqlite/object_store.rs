@@ -29,17 +29,6 @@ use crate::native::object_store::{
 /// 512 KiB keeps every statement and row comfortably under D1's limits.
 pub(crate) const OBJECT_CHUNK_BYTES: usize = 512 * 1024;
 
-fn encode_payload(data: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(data)
-}
-
-fn decode_payload(encoded: &str) -> Result<Vec<u8>> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|error| NarouError::Platform(format!("invalid base64 object payload: {error}")))
-}
 
 /// ObjectStore + AssetStore backed by `.narou/db.sqlite` with a filesystem
 /// mirror under the archive root.
@@ -86,11 +75,12 @@ impl SqliteObjectStore {
     }
 
     /// Read the full payload from SQLite. Returns `Ok(None)` when the key is
-    /// absent; errors only on real storage failures.
+    /// absent; errors only on real storage failures. The stored CRC-32 is
+    /// verified against the decompressed payload.
     fn read_blocking(&self, key: &ObjectKey) -> Result<Option<Vec<u8>>> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let mut statement = conn
-            .prepare("SELECT data, size, encoding FROM objects WHERE object_key = ?")
+            .prepare("SELECT data, size, encoding, crc32 FROM objects WHERE object_key = ?")
             .map_err(super::sqlite_error)?;
         let mut rows = statement
             .query(rusqlite::params![key.as_ref()])
@@ -98,12 +88,13 @@ impl SqliteObjectStore {
         let Some(row) = rows.next().map_err(super::sqlite_error)? else {
             return Ok(None);
         };
-        let inline: Option<String> = row.get(0).map_err(super::sqlite_error)?;
+        let inline: Option<Vec<u8>> = row.get(0).map_err(super::sqlite_error)?;
         let size: i64 = row.get(1).map_err(super::sqlite_error)?;
         let encoding: String = row.get(2).map_err(super::sqlite_error)?;
+        let crc32: i64 = row.get(3).map_err(super::sqlite_error)?;
         let encoding = crate::platform::ObjectEncoding::parse(&encoding)?;
-        let stored = if let Some(encoded) = inline {
-            decode_payload(&encoded)?
+        let stored = if let Some(bytes) = inline {
+            bytes
         } else {
             drop(rows);
             drop(statement);
@@ -113,37 +104,39 @@ impl SqliteObjectStore {
             let mut rows = statement
                 .query(rusqlite::params![key.as_ref()])
                 .map_err(super::sqlite_error)?;
-            let mut encoded = String::new();
+            let mut stored = Vec::new();
             while let Some(row) = rows.next().map_err(super::sqlite_error)? {
-                let chunk: String = row.get(0).map_err(super::sqlite_error)?;
-                encoded.push_str(&chunk);
+                let chunk: Vec<u8> = row.get(0).map_err(super::sqlite_error)?;
+                stored.extend_from_slice(&chunk);
             }
-            decode_payload(&encoded)?
+            stored
         };
         let data = crate::platform::decompress_object_payload(&stored, encoding)?;
+        crate::platform::verify_object_crc32(&data, crc32 as u32)?;
         debug_assert_eq!(data.len() as i64, size);
         Ok(Some(data))
     }
 
     /// Insert or replace one object (inline or chunked) in a single
     /// transaction. Compression runs on the whole payload before chunking so
-    /// chunk boundaries never split a deflate stream; `size` stays the
-    /// original uncompressed length.
+    /// chunk boundaries never split a brotli stream; `size`/`crc32` describe
+    /// the uncompressed payload.
     fn write_blocking(&self, key: &ObjectKey, data: &[u8]) -> Result<()> {
         let (stored, encoding) = crate::platform::compress_object_payload(data);
-        let encoded = encode_payload(&stored);
+        let crc32 = crate::platform::object_crc32(data) as i64;
         let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
         let tx = conn.transaction().map_err(super::sqlite_error)?;
         let content_type = content_type_for_key(key);
-        if encoded.len() <= OBJECT_CHUNK_BYTES {
+        if stored.len() <= OBJECT_CHUNK_BYTES {
             tx.execute(
-                "INSERT INTO objects (object_key, size, content_type, updated_at, encoding, data)
-                 VALUES (?, ?, ?, ?, ?, ?)
+                "INSERT INTO objects (object_key, size, content_type, updated_at, encoding, crc32, data)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(object_key) DO UPDATE SET
                      size = excluded.size,
                      content_type = excluded.content_type,
                      updated_at = excluded.updated_at,
                      encoding = excluded.encoding,
+                     crc32 = excluded.crc32,
                      data = excluded.data",
                 rusqlite::params![
                     key.as_ref(),
@@ -151,7 +144,8 @@ impl SqliteObjectStore {
                     content_type,
                     Self::now_rfc3339(),
                     encoding.as_str(),
-                    encoded
+                    crc32,
+                    stored
                 ],
             )
             .map_err(super::sqlite_error)?;
@@ -162,20 +156,22 @@ impl SqliteObjectStore {
             .map_err(super::sqlite_error)?;
         } else {
             tx.execute(
-                "INSERT INTO objects (object_key, size, content_type, updated_at, encoding, data)
-                 VALUES (?, ?, ?, ?, ?, NULL)
+                "INSERT INTO objects (object_key, size, content_type, updated_at, encoding, crc32, data)
+                 VALUES (?, ?, ?, ?, ?, ?, NULL)
                  ON CONFLICT(object_key) DO UPDATE SET
                      size = excluded.size,
                      content_type = excluded.content_type,
                      updated_at = excluded.updated_at,
                      encoding = excluded.encoding,
+                     crc32 = excluded.crc32,
                      data = NULL",
                 rusqlite::params![
                     key.as_ref(),
                     data.len() as i64,
                     content_type,
                     Self::now_rfc3339(),
-                    encoding.as_str()
+                    encoding.as_str(),
+                    crc32
                 ],
             )
             .map_err(super::sqlite_error)?;
@@ -187,13 +183,7 @@ impl SqliteObjectStore {
             let mut statement = tx
                 .prepare("INSERT INTO object_chunks (object_key, seq, data) VALUES (?, ?, ?)")
                 .map_err(super::sqlite_error)?;
-            for (seq, chunk) in encoded
-                .as_bytes()
-                .chunks(OBJECT_CHUNK_BYTES)
-                .enumerate()
-            {
-                let chunk = std::str::from_utf8(chunk)
-                    .map_err(|error| NarouError::Platform(error.to_string()))?;
+            for (seq, chunk) in stored.chunks(OBJECT_CHUNK_BYTES).enumerate() {
                 statement
                     .execute(rusqlite::params![key.as_ref(), seq as i64, chunk])
                     .map_err(super::sqlite_error)?;
@@ -539,6 +529,110 @@ pub(crate) fn import_archive_into_objects(
     Ok(imported)
 }
 
+/// Move legacy `body_yaml` payloads into the content-addressed
+/// `section_bodies` table and link rows via `body_hash`. Runs inside
+/// `migrations::apply` between 0009 (adds the columns) and 0010 (drops
+/// `body_yaml`). Idempotent: rows already carrying a hash are skipped, and
+/// `INSERT OR IGNORE` keeps reruns cheap.
+pub(crate) fn migrate_section_bodies(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction().map_err(super::sqlite_error)?;
+    // Both tables are WITHOUT ROWID: identify rows by their primary key.
+    for (table, pk1, pk2) in [
+        ("novel_sections", "novel_id", "idx"),
+        ("novel_version_sections", "version_id", "idx"),
+    ] {
+        let select = format!("SELECT {pk1}, {pk2}, body_yaml FROM {table} WHERE body_hash IS NULL");
+        let update = format!("UPDATE {table} SET body_hash = ? WHERE {pk1} = ? AND {pk2} = ?");
+        let mut statement = tx.prepare(&select).map_err(super::sqlite_error)?;
+        let rows: Vec<(i64, String, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(super::sqlite_error)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(super::sqlite_error)?;
+        drop(statement);
+        for (pk1, pk2, body) in rows {
+            let hash = super::content::store_body(&tx, &body)?;
+            tx.execute(&update, rusqlite::params![hash, pk1, pk2])
+                .map_err(super::sqlite_error)?;
+        }
+    }
+    tx.commit().map_err(super::sqlite_error)
+}
+
+
+/// Verify every stored payload against its CRC-32 after decompression.
+/// Returns the number of corrupted rows; used by `narou db verify`.
+/// Skips silently when the encoding/crc32 columns predate the schema.
+pub(crate) fn verify_payload_crc32(conn: &Connection) -> Result<usize> {
+    let has_encoding: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('objects') WHERE name = 'encoding'")
+        .and_then(|mut s| s.exists([]))
+        .unwrap_or(false);
+    if !has_encoding {
+        return Ok(0);
+    }
+    let mut bad = 0usize;
+    // objects: inline or chunked payloads.
+    {
+        let mut statement = conn
+            .prepare("SELECT object_key, data, encoding, crc32 FROM objects")
+            .map_err(super::sqlite_error)?;
+        let rows: Vec<(String, Option<Vec<u8>>, String, i64)> = statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(super::sqlite_error)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(super::sqlite_error)?;
+        drop(statement);
+        for (key, inline, encoding, crc32) in rows {
+            let stored = match inline {
+                Some(bytes) => bytes,
+                None => {
+                    let mut stored = Vec::new();
+                    let mut chunks = conn
+                        .prepare("SELECT data FROM object_chunks WHERE object_key = ? ORDER BY seq")
+                        .map_err(super::sqlite_error)?;
+                    let mut chunk_rows =
+                        chunks.query(rusqlite::params![key]).map_err(super::sqlite_error)?;
+                    while let Some(row) = chunk_rows.next().map_err(super::sqlite_error)? {
+                        let chunk: Vec<u8> = row.get(0).map_err(super::sqlite_error)?;
+                        stored.extend_from_slice(&chunk);
+                    }
+                    stored
+                }
+            };
+            let ok = crate::platform::ObjectEncoding::parse(&encoding)
+                .and_then(|enc| crate::platform::decompress_object_payload(&stored, enc))
+                .and_then(|data| crate::platform::verify_object_crc32(&data, crc32 as u32))
+                .is_ok();
+            if !ok {
+                bad += 1;
+            }
+        }
+    }
+    // section_bodies: always inline.
+    {
+        let mut statement = conn
+            .prepare("SELECT data, encoding, crc32 FROM section_bodies")
+            .map_err(super::sqlite_error)?;
+        let rows: Vec<(Vec<u8>, String, i64)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(super::sqlite_error)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(super::sqlite_error)?;
+        for (stored, encoding, crc32) in rows {
+            let ok = crate::platform::ObjectEncoding::parse(&encoding)
+                .and_then(|enc| crate::platform::decompress_object_payload(&stored, enc))
+                .and_then(|data| crate::platform::verify_object_crc32(&data, crc32 as u32))
+                .is_ok();
+            if !ok {
+                bad += 1;
+            }
+        }
+    }
+    Ok(bad)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn compressible_payload_is_stored_deflated() {
+    fn compressible_payload_is_stored_compressed() {
         let (_dir, store) = temp_store();
         let key = ObjectKey::try_new("novels/site/title/本文/0001 本文.yaml").unwrap();
         let payload = "同じ文章の繰り返し。".repeat(10_000).into_bytes();
@@ -616,7 +710,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(encoding, "deflate");
+        assert_eq!(encoding, "brotli");
         assert!((stored_len as usize) < payload.len());
         drop(conn);
 

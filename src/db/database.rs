@@ -111,6 +111,21 @@ impl Database {
         Ok(None)
     }
 
+    /// Verify every `objects`/`section_bodies` payload against its stored
+    /// CRC-32 after decompression. Returns the count of corrupted rows, or
+    /// `None` in legacy YAML mode / when the tables do not exist yet.
+    pub fn sqlite_payload_check(&self) -> Result<Option<usize>> {
+        #[cfg(feature = "native-runtime")]
+        if let Some(repo) = &self.sqlite {
+            let conn = repo.conn_handle();
+            let guard = conn.lock().expect("sqlite mutex poisoned");
+            return crate::native::sqlite::object_store::verify_payload_crc32(&guard)
+                .map(Some);
+        }
+        #[allow(unreachable_code)]
+        Ok(None)
+    }
+
     fn using_sqlite(&self) -> bool {
         #[cfg(feature = "native-runtime")]
         {
