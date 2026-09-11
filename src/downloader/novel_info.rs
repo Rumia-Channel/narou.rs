@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::error::Result;
+use crate::platform::{HttpClient, RateLimiter};
 
+use super::http_policy;
 use super::site_setting::SiteSetting;
 
 pub struct NovelInfo {
@@ -39,26 +41,41 @@ impl NovelInfo {
         }
     }
 
-    pub fn load(
+    /// Fetch the novel-info page (when the site defines `novel_info_url`)
+    /// and parse it. Any fetch failure falls back to the TOC source, matching
+    /// the old `NovelInfo::load` behaviour.
+    pub async fn load(
+        http: &dyn HttpClient,
+        rate_limiter: &dyn RateLimiter,
         setting: &SiteSetting,
-        client: &reqwest::blocking::Client,
         toc_source: &str,
         url_captures: &HashMap<String, String>,
     ) -> Result<Self> {
-        if let Some(novel_info_url) = &setting.novel_info_url {
-            let resolved_url = setting
-                .novel_info_url_with_captures(url_captures)
-                .unwrap_or_else(|| setting.interpolate(novel_info_url));
-            let response = client.get(&resolved_url).send()?;
-            if !response.status().is_success() {
-                return Ok(Self::empty());
+        let Some(novel_info_url) = &setting.novel_info_url else {
+            return Ok(Self::from_toc_source(setting, toc_source));
+        };
+        let resolved_url = setting
+            .novel_info_url_with_captures(url_captures)
+            .unwrap_or_else(|| setting.interpolate(novel_info_url));
+        match http_policy::fetch_text(
+            http,
+            rate_limiter,
+            &resolved_url,
+            setting.cookie(),
+            Some(setting.encoding()),
+            setting.is_narou,
+        )
+        .await
+        {
+            Ok(mut body) => {
+                crate::downloader::pretreatment_source(
+                    &mut body,
+                    setting.encoding(),
+                    Some(setting),
+                );
+                Ok(Self::from_novel_info_source(setting, &body))
             }
-            let mut body = response.text()?;
-            crate::downloader::pretreatment_source(&mut body, setting.encoding(), Some(setting));
-
-            Ok(Self::from_novel_info_source(setting, &body))
-        } else {
-            Ok(Self::from_toc_source(setting, toc_source))
+            Err(_) => Ok(Self::from_toc_source(setting, toc_source)),
         }
     }
 

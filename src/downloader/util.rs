@@ -78,15 +78,26 @@ pub fn decode_numeric_entities(src: &mut String) {
         .to_string();
 }
 
+/// Length limit for generated filenames (`folder-length-limit` /
+/// `filename-length-limit` local settings). Worker builds have no local
+/// settings and fall back to the provided default.
 pub fn load_length_limit(key: &str, default: Option<usize>) -> Option<usize> {
-    crate::compat::load_local_setting_value(key)
-        .and_then(|value| match value {
-            serde_yaml::Value::Number(number) => number.as_i64(),
-            serde_yaml::Value::String(raw) => raw.parse::<i64>().ok(),
-            _ => None,
-        })
-        .map(|limit| limit.max(0) as usize)
-        .or(default)
+    #[cfg(feature = "native-runtime")]
+    {
+        crate::compat::load_local_setting_value(key)
+            .and_then(|value| match value {
+                serde_yaml::Value::Number(number) => number.as_i64(),
+                serde_yaml::Value::String(raw) => raw.parse::<i64>().ok(),
+                _ => None,
+            })
+            .map(|limit| limit.max(0) as usize)
+            .or(default)
+    }
+    #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+    {
+        let _ = key;
+        default
+    }
 }
 
 pub fn sanitize_filename_with_limit(name: &str, limit: Option<usize>) -> String {

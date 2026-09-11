@@ -1,49 +1,95 @@
+#[cfg(feature = "native-runtime")]
 use chrono::{DateTime, Utc};
 
-use crate::error::Result;
+use crate::error::{NarouError, Result};
+use crate::platform::{HttpClient, HttpRequest, RateLimitScope, RateLimiter};
+#[cfg(feature = "native-runtime")]
+use crate::platform::NovelRepository;
 
-use super::fetch::HttpFetcher;
-use super::rate_limit::RateLimiter;
+use super::http_policy::{ensure_success_response, host_of};
+#[cfg(feature = "native-runtime")]
+use super::rate_limit::RateLimiter as NativeRateLimiter;
+use super::security::validate_public_url;
 
 const NAROU_API_DEFAULT_USER_AGENT: &str = "Narou RS";
 const NAROU_API_DEFAULT_INTERVAL_SECS: f64 = 1.0;
 
 /// User-Agent used for なろうAPI requests.
 /// Configured via the `download.narou-api.user-agent` local setting.
+/// Worker builds use the default (no local settings on the platform).
 pub fn narou_api_user_agent() -> String {
-    crate::compat::load_local_setting_string("download.narou-api.user-agent")
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| NAROU_API_DEFAULT_USER_AGENT.to_string())
+    #[cfg(feature = "native-runtime")]
+    {
+        crate::compat::load_local_setting_string("download.narou-api.user-agent")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| NAROU_API_DEFAULT_USER_AGENT.to_string())
+    }
+    #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+    {
+        NAROU_API_DEFAULT_USER_AGENT.to_string()
+    }
 }
 
 /// Minimum wait time (seconds) between なろうAPI requests.
 /// Configured via the `download.narou-api.interval` local setting.
+/// Worker builds use the default (no local settings on the platform).
 pub fn narou_api_interval_secs() -> f64 {
-    crate::compat::load_local_setting_value("download.narou-api.interval")
-        .and_then(|value| match value {
-            serde_yaml::Value::Number(number) => number.as_f64(),
-            serde_yaml::Value::String(raw) => raw.parse::<f64>().ok(),
-            _ => None,
-        })
-        .unwrap_or(NAROU_API_DEFAULT_INTERVAL_SECS)
-        .max(0.0)
+    #[cfg(feature = "native-runtime")]
+    {
+        crate::compat::load_local_setting_value("download.narou-api.interval")
+            .and_then(|value| match value {
+                serde_yaml::Value::Number(number) => number.as_f64(),
+                serde_yaml::Value::String(raw) => raw.parse::<f64>().ok(),
+                _ => None,
+            })
+            .unwrap_or(NAROU_API_DEFAULT_INTERVAL_SECS)
+            .max(0.0)
+    }
+    #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+    {
+        NAROU_API_DEFAULT_INTERVAL_SECS
+    }
 }
 
 /// Rate limiter dedicated to なろうAPI calls. Independent of the
 /// `download.interval` / `download.wait-steps` settings used by per-episode
-/// downloads.
-pub fn narou_api_rate_limiter() -> RateLimiter {
-    RateLimiter::with_settings(narou_api_interval_secs(), 0)
+/// downloads. Native-only: the concrete limiter is the native rate-limit
+/// implementation; Worker builds schedule batch updates with their own
+/// injected platform `RateLimiter`.
+#[cfg(feature = "native-runtime")]
+pub fn narou_api_rate_limiter() -> NativeRateLimiter {
+    NativeRateLimiter::with_settings(narou_api_interval_secs(), 0)
+}
+
+/// Fetch one なろうAPI JSON response: rate-limit with the dedicated API
+/// limiter, send with the API user-agent, and map non-success statuses to
+/// errors. The body is decoded as UTF-8 (the API always returns JSON).
+pub async fn fetch_narou_api_json(
+    http: &dyn HttpClient,
+    rate_limiter: &dyn RateLimiter,
+    url: &str,
+    user_agent: &str,
+) -> Result<String> {
+    validate_public_url(url).map_err(|e| NarouError::Http(e.to_string()))?;
+    rate_limiter
+        .acquire(&RateLimitScope::site(host_of(url)))
+        .await?;
+    let request = HttpRequest::get(url).with_header("User-Agent", user_agent);
+    let response = http.send(request).await?;
+    let response = ensure_success_response(url, response)?;
+    Ok(String::from_utf8_lossy(&response.body).into_owned())
 }
 
 /// Parse a date/time string from the Syosetu API.
 /// The API returns dates as `"YYYY-MM-DD HH:MM:SS"` (not RFC 3339).
+#[cfg(feature = "native-runtime")]
 fn parse_api_datetime(value: &str) -> Option<DateTime<Utc>> {
     super::parse_datetime_with_timezone(value, Some("Asia/Tokyo"))
 }
 
 /// Parse Syosetu API JSON response.
 /// The API returns a flat array: `[{"allcount":N}, {entry1}, {entry2}, ...]`.
+#[cfg(feature = "native-runtime")]
 fn parse_api_entries(body: &str) -> Vec<serde_json::Value> {
     let arr: Vec<serde_json::Value> = match serde_json::from_str(body) {
         Ok(a) => a,
@@ -56,16 +102,44 @@ fn parse_api_entries(body: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-pub fn narou_api_batch_update(fetcher: &mut HttpFetcher) -> Result<(usize, usize)> {
-    let narou_ids: Vec<(i64, String)> = crate::db::with_database(|db| {
-        Ok(db
-            .all_records()
-            .values()
-            .filter(|r| r.is_narou && r.ncode.is_some())
-            .filter_map(|r| r.ncode.as_ref().map(|nc| (r.id, nc.clone())))
-            .collect())
-    })
-    .unwrap_or_default();
+/// Batch-refresh なろうAPI metadata for all なろう records.
+///
+/// Native-only orchestration: it uses the native dedicated API rate limiter
+/// (`download.narou-api.*` settings). Worker builds schedule their own batch
+/// jobs with an injected platform `RateLimiter`; the portable request/parse
+/// helpers (`fetch_narou_api_json` and friends) remain available to both.
+#[cfg(feature = "native-runtime")]
+pub async fn narou_api_batch_update(
+    http: &dyn HttpClient,
+    novels: &dyn NovelRepository,
+) -> Result<(usize, usize)> {
+    // なろう対象の一覧を keyset scan で取得する (D1: `WHERE is_narou = 1
+    // AND ncode IS NOT NULL ORDER BY id LIMIT ?`)。`ncode` のないレコードは
+    // スキップしてからバッチ処理する。
+    let mut narou_ids: Vec<(i64, String)> = Vec::new();
+    let filter = crate::platform::NovelFilter {
+        is_narou: Some(true),
+        ..Default::default()
+    };
+    const SCAN_PAGE: usize = 500;
+    let mut after_id = None;
+    loop {
+        let page = novels.scan_ids(&filter, after_id, SCAN_PAGE).await?;
+        if page.is_empty() {
+            break;
+        }
+        for id in &page {
+            if let Some(record) = novels.get(*id).await? {
+                if let Some(ncode) = record.ncode {
+                    narou_ids.push((record.id, ncode));
+                }
+            }
+        }
+        after_id = page.last().copied();
+        if page.len() < SCAN_PAGE {
+            break;
+        }
+    }
 
     if narou_ids.is_empty() {
         return Ok((0, 0));
@@ -90,26 +164,8 @@ pub fn narou_api_batch_update(fetcher: &mut HttpFetcher) -> Result<(usize, usize
             api_url, ncode_param
         );
 
-        api_rate_limiter.wait_for_url(&url);
-        let response = match fetcher
-            .client
-            .get(&url)
-            .header(reqwest::header::USER_AGENT, &api_user_agent)
-            .send()
+        let body = match fetch_narou_api_json(http, &api_rate_limiter, &url, &api_user_agent).await
         {
-            Ok(r) => r,
-            Err(_e) => {
-                total_failed += chunk.len();
-                continue;
-            }
-        };
-
-        if !response.status().is_success() {
-            total_failed += chunk.len();
-            continue;
-        }
-
-        let body = match response.text() {
             Ok(b) => b,
             Err(_) => {
                 total_failed += chunk.len();
@@ -130,8 +186,8 @@ pub fn narou_api_batch_update(fetcher: &mut HttpFetcher) -> Result<(usize, usize
                 .find(|(_, nc)| nc.eq_ignore_ascii_case(entry_ncode))
                 .map(|(id, _)| *id)
             {
-                let updated = crate::db::with_database_mut(|db| {
-                    if let Some(record) = db.get(id).cloned() {
+                let updated = match novels.get(id.into()).await? {
+                    Some(record) => {
                         let mut r = record;
 
                         if let Some(s) = entry.get("title").and_then(|v| v.as_str()) {
@@ -164,13 +220,13 @@ pub fn narou_api_batch_update(fetcher: &mut HttpFetcher) -> Result<(usize, usize
                             r.novel_type = if nt == 2 { 2 } else { 1 };
                         }
 
-                        db.insert(r);
-                        Ok(true)
-                    } else {
-                        Ok(false)
+                        novels
+                            .apply_batch(vec![crate::platform::NovelMutation::Upsert(r)])
+                            .await?;
+                        true
                     }
-                })
-                .unwrap_or(false);
+                    None => false,
+                };
 
                 if updated {
                     total_updated += 1;
@@ -179,6 +235,5 @@ pub fn narou_api_batch_update(fetcher: &mut HttpFetcher) -> Result<(usize, usize
         }
     }
 
-    let _ = crate::db::with_database_mut(|db| db.save());
     Ok((total_updated, total_failed))
 }

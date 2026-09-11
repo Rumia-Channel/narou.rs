@@ -43,10 +43,13 @@ fn resolve_alias_target(target: &str) -> String {
 fn resolve_target_to_id(target: &str) -> Option<i64> {
     let target = resolve_alias_target(target);
     if let Ok(i) = target.parse::<i64>() {
-        return narou_rs::db::with_database(|db| Ok(db.get(i).map(|r| r.id)))
+        return narou_rs::native::novel_repository::NativeNovelRepository::new()
+            .get_sync(i.into())
             .ok()
-            .flatten();
+            .flatten()
+            .map(|r| r.id);
     }
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     match Downloader::get_target_type(&target) {
         TargetType::Url => {
             let site_settings = SiteSetting::load_all().ok()?;
@@ -54,33 +57,24 @@ fn resolve_target_to_id(target: &str) -> Option<i64> {
             let toc_url = setting
                 .toc_url_with_url_captures(&target)
                 .unwrap_or_else(|| setting.toc_url());
-            narou_rs::db::with_database(|db| Ok(db.get_by_toc_url(&toc_url).map(|r| r.id)))
+            novels
+                .find_by_toc_url_sync(&toc_url)
                 .ok()
                 .flatten()
+                .map(|r| r.id)
         }
-        TargetType::Ncode => {
-            let ncode = target.to_lowercase();
-            narou_rs::db::with_database(|db| {
-                Ok(db
-                    .all_records()
-                    .values()
-                    .find(|r| {
-                        r.ncode.as_deref() == Some(ncode.as_str())
-                            || r.toc_url
-                                .to_lowercase()
-                                .trim_end_matches('/')
-                                .ends_with(&format!("/{}", ncode))
-                    })
-                    .map(|r| r.id))
-            })
+        TargetType::Ncode => novels
+            .find_by_ncode_sync(&target)
             .ok()
             .flatten()
-        }
+            .map(|r| r.id),
         TargetType::Id => None,
         TargetType::Other => {
-            narou_rs::db::with_database(|db| Ok(db.find_by_title(&target).map(|r| r.id)))
+            novels
+                .find_by_title_sync(&target)
                 .ok()
                 .flatten()
+                .map(|r| r.id)
         }
     }
 }

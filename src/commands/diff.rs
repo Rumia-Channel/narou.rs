@@ -110,26 +110,36 @@ fn resolve_context(target: Option<&str>) -> std::result::Result<Option<NovelCont
                 return Err(format!("{} は存在しません", target));
             };
 
-            let context = db::with_database(|db| {
-                let record = db.get(data.id).cloned().ok_or_else(|| {
-                    narou_rs::error::NarouError::NotFound(format!("ID: {}", data.id))
-                })?;
-                Ok(NovelContext {
-                    record,
-                    archive_root: db.archive_root().to_path_buf(),
-                })
-            })
-            .map_err(|e| e.to_string())?;
-            Ok(Some(context))
+            let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+            let record = novels
+                .get_sync(data.id.into())
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("ID: {}", data.id))?;
+            let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+                .map_err(|e| e.to_string())?;
+            Ok(Some(NovelContext {
+                record,
+                archive_root,
+            }))
         }
-        None => db::with_database(|db| {
-            let latest = db.sort_by("last_update", true).into_iter().next().cloned();
+        None => {
+            let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+            let query = narou_rs::platform::NovelQuery::page(
+                narou_rs::platform::NovelFilter::all(),
+                narou_rs::platform::NovelSort::by(narou_rs::platform::NovelSortKey::LastUpdate),
+                0,
+                1,
+            );
+            let mut query = query;
+            query.sort.reverse = true;
+            let latest = novels.query_sync(&query).map_err(|e| e.to_string())?.into_iter().next();
+            let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+                .map_err(|e| e.to_string())?;
             Ok(latest.map(|record| NovelContext {
                 record,
-                archive_root: db.archive_root().to_path_buf(),
+                archive_root,
             }))
-        })
-        .map_err(|e| e.to_string()),
+        }
     }
 }
 
@@ -424,16 +434,16 @@ fn clean_diff(context: &NovelContext) -> std::result::Result<(), String> {
 }
 
 fn clean_all_diff() -> std::result::Result<(), String> {
-    let (records, archive_root) = db::with_database(|db| {
-        Ok((
-            db.sort_by("id", false)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>(),
-            db.archive_root().to_path_buf(),
-        ))
-    })
-    .map_err(|e| e.to_string())?;
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let query = narou_rs::platform::NovelQuery::page(
+        narou_rs::platform::NovelFilter::all(),
+        narou_rs::platform::NovelSort::by(narou_rs::platform::NovelSortKey::Id),
+        0,
+        usize::MAX,
+    );
+    let records = novels.query_sync(&query).map_err(|e| e.to_string())?;
+    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .map_err(|e| e.to_string())?;
 
     let frozen_ids = compat::load_frozen_ids().map_err(|e| e.to_string())?;
 

@@ -7,13 +7,13 @@ use std::time::Duration;
 
 use serde_yaml::Value;
 use tokio::task::JoinHandle;
-
 use super::push::PushServer;
-use super::sort_state::sort_ids_for_request;
+use super::sort_state::sort_ids_from_records;
+use crate::application::LibraryService;
 use crate::compat::{
     configure_web_subprocess_command, load_local_setting_bool, load_local_setting_string,
 };
-use crate::db::{with_database, with_database_mut};
+use crate::db::with_database_mut;
 use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
 use crate::queue::{
     extract_novel_ids, JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane,
@@ -77,6 +77,8 @@ pub fn start_queue_workers(
     root_dir: PathBuf,
     queue: Arc<PersistentQueue>,
     push_server: Arc<PushServer>,
+    library: Arc<LibraryService>,
+    site_updates: Arc<dyn crate::application::SiteUpdateCapabilityProvider>,
     running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
     running_child_pids: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
     cancelled_job_ids: Arc<parking_lot::Mutex<HashSet<String>>>,
@@ -95,6 +97,8 @@ pub fn start_queue_workers(
                 root_dir.clone(),
                 Arc::clone(&queue),
                 Arc::clone(&push_server),
+                Arc::clone(&library),
+                Arc::clone(&site_updates),
                 Arc::clone(&running_jobs),
                 Arc::clone(&running_child_pids),
                 Arc::clone(&cancelled_job_ids),
@@ -109,6 +113,8 @@ fn start_queue_worker_for_lane(
     root_dir: PathBuf,
     queue: Arc<PersistentQueue>,
     push_server: Arc<PushServer>,
+    library: Arc<LibraryService>,
+    site_updates: Arc<dyn crate::application::SiteUpdateCapabilityProvider>,
     running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
     running_child_pids: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
     cancelled_job_ids: Arc<parking_lot::Mutex<HashSet<String>>>,
@@ -133,15 +139,14 @@ fn start_queue_worker_for_lane(
                 }
                 continue;
             };
-
-            push_server.broadcast_event("queue_start", &job.id);
-
             let root_dir = root_dir.clone();
             let job_for_run = job.clone();
             let ps = Arc::clone(&push_server);
             let pid_ref = Arc::clone(&running_child_pids);
             let cancelled_ref = Arc::clone(&cancelled_job_ids);
             let queue_for_run = Arc::clone(&queue);
+            let library_for_run = Arc::clone(&library);
+            let site_updates_for_run = Arc::clone(&site_updates);
             let result = tokio::task::spawn_blocking(move || {
                 execute_job(
                     &root_dir,
@@ -150,6 +155,8 @@ fn start_queue_worker_for_lane(
                     &ps,
                     &pid_ref,
                     &cancelled_ref,
+                    library_for_run.as_ref(),
+                    site_updates_for_run.as_ref(),
                 )
             })
             .await
@@ -365,7 +372,6 @@ fn clear_progress_for_job(push_server: &Arc<PushServer>, job_id: &str) {
         }));
     }
 }
-
 fn execute_job(
     root_dir: &Path,
     queue: &PersistentQueue,
@@ -373,6 +379,8 @@ fn execute_job(
     push_server: &Arc<PushServer>,
     running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
     cancelled_job_ids: &Arc<parking_lot::Mutex<HashSet<String>>>,
+    library: &LibraryService,
+    site_updates: &dyn crate::application::SiteUpdateCapabilityProvider,
 ) -> JobRunResult {
     if matches!(job.job_type, JobType::AutoUpdate) {
         let success = crate::web::scheduler::execute_auto_update(
@@ -380,6 +388,8 @@ fn execute_job(
             Arc::clone(push_server),
             &job.id,
             Arc::clone(running_pids),
+            library,
+            site_updates,
         );
         return JobRunResult {
             outcome: if success {
@@ -415,6 +425,7 @@ fn execute_job(
             cancelled_job_ids,
             &job.id,
             target_console,
+            library,
         );
     }
 
@@ -704,6 +715,7 @@ fn execute_update_general_lastup_job(
     cancelled_job_ids: &Arc<parking_lot::Mutex<HashSet<String>>>,
     job_id: &str,
     target_console: &str,
+    library: &LibraryService,
 ) -> JobRunResult {
     let mut command = new_web_subprocess_command(exe, root_dir, job_id);
     command.arg("update").arg("--gl");
@@ -728,7 +740,7 @@ fn execute_update_general_lastup_job(
         target_console,
     );
 
-    let modified_ids = current_modified_update_target_ids();
+    let modified_ids = current_modified_update_target_ids(library);
     if modified_ids.is_empty() {
         push_server.broadcast_echo("modified タグの付いた小説はありません", target_console);
         return result;
@@ -772,16 +784,14 @@ fn append_update_by_tag_args(command: &mut std::process::Command, spec: &QueueEx
     }
 }
 
-fn current_modified_update_target_ids() -> Vec<String> {
-    let ids = with_database(|db| {
-        Ok(db
-            .tag_index()
-            .get("modified")
-            .map(|ids| ids.iter().copied().collect::<Vec<_>>())
-            .unwrap_or_default())
-    })
-    .unwrap_or_default();
-    sort_ids_for_request(&ids, None, None)
+fn current_modified_update_target_ids(library: &LibraryService) -> Vec<String> {
+    let records = futures::executor::block_on(library.records()).unwrap_or_default();
+    let ids = records
+        .iter()
+        .filter(|record| record.tags.iter().any(|tag| tag == "modified"))
+        .map(|record| record.id)
+        .collect::<Vec<_>>();
+    sort_ids_from_records(&ids, &records, None, None)
         .into_iter()
         .map(|id| id.to_string())
         .collect()
@@ -1126,7 +1136,7 @@ fn console_target_for_job(job_type: JobType) -> &'static str {
     match job_type {
         JobType::Download | JobType::Update | JobType::AutoUpdate => "stdout",
         JobType::Convert | JobType::Send | JobType::Backup | JobType::Mail => {
-            super::non_external_console_target()
+            crate::native::non_external_console_target()
         }
     }
 }
@@ -1256,19 +1266,19 @@ mod tests {
         assert_eq!(console_target_for_job(JobType::AutoUpdate), "stdout");
         assert_eq!(
             console_target_for_job(JobType::Convert),
-            crate::web::non_external_console_target()
+            crate::native::non_external_console_target()
         );
         assert_eq!(
             console_target_for_job(JobType::Send),
-            crate::web::non_external_console_target()
+            crate::native::non_external_console_target()
         );
         assert_eq!(
             console_target_for_job(JobType::Backup),
-            crate::web::non_external_console_target()
+            crate::native::non_external_console_target()
         );
         assert_eq!(
             console_target_for_job(JobType::Mail),
-            crate::web::non_external_console_target()
+            crate::native::non_external_console_target()
         );
     }
 

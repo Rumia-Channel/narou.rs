@@ -1,0 +1,50 @@
+name: Platform portability
+
+on:
+  push:
+    branches: [develop, refactor-platform-abstraction]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native check and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+      - run: cargo test --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets --all-features
+
+  wasm:
+    name: Portable wasm check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p narou_rs --target wasm32-unknown-unknown --no-default-features --features worker-runtime
+      - run: cargo check -p narou_worker --target wasm32-unknown-unknown
+
+  worker:
+    name: Worker release artifact
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker_entry
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install worker-build --version 0.8.5 --locked
+      - run: worker-build --release

@@ -1,5 +1,7 @@
+#[cfg(feature = "native-runtime")]
 use std::path::Path;
 
+#[cfg(feature = "native-runtime")]
 use crate::error::{NarouError, Result};
 
 pub fn strip_title_prefix(title: &str) -> &str {
@@ -34,14 +36,16 @@ pub fn project_title(raw_title: &str, strip_prefix: bool) -> String {
     }
 }
 
+/// Native-only: rewrites the stored record and renames generated output files
+/// on disk after a title-prefix setting change.
+#[cfg(feature = "native-runtime")]
 pub fn sync_title_projection(id: i64) -> Result<()> {
-    let (record, archive_root) = crate::db::with_database(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
-        Ok((record, db.archive_root().to_path_buf()))
-    })?;
+    let novels = crate::native::novel_repository::NativeNovelRepository::new();
+    let record = novels
+        .get_sync(id.into())?
+        .ok_or_else(|| NarouError::NotFound(format!("ID: {id}")))?;
+    let archive_root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .unwrap_or_else(|_| std::path::PathBuf::from(crate::downloader::ARCHIVE_ROOT_DIR));
     let previous_dir = crate::db::existing_novel_dir_for_record(&archive_root, &record);
     let raw_title = record.raw_title().to_string();
     let settings = crate::converter::settings::NovelSettings::load_for_novel(
@@ -59,21 +63,21 @@ pub fn sync_title_projection(id: i64) -> Result<()> {
     projected.title = display_title.clone();
     projected.set_raw_title(raw_title);
 
-    crate::db::with_database_mut(|db| {
-        db.insert(projected);
-        db.save()
-    })?;
+    novels.apply_batch_sync(vec![crate::platform::NovelMutation::Upsert(projected)])?;
     rename_projected_outputs(&previous_dir, &record.author, &record.title, &display_title)?;
 
-    if let Some(mut toc) = crate::downloader::persistence::load_toc_file(&previous_dir) {
+    if let Some(mut toc) = crate::native::legacy_persistence::load_toc_file(&previous_dir) {
         if toc.title != display_title {
             toc.title = display_title;
-            crate::downloader::persistence::save_toc_file(&previous_dir, &toc)?;
+            crate::native::legacy_persistence::save_toc_file(&previous_dir, &toc)?;
         }
     }
     Ok(())
 }
 
+/// Native-only: renames generated output files (txt/epub/mobi/kepub/zip)
+/// when the projected title changes. Worker builds have no generated files.
+#[cfg(feature = "native-runtime")]
 pub fn rename_projected_outputs(
     novel_dir: &Path,
     author: &str,
@@ -149,7 +153,7 @@ mod tests {
             "epub",
         )
         .unwrap();
-        crate::downloader::persistence::save_toc_file(
+        crate::native::legacy_persistence::save_toc_file(
             &raw_dir,
             &TocFile {
                 title: "【書籍化】作品名".to_string(),
@@ -202,7 +206,7 @@ last_update: 2026-04-20 00:00:00.000000000 +09:00
                 .join("[author] 【書籍化】作品名.epub")
                 .exists()
         );
-        let toc = crate::downloader::persistence::load_toc_file(&raw_dir).unwrap();
+        let toc = crate::native::legacy_persistence::load_toc_file(&raw_dir).unwrap();
         assert_eq!(toc.title, "作品名");
 
         std::fs::write(
@@ -218,7 +222,7 @@ last_update: 2026-04-20 00:00:00.000000000 +09:00
         assert!(raw_dir.exists());
         assert!(!projected_dir.exists());
         assert!(raw_dir.join("[author] 【書籍化】作品名.epub").exists());
-        let toc = crate::downloader::persistence::load_toc_file(&raw_dir).unwrap();
+        let toc = crate::native::legacy_persistence::load_toc_file(&raw_dir).unwrap();
         assert_eq!(toc.title, "【書籍化】作品名");
     }
 }

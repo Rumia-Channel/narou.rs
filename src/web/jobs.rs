@@ -9,8 +9,7 @@ use axum::{
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
-use crate::db::{with_database, with_database_mut};
-use crate::downloader::site_setting::SiteSetting;
+use crate::db::with_database_mut;
 use crate::downloader::types::{CACHE_SAVE_DIR, SECTION_SAVE_DIR, SectionFile};
 use crate::downloader::{Downloader, TargetType};
 use crate::queue::{
@@ -21,7 +20,7 @@ use crate::queue::{
 use super::AppState;
 use super::sort_state::{
     CurrentSortState, current_sort_from_server_setting, load_current_sort_state, request_sort_state,
-    sort_column_key, sort_column_label, sort_ids_for_request, sort_records,
+    sort_column_key, sort_column_label, sort_ids_from_records, sort_records,
 };
 use super::state::{
     ApiResponse, ConfirmRunningTasksBody, ConvertBody, CsvImportBody, DiffBody, DiffCleanBody,
@@ -65,8 +64,8 @@ fn tag_color_class(color: &str) -> &'static str {
     }
 }
 
-fn validate_download_targets(targets: &[String]) -> Result<(), String> {
-    if targets.len() > super::max_web_targets_per_request() {
+fn validate_download_targets(targets: &[String], max_targets: usize) -> Result<(), String> {
+    if targets.len() > max_targets {
         return Err("too many targets".to_string());
     }
     for target in targets {
@@ -111,17 +110,15 @@ fn log_web_failure(context: &str, error: impl std::fmt::Display) {
     eprintln!("web {} failed: {}", context, error);
 }
 
-fn log_immediate_command_failure(context: &str, output: &std::process::Output) {
+fn log_immediate_command_failure(
+    context: &str,
+    output: &crate::application::WebActionOutput,
+) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr.trim().is_empty() {
-        eprintln!("web {} failed with status {}", context, output.status);
+        eprintln!("web {} failed", context);
     } else {
-        eprintln!(
-            "web {} failed with status {}: {}",
-            context,
-            output.status,
-            stderr.trim()
-        );
+        eprintln!("web {} failed: {}", context, stderr.trim());
     }
 }
 
@@ -266,7 +263,7 @@ fn queue_lane_sizes(queue: &PersistentQueue) -> [usize; 2] {
     ]
 }
 
-fn sort_records_for_web_update(records: &mut Vec<&crate::db::NovelRecord>, sort_state: &CurrentSortState) {
+fn sort_records_for_web_update(records: &mut Vec<crate::db::NovelRecord>, sort_state: &CurrentSortState) {
     sort_records(records, sort_state);
 }
 
@@ -287,17 +284,15 @@ fn current_web_update_sort_key_for_cli() -> Option<&'static str> {
     web_update_sort_key_for_cli(&current_web_update_sort_state())
 }
 
-fn sorted_update_all_ids() -> Vec<String> {
+fn sorted_update_all_ids(mut records: Vec<crate::db::NovelRecord>) -> Vec<String> {
     let sort_state = current_web_update_sort_state();
-    with_database(|db| {
-        let mut records: Vec<_> = db.all_records().values().collect();
-        sort_records_for_web_update(&mut records, &sort_state);
-        Ok(records.into_iter().map(|record| record.id.to_string()).collect())
-    })
-    .unwrap_or_default()
+    sort_records_for_web_update(&mut records, &sort_state);
+    records.into_iter().map(|record| record.id.to_string()).collect()
 }
 
-fn sort_numeric_targets_for_request(
+
+async fn sort_numeric_targets_for_state(
+    state: &AppState,
     targets: &[String],
     sort_state: Option<&serde_json::Value>,
     timestamp: Option<u64>,
@@ -309,16 +304,16 @@ fn sort_numeric_targets_for_request(
     else {
         return targets.to_vec();
     };
-    let sorted_ids = sort_ids_for_request(&ids, sort_state, timestamp);
-    sorted_ids
+    let records = state.services.library.records().await.unwrap_or_default();
+    sort_ids_from_records(&ids, &records, sort_state, timestamp)
         .into_iter()
         .map(|id| id.to_string())
         .collect()
 }
-
 fn build_update_by_tag_queue_payload(
     tag_params: &[String],
     snapshot_ids: &[i64],
+
     sort_display: &str,
 ) -> (String, Vec<Value>, Mapping) {
     let target_args = snapshot_ids
@@ -379,8 +374,9 @@ fn queue_download_jobs(
     targets: &[String],
     force: bool,
     mail: bool,
+    max_targets: usize,
 ) -> Result<Vec<String>, String> {
-    validate_download_targets(targets)?;
+    validate_download_targets(targets, max_targets)?;
     let jobs: Vec<(JobType, String)> = targets
         .iter()
         .map(|target| {
@@ -398,43 +394,6 @@ fn queue_download_jobs(
     queue.push_batch(&jobs).map_err(|e| e.to_string())
 }
 
-fn resolve_existing_id_for_target(target: &str) -> Option<i64> {
-    match Downloader::get_target_type(target) {
-        TargetType::Id => {
-            let id = target.parse::<i64>().ok()?;
-            with_database(|db| Ok(db.get(id).map(|record| record.id)))
-                .ok()
-                .flatten()
-        }
-        TargetType::Url => {
-            let settings = SiteSetting::load_all().ok()?;
-            let setting = settings
-                .iter()
-                .find(|setting| setting.matches_url(target))?;
-            let toc_url = setting
-                .toc_url_with_url_captures(target)
-                .unwrap_or_else(|| setting.toc_url());
-            with_database(|db| Ok(db.get_by_toc_url(&toc_url).map(|record| record.id)))
-                .ok()
-                .flatten()
-        }
-        TargetType::Ncode => {
-            let ncode = target.to_lowercase();
-            with_database(|db| {
-                Ok(db
-                    .all_records()
-                    .values()
-                    .find(|record| record.ncode.as_deref() == Some(ncode.as_str()))
-                    .map(|record| record.id))
-            })
-            .ok()
-            .flatten()
-        }
-        _ => with_database(|db| Ok(db.find_by_title(target).map(|record| record.id)))
-            .ok()
-            .flatten(),
-    }
-}
 
 fn existing_update_job_id(
     queue: &PersistentQueue,
@@ -457,6 +416,48 @@ fn existing_update_job_id(
         .chain(queue.get_pending_tasks())
         .find(|job| update_job_matches_request(queue, job, target, legacy_cmd, update_modified))
         .map(|job| job.id)
+}
+async fn resolve_existing_id_for_target_with_library(
+    state: &AppState,
+    target: &str,
+) -> Option<i64> {
+    match Downloader::get_target_type(target) {
+        TargetType::Id => state
+            .services
+            .library
+            .get(target.parse::<i64>().ok()?.into())
+            .await
+            .ok()
+            .flatten()
+            .map(|record| record.id),
+        TargetType::Url => {
+            let toc_url = state.services.site_definitions.resolve_toc_url(target)?;
+            state
+                .services
+                .library
+                .find_by_toc_url(&toc_url)
+                .await
+                .ok()
+                .flatten()
+                .map(|record| record.id)
+        }
+        TargetType::Ncode => state
+            .services
+            .library
+            .find_by_ncode(target)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| record.id),
+        _ => state
+            .services
+            .library
+            .find_by_title(target)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| record.id),
+    }
 }
 
 fn push_update_job_if_needed(
@@ -630,16 +631,16 @@ fn read_sorted_section_files(dir: &PathBuf) -> Result<Vec<PathBuf>, String> {
     Ok(list)
 }
 
-fn render_diff_list_html_for_target(target: &str) -> String {
-    let Some(id) = resolve_existing_id_for_target(target) else {
+async fn render_diff_list_html_for_target(state: &AppState, target: &str) -> String {
+    let Some(id) = resolve_existing_id_for_target_with_library(state, target).await else {
         return String::new();
     };
-    let Ok((record, archive_root)) =
-        with_database(|db| Ok((db.get(id).cloned(), db.archive_root().to_path_buf())))
+    let Ok(Some(record)) = state.services.library.get(id.into()).await else {
+        return String::new();
+    };
+    let Ok(archive_root) =
+        crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
     else {
-        return String::new();
-    };
-    let Some(record) = record else {
         return String::new();
     };
 
@@ -703,13 +704,19 @@ fn gif_response() -> Response {
     )
         .into_response()
 }
-
 pub async fn api_download(
     State(state): State<AppState>,
     Json(body): Json<DownloadBody>,
 ) -> Json<serde_json::Value> {
+    let max_targets = super::max_web_targets_per_request(&state).await;
     let targets = body.targets;
-    let ids = match queue_download_jobs(state.queue.as_ref(), &targets, body.force, body.mail) {
+    let ids = match queue_download_jobs(
+        state.queue.as_ref(),
+        &targets,
+        body.force,
+        body.mail,
+        max_targets,
+    ) {
         Ok(ids) => ids,
         Err(message) => {
             return serde_json::json!({
@@ -738,7 +745,8 @@ pub async fn api_update(
     Json(body): Json<UpdateBody>,
 ) -> Json<serde_json::Value> {
     let raw_targets = targets_to_strings(&body.targets);
-    let targets = match normalize_update_targets(&raw_targets) {
+    let max_targets = super::max_web_targets_per_request(&state).await;
+    let targets = match normalize_update_targets(&raw_targets, max_targets) {
         Ok(targets) => targets,
         Err(message) => {
             return serde_json::json!({
@@ -763,9 +771,16 @@ pub async fn api_update(
         (targets.join("\t"), None)
     } else {
         let mut args = if is_update_all {
-            sorted_update_all_ids()
+            let records = state.services.library.records().await.unwrap_or_default();
+            sorted_update_all_ids(records)
         } else {
-            sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp)
+            sort_numeric_targets_for_state(
+                &state,
+                &targets,
+                body.sort_state.as_ref(),
+                body.timestamp,
+            )
+            .await
         };
         count = args.len();
         if count == 0 {
@@ -835,9 +850,8 @@ pub async fn api_update(
     })
     .into()
 }
-
-fn normalize_update_targets(targets: &[String]) -> Result<Vec<String>, String> {
-    if targets.len() > super::max_web_targets_per_request() {
+fn normalize_update_targets(targets: &[String], max_targets: usize) -> Result<Vec<String>, String> {
+    if targets.len() > max_targets {
         return Err("too many targets".to_string());
     }
     let mut normalized = Vec::with_capacity(targets.len());
@@ -873,7 +887,7 @@ pub async fn api_convert(
     State(state): State<AppState>,
     Json(body): Json<ConvertBody>,
 ) -> Json<serde_json::Value> {
-    if body.targets.len() > super::max_web_targets_per_request() {
+    if body.targets.len() > super::max_web_targets_per_request(&state).await {
         return serde_json::json!({
             "success": false,
             "message": "too many targets",
@@ -909,7 +923,8 @@ pub async fn api_convert(
         }
     };
     let ordered_targets =
-        sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp);
+        sort_numeric_targets_for_state(&state, &targets, body.sort_state.as_ref(), body.timestamp)
+            .await;
     let mut meta = Mapping::new();
     if let Some(device) = device.as_deref() {
         meta.insert(
@@ -1019,38 +1034,6 @@ fn encode_convert_job_target(targets: &[String]) -> String {
     targets.join("\t")
 }
 
-fn run_immediate_blocking(args: &[String]) -> Result<std::process::Output, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut command = std::process::Command::new(exe);
-    command
-        .args(args)
-        .current_dir(std::env::current_dir().unwrap_or_default())
-        .stdin(std::process::Stdio::null());
-    crate::compat::configure_web_subprocess_command(&mut command);
-    command.output().map_err(|e| e.to_string())
-}
-
-async fn run_immediate(args: Vec<String>) -> Result<std::process::Output, String> {
-    tokio::task::spawn_blocking(move || run_immediate_blocking(&args))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-pub(crate) async fn run_cli_and_broadcast(
-    state: &AppState,
-    args: Vec<String>,
-    target_console: &str,
-) -> Result<std::process::Output, String> {
-    let output = run_immediate(args).await?;
-    broadcast_captured_web_output(&state.push_server, &output.stdout, target_console);
-    broadcast_captured_web_output(&state.push_server, &output.stderr, target_console);
-    Ok(output)
-}
-
-fn csv_download_args() -> Vec<String> {
-    vec!["csv".to_string()]
-}
-
 fn broadcast_captured_web_output(
     push_server: &std::sync::Arc<super::push::PushServer>,
     output: &[u8],
@@ -1089,7 +1072,7 @@ pub async fn api_send(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::max_web_targets_per_request() {
+    if raw_targets.len() > super::max_web_targets_per_request(&state).await {
         return serde_json::json!({
             "success": false,
             "message": "too many targets",
@@ -1111,7 +1094,8 @@ pub async fn api_send(
         }
     };
     let ordered_targets =
-        sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp);
+        sort_numeric_targets_for_state(&state, &targets, body.sort_state.as_ref(), body.timestamp)
+            .await;
     let legacy_args = ordered_targets
         .iter()
         .cloned()
@@ -1149,7 +1133,7 @@ pub async fn api_inspect(
     Json(body): Json<TargetsBody>,
 ) -> Json<ApiResponse> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::max_web_targets_per_request() {
+    if raw_targets.len() > super::max_web_targets_per_request(&state).await {
         return Json(ApiResponse {
             success: false,
             message: "too many targets".to_string(),
@@ -1168,13 +1152,21 @@ pub async fn api_inspect(
             });
         }
     };
-    let mut args = vec!["inspect".to_string()];
-    args.extend(targets);
-    match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
+    match state.services.web_actions.inspect(&targets).await {
         Ok(output) => {
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                crate::native::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                crate::native::non_external_console_target(),
+            );
             Json(ApiResponse {
-                success: output.status.success(),
-                message: if output.status.success() {
+                success: output.success,
+                message: if output.success {
                     "OK".to_string()
                 } else {
                     log_immediate_command_failure("inspect", &output);
@@ -1198,7 +1190,7 @@ pub async fn api_folder(
     Json(body): Json<TargetsBody>,
 ) -> Json<ApiResponse> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::max_web_targets_per_request() {
+    if raw_targets.len() > super::max_web_targets_per_request(&state).await {
         return Json(ApiResponse {
             success: false,
             message: "too many targets".to_string(),
@@ -1217,13 +1209,21 @@ pub async fn api_folder(
             });
         }
     };
-    let mut args = vec!["folder".to_string()];
-    args.extend(targets);
-    match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
+    match state.services.web_actions.folder(&targets).await {
         Ok(output) => {
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                crate::native::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                crate::native::non_external_console_target(),
+            );
             Json(ApiResponse {
-                success: output.status.success(),
-                message: if output.status.success() {
+                success: output.success,
+                message: if output.success {
                     "OK".to_string()
                 } else {
                     log_immediate_command_failure("folder", &output);
@@ -1247,7 +1247,7 @@ pub async fn api_backup(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::max_web_targets_per_request() {
+    if raw_targets.len() > super::max_web_targets_per_request(&state).await {
         return serde_json::json!({
             "success": false,
             "message": "too many targets",
@@ -1269,7 +1269,8 @@ pub async fn api_backup(
         }
     };
     let ordered_targets =
-        sort_numeric_targets_for_request(&targets, body.sort_state.as_ref(), body.timestamp);
+        sort_numeric_targets_for_state(&state, &targets, body.sort_state.as_ref(), body.timestamp)
+            .await;
     let legacy_args = ordered_targets
         .iter()
         .cloned()
@@ -1335,7 +1336,7 @@ pub async fn api_mail(
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::max_web_targets_per_request() {
+    if raw_targets.len() > super::max_web_targets_per_request(&state).await {
         return serde_json::json!({
             "success": false,
             "message": "too many targets",
@@ -1383,7 +1384,7 @@ pub async fn api_setting_burn(
     Json(body): Json<TargetsBody>,
 ) -> Json<ApiResponse> {
     let raw_targets = targets_to_strings(&body.targets);
-    if raw_targets.len() > super::max_web_targets_per_request() {
+    if raw_targets.len() > super::max_web_targets_per_request(&state).await {
         return Json(ApiResponse {
             success: false,
             message: "too many targets".to_string(),
@@ -1402,13 +1403,21 @@ pub async fn api_setting_burn(
             });
         }
     };
-    let mut args = vec!["setting".to_string(), "--burn".to_string()];
-    args.extend(targets);
-    match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
+    match state.services.web_actions.setting_burn(&targets).await {
         Ok(output) => {
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                crate::native::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                crate::native::non_external_console_target(),
+            );
             Json(ApiResponse {
-                success: output.status.success(),
-                message: if output.status.success() {
+                success: output.success,
+                message: if output.success {
                     "設定を焼き込みました".to_string()
                 } else {
                     log_immediate_command_failure("setting --burn", &output);
@@ -1428,90 +1437,67 @@ pub async fn api_setting_burn(
 
 // POST /api/diff_list
 pub async fn api_diff_list(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<TargetsBody>,
 ) -> Json<serde_json::Value> {
     let targets = targets_to_strings(&body.targets);
-    if targets.len() > super::max_web_targets_per_request() {
+    if targets.len() > super::max_web_targets_per_request(&state).await {
         return serde_json::json!({ "error": "too many targets" }).into();
     }
     let mut diffs = Vec::new();
-
     for target in &targets {
         let id: i64 = match target.parse() {
             Ok(id) => id,
             Err(_) => continue,
         };
-
-        let result = with_database(|db| {
-            let record = db.get(id).cloned();
-            let archive_root = db.archive_root().to_path_buf();
-            Ok((record, archive_root))
-        });
-
-        let (record, archive_root) = match result {
-            Ok((Some(record), root)) => (record, root),
-            _ => {
-                diffs.push(serde_json::json!({
-                    "id": id,
-                    "title": format!("ID: {}", id),
-                    "content": "Novel not found",
-                }));
-                continue;
+        let record = state.services.library.get(id.into()).await.ok().flatten();
+        let Some(record) = record else {
+            diffs.push(serde_json::json!({
+                "id": id,
+                "title": format!("ID: {}", id),
+                "content": "Novel not found",
+            }));
+            continue;
+        };
+        let content = match state.services.content.diff(id.into()).await {
+            Ok(Some(bytes)) => {
+                String::from_utf8(bytes).unwrap_or_else(|_| "読み取りエラー".to_string())
             }
+            Ok(None) => "No diff".to_string(),
+            Err(_) => "読み取りエラー".to_string(),
         };
-
-        let novel_dir = match super::safe_existing_novel_dir(&archive_root, &record) {
-            Ok(dir) => dir,
-            Err(_) => {
-                diffs.push(serde_json::json!({
-                    "id": id,
-                    "title": record.title,
-                    "content": "Invalid novel storage path",
-                }));
-                continue;
-            }
-        };
-        let diff_path = novel_dir.join("diff.txt");
-
-        let content = if diff_path.exists() {
-            std::fs::read_to_string(&diff_path).unwrap_or_else(|_| "読み取りエラー".to_string())
-        } else {
-            "No diff".to_string()
-        };
-
         diffs.push(serde_json::json!({
             "id": id,
             "title": record.title,
             "content": content,
         }));
     }
-
     serde_json::json!({ "diffs": diffs }).into()
 }
 
 // GET /api/diff_list
 pub async fn api_diff_list_get(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(params): Query<DiffListQuery>,
 ) -> Html<String> {
-    Html(
-        params
-            .target
-            .as_deref()
-            .map(render_diff_list_html_for_target)
-            .unwrap_or_default(),
-    )
+    let html = match params.target.as_deref() {
+        Some(target) => render_diff_list_html_for_target(&state, target).await,
+        None => String::new(),
+    };
+    Html(html)
 }
 
 // GET /api/downloadable.gif
 pub async fn api_downloadable_gif(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(params): Query<BookmarkletDownloadQuery>,
 ) -> Response {
     let _number = match params.target.as_deref() {
         Some(target) if !target.trim().is_empty() => {
-            if resolve_existing_id_for_target(target).is_some() {
+            if resolve_existing_id_for_target_with_library(&state, target)
+                .await
+                .is_some()
+            {
                 1
             } else {
                 0
@@ -1536,7 +1522,7 @@ pub async fn api_diff(
             });
         }
     };
-    if body.ids.len() > super::max_web_targets_per_request() {
+    if body.ids.len() > super::max_web_targets_per_request(&state).await {
         return Json(ApiResponse {
             success: false,
             message: "too many ids".to_string(),
@@ -1563,16 +1549,19 @@ pub async fn api_diff(
     };
 
     for id in &ids {
-        let args = vec![
-            "diff".to_string(),
-            "--no-tool".to_string(),
-            id.clone(),
-            "--number".to_string(),
-            diff_number.clone(),
-        ];
-        match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
+        match state.services.web_actions.diff(id, &diff_number).await {
             Ok(output) => {
-                if !output.status.success() {
+                broadcast_captured_web_output(
+                    &state.push_server,
+                    &output.stdout,
+                    crate::native::non_external_console_target(),
+                );
+                broadcast_captured_web_output(
+                    &state.push_server,
+                    &output.stderr,
+                    crate::native::non_external_console_target(),
+                );
+                if !output.success {
                     log_immediate_command_failure("diff", &output);
                     return Json(ApiResponse {
                         success: false,
@@ -1584,7 +1573,7 @@ pub async fn api_diff(
                 log_web_failure("diff", &e);
                 state.push_server.broadcast_echo(
                     &format!("diff error: {}", e),
-                    super::non_external_console_target(),
+                    crate::native::non_external_console_target(),
                 );
                 return Json(ApiResponse {
                     success: false,
@@ -1621,12 +1610,21 @@ pub async fn api_diff_clean(
         }
     };
 
-    let args = vec!["diff".to_string(), "--clean".to_string(), target.clone()];
-    match run_cli_and_broadcast(&state, args, super::non_external_console_target()).await {
+    match state.services.web_actions.diff_clean(&target).await {
         Ok(output) => {
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                crate::native::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                crate::native::non_external_console_target(),
+            );
             Json(ApiResponse {
-                success: output.status.success(),
-                message: if output.status.success() {
+                success: output.success,
+                message: if output.success {
                     format!("Diff cleaned for {}", target)
                 } else {
                     log_immediate_command_failure("diff --clean", &output);
@@ -1657,47 +1655,19 @@ pub async fn api_csv_import(
             message,
         });
     }
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => {
-            log_web_failure("csv import", &e);
-            return Json(ApiResponse {
-                success: false,
-                message: "CSVインポートに失敗しました".to_string(),
-            });
-        }
-    };
-
-    let mut command = std::process::Command::new(exe);
-    command
-        .args(["csv", "--import", "-"])
-        .current_dir(std::env::current_dir().unwrap_or_default())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    crate::compat::configure_web_subprocess_command(&mut command);
-    let result = command.spawn().and_then(|mut child| {
-        use std::io::Write;
-        if let Some(ref mut stdin) = child.stdin {
-            let _ = stdin.write_all(body.csv.as_bytes());
-        }
-        drop(child.stdin.take());
-        child.wait_with_output()
-    });
-
-    match result {
+    match state.services.web_actions.csv_import(&body.csv).await {
         Ok(output) => {
             broadcast_captured_web_output(
                 &state.push_server,
                 &output.stdout,
-                super::non_external_console_target(),
+                crate::native::non_external_console_target(),
             );
             broadcast_captured_web_output(
                 &state.push_server,
                 &output.stderr,
-                super::non_external_console_target(),
+                crate::native::non_external_console_target(),
             );
-            if output.status.success() {
+            if output.success {
                 match with_database_mut(|db| db.refresh()) {
                     Ok(()) => {
                         state.push_server.broadcast_event("table.reload", "");
@@ -1736,11 +1706,11 @@ pub async fn api_csv_import(
 }
 
 // GET /api/csv/download
-pub async fn api_csv_download(State(_state): State<AppState>) -> axum::response::Response {
+pub async fn api_csv_download(State(state): State<AppState>) -> axum::response::Response {
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
 
-    let output = match run_immediate(csv_download_args()).await {
+    let output = match state.services.web_actions.csv_download().await {
         Ok(output) => output,
         Err(e) => {
             log_web_failure("csv download", &e);
@@ -1752,7 +1722,7 @@ pub async fn api_csv_download(State(_state): State<AppState>) -> axum::response:
         }
     };
 
-    if !output.status.success() {
+    if !output.success {
         log_immediate_command_failure("csv download", &output);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1991,35 +1961,23 @@ pub async fn api_update_by_tag(
     // Snapshot current matching novel IDs before queuing, then run through the
     // same update worker path used by normal selected-ID updates.
     let server_sort_state = current_web_update_sort_state();
-    let snapshot_ids = with_database(|db| {
-        let all = db.all_records();
-        let mut matching: Vec<&crate::db::NovelRecord> = Vec::new();
-
-        for (_id, record) in all {
-            let record_tags: Vec<&str> = record.tags.iter().map(|s| s.as_str()).collect();
-            let mut include = false;
-            let mut exclude = false;
-
-            for tag in &tags {
-                if record_tags.contains(&tag.as_str()) {
-                    include = true;
-                }
-            }
-            for tag in &exclusion_tags {
-                if record_tags.contains(&tag.as_str()) {
-                    exclude = true;
-                }
-            }
-
-            // Include if matches any inclusion tag and no exclusion tag
-            if (tags.is_empty() || include) && !exclude {
-                matching.push(record);
-            }
-        }
+    let records = state.services.library.records().await.unwrap_or_default();
+    let snapshot_ids: Vec<i64> = {
+        let mut matching = records
+            .into_iter()
+            .filter(|record| {
+                let include = tags
+                    .iter()
+                    .any(|tag| record.tags.iter().any(|value| value == tag));
+                let exclude = exclusion_tags
+                    .iter()
+                    .any(|tag| record.tags.iter().any(|value| value == tag));
+                (tags.is_empty() || include) && !exclude
+            })
+            .collect::<Vec<_>>();
         sort_records_for_web_update(&mut matching, &server_sort_state);
-        Ok(matching.into_iter().map(|r| r.id).collect::<Vec<i64>>())
-    })
-    .unwrap_or_default();
+        matching.into_iter().map(|record| record.id).collect()
+    };
 
     let count = snapshot_ids.len();
     if snapshot_ids.is_empty() {
@@ -2065,7 +2023,7 @@ pub async fn api_update_by_tag(
 
 // POST /api/taginfo.json — return tag information for update-by-tag dialog
 pub async fn api_taginfo(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<TagInfoBody>,
 ) -> Json<serde_json::Value> {
     let with_exclusion = body.with_exclusion.unwrap_or(false);
@@ -2078,65 +2036,66 @@ pub async fn api_taginfo(
             _ => None,
         })
         .collect();
-    let selected_ids = sort_ids_for_request(&selected_ids, body.sort_state.as_ref(), body.timestamp);
-
-    let new_tag_color = crate::tag_colors::configured_new_tag_color();
-    let tag_info = with_database(|db| {
-        let tag_index = db.tag_index();
-        let inventory = db.inventory();
-        let mut tag_colors = crate::tag_colors::load_tag_colors(inventory)?;
-        let tag_names = tag_index.keys().map(String::as_str);
-        if crate::tag_colors::ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            tag_names,
-            new_tag_color.as_deref(),
-        ) {
-            crate::tag_colors::save_tag_colors(inventory, &tag_colors)?;
+    let records = state.services.library.records().await.unwrap_or_default();
+    let selected_ids = sort_ids_from_records(
+        &selected_ids,
+        &records,
+        body.sort_state.as_ref(),
+        body.timestamp,
+    );
+    let new_tag_color = super::configured_tag_color(&state).await;
+    let mut tag_index: std::collections::HashMap<String, Vec<i64>> =
+        std::collections::HashMap::new();
+    let mut record_tags: std::collections::HashMap<i64, Vec<String>> =
+        std::collections::HashMap::new();
+    for record in &records {
+        record_tags.insert(record.id, record.tags.clone());
+        for tag in &record.tags {
+            tag_index.entry(tag.clone()).or_default().push(record.id);
         }
-        let tag_colors = tag_colors.into_map();
-
-        let mut selected_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for id in selected_ids.iter().copied() {
-            let Some(record) = db.get(id) else {
-                continue;
-            };
-            for tag in &record.tags {
+    }
+    let tag_names = tag_index.keys().cloned().collect::<Vec<_>>();
+    let tag_colors = state
+        .services
+        .tag_colors
+        .for_tags(tag_names, new_tag_color.as_deref())
+        .await
+        .unwrap_or_default();
+    let mut selected_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for id in selected_ids.iter().copied() {
+        if let Some(tags) = record_tags.get(&id) {
+            for tag in tags {
                 *selected_counts.entry(tag.clone()).or_insert(0) += 1;
             }
         }
+    }
 
-        let mut sorted_tags: Vec<(&String, &Vec<i64>)> = tag_index.iter().collect();
-        sorted_tags.sort_by(|a, b| a.0.cmp(b.0));
-
-        let mut result: Vec<serde_json::Value> = Vec::with_capacity(sorted_tags.len());
-        for (tag, ids) in sorted_tags {
-            let color = tag_colors.get(tag).map(|c| c.as_str()).unwrap_or("");
-            let class = tag_color_class(color);
-            let escaped_tag = html_escape(tag);
-            let html = format!(
-                "<span class=\"tag-label {}\">{}</span>",
+    let mut sorted_tags: Vec<(&String, &Vec<i64>)> = tag_index.iter().collect();
+    sorted_tags.sort_by(|a, b| a.0.cmp(b.0));
+    let mut tag_info = Vec::with_capacity(sorted_tags.len());
+    for (tag, tag_ids) in sorted_tags {
+        let color = tag_colors.get(tag).map(|c| c.as_str()).unwrap_or("");
+        let class = tag_color_class(color);
+        let escaped_tag = html_escape(tag);
+        let html = format!(
+            "<span class=\"tag-label {}\">{}</span>",
+            class, escaped_tag
+        );
+        let mut entry = serde_json::json!({
+            "tag": tag,
+            "count": selected_counts.get(tag.as_str()).copied().unwrap_or(0),
+            "total_count": tag_ids.len(),
+            "html": html,
+        });
+        if with_exclusion {
+            entry["exclusion_html"] = serde_json::json!(format!(
+                "<span class=\"tag-label {} tag-exclusion\">{}</span>",
                 class, escaped_tag
-            );
-            let mut entry = serde_json::json!({
-                "tag": tag,
-                "count": selected_counts.get(tag.as_str()).copied().unwrap_or(0),
-                "total_count": ids.len(),
-                "html": html,
-            });
-            if with_exclusion {
-                let exc_html = format!(
-                    "<span class=\"tag-label {} tag-exclusion\">{}</span>",
-                    class, escaped_tag
-                );
-                entry["exclusion_html"] = serde_json::json!(exc_html);
-            }
-            result.push(entry);
+            ));
         }
-        Ok(result)
-    })
-    .unwrap_or_default();
-
+        tag_info.push(entry);
+    }
     Json(serde_json::json!(tag_info))
 }
 
@@ -2411,7 +2370,7 @@ mod tests {
         broadcast_captured_web_output, build_update_by_tag_queue_payload,
         build_update_general_lastup_meta, build_update_start_message_meta,
         build_webui_update_start_message, encode_convert_job_target, existing_update_job_id,
-        csv_download_args, format_general_lastup_queue_target, format_queue_job_type,
+        format_general_lastup_queue_target, format_queue_job_type,
         format_update_queue_target, normalize_update_targets, push_update_job_if_needed,
         push_update_job_with_legacy_if_needed, queue_lane_sizes, reboot_args_with_no_browser,
         restorable_tasks_available,
@@ -2462,10 +2421,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn csv_download_uses_cli_csv_command() {
-        assert_eq!(csv_download_args(), vec!["csv".to_string()]);
-    }
 
     #[test]
     fn push_update_job_if_needed_reuses_pending_update_job() {
@@ -2565,7 +2520,7 @@ mod tests {
             column: 2,
             dir: "desc".to_string(),
         };
-        let mut records = vec![&first, &second, &third];
+        let mut records = vec![first.clone(), second.clone(), third.clone()];
 
         sort_records_for_web_update(&mut records, &sort_state);
 
@@ -2644,11 +2599,22 @@ mod tests {
     #[test]
     fn validate_download_targets_rejects_flag_like_values() {
         assert!(
-            validate_download_targets(&["1".to_string(), "https://example.com".to_string()])
+            validate_download_targets(
+                &["1".to_string(), "https://example.com".to_string()],
+                crate::web::MAX_WEB_TARGETS_PER_REQUEST,
+            )
                 .is_ok()
         );
-        assert!(validate_download_targets(&["--remove".to_string()]).is_err());
-        assert!(validate_download_targets(&["1\t2".to_string()]).is_err());
+        assert!(validate_download_targets(
+            &["--remove".to_string()],
+            crate::web::MAX_WEB_TARGETS_PER_REQUEST
+        )
+        .is_err());
+        assert!(validate_download_targets(
+            &["1\t2".to_string()],
+            crate::web::MAX_WEB_TARGETS_PER_REQUEST
+        )
+        .is_err());
     }
 
     #[test]
@@ -2863,20 +2829,40 @@ mod tests {
     #[test]
     fn normalize_update_targets_converts_tag_flag() {
         let normalized =
-            normalize_update_targets(&["--tag".to_string(), "modified".to_string()]).unwrap();
+            normalize_update_targets(
+                &["--tag".to_string(), "modified".to_string()],
+                crate::web::MAX_WEB_TARGETS_PER_REQUEST,
+            )
+            .unwrap();
         assert_eq!(normalized, vec!["tag:modified"]);
     }
 
     #[test]
     fn normalize_update_targets_rejects_missing_tag_name() {
-        assert!(normalize_update_targets(&["--tag".to_string()]).is_err());
-        assert!(normalize_update_targets(&["--tag".to_string(), "--gl".to_string()]).is_err());
+        assert!(normalize_update_targets(
+            &["--tag".to_string()],
+            crate::web::MAX_WEB_TARGETS_PER_REQUEST
+        )
+        .is_err());
+        assert!(normalize_update_targets(
+            &["--tag".to_string(), "--gl".to_string()],
+            crate::web::MAX_WEB_TARGETS_PER_REQUEST
+        )
+        .is_err());
     }
 
     #[test]
     fn normalize_update_targets_rejects_unexpected_flags() {
-        assert!(normalize_update_targets(&["--remove".to_string()]).is_err());
-        assert!(normalize_update_targets(&["bad\ttarget".to_string()]).is_err());
+        assert!(normalize_update_targets(
+            &["--remove".to_string()],
+            crate::web::MAX_WEB_TARGETS_PER_REQUEST
+        )
+        .is_err());
+        assert!(normalize_update_targets(
+            &["bad\ttarget".to_string()],
+            crate::web::MAX_WEB_TARGETS_PER_REQUEST
+        )
+        .is_err());
     }
 
     #[test]
@@ -2893,6 +2879,9 @@ mod tests {
             port: 0,
             ws_port: 0,
             push_server: Arc::new(crate::web::push::PushServer::new()),
+            services: crate::web::default_app_services(Arc::new(
+                crate::platform::mocks::MemoryNovelRepository::new(),
+            )),
             basic_auth_header: None,
             control_token: "control-token".to_string(),
             allowed_request_hosts: vec!["localhost".to_string()],

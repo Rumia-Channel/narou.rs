@@ -1,21 +1,27 @@
-pub mod fetch;
 pub mod html;
+pub mod http_policy;
+#[cfg(feature = "native-runtime")]
 pub mod info_cache;
 pub mod narou_api;
 pub mod novel_info;
 pub mod persistence;
 pub mod preprocess;
+#[cfg(feature = "native-runtime")]
 pub mod rate_limit;
-pub mod security;
 pub mod section;
+pub mod security;
+pub mod settings;
 pub mod site_setting;
 pub mod toc;
 pub mod types;
 pub mod util;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+#[cfg(feature = "native-runtime")]
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::{
     DateTime, Datelike, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc,
@@ -23,27 +29,27 @@ use chrono::{
 use chrono_tz::Tz;
 use regex::Regex;
 
-use crate::db::DATABASE;
-use crate::db::novel_record::NovelRecord;
-use crate::error::{NarouError, Result};
-use crate::progress::ProgressReporter;
-use crate::termcolor::bold_colored;
-
-use self::fetch::HttpFetcher;
+#[cfg(feature = "native-runtime")]
 use self::narou_api::narou_api_batch_update;
 use self::novel_info::NovelInfo;
-use self::persistence::{
-    compute_section_hash, ensure_default_files, load_section_file, load_toc_file, move_file_to_dir,
-    remove_dir_if_empty, save_raw_file, save_section_file, save_toc_file, section_filename,
-};
+use self::persistence::section_filename;
+use self::persistence::{PersistenceService, compute_section_hash};
 use self::section::{SectionCache, download_section};
-use self::site_setting::SiteSetting;
-use crate::progress::safe_println as safe_println_fn;
-use self::toc::{create_short_story_subtitles, fetch_toc, parse_subtitles, parse_subtitles_multipage};
 use self::security::is_safe_public_url;
+use self::settings::DownloaderSettings;
+use self::site_setting::SiteSetting;
+use self::toc::{
+    create_short_story_subtitles, fetch_toc, parse_subtitles, parse_subtitles_multipage,
+};
 use self::util::{
     build_section_url, compile_html_pattern, load_length_limit, mask_spoiler_text,
     sanitize_filename_with_limit,
+};
+use crate::db::novel_record::NovelRecord;
+use crate::error::{NarouError, Result};
+use crate::platform::{
+    AssetStore, Clock, HttpClient, NovelMutation, NovelObjectKeys, NovelRepository, ObjectStore,
+    ProgressReporter, RateLimiter,
 };
 
 pub use self::types::{
@@ -53,8 +59,28 @@ pub use self::types::{
 };
 pub use self::util::pretreatment_source;
 
-const SECTION_HASH_CACHE_NAME: &str = "section_hash_cache";
+#[cfg(feature = "native-runtime")]
+pub(crate) const SECTION_HASH_CACHE_NAME: &str = "section_hash_cache";
 const DEFAULT_SITE_TIMEZONE: &str = "Asia/Tokyo";
+
+/// A platform-neutral budget checked only at safe section boundaries.
+///
+/// Implementations must be cheap and side-effect free: the downloader calls
+/// this before starting the next section, never while a section is in flight.
+pub trait SectionBudget: Send {
+    fn should_yield(&mut self, next_section_index: usize) -> bool;
+}
+
+/// Execution options for a resumable download.
+///
+/// `resume_from_section` identifies the first section that still needs
+/// network work. The downloader restores every preceding persisted section
+/// from the object store before fetching anything after that boundary.
+pub struct DownloadExecutionOptions<'a> {
+    pub force: bool,
+    pub budget: Option<&'a mut dyn SectionBudget>,
+    pub resume_from_section: Option<usize>,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum SiteTimezone {
@@ -93,21 +119,57 @@ impl SiteTimezone {
         }
     }
 
-    pub(crate) fn local_naive_datetime(self, dt: DateTime<Utc>) -> NaiveDateTime {
-        match self {
-            Self::Named(tz) => dt.with_timezone(&tz).naive_local(),
-            Self::Fixed(offset) => dt.with_timezone(&offset).naive_local(),
-        }
-    }
 }
 
 pub struct Downloader {
-    fetcher: HttpFetcher,
+    http: Arc<dyn HttpClient>,
+    rate_limiter: Arc<dyn RateLimiter>,
+    novels: Arc<dyn NovelRepository>,
+    assets: Arc<dyn AssetStore>,
+    clock: Arc<dyn Clock>,
+    persistence: PersistenceService,
     site_settings: Vec<SiteSetting>,
     section_cache: SectionCache,
     section_hash_cache: HashMap<String, HashMap<String, String>>,
     section_hash_cache_dirty: bool,
+    settings: Arc<dyn DownloaderSettings>,
     progress: Option<Box<dyn ProgressReporter>>,
+}
+
+/// Report a status line. Native prints to stdout atomically; Worker routes to
+/// the trace log (no terminal on the platform).
+#[cfg(feature = "native-runtime")]
+fn report_line(line: &str) {
+    crate::progress::safe_println(line);
+}
+
+#[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+fn report_line(line: &str) {
+    tracing::debug!("{line}");
+}
+
+/// Report a warning line. Native prints to stderr; Worker routes to the trace
+/// log.
+#[cfg(feature = "native-runtime")]
+fn report_warn(line: &str) {
+    crate::progress::safe_stderr_println(line);
+}
+
+#[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+fn report_warn(line: &str) {
+    tracing::warn!("{line}");
+}
+
+/// Bold-colored text. Native renders terminal/Web colors; Worker keeps the
+/// plain text so messages are not lost.
+#[cfg(feature = "native-runtime")]
+fn colorize(text: &str, color: &str) -> String {
+    crate::termcolor::bold_colored(text, color)
+}
+
+#[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+fn colorize(text: &str, _color: &str) -> String {
+    text.to_string()
 }
 
 fn ncode_target_url(target: &str) -> Option<String> {
@@ -146,50 +208,6 @@ fn normalize_story_for_compare(story: &str) -> String {
         .to_string()
 }
 
-fn load_local_setting_bool(key: &str) -> bool {
-    crate::compat::load_local_setting_bool(key)
-}
-
-fn load_local_setting_string(key: &str) -> Option<String> {
-    crate::compat::load_local_setting_string(key)
-}
-
-fn load_global_setting_optional_bool(key: &str) -> Option<bool> {
-    crate::db::with_database(|db| {
-        let settings: HashMap<String, serde_yaml::Value> = db.inventory().load(
-            "global_setting",
-            crate::db::inventory::InventoryScope::Global,
-        )?;
-        Ok(settings.get(key).and_then(|value| match value {
-            serde_yaml::Value::Bool(v) => Some(*v),
-            serde_yaml::Value::String(v) => Some(matches!(v.as_str(), "true" | "yes" | "on" | "1")),
-            serde_yaml::Value::Number(v) => Some(v.as_i64().unwrap_or(0) != 0),
-            _ => None,
-        }))
-    })
-    .ok()
-    .flatten()
-}
-
-fn save_global_setting_bool(key: &str, value: bool) -> Result<()> {
-    crate::db::with_database_mut(|db| {
-        let mut settings: HashMap<String, serde_yaml::Value> = db
-            .inventory()
-            .load(
-                "global_setting",
-                crate::db::inventory::InventoryScope::Global,
-            )
-            .unwrap_or_default();
-        settings.insert(key.to_string(), serde_yaml::Value::Bool(value));
-        db.inventory().save(
-            "global_setting",
-            crate::db::inventory::InventoryScope::Global,
-            &settings,
-        )?;
-        Ok(())
-    })
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Over18AccessDecision {
     Allow,
@@ -220,7 +238,11 @@ fn over18_access_decision(
     }
 }
 
-fn toc_title_for_type_inference(setting: &SiteSetting, toc_source: &str, info: &NovelInfo) -> String {
+fn toc_title_for_type_inference(
+    setting: &SiteSetting,
+    toc_source: &str,
+    info: &NovelInfo,
+) -> String {
     info.title
         .clone()
         .or_else(|| setting.resolve_info_pattern("t", toc_source))
@@ -279,43 +301,26 @@ fn resolve_novel_type(
 }
 
 fn section_relative_path(subtitle: &SubtitleInfo) -> String {
-    PathBuf::from(types::SECTION_SAVE_DIR)
-        .join(section_filename(subtitle))
-        .to_string_lossy()
-        .to_string()
+    format!("{}/{}", types::SECTION_SAVE_DIR, section_filename(subtitle))
 }
 
-fn create_cache_dir(section_dir: &Path) -> Result<Option<PathBuf>> {
-    if crate::compat::load_local_setting_list("economy")
-        .iter()
-        .any(|v| v == "nosave_diff")
+fn cache_timestamp(clock: &dyn Clock) -> Option<String> {
+    #[cfg(feature = "native-runtime")]
     {
-        return Ok(None);
+        if crate::compat::load_local_setting_list("economy")
+            .iter()
+            .any(|v| v == "nosave_diff")
+        {
+            return None;
+        }
     }
-    let cache_dir = section_dir
-        .join(types::CACHE_SAVE_DIR)
-        .join(chrono::Local::now().format("%Y.%m.%d@%H.%M.%S").to_string());
-    std::fs::create_dir_all(&cache_dir)?;
-    Ok(Some(cache_dir))
-}
-
-fn move_to_cache_dir(
-    section_dir: &Path,
-    cache_dir: Option<&Path>,
-    subtitle: &SubtitleInfo,
-) -> Result<()> {
-    let Some(cache_dir) = cache_dir else {
-        return Ok(());
-    };
-    let path = section_dir.join(section_filename(subtitle));
-    move_file_to_dir(&path, cache_dir)
-}
-
-fn remove_cache_dir_if_empty(cache_dir: Option<&Path>) -> Result<()> {
-    if let Some(cache_dir) = cache_dir {
-        remove_dir_if_empty(cache_dir)?;
-    }
-    Ok(())
+    Some(
+        clock
+            .now_utc()
+            .with_timezone(&chrono::Local)
+            .format("%Y.%m.%d@%H.%M.%S")
+            .to_string(),
+    )
 }
 
 fn sections_latest_update_time_with_timezone(
@@ -422,9 +427,22 @@ pub(crate) fn site_timezone(timezone: Option<&str>) -> SiteTimezone {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .or_else(|| load_local_setting_string("time-zone"))
+        .or_else(local_timezone_setting)
         .unwrap_or_else(|| DEFAULT_SITE_TIMEZONE.to_string());
     parse_site_timezone(&configured).unwrap_or_else(default_site_timezone)
+}
+
+/// `time-zone` local setting override (`.narou/local_setting.yaml`).
+#[cfg(feature = "native-runtime")]
+fn local_timezone_setting() -> Option<String> {
+    crate::compat::load_local_setting_string("time-zone")
+}
+
+/// Worker builds have no local settings; the site's own timezone default
+/// applies.
+#[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+fn local_timezone_setting() -> Option<String> {
+    None
 }
 
 fn default_site_timezone() -> SiteTimezone {
@@ -467,14 +485,18 @@ fn parse_site_timezone(value: &str) -> Option<SiteTimezone> {
     FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60)).map(SiteTimezone::Fixed)
 }
 
-pub fn parse_datetime_with_timezone(
-    value: &str,
-    timezone: Option<&str>,
-) -> Option<DateTime<Utc>> {
+pub fn parse_datetime_with_timezone(value: &str, timezone: Option<&str>) -> Option<DateTime<Utc>> {
     parse_loose_datetime_with_timezone(value, site_timezone(timezone))
 }
 
-fn resolve_user_agent(user_agent: Option<&str>, saved_user_agent: Option<String>) -> String {
+/// Resolve the CLI/saved user-agent, randomizing the value for `auto`/
+/// `random`. Native-only: requires the `ua_generator` randomizer; Worker
+/// builds inject their own user agent through the platform `HttpClient`.
+#[cfg(feature = "native-runtime")]
+pub(crate) fn resolve_user_agent(
+    user_agent: Option<&str>,
+    saved_user_agent: Option<String>,
+) -> String {
     let is_auto = |ua: &str| {
         let trimmed = ua.trim();
         trimmed.is_empty()
@@ -482,14 +504,10 @@ fn resolve_user_agent(user_agent: Option<&str>, saved_user_agent: Option<String>
             || trimmed.eq_ignore_ascii_case("random")
     };
     match user_agent {
-        Some(ua) if is_auto(ua) => {
-            ua_generator::ua::spoof_firefox_ua().to_string()
-        }
+        Some(ua) if is_auto(ua) => ua_generator::ua::spoof_firefox_ua().to_string(),
         Some(ua) if !ua.trim().is_empty() => ua.to_string(),
         _ => match saved_user_agent {
-            Some(ua) if is_auto(&ua) => {
-                ua_generator::ua::spoof_firefox_ua().to_string()
-            }
+            Some(ua) if is_auto(&ua) => ua_generator::ua::spoof_firefox_ua().to_string(),
             Some(ua) if !ua.trim().is_empty() => ua,
             _ => ua_generator::ua::spoof_firefox_ua().to_string(),
         },
@@ -575,20 +593,8 @@ fn sanitize_site_tags(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn section_timestamp_ymd(
-    path: &PathBuf,
-    download_time: Option<&str>,
-    timezone: SiteTimezone,
-) -> Option<String> {
-    if let Some(download_time) = download_time
-        && let Some(ymd) = date_string_to_ymd_with_timezone(download_time, timezone)
-    {
-        return Some(ymd);
-    }
-
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    let dt = DateTime::<Utc>::from(modified);
-    Some(timezone.ymd(dt))
+fn section_timestamp_ymd(download_time: Option<&str>, timezone: SiteTimezone) -> Option<String> {
+    download_time.and_then(|value| date_string_to_ymd_with_timezone(value, timezone))
 }
 
 fn illustration_sources<'a>(
@@ -605,32 +611,89 @@ fn illustration_sources<'a>(
 }
 
 impl Downloader {
-    pub fn new() -> Result<Self> {
-        Self::with_user_agent(None)
+    /// Native constructor: loads site definitions from the filesystem and the
+    /// section hash cache from the Inventory. Worker builds use
+    /// [`Self::with_platform_and_storage_and_settings`] with bundled values.
+    #[cfg(feature = "native-runtime")]
+    pub fn with_platform_and_storage(
+        http: Arc<dyn HttpClient>,
+        rate_limiter: Arc<dyn RateLimiter>,
+        novels: Arc<dyn NovelRepository>,
+        objects: Arc<dyn ObjectStore>,
+        assets: Arc<dyn AssetStore>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
+        let site_settings = SiteSetting::load_all()?;
+        let settings = crate::downloader::settings::default_settings();
+        let section_hash_cache = settings.load_section_hash_cache();
+        Self::with_platform_and_storage_and_settings(
+            http,
+            rate_limiter,
+            novels,
+            objects,
+            assets,
+            clock,
+            site_settings,
+            section_hash_cache,
+        )
     }
 
-    pub fn with_user_agent(user_agent: Option<&str>) -> Result<Self> {
-        let ua = resolve_user_agent(
-            user_agent,
-            crate::compat::load_local_setting_string("user-agent"),
-        );
+    /// Build the downloader without loading site definitions or Inventory.
+    ///
+    /// Worker callers and filesystem-free tests supply both values explicitly.
+    pub fn with_platform_and_storage_and_settings(
+        http: Arc<dyn HttpClient>,
+        rate_limiter: Arc<dyn RateLimiter>,
+        novels: Arc<dyn NovelRepository>,
+        objects: Arc<dyn ObjectStore>,
+        assets: Arc<dyn AssetStore>,
+        clock: Arc<dyn Clock>,
+        site_settings: Vec<SiteSetting>,
+        section_hash_cache: HashMap<String, HashMap<String, String>>,
+    ) -> Result<Self> {
+        Self::with_platform_and_storage_and_settings_and_support(
+            http,
+            rate_limiter,
+            novels,
+            objects,
+            assets,
+            clock,
+            site_settings,
+            section_hash_cache,
+            crate::downloader::settings::default_settings(),
+        )
+    }
 
-        let fetcher = HttpFetcher::new(&ua)?;
-        let site_settings = SiteSetting::load_all()?;
-        let section_hash_cache = crate::db::with_database(|db| {
-            db.inventory().load(
-                SECTION_HASH_CACHE_NAME,
-                crate::db::inventory::InventoryScope::Local,
-            )
-        })
-        .unwrap_or_default();
+    /// Full constructor: additionally injects the settings/interactive
+    /// capability (the platform default is used when building through the
+    /// shorter constructor). Worker callers can supply bundled settings here
+    /// without any filesystem access.
+    pub fn with_platform_and_storage_and_settings_and_support(
+        http: Arc<dyn HttpClient>,
+        rate_limiter: Arc<dyn RateLimiter>,
+        novels: Arc<dyn NovelRepository>,
+        objects: Arc<dyn ObjectStore>,
+        assets: Arc<dyn AssetStore>,
+        clock: Arc<dyn Clock>,
+        site_settings: Vec<SiteSetting>,
+        section_hash_cache: HashMap<String, HashMap<String, String>>,
+        settings: Arc<dyn DownloaderSettings>,
+    ) -> Result<Self> {
+        let persistence =
+            PersistenceService::with_clock(objects.clone(), assets.clone(), clock.clone());
 
         Ok(Self {
-            fetcher,
+            http,
+            rate_limiter,
+            novels,
+            assets,
+            clock,
+            persistence,
             site_settings,
             section_cache: SectionCache::new(),
             section_hash_cache,
             section_hash_cache_dirty: false,
+            settings,
             progress: None,
         })
     }
@@ -650,81 +713,7 @@ impl Downloader {
         }
     }
 
-    pub fn resolve_target(&self, target: &str) -> Result<(i64, SiteSetting)> {
-        let target_type = Self::get_target_type(target);
-
-        match target_type {
-            TargetType::Url => {
-                let setting = self.find_site_setting(target).ok_or_else(|| {
-                    NarouError::InvalidTarget(format!("No site setting found for URL: {}", target))
-                })?;
-                let toc_url = setting
-                    .toc_url_with_url_captures(target)
-                    .unwrap_or_else(|| setting.toc_url());
-                let db = DATABASE.lock();
-                if let Some(db) = db.as_ref() {
-                    if let Some(record) = db.get_by_toc_url(&toc_url) {
-                        return Ok((record.id, setting));
-                    }
-                }
-                Err(NarouError::NotFound(format!(
-                    "Novel not found for URL: {}",
-                    target
-                )))
-            }
-            TargetType::Ncode => {
-                let ncode = target.to_lowercase();
-                let db = DATABASE.lock();
-                if let Some(db) = db.as_ref() {
-                    for record in db.all_records().values() {
-                        if record.ncode.as_deref() == Some(&ncode) {
-                            let setting =
-                                self.find_site_setting(&record.toc_url).ok_or_else(|| {
-                                    NarouError::SiteSetting("No matching site setting".into())
-                                })?;
-                            return Ok((record.id, setting));
-                        }
-                    }
-                }
-                Err(NarouError::NotFound(format!(
-                    "Novel not found for ncode: {}",
-                    ncode
-                )))
-            }
-            TargetType::Id => {
-                let id: i64 = target
-                    .parse()
-                    .map_err(|_| NarouError::InvalidTarget(target.to_string()))?;
-                let db = DATABASE.lock();
-                if let Some(db) = db.as_ref() {
-                    if let Some(record) = db.get(id) {
-                        let setting = self.find_site_setting(&record.toc_url).ok_or_else(|| {
-                            NarouError::SiteSetting("No matching site setting".into())
-                        })?;
-                        return Ok((record.id, setting));
-                    }
-                }
-                Err(NarouError::NotFound(format!(
-                    "Novel not found for ID: {}",
-                    id
-                )))
-            }
-            TargetType::Other => {
-                let db = DATABASE.lock();
-                if let Some(db) = db.as_ref() {
-                    if let Some(record) = db.find_by_title(target) {
-                        let setting = self.find_site_setting(&record.toc_url).ok_or_else(|| {
-                            NarouError::SiteSetting("No matching site setting".into())
-                        })?;
-                        return Ok((record.id, setting));
-                    }
-                }
-                Err(NarouError::NotFound(format!("Novel not found: {}", target)))
-            }
-        }
-    }
-
-    fn find_site_setting(&self, url: &str) -> Option<SiteSetting> {
+    pub fn find_site_setting(&self, url: &str) -> Option<SiteSetting> {
         for setting in &self.site_settings {
             if setting.matches_url(url) {
                 return Some(setting.clone());
@@ -733,33 +722,23 @@ impl Downloader {
         None
     }
 
-    fn load_novel_info(
-        &mut self,
+    async fn load_novel_info(
+        &self,
         setting: &SiteSetting,
         toc_source: &str,
         url_captures: &HashMap<String, String>,
     ) -> Result<NovelInfo> {
-        let Some(novel_info_url) = &setting.novel_info_url else {
-            return Ok(NovelInfo::from_toc_source(setting, toc_source));
-        };
-
-        let resolved_url = setting
-            .novel_info_url_with_captures(url_captures)
-            .unwrap_or_else(|| setting.interpolate(novel_info_url));
-
-        match self
-            .fetcher
-            .fetch_text(&resolved_url, setting.cookie(), Some(setting.encoding()))
-        {
-            Ok(mut body) => {
-                pretreatment_source(&mut body, setting.encoding(), Some(setting));
-                Ok(NovelInfo::from_novel_info_source(setting, &body))
-            }
-            Err(_) => Ok(NovelInfo::from_toc_source(setting, toc_source)),
-        }
+        NovelInfo::load(
+            self.http.as_ref(),
+            self.rate_limiter.as_ref(),
+            setting,
+            toc_source,
+            url_captures,
+        )
+        .await
     }
 
-    pub fn fetch_latest_status_by_id(
+    pub async fn fetch_latest_status_by_id(
         &mut self,
         id: i64,
     ) -> Result<(
@@ -768,10 +747,12 @@ impl Downloader {
         Option<i64>,
         Option<bool>,
     )> {
-        let (toc_url, ncode) = crate::db::with_database(|db| {
-            Ok(db.get(id).map(|r| (r.toc_url.clone(), r.ncode.clone())))
-        })?
-        .ok_or_else(|| NarouError::NotFound(format!("Novel not found for ID: {}", id)))?;
+        let record = self
+            .novels
+            .get(id.into())
+            .await?
+            .ok_or_else(|| NarouError::NotFound(format!("Novel not found for ID: {}", id)))?;
+        let (toc_url, ncode) = (record.toc_url, record.ncode);
 
         let setting = self
             .find_site_setting(&toc_url)
@@ -782,8 +763,16 @@ impl Downloader {
             url_captures.entry("ncode".to_string()).or_insert(ncode);
         }
 
-        let toc_source = fetch_toc(&mut self.fetcher, &setting, &toc_url)?;
-        let info = self.load_novel_info(&setting, &toc_source, &url_captures)?;
+        let toc_source = fetch_toc(
+            self.http.as_ref(),
+            self.rate_limiter.as_ref(),
+            &setting,
+            &toc_url,
+        )
+        .await?;
+        let info = self
+            .load_novel_info(&setting, &toc_source, &url_captures)
+            .await?;
 
         let (novel_type, inferred_is_end) =
             resolve_novel_type(&setting, &toc_source, &url_captures, &info);
@@ -800,13 +789,15 @@ impl Downloader {
             } else {
                 let title = info.title.as_deref().unwrap_or("");
                 parse_subtitles_multipage(
-                    &mut self.fetcher,
+                    self.http.as_ref(),
+                    self.rate_limiter.as_ref(),
                     &setting,
                     &toc_source,
                     &url_captures,
                     title,
                     self.progress.as_deref(),
                 )
+                .await
                 .ok()
             };
             if let Some(subs) = &subtitles {
@@ -832,7 +823,7 @@ impl Downloader {
         Ok((novelupdated_at, general_lastup, info.length, is_end))
     }
 
-    fn process_digest(
+    async fn process_digest(
         &self,
         existing_id: Option<i64>,
         toc_url: &str,
@@ -842,74 +833,97 @@ impl Downloader {
         old_count: usize,
         latest_count: usize,
     ) -> Result<bool> {
-        if latest_count >= old_count {
-            return Ok(false);
+        #[cfg(feature = "native-runtime")]
+        {
+            if latest_count >= old_count {
+                return Ok(false);
+            }
+
+            let mut message = format!(
+                "更新後の話数が保存されている話数より減少していることを検知しました。\nダイジェスト化されている可能性があるので、更新に関しての処理を選択して下さい。\n\n保存済み話数: {}\n更新後の話数: {}\n\n",
+                old_count, latest_count
+            );
+
+            let mut auto_choices = crate::compat::load_digest_auto_choices();
+
+            loop {
+                match crate::compat::choose_digest_action_with_auto_choices(
+                    title,
+                    &message,
+                    &mut auto_choices,
+                ) {
+                    crate::compat::DigestChoice::Update => return Ok(false),
+                    crate::compat::DigestChoice::Cancel => return Ok(true),
+                    crate::compat::DigestChoice::CancelAndFreeze => {
+                        if let Some(id) = existing_id {
+                            let _ = crate::compat::set_frozen_state(id, true);
+                        }
+                        return Ok(true);
+                    }
+                    crate::compat::DigestChoice::Backup => {
+                        let backup_name = crate::compat::create_backup(novel_dir, title)?;
+                        println!("{} を作成しました", backup_name);
+                    }
+                    crate::compat::DigestChoice::ShowStory => {
+                        println!("あらすじ");
+                        println!("{}", latest_story);
+                    }
+                    crate::compat::DigestChoice::OpenBrowser => {
+                        crate::compat::open_browser(toc_url);
+                    }
+                    crate::compat::DigestChoice::OpenFolder => {
+                        crate::compat::open_directory(novel_dir, None);
+                    }
+                    crate::compat::DigestChoice::Convert => {
+                        if let Some(id) = existing_id {
+                            let author = self
+                                .novels
+                                .get(id.into())
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|record| record.author)
+                                .unwrap_or_default();
+                            let _ = crate::compat::convert_existing_novel(
+                                id, title, &author, novel_dir, false,
+                            );
+                        }
+                    }
+                }
+
+                if std::io::stdin().is_terminal() {
+                    message.clear();
+                }
+                let _ = std::io::stdout().flush();
+            }
         }
 
-        let mut message = format!(
-            "更新後の話数が保存されている話数より減少していることを検知しました。\nダイジェスト化されている可能性があるので、更新に関しての処理を選択して下さい。\n\n保存済み話数: {}\n更新後の話数: {}\n\n",
-            old_count, latest_count
-        );
-
-        let mut auto_choices = crate::compat::load_digest_auto_choices();
-
-        loop {
-            match crate::compat::choose_digest_action_with_auto_choices(
+        // Worker: no interactive terminal. Return an explicit domain error
+        // instead of silently continuing or deleting sections.
+        #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+        {
+            let _ = (
+                existing_id,
+                toc_url,
+                novel_dir,
                 title,
-                &message,
-                &mut auto_choices,
-            ) {
-                crate::compat::DigestChoice::Update => return Ok(false),
-                crate::compat::DigestChoice::Cancel => return Ok(true),
-                crate::compat::DigestChoice::CancelAndFreeze => {
-                    if let Some(id) = existing_id {
-                        let _ = crate::compat::set_frozen_state(id, true);
-                    }
-                    return Ok(true);
-                }
-                crate::compat::DigestChoice::Backup => {
-                    let backup_name = crate::compat::create_backup(novel_dir, title)?;
-                    println!("{} を作成しました", backup_name);
-                }
-                crate::compat::DigestChoice::ShowStory => {
-                    println!("あらすじ");
-                    println!("{}", latest_story);
-                }
-                crate::compat::DigestChoice::OpenBrowser => {
-                    crate::compat::open_browser(toc_url);
-                }
-                crate::compat::DigestChoice::OpenFolder => {
-                    crate::compat::open_directory(novel_dir, None);
-                }
-                crate::compat::DigestChoice::Convert => {
-                    if let Some(id) = existing_id {
-                        let author = crate::db::with_database(|db| {
-                            Ok(db
-                                .get(id)
-                                .map(|record| record.author.clone())
-                                .unwrap_or_default())
-                        })
-                        .unwrap_or_default();
-                        let _ = crate::compat::convert_existing_novel(
-                            id, title, &author, novel_dir, false,
-                        );
-                    }
-                }
-            }
-
-            if std::io::stdin().is_terminal() {
-                message.clear();
-            }
-            let _ = std::io::stdout().flush();
+                latest_story,
+                old_count,
+                latest_count,
+            );
+            Err(NarouError::Unsupported(
+                "digest handling requires an interactive terminal; not supported on this platform"
+                    .to_string(),
+            ))
         }
     }
 
-    fn download_illustration(
+    async fn download_illustration(
         &mut self,
         setting: &SiteSetting,
         section: &SectionElement,
-        illust_dir: &Path,
-        illustration_store: &mut crate::illustration_store::IllustrationStore,
+        object_keys: &NovelObjectKeys,
+        illustration_store: &mut crate::illustration_store::IllustrationIndex,
         toc_url: &str,
         raw_html: Option<&str>,
     ) -> Result<()> {
@@ -919,57 +933,67 @@ impl Downloader {
         };
 
         let re = compile_html_pattern(illust_url_pattern).map_err(NarouError::Regex)?;
+        let storage =
+            crate::illustration_store::IllustrationStorageService::new(self.assets.clone());
 
-        std::fs::create_dir_all(illust_dir)?;
-
-        // 解析済みセクションには、本文として保存しないサイト固有マークアップが含まれないことがある。
-        // 保存済みデータや変換結果を変えずにその中の挿絵も取得できるよう、今回取得した raw HTML も検索する。
+        // Parsed sections may omit site-specific image markup. Search the raw
+        // HTML from this fetch as well, while keeping all persistence logical.
         for source in illustration_sources(section, raw_html) {
             for caps in re.captures_iter(source) {
-                if let Some(url_match) = caps.get(1) {
-                    let raw_url = url_match.as_str();
-                    if raw_url.is_empty() {
-                        continue;
-                    }
-                    let resolved = build_section_url(setting, toc_url, raw_url);
-                        let url = resolved.as_str();
-                        if !is_safe_public_url(url) {
-                            crate::progress::safe_stderr_println(&format!(
-                                "WARN: skipping unsafe illustration URL: {url}"
-                            ));
-                            continue;
-                        }
+                let Some(url_match) = caps.get(1) else {
+                    continue;
+                };
+                let raw_url = url_match.as_str();
+                if raw_url.is_empty() {
+                    continue;
+                }
+                let resolved = build_section_url(setting, toc_url, raw_url);
+                let url = resolved.as_str();
+                if !is_safe_public_url(url) {
+                    report_warn(&format!("WARN: skipping unsafe illustration URL: {url}"));
+                    continue;
+                }
 
-                    if illustration_store
-                        .cached_filename_for_source(url, illust_dir)
+                if illustration_store.filename_for_source(url).is_some()
+                    || crate::illustration_store::mitemin_illustration_id(url)
+                        .and_then(|id| illustration_store.filename_for_mitemin_id(&id))
                         .is_some()
-                    {
-                        continue;
-                    }
+                {
+                    continue;
+                }
 
-                    self.fetcher.rate_limiter.wait_for_url(url);
-                    match self.fetcher.fetch_bytes(url, None) {
-                        Ok((bytes, content_type)) => {
-                            let ext =
-                                crate::illustration_store::illustration_extension_from_content_type(
-                                    &content_type,
-                                )
-                                .unwrap_or_else(|| {
-                                    crate::illustration_store::guessed_extension_from_url(url)
-                                });
-                            if let Err(err) =
-                                illustration_store.store_bytes(illust_dir, url, &bytes, ext)
-                            {
-                                crate::progress::safe_stderr_println(&format!(
-                                    "WARN: failed to save illustration {url}: {err}"
-                                ));
-                            }
-                        }
-                        Err(err) => {
-                            crate::progress::safe_stderr_println(&format!(
-                                "WARN: failed to download illustration {url}: {err}"
+                match crate::downloader::http_policy::fetch_bytes(
+                    self.http.as_ref(),
+                    self.rate_limiter.as_ref(),
+                    url,
+                    None,
+                    setting.is_narou,
+                )
+                .await
+                {
+                    Ok(response) => {
+                        let content_type =
+                            response.header("Content-Type").unwrap_or("").to_string();
+                        let ext =
+                            crate::illustration_store::illustration_extension_from_content_type(
+                                &content_type,
+                            )
+                            .unwrap_or_else(|| {
+                                crate::illustration_store::guessed_extension_from_url(url)
+                            });
+                        if let Err(err) = storage
+                            .store_bytes(object_keys, illustration_store, url, &response.body, ext)
+                            .await
+                        {
+                            report_warn(&format!(
+                                "WARN: failed to save illustration {url}: {err}"
                             ));
                         }
+                    }
+                    Err(err) => {
+                        report_warn(&format!(
+                            "WARN: failed to download illustration {url}: {err}"
+                        ));
                     }
                 }
             }
@@ -978,7 +1002,7 @@ impl Downloader {
         Ok(())
     }
 
-    pub fn expand_series_target(&mut self, target: &str) -> Result<Option<Vec<String>>> {
+    pub async fn expand_series_target(&mut self, target: &str) -> Result<Option<Vec<String>>> {
         if !matches!(Self::get_target_type(target), TargetType::Url) {
             return Ok(None);
         }
@@ -991,13 +1015,21 @@ impl Downloader {
             return Ok(None);
         };
         let pattern = setting.compile_series_item_pattern().ok_or_else(|| {
-            NarouError::SiteSetting(format!("No series_item_url pattern defined: {}", setting.name))
+            NarouError::SiteSetting(format!(
+                "No series_item_url pattern defined: {}",
+                setting.name
+            ))
         })?;
 
-        self.fetcher.configure_rate_limiter(setting.is_narou);
-        let mut body = self
-            .fetcher
-            .fetch_text(target, setting.cookie(), Some(setting.encoding()))?;
+        let mut body = crate::downloader::http_policy::fetch_text(
+            self.http.as_ref(),
+            self.rate_limiter.as_ref(),
+            target,
+            setting.cookie(),
+            Some(setting.encoding()),
+            setting.is_narou,
+        )
+        .await?;
         crate::downloader::util::pretreatment_source(&mut body, setting.encoding(), None);
 
         let mut targets = Vec::new();
@@ -1023,25 +1055,62 @@ impl Downloader {
         crate::db::novel_dir_for_record(&PathBuf::from(types::ARCHIVE_ROOT_DIR), record)
     }
 
-    pub fn download_novel(&mut self, target: &str) -> Result<DownloadResult> {
-        self.download_novel_with_force(target, false)
+    pub async fn download_novel(&mut self, target: &str) -> Result<DownloadResult> {
+        self.download_novel_with_force(target, false).await
     }
 
-    pub fn download_novel_with_force(
+    pub async fn download_novel_with_force(
         &mut self,
         target: &str,
         force: bool,
     ) -> Result<DownloadResult> {
-        let (existing_id, mut setting) = self.resolve_target_for_download(target)?;
+        self.download_novel_with_force_budget(target, force, None).await
+    }
+
+    /// Download a novel while yielding only before a new section starts.
+    ///
+    /// Existing callers keep the unbounded API above. Worker callers provide a
+    /// short-lived budget so a timeout cannot cancel an in-flight section
+    /// between its fetch and persistence steps.
+    pub async fn download_novel_with_force_budget(
+        &mut self,
+        target: &str,
+        force: bool,
+        budget: Option<&mut dyn SectionBudget>,
+    ) -> Result<DownloadResult> {
+        self.download_novel_with_execution_options(
+            target,
+            DownloadExecutionOptions {
+                force,
+                budget,
+                resume_from_section: None,
+            },
+        )
+        .await
+    }
+
+    /// Download with an optional durable section resume cursor.
+    pub async fn download_novel_with_execution_options(
+        &mut self,
+        target: &str,
+        mut options: DownloadExecutionOptions<'_>,
+    ) -> Result<DownloadResult> {
+        let force = options.force;
+        let resume_from_section = options.resume_from_section;
+        let mut budget = options.budget.take();
+        let (existing_id, mut setting) = self.resolve_target_for_download(target).await?;
         let provisional_id = match existing_id {
             Some(id) => id,
-            None => crate::db::with_database(|db| Ok(db.create_new_id()))?,
+            None => self.novels.allocate_id().await?.0,
         };
 
         let db_toc_url = if let Some(id) = existing_id {
-            crate::db::with_database(|db| Ok(db.get(id).map(|r| r.toc_url.clone())))
+            self.novels
+                .get(id.into())
+                .await
                 .ok()
                 .flatten()
+                .map(|record| record.toc_url)
         } else {
             None
         };
@@ -1060,13 +1129,19 @@ impl Downloader {
             setting.interpolate_with_captures(&setting.toc_url, &url_captures)
         };
         let toc_url = Self::ageauth_redirect_target(&toc_url).unwrap_or(toc_url);
-        self.fetcher.configure_rate_limiter(setting.is_narou);
-        let toc_url = match self.fetcher.resolve_final_url(&toc_url, setting.cookie()) {
+        let toc_url = match crate::downloader::http_policy::resolve_final_url(
+            self.http.as_ref(),
+            self.rate_limiter.as_ref(),
+            &toc_url,
+            setting.cookie(),
+            setting.is_narou,
+        )
+        .await
+        {
             Ok(final_url) if final_url != toc_url => {
                 let final_url = Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
                 if let Some(final_setting) = self.find_site_setting(&final_url) {
                     setting = final_setting;
-                    self.fetcher.configure_rate_limiter(setting.is_narou);
                     setting
                         .toc_url_with_url_captures(&final_url)
                         .unwrap_or(final_url)
@@ -1076,39 +1151,63 @@ impl Downloader {
             }
             _ => toc_url,
         };
-        let url_captures = setting.extract_url_captures(&toc_url).unwrap_or(url_captures);
+        let url_captures = setting
+            .extract_url_captures(&toc_url)
+            .unwrap_or(url_captures);
         // リダイレクト解決で toc_url が入力時と変わった場合、解決後の URL で
         // 既存レコードを再照合して ID を引き継ぐ。別ドメインへ転送されるサイト
         // (例: ハーメルンの h.syosetu.org 分離)で同じ小説が重複登録されるのを防ぐ。
-        let existing_id = existing_id.or_else(|| {
-            crate::db::with_database(|db| Ok(db.get_by_toc_url(&toc_url).map(|record| record.id)))
+        let existing_id = match existing_id {
+            Some(id) => Some(id),
+            None => self
+                .novels
+                .find_by_toc_url(&toc_url)
+                .await
                 .ok()
                 .flatten()
-        });
+                .map(|record| record.id),
+        };
         let provisional_id = existing_id.unwrap_or(provisional_id);
-        let toc_source = match fetch_toc(&mut self.fetcher, &setting, &toc_url) {
+        let toc_source = match fetch_toc(
+            self.http.as_ref(),
+            self.rate_limiter.as_ref(),
+            &setting,
+            &toc_url,
+        )
+        .await
+        {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
                 let id = existing_id.unwrap();
-                safe_println_fn("小説が削除されているか非公開な可能性があります");
-                let _ = crate::compat::mark_not_found_and_freeze(id);
-                let (title, author, novel_dir) = crate::db::with_database(|db| {
-                    let record = db.get(id).cloned();
-                    let title = record
+                report_line("小説が削除されているか非公開な可能性があります");
+                #[cfg(feature = "native-runtime")]
+                {
+                    let _ = crate::compat::mark_not_found_and_freeze(id);
+                }
+                let record = self.novels.get(id.into()).await.ok().flatten();
+                let title = record
+                    .as_ref()
+                    .map(|record| record.title.clone())
+                    .unwrap_or_default();
+                let author = record
+                    .as_ref()
+                    .map(|record| record.author.clone())
+                    .unwrap_or_default();
+                let novel_dir = {
+                    // archive_root は Inventory 依存 (Phase 4 対象) のため
+                    // 従来どおり Database 経由で取得する。Worker は論理パスを
+                    // そのまま使う (freeze は native Inventory の責務)。
+                    #[cfg(feature = "native-runtime")]
+                    let archive_root =
+                        crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+                            .unwrap_or_else(|_| PathBuf::from(types::ARCHIVE_ROOT_DIR));
+                    #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
+                    let archive_root = PathBuf::from(types::ARCHIVE_ROOT_DIR);
+                    record
                         .as_ref()
-                        .map(|record| record.title.clone())
-                        .unwrap_or_default();
-                    let author = record
-                        .as_ref()
-                        .map(|record| record.author.clone())
-                        .unwrap_or_default();
-                    let novel_dir = record
-                        .as_ref()
-                        .map(|record| crate::db::novel_dir_for_record(db.archive_root(), record))
-                        .unwrap_or_default();
-                    Ok((title, author, novel_dir))
-                })
-                .unwrap_or_default();
+                        .map(|record| crate::db::novel_dir_for_record(&archive_root, record))
+                        .unwrap_or_default()
+                };
                 return Ok(DownloadResult {
                     id,
                     title,
@@ -1132,11 +1231,13 @@ impl Downloader {
         match over18_access_decision(
             &setting,
             &toc_source,
-            load_global_setting_optional_bool("over18"),
+            self.settings.global_setting_optional_bool("over18"),
         ) {
             Over18AccessDecision::Allow => {}
             Over18AccessDecision::Prompt => {
-                if !crate::compat::confirm("年齢認証：あなたは18歳以上ですか", false, false)
+                if !self
+                    .settings
+                    .confirm("年齢認証：あなたは18歳以上ですか", false, false)?
                 {
                     return Ok(DownloadResult {
                         id: provisional_id,
@@ -1155,7 +1256,7 @@ impl Downloader {
                         sections_deleted: false,
                     });
                 }
-                save_global_setting_bool("over18", true)?;
+                self.settings.save_global_setting_bool("over18", true)?;
             }
             Over18AccessDecision::Deny => {
                 return Ok(DownloadResult {
@@ -1177,14 +1278,15 @@ impl Downloader {
             }
         }
 
-        let info = self.load_novel_info(&setting, &toc_source, &url_captures)?;
+        let info = self
+            .load_novel_info(&setting, &toc_source, &url_captures)
+            .await?;
 
         let author = info.author.clone().unwrap_or_default();
-        let existing_record = existing_id.and_then(|eid| {
-            crate::db::with_database(|db| Ok(db.get(eid).cloned()))
-                .ok()
-                .flatten()
-        });
+        let existing_record = match existing_id {
+            Some(eid) => self.novels.get(eid.into()).await.ok().flatten(),
+            None => None,
+        };
         let fetched_raw_title = info.title.clone().unwrap_or_default();
         let raw_title = if fetched_raw_title.is_empty() {
             existing_record
@@ -1194,24 +1296,13 @@ impl Downloader {
         } else {
             fetched_raw_title
         };
-        let previous_novel_dir = existing_record
-            .as_ref()
-            .map(|record| {
-                crate::db::existing_novel_dir_for_record(
-                    Path::new(types::ARCHIVE_ROOT_DIR),
-                    record,
-                )
-            });
-        let settings_dir = previous_novel_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(types::ARCHIVE_ROOT_DIR).join(".new-novel-settings"));
-        let title_settings = crate::converter::settings::NovelSettings::load_for_novel(
-            provisional_id,
-            &raw_title,
-            &author,
-            &settings_dir,
-        );
-        let strip_title_prefix = title_settings.enable_strip_title_prefix;
+        #[cfg(feature = "native-runtime")]
+        let previous_novel_dir = existing_record.as_ref().map(|record| {
+            crate::db::existing_novel_dir_for_record(Path::new(types::ARCHIVE_ROOT_DIR), record)
+        });
+        let strip_title_prefix = self
+            .settings
+            .strip_title_prefix_for(provisional_id, &raw_title, &author);
         let track_raw_title = strip_title_prefix
             || existing_record
                 .as_ref()
@@ -1224,16 +1315,18 @@ impl Downloader {
             create_short_story_subtitles(&setting, &toc_source, &info)?
         } else {
             parse_subtitles_multipage(
-                &mut self.fetcher,
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
                 &setting,
                 &toc_source,
                 &url_captures,
                 &title,
                 self.progress.as_deref(),
-            )?
+            )
+            .await?
         };
 
-        let use_subdirectory = self.download_use_subdirectory(existing_id);
+        let use_subdirectory = self.download_use_subdirectory(existing_record.as_ref());
         let ncode = self
             .extract_ncode(&setting, &toc_source)
             .or_else(|| url_captures.get("ncode").cloned());
@@ -1241,7 +1334,7 @@ impl Downloader {
             &ncode,
             &title,
             setting.append_title_to_folder_name,
-            existing_id,
+            existing_record.as_ref(),
         );
         let sitename = info
             .sitename
@@ -1260,23 +1353,19 @@ impl Downloader {
             })
             .unwrap_or_else(|| setting.sitename.clone());
 
+        let object_keys = NovelObjectKeys::new(&sitename, &file_title, use_subdirectory)
+            .map_err(|error| NarouError::Platform(error.to_string()))?;
         let novel_dir = self.compute_novel_dir(&sitename, &file_title, use_subdirectory);
+        #[cfg(feature = "native-runtime")]
         if let Some(existing) = existing_record.as_ref() {
-            crate::title::rename_projected_outputs(
-                &novel_dir,
-                &author,
-                &existing.title,
-                &title,
-            )?;
+            crate::title::rename_projected_outputs(&novel_dir, &author, &existing.title, &title)?;
         }
-        std::fs::create_dir_all(&novel_dir)?;
 
-        let section_dir = novel_dir.join(types::SECTION_SAVE_DIR);
-        let raw_dir = novel_dir.join(types::RAW_DATA_DIR);
-        std::fs::create_dir_all(&section_dir)?;
-        std::fs::create_dir_all(&raw_dir)?;
-
-        let old_toc = load_toc_file(&novel_dir);
+        let old_toc = self
+            .persistence
+            .load_toc(&object_keys)
+            .await
+            .unwrap_or(None);
         let old_subtitles: HashMap<String, &SubtitleInfo> = old_toc
             .as_ref()
             .map(|t| t.subtitles.iter().map(|s| (s.index.clone(), s)).collect())
@@ -1298,15 +1387,18 @@ impl Downloader {
             } else {
                 title.clone()
             };
-            if self.process_digest(
-                existing_id,
-                &toc_url,
-                &novel_dir,
-                &title_for_digest,
-                &digest_story,
-                old_section_count,
-                subtitles.len(),
-            )? {
+            if self
+                .process_digest(
+                    existing_id,
+                    &toc_url,
+                    &novel_dir,
+                    &title_for_digest,
+                    &digest_story,
+                    old_section_count,
+                    subtitles.len(),
+                )
+                .await?
+            {
                 return Ok(DownloadResult {
                     id: provisional_id,
                     title: title_for_digest,
@@ -1330,40 +1422,65 @@ impl Downloader {
             }
         }
 
-        let illust_dir = novel_dir.join("挿絵");
         let mut illustration_store = if setting.illust_grep_pattern.is_some() {
             Some(
-                crate::illustration_store::IllustrationStore::load(&novel_dir)
+                self.persistence
+                    .load_cache(&object_keys)
+                    .await?
                     .unwrap_or_default(),
             )
         } else {
             None
         };
 
+        let resume_from = resume_from_section.unwrap_or(0);
+        if resume_from > subtitles.len() {
+            return Err(NarouError::DownloadResumeCorrupt(format!(
+                "resume section {resume_from} exceeds TOC length {}",
+                subtitles.len()
+            )));
+        }
+        let mut resumed_sections = HashMap::new();
+        for (section_index, subtitle) in subtitles.iter().enumerate().take(resume_from) {
+            let section = self
+                .persistence
+                .load_section(&object_keys, subtitle)
+                .await?
+                .ok_or_else(|| {
+                    NarouError::DownloadResumeCorrupt(format!(
+                        "persisted section {section_index} ({}) is missing",
+                        subtitle.index
+                    ))
+                })?;
+            resumed_sections.insert(section_index, section);
+        }
+
         struct SectionPlan {
-            latest_section_path: PathBuf,
             is_new_arrival: bool,
             needs_download: bool,
             predownloaded: Option<(SectionElement, String)>,
+            resumed: Option<SectionFile>,
         }
 
         let mut updated_count = 0usize;
         let mut new_arrivals = existing_id.is_none();
         let mut new_arrival_subtitles = Vec::new();
         let mut final_subtitles = Vec::with_capacity(subtitles.len());
-        let strong_update = load_local_setting_bool("update.strong");
+        let strong_update = self.settings.local_setting_bool("update.strong");
         let site_timezone = setting.site_timezone();
-        let mut cache_dir: Option<PathBuf> = None;
+        let mut cache_dir: Option<String> = None;
         let mut pending_section_hashes: HashMap<String, String> = HashMap::new();
         let display_id = provisional_id;
         let mut section_plans = Vec::with_capacity(subtitles.len());
         let mut download_count = 0usize;
-        let guard_spoiler = load_local_setting_bool("guard-spoiler");
-
-        for subtitle in &subtitles {
-            let latest_section_path = section_dir.join(section_filename(subtitle));
-            let is_new_arrival = !latest_section_path.exists();
-            let (needs_download, predownloaded) = if force {
+        let guard_spoiler = self.settings.local_setting_bool("guard-spoiler");
+        for (section_index, subtitle) in subtitles.iter().enumerate() {
+            let resumed = resumed_sections.remove(&section_index);
+            let is_new_arrival =
+                resumed.is_none() && old_subtitles.get(&subtitle.index).is_none();
+            let (needs_download, predownloaded) = if resumed.is_some() {
+                (false, None)
+            } else if force {
                 (true, None)
             } else {
                 self.section_needs_download(
@@ -1371,20 +1488,21 @@ impl Downloader {
                     subtitle,
                     old_subtitles.get(&subtitle.index).copied(),
                     existing_id,
-                    &section_dir,
+                    &object_keys,
                     &toc_url,
                     strong_update,
                     site_timezone,
-                )?
+                )
+                .await?
             };
             if needs_download {
                 download_count += 1;
             }
             section_plans.push(SectionPlan {
-                latest_section_path,
                 is_new_arrival,
                 needs_download,
                 predownloaded,
+                resumed,
             });
         }
 
@@ -1399,15 +1517,29 @@ impl Downloader {
         let mut started_download = false;
         let mut downloaded_index = 0usize;
 
-        for (subtitle, plan) in subtitles.iter().zip(section_plans.into_iter()) {
-            let latest_section_path = plan.latest_section_path;
+        for (section_index, (subtitle, plan)) in subtitles
+            .iter()
+            .zip(section_plans.into_iter())
+            .enumerate()
+        {
+            if section_index >= resume_from
+                && budget
+                    .as_deref_mut()
+                    .is_some_and(|budget| budget.should_yield(section_index))
+            {
+                return Err(NarouError::DownloadBudgetExpired {
+                    next_section_index: section_index,
+                });
+            }
             let is_new_arrival = plan.is_new_arrival;
             let needs_download = plan.needs_download;
 
-            let download_time = if needs_download {
+            let download_time = if let Some(resumed) = plan.resumed {
+                resumed.download_time
+            } else if needs_download {
                 if !started_download {
-                    safe_println_fn(&bold_colored(
-                        &format!("ID:{}　{} のDL開始", display_id, title),
+                    report_line(&colorize(
+                        &format!("ID:{display_id}　{title} のDL開始"),
                         "green",
                     ));
                     started_download = true;
@@ -1422,11 +1554,11 @@ impl Downloader {
                 }
 
                 if !subtitle.chapter.is_empty() && subtitle.chapter != last_chapter {
-                    safe_println_fn(&subtitle.chapter);
+                    report_line(&subtitle.chapter);
                     last_chapter = subtitle.chapter.clone();
                 }
                 if !subtitle.subchapter.is_empty() && subtitle.subchapter != last_subchapter {
-                    safe_println_fn(&subtitle.subchapter);
+                    report_line(&subtitle.subchapter);
                     last_subchapter = subtitle.subchapter.clone();
                 }
 
@@ -1434,23 +1566,37 @@ impl Downloader {
                     downloaded
                 } else {
                     download_section(
-                        &mut self.fetcher,
+                        self.http.as_ref(),
+                        self.rate_limiter.as_ref(),
                         &mut self.section_cache,
                         &setting,
                         subtitle,
                         &toc_url,
-                    )?
+                    )
+                    .await?
                 };
-                if latest_section_path.exists() {
+                let had_existing = self
+                    .persistence
+                    .load_section(&object_keys, subtitle)
+                    .await?
+                    .is_some();
+                if had_existing {
                     if cache_dir.is_none() {
-                        cache_dir = create_cache_dir(&section_dir)?;
+                        cache_dir = cache_timestamp(self.clock.as_ref());
                     }
                     if let Some(id) = existing_id {
                         self.clear_section_digest(id, &section_relative_path(subtitle));
                     }
-                    move_to_cache_dir(&section_dir, cache_dir.as_deref(), subtitle)?;
+                    if let Some(timestamp) = cache_dir.as_deref() {
+                        self.persistence
+                            .move_section_to_cache(&object_keys, timestamp, subtitle)
+                            .await?;
+                    }
                 }
-                save_section_file(&section_dir, subtitle, &section)?;
+                let download_time = self
+                    .persistence
+                    .save_section(&object_keys, subtitle, &section)
+                    .await?;
                 let digest = compute_section_hash(&section);
                 let relative_path = section_relative_path(subtitle);
                 if let Some(id) = existing_id {
@@ -1458,34 +1604,39 @@ impl Downloader {
                 } else {
                     pending_section_hashes.insert(relative_path, digest);
                 }
-                save_raw_file(&raw_dir, subtitle, &raw_html)?;
+                self.persistence
+                    .save_raw(&object_keys, subtitle, &raw_html)
+                    .await?;
                 if let Some(store) = illustration_store.as_mut() {
                     self.download_illustration(
                         &setting,
                         &section,
-                        &illust_dir,
+                        &object_keys,
                         store,
                         &toc_url,
                         Some(raw_html.as_str()),
-                    )?;
+                    )
+                    .await?;
                 }
                 updated_count += 1;
                 downloaded_index += 1;
-                Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string())
+                Some(download_time)
             } else {
-                if let Some(store) = illustration_store.as_mut() {
-                    if let Ok(content) = std::fs::read_to_string(&latest_section_path) {
-                        if let Ok(section_file) = serde_yaml::from_str::<SectionFile>(&content) {
-                            self.download_illustration(
-                                &setting,
-                                &section_file.element,
-                                &illust_dir,
-                                store,
-                                &toc_url,
-                                None,
-                            )?;
-                        }
-                    }
+                if let Some(store) = illustration_store.as_mut()
+                    && let Some(section_file) = self
+                        .persistence
+                        .load_section(&object_keys, subtitle)
+                        .await?
+                {
+                    self.download_illustration(
+                        &setting,
+                        &section_file.element,
+                        &object_keys,
+                        store,
+                        &toc_url,
+                        None,
+                    )
+                    .await?;
                 }
                 old_subtitles
                     .get(&subtitle.index)
@@ -1521,21 +1672,20 @@ impl Downloader {
                 ));
                 if needs_download {
                     if is_new_arrival && (existing_id.is_some() || force) {
-                        line.push_str(&bold_colored(" (新着)", "magenta"));
+                        line.push_str(&colorize(" (新着)", "magenta"));
                     } else if !is_new_arrival && force {
                         line.push_str(" (更新あり)");
                     }
                 }
-                safe_println_fn(&line);
+                report_line(&line);
                 if let Some(ref p) = self.progress {
                     p.inc(1);
                 }
             }
         }
 
-        remove_cache_dir_if_empty(cache_dir.as_deref())?;
-        if let Some(store) = illustration_store.as_mut() {
-            store.flush(&novel_dir)?;
+        if let Some(store) = illustration_store.as_ref() {
+            self.persistence.save_cache(&object_keys, store).await?;
         }
 
         if let Some(ref p) = self.progress {
@@ -1593,9 +1743,12 @@ impl Downloader {
             subtitles: final_subtitles,
             novel_type: Some(novel_type),
         };
-        save_toc_file(&novel_dir, &toc_file)?;
-        ensure_default_files(&novel_dir, &toc_title, &toc_author, &toc_url);
+        self.persistence.save_toc(&object_keys, &toc_file).await?;
+        self.persistence
+            .ensure_default_files(&object_keys, &toc_title, &toc_author, &toc_url)
+            .await?;
 
+        let now = self.clock.now_utc();
         let mut record = NovelRecord {
             id: provisional_id,
             author: toc_author.clone(),
@@ -1605,28 +1758,26 @@ impl Downloader {
             sitename,
             novel_type,
             end: is_end,
-            last_update: Utc::now(),
-            new_arrivals_date: Some(Utc::now()),
+            last_update: now,
+            new_arrivals_date: Some(now),
             use_subdirectory,
             general_firstup: info.general_firstup,
-            novelupdated_at: info.novelupdated_at
-                .or_else(|| {
-                    sections_latest_update_time_with_timezone(
-                        &subtitles,
-                        "subupdate",
-                        Some("subdate"),
-                        site_timezone,
-                    )
-                }),
-            general_lastup: info.general_lastup
-                .or_else(|| {
-                    sections_latest_update_time_with_timezone(
-                        &subtitles,
-                        "subdate",
-                        None,
-                        site_timezone,
-                    )
-                }),
+            novelupdated_at: info.novelupdated_at.or_else(|| {
+                sections_latest_update_time_with_timezone(
+                    &subtitles,
+                    "subupdate",
+                    Some("subdate"),
+                    site_timezone,
+                )
+            }),
+            general_lastup: info.general_lastup.or_else(|| {
+                sections_latest_update_time_with_timezone(
+                    &subtitles,
+                    "subdate",
+                    None,
+                    site_timezone,
+                )
+            }),
             last_mail_date: None,
             tags: Vec::new(),
             ncode,
@@ -1643,7 +1794,7 @@ impl Downloader {
             record.set_raw_title(raw_title);
         }
 
-        let auto_add_tags = load_local_setting_bool("auto-add-tags");
+        let auto_add_tags = self.settings.local_setting_bool("auto-add-tags");
         let auto_tags = if auto_add_tags {
             info.tags
                 .clone()
@@ -1664,10 +1815,9 @@ impl Downloader {
             sections_deleted,
         );
 
-        let id = crate::db::with_database_mut(|db| {
-            db.update_records(|mut records: BTreeMap<i64, NovelRecord>| {
-                let id = if let Some(eid) = existing_id {
-                    if let Some(existing) = records.get(&eid) {
+        let id = if let Some(eid) = existing_id {
+            match self.novels.get(eid.into()).await? {
+                Some(existing) => {
                     let mut updated = existing.clone();
                     if !record.author.is_empty() {
                         updated.author = record.author.clone();
@@ -1698,29 +1848,39 @@ impl Downloader {
                             updated.tags.push(tag.clone());
                         }
                     }
-                    records.insert(eid, updated);
-                    eid
-                } else {
-                    let new_id = provisional_id;
-                    let mut rec = record.clone();
-                    rec.id = new_id;
-                    rec.tags = auto_tags.clone();
-                    records.insert(new_id, rec);
-                    new_id
+                    let merged_id = updated.id;
+                    self.novels
+                        .apply_batch(vec![NovelMutation::Upsert(updated)])
+                        .await?;
+                    merged_id
                 }
-            } else {
-                let new_id = records.keys().copied().max().map(|id| id + 1).unwrap_or(0);
-                let mut rec = record.clone();
-                rec.id = new_id;
-                rec.tags = auto_tags.clone();
-                records.insert(new_id, rec);
-                new_id
-            };
-                Ok((records, id))
-            })
-        })?;
+                None => {
+                    // レコードが消えていた場合: 先頭で確保した provisional_id を使う
+                    // (従来の update_records 分岐と同挙動)。
+                    let mut rec = record.clone();
+                    rec.id = provisional_id;
+                    rec.tags = auto_tags.clone();
+                    self.novels
+                        .apply_batch(vec![NovelMutation::Upsert(rec)])
+                        .await?;
+                    provisional_id
+                }
+            }
+        } else {
+            // 新規: コミット時点で一意 ID を予約する (従来の max+1 と同セマンティクス)。
+            let new_id = self.novels.allocate_id().await?.0;
+            let mut rec = record.clone();
+            rec.id = new_id;
+            rec.tags = auto_tags.clone();
+            self.novels
+                .apply_batch(vec![NovelMutation::Upsert(rec)])
+                .await?;
+            new_id
+        };
 
-        self.remove_migrated_novel_dir(previous_novel_dir.as_deref(), &novel_dir);
+        #[cfg(feature = "native-runtime")]
+        self.remove_migrated_novel_dir(previous_novel_dir.as_deref(), &novel_dir)
+            .await;
 
         if let Some(old_id) = existing_id {
             self.move_section_hash_bucket(old_id, id);
@@ -1749,13 +1909,13 @@ impl Downloader {
         })
     }
 
-    fn section_needs_download(
+    async fn section_needs_download(
         &mut self,
         setting: &SiteSetting,
         latest: &SubtitleInfo,
         old: Option<&SubtitleInfo>,
         existing_id: Option<i64>,
-        section_dir: &PathBuf,
+        keys: &NovelObjectKeys,
         toc_url: &str,
         strong_update: bool,
         timezone: SiteTimezone,
@@ -1768,10 +1928,9 @@ impl Downloader {
             return Ok((true, None));
         }
 
-        let old_section_path = section_dir.join(section_filename(old));
-        if !old_section_path.exists() {
+        let Some(old_section) = self.persistence.load_section(keys, old).await? else {
             return Ok((true, None));
-        }
+        };
 
         let latest_subupdate = latest.subupdate.as_deref();
         let mut old_subupdate = old.subupdate.as_deref();
@@ -1808,29 +1967,30 @@ impl Downloader {
         if strong_update
             && let Some(basis_date) = strong_basis_date
             && date_string_to_ymd_with_timezone(basis_date, timezone)
-                == section_timestamp_ymd(&old_section_path, old.download_time.as_deref(), timezone)
+                == section_timestamp_ymd(old_section.download_time.as_deref(), timezone)
         {
             let downloaded = download_section(
-                &mut self.fetcher,
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
                 &mut self.section_cache,
                 setting,
                 latest,
                 toc_url,
-            )?;
+            )
+            .await?;
             let new_hash = compute_section_hash(&downloaded.0);
             let relative_path = section_relative_path(old);
             let old_hash = existing_id
                 .and_then(|id| {
-                    self.ensure_cached_section_digest(id, &relative_path, &old_section_path)
+                    self.cached_section_digest(id, &relative_path)
+                        .map(str::to_string)
                 })
                 .or_else(|| {
-                    load_section_file(&old_section_path).map(|section| {
-                        let digest = compute_section_hash(&section.element);
-                        if let Some(id) = existing_id {
-                            self.store_section_digest(id, &relative_path, &digest);
-                        }
-                        digest
-                    })
+                    let digest = compute_section_hash(&old_section.element);
+                    if let Some(id) = existing_id {
+                        self.store_section_digest(id, &relative_path, &digest);
+                    }
+                    Some(digest)
                 });
             if old_hash.as_deref() == Some(new_hash.as_str()) {
                 if let Some(id) = existing_id {
@@ -1845,17 +2005,20 @@ impl Downloader {
     }
 
     fn ageauth_redirect_target(url: &str) -> Option<String> {
-        let parsed = reqwest::Url::parse(url).ok()?;
+        let parsed = url::Url::parse(url).ok()?;
         if parsed.host_str() != Some("nl.syosetu.com") || parsed.path() != "/redirect/ageauth/" {
             return None;
         }
-        let target = parsed.query_pairs().find_map(|(key, value)| {
-            (key == "url").then(|| value.into_owned())
-        })?;
+        let target = parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "url").then(|| value.into_owned()))?;
         is_safe_public_url(&target).then_some(target)
     }
 
-    fn resolve_target_for_download(&self, target: &str) -> Result<(Option<i64>, SiteSetting)> {
+    async fn resolve_target_for_download(
+        &self,
+        target: &str,
+    ) -> Result<(Option<i64>, SiteSetting)> {
         let target_type = Self::get_target_type(target);
 
         match target_type {
@@ -1866,53 +2029,41 @@ impl Downloader {
                 let toc_url = setting
                     .toc_url_with_url_captures(target)
                     .unwrap_or_else(|| setting.toc_url());
-                let existing_id =
-                    crate::db::with_database(|db| Ok(db.get_by_toc_url(&toc_url).map(|r| r.id)))
-                        .ok()
-                        .flatten();
+                let existing_id = self
+                    .novels
+                    .find_by_toc_url(&toc_url)
+                    .await?
+                    .map(|record| record.id);
                 Ok((existing_id, setting))
             }
             TargetType::Ncode => {
                 let ncode = target.to_lowercase();
-                let existing_id = crate::db::with_database(|db| {
-                    Ok(db
-                        .all_records()
-                        .values()
-                        .find(|r| r.ncode.as_deref() == Some(ncode.as_str()))
-                        .map(|r| r.id))
-                })
-                .ok()
-                .flatten();
+                let existing_id = self
+                    .novels
+                    .find_by_ncode(&ncode)
+                    .await?
+                    .map(|record| record.id);
                 if let Some(id) = existing_id {
-                    let toc_url =
-                        crate::db::with_database(|db| Ok(db.get(id).map(|r| r.toc_url.clone())))
-                            .ok()
-                            .flatten();
-                    let setting = match toc_url {
-                        Some(ref url) => self.find_site_setting(url).ok_or_else(|| {
-                            NarouError::SiteSetting("No matching site setting".into())
-                        })?,
-                        None => {
-                            return Err(NarouError::NotFound(format!(
-                                "Novel record {} has no toc_url",
-                                id
-                            )));
-                        }
-                    };
+                    let record = self.novels.get(id.into()).await?.ok_or_else(|| {
+                        NarouError::NotFound(format!("Novel record {} has no toc_url", id))
+                    })?;
+                    let setting = self.find_site_setting(&record.toc_url).ok_or_else(|| {
+                        NarouError::SiteSetting("No matching site setting".into())
+                    })?;
                     Ok((Some(id), setting))
                 } else {
                     let narou_url = format!("https://ncode.syosetu.com/{}/", ncode);
                     let setting = self.find_site_setting(&narou_url).ok_or_else(|| {
                         NarouError::InvalidTarget(format!("対応外のncodeです({})", ncode))
                     })?;
-                    let existing_id = crate::db::with_database(|db| {
-                        let toc_url = setting
-                            .toc_url_with_url_captures(&narou_url)
-                            .unwrap_or_else(|| setting.toc_url());
-                        Ok(db.get_by_toc_url(&toc_url).map(|r| r.id))
-                    })
-                    .ok()
-                    .flatten();
+                    let toc_url = setting
+                        .toc_url_with_url_captures(&narou_url)
+                        .unwrap_or_else(|| setting.toc_url());
+                    let existing_id = self
+                        .novels
+                        .find_by_toc_url(&toc_url)
+                        .await?
+                        .map(|record| record.id);
                     Ok((existing_id, setting))
                 }
             }
@@ -1920,42 +2071,30 @@ impl Downloader {
                 let id: i64 = target
                     .parse()
                     .map_err(|_| NarouError::InvalidTarget(target.to_string()))?;
-                let setting = crate::db::with_database(|db| {
-                    Ok(db.get(id).and_then(|r| {
-                        self.find_site_setting(&r.toc_url).or_else(|| {
-                            Self::ageauth_redirect_target(&r.toc_url)
-                                .and_then(|url| self.find_site_setting(&url))
-                        })
-                    }))
-                })
-                .ok()
-                .flatten();
+                let setting = self.novels.get(id.into()).await?.and_then(|record| {
+                    self.find_site_setting(&record.toc_url).or_else(|| {
+                        Self::ageauth_redirect_target(&record.toc_url)
+                            .and_then(|url| self.find_site_setting(&url))
+                    })
+                });
                 let setting = setting.ok_or_else(|| {
                     NarouError::NotFound(format!("Novel not found for ID: {}", id))
                 })?;
                 Ok((Some(id), setting))
             }
             TargetType::Other => {
-                let existing_id =
-                    crate::db::with_database(|db| Ok(db.find_by_title(target).map(|r| r.id)))
-                        .ok()
-                        .flatten();
+                let existing_id = self
+                    .novels
+                    .find_by_title(target)
+                    .await?
+                    .map(|record| record.id);
                 if let Some(id) = existing_id {
-                    let toc_url =
-                        crate::db::with_database(|db| Ok(db.get(id).map(|r| r.toc_url.clone())))
-                            .ok()
-                            .flatten();
-                    let setting = match toc_url {
-                        Some(ref url) => self.find_site_setting(url).ok_or_else(|| {
-                            NarouError::SiteSetting("No matching site setting".into())
-                        })?,
-                        None => {
-                            return Err(NarouError::NotFound(format!(
-                                "Novel record {} has no toc_url",
-                                id
-                            )));
-                        }
-                    };
+                    let record = self.novels.get(id.into()).await?.ok_or_else(|| {
+                        NarouError::NotFound(format!("Novel record {} has no toc_url", id))
+                    })?;
+                    let setting = self.find_site_setting(&record.toc_url).ok_or_else(|| {
+                        NarouError::SiteSetting("No matching site setting".into())
+                    })?;
                     Ok((Some(id), setting))
                 } else {
                     Err(NarouError::NotFound(format!(
@@ -1982,21 +2121,19 @@ impl Downloader {
         ncode: &Option<String>,
         title: &str,
         append_title: bool,
-        existing_id: Option<i64>,
+        existing_record: Option<&NovelRecord>,
     ) -> String {
-        if let Some(id) = existing_id {
-            if let Ok(Some(record)) = crate::db::with_database(|db| Ok(db.get(id).cloned())) {
-                if !record.file_title.is_empty() {
-                    if append_title
-                        && ncode
-                            .as_deref()
-                            .is_some_and(|ncode| record.file_title.eq_ignore_ascii_case(ncode))
-                        && !title.is_empty()
-                    {
-                        // Recover records created before the correct site/title was known.
-                    } else {
-                        return record.file_title;
-                    }
+        if let Some(record) = existing_record {
+            if !record.file_title.is_empty() {
+                if append_title
+                    && ncode
+                        .as_deref()
+                        .is_some_and(|ncode| record.file_title.eq_ignore_ascii_case(ncode))
+                    && !title.is_empty()
+                {
+                    // Recover records created before the correct site/title was known.
+                } else {
+                    return record.file_title.clone();
                 }
             }
         }
@@ -2024,50 +2161,76 @@ impl Downloader {
         file_title: &str,
         use_subdirectory: bool,
     ) -> PathBuf {
+        let root = PathBuf::from(types::ARCHIVE_ROOT_DIR);
         crate::db::paths::novel_dir_from_components(
-            Path::new(types::ARCHIVE_ROOT_DIR),
+            &root,
             sitename,
             file_title,
             use_subdirectory,
         )
     }
 
-    fn remove_migrated_novel_dir(&self, previous: Option<&Path>, current: &Path) {
+    /// Remove the previous novel directory after a title change, but only when
+    /// no other record still references it. Native filesystem compatibility;
+    /// Worker builds have no filesystem to migrate.
+    #[cfg(feature = "native-runtime")]
+    async fn remove_migrated_novel_dir(&self, previous: Option<&Path>, current: &Path) {
         let Some(previous) = previous else {
             return;
         };
         if previous == current || !previous.exists() {
             return;
         }
-        let still_referenced = crate::db::with_database(|db| {
-            Ok(db
-                .all_records()
-                .values()
-                .any(|record| crate::db::novel_dir_for_record(Path::new(types::ARCHIVE_ROOT_DIR), record) == previous))
-        })
-        .unwrap_or(true);
+
+        let filter = crate::platform::NovelFilter::all();
+        let mut after_id = None;
+        let mut still_referenced = false;
+        loop {
+            let ids = match self.novels.scan_ids(&filter, after_id, 256).await {
+                Ok(ids) => ids,
+                Err(_) => {
+                    still_referenced = true;
+                    break;
+                }
+            };
+            if ids.is_empty() {
+                break;
+            }
+            after_id = ids.last().copied();
+            for id in ids {
+                match self.novels.get(id).await {
+                    Ok(Some(record)) => {
+                        if crate::db::novel_dir_for_record(
+                            Path::new(types::ARCHIVE_ROOT_DIR),
+                            &record,
+                        ) == previous
+                        {
+                            still_referenced = true;
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        still_referenced = true;
+                        break;
+                    }
+                }
+            }
+            if still_referenced {
+                break;
+            }
+        }
         if !still_referenced {
             let _ = std::fs::remove_dir_all(previous);
         }
     }
 
-    fn download_use_subdirectory(&self, existing_id: Option<i64>) -> bool {
-        if let Some(id) = existing_id {
-            if let Ok(Some(record)) = crate::db::with_database(|db| Ok(db.get(id).cloned())) {
-                return record.use_subdirectory;
-            }
+    fn download_use_subdirectory(&self, existing_record: Option<&NovelRecord>) -> bool {
+        if let Some(record) = existing_record {
+            return record.use_subdirectory;
         }
 
-        crate::db::with_database(|db| {
-            let settings: HashMap<String, serde_yaml::Value> = db
-                .inventory()
-                .load("local_setting", crate::db::inventory::InventoryScope::Local)?;
-            Ok(settings
-                .get("download.use-subdirectory")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false))
-        })
-        .unwrap_or(false)
+        self.settings.download_use_subdirectory()
     }
 
     fn cached_section_digest(&self, id: i64, relative_path: &str) -> Option<&str> {
@@ -2083,22 +2246,6 @@ impl Downloader {
             bucket.insert(relative_path.to_string(), digest.to_string());
             self.section_hash_cache_dirty = true;
         }
-    }
-
-    fn ensure_cached_section_digest(
-        &mut self,
-        id: i64,
-        relative_path: &str,
-        full_path: &PathBuf,
-    ) -> Option<String> {
-        if let Some(digest) = self.cached_section_digest(id, relative_path) {
-            return Some(digest.to_string());
-        }
-
-        let section = load_section_file(full_path)?;
-        let digest = compute_section_hash(&section.element);
-        self.store_section_digest(id, relative_path, &digest);
-        Some(digest)
     }
 
     fn clear_section_digest(&mut self, id: i64, relative_path: &str) {
@@ -2134,14 +2281,8 @@ impl Downloader {
         if !self.section_hash_cache_dirty {
             return Ok(());
         }
-        crate::db::with_database(|db| {
-            db.inventory().save(
-                SECTION_HASH_CACHE_NAME,
-                crate::db::inventory::InventoryScope::Local,
-                &self.section_hash_cache,
-            )?;
-            Ok(())
-        })?;
+        self.settings
+            .save_section_hash_cache(&self.section_hash_cache)?;
         self.section_hash_cache_dirty = false;
         Ok(())
     }
@@ -2154,26 +2295,37 @@ impl Downloader {
         self.find_site_setting(url).is_some()
     }
 
-    pub fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
-        self.fetcher.configure_rate_limiter(true);
-        narou_api_batch_update(&mut self.fetcher)
+    /// Batch-refresh なろうAPI metadata for all なろう records. Uses the
+    /// native dedicated API rate limiter; Worker builds schedule their own
+    /// batch jobs.
+    #[cfg(feature = "native-runtime")]
+    pub async fn narou_api_batch_update(&mut self) -> Result<(usize, usize)> {
+        narou_api_batch_update(self.http.as_ref(), self.novels.as_ref()).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Downloader, Over18AccessDecision, illustration_sources, over18_access_decision,
-        requires_over18_confirmation, resolve_novel_type, resolve_user_agent,
-    };
     use super::novel_info::NovelInfo;
-    use super::site_setting::SiteSetting;
-    use super::types::SectionElement;
+    use super::persistence::PersistenceService;
+    use super::site_setting::{SiteSetting, SiteSettingValue};
+    use super::types::{SectionElement, TocFile};
     use super::util::compile_html_pattern;
+    use super::{
+        DownloadExecutionOptions, Downloader, Over18AccessDecision, SectionBudget,
+        illustration_sources, over18_access_decision, requires_over18_confirmation,
+        resolve_novel_type, resolve_user_agent,
+    };
     use crate::db::{self, Database};
+    use crate::platform::NovelRepository;
+    use crate::platform::mocks::{
+        FakeRateLimiter, MemoryNovelRepository, MemoryObjectStore, MockHttpClient,
+    };
+    use crate::platform::{AssetStore, NovelMutation, NovelObjectKeys, ObjectStore, SystemClock};
+    use chrono::TimeZone;
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use chrono::TimeZone;
+    use std::sync::Arc;
 
     struct DatabaseGuard(Option<Database>);
 
@@ -2207,10 +2359,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            urls,
-            vec!["http://syosetu.org/img/user/10193/110088.jpg"]
-        );
+        assert_eq!(urls, vec!["http://syosetu.org/img/user/10193/110088.jpg"]);
     }
 
     #[test]
@@ -2235,6 +2384,292 @@ mod tests {
             )
             .as_deref(),
             Some("https://novel18.syosetu.com/n7274mc/")
+        );
+    }
+
+    #[test]
+    fn repository_injection_resolves_existing_ncode_without_database_global() {
+        let mut record = sample_record(chrono::Utc::now());
+        record.id = 42;
+        record.toc_url = "https://ncode.syosetu.com/n1234ab/".to_string();
+        record.ncode = Some("n1234ab".to_string());
+        record.is_narou = true;
+
+        let repository = Arc::new(MemoryNovelRepository::from_records(vec![record]));
+        let downloader = Downloader::with_platform(
+            Arc::new(MockHttpClient::new()),
+            Arc::new(FakeRateLimiter::new()),
+            repository,
+        )
+        .unwrap();
+
+        let (id, setting) =
+            futures::executor::block_on(downloader.resolve_target_for_download("N1234AB")).unwrap();
+        assert_eq!(id, Some(42));
+        assert_eq!(setting.domain, "ncode.syosetu.com");
+    }
+
+    #[test]
+    fn explicit_storage_constructor_avoids_native_loaders() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let objects: Arc<dyn ObjectStore> = store.clone();
+        let assets: Arc<dyn AssetStore> = store;
+        let downloader = Downloader::with_platform_and_storage_and_settings(
+            Arc::new(MockHttpClient::new()),
+            Arc::new(FakeRateLimiter::new()),
+            Arc::new(MemoryNovelRepository::new()),
+            objects,
+            assets,
+            Arc::new(SystemClock),
+            Vec::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+        assert!(downloader.site_settings.is_empty());
+        assert!(downloader.section_hash_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_storage_download_pipeline_persists_toc_section_raw_and_record() {
+        let mut setting: SiteSetting =
+            serde_yaml::from_str(include_str!("../../webnovel/ncode.syosetu.com.yaml")).unwrap();
+        setting.subtitles = Some(SiteSettingValue::Single(
+            r#"<a href="(?<href>[^"]+)" class="p-eplist__subtitle">(?<subtitle>[^<]+)</a>"#
+                .to_string(),
+        ));
+        setting.body_pattern =
+            Some(r#"<div class="js-novel-text p-novel__text">(?<body>.+?)</div>"#.to_string());
+        setting.compile();
+        let toc_url = "https://ncode.syosetu.com/n1234ab/";
+        let section_url = "https://ncode.syosetu.com/n1234ab/1/";
+        let http = Arc::new(MockHttpClient::new());
+        http.add_text(
+            toc_url,
+            200,
+            r#"<div class="p-eplist__sublist">
+<a href="/n1234ab/1/" class="p-eplist__subtitle">第1話</a>
+<div class="p-eplist__update">2026年01月01日</div>
+</div>"#,
+        );
+        http.add_text(
+            section_url,
+            200,
+            r#"<div class="js-novel-text p-novel__text">本文テスト</div>"#,
+        );
+
+        let toc_source =
+            super::toc::fetch_toc(http.as_ref(), &FakeRateLimiter::new(), &setting, toc_url)
+                .await
+                .unwrap();
+        let captures = HashMap::from([("ncode".to_string(), "n1234ab".to_string())]);
+        let subtitles = super::toc::parse_subtitles(&setting, &toc_source, &captures).unwrap();
+        assert_eq!(subtitles.len(), 1);
+
+        let mut section_cache = super::section::SectionCache::new();
+        let (element, raw_html) = super::section::download_section(
+            http.as_ref(),
+            &FakeRateLimiter::new(),
+            &mut section_cache,
+            &setting,
+            &subtitles[0],
+            toc_url,
+        )
+        .await
+        .unwrap();
+        assert_eq!(element.body, "本文テスト");
+
+        let store = Arc::new(MemoryObjectStore::new());
+        let objects: Arc<dyn ObjectStore> = store.clone();
+        let assets: Arc<dyn AssetStore> = store.clone();
+        let persistence =
+            PersistenceService::with_clock(objects.clone(), assets, Arc::new(SystemClock));
+        let keys = NovelObjectKeys::new("小説家になろう", "テスト作品", false).unwrap();
+        let toc = TocFile {
+            title: "テスト作品".to_string(),
+            author: "作者".to_string(),
+            toc_url: toc_url.to_string(),
+            story: Some("あらすじ".to_string()),
+            subtitles: subtitles.clone(),
+            novel_type: Some(1),
+        };
+        persistence.save_toc(&keys, &toc).await.unwrap();
+        persistence
+            .save_section(&keys, &subtitles[0], &element)
+            .await
+            .unwrap();
+        persistence
+            .save_raw(&keys, &subtitles[0], &raw_html)
+            .await
+            .unwrap();
+        assert_eq!(
+            persistence.load_toc(&keys).await.unwrap().unwrap().title,
+            "テスト作品"
+        );
+        assert_eq!(
+            persistence
+                .load_section(&keys, &subtitles[0])
+                .await
+                .unwrap()
+                .unwrap()
+                .element
+                .body,
+            "本文テスト"
+        );
+        assert!(
+            objects
+                .read_small(&keys.raw_section(&subtitles[0].index, &subtitles[0].file_subtitle))
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let mut record = sample_record(chrono::Utc::now());
+        record.id = 7;
+        record.toc_url = toc_url.to_string();
+        record.title = "テスト作品".to_string();
+        let repository = MemoryNovelRepository::new();
+        repository
+            .apply_batch(vec![NovelMutation::Upsert(record.clone())])
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.get(7.into()).await.unwrap().unwrap().title,
+            "テスト作品"
+        );
+        assert_eq!(http.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn resumable_download_reuses_persisted_prefix_without_refetching() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let db = Database::new().unwrap();
+        let mut db_slot = db::DATABASE.lock();
+        let previous_db = db_slot.take();
+        *db_slot = Some(db);
+        drop(db_slot);
+        let _db_guard = DatabaseGuard(previous_db);
+
+        struct YieldBeforeSection(usize);
+
+        impl SectionBudget for YieldBeforeSection {
+            fn should_yield(&mut self, next_section_index: usize) -> bool {
+                next_section_index >= self.0
+            }
+        }
+
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            r#"
+name: Resume Test
+domain: example.com
+top_url: https://example.com
+url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+sitename: Resume Test
+toc_url: 'https://example.com/\k<ncode>/'
+subtitles: |-
+  <a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a>
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+is_narou: false
+"#,
+        )
+        .unwrap();
+        setting.compile();
+
+        let target = "https://example.com/n1234ab/";
+        let toc_url = target;
+        let section_1 = "https://example.com/n1234ab/1/";
+        let section_2 = "https://example.com/n1234ab/2/";
+        let toc = r#"
+<h1>Resume Test</h1><span>Author</span>
+<a href="/n1234ab/1/">第1話</a>
+<a href="/n1234ab/2/">第2話</a>
+"#;
+        let http = Arc::new(MockHttpClient::new());
+        http.add_text(toc_url, 200, toc);
+        http.add_text(section_1, 200, r#"<div class="body">本文1</div>"#);
+        http.add_text(section_2, 200, r#"<div class="body">本文2</div>"#);
+        let store = Arc::new(MemoryObjectStore::new());
+        let objects: Arc<dyn ObjectStore> = store.clone();
+        let assets: Arc<dyn AssetStore> = store;
+        let mut downloader = Downloader::with_platform_and_storage_and_settings(
+            http.clone(),
+            Arc::new(FakeRateLimiter::new()),
+            Arc::new(MemoryNovelRepository::new()),
+            objects,
+            assets,
+            Arc::new(SystemClock),
+            vec![setting],
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let mut budget = YieldBeforeSection(1);
+        let partial = downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: true,
+                    budget: Some(&mut budget),
+                    resume_from_section: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                partial,
+                crate::error::NarouError::DownloadBudgetExpired {
+                    next_section_index: 1
+                }
+            ),
+            "unexpected partial result: {partial:?}; requests={:?}",
+            http.requested_urls()
+        );
+        let first_requests = http.requested_urls();
+        assert_eq!(
+            first_requests
+                .iter()
+                .filter(|url| url.ends_with(section_1))
+                .count(),
+            1
+        );
+        assert_eq!(
+            first_requests
+                .iter()
+                .filter(|url| url.ends_with(section_2))
+                .count(),
+            0
+        );
+
+        downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: false,
+                    budget: None,
+                    resume_from_section: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        let requests = http.requested_urls();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|url| url.ends_with(section_1))
+                .count(),
+            1,
+            "the persisted prefix must not be fetched again"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|url| url.ends_with(section_2))
+                .count(),
+            1
         );
     }
 
@@ -2286,7 +2721,9 @@ mod tests {
             db.insert(current_record);
         }
 
-        downloader.remove_migrated_novel_dir(Some(&previous), &current);
+        futures::executor::block_on(
+            downloader.remove_migrated_novel_dir(Some(&previous), &current),
+        );
         assert!(previous.exists());
     }
 
@@ -2366,9 +2803,8 @@ mod tests {
 
     #[test]
     fn timezone_less_site_datetime_accepts_fixed_offset_setting() {
-        let parsed =
-            super::parse_datetime_with_timezone("2026-04-19 12:00:00", Some("+09:00"))
-                .expect("datetime");
+        let parsed = super::parse_datetime_with_timezone("2026-04-19 12:00:00", Some("+09:00"))
+            .expect("datetime");
 
         assert_eq!(
             parsed.format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -2390,11 +2826,17 @@ mod tests {
 
     #[test]
     fn no_update_preserves_update_timestamps() {
-        assert!(!super::should_replace_last_update(super::types::UpdateStatus::None));
-        assert!(super::should_replace_last_update(super::types::UpdateStatus::Ok));
+        assert!(!super::should_replace_last_update(
+            super::types::UpdateStatus::None
+        ));
+        assert!(super::should_replace_last_update(
+            super::types::UpdateStatus::Ok
+        ));
     }
 
-    fn sample_record(timestamp: chrono::DateTime<chrono::Utc>) -> crate::db::novel_record::NovelRecord {
+    fn sample_record(
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> crate::db::novel_record::NovelRecord {
         crate::db::novel_record::NovelRecord {
             id: 1,
             author: "author".to_string(),
@@ -2565,12 +3007,8 @@ mod tests {
         assert_eq!(super::sanitize_site_tags(&tags), vec!["tag-a", "tag-b"]);
         assert!(html.contains("Chapter;1;10;第一章"));
         assert!(!html.contains("Chapter;1;10;;第一章"));
-        assert!(html.contains(
-            "Episode;20;2021-01-12T16:13:02Z;2021-01-13T16:13:02Z;第1話"
-        ));
-        assert!(html.contains(
-            "Episode;21;2021-01-14T16:13:02Z;2021-01-14T16:13:02Z;第2話"
-        ));
+        assert!(html.contains("Episode;20;2021-01-12T16:13:02Z;2021-01-13T16:13:02Z;第1話"));
+        assert!(html.contains("Episode;21;2021-01-14T16:13:02Z;2021-01-14T16:13:02Z;第2話"));
         let mut url_captures = HashMap::new();
         url_captures.insert("ncode".to_string(), "1177354055617350769".to_string());
         let subtitles = super::toc::parse_subtitles(setting, &html, &url_captures).unwrap();
@@ -2663,19 +3101,17 @@ mod tests {
         assert_eq!(info.author.as_deref(), Some("鉄鋼怪人"));
         assert_eq!(info.novel_type, Some(1));
         assert_eq!(
-            info.general_firstup
-                .map(|dt| dt
-                    .with_timezone(&chrono_tz::Asia::Tokyo)
-                    .format("%Y-%m-%d %H:%M")
-                    .to_string()),
+            info.general_firstup.map(|dt| dt
+                .with_timezone(&chrono_tz::Asia::Tokyo)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()),
             Some("2020-08-01 00:33".to_string())
         );
         assert_eq!(
-            info.general_lastup
-                .map(|dt| dt
-                    .with_timezone(&chrono_tz::Asia::Tokyo)
-                    .format("%Y-%m-%d %H:%M")
-                    .to_string()),
+            info.general_lastup.map(|dt| dt
+                .with_timezone(&chrono_tz::Asia::Tokyo)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()),
             Some("2026-04-17 07:00".to_string())
         );
     }
@@ -2694,7 +3130,13 @@ mod tests {
 
         assert_eq!(
             super::sanitize_site_tags(&tags),
-            vec!["和風ファンタジー", "妖", "ヤンデレ", "闇夜の蛍", "残酷な描写"]
+            vec![
+                "和風ファンタジー",
+                "妖",
+                "ヤンデレ",
+                "闇夜の蛍",
+                "残酷な描写"
+            ]
         );
     }
 
@@ -2931,6 +3373,16 @@ mod tests {
 
     #[test]
     fn section_hash_cache_store_and_clear_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let db = Database::new().unwrap();
+        let mut db_slot = db::DATABASE.lock();
+        let previous_db = db_slot.take();
+        *db_slot = Some(db);
+        drop(db_slot);
+        let _db_guard = DatabaseGuard(previous_db);
+
         let mut downloader = Downloader::with_user_agent(None).unwrap();
         downloader.store_section_digest(42, "本文\\1 test.yaml", "digest-1");
 

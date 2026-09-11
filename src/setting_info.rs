@@ -96,6 +96,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "update.sort-by"
         | "update.auto-schedule.enable"
         | "update.auto-schedule"
+        | "update.auto-schedule.timezone"
         | "update.max-parallel-domains"
         | "convert.copy-to"
         | "convert.copy-zip-to"
@@ -793,6 +794,13 @@ pub fn setting_variables() -> SettingVariables {
             vis(
                 VarType::String,
                 "自動アップデートする時間を指定する。カンマ区切りで複数指定可能。\n      書式：HHMM (例: 0800,1200,1800 = 8時、12時、18時)",
+            ),
+        ),
+        (
+            "update.auto-schedule.timezone",
+            vis(
+                VarType::String,
+                "自動アップデートのHHMMを評価するIANAタイムゾーン。Workerの既定値は Asia/Tokyo",
             ),
         ),
         (

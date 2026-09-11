@@ -1,16 +1,11 @@
 use axum::{extract::State, response::Json};
-use std::collections::HashMap;
 
 use crate::converter::device::Device;
-use crate::setting_core::{
-    SettingScope, apply_device_related_settings, coerce_json_setting_value, setting_scope,
-};
+use crate::setting_core::SettingScope;
 use crate::setting_info::{
-    VarInfo, VarType, default_arg_command_names, default_local_setting_value,
-    original_setting_var_infos, setting_variables, tab_for_setting, webui_help_override,
+    VarInfo, VarType, original_setting_var_infos, setting_variables, tab_for_setting,
+    webui_help_override,
 };
-use crate::db::inventory::{Inventory, InventoryScope};
-use crate::db::with_database;
 
 use super::AppState;
 use super::sort_state::sort_column_label_for_key;
@@ -50,87 +45,98 @@ const TABS: &[(&str, &str, &str)] = &[
 
 /// GET /api/setting — returns all settings with metadata
 pub async fn get_global_settings(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
-    let vars = setting_variables();
+    let entries = match state.services.settings.list().await {
+        Ok(entries) => entries,
+        Err(error) => {
+            return Json(serde_json::json!({
+                "tabs": [],
+                "settings": [],
+                "replace_content": "",
+                "error": error.to_string(),
+            }));
+        }
+    };
+    let mut settings = Vec::new();
+    let variables = setting_variables();
     let novel_vars = original_setting_var_infos();
 
-    // Load current values
-    let local_values: HashMap<String, serde_yaml::Value> = with_database(|db| {
-        db.inventory()
-            .load("local_setting", InventoryScope::Local)
-    })
-    .unwrap_or_default();
-
-    let global_values: HashMap<String, serde_yaml::Value> = {
-        let inv = Inventory::with_default_root().unwrap_or_else(|_| {
-            Inventory::new(std::env::current_dir().unwrap_or_default())
-        });
-        inv.load("global_setting", InventoryScope::Global)
-            .unwrap_or_default()
-    };
-
-    let mut settings = Vec::new();
-
-    // Local settings
-    for (name, info) in &vars.local {
-        let tab = tab_for_setting(name);
-        if tab.is_none() {
+    for entry in entries {
+        let dynamic_prefix = entry
+            .name
+            .strip_prefix("default.")
+            .map(|_| "default")
+            .or_else(|| entry.name.strip_prefix("force.").map(|_| "force"));
+        let tab = if let Some(prefix) = dynamic_prefix {
+            Some(prefix)
+        } else if entry.name.starts_with("default_args.") {
+            Some("command")
+        } else {
+            tab_for_setting(&entry.name)
+        };
+        let Some(tab) = tab else {
             continue;
+        };
+        let scope = match entry.scope {
+            SettingScope::Local => "local",
+            SettingScope::Global => "global",
+        };
+        let info = if let Some(prefix) = dynamic_prefix {
+            let base_name = entry
+                .name
+                .strip_prefix(&format!("{prefix}."))
+                .unwrap_or(&entry.name);
+            novel_vars
+                .iter()
+                .find(|(name, _)| *name == base_name)
+                .map(|(_, info)| info.clone())
+        } else {
+            variables
+                .local
+                .iter()
+                .find(|(name, _)| *name == entry.name)
+                .or_else(|| {
+                    variables
+                        .global
+                        .iter()
+                        .find(|(name, _)| *name == entry.name)
+                })
+                .map(|(_, info)| info.clone())
+        };
+        let mut item = if let Some(info) = info {
+            build_setting_entry(
+                &entry.name,
+                &info,
+                scope,
+                tab,
+                entry.value.clone(),
+            )
+        } else {
+            serde_json::json!({
+                "name": entry.name,
+                "scope": scope,
+                "tab": tab,
+                "var_type": entry.var_type,
+                "help": entry.help,
+                "value": yaml_to_json(entry.value),
+                "select_keys": entry.select_keys,
+                "invisible": false,
+            })
+        };
+        if dynamic_prefix.is_some() && matches!(entry.var_type, VarType::Boolean) {
+            item["three_way"] = serde_json::json!(true);
+            item["invisible"] = serde_json::json!(false);
         }
-        let value = local_values
-            .get(*name)
-            .cloned()
-            .or_else(|| default_local_setting_value(name));
-        settings.push(build_setting_entry(name, info, "local", tab.unwrap(), value));
+        settings.push(item);
     }
 
-    // Global settings
-    for (name, info) in &vars.global {
-        let tab = tab_for_setting(name);
-        if tab.is_none() {
-            continue;
-        }
-        let value = global_values.get(*name).cloned();
-        settings.push(build_setting_entry(name, info, "global", tab.unwrap(), value));
-    }
-
-    // default.* / force.* entries from novel vars
-    for prefix in &["default", "force"] {
-        for (base_name, info) in &novel_vars {
-            let name = format!("{}.{}", prefix, base_name);
-            let tab = *prefix;
-            let value = local_values.get(&name).cloned();
-            let mut entry = build_setting_entry(&name, info, "local", tab, value);
-            // default/force booleans use 3-way (nil/off/on)
-            if matches!(info.var_type, VarType::Boolean) {
-                entry["three_way"] = serde_json::json!(true);
-            }
-            // Make visible for the settings page
-            entry["invisible"] = serde_json::json!(false);
-            settings.push(entry);
-        }
-    }
-
-    // default_args.* entries from known commands
-    for cmd in default_arg_command_names() {
-        let name = format!("default_args.{}", cmd);
-        let value = local_values.get(&name).cloned();
-        settings.push(serde_json::json!({
-            "name": name,
-            "scope": "local",
-            "tab": "command",
-            "var_type": "string",
-            "help": format!("{} コマンドのデフォルトオプション", cmd),
-            "value": yaml_to_json(value),
-            "invisible": false,
-        }));
-    }
-
-    // Load replace.txt content
-    let replace_content = std::fs::read_to_string("replace.txt").unwrap_or_default();
-
-    // Tabs metadata
+    let replace_content = state
+        .services
+        .settings
+        .load_replace_content()
+        .await
+        .unwrap_or_default();
     let tabs: Vec<serde_json::Value> = TABS
         .iter()
         .map(|(id, label, info)| {
@@ -161,120 +167,20 @@ pub async fn save_global_settings(
         });
     };
 
-    // Separate into local and global
-    let mut local_changes: HashMap<String, serde_yaml::Value> = HashMap::new();
-    let mut global_changes: HashMap<String, serde_yaml::Value> = HashMap::new();
-    let mut deletes_local: Vec<String> = Vec::new();
-    let mut deletes_global: Vec<String> = Vec::new();
-    let mut auto_schedule_changed = false;
-    let webui_config_changed = entries.keys().any(|name| is_live_webui_config_name(name));
-
-    for (name, json_val) in entries {
-        // Determine scope
-        let scope = setting_scope(name);
-
-        if json_val.is_null() {
-            match scope {
-                Some(SettingScope::Global) => deletes_global.push(name.clone()),
-                Some(SettingScope::Local) => deletes_local.push(name.clone()),
-                None => {
-                    return Json(ApiResponse {
-                        success: false,
-                        message: format!("{}: 不明な設定名です", name),
-                    });
-                }
-            }
-            continue;
-        }
-
-        let yaml_val = match coerce_json_setting_value(name, json_val) {
-            Ok(value) => value,
-            Err(message) => {
-                return Json(ApiResponse {
-                    success: false,
-                    message: format!("{}: {}", name, message),
-                });
-            }
-        };
-        match scope {
-            Some(SettingScope::Global) => {
-                global_changes.insert(name.clone(), yaml_val);
-            }
-            Some(SettingScope::Local) => {
-                local_changes.insert(name.clone(), yaml_val);
-            }
-            None => {
-                return Json(ApiResponse {
-                    success: false,
-                    message: format!("{}: 不明な設定名です", name),
-                });
-            }
-        }
-    }
-
-    // Save local settings
-    if !local_changes.is_empty() || !deletes_local.is_empty() {
-        let result = with_database(|db| {
-            let inv = db.inventory();
-            let mut settings: HashMap<String, serde_yaml::Value> = inv
-                .load("local_setting", InventoryScope::Local)
-                .unwrap_or_default();
-            let auto_schedule_before = auto_schedule_snapshot(&settings);
-            let previous_device = setting_string(settings.get("device"));
-            for (k, v) in local_changes {
-                settings.insert(k, v);
-            }
-            for k in &deletes_local {
-                settings.remove(k);
-            }
-            if setting_string(settings.get("device")) != previous_device {
-                let _ = apply_device_related_settings(&mut settings);
-            }
-            inv.save("local_setting", InventoryScope::Local, &settings)?;
-            Ok(auto_schedule_before != auto_schedule_snapshot(&settings))
-        });
-        match result {
-            Ok(changed) => {
-                auto_schedule_changed = changed;
-            }
-            Err(e) => {
-                eprintln!("web save local settings failed: {}", e);
-                return Json(ApiResponse {
-                    success: false,
-                    message: "ローカル設定の保存に失敗しました".to_string(),
-                });
-            }
-        }
-    }
-
-    // Save global settings
-    if !global_changes.is_empty() || !deletes_global.is_empty() {
-        let result: std::result::Result<(), Box<dyn std::error::Error>> = (|| {
-            let inv = Inventory::with_default_root().unwrap_or_else(|_| {
-                Inventory::new(std::env::current_dir().unwrap_or_default())
-            });
-            let mut settings: HashMap<String, serde_yaml::Value> = inv
-                .load("global_setting", InventoryScope::Global)
-                .unwrap_or_default();
-            for (k, v) in global_changes {
-                settings.insert(k, v);
-            }
-            for k in &deletes_global {
-                settings.remove(k);
-            }
-            inv.save("global_setting", InventoryScope::Global, &settings)?;
-            Ok(())
-        })();
-        if let Err(e) = result {
-            eprintln!("web save global settings failed: {}", e);
+    let changes: Vec<(String, serde_json::Value)> = entries
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let effects = match state.services.settings.apply_json(&changes).await {
+        Ok(effects) => effects,
+        Err(error) => {
             return Json(ApiResponse {
                 success: false,
-                message: "グローバル設定の保存に失敗しました".to_string(),
+                message: error.to_string(),
             });
         }
-    }
+    };
 
-    // Save replace.txt if provided
     if let Some(content) = body["replace_content"].as_str() {
         if let Err(message) =
             super::validate_web_text_size(content, super::MAX_WEB_TEXT_INPUT_BYTES, "replace.txt")
@@ -284,16 +190,18 @@ pub async fn save_global_settings(
                 message,
             });
         }
-        if let Err(e) = std::fs::write("replace.txt", content) {
-            eprintln!("web save replace.txt failed: {}", e);
+        if let Err(error) = state.services.settings.save_replace_content(content).await {
             return Json(ApiResponse {
                 success: false,
-                message: "replace.txt の保存に失敗しました".to_string(),
+                message: error.to_string(),
             });
         }
     }
 
-    if auto_schedule_changed {
+    if effects
+        .iter()
+        .any(|effect| matches!(effect, crate::application::SettingsEffect::AutoScheduleChanged))
+    {
         let started = crate::web::scheduler::start_or_restart_auto_update_scheduler(
             state.queue.clone(),
             state.running_jobs.clone(),
@@ -307,7 +215,10 @@ pub async fn save_global_settings(
         };
         state.push_server.broadcast_echo(message, "stdout");
     }
-    if webui_config_changed {
+    if effects
+        .iter()
+        .any(|effect| matches!(effect, crate::application::SettingsEffect::WebuiConfigChanged))
+    {
         state.push_server.broadcast_event("webui.config.reload", "");
     }
 
@@ -317,14 +228,6 @@ pub async fn save_global_settings(
     })
 }
 
-fn auto_schedule_snapshot(
-    settings: &HashMap<String, serde_yaml::Value>,
-) -> (Option<serde_yaml::Value>, Option<serde_yaml::Value>) {
-    (
-        settings.get("update.auto-schedule.enable").cloned(),
-        settings.get("update.auto-schedule").cloned(),
-    )
-}
 
 fn build_setting_entry(
     name: &str,
@@ -348,16 +251,6 @@ fn build_setting_entry(
     })
 }
 
-fn is_live_webui_config_name(name: &str) -> bool {
-    matches!(
-        name,
-        "webui.theme"
-            | "webui.table.reload-timing"
-            | "webui.performance-mode"
-            | "webui.new-tag-color"
-            | "webui.debug-mode"
-    )
-}
 
 fn select_summaries_for_setting(name: &str, info: &VarInfo) -> Option<Vec<String>> {
     let keys = info.select_keys.as_ref()?;
@@ -440,16 +333,12 @@ fn yaml_to_json(value: Option<serde_yaml::Value>) -> serde_json::Value {
     }
 }
 
-fn setting_string(value: Option<&serde_yaml::Value>) -> Option<String> {
-    match value {
-        Some(serde_yaml::Value::String(raw)) => Some(raw.clone()),
-        _ => None,
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use crate::setting_core::{apply_device_related_settings, coerce_json_setting_value};
 
     #[test]
     fn coerce_float_setting_from_string() {
@@ -545,13 +434,4 @@ mod tests {
         assert_eq!(entry["invisible"], false);
     }
 
-    #[test]
-    fn live_webui_config_names_are_detected() {
-        assert!(is_live_webui_config_name("webui.theme"));
-        assert!(is_live_webui_config_name("webui.table.reload-timing"));
-        assert!(is_live_webui_config_name("webui.performance-mode"));
-        assert!(is_live_webui_config_name("webui.new-tag-color"));
-        assert!(is_live_webui_config_name("webui.debug-mode"));
-        assert!(!is_live_webui_config_name("server-port"));
-    }
 }

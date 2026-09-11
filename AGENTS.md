@@ -131,6 +131,17 @@ src/
   error.rs                         - NarouError enum + Result type
   queue.rs                         - PersistentQueue (YAMLベース永続化ジョブキュー)
   lib.rs                           - クレートルート (pub mod定義)
+  platform/
+    mod.rs                         - プラットフォーム抽象層 (traits re-export, 設計: docs/platform-abstraction.md)
+    http.rs                        - HttpClient trait + HttpRequest/HttpResponse (coreはreqwest/curlを直接呼ばない)
+    clock.rs                       - Clock trait + SystemClock
+    rate_limiter.rs                - RateLimiter trait + RateLimitScope
+    object_store.rs                - ObjectStore trait + ObjectKey/ObjectMetadata
+    repository.rs                  - NovelRepository trait + NovelId/NovelQuery
+    mocks.rs                       - MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter
+  native/
+    mod.rs                         - native 実装 (core から参照しない)
+    http.rs                        - NativeHttpClient (3-tier: curl crate → reqwest → wget fallback, spawn_blocking 隔離)
   commands/
     mod.rs                         - pub mod + resolve_target_to_id, resolve_alias_target
     init.rs                        - narou init (ディレクトリ作成, AozoraEpub3設定)
@@ -157,9 +168,9 @@ src/
     paths.rs                       - novel_dir_for_record, create_subdirectory_name
     ruby_time.rs                   - Ruby互換日時フォーマット
   downloader/
-    mod.rs                         - Downloader struct (DL pipeline orchestrator, 2497行)
+    mod.rs                         - Downloader struct (DL pipeline orchestrator, Arc<dyn HttpClient> + Arc<dyn RateLimiter> 注入)
     types.rs                       - SectionElement, SectionFile, TocObject, DownloadResult 等
-    fetch.rs                       - HttpFetcher (3-tier: curl crate → reqwest → wget fallback)
+    http_policy.rs                 - プラットフォーム中立 HTTP ポリシー (decode/status mapping/redirect/fetch_text/fetch_bytes)
     toc.rs                         - fetch_toc, parse_subtitles, parse_subtitles_multipage
     section.rs                     - download_section, parse_section_html, section cache
     persistence.rs                 - save_section_file, save_raw_file, save_toc_file, ensure_default_files
@@ -233,7 +244,41 @@ sample/
 - `sample/narou/lib/novelsetting.rb` — 設定定義
 - `sample/narou/lib/command/*.rb` — 各コマンド実装 (help/CLI挙動の参照元)
 
-## Current Status (2026-07)
+## Current Status (2026-08-10)
+
+### プラットフォーム抽象化 (Phase 1-7 完了、Phase 8: 2026-08)
+- **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。Phase 4のsmall object / large asset境界、logical key、native mapping、remaining native FSも記録。Phase 7のD1/Wasabi/Worker read-only adapterも記録。
+- **Phase 1 完了**: `src/platform/` に traits（HttpClient / Clock / RateLimiter / ObjectStore / NovelRepository）+ テスト用 mock（MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter / SystemClock）を導入。
+- `NarouError::Http` は `reqwest::Error` の直接 `#[from]` をやめ String 化。`Platform(String)` variant 追加。core から reqwest 型が error 経由で漏れるのを防止。
+- **Phase 2 完了**: downloader を trait 利用へ全面移行。
+  - `HttpClient::send` / `RateLimiter::acquire` は boxed future の async trait（`Send`）。`HttpRequest` は所有型 + `RedirectMode`（Follow/Manual）、`HttpResponse` は bytes のみ。
+  - `src/downloader/fetch.rs`（HttpFetcher）は削除。transport は `src/native/http.rs` の `NativeHttpClient`（curl→reqwest→wget tier fallback、`tokio::task::spawn_blocking` で隔離）。
+  - デコード・ステータス→ドメインエラー変換・リダイレクト解決は `src/downloader/http_policy.rs`（プラットフォーム中立）に集約。
+  - Downloader は `Arc<dyn HttpClient>` + `Arc<dyn RateLimiter>` + `Arc<dyn NovelRepository>` を保持。`with_platform(http, rate_limiter, novels)` で注入し、`with_user_agent` は native 実装を組み立てる。
+  - `cmd_download` / `cmd_update` は async 化。update の domain 別並列 worker は `tokio::spawn` に移行。
+  - なろう系サイトの wait-steps 既定 10 は `RateLimitScope::narou` フラグで維持。
+- **Phase 3 完了**: `NovelRepository` を async 化し、typed `NovelFilter` / `SearchTerm` / `NovelSortKey` / `NovelQuery` / `NovelMutation`、keyset `scan_ids`、atomic `allocate_id`、一回保存の `apply_batch` を実装。
+  - `src/native/novel_repository.rs` は共有 `db::DATABASE` を使う stateless adapter。async 経路は `spawn_blocking`、CLI は `_sync` 経路で実行し、YAML を二重ロードしない。
+  - Downloader / narou API / CLI / Web の NovelRecord 操作を repository 経由へ移行。Web 一覧は `count` + paginated `query`、一括処理は `scan_ids`。
+  - Native YAML round-trip、unknown fields / raw_title / nilable bool / 日時、Memory repository、並列 ID reservation、Downloader injection をテストで固定。
+- **Phase 4 完了**:
+  - `ObjectStore` は `PlatformFuture` async API（`stat` / bounded `read_small`・`write_small` / `delete` / cursor付き `list_page`）、`AssetStore` は bounded chunk streamとcopy/move semanticsを提供。
+  - `ObjectKey` は `/`区切りlogical UTF-8 key。`NovelObjectKeys` / `GeneratedAssetKey` がキー生成を集約し、OS `Path`をcore identityにしない。
+  - `NativeObjectStore` は既存の `小説データ/` layoutへ写像し、atomic write、archive-root / symlink / reparse-point escape対策、legacy section filename fallbackをnative adapter内で維持。
+  - downloaderのTOC/section/raw/setting/replace/cache persistenceは`PersistenceService`経由。codecはpureで、`Clock`を注入可能。旧Path APIは`src/native/legacy_persistence.rs`へ隔離。
+  - illustrationはmetadata indexと`IllustrationStorageService`を分離し、blob write成功後にcache indexを更新。既存`.illustration_cache.yaml`形式とnative migration/orphan CLI互換を維持。
+  - converterのdirect `curl::Easy`を除去し、illustration localizationの`ConverterCapabilities`へ`HttpClient` / `RateLimiter` / `ObjectStore` / `AssetStore` / index / logical prefix / 必要時の`NovelRecord` resolverを注入可能にした。zero-argument native constructorsは`src/native/converter.rs`へ隔離し、pure converter pipelineへplatform traitを逆流させない。
+  - `src/native/converter.rs` / `src/native/downloader.rs` にzero-argument native constructorsを隔離し、coreからNativeHttpClient / NativeObjectStore / NativeNovelRepositoryを直接参照しない。
+  - `MemoryObjectStore` async/paged/chunked fake、PersistenceService fixed-clock、NativeObjectStore layout/existing-data compatibility testsを追加。
+- **Phase 5 remaining native boundary**: Inventory/settings、site definition loader、downloader info cache、Web固有FS、converter/settings/ini/inspector/user-converter/section-convert-cache、converter/deviceのsubprocess/tempdirはnative-only capabilityとして残る。content blobをLISTでmetadata DB化しない。
+
+### Phase 6-7 Worker backend (2026-08-10)
+- `narou_rs` の `worker-runtime` feature は `application`、`platform`、portable `db`/`converter::ini` のみを公開する。CLI、Web、native HTTP、filesystem、process、settings adapters は `native-runtime` gate の内側に置く。
+- `worker_entry/` は `workers-rs 0.8.5` の `fetch` / `scheduled` / `queue` eventを公開する。`composition.rs` は D1 novel/freeze/settings/tag-color adapters と Wasabi `ObjectStore` を構成し、Worker固有型をcoreへ逆流させない。
+- `WorkerHttpClient` は Fetch APIを既存 `HttpClient` traitへ接続し、request/response body上限を強制する。`WasabiObjectStore` はSigV4、logical-key prefix、paged LIST、bounded small read/write、streaming/multipart AssetStoreを実装する。
+- `D1NovelRepository` はprepared statements/migrationsでtyped filter/sort、keyset `scan_ids`、atomic sequence allocation、batch mutationをSQL化する。settings、freeze、tag colorsもD1 state/tableへ接続する。
+- `/health/live`、`/health/ready`、認証付きread-only `/api/novels`/`/api/novels/:id`を公開する。`NAROU_ADMIN_TOKEN`はconstant-time比較し、未知queue envelopeはretryする。Queue実ジョブ実行はPhase 8へ残す。
+- Worker production readinessはD1 `DB` binding、Wasabi endpoint/bucket/region/prefix variables、Wasabi/admin secretsを要求する。秘密値はリポジトリへ置かない。
 
 ### 最近の追加 (2026-05〜07)
 - **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1 で従来の逐次動作、フォース指定・ウェブモード・ドメインが1種類のときは自動的に逐次にフォールバック

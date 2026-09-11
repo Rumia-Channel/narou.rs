@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,18 +20,50 @@ use sha2::{Digest, Sha256};
 use settings::NovelSettings;
 use user_converter::UserConverter;
 
-use crate::downloader::{SectionElement, SectionFile, TocObject, SECTION_SAVE_DIR};
+use crate::db::NovelRecord;
+use crate::downloader::{SECTION_SAVE_DIR, SectionElement, SectionFile, TocObject};
 use crate::error::{NarouError, Result};
 use crate::illustration_store::{
-    IllustrationStore, find_saved_illustration_filename, illustration_extension_from_content_type,
+    IllustrationIndex, IllustrationStorageService, IllustrationStore, StoredIllustration,
+    find_saved_illustration_filename, illustration_extension_from_content_type,
     is_remote_illustration_source, legacy_basename_from_source, normalize_illustration_url,
 };
+use crate::platform::{AssetStore, HttpClient, ObjectKey, ObjectStore, RateLimiter};
 use crate::progress::ProgressReporter;
 use crate::termcolor::bold_colored;
 
 const SECTION_CONVERT_CACHE_NAME: &str = "section_convert_cache";
 const SECTION_CONVERT_CACHE_DIR_NAME: &str = "section_convert_cache";
 const ILLUSTRATION_LOCALIZATION_VERSION: &str = "illustration-localization:v4";
+
+/// I/O capabilities used only by converter-side illustration localization.
+///
+/// Text conversion remains pure; callers can provide mocks here and avoid
+/// curl, real network access, and filesystem-backed image storage.
+#[derive(Clone)]
+pub struct ConverterCapabilities {
+    pub http: Arc<dyn HttpClient>,
+    pub rate_limiter: Arc<dyn RateLimiter>,
+    pub assets: Option<Arc<dyn AssetStore>>,
+    pub objects: Option<Arc<dyn ObjectStore>>,
+    pub illustration_index: Option<IllustrationIndex>,
+    pub illustration_prefix: Option<ObjectKey>,
+    pub novel_record_resolver: Option<Arc<dyn Fn(i64) -> Option<NovelRecord> + Send + Sync>>,
+}
+
+impl ConverterCapabilities {
+    pub fn new(http: Arc<dyn HttpClient>, rate_limiter: Arc<dyn RateLimiter>) -> Self {
+        Self {
+            http,
+            rate_limiter,
+            assets: None,
+            objects: None,
+            illustration_index: None,
+            illustration_prefix: None,
+            novel_record_resolver: None,
+        }
+    }
+}
 
 pub struct NovelConverter {
     settings: NovelSettings,
@@ -42,7 +75,8 @@ pub struct NovelConverter {
     display_inspector: bool,
     last_inspection_output: Option<String>,
     use_dakuten_font: bool,
-    illustration_store: IllustrationStore,
+    illustration_store: IllustrationIndex,
+    capabilities: Option<ConverterCapabilities>,
     target_device: Option<device::Device>,
 }
 
@@ -110,13 +144,24 @@ struct CacheSettingsSignature<'a> {
 }
 
 impl NovelConverter {
-    pub fn new(settings: NovelSettings) -> Self {
+    pub(crate) fn build(
+        settings: NovelSettings,
+        user_converter: Option<UserConverter>,
+        capabilities: Option<ConverterCapabilities>,
+    ) -> Self {
         let inspector = Rc::new(RefCell::new(inspector::Inspector::new(&settings)));
-        let illustration_store = IllustrationStore::load(&settings.archive_path)
-            .unwrap_or_else(|_| IllustrationStore::default());
+        let illustration_store = capabilities
+            .as_ref()
+            .and_then(|caps| caps.illustration_index.clone())
+            .unwrap_or_else(|| {
+                IllustrationIndex::from_store(
+                    IllustrationStore::load(&settings.archive_path)
+                        .unwrap_or_else(|_| IllustrationStore::default()),
+                )
+            });
         Self {
             settings,
-            user_converter: None,
+            user_converter,
             section_cache: HashMap::new(),
             section_convert_cache: SectionConvertCache::default(),
             progress: None,
@@ -125,27 +170,28 @@ impl NovelConverter {
             last_inspection_output: None,
             use_dakuten_font: false,
             illustration_store,
+            capabilities,
             target_device: None,
         }
     }
 
-    pub fn with_user_converter(settings: NovelSettings, user_converter: UserConverter) -> Self {
-        let inspector = Rc::new(RefCell::new(inspector::Inspector::new(&settings)));
-        let illustration_store = IllustrationStore::load(&settings.archive_path)
-            .unwrap_or_else(|_| IllustrationStore::default());
-        Self {
-            settings,
-            user_converter: Some(user_converter),
-            section_cache: HashMap::new(),
-            section_convert_cache: SectionConvertCache::default(),
-            progress: None,
-            inspector,
-            display_inspector: false,
-            last_inspection_output: None,
-            use_dakuten_font: false,
-            illustration_store,
-            target_device: None,
-        }
+    fn resolve_novel_record(&self, id: i64) -> Option<NovelRecord> {
+        self.capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.novel_record_resolver.as_ref())
+            .and_then(|resolver| resolver(id))
+    }
+
+    pub fn with_capabilities(settings: NovelSettings, capabilities: ConverterCapabilities) -> Self {
+        Self::build(settings, None, Some(capabilities))
+    }
+
+    pub fn with_user_converter_and_capabilities(
+        settings: NovelSettings,
+        user_converter: UserConverter,
+        capabilities: ConverterCapabilities,
+    ) -> Self {
+        Self::build(settings, Some(user_converter), Some(capabilities))
     }
 
     pub fn set_progress(&mut self, progress: Box<dyn ProgressReporter>) {
@@ -368,10 +414,7 @@ impl NovelConverter {
             ));
         }
 
-        let record = novel_id
-            .or(self.settings.id)
-            .and_then(|id| crate::db::with_database(|db| Ok(db.get(id).cloned())).ok())
-            .flatten();
+        let record = novel_id.and_then(|id| self.resolve_novel_record(id));
 
         self.flush_illustration_store()?;
 
@@ -431,9 +474,9 @@ impl NovelConverter {
     }
 
     fn make_converter_for_section(&self, section: &SectionFile) -> converter_base::ConverterBase {
-        self.make_converter_with_parenthesized_ruby(
-            Self::parenthesized_ruby_enabled_for_data_type(&section.element.data_type),
-        )
+        self.make_converter_with_parenthesized_ruby(Self::parenthesized_ruby_enabled_for_data_type(
+            &section.element.data_type,
+        ))
     }
 
     fn compute_digest(&self, section: &SectionFile) -> String {
@@ -477,7 +520,9 @@ impl NovelConverter {
             enable_inspect: self.settings.enable_inspect,
             enable_convert_num_to_kanji: self.settings.enable_convert_num_to_kanji,
             enable_kanji_num_with_units: self.settings.enable_kanji_num_with_units,
-            kanji_num_with_units_lower_digit_zero: self.settings.kanji_num_with_units_lower_digit_zero,
+            kanji_num_with_units_lower_digit_zero: self
+                .settings
+                .kanji_num_with_units_lower_digit_zero,
             enable_alphabet_force_zenkaku: self.settings.enable_alphabet_force_zenkaku,
             disable_alphabet_word_to_zenkaku: self.settings.disable_alphabet_word_to_zenkaku,
             enable_half_indent_bracket: self.settings.enable_half_indent_bracket,
@@ -521,7 +566,7 @@ impl NovelConverter {
         };
         hasher.update(
             serde_json::to_vec(&settings_signature)
-            .expect("settings signature serialization should succeed"),
+                .expect("settings signature serialization should succeed"),
         );
         hex::encode(hasher.finalize())
     }
@@ -619,42 +664,62 @@ impl NovelConverter {
             return Some(source.to_string());
         }
 
-        if let Some(filename) = self
-            .illustration_store
-            .cached_filename_for_source(source, illust_dir)
-        {
+        let has_injected_assets = self
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.assets.is_some());
+        let cached_filename = if has_injected_assets {
+            if let Some(id) = crate::illustration_store::mitemin_illustration_id(source) {
+                self.illustration_store
+                    .filename_for_mitemin_id(&id)
+                    .map(str::to_string)
+            } else {
+                self.illustration_store
+                    .filename_for_source(source)
+                    .map(str::to_string)
+            }
+        } else {
+            self.illustration_store
+                .legacy()
+                .cached_filename_for_source(source, illust_dir)
+        };
+        if let Some(filename) = cached_filename {
             return Some(format!("挿絵/{}", filename));
         }
 
-        let basename = legacy_basename_from_source(source)
-            .unwrap_or_else(|| format!("{}-{}", section_index, illust_index));
-        if let Some(filename) = find_saved_illustration_filename(illust_dir, &basename) {
-            return match self
-                .illustration_store
-                .store_existing_file(illust_dir, source, &filename)
-            {
-                Ok(stored) => {
-                    if stored.created {
-                        self.inspector
-                            .borrow_mut()
-                            .info(format!("挿絵「{}」を保存しました。", stored.filename));
+        if !has_injected_assets {
+            let basename = legacy_basename_from_source(source)
+                .unwrap_or_else(|| format!("{}-{}", section_index, illust_index));
+            if let Some(filename) = find_saved_illustration_filename(illust_dir, &basename) {
+                return match self
+                    .illustration_store
+                    .legacy_mut()
+                    .store_existing_file(illust_dir, source, &filename)
+                {
+                    Ok(stored) => {
+                        if stored.created {
+                            self.inspector
+                                .borrow_mut()
+                                .info(format!("挿絵「{}」を保存しました。", stored.filename));
+                        }
+                        Some(format!("挿絵/{}", stored.filename))
                     }
-                    Some(format!("挿絵/{}", stored.filename))
-                }
-                Err(_) => Some(format!("挿絵/{}", filename)),
-            };
+                    Err(_) => Some(format!("挿絵/{}", filename)),
+                };
+            }
         }
 
         self.download_section_illustration(illust_dir, source)
     }
 
-    fn download_section_illustration(
-        &mut self,
-        illust_dir: &Path,
-        source: &str,
-    ) -> Option<String> {
+    fn download_section_illustration(&mut self, illust_dir: &Path, source: &str) -> Option<String> {
         let url = normalize_illustration_url(source);
-        let (bytes, content_type) = match fetch_illustration_bytes(&url) {
+        let capabilities = self.capabilities.clone()?;
+        let (bytes, content_type) = match fetch_illustration_bytes(
+            capabilities.http.clone(),
+            capabilities.rate_limiter.clone(),
+            url.clone(),
+        ) {
             Ok((bytes, content_type)) => (bytes, content_type),
             Err(err) => {
                 self.inspector.borrow_mut().error(format!(
@@ -675,11 +740,18 @@ impl NovelConverter {
             }
         };
 
-        match self
-            .illustration_store
-            .store_bytes(illust_dir, source, &bytes, ext)
-        {
-            Ok(stored) => {
+        let stored = if capabilities.assets.is_some() {
+            self.store_illustration_with_capabilities(&capabilities, source, &bytes, ext)
+                .ok()
+                .flatten()
+        } else {
+            self.illustration_store
+                .legacy_mut()
+                .store_bytes(illust_dir, source, &bytes, ext)
+                .ok()
+        };
+        match stored {
+            Some(stored) => {
                 if stored.created {
                     self.inspector
                         .borrow_mut()
@@ -687,8 +759,36 @@ impl NovelConverter {
                 }
                 Some(format!("挿絵/{}", stored.filename))
             }
-            Err(_) => None,
+            None => None,
         }
+    }
+
+    fn store_illustration_with_capabilities(
+        &mut self,
+        capabilities: &ConverterCapabilities,
+        source: &str,
+        bytes: &[u8],
+        ext: &str,
+    ) -> Result<Option<StoredIllustration>> {
+        let Some(assets) = capabilities.assets.clone() else {
+            return Ok(None);
+        };
+        let Some(prefix) = capabilities.illustration_prefix.clone() else {
+            return Ok(None);
+        };
+        let service = IllustrationStorageService::new(assets);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| NarouError::Platform(error.to_string()))?;
+        let stored = runtime.block_on(service.store_bytes_at(
+            &prefix,
+            &mut self.illustration_store,
+            source,
+            bytes,
+            ext,
+        ))?;
+        Ok(Some(stored))
     }
 
     pub fn clear_cache(&mut self) {
@@ -770,10 +870,17 @@ impl NovelConverter {
         self.display_header(id, &toc_object.title);
 
         let sections = load_sections_from_dir(novel_dir, &toc_object.subtitles)?;
+        let record = self.resolve_novel_record(id);
 
         let aozora_text = self.convert_novel_with_id(Some(id), &toc_object, &sections)?;
         self.flush_section_convert_cache()?;
-        let txt_path = output::create_output_text_path(&self.settings, id, novel_dir, &toc_object);
+        let txt_path = output::create_output_text_path(
+            &self.settings,
+            id,
+            novel_dir,
+            &toc_object,
+            record.as_ref(),
+        );
         std::fs::write(&txt_path, &aozora_text)?;
         save_latest_convert(id)?;
         self.inspect_converted_text(&aozora_text)?;
@@ -810,6 +917,7 @@ impl NovelConverter {
         self.display_header(_id, &toc_object.title);
 
         let sections = load_sections_from_dir(novel_dir, &toc_object.subtitles)?;
+        let record = self.resolve_novel_record(_id);
 
         let previous_device = self.target_device;
         self.target_device = Some(device);
@@ -817,7 +925,13 @@ impl NovelConverter {
         self.target_device = previous_device;
         let aozora_text = converted?;
         self.flush_section_convert_cache()?;
-        let txt_path = output::create_output_text_path(&self.settings, _id, novel_dir, &toc_object);
+        let txt_path = output::create_output_text_path(
+            &self.settings,
+            _id,
+            novel_dir,
+            &toc_object,
+            record.as_ref(),
+        );
         std::fs::write(&txt_path, &aozora_text)?;
         save_latest_convert(_id)?;
         self.inspect_converted_text(&aozora_text)?;
@@ -864,7 +978,10 @@ impl NovelConverter {
 
     /// Ruby: display_header — "ID:{id}　{title} の変換を開始"
     fn display_header(&self, id: i64, title: &str) {
-        println!("{}", bold_colored(&format!("ID:{}　{} の変換を開始", id, title), "green"));
+        println!(
+            "{}",
+            bold_colored(&format!("ID:{}　{} の変換を開始", id, title), "green")
+        );
     }
 
     /// Ruby: display_footer — "縦書用の変換が終了しました"
@@ -918,7 +1035,30 @@ impl NovelConverter {
     }
 
     fn flush_illustration_store(&mut self) -> Result<()> {
-        self.illustration_store.flush(&self.settings.archive_path)
+        if let Some(capabilities) = self.capabilities.clone()
+            && let (Some(objects), Some(prefix)) =
+                (capabilities.objects, capabilities.illustration_prefix)
+        {
+            let key = prefix.join(".illustration_cache.yaml")?;
+            let body = self.illustration_store.to_cache_yaml()?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| NarouError::Platform(error.to_string()))?;
+            runtime.block_on(objects.write_small(&key, body))?;
+            self.illustration_store.mark_clean();
+            return Ok(());
+        }
+        if self
+            .capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.assets.is_some())
+        {
+            return Ok(());
+        }
+        self.illustration_store
+            .legacy_mut()
+            .flush(&self.settings.archive_path)
     }
 }
 
@@ -1023,11 +1163,10 @@ fn load_section_convert_bucket(novel_id: i64) -> Result<HashMap<String, CacheEnt
 
 fn save_section_convert_bucket(id: &str, bucket: &HashMap<String, CacheEntry>) -> Result<()> {
     let path = section_convert_cache_file_path(id)?;
-    crate::db::inventory::update_locked_yaml_file::<
-        (),
-        HashMap<String, CacheEntry>,
-        _,
-    >(&path, |_| Ok((bucket.clone(), ())))?;
+    crate::db::inventory::update_locked_yaml_file::<(), HashMap<String, CacheEntry>, _>(
+        &path,
+        |_| Ok((bucket.clone(), ())),
+    )?;
     Ok(())
 }
 
@@ -1075,7 +1214,7 @@ fn load_sections_from_dir(
     let mut sections = Vec::new();
 
     for sub in subtitles {
-        let path = crate::downloader::persistence::resolve_section_file_path(&section_dir, sub)
+        let path = crate::native::legacy_persistence::resolve_section_file_path(&section_dir, sub)
             .ok_or_else(|| {
                 let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
                 NarouError::Io(std::io::Error::new(
@@ -1152,74 +1291,30 @@ fn find_saved_section_illustration_filename(
     find_saved_illustration_filename(illust_dir, &basename)
 }
 
-fn fetch_illustration_bytes(url: &str) -> std::result::Result<(Vec<u8>, String), String> {
-    let user_agent = ua_generator::ua::spoof_firefox_ua().to_string();
-    let mut handle = curl::easy::Easy::new();
-    handle.url(url).map_err(|err| err.to_string())?;
-    handle
-        .useragent(&user_agent)
-        .map_err(|err| err.to_string())?;
-    handle
-        .follow_location(true)
-        .map_err(|err| err.to_string())?;
-    let _ = handle.accept_encoding("gzip, deflate");
-
-    let mut headers = curl::easy::List::new();
-    headers
-        .append("Accept: image/webp,image/apng,image/*,*/*;q=0.8")
-        .map_err(|err| err.to_string())?;
-    headers
-        .append("Accept-Language: ja,en-US;q=0.9,en;q=0.8")
-        .map_err(|err| err.to_string())?;
-    headers
-        .append("Accept-Charset: utf-8")
-        .map_err(|err| err.to_string())?;
-    headers
-        .append("Connection: keep-alive")
-        .map_err(|err| err.to_string())?;
-    handle
-        .http_headers(headers)
-        .map_err(|err| err.to_string())?;
-
-    let mut body = Vec::new();
-    let mut content_type: Option<String> = None;
-    {
-        let mut transfer = handle.transfer();
-        transfer
-            .write_function(|data| {
-                body.extend_from_slice(data);
-                Ok(data.len())
-            })
-            .map_err(|err| err.to_string())?;
-        transfer
-            .header_function(|header| {
-                if let Ok(line) = std::str::from_utf8(header) {
-                    if let Some((name, value)) = line.split_once(':') {
-                        if name.eq_ignore_ascii_case("Content-Type") {
-                            content_type = Some(
-                                value
-                                    .trim()
-                                    .split(';')
-                                    .next()
-                                    .unwrap_or("")
-                                    .trim()
-                                    .to_string(),
-                            );
-                        }
-                    }
-                }
-                true
-            })
-            .map_err(|err| err.to_string())?;
-        transfer.perform().map_err(|err| err.to_string())?;
-    }
-
-    let code = handle.response_code().map_err(|err| err.to_string())?;
-    if code >= 400 {
-        return Err(format!("HTTP {}", code));
-    }
-
-    Ok((body, content_type.unwrap_or_default()))
+fn fetch_illustration_bytes(
+    http: Arc<dyn HttpClient>,
+    rate_limiter: Arc<dyn RateLimiter>,
+    url: String,
+) -> std::result::Result<(Vec<u8>, String), String> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let response = runtime
+            .block_on(crate::downloader::http_policy::fetch_bytes(
+                http.as_ref(),
+                rate_limiter.as_ref(),
+                &url,
+                None,
+                false,
+            ))
+            .map_err(|error| error.to_string())?;
+        let content_type = response.header("Content-Type").unwrap_or("").to_string();
+        Ok((response.body, content_type))
+    })
+    .join()
+    .map_err(|_| "illustration fetch thread panicked".to_string())?
 }
 
 #[cfg(test)]
@@ -1339,8 +1434,7 @@ mod tests {
         let mut section = make_parenthesized_kana_html_section();
         section.element.data_type = "text".to_string();
         section.element.body =
-            "おじいちゃんが錬金術師(あるけみすと)さんだったの、ちゃんとわかるもん"
-                .to_string();
+            "おじいちゃんが錬金術師(あるけみすと)さんだったの、ちゃんとわかるもん".to_string();
         section
     }
 
@@ -1381,7 +1475,9 @@ mod tests {
             )]),
         );
         std::fs::write(
-            temp.path().join(".narou").join("section_convert_cache.yaml"),
+            temp.path()
+                .join(".narou")
+                .join("section_convert_cache.yaml"),
             serde_yaml::to_string(&legacy).unwrap(),
         )
         .unwrap();
@@ -1392,24 +1488,33 @@ mod tests {
         let mut cache = super::SectionConvertCache::default();
         let bucket = cache.bucket(1).unwrap();
         assert_eq!(bucket["本文\\1.yaml"].converted_section.body, "one");
-        assert!(temp
-            .path()
-            .join(".narou")
-            .join("section_convert_cache")
-            .join("1.yaml")
-            .is_file());
-        assert!(temp
-            .path()
-            .join(".narou")
-            .join("section_convert_cache")
-            .join("2.yaml")
-            .is_file());
-        assert!(!temp.path().join(".narou").join("section_convert_cache.yaml").exists());
-        assert!(temp
-            .path()
-            .join(".narou")
-            .join("section_convert_cache.yaml.migrated")
-            .is_file());
+        assert!(
+            temp.path()
+                .join(".narou")
+                .join("section_convert_cache")
+                .join("1.yaml")
+                .is_file()
+        );
+        assert!(
+            temp.path()
+                .join(".narou")
+                .join("section_convert_cache")
+                .join("2.yaml")
+                .is_file()
+        );
+        assert!(
+            !temp
+                .path()
+                .join(".narou")
+                .join("section_convert_cache.yaml")
+                .exists()
+        );
+        assert!(
+            temp.path()
+                .join(".narou")
+                .join("section_convert_cache.yaml.migrated")
+                .is_file()
+        );
 
         *crate::db::DATABASE.lock() = None;
     }
@@ -1489,7 +1594,9 @@ mod tests {
         let resolved = converter.resolve_section_html_illustrations(&section);
         assert!(resolved.body.contains(r#"src="挿絵/i422674.png""#));
         assert_eq!(
-            converter.illustration_store.filename_for_mitemin_id("i422674"),
+            converter
+                .illustration_store
+                .filename_for_mitemin_id("i422674"),
             Some("i422674.png")
         );
         assert_eq!(
@@ -1540,7 +1647,10 @@ mod tests {
         let mut converter = NovelConverter::new(settings);
         let resolved = converter.resolve_section_html_illustrations(&section);
 
-        assert_eq!(resolved.body.matches(r#"src="挿絵/i422674.jpg""#).count(), 2);
+        assert_eq!(
+            resolved.body.matches(r#"src="挿絵/i422674.jpg""#).count(),
+            2
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1567,7 +1677,10 @@ mod tests {
             .convert_novel(&toc, &[make_illustration_section()])
             .unwrap();
 
-        assert!(text.contains("［＃挿絵（挿絵/i422674.jpg）入る］"), "{text}");
+        assert!(
+            text.contains("［＃挿絵（挿絵/i422674.jpg）入る］"),
+            "{text}"
+        );
         let cache_path = crate::illustration_store::cache_path(&root);
         assert!(cache_path.is_file());
 
@@ -1589,7 +1702,10 @@ mod tests {
             .convert_novel(&toc, &[make_parenthesized_kana_html_section()])
             .unwrap();
 
-        assert!(text.contains("錬金術師（あるけみすと）さんだったの"), "{text}");
+        assert!(
+            text.contains("錬金術師（あるけみすと）さんだったの"),
+            "{text}"
+        );
         assert!(!text.contains("錬金術師｜"), "{text}");
         assert!(!text.contains("「あるけみすと」"), "{text}");
     }
@@ -1609,7 +1725,10 @@ mod tests {
             .convert_novel(&toc, &[make_explicit_ruby_html_section()])
             .unwrap();
 
-        assert!(text.contains("｜錬金術師《あるけみすと》さんだった"), "{text}");
+        assert!(
+            text.contains("｜錬金術師《あるけみすと》さんだった"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1646,7 +1765,10 @@ mod tests {
             .unwrap();
 
         assert!(text.contains("「あるけみすと」"), "{text}");
-        assert!(!text.contains("錬金術師（あるけみすと）さんだったの"), "{text}");
+        assert!(
+            !text.contains("錬金術師（あるけみすと）さんだったの"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1746,5 +1868,55 @@ before_settings:
             NovelConverter::with_user_converter(NovelSettings::default(), user_converter_variant)
                 .compute_digest(&section);
         assert_ne!(user_converter_digest, user_converter_variant_digest);
+    }
+
+    #[test]
+    fn injected_illustration_capabilities_avoid_native_filesystem() {
+        use crate::platform::mocks::{FakeRateLimiter, MemoryObjectStore, MockHttpClient};
+        use crate::platform::{AssetStore, HttpResponse, ObjectKey, ObjectStore};
+        use std::path::Path;
+        use std::sync::Arc;
+
+        let http = Arc::new(MockHttpClient::new());
+        let source = "https://example.com/image.png";
+        http.add_response(
+            source,
+            HttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".into(), "image/png".into())],
+                body: b"png bytes".to_vec(),
+            },
+        );
+        let rate_limiter = Arc::new(FakeRateLimiter::new());
+        let objects = Arc::new(MemoryObjectStore::new());
+        let assets: Arc<dyn AssetStore> = objects.clone();
+        let objects_trait: Arc<dyn ObjectStore> = objects.clone();
+        let mut capabilities =
+            super::ConverterCapabilities::new(http.clone(), rate_limiter.clone());
+        capabilities.assets = Some(assets);
+        capabilities.objects = Some(objects_trait);
+        capabilities.illustration_index =
+            Some(crate::illustration_store::IllustrationIndex::default());
+        capabilities.illustration_prefix = Some(ObjectKey::try_new("novels").unwrap());
+
+        let mut settings = NovelSettings::default();
+        settings.archive_path = Path::new("not-a-native-path").to_path_buf();
+        let mut converter = NovelConverter::with_capabilities(settings, capabilities);
+        let localized = converter
+            .download_section_illustration(Path::new("not-a-native-path/挿絵"), source)
+            .unwrap();
+        assert!(localized.starts_with("挿絵/"));
+        assert_eq!(objects.len(), 1);
+        converter.flush_illustration_store().unwrap();
+        assert_eq!(objects.len(), 2);
+        assert!(
+            futures::executor::block_on(
+                objects.read_small(
+                    &ObjectKey::try_new("novels/.illustration_cache.yaml").unwrap()
+                )
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 }

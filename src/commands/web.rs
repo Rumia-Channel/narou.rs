@@ -89,13 +89,24 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         std::process::exit(1);
     }
     let control_token = generate_control_token();
-    let root_dir = match Inventory::with_default_root() {
-        Ok(inventory) => inventory.root_dir().to_path_buf(),
+    let inventory = match Inventory::with_default_root() {
+        Ok(inventory) => Arc::new(inventory),
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     };
+    let root_dir = inventory.root_dir().to_path_buf();
+    let native_services =
+        match narou_rs::native::application::NativeAppServices::new(inventory.clone()) {
+            Ok(services) => services,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
+    let site_updates = native_services.site_updates;
+    let services = native_services.services;
     let queue =
         match narou_rs::queue::PersistentQueue::new(&root_dir.join(".narou").join("queue.yaml")) {
             Ok(queue) => Arc::new(queue),
@@ -114,6 +125,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         port: address.port,
         ws_port: address.ws_port,
         push_server: push_server.clone(),
+        services: services.clone(),
         basic_auth_header: security_settings.basic_auth_header,
         control_token: control_token.clone(),
         allowed_request_hosts,
@@ -166,6 +178,8 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         root_dir.clone(),
         queue.clone(),
         push_server.clone(),
+        services.library.clone(),
+        site_updates,
         running_jobs.clone(),
         running_child_pids,
         cancelled_job_ids,
@@ -224,37 +238,36 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
 }
 
 fn fill_general_all_no_in_database() -> Result<(), String> {
-    narou_rs::db::with_database_mut(|db| {
-        let archive_root = db.archive_root().to_path_buf();
-        let ids: Vec<i64> = db
-            .all_records()
-            .values()
-            .filter(|record| record.general_all_no.is_none())
-            .map(|record| record.id)
-            .collect();
-        let mut modified = false;
+    use narou_rs::platform::{NovelFilter, NovelMutation};
 
-        for id in ids {
-            let Some(record) = db.get(id).cloned() else {
-                continue;
-            };
-            let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
-            let Some(toc) = narou_rs::downloader::persistence::load_toc_file(&novel_dir) else {
-                continue;
-            };
-            let Some(target) = db.all_records_mut().get_mut(&id) else {
-                continue;
-            };
-            target.general_all_no = Some(toc.subtitles.len() as i64);
-            modified = true;
-        }
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let ids = novels
+        .scan_ids_sync(&NovelFilter::all(), None, usize::MAX)
+        .map_err(|e| e.to_string())?;
+    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .map_err(|e| e.to_string())?;
+    let mut modified = false;
 
-        if modified {
-            db.save()?;
+    for id in ids {
+        let Ok(Some(mut record)) = novels.get_sync(id) else {
+            continue;
+        };
+        if record.general_all_no.is_some() {
+            continue;
         }
-        Ok(())
-    })
-    .map_err(|e| e.to_string())
+        let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
+        let Some(toc) = narou_rs::native::legacy_persistence::load_toc_file(&novel_dir) else {
+            continue;
+        };
+        record.general_all_no = Some(toc.subtitles.len() as i64);
+        novels
+            .apply_batch_sync(vec![NovelMutation::Upsert(record)])
+            .map_err(|e| e.to_string())?;
+        modified = true;
+    }
+
+    let _ = modified;
+    Ok(())
 }
 
 fn resolve_web_address(user_port: Option<u16>) -> Result<WebAddress, String> {

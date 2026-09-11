@@ -76,6 +76,40 @@ impl RateLimiter {
     }
 
     fn reserve_wait_duration(&self, host: &str) -> Duration {
+        self.reserve_wait_duration_with_steps(host, self.wait_steps)
+    }
+}
+
+impl crate::platform::RateLimiter for RateLimiter {
+    fn acquire<'a>(
+        &'a self,
+        scope: &'a crate::platform::RateLimitScope,
+    ) -> futures::future::BoxFuture<'a, crate::error::Result<()>> {
+        let duration = self.reserve_wait_duration_for_scope(scope);
+        Box::pin(async move {
+            if !duration.is_zero() {
+                tokio::time::sleep(duration).await;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl RateLimiter {
+    /// Reserve the wait for a scope, applying the なろう wait-steps default
+    /// (10) when the scope is a なろう site. The sync `wait_for_host` keeps
+    /// using the construction-time `wait_steps`; the async trait path is the
+    /// one that knows the per-site narou flag.
+    fn reserve_wait_duration_for_scope(&self, scope: &crate::platform::RateLimitScope) -> Duration {
+        let wait_steps = if scope.narou {
+            normalize_wait_steps(self.wait_steps as i64, true)
+        } else {
+            self.wait_steps
+        };
+        self.reserve_wait_duration_with_steps(&scope.site, wait_steps)
+    }
+
+    fn reserve_wait_duration_with_steps(&self, host: &str, wait_steps: u32) -> Duration {
         let now = Instant::now();
         let mut state = STATE.lock();
         let host_state = state.hosts.entry(host.to_string()).or_default();
@@ -85,7 +119,9 @@ impl RateLimiter {
             .map(|next_allowed| now >= next_allowed)
             .unwrap_or(true);
         if let Some(last_download) = host_state.last_download {
-            let elapsed = now.checked_duration_since(last_download).unwrap_or_default();
+            let elapsed = now
+                .checked_duration_since(last_download)
+                .unwrap_or_default();
             if elapsed > self.max_steps_wait_time && no_pending_slot {
                 host_state.counter = 0;
                 host_state.last_download = None;
@@ -100,13 +136,14 @@ impl RateLimiter {
 
         host_state.counter += 1;
         host_state.last_download = Some(allowed_at);
-        host_state.next_allowed = Some(allowed_at + self.delay_after_request(host_state.counter));
+        host_state.next_allowed =
+            Some(allowed_at + self.delay_after_request(host_state.counter, wait_steps));
 
         allowed_at.checked_duration_since(now).unwrap_or_default()
     }
 
-    fn delay_after_request(&self, counter: u32) -> Duration {
-        if self.wait_steps > 0 && counter % self.wait_steps == 0 && counter >= self.wait_steps {
+    fn delay_after_request(&self, counter: u32, wait_steps: u32) -> Duration {
+        if wait_steps > 0 && counter % wait_steps == 0 && counter >= wait_steps {
             self.max_steps_wait_time
         } else if counter > 0 {
             self.interval
@@ -117,7 +154,7 @@ impl RateLimiter {
 }
 
 fn host_key_from_url(url: &str) -> String {
-    reqwest::Url::parse(url)
+    url::Url::parse(url)
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_string))
         .unwrap_or_else(|| GLOBAL_HOST_KEY.to_string())

@@ -1,0 +1,58 @@
+name = "narou-rs"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-08-10"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "narou-rs"
+migrations_dir = "migrations"
+
+# Set the remote database_id before deployment (or in an environment-specific
+# Wrangler config). Keep Wasabi endpoint/bucket/region/prefix vars and
+# Wasabi/NAROU_ADMIN_TOKEN secrets outside this file.
+
+[build]
+command = "worker-build --release"
+
+# --- Phase 8: jobs queue ------------------------------------------------
+# Producer: POST /api/jobs and the cron planner send version-2 envelopes
+# (WorkerJobEnvelope {version, job_id, job}) here.
+
+[[queues.producers]]
+binding = "NAROU_JOBS"
+queue = "narou-jobs"
+
+# Consumer: the queue handler claims each job against the D1 ledger and acks
+# only after a durable terminal state. Conservative settings: one message at
+# a time. max_retries must be >= the ledger's attempt cap, because Cloudflare
+# counts *explicit* `retry_with_options` calls against max_retries too; the
+# ledger cap (3 attempts, then durable permanent) is what actually stops
+# retries, and crashed messages land in the DLQ for operator inspection.
+
+[[queues.consumers]]
+queue = "narou-jobs"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "narou-jobs-dlq"
+max_concurrency = 1
+
+# There is intentionally no DLQ consumer binding. DLQ messages remain
+# operator-inspection artifacts; ordinary execution never drains or re-enqueues
+# them. A later operator action can replay a selected envelope explicitly.
+
+# --- Phase 8: per-site rate limiting Durable Object ----------------------
+# One SiteRateLimiter instance per normalized site key; the runtime
+# serializes permit allocation per instance.
+
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "SiteRateLimiter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SiteRateLimiter"]
+
+# Run every minute; the planner's D1 checkpoint decides whether the configured
+# HHMM wall-clock schedule is due and bounds each invocation to one page.
+[triggers]
+crons = ["* * * * *"]

@@ -151,8 +151,6 @@ pub fn cmd_list(options: ListOptions) -> i32 {
 }
 
 fn cmd_list_inner(options: &ListOptions) -> i32 {
-    use narou_rs::db;
-
     let filter_words = match options.filter_words() {
         Ok(filters) => filters,
         Err(message) => {
@@ -182,25 +180,35 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         }
     };
 
-    let records = match db::with_database(|db| {
-        let mut values = if let Some(key) = sort_key {
-            // 明示的な --sort-by が指定された場合: db::sort_by の型付き比較を使う。
-            db.sort_by(key, false).into_iter().cloned().collect::<Vec<_>>()
-        } else if options.latest {
-            db.sort_by(options.view_date_type(), true)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            let mut records = db.all_records().values().cloned().collect::<Vec<_>>();
-            records.sort_by_key(|record| record.id);
-            records
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let records = match (|| -> narou_rs::error::Result<Vec<NovelRecord>> {
+        let sort = match sort_key {
+            Some(key) => narou_rs::platform::NovelSort::by(
+                narou_rs::platform::NovelSortKey::from_db_key(key).unwrap_or(
+                    narou_rs::platform::NovelSortKey::Id,
+                ),
+            ),
+            None => narou_rs::platform::NovelSort::by(if options.latest {
+                narou_rs::platform::NovelSortKey::from_db_key(options.view_date_type())
+                    .unwrap_or(narou_rs::platform::NovelSortKey::Id)
+            } else {
+                narou_rs::platform::NovelSortKey::Id
+            }),
         };
+        let mut sort = sort;
         if options.reverse {
-            values.reverse();
+            sort.reverse = true;
         }
-        Ok(values)
-    }) {
+        // CLI list は全件表示: display 用 query ではなく全件を取得する
+        // (既存挙動: フィルタは表示後に適用される)。
+        let query = narou_rs::platform::NovelQuery::page(
+            narou_rs::platform::NovelFilter::all(),
+            sort,
+            0,
+            usize::MAX,
+        );
+        novels.query_sync(&query)
+    })() {
         Ok(records) => records,
         Err(err) => {
             log::report_error(&err.to_string());
@@ -359,9 +367,11 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         .collect::<Vec<_>>();
 
     let new_tag_color = tag_colors::configured_new_tag_color();
-    let outputs = match db::with_database_mut(|db| {
+    let outputs = (|| -> narou_rs::error::Result<(Vec<TagOutput>, bool)> {
+        let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
         let mut outputs = Vec::new();
         let mut auto_color_changed = false;
+        let mut mutations = Vec::new();
         for item in resolved {
             let (id, title) = match item {
                 Ok(data) => data,
@@ -371,10 +381,12 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
                 }
             };
 
-            let Some(record) = db.get(id).cloned() else {
-                outputs.push(TagOutput::Error(format!("ID:{} は存在しません", id)));
-                continue;
-            };
+            let record = novels
+                .get_sync(id.into())
+                .map_err(|err| narou_rs::error::NarouError::Database(err.to_string()))?
+                .ok_or_else(|| {
+                    narou_rs::error::NarouError::NotFound(format!("ID:{} は存在しません", id))
+                })?;
 
             let mut updated = record;
             match &mode {
@@ -409,19 +421,23 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
                 outputs.push(TagOutput::Current(updated.tags.clone()));
             }
 
-            db.insert(updated);
+            mutations.push(narou_rs::platform::NovelMutation::Upsert(updated));
         }
-        db.save()?;
-        Ok::<(Vec<TagOutput>, bool), narou_rs::error::NarouError>((outputs, auto_color_changed))
-    }) {
+        if !mutations.is_empty() {
+            novels
+                .apply_batch_sync(mutations)
+                .map_err(|err| narou_rs::error::NarouError::Database(err.to_string()))?;
+        }
+        Ok((outputs, auto_color_changed))
+    })();
+
+    let (outputs, auto_color_changed) = match outputs {
         Ok(result) => result,
         Err(err) => {
             log::report_error(&err.to_string());
             return 127;
         }
     };
-
-    let (outputs, auto_color_changed) = outputs;
 
     if auto_color_changed {
         if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
@@ -763,32 +779,35 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
 }
 
 fn get_tag_list() -> Result<Vec<(String, usize)>, String> {
-    use narou_rs::db;
+    use narou_rs::platform::NovelFilter;
+    use narou_rs::native::novel_repository::NativeNovelRepository;
 
-    db::with_database(|db| {
-        let mut records = db.all_records().values().collect::<Vec<_>>();
-        records.sort_by_key(|record| record.id);
+    let novels = NativeNovelRepository::new();
+    let ids = novels
+        .scan_ids_sync(&NovelFilter::all(), None, usize::MAX)
+        .map_err(|err| err.to_string())?;
 
-        let mut counts = HashMap::<String, usize>::new();
-        let mut order = Vec::<String>::new();
-        for record in records {
-            for tag in &record.tags {
-                if !counts.contains_key(tag) {
-                    order.push(tag.clone());
-                }
-                *counts.entry(tag.clone()).or_insert(0) += 1;
+    let mut counts = HashMap::<String, usize>::new();
+    let mut order = Vec::<String>::new();
+    for id in ids {
+        let Ok(Some(record)) = novels.get_sync(id) else {
+            continue;
+        };
+        for tag in &record.tags {
+            if !counts.contains_key(tag) {
+                order.push(tag.clone());
             }
+            *counts.entry(tag.clone()).or_insert(0) += 1;
         }
+    }
 
-        Ok(order
-            .into_iter()
-            .map(|tag| {
-                let count = counts.get(&tag).copied().unwrap_or_default();
-                (tag, count)
-            })
-            .collect::<Vec<_>>())
-    })
-    .map_err(|err| err.to_string())
+    Ok(order
+        .into_iter()
+        .map(|tag| {
+            let count = counts.get(&tag).copied().unwrap_or_default();
+            (tag, count)
+        })
+        .collect::<Vec<_>>())
 }
 
 fn render_tag_count(tag: &str, count: usize, tag_colors: &TagColors) -> String {
@@ -1023,42 +1042,48 @@ struct RemoveOutcome {
 }
 
 fn remove_novel_by_id(id: i64, with_file: bool) -> Result<RemoveOutcome, String> {
-    use narou_rs::db;
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let record = novels
+        .get_sync(id.into())
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("ID: {} は存在しません", id))?;
+    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .map_err(|e| e.to_string())?;
+    let dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
+    remove_novel_files(&dir, with_file).map_err(|e| e.to_string())?;
+    novels
+        .apply_batch_sync(vec![narou_rs::platform::NovelMutation::Remove(id.into())])
+        .map_err(|e| e.to_string())?;
 
-    let result = db::with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
-        let dir = db::existing_novel_dir_for_record(db.archive_root(), &record);
-        remove_novel_files(&dir, with_file).map_err(narou_rs::error::NarouError::Conversion)?;
-        db.remove(id);
-        db.save()?;
-        Ok::<RemoveOutcome, narou_rs::error::NarouError>(RemoveOutcome {
-            title: record.title,
-            removed_path: with_file.then_some(dir),
-        })
-    });
-
-    let outcome = result.map_err(|e| e.to_string())?;
     let _ = narou_rs::converter::clear_section_convert_cache(id);
-    Ok(outcome)
+    Ok(RemoveOutcome {
+        title: record.title,
+        removed_path: with_file.then_some(dir),
+    })
 }
 
 fn collect_all_short_story_ids() -> Vec<String> {
-    use narou_rs::db;
+    use narou_rs::platform::{NovelFilter, NovelSort, NovelSortKey, NovelQuery};
+    use narou_rs::native::novel_repository::NativeNovelRepository;
 
-    db::with_database(|db| {
-        let mut ids = db
-            .all_records()
-            .values()
-            .filter(|record| record.novel_type == 2)
-            .map(|record| record.id.to_string())
-            .collect::<Vec<_>>();
-        ids.sort();
-        Ok(ids)
-    })
-    .unwrap_or_default()
+    let novels = NativeNovelRepository::new();
+    let query = NovelQuery::page(
+        NovelFilter {
+            novel_type: Some(2),
+            ..Default::default()
+        },
+        NovelSort::by(NovelSortKey::Id),
+        0,
+        usize::MAX,
+    );
+    let mut ids = novels
+        .query_sync(&query)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| record.id.to_string())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
 }
 
 fn load_inventory_ids(name: &str) -> HashSet<i64> {

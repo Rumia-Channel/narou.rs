@@ -4,7 +4,6 @@ use serde_yaml::{Mapping, Value};
 
 use crate::db::{
     NovelRecord, compare_records_by_key, inventory::{Inventory, InventoryScope}, sort_keys,
-    with_database,
 };
 
 /// Web UI / CLI 共通のソートキー一覧。`db::SORT_KEYS` を再エクスポートして
@@ -139,7 +138,7 @@ pub fn sort_record_ordering(a: &NovelRecord, b: &NovelRecord, sort_key: &str) ->
     compare_records_by_key(a, b, sort_key)
 }
 
-pub(crate) fn sort_records(records: &mut Vec<&NovelRecord>, sort_state: &CurrentSortState) {
+pub(crate) fn sort_records(records: &mut Vec<NovelRecord>, sort_state: &CurrentSortState) {
     let sort_key = sort_column_key(sort_state).unwrap_or("id");
     let reverse = sort_state.dir == "desc";
     records.sort_by(|a, b| {
@@ -155,8 +154,9 @@ pub(crate) fn sort_records(records: &mut Vec<&NovelRecord>, sort_state: &Current
     });
 }
 
-pub(crate) fn sort_ids_for_request(
+pub(crate) fn sort_ids_from_records(
     ids: &[i64],
+    records: &[NovelRecord],
     sort_state: Option<&serde_json::Value>,
     timestamp: Option<u64>,
 ) -> Vec<i64> {
@@ -164,12 +164,14 @@ pub(crate) fn sort_ids_for_request(
         return ids.to_vec();
     }
     let sort_state = requested_or_current_sort_state(sort_state, timestamp);
-    with_database(|db| {
-        let mut records: Vec<_> = ids.iter().filter_map(|id| db.get(*id)).collect();
-        sort_records(&mut records, &sort_state);
-        Ok(records.into_iter().map(|record| record.id).collect())
-    })
-    .unwrap_or_else(|_| ids.to_vec())
+    let selected = ids.iter().copied().collect::<std::collections::HashSet<_>>();
+    let mut records = records
+        .iter()
+        .filter(|record| selected.contains(&record.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_records(&mut records, &sort_state);
+    records.into_iter().map(|record| record.id).collect()
 }
 
 fn normalize_current_sort_value(sort_state: &Value) -> Option<CurrentSortState> {
@@ -317,7 +319,7 @@ mod tests {
             column: 3, // last_check_date
             dir: "desc".to_string(),
         };
-        let mut records = vec![&first, &second, &third];
+        let mut records = vec![first.clone(), second.clone(), third.clone()];
 
         sort_records(&mut records, &sort_state);
 
@@ -395,7 +397,7 @@ mod tests {
             column: 9, // general_all_no
             dir: "asc".to_string(),
         };
-        let mut records = vec![&second, &first];
+        let mut records = vec![second.clone(), first.clone()];
         sort_records(&mut records, &sort_state);
         assert_eq!(
             records.into_iter().map(|r| r.id).collect::<Vec<_>>(),
@@ -412,7 +414,7 @@ mod tests {
             column: 2, // general_lastup
             dir: "asc".to_string(),
         };
-        let mut records = vec![&second, &first];
+        let mut records = vec![second.clone(), first.clone()];
         sort_records(&mut records, &sort_state);
         assert_eq!(
             records.into_iter().map(|r| r.id).collect::<Vec<_>>(),

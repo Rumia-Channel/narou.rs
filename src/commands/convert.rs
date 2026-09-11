@@ -125,23 +125,21 @@ pub fn cmd_convert(
                 continue;
             }
 
-            let (novel_dir, title, author) = match narou_rs::db::with_database(|db| {
-                let record = db
-                    .get(id)
-                    .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
-                let dir = narou_rs::db::existing_novel_dir_for_record(db.archive_root(), record);
-                Ok::<(std::path::PathBuf, String, String), narou_rs::error::NarouError>((
-                    dir,
-                    record.title.clone(),
-                    record.author.clone(),
-                ))
-            }) {
-                Ok(data) => data,
-                Err(e) => {
-                    println!("  Error: {}", e);
+            let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+            let record = match novels.get_sync(id.into()) {
+                Ok(Some(record)) => record,
+                _ => {
+                    println!("  Error: ID: {} は存在しません", id);
                     continue;
                 }
             };
+            let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+                .unwrap_or_else(|_| std::path::PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR));
+            let (novel_dir, title, author) = (
+                narou_rs::db::existing_novel_dir_for_record(&archive_root, &record),
+                record.title.clone(),
+                record.author.clone(),
+            );
 
             let progress: Box<dyn narou_rs::progress::ProgressReporter> = if is_web_mode() {
                 Box::new(WebProgress::new("convert"))
@@ -549,7 +547,8 @@ fn load_dc_subjects_for_novel(novel_id: i64) -> std::result::Result<Option<Vec<S
         return Ok(None);
     }
 
-    let record = narou_rs::db::with_database(|db| Ok(db.get(novel_id).cloned()))
+    let record = narou_rs::native::novel_repository::NativeNovelRepository::new()
+        .get_sync(novel_id.into())
         .map_err(|e| e.to_string())?;
     let Some(record) = record else {
         return Ok(None);

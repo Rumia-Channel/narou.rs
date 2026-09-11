@@ -266,7 +266,7 @@ async fn run_command(
         }
     };
 
-    let ua = user_agent.or(cli.user_agent);
+    let ua = user_agent.clone().or(cli.user_agent);
     logger::use_convert_log_postfix(matches!(&cli.command, Commands::Convert { .. }));
 
     match cli.command {
@@ -277,28 +277,6 @@ async fn run_command(
         } => {
             commands::web::run_web_server(port, no_browser, hide_console).await;
             0
-        }
-        other => run_sync_command(other, trace_args, ua, backtrace),
-    }
-}
-
-fn run_sync_command(
-    command: Commands,
-    trace_args: Vec<String>,
-    user_agent: Option<String>,
-    backtrace: bool,
-) -> i32 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match command {
-        Commands::Init {
-            aozora_path,
-            line_height,
-        } => {
-            if let Err(e) = commands::init::cmd_init(aozora_path.as_deref(), line_height) {
-                eprintln!("Error initializing: {}", e);
-                1
-            } else {
-                0
-            }
         }
         Commands::Download {
             targets,
@@ -319,9 +297,50 @@ fn run_sync_command(
                 freeze,
                 remove,
                 mail,
-                user_agent,
+                user_agent: ua,
             })
+            .await
         }
+        Commands::Update {
+            ids,
+            force,
+            no_convert,
+            convert_only_new_arrival,
+            gl,
+            sort_by,
+            ignore_all,
+        } => {
+            commands::update::cmd_update(commands::update::UpdateOptions {
+                ids,
+                force,
+                no_convert,
+                convert_only_new_arrival,
+                gl,
+                sort_by,
+                ignore_all,
+                user_agent: ua,
+            })
+            .await;
+            0
+        }
+        other => run_sync_command(other, trace_args, backtrace),
+    }
+}
+
+fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool) -> i32 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match command {
+        Commands::Init {
+            aozora_path,
+            line_height,
+        } => {
+            if let Err(e) = commands::init::cmd_init(aozora_path.as_deref(), line_height) {
+                eprintln!("Error initializing: {}", e);
+                1
+            } else {
+                0
+            }
+        }
+        Commands::Download { .. } | Commands::Update { .. } => unreachable!(),
         Commands::Mail { targets, force } => {
             commands::mail::cmd_mail(commands::mail::MailOptions { targets, force });
             0
@@ -346,27 +365,6 @@ fn run_sync_command(
                 127
             }
         },
-        Commands::Update {
-            ids,
-            force,
-            no_convert,
-            convert_only_new_arrival,
-            gl,
-            sort_by,
-            ignore_all,
-        } => {
-            commands::update::cmd_update(commands::update::UpdateOptions {
-                ids,
-                force,
-                no_convert,
-                convert_only_new_arrival,
-                gl,
-                sort_by,
-                ignore_all,
-                user_agent,
-            });
-            0
-        }
         Commands::Convert {
             mut targets,
             output,

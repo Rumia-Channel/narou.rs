@@ -8,14 +8,13 @@ use std::time::Duration;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, LocalResult, NaiveDate, TimeZone, Utc};
 use serde_yaml::{Number, Value};
 use tokio::task::JoinHandle;
-
+use crate::application::{JobKind, JobRequest, JobService, Schedule};
 use crate::compat::{
-    configure_web_subprocess_command, load_frozen_ids_from_inventory, load_local_setting_bool,
-    load_local_setting_string, load_local_setting_value, record_is_frozen,
+    configure_web_subprocess_command, load_local_setting_bool, load_local_setting_string,
+    load_local_setting_value, record_is_frozen,
 };
 use crate::db;
 use crate::db::inventory::{Inventory, InventoryScope};
-use crate::downloader::site_setting::SiteSetting;
 use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
 use crate::queue::{JobType, PersistentQueue, QueueJob};
 use crate::termcolor::colored;
@@ -164,22 +163,7 @@ pub fn stop_auto_update_scheduler(scheduler_task: &parking_lot::Mutex<Option<Joi
 }
 
 fn parse_schedule_times(schedule_string: &str) -> Vec<(u32, u32)> {
-    let mut times: Vec<(u32, u32)> = schedule_string
-        .split(',')
-        .filter_map(|value| {
-            let trimmed = value.trim();
-            if trimmed.len() != 4 || !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-                return None;
-            }
-
-            let hour = trimmed[0..2].parse::<u32>().ok()?;
-            let minute = trimmed[2..4].parse::<u32>().ok()?;
-            (hour < 24 && minute < 60).then_some((hour, minute))
-        })
-        .collect();
-    times.sort_unstable();
-    times.dedup();
-    times
+    Schedule::parse(schedule_string).times
 }
 
 fn calculate_next_run_time(times: &[(u32, u32)]) -> Option<chrono::DateTime<Local>> {
@@ -306,6 +290,8 @@ pub fn execute_auto_update(
     push_server: Arc<PushServer>,
     job_id: &str,
     running_pids: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    library: &crate::application::LibraryService,
+    site_updates: &dyn crate::application::SiteUpdateCapabilityProvider,
 ) -> bool {
     auto_update_echo(
         push_server.as_ref(),
@@ -331,8 +317,7 @@ pub fn execute_auto_update(
         return false;
     }
 
-    let (modified_ids, other_ids) = collect_auto_update_target_ids();
-
+    let (modified_ids, other_ids) = collect_auto_update_target_ids(library, site_updates);
     if modified_ids.is_empty() {
         auto_update_echo(
             push_server.as_ref(),
@@ -429,30 +414,23 @@ fn auto_update_sort_key_from_value(server_setting: &Value) -> Option<&'static st
     normalize_sort_key(key)
 }
 
-fn collect_auto_update_target_ids() -> (Vec<String>, Vec<String>) {
-    let site_settings = SiteSetting::load_all().unwrap_or_default();
-    db::with_database(|db| {
-        let frozen_ids = load_frozen_ids_from_inventory(db.inventory()).unwrap_or_default();
-        let modified_ids = db
-            .tag_index()
-            .get("modified")
-            .into_iter()
-            .flat_map(|ids| ids.iter().copied())
-            .collect::<std::collections::BTreeSet<_>>();
-        Ok::<_, crate::error::NarouError>(split_auto_update_target_ids(
-            db.all_records().values(),
-            &modified_ids,
-            &frozen_ids,
-            |record| {
-                site_settings
-                    .iter()
-                    .find(|setting| setting.matches_url(&record.toc_url))
-                    .and_then(|setting| setting.narou_api_url.as_ref())
-                    .is_some()
-            },
-        ))
-    })
-    .unwrap_or_default()
+fn collect_auto_update_target_ids(
+    library: &crate::application::LibraryService,
+    site_updates: &dyn crate::application::SiteUpdateCapabilityProvider,
+) -> (Vec<String>, Vec<String>) {
+    let records = futures::executor::block_on(library.records()).unwrap_or_default();
+    let frozen_ids = futures::executor::block_on(library.frozen_ids()).unwrap_or_default();
+    let modified_ids = records
+        .iter()
+        .filter(|record| record.tags.iter().any(|tag| tag == "modified"))
+        .map(|record| record.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    split_auto_update_target_ids(
+        records.iter(),
+        &modified_ids,
+        &frozen_ids,
+        |record| site_updates.supports_narou_api(&record.toc_url),
+    )
 }
 
 fn split_auto_update_target_ids<'a, I, F>(
@@ -487,6 +465,15 @@ fn queue_auto_update_job_if_needed(
     queue: &PersistentQueue,
     running_jobs: &parking_lot::Mutex<Vec<QueueJob>>,
 ) -> std::result::Result<(String, bool), String> {
+    let plan = JobService.plan(&JobRequest {
+        kind: JobKind::AutoUpdate,
+        targets: Vec::new(),
+        options: Vec::new(),
+    });
+    if plan.invalid.len() != 0 || plan.plans.len() != 1 {
+        return Err("自動アップデートジョブの計画に失敗しました".to_string());
+    }
+
     if let Some(existing_id) = running_jobs
         .lock()
         .iter()
