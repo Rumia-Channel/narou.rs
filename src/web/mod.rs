@@ -648,6 +648,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/diff", post(jobs::api_diff))
         .route("/api/diff_clean", post(jobs::api_diff_clean))
+        .route("/api/diff_history", get(jobs::api_diff_history))
+        .route("/api/diff_show", get(jobs::api_diff_show))
+        .route("/api/diff_restore", post(jobs::api_diff_restore))
+        .route("/api/diff_merge", post(jobs::api_diff_merge))
         .route("/api/csv/import", post(jobs::api_csv_import))
         .route("/api/csv/download", get(jobs::api_csv_download))
         .route(

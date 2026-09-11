@@ -339,6 +339,36 @@ impl JobQueue for D1JobLedger {
         })
     }
 
+    fn save_checkpoint<'a>(
+        &'a self,
+        job_id: &'a JobId,
+        execution_token: &'a str,
+        checkpoint: &'a narou_rs::application::WorkerExecutionCheckpoint,
+    ) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let value = serde_json::to_string(checkpoint).map_err(|error| {
+                NarouError::Platform(format!("execution checkpoint serialization: {error}"))
+            })?;
+            // Unlike yield_for_continuation this keeps status='running' and
+            // the lease intact: it only refreshes the resume cursor.
+            let statement = self.prepare(
+                "UPDATE worker_jobs
+                 SET checkpoint_json = ?, updated_at = ?
+                 WHERE job_id = ? AND status = 'running' AND execution_token = ?",
+                vec![
+                    BindValue::Text(value),
+                    BindValue::Text(self.now_rfc3339()),
+                    BindValue::Text(job_id.as_str().to_string()),
+                    BindValue::Text(execution_token.to_string()),
+                ],
+            )?;
+            // A stale token means another executor owns the job; the write is
+            // best-effort progress, so that is not an error.
+            let _ = statement.run().await.map_err(worker_error)?;
+            Ok(())
+        })
+    }
+
     fn record_attempt<'a>(
         &'a self,
         job_id: &'a JobId,

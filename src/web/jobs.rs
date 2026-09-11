@@ -1512,21 +1512,15 @@ pub async fn api_downloadable_gif(
 pub async fn api_diff(
     State(state): State<AppState>,
     Json(body): Json<DiffBody>,
-) -> Json<ApiResponse> {
+) -> Json<serde_json::Value> {
     let diff_number = match validate_diff_number(&body.number) {
         Ok(number) => number,
         Err(message) => {
-            return Json(ApiResponse {
-                success: false,
-                message,
-            });
+            return serde_json::json!({ "success": false, "message": message }).into();
         }
     };
     if body.ids.len() > super::max_web_targets_per_request(&state).await {
-        return Json(ApiResponse {
-            success: false,
-            message: "too many ids".to_string(),
-        });
+        return serde_json::json!({ "success": false, "message": "too many ids" }).into();
     }
     let ids: Vec<String> = match body
         .ids
@@ -1541,10 +1535,7 @@ pub async fn api_diff(
     {
         Ok(ids) => ids,
         Err(message) => {
-            return Json(ApiResponse {
-                success: false,
-                message,
-            });
+            return serde_json::json!({ "success": false, "message": message }).into();
         }
     };
 
@@ -1563,10 +1554,10 @@ pub async fn api_diff(
                 );
                 if !output.success {
                     log_immediate_command_failure("diff", &output);
-                    return Json(ApiResponse {
-                        success: false,
-                        message: format!("diff の実行に失敗しました ({id})"),
-                    });
+                    return serde_json::json!({
+                        "success": false,
+                        "message": format!("diff の実行に失敗しました ({id})"),
+                    }).into();
                 }
             }
             Err(e) => {
@@ -1575,18 +1566,25 @@ pub async fn api_diff(
                     &format!("diff error: {}", e),
                     crate::native::non_external_console_target(),
                 );
-                return Json(ApiResponse {
-                    success: false,
-                    message: format!("diff の実行に失敗しました ({id})"),
-                });
+                return serde_json::json!({
+                    "success": false,
+                    "message": format!("diff の実行に失敗しました ({id})"),
+                }).into();
             }
         }
     }
 
-    Json(ApiResponse {
-        success: true,
-        message: format!("Diff completed for {} novel(s)", ids.len()),
+    let history: serde_json::Map<String, serde_json::Value> = ids
+        .iter()
+        .filter_map(|id| id.parse::<i64>().ok())
+        .map(|id| (id.to_string(), serde_json::json!(diff_history_versions(id))))
+        .collect();
+    serde_json::json!({
+        "success": true,
+        "message": format!("Diff completed for {} novel(s)", ids.len()),
+        "history": history,
     })
+    .into()
 }
 
 // POST /api/diff_clean
@@ -1640,6 +1638,199 @@ pub async fn api_diff_clean(
             })
         }
     }
+}
+
+/// Shared SQLite connection for diff-history endpoints; `None` when the
+/// library still runs on the legacy YAML backend.
+fn diff_history_conn(
+) -> Option<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>> {
+    let narou_dir = crate::db::inventory::Inventory::with_default_root()
+        .ok()?
+        .root_dir()
+        .join(".narou");
+    crate::native::sqlite::state::active_for(&narou_dir).map(|state| state.conn())
+}
+
+fn diff_history_versions(id: i64) -> Vec<serde_json::Value> {
+    let Some(conn) = diff_history_conn() else {
+        return Vec::new();
+    };
+    let guard = conn.lock().expect("sqlite mutex poisoned");
+    match crate::native::sqlite::versions::list_versions(&guard, id) {
+        Ok(versions) => versions
+            .into_iter()
+            .map(|version| {
+                serde_json::json!({
+                    "id": version.id,
+                    "parent_id": version.parent_id,
+                    "origin": version.origin,
+                    "note": version.note,
+                    "created_at": version.created_at,
+                    "section_count": version.section_count,
+                })
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffHistoryQuery {
+    pub id: Option<i64>,
+}
+
+// GET /api/diff_history?id=N — P4b version history (newest first).
+pub async fn api_diff_history(
+    State(_state): State<AppState>,
+    Query(params): Query<DiffHistoryQuery>,
+) -> Json<serde_json::Value> {
+    let Some(id) = params.id else {
+        return serde_json::json!({ "success": false, "message": "id is required" }).into();
+    };
+    serde_json::json!({
+        "success": true,
+        "id": id,
+        "versions": diff_history_versions(id),
+    })
+    .into()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffShowQuery {
+    pub id: Option<i64>,
+    pub version: Option<i64>,
+}
+
+// GET /api/diff_show?id=N&version=V — stored unified diff for one version.
+pub async fn api_diff_show(
+    State(_state): State<AppState>,
+    Query(params): Query<DiffShowQuery>,
+) -> Json<serde_json::Value> {
+    let (Some(id), Some(version_id)) = (params.id, params.version) else {
+        return serde_json::json!({ "success": false, "message": "id and version are required" })
+            .into();
+    };
+    let Some(conn) = diff_history_conn() else {
+        return serde_json::json!({ "success": false, "message": "SQLite backend is not active" })
+            .into();
+    };
+    let guard = conn.lock().expect("sqlite mutex poisoned");
+    match crate::native::sqlite::versions::version_diff(&guard, version_id) {
+        Ok(Some(diff)) => serde_json::json!({
+            "success": true,
+            "id": id,
+            "version": version_id,
+            "diff": diff,
+        })
+        .into(),
+        Ok(None) => serde_json::json!({
+            "success": false,
+            "message": format!("バージョン{version_id}の差分はありません"),
+        })
+        .into(),
+        Err(error) => serde_json::json!({
+            "success": false,
+            "message": error.to_string(),
+        })
+        .into(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiffVersionBody {
+    pub target: serde_json::Value,
+    pub version: i64,
+    #[serde(default)]
+    pub sections: Option<String>,
+}
+
+fn diff_version_target(body: &DiffVersionBody) -> std::result::Result<String, String> {
+    let target = match &body.target {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    super::validate_web_target_value(&target)
+}
+
+async fn run_diff_version_action(
+    state: &AppState,
+    body: DiffVersionBody,
+    action: &str,
+) -> Json<ApiResponse> {
+    let target = match diff_version_target(&body) {
+        Ok(target) => target,
+        Err(message) => {
+            return Json(ApiResponse {
+                success: false,
+                message,
+            })
+        }
+    };
+    let result = match action {
+        "restore" => {
+            state
+                .services
+                .web_actions
+                .diff_restore(&target, body.version)
+                .await
+        }
+        _ => {
+            state
+                .services
+                .web_actions
+                .diff_merge(&target, body.version, body.sections.as_deref())
+                .await
+        }
+    };
+    match result {
+        Ok(output) => {
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stdout,
+                crate::native::non_external_console_target(),
+            );
+            broadcast_captured_web_output(
+                &state.push_server,
+                &output.stderr,
+                crate::native::non_external_console_target(),
+            );
+            if !output.success {
+                log_immediate_command_failure(action, &output);
+            }
+            Json(ApiResponse {
+                success: output.success,
+                message: if output.success {
+                    format!("バージョン{}の{action}を実行しました", body.version)
+                } else {
+                    format!("バージョン{}の{action}に失敗しました", body.version)
+                },
+            })
+        }
+        Err(e) => {
+            log_web_failure(action, &e);
+            Json(ApiResponse {
+                success: false,
+                message: format!("バージョン{}の{action}に失敗しました", body.version),
+            })
+        }
+    }
+}
+
+// POST /api/diff_restore — copy-forward restore of one version.
+pub async fn api_diff_restore(
+    State(state): State<AppState>,
+    Json(body): Json<DiffVersionBody>,
+) -> Json<ApiResponse> {
+    run_diff_version_action(&state, body, "restore").await
+}
+
+// POST /api/diff_merge — merge sections of one version into the working set.
+pub async fn api_diff_merge(
+    State(state): State<AppState>,
+    Json(body): Json<DiffVersionBody>,
+) -> Json<ApiResponse> {
+    run_diff_version_action(&state, body, "merge").await
 }
 
 // POST /api/csv/import

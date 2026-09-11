@@ -58,6 +58,32 @@ impl WebActionService for NativeWebActionService {
         self.run(vec!["diff".to_string(), "--clean".to_string(), target.to_string()], None)
     }
 
+    fn diff_restore<'a>(&'a self, target: &'a str, version: i64) -> PlatformFuture<'a, Result<WebActionOutput>> {
+        self.run(
+            vec![
+                "diff".to_string(),
+                "--restore".to_string(),
+                version.to_string(),
+                target.to_string(),
+            ],
+            None,
+        )
+    }
+
+    fn diff_merge<'a>(&'a self, target: &'a str, version: i64, sections: Option<&'a str>) -> PlatformFuture<'a, Result<WebActionOutput>> {
+        let mut args = vec![
+            "diff".to_string(),
+            "--merge-from".to_string(),
+            version.to_string(),
+        ];
+        if let Some(sections) = sections {
+            args.push("--merge-sections".to_string());
+            args.push(sections.to_string());
+        }
+        args.push(target.to_string());
+        self.run(args, None)
+    }
+
     fn csv_import<'a>(&'a self, csv: &'a str) -> PlatformFuture<'a, Result<WebActionOutput>> {
         self.run(vec!["csv".to_string(), "--import".to_string(), "-".to_string()], Some(csv.to_string()))
     }

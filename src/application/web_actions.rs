@@ -20,6 +20,16 @@ pub trait WebActionService: Send + Sync {
     fn setting_burn<'a>(&'a self, targets: &'a [String]) -> PlatformFuture<'a, crate::error::Result<WebActionOutput>>;
     fn diff<'a>(&'a self, target: &'a str, number: &'a str) -> PlatformFuture<'a, crate::error::Result<WebActionOutput>>;
     fn diff_clean<'a>(&'a self, target: &'a str) -> PlatformFuture<'a, crate::error::Result<WebActionOutput>>;
+    /// P4b: copy-forward restore of one stored version (`narou diff --restore`).
+    fn diff_restore<'a>(&'a self, target: &'a str, version: i64) -> PlatformFuture<'a, crate::error::Result<WebActionOutput>> {
+        let _ = (target, version);
+        unsupported()
+    }
+    /// P4b: merge sections of one stored version (`narou diff --merge-from`).
+    fn diff_merge<'a>(&'a self, target: &'a str, version: i64, sections: Option<&'a str>) -> PlatformFuture<'a, crate::error::Result<WebActionOutput>> {
+        let _ = (target, version, sections);
+        unsupported()
+    }
     fn csv_import<'a>(&'a self, csv: &'a str) -> PlatformFuture<'a, crate::error::Result<WebActionOutput>>;
     fn csv_download(&self) -> PlatformFuture<'_, crate::error::Result<WebActionOutput>>;
 }

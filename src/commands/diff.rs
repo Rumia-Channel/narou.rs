@@ -437,13 +437,31 @@ fn display_diff_list(context: &NovelContext) -> std::result::Result<(), String> 
 fn clean_diff(context: &NovelContext) -> std::result::Result<(), String> {
     let cache_root = cache_root_dir(context);
     print!("{} の", context.record.title);
-    if !cache_root.exists() {
-        println!("差分はひとつもありません");
-        return Ok(());
+    let mut removed = false;
+    if cache_root.exists() {
+        fs::remove_dir_all(&cache_root).map_err(|e| e.to_string())?;
+        removed = true;
     }
-
-    fs::remove_dir_all(&cache_root).map_err(|e| e.to_string())?;
-    println!("差分を削除しました");
+    // P4b: clearing diffs also clears the SQLite version history (plan §11.3:
+    // api_diff_clean == prune all).
+    #[cfg(feature = "native-runtime")]
+    {
+        if let Ok(conn) = version_conn() {
+            let guard = conn.lock().expect("sqlite mutex poisoned");
+            let pruned = narou_rs::native::sqlite::versions::prune_history(
+                &guard,
+                context.record.id,
+                0,
+            )
+            .map_err(|e| e.to_string())?;
+            removed = removed || pruned > 0;
+        }
+    }
+    if removed {
+        println!("差分を削除しました");
+    } else {
+        println!("差分はひとつもありません");
+    }
     Ok(())
 }
 
@@ -714,6 +732,7 @@ fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Re
     if let Some(version_id) = opts.restore {
         versions::restore_version(&mut guard, novel_id, version_id, false)
             .map_err(|e| e.to_string())?;
+        write_back_working_set(context, &guard)?;
         println!("バージョン{version_id}から復元しました (新しいヘッドとして記録)");
         return Ok(());
     }
@@ -727,10 +746,75 @@ fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Re
         });
         versions::merge_from_version(&mut guard, novel_id, version_id, only.as_deref(), None)
             .map_err(|e| e.to_string())?;
+        write_back_working_set(context, &guard)?;
         println!("バージョン{version_id}からマージしました");
         return Ok(());
     }
 
+    Ok(())
+}
+
+/// Write the mirrored working set back to `本文/*.yaml` after a
+/// restore/merge. The SQLite tables are a mirror; the section files remain
+/// authoritative for conversion, so a version operation that only updates
+/// the mirror would be silently discarded by the next convert.
+#[cfg(feature = "native-runtime")]
+fn write_back_working_set(
+    context: &NovelContext,
+    conn: &rusqlite::Connection,
+) -> std::result::Result<(), String> {
+    use narou_rs::downloader::persistence::section_filename;
+    use narou_rs::downloader::types::SubtitleInfo;
+
+    let novel_id = context.record.id;
+    let sections = narou_rs::native::sqlite::content::load_sections(conn, novel_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "作業セットがミラーされていません".to_string())?;
+
+    let novel_dir =
+        narou_rs::db::existing_novel_dir_for_record(&context.archive_root, &context.record);
+    let section_dir = novel_dir.join(SECTION_SAVE_DIR);
+    fs::create_dir_all(&section_dir).map_err(|e| e.to_string())?;
+
+    let mut expected = std::collections::HashSet::new();
+    for (idx, (subtitle, body_yaml)) in &sections {
+        let section: SectionFile =
+            serde_yaml::from_str(body_yaml).map_err(|e| e.to_string())?;
+        let info = SubtitleInfo {
+            index: idx.clone(),
+            href: section.href.clone(),
+            chapter: section.chapter.clone(),
+            subchapter: section.subchapter.clone(),
+            subtitle: subtitle.clone().unwrap_or_else(|| section.subtitle.clone()),
+            file_subtitle: section.file_subtitle.clone(),
+            subdate: section.subdate.clone(),
+            subupdate: section.subupdate.clone(),
+            download_time: section.download_time.clone(),
+        };
+        let name = section_filename(&info);
+        expected.insert(name.clone());
+        fs::write(section_dir.join(&name), body_yaml).map_err(|e| e.to_string())?;
+    }
+
+    // Remove section files that no longer exist in the working set.
+    for entry in fs::read_dir(&section_dir).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        let is_yaml = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext == "yaml");
+        if !is_yaml {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if !expected.contains(&name) {
+            fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+    }
     Ok(())
 }
 

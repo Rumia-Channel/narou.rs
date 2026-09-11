@@ -846,6 +846,19 @@ pub trait JobQueue: Send + Sync {
         execution_token: &'a str,
         checkpoint: &'a WorkerExecutionCheckpoint,
     ) -> PlatformFuture<'a, crate::error::Result<()>>;
+    /// Persist a mid-execution progress checkpoint without releasing the
+    /// claim or changing the job status. Used so a crashed invocation resumes
+    /// near the last completed section instead of restarting the download.
+    /// Default is a no-op for backends without durable checkpoints.
+    fn save_checkpoint<'a>(
+        &'a self,
+        _job_id: &'a JobId,
+        _execution_token: &'a str,
+        _checkpoint: &'a WorkerExecutionCheckpoint,
+    ) -> PlatformFuture<'a, crate::error::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
 
     /// Durably record one retryable attempt for the current execution token;
     /// returns the new attempt count. A stale token is an error.

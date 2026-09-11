@@ -73,11 +73,9 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
             let latest = json["tag_name"]
                 .as_str()
                 .or_else(|| json["name"].as_str())
-                .unwrap_or("")
-                .trim()
-                .trim_start_matches('v')
-                .to_string();
-            let current_plain = normalize_version(&current);
+                .map(version_core)
+                .unwrap_or_default();
+            let current_plain = version_core(&current);
             let develop = !version::commit_version_exists();
             let local_build = version::is_local_build();
             let container = version::is_container_runtime();
@@ -86,7 +84,7 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
                 "success": true,
                 "current_version": current,
                 "latest_version": latest,
-                "update_available": !latest.is_empty() && latest != current_plain,
+                "update_available": version_is_newer(&latest, &current_plain),
                 "develop": develop,
                 "local_build": local_build,
                 "container": container,
@@ -110,23 +108,47 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
     }
 }
 
-fn normalize_version(version: &str) -> String {
-    version
-        .trim()
-        .trim_start_matches('v')
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string()
+/// Extract the numeric `x.y.z` core from a version string, ignoring `v`
+/// prefixes, suffixes like `(develop)`/`(local-build)`, and any invisible
+/// characters that may slip into release metadata.
+fn version_core(version: &str) -> String {
+    let mut core = String::new();
+    for ch in version.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            core.push(ch);
+        } else if !core.is_empty() {
+            break;
+        }
+    }
+    core.trim_end_matches('.').to_string()
 }
 
-fn notepad_path() -> crate::error::Result<PathBuf> {
-    Ok(Inventory::with_default_root()?
-        .root_dir()
-        .join(".narou")
-        .join("notepad.txt"))
+/// Numeric semver-style comparison: `latest` is an update only when it is
+/// strictly newer than `current`. Falls back to inequality when either side
+/// has no parseable version core.
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    if latest.is_empty() {
+        return false;
+    }
+    let parse = |v: &str| -> Option<Vec<u64>> {
+        let parts: Option<Vec<u64>> = v.split('.').map(|p| p.parse().ok()).collect();
+        parts.filter(|p| !p.is_empty())
+    };
+    match (parse(latest), parse(current)) {
+        (Some(l), Some(c)) => {
+            let len = l.len().max(c.len());
+            for i in 0..len {
+                let lv = l.get(i).copied().unwrap_or(0);
+                let cv = c.get(i).copied().unwrap_or(0);
+                if lv != cv {
+                    return lv > cv;
+                }
+            }
+            false
+        }
+        _ => latest != current,
+    }
 }
-
 
 /// P2: notepad text lives in app_state('inv','notepad'); the file under
 /// `.narou/` remains only as a legacy import source / pre-DB fallback.
@@ -145,6 +167,13 @@ fn notepad_state() -> Option<crate::native::sqlite::state::StateDb> {
     {
         None
     }
+}
+
+fn notepad_path() -> crate::error::Result<PathBuf> {
+    Ok(Inventory::with_default_root()?
+        .root_dir()
+        .join(".narou")
+        .join("notepad.txt"))
 }
 
 fn read_notepad() -> String {

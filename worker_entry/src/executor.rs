@@ -103,6 +103,8 @@ pub async fn execute_job(
     job_id: &JobId,
     checkpoint: Option<&WorkerExecutionCheckpoint>,
     subrequests: &SubrequestBudget,
+    ledger: &std::sync::Arc<crate::ledger::D1JobLedger>,
+    execution_token: &str,
 ) -> JobOutcome {
     if let Some(reason) = unsupported_reason(job) {
         return JobOutcome::Blocked { reason };
@@ -123,7 +125,12 @@ pub async fn execute_job(
             Err(reason) => return JobOutcome::Permanent { reason },
         };
 
-    let mut budget = WorkerBudget::new(JOB_TIME_BUDGET, subrequests);
+    let mut budget = WorkerBudget::new(JOB_TIME_BUDGET, subrequests).with_checkpoints(
+        ledger.clone(),
+        job_id.clone(),
+        execution_token.to_string(),
+        novel_id,
+    );
     let result = downloader
         .download_novel_with_execution_options(
             &target,

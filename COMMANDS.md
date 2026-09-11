@@ -496,7 +496,7 @@ narou setting name         # 読み取り
 | `--merge-from ID` | — | int | — | (P4b) 指定バージョンを作業セットへマージ |
 | `--merge-sections LIST` | — | str | — | (P4b) `--merge-from` の対象話制限 (カンマ区切り) |
 
-> P4b オプションは SQLite バックエンド有効時のみ動作する。履歴は convert 実行時に自動スナップショットされ、保持数は将来 `diff.history-limit` で制御予定。
+> P4b オプションは SQLite バックエンド有効時のみ動作する。履歴は convert 実行時に自動スナップショットされ、保持数は将来 `diff.history-limit` で制御予定。`--restore` / `--merge-from` はミラー更新後に `本文/*.yaml` へも書き戻す（authoritative はファイルのまま）。`--clean` は差分キャッシュに加えて SQLite バージョン履歴も全削除する。
 | target | | string | — | 小説指定 (省略時=最終更新) |
 
 **実装状況**:
@@ -504,6 +504,7 @@ narou setting name         # 読み取り
 - 差分バージョン指定 `YYYY.MM.DD@HH.MM.SS` / `;` 区切りに対応
 - セクション YAML からの一時テキスト生成、外部 diff ツール統合、内蔵差分ビューアを実装済み
 - 既定対象は最新更新の小説で、差分キャッシュは `本文/cache/<version>/` に配置する
+- Web API: `GET /api/diff_history?id=N`（バージョン一覧）、`GET /api/diff_show?id=N&version=V`（保存済み差分）、`POST /api/diff_restore` / `POST /api/diff_merge`（`{target, version, sections?}`）を追加。`api_diff` 応答に `history` フィールドを追加（既存キー不変）
 
 ---
 

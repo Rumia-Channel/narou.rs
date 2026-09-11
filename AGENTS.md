@@ -339,6 +339,7 @@ sample/
 - 再現環境は喪失 (ユーザー側アップデート済み、2026-04-26)
 - `841bec5` で `NAROU_RS_RELEASE_BUILD` フラグ焼き込み済み
 - 対応指針: `version_latest` 防御的書き直し、JS 側フォールバック判定、生バイト列検査
+- **2026-09 対応済み**: `version_latest` を書き直し、`version_core`（数字と `.` のみ抽出）+ `version_is_newer`（数値タプル比較、パース不能時は不一致フォールバック）で不可視文字・表記揺れを吸収するようにした
 
 ### YAML駆動サイト定義
 - 2026-05: 完了。`kakuyomu_preprocess` ハードコードは除去され、YAML の `preprocess:` DSL ブロック + pest 文法 + セーフインタプリタで駆動される。
