@@ -90,7 +90,7 @@ impl SqliteObjectStore {
     fn read_blocking(&self, key: &ObjectKey) -> Result<Option<Vec<u8>>> {
         let conn = self.conn.lock().expect("sqlite mutex poisoned");
         let mut statement = conn
-            .prepare("SELECT data, size FROM objects WHERE object_key = ?")
+            .prepare("SELECT data, size, encoding FROM objects WHERE object_key = ?")
             .map_err(super::sqlite_error)?;
         let mut rows = statement
             .query(rusqlite::params![key.as_ref()])
@@ -100,46 +100,58 @@ impl SqliteObjectStore {
         };
         let inline: Option<String> = row.get(0).map_err(super::sqlite_error)?;
         let size: i64 = row.get(1).map_err(super::sqlite_error)?;
-        if let Some(encoded) = inline {
-            return Ok(Some(decode_payload(&encoded)?));
-        }
-        drop(rows);
-        drop(statement);
-        let mut statement = conn
-            .prepare("SELECT data FROM object_chunks WHERE object_key = ? ORDER BY seq")
-            .map_err(super::sqlite_error)?;
-        let mut rows = statement
-            .query(rusqlite::params![key.as_ref()])
-            .map_err(super::sqlite_error)?;
-        let mut data = Vec::with_capacity(size as usize);
-        while let Some(row) = rows.next().map_err(super::sqlite_error)? {
-            let chunk: String = row.get(0).map_err(super::sqlite_error)?;
-            data.extend_from_slice(&decode_payload(&chunk)?);
-        }
+        let encoding: String = row.get(2).map_err(super::sqlite_error)?;
+        let encoding = crate::platform::ObjectEncoding::parse(&encoding)?;
+        let stored = if let Some(encoded) = inline {
+            decode_payload(&encoded)?
+        } else {
+            drop(rows);
+            drop(statement);
+            let mut statement = conn
+                .prepare("SELECT data FROM object_chunks WHERE object_key = ? ORDER BY seq")
+                .map_err(super::sqlite_error)?;
+            let mut rows = statement
+                .query(rusqlite::params![key.as_ref()])
+                .map_err(super::sqlite_error)?;
+            let mut encoded = String::new();
+            while let Some(row) = rows.next().map_err(super::sqlite_error)? {
+                let chunk: String = row.get(0).map_err(super::sqlite_error)?;
+                encoded.push_str(&chunk);
+            }
+            decode_payload(&encoded)?
+        };
+        let data = crate::platform::decompress_object_payload(&stored, encoding)?;
+        debug_assert_eq!(data.len() as i64, size);
         Ok(Some(data))
     }
 
     /// Insert or replace one object (inline or chunked) in a single
-    /// transaction. Chunk rows are fully rewritten to keep `seq` dense.
+    /// transaction. Compression runs on the whole payload before chunking so
+    /// chunk boundaries never split a deflate stream; `size` stays the
+    /// original uncompressed length.
     fn write_blocking(&self, key: &ObjectKey, data: &[u8]) -> Result<()> {
+        let (stored, encoding) = crate::platform::compress_object_payload(data);
+        let encoded = encode_payload(&stored);
         let mut conn = self.conn.lock().expect("sqlite mutex poisoned");
         let tx = conn.transaction().map_err(super::sqlite_error)?;
         let content_type = content_type_for_key(key);
-        if data.len() <= OBJECT_CHUNK_BYTES {
+        if encoded.len() <= OBJECT_CHUNK_BYTES {
             tx.execute(
-                "INSERT INTO objects (object_key, size, content_type, updated_at, data)
-                 VALUES (?, ?, ?, ?, ?)
+                "INSERT INTO objects (object_key, size, content_type, updated_at, encoding, data)
+                 VALUES (?, ?, ?, ?, ?, ?)
                  ON CONFLICT(object_key) DO UPDATE SET
                      size = excluded.size,
                      content_type = excluded.content_type,
                      updated_at = excluded.updated_at,
+                     encoding = excluded.encoding,
                      data = excluded.data",
                 rusqlite::params![
                     key.as_ref(),
                     data.len() as i64,
                     content_type,
                     Self::now_rfc3339(),
-                    encode_payload(data)
+                    encoding.as_str(),
+                    encoded
                 ],
             )
             .map_err(super::sqlite_error)?;
@@ -150,18 +162,20 @@ impl SqliteObjectStore {
             .map_err(super::sqlite_error)?;
         } else {
             tx.execute(
-                "INSERT INTO objects (object_key, size, content_type, updated_at, data)
-                 VALUES (?, ?, ?, ?, NULL)
+                "INSERT INTO objects (object_key, size, content_type, updated_at, encoding, data)
+                 VALUES (?, ?, ?, ?, ?, NULL)
                  ON CONFLICT(object_key) DO UPDATE SET
                      size = excluded.size,
                      content_type = excluded.content_type,
                      updated_at = excluded.updated_at,
+                     encoding = excluded.encoding,
                      data = NULL",
                 rusqlite::params![
                     key.as_ref(),
                     data.len() as i64,
                     content_type,
-                    Self::now_rfc3339()
+                    Self::now_rfc3339(),
+                    encoding.as_str()
                 ],
             )
             .map_err(super::sqlite_error)?;
@@ -173,9 +187,15 @@ impl SqliteObjectStore {
             let mut statement = tx
                 .prepare("INSERT INTO object_chunks (object_key, seq, data) VALUES (?, ?, ?)")
                 .map_err(super::sqlite_error)?;
-            for (seq, chunk) in data.chunks(OBJECT_CHUNK_BYTES).enumerate() {
+            for (seq, chunk) in encoded
+                .as_bytes()
+                .chunks(OBJECT_CHUNK_BYTES)
+                .enumerate()
+            {
+                let chunk = std::str::from_utf8(chunk)
+                    .map_err(|error| NarouError::Platform(error.to_string()))?;
                 statement
-                    .execute(rusqlite::params![key.as_ref(), seq as i64, encode_payload(chunk)])
+                    .execute(rusqlite::params![key.as_ref(), seq as i64, chunk])
                     .map_err(super::sqlite_error)?;
             }
         }
@@ -565,10 +585,41 @@ mod tests {
     fn chunked_payload_roundtrips() {
         let (_dir, store) = temp_store();
         let key = ObjectKey::try_new("generated/epub/book.epub").unwrap();
+        // Incompressible bytes (xorshift PRNG) so the payload stays chunked
+        // even with deflate enabled.
+        let mut state = 0x9E3779B97F4A7C15u64;
         let payload: Vec<u8> = (0..(OBJECT_CHUNK_BYTES * 2 + 1234))
-            .map(|i| (i % 251) as u8)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8
+            })
             .collect();
         futures::executor::block_on(store.write_small(&key, payload.clone())).unwrap();
+        let data = futures::executor::block_on(store.read_small(&key)).unwrap().unwrap();
+        assert_eq!(data, payload);
+    }
+
+    #[test]
+    fn compressible_payload_is_stored_deflated() {
+        let (_dir, store) = temp_store();
+        let key = ObjectKey::try_new("novels/site/title/本文/0001 本文.yaml").unwrap();
+        let payload = "同じ文章の繰り返し。".repeat(10_000).into_bytes();
+        futures::executor::block_on(store.write_small(&key, payload.clone())).unwrap();
+
+        let conn = store.conn.lock().expect("sqlite mutex poisoned");
+        let (encoding, stored_len): (String, i64) = conn
+            .query_row(
+                "SELECT encoding, LENGTH(data) FROM objects WHERE object_key = ?",
+                rusqlite::params![key.as_ref()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(encoding, "deflate");
+        assert!((stored_len as usize) < payload.len());
+        drop(conn);
+
         let data = futures::executor::block_on(store.read_small(&key)).unwrap().unwrap();
         assert_eq!(data, payload);
     }

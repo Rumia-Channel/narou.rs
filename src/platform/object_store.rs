@@ -349,6 +349,67 @@ pub fn sanitize_key_component_with_limit(value: &str, limit: Option<usize>) -> S
     candidate
 }
 
+/// Stored-payload encoding for the `objects`/`object_chunks` tables.
+///
+/// `None` stores raw bytes (base64'd at the storage layer); `Deflate`
+/// stores `miniz_oxide` deflate-compressed bytes. Compression is applied to
+/// the whole payload *before* chunking so chunk boundaries never split a
+/// deflate stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectEncoding {
+    None,
+    Deflate,
+}
+
+impl ObjectEncoding {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Deflate => "deflate",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "none" => Ok(Self::None),
+            "deflate" => Ok(Self::Deflate),
+            other => Err(NarouError::Platform(format!(
+                "unknown object encoding: {other}"
+            ))),
+        }
+    }
+}
+
+/// Below this size compression costs more CPU than the bytes it saves.
+const COMPRESS_MIN_BYTES: usize = 512;
+
+/// Compress `data` when it is large enough and deflate actually shrinks it.
+/// Returns the stored bytes plus the encoding marker to persist.
+pub fn compress_object_payload(data: &[u8]) -> (Vec<u8>, ObjectEncoding) {
+    if data.len() < COMPRESS_MIN_BYTES {
+        return (data.to_vec(), ObjectEncoding::None);
+    }
+    let compressed = miniz_oxide::deflate::compress_to_vec(data, 6);
+    if compressed.len() < data.len() {
+        (compressed, ObjectEncoding::Deflate)
+    } else {
+        (data.to_vec(), ObjectEncoding::None)
+    }
+}
+
+/// Reverse [`compress_object_payload`]. `encoding` comes from the object's
+/// `encoding` column.
+pub fn decompress_object_payload(data: &[u8], encoding: ObjectEncoding) -> Result<Vec<u8>> {
+    match encoding {
+        ObjectEncoding::None => Ok(data.to_vec()),
+        ObjectEncoding::Deflate => {
+            miniz_oxide::inflate::decompress_to_vec(data).map_err(|error| {
+                NarouError::Platform(format!("invalid deflate object payload: {error}"))
+            })
+        }
+    }
+}
+
 fn create_subdirectory_name(file_title: &str) -> String {
     let chars = if file_title.starts_with('n') {
         file_title.chars().skip(1).take(2).collect::<String>()

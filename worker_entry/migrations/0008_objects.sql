@@ -5,16 +5,19 @@
 -- Payloads are stored base64-encoded in TEXT columns so the same schema and
 -- row format work identically on local SQLite (rusqlite) and Cloudflare D1
 -- (workers-rs serde path), where BLOB↔Vec<u8> conversion is unreliable.
--- Payloads up to 512 KiB live inline in `objects.data`; larger payloads set
--- `objects.data = NULL` and store all bytes in `object_chunks` (seq 0..N,
--- 512 KiB each). 512 KiB keeps every statement and row comfortably under
--- D1's limits even after base64 inflation (~683 KiB worst case).
+-- Payloads up to 512 KiB (stored size, after optional deflate compression)
+-- live inline in `objects.data`; larger payloads set `objects.data = NULL`
+-- and store all bytes in `object_chunks` (seq 0..N, 512 KiB each). The
+-- `encoding` column records 'none' or 'deflate' (miniz_oxide, applied to the
+-- whole payload before chunking). 512 KiB keeps every statement and row
+-- comfortably under D1's limits even after base64 inflation.
 
 CREATE TABLE IF NOT EXISTS objects (
     object_key  TEXT PRIMARY KEY,
     size        INTEGER NOT NULL,
     updated_at  TEXT NOT NULL,
     content_type TEXT,
+    encoding    TEXT NOT NULL DEFAULT 'none',
     data        TEXT
 ) WITHOUT ROWID;
 

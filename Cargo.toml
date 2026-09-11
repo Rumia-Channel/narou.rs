@@ -92,6 +92,7 @@ url = "2"
 rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 aozora_epub3_lite = { git = "https://github.com/Rumia-Channel/AozoraEpub3_Lite", rev = "69f6904", optional = true }
 base64 = "0.22"
+miniz_oxide = "0.9"
 
 [build-dependencies]
 base64 = "0.22"

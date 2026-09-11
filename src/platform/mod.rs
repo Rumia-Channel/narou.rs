@@ -24,8 +24,9 @@ pub mod repository;
 pub use clock::{Clock, SystemClock};
 pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
 pub use object_store::{
-    AssetChunk, AssetStore, AssetStream, GeneratedAssetKey, NovelObjectKeys, ObjectKey,
-    ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectStore,
+    AssetChunk, AssetStore, AssetStream, GeneratedAssetKey, NovelObjectKeys, ObjectEncoding,
+    ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectStore,
+    compress_object_payload, decompress_object_payload,
 };
 pub use progress::ProgressReporter;
 pub use rate_limiter::{normalize_site_key, RateLimitScope, RateLimiter};

@@ -54,12 +54,14 @@ struct StatRow {
 struct DataRow {
     data: Option<String>,
     size: i64,
+    encoding: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChunkRow {
     data: String,
 }
+
 
 #[derive(Debug, Deserialize)]
 struct ListRow {
@@ -106,10 +108,9 @@ impl D1ObjectStore {
             .map_err(worker_error)?;
         Ok(row.map(|row| metadata_from(key, row.size, &row.updated_at, row.content_type)))
     }
-
     async fn read_all(&self, key: &ObjectKey) -> Result<Option<Vec<u8>>> {
         let statement = self.prepare(
-            "SELECT data, size FROM objects WHERE object_key = ?",
+            "SELECT data, size, encoding FROM objects WHERE object_key = ?",
             vec![JsValue::from_str(key.as_ref())],
         )?;
         let row = statement
@@ -119,37 +120,45 @@ impl D1ObjectStore {
         let Some(row) = row else {
             return Ok(None);
         };
-        if let Some(encoded) = row.data {
-            return Ok(Some(decode_payload(&encoded)?));
-        }
-        let chunks = self
-            .prepare(
-                "SELECT data FROM object_chunks WHERE object_key = ? ORDER BY seq",
-                vec![JsValue::from_str(key.as_ref())],
-            )?
-            .all()
-            .await
-            .map_err(worker_error)?
-            .results::<ChunkRow>()
-            .map_err(worker_error)?;
-        let mut data = Vec::with_capacity(row.size.max(0) as usize);
-        for chunk in chunks {
-            data.extend_from_slice(&decode_payload(&chunk.data)?);
-        }
-        Ok(Some(data))
+        let encoding = narou_rs::platform::ObjectEncoding::parse(&row.encoding)?;
+        let stored = if let Some(encoded) = row.data {
+            decode_payload(&encoded)?
+        } else {
+            let chunks = self
+                .prepare(
+                    "SELECT data FROM object_chunks WHERE object_key = ? ORDER BY seq",
+                    vec![JsValue::from_str(key.as_ref())],
+                )?
+                .all()
+                .await
+                .map_err(worker_error)?
+                .results::<ChunkRow>()
+                .map_err(worker_error)?;
+            let mut encoded = String::new();
+            for chunk in chunks {
+                encoded.push_str(&chunk.data);
+            }
+            decode_payload(&encoded)?
+        };
+        Ok(Some(narou_rs::platform::decompress_object_payload(
+            &stored, encoding,
+        )?))
     }
 
     async fn write_all(&self, key: &ObjectKey, data: &[u8]) -> Result<()> {
+        let (stored, encoding) = narou_rs::platform::compress_object_payload(data);
+        let encoded = encode_payload(&stored);
         let now = chrono::Utc::now().to_rfc3339();
         let content_type = content_type_for_key(key);
         let mut statements = Vec::new();
-        if data.len() <= INLINE_MAX {
+        if encoded.len() <= INLINE_MAX {
             statements.push(self.prepare(
-                "INSERT INTO objects (object_key, size, updated_at, content_type, data) \
-                 VALUES (?, ?, ?, ?, ?) \
+                "INSERT INTO objects (object_key, size, updated_at, content_type, encoding, data) \
+                 VALUES (?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(object_key) DO UPDATE SET \
                  size = excluded.size, updated_at = excluded.updated_at, \
-                 content_type = excluded.content_type, data = excluded.data",
+                 content_type = excluded.content_type, encoding = excluded.encoding, \
+                 data = excluded.data",
                 vec![
                     JsValue::from_str(key.as_ref()),
                     JsValue::from_f64(data.len() as f64),
@@ -158,7 +167,8 @@ impl D1ObjectStore {
                         Some(ct) => JsValue::from_str(ct),
                         None => JsValue::NULL,
                     },
-                    JsValue::from_str(&encode_payload(data)),
+                    JsValue::from_str(encoding.as_str()),
+                    JsValue::from_str(&encoded),
                 ],
             )?);
             statements.push(self.prepare(
@@ -167,11 +177,12 @@ impl D1ObjectStore {
             )?);
         } else {
             statements.push(self.prepare(
-                "INSERT INTO objects (object_key, size, updated_at, content_type, data) \
-                 VALUES (?, ?, ?, ?, NULL) \
+                "INSERT INTO objects (object_key, size, updated_at, content_type, encoding, data) \
+                 VALUES (?, ?, ?, ?, ?, NULL) \
                  ON CONFLICT(object_key) DO UPDATE SET \
                  size = excluded.size, updated_at = excluded.updated_at, \
-                 content_type = excluded.content_type, data = NULL",
+                 content_type = excluded.content_type, encoding = excluded.encoding, \
+                 data = NULL",
                 vec![
                     JsValue::from_str(key.as_ref()),
                     JsValue::from_f64(data.len() as f64),
@@ -180,19 +191,22 @@ impl D1ObjectStore {
                         Some(ct) => JsValue::from_str(ct),
                         None => JsValue::NULL,
                     },
+                    JsValue::from_str(encoding.as_str()),
                 ],
             )?);
             statements.push(self.prepare(
                 "DELETE FROM object_chunks WHERE object_key = ?",
                 vec![JsValue::from_str(key.as_ref())],
             )?);
-            for (seq, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
+            for (seq, chunk) in encoded.as_bytes().chunks(CHUNK_SIZE).enumerate() {
+                let chunk = std::str::from_utf8(chunk)
+                    .map_err(|error| NarouError::Platform(error.to_string()))?;
                 statements.push(self.prepare(
                     "INSERT INTO object_chunks (object_key, seq, data) VALUES (?, ?, ?)",
                     vec![
                         JsValue::from_str(key.as_ref()),
                         JsValue::from_f64(seq as f64),
-                        JsValue::from_str(&encode_payload(chunk)),
+                        JsValue::from_str(chunk),
                     ],
                 )?);
             }
