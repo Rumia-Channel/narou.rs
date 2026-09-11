@@ -10,7 +10,7 @@
 | P3 既定化 | ✅ Database::new が db.sqlite を既定使用。YAML非書込テスト & perf smoke(1000件) 追加 |
 | P4a コンテンツ | ✅ novel_sections/novel_outputs ミラー (convert時)。Web DL時EPUBはDB優先。sectionsの全経路DB化は段階継続 |
 | P4b 差分履歴 | ✅ §11テーブル実装 + diff CLI拡張 (--history/--show/--restore/--merge-from/--merge-sections) + prune。**update時自動snapshotはconvertフック経由**、Web api_diff拡張と行レベル3-wayマージは未着手 |
-| P4c オブジェクト格納 | ✅ `objects`/`object_chunks` (base64 TEXT) に小説データ/生成物を格納。native は FS ミラー+読みフォールバック+union listing、worker は D1 のみ (Wasabi 撤去)。`configure` 時に空なら FS 一括 import |
+| P4c オブジェクト格納 | ✅ `objects`/`object_chunks` (BLOB + brotli + crc32) に小説データ/生成物を格納。native は FS ミラー+読みフォールバック+union listing、worker は D1 のみ (Wasabi 撤去)。`configure` 時に空なら FS 一括 import。`section_bodies` で本文を content-addressed dedup、`novel_outputs`/`unified_diff` も圧縮 |
 | P5 清算 | ◐ AGENTS/COMMANDS更新・version bump。Inventory削減は残置(legacy import用に維持) |
 
 ### 計画からの逸脱 (意図的)

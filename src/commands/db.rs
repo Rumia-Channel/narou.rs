@@ -37,6 +37,14 @@ fn cmd_verify() -> narou_rs::error::Result<()> {
         Some(report) => println!("integrity: {report}"),
         None => println!("レガシーYAMLモードのため整合性チェックをスキップしました"),
     }
+    // Payload-level check: every objects/section_bodies row's stored CRC-32
+    // must match its decompressed payload. PRAGMA integrity_check covers
+    // B-tree structure, not application-level corruption.
+    match narou_rs::db::with_database(|db| db.sqlite_payload_check())? {
+        Some(0) => println!("payloads: ok"),
+        Some(bad) => println!("payloads: {bad} corrupted"),
+        None => {}
+    }
     Ok(())
 }
 

@@ -349,15 +349,18 @@ pub fn sanitize_key_component_with_limit(value: &str, limit: Option<usize>) -> S
     candidate
 }
 
-/// Stored-payload encoding for the `objects`/`object_chunks` tables.
+/// Stored-payload codec for the `objects`/`object_chunks`/`section_bodies`
+/// tables.
 ///
-/// `None` stores raw bytes (base64'd at the storage layer); `Deflate`
-/// stores `miniz_oxide` deflate-compressed bytes. Compression is applied to
-/// the whole payload *before* chunking so chunk boundaries never split a
-/// deflate stream.
+/// `None` stores raw bytes; `Brotli` stores brotli-compressed bytes (pure
+/// Rust, wasm32-safe — zstd needs clang and cannot build for the Worker).
+/// `Deflate` is decode-only legacy support for rows written by the first
+/// revision of this schema. Compression is applied to the whole payload
+/// *before* chunking so chunk boundaries never split a compressed stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectEncoding {
     None,
+    Brotli,
     Deflate,
 }
 
@@ -365,6 +368,7 @@ impl ObjectEncoding {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::None => "none",
+            Self::Brotli => "brotli",
             Self::Deflate => "deflate",
         }
     }
@@ -372,6 +376,7 @@ impl ObjectEncoding {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "none" => Ok(Self::None),
+            "brotli" => Ok(Self::Brotli),
             "deflate" => Ok(Self::Deflate),
             other => Err(NarouError::Platform(format!(
                 "unknown object encoding: {other}"
@@ -383,15 +388,21 @@ impl ObjectEncoding {
 /// Below this size compression costs more CPU than the bytes it saves.
 const COMPRESS_MIN_BYTES: usize = 512;
 
-/// Compress `data` when it is large enough and deflate actually shrinks it.
+/// CRC-32 of an uncompressed payload, stored alongside the encoding so
+/// reads and `db verify` can detect corruption independent of the codec.
+pub fn object_crc32(data: &[u8]) -> u32 {
+    crc32fast::hash(data)
+}
+
+/// Compress `data` when it is large enough and brotli actually shrinks it.
 /// Returns the stored bytes plus the encoding marker to persist.
 pub fn compress_object_payload(data: &[u8]) -> (Vec<u8>, ObjectEncoding) {
     if data.len() < COMPRESS_MIN_BYTES {
         return (data.to_vec(), ObjectEncoding::None);
     }
-    let compressed = miniz_oxide::deflate::compress_to_vec(data, 6);
+    let compressed = brotli_compress(data);
     if compressed.len() < data.len() {
-        (compressed, ObjectEncoding::Deflate)
+        (compressed, ObjectEncoding::Brotli)
     } else {
         (data.to_vec(), ObjectEncoding::None)
     }
@@ -402,12 +413,46 @@ pub fn compress_object_payload(data: &[u8]) -> (Vec<u8>, ObjectEncoding) {
 pub fn decompress_object_payload(data: &[u8], encoding: ObjectEncoding) -> Result<Vec<u8>> {
     match encoding {
         ObjectEncoding::None => Ok(data.to_vec()),
+        ObjectEncoding::Brotli => brotli_decompress(data),
         ObjectEncoding::Deflate => {
             miniz_oxide::inflate::decompress_to_vec(data).map_err(|error| {
                 NarouError::Platform(format!("invalid deflate object payload: {error}"))
             })
         }
     }
+}
+
+/// Verify `data` (uncompressed) against a stored CRC-32.
+pub fn verify_object_crc32(data: &[u8], expected: u32) -> Result<()> {
+    let actual = object_crc32(data);
+    if actual != expected {
+        return Err(NarouError::Platform(format!(
+            "object payload CRC mismatch: expected {expected:08x}, got {actual:08x}"
+        )));
+    }
+    Ok(())
+}
+
+fn brotli_compress(data: &[u8]) -> Vec<u8> {
+    // Quality 6: near-best ratio for text at a fraction of q11's CPU cost.
+    let mut output = Vec::new();
+    let params = brotli::enc::BrotliEncoderParams {
+        quality: 6,
+        ..Default::default()
+    };
+    let mut input = std::io::Cursor::new(data);
+    if brotli::BrotliCompress(&mut input, &mut output, &params).is_err() {
+        return data.to_vec();
+    }
+    output
+}
+
+fn brotli_decompress(data: &[u8]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut input = std::io::Cursor::new(data);
+    brotli::BrotliDecompress(&mut input, &mut output)
+        .map_err(|error| NarouError::Platform(format!("invalid brotli object payload: {error}")))?;
+    Ok(output)
 }
 
 fn create_subdirectory_name(file_title: &str) -> String {

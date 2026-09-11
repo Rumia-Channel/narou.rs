@@ -323,7 +323,7 @@ pub trait NovelRepository: PlatformService {
 | fetch / scheduled / queue handlers | `workers-rs` `0.8.5` event macros | 完了。queue consumerはD1 ledgerとbounded retryを使用 |
 | `worker-build` / Wrangler | `worker_entry/wrangler.toml` | 完了。D1 migrations / Queue producer・consumer / DLQを定義 |
 | `WorkerHttpClient` | Workers Fetch API | 完了。bounded response body、trait future、redirect policyを維持 |
-| `D1ObjectStore` / `AssetStore` | D1 `objects`/`object_chunks` (base64 TEXT) | 完了。logical key、paged LIST、small/streaming境界を維持。Wasabi は撤去 |
+| `D1ObjectStore` / `AssetStore` | D1 `objects`/`object_chunks` (BLOB + brotli + crc32) | 完了。logical key、paged LIST、small/streaming境界を維持。Wasabi は撤去 |
 | `D1NovelRepository` | D1 prepared statements + migrations | 完了。typed filter/sort、keyset scan、batch mutationをSQLへ変換 |
 | authenticated read-only API | `/health/*`, `/api/novels*` | 完了。`NAROU_ADMIN_TOKEN`をconstant-time比較 |
 

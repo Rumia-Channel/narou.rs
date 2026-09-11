@@ -12,8 +12,10 @@ default = []
 
 [dependencies]
 base64 = "0.23"
+brotli = "9.0"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.10", features = ["case-insensitive"] }
+crc32fast = "1.5"
 futures = "0.3"
 hex = "0.4"
 hmac = "0.13"
