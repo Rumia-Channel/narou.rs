@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use regex::Regex;
 
 use super::ConverterBase;
@@ -6,12 +8,26 @@ const STASH_INDEX_BASE: u32 = 0xE100;
 const ILLUST_STASH_MARKER: char = '\u{E010}';
 const URL_STASH_MARKER: char = '\u{E011}';
 
+static RE_ILLUST_TAG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"[ 　\t]*?(\u{FF3B}\u{FF03}\u{633F}\u{7D75}\u{FF08}.+?\u{FF09}\u{5165}\u{308B}\u{FF3D})\n?",
+    )
+    .unwrap()
+});
+static RE_URL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).unwrap());
+static RE_FORCE_INDENT_CHAPTER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\u{FF3B}\u{FF03}\u{7AE0}\u{898B}\u{51FA}\u{3057}\u{3063}\u{307D}\u{3044}\u{6587}\u{FF1D}(\d+)\u{FF3D}")
+        .unwrap()
+});
+static RE_ILLUST_STASH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\u{E010}([\u{E100}-\u{F8FF}])").unwrap());
+static RE_URL_STASH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\u{E011}([\u{E100}-\u{F8FF}])").unwrap());
+
 impl ConverterBase {
     pub(super) fn replace_illust_tag(&mut self, text: &mut String) {
-        let re = Regex::new(
-            r"[ 　\t]*?(\u{FF3B}\u{FF03}\u{633F}\u{7D75}\u{FF08}.+?\u{FF09}\u{5165}\u{308B}\u{FF3D})\n?",
-        )
-        .unwrap();
+        let re = &*RE_ILLUST_TAG;
         if !self.settings.enable_illust {
             *text = re.replace_all(text, "").to_string();
             return;
@@ -26,8 +42,7 @@ impl ConverterBase {
     }
 
     pub(super) fn replace_url(&mut self, text: &str) -> String {
-        let re = Regex::new(r#"https?://[^\s<>"']+"#).unwrap();
-        let result = re
+        let result = RE_URL
             .replace_all(text, |caps: &regex::Captures| {
                 let url = caps[0].to_string();
                 let idx = self.url_stash.len();
@@ -58,9 +73,7 @@ impl ConverterBase {
     }
 
     pub(super) fn rebuild_force_indent_chapter(&self, data: &mut String) {
-        let re = Regex::new(r"\u{FF3B}\u{FF03}\u{7AE0}\u{898B}\u{51FA}\u{3057}\u{3063}\u{307D}\u{3044}\u{6587}\u{FF1D}(\d+)\u{FF3D}")
-            .unwrap();
-        *data = re
+        *data = RE_FORCE_INDENT_CHAPTER
             .replace_all(data, |caps: &regex::Captures| {
                 let idx: usize = caps[1].parse().unwrap_or(0);
                 self.force_indent_chapter_stash
@@ -72,8 +85,7 @@ impl ConverterBase {
     }
 
     pub(super) fn rebuild_illust(&self, data: &mut String) {
-        let re = Regex::new(r"\u{E010}([\u{E100}-\u{F8FF}])").unwrap();
-        *data = re
+        *data = RE_ILLUST_STASH
             .replace_all(data, |caps: &regex::Captures| {
                 let idx = decode_stash_index(&caps[1]).unwrap_or(usize::MAX);
                 self.illust_stash.get(idx).cloned().unwrap_or_default()
@@ -82,8 +94,7 @@ impl ConverterBase {
     }
 
     pub(super) fn rebuild_url(&self, data: &mut String) {
-        let re = Regex::new(r"\u{E011}([\u{E100}-\u{F8FF}])").unwrap();
-        *data = re
+        *data = RE_URL_STASH
             .replace_all(data, |caps: &regex::Captures| {
                 let idx = decode_stash_index(&caps[1]).unwrap_or(usize::MAX);
                 self.url_stash.get(idx).cloned().unwrap_or_default()

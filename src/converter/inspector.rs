@@ -341,8 +341,9 @@ fn is_ignore_indent_char(ch: char) -> bool {
 }
 
 fn rebuild_brackets(data: &str, replacements: &[String]) -> String {
-    let re = regex::Regex::new(r"［＃かぎ括弧＝(\d+)］").unwrap();
-    re.replace_all(data, |caps: &regex::Captures| {
+    static RE_KAGI_BRACKET: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"［＃かぎ括弧＝(\d+)］").unwrap());
+    RE_KAGI_BRACKET.replace_all(data, |caps: &regex::Captures| {
         let index = caps[1].parse::<usize>().unwrap_or(usize::MAX);
         replacements
             .get(index)
