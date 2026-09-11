@@ -12,8 +12,9 @@ database_name = "narou-rs"
 migrations_dir = "migrations"
 
 # Set the remote database_id before deployment (or in an environment-specific
-# Wrangler config). Keep Wasabi endpoint/bucket/region/prefix vars and
-# Wasabi/NAROU_ADMIN_TOKEN secrets outside this file.
+# Wrangler config). Keep NAROU_ADMIN_TOKEN and other secrets outside this file.
+# Object payloads live in the D1 `objects`/`object_chunks` tables (migration
+# 0008); no external bucket is required.
 
 [build]
 command = "worker-build --release"

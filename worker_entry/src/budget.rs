@@ -1,8 +1,8 @@
 //! Per-invocation subrequest accounting (Workers Paid optimization).
 //!
-//! Every `fetch()` issued by this isolate — site downloads, Wasabi object
-//! operations, and Durable Object permit calls — counts against the
-//! platform's 1,000-subrequest-per-invocation hard limit. D1, Queue, and
+//! Every `fetch()` issued by this isolate — site downloads and Durable
+//! Object permit calls — counts against the platform's
+//! 1,000-subrequest-per-invocation hard limit. D1, Queue, and
 //! other RPC bindings do not consume subrequests.
 //!
 //! [`SubrequestBudget`] is a cheap shared counter cloned into the HTTP

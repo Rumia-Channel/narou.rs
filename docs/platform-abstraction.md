@@ -319,18 +319,18 @@ pub trait NovelRepository: PlatformService {
 | 実装 | 技術 | 状態 |
 |---|---|---|
 | portable core crate | `narou_rs` の `worker-runtime` feature | 完了。native-only modules は feature gate |
-| `worker_entry` composition root | `AppServices` + D1/Wasabi adapters | 完了。production bindings are required |
+| `worker_entry` composition root | `AppServices` + D1 adapters | 完了。production bindings are required |
 | fetch / scheduled / queue handlers | `workers-rs` `0.8.5` event macros | 完了。queue consumerはD1 ledgerとbounded retryを使用 |
 | `worker-build` / Wrangler | `worker_entry/wrangler.toml` | 完了。D1 migrations / Queue producer・consumer / DLQを定義 |
 | `WorkerHttpClient` | Workers Fetch API | 完了。bounded response body、trait future、redirect policyを維持 |
-| `WasabiObjectStore` / `AssetStore` | SigV4 + S3 multipart | 完了。logical key、paged LIST、small/streaming境界を維持 |
+| `D1ObjectStore` / `AssetStore` | D1 `objects`/`object_chunks` (base64 TEXT) | 完了。logical key、paged LIST、small/streaming境界を維持。Wasabi は撤去 |
 | `D1NovelRepository` | D1 prepared statements + migrations | 完了。typed filter/sort、keyset scan、batch mutationをSQLへ変換 |
 | authenticated read-only API | `/health/*`, `/api/novels*` | 完了。`NAROU_ADMIN_TOKEN`をconstant-time比較 |
 
-Production binding setup keeps credentials out of the repository. `worker_entry/wrangler.toml` declares the `DB` binding and `migrations_dir`; set the remote D1 `database_id` in an environment-specific Wrangler configuration before deployment. Define `WASABI_ENDPOINT`, `WASABI_BUCKET`, `WASABI_REGION`, and optional `WASABI_PREFIX` as variables, and `WASABI_ACCESS_KEY`, `WASABI_SECRET_KEY`, and `NAROU_ADMIN_TOKEN` as secrets.
+Production binding setup keeps credentials out of the repository. `worker_entry/wrangler.toml` declares the `DB` binding and `migrations_dir`; set the remote D1 `database_id` in an environment-specific Wrangler configuration before deployment. Object payloads live in the D1 `objects`/`object_chunks` tables (migration 0008), so no external bucket is required. Define `NAROU_ADMIN_TOKEN` as a secret.
 
 `worker_entry/` は fetch / scheduled / queue の3エントリだけを持つ。`composition.rs` が唯一のサービス構成点であり、Worker固有型を application/platform coreへ持ち込まない。
-Queue payload は `WorkerJobEnvelope { version: 2, job_id, job }` とし、未知 version・不正payloadはledgerへ記録して安全にackする。D1/Wasabiはproduction bindingとして構成し、Download/Updateはbounded execution + checkpoint resume、native-only jobはblockedとして処理する。
+Queue payload は `WorkerJobEnvelope { version: 2, job_id, job }` とし、未知 version・不正payloadはledgerへ記録して安全にackする。D1はproduction bindingとして構成し、Download/Updateはbounded execution + checkpoint resume、native-only jobはblockedとして処理する。
 
 D1 supports SQLite FTS5, but this adapter intentionally keeps the current
 `instr`-based folded-column search. Native compatibility requires substring,
@@ -411,7 +411,7 @@ Worker (worker_entry)
 | 4（完了） | async `ObjectStore`/`AssetStore`、logical key、NativeObjectStore、downloader persistence、illustration/converter境界 | native compatibility、Memory/native persistence tests、core主要content FS除去 |
 | 5（完了） | Web UI service 層化 | Web固有のDB/FSアクセスがapplication service経由 |
 | 6（skeleton 完了） | Worker backend skeleton（`worker_entry` + feature 分離 + Wrangler） | workspace native check、portable wasm check、`worker-build --release` が通る |
-| 7（完了） | D1 NovelRepository / Wasabi ObjectStore / Worker fetch | authenticated read-only API、D1 prepared query/mutation、Wasabi small/streaming storage |
+| 7（完了） | D1 NovelRepository / D1 ObjectStore / Worker fetch | authenticated read-only API、D1 prepared query/mutation、D1 object storage |
 | 8（実装完了） | Queues / crawler / scheduling（Cron + Durable Object） | D1 ledger lease、bounded retry、論理 generation cursor、section checkpoint resume、サイト単位 rate limit |
 
 各 Phase 終了時: `cargo build && cargo test && cargo clippy`。
