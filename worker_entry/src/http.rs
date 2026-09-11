@@ -3,15 +3,21 @@ use narou_rs::platform::{HttpClient, HttpMethod, HttpRequest, HttpResponse, Plat
 use wasm_bindgen::JsValue;
 use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect};
 
+use crate::budget::SubrequestBudget;
+
 pub const MAX_WORKER_HTTP_BODY: usize = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct WorkerHttpClient;
+#[derive(Debug, Clone, Default)]
+pub struct WorkerHttpClient {
+    subrequests: SubrequestBudget,
+}
 
 impl WorkerHttpClient {
-    pub const fn new() -> Self { Self }
+    pub fn new(subrequests: SubrequestBudget) -> Self {
+        Self { subrequests }
+    }
 
-    async fn send_request(request: HttpRequest) -> Result<HttpResponse> {
+    async fn send_request(&self, request: HttpRequest) -> Result<HttpResponse> {
         let method = match request.method {
             HttpMethod::Get => Method::Get,
             HttpMethod::Post => Method::Post,
@@ -38,6 +44,7 @@ impl WorkerHttpClient {
         }
         let request = Request::new_with_init(&request.url, &init)
             .map_err(|error| NarouError::Platform(format!("invalid HTTP request: {error}")))?;
+        self.subrequests.record();
         let mut response = Fetch::Request(request)
             .send()
             .await
@@ -69,7 +76,7 @@ impl WorkerHttpClient {
 
 impl HttpClient for WorkerHttpClient {
     fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
-        Box::pin(Self::send_request(request))
+        Box::pin(self.send_request(request))
     }
 }
 

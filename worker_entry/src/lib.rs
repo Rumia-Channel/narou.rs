@@ -1,5 +1,6 @@
 #![cfg(target_arch = "wasm32")]
 
+mod budget;
 mod bundled_sites;
 mod composition;
 mod consumer;

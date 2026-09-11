@@ -65,11 +65,12 @@ impl WasabiConfig {
 #[derive(Debug, Clone)]
 pub struct WasabiObjectStore {
     config: Arc<WasabiConfig>,
+    subrequests: crate::budget::SubrequestBudget,
 }
 
 impl WasabiObjectStore {
-    pub fn new(config: WasabiConfig) -> Self {
-        Self { config: Arc::new(config) }
+    pub fn new(config: WasabiConfig, subrequests: crate::budget::SubrequestBudget) -> Self {
+        Self { config: Arc::new(config), subrequests }
     }
 
     fn object_key(&self, key: &ObjectKey) -> String {
@@ -145,6 +146,7 @@ impl WasabiObjectStore {
             init.with_body(Some(JsValue::from(js_sys::Uint8Array::from(body.as_slice()))));
         }
         let request = Request::new_with_init(url.as_str(), &init).map_err(worker_error)?;
+        self.subrequests.record();
         Fetch::Request(request).send().await.map_err(worker_error)
     }
 

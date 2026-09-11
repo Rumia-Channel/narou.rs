@@ -57,6 +57,9 @@ pub struct WorkerRuntime {
     assets: Arc<dyn AssetStore>,
     clock: Arc<dyn Clock>,
     site_settings: Vec<SiteSetting>,
+    /// Shared subrequest counter for this invocation; the executor reads it
+    /// at section boundaries via `WorkerBudget`.
+    pub subrequests: crate::budget::SubrequestBudget,
 }
 
 impl WorkerRuntime {
@@ -67,15 +70,17 @@ impl WorkerRuntime {
         let db = Arc::new(env.d1("DB")?);
         let config = WasabiConfig::from_env(env)
             .map_err(|error| worker::Error::RustError(error.to_string()))?;
-        let store = Arc::new(WasabiObjectStore::new(config));
+        let subrequests = crate::budget::SubrequestBudget::new();
+        let store = Arc::new(WasabiObjectStore::new(config, subrequests.clone()));
         let objects: Arc<dyn ObjectStore> = store.clone();
         let assets: Arc<dyn AssetStore> = store;
         let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let freeze = Arc::new(D1FreezeStore::new(db.clone()));
-        let http: Arc<dyn HttpClient> = Arc::new(WorkerHttpClient::new());
+        let http: Arc<dyn HttpClient> =
+            Arc::new(WorkerHttpClient::new(subrequests.clone()));
         let rate_limiter: Arc<dyn RateLimiter> = Arc::new(
-            WorkerRateLimiter::new(env)
+            WorkerRateLimiter::new(env, subrequests.clone())
                 .map_err(|error| worker::Error::RustError(error.to_string()))?,
         );
         let site_settings = load_bundled_site_settings()
@@ -102,6 +107,7 @@ impl WorkerRuntime {
             rate_limiter,
             objects,
             assets,
+            subrequests,
             clock,
             site_settings,
         })
@@ -257,7 +263,10 @@ pub fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
     let db = Arc::new(env.d1("DB")?);
     let config = WasabiConfig::from_env(env)
         .map_err(|error| worker::Error::RustError(error.to_string()))?;
-    let objects: Arc<dyn ObjectStore> = Arc::new(WasabiObjectStore::new(config));
+    let objects: Arc<dyn ObjectStore> = Arc::new(WasabiObjectStore::new(
+        config,
+        crate::budget::SubrequestBudget::new(),
+    ));
     let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::new(db.clone()));

@@ -165,7 +165,7 @@ async fn process_discrete(
         }
     };
 
-    let outcome = execute_job(downloader, job, &job_id, checkpoint.as_ref()).await;
+    let outcome = execute_job(downloader, job, &job_id, checkpoint.as_ref(), &runtime.subrequests).await;
     match outcome {
         JobOutcome::Succeeded => {
             runtime

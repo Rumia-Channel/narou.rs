@@ -21,32 +21,16 @@ use narou_rs::application::{
     WorkerExecutionCheckpoint,
 };
 use narou_rs::downloader::{
-    DownloadExecutionOptions, DownloadResult, Downloader, SectionBudget, UpdateStatus,
+    DownloadExecutionOptions, DownloadResult, Downloader, UpdateStatus,
 };
 use narou_rs::error::{NarouError, Result};
+
+use crate::budget::{SubrequestBudget, WorkerBudget};
 
 /// Bounded wall-clock budget per job. It is checked only before starting the
 /// next section, so a section's fetch and persistence remain atomic from the
 /// worker's point of view.
 pub const JOB_TIME_BUDGET: Duration = Duration::from_secs(60 * 10);
-
-struct DeadlineBudget {
-    deadline_ms: f64,
-}
-
-impl DeadlineBudget {
-    fn new(budget: Duration) -> Self {
-        Self {
-            deadline_ms: js_sys::Date::now() + budget.as_secs_f64() * 1_000.0,
-        }
-    }
-}
-
-impl SectionBudget for DeadlineBudget {
-    fn should_yield(&mut self, _next_section_index: usize) -> bool {
-        js_sys::Date::now() >= self.deadline_ms
-    }
-}
 
 /// Typed outcome of executing one job.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,13 +97,12 @@ fn resume_section_for_checkpoint(
 /// Execute one job and classify the outcome.
 ///
 /// `downloader` is owned by the caller for the duration of a queue batch —
-/// one consumer invocation never shares a mutable Downloader across
-/// concurrent executions.
 pub async fn execute_job(
     downloader: &mut Downloader,
     job: &JobPlan,
     job_id: &JobId,
     checkpoint: Option<&WorkerExecutionCheckpoint>,
+    subrequests: &SubrequestBudget,
 ) -> JobOutcome {
     if let Some(reason) = unsupported_reason(job) {
         return JobOutcome::Blocked { reason };
@@ -140,7 +123,7 @@ pub async fn execute_job(
             Err(reason) => return JobOutcome::Permanent { reason },
         };
 
-    let mut budget = DeadlineBudget::new(JOB_TIME_BUDGET);
+    let mut budget = WorkerBudget::new(JOB_TIME_BUDGET, subrequests);
     let result = downloader
         .download_novel_with_execution_options(
             &target,
@@ -156,7 +139,7 @@ pub async fn execute_job(
             console_log!(
                 "job {job_id}: invalid resume checkpoint ({reason}); restarting from section 0"
             );
-            let mut restart_budget = DeadlineBudget::new(JOB_TIME_BUDGET);
+            let mut restart_budget = WorkerBudget::new(JOB_TIME_BUDGET, subrequests);
             downloader
                 .download_novel_with_execution_options(
                     &target,
@@ -173,14 +156,17 @@ pub async fn execute_job(
     match result {
         Err(NarouError::DownloadBudgetExpired {
             next_section_index,
-        }) => JobOutcome::Partial {
-            reason: format!(
-                "section-boundary budget expired after {}s before section {next_section_index}",
-                JOB_TIME_BUDGET.as_secs()
-            ),
-            checkpoint: WorkerExecutionCheckpoint::planned(job_id.clone(), novel_id)
-                .advance(ExecutionPhase::Fetching, Some(next_section_index as u64)),
-        },
+        }) => {
+            let limit = budget.exceeded_reason().unwrap_or("wall-clock");
+            JobOutcome::Partial {
+                reason: format!(
+                    "section-boundary {limit} budget expired before section {next_section_index} ({} subrequests used)",
+                    subrequests.used()
+                ),
+                checkpoint: WorkerExecutionCheckpoint::planned(job_id.clone(), novel_id)
+                    .advance(ExecutionPhase::Fetching, Some(next_section_index as u64)),
+            }
+        }
         result => classify_result(result, job),
     }
 }

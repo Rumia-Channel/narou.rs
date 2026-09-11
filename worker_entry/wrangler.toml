@@ -2,6 +2,10 @@ name = "narou-rs"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-08-10"
 
+[limits]
+# Paid-plan headroom for in-process EPUB generation and long queue jobs.
+cpu_ms = 300000
+
 [[d1_databases]]
 binding = "DB"
 database_name = "narou-rs"
@@ -34,7 +38,10 @@ queue = "narou-jobs"
 max_batch_size = 1
 max_retries = 3
 dead_letter_queue = "narou-jobs-dlq"
-max_concurrency = 1
+max_concurrency = 4
+# Concurrency above 1 is safe: every invocation builds its own runtime and
+# Downloader, the D1 ledger claim is atomic, and the SiteRateLimiter DO
+# serializes per-site pacing across consumers.
 
 # There is intentionally no DLQ consumer binding. DLQ messages remain
 # operator-inspection artifacts; ordinary execution never drains or re-enqueues
