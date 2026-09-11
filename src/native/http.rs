@@ -1,10 +1,10 @@
-//! Native HTTP transport: curl → reqwest → wget tier fallback.
+//! Native HTTP transport: curl → reqwest → subprocess (curl/wget) tier fallback.
 //!
 //! This is the native implementation of [`HttpClient`]. It owns everything
 //! transport-specific: the two reqwest clients (follow / manual-redirect),
-//! the libcurl handle configuration, the wget subprocess fallback, the
-//! per-domain tier-failure bookkeeping, and the CDN curl-probe enhancement
-//! used by `resolve_final_url`.
+//! the libcurl handle configuration, the subprocess fallback (curl.exe on
+//! Windows, wget elsewhere), the per-domain tier-failure bookkeeping, and the
+//! CDN curl-probe enhancement used by `resolve_final_url`.
 //!
 //! It never decodes response bytes and never decides what a status code
 //! means — that is `downloader::http_policy`'s job. 404/503 responses are
@@ -43,7 +43,7 @@ use crate::platform::{HttpClient, HttpMethod, HttpRequest, HttpResponse, Redirec
 
 const FAIL_THRESHOLD: u8 = 5;
 
-/// Native HTTP transport with the curl → reqwest → wget fallback.
+/// Native HTTP transport with the curl → reqwest → subprocess fallback.
 ///
 /// `Clone` is cheap: the two reqwest clients are `Arc`-backed and the
 /// tier-failure / prefer-curl state is shared through `Arc`, so clones
@@ -96,7 +96,7 @@ impl NativeHttpClient {
         }
     }
 
-    /// Follow-mode GET: tiered curl → reqwest → wget fallback.
+    /// Follow-mode GET: tiered curl → reqwest → subprocess fallback.
     ///
     /// A tier that receives a definitive server answer (404/503) returns the
     /// raw response immediately; the policy layer maps it. Other 4xx/5xx and
@@ -159,7 +159,7 @@ impl NativeHttpClient {
         }
 
         if !skip_wget {
-            match self.fetch_tier_wget(url, cookie, user_agent) {
+            match self.fetch_tier_subprocess(url, cookie, user_agent) {
                 Ok(response) => return Ok(response),
                 Err(err) => {
                     last_error = Some(err);
@@ -346,52 +346,175 @@ impl NativeHttpClient {
         })
     }
 
-    fn fetch_tier_wget(
+    /// Last-resort subprocess fetch. Windows has no `wget` but ships
+    /// `curl.exe` since Windows 10, so the candidate order is
+    /// platform-dependent: `curl` first on Windows, `wget` first elsewhere.
+    /// A tool that is not installed falls through to the next candidate;
+    /// a tool that runs but fails (HTTP error, timeout) is a real transport
+    /// failure and is reported as-is.
+    fn fetch_tier_subprocess(
         &self,
         url: &str,
         cookie: Option<&str>,
         user_agent: &str,
     ) -> Result<HttpResponse> {
-        let mut cmd = Command::new("wget");
-        cmd.arg("--quiet")
-            .arg("--output-document=-")
-            .arg("--tries=1")
-            .arg(format!("--connect-timeout={CONNECT_TIMEOUT_SECS}"))
-            .arg(format!("--read-timeout={READ_TIMEOUT_SECS}"))
-            .arg(format!("--timeout={TOTAL_TIMEOUT_SECS}"))
-            .arg("--max-redirect=0")
-            .arg(format!("--max-filesize={MAX_RESPONSE_BYTES}"))
-            .arg(format!("--user-agent={user_agent}"))
-            .arg("--header=Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-            .arg("--header=Accept-Language: ja,en-US;q=0.9,en;q=0.8")
-            .arg("--header=Accept-Encoding: gzip, deflate")
-            .arg("--header=Connection: keep-alive");
-        if let Some(cookie) = cookie {
-            if !is_safe_header_value(cookie) {
-                return Err(io_error("unsafe Cookie header value"));
+        if let Some(cookie) = cookie
+            && !is_safe_header_value(cookie)
+        {
+            return Err(io_error("unsafe Cookie header value"));
+        }
+
+        let candidates: &[&str] = if cfg!(windows) {
+            &["curl", "wget"]
+        } else {
+            &["wget", "curl"]
+        };
+        let mut first_error: Option<NarouError> = None;
+        let mut missing: Vec<&str> = Vec::new();
+        for tool in candidates {
+            match self.run_fetch_tool(tool, url, cookie, user_agent) {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    let not_found = matches!(
+                        &err,
+                        NarouError::Io(e) if e.kind() == std::io::ErrorKind::NotFound
+                    );
+                    if not_found {
+                        missing.push(tool);
+                    } else {
+                        tracing::warn!("{tool} fetch failed for {url}: {err}");
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
+                    }
+                }
             }
-            cmd.arg(format!("--header=Cookie: {cookie}"));
         }
-        cmd.arg("--").arg(url);
-        let output = run_command_with_timeout(cmd, Duration::from_secs(TOTAL_TIMEOUT_SECS))
-            .map_err(NarouError::Io)?;
-        if !output.status.success() {
-            return Err(io_error(format!(
-                "wget fetch failed for {url}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
+        Err(first_error.unwrap_or_else(|| {
+            io_error(format!(
+                "no download tool available (tried: {})",
+                missing.join(", ")
+            ))
+        }))
+    }
+
+    /// Run one subprocess fetch tool (`curl` or `wget`) against `url`.
+    /// Both tools are invoked without redirect following and fail on
+    /// non-2xx statuses, matching the historical wget tier semantics.
+    fn run_fetch_tool(
+        &self,
+        tool: &str,
+        url: &str,
+        cookie: Option<&str>,
+        user_agent: &str,
+    ) -> Result<HttpResponse> {
+        let mut cmd = Command::new(tool);
+        match tool {
+            "curl" => {
+                const STATUS_MARKER: &str = "\n__NAROU_HTTP_STATUS__";
+                cmd.arg("-sS")
+                    .arg("--compressed")
+                    .arg("--retry")
+                    .arg("0")
+                    .arg("--connect-timeout")
+                    .arg(CONNECT_TIMEOUT_SECS.to_string())
+                    .arg("--max-time")
+                    .arg(TOTAL_TIMEOUT_SECS.to_string())
+                    .arg("--max-filesize")
+                    .arg(MAX_RESPONSE_BYTES.to_string())
+                    .arg("--max-redirs")
+                    .arg("0")
+                    .arg("-A")
+                    .arg(user_agent)
+                    .arg("-H")
+                    .arg("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+                    .arg("-H")
+                    .arg("Accept-Language: ja,en-US;q=0.9,en;q=0.8")
+                    .arg("-H")
+                    .arg("Connection: keep-alive")
+                    .arg("-w")
+                    .arg(format!("{STATUS_MARKER}%{{http_code}}"));
+                if let Some(cookie) = cookie {
+                    cmd.arg("-H").arg(format!("Cookie: {cookie}"));
+                }
+                cmd.arg(url);
+                let output = run_command_with_timeout(cmd, Duration::from_secs(TOTAL_TIMEOUT_SECS))
+                    .map_err(NarouError::Io)?;
+                if !output.status.success() {
+                    return Err(io_error(format!(
+                        "curl fetch failed for {url}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )));
+                }
+                let marker = STATUS_MARKER.as_bytes();
+                let Some(pos) = output
+                    .stdout
+                    .windows(marker.len())
+                    .rposition(|window| window == marker)
+                else {
+                    return Err(io_error(format!(
+                        "curl status marker missing for {url}"
+                    )));
+                };
+                let body = &output.stdout[..pos];
+                let status_text = String::from_utf8_lossy(&output.stdout[pos + marker.len()..]);
+                let status: u16 = status_text.trim().parse().unwrap_or(0);
+                if !(200..300).contains(&status) {
+                    return Err(io_error(format!(
+                        "HTTP {status} while fetching {url} via curl"
+                    )));
+                }
+                if body.len() > MAX_RESPONSE_BYTES {
+                    return Err(io_error(format!(
+                        "response body exceeded {} bytes while fetching {url}",
+                        MAX_RESPONSE_BYTES
+                    )));
+                }
+                Ok(HttpResponse {
+                    status,
+                    headers: Vec::new(),
+                    body: body.to_vec(),
+                })
+            }
+            _ => {
+                cmd.arg("--quiet")
+                    .arg("--output-document=-")
+                    .arg("--tries=1")
+                    .arg(format!("--connect-timeout={CONNECT_TIMEOUT_SECS}"))
+                    .arg(format!("--read-timeout={READ_TIMEOUT_SECS}"))
+                    .arg(format!("--timeout={TOTAL_TIMEOUT_SECS}"))
+                    .arg("--max-redirect=0")
+                    .arg(format!("--max-filesize={MAX_RESPONSE_BYTES}"))
+                    .arg(format!("--user-agent={user_agent}"))
+                    .arg("--header=Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+                    .arg("--header=Accept-Language: ja,en-US;q=0.9,en;q=0.8")
+                    .arg("--header=Accept-Encoding: gzip, deflate")
+                    .arg("--header=Connection: keep-alive");
+                if let Some(cookie) = cookie {
+                    cmd.arg(format!("--header=Cookie: {cookie}"));
+                }
+                cmd.arg("--").arg(url);
+                let output = run_command_with_timeout(cmd, Duration::from_secs(TOTAL_TIMEOUT_SECS))
+                    .map_err(NarouError::Io)?;
+                if !output.status.success() {
+                    return Err(io_error(format!(
+                        "wget fetch failed for {url}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )));
+                }
+                if output.stdout.len() > MAX_RESPONSE_BYTES {
+                    return Err(io_error(format!(
+                        "response body exceeded {} bytes while fetching {url}",
+                        MAX_RESPONSE_BYTES
+                    )));
+                }
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: output.stdout,
+                })
+            }
         }
-        if output.stdout.len() > MAX_RESPONSE_BYTES {
-            return Err(io_error(format!(
-                "response body exceeded {} bytes while fetching {url}",
-                MAX_RESPONSE_BYTES
-            )));
-        }
-        Ok(HttpResponse {
-            status: 200,
-            headers: Vec::new(),
-            body: output.stdout,
-        })
     }
 
     fn send_reqwest(
@@ -791,6 +914,51 @@ mod tests {
             crate::downloader::http_policy::ensure_success_response(&url, response),
             Err(NarouError::SuspendDownload(_))
         ));
+    }
+
+    /// Serves `response` once on an ephemeral port and returns its URL.
+    fn serve_once(response: &'static [u8]) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream.write_all(response).unwrap();
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn subprocess_tier_fetches_200_body() {
+        let (url, server) = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        );
+        let client = NativeHttpClient::new("narou_rs-test").unwrap();
+        match client.fetch_tier_subprocess(&url, None, "narou_rs-test") {
+            Ok(response) => {
+                assert_eq!(response.status, 200);
+                assert_eq!(response.body, b"hello");
+            }
+            // No curl/wget on this machine: nothing to verify.
+            Err(err) if err.to_string().contains("no download tool available") => {}
+            Err(err) => panic!("subprocess fetch failed: {err}"),
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn subprocess_tier_treats_non_2xx_as_error() {
+        let (url, server) = serve_once(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let client = NativeHttpClient::new("narou_rs-test").unwrap();
+        match client.fetch_tier_subprocess(&url, None, "narou_rs-test") {
+            Err(err) if err.to_string().contains("no download tool available") => {}
+            Err(err) => assert!(err.to_string().contains("404"), "{err}"),
+            Ok(_) => panic!("404 must not succeed"),
+        }
+        server.join().unwrap();
     }
 
     #[tokio::test]
