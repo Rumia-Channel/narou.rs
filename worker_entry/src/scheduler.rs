@@ -47,10 +47,24 @@ pub async fn plan_auto_update(runtime: &WorkerRuntime, _probe_generation: u64) -
         }
     } else {
         let services = &runtime.services;
-        let enabled = settings_bool(services, "update.auto-schedule.enable").await?;
-        let schedule_string = settings_string(services, "update.auto-schedule").await?;
-        let interval_secs = settings_f64(services, "update.interval").await?;
-        let timezone = settings_timezone(services, "update.auto-schedule.timezone").await?;
+        // One scoped load instead of four app_state scans per cron tick.
+        let mut values = services
+            .settings
+            .get_many(&[
+                "update.auto-schedule.enable",
+                "update.auto-schedule",
+                "update.interval",
+                "update.auto-schedule.timezone",
+            ])
+            .await
+            .map_err(|error| {
+                NarouError::Platform(format!("cannot read scheduler settings: {error}"))
+            })?
+            .into_iter();
+        let enabled = yaml_bool(values.next().flatten());
+        let schedule_string = yaml_string(values.next().flatten());
+        let interval_secs = yaml_f64(values.next().flatten());
+        let timezone = yaml_timezone(values.next().flatten())?;
         let policy = services
             .scheduler
             .policy(enabled, &schedule_string, interval_secs, Vec::new());
@@ -140,60 +154,52 @@ fn apply_page_dispatch(
     Ok(())
 }
 
-async fn settings_timezone(
-    services: &narou_rs::application::AppServices,
-    name: &str,
-) -> Result<chrono_tz::Tz> {
-    let value = settings_string(services, name).await?;
-    if value.trim().is_empty() {
+
+fn yaml_timezone(value: Option<YamlValue>) -> Result<chrono_tz::Tz> {
+    let text = match value {
+        Some(YamlValue::String(value)) => value,
+        Some(YamlValue::Number(value)) => value.to_string(),
+        Some(_) | None => String::new(),
+    };
+    if text.trim().is_empty() {
         return Ok(chrono_tz::Asia::Tokyo);
     }
-    value.parse().map_err(|_| {
+    text.parse().map_err(|_| {
         NarouError::Platform(format!(
-            "invalid scheduler timezone {value:?}; expected an IANA timezone"
+            "invalid scheduler timezone {text:?}; expected an IANA timezone"
         ))
     })
 }
 
-async fn settings_bool(services: &narou_rs::application::AppServices, name: &str) -> Result<bool> {
-    match settings_value(services, name).await? {
-        Some(YamlValue::Bool(value)) => Ok(value),
-        Some(YamlValue::String(value)) => Ok(matches!(
-            value.as_str(),
-            "true" | "yes" | "on" | "1"
-        )),
-        Some(_) | None => Ok(false),
+fn yaml_bool(value: Option<YamlValue>) -> bool {
+    match value {
+        Some(YamlValue::Bool(value)) => value,
+        Some(YamlValue::String(value)) => {
+            matches!(value.as_str(), "true" | "yes" | "on" | "1")
+        }
+        Some(_) | None => false,
     }
 }
 
-async fn settings_string(services: &narou_rs::application::AppServices, name: &str) -> Result<String> {
-    match settings_value(services, name).await? {
-        Some(YamlValue::String(value)) => Ok(value),
-        Some(YamlValue::Number(value)) => Ok(value.to_string()),
-        Some(_) | None => Ok(String::new()),
+fn yaml_string(value: Option<YamlValue>) -> String {
+    match value {
+        Some(YamlValue::String(value)) => value,
+        Some(YamlValue::Number(value)) => value.to_string(),
+        Some(_) | None => String::new(),
     }
 }
 
-async fn settings_f64(services: &narou_rs::application::AppServices, name: &str) -> Result<Option<f64>> {
-    match settings_value(services, name).await? {
-        Some(YamlValue::Number(value)) => Ok(value.as_f64()),
-        Some(YamlValue::String(value)) => Ok(value.parse::<f64>().ok()),
-        Some(_) | None => Ok(None),
+fn yaml_f64(value: Option<YamlValue>) -> Option<f64> {
+    match value {
+        Some(YamlValue::Number(value)) => value.as_f64(),
+        Some(YamlValue::String(value)) => value.parse::<f64>().ok(),
+        Some(_) | None => None,
     }
-}
-
-async fn settings_value(
-    services: &narou_rs::application::AppServices,
-    name: &str,
-) -> Result<Option<YamlValue>> {
-    services.settings.get(name).await.map_err(|error| {
-        NarouError::Platform(format!("cannot read setting {name:?}: {error}"))
-    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_page_dispatch, SchedulerCheckpoint};
+    use super::{SchedulerCheckpoint, apply_page_dispatch};
     use narou_rs::error::NarouError;
 
     #[test]

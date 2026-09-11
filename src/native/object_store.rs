@@ -23,6 +23,10 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 pub struct NativeObjectStore {
     root: PathBuf,
+    /// Directories already known to exist this process. `create_dir_all` on
+    /// an existing path still costs a syscall per ancestor; section writes
+    /// repeat the same `本文/` parent hundreds of times per novel.
+    created_dirs: std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<PathBuf>>>,
 }
 
 impl NativeObjectStore {
@@ -33,7 +37,12 @@ impl NativeObjectStore {
 
     pub fn from_root(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            created_dirs: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -96,6 +105,28 @@ impl NativeObjectStore {
         Ok(exact)
     }
 
+    /// Map a listing prefix to the on-disk directory that contains every
+    /// matching object. `novels` alone covers the whole archive root;
+    /// `novels/<rest>` maps to `<root>/<rest>`; any other prefix lives under
+    /// `<root>/.objects/<prefix>` mirroring `resolve_path`.
+    fn resolve_prefix_dir(&self, prefix: &str) -> Result<PathBuf> {
+        let trimmed = prefix.trim_end_matches('/');
+        let relative = if trimmed.is_empty() || trimmed == "novels" {
+            String::new()
+        } else if let Some(rest) = trimmed.strip_prefix("novels/") {
+            rest.to_string()
+        } else {
+            format!(".objects/{trimmed}")
+        };
+        let candidate = if relative.is_empty() {
+            self.root.clone()
+        } else {
+            self.root
+                .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
+        };
+        crate::db::paths::ensure_within_archive_root(&candidate, &self.root)
+    }
+
     fn metadata_for_path(&self, key: &ObjectKey, path: &Path) -> Result<Option<ObjectMetadata>> {
         let metadata = match fs::metadata(path) {
             Ok(metadata) if metadata.is_file() => metadata,
@@ -116,6 +147,21 @@ impl NativeObjectStore {
         }))
     }
 
+    /// `create_dir_all` with a per-store memo: the first write under a novel
+    /// directory pays the syscall, subsequent writes to the same parent skip
+    /// it entirely.
+    fn ensure_parent_dir(&self, path: &Path) -> Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| NarouError::Platform(format!("object has no parent: {}", path.display())))?;
+        if self.created_dirs.lock().contains(parent) {
+            return Ok(());
+        }
+        fs::create_dir_all(parent)?;
+        self.created_dirs.lock().insert(parent.to_path_buf());
+        Ok(())
+    }
+
     fn write_small_blocking(&self, key: &ObjectKey, data: Vec<u8>) -> Result<()> {
         if data.len() as u64 > MAX_SMALL_OBJECT_BYTES {
             return Err(NarouError::Platform(format!(
@@ -124,12 +170,10 @@ impl NativeObjectStore {
             )));
         }
         let path = self.resolve_path(key)?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| NarouError::Platform(format!("object has no parent: {key}")))?;
-        fs::create_dir_all(parent)?;
+        self.ensure_parent_dir(&path)?;
         atomic_write_bytes(&path, &data)
     }
+
 
     fn recursive_files(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
         for entry in fs::read_dir(current)? {
@@ -186,12 +230,17 @@ fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
     ));
     {
         let mut file = fs::File::create(&temp_path)?;
-        file.write_all(data)?;
+        // Chunked writes keep a single oversized buffer from being handed to
+        // one write(2) call; some filesystems short-write large buffers.
+        for chunk in data.chunks(1024 * 1024) {
+            file.write_all(chunk)?;
+        }
         file.sync_all()?;
     }
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
+    // std::fs::rename replaces an existing destination atomically on every
+    // supported platform (rename(2) on Unix, MoveFileExW with
+    // MOVEFILE_REPLACE_EXISTING on Windows). A preceding exists+remove would
+    // only open a window where the destination is missing.
     fs::rename(temp_path, path)?;
     Ok(())
 }
@@ -228,20 +277,38 @@ impl ObjectStore for NativeObjectStore {
         let this = self.clone();
         let key = key.clone();
         run_blocking(move || {
+            use std::io::Read;
             let path = this.resolve_read_path(&key)?;
-            let metadata = match fs::metadata(&path) {
-                Ok(metadata) if metadata.is_file() => metadata,
-                Ok(_) => return Ok(None),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // Open first, then fstat the handle: a path-based metadata check
+            // followed by a separate open would race a swap for a larger file.
+            let file = match fs::File::open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None)
+                }
                 Err(error) => return Err(error.into()),
             };
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Ok(None);
+            }
             if metadata.len() > MAX_SMALL_OBJECT_BYTES {
                 return Err(NarouError::Platform(format!(
                     "small object exceeds {} bytes: {key}",
                     MAX_SMALL_OBJECT_BYTES
                 )));
             }
-            Ok(Some(fs::read(path)?))
+            // Read at most limit+1 so a file that grew between fstat and read
+            // is still rejected instead of silently truncated.
+            let mut data = Vec::with_capacity(metadata.len() as usize);
+            file.take(MAX_SMALL_OBJECT_BYTES + 1).read_to_end(&mut data)?;
+            if data.len() as u64 > MAX_SMALL_OBJECT_BYTES {
+                return Err(NarouError::Platform(format!(
+                    "small object exceeds {} bytes: {key}",
+                    MAX_SMALL_OBJECT_BYTES
+                )));
+            }
+            Ok(Some(data))
         })
     }
 
@@ -275,9 +342,17 @@ impl ObjectStore for NativeObjectStore {
         let this = self.clone();
         let request = request.clone();
         run_blocking(move || {
+            // Walk only the subtree that can contain matching keys instead of
+            // the whole archive: a novel-scoped prefix resolves to that
+            // novel's directory, so a per-novel LIST no longer scans every
+            // library entry.
+            let prefix_dir = this.resolve_prefix_dir(request.prefix.as_ref())?;
             let mut paths = Vec::new();
-            Self::recursive_files(&this.root, &this.root, &mut paths)?;
+            if prefix_dir.is_dir() {
+                Self::recursive_files(&this.root, &prefix_dir, &mut paths)?;
+            }
             let mut objects = paths
+
                 .into_iter()
                 .filter_map(|path| {
                     let key = logical_key_for_native_path(&this.root, &path)?;
@@ -365,7 +440,6 @@ impl AssetStore for NativeObjectStore {
         mut stream: AssetStream,
     ) -> PlatformFuture<'a, Result<()>> {
         let this = self.clone();
-        let key = key.clone();
         Box::pin(async move {
             let path = run_blocking({
                 let this = this.clone();
@@ -375,8 +449,18 @@ impl AssetStore for NativeObjectStore {
             .await?;
             let parent = path
                 .parent()
-                .ok_or_else(|| NarouError::Platform(format!("asset has no parent: {key}")))?;
-            tokio::fs::create_dir_all(parent).await?;
+                .ok_or_else(|| NarouError::Platform(format!("asset has no parent: {key}")))?
+                .to_path_buf();
+            run_blocking({
+                let this = this.clone();
+                let parent = parent.clone();
+                move || {
+                    // ensure_parent_dir takes the file path; pass a synthetic
+                    // child so the parent itself is the directory memoized.
+                    this.ensure_parent_dir(&parent.join(".narou-dir"))
+                }
+            })
+            .await?;
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let temp_path = parent.join(format!(
                 ".narou-asset-{}-{sequence}.tmp",
@@ -388,9 +472,8 @@ impl AssetStore for NativeObjectStore {
                 file.write_all(&chunk?).await?;
             }
             file.sync_all().await?;
-            if tokio::fs::try_exists(&path).await? {
-                tokio::fs::remove_file(&path).await?;
-            }
+            // Same rationale as atomic_write_bytes: rename already replaces
+            // the destination atomically; removing first only opens a gap.
             tokio::fs::rename(temp_path, path).await?;
             Ok(())
         })

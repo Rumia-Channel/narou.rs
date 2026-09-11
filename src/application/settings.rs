@@ -205,6 +205,51 @@ impl SettingsService {
             .map_err(ApplicationError::platform)?;
         Ok(settings.get(name).cloned())
     }
+
+    /// Get several typed setting values with at most one store load per
+    /// scope. Results are returned in the same order as `names`; an unknown
+    /// setting name fails the whole call, matching [`Self::get`].
+    pub async fn get_many(
+        &self,
+        names: &[&str],
+    ) -> Result<Vec<Option<serde_yaml::Value>>, ApplicationError> {
+        let mut local: Option<HashMap<String, serde_yaml::Value>> = None;
+        let mut global: Option<HashMap<String, serde_yaml::Value>> = None;
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let scope = self
+                .scope_of(name)
+                .ok_or_else(|| {
+                    ApplicationError::InvalidRequest(format!("不明な設定名です: {name}"))
+                })?;
+            let settings = match scope {
+                SettingScope::Local => {
+                    if local.is_none() {
+                        local = Some(
+                            self.store
+                                .load(scope)
+                                .await
+                                .map_err(ApplicationError::platform)?,
+                        );
+                    }
+                    local.as_ref().unwrap()
+                }
+                SettingScope::Global => {
+                    if global.is_none() {
+                        global = Some(
+                            self.store
+                                .load(scope)
+                                .await
+                                .map_err(ApplicationError::platform)?,
+                        );
+                    }
+                    global.as_ref().unwrap()
+                }
+            };
+            out.push(settings.get(*name).cloned());
+        }
+        Ok(out)
+    }
     /// Read a raw value without requiring a built-in setting definition.
     ///
     /// This is reserved for compatibility metadata such as feature-tour
