@@ -3080,6 +3080,7 @@ mod tests {
             queue,
             restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            library_backup: Arc::new(crate::web::library_backup::LibraryBackupState::new()),
             running_jobs: Arc::new(Mutex::new(Vec::new())),
             running_child_pids: Arc::new(Mutex::new(std::collections::HashMap::new())),
             cancelled_job_ids: Arc::new(Mutex::new(std::collections::HashSet::new())),

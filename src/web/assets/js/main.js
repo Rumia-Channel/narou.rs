@@ -98,6 +98,7 @@ async function init() {
   // Sync UI state (check marks, wide mode, footer)
   syncViewChecks();
   void maybeShowPendingFeatureTour();
+  void maybeOfferLibraryBackup();
 
   // WebSocket
   connectWebSocket();
@@ -289,6 +290,16 @@ function handleWsMessage(msg) {
       refreshQueueDetailed();
       notifyQueueCancelled(msg.data);
       break;
+    case 'library_backup.done': {
+      const path = (msg.data && msg.data.path) || '';
+      showNotification(`ライブラリのバックアップを作成しました: ${path}`, 'success');
+      break;
+    }
+    case 'library_backup.failed': {
+      const message = (msg.data && msg.data.message) || '不明なエラー';
+      showNotification(`ライブラリのバックアップに失敗しました: ${message}`, 'error');
+      break;
+    }
     case 'shutdown':
       appendConsole('サーバーをシャットダウンしています...');
       break;
@@ -334,6 +345,77 @@ function handleWsMessage(msg) {
       console.debug('Unknown WS event:', msg);
       break;
   }
+}
+
+/**
+ * 0.4.0 未満からのアップデート後初回表示で、ライブラリ全体バックアップを
+ * 提案するモーダルを出す。サーバー側の marker (.narou/last-run-version) が
+ * 境界を跨いだ場合だけ pending=true が返る。
+ */
+async function maybeOfferLibraryBackup() {
+  let status;
+  try {
+    status = await fetchJson('/api/library_backup');
+  } catch {
+    return;
+  }
+  if (!status || !status.pending) return;
+
+  const modal = El.libraryBackupModal;
+  if (!modal) return;
+
+  const sizeText = formatBytes(status.total_bytes);
+  const freeText = status.free_bytes != null ? formatBytes(status.free_bytes) : '不明';
+  if (El.libraryBackupSize) {
+    El.libraryBackupSize.textContent = `対象: 小説データ と .narou (計 ${sizeText}) / 保存先ドライブの空き: ${freeText}`;
+  }
+  if (El.libraryBackupSpaceWarning) {
+    El.libraryBackupSpaceWarning.classList.toggle('hide', status.enough_space !== false);
+  }
+  if (El.libraryBackupOutput) {
+    El.libraryBackupOutput.value = status.default_output || '';
+  }
+
+  modal.classList.remove('hide');
+
+  const close = () => modal.classList.add('hide');
+  El.libraryBackupClose?.addEventListener('click', close, { once: true });
+  El.libraryBackupDismiss?.addEventListener('click', async () => {
+    close();
+    try {
+      await fetchJson('/api/library_backup', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'dismiss' }),
+      });
+    } catch { /* marker は次回起動時に再評価される */ }
+  }, { once: true });
+  El.libraryBackupCreate?.addEventListener('click', async () => {
+    close();
+    const output = El.libraryBackupOutput?.value?.trim() || '';
+    try {
+      const result = await fetchJson('/api/library_backup', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'create', output }),
+      });
+      if (result && result.started) {
+        showNotification('ライブラリのバックアップを開始しました', 'info');
+      }
+    } catch (error) {
+      showNotification(error.message || 'バックアップの開始に失敗しました', 'error');
+    }
+  }, { once: true });
+}
+
+function formatBytes(bytes) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes)) return '不明';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit + 1 < units.length) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 0 ? `${bytes} ${units[unit]}` : `${value.toFixed(1)} ${units[unit]}`;
 }
 
 function notifyQueueFailure(data) {

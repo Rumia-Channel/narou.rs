@@ -3,6 +3,7 @@ pub mod feature_tour;
 pub mod frontend;
 pub mod global_settings;
 pub mod jobs;
+pub mod library_backup;
 pub mod misc;
 pub mod novel_settings;
 pub mod novels;
@@ -64,6 +65,7 @@ pub struct AppState {
     pub running_jobs: Arc<parking_lot::Mutex<Vec<crate::queue::QueueJob>>>,
     pub running_child_pids: Arc<parking_lot::Mutex<std::collections::HashMap<String, u32>>>,
     pub cancelled_job_ids: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pub library_backup: Arc<library_backup::LibraryBackupState>,
     pub auto_update_scheduler: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -681,6 +683,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/shutdown", post(jobs::api_shutdown))
         .route("/api/reboot", post(jobs::api_reboot))
         .route("/api/update/start", post(update::api_update_start))
+        .route("/api/library_backup", get(library_backup::api_library_backup_status))
+        .route("/api/library_backup", post(library_backup::api_library_backup))
         .route("/settings", get(frontend::settings_page))
         .route("/help", get(frontend::help_page))
         .route("/about", get(frontend::about_page))
@@ -820,6 +824,7 @@ mod tests {
             ),
             restore_prompt_pending: Arc::new(AtomicBool::new(false)),
             restorable_tasks_available: Arc::new(AtomicBool::new(false)),
+            library_backup: Arc::new(crate::web::library_backup::LibraryBackupState::new()),
             running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
             running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             cancelled_job_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
@@ -847,6 +852,7 @@ mod tests {
             ),
             restore_prompt_pending: Arc::new(AtomicBool::new(false)),
             restorable_tasks_available: Arc::new(AtomicBool::new(false)),
+            library_backup: Arc::new(crate::web::library_backup::LibraryBackupState::new()),
             running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
             running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             cancelled_job_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),

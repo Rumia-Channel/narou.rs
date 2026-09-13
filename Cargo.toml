@@ -111,6 +111,11 @@ path = "src/bin/updater.rs"
 required-features = ["native-runtime"]
 
 [[bin]]
+name = "narou_rs_backup"
+path = "src/bin/narou_rs_backup.rs"
+required-features = ["native-runtime"]
+
+[[bin]]
 name = "cargo-local-build"
 path = "src/bin/cargo-local-build.rs"
 required-features = ["native-runtime"]

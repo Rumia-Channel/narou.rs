@@ -137,6 +137,7 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         running_child_pids: running_child_pids.clone(),
         cancelled_job_ids: cancelled_job_ids.clone(),
         auto_update_scheduler: auto_update_scheduler.clone(),
+        library_backup: Arc::new(web::library_backup::LibraryBackupState::new()),
     };
     let app = web::create_router(app_state.clone());
     let ws_app = web::push::create_push_router(app_state);

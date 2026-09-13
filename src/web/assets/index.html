@@ -387,6 +387,31 @@
       </div>
     </div>
 
+    <!-- Library Backup Offer Modal -->
+    <div class="modal-overlay hide" id="library-backup-modal">
+      <div class="modal-dialog modal-dialog-sm">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="library-backup-close" type="button">&times;</button>
+            <h4 class="modal-title">小説データのバックアップ</h4>
+          </div>
+          <div class="modal-body">
+            <p>0.4.0 では管理データの保存形式に破壊的な変更が加わっています。データ消失に備え、小説データのバックアップを推奨します。</p>
+            <p id="library-backup-size"></p>
+            <p id="library-backup-space-warning" class="hide" style="color: var(--danger-color, #c00);">保存先ドライブの空き容量が不足している可能性があります。</p>
+            <div class="form-group">
+              <label for="library-backup-output">保存先フォルダ</label>
+              <input type="text" id="library-backup-output" class="form-control">
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="library-backup-dismiss" type="button">作成しない</button>
+            <button class="btn btn-primary" id="library-backup-create" type="button">バックアップを作成</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Column Visibility Modal -->
     <div class="modal-overlay hide" id="colvis-modal">
       <div class="modal-dialog modal-dialog-sm">

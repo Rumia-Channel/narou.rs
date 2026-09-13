@@ -44,8 +44,8 @@ jobs:
           $isPrerelease = ("${{ github.ref_type }}" -eq "tag") -and ($tag -match "^[^+]*-")
           "prerelease=$($isPrerelease.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-  build-updater:
-    name: Build updater (${{ matrix.name }})
+  build-helpers:
+    name: Build helper binaries (${{ matrix.name }})
     needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
@@ -84,19 +84,32 @@ jobs:
           path: target/${{ matrix.target }}/release/narou_rs_updater.exe
           if-no-files-found: error
 
-  sign-updater:
-    name: Sign Windows updaters
-    needs: build-updater
+      - name: Build backup binary
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_backup
+
+      - name: Upload unsigned backup binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-backup-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/narou_rs_backup.exe
+          if-no-files-found: error
+
+  sign-helpers:
+    name: Sign Windows helper binaries
+    needs: build-helpers
     runs-on: windows-2025
     environment: CodeSining
     steps:
-      - name: Download unsigned updaters
+      - name: Download unsigned helper binaries
         uses: actions/download-artifact@v4
         with:
-          pattern: unsigned-updater-*
+          pattern: unsigned-*-*
           path: unsigned
 
-      - name: Sign Windows updaters (Certum SimplySign)
+      - name: Sign Windows helper binaries (Certum SimplySign)
         uses: Rumia-Channel/windows-certum-signin@main
         with:
           certum-username: ${{ secrets.CERTUM_USERNAME }}
@@ -106,6 +119,8 @@ jobs:
           files: |
             unsigned\unsigned-updater-x86_64-pc-windows-msvc\narou_rs_updater.exe
             unsigned\unsigned-updater-aarch64-pc-windows-msvc\narou_rs_updater.exe
+            unsigned\unsigned-backup-x86_64-pc-windows-msvc\narou_rs_backup.exe
+            unsigned\unsigned-backup-aarch64-pc-windows-msvc\narou_rs_backup.exe
 
       - name: Upload signed updater (x64)
         uses: actions/upload-artifact@v4
@@ -121,10 +136,24 @@ jobs:
           path: unsigned/unsigned-updater-aarch64-pc-windows-msvc/narou_rs_updater.exe
           if-no-files-found: error
 
+      - name: Upload signed backup binary (x64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-backup-x86_64-pc-windows-msvc
+          path: unsigned/unsigned-backup-x86_64-pc-windows-msvc/narou_rs_backup.exe
+          if-no-files-found: error
+
+      - name: Upload signed backup binary (ARM64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-backup-aarch64-pc-windows-msvc
+          path: unsigned/unsigned-backup-aarch64-pc-windows-msvc/narou_rs_backup.exe
+          if-no-files-found: error
+
   build:
     needs:
       - validate
-      - sign-updater
+      - sign-helpers
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -292,6 +321,19 @@ jobs:
         shell: bash
         run: cargo install cross --locked
 
+      - name: Build backup binary
+        if: matrix.platform != 'win'
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: |
+          if ("${{ matrix.builder }}" -eq "cross") {
+            $env:PKG_CONFIG_ALLOW_CROSS = "1"
+            cross build --locked --release --target "${{ matrix.target }}" --bin narou_rs_backup
+          } else {
+            cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_backup
+          }
+
       - name: Build updater binary
         if: matrix.platform != 'win'
         shell: pwsh
@@ -364,8 +406,10 @@ jobs:
           $binary = "${{ matrix.binary }}"
           if ($binary.EndsWith(".exe")) {
             $updaterBinary = "narou_rs_updater.exe"
+            $backupBinary = "narou_rs_backup.exe"
           } else {
             $updaterBinary = "narou_rs_updater"
+            $backupBinary = "narou_rs_backup"
           }
           $commitVersion = "${{ github.ref_name }}"
           if ("${{ github.ref_type }}" -ne "tag") {
@@ -374,6 +418,7 @@ jobs:
           $archivePath = & .\scripts\package-release.ps1 `
             -BinaryPath "target/${{ matrix.target }}/release/${{ matrix.binary }}" `
             -UpdaterBinaryPath "target/${{ matrix.target }}/release/$updaterBinary" `
+            -BackupBinaryPath "target/${{ matrix.target }}/release/$backupBinary" `
             -Platform "${{ matrix.platform }}" `
             -Arch "${{ matrix.arch }}" `
             -PackageRoot "narou" `
@@ -414,6 +459,12 @@ jobs:
           pattern: signed-updater-*
           path: signed-updater
 
+      - name: Download signed backup binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: signed-backup-*
+          path: signed-backup
+
       - name: Sign Windows binaries (Certum SimplySign)
         uses: Rumia-Channel/windows-certum-signin@main
         with:
@@ -444,6 +495,10 @@ jobs:
             if (-not (Test-Path -Path $updater -PathType Leaf)) {
               throw "Signed updater not found: $updater"
             }
+            $backup = "signed-backup\signed-backup-$($t.Target)\narou_rs_backup.exe"
+            if (-not (Test-Path -Path $backup -PathType Leaf)) {
+              throw "Signed backup binary not found: $backup"
+            }
             foreach ($v in $variants) {
               $suffix = if ($v -eq "") { "" } else { "-$v" }
               $binary = "unsigned\unsigned-main-$($t.Target)$suffix\narou_rs.exe"
@@ -453,6 +508,7 @@ jobs:
               & .\scripts\package-release.ps1 `
                 -BinaryPath $binary `
                 -UpdaterBinaryPath $updater `
+                -BackupBinaryPath $backup `
                 -Platform "win" `
                 -Arch $t.Arch `
                 -PackageRoot "narou" `
