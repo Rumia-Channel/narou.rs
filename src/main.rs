@@ -178,6 +178,16 @@ async fn main() {
 
     narou_rs::updater_promote::try_promote_pending_updater();
 
+    // セルフアップデート経由の再起動では updater が install_dir (exe 側) を
+    // cwd にして本体を起動する。`.narou` はライブラリ dir にあるため、
+    // 親が渡した `NAROU_RS_RESTART_CWD` へ戻してから通常処理に入る。
+    // 旧 updater でも環境変数は透過するため後方互換。
+    if let Ok(dir) = std::env::var("NAROU_RS_RESTART_CWD") {
+        if !dir.is_empty() {
+            let _ = std::env::set_current_dir(&dir);
+        }
+    }
+
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
     let global_flags = cli::preprocess_args(&mut args);

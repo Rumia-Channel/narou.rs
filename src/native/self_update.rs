@@ -223,6 +223,13 @@ async fn start_native_update(
         .arg("--restart")
         .args(&restart_args)
         .current_dir(&install_dir)
+        // updater は restart 時に install_dir を cwd にするため、本体が
+        // 起動すべきライブラリ dir を環境変数で引き渡す。旧 updater でも
+        // env は透過するので新本体側の chdir だけで復帰できる。
+        .env(
+            "NAROU_RS_RESTART_CWD",
+            std::env::current_dir().unwrap_or_else(|_| install_dir.clone()),
+        )
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
