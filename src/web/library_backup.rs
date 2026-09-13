@@ -14,7 +14,6 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use parking_lot::Mutex;
 use serde::Deserialize;
 
 use super::AppState;
@@ -22,8 +21,6 @@ use crate::startup_backup;
 
 /// ライブラリバックアップの実行状態。同時実行は1つまで。
 pub struct LibraryBackupState {
-    /// 提案が必要かのキャッシュ。None は未評価。
-    pending: Mutex<Option<Option<startup_backup::PendingOffer>>>,
     /// バックアップ実行中フラグ。
     running: AtomicBool,
 }
@@ -31,13 +28,8 @@ pub struct LibraryBackupState {
 impl LibraryBackupState {
     pub fn new() -> Self {
         Self {
-            pending: Mutex::new(None),
             running: AtomicBool::new(false),
         }
-    }
-
-    fn invalidate(&self) {
-        *self.pending.lock() = None;
     }
 }
 
@@ -88,7 +80,6 @@ pub async fn api_library_backup(
     match body.action.as_str() {
         "dismiss" => {
             startup_backup::record_run(&root);
-            state.library_backup.invalidate();
             (
                 StatusCode::OK,
                 Json(serde_json::json!({"success": true, "dismissed": true})),
@@ -96,9 +87,8 @@ pub async fn api_library_backup(
         }
         "create" => {
             // 既に他経路 (CLI 等) で提案済みなら冪等に成功を返す。
-            // GET 時点のキャッシュではなく marker を見直して判定する。
-            state.library_backup.invalidate();
-            if evaluate_pending(&state).is_none() {
+            // marker を直接見て判定する (キャッシュは持たない)。
+            if startup_backup::pending_offer(&root).is_none() {
                 return (
                     StatusCode::OK,
                     Json(serde_json::json!({"success": true, "already_done": true})),
@@ -130,7 +120,6 @@ pub async fn api_library_backup(
 
             // 回答があった時点で marker を記録する (成否に関わらず再提案しない)。
             startup_backup::record_run(&root);
-            state.library_backup.invalidate();
 
             spawn_backup_process(&state, root, output);
             (
@@ -145,18 +134,10 @@ pub async fn api_library_backup(
     }
 }
 
-/// 提案状態を評価する。キャッシュ済みならそれを返す。
+/// 提案状態を評価する。毎回 marker と容量を見直す。
 fn evaluate_pending(state: &AppState) -> Option<startup_backup::PendingOffer> {
-    {
-        let cache = state.library_backup.pending.lock();
-        if let Some(cached) = *cache {
-            return cached;
-        }
-    }
-    let evaluated =
-        crate::logger::find_narou_root().and_then(|root| startup_backup::pending_offer(&root));
-    *state.library_backup.pending.lock() = Some(evaluated);
-    evaluated
+    let _ = state;
+    crate::logger::find_narou_root().and_then(|root| startup_backup::pending_offer(&root))
 }
 
 /// `narou_rs_backup` をサブプロセスで起動し、出力をコンソールへ流す。
