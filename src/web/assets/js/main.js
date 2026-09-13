@@ -2,7 +2,7 @@
  * Main entry point — initialization and periodic refresh
  */
 import { State, El, initElements } from './core/state.js';
-import { fetchJson } from './core/http.js';
+import { fetchJson, postJson } from './core/http.js';
 import { applyI18n } from './ui/i18n.js';
 import { initDropdowns } from './ui/dropdown.js';
 import { initFeatureTour, maybeShowPendingFeatureTour } from './ui/feature_tour.js';
@@ -383,25 +383,24 @@ async function maybeOfferLibraryBackup() {
   El.libraryBackupDismiss?.addEventListener('click', async () => {
     close();
     try {
-      await fetchJson('/api/library_backup', {
-        method: 'POST',
-        body: JSON.stringify({ action: 'dismiss' }),
-      });
+      await postJson('/api/library_backup', { action: 'dismiss' });
     } catch { /* marker は次回起動時に再評価される */ }
   }, { once: true });
   El.libraryBackupCreate?.addEventListener('click', async () => {
     close();
     const output = El.libraryBackupOutput?.value?.trim() || '';
     try {
-      const result = await fetchJson('/api/library_backup', {
-        method: 'POST',
-        body: JSON.stringify({ action: 'create', output }),
-      });
+      const result = await postJson('/api/library_backup', { action: 'create', output });
       if (result && result.started) {
         showNotification('ライブラリのバックアップを開始しました', 'info');
       }
     } catch (error) {
-      showNotification(error.message || 'バックアップの開始に失敗しました', 'error');
+      let message = error.message || 'バックアップの開始に失敗しました';
+      try {
+        const parsed = JSON.parse(message);
+        if (parsed && parsed.message) message = parsed.message;
+      } catch { /* raw text */ }
+      showNotification(message, 'error');
     }
   }, { once: true });
 }
