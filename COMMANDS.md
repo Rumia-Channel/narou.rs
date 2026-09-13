@@ -40,6 +40,7 @@ narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状�
 - `-v` / `--version` は `version` コマンドに変換される。`version --more` も受け付ける。 ✅
 - `-h` / `--help` は clap ヘルプを表示。 ✅
 - 引数なしは `help` コマンドにフォールバック。 ✅
+- 【Rust 拡張】0.4.0 未満から 0.4.0 以上へアップデートした後の初回起動時に、小説データ一括バックアップ (`小説データ/` + `.narou/` → exe と同じフォルダの `backup/narou-backup-<timestamp>.zip`) を対話プロンプトで提案する。前回起動バージョンは `.narou/last-run-version` に記録。`web`/`help`/`version`・非対話実行・`NAROU_ENV=test` では出さない。容量不足時は警告して既定を「いいえ」にする。
 
 ---
 

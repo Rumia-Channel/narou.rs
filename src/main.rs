@@ -214,6 +214,10 @@ async fn main() {
         cli::inject_command_defaults(&mut args);
     }
 
+    // 0.4.0 未満からのアップデート後の初回起動では、小説データの
+    // 一括バックアップを提案する (web/help/version 等では出さない)。
+    narou_rs::startup_backup::maybe_offer(&args[0]);
+
     let start = if show_time {
         Some(Instant::now())
     } else {
