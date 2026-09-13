@@ -49,7 +49,7 @@ fn run() -> Result<(), String> {
     };
 
     let total = startup_backup::backup_size(&root).map_err(|e| e.to_string())?;
-    println!("対象: {} と .narou (計 {})", narou_rs::downloader::ARCHIVE_ROOT_DIR, format_size(total));
+    println!("対象: ライブラリフォルダ全体 (計 {})", format_size(total));
     println!("保存先: {}", output.display());
     startup_backup::check_free_space(&output, total).map_err(|e| e.to_string())?;
 

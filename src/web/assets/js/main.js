@@ -367,7 +367,7 @@ async function maybeOfferLibraryBackup() {
   const sizeText = formatBytes(status.total_bytes);
   const freeText = status.free_bytes != null ? formatBytes(status.free_bytes) : '不明';
   if (El.libraryBackupSize) {
-    El.libraryBackupSize.textContent = `対象: 小説データ と .narou (計 ${sizeText}) / 保存先ドライブの空き: ${freeText}`;
+    El.libraryBackupSize.textContent = `対象: ライブラリフォルダ全体 (計 ${sizeText}) / 保存先ドライブの空き: ${freeText}`;
   }
   if (El.libraryBackupSpaceWarning) {
     El.libraryBackupSpaceWarning.classList.toggle('hide', status.enough_space !== false);

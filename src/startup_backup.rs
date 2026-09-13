@@ -133,7 +133,8 @@ fn should_offer(previous: Option<&str>, current: &str) -> bool {
 }
 
 /// バックアップ対象となる実データがあるか。
-/// `.narou` だけの空ライブラリでは提案しない。
+/// `小説データ/` に1件でもあれば提案。DL 済み小説は必ずここに
+/// ディレクトリを持つので、init 直後の空ライブラリでは提案しない。
 fn has_library_data(root: &Path) -> bool {
     let archive = root.join(crate::downloader::ARCHIVE_ROOT_DIR);
     fs::read_dir(&archive)
@@ -148,7 +149,7 @@ fn prompt_and_backup(root: &Path, pending: &PendingOffer) {
     println!();
     println!("0.4.0 では管理データの保存形式に破壊的な変更が加わっています。データ消失に備え、小説データのバックアップを推奨します。");
     println!(
-        "対象: {} と .narou (計 {})",
+        "対象: ライブラリフォルダ全体 ({}、.narou、webnovel など、計 {})",
         crate::downloader::ARCHIVE_ROOT_DIR,
         format_size(pending.total_bytes)
     );
@@ -255,8 +256,10 @@ pub fn backup_exe_path() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// `小説データ/` と `.narou/` を `dest_dir` に zip 化する。
+/// ライブラリルート全体 (`小説データ/`、`.narou/`、`webnovel/`、その他の
+/// ユーザー作成ファイルを含む) を `dest_dir` に zip 化する。
 /// `dest_dir` は zip を置くフォルダ (なければ作成する)。
+/// `dest_dir` がライブラリ内にある場合はバックアップ対象から除外する。
 /// 失敗時は中途半端な zip を残さない。
 pub fn create_library_backup(root: &Path, dest_dir: &Path) -> Result<PathBuf> {
     fs::create_dir_all(dest_dir)?;
@@ -265,20 +268,14 @@ pub fn create_library_backup(root: &Path, dest_dir: &Path) -> Result<PathBuf> {
         chrono::Local::now().format("%Y%m%d%H%M%S")
     );
     let backup_path = dest_dir.join(&backup_name);
+    let exclude_dir = dest_dir.canonicalize().ok();
 
     let result = (|| -> Result<()> {
         let file = fs::File::create(&backup_path)?;
         let mut zip = zip::ZipWriter::new(file);
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
-        for dir in [
-            root.join(crate::downloader::ARCHIVE_ROOT_DIR),
-            root.join(".narou"),
-        ] {
-            if dir.is_dir() {
-                add_directory_to_zip(&mut zip, root, &dir, options)?;
-            }
-        }
+        add_directory_to_zip(&mut zip, root, root, exclude_dir.as_deref(), options)?;
         zip.finish()
             .map(|_| ())
             .map_err(|e| NarouError::Conversion(e.to_string()))
@@ -291,31 +288,33 @@ pub fn create_library_backup(root: &Path, dest_dir: &Path) -> Result<PathBuf> {
 }
 
 /// バックアップ対象ファイルの合計サイズ (非圧縮)。
+/// `exclude_dir` (保存先) がライブラリ内にある場合は除外して数える。
 pub fn backup_size(root: &Path) -> Result<u64> {
+    backup_size_excluding(root, None)
+}
+
+/// `backup_size` の除外指定あり版。
+pub fn backup_size_excluding(root: &Path, exclude_dir: Option<&Path>) -> Result<u64> {
+    let exclude = exclude_dir.and_then(|dir| dir.canonicalize().ok());
+    let mut files = Vec::new();
+    collect_backup_files(root, root, exclude.as_deref(), &mut files)?;
     let mut total = 0u64;
-    for dir in [
-        root.join(crate::downloader::ARCHIVE_ROOT_DIR),
-        root.join(".narou"),
-    ] {
-        if dir.is_dir() {
-            let mut files = Vec::new();
-            collect_backup_files(root, &dir, &mut files)?;
-            for path in files {
-                total += fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            }
-        }
+    for path in files {
+        total += fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     }
     Ok(total)
 }
+
 
 fn add_directory_to_zip(
     zip: &mut zip::ZipWriter<fs::File>,
     base_dir: &Path,
     current_dir: &Path,
+    exclude_dir: Option<&Path>,
     options: zip::write::SimpleFileOptions,
 ) -> Result<()> {
     let mut files = Vec::new();
-    collect_backup_files(base_dir, current_dir, &mut files)?;
+    collect_backup_files(base_dir, current_dir, exclude_dir, &mut files)?;
 
     let mut entries: Vec<(String, PathBuf)> = files
         .into_iter()
@@ -339,22 +338,35 @@ fn add_directory_to_zip(
 
 /// バックアップ対象を再帰列挙する。シンボリックリンクは辿らない。
 /// 除外ルール:
+/// - `exclude_dir` (保存先フォルダ) 以下
 /// - 任意の階層の `backup/` ディレクトリ (小説ごとのバックアップ)
 /// - `.narou/section_convert_cache/` (再生成可能なキャッシュ)
 /// - `.narou/*.lock`, `.narou/server.pid` (実行時の一時ファイル)
-fn collect_backup_files(base_dir: &Path, current_dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_backup_files(
+    base_dir: &Path,
+    current_dir: &Path,
+    exclude_dir: Option<&Path>,
+    files: &mut Vec<PathBuf>,
+) -> Result<()> {
     for entry in fs::read_dir(current_dir)? {
         let entry = entry?;
         let path = entry.path();
         if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
             continue;
         }
-        if is_backup_excluded(base_dir, &path) {
-            continue;
-        }
         if path.is_dir() {
-            collect_backup_files(base_dir, &path, files)?;
-        } else if path.is_file() {
+            // 保存先フォルダ以下は対象外 (zip の自己取り込み防止)。
+            if let Some(exclude) = exclude_dir
+                && let Ok(canonical) = path.canonicalize()
+                && canonical.starts_with(exclude)
+            {
+                continue;
+            }
+            if is_backup_excluded(base_dir, &path) {
+                continue;
+            }
+            collect_backup_files(base_dir, &path, exclude_dir, files)?;
+        } else if path.is_file() && !is_backup_excluded(base_dir, &path) {
             files.push(path);
         }
     }
