@@ -21,6 +21,8 @@ jobs:
       - run: cargo check --workspace --all-targets
       - run: cargo test --workspace --all-targets
       - run: cargo clippy --workspace --all-targets --all-features
+      # Verify the non-GPL binaries actually link (check/test do not).
+      - run: cargo build -p narou_rs --bins
 
   native-gpl:
     name: Native check (lite/GPL)
@@ -33,6 +35,8 @@ jobs:
           key: gpl
       - run: cargo check -p narou_rs --all-targets --features lite
       - run: cargo test -p narou_rs --lib --features lite
+      # Verify the GPL (embedded AozoraEpub3_Lite) binary links.
+      - run: cargo build -p narou_rs --bin narou_rs --features lite
 
   wasm:
     name: Portable wasm check

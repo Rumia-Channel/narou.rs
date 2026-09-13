@@ -118,12 +118,12 @@ cp -r assets/aozora C:/path/to/tools/
 
 ## ライブラリ組み込み実装 (2026-08-25, feature `lite`)
 
-- cargo feature `lite`: `aozora_epub3_lite` を git 依存 (rev `8e0e3f6` に pin) で追加。**`worker-runtime` は `lite` を自動的に内包**し、Worker ビルドは常にライブラリ変換になる。GPL-3.0-only のため CI 成果物は `_GPL` 付きで頒布する
+- cargo feature `lite`: `aozora_epub3_lite` を git 依存 (rev `8e0e3f6` に pin) で追加。**`worker-runtime` は `lite` を自動的に内包**し、Worker ビルドは常にライブラリ変換になる。GPL-3.0-only のため CI 成果物は `-GPL` 付きで頒布する
 - `src/epub_lite.rs`: chuki テーブル7種 + replace.txt を `include_str!` 埋め込みした `embedded_config()`、テキスト→`EpubBook` 組立 (`build_book`)、seek 不要の ZIP data descriptor 書き出し (`stream_epub`)。画像は provider 経由で書き出し時に都度解決 (省メモリ)。単体テスト6件 (+`NAROU_EPUB_SMOKE_TXT` で実データ smoke を opt-in)
 - Worker: `GET /api/novels/:id/download.epub` — ObjectStore 上の `novel.txt` (= 新設 `NovelObjectKeys::converted_text()`) を DL 時に EPUB 化して返す。挿絵は 512 枚 / 64 MiB 上限の prefetch 後にメモリ解決。未生成時は 409
 - Native Web: 既存 `/novels/{id}/download` で EPUB が見つからない場合、`lite` ビルドなら変換済み txt からその場で EPUB 生成して返す
 - Native 変換後、固定名ミラー `novel.txt` を小説ディレクトリへ併せて書き出し (feature `lite` 時)。ObjectStore レイアウト経由で Worker と同じキーで参照できる
-- CI: platform.yml に `native-gpl` job (`--features lite` の check/test)。release.yml は全8プラットフォームに GPL 版を追加 (`narou_rs_{plat}_{arch}_GPL.zip`)、package-release.ps1 に `-Variant` 引数を追加
+- CI: platform.yml に `native-gpl` job (`--features lite` の check/test/build)。release.yml は全8プラットフォームに GPL 版を追加 (`narou_rs_{plat}_{arch}-GPL.zip`)、package-release.ps1 に `-Variant` 引数を追加。タグ push に加え `workflow_dispatch` で任意ブランチから両 variant の zip を生成可能 (dispatch 時は GitHub Release を作成しない)
 
 ### 制限
 - Worker の Convert ジョブ自体は引き続き blocked (セクション→テキスト組立の portable 化は後続作業)。DL 時 EPUB は `novel.txt` オブジェクトが存在する場合のみ動作

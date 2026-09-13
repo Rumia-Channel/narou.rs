@@ -40,7 +40,7 @@ New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $resolvedBinary = (Resolve-Path -Path $BinaryPath).Path
 $resolvedUpdaterBinary = (Resolve-Path -Path $UpdaterBinaryPath).Path
 $resolvedOutputDir = (Resolve-Path -Path $OutputDir).Path
-$variantSuffix = if ([string]::IsNullOrWhiteSpace($Variant)) { "" } else { "_$Variant" }
+$variantSuffix = if ([string]::IsNullOrWhiteSpace($Variant)) { "" } else { "-$Variant" }
 $archiveName = "narou_rs_{0}_{1}{2}.zip" -f $Platform, $Arch, $variantSuffix
 $archivePath = Join-Path -Path $resolvedOutputDir -ChildPath $archiveName
 

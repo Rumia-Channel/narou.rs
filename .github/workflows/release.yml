@@ -5,6 +5,7 @@ on:
     tags:
       - "v*"
       - "[0-9]*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -30,13 +31,17 @@ jobs:
 
           $version = $Matches[1]
           $tag = "${{ github.ref_name }}"
-          $escapedVersion = [regex]::Escape($version)
-          if ($tag -notmatch "^(?:v)?$escapedVersion(?:[-+][0-9A-Za-z.-]+)?$") {
-            throw "Tag '$tag' does not match Cargo.toml version '$version' or an allowed prerelease/build variant of it."
+          # Tag match is enforced only when the ref is an actual tag
+          # (push to a tag, or a manual dispatch that selected a tag).
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $escapedVersion = [regex]::Escape($version)
+            if ($tag -notmatch "^(?:v)?$escapedVersion(?:[-+][0-9A-Za-z.-]+)?$") {
+              throw "Tag '$tag' does not match Cargo.toml version '$version' or an allowed prerelease/build variant of it."
+            }
           }
 
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          $isPrerelease = $tag -match "^[^+]*-"
+          $isPrerelease = ("${{ github.ref_type }}" -eq "tag") -and ($tag -match "^[^+]*-")
           "prerelease=$($isPrerelease.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
   build:
@@ -267,13 +272,17 @@ jobs:
           } else {
             $updaterBinary = "narou_rs_updater"
           }
+          $commitVersion = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -ne "tag") {
+            $commitVersion = "{0}+{1}" -f "${{ needs.validate.outputs.version }}", $env:GITHUB_SHA.Substring(0, 7)
+          }
           $archivePath = & .\scripts\package-release.ps1 `
             -BinaryPath "target/${{ matrix.target }}/release/${{ matrix.binary }}" `
             -UpdaterBinaryPath "target/${{ matrix.target }}/release/$updaterBinary" `
             -Platform "${{ matrix.platform }}" `
             -Arch "${{ matrix.arch }}" `
             -PackageRoot "narou" `
-            -CommitVersion "${{ github.ref_name }}" `
+            -CommitVersion $commitVersion `
             -Variant "${{ matrix.variant }}" `
             -OutputDir "dist"
 
@@ -291,6 +300,7 @@ jobs:
     needs:
       - validate
       - build
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
