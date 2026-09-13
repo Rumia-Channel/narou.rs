@@ -135,6 +135,8 @@ const ELEMENT_IDS = [
   'about-modal', 'about-close', 'about-ok', 'about-version',
   'about-latest-version', 'about-check-latest',
   'about-update', 'about-update-status',
+  'update-variant-modal', 'update-variant-close', 'update-variant-cancel',
+  'update-variant-standard', 'update-variant-gpl',
   'feature-tour-modal', 'feature-tour-close', 'feature-tour-body',
   'feature-tour-disable-auto', 'feature-tour-ok',
   'confirm-modal', 'confirm-title', 'confirm-message',

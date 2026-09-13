@@ -60,7 +60,10 @@ pub use events::{
     SiteDefinitionProvider, SiteTimezone, SiteTimezoneProvider,
     SiteUpdateCapabilityProvider, SystemFreezeStore,
 };
-pub use self_update::{NoopSelfUpdateService, SelfUpdateRequest, SelfUpdateResult, SelfUpdateService};
+pub use self_update::{
+    NoopSelfUpdateService, SelfUpdateRequest, SelfUpdateResult, SelfUpdateService,
+    SelfUpdateVariant,
+};
 pub use library::{
     LibraryListRequest, LibraryPage, LibraryService, LibrarySortColumn, LibrarySortOrder,
     NovelSummary,

@@ -1156,6 +1156,13 @@ pub fn setting_variables() -> SettingVariables {
             ),
         ),
         ("over18", invis(VarType::Boolean, "18歳以上かどうか")),
+        (
+            "self-update.variant",
+            invis_sel(
+                "セルフアップデートで取得するリリース variant。gpl: AozoraEpub3_Lite 組込み(GPL-3.0) / standard: 外部 AozoraEpub3 を利用(BSD)",
+                vec!["gpl", "standard"],
+            ),
+        ),
     ];
 
     SettingVariables {

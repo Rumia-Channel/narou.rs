@@ -14,7 +14,9 @@ use axum::{Json, extract::State, http::StatusCode};
 use super::AppState;
 use super::jobs::prepare_process_shutdown;
 use super::state::ApiResponse;
-use crate::application::{ApplicationEvent, EventSink, SelfUpdateRequest};
+use crate::application::{
+    ApplicationEvent, EventSink, SelfUpdateRequest, SelfUpdateVariant,
+};
 use crate::platform::PlatformFuture;
 
 const PROGRESS_TOPIC: &str = "update";
@@ -24,6 +26,10 @@ pub struct UpdateStartBody {
     /// 任意: 指定すれば独自のアセット URL を使用 (デバッグ用)。
     #[serde(default)]
     pub asset_url: Option<String>,
+    /// 任意: ダウンロードするリリース variant ("gpl" / "standard")。
+    /// 0.4.0 以下からの更新時に UI が選択を求め、ここへ渡す。
+    #[serde(default)]
+    pub variant: Option<SelfUpdateVariant>,
 }
 
 #[derive(Clone)]
@@ -95,6 +101,7 @@ pub async fn api_update_start(
         .start(
             SelfUpdateRequest {
                 asset_url: body.asset_url,
+                variant: body.variant,
             },
             events,
         )

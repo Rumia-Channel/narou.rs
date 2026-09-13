@@ -370,30 +370,22 @@ export function bindActions() {
     await updateLatestVersionInfo();
   });
   on('about-update', async () => {
-    if (!confirm('最新バージョンへ更新します。WEBサーバーは一旦停止し、自動的に再起動します。よろしいですか？')) return;
-    const btn = El.aboutUpdate;
-    if (btn) btn.disabled = true;
-    if (El.aboutUpdateStatus) {
-      El.aboutUpdateStatus.classList.remove('hide');
-      El.aboutUpdateStatus.textContent = 'アップデートを開始しています...';
+    if (latestVersionData?.variant_choice_required) {
+      El.updateVariantModal?.classList.remove('hide');
+      return;
     }
-    try {
-      const result = await postJson('/api/update/start', {});
-      if (!result?.success) {
-        throw new Error(result?.message || 'アップデート開始に失敗しました');
-      }
-      if (El.aboutUpdateStatus) {
-        El.aboutUpdateStatus.textContent = 'ダウンロード中... 完了後に再起動します';
-      }
-      // Server triggers reboot; the existing /_rebooting page handles reconnection.
-      setTimeout(() => { window.location.href = '/_rebooting'; }, 1500);
-    } catch (error) {
-      if (El.aboutUpdateStatus) {
-        El.aboutUpdateStatus.textContent = `アップデート失敗: ${error.message || error}`;
-      }
-      if (btn) btn.disabled = false;
-      showNotification(error.message || 'アップデートに失敗しました', 'error');
-    }
+    await startSelfUpdate(null);
+  });
+
+  on('update-variant-close', () => El.updateVariantModal?.classList.add('hide'));
+  on('update-variant-cancel', () => El.updateVariantModal?.classList.add('hide'));
+  on('update-variant-standard', async () => {
+    El.updateVariantModal?.classList.add('hide');
+    await startSelfUpdate('standard');
+  });
+  on('update-variant-gpl', async () => {
+    El.updateVariantModal?.classList.add('hide');
+    await startSelfUpdate('gpl');
   });
 
   on('queue-restore-yes', async () => {
@@ -1569,6 +1561,7 @@ async function updateLatestVersionInfo() {
   if (!El.aboutLatestVersion) return;
   try {
     const data = await fetchJson('/api/version/latest.json');
+    latestVersionData = data?.success ? data : null;
     if (data?.success) {
       const latest = data.latest_version || '-';
       const current = data.current_version || '-';
@@ -1603,6 +1596,36 @@ async function updateLatestVersionInfo() {
       `最新バージョン: 取得失敗${data?.message ? ' (' + data.message + ')' : ''}`;
   } catch (e) {
     El.aboutLatestVersion.textContent = '最新バージョン: 取得失敗';
+  }
+}
+
+let latestVersionData = null;
+
+async function startSelfUpdate(variant) {
+  if (!confirm('最新バージョンへ更新します。WEBサーバーは一旦停止し、自動的に再起動します。よろしいですか？')) return;
+  const btn = El.aboutUpdate;
+  if (btn) btn.disabled = true;
+  if (El.aboutUpdateStatus) {
+    El.aboutUpdateStatus.classList.remove('hide');
+    El.aboutUpdateStatus.textContent = 'アップデートを開始しています...';
+  }
+  try {
+    const body = variant ? { variant } : {};
+    const result = await postJson('/api/update/start', body);
+    if (!result?.success) {
+      throw new Error(result?.message || 'アップデート開始に失敗しました');
+    }
+    if (El.aboutUpdateStatus) {
+      El.aboutUpdateStatus.textContent = 'ダウンロード中... 完了後に再起動します';
+    }
+    // Server triggers reboot; the existing /_rebooting page handles reconnection.
+    setTimeout(() => { window.location.href = '/_rebooting'; }, 1500);
+  } catch (error) {
+    if (El.aboutUpdateStatus) {
+      El.aboutUpdateStatus.textContent = `アップデート失敗: ${error.message || error}`;
+    }
+    if (btn) btn.disabled = false;
+    showNotification(error.message || 'アップデートに失敗しました', 'error');
   }
 }
 

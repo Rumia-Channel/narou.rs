@@ -7,11 +7,81 @@ use serde_json::Value;
 
 use crate::application::{
     ApplicationEvent, EventSink, SelfUpdateRequest, SelfUpdateResult, SelfUpdateService,
+    SelfUpdateVariant,
 };
+use crate::db::inventory::{Inventory, InventoryScope};
 use crate::error::{NarouError, Result};
 use crate::platform::PlatformFuture;
 
 const PROGRESS_TOPIC: &str = "update";
+
+/// `global_setting.yaml` key that persists the user's self-update variant
+/// choice (`gpl` / `standard`). Settable via `narou setting`.
+pub const VARIANT_SETTING_KEY: &str = "self-update.variant";
+
+/// Version boundary for the one-time variant prompt: builds at or below this
+/// version predate the GPL/standard split, so the update flow asks the user
+/// which variant to install. Later builds reuse the saved choice.
+const VARIANT_PROMPT_MAX_VERSION: &str = "0.4.0";
+
+/// The variant of the running binary.
+pub fn build_variant() -> SelfUpdateVariant {
+    if crate::version::EMBEDS_AOZORA_LITE {
+        SelfUpdateVariant::Gpl
+    } else {
+        SelfUpdateVariant::Standard
+    }
+}
+
+/// Variant preference saved in `global_setting.yaml`, if any.
+pub fn saved_variant_preference() -> Option<SelfUpdateVariant> {
+    let inventory = Inventory::with_default_root().ok()?;
+    let settings: std::collections::HashMap<String, serde_yaml::Value> = inventory
+        .load("global_setting", InventoryScope::Global)
+        .unwrap_or_default();
+    settings
+        .get(VARIANT_SETTING_KEY)
+        .and_then(|v| v.as_str())
+        .and_then(SelfUpdateVariant::from_str_lossy)
+}
+
+/// Persist an explicit variant choice so later updates reuse it.
+fn persist_variant_preference(variant: SelfUpdateVariant) -> Result<()> {
+    let inventory = Inventory::with_default_root()
+        .map_err(|e| platform_error(format!("global_setting へのアクセス失敗: {e}")))?;
+    inventory
+        .update_yaml::<(), std::collections::HashMap<String, serde_yaml::Value>, _>(
+            "global_setting",
+            InventoryScope::Global,
+            |mut settings| {
+                settings.insert(
+                    VARIANT_SETTING_KEY.to_string(),
+                    serde_yaml::Value::String(variant.as_str().to_string()),
+                );
+                Ok((settings, ()))
+            },
+        )
+        .map_err(|e| platform_error(format!("{VARIANT_SETTING_KEY} の保存失敗: {e}")))
+}
+
+/// Whether the update flow must ask the user which variant to install.
+/// True only for builds at or below `VARIANT_PROMPT_MAX_VERSION` — the first
+/// release line that predates the GPL/standard asset split.
+pub fn variant_choice_required() -> bool {
+    crate::version::version_at_most(
+        &crate::version::create_version_string(),
+        VARIANT_PROMPT_MAX_VERSION,
+    )
+}
+
+/// Effective variant for this update: explicit request > saved preference >
+/// the running build's own variant.
+fn resolve_variant(request: &SelfUpdateRequest) -> SelfUpdateVariant {
+    request
+        .variant
+        .or_else(saved_variant_preference)
+        .unwrap_or_else(build_variant)
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NativeSelfUpdateService;
@@ -43,7 +113,13 @@ async fn start_native_update(
         )));
     }
 
-    let asset_name = current_asset_name().ok_or_else(|| {
+    let variant = resolve_variant(&request);
+    if let Some(chosen) = request.variant {
+        // 明示的な選択は以後の更新でも再利用するよう保存する。
+        persist_variant_preference(chosen)?;
+    }
+
+    let asset_name = asset_name_for(variant).ok_or_else(|| {
         platform_error(format!(
             "未対応のプラットフォーム ({}/{}) — 手動でアップデートしてください",
             std::env::consts::OS,
@@ -348,7 +424,10 @@ fn validate_zip(path: &Path) -> std::result::Result<(), String> {
     Ok(())
 }
 
-pub fn current_asset_name() -> Option<String> {
+/// Release asset name for the given variant on this platform.
+/// GPL builds download `narou_rs_<key>-GPL.zip`; standard builds use the
+/// unsuffixed name.
+pub fn asset_name_for(variant: SelfUpdateVariant) -> Option<String> {
     let key = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => "win_x64",
         ("windows", "aarch64") => "win_arm64",
@@ -360,7 +439,17 @@ pub fn current_asset_name() -> Option<String> {
         ("linux", "armv7") => "linux_armv7",
         _ => return None,
     };
-    Some(format!("narou_rs_{key}.zip"))
+    let suffix = match variant {
+        SelfUpdateVariant::Gpl => "-GPL",
+        SelfUpdateVariant::Standard => "",
+    };
+    Some(format!("narou_rs_{key}{suffix}.zip"))
+}
+
+/// Asset name matching this build's own variant (used when no explicit or
+/// saved choice exists).
+pub fn current_asset_name() -> Option<String> {
+    asset_name_for(build_variant())
 }
 
 #[cfg(test)]
@@ -368,14 +457,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_asset_name_matches_host() {
-        let name = current_asset_name();
+    fn asset_name_for_appends_gpl_suffix() {
         if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-            assert_eq!(name.as_deref(), Some("narou_rs_win_x64.zip"));
+            assert_eq!(
+                asset_name_for(SelfUpdateVariant::Standard).as_deref(),
+                Some("narou_rs_win_x64.zip")
+            );
+            assert_eq!(
+                asset_name_for(SelfUpdateVariant::Gpl).as_deref(),
+                Some("narou_rs_win_x64-GPL.zip")
+            );
         }
         if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-            assert_eq!(name.as_deref(), Some("narou_rs_linux_x64.zip"));
+            assert_eq!(
+                asset_name_for(SelfUpdateVariant::Standard).as_deref(),
+                Some("narou_rs_linux_x64.zip")
+            );
+            assert_eq!(
+                asset_name_for(SelfUpdateVariant::Gpl).as_deref(),
+                Some("narou_rs_linux_x64-GPL.zip")
+            );
         }
+    }
+
+    #[test]
+    fn current_asset_name_matches_build_variant() {
+        let expected = asset_name_for(build_variant());
+        assert_eq!(current_asset_name(), expected);
+    }
+
+    #[test]
+    fn variant_round_trips_through_str() {
+        assert_eq!(
+            SelfUpdateVariant::from_str_lossy("GPL"),
+            Some(SelfUpdateVariant::Gpl)
+        );
+        assert_eq!(
+            SelfUpdateVariant::from_str_lossy(" standard "),
+            Some(SelfUpdateVariant::Standard)
+        );
+        assert_eq!(SelfUpdateVariant::from_str_lossy("bogus"), None);
     }
 
     #[test]

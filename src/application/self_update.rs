@@ -10,9 +10,39 @@ use crate::application::events::EventSink;
 use crate::error::Result;
 use crate::platform::PlatformFuture;
 
+/// Release asset variant selected for a self-update download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SelfUpdateVariant {
+    /// Standard build (BSD-2-Clause); EPUB 変換には外部 AozoraEpub3 が必要。
+    Standard,
+    /// GPL build with AozoraEpub3_Lite embedded (`narou_rs_*-GPL.zip`).
+    Gpl,
+}
+
+impl SelfUpdateVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Gpl => "gpl",
+        }
+    }
+
+    pub fn from_str_lossy(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "gpl" => Some(Self::Gpl),
+            "standard" => Some(Self::Standard),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SelfUpdateRequest {
     pub asset_url: Option<String>,
+    /// Explicit variant choice from the UI. `None` falls back to the saved
+    /// `self-update.variant` preference, then to the running build's variant.
+    pub variant: Option<SelfUpdateVariant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

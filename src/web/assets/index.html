@@ -364,6 +364,29 @@
       </div>
     </div>
 
+    <!-- Update Variant Choice Modal -->
+    <div class="modal-overlay hide" id="update-variant-modal">
+      <div class="modal-dialog modal-dialog-sm">
+        <div class="modal-content">
+          <div class="modal-header">
+            <button class="modal-close" id="update-variant-close" type="button">&times;</button>
+            <h4 class="modal-title">アップデート版の選択</h4>
+          </div>
+          <div class="modal-body">
+            <p>0.4.1 以降、リリースは2種類に分かれています。どちらで更新しますか？</p>
+            <p><strong>GPL版</strong>: AozoraEpub3_Lite 組込み。外部の AozoraEpub3 (Java) なしで EPUB を生成できます (GPL-3.0)。</p>
+            <p><strong>通常版</strong>: 従来どおり外部の AozoraEpub3 を利用します (BSD-2-Clause)。</p>
+            <p>選択は <code>narou setting self-update.variant</code> で後から変更できます。</p>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-default" id="update-variant-cancel" type="button">キャンセル</button>
+            <button class="btn btn-default" id="update-variant-standard" type="button">通常版で更新</button>
+            <button class="btn btn-primary" id="update-variant-gpl" type="button">GPL版で更新</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Column Visibility Modal -->
     <div class="modal-overlay hide" id="colvis-modal">
       <div class="modal-dialog modal-dialog-sm">

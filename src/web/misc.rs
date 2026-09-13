@@ -73,9 +73,9 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
             let latest = json["tag_name"]
                 .as_str()
                 .or_else(|| json["name"].as_str())
-                .map(version_core)
+                .map(version::version_core)
                 .unwrap_or_default();
-            let current_plain = version_core(&current);
+            let current_plain = version::version_core(&current);
             let develop = !version::commit_version_exists();
             let local_build = version::is_local_build();
             let container = version::is_container_runtime();
@@ -90,6 +90,8 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
                 "container": container,
                 "self_update_supported": self_update_supported,
                 "self_update_unavailable_reason": version::self_update_unavailable_reason(),
+                "build_variant": version::BUILD_VARIANT,
+                "variant_choice_required": crate::native::self_update::variant_choice_required(),
                 "url": json["html_url"].as_str().unwrap_or("https://github.com/Rumia-Channel/narou.rs/releases/latest"),
             }))
         }
@@ -108,21 +110,6 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
     }
 }
 
-/// Extract the numeric `x.y.z` core from a version string, ignoring `v`
-/// prefixes, suffixes like `(develop)`/`(local-build)`, and any invisible
-/// characters that may slip into release metadata.
-fn version_core(version: &str) -> String {
-    let mut core = String::new();
-    for ch in version.chars() {
-        if ch.is_ascii_digit() || ch == '.' {
-            core.push(ch);
-        } else if !core.is_empty() {
-            break;
-        }
-    }
-    core.trim_end_matches('.').to_string()
-}
-
 /// Numeric semver-style comparison: `latest` is an update only when it is
 /// strictly newer than `current`. Falls back to inequality when either side
 /// has no parseable version core.
@@ -130,23 +117,9 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
     if latest.is_empty() {
         return false;
     }
-    let parse = |v: &str| -> Option<Vec<u64>> {
-        let parts: Option<Vec<u64>> = v.split('.').map(|p| p.parse().ok()).collect();
-        parts.filter(|p| !p.is_empty())
-    };
-    match (parse(latest), parse(current)) {
-        (Some(l), Some(c)) => {
-            let len = l.len().max(c.len());
-            for i in 0..len {
-                let lv = l.get(i).copied().unwrap_or(0);
-                let cv = c.get(i).copied().unwrap_or(0);
-                if lv != cv {
-                    return lv > cv;
-                }
-            }
-            false
-        }
-        _ => latest != current,
+    match version::version_compare(latest, current) {
+        Some(ord) => ord == std::cmp::Ordering::Greater,
+        None => latest != current,
     }
 }
 

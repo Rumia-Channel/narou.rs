@@ -298,6 +298,7 @@ sample/
 - **reverse proxy Host 許可リスト拡張** (I-3): `server-add-accepted-hosts` 設定で許可 Host を後から追加できるようにし、リバースプロキシ越しのアクセス制御を強化
 - **list / update の型付きソート** (I-1): ソートキーを型付きで実装し、`new_arrivals_date` / `general_lastup` など拡張キーをバリデーション込みで受理
 - **self-update の Unix デタッチ** (D): Linux/macOS で self-update 中も本体が生存できるよう、updater を `setsid` で切り離して起動
+- **self-update の variant 選択** (2026-09): 0.4.0 以下からの更新時は Web UI が GPL版(Lite組込み)/通常版 の選択モーダルを表示し、選択を `self-update.variant` (global) へ保存する。以後の更新は保存値→ビルド variant の順で解決。GPL版は `narou_rs_*-GPL.zip` を取得する
 - **ruby タグ除去** (I-4): サブタイトルとファイル名からルビ注記（`《…》` 形式）を除去し、Ruby版と表示を揃える
 - **小説単位の queue lane 跨ぎ exclusion** (C): 同じ小説が primary / secondary lane の両方で同時に走らないよう、novel 単位の排他を queue worker に追加
 
