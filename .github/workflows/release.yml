@@ -533,8 +533,17 @@ jobs:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download packaged release zips
+        uses: actions/download-artifact@v4
         with:
+          pattern: narou_rs_*.zip
+          path: release-assets
+          merge-multiple: true
+
+      - name: Download signed Windows assets
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-assets
           path: release-assets
           merge-multiple: true
 
