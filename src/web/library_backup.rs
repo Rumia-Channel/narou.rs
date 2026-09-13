@@ -96,6 +96,8 @@ pub async fn api_library_backup(
         }
         "create" => {
             // 既に他経路 (CLI 等) で提案済みなら冪等に成功を返す。
+            // GET 時点のキャッシュではなく marker を見直して判定する。
+            state.library_backup.invalidate();
             if evaluate_pending(&state).is_none() {
                 return (
                     StatusCode::OK,
