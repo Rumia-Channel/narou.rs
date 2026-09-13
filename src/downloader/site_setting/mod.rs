@@ -173,6 +173,25 @@ impl SiteSetting {
         Ok(loader::load_all_from_dirs(load_dirs))
     }
 
+    /// Parse and compile bundled site definitions from YAML strings.
+    ///
+    /// Worker callers embed the `webnovel/*.yaml` files as static strings
+    /// (e.g. from `build.rs`) and supply them here; no filesystem access is
+    /// involved. User/bundled merge semantics are not applied — the caller
+    /// supplies the effective list. Fails loudly on any malformed definition
+    /// so a Worker never silently shrinks the supported site set.
+    pub fn load_bundled(contents: &[&str]) -> Result<Vec<Self>> {
+        let mut settings = Vec::new();
+        for content in contents {
+            let raw_yaml: serde_yaml::Value = serde_yaml::from_str(content)?;
+            settings.push(serde_yaml::from_value::<SiteSetting>(raw_yaml)?);
+        }
+        for setting in &mut settings {
+            setting.compile();
+        }
+        Ok(settings)
+    }
+
     pub(super) fn compile(&mut self) {
         if looks_like_pattern(&self.sitename) && self.sitename_pattern.is_none() {
             self.sitename_pattern = Some(SiteSettingValue::Single(self.sitename.clone()));
@@ -195,19 +214,19 @@ impl SiteSetting {
         self.compiled_body = self
             .body_pattern
             .as_deref()
-            .and_then(|s| Regex::new(s).ok());
+            .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_introduction = self
             .introduction_pattern
             .as_deref()
-            .and_then(|s| Regex::new(s).ok());
+            .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_postscript = self
             .postscript_pattern
             .as_deref()
-            .and_then(|s| Regex::new(s).ok());
+            .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_error_message = self
             .error_message
             .as_deref()
-            .and_then(|s| Regex::new(s).ok());
+            .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_over18_pattern = self
             .over18_pattern
             .as_ref()
@@ -411,6 +430,25 @@ impl SiteSetting {
 
     pub fn postscript_pattern(&self) -> Option<&str> {
         self.postscript_pattern.as_deref()
+    }
+
+    /// Section-extraction patterns compiled once at load with the same flags
+    /// `compile_html_pattern` applies (dot-matches-newline + size limit).
+    /// These replace per-section `compile_html_pattern` calls.
+    pub fn compiled_body_pattern(&self) -> Option<&Regex> {
+        self.compiled_body.as_ref()
+    }
+
+    pub fn compiled_introduction_pattern(&self) -> Option<&Regex> {
+        self.compiled_introduction.as_ref()
+    }
+
+    pub fn compiled_postscript_pattern(&self) -> Option<&Regex> {
+        self.compiled_postscript.as_ref()
+    }
+
+    pub fn compiled_error_message_pattern(&self) -> Option<&Regex> {
+        self.compiled_error_message.as_ref()
     }
 
     pub fn subtitles_pattern(&self) -> Option<&Regex> {

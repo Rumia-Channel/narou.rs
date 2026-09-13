@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 const COMMAND_NAMES: &[&str] = &[
+    "db",
     "download", "update", "list", "convert", "diff", "setting", "alias", "inspect", "send",
     "folder", "browser", "remove", "freeze", "tag", "web", "mail", "backup", "csv", "clean", "log",
     "trace", "help", "version", "init", "illust",
@@ -633,6 +634,11 @@ pub struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Commands {
+    /// Maintenance operations for the SQLite management database (P2).
+    Db {
+        #[command(subcommand)]
+        action: crate::commands::db::DbAction,
+    },
     Init {
         #[arg(short = 'p', long = "path")]
         aozora_path: Option<String>,
@@ -734,6 +740,21 @@ pub enum Commands {
         all_clean: bool,
         #[arg(long)]
         no_tool: bool,
+        /// P4b: list SQLite version history
+        #[arg(long = "history")]
+        history: bool,
+        /// P4b: show the stored diff of one version id
+        #[arg(long = "show")]
+        show: Option<i64>,
+        /// P4b: restore one version (copy-forward)
+        #[arg(long = "restore")]
+        restore: Option<i64>,
+        /// P4b: merge sections of one version into the working set
+        #[arg(long = "merge-from")]
+        merge_from: Option<i64>,
+        /// P4b: with --merge-from, restrict to these section indexes
+        #[arg(long = "merge-sections")]
+        merge_sections: Option<String>,
     },
     List {
         limit: Option<usize>,

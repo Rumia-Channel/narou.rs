@@ -6,6 +6,8 @@ param(
     [string]$UpdaterBinaryPath,
 
     [Parameter(Mandatory = $true)]
+    [string]$BackupBinaryPath,
+    [Parameter(Mandatory = $true)]
     [ValidateSet("win", "mac", "linux")]
     [string]$Platform,
 
@@ -19,7 +21,10 @@ param(
 
     [string[]]$ResourceDirectories = @("webnovel", "preset"),
 
-    [string]$CommitVersion
+    [string]$CommitVersion,
+
+    # Optional build variant tag appended to the archive name (e.g. "GPL").
+    [string]$Variant = ""
 )
 
 Set-StrictMode -Version Latest
@@ -31,13 +36,18 @@ if (-not (Test-Path -Path $BinaryPath -PathType Leaf)) {
 if (-not (Test-Path -Path $UpdaterBinaryPath -PathType Leaf)) {
     throw "Updater binary not found: $UpdaterBinaryPath"
 }
+if (-not (Test-Path -Path $BackupBinaryPath -PathType Leaf)) {
+    throw "Backup binary not found: $BackupBinaryPath"
+}
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
 $resolvedBinary = (Resolve-Path -Path $BinaryPath).Path
 $resolvedUpdaterBinary = (Resolve-Path -Path $UpdaterBinaryPath).Path
+$resolvedBackupBinary = (Resolve-Path -Path $BackupBinaryPath).Path
 $resolvedOutputDir = (Resolve-Path -Path $OutputDir).Path
-$archiveName = "narou_rs_{0}_{1}.zip" -f $Platform, $Arch
+$variantSuffix = if ([string]::IsNullOrWhiteSpace($Variant)) { "" } else { "-$Variant" }
+$archiveName = "narou_rs_{0}_{1}{2}.zip" -f $Platform, $Arch, $variantSuffix
 $archivePath = Join-Path -Path $resolvedOutputDir -ChildPath $archiveName
 
 if (Test-Path -Path $archivePath -PathType Leaf) {
@@ -135,6 +145,12 @@ try {
         -Archive $archive `
         -SourcePath $resolvedUpdaterBinary `
         -EntryPath (Join-Path -Path $PackageRoot -ChildPath $updaterEntryName)
+
+    # バックアップ用サブ実行ファイル。本体と同じフォルダに置く。
+    Add-FileToArchive `
+        -Archive $archive `
+        -SourcePath $resolvedBackupBinary `
+        -EntryPath (Join-Path -Path $PackageRoot -ChildPath ([System.IO.Path]::GetFileName($resolvedBackupBinary)))
 
     foreach ($resourceDir in $ResourceDirectories) {
         if ([string]::IsNullOrWhiteSpace($resourceDir)) {

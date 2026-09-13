@@ -27,12 +27,14 @@ fn run() -> Result<(), String> {
     let exe_suffix = env::consts::EXE_SUFFIX;
     let app_binary = target_release_dir.join(format!("narou_rs{exe_suffix}"));
     let updater_binary = target_release_dir.join(format!("narou_rs_updater{exe_suffix}"));
+    let backup_binary = target_release_dir.join(format!("narou_rs_backup{exe_suffix}"));
 
     build_release_binary(&options, "narou_rs_updater")?;
+    build_release_binary(&options, "narou_rs_backup")?;
     let updater_hash = sha256_file(&updater_binary)
         .map_err(|err| format!("failed to hash {}: {err}", updater_binary.display()))?;
     build_app_binary(&options, &updater_hash)?;
-    create_local_package(&root, &app_binary, &updater_binary)?;
+    create_local_package(&root, &app_binary, &updater_binary, &backup_binary)?;
 
     println!("Created {}", root.join("narou").display());
     Ok(())
@@ -123,11 +125,11 @@ fn sha256_file(path: &Path) -> io::Result<String> {
     let digest = Sha256::digest(&bytes);
     Ok(hex::encode(digest))
 }
-
 fn create_local_package(
     root: &Path,
     app_binary: &Path,
     updater_binary: &Path,
+    backup_binary: &Path,
 ) -> Result<(), String> {
     let package_root = root.join("narou");
     if !app_binary.is_file() {
@@ -137,6 +139,12 @@ fn create_local_package(
         return Err(format!(
             "updater binary not found: {}",
             updater_binary.display()
+        ));
+    }
+    if !backup_binary.is_file() {
+        return Err(format!(
+            "backup binary not found: {}",
+            backup_binary.display()
         ));
     }
 
@@ -150,6 +158,7 @@ fn create_local_package(
     copy_file(app_binary, &package_root.join(file_name(app_binary)?))?;
     let updater_name = format!("{}.new", file_name(updater_binary)?);
     copy_file(updater_binary, &package_root.join(updater_name))?;
+    copy_file(backup_binary, &package_root.join(file_name(backup_binary)?))?;
 
     for dir in ["webnovel", "preset"] {
         copy_dir_recursive(&root.join(dir), &package_root.join(dir))?;

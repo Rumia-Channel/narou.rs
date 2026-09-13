@@ -10,9 +10,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::compat::{load_local_setting_bool, load_local_setting_string};
 use crate::db::inventory::{Inventory, InventoryScope};
-use crate::db::with_database;
 use crate::version;
 
 use super::AppState;
@@ -75,11 +73,9 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
             let latest = json["tag_name"]
                 .as_str()
                 .or_else(|| json["name"].as_str())
-                .unwrap_or("")
-                .trim()
-                .trim_start_matches('v')
-                .to_string();
-            let current_plain = normalize_version(&current);
+                .map(version::version_core)
+                .unwrap_or_default();
+            let current_plain = version::version_core(&current);
             let develop = !version::commit_version_exists();
             let local_build = version::is_local_build();
             let container = version::is_container_runtime();
@@ -88,12 +84,14 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
                 "success": true,
                 "current_version": current,
                 "latest_version": latest,
-                "update_available": !latest.is_empty() && latest != current_plain,
+                "update_available": version_is_newer(&latest, &current_plain),
                 "develop": develop,
                 "local_build": local_build,
                 "container": container,
                 "self_update_supported": self_update_supported,
                 "self_update_unavailable_reason": version::self_update_unavailable_reason(),
+                "build_variant": version::BUILD_VARIANT,
+                "variant_choice_required": crate::native::self_update::variant_choice_required(),
                 "url": json["html_url"].as_str().unwrap_or("https://github.com/Rumia-Channel/narou.rs/releases/latest"),
             }))
         }
@@ -112,14 +110,36 @@ pub async fn version_latest(State(_state): State<AppState>) -> Json<serde_json::
     }
 }
 
-fn normalize_version(version: &str) -> String {
-    version
-        .trim()
-        .trim_start_matches('v')
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string()
+/// Numeric semver-style comparison: `latest` is an update only when it is
+/// strictly newer than `current`. Falls back to inequality when either side
+/// has no parseable version core.
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    if latest.is_empty() {
+        return false;
+    }
+    match version::version_compare(latest, current) {
+        Some(ord) => ord == std::cmp::Ordering::Greater,
+        None => latest != current,
+    }
+}
+
+/// P2: notepad text lives in app_state('inv','notepad'); the file under
+/// `.narou/` remains only as a legacy import source / pre-DB fallback.
+fn notepad_state() -> Option<crate::native::sqlite::state::StateDb> {
+    #[cfg(feature = "native-runtime")]
+    {
+        if crate::native::sqlite::state::legacy_yaml_active() {
+            return None;
+        }
+        let narou_dir = Inventory::with_default_root()
+            .ok()
+            .map(|inventory| inventory.root_dir().join(".narou"));
+        narou_dir.as_deref().and_then(crate::native::sqlite::state::active_for)
+    }
+    #[cfg(not(feature = "native-runtime"))]
+    {
+        None
+    }
 }
 
 fn notepad_path() -> crate::error::Result<PathBuf> {
@@ -127,6 +147,33 @@ fn notepad_path() -> crate::error::Result<PathBuf> {
         .root_dir()
         .join(".narou")
         .join("notepad.txt"))
+}
+
+fn read_notepad() -> String {
+    if let Some(state) = notepad_state() {
+        return state
+            .get_raw("inv", "notepad")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+    }
+    notepad_path()
+        .ok()
+        .and_then(|path| read_notepad_content(&path).ok())
+        .unwrap_or_default()
+}
+
+fn write_notepad(content: &str) -> std::io::Result<()> {
+    if let Some(state) = notepad_state() {
+        return state
+            .set_raw("inv", "notepad", content)
+            .map_err(|error| std::io::Error::other(error.to_string()));
+    }
+    let path = notepad_path().map_err(|error| std::io::Error::other(error.to_string()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)
 }
 
 fn read_notepad_content(path: &Path) -> std::io::Result<String> {
@@ -138,14 +185,25 @@ fn read_notepad_content(path: &Path) -> std::io::Result<String> {
 }
 
 pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let theme = load_local_setting_string("webui.theme").unwrap_or_else(|| "Cerulean".to_string());
-    let performance_mode =
-        load_local_setting_string("webui.performance-mode").unwrap_or_else(|| "auto".to_string());
-    let reload_timing = load_local_setting_string("webui.table.reload-timing")
-        .unwrap_or_else(|| "every".to_string());
-    let debug_mode = load_local_setting_bool("webui.debug-mode");
-
-    let concurrency_enabled = load_local_setting_bool("concurrency");
+    let setting = |name: &'static str| async {
+        state.services.settings.get(name).await.ok().flatten()
+    };
+    let string_value = |value: Option<serde_yaml::Value>, default: &str| {
+        value
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| default.to_string())
+    };
+    let theme = string_value(setting("webui.theme").await, "Cerulean");
+    let performance_mode = string_value(setting("webui.performance-mode").await, "auto");
+    let reload_timing = string_value(setting("webui.table.reload-timing").await, "every");
+    let debug_mode = setting("webui.debug-mode")
+        .await
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let concurrency_enabled = setting("concurrency")
+        .await
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
 
     Json(serde_json::json!({
         "theme": theme,
@@ -159,29 +217,29 @@ pub async fn webui_config(State(state): State<AppState>) -> Json<serde_json::Val
 }
 
 pub async fn tag_list(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(params): Query<TagListParams>,
 ) -> Response {
-    let new_tag_color = crate::tag_colors::configured_new_tag_color();
-    let (tags, tag_colors) = with_database(|db| {
-        let index = db.tag_index();
-        let mut list: Vec<(&String, &Vec<i64>)> = index.iter().collect();
-        list.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-        let tags = list.into_iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
-
-        let inventory = db.inventory();
-        let mut tag_colors = crate::tag_colors::load_tag_colors(inventory)?;
-        if crate::tag_colors::ensure_tag_colors_with_default_color(
-            &mut tag_colors,
-            tags.iter().map(String::as_str),
-            new_tag_color.as_deref(),
-        ) {
-            crate::tag_colors::save_tag_colors(inventory, &tag_colors)?;
+    let new_tag_color = super::configured_tag_color(&state).await;
+    let records = match state.services.library.records().await {
+        Ok(records) => records,
+        Err(_) => Vec::new(),
+    };
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for record in &records {
+        for tag in &record.tags {
+            *counts.entry(tag.clone()).or_insert(0) += 1;
         }
-
-        Ok((tags, tag_colors.into_map()))
-    })
-    .unwrap_or_default();
+    }
+    let mut list: Vec<(String, usize)> = counts.into_iter().collect();
+    list.sort_by(|a, b| b.1.cmp(&a.1));
+    let tags = list.into_iter().map(|(tag, _)| tag).collect::<Vec<_>>();
+    let tag_colors = state
+        .services
+        .tag_colors
+        .for_tags(tags.clone(), new_tag_color.as_deref())
+        .await
+        .unwrap_or_default();
 
     if params.format.as_deref() == Some("json") {
         return Json(serde_json::json!({ "tags": tags, "tag_colors": tag_colors })).into_response();
@@ -193,12 +251,7 @@ pub async fn tag_list(
     );
     for tag in &tags {
         let escaped_tag = html_escape(tag);
-        let class = tag_color_class(
-            tag_colors
-                .get(tag)
-                .map(|value| value.as_str())
-                .unwrap_or("default"),
-        );
+        let class = tag_color_class(tag_colors.get(tag).map(String::as_str).unwrap_or("default"));
         html.push_str(&format!(
             "<div><span class=\"tag-label {}\" data-tag=\"{}\">{}</span> \
 <span class=\"select-color-button\" data-target-tag=\"{}\"><span class=\"tag-label {} tag-fixed-width\">a</span></span></div>",
@@ -209,7 +262,7 @@ pub async fn tag_list(
 }
 
 pub async fn tag_change_color(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
     let tag = match super::validate_web_tag_name(body["tag"].as_str().unwrap_or("")) {
@@ -222,57 +275,50 @@ pub async fn tag_change_color(
         }
     };
     let color = body["color"].as_str().unwrap_or("");
-
     if !color.is_empty() && !crate::tag_colors::is_valid_tag_color(color) {
         return Json(ApiResponse {
             success: false,
             message: format!("{}という色は存在しません", color),
         });
     }
-
-    let result = with_database(|db| {
-        let inv = db.inventory();
-        let mut colors = crate::tag_colors::load_tag_colors(inv)?;
-        if color.is_empty() {
-            colors.remove(&tag);
-        } else {
-            colors.set(&tag, color);
-        }
-        crate::tag_colors::save_tag_colors(inv, &colors)?;
-        Ok(())
-    });
-
-    match result {
+    match state
+        .services
+        .tag_colors
+        .set(&tag, (!color.is_empty()).then_some(color))
+        .await
+    {
         Ok(()) => Json(ApiResponse {
             success: true,
             message: "OK".to_string(),
         }),
-        Err(e) => Json(ApiResponse {
+        Err(error) => Json(ApiResponse {
             success: false,
-            message: e.to_string(),
+            message: error.to_string(),
         }),
     }
 }
 
-pub async fn all_novel_ids(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let ids = with_database(|db| {
-        let ids: Vec<i64> = db.all_records().keys().copied().collect();
-        Ok(ids)
-    })
-    .unwrap_or_default();
+pub async fn all_novel_ids(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let ids = state
+        .services
+        .library
+        .records()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| record.id)
+        .collect::<Vec<i64>>();
     Json(serde_json::json!({ "ids": ids }))
 }
 
 pub async fn notepad_read(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let content = notepad_path()
-        .ok()
-        .and_then(|path| read_notepad_content(&path).ok())
-        .unwrap_or_default();
+    let content = read_notepad();
     Json(notepad_response_value(&content))
 }
 
 pub async fn notepad_save(
     State(state): State<AppState>,
+    #[allow(unused_variables)]
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     let content = body["content"]
@@ -287,24 +333,28 @@ pub async fn notepad_save(
             "message": message,
         }));
     }
-    let path = match notepad_path() {
-        Ok(path) => path,
-        Err(e) => {
+    let state_db = notepad_state();
+    if state_db.is_none() {
+        // Legacy file flow (pre-DB libraries / legacy escape hatch).
+        let path = match notepad_path() {
+            Ok(path) => path,
+            Err(e) => {
+                return Json(serde_json::json!({
+                    "success": false,
+                    "message": e.to_string(),
+                }));
+            }
+        };
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
             return Json(serde_json::json!({
                 "success": false,
                 "message": e.to_string(),
             }));
         }
-    };
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        return Json(serde_json::json!({
-            "success": false,
-            "message": e.to_string(),
-        }));
     }
-    let current_content = read_notepad_content(&path).unwrap_or_default();
+    let current_content = read_notepad();
     let current_object_id = notepad_object_id(&current_content);
     let request_object_id = body["object_id"].as_str().unwrap_or("");
 
@@ -319,7 +369,12 @@ pub async fn notepad_save(
         }));
     }
 
-    let result = crate::db::inventory::atomic_write(&path, content);
+    let result = if let Some(ref db) = state_db {
+        db.set_raw("inv", "notepad", content)
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    } else {
+        write_notepad(content)
+    };
     let object_id = notepad_object_id(content);
     let response = serde_json::json!({
         "content": content,
@@ -449,16 +504,13 @@ pub async fn save_sort_state(
     }
 }
 
-pub async fn validate_url_regexp_list(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    use crate::downloader::site_setting::SiteSetting;
-
-    let patterns: Vec<String> = SiteSetting::load_all()
-        .unwrap_or_default()
-        .iter()
-        .flat_map(|s| s.url_patterns_for_validation())
-        .collect();
-
-    Json(serde_json::json!(patterns))
+pub async fn validate_url_regexp_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!(
+        state
+            .services
+            .site_definitions
+            .url_patterns_for_validation()
+    ))
 }
 
 #[cfg(test)]

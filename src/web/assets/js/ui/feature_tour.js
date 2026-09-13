@@ -67,7 +67,61 @@ function renderFeatureTour(entries, data = {}, options = {}) {
     fragment.appendChild(empty);
   }
 
+  const migration = data.storage_migration;
+  if (migration && migration.available && !options.manual) {
+    fragment.appendChild(renderStorageMigrationPrompt());
+  }
+
   El.featureTourBody.replaceChildren(fragment);
+}
+
+function renderStorageMigrationPrompt() {
+  const box = document.createElement('div');
+  box.className = 'feature-tour-storage';
+
+  const title = document.createElement('p');
+  title.className = 'feature-tour-storage-title';
+  title.textContent = '管理方式の選択（0.4.0 移行）';
+  box.appendChild(title);
+
+  const desc = document.createElement('p');
+  desc.className = 'feature-tour-storage-desc';
+  desc.textContent =
+    '0.4.0 から作品データの管理を SQLite へ移行できます。移行すると旧 YAML は自動退避され、いつでも export-yaml で戻せます。どちらの方式でも今までのデータがそのまま使えます。';
+  box.appendChild(desc);
+
+  const buttons = document.createElement('div');
+  buttons.className = 'feature-tour-storage-actions';
+
+  const sqliteButton = document.createElement('button');
+  sqliteButton.type = 'button';
+  sqliteButton.className = 'button primary';
+  sqliteButton.textContent = 'Lite版（SQLite管理）へ移行';
+  sqliteButton.addEventListener('click', () => chooseStorageMode('sqlite', sqliteButton));
+
+  const yamlButton = document.createElement('button');
+  yamlButton.type = 'button';
+  yamlButton.className = 'button';
+  yamlButton.textContent = '従来どおり YAML 管理';
+  yamlButton.addEventListener('click', () => chooseStorageMode('yaml', yamlButton));
+
+  buttons.appendChild(sqliteButton);
+  buttons.appendChild(yamlButton);
+  box.appendChild(buttons);
+  return box;
+}
+
+async function chooseStorageMode(mode, button) {
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    const result = await postJson('/api/storage/mode', { mode });
+    window.alert(result.message || '設定しました');
+    window.location.reload();
+  } catch (error) {
+    window.alert('設定に失敗しました: ' + error);
+    button.disabled = false;
+  }
 }
 
 async function saveDisableAutoTour() {

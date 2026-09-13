@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use narou_rs::db;
 use narou_rs::db::paths::novel_dir_for_record;
-use narou_rs::downloader::persistence::{load_toc_file, section_filename};
+use narou_rs::downloader::persistence::section_filename;
 use narou_rs::downloader::{RAW_DATA_DIR, SECTION_SAVE_DIR};
+use narou_rs::native::legacy_persistence::load_toc_file;
 
 use super::download;
 use super::log;
@@ -58,18 +59,22 @@ fn cmd_clean_inner(
 
 fn clean_all(remove: bool) -> Result<(), String> {
     let frozen_ids = narou_rs::compat::load_frozen_ids().map_err(|e| e.to_string())?;
-    let dirs = db::with_database(|db| {
-        let archive_root = db.archive_root().to_path_buf();
-        let mut dirs = Vec::new();
-        for record in db.all_records().values() {
-            if narou_rs::compat::record_is_frozen(record, &frozen_ids) {
-                continue;
-            }
-            dirs.push(novel_dir_for_record(&archive_root, record));
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let ids = novels
+        .scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX)
+        .map_err(|e| e.to_string())?;
+    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .map_err(|e| e.to_string())?;
+    let mut dirs = Vec::new();
+    for id in ids {
+        let Ok(Some(record)) = novels.get_sync(id) else {
+            continue;
+        };
+        if narou_rs::compat::record_is_frozen(&record, &frozen_ids) {
+            continue;
         }
-        Ok::<Vec<PathBuf>, narou_rs::error::NarouError>(dirs)
-    })
-    .map_err(|e| e.to_string())?;
+        dirs.push(novel_dir_for_record(&archive_root, &record));
+    }
 
     for dir in dirs {
         clean_novel_dir(&dir, remove)?;
@@ -79,17 +84,14 @@ fn clean_all(remove: bool) -> Result<(), String> {
 
 fn resolve_novel_dir(target: &str) -> Option<PathBuf> {
     let id = super::resolve_target_to_id(target)?;
-    db::with_database(|db| {
-        let archive_root = db.archive_root().to_path_buf();
-        Ok(db
-            .get(id)
-            .map(|record| novel_dir_for_record(&archive_root, record)))
-    })
-    .ok()
-    .flatten()
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let record = novels.get_sync(id.into()).ok().flatten()?;
+    let archive_root = db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .unwrap_or_else(|_| PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR));
+    Some(novel_dir_for_record(&archive_root, &record))
 }
 
-fn clean_novel_dir(novel_dir: &PathBuf, remove: bool) -> Result<(), String> {
+fn clean_novel_dir(novel_dir: &Path, remove: bool) -> Result<(), String> {
     if !novel_dir.is_dir() || !novel_dir.join("toc.yaml").exists() {
         return Ok(());
     }
@@ -114,7 +116,10 @@ fn find_orphan_files(novel_dir: &Path) -> Result<Vec<PathBuf>, String> {
         .iter()
         .map(|subtitle| {
             let filename = section_filename(subtitle);
-            filename.strip_suffix(".yaml").unwrap_or(&filename).to_string()
+            filename
+                .strip_suffix(".yaml")
+                .unwrap_or(&filename)
+                .to_string()
         })
         .collect::<HashSet<_>>();
 
@@ -169,8 +174,8 @@ fn collect_orphans(
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use narou_rs::downloader::persistence::save_toc_file;
     use narou_rs::downloader::{SubtitleInfo, TocFile};
+    use narou_rs::native::legacy_persistence::save_toc_file;
 
     use super::find_orphan_files;
 

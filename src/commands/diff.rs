@@ -25,6 +25,16 @@ pub struct DiffOptions {
     pub clean: bool,
     pub all_clean: bool,
     pub no_tool: bool,
+    /// P4b: list SQLite version history (newest first).
+    pub history: bool,
+    /// P4b: show the unified diff stored for one version id.
+    pub show: Option<i64>,
+    /// P4b: copy-forward restore of one version into the working set.
+    pub restore: Option<i64>,
+    /// P4b: merge sections of one version into the working set.
+    pub merge_from: Option<i64>,
+    /// P4b: restrict --merge-from to these section indexes (comma separated).
+    pub merge_sections: Option<String>,
 }
 
 #[derive(Clone)]
@@ -66,6 +76,10 @@ fn cmd_diff_inner(opts: DiffOptions) -> std::result::Result<(), String> {
         Some(context) => context,
         None => return Ok(()),
     };
+
+    if opts.history || opts.show.is_some() || opts.restore.is_some() || opts.merge_from.is_some() {
+        return run_version_ops(&context, opts);
+    }
 
     if let Some(version) = opts.view_diff_version.as_deref() {
         if invalid_diff_version_string(version) {
@@ -110,26 +124,36 @@ fn resolve_context(target: Option<&str>) -> std::result::Result<Option<NovelCont
                 return Err(format!("{} は存在しません", target));
             };
 
-            let context = db::with_database(|db| {
-                let record = db.get(data.id).cloned().ok_or_else(|| {
-                    narou_rs::error::NarouError::NotFound(format!("ID: {}", data.id))
-                })?;
-                Ok(NovelContext {
-                    record,
-                    archive_root: db.archive_root().to_path_buf(),
-                })
-            })
-            .map_err(|e| e.to_string())?;
-            Ok(Some(context))
+            let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+            let record = novels
+                .get_sync(data.id.into())
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("ID: {}", data.id))?;
+            let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+                .map_err(|e| e.to_string())?;
+            Ok(Some(NovelContext {
+                record,
+                archive_root,
+            }))
         }
-        None => db::with_database(|db| {
-            let latest = db.sort_by("last_update", true).into_iter().next().cloned();
+        None => {
+            let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+            let query = narou_rs::platform::NovelQuery::page(
+                narou_rs::platform::NovelFilter::all(),
+                narou_rs::platform::NovelSort::by(narou_rs::platform::NovelSortKey::LastUpdate),
+                0,
+                1,
+            );
+            let mut query = query;
+            query.sort.reverse = true;
+            let latest = novels.query_sync(&query).map_err(|e| e.to_string())?.into_iter().next();
+            let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+                .map_err(|e| e.to_string())?;
             Ok(latest.map(|record| NovelContext {
                 record,
-                archive_root: db.archive_root().to_path_buf(),
+                archive_root,
             }))
-        })
-        .map_err(|e| e.to_string()),
+        }
     }
 }
 
@@ -413,27 +437,45 @@ fn display_diff_list(context: &NovelContext) -> std::result::Result<(), String> 
 fn clean_diff(context: &NovelContext) -> std::result::Result<(), String> {
     let cache_root = cache_root_dir(context);
     print!("{} の", context.record.title);
-    if !cache_root.exists() {
-        println!("差分はひとつもありません");
-        return Ok(());
+    let mut removed = false;
+    if cache_root.exists() {
+        fs::remove_dir_all(&cache_root).map_err(|e| e.to_string())?;
+        removed = true;
     }
-
-    fs::remove_dir_all(&cache_root).map_err(|e| e.to_string())?;
-    println!("差分を削除しました");
+    // P4b: clearing diffs also clears the SQLite version history (plan §11.3:
+    // api_diff_clean == prune all).
+    #[cfg(feature = "native-runtime")]
+    {
+        if let Ok(conn) = version_conn() {
+            let guard = conn.lock().expect("sqlite mutex poisoned");
+            let pruned = narou_rs::native::sqlite::versions::prune_history(
+                &guard,
+                context.record.id,
+                0,
+            )
+            .map_err(|e| e.to_string())?;
+            removed = removed || pruned > 0;
+        }
+    }
+    if removed {
+        println!("差分を削除しました");
+    } else {
+        println!("差分はひとつもありません");
+    }
     Ok(())
 }
 
 fn clean_all_diff() -> std::result::Result<(), String> {
-    let (records, archive_root) = db::with_database(|db| {
-        Ok((
-            db.sort_by("id", false)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>(),
-            db.archive_root().to_path_buf(),
-        ))
-    })
-    .map_err(|e| e.to_string())?;
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let query = narou_rs::platform::NovelQuery::page(
+        narou_rs::platform::NovelFilter::all(),
+        narou_rs::platform::NovelSort::by(narou_rs::platform::NovelSortKey::Id),
+        0,
+        usize::MAX,
+    );
+    let records = novels.query_sync(&query).map_err(|e| e.to_string())?;
+    let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .map_err(|e| e.to_string())?;
 
     let frozen_ids = compat::load_frozen_ids().map_err(|e| e.to_string())?;
 
@@ -633,4 +675,150 @@ mod tests {
         assert!(invalid_diff_version_string("2024-01-03@04.05.06"));
         assert!(invalid_diff_version_string("2024.01.03 04.05.06"));
     }
+}
+
+#[cfg(feature = "native-runtime")]
+fn version_conn() -> std::result::Result<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>, String> {
+    use narou_rs::native::sqlite::state;
+    if state::legacy_yaml_active() {
+        return Err("SQLiteバックエンドが無効です (NAROU_RS_LEGACY_YAML)".to_string());
+    }
+    let narou_dir = narou_rs::db::inventory::Inventory::with_default_root()
+        .map_err(|error| error.to_string())?
+        .root_dir()
+        .join(".narou")
+        ;
+    let handle = state::active_for(&narou_dir)
+        .ok_or_else(|| "SQLiteバックエンドが有効ではありません".to_string())?;
+    Ok(handle.conn_ref().clone())
+}
+
+#[cfg(feature = "native-runtime")]
+fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Result<(), String> {
+    use narou_rs::native::sqlite::versions;
+
+    let conn = version_conn()?;
+    let mut guard = conn.lock().expect("sqlite mutex poisoned");
+    let novel_id = context.record.id;
+
+    if opts.history {
+        let versions = versions::list_versions(&guard, novel_id).map_err(|e| e.to_string())?;
+        if versions.is_empty() {
+            println!("バージョン履歴はありません");
+            return Ok(());
+        }
+        println!("{:>6}  {:<8}  {:<24}  {:>8}  {}", "ID", "ORIGIN", "CREATED", "SECTIONS", "NOTE");
+        for version in versions {
+            println!(
+                "{:>6}  {:<8}  {:<24}  {:>8}  {}",
+                version.id,
+                version.origin,
+                version.created_at,
+                version.section_count,
+                version.note.as_deref().unwrap_or("")
+            );
+        }
+        return Ok(());
+    }
+
+    if let Some(version_id) = opts.show {
+        let diff = versions::version_diff(&guard, version_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("バージョン{version_id}の差分はありません"))?;
+        print!("{diff}");
+        return Ok(());
+    }
+
+    if let Some(version_id) = opts.restore {
+        versions::restore_version(&mut guard, novel_id, version_id, false)
+            .map_err(|e| e.to_string())?;
+        write_back_working_set(context, &guard)?;
+        println!("バージョン{version_id}から復元しました (新しいヘッドとして記録)");
+        return Ok(());
+    }
+
+    if let Some(version_id) = opts.merge_from {
+        let only = opts.merge_sections.as_ref().map(|raw| {
+            raw.split(',')
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+        });
+        versions::merge_from_version(&mut guard, novel_id, version_id, only.as_deref(), None)
+            .map_err(|e| e.to_string())?;
+        write_back_working_set(context, &guard)?;
+        println!("バージョン{version_id}からマージしました");
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+/// Write the mirrored working set back to `本文/*.yaml` after a
+/// restore/merge. The SQLite tables are a mirror; the section files remain
+/// authoritative for conversion, so a version operation that only updates
+/// the mirror would be silently discarded by the next convert.
+#[cfg(feature = "native-runtime")]
+fn write_back_working_set(
+    context: &NovelContext,
+    conn: &rusqlite::Connection,
+) -> std::result::Result<(), String> {
+    use narou_rs::downloader::persistence::section_filename;
+    use narou_rs::downloader::types::SubtitleInfo;
+
+    let novel_id = context.record.id;
+    let sections = narou_rs::native::sqlite::content::load_sections(conn, novel_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "作業セットがミラーされていません".to_string())?;
+
+    let novel_dir =
+        narou_rs::db::existing_novel_dir_for_record(&context.archive_root, &context.record);
+    let section_dir = novel_dir.join(SECTION_SAVE_DIR);
+    fs::create_dir_all(&section_dir).map_err(|e| e.to_string())?;
+
+    let mut expected = std::collections::HashSet::new();
+    for (idx, (subtitle, body_yaml)) in &sections {
+        let section: SectionFile =
+            serde_yaml::from_str(body_yaml).map_err(|e| e.to_string())?;
+        let info = SubtitleInfo {
+            index: idx.clone(),
+            href: section.href.clone(),
+            chapter: section.chapter.clone(),
+            subchapter: section.subchapter.clone(),
+            subtitle: subtitle.clone().unwrap_or_else(|| section.subtitle.clone()),
+            file_subtitle: section.file_subtitle.clone(),
+            subdate: section.subdate.clone(),
+            subupdate: section.subupdate.clone(),
+            download_time: section.download_time.clone(),
+        };
+        let name = section_filename(&info);
+        expected.insert(name.clone());
+        fs::write(section_dir.join(&name), body_yaml).map_err(|e| e.to_string())?;
+    }
+
+    // Remove section files that no longer exist in the working set.
+    for entry in fs::read_dir(&section_dir).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        let is_yaml = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext == "yaml");
+        if !is_yaml {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if !expected.contains(&name) {
+            fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "native-runtime"))]
+fn run_version_ops(_context: &NovelContext, _opts: DiffOptions) -> std::result::Result<(), String> {
+    Err("SQLiteバージョン管理はネイティブビルドでのみ利用できます".to_string())
 }

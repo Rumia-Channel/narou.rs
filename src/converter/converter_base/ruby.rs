@@ -1,13 +1,26 @@
+use std::sync::LazyLock;
+
 use regex::Regex;
 
 use super::ConverterBase;
 
+static RE_EXPLICIT_RUBY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\u{FF5C}([^《\n]+?)《([^》\n]*?)》").unwrap());
+static RE_SESAME_RUBY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\u{FF5C}([^《\n]+?)《([・、]+)》").unwrap());
+static RE_GUILLEMET: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\u{226A}(.+?)\u{226B}").unwrap());
+static RE_PAREN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\u{FF08}(.+?)\u{FF09}").unwrap());
+static RE_RUBY_TEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[ぁ-んァ-ヶーゝゞ・]+[ 　]?[ぁ-んァ-ヶーゝゞ・]*$").unwrap()
+});
+
 impl ConverterBase {
     pub(super) fn narou_ruby(&self, data: &mut String) {
-        let explicit_ruby_re = Regex::new(r"\u{FF5C}([^《\n]+?)《([^》\n]*?)》").unwrap();
-        let original = data.clone();
-        *data = explicit_ruby_re
-            .replace_all(&original, |caps: &regex::Captures| {
+        let original: &str = data;
+        *data = RE_EXPLICIT_RUBY
+            .replace_all(original, |caps: &regex::Captures| {
                 let ruby_text = &caps[2];
                 if ruby_text.starts_with(' ') || ruby_text.ends_with("  ") {
                     format!(
@@ -20,10 +33,9 @@ impl ConverterBase {
             })
             .to_string();
 
-        let sesame_re = Regex::new(r"\u{FF5C}([^《\n]+?)《([・、]+)》").unwrap();
-        let original = data.clone();
-        *data = sesame_re
-            .replace_all(&original, |caps: &regex::Captures| {
+        let original: &str = data;
+        *data = RE_SESAME_RUBY
+            .replace_all(original, |caps: &regex::Captures| {
                 format!(
                     "\u{FF3B}\u{FF03}\u{508D}\u{70B9}\u{FF3D}{}\u{FF3B}\u{FF03}\u{508D}\u{70B9}\u{7D42}\u{308F}\u{308A}\u{FF3D}",
                     &caps[1]
@@ -31,12 +43,11 @@ impl ConverterBase {
             })
             .to_string();
 
-        let guillemet_re = Regex::new(r"\u{226A}(.+?)\u{226B}").unwrap();
-        let original = data.clone();
-        *data = guillemet_re
-            .replace_all(&original, |caps: &regex::Captures| {
+        let original: &str = data;
+        *data = RE_GUILLEMET
+            .replace_all(original, |caps: &regex::Captures| {
                 let ruby_text = &caps[1];
-                let base = self.find_ruby_base(&original, caps.get(0).unwrap().start());
+                let base = self.find_ruby_base(original, caps.get(0).unwrap().start());
                 format!("\u{FF5C}{}\u{300C}{}\u{300D}", base, ruby_text)
             })
             .to_string();
@@ -45,19 +56,17 @@ impl ConverterBase {
             return;
         }
 
-        let paren_re = Regex::new(r"\u{FF08}(.+?)\u{FF09}").unwrap();
-        let ruby_re = Regex::new(r"^[ぁ-んァ-ヶーゝゞ・]+[ 　]?[ぁ-んァ-ヶーゝゞ・]*$").unwrap();
-        let original = data.clone();
-        *data = paren_re
-            .replace_all(&original, |caps: &regex::Captures| {
+        let original: &str = data;
+        *data = RE_PAREN
+            .replace_all(original, |caps: &regex::Captures| {
                 let ruby_text = &caps[1];
                 if ruby_text.is_empty()
                     || ruby_text.starts_with(' ')
-                    || !ruby_re.is_match(ruby_text)
+                    || !RE_RUBY_TEXT.is_match(ruby_text)
                 {
                     return caps[0].to_string();
                 }
-                let base = self.find_ruby_base(&original, caps.get(0).unwrap().start());
+                let base = self.find_ruby_base(original, caps.get(0).unwrap().start());
                 if base.is_empty() {
                     return caps[0].to_string();
                 }

@@ -1,0 +1,37 @@
+# Golden fixture library A (synthetic). Canonical metadata snapshot used by
+# dual-run repository tests. Keep byte-stable; regenerate only with review.
+1:
+  id: 1
+  title: "Alpha物語"
+  author: "作者壱"
+  file_title: "[作者壱] Alpha物語"
+  toc_url: "https://ncode.syosetu.com/n000001/"
+  sitename: "小説家になろう"
+  novel_type: 0
+  end: true
+  last_update: "2026-08-01T12:00:00Z"
+  general_firstup: "2026-01-01T00:00:00Z"
+  general_lastup: "2026-07-30T00:00:00Z"
+  tags: ["end"]
+  is_narou: true
+  ncode: "n000001"
+  domain: "ncode.syosetu.com"
+  general_all_no: 101
+  length: 1000
+2:
+  id: 2
+  title: "beta行"
+  author: "作者弐"
+  file_title: "[作者弐] beta行"
+  toc_url: "https://ncode.syosetu.com/n000002/"
+  sitename: "小説家になろう"
+  novel_type: 0
+  end: false
+  last_update: "2026-08-01T12:00:00Z"
+  general_lastup: "2026-07-30T00:00:00Z"
+  tags: ["進行中", "frozen"]
+  is_narou: true
+  ncode: "n000002"
+  domain: "ncode.syosetu.com"
+  general_all_no: 102
+  length: 2000

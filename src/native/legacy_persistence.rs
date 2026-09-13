@@ -1,0 +1,163 @@
+//! Filesystem compatibility wrappers for pre-Phase-4 callers.
+//!
+//! Core downloader persistence uses `PersistenceService` and logical keys. CLI
+//! and Web compatibility APIs still accept `Path` values; those wrappers are
+//! intentionally native-only and preserve the existing layout and guards.
+
+use std::path::{Path, PathBuf};
+
+use chrono::Utc;
+
+use crate::downloader::persistence::{
+    compute_section_hash, default_replace_txt, default_setting_ini, raw_filename, section_filename,
+};
+use crate::downloader::{SectionElement, SectionFile, SubtitleInfo, TocFile};
+use crate::error::Result;
+
+pub fn section_needs_update(
+    section_dir: &PathBuf,
+    subtitle: &SubtitleInfo,
+    new_section: &SectionElement,
+) -> bool {
+    let path = section_dir.join(section_filename(subtitle));
+    if !path.exists() {
+        return true;
+    }
+    if let Some(existing) = load_section_file(&path) {
+        return compute_section_hash(&existing.element) != compute_section_hash(new_section);
+    }
+    true
+}
+
+pub fn resolve_section_file_path(section_dir: &Path, subtitle: &SubtitleInfo) -> Option<PathBuf> {
+    let exact = section_dir.join(section_filename(subtitle));
+    if exact.exists() {
+        return Some(exact);
+    }
+    find_section_file_by_index(section_dir, &subtitle.index)
+}
+
+pub fn find_section_file_by_index(section_dir: &Path, index: &str) -> Option<PathBuf> {
+    let prefix = format!("{} ", index);
+    let entries = std::fs::read_dir(section_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".yaml") {
+            continue;
+        }
+        let stem = &name[..name.len() - 5];
+        if stem == index || stem.starts_with(&prefix) {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+pub fn load_section_file(path: &PathBuf) -> Option<SectionFile> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_yaml::from_str(&content).ok()
+}
+
+pub fn save_section_file(
+    section_dir: &PathBuf,
+    subtitle: &SubtitleInfo,
+    section: &SectionElement,
+) -> Result<()> {
+    let section_dir = validate_archive_write_dir(section_dir, 2)?;
+    std::fs::create_dir_all(&section_dir)?;
+    let path = section_dir.join(section_filename(subtitle));
+    let file_data = SectionFile {
+        index: subtitle.index.clone(),
+        href: subtitle.href.clone(),
+        chapter: subtitle.chapter.clone(),
+        subchapter: subtitle.subchapter.clone(),
+        subtitle: subtitle.subtitle.clone(),
+        file_subtitle: subtitle.file_subtitle.clone(),
+        subdate: subtitle.subdate.clone(),
+        subupdate: subtitle.subupdate.clone(),
+        download_time: Some(Utc::now().format("%Y-%m-%d %H:%M:%S%.6f %z").to_string()),
+        element: section.clone(),
+    };
+    let content = crate::downloader::persistence::serialize_section(&file_data)?;
+    crate::db::inventory::atomic_write(&path, &content)?;
+    Ok(())
+}
+
+pub fn save_raw_file(raw_dir: &PathBuf, subtitle: &SubtitleInfo, raw_html: &str) -> Result<()> {
+    if raw_html.is_empty() {
+        return Ok(());
+    }
+    let raw_dir = validate_archive_write_dir(raw_dir, 2)?;
+    std::fs::create_dir_all(&raw_dir)?;
+    let path = raw_dir.join(raw_filename(subtitle));
+    crate::db::inventory::atomic_write(&path, raw_html)?;
+    Ok(())
+}
+
+pub fn move_file_to_dir(path: &Path, dst_dir: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst_dir)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| crate::error::NarouError::Io(std::io::Error::other("invalid file name")))?;
+    std::fs::rename(path, dst_dir.join(file_name))?;
+    Ok(())
+}
+
+pub fn remove_dir_if_empty(path: &Path) -> Result<()> {
+    if path.is_dir() && std::fs::read_dir(path)?.next().is_none() {
+        std::fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
+pub fn load_toc_file(novel_dir: &PathBuf) -> Option<TocFile> {
+    let path = novel_dir.join("toc.yaml");
+    let content = std::fs::read_to_string(&path).ok()?;
+    serde_yaml::from_str(&content).ok()
+}
+
+pub fn save_toc_file(novel_dir: &PathBuf, toc: &TocFile) -> Result<()> {
+    let novel_dir = validate_archive_write_dir(novel_dir, 1)?;
+    std::fs::create_dir_all(&novel_dir)?;
+    let path = novel_dir.join("toc.yaml");
+    let content = crate::downloader::persistence::serialize_toc(toc)?;
+    crate::db::inventory::atomic_write(&path, &content)?;
+    Ok(())
+}
+
+pub fn ensure_default_files(novel_dir: &PathBuf, title: &str, author: &str, toc_url: &str) {
+    let Ok(novel_dir) = validate_archive_write_dir(novel_dir, 1) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&novel_dir);
+    let setting_path = novel_dir.join("setting.ini");
+    if !setting_path.exists() {
+        let _ = std::fs::write(&setting_path, default_setting_ini());
+    }
+
+    let replace_path = novel_dir.join("replace.txt");
+    if !replace_path.exists() {
+        let _ = std::fs::write(&replace_path, default_replace_txt(title, author, toc_url));
+    }
+}
+
+fn validate_archive_write_dir(path: &Path, fallback_depth: usize) -> Result<PathBuf> {
+    let archive_root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+        .unwrap_or_else(|_| infer_archive_root(path, fallback_depth));
+    crate::db::paths::ensure_within_archive_root(path, &archive_root)
+}
+
+fn infer_archive_root(path: &Path, fallback_depth: usize) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..fallback_depth {
+        if let Some(parent) = current.parent() {
+            current = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+    current
+}

@@ -1,7 +1,11 @@
+#[cfg(feature = "native-runtime")]
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+#[cfg(feature = "native-runtime")]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 
 use super::novel_record::NovelRecord;
+#[cfg(feature = "native-runtime")]
 use crate::error::{NarouError, Result};
 
 pub fn create_subdirectory_name(file_title: &str) -> String {
@@ -41,6 +45,10 @@ pub fn novel_dir_for_record(archive_root: &Path, record: &NovelRecord) -> PathBu
     )
 }
 
+/// Native-only: probes the filesystem for the canonical vs legacy directory
+/// layout. Worker builds have no filesystem and always use the canonical
+/// logical path from [`novel_dir_for_record`].
+#[cfg(feature = "native-runtime")]
 pub fn existing_novel_dir_for_record(archive_root: &Path, record: &NovelRecord) -> PathBuf {
     let canonical = novel_dir_for_record(archive_root, record);
     if canonical.exists() {
@@ -95,6 +103,9 @@ pub fn sanitize_path_component(value: &str) -> String {
     sanitize_windows_filename_component_with_limit(value, None, Some('_'), "_")
 }
 
+/// Native-only: canonicalization and reparse-point containment checks require
+/// the filesystem. Worker storage adapters enforce their own key containment.
+#[cfg(feature = "native-runtime")]
 pub fn ensure_within_archive_root(path: &Path, root: &Path) -> Result<PathBuf> {
     let absolute_root = absolute_normalized_path(root)?;
     let canonical_root = canonical_existing_path(root)?;
@@ -170,6 +181,7 @@ fn is_windows_reserved_name(value: &str) -> bool {
     )
 }
 
+#[cfg(feature = "native-runtime")]
 fn absolute_normalized_path(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -179,10 +191,12 @@ fn absolute_normalized_path(path: &Path) -> Result<PathBuf> {
     Ok(normalize_path(&strip_windows_verbatim_prefix(&absolute)))
 }
 
+#[cfg(feature = "native-runtime")]
 fn canonical_existing_path(path: &Path) -> Result<PathBuf> {
     Ok(normalize_path(&strip_windows_verbatim_prefix(&fs::canonicalize(path)?)))
 }
 
+#[cfg(feature = "native-runtime")]
 fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
     let mut current = path;
     loop {
@@ -193,6 +207,7 @@ fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn reject_escaping_reparse_points(
     path: &Path,
     root: &Path,
@@ -227,6 +242,7 @@ fn reject_escaping_reparse_points(
     Ok(())
 }
 
+#[cfg(feature = "native-runtime")]
 #[cfg(windows)]
 fn is_symlink_like(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -235,11 +251,13 @@ fn is_symlink_like(metadata: &fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
+#[cfg(feature = "native-runtime")]
 #[cfg(not(windows))]
 fn is_symlink_like(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
+#[cfg(feature = "native-runtime")]
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -256,6 +274,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+#[cfg(feature = "native-runtime")]
 fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
     if cfg!(windows) {
         let raw = path.to_string_lossy();

@@ -6,6 +6,7 @@ mod text_normalization;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::LazyLock;
 
 use regex::Regex;
 
@@ -13,6 +14,9 @@ use super::device::Device;
 use super::inspector::Inspector;
 use super::settings::NovelSettings;
 use super::user_converter::UserConverter;
+
+static RE_BLANK_LINE_PACK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(^\n){3}").unwrap());
 
 pub struct ConverterBase {
     pub settings: NovelSettings,
@@ -180,8 +184,7 @@ impl ConverterBase {
 
         if self.text_type != TextType::Story && self.settings.enable_pack_blank_line {
             result = result.replace("\n\n", "\n");
-            let re = Regex::new(r"(^\n){3}").unwrap();
-            result = re.replace_all(&result, "\n\n").to_string();
+            result = RE_BLANK_LINE_PACK.replace_all(&result, "\n\n").to_string();
         }
 
         result
@@ -242,31 +245,30 @@ impl ConverterBase {
 
         let lines: Vec<&str> = text.lines().collect();
         let mut result = Vec::new();
-        let mut before_line = String::new();
+        let mut before_line_blank = true;
         let mut request_insert_blank = false;
 
         for line in &lines {
-            let mut line = line.to_string();
-            line = zenkaku_rstrip(&line);
+            let mut line = zenkaku_rstrip(line).into_owned();
 
             if request_insert_blank {
                 if !is_blank_line(&line) {
                     result.push(String::new());
                 }
                 request_insert_blank = false;
-                before_line.clear();
+                before_line_blank = true;
             }
 
             if matches!(text_type, TextType::Body | TextType::TextFile) {
                 let mut prefix = String::new();
                 if line.contains("\u{FF3B}\u{FF03}\u{7AE0}\u{898B}\u{51FA}\u{3057}\u{3063}\u{307D}\u{3044}\u{6587}\u{FF1D}") {
-                    if !is_blank_line(&before_line) {
+                    if !before_line_blank {
                         prefix.push('\n');
                     }
                     request_insert_blank = true;
                 }
                 if is_border_symbol(&line) {
-                    if !is_blank_line(&before_line) {
+                    if !before_line_blank {
                         prefix.push('\n');
                     }
                     request_insert_blank = true;
@@ -286,8 +288,8 @@ impl ConverterBase {
                 }
             }
 
-            result.push(line.clone());
-            before_line = line;
+            before_line_blank = is_blank_line(&line);
+            result.push(line);
         }
 
         let mut data = result.join("\n");

@@ -40,6 +40,7 @@ narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状�
 - `-v` / `--version` は `version` コマンドに変換される。`version --more` も受け付ける。 ✅
 - `-h` / `--help` は clap ヘルプを表示。 ✅
 - 引数なしは `help` コマンドにフォールバック。 ✅
+- 【Rust 拡張】0.4.0 未満から 0.4.0 以上へアップデートした後の初回起動時に、ライブラリ全体バックアップ (ライブラリルート全体 = `小説データ/` + `.narou/` + `webnovel/` + その他ユーザー作成ファイル → exe と同じフォルダの `backup/narou-backup-<timestamp>.zip`) を対話プロンプトで提案する。実際の zip 作成は同梱サブ実行ファイル `narou_rs_backup` が行い、保存先はプロンプトで変更できる。保存先がライブラリ内にある場合は対象から除外する。前回起動バージョンは `.narou/last-run-version` に記録。`web`/`help`/`version`・非対話実行・`NAROU_ENV=test` では出さない。容量不足時は警告して既定を「いいえ」にする。Web UI でも `GET/POST /api/library_backup` で同じ提案・作成を行える。
 
 ---
 
@@ -217,6 +218,21 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 
 ---
 
+### 3.x `db` — 追加サブコマンド (narou.rs 独自, Ruby版対応外)
+
+SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のまま**で、Web UI 初回ツアー(または `.narou/storage-backend` マーカーファイル=`sqlite`)で選択したときのみ有効化される。Web API は `GET/POST /api/storage/mode`。
+
+| サブコマンド | 内容 |
+|---|---|
+| `verify` | `PRAGMA integrity_check` + 全 payload の CRC-32 検査 |
+| `export-yaml [--out DIR]` | レガシー YAML/TXT バンドルを再生成 (旧バージョンへのロールバック用) |
+| `export-yaml --in-place` | `.narou/*.yaml`・`~/.narousetting/global_setting.yaml` を実位置へ書き戻し、`storage-backend` を `yaml` に戻す。narou.rb への完全復帰用 |
+| `vacuum` | VACUUM で容量回収 |
+
+**前方互換モード**: `narou setting narou-compat=true` で `.narou/*.yaml` (database.yaml, freeze.yaml, alias.yaml, tag_colors.yaml, latest_convert.yaml, local_setting.yaml, queue.yaml, notepad.txt) と `~/.narousetting/global_setting.yaml` をファイルとして維持し、narou.rb がそのまま読める状態を保つ。ファイルが正で SQLite はミラー。OFF(既定) ではファイルを `*.imported-*` へ退避し SQLite のみで管理する。
+
+---
+
 ### 4. `convert` — 🟡 部分
 
 > 小説を変換します。管理小説以外にテキストファイルも変換可能
@@ -271,7 +287,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - Windows の `\\?\\C:\\...\\AozoraEpub3.jar` 形式パスは Java classpath にそのまま渡すと失敗するため、Ruby版同様に jar の basename を current_dir 基準で渡すよう修正した。`sample\\novel` で `device=epub` 実変換と `--no-epub` 抑止を確認済み
 - Windows で `〜` / `～` / `−` / `‼` / `⁇` / `⁈` / `⁉` / variation selector や CP932/Windows-31J 未定義文字 (`♠` / `♡` / `♢` / `♣` / `𠮷` など) を含み、Java/AozoraEpub3 側で出力名がずれやすい小説パスは、AozoraEpub3 に本文・表紙・`挿絵/` を安全な一時ファイル名で渡し、生成後に本来の Unicode ファイル名へ戻す。`C:\\Users\\rumia\\Documents\\Narou` の n5853lh で EPUB 生成を確認済み
 
-**注**: EPUB/MOBI 生成は AozoraEpub3.jar と kindlegen への依存がある。Rust 側のテキスト変換 (`novel.txt` 生成) は完了しているが、AozoraEpub3 の呼び出しパイプラインは別途必要。
+**注**: EPUB/MOBI 生成は AozoraEpub3 (Java 版 `AozoraEpub3.jar`、または Rust 製代替 [AozoraEpub3_Lite](https://github.com/Rumia-Channel/AozoraEpub3_Lite)) と kindlegen への依存がある。`aozoraepub3dir` 設定は jar を優先し、無ければ `AozoraEpub3_Lite.exe` / `AozoraEpub3.exe` バイナリを受理する (`canonicalize_aozoraepub3_tool_path`)。詳細は `docs/aozora_lite_evaluation_2026-08-23.md`。
 
 ---
 
@@ -478,6 +494,13 @@ narou setting name         # 読み取り
 | `--all-clean` | — | flag | false | 凍結以外の全差分削除 |
 | `--no-tool` | — | flag | false | 外部 diff ツールを使わない |
 | `-N` (数値) | — | int | — | `-n N` の短縮形 |
+| `--history` | — | flag | false | (P4b) SQLite版バージョン履歴一覧 |
+| `--show ID` | — | int | — | (P4b) 指定バージョンの保存済み差分表示 |
+| `--restore ID` | — | int | — | (P4b) 指定バージョンへ復元 (copy-forward・新ヘッド記録) |
+| `--merge-from ID` | — | int | — | (P4b) 指定バージョンを作業セットへマージ |
+| `--merge-sections LIST` | — | str | — | (P4b) `--merge-from` の対象話制限 (カンマ区切り) |
+
+> P4b オプションは SQLite バックエンド有効時のみ動作する。履歴は convert 実行時に自動スナップショットされ、保持数は将来 `diff.history-limit` で制御予定。`--restore` / `--merge-from` はミラー更新後に `本文/*.yaml` へも書き戻す（authoritative はファイルのまま）。`--clean` は差分キャッシュに加えて SQLite バージョン履歴も全削除する。
 | target | | string | — | 小説指定 (省略時=最終更新) |
 
 **実装状況**:
@@ -485,6 +508,7 @@ narou setting name         # 読み取り
 - 差分バージョン指定 `YYYY.MM.DD@HH.MM.SS` / `;` 区切りに対応
 - セクション YAML からの一時テキスト生成、外部 diff ツール統合、内蔵差分ビューアを実装済み
 - 既定対象は最新更新の小説で、差分キャッシュは `本文/cache/<version>/` に配置する
+- Web API: `GET /api/diff_history?id=N`（バージョン一覧）、`GET /api/diff_show?id=N&version=V`（保存済み差分）、`POST /api/diff_restore` / `POST /api/diff_merge`（`{target, version, sections?}`）を追加。`api_diff` 応答に `history` フィールドを追加（既存キー不変）
 
 ---
 

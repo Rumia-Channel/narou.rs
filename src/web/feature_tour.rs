@@ -1,10 +1,7 @@
 use axum::{Json, extract::State};
 use serde::Serialize;
-use std::collections::HashMap;
-
-use crate::db::inventory::InventoryScope;
-use crate::db::with_database;
 use crate::version;
+use crate::setting_core::SettingScope;
 
 use super::AppState;
 use super::state::ApiResponse;
@@ -91,11 +88,23 @@ const FEATURE_TOURS: &[FeatureTourEntry] = &[
             "再試行の予定は queue_retry 通知として Web UI に配信",
         ],
     },
+    FeatureTourEntry {
+        version: "0.4.0",
+        title: "管理データの SQLite 移行とライブラリバックアップ",
+        body: "0.4.0 では .narou 配下の管理データを SQLite へ移行できます。破壊的な変更に備え、アップデート後の初回起動時にライブラリ全体のバックアップを提案します。",
+        items: &[
+            "初回起動時にライブラリ全体 (小説データ + .narou + webnovel 等) のバックアップを提案",
+            "narou_rs_backup サブ実行ファイルでいつでもライブラリ全体を zip 化可能",
+            "管理方式は Web UI ツアーまたは .narou/storage-backend で SQLite / YAML を選択",
+            "narou db verify / export-yaml / vacuum で SQLite 管理データを保守",
+            "narou diff --history / --restore で小説本文のバージョン履歴を参照・復元",
+        ],
+    },
 ];
 
-pub async fn pending(State(_state): State<AppState>) -> Json<serde_json::Value> {
-    let seen_version = load_seen_version();
-    let disabled = load_disabled();
+pub async fn pending(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let seen_version = load_seen_version(&state).await;
+    let disabled = load_disabled(&state).await;
     let entries = pending_entries(seen_version.as_deref(), version::VERSION);
     let latest_pending_version = entries
         .iter()
@@ -103,6 +112,7 @@ pub async fn pending(State(_state): State<AppState>) -> Json<serde_json::Value> 
         .max_by(|a, b| compare_versions(a, b))
         .unwrap_or("");
 
+    let storage_migration = storage_migration_prompt();
     Json(serde_json::json!({
         "success": true,
         "current_version": version::create_version_string(),
@@ -110,22 +120,23 @@ pub async fn pending(State(_state): State<AppState>) -> Json<serde_json::Value> 
         "disabled": disabled,
         "latest_pending_version": latest_pending_version,
         "entries": if disabled { Vec::new() } else { entries },
+        "storage_migration": storage_migration,
     }))
 }
 
-pub async fn all(State(_state): State<AppState>) -> Json<serde_json::Value> {
+pub async fn all(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "success": true,
         "current_version": version::create_version_string(),
-        "seen_version": load_seen_version(),
-        "disabled": load_disabled(),
+        "seen_version": load_seen_version(&state).await,
+        "disabled": load_disabled(&state).await,
         "latest_pending_version": latest_tour_version(),
         "entries": current_entries(version::VERSION),
     }))
 }
 
 pub async fn mark_seen(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
     let requested = body["version"].as_str().unwrap_or("").trim();
@@ -142,11 +153,12 @@ pub async fn mark_seen(
         });
     }
 
-    let version_to_save = load_seen_version()
+    let version_to_save = load_seen_version(&state)
+        .await
         .filter(|seen| version_greater(seen, requested))
         .unwrap_or_else(|| requested.to_string());
 
-    match save_seen_version(&version_to_save) {
+    match save_seen_version(&state, &version_to_save).await {
         Ok(()) => Json(ApiResponse {
             success: true,
             message: "OK".to_string(),
@@ -159,11 +171,11 @@ pub async fn mark_seen(
 }
 
 pub async fn configure(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
     let disabled = body["disabled"].as_bool().unwrap_or(false);
-    match save_disabled(disabled) {
+    match save_disabled(&state, disabled).await {
         Ok(()) => Json(ApiResponse {
             success: true,
             message: "OK".to_string(),
@@ -174,41 +186,57 @@ pub async fn configure(
         }),
     }
 }
-
-fn load_seen_version() -> Option<String> {
-    crate::compat::load_local_setting_string(SEEN_VERSION_KEY)
+async fn load_seen_version(state: &AppState) -> Option<String> {
+    state
+        .services
+        .settings
+        .get_raw(SettingScope::Local, SEEN_VERSION_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_str().map(str::to_owned))
 }
 
-fn load_disabled() -> bool {
-    crate::compat::load_local_setting_bool(DISABLED_KEY)
+async fn load_disabled(state: &AppState) -> bool {
+    state
+        .services
+        .settings
+        .get_raw(SettingScope::Local, DISABLED_KEY)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
-fn save_seen_version(version: &str) -> crate::error::Result<()> {
-    update_local_settings(|settings| {
-        settings.insert(
-            SEEN_VERSION_KEY.to_string(),
+async fn save_seen_version(
+    state: &AppState,
+    version: &str,
+) -> Result<(), crate::application::ApplicationError> {
+    state
+        .services
+        .settings
+        .set_raw(
+            SettingScope::Local,
+            SEEN_VERSION_KEY,
             serde_yaml::Value::String(version.to_string()),
-        );
-    })
+        )
+        .await
 }
 
-fn save_disabled(disabled: bool) -> crate::error::Result<()> {
-    update_local_settings(|settings| {
-        settings.insert(DISABLED_KEY.to_string(), serde_yaml::Value::Bool(disabled));
-    })
-}
-
-fn update_local_settings(
-    update: impl FnOnce(&mut HashMap<String, serde_yaml::Value>),
-) -> crate::error::Result<()> {
-    with_database(|db| {
-        let inv = db.inventory();
-        let mut settings: HashMap<String, serde_yaml::Value> = inv
-            .load("local_setting", InventoryScope::Local)
-            .unwrap_or_default();
-        update(&mut settings);
-        inv.save("local_setting", InventoryScope::Local, &settings)
-    })
+async fn save_disabled(
+    state: &AppState,
+    disabled: bool,
+) -> Result<(), crate::application::ApplicationError> {
+    state
+        .services
+        .settings
+        .set_raw(
+            SettingScope::Local,
+            DISABLED_KEY,
+            serde_yaml::Value::Bool(disabled),
+        )
+        .await
 }
 
 fn current_entries(current_version: &str) -> Vec<FeatureTourEntry> {
@@ -312,4 +340,109 @@ mod tests {
                 .all(|entry| !version_greater(entry.version, super::version::VERSION))
         );
     }
+}
+
+#[cfg(feature = "native-runtime")]
+fn storage_migration_prompt() -> serde_json::Value {
+    use crate::native::sqlite::state;
+
+    if state::legacy_yaml_active() {
+        return serde_json::json!({ "available": false, "mode": "yaml" });
+    }
+    let narou_dir = match crate::db::inventory::Inventory::with_default_root() {
+        Ok(inventory) => inventory.root_dir().join(".narou"),
+        Err(_) => return serde_json::json!({ "available": false, "mode": "yaml" }),
+    };
+    let mode = state::read_mode(&narou_dir);
+    serde_json::json!({
+        "available": mode == state::StorageMode::Yaml,
+        "mode": match mode {
+            state::StorageMode::Sqlite => "sqlite",
+            state::StorageMode::Yaml => "yaml",
+        },
+    })
+}
+
+#[cfg(not(feature = "native-runtime"))]
+fn storage_migration_prompt() -> serde_json::Value {
+    serde_json::json!({ "available": false, "mode": "yaml" })
+}
+
+/// GET /api/storage/mode — current management backend of this library.
+pub async fn storage_mode_get() -> Json<serde_json::Value> {
+    #[cfg(feature = "native-runtime")]
+    {
+        use crate::native::sqlite::state;
+        if state::legacy_yaml_active() {
+            return Json(serde_json::json!({ "success": true, "mode": "yaml", "locked_by_env": true }));
+        }
+        let mode = crate::db::inventory::Inventory::with_default_root()
+            .map(|inventory| state::read_mode(&inventory.root_dir().join(".narou")))
+            .unwrap_or(state::StorageMode::Yaml);
+        let mode_str = match mode {
+            state::StorageMode::Sqlite => "sqlite",
+            state::StorageMode::Yaml => "yaml",
+        };
+        return Json(serde_json::json!({ "success": true, "mode": mode_str, "locked_by_env": false }));
+    }
+    #[cfg(not(feature = "native-runtime"))]
+    Json(serde_json::json!({ "success": true, "mode": "yaml", "locked_by_env": false }))
+}
+
+/// POST /api/storage/mode — switch the management backend for this library.
+///
+/// `sqlite` writes the marker and re-initializes the database handle, which
+/// performs the one-time legacy import (originals are renamed, never deleted).
+/// `yaml` records the explicit choice so the tour never re-prompts.
+pub async fn storage_mode_set(
+    Json(body): Json<serde_json::Value>,
+) -> Json<ApiResponse> {
+    #[cfg(feature = "native-runtime")]
+    {
+        use crate::native::sqlite::state;
+        let requested = body["mode"].as_str().unwrap_or("").trim().to_string();
+        let mode = match requested.as_str() {
+            "sqlite" => state::StorageMode::Sqlite,
+            "yaml" => state::StorageMode::Yaml,
+            _ => {
+                return Json(ApiResponse {
+                    success: false,
+                    message: "mode must be 'sqlite' or 'yaml'".to_string(),
+                })
+            }
+        };
+        let narou_dir = match crate::db::inventory::Inventory::with_default_root() {
+            Ok(inventory) => inventory.root_dir().join(".narou"),
+            Err(error) => {
+                return Json(ApiResponse {
+                    success: false,
+                    message: error.to_string(),
+                })
+            }
+        };
+        return match state::write_mode(&narou_dir, mode) {
+            Ok(()) => match crate::db::init_database() {
+                Ok(()) => Json(ApiResponse {
+                    success: true,
+                    message: match mode {
+                        state::StorageMode::Sqlite => "SQLite管理へ移行しました".to_string(),
+                        state::StorageMode::Yaml => "YAML管理を継続します".to_string(),
+                    },
+                }),
+                Err(error) => Json(ApiResponse {
+                    success: false,
+                    message: error.to_string(),
+                }),
+            },
+            Err(error) => Json(ApiResponse {
+                success: false,
+                message: error.to_string(),
+            }),
+        };
+    }
+    #[cfg(not(feature = "native-runtime"))]
+    Json(ApiResponse {
+        success: false,
+        message: "unsupported on this runtime".to_string(),
+    })
 }

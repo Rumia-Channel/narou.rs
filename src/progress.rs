@@ -69,14 +69,11 @@ pub fn emit_novel_refresh(id: i64) {
     emit_web_event("novel.refresh", serde_json::json!({ "id": id }));
 }
 
-pub trait ProgressReporter: Send + Sync {
-    fn set_length(&self, len: u64);
-    fn set_position(&self, pos: u64);
-    fn inc(&self, delta: u64);
-    fn set_message(&self, msg: &str);
-    fn finish_with_message(&self, msg: &str);
-    fn println(&self, msg: &str);
-}
+/// Portable progress sink used by the shared downloader/converter core.
+/// Implementations live in this native module (terminal bars, WebSocket
+/// events); the trait itself is defined in `platform::progress` so core
+/// modules never depend on this native-only module.
+pub use crate::platform::ProgressReporter;
 
 pub struct NoProgress;
 

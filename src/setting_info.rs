@@ -96,6 +96,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "update.sort-by"
         | "update.auto-schedule.enable"
         | "update.auto-schedule"
+        | "update.auto-schedule.timezone"
         | "update.max-parallel-domains"
         | "convert.copy-to"
         | "convert.copy-zip-to"
@@ -133,7 +134,8 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "time-zone"
         | "user-agent"
         | "queue.max-retries"
-        | "queue.retry-backoff" => Some("detail"),
+        | "queue.retry-backoff"
+        | "narou-compat" => Some("detail"),
 
         // local → webui
         "webui.theme"
@@ -796,6 +798,13 @@ pub fn setting_variables() -> SettingVariables {
             ),
         ),
         (
+            "update.auto-schedule.timezone",
+            vis(
+                VarType::String,
+                "自動アップデートのHHMMを評価するIANAタイムゾーン。Workerの既定値は Asia/Tokyo",
+            ),
+        ),
+        (
             "update.max-parallel-domains",
             vis(
                 VarType::Integer,
@@ -1048,6 +1057,13 @@ pub fn setting_variables() -> SettingVariables {
                 "リトライ時の待機秒数をカンマ区切りで指定（s/m/h 単位可、例: 1m,5m,15m）。要素数より多く失敗したときは最後の値を再利用",
             ),
         ),
+        (
+            "narou-compat",
+            invis(
+                VarType::Boolean,
+                "SQLite 管理時も .narou/*.yaml を維持し narou.rb との前方互換を保つ。OFF(既定) で完全 SQLite 移行",
+            ),
+        ),
     ];
 
     let global_vars = vec![
@@ -1140,6 +1156,13 @@ pub fn setting_variables() -> SettingVariables {
             ),
         ),
         ("over18", invis(VarType::Boolean, "18歳以上かどうか")),
+        (
+            "self-update.variant",
+            invis_sel(
+                "セルフアップデートで取得するリリース variant。gpl: AozoraEpub3_Lite 組込み(GPL-3.0) / standard: 外部 AozoraEpub3 を利用(BSD)",
+                vec!["gpl", "standard"],
+            ),
+        ),
     ];
 
     SettingVariables {

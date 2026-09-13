@@ -4,10 +4,9 @@ use axum::{
     response::Json,
 };
 
-use crate::db::with_database_mut;
 
 use super::AppState;
-use super::sort_state::sort_ids_for_request;
+use super::sort_state::sort_ids_from_records;
 use super::state::{ApiResponse, EditTagBody, IdPath, TagBody, TagsBody};
 
 fn validate_tags(tags: &[String]) -> Result<Vec<String>, String> {
@@ -19,27 +18,58 @@ fn validate_tags(tags: &[String]) -> Result<Vec<String>, String> {
         .collect()
 }
 
-async fn run_tag_commands(
+async fn apply_tag_change(
     state: &AppState,
-    commands: Vec<Vec<String>>,
-) -> Result<(), (StatusCode, String)> {
-    for args in commands {
-        let output = super::jobs::run_cli_and_broadcast(
-            state,
-            args,
-            super::non_external_console_target(),
-        )
+    ids: &[i64],
+    action: crate::application::TagAction,
+    tags: Vec<String>,
+) -> Result<crate::application::TagChangeResult, (StatusCode, String)> {
+    let result = state
+        .services
+        .novel_actions
+        .change_tags(&crate::application::TagChangeRequest {
+            ids: ids.iter().copied().map(Into::into).collect(),
+            action,
+            tags,
+        })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        if !output.status.success() {
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "tag の実行に失敗しました".to_string()));
-        }
-    }
-    with_database_mut(|db| db.refresh())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|error| match error {
+            crate::application::ApplicationError::InvalidRequest(message) => {
+                (StatusCode::BAD_REQUEST, message)
+            }
+            crate::application::ApplicationError::NotFound(message) => {
+                (StatusCode::NOT_FOUND, message)
+            }
+            crate::application::ApplicationError::Platform(message) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, message)
+            }
+        })?;
     state.push_server.broadcast_event("table.reload", "");
     state.push_server.broadcast_event("tag.updateCanvas", "");
-    Ok(())
+    Ok(result)
+}
+
+async fn sort_ids_for_request(
+    state: &AppState,
+    ids: &[i64],
+    sort_state: Option<&serde_json::Value>,
+    timestamp: Option<u64>,
+) -> Vec<i64> {
+    let records = state.services.library.records().await.unwrap_or_default();
+    sort_ids_from_records(ids, &records, sort_state, timestamp)
+}
+
+fn ensure_all_ids_found(
+    result: &crate::application::TagChangeResult,
+) -> Result<(), (StatusCode, String)> {
+    if result.missing.is_empty() {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            format!("ID: {}", result.missing[0].0),
+        ))
+    }
 }
 
 pub async fn add_tag(
@@ -49,16 +79,14 @@ pub async fn add_tag(
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     let tag = super::normalize_web_tag_name(&body.tag)
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    run_tag_commands(
+    let result = apply_tag_change(
         &state,
-        vec![vec![
-            "tag".to_string(),
-            "--add".to_string(),
-            tag,
-            id.to_string(),
-        ]],
+        &[id],
+        crate::application::TagAction::Add,
+        vec![tag],
     )
     .await?;
+    ensure_all_ids_found(&result)?;
 
     Ok(Json(ApiResponse {
         success: true,
@@ -73,16 +101,14 @@ pub async fn remove_tag(
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     let tag = super::normalize_web_tag_name(&body.tag)
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    run_tag_commands(
+    let result = apply_tag_change(
         &state,
-        vec![vec![
-            "tag".to_string(),
-            "--delete".to_string(),
-            tag,
-            id.to_string(),
-        ]],
+        &[id],
+        crate::application::TagAction::Remove,
+        vec![tag],
     )
     .await?;
+    ensure_all_ids_found(&result)?;
 
     Ok(Json(ApiResponse {
         success: true,
@@ -97,15 +123,14 @@ pub async fn add_tags(
     Json(body): Json<TagsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     let tags = validate_tags(&body.tags).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    run_tag_commands(
+    let result = apply_tag_change(
         &state,
-        vec![{
-            let mut args = vec!["tag".to_string(), "--add".to_string(), tags.join(" ")];
-            args.push(id.to_string());
-            args
-        }],
+        &[id],
+        crate::application::TagAction::Add,
+        tags,
     )
     .await?;
+    ensure_all_ids_found(&result)?;
 
     Ok(Json(ApiResponse {
         success: true,
@@ -120,15 +145,14 @@ pub async fn remove_tags(
     Json(body): Json<TagsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     let tags = validate_tags(&body.tags).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    run_tag_commands(
+    let result = apply_tag_change(
         &state,
-        vec![{
-            let mut args = vec!["tag".to_string(), "--delete".to_string(), tags.join(" ")];
-            args.push(id.to_string());
-            args
-        }],
+        &[id],
+        crate::application::TagAction::Remove,
+        tags,
     )
     .await?;
+    ensure_all_ids_found(&result)?;
 
     Ok(Json(ApiResponse {
         success: true,
@@ -142,15 +166,14 @@ pub async fn update_tags(
     Json(body): Json<TagsBody>,
 ) -> Result<Json<ApiResponse>, (StatusCode, String)> {
     let tags = validate_tags(&body.tags).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    let mut commands = vec![vec!["tag".to_string(), "--clear".to_string(), id.to_string()]];
-    if !tags.is_empty() {
-        commands.push({
-            let mut args = vec!["tag".to_string(), "--add".to_string(), tags.join(" ")];
-            args.push(id.to_string());
-            args
-        });
-    }
-    run_tag_commands(&state, commands).await?;
+    let result = apply_tag_change(
+        &state,
+        &[id],
+        crate::application::TagAction::Replace,
+        tags,
+    )
+    .await?;
+    ensure_all_ids_found(&result)?;
 
     Ok(Json(ApiResponse {
         success: true,
@@ -164,7 +187,7 @@ pub async fn edit_tag(
     State(state): State<AppState>,
     Json(body): Json<EditTagBody>,
 ) -> Json<serde_json::Value> {
-    if body.ids.len() > super::max_web_targets_per_request() {
+    if body.ids.len() > super::max_web_targets_per_request(&state).await {
         return serde_json::json!({ "success": false, "error": "too many ids" }).into();
     }
     if body.states.len() > super::MAX_WEB_TAGS_PER_REQUEST {
@@ -179,7 +202,8 @@ pub async fn edit_tag(
             _ => None,
         })
         .collect();
-    let ids = sort_ids_for_request(&ids, body.sort_state.as_ref(), body.timestamp);
+    let ids =
+        sort_ids_for_request(&state, &ids, body.sort_state.as_ref(), body.timestamp).await;
 
     if ids.is_empty() {
         return serde_json::json!({ "success": false, "error": "No valid IDs" }).into();
@@ -207,28 +231,31 @@ pub async fn edit_tag(
         }
     }
 
-    let mut commands = Vec::new();
     if !tags_to_delete.is_empty() {
-        let mut args = vec![
-            "tag".to_string(),
-            "--delete".to_string(),
-            tags_to_delete.join(" "),
-        ];
-        args.extend(ids.iter().map(ToString::to_string));
-        commands.push(args);
+        if let Err((_, error)) = apply_tag_change(
+            &state,
+            &ids,
+            crate::application::TagAction::Remove,
+            tags_to_delete,
+        )
+        .await
+        .and_then(|result| ensure_all_ids_found(&result).map(|()| result))
+        {
+            return serde_json::json!({ "success": false, "error": error }).into();
+        }
     }
     if !tags_to_add.is_empty() {
-        let mut args = vec![
-            "tag".to_string(),
-            "--add".to_string(),
-            tags_to_add.join(" "),
-        ];
-        args.extend(ids.iter().map(ToString::to_string));
-        commands.push(args);
-    }
-
-    if let Err((_, error)) = run_tag_commands(&state, commands).await {
-        return serde_json::json!({ "success": false, "error": error }).into();
+        if let Err((_, error)) = apply_tag_change(
+            &state,
+            &ids,
+            crate::application::TagAction::Add,
+            tags_to_add,
+        )
+        .await
+        .and_then(|result| ensure_all_ids_found(&result).map(|()| result))
+        {
+            return serde_json::json!({ "success": false, "error": error }).into();
+        }
     }
 
     serde_json::json!({ "success": true }).into()

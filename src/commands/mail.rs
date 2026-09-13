@@ -100,35 +100,54 @@ fn mail_interrupt_flag() -> Result<Arc<AtomicBool>, i32> {
 
 fn collect_all_targets() -> Vec<String> {
     let frozen_ids = narou_rs::compat::load_frozen_ids().unwrap_or_default();
-    narou_rs::db::with_database(|db| {
-        let mut ids = db.ids();
-        ids.sort_unstable();
-        Ok(ids
-            .into_iter()
-            .filter(|id| {
-                db.get(*id)
-                    .map(|record| !narou_rs::compat::record_is_frozen(record, &frozen_ids))
-                    .unwrap_or(false)
-            })
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>())
-    })
-    .unwrap_or_default()
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let mut ids: Vec<i64> = novels
+        .scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
+    ids.sort_unstable();
+    ids.into_iter()
+        .filter(|id| {
+            novels
+                .get_sync((*id).into())
+                .ok()
+                .flatten()
+                .map(|record| !narou_rs::compat::record_is_frozen(&record, &frozen_ids))
+                .unwrap_or(false)
+        })
+        .map(|id| id.to_string())
+        .collect()
 }
 
 fn expand_targets(targets: &[String]) -> Vec<String> {
-    let (tag_index, all_ids) = narou_rs::db::with_database(|db| {
-        Ok::<_, narou_rs::error::NarouError>((db.tag_index(), db.ids()))
-    })
-    .unwrap_or_default();
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let all_ids: Vec<i64> = novels
+        .scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
     let mut all_sorted = all_ids;
     all_sorted.sort_unstable();
+    let tag_ids = |tag_name: &str| -> Vec<i64> {
+        let filter = narou_rs::platform::NovelFilter {
+            tag: Some(tag_name.to_string()),
+            ..Default::default()
+        };
+        novels
+            .scan_ids_sync(&filter, None, usize::MAX)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| id.0)
+            .collect()
+    };
 
     let mut expanded = Vec::new();
     for target in targets {
         if let Ok(id) = target.parse::<i64>() {
-            let exists =
-                narou_rs::db::with_database(|db| Ok(db.get(id).is_some())).unwrap_or(false);
+            let exists = novels.get_sync(id.into()).ok().flatten().is_some();
             if exists {
                 expanded.push(id.to_string());
                 continue;
@@ -136,8 +155,9 @@ fn expand_targets(targets: &[String]) -> Vec<String> {
         }
 
         if let Some(tag_name) = target.strip_prefix("^tag:") {
-            if let Some(exclude_ids) = tag_index.get(tag_name) {
-                let exclude: std::collections::HashSet<i64> = exclude_ids.iter().copied().collect();
+            let exclude: std::collections::HashSet<i64> =
+                tag_ids(tag_name).into_iter().collect();
+            if !exclude.is_empty() {
                 expanded.extend(
                     all_sorted
                         .iter()
@@ -151,7 +171,8 @@ fn expand_targets(targets: &[String]) -> Vec<String> {
         }
 
         if let Some(tag_name) = target.strip_prefix("tag:") {
-            if let Some(ids) = tag_index.get(tag_name) {
+            let ids = tag_ids(tag_name);
+            if !ids.is_empty() {
                 expanded.extend(ids.iter().map(|id| id.to_string()));
             } else {
                 expanded.push(tag_name.to_string());
@@ -159,7 +180,8 @@ fn expand_targets(targets: &[String]) -> Vec<String> {
             continue;
         }
 
-        if let Some(ids) = tag_index.get(target) {
+        let ids = tag_ids(target);
+        if !ids.is_empty() {
             expanded.extend(ids.iter().map(|id| id.to_string()));
         } else {
             expanded.push(target.clone());

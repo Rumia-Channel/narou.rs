@@ -1,6 +1,7 @@
 mod setting_override;
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,10 @@ pub struct UserConverter {
     pub before_settings: Vec<SettingOverride>,
     #[serde(default)]
     pub after_settings: Vec<SettingOverride>,
+    #[serde(skip)]
+    compiled_before: OnceLock<Vec<CompiledReplaceRule>>,
+    #[serde(skip)]
+    compiled_after: OnceLock<Vec<CompiledReplaceRule>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -111,9 +116,11 @@ impl UserConverter {
         text_type: TextType,
         _settings: &mut NovelSettings,
     ) -> String {
-        let compiled = Self::compile_rules(&self.before);
+        let compiled = self
+            .compiled_before
+            .get_or_init(|| Self::compile_rules(&self.before));
         let mut result = text.to_string();
-        for rule in &compiled {
+        for rule in compiled.iter() {
             if !rule.text_types.is_empty() {
                 let type_str = text_type_to_str(text_type);
                 if !rule.text_types.iter().any(|t| t == type_str) {
@@ -140,9 +147,11 @@ impl UserConverter {
         text_type: TextType,
         _settings: &mut NovelSettings,
     ) -> String {
-        let compiled = Self::compile_rules(&self.after);
+        let compiled = self
+            .compiled_after
+            .get_or_init(|| Self::compile_rules(&self.after));
         let mut result = text.to_string();
-        for rule in &compiled {
+        for rule in compiled.iter() {
             if !rule.text_types.is_empty() {
                 let type_str = text_type_to_str(text_type);
                 if !rule.text_types.iter().any(|t| t == type_str) {

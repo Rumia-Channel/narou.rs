@@ -46,66 +46,78 @@ fn output_csv(path: Option<&str>) -> Result<(), String> {
 }
 
 fn generate_csv() -> Result<String, String> {
-    db::with_database(|db| {
-        let frozen: HashMap<i64, serde_yaml::Value> =
-            db.inventory().load("freeze", InventoryScope::Local)?;
-        let mut ids = db.ids();
-        ids.sort_unstable();
+    let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+    let frozen: HashMap<i64, serde_yaml::Value> = narou_rs::db::with_database(|db| {
+        Ok::<HashMap<i64, serde_yaml::Value>, narou_rs::error::NarouError>(
+            db.inventory()
+                .load("freeze", InventoryScope::Local)
+                .unwrap_or_default(),
+        )
+    })
+    .map_err(|e| e.to_string())?;
+    let mut ids: Vec<i64> = novels
+        .scan_ids_sync(&narou_rs::platform::NovelFilter::all(), None, usize::MAX)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
+    ids.sort_unstable();
 
-        let mut writer = WriterBuilder::new()
-            .terminator(Terminator::Any(b'\n'))
-            .from_writer(Vec::new());
+    let mut writer = WriterBuilder::new()
+        .terminator(Terminator::Any(b'\n'))
+        .from_writer(Vec::new());
+    writer
+        .write_record([
+            "id",
+            "title",
+            "author",
+            "sitename",
+            "url",
+            "novel_type",
+            "tags",
+            "frozen",
+            "last_update",
+            "general_lastup",
+        ])
+        .map_err(|e| std::io::Error::other(e.to_string()))
+        .map_err(|e: std::io::Error| e.to_string())?;
+
+    for id in ids {
+        let Ok(Some(record)) = novels.get_sync(id.into()) else {
+            continue;
+        };
+        let is_frozen =
+            frozen.contains_key(&record.id) || record.tags.iter().any(|tag| tag == "frozen");
+        let general_lastup = record
+            .general_lastup
+            .map(|date| date.timestamp().to_string())
+            .unwrap_or_else(|| "0".to_string());
         writer
             .write_record([
-                "id",
-                "title",
-                "author",
-                "sitename",
-                "url",
-                "novel_type",
-                "tags",
-                "frozen",
-                "last_update",
-                "general_lastup",
+                record.id.to_string(),
+                record.title.clone(),
+                record.author.clone(),
+                record.sitename.clone(),
+                record.toc_url.clone(),
+                if record.novel_type == 2 {
+                    "短編".to_string()
+                } else {
+                    "連載".to_string()
+                },
+                record.tags.join(" "),
+                is_frozen.to_string(),
+                record.last_update.timestamp().to_string(),
+                general_lastup,
             ])
-            .map_err(|e| narou_rs::error::NarouError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))
+            .map_err(|e: std::io::Error| e.to_string())?;
+    }
 
-        for id in ids {
-            let Some(record) = db.get(id) else { continue };
-            let is_frozen =
-                frozen.contains_key(&record.id) || record.tags.iter().any(|tag| tag == "frozen");
-            let general_lastup = record
-                .general_lastup
-                .map(|date| date.timestamp().to_string())
-                .unwrap_or_else(|| "0".to_string());
-            writer
-                .write_record([
-                    record.id.to_string(),
-                    record.title.clone(),
-                    record.author.clone(),
-                    record.sitename.clone(),
-                    record.toc_url.clone(),
-                    if record.novel_type == 2 {
-                        "短編".to_string()
-                    } else {
-                        "連載".to_string()
-                    },
-                    record.tags.join(" "),
-                    is_frozen.to_string(),
-                    record.last_update.timestamp().to_string(),
-                    general_lastup,
-                ])
-                .map_err(|e| {
-                    narou_rs::error::NarouError::Io(std::io::Error::other(e.to_string()))
-                })?;
-        }
-
-        let bytes = writer
-            .into_inner()
-            .map_err(|e| narou_rs::error::NarouError::Io(std::io::Error::other(e.to_string())))?;
-        Ok::<String, narou_rs::error::NarouError>(String::from_utf8_lossy(&bytes).to_string())
-    })
-    .map_err(|e| e.to_string())
+    let bytes = writer
+        .into_inner()
+        .map_err(|e| std::io::Error::other(e.to_string()))
+        .map_err(|e: std::io::Error| e.to_string())?;
+    Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
 fn import_csv(path: &str) -> Result<(), String> {

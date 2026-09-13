@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use regex::Regex;
 
 use super::{ConverterBase, TextType};
@@ -7,6 +9,28 @@ const KANJI_DIGITS: &[char] = &[
     '\u{3007}', '\u{4E00}', '\u{4E8C}', '\u{4E09}', '\u{56DB}', '\u{4E94}', '\u{516D}', '\u{4E03}',
     '\u{516B}', '\u{4E5D}',
 ];
+
+static RE_NUM_RUN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\d\u{FF10}-\u{FF19},\u{FF0C}]+").unwrap());
+static RE_ASCII_DIGITS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[0-9]+").unwrap());
+static RE_DAKUTEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new("([\u{3041}-\u{3093}\u{30A1}-\u{30F6}\u{03B9}])[\u{309B}\u{FF9E}]").unwrap()
+});
+static RE_KANJI_NUM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[〇一二三四五六七八九十百千万億兆京]+").unwrap());
+static RE_KANJI_NUM_MARKER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"［＃漢数字＝(.+?)］").unwrap());
+static RE_ASCII_ALPHA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z]+").unwrap());
+static RE_ASCII_WORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"[A-Za-z0-9_.,!?'" &:;-]+"#).unwrap());
+static RE_FRACTION_DATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[0-9０-９〇一二三四五六七八九十百千万億兆京垓/／]+").unwrap()
+});
+static RE_EXCLAM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"！+").unwrap());
+static RE_EXCLAM_QUESTION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[！？]+").unwrap());
+static RE_HANKAKU_NUM_COMMA_MARKER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\u{FF3B}\u{FF03}\u{534A}\u{89D2}\u{6570}\u{5B57}\u{FF1D}(\d+)\u{FF3D}").unwrap()
+});
 
 impl ConverterBase {
     pub(super) fn hankakukana_to_zenkakukana(&self, text: &str) -> String {
@@ -38,8 +62,7 @@ impl ConverterBase {
 
     pub(super) fn convert_numbers_to_kanji(&mut self, text: &str) -> String {
         let text = self.stash_kanji_num(text);
-        let re = Regex::new(r"[\d\u{FF10}-\u{FF19},\u{FF0C}]+").unwrap();
-        let result = re
+        let result = RE_NUM_RUN
             .replace_all(&text, |caps: &regex::Captures| {
                 let num_str = &caps[0];
                 if num_str.contains(',') || num_str.contains('\u{FF0C}') {
@@ -67,8 +90,7 @@ impl ConverterBase {
     }
 
     pub(super) fn hankaku_num_to_zenkaku(&self, text: &str) -> String {
-        let re = Regex::new(r"[0-9]+").unwrap();
-        re.replace_all(text, |caps: &regex::Captures| {
+        RE_ASCII_DIGITS.replace_all(text, |caps: &regex::Captures| {
             let num = &caps[0];
             let m = caps.get(0).unwrap();
             let is_line_start = m.start() == 0 || text[..m.start()].ends_with('\n');
@@ -89,10 +111,7 @@ impl ConverterBase {
             return text.to_string();
         }
         // [ぁ-んァ-ヶι] と続く濁点記号 (U+309B 全角濁点 / U+FF9E 半角濁点)。
-        let re = Regex::new(
-            "([\u{3041}-\u{3093}\u{30A1}-\u{30F6}\u{03B9}])[\u{309B}\u{FF9E}]",
-        )
-        .unwrap();
+        let re = &*RE_DAKUTEN;
         let mut hit = false;
         let result = re
             .replace_all(text, |caps: &regex::Captures| {
@@ -118,21 +137,38 @@ impl ConverterBase {
             "\u{2161}", "\u{2162}", "\u{2163}", "\u{2165}", "\u{2166}", "\u{2167}", "\u{2168}",
             "\u{2171}", "\u{2172}", "\u{2173}", "\u{2175}", "\u{2176}", "\u{2177}", "\u{2178}",
         ];
+        static ROME_RES: [LazyLock<Regex>; 14] = [
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])II([^A-Za-z])").unwrap()),
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])III([^A-Za-z])").unwrap()),
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])IV([^A-Za-z])").unwrap()),
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])VI([^A-Za-z])").unwrap()),
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])VII([^A-Za-z])").unwrap()),
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])VIII([^A-Za-z])").unwrap()),
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])IX([^A-Za-z])").unwrap()),
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])ii([^A-Za-z])").unwrap()),
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])iii([^A-Za-z])").unwrap()),
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])iv([^A-Za-z])").unwrap()),
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])vi([^A-Za-z])").unwrap()),
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])vii([^A-Za-z])").unwrap()),
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])viii([^A-Za-z])").unwrap()),
+            LazyLock::new(|| Regex::new(r"([^A-Za-z])ix([^A-Za-z])").unwrap()),
+        ];
+
+        if !FROM.iter().any(|t| text.contains(t)) {
+            return text.to_string();
+        }
 
         let mut result = text.to_string();
-        for (from, to) in FROM.iter().zip(TO.iter()) {
-            let re = Regex::new(&format!(r"([^A-Za-z]){}([^A-Za-z])", regex::escape(from)))
-                .unwrap();
+        for (re, to) in ROME_RES.iter().zip(TO.iter()) {
             result = re.replace_all(&result, format!("$1{to}$2")).to_string();
         }
         result
     }
 
     pub(super) fn stash_kanji_num(&mut self, text: &str) -> String {
-        let re = Regex::new(r"[〇一二三四五六七八九十百千万億兆京]+").unwrap();
-        re.replace_all(text, |caps: &regex::Captures| {
+        RE_KANJI_NUM.replace_all(text, |caps: &regex::Captures| {
             let matched = caps.get(0).unwrap();
-            let prev = text[..matched.start()].chars().last();
+            let prev = text[..matched.start()].chars().next_back();
             let next = text[matched.end()..].chars().next();
             if prev.is_some_and(is_arabic_digit) || next.is_some_and(is_arabic_digit) {
                 return matched.as_str().to_string();
@@ -146,8 +182,7 @@ impl ConverterBase {
     }
 
     pub(super) fn convert_kanji_num_with_unit(&self, text: &str, lower_digit_zero: i64) -> String {
-        let re = Regex::new(r"[〇一二三四五六七八九十百千万億兆京]+").unwrap();
-        re.replace_all(text, |caps: &regex::Captures| {
+        RE_KANJI_NUM.replace_all(text, |caps: &regex::Captures| {
             let matched = &caps[0];
             let Some(total) = kanji_num_to_integer(matched) else {
                 return matched.to_string();
@@ -168,8 +203,7 @@ impl ConverterBase {
     }
 
     pub(super) fn rebuild_kanji_num(&self, data: &mut String) {
-        let re = Regex::new(r"［＃漢数字＝(.+?)］").unwrap();
-        *data = re
+        *data = RE_KANJI_NUM_MARKER
             .replace_all(data, |caps: &regex::Captures| {
                 let Some(index) = marker_index_to_usize(&caps[1]) else {
                     return caps[0].to_string();
@@ -184,16 +218,14 @@ impl ConverterBase {
 
     pub(super) fn alphabet_to_zenkaku(&mut self, text: &str) -> String {
         if self.settings.enable_alphabet_force_zenkaku {
-            let re = Regex::new(r"[A-Za-z]+").unwrap();
-            return re
+            return RE_ASCII_ALPHA
                 .replace_all(text, |caps: &regex::Captures| {
                     ascii_letters_to_fullwidth(&caps[0])
                 })
                 .to_string();
         }
 
-        let re = Regex::new(r#"[A-Za-z0-9_.,!?'" &:;-]+"#).unwrap();
-        re.replace_all(text, |caps: &regex::Captures| {
+        RE_ASCII_WORD.replace_all(text, |caps: &regex::Captures| {
             let word = &caps[0];
             if self.settings.disable_alphabet_word_to_zenkaku && has_ascii_alpha(word) {
                 let index = self.english_stash.len();
@@ -218,9 +250,7 @@ impl ConverterBase {
             return text.to_string();
         }
 
-        let re =
-            Regex::new(r"[0-9０-９〇一二三四五六七八九十百千万億兆京垓/／]+").unwrap();
-        re.replace_all(text, |caps: &regex::Captures| {
+        RE_FRACTION_DATE.replace_all(text, |caps: &regex::Captures| {
             let matched = &caps[0];
             let numerics: Vec<&str> = matched.split(['/', '／']).collect();
             match numerics.len() {
@@ -305,13 +335,12 @@ impl ConverterBase {
     }
 
     pub(super) fn convert_tatechuyoko(&self, text: &str) -> String {
-        let re_exclam = Regex::new(r"！+").unwrap();
-        let mut result = re_exclam
+        let mut result = RE_EXCLAM
             .replace_all(text, |caps: &regex::Captures| {
                 let matched = &caps[0];
                 let start = caps.get(0).unwrap().start();
                 let end = caps.get(0).unwrap().end();
-                let prev = text[..start].chars().last();
+                let prev = text[..start].chars().next_back();
                 let next = text[end..].chars().next();
                 if prev == Some('？') || next == Some('？') {
                     return matched.to_string();
@@ -330,8 +359,7 @@ impl ConverterBase {
             })
             .to_string();
 
-        let re_mix = Regex::new(r"[！？]+").unwrap();
-        result = re_mix
+        result = RE_EXCLAM_QUESTION
             .replace_all(&result, |caps: &regex::Captures| {
                 let matched = &caps[0];
                 match matched.chars().count() {
@@ -388,10 +416,7 @@ impl ConverterBase {
     }
 
     pub(super) fn rebuild_hankaku_num_comma(&self, data: &mut String) {
-        let re =
-            Regex::new(r"\u{FF3B}\u{FF03}\u{534A}\u{89D2}\u{6570}\u{5B57}\u{FF1D}(\d+)\u{FF3D}")
-                .unwrap();
-        *data = re
+        *data = RE_HANKAKU_NUM_COMMA_MARKER
             .replace_all(data, |caps: &regex::Captures| {
                 let idx: usize = caps[1].parse().unwrap_or(0);
                 self.hankaku_num_comma_stash

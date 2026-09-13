@@ -178,6 +178,16 @@ async fn main() {
 
     narou_rs::updater_promote::try_promote_pending_updater();
 
+    // セルフアップデート経由の再起動では updater が install_dir (exe 側) を
+    // cwd にして本体を起動する。`.narou` はライブラリ dir にあるため、
+    // 親が渡した `NAROU_RS_RESTART_CWD` へ戻してから通常処理に入る。
+    // 旧 updater でも環境変数は透過するため後方互換。
+    if let Ok(dir) = std::env::var("NAROU_RS_RESTART_CWD") {
+        if !dir.is_empty() {
+            let _ = std::env::set_current_dir(&dir);
+        }
+    }
+
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
     let global_flags = cli::preprocess_args(&mut args);
@@ -203,6 +213,10 @@ async fn main() {
         cli::inject_default_args(&mut args);
         cli::inject_command_defaults(&mut args);
     }
+
+    // 0.4.0 未満からのアップデート後の初回起動では、小説データの
+    // 一括バックアップを提案する (web/help/version 等では出さない)。
+    narou_rs::startup_backup::maybe_offer(&args[0]);
 
     let start = if show_time {
         Some(Instant::now())
@@ -266,7 +280,7 @@ async fn run_command(
         }
     };
 
-    let ua = user_agent.or(cli.user_agent);
+    let ua = user_agent.clone().or(cli.user_agent);
     logger::use_convert_log_postfix(matches!(&cli.command, Commands::Convert { .. }));
 
     match cli.command {
@@ -277,28 +291,6 @@ async fn run_command(
         } => {
             commands::web::run_web_server(port, no_browser, hide_console).await;
             0
-        }
-        other => run_sync_command(other, trace_args, ua, backtrace),
-    }
-}
-
-fn run_sync_command(
-    command: Commands,
-    trace_args: Vec<String>,
-    user_agent: Option<String>,
-    backtrace: bool,
-) -> i32 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match command {
-        Commands::Init {
-            aozora_path,
-            line_height,
-        } => {
-            if let Err(e) = commands::init::cmd_init(aozora_path.as_deref(), line_height) {
-                eprintln!("Error initializing: {}", e);
-                1
-            } else {
-                0
-            }
         }
         Commands::Download {
             targets,
@@ -319,33 +311,10 @@ fn run_sync_command(
                 freeze,
                 remove,
                 mail,
-                user_agent,
+                user_agent: ua,
             })
+            .await
         }
-        Commands::Mail { targets, force } => {
-            commands::mail::cmd_mail(commands::mail::MailOptions { targets, force });
-            0
-        }
-        Commands::Send {
-            args,
-            without_freeze,
-            force,
-            backup_bookmark,
-            restore_bookmark,
-        } => commands::send::cmd_send(commands::send::SendOptions {
-            args,
-            without_freeze,
-            force,
-            backup_bookmark,
-            restore_bookmark,
-        }),
-        Commands::Backup { targets } => match commands::backup::cmd_backup(&targets) {
-            Ok(_) => 0,
-            Err(e) => {
-                eprintln!("{}", e);
-                127
-            }
-        },
         Commands::Update {
             ids,
             force,
@@ -363,10 +332,60 @@ fn run_sync_command(
                 gl,
                 sort_by,
                 ignore_all,
-                user_agent,
-            });
+                user_agent: ua,
+            })
+            .await;
             0
         }
+        other => run_sync_command(other, trace_args, backtrace),
+    }
+}
+
+fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool) -> i32 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match command {
+        Commands::Init {
+            aozora_path,
+            line_height,
+        } => {
+            if let Err(e) = commands::init::cmd_init(aozora_path.as_deref(), line_height) {
+                eprintln!("Error initializing: {}", e);
+                1
+            } else {
+                0
+            }
+        }
+        Commands::Download { .. } | Commands::Update { .. } => unreachable!(),
+        Commands::Mail { targets, force } => {
+            commands::mail::cmd_mail(commands::mail::MailOptions { targets, force });
+            0
+        }
+        Commands::Send {
+            args,
+            without_freeze,
+            force,
+            backup_bookmark,
+            restore_bookmark,
+        } => commands::send::cmd_send(commands::send::SendOptions {
+            args,
+            without_freeze,
+            force,
+            backup_bookmark,
+            restore_bookmark,
+        }),
+        Commands::Db { action } => match commands::db::cmd_db(action) {
+            Ok(_) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                127
+            }
+        },
+        Commands::Backup { targets } => match commands::backup::cmd_backup(&targets) {
+            Ok(_) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                127
+            }
+        },
         Commands::Convert {
             mut targets,
             output,
@@ -413,6 +432,11 @@ fn run_sync_command(
             clean,
             all_clean,
             no_tool,
+            history,
+            show,
+            restore,
+            merge_from,
+            merge_sections,
         } => commands::diff::cmd_diff(commands::diff::DiffOptions {
             target,
             view_diff_version,
@@ -421,6 +445,11 @@ fn run_sync_command(
             clean,
             all_clean,
             no_tool,
+            history,
+            show,
+            restore,
+            merge_from,
+            merge_sections,
         }),
         Commands::List {
             limit,

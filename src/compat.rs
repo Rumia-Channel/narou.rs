@@ -212,10 +212,23 @@ pub fn fsync_parent_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn canonicalize_aozoraepub3_jar_dir(dir: &str) -> Option<PathBuf> {
+/// `aozoraepub3dir` 設定が指すディレクトリから変換ツールの実体を解決する。
+/// Java 版 (`AozoraEpub3.jar`) を優先し、無ければ Rust 製 Lite のバイナリ
+/// (`AozoraEpub3_Lite.exe` / `AozoraEpub3.exe`、非 Windows は拡張子なし) を受け付ける。
+pub fn canonicalize_aozoraepub3_tool_path(dir: &str) -> Option<PathBuf> {
     let canonical_dir = canonicalize_existing_path(PathBuf::from(dir))?;
     let jar = canonical_dir.join("AozoraEpub3.jar");
-    canonicalize_existing_path(jar)
+    if let Some(jar) = canonicalize_existing_path(jar) {
+        return Some(jar);
+    }
+    [
+        "AozoraEpub3_Lite.exe",
+        "AozoraEpub3.exe",
+        "AozoraEpub3_Lite",
+        "AozoraEpub3",
+    ]
+    .into_iter()
+    .find_map(|name| canonicalize_existing_path(canonical_dir.join(name)))
 }
 
 pub fn resolve_java_command_path() -> Option<PathBuf> {
@@ -252,6 +265,24 @@ pub fn resolve_java_command_path() -> Option<PathBuf> {
 }
 
 pub fn load_global_setting_value(key: &str) -> Option<serde_yaml::Value> {
+    // P2: when the SQLite state backend is active, the payload of
+    // `global_setting.yaml` lives in app_state('global', 'global_setting').
+    #[cfg(feature = "native-runtime")]
+    if !crate::native::sqlite::state::legacy_yaml_active() {
+        let narou_dir = crate::db::inventory::Inventory::with_default_root()
+            .ok()
+            .map(|inventory| inventory.root_dir().join(".narou"));
+        if let Some(state) = narou_dir.as_deref().and_then(crate::native::sqlite::state::active_for) {
+            if let Ok(Some(raw)) = state.get_raw("global", "global_setting") {
+                if let Ok(settings) =
+                    serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(&raw)
+                {
+                    return settings.get(key).cloned();
+                }
+            }
+            return None;
+        }
+    }
     let path = global_setting_path()?;
     let raw = fs::read_to_string(path).ok()?;
     let settings: HashMap<String, serde_yaml::Value> = serde_yaml::from_str(&raw).ok()?;
@@ -836,10 +867,11 @@ fn get_copy_to_directory(
         .iter()
         .any(|value| value.eq_ignore_ascii_case("site"))
     {
-        let sitename =
-            crate::db::with_database(|db| Ok(db.get(novel_id).map(|r| r.sitename.clone())))
-                .ok()
-                .flatten();
+        let sitename = crate::native::novel_repository::NativeNovelRepository::new()
+            .get_sync(novel_id.into())
+            .ok()
+            .flatten()
+            .map(|record| record.sitename);
         if let Some(sitename) = sitename.filter(|value| !value.is_empty()) {
             dir.push(sitename);
         }
@@ -971,7 +1003,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        DigestChoice, NovelLockGuard, choose_digest_action_with_auto_choices,
+        DigestChoice, NovelLockGuard, canonicalize_aozoraepub3_tool_path,
+        canonicalize_existing_path, choose_digest_action_with_auto_choices,
         configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
         load_locked_ids_from_inventory, mark_not_found_and_freeze, parse_digest_auto_choices,
         record_is_frozen, reroute_web_line_to_console, resolve_auto_convert_devices,
@@ -1219,6 +1252,7 @@ mod tests {
 
     #[test]
     fn database_parity_get_copy_to_directory_includes_site_for_zero_id() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
@@ -1249,6 +1283,7 @@ mod tests {
 
     #[test]
     fn update_auto_convert_uses_convert_multi_device_before_device_setting() {
+    let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
@@ -1385,5 +1420,41 @@ mod tests {
 
         let status = child.wait().expect("wait child");
         assert!(status.success(), "child failed: {status:?}");
+    }
+
+    #[test]
+    fn aozora_tool_path_requires_existing_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+        assert_eq!(canonicalize_aozoraepub3_tool_path(&dir), None);
+    }
+
+    #[test]
+    fn aozora_tool_path_accepts_lite_binary_when_jar_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("AozoraEpub3_Lite.exe"), b"stub").unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+
+        let resolved = canonicalize_aozoraepub3_tool_path(&dir).expect("lite binary resolved");
+
+        assert_eq!(
+            Some(resolved),
+            canonicalize_existing_path(temp.path().join("AozoraEpub3_Lite.exe"))
+        );
+    }
+
+    #[test]
+    fn aozora_tool_path_prefers_jar_over_lite_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("AozoraEpub3.jar"), b"stub jar").unwrap();
+        std::fs::write(temp.path().join("AozoraEpub3_Lite.exe"), b"stub lite").unwrap();
+        let dir = temp.path().to_string_lossy().to_string();
+
+        let resolved = canonicalize_aozoraepub3_tool_path(&dir).expect("jar resolved");
+
+        assert_eq!(
+            Some(resolved),
+            canonicalize_existing_path(temp.path().join("AozoraEpub3.jar"))
+        );
     }
 }

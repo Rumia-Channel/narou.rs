@@ -1,0 +1,876 @@
+//! Native ObjectStore and AssetStore adapters.
+//!
+//! Logical keys are mapped below the existing archive root. `novels/` is a
+//! namespace in the logical key only; the native layout remains
+//! `小説データ/<site>/<optional-subdirectory>/<title>/...`.
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use futures::StreamExt;
+
+use crate::error::{NarouError, Result};
+use crate::platform::{
+    AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
+    ObjectStore, PlatformFuture,
+};
+
+pub(crate) const MAX_SMALL_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone)]
+pub struct NativeObjectStore {
+    root: PathBuf,
+    /// Directories already known to exist this process. `create_dir_all` on
+    /// an existing path still costs a syscall per ancestor; section writes
+    /// repeat the same `本文/` parent hundreds of times per novel.
+    created_dirs: std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<PathBuf>>>,
+}
+
+impl NativeObjectStore {
+    pub fn new() -> Result<Self> {
+        let root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))?;
+        Self::from_root(root)
+    }
+
+    pub fn from_root(root: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&root)?;
+        Ok(Self {
+            root,
+            created_dirs: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn resolve_path(&self, key: &ObjectKey) -> Result<PathBuf> {
+        key.validate()?;
+        let relative = key
+            .as_ref()
+            .strip_prefix("novels/")
+            .unwrap_or_else(|| key.as_ref());
+        let relative = if key.as_ref().starts_with("novels/") {
+            relative.to_string()
+        } else {
+            format!(".objects/{relative}")
+        };
+        let candidate = self
+            .root
+            .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        crate::db::paths::ensure_within_archive_root(&candidate, &self.root)
+    }
+
+    pub(crate) fn resolve_read_path(&self, key: &ObjectKey) -> Result<PathBuf> {
+        let exact = self.resolve_path(key)?;
+        if exact.exists() {
+            return Ok(exact);
+        }
+
+        // Existing narou.rb layouts sometimes changed only the subtitle part
+        // of a section filename. Keep that fallback native-only; normal core
+        // paths always use the canonical ObjectKey generated from the TOC.
+        let Some(parent) = exact.parent() else {
+            return Ok(exact);
+        };
+        if parent.file_name().and_then(|name| name.to_str()) != Some("本文") {
+            return Ok(exact);
+        }
+        if !parent.exists() {
+            return Ok(exact);
+        }
+        let Some(filename) = exact.file_name().and_then(|name| name.to_str()) else {
+            return Ok(exact);
+        };
+        let Some(index) = filename.split_once(' ').map(|(index, _)| index) else {
+            return Ok(exact);
+        };
+        let prefix = format!("{index} ");
+        for entry in fs::read_dir(parent)?.flatten() {
+            let candidate = entry.path();
+            let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.ends_with(".yaml")
+                && (name == format!("{index}.yaml") || name.starts_with(&prefix))
+            {
+                return crate::db::paths::ensure_within_archive_root(&candidate, &self.root);
+            }
+        }
+        Ok(exact)
+    }
+
+    /// Map a listing prefix to the on-disk directory that contains every
+    /// matching object. `novels` alone covers the whole archive root;
+    /// `novels/<rest>` maps to `<root>/<rest>`; any other prefix lives under
+    /// `<root>/.objects/<prefix>` mirroring `resolve_path`.
+    pub(crate) fn resolve_prefix_dir(&self, prefix: &str) -> Result<PathBuf> {
+        let trimmed = prefix.trim_end_matches('/');
+        let relative = if trimmed.is_empty() || trimmed == "novels" {
+            String::new()
+        } else if let Some(rest) = trimmed.strip_prefix("novels/") {
+            rest.to_string()
+        } else {
+            format!(".objects/{trimmed}")
+        };
+        let candidate = if relative.is_empty() {
+            self.root.clone()
+        } else {
+            self.root
+                .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
+        };
+        crate::db::paths::ensure_within_archive_root(&candidate, &self.root)
+    }
+
+    pub(crate) fn metadata_for_path(&self, key: &ObjectKey, path: &Path) -> Result<Option<ObjectMetadata>> {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let last_modified = metadata
+            .modified()
+            .ok()
+            .map(chrono::DateTime::<chrono::Utc>::from);
+        Ok(Some(ObjectMetadata {
+            key: key.clone(),
+            size: metadata.len(),
+            etag: None,
+            content_type: content_type_for_path(path),
+            last_modified,
+        }))
+    }
+
+    /// `create_dir_all` with a per-store memo: the first write under a novel
+    /// directory pays the syscall, subsequent writes to the same parent skip
+    /// it entirely.
+    pub(crate) fn ensure_parent_dir(&self, path: &Path) -> Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| NarouError::Platform(format!("object has no parent: {}", path.display())))?;
+        if self.created_dirs.lock().contains(parent) {
+            return Ok(());
+        }
+        fs::create_dir_all(parent)?;
+        self.created_dirs.lock().insert(parent.to_path_buf());
+        Ok(())
+    }
+
+    fn write_small_blocking(&self, key: &ObjectKey, data: Vec<u8>) -> Result<()> {
+        if data.len() as u64 > MAX_SMALL_OBJECT_BYTES {
+            return Err(NarouError::Platform(format!(
+                "small object exceeds {} bytes: {key}",
+                MAX_SMALL_OBJECT_BYTES
+            )));
+        }
+        let path = self.resolve_path(key)?;
+        self.ensure_parent_dir(&path)?;
+        atomic_write_bytes(&path, &data)
+    }
+
+
+    /// Write without the small-object cap. Used by the SQLite store's
+    /// filesystem mirror and by the one-shot legacy import, where payloads
+    /// (EPUB, large sections) may exceed `MAX_SMALL_OBJECT_BYTES`.
+    pub(crate) fn write_bytes_blocking(&self, key: &ObjectKey, data: &[u8]) -> Result<()> {
+        let path = self.resolve_path(key)?;
+        self.ensure_parent_dir(&path)?;
+        atomic_write_bytes(&path, data)
+    }
+
+    pub(crate) fn recursive_files(root: &Path, current: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(current)? {
+            let entry = entry?;
+            let path = entry.path();
+            let safe_path = crate::db::paths::ensure_within_archive_root(&path, root)?;
+            if safe_path.is_dir() {
+                Self::recursive_files(root, &safe_path, output)?;
+            } else if safe_path.is_file() {
+                output.push(safe_path);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn logical_key_for_native_path(root: &Path, path: &Path) -> Option<ObjectKey> {
+    let relative = path
+        .strip_prefix(root)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    if let Some(object_relative) = relative.strip_prefix(".objects/") {
+        ObjectKey::try_new(object_relative.to_string()).ok()
+    } else {
+        ObjectKey::try_new(format!("novels/{relative}")).ok()
+    }
+}
+
+pub(crate) fn run_blocking<T, F>(operation: F) -> PlatformFuture<'static, Result<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(operation)
+                .await
+                .map_err(|error| NarouError::Platform(error.to_string()))?
+        })
+    } else {
+        Box::pin(async move { operation() })
+    }
+}
+
+pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| NarouError::Platform(format!("object has no parent: {}", path.display())))?;
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = parent.join(format!(
+        ".narou-object-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    {
+        let mut file = fs::File::create(&temp_path)?;
+        // Chunked writes keep a single oversized buffer from being handed to
+        // one write(2) call; some filesystems short-write large buffers.
+        for chunk in data.chunks(1024 * 1024) {
+            file.write_all(chunk)?;
+        }
+        file.sync_all()?;
+    }
+    // std::fs::rename replaces an existing destination atomically on every
+    // supported platform (rename(2) on Unix, MoveFileExW with
+    // MOVEFILE_REPLACE_EXISTING on Windows). A preceding exists+remove would
+    // only open a window where the destination is missing.
+    fs::rename(temp_path, path)?;
+    Ok(())
+}
+
+pub(crate) fn content_type_for_path(path: &Path) -> Option<String> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("yaml" | "yml") => Some("application/yaml".to_string()),
+        Some("ini" | "txt") => Some("text/plain; charset=utf-8".to_string()),
+        Some("html") => Some("text/html; charset=utf-8".to_string()),
+        Some("jpg" | "jpeg") => Some("image/jpeg".to_string()),
+        Some("png") => Some("image/png".to_string()),
+        Some("gif") => Some("image/gif".to_string()),
+        Some("webp") => Some("image/webp".to_string()),
+        Some("epub") => Some("application/epub+zip".to_string()),
+        Some("zip") => Some("application/zip".to_string()),
+        _ => None,
+    }
+}
+
+impl ObjectStore for NativeObjectStore {
+    fn stat<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+        let this = self.clone();
+        let key = key.clone();
+        run_blocking(move || {
+            let path = this.resolve_read_path(&key)?;
+            this.metadata_for_path(&key, &path)
+        })
+    }
+
+    fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+        let this = self.clone();
+        let key = key.clone();
+        run_blocking(move || {
+            use std::io::Read;
+            let path = this.resolve_read_path(&key)?;
+            // Open first, then fstat the handle: a path-based metadata check
+            // followed by a separate open would race a swap for a larger file.
+            let file = match fs::File::open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None)
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Ok(None);
+            }
+            if metadata.len() > MAX_SMALL_OBJECT_BYTES {
+                return Err(NarouError::Platform(format!(
+                    "small object exceeds {} bytes: {key}",
+                    MAX_SMALL_OBJECT_BYTES
+                )));
+            }
+            // Read at most limit+1 so a file that grew between fstat and read
+            // is still rejected instead of silently truncated.
+            let mut data = Vec::with_capacity(metadata.len() as usize);
+            file.take(MAX_SMALL_OBJECT_BYTES + 1).read_to_end(&mut data)?;
+            if data.len() as u64 > MAX_SMALL_OBJECT_BYTES {
+                return Err(NarouError::Platform(format!(
+                    "small object exceeds {} bytes: {key}",
+                    MAX_SMALL_OBJECT_BYTES
+                )));
+            }
+            Ok(Some(data))
+        })
+    }
+
+    fn write_small<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        data: Vec<u8>,
+    ) -> PlatformFuture<'a, Result<()>> {
+        let this = self.clone();
+        let key = key.clone();
+        run_blocking(move || this.write_small_blocking(&key, data))
+    }
+
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+        let this = self.clone();
+        let key = key.clone();
+        run_blocking(move || {
+            let path = this.resolve_path(&key)?;
+            match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
+
+    fn list_page<'a>(
+        &'a self,
+        request: &'a ObjectListRequest,
+    ) -> PlatformFuture<'a, Result<ObjectListPage>> {
+        let this = self.clone();
+        let request = request.clone();
+        run_blocking(move || {
+            // Walk only the subtree that can contain matching keys instead of
+            // the whole archive: a novel-scoped prefix resolves to that
+            // novel's directory, so a per-novel LIST no longer scans every
+            // library entry.
+            let prefix_dir = this.resolve_prefix_dir(request.prefix.as_ref())?;
+            let mut paths = Vec::new();
+            if prefix_dir.is_dir() {
+                Self::recursive_files(&this.root, &prefix_dir, &mut paths)?;
+            }
+            let mut objects = paths
+
+                .into_iter()
+                .filter_map(|path| {
+                    let key = logical_key_for_native_path(&this.root, &path)?;
+                    if !request.prefix.matches(&key) {
+                        return None;
+                    }
+                    this.metadata_for_path(&key, &path).ok().flatten()
+                })
+                .collect::<Vec<_>>();
+            objects.sort_by(|left, right| left.key.cmp(&right.key));
+            let start = request
+                .cursor
+                .as_deref()
+                .map(|cursor| {
+                    objects
+                        .iter()
+                        .position(|item| item.key.as_ref() > cursor)
+                        .unwrap_or(objects.len())
+                })
+                .unwrap_or(0);
+            let end = (start + request.limit.get()).min(objects.len());
+            let page = objects[start.min(objects.len())..end].to_vec();
+            let next_cursor = if end < objects.len() {
+                page.last().map(|item| item.key.as_ref().to_string())
+            } else {
+                None
+            };
+            Ok(ObjectListPage {
+                objects: page,
+                next_cursor,
+            })
+        })
+    }
+}
+
+impl AssetStore for NativeObjectStore {
+    fn stat<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+        ObjectStore::stat(self, key)
+    }
+
+    fn read_stream<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
+        let this = self.clone();
+        let key = key.clone();
+        Box::pin(async move {
+            let path = run_blocking(move || {
+                let path = this.resolve_read_path(&key)?;
+                match fs::metadata(&path) {
+                    Ok(metadata) if metadata.is_file() => Ok(Some(path)),
+                    Ok(_) => Ok(None),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error.into()),
+                }
+            })
+            .await?;
+            let Some(path) = path else {
+                return Ok(None);
+            };
+            let file = tokio::fs::File::open(path).await?;
+            let stream: AssetStream =
+                Box::pin(futures::stream::unfold(file, |mut file| async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut chunk = vec![0_u8; 64 * 1024];
+                    match file.read(&mut chunk).await {
+                        Ok(0) => None,
+                        Ok(size) => {
+                            chunk.truncate(size);
+                            Some((Ok(chunk), file))
+                        }
+                        Err(error) => Some((Err(NarouError::Io(error)), file)),
+                    }
+                }));
+            Ok(Some(stream))
+        })
+    }
+
+    fn write_stream<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        mut stream: AssetStream,
+    ) -> PlatformFuture<'a, Result<()>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let path = run_blocking({
+                let this = this.clone();
+                let key = key.clone();
+                move || this.resolve_path(&key)
+            })
+            .await?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| NarouError::Platform(format!("asset has no parent: {key}")))?
+                .to_path_buf();
+            run_blocking({
+                let this = this.clone();
+                let parent = parent.clone();
+                move || {
+                    // ensure_parent_dir takes the file path; pass a synthetic
+                    // child so the parent itself is the directory memoized.
+                    this.ensure_parent_dir(&parent.join(".narou-dir"))
+                }
+            })
+            .await?;
+            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let temp_path = parent.join(format!(
+                ".narou-asset-{}-{sequence}.tmp",
+                std::process::id()
+            ));
+            let mut file = tokio::fs::File::create(&temp_path).await?;
+            while let Some(chunk) = stream.next().await {
+                use tokio::io::AsyncWriteExt;
+                file.write_all(&chunk?).await?;
+            }
+            file.sync_all().await?;
+            // Same rationale as atomic_write_bytes: rename already replaces
+            // the destination atomically; removing first only opens a gap.
+            tokio::fs::rename(temp_path, path).await?;
+            Ok(())
+        })
+    }
+
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+        ObjectStore::delete(self, key)
+    }
+
+    fn copy<'a>(
+        &'a self,
+        source: &'a ObjectKey,
+        destination: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<()>> {
+        let this = self.clone();
+        let source = source.clone();
+        let destination = destination.clone();
+        run_blocking(move || {
+            let source = this.resolve_read_path(&source)?;
+            let destination = this.resolve_path(&destination)?;
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(source, destination)?;
+            Ok(())
+        })
+    }
+
+    fn move_or_copy<'a>(
+        &'a self,
+        source: &'a ObjectKey,
+        destination: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<()>> {
+        let this = self.clone();
+        let source_key = source.clone();
+        let destination_key = destination.clone();
+        run_blocking(move || {
+            let source = this.resolve_read_path(&source_key)?;
+            let destination = this.resolve_path(&destination_key)?;
+            if !source.exists() {
+                return Ok(());
+            }
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            match fs::rename(&source, &destination) {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    fs::copy(&source, &destination)?;
+                    fs::remove_file(source)?;
+                    Ok(())
+                }
+            }
+        })
+    }
+}
+
+/// Native object storage selected by the storage backend marker.
+///
+/// `Yaml` mode keeps the pure-filesystem store; `Sqlite` mode wraps the
+/// `objects`/`object_chunks` tables with a filesystem mirror so rollback and
+/// narou.rb reads keep working without an export step.
+#[derive(Debug, Clone)]
+pub enum NativeStore {
+    Fs(NativeObjectStore),
+    Sqlite(crate::native::sqlite::object_store::SqliteObjectStore),
+}
+
+impl NativeStore {
+    /// Resolve the store for the library rooted at `narou_root` (the
+    /// directory that contains `.narou`). Falls back to the filesystem store
+    /// when SQLite is unavailable or not opted in.
+    pub fn for_narou_root(narou_root: &Path) -> Result<Self> {
+        let archive_root = narou_root.join(crate::downloader::types::ARCHIVE_ROOT_DIR);
+        let mirror = NativeObjectStore::from_root(archive_root)?;
+        let narou_dir = narou_root.join(".narou");
+        if let Some(state) = crate::native::sqlite::state::active_for(&narou_dir) {
+            return Ok(Self::Sqlite(
+                crate::native::sqlite::object_store::SqliteObjectStore::new(
+                    state.conn_ref().clone(),
+                    mirror,
+                ),
+            ));
+        }
+        Ok(Self::Fs(mirror))
+    }
+
+    /// Resolve using the process-wide database root (same lookup
+    /// `NativeObjectStore::new` performs).
+    pub fn for_current_root() -> Result<Self> {
+        let root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))?;
+        let narou_root = root
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::for_narou_root(&narou_root)
+    }
+}
+
+impl ObjectStore for NativeStore {
+    fn stat<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+        match self {
+            NativeStore::Fs(store) => ObjectStore::stat(store, key),
+            NativeStore::Sqlite(store) => ObjectStore::stat(store, key),
+        }
+    }
+
+    fn read_small<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<Vec<u8>>>> {
+        match self {
+            NativeStore::Fs(store) => store.read_small(key),
+            NativeStore::Sqlite(store) => store.read_small(key),
+        }
+    }
+
+    fn write_small<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        data: Vec<u8>,
+    ) -> PlatformFuture<'a, Result<()>> {
+        match self {
+            NativeStore::Fs(store) => store.write_small(key, data),
+            NativeStore::Sqlite(store) => store.write_small(key, data),
+        }
+    }
+
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+        match self {
+            NativeStore::Fs(store) => ObjectStore::delete(store, key),
+            NativeStore::Sqlite(store) => ObjectStore::delete(store, key),
+        }
+    }
+
+    fn list_page<'a>(
+        &'a self,
+        request: &'a ObjectListRequest,
+    ) -> PlatformFuture<'a, Result<ObjectListPage>> {
+        match self {
+            NativeStore::Fs(store) => store.list_page(request),
+            NativeStore::Sqlite(store) => store.list_page(request),
+        }
+    }
+}
+
+impl AssetStore for NativeStore {
+    fn stat<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+        match self {
+            NativeStore::Fs(store) => AssetStore::stat(store, key),
+            NativeStore::Sqlite(store) => AssetStore::stat(store, key),
+        }
+    }
+
+    fn read_stream<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<AssetStream>>> {
+        match self {
+            NativeStore::Fs(store) => store.read_stream(key),
+            NativeStore::Sqlite(store) => store.read_stream(key),
+        }
+    }
+
+    fn write_stream<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+        stream: AssetStream,
+    ) -> PlatformFuture<'a, Result<()>> {
+        match self {
+            NativeStore::Fs(store) => store.write_stream(key, stream),
+            NativeStore::Sqlite(store) => store.write_stream(key, stream),
+        }
+    }
+
+    fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+        match self {
+            NativeStore::Fs(store) => AssetStore::delete(store, key),
+            NativeStore::Sqlite(store) => AssetStore::delete(store, key),
+        }
+    }
+
+    fn copy<'a>(
+        &'a self,
+        source: &'a ObjectKey,
+        destination: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<()>> {
+        match self {
+            NativeStore::Fs(store) => store.copy(source, destination),
+            NativeStore::Sqlite(store) => store.copy(source, destination),
+        }
+    }
+
+    fn move_or_copy<'a>(
+        &'a self,
+        source: &'a ObjectKey,
+        destination: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<()>> {
+        match self {
+            NativeStore::Fs(store) => store.move_or_copy(source, destination),
+            NativeStore::Sqlite(store) => store.move_or_copy(source, destination),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::ObjectStore;
+
+    #[test]
+    fn native_store_maps_logical_novel_keys_to_existing_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let keys = crate::platform::NovelObjectKeys::new("site", "n1234ab", true).unwrap();
+        let key = keys.toc();
+        futures::executor::block_on(store.write_small(&key, b"title: test\n".to_vec())).unwrap();
+        assert!(
+            root.path()
+                .join("site")
+                .join("12")
+                .join("n1234ab")
+                .join("toc.yaml")
+                .exists()
+        );
+        assert_eq!(
+            futures::executor::block_on(store.read_small(&key))
+                .unwrap()
+                .unwrap(),
+            b"title: test\n"
+        );
+    }
+
+    #[test]
+    fn native_store_rejects_escape_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let _store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        assert!(ObjectKey::try_new("novels/../escape").is_err());
+    }
+
+    #[test]
+    fn native_store_preserves_all_novel_object_layouts() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let keys = crate::platform::NovelObjectKeys::new("site", "n1234ab", true).unwrap();
+        let subtitle = "第一話";
+        let section = keys.section("1", subtitle);
+        let raw = keys.raw_section("1", subtitle);
+        let setting = keys.setting();
+        let replace = keys.replace();
+        let cache = keys.illustration_cache();
+        let illustration = keys.illustration("abc.png").unwrap();
+
+        futures::executor::block_on(async {
+            for (key, value) in [
+                (keys.toc(), b"toc".as_slice()),
+                (section.clone(), b"section".as_slice()),
+                (raw.clone(), b"raw".as_slice()),
+                (setting.clone(), b"setting".as_slice()),
+                (replace.clone(), b"replace".as_slice()),
+                (cache.clone(), b"cache".as_slice()),
+                (illustration.clone(), b"png".as_slice()),
+            ] {
+                store.write_small(&key, value.to_vec()).await.unwrap();
+            }
+            let prefix = crate::platform::ObjectPrefix::new(keys.prefix().to_string()).unwrap();
+            let page = store
+                .list_page(&crate::platform::ObjectListRequest::new(
+                    prefix,
+                    std::num::NonZeroUsize::new(3).unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(page.objects.len(), 3);
+            assert!(page.next_cursor.is_some());
+        });
+
+        let novel_dir = root.path().join("site").join("12").join("n1234ab");
+        assert!(novel_dir.join("toc.yaml").is_file());
+        assert!(novel_dir.join("本文").join("1 第一話.yaml").is_file());
+        assert!(novel_dir.join("raw").join("1 第一話.html").is_file());
+        assert!(novel_dir.join("setting.ini").is_file());
+        assert!(novel_dir.join("replace.txt").is_file());
+        assert!(novel_dir.join(".illustration_cache.yaml").is_file());
+        assert!(novel_dir.join("挿絵").join("abc.png").is_file());
+    }
+
+    #[test]
+    fn native_store_lists_non_novel_logical_objects() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let key = ObjectKey::try_new("generated/epub/book.epub").unwrap();
+        futures::executor::block_on(store.write_small(&key, b"epub".to_vec())).unwrap();
+        let prefix = crate::platform::ObjectPrefix::new("generated").unwrap();
+        let page =
+            futures::executor::block_on(store.list_page(&crate::platform::ObjectListRequest::new(
+                prefix,
+                std::num::NonZeroUsize::new(10).unwrap(),
+            )))
+            .unwrap();
+        assert_eq!(page.objects[0].key, key);
+        assert_eq!(
+            std::fs::read(
+                root.path()
+                    .join(".objects")
+                    .join("generated")
+                    .join("epub")
+                    .join("book.epub")
+            )
+            .unwrap(),
+            b"epub"
+        );
+    }
+
+    #[test]
+    fn native_store_cursor_skips_deleted_cursor_object() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let first = ObjectKey::try_new("generated/a.bin").unwrap();
+        let second = ObjectKey::try_new("generated/b.bin").unwrap();
+        let third = ObjectKey::try_new("generated/c.bin").unwrap();
+        futures::executor::block_on(async {
+            for key in [&first, &second, &third] {
+                store.write_small(key, b"data".to_vec()).await.unwrap();
+            }
+            let prefix = crate::platform::ObjectPrefix::new("generated").unwrap();
+            let page = store
+                .list_page(&crate::platform::ObjectListRequest::new(
+                    prefix.clone(),
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let cursor = page.next_cursor.clone().unwrap();
+            assert_eq!(page.objects[0].key, first);
+            ObjectStore::delete(&store, &first).await.unwrap();
+            let page = store
+                .list_page(
+                    &crate::platform::ObjectListRequest::new(
+                        prefix,
+                        std::num::NonZeroUsize::new(1).unwrap(),
+                    )
+                    .after(cursor),
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.objects[0].key, second);
+        });
+    }
+
+    #[test]
+    fn native_store_loads_existing_layout_without_migration() {
+        let root = tempfile::tempdir().unwrap();
+        let novel_dir = root.path().join("site").join("12").join("n1234ab");
+        std::fs::create_dir_all(novel_dir.join("本文")).unwrap();
+        std::fs::write(novel_dir.join("本文").join("1 旧題.yaml"), b"legacy").unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let keys = crate::platform::NovelObjectKeys::new("site", "n1234ab", true).unwrap();
+        let subtitle = crate::downloader::SubtitleInfo {
+            index: "1".to_string(),
+            href: String::new(),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: "新題".to_string(),
+            file_subtitle: "新題".to_string(),
+            subdate: String::new(),
+            subupdate: None,
+            download_time: None,
+        };
+        let loaded = futures::executor::block_on(
+            store.read_small(&keys.section(&subtitle.index, &subtitle.file_subtitle)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(loaded, b"legacy");
+    }
+
+    #[test]
+    fn missing_section_parent_is_a_cache_miss() {
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::from_root(root.path().to_path_buf()).unwrap();
+        let keys = crate::platform::NovelObjectKeys::new("site", "n1234ab", true).unwrap();
+        let section = keys.section("1", "第一話");
+
+        let result = futures::executor::block_on(store.read_small(&section)).unwrap();
+        assert!(result.is_none());
+    }
+}

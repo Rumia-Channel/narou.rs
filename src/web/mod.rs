@@ -3,6 +3,7 @@ pub mod feature_tour;
 pub mod frontend;
 pub mod global_settings;
 pub mod jobs;
+pub mod library_backup;
 pub mod misc;
 pub mod novel_settings;
 pub mod novels;
@@ -29,15 +30,14 @@ use tokio::task::JoinHandle;
 
 pub(crate) const MAX_WEB_TARGETS_PER_REQUEST: usize = 100_000;
 
-/// Effective per-request target cap. Reads `server-max-targets-per-request`
-/// from `~/.narousetting/global_setting.yaml` if present (must be > 0),
-/// otherwise falls back to [`MAX_WEB_TARGETS_PER_REQUEST`].
-pub(crate) fn max_web_targets_per_request() -> usize {
-    crate::compat::load_global_setting_value("server-max-targets-per-request")
-        .and_then(|v| v.as_u64())
-        .filter(|&n| n > 0)
-        .map(|n| n as usize)
-        .unwrap_or(MAX_WEB_TARGETS_PER_REQUEST)
+/// Effective per-request target cap, resolved through the application
+/// settings port.
+pub(crate) async fn max_web_targets_per_request(state: &AppState) -> usize {
+    state
+        .services
+        .settings
+        .web_target_limit(MAX_WEB_TARGETS_PER_REQUEST)
+        .await
 }
 pub(crate) const MAX_WEB_TAGS_PER_REQUEST: usize = 128;
 pub(crate) const MAX_WEB_TARGET_LENGTH: usize = 4096;
@@ -49,11 +49,12 @@ pub(crate) const MAX_WEB_PAGE_LENGTH: u64 = 500;
 pub(crate) const MAX_WEB_SEARCH_BYTES: usize = 4096;
 pub const INTERNAL_CONTROL_HEADER: &str = "x-narou-internal-token";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
     pub port: u16,
     pub ws_port: u16,
     pub push_server: Arc<push::PushServer>,
+    pub services: Arc<crate::application::AppServices>,
     pub basic_auth_header: Option<String>,
     pub control_token: String,
     pub allowed_request_hosts: Vec<String>,
@@ -64,16 +65,76 @@ pub struct AppState {
     pub running_jobs: Arc<parking_lot::Mutex<Vec<crate::queue::QueueJob>>>,
     pub running_child_pids: Arc<parking_lot::Mutex<std::collections::HashMap<String, u32>>>,
     pub cancelled_job_ids: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pub library_backup: Arc<library_backup::LibraryBackupState>,
     pub auto_update_scheduler: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
 }
 
-pub(crate) fn non_external_console_target() -> &'static str {
-    if crate::compat::load_local_setting_bool("concurrency") {
-        "stdout2"
-    } else {
-        "stdout"
-    }
+#[cfg(test)]
+pub(crate) fn default_app_services(
+    novels: Arc<dyn crate::platform::NovelRepository>,
+) -> Arc<crate::application::AppServices> {
+    let objects: Arc<dyn crate::platform::ObjectStore> =
+        Arc::new(crate::platform::mocks::MemoryObjectStore::new());
+    let freeze_store: Arc<dyn crate::application::FreezeStore> =
+        Arc::new(crate::application::SystemFreezeStore);
+    let library = Arc::new(crate::application::LibraryService::new(
+        novels.clone(),
+        Arc::new(crate::platform::clock::SystemClock),
+        freeze_store.clone(),
+        Arc::new(crate::application::EmptySiteTimezoneProvider),
+    ));
+    let actions = Arc::new(crate::application::NovelActionService::new(
+        novels.clone(),
+        freeze_store,
+        Arc::new(crate::application::NoopFreezeMutationStore),
+        Some(objects.clone()),
+    ));
+    let settings_store: Arc<dyn crate::application::SettingsStore> =
+        Arc::new(crate::application::MemorySettingsStore::new());
+    let settings = Arc::new(crate::application::SettingsService::new(settings_store));
+    let novel_settings = Arc::new(crate::application::NovelSettingsService::new(
+        novels.clone(),
+        objects.clone(),
+    ));
+    let content = Arc::new(crate::application::NovelContentService::new(
+        novels,
+        objects,
+    ));
+    let tag_colors = Arc::new(crate::application::TagColorService::new(Arc::new(
+        crate::application::MemoryTagColorStore::default(),
+    )));
+    let scheduler = Arc::new(crate::application::SchedulerService::new(Arc::new(
+        crate::platform::clock::SystemClock,
+    )));
+    Arc::new(crate::application::AppServices::new(
+        crate::application::AppServiceDependencies {
+            library,
+            novel_actions: actions,
+            novel_settings,
+            content,
+            settings,
+            tag_colors,
+            jobs: Arc::new(crate::application::JobService),
+            scheduler,
+            site_definitions: Arc::new(crate::application::EmptySiteDefinitionProvider),
+            self_update: Arc::new(crate::application::NoopSelfUpdateService),
+            web_actions: Arc::new(crate::application::EmptyWebActionService),
+        },
+    ))
 }
+pub(crate) async fn configured_tag_color(state: &AppState) -> Option<String> {
+    state
+        .services
+        .settings
+        .get(crate::tag_colors::NEW_TAG_COLOR_SETTING)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| crate::tag_colors::is_valid_tag_color(value))
+}
+
 
 pub(crate) fn normalize_web_device_override(value: Option<&str>) -> Result<Option<String>, String> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -517,6 +578,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/feature_tour/all", get(feature_tour::all))
         .route("/api/feature_tour/seen", post(feature_tour::mark_seen))
         .route("/api/feature_tour/config", post(feature_tour::configure))
+        .route("/api/storage/mode", get(feature_tour::storage_mode_get).post(feature_tour::storage_mode_set))
         .route("/api/webui/config", get(misc::webui_config))
         .route("/api/tag_list", get(misc::tag_list))
         .route("/api/tag/change_color", post(misc::tag_change_color))
@@ -588,6 +650,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/diff", post(jobs::api_diff))
         .route("/api/diff_clean", post(jobs::api_diff_clean))
+        .route("/api/diff_history", get(jobs::api_diff_history))
+        .route("/api/diff_show", get(jobs::api_diff_show))
+        .route("/api/diff_restore", post(jobs::api_diff_restore))
+        .route("/api/diff_merge", post(jobs::api_diff_merge))
         .route("/api/csv/import", post(jobs::api_csv_import))
         .route("/api/csv/download", get(jobs::api_csv_download))
         .route(
@@ -617,6 +683,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/shutdown", post(jobs::api_shutdown))
         .route("/api/reboot", post(jobs::api_reboot))
         .route("/api/update/start", post(update::api_update_start))
+        .route("/api/library_backup", get(library_backup::api_library_backup_status))
+        .route("/api/library_backup", post(library_backup::api_library_backup))
         .route("/settings", get(frontend::settings_page))
         .route("/help", get(frontend::help_page))
         .route("/about", get(frontend::about_page))
@@ -744,6 +812,9 @@ mod tests {
             port: 8080,
             ws_port: 8081,
             push_server: Arc::new(push_server),
+            services: super::default_app_services(Arc::new(
+                crate::platform::mocks::MemoryNovelRepository::new(),
+            )),
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
             allowed_request_hosts: vec!["127.0.0.1".to_string(), "localhost".to_string()],
@@ -753,6 +824,7 @@ mod tests {
             ),
             restore_prompt_pending: Arc::new(AtomicBool::new(false)),
             restorable_tasks_available: Arc::new(AtomicBool::new(false)),
+            library_backup: Arc::new(crate::web::library_backup::LibraryBackupState::new()),
             running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
             running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             cancelled_job_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
@@ -768,6 +840,9 @@ mod tests {
             port: 8080,
             ws_port: 8081,
             push_server: Arc::new(push_server),
+            services: super::default_app_services(Arc::new(
+                crate::platform::mocks::MemoryNovelRepository::new(),
+            )),
             basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
             control_token: "control-token".to_string(),
             allowed_request_hosts: extra_hosts,
@@ -777,6 +852,7 @@ mod tests {
             ),
             restore_prompt_pending: Arc::new(AtomicBool::new(false)),
             restorable_tasks_available: Arc::new(AtomicBool::new(false)),
+            library_backup: Arc::new(crate::web::library_backup::LibraryBackupState::new()),
             running_jobs: Arc::new(parking_lot::Mutex::new(Vec::new())),
             running_child_pids: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             cancelled_job_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),

@@ -62,23 +62,25 @@ pub fn cmd_backup(targets: &[String]) -> Result<()> {
             continue;
         };
 
-        let (record, novel_dir) = narou_rs::db::with_database_mut(|db| {
-            let record = db
-                .get(data.id)
-                .cloned()
-                .ok_or_else(|| NarouError::NotFound(format!("ID: {}", data.id)))?;
-            let novel_dir = narou_rs::db::existing_novel_dir_for_record(db.archive_root(), &record);
-            if novel_dir.exists() {
-                return Ok((record, novel_dir));
-            }
-
-            db.remove(data.id);
-            db.save()?;
-            Err(NarouError::NotFound(format!(
+        let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
+        let record = novels
+            .get_sync(data.id.into())
+            .map_err(|e| NarouError::Database(e.to_string()))?
+            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", data.id)))?;
+        let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+            .map_err(|e| NarouError::Database(e.to_string()))?;
+        let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
+        if !novel_dir.exists() {
+            novels
+                .apply_batch_sync(vec![narou_rs::platform::NovelMutation::Remove(
+                    data.id.into(),
+                )])
+                .map_err(|e| NarouError::Database(e.to_string()))?;
+            return Err(NarouError::NotFound(format!(
                 "{} が見つかりません。\n保存フォルダが消去されていたため、データベースのインデックスを削除しました。",
                 novel_dir.display()
-            )))
-        })?;
+            )));
+        }
 
         println!("ID:{}　{}", data.id, data.title);
         print!("バックアップを作成しています");

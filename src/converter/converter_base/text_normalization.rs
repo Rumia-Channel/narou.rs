@@ -1,7 +1,36 @@
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
 use regex::Regex;
 
 use super::{ConverterBase, TextType};
 use crate::converter::device::Device;
+
+static RE_AUTO_JOIN_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"([^、])、\n　([^「『\(（【<＜〈《≪・■…‥―　１-９一-九])").unwrap()
+});
+static RE_COMMENTS_BLOCK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^-{5,}.*$").unwrap());
+static RE_KUTEN_KAKKO: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\u{3002}\u{300D}").unwrap());
+static RE_KUTEN_NIJU_KAKKO: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\u{3002}\u{300F}").unwrap());
+static RE_KUTEN_PAREN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\u{3002}\u{FF09}").unwrap());
+static RE_KUTEN_SPACE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\u{3002}\u{3000}").unwrap());
+static RE_HORIZONTAL_ELLIPSIS_TARGETS: [LazyLock<Regex>; 4] = [
+    LazyLock::new(|| Regex::new("\u{30FB}{3,}").unwrap()),
+    LazyLock::new(|| Regex::new("\u{3002}{3,}").unwrap()),
+    LazyLock::new(|| Regex::new("\u{3001}{3,}").unwrap()),
+    LazyLock::new(|| Regex::new("\u{FF0E}{3,}").unwrap()),
+];
+static RE_BRACKET_LINE_BREAK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"([…―])\n").unwrap());
+static RE_KAGI_BRACKET: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"［＃かぎ括弧＝(\d+)］").unwrap());
+static RE_ELLIPSIS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{2026}+").unwrap());
+static RE_DITTO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{2025}+").unwrap());
 
 impl ConverterBase {
     pub(super) fn rstrip_all_lines(&self, text: &str) -> String {
@@ -81,13 +110,11 @@ impl ConverterBase {
     }
 
     pub(super) fn auto_join_line(&self, text: &str) -> String {
-        let re = Regex::new(r"([^、])、\n　([^「『\(（【<＜〈《≪・■…‥―　１-９一-九])").unwrap();
-        re.replace_all(text, "$1、$2").to_string()
+        RE_AUTO_JOIN_LINE.replace_all(text, "$1、$2").to_string()
     }
 
     pub(super) fn erase_comments_block(&self, text: &str) -> String {
-        let re = Regex::new(r"(?m)^-{5,}.*$").unwrap();
-        re.replace_all(text, "").to_string()
+        RE_COMMENTS_BLOCK.replace_all(text, "").to_string()
     }
 
     pub(super) fn convert_page_break(&self, text: &str) -> String {
@@ -104,40 +131,35 @@ impl ConverterBase {
     pub(super) fn convert_novel_rule(&self, text: &str) -> String {
         let mut result = text.to_string();
 
-        result = Regex::new(r"\u{3002}\u{300D}")
-            .unwrap()
+        result = RE_KUTEN_KAKKO
             .replace_all(&result, "\u{300D}")
             .to_string();
 
-        result = Regex::new(r"\u{3002}\u{300F}")
-            .unwrap()
+        result = RE_KUTEN_NIJU_KAKKO
             .replace_all(&result, "\u{300F}")
             .to_string();
 
-        result = Regex::new(r"\u{3002}\u{FF09}")
-            .unwrap()
+        result = RE_KUTEN_PAREN
             .replace_all(&result, "\u{FF09}")
             .to_string();
 
         result = normalize_ellipsis(&result);
         result = normalize_ditto(&result);
 
-        let re = Regex::new(r"\u{3002}\u{3000}").unwrap();
-        result = re.replace_all(&result, "\u{3002}").to_string();
+        result = RE_KUTEN_SPACE.replace_all(&result, "\u{3002}").to_string();
 
         result
     }
 
     pub(super) fn convert_horizontal_ellipsis(&self, text: &str) -> String {
         let mut result = text.to_string();
-        for target in ['\u{30FB}', '\u{3002}', '\u{3001}', '\u{FF0E}'] {
-            let re = Regex::new(&format!("{}{{3,}}", regex::escape(&target.to_string()))).unwrap();
+        for re in &RE_HORIZONTAL_ELLIPSIS_TARGETS {
             result = re
                 .replace_all(&result, |caps: &regex::Captures| {
                     let len = caps[0].chars().count();
                     let start = caps.get(0).unwrap().start();
                     let end = caps.get(0).unwrap().end();
-                    let prev = result[..start].chars().last();
+                    let prev = result[..start].chars().next_back();
                     let next = result[end..].chars().next();
                     if prev == Some('\u{2015}') || next == Some('\u{2015}') {
                         caps[0].to_string()
@@ -153,6 +175,14 @@ impl ConverterBase {
     }
 
     pub(super) fn delete_dust_char(&self, data: &mut String) {
+        if !data.chars().any(|c| {
+            matches!(
+                c as u32,
+                0x200B..=0x200F | 0x2028..=0x202F | 0x2060..=0x206F | 0xFEFF
+            )
+        }) {
+            return;
+        }
         *data = data
             .chars()
             .filter(|&c| {
@@ -367,8 +397,7 @@ fn join_inner_bracket(text: &str) -> Option<String> {
         return None;
     }
 
-    let re = Regex::new(r"([…―])\n").unwrap();
-    let joined = re.replace_all(text, "$1。\n").to_string();
+    let joined = RE_BRACKET_LINE_BREAK.replace_all(text, "$1。\n").to_string();
     Some(
         joined
             .split('\n')
@@ -379,8 +408,7 @@ fn join_inner_bracket(text: &str) -> Option<String> {
 }
 
 fn rebuild_brackets(text: &str, replacements: &[String]) -> String {
-    let re = Regex::new(r"［＃かぎ括弧＝(\d+)］").unwrap();
-    re.replace_all(text, |caps: &regex::Captures| {
+    RE_KAGI_BRACKET.replace_all(text, |caps: &regex::Captures| {
         let index = caps[1].parse::<usize>().unwrap_or(usize::MAX);
         replacements
             .get(index)
@@ -390,9 +418,8 @@ fn rebuild_brackets(text: &str, replacements: &[String]) -> String {
     .to_string()
 }
 
-pub fn zenkaku_rstrip(line: &str) -> String {
-    line.trim_end_matches(|c: char| c == '\u{3000}' || c.is_whitespace())
-        .to_string()
+pub fn zenkaku_rstrip(line: &str) -> Cow<'_, str> {
+    Cow::Borrowed(line.trim_end_matches(|c: char| c == '\u{3000}' || c.is_whitespace()))
 }
 
 pub fn tcy(text: &str) -> String {
@@ -435,8 +462,7 @@ pub fn is_border_symbol(line: &str) -> bool {
 }
 
 fn normalize_ellipsis(text: &str) -> String {
-    let re = Regex::new(r"\u{2026}+").unwrap();
-    re.replace_all(text, |caps: &regex::Captures| {
+    RE_ELLIPSIS.replace_all(text, |caps: &regex::Captures| {
         let count = caps[0].chars().count();
         let even = (count + 1) / 2 * 2;
         "\u{2026}".repeat(even)
@@ -445,8 +471,7 @@ fn normalize_ellipsis(text: &str) -> String {
 }
 
 fn normalize_ditto(text: &str) -> String {
-    let re = Regex::new(r"\u{2025}+").unwrap();
-    re.replace_all(text, |caps: &regex::Captures| {
+    RE_DITTO.replace_all(text, |caps: &regex::Captures| {
         let count = caps[0].chars().count();
         let even = (count + 1) / 2 * 2;
         "\u{2025}".repeat(even)
