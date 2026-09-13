@@ -44,9 +44,87 @@ jobs:
           $isPrerelease = ("${{ github.ref_type }}" -eq "tag") -and ($tag -match "^[^+]*-")
           "prerelease=$($isPrerelease.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-  build:
-    name: Build ${{ matrix.name }}
+  build-updater:
+    name: Build updater (${{ matrix.name }})
     needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - name: Windows ARM64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-updater-${{ matrix.os }}-${{ matrix.target }}
+
+      - name: Add Rust target
+        shell: pwsh
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build updater binary
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_updater
+
+      - name: Upload unsigned updater
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-updater-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/narou_rs_updater.exe
+          if-no-files-found: error
+
+  sign-updater:
+    name: Sign Windows updaters
+    needs: build-updater
+    runs-on: windows-2025
+    environment: CodeSining
+    steps:
+      - name: Download unsigned updaters
+        uses: actions/download-artifact@v4
+        with:
+          pattern: unsigned-updater-*
+          path: unsigned
+
+      - name: Sign Windows updaters (Certum SimplySign)
+        uses: Rumia-Channel/windows-certum-signin@main
+        with:
+          certum-username: ${{ secrets.CERTUM_USERNAME }}
+          certum-otp-uri: ${{ secrets.CERTUM_OTP_URI }}
+          certum-key-id: ${{ vars.CERTUM_KEY_ID }}
+          signer: authenticode
+          files: |
+            unsigned\unsigned-updater-x86_64-pc-windows-msvc\narou_rs_updater.exe
+            unsigned\unsigned-updater-aarch64-pc-windows-msvc\narou_rs_updater.exe
+
+      - name: Upload signed updater (x64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-updater-x86_64-pc-windows-msvc
+          path: unsigned/unsigned-updater-x86_64-pc-windows-msvc/narou_rs_updater.exe
+          if-no-files-found: error
+
+      - name: Upload signed updater (ARM64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-updater-aarch64-pc-windows-msvc
+          path: unsigned/unsigned-updater-aarch64-pc-windows-msvc/narou_rs_updater.exe
+          if-no-files-found: error
+
+  build:
+    needs:
+      - validate
+      - sign-updater
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -215,6 +293,7 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build updater binary
+        if: matrix.platform != 'win'
         shell: pwsh
         env:
           NAROU_RS_RELEASE_BUILD: "1"
@@ -225,6 +304,13 @@ jobs:
           } else {
             cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_updater
           }
+
+      - name: Download signed updater
+        if: matrix.platform == 'win'
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-updater-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release
 
       - name: Compute updater SHA-256
         id: updater_hash
@@ -262,7 +348,16 @@ jobs:
             cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs @featureArgs
           }
 
+      - name: Upload unsigned Windows binary
+        if: matrix.platform == 'win'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-main-${{ matrix.target }}${{ matrix.variant != '' && format('-{0}', matrix.variant) || '' }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+
       - name: Package release asset
+        if: matrix.platform != 'win'
         id: package
         shell: pwsh
         run: |
@@ -289,10 +384,88 @@ jobs:
           "archive_path=$archivePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "archive_name=$([System.IO.Path]::GetFileName($archivePath))" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload release asset
+        if: matrix.platform != 'win'
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.archive_name }}
           path: ${{ steps.package.outputs.archive_path }}
+          if-no-files-found: error
+
+  sign-windows:
+    name: Sign Windows binaries
+    needs:
+      - validate
+      - build
+    runs-on: windows-2025
+    environment: CodeSining
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download unsigned binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: unsigned-main-*
+          path: unsigned
+
+      - name: Download signed updaters
+        uses: actions/download-artifact@v4
+        with:
+          pattern: signed-updater-*
+          path: signed-updater
+
+      - name: Sign Windows binaries (Certum SimplySign)
+        uses: Rumia-Channel/windows-certum-signin@main
+        with:
+          certum-username: ${{ secrets.CERTUM_USERNAME }}
+          certum-otp-uri: ${{ secrets.CERTUM_OTP_URI }}
+          certum-key-id: ${{ vars.CERTUM_KEY_ID }}
+          signer: authenticode
+          files: |
+            unsigned\unsigned-main-x86_64-pc-windows-msvc\narou_rs.exe
+            unsigned\unsigned-main-x86_64-pc-windows-msvc-GPL\narou_rs.exe
+            unsigned\unsigned-main-aarch64-pc-windows-msvc\narou_rs.exe
+            unsigned\unsigned-main-aarch64-pc-windows-msvc-GPL\narou_rs.exe
+
+      - name: Package signed assets
+        shell: pwsh
+        run: |
+          $targets = @(
+            @{ Target = "x86_64-pc-windows-msvc"; Arch = "x64" },
+            @{ Target = "aarch64-pc-windows-msvc"; Arch = "arm64" }
+          )
+          $variants = @("", "GPL")
+          $commitVersion = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -ne "tag") {
+            $commitVersion = "{0}+{1}" -f "${{ needs.validate.outputs.version }}", $env:GITHUB_SHA.Substring(0, 7)
+          }
+          foreach ($t in $targets) {
+            $updater = "signed-updater\signed-updater-$($t.Target)\narou_rs_updater.exe"
+            if (-not (Test-Path -Path $updater -PathType Leaf)) {
+              throw "Signed updater not found: $updater"
+            }
+            foreach ($v in $variants) {
+              $suffix = if ($v -eq "") { "" } else { "-$v" }
+              $binary = "unsigned\unsigned-main-$($t.Target)$suffix\narou_rs.exe"
+              if (-not (Test-Path -Path $binary -PathType Leaf)) {
+                throw "Signed binary not found: $binary"
+              }
+              & .\scripts\package-release.ps1 `
+                -BinaryPath $binary `
+                -UpdaterBinaryPath $updater `
+                -Platform "win" `
+                -Arch $t.Arch `
+                -PackageRoot "narou" `
+                -CommitVersion $commitVersion `
+                -Variant $v `
+                -OutputDir "dist"
+            }
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-assets
+          path: dist
           if-no-files-found: error
 
   release:
@@ -300,6 +473,7 @@ jobs:
     needs:
       - validate
       - build
+      - sign-windows
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
