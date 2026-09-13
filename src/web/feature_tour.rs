@@ -88,6 +88,18 @@ const FEATURE_TOURS: &[FeatureTourEntry] = &[
             "再試行の予定は queue_retry 通知として Web UI に配信",
         ],
     },
+    FeatureTourEntry {
+        version: "0.4.0",
+        title: "管理データの SQLite 移行とライブラリバックアップ",
+        body: "0.4.0 では .narou 配下の管理データを SQLite へ移行できます。破壊的な変更に備え、アップデート後の初回起動時にライブラリ全体のバックアップを提案します。",
+        items: &[
+            "初回起動時にライブラリ全体 (小説データ + .narou + webnovel 等) のバックアップを提案",
+            "narou_rs_backup サブ実行ファイルでいつでもライブラリ全体を zip 化可能",
+            "管理方式は Web UI ツアーまたは .narou/storage-backend で SQLite / YAML を選択",
+            "narou db verify / export-yaml / vacuum で SQLite 管理データを保守",
+            "narou diff --history / --restore で小説本文のバージョン履歴を参照・復元",
+        ],
+    },
 ];
 
 pub async fn pending(State(state): State<AppState>) -> Json<serde_json::Value> {
