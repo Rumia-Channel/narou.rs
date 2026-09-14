@@ -38,13 +38,16 @@ mod embedded {
     /// `narou init` が同じ行をインストール先 `chuki_tag.txt` へ注入するため、
     /// ここで重ねておけば Java 実行と同じ注記が常に使える。
     pub const CUSTOM_CHUKI_TAG: &str = include_str!("../preset/custom_chuki_tag.txt");
+    /// `narou init` がインストール先へコピーするプリセット INI。外部 AozoraEpub3 が
+    /// 無い環境でも Java 版と同じ変換フラグ (TitlePage / CoverPage /
+    /// SpaceHyphenation / DakutenType など) で動かすために読み込む。
+    pub const AOZORA_INI: &str = include_str!("../preset/AozoraEpub3.ini");
     pub const CHUKI_TAG: &str = include_str!("../assets/aozora_lite/chuki_tag.txt");
     pub const CHUKI_TAG_SUF: &str = include_str!("../assets/aozora_lite/chuki_tag_suf.txt");
     pub const CHUKI_UTF: &str = include_str!("../assets/aozora_lite/chuki_utf.txt");
     pub const CHUKI_IVS: &str = include_str!("../assets/aozora_lite/chuki_ivs.txt");
     pub const CHUKI_ALT: &str = include_str!("../assets/aozora_lite/chuki_alt.txt");
     pub const CHUKI_LATIN: &str = include_str!("../assets/aozora_lite/chuki_latin.txt");
-    pub const REPLACE: &str = include_str!("../assets/aozora_lite/replace.txt");
 }
 
 /// `AozoraConfig` equivalent to running the Lite CLI with its bundled assets
@@ -53,14 +56,18 @@ mod embedded {
 /// Built from strings on every call; cheap relative to text conversion and
 /// keeps the config free of shared mutable state.
 pub fn embedded_config() -> AozoraConfig {
-    let mut config = AozoraConfig::default();
+    // narou.rb がインストール先へコピーするプリセット INI を既定にする。
+    // Java 版は常にこの INI を読むため、外部 AozoraEpub3 が無い環境でも
+    // 変換フラグが一致する。
+    let ini = aozora_epub3_lite::IniSettings::parse(embedded::AOZORA_INI)
+        .unwrap_or_default();
+    let mut config = AozoraConfig::from_ini(ini);
     config.load_tag_text(embedded::CHUKI_TAG);
     config.load_suffix_text(embedded::CHUKI_TAG_SUF);
     config.load_utf_text(embedded::CHUKI_UTF);
     config.load_ivs_text(embedded::CHUKI_IVS);
     config.load_alt_text(embedded::CHUKI_ALT);
     config.load_latin_text(embedded::CHUKI_LATIN);
-    config.load_replace_text(embedded::REPLACE);
     config.load_tag_text(embedded::CUSTOM_CHUKI_TAG);
     apply_narou_preset_flags(&mut config);
     config

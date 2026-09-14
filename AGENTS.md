@@ -314,7 +314,10 @@ sample/
   - `build_book(input_txt, options)`: `collect_assets` → `decorate_image_tags` → `rewrite_image_source` → `remove_missing_image_sources` → `remove_image_sources` (自動表紙) → `reflow_image_sections` → `build_metadata` (`urn:uuid:` は Java と同じ `java_name_uuid`) → `build_title_page_markup` → `append_gaiji_assets`。
   - 挿絵は `EpubBuild::resolve` が書き出し時に 1 枚ずつ読み、`image::process` (余白除去・リサイズ・回転) をかける。寸法だけ事前に読む。
 - narou カスタム注記 (`preset/custom_chuki_tag.txt`, 21 行) は `include_str!` で常に重ねる。`init` がインストール先 `chuki_tag.txt` に書き込む内容と同一なので、同梱資産だけで動く wasm / 未設定時でも `ここから柱` / 前書き / 後書き / 一字下げ 等が効く。
-- **注意**: `aozoraepub3dir` が未設定だと資産を読めず、`AozoraEpub3.ini` のスタイル/表紙/表題ページ設定も入らない (Java を起動する場合と同じ前提)。
+- `preset/AozoraEpub3.ini` も `include_str!` し、`aozoraepub3dir` が無いときの既定にする (`IniSettings::parse` → `AozoraConfig::from_ini`)。Java 版は常にこの INI (init がインストール先へコピーしたもの) を読むため、外部 AozoraEpub3 が無い環境でも `TitlePage` / `CoverPage` / `SpaceHyphenation` / `DakutenType` などのフラグが一致する。実測: 資産なしでも Java と 419/423 バイト一致。
+- 同梱 `replace.txt` は読み込まない (削除済み)。Java は narou.rb 構成では `replace.txt` を持たない (配布物は `replace_sample.txt`) ため、読み込むと `－`→`―` など不要な文字置換が入り Java とずれる。
+- 残差: 外字フォント (`gaiji/dakuten/*.ttf`) は `aozoraepub3dir` が無いと格納できない。`AozoraConfig::gaiji_fonts` がパス指定のため、同梱資産 (バイト列) からは渡せない。Java は濁点外字に `<span class="glyph u30fc-u309a">` を出すが Lite は素の文字になる (この差は外字を使う小説でのみ発生)。
+- **注意**: `aozoraepub3dir` を設定すると CLI は外部ツール (jar / Lite exe) を優先する (narou.rb と同じ)。組み込みエンジンを強制する設定は持たない。
 - 実データ検証 (2026-09-15, v0.1.3): `WebNovel` の n0421du (401 セクション) で Java 版と **422/423 ファイルがバイト完全一致**、挿絵入りでも **425/426 がバイト完全一致**（単ページ画像化・連番・表紙処理を含む）。残差は `dcterms:modified` のみ（Java はローカル時刻に `Z`、Lite は UTC。Lite 側の意図的な非再現）。
 - 検証手順は `docs/aozora_lite_evaluation_2026-08-23.md` の「更新 (2026-09-15)」節。
 
