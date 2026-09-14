@@ -48,51 +48,56 @@ the time of this audit.
 
 | Dependency | Version req | License |
 | --- | --- | --- |
-| askama | ^0.12 | MIT OR Apache-2.0 |
+| aozora_epub3_lite | git (see `assets/aozora_lite/LICENSE.md`) | GPL-3.0-only |
 | axum | ^0.8 | MIT |
-| base64 | ^0.22 | MIT OR Apache-2.0 |
+| base64 | ^0.23 | MIT OR Apache-2.0 |
+| base64 (build) | ^0.22 | MIT OR Apache-2.0 |
+| brotli | ^9.0 | BSD-3-Clause AND MIT |
 | chrono | ^0.4 | MIT OR Apache-2.0 |
-| chrono-tz | ^0.10.4 | MIT OR Apache-2.0 |
+| chrono-tz | ^0.10 | MIT OR Apache-2.0 |
 | clap | ^4 | MIT OR Apache-2.0 |
+| crc32fast | ^1.5 | MIT OR Apache-2.0 |
 | csv | ^1.4 | Unlicense/MIT |
 | ctrlc | ^3.5 | MIT/Apache-2.0 |
 | curl | ^0.4 | MIT |
 | dashmap | ^6 | MIT |
 | encoding_rs | ^0.8 | (Apache-2.0 OR MIT) AND BSD-3-Clause |
-| fancy-regex | ^0.17 | MIT |
-| fs2 | ^0.4.3 | MIT OR Apache-2.0 |
+| fancy-regex | ^0.19 | MIT |
+| fs2 | ^0.4 | MIT/Apache-2.0 |
 | futures | ^0.3 | MIT OR Apache-2.0 |
-| getrandom | ^0.4.2 | MIT OR Apache-2.0 |
+| getrandom | ^0.4 | MIT OR Apache-2.0 |
 | hex | ^0.4 | MIT OR Apache-2.0 |
 | indicatif | ^0.18 | MIT |
 | lettre | ^0.11 | MIT |
-| libc | ^0.2.186 | MIT OR Apache-2.0 |
+| libc | ^0.2 | MIT OR Apache-2.0 |
+| mailparse (dev) | ^0.17 | 0BSD |
+| miniz_oxide | ^0.9 | MIT OR Zlib OR Apache-2.0 |
 | open | ^5 | MIT |
 | parking_lot | ^0.12 | MIT OR Apache-2.0 |
 | pest | ^2.8 | MIT OR Apache-2.0 |
 | pest_derive | ^2.8 | MIT OR Apache-2.0 |
 | regex | ^1 | MIT OR Apache-2.0 |
-| reqwest | ^0.12 | MIT OR Apache-2.0 |
+| reqwest | ^0.13 | MIT OR Apache-2.0 |
+| rusqlite | ^0.40 | MIT |
 | serde | ^1 | MIT OR Apache-2.0 |
 | serde_json | ^1 | MIT OR Apache-2.0 |
 | serde_yaml | ^0.9 | MIT OR Apache-2.0 |
-| sha2 | ^0.10 | MIT OR Apache-2.0 |
-| sha3 | ^0.11 | MIT OR Apache-2.0 |
+| sha2 | ^0.11 | MIT OR Apache-2.0 |
+| sha3 (build) | ^0.12 | MIT OR Apache-2.0 |
 | shell-words | ^1.1 | MIT/Apache-2.0 |
 | similar | ^3.1 | Apache-2.0 |
 | socket2 | ^0.6 | MIT OR Apache-2.0 |
-| subtle | ^2.6.1 | BSD-3-Clause |
+| subtle | ^2.6 | BSD-3-Clause |
 | tempfile | ^3.27 | MIT OR Apache-2.0 |
 | thiserror | ^2 | MIT OR Apache-2.0 |
 | tokio | ^1 | MIT |
-| tokio-stream | ^0.1 | MIT |
-| tower-http | ^0.6 | MIT |
-| tray-icon | ^0.22.0 | MIT OR Apache-2.0 |
 | tracing | ^0.1 | MIT |
 | tracing-subscriber | ^0.3 | MIT |
+| tray-icon (Windows) | ^0.25 | MIT OR Apache-2.0 |
 | ua_generator | ^0.5 | MIT |
 | unicode-normalization | ^0.1 | MIT OR Apache-2.0 |
-| windows-sys | ^0.61.2 | MIT OR Apache-2.0 |
+| url | ^2 | MIT OR Apache-2.0 |
+| windows-sys (Windows) | ^0.61 | MIT OR Apache-2.0 |
 | zip | ^8.5 | MIT |
 
 

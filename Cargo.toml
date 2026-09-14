@@ -15,13 +15,10 @@ native-runtime = [
     "dep:reqwest",
     "dep:axum",
     "dep:tokio",
-    "dep:tokio-stream",
-    "dep:askama",
     "dep:clap",
     "dep:open",
     "dep:tracing-subscriber",
     "dep:dashmap",
-    "dep:tower-http",
     "dep:ua_generator",
     "dep:curl",
     "dep:indicatif",
@@ -51,21 +48,18 @@ serde_yaml = "0.9"
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
-reqwest = { version = "0.12", features = ["cookies", "gzip", "brotli", "deflate", "blocking", "native-tls", "native-tls-vendored"], optional = true }
+reqwest = { version = "0.13", features = ["cookies", "gzip", "brotli", "deflate", "blocking", "native-tls", "native-tls-vendored", "charset", "http2", "system-proxy"], optional = true, default-features = false }
 axum = { version = "0.8", features = ["macros", "ws"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
-tokio-stream = { version = "0.1", optional = true }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 thiserror = "2"
-askama = { version = "0.12", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 open = { version = "5", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true }
 parking_lot = "0.12"
 dashmap = { version = "6", optional = true }
-tower-http = { version = "0.6", features = ["cors"], optional = true }
 futures = "0.3"
 pest = "2.8"
 pest_derive = "2.8"
@@ -81,7 +75,7 @@ tempfile = { version = "3.27", optional = true }
 shell-words = { version = "1.1", optional = true }
 csv = { version = "1.4", optional = true }
 ctrlc = { version = "3.5", optional = true }
-fancy-regex = "0.17"
+fancy-regex = "0.19"
 socket2 = { version = "0.6", optional = true }
 chrono-tz = { version = "0.10", features = ["case-insensitive"] }
 subtle = "2.6"
@@ -91,14 +85,14 @@ libc = { version = "0.2", optional = true }
 url = "2"
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 aozora_epub3_lite = { git = "https://github.com/Rumia-Channel/AozoraEpub3_Lite", rev = "89ae0b6", optional = true }
-base64 = "0.22"
+base64 = "0.23"
 miniz_oxide = "0.9"
 brotli = "9.0"
 crc32fast = "1.5"
 
 [build-dependencies]
 base64 = "0.22"
-sha3 = "0.11"
+sha3 = "0.12"
 
 [[bin]]
 name = "narou_rs"
@@ -121,8 +115,8 @@ path = "src/bin/cargo-local-build.rs"
 required-features = ["native-runtime"]
 
 [target."cfg(windows)".dependencies]
-tray-icon = "0.22"
+tray-icon = "0.25"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
-mailparse = "0.16"
+mailparse = "0.17"

@@ -18,7 +18,6 @@ chrono-tz = { version = "0.10", features = ["case-insensitive"] }
 crc32fast = "1.5"
 futures = "0.3"
 hex = "0.4"
-hmac = "0.13"
 js-sys = "0.3"
 miniz_oxide = "0.9"
 narou_rs = { package = "narou_rs", path = "..", default-features = false, features = ["worker-runtime"] }
