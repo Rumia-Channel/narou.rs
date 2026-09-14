@@ -1,3 +1,19 @@
+# cargo-about configuration for the GPL-side artifacts (the `lite` binaries and
+# the Cloudflare Worker, which always enables `lite`).
+#
+# The workspace scan sees this graph: `worker_entry` depends on
+# `worker-runtime`, which implies `lite`, so workspace-wide feature unification
+# enables `narou_rs/lite` for every `cargo about` run rooted at the workspace.
+# `lite` embeds AozoraEpub3_Lite, which is GPL-3.0-only.
+#
+# GPL is therefore accepted per crate only, never globally: the two known
+# GPL-3.0-only components may appear, and any new copyleft dependency still
+# fails the scan.
+#
+# The non-GPL binaries are covered by `about-non-gpl.toml`, which runs against
+# `about-probe/Cargo.toml` (the same `narou_rs` without `lite`) and accepts no
+# GPL at all.
+
 accepted = [
     "MIT",
     "Apache-2.0",
@@ -35,3 +51,12 @@ workarounds = [
     "rustls",
     "wasmtime",
 ]
+
+# Embedded EPUB engine (assets/aozora_lite/LICENSE.md).
+[aozora_epub3_lite]
+accepted = ["GPL-3.0-only"]
+
+# Worker runtime: `worker-runtime` implies `lite`, so the deployed Worker is
+# distributed under GPL-3.0-only as well.
+[narou_worker]
+accepted = ["GPL-3.0-only"]

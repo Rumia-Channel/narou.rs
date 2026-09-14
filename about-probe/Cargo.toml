@@ -1,0 +1,27 @@
+# License-scanning probe for the non-GPL binaries.
+#
+# `cargo about` scans the active package and, in this repository, the workspace
+# always enables the `lite` feature for `narou_rs` because `worker_entry`
+# depends on `worker-runtime` (which implies `lite`). That workspace-wide
+# feature unification pulls the GPL-3.0-only `aozora_epub3_lite` into every
+# scan, so the non-GPL graph cannot be inspected from the workspace root.
+#
+# This manifest is deliberately detached from the workspace (the empty
+# `[workspace]` table) and depends on `narou_rs` without `lite`, which is
+# exactly the dependency set of the non-GPL binaries. Point `cargo about` at it
+# together with `about-non-gpl.toml` to generate the non-GPL notice and to fail
+# the scan whenever a copyleft dependency enters the non-GPL graph.
+#
+# It is not a buildable part of the release; nothing here is compiled.
+
+[package]
+name = "narou-license-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "BSD-2-Clause"
+
+[workspace]
+
+[dependencies]
+narou_rs = { path = "..", default-features = false, features = ["native-runtime"] }

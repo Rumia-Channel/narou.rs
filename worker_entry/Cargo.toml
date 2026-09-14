@@ -3,6 +3,10 @@ name = "narou_worker"
 version = "0.4.0"
 edition = "2024"
 publish = false
+# The Worker always enables `narou_rs/worker-runtime`, which implies `lite` and
+# therefore embeds AozoraEpub3_Lite (GPL-3.0-only). Deployed workers are
+# distributed under GPL-3.0-only; see assets/aozora_lite/LICENSE.md.
+license = "GPL-3.0-only"
 
 [lib]
 crate-type = ["cdylib"]

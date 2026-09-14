@@ -426,3 +426,4 @@ For each section:
 - **Random UA**: ua_generator
 - **管理DB**: SQLite (`rusqlite` bundled, optional dep / native-runtime)。`NAROU_RS_LEGACY_YAML=1` でレガシーYAML運用に切替
 - **EPUB エンジン (オプション)**: `aozora_epub3_lite` (git 依存, rev pin) — cargo feature `lite` で有効化。`worker-runtime` は自動的に `lite` を含む。`lite` ビルドは GPL-3.0-only (assets/aozora_lite/LICENSE.md)、無しは従来どおり BSD-2-Clause + 外部 AozoraEpub3 プロセス。
+- **サードパーティライセンス**: `cargo-about` で 2 種類生成する。GPL 側は `about.toml` + `--workspace` → `Third-Party-License.md`（`aozora_epub3_lite` と `narou_worker` に限り GPL-3.0-only を crate 単位で許可）。非 GPL 側は `about-non-gpl.toml` + `about-probe/`（`lite` 無しの `narou_rs` に依存する切り離し manifest）→ `Third-Party-License-non-GPL.md` で、GPL を一切許可しないゲートを兼ねる。`worker_entry` が `worker-runtime` 経由で `lite` を常時有効化するため、workspace 直下の走査は必ず GPL 側になる。生成コマンドは `about.hbs` の冒頭に記載。

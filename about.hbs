@@ -7,10 +7,17 @@ This summary is based on Cargo metadata for the Rust dependency graph and the
 license notices that accompany the narou.rb reference software used during
 development.
 
-If dependency versions change, this file should be regenerated with:
+If dependency versions change, regenerate both notices:
 
 ```powershell
-cargo-about generate --locked --offline -o Third-Party-License.md about.hbs
+# GPL side: the workspace always enables `lite` through `worker_entry`, and both
+# `lite` (AozoraEpub3_Lite) and the Worker are GPL-3.0-only. Produces the notice
+# shipped with the GPL archives.
+cargo-about generate --workspace --locked --offline -c about.toml -o Third-Party-License.md about.hbs
+
+# Non-GPL binaries: accepts no GPL at all, so the scan fails if copyleft reaches
+# the non-GPL graph. Produces the notice shipped with the standard archives.
+cargo-about generate -m about-probe/Cargo.toml -c about-non-gpl.toml --locked --offline -o Third-Party-License-non-GPL.md about.hbs
 ```
 
 
@@ -48,7 +55,7 @@ the time of this audit.
 
 | Dependency | Version req | License |
 | --- | --- | --- |
-| aozora_epub3_lite | git (see `assets/aozora_lite/LICENSE.md`) | GPL-3.0-only |
+| aozora_epub3_lite (`lite` feature only) | git (see `assets/aozora_lite/LICENSE.md`) | GPL-3.0-only |
 | axum | ^0.8 | MIT |
 | base64 | ^0.23 | MIT OR Apache-2.0 |
 | base64 (build) | ^0.22 | MIT OR Apache-2.0 |
