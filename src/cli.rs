@@ -4,13 +4,20 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+/// narou.rb の COMMAND_LIST と同じ順序。ショートカットはこの順で優先度が
+/// 決まる (先に並ぶコマンドほど優先)。Rust 拡張コマンドは末尾に置く。
 const COMMAND_NAMES: &[&str] = &[
-    "db",
     "download", "update", "list", "convert", "diff", "setting", "alias", "inspect", "send",
     "folder", "browser", "remove", "freeze", "tag", "web", "mail", "backup", "csv", "clean", "log",
-    "trace", "help", "version", "init", "illust",
+    "trace", "help", "version", "init",
+    // Rust 拡張 (narou.rb に無いコマンド)。narou.rb コマンドのショートカットを
+    // 奪わないよう末尾に置く。
+    "db", "illust",
 ];
 
+/// narou.rb の `Command::Shortcuts` と同じ規則でショートカットを構築する。
+/// COMMAND_LIST の先頭ほど優先度が高いので、逆順に insert して先頭側で
+/// 上書きされるようにする。
 fn build_shortcuts() -> HashMap<String, &'static str> {
     let mut map = HashMap::new();
     for &name in COMMAND_NAMES.iter().rev() {

@@ -121,7 +121,7 @@ fn stable_identifier(source_id: &str) -> String {
     let digest = Sha256::digest(source_id.as_bytes());
     let hex = hex::encode(&digest[..16]);
     format!(
-        "{:8}-{:4}-{:4}-{:4}-{:12}",
+        "urn:uuid:{:8}-{:4}-{:4}-{:4}-{:12}",
         &hex[0..8],
         &hex[8..12],
         &hex[12..16],
@@ -157,7 +157,20 @@ pub fn build_book(text: &str, options: &EpubBuildOptions, images: &[EpubImage]) 
         })
         .collect::<Vec<_>>();
 
-    let metadata = EpubMetadata::new(options.title.clone(), stable_identifier(&options.source_id));
+    let title = if options.title.is_empty() {
+        detected.title.clone().unwrap_or_default()
+    } else {
+        options.title.clone()
+    };
+    let mut metadata = EpubMetadata::new(title, stable_identifier(&options.source_id));
+    let creator = if options.author.is_empty() {
+        detected.creator.clone()
+    } else {
+        Some(options.author.clone())
+    };
+    if let Some(creator) = creator {
+        metadata = metadata.with_creator(creator);
+    }
     let mut book = EpubBook::from_sections(metadata, sections)
         .with_vertical(options.vertical)
         .with_toc_page(config.toc_page)
