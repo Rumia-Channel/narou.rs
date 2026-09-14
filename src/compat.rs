@@ -231,6 +231,16 @@ pub fn canonicalize_aozoraepub3_tool_path(dir: &str) -> Option<PathBuf> {
     .find_map(|name| canonicalize_existing_path(canonical_dir.join(name)))
 }
 
+/// `aozoraepub3dir` 設定が指す AozoraEpub3 ディレクトリ。
+///
+/// Java 版を起動する場合はカレントディレクトリとして使われ、`chuki_*.txt` /
+/// `gaiji/*.ttf` / `AozoraEpub3.ini` がここから読まれる。組み込みエンジンも
+/// 同じ資産を読む必要があるため、ツール本体 (jar / exe) の有無とは独立に解決する。
+pub fn aozora_assets_dir() -> Option<PathBuf> {
+    let dir = load_global_setting_string("aozoraepub3dir")?;
+    canonicalize_existing_path(PathBuf::from(dir))
+}
+
 pub fn resolve_java_command_path() -> Option<PathBuf> {
     if let Some(path) =
         load_global_setting_string_with_aliases(&["java_path", "java-path", "javapath"])

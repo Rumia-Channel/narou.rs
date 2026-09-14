@@ -46,34 +46,38 @@ narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状�
 
 ## コマンドショートカット
 
-narou.rb はコマンド名の先頭1文字または2文字でコマンドを一意に特定できる。 ✅ 完了
+narou.rb はコマンド名の先頭1文字または2文字でコマンドを一意に特定できる。優先度は upstream の `Command::COMMAND_LIST` の並び順で決まり、**先に並ぶコマンドが優先**される。 ✅ 完了
 
-| 1文字 | 2文字 | コマンド |
-|:-----:|:-----:|---------|
-| `d` | `do` | download |
-| `u` | `up` | update |
-| `l` | `li` | list |
-| `c` | `co` | convert |
-| `di` | | diff |
-| `se` | | setting |
-| `al` | | alias |
-| `in` | | inspect |
-| `se` | | send (settingと衝突。`se`→settingが優先) |
-| `fo` | | folder |
-| `br` | | browser |
-| `r` | `re` | remove |
-| `f` | `fr` | freeze |
-| `t` | `ta` | tag |
-| `w` | `we` | web |
-| `ma` | | mail |
-| `ba` | | backup |
-| `cs` | | csv |
-| `cl` | | clean |
-| `lo` | | log |
-| `tr` | | trace |
-| `h` | `he` | help |
-| `v` | `ve` | version |
-| | | init (`i`はinspectが優先) |
+| コマンド | 1文字 | 2文字 | 備考 |
+|---------|:-----:|:-----:|------|
+| download | `d` | `do` | |
+| update | `u` | `up` | |
+| list | `l` | `li` | |
+| convert | `c` | `co` | `clean` / `csv` より優先 |
+| diff | | `di` | |
+| setting | `s` | `se` | `send` と衝突するため `s` / `se` は setting |
+| alias | `a` | `al` | |
+| inspect | `i` | `in` | `init` と衝突するため `i` は inspect |
+| send | | | ショートカット無し（`s` / `se` は setting） |
+| folder | `f` | `fo` | `freeze` と衝突するため `f` は folder |
+| browser | `b` | `br` | `backup` と衝突するため `b` は browser |
+| remove | `r` | `re` | |
+| freeze | | `fr` | 1文字 `f` は folder |
+| tag | `t` | `ta` | |
+| web | `w` | `we` | |
+| mail | `m` | `ma` | |
+| backup | | `ba` | 1文字 `b` は browser |
+| csv | | `cs` | |
+| clean | | `cl` | |
+| log | | `lo` | |
+| trace | | `tr` | |
+| help | `h` | `he` | |
+| version | `v` | `ve` | |
+| init | | | ショートカット無し（`i` / `in` は inspect） |
+| db（Rust 拡張） | | `db` | narou.rb コマンドのショートカットを奪わない |
+| illust（Rust 拡張） | | `il` | 同上 |
+
+**注意**: v0.4.0 では `COMMAND_NAMES` の先頭に Rust 拡張の `db` が入っていたため `narou d` が `db` に解決されていた。現在は upstream と同じ並び（Rust 拡張は末尾）で、`d` は `download`。`src/cli.rs` のテストで並び順と主要な解決結果を固定している。
 
 ---
 
@@ -286,6 +290,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 - HTML 由来の story / section では Ruby版同様に `()` の暗黙ルビ推測を行わず、HTML `<ruby>` は `to_aozora` 経由の明示ルビとして保持する。`text` / `text/plain` / textfile では従来どおり `()` 暗黙ルビを処理する
 - Windows の `\\?\\C:\\...\\AozoraEpub3.jar` 形式パスは Java classpath にそのまま渡すと失敗するため、Ruby版同様に jar の basename を current_dir 基準で渡すよう修正した。`sample\\novel` で `device=epub` 実変換と `--no-epub` 抑止を確認済み
 - Windows で `〜` / `～` / `−` / `‼` / `⁇` / `⁈` / `⁉` / variation selector や CP932/Windows-31J 未定義文字 (`♠` / `♡` / `♢` / `♣` / `𠮷` など) を含み、Java/AozoraEpub3 側で出力名がずれやすい小説パスは、AozoraEpub3 に本文・表紙・`挿絵/` を安全な一時ファイル名で渡し、生成後に本来の Unicode ファイル名へ戻す。`C:\\Users\\rumia\\Documents\\Narou` の n5853lh で EPUB 生成を確認済み
+- `lite` feature 有効時は、外部 AozoraEpub3 が見つからない場合に組み込み `epub_lite` エンジンへフォールバックする（外部ツール (jar / `AozoraEpub3_Lite.exe`) が見つかればそちらを優先する。narou.rb と同じ挙動）。`device=epub` / `kobo` / `reader` / `ibooks` / `mobi` の中間 EPUB 生成を外部ツールなしで行える。**Java 版と同じ資産と組み立て**: `aozoraepub3dir` があれば `chuki_*.txt` (narou カスタム注記込み)・`gaiji/*.ttf`・`AozoraEpub3.ini` を読み、無ければ同梱の `preset/AozoraEpub3.ini` と `preset/custom_chuki_tag.txt` で同じフラグを再現する（外字フォントだけは同梱できないので入らない）。Lite の公開パイプライン (`collect_assets` / `decorate_image_tags` / `reflow_image_sections` / `build_title_page_markup` / `append_gaiji_assets` / `build_metadata`) を CLI と同じ順で使う。挿絵は書き出し時に 1 枚ずつ読み、Java と同じ前処理 (余白除去・リサイズ・回転) をかける。実データ検証: `C:\Users\rumia\Documents\WebNovel` の n0421du (401セクション) で Java 版 `AozoraEpub3.jar` の出力と **422/423 ファイルがバイト完全一致**（`aozoraepub3dir` 未設定でも **419/423**）、挿絵入りでも **425/426 がバイト完全一致**。残差は `dcterms:modified` のみ (Java はローカル時刻に `Z`、Lite は UTC)
 
 **注**: EPUB/MOBI 生成は AozoraEpub3 (Java 版 `AozoraEpub3.jar`、または Rust 製代替 [AozoraEpub3_Lite](https://github.com/Rumia-Channel/AozoraEpub3_Lite)) と kindlegen への依存がある。`aozoraepub3dir` 設定は jar を優先し、無ければ `AozoraEpub3_Lite.exe` / `AozoraEpub3.exe` バイナリを受理する (`canonicalize_aozoraepub3_tool_path`)。詳細は `docs/aozora_lite_evaluation_2026-08-23.md`。
 

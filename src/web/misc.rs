@@ -406,7 +406,7 @@ pub async fn notepad_save(
 fn notepad_object_id(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn notepad_response_value(content: &str) -> serde_json::Value {

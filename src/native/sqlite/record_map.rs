@@ -59,15 +59,6 @@ pub(crate) struct RecordParams {
     pub values: Vec<Value>,
 }
 
-impl RecordParams {
-    pub fn extra_fields_len(&self) -> usize {
-        // Last two binds are extra_fields_yaml + its byte length.
-        match self.values.as_slice() {
-            [.., Value::Text(yaml), Value::Integer(_)] => yaml.len(),
-            _ => 0,
-        }
-    }
-}
 
 fn text(value: impl Into<String>) -> Value {
     Value::Text(value.into())

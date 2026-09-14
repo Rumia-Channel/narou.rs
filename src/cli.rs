@@ -4,13 +4,20 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+/// narou.rb の COMMAND_LIST と同じ順序。ショートカットはこの順で優先度が
+/// 決まる (先に並ぶコマンドほど優先)。Rust 拡張コマンドは末尾に置く。
 const COMMAND_NAMES: &[&str] = &[
-    "db",
     "download", "update", "list", "convert", "diff", "setting", "alias", "inspect", "send",
     "folder", "browser", "remove", "freeze", "tag", "web", "mail", "backup", "csv", "clean", "log",
-    "trace", "help", "version", "init", "illust",
+    "trace", "help", "version", "init",
+    // Rust 拡張 (narou.rb に無いコマンド)。narou.rb コマンドのショートカットを
+    // 奪わないよう末尾に置く。
+    "db", "illust",
 ];
 
+/// narou.rb の `Command::Shortcuts` と同じ規則でショートカットを構築する。
+/// COMMAND_LIST の先頭ほど優先度が高いので、逆順に insert して先頭側で
+/// 上書きされるようにする。
 fn build_shortcuts() -> HashMap<String, &'static str> {
     let mut map = HashMap::new();
     for &name in COMMAND_NAMES.iter().rev() {
@@ -361,6 +368,68 @@ fn is_terminal_stdin() -> bool {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// upstream `Command::COMMAND_LIST` の並び順 (ショートカットの優先度)。
+    /// 先に並ぶコマンドほど優先される。
+    const NAROU_RB_COMMAND_LIST: &[&str] = &[
+        "download", "update", "list", "convert", "diff", "setting", "alias", "inspect", "send",
+        "folder", "browser", "remove", "freeze", "tag", "web", "mail", "backup", "csv", "clean",
+        "log", "trace", "help", "version", "init",
+    ];
+
+    #[test]
+    fn command_order_matches_narou_rb() {
+        // v0.4.0 では先頭に Rust 拡張の `db` が入り、`narou d` が db に解決されていた。
+        assert_eq!(
+            &COMMAND_NAMES[..NAROU_RB_COMMAND_LIST.len()],
+            NAROU_RB_COMMAND_LIST
+        );
+        assert!(COMMAND_NAMES.len() > NAROU_RB_COMMAND_LIST.len());
+    }
+
+    #[test]
+    fn shortcuts_resolve_like_narou_rb() {
+        let shortcuts = build_shortcuts();
+        // 1文字が衝突する組は upstream と同じ優先順で解決する。
+        for (key, command) in [
+            ("d", "download"),
+            ("do", "download"),
+            ("f", "folder"),
+            ("fr", "freeze"),
+            ("b", "browser"),
+            ("c", "convert"),
+            ("i", "inspect"),
+            ("s", "setting"),
+            ("se", "setting"),
+            ("m", "mail"),
+            ("a", "alias"),
+        ] {
+            assert_eq!(shortcuts.get(key).copied(), Some(command), "{key}");
+        }
+        // 3文字以上はショートカットにしない (`dl` 等は clap 側でエラーになる)。
+        assert!(shortcuts.keys().all(|key| key.chars().count() <= 2));
+    }
+
+    #[test]
+    fn extensions_do_not_take_single_letter_shortcuts() {
+        let shortcuts = build_shortcuts();
+        for extension in ["db", "illust"] {
+            for (key, command) in &shortcuts {
+                if *command == extension {
+                    assert_eq!(key.chars().count(), 2, "{extension} took {key}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shortcut_resolves_through_global_flags() {
+        // グローバルフラグが先頭にあってもコマンド位置の短縮を解決する。
+        let mut args = vec!["--no-color".to_string(), "d".to_string(), "0".to_string()];
+        let flags = preprocess_args(&mut args);
+        assert!(flags.no_color);
+        assert_eq!(args, vec!["download".to_string(), "0".to_string()]);
+    }
 
     #[test]
     fn version_flag_becomes_version_command() {

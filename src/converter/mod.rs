@@ -1031,6 +1031,11 @@ impl NovelConverter {
             .with_no_strip(no_strip)
             .with_use_dakuten_font(self.use_dakuten_font)
             .with_yokogaki(self.settings.enable_yokogaki);
+        #[cfg(feature = "lite")]
+        let output_manager = output_manager.with_lite_epub(device::LiteEpubContext {
+            title: toc_object.title.clone(),
+            author: toc_object.author.clone(),
+        });
         let base_name = txt_path
             .file_stem()
             .and_then(|stem| stem.to_str())

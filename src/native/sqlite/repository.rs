@@ -12,7 +12,7 @@ use rusqlite::{params_from_iter, Connection, Row};
 use crate::db::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::native::sqlite::query::{
-    build_where, select_sql, sort_direction, sort_expression, UPSERT_SQL,
+    build_where, select_sql, sort_direction, sort_expression, STATUS_SORT_EXPRESSION, UPSERT_SQL,
 };
 use crate::native::sqlite::record_map::{
     fold, parse_extra_fields, parse_optional_time, parse_time, record_params,
@@ -162,7 +162,7 @@ pub(crate) fn upsert_record_conn(conn: &Connection, record: &NovelRecord) -> Res
 
 pub(crate) fn refresh_status_sort(conn: &Connection, id: i64) -> Result<()> {
     conn.execute(
-        "UPDATE novels AS n SET status_sort = (CASE WHEN n.end <> 0 OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = 'end') THEN '完結' ELSE '' END || CASE WHEN (n.end <> 0 OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = 'end')) AND EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = '404') THEN ', ' ELSE '' END || CASE WHEN EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = '404') THEN '削除' ELSE '' END || CASE WHEN (n.end <> 0 OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = 'end') OR EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = '404')) AND n.suspend <> 0 THEN ', ' ELSE '' END || CASE WHEN n.suspend <> 0 THEN '中断' ELSE '' END) WHERE n.id = ?",
+        &format!("UPDATE novels AS n SET status_sort = {STATUS_SORT_EXPRESSION} WHERE n.id = ?"),
         [id],
     )
     .map_err(super::sqlite_error)?;
@@ -309,7 +309,7 @@ impl NovelRepository for SqliteNovelRepository {
             if mutations.is_empty() {
                 return Ok(());
             }
-            let mut tx = conn.transaction().map_err(super::sqlite_error)?;
+            let tx = conn.transaction().map_err(super::sqlite_error)?;
             for mutation in mutations {
                 match mutation {
                     NovelMutation::Upsert(record) => upsert_record_conn(&tx, &record)?,
@@ -392,7 +392,7 @@ mod tests {
     use crate::application::events::FreezeStore as _;
     use crate::application::novel_actions::FreezeMutationStore as _;
     use crate::platform::mocks::MemoryNovelRepository;
-    use crate::platform::{NovelFilter, NovelQuery, NovelSort, NovelSortKey, SearchField, SearchTerm};
+    use crate::platform::{NovelFilter, NovelQuery, NovelSort, NovelSortKey, SearchField};
     use chrono::{TimeZone, Utc};
 
     pub(super) fn record(id: i64, title: &str, author: &str, toc_url: &str, tags: &[&str]) -> NovelRecord {

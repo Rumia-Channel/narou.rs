@@ -307,6 +307,20 @@ sample/
 - **カクヨム (ID=1177354055617350769)**: **完全互換達成** — 行数完全一致 (25,273/25,273)、行単位 diff 0件。`cargo test` の `tests/convert_parity.rs` で byte-for-byte fixture テスト通過
 - ※米印変換、全角数字、ルビ、auto_join_line、各種文字変換も完全一致
 
+### AozoraEpub3_Lite 組み込みエンジン (lite feature, 2026-09)
+- pin: `aozora_epub3_lite` = `1c3fca6` (v0.1.3)。更新時は `Cargo.toml` の `rev` を書き換えて `cargo update -p aozora_epub3_lite`。
+- 組み立ては Lite CLI (`main.rs::convert_input`) と同じ公開 API を使う。独自実装 (挿絵の連番化・外字フォント収集・UUID 生成) は持たない。
+  - `config_for(aozoraepub3dir)` = `AozoraConfig::load_from_dirs([dir], <dir>/AozoraEpub3.ini)`。Java 版と同じ注記表・外字フォント・INI を読む。INI が無ければ `preset/AozoraEpub3.ini` 相当のフラグ。
+  - `build_book(input_txt, options)`: `collect_assets` → `decorate_image_tags` → `rewrite_image_source` → `remove_missing_image_sources` → `remove_image_sources` (自動表紙) → `reflow_image_sections` → `build_metadata` (`urn:uuid:` は Java と同じ `java_name_uuid`) → `build_title_page_markup` → `append_gaiji_assets`。
+  - 挿絵は `EpubBuild::resolve` が書き出し時に 1 枚ずつ読み、`image::process` (余白除去・リサイズ・回転) をかける。寸法だけ事前に読む。
+- narou カスタム注記 (`preset/custom_chuki_tag.txt`, 21 行) は `include_str!` で常に重ねる。`init` がインストール先 `chuki_tag.txt` に書き込む内容と同一なので、同梱資産だけで動く wasm / 未設定時でも `ここから柱` / 前書き / 後書き / 一字下げ 等が効く。
+- `preset/AozoraEpub3.ini` も `include_str!` し、`aozoraepub3dir` が無いときの既定にする (`IniSettings::parse` → `AozoraConfig::from_ini`)。Java 版は常にこの INI (init がインストール先へコピーしたもの) を読むため、外部 AozoraEpub3 が無い環境でも `TitlePage` / `CoverPage` / `SpaceHyphenation` / `DakutenType` などのフラグが一致する。実測: 資産なしでも Java と 419/423 バイト一致。
+- 同梱 `replace.txt` は読み込まない (削除済み)。Java は narou.rb 構成では `replace.txt` を持たない (配布物は `replace_sample.txt`) ため、読み込むと `－`→`―` など不要な文字置換が入り Java とずれる。
+- 残差: 外字フォント (`gaiji/dakuten/*.ttf`) は `aozoraepub3dir` が無いと格納できない。`AozoraConfig::gaiji_fonts` がパス指定のため、同梱資産 (バイト列) からは渡せない。Java は濁点外字に `<span class="glyph u30fc-u309a">` を出すが Lite は素の文字になる (この差は外字を使う小説でのみ発生)。
+- **注意**: `aozoraepub3dir` を設定すると CLI は外部ツール (jar / Lite exe) を優先する (narou.rb と同じ)。組み込みエンジンを強制する設定は持たない。
+- 実データ検証 (2026-09-15, v0.1.3): `WebNovel` の n0421du (401 セクション) で Java 版と **422/423 ファイルがバイト完全一致**、挿絵入りでも **425/426 がバイト完全一致**（単ページ画像化・連番・表紙処理を含む）。残差は `dcterms:modified` のみ（Java はローカル時刻に `Z`、Lite は UTC。Lite 側の意図的な非再現）。
+- 検証手順は `docs/aozora_lite_evaluation_2026-08-23.md` の「更新 (2026-09-15)」節。
+
 ### ダウンロード互換性
 - なろう (n8858hb, 24セクション) DL完走確認済み
 - カクヨム (ID=2, 294セクション) DL完走確認済み
@@ -412,13 +426,12 @@ For each section:
 - **Web framework**: Axum 0.8
 - **Async runtime**: Tokio (full features)
 - **Serialization**: serde + serde_yaml + serde_json
-- **HTTP client**: reqwest (blocking, cookies, gzip/brotli/deflate) + curl crate
+- **HTTP client**: reqwest (blocking + async, cookies, gzip/brotli/deflate, native-tls via `native-tls-vendored`) + curl crate。`default-features = false` で rustls を避けている (Windows で aws-lc-rs の NASM 依存を踏まないため)
 - **CLI**: clap 4
 - **Date/time**: chrono + chrono-tz
 - **Regex**: regex
 - **Hashing**: sha2 + hex
 - **Error handling**: thiserror
-- **Template**: askama
 - **Logging**: tracing + tracing-subscriber
 - **Sync**: parking_lot, dashmap, tokio::sync
 - **Browser open**: open
@@ -427,3 +440,4 @@ For each section:
 - **Random UA**: ua_generator
 - **管理DB**: SQLite (`rusqlite` bundled, optional dep / native-runtime)。`NAROU_RS_LEGACY_YAML=1` でレガシーYAML運用に切替
 - **EPUB エンジン (オプション)**: `aozora_epub3_lite` (git 依存, rev pin) — cargo feature `lite` で有効化。`worker-runtime` は自動的に `lite` を含む。`lite` ビルドは GPL-3.0-only (assets/aozora_lite/LICENSE.md)、無しは従来どおり BSD-2-Clause + 外部 AozoraEpub3 プロセス。
+- **サードパーティライセンス**: `cargo-about` で 2 種類生成する。GPL 側は `about.toml` + `--workspace` → `Third-Party-License.md`（`aozora_epub3_lite` と `narou_worker` に限り GPL-3.0-only を crate 単位で許可）。非 GPL 側は `about-non-gpl.toml` + `about-probe/`（`lite` 無しの `narou_rs` に依存する切り離し manifest）→ `Third-Party-License-non-GPL.md` で、GPL を一切許可しないゲートを兼ねる。`worker_entry` が `worker-runtime` 経由で `lite` を常時有効化するため、workspace 直下の走査は必ず GPL 側になる。生成コマンドは `about.hbs` の冒頭に記載。CI (`platform.yml` の `license` job) が両方を再生成して差分ゼロを検証するため、依存を変更したらノーティスも再生成して同時にコミットすること（生成器は `cargo-about` 0.9.2 に固定）。第 3 節の直接依存テーブルは手書きなので、`scripts/check-license-table.py` が `Cargo.toml` と突き合わせる（同じく CI で実行）。依存の追加・削除・要求バージョン変更時は `about.hbs` のテーブルも直すこと。

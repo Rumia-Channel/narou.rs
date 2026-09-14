@@ -163,11 +163,19 @@ fn create_local_package(
     for dir in ["webnovel", "preset"] {
         copy_dir_recursive(&root.join(dir), &package_root.join(dir))?;
     }
-    for file in ["LICENSE", "README.md", "Third-Party-License.md"] {
+    for file in ["LICENSE", "README.md"] {
         let source = root.join(file);
         if source.is_file() {
             copy_file(&source, &package_root.join(file))?;
         }
+    }
+    // local-build always builds the default feature set, so the resulting
+    // package is the non-GPL one. Ship the notice that excludes copyleft
+    // (`about-non-gpl.toml` against `about-probe/`), under the same file name
+    // the release archives use.
+    let notice = root.join("Third-Party-License-non-GPL.md");
+    if notice.is_file() {
+        copy_file(&notice, &package_root.join("Third-Party-License.md"))?;
     }
     fs::write(
         package_root.join("commitversion"),

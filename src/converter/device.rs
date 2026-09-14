@@ -137,6 +137,17 @@ pub struct OutputManager {
     no_strip: bool,
     use_dakuten_font: bool,
     yokogaki: bool,
+    #[cfg(feature = "lite")]
+    lite_epub: Option<LiteEpubContext>,
+}
+
+/// `lite` feature での組み込み EPUB 生成に必要なメタ情報。
+/// `None` 項目は変換済みテキストから検出する。
+#[cfg(feature = "lite")]
+#[derive(Debug, Clone, Default)]
+pub struct LiteEpubContext {
+    pub title: String,
+    pub author: String,
 }
 
 fn file_contains_dakuten_chuki(path: &Path) -> bool {
@@ -156,11 +167,20 @@ impl OutputManager {
             no_strip: false,
             use_dakuten_font: false,
             yokogaki: false,
+            #[cfg(feature = "lite")]
+            lite_epub: None,
         }
     }
-
     pub fn with_verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
+        self
+    }
+
+    /// `lite` feature の組み込み EPUB 生成に使うメタ情報を設定する。
+    /// 外部 AozoraEpub3 が見つからない場合のフォールバックとして使われる。
+    #[cfg(feature = "lite")]
+    pub fn with_lite_epub(mut self, context: LiteEpubContext) -> Self {
+        self.lite_epub = Some(context);
         self
     }
 
@@ -631,15 +651,15 @@ impl OutputManager {
     ) -> Result<PathBuf> {
         match self.device {
             Device::Text => Ok(input_txt.to_path_buf()),
-            Device::Epub => self.run_aozora_epub3(input_txt, output_dir, ".epub"),
-            Device::Kobo => self.run_aozora_epub3(input_txt, output_dir, ".kepub.epub"),
+            Device::Epub => self.epub_output(input_txt, output_dir, ".epub"),
+            Device::Kobo => self.epub_output(input_txt, output_dir, ".kepub.epub"),
             Device::Ibunko => self.create_ibunko_zip(input_txt, include_illust),
-            Device::Reader => self.run_aozora_epub3(input_txt, output_dir, ".epub"),
-            Device::Ibooks => self.run_aozora_epub3(input_txt, output_dir, ".epub"),
+            Device::Reader => self.epub_output(input_txt, output_dir, ".epub"),
+            Device::Ibooks => self.epub_output(input_txt, output_dir, ".epub"),
             Device::Mobi => {
                 let temp_input = output_dir.join(format!("{}_mobi_source.txt", base_name));
                 std::fs::copy(input_txt, &temp_input)?;
-                let epub_temp = match self.run_aozora_epub3(&temp_input, output_dir, ".epub") {
+                let epub_temp = match self.epub_output(&temp_input, output_dir, ".epub") {
                     Ok(path) => path,
                     Err(err) => {
                         let _ = std::fs::remove_file(&temp_input);
@@ -706,6 +726,61 @@ impl OutputManager {
                 Ok(mobi_output)
             }
         }
+    }
+
+    /// EPUB 出力の入口。外部 AozoraEpub3 が見つかればそれを使い、
+    /// 見つからなければ `lite` feature の組み込みエンジンへフォールバックする。
+    fn epub_output(&self, input_txt: &Path, output_dir: &Path, output_ext: &str) -> Result<PathBuf> {
+        if self.aozora_epub3_path.is_some() {
+            return self.run_aozora_epub3(input_txt, output_dir, output_ext);
+        }
+        #[cfg(feature = "lite")]
+        {
+            return self.run_lite_epub(input_txt, output_dir, output_ext);
+        }
+        #[cfg(not(feature = "lite"))]
+        {
+            self.run_aozora_epub3(input_txt, output_dir, output_ext)
+        }
+    }
+
+    /// `lite` feature の組み込み EPUB エンジンで生成する。挿絵は入力テキストの
+    /// 階層から解決する (Java 版と同じ規約)。
+    #[cfg(feature = "lite")]
+    fn run_lite_epub(&self, input_txt: &Path, output_dir: &Path, output_ext: &str) -> Result<PathBuf> {
+        let context = self.lite_epub.clone().unwrap_or_default();
+        // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
+        let options = crate::epub_lite::EpubBuildOptions {
+            title: context.title.clone(),
+            author: context.author.clone(),
+            vertical: !self.yokogaki,
+            // Java 経路と同じ条件で `-c 0` (先頭の挿絵を表紙にする) を渡す。
+            cover_from_first_image: input_txt.parent().is_some_and(has_cover_image),
+            assets_dir: crate::compat::aozora_assets_dir(),
+            kindle: matches!(self.device, Device::Mobi),
+        };
+        let build = crate::epub_lite::build_book(input_txt, &options)?;
+
+        let base_name = input_txt
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| NarouError::Conversion("Invalid input filename".into()))?;
+        let output_path = output_dir.join(format!("{}{}", base_name, output_ext));
+        if output_path.exists() {
+            std::fs::remove_file(&output_path).map_err(|e| {
+                NarouError::Conversion(format!(
+                    "Failed to remove existing output file {}: {}",
+                    output_path.display(),
+                    e
+                ))
+            })?;
+        }
+        let file = std::fs::File::create(&output_path)?;
+        crate::epub_lite::stream_epub(&build.book, file, |epub_path| build.resolve(epub_path))?;
+        if self.verbose {
+            eprintln!("AozoraEpub3_Lite (組み込み) でEPUBに変換しました");
+        }
+        Ok(output_path)
     }
 
     pub fn available_devices() -> Vec<(String, bool)> {
@@ -1340,6 +1415,8 @@ mod tests {
             no_strip: false,
             use_dakuten_font: false,
             yokogaki: false,
+            #[cfg(feature = "lite")]
+            lite_epub: None,
         }
     }
 

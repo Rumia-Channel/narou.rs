@@ -50,6 +50,17 @@ $variantSuffix = if ([string]::IsNullOrWhiteSpace($Variant)) { "" } else { "-$Va
 $archiveName = "narou_rs_{0}_{1}{2}.zip" -f $Platform, $Arch, $variantSuffix
 $archivePath = Join-Path -Path $resolvedOutputDir -ChildPath $archiveName
 
+# 同梱するサードパーティライセンス全文。GPL 版は GPL-3.0-only の
+# AozoraEpub3_Lite を含むため GPL 記載のあるノーティスを、非 GPL 版は
+# copyleft を含まないノーティスを選ぶ。どちらもアーカイブ内では
+# Third-Party-License.md という名前で入る。
+$LicenseNoticeSource = if ([string]::IsNullOrWhiteSpace($Variant)) {
+    "Third-Party-License-non-GPL.md"
+}
+else {
+    "Third-Party-License.md"
+}
+
 if (Test-Path -Path $archivePath -PathType Leaf) {
     Remove-Item -Path $archivePath -Force
 }
@@ -170,15 +181,31 @@ try {
         if ([string]::IsNullOrWhiteSpace($extraFile)) {
             continue
         }
-        if (-not (Test-Path -Path $extraFile -PathType Leaf)) {
+
+        # 同梱するサードパーティライセンス全文はバリアントで異なる。GPL 版は
+        # GPL-3.0-only の AozoraEpub3_Lite を含むため GPL 記載のある
+        # ノーティスを、非 GPL 版は copyleft を含まないノーティスを使う。
+        # アーカイブ内のファイル名はどちらも Third-Party-License.md にする。
+        $entryName = [System.IO.Path]::GetFileName($extraFile)
+        $sourceFile = $extraFile
+        if ($entryName -eq "Third-Party-License.md") {
+            $noticeDir = [System.IO.Path]::GetDirectoryName($extraFile)
+            $sourceFile = if ([string]::IsNullOrWhiteSpace($noticeDir)) {
+                $LicenseNoticeSource
+            }
+            else {
+                Join-Path -Path $noticeDir -ChildPath $LicenseNoticeSource
+            }
+        }
+        if (-not (Test-Path -Path $sourceFile -PathType Leaf)) {
             continue
         }
 
-        $resolvedExtraFile = (Resolve-Path -Path $extraFile).Path
+        $resolvedExtraFile = (Resolve-Path -Path $sourceFile).Path
         Add-FileToArchive `
             -Archive $archive `
             -SourcePath $resolvedExtraFile `
-            -EntryPath (Join-Path -Path $PackageRoot -ChildPath ([System.IO.Path]::GetFileName($resolvedExtraFile)))
+            -EntryPath (Join-Path -Path $PackageRoot -ChildPath $entryName)
     }
 
     $commitEntry = $archive.CreateEntry((Join-Path -Path $PackageRoot -ChildPath "commitversion").Replace('\', '/'))
