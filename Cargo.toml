@@ -89,8 +89,8 @@ getrandom = { version = "0.4", optional = true }
 fs2 = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
 url = "2"
-rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
-aozora_epub3_lite = { git = "https://github.com/Rumia-Channel/AozoraEpub3_Lite", rev = "69f6904", optional = true }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+aozora_epub3_lite = { git = "https://github.com/Rumia-Channel/AozoraEpub3_Lite", rev = "89ae0b6", optional = true }
 base64 = "0.22"
 miniz_oxide = "0.9"
 brotli = "9.0"
