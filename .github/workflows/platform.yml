@@ -93,3 +93,7 @@ jobs:
           cargo-about generate -m about-probe/Cargo.toml -c about-non-gpl.toml --locked --offline -o Third-Party-License-non-GPL.md about.hbs
       - name: Committed notices are current
         run: git diff --exit-code -- Third-Party-License.md Third-Party-License-non-GPL.md
+      # Section 3 is written by hand; regenerating the notices would not notice
+      # a stale table, so compare it against the manifest.
+      - name: Direct dependency table is current
+        run: python3 scripts/check-license-table.py

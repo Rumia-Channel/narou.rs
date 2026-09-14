@@ -24,6 +24,10 @@ CI regenerates both and fails on any difference (the `license` job in
 `.github/workflows/platform.yml`), pinning `cargo-about` 0.9.2. Use the same
 version when regenerating locally, or the output will differ.
 
+Section 3 below is written by hand. `scripts/check-license-table.py` (also run
+in CI) compares it with `Cargo.toml`, because regeneration alone would keep a
+stale table unchanged.
+
 
 ## 1. narou_rs itself
 
