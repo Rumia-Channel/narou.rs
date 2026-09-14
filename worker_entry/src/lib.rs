@@ -132,6 +132,43 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
     Response::from_json(&value)
 }
 
+/// `ObjectStore` から取り込んだテキストと挿絵を、Lite の入力層へ渡すための
+/// メモリ実装。ファイルシステムを持たない wasm ではこの経路で EPUB を組む。
+#[derive(Debug)]
+struct MemorySource {
+    names: Vec<String>,
+    files: Vec<(String, Vec<u8>)>,
+}
+
+impl MemorySource {
+    fn new(text: String, mut images: Vec<(String, Vec<u8>)>) -> Self {
+        let mut files = vec![("novel.txt".to_string(), text.into_bytes())];
+        files.append(&mut images);
+        let names = files.iter().map(|(name, _)| name.clone()).collect();
+        Self { names, files }
+    }
+}
+
+impl narou_rs::epub_lite::FileSource for MemorySource {
+    fn list(&self) -> &[String] {
+        &self.names
+    }
+
+    fn open(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Box<dyn std::io::Read + Send>>, narou_rs::epub_lite::InputError>
+    {
+        Ok(self
+            .files
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, bytes)| {
+                Box::new(std::io::Cursor::new(bytes.clone())) as Box<dyn std::io::Read + Send>
+            }))
+    }
+}
+
 /// GET /api/novels/:id/download.epub — build the EPUB from the stored
 /// converted text (`novel.txt` object) at download time and return it as the
 /// response body. Illustrations are read from the object store through a
@@ -183,7 +220,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     // them from memory without touching storage mid-stream.
     const MAX_IMAGES: usize = 512;
     const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
-    let mut prefetched: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    let mut prefetched: Vec<(String, Vec<u8>)> = Vec::new();
     let mut total = 0usize;
     let Ok(illust_prefix) = narou_rs::platform::ObjectPrefix::new(format!(
         "{}/挿絵",
@@ -191,6 +228,12 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     )) else {
         return Response::error("Invalid illustration prefix", 500);
     };
+    // 挿絵は入力テキストの階層 (`<小説ディレクトリ>/挿絵/...`) にある前提で渡す。
+    let text_parent = text_key
+        .as_ref()
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_owned())
+        .unwrap_or_default();
     let mut cursor = None;
     loop {
         let mut request =
@@ -206,12 +249,17 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
             }
             let key = meta.key;
             let name = key.as_ref().rsplit('/').next().unwrap_or_default().to_string();
-            if narou_rs::epub_lite::media_type_for(&name).is_none() {
+            if !narou_rs::epub_lite::is_supported_image(&name) {
                 continue;
             }
             if let Ok(Some(bytes)) = services.objects.read_small(&key).await {
                 total += bytes.len();
-                prefetched.insert(format!("image/{name}"), bytes);
+                let entry = if text_parent.is_empty() {
+                    format!("挿絵/{name}")
+                } else {
+                    format!("{text_parent}/挿絵/{name}")
+                };
+                prefetched.push((entry, bytes));
                 if total > MAX_IMAGE_BYTES {
                     break;
                 }
@@ -223,25 +271,25 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         }
     }
 
-    let images = narou_rs::epub_lite::image_entries(&text)
-        .into_iter()
-        .filter(|image| prefetched.contains_key(&image.epub_path))
-        .collect::<Vec<_>>();
     let options = narou_rs::epub_lite::EpubBuildOptions {
         title: record.title.clone(),
         author: record.author.clone(),
-        source_id: format!("narou:{id}"),
         vertical: true,
-        cover_from_first_image: !images.is_empty(),
+        cover_from_first_image: !prefetched.is_empty(),
+        assets_dir: None,
+        kindle: false,
     };
-    let book = match narou_rs::epub_lite::build_book(&text, &options, &images) {
-        Ok(book) => book,
+    let build = match narou_rs::epub_lite::build_book_from_source(
+        std::sync::Arc::new(MemorySource::new(text.clone(), prefetched)),
+        &options,
+    ) {
+        Ok(build) => build,
         Err(error) => return Response::error(&format!("EPUB build failed: {error}"), 500),
     };
     let mut body = Vec::new();
-    if let Err(error) = narou_rs::epub_lite::stream_epub(&book, &mut body, |path| {
-        prefetched.get(path).cloned()
-    }) {
+    if let Err(error) =
+        narou_rs::epub_lite::stream_epub(&build.book, &mut body, |path| build.resolve(path))
+    {
         return Response::error(&format!("EPUB write failed: {error}"), 500);
     }
 

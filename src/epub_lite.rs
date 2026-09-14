@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use aozora_epub3_lite::{
-    AozoraConfig, EpubBook, Input, NavChapter, StyleSettings, TitleType,
+    AozoraConfig, EpubAsset, EpubBook, Input, NavChapter, StyleSettings, TitleType,
     aozora_text_to_xhtml_sections_with_chapters, build_metadata, build_title_page_markup,
     collect_assets, collect_image_alts, decode_text, decorate_image_tags, detect_meta_with_gaiji,
     escape_html, image_references, inline_to_xhtml, is_auto_cover, remove_image_sources,
@@ -27,6 +27,9 @@ use aozora_epub3_lite::{
 use aozora_epub3_lite::pipeline::append_gaiji_assets;
 
 use crate::error::{NarouError, Result};
+
+/// ライブラリ利用側 (Worker など) が入力源を実装するために使う。
+pub use aozora_epub3_lite::{FileSource, InputError};
 
 /// chuki tables vendored from the Lite crate's bundled assets so that wasm
 /// builds (no filesystem) see the same note definitions as CLI runs.
@@ -121,13 +124,14 @@ pub struct EpubBuildOptions {
     pub kindle: bool,
 }
 
-/// 書き出し時に読み出す挿絵。パスは入力テキストの階層からの相対。
+/// 書き出し時に読み出す挿絵。
 #[derive(Debug, Clone)]
 pub struct EpubImageSource {
     /// Path inside the EPUB, e.g. `image/0001.png`.
     pub epub_path: String,
-    /// 実際に読み出すファイル (入力テキストの階層からの相対パス)。
-    pub file_path: PathBuf,
+    /// 読み出し名 (TXT 入力なら入力テキストの階層からの相対パス、ObjectStore
+    /// 入力なら論理キー)。
+    pub source: String,
     pub media_type: String,
     /// 表紙として書き出すか (Java は表紙だけ余白処理の条件が違う)。
     pub is_cover: bool,
@@ -141,6 +145,7 @@ pub struct EpubBuild {
     pub book: EpubBook,
     pub images: Vec<EpubImageSource>,
     config: AozoraConfig,
+    input: Input,
 }
 
 impl EpubBuild {
@@ -152,7 +157,16 @@ impl EpubBuild {
             .images
             .iter()
             .find(|image| image.epub_path == epub_path)?;
-        let data = std::fs::read(&image.file_path).ok()?;
+        let data = self
+            .input
+            .read_image(&image.source)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                // TXT 入力はファイルシステムから読む (Lite CLI と同じ)。
+                let base = self.input.path().parent()?;
+                std::fs::read(base.join(image.source.replace('\\', "/"))).ok()
+            })?;
         aozora_epub3_lite::image::process(
             &data,
             &image.media_type,
@@ -163,6 +177,16 @@ impl EpubBuild {
         .ok()
     }
 }
+
+/// 挿絵として格納できる拡張子か。ObjectStore の一覧から拾うときに使う。
+pub fn is_supported_image(file_name: &str) -> bool {
+    file_name
+        .rsplit_once('.')
+        .and_then(|(_, extension)| {
+            aozora_epub3_lite::pipeline::media_type_for_extension(extension)
+        })
+        .is_some()
+}
 /// 変換済みテキストから EPUB を組み立てる。手順は Lite CLI
 /// (`main.rs::convert_input`) と同じで、注記表・外字フォント・INI は
 /// `aozoraepub3dir` から Java 版と同じものを読む。
@@ -170,7 +194,6 @@ impl EpubBuild {
 /// 画像は寸法だけをここで読み、バイト列は書き出し時に [`EpubBuild::resolve`]
 /// が 1 枚ずつ読み出して前処理する。
 pub fn build_book(input_txt: &Path, options: &EpubBuildOptions) -> Result<EpubBuild> {
-    let mut config = config_for(options.assets_dir.as_deref());
     let input = Input::open(input_txt).map_err(|error| {
         NarouError::Conversion(format!(
             "変換済みテキストを開けません ({}): {}",
@@ -178,6 +201,132 @@ pub fn build_book(input_txt: &Path, options: &EpubBuildOptions) -> Result<EpubBu
             error
         ))
     })?;
+    build_from_input(input, options)
+}
+
+/// ファイルシステムの無いランタイム (wasm / ObjectStore) 向け。入力テキストと
+/// 挿絵を [`FileSource`] から供給して EPUB を組み立てる。
+///
+/// 注意: Lite の画像パイプライン (`collect_assets`) は現状 `FileSource` 入力の
+/// 挿絵を解決できない (内部で `Input::is_archive()` しか見ていない) ため、この経路
+/// では単ページ画像化・連番・表紙処理を行わず、注記のパスをそのまま格納先に
+/// して参照が解決するようにする。ネイティブ経路 (`build_book`) は Java と同じ
+/// パイプラインを通る。
+///
+/// [FileSource]: aozora_epub3_lite::FileSource
+pub fn build_book_from_source(
+    source: std::sync::Arc<dyn aozora_epub3_lite::FileSource>,
+    options: &EpubBuildOptions,
+) -> Result<EpubBuild> {
+    let input = Input::from_source(source).map_err(|error| {
+        NarouError::Conversion(format!("入力テキストを開けません: {error}"))
+    })?;
+    let Some(entry) = input.text_entries().first() else {
+        return Err(NarouError::Conversion(
+            "変換済みテキストが空です".to_string(),
+        ));
+    };
+    let bytes = input.read_text(entry).map_err(|error| {
+        NarouError::Conversion(format!("変換済みテキストを読めません: {error}"))
+    })?;
+    let text = decode_text(&bytes, Some("UTF-8")).map_err(|error| {
+        NarouError::Conversion(format!("変換済みテキストを復号できません: {error}"))
+    })?;
+
+    let mut config = config_for(options.assets_dir.as_deref());
+    let detected = detect_meta_with_gaiji(&text, TitleType::TitleAuthor, false, &config.gaiji);
+    let body = remove_metadata_lines(&text, &detected);
+    config.image_alt_map.clear();
+    collect_image_alts(&body, &mut config);
+    let (sections, records) =
+        aozora_text_to_xhtml_sections_with_chapters(&body, &config, detected.title_line.is_none())
+            .map_err(|error| NarouError::Conversion(format!("EPUB変換に失敗しました: {error}")))?;
+
+    // 注記のパスをそのまま EPUB の格納先にする (レンダラが同じパスを参照する)。
+    let mut images = Vec::new();
+    let mut epub_assets = Vec::new();
+    for reference in image_references(&text) {
+        let Some(source_path) = input.resolve_image_path(entry, &reference) else {
+            continue;
+        };
+        let Some(extension) = source_path.rsplit_once('.').map(|(_, extension)| extension) else {
+            continue;
+        };
+        let Some(media_type) =
+            aozora_epub3_lite::pipeline::media_type_for_extension(extension)
+        else {
+            continue;
+        };
+        let epub_path = format!("image/{source_path}");
+        epub_assets.push(EpubAsset::lazy(epub_path.clone(), media_type));
+        images.push(EpubImageSource {
+            epub_path,
+            source: source_path,
+            media_type: media_type.to_string(),
+            is_cover: false,
+            rotate: 0,
+        });
+    }
+
+    let chapters = nav_chapters(records, &config);
+    let title = if options.title.is_empty() {
+        detected.title.clone().unwrap_or_default()
+    } else {
+        options.title.clone()
+    };
+    let creator = if options.author.is_empty() {
+        detected.creator.clone()
+    } else {
+        Some(options.author.clone())
+    };
+    let metadata = build_metadata(&title, creator.as_deref(), None, None);
+    let book = EpubBook::from_sections(metadata, sections)
+        .with_vertical(options.vertical)
+        .with_style(StyleSettings::from_ini(&config.ini))
+        .with_toc_page(config.toc_page)
+        .with_toc_vertical(config.toc_vertical)
+        .with_toc_nest(config.nav_nest, config.ncx_nest)
+        .with_title_toc(config.title_toc)
+        .with_kindle(options.kindle)
+        .with_chapters(chapters)
+        .with_assets(epub_assets);
+
+    Ok(EpubBuild {
+        book,
+        images,
+        config,
+        input,
+    })
+}
+
+/// 章レコードを nav/NCX 用の並びへ変換する (Java `Epub3Writer` と同じ規則)。
+fn nav_chapters(records: Vec<aozora_epub3_lite::ChapterRecord>, config: &AozoraConfig) -> Vec<NavChapter> {
+    records
+        .into_iter()
+        .map(|record| {
+            // Java Epub3Writer: TocVertical のときだけ章名をエスケープ後に
+            // 縦中横変換へ通す。
+            let (label, markup) = if config.toc_vertical {
+                (tcy_label(&escape_html(&record.label), config), true)
+            } else {
+                (record.label, false)
+            };
+            let mut chapter = NavChapter::new(
+                label,
+                format!("xhtml/{:04}.xhtml", record.section_index + 1),
+            )
+            .with_level(record.level)
+            .with_markup(markup);
+            if let Some(anchor) = record.anchor {
+                chapter = chapter.with_anchor(anchor);
+            }
+            chapter
+        })
+        .collect()
+}
+
+fn build_from_input(input: Input, options: &EpubBuildOptions) -> Result<EpubBuild> {
+    let mut config = config_for(options.assets_dir.as_deref());
     let Some(entry) = input.text_entries().first() else {
         return Err(NarouError::Conversion(
             "変換済みテキストが空です".to_string(),
@@ -235,28 +384,7 @@ pub fn build_book(input_txt: &Path, options: &EpubBuildOptions) -> Result<EpubBu
     }
     reflow_image_sections(&mut sections, &mut records, &assets, &config);
 
-    let chapters = records
-        .into_iter()
-        .map(|record| {
-            // Java Epub3Writer: TocVertical のときだけ章名をエスケープ後に
-            // 縦中横変換へ通す。
-            let (label, markup) = if config.toc_vertical {
-                (tcy_label(&escape_html(&record.label), &config), true)
-            } else {
-                (record.label, false)
-            };
-            let mut chapter = NavChapter::new(
-                label,
-                format!("xhtml/{:04}.xhtml", record.section_index + 1),
-            )
-            .with_level(record.level)
-            .with_markup(markup);
-            if let Some(anchor) = record.anchor {
-                chapter = chapter.with_anchor(anchor);
-            }
-            chapter
-        })
-        .collect::<Vec<_>>();
+    let chapters = nav_chapters(records, &config);
 
     let title = if options.title.is_empty() {
         detected.title.clone().unwrap_or_default()
@@ -335,16 +463,11 @@ pub fn build_book(input_txt: &Path, options: &EpubBuildOptions) -> Result<EpubBu
             .with_cover_dimensions(dimensions);
     }
 
-    let base = input
-        .path()
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
     let images = assets
         .iter()
         .map(|collected| EpubImageSource {
             epub_path: collected.asset.path.clone(),
-            file_path: base.join(collected.source.replace('\\', "/")),
+            source: collected.source.clone(),
             media_type: collected.asset.media_type.clone(),
             is_cover: collected.is_cover,
             rotate: collected.rotate,
@@ -355,6 +478,7 @@ pub fn build_book(input_txt: &Path, options: &EpubBuildOptions) -> Result<EpubBu
         book,
         images,
         config,
+        input,
     })
 }
 
@@ -380,6 +504,7 @@ pub fn stream_epub<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     const SAMPLE: &str = "テスト小説\nテスト著者\n\n　これはテストです。ルビ《てすと》の確認。\n";
 
@@ -475,6 +600,53 @@ mod tests {
         let needle = b"item/image/0001.png";
         assert!(bytes.windows(needle.len()).any(|window| window == needle));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn builds_from_an_in_memory_source() {
+        // Worker (wasm) と同じ経路: ファイルシステム無しで入力と挿絵を渡す。
+        #[derive(Debug)]
+        struct Memory {
+            files: Vec<(String, Vec<u8>)>,
+            names: Vec<String>,
+        }
+        impl FileSource for Memory {
+            fn list(&self) -> &[String] {
+                &self.names
+            }
+            fn open(
+                &self,
+                name: &str,
+            ) -> std::result::Result<Option<Box<dyn std::io::Read + Send>>, InputError> {
+                Ok(self
+                    .files
+                    .iter()
+                    .find(|(candidate, _)| candidate == name)
+                    .map(|(_, bytes)| {
+                        Box::new(std::io::Cursor::new(bytes.clone())) as Box<dyn std::io::Read + Send>
+                    }))
+            }
+        }
+
+        let png: &[u8] = b"\x89PNG\r\n\x1a\nstub";
+        let text = format!("{SAMPLE}\n　挿絵。［＃挿絵（挿絵/i1.png）入る］\n");
+        let files = vec![
+            ("novel.txt".to_string(), text.into_bytes()),
+            ("挿絵/i1.png".to_string(), png.to_vec()),
+        ];
+        let names = files.iter().map(|(name, _)| name.clone()).collect();
+        let build = build_book_from_source(Arc::new(Memory { files, names }), &options()).unwrap();
+
+        // この経路は番号化しないので、注記のパスがそのまま格納先になる。
+        assert_eq!(build.images.len(), 1);
+        assert_eq!(build.images[0].epub_path, "image/挿絵/i1.png");
+        assert_eq!(build.resolve("image/挿絵/i1.png").as_deref(), Some(png));
+
+        // 本文の参照 (<img src="../image/挿絵/i1.png">) と格納先が一致すること。
+        let mut bytes = Vec::new();
+        stream_epub(&build.book, &mut bytes, |path| build.resolve(path)).unwrap();
+        let needle = "item/image/挿絵/i1.png".as_bytes();
+        assert!(bytes.windows(needle.len()).any(|window| window == needle));
     }
 
     #[test]
