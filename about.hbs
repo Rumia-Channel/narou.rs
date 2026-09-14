@@ -20,6 +20,10 @@ cargo-about generate --workspace --locked --offline -c about.toml -o Third-Party
 cargo-about generate -m about-probe/Cargo.toml -c about-non-gpl.toml --locked --offline -o Third-Party-License-non-GPL.md about.hbs
 ```
 
+CI regenerates both and fails on any difference (the `license` job in
+`.github/workflows/platform.yml`), pinning `cargo-about` 0.9.2. Use the same
+version when regenerating locally, or the output will differ.
+
 
 ## 1. narou_rs itself
 
