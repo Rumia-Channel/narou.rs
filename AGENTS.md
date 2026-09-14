@@ -412,13 +412,12 @@ For each section:
 - **Web framework**: Axum 0.8
 - **Async runtime**: Tokio (full features)
 - **Serialization**: serde + serde_yaml + serde_json
-- **HTTP client**: reqwest (blocking, cookies, gzip/brotli/deflate) + curl crate
+- **HTTP client**: reqwest (blocking + async, cookies, gzip/brotli/deflate, native-tls via `native-tls-vendored`) + curl crate。`default-features = false` で rustls を避けている (Windows で aws-lc-rs の NASM 依存を踏まないため)
 - **CLI**: clap 4
 - **Date/time**: chrono + chrono-tz
 - **Regex**: regex
 - **Hashing**: sha2 + hex
 - **Error handling**: thiserror
-- **Template**: askama
 - **Logging**: tracing + tracing-subscriber
 - **Sync**: parking_lot, dashmap, tokio::sync
 - **Browser open**: open
