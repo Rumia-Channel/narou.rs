@@ -1811,7 +1811,7 @@ limitations under the License.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_rs 0.4.0
+- narou_rs 0.4.1
 
 ```text
 BSD 2-Clause License

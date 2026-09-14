@@ -2258,7 +2258,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "narou_rs"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aozora_epub3_lite",
  "axum",
@@ -2315,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "narou_worker"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64 0.23.1",
  "brotli 9.0.0",

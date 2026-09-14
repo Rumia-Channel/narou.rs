@@ -2027,7 +2027,7 @@ limitations under the License.
 ### BSD 2-Clause &quot;Simplified&quot; License (`BSD-2-Clause`)
 
 Used by:
-- narou_rs 0.4.0
+- narou_rs 0.4.1
 
 ```text
 BSD 2-Clause License
@@ -2597,8 +2597,8 @@ insights.
 ### GNU General Public License v3.0 only (`GPL-3.0-only`)
 
 Used by:
-- aozora_epub3_lite 0.1.1
-- narou_worker 0.4.0
+- aozora_epub3_lite 0.1.3
+- narou_worker 0.4.1
 
 ```text
 GNU GENERAL PUBLIC LICENSE
