@@ -13,6 +13,10 @@
 # the scan whenever a copyleft dependency enters the non-GPL graph.
 #
 # It is not a buildable part of the release; nothing here is compiled.
+#
+# `Cargo.lock` is committed so the notice is reproducible. It only needs
+# refreshing when a dependency *requirement* changes (a new `cargo add`/version
+# bump in the root manifest): drop `--locked` from the command above once.
 
 [package]
 name = "narou-license-probe"
