@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::downloader::{Downloader, types};
+use crate::downloader::Downloader;
 use crate::platform::{
     AssetStore, HttpClient, NovelRepository, ObjectStore, RateLimiter, SystemClock,
 };
