@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use narou_rs::db::{Database, NovelRecord};
-use narou_rs::native::sqlite::state::{StorageMode, legacy_yaml_active};
+use narou_rs::native::sqlite::state::StorageMode;
 use narou_rs::platform::{NovelFilter, NovelId};
 
 static SERIES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -128,7 +128,7 @@ let temp = tempfile::tempdir().unwrap();
     )
     .unwrap();
     let state = narou_rs::native::sqlite::state::active_for(&root.join(".narou")).unwrap();
-    let db = Database::with_root(root).unwrap();
+    let _db = Database::with_root(root).unwrap();
 
     let mut filter = NovelFilter::all();
     filter.ncode = Some("n000002".to_string());
@@ -149,7 +149,7 @@ let temp = tempfile::tempdir().unwrap();
         StorageMode::Sqlite,
     )
     .unwrap();
-    let state = narou_rs::native::sqlite::state::active_for(&root.join(".narou")).unwrap();
+    let _state = narou_rs::native::sqlite::state::active_for(&root.join(".narou")).unwrap();
 
     let mut db = Database::with_root(root.clone()).unwrap();
     db.update_records(|records| Ok((records, ()))).unwrap();
@@ -179,7 +179,7 @@ fn p3_perf_smoke_1000_records() {
         StorageMode::Sqlite,
     )
     .unwrap();
-    let state = narou_rs::native::sqlite::state::active_for(&root.join(".narou")).unwrap();
+    let _state = narou_rs::native::sqlite::state::active_for(&root.join(".narou")).unwrap();
     let mut db = Database::with_root(root.clone()).unwrap();
 
     let started = Instant::now();

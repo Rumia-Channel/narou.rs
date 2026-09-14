@@ -392,7 +392,7 @@ mod tests {
     use crate::application::events::FreezeStore as _;
     use crate::application::novel_actions::FreezeMutationStore as _;
     use crate::platform::mocks::MemoryNovelRepository;
-    use crate::platform::{NovelFilter, NovelQuery, NovelSort, NovelSortKey, SearchField, SearchTerm};
+    use crate::platform::{NovelFilter, NovelQuery, NovelSort, NovelSortKey, SearchField};
     use chrono::{TimeZone, Utc};
 
     pub(super) fn record(id: i64, title: &str, author: &str, toc_url: &str, tags: &[&str]) -> NovelRecord {

@@ -29,6 +29,11 @@ impl Drop for CurrentDirGuard {
 
 /// Serialize tests that force the legacy YAML storage backend and toggle the
 /// process-global `NAROU_RS_LEGACY_YAML` escape hatch.
+///
+/// Only lib tests reach this: the `narou_rs` binary's test target compiles this
+/// module too (its own module tree needs [`set_current_dir_for_test`]), but no
+/// module under it exercises the legacy backend.
+#[allow(dead_code)]
 pub(crate) fn legacy_yaml_guard() -> LegacyYamlGuard {
     let lock = LEGACY_LOCK.get_or_init(|| Mutex::new(()));
     let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -37,6 +42,7 @@ pub(crate) fn legacy_yaml_guard() -> LegacyYamlGuard {
     LegacyYamlGuard { _guard: guard }
 }
 
+#[allow(dead_code)]
 pub(crate) struct LegacyYamlGuard {
     _guard: MutexGuard<'static, ()>,
 }
@@ -47,4 +53,5 @@ impl Drop for LegacyYamlGuard {
     }
 }
 
+#[allow(dead_code)]
 static LEGACY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
