@@ -601,14 +601,21 @@ async fn generate_epub_on_demand(
     })?;
 
     let images_dir = novel_dir.join("挿絵");
-    let images = crate::epub_lite::image_entries(&text);
+    let (text, images) = crate::epub_lite::prepare_images(&text);
+    let cover = images.first().filter(|_| settings.enable_illust);
     let options = crate::epub_lite::EpubBuildOptions {
         title: record.title.clone(),
         author: record.author.clone(),
         source_id: record.toc_url.clone(),
         vertical: !settings.enable_yokogaki,
-        cover_from_first_image: !images.is_empty() && settings.enable_illust,
+        cover_from_first_image: cover.is_some(),
+        // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
+        assets_dir: crate::compat::aozora_assets_dir(),
+        kindle: false,
+        cover_dimensions: cover
+            .and_then(|image| crate::epub_lite::cover_dimensions(&images_dir, image)),
     };
+    let image_files = crate::epub_lite::image_names(&images);
     let book = tokio::task::spawn_blocking(move || {
         crate::epub_lite::build_book(&text, &options, &images)
     })
@@ -618,7 +625,7 @@ async fn generate_epub_on_demand(
 
     let mut bytes = Vec::new();
     crate::epub_lite::stream_epub(&book, &mut bytes, |epub_path| {
-        let name = epub_path.strip_prefix("image/")?;
+        let name = image_files.get(epub_path)?;
         std::fs::read(images_dir.join(name)).ok()
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

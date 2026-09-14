@@ -760,7 +760,8 @@ impl OutputManager {
             .images_dir
             .clone()
             .unwrap_or_else(|| input_txt.parent().unwrap_or_else(|| Path::new(".")).join("挿絵"));
-        let images = crate::epub_lite::image_entries(&text);
+        let (text, images) = crate::epub_lite::prepare_images(&text);
+        let cover = images.first();
         let options = crate::epub_lite::EpubBuildOptions {
             title: context.title.clone(),
             author: context.author.clone(),
@@ -771,6 +772,11 @@ impl OutputManager {
             },
             vertical: !self.yokogaki,
             cover_from_first_image: !images.is_empty(),
+            // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
+            assets_dir: crate::compat::aozora_assets_dir(),
+            kindle: matches!(self.device, Device::Mobi),
+            cover_dimensions: cover
+                .and_then(|image| crate::epub_lite::cover_dimensions(&images_dir, image)),
         };
         let book = crate::epub_lite::build_book(&text, &options, &images)?;
 
@@ -789,8 +795,9 @@ impl OutputManager {
             })?;
         }
         let file = std::fs::File::create(&output_path)?;
+        let image_files = crate::epub_lite::image_names(&images);
         crate::epub_lite::stream_epub(&book, file, |epub_path| {
-            let name = epub_path.strip_prefix("image/")?;
+            let name = image_files.get(epub_path)?;
             std::fs::read(images_dir.join(name)).ok()
         })?;
         if self.verbose {
