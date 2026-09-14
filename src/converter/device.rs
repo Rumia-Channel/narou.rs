@@ -148,10 +148,6 @@ pub struct OutputManager {
 pub struct LiteEpubContext {
     pub title: String,
     pub author: String,
-    /// 書籍 ID の安定化に使う識別子 (toc_url など)。
-    pub source_id: String,
-    /// 挿絵ファイルを探すディレクトリ (通常は novel_dir/挿絵)。
-    pub images_dir: Option<PathBuf>,
 }
 
 fn file_contains_dakuten_chuki(path: &Path) -> bool {
@@ -748,37 +744,22 @@ impl OutputManager {
         }
     }
 
-    /// `lite` feature の組み込み EPUB エンジンで生成する。
-    /// 挿絵は `lite_epub.images_dir` (既定: input_txt と同じ階層の `挿絵/`) から解決する。
+    /// `lite` feature の組み込み EPUB エンジンで生成する。挿絵は入力テキストの
+    /// 階層から解決する (Java 版と同じ規約)。
     #[cfg(feature = "lite")]
     fn run_lite_epub(&self, input_txt: &Path, output_dir: &Path, output_ext: &str) -> Result<PathBuf> {
         let context = self.lite_epub.clone().unwrap_or_default();
-        let text = std::fs::read_to_string(input_txt).map_err(|e| {
-            NarouError::Conversion(format!("変換済みテキストの読み込みに失敗: {}", e))
-        })?;
-        let images_dir = context
-            .images_dir
-            .clone()
-            .unwrap_or_else(|| input_txt.parent().unwrap_or_else(|| Path::new(".")).join("挿絵"));
-        let (text, images) = crate::epub_lite::prepare_images(&text);
-        let cover = images.first();
+        // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
         let options = crate::epub_lite::EpubBuildOptions {
             title: context.title.clone(),
             author: context.author.clone(),
-            source_id: if context.source_id.is_empty() {
-                input_txt.display().to_string()
-            } else {
-                context.source_id.clone()
-            },
             vertical: !self.yokogaki,
-            cover_from_first_image: !images.is_empty(),
-            // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
+            // Java 経路と同じ条件で `-c 0` (先頭の挿絵を表紙にする) を渡す。
+            cover_from_first_image: input_txt.parent().is_some_and(has_cover_image),
             assets_dir: crate::compat::aozora_assets_dir(),
             kindle: matches!(self.device, Device::Mobi),
-            cover_dimensions: cover
-                .and_then(|image| crate::epub_lite::cover_dimensions(&images_dir, image)),
         };
-        let book = crate::epub_lite::build_book(&text, &options, &images)?;
+        let build = crate::epub_lite::build_book(input_txt, &options)?;
 
         let base_name = input_txt
             .file_stem()
@@ -795,11 +776,7 @@ impl OutputManager {
             })?;
         }
         let file = std::fs::File::create(&output_path)?;
-        let image_files = crate::epub_lite::image_names(&images);
-        crate::epub_lite::stream_epub(&book, file, |epub_path| {
-            let name = image_files.get(epub_path)?;
-            std::fs::read(images_dir.join(name)).ok()
-        })?;
+        crate::epub_lite::stream_epub(&build.book, file, |epub_path| build.resolve(epub_path))?;
         if self.verbose {
             eprintln!("AozoraEpub3_Lite (組み込み) でEPUBに変換しました");
         }

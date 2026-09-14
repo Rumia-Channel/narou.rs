@@ -1035,8 +1035,6 @@ impl NovelConverter {
         let output_manager = output_manager.with_lite_epub(device::LiteEpubContext {
             title: toc_object.title.clone(),
             author: toc_object.author.clone(),
-            source_id: toc_object.toc_url.clone(),
-            images_dir: Some(novel_dir.join("挿絵")),
         });
         let base_name = txt_path
             .file_stem()
