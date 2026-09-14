@@ -49,3 +49,6 @@ workarounds = [
     "rustls",
     "wasmtime",
 ]
+
+# The probe crate itself is unpublished scaffolding; keep it out of the notice.
+private = { ignore = true }
