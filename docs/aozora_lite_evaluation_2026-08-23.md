@@ -125,6 +125,34 @@ cp -r assets/aozora C:/path/to/tools/
 - Native 変換後、固定名ミラー `novel.txt` を小説ディレクトリへ併せて書き出し (feature `lite` 時)。ObjectStore レイアウト経由で Worker と同じキーで参照できる
 - CI: platform.yml に `native-gpl` job (`--features lite` の check/test/build)。release.yml は全8プラットフォームに GPL 版を追加 (`narou_rs_{plat}_{arch}-GPL.zip`)、package-release.ps1 に `-Variant` 引数を追加。タグ push に加え `workflow_dispatch` で任意ブランチから両 variant の zip を生成可能 (dispatch 時は GitHub Release を作成しない)
 
+### 更新 (2026-09-15): v0.1.3 で Java 出力とほぼ完全一致
+
+Lite 側に資産注入の口が揃ったため、`src/epub_lite.rs` を組み込みエンジンの公開
+パイプラインへ載せ替えた。独自実装（挿絵の連番化、外字フォント収集、UUID 生成）は
+すべて削除し、ライブラリの API を直接使う。
+
+- pin: `aozora_epub3_lite` = `1c3fca6` (v0.1.3)。`Cargo.toml` の `rev` を書き換えて
+  `cargo update -p aozora_epub3_lite`
+- `config_for(aozoraepub3dir)`: `AozoraConfig::load_from_dirs([dir], <dir>/AozoraEpub3.ini)`。
+  Java 版と同じ注記表 (`chuki_*.txt`)・外字フォント (`gaiji/*.ttf`)・INI を読む。
+  INI が無ければ `preset/AozoraEpub3.ini` 相当のフラグを適用
+- `preset/custom_chuki_tag.txt` (21 行) を `include_str!` で常時重ねる。`narou init` が
+  インストール先 `chuki_tag.txt` へ注入する内容と同一なので、同梱資産だけで動く
+  wasm / 未設定時でも `ここから柱` / 前書き / 後書き / 一字下げ 等が効く
+- `build_book(input_txt, options)`: Lite CLI と同じ順で組み立てる —
+  `collect_assets` → `decorate_image_tags` → `rewrite_image_source` →
+  `remove_missing_image_sources` → `remove_image_sources` (自動表紙) →
+  `reflow_image_sections` → `build_metadata` (`urn:uuid:` は Java と同じ
+  `java_name_uuid`) → `build_title_page_markup` → `append_gaiji_assets`
+- 挿絵は `EpubBuild::resolve` が書き出し時に 1 枚ずつ読み、Java と同じ前処理
+  (`image::process`: 余白除去・リサイズ・回転) をかける。寸法だけ事前に読む
+- 表紙は Java 経路と同じ条件 (`cover.jpg/png/jpeg` の有無) で `-c 0` 相当を渡す
+- 実データ検証 (2026-09-15): `WebNovel` の n0421du (401 セクション、濁点外字・
+  custom chuki 使用) で、Java 版 (`java -cp AozoraEpub3.jar AozoraEpub3 -enc UTF-8
+  -of -dst out novel.txt`) と **422/423 ファイルがバイト完全一致**。挿絵を 1 枚
+  入れた入力でも **425/426 がバイト完全一致**（単ページ画像化・連番・表紙処理まで含む）。
+  唯一の差は `dcterms:modified`（Java はローカル時刻に `Z` を付ける、Lite は UTC）
+
 ### 制限
 - Worker の Convert ジョブ自体は引き続き blocked (セクション→テキスト組立の portable 化は後続作業)。DL 時 EPUB は `novel.txt` オブジェクトが存在する場合のみ動作
 - HTTP レイヤはレスポンス全体をバッファしてから返す (Lite 自体はチャンク書き出し対応済み)。真の chunked 転送は後続作業

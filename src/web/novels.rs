@@ -593,42 +593,38 @@ async fn generate_epub_on_demand(
         &toc_object,
         Some(record),
     );
-    let text = std::fs::read_to_string(&txt_path).map_err(|_| {
-        (
+    if !txt_path.is_file() {
+        return Err((
             StatusCode::CONFLICT,
             "Converted text not found: run convert first".to_string(),
-        )
-    })?;
+        ));
+    }
 
-    let images_dir = novel_dir.join("挿絵");
-    let (text, images) = crate::epub_lite::prepare_images(&text);
-    let cover = images.first().filter(|_| settings.enable_illust);
     let options = crate::epub_lite::EpubBuildOptions {
         title: record.title.clone(),
         author: record.author.clone(),
-        source_id: record.toc_url.clone(),
         vertical: !settings.enable_yokogaki,
-        cover_from_first_image: cover.is_some(),
+        cover_from_first_image: settings.enable_illust
+            && txt_path.parent().is_some_and(|dir| {
+                [".jpg", ".png", ".jpeg"]
+                    .iter()
+                    .any(|ext| dir.join(format!("cover{ext}")).is_file())
+            }),
         // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
         assets_dir: crate::compat::aozora_assets_dir(),
         kindle: false,
-        cover_dimensions: cover
-            .and_then(|image| crate::epub_lite::cover_dimensions(&images_dir, image)),
     };
-    let image_files = crate::epub_lite::image_names(&images);
-    let book = tokio::task::spawn_blocking(move || {
-        crate::epub_lite::build_book(&text, &options, &images)
+    let build_path = txt_path.clone();
+    let build = tokio::task::spawn_blocking(move || {
+        crate::epub_lite::build_book(&build_path, &options)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let mut bytes = Vec::new();
-    crate::epub_lite::stream_epub(&book, &mut bytes, |epub_path| {
-        let name = image_files.get(epub_path)?;
-        std::fs::read(images_dir.join(name)).ok()
-    })
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::epub_lite::stream_epub(&build.book, &mut bytes, |epub_path| build.resolve(epub_path))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let filename = txt_path
         .file_name()

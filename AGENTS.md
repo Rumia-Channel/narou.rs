@@ -308,13 +308,15 @@ sample/
 - ※米印変換、全角数字、ルビ、auto_join_line、各種文字変換も完全一致
 
 ### AozoraEpub3_Lite 組み込みエンジン (lite feature, 2026-09)
-- pin: `f379eec` (v0.1.2 + テスト 1 件)。更新時は `Cargo.toml` の `rev` を書き換えて `cargo update -p aozora_epub3_lite`。
-- `src/epub_lite.rs::config_for(aozoraepub3dir)` は Java 版の起動時と同じ資産を読む: `AozoraConfig::load_from_dirs([dir], <dir>/AozoraEpub3.ini)`。`chuki_*.txt` (init が注入した narou カスタム注記込み)、`gaiji/*.ttf`、INI の変換フラグ・スタイルが入る。INI が無い場合は `preset/AozoraEpub3.ini` 相当のフラグを適用。
+- pin: `aozora_epub3_lite` = `1c3fca6` (v0.1.3)。更新時は `Cargo.toml` の `rev` を書き換えて `cargo update -p aozora_epub3_lite`。
+- 組み立ては Lite CLI (`main.rs::convert_input`) と同じ公開 API を使う。独自実装 (挿絵の連番化・外字フォント収集・UUID 生成) は持たない。
+  - `config_for(aozoraepub3dir)` = `AozoraConfig::load_from_dirs([dir], <dir>/AozoraEpub3.ini)`。Java 版と同じ注記表・外字フォント・INI を読む。INI が無ければ `preset/AozoraEpub3.ini` 相当のフラグ。
+  - `build_book(input_txt, options)`: `collect_assets` → `decorate_image_tags` → `rewrite_image_source` → `remove_missing_image_sources` → `remove_image_sources` (自動表紙) → `reflow_image_sections` → `build_metadata` (`urn:uuid:` は Java と同じ `java_name_uuid`) → `build_title_page_markup` → `append_gaiji_assets`。
+  - 挿絵は `EpubBuild::resolve` が書き出し時に 1 枚ずつ読み、`image::process` (余白除去・リサイズ・回転) をかける。寸法だけ事前に読む。
 - narou カスタム注記 (`preset/custom_chuki_tag.txt`, 21 行) は `include_str!` で常に重ねる。`init` がインストール先 `chuki_tag.txt` に書き込む内容と同一なので、同梱資産だけで動く wasm / 未設定時でも `ここから柱` / 前書き / 後書き / 一字下げ 等が効く。
-- `build_book` は Lite CLI (`main.rs::convert_input`) と同じ組み立てをする: metadata strip → `collect_image_alts` → セクション変換 → `tcy_label` 章名 → 表題・著者の `inline_to_xhtml` (TitlePage=2 は縦書き変換なし) → `StyleSettings::from_ini` (text.css) → `CoverPage` / `TitlePage` / `TocVertical` / `with_kindle` → 使用された外字フォントのみ `gaiji/` へ同梱。
-- 挿絵注記は `prepare_images` で Java / Lite CLI と同じ連番 (`0001.png`, `.jpeg`→`.jpg`) に書き換える。Lite は注記パスをそのまま `src` に出し、表紙だけファイル名で参照するため、書き換えないと本文と表紙で参照先が食い違う。
-- 実データ検証 (2026-09-15): `WebNovel` の n0421du (401 セクション, 濁点外字・custom chuki 使用) で、Java 版 (`java -cp AozoraEpub3.jar AozoraEpub3 -enc UTF-8 -of -dst out novel.txt`) と **EPUB 内 423 エントリが完全一致**。text.css / 注記タグ / 外字フォント / 表題ページ / nav / ncx も一致。
-- 既知の残差: (1) 全 xhtml の CRLF (Lite の組み込みテンプレートが CRLF、Java は LF)、(2) `SpaceHyphenation` の全角スペース変換が Java より 126 箇所少ない (Lite CLI でも同じ 1,816 / Java 1,942。行頭 20 文字未満と約物隣接が対象外になっている)、(3) 挿絵の単ページ化・`-c` 表紙処理 (Lite の画像パイプライン `collect_assets` / `decorate_image_tags` / `reflow_image_sections` がライブラリ未公開のため未移植)、(4) `dc:identifier` は Java の UUID ではなく Rust 側の安定ハッシュ (Java 側も入力から決定論的に生成されるが導出規則は未特定)。
+- **注意**: `aozoraepub3dir` が未設定だと資産を読めず、`AozoraEpub3.ini` のスタイル/表紙/表題ページ設定も入らない (Java を起動する場合と同じ前提)。
+- 実データ検証 (2026-09-15, v0.1.3): `WebNovel` の n0421du (401 セクション) で Java 版と **422/423 ファイルがバイト完全一致**、挿絵入りでも **425/426 がバイト完全一致**（単ページ画像化・連番・表紙処理を含む）。残差は `dcterms:modified` のみ（Java はローカル時刻に `Z`、Lite は UTC。Lite 側の意図的な非再現）。
+- 検証手順は `docs/aozora_lite_evaluation_2026-08-23.md` の「更新 (2026-09-15)」節。
 
 ### ダウンロード互換性
 - なろう (n8858hb, 24セクション) DL完走確認済み
