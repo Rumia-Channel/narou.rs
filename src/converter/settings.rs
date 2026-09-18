@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::setting_core::SettingScope;
+
 use super::ini::{IniData, IniValue};
 
 #[derive(Debug, Clone, Serialize)]
@@ -151,7 +153,6 @@ impl NovelSettings {
 
         let ini_path = archive_path.join("setting.ini");
         let replace_path = archive_path.join("replace.txt");
-        let local_setting_path = Self::local_setting_path();
 
         let ini = match IniData::load_file(&ini_path) {
             Ok(i) => i,
@@ -169,7 +170,6 @@ impl NovelSettings {
         settings = Self::apply_ini_novel(&settings, &ini, novel_id);
         settings = Self::apply_force_and_default_settings(
             &settings,
-            &local_setting_path,
             ignore_force,
             ignore_default,
         );
@@ -237,17 +237,6 @@ impl NovelSettings {
         settings
     }
 
-    fn local_setting_path() -> PathBuf {
-        crate::db::inventory::Inventory::with_default_root()
-            .map(|inventory| {
-                inventory
-                    .root_dir()
-                    .join(".narou")
-                    .join("local_setting.yaml")
-            })
-            .unwrap_or_else(|_| PathBuf::from(".narou").join("local_setting.yaml"))
-    }
-
     fn apply_ini_defaults(settings: &Self, ini: &IniData) -> Self {
         let mut s = Self::load_from_ini(ini);
         s.id = settings.id;
@@ -271,48 +260,40 @@ impl NovelSettings {
 
     fn apply_force_and_default_settings(
         settings: &Self,
-        local_setting_path: &Path,
         ignore_force: bool,
         ignore_default: bool,
     ) -> Self {
         let mut s = settings.clone();
-        if !local_setting_path.exists() {
+        let Ok(data) = crate::db::settings::load(SettingScope::Local) else {
             return s;
+        };
+
+        let mut default_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
+        let mut force_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
+        for (key, value) in &data {
+            if !ignore_default {
+                if let Some(rest) = key.strip_prefix("default.") {
+                    default_settings.insert(rest, value);
+                    continue;
+                }
+            }
+            if !ignore_force {
+                if let Some(rest) = key.strip_prefix("force.") {
+                    force_settings.insert(rest, value);
+                }
+            }
         }
-        if let Ok(content) = fs::read_to_string(local_setting_path) {
-            if let Ok(data) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-                if let Some(mapping) = data.as_mapping() {
-                    let mut default_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
-                    let mut force_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
-                    for (key, value) in mapping {
-                        if let Some(key_str) = key.as_str() {
-                            if !ignore_default {
-                                if let Some(rest) = key_str.strip_prefix("default.") {
-                                    default_settings.insert(rest, value);
-                                    continue;
-                                }
-                            }
-                            if !ignore_force {
-                                if let Some(rest) = key_str.strip_prefix("force.") {
-                                    force_settings.insert(rest, value);
-                                }
-                            }
-                        }
-                    }
-                    let defaults = NovelSettings::default();
-                    let original_defaults = Self::get_original_defaults(&defaults);
-                    for (name, default_val) in &original_defaults {
-                        let ini_key = name;
-                        if force_settings.contains_key(ini_key) {
-                            let ini_val = yaml_value_to_ini(force_settings[ini_key]);
-                            Self::apply_single_setting(&mut s, ini_key, &ini_val);
-                        } else if s.has_default_setting(ini_key, default_val) {
-                            if let Some(val) = default_settings.get(ini_key) {
-                                let ini_val = yaml_value_to_ini(val);
-                                Self::apply_single_setting(&mut s, ini_key, &ini_val);
-                            }
-                        }
-                    }
+        let defaults = NovelSettings::default();
+        let original_defaults = Self::get_original_defaults(&defaults);
+        for (name, default_val) in &original_defaults {
+            let ini_key = name;
+            if force_settings.contains_key(ini_key) {
+                let ini_val = yaml_value_to_ini(force_settings[ini_key]);
+                Self::apply_single_setting(&mut s, ini_key, &ini_val);
+            } else if s.has_default_setting(ini_key, default_val) {
+                if let Some(val) = default_settings.get(ini_key) {
+                    let ini_val = yaml_value_to_ini(val);
+                    Self::apply_single_setting(&mut s, ini_key, &ini_val);
                 }
             }
         }
