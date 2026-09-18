@@ -11,6 +11,8 @@ use std::sync::{
 use chrono::Local;
 use regex::Regex;
 
+use crate::setting_core::SettingScope;
+
 const DEFAULT_LOG_FORMAT_FILENAME: &str = "%Y%m%d.txt";
 const DEFAULT_LOG_FORMAT_TIMESTAMP: &str = "[%H:%M:%S]";
 
@@ -48,8 +50,8 @@ impl LoggerState {
             return Self::disabled();
         };
 
-        let local_setting_path = root_dir.join(".narou").join("local_setting.yaml");
-        let settings = read_yaml_map(&local_setting_path);
+        let settings =
+            crate::db::settings::load_for_root(&root_dir, SettingScope::Local).unwrap_or_default();
         let logging_enabled = yaml_bool(settings.get("logging"));
         let logging_enabled =
             logging_enabled && std::env::var("NAROU_ENV").ok().as_deref() != Some("test");
@@ -331,13 +333,6 @@ pub(crate) fn find_narou_root() -> Option<PathBuf> {
             return None;
         }
     }
-}
-
-fn read_yaml_map(path: &Path) -> HashMap<String, serde_yaml::Value> {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-    serde_yaml::from_str(&raw).unwrap_or_default()
 }
 
 fn yaml_bool(value: Option<&serde_yaml::Value>) -> bool {
