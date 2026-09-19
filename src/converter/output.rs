@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -60,18 +59,12 @@ pub(crate) fn create_output_text_filename(
 }
 
 fn convert_filename_to_ncode() -> bool {
-    crate::db::with_database(|db| {
-        let settings: HashMap<String, serde_yaml::Value> = db
-            .inventory()
-            .load("local_setting", crate::db::inventory::InventoryScope::Local)?;
-        Ok(settings
-            .get("convert.filename-to-ncode")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false))
-    })
+    crate::db::settings::bool_value(
+        crate::setting_core::SettingScope::Local,
+        "convert.filename-to-ncode",
+    )
     .unwrap_or(false)
 }
-
 fn sanitize_filename_for_output(name: &str) -> String {
     crate::db::paths::sanitize_windows_filename_component_with_limit(
         name,
