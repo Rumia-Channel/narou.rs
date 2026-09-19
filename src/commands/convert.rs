@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -7,7 +6,7 @@ use encoding_rs::{Encoding, UTF_8};
 use narou_rs::converter::NovelConverter;
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
-use narou_rs::db::inventory::{Inventory, InventoryScope};
+use narou_rs::db::inventory::Inventory;
 use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
 use narou_rs::termcolor::bold_colored;
 use regex::Regex;
