@@ -68,6 +68,7 @@ export function bindActions() {
     El.console?.classList.toggle('expanded');
     El.consoleStdout2?.classList.toggle('expanded');
     State.consoleExpanded = !State.consoleExpanded;
+    El.console?.closest('.console-panes')?.classList.toggle('expanded', State.consoleExpanded);
     // Toggle icon
     const expand = El.consoleExpand?.querySelector('.expand-icon');
     const collapse = El.consoleExpand?.querySelector('.collapse-icon');
