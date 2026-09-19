@@ -12,7 +12,7 @@ use crate::commands::download;
 use crate::commands::log;
 use crate::logger;
 use narou_rs::compat;
-use narou_rs::db::inventory::InventoryScope;
+use narou_rs::setting_core::SettingScope;
 use narou_rs::db::{self, NovelRecord};
 use narou_rs::downloader::html;
 use narou_rs::downloader::types::{CACHE_SAVE_DIR, SECTION_SAVE_DIR, SectionFile};
@@ -165,13 +165,9 @@ fn invalid_diff_version_string(version: &str) -> bool {
 }
 
 fn load_global_setting_string(key: &str) -> std::result::Result<Option<String>, String> {
-    db::with_database(|db| {
-        let settings: HashMap<String, serde_yaml::Value> = db
-            .inventory()
-            .load("global_setting", InventoryScope::Global)?;
-        Ok(settings.get(key).and_then(compat::yaml_value_to_string))
-    })
-    .map_err(|e| e.to_string())
+    narou_rs::db::settings::load(SettingScope::Global)
+        .map(|settings| settings.get(key).and_then(compat::yaml_value_to_string))
+        .map_err(|e| e.to_string())
 }
 
 fn cache_root_dir(context: &NovelContext) -> PathBuf {
