@@ -182,23 +182,7 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
 
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     let records = match (|| -> narou_rs::error::Result<Vec<NovelRecord>> {
-        let sort = match sort_key {
-            Some(key) => narou_rs::platform::NovelSort::by(
-                narou_rs::platform::NovelSortKey::from_db_key(key).unwrap_or(
-                    narou_rs::platform::NovelSortKey::Id,
-                ),
-            ),
-            None => narou_rs::platform::NovelSort::by(if options.latest {
-                narou_rs::platform::NovelSortKey::from_db_key(options.view_date_type())
-                    .unwrap_or(narou_rs::platform::NovelSortKey::Id)
-            } else {
-                narou_rs::platform::NovelSortKey::Id
-            }),
-        };
-        let mut sort = sort;
-        if options.reverse {
-            sort.reverse = true;
-        }
+        let sort = resolve_list_sort(&options, sort_key);
         // CLI list は全件表示: display 用 query ではなく全件を取得する
         // (既存挙動: フィルタは表示後に適用される)。
         let query = narou_rs::platform::NovelQuery::page(
@@ -468,6 +452,26 @@ fn split_words(value: Option<&str>) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+/// Ruby `Database#sort_by` defaults to descending date order. Only
+/// `--latest` flips the normal ascending direction; `--reverse` flips it back.
+fn resolve_list_sort(
+    options: &ListOptions,
+    sort_key: Option<&'static str>,
+) -> narou_rs::platform::NovelSort {
+    use narou_rs::platform::{NovelSort, NovelSortKey};
+
+    let key = match sort_key {
+        Some(key) => NovelSortKey::from_db_key(key).unwrap_or(NovelSortKey::Id),
+        None if options.latest => {
+            NovelSortKey::from_db_key(options.view_date_type()).unwrap_or(NovelSortKey::Id)
+        }
+        None => NovelSortKey::Id,
+    };
+    let mut sort = NovelSort::by(key);
+    sort.reverse = options.reverse ^ (sort_key.is_none() && options.latest);
+    sort
 }
 
 /// `narou list --sort-by` のキー文字列を検証し、内部表現に変換する。
@@ -1137,7 +1141,7 @@ mod tests {
 
     use super::{
         ListOptions, TagColors, TagOptions, build_tag_mode, matches_filters, matches_grep,
-        remove_novel_files, resolve_list_sort_key,
+        remove_novel_files, resolve_list_sort, resolve_list_sort_key,
     };
     use narou_rs::db::novel_record::NovelRecord;
     use narou_rs::tag_colors;
@@ -1290,5 +1294,41 @@ mod tests {
     fn list_options_default_has_sort_by_unset() {
         let opts = ListOptions::default();
         assert!(opts.sort_by.is_none());
+    }
+
+    #[test]
+    fn list_latest_sorts_newest_first_and_reverse_flips_direction() {
+        use narou_rs::platform::NovelSortKey;
+
+        for gl in [false, true] {
+            let opts = ListOptions {
+                latest: true,
+                general_lastup: gl,
+                ..Default::default()
+            };
+            let sort = resolve_list_sort(&opts, None);
+            assert_eq!(
+                sort.key,
+                if gl { NovelSortKey::GeneralLastup } else { NovelSortKey::LastUpdate }
+            );
+            assert!(sort.reverse, "--latest must be newest first");
+
+            let reversed = resolve_list_sort(
+                &ListOptions { reverse: true, ..opts.clone() },
+                None,
+            );
+            assert!(!reversed.reverse, "--latest --reverse must be oldest first");
+        }
+
+        assert!(!resolve_list_sort(&ListOptions::default(), None).reverse);
+        assert!(resolve_list_sort(&ListOptions { reverse: true, ..Default::default() }, None).reverse);
+    }
+
+    #[test]
+    fn list_explicit_sort_by_does_not_inherit_latest_direction() {
+        let opts = ListOptions { latest: true, ..Default::default() };
+        assert!(!resolve_list_sort(&opts, Some("title")).reverse);
+        let reversed = ListOptions { reverse: true, ..opts };
+        assert!(resolve_list_sort(&reversed, Some("title")).reverse);
     }
 }
