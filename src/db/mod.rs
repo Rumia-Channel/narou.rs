@@ -4,6 +4,8 @@ pub mod database;
 pub mod index_store;
 #[cfg(feature = "native-runtime")]
 pub mod inventory;
+#[cfg(feature = "native-runtime")]
+pub mod settings;
 pub mod novel_record;
 pub mod paths;
 pub mod sort;

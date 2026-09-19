@@ -257,20 +257,14 @@ fn load_last_auto_update_run() -> Option<DateTime<Local>> {
 }
 
 fn persist_last_auto_update_run(timestamp: DateTime<Local>) -> Result<(), String> {
-    let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    inventory
-        .update_yaml::<(), HashMap<String, Value>, _>(
-            "local_setting",
-            InventoryScope::Local,
-            |mut settings| {
-                settings.insert(
-                    AUTO_UPDATE_LAST_RUN_KEY.to_string(),
-                    Value::Number(Number::from(timestamp.timestamp())),
-                );
-                Ok((settings, ()))
-            },
-        )
-        .map_err(|e| e.to_string())
+    crate::db::settings::update(crate::setting_core::SettingScope::Local, |settings| {
+        settings.insert(
+            AUTO_UPDATE_LAST_RUN_KEY.to_string(),
+            Value::Number(Number::from(timestamp.timestamp())),
+        );
+        Ok(())
+    })
+    .map_err(|e| e.to_string())
 }
 
 async fn sleep_until(target_time: chrono::DateTime<Local>) {

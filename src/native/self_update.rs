@@ -9,7 +9,7 @@ use crate::application::{
     ApplicationEvent, EventSink, SelfUpdateRequest, SelfUpdateResult, SelfUpdateService,
     SelfUpdateVariant,
 };
-use crate::db::inventory::{Inventory, InventoryScope};
+use crate::setting_core::SettingScope;
 use crate::error::{NarouError, Result};
 use crate::platform::PlatformFuture;
 
@@ -35,33 +35,21 @@ pub fn build_variant() -> SelfUpdateVariant {
 
 /// Variant preference saved in `global_setting.yaml`, if any.
 pub fn saved_variant_preference() -> Option<SelfUpdateVariant> {
-    let inventory = Inventory::with_default_root().ok()?;
-    let settings: std::collections::HashMap<String, serde_yaml::Value> = inventory
-        .load("global_setting", InventoryScope::Global)
-        .unwrap_or_default();
-    settings
-        .get(VARIANT_SETTING_KEY)
-        .and_then(|v| v.as_str())
-        .and_then(SelfUpdateVariant::from_str_lossy)
+    crate::db::settings::value(SettingScope::Global, VARIANT_SETTING_KEY)
+        .and_then(|value| value.as_str().and_then(SelfUpdateVariant::from_str_lossy))
 }
+
 
 /// Persist an explicit variant choice so later updates reuse it.
 fn persist_variant_preference(variant: SelfUpdateVariant) -> Result<()> {
-    let inventory = Inventory::with_default_root()
-        .map_err(|e| platform_error(format!("global_setting へのアクセス失敗: {e}")))?;
-    inventory
-        .update_yaml::<(), std::collections::HashMap<String, serde_yaml::Value>, _>(
-            "global_setting",
-            InventoryScope::Global,
-            |mut settings| {
-                settings.insert(
-                    VARIANT_SETTING_KEY.to_string(),
-                    serde_yaml::Value::String(variant.as_str().to_string()),
-                );
-                Ok((settings, ()))
-            },
-        )
-        .map_err(|e| platform_error(format!("{VARIANT_SETTING_KEY} の保存失敗: {e}")))
+    crate::db::settings::update(SettingScope::Global, |settings| {
+        settings.insert(
+            VARIANT_SETTING_KEY.to_string(),
+            serde_yaml::Value::String(variant.as_str().to_string()),
+        );
+        Ok(())
+    })
+    .map_err(|e| platform_error(format!("{VARIANT_SETTING_KEY} の保存失敗: {e}")))
 }
 
 /// Whether the update flow must ask the user which variant to install.

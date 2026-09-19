@@ -1,3 +1,5 @@
+extern crate self as narou_rs;
+
 #[cfg(feature = "native-runtime")]
 #[macro_use]
 mod output_macros;

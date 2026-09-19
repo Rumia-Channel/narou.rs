@@ -302,9 +302,9 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 | オプション | 短縮 | 型 | デフォルト | 説明 | Rust |
 |-----------|------|-----|-----------|------|:----:|
-| `--latest` | `-l` | flag | false | 最新更新順でソート | ✅ |
+| `--latest` | `-l` | flag | false | 最終更新日の新しい順（降順）でソート | ✅ |
 | `--gl` | — | flag | false | 更新日ではなく最新話掲載日を使用 | ✅ |
-| `--reverse` | `-r` | flag | false | 逆順ソート | ✅ |
+| `--reverse` | `-r` | flag | false | 表示順を反転（`--latest` と併用すると昇順） | ✅ |
 | `--url` | `-u` | flag | false | URL 表示 | ✅ |
 | `--kind` | `-k` | flag | false | 小説種別表示 (短編/連載) | ✅ |
 | `--site` | `-s` | flag | false | サイト名表示 | ✅ |
@@ -317,6 +317,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 **Rust 実装**:
 - `limit` positional、`--latest` / `--gl` / `--reverse`、列追加オプション (`--url` / `--kind` / `--site` / `--author`) を実装
+- `--latest` は `last_update` 降順（`--gl` 併用時は `general_lastup` 降順）、`--reverse` 併用時は昇順。Ruby版 `Database#sort_by` の既定動作に合わせる（Issue #21）。
 - `--filter` は `series` / `ss` / `frozen` / `nonfrozen` の複数指定と Ruby版相当の不正値エラー (終了コード127) に対応
 - hidden 互換オプション `--frozen` も受理し、`--filter frozen` 相当として扱う
 - `--grep` は AND / `-word` の NOT 検索に対応
@@ -348,6 +349,8 @@ narou setting name         # 読み取り
 - `~/.narousetting/global_setting.yaml` (グローバル)
 - `default.*` = 未設定小説のデフォルト値
 - `force.*` = 全小説の強制上書き値
+- `default.*` / `force.*` は `convert` の小説・テキスト入力の両経路で共通設定ストアから取得し、`--ignore-default` / `--ignore-force` で個別に無効化できる（Issue #22）。
+- local / global 設定の入出力は `src/db/settings.rs` → `Inventory` に統一する。SQLite 利用時は `app_state`、legacy YAML 利用時は従来の設定ファイルに保存し、双方で同じキー・型を扱う。
 
 **主要 local_setting 項目**:
 

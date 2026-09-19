@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::setting_core::SettingScope;
+
 use super::ini::{IniData, IniValue};
 
 #[derive(Debug, Clone, Serialize)]
@@ -151,7 +153,6 @@ impl NovelSettings {
 
         let ini_path = archive_path.join("setting.ini");
         let replace_path = archive_path.join("replace.txt");
-        let local_setting_path = Self::local_setting_path();
 
         let ini = match IniData::load_file(&ini_path) {
             Ok(i) => i,
@@ -169,7 +170,6 @@ impl NovelSettings {
         settings = Self::apply_ini_novel(&settings, &ini, novel_id);
         settings = Self::apply_force_and_default_settings(
             &settings,
-            &local_setting_path,
             ignore_force,
             ignore_default,
         );
@@ -206,7 +206,6 @@ impl NovelSettings {
     ) -> Self {
         let ini_path = archive_path.join("setting.ini");
         let replace_path = archive_path.join("replace.txt");
-        let local_setting_path = Self::local_setting_path();
 
         let ini = match IniData::load_file(&ini_path) {
             Ok(i) => i,
@@ -222,7 +221,6 @@ impl NovelSettings {
         settings = Self::apply_ini_defaults(&settings, &ini);
         settings = Self::apply_force_and_default_settings(
             &settings,
-            &local_setting_path,
             ignore_force,
             ignore_default,
         );
@@ -235,17 +233,6 @@ impl NovelSettings {
         }
 
         settings
-    }
-
-    fn local_setting_path() -> PathBuf {
-        crate::db::inventory::Inventory::with_default_root()
-            .map(|inventory| {
-                inventory
-                    .root_dir()
-                    .join(".narou")
-                    .join("local_setting.yaml")
-            })
-            .unwrap_or_else(|_| PathBuf::from(".narou").join("local_setting.yaml"))
     }
 
     fn apply_ini_defaults(settings: &Self, ini: &IniData) -> Self {
@@ -271,48 +258,40 @@ impl NovelSettings {
 
     fn apply_force_and_default_settings(
         settings: &Self,
-        local_setting_path: &Path,
         ignore_force: bool,
         ignore_default: bool,
     ) -> Self {
         let mut s = settings.clone();
-        if !local_setting_path.exists() {
+        let Ok(data) = crate::db::settings::load(SettingScope::Local) else {
             return s;
+        };
+
+        let mut default_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
+        let mut force_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
+        for (key, value) in &data {
+            if !ignore_default {
+                if let Some(rest) = key.strip_prefix("default.") {
+                    default_settings.insert(rest, value);
+                    continue;
+                }
+            }
+            if !ignore_force {
+                if let Some(rest) = key.strip_prefix("force.") {
+                    force_settings.insert(rest, value);
+                }
+            }
         }
-        if let Ok(content) = fs::read_to_string(local_setting_path) {
-            if let Ok(data) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-                if let Some(mapping) = data.as_mapping() {
-                    let mut default_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
-                    let mut force_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
-                    for (key, value) in mapping {
-                        if let Some(key_str) = key.as_str() {
-                            if !ignore_default {
-                                if let Some(rest) = key_str.strip_prefix("default.") {
-                                    default_settings.insert(rest, value);
-                                    continue;
-                                }
-                            }
-                            if !ignore_force {
-                                if let Some(rest) = key_str.strip_prefix("force.") {
-                                    force_settings.insert(rest, value);
-                                }
-                            }
-                        }
-                    }
-                    let defaults = NovelSettings::default();
-                    let original_defaults = Self::get_original_defaults(&defaults);
-                    for (name, default_val) in &original_defaults {
-                        let ini_key = name;
-                        if force_settings.contains_key(ini_key) {
-                            let ini_val = yaml_value_to_ini(force_settings[ini_key]);
-                            Self::apply_single_setting(&mut s, ini_key, &ini_val);
-                        } else if s.has_default_setting(ini_key, default_val) {
-                            if let Some(val) = default_settings.get(ini_key) {
-                                let ini_val = yaml_value_to_ini(val);
-                                Self::apply_single_setting(&mut s, ini_key, &ini_val);
-                            }
-                        }
-                    }
+        let defaults = NovelSettings::default();
+        let original_defaults = Self::get_original_defaults(&defaults);
+        for (name, default_val) in &original_defaults {
+            let ini_key = name;
+            if force_settings.contains_key(ini_key) {
+                let ini_val = yaml_value_to_ini(force_settings[ini_key]);
+                Self::apply_single_setting(&mut s, ini_key, &ini_val);
+            } else if s.has_default_setting(ini_key, default_val) {
+                if let Some(val) = default_settings.get(ini_key) {
+                    let ini_val = yaml_value_to_ini(val);
+                    Self::apply_single_setting(&mut s, ini_key, &ini_val);
                 }
             }
         }
@@ -1042,6 +1021,68 @@ mod tests {
         assert!(settings.enable_add_date_to_title);
         assert_eq!(settings.title_date_format, "$t (%F) $ns");
         assert_eq!(settings.title_date_target, "general_lastup");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn converter_reads_sqlite_backed_default_and_force_settings() {
+        if crate::native::sqlite::state::legacy_yaml_active() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "narou-rs-settings-sqlite-test-{}-{}",
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive_path = root.join("小説データ").join("test-novel");
+        std::fs::create_dir_all(root.join(".narou")).unwrap();
+        std::fs::create_dir_all(&archive_path).unwrap();
+        std::fs::write(root.join(".narou").join("storage-backend"), "sqlite\n").unwrap();
+
+        let mut map = crate::db::settings::SettingsMap::new();
+        map.insert("default.enable_yokogaki".into(), serde_yaml::Value::Bool(true));
+        map.insert("default.enable_illust".into(), serde_yaml::Value::Bool(false));
+        map.insert("default.enable_add_date_to_title".into(), serde_yaml::Value::Bool(true));
+        crate::db::settings::save_for_root(&root, crate::setting_core::SettingScope::Local, &map).unwrap();
+
+        // This stale file must not override settings saved to SQLite app_state.
+        std::fs::write(
+            root.join(".narou").join("local_setting.yaml"),
+            "default.enable_yokogaki: false\ndefault.enable_illust: true\n",
+        )
+        .unwrap();
+
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&archive_path);
+            let settings = NovelSettings::load_for_novel(1, "title", "author", &archive_path);
+            assert!(settings.enable_yokogaki);
+            assert!(!settings.enable_illust);
+            assert!(settings.enable_add_date_to_title);
+        }
+
+        map.insert("force.enable_yokogaki".into(), serde_yaml::Value::Bool(false));
+        map.insert("force.enable_illust".into(), serde_yaml::Value::Bool(true));
+        map.insert("force.enable_add_date_to_title".into(), serde_yaml::Value::Bool(false));
+        crate::db::settings::save_for_root(&root, crate::setting_core::SettingScope::Local, &map).unwrap();
+
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&archive_path);
+            let forced = NovelSettings::load_for_novel(1, "title", "author", &archive_path);
+            assert!(!forced.enable_yokogaki);
+            assert!(forced.enable_illust);
+            assert!(!forced.enable_add_date_to_title);
+
+            let no_force = NovelSettings::load_for_novel_with_options(
+                1, "title", "author", &archive_path, true, false,
+            );
+            assert!(no_force.enable_yokogaki);
+            assert!(!no_force.enable_illust);
+            assert!(no_force.enable_add_date_to_title);
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }
