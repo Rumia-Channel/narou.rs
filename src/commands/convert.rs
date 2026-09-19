@@ -584,16 +584,18 @@ fn load_dc_subject_exclude_tags() -> std::result::Result<Vec<String>, String> {
 
     let default_value = "404,end".to_string();
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let mut settings: HashMap<String, serde_yaml::Value> = inventory
-        .load("local_setting", InventoryScope::Local)
-        .map_err(|e| e.to_string())?;
-    settings.insert(
-        "convert.dc-subject-exclude-tags".to_string(),
-        serde_yaml::Value::String(default_value.clone()),
-    );
-    inventory
-        .save("local_setting", InventoryScope::Local, &settings)
-        .map_err(|e| e.to_string())?;
+    narou_rs::db::settings::update_with_inventory(
+        &inventory,
+        narou_rs::setting_core::SettingScope::Local,
+        |settings| {
+            settings.insert(
+                "convert.dc-subject-exclude-tags".to_string(),
+                serde_yaml::Value::String(default_value.clone()),
+            );
+            Ok(())
+        },
+    )
+    .map_err(|e| e.to_string())?;
 
     Ok(default_value
         .split(',')
