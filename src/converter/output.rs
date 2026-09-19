@@ -65,6 +65,7 @@ fn convert_filename_to_ncode() -> bool {
     )
     .unwrap_or(false)
 }
+
 fn sanitize_filename_for_output(name: &str) -> String {
     crate::db::paths::sanitize_windows_filename_component_with_limit(
         name,
