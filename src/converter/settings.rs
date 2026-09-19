@@ -1028,6 +1028,68 @@ mod tests {
     }
 
     #[test]
+    fn converter_reads_sqlite_backed_default_and_force_settings() {
+        if crate::native::sqlite::state::legacy_yaml_active() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "narou-rs-settings-sqlite-test-{}-{}",
+            TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive_path = root.join("小説データ").join("test-novel");
+        std::fs::create_dir_all(root.join(".narou")).unwrap();
+        std::fs::create_dir_all(&archive_path).unwrap();
+        std::fs::write(root.join(".narou").join("storage-backend"), "sqlite\n").unwrap();
+
+        let mut map = crate::db::settings::SettingsMap::new();
+        map.insert("default.enable_yokogaki".into(), serde_yaml::Value::Bool(true));
+        map.insert("default.enable_illust".into(), serde_yaml::Value::Bool(false));
+        map.insert("default.enable_add_date_to_title".into(), serde_yaml::Value::Bool(true));
+        crate::db::settings::save_for_root(&root, SettingScope::Local, &map).unwrap();
+
+        // This stale file must not override settings saved to SQLite app_state.
+        std::fs::write(
+            root.join(".narou").join("local_setting.yaml"),
+            "default.enable_yokogaki: false\ndefault.enable_illust: true\n",
+        )
+        .unwrap();
+
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&archive_path);
+            let settings = NovelSettings::load_for_novel(1, "title", "author", &archive_path);
+            assert!(settings.enable_yokogaki);
+            assert!(!settings.enable_illust);
+            assert!(settings.enable_add_date_to_title);
+        }
+
+        map.insert("force.enable_yokogaki".into(), serde_yaml::Value::Bool(false));
+        map.insert("force.enable_illust".into(), serde_yaml::Value::Bool(true));
+        map.insert("force.enable_add_date_to_title".into(), serde_yaml::Value::Bool(false));
+        crate::db::settings::save_for_root(&root, SettingScope::Local, &map).unwrap();
+
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&archive_path);
+            let forced = NovelSettings::load_for_novel(1, "title", "author", &archive_path);
+            assert!(!forced.enable_yokogaki);
+            assert!(forced.enable_illust);
+            assert!(!forced.enable_add_date_to_title);
+
+            let no_force = NovelSettings::load_for_novel_with_options(
+                1, "title", "author", &archive_path, true, false,
+            );
+            assert!(no_force.enable_yokogaki);
+            assert!(!no_force.enable_illust);
+            assert!(no_force.enable_add_date_to_title);
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn load_for_novel_with_options_ignores_force_and_default_settings() {
         let root = std::env::temp_dir().join(format!(
             "narou-rs-settings-ignore-test-{}-{}",
