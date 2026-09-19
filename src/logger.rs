@@ -11,7 +11,7 @@ use std::sync::{
 use chrono::Local;
 use regex::Regex;
 
-use crate::setting_core::SettingScope;
+use narou_rs::setting_core::SettingScope;
 
 const DEFAULT_LOG_FORMAT_FILENAME: &str = "%Y%m%d.txt";
 const DEFAULT_LOG_FORMAT_TIMESTAMP: &str = "[%H:%M:%S]";
@@ -51,7 +51,7 @@ impl LoggerState {
         };
 
         let settings =
-            crate::db::settings::load_for_root(&root_dir, SettingScope::Local).unwrap_or_default();
+            narou_rs::db::settings::load_for_root(&root_dir, SettingScope::Local).unwrap_or_default();
         let logging_enabled = yaml_bool(settings.get("logging"));
         let logging_enabled =
             logging_enabled && std::env::var("NAROU_ENV").ok().as_deref() != Some("test");
