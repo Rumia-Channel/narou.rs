@@ -608,7 +608,7 @@ mod tests {
                 .unwrap();
             stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
                 .unwrap()
-                .map(Result::unwrap)
+                .map(|row| row.unwrap())
                 .collect()
         };
         assert_eq!(
