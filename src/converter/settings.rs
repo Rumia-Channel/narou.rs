@@ -206,7 +206,6 @@ impl NovelSettings {
     ) -> Self {
         let ini_path = archive_path.join("setting.ini");
         let replace_path = archive_path.join("replace.txt");
-        let local_setting_path = Self::local_setting_path();
 
         let ini = match IniData::load_file(&ini_path) {
             Ok(i) => i,
@@ -222,7 +221,6 @@ impl NovelSettings {
         settings = Self::apply_ini_defaults(&settings, &ini);
         settings = Self::apply_force_and_default_settings(
             &settings,
-            &local_setting_path,
             ignore_force,
             ignore_default,
         );
@@ -1049,7 +1047,7 @@ mod tests {
         map.insert("default.enable_yokogaki".into(), serde_yaml::Value::Bool(true));
         map.insert("default.enable_illust".into(), serde_yaml::Value::Bool(false));
         map.insert("default.enable_add_date_to_title".into(), serde_yaml::Value::Bool(true));
-        crate::db::settings::save_for_root(&root, SettingScope::Local, &map).unwrap();
+        crate::db::settings::save_for_root(&root, crate::setting_core::SettingScope::Local, &map).unwrap();
 
         // This stale file must not override settings saved to SQLite app_state.
         std::fs::write(
@@ -1069,7 +1067,7 @@ mod tests {
         map.insert("force.enable_yokogaki".into(), serde_yaml::Value::Bool(false));
         map.insert("force.enable_illust".into(), serde_yaml::Value::Bool(true));
         map.insert("force.enable_add_date_to_title".into(), serde_yaml::Value::Bool(false));
-        crate::db::settings::save_for_root(&root, SettingScope::Local, &map).unwrap();
+        crate::db::settings::save_for_root(&root, crate::setting_core::SettingScope::Local, &map).unwrap();
 
         {
             let _guard = crate::test_support::set_current_dir_for_test(&archive_path);
