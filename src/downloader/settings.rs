@@ -104,53 +104,24 @@ impl DownloaderSettings for NativeDownloaderSettings {
     }
 
     fn global_setting_optional_bool(&self, key: &str) -> Option<bool> {
-        crate::db::with_database(|db| {
-            let settings: HashMap<String, serde_yaml::Value> = db.inventory().load(
-                "global_setting",
-                crate::db::inventory::InventoryScope::Global,
-            )?;
-            Ok(settings.get(key).and_then(|value| match value {
-                serde_yaml::Value::Bool(v) => Some(*v),
-                serde_yaml::Value::String(v) => {
-                    Some(matches!(v.as_str(), "true" | "yes" | "on" | "1"))
-                }
-                serde_yaml::Value::Number(v) => Some(v.as_i64().unwrap_or(0) != 0),
-                _ => None,
-            }))
-        })
-        .ok()
-        .flatten()
+        crate::db::settings::bool_value(crate::setting_core::SettingScope::Global, key)
     }
 
     fn save_global_setting_bool(&self, key: &str, value: bool) -> Result<()> {
-        crate::db::with_database_mut(|db| {
-            let mut settings: HashMap<String, serde_yaml::Value> = db
-                .inventory()
-                .load(
-                    "global_setting",
-                    crate::db::inventory::InventoryScope::Global,
-                )
-                .unwrap_or_default();
-            settings.insert(key.to_string(), serde_yaml::Value::Bool(value));
-            db.inventory().save(
-                "global_setting",
-                crate::db::inventory::InventoryScope::Global,
-                &settings,
-            )?;
-            Ok(())
-        })
+        crate::db::settings::update(
+            crate::setting_core::SettingScope::Global,
+            |settings| {
+                settings.insert(key.to_string(), serde_yaml::Value::Bool(value));
+                Ok(())
+            },
+        )
     }
 
     fn download_use_subdirectory(&self) -> bool {
-        crate::db::with_database(|db| {
-            let settings: HashMap<String, serde_yaml::Value> = db
-                .inventory()
-                .load("local_setting", crate::db::inventory::InventoryScope::Local)?;
-            Ok(settings
-                .get("download.use-subdirectory")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false))
-        })
+        crate::db::settings::bool_value(
+            crate::setting_core::SettingScope::Local,
+            "download.use-subdirectory",
+        )
         .unwrap_or(false)
     }
 
