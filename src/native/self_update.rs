@@ -241,7 +241,7 @@ async fn start_native_update(
         // already installed updater without --restart (supported by old
         // releases), then ask systemd to restart the original service. This
         // also replaces any old process started by Restart=always.
-        let mut command = systemd_update_command(
+        let command = systemd_update_command(
             &service,
             &updater_path,
             &zip_path,
