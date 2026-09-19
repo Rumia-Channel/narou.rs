@@ -136,6 +136,13 @@ impl SqliteNovelRepository {
 }
 
 pub(crate) fn upsert_record_conn(conn: &Connection, record: &NovelRecord) -> Result<()> {
+    // A re-registered novel can receive the same tag from multiple sources.
+    // Normalize before encoding tags_json/tags_sort as well as novel_tags, so
+    // the denormalized and indexed representations never disagree.
+    let mut normalized = record.clone();
+    let mut seen = HashSet::new();
+    normalized.tags.retain(|tag| seen.insert(tag.clone()));
+    let record = &normalized;
     let params = record_params(record)?;
     conn.execute(UPSERT_SQL, params_from_iter(params.values.iter()))
         .map_err(super::sqlite_error)?;
@@ -561,6 +568,53 @@ mod tests {
         };
         assert_eq!(tags_left, 0);
         assert!(freeze.frozen_ids().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn removed_novel_can_be_reregistered_with_duplicate_tags() {
+        let conn = crate::native::sqlite::open_in_memory().unwrap();
+        let sqlite = SqliteNovelRepository::new(conn.clone());
+        let original = record(9, "以前の登録", "a", "u9", &["end", "favorite"]);
+        sqlite
+            .apply_batch(vec![NovelMutation::Upsert(original)])
+            .await
+            .unwrap();
+        sqlite
+            .apply_batch(vec![NovelMutation::Remove(NovelId(9))])
+            .await
+            .unwrap();
+
+        // Registration paths may merge default tags with tags retained from
+        // the previous download. SQLite must not reject the duplicate names.
+        let replacement = record(
+            9,
+            "再登録",
+            "a",
+            "u9",
+            &["favorite", "end", "favorite", "end"],
+        );
+        sqlite
+            .apply_batch(vec![NovelMutation::Upsert(replacement)])
+            .await
+            .unwrap();
+
+        let loaded = sqlite.get(NovelId(9)).await.unwrap().unwrap();
+        assert_eq!(loaded.title, "再登録");
+        assert_eq!(loaded.tags, vec!["favorite", "end"]);
+        let indexed_tags: Vec<(i64, String)> = {
+            let guard = conn.lock().unwrap();
+            let mut stmt = guard
+                .prepare("SELECT position, tag FROM novel_tags WHERE novel_id = 9 ORDER BY position")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            indexed_tags,
+            vec![(0, "favorite".to_string()), (1, "end".to_string())]
+        );
     }
 
     #[tokio::test]
