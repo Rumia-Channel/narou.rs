@@ -355,7 +355,7 @@ pub(crate) fn record_matches_term(
                 || tags.iter().any(|tag| tag.contains(value))
                 || record.ncode.as_ref().is_some_and(|ncode| ncode.to_lowercase().contains(value))
                 || record.toc_url.to_lowercase().contains(value.trim_end_matches('/'))
-                || record.id.to_string() == *value
+                || record.id.to_string() == value.as_str()
         }),
     };
 
