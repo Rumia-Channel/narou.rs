@@ -15,7 +15,10 @@
 //!
 //! Cookies are stored through the library inventory, so they live in
 //! `.narou/login_cookie.yaml` or in SQLite `app_state` depending on the storage
-//! backend.
+//! backend. When this executable runs on a *different* machine than the one
+//! that downloads, `--export <file>` writes a portable envelope instead (the
+//! download host reads it back with `narou login import`), and outside a
+//! library that export is the only output.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -28,7 +31,9 @@ use clap::Parser;
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::native::cookie_store::InventoryCookieStore;
 use narou_rs::platform::cookie_store::{cookie_host_for_url, format_cookie_header};
+use narou_rs::login::build_export;
 use narou_rs::platform::CookieStore;
+use std::collections::BTreeMap;
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +62,15 @@ struct Args {
     /// 保存済みの Cookie を削除する
     #[arg(long)]
     clear: bool,
+    /// 取得した Cookie を書き出しファイル (YAML) に出力する
+    #[arg(long, value_name = "FILE")]
+    export: Option<PathBuf>,
+    /// 書き出しファイルを暗号化するパスフレーズ
+    #[arg(long, value_name = "PASS")]
+    passphrase: Option<String>,
+    /// パスフレーズ指定時でも平文で書き出す
+    #[arg(long = "clear-text")]
+    clear_text: bool,
 }
 
 fn main() -> std::process::ExitCode {
@@ -70,11 +84,18 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Default export file name when no library is present.
+const DEFAULT_EXPORT_FILE: &str = "narou_login_export.yaml";
+
+fn no_library_message() -> String {
+    "このフォルダは初期化されていません (narou init)。ライブラリ外では --export <ファイル> で書き出してください".to_string()
+}
+
 fn run(args: Args) -> std::result::Result<(), String> {
-    let store = InventoryCookieStore::for_current_root()
-        .map_err(|error| format!("このフォルダは初期化されていません (narou init): {error}"))?;
+    let store = InventoryCookieStore::for_current_root().ok();
 
     if args.list {
+        let store = store.ok_or_else(no_library_message)?;
         return list_cookies(&store);
     }
 
@@ -86,6 +107,7 @@ fn run(args: Args) -> std::result::Result<(), String> {
     let hosts = site_hosts(&site, &target);
 
     if args.clear {
+        let store = store.ok_or_else(no_library_message)?;
         for host in &hosts {
             block_on(store.clear(host)).map_err(|error| error.to_string())?;
             println!("{host} の Cookie を削除しました");
@@ -93,39 +115,98 @@ fn run(args: Args) -> std::result::Result<(), String> {
         return Ok(());
     }
 
-    if let Some(cookie) = args.cookie.as_deref() {
+    // Collect the cookies to store or export.
+    let captured: BTreeMap<String, String> = if let Some(cookie) = args.cookie.as_deref() {
         let host = hosts
             .first()
-            .ok_or_else(|| "Cookie を保存するホストを特定できませんでした".to_string())?;
-        save_cookie(&store, host, cookie)?;
-        return Ok(());
-    }
+            .ok_or_else(|| "Cookie を保存するホストを特定できませんでした".to_string())?
+            .clone();
+        BTreeMap::from([(host, cookie.to_string())])
+    } else {
+        let login_url = site
+            .login_url()
+            .or_else(|| Some(site.top_url()))
+            .ok_or_else(|| format!("{} のログイン URL がサイト定義にありません", site.sitename))?;
+        println!("{login_url} をブラウザで開きます。ログインが終わったら Enter を押してください。");
 
-    let login_url = site
-        .login_url()
-        .or_else(|| Some(site.top_url()))
-        .ok_or_else(|| format!("{} のログイン URL がサイト定義にありません", site.sitename))?;
-    println!("{login_url} をブラウザで開きます。ログインが終わったら Enter を押してください。");
-
-    let browser = args.browser.clone().or_else(find_browser).ok_or_else(|| {
-        "Chromium 系ブラウザが見つかりませんでした。--browser でパスを指定するか、--cookie で Cookie 文字列を渡してください"
-            .to_string()
-    })?;
-    let mut child = launch_browser(&browser, &login_url, args.port)?;
-    let captured = match capture_cookies(&mut child, args.port, args.timeout, &site, &hosts) {
-        Ok(captured) => captured,
-        Err(error) => {
-            let _ = child.kill();
-            return Err(error);
-        }
+        let browser = args.browser.clone().or_else(find_browser).ok_or_else(|| {
+            "Chromium 系ブラウザが見つかりませんでした。--browser でパスを指定するか、--cookie で Cookie 文字列を渡してください"
+                .to_string()
+        })?;
+        let mut child = launch_browser(&browser, &login_url, args.port)?;
+        let captured = match capture_cookies(&mut child, args.port, args.timeout, &site, &hosts) {
+            Ok(captured) => captured,
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error);
+            }
+        };
+        let _ = child.kill();
+        captured.into_iter().collect()
     };
-    let _ = child.kill();
 
     if captured.is_empty() {
         return Err("Cookie を取得できませんでした".to_string());
     }
-    for (host, cookie) in &captured {
-        save_cookie(&store, host, cookie)?;
+
+    // Outside a library the export is the only output; inside one it is
+    // optional and the inventory keeps the cookies as before.
+    let export_path = args
+        .export
+        .clone()
+        .or_else(|| store.is_none().then(|| PathBuf::from(DEFAULT_EXPORT_FILE)));
+    if let Some(path) = export_path {
+        write_export(&path, &captured, store.as_ref(), &args)?;
+    }
+    if let Some(store) = &store {
+        for (host, cookie) in &captured {
+            save_cookie(store, host, cookie)?;
+        }
+    }
+    Ok(())
+}
+
+/// Write the captured cookies (plus the library's existing ones) to a portable
+/// export file the download host reads back with `narou login import`.
+fn write_export(
+    path: &Path,
+    captured: &BTreeMap<String, String>,
+    store: Option<&InventoryCookieStore>,
+    args: &Args,
+) -> std::result::Result<(), String> {
+    let mut cookies = match store {
+        Some(store) => store.load_all().map_err(|error| error.to_string())?,
+        None => BTreeMap::new(),
+    };
+    cookies.extend(captured.iter().map(|(host, cookie)| (host.clone(), cookie.clone())));
+
+    let passphrase = if args.clear_text {
+        None
+    } else {
+        args.passphrase.as_deref()
+    };
+    let library = std::env::current_dir()
+        .ok()
+        .and_then(|dir| dir.file_name().map(|name| name.to_string_lossy().into_owned()));
+    let text = build_export(
+        &cookies,
+        passphrase,
+        &chrono::Local::now().to_rfc3339(),
+        library.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::write(path, text).map_err(|error| format!("{} に書き込めません: {error}", path.display()))?;
+
+    println!("{} に {} サイトの Cookie を書き出しました", path.display(), cookies.len());
+    match passphrase {
+        Some(_) => println!(
+            "  暗号化済みです。取り込み先で `narou login import {} --passphrase <同じパスフレーズ>` を実行してください。",
+            path.display()
+        ),
+        None => println!(
+            "  平文です。取り込み先で `narou login import {}` を実行してください。",
+            path.display()
+        ),
     }
     Ok(())
 }
