@@ -46,6 +46,8 @@ README では、導入方法、基本操作、主な注意点をまとめます�
 narou/
   narou_rs(.exe)
   narou_rs_updater(.exe).new
+  narou_rs_backup(.exe)
+  narou_rs_login(.exe)
   webnovel/
   preset/
   LICENSE
@@ -107,7 +109,7 @@ Release と同じ構成の `narou/` フォルダをリポジトリ直下に作�
 cargo local-build
 ```
 
-`cargo local-build` は GitHub Actions の release と同じ構成の `narou/` フォルダを作成します。release ビルドした `narou_rs(.exe)`、`narou_rs_updater(.exe).new`、`narou_rs_backup(.exe)`、`webnovel/`、`preset/`、`LICENSE`、`README.md`、`Third-Party-License.md`、`commitversion` を `narou/` に配置します。
+`cargo local-build` は GitHub Actions の release と同じ構成の `narou/` フォルダを作成します。release ビルドした `narou_rs(.exe)`、`narou_rs_updater(.exe).new`、`narou_rs_backup(.exe)`、`narou_rs_login(.exe)`、`webnovel/`、`preset/`、`LICENSE`、`README.md`、`Third-Party-License.md`、`commitversion` を `narou/` に配置します。
 
 作成された `narou/` は Release 版と同じように `Path` に追加し、小説を管理したいフォルダで `narou_rs init` を実行してください。`narou/` の中を作業ディレクトリにはしません。
 
@@ -172,6 +174,8 @@ narou_rs web
 | `trace` | panic 時のトレース表示 |
 | `help` | ヘルプ表示 |
 | `version` | バージョン情報表示 |
+| `login` | ログイン Cookie の取り込み・管理 (Rust 拡張) |
+| `illust` | 挿絵キャッシュのメンテナンス (Rust 拡張) |
 
 すべてのコマンド仕様、オプション、完了度は `COMMANDS.md` にまとめています。
 
@@ -236,6 +240,62 @@ narou_rs setting server-basic-auth.require-for-external-bind=false
   ```
   unsafe なワイルドカードパターン（`*` 単独、`*.com`、末尾ワイルドなど）は警告ログを出して無視されます。
 - これらのうち Web UI の設定画面に出るのは `server-bind` だけで、それ以外は hidden のまま CLI からのみ変更します。
+
+### ログインが必要な小説
+
+ログインが必要なサイトの小説は、ブラウザで取得した Cookie を保存してからダウンロードします。Cookie の取得は同梱の `narou_rs_login` が担当し、保存した値は `.narou/login.key` の鍵で暗号化されます。
+
+ブラウザと narou_rs が同じマシンにある場合は、ライブラリのフォルダで次を実行します。
+
+```powershell
+narou_rs_login ncode.syosetu.com
+```
+
+Chromium 系ブラウザがログイン URL で開くので、ログインが終わったら Enter を押してください。2 段階認証や CAPTCHA もそのまま通せます。ブラウザが見つからない環境では `--browser <パス>` で指定するか、ブラウザからコピーした Cookie 文字列を直接渡せます。
+
+```powershell
+narou_rs_login ncode.syosetu.com --browser "C:\path\to\chrome.exe"
+narou_rs_login ncode.syosetu.com --cookie "over18=yes; ses=..."
+```
+
+ブラウザのある端末と narou_rs を動かすサーバーが別の場合は、ブラウザ側で書き出しファイルを作って持ち込みます。ライブラリ外で実行した場合は書き出し (`narou_login_export.yaml`) が既定の出力になります。
+
+```powershell
+# ブラウザ側 (ライブラリ外でも可)
+narou_rs_login ncode.syosetu.com --export login.yaml --passphrase <パスフレーズ>
+
+# narou_rs 側 (ライブラリのフォルダ)
+narou_rs login import login.yaml --passphrase <パスフレーズ>
+```
+
+`--passphrase` を付けると書き出しファイルは Argon2id + XChaCha20-Poly1305 で暗号化されます。Web UI を使う場合は、設定ページの「ログイン」タブからファイルを選択して取り込めます。
+
+`narou_rs_login` の主なオプションは以下です。
+
+| オプション | 意味 |
+| --- | --- |
+| `--cookie <文字列>` | ブラウザを開かず、コピーした Cookie 文字列を保存 |
+| `--browser <パス>` | 使用する Chromium 系ブラウザを指定 |
+| `--export <ファイル>` | 取得した Cookie を書き出しファイル (YAML) に出力 |
+| `--passphrase <パス>` | 書き出しファイルを暗号化 |
+| `--clear-text` | パスフレーズ指定時でも平文で書き出す |
+| `--list` | 保存済みの Cookie を表示 (値ではなく名前のみ) |
+| `--clear` | 指定サイトの Cookie を削除 |
+| `--port <ポート>` | ブラウザのリモートデバッグポート (既定 9222) |
+| `--timeout <秒>` | ログイン完了を待つ秒数 (既定 300) |
+
+保存済みの情報は `narou_rs login` サブコマンドでも管理できます。
+
+```powershell
+narou_rs login list                              # 一覧 (値は伏せて表示)
+narou_rs login set <ホスト> --cookie "..."        # 1 サイト分を直接保存
+narou_rs login export login.yaml --passphrase P  # 書き出し
+narou_rs login import login.yaml --replace       # 取り込みに無いサイトを削除
+narou_rs login clear <ホスト>                    # 1 サイト分を削除
+narou_rs login clear                             # すべて削除
+```
+
+保存した Cookie は、ダウンロード時に 404 またはサイト定義の `login_pattern` に一致するログイン壁が返った場合に自動で使われます。`webnovel/*.yaml` に `login_url` (ログイン用 bin が開く URL) と `login_pattern` (ログイン壁を検出する正規表現) を定義すると、サイトごとの挙動を調整できます。
 
 ## グローバルオプション
 
