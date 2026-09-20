@@ -485,6 +485,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_search_matches_url_ncode_and_numeric_id() {
+        let sqlite = SqliteNovelRepository::new(crate::native::sqlite::open_in_memory().unwrap());
+        sqlite
+            .apply_batch(vec![NovelMutation::Upsert(record(
+                42,
+                "検索対象",
+                "作者",
+                "https://ncode.syosetu.com/n1980en/",
+                &[],
+            ))])
+            .await
+            .unwrap();
+
+        for keyword in [
+            "https://ncode.syosetu.com/n1980en/",
+            "n1980en",
+            "42",
+        ] {
+            let mut filter = NovelFilter::all();
+            filter.terms.push(crate::platform::SearchTerm::new(
+                SearchField::Any,
+                false,
+                vec![keyword.to_string()],
+            ));
+            assert_eq!(
+                sqlite.count(&filter).await.unwrap(),
+                1,
+                "search value={keyword}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn dual_run_query_sort_filter_scan_count_agree() {
         let (sqlite, memory) = seed_both().await;
 
