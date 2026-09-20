@@ -706,6 +706,7 @@ mod tests {
             is_narou: false,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
             extra_fields: BTreeMap::new(),
         }
     }

@@ -33,6 +33,8 @@ use self::narou_api::narou_api_batch_update;
 use self::novel_info::NovelInfo;
 use self::persistence::section_filename;
 use self::persistence::{PersistenceService, compute_section_hash};
+
+use crate::platform::CookieStore;
 use self::section::{SectionCache, download_section};
 use self::security::is_safe_public_url;
 use self::settings::DownloaderSettings;
@@ -131,6 +133,9 @@ pub struct Downloader {
     section_cache: SectionCache,
     section_hash_cache: HashMap<String, HashMap<String, String>>,
     section_hash_cache_dirty: bool,
+    /// Stored login cookies. `None` keeps the downloader anonymous (tests and
+    /// the Worker); the native constructors inject the inventory-backed store.
+    cookies: Option<Arc<dyn CookieStore>>,
     settings: Arc<dyn DownloaderSettings>,
     progress: Option<Box<dyn ProgressReporter>>,
 }
@@ -612,6 +617,18 @@ fn illustration_sources<'a>(
 impl Downloader {
     /// Native constructor: loads site definitions from the filesystem and the
     /// section hash cache from the Inventory. Worker builds use
+    /// Inject the store that keeps login cookies for authenticated sites.
+    pub fn with_cookie_store(mut self, cookies: Arc<dyn CookieStore>) -> Self {
+        self.cookies = Some(cookies);
+        self
+    }
+
+    /// Load the stored login cookie for `host`, when a store is available.
+    async fn stored_cookie_for(&self, host: Option<&str>) -> Option<String> {
+        let cookies = self.cookies.as_ref()?;
+        cookies.load(host?).await.ok().flatten()
+    }
+
     /// [`Self::with_platform_and_storage_and_settings`] with bundled values.
     #[cfg(feature = "native-runtime")]
     pub fn with_platform_and_storage(
@@ -691,6 +708,7 @@ impl Downloader {
             site_settings,
             section_cache: SectionCache::new(),
             section_hash_cache,
+            cookies: None,
             section_hash_cache_dirty: false,
             settings,
             progress: None,
@@ -1130,6 +1148,30 @@ impl Downloader {
             setting.interpolate_with_captures(&setting.toc_url, &url_captures)
         };
         let toc_url = Self::ageauth_redirect_target(&toc_url).unwrap_or(toc_url);
+        // Login fallback: a novel already flagged as needing authentication
+        // sends the stored cookie from the first request; every other novel
+        // stays anonymous until a fetch actually fails.
+        let login_host = crate::platform::cookie_host_for_url(&toc_url);
+        let mut login_cookie = match existing_id {
+            Some(id) => {
+                let flagged = self
+                    .novels
+                    .get(id.into())
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.requires_login);
+                match flagged {
+                    true => self.stored_cookie_for(login_host.as_deref()).await,
+                    false => None,
+                }
+            }
+            None => None,
+        };
+        let mut requires_login = login_cookie.is_some();
+        if let Some(cookie) = login_cookie.as_deref() {
+            apply_login_cookie(&mut setting, cookie);
+        }
         let (resolved_toc_url, prefetched_toc) =
             match crate::downloader::http_policy::resolve_final_url_with_body(
                 self.http.as_ref(),
@@ -1210,6 +1252,27 @@ impl Downloader {
             )
             .await,
         };
+        // Login fallback: retry once with the stored cookie before treating the
+        // novel as deleted. Nothing is sent when no cookie is stored, so sites
+        // the user never signed in to behave exactly as before.
+        let mut toc_source = toc_source;
+        if login_cookie.is_none() && should_retry_with_login(&setting, &toc_source) {
+            if let Some(cookie) = self.stored_cookie_for(login_host.as_deref()).await {
+                report_line("ログインが必要な可能性があります。保存済みのログイン情報で再試行します");
+                apply_login_cookie(&mut setting, &cookie);
+                let retried = fetch_toc(
+                    self.http.as_ref(),
+                    self.rate_limiter.as_ref(),
+                    &setting,
+                    &toc_url,
+                )
+                .await;
+                if retried.is_ok() {
+                    requires_login = true;
+                }
+                toc_source = retried;
+            }
+        }
         let toc_source = match toc_source {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
@@ -1841,6 +1904,7 @@ impl Downloader {
             is_narou: setting.is_narou,
             last_check_date: None,
             convert_failure: false,
+            requires_login,
             extra_fields: Default::default(),
         };
         if track_raw_title {
@@ -1896,6 +1960,7 @@ impl Downloader {
                     updated.domain = record.domain.clone();
                     updated.suspend = false;
                     updated.is_narou = record.is_narou;
+                    updated.requires_login |= requires_login;
                     for tag in &auto_tags {
                         if !updated.tags.contains(tag) {
                             updated.tags.push(tag.clone());
@@ -2366,6 +2431,23 @@ impl Downloader {
     }
 }
 
+/// Merge the stored login cookie into the site's static cookie value.
+fn apply_login_cookie(setting: &mut SiteSetting, login_cookie: &str) {
+    setting.cookie = crate::platform::merge_cookie_headers(setting.cookie(), Some(login_cookie));
+}
+
+/// A missing page (404) or a login wall served with HTTP 200 both mean the
+/// fetch may need authentication; every other error is a real failure.
+fn should_retry_with_login(setting: &SiteSetting, toc_source: &Result<String>) -> bool {
+    match toc_source {
+        Err(NarouError::NotFound(_)) => true,
+        Ok(source) => setting
+            .compiled_login_pattern()
+            .is_some_and(|pattern| pattern.is_match(source)),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::novel_info::NovelInfo;
@@ -2490,6 +2572,7 @@ mod tests {
         assert!(downloader.site_settings.is_empty());
         assert!(downloader.section_hash_cache.is_empty());
     }
+
 
     #[tokio::test]
     async fn memory_storage_download_pipeline_persists_toc_section_raw_and_record() {
@@ -2924,6 +3007,7 @@ is_narou: false
             is_narou: false,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
             extra_fields: Default::default(),
         }
     }

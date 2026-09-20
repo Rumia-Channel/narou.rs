@@ -56,9 +56,18 @@ pub struct NativeHttpClient {
     user_agent: String,
     tier_failures: Arc<Mutex<HashMap<String, [u8; 3]>>>,
     prefer_curl: Arc<AtomicBool>,
+    /// Login cookies are only refreshed for hosts that already store one, so a
+    /// site the user never signed in to never gains an entry here.
+    cookie_store: Option<Arc<dyn crate::platform::CookieStore>>,
 }
 
 impl NativeHttpClient {
+    /// Refresh stored login cookies from `Set-Cookie` responses.
+    pub fn with_cookie_store(mut self, store: Arc<dyn crate::platform::CookieStore>) -> Self {
+        self.cookie_store = Some(store);
+        self
+    }
+
     pub fn new(user_agent: &str) -> Result<Self> {
         if tokio::runtime::Handle::try_current().is_ok() {
             let user_agent = user_agent.to_string();
@@ -82,7 +91,38 @@ impl NativeHttpClient {
             user_agent: user_agent.to_string(),
             tier_failures: Arc::new(Mutex::new(HashMap::new())),
             prefer_curl: Arc::new(AtomicBool::new(false)),
+            cookie_store: None,
         })
+    }
+
+    /// Persist `Set-Cookie` updates for hosts with a stored login cookie.
+    ///
+    /// Sessions rotate their cookies on most responses; writing them back keeps
+    /// the stored value usable for the next run. Hosts without an entry are
+    /// left alone.
+    async fn persist_set_cookie(&self, url: &str, response: &HttpResponse) {
+        let Some(store) = self.cookie_store.as_ref() else {
+            return;
+        };
+        let values: Vec<String> = response
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, value)| value.clone())
+            .collect();
+        if values.is_empty() {
+            return;
+        }
+        let Some(host) = crate::platform::cookie_host_for_url(url) else {
+            return;
+        };
+        let Ok(Some(stored)) = store.load(&host).await else {
+            return;
+        };
+        let updated = crate::platform::apply_set_cookie(&stored, &values);
+        if updated != stored {
+            let _ = store.save(&host, &updated).await;
+        }
     }
 
     /// Synchronous entry point used by `send` inside `spawn_blocking`.
@@ -681,9 +721,13 @@ impl HttpClient for NativeHttpClient {
     fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, Result<HttpResponse>> {
         let this = self.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || this.send_blocking(&request))
+            let url = request.url.clone();
+            let worker = this.clone();
+            let response = tokio::task::spawn_blocking(move || worker.send_blocking(&request))
                 .await
-                .map_err(|e| NarouError::Http(e.to_string()))?
+                .map_err(|e| NarouError::Http(e.to_string()))??;
+            this.persist_set_cookie(&url, &response).await;
+            Ok(response)
         })
     }
 }

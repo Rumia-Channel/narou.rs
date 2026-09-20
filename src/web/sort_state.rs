@@ -249,6 +249,7 @@ mod tests {
             is_narou: true,
             last_check_date: Some(Utc.timestamp_opt(last_check_ts, 0).unwrap()),
             convert_failure: false,
+            requires_login: false,
             extra_fields: Default::default(),
         }
     }

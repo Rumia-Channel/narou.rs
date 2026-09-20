@@ -46,12 +46,17 @@ where
 }
 
 
-const SELECT_COLUMNS: usize = 26;
+const SELECT_COLUMNS: usize = 27;
+
+/// `extra_fields_yaml` keeps its own index: it sits before the columns added
+/// later (`requires_login`), so `SELECT_COLUMNS - 1` no longer addresses it.
+const EXTRA_FIELDS_COLUMN: usize = 25;
 
 pub(crate) fn record_from_row(row: &Row<'_>) -> Result<NovelRecord> {
     let tags_json: String = row.get(16).map_err(|error| NarouError::Platform(error.to_string()))?;
-    let extra_yaml: String =
-        row.get(SELECT_COLUMNS - 1).map_err(|error| NarouError::Platform(error.to_string()))?;
+    let extra_yaml: String = row
+        .get(EXTRA_FIELDS_COLUMN)
+        .map_err(|error| NarouError::Platform(error.to_string()))?;
     let tags: Vec<String> = serde_json::from_str(&tags_json)
         .map_err(|error| NarouError::Platform(format!("invalid tags JSON: {error}")))?;
     let extra_fields = parse_extra_fields(&extra_yaml)?;
@@ -84,6 +89,7 @@ pub(crate) fn record_from_row(row: &Row<'_>) -> Result<NovelRecord> {
         is_narou: int_flag(row, 22)?,
         last_check_date: parse_optional_time(column(row, 23)?)?,
         convert_failure: int_flag(row, 24)?,
+        requires_login: int_flag(row, 26)?,
         extra_fields,
     })
 }
@@ -428,6 +434,7 @@ mod tests {
             is_narou: true,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
             extra_fields: Default::default(),
         };
         if toc_url.contains("syosetu") {

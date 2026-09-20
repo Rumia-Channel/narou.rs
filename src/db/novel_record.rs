@@ -53,6 +53,15 @@ pub struct NovelRecord {
         rename = "_convert_failure"
     )]
     pub convert_failure: bool,
+    /// Set once a fetch failed without a login cookie but succeeded with it.
+    /// Novels flagged here send the stored login cookie up front; every other
+    /// novel stays anonymous until a fetch actually needs authentication.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nilable_bool",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub requires_login: bool,
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_fields: BTreeMap<String, serde_yaml::Value>,
 }

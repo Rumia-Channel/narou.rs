@@ -41,6 +41,13 @@ pub struct SiteSetting {
     pub confirm_over18: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie: Option<String>,
+    /// Login page the `narou_rs_login` executable opens for this site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_url: Option<String>,
+    /// Page content that marks a login wall (a page served with HTTP 200 that
+    /// asks for authentication). Matching it retries with the stored cookie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_pattern: Option<SiteSettingValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub over18_pattern: Option<SiteSettingValue>,
     pub sitename: String,
@@ -131,6 +138,8 @@ pub struct SiteSetting {
     pub(super) compiled_error_message: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_over18_pattern: Option<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_login_pattern: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_next_toc: Option<Regex>,
     #[serde(skip)]
@@ -229,6 +238,10 @@ impl SiteSetting {
             .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_over18_pattern = self
             .over18_pattern
+            .as_ref()
+            .and_then(|v| self.compile_value(v));
+        self.compiled_login_pattern = self
+            .login_pattern
             .as_ref()
             .and_then(|v| self.compile_value(v));
         self.compiled_next_toc = self.next_toc.as_deref().and_then(|s| Regex::new(s).ok());
@@ -410,6 +423,15 @@ impl SiteSetting {
 
     pub fn cookie(&self) -> Option<&str> {
         self.cookie.as_deref()
+    }
+
+    /// Login page for this site, with `\k<...>` placeholders resolved.
+    pub fn login_url(&self) -> Option<String> {
+        self.login_url.as_ref().map(|url| self.interpolate(url))
+    }
+
+    pub fn compiled_login_pattern(&self) -> Option<&Regex> {
+        self.compiled_login_pattern.as_ref()
     }
 
     pub fn error_message(&self) -> Option<&str> {
