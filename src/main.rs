@@ -557,6 +557,13 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             commands::version::cmd_version(more);
             0
         }
+        Commands::Login { action } => match commands::login::cmd_login(action) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
         Commands::Illust {
             force,
             all,

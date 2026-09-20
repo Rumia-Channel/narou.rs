@@ -110,6 +110,10 @@ const COMMANDS: &[CmdInfo] = &[
         name: "illust",
         oneline: "挿絵ハッシュストアの運用補助 (orphan/migrate/fix-ext/rebuild)",
     },
+    CmdInfo {
+        name: "login",
+        oneline: "ログイン情報の取り込み・書き出し (import/export/list/set/clear)",
+    },
 ];
 
 const HEADER: &str = "Narou.rb ― 小説家になろうダウンローダ＆縦書き用整形スクリプト";
@@ -892,6 +896,40 @@ const ILLUST_HELP: CmdHelp = CmdHelp {
     ],
 };
 
+const LOGIN_HELP: CmdHelp = CmdHelp {
+    banner: "<sub> [options]",
+    description: "\
+  ・ログインが必要なサイトの Cookie を、ブラウザのある端末から受け取ります。
+  ・Cookie の取得は別実行ファイル narou_rs_login が担当します。
+      narou_rs_login <サイト>            # ブラウザを開いてログインし保存
+      narou_rs_login <サイト> --list      # 保存済みの確認
+      narou_rs_login <サイト> --clear     # 削除
+  ・このコマンドは取得済みの Cookie を本ライブラリへ取り込みます。
+      保存は暗号化され (.narou/login.key または NAROU_RS_LOGIN_KEY の鍵)、
+      取り込みファイルも --passphrase 指定時は暗号化されます。
+  ・<sub> に次のいずれかを指定します。
+      list     保存済みのサイト一覧 (値は伏せて表示)
+      import   書き出しファイル (YAML) を取り込む
+      export   保存済みの情報を書き出しファイルへ出力
+      set      1 サイト分の Cookie を直接保存 (--cookie 省略時は標準入力)
+      clear    1 サイト分、またはすべての情報を削除
+
+  Examples:
+    narou login import login.yaml --passphrase hunter2
+    narou login import login.yaml --replace
+    narou login export login.yaml --passphrase hunter2
+    narou login list
+    narou login set ncode.syosetu.com --cookie \"over18=yes; ses=...\"
+    narou login clear ncode.syosetu.com
+    narou login clear",
+    options: &[
+        opt(None, "--passphrase", Some("<pass>"), "書き出し/取り込みの暗号化パスフレーズ"),
+        opt(None, "--replace", None, "取り込みに含まれないサイトの情報を削除する"),
+        opt(None, "--clear-text", None, "パスフレーズ指定時でも平文で書き出す"),
+        opt(None, "--cookie", Some("<value>"), "set で保存する Cookie 文字列"),
+    ],
+};
+
 const LOG_HELP: CmdHelp = CmdHelp {
     banner: "[options] [<path>]",
     description: "\
@@ -1029,6 +1067,10 @@ const ALL_COMMAND_HELP: &[CommandHelpEntry] = &[
     CommandHelpEntry {
         name: "illust",
         help: &ILLUST_HELP,
+    },
+    CommandHelpEntry {
+        name: "login",
+        help: &LOGIN_HELP,
     },
     CommandHelpEntry {
         name: "log",

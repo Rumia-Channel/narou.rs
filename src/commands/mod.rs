@@ -20,6 +20,7 @@ pub mod illust;
 pub mod init;
 pub mod inspect;
 pub mod log;
+pub mod login;
 pub mod mail;
 pub mod manage;
 pub mod db;
