@@ -65,6 +65,16 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - SQLite migration / compat 判定等のストレージ実装内部、`webnovel/*.yaml` のようなユーザー編集可能なサイト定義、`setting.ini` 等の小説固有入力は別用途なのでこの禁止の対象外とする。設定保存時は必要に応じて `update` で同時更新による上書きを防ぐ。
 - 保存元と読み出し先の不一致を防ぐため、SQLite 有効時に `setting` で保存した `default.*` / `force.*` が converter に反映されることを回帰テストで確認する。
 
+## ログインが必要なサイト (フォールバック方式)
+- 本体 (`narou_rs`) はログイン処理そのものを持たない。担うのは (1) ログインが必要かの判定、(2) どの小説の取得にログインが必要かの区別、(3) ログイン済み Cookie の更新の 3 点だけ。
+- 通常は Cookie を送らない。取得に失敗したときだけ、保存済みのログイン Cookie を付けて 1 回再試行する。`404`（小説が消えた）またはサイト定義の `login_pattern` に一致するログイン壁が対象で、それ以外のエラーは従来どおり失敗させる。
+- 再試行で取得できた小説はレコードの `requires_login`（SQLite `novels.requires_login` / `*.yaml` の `requires_login: true`）を立て、次回から最初のリクエストで Cookie を送る。オプション無しの小説は Cookie を一切送らないため、ログイン不要な小説の挙動は従来と変わらない。
+- 再試行しても取得できない場合は従来どおり 404 判定（`frozen` / `404` タグ + `freeze.yaml`）へ進む。`requires_login` が立っている小説は「Cookie 付きで取得 → 失敗なら凍結」の順になる。
+- サイト固有の値は `webnovel/*.yaml` に置く。追加キーは `login_url`（ログイン用 bin が開く URL、`\k<domain>` 補間あり）と `login_pattern`（HTTP 200 で返るログイン壁を検出する正規表現）。本体にサイト名・ドメイン固有の分岐は置かない。
+- Cookie は `Inventory` の `login_cookie`（SQLite `app_state` / `.narou/login_cookie.yaml`）にホスト単位で保存する。応答の `Set-Cookie` は、既に保存済みのホストに限り `src/native/http.rs` が書き戻してセッションを維持する（保存していないホストには新規エントリを作らない）。
+- ログイン実行は別 bin `narou_rs_login`（`src/bin/login.rs`）が担当する。Chromium 系ブラウザを `--remote-debugging-port` 付きで起動し、DevTools protocol (`Storage.getCookies`) で Cookie を取得する（`ws://` のみなのでブラウザ自動化依存を追加しない）。2 段階認証や CAPTCHA は実ブラウザ操作なのでそのまま通る。ブラウザが無い環境向けに `--cookie "<Cookie 文字列>"` の貼り付け保存、`--list` / `--clear` も用意する。
+- 未対応: リリース zip への `narou_rs_login` 同梱（`.github/workflows/release.yml` / `src/bin/cargo-local-build.rs` は現状 `narou_rs` / `narou_rs_updater` / `narou_rs_backup` のみを梱包する）。develop へ統合する前に同梱処理を追加すること。
+
 ## Git 運用ルール
 - 通常の修正・軽微な機能追加・ドキュメント更新は `develop` 上で行う。作業開始前に現在ブランチと作業ツリーを確認し、`main` 上で直接作業しない。
 - 作業開始時に対象ブランチが `origin` より遅れている場合は、`git pull` で最新へ追従してから作業を始める。
