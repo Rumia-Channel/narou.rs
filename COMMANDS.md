@@ -1,6 +1,6 @@
 # narou.rs コマンド互換性ドキュメント
 
-narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状況・要件を整理する。Rust 拡張の `illust` (挿絵メンテナンス) を含む 25 コマンドを網羅する。
+narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状況・要件を整理する。Rust 拡張の `illust` (挿絵メンテナンス) と `login` (ログイン情報管理) を含む 26 コマンドを網羅する。
 
 ---
 
@@ -76,6 +76,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | init | | | ショートカット無し（`i` / `in` は inspect） |
 | db（Rust 拡張） | | `db` | narou.rb コマンドのショートカットを奪わない |
 | illust（Rust 拡張） | | `il` | 同上 |
+| login（Rust 拡張） | | `log` は `log` コマンド | narou.rb コマンドのショートカットを奪わない |
 
 **注意**: v0.4.0 では `COMMAND_NAMES` の先頭に Rust 拡張の `db` が入っていたため `narou d` が `db` に解決されていた。現在は upstream と同じ並び（Rust 拡張は末尾）で、`d` は `download`。`src/cli.rs` のテストで並び順と主要な解決結果を固定している。
 
@@ -101,6 +102,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `backup` | ✅ | ✅ 完了 | `narou backup`/複数 target、`backup/` 除外、180バイト切り詰めまで対応 |
 | `clean` | ✅ | ✅ 完了 | `latest_convert` 既定値、`--all`、`--force`/`--dry-run`、freeze スキップ、`raw/*.txt|*.html` と `本文/*.yaml` の orphan 判定を実装 |
 | `illust` | ✅ | ✅ 完了 | v0.2.11 で導入した `.illustration_cache.yaml` 運用のための `narou illust <sub>` 新設。サブコマンド `orphan`/`migrate`/`fix-ext`/`rebuild` を実装し、削除/改名/移行はいずれも既定 dry-run (`-f` で実行) |
+| `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`set`/`clear` を実装。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET/DELETE /api/login`、`POST /api/login/import`、`POST /api/login/set`、`DELETE /api/login/{host}` も対応 |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
 | `version` | ✅ | ✅ 完了 | `-v`/`--version` と `--more` を実装。出力順序、help 文言、AozoraEpub3 探索、失敗時メッセージを Ruby 版に揃えた |
 | `log` | ✅ | ✅ 完了 | `--num`, `--tail`, `--source-convert`, `<path>` を実装。最新ログ選択、`.narou/local_setting.yaml` の `log.*` 既定値、`*_convert` フィルタも対応 |
@@ -234,6 +236,26 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 | `vacuum` | VACUUM で容量回収 |
 
 **前方互換モード**: `narou setting narou-compat=true` で `.narou/*.yaml` (database.yaml, freeze.yaml, alias.yaml, tag_colors.yaml, latest_convert.yaml, local_setting.yaml, queue.yaml, notepad.txt) と `~/.narousetting/global_setting.yaml` をファイルとして維持し、narou.rb がそのまま読める状態を保つ。ファイルが正で SQLite はミラー。OFF(既定) ではファイルを `*.imported-*` へ退避し SQLite のみで管理する。
+
+---
+
+### 3.y `login` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
+
+ブラウザのある端末とダウンロード実行ホストが別であることを前提にしたログイン情報管理コマンド。取得側は別実行ファイル `narou_rs_login` が担当し、本コマンドは受け入れ・書き出し・一覧・削除を行う。
+
+| サブコマンド | 内容 |
+|---|---|
+| `list` | 保存済みサイト一覧。Cookie 値は `name=…` に伏せて表示し、暗号化状態と鍵の出所を示す |
+| `import <file> [--passphrase P] [--replace]` | `narou_rs_login --export` の書き出しファイル (YAML) を取り込む。`--replace` で取り込みに含まれないホストを削除 |
+| `export <file> [--passphrase P] [--clear-text]` | 保存済み情報を書き出しファイルへ出力。`--passphrase` 指定時は Argon2id→XChaCha20-Poly1305 で暗号化 |
+| `set <host> [--cookie V]` | 1 サイト分の Cookie を直接保存 (`--cookie` 省略時は標準入力) |
+| `clear [host]` | 1 サイト分、または引数なしですべての情報を削除 |
+
+**保存形式**: `login_cookie` inventory (SQLite `app_state` / `.narou/login_cookie.yaml`) に `enc:v1:<nonce>:<payload>` として暗号化保存。鍵は `.narou/login.key` (初回作成、Unix では 0600) または `NAROU_RS_LOGIN_KEY` (base64)。ホスト名を AEAD の associated data に束ねるため別ホストへの流用は不可。旧形式の平文値は読み取り可能で次回保存時に暗号化される。
+
+**書き出し形式**: `version`/`exported_at`/`library`/`encrypted`/`kdf`/`salt`/`payload`/`cookies` を持つ YAML エンベロープ。`narou_rs_login --export <file>` が生成し、ライブラリ外ではそれが既定の出力になる。
+
+**Web UI**: 設定ページ「ログイン」タブで一覧・取り込み・直接登録・削除。API: `GET/DELETE /api/login`、`POST /api/login/import`、`POST /api/login/set`、`DELETE /api/login/{host}`。
 
 ---
 
