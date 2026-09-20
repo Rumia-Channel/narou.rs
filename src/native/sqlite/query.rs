@@ -124,7 +124,7 @@ fn term_expression(field: SearchField) -> String {
         SearchField::Tag => "instr(n.tags_fold, value) > 0".to_string(),
         SearchField::Status => format!("instr({STATUS_SEARCH_EXPRESSION}, value) > 0"),
         SearchField::Any => format!(
-            "instr(n.title_fold, value) > 0 OR instr(n.author_fold, value) > 0 OR instr(n.sitename_fold, value) > 0 OR instr(n.tags_fold, value) > 0 OR instr({STATUS_SEARCH_EXPRESSION}, value) > 0 OR instr(n.ncode_fold, value) > 0 OR instr(n.toc_url_fold, rtrim(value, '/')) > 0 OR CAST(n.id AS TEXT) = value"
+            "instr(n.title_fold, value) > 0 OR instr(n.author_fold, value) > 0 OR instr(n.sitename_fold, value) > 0 OR instr(n.tags_fold, value) > 0 OR instr({STATUS_SEARCH_EXPRESSION}, value) > 0 OR instr(n.ncode_fold, value) > 0 OR (instr(value, '://') > 0 AND instr(n.toc_url_fold, rtrim(value, '/')) > 0) OR substr(rtrim(n.toc_url_fold, '/'), -(length(value) + 1)) = '/' || value OR CAST(n.id AS TEXT) = value"
         ),
     }
 }
