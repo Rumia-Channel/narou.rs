@@ -89,6 +89,7 @@ base64 = "0.23"
 miniz_oxide = "0.9"
 brotli = "9.0"
 crc32fast = "1.5"
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 
 [build-dependencies]
 base64 = "0.22"
@@ -107,6 +108,11 @@ required-features = ["native-runtime"]
 [[bin]]
 name = "narou_rs_backup"
 path = "src/bin/narou_rs_backup.rs"
+required-features = ["native-runtime"]
+
+[[bin]]
+name = "narou_rs_login"
+path = "src/bin/login.rs"
 required-features = ["native-runtime"]
 
 [[bin]]
