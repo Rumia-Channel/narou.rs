@@ -581,6 +581,37 @@ impl NativeStore {
             .unwrap_or_else(|| PathBuf::from("."));
         Self::for_narou_root(&narou_root)
     }
+
+    /// Rebuild a deleted mirror file from the stored object.
+    ///
+    /// Returns `false` when the backend has no second copy (filesystem mode) or
+    /// does not know the key.
+    pub fn restore_mirror_file(&self, path: &Path) -> Result<bool> {
+        match self {
+            NativeStore::Fs(_) => Ok(false),
+            NativeStore::Sqlite(store) => store.restore_mirror_file(path),
+        }
+    }
+}
+
+/// Ensure a mirror file exists, rebuilding it from storage when the backend
+/// still holds the object. Returns `true` when the file is readable afterwards.
+///
+/// Files deleted outside narou leave SQLite mode with a stored object but no
+/// file for the converter and narou.rb to read; read paths call this before
+/// reporting a missing file. The library root comes from the working directory
+/// rather than the database, so this also works before any command initialized
+/// the database.
+pub fn ensure_mirror_file(path: &Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+    let Ok(inventory) = crate::db::inventory::Inventory::with_default_root() else {
+        return false;
+    };
+    NativeStore::for_narou_root(inventory.root_dir())
+        .and_then(|store| store.restore_mirror_file(path))
+        .unwrap_or(false)
 }
 
 impl ObjectStore for NativeStore {

@@ -8,6 +8,7 @@
 //! legacy illustration directory handling).
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
@@ -44,6 +45,33 @@ impl SqliteObjectStore {
 
     fn now_rfc3339() -> String {
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    }
+
+    /// Rewrite the mirror file for `path` from the stored object.
+    ///
+    /// The filesystem mirror can disappear outside narou (manual cleanup, a
+    /// sync tool). The stored copy stays authoritative, so rebuild the file
+    /// instead of failing the caller that needs to read it. Returns `false`
+    /// when the storage does not know the key.
+    pub fn restore_mirror_file(&self, path: &Path) -> Result<bool> {
+        // Callers reach this with either an absolute path or one relative to the
+        // library root (the download-triggered conversion passes a relative
+        // novel directory), so resolve against the working directory first.
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        };
+        let Some(key) = logical_key_for_native_path(self.mirror.root(), &absolute) else {
+            return Ok(false);
+        };
+        let Some(data) = self.read_blocking(&key)? else {
+            return Ok(false);
+        };
+        self.mirror.write_bytes_blocking(&key, &data)?;
+        Ok(path.is_file())
     }
 
     fn stat_blocking(&self, key: &ObjectKey) -> Result<Option<ObjectMetadata>> {
@@ -773,6 +801,24 @@ mod tests {
         let key = ObjectKey::try_new("novels/site/title/toc.yaml").unwrap();
         let data = futures::executor::block_on(store.read_small(&key)).unwrap().unwrap();
         assert_eq!(data, b"toc-data");
+    }
+
+    /// A mirror file deleted outside narou is rebuilt from the stored object.
+    #[test]
+    fn restore_mirror_file_rebuilds_deleted_file() {
+        let (dir, store) = temp_store();
+        let keys = crate::platform::NovelObjectKeys::new("site", "n1234ab", false).unwrap();
+        let section = keys.section("1", "第一話");
+        futures::executor::block_on(store.write_small(&section, b"section".to_vec())).unwrap();
+        let path = dir.path().join("site/n1234ab/本文/1 第一話.yaml");
+        assert!(path.is_file());
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(store.restore_mirror_file(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"section");
+
+        let unknown = dir.path().join("site/n1234ab/本文/9 存在しない.yaml");
+        assert!(!store.restore_mirror_file(&unknown).unwrap());
     }
 
     /// `remove --with-file` relies on this: a prefix delete must drop the

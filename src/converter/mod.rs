@@ -1307,18 +1307,28 @@ fn load_sections_from_dir(
     let mut sections = Vec::new();
 
     for sub in subtitles {
-        let path = crate::native::legacy_persistence::resolve_section_file_path(&section_dir, sub)
-            .ok_or_else(|| {
-                let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
-                NarouError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!(
-                        "section file not found: expected '{}' in {}",
-                        filename,
-                        section_dir.display()
-                    ),
-                ))
-            })?;
+        let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
+        let path = match crate::native::legacy_persistence::resolve_section_file_path(&section_dir, sub)
+        {
+            Some(path) => path,
+            None => {
+                // SQLite storage keeps its own copy of every section, so a
+                // mirror file deleted outside narou can still be rebuilt here
+                // instead of failing the conversion.
+                crate::native::object_store::ensure_mirror_file(&section_dir.join(&filename));
+                crate::native::legacy_persistence::resolve_section_file_path(&section_dir, sub)
+                    .ok_or_else(|| {
+                        NarouError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!(
+                                "section file not found: expected '{}' in {}",
+                                filename,
+                                section_dir.display()
+                            ),
+                        ))
+                    })?
+            }
+        };
         let content = std::fs::read_to_string(&path).map_err(|e| NarouError::Io(e))?;
         let section: crate::downloader::SectionFile =
             serde_yaml::from_str(&content).map_err(|e| NarouError::Yaml(e))?;
