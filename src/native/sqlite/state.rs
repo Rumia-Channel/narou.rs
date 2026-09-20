@@ -32,6 +32,7 @@ const MANAGED_LOCAL: &[(&str, &str)] = &[
     ("freeze", "freeze.yaml"),
     ("alias", "alias.yaml"),
     ("tag_colors", "tag_colors.yaml"),
+    ("login_cookie", "login_cookie.yaml"),
     ("latest_convert", "latest_convert.yaml"),
     ("local_setting", "local_setting.yaml"),
     ("queue", "queue.yaml"),

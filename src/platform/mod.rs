@@ -14,6 +14,7 @@
 //! See `docs/platform-abstraction.md` for the full design.
 
 pub mod clock;
+pub mod cookie_store;
 pub mod http;
 pub mod mocks;
 pub mod object_store;
@@ -22,6 +23,10 @@ pub mod rate_limiter;
 pub mod repository;
 
 pub use clock::{Clock, SystemClock};
+pub use cookie_store::{
+    CookieStore, apply_set_cookie, cookie_host_for_url, format_cookie_header,
+    merge_cookie_headers, parse_cookie_header,
+};
 pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
 pub use object_store::{
     AssetChunk, AssetStore, AssetStream, GeneratedAssetKey, NovelObjectKeys, ObjectEncoding,

@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use crate::db::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::platform::{
-    AssetStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, NovelFilter, NovelId,
+    AssetStore, CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, NovelFilter, NovelId,
     NovelMutation, NovelQuery, NovelRepository, ObjectKey, ObjectListPage, ObjectListRequest,
     ObjectMetadata, ObjectStore, PlatformFuture, RateLimitScope, RateLimiter,
 };
@@ -474,6 +474,67 @@ impl RateLimiter for FakeRateLimiter {
     }
 }
 
+/// In-memory [`CookieStore`] for tests and the Worker runtime.
+#[derive(Debug, Default, Clone)]
+pub struct MemoryCookieStore {
+    cookies: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
+}
+
+impl MemoryCookieStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.cookies.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl CookieStore for MemoryCookieStore {
+    fn load<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<Option<String>>> {
+        let host = host.to_ascii_lowercase();
+        Box::pin(async move {
+            Ok(self
+                .cookies
+                .lock()
+                .unwrap()
+                .get(&host)
+                .filter(|cookie| !cookie.is_empty())
+                .cloned())
+        })
+    }
+
+    fn save<'a>(&'a self, host: &'a str, cookie: &'a str) -> PlatformFuture<'a, Result<()>> {
+        let host = host.to_ascii_lowercase();
+        let cookie = cookie.to_string();
+        Box::pin(async move {
+            let mut cookies = self.cookies.lock().unwrap();
+            if cookie.trim().is_empty() {
+                cookies.remove(&host);
+            } else {
+                cookies.insert(host, cookie);
+            }
+            Ok(())
+        })
+    }
+
+    fn clear<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<()>> {
+        let host = host.to_ascii_lowercase();
+        Box::pin(async move {
+            self.cookies.lock().unwrap().remove(&host);
+            Ok(())
+        })
+    }
+
+    fn list(&self) -> PlatformFuture<'_, Result<std::collections::BTreeMap<String, String>>> {
+        Box::pin(async move { Ok(self.cookies.lock().unwrap().clone()) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +568,7 @@ mod tests {
             is_narou: false,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
             extra_fields: Default::default(),
         }
     }
