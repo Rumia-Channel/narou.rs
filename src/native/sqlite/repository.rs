@@ -46,10 +46,8 @@ where
 }
 
 
-const SELECT_COLUMNS: usize = 27;
-
 /// `extra_fields_yaml` keeps its own index: it sits before the columns added
-/// later (`requires_login`), so `SELECT_COLUMNS - 1` no longer addresses it.
+/// later (`requires_login`), so the last column no longer addresses it.
 const EXTRA_FIELDS_COLUMN: usize = 25;
 
 pub(crate) fn record_from_row(row: &Row<'_>) -> Result<NovelRecord> {

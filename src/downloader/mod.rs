@@ -1152,7 +1152,7 @@ impl Downloader {
         // sends the stored cookie from the first request; every other novel
         // stays anonymous until a fetch actually fails.
         let login_host = crate::platform::cookie_host_for_url(&toc_url);
-        let mut login_cookie = match existing_id {
+        let login_cookie = match existing_id {
             Some(id) => {
                 let flagged = self
                     .novels
