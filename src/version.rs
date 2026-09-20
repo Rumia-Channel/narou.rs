@@ -1,10 +1,9 @@
-use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::compat::configure_hidden_console_command;
 use crate::db::inventory::Inventory;
+use crate::setting_core::SettingScope;
 
 pub const NAME: &str = "narou.rs";
 pub const VERSION: &str = match option_env!("NAROU_RS_VERSION_OVERRIDE") {
@@ -191,9 +190,7 @@ pub fn self_update_unavailable_reason() -> Option<&'static str> {
 }
 
 fn aozoraepub3_jar_from_global_setting() -> Option<PathBuf> {
-    let path = global_setting_path()?;
-    let raw = fs::read_to_string(path).ok()?;
-    let settings: HashMap<String, serde_yaml::Value> = serde_yaml::from_str(&raw).ok()?;
+    let settings = crate::db::settings::load(SettingScope::Global).ok()?;
     let dir = settings.get("aozoraepub3dir")?.as_str()?;
     let jar = PathBuf::from(dir).join("AozoraEpub3.jar");
     jar.exists().then_some(jar)
@@ -210,27 +207,6 @@ fn aozoraepub3_jar_next_to_exe() -> Option<PathBuf> {
     let dir = exe.parent()?;
     let jar = dir.join("AozoraEpub3").join("AozoraEpub3.jar");
     jar.exists().then_some(jar)
-}
-
-fn global_setting_path() -> Option<PathBuf> {
-    if let Ok(inv) = Inventory::with_default_root() {
-        let dir = inv.root_dir().join(".narousetting");
-        if dir.is_dir() {
-            return Some(dir.join("global_setting.yaml"));
-        }
-    }
-
-    let home = home_dir()?;
-    let path = home.join(".narousetting").join("global_setting.yaml");
-    Some(path)
-}
-
-fn home_dir() -> Option<PathBuf> {
-    if cfg!(windows) {
-        std::env::var("USERPROFILE").ok().map(PathBuf::from)
-    } else {
-        std::env::var("HOME").ok().map(PathBuf::from)
-    }
 }
 
 #[cfg(test)]

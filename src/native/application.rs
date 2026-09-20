@@ -133,10 +133,8 @@ impl SettingsStore for NativeSettingsStore {
         scope: crate::setting_core::SettingScope,
     ) -> PlatformFuture<'a, Result<HashMap<String, serde_yaml::Value>>> {
         let inventory = Arc::clone(&self.inventory);
-        let inventory_scope = inventory_scope(scope);
-        let name = setting_name(scope);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || inventory.load(name, inventory_scope))
+            tokio::task::spawn_blocking(move || crate::db::settings::load_with_inventory(&inventory, scope))
                 .await
                 .map_err(|error| {
                     NarouError::Platform(format!("settings load task failed: {error}"))
@@ -150,11 +148,11 @@ impl SettingsStore for NativeSettingsStore {
         settings: &'a HashMap<String, serde_yaml::Value>,
     ) -> PlatformFuture<'a, Result<()>> {
         let inventory = Arc::clone(&self.inventory);
-        let inventory_scope = inventory_scope(scope);
-        let name = setting_name(scope);
         let settings = settings.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || inventory.save(name, inventory_scope, &settings))
+            tokio::task::spawn_blocking(move || {
+                crate::db::settings::save_with_inventory(&inventory, scope, &settings)
+            })
                 .await
                 .map_err(|error| {
                     NarouError::Platform(format!("settings save task failed: {error}"))
@@ -188,20 +186,6 @@ impl SettingsStore for NativeSettingsStore {
                 .map_err(|error| NarouError::Platform(format!("replace save task failed: {error}")))?
                 .map_err(Into::into)
         })
-    }
-}
-
-fn inventory_scope(scope: crate::setting_core::SettingScope) -> InventoryScope {
-    match scope {
-        crate::setting_core::SettingScope::Local => InventoryScope::Local,
-        crate::setting_core::SettingScope::Global => InventoryScope::Global,
-    }
-}
-
-fn setting_name(scope: crate::setting_core::SettingScope) -> &'static str {
-    match scope {
-        crate::setting_core::SettingScope::Local => "local_setting",
-        crate::setting_core::SettingScope::Global => "global_setting",
     }
 }
 

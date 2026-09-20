@@ -59,6 +59,12 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
   - `use` / `import` の順番を入れ替えるだけの変更
 - これらの整形変更は、機能変更に付随して不可避な場合（例: 引数追加で行長が変わる）のみ許容する。
 
+## 設定データの I/O 境界
+- `local_setting` / `global_setting` の本番コードからの読み書きは `src/db/settings.rs`（`load` / `save` / `update` / `value` 等）を共通入口とする。CLI・Web・converter・downloader・logger・init・self-update から設定 YAML を直接 `fs::read_to_string` / `fs::write` で操作しない。
+- 共通入口の下では既存 `Inventory` が保存方式（SQLite `app_state` と legacy YAML）を選択する。`native::application::NativeSettingsStore` も同じ共通入口に委譲する。Worker 側は従来の `SettingsStore` port / D1 adapter を利用する。
+- SQLite migration / compat 判定等のストレージ実装内部、`webnovel/*.yaml` のようなユーザー編集可能なサイト定義、`setting.ini` 等の小説固有入力は別用途なのでこの禁止の対象外とする。設定保存時は必要に応じて `update` で同時更新による上書きを防ぐ。
+- 保存元と読み出し先の不一致を防ぐため、SQLite 有効時に `setting` で保存した `default.*` / `force.*` が converter に反映されることを回帰テストで確認する。
+
 ## Git 運用ルール
 - 通常の修正・軽微な機能追加・ドキュメント更新は `develop` 上で行う。作業開始前に現在ブランチと作業ツリーを確認し、`main` 上で直接作業しない。
 - 作業開始時に対象ブランチが `origin` より遅れている場合は、`git pull` で最新へ追従してから作業を始める。

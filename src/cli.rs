@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::path::PathBuf;
 
 use clap::Parser;
 
@@ -173,27 +172,11 @@ fn load_multiple_delimiter() -> String {
 }
 
 fn load_global_no_color() -> bool {
-    let home = if cfg!(windows) {
-        std::env::var("USERPROFILE").ok()
-    } else {
-        std::env::var("HOME").ok()
-    };
-    let Some(home) = home else { return false };
-    let path = PathBuf::from(home).join(".narousetting/global_setting.yaml");
-    if !path.exists() {
-        return false;
-    }
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let Ok(settings): Result<HashMap<String, serde_yaml::Value>, _> = serde_yaml::from_str(&raw)
-    else {
-        return false;
-    };
-    settings
-        .get("no-color")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    narou_rs::db::settings::bool_value(
+        narou_rs::setting_core::SettingScope::Global,
+        "no-color",
+    )
+    .unwrap_or(false)
 }
 
 fn args_before_double_dash(args: &[String]) -> &[String] {
@@ -270,18 +253,7 @@ fn load_local_setting_bool(key: &str) -> Option<bool> {
 }
 
 fn load_local_setting_raw_value(key: &str) -> Option<serde_yaml::Value> {
-    let dir = std::env::current_dir().ok()?;
-    if !dir.join(".narou").exists() {
-        return None;
-    }
-    let inv = narou_rs::db::inventory::Inventory::new(dir);
-    let settings: HashMap<String, serde_yaml::Value> = inv
-        .load(
-            "local_setting",
-            narou_rs::db::inventory::InventoryScope::Local,
-        )
-        .ok()?;
-    settings.get(key).cloned()
+    narou_rs::db::settings::value(narou_rs::setting_core::SettingScope::Local, key)
 }
 
 fn inject_log_defaults(args: &mut Vec<String>) {

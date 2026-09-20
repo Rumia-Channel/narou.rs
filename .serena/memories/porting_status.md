@@ -1,5 +1,10 @@
 # narou.rb Porting Status (updated 2026-04-14)
 
+## 2026-09-19: Issue #21 / #22（機能ブランチ上の修正）
+- `list --latest` と `list --latest --gl` の既定方向を narou.rb の更新日降順に統一、`--reverse` の反転もテスト追加。
+- 設定 I/O を `src/db/settings.rs` → `Inventory`（SQLite app_state / legacy YAML）に集約。CLI / converter / Web / downloader 等の `local_setting` / `global_setting` 読み書きを移行。
+- `default.enable_yokogaki` / `default.enable_illust` / `default.enable_add_date_to_title` と `force.*` の SQLite 回帰テストを追加。実際の CI / Windows 確認結果は PR に記録する。
+
 ## ⚠ 互換性の要件レベル（妥協なし）
 - 外部から観測できる挙動の互換性は**妥協せず完璧に**追求する。
 - **設定ファイルの位置**: `.narou/local_setting.yaml`、`~/.narousetting/global_setting.yaml` など Ruby 版と同一パス。

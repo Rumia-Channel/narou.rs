@@ -2,6 +2,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use narou_rs::error::Result;
+use narou_rs::setting_core::SettingScope;
 
 pub fn cmd_init(aozora_path: Option<&str>, line_height: Option<f64>) -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -30,7 +31,7 @@ pub fn cmd_init(aozora_path: Option<&str>, line_height: Option<f64>) -> Result<(
 
     ensure_dot_narou_files(&root)?;
 
-    init_aozoraepub3_settings(aozora_path, line_height, already_root.is_some())?;
+    init_aozoraepub3_settings(&root, aozora_path, line_height, already_root.is_some())?;
 
     if already_root.is_none() {
         println!("初期化が完了しました！");
@@ -100,20 +101,12 @@ fn bundled_webnovel_dir() -> Option<PathBuf> {
 }
 
 fn init_aozoraepub3_settings(
+    root: &Path,
     aozora_path: Option<&str>,
     line_height: Option<f64>,
     force: bool,
 ) -> Result<()> {
-    let global_dir = home_dir().join(".narousetting");
-    let global_path = global_dir.join("global_setting.yaml");
-
-    let mut settings = if global_path.exists() {
-        let raw = std::fs::read_to_string(&global_path)?;
-        serde_yaml::from_str::<std::collections::BTreeMap<String, serde_yaml::Value>>(&raw)
-            .unwrap_or_default()
-    } else {
-        std::collections::BTreeMap::new()
-    };
+    let mut settings = narou_rs::db::settings::load_for_root(root, SettingScope::Global)?;
 
     if !force
         && aozora_path.is_none()
@@ -160,9 +153,7 @@ fn init_aozoraepub3_settings(
 
     rewrite_aozoraepub3_files(&resolved_aozora_path, height)?;
 
-    let content = serde_yaml::to_string(&settings)?;
-    std::fs::create_dir_all(&global_dir)?;
-    std::fs::write(global_path, content)?;
+    narou_rs::db::settings::save_for_root(root, SettingScope::Global, &settings)?;
     println!("グローバル設定を保存しました");
 
     Ok(())
@@ -170,7 +161,7 @@ fn init_aozoraepub3_settings(
 
 fn resolve_init_aozora_path(
     aozora_path: Option<&str>,
-    settings: &std::collections::BTreeMap<String, serde_yaml::Value>,
+    settings: &std::collections::HashMap<String, serde_yaml::Value>,
 ) -> Result<Option<String>> {
     match aozora_path {
         Some(":keep") => Ok(settings
@@ -187,7 +178,7 @@ fn resolve_init_aozora_path(
 }
 
 fn ask_aozoraepub3_path(
-    settings: &std::collections::BTreeMap<String, serde_yaml::Value>,
+    settings: &std::collections::HashMap<String, serde_yaml::Value>,
 ) -> Result<Option<String>> {
     let current_path = settings
         .get("aozoraepub3dir")
@@ -224,7 +215,7 @@ fn ask_aozoraepub3_path(
 }
 
 fn ask_line_height(
-    settings: &std::collections::BTreeMap<String, serde_yaml::Value>,
+    settings: &std::collections::HashMap<String, serde_yaml::Value>,
 ) -> Result<f64> {
     let default = settings
         .get("line-height")
@@ -502,14 +493,4 @@ fn is_disallowed_aozora_path(path: &str) -> bool {
                 rest.is_empty() || !(rest.starts_with('\\') || rest.starts_with('/'))
             })
             .unwrap_or(false)
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
-        })
 }

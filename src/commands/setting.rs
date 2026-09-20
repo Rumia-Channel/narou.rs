@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use narou_rs::compat::confirm;
 use narou_rs::converter::ini::{IniData, IniValue};
 use narou_rs::converter::settings::NovelSettings;
-use narou_rs::db::inventory::{Inventory, InventoryScope};
+use narou_rs::db::inventory::Inventory;
 use narou_rs::db::novel_dir_for_record;
+use narou_rs::db::settings as settings_store;
 use narou_rs::setting_core::{
     SettingScope as Scope, apply_device_related_settings, cast_setting_value, setting_scope,
     var_type_description, yaml_value_display,
@@ -49,9 +50,9 @@ fn cmd_setting_inner(
     }
 
     let mut local_settings: HashMap<String, serde_yaml::Value> =
-        inv.load("local_setting", InventoryScope::Local)?;
+        settings_store::load_with_inventory(&inv, Scope::Local)?;
     let mut global_settings: HashMap<String, serde_yaml::Value> =
-        inv.load("global_setting", InventoryScope::Global)?;
+        settings_store::load_with_inventory(&inv, Scope::Global)?;
 
     let mut error_count = 0u32;
 
@@ -127,8 +128,8 @@ fn cmd_setting_inner(
         }
     }
 
-    inv.save("local_setting", InventoryScope::Local, &local_settings)?;
-    inv.save("global_setting", InventoryScope::Global, &global_settings)?;
+    settings_store::save_with_inventory(&inv, Scope::Local, &local_settings)?;
+    settings_store::save_with_inventory(&inv, Scope::Global, &global_settings)?;
 
     if error_count > 0 {
         std::process::exit(error_count as i32);
@@ -156,11 +157,9 @@ fn cast_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> 
 }
 
 fn output_setting_list(inv: &Inventory) {
-    let local_settings: HashMap<String, serde_yaml::Value> = inv
-        .load("local_setting", InventoryScope::Local)
+    let local_settings: HashMap<String, serde_yaml::Value> = settings_store::load_with_inventory(inv, Scope::Local)
         .unwrap_or_default();
-    let global_settings: HashMap<String, serde_yaml::Value> = inv
-        .load("global_setting", InventoryScope::Global)
+    let global_settings: HashMap<String, serde_yaml::Value> = settings_store::load_with_inventory(inv, Scope::Global)
         .unwrap_or_default();
 
     println!("[Local Variables]");
@@ -383,8 +382,7 @@ fn modify_settings_when_device_changed(settings: &mut HashMap<String, serde_yaml
 }
 
 fn load_settings_by_pattern(inv: &Inventory, pattern: &str) -> HashMap<String, serde_yaml::Value> {
-    let local: HashMap<String, serde_yaml::Value> = inv
-        .load("local_setting", InventoryScope::Local)
+    let local: HashMap<String, serde_yaml::Value> = settings_store::load_with_inventory(inv, Scope::Local)
         .unwrap_or_default();
 
     let prefix = format!("{}.", pattern);
