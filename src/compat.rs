@@ -12,6 +12,7 @@ use crate::converter::settings::NovelSettings;
 use crate::converter::user_converter::UserConverter;
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::error::{NarouError, Result};
+use crate::setting_core::SettingScope;
 use unicode_normalization::UnicodeNormalization;
 
 const DIGEST_CHOICES: &[(&str, &str)] = &[
@@ -275,32 +276,11 @@ pub fn resolve_java_command_path() -> Option<PathBuf> {
 }
 
 pub fn load_global_setting_value(key: &str) -> Option<serde_yaml::Value> {
-    // P2: when the SQLite state backend is active, the payload of
-    // `global_setting.yaml` lives in app_state('global', 'global_setting').
-    #[cfg(feature = "native-runtime")]
-    if !crate::native::sqlite::state::legacy_yaml_active() {
-        let narou_dir = crate::db::inventory::Inventory::with_default_root()
-            .ok()
-            .map(|inventory| inventory.root_dir().join(".narou"));
-        if let Some(state) = narou_dir.as_deref().and_then(crate::native::sqlite::state::active_for) {
-            if let Ok(Some(raw)) = state.get_raw("global", "global_setting") {
-                if let Ok(settings) =
-                    serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(&raw)
-                {
-                    return settings.get(key).cloned();
-                }
-            }
-            return None;
-        }
-    }
-    let path = global_setting_path()?;
-    let raw = fs::read_to_string(path).ok()?;
-    let settings: HashMap<String, serde_yaml::Value> = serde_yaml::from_str(&raw).ok()?;
-    settings.get(key).cloned()
+    crate::db::settings::value(SettingScope::Global, key)
 }
 
 pub fn load_global_setting_string(key: &str) -> Option<String> {
-    load_global_setting_value(key).and_then(|v| yaml_value_to_string(&v))
+    crate::db::settings::string(SettingScope::Global, key)
 }
 
 pub fn load_global_setting_string_with_aliases(keys: &[&str]) -> Option<String> {
@@ -308,34 +288,7 @@ pub fn load_global_setting_string_with_aliases(keys: &[&str]) -> Option<String> 
 }
 
 pub fn load_local_setting_value(key: &str) -> Option<serde_yaml::Value> {
-    crate::db::with_database(|db| {
-        let settings: HashMap<String, serde_yaml::Value> = db
-            .inventory()
-            .load("local_setting", InventoryScope::Local)?;
-        Ok(settings.get(key).cloned())
-    })
-    .ok()
-    .flatten()
-}
-
-fn global_setting_path() -> Option<PathBuf> {
-    if let Ok(inv) = Inventory::with_default_root() {
-        let dir = inv.root_dir().join(".narousetting");
-        if dir.is_dir() {
-            return Some(dir.join("global_setting.yaml"));
-        }
-    }
-
-    let home = home_dir()?;
-    Some(home.join(".narousetting").join("global_setting.yaml"))
-}
-
-fn home_dir() -> Option<PathBuf> {
-    if cfg!(windows) {
-        std::env::var("USERPROFILE").ok().map(PathBuf::from)
-    } else {
-        std::env::var("HOME").ok().map(PathBuf::from)
-    }
+    crate::db::settings::value(SettingScope::Local, key)
 }
 
 pub fn load_local_setting_string(key: &str) -> Option<String> {
@@ -1015,7 +968,7 @@ mod tests {
     use super::{
         DigestChoice, NovelLockGuard, canonicalize_aozoraepub3_tool_path,
         canonicalize_existing_path, choose_digest_action_with_auto_choices,
-        configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
+        configure_process_group_command, configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
         load_locked_ids_from_inventory, mark_not_found_and_freeze, parse_digest_auto_choices,
         record_is_frozen, reroute_web_line_to_console, resolve_auto_convert_devices,
         sanitize_backup_name, terminate_process,

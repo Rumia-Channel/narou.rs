@@ -182,23 +182,7 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
 
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     let records = match (|| -> narou_rs::error::Result<Vec<NovelRecord>> {
-        let sort = match sort_key {
-            Some(key) => narou_rs::platform::NovelSort::by(
-                narou_rs::platform::NovelSortKey::from_db_key(key).unwrap_or(
-                    narou_rs::platform::NovelSortKey::Id,
-                ),
-            ),
-            None => narou_rs::platform::NovelSort::by(if options.latest {
-                narou_rs::platform::NovelSortKey::from_db_key(options.view_date_type())
-                    .unwrap_or(narou_rs::platform::NovelSortKey::Id)
-            } else {
-                narou_rs::platform::NovelSortKey::Id
-            }),
-        };
-        let mut sort = sort;
-        if options.reverse {
-            sort.reverse = true;
-        }
+        let sort = resolve_list_sort(&options, sort_key);
         // CLI list は全件表示: display 用 query ではなく全件を取得する
         // (既存挙動: フィルタは表示後に適用される)。
         let query = narou_rs::platform::NovelQuery::page(
@@ -468,6 +452,26 @@ fn split_words(value: Option<&str>) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+/// Ruby `Database#sort_by` defaults to descending date order. Only
+/// `--latest` flips the normal ascending direction; `--reverse` flips it back.
+fn resolve_list_sort(
+    options: &ListOptions,
+    sort_key: Option<&'static str>,
+) -> narou_rs::platform::NovelSort {
+    use narou_rs::platform::{NovelSort, NovelSortKey};
+
+    let key = match sort_key {
+        Some(key) => NovelSortKey::from_db_key(key).unwrap_or(NovelSortKey::Id),
+        None if options.latest => {
+            NovelSortKey::from_db_key(options.view_date_type()).unwrap_or(NovelSortKey::Id)
+        }
+        None => NovelSortKey::Id,
+    };
+    let mut sort = NovelSort::by(key);
+    sort.reverse = options.reverse ^ (sort_key.is_none() && options.latest);
+    sort
 }
 
 /// `narou list --sort-by` のキー文字列を検証し、内部表現に変換する。
@@ -1050,6 +1054,7 @@ fn remove_novel_by_id(id: i64, with_file: bool) -> Result<RemoveOutcome, String>
     let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
         .map_err(|e| e.to_string())?;
     let dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
+    remove_novel_objects(&record, with_file).map_err(|e| e.to_string())?;
     remove_novel_files(&dir, with_file).map_err(|e| e.to_string())?;
     novels
         .apply_batch_sync(vec![narou_rs::platform::NovelMutation::Remove(id.into())])
@@ -1115,6 +1120,33 @@ fn colorize_removed_message(title: &str) -> String {
     }
 }
 
+/// Delete the novel's stored objects from the active storage backend.
+///
+/// `--with-file` drops every object below the novel prefix, while a plain
+/// `remove` drops only `toc.yaml` so the next download re-reads the table of
+/// contents (the same split [`remove_novel_files`] applies to the saved files).
+/// SQLite storage keeps these objects in the database, so leaving them behind
+/// makes a later download believe the section files are still there and skip
+/// rewriting them, which then breaks the conversion.
+fn remove_novel_objects(
+    record: &narou_rs::db::novel_record::NovelRecord,
+    with_file: bool,
+) -> narou_rs::error::Result<()> {
+    use narou_rs::platform::ObjectStore;
+
+    let store = narou_rs::native::object_store::NativeStore::for_current_root()?;
+    let keys = narou_rs::platform::NovelObjectKeys::new(
+        &record.sitename,
+        &record.file_title,
+        record.use_subdirectory,
+    )?;
+    if with_file {
+        narou_rs::native::object_store::delete_prefix_sync(&store, keys.prefix())
+    } else {
+        futures::executor::block_on(store.delete(&keys.toc()))
+    }
+}
+
 fn remove_novel_files(dir: &Path, with_file: bool) -> Result<(), String> {
     if with_file {
         if dir.exists() {
@@ -1137,7 +1169,7 @@ mod tests {
 
     use super::{
         ListOptions, TagColors, TagOptions, build_tag_mode, matches_filters, matches_grep,
-        remove_novel_files, resolve_list_sort_key,
+        remove_novel_by_id, remove_novel_files, resolve_list_sort, resolve_list_sort_key,
     };
     use narou_rs::db::novel_record::NovelRecord;
     use narou_rs::tag_colors;
@@ -1290,5 +1322,103 @@ mod tests {
     fn list_options_default_has_sort_by_unset() {
         let opts = ListOptions::default();
         assert!(opts.sort_by.is_none());
+    }
+
+    #[test]
+    fn list_latest_sorts_newest_first_and_reverse_flips_direction() {
+        use narou_rs::platform::NovelSortKey;
+
+        for gl in [false, true] {
+            let opts = ListOptions {
+                latest: true,
+                general_lastup: gl,
+                ..Default::default()
+            };
+            let sort = resolve_list_sort(&opts, None);
+            assert_eq!(
+                sort.key,
+                if gl { NovelSortKey::GeneralLastup } else { NovelSortKey::LastUpdate }
+            );
+            assert!(sort.reverse, "--latest must be newest first");
+
+            let reversed = resolve_list_sort(
+                &ListOptions { reverse: true, ..opts.clone() },
+                None,
+            );
+            assert!(!reversed.reverse, "--latest --reverse must be oldest first");
+        }
+
+        assert!(!resolve_list_sort(&ListOptions::default(), None).reverse);
+        assert!(resolve_list_sort(&ListOptions { reverse: true, ..Default::default() }, None).reverse);
+    }
+
+    #[test]
+    fn list_explicit_sort_by_does_not_inherit_latest_direction() {
+        let opts = ListOptions { latest: true, ..Default::default() };
+        assert!(!resolve_list_sort(&opts, Some("title")).reverse);
+        let reversed = ListOptions { reverse: true, ..opts };
+        assert!(resolve_list_sort(&reversed, Some("title")).reverse);
+    }
+
+    /// Regression: SQLite storage keeps novel objects in the database, so
+    /// `remove --with-file` has to drop them as well. Otherwise the next
+    /// download sees the sections as already stored, skips rewriting the files
+    /// on disk and the conversion fails with "section file not found".
+    #[test]
+    fn remove_with_file_drops_stored_objects_in_sqlite_mode() {
+        use narou_rs::platform::{NovelObjectKeys, ObjectStore};
+
+        let temp = TempDir::new().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        std::fs::write(temp.path().join(".narou").join("storage-backend"), "sqlite").unwrap();
+        narou_rs::db::init_database().unwrap();
+
+        let record = sample_record(1, 1, &[]);
+        narou_rs::db::with_database_mut(|db| {
+            db.insert(record.clone());
+            Ok(())
+        })
+        .unwrap();
+
+        let store = narou_rs::native::object_store::NativeStore::for_current_root().unwrap();
+        let keys =
+            NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
+                .unwrap();
+        futures::executor::block_on(async {
+            store
+                .write_small(&keys.toc(), b"toc".to_vec())
+                .await
+                .unwrap();
+            store
+                .write_small(&keys.section("1", "第一話"), b"body".to_vec())
+                .await
+                .unwrap();
+        });
+
+        remove_novel_by_id(record.id, true).unwrap();
+
+        assert!(
+            futures::executor::block_on(store.read_small(&keys.toc()))
+                .unwrap()
+                .is_none(),
+            "toc object must not survive remove --with-file"
+        );
+        assert!(
+            futures::executor::block_on(store.read_small(&keys.section("1", "第一話")))
+                .unwrap()
+                .is_none(),
+            "section object must not survive remove --with-file"
+        );
+        assert!(!temp
+            .path()
+            .join("小説データ")
+            .join("site")
+            .join("file_title")
+            .join("本文")
+            .join("1 第一話.yaml")
+            .exists());
+
+        *narou_rs::db::DATABASE.lock() = None;
     }
 }

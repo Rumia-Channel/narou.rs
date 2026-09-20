@@ -6,6 +6,8 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use narou_rs::db::inventory::{Inventory, InventoryScope};
+use narou_rs::db::settings as settings_store;
+use narou_rs::setting_core::SettingScope;
 use serde_yaml::{Number, Value};
 use tracing::info;
 
@@ -273,8 +275,7 @@ fn fill_general_all_no_in_database() -> Result<(), String> {
 
 fn resolve_web_address(user_port: Option<u16>) -> Result<WebAddress, String> {
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let mut global_setting: HashMap<String, Value> = inventory
-        .load("global_setting", InventoryScope::Global)
+    let mut global_setting: HashMap<String, Value> = settings_store::load_with_inventory(&inventory, SettingScope::Global)
         .unwrap_or_default();
     let host = normalize_bind_host(yaml_string(global_setting.get("server-bind")));
     let port = if let Some(port) = user_port {
@@ -284,8 +285,7 @@ fn resolve_web_address(user_port: Option<u16>) -> Result<WebAddress, String> {
     } else {
         let port = find_available_web_port(&host)?;
         global_setting.insert("server-port".to_string(), Value::Number(Number::from(port)));
-        inventory
-            .save("global_setting", InventoryScope::Global, &global_setting)
+        settings_store::save_with_inventory(&inventory, SettingScope::Global, &global_setting)
             .map_err(|e| e.to_string())?;
         port
     };
@@ -513,8 +513,7 @@ struct WebSecuritySettings {
 
 fn load_web_security_settings() -> Result<WebSecuritySettings, String> {
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let global_setting: HashMap<String, Value> = inventory
-        .load("global_setting", InventoryScope::Global)
+    let global_setting: HashMap<String, Value> = settings_store::load_with_inventory(&inventory, SettingScope::Global)
         .unwrap_or_default();
     Ok(WebSecuritySettings {
         basic_auth_header: basic_auth_header_from_settings(&global_setting),
@@ -568,8 +567,7 @@ fn load_ws_accepted_domains(host: &str, reverse_proxy_mode: bool) -> Result<Vec<
         return Ok(Vec::new());
     }
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let global_setting: HashMap<String, Value> = inventory
-        .load("global_setting", InventoryScope::Global)
+    let global_setting: HashMap<String, Value> = settings_store::load_with_inventory(&inventory, SettingScope::Global)
         .unwrap_or_default();
     let mut accepted_domains = default_ws_accepted_domains(host);
     if let Some(extra) = yaml_string(global_setting.get("server-ws-add-accepted-domains")) {
@@ -622,8 +620,7 @@ fn load_http_allowed_request_hosts(
     }
     let mut allowed = narou_rs::web::default_allowed_request_hosts(host);
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let global_setting: HashMap<String, Value> = inventory
-        .load("global_setting", InventoryScope::Global)
+    let global_setting: HashMap<String, Value> = settings_store::load_with_inventory(&inventory, SettingScope::Global)
         .unwrap_or_default();
     if let Some(extra) = yaml_string(global_setting.get("server-add-accepted-hosts")) {
         allowed.extend(parse_extra_allowed_hosts(&extra));

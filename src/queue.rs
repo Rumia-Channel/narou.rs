@@ -1890,6 +1890,7 @@ mod tests {
     #[test]
     fn queue_yaml_backward_compatible_when_available_at_missing() {
         let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         let queue_path = temp.path().join("queue.yaml");
 
         // Hand-written YAML mimicking a queue produced before the retry field

@@ -19,6 +19,10 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
+      - name: Regression - SQLite converter settings (issue 22)
+        run: cargo test -p narou_rs --lib converter_reads_sqlite_backed_default_and_force_settings
+      - name: Regression - latest list ordering (issue 21)
+        run: cargo test -p narou_rs --bin narou_rs list_latest_sorts_newest_first
       - run: cargo test --workspace --all-targets
       - run: cargo clippy --workspace --all-targets --all-features
       # Verify the non-GPL binaries actually link (check/test do not).

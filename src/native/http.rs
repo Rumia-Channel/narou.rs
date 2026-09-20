@@ -477,14 +477,16 @@ impl NativeHttpClient {
                 })
             }
             _ => {
-                cmd.arg("--quiet")
+                // `--no-verbose` (not `--quiet`) keeps error messages on stderr
+                // so a failed fetch can be reported with its status, matching
+                // the curl tier's `-sS`.
+                cmd.arg("--no-verbose")
                     .arg("--output-document=-")
                     .arg("--tries=1")
                     .arg(format!("--connect-timeout={CONNECT_TIMEOUT_SECS}"))
                     .arg(format!("--read-timeout={READ_TIMEOUT_SECS}"))
                     .arg(format!("--timeout={TOTAL_TIMEOUT_SECS}"))
                     .arg("--max-redirect=0")
-                    .arg(format!("--max-filesize={MAX_RESPONSE_BYTES}"))
                     .arg(format!("--user-agent={user_agent}"))
                     .arg("--header=Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
                     .arg("--header=Accept-Language: ja,en-US;q=0.9,en;q=0.8")

@@ -1,6 +1,6 @@
 [package]
 name = "narou_worker"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 publish = false
 # The Worker always enables `narou_rs/worker-runtime`, which implies `lite` and

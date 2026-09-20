@@ -1,0 +1,6 @@
+# cargo-about embeds upstream license text byte-for-byte, and some crates ship
+# their LICENSE with CRLF line endings. Treating the generated notices as text
+# keeps them LF in the repository, so the "committed notices are current" CI
+# check behaves the same on Windows and Linux.
+Third-Party-License.md text
+Third-Party-License-non-GPL.md text

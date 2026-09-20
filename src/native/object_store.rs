@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,7 +15,7 @@ use futures::StreamExt;
 use crate::error::{NarouError, Result};
 use crate::platform::{
     AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
-    ObjectStore, PlatformFuture,
+    ObjectPrefix, ObjectStore, PlatformFuture,
 };
 
 pub(crate) const MAX_SMALL_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
@@ -580,6 +581,37 @@ impl NativeStore {
             .unwrap_or_else(|| PathBuf::from("."));
         Self::for_narou_root(&narou_root)
     }
+
+    /// Rebuild a deleted mirror file from the stored object.
+    ///
+    /// Returns `false` when the backend has no second copy (filesystem mode) or
+    /// does not know the key.
+    pub fn restore_mirror_file(&self, path: &Path) -> Result<bool> {
+        match self {
+            NativeStore::Fs(_) => Ok(false),
+            NativeStore::Sqlite(store) => store.restore_mirror_file(path),
+        }
+    }
+}
+
+/// Ensure a mirror file exists, rebuilding it from storage when the backend
+/// still holds the object. Returns `true` when the file is readable afterwards.
+///
+/// Files deleted outside narou leave SQLite mode with a stored object but no
+/// file for the converter and narou.rb to read; read paths call this before
+/// reporting a missing file. The library root comes from the working directory
+/// rather than the database, so this also works before any command initialized
+/// the database.
+pub fn ensure_mirror_file(path: &Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+    let Ok(inventory) = crate::db::inventory::Inventory::with_default_root() else {
+        return false;
+    };
+    NativeStore::for_narou_root(inventory.root_dir())
+        .and_then(|store| store.restore_mirror_file(path))
+        .unwrap_or(false)
 }
 
 impl ObjectStore for NativeStore {
@@ -687,6 +719,35 @@ impl AssetStore for NativeStore {
         match self {
             NativeStore::Fs(store) => store.move_or_copy(source, destination),
             NativeStore::Sqlite(store) => store.move_or_copy(source, destination),
+        }
+    }
+}
+
+/// Delete every object stored below `prefix` using the active storage backend.
+///
+/// `remove --with-file` has to drop the stored objects together with their
+/// filesystem mirror: in SQLite mode the `objects` table survives the deleted
+/// folder, and a later download then treats the sections as already present
+/// and never rewrites the files the converter reads.
+pub fn delete_prefix_sync(store: &dyn ObjectStore, prefix: &ObjectKey) -> Result<()> {
+    let prefix = ObjectPrefix::from(prefix.clone());
+    let mut cursor: Option<String> = None;
+    loop {
+        let request = ObjectListRequest::new(
+            prefix.clone(),
+            NonZeroUsize::new(100).expect("page size is non-zero"),
+        );
+        let request = match &cursor {
+            Some(cursor) => request.after(cursor.clone()),
+            None => request,
+        };
+        let page = futures::executor::block_on(store.list_page(&request))?;
+        for object in &page.objects {
+            futures::executor::block_on(store.delete(&object.key))?;
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(()),
         }
     }
 }
