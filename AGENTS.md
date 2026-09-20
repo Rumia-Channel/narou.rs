@@ -73,7 +73,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - サイト固有の値は `webnovel/*.yaml` に置く。追加キーは `login_url`（ログイン用 bin が開く URL、`\k<domain>` 補間あり）と `login_pattern`（HTTP 200 で返るログイン壁を検出する正規表現）。本体にサイト名・ドメイン固有の分岐は置かない。
 - Cookie は `Inventory` の `login_cookie`（SQLite `app_state` / `.narou/login_cookie.yaml`）にホスト単位で保存する。応答の `Set-Cookie` は、既に保存済みのホストに限り `src/native/http.rs` が書き戻してセッションを維持する（保存していないホストには新規エントリを作らない）。
 - ログイン実行は別 bin `narou_rs_login`（`src/bin/login.rs`）が担当する。Chromium 系ブラウザを `--remote-debugging-port` 付きで起動し、DevTools protocol (`Storage.getCookies`) で Cookie を取得する（`ws://` のみなのでブラウザ自動化依存を追加しない）。2 段階認証や CAPTCHA は実ブラウザ操作なのでそのまま通る。ブラウザが無い環境向けに `--cookie "<Cookie 文字列>"` の貼り付け保存、`--list` / `--clear` も用意する。
-- 未対応: リリース zip への `narou_rs_login` 同梱（`.github/workflows/release.yml` / `src/bin/cargo-local-build.rs` は現状 `narou_rs` / `narou_rs_updater` / `narou_rs_backup` のみを梱包する）。develop へ統合する前に同梱処理を追加すること。
+- 配布物: `narou_rs_login` もリリース zip に同梱する（`scripts/package-release.ps1` の `-LoginBinaryPath`、`.github/workflows/release.yml` の helper build / sign / package、`cargo local-build` のすべてに対応済み）。Windows では他のサブ実行ファイルと同じく署名対象に含める。
 
 ## Git 運用ルール
 - 通常の修正・軽微な機能追加・ドキュメント更新は `develop` 上で行う。作業開始前に現在ブランチと作業ツリーを確認し、`main` 上で直接作業しない。

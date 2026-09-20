@@ -97,6 +97,19 @@ jobs:
           path: target/${{ matrix.target }}/release/narou_rs_backup.exe
           if-no-files-found: error
 
+      - name: Build login binary
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_login
+
+      - name: Upload unsigned login binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-login-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/narou_rs_login.exe
+          if-no-files-found: error
+
   sign-helpers:
     name: Sign Windows helper binaries
     needs: build-helpers
@@ -121,6 +134,8 @@ jobs:
             unsigned\unsigned-updater-aarch64-pc-windows-msvc\narou_rs_updater.exe
             unsigned\unsigned-backup-x86_64-pc-windows-msvc\narou_rs_backup.exe
             unsigned\unsigned-backup-aarch64-pc-windows-msvc\narou_rs_backup.exe
+            unsigned\unsigned-login-x86_64-pc-windows-msvc\narou_rs_login.exe
+            unsigned\unsigned-login-aarch64-pc-windows-msvc\narou_rs_login.exe
 
       - name: Upload signed updater (x64)
         uses: actions/upload-artifact@v4
@@ -148,6 +163,20 @@ jobs:
         with:
           name: signed-backup-aarch64-pc-windows-msvc
           path: unsigned/unsigned-backup-aarch64-pc-windows-msvc/narou_rs_backup.exe
+          if-no-files-found: error
+
+      - name: Upload signed login binary (x64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-login-x86_64-pc-windows-msvc
+          path: unsigned/unsigned-login-x86_64-pc-windows-msvc/narou_rs_login.exe
+          if-no-files-found: error
+
+      - name: Upload signed login binary (ARM64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-login-aarch64-pc-windows-msvc
+          path: unsigned/unsigned-login-aarch64-pc-windows-msvc/narou_rs_login.exe
           if-no-files-found: error
 
   build:
@@ -334,6 +363,19 @@ jobs:
             cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_backup
           }
 
+      - name: Build login binary
+        if: matrix.platform != 'win'
+        shell: pwsh
+        env:
+          NAROU_RS_RELEASE_BUILD: "1"
+        run: |
+          if ("${{ matrix.builder }}" -eq "cross") {
+            $env:PKG_CONFIG_ALLOW_CROSS = "1"
+            cross build --locked --release --target "${{ matrix.target }}" --bin narou_rs_login
+          } else {
+            cargo build --locked --release --target "${{ matrix.target }}" --bin narou_rs_login
+          }
+
       - name: Build updater binary
         if: matrix.platform != 'win'
         shell: pwsh
@@ -407,9 +449,11 @@ jobs:
           if ($binary.EndsWith(".exe")) {
             $updaterBinary = "narou_rs_updater.exe"
             $backupBinary = "narou_rs_backup.exe"
+            $loginBinary = "narou_rs_login.exe"
           } else {
             $updaterBinary = "narou_rs_updater"
             $backupBinary = "narou_rs_backup"
+            $loginBinary = "narou_rs_login"
           }
           $commitVersion = "${{ github.ref_name }}"
           if ("${{ github.ref_type }}" -ne "tag") {
@@ -419,6 +463,7 @@ jobs:
             -BinaryPath "target/${{ matrix.target }}/release/${{ matrix.binary }}" `
             -UpdaterBinaryPath "target/${{ matrix.target }}/release/$updaterBinary" `
             -BackupBinaryPath "target/${{ matrix.target }}/release/$backupBinary" `
+            -LoginBinaryPath "target/${{ matrix.target }}/release/$loginBinary" `
             -Platform "${{ matrix.platform }}" `
             -Arch "${{ matrix.arch }}" `
             -PackageRoot "narou" `
@@ -465,6 +510,12 @@ jobs:
           pattern: signed-backup-*
           path: signed-backup
 
+      - name: Download signed login binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: signed-login-*
+          path: signed-login
+
       - name: Sign Windows binaries (Certum SimplySign)
         uses: Rumia-Channel/windows-certum-signin@main
         with:
@@ -499,6 +550,10 @@ jobs:
             if (-not (Test-Path -Path $backup -PathType Leaf)) {
               throw "Signed backup binary not found: $backup"
             }
+            $login = "signed-login\signed-login-$($t.Target)\narou_rs_login.exe"
+            if (-not (Test-Path -Path $login -PathType Leaf)) {
+              throw "Signed login binary not found: $login"
+            }
             foreach ($v in $variants) {
               $suffix = if ($v -eq "") { "" } else { "-$v" }
               $binary = "unsigned\unsigned-main-$($t.Target)$suffix\narou_rs.exe"
@@ -509,6 +564,7 @@ jobs:
                 -BinaryPath $binary `
                 -UpdaterBinaryPath $updater `
                 -BackupBinaryPath $backup `
+                -LoginBinaryPath $login `
                 -Platform "win" `
                 -Arch $t.Arch `
                 -PackageRoot "narou" `
