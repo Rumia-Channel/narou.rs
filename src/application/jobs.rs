@@ -428,6 +428,9 @@ pub fn classify_failure(error: &NarouError) -> JobFailureClass {
         | NarouError::SiteSetting(_)
         | NarouError::Yaml(_)
         | NarouError::Regex(_) => JobFailureClass::Blocked,
+        // A credential that cannot be decrypted (wrong key, missing
+        // passphrase) needs the operator to import it again.
+        NarouError::Login(_) => JobFailureClass::Blocked,
         // Interactive decisions (age verification, digest choice) have no
         // terminal on the Worker; the downloader reports them explicitly.
         NarouError::Unsupported(_) => JobFailureClass::Blocked,
