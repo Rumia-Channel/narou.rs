@@ -1015,7 +1015,7 @@ mod tests {
     use super::{
         DigestChoice, NovelLockGuard, canonicalize_aozoraepub3_tool_path,
         canonicalize_existing_path, choose_digest_action_with_auto_choices,
-        configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
+        configure_process_group_command, configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
         load_locked_ids_from_inventory, mark_not_found_and_freeze, parse_digest_auto_choices,
         record_is_frozen, reroute_web_line_to_console, resolve_auto_convert_devices,
         sanitize_backup_name, terminate_process,
