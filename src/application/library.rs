@@ -429,7 +429,10 @@ fn parse_search_token(raw_term: &str) -> SearchToken {
     let term = raw_term.trim();
     let negated = matches!(term.chars().next(), Some('-' | '^' | '!'));
     let body = if negated { &term[1..] } else { term };
-    let (field, value) = if let Some(colon) = body.find(':') {
+    // A pasted URL is a plain search value, not a "https:" field token.
+    let (field, value) = if body.starts_with("https://") || body.starts_with("http://") {
+        (None, body)
+    } else if let Some(colon) = body.find(':') {
         let field = body[..colon].trim();
         if field.is_empty() {
             (None, body)
@@ -654,6 +657,49 @@ mod tests {
         assert!(!plain.negated);
         assert_eq!(plain.field, None);
         assert_eq!(plain.values, vec!["完結".to_string()]);
+    }
+
+    #[test]
+    fn search_token_parsing_preserves_pasted_urls() {
+        let tokens = collect_search_tokens(Some(
+            "https://ncode.syosetu.com/n1980en/ 16818093084718034215",
+        ));
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].field, None);
+        assert_eq!(
+            tokens[0].values,
+            vec!["https://ncode.syosetu.com/n1980en/"]
+        );
+        assert_eq!(tokens[1].field, None);
+        assert_eq!(tokens[1].values, vec!["16818093084718034215"]);
+    }
+
+    #[test]
+    fn list_finds_novels_by_url_ncode_and_numeric_id() {
+        let mut record = sample_record(42);
+        record.toc_url = "https://ncode.syosetu.com/n1980en/".into();
+        record.ncode = Some("n1980en".into());
+        let mut kakuyomu = sample_record(43);
+        kakuyomu.toc_url =
+            "https://kakuyomu.jp/works/16818093084718034215".into();
+        let service = service(
+            Arc::new(MemoryNovelRepository::from_records(vec![record, kakuyomu])),
+            Arc::new(FakeClock::default()),
+        );
+        for query in ["https://ncode.syosetu.com/n1980en/", "n1980en", "42"] {
+            let page =
+                futures::executor::block_on(service.list(&request(Some(query), 0, None))).unwrap();
+            assert_eq!(page.records_filtered, 1, "query={query}");
+            assert_eq!(page.data[0].id, 42, "query={query}");
+        }
+        let page = futures::executor::block_on(service.list(&request(
+            Some("16818093084718034215"),
+            0,
+            None,
+        )))
+        .unwrap();
+        assert_eq!(page.records_filtered, 1);
+        assert_eq!(page.data[0].id, 43);
     }
 
     #[test]

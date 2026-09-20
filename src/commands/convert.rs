@@ -915,6 +915,12 @@ mod tests {
 
     #[test]
     fn split_output_name_ignores_directory_part() {
+        // `/` separates path components on every platform, `\` only on Windows.
+        assert_eq!(
+            split_output_name("/tmp/custom-name.epub"),
+            ("custom-name".to_string(), ".epub".to_string())
+        );
+        #[cfg(windows)]
         assert_eq!(
             split_output_name(r"C:\tmp\custom-name.epub"),
             ("custom-name".to_string(), ".epub".to_string())

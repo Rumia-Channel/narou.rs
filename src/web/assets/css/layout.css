@@ -195,6 +195,12 @@
   max-height: 80vh;
 }
 
+/* Stretch both console panes together, including an empty stdout2 pane. */
+.console-panes.expanded .console {
+  min-height: 80vh;
+  max-height: 80vh;
+}
+
 .console-line {
   min-height: 1.20em;
 }

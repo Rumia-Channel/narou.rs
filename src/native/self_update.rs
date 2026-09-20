@@ -197,38 +197,17 @@ async fn start_native_update(
             }
         });
     let restart_args = build_restart_args(&exe_name, crate::compat::inherited_hide_console_requested());
-
-    let mut command = std::process::Command::new(&updater_path);
-    command
-        .arg("--pid")
-        .arg(pid.to_string())
-        .arg("--zip")
-        .arg(&zip_path)
-        .arg("--install-dir")
-        .arg(&install_dir)
-        .arg("--log")
-        .arg(install_dir.join("update.log"))
-        .arg("--restart")
-        .args(&restart_args)
-        .current_dir(&install_dir)
-        // updater は restart 時に install_dir を cwd にするため、本体が
-        // 起動すべきライブラリ dir を環境変数で引き渡す。旧 updater でも
-        // env は透過するので新本体側の chdir だけで復帰できる。
-        .env(
-            "NAROU_RS_RESTART_CWD",
-            std::env::current_dir().unwrap_or_else(|_| install_dir.clone()),
-        )
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    crate::compat::configure_hidden_console_command(&mut command);
-    crate::compat::configure_process_group_command(&mut command);
+    #[cfg(target_os = "linux")]
+    let systemd_service = current_systemd_service();
+    #[cfg(not(target_os = "linux"))]
+    let systemd_service: Option<()> = None;
 
     append_update_session_marker(
         &install_dir.join("update.log"),
         &format!(
-            "session: parent pid={} spawning updater (Unix detach via setsid; SIGHUP relayed only if signal is explicitly sent to updater pid)",
-            pid
+            "session: parent pid={} handoff={} (setsid alone cannot escape a systemd service cgroup)",
+            pid,
+            if systemd_service.is_some() { "systemd-run" } else { "detached updater" }
         ),
     );
 
@@ -242,12 +221,160 @@ async fn start_native_update(
     )
     .await;
 
-    command
-        .spawn()
-        .map_err(|error| platform_error(format!("updater spawn 失敗: {error}")))?;
+    #[cfg(target_os = "linux")]
+    if let Some(service) = systemd_service {
+        // systemd's default KillMode=control-group kills ordinary descendants
+        // when the Web process exits, even if the updater called setsid().
+        // A transient *separate service* survives that shutdown. Run the
+        // already installed updater without --restart (supported by old
+        // releases), then ask systemd to restart the original service. This
+        // also replaces any old process started by Restart=always.
+        let command = systemd_update_command(
+            &service,
+            &updater_path,
+            &zip_path,
+            &install_dir,
+            pid,
+        );
+        let output = tokio::process::Command::from(command)
+            .output()
+            .await
+            .map_err(|error| platform_error(format!(
+                "systemd-run 起動失敗: {error}。サービスの更新権限を確認してください"
+            )))?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            let _ = tokio::fs::remove_file(&zip_path).await;
+            return Err(platform_error(format!(
+                "systemd-run によるアップデートの引き渡し失敗: {}。systemd の権限と journalctl を確認してください",
+                detail.trim()
+            )));
+        }
+    } else {
+        spawn_detached_updater(&updater_path, &zip_path, &install_dir, pid, &restart_args)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    spawn_detached_updater(&updater_path, &zip_path, &install_dir, pid, &restart_args)?;
+
     emit(&events, "reboot", Value::String(String::new())).await;
 
     Ok(SelfUpdateResult { asset_name })
+}
+
+fn spawn_detached_updater(
+    updater_path: &Path,
+    zip_path: &Path,
+    install_dir: &Path,
+    pid: u32,
+    restart_args: &[String],
+) -> Result<()> {
+    let mut command = std::process::Command::new(updater_path);
+    command
+        .arg("--pid")
+        .arg(pid.to_string())
+        .arg("--zip")
+        .arg(zip_path)
+        .arg("--install-dir")
+        .arg(install_dir)
+        .arg("--log")
+        .arg(install_dir.join("update.log"))
+        .arg("--restart")
+        .args(restart_args)
+        .current_dir(install_dir)
+        // Old updaters also pass this environment variable to the new binary.
+        .env(
+            "NAROU_RS_RESTART_CWD",
+            std::env::current_dir().unwrap_or_else(|_| install_dir.to_path_buf()),
+        )
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    crate::compat::configure_hidden_console_command(&mut command);
+    crate::compat::configure_process_group_command(&mut command);
+    command
+        .spawn()
+        .map_err(|error| platform_error(format!("updater spawn 失敗: {error}")))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+struct SystemdService {
+    unit: String,
+    user: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_service_from_cgroup(contents: &str) -> Option<SystemdService> {
+    // cgroup v2: 0::/system.slice/narou.service
+    // cgroup v1: 1:name=systemd:/system.slice/narou.service
+    // User units also contain user@UID.service: choose the innermost unit.
+    for line in contents.lines() {
+        let path = line.splitn(3, ':').nth(2)?;
+        let components: Vec<&str> = path.split('/').collect();
+        let Some(unit) = components
+            .iter()
+            .rev()
+            .find(|part| part.ends_with(".service") && !part.starts_with("user@"))
+        else {
+            continue;
+        };
+        return Some(SystemdService {
+            unit: (*unit).to_string(),
+            user: components
+                .iter()
+                .any(|part| part.starts_with("user@") && part.ends_with(".service")),
+        });
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn current_systemd_service() -> Option<SystemdService> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    systemd_service_from_cgroup(&cgroup)
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_update_command(
+    service: &SystemdService,
+    updater_path: &Path,
+    zip_path: &Path,
+    install_dir: &Path,
+    pid: u32,
+) -> std::process::Command {
+    let mut command = std::process::Command::new("systemd-run");
+    if service.user {
+        command.arg("--user");
+    }
+    // Use /bin/sh solely to sequence two argv-safe commands, avoiding a new
+    // flag unsupported by the updater shipped with existing release ZIPs.
+    // $0 is the unit, $1 is the updater binary, and "$@" forwards its args.
+    command
+        .arg("--unit")
+        .arg(format!("narou-rs-update-{pid}"))
+        .arg("--collect")
+        .arg("--property=Type=exec")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(if service.user {
+            r#""$@" && systemctl --user restart "$0""#
+        } else {
+            r#""$@" && systemctl restart "$0""#
+        })
+        .arg(&service.unit)
+        .arg(updater_path)
+        .arg("--pid")
+        .arg(pid.to_string())
+        .arg("--zip")
+        .arg(zip_path)
+        .arg("--install-dir")
+        .arg(install_dir)
+        .arg("--log")
+        .arg(install_dir.join("update.log"))
+        .current_dir(install_dir);
+    command
 }
 
 async fn emit(events: &Arc<dyn EventSink>, name: &str, data: Value) {
@@ -450,6 +577,57 @@ pub fn current_asset_name() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_cgroup_identifies_innermost_service_and_manager() {
+        assert_eq!(
+            systemd_service_from_cgroup("0::/system.slice/narou.service\n"),
+            Some(SystemdService {
+                unit: "narou.service".to_string(),
+                user: false,
+            })
+        );
+        assert_eq!(
+            systemd_service_from_cgroup(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/narou.service\n"
+            ),
+            Some(SystemdService {
+                unit: "narou.service".to_string(),
+                user: true,
+            })
+        );
+        assert_eq!(
+            systemd_service_from_cgroup("0::/user.slice/user-1000.slice/session-1.scope\n"),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_handoff_uses_transient_unit_and_legacy_updater_arguments() {
+        let service = SystemdService {
+            unit: "narou.service".to_string(),
+            user: false,
+        };
+        let command = systemd_update_command(
+            &service,
+            Path::new("/opt/narou/narou_rs_updater"),
+            Path::new("/opt/narou/update.zip"),
+            Path::new("/opt/narou"),
+            1234,
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"--unit".to_string()));
+        assert!(args.contains(&"narou-rs-update-1234".to_string()));
+        assert!(args.contains(&"--property=Type=exec".to_string()));
+        assert!(args.contains(&r#""$@" && systemctl restart "$0""#.to_string()));
+        assert!(!args.contains(&"--restart".to_string()));
+        assert_eq!(args.last().unwrap(), "/opt/narou/update.log");
+    }
 
     #[test]
     fn asset_name_for_appends_gpl_suffix() {

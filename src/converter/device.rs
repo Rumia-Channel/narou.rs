@@ -1449,6 +1449,7 @@ mod tests {
         assert!(!Device::Kobo.matches_ebook_file(Path::new("novel.epub")));
     }
 
+    #[cfg(windows)]
     #[test]
     fn normalize_windows_verbatim_path_strips_prefix() {
         assert_eq!(
