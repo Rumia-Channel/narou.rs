@@ -4,6 +4,7 @@ pub mod frontend;
 pub mod global_settings;
 pub mod jobs;
 pub mod library_backup;
+pub mod login;
 pub mod misc;
 pub mod novel_settings;
 pub mod novels;
@@ -583,6 +584,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/tag_list", get(misc::tag_list))
         .route("/api/tag/change_color", post(misc::tag_change_color))
         .route("/api/novels/all_ids", get(misc::all_novel_ids))
+        .route("/api/login", get(login::login_status))
+        .route("/api/login", delete(login::login_clear_all))
+        .route("/api/login/import", post(login::login_import))
+        .route("/api/login/set", post(login::login_set))
+        .route("/api/login/{host}", delete(login::login_clear_host))
         .route("/api/notepad/read", get(misc::notepad_read))
         .route("/api/notepad/save", post(misc::notepad_save))
         .route("/api/novels/{id}", get(novels::get_novel))
