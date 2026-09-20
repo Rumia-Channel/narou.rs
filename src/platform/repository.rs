@@ -354,7 +354,10 @@ pub(crate) fn record_matches_term(
                 || status.contains(value)
                 || tags.iter().any(|tag| tag.contains(value))
                 || record.ncode.as_ref().is_some_and(|ncode| ncode.to_lowercase().contains(value))
-                || record.toc_url.to_lowercase().contains(value.trim_end_matches('/'))
+                || (value.contains("://")
+                    && record.toc_url.to_lowercase().contains(value.trim_end_matches('/')))
+                || record.toc_url.trim_end_matches('/').rsplit('/').next()
+                    .is_some_and(|segment| segment.eq_ignore_ascii_case(value))
                 || record.id.to_string() == value.as_str()
         }),
     };
