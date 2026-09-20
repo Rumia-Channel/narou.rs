@@ -19,7 +19,7 @@ use crate::error::Result;
 use crate::login::crypto::{decrypt_at_rest, encrypt_at_rest};
 use crate::native::login_key::LoginKey;
 use crate::native::object_store::run_blocking;
-use crate::platform::{CookieStore, PlatformFuture};
+use crate::platform::{CookieStore, PlatformFuture, normalize_cookie_host};
 
 pub const INVENTORY_NAME: &str = "login_cookie";
 
@@ -100,7 +100,7 @@ impl InventoryCookieStore {
     pub fn merge(&self, cookies: &BTreeMap<String, String>) -> Result<usize> {
         let mut map = self.load_plain()?;
         for (host, cookie) in cookies {
-            map.insert(normalize_host(host), cookie.trim().to_string());
+            map.insert(normalize_cookie_host(host), cookie.trim().to_string());
         }
         map.retain(|_, cookie| !cookie.is_empty());
         let written = map.len();
@@ -114,12 +114,32 @@ impl InventoryCookieStore {
     pub fn replace_all(&self, cookies: &BTreeMap<String, String>) -> Result<usize> {
         let mut map: BTreeMap<String, String> = BTreeMap::new();
         for (host, cookie) in cookies {
-            map.insert(normalize_host(host), cookie.trim().to_string());
+            map.insert(normalize_cookie_host(host), cookie.trim().to_string());
         }
         map.retain(|_, cookie| !cookie.is_empty());
         let written = map.len();
         self.save_plain(&map)?;
         Ok(written)
+    }
+
+    /// Every stored credential, decrypted.
+    pub fn load_all(&self) -> Result<BTreeMap<String, String>> {
+        self.load_plain()
+    }
+
+    /// Drop one host's credential. Returns whether anything was removed.
+    pub fn remove(&self, host: &str) -> Result<bool> {
+        let mut map = self.load_plain()?;
+        let removed = map.remove(&normalize_cookie_host(host)).is_some();
+        if removed {
+            self.save_plain(&map)?;
+        }
+        Ok(removed)
+    }
+
+    /// Where the library login key comes from (creating it when needed).
+    pub fn key_source(&self) -> Result<crate::native::login_key::KeySource> {
+        Ok(self.key()?.source())
     }
 
     /// Drop every stored credential.
@@ -131,19 +151,17 @@ impl InventoryCookieStore {
     pub fn is_encrypted(&self, host: &str) -> Result<bool> {
         Ok(self
             .load_map()?
-            .get(&normalize_host(host))
+            .get(&normalize_cookie_host(host))
             .is_some_and(|value| crate::login::crypto::is_encrypted_at_rest(value)))
     }
 }
 
-fn normalize_host(host: &str) -> String {
-    host.trim().to_ascii_lowercase()
-}
+
 
 impl CookieStore for InventoryCookieStore {
     fn load<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<Option<String>>> {
         let this = self.clone();
-        let host = normalize_host(host);
+        let host = normalize_cookie_host(host);
         run_blocking(move || {
             Ok(this
                 .load_plain()?
@@ -155,7 +173,7 @@ impl CookieStore for InventoryCookieStore {
 
     fn save<'a>(&'a self, host: &'a str, cookie: &'a str) -> PlatformFuture<'a, Result<()>> {
         let this = self.clone();
-        let host = normalize_host(host);
+        let host = normalize_cookie_host(host);
         let cookie = cookie.to_string();
         run_blocking(move || {
             let mut map = this.load_plain()?;
@@ -170,7 +188,7 @@ impl CookieStore for InventoryCookieStore {
 
     fn clear<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<()>> {
         let this = self.clone();
-        let host = normalize_host(host);
+        let host = normalize_cookie_host(host);
         run_blocking(move || {
             let mut map = this.load_plain()?;
             map.remove(&host);

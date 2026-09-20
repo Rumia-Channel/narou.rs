@@ -26,6 +26,14 @@ pub trait CookieStore: Send + Sync {
     fn list(&self) -> PlatformFuture<'_, Result<BTreeMap<String, String>>>;
 }
 
+/// Canonical form of a request host used as a credential key.
+///
+/// Hosts are matched case-insensitively and never carry surrounding space, so
+/// `Ncode.Syosetu.com ` and `ncode.syosetu.com` address the same entry.
+pub fn normalize_cookie_host(host: &str) -> String {
+    host.trim().to_ascii_lowercase()
+}
+
 /// Parse a `Cookie:` header value into `name=value` pairs, preserving order.
 ///
 /// Attributes (`Path`, `Domain`, …) are not part of a request header, so a
