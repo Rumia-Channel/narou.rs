@@ -401,3 +401,14 @@
 .login-envelope {
   min-height: 8rem;
 }
+
+.login-envelope-file {
+  font-size: 0.875rem;
+  color: var(--text-color, #333);
+  max-width: 32rem;
+}
+
+.login-file-name {
+  font-size: 0.8125rem;
+  color: var(--text-muted, #777);
+}

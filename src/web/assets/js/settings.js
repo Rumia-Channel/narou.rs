@@ -207,8 +207,9 @@
 
   // ─── Login tab ─────────────────────────────────────────
   // The browser half is the separate narou_rs_login executable; this pane is
-  // the receiving end: it uploads the export it writes (or pastes a cookie
-  // header) and stores the credentials encrypted at rest.
+  // the receiving end: it reads the export that writes (by picking the file or
+  // pasting its text, or pasting a cookie header) and stores the credentials
+  // encrypted at rest.
   function renderLoginTab() {
     return '<div class="panel-settings">' +
       '<div class="panel-heading">ログイン情報 (Cookie) の管理</div>' +
@@ -224,7 +225,11 @@
       '</div>' +
       '<div class="list-group-item">' +
       '<h4 class="list-group-item-heading">書き出しファイルを取り込む</h4>' +
-      '<div class="setting-help">narou_rs_login が書き出したファイル (YAML) を貼り付けて取り込みます。</div>' +
+      '<div class="setting-help">narou_rs_login が書き出したファイル (YAML) を選択するか、内容を貼り付けて取り込みます。</div>' +
+      '<div class="login-form">' +
+      '<input type="file" class="login-envelope-file" id="login-envelope-file" accept=".yaml,.yml,.txt,.json">' +
+      '<span class="login-file-name" id="login-file-name"></span>' +
+      '</div>' +
       '<textarea class="replace-textarea login-envelope" id="login-envelope" placeholder="version: 1&#10;encrypted: true&#10;…"></textarea>' +
       '<div class="login-form">' +
       '<input type="password" class="setting-input" id="login-passphrase" placeholder="パスフレーズ (暗号化されている場合)">' +
@@ -253,11 +258,35 @@
     const clearAll = pane.querySelector('#login-clear-all');
     const importBtn = pane.querySelector('#login-import');
     const setBtn = pane.querySelector('#login-set');
+    const envelopeFile = pane.querySelector('#login-envelope-file');
     if (refresh) refresh.addEventListener('click', loadLoginHosts);
     if (clearAll) clearAll.addEventListener('click', clearAllLogin);
     if (importBtn) importBtn.addEventListener('click', importLoginEnvelope);
     if (setBtn) setBtn.addEventListener('click', saveLoginCookie);
+    if (envelopeFile) envelopeFile.addEventListener('change', readLoginEnvelopeFile);
     loadLoginHosts();
+  }
+
+  function readLoginEnvelopeFile() {
+    const input = document.getElementById('login-envelope-file');
+    const envelope = document.getElementById('login-envelope');
+    const name = document.getElementById('login-file-name');
+    if (!input || !envelope) return;
+    const file = input.files && input.files[0];
+    if (!file) {
+      if (name) name.textContent = '';
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = function() {
+      envelope.value = String(reader.result || '');
+      if (name) name.textContent = file.name + ' を読み込みました';
+    };
+    reader.onerror = function() {
+      if (name) name.textContent = '';
+      showToast('ファイルを読み込めませんでした: ' + file.name, 'error');
+    };
+    reader.readAsText(file);
   }
 
   async function loadLoginHosts() {
@@ -297,7 +326,7 @@
     const passphrase = document.getElementById('login-passphrase');
     const replace = document.getElementById('login-replace');
     if (!envelope || !envelope.value.trim()) {
-      showToast('書き出しファイルの内容を貼り付けてください', 'error');
+      showToast('書き出しファイルを選択するか、内容を貼り付けてください', 'error');
       return;
     }
     try {
@@ -315,6 +344,10 @@
       showToast(result.message || '取り込みました', 'success');
       envelope.value = '';
       if (passphrase) passphrase.value = '';
+      const fileInput = document.getElementById('login-envelope-file');
+      const fileName = document.getElementById('login-file-name');
+      if (fileInput) fileInput.value = '';
+      if (fileName) fileName.textContent = '';
       loadLoginHosts();
     } catch (e) {
       showToast(e.message, 'error');

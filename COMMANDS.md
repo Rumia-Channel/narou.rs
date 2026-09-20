@@ -255,7 +255,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 **書き出し形式**: `version`/`exported_at`/`library`/`encrypted`/`kdf`/`salt`/`payload`/`cookies` を持つ YAML エンベロープ。`narou_rs_login --export <file>` が生成し、ライブラリ外ではそれが既定の出力になる。
 
-**Web UI**: 設定ページ「ログイン」タブで一覧・取り込み・直接登録・削除。API: `GET/DELETE /api/login`、`POST /api/login/import`、`POST /api/login/set`、`DELETE /api/login/{host}`。
+**Web UI**: 設定ページ「ログイン」タブで一覧・取り込み・直接登録・削除。取り込みはファイル選択 (FileReader) と貼り付けの両方に対応。API: `GET/DELETE /api/login`、`POST /api/login/import`、`POST /api/login/set`、`DELETE /api/login/{host}`。
 
 ---
 
