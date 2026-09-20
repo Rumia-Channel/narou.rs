@@ -54,6 +54,9 @@
 
       if (tab.id === 'replace') {
         pane.innerHTML = renderReplaceTab();
+      } else if (tab.id === 'login') {
+        pane.innerHTML = renderLoginTab();
+        bindLoginPane(pane);
       } else {
         pane.innerHTML = renderSettingsPanel(tab);
       }
@@ -200,6 +203,171 @@
            '</ul>' +
            '<textarea class="replace-textarea" id="replace-content">' + escapeHtml(content) + '</textarea>' +
            '</div></div></div>';
+  }
+
+  // ─── Login tab ─────────────────────────────────────────
+  // The browser half is the separate narou_rs_login executable; this pane is
+  // the receiving end: it uploads the export it writes (or pastes a cookie
+  // header) and stores the credentials encrypted at rest.
+  function renderLoginTab() {
+    return '<div class="panel-settings">' +
+      '<div class="panel-heading">ログイン情報 (Cookie) の管理</div>' +
+      '<div class="list-group">' +
+      '<div class="list-group-item">' +
+      '<h4 class="list-group-item-heading">保存済みのサイト</h4>' +
+      '<div id="login-hosts" class="login-hosts"><em>読み込み中…</em></div>' +
+      '<div class="setting-help">値は表示しません。削除はサイトごと、またはすべて行えます。</div>' +
+      '<div style="margin-top:0.5rem">' +
+      '<button type="button" class="btn btn-default" id="login-refresh">再読み込み</button> ' +
+      '<button type="button" class="btn btn-danger" id="login-clear-all">すべて削除</button>' +
+      '</div>' +
+      '</div>' +
+      '<div class="list-group-item">' +
+      '<h4 class="list-group-item-heading">書き出しファイルを取り込む</h4>' +
+      '<div class="setting-help">narou_rs_login が書き出したファイル (YAML) を貼り付けて取り込みます。</div>' +
+      '<textarea class="replace-textarea login-envelope" id="login-envelope" placeholder="version: 1&#10;encrypted: true&#10;…"></textarea>' +
+      '<div class="login-form">' +
+      '<input type="password" class="setting-input" id="login-passphrase" placeholder="パスフレーズ (暗号化されている場合)">' +
+      '<label class="login-replace"><input type="checkbox" id="login-replace"> 取り込みに含まれないサイトを削除する</label>' +
+      '</div>' +
+      '<div style="margin-top:0.5rem">' +
+      '<button type="button" class="btn btn-primary" id="login-import">取り込む</button>' +
+      '</div>' +
+      '</div>' +
+      '<div class="list-group-item">' +
+      '<h4 class="list-group-item-heading">Cookie を直接登録する</h4>' +
+      '<div class="setting-help">ブラウザからコピーした Cookie 文字列を 1 サイト分だけ保存します。</div>' +
+      '<div class="login-form">' +
+      '<input type="text" class="setting-input" id="login-host" placeholder="サイト (例: ncode.syosetu.com)">' +
+      '<input type="text" class="setting-input" id="login-cookie" placeholder="Cookie 文字列 (例: over18=yes; ses=…)">' +
+      '</div>' +
+      '<div style="margin-top:0.5rem">' +
+      '<button type="button" class="btn btn-primary" id="login-set">保存する</button>' +
+      '</div>' +
+      '</div>' +
+      '</div></div>';
+  }
+
+  function bindLoginPane(pane) {
+    const refresh = pane.querySelector('#login-refresh');
+    const clearAll = pane.querySelector('#login-clear-all');
+    const importBtn = pane.querySelector('#login-import');
+    const setBtn = pane.querySelector('#login-set');
+    if (refresh) refresh.addEventListener('click', loadLoginHosts);
+    if (clearAll) clearAll.addEventListener('click', clearAllLogin);
+    if (importBtn) importBtn.addEventListener('click', importLoginEnvelope);
+    if (setBtn) setBtn.addEventListener('click', saveLoginCookie);
+    loadLoginHosts();
+  }
+
+  async function loadLoginHosts() {
+    const container = document.getElementById('login-hosts');
+    if (!container) return;
+    try {
+      const resp = await fetch('/api/login');
+      const result = await resp.json();
+      if (!result.success) throw new Error(result.message || '読み込みに失敗しました');
+      const hosts = (result.data && result.data.hosts) || [];
+      if (hosts.length === 0) {
+        container.innerHTML = '<em>保存されたログイン情報はありません。narou_rs_login で取得して取り込んでください。</em>';
+      } else {
+        container.innerHTML = hosts.map(function(entry) {
+          return '<div class="login-host-row">' +
+            '<span class="login-host-name">' + escapeHtml(entry.host) + '</span>' +
+            '<span class="login-host-cookies">' + escapeHtml(entry.cookies) + '</span>' +
+            '<button type="button" class="btn btn-default btn-xs login-remove" data-host="' + escapeAttr(entry.host) + '">削除</button>' +
+            '</div>';
+        }).join('');
+        container.querySelectorAll('.login-remove').forEach(function(btn) {
+          btn.addEventListener('click', function() { removeLoginHost(btn.dataset.host); });
+        });
+      }
+      const key = (result.data && result.data.key_source) || '';
+      const help = container.nextElementSibling;
+      if (help && key) {
+        help.textContent = '値は表示しません。鍵: ' + key;
+      }
+    } catch (e) {
+      container.innerHTML = '<em>読み込みに失敗しました: ' + escapeHtml(e.message) + '</em>';
+    }
+  }
+
+  async function importLoginEnvelope() {
+    const envelope = document.getElementById('login-envelope');
+    const passphrase = document.getElementById('login-passphrase');
+    const replace = document.getElementById('login-replace');
+    if (!envelope || !envelope.value.trim()) {
+      showToast('書き出しファイルの内容を貼り付けてください', 'error');
+      return;
+    }
+    try {
+      const resp = await fetch('/api/login/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          envelope: envelope.value,
+          passphrase: passphrase ? passphrase.value || null : null,
+          replace: !!(replace && replace.checked),
+        }),
+      });
+      const result = await resp.json();
+      if (!result.success) throw new Error(result.message || '取り込みに失敗しました');
+      showToast(result.message || '取り込みました', 'success');
+      envelope.value = '';
+      if (passphrase) passphrase.value = '';
+      loadLoginHosts();
+    } catch (e) {
+      showToast(e.message, 'error');
+    }
+  }
+
+  async function saveLoginCookie() {
+    const host = document.getElementById('login-host');
+    const cookie = document.getElementById('login-cookie');
+    if (!host || !cookie || !host.value.trim() || !cookie.value.trim()) {
+      showToast('サイトと Cookie の両方を入力してください', 'error');
+      return;
+    }
+    try {
+      const resp = await fetch('/api/login/set', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host: host.value.trim(), cookie: cookie.value }),
+      });
+      const result = await resp.json();
+      if (!result.success) throw new Error(result.message || '保存に失敗しました');
+      showToast(result.message || '保存しました', 'success');
+      host.value = '';
+      cookie.value = '';
+      loadLoginHosts();
+    } catch (e) {
+      showToast(e.message, 'error');
+    }
+  }
+
+  async function removeLoginHost(host) {
+    try {
+      const resp = await fetch('/api/login/' + encodeURIComponent(host), { method: 'DELETE' });
+      const result = await resp.json();
+      if (!result.success) throw new Error(result.message || '削除に失敗しました');
+      showToast(result.message || '削除しました', 'success');
+      loadLoginHosts();
+    } catch (e) {
+      showToast(e.message, 'error');
+    }
+  }
+
+  async function clearAllLogin() {
+    if (!window.confirm('保存されているすべてのログイン情報を削除します。よろしいですか？')) return;
+    try {
+      const resp = await fetch('/api/login', { method: 'DELETE' });
+      const result = await resp.json();
+      if (!result.success) throw new Error(result.message || '削除に失敗しました');
+      showToast(result.message || '削除しました', 'success');
+      loadLoginHosts();
+    } catch (e) {
+      showToast(e.message, 'error');
+    }
   }
 
   // ─── Events ────────────────────────────────────────────

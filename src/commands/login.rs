@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn set_clear_and_list_follow_the_stored_hosts() {
         let _legacy = legacy_yaml_guard();
-        let (temp, _guard, store) = library();
+        let (_temp, _guard, store) = library();
 
         set(&store, "Ncode.Syosetu.com", Some(" over18=yes; ses=1 ".to_string())).unwrap();
         assert_eq!(
