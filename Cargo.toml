@@ -35,6 +35,8 @@ native-runtime = [
     "dep:fs2",
     "dep:libc",
     "dep:rusqlite",
+    # Only the native login executable talks to a browser over ws://.
+    "dep:tungstenite",
 ]
 # `lite`: embed AozoraEpub3_Lite (GPL-3.0-only) as the in-process EPUB
 # engine. Binaries built with this feature are distributed under GPL-3.0;
@@ -89,7 +91,7 @@ base64 = "0.23"
 miniz_oxide = "0.9"
 brotli = "9.0"
 crc32fast = "1.5"
-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"], optional = true }
 
 [build-dependencies]
 base64 = "0.22"

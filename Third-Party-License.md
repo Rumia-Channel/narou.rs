@@ -109,6 +109,7 @@ the time of this audit.
 | tracing | ^0.1 | MIT |
 | tracing-subscriber | ^0.3 | MIT |
 | tray-icon (Windows) | ^0.25 | MIT OR Apache-2.0 |
+| tungstenite | ^0.30.0 | MIT OR Apache-2.0 |
 | ua_generator | ^0.5 | MIT |
 | unicode-normalization | ^0.1 | MIT OR Apache-2.0 |
 | url | ^2 | MIT OR Apache-2.0 |
@@ -126,7 +127,7 @@ dependency).
 
 | License | Used by |
 | --- | ---: |
-| MIT License | 396 |
+| MIT License | 400 |
 | ISC License | 19 |
 | Unicode License v3 | 19 |
 | Apache License 2.0 | 16 |
@@ -5008,6 +5009,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 - tungstenite 0.29.0
+- tungstenite 0.30.0
 
 ```text
 Copyright (c) 2017 Alexey Galakhov
@@ -5947,6 +5949,40 @@ DEALINGS IN THE SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
+- rand_core 0.10.1
+
+```text
+Copyright (c) 2018-2026 The Rand Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### MIT License (`MIT`)
+
+Used by:
 - keccak 0.2.2
 - zeroize 1.9.0
 
@@ -6329,6 +6365,40 @@ Used by:
 
 ```text
 Copyright (c) 2019-2026 Sean McArthur & Hyper Contributors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### MIT License (`MIT`)
+
+Used by:
+- chacha20 0.10.2
+
+```text
+Copyright (c) 2019-2026 The RustCrypto Project Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -7224,6 +7294,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 ### MIT License (`MIT`)
 
 Used by:
+- rand 0.10.3
 - rand 0.9.5
 - rand_chacha 0.9.0
 - rand_core 0.9.5
