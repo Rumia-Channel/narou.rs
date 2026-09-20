@@ -774,4 +774,37 @@ mod tests {
         let data = futures::executor::block_on(store.read_small(&key)).unwrap().unwrap();
         assert_eq!(data, b"toc-data");
     }
+
+    /// `remove --with-file` relies on this: a prefix delete must drop the
+    /// stored objects *and* their mirror files, including nested section keys.
+    #[test]
+    fn delete_prefix_removes_stored_objects_and_mirror_files() {
+        let (dir, store) = temp_store();
+        let keys = crate::platform::NovelObjectKeys::new("site", "n1234ab", false).unwrap();
+        let section = keys.section("1", "第一話");
+        futures::executor::block_on(async {
+            store.write_small(&keys.toc(), b"toc".to_vec()).await.unwrap();
+            store
+                .write_small(&section, b"section".to_vec())
+                .await
+                .unwrap();
+        });
+        let section_path = dir.path().join("site/n1234ab/本文/1 第一話.yaml");
+        assert!(section_path.is_file());
+
+        crate::native::object_store::delete_prefix_sync(&store, keys.prefix()).unwrap();
+
+        assert!(
+            futures::executor::block_on(store.read_small(&keys.toc()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            futures::executor::block_on(store.read_small(&section))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!section_path.exists());
+        assert!(!dir.path().join("site/n1234ab/toc.yaml").exists());
+    }
 }

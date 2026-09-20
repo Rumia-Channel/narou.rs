@@ -484,6 +484,7 @@ narou setting name         # 読み取り
 **Rust 実装**:
 - デフォルトは Ruby版同様 DB index のみ削除し、保存フォルダは残したまま `toc.yaml` だけ削除する
 - `--with-file` で小説保存フォルダを完全削除する
+- SQLite 管理時は小説データが `objects` テーブルにも入っているため、削除時はストレージ側のオブジェクトも同時に消す（`--with-file` は小説プレフィックス配下を全削除、オプションなしは `toc.yaml` のみ）。残すと次回の DL が「本文は取得済み」と判断してファイルを書き戻さず、変換が `section file not found` で失敗する
 - `--yes` 未指定時は Ruby版 `Input.confirm` 相当で削除確認を出す
 - `--all-ss` で `novel_type == 2` の短編を全選択する。短編が存在しない場合は `短編小説がひとつもありません` を表示する
 - tag 展開、alias/タイトル/URL/Nコード解決、freeze.yaml ベースの凍結判定、`.narou/lock.yaml` が存在する場合の変換中チェックを実装

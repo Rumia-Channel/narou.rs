@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -14,7 +15,7 @@ use futures::StreamExt;
 use crate::error::{NarouError, Result};
 use crate::platform::{
     AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
-    ObjectStore, PlatformFuture,
+    ObjectPrefix, ObjectStore, PlatformFuture,
 };
 
 pub(crate) const MAX_SMALL_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
@@ -687,6 +688,35 @@ impl AssetStore for NativeStore {
         match self {
             NativeStore::Fs(store) => store.move_or_copy(source, destination),
             NativeStore::Sqlite(store) => store.move_or_copy(source, destination),
+        }
+    }
+}
+
+/// Delete every object stored below `prefix` using the active storage backend.
+///
+/// `remove --with-file` has to drop the stored objects together with their
+/// filesystem mirror: in SQLite mode the `objects` table survives the deleted
+/// folder, and a later download then treats the sections as already present
+/// and never rewrites the files the converter reads.
+pub fn delete_prefix_sync(store: &dyn ObjectStore, prefix: &ObjectKey) -> Result<()> {
+    let prefix = ObjectPrefix::from(prefix.clone());
+    let mut cursor: Option<String> = None;
+    loop {
+        let request = ObjectListRequest::new(
+            prefix.clone(),
+            NonZeroUsize::new(100).expect("page size is non-zero"),
+        );
+        let request = match &cursor {
+            Some(cursor) => request.after(cursor.clone()),
+            None => request,
+        };
+        let page = futures::executor::block_on(store.list_page(&request))?;
+        for object in &page.objects {
+            futures::executor::block_on(store.delete(&object.key))?;
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(()),
         }
     }
 }
