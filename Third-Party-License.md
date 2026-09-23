@@ -84,7 +84,7 @@ the time of this audit.
 | futures | ^0.3 | MIT OR Apache-2.0 |
 | getrandom | ^0.4 | MIT OR Apache-2.0 |
 | hex | ^0.4 | MIT OR Apache-2.0 |
-| image | ^0.25.10 | MIT OR Apache-2.0 |
+| image | ^0.25 | MIT OR Apache-2.0 |
 | indicatif | ^0.18 | MIT |
 | lettre | ^0.11 | MIT |
 | libc | ^0.2 | MIT OR Apache-2.0 |
