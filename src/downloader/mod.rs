@@ -954,6 +954,9 @@ impl Downloader {
         let re = compile_html_pattern(illust_url_pattern).map_err(NarouError::Regex)?;
         let storage =
             crate::illustration_store::IllustrationStorageService::new(self.assets.clone());
+        // Illustration hosts (i.pximg.net) reject requests without the site's
+        // headers, and login-only images need the same cookie jar.
+        let illustration_policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
 
         // Parsed sections may omit site-specific image markup. Search the raw
         // HTML from this fetch as well, while keeping all persistence logical.
@@ -985,8 +988,7 @@ impl Downloader {
                     self.http.as_ref(),
                     self.rate_limiter.as_ref(),
                     url,
-                    None,
-                    setting.is_narou,
+                    &illustration_policy,
                 )
                 .await
                 {
@@ -1044,9 +1046,8 @@ impl Downloader {
             self.http.as_ref(),
             self.rate_limiter.as_ref(),
             target,
-            setting.cookie(),
+            &crate::downloader::http_policy::FetchPolicy::for_site(&setting),
             Some(setting.encoding()),
-            setting.is_narou,
         )
         .await?;
         crate::downloader::util::pretreatment_source(&mut body, setting.encoding(), None);
@@ -1177,8 +1178,7 @@ impl Downloader {
                 self.http.as_ref(),
                 self.rate_limiter.as_ref(),
                 &toc_url,
-                setting.cookie(),
-                setting.is_narou,
+                &crate::downloader::http_policy::FetchPolicy::for_site(&setting),
             )
             .await
             {

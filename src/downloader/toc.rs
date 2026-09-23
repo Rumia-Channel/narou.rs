@@ -22,9 +22,8 @@ pub async fn fetch_toc(
         http,
         rate_limiter,
         toc_url,
-        setting.cookie(),
+        &crate::downloader::http_policy::FetchPolicy::for_site(setting),
         Some(setting.encoding()),
-        setting.is_narou,
     )
     .await?;
     pretreatment_source(&mut body, setting.encoding(), Some(setting));

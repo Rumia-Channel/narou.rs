@@ -41,6 +41,11 @@ pub struct SiteSetting {
     pub confirm_over18: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie: Option<String>,
+    /// Extra request headers sent with every fetch for this site (e.g. the
+    /// `Referer` some image hosts require). Names/values that could inject a
+    /// second header are dropped when the policy is built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
     /// Login page the `narou_rs_login` executable opens for this site.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_url: Option<String>,
@@ -428,6 +433,14 @@ impl SiteSetting {
 
     pub fn cookie(&self) -> Option<&str> {
         self.cookie.as_deref()
+    }
+
+    /// Site-declared request headers, in a stable order.
+    pub fn header_list(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers
+            .iter()
+            .flat_map(|map| map.iter())
+            .map(|(name, value)| (name.as_str(), value.as_str()))
     }
 
     /// Login page for this site, with `\k<...>` placeholders resolved.

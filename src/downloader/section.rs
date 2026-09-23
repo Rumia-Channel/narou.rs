@@ -60,9 +60,8 @@ pub async fn download_section(
         http,
         rate_limiter,
         &url,
-        setting.cookie(),
+        &http_policy::FetchPolicy::for_site(setting),
         Some(setting.encoding()),
-        setting.is_narou,
     )
     .await?;
     pretreatment_source(&mut html_source, setting.encoding(), Some(setting));

@@ -72,9 +72,8 @@ impl NovelInfo {
             http,
             rate_limiter,
             &resolved_url,
-            setting.cookie(),
+            &http_policy::FetchPolicy::for_site(setting),
             Some(setting.encoding()),
-            setting.is_narou,
         )
         .await
         {
