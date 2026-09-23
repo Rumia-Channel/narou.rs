@@ -359,7 +359,9 @@ sample/
 ### ダウンロード互換性
 - なろう (n8858hb, 24セクション) DL完走確認済み
 - カクヨム (ID=2, 294セクション) DL完走確認済み
-- syosetu.org（ハーメルン）: UAランダム化、HTTP/1.1/Cookie/圧縮/curl fallback による403回避対応済み。R18 分離ドメイン h.syosetu.org も同一サイトとして対応（412369=44セクション、405366=5セクションで h あり/なし双方向の DL・重複防止を実機確認済み）
+- syosetu.org（ハーメルン）: UAランダム化、HTTP/1.1/Cookie/圧縮/curl fallback による403回避対応済み。R18 分離ドメイン h.syosetu.org も同一サイトとして対応（412369=56セクション、405366=15セクションで h あり/なし双方向の DL・重複防止を実機確認済み）
+- ハーメルン R18 (h.syosetu.org) は Cloudflare の managed challenge 配下にあり、ブラウザが必ず送る `Sec-Fetch-*` が無いリクエストは `403` + `Cf-Mitigated: challenge` で弾かれる。`webnovel/syosetu.org.yaml` の `headers:` で実ブラウザ相当の `Sec-Fetch-*` / `Upgrade-Insecure-Requests` / `Accept` / `Accept-Language` を明示して回避する（2026-09 対応）。
+- 同じホストで reqwest は 403、libcurl は 200 を返す（TLS/HTTP クライアント差）。そのため `send_manual`（リダイレクトを自前で辿るモード）も curl ティアを先に試すようにした。以前は reqwest 固定で、curl は 4xx/5xx 時のリダイレクト探索にしか使っておらず、challenge 下のサイトで本文ごと 403 になっていた。
 - Arcadia: `href` の `&amp;` デコード修正により本文取得修正済み
 
 ### YAML駆動サイト定義

@@ -73,6 +73,43 @@ fn is_safe_header_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn hameln_definition_carries_browser_fetch_metadata() {
+        // R18 分離ドメインの Cloudflare challenge を避けるためのヘッダが
+        // サイト定義から実際に policy へ流れていることを固定する。
+        let setting: super::super::site_setting::SiteSetting = serde_yaml::from_str(
+            include_str!("../../webnovel/syosetu.org.yaml"),
+        )
+        .unwrap();
+        let policy = FetchPolicy::for_site(&setting);
+
+        for name in [
+            "Sec-Fetch-Dest",
+            "Sec-Fetch-Mode",
+            "Sec-Fetch-Site",
+            "Sec-Fetch-User",
+            "Upgrade-Insecure-Requests",
+            "Accept-Language",
+        ] {
+            assert!(
+                policy.headers().iter().any(|(key, _)| key == name),
+                "missing {name} in {:?}",
+                policy.headers()
+            );
+        }
+        assert!(
+            policy
+                .headers()
+                .iter()
+                .any(|(key, value)| key == "Cookie" && value == "over18=off")
+        );
+    }
+}
+
 /// Decode response bytes using the site's declared encoding.
 ///
 /// `None`/`utf-8` uses lossy UTF-8; other labels go through `encoding_rs`

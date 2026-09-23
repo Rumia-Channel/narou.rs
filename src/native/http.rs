@@ -224,6 +224,19 @@ impl NativeHttpClient {
         validate_public_url(url).map_err(io_error)?;
         let user_agent = request.header("User-Agent").unwrap_or(&self.user_agent);
 
+        // libcurl first: Cloudflare-style managed challenges answer curl and
+        // reject reqwest for the same request. A definitive answer (2xx/3xx, or
+        // the 4xx/5xx that the policy layer maps itself) is returned as-is;
+        // anything else falls through so reqwest can still have a turn.
+        match self.fetch_tier_curl_manual(request, user_agent) {
+            Ok(response)
+                if !(400..600).contains(&response.status) || response.status == 404 || response.status == 503 =>
+            {
+                return Ok(response);
+            }
+            Ok(_) | Err(_) => {}
+        }
+
         let mut req = self.manual_redirect_client.get(url);
         for (name, value) in &request.headers {
             if !is_safe_header_value(value) {
@@ -695,6 +708,69 @@ impl NativeHttpClient {
         Ok(handle)
     }
 
+    /// Non-following GET via libcurl, returning the response untouched.
+    ///
+    /// `send_manual` prefers this over reqwest: some CDNs (Cloudflare managed
+    /// challenges) answer libcurl and reject reqwest for the same request, and
+    /// the manual path needs the real status/`Location` pair rather than a
+    /// rewritten redirect.
+    fn fetch_tier_curl_manual(
+        &self,
+        request: &HttpRequest,
+        user_agent: &str,
+    ) -> Result<HttpResponse> {
+        let mut handle = self.configured_curl_handle(request, user_agent)?;
+        let mut body = Vec::new();
+        let mut content_type = String::new();
+        let mut location: Option<String> = None;
+        let mut too_large = false;
+        let perform_result = {
+            let mut transfer = handle.transfer();
+            transfer
+                .write_function(|data| {
+                    if body.len() + data.len() > MAX_RESPONSE_BYTES {
+                        too_large = true;
+                        return Ok(0);
+                    }
+                    body.extend_from_slice(data);
+                    Ok(data.len())
+                })
+                .map_err(|e| io_error(e.to_string()))?;
+            transfer
+                .header_function(|header| {
+                    let header = String::from_utf8_lossy(header);
+                    if let Some(value) = header.strip_prefix("Content-Type:") {
+                        content_type = value.trim().to_string();
+                    } else if let Some(value) = header.strip_prefix("Location:") {
+                        location = Some(value.trim().to_string());
+                    }
+                    true
+                })
+                .map_err(|e| io_error(e.to_string()))?;
+            transfer.perform()
+        };
+        if too_large {
+            return Err(io_error(format!(
+                "response body exceeded {MAX_RESPONSE_BYTES} bytes while fetching {}",
+                request.url
+            )));
+        }
+        perform_result.map_err(|e| io_error(e.to_string()))?;
+
+        let code = handle
+            .response_code()
+            .map_err(|e| io_error(e.to_string()))?;
+        let mut headers = content_type_header(content_type);
+        if let Some(location) = location {
+            headers.push(("Location".into(), location));
+        }
+        Ok(HttpResponse {
+            status: code as u16,
+            headers,
+            body,
+        })
+    }
+
     /// Perform a single non-following GET via libcurl and report the response
     /// status code plus the redirect target (when the status is 3xx). Used as
     /// a fallback by `send_manual` when the reqwest hop is blocked (e.g. a
@@ -951,6 +1027,38 @@ mod tests {
         server.join().unwrap();
 
         assert!(err.to_string().contains("HTTP redirect 302"));
+    }
+
+    #[test]
+    fn manual_mode_returns_the_curl_redirect_and_its_location() {
+        // Manual モードは curl ティアを先に使う。3xx をそのまま返し、Location を
+        // 落とさないこと (CDN challenge を curl が通り reqwest が弾かれる hosts
+        // があるため、ここが reqwest 任せだと本文ごと 403 になる)。
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/moved", listener.local_addr().unwrap());
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let client = NativeHttpClient::new("narou_rs-test").unwrap();
+        let response = client
+            .fetch_tier_curl_manual(&HttpRequest::get(url), "narou_rs-test")
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(response.status, 302);
+        assert_eq!(
+            response.header("Location"),
+            Some("http://127.0.0.1/elsewhere")
+        );
     }
 
     #[test]

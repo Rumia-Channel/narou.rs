@@ -19,6 +19,17 @@ append_title_to_folder_name: yes
 title_strip_pattern: null
 cookie: over18=off
 over18_pattern: ※この作品はR-18です。
+# R18 分離ドメイン (h.syosetu.org) は Cloudflare の managed challenge 配下に
+# あり、ブラウザが必ず送る Sec-Fetch-* が無いリクエストは 403 で弾かれる
+# (HTTP 403 + "Just a moment..." を返す)。実ブラウザ相当のヘッダを明示する。
+headers:
+  Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8
+  Accept-Language: ja,en-US;q=0.9,en;q=0.8
+  Sec-Fetch-Dest: document
+  Sec-Fetch-Mode: navigate
+  Sec-Fetch-Site: none
+  Sec-Fetch-User: "?1"
+  Upgrade-Insecure-Requests: "1"
 sitename: *name
 version: 1.8
 
