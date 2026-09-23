@@ -1,22 +1,31 @@
 # ------------------------------------------------------------
 # 小説サイト定義
-# Pixiv の小説 (novel) と小説シリーズ (series)。
-# 本文・目次・作品情報はすべて /ajax/* の JSON API から取得する。小説ページの
+# Pixiv の 4 種の対象を扱う: 小説 / 小説シリーズ / イラスト・漫画 (artworks) /
+# 漫画シリーズ (ユーザーの series ページ)。
+# 本文・目次・作品情報はすべて /ajax/* の JSON API から取得する。作品ページの
 # HTML は Next.js の SPA シェルで本文を含まないため使わない。
-# ncode は単純な数字だと作品種別をまたいで衝突するため、小説は n、シリーズは s
-# を先頭に付ける (元の数値 ID は work_id に入る)。
+# ncode は単純な数字だと作品種別をまたいで衝突するため、種別ごとに接頭辞を付ける
+# (n = 小説, s = 小説シリーズ, a = イラスト・漫画, c = 漫画シリーズ)。
 name: &name Pixiv
 sitename: *name
 scheme: https
 domain: www.pixiv.net
 top_url: \\k<scheme>://\\k<domain>
 url:
-  - https?://\\k<domain>/novel/(?<kind>series/)(?<work_id>\d+)
-  - https?://\\k<domain>/novel/(?<kind>)show\.php\?id=(?<work_id>\d+)
+  # 小説 (単体)
+  - https?://\\k<domain>/novel/show\.php\?id=(?<work_id>\d+)
+  # 小説シリーズ
+  - https?://\\k<domain>/novel/series/(?<work_id>\d+)
+  # イラスト・漫画 (単体作品)
+  - https?://\\k<domain>/artworks/(?<work_id>\d+)
+  # 漫画シリーズ (ユーザーのシリーズページ)
+  - https?://\\k<domain>/user/(?<user_id>\d+)/series/(?<series_id>\d+)
   # 保存済みレコードの toc_url は API 側の URL になる。更新時にサイト定義を
   # 引き直せるよう、その形も受け付ける。
-  - https?://\\k<domain>/ajax/novel/(?<kind>series/)(?<work_id>\d+)
-  - https?://\\k<domain>/ajax/novel/(?<kind>)(?<work_id>\d+)
+  - https?://\\k<domain>/ajax/novel/series/(?<work_id>\d+)
+  - https?://\\k<domain>/ajax/illust/(?<work_id>\d+)
+  - https?://\\k<domain>/ajax/series/(?<series_id>\d+)
+  - https?://\\k<domain>/ajax/novel/(?<work_id>\d+)
 encoding: UTF-8
 timezone: Asia/Tokyo
 headers:
@@ -41,119 +50,191 @@ preprocess: |-
   emit "<!---"
   emit "PixivPreprocessEvalMagicWord"
 
-  if body.page && body.page.seriesContents
-    # シリーズ目次ページ。thumbnails.novel は page.seriesContents と同じ順序で
-    # 話数 (seriesContentOrder) と掲載日を持つため、こちらから目次を作る。
-    let entries = body.thumbnails.novel
-    for entry in entries
-      emit "Episode;${entry.seriesContentOrder};https://www.pixiv.net/ajax/novel/${entry.id};${entry.createDate};${entry.title}"
+  if body.page && body.page.series
+    # 漫画シリーズの目次ページ (/ajax/series/{id}?p=N)。一覧は 12 件ずつ order の
+    # 降順で返るため reverse して 1 話から並べる。
+    let series = body.illustSeries.first
+    emit "ncode::c${series.id}"
+    emit "title::${series.title}"
+    emit "story::${series.description.replace("\n", "<br>")}"
+    emit "novel_type::連載中"
+    emit "general_all_no::${series.total}"
+    emit "general_firstup::${series.createDate}"
+    emit "general_lastup::${series.updateDate}"
+    emit "novelupdated_at::${series.updateDate}"
+    for entry in body.page.series.reverse
+      # 各話の題名と掲載日は作品ページから取る (一覧は ID と順序だけ)。
+      let work = fetch_json("https://www.pixiv.net/ajax/illust/${entry.workId}")
+      # 作者はシリーズ情報に無いので各話から拾う (情報側は最初の一致を採用する)。
+      emit "author::${work.body.userName}"
+      emit "Episode;${entry.order};https://www.pixiv.net/ajax/illust/${entry.workId};${work.body.uploadDate};${work.body.title}"
     end
-    if entries.size == 30
-      emit "next::/ajax/novel/series_content/${entries.first.seriesId}?limit=30&last_order=${entries.last.seriesContentOrder}&order_by=asc"
+    if body.page.series.last.order != 1
+      # order 1 まで来ていなければ続きのページがある。
+      let current_page = url.gsub(/^.*[?&]p=(\d+).*$/, "$1")
+      if current_page != url
+        emit "next::/ajax/series/${series.id}?p=${current_page + 1}&lang=ja"
+      end
     end
   else
-    if body.total
-      # シリーズ詳細ページ
-      emit "ncode::s${body.id}"
-      emit "title::${body.title}"
-      emit "author::${body.userName}"
-      emit "story::${body.caption.replace("\n", "<br>")}"
-      if body.isConcluded
-        emit "novel_type::完結済"
+    if body.illustTitle
+      # イラスト・漫画の作品ページ (/ajax/illust/{id})。シリーズの 1 話でもある。
+      # 判定に illustType を使わない: イラストは 0 で、DSL では数値 0 が偽になる。
+      # 本文はページ画像そのものなので、挿絵タグを並べる (narou がローカライズする)。
+      let art_pages = fetch_json("https://www.pixiv.net/ajax/illust/${body.id}/pages")
+      let art_text = art_pages.body.map { |page| "<img src=\"${page.urls.original}\">" }.join("<br>")
+      if body.seriesNavData
+        # シリーズの 1 話。作品情報はシリーズの目次ページが持つので前書きだけ出す。
+        emit "introduction::"
+        emit body.description.replace("\n", "<br>")
+        emit "::introduction_end"
       else
-        emit "novel_type::連載中"
-      end
-      emit "general_all_no::${body.total}"
-      emit "general_firstup::${body.createDate}"
-      emit "general_lastup::${body.updateDate}"
-      emit "novelupdated_at::${body.updateDate}"
-      emit "length::${body.publishedTotalCharacterCount}"
-      if body.tags && body.tags.is_array
-        for tag in body.tags
-          emit "tag::${tag}"
-        end
-      end
-      emit "next::/ajax/novel/series_content/${body.id}?limit=30&last_order=0&order_by=asc"
-    else
-      if body.content
-        # 小説ページ (単体作品、またはシリーズの各話)。レコードの同一性は話そのもの
-        # なので、シリーズの一部でも話の ID を使う (シリーズ全体はシリーズ URL で取得)。
-        emit "ncode::n${body.id}"
+        emit "ncode::a${body.id}"
         emit "title::${body.title}"
         emit "author::${body.userName}"
-        # キャプションは話の前書き。単体作品ではあらすじそのものなので story に回す
-        # (同じ文を あらすじ と 前書き の両方に出すと本文で二重に見える)。
-        if body.seriesNavData
-          emit "introduction::"
-          emit body.description.replace("\n", "<br>")
-          emit "::introduction_end"
-        else
-          emit "story::${body.description.replace("\n", "<br>")}"
-        end
+        emit "story::${body.description.replace("\n", "<br>")}"
         emit "novel_type::短編"
         emit "general_all_no::1"
         emit "general_firstup::${body.createDate}"
         emit "general_lastup::${body.uploadDate}"
         emit "novelupdated_at::${body.uploadDate}"
-        emit "length::${body.characterCount}"
+        emit "length::0"
         if body.tags && body.tags.tags && body.tags.tags.is_array
           for tag in body.tags.tags
             emit "tag::${tag.tag}"
           end
         end
-
-        # 単体作品は 1 話なので目次を出さない。novel_type が短編 (2) なら narou は
-        # 目次を使わず、本文ページ = この URL を 1 話として扱う。ここで Episode 行を
-        # 出すと「href 付きの目次 = 連載」と判定され、短編が連載中に化ける。
-        # 本文。Pixiv の記法を Aozora へ渡せる HTML に直してから改行を <br> に
-        # する (to_aozora は素の改行を落とすため)。
-        let text = body.content
-        let text = text.gsub(/\[\[rb:(.*?)\s*>\s*(.*?)\]\]/, "<ruby>$1<rp>(</rp><rt>$2</rt><rp>)</rp></ruby>")
-        let text = text.gsub(/\[\[jumpuri:(.*?)\s*>\s*(.*?)\]\]/, "<a href=\"$2\">$1</a>")
-        let text = text.gsub(/\[chapter:([^\]]*)\]/, "$1")
-        let text = text.gsub(/\[jump:(\d+)\]/, "（$1ページ目へ）")
-
-        # 挿絵。`[pixivimage:ID-N]` は ID から画像 URL を引く追加 API が要るので
-        # request キューに載せ、次の実行で結果が入る。解決できなかった参照は
-        # 目印だけ残して読書面から消す (取得失敗で本文全体を落とさない)。
-        # 話数付き (`-N`) と話数なし (1 枚目) の 2 形態がある。
-        let text = text.gsub(/\[pixivimage:(\d+)-(\d+)\]/) { |m| fetch_json("https://www.pixiv.net/ajax/illust/${m[1]}/pages").body[m[2] - 1].urls.original || "<!--pixivimage:${m[1]}-${m[2]}-->" }
-        let text = text.gsub(/\[pixivimage:(\d+)\]/) { |m| fetch_json("https://www.pixiv.net/ajax/illust/${m[1]}/pages").body.first.urls.original || "<!--pixivimage:${m[1]}-->" }
-        # `[uploadedimage:ID]` は同じ応答に URL があるので追加取得は不要。
-        let text = text.gsub(/\[uploadedimage:(\d+)\]/) { |m| body.textEmbeddedImages[m[1]].urls.original || "<!--uploadedimage:${m[1]}-->" }
-        # 解決済みの画像 URL を挿絵タグへ (narou が illust_grep_pattern で拾う)。
-        let text = text.gsub(/https:\/\/i\.pximg\.net\/[^\s<>"]+/, "<img src=\"$0\">")
-
-        let text = text.replace("[newpage]", "［＃改ページ］")
-        let text = text.replace("\n", "<br>")
-        emit "body::"
-        emit text
-        emit "::body_end"
-
-        if body.pollData
-          let choices = body.pollData.choices.map { |choice| "　　　${choice.text}　　${choice.count}票" }.join("<br>")
-          emit "postscript::"
-          emit "アンケート　\"${body.pollData.question}\"　　票数${body.pollData.total}票<br>${choices}"
-          emit "::postscript_end"
+      end
+      emit "body::"
+      # うごイラなどでページ一覧が空のときは代表画像だけ出す。
+      emit art_text || "<img src=\"${body.urls.original}\">"
+      emit "::body_end"
+    else
+      if body.page && body.page.seriesContents
+        # 小説シリーズの目次ページ。thumbnails.novel は page.seriesContents と
+        # 同じ順序で話数 (seriesContentOrder) と掲載日を持つため、こちらを使う。
+        let entries = body.thumbnails.novel
+        for entry in entries
+          emit "Episode;${entry.seriesContentOrder};https://www.pixiv.net/ajax/novel/${entry.id};${entry.createDate};${entry.title}"
+        end
+        if entries.size == 30
+          emit "next::/ajax/novel/series_content/${entries.first.seriesId}?limit=30&last_order=${entries.last.seriesContentOrder}&order_by=asc"
         end
       else
-        # 本文が無い小説ページ = ログインが要る作品 (R-18 / ログイン限定)。
-        # この目印に一致したら narou 側が保存済み Cookie で 1 回だけ再試行する。
-        emit "login_required::1"
+        if body.total
+          # 小説シリーズの詳細ページ
+          emit "ncode::s${body.id}"
+          emit "title::${body.title}"
+          emit "author::${body.userName}"
+          emit "story::${body.caption.replace("\n", "<br>")}"
+          if body.isConcluded
+            emit "novel_type::完結済"
+          else
+            emit "novel_type::連載中"
+          end
+          emit "general_all_no::${body.total}"
+          emit "general_firstup::${body.createDate}"
+          emit "general_lastup::${body.updateDate}"
+          emit "novelupdated_at::${body.updateDate}"
+          emit "length::${body.publishedTotalCharacterCount}"
+          if body.tags && body.tags.is_array
+            for tag in body.tags
+              emit "tag::${tag}"
+            end
+          end
+          emit "next::/ajax/novel/series_content/${body.id}?limit=30&last_order=0&order_by=asc"
+        else
+          if body.content
+            # 小説ページ (単体作品、またはシリーズの各話)。レコードの同一性は話その
+            # ものなので、シリーズの一部でも話の ID を使う。
+            emit "ncode::n${body.id}"
+            emit "title::${body.title}"
+            emit "author::${body.userName}"
+            # キャプションは話の前書き。単体作品ではあらすじそのものなので story に
+            # 回す (同じ文を あらすじ と 前書き の両方に出すと本文で二重に見える)。
+            if body.seriesNavData
+              emit "introduction::"
+              emit body.description.replace("\n", "<br>")
+              emit "::introduction_end"
+            else
+              emit "story::${body.description.replace("\n", "<br>")}"
+            end
+            emit "novel_type::短編"
+            emit "general_all_no::1"
+            emit "general_firstup::${body.createDate}"
+            emit "general_lastup::${body.uploadDate}"
+            emit "novelupdated_at::${body.uploadDate}"
+            emit "length::${body.characterCount}"
+            if body.tags && body.tags.tags && body.tags.tags.is_array
+              for tag in body.tags.tags
+                emit "tag::${tag.tag}"
+              end
+            end
+
+            # 単体作品は 1 話なので目次を出さない。novel_type が短編 (2) なら narou は
+            # 本文ページ = この URL を 1 話として扱う。ここで Episode 行を出すと
+            # 「href 付きの目次 = 連載」と判定され、短編が連載中に化ける。
+            # 本文。Pixiv の記法を Aozora へ渡せる HTML に直してから改行を <br> に
+            # する (to_aozora は素の改行を落とすため)。
+            let text = body.content
+            let text = text.gsub(/\[\[rb:(.*?)\s*>\s*(.*?)\]\]/, "<ruby>$1<rp>(</rp><rt>$2</rt><rp>)</rp></ruby>")
+            let text = text.gsub(/\[\[jumpuri:(.*?)\s*>\s*(.*?)\]\]/, "<a href=\"$2\">$1</a>")
+            let text = text.gsub(/\[chapter:([^\]]*)\]/, "$1")
+            let text = text.gsub(/\[jump:(\d+)\]/, "（$1ページ目へ）")
+
+            # 挿絵。`[pixivimage:ID-N]` は ID から画像 URL を引く追加 API が要るので
+            # request キューに載せ、次の実行で結果が入る。解決できなかった参照は
+            # 目印だけ残して読書面から消す (取得失敗で本文全体を落とさない)。
+            # 話数付き (`-N`) と話数なし (1 枚目) の 2 形態がある。
+            let text = text.gsub(/\[pixivimage:(\d+)-(\d+)\]/) { |m| fetch_json("https://www.pixiv.net/ajax/illust/${m[1]}/pages").body[m[2] - 1].urls.original || "<!--pixivimage:${m[1]}-${m[2]}-->" }
+            let text = text.gsub(/\[pixivimage:(\d+)\]/) { |m| fetch_json("https://www.pixiv.net/ajax/illust/${m[1]}/pages").body.first.urls.original || "<!--pixivimage:${m[1]}-->" }
+            # `[uploadedimage:ID]` は同じ応答に URL があるので追加取得は不要。
+            let text = text.gsub(/\[uploadedimage:(\d+)\]/) { |m| body.textEmbeddedImages[m[1]].urls.original || "<!--uploadedimage:${m[1]}-->" }
+            # 解決済みの画像 URL を挿絵タグへ (narou が illust_grep_pattern で拾う)。
+            let text = text.gsub(/https:\/\/i\.pximg\.net\/[^\s<>"]+/, "<img src=\"$0\">")
+
+            let text = text.replace("[newpage]", "［＃改ページ］")
+            let text = text.replace("\n", "<br>")
+            emit "body::"
+            emit text
+            emit "::body_end"
+
+            if body.pollData
+              let choices = body.pollData.choices.map { |choice| "　　　${choice.text}　　${choice.count}票" }.join("<br>")
+              emit "postscript::"
+              emit "アンケート　\"${body.pollData.question}\"　　票数${body.pollData.total}票<br>${choices}"
+              emit "::postscript_end"
+            end
+          else
+            # 本文が無い小説ページ = ログインが要る作品 (R-18 / ログイン限定)。
+            # この目印に一致したら narou 側が保存済み Cookie で 1 回だけ再試行する。
+            emit "login_required::1"
+          end
+        end
       end
     end
   end
 
   emit "--->"
   insert_at_match
-
 # ------------------------------------------------------------
 # 目次取得設定
 # シリーズ詳細ページを 1 ページ目として読み、続きは next_toc で辿る。
 # 単体作品はこのページ自身が本文ページになる。
-toc_url: \\k<top_url>/ajax/novel/\\k<kind>\\k<work_id>
+# 対象の形ごとに取得先 API が違うので、ターゲット URL に一致した最初の
+# エントリを使う。
+toc_url:
+  by_target:
+    - match: /ajax/novel/series/|/novel/series/
+      url: \\k<top_url>/ajax/novel/series/\\k<work_id>
+    - match: /ajax/series/|/user/\d+/series/
+      url: \\k<top_url>/ajax/series/\\k<series_id>?p=1&lang=ja
+    - match: /ajax/illust/|/artworks/
+      url: \\k<top_url>/ajax/illust/\\k<work_id>
+    - match: /ajax/novel/|/novel/show\.php
+      url: \\k<top_url>/ajax/novel/\\k<work_id>
 subtitles: |-
-  ^Episode;(?<index>\d+);(?<href>https://www\.pixiv\.net/ajax/novel/\d+);(?<subdate>[^;\n]*);(?<subtitle>[^\n]+)$
+  ^Episode;(?<index>\d+);(?<href>https://www\.pixiv\.net/ajax/(?:novel|illust)/\d+);(?<subdate>[^;\n]*);(?<subtitle>[^\n]+)$
 next_toc: next::(?<next_page>.+)
 next_url: \\k<top_url>\\k<next_page>
 

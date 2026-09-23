@@ -104,6 +104,7 @@ method = {
     | ".size" ~ method_end
     | ".first" ~ method_end
     | ".last" ~ method_end
+    | ".reverse" ~ method_end
 }
 
 // 引数を取らないメソッドは、名前の続きがあるときは識別子アクセスとして扱う

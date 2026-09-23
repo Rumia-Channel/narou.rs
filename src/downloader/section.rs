@@ -75,6 +75,7 @@ pub async fn download_section(
         setting.encoding(),
         Some(setting),
         jobs,
+        &url,
     )
     .await?;
     let (element, raw_html) = parse_section_html(setting, html_source)?;

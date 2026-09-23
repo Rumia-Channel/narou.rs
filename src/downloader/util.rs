@@ -67,7 +67,7 @@ pub fn pretreatment_source(src: &mut String, _encoding: &str, setting: Option<&S
     if let Some(setting) = setting {
         if let Some(pipeline) = setting.preprocess_pipeline() {
             let jobs = preprocess::PreprocessJobs::new();
-            let run = preprocess::run_preprocess(pipeline, src, &jobs);
+            let run = preprocess::run_preprocess(pipeline, src, &jobs, "");
             if !run.requested.is_empty() {
                 tracing::warn!(
                     "preprocess for {} requested {} URL(s) that this path cannot fetch",
@@ -94,6 +94,7 @@ pub async fn pretreatment_source_with_jobs(
     _encoding: &str,
     setting: Option<&SiteSetting>,
     jobs: &mut preprocess::PreprocessJobs,
+    url: &str,
 ) -> Result<()> {
     src.retain(|c| c != '\r');
     decode_numeric_entities(src);
@@ -108,7 +109,7 @@ pub async fn pretreatment_source_with_jobs(
     let mut rounds = 0;
     loop {
         let mut working = original.clone();
-        let run = preprocess::run_preprocess(pipeline, &mut working, jobs);
+        let run = preprocess::run_preprocess(pipeline, &mut working, jobs, url);
         let pending: Vec<String> = run
             .requested
             .into_iter()

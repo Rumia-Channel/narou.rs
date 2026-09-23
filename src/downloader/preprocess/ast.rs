@@ -125,6 +125,7 @@ pub enum Method {
     Size,
     First,
     Last,
+    Reverse,
 }
 
 pub fn val_to_string(val: &Value) -> String {

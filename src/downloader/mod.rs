@@ -1155,9 +1155,11 @@ impl Downloader {
         let toc_url = if let Some(ref url) = db_toc_url {
             url.clone()
         } else if url_captures.is_empty() {
-            setting.interpolate(&setting.toc_url)
+            setting.toc_url()
         } else {
-            setting.interpolate_with_captures(&setting.toc_url, &url_captures)
+            let mut selects = url_captures.clone();
+            selects.insert("__target_url".to_string(), target.to_string());
+            setting.get_toc_url_with_captures(&selects)
         };
         let toc_url = Self::ageauth_redirect_target(&toc_url).unwrap_or(toc_url);
         // Login fallback: a novel already flagged as needing authentication
@@ -1255,6 +1257,7 @@ impl Downloader {
                             setting.encoding(),
                             Some(&setting),
                             &mut self.preprocess_jobs,
+                            &toc_url,
                         )
                         .await?;
                         if let Some(re) = setting.compiled_error_message_pattern()
@@ -3228,33 +3231,201 @@ is_narou: false
     }
 
     #[test]
-    fn pixiv_url_patterns_split_kind_prefix_and_numeric_work_id() {
+    fn pixiv_targets_resolve_to_their_own_api_endpoint() {
         let setting = pixiv_setting();
 
-        let series = setting
-            .extract_url_captures("https://www.pixiv.net/novel/series/16299140")
-            .expect("series URL should match");
-        assert_eq!(series.get("kind").map(String::as_str), Some("series/"));
-        assert_eq!(series.get("work_id").map(String::as_str), Some("16299140"));
+        for (target, expected) in [
+            (
+                "https://www.pixiv.net/novel/show.php?id=29204764",
+                "https://www.pixiv.net/ajax/novel/29204764",
+            ),
+            (
+                "https://www.pixiv.net/novel/series/16299140",
+                "https://www.pixiv.net/ajax/novel/series/16299140",
+            ),
+            (
+                "https://www.pixiv.net/artworks/143868144",
+                "https://www.pixiv.net/ajax/illust/143868144",
+            ),
+            (
+                "https://www.pixiv.net/user/855548/series/205917?p=1#seriesContents",
+                "https://www.pixiv.net/ajax/series/205917?p=1&lang=ja",
+            ),
+            // 保存済みレコードの toc_url (API 側) も同じ定義で解決できる。
+            (
+                "https://www.pixiv.net/ajax/illust/143868144",
+                "https://www.pixiv.net/ajax/illust/143868144",
+            ),
+            (
+                "https://www.pixiv.net/ajax/series/205917",
+                "https://www.pixiv.net/ajax/series/205917?p=1&lang=ja",
+            ),
+        ] {
+            assert_eq!(
+                setting.toc_url_with_url_captures(target).as_deref(),
+                Some(expected),
+                "target: {target}"
+            );
+        }
+    }
 
-        let novel = setting
-            .extract_url_captures("https://www.pixiv.net/novel/show.php?id=29204764")
-            .expect("novel URL should match");
-        assert_eq!(novel.get("kind").map(String::as_str), Some(""));
-        assert_eq!(novel.get("work_id").map(String::as_str), Some("29204764"));
+    #[test]
+    fn pixiv_artwork_emits_short_story_metadata_and_page_images() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "id":"143868144","illustType":1,"title":"アイドル一騎打ち","illustTitle":"アイドル一騎打ち",
+                "userName":"mini_La（ミニラ）","description":"漫画です","pageCount":2,
+                "createDate":"2026-04-22T13:02:00+00:00","uploadDate":"2026-04-22T13:02:00+00:00",
+                "seriesNavData":null,
+                "urls":{"original":"https://i.pximg.net/img/143868144_p0.png"},
+                "tags":{"tags":[{"tag":"漫画"}]}}}"#,
+        );
 
-        assert_eq!(
-            setting
-                .toc_url_with_url_captures("https://www.pixiv.net/novel/series/16299140")
-                .as_deref(),
-            Some("https://www.pixiv.net/ajax/novel/series/16299140")
+        assert!(html.contains("ncode::a143868144"), "got: {html}");
+        assert!(html.contains("title::アイドル一騎打ち"));
+        assert!(html.contains("author::mini_La（ミニラ）"));
+        assert!(html.contains("story::漫画です"));
+        assert!(html.contains("novel_type::短編"));
+        assert!(html.contains("tag::漫画"));
+        // ページ画像は追加 API の結果を待つので、未解決のうちは代表画像に落ちる
+        assert!(html.contains("<img src=\"https://i.pximg.net/img/143868144_p0.png\">"));
+    }
+
+    #[test]
+    fn pixiv_plain_illustration_is_treated_as_an_artwork() {
+        // illustType 0 (イラスト) でも作品として扱う。数値 0 は DSL では偽なので
+        // 判定は illustTitle の有無で行う。
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "id":"141939696","illustType":0,"title":"花火vs火花（仮）","illustTitle":"花火vs火花（仮）",
+                "userName":"猫目ミト","description":"","pageCount":1,
+                "createDate":"2026-03-01T00:00:00+00:00","uploadDate":"2026-03-01T00:00:00+00:00",
+                "seriesNavData":null,
+                "urls":{"original":"https://i.pximg.net/img/141939696_p0.jpg"},
+                "tags":{"tags":[{"tag":"イラスト"}]}}}"#,
         );
-        assert_eq!(
-            setting
-                .toc_url_with_url_captures("https://www.pixiv.net/novel/show.php?id=29204764")
-                .as_deref(),
-            Some("https://www.pixiv.net/ajax/novel/29204764")
+
+        assert!(html.contains("ncode::a141939696"), "got: {html}");
+        assert!(html.contains("novel_type::短編"));
+        assert!(html.contains("<img src=\"https://i.pximg.net/img/141939696_p0.jpg\">"));
+        assert!(
+            !html.contains("login_required::1"),
+            "an illustration must not be read as a login wall: {html}"
         );
+    }
+
+    #[test]
+    fn pixiv_artwork_pages_resolve_into_image_tags() {
+        let setting = pixiv_setting();
+        let http = MockHttpClient::new();
+        http.add_text(
+            "https://www.pixiv.net/ajax/illust/143868144/pages",
+            200,
+            r#"{"error":false,"body":[{"urls":{"original":"https://i.pximg.net/img/143868144_p0.png"}},{"urls":{"original":"https://i.pximg.net/img/143868144_p1.png"}}]}"#,
+        );
+        let mut jobs = super::preprocess::PreprocessJobs::new();
+        let mut source = r#"{"error":false,"message":"","body":{
+            "id":"143868144","illustType":1,"title":"アイドル一騎打ち","illustTitle":"アイドル一騎打ち",
+            "userName":"mini_La（ミニラ）","description":"漫画です","pageCount":2,
+            "createDate":"2026-04-22T13:02:00+00:00","uploadDate":"2026-04-22T13:02:00+00:00",
+            "seriesNavData":null,
+            "urls":{"original":"https://i.pximg.net/img/143868144_p0.png"},
+            "tags":{"tags":[{"tag":"漫画"}]}}}"#
+            .to_string();
+
+        futures::executor::block_on(super::util::pretreatment_source_with_jobs(
+            &http,
+            &FakeRateLimiter::new(),
+            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+            &mut source,
+            "UTF-8",
+            Some(setting),
+            &mut jobs,
+            "https://www.pixiv.net/ajax/illust/143868144",
+        ))
+        .unwrap();
+
+        let body = setting_body(&source);
+        assert_eq!(
+            body,
+            "<img src=\"https://i.pximg.net/img/143868144_p0.png\"><br><img src=\"https://i.pximg.net/img/143868144_p1.png\">"
+        );
+    }
+
+    #[test]
+    fn pixiv_manga_series_emits_ascending_episodes_and_pages_on() {
+        let setting = pixiv_setting();
+        let http = MockHttpClient::new();
+        for (id, title) in [("139115096", "第19話"), ("139115097", "第20話")] {
+            http.add_text(
+                &format!("https://www.pixiv.net/ajax/illust/{id}"),
+                200,
+                &format!(
+                    r#"{{"error":false,"body":{{"id":"{id}","title":"{title}","userName":"作者名","uploadDate":"2026-01-02T03:04:05+09:00"}}}}"#
+                ),
+            );
+        }
+        let mut jobs = super::preprocess::PreprocessJobs::new();
+        // API は order の降順で返す。
+        let mut source = r#"{"error":false,"message":"","body":{
+            "illustSeries":[{"id":"205917","title":"靈夢と訓練する","description":"シリーズの説明",
+                             "total":21,"createDate":"2025-01-01T00:00:00+09:00","updateDate":"2026-01-02T00:00:00+09:00"}],
+            "page":{"seriesId":"205917","total":3,
+                    "series":[{"workId":"139115097","order":20},{"workId":"139115096","order":19}]}}}"#
+            .to_string();
+
+        futures::executor::block_on(super::util::pretreatment_source_with_jobs(
+            &http,
+            &FakeRateLimiter::new(),
+            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+            &mut source,
+            "UTF-8",
+            Some(setting),
+            &mut jobs,
+            "https://www.pixiv.net/ajax/series/205917?p=1&lang=ja",
+        ))
+        .unwrap();
+
+        assert!(source.contains("ncode::c205917"), "got: {source}");
+        assert!(source.contains("title::靈夢と訓練する"));
+        assert!(source.contains("story::シリーズの説明"));
+        assert!(source.contains("novel_type::連載中"));
+        // 公開話数はシリーズ情報の total
+        assert!(source.contains("general_all_no::21"));
+        // 作者は各話ページから拾う
+        assert!(source.contains("author::作者名"), "got: {source}");
+        // 目次は order の昇順で出る
+        let first = source.find("Episode;19;https://www.pixiv.net/ajax/illust/139115096")
+            .expect("order 19 entry");
+        let second = source.find("Episode;20;https://www.pixiv.net/ajax/illust/139115097")
+            .expect("order 20 entry");
+        assert!(first < second, "episodes must be ascending: {source}");
+        assert!(source.contains(";第19話"), "titles come from each work: {source}");
+        // order 1 に到達していないので次ページを要求する
+        assert!(
+            source.contains("next::/ajax/series/205917?p=2&lang=ja"),
+            "got: {source}"
+        );
+
+        let mut url_captures = HashMap::new();
+        url_captures.insert("series_id".to_string(), "205917".to_string());
+        let subtitles = super::toc::parse_subtitles(setting, &source, &url_captures).unwrap();
+        assert_eq!(subtitles.len(), 2);
+        assert_eq!(subtitles[0].index, "19");
+        assert_eq!(subtitles[0].subtitle, "第19話");
+        assert_eq!(subtitles[1].index, "20");
+    }
+
+    #[test]
+    fn pixiv_manga_series_stops_paging_at_order_one() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "illustSeries":[{"id":"311834","title":"もここのグルメ","description":"説明","total":5,
+                                 "createDate":"2025-11-18T11:48:54+09:00","updateDate":"2025-12-11T07:54:14+09:00"}],
+                "page":{"seriesId":"311834","total":1,"series":[{"workId":"138467437","order":1}]}}}"#,
+        );
+        assert!(html.contains("ncode::c311834"));
+        assert!(!html.contains("next::"), "got: {html}");
     }
 
     #[test]
@@ -3467,6 +3638,7 @@ is_narou: false
             "UTF-8",
             Some(setting),
             &mut jobs,
+            "https://www.pixiv.net/ajax/novel/29204764",
         ))
         .unwrap();
 
@@ -3510,6 +3682,7 @@ is_narou: false
             "UTF-8",
             Some(setting),
             &mut jobs,
+            "https://www.pixiv.net/ajax/novel/29204764",
         ))
         .unwrap();
 

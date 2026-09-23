@@ -62,7 +62,7 @@ pub struct SiteSetting {
     pub append_title_to_folder_name: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_strip_pattern: Option<String>,
-    pub toc_url: String,
+    pub toc_url: SiteUrlTemplate,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitles: Option<SiteSettingValue>,
 
@@ -154,6 +154,44 @@ pub struct SiteSetting {
     pub(super) compiled_next_toc: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_toc_page_max: Option<Regex>,
+}
+
+/// A URL template that may depend on the shape of the target URL.
+///
+/// Sites that expose several kinds of target under one domain (Pixiv has
+/// novels, novel series, artworks and manga series) need a different API URL
+/// for each. The list form picks the first entry whose `match` regex applies
+/// to the target URL; the plain string form is the single-template case.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SiteUrlTemplate {
+    Single(String),
+    ByTarget { by_target: Vec<SiteUrlTemplateEntry> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteUrlTemplateEntry {
+    #[serde(rename = "match")]
+    pub pattern: String,
+    pub url: String,
+}
+
+impl SiteUrlTemplate {
+    fn selected(&self, target_url: Option<&str>) -> Option<&str> {
+        match self {
+            SiteUrlTemplate::Single(url) => Some(url.as_str()),
+            SiteUrlTemplate::ByTarget { by_target } => by_target
+                .iter()
+                .find(|entry| {
+                    target_url.is_some_and(|target| {
+                        Regex::new(&entry.pattern)
+                            .map(|re| re.is_match(target))
+                            .unwrap_or(false)
+                    })
+                })
+                .map(|entry| entry.url.as_str()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,7 +395,20 @@ impl SiteSetting {
     }
 
     pub fn toc_url(&self) -> String {
-        self.interpolate(&self.toc_url)
+        match self.toc_url.selected(None) {
+            Some(template) => self.interpolate(template),
+            None => String::new(),
+        }
+    }
+
+    /// Resolve `toc_url` for a concrete target URL, so definitions with several
+    /// target shapes pick the right API endpoint. The selected template is also
+    /// exposed as `\k<toc_url>` so `novel_info_url: \k<toc_url>` keeps working.
+    pub fn toc_url_with_url_captures(&self, url: &str) -> Option<String> {
+        let mut captures = self.extract_url_captures(url)?;
+        let template = self.toc_url.selected(Some(url))?.to_string();
+        captures.insert("toc_url".to_string(), template.clone());
+        Some(self.interpolate_with_captures(&template, &captures))
     }
 
     pub fn extract_url_captures(&self, url: &str) -> Option<HashMap<String, String>> {
@@ -366,11 +417,6 @@ impl SiteSetting {
 
     pub fn extract_series_url_captures(&self, url: &str) -> Option<HashMap<String, String>> {
         extract_captures_from_patterns(&self.compiled_series_url, url)
-    }
-
-    pub fn toc_url_with_url_captures(&self, url: &str) -> Option<String> {
-        let captures = self.extract_url_captures(url)?;
-        Some(self.interpolate_with_captures(&self.toc_url, &captures))
     }
 
     pub fn compile_series_item_pattern(&self) -> Option<Regex> {
@@ -407,16 +453,30 @@ impl SiteSetting {
                 captures.insert(name.to_string(), m.as_str().to_string());
             }
         }
-        (!captures.is_empty()).then(|| self.interpolate_with_captures(&self.toc_url, &captures))
+        (!captures.is_empty()).then(|| {
+            let template = self.toc_url.selected(None).unwrap_or_default();
+            self.interpolate_with_captures(template, &captures)
+        })
     }
 
+    /// Resolve `novel_info_url`. `\k<toc_url>` inside it means "the same page as
+    /// the table of contents", so the template for the current target is
+    /// substituted first — a definition with several target shapes must not
+    /// resolve it to another shape's endpoint.
     pub fn novel_info_url_with_captures(
         &self,
         url_captures: &HashMap<String, String>,
     ) -> Option<String> {
+        let mut captures = url_captures.clone();
+        if let Some(template) = self
+            .toc_url
+            .selected(captures.get("__target_url").map(String::as_str))
+        {
+            captures.insert("toc_url".to_string(), template.to_string());
+        }
         self.novel_info_url
             .as_ref()
-            .map(|u| self.interpolate_with_captures(u, url_captures))
+            .map(|u| self.interpolate_with_captures(u, &captures))
     }
 
     pub fn top_url(&self) -> String {
@@ -512,7 +572,11 @@ impl SiteSetting {
     }
 
     pub fn get_toc_url_with_captures(&self, captures: &HashMap<String, String>) -> String {
-        self.interpolate_with_captures(&self.toc_url, captures)
+        let target = captures.get("__target_url").map(String::as_str);
+        match self.toc_url.selected(target) {
+            Some(template) => self.interpolate_with_captures(template, captures),
+            None => String::new(),
+        }
     }
 
     pub fn get_next_url_with_captures(

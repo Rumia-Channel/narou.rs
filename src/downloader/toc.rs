@@ -38,6 +38,7 @@ pub async fn fetch_toc(
         setting.encoding(),
         Some(setting),
         jobs,
+        toc_url,
     )
     .await?;
 

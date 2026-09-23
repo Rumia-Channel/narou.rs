@@ -60,8 +60,10 @@ impl NovelInfo {
         let Some(novel_info_url) = &setting.novel_info_url else {
             return Ok(Self::from_toc_source(setting, toc_source));
         };
+        let mut captures = url_captures.clone();
+        captures.insert("__target_url".to_string(), toc_url.to_string());
         let resolved_url = setting
-            .novel_info_url_with_captures(url_captures)
+            .novel_info_url_with_captures(&captures)
             .unwrap_or_else(|| setting.interpolate(novel_info_url));
         if resolved_url == toc_url {
             // The TOC fetch already ran `pretreatment_source`; parsing it with
@@ -88,6 +90,7 @@ impl NovelInfo {
                     setting.encoding(),
                     Some(setting),
                     jobs,
+                    &resolved_url,
                 )
                 .await?;
                 Ok(Self::from_novel_info_source(setting, &body))

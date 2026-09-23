@@ -411,6 +411,7 @@ fn build_method(pair: pest::iterators::Pair<Rule>) -> Method {
         ".size" => Method::Size,
         ".first" => Method::First,
         ".last" => Method::Last,
+        ".reverse" => Method::Reverse,
         _ => unreachable!("unexpected method: {s}"),
     }
 }

@@ -24,12 +24,15 @@ struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    fn new(jobs: &'a PreprocessJobs) -> Self {
+    fn new(jobs: &'a PreprocessJobs, url: &str) -> Self {
         let mut vars = HashMap::new();
         vars.insert(
             "fetched".to_string(),
             Value::Object(jobs.results().iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
         );
+        // The URL this body came from, so definitions can derive follow-up
+        // URLs (Pixiv pages its manga series listings).
+        vars.insert("url".to_string(), Value::String(url.to_string()));
         Self {
             vars,
             output: Vec::new(),
@@ -438,6 +441,10 @@ fn eval_method(ctx: &mut Ctx, val: Value, method: &Method) -> PreprocessResult<V
             Some(arr) => arr.last().cloned().unwrap_or(Value::Null),
             None => val,
         },
+        Method::Reverse => match val.as_array() {
+            Some(arr) => Value::Array(arr.iter().rev().cloned().collect()),
+            None => val,
+        },
     };
     validate_value_limits(&value)?;
     Ok(value)
@@ -553,8 +560,9 @@ pub(super) fn run_stmts(
     stmts: &[Stmt],
     source: &mut String,
     jobs: &PreprocessJobs,
+    url: &str,
 ) -> super::PreprocessRun {
-    match run_stmts_checked(stmts, source, jobs) {
+    match run_stmts_checked(stmts, source, jobs, url) {
         Ok(run) => run,
         Err(err) => panic!("{err}"),
     }
@@ -564,8 +572,9 @@ fn run_stmts_checked(
     stmts: &[Stmt],
     source: &mut String,
     jobs: &PreprocessJobs,
+    url: &str,
 ) -> PreprocessResult<super::PreprocessRun> {
-    let mut ctx = Ctx::new(jobs);
+    let mut ctx = Ctx::new(jobs, url);
     eval_stmts(&mut ctx, stmts, source)?;
     Ok(super::PreprocessRun {
         requested: ctx.requested,
@@ -639,7 +648,7 @@ mod tests {
     use super::*;
 
     fn run(stmts: &[Stmt], source: &mut String) -> Result<(), String> {
-        run_stmts_checked(stmts, source, &PreprocessJobs::new()).map(|_| ())
+        run_stmts_checked(stmts, source, &PreprocessJobs::new(), "").map(|_| ())
     }
 
     /// Compile DSL source, run it over `source`, and return the result.
@@ -647,7 +656,7 @@ mod tests {
         let stmts = crate::downloader::preprocess::parser::parse_preprocess(program)
             .unwrap_or_else(|err| panic!("should parse: {err}\n{program}"));
         let mut text = source.to_string();
-        run_stmts_checked(&stmts, &mut text, &PreprocessJobs::new())
+        run_stmts_checked(&stmts, &mut text, &PreprocessJobs::new(), "")
             .unwrap_or_else(|err| panic!("{program}: {err}"));
         text
     }
@@ -769,7 +778,7 @@ mod tests {
                        insert_at_match\n";
         let stmts = crate::downloader::preprocess::parser::parse_preprocess(program).unwrap();
         let mut source = String::new();
-        let run = run_stmts_checked(&stmts, &mut source, &jobs).unwrap();
+        let run = run_stmts_checked(&stmts, &mut source, &jobs, "").unwrap();
         assert_eq!(run.requested, vec!["https://example.com/illust/11"]);
         assert_eq!(source, "url=");
 
@@ -780,7 +789,7 @@ mod tests {
             serde_json::json!({"body": [{"urls": {"original": "https://i.example/11.jpg"}}]}),
         );
         let mut source = String::new();
-        let run = run_stmts_checked(&stmts, &mut source, &settled).unwrap();
+        let run = run_stmts_checked(&stmts, &mut source, &settled, "").unwrap();
         assert!(run.requested.is_empty(), "settled jobs are not re-requested");
         assert_eq!(source, "url=https://i.example/11.jpg");
     }
@@ -795,7 +804,7 @@ mod tests {
         )
         .unwrap();
         let mut source = String::new();
-        let run = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new()).unwrap();
+        let run = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap();
         assert!(run.requested.is_empty(), "{:?}", run.requested);
     }
 
@@ -1265,7 +1274,7 @@ mod tests {
             (PREPROCESS_STEP_BUDGET / 2) + 1
         ];
         let mut source = String::new();
-        let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new()).unwrap_err();
+        let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
         assert_eq!(err, "preprocess: step budget exceeded");
     }
 
@@ -1280,7 +1289,7 @@ mod tests {
             methods: vec![Method::Join(vec![StrPart::Lit(String::new())])],
         })];
         let mut source = String::new();
-        let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new()).unwrap_err();
+        let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
         assert_eq!(
             err,
             format!(
@@ -1296,7 +1305,7 @@ mod tests {
             expr: Expr::Array(vec![Expr::Null; PREPROCESS_MAX_ARRAY_ITEMS + 1]),
         }];
         let mut source = String::new();
-        let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new()).unwrap_err();
+        let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
         assert_eq!(
             err,
             format!(
