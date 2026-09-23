@@ -130,13 +130,20 @@ preprocess: |-
         # 小説シリーズの目次ページ。thumbnails.novel は page.seriesContents と
         # 同じ順序で話数 (seriesContentOrder) と掲載日を持つため、こちらを使う。
         let entries = body.thumbnails.novel
+        # 匿名でも page.seriesContents には全話の id と話数が入っており、
+        # 中身を伏せられている話だけ viewableType が 0 以外になる。これが
+        # 「空のデータ + 実データ」の実データ側なので、欠けの判定に使う。
+        let contents = body.page.seriesContents
+        for entry in contents
+          if entry.series && entry.series.viewableType != 0
+            emit "login_partial::1"
+          end
+        end
+        # viewableType が無い応答向けの保険 (0 件 / 1 話目から始まらない)。
         let asked_last_order = url.gsub(/^.*[?&]last_order=(\d+).*$/, "$1")
         if entries.size == 0
-          # 未ログイン (またはマイピク限定) だと全話が伏せられて 0 件になる。
           emit "login_partial::1"
         else
-          # 1 ページ目は 1 話目から始まる。そうでなければ未ログインで R-18
-          # などが落ちている (匿名で 7, 13 話だけ見える、のような形)。
           if asked_last_order == "0" && entries.first.seriesContentOrder != 1
             emit "login_partial::1"
           end

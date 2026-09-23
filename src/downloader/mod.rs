@@ -2664,6 +2664,9 @@ mod tests {
 
     #[test]
     fn repository_injection_resolves_existing_ncode_without_database_global() {
+        // `with_platform` loads サイト定義 from the working directory, so this
+        // test must not overlap another one that changes it.
+        let _state = crate::test_support::global_state_guard();
         let mut record = sample_record(chrono::Utc::now());
         record.id = 42;
         record.toc_url = "https://ncode.syosetu.com/n1234ab/".to_string();
