@@ -23,6 +23,7 @@ native-runtime = [
     "dep:curl",
     "dep:indicatif",
     "dep:zip",
+    "dep:image",
     "dep:lettre",
     "dep:unicode-normalization",
     "dep:similar",
@@ -48,6 +49,7 @@ native-runtime = [
 # see assets/aozora_lite/LICENSE.md. The Worker runtime enables it always.
 lite = ["dep:aozora_epub3_lite"]
 worker-runtime = ["lite"]
+image = ["dep:image"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -99,6 +101,7 @@ crc32fast = "1.5"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
 chacha20poly1305 = { version = "0.11", optional = true }
 argon2 = { version = "0.6", optional = true }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"], optional = true }
 
 [build-dependencies]
 base64 = "0.22"

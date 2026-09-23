@@ -83,6 +83,15 @@ preprocess: |-
       # 本文はページ画像そのものなので、挿絵タグを並べる (narou がローカライズする)。
       let art_pages = fetch_json("https://www.pixiv.net/ajax/illust/${body.id}/pages")
       let art_text = art_pages.body.map { |page| "<img src=\"${page.urls.original}\">" }.join("<br>")
+      if body.illustType == 2
+        # うごイラ。フレームは zip で配られるので、各フレームの表示時間を URL に
+        # 載せて渡し、narou 側が APNG に組み立てる (組み立てられなければ先頭フレーム)。
+        let ugoira = fetch_json("https://www.pixiv.net/ajax/illust/${body.id}/ugoira_meta?lang=ja")
+        let ugoira_delays = ugoira.body.frames.map { |frame| frame.delay }.join(",")
+        if ugoira_delays != ""
+          let art_text = "<img src=\"${ugoira.body.originalSrc}?ugoira=${ugoira_delays}\">"
+        end
+      end
       if body.seriesNavData
         # シリーズの 1 話。作品情報はシリーズの目次ページが持つので前書きだけ出す。
         emit "introduction::"

@@ -745,7 +745,20 @@ impl NovelConverter {
             capabilities.fetch_policy.clone(),
             url.clone(),
         ) {
-            Ok((bytes, content_type)) => (bytes, content_type),
+            Ok((bytes, content_type)) => {
+                // Animated works arrive as a frame archive; the site
+                // definition declares the frame timings on the URL.
+                match crate::illustration_animation::assemble_animation(&url, &bytes) {
+                    Some(Ok(apng)) => (apng, "image/png".to_string()),
+                    Some(Err(err)) => {
+                        self.inspector.borrow_mut().error(format!(
+                            "Illustration#assemble_animation: {url} の組み立てに失敗しました({err})"
+                        ));
+                        (bytes, content_type)
+                    }
+                    None => (bytes, content_type),
+                }
+            }
             Err(err) => {
                 self.inspector.borrow_mut().error(format!(
                     "Illustration#download_image: {} を処理中に例外が発生しました({})",

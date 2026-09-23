@@ -1003,6 +1003,22 @@ impl Downloader {
                     Ok(response) => {
                         let content_type =
                             response.header("Content-Type").unwrap_or("").to_string();
+                        // Animated works arrive as a frame archive; the site
+                        // definition declares the frame timings on the URL.
+                        let (body, content_type) =
+                            match crate::illustration_animation::assemble_animation(
+                                url,
+                                &response.body,
+                            ) {
+                                Some(Ok(apng)) => (apng, "image/png".to_string()),
+                                Some(Err(err)) => {
+                                    report_warn(&format!(
+                                        "WARN: failed to assemble animation {url}: {err}"
+                                    ));
+                                    (response.body.clone(), content_type)
+                                }
+                                None => (response.body.clone(), content_type),
+                            };
                         let ext =
                             crate::illustration_store::illustration_extension_from_content_type(
                                 &content_type,
@@ -1011,7 +1027,7 @@ impl Downloader {
                                 crate::illustration_store::guessed_extension_from_url(url)
                             });
                         if let Err(err) = storage
-                            .store_bytes(object_keys, illustration_store, url, &response.body, ext)
+                            .store_bytes(object_keys, illustration_store, url, &body, ext)
                             .await
                         {
                             report_warn(&format!(
@@ -3289,6 +3305,57 @@ is_narou: false
         assert!(html.contains("tag::漫画"));
         // ページ画像は追加 API の結果を待つので、未解決のうちは代表画像に落ちる
         assert!(html.contains("<img src=\"https://i.pximg.net/img/143868144_p0.png\">"));
+    }
+
+    #[test]
+    fn pixiv_ugoira_emits_the_frame_archive_with_its_delays() {
+        // うごイラは静止画ではなくフレーム集約 zip と表示時間を渡す。
+        let setting = pixiv_setting();
+        let http = MockHttpClient::new();
+        http.add_text(
+            "https://www.pixiv.net/ajax/illust/69642452/ugoira_meta?lang=ja",
+            200,
+            r#"{"error":false,"body":{"originalSrc":"https://i.pximg.net/img-zip-ugoira/img/x/69642452_ugoira1920x1080.zip","frames":[{"file":"000000.jpg","delay":120},{"file":"000001.jpg","delay":80}]}}"#,
+        );
+        http.add_text(
+            "https://www.pixiv.net/ajax/illust/69642452/pages",
+            200,
+            r#"{"error":false,"body":[{"urls":{"original":"https://i.pximg.net/img-original/img/x/69642452_ugoira0.png"}}]}"#,
+        );
+        let mut jobs = super::preprocess::PreprocessJobs::new();
+        let mut source = r#"{"error":false,"message":"","body":{
+            "id":"69642452","illustType":2,"title":"うごイラ作品","illustTitle":"うごイラ作品",
+            "userName":"hamati","description":"","pageCount":1,
+            "createDate":"2018-07-11T10:47:00+00:00","uploadDate":"2018-07-11T10:47:00+00:00",
+            "seriesNavData":null,
+            "urls":{"original":null},
+            "tags":{"tags":[{"tag":"うごイラ"}]}}}"#
+            .to_string();
+
+        futures::executor::block_on(super::util::pretreatment_source_with_jobs(
+            &http,
+            &FakeRateLimiter::new(),
+            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+            &mut source,
+            "UTF-8",
+            Some(setting),
+            &mut jobs,
+            "https://www.pixiv.net/ajax/illust/69642452",
+        ))
+        .unwrap();
+
+        let body = setting_body(&source);
+        assert_eq!(
+            body,
+            "<img src=\"https://i.pximg.net/img-zip-ugoira/img/x/69642452_ugoira1920x1080.zip?ugoira=120,80\">",
+            "ugoira should pass the archive and its frame delays"
+        );
+        assert_eq!(
+            crate::illustration_animation::frame_delays(
+                "https://i.pximg.net/x.zip?ugoira=120,80"
+            ),
+            Some(vec![120, 80])
+        );
     }
 
     #[test]
