@@ -378,26 +378,25 @@ mod tests {
             "alpha (same host) should wait at least ~120ms, got {:?}",
             alpha_waited
         );
-        // Different-host (beta/gamma) workers must proceed without
-        // waiting on alpha's slot. Even on a heavily loaded CI box a
-        // sub-80ms gate is comfortably wide enough.
+        // Different-host (beta/gamma) workers must proceed without waiting on
+        // alpha's slot. Compare against alpha's own wait instead of absolute
+        // milliseconds: both are measured in this run, so a loaded machine
+        // inflates them together and the discrimination survives.
         assert!(
-            beta_waited < Duration::from_millis(80),
-            "beta (different host) blocked unexpectedly: {:?}",
-            beta_waited
+            beta_waited * 2 < alpha_waited,
+            "beta (different host) blocked unexpectedly: beta={beta_waited:?} alpha={alpha_waited:?}"
         );
         assert!(
-            gamma_waited < Duration::from_millis(80),
-            "gamma (different host) blocked unexpectedly: {:?}",
-            gamma_waited
+            gamma_waited * 2 < alpha_waited,
+            "gamma (different host) blocked unexpectedly: gamma={gamma_waited:?} alpha={alpha_waited:?}"
         );
 
-        // Total runtime should be dominated by alpha's queued wait,
-        // not by stacking all the cross-domain traffic behind it.
+        // Total runtime should be dominated by alpha's queued wait, not by
+        // stacking all the cross-domain traffic behind it.
         let total = started.elapsed();
         assert!(
-            total < Duration::from_millis(400),
-            "overall took too long: {total:?}"
+            total < alpha_waited * 3,
+            "overall took too long: total={total:?} alpha={alpha_waited:?}"
         );
         reset_state();
     }

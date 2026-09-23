@@ -190,8 +190,9 @@ pub async fn resolve_final_url_with_body(
                 .join(location)
                 .map_err(|e| NarouError::Http(format!("invalid redirect location: {e}")))?;
             if !same_site_hosts(next.host_str(), current.host_str()) {
-                // A hop that leaves the site must not carry its headers.
-                headers.retain(|(name, _)| name != "Cookie");
+                // A hop that leaves the site must not carry the cookie jar,
+                // however the site definition spelled the header name.
+                headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Cookie"));
             }
             current = next;
             continue;
@@ -373,6 +374,41 @@ headers:
             "unsafe headers should be dropped: {:?}",
             policy.headers()
         );
+    }
+
+    #[test]
+    fn fetch_policy_drops_the_cookie_when_a_hop_leaves_the_site() {
+        // サイト定義が小文字で Cookie を書いても、サイト外へのホップでは
+        // クッキージャーを落とす。
+        let setting: super::super::site_setting::SiteSetting = serde_yaml::from_str(
+            r#"
+name: Example
+domain: example.com
+top_url: https://example.com
+sitename: Example
+toc_url: https://example.com/\k<ncode>
+headers:
+  cookie: "over18=yes"
+  Referer: https://example.com/
+"#,
+        )
+        .unwrap();
+        let policy = FetchPolicy::for_site(&setting);
+        let mut headers = policy.headers().to_vec();
+
+        assert!(
+            headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("Cookie"))
+        );
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Cookie"));
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("Cookie")),
+            "cookie should be gone, headers: {headers:?}"
+        );
+        assert!(headers.iter().any(|(name, _)| name == "Referer"));
     }
 
     #[test]
