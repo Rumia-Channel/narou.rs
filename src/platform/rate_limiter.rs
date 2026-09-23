@@ -19,6 +19,11 @@ pub struct RateLimitScope {
     /// 10). The native limiter applies `normalize_wait_steps(.., true)` for
     /// these scopes; other scopes use the configured wait-steps as-is.
     pub narou: bool,
+    /// Minimum spacing for this site, from the definition's `min_interval`
+    /// (seconds). Sites that answer a burst with 429 (Pixiv) declare a floor
+    /// here instead of slowing every other site down. `None` keeps the global
+    /// `download.interval`.
+    pub min_interval: Option<std::time::Duration>,
 }
 
 impl RateLimitScope {
@@ -26,6 +31,7 @@ impl RateLimitScope {
         Self {
             site: site.into(),
             narou: false,
+            min_interval: None,
         }
     }
 
@@ -33,7 +39,17 @@ impl RateLimitScope {
         Self {
             site: site.into(),
             narou: true,
+            min_interval: None,
         }
+    }
+
+    /// Apply a site definition's `min_interval`, ignoring absent or
+    /// non-positive values.
+    pub fn with_min_interval(mut self, seconds: Option<f64>) -> Self {
+        self.min_interval = seconds
+            .filter(|seconds| *seconds > 0.0)
+            .map(std::time::Duration::from_secs_f64);
+        self
     }
 }
 
@@ -81,6 +97,17 @@ pub fn normalize_site_key(site: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_carries_a_site_interval() {
+        let scope = RateLimitScope::site("www.pixiv.net").with_min_interval(Some(5.0));
+        assert_eq!(scope.min_interval, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(RateLimitScope::site("x").min_interval, None);
+        // 0 や負値、未指定は「指定なし」として扱う。
+        assert_eq!(RateLimitScope::site("x").with_min_interval(Some(0.0)).min_interval, None);
+        assert_eq!(RateLimitScope::site("x").with_min_interval(Some(-1.0)).min_interval, None);
+        assert_eq!(RateLimitScope::site("x").with_min_interval(None).min_interval, None);
+    }
 
     #[test]
     fn scope_display_and_equality() {

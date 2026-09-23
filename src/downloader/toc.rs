@@ -359,6 +359,10 @@ mod tests {
             .find(|s| s.domain == "www.pixiv.net")
             .unwrap();
         assert!(setting.is_partial_login_view("login_partial::1"));
+        // 429 を避けるための間隔の下限 (サイト定義由来)。
+        assert_eq!(setting.min_interval, Some(5.0));
+        let scope = crate::downloader::http_policy::FetchPolicy::for_site(setting);
+        assert_eq!(scope.min_interval(), Some(5.0));
 
         let first_page = "Episode;1;https://www.pixiv.net/ajax/novel/1;2020-01-01T00:00:00+00:00;一話\n\
              next::/ajax/novel/series_content/1?limit=30&last_order=1&order_by=asc\n";

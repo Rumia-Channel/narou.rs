@@ -76,7 +76,7 @@ impl RateLimiter {
     }
 
     fn reserve_wait_duration(&self, host: &str) -> Duration {
-        self.reserve_wait_duration_with_steps(host, self.wait_steps)
+        self.reserve_wait_duration_with_steps(host, self.wait_steps, self.interval)
     }
 }
 
@@ -106,10 +106,20 @@ impl RateLimiter {
         } else {
             self.wait_steps
         };
-        self.reserve_wait_duration_with_steps(&scope.site, wait_steps)
+        // サイト定義が下限を宣言していれば、全体設定より優先する。
+        let interval = match scope.min_interval {
+            Some(min_interval) => self.interval.max(min_interval),
+            None => self.interval,
+        };
+        self.reserve_wait_duration_with_steps(&scope.site, wait_steps, interval)
     }
 
-    fn reserve_wait_duration_with_steps(&self, host: &str, wait_steps: u32) -> Duration {
+    fn reserve_wait_duration_with_steps(
+        &self,
+        host: &str,
+        wait_steps: u32,
+        interval: Duration,
+    ) -> Duration {
         let now = Instant::now();
         let mut state = STATE.lock();
         let host_state = state.hosts.entry(host.to_string()).or_default();
@@ -136,17 +146,18 @@ impl RateLimiter {
 
         host_state.counter += 1;
         host_state.last_download = Some(allowed_at);
-        host_state.next_allowed =
-            Some(allowed_at + self.delay_after_request(host_state.counter, wait_steps));
+        host_state.next_allowed = Some(
+            allowed_at + self.delay_after_request(host_state.counter, wait_steps, interval),
+        );
 
         allowed_at.checked_duration_since(now).unwrap_or_default()
     }
 
-    fn delay_after_request(&self, counter: u32, wait_steps: u32) -> Duration {
+    fn delay_after_request(&self, counter: u32, wait_steps: u32, interval: Duration) -> Duration {
         if wait_steps > 0 && counter % wait_steps == 0 && counter >= wait_steps {
-            self.max_steps_wait_time
+            self.max_steps_wait_time.max(interval)
         } else if counter > 0 {
-            self.interval
+            interval
         } else {
             Duration::ZERO
         }
@@ -209,6 +220,29 @@ mod tests {
 
     fn reset_state() {
         STATE.lock().hosts.clear();
+    }
+
+    #[test]
+    fn site_interval_floor_applies_to_the_scope_only() {
+        let _guard = TEST_MUTEX.lock();
+        reset_state();
+        let limiter = RateLimiter::from_values(0.7, 0);
+        let pixiv = crate::platform::RateLimitScope::site("interval-floor.example")
+            .with_min_interval(Some(5.0));
+        let other = crate::platform::RateLimitScope::site("interval-floor-other.example");
+
+        // 1 回目は待たない。2 回目はサイト定義の下限まで待つ。
+        assert!(limiter.reserve_wait_duration_for_scope(&pixiv).is_zero());
+        let second = limiter.reserve_wait_duration_for_scope(&pixiv);
+        // 予約から測定までのわずかな差を見込んで少し緩める。
+        assert!(second >= Duration::from_millis(4950), "got {second:?}");
+        assert!(second < Duration::from_secs(6), "got {second:?}");
+
+        // 下限を宣言していないサイトは従来どおり全体設定の間隔。
+        assert!(limiter.reserve_wait_duration_for_scope(&other).is_zero());
+        let second = limiter.reserve_wait_duration_for_scope(&other);
+        assert!(second >= Duration::from_millis(600), "got {second:?}");
+        assert!(second < Duration::from_secs(1), "got {second:?}");
     }
 
     #[test]

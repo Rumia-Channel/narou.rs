@@ -28,6 +28,8 @@ use super::security::{MAX_REDIRECTS, is_safe_header_value, validate_public_url};
 pub struct FetchPolicy {
     headers: Vec<(String, String)>,
     narou: bool,
+    /// Site definition's `min_interval`, applied to the rate-limit scope.
+    min_interval: Option<f64>,
 }
 
 impl FetchPolicy {
@@ -43,6 +45,7 @@ impl FetchPolicy {
         Self {
             headers,
             narou: setting.is_narou,
+            min_interval: setting.min_interval,
         }
     }
 
@@ -56,6 +59,11 @@ impl FetchPolicy {
 
     pub fn headers(&self) -> &[(String, String)] {
         &self.headers
+    }
+
+    /// The site definition's `min_interval`, when it declares one.
+    pub fn min_interval(&self) -> Option<f64> {
+        self.min_interval
     }
 
     pub fn narou(&self) -> bool {
@@ -210,7 +218,7 @@ pub async fn resolve_final_url_with_body(
     for hop in 0..=MAX_REDIRECTS {
         validate_public_url(current.as_str()).map_err(|e| NarouError::Http(e.to_string()))?;
         rate_limiter
-            .acquire(&scope_for(host_of(current.as_str()), policy.narou()))
+            .acquire(&scope_for(host_of(current.as_str()), policy))
             .await?;
 
         let mut request = HttpRequest::get(current.as_str()).with_redirect(RedirectMode::Manual);
@@ -267,7 +275,7 @@ pub async fn fetch_bytes(
 ) -> Result<HttpResponse> {
     validate_public_url(url).map_err(|e| NarouError::Http(e.to_string()))?;
     rate_limiter
-        .acquire(&scope_for(host_of(url), policy.narou()))
+        .acquire(&scope_for(host_of(url), policy))
         .await?;
 
     let mut request = HttpRequest::get(url);
@@ -279,12 +287,13 @@ pub async fn fetch_bytes(
     ensure_success_response(url, response)
 }
 
-fn scope_for(host: String, narou: bool) -> RateLimitScope {
-    if narou {
+fn scope_for(host: String, policy: &FetchPolicy) -> RateLimitScope {
+    let scope = if policy.narou {
         RateLimitScope::narou(host)
     } else {
         RateLimitScope::site(host)
-    }
+    };
+    scope.with_min_interval(policy.min_interval)
 }
 
 pub(crate) fn host_of(url: &str) -> String {

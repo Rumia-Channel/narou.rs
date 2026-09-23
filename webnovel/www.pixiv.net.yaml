@@ -338,6 +338,9 @@ tags: ^tag::(?<tag>[^\n]+)$
 #   content が無い … ログイン限定・R-18 (HTTP 200 のまま本文だけ伏せる)
 # どちらも保存済み Cookie での再試行対象にし、それでも駄目なら 404 として扱う。
 error_message: '"error":\s*true|login_required::1'
+# pixiv は短時間に連続アクセスすると 429 を返す。アクセス間隔の下限 (秒)。
+# 最低 2 秒、余裕を見て 5 秒とする。
+min_interval: 5
 login_pattern: ^login_required::1$
 # 一覧が欠けたまま成功する応答 (ログインすると増える) の目印。
 login_partial_pattern: ^login_partial::1$

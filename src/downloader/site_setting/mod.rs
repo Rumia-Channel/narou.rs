@@ -57,6 +57,10 @@ pub struct SiteSetting {
     /// the list (a retry with the stored cookie may see more).
     #[serde(default)]
     pub login_partial_pattern: Option<SiteSettingValue>,
+    /// Minimum seconds between requests to this site. Sites that rate-limit
+    /// aggressively (Pixiv) declare a floor; `None` uses `download.interval`.
+    #[serde(default)]
+    pub min_interval: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub over18_pattern: Option<SiteSettingValue>,
     pub sitename: String,
