@@ -54,6 +54,13 @@ preprocess: |-
     # 漫画シリーズの目次ページ (/ajax/series/{id}?p=N)。一覧は 12 件ずつ order の
     # 降順で返るため reverse して 1 話から並べる。
     let series = body.illustSeries.first
+    # 1 ページ目で最新の order が総数に届いていなければ、未ログインで
+    # R-18 など一部の作品が落ちている (再試行の判断材料)。
+    let page_number = url.gsub(/^.*[?&]p=(\d+).*$/, "$1")
+    let is_first_page = page_number == "1" || page_number == url
+    if is_first_page && body.page.series.first.order != series.total
+      emit "login_partial::1"
+    end
     emit "ncode::c${series.id}"
     emit "title::${series.title}"
     emit "story::${series.description.replace("\n", "<br>")}"
@@ -314,4 +321,6 @@ tags: ^tag::(?<tag>[^\n]+)$
 # どちらも保存済み Cookie での再試行対象にし、それでも駄目なら 404 として扱う。
 error_message: '"error":\s*true|login_required::1'
 login_pattern: ^login_required::1$
+# 一覧が欠けたまま成功する応答 (ログインすると増える) の目印。
+login_partial_pattern: ^login_partial::1$
 login_url: \\k<top_url>/

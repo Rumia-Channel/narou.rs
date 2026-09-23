@@ -53,6 +53,10 @@ pub struct SiteSetting {
     /// asks for authentication). Matching it retries with the stored cookie.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_pattern: Option<SiteSettingValue>,
+    /// Marker a definition emits when an anonymous fetch returned only part of
+    /// the list (a retry with the stored cookie may see more).
+    #[serde(default)]
+    pub login_partial_pattern: Option<SiteSettingValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub over18_pattern: Option<SiteSettingValue>,
     pub sitename: String,
@@ -150,6 +154,8 @@ pub struct SiteSetting {
     pub(super) compiled_over18_pattern: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_login_pattern: Option<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_login_partial_pattern: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_next_toc: Option<Regex>,
     #[serde(skip)]
@@ -290,6 +296,10 @@ impl SiteSetting {
             .and_then(|v| self.compile_value(v));
         self.compiled_login_pattern = self
             .login_pattern
+            .as_ref()
+            .and_then(|v| self.compile_value(v));
+        self.compiled_login_partial_pattern = self
+            .login_partial_pattern
             .as_ref()
             .and_then(|v| self.compile_value(v));
         self.compiled_next_toc = self.next_toc.as_deref().and_then(|s| Regex::new(s).ok());
@@ -514,6 +524,14 @@ impl SiteSetting {
         self.compiled_login_pattern.as_ref()
     }
 
+    /// Whether `source` shows only part of the list because the request was
+    /// anonymous.
+    pub fn is_partial_login_view(&self, source: &str) -> bool {
+        self.compiled_login_partial_pattern
+            .as_ref()
+            .is_some_and(|pattern| pattern.is_match(source))
+    }
+
     pub fn error_message(&self) -> Option<&str> {
         self.error_message.as_deref()
     }
@@ -609,6 +627,31 @@ fn extract_captures_from_patterns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_login_pattern_detects_an_incomplete_listing() {
+        let yaml = r#"
+name: Example
+domain: example.com
+top_url: https://example.com
+sitename: Example
+toc_url: https://example.com/\k<url>
+login_partial_pattern: ^login_partial::1$
+"#;
+        let mut setting: SiteSetting = serde_yaml::from_str(yaml).unwrap();
+        setting.compile();
+
+        assert!(setting.is_partial_login_view("login_partial::1\nEpisode;1;..."));
+        assert!(!setting.is_partial_login_view("Episode;1;..."));
+
+        // Definitions without the key never report a partial view.
+        let mut plain: SiteSetting = serde_yaml::from_str(
+            "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Example\ntoc_url: x\\k<url>\n",
+        )
+        .unwrap();
+        plain.compile();
+        assert!(!plain.is_partial_login_view("login_partial::1"));
+    }
 
     #[test]
     fn user_webnovel_yaml_merges_over_bundled_yaml_by_name() {

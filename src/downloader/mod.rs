@@ -1301,7 +1301,9 @@ impl Downloader {
         // novel as deleted. Nothing is sent when no cookie is stored, so sites
         // the user never signed in to behave exactly as before.
         let mut toc_source = toc_source;
-        if login_cookie.is_none() && should_retry_with_login(&setting, &toc_source) {
+        let login_wall = should_retry_with_login(&setting, &toc_source);
+        let partial_view = !login_wall && is_partial_login_view(&setting, &toc_source);
+        if login_cookie.is_none() && (login_wall || partial_view) {
             if let Some(cookie) = self.stored_cookie_for(login_host.as_deref()).await {
                 report_line("ログインが必要な可能性があります。保存済みのログイン情報で再試行します");
                 apply_login_cookie(&mut setting, &cookie);
@@ -1313,10 +1315,22 @@ impl Downloader {
                     &mut self.preprocess_jobs,
                 )
                 .await;
-                if retried.is_ok() {
-                    requires_login = true;
+                if partial_view {
+                    // 一覧が欠けたまま成功した応答。Cookie で増えたときだけ
+                    // 採用し、増えないなら未ログインの結果をそのまま使う。
+                    if retried
+                        .as_ref()
+                        .is_ok_and(|source| !setting.is_partial_login_view(source))
+                    {
+                        requires_login = true;
+                        toc_source = retried;
+                    }
+                } else {
+                    if retried.is_ok() {
+                        requires_login = true;
+                    }
+                    toc_source = retried;
                 }
-                toc_source = retried;
             }
         }
         let toc_source = match toc_source {
@@ -2484,6 +2498,18 @@ impl Downloader {
 /// Merge the stored login cookie into the site's static cookie value.
 fn apply_login_cookie(setting: &mut SiteSetting, login_cookie: &str) {
     setting.cookie = crate::platform::merge_cookie_headers(setting.cookie(), Some(login_cookie));
+}
+
+/// Whether a *successful* fetch still shows only part of the works.
+///
+/// A definition reports this itself (Pixiv hides R-18 works while answering
+/// HTTP 200), so the request is retried with the stored cookie — but unlike a
+/// login wall, an unimproved retry must not replace the anonymous result.
+fn is_partial_login_view(setting: &SiteSetting, toc_source: &Result<String>) -> bool {
+    match toc_source {
+        Ok(source) => setting.is_partial_login_view(source),
+        Err(_) => false,
+    }
 }
 
 /// A missing page (404) or a login wall served with HTTP 200 both mean the
