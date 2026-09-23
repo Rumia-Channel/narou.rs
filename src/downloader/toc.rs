@@ -149,7 +149,7 @@ pub async fn parse_subtitles_multipage(
     title: &str,
     progress: Option<&dyn ProgressReporter>,
     jobs: &mut PreprocessJobs,
-) -> Result<Vec<SubtitleInfo>> {
+) -> Result<(Vec<SubtitleInfo>, bool)> {
     parse_subtitles_multipage_with(
         http,
         rate_limiter,
@@ -176,7 +176,7 @@ fn parse_subtitles_multipage_with<'a, F>(
     progress: Option<&'a dyn ProgressReporter>,
     jobs: &'a mut PreprocessJobs,
     mut fetch_next_toc: F,
-) -> PlatformFuture<'a, Result<Vec<SubtitleInfo>>>
+) -> PlatformFuture<'a, Result<(Vec<SubtitleInfo>, bool)>>
 where
     F: for<'b> FnMut(
             &'b dyn HttpClient,
@@ -190,6 +190,8 @@ where
 {
     Box::pin(async move {
         let mut all_subtitles = Vec::new();
+        // 本文一覧のページが「未ログインで欠けている」と報告したか。
+        let mut partial_listing = false;
         let mut current_toc_source = toc_source.to_string();
         let mut page = 0;
         let max_pages = if let Some(pattern) = setting.toc_page_max_pattern() {
@@ -212,6 +214,9 @@ where
         }
 
         loop {
+            if setting.is_partial_login_view(&current_toc_source) {
+                partial_listing = true;
+            }
             let page_subs = parse_subtitles(setting, &current_toc_source, url_captures)?;
             all_subtitles.extend(page_subs);
 
@@ -258,7 +263,7 @@ where
             }
         }
 
-        Ok(all_subtitles)
+        Ok((all_subtitles, partial_listing))
     })
 }
 
@@ -332,7 +337,8 @@ mod tests {
             Some(&progress),
             &mut PreprocessJobs::new(),
         ))
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert!(subtitles.is_empty() || subtitles.len() == 1);
         assert_eq!(*progress.lengths.lock().unwrap(), vec![5]);
@@ -342,6 +348,46 @@ mod tests {
             vec!["目次 テスト作品".to_string()]
         );
         assert_eq!(*progress.positions.lock().unwrap(), vec![0, 0]);
+    }
+
+    #[test]
+    fn multipage_reports_a_partial_listing_from_any_page() {
+        // 目次は複数ページに分かれるので、2 ページ目以降の目印も拾う。
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "www.pixiv.net")
+            .unwrap();
+        assert!(setting.is_partial_login_view("login_partial::1"));
+
+        let first_page = "Episode;1;https://www.pixiv.net/ajax/novel/1;2020-01-01T00:00:00+00:00;一話\n\
+             next::/ajax/novel/series_content/1?limit=30&last_order=1&order_by=asc\n";
+        let second_page = "login_partial::1\n\
+             Episode;2;https://www.pixiv.net/ajax/novel/2;2020-01-01T00:00:00+00:00;二話\n";
+        let http = MockHttpClient::new();
+        let rate_limiter = FakeRateLimiter::new();
+
+        let (subtitles, partial) = futures::executor::block_on(parse_subtitles_multipage_with(
+            &http,
+            &rate_limiter,
+            setting,
+            first_page,
+            &HashMap::new(),
+            "",
+            None,
+            &mut PreprocessJobs::new(),
+            {
+                let page = second_page.to_string();
+                move |_, _, _, _, _| {
+                    let page = page.clone();
+                    Box::pin(async move { Ok(page) })
+                }
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(subtitles.len(), 2);
+        assert!(partial, "2 ページ目の目印を拾えていない");
     }
 
     #[test]
@@ -397,7 +443,8 @@ mod tests {
                 }
             },
         ))
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert_eq!(
             *fetched_urls.lock().unwrap(),
@@ -483,7 +530,8 @@ mod tests {
                 }
             },
         ))
-        .unwrap();
+        .unwrap()
+        .0;
 
         let fetched_urls = fetched_urls.lock().unwrap();
         assert_eq!(fetched_urls.len(), 2);

@@ -826,6 +826,7 @@ impl Downloader {
                 )
                 .await
                 .ok()
+                .map(|(subtitles, _partial)| subtitles)
             };
             if let Some(subs) = &subtitles {
                 if novelupdated_at.is_none() {
@@ -1316,12 +1317,10 @@ impl Downloader {
                 )
                 .await;
                 if partial_view {
-                    // 一覧が欠けたまま成功した応答。Cookie で増えたときだけ
-                    // 採用し、増えないなら未ログインの結果をそのまま使う。
-                    if retried
-                        .as_ref()
-                        .is_ok_and(|source| !setting.is_partial_login_view(source))
-                    {
+                    // 一覧が欠けたまま成功した応答。ログインしてもマイピク
+                    // などで欠けたままのことがあるため、「欠けが消えた」か
+                    // 「取得できた話数が増えた」ときだけ採用する。
+                    if is_improved_toc(&setting, toc_source.as_ref(), retried.as_ref()) {
                         requires_login = true;
                         toc_source = retried;
                     }
@@ -1469,8 +1468,11 @@ impl Downloader {
 
         let (novel_type, is_end) = resolve_novel_type(&setting, &toc_source, &url_captures, &info);
 
-        let subtitles = if novel_type == 2 {
-            create_short_story_subtitles(&setting, &toc_source, &info)?
+        let (mut subtitles, partial_listing) = if novel_type == 2 {
+            (
+                create_short_story_subtitles(&setting, &toc_source, &info)?,
+                false,
+            )
         } else {
             parse_subtitles_multipage(
                 self.http.as_ref(),
@@ -1484,6 +1486,33 @@ impl Downloader {
             )
             .await?
         };
+
+        // 目次ページの途中で「一覧が欠けている」と分かった場合 (Pixiv の小説
+        // シリーズは未ログインだと本文一覧が 0 件になる) は、保存済み Cookie で
+        // 取り直し、話数が増えたときだけ採用する。
+        if partial_listing && login_cookie.is_none() {
+            if let Some(cookie) = self.stored_cookie_for(login_host.as_deref()).await {
+                report_line("ログインが必要な可能性があります。保存済みのログイン情報で再試行します");
+                apply_login_cookie(&mut setting, &cookie);
+                if let Ok((retried, retried_partial)) = parse_subtitles_multipage(
+                    self.http.as_ref(),
+                    self.rate_limiter.as_ref(),
+                    &setting,
+                    &toc_source,
+                    &url_captures,
+                    &title,
+                    self.progress.as_deref(),
+                    &mut self.preprocess_jobs,
+                )
+                .await
+                {
+                    if !retried_partial || retried.len() > subtitles.len() {
+                        subtitles = retried;
+                        requires_login = true;
+                    }
+                }
+            }
+        }
 
         let use_subdirectory = self.download_use_subdirectory(existing_record.as_ref());
         let ncode = self
@@ -2498,6 +2527,32 @@ impl Downloader {
 /// Merge the stored login cookie into the site's static cookie value.
 fn apply_login_cookie(setting: &mut SiteSetting, login_cookie: &str) {
     setting.cookie = crate::platform::merge_cookie_headers(setting.cookie(), Some(login_cookie));
+}
+
+/// Whether a retry after a partial listing is worth keeping.
+///
+/// A signed-in visitor can still see fewer works than a series holds (Pixiv
+/// マイピク restricts some to mutual followers), so the marker disappearing is
+/// not the only success: collecting more sections also counts. A retry that
+/// changes nothing keeps the earlier result.
+fn is_improved_toc(
+    setting: &SiteSetting,
+    before: std::result::Result<&String, &NarouError>,
+    after: std::result::Result<&String, &NarouError>,
+) -> bool {
+    let (Ok(before), Ok(after)) = (before, after) else {
+        return false;
+    };
+    !setting.is_partial_login_view(after)
+        || count_toc_entries(setting, after) > count_toc_entries(setting, before)
+}
+
+/// Sections a preprocessed TOC source yields, using the definition's own
+/// subtitles pattern.
+fn count_toc_entries(setting: &SiteSetting, source: &str) -> usize {
+    setting
+        .subtitles_pattern()
+        .map_or(0, |pattern| pattern.find_iter(source).count())
 }
 
 /// Whether a *successful* fetch still shows only part of the works.

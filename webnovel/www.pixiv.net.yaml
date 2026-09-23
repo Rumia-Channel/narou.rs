@@ -130,6 +130,10 @@ preprocess: |-
         # 小説シリーズの目次ページ。thumbnails.novel は page.seriesContents と
         # 同じ順序で話数 (seriesContentOrder) と掲載日を持つため、こちらを使う。
         let entries = body.thumbnails.novel
+        if entries.size == 0
+          # 未ログイン (またはマイピク限定) だと全話が伏せられて 0 件になる。
+          emit "login_partial::1"
+        end
         for entry in entries
           emit "Episode;${entry.seriesContentOrder};https://www.pixiv.net/ajax/novel/${entry.id};${entry.createDate};${entry.title}"
         end
