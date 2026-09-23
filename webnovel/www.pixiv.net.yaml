@@ -130,9 +130,16 @@ preprocess: |-
         # 小説シリーズの目次ページ。thumbnails.novel は page.seriesContents と
         # 同じ順序で話数 (seriesContentOrder) と掲載日を持つため、こちらを使う。
         let entries = body.thumbnails.novel
+        let asked_last_order = url.gsub(/^.*[?&]last_order=(\d+).*$/, "$1")
         if entries.size == 0
           # 未ログイン (またはマイピク限定) だと全話が伏せられて 0 件になる。
           emit "login_partial::1"
+        else
+          # 1 ページ目は 1 話目から始まる。そうでなければ未ログインで R-18
+          # などが落ちている (匿名で 7, 13 話だけ見える、のような形)。
+          if asked_last_order == "0" && entries.first.seriesContentOrder != 1
+            emit "login_partial::1"
+          end
         end
         for entry in entries
           emit "Episode;${entry.seriesContentOrder};https://www.pixiv.net/ajax/novel/${entry.id};${entry.createDate};${entry.title}"
