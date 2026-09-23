@@ -1297,6 +1297,7 @@ mod tests {
 
     #[test]
     fn resolve_list_sort_key_accepts_db_supported_keys() {
+        let _global = crate::test_support::global_state_guard();
         // `narou_rs::db::sort_keys()` の各値をそのまま受理する。
         for key in narou_rs::db::sort_keys() {
             let result = resolve_list_sort_key(Some(*key)).unwrap();
@@ -1311,6 +1312,7 @@ mod tests {
 
     #[test]
     fn resolve_list_sort_key_rejects_unknown_key() {
+        let _global = crate::test_support::global_state_guard();
         let err = resolve_list_sort_key(Some("not_a_key")).unwrap_err();
         assert!(err.contains("not_a_key は正しいキーではありません"));
         // 候補一覧も一緒に表示する (update.rb 互換の挙動)。

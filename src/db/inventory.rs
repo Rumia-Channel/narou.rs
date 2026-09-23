@@ -777,6 +777,7 @@ mod tests {
 
     #[test]
     fn lock_file_remains_when_update_fails() {
+        let _global = crate::test_support::global_state_guard();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let narou_dir = root.join(".narou");

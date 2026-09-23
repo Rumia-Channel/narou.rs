@@ -161,6 +161,7 @@ mod tests {
 
     #[test]
     fn deserialize_blank_end_as_false() {
+        let _global = crate::test_support::global_state_guard();
         let yaml = r#"---
 id: 115
 author: 風見鶏
@@ -188,6 +189,7 @@ tags: []
 
     #[test]
     fn database_parity_preserves_unknown_fields_during_round_trip() {
+        let _global = crate::test_support::global_state_guard();
         let yaml = r#"---
 id: 0
 author: author
@@ -215,6 +217,7 @@ custom_map:
 
     #[test]
     fn raw_title_uses_compatible_flattened_field() {
+        let _global = crate::test_support::global_state_guard();
         let yaml = r#"---
 id: 0
 author: author

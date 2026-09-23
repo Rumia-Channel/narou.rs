@@ -358,6 +358,7 @@ mod tests {
 
     #[test]
     fn sort_column_keys_come_from_db_layer() {
+        let _global = crate::test_support::global_state_guard();
         // SORT_COLUMN_KEYS は db::sort_keys() と同じ slice を参照する。
         assert_eq!(SORT_COLUMN_KEYS, crate::db::sort_keys());
         // `normalize_sort_key` も db::sort_keys() と同じ受理集合を持つ。
