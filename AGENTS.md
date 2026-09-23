@@ -62,6 +62,12 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
   - `use` / `import` の順番を入れ替えるだけの変更
 - これらの整形変更は、機能変更に付随して不可避な場合（例: 引数追加で行長が変わる）のみ許容する。
 
+## グローバル設定の保存先 (2026-09 修正)
+- `~/.narousetting/global_setting.yaml` は**ライブラリ状態ではない**ため、storage-backend が `sqlite` のときもファイルのまま維持する。`SQLITE_MANAGED_NAMES` から `global_setting` を外してあり、SQLite への取込・退避 (`*.imported-*`) は行わない。
+- 理由: narou.rb はこのファイルしか読まないため、退避すると narou.rb 側で `aozoraepub3dir` 等が消える。また SQLite 側の実体は「そのライブラリの `.narou/db.sqlite`」なので、別ライブラリ (YAML モード) からは設定が見えなくなる。
+- 旧ビルドが `app_state(scope='global', key='global_setting')` に残した行は、ファイルが無いときに初回読み出しでファイルへ書き戻し、その行を削除する (一度きりの復旧)。`tests/global_settings_storage.rs` がモード往復と復旧を固定している。
+- ローカル側 (`local_setting` / `freeze` / `alias` / `tag_colors` / `latest_convert` / `login_cookie`) は従来どおり SQLite 管理で、`narou-compat` の挙動も変更なし。
+
 ## 設定データの I/O 境界
 - `local_setting` / `global_setting` の本番コードからの読み書きは `src/db/settings.rs`（`load` / `save` / `update` / `value` 等）を共通入口とする。CLI・Web・converter・downloader・logger・init・self-update から設定 YAML を直接 `fs::read_to_string` / `fs::write` で操作しない。
 - 共通入口の下では既存 `Inventory` が保存方式（SQLite `app_state` と legacy YAML）を選択する。`native::application::NativeSettingsStore` も同じ共通入口に委譲する。Worker 側は従来の `SettingsStore` port / D1 adapter を利用する。

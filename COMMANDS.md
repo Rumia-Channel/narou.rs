@@ -379,6 +379,7 @@ narou setting name         # 読み取り
 - `default.*` = 未設定小説のデフォルト値
 - `force.*` = 全小説の強制上書き値
 - `default.*` / `force.*` は `convert` の小説・テキスト入力の両経路で共通設定ストアから取得し、`--ignore-default` / `--ignore-force` で個別に無効化できる（Issue #22）。
+- `global_setting` は SQLite 管理の対象外とし、storage-backend が `sqlite` でも `~/.narousetting/global_setting.yaml` を維持する (narou.rb 互換・ライブラリ間で共有するため)。旧ビルドが DB へ取り込んで退避した分は、ファイルが無ければ初回読み出しで復旧する
 - local / global 設定の入出力は `src/db/settings.rs` → `Inventory` に統一する。SQLite 利用時は `app_state`、legacy YAML 利用時は従来の設定ファイルに保存し、双方で同じキー・型を扱う。
 
 **主要 local_setting 項目**:

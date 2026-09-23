@@ -52,13 +52,17 @@ pub struct Inventory {
 /// Names whose raw payloads live in `app_state` instead of files while the
 /// SQLite backend is active.
 #[cfg(feature = "native-runtime")]
+/// Names whose state moves into `.narou/db.sqlite` in SQLite mode.
+///
+/// `global_setting` is deliberately absent: it is not library state. It stays
+/// in `~/.narousetting/global_setting.yaml` in every mode so narou.rb — which
+/// only reads the file — keeps seeing the user's settings.
 const SQLITE_MANAGED_NAMES: &[&str] = &[
     "freeze",
     "alias",
     "tag_colors",
     "latest_convert",
     "local_setting",
-    "global_setting",
     "login_cookie",
 ];
 
@@ -168,10 +172,47 @@ impl Inventory {
 
         let content = read_optional_yaml_file(&path)?;
 
+        #[cfg(feature = "native-runtime")]
+        if content.trim().is_empty()
+            && scope == InventoryScope::Global
+            && let Some(payload) = self.legacy_global_payload()?
+        {
+            // Older builds imported the global settings map into this
+            // library's `app_state` and renamed the file away, which hid the
+            // settings from other libraries and from narou.rb. Put the file
+            // back on first read and drop the stale row.
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            atomic_write(&path, &payload)?;
+            self.cache
+                .lock()
+                .remember(cache_key, payload.clone(), file_mtime(&path));
+            return Ok(payload);
+        }
+
         self.cache
             .lock()
             .remember(cache_key, content.clone(), current_mtime);
         Ok(content)
+    }
+
+    /// Legacy `app_state(global, global_setting)` row, if an older build left
+    /// one behind. Removed once the file has been restored from it.
+    #[cfg(feature = "native-runtime")]
+    fn legacy_global_payload(&self) -> Result<Option<String>> {
+        let Some(state) = &self.state else {
+            return Ok(None);
+        };
+        let Some(payload) = state.get_raw("global", "global_setting")? else {
+            return Ok(None);
+        };
+        if payload.trim().is_empty() {
+            state.delete_raw("global", "global_setting")?;
+            return Ok(None);
+        }
+        state.delete_raw("global", "global_setting")?;
+        Ok(Some(payload))
     }
 
     pub fn save_raw(&self, name: &str, scope: InventoryScope, content: &str) -> Result<()> {

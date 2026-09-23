@@ -370,32 +370,16 @@ fn reconcile_managed_files(state: &StateDb) -> Result<()> {
             imported.push(path);
         }
     }
-    if let Some(home) = dirs_home() {
-        let global = home.join(".narousetting").join("global_setting.yaml");
-        let file_content = std::fs::read_to_string(&global).ok();
-        if compat {
-            match file_content {
-                Some(content) => state.set_raw_db("global", "global_setting", &content)?,
-                None => {
-                    if let Some(payload) = state.get_raw_db("global", "global_setting")? {
-                        if let Some(parent) = global.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        crate::db::inventory::atomic_write(&global, &payload)?;
-                    }
-                }
-            }
-        } else if let Some(content) = file_content {
-            if !content.trim().is_empty() {
-                state.set_raw_db("global", "global_setting", &content)?;
-            }
-            imported.push(global);
-        }
-    }
     if !imported.is_empty() {
         rename_imported(imported);
     }
     Ok(())
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
 }
 
 /// Rename imported legacy files instead of deleting them: old versions can
@@ -410,10 +394,4 @@ fn rename_imported(paths: Vec<PathBuf>) {
         target.push(&format!(".imported-{stamp}"));
         let _ = std::fs::rename(&path, PathBuf::from(target));
     }
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
 }
