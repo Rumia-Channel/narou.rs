@@ -1242,7 +1242,21 @@ impl Downloader {
                             &response.body,
                             Some(setting.encoding()),
                         );
-                        pretreatment_source(&mut body, setting.encoding(), Some(&setting));
+                        // The redirect probe already spent the GET, so run the
+                        // definition (and any requests it makes) here rather
+                        // than re-fetching the same URL through `fetch_toc`.
+                        let policy =
+                            crate::downloader::http_policy::FetchPolicy::for_site(&setting);
+                        crate::downloader::util::pretreatment_source_with_jobs(
+                            self.http.as_ref(),
+                            self.rate_limiter.as_ref(),
+                            &policy,
+                            &mut body,
+                            setting.encoding(),
+                            Some(&setting),
+                            &mut self.preprocess_jobs,
+                        )
+                        .await?;
                         if let Some(re) = setting.compiled_error_message_pattern()
                             && re.is_match(&body)
                         {
