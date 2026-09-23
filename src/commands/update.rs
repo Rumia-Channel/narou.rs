@@ -486,6 +486,11 @@ fn resolve_target_to_id(target: &str, site_settings: &[SiteSetting]) -> Option<i
             .find_by_title_sync(&target)
             .ok()
             .flatten()
+            .or_else(|| {
+                // なろう式の ncode 判定 (`n\d+[a-z]+`) に当たらない ncode
+                // (Pixiv の `n29204764` / `s16299140` など) はここで拾う。
+                novels.find_by_ncode_sync(&target).ok().flatten()
+            })
             .map(|r| r.id),
     }
 }

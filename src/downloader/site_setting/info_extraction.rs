@@ -157,6 +157,7 @@ impl SiteSetting {
             "l" => self.l.as_ref(),
             "tags" => self.tags.as_ref(),
             "sitename" => self.sitename_pattern.as_ref(),
+            "ncode" => self.ncode.as_ref(),
             _ => return None,
         };
 
@@ -223,6 +224,7 @@ impl SiteSetting {
             "l" => self.l.as_ref(),
             "tags" => self.tags.as_ref(),
             "sitename" => self.sitename_pattern.as_ref(),
+            "ncode" => self.ncode.as_ref(),
             _ => return None,
         };
 

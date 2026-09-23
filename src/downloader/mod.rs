@@ -2214,6 +2214,7 @@ impl Downloader {
                     .novels
                     .find_by_title(target)
                     .await?
+                    .or(self.novels.find_by_ncode(target).await?)
                     .map(|record| record.id);
                 if let Some(id) = existing_id {
                     let record = self.novels.get(id.into()).await?.ok_or_else(|| {
@@ -3168,6 +3169,294 @@ is_narou: false
             subtitles[1].subupdate.as_deref(),
             Some("2021-01-14T16:13:02Z")
         );
+    }
+
+    fn pixiv_setting() -> &'static SiteSetting {
+        static SETTING: std::sync::OnceLock<SiteSetting> = std::sync::OnceLock::new();
+        SETTING.get_or_init(|| {
+            let settings = SiteSetting::load_all().unwrap();
+            settings
+                .iter()
+                .find(|s| s.domain == "www.pixiv.net")
+                .cloned()
+                .expect("bundled www.pixiv.net.yaml should load")
+        })
+    }
+
+    fn run_pixiv_preprocess(json: &str) -> String {
+        let setting = pixiv_setting();
+        let mut source = json.to_string();
+        super::util::pretreatment_source(&mut source, "UTF-8", Some(setting));
+        source
+    }
+
+    #[test]
+    fn pixiv_url_patterns_split_kind_prefix_and_numeric_work_id() {
+        let setting = pixiv_setting();
+
+        let series = setting
+            .extract_url_captures("https://www.pixiv.net/novel/series/16299140")
+            .expect("series URL should match");
+        assert_eq!(series.get("kind").map(String::as_str), Some("series/"));
+        assert_eq!(series.get("work_id").map(String::as_str), Some("16299140"));
+
+        let novel = setting
+            .extract_url_captures("https://www.pixiv.net/novel/show.php?id=29204764")
+            .expect("novel URL should match");
+        assert_eq!(novel.get("kind").map(String::as_str), Some(""));
+        assert_eq!(novel.get("work_id").map(String::as_str), Some("29204764"));
+
+        assert_eq!(
+            setting
+                .toc_url_with_url_captures("https://www.pixiv.net/novel/series/16299140")
+                .as_deref(),
+            Some("https://www.pixiv.net/ajax/novel/series/16299140")
+        );
+        assert_eq!(
+            setting
+                .toc_url_with_url_captures("https://www.pixiv.net/novel/show.php?id=29204764")
+                .as_deref(),
+            Some("https://www.pixiv.net/ajax/novel/29204764")
+        );
+    }
+
+    #[test]
+    fn pixiv_series_detail_emits_info_and_first_content_page() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "id":"16299140","title":"トゥルースヒーローズ設定集","userId":"92017217","userName":"ゆっきー593",
+                "caption":"設定をまとめます","total":6,"isConcluded":false,
+                "publishedTotalCharacterCount":80418,
+                "tags":["トゥルースヒーローズ","設定"],
+                "createDate":"2026-08-03T22:26:01+09:00","updateDate":"2026-09-23T17:04:49+09:00"}}"#,
+        );
+
+        assert!(html.contains("PixivPreprocessEvalMagicWord"));
+        assert!(html.contains("title::トゥルースヒーローズ設定集"));
+        assert!(html.contains("author::ゆっきー593"));
+        assert!(html.contains("story::設定をまとめます"));
+        assert!(html.contains("novel_type::連載中"));
+        assert!(html.contains("general_all_no::6"));
+        assert!(html.contains("general_firstup::2026-08-03T22:26:01+09:00"));
+        assert!(html.contains("general_lastup::2026-09-23T17:04:49+09:00"));
+        assert!(html.contains("length::80418"));
+        assert!(html.contains("tag::トゥルースヒーローズ"));
+        assert!(html.contains(
+            "next::/ajax/novel/series_content/16299140?limit=30&last_order=0&order_by=asc"
+        ));
+
+        let setting = pixiv_setting();
+        let next = setting
+            .next_toc_pattern()
+            .unwrap()
+            .captures(&html)
+            .and_then(|caps| caps.name("next_page").map(|m| m.as_str().to_string()))
+            .unwrap();
+        assert_eq!(
+            next,
+            "/ajax/novel/series_content/16299140?limit=30&last_order=0&order_by=asc"
+        );
+        assert_eq!(
+            setting.get_next_url_with_captures(setting.next_url.as_deref().unwrap(), &{
+                let mut captures = HashMap::new();
+                captures.insert("next_page".to_string(), next);
+                captures
+            }),
+            "https://www.pixiv.net/ajax/novel/series_content/16299140?limit=30&last_order=0&order_by=asc"
+        );
+    }
+
+    #[test]
+    fn pixiv_series_content_emits_episodes_and_follows_a_full_page() {
+        let mut entries = String::new();
+        for order in 1..=30 {
+            if order > 1 {
+                entries.push(',');
+            }
+            entries.push_str(&format!(
+                r#"{{"id":"20{order:06}","title":"第{order}話","seriesContentOrder":{order},"seriesId":"11075024","createDate":"2026-09-21T22:36:52+09:00","updateDate":"2026-09-22T00:12:53+09:00"}}"#
+            ));
+        }
+        let html = run_pixiv_preprocess(&format!(
+            r#"{{"error":false,"message":"","body":{{
+                "thumbnails":{{"novel":[{entries}]}},
+                "page":{{"seriesContents":[{{"id":"20000001","series":{{"id":11075024,"contentOrder":1}}}}]}}}}}}"#
+        ));
+
+        assert!(html.contains(
+            "Episode;1;https://www.pixiv.net/ajax/novel/20000001;2026-09-21T22:36:52+09:00;第1話"
+        ));
+        assert!(html.contains(
+            "Episode;30;https://www.pixiv.net/ajax/novel/20000030;2026-09-21T22:36:52+09:00;第30話"
+        ));
+        assert!(html.contains(
+            "next::/ajax/novel/series_content/11075024?limit=30&last_order=30&order_by=asc"
+        ));
+
+        let setting = pixiv_setting();
+        let mut url_captures = HashMap::new();
+        url_captures.insert("ncode".to_string(), "s11075024".to_string());
+        let subtitles = super::toc::parse_subtitles(setting, &html, &url_captures).unwrap();
+        assert_eq!(subtitles.len(), 30);
+        assert_eq!(subtitles[0].index, "1");
+        assert_eq!(
+            subtitles[0].href,
+            "https://www.pixiv.net/ajax/novel/20000001"
+        );
+        assert_eq!(subtitles[0].subtitle, "第1話");
+        assert_eq!(subtitles[0].subdate, "2026-09-21T22:36:52+09:00");
+        assert_eq!(subtitles[29].index, "30");
+        assert_eq!(subtitles[29].subtitle, "第30話");
+    }
+
+    #[test]
+    fn pixiv_partial_series_content_page_stops_pagination() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "thumbnails":{"novel":[{"id":"28776498","title":"設定集","seriesContentOrder":1,"seriesId":"16299140","createDate":"2026-08-04T22:49:29+09:00"}]},
+                "page":{"seriesContents":[{"id":"28776498","series":{"id":16299140,"contentOrder":1}}]}}}"#,
+        );
+
+        assert!(html.contains("Episode;1;https://www.pixiv.net/ajax/novel/28776498"));
+        assert!(!html.contains("next::"));
+    }
+
+    #[test]
+    fn pixiv_single_novel_emits_metadata_and_converts_body_markup() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "id":"29204764","title":"短編集","userName":"沼月時雨","description":"あらすじです",
+                "content":"1行目\n2行目\n[[rb:漢字 > かんじ]]\n[chapter:第二章]\n[newpage]\n[[jumpuri:作者サイト > https://example.com/]]\n[pixivimage:83791147-1]\n[uploadedimage:22638629]\n[jump:2]",
+                "createDate":"2026-09-23T07:48:07+00:00","uploadDate":"2026-09-23T07:48:07+00:00",
+                "characterCount":1274,"seriesNavData":null,
+                "tags":{"tags":[{"tag":"タグA"},{"tag":"タグB"}]}}}"#,
+        );
+
+        assert!(html.contains("ncode::n29204764"));
+        assert!(html.contains("title::短編集"));
+        assert!(html.contains("author::沼月時雨"));
+        assert!(html.contains("story::あらすじです"));
+        assert!(html.contains("novel_type::短編"));
+        assert!(html.contains("general_all_no::1"));
+        assert!(html.contains("general_lastup::2026-09-23T07:48:07+00:00"));
+        assert!(html.contains("length::1274"));
+        assert!(html.contains("tag::タグA"));
+        assert!(html.contains("tag::タグB"));
+        // 短編は目次を出さない (href 付きの目次があると連載中と判定される)
+        assert!(!html.contains("Episode;"), "got: {html}");
+        assert!(!html.contains("next::"));
+
+        // 短編として扱われ、本文ページはこの URL 自身になる
+        let setting = pixiv_setting();
+        let mut url_captures = HashMap::new();
+        url_captures.insert("work_id".to_string(), "29204764".to_string());
+        let (novel_type, _) =
+            super::resolve_novel_type(setting, &html, &url_captures, &pixiv_info(&html));
+        assert_eq!(novel_type, 2);
+
+        // 本文は Aozora へ渡せる HTML へ変換される (素の改行は to_aozora が落とす)
+        let body = setting_body(&html);
+        assert_eq!(
+            body,
+            "1行目<br>2行目<br><ruby>漢字<rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby><br>第二章<br>［＃改ページ］<br><a href=\"https://example.com/\">作者サイト</a><br><!--pixivimage:83791147-1--><br><!--uploadedimage:22638629--><br>（2ページ目へ）"
+        );
+        assert!(!body.contains("[pixivimage"), "raw tag leaked: {body}");
+        // 単体作品の description はあらすじなので前書きには回さない
+        assert!(!html.contains("introduction::"));
+
+        let aozora = super::html::to_aozora(&body);
+        assert!(aozora.contains("｜漢字《かんじ》"));
+        assert!(aozora.contains("［＃改ページ］"));
+        // narou.rb と同じく <a> は落としてリンク文字列だけ残す
+        assert!(aozora.contains("作者サイト"));
+        assert!(!aozora.contains("<a href"));
+        // 挿絵・ジャンプは本文を汚さない形にする
+        assert!(aozora.contains("（2ページ目へ）"), "got: {aozora}");
+        assert!(!aozora.contains("pixivimage"));
+        assert!(!aozora.contains("uploadedimage"));
+    }
+
+    #[test]
+    fn pixiv_series_episode_emits_introduction_and_poll_postscript() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "id":"29205030","title":"純血とマグル","userName":"ラギー","description":"前書き<br />二行目",
+                "content":"本文です","createDate":"2026-09-23T08:20:09+00:00","uploadDate":"2026-09-23T08:20:09+00:00",
+                "characterCount":4444,
+                "seriesNavData":{"seriesId":14889031,"title":"魔法学園ヘタリア","order":2},
+                "pollData":{"question":"どれ？","total":10,"choices":[{"text":"A","count":6},{"text":"B","count":4}]},
+                "tags":{"tags":[{"tag":"夢小説"}]}}}"#,
+        );
+
+        // シリーズの各話でもレコードは話そのもの
+        assert!(html.contains("ncode::n29205030"), "got: {html}");
+        assert!(html.contains("introduction::"));
+        assert!(html.contains("前書き<br />二行目"));
+        assert!(html.contains("::introduction_end"));
+        // 同じ文を あらすじ と 前書き の両方には出さない
+        assert!(!html.contains("story::前書き"), "got: {html}");
+        assert!(html.contains("postscript::"));
+        assert!(html.contains("アンケート　\"どれ？\"　　票数10票<br>　　　A　　6票<br>　　　B　　4票"));
+        assert!(html.contains("::postscript_end"));
+        assert_eq!(setting_body(&html), "本文です");
+    }
+
+    #[test]
+    fn pixiv_error_envelope_is_reported_as_missing_novel() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":true,"message":"作品がありません","body":[]}"#,
+        );
+
+        let setting = pixiv_setting();
+        let pattern = setting.compiled_error_message_pattern().unwrap();
+        assert!(
+            pattern.is_match(&html),
+            "error envelope should match error_message: {html}"
+        );
+    }
+
+    #[test]
+    fn pixiv_login_only_novel_asks_for_a_stored_cookie() {
+        // ログイン限定作品は HTTP 200 のまま content だけが欠ける。
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "id":"26352975","title":"技術テスト","userName":"るみゃ","description":"技術テストです",
+                "content":null,"isLoginOnly":true,
+                "createDate":"2025-11-02T03:18:05+00:00","uploadDate":"2025-11-02T03:18:05+00:00",
+                "characterCount":36,"seriesNavData":null,
+                "tags":{"tags":[{"tag":"技術畑"}]}}}"#,
+        );
+
+        assert!(html.contains("login_required::1"), "got: {html}");
+        assert!(!html.contains("body::"));
+        assert!(!html.contains("title::技術テスト"));
+
+        let setting = pixiv_setting();
+        assert!(
+            setting
+                .compiled_error_message_pattern()
+                .unwrap()
+                .is_match(&html),
+            "login wall should also read as missing so the download fails without a cookie"
+        );
+        assert!(
+            setting.compiled_login_pattern().unwrap().is_match(&html),
+            "login wall should match login_pattern so the stored cookie is retried"
+        );
+        // 本文が無いので本文パターンは一致しない
+        let (element, _) =
+            super::section::parse_section_html(setting, html.clone()).unwrap();
+        assert_eq!(element.body, "");
+    }
+
+    fn pixiv_info(html: &str) -> super::novel_info::NovelInfo {
+        super::novel_info::NovelInfo::from_novel_info_source(pixiv_setting(), html)
+    }
+
+    fn setting_body(html: &str) -> String {
+        let setting = pixiv_setting();
+        let (element, _) = super::section::parse_section_html(setting, html.to_string()).unwrap();
+        element.body
     }
 
     #[test]

@@ -77,6 +77,11 @@ pub struct SiteSetting {
     pub postscript_pattern: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub novel_info_url: Option<String>,
+    /// Pattern that yields the record's `ncode` from the fetched page. Used by
+    /// sites whose URL carries no site-specific prefix (e.g. pixiv, where the
+    /// numeric work id alone would collide between novels and series).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ncode: Option<SiteSettingValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     #[serde(default)]
