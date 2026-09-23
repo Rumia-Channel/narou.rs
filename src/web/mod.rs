@@ -588,7 +588,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/login", delete(login::login_clear_all))
         .route("/api/login/import", post(login::login_import))
         .route("/api/login/set", post(login::login_set))
+        .route("/api/login/add", post(login::login_add))
+        .route("/api/login/order", post(login::login_order))
         .route("/api/login/{host}", delete(login::login_clear_host))
+        .route(
+            "/api/login/{host}/{index}",
+            delete(login::login_clear_credential),
+        )
         .route("/api/notepad/read", get(misc::notepad_read))
         .route("/api/notepad/save", post(misc::notepad_save))
         .route("/api/novels/{id}", get(novels::get_novel))

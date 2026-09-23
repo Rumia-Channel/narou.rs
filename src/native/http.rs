@@ -61,6 +61,17 @@ pub struct NativeHttpClient {
     cookie_store: Option<Arc<dyn crate::platform::CookieStore>>,
 }
 
+/// Whether every pair of a stored credential was part of the sent header,
+/// which is how a response is attributed to one of several stored logins.
+fn credential_was_sent(credential: &str, sent: &[(String, String)]) -> bool {
+    let pairs = crate::platform::parse_cookie_header(credential);
+    !pairs.is_empty()
+        && pairs.iter().all(|(name, value)| {
+            sent.iter()
+                .any(|(sent_name, sent_value)| sent_name == name && sent_value == value)
+        })
+}
+
 impl NativeHttpClient {
     /// Refresh stored login cookies from `Set-Cookie` responses.
     pub fn with_cookie_store(mut self, store: Arc<dyn crate::platform::CookieStore>) -> Self {
@@ -100,7 +111,7 @@ impl NativeHttpClient {
     /// Sessions rotate their cookies on most responses; writing them back keeps
     /// the stored value usable for the next run. Hosts without an entry are
     /// left alone.
-    async fn persist_set_cookie(&self, url: &str, response: &HttpResponse) {
+    async fn persist_set_cookie(&self, url: &str, response: &HttpResponse, sent_cookie: Option<&str>) {
         let Some(store) = self.cookie_store.as_ref() else {
             return;
         };
@@ -116,25 +127,38 @@ impl NativeHttpClient {
         let Some(host) = crate::platform::cookie_host_for_url(url) else {
             return;
         };
-        // Refresh the entry the request actually used: the exact host, or the
-        // parent domain the cookie was stored under (`.pixiv.net` for
-        // `www.pixiv.net`). Hosts without an entry are left alone.
+        // 送信した Cookie に対応する資格情報だけを更新する。サイトは複数の
+        // ログイン情報を持てるので、他のアカウントのセッションをこの応答で
+        // 上書きしてはいけない。キーは要求ホストとその親ドメイン。
+        let Some(sent) = sent_cookie else {
+            return;
+        };
+        let sent_pairs = crate::platform::parse_cookie_header(sent);
+        if sent_pairs.is_empty() {
+            return;
+        }
         let Ok(all) = store.list().await else {
             return;
         };
-        let Some((key, stored)) = crate::platform::cookie_lookup_hosts(&host)
-            .into_iter()
-            .find_map(|key| {
-                all.get(&key)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| (key, value.clone()))
-            })
-        else {
-            return;
-        };
-        let updated = crate::platform::apply_set_cookie(&stored, &values);
-        if updated != stored {
-            let _ = store.save(&key, &updated).await;
+        for key in crate::platform::cookie_lookup_hosts(&host) {
+            let Some(credentials) = all.get(&key) else {
+                continue;
+            };
+            let mut updated_credentials = credentials.clone();
+            let mut changed = false;
+            for credential in updated_credentials.iter_mut() {
+                if !credential_was_sent(&credential.cookie, &sent_pairs) {
+                    continue;
+                }
+                let updated = crate::platform::apply_set_cookie(&credential.cookie, &values);
+                if updated != credential.cookie {
+                    credential.cookie = updated;
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = store.save_all(&key, &updated_credentials).await;
+            }
         }
     }
 
@@ -825,11 +849,13 @@ impl HttpClient for NativeHttpClient {
         let this = self.clone();
         Box::pin(async move {
             let url = request.url.clone();
+            let sent_cookie = request.header("Cookie").map(str::to_string);
             let worker = this.clone();
             let response = tokio::task::spawn_blocking(move || worker.send_blocking(&request))
                 .await
                 .map_err(|e| NarouError::Http(e.to_string()))??;
-            this.persist_set_cookie(&url, &response).await;
+            this.persist_set_cookie(&url, &response, sent_cookie.as_deref())
+                .await;
             Ok(response)
         })
     }

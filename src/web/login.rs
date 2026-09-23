@@ -11,9 +11,9 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::error::NarouError;
-use crate::login::parse_export;
+use crate::login::{group_credentials, parse_export};
 use crate::native::cookie_store::InventoryCookieStore;
-use crate::platform::{normalize_cookie_host, parse_cookie_header};
+use crate::platform::{LoginCredential, normalize_cookie_host, parse_cookie_header};
 
 use super::AppState;
 use super::{MAX_WEB_TEXT_INPUT_BYTES, validate_web_text_size};
@@ -36,6 +36,18 @@ pub struct LoginSetRequest {
     pub host: String,
     /// `Cookie:` header value as copied from the browser.
     pub cookie: String,
+    /// Optional label shown in the list ("メイン", "R18用", …).
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// `POST /api/login/order` — reorder a host's credentials.
+#[derive(Debug, Deserialize)]
+pub struct LoginOrderRequest {
+    /// Request host whose credentials are being reordered.
+    pub host: String,
+    /// Current indices in their new order, e.g. `[1, 0, 2]`.
+    pub order: Vec<usize>,
 }
 
 /// `GET /api/login` — stored hosts with their values masked.
@@ -58,11 +70,11 @@ pub async fn login_import(
     ) {
         return Json(serde_json::json!({ "success": false, "message": message }));
     }
-    let cookies = match parse_export(&body.envelope, body.passphrase.as_deref()) {
-        Ok(cookies) => cookies,
+    let credentials = match parse_export(&body.envelope, body.passphrase.as_deref()) {
+        Ok(credentials) => credentials,
         Err(error) => return Json(failure(error)),
     };
-    if cookies.is_empty() {
+    if credentials.is_empty() {
         return Json(serde_json::json!({
             "success": false,
             "message": "書き出しファイルに Cookie が含まれていません",
@@ -72,11 +84,12 @@ pub async fn login_import(
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let imported = cookies.len();
+    let imported = credentials.len();
+    let grouped = group_credentials(credentials);
     let stored = match if body.replace {
-        store.replace_all(&cookies)
+        store.replace_credentials(&grouped)
     } else {
-        store.merge(&cookies)
+        store.merge_credentials(&grouped)
     } {
         Ok(stored) => stored,
         Err(error) => return Json(failure(error)),
@@ -88,11 +101,16 @@ pub async fn login_import(
     }))
 }
 
-/// `POST /api/login/set` — store one host's cookie header.
+/// `POST /api/login/set` — replace one host's cookie header.
 pub async fn login_set(
     State(_state): State<AppState>,
     Json(body): Json<LoginSetRequest>,
 ) -> Json<serde_json::Value> {
+    login_set_or_add(body, false).await
+}
+
+/// 資格情報を 1 件保存する。`append` が真なら既存の後ろに足す。
+async fn login_set_or_add(body: LoginSetRequest, append: bool) -> Json<serde_json::Value> {
     if let Err(message) =
         validate_web_text_size(&body.cookie, MAX_WEB_TEXT_INPUT_BYTES, "cookie header")
     {
@@ -109,15 +127,86 @@ pub async fn login_set(
         Err(error) => return Json(failure(error)),
     };
     let host = normalize_cookie_host(&body.host);
-    let cookies = std::collections::BTreeMap::from([(host.clone(), body.cookie.trim().to_string())]);
-    if let Err(error) = store.merge(&cookies) {
+    let credential = LoginCredential::new(host.clone(), body.cookie.trim())
+        .with_label(body.label)
+        .with_added_at(Some(chrono::Local::now().to_rfc3339()));
+    let stored = match store.credentials_for(&host) {
+        Ok(stored) => stored,
+        Err(error) => return Json(failure(error)),
+    };
+    let credentials = if append {
+        let mut credentials = stored;
+        credentials.push(credential);
+        credentials
+    } else {
+        vec![credential]
+    };
+    if let Err(error) = store.save_credentials_for(&host, &credentials) {
         return Json(failure(error));
     }
     Json(serde_json::json!({
         "success": true,
-        "message": format!("{host} のログイン情報を保存しました"),
+        "message": format!("{host} のログイン情報を保存しました ({} 件)", credentials.len()),
         "data": status_payload().unwrap_or(serde_json::Value::Null),
     }))
+}
+
+/// `POST /api/login/add` — append one credential to a host's list.
+pub async fn login_add(
+    State(_state): State<AppState>,
+    Json(body): Json<LoginSetRequest>,
+) -> Json<serde_json::Value> {
+    login_set_or_add(body, true).await
+}
+
+/// `POST /api/login/{host}/{index}/order` 用の並べ替え。
+pub async fn login_order(
+    State(_state): State<AppState>,
+    Json(body): Json<LoginOrderRequest>,
+) -> Json<serde_json::Value> {
+    let store = match store() {
+        Ok(store) => store,
+        Err(error) => return Json(failure(error)),
+    };
+    let host = normalize_cookie_host(&body.host);
+    let stored = match store.credentials_for(&host) {
+        Ok(stored) => stored,
+        Err(error) => return Json(failure(error)),
+    };
+    let reordered = match reorder_credentials(&stored, &body.order) {
+        Ok(reordered) => reordered,
+        Err(message) => {
+            return Json(serde_json::json!({ "success": false, "message": message }));
+        }
+    };
+    if let Err(error) = store.save_credentials_for(&host, &reordered) {
+        return Json(failure(error));
+    }
+    Json(serde_json::json!({
+        "success": true,
+        "message": format!("{host} の試行順を変更しました"),
+        "data": status_payload().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+/// 並び順の指定（現在の添字の並び）を検証して適用する。
+fn reorder_credentials(
+    stored: &[LoginCredential],
+    order: &[usize],
+) -> std::result::Result<Vec<LoginCredential>, String> {
+    if order.len() != stored.len() {
+        return Err("並び順の指定が保存済みの件数と一致しません".to_string());
+    }
+    let mut seen = vec![false; stored.len()];
+    let mut reordered = Vec::with_capacity(stored.len());
+    for index in order {
+        if *index >= stored.len() || seen[*index] {
+            return Err("並び順の指定が不正です".to_string());
+        }
+        seen[*index] = true;
+        reordered.push(stored[*index].clone());
+    }
+    Ok(reordered)
 }
 
 /// `DELETE /api/login/{host}` — drop one host.
@@ -144,13 +233,47 @@ pub async fn login_clear_host(
     }
 }
 
+/// `DELETE /api/login/{host}/{index}` — drop one credential of a host.
+pub async fn login_clear_credential(
+    State(_state): State<AppState>,
+    Path((host, index)): Path<(String, usize)>,
+) -> Json<serde_json::Value> {
+    let store = match store() {
+        Ok(store) => store,
+        Err(error) => return Json(failure(error)),
+    };
+    let host = normalize_cookie_host(&host);
+    let mut credentials = match store.credentials_for(&host) {
+        Ok(credentials) => credentials,
+        Err(error) => return Json(failure(error)),
+    };
+    if index >= credentials.len() {
+        return Json(serde_json::json!({
+            "success": false,
+            "message": format!("{host} の {} 番目のログイン情報はありません", index + 1),
+        }));
+    }
+    credentials.remove(index);
+    if let Err(error) = store.save_credentials_for(&host, &credentials) {
+        return Json(failure(error));
+    }
+    Json(serde_json::json!({
+        "success": true,
+        "message": format!("{host} の {} 番目のログイン情報を削除しました", index + 1),
+        "data": status_payload().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
 /// `DELETE /api/login` — drop every host.
 pub async fn login_clear_all(State(_state): State<AppState>) -> Json<serde_json::Value> {
     let store = match store() {
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let removed = store.load_all().map(|cookies| cookies.len()).unwrap_or(0);
+    let removed = store
+        .credentials_by_host()
+        .map(|cookies| cookies.len())
+        .unwrap_or(0);
     if let Err(error) = store.clear_all() {
         return Json(failure(error));
     }
@@ -168,17 +291,33 @@ fn store() -> Result<InventoryCookieStore, NarouError> {
 /// Stored hosts and their key source, with every cookie value masked.
 fn status_payload() -> Result<serde_json::Value, NarouError> {
     let store = store()?;
-    let cookies = store.load_all()?;
+    let cookies = store.credentials_by_host()?;
+    let mut total = 0;
     let hosts = cookies
         .iter()
-        .map(|(host, cookie)| {
+        .map(|(host, credentials)| {
+            total += credentials.len();
+            let entries = credentials
+                .iter()
+                .enumerate()
+                .map(|(index, credential)| {
+                    serde_json::json!({
+                        "index": index,
+                        "label": credential.label,
+                        "host": credential.host,
+                        "cookies": mask_cookie(&credential.cookie),
+                        "names": parse_cookie_header(&credential.cookie)
+                            .into_iter()
+                            .map(|(name, _)| name)
+                            .collect::<Vec<_>>(),
+                        "length": credential.cookie.chars().count(),
+                        "added_at": credential.added_at,
+                    })
+                })
+                .collect::<Vec<_>>();
             serde_json::json!({
                 "host": host,
-                "cookies": mask_cookie(cookie),
-                "names": parse_cookie_header(cookie)
-                    .into_iter()
-                    .map(|(name, _)| name)
-                    .collect::<Vec<_>>(),
+                "credentials": entries,
                 "encrypted": store.is_encrypted(host).unwrap_or(false),
             })
         })
@@ -186,6 +325,7 @@ fn status_payload() -> Result<serde_json::Value, NarouError> {
     Ok(serde_json::json!({
         "hosts": hosts,
         "count": cookies.len(),
+        "credentials": total,
         "key_source": store.key_source().map(|source| source.describe()).unwrap_or("unknown"),
     }))
 }

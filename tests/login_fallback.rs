@@ -113,7 +113,16 @@ async fn login_fallback_retries_with_the_stored_cookie_and_flags_the_novel() {
         authenticated_requests: AtomicUsize::new(0),
     });
     let cookies = Arc::new(MemoryCookieStore::new());
-    cookies.save("example.com", "session=abc").await.unwrap();
+    cookies
+        .save_all(
+            "example.com",
+            &[narou_rs::platform::LoginCredential::new(
+                "example.com",
+                "session=abc",
+            )],
+        )
+        .await
+        .unwrap();
 
     let store = Arc::new(MemoryObjectStore::new());
     let objects: Arc<dyn ObjectStore> = store.clone();

@@ -241,11 +241,21 @@ fn write_export(
     store: Option<&InventoryCookieStore>,
     args: &Args,
 ) -> std::result::Result<(), String> {
-    let mut cookies = match store {
-        Some(store) => store.load_all().map_err(|error| error.to_string())?,
+    let mut credentials = match store {
+        Some(store) => store.credentials_by_host().map_err(|error| error.to_string())?,
         None => BTreeMap::new(),
     };
-    cookies.extend(captured.iter().map(|(host, cookie)| (host.clone(), cookie.clone())));
+    for (host, cookie) in captured {
+        credentials.insert(
+            host.clone(),
+            vec![
+                narou_rs::platform::LoginCredential::new(host, cookie)
+                    .with_added_at(Some(chrono::Local::now().to_rfc3339())),
+            ],
+        );
+    }
+    let credentials: Vec<narou_rs::platform::LoginCredential> =
+        credentials.into_values().flatten().collect();
 
     let passphrase = if args.clear_text {
         None
@@ -256,7 +266,7 @@ fn write_export(
         .ok()
         .and_then(|dir| dir.file_name().map(|name| name.to_string_lossy().into_owned()));
     let text = build_export(
-        &cookies,
+        &credentials,
         passphrase,
         &chrono::Local::now().to_rfc3339(),
         library.as_deref(),
@@ -264,7 +274,11 @@ fn write_export(
     .map_err(|error| error.to_string())?;
     std::fs::write(path, text).map_err(|error| format!("{} に書き込めません: {error}", path.display()))?;
 
-    println!("{} に {} サイトの Cookie を書き出しました", path.display(), cookies.len());
+    println!(
+        "{} に {} 件の Cookie を書き出しました",
+        path.display(),
+        credentials.len()
+    );
     match passphrase {
         Some(_) => println!(
             "  暗号化済みです。取り込み先で `narou login import {} --passphrase <同じパスフレーズ>` を実行してください。",
@@ -279,18 +293,30 @@ fn write_export(
 }
 
 fn list_cookies(store: &InventoryCookieStore) -> std::result::Result<(), String> {
-    let cookies = block_on(store.list()).map_err(|error| error.to_string())?;
-    if cookies.is_empty() {
+    let stored = store.credentials_by_host().map_err(|error| error.to_string())?;
+    if stored.is_empty() {
         println!("保存済みのログイン Cookie はありません");
         return Ok(());
     }
-    for (host, cookie) in cookies {
-        let names: Vec<&str> = cookie
-            .split(';')
-            .filter_map(|pair| pair.split('=').next())
-            .map(str::trim)
-            .collect();
-        println!("{host}: {}", names.join(", "));
+    for (host, credentials) in stored {
+        println!("{host}:");
+        for (index, credential) in credentials.iter().enumerate() {
+            let names: Vec<String> = narou_rs::platform::parse_cookie_header(&credential.cookie)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            println!(
+                "  {}. {}{} ({})",
+                index + 1,
+                credential.display_name(),
+                credential
+                    .label
+                    .as_ref()
+                    .map(|_| format!(" [{}]", credential.host))
+                    .unwrap_or_default(),
+                names.join(", ")
+            );
+        }
     }
     Ok(())
 }
@@ -300,13 +326,16 @@ fn save_cookie(
     host: &str,
     cookie: &str,
 ) -> std::result::Result<(), String> {
-    let names: Vec<&str> = cookie
-        .split(';')
-        .filter_map(|pair| pair.split('=').next())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
+    let names: Vec<String> = narou_rs::platform::parse_cookie_header(cookie)
+        .into_iter()
+        .map(|(name, _)| name)
         .collect();
-    block_on(store.save(host, cookie)).map_err(|error| error.to_string())?;
+    // 同じホストの既存分は置き換える（`narou login set` と同じ意味）。
+    let credential = narou_rs::platform::LoginCredential::new(host, cookie)
+        .with_added_at(Some(chrono::Local::now().to_rfc3339()));
+    store
+        .save_credentials_for(host, &[credential])
+        .map_err(|error| error.to_string())?;
     println!("{host} の Cookie を保存しました ({})", names.join(", "));
     Ok(())
 }

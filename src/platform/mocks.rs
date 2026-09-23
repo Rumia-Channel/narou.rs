@@ -12,9 +12,9 @@ use parking_lot::Mutex;
 use crate::db::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::platform::{
-    AssetStore, CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, NovelFilter, NovelId,
-    NovelMutation, NovelQuery, NovelRepository, ObjectKey, ObjectListPage, ObjectListRequest,
-    ObjectMetadata, ObjectStore, PlatformFuture, RateLimitScope, RateLimiter,
+    AssetStore, CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, LoginCredential,
+    NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, ObjectKey, ObjectListPage,
+    ObjectListRequest, ObjectMetadata, ObjectStore, PlatformFuture, RateLimitScope, RateLimiter,
 };
 
 /// HTTP client backed by a caller-provided responder closure.
@@ -477,7 +477,9 @@ impl RateLimiter for FakeRateLimiter {
 /// In-memory [`CookieStore`] for tests and the Worker runtime.
 #[derive(Debug, Default, Clone)]
 pub struct MemoryCookieStore {
-    cookies: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
+    cookies: std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, Vec<LoginCredential>>>,
+    >,
 }
 
 impl MemoryCookieStore {
@@ -495,28 +497,38 @@ impl MemoryCookieStore {
 }
 
 impl CookieStore for MemoryCookieStore {
-    fn load<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<Option<String>>> {
+    fn load_all<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<Vec<LoginCredential>>> {
         let host = host.to_ascii_lowercase();
         Box::pin(async move {
-            Ok(self
-                .cookies
-                .lock()
-                .unwrap()
-                .get(&host)
-                .filter(|cookie| !cookie.is_empty())
-                .cloned())
+            let cookies = self.cookies.lock().unwrap();
+            let mut credentials: Vec<LoginCredential> = Vec::new();
+            for key in crate::platform::cookie_lookup_hosts(&host) {
+                let Some(entries) = cookies.get(&key) else {
+                    continue;
+                };
+                for credential in entries {
+                    if !credentials.iter().any(|seen| seen.same_cookie(credential)) {
+                        credentials.push(credential.clone());
+                    }
+                }
+            }
+            Ok(credentials)
         })
     }
 
-    fn save<'a>(&'a self, host: &'a str, cookie: &'a str) -> PlatformFuture<'a, Result<()>> {
+    fn save_all<'a>(
+        &'a self,
+        host: &'a str,
+        credentials: &'a [LoginCredential],
+    ) -> PlatformFuture<'a, Result<()>> {
         let host = host.to_ascii_lowercase();
-        let cookie = cookie.to_string();
+        let credentials: Vec<LoginCredential> = credentials.to_vec();
         Box::pin(async move {
             let mut cookies = self.cookies.lock().unwrap();
-            if cookie.trim().is_empty() {
+            if credentials.is_empty() {
                 cookies.remove(&host);
             } else {
-                cookies.insert(host, cookie);
+                cookies.insert(host, credentials);
             }
             Ok(())
         })
@@ -530,7 +542,9 @@ impl CookieStore for MemoryCookieStore {
         })
     }
 
-    fn list(&self) -> PlatformFuture<'_, Result<std::collections::BTreeMap<String, String>>> {
+    fn list(
+        &self,
+    ) -> PlatformFuture<'_, Result<std::collections::BTreeMap<String, Vec<LoginCredential>>>> {
         Box::pin(async move { Ok(self.cookies.lock().unwrap().clone()) })
     }
 }

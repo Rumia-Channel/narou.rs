@@ -11,19 +11,102 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::Result;
 use crate::platform::PlatformFuture;
 
+/// One stored login credential (a `Cookie:` header captured for a site).
+///
+/// A site may hold several, and their order *is* the order the downloader
+/// tries them in: the first entry is sent when a novel is already known to
+/// need a login, and the rest are tried when a fetch still looks blocked or
+/// incomplete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginCredential {
+    /// Host the cookies were captured from; also where `Set-Cookie` updates
+    /// are written back.
+    pub host: String,
+    /// `Cookie:` header value.
+    pub cookie: String,
+    /// Optional label shown in the CLI and Web UI ("メイン", "R18用", …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// When the credential was captured or imported (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<String>,
+}
+
+impl LoginCredential {
+    pub fn new(host: impl Into<String>, cookie: impl Into<String>) -> Self {
+        Self {
+            host: normalize_cookie_host(&host.into()),
+            cookie: cookie.into(),
+            label: None,
+            added_at: None,
+        }
+    }
+
+    pub fn with_label(mut self, label: Option<String>) -> Self {
+        self.label = label.filter(|label| !label.trim().is_empty());
+        self
+    }
+
+    pub fn with_added_at(mut self, added_at: Option<String>) -> Self {
+        self.added_at = added_at;
+        self
+    }
+
+    /// Label for display, falling back to the host.
+    pub fn display_name(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.host)
+    }
+
+    /// Whether two entries carry the same session (the order list treats a
+    /// repeated value as the same credential).
+    pub fn same_cookie(&self, other: &Self) -> bool {
+        self.cookie == other.cookie
+    }
+}
+
+/// Encode credentials for inventory storage, which only holds strings.
+pub fn encode_credentials(credentials: &[LoginCredential]) -> Result<String> {
+    serde_json::to_string(credentials)
+        .map_err(|error| crate::error::NarouError::Login(format!("資格情報を保存できません: {error}")))
+}
+
+/// Decode a stored value.
+///
+/// Values written before a site could hold several credentials are a bare
+/// `Cookie:` header; those are read as a single entry so an older library keeps
+/// working (and is upgraded on the next write).
+pub fn decode_credentials(value: &str, host: &str) -> Vec<LoginCredential> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('[') {
+        if let Ok(credentials) = serde_json::from_str::<Vec<LoginCredential>>(trimmed) {
+            return credentials;
+        }
+    }
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    vec![LoginCredential::new(host, trimmed)]
+}
+
 /// Cookie persistence boundary.
 pub trait CookieStore: Send + Sync {
-    /// Stored `Cookie:` header value for `host`, when present.
-    fn load<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<Option<String>>>;
-    /// Replace the stored cookies for `host`.
-    fn save<'a>(&'a self, host: &'a str, cookie: &'a str) -> PlatformFuture<'a, Result<()>>;
-    /// Drop the stored cookies for `host`.
+    /// Credentials stored for `host`, in the order they should be tried.
+    fn load_all<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<Vec<LoginCredential>>>;
+    /// Replace every credential for `host` (an empty slice removes the entry).
+    fn save_all<'a>(
+        &'a self,
+        host: &'a str,
+        credentials: &'a [LoginCredential],
+    ) -> PlatformFuture<'a, Result<()>>;
+    /// Drop the stored credentials for `host`.
     fn clear<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<()>>;
-    /// Every stored `host → cookie` pair, ordered by host.
-    fn list(&self) -> PlatformFuture<'_, Result<BTreeMap<String, String>>>;
+    /// Every stored host with its ordered credentials.
+    fn list(&self) -> PlatformFuture<'_, Result<BTreeMap<String, Vec<LoginCredential>>>>;
 }
 
 /// Canonical form of a request host used as a credential key.

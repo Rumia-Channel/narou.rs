@@ -34,7 +34,7 @@ use self::novel_info::NovelInfo;
 use self::persistence::section_filename;
 use self::persistence::{PersistenceService, compute_section_hash};
 
-use crate::platform::CookieStore;
+use crate::platform::{CookieStore, LoginCredential};
 use self::section::{SectionCache, download_section};
 use self::security::is_safe_public_url;
 use self::settings::DownloaderSettings;
@@ -629,8 +629,21 @@ impl Downloader {
 
     /// Load the stored login cookie for `host`, when a store is available.
     async fn stored_cookie_for(&self, host: Option<&str>) -> Option<String> {
-        let cookies = self.cookies.as_ref()?;
-        cookies.load(host?).await.ok().flatten()
+        self.stored_credentials_for(host)
+            .await
+            .first()
+            .map(|credential| credential.cookie.clone())
+    }
+
+    /// 保存済みの資格情報を試行順で返す。
+    async fn stored_credentials_for(&self, host: Option<&str>) -> Vec<LoginCredential> {
+        let Some(cookies) = self.cookies.as_ref() else {
+            return Vec::new();
+        };
+        let Some(host) = host else {
+            return Vec::new();
+        };
+        cookies.load_all(host).await.unwrap_or_default()
     }
 
     /// [`Self::with_platform_and_storage_and_settings`] with bundled values.
@@ -1305,30 +1318,47 @@ impl Downloader {
         let login_wall = should_retry_with_login(&setting, &toc_source);
         let partial_view = !login_wall && is_partial_login_view(&setting, &toc_source);
         if login_cookie.is_none() && (login_wall || partial_view) {
-            if let Some(cookie) = self.stored_cookie_for(login_host.as_deref()).await {
+            // 保存済みの資格情報を順に試す。ログイン壁は成功した時点で、
+            // 部分一覧は「欠けが消えた／話数が増えた」時点で打ち切る。
+            let credentials = self.stored_credentials_for(login_host.as_deref()).await;
+            if !credentials.is_empty() {
                 report_line("ログインが必要な可能性があります。保存済みのログイン情報で再試行します");
-                apply_login_cookie(&mut setting, &cookie);
-                let retried = fetch_toc(
-                    self.http.as_ref(),
-                    self.rate_limiter.as_ref(),
-                    &setting,
-                    &toc_url,
-                    &mut self.preprocess_jobs,
-                )
-                .await;
-                if partial_view {
-                    // 一覧が欠けたまま成功した応答。ログインしてもマイピク
-                    // などで欠けたままのことがあるため、「欠けが消えた」か
-                    // 「取得できた話数が増えた」ときだけ採用する。
-                    if is_improved_toc(&setting, toc_source.as_ref(), retried.as_ref()) {
+                let base_cookie = setting.cookie.clone();
+                let mut winner: Option<LoginCredential> = None;
+                for credential in &credentials {
+                    setting.cookie = base_cookie.clone();
+                    apply_login_cookie(&mut setting, &credential.cookie);
+                    let retried = fetch_toc(
+                        self.http.as_ref(),
+                        self.rate_limiter.as_ref(),
+                        &setting,
+                        &toc_url,
+                        &mut self.preprocess_jobs,
+                    )
+                    .await;
+                    if partial_view {
+                        if is_improved_toc(&setting, toc_source.as_ref(), retried.as_ref()) {
+                            let resolved = retried
+                                .as_ref()
+                                .is_ok_and(|source| !setting.is_partial_login_view(source));
+                            requires_login = true;
+                            toc_source = retried;
+                            winner = Some(credential.clone());
+                            if resolved {
+                                break;
+                            }
+                        }
+                    } else if retried.is_ok() {
                         requires_login = true;
                         toc_source = retried;
+                        winner = Some(credential.clone());
+                        break;
                     }
-                } else {
-                    if retried.is_ok() {
-                        requires_login = true;
-                    }
-                    toc_source = retried;
+                }
+                // 採用した資格情報を最終状態に残す（本文も同じ Cookie で取る）。
+                setting.cookie = base_cookie;
+                if let Some(winner) = &winner {
+                    apply_login_cookie(&mut setting, &winner.cookie);
                 }
             }
         }
@@ -1491,25 +1521,41 @@ impl Downloader {
         // シリーズは未ログインだと本文一覧が 0 件になる) は、保存済み Cookie で
         // 取り直し、話数が増えたときだけ採用する。
         if partial_listing && login_cookie.is_none() {
-            if let Some(cookie) = self.stored_cookie_for(login_host.as_deref()).await {
+            let credentials = self.stored_credentials_for(login_host.as_deref()).await;
+            if !credentials.is_empty() {
                 report_line("ログインが必要な可能性があります。保存済みのログイン情報で再試行します");
-                apply_login_cookie(&mut setting, &cookie);
-                if let Ok((retried, retried_partial)) = parse_subtitles_multipage(
-                    self.http.as_ref(),
-                    self.rate_limiter.as_ref(),
-                    &setting,
-                    &toc_source,
-                    &url_captures,
-                    &title,
-                    self.progress.as_deref(),
-                    &mut self.preprocess_jobs,
-                )
-                .await
-                {
+                let base_cookie = setting.cookie.clone();
+                let mut winner: Option<LoginCredential> = None;
+                for credential in &credentials {
+                    setting.cookie = base_cookie.clone();
+                    apply_login_cookie(&mut setting, &credential.cookie);
+                    let Ok((retried, retried_partial)) = parse_subtitles_multipage(
+                        self.http.as_ref(),
+                        self.rate_limiter.as_ref(),
+                        &setting,
+                        &toc_source,
+                        &url_captures,
+                        &title,
+                        self.progress.as_deref(),
+                        &mut self.preprocess_jobs,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
                     if !retried_partial || retried.len() > subtitles.len() {
+                        let resolved = !retried_partial;
                         subtitles = retried;
                         requires_login = true;
+                        winner = Some(credential.clone());
+                        if resolved {
+                            break;
+                        }
                     }
+                }
+                setting.cookie = base_cookie;
+                if let Some(winner) = &winner {
+                    apply_login_cookie(&mut setting, &winner.cookie);
                 }
             }
         }
