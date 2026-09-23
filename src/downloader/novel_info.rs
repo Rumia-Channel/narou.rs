@@ -55,6 +55,7 @@ impl NovelInfo {
         toc_source: &str,
         url_captures: &HashMap<String, String>,
         toc_url: &str,
+        jobs: &mut super::preprocess::PreprocessJobs,
     ) -> Result<Self> {
         let Some(novel_info_url) = &setting.novel_info_url else {
             return Ok(Self::from_toc_source(setting, toc_source));
@@ -68,21 +69,27 @@ impl NovelInfo {
             // and pre-treating it again.
             return Ok(Self::from_novel_info_source(setting, toc_source));
         }
+        let policy = http_policy::FetchPolicy::for_site(setting);
         match http_policy::fetch_text(
             http,
             rate_limiter,
             &resolved_url,
-            &http_policy::FetchPolicy::for_site(setting),
+            &policy,
             Some(setting.encoding()),
         )
         .await
         {
             Ok(mut body) => {
-                crate::downloader::pretreatment_source(
+                crate::downloader::util::pretreatment_source_with_jobs(
+                    http,
+                    rate_limiter,
+                    &policy,
                     &mut body,
                     setting.encoding(),
                     Some(setting),
-                );
+                    jobs,
+                )
+                .await?;
                 Ok(Self::from_novel_info_source(setting, &body))
             }
             Err(_) => Ok(Self::from_toc_source(setting, toc_source)),

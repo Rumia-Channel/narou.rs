@@ -138,6 +138,10 @@ pub struct Downloader {
     cookies: Option<Arc<dyn CookieStore>>,
     settings: Arc<dyn DownloaderSettings>,
     progress: Option<Box<dyn ProgressReporter>>,
+    /// Results of URLs that `preprocess:` runs asked for. Lives for one novel
+    /// download so repeated references (e.g. one illustration used by many
+    /// sections of a series) resolve once.
+    preprocess_jobs: super::downloader::preprocess::PreprocessJobs,
 }
 
 /// Report a status line. Native prints to stdout atomically; Worker routes to
@@ -712,6 +716,7 @@ impl Downloader {
             section_hash_cache_dirty: false,
             settings,
             progress: None,
+            preprocess_jobs: super::downloader::preprocess::PreprocessJobs::new(),
         })
     }
 
@@ -740,7 +745,7 @@ impl Downloader {
     }
 
     async fn load_novel_info(
-        &self,
+        &mut self,
         setting: &SiteSetting,
         toc_source: &str,
         url_captures: &HashMap<String, String>,
@@ -753,6 +758,7 @@ impl Downloader {
             toc_source,
             url_captures,
             toc_url,
+            &mut self.preprocess_jobs,
         )
         .await
     }
@@ -787,6 +793,7 @@ impl Downloader {
             self.rate_limiter.as_ref(),
             &setting,
             &toc_url,
+            &mut self.preprocess_jobs,
         )
         .await?;
         let info = self
@@ -815,6 +822,7 @@ impl Downloader {
                     &url_captures,
                     title,
                     self.progress.as_deref(),
+                    &mut self.preprocess_jobs,
                 )
                 .await
                 .ok()
@@ -1118,6 +1126,9 @@ impl Downloader {
         let force = options.force;
         let resume_from_section = options.resume_from_section;
         let mut budget = options.budget.take();
+        // Preprocess job results belong to one novel: a new download starts
+        // with an empty set so nothing leaks between works.
+        self.preprocess_jobs.reset();
         let (existing_id, mut setting) = self.resolve_target_for_download(target).await?;
         let provisional_id = match existing_id {
             Some(id) => id,
@@ -1249,6 +1260,7 @@ impl Downloader {
                 self.rate_limiter.as_ref(),
                 &setting,
                 &toc_url,
+                &mut self.preprocess_jobs,
             )
             .await,
         };
@@ -1265,6 +1277,7 @@ impl Downloader {
                     self.rate_limiter.as_ref(),
                     &setting,
                     &toc_url,
+                    &mut self.preprocess_jobs,
                 )
                 .await;
                 if retried.is_ok() {
@@ -1420,6 +1433,7 @@ impl Downloader {
                 &url_captures,
                 &title,
                 self.progress.as_deref(),
+                &mut self.preprocess_jobs,
             )
             .await?
         };
@@ -1686,6 +1700,7 @@ impl Downloader {
                         &setting,
                         subtitle,
                         &toc_url,
+                        &mut self.preprocess_jobs,
                     )
                     .await?
                 };
@@ -2102,6 +2117,7 @@ impl Downloader {
                     setting,
                     latest,
                     toc_url,
+                    &mut self.preprocess_jobs,
                 )
                 .await?;
                 let new_hash = compute_section_hash(&downloaded.0);
@@ -2604,7 +2620,13 @@ mod tests {
         );
 
         let toc_source =
-            super::toc::fetch_toc(http.as_ref(), &FakeRateLimiter::new(), &setting, toc_url)
+            super::toc::fetch_toc(
+                http.as_ref(),
+                &FakeRateLimiter::new(),
+                &setting,
+                toc_url,
+                &mut super::preprocess::PreprocessJobs::new(),
+            )
                 .await
                 .unwrap();
         let captures = HashMap::from([("ncode".to_string(), "n1234ab".to_string())]);
@@ -2619,6 +2641,7 @@ mod tests {
             &setting,
             &subtitles[0],
             toc_url,
+            &mut super::preprocess::PreprocessJobs::new(),
         )
         .await
         .unwrap();
@@ -3399,6 +3422,87 @@ is_narou: false
         assert!(html.contains("アンケート　\"どれ？\"　　票数10票<br>　　　A　　6票<br>　　　B　　4票"));
         assert!(html.contains("::postscript_end"));
         assert_eq!(setting_body(&html), "本文です");
+    }
+
+    #[test]
+    fn pixiv_illustration_references_resolve_through_the_job_queue() {
+        // 挿絵 URL は同じ応答に無いので、DSL が追加 API を要求し、実行側が
+        // 取得して再実行した結果として <img> に変わる。
+        let setting = pixiv_setting();
+        let http = MockHttpClient::new();
+        http.add_text(
+            "https://www.pixiv.net/ajax/illust/83791147/pages",
+            200,
+            r#"{"error":false,"body":[{"urls":{"original":"https://i.pximg.net/img/83791147_p0.jpg"}}]}"#,
+        );
+        let mut jobs = super::preprocess::PreprocessJobs::new();
+        let mut source = r#"{"error":false,"message":"","body":{
+            "id":"29204764","title":"短編集","userName":"沼月時雨","description":"あらすじ",
+            "content":"前\n[pixivimage:83791147-1]\n[uploadedimage:22638629]\n後",
+            "createDate":"2026-09-23T07:48:07+00:00","uploadDate":"2026-09-23T07:48:07+00:00",
+            "characterCount":10,"seriesNavData":null,
+            "textEmbeddedImages":{"22638629":{"urls":{"original":"https://i.pximg.net/img/uploaded.png"}}},
+            "tags":{"tags":[{"tag":"タグA"}]}}}"#
+            .to_string();
+
+        futures::executor::block_on(super::util::pretreatment_source_with_jobs(
+            &http,
+            &FakeRateLimiter::new(),
+            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+            &mut source,
+            "UTF-8",
+            Some(setting),
+            &mut jobs,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            http.requested_urls(),
+            vec!["GET https://www.pixiv.net/ajax/illust/83791147/pages"],
+            "the definition should ask for the illustration pages once"
+        );
+        assert_eq!(jobs.len(), 1);
+        let body = setting_body(&source);
+        assert!(
+            body.contains(r#"<img src="https://i.pximg.net/img/83791147_p0.jpg">"#),
+            "got: {body}"
+        );
+        // 同じ応答にある挿絵は追加取得なしで解決する
+        assert!(
+            body.contains(r#"<img src="https://i.pximg.net/img/uploaded.png">"#),
+            "got: {body}"
+        );
+        assert!(!body.contains("pixivimage"), "got: {body}");
+    }
+
+    #[test]
+    fn pixiv_unresolved_illustration_keeps_only_a_marker() {
+        // 取得に失敗しても本文は落とさず、目印だけ残す。
+        let setting = pixiv_setting();
+        let http = MockHttpClient::new();
+        let mut jobs = super::preprocess::PreprocessJobs::new();
+        let mut source = r#"{"error":false,"message":"","body":{
+            "id":"29204764","title":"短編集","userName":"沼月時雨","description":"あらすじ",
+            "content":"前\n[pixivimage:83791147-1]\n後",
+            "createDate":"2026-09-23T07:48:07+00:00","uploadDate":"2026-09-23T07:48:07+00:00",
+            "characterCount":10,"seriesNavData":null,"tags":{"tags":[{"tag":"タグA"}]}}}"#
+            .to_string();
+
+        futures::executor::block_on(super::util::pretreatment_source_with_jobs(
+            &http,
+            &FakeRateLimiter::new(),
+            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+            &mut source,
+            "UTF-8",
+            Some(setting),
+            &mut jobs,
+        ))
+        .unwrap();
+
+        let body = setting_body(&source);
+        assert_eq!(body, "前<br><!--pixivimage:83791147-1--><br>後");
+        // 失敗したジョブは null として残り、無駄に再取得しない
+        assert_eq!(jobs.len(), 1);
     }
 
     #[test]

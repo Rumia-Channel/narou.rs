@@ -51,12 +51,18 @@ expr       = _{ or_expr }
 or_expr    = { and_expr ~ ("||" ~ and_expr)* }
 and_expr   = { unary_expr ~ ("&&" ~ unary_expr)* }
 unary_expr = { "!" ~ unary_expr | cmp_expr }
-cmp_expr   = { primary ~ (cmp_op ~ primary)? }
+cmp_expr   = { add_expr ~ (cmp_op ~ add_expr)? }
 cmp_op     = { "==" | "!=" }
+// 整数の加減算。数値でない被演算数は null になる (暗黙の文字列連結はしない)。
+add_expr   = { primary ~ (add_op ~ primary)* }
+add_op     = { "+" | "-" }
 
 primary = _{
     string
     | extract_json_expr
+    | call_chain_expr
+    | request_expr
+    | fetch_json_expr
     | chain_expr
     | array_chain_expr
     | array_literal
@@ -68,12 +74,21 @@ primary = _{
 // --- JSON extraction ---
 extract_json_expr = { "extract_json" ~ "(" ~ regex ~ ")" }
 
+// --- extra fetch request ---
+// 追加の取得要求。実行は async 側 (サイトの FetchPolicy 経由) が行い、結果は
+// 次の実行で `fetched["<url>"]` として見える。
+request_expr = { "request" ~ "(" ~ string ~ ")" }
+// 取得要求と結果参照の糖衣。未解決・失敗なら null を返す。
+fetch_json_expr = { "fetch_json" ~ "(" ~ string ~ ")" }
+// `fetch_json(...).body[0].urls.original` のように呼び出し結果を辿る形。
+call_chain_expr = { (request_expr | fetch_json_expr) ~ chain_part+ }
+
 // --- accessor + method chain ---
 chain_expr = { ident ~ chain_part* }
 chain_part = _{ method | dot_access | bracket_access }
 dot_access   = { "." ~ ident }
 bracket_access = { "[" ~ bracket_inner ~ "]" }
-bracket_inner  = _{ int_lit | string | chain_expr }
+bracket_inner  = _{ int_lit | string | expr }
 
 method = {
     ".map" ~ block
@@ -81,6 +96,7 @@ method = {
     | ".flatten" ~ method_end
     | ".compact" ~ method_end
     | ".join" ~ "(" ~ string ~ ")"
+    | ".gsub" ~ "(" ~ (regex | string) ~ ")" ~ block
     | ".gsub" ~ "(" ~ (regex | string) ~ "," ~ string ~ ")"
     | ".replace" ~ "(" ~ string ~ "," ~ string ~ ")"
     | ".is_array" ~ method_end
@@ -103,7 +119,7 @@ block = { BLOCK_OPEN ~ PIPE ~ ident ~ PIPE ~ expr ~ BLOCK_CLOSE }
 string   = _{ i_string | r_string }
 i_string = { "\"" ~ i_part* ~ "\"" }
 i_part   = _{ interp | i_text }
-interp   = { "${" ~ chain_expr ~ "}" }
+interp   = { "${" ~ expr ~ "}" }
 i_text   = @{ (escape_char | (!(("\"") | ("${")) ~ ANY))+ }
 
 r_string = { "'" ~ r_text ~ "'" }

@@ -38,9 +38,7 @@ impl FetchPolicy {
         if let Some(cookie) = setting.cookie() {
             headers.push(("Cookie".to_string(), cookie.to_string()));
         }
-        for (name, value) in setting.header_list() {
-            headers.push((name.to_string(), value.to_string()));
-        }
+        headers.extend(setting.header_list());
         headers.retain(|(name, value)| is_safe_header_name(name) && is_safe_header_value(value));
         Self {
             headers,

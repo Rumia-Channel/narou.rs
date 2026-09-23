@@ -19,6 +19,8 @@ url:
   - https?://\\k<domain>/ajax/novel/(?<kind>)(?<work_id>\d+)
 encoding: UTF-8
 timezone: Asia/Tokyo
+headers:
+  Referer: \k<top_url>/
 confirm_over18: no
 append_title_to_folder_name: yes
 version: 1.0
@@ -110,11 +112,18 @@ preprocess: |-
         let text = text.gsub(/\[\[jumpuri:(.*?)\s*>\s*(.*?)\]\]/, "<a href=\"$2\">$1</a>")
         let text = text.gsub(/\[chapter:([^\]]*)\]/, "$1")
         let text = text.gsub(/\[jump:(\d+)\]/, "（$1ページ目へ）")
-        # 挿絵は URL の解決に別 API (illust/pages) と i.pximg.net 用の Referer が
-        # 要るため、この定義では本文へ取り込まない。原文は raw/ に残るので、
-        # 本文では目印だけ残して読書面から消す。
-        let text = text.gsub(/\[pixivimage:(\d+-\d+)\]/, "<!--pixivimage:$1-->")
-        let text = text.gsub(/\[uploadedimage:(\d+)\]/, "<!--uploadedimage:$1-->")
+
+        # 挿絵。`[pixivimage:ID-N]` は ID から画像 URL を引く追加 API が要るので
+        # request キューに載せ、次の実行で結果が入る。解決できなかった参照は
+        # 目印だけ残して読書面から消す (取得失敗で本文全体を落とさない)。
+        # 話数付き (`-N`) と話数なし (1 枚目) の 2 形態がある。
+        let text = text.gsub(/\[pixivimage:(\d+)-(\d+)\]/) { |m| fetch_json("https://www.pixiv.net/ajax/illust/${m[1]}/pages").body[m[2] - 1].urls.original || "<!--pixivimage:${m[1]}-${m[2]}-->" }
+        let text = text.gsub(/\[pixivimage:(\d+)\]/) { |m| fetch_json("https://www.pixiv.net/ajax/illust/${m[1]}/pages").body.first.urls.original || "<!--pixivimage:${m[1]}-->" }
+        # `[uploadedimage:ID]` は同じ応答に URL があるので追加取得は不要。
+        let text = text.gsub(/\[uploadedimage:(\d+)\]/) { |m| body.textEmbeddedImages[m[1]].urls.original || "<!--uploadedimage:${m[1]}-->" }
+        # 解決済みの画像 URL を挿絵タグへ (narou が illust_grep_pattern で拾う)。
+        let text = text.gsub(/https:\/\/i\.pximg\.net\/[^\s<>"]+/, "<img src=\"$0\">")
+
         let text = text.replace("[newpage]", "［＃改ページ］")
         let text = text.replace("\n", "<br>")
         emit "body::"
@@ -150,6 +159,8 @@ next_url: \\k<top_url>\\k<next_page>
 
 # ------------------------------------------------------------
 # 本文取得設定
+# 挿絵は i.pximg.net から落とす。このホストは Referer が無いと 403 を返す。
+illust_grep_pattern: <img src="(?<src>.+?)"[^>]*>
 body_pattern: |-
   body::
   (?<body>.+?)

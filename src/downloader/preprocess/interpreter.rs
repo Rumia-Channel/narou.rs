@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use super::ast::*;
+use super::jobs::{MAX_PREPROCESS_JOBS, PreprocessJobs};
 
 const PREPROCESS_STEP_BUDGET: usize = 100_000;
 const PREPROCESS_MAX_STRING_BYTES: usize = 16 * 1024 * 1024;
@@ -11,21 +12,49 @@ const PREPROCESS_MAX_ARRAY_ITEMS: usize = 100_000;
 
 type PreprocessResult<T> = Result<T, String>;
 
-struct Ctx {
+struct Ctx<'a> {
     vars: HashMap<String, Value>,
     output: Vec<String>,
     match_start: Option<usize>,
     step_budget: usize,
+    /// Results of previously requested URLs, exposed to the DSL as `fetched`.
+    jobs: &'a PreprocessJobs,
+    /// URLs this run asked for, in request order.
+    requested: Vec<String>,
 }
 
-impl Ctx {
-    fn new() -> Self {
+impl<'a> Ctx<'a> {
+    fn new(jobs: &'a PreprocessJobs) -> Self {
+        let mut vars = HashMap::new();
+        vars.insert(
+            "fetched".to_string(),
+            Value::Object(jobs.results().iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        );
         Self {
-            vars: HashMap::new(),
+            vars,
             output: Vec::new(),
             match_start: None,
             step_budget: PREPROCESS_STEP_BUDGET,
+            jobs,
+            requested: Vec::new(),
         }
+    }
+
+    /// Record a fetch request. Invalid or already-known URLs are not queued;
+    /// the DSL still gets the URL back so it can look the result up.
+    fn request(&mut self, url: String) -> PreprocessResult<Value> {
+        if !(url.starts_with("http://") || url.starts_with("https://"))
+            || !crate::downloader::security::is_safe_public_url(&url)
+        {
+            return Ok(Value::Null);
+        }
+        if !self.jobs.contains(&url)
+            && !self.requested.contains(&url)
+            && self.requested.len() < MAX_PREPROCESS_JOBS
+        {
+            self.requested.push(url.clone());
+        }
+        Ok(Value::String(url))
     }
 
     fn get(&self, name: &str) -> Option<&Value> {
@@ -158,6 +187,31 @@ fn eval_expr(ctx: &mut Ctx, expr: &Expr) -> PreprocessResult<Value> {
             Value::Array(values)
         }
         Expr::Int(value) => Value::Number((*value).into()),
+        Expr::Request(inner) => {
+            let url = val_to_string(&eval_expr(ctx, inner)?);
+            ctx.request(url)?
+        }
+        Expr::FetchJson(inner) => {
+            let url = val_to_string(&eval_expr(ctx, inner)?);
+            let url = val_to_string(&ctx.request(url)?);
+            if url.is_empty() {
+                Value::Null
+            } else {
+                ctx.jobs.results().get(&url).cloned().unwrap_or(Value::Null)
+            }
+        }
+        Expr::Arith(left, op, right) => {
+            let left = eval_expr(ctx, left)?;
+            let right = eval_expr(ctx, right)?;
+            match (as_integer(&left), as_integer(&right)) {
+                (Some(a), Some(b)) => Value::Number(match op {
+                    ArithOp::Add => a.saturating_add(b),
+                    ArithOp::Sub => a.saturating_sub(b),
+                }
+                .into()),
+                _ => Value::Null,
+            }
+        }
         Expr::ExtractJson(_, _) | Expr::Regex(_, _) => Value::Null,
     };
     validate_value_limits(&value)?;
@@ -187,6 +241,17 @@ fn eval_extract_json(
         validate_value_limits(value)?;
     }
     Ok(value)
+}
+
+/// Integers for arithmetic. Numeric strings are coerced (captures are always
+/// strings); anything else yields `None`, which makes the whole expression null
+/// instead of silently concatenating.
+fn as_integer(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
 }
 
 fn eval_method(ctx: &mut Ctx, val: Value, method: &Method) -> PreprocessResult<Value> {
@@ -304,6 +369,37 @@ fn eval_method(ctx: &mut Ctx, val: Value, method: &Method) -> PreprocessResult<V
                 None => val,
             }
         }
+        Method::GsubBlock {
+            pattern,
+            flags,
+            var,
+            body,
+        } => match val.as_str() {
+            Some(text) => {
+                let re = cached_preprocess_regex(pattern, flags)?;
+                let mut replaced = String::with_capacity(text.len());
+                let mut last = 0;
+                for caps in re.captures_iter(text) {
+                    let whole = caps.get(0).expect("group 0 always participates");
+                    replaced.push_str(&text[last..whole.start()]);
+                    let mut groups = Vec::with_capacity(caps.len());
+                    for index in 0..caps.len() {
+                        groups.push(
+                            caps.get(index)
+                                .map(|m| Value::String(m.as_str().to_string()))
+                                .unwrap_or(Value::Null),
+                        );
+                    }
+                    ctx.set(var, Value::Array(groups))?;
+                    replaced.push_str(&val_to_string(&eval_expr(ctx, body)?));
+                    last = whole.end();
+                }
+                replaced.push_str(&text[last..]);
+                validate_string_size(&replaced)?;
+                Value::String(replaced)
+            }
+            None => val,
+        },
         Method::Field(field) => val.get(field.as_str()).cloned().unwrap_or(Value::Null),
         Method::Bracket(key) => {
             let key_val = match key {
@@ -453,15 +549,27 @@ fn eval_stmt(ctx: &mut Ctx, stmt: &Stmt, source: &mut String) -> PreprocessResul
     Ok(())
 }
 
-pub(super) fn run_stmts(stmts: &[Stmt], source: &mut String) {
-    if let Err(err) = run_stmts_checked(stmts, source) {
-        panic!("{err}");
+pub(super) fn run_stmts(
+    stmts: &[Stmt],
+    source: &mut String,
+    jobs: &PreprocessJobs,
+) -> super::PreprocessRun {
+    match run_stmts_checked(stmts, source, jobs) {
+        Ok(run) => run,
+        Err(err) => panic!("{err}"),
     }
 }
 
-fn run_stmts_checked(stmts: &[Stmt], source: &mut String) -> PreprocessResult<()> {
-    let mut ctx = Ctx::new();
-    eval_stmts(&mut ctx, stmts, source)
+fn run_stmts_checked(
+    stmts: &[Stmt],
+    source: &mut String,
+    jobs: &PreprocessJobs,
+) -> PreprocessResult<super::PreprocessRun> {
+    let mut ctx = Ctx::new(jobs);
+    eval_stmts(&mut ctx, stmts, source)?;
+    Ok(super::PreprocessRun {
+        requested: ctx.requested,
+    })
 }
 
 fn validate_string_size(text: &str) -> PreprocessResult<()> {
@@ -531,7 +639,7 @@ mod tests {
     use super::*;
 
     fn run(stmts: &[Stmt], source: &mut String) -> Result<(), String> {
-        run_stmts_checked(stmts, source)
+        run_stmts_checked(stmts, source, &PreprocessJobs::new()).map(|_| ())
     }
 
     /// Compile DSL source, run it over `source`, and return the result.
@@ -539,7 +647,8 @@ mod tests {
         let stmts = crate::downloader::preprocess::parser::parse_preprocess(program)
             .unwrap_or_else(|err| panic!("should parse: {err}\n{program}"));
         let mut text = source.to_string();
-        run_stmts_checked(&stmts, &mut text).unwrap_or_else(|err| panic!("{program}: {err}"));
+        run_stmts_checked(&stmts, &mut text, &PreprocessJobs::new())
+            .unwrap_or_else(|err| panic!("{program}: {err}"));
         text
     }
 
@@ -623,6 +732,71 @@ mod tests {
             out,
             "A <ruby>漢字<rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby> b"
         );
+    }
+
+    #[test]
+    fn gsub_block_receives_the_match_and_replaces_each_occurrence() {
+        let out = run_program(
+            "let text = \"a [pixivimage:11-2] b [pixivimage:22-1]\"\n\
+             let text = text.gsub(/\\[pixivimage:(\\d+)-(\\d+)\\]/) { |m| \"img:${m[1]}:${m[2]}\" }\n\
+             emit text\n\
+             insert_at_match\n",
+            "",
+        );
+        assert_eq!(out, "a img:11:2 b img:22:1");
+    }
+
+    #[test]
+    fn arithmetic_coerces_numeric_captures() {
+        let out = run_program(
+            "let a = [\"zero\", \"one\", \"two\"]\n\
+             let text = \"x-2\"\n\
+             let text = text.gsub(/x-(\\d+)/) { |m| a[m[1] - 1] }\n\
+             emit text\n\
+             emit \"sum=${1 + 2}\"\n\
+             emit \"bad=${a - 1}\"\n\
+             insert_at_match\n",
+            "",
+        );
+        assert_eq!(out, "one\nsum=3\nbad=");
+    }
+
+    #[test]
+    fn fetch_json_registers_a_request_and_reads_settled_results() {
+        let jobs = PreprocessJobs::new();
+        let program = "let pages = fetch_json(\"https://example.com/illust/11\")\n\
+                       emit \"url=${pages.body[0].urls.original}\"\n\
+                       insert_at_match\n";
+        let stmts = crate::downloader::preprocess::parser::parse_preprocess(program).unwrap();
+        let mut source = String::new();
+        let run = run_stmts_checked(&stmts, &mut source, &jobs).unwrap();
+        assert_eq!(run.requested, vec!["https://example.com/illust/11"]);
+        assert_eq!(source, "url=");
+
+        // The same program with the job settled sees the value.
+        let mut settled = PreprocessJobs::new();
+        settled.insert(
+            "https://example.com/illust/11".to_string(),
+            serde_json::json!({"body": [{"urls": {"original": "https://i.example/11.jpg"}}]}),
+        );
+        let mut source = String::new();
+        let run = run_stmts_checked(&stmts, &mut source, &settled).unwrap();
+        assert!(run.requested.is_empty(), "settled jobs are not re-requested");
+        assert_eq!(source, "url=https://i.example/11.jpg");
+    }
+
+    #[test]
+    fn request_rejects_urls_that_are_not_fetchable() {
+        let stmts = crate::downloader::preprocess::parser::parse_preprocess(
+            "let a = request(\"file:///etc/passwd\")\n\
+             let b = request(\"http://127.0.0.1/x\")\n\
+             emit \"a=${a} b=${b}\"\n\
+             insert_at_match\n",
+        )
+        .unwrap();
+        let mut source = String::new();
+        let run = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new()).unwrap();
+        assert!(run.requested.is_empty(), "{:?}", run.requested);
     }
 
     #[test]
@@ -1091,7 +1265,7 @@ mod tests {
             (PREPROCESS_STEP_BUDGET / 2) + 1
         ];
         let mut source = String::new();
-        let err = run_stmts_checked(&stmts, &mut source).unwrap_err();
+        let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new()).unwrap_err();
         assert_eq!(err, "preprocess: step budget exceeded");
     }
 
@@ -1106,7 +1280,7 @@ mod tests {
             methods: vec![Method::Join(vec![StrPart::Lit(String::new())])],
         })];
         let mut source = String::new();
-        let err = run_stmts_checked(&stmts, &mut source).unwrap_err();
+        let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new()).unwrap_err();
         assert_eq!(
             err,
             format!(
@@ -1122,7 +1296,7 @@ mod tests {
             expr: Expr::Array(vec![Expr::Null; PREPROCESS_MAX_ARRAY_ITEMS + 1]),
         }];
         let mut source = String::new();
-        let err = run_stmts_checked(&stmts, &mut source).unwrap_err();
+        let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new()).unwrap_err();
         assert_eq!(
             err,
             format!(

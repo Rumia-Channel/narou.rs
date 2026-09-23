@@ -125,6 +125,34 @@ fn build_expr(pair: pest::iterators::Pair<Rule>) -> Expr {
         }
         Rule::primary => build_expr(pair.into_inner().next().unwrap()),
         Rule::string | Rule::i_string | Rule::r_string => Expr::String(build_string_parts(pair)),
+        Rule::request_expr => {
+            Expr::Request(Box::new(build_expr(pair.into_inner().next().unwrap())))
+        }
+        Rule::fetch_json_expr => {
+            Expr::FetchJson(Box::new(build_expr(pair.into_inner().next().unwrap())))
+        }
+        Rule::call_chain_expr => {
+            let mut inner = pair.into_inner();
+            let base = build_expr(inner.next().unwrap());
+            Expr::ValueChain {
+                base: Box::new(base),
+                methods: build_chain_parts(inner),
+            }
+        }
+        Rule::add_expr => {
+            let mut inner = pair.into_inner();
+            let mut left = build_expr(inner.next().unwrap());
+            while let Some(op) = inner.next() {
+                let right = build_expr(inner.next().unwrap());
+                let op = if op.as_str() == "+" {
+                    ArithOp::Add
+                } else {
+                    ArithOp::Sub
+                };
+                left = Expr::Arith(Box::new(left), op, Box::new(right));
+            }
+            left
+        }
         Rule::extract_json_expr => {
             let mut inner = pair.into_inner();
             let regex_pair = inner.next().unwrap();
@@ -134,22 +162,7 @@ fn build_expr(pair: pest::iterators::Pair<Rule>) -> Expr {
         Rule::chain_expr => {
             let mut inner = pair.into_inner();
             let base_name = inner.next().unwrap().as_str().to_string();
-            let mut methods: Vec<Method> = Vec::new();
-            for part in inner {
-                match part.as_rule() {
-                    Rule::dot_access => {
-                        let field = part.into_inner().next().unwrap().as_str().to_string();
-                        methods.push(Method::Field(field));
-                    }
-                    Rule::bracket_access => {
-                        let key_pair = part.into_inner().next().unwrap();
-                        methods.push(Method::Bracket(build_bracket_key(key_pair)));
-                    }
-                    _ => {
-                        methods.push(build_method(part));
-                    }
-                }
-            }
+            let methods = build_chain_parts(inner);
             let accessor = Accessor {
                 base: base_name,
                 path: Vec::new(),
@@ -258,12 +271,16 @@ fn build_string_from_inner(pair: pest::iterators::Pair<Rule>) -> Vec<StrPart> {
 }
 
 fn build_bracket_key(pair: pest::iterators::Pair<Rule>) -> BracketKey {
-    match pair.as_rule() {
-        Rule::string | Rule::i_string | Rule::r_string => BracketKey::Str(build_string_parts(pair)),
-        Rule::int_lit => BracketKey::Index(pair.as_str().parse().unwrap_or(0)),
-        Rule::chain_expr => BracketKey::Expr(build_expr(pair)),
-        other => unreachable!("unexpected bracket_key: {:?}", other),
+    if matches!(
+        pair.as_rule(),
+        Rule::string | Rule::i_string | Rule::r_string
+    ) {
+        return BracketKey::Str(build_string_parts(pair));
     }
+    if pair.as_rule() == Rule::int_lit {
+        return BracketKey::Index(pair.as_str().parse().unwrap_or(0));
+    }
+    BracketKey::Expr(build_expr(pair))
 }
 
 fn build_lvalue(pair: pest::iterators::Pair<Rule>) -> LValue {
@@ -306,6 +323,24 @@ fn build_lvalue(pair: pest::iterators::Pair<Rule>) -> LValue {
     }
 }
 
+/// Chain parts keep their written order: `.field` / `[...]` become methods so
+/// they are applied where they appear rather than before every method call.
+fn build_chain_parts<'a>(
+    parts: impl Iterator<Item = pest::iterators::Pair<'a, Rule>>,
+) -> Vec<Method> {
+    parts
+        .map(|part| match part.as_rule() {
+            Rule::dot_access => Method::Field(
+                part.into_inner().next().unwrap().as_str().to_string(),
+            ),
+            Rule::bracket_access => Method::Bracket(build_bracket_key(
+                part.into_inner().next().unwrap(),
+            )),
+            _ => build_method(part),
+        })
+        .collect()
+}
+
 fn build_block(pair: pest::iterators::Pair<Rule>) -> (String, Expr) {
     let mut inner = pair.into_inner();
     let var = inner.next().unwrap().as_str().to_string();
@@ -341,9 +376,19 @@ fn build_method(pair: pest::iterators::Pair<Rule>) -> Method {
             Method::Join(sep)
         }
         s if s.starts_with(".gsub") => {
-            let mut inner = pair.into_inner();
-            let pattern_pair = inner.next().unwrap();
-            let to = build_string_parts(inner.next().unwrap());
+            let parts: Vec<pest::iterators::Pair<Rule>> = pair.into_inner().collect();
+            let pattern_pair = parts[0].clone();
+            if let Some(block) = parts.get(1).filter(|p| p.as_rule() == Rule::block) {
+                let (pattern, flags) = build_regex(pattern_pair);
+                let (var, body) = build_block(block.clone());
+                return Method::GsubBlock {
+                    pattern,
+                    flags,
+                    var,
+                    body: Box::new(body),
+                };
+            }
+            let to = build_string_parts(parts[1].clone());
             if pattern_pair.as_rule() == Rule::regex {
                 let (pattern, flags) = build_regex(pattern_pair);
                 Method::GsubRegex {

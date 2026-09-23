@@ -145,13 +145,12 @@ impl NativeHttpClient {
     fn send_follow(&self, request: &HttpRequest) -> Result<HttpResponse> {
         let url = &request.url;
         validate_public_url(url).map_err(io_error)?;
-        let cookie = request.header("Cookie");
         let user_agent = request.header("User-Agent").unwrap_or(&self.user_agent);
         let domain = crate::downloader::http_policy::domain_of(url).to_string();
         let mut last_error = None;
 
         if self.prefer_curl.load(Ordering::Relaxed) {
-            match self.fetch_tier_curl(url, cookie, user_agent) {
+            match self.fetch_tier_curl(request, user_agent) {
                 Ok(response) => return Ok(response),
                 Err(err) => last_error = Some(err),
             }
@@ -170,7 +169,7 @@ impl NativeHttpClient {
         drop(tier_failures);
 
         if !skip_curl && !self.prefer_curl.load(Ordering::Relaxed) {
-            match self.fetch_tier_curl(url, cookie, user_agent) {
+            match self.fetch_tier_curl(request, user_agent) {
                 Ok(response) => {
                     self.prefer_curl.store(true, Ordering::Relaxed);
                     return Ok(response);
@@ -186,7 +185,7 @@ impl NativeHttpClient {
         }
 
         if !skip_reqwest {
-            match self.fetch_tier_reqwest(url, cookie, user_agent) {
+            match self.fetch_tier_reqwest(request, user_agent) {
                 Ok(response) => return Ok(response),
                 Err(err) => {
                     last_error = Some(err);
@@ -199,7 +198,7 @@ impl NativeHttpClient {
         }
 
         if !skip_wget {
-            match self.fetch_tier_subprocess(url, cookie, user_agent) {
+            match self.fetch_tier_subprocess(request, user_agent) {
                 Ok(response) => return Ok(response),
                 Err(err) => {
                     last_error = Some(err);
@@ -223,15 +222,14 @@ impl NativeHttpClient {
     fn send_manual(&self, request: &HttpRequest) -> Result<HttpResponse> {
         let url = &request.url;
         validate_public_url(url).map_err(io_error)?;
-        let cookie = request.header("Cookie");
         let user_agent = request.header("User-Agent").unwrap_or(&self.user_agent);
 
         let mut req = self.manual_redirect_client.get(url);
-        if let Some(cookie) = cookie {
-            if !is_safe_header_value(cookie) {
-                return Err(io_error("unsafe Cookie header value"));
+        for (name, value) in &request.headers {
+            if !is_safe_header_value(value) {
+                return Err(io_error("unsafe header value"));
             }
-            req = req.header("Cookie", cookie);
+            req = req.header(name, value);
         }
         if user_agent != self.user_agent {
             req = req.header(USER_AGENT, user_agent);
@@ -240,7 +238,7 @@ impl NativeHttpClient {
         let response = req.send().map_err(|e| NarouError::Http(e.to_string()))?;
         let status = response.status().as_u16();
         if (400..600).contains(&status) {
-            if let Ok((code, Some(location))) = self.curl_probe_redirect(url, cookie, user_agent)
+            if let Ok((code, Some(location))) = self.curl_probe_redirect(request, user_agent)
                 && (300..400).contains(&code)
             {
                 return Ok(HttpResponse {
@@ -288,11 +286,11 @@ impl NativeHttpClient {
 
     fn fetch_tier_curl(
         &self,
-        url: &str,
-        cookie: Option<&str>,
+        request: &HttpRequest,
         user_agent: &str,
     ) -> Result<HttpResponse> {
-        let mut handle = self.configured_curl_handle(url, cookie, user_agent)?;
+        let url = request.url.as_str();
+        let mut handle = self.configured_curl_handle(request, user_agent)?;
 
         let mut body = Vec::new();
         let mut content_type = String::new();
@@ -359,11 +357,11 @@ impl NativeHttpClient {
 
     fn fetch_tier_reqwest(
         &self,
-        url: &str,
-        cookie: Option<&str>,
+        request: &HttpRequest,
         user_agent: &str,
     ) -> Result<HttpResponse> {
-        let response = self.send_reqwest(url, cookie, user_agent)?;
+        let url = &request.url;
+        let response = self.send_reqwest(request, user_agent)?;
         let status = response.status().as_u16();
         if status == 404 || status == 503 {
             let headers = content_type_header(content_type_of(&response));
@@ -394,14 +392,14 @@ impl NativeHttpClient {
     /// failure and is reported as-is.
     fn fetch_tier_subprocess(
         &self,
-        url: &str,
-        cookie: Option<&str>,
+        request: &HttpRequest,
         user_agent: &str,
     ) -> Result<HttpResponse> {
-        if let Some(cookie) = cookie
-            && !is_safe_header_value(cookie)
-        {
-            return Err(io_error("unsafe Cookie header value"));
+        let url = &request.url;
+        for (_, value) in &request.headers {
+            if !is_safe_header_value(value) {
+                return Err(io_error("unsafe header value"));
+            }
         }
 
         let candidates: &[&str] = if cfg!(windows) {
@@ -412,7 +410,7 @@ impl NativeHttpClient {
         let mut first_error: Option<NarouError> = None;
         let mut missing: Vec<&str> = Vec::new();
         for tool in candidates {
-            match self.run_fetch_tool(tool, url, cookie, user_agent) {
+            match self.run_fetch_tool(tool, request, user_agent) {
                 Ok(response) => return Ok(response),
                 Err(err) => {
                     let not_found = matches!(
@@ -444,10 +442,10 @@ impl NativeHttpClient {
     fn run_fetch_tool(
         &self,
         tool: &str,
-        url: &str,
-        cookie: Option<&str>,
+        request: &HttpRequest,
         user_agent: &str,
     ) -> Result<HttpResponse> {
+        let url = request.url.as_str();
         let mut cmd = Command::new(tool);
         match tool {
             "curl" => {
@@ -474,8 +472,8 @@ impl NativeHttpClient {
                     .arg("Connection: keep-alive")
                     .arg("-w")
                     .arg(format!("{STATUS_MARKER}%{{http_code}}"));
-                if let Some(cookie) = cookie {
-                    cmd.arg("-H").arg(format!("Cookie: {cookie}"));
+                for (name, value) in &request.headers {
+                    cmd.arg("-H").arg(format!("{name}: {value}"));
                 }
                 cmd.arg(url);
                 let output = run_command_with_timeout(cmd, Duration::from_secs(TOTAL_TIMEOUT_SECS))
@@ -532,8 +530,8 @@ impl NativeHttpClient {
                     .arg("--header=Accept-Language: ja,en-US;q=0.9,en;q=0.8")
                     .arg("--header=Accept-Encoding: gzip, deflate")
                     .arg("--header=Connection: keep-alive");
-                if let Some(cookie) = cookie {
-                    cmd.arg(format!("--header=Cookie: {cookie}"));
+                for (name, value) in &request.headers {
+                    cmd.arg(format!("--header={name}: {value}"));
                 }
                 cmd.arg("--").arg(url);
                 let output = run_command_with_timeout(cmd, Duration::from_secs(TOTAL_TIMEOUT_SECS))
@@ -561,18 +559,22 @@ impl NativeHttpClient {
 
     fn send_reqwest(
         &self,
-        url: &str,
-        cookie: Option<&str>,
+        http_request: &HttpRequest,
         user_agent: &str,
     ) -> Result<reqwest::blocking::Response> {
-        if let Some(cookie) = cookie {
-            if !is_safe_header_value(cookie) {
-                return Err(io_error("unsafe Cookie header value"));
+        for (_, value) in &http_request.headers {
+            if !is_safe_header_value(value) {
+                return Err(io_error("unsafe header value"));
             }
-            return self.send_reqwest_with_manual_cookie_redirects(url, cookie, user_agent);
+        }
+        if http_request.header("Cookie").is_some() {
+            return self.send_reqwest_with_manual_cookie_redirects(http_request, user_agent);
         }
 
-        let mut request = self.client.get(url);
+        let mut request = self.client.get(&http_request.url);
+        for (name, value) in &http_request.headers {
+            request = request.header(name, value);
+        }
         if user_agent != self.user_agent {
             request = request.header(USER_AGENT, user_agent);
         }
@@ -583,16 +585,27 @@ impl NativeHttpClient {
     /// hop leaves the current site (see [`same_site_hosts`]).
     fn send_reqwest_with_manual_cookie_redirects(
         &self,
-        url: &str,
-        cookie: &str,
+        http_request: &HttpRequest,
         user_agent: &str,
     ) -> Result<reqwest::blocking::Response> {
-        let mut current = reqwest::Url::parse(url).map_err(|e| io_error(e.to_string()))?;
-        let mut current_cookie = Some(cookie.to_string());
+        let mut current =
+            reqwest::Url::parse(&http_request.url).map_err(|e| io_error(e.to_string()))?;
+        // Non-cookie headers stay as given; the cookie is dropped per hop when
+        // the chain leaves the site.
+        let headers: Vec<(String, String)> = http_request
+            .headers
+            .iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("Cookie"))
+            .cloned()
+            .collect();
+        let mut current_cookie = http_request.header("Cookie").map(str::to_string);
 
         for _ in 0..=MAX_REDIRECTS {
             validate_public_url(current.as_str()).map_err(io_error)?;
             let mut request = self.manual_redirect_client.get(current.clone());
+            for (name, value) in &headers {
+                request = request.header(name, value);
+            }
             if let Some(cookie) = current_cookie.as_deref() {
                 request = request.header("Cookie", cookie);
             }
@@ -623,19 +636,20 @@ impl NativeHttpClient {
         }
 
         Err(io_error(format!(
-            "redirect limit exceeded for {url} after {} hops",
-            MAX_REDIRECTS
+            "redirect limit exceeded for {} after {} hops",
+            http_request.url, MAX_REDIRECTS
         )))
     }
 
     fn configured_curl_handle(
         &self,
-        url: &str,
-        cookie: Option<&str>,
+        request: &HttpRequest,
         user_agent: &str,
     ) -> Result<curl::easy::Easy> {
         let mut handle = curl::easy::Easy::new();
-        handle.url(url).map_err(|e| io_error(e.to_string()))?;
+        handle
+            .url(&request.url)
+            .map_err(|e| io_error(e.to_string()))?;
         handle
             .useragent(user_agent)
             .map_err(|e| io_error(e.to_string()))?;
@@ -666,12 +680,13 @@ impl NativeHttpClient {
         headers
             .append("Connection: keep-alive")
             .map_err(|e| io_error(e.to_string()))?;
-        if let Some(cookie) = cookie {
-            if !is_safe_header_value(cookie) {
-                return Err(io_error("unsafe Cookie header value"));
+        // Caller headers (Cookie, Referer, …) win over the defaults above.
+        for (name, value) in &request.headers {
+            if !is_safe_header_value(value) {
+                return Err(io_error("unsafe header value"));
             }
             headers
-                .append(&format!("Cookie: {cookie}"))
+                .append(&format!("{name}: {value}"))
                 .map_err(|e| io_error(e.to_string()))?;
         }
         handle
@@ -687,11 +702,10 @@ impl NativeHttpClient {
     /// chains can still be observed. The response body is discarded.
     fn curl_probe_redirect(
         &self,
-        url: &str,
-        cookie: Option<&str>,
+        request: &HttpRequest,
         user_agent: &str,
     ) -> Result<(u32, Option<String>)> {
-        let mut handle = self.configured_curl_handle(url, cookie, user_agent)?;
+        let mut handle = self.configured_curl_handle(request, user_agent)?;
 
         let mut received = 0usize;
         let perform_result = {
@@ -883,6 +897,7 @@ pub fn default_request_headers() -> HeaderMap {
 mod tests {
     use super::NativeHttpClient;
     use crate::error::NarouError;
+    use crate::platform::HttpRequest;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -904,7 +919,7 @@ mod tests {
         });
 
         let client = NativeHttpClient::new("narou_rs-test").unwrap();
-        let response = client.fetch_tier_curl(&url, None, "narou_rs-test").unwrap();
+        let response = client.fetch_tier_curl(&HttpRequest::get(url.clone()), "narou_rs-test").unwrap();
         server.join().unwrap();
 
         assert_eq!(response.status, 404);
@@ -928,7 +943,10 @@ mod tests {
 
         let client = NativeHttpClient::new("narou_rs-test").unwrap();
         let err = client
-            .fetch_tier_curl(&url, Some("over18=yes"), "narou_rs-test")
+            .fetch_tier_curl(
+                &HttpRequest::get(url.clone()).with_header("Cookie", "over18=yes"),
+                "narou_rs-test",
+            )
             .unwrap_err();
         server.join().unwrap();
 
@@ -952,7 +970,7 @@ mod tests {
         });
 
         let client = NativeHttpClient::new("narou_rs-test").unwrap();
-        let response = client.fetch_tier_curl(&url, None, "narou_rs-test").unwrap();
+        let response = client.fetch_tier_curl(&HttpRequest::get(url.clone()), "narou_rs-test").unwrap();
         server.join().unwrap();
 
         assert_eq!(response.status, 503);
@@ -981,7 +999,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
         );
         let client = NativeHttpClient::new("narou_rs-test").unwrap();
-        match client.fetch_tier_subprocess(&url, None, "narou_rs-test") {
+        match client.fetch_tier_subprocess(&HttpRequest::get(url.clone()), "narou_rs-test") {
             Ok(response) => {
                 assert_eq!(response.status, 200);
                 assert_eq!(response.body, b"hello");
@@ -999,7 +1017,7 @@ mod tests {
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
         let client = NativeHttpClient::new("narou_rs-test").unwrap();
-        match client.fetch_tier_subprocess(&url, None, "narou_rs-test") {
+        match client.fetch_tier_subprocess(&HttpRequest::get(url.clone()), "narou_rs-test") {
             Err(err) if err.to_string().contains("no download tool available") => {}
             Err(err) => assert!(err.to_string().contains("404"), "{err}"),
             Ok(_) => panic!("404 must not succeed"),

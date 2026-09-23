@@ -435,12 +435,14 @@ impl SiteSetting {
         self.cookie.as_deref()
     }
 
-    /// Site-declared request headers, in a stable order.
-    pub fn header_list(&self) -> impl Iterator<Item = (&str, &str)> {
+    /// Site-declared request headers, in a stable order, with `\k<...>`
+    /// placeholders resolved (the values usually embed `top_url`).
+    pub fn header_list(&self) -> Vec<(String, String)> {
         self.headers
             .iter()
             .flat_map(|map| map.iter())
-            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .map(|(name, value)| (name.clone(), self.interpolate(value)))
+            .collect()
     }
 
     /// Login page for this site, with `\k<...>` placeholders resolved.
