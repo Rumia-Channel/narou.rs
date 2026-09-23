@@ -55,15 +55,10 @@ fn build_apng(archive: &[u8], delays: &[u16]) -> Result<Vec<u8>> {
         .first()
         .ok_or_else(|| NarouError::Platform("animation archive has no frames".into()))?;
     let (width, height) = (first.width(), first.height());
-    // Photo frames are opaque; encoding them without an alpha channel keeps the
-    // animation about a quarter smaller (and matches what Pillow produced).
-    let opaque = frames
-        .iter()
-        .all(|frame| frame.pixels().all(|pixel| pixel.0[3] == 255));
 
     if frames.len() == 1 {
         // Nothing to animate; a plain PNG is the honest output.
-        return encode_png(first, opaque);
+        return encode_png(first);
     }
 
     let mut chunks: Vec<Vec<u8>> = Vec::new();
@@ -78,7 +73,7 @@ fn build_apng(archive: &[u8], delays: &[u16]) -> Result<Vec<u8>> {
             )));
         }
         let delay = u16::from(*delays.get(index).unwrap_or(&delays[delays.len() - 1]));
-        let png = encode_png(frame, opaque)?;
+        let png = encode_png(frame)?;
         let (ihdr, idat) = split_png(&png)?;
 
         if index == 0 {
@@ -172,14 +167,12 @@ fn decode_frames(archive: &[u8]) -> Result<Vec<image::RgbaImage>> {
     Ok(frames)
 }
 
-fn encode_png(frame: &image::RgbaImage, opaque: bool) -> Result<Vec<u8>> {
-    let image = if opaque {
-        image::DynamicImage::ImageRgb8(image::DynamicImage::ImageRgba8(frame.clone()).to_rgb8())
-    } else {
-        image::DynamicImage::ImageRgba8(frame.clone())
-    };
+/// Encode one frame. Frames stay RGBA: an animated work may carry
+/// transparency, and keeping one colour type for every frame is what the APNG
+/// requires anyway.
+fn encode_png(frame: &image::RgbaImage) -> Result<Vec<u8>> {
     let mut png = Vec::new();
-    image
+    image::DynamicImage::ImageRgba8(frame.clone())
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .map_err(|error| NarouError::Platform(format!("animation frame encode: {error}")))?;
     Ok(png)
@@ -337,35 +330,23 @@ mod tests {
     }
 
     #[test]
-    fn opaque_frames_drop_the_alpha_channel() {
-        let archive = zip_of(&[
-            ("000000.png", png_frame(2, 2, [10, 20, 30, 255])),
-            ("000001.png", png_frame(2, 2, [40, 50, 60, 255])),
-        ]);
-        let apng = assemble_animation("https://i.pximg.net/x.zip?ugoira=50,50", &archive)
-            .unwrap()
-            .unwrap();
-        let ihdr = chunks(&apng)
-            .into_iter()
-            .find(|(kind, _)| kind == "IHDR")
-            .expect("IHDR");
-        // bit depth 8, colour type 2 = truecolour (no alpha)
-        assert_eq!(ihdr.1[8], 8);
-        assert_eq!(ihdr.1[9], 2, "opaque frames should be encoded as RGB");
-
-        // A translucent frame keeps the alpha channel.
-        let translucent = zip_of(&[
-            ("000000.png", png_frame(2, 2, [1, 2, 3, 128])),
-            ("000001.png", png_frame(2, 2, [4, 5, 6, 255])),
-        ]);
-        let apng = assemble_animation("https://i.pximg.net/x.zip?ugoira=50,50", &translucent)
-            .unwrap()
-            .unwrap();
-        let ihdr = chunks(&apng)
-            .into_iter()
-            .find(|(kind, _)| kind == "IHDR")
-            .expect("IHDR");
-        assert_eq!(ihdr.1[9], 6, "translucent frames need RGBA");
+    fn frames_keep_their_alpha_channel() {
+        // アニメ作品は半透明を含みうるので、全フレームを RGBA で揃える。
+        for color in [[10, 20, 30, 255], [1, 2, 3, 128]] {
+            let archive = zip_of(&[
+                ("000000.png", png_frame(2, 2, color)),
+                ("000001.png", png_frame(2, 2, [40, 50, 60, 255])),
+            ]);
+            let apng = assemble_animation("https://i.pximg.net/x.zip?ugoira=50,50", &archive)
+                .unwrap()
+                .unwrap();
+            let ihdr = chunks(&apng)
+                .into_iter()
+                .find(|(kind, _)| kind == "IHDR")
+                .expect("IHDR");
+            assert_eq!(ihdr.1[8], 8, "bit depth");
+            assert_eq!(ihdr.1[9], 6, "colour type 6 = RGBA (frame {color:?})");
+        }
     }
 
     #[test]
