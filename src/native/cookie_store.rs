@@ -163,11 +163,17 @@ impl CookieStore for InventoryCookieStore {
         let this = self.clone();
         let host = normalize_cookie_host(host);
         run_blocking(move || {
-            Ok(this
-                .load_plain()?
-                .get(&host)
+            let stored = this.load_plain()?;
+            // A parent-domain cookie (`.pixiv.net`) is sent to the subdomain
+            // (`www.pixiv.net`) too, so consult both keys.
+            let keys = crate::platform::cookie_lookup_hosts(&host);
+            let values: Vec<&str> = keys
+                .iter()
+                .filter_map(|key| stored.get(key))
+                .map(String::as_str)
                 .filter(|cookie| !cookie.is_empty())
-                .cloned())
+                .collect();
+            Ok(crate::platform::merge_stored_cookies(values))
         })
     }
 
@@ -240,6 +246,28 @@ mod tests {
             futures::executor::block_on(store.load("example.com"))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn parent_domain_cookies_reach_subdomain_requests() {
+        let _legacy = legacy_yaml_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = set_current_dir_for_test(temp.path());
+        let store = store_in(&temp);
+
+        // Pixiv stores the session on `.pixiv.net`, so the login executable
+        // saves it under the parent domain while requests go to `www`.
+        futures::executor::block_on(store.save("pixiv.net", "PHPSESSID=abc; cc1=1")).unwrap();
+        futures::executor::block_on(store.save("www.pixiv.net", "www_only=1")).unwrap();
+
+        assert_eq!(
+            futures::executor::block_on(store.load("www.pixiv.net")).unwrap().as_deref(),
+            Some("www_only=1; PHPSESSID=abc; cc1=1")
+        );
+        // An unrelated host must not see the session.
+        assert!(
+            futures::executor::block_on(store.load("example.com")).unwrap().is_none()
         );
     }
 

@@ -30,9 +30,11 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::native::cookie_store::InventoryCookieStore;
-use narou_rs::platform::cookie_store::{cookie_host_for_url, format_cookie_header};
+use narou_rs::platform::cookie_store::{
+    cookie_host_for_url, cookie_lookup_hosts, format_cookie_header, merge_stored_cookies,
+};
 use narou_rs::login::build_export;
-use narou_rs::platform::CookieStore;
+use narou_rs::platform::{CookieStore, HttpClient};
 use std::collections::BTreeMap;
 
 #[derive(Parser)]
@@ -62,6 +64,9 @@ struct Args {
     /// 保存済みの Cookie を削除する
     #[arg(long)]
     clear: bool,
+    /// ブラウザプロファイルの保管先（既定はサイトごとの固定フォルダ）
+    #[arg(long, value_name = "DIR")]
+    profile: Option<PathBuf>,
     /// 取得した Cookie を書き出しファイル (YAML) に出力する
     #[arg(long, value_name = "FILE")]
     export: Option<PathBuf>,
@@ -133,7 +138,10 @@ fn run(args: Args) -> std::result::Result<(), String> {
             "Chromium 系ブラウザが見つかりませんでした。--browser でパスを指定するか、--cookie で Cookie 文字列を渡してください"
                 .to_string()
         })?;
-        let mut child = launch_browser(&browser, &login_url, args.port)?;
+        let profile = profile_dir(&site, args.profile.as_deref());
+        std::fs::create_dir_all(&profile)
+            .map_err(|error| format!("{} を作成できません: {error}", profile.display()))?;
+        let mut child = launch_browser(&browser, &login_url, args.port, &profile)?;
         let captured = match capture_cookies(&mut child, args.port, args.timeout, &site, &hosts) {
             Ok(captured) => captured,
             Err(error) => {
@@ -163,7 +171,66 @@ fn run(args: Args) -> std::result::Result<(), String> {
             save_cookie(store, host, cookie)?;
         }
     }
+
+    // 保存は済んでいるので、その Cookie で実際に取得できるかだけ確かめる。
+    if site.matches_url(&target) && cookie_host_for_url(&target).is_some() {
+        verify_capture(&target, &site, &captured);
+    }
     Ok(())
+}
+
+/// Browser profile directory for `site`.
+///
+/// Reusing one profile per site keeps the session between runs, so signing in
+/// again is only necessary when the site drops the login (the Python bridge
+/// keeps a per-site cookie folder for the same reason).
+fn profile_dir(site: &SiteSetting, override_dir: Option<&Path>) -> PathBuf {
+    match override_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::temp_dir()
+            .join("narou-rs-login")
+            .join(site.domain.to_ascii_lowercase()),
+    }
+}
+
+/// One request with the captured cookies, mirroring the downloader's login-wall
+/// detection: a work that needs the session keeps answering with the site's
+/// error message or login marker while the captured cookies are anonymous.
+fn verify_capture(target: &str, site: &SiteSetting, cookies: &BTreeMap<String, String>) {
+    let Some(host) = cookie_host_for_url(target) else {
+        return;
+    };
+    let values: Vec<&str> = cookie_lookup_hosts(&host)
+        .iter()
+        .filter_map(|key| cookies.get(key))
+        .map(String::as_str)
+        .collect();
+    let Some(cookie) = merge_stored_cookies(values) else {
+        return;
+    };
+    let user_agent = ua_generator::ua::spoof_firefox_ua().to_string();
+    let Ok(client) = narou_rs::native::http::NativeHttpClient::new(&user_agent) else {
+        return;
+    };
+    let request = narou_rs::platform::HttpRequest::get(target).with_header("Cookie", cookie);
+    let Ok(response) = block_on(client.send(request)) else {
+        return;
+    };
+    let body = String::from_utf8_lossy(&response.body);
+    let walled = site
+        .error_message()
+        .and_then(|pattern| regex::Regex::new(pattern).ok())
+        .is_some_and(|regex| regex.is_match(&body))
+        || site
+            .compiled_login_pattern()
+            .is_some_and(|regex| regex.is_match(&body));
+    if walled {
+        println!(
+            "注意: {target} は Cookie を付けても取得できません。ログインし直すか、--cookie で Cookie 文字列を直接渡してください"
+        );
+    } else {
+        println!("{target} を保存した Cookie で取得できることを確認しました");
+    }
 }
 
 /// Write the captured cookies (plus the library's existing ones) to a portable
@@ -285,8 +352,12 @@ fn site_hosts(site: &SiteSetting, target: &str) -> Vec<String> {
 }
 
 /// Launch the browser with remote debugging enabled and the login page open.
-fn launch_browser(browser: &Path, login_url: &str, port: u16) -> std::result::Result<Child, String> {
-    let profile = std::env::temp_dir().join(format!("narou-rs-login-{}", std::process::id()));
+fn launch_browser(
+    browser: &Path,
+    login_url: &str,
+    port: u16,
+    profile: &Path,
+) -> std::result::Result<Child, String> {
     Command::new(browser)
         .arg(format!("--remote-debugging-port={port}"))
         .arg(format!("--user-data-dir={}", profile.display()))
@@ -452,6 +523,25 @@ fn belongs_to_site(domain: &str, site: &SiteSetting, hosts: &[String]) -> bool {
     hosts.iter().any(|host| host == domain)
         || domain == site_domain
         || domain.ends_with(&format!(".{site_domain}"))
+        // Cookies for the parent domain (`.pixiv.net` for `www.pixiv.net`) are
+        // sent to the site, so they are part of the session. Sessions usually
+        // live there, not on the `www` host.
+        || same_registrable_domain(domain, &site_domain)
+}
+
+/// Whether two hosts share their last two labels (`www.pixiv.net` and
+/// `pixiv.net`), which is how a site's own cookie family is recognised.
+fn same_registrable_domain(left: &str, right: &str) -> bool {
+    fn registrable(host: &str) -> Option<String> {
+        let mut labels = host.rsplit('.');
+        let tld = labels.next()?;
+        let sld = labels.next()?;
+        (!sld.is_empty() && !tld.is_empty()).then(|| format!("{sld}.{tld}"))
+    }
+    match (registrable(left), registrable(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// First Chromium-family browser found for the current platform.
@@ -513,4 +603,38 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 /// Minimal blocking executor: the login flow is single-threaded.
 fn block_on<T>(future: narou_rs::platform::PlatformFuture<'_, narou_rs::error::Result<T>>) -> narou_rs::error::Result<T> {
     futures::executor::block_on(future)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn site(yaml: &str) -> SiteSetting {
+        serde_yaml::from_str(yaml).expect("site setting")
+    }
+
+    #[test]
+    fn capture_keeps_the_domain_family_of_the_site() {
+        let site = site("name: pixiv\nsitename: Pixiv\ndomain: www.pixiv.net\ntop_url: https://www.pixiv.net/\ntoc_url: \\k<url>\nnovel_info_url: https://www.pixiv.net/novel/show.php?id=\\k<id>\n");
+        let hosts = vec!["www.pixiv.net".to_string()];
+        // Session cookies live on `.pixiv.net`, not on the `www` host, so both
+        // the parent domain and sibling hosts belong to the capture.
+        assert!(belongs_to_site("pixiv.net", &site, &hosts));
+        assert!(belongs_to_site("accounts.pixiv.net", &site, &hosts));
+        assert!(belongs_to_site("www.pixiv.net", &site, &hosts));
+        // Unrelated domains stay out of the stored session.
+        assert!(!belongs_to_site("i.pximg.net", &site, &hosts));
+        assert!(!belongs_to_site("example.com", &site, &hosts));
+        assert!(!belongs_to_site("net", &site, &hosts));
+    }
+
+    #[test]
+    fn profile_directory_is_stable_per_site() {
+        let site = site("name: pixiv\nsitename: Pixiv\ndomain: www.pixiv.net\ntop_url: https://www.pixiv.net/\ntoc_url: \\k<url>\nnovel_info_url: https://www.pixiv.net/novel/show.php?id=\\k<id>\n");
+        assert!(profile_dir(&site, None).ends_with("narou-rs-login/www.pixiv.net"));
+        assert_eq!(
+            profile_dir(&site, Some(Path::new("custom"))),
+            PathBuf::from("custom")
+        );
+    }
 }

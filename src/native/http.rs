@@ -116,12 +116,25 @@ impl NativeHttpClient {
         let Some(host) = crate::platform::cookie_host_for_url(url) else {
             return;
         };
-        let Ok(Some(stored)) = store.load(&host).await else {
+        // Refresh the entry the request actually used: the exact host, or the
+        // parent domain the cookie was stored under (`.pixiv.net` for
+        // `www.pixiv.net`). Hosts without an entry are left alone.
+        let Ok(all) = store.list().await else {
+            return;
+        };
+        let Some((key, stored)) = crate::platform::cookie_lookup_hosts(&host)
+            .into_iter()
+            .find_map(|key| {
+                all.get(&key)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| (key, value.clone()))
+            })
+        else {
             return;
         };
         let updated = crate::platform::apply_set_cookie(&stored, &values);
         if updated != stored {
-            let _ = store.save(&host, &updated).await;
+            let _ = store.save(&key, &updated).await;
         }
     }
 

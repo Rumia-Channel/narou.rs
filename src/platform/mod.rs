@@ -24,8 +24,8 @@ pub mod repository;
 
 pub use clock::{Clock, SystemClock};
 pub use cookie_store::{
-    CookieStore, apply_set_cookie, cookie_host_for_url, format_cookie_header,
-    merge_cookie_headers, normalize_cookie_host, parse_cookie_header,
+    CookieStore, apply_set_cookie, cookie_host_for_url, cookie_lookup_hosts, format_cookie_header,
+    merge_cookie_headers, merge_stored_cookies, normalize_cookie_host, parse_cookie_header,
 };
 pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
 pub use object_store::{

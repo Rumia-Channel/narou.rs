@@ -151,6 +151,43 @@ fn set_cookie_expires_immediately(attributes: &str) -> bool {
     false
 }
 
+/// Keys to consult for a request host, most specific first.
+///
+/// A cookie set for `.example.com` is sent to `example.com` and to every one of
+/// its subdomains, so a lookup for `www.example.com` must also see the entry
+/// stored under `example.com`. Candidates keep at least two labels, so a bare
+/// public suffix is never consulted.
+pub fn cookie_lookup_hosts(host: &str) -> Vec<String> {
+    let host = normalize_cookie_host(host);
+    let mut keys = vec![host.clone()];
+    let mut rest = host.as_str();
+    while let Some((_, parent)) = rest.split_once('.') {
+        if parent.split('.').count() < 2 {
+            break;
+        }
+        keys.push(parent.to_string());
+        rest = parent;
+    }
+    keys
+}
+
+/// Merge stored cookie values, most specific first.
+///
+/// A name defined by several keys keeps the value of the most specific one,
+/// which is what a browser sends (`www.example.com` beats `.example.com`).
+pub fn merge_stored_cookies<'a>(values: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for value in values {
+        for (name, value) in parse_cookie_header(value) {
+            if pairs.iter().any(|(existing, _)| *existing == name) {
+                continue;
+            }
+            pairs.push((name, value));
+        }
+    }
+    (!pairs.is_empty()).then(|| format_cookie_header(&pairs))
+}
+
 /// Host used as the cookie key for a URL, without a port.
 pub fn cookie_host_for_url(url: &str) -> Option<String> {
     let rest = url.split_once("://")?.1;
@@ -163,6 +200,29 @@ pub fn cookie_host_for_url(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lookup_hosts_walk_up_to_the_parent_domain() {
+        assert_eq!(
+            cookie_lookup_hosts("www.pixiv.net"),
+            vec!["www.pixiv.net", "pixiv.net"]
+        );
+        assert_eq!(
+            cookie_lookup_hosts(" Ncode.Syosetu.Com "),
+            vec!["ncode.syosetu.com", "syosetu.com"]
+        );
+        // A bare public suffix is never a candidate.
+        assert_eq!(cookie_lookup_hosts("example.com"), vec!["example.com"]);
+        assert_eq!(cookie_lookup_hosts("localhost"), vec!["localhost"]);
+    }
+
+    #[test]
+    fn merge_keeps_the_most_specific_value() {
+        let merged = merge_stored_cookies(["PHPSESSID=sub; a=1", "PHPSESSID=parent; b=2"]).unwrap();
+        assert_eq!(merged, "PHPSESSID=sub; a=1; b=2");
+        assert_eq!(merge_stored_cookies(Vec::<&str>::new()), None);
+        assert_eq!(merge_stored_cookies(["", "; "]), None);
+    }
 
     #[test]
     fn merge_keeps_static_consent_and_prefers_login_values() {

@@ -85,6 +85,8 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - ログイン実行は別 bin `narou_rs_login`（`src/bin/login.rs`）が担当する。Chromium 系ブラウザを `--remote-debugging-port` 付きで起動し、DevTools protocol (`Storage.getCookies`) で Cookie を取得する（`ws://` のみなのでブラウザ自動化依存を追加しない）。2 段階認証や CAPTCHA は実ブラウザ操作なのでそのまま通る。ブラウザが無い環境向けに `--cookie "<Cookie 文字列>"` の貼り付け保存、`--list` / `--clear` も用意する。
 - **別端末・サーバーへの持ち込み**: `narou_rs_login` はブラウザのある端末で動かし、`--export <file>` でポータブルな書き出しファイル (YAML) を作る。`--passphrase` 指定時は Argon2id → XChaCha20-Poly1305 で暗号化される。ライブラリ外では書き出しが既定の出力になる。取り込み側は `narou login import <file>`（CLI）または Web UI 設定の「ログイン」タブで受け付ける。
 - **暗号化保存**: 保存値は `.narou/login.key`（または `NAROU_RS_LOGIN_KEY`）の鍵で `enc:v1:<nonce>:<payload>` として暗号化され、ホスト名を AEAD の associated data に束ねるため別ホストへの流用はできない。旧形式の平文値は読み取り可能で、次回保存時に暗号化される。
+- **Cookie の取得範囲**: 取得側はサイトのドメインファミリー（サイト自身・親ドメイン・兄弟サブドメイン）をまとめて保存する。Pixiv のように `.pixiv.net` にセッションを置くサイトで `www.pixiv.net` だけを見るとセッションを取り落とす。親ドメインで保存した Cookie は、サブドメイン宛のリクエストでも `CookieStore::load` がマージして送る（`Set-Cookie` の書き戻しも同じキーへ行う）。
+- **ブラウザプロファイル**: `narou_rs_login` はサイト単位の固定プロファイル（`%TEMP%/narou-rs-login/<domain>`、`--profile` で変更可）を使い回す。ログイン状態が次回以降も残るため毎回サインインし直さなくてよい。取得後は対象 URL を 1 回取得し、サイト定義の `error_message` / `login_pattern` に当たる場合は「ログインできていない」と警告する（Python ブリッジの `/dashboard` リダイレクト判定に相当）。
 - **CLI**: `narou login`（`list` / `import` / `export` / `set` / `clear`）で取り込み・書き出し・一覧・削除を行う。`list` は値を伏せて表示する。
 - **Web UI**: 設定ページの「ログイン」タブで一覧・取り込み・直接登録・削除を行う。API は `GET/DELETE /api/login`、`POST /api/login/import`、`POST /api/login/set`、`DELETE /api/login/{host}`。
 - 配布物: `narou_rs_login` もリリース zip に同梱する（`scripts/package-release.ps1` の `-LoginBinaryPath`、`.github/workflows/release.yml` の helper build / sign / package、`cargo local-build` のすべてに対応済み）。Windows では他のサブ実行ファイルと同じく署名対象に含める。
