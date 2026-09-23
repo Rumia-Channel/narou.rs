@@ -41,6 +41,7 @@ pub enum Expr {
     },
     Array(Vec<Expr>),
     Null,
+    Int(i64),
     Not(Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     And(Box<Expr>, Box<Expr>),
@@ -51,7 +52,7 @@ pub enum Expr {
 #[derive(Debug, Clone)]
 pub enum StrPart {
     Lit(String),
-    Interp(Accessor),
+    Interp(Expr),
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +70,8 @@ pub enum AccessPart {
 #[derive(Debug, Clone)]
 pub enum BracketKey {
     Str(Vec<StrPart>),
-    Accessor(Accessor),
+    Expr(Expr),
+    Index(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -89,9 +91,22 @@ pub enum Method {
     Compact,
     Join(Vec<StrPart>),
     Gsub(Vec<StrPart>, Vec<StrPart>),
+    GsubRegex {
+        pattern: String,
+        flags: String,
+        to: Vec<StrPart>,
+    },
     Replace(Vec<StrPart>, Vec<StrPart>),
+    /// `.field` inside a chain — kept in `Method` so chain steps keep their
+    /// written order instead of being split into access-then-method phases.
+    Field(String),
+    /// `[...]` inside a chain.
+    Bracket(BracketKey),
     IsArray,
     Empty,
+    Size,
+    First,
+    Last,
 }
 
 pub fn val_to_string(val: &Value) -> String {

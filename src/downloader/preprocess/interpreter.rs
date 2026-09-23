@@ -52,13 +52,13 @@ impl Ctx {
         Ok(())
     }
 
-    fn resolve_str_parts(&self, parts: &[StrPart]) -> PreprocessResult<String> {
+    fn resolve_str_parts(&mut self, parts: &[StrPart]) -> PreprocessResult<String> {
         let mut s = String::new();
         for part in parts {
             match part {
                 StrPart::Lit(lit) => s.push_str(lit),
-                StrPart::Interp(accessor) => {
-                    let val = self.resolve_accessor(accessor)?;
+                StrPart::Interp(expr) => {
+                    let val = eval_expr(self, expr)?;
                     s.push_str(&val_to_string(&val));
                 }
             }
@@ -67,7 +67,7 @@ impl Ctx {
         Ok(s)
     }
 
-    fn resolve_accessor(&self, acc: &Accessor) -> PreprocessResult<Value> {
+    fn resolve_accessor(&mut self, acc: &Accessor) -> PreprocessResult<Value> {
         let base = match self.vars.get(&acc.base) {
             Some(v) => v.clone(),
             None => return Ok(Value::Null),
@@ -75,7 +75,7 @@ impl Ctx {
         self.walk_accessor(&base, &acc.path)
     }
 
-    fn walk_accessor(&self, val: &Value, path: &[AccessPart]) -> PreprocessResult<Value> {
+    fn walk_accessor(&mut self, val: &Value, path: &[AccessPart]) -> PreprocessResult<Value> {
         let mut current = val.clone();
         for part in path {
             current = match part {
@@ -83,7 +83,8 @@ impl Ctx {
                 AccessPart::Bracket(key) => {
                     let key_val = match key {
                         BracketKey::Str(parts) => Value::String(self.resolve_str_parts(parts)?),
-                        BracketKey::Accessor(acc) => self.resolve_accessor(acc)?,
+                        BracketKey::Expr(expr) => eval_expr(self, expr)?,
+                        BracketKey::Index(index) => Value::Number((*index).into()),
                     };
                     match key_val {
                         Value::String(k) => current.get(&k).cloned().unwrap_or(Value::Null),
@@ -156,6 +157,7 @@ fn eval_expr(ctx: &mut Ctx, expr: &Expr) -> PreprocessResult<Value> {
             }
             Value::Array(values)
         }
+        Expr::Int(value) => Value::Number((*value).into()),
         Expr::ExtractJson(_, _) | Expr::Regex(_, _) => Value::Null,
     };
     validate_value_limits(&value)?;
@@ -168,7 +170,7 @@ fn eval_extract_json(
     flags: &str,
     source: &str,
 ) -> PreprocessResult<Option<Value>> {
-    let re = cached_extract_json_regex(pattern, flags)?;
+    let re = cached_preprocess_regex(pattern, flags)?;
     let Some(caps) = re.captures(source) else {
         return Ok(None);
     };
@@ -286,12 +288,59 @@ fn eval_method(ctx: &mut Ctx, val: Value, method: &Method) -> PreprocessResult<V
                 None => val,
             }
         }
+        Method::GsubRegex {
+            pattern,
+            flags,
+            to,
+        } => {
+            let replacement = ctx.resolve_str_parts(to)?;
+            match val.as_str() {
+                Some(s) => {
+                    let re = cached_preprocess_regex(pattern, flags)?;
+                    let replaced = re.replace_all(s, replacement.as_str()).into_owned();
+                    validate_string_size(&replaced)?;
+                    Value::String(replaced)
+                }
+                None => val,
+            }
+        }
+        Method::Field(field) => val.get(field.as_str()).cloned().unwrap_or(Value::Null),
+        Method::Bracket(key) => {
+            let key_val = match key {
+                BracketKey::Str(parts) => Value::String(ctx.resolve_str_parts(parts)?),
+                BracketKey::Expr(expr) => eval_expr(ctx, expr)?,
+                BracketKey::Index(index) => Value::Number((*index).into()),
+            };
+            match key_val {
+                Value::String(key) => val.get(&key).cloned().unwrap_or(Value::Null),
+                Value::Number(number) => {
+                    let index = number.as_u64().unwrap_or(0) as usize;
+                    val.get(index).cloned().unwrap_or(Value::Null)
+                }
+                _ => Value::Null,
+            }
+        }
         Method::IsArray => Value::Bool(matches!(val, Value::Array(_))),
         Method::Empty => match &val {
             Value::String(s) => Value::Bool(s.is_empty()),
             Value::Array(a) => Value::Bool(a.is_empty()),
             Value::Null => Value::Bool(true),
             _ => Value::Bool(false),
+        },
+        Method::Size => match &val {
+            Value::String(s) => Value::Number(s.chars().count().into()),
+            Value::Array(a) => Value::Number(a.len().into()),
+            Value::Object(map) => Value::Number(map.len().into()),
+            Value::Null => Value::Number(0.into()),
+            _ => val,
+        },
+        Method::First => match val.as_array() {
+            Some(arr) => arr.first().cloned().unwrap_or(Value::Null),
+            None => val,
+        },
+        Method::Last => match val.as_array() {
+            Some(arr) => arr.last().cloned().unwrap_or(Value::Null),
+            None => val,
         },
     };
     validate_value_limits(&value)?;
@@ -453,7 +502,9 @@ fn validate_value_limits(value: &Value) -> PreprocessResult<()> {
     }
 }
 
-fn cached_extract_json_regex(pattern: &str, flags: &str) -> PreprocessResult<regex::Regex> {
+/// Compile a DSL regex literal, caching by `(pattern, flags)`. `s` enables
+/// dot-matches-newline, `m` multi-line anchors, `i` case-insensitive matching.
+fn cached_preprocess_regex(pattern: &str, flags: &str) -> PreprocessResult<regex::Regex> {
     static CACHE: OnceLock<Mutex<HashMap<(String, String), regex::Regex>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (pattern.to_string(), flags.to_string());
@@ -467,6 +518,7 @@ fn cached_extract_json_regex(pattern: &str, flags: &str) -> PreprocessResult<reg
     let mut builder = RegexBuilder::new(pattern);
     builder.dot_matches_new_line(flags.contains('s'));
     builder.multi_line(flags.contains('m'));
+    builder.case_insensitive(flags.contains('i'));
     let regex = builder
         .build()
         .map_err(|err| format!("preprocess: invalid regex: {err}"))?;
@@ -480,6 +532,108 @@ mod tests {
 
     fn run(stmts: &[Stmt], source: &mut String) -> Result<(), String> {
         run_stmts_checked(stmts, source)
+    }
+
+    /// Compile DSL source, run it over `source`, and return the result.
+    fn run_program(program: &str, source: &str) -> String {
+        let stmts = crate::downloader::preprocess::parser::parse_preprocess(program)
+            .unwrap_or_else(|err| panic!("should parse: {err}\n{program}"));
+        let mut text = source.to_string();
+        run_stmts_checked(&stmts, &mut text).unwrap_or_else(|err| panic!("{program}: {err}"));
+        text
+    }
+
+    #[test]
+    fn list_helpers_size_first_last_and_index() {
+        let out = run_program(
+            "let a = [10, 20, 30]\n\
+             emit \"size=${a.size}\"\n\
+             emit \"first=${a.first}\"\n\
+             emit \"last=${a.last}\"\n\
+             emit \"index0=${a[0]}\"\n\
+             emit \"index2=${a[2]}\"\n\
+             emit \"oob=${a[9]}\"\n\
+             insert_at_match\n",
+            "",
+        );
+        assert_eq!(
+            out,
+            "size=3\nfirst=10\nlast=30\nindex0=10\nindex2=30\noob="
+        );
+    }
+
+    #[test]
+    fn comparisons_keep_their_operator() {
+        // `==` / `!=` が条件から落ちると常に真になるため、両方向で固定する。
+        let out = run_program(
+            "let a = [1, 2, 3]\n\
+             if a.size == 30\n\
+             emit \"BIG\"\n\
+             else\n\
+             emit \"SMALL\"\n\
+             end\n\
+             if a.size == 3\n\
+             emit \"THREE\"\n\
+             end\n\
+             if a.size != 3\n\
+             emit \"NOT-THREE\"\n\
+             end\n\
+             insert_at_match\n",
+            "",
+        );
+        assert_eq!(out, "SMALL\nTHREE");
+    }
+
+    #[test]
+    fn chain_steps_keep_their_written_order() {
+        // メソッドが後ろに寄せられると `items.first.name` が解決できなくなる。
+        let out = run_program(
+            "let json = extract_json(/(.+)/s)\n\
+             let items = json.items\n\
+             emit \"first=${items.first.name}\"\n\
+             emit \"last=${items.last.name}\"\n\
+             insert_at_match\n",
+            r#"{"items":[{"name":"one"},{"name":"two"}]}"#,
+        );
+        assert!(out.starts_with("first=one\nlast=two"), "got: {out}");
+    }
+
+    #[test]
+    fn bare_method_names_do_not_swallow_longer_field_names() {
+        let out = run_program(
+            "let json = extract_json(/(.+)/s)\n\
+             emit \"at::${json.lastEpisodePublishedAt}\"\n\
+             insert_at_match\n",
+            r#"{"lastEpisodePublishedAt":"2021-01-12T16:13:02Z"}"#,
+        );
+        assert!(out.starts_with("at::2021-01-12T16:13:02Z"), "got: {out}");
+    }
+
+    #[test]
+    fn regex_gsub_expands_capture_groups() {
+        let out = run_program(
+            "let text = \"a [[rb:漢字>かんじ]] b\"\n\
+             let text = text.gsub(/\\[\\[rb:(.*?)>(.*?)\\]\\]/, \"<ruby>$1<rp>(</rp><rt>$2</rt><rp>)</rp></ruby>\")\n\
+             let text = text.gsub(/a/, \"A\")\n\
+             emit text\n\
+             insert_at_match\n",
+            "",
+        );
+        assert_eq!(
+            out,
+            "A <ruby>漢字<rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby> b"
+        );
+    }
+
+    #[test]
+    fn interpolated_strings_allow_escaped_quotes() {
+        let out = run_program(
+            "let name = \"pixiv\"\n\
+             emit \"site=\\\"${name}\\\"\"\n\
+             insert_at_match\n",
+            "",
+        );
+        assert_eq!(out, "site=\"pixiv\"");
     }
 
     #[test]
@@ -504,10 +658,10 @@ mod tests {
             },
             Stmt::Emit(Expr::String(vec![
                 StrPart::Lit("title::".to_string()),
-                StrPart::Interp(Accessor {
+                StrPart::Interp(Expr::Access(Accessor {
                     base: "title".to_string(),
                     path: vec![],
-                }),
+                })),
             ])),
             Stmt::InsertAtMatch,
         ];
@@ -618,10 +772,10 @@ mod tests {
                 expr: Expr::Chain {
                     base: Accessor {
                         base: "result".to_string(),
-                        path: vec![AccessPart::Bracket(BracketKey::Accessor(Accessor {
+                        path: vec![AccessPart::Bracket(BracketKey::Expr(Expr::Access(Accessor {
                             base: "key".to_string(),
                             path: vec![],
-                        }))],
+                        })))],
                     },
                     methods: vec![],
                 },
@@ -725,10 +879,10 @@ mod tests {
                             var: "tag".to_string(),
                             body: Box::new(Expr::String(vec![
                                 StrPart::Lit("tag::".to_string()),
-                                StrPart::Interp(Accessor {
+                                StrPart::Interp(Expr::Access(Accessor {
                                     base: "tag".to_string(),
                                     path: vec![],
-                                }),
+                                })),
                             ])),
                         },
                         Method::Join(vec![StrPart::Lit("\n".to_string())]),
@@ -781,10 +935,10 @@ mod tests {
             },
             Stmt::Emit(Expr::String(vec![
                 StrPart::Lit("title::".to_string()),
-                StrPart::Interp(Accessor {
+                StrPart::Interp(Expr::Access(Accessor {
                     base: "work".to_string(),
                     path: vec![AccessPart::Dot("title".to_string())],
-                }),
+                })),
             ])),
             Stmt::InsertAtMatch,
         ];
@@ -915,10 +1069,10 @@ mod tests {
                     },
                     methods: vec![],
                 },
-                body: vec![Stmt::Emit(Expr::String(vec![StrPart::Interp(Accessor {
+                body: vec![Stmt::Emit(Expr::String(vec![StrPart::Interp(Expr::Access(Accessor {
                     base: "item".to_string(),
                     path: vec![],
-                })]))],
+                }))]))],
             },
             Stmt::InsertAtMatch,
         ];
