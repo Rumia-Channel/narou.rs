@@ -149,6 +149,16 @@ async fn login_fallback_retries_with_the_stored_cookie_and_flags_the_novel() {
         record.requires_login,
         "the novel must be flagged once the login cookie rescued the fetch"
     );
+    let session = record
+        .login_session
+        .clone()
+        .expect("the credential that worked is remembered by id");
+    let stored = cookies.load_all("example.com").await.unwrap();
+    assert_eq!(
+        stored.iter().filter(|credential| credential.id == session).count(),
+        1,
+        "the recorded id must address the stored credential: {session}"
+    );
 
     assert!(
         http.anonymous_requests.load(Ordering::SeqCst) > 0,

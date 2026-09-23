@@ -62,6 +62,12 @@ pub struct NovelRecord {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub requires_login: bool,
+    /// Identifier of the stored login credential that made this novel's fetch
+    /// work. `requires_login` says a cookie is needed; this says *which* one,
+    /// so a site with several logins (a main account and the one in a マイピク)
+    /// does not walk the whole list on every run. Absent until one succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_session: Option<String>,
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_fields: BTreeMap<String, serde_yaml::Value>,
 }

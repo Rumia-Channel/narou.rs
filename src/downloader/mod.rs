@@ -628,13 +628,6 @@ impl Downloader {
     }
 
     /// Load the stored login cookie for `host`, when a store is available.
-    async fn stored_cookie_for(&self, host: Option<&str>) -> Option<String> {
-        self.stored_credentials_for(host)
-            .await
-            .first()
-            .map(|credential| credential.cookie.clone())
-    }
-
     /// 保存済みの資格情報を試行順で返す。
     async fn stored_credentials_for(&self, host: Option<&str>) -> Vec<LoginCredential> {
         let Some(cookies) = self.cookies.as_ref() else {
@@ -1198,21 +1191,28 @@ impl Downloader {
         let login_host = crate::platform::cookie_host_for_url(&toc_url);
         let login_cookie = match existing_id {
             Some(id) => {
-                let flagged = self
-                    .novels
-                    .get(id.into())
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|record| record.requires_login);
-                match flagged {
-                    true => self.stored_cookie_for(login_host.as_deref()).await,
-                    false => None,
+                let record = self.novels.get(id.into()).await.ok().flatten();
+                let requires = record.as_ref().is_some_and(|record| record.requires_login);
+                if requires {
+                    // その小説で前に成功したセッションがあればそれを、無ければ
+                    // 一覧の先頭を最初のリクエストから送る。
+                    let credentials = self.stored_credentials_for(login_host.as_deref()).await;
+                    let chosen = record
+                        .as_ref()
+                        .and_then(|record| record.login_session.as_deref())
+                        .and_then(|id| credentials.iter().find(|credential| credential.id == id))
+                        .or_else(|| credentials.first());
+                    chosen.map(|credential| credential.cookie.clone())
+                } else {
+                    None
                 }
             }
             None => None,
         };
         let mut requires_login = login_cookie.is_some();
+        // 採用した資格情報の ID。小説レコードに残して次回の最初の
+        // リクエストで同じセッションを使う。
+        let mut login_session: Option<String> = None;
         if let Some(cookie) = login_cookie.as_deref() {
             apply_login_cookie(&mut setting, cookie);
         }
@@ -1342,6 +1342,7 @@ impl Downloader {
                                 .as_ref()
                                 .is_ok_and(|source| !setting.is_partial_login_view(source));
                             requires_login = true;
+                            login_session = Some(credential.id.clone());
                             toc_source = retried;
                             winner = Some(credential.clone());
                             if resolved {
@@ -1350,6 +1351,7 @@ impl Downloader {
                         }
                     } else if retried.is_ok() {
                         requires_login = true;
+                        login_session = Some(credential.id.clone());
                         toc_source = retried;
                         winner = Some(credential.clone());
                         break;
@@ -1547,6 +1549,7 @@ impl Downloader {
                         let resolved = !retried_partial;
                         subtitles = retried;
                         requires_login = true;
+                        login_session = Some(credential.id.clone());
                         winner = Some(credential.clone());
                         if resolved {
                             break;
@@ -2042,6 +2045,7 @@ impl Downloader {
             last_check_date: None,
             convert_failure: false,
             requires_login,
+            login_session: login_session.clone(),
             extra_fields: Default::default(),
         };
         if track_raw_title {
@@ -2098,6 +2102,9 @@ impl Downloader {
                     updated.suspend = false;
                     updated.is_narou = record.is_narou;
                     updated.requires_login |= requires_login;
+                    if login_session.is_some() {
+                        updated.login_session = login_session.clone();
+                    }
                     for tag in &auto_tags {
                         if !updated.tags.contains(tag) {
                             updated.tags.push(tag.clone());
@@ -3195,6 +3202,7 @@ is_narou: false
             last_check_date: None,
             convert_failure: false,
             requires_login: false,
+            login_session: None,
             extra_fields: Default::default(),
         }
     }

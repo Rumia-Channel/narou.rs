@@ -80,6 +80,12 @@ impl InventoryCookieStore {
                 stored.insert(host, credentials);
             }
         }
+        // A credential recorded by a novel is referenced by id, so every entry
+        // needs one that stays the same across runs: values written before ids
+        // existed (and version 1 imports) get theirs here and are saved back.
+        if assign_credential_ids(&mut stored) {
+            self.save_credentials(&stored)?;
+        }
         Ok(stored)
     }
 
@@ -209,6 +215,22 @@ impl InventoryCookieStore {
     }
 }
 
+/// Give every credential an id, returning whether anything changed.
+fn assign_credential_ids(stored: &mut BTreeMap<String, Vec<LoginCredential>>) -> bool {
+    let mut changed = false;
+    for credentials in stored.values_mut() {
+        for credential in credentials.iter_mut() {
+            if credential.id.is_empty()
+                && let Ok(id) = crate::login::new_credential_id()
+            {
+                credential.id = id;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// Normalize a credential before it is stored: surrounding space is never
 /// meaningful in a `Cookie:` header, and an empty one is not a credential.
 fn tidy(credentials: &[LoginCredential]) -> Vec<LoginCredential> {
@@ -221,6 +243,11 @@ fn tidy(credentials: &[LoginCredential]) -> Vec<LoginCredential> {
             }
             let mut credential = credential.clone();
             credential.cookie = cookie.to_string();
+            if credential.id.is_empty()
+                && let Ok(id) = crate::login::new_credential_id()
+            {
+                credential.id = id;
+            }
             Some(credential)
         })
         .collect()
@@ -437,19 +464,16 @@ mod tests {
             )]))
             .unwrap();
 
+        // 読み込み時に識別子が振られ、その書き戻しで暗号化される。
         let loaded = futures::executor::block_on(store.load_all("example.com")).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].cookie, "session=legacy");
-        assert!(!store.is_encrypted("example.com").unwrap());
-
-        // The next write of that host encrypts it.
-        store
-            .save_credentials_for(
-                "example.com",
-                &[LoginCredential::new("example.com", "session=legacy")],
-            )
-            .unwrap();
+        assert!(!loaded[0].id.is_empty(), "旧形式にも識別子が付く");
         assert!(store.is_encrypted("example.com").unwrap());
+
+        // 識別子は読み直しても変わらない（小説側が覚える値なので）。
+        let again = futures::executor::block_on(store.load_all("example.com")).unwrap();
+        assert_eq!(again[0].id, loaded[0].id);
     }
 
     #[test]

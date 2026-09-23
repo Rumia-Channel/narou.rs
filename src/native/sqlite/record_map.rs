@@ -137,6 +137,7 @@ pub(crate) fn record_params(record: &NovelRecord) -> Result<RecordParams> {
             text(extra_fields_yaml),
             Value::Integer(extra_fields_len as i64),
             Value::Integer(record.requires_login as i64),
+            opt_text(record.login_session.clone()),
         ],
     })
 }

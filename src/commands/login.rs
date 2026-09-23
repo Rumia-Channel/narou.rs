@@ -6,13 +6,11 @@
 //! with the library login key), exports the stored credentials for another
 //! machine, lists them, or clears them.
 
-use std::collections::BTreeMap;
 use std::io::Read as _;
 
 use narou_rs::error::{NarouError, Result};
 use narou_rs::login::{build_export, parse_export};
 use narou_rs::login::group_credentials;
-use narou_rs::platform::LoginCredential;
 use narou_rs::native::cookie_store::InventoryCookieStore;
 
 /// Subcommands of `narou login`.
@@ -131,9 +129,10 @@ fn list(store: &InventoryCookieStore) -> Result<()> {
         println!("  {host:<32} [{state}]");
         for (index, credential) in credentials.iter().enumerate() {
             println!(
-                "    {}. {:<16} {}",
+                "    {}. {:<16} [{}] {}",
                 index + 1,
                 credential.display_name(),
+                credential.short_id(),
                 mask_cookie(&credential.cookie)
             );
         }
@@ -362,6 +361,7 @@ fn mask_cookie(cookie: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use narou_rs::platform::LoginCredential;
     use super::*;
     use crate::test_support::{legacy_yaml_guard, set_current_dir_for_test};
 
@@ -409,7 +409,10 @@ mod tests {
 
         assert!(import(&store, &file, Some("wrong"), false).is_err());
         import(&store, &file, Some("hunter2"), false).unwrap();
-        assert_eq!(store.credentials_for("example.com").unwrap(), source);
+        let stored = store.credentials_for("example.com").unwrap();
+        assert_eq!(stored.len(), source.len());
+        assert_eq!(stored[0].cookie, source[0].cookie);
+        assert!(!stored[0].id.is_empty(), "取り込み時に識別子が振られる");
         assert!(store.is_encrypted("example.com").unwrap());
 
         let out = temp.path().join("out.yaml");
@@ -417,13 +420,16 @@ mod tests {
         export(&store, &out, Some("hunter2"), false).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(!text.contains("sid=abc"), "the export is encrypted");
-        assert_eq!(parse_export(&text, Some("hunter2")).unwrap(), source);
+        let exported = parse_export(&text, Some("hunter2")).unwrap();
+        assert_eq!(exported[0].cookie, source[0].cookie);
+        assert_eq!(exported[0].id, stored[0].id, "書き出しにも識別子が乗る");
 
         // The clear-text form is what a machine without a passphrase reads.
         export(&store, &out, Some("hunter2"), true).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("sid=abc"));
-        assert_eq!(parse_export(&text, None).unwrap(), source);
+        let exported = parse_export(&text, None).unwrap();
+        assert_eq!(exported[0].cookie, source[0].cookie);
     }
 
     #[test]

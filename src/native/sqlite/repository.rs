@@ -88,6 +88,7 @@ pub(crate) fn record_from_row(row: &Row<'_>) -> Result<NovelRecord> {
         last_check_date: parse_optional_time(column(row, 23)?)?,
         convert_failure: int_flag(row, 24)?,
         requires_login: int_flag(row, 26)?,
+        login_session: column(row, 27)?,
         extra_fields,
     })
 }
@@ -433,6 +434,7 @@ mod tests {
             last_check_date: None,
             convert_failure: false,
             requires_login: false,
+            login_session: None,
             extra_fields: Default::default(),
         };
         if toc_url.contains("syosetu") {

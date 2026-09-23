@@ -253,7 +253,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 | サブコマンド | 内容 |
 |---|---|
-| `list` | 保存済みサイト一覧。Cookie 値は `name=…` に伏せて表示し、暗号化状態と鍵の出所を示す |
+| `list` | 保存済みサイト一覧。Cookie 値は `name=…` に伏せ、資格情報ごとの短縮 ID・暗号化状態・鍵の出所を示す |
 | `import <file> [--passphrase P] [--replace]` | `narou_rs_login --export` の書き出しファイル (YAML) を取り込む。`--replace` で取り込みに含まれないホストを削除 |
 | `export <file> [--passphrase P] [--clear-text]` | 保存済み情報を書き出しファイルへ出力。`--passphrase` 指定時は Argon2id→XChaCha20-Poly1305 で暗号化 |
 | `set <host> [--cookie V] [--label L]` | そのホストの一覧を 1 件に置き換えて保存 (`--cookie` 省略時は標準入力) |
@@ -262,6 +262,8 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 | `clear [host] [--index N]` | 1 サイト分 / `--index` で 1 件だけ / 引数なしですべて削除 |
 
 **保存形式**: `login_cookie` inventory (SQLite `app_state` / `.narou/login_cookie.yaml`) に、**1 ホスト = 順序つき資格情報リスト** (`LoginCredential` の JSON 配列) を `enc:v1:<nonce>:<payload>` として暗号化保存。並び順がそのまま試行順になる。鍵は `.narou/login.key` (初回作成、Unix では 0600) または `NAROU_RS_LOGIN_KEY` (base64)。ホスト名を AEAD の associated data に束ねるため別ホストへの流用は不可。旧形式 (プレーンな Cookie 文字列) は 1 件として読み取り、次回保存時に暗号化された新形式へ移行する。
+
+**セッション ID**: 各資格情報に UUID を振り（保存値に含める）、小説レコードは `requires_login` に加えて `login_session`（成功した資格情報の ID）を持つ。フラグ付きの小説は次回以降その ID の資格情報を最初のリクエストから送るため、一覧の総当たりをしない。ID の無い旧データはストア読み込み時に採番・保存される。
 
 **試行順の使われ方**: ダウンロード時、ログイン壁 (404 / `login_pattern`) か部分一覧 (`login_partial_pattern`) のときに保存済みを**順に試す**。ログイン壁は成功した時点で、部分一覧は「欠けが消えた／取得話数が増えた」時点で打ち切る。採用した資格情報はその後の本文取得にも使う。`Set-Cookie` の書き戻しは、その応答で実際に送った資格情報だけを更新する (別アカウントのセッションを壊さない)。
 

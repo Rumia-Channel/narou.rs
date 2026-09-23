@@ -287,7 +287,8 @@
       (names ? ' <span class="login-cred-names">' + escapeHtml(names) + '</span>' : '') +
       '</div>' +
       '<div class="login-cred-cookies">' + escapeHtml(credential.cookies || '') + '</div>' +
-      (credential.added_at ? '<div class="login-cred-added">' + escapeHtml(formatLoginAddedAt(credential.added_at)) + '</div>' : '') +
+      (credential.added_at ? '<div class="login-cred-added">' + escapeHtml(formatLoginAddedAt(credential.added_at)) +
+        (credential.short_id ? ' · ID: ' + escapeHtml(credential.short_id) : '') + '</div>' : '') +
       '</div>' +
       '<span class="login-cred-actions">' + up + down +
       '<button type="button" class="btn btn-default login-cred-remove" data-host="' + escapeAttr(host) + '" data-index="' + index + '">削除</button>' +

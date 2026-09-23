@@ -303,6 +303,8 @@ fn status_payload() -> Result<serde_json::Value, NarouError> {
                 .map(|(index, credential)| {
                     serde_json::json!({
                         "index": index,
+                        "id": credential.id,
+                        "short_id": credential.short_id(),
                         "label": credential.label,
                         "host": credential.host,
                         "cookies": mask_cookie(&credential.cookie),

@@ -20,6 +20,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
  (9, include_str!("migrations/0009_section_bodies.sql")),
  (10, include_str!("migrations/0010_drop_body_yaml.sql")),
  (11, include_str!("migrations/0011_requires_login.sql")),
+    (12, include_str!("migrations/0012_login_session.sql")),
 ];
 
 pub(crate) fn apply(conn: &mut Connection) -> Result<()> {
@@ -62,7 +63,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
     }
 
     #[test]

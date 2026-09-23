@@ -24,6 +24,12 @@ use crate::platform::PlatformFuture;
 /// incomplete.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoginCredential {
+    /// Identifier this credential is remembered by. A novel records the id of
+    /// the credential that made its fetch work, so later runs can send that
+    /// one straight away instead of walking the list. Empty on a value written
+    /// before ids existed; the store fills one in and saves it back.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     /// Host the cookies were captured from; also where `Set-Cookie` updates
     /// are written back.
     pub host: String,
@@ -40,11 +46,23 @@ pub struct LoginCredential {
 impl LoginCredential {
     pub fn new(host: impl Into<String>, cookie: impl Into<String>) -> Self {
         Self {
+            id: String::new(),
             host: normalize_cookie_host(&host.into()),
             cookie: cookie.into(),
             label: None,
             added_at: None,
         }
+    }
+
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
+    }
+
+    /// Short form for the CLI and Web UI (the full id stays in storage).
+    pub fn short_id(&self) -> &str {
+        let end = self.id.len().min(8);
+        &self.id[..end]
     }
 
     pub fn with_label(mut self, label: Option<String>) -> Self {

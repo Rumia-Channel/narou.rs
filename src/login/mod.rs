@@ -21,7 +21,7 @@ pub mod transfer;
 
 pub use crypto::{
     AT_REST_PREFIX, KEY_LEN, decrypt_at_rest, decrypt_with_key, derive_key, encrypt_at_rest,
-    encrypt_with_key, is_encrypted_at_rest, random_key,
+    encrypt_with_key, is_encrypted_at_rest, new_credential_id, random_key,
 };
 pub use transfer::{
     CookieEnvelope, EXPORT_VERSION, build_export, group_credentials, parse_export,

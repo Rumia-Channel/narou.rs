@@ -30,6 +30,24 @@ fn login_error(message: impl Into<String>) -> NarouError {
 }
 
 /// Fill `N` bytes from the operating system random source.
+/// Identifier for one stored login credential (UUID v4 shape, lowercase hex).
+///
+/// Random rather than sequential so ids stay unique after exports move between
+/// machines. Generated wherever a credential is first stored.
+pub fn new_credential_id() -> Result<String> {
+    let mut bytes: [u8; 16] = random_bytes()?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut out = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push_str(&format!("{byte:02x}"));
+    }
+    Ok(out)
+}
+
 pub fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes)
