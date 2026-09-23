@@ -36,7 +36,9 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - Rust の production code に置いてよいのは、HTTP 取得、URL 解決、HTML エンティティ復元、共通抽出、DSL 実行基盤、実行制限など全サイトで再利用できる仕組みだけとする。サイト名・ドメイン名・サイト固有 CSS selector / 正規表現 / JSON path を条件にした分岐や専用関数は置かず、それらの値と処理手順は YAML / DSL 側に記述する。
 - 特定サイト名や実データを使う回帰テスト・fixture は許可するが、テスト対象の production code はサイト非依存でなければならない。DSL 拡張が安全性・互換性上どうしても不可能で暫定 Rust 処理が必要な場合は、実装前に理由と YAML へ戻す条件を明示し、ユーザーの了承を得る。
 - 2026-05 時点: ハードコードされた `kakuyomu_preprocess` は完全に除去され、`webnovel/kakuyomu.jp.yaml` の `preprocess:` DSL ブロックへ移行済み。pest 文法ベースの安全な DSL パーサー (`src/downloader/preprocess.pest`) + インタプリタ (`src/downloader/preprocess/interpreter.rs`) により、YAML 記述だけでカクヨム JSON → 中間テキストの展開が可能である。ユーザー側 YAML の `preprocess:` を編集するだけで前処理ロジックを差し替えられる。
-- pest 文法 (`src/downloader/preprocess.pest`) は以下の構文に対応: `guard`/`let`/`set`/`if`/`else`/`for`/`emit`/`insert_at_match`, 文字列補間 `${...}`, 正規表現 JSON 抽出 `extract_json(/.../)`, メソッドチェイン `.map`/`.flat_map`/`.flatten`/`.compact`/`.join`/`.gsub`/`.replace`/`.is_array`/`.empty`, 論理演算 `&&`/`||`/`!`/`==`/`!=`。実行時に step budget / 文字列サイズ上限 / 配列要素数上限による防御あり。
+- pest 文法 (`src/downloader/preprocess.pest`) は以下の構文に対応: `guard`/`let`/`set`/`if`/`else`/`for`/`emit`/`insert_at_match`, 文字列補間 `${...}`, 正規表現 JSON 抽出 `extract_json(/.../)`, メソッドチェイン `.map`/`.flat_map`/`.flatten`/`.compact`/`.join`/`.gsub`/`.replace`/`.is_array`/`.empty`/`.size`/`.first`/`.last`, 添字アクセス `arr[0]`/`hash["key"]`, 整数リテラル, 論理演算 `&&`/`||`/`!`/`==`/`!=`。実行時に step budget / 文字列サイズ上限 / 配列要素数上限による防御あり。
+- `.gsub` は第 1 引数に正規表現リテラル (`/re/`) も取れる。置換文字列では `$1` / `${name}` が展開される。チェインの `.field` / `[...]` は書いた順に評価される (`.first.name` が `.name` → `.first` の順に化けない)。
+- 注意: `preprocess` は TOC・本文・小説情報の全フェッチに同じスクリプトが走る。ページ種別は JSON の形で判定する。
 - 新しいサイト対応やサイト構造変更対応では、まず YAML 表現で解決できるかを検討する。やむを得ず Rust に暫定処理を置く場合は、暫定であること、対応する YAML 意味論、将来 YAML 駆動へ戻す作業を `AGENTS.md` または Serena メモに明記する。
 - Arcadia (`webnovel/www.mai-net.net.yaml`) に `encoding: UTF-8` は置かない。narou.rb の同梱 Arcadia 定義には無く、Rust 側は UTF-8 を既定として扱えばよい。Arcadia の本文取得不具合の実原因は `href` の `&amp;` を未デコードのまま section URL に使っていたことであり、`build_section_url()` 側で HTML エンティティを復元する。
 
@@ -340,6 +342,16 @@ sample/
 - **注意**: `aozoraepub3dir` を設定すると CLI は外部ツール (jar / Lite exe) を優先する (narou.rb と同じ)。組み込みエンジンを強制する設定は持たない。
 - 実データ検証 (2026-09-15, v0.1.3): `WebNovel` の n0421du (401 セクション) で Java 版と **422/423 ファイルがバイト完全一致**、挿絵入りでも **425/426 がバイト完全一致**（単ページ画像化・連番・表紙処理を含む）。残差は `dcterms:modified` のみ（Java はローカル時刻に `Z`、Lite は UTC。Lite 側の意図的な非再現）。
 - 検証手順は `docs/aozora_lite_evaluation_2026-08-23.md` の「更新 (2026-09-15)」節。
+
+### Pixiv 対応 (webnovel/www.pixiv.net.yaml, 2026-09)
+- 小説 (`https://www.pixiv.net/novel/show.php?id=N`) と小説シリーズ (`https://www.pixiv.net/novel/series/S`) に対応。作品ページの HTML は Next.js の SPA シェルで本文を含まないため、`/ajax/*` の JSON API だけを使う。サイト固有の Rust 処理は無く、すべて YAML + `preprocess:` DSL で表現している。
+- 取得元: シリーズ詳細 `/ajax/novel/series/{id}` (作品情報 + 目次 1 ページ目への誘導)、シリーズ目次 `/ajax/novel/series_content/{id}?limit=30&last_order=N&order_by=asc` (30 話ずつ、続きがあれば `next_toc` で辿る)、本文 `/ajax/novel/{id}`。
+- ncode は URL の数値だけだと作品種別をまたいで衝突するため、`ncode:` キーでページから `n` + 数値 (小説) / `s` + 数値 (シリーズ) を組み立てる。`ncode` はサイト定義の新キーで、URL に種別プレフィックスが無いサイト向けの汎用機能。
+- 目次は `body.thumbnails.novel` から作る (`page.seriesContents` と同じ順序で話数 `seriesContentOrder` と掲載日を持つため)。ページが 30 件で埋まっているときだけ `next::` 行を出し、`next_toc`/`next_url` がそれを拾う。
+- 本文記法: `[[rb:base>ruby]]` → `<ruby>`、`[[jumpuri:text>url]]` → `<a>`、`[chapter:X]` → 見出し行、`[newpage]` → `［＃改ページ］`、`[jump:N]` → `（Nページ目へ）`。挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は本文から消して `<!--...-->` の目印だけ残す。
+- **既知の未対応**: 挿絵のローカライズ。画像 URL の解決に `/ajax/illust/{id}/pages` の追加取得が要り、`i.pximg.net` は `Referer` 無しだと 403 を返す。narou.rs にはサイト別ヘッダの仕組みが無く、DSL からは複数 URL を取得できないため、本文への取り込みは未実装 (原文は `raw/` に残る)。
+- ログインが必要な作品 (R-18 / ログイン限定) は HTTP 200 のまま `content` が欠ける。DSL が `login_required::1` を出し、`login_pattern` と `error_message` の両方に一致させて、保存済み Cookie での 1 回再試行 → 駄目なら 404 判定に乗せる。
+- 実機確認 (2026-09-23): 単体作品 (短編, `n26352975`/`n29204764`)、シリーズ 6 話 (`s16299140`)、シリーズ 42 話 (`s16305923`, 目次 2 ページ)、シリーズの 1 話 (`n29205030`, 前書き/改ページ/章見出し/ルビ) で DL・変換・再更新 (差分なし) を確認。ログイン限定作品は Cookie 無しで 404 判定になることも確認。
 
 ### ダウンロード互換性
 - なろう (n8858hb, 24セクション) DL完走確認済み

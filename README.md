@@ -31,6 +31,7 @@ README では、導入方法、基本操作、主な注意点をまとめます�
 + Arcadia http://www.mai-net.net/
 + 暁 http://www.akatsuki-novels.com/
 + カクヨム https://kakuyomu.jp/
++ Pixiv https://www.pixiv.net/ （小説と小説シリーズ）
 
 ## セットアップ
 
@@ -318,6 +319,7 @@ narou_rs login clear                             # すべて削除
 - 作業ディレクトリ単位で `.narou/` を持つ設計です。`download`、`update`、`convert` などは基本的に初期化済みディレクトリで実行してください。
 - サイトごとの取得・抽出ルールは `webnovel/*.yaml` を使います。ユーザーがこの YAML を編集すると、挙動もそれに追従します。
 - 保存データや設定ファイルは [narou.rb](https://github.com/whiteleaf7/narou) 互換の YAML / ディレクトリ構成を重視しています。
+- Pixiv は本文・目次・作品情報を `/ajax/*` の JSON から取得します (`webnovel/www.pixiv.net.yaml`)。挿絵の取り込みは未対応で、本文中の挿絵位置には目印だけを残します。ログイン限定作品は `narou_rs_login` で保存した Cookie を使って再試行します。
 - 変換結果は青空文庫向け整形を基準にし、設定や device 指定に応じて追加出力を行います。
 - `update` は `general_lastup`、差分 cache、strong update、freeze などの挙動を持ちます。
 - `web` は localhost 利用を基本にしています。非 loopback で公開する場合は認証設定を行ってください。
