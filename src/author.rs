@@ -9,8 +9,6 @@
 //! The store lives in the `author` inventory, so SQLite keeps it in `app_state`
 //! and the legacy backend keeps `.narou/author.yaml`.
 
-use std::collections::BTreeMap;
-
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::error::Result;
 

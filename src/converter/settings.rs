@@ -967,12 +967,8 @@ fn yaml_value_to_ini(value: &serde_yaml::Value) -> IniValue {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::NovelSettings;
-
-    static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     #[test]
     fn default_enables_half_indent_bracket_like_ruby() {
@@ -994,14 +990,10 @@ mod tests {
 
     #[test]
     fn load_for_novel_reads_project_local_setting_defaults() {
-        let root = std::env::temp_dir().join(format!(
-            "narou-rs-settings-test-{}-{}",
-            TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // `TempDir` は panic 時も Drop で消えるので、落ちたテストの残骸が
+        // 一時ディレクトリに溜まらない。
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
         let archive_path = root.join("小説データ").join("test-novel");
         std::fs::create_dir_all(root.join(".narou")).unwrap();
         std::fs::create_dir_all(&archive_path).unwrap();
@@ -1022,7 +1014,6 @@ mod tests {
         assert_eq!(settings.title_date_format, "$t (%F) $ns");
         assert_eq!(settings.title_date_target, "general_lastup");
 
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1030,14 +1021,10 @@ mod tests {
         if crate::native::sqlite::state::legacy_yaml_active() {
             return;
         }
-        let root = std::env::temp_dir().join(format!(
-            "narou-rs-settings-sqlite-test-{}-{}",
-            TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // `TempDir` は panic 時も Drop で消えるので、落ちたテストの残骸が
+        // 一時ディレクトリに溜まらない。
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
         let archive_path = root.join("小説データ").join("test-novel");
         std::fs::create_dir_all(root.join(".narou")).unwrap();
         std::fs::create_dir_all(&archive_path).unwrap();
@@ -1084,19 +1071,12 @@ mod tests {
             assert!(no_force.enable_add_date_to_title);
         }
 
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn load_for_novel_with_options_ignores_force_and_default_settings() {
-        let root = std::env::temp_dir().join(format!(
-            "narou-rs-settings-ignore-test-{}-{}",
-            TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
         let archive_path = root.join("小説データ").join("test-novel");
         std::fs::create_dir_all(root.join(".narou")).unwrap();
         std::fs::create_dir_all(&archive_path).unwrap();
@@ -1131,19 +1111,12 @@ mod tests {
         assert!(!ignore_default.enable_inspect);
         assert!(!ignore_force.enable_erase_introduction);
 
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn load_for_novel_appends_global_replace_patterns_after_local_patterns() {
-        let root = std::env::temp_dir().join(format!(
-            "narou-rs-settings-global-replace-{}-{}",
-            TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path();
         let archive_path = root.join("小説データ").join("test-novel");
         std::fs::create_dir_all(root.join(".narou")).unwrap();
         std::fs::create_dir_all(&archive_path).unwrap();
@@ -1160,7 +1133,6 @@ mod tests {
             ]
         );
 
-        let _ = std::fs::remove_dir_all(root);
     }
 }
 
