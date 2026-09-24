@@ -3686,17 +3686,21 @@ is_narou: false
         // 作者ページの作品一覧 (/ajax/user/{id}/profile/all) を preprocess に通すと、
         // 単体小説と小説シリーズが作品として並ぶ。
         let json = r#"{"error":false,"message":"","body":{"novels":{"2594847":null,"2610142":null},
-            "novelSeries":[{"id":"272850","userId":"1"},{"id":"551006","userId":"1"}]}}"#;
+            "novelSeries":[{"id":"272850","userId":"1"},{"id":"551006","userId":"1"}],
+            "mangaSeries":[{"id":"329992","userId":"1"}]}}"#;
         let html = run_pixiv_preprocess(json);
 
         assert!(html.contains("author_novel::https://www.pixiv.net/novel/show.php?id=2594847"));
         assert!(html.contains("author_novel::https://www.pixiv.net/novel/show.php?id=2610142"));
         assert!(html.contains("author_novel::https://www.pixiv.net/novel/series/272850"));
         assert!(html.contains("author_novel::https://www.pixiv.net/novel/series/551006"));
+        // 漫画シリーズも作品として並ぶ (シリーズの各ページは artwork なので出さない)。
+        assert!(html.contains("author_novel::https://www.pixiv.net/ajax/series/329992"));
 
         let setting = pixiv_setting();
         let urls = setting.author_novel_urls(&html).expect("Pixiv lists works");
-        assert_eq!(urls.len(), 4, "got {urls:?}");
+        assert_eq!(urls.len(), 5, "got {urls:?}");
+        assert!(urls.iter().any(|url| url.ends_with("/ajax/series/329992")));
         assert_eq!(setting.author_series_ids(&html), vec!["272850", "551006"]);
 
         // シリーズの 1 話は content_titles から取り出して作品一覧から除く。

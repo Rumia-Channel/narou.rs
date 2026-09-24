@@ -31,8 +31,8 @@ timezone: Asia/Tokyo
 # ------------------------------------------------------------
 # 作者追跡設定 (作者ページ = ユーザーページ)。`narou author add` で登録する。
 # 作品一覧は /ajax/user/{id}/profile/all の JSON から preprocess で組み立てる
-# (小説シリーズ + 単体小説)。シリーズの 1 話は作品ではないため、作品一覧に
-# 混ざる分を content_titles で除く。
+# (単体小説 + 小説シリーズ + 漫画シリーズ)。小説シリーズの 1 話は作者の作品一覧に
+# も混ざるため、content_titles でその回の話を除く。
 author_url: ^https?://\k<domain>/users/(?<user_id>\d+)
 author_api_url: \k<top_url>/ajax/user/\k<user_id>/profile/all
 author_series_episodes_url: \k<top_url>/ajax/novel/series/\k<series_id>/content_titles
@@ -60,15 +60,24 @@ preprocess: |-
   emit "<!---"
   emit "PixivPreprocessEvalMagicWord"
 
-  # 作者ページの作品一覧。単体小説と小説シリーズを作品として出し、シリーズの
-  # 1 話が混ざっていたら narou 側が author_series を見て取り除く。
-  if body.novels && body.novelSeries
+  # 作者ページの作品一覧 (/ajax/user/{id}/profile/all)。単体小説・小説シリーズ・
+  # 漫画シリーズを作品として出す。小説シリーズの 1 話は作者の作品一覧にも
+  # 混ざるため author_series を出し、narou 側がその回の話を取り除く
+  # (漫画シリーズの各ページは artwork なので、そもそも作品として出していない)。
+  if body.novels
     for novel_id in body.novels.keys
       emit "author_novel::https://www.pixiv.net/novel/show.php?id=${novel_id}"
     end
+  end
+  if body.novelSeries
     for series in body.novelSeries
       emit "author_novel::https://www.pixiv.net/novel/series/${series.id}"
       emit "author_series::${series.id}"
+    end
+  end
+  if body.mangaSeries
+    for series in body.mangaSeries
+      emit "author_novel::https://www.pixiv.net/ajax/series/${series.id}"
     end
   end
 
