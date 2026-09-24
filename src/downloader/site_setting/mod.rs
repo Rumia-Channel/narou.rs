@@ -69,6 +69,16 @@ pub struct SiteSetting {
     /// episodes can be kept out of the author's work list.
     #[serde(default)]
     pub author_series_episodes_pattern: Option<String>,
+    /// URL of one page of a comic series' page list (Pixiv pages `?p=N`).
+    ///
+    /// `\k<series_id>` and `\k<page>` are available, plus whatever `author_url`
+    /// captured.
+    #[serde(default)]
+    pub author_comic_series_pages_url: Option<String>,
+    /// Pattern over that page list yielding `novel_id`, so a comic series'
+    /// pages can be kept out of the author's single-artwork list.
+    #[serde(default)]
+    pub author_comic_series_pages_pattern: Option<String>,
     /// Pattern whose `author_next` capture is the next page of an author
     /// listing (ハーメルン pages its works). Followed until a page has no next
     /// link or points at one already visited — the visited set is what keeps a
@@ -197,6 +207,8 @@ pub struct SiteSetting {
     #[serde(skip)]
     pub(super) compiled_author_series_episodes: Option<Regex>,
     #[serde(skip)]
+    pub(super) compiled_author_comic_pages: Option<Regex>,
+    #[serde(skip)]
     pub(super) compiled_subtitles: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_body: Option<Regex>,
@@ -274,6 +286,8 @@ pub enum SiteSettingEntry {
 const AUTHOR_NOVEL_MARKER: &str = "author_novel::";
 /// Preprocess marker carrying a series whose episodes must be left out.
 const AUTHOR_SERIES_MARKER: &str = "author_series::";
+/// Preprocess marker carrying a comic series whose pages must be left out.
+const AUTHOR_COMIC_SERIES_MARKER: &str = "author_comic_series::";
 
 impl SiteSetting {
     pub fn load_all() -> Result<Vec<Self>> {
@@ -345,6 +359,10 @@ impl SiteSetting {
             .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
         self.compiled_author_series_episodes = self
             .author_series_episodes_pattern
+            .as_deref()
+            .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
+        self.compiled_author_comic_pages = self
+            .author_comic_series_pages_pattern
             .as_deref()
             .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
         self.compiled_subtitles = self.subtitles.as_ref().and_then(|v| self.compile_value(v));
@@ -480,9 +498,14 @@ impl SiteSetting {
     /// Pixiv mixes the episodes of a series into the author's novel list; the
     /// definition emits the series so those episodes can be left out.
     pub fn author_series_ids(&self, source: &str) -> Vec<String> {
+        Self::marked_ids(source, AUTHOR_SERIES_MARKER)
+    }
+
+    /// Ids carried by `<marker><id>` lines of a preprocessed source.
+    fn marked_ids(source: &str, marker: &str) -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
         for line in source.lines() {
-            if let Some(id) = line.trim().strip_prefix(AUTHOR_SERIES_MARKER) {
+            if let Some(id) = line.trim().strip_prefix(marker) {
                 let id = id.trim().to_string();
                 if !id.is_empty() && !ids.contains(&id) {
                     ids.push(id);
@@ -508,6 +531,41 @@ impl SiteSetting {
     /// Episode ids found in a series' episode list.
     pub fn author_series_episode_ids(&self, source: &str) -> Vec<String> {
         let Some(pattern) = self.compiled_author_series_episodes.as_ref() else {
+            return Vec::new();
+        };
+        pattern
+            .captures_iter(source)
+            .filter_map(|captures| {
+                captures
+                    .name("novel_id")
+                    .or_else(|| captures.name("ncode"))
+                    .map(|matched| matched.as_str().to_string())
+            })
+            .collect()
+    }
+
+    /// Comic series the listing asked to check (`author_comic_series::<id>`).
+    pub fn author_comic_series_ids(&self, source: &str) -> Vec<String> {
+        Self::marked_ids(source, AUTHOR_COMIC_SERIES_MARKER)
+    }
+
+    /// URL of one page of a comic series' page list.
+    pub fn author_comic_series_pages_fetch_url(
+        &self,
+        captures: &HashMap<String, String>,
+        series_id: &str,
+        page: usize,
+    ) -> Option<String> {
+        let template = self.author_comic_series_pages_url.as_deref()?;
+        let mut named = captures.clone();
+        named.insert("series_id".to_string(), series_id.to_string());
+        named.insert("page".to_string(), page.to_string());
+        Some(self.interpolate_with_captures(template, &named))
+    }
+
+    /// Artwork ids found in one page of a comic series' page list.
+    pub fn author_comic_series_page_ids(&self, source: &str) -> Vec<String> {
+        let Some(pattern) = self.compiled_author_comic_pages.as_ref() else {
             return Vec::new();
         };
         pattern

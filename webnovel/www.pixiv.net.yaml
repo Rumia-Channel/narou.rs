@@ -31,12 +31,15 @@ timezone: Asia/Tokyo
 # ------------------------------------------------------------
 # 作者追跡設定 (作者ページ = ユーザーページ)。`narou author add` で登録する。
 # 作品一覧は /ajax/user/{id}/profile/all の JSON から preprocess で組み立てる
-# (単体小説 + 小説シリーズ + 漫画シリーズ)。小説シリーズの 1 話は作者の作品一覧に
-# も混ざるため、content_titles でその回の話を除く。
+# (単体小説 + 小説シリーズ + 漫画シリーズ + 単体イラスト・漫画)。シリーズの
+# 各話・各ページは一覧にも混ざるため、content_titles / ?p=N でその分を除く。
 author_url: ^https?://\k<domain>/users/(?<user_id>\d+)
 author_api_url: \k<top_url>/ajax/user/\k<user_id>/profile/all
 author_series_episodes_url: \k<top_url>/ajax/novel/series/\k<series_id>/content_titles
 author_series_episodes_pattern: '"id":"(?<novel_id>\d+)"'
+# 漫画シリーズの各ページも単体イラスト一覧に混ざる。ページ一覧 (?p=N) は 12 件ずつ。
+author_comic_series_pages_url: \k<top_url>/ajax/series/\k<series_id>?p=\k<page>&lang=ja
+author_comic_series_pages_pattern: '"workId":"(?<novel_id>\d+)"'
 
 headers:
   Referer: \k<top_url>/
@@ -61,9 +64,9 @@ preprocess: |-
   emit "PixivPreprocessEvalMagicWord"
 
   # 作者ページの作品一覧 (/ajax/user/{id}/profile/all)。単体小説・小説シリーズ・
-  # 漫画シリーズを作品として出す。小説シリーズの 1 話は作者の作品一覧にも
-  # 混ざるため author_series を出し、narou 側がその回の話を取り除く
-  # (漫画シリーズの各ページは artwork なので、そもそも作品として出していない)。
+  # 漫画シリーズ・単体イラスト/漫画を作品として出す。シリーズに属する話/ページは
+  # 一覧にも混ざるため author_series / author_comic_series を出し、narou 側が
+  # その分を取り除く。
   if body.novels
     for novel_id in body.novels.keys
       emit "author_novel::https://www.pixiv.net/novel/show.php?id=${novel_id}"
@@ -78,6 +81,20 @@ preprocess: |-
   if body.mangaSeries
     for series in body.mangaSeries
       emit "author_novel::https://www.pixiv.net/ajax/series/${series.id}"
+      emit "author_comic_series::${series.id}"
+    end
+  end
+  # 単体イラスト・漫画。空のときは [] で返るので、配列になっているときは触らない。
+  # キーの並びは JSON のオブジェクト順 (id の文字列昇順) で、narou_bridge の
+  # sorted() と同じ。取り込み順 = narou の ID 順になる。
+  if !body.illusts.is_array
+    for illust_id in body.illusts.keys
+      emit "author_novel::https://www.pixiv.net/artworks/${illust_id}"
+    end
+  end
+  if body.manga && !body.manga.is_array
+    for illust_id in body.manga.keys
+      emit "author_novel::https://www.pixiv.net/artworks/${illust_id}"
     end
   end
 

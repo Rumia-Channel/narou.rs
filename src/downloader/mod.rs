@@ -670,6 +670,8 @@ impl Downloader {
         // Pixiv は 1 話ずつが作者の作品一覧に混ざる。定義が出す
         // `author_series::<id>` を集めておき、その回の話を後で除く。
         let mut series: Vec<String> = Vec::new();
+        // 漫画シリーズの各ページも単体イラスト一覧に混ざる。
+        let mut comic_series: Vec<String> = Vec::new();
         let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
         // 一覧がページ分けされているサイト (ハーメルン) は次ページを辿る。
         // 次ページが無くなるか、既に訪れた URL に戻ったら終わり。訪問済みを
@@ -703,21 +705,88 @@ impl Downloader {
                     series.push(id);
                 }
             }
+            for id in setting.author_comic_series_ids(&body) {
+                if !comic_series.contains(&id) {
+                    comic_series.push(id);
+                }
+            }
             match setting.author_next_url(&body) {
                 Some(next) => fetch_url = next,
                 None => break,
             }
         }
-        // シリーズの 1 話は作者の作品ではないので落とす (取得できなければ
+        // シリーズに属する話/ページは作者の作品ではないので落とす (取得できなければ
         // そのまま返す: 一覧の取りこぼしより、余分に足さない方が害が小さい)。
+        let mut inside_series: Vec<String> = Vec::new();
         if !series.is_empty()
             && setting.author_series_episodes_url.is_some()
-            && let Ok(episodes) = self.author_series_episodes(setting, page_url, &series).await
-            && !episodes.is_empty()
+            && let Ok(ids) = self.author_series_episodes(setting, page_url, &series).await
         {
-            urls.retain(|url| !episodes.iter().any(|id| url_mentions_id(url, id)));
+            inside_series.extend(ids);
+        }
+        if !comic_series.is_empty()
+            && setting.author_comic_series_pages_url.is_some()
+            && let Ok(ids) = self.author_comic_series_pages(setting, page_url, &comic_series).await
+        {
+            inside_series.extend(ids);
+        }
+        if !inside_series.is_empty() {
+            urls.retain(|url| !inside_series.iter().any(|id| url_mentions_id(url, id)));
         }
         Ok(urls)
+    }
+
+    /// Artwork ids of the given comic series, read page by page until a page
+    /// stops adding anything (Pixiv returns 12 artworks per page).
+    ///
+    /// Best effort like [`Self::author_series_episodes`].
+    async fn author_comic_series_pages(
+        &self,
+        setting: &SiteSetting,
+        page_url: &str,
+        series: &[String],
+    ) -> Result<Vec<String>> {
+        const MAX_PAGES: usize = 100;
+        let captures = setting
+            .extract_author_url_captures(page_url)
+            .unwrap_or_default();
+        let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
+        let mut pages: Vec<String> = Vec::new();
+        for series_id in series {
+            for page in 1..=MAX_PAGES {
+                let Some(url) =
+                    setting.author_comic_series_pages_fetch_url(&captures, series_id, page)
+                else {
+                    break;
+                };
+                let Ok(body) = crate::downloader::http_policy::fetch_text(
+                    self.http.as_ref(),
+                    self.rate_limiter.as_ref(),
+                    &url,
+                    &policy,
+                    Some(setting.encoding()),
+                )
+                .await
+                else {
+                    break;
+                };
+                let ids = setting.author_comic_series_page_ids(&body);
+                if ids.is_empty() {
+                    break;
+                }
+                let before = pages.len();
+                for id in ids {
+                    if !pages.contains(&id) {
+                        pages.push(id);
+                    }
+                }
+                if pages.len() == before {
+                    // 同じページが返り続ける定義でも止まる。
+                    break;
+                }
+            }
+        }
+        Ok(pages)
     }
 
     /// Episode ids of the given series, fetched through the definition.
@@ -3687,20 +3756,44 @@ is_narou: false
         // 単体小説と小説シリーズが作品として並ぶ。
         let json = r#"{"error":false,"message":"","body":{"novels":{"2594847":null,"2610142":null},
             "novelSeries":[{"id":"272850","userId":"1"},{"id":"551006","userId":"1"}],
-            "mangaSeries":[{"id":"329992","userId":"1"}]}}"#;
+            "mangaSeries":[{"id":"329992","userId":"1"}],
+            "illusts":{"149803200":null,"149768354":null},
+            "manga":[]}}"#;
         let html = run_pixiv_preprocess(json);
 
         assert!(html.contains("author_novel::https://www.pixiv.net/novel/show.php?id=2594847"));
         assert!(html.contains("author_novel::https://www.pixiv.net/novel/show.php?id=2610142"));
         assert!(html.contains("author_novel::https://www.pixiv.net/novel/series/272850"));
         assert!(html.contains("author_novel::https://www.pixiv.net/novel/series/551006"));
-        // 漫画シリーズも作品として並ぶ (シリーズの各ページは artwork なので出さない)。
+        // 漫画シリーズも作品として並ぶ。
         assert!(html.contains("author_novel::https://www.pixiv.net/ajax/series/329992"));
+        assert!(html.contains("author_comic_series::329992"));
+        // 単体イラストも作品。古い順に並べる (一覧は新しい順で返る)。
+        assert!(html.contains("author_novel::https://www.pixiv.net/artworks/149803200"));
+        assert!(html.contains("author_novel::https://www.pixiv.net/artworks/149768354"));
+        // 並びは一覧の JSON 順 (id の文字列昇順) で、narou_bridge の sorted() と同じ。
+        assert!(
+            html.find("artworks/149768354") < html.find("artworks/149803200"),
+            "一覧の順に並べる: {html}"
+        );
+        // 空のときは配列で返るので、その場合は何も出さない。
+        assert!(!html.contains("artworks/manga"));
 
         let setting = pixiv_setting();
         let urls = setting.author_novel_urls(&html).expect("Pixiv lists works");
-        assert_eq!(urls.len(), 5, "got {urls:?}");
+        assert_eq!(urls.len(), 7, "got {urls:?}");
         assert!(urls.iter().any(|url| url.ends_with("/ajax/series/329992")));
+        assert_eq!(setting.author_comic_series_ids(&html), vec!["329992"]);
+        assert_eq!(
+            setting.author_comic_series_page_ids(r#"{"page":{"series":[{"workId":"138467437","order":5}]}}"#),
+            vec!["138467437"]
+        );
+        let mut captures = HashMap::new();
+        captures.insert("user_id".to_string(), "6519870".to_string());
+        assert_eq!(
+            setting.author_comic_series_pages_fetch_url(&captures, "329992", 2),
+            Some("https://www.pixiv.net/ajax/series/329992?p=2&lang=ja".to_string())
+        );
         assert_eq!(setting.author_series_ids(&html), vec!["272850", "551006"]);
 
         // シリーズの 1 話は content_titles から取り出して作品一覧から除く。

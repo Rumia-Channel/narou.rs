@@ -248,7 +248,7 @@ pub async fn cmd_update(opts: UpdateOptions) {
             println!("アップデートを中断しました");
             std::process::exit(126);
         }
-        match crate::commands::author::check_tracked_authors(opts.user_agent.as_deref()).await {
+        match crate::commands::author::check_tracked_authors(opts.user_agent.as_deref(), false).await {
             Ok(report) => {
                 report.print();
                 mistook += report.failed;

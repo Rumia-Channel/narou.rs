@@ -31,7 +31,11 @@ pub enum AuthorAction {
         target: String,
     },
     /// Check every tracked author now and download new works.
-    Check,
+    Check {
+        /// List the works that would be added without downloading them.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
 }
 
 /// Run `narou author`.
@@ -40,8 +44,8 @@ pub async fn cmd_author(action: AuthorAction) -> Result<()> {
         AuthorAction::Add { url } => add(&url),
         AuthorAction::List => list(),
         AuthorAction::Remove { target } => remove(&target),
-        AuthorAction::Check => {
-            let report = check_tracked_authors(None).await?;
+        AuthorAction::Check { dry_run } => {
+            let report = check_tracked_authors(None, dry_run).await?;
             report.print();
             Ok(())
         }
@@ -134,7 +138,10 @@ impl AuthorCheckReport {
 /// published is picked up in the same run. Each new work goes through the
 /// ordinary download path (`narou download <url>`), which is what records it,
 /// tags it and converts it.
-pub async fn check_tracked_authors(user_agent: Option<&str>) -> Result<AuthorCheckReport> {
+pub async fn check_tracked_authors(
+    user_agent: Option<&str>,
+    dry_run: bool,
+) -> Result<AuthorCheckReport> {
     // 新規作品の判定と追加は小説データベースを触るので、他コマンドと同じく
     // ここで初期化しておく (`narou update` から呼ばれる場合は初期化済み)。
     narou_rs::db::init_database()
@@ -193,6 +200,12 @@ pub async fn check_tracked_authors(user_agent: Option<&str>) -> Result<AuthorChe
             }
             if download::target_is_known(url) {
                 known += 1;
+                continue;
+            }
+            if dry_run {
+                // 何が増えるかだけを見せる (数千作品の作者でも確かめられる)。
+                println!("  {url}");
+                added += 1;
                 continue;
             }
             let code = download::cmd_download(DownloadOptions {
