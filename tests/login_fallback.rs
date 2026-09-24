@@ -114,11 +114,14 @@ async fn login_fallback_retries_with_the_stored_cookie_and_flags_the_novel() {
     });
     let cookies = Arc::new(MemoryCookieStore::new());
     cookies
-        .save_all(
+        .save_groups(
             "example.com",
-            &[narou_rs::platform::LoginCredential::new(
+            &[narou_rs::platform::LoginGroup::new(
                 "example.com",
-                "session=abc",
+                vec![narou_rs::platform::HostCookie {
+                    host: "example.com".to_string(),
+                    cookie: "session=abc".to_string(),
+                }],
             )],
         )
         .await
@@ -153,11 +156,11 @@ async fn login_fallback_retries_with_the_stored_cookie_and_flags_the_novel() {
         .login_session
         .clone()
         .expect("the credential that worked is remembered by id");
-    let stored = cookies.load_all("example.com").await.unwrap();
+    let stored = cookies.load_groups("example.com").await.unwrap();
     assert_eq!(
-        stored.iter().filter(|credential| credential.id == session).count(),
+        stored.iter().filter(|group| group.id == session).count(),
         1,
-        "the recorded id must address the stored credential: {session}"
+        "the recorded id must address the stored login: {session}"
     );
 
     assert!(

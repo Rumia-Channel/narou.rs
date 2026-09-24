@@ -16,40 +16,50 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::platform::PlatformFuture;
 
-/// One stored login credential (a `Cookie:` header captured for a site).
-///
-/// A site may hold several, and their order *is* the order the downloader
-/// tries them in: the first entry is sent when a novel is already known to
-/// need a login, and the rest are tried when a fetch still looks blocked or
-/// incomplete.
+/// One host's cookies inside a login.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LoginCredential {
-    /// Identifier this credential is remembered by. A novel records the id of
-    /// the credential that made its fetch work, so later runs can send that
-    /// one straight away instead of walking the list. Empty on a value written
-    /// before ids existed; the store fills one in and saves it back.
+pub struct HostCookie {
+    /// Host the cookies were captured from (and where `Set-Cookie` writes back).
+    pub host: String,
+    /// `Cookie:` header value for that host.
+    pub cookie: String,
+}
+
+/// One login: which site it belongs to, what the user calls it, and the
+/// cookies it carries.
+///
+/// A browser session is not one cookie string but several, one per host the
+/// site uses (Pixiv sets `.pixiv.net`, `www.pixiv.net` and
+/// `accounts.pixiv.net`), so a login keeps them together and sends the union.
+/// A site may hold several logins; their order is the order they are tried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginGroup {
+    /// Identifier this login is remembered by. A novel records the id of the
+    /// login that made its fetch work. Empty on a value written before ids
+    /// existed; the store fills one in and saves it back.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
-    /// Host the cookies were captured from; also where `Set-Cookie` updates
-    /// are written back.
-    pub host: String,
-    /// `Cookie:` header value.
-    pub cookie: String,
-    /// Optional label shown in the CLI and Web UI ("メイン", "R18用", …).
+    /// Site the login belongs to — the site definition's domain
+    /// (`www.pixiv.net`), used to group the hosts of one session.
+    pub site: String,
+    /// Name the user gave it ("メインアカウント", "Pixiv1", …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// When the credential was captured or imported (RFC 3339).
+    /// Cookies of this login, one entry per host.
+    #[serde(default)]
+    pub cookies: Vec<HostCookie>,
+    /// When the login was captured or imported (RFC 3339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_at: Option<String>,
 }
 
-impl LoginCredential {
-    pub fn new(host: impl Into<String>, cookie: impl Into<String>) -> Self {
+impl LoginGroup {
+    pub fn new(site: impl Into<String>, cookies: Vec<HostCookie>) -> Self {
         Self {
             id: String::new(),
-            host: normalize_cookie_host(&host.into()),
-            cookie: cookie.into(),
+            site: site.into(),
             label: None,
+            cookies,
             added_at: None,
         }
     }
@@ -57,12 +67,6 @@ impl LoginCredential {
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = id.into();
         self
-    }
-
-    /// Short form for the CLI and Web UI (the full id stays in storage).
-    pub fn short_id(&self) -> &str {
-        let end = self.id.len().min(8);
-        &self.id[..end]
     }
 
     pub fn with_label(mut self, label: Option<String>) -> Self {
@@ -75,56 +79,245 @@ impl LoginCredential {
         self
     }
 
-    /// Label for display, falling back to the host.
+    /// Name shown in the CLI and Web UI, falling back to the site.
     pub fn display_name(&self) -> &str {
-        self.label.as_deref().unwrap_or(&self.host)
+        self.label.as_deref().unwrap_or(&self.site)
     }
 
-    /// Whether two entries carry the same session (the order list treats a
-    /// repeated value as the same credential).
-    pub fn same_cookie(&self, other: &Self) -> bool {
-        self.cookie == other.cookie
+    /// Short form of the id (the full one stays in storage).
+    pub fn short_id(&self) -> &str {
+        let end = self.id.len().min(8);
+        &self.id[..end]
+    }
+
+    /// Whether two logins carry the same cookies (the list treats a repeated
+    /// value as the same login).
+    pub fn same_cookies(&self, other: &Self) -> bool {
+        self.cookies == other.cookies
+    }
+
+    /// Hosts of this login, most specific first.
+    pub fn hosts(&self) -> Vec<&str> {
+        let mut hosts: Vec<&str> = self.cookies.iter().map(|entry| entry.host.as_str()).collect();
+        hosts.sort_by_key(|host| std::cmp::Reverse(host.matches('.').count()));
+        hosts
+    }
+
+    /// `Cookie:` header to send for this login: every host's cookies, with the
+    /// most specific host winning a name it shares with a broader one.
+    pub fn merged_cookie(&self) -> String {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for host in self.hosts() {
+            let Some(entry) = self.cookies.iter().find(|entry| entry.host == host) else {
+                continue;
+            };
+            for (name, value) in parse_cookie_header(&entry.cookie) {
+                match pairs.iter_mut().find(|(existing, _)| *existing == name) {
+                    Some(existing) => existing.1 = value,
+                    None => pairs.push((name, value)),
+                }
+            }
+        }
+        format_cookie_header(&pairs)
+    }
+
+    /// Host whose cookies are part of `sent`, which is where a `Set-Cookie`
+    /// response came from.
+    pub fn host_for_sent(&self, sent: &[(String, String)]) -> Option<&str> {
+        self.cookies
+            .iter()
+            .filter(|entry| {
+                let pairs = parse_cookie_header(&entry.cookie);
+                !pairs.is_empty()
+                    && pairs.iter().all(|(name, value)| {
+                        sent.iter()
+                            .any(|(sent_name, sent_value)| sent_name == name && sent_value == value)
+                    })
+            })
+            .map(|entry| entry.host.as_str())
+            .next()
     }
 }
 
-/// Encode credentials for inventory storage, which only holds strings.
-pub fn encode_credentials(credentials: &[LoginCredential]) -> Result<String> {
-    serde_json::to_string(credentials)
-        .map_err(|error| crate::error::NarouError::Login(format!("資格情報を保存できません: {error}")))
+/// Encode login groups for inventory storage, which only holds strings.
+pub fn encode_groups(groups: &[LoginGroup]) -> Result<String> {
+    serde_json::to_string(groups)
+        .map_err(|error| crate::error::NarouError::Login(format!("ログイン情報を保存できません: {error}")))
 }
 
 /// Decode a stored value.
 ///
-/// Values written before a site could hold several credentials are a bare
-/// `Cookie:` header; those are read as a single entry so an older library keeps
-/// working (and is upgraded on the next write).
-pub fn decode_credentials(value: &str, host: &str) -> Vec<LoginCredential> {
+/// A value written by an older build is a list of per-host credentials; those
+/// are folded into one login per site, which is what the newer shape expects.
+pub fn decode_groups(value: &str, site: &str) -> Result<DecodedGroups> {
     let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(DecodedGroups::Current(Vec::new()));
+    }
     if trimmed.starts_with('[') {
-        if let Ok(credentials) = serde_json::from_str::<Vec<LoginCredential>>(trimmed) {
-            return credentials;
+        if let Ok(groups) = serde_json::from_str::<Vec<LoginGroup>>(trimmed) {
+            return Ok(DecodedGroups::Current(groups));
+        }
+        if let Ok(legacy) = serde_json::from_str::<Vec<LegacyCredential>>(trimmed) {
+            return Ok(DecodedGroups::PerHost(
+                legacy
+                    .into_iter()
+                    .map(|old| old.into_group(site))
+                    .collect(),
+            ));
         }
     }
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    vec![LoginCredential::new(host, trimmed)]
+    Ok(DecodedGroups::Current(Vec::new()))
 }
 
-/// Cookie persistence boundary.
+/// What a stored value turned out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedGroups {
+    /// Current form: logins already grouped per site.
+    Current(Vec<LoginGroup>),
+    /// Version 2 form: one credential per host, read to migrate it.
+    PerHost(Vec<LoginGroup>),
+}
+
+impl DecodedGroups {
+    pub fn into_groups(self) -> Vec<LoginGroup> {
+        match self {
+            DecodedGroups::Current(groups) | DecodedGroups::PerHost(groups) => groups,
+        }
+    }
+}
+
+/// Fold per-host credentials into one login per account.
+///
+/// Version 2 kept a list per host, and the same position in every list was the
+/// same account. Folding by position restores one login carrying every host's
+/// cookies, which is what a browser sends.
+pub fn fold_per_host_lists(lists: Vec<Vec<LoginGroup>>, site: &str) -> Vec<LoginGroup> {
+    let mut merged: Vec<LoginGroup> = Vec::new();
+    for list in lists {
+        for (index, group) in list.into_iter().enumerate() {
+            let mut group = group;
+            group.site = site.to_string();
+            group.cookies.retain(|entry| !entry.cookie.trim().is_empty());
+            if group.cookies.is_empty() {
+                continue;
+            }
+            if index >= merged.len() {
+                merged.push(group);
+                continue;
+            }
+            let existing = &mut merged[index];
+            for entry in group.cookies {
+                match existing
+                    .cookies
+                    .iter_mut()
+                    .find(|current| current.host == entry.host)
+                {
+                    Some(current) => current.cookie = entry.cookie,
+                    None => existing.cookies.push(entry),
+                }
+            }
+            if existing.label.is_none() {
+                existing.label = group.label;
+            }
+            if existing.id.is_empty() {
+                existing.id = group.id;
+            }
+            if existing.added_at.is_none() {
+                existing.added_at = group.added_at;
+            }
+        }
+    }
+    merged
+}
+
+/// The per-host credential a previous build wrote, read only to migrate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyCredential {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub cookie: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub added_at: Option<String>,
+}
+
+impl LegacyCredential {
+    pub fn into_group(self, site: &str) -> LoginGroup {
+        let host = if self.host.is_empty() {
+            site.to_string()
+        } else {
+            self.host
+        };
+        LoginGroup {
+            id: self.id,
+            site: site.to_string(),
+            label: self.label,
+            cookies: vec![HostCookie {
+                host,
+                cookie: self.cookie,
+            }],
+            added_at: self.added_at,
+        }
+    }
+}
+
+impl LoginGroup {
+    /// Fold the hosts of the same site into one login.
+    ///
+    /// Used when an import (or a migrated value) carries one entry per host:
+    /// they are one session and belong together.
+    pub fn merge_by_site(groups: Vec<LoginGroup>, site: &str) -> Vec<LoginGroup> {
+        let mut merged: Vec<LoginGroup> = Vec::new();
+        for group in groups {
+            let mut group = group;
+            group.site = site.to_string();
+            group.cookies.retain(|entry| !entry.cookie.trim().is_empty());
+            if group.cookies.is_empty() {
+                continue;
+            }
+            match merged.iter_mut().find(|existing| existing.same_cookies(&group)) {
+                Some(existing) => {
+                    for entry in group.cookies {
+                        if let Some(found) = existing.cookies.iter_mut().find(|it| it.host == entry.host)
+                        {
+                            found.cookie = entry.cookie;
+                        } else {
+                            existing.cookies.push(entry);
+                        }
+                    }
+                    if existing.label.is_none() {
+                        existing.label = group.label;
+                    }
+                    if existing.id.is_empty() {
+                        existing.id = group.id;
+                    }
+                }
+                None => merged.push(group),
+            }
+        }
+        merged
+    }
+}
+
+/// Cookie persistence boundary./// Cookie persistence boundary.
 pub trait CookieStore: Send + Sync {
-    /// Credentials stored for `host`, in the order they should be tried.
-    fn load_all<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<Vec<LoginCredential>>>;
-    /// Replace every credential for `host` (an empty slice removes the entry).
-    fn save_all<'a>(
+    /// Logins registered for `site`, in the order they should be tried.
+    fn load_groups<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<Vec<LoginGroup>>>;
+    /// Replace every login for `site` (an empty slice removes the entry).
+    fn save_groups<'a>(
         &'a self,
-        host: &'a str,
-        credentials: &'a [LoginCredential],
+        site: &'a str,
+        groups: &'a [LoginGroup],
     ) -> PlatformFuture<'a, Result<()>>;
-    /// Drop the stored credentials for `host`.
-    fn clear<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<()>>;
-    /// Every stored host with its ordered credentials.
-    fn list(&self) -> PlatformFuture<'_, Result<BTreeMap<String, Vec<LoginCredential>>>>;
+    /// Drop the stored logins for `site`.
+    fn clear<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<()>>;
+    /// Every stored site with its ordered logins.
+    fn list_groups(&self) -> PlatformFuture<'_, Result<BTreeMap<String, Vec<LoginGroup>>>>;
 }
 
 /// Canonical form of a request host used as a credential key.

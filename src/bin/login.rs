@@ -30,9 +30,8 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::native::cookie_store::InventoryCookieStore;
-use narou_rs::platform::cookie_store::{
-    cookie_host_for_url, cookie_lookup_hosts, format_cookie_header, merge_stored_cookies,
-};
+use narou_rs::platform::cookie_store::{cookie_host_for_url, format_cookie_header};
+use narou_rs::platform::{HostCookie, LoginGroup};
 use narou_rs::login::build_export;
 use narou_rs::platform::{CookieStore, HttpClient};
 use std::collections::BTreeMap;
@@ -173,12 +172,10 @@ fn run(args: Args) -> std::result::Result<(), String> {
         .clone()
         .or_else(|| store.is_none().then(|| PathBuf::from(DEFAULT_EXPORT_FILE)));
     if let Some(path) = export_path {
-        write_export(&path, &captured, store.as_ref(), &args)?;
+        write_export(&path, &site, &captured, store.as_ref(), &args)?;
     }
     if let Some(store) = &store {
-        for (host, cookie) in &captured {
-            save_cookie(store, host, cookie)?;
-        }
+        save_group(store, &site.domain, &captured)?;
     }
 
     // 保存は済んでいるので、その Cookie で実際に取得できるかだけ確かめる。
@@ -215,17 +212,24 @@ fn cleanup_profile(profile: &Path) {
 /// detection: a work that needs the session keeps answering with the site's
 /// error message or login marker while the captured cookies are anonymous.
 fn verify_capture(target: &str, site: &SiteSetting, cookies: &BTreeMap<String, String>) {
-    let Some(host) = cookie_host_for_url(target) else {
+    if cookie_host_for_url(target).is_none() {
         return;
-    };
-    let values: Vec<&str> = cookie_lookup_hosts(&host)
-        .iter()
-        .filter_map(|key| cookies.get(key))
-        .map(String::as_str)
-        .collect();
-    let Some(cookie) = merge_stored_cookies(values) else {
+    }
+    // 取得したホスト群を 1 本のヘッダにまとめる (ブラウザと同じ送り方)。
+    let cookie = LoginGroup::new(
+        &site.domain,
+        cookies
+            .iter()
+            .map(|(host, cookie)| HostCookie {
+                host: host.clone(),
+                cookie: cookie.clone(),
+            })
+            .collect(),
+    )
+    .merged_cookie();
+    if cookie.is_empty() {
         return;
-    };
+    }
     let user_agent = ua_generator::ua::spoof_firefox_ua().to_string();
     let Ok(client) = narou_rs::native::http::NativeHttpClient::new(&user_agent) else {
         return;
@@ -255,25 +259,31 @@ fn verify_capture(target: &str, site: &SiteSetting, cookies: &BTreeMap<String, S
 /// export file the download host reads back with `narou login import`.
 fn write_export(
     path: &Path,
+    site: &SiteSetting,
     captured: &BTreeMap<String, String>,
     store: Option<&InventoryCookieStore>,
     args: &Args,
 ) -> std::result::Result<(), String> {
-    let mut credentials = match store {
-        Some(store) => store.credentials_by_host().map_err(|error| error.to_string())?,
+    let mut sites = match store {
+        Some(store) => store.groups_by_site().map_err(|error| error.to_string())?,
         None => BTreeMap::new(),
     };
-    for (host, cookie) in captured {
-        credentials.insert(
-            host.clone(),
-            vec![
-                narou_rs::platform::LoginCredential::new(host, cookie)
-                    .with_added_at(Some(chrono::Local::now().to_rfc3339())),
-            ],
-        );
-    }
-    let credentials: Vec<narou_rs::platform::LoginCredential> =
-        credentials.into_values().flatten().collect();
+    sites.insert(
+        site.domain.clone(),
+        vec![
+            LoginGroup::new(
+                &site.domain,
+                captured
+                    .iter()
+                    .map(|(host, cookie)| HostCookie {
+                        host: host.clone(),
+                        cookie: cookie.clone(),
+                    })
+                    .collect(),
+            )
+            .with_added_at(Some(chrono::Local::now().to_rfc3339())),
+        ],
+    );
 
     let passphrase = if args.clear_text {
         None
@@ -284,7 +294,7 @@ fn write_export(
         .ok()
         .and_then(|dir| dir.file_name().map(|name| name.to_string_lossy().into_owned()));
     let text = build_export(
-        &credentials,
+        &sites,
         passphrase,
         &chrono::Local::now().to_rfc3339(),
         library.as_deref(),
@@ -292,10 +302,11 @@ fn write_export(
     .map_err(|error| error.to_string())?;
     std::fs::write(path, text).map_err(|error| format!("{} に書き込めません: {error}", path.display()))?;
 
+    let logins: usize = sites.values().map(Vec::len).sum();
     println!(
-        "{} に {} 件の Cookie を書き出しました",
+        "{} に {} 件のログイン情報を書き出しました",
         path.display(),
-        credentials.len()
+        logins
     );
     match passphrase {
         Some(_) => println!(
@@ -311,50 +322,52 @@ fn write_export(
 }
 
 fn list_cookies(store: &InventoryCookieStore) -> std::result::Result<(), String> {
-    let stored = store.credentials_by_host().map_err(|error| error.to_string())?;
+    let stored = store.groups_by_site().map_err(|error| error.to_string())?;
     if stored.is_empty() {
         println!("保存済みのログイン Cookie はありません");
         return Ok(());
     }
-    for (host, credentials) in stored {
-        println!("{host}:");
-        for (index, credential) in credentials.iter().enumerate() {
-            let names: Vec<String> = narou_rs::platform::parse_cookie_header(&credential.cookie)
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect();
+    for (site, groups) in stored {
+        println!("{site}:");
+        for (index, group) in groups.iter().enumerate() {
+            let hosts: Vec<&str> = group.cookies.iter().map(|entry| entry.host.as_str()).collect();
             println!(
-                "  {}. {}{} ({})",
+                "  {}. {} ({} ホスト: {})",
                 index + 1,
-                credential.display_name(),
-                credential
-                    .label
-                    .as_ref()
-                    .map(|_| format!(" [{}]", credential.host))
-                    .unwrap_or_default(),
-                names.join(", ")
+                group.display_name(),
+                group.cookies.len(),
+                hosts.join(", ")
             );
         }
     }
     Ok(())
 }
 
-fn save_cookie(
+fn save_group(
     store: &InventoryCookieStore,
-    host: &str,
-    cookie: &str,
+    site: &str,
+    captured: &BTreeMap<String, String>,
 ) -> std::result::Result<(), String> {
-    let names: Vec<String> = narou_rs::platform::parse_cookie_header(cookie)
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    // 同じホストの既存分は置き換える（`narou login set` と同じ意味）。
-    let credential = narou_rs::platform::LoginCredential::new(host, cookie)
-        .with_added_at(Some(chrono::Local::now().to_rfc3339()));
+    let group = LoginGroup::new(
+        site,
+        captured
+            .iter()
+            .map(|(host, cookie)| HostCookie {
+                host: host.clone(),
+                cookie: cookie.clone(),
+            })
+            .collect(),
+    )
+    .with_added_at(Some(chrono::Local::now().to_rfc3339()));
+    let mut map = BTreeMap::new();
+    map.insert(site.to_string(), vec![group.clone()]);
     store
-        .save_credentials_for(host, &[credential])
+        .merge_groups(&map)
         .map_err(|error| error.to_string())?;
-    println!("{host} の Cookie を保存しました ({})", names.join(", "));
+    println!(
+        "{site} のログインを保存しました ({} ホスト)",
+        group.cookies.len()
+    );
     Ok(())
 }
 

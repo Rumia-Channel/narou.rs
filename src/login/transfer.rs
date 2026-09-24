@@ -11,15 +11,18 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{NarouError, Result};
-use crate::platform::LoginCredential;
+use crate::platform::cookie_store::LegacyCredential;
+use crate::platform::LoginGroup;
 use crate::login::crypto::{
     ENVELOPE_AAD, SALT_LEN, decrypt_with_key, derive_key, encrypt_with_key, random_bytes,
 };
 
 /// Envelope format version understood by this build.
-pub const EXPORT_VERSION: u32 = 2;
-/// Version written before a host could hold several credentials.
+pub const EXPORT_VERSION: u32 = 3;
+/// Versions written before logins were grouped by site.
 pub const EXPORT_VERSION_LEGACY: u32 = 1;
+/// Version that kept one credential list per host.
+pub const EXPORT_VERSION_PER_HOST: u32 = 2;
 /// `kdf` value written for encrypted envelopes.
 pub const KDF_ARGON2ID: &str = "argon2id";
 
@@ -51,9 +54,12 @@ pub struct CookieEnvelope {
     /// Encrypted cookie map (`nonce:payload`, base64).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<String>,
-    /// Clear-text credentials (trial order), only for `encrypted: false`.
+    /// Clear-text logins per site, only for `encrypted: false`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sites: BTreeMap<String, Vec<LoginGroup>>,
+    /// Version 2 clear-text credentials (one host each), read-only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub credentials: Vec<LoginCredential>,
+    pub credentials: Vec<LegacyCredential>,
     /// Version 1 clear-text cookie map (`host → cookie`), read-only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub cookies: BTreeMap<String, String>,
@@ -64,7 +70,7 @@ pub struct CookieEnvelope {
 /// A passphrase encrypts the payload; without one the cookies are written in
 /// clear (the CLI asks for confirmation before doing that).
 pub fn build_export(
-    credentials: &[LoginCredential],
+    sites: &BTreeMap<String, Vec<LoginGroup>>,
     passphrase: Option<&str>,
     exported_at: &str,
     library: Option<&str>,
@@ -73,8 +79,8 @@ pub fn build_export(
         Some(passphrase) => {
             let salt: [u8; SALT_LEN] = random_bytes()?;
             let key = derive_key(passphrase, &salt)?;
-            let plaintext = serde_json::to_string(credentials).map_err(|error| {
-                login_error(format!("could not serialize the credentials: {error}"))
+            let plaintext = serde_json::to_string(sites).map_err(|error| {
+                login_error(format!("could not serialize the logins: {error}"))
             })?;
             let payload = encrypt_with_key(&key, ENVELOPE_AAD, &plaintext)?;
             CookieEnvelope {
@@ -85,6 +91,7 @@ pub fn build_export(
                 kdf: Some(KDF_ARGON2ID.to_string()),
                 salt: Some(base64_encode(&salt)),
                 payload: Some(payload),
+                sites: BTreeMap::new(),
                 credentials: Vec::new(),
                 cookies: BTreeMap::new(),
             }
@@ -97,7 +104,8 @@ pub fn build_export(
             kdf: None,
             salt: None,
             payload: None,
-            credentials: credentials.to_vec(),
+            sites: sites.clone(),
+            credentials: Vec::new(),
             cookies: BTreeMap::new(),
         },
     };
@@ -109,23 +117,49 @@ pub fn build_export(
 /// `passphrase` is required for an encrypted envelope and ignored otherwise.
 /// A version 1 document (`host → cookie`) still imports, as one credential per
 /// host, so an export taken before a site could hold several keeps working.
-pub fn parse_export(text: &str, passphrase: Option<&str>) -> Result<Vec<LoginCredential>> {
+pub fn parse_export(
+    text: &str,
+    passphrase: Option<&str>,
+) -> Result<BTreeMap<String, Vec<LoginGroup>>> {
     let envelope: CookieEnvelope = serde_yaml::from_str(text)?;
-    if envelope.version != EXPORT_VERSION && envelope.version != EXPORT_VERSION_LEGACY {
+    if !matches!(
+        envelope.version,
+        EXPORT_VERSION | EXPORT_VERSION_PER_HOST | EXPORT_VERSION_LEGACY
+    ) {
         return Err(login_error(format!(
-            "unsupported export version {} (this build reads versions {} and {})",
-            envelope.version, EXPORT_VERSION_LEGACY, EXPORT_VERSION
+            "unsupported export version {} (this build reads up to version {})",
+            envelope.version, EXPORT_VERSION
         )));
     }
     if !envelope.encrypted {
         if envelope.version == EXPORT_VERSION_LEGACY {
-            return Ok(envelope
+            // version 1: ホスト → Cookie 1 本。サイトはホストのまま入れ、取り込み側で
+            // 定義に照らしてまとめる。
+            let groups = envelope
                 .cookies
                 .into_iter()
-                .map(|(host, cookie)| LoginCredential::new(host, cookie))
-                .collect());
+                .map(|(host, cookie)| {
+                    LoginGroup::new(
+                        host.clone(),
+                        vec![crate::platform::HostCookie { host, cookie }],
+                    )
+                })
+                .collect::<Vec<_>>();
+            return Ok(group_by_site(groups));
         }
-        return Ok(envelope.credentials);
+        if envelope.version == EXPORT_VERSION_PER_HOST {
+            // 版 2 はホストごとの 1 本。同じ利用者のホストはサイト単位で 1 本に戻す。
+            let groups = envelope
+                .credentials
+                .into_iter()
+                .map(|credential| {
+                    let host = credential.host.clone();
+                    credential.into_group(&host)
+                })
+                .collect::<Vec<_>>();
+            return Ok(group_by_site(groups));
+        }
+        return Ok(envelope.sites);
     }
     let passphrase = passphrase.ok_or_else(|| {
         login_error("this export is encrypted: pass a passphrase to import it")
@@ -146,25 +180,49 @@ pub fn parse_export(text: &str, passphrase: Option<&str>) -> Result<Vec<LoginCre
     let salt_bytes = base64_decode(salt)?;
     let key = derive_key(passphrase, &salt_bytes)?;
     let plaintext = decrypt_with_key(&key, ENVELOPE_AAD, payload)?;
-    serde_json::from_str(&plaintext).map_err(|error| {
-        login_error(format!("decrypted payload is not a credential list: {error}"))
-    })
+    let value: serde_json::Value = serde_json::from_str(&plaintext).map_err(|error| {
+        login_error(format!("decrypted payload is not a login list: {error}"))
+    })?;
+    if let Ok(sites) = serde_json::from_value::<BTreeMap<String, Vec<LoginGroup>>>(value.clone()) {
+        return Ok(sites);
+    }
+    let credentials: Vec<LoginGroup> = serde_json::from_value(value)
+        .map_err(|error| login_error(format!("decrypted payload is not a login list: {error}")))?;
+    Ok(group_by_site(credentials))
 }
 
-/// Group credentials by host, keeping the order inside each group.
+/// Fold a flat list of logins into per-site groups.
 ///
-/// Imports carry a flat, ordered list; storage keeps one list per host.
-pub fn group_credentials(
-    credentials: Vec<LoginCredential>,
-) -> BTreeMap<String, Vec<LoginCredential>> {
-    let mut grouped: BTreeMap<String, Vec<LoginCredential>> = BTreeMap::new();
-    for credential in credentials {
-        grouped
-            .entry(crate::platform::normalize_cookie_host(&credential.host))
-            .or_default()
-            .push(credential);
+/// A login written per host (`site` = host) is grouped under the site
+/// definition that host belongs to, so `pixiv.net` and `www.pixiv.net` end up
+/// in one place.
+fn group_by_site(groups: Vec<LoginGroup>) -> BTreeMap<String, Vec<LoginGroup>> {
+    let mut sites: BTreeMap<String, Vec<LoginGroup>> = BTreeMap::new();
+    for group in groups {
+        let site = site_for_host(&group.site);
+        sites.entry(site).or_default().push(group);
     }
-    grouped
+    sites
+}
+
+/// Site a host belongs to, through the site definitions (falling back to the
+/// registrable domain).
+fn site_for_host(host: &str) -> String {
+    let host = host.trim().to_ascii_lowercase();
+    if let Ok(settings) = crate::downloader::site_setting::SiteSetting::load_all()
+        && let Some(setting) = settings.iter().find(|setting| {
+            let domain = setting.domain.to_ascii_lowercase();
+            domain == host || host.ends_with(&format!(".{domain}"))
+        })
+    {
+        return setting.domain.to_ascii_lowercase();
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() > 2 {
+        labels[labels.len() - 2..].join(".")
+    } else {
+        host
+    }
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -183,38 +241,81 @@ fn base64_decode(text: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
-    fn cookies() -> Vec<LoginCredential> {
-        vec![
-            LoginCredential::new("ncode.syosetu.com", "over18=yes; ses=1"),
-            LoginCredential::new("example.com", "sid=abc"),
-        ]
+    fn sites() -> BTreeMap<String, Vec<LoginGroup>> {
+        BTreeMap::from([
+            (
+                "ncode.syosetu.com".to_string(),
+                vec![LoginGroup::new(
+                    "ncode.syosetu.com",
+                    vec![crate::platform::HostCookie {
+                        host: "ncode.syosetu.com".to_string(),
+                        cookie: "over18=yes; ses=1".to_string(),
+                    }],
+                )],
+            ),
+            (
+                "www.pixiv.net".to_string(),
+                vec![
+                    LoginGroup::new(
+                        "www.pixiv.net",
+                        vec![
+                            crate::platform::HostCookie {
+                                host: "pixiv.net".to_string(),
+                                cookie: "PHPSESSID=abc".to_string(),
+                            },
+                            crate::platform::HostCookie {
+                                host: "www.pixiv.net".to_string(),
+                                cookie: "yuid_b=1".to_string(),
+                            },
+                        ],
+                    )
+                    .with_label(Some("Pixiv1".to_string())),
+                ],
+            ),
+        ])
     }
 
     #[test]
     fn plain_envelope_round_trips() {
-        let text = build_export(&cookies(), None, "2026-09-20T00:00:00+09:00", Some("lib")).unwrap();
+        let text = build_export(&sites(), None, "2026-09-20T00:00:00+09:00", Some("lib")).unwrap();
         assert!(text.contains("encrypted: false"));
         assert!(!text.contains("payload"));
-        assert_eq!(parse_export(&text, None).unwrap(), cookies());
+        assert_eq!(parse_export(&text, None).unwrap(), sites());
     }
 
     #[test]
-    fn encrypted_envelope_hides_the_cookies_and_needs_the_passphrase() {
-        let text = build_export(&cookies(), Some("hunter2"), "2026-09-20T00:00:00+09:00", None)
+    fn encrypted_envelope_hides_the_logins_and_needs_the_passphrase() {
+        let text = build_export(&sites(), Some("hunter2"), "2026-09-20T00:00:00+09:00", None)
             .unwrap();
         assert!(text.contains("encrypted: true"));
         assert!(text.contains("kdf: argon2id"));
-        assert!(!text.contains("sid=abc"));
-        assert_eq!(parse_export(&text, Some("hunter2")).unwrap(), cookies());
+        assert!(!text.contains("PHPSESSID=abc"));
+        assert_eq!(parse_export(&text, Some("hunter2")).unwrap(), sites());
         assert!(parse_export(&text, Some("wrong")).is_err());
         assert!(parse_export(&text, None).is_err());
     }
 
     #[test]
+    fn version_two_exports_are_folded_into_sites() {
+        // 版 2 はホストごとの 1 本。取り込み時にサイトへまとめる
+        // (定義があればそのドメイン、無ければ登録可能ドメイン)。
+        let text = "version: 2\nexported_at: 2026-09-20T00:00:00+09:00\nencrypted: false\n\
+                    credentials:\n- host: www.pixiv.net\n  cookie: yuid_b=1\n\
+                    - host: pixiv.net\n  cookie: PHPSESSID=abc\n";
+        // サイト定義が読めない環境では、まとめ先が分からないのでホストのまま残す。
+        let sites = parse_export(text, None).unwrap();
+        assert_eq!(sites.len(), 2, "got {sites:?}");
+        let group = &sites["www.pixiv.net"][0];
+        assert_eq!(group.cookies[0].cookie, "yuid_b=1");
+        assert_eq!(sites["pixiv.net"][0].cookies[0].cookie, "PHPSESSID=abc");
+        assert!(sites["www.pixiv.net"][0].id.is_empty(), "識別子は取り込み側で振る");
+    }
+
+    #[test]
     fn rejects_unknown_versions_and_damaged_payloads() {
-        let text = build_export(&cookies(), Some("hunter2"), "2026-09-20T00:00:00+09:00", None)
+        let text = build_export(&sites(), Some("hunter2"), "2026-09-20T00:00:00+09:00", None)
             .unwrap();
-        let bumped = text.replace("version: 2", "version: 99");
+        let bumped = text.replace("version: 3", "version: 99");
         assert!(parse_export(&bumped, Some("hunter2")).is_err());
 
         let damaged = text.replace("payload: ", "payload: AAAA");

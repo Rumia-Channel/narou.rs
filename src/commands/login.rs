@@ -6,17 +6,15 @@
 //! with the library login key), exports the stored credentials for another
 //! machine, lists them, or clears them.
 
-use std::io::Read as _;
 
 use narou_rs::error::{NarouError, Result};
 use narou_rs::login::{build_export, parse_export};
-use narou_rs::login::group_credentials;
 use narou_rs::native::cookie_store::InventoryCookieStore;
 
 /// Subcommands of `narou login`.
 #[derive(clap::Subcommand, Debug)]
 pub enum LoginAction {
-    /// List stored hosts (values are masked).
+    /// List stored sites and their logins (values are masked).
     List,
     /// Import an export written by `narou_rs_login`.
     Import {
@@ -25,11 +23,11 @@ pub enum LoginAction {
         /// Passphrase of an encrypted export.
         #[arg(long)]
         passphrase: Option<String>,
-        /// Replace every stored host instead of merging.
+        /// Replace every stored site instead of merging.
         #[arg(long, default_value_t = false)]
         replace: bool,
     },
-    /// Write the stored credentials to an export file.
+    /// Write the stored logins to an export file.
     Export {
         /// Export file (YAML) to write.
         file: String,
@@ -40,40 +38,27 @@ pub enum LoginAction {
         #[arg(long = "clear-text", default_value_t = false)]
         clear_text: bool,
     },
-    /// Replace one host's login credential (reads stdin when --cookie is omitted).
-    Set {
-        /// Request host, for example `ncode.syosetu.com`.
-        host: String,
-        /// `Cookie:` header value as copied from the browser.
-        #[arg(long)]
-        cookie: Option<String>,
-        /// Label shown in the list ("メイン", "R18用", …).
-        #[arg(long)]
-        label: Option<String>,
+    /// Name a stored login, e.g. `narou login rename www.pixiv.net 2 サブ垢`.
+    Rename {
+        /// Site the login belongs to, for example `www.pixiv.net`.
+        site: String,
+        /// Position in `narou login list` (1 始まり).
+        index: usize,
+        /// Name to show ("Pixiv1", "メインアカウント", …). Empty clears it.
+        label: String,
     },
-    /// Append another credential to a host, tried after the ones already there.
-    Add {
-        /// Request host, for example `ncode.syosetu.com`.
-        host: String,
-        /// `Cookie:` header value as copied from the browser.
-        #[arg(long)]
-        cookie: Option<String>,
-        /// Label shown in the list ("メイン", "R18用", …).
-        #[arg(long)]
-        label: Option<String>,
-    },
-    /// Reorder a host's credentials, e.g. `-- 1,2,0` (current positions).
+    /// Reorder a site's logins, e.g. `-- 2,1` (current positions).
     Order {
-        /// Request host whose order is being changed.
-        host: String,
+        /// Site whose order is being changed.
+        site: String,
         /// Current positions in their new order, comma separated.
         order: String,
     },
-    /// Drop one credential, one host, or every host.
+    /// Drop one login, one site, or everything.
     Clear {
-        /// Request host; omitted clears everything.
-        host: Option<String>,
-        /// Drop only this credential (1-based position in `narou login list`).
+        /// Site; omitted clears everything.
+        site: Option<String>,
+        /// Drop only this login (position in `narou login list`, 1 始まり).
         #[arg(long)]
         index: Option<usize>,
     },
@@ -94,46 +79,37 @@ pub fn cmd_login(action: LoginAction) -> Result<()> {
             passphrase,
             clear_text,
         } => export(&store, &file, passphrase.as_deref(), clear_text),
-        LoginAction::Set {
-            host,
-            cookie,
-            label,
-        } => set(&store, &host, cookie, label, false),
-        LoginAction::Add {
-            host,
-            cookie,
-            label,
-        } => set(&store, &host, cookie, label, true),
-        LoginAction::Order { host, order } => reorder(&store, &host, &order),
-        LoginAction::Clear { host, index } => clear(&store, host.as_deref(), index),
+        LoginAction::Rename { site, index, label } => rename(&store, &site, index, &label),
+        LoginAction::Order { site, order } => reorder(&store, &site, &order),
+        LoginAction::Clear { site, index } => clear(&store, site.as_deref(), index),
     }
 }
 
 fn list(store: &InventoryCookieStore) -> Result<()> {
-    let stored = store.credentials_by_host()?;
+    let stored = store.groups_by_site()?;
     if stored.is_empty() {
         println!("保存されたログイン情報はありません。");
-        println!("  narou_rs_login <サイト> で取得し、narou login import <ファイル> で取り込めます。");
+        println!("  narou_rs_login <サイト> --export <ファイル> で取得し、narou login import <ファイル> で取り込めます。");
         return Ok(());
     }
     let total: usize = stored.values().map(Vec::len).sum();
     println!("保存されたログイン情報: {} サイト / {total} 件", stored.len());
-    for (host, credentials) in &stored {
-        let state = if store.is_encrypted(host)? {
+    for (site, groups) in &stored {
+        let state = if store.is_encrypted(site)? {
             "暗号化済み"
         } else {
             "平文(次回保存時に暗号化)"
         };
-        let encrypted = [""; 0];
-        let _ = encrypted;
-        println!("  {host:<32} [{state}]");
-        for (index, credential) in credentials.iter().enumerate() {
+        println!("  {site} [{state}]");
+        for (index, group) in groups.iter().enumerate() {
+            let hosts: Vec<&str> = group.cookies.iter().map(|entry| entry.host.as_str()).collect();
             println!(
-                "    {}. {:<16} [{}] {}",
+                "    {}. {} [{}] {} ホスト: {}",
                 index + 1,
-                credential.display_name(),
-                credential.short_id(),
-                mask_cookie(&credential.cookie)
+                group.display_name(),
+                group.short_id(),
+                group.cookies.len(),
+                hosts.join(", ")
             );
         }
     }
@@ -149,20 +125,19 @@ fn import(
     replace: bool,
 ) -> Result<()> {
     let text = read_file(file)?;
-    let credentials = parse_export(&text, passphrase)?;
-    if credentials.is_empty() {
-        println!("{file} に Cookie が含まれていません。");
+    let sites = parse_export(&text, passphrase)?;
+    if sites.is_empty() {
+        println!("{file} にログイン情報が含まれていません。");
         return Ok(());
     }
-    let count = credentials.len();
-    let grouped = group_credentials(credentials);
-    let hosts = grouped.len();
+    let logins: usize = sites.values().map(Vec::len).sum();
+    let sites_count = sites.len();
     let stored = if replace {
-        store.replace_credentials(&grouped)?
+        store.replace_groups(&sites)?
     } else {
-        store.merge_credentials(&grouped)?
+        store.merge_groups(&sites)?
     };
-    println!("ログイン情報を取り込みました: {count} 件 / {hosts} サイト");
+    println!("ログイン情報を取り込みました: {logins} 件 / {sites_count} サイト");
     println!("  保存済み: {stored} サイト ({})", store.key_source()?.describe());
     if replace {
         println!("  取り込みに含まれないサイトの情報は削除されました。");
@@ -176,9 +151,9 @@ fn export(
     passphrase: Option<&str>,
     clear_text: bool,
 ) -> Result<()> {
-    let stored = store.credentials_by_host()?;
-    let credentials: Vec<_> = stored.into_values().flatten().collect();
-    if credentials.is_empty() {
+    let sites = store.groups_by_site()?;
+    let logins: usize = sites.values().map(Vec::len).sum();
+    if logins == 0 {
         return Err(NarouError::Login(
             "保存されたログイン情報がありません。".to_string(),
         ));
@@ -188,17 +163,9 @@ fn export(
     let library = std::env::current_dir()
         .ok()
         .and_then(|dir| dir.file_name().map(|name| name.to_string_lossy().into_owned()));
-    let text = build_export(
-        &credentials,
-        passphrase,
-        &exported_at,
-        library.as_deref(),
-    )?;
+    let text = build_export(&sites, passphrase, &exported_at, library.as_deref())?;
     std::fs::write(file, text)?;
-    println!(
-        "ログイン情報を書き出しました: {file} ({} 件)",
-        credentials.len()
-    );
+    println!("ログイン情報を書き出しました: {file} ({logins} 件)");
     if passphrase.is_none() {
         println!("  平文で書き出しました。移動先では速やかに取り込んでください。");
         println!("  暗号化するには --passphrase を指定します。");
@@ -206,62 +173,38 @@ fn export(
     Ok(())
 }
 
-fn read_cookie_argument(cookie: Option<String>) -> Result<String> {
-    let cookie = match cookie {
-        Some(cookie) => cookie,
-        None => {
-            let mut buffer = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buffer)
-                .map_err(|error| NarouError::Login(format!("Cookie を読み込めません: {error}")))?;
-            buffer
-        }
-    };
-    if cookie.trim().is_empty() {
-        return Err(NarouError::Login("Cookie が空です。".to_string()));
+/// 保存済みのログインの位置 (1 始まり) を解決する。
+fn group_at(
+    store: &InventoryCookieStore,
+    site: &str,
+    index: usize,
+) -> Result<(Vec<narou_rs::platform::LoginGroup>, usize)> {
+    let site = site.trim().to_ascii_lowercase();
+    let groups = store.groups_for(&site)?;
+    if index == 0 || index > groups.len() {
+        return Err(NarouError::Login(format!(
+            "{site} の {index} 番目のログイン情報はありません。"
+        )));
     }
-    Ok(cookie.trim().to_string())
+    Ok((groups, index - 1))
 }
 
-fn set(
-    store: &InventoryCookieStore,
-    host: &str,
-    cookie: Option<String>,
-    label: Option<String>,
-    append: bool,
-) -> Result<()> {
-    let cookie = read_cookie_argument(cookie)?;
-    let host = narou_rs::platform::normalize_cookie_host(host);
-    let credential = narou_rs::platform::LoginCredential::new(host.clone(), cookie)
-        .with_label(label)
-        .with_added_at(Some(chrono::Local::now().to_rfc3339()));
-    let credentials = if append {
-        let mut credentials = store.credentials_for(&host)?;
-        if credentials.iter().any(|seen| seen.same_cookie(&credential)) {
-            println!("{host} には同じログイン情報が既に保存されています。");
-            return Ok(());
-        }
-        credentials.push(credential);
-        credentials
-    } else {
-        vec![credential]
-    };
-    let count = credentials.len();
-    store.save_credentials_for(&host, &credentials)?;
-    println!(
-        "{host} のログイン情報を保存しました ({count} 件, {})",
-        store.key_source()?.describe()
-    );
+fn rename(store: &InventoryCookieStore, site: &str, index: usize, label: &str) -> Result<()> {
+    let (mut groups, position) = group_at(store, site, index)?;
+    let label = label.trim();
+    groups[position].label = (!label.is_empty()).then(|| label.to_string());
+    let name = groups[position].display_name().to_string();
+    store.save_groups_for(site, &groups)?;
+    println!("{site} の {index} 番目を「{name}」にしました。");
     Ok(())
 }
 
-/// 現在の並び（1 始まり）を新しい順序に並べ替える。
-fn reorder(store: &InventoryCookieStore, host: &str, order: &str) -> Result<()> {
-    let host = narou_rs::platform::normalize_cookie_host(host);
-    let stored = store.credentials_for(&host)?;
+fn reorder(store: &InventoryCookieStore, site: &str, order: &str) -> Result<()> {
+    let site = site.trim().to_ascii_lowercase();
+    let stored = store.groups_for(&site)?;
     if stored.is_empty() {
         return Err(NarouError::Login(format!(
-            "{host} のログイン情報は保存されていません。"
+            "{site} のログイン情報は保存されていません。"
         )));
     }
     let positions: Vec<usize> = order
@@ -297,41 +240,36 @@ fn reorder(store: &InventoryCookieStore, host: &str, order: &str) -> Result<()> 
         seen[position - 1] = true;
         reordered.push(stored[position - 1].clone());
     }
-    store.save_credentials_for(&host, &reordered)?;
-    println!("{host} の試行順を変更しました:");
-    for (index, credential) in reordered.iter().enumerate() {
-        println!("  {}. {}", index + 1, credential.display_name());
+    store.save_groups_for(&site, &reordered)?;
+    println!("{site} の試行順を変更しました:");
+    for (index, group) in reordered.iter().enumerate() {
+        println!("  {}. {}", index + 1, group.display_name());
     }
     Ok(())
 }
 
-fn clear(store: &InventoryCookieStore, host: Option<&str>, index: Option<usize>) -> Result<()> {
-    match host {
-        Some(host) => {
-            let host = narou_rs::platform::normalize_cookie_host(host);
+fn clear(store: &InventoryCookieStore, site: Option<&str>, index: Option<usize>) -> Result<()> {
+    match site {
+        Some(site) => {
+            let site = site.trim().to_ascii_lowercase();
             match index {
                 Some(index) => {
-                    let mut credentials = store.credentials_for(&host)?;
-                    if index == 0 || index > credentials.len() {
-                        return Err(NarouError::Login(format!(
-                            "{host} の {index} 番目のログイン情報はありません。"
-                        )));
-                    }
-                    credentials.remove(index - 1);
-                    store.save_credentials_for(&host, &credentials)?;
-                    println!("{host} の {index} 番目のログイン情報を削除しました。");
+                    let (mut groups, position) = group_at(store, &site, index)?;
+                    let removed = groups.remove(position);
+                    store.save_groups_for(&site, &groups)?;
+                    println!("{site} の「{}」を削除しました。", removed.display_name());
                 }
                 None => {
-                    if store.remove(&host)? {
-                        println!("{host} のログイン情報を削除しました。");
+                    if store.remove(&site)? {
+                        println!("{site} のログイン情報を削除しました。");
                     } else {
-                        println!("{host} のログイン情報は保存されていません。");
+                        println!("{site} のログイン情報は保存されていません。");
                     }
                 }
             }
         }
         None => {
-            let count = store.credentials_by_host()?.len();
+            let count = store.groups_by_site()?.len();
             store.clear_all()?;
             println!("ログイン情報をすべて削除しました ({count} サイト)。");
         }
@@ -345,6 +283,7 @@ fn read_file(path: &str) -> Result<String> {
 }
 
 /// Show which cookies a header carries without printing their values.
+#[cfg(test)]
 fn mask_cookie(cookie: &str) -> String {
     let pairs = narou_rs::platform::parse_cookie_header(cookie);
     let length = cookie.chars().count();
@@ -361,10 +300,10 @@ fn mask_cookie(cookie: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use narou_rs::platform::LoginCredential;
     use super::*;
+    use narou_rs::platform::cookie_store::{HostCookie, LoginGroup};
     use crate::test_support::{legacy_yaml_guard, set_current_dir_for_test};
-
+    use std::collections::BTreeMap;
 
     /// A throwaway library with the process working directory pointed at it.
     ///
@@ -382,6 +321,17 @@ mod tests {
         (temp, guard, store)
     }
 
+    fn login(site: &str, cookie: &str, label: Option<&str>) -> LoginGroup {
+        LoginGroup::new(
+            site,
+            vec![HostCookie {
+                host: site.to_string(),
+                cookie: cookie.to_string(),
+            }],
+        )
+        .with_label(label.map(str::to_string))
+    }
+
     #[test]
     fn masks_cookie_values_but_keeps_the_names() {
         let masked = mask_cookie("over18=yes; ses=abcdef");
@@ -397,9 +347,12 @@ mod tests {
 
         let file = temp.path().join("login.yaml");
         let file = file.to_string_lossy().into_owned();
-        let source = vec![LoginCredential::new("example.com", "sid=abc")];
+        let sites = BTreeMap::from([(
+            "example.com".to_string(),
+            vec![login("example.com", "sid=abc", Some("本垢"))],
+        )]);
         let exported = build_export(
-            &source,
+            &sites,
             Some("hunter2"),
             "2026-09-20T00:00:00+09:00",
             None,
@@ -409,9 +362,10 @@ mod tests {
 
         assert!(import(&store, &file, Some("wrong"), false).is_err());
         import(&store, &file, Some("hunter2"), false).unwrap();
-        let stored = store.credentials_for("example.com").unwrap();
-        assert_eq!(stored.len(), source.len());
-        assert_eq!(stored[0].cookie, source[0].cookie);
+        let stored = store.groups_for("example.com").unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].cookies[0].cookie, "sid=abc");
+        assert_eq!(stored[0].display_name(), "本垢");
         assert!(!stored[0].id.is_empty(), "取り込み時に識別子が振られる");
         assert!(store.is_encrypted("example.com").unwrap());
 
@@ -421,58 +375,75 @@ mod tests {
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(!text.contains("sid=abc"), "the export is encrypted");
         let exported = parse_export(&text, Some("hunter2")).unwrap();
-        assert_eq!(exported[0].cookie, source[0].cookie);
-        assert_eq!(exported[0].id, stored[0].id, "書き出しにも識別子が乗る");
+        assert_eq!(exported["example.com"][0].cookies[0].cookie, "sid=abc");
+        assert_eq!(
+            exported["example.com"][0].id, stored[0].id,
+            "書き出しにも識別子が乗る"
+        );
 
-        // The clear-text form is what a machine without a passphrase reads.
+        // パスフレーズ無しで読む平文形式。
         export(&store, &out, Some("hunter2"), true).unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(text.contains("sid=abc"));
         let exported = parse_export(&text, None).unwrap();
-        assert_eq!(exported[0].cookie, source[0].cookie);
+        assert_eq!(exported["example.com"][0].cookies[0].cookie, "sid=abc");
     }
 
     #[test]
-    fn set_clear_and_list_follow_the_stored_hosts() {
+    fn rename_order_and_remove_follow_the_stored_logins() {
         let _legacy = legacy_yaml_guard();
         let (_temp, _guard, store) = library();
 
-        set(
-            &store,
-            "Ncode.Syosetu.com",
-            Some(" over18=yes; ses=1 ".to_string()),
-            None,
-            false,
-        )
-        .unwrap();
-        let stored = store.credentials_for("ncode.syosetu.com").unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].cookie, "over18=yes; ses=1");
-        assert!(set(&store, "example.com", Some("   ".to_string()), None, false).is_err());
+        store
+            .save_groups_for(
+                "www.pixiv.net",
+                &[
+                    login("www.pixiv.net", "PHPSESSID=main", None),
+                    login("www.pixiv.net", "PHPSESSID=sub", None),
+                ],
+            )
+            .unwrap();
 
-        // 追加は末尾に積まれ、並べ替えで順序を変えられる。
-        set(
-            &store,
-            "ncode.syosetu.com",
-            Some("over18=yes; ses=2".to_string()),
-            Some("サブ".to_string()),
-            true,
-        )
-        .unwrap();
-        let stored = store.credentials_for("ncode.syosetu.com").unwrap();
-        assert_eq!(stored.len(), 2);
+        // 名前は利用者が後から付けられる (番号は 1 始まり)。
+        rename(&store, "www.pixiv.net", 2, "サブ").unwrap();
+        let stored = store.groups_for("www.pixiv.net").unwrap();
+        assert_eq!(stored[0].display_name(), "www.pixiv.net", "名前なしはサイト名");
         assert_eq!(stored[1].display_name(), "サブ");
-        reorder(&store, "ncode.syosetu.com", "2,1").unwrap();
-        let stored = store.credentials_for("ncode.syosetu.com").unwrap();
+        assert!(rename(&store, "www.pixiv.net", 9, "").is_err());
+
+        // 並べ替えは現在の並びの添字 (1 始まり) で指定する。
+        reorder(&store, "www.pixiv.net", "2,1").unwrap();
+        let stored = store.groups_for("www.pixiv.net").unwrap();
         assert_eq!(stored[0].display_name(), "サブ");
-        assert!(reorder(&store, "ncode.syosetu.com", "1,3").is_err());
+        assert!(reorder(&store, "www.pixiv.net", "1").is_err(), "件数が合わない");
 
-        clear(&store, Some("ncode.syosetu.com"), Some(1)).unwrap();
-        let stored = store.credentials_for("ncode.syosetu.com").unwrap();
+        clear(&store, Some("www.pixiv.net"), Some(1)).unwrap();
+        let stored = store.groups_for("www.pixiv.net").unwrap();
         assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].display_name(), "www.pixiv.net");
 
-        assert!(store.remove("ncode.syosetu.com").unwrap());
-        assert!(!store.remove("ncode.syosetu.com").unwrap());
-        assert!(store.credentials_by_host().unwrap().is_empty());
+        clear(&store, Some("www.pixiv.net"), Some(1)).unwrap();
+        assert!(store.groups_for("www.pixiv.net").unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_shows_every_site_without_values() {
+        let _legacy = legacy_yaml_guard();
+        let (_temp, _guard, store) = library();
+
+        store
+            .merge_groups(&BTreeMap::from([
+                (
+                    "www.pixiv.net".to_string(),
+                    vec![login("www.pixiv.net", "PHPSESSID=secret", None)],
+                ),
+                (
+                    "ncode.syosetu.com".to_string(),
+                    vec![login("ncode.syosetu.com", "over18=yes; ses=hidden", None)],
+                ),
+            ]))
+            .unwrap();
+
+        list(&store).unwrap();
     }
 }

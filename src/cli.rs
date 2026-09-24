@@ -918,7 +918,7 @@ pub enum Commands {
         #[command(subcommand)]
         action: crate::commands::author::AuthorAction,
     },
-    /// Login credentials shared with a browser machine (import/export).
+    /// Login credentials shared with a browser machine (list/import/export/rename/order/clear).
     Login {
         #[command(subcommand)]
         action: crate::commands::login::LoginAction,

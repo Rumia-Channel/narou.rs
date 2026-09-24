@@ -208,14 +208,13 @@
   // ─── Login tab ─────────────────────────────────────────
   // The browser half is the separate narou_rs_login executable; this pane is
   // the receiving end: it reads the export that writes (by picking the file or
-  // pasting its text, or pasting a cookie header) and stores the credentials
-  // encrypted at rest.
+  // pasting its text) and stores the credentials encrypted at rest.
   function renderLoginTab() {
     return '<div class="panel-settings">' +
       '<div class="panel-heading">ログイン情報 (Cookie) の管理</div>' +
       '<div class="list-group">' +
       '<div class="list-group-item">' +
-      '<h4 class="list-group-item-heading">保存済みのサイト</h4>' +
+      '<h4 class="list-group-item-heading">保存済みのログイン</h4>' +
       '<div id="login-hosts" class="login-hosts"><em>読み込み中…</em></div>' +
       '<div class="setting-help" id="login-list-help">上から順にログインを試行します。値はマスクして表示しています。</div>' +
       '<div style="margin-top:0.5rem">' +
@@ -239,59 +238,57 @@
       '<button type="button" class="btn btn-primary" id="login-import">取り込む</button>' +
       '</div>' +
       '</div>' +
-      '<div class="list-group-item">' +
-      '<h4 class="list-group-item-heading">Cookie を直接登録する</h4>' +
-      '<div class="setting-help">ブラウザからコピーした Cookie 文字列を保存します。「追加する」はサイトの一覧の末尾に足し、「置き換える」はそのサイトの既存の情報をすべて入れ替えます。</div>' +
-      '<div class="login-form">' +
-      '<input type="text" class="setting-input" id="login-host" placeholder="サイト (例: ncode.syosetu.com)">' +
-      '<input type="text" class="setting-input" id="login-label" placeholder="ラベル (任意。例: メイン)">' +
-      '<input type="text" class="setting-input" id="login-cookie" placeholder="Cookie 文字列 (例: over18=yes; ses=…)">' +
-      '</div>' +
-      '<div style="margin-top:0.5rem">' +
-      '<button type="button" class="btn btn-primary" id="login-add">追加する</button> ' +
-      '<button type="button" class="btn btn-default" id="login-set">置き換える</button>' +
-      '</div>' +
-      '</div>' +
       '</div></div>';
   }
 
   function renderLoginSite(entry) {
-    const credentials = entry.credentials || [];
+    const logins = entry.logins || [];
     const state = entry.encrypted ? '暗号化済み' : '未暗号';
     let html = '<div class="login-site">' +
       '<div class="login-site-head">' +
-      '<span class="login-site-name">' + escapeHtml(entry.host) + '</span>' +
+      '<span class="login-site-name">' + escapeHtml(entry.site) + '</span>' +
       '<span class="login-site-state">' + state + '</span>' +
-      '<button type="button" class="btn btn-default login-remove-site" data-host="' + escapeAttr(entry.host) + '">サイトを削除</button>' +
+      '<button type="button" class="btn btn-default login-remove-site" data-site="' + escapeAttr(entry.site) + '">サイトを削除</button>' +
       '</div>';
-    html += credentials.map(function(credential, index) {
-      return renderLoginCredential(entry.host, credential, index, credentials.length);
+    html += logins.map(function(login, index) {
+      return renderLoginEntry(entry.site, login, index, logins.length);
     }).join('');
     html += '</div>';
     return html;
   }
 
-  function renderLoginCredential(host, credential, index, total) {
-    const label = credential.label || credential.host || host;
-    const names = (credential.names || []).join(', ');
+  function renderLoginEntry(site, login, index, total) {
+    const name = login.display_name || login.label || site;
+    const hosts = login.hosts || [];
     const up = index > 0
-      ? '<button type="button" class="login-cred-up" data-host="' + escapeAttr(host) + '" data-index="' + index + '" title="上へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_up</span></button>'
+      ? '<button type="button" class="login-cred-up" data-site="' + escapeAttr(site) + '" data-index="' + index + '" title="上へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_up</span></button>'
       : '<button type="button" class="login-cred-up" disabled title="上へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_up</span></button>';
     const down = index < total - 1
-      ? '<button type="button" class="login-cred-down" data-host="' + escapeAttr(host) + '" data-index="' + index + '" title="下へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_down</span></button>'
+      ? '<button type="button" class="login-cred-down" data-site="' + escapeAttr(site) + '" data-index="' + index + '" title="下へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_down</span></button>'
       : '<button type="button" class="login-cred-down" disabled title="下へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_down</span></button>';
+    const meta = [];
+    if (typeof login.host_count === 'number') meta.push(login.host_count + ' ホスト');
+    if (login.short_id) meta.push('ID: ' + login.short_id);
+    if (login.added_at) meta.push(formatLoginAddedAt(login.added_at));
     return '<div class="login-cred-row">' +
       '<span class="login-cred-index">' + (index + 1) + '.</span>' +
       '<div class="login-cred-info">' +
-      '<div class="login-cred-label">' + escapeHtml(label) +
-      (names ? ' <span class="login-cred-names">' + escapeHtml(names) + '</span>' : '') +
+      '<div class="login-cred-label">' + escapeHtml(name) + '</div>' +
+      (meta.length ? '<div class="login-cred-added">' + escapeHtml(meta.join(' · ')) + '</div>' : '') +
+      '<div class="login-cred-hosts">' +
+      hosts.map(function(host) {
+        const names = (host.names || []).join(', ');
+        return '<div class="login-cred-host">' + escapeHtml(host.host) +
+          (names ? ' <span class="login-cred-names">' + escapeHtml(names) + '</span>' : '') +
+          (host.cookies ? '<div class="login-cred-cookies">' + escapeHtml(host.cookies) + '</div>' : '') +
+          '</div>';
+      }).join('') +
       '</div>' +
-      '<div class="login-cred-cookies">' + escapeHtml(credential.cookies || '') + '</div>' +
-      (credential.added_at ? '<div class="login-cred-added">' + escapeHtml(formatLoginAddedAt(credential.added_at)) +
-        (credential.short_id ? ' · ID: ' + escapeHtml(credential.short_id) : '') + '</div>' : '') +
       '</div>' +
-      '<span class="login-cred-actions">' + up + down +
-      '<button type="button" class="btn btn-default login-cred-remove" data-host="' + escapeAttr(host) + '" data-index="' + index + '">削除</button>' +
+      '<span class="login-cred-actions">' +
+      '<button type="button" class="btn btn-default login-cred-rename" data-site="' + escapeAttr(site) + '" data-index="' + index + '" data-label="' + escapeAttr(login.label || '') + '">名前を変更</button>' +
+      up + down +
+      '<button type="button" class="btn btn-default login-cred-remove" data-site="' + escapeAttr(site) + '" data-index="' + index + '">削除</button>' +
       '</span>' +
       '</div>';
   }
@@ -306,16 +303,11 @@
     const refresh = pane.querySelector('#login-refresh');
     const clearAll = pane.querySelector('#login-clear-all');
     const importBtn = pane.querySelector('#login-import');
-    const setBtn = pane.querySelector('#login-set');
-    const addBtn = pane.querySelector('#login-add');
     const envelopeFile = pane.querySelector('#login-envelope-file');
     if (refresh) refresh.addEventListener('click', loadLoginHosts);
     if (clearAll) clearAll.addEventListener('click', clearAllLogin);
     if (importBtn) importBtn.addEventListener('click', importLoginEnvelope);
-    if (setBtn) setBtn.addEventListener('click', function() { saveLoginCookie('set'); });
-    if (addBtn) addBtn.addEventListener('click', function() { saveLoginCookie('add'); });
     if (envelopeFile) envelopeFile.addEventListener('change', readLoginEnvelopeFile);
-    loadLoginHosts();
   }
 
   function readLoginEnvelopeFile() {
@@ -356,7 +348,7 @@
   // Re-render the list from a mutation response's `data` (same shape as
   // GET /api/login), refetching when the response carried none.
   function refreshLoginHosts(data) {
-    if (data && data.hosts) {
+    if (data && data.sites) {
       renderLoginHosts(data);
     } else {
       loadLoginHosts();
@@ -366,25 +358,30 @@
   function renderLoginHosts(data) {
     const container = document.getElementById('login-hosts');
     if (!container) return;
-    const hosts = (data && data.hosts) || [];
-    if (hosts.length === 0) {
-      container.innerHTML = '<em>保存されたログイン情報はありません。narou_rs_login で取得して取り込んでください。</em>';
+    const sites = (data && data.sites) || [];
+    if (sites.length === 0) {
+      container.innerHTML = '<em>保存されたログイン情報はありません。narou_rs_login で書き出したファイルを取り込んでください。</em>';
     } else {
-      container.innerHTML = hosts.map(renderLoginSite).join('');
+      container.innerHTML = sites.map(renderLoginSite).join('');
+      container.querySelectorAll('.login-cred-rename').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          renameLogin(btn.dataset.site, parseInt(btn.dataset.index, 10), btn.dataset.label || '');
+        });
+      });
       container.querySelectorAll('.login-cred-remove').forEach(function(btn) {
         btn.addEventListener('click', function() {
-          removeLoginCredential(btn.dataset.host, parseInt(btn.dataset.index, 10));
+          removeLoginEntry(btn.dataset.site, parseInt(btn.dataset.index, 10));
         });
       });
       container.querySelectorAll('.login-remove-site').forEach(function(btn) {
-        btn.addEventListener('click', function() { removeLoginHost(btn.dataset.host); });
+        btn.addEventListener('click', function() { removeLoginSite(btn.dataset.site); });
       });
       const wireReorder = function(selector, direction) {
         container.querySelectorAll(selector).forEach(function(btn) {
           btn.addEventListener('click', function() {
             const site = btn.closest('.login-site');
             const total = site ? site.querySelectorAll('.login-cred-row').length : 0;
-            moveLoginCredential(btn.dataset.host, parseInt(btn.dataset.index, 10), direction, total);
+            moveLogin(btn.dataset.site, parseInt(btn.dataset.index, 10), direction, total);
           });
         });
       };
@@ -393,9 +390,9 @@
     }
     const help = document.getElementById('login-list-help');
     if (help && data) {
-      const sites = (typeof data.count === 'number') ? data.count : hosts.length;
-      const credentials = (typeof data.credentials === 'number') ? data.credentials : 0;
-      let text = '保存中: ' + sites + ' サイト / ' + credentials + ' 件。上から順にログインを試行します。値はマスクして表示しています。';
+      const siteCount = (typeof data.sites_count === 'number') ? data.sites_count : sites.length;
+      const loginCount = (typeof data.logins_count === 'number') ? data.logins_count : 0;
+      let text = '保存済み: ' + siteCount + ' サイト / ' + loginCount + ' 件。上から順にログインを試行します。値はマスクして表示しています。';
       if (data.key_source) text += ' 鍵: ' + data.key_source;
       help.textContent = text;
     }
@@ -434,38 +431,27 @@
     }
   }
 
-  async function saveLoginCookie(mode) {
-    const host = document.getElementById('login-host');
-    const cookie = document.getElementById('login-cookie');
-    const label = document.getElementById('login-label');
-    if (!host || !cookie || !host.value.trim() || !cookie.value.trim()) {
-      showToast('サイトと Cookie の両方を入力してください', 'error');
-      return;
-    }
+  async function renameLogin(site, index, current) {
+    const input = window.prompt(site + ' の ' + (index + 1) + ' 番目のログインの名前を入力してください。空にすると名前を消します。', current || '');
+    if (input === null) return;
     try {
-      const resp = await fetch('/api/login/' + mode, {
+      const resp = await fetch('/api/login/rename', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          host: host.value.trim(),
-          cookie: cookie.value,
-          label: (label && label.value.trim()) ? label.value.trim() : null,
-        }),
+        body: JSON.stringify({ site: site, index: index, label: input.trim() }),
       });
       const result = await resp.json();
-      if (!result.success) throw new Error(result.message || '保存に失敗しました');
-      showToast(result.message || '保存しました', 'success');
-      cookie.value = '';
-      if (label) label.value = '';
+      if (!result.success) throw new Error(result.message || '名前の変更に失敗しました');
+      showToast(result.message || '名前を変更しました', 'success');
       refreshLoginHosts(result.data);
     } catch (e) {
       showToast(e.message, 'error');
     }
   }
 
-  async function removeLoginCredential(host, index) {
+  async function removeLoginEntry(site, index) {
     try {
-      const resp = await fetch('/api/login/' + encodeURIComponent(host) + '/' + index, { method: 'DELETE' });
+      const resp = await fetch('/api/login/' + encodeURIComponent(site) + '/' + index, { method: 'DELETE' });
       const result = await resp.json();
       if (!result.success) throw new Error(result.message || '削除に失敗しました');
       showToast(result.message || '削除しました', 'success');
@@ -475,7 +461,7 @@
     }
   }
 
-  async function moveLoginCredential(host, index, direction, total) {
+  async function moveLogin(site, index, direction, total) {
     const swap = index + direction;
     if (swap < 0 || swap >= total) return;
     const order = [];
@@ -487,7 +473,7 @@
       const resp = await fetch('/api/login/order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ host: host, order: order }),
+        body: JSON.stringify({ site: site, order: order }),
       });
       const result = await resp.json();
       if (!result.success) throw new Error(result.message || '並べ替えに失敗しました');
@@ -498,10 +484,10 @@
     }
   }
 
-  async function removeLoginHost(host) {
-    if (!window.confirm('サイト ' + host + ' のログイン情報をすべて削除します。よろしいですか？')) return;
+  async function removeLoginSite(site) {
+    if (!window.confirm('サイト ' + site + ' のログイン情報をすべて削除します。よろしいですか？')) return;
     try {
-      const resp = await fetch('/api/login/' + encodeURIComponent(host), { method: 'DELETE' });
+      const resp = await fetch('/api/login/' + encodeURIComponent(site), { method: 'DELETE' });
       const result = await resp.json();
       if (!result.success) throw new Error(result.message || '削除に失敗しました');
       showToast(result.message || '削除しました', 'success');
@@ -563,6 +549,8 @@
     });
     const targetPane = document.getElementById('tab-' + tabId);
     if (targetPane) targetPane.classList.add('active');
+    // 一覧は pane が DOM に乗ってから読む (タブを開くたびに最新化する)。
+    if (tabId === 'login') loadLoginHosts();
 
     // Remember active tab
     activeTab = tabId;

@@ -61,17 +61,6 @@ pub struct NativeHttpClient {
     cookie_store: Option<Arc<dyn crate::platform::CookieStore>>,
 }
 
-/// Whether every pair of a stored credential was part of the sent header,
-/// which is how a response is attributed to one of several stored logins.
-fn credential_was_sent(credential: &str, sent: &[(String, String)]) -> bool {
-    let pairs = crate::platform::parse_cookie_header(credential);
-    !pairs.is_empty()
-        && pairs.iter().all(|(name, value)| {
-            sent.iter()
-                .any(|(sent_name, sent_value)| sent_name == name && sent_value == value)
-        })
-}
-
 impl NativeHttpClient {
     /// Refresh stored login cookies from `Set-Cookie` responses.
     pub fn with_cookie_store(mut self, store: Arc<dyn crate::platform::CookieStore>) -> Self {
@@ -111,7 +100,7 @@ impl NativeHttpClient {
     /// Sessions rotate their cookies on most responses; writing them back keeps
     /// the stored value usable for the next run. Hosts without an entry are
     /// left alone.
-    async fn persist_set_cookie(&self, url: &str, response: &HttpResponse, sent_cookie: Option<&str>) {
+    async fn persist_set_cookie(&self, response: &HttpResponse, sent_cookie: Option<&str>) {
         let Some(store) = self.cookie_store.as_ref() else {
             return;
         };
@@ -124,12 +113,8 @@ impl NativeHttpClient {
         if values.is_empty() {
             return;
         }
-        let Some(host) = crate::platform::cookie_host_for_url(url) else {
-            return;
-        };
-        // 送信した Cookie に対応する資格情報だけを更新する。サイトは複数の
-        // ログイン情報を持てるので、他のアカウントのセッションをこの応答で
-        // 上書きしてはいけない。キーは要求ホストとその親ドメイン。
+        // 送った Cookie を含むホストを持つログインだけを更新する。サイトは
+        // 複数のログインを持てるので、別アカウントのセッションは触らない。
         let Some(sent) = sent_cookie else {
             return;
         };
@@ -137,27 +122,26 @@ impl NativeHttpClient {
         if sent_pairs.is_empty() {
             return;
         }
-        let Ok(all) = store.list().await else {
+        let Ok(all) = store.list_groups().await else {
             return;
         };
-        for key in crate::platform::cookie_lookup_hosts(&host) {
-            let Some(credentials) = all.get(&key) else {
-                continue;
-            };
-            let mut updated_credentials = credentials.clone();
+        for (site, groups) in all {
+            let mut updated_groups = groups.clone();
             let mut changed = false;
-            for credential in updated_credentials.iter_mut() {
-                if !credential_was_sent(&credential.cookie, &sent_pairs) {
+            for group in updated_groups.iter_mut() {
+                let Some(host) = group.host_for_sent(&sent_pairs).map(str::to_string) else {
                     continue;
-                }
-                let updated = crate::platform::apply_set_cookie(&credential.cookie, &values);
-                if updated != credential.cookie {
-                    credential.cookie = updated;
-                    changed = true;
+                };
+                if let Some(entry) = group.cookies.iter_mut().find(|entry| entry.host == host) {
+                    let updated = crate::platform::apply_set_cookie(&entry.cookie, &values);
+                    if updated != entry.cookie {
+                        entry.cookie = updated;
+                        changed = true;
+                    }
                 }
             }
             if changed {
-                let _ = store.save_all(&key, &updated_credentials).await;
+                let _ = store.save_groups(&site, &updated_groups).await;
             }
         }
     }
@@ -848,14 +832,12 @@ impl HttpClient for NativeHttpClient {
     fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, Result<HttpResponse>> {
         let this = self.clone();
         Box::pin(async move {
-            let url = request.url.clone();
             let sent_cookie = request.header("Cookie").map(str::to_string);
             let worker = this.clone();
             let response = tokio::task::spawn_blocking(move || worker.send_blocking(&request))
                 .await
                 .map_err(|e| NarouError::Http(e.to_string()))??;
-            this.persist_set_cookie(&url, &response, sent_cookie.as_deref())
-                .await;
+            this.persist_set_cookie(&response, sent_cookie.as_deref()).await;
             Ok(response)
         })
     }

@@ -34,7 +34,7 @@ use self::novel_info::NovelInfo;
 use self::persistence::section_filename;
 use self::persistence::{PersistenceService, compute_section_hash};
 
-use crate::platform::{CookieStore, LoginCredential};
+use crate::platform::{CookieStore, LoginGroup};
 use self::section::{SectionCache, download_section};
 use self::security::is_safe_public_url;
 use self::settings::DownloaderSettings;
@@ -628,15 +628,15 @@ impl Downloader {
     }
 
     /// Load the stored login cookie for `host`, when a store is available.
-    /// 保存済みの資格情報を試行順で返す。
-    async fn stored_credentials_for(&self, host: Option<&str>) -> Vec<LoginCredential> {
+    /// そのサイトに保存されたログインを試行順で返す。
+    async fn stored_groups_for(&self, setting: &SiteSetting) -> Vec<LoginGroup> {
         let Some(cookies) = self.cookies.as_ref() else {
             return Vec::new();
         };
-        let Some(host) = host else {
-            return Vec::new();
-        };
-        cookies.load_all(host).await.unwrap_or_default()
+        cookies
+            .load_groups(&setting.domain)
+            .await
+            .unwrap_or_default()
     }
 
     /// Fetch an author page and list the work URLs its definition finds.
@@ -658,11 +658,9 @@ impl Downloader {
         let mut setting = setting.clone();
         // 保存済みのログインがあれば作者ページにも送る (ログインが要る作者ページ
         // のため)。無ければ定義の cookie だけで取得する。
-        let login_host = crate::platform::cookie_host_for_url(page_url);
-        let credentials = self.stored_credentials_for(login_host.as_deref()).await;
-        if let Some(credential) = credentials.first() {
-            setting.cookie =
-                crate::platform::merge_cookie_headers(setting.cookie(), Some(&credential.cookie));
+        let groups = self.stored_groups_for(&setting).await;
+        if let Some(group) = groups.first().map(|group| group.merged_cookie()) {
+            setting.cookie = crate::platform::merge_cookie_headers(setting.cookie(), Some(&group));
         }
         let setting = &setting;
         let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
@@ -1247,21 +1245,22 @@ impl Downloader {
         // Login fallback: a novel already flagged as needing authentication
         // sends the stored cookie from the first request; every other novel
         // stays anonymous until a fetch actually fails.
-        let login_host = crate::platform::cookie_host_for_url(&toc_url);
         let login_cookie = match existing_id {
             Some(id) => {
                 let record = self.novels.get(id.into()).await.ok().flatten();
                 let requires = record.as_ref().is_some_and(|record| record.requires_login);
                 if requires {
-                    // その小説で前に成功したセッションがあればそれを、無ければ
+                    // その小説で前に成功したログインがあればそれを、無ければ
                     // 一覧の先頭を最初のリクエストから送る。
-                    let credentials = self.stored_credentials_for(login_host.as_deref()).await;
+                    let groups = self.stored_groups_for(&setting).await;
                     let chosen = record
                         .as_ref()
                         .and_then(|record| record.login_session.as_deref())
-                        .and_then(|id| credentials.iter().find(|credential| credential.id == id))
-                        .or_else(|| credentials.first());
-                    chosen.map(|credential| credential.cookie.clone())
+                        .and_then(|id| groups.iter().find(|group| group.id == id))
+                        .or_else(|| groups.first());
+                    chosen
+                        .map(|group| group.merged_cookie())
+                        .filter(|cookie| !cookie.is_empty())
                 } else {
                     None
                 }
@@ -1379,14 +1378,14 @@ impl Downloader {
         if login_cookie.is_none() && (login_wall || partial_view) {
             // 保存済みの資格情報を順に試す。ログイン壁は成功した時点で、
             // 部分一覧は「欠けが消えた／話数が増えた」時点で打ち切る。
-            let credentials = self.stored_credentials_for(login_host.as_deref()).await;
-            if !credentials.is_empty() {
+            let groups = self.stored_groups_for(&setting).await;
+            if !groups.is_empty() {
                 report_line("ログインが必要な可能性があります。保存済みのログイン情報で再試行します");
                 let base_cookie = setting.cookie.clone();
-                let mut winner: Option<LoginCredential> = None;
-                for credential in &credentials {
+                let mut winner: Option<LoginGroup> = None;
+                for group in &groups {
                     setting.cookie = base_cookie.clone();
-                    apply_login_cookie(&mut setting, &credential.cookie);
+                    apply_login_cookie(&mut setting, &group.merged_cookie());
                     let retried = fetch_toc(
                         self.http.as_ref(),
                         self.rate_limiter.as_ref(),
@@ -1401,25 +1400,25 @@ impl Downloader {
                                 .as_ref()
                                 .is_ok_and(|source| !setting.is_partial_login_view(source));
                             requires_login = true;
-                            login_session = Some(credential.id.clone());
+                            login_session = Some(group.id.clone());
                             toc_source = retried;
-                            winner = Some(credential.clone());
+                            winner = Some(group.clone());
                             if resolved {
                                 break;
                             }
                         }
                     } else if retried.is_ok() {
                         requires_login = true;
-                        login_session = Some(credential.id.clone());
+                        login_session = Some(group.id.clone());
                         toc_source = retried;
-                        winner = Some(credential.clone());
+                        winner = Some(group.clone());
                         break;
                     }
                 }
                 // 採用した資格情報を最終状態に残す（本文も同じ Cookie で取る）。
                 setting.cookie = base_cookie;
                 if let Some(winner) = &winner {
-                    apply_login_cookie(&mut setting, &winner.cookie);
+                    apply_login_cookie(&mut setting, &winner.merged_cookie());
                 }
             }
         }
@@ -1582,14 +1581,14 @@ impl Downloader {
         // シリーズは未ログインだと本文一覧が 0 件になる) は、保存済み Cookie で
         // 取り直し、話数が増えたときだけ採用する。
         if partial_listing && login_cookie.is_none() {
-            let credentials = self.stored_credentials_for(login_host.as_deref()).await;
-            if !credentials.is_empty() {
+            let groups = self.stored_groups_for(&setting).await;
+            if !groups.is_empty() {
                 report_line("ログインが必要な可能性があります。保存済みのログイン情報で再試行します");
                 let base_cookie = setting.cookie.clone();
-                let mut winner: Option<LoginCredential> = None;
-                for credential in &credentials {
+                let mut winner: Option<LoginGroup> = None;
+                for group in &groups {
                     setting.cookie = base_cookie.clone();
-                    apply_login_cookie(&mut setting, &credential.cookie);
+                    apply_login_cookie(&mut setting, &group.merged_cookie());
                     let Ok((retried, retried_partial)) = parse_subtitles_multipage(
                         self.http.as_ref(),
                         self.rate_limiter.as_ref(),
@@ -1608,8 +1607,8 @@ impl Downloader {
                         let resolved = !retried_partial;
                         subtitles = retried;
                         requires_login = true;
-                        login_session = Some(credential.id.clone());
-                        winner = Some(credential.clone());
+                        login_session = Some(group.id.clone());
+                        winner = Some(group.clone());
                         if resolved {
                             break;
                         }
@@ -1617,7 +1616,7 @@ impl Downloader {
                 }
                 setting.cookie = base_cookie;
                 if let Some(winner) = &winner {
-                    apply_login_cookie(&mut setting, &winner.cookie);
+                    apply_login_cookie(&mut setting, &winner.merged_cookie());
                 }
             }
         }

@@ -587,13 +587,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/login", get(login::login_status))
         .route("/api/login", delete(login::login_clear_all))
         .route("/api/login/import", post(login::login_import))
-        .route("/api/login/set", post(login::login_set))
-        .route("/api/login/add", post(login::login_add))
+        .route("/api/login/rename", post(login::login_rename))
         .route("/api/login/order", post(login::login_order))
-        .route("/api/login/{host}", delete(login::login_clear_host))
+        .route("/api/login/{site}", delete(login::login_clear_site))
         .route(
-            "/api/login/{host}/{index}",
-            delete(login::login_clear_credential),
+            "/api/login/{site}/{index}",
+            delete(login::login_clear_group),
         )
         .route("/api/notepad/read", get(misc::notepad_read))
         .route("/api/notepad/save", post(misc::notepad_save))

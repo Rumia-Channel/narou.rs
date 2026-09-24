@@ -11,9 +11,9 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::error::NarouError;
-use crate::login::{group_credentials, parse_export};
+use crate::login::parse_export;
 use crate::native::cookie_store::InventoryCookieStore;
-use crate::platform::{LoginCredential, normalize_cookie_host, parse_cookie_header};
+use crate::platform::{LoginGroup, normalize_cookie_host, parse_cookie_header};
 
 use super::AppState;
 use super::{MAX_WEB_TEXT_INPUT_BYTES, validate_web_text_size};
@@ -25,32 +25,33 @@ pub struct LoginImportRequest {
     /// Passphrase of an encrypted export.
     #[serde(default)]
     pub passphrase: Option<String>,
-    /// Drop hosts that are not part of the import.
+    /// Drop sites that are not part of the import.
     #[serde(default)]
     pub replace: bool,
 }
 
+/// `POST /api/login/rename` — name one stored login.
 #[derive(Debug, Deserialize)]
-pub struct LoginSetRequest {
-    /// Request host, for example `ncode.syosetu.com`.
-    pub host: String,
-    /// `Cookie:` header value as copied from the browser.
-    pub cookie: String,
-    /// Optional label shown in the list ("メイン", "R18用", …).
+pub struct LoginRenameRequest {
+    /// Site the login belongs to (`www.pixiv.net`).
+    pub site: String,
+    /// Position in the list (0 始まり).
+    pub index: usize,
+    /// Name to show ("Pixiv1", "メインアカウント", …). Empty clears it.
     #[serde(default)]
-    pub label: Option<String>,
+    pub label: String,
 }
 
-/// `POST /api/login/order` — reorder a host's credentials.
+/// `POST /api/login/order` — reorder a site's logins.
 #[derive(Debug, Deserialize)]
 pub struct LoginOrderRequest {
-    /// Request host whose credentials are being reordered.
-    pub host: String,
-    /// Current indices in their new order, e.g. `[1, 0, 2]`.
+    /// Site whose logins are being reordered.
+    pub site: String,
+    /// Current indices in their new order, e.g. `[1, 0]`.
     pub order: Vec<usize>,
 }
 
-/// `GET /api/login` — stored hosts with their values masked.
+/// `GET /api/login` — stored sites with their logins (values masked).
 pub async fn login_status(State(_state): State<AppState>) -> Json<serde_json::Value> {
     match status_payload() {
         Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
@@ -63,103 +64,76 @@ pub async fn login_import(
     State(_state): State<AppState>,
     Json(body): Json<LoginImportRequest>,
 ) -> Json<serde_json::Value> {
-    if let Err(message) = validate_web_text_size(
-        &body.envelope,
-        MAX_WEB_TEXT_INPUT_BYTES,
-        "login export",
-    ) {
+    if let Err(message) =
+        validate_web_text_size(&body.envelope, MAX_WEB_TEXT_INPUT_BYTES, "login export")
+    {
         return Json(serde_json::json!({ "success": false, "message": message }));
     }
-    let credentials = match parse_export(&body.envelope, body.passphrase.as_deref()) {
-        Ok(credentials) => credentials,
+    let sites = match parse_export(&body.envelope, body.passphrase.as_deref()) {
+        Ok(sites) => sites,
         Err(error) => return Json(failure(error)),
     };
-    if credentials.is_empty() {
+    let logins: usize = sites.values().map(Vec::len).sum();
+    if logins == 0 {
         return Json(serde_json::json!({
             "success": false,
-            "message": "書き出しファイルに Cookie が含まれていません",
+            "message": "書き出しファイルにログイン情報が含まれていません",
         }));
     }
     let store = match store() {
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let imported = credentials.len();
-    let grouped = group_credentials(credentials);
+    let site_count = sites.len();
     let stored = match if body.replace {
-        store.replace_credentials(&grouped)
+        store.replace_groups(&sites)
     } else {
-        store.merge_credentials(&grouped)
+        store.merge_groups(&sites)
     } {
         Ok(stored) => stored,
         Err(error) => return Json(failure(error)),
     };
     Json(serde_json::json!({
         "success": true,
-        "message": format!("{imported} サイトを取り込みました (保存済み {stored} サイト)"),
+        "message": format!("{logins} 件を取り込みました ({site_count} サイト / 保存済み {stored} サイト)"),
         "data": status_payload().unwrap_or(serde_json::Value::Null),
     }))
 }
 
-/// `POST /api/login/set` — replace one host's cookie header.
-pub async fn login_set(
+/// `POST /api/login/rename` — name one login.
+pub async fn login_rename(
     State(_state): State<AppState>,
-    Json(body): Json<LoginSetRequest>,
+    Json(body): Json<LoginRenameRequest>,
 ) -> Json<serde_json::Value> {
-    login_set_or_add(body, false).await
-}
-
-/// 資格情報を 1 件保存する。`append` が真なら既存の後ろに足す。
-async fn login_set_or_add(body: LoginSetRequest, append: bool) -> Json<serde_json::Value> {
-    if let Err(message) =
-        validate_web_text_size(&body.cookie, MAX_WEB_TEXT_INPUT_BYTES, "cookie header")
-    {
-        return Json(serde_json::json!({ "success": false, "message": message }));
-    }
-    if body.host.trim().is_empty() || body.cookie.trim().is_empty() {
-        return Json(serde_json::json!({
-            "success": false,
-            "message": "サイトと Cookie の両方を入力してください",
-        }));
-    }
     let store = match store() {
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let host = normalize_cookie_host(&body.host);
-    let credential = LoginCredential::new(host.clone(), body.cookie.trim())
-        .with_label(body.label)
-        .with_added_at(Some(chrono::Local::now().to_rfc3339()));
-    let stored = match store.credentials_for(&host) {
-        Ok(stored) => stored,
+    let site = normalize_cookie_host(&body.site);
+    let mut groups = match store.groups_for(&site) {
+        Ok(groups) => groups,
         Err(error) => return Json(failure(error)),
     };
-    let credentials = if append {
-        let mut credentials = stored;
-        credentials.push(credential);
-        credentials
-    } else {
-        vec![credential]
-    };
-    if let Err(error) = store.save_credentials_for(&host, &credentials) {
+    if body.index >= groups.len() {
+        return Json(serde_json::json!({
+            "success": false,
+            "message": format!("{site} の {} 番目のログイン情報はありません", body.index + 1),
+        }));
+    }
+    let label = body.label.trim();
+    groups[body.index].label = (!label.is_empty()).then(|| label.to_string());
+    let name = groups[body.index].display_name().to_string();
+    if let Err(error) = store.save_groups_for(&site, &groups) {
         return Json(failure(error));
     }
     Json(serde_json::json!({
         "success": true,
-        "message": format!("{host} のログイン情報を保存しました ({} 件)", credentials.len()),
+        "message": format!("{site} の {} 番目を「{name}」にしました", body.index + 1),
         "data": status_payload().unwrap_or(serde_json::Value::Null),
     }))
 }
 
-/// `POST /api/login/add` — append one credential to a host's list.
-pub async fn login_add(
-    State(_state): State<AppState>,
-    Json(body): Json<LoginSetRequest>,
-) -> Json<serde_json::Value> {
-    login_set_or_add(body, true).await
-}
-
-/// `POST /api/login/{host}/{index}/order` 用の並べ替え。
+/// `POST /api/login/order` — reorder a site's logins.
 pub async fn login_order(
     State(_state): State<AppState>,
     Json(body): Json<LoginOrderRequest>,
@@ -168,32 +142,32 @@ pub async fn login_order(
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let host = normalize_cookie_host(&body.host);
-    let stored = match store.credentials_for(&host) {
+    let site = normalize_cookie_host(&body.site);
+    let stored = match store.groups_for(&site) {
         Ok(stored) => stored,
         Err(error) => return Json(failure(error)),
     };
-    let reordered = match reorder_credentials(&stored, &body.order) {
+    let reordered = match reorder_groups(&stored, &body.order) {
         Ok(reordered) => reordered,
         Err(message) => {
             return Json(serde_json::json!({ "success": false, "message": message }));
         }
     };
-    if let Err(error) = store.save_credentials_for(&host, &reordered) {
+    if let Err(error) = store.save_groups_for(&site, &reordered) {
         return Json(failure(error));
     }
     Json(serde_json::json!({
         "success": true,
-        "message": format!("{host} の試行順を変更しました"),
+        "message": format!("{site} の試行順を変更しました"),
         "data": status_payload().unwrap_or(serde_json::Value::Null),
     }))
 }
 
 /// 並び順の指定（現在の添字の並び）を検証して適用する。
-fn reorder_credentials(
-    stored: &[LoginCredential],
+fn reorder_groups(
+    stored: &[LoginGroup],
     order: &[usize],
-) -> std::result::Result<Vec<LoginCredential>, String> {
+) -> std::result::Result<Vec<LoginGroup>, String> {
     if order.len() != stored.len() {
         return Err("並び順の指定が保存済みの件数と一致しません".to_string());
     }
@@ -209,71 +183,68 @@ fn reorder_credentials(
     Ok(reordered)
 }
 
-/// `DELETE /api/login/{host}` — drop one host.
-pub async fn login_clear_host(
+/// `DELETE /api/login/{site}` — drop one site.
+pub async fn login_clear_site(
     State(_state): State<AppState>,
-    Path(host): Path<String>,
+    Path(site): Path<String>,
 ) -> Json<serde_json::Value> {
     let store = match store() {
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let host = normalize_cookie_host(&host);
-    match store.remove(&host) {
+    let site = normalize_cookie_host(&site);
+    match store.remove(&site) {
         Ok(true) => Json(serde_json::json!({
             "success": true,
-            "message": format!("{host} のログイン情報を削除しました"),
+            "message": format!("{site} のログイン情報を削除しました"),
             "data": status_payload().unwrap_or(serde_json::Value::Null),
         })),
         Ok(false) => Json(serde_json::json!({
             "success": false,
-            "message": format!("{host} のログイン情報は保存されていません"),
+            "message": format!("{site} のログイン情報は保存されていません"),
         })),
         Err(error) => Json(failure(error)),
     }
 }
 
-/// `DELETE /api/login/{host}/{index}` — drop one credential of a host.
-pub async fn login_clear_credential(
+/// `DELETE /api/login/{site}/{index}` — drop one login of a site.
+pub async fn login_clear_group(
     State(_state): State<AppState>,
-    Path((host, index)): Path<(String, usize)>,
+    Path((site, index)): Path<(String, usize)>,
 ) -> Json<serde_json::Value> {
     let store = match store() {
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let host = normalize_cookie_host(&host);
-    let mut credentials = match store.credentials_for(&host) {
-        Ok(credentials) => credentials,
+    let site = normalize_cookie_host(&site);
+    let mut groups = match store.groups_for(&site) {
+        Ok(groups) => groups,
         Err(error) => return Json(failure(error)),
     };
-    if index >= credentials.len() {
+    if index >= groups.len() {
         return Json(serde_json::json!({
             "success": false,
-            "message": format!("{host} の {} 番目のログイン情報はありません", index + 1),
+            "message": format!("{site} の {} 番目のログイン情報はありません", index + 1),
         }));
     }
-    credentials.remove(index);
-    if let Err(error) = store.save_credentials_for(&host, &credentials) {
+    let removed = groups.remove(index);
+    if let Err(error) = store.save_groups_for(&site, &groups) {
         return Json(failure(error));
     }
     Json(serde_json::json!({
         "success": true,
-        "message": format!("{host} の {} 番目のログイン情報を削除しました", index + 1),
+        "message": format!("{site} の「{}」を削除しました", removed.display_name()),
         "data": status_payload().unwrap_or(serde_json::Value::Null),
     }))
 }
 
-/// `DELETE /api/login` — drop every host.
+/// `DELETE /api/login` — drop every site.
 pub async fn login_clear_all(State(_state): State<AppState>) -> Json<serde_json::Value> {
     let store = match store() {
         Ok(store) => store,
         Err(error) => return Json(failure(error)),
     };
-    let removed = store
-        .credentials_by_host()
-        .map(|cookies| cookies.len())
-        .unwrap_or(0);
+    let removed = store.groups_by_site().map(|sites| sites.len()).unwrap_or(0);
     if let Err(error) = store.clear_all() {
         return Json(failure(error));
     }
@@ -288,46 +259,57 @@ fn store() -> Result<InventoryCookieStore, NarouError> {
     InventoryCookieStore::for_current_root()
 }
 
-/// Stored hosts and their key source, with every cookie value masked.
+/// Stored sites and their logins, with every cookie value masked.
 fn status_payload() -> Result<serde_json::Value, NarouError> {
     let store = store()?;
-    let cookies = store.credentials_by_host()?;
+    let sites = store.groups_by_site()?;
     let mut total = 0;
-    let hosts = cookies
+    let entries = sites
         .iter()
-        .map(|(host, credentials)| {
-            total += credentials.len();
-            let entries = credentials
+        .map(|(site, groups)| {
+            total += groups.len();
+            let logins = groups
                 .iter()
                 .enumerate()
-                .map(|(index, credential)| {
+                .map(|(index, group)| {
+                    let hosts = group
+                        .cookies
+                        .iter()
+                        .map(|entry| {
+                            serde_json::json!({
+                                "host": entry.host,
+                                "cookies": mask_cookie(&entry.cookie),
+                                "names": parse_cookie_header(&entry.cookie)
+                                    .into_iter()
+                                    .map(|(name, _)| name)
+                                    .collect::<Vec<_>>(),
+                                "length": entry.cookie.chars().count(),
+                            })
+                        })
+                        .collect::<Vec<_>>();
                     serde_json::json!({
                         "index": index,
-                        "id": credential.id,
-                        "short_id": credential.short_id(),
-                        "label": credential.label,
-                        "host": credential.host,
-                        "cookies": mask_cookie(&credential.cookie),
-                        "names": parse_cookie_header(&credential.cookie)
-                            .into_iter()
-                            .map(|(name, _)| name)
-                            .collect::<Vec<_>>(),
-                        "length": credential.cookie.chars().count(),
-                        "added_at": credential.added_at,
+                        "id": group.id,
+                        "short_id": group.short_id(),
+                        "label": group.label,
+                        "display_name": group.display_name(),
+                        "hosts": hosts,
+                        "host_count": group.cookies.len(),
+                        "added_at": group.added_at,
                     })
                 })
                 .collect::<Vec<_>>();
             serde_json::json!({
-                "host": host,
-                "credentials": entries,
-                "encrypted": store.is_encrypted(host).unwrap_or(false),
+                "site": site,
+                "logins": logins,
+                "encrypted": store.is_encrypted(site).unwrap_or(false),
             })
         })
         .collect::<Vec<_>>();
     Ok(serde_json::json!({
-        "hosts": hosts,
-        "count": cookies.len(),
-        "credentials": total,
+        "sites": entries,
+        "sites_count": sites.len(),
+        "logins_count": total,
         "key_source": store.key_source().map(|source| source.describe()).unwrap_or("unknown"),
     }))
 }

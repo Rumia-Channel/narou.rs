@@ -103,7 +103,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `clean` | ✅ | ✅ 完了 | `latest_convert` 既定値、`--all`、`--force`/`--dry-run`、freeze スキップ、`raw/*.txt|*.html` と `本文/*.yaml` の orphan 判定を実装 |
 | `illust` | ✅ | ✅ 完了 | v0.2.11 で導入した `.illustration_cache.yaml` 運用のための `narou illust <sub>` 新設。サブコマンド `orphan`/`migrate`/`fix-ext`/`rebuild` を実装し、削除/改名/移行はいずれも既定 dry-run (`-f` で実行) |
 | `author` | — (Rust 拡張) | ✅ 完了 | 追跡する作者を登録すると (`narou author add <作者ページURL>`)、`narou update` の後段で新しい作品を自動追加する。`add`/`list`/`remove`/`check`。作者ページの認識と作品一覧の取得はサイト定義 (`author_url` / `author_api_url` / `author_novel_pattern` / `author_work_url`) が担う |
-| `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`set`/`add`/`order`/`clear` を実装。サイトごとに複数の資格情報を試行順つきで保持できる。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET/DELETE /api/login`、`POST /api/login/import`、`POST /api/login/set`、`DELETE /api/login/{host}` も対応 |
+| `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`rename`/`order`/`clear` を実装。**サイトごとに複数の「名前つきログイン」を試行順つきで保持**し、1 ログインが複数ホストの Cookie を持つ (ブラウザのセッションがホストをまたぐため)。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET /api/login`、`POST /api/login/import\|rename\|order`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}` も対応 |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
 | `version` | ✅ | ✅ 完了 | `-v`/`--version` と `--more` を実装。出力順序、help 文言、AozoraEpub3 探索、失敗時メッセージを Ruby 版に揃えた |
 | `log` | ✅ | ✅ 完了 | `--num`, `--tail`, `--source-convert`, `<path>` を実装。最新ログ選択、`.narou/local_setting.yaml` の `log.*` 既定値、`*_convert` フィルタも対応 |
@@ -271,23 +271,26 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 | サブコマンド | 内容 |
 |---|---|
-| `list` | 保存済みサイト一覧。Cookie 値は `name=…` に伏せ、資格情報ごとの短縮 ID・暗号化状態・鍵の出所を示す |
-| `import <file> [--passphrase P] [--replace]` | `narou_rs_login --export` の書き出しファイル (YAML) を取り込む。`--replace` で取り込みに含まれないホストを削除 |
+| `list` | サイトごとにログインを番号・名前・短縮 ID・ホスト数つきで表示 (Cookie 値は `name=…` に伏せる) |
+| `import <file> [--passphrase P] [--replace]` | `narou_rs_login --export` の書き出しファイル (YAML) を取り込む。`--replace` で取り込みに含まれないサイトを削除 |
 | `export <file> [--passphrase P] [--clear-text]` | 保存済み情報を書き出しファイルへ出力。`--passphrase` 指定時は Argon2id→XChaCha20-Poly1305 で暗号化 |
-| `set <host> [--cookie V] [--label L]` | そのホストの一覧を 1 件に置き換えて保存 (`--cookie` 省略時は標準入力) |
-| `add <host> [--cookie V] [--label L]` | 同じホストに資格情報を追加。**試行順は保存順で、追加分は末尾** |
-| `order <host> 2,1,3` | 現在の位置 (1 始まり) を新しい順に並べ替える。件数・重複は検証 |
-| `clear [host] [--index N]` | 1 サイト分 / `--index` で 1 件だけ / 引数なしですべて削除 |
+| `rename <site> <番号> <名前>` | ログインに名前を付ける (`""` で名前を消す)。番号は `list` の 1 始まり |
+| `order <site> 2,1,3` | 現在の位置 (1 始まり) を新しい試行順に並べ替える。件数・重複は検証 |
+| `clear [site] [--index N]` | 1 サイト分 / `--index` でそのサイトの 1 件だけ / 引数なしですべて削除 |
 
-**保存形式**: `login_cookie` inventory (SQLite `app_state` / `.narou/login_cookie.yaml`) に、**1 ホスト = 順序つき資格情報リスト** (`LoginCredential` の JSON 配列) を `enc:v1:<nonce>:<payload>` として暗号化保存。並び順がそのまま試行順になる。鍵は `.narou/login.key` (初回作成、Unix では 0600) または `NAROU_RS_LOGIN_KEY` (base64)。ホスト名を AEAD の associated data に束ねるため別ホストへの流用は不可。旧形式 (プレーンな Cookie 文字列) は 1 件として読み取り、次回保存時に暗号化された新形式へ移行する。
+Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs_login` のブラウザ取得と書き出しファイルの取り込みだけで、利用者は名前と順序を管理する。
 
-**セッション ID**: 各資格情報に UUID を振り（保存値に含める）、小説レコードは `requires_login` に加えて `login_session`（成功した資格情報の ID）を持つ。フラグ付きの小説は次回以降その ID の資格情報を最初のリクエストから送るため、一覧の総当たりをしない。ID の無い旧データはストア読み込み時に採番・保存される。
+**保存形式**: `login_cookie` inventory (SQLite `app_state` / `.narou/login_cookie.yaml`) に、**1 サイト = 順序つきログイン配列** (`LoginGroup { id, site, label, cookies: [{ host, cookie }], added_at }` の JSON 配列) を `enc:v1:<nonce>:<payload>` として暗号化保存。並び順がそのまま試行順になる。鍵は `.narou/login.key` (初回作成、Unix では 0600) または `NAROU_RS_LOGIN_KEY` (base64)。在庫のキー (サイト名) を AEAD の associated data に束ねるため別サイトへの流用は不可。旧形式の平文値はそのまま読め (ホスト名で束ねた旧暗号文も可)、次回保存時にサイト単位の新形式へ移行する。
 
-**試行順の使われ方**: ダウンロード時、ログイン壁 (404 / `login_pattern`) か部分一覧 (`login_partial_pattern`) のときに保存済みを**順に試す**。ログイン壁は成功した時点で、部分一覧は「欠けが消えた／取得話数が増えた」時点で打ち切る。採用した資格情報はその後の本文取得にも使う。`Set-Cookie` の書き戻しは、その応答で実際に送った資格情報だけを更新する (別アカウントのセッションを壊さない)。
+**1 ログイン = 複数ホスト**: ブラウザのセッションは `pixiv.net` と `www.pixiv.net` のように複数ホストにまたがるため、取得側はサイトのドメインファミリーを 1 つのログインにまとめて保存する。送信時は `merged_cookie()` が各ホストの Cookie を 1 本の `Cookie:` ヘッダに畳み、名前が衝突したときは具体的なホストを優先する。まとめ先のサイト名はサイト定義 (`webnovel/*.yaml`) のドメインで決め、定義が無ければホストをそのまま使う。旧形式 (版 1 の host→cookie、版 2 のホスト→資格情報リスト) は読み取り可能で、版 2 は「同じ位置 = 同じアカウント」として 1 ログインに畳み直す。
 
-**書き出し形式**: `version`/`exported_at`/`library`/`encrypted`/`kdf`/`salt`/`payload`/`credentials` を持つ YAML エンベロープ (version 2)。`narou_rs_login --export <file>` が生成し、ライブラリ外ではそれが既定の出力になる。version 1 (`cookies:` のホスト→Cookie マップ) も読み取り可能。
+**セッション ID**: 各ログインに UUID を振り（保存値に含める）、小説レコードは `requires_login` に加えて `login_session`（成功したログインの ID）を持つ。フラグ付きの小説は次回以降その ID のログインを最初のリクエストから送るため、一覧の総当たりをしない。ID の無い旧データはストア読み込み時に採番・保存される。
 
-**Web UI**: 設定ページ「ログイン」タブで一覧・取り込み・直接登録・追加・1 件削除・並べ替え (上下ボタン)。取り込みはファイル選択 (FileReader) と貼り付けの両方に対応。API: `GET/DELETE /api/login`、`POST /api/login/import`、`POST /api/login/set`、`POST /api/login/add`、`POST /api/login/order`、`DELETE /api/login/{host}`、`DELETE /api/login/{host}/{index}`。
+**試行順の使われ方**: ダウンロード時、ログイン壁 (404 / `login_pattern`) か部分一覧 (`login_partial_pattern`) のときに保存済みを**順に試す**。ログイン壁は成功した時点で、部分一覧は「欠けが消えた／取得話数が増えた」時点で打ち切る。採用したログインはその後の本文取得にも使う。`Set-Cookie` の書き戻しは、その応答で実際に送ったログインだけを更新する (別アカウントのセッションを壊さない)。
+
+**書き出し形式**: `version`/`exported_at`/`library`/`encrypted`/`kdf`/`salt`/`payload`/`sites` を持つ YAML エンベロープ (version 3)。`narou_rs_login --export <file>` が生成し、ライブラリ外ではそれが既定の出力になる。version 2 (`credentials:` にホストごとの 1 本) と version 1 (`cookies:` のホスト→Cookie マップ) も読み取り可能。
+
+**Web UI**: 設定ページ「ログイン」タブで一覧 (サイト → 名前つきログイン)・取り込み・名前変更・並べ替え (上下ボタン)・1 件削除・サイト削除・全削除。取り込みはファイル選択 (FileReader) と貼り付けの両方に対応。API: `GET /api/login`、`POST /api/login/import`、`POST /api/login/rename`、`POST /api/login/order`、`DELETE /api/login`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}`。
 
 ---
 
