@@ -60,13 +60,11 @@ pub struct SiteSetting {
     #[serde(default)]
     pub author_work_url: Option<String>,
     /// Pattern whose `author_next` capture is the next page of an author
-    /// listing (ハーメルン pages its works). Followed until it repeats, runs
-    /// out, or `author_page_max` is reached.
+    /// listing (ハーメルン pages its works). Followed until a page has no next
+    /// link or points at one already visited — the visited set is what keeps a
+    /// pager that links back from looping, so there is no page limit to hit.
     #[serde(default)]
     pub author_next_pattern: Option<String>,
-    /// Pages an author listing is followed for (default 50).
-    #[serde(default)]
-    pub author_page_max: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub series_item_url: Option<String>,
     #[serde(default)]
@@ -463,11 +461,6 @@ impl SiteSetting {
             .name("author_next")
             .map(|matched| crate::downloader::util::decode_html_text(matched.as_str()))
             .filter(|url| !url.is_empty())
-    }
-
-    /// Pages an author listing is followed for.
-    pub fn author_page_max(&self) -> usize {
-        self.author_page_max.unwrap_or(50).max(1)
     }
 
     /// Captures of `author_url` for a concrete author page.

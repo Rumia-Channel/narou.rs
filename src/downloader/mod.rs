@@ -671,8 +671,9 @@ impl Downloader {
         let mut urls: Vec<String> = Vec::new();
         let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
         // 一覧がページ分けされているサイト (ハーメルン) は次ページを辿る。
-        // 同じ URL に戻ったら終わり、暴走防止にページ上限も設ける。
-        for _ in 0..setting.author_page_max() {
+        // 次ページが無くなるか、既に訪れた URL に戻ったら終わり。訪問済みを
+        // 覚えているのでページ数の上限は要らない。
+        loop {
             if !visited.insert(fetch_url.clone()) {
                 break;
             }
@@ -3490,7 +3491,48 @@ is_narou: false
                 "https://syosetu.org/novel/388855/".to_string(),
                 "https://syosetu.org/novel/400001/".to_string()
             ],
-            "話ページを作品として数えず、>> の付いた次ページだけを辿る"
+            "話ページを作品として数えず、>> の付いた次ページだけを辿る (上限なしで終端まで)"
+        );
+    }
+
+    #[test]
+    fn a_pager_that_links_back_does_not_loop() {
+        // 終端で先頭に戻るページャでも、訪問済みなら止まる (上限は設けない)。
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|setting| setting.domain == "syosetu.org")
+            .unwrap();
+        let page = "https://syosetu.org/user/495125/";
+        let first = "https://syosetu.org/search/?mode=search_user_novel_list&uid=495125";
+        let second = "https://syosetu.org/search/?mode=search_user_novel_list&word=&uid=495125&page=2";
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            first,
+            200,
+            r#"<a href="https://syosetu.org/novel/1/">作品1</a>
+               <a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=2">>></a>"#,
+        );
+        http.add_text(
+            second,
+            200,
+            r#"<a href="https://syosetu.org/novel/2/">作品2</a>
+               <a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;uid=495125">>></a>"#,
+        );
+        let downloader = Downloader::with_platform(
+            Arc::new(http),
+            Arc::new(FakeRateLimiter::new()),
+            Arc::new(MemoryNovelRepository::new()),
+        )
+        .unwrap();
+        let urls = futures::executor::block_on(downloader.author_novel_urls(setting, page)).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://syosetu.org/novel/1/".to_string(),
+                "https://syosetu.org/novel/2/".to_string()
+            ]
         );
     }
 
