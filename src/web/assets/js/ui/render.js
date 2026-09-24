@@ -473,8 +473,10 @@ function createRow(novel, rowIndex) {
   // Status
   const statusText = getStatusText(novel);
 
-  // TOC URL link button
-  const tocUrl = novel.toc_url || '';
+  // TOC URL link button. `display_url` is the page the novel was registered
+  // from; `toc_url` can be an API endpoint (Pixiv), which is not something to
+  // open in a browser.
+  const tocUrl = novel.display_url || novel.toc_url || '';
   const tocLink = tocUrl
     ? `<a href="${esc(tocUrl)}" target="_blank" rel="noopener" class="btn-link-icon" title="${esc(tocUrl)}">${materialIcon('link', 'icon-only')}</a>`
     : '';

@@ -2107,6 +2107,12 @@ impl Downloader {
             login_session: login_session.clone(),
             extra_fields: Default::default(),
         };
+        // 取得に使う URL (toc_url) と利用者が指定した URL が違う場合、後者を
+        // 控えておく。Pixiv は toc_url が API なので、Web UI のリンクが
+        // API を開いてしまうのを避ける (通常サイトは両者同じなので記録しない)。
+        if target != record.toc_url {
+            record.set_original_url(target.to_string());
+        }
         if track_raw_title {
             record.set_raw_title(raw_title);
         }
@@ -2163,6 +2169,10 @@ impl Downloader {
                     updated.requires_login |= requires_login;
                     if login_session.is_some() {
                         updated.login_session = login_session.clone();
+                    }
+                    // 既存の小説をページ URL 指定で取り直したときも控え直す。
+                    if target != updated.toc_url && updated.original_url().is_none() {
+                        updated.set_original_url(target.to_string());
                     }
                     for tag in &auto_tags {
                         if !updated.tags.contains(tag) {
@@ -3441,6 +3451,29 @@ is_narou: false
         let mut source = json.to_string();
         super::util::pretreatment_source(&mut source, "UTF-8", Some(setting));
         source
+    }
+
+    #[test]
+    fn a_target_that_differs_from_the_toc_url_is_remembered() {
+        // Pixiv は取得に API を使うため toc_url が API になる。利用者が指定した
+        // ページ URL を控えておかないと、Web UI のリンクが API を開いてしまう。
+        let record = crate::db::novel_record::NovelRecord {
+            toc_url: "https://www.pixiv.net/ajax/novel/series/768265".to_string(),
+            ..sample_record(chrono::Utc::now())
+        };
+        assert_eq!(record.display_url(), record.toc_url, "未記録なら toc_url");
+
+        let mut record = record;
+        record.set_original_url("https://www.pixiv.net/novel/series/768265");
+        assert_eq!(
+            record.display_url(),
+            "https://www.pixiv.net/novel/series/768265"
+        );
+        // 追加フィールドとして保存され、往復しても保たれる。
+        let yaml = serde_yaml::to_string(&record).unwrap();
+        assert!(yaml.contains("original_url:"), "got {yaml}");
+        let back: crate::db::novel_record::NovelRecord = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.display_url(), record.display_url());
     }
 
     #[test]

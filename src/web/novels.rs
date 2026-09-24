@@ -132,6 +132,7 @@ async fn api_list_inner(
             frozen: record.frozen,
             suspend: record.suspend,
             length: record.length,
+            display_url: record.display_url,
             toc_url: record.toc_url,
             general_all_no: record.general_all_no,
         })
@@ -153,6 +154,7 @@ mod tests {
     #[test]
     fn novel_list_item_serializes_dates_as_epoch_integers() {
         let item = NovelListItem {
+            display_url: "https://example.com".to_string(),
             id: 5,
             title: "title".to_string(),
             author: "author".to_string(),

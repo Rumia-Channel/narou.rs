@@ -52,6 +52,9 @@ pub struct NovelListItem {
     pub suspend: bool,
     pub length: Option<i64>,
     pub toc_url: String,
+    /// Link to show (the page the novel was registered from). Falls back to
+    /// `toc_url` inside the record before it reaches here.
+    pub display_url: String,
     pub general_all_no: Option<i64>,
 }
 

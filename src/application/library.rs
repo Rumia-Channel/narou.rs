@@ -107,6 +107,9 @@ pub struct NovelSummary {
     pub suspend: bool,
     pub length: Option<i64>,
     pub toc_url: String,
+    /// Link to show for the novel: the page it was registered from, falling
+    /// back to `toc_url` (Pixiv keeps an API endpoint in `toc_url`).
+    pub display_url: String,
     pub general_all_no: Option<i64>,
 }
 
@@ -256,6 +259,7 @@ impl LibraryService {
                 timezone,
             );
             let is_frozen = record_is_frozen(&record, &frozen_ids);
+            let display_url = record.display_url().to_string();
             data.push(NovelSummary {
                 id: record.id,
                 title: record.title,
@@ -273,6 +277,7 @@ impl LibraryService {
                 suspend: record.suspend,
                 length: record.length,
                 toc_url: record.toc_url,
+                display_url,
                 general_all_no: record.general_all_no,
             });
         }
