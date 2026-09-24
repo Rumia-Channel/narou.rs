@@ -241,6 +241,39 @@ mod tests {
     }
 
     #[test]
+    fn the_r18_definition_reads_works_from_the_mypage() {
+        let settings = SiteSetting::load_all().expect("site definitions");
+        let setting = settings
+            .iter()
+            .find(|setting| setting.domain == "novel18.syosetu.com")
+            .expect("R18 定義");
+        // R18 のマイページ (xmypage.syosetu.com/<x ID>/) を作者ページとして扱う。
+        assert!(setting.matches_author_url("https://xmypage.syosetu.com/x8094bm/"));
+        assert!(
+            !setting.matches_author_url("https://mypage.syosetu.com/2842627/"),
+            "通常のマイページはなろう側の定義が扱う"
+        );
+        // 実ページにある形のリンクから作品 URL を拾う (情報ページは拾わない)。
+        let html = r#"
+            <a href="https://novel18.syosetu.com/n0316gv/" class="c-novel-list__title">作品1</a>
+            <a href="https://novel18.syosetu.com/novelview/infotop/ncode/n0316gv/" class="c-novel-list__novel-info">情報</a>
+            <a href="https://novel18.syosetu.com/n9878es/" class="c-novel-list__title">作品2</a>
+        "#;
+        assert_eq!(
+            setting.author_novel_urls(html).expect("pattern"),
+            vec![
+                "https://novel18.syosetu.com/n0316gv/".to_string(),
+                "https://novel18.syosetu.com/n9878es/".to_string()
+            ]
+        );
+        // 作品一覧 API は使わない (userid で絞れないため)。
+        assert_eq!(
+            setting.author_fetch_url("https://xmypage.syosetu.com/x8094bm/"),
+            "https://xmypage.syosetu.com/x8094bm/"
+        );
+    }
+
+    #[test]
     fn the_narou_definition_lists_works_from_its_api() {
         let settings = SiteSetting::load_all().expect("site definitions");
         let setting = settings

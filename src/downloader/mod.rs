@@ -655,6 +655,16 @@ impl Downloader {
                 setting.sitename
             )));
         }
+        let mut setting = setting.clone();
+        // 保存済みのログインがあれば作者ページにも送る (ログインが要る作者ページ
+        // のため)。無ければ定義の cookie だけで取得する。
+        let login_host = crate::platform::cookie_host_for_url(page_url);
+        let credentials = self.stored_credentials_for(login_host.as_deref()).await;
+        if let Some(credential) = credentials.first() {
+            setting.cookie =
+                crate::platform::merge_cookie_headers(setting.cookie(), Some(&credential.cookie));
+        }
+        let setting = &setting;
         let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
         // Sites with an author API (なろう) answer with JSON instead of HTML.
         let fetch_url = setting.author_fetch_url(page_url);
