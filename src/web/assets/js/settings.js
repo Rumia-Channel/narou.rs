@@ -713,15 +713,24 @@
   function collectFormData() {
     const data = {};
 
+    // 設定ページにはログインなど独自の pane も同居している。そこにある
+    // 入力欄 (data-name を持たない) は設定ではないので送らない。
+    // 送ると `undefined` という名前として扱われ、サーバーが全体を拒否する。
+    function settingName(input) {
+      return input && input.dataset ? input.dataset.name : '';
+    }
+
     // Checkboxes (normal boolean)
     document.querySelectorAll('.switch-light input[type="checkbox"]').forEach(function(input) {
-      data[input.dataset.name] = input.checked;
+      const name = settingName(input);
+      if (!name) return;
+      data[name] = input.checked;
     });
 
     // Radio buttons (3-way)
     document.querySelectorAll('.switch-3way').forEach(function(group) {
       const checked = group.querySelector('input[type="radio"]:checked');
-      if (checked) {
+      if (checked && checked.name) {
         const name = checked.name;
         const val = checked.value;
         if (val === 'nil') {
@@ -736,21 +745,24 @@
 
     // Selects (single)
     document.querySelectorAll('select.setting-select:not([multiple])').forEach(function(sel) {
-      const name = sel.dataset.name;
+      const name = settingName(sel);
+      if (!name) return;
       const val = sel.value;
       data[name] = val === '' ? null : val;
     });
 
     // Selects (multiple)
     document.querySelectorAll('select.setting-select[multiple]').forEach(function(sel) {
-      const name = sel.dataset.name;
+      const name = settingName(sel);
+      if (!name) return;
       const selected = Array.from(sel.selectedOptions).map(function(opt) { return opt.value; });
       data[name] = selected.length > 0 ? selected.join(',') : null;
     });
 
     // Text inputs
     document.querySelectorAll('input.setting-input[type="text"]').forEach(function(input) {
-      const name = input.dataset.name;
+      const name = settingName(input);
+      if (!name) return;
       const val = input.value.trim();
       data[name] = val === '' ? null : val;
     });
