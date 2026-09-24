@@ -31,7 +31,7 @@ headers:
   Sec-Fetch-User: "?1"
   Upgrade-Insecure-Requests: "1"
 sitename: *name
-version: 1.8
+version: 1.9
 
 # ------------------------------------------------------------
 # 目次取得設定

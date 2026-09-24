@@ -821,6 +821,55 @@ login_partial_pattern: ^login_partial::1$
     }
 
     #[test]
+    fn a_user_definition_below_the_bundled_version_is_ignored() {
+        // 同梱定義を更新したら version を上げる必要がある理由を固定する:
+        // ユーザー側が古い (<) ときは無視され、同版以上 (>=) のときだけ
+        // キー単位で上書きマージされる。
+        let root = std::env::temp_dir().join(format!(
+            "narou_rs_site_setting_version_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let bundled = root.join("bundled").join("webnovel");
+        let user = root.join("user").join("webnovel");
+        std::fs::create_dir_all(&bundled).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+
+        let definition = |version: &str, author_url: &str| {
+            format!(
+                "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Example\ntoc_url: https://example.com/\\k<ncode>/\nversion: {version}\nauthor_url: {author_url}\n"
+            )
+        };
+        std::fs::write(
+            bundled.join("example.yaml"),
+            definition("2.4", "^https?://example\\.com/bundled/"),
+        )
+        .unwrap();
+        // 古いユーザー定義: 同梱版より低いので無視される。
+        std::fs::write(
+            user.join("example.yaml"),
+            definition("2.3", "^https?://example\\.com/user/old/"),
+        )
+        .unwrap();
+        let settings = loader::load_all_from_dirs(vec![bundled.clone(), user.clone()]);
+        let setting = settings.iter().find(|s| s.name == "Example").unwrap();
+        assert!(setting.matches_author_url("https://example.com/bundled/"));
+        assert!(!setting.matches_author_url("https://example.com/user/old/"));
+
+        // 同じ版のユーザー定義: そのキーが優先される。
+        std::fs::write(
+            user.join("example.yaml"),
+            definition("2.4", "^https?://example\\.com/user/new/"),
+        )
+        .unwrap();
+        let settings = loader::load_all_from_dirs(vec![bundled, user]);
+        let setting = settings.iter().find(|s| s.name == "Example").unwrap();
+        assert!(setting.matches_author_url("https://example.com/user/new/"));
+        assert!(!setting.matches_author_url("https://example.com/bundled/"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn user_webnovel_yaml_merges_over_bundled_yaml_by_name() {
         let root = std::env::temp_dir().join(format!(
             "narou_rs_site_setting_merge_{}",

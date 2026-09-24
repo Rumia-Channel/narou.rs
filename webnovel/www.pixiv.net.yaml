@@ -32,7 +32,7 @@ headers:
   Referer: \k<top_url>/
 confirm_over18: no
 append_title_to_folder_name: yes
-version: 1.0
+version: 1.1
 
 # ------------------------------------------------------------
 # 前処理設定 (DSL — pest parser で実行)

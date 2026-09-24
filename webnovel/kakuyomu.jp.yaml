@@ -20,7 +20,7 @@ confirm_over18: no
 append_title_to_folder_name: yes
 title_strip_pattern: null
 sitename: *name
-version: 2.4
+version: 2.5
 
 # ------------------------------------------------------------
 # 前処理設定 (DSL — pest parser で実行)

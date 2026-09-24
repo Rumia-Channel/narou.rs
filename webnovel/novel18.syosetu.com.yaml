@@ -26,7 +26,7 @@ sitename: |-
   <dt class="p-infotop-data__title">掲載サイト</dt>
   <dd class="p-infotop-data__value">(?<sitename>.+?)\(.+\)</dd>
 
-version: 2.3
+version: 2.4
 
 # ------------------------------------------------------------
 # 目次取得設定
