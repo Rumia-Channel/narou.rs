@@ -730,8 +730,12 @@ impl OutputManager {
 
     /// EPUB 出力の入口。外部 AozoraEpub3 が見つかればそれを使い、
     /// 見つからなければ `lite` feature の組み込みエンジンへフォールバックする。
+    ///
+    /// `NAROU_RS_EPUB_ENGINE=lite` (または `builtin`) で組み込みを、`external`
+    /// (または `java`) で外部ツールを強制できる — 組み込みエンジンの動作確認用。
     fn epub_output(&self, input_txt: &Path, output_dir: &Path, output_ext: &str) -> Result<PathBuf> {
-        if self.aozora_epub3_path.is_some() {
+        let preference = epub_engine_preference();
+        if preference != EpubEngine::Lite && self.aozora_epub3_path.is_some() {
             return self.run_aozora_epub3(input_txt, output_dir, output_ext);
         }
         #[cfg(feature = "lite")]
@@ -740,6 +744,13 @@ impl OutputManager {
         }
         #[cfg(not(feature = "lite"))]
         {
+            if preference == EpubEngine::Lite {
+                return Err(NarouError::Conversion(
+                    "NAROU_RS_EPUB_ENGINE=lite ですが、この実行ファイルは組み込み EPUB \
+                     エンジン入りでビルドされていません (cargo build --features lite)"
+                        .into(),
+                ));
+            }
             self.run_aozora_epub3(input_txt, output_dir, output_ext)
         }
     }
@@ -913,6 +924,29 @@ impl StripError {
 impl fmt::Display for StripError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// Which EPUB engine the environment asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpubEngine {
+    /// External tool when found, otherwise the embedded engine.
+    Auto,
+    /// Embedded engine (`lite` feature builds).
+    Lite,
+    /// External AozoraEpub3, even if the embedded engine is available.
+    External,
+}
+
+/// `NAROU_RS_EPUB_ENGINE` switches the engine; anything else means `Auto`.
+fn epub_engine_preference() -> EpubEngine {
+    let Ok(value) = std::env::var("NAROU_RS_EPUB_ENGINE") else {
+        return EpubEngine::Auto;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "lite" | "builtin" => EpubEngine::Lite,
+        "external" | "java" => EpubEngine::External,
+        _ => EpubEngine::Auto,
     }
 }
 
