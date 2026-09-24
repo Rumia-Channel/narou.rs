@@ -241,6 +241,34 @@ mod tests {
     }
 
     #[test]
+    fn the_kakuyomu_definition_reads_the_authors_own_works_page() {
+        let settings = SiteSetting::load_all().expect("site definitions");
+        let setting = settings
+            .iter()
+            .find(|setting| setting.domain == "kakuyomu.jp")
+            .expect("カクヨム定義");
+        assert!(setting.matches_author_url("https://kakuyomu.jp/users/sokin"));
+        // プロフィールページは他作者の作品も並ぶので、本人の作品一覧ページを取る。
+        assert_eq!(
+            setting.author_fetch_url("https://kakuyomu.jp/users/sokin"),
+            "https://kakuyomu.jp/users/sokin/works"
+        );
+        // 作品リンクは相対 (id だけ) なので、定義側で絶対 URL を組み立てる。
+        let html = r#"
+            <a href="/works/1177354054880842657">作品1</a>
+            <a href="/works/1177354054880842657/episodes/123">作品1 の話</a>
+            <a href="/works/16816452218689030051">作品2</a>
+        "#;
+        assert_eq!(
+            setting.author_novel_urls(html).expect("pattern"),
+            vec![
+                "https://kakuyomu.jp/works/1177354054880842657".to_string(),
+                "https://kakuyomu.jp/works/16816452218689030051".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn the_r18_definition_reads_works_from_the_mypage() {
         let settings = SiteSetting::load_all().expect("site definitions");
         let setting = settings
@@ -294,10 +322,12 @@ mod tests {
     #[test]
     fn definitions_without_the_pattern_report_nothing() {
         let settings = SiteSetting::load_all().expect("site definitions");
+        // 作者ページを持たない定義 (pixiv) は何も返さない。
         let setting = settings
             .iter()
-            .find(|setting| setting.domain == "kakuyomu.jp")
-            .expect("カクヨム定義");
+            .find(|setting| setting.domain == "www.pixiv.net")
+            .expect("pixiv 定義");
         assert_eq!(setting.author_novel_urls("<a href=x>"), None);
+        assert!(!setting.matches_author_url("https://www.pixiv.net/users/742462"));
     }
 }

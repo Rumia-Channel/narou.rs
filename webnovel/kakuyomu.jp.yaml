@@ -7,6 +7,13 @@ top_url: \\k<scheme>://\\k<domain>
 url: \\k<top_url>/works/(?<ncode>\d+)
 series_url: \\k<top_url>/users/[^/]+/collections/(?<series>\d+)
 series_item_url: (?:"|')(?<href>/works/\d+)(?:"|')
+# 作者ページ (作者追跡)。`narou author add https://kakuyomu.jp/users/<name>` で登録する。
+# プロフィールページは他作者の作品 (読んだ作品など) も並ぶため、作者本人の作品だけが
+# 並ぶ `/users/<name>/works` を取得する。
+author_url: ^https?://kakuyomu\.jp/users/(?<user_id>[^/?#]+)
+author_api_url: \k<top_url>/users/\k<user_id>/works
+author_novel_pattern: /works/(?<work_id>\d+)
+author_work_url: \k<top_url>/works/\k<work_id>
 encoding: UTF-8
 timezone: Asia/Tokyo
 confirm_over18: no
