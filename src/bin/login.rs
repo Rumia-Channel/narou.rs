@@ -75,6 +75,9 @@ struct Args {
     /// パスフレーズ指定時でも平文で書き出す
     #[arg(long = "clear-text")]
     clear_text: bool,
+    /// この取得に付ける名前（`narou login list` や Web UI に表示される）
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
 }
 
 fn main() -> std::process::ExitCode {
@@ -175,7 +178,7 @@ fn run(args: Args) -> std::result::Result<(), String> {
         write_export(&path, &site, &captured, store.as_ref(), &args)?;
     }
     if let Some(store) = &store {
-        save_group(store, &site.domain, &captured)?;
+        save_group(store, &site.domain, &captured, args.name.as_deref())?;
     }
 
     // 保存は済んでいるので、その Cookie で実際に取得できるかだけ確かめる。
@@ -281,6 +284,7 @@ fn write_export(
                     })
                     .collect(),
             )
+            .with_label(args.name.as_deref().map(str::to_string))
             .with_added_at(Some(chrono::Local::now().to_rfc3339())),
         ],
     );
@@ -347,6 +351,7 @@ fn save_group(
     store: &InventoryCookieStore,
     site: &str,
     captured: &BTreeMap<String, String>,
+    name: Option<&str>,
 ) -> std::result::Result<(), String> {
     let group = LoginGroup::new(
         site,
@@ -358,6 +363,7 @@ fn save_group(
             })
             .collect(),
     )
+    .with_label(name.map(str::to_string))
     .with_added_at(Some(chrono::Local::now().to_rfc3339()));
     let mut map = BTreeMap::new();
     map.insert(site.to_string(), vec![group.clone()]);

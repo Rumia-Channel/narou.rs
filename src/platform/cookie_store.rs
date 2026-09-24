@@ -9,7 +9,7 @@
 //! from `Set-Cookie` responses so a session survives across runs; the login
 //! executable writes the initial value after the user signs in.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -266,6 +266,86 @@ impl LegacyCredential {
     }
 }
 
+/// The site a host belongs to: the site definition that covers it, or the
+/// registrable-looking parent domain when no definition matches.
+///
+/// A parent-domain key (`pixiv.net`) resolves to the definition below it
+/// (`www.pixiv.net`) so one browser session stays in one place.
+pub fn site_for_host(host: &str) -> String {
+    let host = host.trim().to_ascii_lowercase();
+    let domain_of = |setting: &crate::downloader::site_setting::SiteSetting| {
+        setting.domain.to_ascii_lowercase()
+    };
+    let Ok(settings) = crate::downloader::site_setting::SiteSetting::load_all() else {
+        return parent_domain(&host);
+    };
+    // 1. 定義そのもの、その配下、またはその定義が使うホスト。
+    if let Some(setting) = settings.iter().find(|setting| {
+        let domain = domain_of(setting);
+        domain == host
+            || host.ends_with(&format!(".{domain}"))
+            || domain.ends_with(&format!(".{host}"))
+            || crate::platform::cookie_host_for_url(&setting.top_url())
+                .is_some_and(|top| top == host || host.ends_with(&format!(".{top}")))
+    }) {
+        return domain_of(setting);
+    }
+    // 2. 同じ登録ドメインの兄弟サブドメイン (`accounts.pixiv.net` など)。
+    //    定義が 1 つに定まるときだけ寄せる (なろうの ncode / novel18 は別サイト)。
+    let base = parent_domain(&host);
+    let mut siblings = settings
+        .iter()
+        .filter(|setting| parent_domain(&domain_of(setting)) == base)
+        .map(domain_of);
+    if let Some(domain) = siblings.next()
+        && siblings.next().is_none()
+    {
+        return domain;
+    }
+    base
+}
+
+/// Last two labels: what a host's registrable domain looks like.
+fn parent_domain(host: &str) -> String {
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() > 2 {
+        labels[labels.len() - 2..].join(".")
+    } else {
+        host.to_string()
+    }
+}
+
+/// Whether two logins look like two halves of one browser session.
+///
+/// Sessions of a site span several hosts, so a per-host capture leaves logins
+/// whose hosts do not overlap. Cookies of different accounts usually share
+/// names (`PHPSESSID`, …), which keeps those apart.
+fn fragments_of_one_session(a: &LoginGroup, b: &LoginGroup) -> bool {
+    let hosts = |group: &LoginGroup| -> BTreeSet<String> {
+        group
+            .cookies
+            .iter()
+            .map(|entry| entry.host.clone())
+            .collect()
+    };
+    if !hosts(a).is_disjoint(&hosts(b)) {
+        return false;
+    }
+    let cookie_names = |group: &LoginGroup| -> BTreeSet<String> {
+        group
+            .cookies
+            .iter()
+            .flat_map(|entry| {
+                parse_cookie_header(&entry.cookie)
+                    .into_iter()
+                    .map(|(name, _)| name)
+            })
+            .collect()
+    };
+    let a_names = cookie_names(a);
+    !a_names.is_empty() && a_names.is_disjoint(&cookie_names(b))
+}
+
 impl LoginGroup {
     /// Fold the hosts of the same site into one login.
     ///
@@ -300,7 +380,54 @@ impl LoginGroup {
                 None => merged.push(group),
             }
         }
-        merged
+        // 1 回の取得が複数のログインに分かれていたものを戻す。
+        Self::fold_session_fragments(merged, site)
+    }
+
+    /// Fold logins that are fragments of one browser session.
+    ///
+    /// A previous build wrote one entry per host, so a single capture arrived
+    /// as several logins: their host sets are disjoint and no cookie name
+    /// collides. Those are one session — the browser sends every host's
+    /// cookies together — so they are merged into the first of them.
+    pub fn fold_session_fragments(groups: Vec<LoginGroup>, site: &str) -> Vec<LoginGroup> {
+        let mut folded: Vec<LoginGroup> = Vec::new();
+        for group in groups {
+            let mut group = group;
+            group.site = site.to_string();
+            group.cookies.retain(|entry| !entry.cookie.trim().is_empty());
+            if group.cookies.is_empty() {
+                continue;
+            }
+            match folded
+                .iter_mut()
+                .find(|existing| fragments_of_one_session(existing, &group))
+            {
+                Some(existing) => {
+                    for entry in group.cookies {
+                        match existing
+                            .cookies
+                            .iter_mut()
+                            .find(|current| current.host == entry.host)
+                        {
+                            Some(current) => current.cookie = entry.cookie,
+                            None => existing.cookies.push(entry),
+                        }
+                    }
+                    if existing.label.is_none() {
+                        existing.label = group.label;
+                    }
+                    if existing.id.is_empty() {
+                        existing.id = group.id;
+                    }
+                    if existing.added_at.is_none() {
+                        existing.added_at = group.added_at;
+                    }
+                }
+                None => folded.push(group),
+            }
+        }
+        folded
     }
 }
 

@@ -11,7 +11,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::error::NarouError;
-use crate::login::parse_export;
+use crate::login::{apply_import_name, parse_export};
 use crate::native::cookie_store::InventoryCookieStore;
 use crate::platform::{LoginGroup, normalize_cookie_host, parse_cookie_header};
 
@@ -28,6 +28,9 @@ pub struct LoginImportRequest {
     /// Drop sites that are not part of the import.
     #[serde(default)]
     pub replace: bool,
+    /// Name the logins this file brings in ("本垢", "サブ垢", …).
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// `POST /api/login/rename` — name one stored login.
@@ -69,10 +72,13 @@ pub async fn login_import(
     {
         return Json(serde_json::json!({ "success": false, "message": message }));
     }
-    let sites = match parse_export(&body.envelope, body.passphrase.as_deref()) {
+    let mut sites = match parse_export(&body.envelope, body.passphrase.as_deref()) {
         Ok(sites) => sites,
         Err(error) => return Json(failure(error)),
     };
+    if let Some(name) = body.name.as_deref() {
+        apply_import_name(&mut sites, name);
+    }
     let logins: usize = sites.values().map(Vec::len).sum();
     if logins == 0 {
         return Json(serde_json::json!({

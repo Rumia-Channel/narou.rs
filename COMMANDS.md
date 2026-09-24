@@ -272,7 +272,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 | サブコマンド | 内容 |
 |---|---|
 | `list` | サイトごとにログインを番号・名前・短縮 ID・ホスト数つきで表示 (Cookie 値は `name=…` に伏せる) |
-| `import <file> [--passphrase P] [--replace]` | `narou_rs_login --export` の書き出しファイル (YAML) を取り込む。`--replace` で取り込みに含まれないサイトを削除 |
+| `import <file> [--passphrase P] [--replace] [--name N]` | `narou_rs_login --export` の書き出しファイル (YAML) を取り込む。`--name` でそのファイルが持ち込むログインに名前を付ける (`本垢` など)。`--replace` で取り込みに含まれないサイトを削除 |
 | `export <file> [--passphrase P] [--clear-text]` | 保存済み情報を書き出しファイルへ出力。`--passphrase` 指定時は Argon2id→XChaCha20-Poly1305 で暗号化 |
 | `rename <site> <番号> <名前>` | ログインに名前を付ける (`""` で名前を消す)。番号は `list` の 1 始まり |
 | `order <site> 2,1,3` | 現在の位置 (1 始まり) を新しい試行順に並べ替える。件数・重複は検証 |
@@ -282,7 +282,9 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 
 **保存形式**: `login_cookie` inventory (SQLite `app_state` / `.narou/login_cookie.yaml`) に、**1 サイト = 順序つきログイン配列** (`LoginGroup { id, site, label, cookies: [{ host, cookie }], added_at }` の JSON 配列) を `enc:v1:<nonce>:<payload>` として暗号化保存。並び順がそのまま試行順になる。鍵は `.narou/login.key` (初回作成、Unix では 0600) または `NAROU_RS_LOGIN_KEY` (base64)。在庫のキー (サイト名) を AEAD の associated data に束ねるため別サイトへの流用は不可。旧形式の平文値はそのまま読め (ホスト名で束ねた旧暗号文も可)、次回保存時にサイト単位の新形式へ移行する。
 
-**1 ログイン = 複数ホスト**: ブラウザのセッションは `pixiv.net` と `www.pixiv.net` のように複数ホストにまたがるため、取得側はサイトのドメインファミリーを 1 つのログインにまとめて保存する。送信時は `merged_cookie()` が各ホストの Cookie を 1 本の `Cookie:` ヘッダに畳み、名前が衝突したときは具体的なホストを優先する。まとめ先のサイト名はサイト定義 (`webnovel/*.yaml`) のドメインで決め、定義が無ければホストをそのまま使う。旧形式 (版 1 の host→cookie、版 2 のホスト→資格情報リスト) は読み取り可能で、版 2 は「同じ位置 = 同じアカウント」として 1 ログインに畳み直す。
+**1 ログイン = 複数ホスト (取り込んだ 1 ファイル = 1 ログイン)**: ブラウザのセッションは `pixiv.net` と `www.pixiv.net` のように複数ホストにまたがるため、取得側はサイトのドメインファミリーを 1 つのログインにまとめて保存する。送信時は `merged_cookie()` が各ホストの Cookie を 1 本の `Cookie:` ヘッダに畳み、名前が衝突したときは具体的なホストを優先する。まとめ先のサイト名はサイト定義 (`webnovel/*.yaml`) のドメインで決め、定義が無ければホストを使う (親ドメインのキーは配下の定義があればそこへ寄せる)。
+
+旧形式 (版 1 の host→cookie、版 2 のホストごとの一覧) は読み取り時に**ホストごとに並べ直してから 1 ログインへ畳み直す**ので、1 ファイル = 1 セッションのまま入る (版 2 の同じ位置は同じアカウント)。過去にホストごとに分解されたまま保存されたデータも、読み込み時に「ホストが重ならず Cookie 名も衝突しない」ログイン同士を 1 つに畳んで書き戻す。
 
 **セッション ID**: 各ログインに UUID を振り（保存値に含める）、小説レコードは `requires_login` に加えて `login_session`（成功したログインの ID）を持つ。フラグ付きの小説は次回以降その ID のログインを最初のリクエストから送るため、一覧の総当たりをしない。ID の無い旧データはストア読み込み時に採番・保存される。
 
@@ -290,7 +292,7 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 
 **書き出し形式**: `version`/`exported_at`/`library`/`encrypted`/`kdf`/`salt`/`payload`/`sites` を持つ YAML エンベロープ (version 3)。`narou_rs_login --export <file>` が生成し、ライブラリ外ではそれが既定の出力になる。version 2 (`credentials:` にホストごとの 1 本) と version 1 (`cookies:` のホスト→Cookie マップ) も読み取り可能。
 
-**Web UI**: 設定ページ「ログイン」タブで一覧 (サイト → 名前つきログイン)・取り込み・名前変更・並べ替え (上下ボタン)・1 件削除・サイト削除・全削除。取り込みはファイル選択 (FileReader) と貼り付けの両方に対応。API: `GET /api/login`、`POST /api/login/import`、`POST /api/login/rename`、`POST /api/login/order`、`DELETE /api/login`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}`。
+**Web UI**: 設定ページ「ログイン」タブで一覧 (サイト → 名前つきログイン)・取り込み (名前欄つき。空欄ならファイル名を使用)・名前変更・並べ替え (上下ボタン)・1 件削除・サイト削除・全削除。取り込みはファイル選択 (FileReader) と貼り付けの両方に対応。API: `GET /api/login`、`POST /api/login/import`、`POST /api/login/rename`、`POST /api/login/order`、`DELETE /api/login`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}`。
 
 ---
 

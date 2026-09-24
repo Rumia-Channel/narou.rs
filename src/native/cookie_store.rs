@@ -102,13 +102,17 @@ impl InventoryCookieStore {
             stored.entry(site).or_default().extend(folded);
         }
         // 同じサイトのログインが複数のキーから来たら 1 つに畳む。
-        let mut stored: BTreeMap<String, Vec<LoginGroup>> = stored
-            .into_iter()
-            .map(|(site, groups)| {
-                let groups = LoginGroup::merge_by_site(groups, &site);
-                (site, groups)
-            })
-            .collect();
+        let mut tidied: BTreeMap<String, Vec<LoginGroup>> = BTreeMap::new();
+        for (site, groups) in stored {
+            let before = groups.len();
+            let groups = LoginGroup::merge_by_site(groups, &site);
+            if groups.len() != before {
+                // 断片が 1 ログインにまとまった分は書き戻す。
+                needs_rekey = true;
+            }
+            tidied.insert(site, groups);
+        }
+        let mut stored = tidied;
         if assign_group_ids(&mut stored) {
             needs_rekey = true;
         }
@@ -242,28 +246,7 @@ impl InventoryCookieStore {
 /// resolved through the site definitions (falling back to the registrable
 /// domain, which is enough to fold `www.pixiv.net` and `pixiv.net` together).
 fn site_for_key(key: &str) -> String {
-    let key = key.trim().to_ascii_lowercase();
-    if let Ok(settings) = crate::downloader::site_setting::SiteSetting::load_all()
-        && let Some(setting) = settings.iter().find(|setting| {
-            let domain = setting.domain.to_ascii_lowercase();
-            // 上位ドメインのキー (`pixiv.net`) は、その配下の定義
-            // (`www.pixiv.net`) に属する Cookie が混ざっている。
-            domain == key
-                || key.ends_with(&format!(".{domain}"))
-                || domain.ends_with(&format!(".{key}"))
-                || crate::platform::cookie_host_for_url(&setting.top_url())
-                    .is_some_and(|host| host == key || key.ends_with(&format!(".{host}")))
-        })
-    {
-        return setting.domain.to_ascii_lowercase();
-    }
-    // Fall back to the last two labels so hosts of one site stay together.
-    let labels: Vec<&str> = key.split('.').collect();
-    if labels.len() > 2 {
-        labels[labels.len() - 2..].join(".")
-    } else {
-        key
-    }
+    crate::platform::site_for_host(key)
 }
 
 /// Give every login an id, returning whether anything changed.
@@ -463,6 +446,45 @@ mod tests {
         assert_eq!(loaded[0].merged_cookie(), "yuid_b=1; PHPSESSID=abc");
         // 親ドメインのキーは残らない。
         assert!(store.groups_for("pixiv.net").unwrap().is_empty());
+    }
+
+    #[test]
+    fn per_host_fragments_fold_into_one_login() {
+        let _legacy = legacy_yaml_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = set_current_dir_for_test(temp.path());
+        let store = store_in(&temp);
+
+        // 版 2 の取り込みでホストごとに分かれていた 1 セッション。
+        store
+            .save_groups_for(
+                "www.pixiv.net",
+                &[
+                    group("www.pixiv.net", &[("pixiv.net", "PHPSESSID=abc")]),
+                    group("www.pixiv.net", &[("www.pixiv.net", "yuid_b=1")]),
+                    group("www.pixiv.net", &[("accounts.pixiv.net", "p_ab_id=2")]),
+                ],
+            )
+            .unwrap();
+
+        let loaded = store.groups_for("www.pixiv.net").unwrap();
+        assert_eq!(loaded.len(), 1, "1 セッション: {loaded:?}");
+        assert_eq!(loaded[0].cookies.len(), 3);
+        assert_eq!(loaded[0].merged_cookie(), "yuid_b=1; p_ab_id=2; PHPSESSID=abc");
+        assert!(loaded[0].id.is_empty() == false, "識別子はどれか 1 つを引き継ぐ");
+
+        // 別アカウントは名前が衝突するので畳まない。
+        store
+            .save_groups_for(
+                "www.pixiv.net",
+                &[
+                    group("www.pixiv.net", &[("www.pixiv.net", "PHPSESSID=main")]),
+                    group("www.pixiv.net", &[("pixiv.net", "PHPSESSID=alt")]),
+                ],
+            )
+            .unwrap();
+        let loaded = store.groups_for("www.pixiv.net").unwrap();
+        assert_eq!(loaded.len(), 2, "別アカウントは分けたまま: {loaded:?}");
     }
 
     #[test]

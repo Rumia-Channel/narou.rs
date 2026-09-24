@@ -26,6 +26,9 @@ pub enum LoginAction {
         /// Replace every stored site instead of merging.
         #[arg(long, default_value_t = false)]
         replace: bool,
+        /// Name the logins this file brings in ("本垢", "サブ垢", …).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
     },
     /// Write the stored logins to an export file.
     Export {
@@ -73,7 +76,8 @@ pub fn cmd_login(action: LoginAction) -> Result<()> {
             file,
             passphrase,
             replace,
-        } => import(&store, &file, passphrase.as_deref(), replace),
+            name,
+        } => import(&store, &file, passphrase.as_deref(), replace, name.as_deref()),
         LoginAction::Export {
             file,
             passphrase,
@@ -123,9 +127,13 @@ fn import(
     file: &str,
     passphrase: Option<&str>,
     replace: bool,
+    name: Option<&str>,
 ) -> Result<()> {
     let text = read_file(file)?;
-    let sites = parse_export(&text, passphrase)?;
+    let mut sites = parse_export(&text, passphrase)?;
+    if let Some(name) = name {
+        narou_rs::login::apply_import_name(&mut sites, name);
+    }
     if sites.is_empty() {
         println!("{file} にログイン情報が含まれていません。");
         return Ok(());
@@ -360,8 +368,8 @@ mod tests {
         .unwrap();
         std::fs::write(&file, exported).unwrap();
 
-        assert!(import(&store, &file, Some("wrong"), false).is_err());
-        import(&store, &file, Some("hunter2"), false).unwrap();
+        assert!(import(&store, &file, Some("wrong"), false, None).is_err());
+        import(&store, &file, Some("hunter2"), false, None).unwrap();
         let stored = store.groups_for("example.com").unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].cookies[0].cookie, "sid=abc");
@@ -424,6 +432,30 @@ mod tests {
 
         clear(&store, Some("www.pixiv.net"), Some(1)).unwrap();
         assert!(store.groups_for("www.pixiv.net").unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_applies_the_name_it_was_given() {
+        let _legacy = legacy_yaml_guard();
+        let (temp, _guard, store) = library();
+
+        // 1 回の取得がホストごとに分かれた版 2 のファイル。
+        let file = temp.path().join("capture.yaml");
+        std::fs::write(
+            &file,
+            "version: 2\nexported_at: 2026-09-24T00:00:00+09:00\nencrypted: false\n\
+             credentials:\n- host: pixiv.net\n  cookie: PHPSESSID=abc\n\
+             - host: www.pixiv.net\n  cookie: yuid_b=1\n",
+        )
+        .unwrap();
+        let file = file.to_string_lossy().into_owned();
+
+        import(&store, &file, None, false, Some("本垢")).unwrap();
+        let stored = store.groups_for("www.pixiv.net").unwrap();
+        assert_eq!(stored.len(), 1, "1 ファイル = 1 ログイン: {stored:?}");
+        assert_eq!(stored[0].display_name(), "本垢");
+        assert_eq!(stored[0].cookies.len(), 2, "ホストは分かれたまま 1 本にまとまる");
+        assert_eq!(stored[0].merged_cookie(), "yuid_b=1; PHPSESSID=abc");
     }
 
     #[test]

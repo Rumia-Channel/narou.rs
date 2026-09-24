@@ -229,6 +229,9 @@
       '<input type="file" class="login-envelope-file" id="login-envelope-file" accept=".yaml,.yml,.txt,.json">' +
       '<span class="login-file-name" id="login-file-name"></span>' +
       '</div>' +
+      '<div class="login-form">' +
+      '<input type="text" class="setting-input" id="login-import-name" placeholder="名前 (例: 本垢 / サブ垢。空ならファイルの名前を使います)">' +
+      '</div>' +
       '<textarea class="replace-textarea login-envelope" id="login-envelope" placeholder="version: 1&#10;encrypted: true&#10;…"></textarea>' +
       '<div class="login-form">' +
       '<input type="password" class="setting-input" id="login-passphrase" placeholder="パスフレーズ (暗号化されている場合)">' +
@@ -308,6 +311,17 @@
     if (clearAll) clearAll.addEventListener('click', clearAllLogin);
     if (importBtn) importBtn.addEventListener('click', importLoginEnvelope);
     if (envelopeFile) envelopeFile.addEventListener('change', readLoginEnvelopeFile);
+  }
+
+  /// The name to give what an import brings in: what the user typed, or the
+  /// file's own name (minus its extension) when they left it empty.
+  function importName() {
+    const input = document.getElementById('login-import-name');
+    const typed = input && input.value.trim();
+    if (typed) return typed;
+    const file = document.getElementById('login-envelope-file');
+    const name = file && file.files && file.files[0] ? file.files[0].name : '';
+    return name.replace(/\.[^.]*$/, '');
   }
 
   function readLoginEnvelopeFile() {
@@ -414,6 +428,7 @@
           envelope: envelope.value,
           passphrase: passphrase ? passphrase.value || null : null,
           replace: !!(replace && replace.checked),
+          name: importName() || null,
         }),
       });
       const result = await resp.json();
@@ -425,6 +440,8 @@
       const fileName = document.getElementById('login-file-name');
       if (fileInput) fileInput.value = '';
       if (fileName) fileName.textContent = '';
+      const nameInput = document.getElementById('login-import-name');
+      if (nameInput) nameInput.value = '';
       refreshLoginHosts(result.data);
     } catch (e) {
       showToast(e.message, 'error');
