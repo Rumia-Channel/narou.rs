@@ -85,8 +85,8 @@ preprocess: |-
     end
   end
   # 単体イラスト・漫画。空のときは [] で返るので、配列になっているときは触らない。
-  # キーの並びは JSON のオブジェクト順 (id の文字列昇順) で、narou_bridge の
-  # sorted() と同じ。取り込み順 = narou の ID 順になる。
+  # DSL のオブジェクトはキー昇順なので id の文字列昇順に並ぶ (narou_bridge の
+  # sorted() と同じ)。取り込み順 = narou の ID 順になる。
   if !body.illusts.is_array
     for illust_id in body.illusts.keys
       emit "author_novel::https://www.pixiv.net/artworks/${illust_id}"
