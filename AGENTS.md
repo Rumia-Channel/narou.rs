@@ -348,7 +348,7 @@ sample/
 - **self-update の Unix デタッチ** (D): Linux/macOS で self-update 中も本体が生存できるよう、updater を `setsid` で切り離して起動
 - **self-update の variant 選択** (2026-09): 0.4.0 以下からの更新時は Web UI が GPL版(Lite組込み)/通常版 の選択モーダルを表示し、選択を `self-update.variant` (global) へ保存する。以後の更新は保存値→ビルド variant の順で解決。GPL版は `narou_rs_*-GPL.zip` を取得する
 - **ruby タグ除去** (I-4): サブタイトルとファイル名からルビ注記（`《…》` 形式）を除去し、Ruby版と表示を揃える
-- **小説単位の queue lane 跨ぎ exclusion** (C): 同じ小説が primary / secondary lane の両方で同時に走らないよう、novel 単位の排他を queue worker に追加
+- **小説単位の queue lane 跨ぎ exclusion** (C): 同じ小説が primary / secondary lane の両方で同時に走らないよう、novel 単位の排他を queue worker に追加。判定は**実行中の子プロセスが今まさに触っている小説**（`.narou/lock.yaml`、`NovelLockGuard`。convert / download / update が取得し、終了で消える。30 分を超えた残骸は無視）で行うので、全作品更新の最中でも別の小説の変換は並行できる（当初は「対象一覧」で判定していたため、全作品更新の間はどの変換も待機になっていた）
 
 ### 変換互換性
 - **なろう**: narou.rb参照データと完全互換確認済み

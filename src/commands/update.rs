@@ -1747,7 +1747,12 @@ async fn process_novel_for_update(
 
     let mut new_mistook = 0usize;
 
-    match downloader.download_novel(&id.to_string()).await {
+    // ダウンロード中はこの小説をロックする (別レーンの変換と同時に触らない)。
+    let download_result = {
+        let _lock = narou_rs::compat::NovelLockGuard::acquire(Some(id));
+        downloader.download_novel(&id.to_string()).await
+    };
+    match download_result {
         Ok(dl) => {
             print_status_messages(&dl);
 

@@ -120,7 +120,16 @@ async fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, D
             };
             downloader.set_progress(progress);
 
-            match downloader.download_novel_with_force(&download_target, opts.force).await {
+            // 数値 ID が分かっているときはダウンロード中ロックする
+            // (別レーンの変換と同時に触らない)。
+            let locked_id = download_target.trim().parse::<i64>().ok();
+            let download_result = {
+                let _lock = narou_rs::compat::NovelLockGuard::acquire(locked_id);
+                downloader
+                    .download_novel_with_force(&download_target, opts.force)
+                    .await
+            };
+            match download_result {
                 Ok(dl) => {
                     print_download_status(&dl);
 

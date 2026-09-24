@@ -393,6 +393,37 @@ pub fn load_locked_ids_from_inventory(inventory: &Inventory) -> Result<HashSet<i
     Ok(locked.into_keys().collect())
 }
 
+/// Novels a running child says it is working on right now.
+///
+/// `lock.yaml` is written by the child that owns a novel (`convert`,
+/// `download`, `update`) and cleared when it finishes. Entries older than
+/// `max_age` are ignored so a killed child cannot block a novel forever.
+pub fn load_active_locked_ids(max_age: std::time::Duration) -> Result<HashSet<i64>> {
+    let inventory = Inventory::with_default_root()?;
+    let locked: HashMap<i64, serde_yaml::Value> = inventory.load("lock", InventoryScope::Local)?;
+    let now = chrono::Local::now();
+    Ok(locked
+        .into_iter()
+        .filter(|(_, value)| lock_is_fresh(value, now, max_age))
+        .map(|(id, _)| id)
+        .collect())
+}
+
+/// A lock value is `%Y-%m-%d %H:%M:%S%.9f %:z` in local time. Unparseable or
+/// future values count as fresh (a clock change must not unlock a novel).
+fn lock_is_fresh(value: &serde_yaml::Value, now: chrono::DateTime<chrono::Local>, max_age: std::time::Duration) -> bool {
+    let Some(text) = value.as_str() else {
+        return true;
+    };
+    let Ok(when) = chrono::DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.9f %:z") else {
+        return true;
+    };
+    match now.signed_duration_since(when.with_timezone(&chrono::Local)).to_std() {
+        Ok(age) => age <= max_age,
+        Err(_) => true,
+    }
+}
+
 pub struct NovelLockGuard {
     inventory: Option<Inventory>,
     id: Option<i64>,
