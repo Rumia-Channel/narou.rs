@@ -59,6 +59,16 @@ pub struct SiteSetting {
     /// (`\k<top_url>/\k<ncode>/`).
     #[serde(default)]
     pub author_work_url: Option<String>,
+    /// URL of one series' episode list, for author listings that mix the
+    /// episodes of a series in with standalone works (Pixiv).
+    ///
+    /// `\k<series_id>` plus whatever `author_url` captured can be used.
+    #[serde(default)]
+    pub author_series_episodes_url: Option<String>,
+    /// Pattern over that episode list yielding `novel_id` (or `ncode`), so the
+    /// episodes can be kept out of the author's work list.
+    #[serde(default)]
+    pub author_series_episodes_pattern: Option<String>,
     /// Pattern whose `author_next` capture is the next page of an author
     /// listing (ハーメルン pages its works). Followed until a page has no next
     /// link or points at one already visited — the visited set is what keeps a
@@ -185,6 +195,8 @@ pub struct SiteSetting {
     #[serde(skip)]
     pub(super) compiled_author_next: Option<Regex>,
     #[serde(skip)]
+    pub(super) compiled_author_series_episodes: Option<Regex>,
+    #[serde(skip)]
     pub(super) compiled_subtitles: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_body: Option<Regex>,
@@ -258,6 +270,11 @@ pub enum SiteSettingEntry {
     Eval { eval: String },
 }
 
+/// Preprocess marker carrying one work URL of an author listing.
+const AUTHOR_NOVEL_MARKER: &str = "author_novel::";
+/// Preprocess marker carrying a series whose episodes must be left out.
+const AUTHOR_SERIES_MARKER: &str = "author_series::";
+
 impl SiteSetting {
     pub fn load_all() -> Result<Vec<Self>> {
         let mut load_dirs = Vec::new();
@@ -324,6 +341,10 @@ impl SiteSetting {
             .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
         self.compiled_author_next = self
             .author_next_pattern
+            .as_deref()
+            .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
+        self.compiled_author_series_episodes = self
+            .author_series_episodes_pattern
             .as_deref()
             .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
         self.compiled_subtitles = self.subtitles.as_ref().and_then(|v| self.compile_value(v));
@@ -454,6 +475,52 @@ impl SiteSetting {
     }
 
     /// Next page of an author listing, when the definition pages it.
+    /// Series the listing asked to check (`author_series::<id>` lines).
+    ///
+    /// Pixiv mixes the episodes of a series into the author's novel list; the
+    /// definition emits the series so those episodes can be left out.
+    pub fn author_series_ids(&self, source: &str) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for line in source.lines() {
+            if let Some(id) = line.trim().strip_prefix(AUTHOR_SERIES_MARKER) {
+                let id = id.trim().to_string();
+                if !id.is_empty() && !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
+    /// URL of one series' episode list, for keeping its episodes out of the
+    /// author listing. `captures` come from `author_url`.
+    pub fn author_series_episodes_fetch_url(
+        &self,
+        captures: &HashMap<String, String>,
+        series_id: &str,
+    ) -> Option<String> {
+        let template = self.author_series_episodes_url.as_deref()?;
+        let mut named = captures.clone();
+        named.insert("series_id".to_string(), series_id.to_string());
+        Some(self.interpolate_with_captures(template, &named))
+    }
+
+    /// Episode ids found in a series' episode list.
+    pub fn author_series_episode_ids(&self, source: &str) -> Vec<String> {
+        let Some(pattern) = self.compiled_author_series_episodes.as_ref() else {
+            return Vec::new();
+        };
+        pattern
+            .captures_iter(source)
+            .filter_map(|captures| {
+                captures
+                    .name("novel_id")
+                    .or_else(|| captures.name("ncode"))
+                    .map(|matched| matched.as_str().to_string())
+            })
+            .collect()
+    }
+
     pub fn author_next_url(&self, source: &str) -> Option<String> {
         let pattern = self.compiled_author_next.as_ref()?;
         let captures = pattern.captures(source)?;
@@ -473,8 +540,26 @@ impl SiteSetting {
     /// 定義が無ければ None。`novel_url` を capture しない定義では
     /// `author_work_url` に capture を流し込んで URL を作る。
     pub fn author_novel_urls(&self, source: &str) -> Option<Vec<String>> {
-        let pattern = self.compiled_author_novel.as_ref()?;
+        // `preprocess:` の DSL が `author_novel::<url>` を出すサイト (Pixiv) は
+        // パターン無しでも作品を列挙できる。列挙する口 (API + DSL) が
+        // 定義されていなければ「対応していない」と答える。
+        let declared = self.compiled_author_novel.is_some()
+            || (self.author_api_url.is_some() && self.preprocess_pipeline().is_some());
+        if !declared {
+            return None;
+        }
         let mut urls: Vec<String> = Vec::new();
+        for line in source.lines() {
+            if let Some(url) = line.trim().strip_prefix(AUTHOR_NOVEL_MARKER) {
+                let url = crate::downloader::util::decode_html_text(url.trim());
+                if !url.is_empty() && !urls.contains(&url) {
+                    urls.push(url);
+                }
+            }
+        }
+        let Some(pattern) = self.compiled_author_novel.as_ref() else {
+            return Some(urls);
+        };
         for captures in pattern.captures_iter(source) {
             let named: HashMap<String, String> = pattern
                 .capture_names()

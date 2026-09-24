@@ -667,6 +667,9 @@ impl Downloader {
         // Sites with an author API (なろう) answer with JSON instead of HTML.
         let mut fetch_url = setting.author_fetch_url(page_url);
         let mut urls: Vec<String> = Vec::new();
+        // Pixiv は 1 話ずつが作者の作品一覧に混ざる。定義が出す
+        // `author_series::<id>` を集めておき、その回の話を後で除く。
+        let mut series: Vec<String> = Vec::new();
         let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
         // 一覧がページ分けされているサイト (ハーメルン) は次ページを辿る。
         // 次ページが無くなるか、既に訪れた URL に戻ったら終わり。訪問済みを
@@ -675,7 +678,7 @@ impl Downloader {
             if !visited.insert(fetch_url.clone()) {
                 break;
             }
-            let body = crate::downloader::http_policy::fetch_text(
+            let mut body = crate::downloader::http_policy::fetch_text(
                 self.http.as_ref(),
                 self.rate_limiter.as_ref(),
                 &fetch_url,
@@ -683,9 +686,21 @@ impl Downloader {
                 Some(setting.encoding()),
             )
             .await?;
+            // `preprocess:` の DSL が `author_novel::` / `author_series::` を
+            // 出せるように、本文を定義に通してから読み取る。
+            crate::downloader::util::pretreatment_source(
+                &mut body,
+                setting.encoding(),
+                Some(setting),
+            );
             for url in setting.author_novel_urls(&body).unwrap_or_default() {
                 if !urls.contains(&url) {
                     urls.push(url);
+                }
+            }
+            for id in setting.author_series_ids(&body) {
+                if !series.contains(&id) {
+                    series.push(id);
                 }
             }
             match setting.author_next_url(&body) {
@@ -693,7 +708,55 @@ impl Downloader {
                 None => break,
             }
         }
+        // シリーズの 1 話は作者の作品ではないので落とす (取得できなければ
+        // そのまま返す: 一覧の取りこぼしより、余分に足さない方が害が小さい)。
+        if !series.is_empty()
+            && setting.author_series_episodes_url.is_some()
+            && let Ok(episodes) = self.author_series_episodes(setting, page_url, &series).await
+            && !episodes.is_empty()
+        {
+            urls.retain(|url| !episodes.iter().any(|id| url_mentions_id(url, id)));
+        }
         Ok(urls)
+    }
+
+    /// Episode ids of the given series, fetched through the definition.
+    ///
+    /// Best effort: a series that cannot be read contributes nothing, so its
+    /// episodes stay in the listing instead of silently vanishing.
+    async fn author_series_episodes(
+        &self,
+        setting: &SiteSetting,
+        page_url: &str,
+        series: &[String],
+    ) -> Result<Vec<String>> {
+        let captures = setting
+            .extract_author_url_captures(page_url)
+            .unwrap_or_default();
+        let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
+        let mut episodes: Vec<String> = Vec::new();
+        for series_id in series {
+            let Some(url) = setting.author_series_episodes_fetch_url(&captures, series_id) else {
+                continue;
+            };
+            let Ok(body) = crate::downloader::http_policy::fetch_text(
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
+                &url,
+                &policy,
+                Some(setting.encoding()),
+            )
+            .await
+            else {
+                continue;
+            };
+            for id in setting.author_series_episode_ids(&body) {
+                if !episodes.contains(&id) {
+                    episodes.push(id);
+                }
+            }
+        }
+        Ok(episodes)
     }
 
     /// [`Self::with_platform_and_storage_and_settings`] with bundled values.
@@ -2656,6 +2719,17 @@ fn apply_login_cookie(setting: &mut SiteSetting, login_cookie: &str) {
 /// マイピク restricts some to mutual followers), so the marker disappearing is
 /// not the only success: collecting more sections also counts. A retry that
 /// changes nothing keeps the earlier result.
+/// Whether a work URL names the given id (`?id=123`, `/123/`, …).
+///
+/// Ids are compared as whole tokens so `123` never matches `1234`.
+fn url_mentions_id(url: &str, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    url.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == id)
+}
+
 fn is_improved_toc(
     setting: &SiteSetting,
     before: std::result::Result<&String, &NarouError>,
@@ -2703,6 +2777,7 @@ fn should_retry_with_login(setting: &SiteSetting, toc_source: &Result<String>) -
 #[cfg(test)]
 mod tests {
     use super::novel_info::NovelInfo;
+    use super::url_mentions_id;
     use super::persistence::PersistenceService;
     use super::site_setting::{SiteSetting, SiteSettingValue};
     use super::types::{SectionElement, TocFile};
@@ -3604,6 +3679,38 @@ is_narou: false
                 "https://ncode.syosetu.com/n6275mr/".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn pixiv_author_listing_yields_novels_and_series() {
+        // 作者ページの作品一覧 (/ajax/user/{id}/profile/all) を preprocess に通すと、
+        // 単体小説と小説シリーズが作品として並ぶ。
+        let json = r#"{"error":false,"message":"","body":{"novels":{"2594847":null,"2610142":null},
+            "novelSeries":[{"id":"272850","userId":"1"},{"id":"551006","userId":"1"}]}}"#;
+        let html = run_pixiv_preprocess(json);
+
+        assert!(html.contains("author_novel::https://www.pixiv.net/novel/show.php?id=2594847"));
+        assert!(html.contains("author_novel::https://www.pixiv.net/novel/show.php?id=2610142"));
+        assert!(html.contains("author_novel::https://www.pixiv.net/novel/series/272850"));
+        assert!(html.contains("author_novel::https://www.pixiv.net/novel/series/551006"));
+
+        let setting = pixiv_setting();
+        let urls = setting.author_novel_urls(&html).expect("Pixiv lists works");
+        assert_eq!(urls.len(), 4, "got {urls:?}");
+        assert_eq!(setting.author_series_ids(&html), vec!["272850", "551006"]);
+
+        // シリーズの 1 話は content_titles から取り出して作品一覧から除く。
+        let episodes = setting
+            .author_series_episode_ids(r#"{"body":[{"id":"2594847","title":"x","available":true}]}"#);
+        assert_eq!(episodes, vec!["2594847"]);
+        assert!(url_mentions_id(
+            "https://www.pixiv.net/novel/show.php?id=2594847",
+            "2594847"
+        ));
+        assert!(!url_mentions_id(
+            "https://www.pixiv.net/novel/show.php?id=25948471",
+            "2594847"
+        ));
     }
 
     #[test]

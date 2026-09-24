@@ -426,6 +426,19 @@ fn eval_method(ctx: &mut Ctx, val: Value, method: &Method) -> PreprocessResult<V
             Value::Null => Value::Bool(true),
             _ => Value::Bool(false),
         },
+        Method::Keys => match &val {
+            Value::Object(map) => Value::Array(
+                map.keys()
+                    .map(|key| Value::String(key.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+            Value::Array(items) => Value::Array(
+                (0..items.len())
+                    .map(|index| Value::String(index.to_string()))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => Value::Array(Vec::new()),
+        },
         Method::Size => match &val {
             Value::String(s) => Value::Number(s.chars().count().into()),
             Value::Array(a) => Value::Number(a.len().into()),

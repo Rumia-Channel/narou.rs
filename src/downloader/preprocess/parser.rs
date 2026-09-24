@@ -406,6 +406,7 @@ fn build_method(pair: pest::iterators::Pair<Rule>) -> Method {
             let to = build_string_parts(inner.next().unwrap());
             Method::Replace(from, to)
         }
+        ".keys" => Method::Keys,
         ".is_array" => Method::IsArray,
         ".empty" => Method::Empty,
         ".size" => Method::Size,

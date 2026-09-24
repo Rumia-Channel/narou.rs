@@ -28,6 +28,16 @@ url:
   - https?://\\k<domain>/ajax/novel/(?<work_id>\d+)
 encoding: UTF-8
 timezone: Asia/Tokyo
+# ------------------------------------------------------------
+# 作者追跡設定 (作者ページ = ユーザーページ)。`narou author add` で登録する。
+# 作品一覧は /ajax/user/{id}/profile/all の JSON から preprocess で組み立てる
+# (小説シリーズ + 単体小説)。シリーズの 1 話は作品ではないため、作品一覧に
+# 混ざる分を content_titles で除く。
+author_url: ^https?://\k<domain>/users/(?<user_id>\d+)
+author_api_url: \k<top_url>/ajax/user/\k<user_id>/profile/all
+author_series_episodes_url: \k<top_url>/ajax/novel/series/\k<series_id>/content_titles
+author_series_episodes_pattern: '"id":"(?<novel_id>\d+)"'
+
 headers:
   Referer: \k<top_url>/
 confirm_over18: no
@@ -49,6 +59,18 @@ preprocess: |-
 
   emit "<!---"
   emit "PixivPreprocessEvalMagicWord"
+
+  # 作者ページの作品一覧。単体小説と小説シリーズを作品として出し、シリーズの
+  # 1 話が混ざっていたら narou 側が author_series を見て取り除く。
+  if body.novels && body.novelSeries
+    for novel_id in body.novels.keys
+      emit "author_novel::https://www.pixiv.net/novel/show.php?id=${novel_id}"
+    end
+    for series in body.novelSeries
+      emit "author_novel::https://www.pixiv.net/novel/series/${series.id}"
+      emit "author_series::${series.id}"
+    end
+  end
 
   if body.page && body.page.series
     # 漫画シリーズの目次ページ (/ajax/series/{id}?p=N)。一覧は 12 件ずつ order の

@@ -322,12 +322,55 @@ mod tests {
     #[test]
     fn definitions_without_the_pattern_report_nothing() {
         let settings = SiteSetting::load_all().expect("site definitions");
-        // 作者ページを持たない定義 (pixiv) は何も返さない。
+        // 作者ページを持たない定義は何も返さない。
+        let setting = settings
+            .iter()
+            .find(|setting| setting.domain == "www.akatsuki-novels.com")
+            .expect("暁 定義");
+        assert_eq!(setting.author_novel_urls("<a href=x>"), None);
+        assert!(!setting.matches_author_url("https://www.akatsuki-novels.com/users/1"));
+    }
+
+    #[test]
+    fn pixiv_author_pages_list_novels_and_series() {
+        let settings = SiteSetting::load_all().expect("site definitions");
         let setting = settings
             .iter()
             .find(|setting| setting.domain == "www.pixiv.net")
             .expect("pixiv 定義");
-        assert_eq!(setting.author_novel_urls("<a href=x>"), None);
-        assert!(!setting.matches_author_url("https://www.pixiv.net/users/742462"));
+        let page = "https://www.pixiv.net/users/6519870";
+        assert!(setting.matches_author_url(page));
+        assert_eq!(
+            setting.author_fetch_url(page),
+            "https://www.pixiv.net/ajax/user/6519870/profile/all"
+        );
+
+        // preprocess が出す目印から作品を読む。
+        let source = concat!(
+            "author_novel::https://www.pixiv.net/novel/show.php?id=2594847\n",
+            "author_novel::https://www.pixiv.net/novel/series/272850\n",
+            "author_series::272850\n",
+        );
+        assert_eq!(
+            setting.author_novel_urls(source),
+            Some(vec![
+                "https://www.pixiv.net/novel/show.php?id=2594847".to_string(),
+                "https://www.pixiv.net/novel/series/272850".to_string(),
+            ])
+        );
+        assert_eq!(setting.author_series_ids(source), vec!["272850"]);
+
+        // シリーズの 1 話を除くための URL は author_url の captures を使う。
+        let captures = setting
+            .extract_author_url_captures(page)
+            .expect("user_id capture");
+        assert_eq!(
+            setting.author_series_episodes_fetch_url(&captures, "272850"),
+            Some("https://www.pixiv.net/ajax/novel/series/272850/content_titles".to_string())
+        );
+        assert_eq!(
+            setting.author_series_episode_ids(r#"{"body":[{"id":"2594847","title":"x"}]}"#),
+            vec!["2594847"]
+        );
     }
 }
