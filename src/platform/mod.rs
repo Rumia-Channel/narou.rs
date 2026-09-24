@@ -36,7 +36,7 @@ pub mod url_policy;
 pub use clock::{Clock, SystemClock};
 pub use cookie_store::{
     CookieStore, DecodedGroups, HostCookie, LoginGroup, apply_set_cookie, cookie_host_for_url,
-    cookie_lookup_hosts, decode_groups, fold_per_host_lists,
+    cookie_lookup_hosts, decode_groups, fold_per_host_lists, site_for_host,
     encode_groups, format_cookie_header, mask_cookie, merge_cookie_headers, merge_stored_cookies,
     normalize_cookie_host, parse_cookie_header,
 };

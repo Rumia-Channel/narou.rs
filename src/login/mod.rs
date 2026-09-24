@@ -24,4 +24,4 @@ pub use crypto::{
     encrypt_at_rest, encrypt_with_key, is_encrypted_at_rest, new_credential_id, parse_key_base64,
     random_bytes, random_key,
 };
-pub use transfer::{CookieEnvelope, EXPORT_VERSION, build_export, parse_export};
+pub use transfer::{CookieEnvelope, EXPORT_VERSION, apply_import_name, build_export, parse_export};

@@ -133,8 +133,7 @@ pub fn parse_export(
     }
     if !envelope.encrypted {
         if envelope.version == EXPORT_VERSION_LEGACY {
-            // version 1: ホスト → Cookie 1 本。サイトはホストのまま入れ、取り込み側で
-            // 定義に照らしてまとめる。
+            // version 1: ホスト → Cookie 1 本。1 回の取得がホストごとに分かれている。
             let groups = envelope
                 .cookies
                 .into_iter()
@@ -145,10 +144,11 @@ pub fn parse_export(
                     )
                 })
                 .collect::<Vec<_>>();
-            return Ok(group_by_site(groups));
+            return Ok(fold_host_entries(groups));
         }
         if envelope.version == EXPORT_VERSION_PER_HOST {
-            // 版 2 はホストごとの 1 本。同じ利用者のホストはサイト単位で 1 本に戻す。
+            // 版 2 はホストごとの 1 本。同じ位置が同じアカウントなので、ホストごとに
+            // 並べ直してから 1 ログインへ畳む。
             let groups = envelope
                 .credentials
                 .into_iter()
@@ -157,7 +157,7 @@ pub fn parse_export(
                     credential.into_group(&host)
                 })
                 .collect::<Vec<_>>();
-            return Ok(group_by_site(groups));
+            return Ok(fold_host_entries(groups));
         }
         return Ok(envelope.sites);
     }
@@ -188,41 +188,65 @@ pub fn parse_export(
     }
     let credentials: Vec<LoginGroup> = serde_json::from_value(value)
         .map_err(|error| login_error(format!("decrypted payload is not a login list: {error}")))?;
-    Ok(group_by_site(credentials))
+    Ok(fold_host_entries(credentials))
 }
 
-/// Fold a flat list of logins into per-site groups.
+/// Name what an import brought in.
 ///
-/// A login written per host (`site` = host) is grouped under the site
-/// definition that host belongs to, so `pixiv.net` and `www.pixiv.net` end up
-/// in one place.
-fn group_by_site(groups: Vec<LoginGroup>) -> BTreeMap<String, Vec<LoginGroup>> {
-    let mut sites: BTreeMap<String, Vec<LoginGroup>> = BTreeMap::new();
-    for group in groups {
-        let site = site_for_host(&group.site);
-        sites.entry(site).or_default().push(group);
+/// One capture is one browser session per site, so a name given at import time
+/// labels exactly that session (`本垢`). A counter is added only when one file
+/// carries several sessions for the same site.
+pub fn apply_import_name(sites: &mut BTreeMap<String, Vec<LoginGroup>>, name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
     }
-    sites
+    for groups in sites.values_mut() {
+        let total = groups.len();
+        for (index, group) in groups.iter_mut().enumerate() {
+            group.label = Some(if total == 1 {
+                name.to_string()
+            } else {
+                format!("{name} {}", index + 1)
+            });
+        }
+    }
 }
 
-/// Site a host belongs to, through the site definitions (falling back to the
-/// registrable domain).
-fn site_for_host(host: &str) -> String {
-    let host = host.trim().to_ascii_lowercase();
-    if let Ok(settings) = crate::downloader::site_setting::SiteSetting::load_all()
-        && let Some(setting) = settings.iter().find(|setting| {
-            let domain = setting.domain.to_ascii_lowercase();
-            domain == host || host.ends_with(&format!(".{domain}"))
+/// Fold one capture's per-host entries into one login per site.
+///
+/// Versions 1 and 2 wrote one entry per host, so a single browser session
+/// arrived as several entries. The same position in every host's list was the
+/// same account, so folding per host gives the session back.
+fn fold_host_entries(entries: Vec<LoginGroup>) -> BTreeMap<String, Vec<LoginGroup>> {
+    let mut per_site: BTreeMap<String, BTreeMap<String, Vec<LoginGroup>>> = BTreeMap::new();
+    for entry in entries {
+        let host = entry
+            .cookies
+            .first()
+            .map(|cookie| cookie.host.clone())
+            .unwrap_or_else(|| entry.site.clone());
+        let site = site_for_host(&host);
+        per_site
+            .entry(site)
+            .or_default()
+            .entry(host)
+            .or_default()
+            .push(entry);
+    }
+    per_site
+        .into_iter()
+        .map(|(site, by_host)| {
+            let lists: Vec<Vec<LoginGroup>> = by_host.into_values().collect();
+            let groups = crate::platform::fold_per_host_lists(lists, &site);
+            (site, groups)
         })
-    {
-        return setting.domain.to_ascii_lowercase();
-    }
-    let labels: Vec<&str> = host.split('.').collect();
-    if labels.len() > 2 {
-        labels[labels.len() - 2..].join(".")
-    } else {
-        host
-    }
+        .collect()
+}
+
+/// Site a host belongs to (site definitions first, then its parent domain).
+fn site_for_host(host: &str) -> String {
+    crate::platform::site_for_host(host)
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -302,13 +326,76 @@ mod tests {
         let text = "version: 2\nexported_at: 2026-09-20T00:00:00+09:00\nencrypted: false\n\
                     credentials:\n- host: www.pixiv.net\n  cookie: yuid_b=1\n\
                     - host: pixiv.net\n  cookie: PHPSESSID=abc\n";
-        // サイト定義が読めない環境では、まとめ先が分からないのでホストのまま残す。
+        // 1 回の取得がホストごとに分かれていたものを、サイト単位で 1 ログインに戻す。
         let sites = parse_export(text, None).unwrap();
-        assert_eq!(sites.len(), 2, "got {sites:?}");
-        let group = &sites["www.pixiv.net"][0];
-        assert_eq!(group.cookies[0].cookie, "yuid_b=1");
-        assert_eq!(sites["pixiv.net"][0].cookies[0].cookie, "PHPSESSID=abc");
-        assert!(sites["www.pixiv.net"][0].id.is_empty(), "識別子は取り込み側で振る");
+        let (site, groups) = sites.iter().next().unwrap();
+        assert_eq!(sites.len(), 1, "got {sites:?}");
+        assert_eq!(site, "www.pixiv.net");
+        assert_eq!(groups.len(), 1, "1 セッションは 1 ログイン: {groups:?}");
+        let hosts = groups[0].hosts();
+        assert_eq!(hosts, vec!["www.pixiv.net", "pixiv.net"]);
+        assert_eq!(groups[0].merged_cookie(), "yuid_b=1; PHPSESSID=abc");
+        assert!(groups[0].id.is_empty(), "識別子は取り込み側で振る");
+    }
+
+    #[test]
+    fn version_one_cookies_fold_into_one_login() {
+        let text = "version: 1\nexported_at: 2026-09-20T00:00:00+09:00\nencrypted: false\n\
+                    cookies:\n  www.pixiv.net: yuid_b=1\n  pixiv.net: PHPSESSID=abc\n";
+        let sites = parse_export(text, None).unwrap();
+        let groups = &sites["www.pixiv.net"];
+        assert_eq!(groups.len(), 1, "got {groups:?}");
+        assert_eq!(groups[0].merged_cookie(), "yuid_b=1; PHPSESSID=abc");
+    }
+
+    #[test]
+    fn two_accounts_stay_two_logins() {
+        // ホストごとの一覧で 2 番目にいるものは別アカウント。まとめてはいけない。
+        let text = "version: 2\nexported_at: 2026-09-20T00:00:00+09:00\nencrypted: false\n\
+                    credentials:\n- host: www.pixiv.net\n  cookie: PHPSESSID=main\n\
+                    - host: www.pixiv.net\n  cookie: PHPSESSID=alt\n\
+                    - host: pixiv.net\n  cookie: PHPSESSID=main\n\
+                    - host: pixiv.net\n  cookie: PHPSESSID=alt\n";
+        let sites = parse_export(text, None).unwrap();
+        let groups = &sites["www.pixiv.net"];
+        assert_eq!(groups.len(), 2, "got {groups:?}");
+        assert_eq!(groups[0].cookies.len(), 2);
+        assert_eq!(groups[1].cookies.len(), 2);
+        assert_eq!(groups[0].merged_cookie(), "PHPSESSID=main");
+        assert_eq!(groups[1].merged_cookie(), "PHPSESSID=alt");
+    }
+
+    #[test]
+    fn import_name_labels_what_one_file_brought_in() {
+        let mut sites = BTreeMap::from([(
+            "www.pixiv.net".to_string(),
+            vec![LoginGroup::new("www.pixiv.net", Vec::new())],
+        )]);
+        apply_import_name(&mut sites, "  本垢  ");
+        assert_eq!(sites["www.pixiv.net"][0].display_name(), "本垢");
+
+        // 1 ファイルに複数のセッションがあれば番号を足す。
+        let mut sites = BTreeMap::from([(
+            "www.pixiv.net".to_string(),
+            vec![
+                LoginGroup::new("www.pixiv.net", Vec::new()),
+                LoginGroup::new("www.pixiv.net", Vec::new()),
+            ],
+        )]);
+        apply_import_name(&mut sites, "サブ垢");
+        let names: Vec<&str> = sites["www.pixiv.net"]
+            .iter()
+            .map(LoginGroup::display_name)
+            .collect();
+        assert_eq!(names, vec!["サブ垢 1", "サブ垢 2"]);
+
+        // 空の名前は何もしない。
+        let mut sites = BTreeMap::from([(
+            "www.pixiv.net".to_string(),
+            vec![LoginGroup::new("www.pixiv.net", Vec::new())],
+        )]);
+        apply_import_name(&mut sites, "   ");
+        assert_eq!(sites["www.pixiv.net"][0].display_name(), "www.pixiv.net");
     }
 
     #[test]
