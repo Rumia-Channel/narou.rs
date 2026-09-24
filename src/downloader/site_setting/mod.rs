@@ -59,6 +59,14 @@ pub struct SiteSetting {
     /// (`\k<top_url>/\k<ncode>/`).
     #[serde(default)]
     pub author_work_url: Option<String>,
+    /// Pattern whose `author_next` capture is the next page of an author
+    /// listing (ハーメルン pages its works). Followed until it repeats, runs
+    /// out, or `author_page_max` is reached.
+    #[serde(default)]
+    pub author_next_pattern: Option<String>,
+    /// Pages an author listing is followed for (default 50).
+    #[serde(default)]
+    pub author_page_max: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub series_item_url: Option<String>,
     #[serde(default)]
@@ -176,6 +184,8 @@ pub struct SiteSetting {
     pub(super) compiled_author_url: Vec<Regex>,
     #[serde(skip)]
     pub(super) compiled_author_novel: Option<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_author_next: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_subtitles: Option<Regex>,
     #[serde(skip)]
@@ -314,6 +324,10 @@ impl SiteSetting {
             .author_novel_pattern
             .as_deref()
             .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
+        self.compiled_author_next = self
+            .author_next_pattern
+            .as_deref()
+            .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
         self.compiled_subtitles = self.subtitles.as_ref().and_then(|v| self.compile_value(v));
         self.compiled_body = self
             .body_pattern
@@ -441,6 +455,21 @@ impl SiteSetting {
         self.interpolate_with_captures(template, &captures)
     }
 
+    /// Next page of an author listing, when the definition pages it.
+    pub fn author_next_url(&self, source: &str) -> Option<String> {
+        let pattern = self.compiled_author_next.as_ref()?;
+        let captures = pattern.captures(source)?;
+        captures
+            .name("author_next")
+            .map(|matched| crate::downloader::util::decode_html_text(matched.as_str()))
+            .filter(|url| !url.is_empty())
+    }
+
+    /// Pages an author listing is followed for.
+    pub fn author_page_max(&self) -> usize {
+        self.author_page_max.unwrap_or(50).max(1)
+    }
+
     /// Captures of `author_url` for a concrete author page.
     pub fn extract_author_url_captures(&self, url: &str) -> Option<HashMap<String, String>> {
         extract_captures_from_patterns(&self.compiled_author_url, url)
@@ -464,7 +493,8 @@ impl SiteSetting {
                 })
                 .collect();
             let url = match named.get("novel_url") {
-                Some(url) => url.clone(),
+                // href は `&amp;` のまま取れることがある (実ページの書き方次第)。
+                Some(url) => crate::downloader::util::decode_html_text(url),
                 None => {
                     let Some(template) = self.author_work_url.as_deref() else {
                         continue;

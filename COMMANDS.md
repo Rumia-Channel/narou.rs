@@ -261,7 +261,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 **保存形式**: 小説とは別の inventory `author`（SQLite `app_state` / `.narou/author.yaml`）に、**作者ページ URL（ユニーク）→ サイト名** だけを持つ。名前や日時などの帳簿は持たない。
 
-**サイト定義**: `author_url`（作者ページを認識する正規表現）/ `author_api_url`（作品一覧 API の雛形。任意）/ `author_novel_pattern`（作品を抜く正規表現。`novel_url` か、`author_work_url` 用の capture）/ `author_work_url`（capture から作品 URL を作る雛形）。
+**サイト定義**: `author_url`（作者ページを認識する正規表現）/ `author_api_url`（作品一覧の取得先の雛形。任意）/ `author_novel_pattern`（作品を抜く正規表現。`novel_url` か、`author_work_url` 用の capture）/ `author_work_url`（capture から作品 URL を作る雛形）/ `author_next_pattern` + `author_page_max`（ページ分けされた一覧を次ページへ辿る。ハーメルンで使用）。
 
 ---
 

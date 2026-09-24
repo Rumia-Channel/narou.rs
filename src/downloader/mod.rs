@@ -667,16 +667,34 @@ impl Downloader {
         let setting = &setting;
         let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
         // Sites with an author API (なろう) answer with JSON instead of HTML.
-        let fetch_url = setting.author_fetch_url(page_url);
-        let body = crate::downloader::http_policy::fetch_text(
-            self.http.as_ref(),
-            self.rate_limiter.as_ref(),
-            &fetch_url,
-            &policy,
-            Some(setting.encoding()),
-        )
-        .await?;
-        Ok(setting.author_novel_urls(&body).unwrap_or_default())
+        let mut fetch_url = setting.author_fetch_url(page_url);
+        let mut urls: Vec<String> = Vec::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // 一覧がページ分けされているサイト (ハーメルン) は次ページを辿る。
+        // 同じ URL に戻ったら終わり、暴走防止にページ上限も設ける。
+        for _ in 0..setting.author_page_max() {
+            if !visited.insert(fetch_url.clone()) {
+                break;
+            }
+            let body = crate::downloader::http_policy::fetch_text(
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
+                &fetch_url,
+                &policy,
+                Some(setting.encoding()),
+            )
+            .await?;
+            for url in setting.author_novel_urls(&body).unwrap_or_default() {
+                if !urls.contains(&url) {
+                    urls.push(url);
+                }
+            }
+            match setting.author_next_url(&body) {
+                Some(next) => fetch_url = next,
+                None => break,
+            }
+        }
+        Ok(urls)
     }
 
     /// [`Self::with_platform_and_storage_and_settings`] with bundled values.
@@ -3422,6 +3440,58 @@ is_narou: false
         let mut source = json.to_string();
         super::util::pretreatment_source(&mut source, "UTF-8", Some(setting));
         source
+    }
+
+    #[test]
+    fn paged_author_listings_are_followed_to_the_end() {
+        // ハーメルンの作者ページは検索ページの一覧を page=2, 3… と辿る。
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|setting| setting.domain == "syosetu.org")
+            .unwrap();
+        let page = "https://syosetu.org/user/495125/";
+        let first = "https://syosetu.org/search/?mode=search_user_novel_list&uid=495125";
+        assert_eq!(setting.author_fetch_url(page), first);
+        assert!(setting.matches_author_url(page));
+        assert!(!setting.matches_author_url("https://syosetu.org/novel/388533/"));
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            first,
+            200,
+            r#"<a href="https://h.syosetu.org/novel/388533/">作品1</a>
+               <a href="https://h.syosetu.org/novel/388533/1.html">第1話</a>
+               <li><a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=2">>></a></li>"#,
+        );
+        http.add_text(
+            "https://syosetu.org/search/?mode=search_user_novel_list&word=&uid=495125&page=2",
+            200,
+            r#"<a href="https://syosetu.org/novel/388855/">作品2</a>
+               <li><a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=1"><<</a></li>
+               <li><a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=3">>></a></li>"#,
+        );
+        http.add_text(
+            "https://syosetu.org/search/?mode=search_user_novel_list&word=&uid=495125&page=3",
+            200,
+            r#"<a href="https://syosetu.org/novel/400001/">作品3</a>"#,
+        );
+        let downloader = Downloader::with_platform(
+            Arc::new(http),
+            Arc::new(FakeRateLimiter::new()),
+            Arc::new(MemoryNovelRepository::new()),
+        )
+        .unwrap();
+        let urls = futures::executor::block_on(downloader.author_novel_urls(setting, page)).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://h.syosetu.org/novel/388533/".to_string(),
+                "https://syosetu.org/novel/388855/".to_string(),
+                "https://syosetu.org/novel/400001/".to_string()
+            ],
+            "話ページを作品として数えず、>> の付いた次ページだけを辿る"
+        );
     }
 
     #[test]
