@@ -64,7 +64,7 @@ struct Args {
     /// 保存済みの Cookie を削除する
     #[arg(long)]
     clear: bool,
-    /// ブラウザプロファイルの保管先（既定はサイトごとの固定フォルダ）
+    /// ブラウザプロファイルを使い回す（既定は毎回まっさらな状態で開く）
     #[arg(long, value_name = "DIR")]
     profile: Option<PathBuf>,
     /// 取得した Cookie を書き出しファイル (YAML) に出力する
@@ -120,7 +120,9 @@ fn run(args: Args) -> std::result::Result<(), String> {
         return Ok(());
     }
 
-    // Collect the cookies to store or export.
+    // Collect the cookies to store or export. A throwaway browser profile (the
+    // default) is remembered here and removed once the cookies are safe.
+    let mut throwaway_profile: Option<PathBuf> = None;
     let captured: BTreeMap<String, String> = if let Some(cookie) = args.cookie.as_deref() {
         let host = hosts
             .first()
@@ -138,7 +140,7 @@ fn run(args: Args) -> std::result::Result<(), String> {
             "Chromium 系ブラウザが見つかりませんでした。--browser でパスを指定するか、--cookie で Cookie 文字列を渡してください"
                 .to_string()
         })?;
-        let profile = profile_dir(&site, args.profile.as_deref());
+        let profile = profile_dir(args.profile.as_deref());
         std::fs::create_dir_all(&profile)
             .map_err(|error| format!("{} を作成できません: {error}", profile.display()))?;
         let mut child = launch_browser(&browser, &login_url, args.port, &profile)?;
@@ -146,10 +148,17 @@ fn run(args: Args) -> std::result::Result<(), String> {
             Ok(captured) => captured,
             Err(error) => {
                 let _ = child.kill();
+                println!(
+                    "ブラウザプロファイルを残しました: {} (再試行時に使えます)",
+                    profile.display()
+                );
                 return Err(error);
             }
         };
         let _ = child.kill();
+        if args.profile.is_none() {
+            throwaway_profile = Some(profile);
+        }
         captured.into_iter().collect()
     };
 
@@ -176,21 +185,30 @@ fn run(args: Args) -> std::result::Result<(), String> {
     if site.matches_url(&target) && cookie_host_for_url(&target).is_some() {
         verify_capture(&target, &site, &captured);
     }
+    // Cookie を保存し終えたので、使い捨てのプロファイルを片付ける。
+    if let Some(profile) = throwaway_profile {
+        cleanup_profile(&profile);
+    }
     Ok(())
 }
 
-/// Browser profile directory for `site`.
+/// Browser profile directory for this run.
 ///
-/// Reusing one profile per site keeps the session between runs, so signing in
-/// again is only necessary when the site drops the login (the Python bridge
-/// keeps a per-site cookie folder for the same reason).
-fn profile_dir(site: &SiteSetting, override_dir: Option<&Path>) -> PathBuf {
+/// The default is a fresh directory: the browser must start signed out, or
+/// signing in as somebody else means logging out first (and that detour is
+/// where a session often dies). Pass `--profile <DIR>` to reuse one instead —
+/// for the browser's own conveniences (saved logins, extensions) — knowing the
+/// session is then carried over.
+fn profile_dir(override_dir: Option<&Path>) -> PathBuf {
     match override_dir {
         Some(dir) => dir.to_path_buf(),
-        None => std::env::temp_dir()
-            .join("narou-rs-login")
-            .join(site.domain.to_ascii_lowercase()),
+        None => std::env::temp_dir().join(format!("narou-rs-login-{}", std::process::id())),
     }
+}
+
+/// Remove a throwaway browser profile once the cookies are safely stored.
+fn cleanup_profile(profile: &Path) {
+    let _ = std::fs::remove_dir_all(profile);
 }
 
 /// One request with the captured cookies, mirroring the downloader's login-wall
@@ -658,11 +676,22 @@ mod tests {
     }
 
     #[test]
-    fn profile_directory_is_stable_per_site() {
-        let site = site("name: pixiv\nsitename: Pixiv\ndomain: www.pixiv.net\ntop_url: https://www.pixiv.net/\ntoc_url: \\k<url>\nnovel_info_url: https://www.pixiv.net/novel/show.php?id=\\k<id>\n");
-        assert!(profile_dir(&site, None).ends_with("narou-rs-login/www.pixiv.net"));
+    fn the_default_profile_is_fresh_for_every_run() {
+        // 前回のログインを持ち越さない: ブラウザは必ず未ログインで開く。
+        let first = profile_dir(None);
+        assert!(
+            first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("narou-rs-login-")),
+            "got {}",
+            first.display()
+        );
+        assert!(!first.join("Default").exists(), "プロファイルは空から始まる");
+
+        // --profile を渡したときだけ使い回す。
         assert_eq!(
-            profile_dir(&site, Some(Path::new("custom"))),
+            profile_dir(Some(Path::new("custom"))),
             PathBuf::from("custom")
         );
     }
