@@ -23,9 +23,12 @@ pub mod db;
 pub mod downloader;
 pub mod error;
 #[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
+pub mod illustration_animation;
 pub mod illustration_store;
 #[cfg(feature = "native-runtime")]
 pub mod logger;
+#[cfg(feature = "native-runtime")]
+pub mod login;
 #[cfg(feature = "native-runtime")]
 pub mod mail;
 #[cfg(feature = "native-runtime")]

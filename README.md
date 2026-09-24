@@ -31,6 +31,7 @@ README では、導入方法、基本操作、主な注意点をまとめます�
 + Arcadia http://www.mai-net.net/
 + 暁 http://www.akatsuki-novels.com/
 + カクヨム https://kakuyomu.jp/
++ Pixiv https://www.pixiv.net/ （小説・小説シリーズ・イラスト/漫画・漫画シリーズ）
 
 ## セットアップ
 
@@ -46,6 +47,8 @@ README では、導入方法、基本操作、主な注意点をまとめます�
 narou/
   narou_rs(.exe)
   narou_rs_updater(.exe).new
+  narou_rs_backup(.exe)
+  narou_rs_login(.exe)
   webnovel/
   preset/
   LICENSE
@@ -107,7 +110,7 @@ Release と同じ構成の `narou/` フォルダをリポジトリ直下に作�
 cargo local-build
 ```
 
-`cargo local-build` は GitHub Actions の release と同じ構成の `narou/` フォルダを作成します。release ビルドした `narou_rs(.exe)`、`narou_rs_updater(.exe).new`、`narou_rs_backup(.exe)`、`webnovel/`、`preset/`、`LICENSE`、`README.md`、`Third-Party-License.md`、`commitversion` を `narou/` に配置します。
+`cargo local-build` は GitHub Actions の release と同じ構成の `narou/` フォルダを作成します。release ビルドした `narou_rs(.exe)`、`narou_rs_updater(.exe).new`、`narou_rs_backup(.exe)`、`narou_rs_login(.exe)`、`webnovel/`、`preset/`、`LICENSE`、`README.md`、`Third-Party-License.md`、`commitversion` を `narou/` に配置します。
 
 作成された `narou/` は Release 版と同じように `Path` に追加し、小説を管理したいフォルダで `narou_rs init` を実行してください。`narou/` の中を作業ディレクトリにはしません。
 
@@ -172,6 +175,8 @@ narou_rs web
 | `trace` | panic 時のトレース表示 |
 | `help` | ヘルプ表示 |
 | `version` | バージョン情報表示 |
+| `login` | ログイン Cookie の取り込み・管理 (Rust 拡張) |
+| `illust` | 挿絵キャッシュのメンテナンス (Rust 拡張) |
 
 すべてのコマンド仕様、オプション、完了度は `COMMANDS.md` にまとめています。
 
@@ -237,6 +242,62 @@ narou_rs setting server-basic-auth.require-for-external-bind=false
   unsafe なワイルドカードパターン（`*` 単独、`*.com`、末尾ワイルドなど）は警告ログを出して無視されます。
 - これらのうち Web UI の設定画面に出るのは `server-bind` だけで、それ以外は hidden のまま CLI からのみ変更します。
 
+### ログインが必要な小説
+
+ログインが必要なサイトの小説は、ブラウザで取得した Cookie を保存してからダウンロードします。Cookie の取得は同梱の `narou_rs_login` が担当し、保存した値は `.narou/login.key` の鍵で暗号化されます。
+
+ブラウザと narou_rs が同じマシンにある場合は、ライブラリのフォルダで次を実行します。
+
+```powershell
+narou_rs_login ncode.syosetu.com
+```
+
+Chromium 系ブラウザがログイン URL で開くので、ログインが終わったら Enter を押してください。2 段階認証や CAPTCHA もそのまま通せます。ブラウザが見つからない環境では `--browser <パス>` で指定するか、ブラウザからコピーした Cookie 文字列を直接渡せます。
+
+```powershell
+narou_rs_login ncode.syosetu.com --browser "C:\path\to\chrome.exe"
+narou_rs_login ncode.syosetu.com --cookie "over18=yes; ses=..."
+```
+
+ブラウザのある端末と narou_rs を動かすサーバーが別の場合は、ブラウザ側で書き出しファイルを作って持ち込みます。ライブラリ外で実行した場合は書き出し (`narou_login_export.yaml`) が既定の出力になります。
+
+```powershell
+# ブラウザ側 (ライブラリ外でも可)
+narou_rs_login ncode.syosetu.com --export login.yaml --passphrase <パスフレーズ>
+
+# narou_rs 側 (ライブラリのフォルダ)
+narou_rs login import login.yaml --passphrase <パスフレーズ>
+```
+
+`--passphrase` を付けると書き出しファイルは Argon2id + XChaCha20-Poly1305 で暗号化されます。Web UI を使う場合は、設定ページの「ログイン」タブからファイルを選択して取り込めます。
+
+`narou_rs_login` の主なオプションは以下です。
+
+| オプション | 意味 |
+| --- | --- |
+| `--cookie <文字列>` | ブラウザを開かず、コピーした Cookie 文字列を保存 |
+| `--browser <パス>` | 使用する Chromium 系ブラウザを指定 |
+| `--export <ファイル>` | 取得した Cookie を書き出しファイル (YAML) に出力 |
+| `--passphrase <パス>` | 書き出しファイルを暗号化 |
+| `--clear-text` | パスフレーズ指定時でも平文で書き出す |
+| `--list` | 保存済みの Cookie を表示 (値ではなく名前のみ) |
+| `--clear` | 指定サイトの Cookie を削除 |
+| `--port <ポート>` | ブラウザのリモートデバッグポート (既定 9222) |
+| `--timeout <秒>` | ログイン完了を待つ秒数 (既定 300) |
+
+保存済みの情報は `narou_rs login` サブコマンドでも管理できます。
+
+```powershell
+narou_rs login list                              # 一覧 (値は伏せて表示)
+narou_rs login set <ホスト> --cookie "..."        # 1 サイト分を直接保存
+narou_rs login export login.yaml --passphrase P  # 書き出し
+narou_rs login import login.yaml --replace       # 取り込みに無いサイトを削除
+narou_rs login clear <ホスト>                    # 1 サイト分を削除
+narou_rs login clear                             # すべて削除
+```
+
+保存した Cookie は、ダウンロード時に 404 またはサイト定義の `login_pattern` に一致するログイン壁が返った場合に自動で使われます。`webnovel/*.yaml` に `login_url` (ログイン用 bin が開く URL) と `login_pattern` (ログイン壁を検出する正規表現) を定義すると、サイトごとの挙動を調整できます。
+
 ## グローバルオプション
 
 主なグローバルオプションは以下です。
@@ -258,6 +319,8 @@ narou_rs setting server-basic-auth.require-for-external-bind=false
 - 作業ディレクトリ単位で `.narou/` を持つ設計です。`download`、`update`、`convert` などは基本的に初期化済みディレクトリで実行してください。
 - サイトごとの取得・抽出ルールは `webnovel/*.yaml` を使います。ユーザーがこの YAML を編集すると、挙動もそれに追従します。
 - 保存データや設定ファイルは [narou.rb](https://github.com/whiteleaf7/narou) 互換の YAML / ディレクトリ構成を重視しています。
+- Pixiv は本文・目次・作品情報を `/ajax/*` の JSON から取得します (`webnovel/www.pixiv.net.yaml`)。挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は画像 URL を追加 API から解決して `挿絵/` に取り込みます。ログイン限定作品は `narou_rs_login` で保存した Cookie を使って再試行します。
+- Pixiv のイラスト・漫画 (`/artworks/A`) と漫画シリーズ (`/user/U/series/S`) も扱えます。うごイラはフレーム集約 zip から APNG を組み立てて `挿絵/` に取り込みます。イラストは 1 話・本文がページ画像のみの作品として、漫画シリーズは各作品を 1 話とする連載として登録し、画像は `挿絵/` に取り込みます。R18 作品はログインしていないと一覧に現れないため、含むシリーズは先に `narou_rs_login` で Cookie を保存してください。
 - 変換結果は青空文庫向け整形を基準にし、設定や device 指定に応じて追加出力を行います。
 - `update` は `general_lastup`、差分 cache、strong update、freeze などの挙動を持ちます。
 - `web` は localhost 利用を基本にしています。非 loopback で公開する場合は認証設定を行ってください。

@@ -1,0 +1,347 @@
+# ------------------------------------------------------------
+# 小説サイト定義
+# Pixiv の 4 種の対象を扱う: 小説 / 小説シリーズ / イラスト・漫画 (artworks) /
+# 漫画シリーズ (ユーザーの series ページ)。
+# 本文・目次・作品情報はすべて /ajax/* の JSON API から取得する。作品ページの
+# HTML は Next.js の SPA シェルで本文を含まないため使わない。
+# ncode は単純な数字だと作品種別をまたいで衝突するため、種別ごとに接頭辞を付ける
+# (n = 小説, s = 小説シリーズ, a = イラスト・漫画, c = 漫画シリーズ)。
+name: &name Pixiv
+sitename: *name
+scheme: https
+domain: www.pixiv.net
+top_url: \\k<scheme>://\\k<domain>
+url:
+  # 小説 (単体)
+  - https?://\\k<domain>/novel/show\.php\?id=(?<work_id>\d+)
+  # 小説シリーズ
+  - https?://\\k<domain>/novel/series/(?<work_id>\d+)
+  # イラスト・漫画 (単体作品)
+  - https?://\\k<domain>/artworks/(?<work_id>\d+)
+  # 漫画シリーズ (ユーザーのシリーズページ)
+  - https?://\\k<domain>/user/(?<user_id>\d+)/series/(?<series_id>\d+)
+  # 保存済みレコードの toc_url は API 側の URL になる。更新時にサイト定義を
+  # 引き直せるよう、その形も受け付ける。
+  - https?://\\k<domain>/ajax/novel/series/(?<work_id>\d+)
+  - https?://\\k<domain>/ajax/illust/(?<work_id>\d+)
+  - https?://\\k<domain>/ajax/series/(?<series_id>\d+)
+  - https?://\\k<domain>/ajax/novel/(?<work_id>\d+)
+encoding: UTF-8
+timezone: Asia/Tokyo
+headers:
+  Referer: \k<top_url>/
+confirm_over18: no
+append_title_to_folder_name: yes
+version: 1.0
+
+# ------------------------------------------------------------
+# 前処理設定 (DSL — pest parser で実行)
+# 4 種類の JSON を同じスクリプトで処理し、正規表現で読める行へ変換する。
+#   シリーズ詳細   /ajax/novel/series/{id}           → 作品情報 + 目次 1 ページ目への誘導
+#   シリーズ目次   /ajax/novel/series_content/{id}   → 各話 (30 件ずつ、続きがあれば次ページ)
+#   小説 (各話)    /ajax/novel/{id}                  → 作品情報 (単体作品) と本文
+#   ログイン壁     content が無い /ajax/novel/{id}   → ログイン要求の目印だけ出す
+preprocess: |-
+  guard "PixivPreprocessEvalMagicWord"
+
+  let json = extract_json(/(.+)/s)
+  let body = json.body
+
+  emit "<!---"
+  emit "PixivPreprocessEvalMagicWord"
+
+  if body.page && body.page.series
+    # 漫画シリーズの目次ページ (/ajax/series/{id}?p=N)。一覧は 12 件ずつ order の
+    # 降順で返るため reverse して 1 話から並べる。
+    let series = body.illustSeries.first
+    # 1 ページ目で最新の order が総数に届いていなければ、未ログインで
+    # R-18 など一部の作品が落ちている (再試行の判断材料)。
+    let page_number = url.gsub(/^.*[?&]p=(\d+).*$/, "$1")
+    let is_first_page = page_number == "1" || page_number == url
+    if is_first_page && body.page.series.first.order != series.total
+      emit "login_partial::1"
+    end
+    emit "ncode::c${series.id}"
+    emit "title::${series.title}"
+    emit "story::${series.description.replace("\n", "<br>")}"
+    emit "novel_type::連載中"
+    emit "general_all_no::${series.total}"
+    emit "general_firstup::${series.createDate}"
+    emit "general_lastup::${series.updateDate}"
+    emit "novelupdated_at::${series.updateDate}"
+    for entry in body.page.series.reverse
+      # 各話の題名と掲載日は作品ページから取る (一覧は ID と順序だけ)。
+      let work = fetch_json("https://www.pixiv.net/ajax/illust/${entry.workId}")
+      # 作者はシリーズ情報に無いので各話から拾う (情報側は最初の一致を採用する)。
+      emit "author::${work.body.userName}"
+      emit "Episode;${entry.order};https://www.pixiv.net/ajax/illust/${entry.workId};${work.body.uploadDate};${work.body.title}"
+    end
+    if body.page.series.last.order != 1
+      # order 1 まで来ていなければ続きのページがある。
+      let current_page = url.gsub(/^.*[?&]p=(\d+).*$/, "$1")
+      if current_page != url
+        emit "next::/ajax/series/${series.id}?p=${current_page + 1}&lang=ja"
+      end
+    end
+  else
+    if body.illustTitle
+      # イラスト・漫画の作品ページ (/ajax/illust/{id})。シリーズの 1 話でもある。
+      # 判定に illustType を使わない: イラストは 0 で、DSL では数値 0 が偽になる。
+      # 本文はページ画像そのものなので、挿絵タグを並べる (narou がローカライズする)。
+      let art_pages = fetch_json("https://www.pixiv.net/ajax/illust/${body.id}/pages")
+      let art_text = art_pages.body.map { |page| "<img src=\"${page.urls.original}\">" }.join("<br>")
+      if body.illustType == 2
+        # うごイラ。フレームは zip で配られるので、各フレームの表示時間を URL に
+        # 載せて渡し、narou 側が APNG に組み立てる (組み立てられなければ先頭フレーム)。
+        let ugoira = fetch_json("https://www.pixiv.net/ajax/illust/${body.id}/ugoira_meta?lang=ja")
+        let ugoira_delays = ugoira.body.frames.map { |frame| frame.delay }.join(",")
+        if ugoira_delays != ""
+          let art_text = "<img src=\"${ugoira.body.originalSrc}?ugoira=${ugoira_delays}\">"
+        end
+      end
+      if body.seriesNavData
+        # シリーズの 1 話。作品情報はシリーズの目次ページが持つので前書きだけ出す。
+        emit "introduction::"
+        emit body.description.replace("\n", "<br>")
+        emit "::introduction_end"
+      else
+        emit "ncode::a${body.id}"
+        emit "title::${body.title}"
+        emit "author::${body.userName}"
+        emit "story::${body.description.replace("\n", "<br>")}"
+        emit "novel_type::短編"
+        emit "general_all_no::1"
+        emit "general_firstup::${body.createDate}"
+        emit "general_lastup::${body.uploadDate}"
+        emit "novelupdated_at::${body.uploadDate}"
+        emit "length::0"
+        if body.tags && body.tags.tags && body.tags.tags.is_array
+          for tag in body.tags.tags
+            emit "tag::${tag.tag}"
+          end
+        end
+      end
+      emit "body::"
+      # うごイラなどでページ一覧が空のときは代表画像だけ出す。
+      emit art_text || "<img src=\"${body.urls.original}\">"
+      emit "::body_end"
+    else
+      if body.page && body.page.seriesContents
+        # 小説シリーズの目次ページ。thumbnails.novel は page.seriesContents と
+        # 同じ順序で話数 (seriesContentOrder) と掲載日を持つため、こちらを使う。
+        let entries = body.thumbnails.novel
+        # 匿名でも page.seriesContents には全話の id と話数が入っており、
+        # 中身を伏せられている話だけ viewableType が 0 以外になる。これが
+        # 「空のデータ + 実データ」の実データ側なので、欠けの判定に使う。
+        let contents = body.page.seriesContents
+        for entry in contents
+          if entry.series && entry.series.viewableType != 0
+            emit "login_partial::1"
+          end
+        end
+        # viewableType が無い応答向けの保険 (0 件 / 1 話目から始まらない)。
+        let asked_last_order = url.gsub(/^.*[?&]last_order=(\d+).*$/, "$1")
+        if entries.size == 0
+          emit "login_partial::1"
+        else
+          if asked_last_order == "0" && entries.first.seriesContentOrder != 1
+            emit "login_partial::1"
+          end
+        end
+        for entry in entries
+          emit "Episode;${entry.seriesContentOrder};https://www.pixiv.net/ajax/novel/${entry.id};${entry.createDate};${entry.title}"
+        end
+        if entries.size == 30
+          emit "next::/ajax/novel/series_content/${entries.first.seriesId}?limit=30&last_order=${entries.last.seriesContentOrder}&order_by=asc"
+        end
+      else
+        if body.total
+          # 小説シリーズの詳細ページ
+          emit "ncode::s${body.id}"
+          emit "title::${body.title}"
+          emit "author::${body.userName}"
+          emit "story::${body.caption.replace("\n", "<br>")}"
+          if body.isConcluded
+            emit "novel_type::完結済"
+          else
+            emit "novel_type::連載中"
+          end
+          emit "general_all_no::${body.total}"
+          emit "general_firstup::${body.createDate}"
+          emit "general_lastup::${body.updateDate}"
+          emit "novelupdated_at::${body.updateDate}"
+          emit "length::${body.publishedTotalCharacterCount}"
+          if body.tags && body.tags.is_array
+            for tag in body.tags
+              emit "tag::${tag}"
+            end
+          end
+          emit "next::/ajax/novel/series_content/${body.id}?limit=30&last_order=0&order_by=asc"
+        else
+          if body.content
+            # 小説ページ (単体作品、またはシリーズの各話)。レコードの同一性は話その
+            # ものなので、シリーズの一部でも話の ID を使う。
+            emit "ncode::n${body.id}"
+            emit "title::${body.title}"
+            emit "author::${body.userName}"
+            # キャプションは話の前書き。単体作品ではあらすじそのものなので story に
+            # 回す (同じ文を あらすじ と 前書き の両方に出すと本文で二重に見える)。
+            if body.seriesNavData
+              emit "introduction::"
+              emit body.description.replace("\n", "<br>")
+              emit "::introduction_end"
+            else
+              emit "story::${body.description.replace("\n", "<br>")}"
+            end
+            emit "novel_type::短編"
+            emit "general_all_no::1"
+            emit "general_firstup::${body.createDate}"
+            emit "general_lastup::${body.uploadDate}"
+            emit "novelupdated_at::${body.uploadDate}"
+            emit "length::${body.characterCount}"
+            if body.tags && body.tags.tags && body.tags.tags.is_array
+              for tag in body.tags.tags
+                emit "tag::${tag.tag}"
+              end
+            end
+
+            # 単体作品は 1 話なので目次を出さない。novel_type が短編 (2) なら narou は
+            # 本文ページ = この URL を 1 話として扱う。ここで Episode 行を出すと
+            # 「href 付きの目次 = 連載」と判定され、短編が連載中に化ける。
+            # 本文。Pixiv の記法を Aozora へ渡せる HTML に直してから改行を <br> に
+            # する (to_aozora は素の改行を落とすため)。
+            let text = body.content
+            let text = text.gsub(/\[\[rb:(.*?)\s*>\s*(.*?)\]\]/, "<ruby>$1<rp>(</rp><rt>$2</rt><rp>)</rp></ruby>")
+            let text = text.gsub(/\[\[jumpuri:(.*?)\s*>\s*(.*?)\]\]/, "<a href=\"$2\">$1</a>")
+            let text = text.gsub(/\[chapter:([^\]]*)\]/, "$1")
+            let text = text.gsub(/\[jump:(\d+)\]/, "（$1ページ目へ）")
+
+            # 挿絵。`[pixivimage:ID-N]` は ID から画像 URL を引く追加 API が要るので
+            # request キューに載せ、次の実行で結果が入る。解決できなかった参照は
+            # 目印だけ残して読書面から消す (取得失敗で本文全体を落とさない)。
+            # 話数付き (`-N`) と話数なし (1 枚目) の 2 形態がある。
+            let text = text.gsub(/\[pixivimage:(\d+)-(\d+)\]/) { |m| fetch_json("https://www.pixiv.net/ajax/illust/${m[1]}/pages").body[m[2] - 1].urls.original || "<!--pixivimage:${m[1]}-${m[2]}-->" }
+            let text = text.gsub(/\[pixivimage:(\d+)\]/) { |m| fetch_json("https://www.pixiv.net/ajax/illust/${m[1]}/pages").body.first.urls.original || "<!--pixivimage:${m[1]}-->" }
+            # `[uploadedimage:ID]` は同じ応答に URL があるので追加取得は不要。
+            let text = text.gsub(/\[uploadedimage:(\d+)\]/) { |m| body.textEmbeddedImages[m[1]].urls.original || "<!--uploadedimage:${m[1]}-->" }
+            # 解決済みの画像 URL を挿絵タグへ (narou が illust_grep_pattern で拾う)。
+            let text = text.gsub(/https:\/\/i\.pximg\.net\/[^\s<>"]+/, "<img src=\"$0\">")
+
+            let text = text.replace("[newpage]", "［＃改ページ］")
+            let text = text.replace("\n", "<br>")
+            emit "body::"
+            emit text
+            emit "::body_end"
+
+            if body.pollData
+              let choices = body.pollData.choices.map { |choice| "　　　${choice.text}　　${choice.count}票" }.join("<br>")
+              emit "postscript::"
+              emit "アンケート　\"${body.pollData.question}\"　　票数${body.pollData.total}票<br>${choices}"
+              emit "::postscript_end"
+            end
+          else
+            # 本文が無い小説ページ = ログインが要る作品 (R-18 / ログイン限定)。
+            # この目印に一致したら narou 側が保存済み Cookie で 1 回だけ再試行する。
+            emit "login_required::1"
+          end
+        end
+      end
+    end
+  end
+
+  emit "--->"
+  insert_at_match
+# ------------------------------------------------------------
+# 目次取得設定
+# シリーズ詳細ページを 1 ページ目として読み、続きは next_toc で辿る。
+# 単体作品はこのページ自身が本文ページになる。
+# 対象の形ごとに取得先 API が違うので、ターゲット URL に一致した最初の
+# エントリを使う。
+toc_url:
+  by_target:
+    - match: /ajax/novel/series/|/novel/series/
+      url: \\k<top_url>/ajax/novel/series/\\k<work_id>
+    - match: /ajax/series/|/user/\d+/series/
+      url: \\k<top_url>/ajax/series/\\k<series_id>?p=1&lang=ja
+    - match: /ajax/illust/|/artworks/
+      url: \\k<top_url>/ajax/illust/\\k<work_id>
+    - match: /ajax/novel/|/novel/show\.php
+      url: \\k<top_url>/ajax/novel/\\k<work_id>
+subtitles: |-
+  ^Episode;(?<index>\d+);(?<href>https://www\.pixiv\.net/ajax/(?:novel|illust)/\d+);(?<subdate>[^;\n]*);(?<subtitle>[^\n]+)$
+next_toc: next::(?<next_page>.+)
+next_url: \\k<top_url>\\k<next_page>
+
+# ------------------------------------------------------------
+# 本文取得設定
+# 挿絵は i.pximg.net から落とす。このホストは Referer が無いと 403 を返す。
+illust_grep_pattern: <img src="(?<src>.+?)"[^>]*>
+body_pattern: |-
+  body::
+  (?<body>.+?)
+  ::body_end
+introduction_pattern: |-
+  introduction::
+  (?<introduction>.+?)
+  ::introduction_end
+postscript_pattern: |-
+  postscript::
+  (?<postscript>.+?)
+  ::postscript_end
+
+# ------------------------------------------------------------
+# 小説情報からパースするための設定
+novel_info_url: \\k<toc_url>
+
+# ncode (n = 小説, s = シリーズ)。URL の数値だけでは作品種別をまたいで
+# 衝突するため、ページが持つ種別付きの ID を採用する。
+ncode: ^ncode::(?<ncode>[^\n]+)$
+
+# タイトル
+t: ^title::(?<title>[^\n]+)$
+
+# novel_type 小説種別
+nt: ^novel_type::(?<novel_type>[^\n]+)$
+novel_type_string:
+  連載中: 1
+  完結済: 3
+  短編: 2
+
+# general_all_no 掲載話数
+ga: ^general_all_no::(?<general_all_no>\d+)$
+
+# story あらすじ
+s: ^story::(?<story>[^\n]+)$
+
+# general_firstup 初回掲載日
+gf: ^general_firstup::(?<general_firstup>[^\n]+)$
+
+# novelupdated_at 小説の更新時刻
+nu: ^novelupdated_at::(?<novelupdated_at>[^\n]+)$
+
+# general_lastup 最新話掲載日
+gl: ^general_lastup::(?<general_lastup>[^\n]+)$
+
+# writer 作者名
+w: ^author::(?<writer>[^\n]+)$
+
+# length 文字数
+l: ^length::(?<length>\d+)$
+
+# tags タグ
+tags: ^tag::(?<tag>[^\n]+)$
+
+# ------------------------------------------------------------
+# 特殊な設定
+# 取得できない作品は 2 通りで返る。
+#   error:true     … 削除済み / 非公開 / ログインが要る
+#   content が無い … ログイン限定・R-18 (HTTP 200 のまま本文だけ伏せる)
+# どちらも保存済み Cookie での再試行対象にし、それでも駄目なら 404 として扱う。
+error_message: '"error":\s*true|login_required::1'
+# pixiv は短時間に連続アクセスすると 429 を返す。アクセス間隔の下限 (秒)。
+# 最低 2 秒、余裕を見て 5 秒とする。
+min_interval: 5
+login_pattern: ^login_required::1$
+# 一覧が欠けたまま成功する応答 (ログインすると増える) の目印。
+login_partial_pattern: ^login_partial::1$
+login_url: \\k<top_url>/

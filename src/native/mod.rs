@@ -7,8 +7,10 @@
 //! (`Downloader::with_user_agent` etc.) wire it in.
 
 pub mod converter;
+pub mod cookie_store;
 pub mod downloader;
 pub mod http;
+pub mod login_key;
 pub mod legacy_persistence;
 pub mod novel_repository;
 pub mod sqlite;

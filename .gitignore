@@ -44,3 +44,6 @@ errors.txt
 /.cocoindex_code/
 /dist/
 /narou
+
+# ログイン Cookie の書き出しファイル（資格情報を含むため追跡しない）
+/narou_login_export.yaml

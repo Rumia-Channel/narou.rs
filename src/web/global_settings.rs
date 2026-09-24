@@ -41,6 +41,11 @@ const TABS: &[(&str, &str, &str)] = &[
         "default_args.* 系の設定はコマンド実行時のオプションを省略した場合のデフォルト値を指定します",
     ),
     ("replace", "置換設定", ""),
+    (
+        "login",
+        "ログイン",
+        "ブラウザのある端末で取得したログイン情報を取り込みます",
+    ),
 ];
 
 /// GET /api/setting — returns all settings with metadata

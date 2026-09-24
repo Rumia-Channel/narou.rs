@@ -23,6 +23,7 @@ native-runtime = [
     "dep:curl",
     "dep:indicatif",
     "dep:zip",
+    "dep:image",
     "dep:lettre",
     "dep:unicode-normalization",
     "dep:similar",
@@ -35,12 +36,20 @@ native-runtime = [
     "dep:fs2",
     "dep:libc",
     "dep:rusqlite",
+    # Only the native login executable talks to a browser over ws://.
+    "dep:tungstenite",
+    # Login credentials are stored encrypted at rest and travel between
+    # machines as an encrypted envelope.
+    "dep:chacha20poly1305",
+    "dep:argon2",
+    "dep:base64",
 ]
 # `lite`: embed AozoraEpub3_Lite (GPL-3.0-only) as the in-process EPUB
 # engine. Binaries built with this feature are distributed under GPL-3.0;
 # see assets/aozora_lite/LICENSE.md. The Worker runtime enables it always.
 lite = ["dep:aozora_epub3_lite"]
 worker-runtime = ["lite"]
+image = ["dep:image"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -85,10 +94,14 @@ libc = { version = "0.2", optional = true }
 url = "2"
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 aozora_epub3_lite = { git = "https://github.com/Rumia-Channel/AozoraEpub3_Lite", rev = "1c3fca6", optional = true }
-base64 = "0.23"
+base64 = { version = "0.23", optional = true }
 miniz_oxide = "0.9"
 brotli = "9.0"
 crc32fast = "1.5"
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
+chacha20poly1305 = { version = "0.11", optional = true }
+argon2 = { version = "0.6", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 
 [build-dependencies]
 base64 = "0.22"
@@ -107,6 +120,11 @@ required-features = ["native-runtime"]
 [[bin]]
 name = "narou_rs_backup"
 path = "src/bin/narou_rs_backup.rs"
+required-features = ["native-runtime"]
+
+[[bin]]
+name = "narou_rs_login"
+path = "src/bin/login.rs"
 required-features = ["native-runtime"]
 
 [[bin]]

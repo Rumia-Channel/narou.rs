@@ -28,13 +28,15 @@ fn run() -> Result<(), String> {
     let app_binary = target_release_dir.join(format!("narou_rs{exe_suffix}"));
     let updater_binary = target_release_dir.join(format!("narou_rs_updater{exe_suffix}"));
     let backup_binary = target_release_dir.join(format!("narou_rs_backup{exe_suffix}"));
+    let login_binary = target_release_dir.join(format!("narou_rs_login{exe_suffix}"));
 
     build_release_binary(&options, "narou_rs_updater")?;
     build_release_binary(&options, "narou_rs_backup")?;
+    build_release_binary(&options, "narou_rs_login")?;
     let updater_hash = sha256_file(&updater_binary)
         .map_err(|err| format!("failed to hash {}: {err}", updater_binary.display()))?;
     build_app_binary(&options, &updater_hash)?;
-    create_local_package(&root, &app_binary, &updater_binary, &backup_binary)?;
+    create_local_package(&root, &app_binary, &updater_binary, &backup_binary, &login_binary)?;
 
     println!("Created {}", root.join("narou").display());
     Ok(())
@@ -130,6 +132,7 @@ fn create_local_package(
     app_binary: &Path,
     updater_binary: &Path,
     backup_binary: &Path,
+    login_binary: &Path,
 ) -> Result<(), String> {
     let package_root = root.join("narou");
     if !app_binary.is_file() {
@@ -147,6 +150,12 @@ fn create_local_package(
             backup_binary.display()
         ));
     }
+    if !login_binary.is_file() {
+        return Err(format!(
+            "login binary not found: {}",
+            login_binary.display()
+        ));
+    }
 
     if package_root.exists() {
         fs::remove_dir_all(&package_root)
@@ -159,6 +168,7 @@ fn create_local_package(
     let updater_name = format!("{}.new", file_name(updater_binary)?);
     copy_file(updater_binary, &package_root.join(updater_name))?;
     copy_file(backup_binary, &package_root.join(file_name(backup_binary)?))?;
+    copy_file(login_binary, &package_root.join(file_name(login_binary)?))?;
 
     for dir in ["webnovel", "preset"] {
         copy_dir_recursive(&root.join(dir), &package_root.join(dir))?;

@@ -18,6 +18,7 @@ fn native_capabilities() -> Option<ConverterCapabilities> {
     Some(ConverterCapabilities {
         http,
         rate_limiter,
+        fetch_policy: crate::downloader::http_policy::FetchPolicy::default(),
         assets: None,
         objects: None,
         illustration_index: None,
@@ -27,6 +28,14 @@ fn native_capabilities() -> Option<ConverterCapabilities> {
                 .get_sync(id.into())
                 .ok()
                 .flatten()
+        })),
+        fetch_policy_resolver: Some(Arc::new(|record| {
+            let settings = crate::downloader::site_setting::SiteSetting::load_all().unwrap_or_default();
+            settings
+                .iter()
+                .find(|setting| setting.matches_url(&record.toc_url))
+                .map(crate::downloader::http_policy::FetchPolicy::for_site)
+                .unwrap_or_default()
         })),
     })
 }

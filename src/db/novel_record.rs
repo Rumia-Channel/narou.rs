@@ -53,6 +53,21 @@ pub struct NovelRecord {
         rename = "_convert_failure"
     )]
     pub convert_failure: bool,
+    /// Set once a fetch failed without a login cookie but succeeded with it.
+    /// Novels flagged here send the stored login cookie up front; every other
+    /// novel stays anonymous until a fetch actually needs authentication.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nilable_bool",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub requires_login: bool,
+    /// Identifier of the stored login credential that made this novel's fetch
+    /// work. `requires_login` says a cookie is needed; this says *which* one,
+    /// so a site with several logins (a main account and the one in a マイピク)
+    /// does not walk the whole list on every run. Absent until one succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_session: Option<String>,
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_fields: BTreeMap<String, serde_yaml::Value>,
 }
@@ -152,6 +167,7 @@ mod tests {
 
     #[test]
     fn deserialize_blank_end_as_false() {
+        let _global = crate::test_support::global_state_guard();
         let yaml = r#"---
 id: 115
 author: 風見鶏
@@ -179,6 +195,7 @@ tags: []
 
     #[test]
     fn database_parity_preserves_unknown_fields_during_round_trip() {
+        let _global = crate::test_support::global_state_guard();
         let yaml = r#"---
 id: 0
 author: author
@@ -206,6 +223,7 @@ custom_map:
 
     #[test]
     fn raw_title_uses_compatible_flattened_field() {
+        let _global = crate::test_support::global_state_guard();
         let yaml = r#"---
 id: 0
 author: author

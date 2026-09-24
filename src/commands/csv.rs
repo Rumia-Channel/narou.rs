@@ -219,6 +219,7 @@ mod tests {
 
     #[test]
     fn load_import_csv_content_reads_stdin_when_requested() {
+        let _global = crate::test_support::global_state_guard();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .arg("--nocapture")

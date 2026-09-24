@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     configure_windows_uac_manifest();
+    configure_windows_main_thread_stack();
 
     println!("cargo:rerun-if-env-changed=NAROU_RS_VERSION_OVERRIDE");
     if let Ok(override_version) = std::env::var("NAROU_RS_VERSION_OVERRIDE") {
@@ -77,6 +78,26 @@ fn configure_windows_uac_manifest() {
     for target in ["bins", "tests"] {
         println!("cargo:rustc-link-arg-{target}=/MANIFEST:EMBED");
         println!("cargo:rustc-link-arg-{target}=/MANIFESTUAC:level='asInvoker' uiAccess='false'");
+    }
+}
+
+/// Reserve the stack other platforms give a process by default.
+///
+/// Windows starts the main thread with 1 MiB, and an unoptimized build needs
+/// more than that to parse this CLI: clap builds the whole command tree inside
+/// `try_parse_from`, so every subcommand and argument adds frames. Debug builds
+/// died with "has overflowed its stack" on `narou version` as soon as the
+/// command set grew, while the optimized build stayed far below the limit.
+fn configure_windows_main_thread_stack() {
+    if std::env::var_os("CARGO_CFG_WINDOWS").is_none() {
+        return;
+    }
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+        return;
+    }
+
+    for target in ["bins", "tests"] {
+        println!("cargo:rustc-link-arg-{target}=/STACK:8388608");
     }
 }
 

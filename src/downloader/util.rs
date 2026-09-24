@@ -1,8 +1,15 @@
+use crate::error::Result;
+use crate::platform::{HttpClient, RateLimiter};
+
 use super::preprocess;
-use super::site_setting::SiteSetting;
 use super::security::MAX_YAML_REGEX_PATTERN_LEN;
+use super::site_setting::SiteSetting;
 
 pub const DEFAULT_REGEX_SIZE_LIMIT: usize = 1_000_000;
+
+/// How many times one body may be re-processed while the definition keeps
+/// asking for new URLs. Each round resolves one dependency level.
+pub const MAX_PREPROCESS_ROUNDS: usize = 4;
 
 pub fn build_section_url(setting: &SiteSetting, toc_url: &str, href: &str) -> String {
     let href = decode_html_href(href);
@@ -49,13 +56,100 @@ pub fn compile_html_pattern(pattern: &str) -> std::result::Result<regex::Regex, 
         .build()
 }
 
+/// Rewrite a fetched body in place with the site's `preprocess:` definition.
+///
+/// Definitions that never call `request()` finish in one pass. Definitions
+/// that do need [`pretreatment_source_with_jobs`], which can execute the
+/// requested URLs; this entry point logs the requests it had to drop.
 pub fn pretreatment_source(src: &mut String, _encoding: &str, setting: Option<&SiteSetting>) {
     src.retain(|c| c != '\r');
     decode_numeric_entities(src);
     if let Some(setting) = setting {
         if let Some(pipeline) = setting.preprocess_pipeline() {
-            preprocess::run_preprocess(pipeline, src);
+            let jobs = preprocess::PreprocessJobs::new();
+            let run = preprocess::run_preprocess(pipeline, src, &jobs, "");
+            if !run.requested.is_empty() {
+                tracing::warn!(
+                    "preprocess for {} requested {} URL(s) that this path cannot fetch",
+                    setting.name,
+                    run.requested.len()
+                );
+            }
         }
+    }
+}
+
+/// Rewrite a fetched body in place, executing any URLs the definition asks for.
+///
+/// The definition is re-run until it stops asking for new URLs (bounded by
+/// [`MAX_PREPROCESS_ROUNDS`]); each round starts from the original body, so the
+/// result depends only on the body and the settled job results. Jobs that have
+/// finished are visible immediately through `jobs`, which callers keep for the
+/// whole novel so repeated references resolve once.
+pub async fn pretreatment_source_with_jobs(
+    http: &dyn HttpClient,
+    rate_limiter: &dyn RateLimiter,
+    policy: &crate::downloader::http_policy::FetchPolicy,
+    src: &mut String,
+    _encoding: &str,
+    setting: Option<&SiteSetting>,
+    jobs: &mut preprocess::PreprocessJobs,
+    url: &str,
+) -> Result<()> {
+    src.retain(|c| c != '\r');
+    decode_numeric_entities(src);
+    let Some(setting) = setting else {
+        return Ok(());
+    };
+    let Some(pipeline) = setting.preprocess_pipeline() else {
+        return Ok(());
+    };
+
+    let original = src.clone();
+    let mut rounds = 0;
+    loop {
+        let mut working = original.clone();
+        let run = preprocess::run_preprocess(pipeline, &mut working, jobs, url);
+        let pending: Vec<String> = run
+            .requested
+            .into_iter()
+            .filter(|url| !jobs.contains(url))
+            .collect();
+        if pending.is_empty() || rounds >= MAX_PREPROCESS_ROUNDS {
+            if !pending.is_empty() {
+                tracing::warn!(
+                    "preprocess for {} stopped after {} rounds with {} URL(s) unresolved",
+                    setting.name,
+                    MAX_PREPROCESS_ROUNDS,
+                    pending.len()
+                );
+            }
+            *src = working;
+            return Ok(());
+        }
+
+        for url in pending {
+            // A failed request settles as `null`: illustrations are optional and
+            // the definition branches on the result instead of failing the
+            // whole download.
+            let value = match crate::downloader::http_policy::fetch_text(
+                http,
+                rate_limiter,
+                &url,
+                policy,
+                Some("UTF-8"),
+            )
+            .await
+            {
+                Ok(body) => serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+                Err(err) => {
+                    tracing::debug!("preprocess request failed for {url}: {err}");
+                    serde_json::Value::Null
+                }
+            };
+            jobs.insert(url, value);
+        }
+        rounds += 1;
     }
 }
 

@@ -55,12 +55,15 @@ impl NovelInfo {
         toc_source: &str,
         url_captures: &HashMap<String, String>,
         toc_url: &str,
+        jobs: &mut super::preprocess::PreprocessJobs,
     ) -> Result<Self> {
         let Some(novel_info_url) = &setting.novel_info_url else {
             return Ok(Self::from_toc_source(setting, toc_source));
         };
+        let mut captures = url_captures.clone();
+        captures.insert("__target_url".to_string(), toc_url.to_string());
         let resolved_url = setting
-            .novel_info_url_with_captures(url_captures)
+            .novel_info_url_with_captures(&captures)
             .unwrap_or_else(|| setting.interpolate(novel_info_url));
         if resolved_url == toc_url {
             // The TOC fetch already ran `pretreatment_source`; parsing it with
@@ -68,22 +71,28 @@ impl NovelInfo {
             // and pre-treating it again.
             return Ok(Self::from_novel_info_source(setting, toc_source));
         }
+        let policy = http_policy::FetchPolicy::for_site(setting);
         match http_policy::fetch_text(
             http,
             rate_limiter,
             &resolved_url,
-            setting.cookie(),
+            &policy,
             Some(setting.encoding()),
-            setting.is_narou,
         )
         .await
         {
             Ok(mut body) => {
-                crate::downloader::pretreatment_source(
+                crate::downloader::util::pretreatment_source_with_jobs(
+                    http,
+                    rate_limiter,
+                    &policy,
                     &mut body,
                     setting.encoding(),
                     Some(setting),
-                );
+                    jobs,
+                    &resolved_url,
+                )
+                .await?;
                 Ok(Self::from_novel_info_source(setting, &body))
             }
             Err(_) => Ok(Self::from_toc_source(setting, toc_source)),

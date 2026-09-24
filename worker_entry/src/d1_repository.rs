@@ -475,6 +475,10 @@ struct NovelRow {
     last_check_date: Option<String>,
     convert_failure: i64,
     extra_fields_yaml: String,
+    #[serde(default)]
+    requires_login: i64,
+    #[serde(default)]
+    login_session: Option<String>,
 }
 
 impl NovelRow {
@@ -507,6 +511,8 @@ impl NovelRow {
             is_narou: self.is_narou != 0,
             last_check_date: parse_optional_time(self.last_check_date)?,
             convert_failure: self.convert_failure != 0,
+            requires_login: self.requires_login != 0,
+            login_session: self.login_session,
             extra_fields,
         })
     }
@@ -680,6 +686,11 @@ fn record_binds(record: &NovelRecord) -> Result<Vec<BindValue>> {
         BindValue::Int(record.is_narou as i64),
         optional_text(format_time(record.last_check_date)),
         BindValue::Int(record.convert_failure as i64),
+        BindValue::Int(record.requires_login as i64),
+    match record.login_session.as_deref() {
+        Some(value) => BindValue::Text(value),
+        None => BindValue::Null,
+    },
         BindValue::Text(extra_fields_yaml.clone()),
         BindValue::Int(extra_fields_yaml.len() as i64),
     ])
@@ -692,10 +703,10 @@ fn optional_int(value: Option<i64>) -> BindValue {
     BindValue::Int(value.unwrap_or(-1))
 }
 
-const UPSERT_SQL: &str = "INSERT INTO novels (id, author, author_fold, title, title_fold, file_title, toc_url, toc_url_fold, sitename, sitename_fold, novel_type, end, last_update, new_arrivals_date, use_subdirectory, general_firstup, novelupdated_at, general_lastup, last_mail_date, tags_json, tags_fold, tags_sort, ncode, ncode_fold, domain, domain_fold, general_all_no, length, suspend, is_narou, last_check_date, convert_failure, extra_fields_yaml, extra_fields_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, -1), NULLIF(?, -1), ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET author=excluded.author, author_fold=excluded.author_fold, title=excluded.title, title_fold=excluded.title_fold, file_title=excluded.file_title, toc_url=excluded.toc_url, toc_url_fold=excluded.toc_url_fold, sitename=excluded.sitename, sitename_fold=excluded.sitename_fold, novel_type=excluded.novel_type, end=excluded.end, last_update=excluded.last_update, new_arrivals_date=excluded.new_arrivals_date, use_subdirectory=excluded.use_subdirectory, general_firstup=excluded.general_firstup, novelupdated_at=excluded.novelupdated_at, general_lastup=excluded.general_lastup, last_mail_date=excluded.last_mail_date, tags_json=excluded.tags_json, tags_fold=excluded.tags_fold, tags_sort=excluded.tags_sort, ncode=excluded.ncode, ncode_fold=excluded.ncode_fold, domain=excluded.domain, domain_fold=excluded.domain_fold, general_all_no=excluded.general_all_no, length=excluded.length, suspend=excluded.suspend, is_narou=excluded.is_narou, last_check_date=excluded.last_check_date, convert_failure=excluded.convert_failure, extra_fields_yaml=excluded.extra_fields_yaml, extra_fields_bytes=excluded.extra_fields_bytes";
+const UPSERT_SQL: &str = "INSERT INTO novels (id, author, author_fold, title, title_fold, file_title, toc_url, toc_url_fold, sitename, sitename_fold, novel_type, end, last_update, new_arrivals_date, use_subdirectory, general_firstup, novelupdated_at, general_lastup, last_mail_date, tags_json, tags_fold, tags_sort, ncode, ncode_fold, domain, domain_fold, general_all_no, length, suspend, is_narou, last_check_date, convert_failure, extra_fields_yaml, extra_fields_bytes, requires_login, login_session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, -1), NULLIF(?, -1), ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET author=excluded.author, author_fold=excluded.author_fold, title=excluded.title, title_fold=excluded.title_fold, file_title=excluded.file_title, toc_url=excluded.toc_url, toc_url_fold=excluded.toc_url_fold, sitename=excluded.sitename, sitename_fold=excluded.sitename_fold, novel_type=excluded.novel_type, end=excluded.end, last_update=excluded.last_update, new_arrivals_date=excluded.new_arrivals_date, use_subdirectory=excluded.use_subdirectory, general_firstup=excluded.general_firstup, novelupdated_at=excluded.novelupdated_at, general_lastup=excluded.general_lastup, last_mail_date=excluded.last_mail_date, tags_json=excluded.tags_json, tags_fold=excluded.tags_fold, tags_sort=excluded.tags_sort, ncode=excluded.ncode, ncode_fold=excluded.ncode_fold, domain=excluded.domain, domain_fold=excluded.domain_fold, general_all_no=excluded.general_all_no, length=excluded.length, suspend=excluded.suspend, is_narou=excluded.is_narou, last_check_date=excluded.last_check_date, convert_failure=excluded.convert_failure, extra_fields_yaml=excluded.extra_fields_yaml, extra_fields_bytes=excluded.extra_fields_bytes, requires_login=excluded.requires_login, login_session=excluded.login_session";
 
 fn select_sql() -> &'static str {
-    "SELECT n.id, n.author, n.author_fold, n.title, n.file_title, n.toc_url, n.sitename, n.novel_type, n.end, n.last_update, n.new_arrivals_date, n.use_subdirectory, n.general_firstup, n.novelupdated_at, n.general_lastup, n.last_mail_date, n.tags_json, n.ncode, n.domain, n.general_all_no, n.length, n.suspend, n.is_narou, n.last_check_date, n.convert_failure, n.extra_fields_yaml FROM novels n"
+    "SELECT n.id, n.author, n.author_fold, n.title, n.file_title, n.toc_url, n.sitename, n.novel_type, n.end, n.last_update, n.new_arrivals_date, n.use_subdirectory, n.general_firstup, n.novelupdated_at, n.general_lastup, n.last_mail_date, n.tags_json, n.ncode, n.domain, n.general_all_no, n.length, n.suspend, n.is_narou, n.last_check_date, n.convert_failure, n.extra_fields_yaml, n.requires_login FROM novels n"
 }
 
 struct WhereBuilder {
@@ -1165,8 +1176,8 @@ mod tests {
             ("answer".to_string(), YamlValue::Number(serde_yaml::Number::from(42_i64))),
         ]));
         let binds = record_binds(&record).unwrap();
-        assert_eq!(binds.len(), 34);
-        assert_eq!(UPSERT_SQL.matches('?').count(), 34);
+        assert_eq!(binds.len(), 35);
+        assert_eq!(UPSERT_SQL.matches('?').count(), 35);
         let BindValue::Text(yaml) = &binds[32] else {
             panic!("extra fields bind must be text");
         };

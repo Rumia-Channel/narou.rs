@@ -6,7 +6,8 @@ use crate::platform::{HttpClient, RateLimiter};
 use super::http_policy;
 use super::site_setting::SiteSetting;
 use super::types::{MAX_SECTION_CACHE, SectionElement, SubtitleInfo};
-use super::util::{build_section_url, pretreatment_source};
+use super::preprocess::PreprocessJobs;
+use super::util::{build_section_url, pretreatment_source_with_jobs};
 
 pub struct SectionCache {
     cache: HashMap<String, SectionElement>,
@@ -50,22 +51,33 @@ pub async fn download_section(
     setting: &SiteSetting,
     subtitle: &SubtitleInfo,
     toc_url: &str,
+    jobs: &mut PreprocessJobs,
 ) -> Result<(SectionElement, String)> {
     let url = section_cache_key(setting, toc_url, subtitle);
     if let Some(cached) = cache.get(&url) {
         return Ok((cached.clone(), String::new()));
     }
 
+    let policy = http_policy::FetchPolicy::for_site(setting);
     let mut html_source = http_policy::fetch_text(
         http,
         rate_limiter,
         &url,
-        setting.cookie(),
+        &policy,
         Some(setting.encoding()),
-        setting.is_narou,
     )
     .await?;
-    pretreatment_source(&mut html_source, setting.encoding(), Some(setting));
+    pretreatment_source_with_jobs(
+        http,
+        rate_limiter,
+        &policy,
+        &mut html_source,
+        setting.encoding(),
+        Some(setting),
+        jobs,
+        &url,
+    )
+    .await?;
     let (element, raw_html) = parse_section_html(setting, html_source)?;
     cache.insert(url, element.clone());
     Ok((element, raw_html))
