@@ -295,6 +295,8 @@ sample/
 ### SQLite 管理基盤移行 (P0-P4 完了、詳細: docs/sqlite-storage-migration-plan.md)
 - P1 `src/native/sqlite/` エンジン + dual-run テスト、P2 メタデータ全面移行 (database/freeze/alias/tag_colors/local+global_setting/queue/notepad/latest_convert → db.sqlite)、レガシー自動import(元ファイルは *.imported-* 退避)、`narou db verify|export-yaml|vacuum`
 - P3 デュアルモード化: **既定は従来どおり YAML 管理**。`.narou/storage-backend` マーカー(`sqlite`)または Web UI ツアーの選択で Lite(SQLite) へ切替。`NAROU_RS_LEGACY_YAML=1` は強制レガシー。API: `GET/POST /api/storage/mode`
+- **設定ページからの切替**: 設定 → WEB UI タブの「データ管理方式」から現在のモード表示・SQLite への移行・YAML への復帰ができる (`GET/POST /api/storage/mode`、実装は `src/web/storage.rs`)。YAML へ戻すときは `narou db export-yaml --in-place` 相当 (実位置への書き出し + マーカー切替) を先に実行するので、切替で作品データは失われない。`NAROU_RS_LEGACY_YAML=1` のときは固定 (API が `locked_by_env` を返す)。
+- **アップデート版 (Lite / 通常)**: `self-update.variant` は設定ページの Global タブで選べる (`gpl` = AozoraEpub3_Lite 組込み / `standard` = 外部 AozoraEpub3)。更新時の版選択モーダルと同じ設定を書き換える。
 - P4a コンテンツミラー (novel_sections/novel_outputs) — convert時に書込み、Web DL時EPUBはDB優先
 - P4b バージョン履歴 (novel_versions/_sections/_diffs) + `narou diff --history|--show|--restore|--merge-from`。update時自動snapshotはconvertフック経由
 - 後方互換: 旧ライブラリからの自動取込と `narou db export-yaml` によるロールバックを保証。`narou setting narou-compat=true` で `.narou/*.yaml` を維持する前方互換モードあり (既定 OFF)。`export-yaml --in-place` は実位置へ書き戻して YAML モードへ復帰する

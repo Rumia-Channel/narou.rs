@@ -80,6 +80,7 @@
 
     if (items.length === 0) {
       html += '<div class="list-group"><div class="list-group-item"><em>この分類に該当する設定はありません</em></div></div>';
+      if (tab.id === 'webui') html += renderStorageModeBlock();
       html += '</div>';
       return html;
     }
@@ -88,8 +89,81 @@
     items.forEach(function(setting) {
       html += renderSettingItem(setting);
     });
-    html += '</div></div>';
+    html += '</div>';
+    if (tab.id === 'webui') html += renderStorageModeBlock();
+    html += '</div>';
     return html;
+  }
+
+  // ─── データ管理方式 (YAML / SQLite) ──────────────────────
+  function renderStorageModeBlock() {
+    return '<div class="list-group" id="storage-mode-panel">' +
+      '<div class="list-group-item">' +
+      '<h4 class="list-group-item-heading">データ管理方式</h4>' +
+      '<div class="list-group-item-text">' +
+      '<div class="setting-help">作品データを従来の YAML ファイルで管理するか、SQLite データベースで管理するかを選びます。' +
+      'SQLite へ移行すると旧 YAML は <code>*.imported-*</code> へ退避され、戻すときは YAML を書き出してから切り替えます。' +
+      'どちらの方式でも作品データはそのまま使えます。</div>' +
+      '<div id="storage-mode-status"><em>読み込み中…</em></div>' +
+      '<div class="storage-mode-actions">' +
+      '<button type="button" class="btn btn-primary" id="storage-mode-to-sqlite">SQLite 管理へ移行</button>' +
+      '<button type="button" class="btn btn-default" id="storage-mode-to-yaml">YAML 管理へ戻す</button>' +
+      '</div>' +
+      '</div></div></div>';
+  }
+
+  async function loadStorageMode() {
+    const panel = document.getElementById('storage-mode-panel');
+    if (!panel) return;
+    const status = document.getElementById('storage-mode-status');
+    const toSqlite = document.getElementById('storage-mode-to-sqlite');
+    const toYaml = document.getElementById('storage-mode-to-yaml');
+    const bind = function(button, mode) {
+      if (!button || button.dataset.bound === '1') return;
+      button.dataset.bound = '1';
+      button.addEventListener('click', function() { switchStorageMode(mode, button); });
+    };
+    try {
+      const resp = await fetch('/api/storage/mode');
+      const data = await resp.json();
+      const sqlite = data.mode === 'sqlite';
+      const locked = Boolean(data.locked_by_env);
+      let html = '<p class="storage-mode-current">現在: <strong>' +
+        (sqlite ? 'SQLite 管理' : 'YAML 管理') + '</strong>' +
+        (locked ? '（' + escapeHtml(data.reason || 'この環境では固定されています') + '）' : '') + '</p>';
+      if (data.marker) {
+        html += '<p class="setting-help storage-mode-paths">切替ファイル: <code>' + escapeHtml(data.marker) + '</code>' +
+          (data.database ? ' / データベース: <code>' + escapeHtml(data.database) + '</code>' : '') + '</p>';
+      }
+      status.innerHTML = html;
+      if (toSqlite) toSqlite.classList.toggle('hide', sqlite || locked);
+      if (toYaml) toYaml.classList.toggle('hide', !sqlite || locked);
+      bind(toSqlite, 'sqlite');
+      bind(toYaml, 'yaml');
+    } catch (e) {
+      status.innerHTML = '<em>読み込みに失敗しました: ' + escapeHtml(e.message) + '</em>';
+    }
+  }
+
+  async function switchStorageMode(mode, button) {
+    if (button && button.disabled) return;
+    if (mode === 'sqlite' && !window.confirm('作品データの管理を SQLite へ移行します。旧 YAML は自動で退避されます。よろしいですか？')) return;
+    if (mode === 'yaml' && !window.confirm('YAML を書き出してから YAML 管理へ戻します。よろしいですか？')) return;
+    if (button) button.disabled = true;
+    try {
+      const resp = await fetch('/api/storage/mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: mode }),
+      });
+      const result = await resp.json();
+      if (!result.success) throw new Error(result.message || '切り替えに失敗しました');
+      showToast(result.message || '切り替えました', 'success');
+      setTimeout(function() { window.location.reload(); }, 1200);
+    } catch (e) {
+      showToast('切り替えに失敗しました: ' + e.message, 'error');
+      if (button) button.disabled = false;
+    }
   }
 
   function renderSettingItem(setting) {
@@ -568,6 +642,7 @@
     if (targetPane) targetPane.classList.add('active');
     // 一覧は pane が DOM に乗ってから読む (タブを開くたびに最新化する)。
     if (tabId === 'login') loadLoginHosts();
+    if (tabId === 'webui') loadStorageMode();
 
     // Remember active tab
     activeTab = tabId;

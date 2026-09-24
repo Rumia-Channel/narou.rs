@@ -156,6 +156,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "server-basic-auth.password"
         | "server-ws-add-accepted-domains"
         | "server-add-accepted-hosts"
+        | "self-update.variant"
         | "over18" => Some("global"),
 
         _ => None,
@@ -525,6 +526,11 @@ mod tests {
 
     #[test]
     fn webui_debug_mode_is_visible_on_webui_tab() {
+        assert_eq!(
+            tab_for_setting("self-update.variant"),
+            Some("global"),
+            "アップデート版は設定ページの Global タブで選べる"
+        );
         assert_eq!(tab_for_setting("webui.debug-mode"), Some("webui"));
         assert!(setting_variables().get("webui.debug-mode").is_some());
     }

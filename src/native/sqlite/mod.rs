@@ -12,6 +12,7 @@
 
 pub mod bulk;
 pub mod content;
+pub mod export_yaml;
 pub mod versions;
 pub mod object_store;
 mod migrations;

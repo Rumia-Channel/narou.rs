@@ -12,6 +12,7 @@ pub mod push;
 pub mod scheduler;
 pub mod sort_state;
 pub mod state;
+pub mod storage;
 pub mod tags;
 pub mod update;
 pub mod worker;
@@ -579,7 +580,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/feature_tour/all", get(feature_tour::all))
         .route("/api/feature_tour/seen", post(feature_tour::mark_seen))
         .route("/api/feature_tour/config", post(feature_tour::configure))
-        .route("/api/storage/mode", get(feature_tour::storage_mode_get).post(feature_tour::storage_mode_set))
+        .route("/api/storage/mode", get(storage::storage_mode_get).post(storage::storage_mode_set))
         .route("/api/webui/config", get(misc::webui_config))
         .route("/api/tag_list", get(misc::tag_list))
         .route("/api/tag/change_color", post(misc::tag_change_color))

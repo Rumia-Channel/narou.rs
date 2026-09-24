@@ -503,3 +503,19 @@
   font-size: 0.8125rem;
   color: var(--text-muted, #777);
 }
+
+/* データ管理方式 (設定 → WEB UI) */
+.storage-mode-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5em;
+  margin-top: 0.5em;
+}
+
+.storage-mode-current {
+  margin: 0.25em 0;
+}
+
+.storage-mode-paths {
+  word-break: break-all;
+}
