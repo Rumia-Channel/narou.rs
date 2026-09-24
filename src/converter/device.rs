@@ -938,15 +938,28 @@ enum EpubEngine {
     External,
 }
 
-/// `NAROU_RS_EPUB_ENGINE` switches the engine; anything else means `Auto`.
+/// `convert.epub-engine` picks the engine; `NAROU_RS_EPUB_ENGINE` overrides it
+/// for one run (the Web UI starts conversions as child processes, so the
+/// setting is what the browser switches).
 fn epub_engine_preference() -> EpubEngine {
-    let Ok(value) = std::env::var("NAROU_RS_EPUB_ENGINE") else {
-        return EpubEngine::Auto;
-    };
+    if let Ok(value) = std::env::var("NAROU_RS_EPUB_ENGINE")
+        && let Some(engine) = parse_epub_engine(&value)
+    {
+        return engine;
+    }
+    crate::compat::load_global_setting_string("convert.epub-engine")
+        .and_then(|value| parse_epub_engine(&value))
+        .unwrap_or(EpubEngine::Auto)
+}
+
+/// `auto` / `lite` (builtin) / `external` (java); unknown values mean "no
+/// preference".
+fn parse_epub_engine(value: &str) -> Option<EpubEngine> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "lite" | "builtin" => EpubEngine::Lite,
-        "external" | "java" => EpubEngine::External,
-        _ => EpubEngine::Auto,
+        "auto" => Some(EpubEngine::Auto),
+        "lite" | "builtin" => Some(EpubEngine::Lite),
+        "external" | "java" => Some(EpubEngine::External),
+        _ => None,
     }
 }
 

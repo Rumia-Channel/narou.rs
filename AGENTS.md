@@ -365,7 +365,7 @@ sample/
 - `preset/AozoraEpub3.ini` も `include_str!` し、`aozoraepub3dir` が無いときの既定にする (`IniSettings::parse` → `AozoraConfig::from_ini`)。Java 版は常にこの INI (init がインストール先へコピーしたもの) を読むため、外部 AozoraEpub3 が無い環境でも `TitlePage` / `CoverPage` / `SpaceHyphenation` / `DakutenType` などのフラグが一致する。実測: 資産なしでも Java と 419/423 バイト一致。
 - 同梱 `replace.txt` は読み込まない (削除済み)。Java は narou.rb 構成では `replace.txt` を持たない (配布物は `replace_sample.txt`) ため、読み込むと `－`→`―` など不要な文字置換が入り Java とずれる。
 - 残差: 外字フォント (`gaiji/dakuten/*.ttf`) は `aozoraepub3dir` が無いと格納できない。`AozoraConfig::gaiji_fonts` がパス指定のため、同梱資産 (バイト列) からは渡せない。Java は濁点外字に `<span class="glyph u30fc-u309a">` を出すが Lite は素の文字になる (この差は外字を使う小説でのみ発生)。
-- **注意**: `aozoraepub3dir` を設定すると CLI は外部ツール (jar / Lite exe) を優先する (narou.rb と同じ)。エンジンの切り替えは環境変数 `NAROU_RS_EPUB_ENGINE` で行う (動作確認用): `lite` / `builtin` で組み込みを強制 (組み込み入りでビルドされていなければエラー)、`external` / `java` で外部を強制、未設定は従来どおり (外部があれば外部、無ければ組み込み)。
+- **注意**: `aozoraepub3dir` を設定すると CLI は外部ツール (jar / Lite exe) を優先する (narou.rb と同じ)。エンジンは設定 `convert.epub-engine` (global、値: `auto` / `lite` / `external`) で選ぶ。未設定 = `auto` は従来どおり外部があれば外部・無ければ組み込み、`lite` は組み込みを強制 (組み込み入りでビルドされていなければエラー)、`external` は外部を強制する。設定ページの「一般」タブからも切り替えられ、Web UI の変換は子プロセスで走るためその設定がそのまま効く。1 回だけ試すときは環境変数 `NAROU_RS_EPUB_ENGINE=lite|external` (`builtin` / `java` も可) で上書きできる。
 - 実データ検証 (2026-09-15, v0.1.3): `WebNovel` の n0421du (401 セクション) で Java 版と **422/423 ファイルがバイト完全一致**、挿絵入りでも **425/426 がバイト完全一致**（単ページ画像化・連番・表紙処理を含む）。残差は `dcterms:modified` のみ（Java はローカル時刻に `Z`、Lite は UTC。Lite 側の意図的な非再現）。
 - 検証手順は `docs/aozora_lite_evaluation_2026-08-23.md` の「更新 (2026-09-15)」節。
 

@@ -157,6 +157,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "server-ws-add-accepted-domains"
         | "server-add-accepted-hosts"
         | "self-update.variant"
+        | "convert.epub-engine"
         | "over18" => Some("global"),
 
         _ => None,
@@ -1098,6 +1099,13 @@ pub fn setting_variables() -> SettingVariables {
             sel(
                 "コンソール上でのANSIカラーを表示する方法の選択(Windowsのみ)。system: システムに任せる(デフォルト) / self: Narou.rbで処理",
                 vec!["system", "self"],
+            ),
+        ),
+        (
+            "convert.epub-engine",
+            sel(
+                "EPUB 生成エンジンの選択。auto: 外部 AozoraEpub3 があればそれを使い、無ければ組み込み (Lite) / lite: 組み込みを強制 (要 lite ビルド) / external: 外部を強制",
+                vec!["auto", "lite", "external"],
             ),
         ),
         (
