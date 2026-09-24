@@ -111,6 +111,10 @@ const COMMANDS: &[CmdInfo] = &[
         oneline: "挿絵ハッシュストアの運用補助 (orphan/migrate/fix-ext/rebuild)",
     },
     CmdInfo {
+        name: "author",
+        oneline: "追跡する作者の管理と確認 (add/list/remove/check)",
+    },
+    CmdInfo {
         name: "login",
         oneline: "ログイン情報の取り込み・書き出し (import/export/list/set/clear)",
     },

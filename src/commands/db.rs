@@ -103,6 +103,7 @@ fn cmd_export_yaml(out: Option<String>, in_place: bool) -> narou_rs::error::Resu
             ("tag_colors", "tag_colors.yaml"),
             ("login_cookie", "login_cookie.yaml"),
             ("latest_convert", "latest_convert.yaml"),
+            ("author", "author.yaml"),
             ("local_setting", "local_setting.yaml"),
             ("queue", "queue.yaml"),
             ("notepad", "notepad.txt"),

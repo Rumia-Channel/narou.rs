@@ -17,8 +17,16 @@ impl SiteSetting {
         let base = self.build_base_vars();
         let re = Regex::new(r"\\+k<(.+?)>").unwrap();
         re.replace_all(pattern, |caps: &regex::Captures| {
-            let key = &caps[1];
-            self.resolve_k_key(key, captures, &base, &mut Vec::new())
+            // `\k<lower:key>` lowercases the value: an API can hand back an
+            // identifier in a different case than the site's URLs use
+            // (なろう's `ncode` comes back as `N5181MT`).
+            let raw = caps[1].to_string();
+            let (key, lowercase) = match raw.split_once(':') {
+                Some(("lower", key)) => (key.to_string(), true),
+                _ => (raw, false),
+            };
+            let value = self.resolve_k_key(&key, captures, &base, &mut Vec::new());
+            if lowercase { value.to_lowercase() } else { value }
         })
         .to_string()
     }
@@ -117,5 +125,33 @@ impl SiteSetting {
         let mut vars = url_captures.clone();
         vars.insert("index".to_string(), index.to_string());
         self.interpolate_with_captures(template, &vars)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setting() -> SiteSetting {
+        serde_yaml::from_str(
+            "name: Example\nsitename: Example\ndomain: example.com\ntop_url: https://example.com\ntoc_url: \\k<top_url>/\\k<ncode>/\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn lower_prefix_lowercases_a_capture() {
+        let setting = setting();
+        let mut captures = HashMap::new();
+        captures.insert("ncode".to_string(), "N5181MT".to_string());
+        assert_eq!(
+            setting.interpolate_with_captures("\\k<top_url>/\\k<lower:ncode>/", &captures),
+            "https://example.com/n5181mt/"
+        );
+        assert_eq!(
+            setting.interpolate_with_captures("\\k<ncode>", &captures),
+            "N5181MT",
+            "接頭辞が無ければそのまま"
+        );
     }
 }

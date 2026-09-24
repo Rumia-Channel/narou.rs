@@ -102,6 +102,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `backup` | ✅ | ✅ 完了 | `narou backup`/複数 target、`backup/` 除外、180バイト切り詰めまで対応 |
 | `clean` | ✅ | ✅ 完了 | `latest_convert` 既定値、`--all`、`--force`/`--dry-run`、freeze スキップ、`raw/*.txt|*.html` と `本文/*.yaml` の orphan 判定を実装 |
 | `illust` | ✅ | ✅ 完了 | v0.2.11 で導入した `.illustration_cache.yaml` 運用のための `narou illust <sub>` 新設。サブコマンド `orphan`/`migrate`/`fix-ext`/`rebuild` を実装し、削除/改名/移行はいずれも既定 dry-run (`-f` で実行) |
+| `author` | — (Rust 拡張) | ✅ 完了 | 追跡する作者を登録すると (`narou author add <作者ページURL>`)、`narou update` の後段で新しい作品を自動追加する。`add`/`list`/`remove`/`check`。作者ページの認識と作品一覧の取得はサイト定義 (`author_url` / `author_api_url` / `author_novel_pattern` / `author_work_url`) が担う |
 | `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`set`/`add`/`order`/`clear` を実装。サイトごとに複数の資格情報を試行順つきで保持できる。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET/DELETE /api/login`、`POST /api/login/import`、`POST /api/login/set`、`DELETE /api/login/{host}` も対応 |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
 | `version` | ✅ | ✅ 完了 | `-v`/`--version` と `--more` を実装。出力順序、help 文言、AozoraEpub3 探索、失敗時メッセージを Ruby 版に揃えた |
@@ -244,6 +245,23 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 | `vacuum` | VACUUM で容量回収 |
 
 **前方互換モード**: `narou setting narou-compat=true` で `.narou/*.yaml` (database.yaml, freeze.yaml, alias.yaml, tag_colors.yaml, latest_convert.yaml, local_setting.yaml, queue.yaml, notepad.txt) と `~/.narousetting/global_setting.yaml` をファイルとして維持し、narou.rb がそのまま読める状態を保つ。ファイルが正で SQLite はミラー。OFF(既定) ではファイルを `*.imported-*` へ退避し SQLite のみで管理する。
+
+---
+
+### 3.x `author` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
+
+作者ページを登録しておくと、`narou update` の後段で毎回その作者を確認し、**まだ管理していない作品**を通常のダウンロード経路で追加する。
+
+| サブコマンド | 内容 |
+|---|---|
+| `add <URL> [--name N]` | 作者ページを登録。`author_url` に一致するサイト定義が必要 |
+| `list` | 登録済みの作者（サイト / ページ URL / 最終確認 / 前回の新規件数） |
+| `remove <URL\|番号>` | `list` の番号か URL で解除 |
+| `check` | いま全作者を確認して新規作品を追加（`update` と同じ処理） |
+
+**保存形式**: 小説とは別の inventory `author`（SQLite `app_state` / `.narou/author.yaml`）に、`サイト` と `作者ページ URL` と帳簿（名前・追加日時・最終確認・前回の新規件数）だけを持つ。
+
+**サイト定義**: `author_url`（作者ページを認識する正規表現）/ `author_api_url`（作品一覧 API の雛形。任意）/ `author_novel_pattern`（作品を抜く正規表現。`novel_url` か、`author_work_url` 用の capture）/ `author_work_url`（capture から作品 URL を作る雛形）。
 
 ---
 

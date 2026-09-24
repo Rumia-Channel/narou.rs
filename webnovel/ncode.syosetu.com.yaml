@@ -6,6 +6,12 @@ top_url: https://\\k<domain>
 url: https?://\\k<domain>/(?<ncode>n\d+[a-z]+)
 series_url: https?://\\k<domain>/(?<series>s\d+[a-z]+)
 series_item_url: (?:"|')(?<href>(?:https?://\\k<domain>)?/n\d+[a-z]+/?)(?:"|')
+# 作者ページ (作者追跡)。作者の作品一覧は なろう小説API から取る (HTML を
+# 読まないので壊れにくい)。`narou author add <作者ページURL>` で登録する。
+author_url: ^https?://mypage\.syosetu\.com/(?<author_id>\d+)/
+author_novel_pattern: '"ncode":"(?<ncode>[nN]\d+[A-Za-z]+)"'
+author_api_url: https://api.syosetu.com/novelapi/api/?out=json&userid=\k<author_id>&lim=500
+author_work_url: \k<top_url>/\k<lower:ncode>/
 encoding: UTF-8
 timezone: Asia/Tokyo
 confirm_over18: no

@@ -31,6 +31,34 @@ pub struct SiteSetting {
     pub url: Option<SiteSettingValue>,
     #[serde(default)]
     pub series_url: Option<SiteSettingValue>,
+    /// Pattern recognising an author page (作者ページ), e.g.
+    /// `https://mypage.syosetu.com/(?<author_id>\d+)/`.
+    ///
+    /// `narou author add <url>` uses it to decide which definition owns the
+    /// page; the tracked entry keeps only the site and the URL.
+    #[serde(default)]
+    pub author_url: Option<SiteSettingValue>,
+    /// Pattern over an author page (or its API response) that yields the works
+    /// it lists.
+    ///
+    /// Every match captures either `novel_url` (an absolute work URL) or the
+    /// pieces `author_work_url` needs (`ncode`, `novel_id`, …). The result is
+    /// downloaded exactly like a URL typed on the command line; works already
+    /// in the library are skipped.
+    #[serde(default)]
+    pub author_novel_pattern: Option<String>,
+    /// API endpoint that lists an author's works, when the site offers one
+    /// (なろう: `https://api.syosetu.com/novelapi/api/?out=json&userid=\k<author_id>&lim=500`).
+    ///
+    /// Fetched instead of the author page itself; captures from `author_url`
+    /// are available as `\k<...>`.
+    #[serde(default)]
+    pub author_api_url: Option<String>,
+    /// Template that turns the captures of `author_novel_pattern` into a work
+    /// URL, for sites whose listing carries ids rather than links
+    /// (`\k<top_url>/\k<ncode>/`).
+    #[serde(default)]
+    pub author_work_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub series_item_url: Option<String>,
     #[serde(default)]
@@ -144,6 +172,10 @@ pub struct SiteSetting {
     pub(super) compiled_url: Vec<Regex>,
     #[serde(skip)]
     pub(super) compiled_series_url: Vec<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_author_url: Vec<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_author_novel: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_subtitles: Option<Regex>,
     #[serde(skip)]
@@ -277,6 +309,11 @@ impl SiteSetting {
         }
         self.compiled_url = self.compile_url_patterns();
         self.compiled_series_url = self.compile_url_patterns_for(self.series_url.as_ref());
+        self.compiled_author_url = self.compile_url_patterns_for(self.author_url.as_ref());
+        self.compiled_author_novel = self
+            .author_novel_pattern
+            .as_deref()
+            .and_then(|pattern| crate::downloader::util::compile_html_pattern(pattern).ok());
         self.compiled_subtitles = self.subtitles.as_ref().and_then(|v| self.compile_value(v));
         self.compiled_body = self
             .body_pattern
@@ -387,6 +424,59 @@ impl SiteSetting {
 
     pub fn matches_series_url(&self, url: &str) -> bool {
         self.compiled_series_url.iter().any(|re| re.is_match(url))
+    }
+
+    /// Whether `url` is this site's author page.
+    pub fn matches_author_url(&self, url: &str) -> bool {
+        self.compiled_author_url.iter().any(|re| re.is_match(url))
+    }
+
+    /// Fetch target for `page_url`: the author API when the definition has
+    /// one, otherwise the page itself.
+    pub fn author_fetch_url(&self, page_url: &str) -> String {
+        let Some(template) = self.author_api_url.as_deref() else {
+            return page_url.to_string();
+        };
+        let captures = self.extract_author_url_captures(page_url).unwrap_or_default();
+        self.interpolate_with_captures(template, &captures)
+    }
+
+    /// Captures of `author_url` for a concrete author page.
+    pub fn extract_author_url_captures(&self, url: &str) -> Option<HashMap<String, String>> {
+        extract_captures_from_patterns(&self.compiled_author_url, url)
+    }
+
+    /// 作者ページ（またはその API 応答）から作品 URL を抜く。
+    ///
+    /// 定義が無ければ None。`novel_url` を capture しない定義では
+    /// `author_work_url` に capture を流し込んで URL を作る。
+    pub fn author_novel_urls(&self, source: &str) -> Option<Vec<String>> {
+        let pattern = self.compiled_author_novel.as_ref()?;
+        let mut urls: Vec<String> = Vec::new();
+        for captures in pattern.captures_iter(source) {
+            let named: HashMap<String, String> = pattern
+                .capture_names()
+                .flatten()
+                .filter_map(|name| {
+                    captures
+                        .name(name)
+                        .map(|value| (name.to_string(), value.as_str().to_string()))
+                })
+                .collect();
+            let url = match named.get("novel_url") {
+                Some(url) => url.clone(),
+                None => {
+                    let Some(template) = self.author_work_url.as_deref() else {
+                        continue;
+                    };
+                    self.interpolate_with_captures(template, &named)
+                }
+            };
+            if !url.is_empty() && !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+        Some(urls)
     }
 
     pub fn debug_url_pattern(&self) -> Option<String> {
@@ -631,6 +721,56 @@ fn extract_captures_from_patterns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn author_page_works_are_extracted_from_the_page_or_its_api() {
+        // API を持たないサイト向け: 作者ページの HTML から作品 URL を拾う。
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            "name: Example\nsitename: Example\ndomain: example.com\ntop_url: https://example.com\ntoc_url: \\k<top_url>/\\k<ncode>/\n\
+             author_url: ^https?://example\\.com/user/(?<author_id>\\d+)/\n\
+             author_novel_pattern: (?<novel_url>https?://example\\.com/n\\d+[a-z]+/)\n",
+        )
+        .expect("synthetic definition");
+        setting.compile();
+        assert!(setting.matches_author_url("https://example.com/user/2842627/"));
+        assert!(!setting.matches_author_url("https://example.com/n0915mt/"));
+
+        let html = r#"
+            <a href="https://example.com/n0915mt/">作品1</a>
+            <a href="https://example.com/n1261ku/">作品2</a>
+            <a href="https://example.com/n0915mt/">作品1 (再掲)</a>
+        "#;
+        assert_eq!(
+            setting.author_novel_urls(html).expect("pattern"),
+            vec![
+                "https://example.com/n0915mt/".to_string(),
+                "https://example.com/n1261ku/".to_string()
+            ]
+        );
+
+        // API 向け: capture から `author_work_url` で URL を組み立てる。
+        let mut api: SiteSetting = serde_yaml::from_str(
+            "name: Api\nsitename: Api\ndomain: api.example.com\ntop_url: https://example.com\ntoc_url: \\k<top_url>/\\k<ncode>/\n\
+             author_url: ^https?://example\\.com/user/(?<author_id>\\d+)/\n\
+             author_novel_pattern: '\"ncode\":\"(?<ncode>[nN]\\d+[A-Za-z]+)\"'\n\
+             author_work_url: \\k<top_url>/\\k<lower:ncode>/\n",
+        )
+        .expect("synthetic api definition");
+        api.compile();
+        assert_eq!(
+            api.author_fetch_url("https://example.com/user/2842627/"),
+            "https://example.com/user/2842627/",
+            "author_api_url が無ければ作者ページをそのまま取得する"
+        );
+        assert_eq!(
+            api.author_novel_urls(r#"[{"ncode":"N5181MT"},{"ncode":"N6275MR"}]"#)
+                .expect("pattern"),
+            vec![
+                "https://example.com/n5181mt/".to_string(),
+                "https://example.com/n6275mr/".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn partial_login_pattern_detects_an_incomplete_listing() {

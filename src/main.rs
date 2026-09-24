@@ -292,6 +292,13 @@ async fn run_command(
             commands::web::run_web_server(port, no_browser, hide_console).await;
             0
         }
+        Commands::Author { action } => match commands::author::cmd_author(action).await {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
         Commands::Download {
             targets,
             force,
@@ -354,7 +361,9 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                 0
             }
         }
-        Commands::Download { .. } | Commands::Update { .. } => unreachable!(),
+        Commands::Download { .. } | Commands::Update { .. } | Commands::Author { .. } => {
+            unreachable!()
+        }
         Commands::Mail { targets, force } => {
             commands::mail::cmd_mail(commands::mail::MailOptions { targets, force });
             0

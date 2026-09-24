@@ -64,6 +64,7 @@ const SQLITE_MANAGED_NAMES: &[&str] = &[
     "latest_convert",
     "local_setting",
     "login_cookie",
+    "author",
 ];
 
 struct InventoryCache {

@@ -389,6 +389,35 @@ pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
     }
 }
 
+/// Whether `target` is already managed.
+///
+/// Used by the author check to skip works that are already in the library
+/// before going through the whole download path.
+pub fn target_is_known(target: &str) -> bool {
+    if let Some(toc_url) = resolve_toc_url_from_url(target)
+        && let Ok(Some(_)) = narou_rs::native::novel_repository::NativeNovelRepository::new()
+            .find_by_toc_url_sync(&toc_url)
+    {
+        return true;
+    }
+    let settings = match narou_rs::downloader::site_setting::SiteSetting::load_all() {
+        Ok(settings) => settings,
+        Err(_) => return false,
+    };
+    settings
+        .iter()
+        .filter(|setting| setting.matches_url(target))
+        .filter_map(|setting| setting.extract_url_captures(target))
+        .filter_map(|captures| captures.get("ncode").cloned())
+        .any(|ncode| {
+            narou_rs::native::novel_repository::NativeNovelRepository::new()
+                .find_by_ncode_sync(&ncode)
+                .ok()
+                .flatten()
+                .is_some()
+        })
+}
+
 fn resolve_toc_url_from_url(target: &str) -> Option<String> {
     let settings = narou_rs::downloader::site_setting::SiteSetting::load_all().ok()?;
     for setting in &settings {

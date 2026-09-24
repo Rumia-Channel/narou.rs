@@ -639,6 +639,36 @@ impl Downloader {
         cookies.load_all(host).await.unwrap_or_default()
     }
 
+    /// Fetch an author page and list the work URLs its definition finds.
+    ///
+    /// Uses the same transport and rate limiter as a novel fetch, so a site
+    /// that spaces requests (Pixiv, なろう) is spaced here too. A definition
+    /// without `author_novel_pattern` yields no URLs.
+    pub async fn author_novel_urls(
+        &self,
+        setting: &SiteSetting,
+        page_url: &str,
+    ) -> Result<Vec<String>> {
+        if setting.author_novel_urls("").is_none() {
+            return Err(NarouError::SiteSetting(format!(
+                "{} に author_novel_pattern がありません",
+                setting.sitename
+            )));
+        }
+        let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
+        // Sites with an author API (なろう) answer with JSON instead of HTML.
+        let fetch_url = setting.author_fetch_url(page_url);
+        let body = crate::downloader::http_policy::fetch_text(
+            self.http.as_ref(),
+            self.rate_limiter.as_ref(),
+            &fetch_url,
+            &policy,
+            Some(setting.encoding()),
+        )
+        .await?;
+        Ok(setting.author_novel_urls(&body).unwrap_or_default())
+    }
+
     /// [`Self::with_platform_and_storage_and_settings`] with bundled values.
     #[cfg(feature = "native-runtime")]
     pub fn with_platform_and_storage(
@@ -3382,6 +3412,44 @@ is_narou: false
         let mut source = json.to_string();
         super::util::pretreatment_source(&mut source, "UTF-8", Some(setting));
         source
+    }
+
+    #[test]
+    fn author_pages_fall_back_to_the_sites_own_api() {
+        // なろうの作者ページは小説API から作品を取る: 定義の `author_api_url`
+        // に作者ページの capture が流し込まれ、応答の `ncode` から作品 URL を
+        // 組み立てる (大文字の ncode は小文字化する)。
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|setting| setting.domain == "ncode.syosetu.com")
+            .unwrap();
+        let page = "https://mypage.syosetu.com/2842627/";
+        assert_eq!(
+            setting.author_fetch_url(page),
+            "https://api.syosetu.com/novelapi/api/?out=json&userid=2842627&lim=500"
+        );
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            &setting.author_fetch_url(page),
+            200,
+            r#"[{"allcount":2},{"ncode":"N5181MT","title":"作品1"},{"ncode":"N6275MR","title":"作品2"}]"#,
+        );
+        let downloader = Downloader::with_platform(
+            Arc::new(http),
+            Arc::new(FakeRateLimiter::new()),
+            Arc::new(MemoryNovelRepository::new()),
+        )
+        .unwrap();
+        let urls = futures::executor::block_on(downloader.author_novel_urls(setting, page)).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://ncode.syosetu.com/n5181mt/".to_string(),
+                "https://ncode.syosetu.com/n6275mr/".to_string()
+            ]
+        );
     }
 
     #[test]

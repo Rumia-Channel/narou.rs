@@ -43,6 +43,7 @@ pub mod setting_info;
 #[cfg(feature = "native-runtime")]
 pub mod startup_backup;
 #[cfg(feature = "native-runtime")]
+pub mod author;
 pub mod tag_colors;
 #[cfg(feature = "native-runtime")]
 pub mod termcolor;

@@ -34,6 +34,7 @@ const MANAGED_LOCAL: &[(&str, &str)] = &[
     ("tag_colors", "tag_colors.yaml"),
     ("login_cookie", "login_cookie.yaml"),
     ("latest_convert", "latest_convert.yaml"),
+    ("author", "author.yaml"),
     ("local_setting", "local_setting.yaml"),
     ("queue", "queue.yaml"),
     ("notepad", "notepad.txt"),

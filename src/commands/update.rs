@@ -240,6 +240,26 @@ pub async fn cmd_update(opts: UpdateOptions) {
         }
     }
 
+    // 追跡中の作者を確認し、新しく公開された作品を追加する (`narou author add`)。
+    // 小説の更新が終わった後に行うので、作者が公開したばかりの作品も同じ実行で入る。
+    let author_tracking = !load_local_setting_bool("update.disabled-author-tracking");
+    if author_tracking && narou_rs::author::authors_for_current_root().is_ok_and(|a| !a.is_empty()) {
+        if abort_if_interrupted(interrupted.as_ref()).is_err() {
+            println!("アップデートを中断しました");
+            std::process::exit(126);
+        }
+        match crate::commands::author::check_tracked_authors(opts.user_agent.as_deref()).await {
+            Ok(report) => {
+                report.print();
+                mistook += report.failed;
+            }
+            Err(e) => {
+                println!("作者の確認に失敗しました\n  {}", e);
+                mistook += 1;
+            }
+        }
+    }
+
     if mistook > 0 {
         println!("\n{} 件のエラーが発生しました", mistook);
     }
