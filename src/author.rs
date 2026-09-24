@@ -18,29 +18,17 @@ use crate::error::Result;
 pub const INVENTORY_NAME: &str = "author";
 
 /// One tracked author.
+///
+/// Nothing but the site and the page: the URL is the identity, and everything
+/// else (name, when it was added, when it was last checked) is either
+/// derivable or bookkeeping the feature does not need.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthorRecord {
     /// Site definition domain the author page belongs to, e.g.
     /// `ncode.syosetu.com`.
     pub site: String,
-    /// Author page URL, e.g. `https://mypage.syosetu.com/2842627/`.
+    /// Author page URL, e.g. `https://mypage.syosetu.com/2842627/`. Unique.
     pub url: String,
-    /// Display name, when the site definition or the user provided one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// When the author was added (RFC 3339).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub added_at: Option<String>,
-    /// When the page was last checked (RFC 3339).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_checked_at: Option<String>,
-    /// Works found by the last check that were not in the library yet.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub last_found: usize,
-}
-
-fn is_zero(value: &usize) -> bool {
-    *value == 0
 }
 
 impl AuthorRecord {
@@ -48,26 +36,7 @@ impl AuthorRecord {
         Self {
             site: site.into(),
             url: url.into(),
-            name: None,
-            added_at: None,
-            last_checked_at: None,
-            last_found: 0,
         }
-    }
-
-    pub fn with_name(mut self, name: Option<String>) -> Self {
-        self.name = name.filter(|name| !name.trim().is_empty());
-        self
-    }
-
-    pub fn with_added_at(mut self, added_at: Option<String>) -> Self {
-        self.added_at = added_at;
-        self
-    }
-
-    /// Label for the CLI and Web UI, falling back to the URL.
-    pub fn display_name(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.url)
     }
 
     /// Whether two entries point at the same page.
@@ -91,21 +60,16 @@ pub fn load_authors(inventory: &Inventory) -> Result<Vec<AuthorRecord>> {
         let Some(url) = key.as_str() else {
             continue;
         };
-        match serde_yaml::from_value::<AuthorRecord>(entry.clone()) {
-            Ok(author) => authors.push(author),
-            // A URL key with an unusable body keeps the site alone, so a hand
-            // edited file still tracks something instead of silently dropping.
-            Err(_) => {
-                authors.push(AuthorRecord {
-                    site: String::new(),
-                    url: url.to_string(),
-                    name: None,
-                    added_at: None,
-                    last_checked_at: None,
-                    last_found: 0,
-                });
-            }
-        }
+        // 値はサイト名だけ。旧形式 (site/name/added_at… を持つマップ) も読む。
+        let site = match entry {
+            serde_yaml::Value::String(site) => site.clone(),
+            other => other
+                .get("site")
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        };
+        authors.push(AuthorRecord::new(site, url));
     }
     authors.sort_by(|left, right| {
         left.site
@@ -118,18 +82,17 @@ pub fn load_authors(inventory: &Inventory) -> Result<Vec<AuthorRecord>> {
 /// Replace the tracked authors.
 pub fn save_authors(inventory: &Inventory, authors: &[AuthorRecord]) -> Result<()> {
     if authors.is_empty() {
-        inventory.save_raw(INVENTORY_NAME, InventoryScope::Local, "")
-    } else {
-        let mut map = serde_yaml::Mapping::new();
-        for author in authors {
-            map.insert(
-                serde_yaml::Value::String(author.url.clone()),
-                serde_yaml::to_value(author)?,
-            );
-        }
-        let text = serde_yaml::to_string(&serde_yaml::Value::Mapping(map))?;
-        inventory.save_raw(INVENTORY_NAME, InventoryScope::Local, &text)
+        return inventory.save_raw(INVENTORY_NAME, InventoryScope::Local, "");
     }
+    let mut map = serde_yaml::Mapping::new();
+    for author in authors {
+        map.insert(
+            serde_yaml::Value::String(author.url.clone()),
+            serde_yaml::Value::String(author.site.clone()),
+        );
+    }
+    let text = serde_yaml::to_string(&serde_yaml::Value::Mapping(map))?;
+    inventory.save_raw(INVENTORY_NAME, InventoryScope::Local, &text)
 }
 
 /// Convenience: the tracked authors of the current library.
@@ -164,41 +127,6 @@ pub fn remove_author(url: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Record the outcome of a check for `url`.
-pub fn mark_checked(
-    inventory: &Inventory,
-    url: &str,
-    checked_at: &str,
-    found: usize,
-    name: Option<&str>,
-) -> Result<bool> {
-    let mut authors = load_authors(inventory)?;
-    let mut changed = false;
-    for author in authors.iter_mut() {
-        if author.url != url {
-            continue;
-        }
-        author.last_checked_at = Some(checked_at.to_string());
-        author.last_found = found;
-        if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
-            author.name = Some(name.to_string());
-        }
-        changed = true;
-    }
-    if changed {
-        save_authors(inventory, &authors)?;
-    }
-    Ok(changed)
-}
-
-/// Keyed view used by callers that prefer lookups by URL.
-pub fn authors_by_url(authors: &[AuthorRecord]) -> BTreeMap<String, AuthorRecord> {
-    authors
-        .iter()
-        .map(|author| (author.url.clone(), author.clone()))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,23 +148,39 @@ mod tests {
         let (_temp, _guard, inventory) = library();
 
         assert!(load_authors(&inventory).unwrap().is_empty());
-        let mut author = AuthorRecord::new(
-            "ncode.syosetu.com",
-            "https://mypage.syosetu.com/2842627/",
-        )
-        .with_name(Some("作者名".into()));
-        author.added_at = Some("2026-09-24T00:00:00+09:00".into());
+        let author =
+            AuthorRecord::new("ncode.syosetu.com", "https://mypage.syosetu.com/2842627/");
         save_authors(&inventory, std::slice::from_ref(&author)).unwrap();
 
-        let loaded = load_authors(&inventory).unwrap();
-        assert_eq!(loaded, vec![author]);
+        assert_eq!(load_authors(&inventory).unwrap(), vec![author]);
 
-        // The record holds the site and the page; nothing about novels.
+        // 保存は URL(ユニーク) → サイト名 だけ。余計な情報は持たない。
         let text = inventory
             .load_raw(INVENTORY_NAME, InventoryScope::Local)
             .unwrap();
-        assert!(text.contains("ncode.syosetu.com"), "got {text}");
-        assert!(text.contains("mypage.syosetu.com/2842627"), "got {text}");
+        assert_eq!(
+            text.trim(),
+            "https://mypage.syosetu.com/2842627/: ncode.syosetu.com"
+        );
+    }
+
+    #[test]
+    fn a_map_written_by_an_older_build_still_reads() {
+        let _legacy = legacy_yaml_guard();
+        let (_temp, _guard, inventory) = library();
+
+        inventory
+            .save_raw(
+                INVENTORY_NAME,
+                InventoryScope::Local,
+                "https://mypage.syosetu.com/2842627/:\n  site: ncode.syosetu.com\n  name: 作者名\n  last_found: 2\n",
+            )
+            .unwrap();
+
+        let loaded = load_authors(&inventory).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].site, "ncode.syosetu.com");
+        assert_eq!(loaded[0].url, "https://mypage.syosetu.com/2842627/");
     }
 
     #[test]
@@ -253,30 +197,5 @@ mod tests {
         assert!(remove_author(&author.url).unwrap());
         assert!(!remove_author(&author.url).unwrap());
         assert!(authors_for_current_root().unwrap().is_empty());
-    }
-
-    #[test]
-    fn checking_an_author_updates_its_bookkeeping() {
-        let _legacy = legacy_yaml_guard();
-        let (_temp, _guard, inventory) = library();
-
-        let author =
-            AuthorRecord::new("ncode.syosetu.com", "https://mypage.syosetu.com/2842627/");
-        add_author(&author).unwrap();
-        assert!(
-            mark_checked(
-                &inventory,
-                &author.url,
-                "2026-09-24T10:00:00+09:00",
-                2,
-                Some("作者名")
-            )
-            .unwrap()
-        );
-
-        let loaded = authors_for_current_root().unwrap();
-        assert_eq!(loaded[0].last_found, 2);
-        assert_eq!(loaded[0].last_checked_at.as_deref(), Some("2026-09-24T10:00:00+09:00"));
-        assert_eq!(loaded[0].name.as_deref(), Some("作者名"));
     }
 }

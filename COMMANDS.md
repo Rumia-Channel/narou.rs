@@ -254,12 +254,12 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 | サブコマンド | 内容 |
 |---|---|
-| `add <URL> [--name N]` | 作者ページを登録。`author_url` に一致するサイト定義が必要 |
-| `list` | 登録済みの作者（サイト / ページ URL / 最終確認 / 前回の新規件数） |
+| `add <URL>` | 作者ページを登録。`author_url` に一致するサイト定義が必要 |
+| `list` | 登録済みの作者（サイト / ページ URL） |
 | `remove <URL\|番号>` | `list` の番号か URL で解除 |
 | `check` | いま全作者を確認して新規作品を追加（`update` と同じ処理） |
 
-**保存形式**: 小説とは別の inventory `author`（SQLite `app_state` / `.narou/author.yaml`）に、`サイト` と `作者ページ URL` と帳簿（名前・追加日時・最終確認・前回の新規件数）だけを持つ。
+**保存形式**: 小説とは別の inventory `author`（SQLite `app_state` / `.narou/author.yaml`）に、**作者ページ URL（ユニーク）→ サイト名** だけを持つ。名前や日時などの帳簿は持たない。
 
 **サイト定義**: `author_url`（作者ページを認識する正規表現）/ `author_api_url`（作品一覧 API の雛形。任意）/ `author_novel_pattern`（作品を抜く正規表現。`novel_url` か、`author_work_url` 用の capture）/ `author_work_url`（capture から作品 URL を作る雛形）。
 

@@ -9,7 +9,6 @@
 use std::collections::HashSet;
 
 use narou_rs::author::{self, AuthorRecord};
-use narou_rs::db::inventory::Inventory;
 use narou_rs::downloader::Downloader;
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::{NarouError, Result};
@@ -21,11 +20,8 @@ use crate::commands::download::{self, DownloadOptions};
 pub enum AuthorAction {
     /// Track an author page (e.g. `https://mypage.syosetu.com/2842627/`).
     Add {
-        /// Asset page URL.
+        /// Author page URL.
         url: String,
-        /// Label shown in `narou author list`.
-        #[arg(long)]
-        name: Option<String>,
     },
     /// List tracked authors.
     List,
@@ -41,7 +37,7 @@ pub enum AuthorAction {
 /// Run `narou author`.
 pub async fn cmd_author(action: AuthorAction) -> Result<()> {
     match action {
-        AuthorAction::Add { url, name } => add(&url, name),
+        AuthorAction::Add { url } => add(&url),
         AuthorAction::List => list(),
         AuthorAction::Remove { target } => remove(&target),
         AuthorAction::Check => {
@@ -53,7 +49,7 @@ pub async fn cmd_author(action: AuthorAction) -> Result<()> {
 }
 
 /// Register an author page.
-fn add(url: &str, name: Option<String>) -> Result<()> {
+fn add(url: &str) -> Result<()> {
     let settings = SiteSetting::load_all()?;
     let setting = settings
         .iter()
@@ -63,15 +59,9 @@ fn add(url: &str, name: Option<String>) -> Result<()> {
                 "{url} を作者ページとして扱うサイト定義がありません (author_url 未定義)"
             ))
         })?;
-    let author = AuthorRecord::new(setting.domain.clone(), url)
-        .with_name(name)
-        .with_added_at(Some(chrono::Local::now().to_rfc3339()));
+    let author = AuthorRecord::new(setting.domain.clone(), url);
     if author::add_author(&author)? {
-        println!(
-            "作者を登録しました: {} ({})",
-            author.display_name(),
-            author.site
-        );
+        println!("作者を登録しました: {} ({})", author.url, author.site);
         println!("  `narou update` のたびに確認し、新しい作品があれば追加します。");
     } else {
         println!("{} は既に登録されています。", author.url);
@@ -89,18 +79,7 @@ fn list() -> Result<()> {
     }
     println!("追跡中の作者: {} 件", authors.len());
     for (index, author) in authors.iter().enumerate() {
-        let checked = author
-            .last_checked_at
-            .as_deref()
-            .map(|checked| format!(" / 最終確認 {checked}"))
-            .unwrap_or_default();
-        let found = if author.last_checked_at.is_some() {
-            format!(" / 前回の新規 {} 件", author.last_found)
-        } else {
-            String::new()
-        };
-        println!("  {}. {:<24} [{}]{checked}{found}", index + 1, author.display_name(), author.site);
-        println!("     {}", author.url);
+        println!("  {}. [{}] {}", index + 1, author.site, author.url);
     }
     Ok(())
 }
@@ -165,7 +144,6 @@ pub async fn check_tracked_authors(user_agent: Option<&str>) -> Result<AuthorChe
     if authors.is_empty() {
         return Ok(report);
     }
-    let inventory = Inventory::with_default_root()?;
     let settings = SiteSetting::load_all()?;
     let downloader = Downloader::with_user_agent(user_agent)?;
     let mut seen: HashSet<String> = HashSet::new();
@@ -236,15 +214,6 @@ pub async fn check_tracked_authors(user_agent: Option<&str>) -> Result<AuthorChe
         report.checked += 1;
         report.added += added;
         report.known += known;
-        if let Err(error) = author::mark_checked(
-            &inventory,
-            &author.url,
-            &chrono::Local::now().to_rfc3339(),
-            added,
-            None,
-        ) {
-            eprintln!("作者 {} の記録を更新できません: {error}", author.url);
-        }
     }
     Ok(report)
 }
