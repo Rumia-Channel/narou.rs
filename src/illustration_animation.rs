@@ -13,7 +13,12 @@
 //! Python bridge produced with Pillow). Decoding handles JPEG and PNG frames;
 //! frames of other formats fall back to the first decodable frame so the
 //! illustration is still usable.
+//!
+//! Decoding needs the `image` and `zip` crates, which the portable (Worker /
+//! wasm) build leaves out. There `assemble_animation` reports the archive as
+//! unsupported instead, so callers keep the bytes they downloaded.
 
+#[cfg(feature = "illustration-animation")]
 use std::io::Read;
 
 use crate::error::{NarouError, Result};
@@ -49,6 +54,17 @@ fn is_zip(bytes: &[u8]) -> bool {
     bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06")
 }
 
+/// Frame decoding and APNG assembly need the `zip` and `image` crates. The
+/// portable (Worker / wasm) build leaves both out; its callers keep the
+/// archive as it arrived and report this through their warning path.
+#[cfg(not(feature = "illustration-animation"))]
+fn build_apng(_archive: &[u8], _delays: &[u16]) -> Result<Vec<u8>> {
+    Err(NarouError::Platform(
+        "assembling an animated illustration needs the zip and image crates".into(),
+    ))
+}
+
+#[cfg(feature = "illustration-animation")]
 fn build_apng(archive: &[u8], delays: &[u16]) -> Result<Vec<u8>> {
     let frames = decode_frames(archive)?;
     let first = frames
@@ -106,6 +122,7 @@ fn build_apng(archive: &[u8], delays: &[u16]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(feature = "illustration-animation")]
 fn frame_control(sequence: u32, width: u32, height: u32, delay_ms: u16) -> Vec<u8> {
     let mut payload = Vec::with_capacity(26);
     payload.extend_from_slice(&sequence.to_be_bytes());
@@ -120,6 +137,7 @@ fn frame_control(sequence: u32, width: u32, height: u32, delay_ms: u16) -> Vec<u
     png_chunk(b"fcTL", &payload)
 }
 
+#[cfg(feature = "illustration-animation")]
 fn png_chunk(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut chunk = Vec::with_capacity(payload.len() + 12);
     chunk.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -132,6 +150,7 @@ fn png_chunk(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     chunk
 }
 
+#[cfg(feature = "illustration-animation")]
 fn decode_frames(archive: &[u8]) -> Result<Vec<image::RgbaImage>> {
     let cursor = std::io::Cursor::new(archive);
     let mut zip = zip::ZipArchive::new(cursor)
@@ -170,6 +189,7 @@ fn decode_frames(archive: &[u8]) -> Result<Vec<image::RgbaImage>> {
 /// Encode one frame. Frames stay RGBA: an animated work may carry
 /// transparency, and keeping one colour type for every frame is what the APNG
 /// requires anyway.
+#[cfg(feature = "illustration-animation")]
 fn encode_png(frame: &image::RgbaImage) -> Result<Vec<u8>> {
     let mut png = Vec::new();
     image::DynamicImage::ImageRgba8(frame.clone())
@@ -179,6 +199,7 @@ fn encode_png(frame: &image::RgbaImage) -> Result<Vec<u8>> {
 }
 
 /// Split a PNG into its `IHDR` payload and the concatenated `IDAT` payload.
+#[cfg(feature = "illustration-animation")]
 fn split_png(png: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut cursor = 8usize; // skip the signature
     let mut ihdr = Vec::new();
@@ -208,7 +229,7 @@ fn split_png(png: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     Ok((ihdr, idat))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "illustration-animation"))]
 mod tests {
     use super::*;
     use std::io::Write;

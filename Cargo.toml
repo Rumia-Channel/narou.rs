@@ -23,7 +23,7 @@ native-runtime = [
     "dep:curl",
     "dep:indicatif",
     "dep:zip",
-    "dep:image",
+    "illustration-animation",
     "dep:lettre",
     "dep:unicode-normalization",
     "dep:similar",
@@ -49,7 +49,10 @@ native-runtime = [
 # see assets/aozora_lite/LICENSE.md. The Worker runtime enables it always.
 lite = ["dep:aozora_epub3_lite"]
 worker-runtime = ["lite"]
-image = ["dep:image"]
+# Animated illustrations arrive as a frame archive and are assembled into an
+# APNG, which needs the image codecs and a ZIP reader. The portable (Worker /
+# wasm) build leaves both out and keeps the archive as it arrived.
+illustration-animation = ["dep:image", "dep:zip"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
