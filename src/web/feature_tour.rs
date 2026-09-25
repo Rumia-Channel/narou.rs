@@ -106,18 +106,18 @@ const FEATURE_TOURS: &[FeatureTourEntry] = &[
         body: "Pixiv の URL から作品を登録し、本文やページ画像を取得できるようになりました。",
         items: &[
             "小説・小説シリーズ・イラスト/漫画・漫画シリーズの URL に対応",
-            "挿絵や漫画のページ画像を保存。うごイラは対応するネイティブ版で APNG に変換",
-            "R18・ログイン限定作品は、先にログイン Cookie を登録してから取得",
+            "挿絵や漫画のページ画像を保存し、うごイラはネイティブ版で APNG に変換",
+            "R18・ログイン限定作品を取得するには、先にログイン Cookie を登録",
         ],
     },
     FeatureTourEntry {
         version: "0.4.3",
         title: "ログインが必要な作品を取得",
-        body: "保存したログイン Cookie を使い、ログイン壁に当たった作品の取得を再試行できます。",
+        body: "ログインを求められた作品は、保存済みの Cookie を使って再取得できます。",
         items: &[
-            "同梱の narou_rs_login でブラウザから Cookie を取得。別端末からは書き出し・取り込みも可能",
-            "環境設定の「ログイン」タブや narou login で登録・管理。複数のログインは試行順を変更可能",
-            "保存した Cookie は暗号化。ログイン不要な作品には通常送信しない",
+            "同梱の narou_rs_login でブラウザの Cookie を取得し、書き出しファイルで別端末へ持ち込めます",
+            "環境設定の「ログイン」タブや narou login で管理し、複数のアカウントを試す順序も変更できます",
+            "Cookie は暗号化して保存し、ログイン不要な作品には通常送信しません",
         ],
     },
     FeatureTourEntry {
@@ -135,8 +135,8 @@ const FEATURE_TOURS: &[FeatureTourEntry] = &[
         body: "環境設定の Global タブで、今後のセルフアップデートで取得する版を選べます。",
         items: &[
             "GPL 版は AozoraEpub3_Lite を組み込み、通常版は外部 AozoraEpub3 を利用",
-            "self-update.variant を GPL 版 / 通常版 / 未設定から選択。CLI の narou setting でも変更可能",
-            "未設定なら実行中のビルドと同じ版を取得",
+            "self-update.variant で GPL 版 / 通常版 / 未設定を選択。CLI の narou setting でも変更可能",
+            "未設定なら、現在利用中のビルドと同じ種類の版を取得",
         ],
     },
 ];

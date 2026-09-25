@@ -1,13 +1,13 @@
 # SQLite 管理基盤移行計画 (2026-08-25)
 
-## 実装状況 (2026-08-25): **P0〜P4b 完了 / P5 一部**
+## 実装状況 (2026-09-25): **P0〜P4c 完了 / P5 一部** (Inventory 削減は legacy import 用に残置)
 
 | Phase | 状態 |
 |---|---|
 | P0 監査 | ✅ docs/sqlite-p0-record-mapping.md + tests/golden |
 | P1 エンジン | ✅ src/native/sqlite/ dual-run テスト9件 |
 | P2 メタデータ切替 | ✅ 自動import+rename退避 / narou db verify\|export-yaml\|vacuum / queue・notepad・settings 経由化 |
-| P3 既定化 | ✅ Database::new が db.sqlite を既定使用。YAML非書込テスト & perf smoke(1000件) 追加 |
+| P3 既定化 | ✅ dual-run/非書込テスト & perf smoke(1000件) 完了。※当初計画の「SQLite 既定」は P6 (文末) で方針変更し、既定は YAML 継続・SQLite はオプトイン |
 | P4a コンテンツ | ✅ novel_sections/novel_outputs ミラー (convert時)。Web DL時EPUBはDB優先。sectionsの全経路DB化は段階継続 |
 | P4b 差分履歴 | ✅ §11テーブル実装 + diff CLI拡張 (--history/--show/--restore/--merge-from/--merge-sections) + prune。**update時自動snapshotはconvertフック経由**、Web api_diff拡張と行レベル3-wayマージは未着手 |
 | P4c オブジェクト格納 | ✅ `objects`/`object_chunks` (BLOB + brotli + crc32) に小説データ/生成物を格納。native は FS ミラー+読みフォールバック+union listing、worker は D1 のみ (Wasabi 撤去)。`configure` 時に空なら FS 一括 import。`section_bodies` で本文を content-addressed dedup、`novel_outputs`/`unified_diff` も圧縮 |
@@ -19,6 +19,8 @@
 3. HTTPレスポンスは全体バッファ後返却 (Lite自体はチャンク書出対応)
 
 ## 0. ポリシー変更の定義
+
+この節と第7節の表は当初の計画を記録したもの。現在は YAML 管理が既定で SQLite 管理は選択制。SQLite 管理時も `narou-compat=true` ならローカル YAML を維持し、グローバル設定はモードに関係なくファイル管理する。現在の挙動は冒頭の実装状況と `AGENTS.md` を優先する。
 
 本計画はプロジェクトの互換性ポリシーを以下のように変更する (**AGENTS.md の Porting Policy / 互換性要件の改訂を含む**)。
 
@@ -37,17 +39,17 @@
 | 現行ファイル | SQLite 移行先 | 備考 |
 |---|---|---|
 | `database.yaml` | `novels` (33+ 列) | Worker D1 の `0001_core`〜`0003_status_sort` スキーマをほぼ踏襲 |
-| `database_index.yaml` (SHA256 fingerprint) | 廃止 | SQLite 自身がインデックスを持つ (`index_store.rs` 役割終了) |
+| `database_index.yaml` (SHA256 fingerprint) | SQLite では廃止 | SQLite モードでは DB が索引を持つ。YAML / narou-compat モードでは引き続き使用 |
 | ID 採番 | `novel_id_sequence` | D1 と同一 (atomic allocate) |
 | `freeze.yaml` (+lock) | `frozen_novels` | fs2 lock 不要化 |
 | タグ | `novel_tags` (position, tag, tag_fold) | `database.rs` の tag index 置換 |
 | `tag_colors.yaml` | `app_state('tag_colors','colors')` | D1 実装と同一キー |
 | `alias.yaml` | `app_state('alias', ncode→id)` | |
-| `latest_convert.yaml` | `novels.last_convert_at` 列追加 (0007) | |
+| `latest_convert.yaml` | `app_state('inv','latest_convert')` | 当初 `novels.last_convert_at` 列案だったが逸脱2の通り app_state 実装 |
 | `notepad.txt` | `app_state('notepad','text')` | |
-| `local_setting.yaml` | `app_state('local', …)` | 初回起動時に import、以後 DB が truth |
-| `~/.narousetting/global_setting.yaml` | `app_state('global', …)` | 同上 (パスは読み取り専用の legacy 入力へ格下げ) |
-| `queue.yaml` | `jobs` (worker_jobs と同構造) | `PersistentQueue` を SQLite 実装へ差し替え。retry backoff / lease も列で管理 |
+| `local_setting.yaml` | `app_state('local', …)` | SQLite モード時のみ。初回起動時に import、以後 DB が truth |
+| `~/.narousetting/global_setting.yaml` | ~~`app_state('global', …)`~~ → **ファイル管理のまま** | 後述。SQLite 移行は 2026-09 に見送り (AGENTS.md「グローバル設定の保存先」) |
+| `queue.yaml` | `app_state('inv','queue')` | 当初 `worker_jobs` 型テーブル案だったが逸脱1の通り app_state 実装 |
 | `.illustration_cache.yaml` (+index) | `novel_illustrations` (0008) | blob 本体は引き続き ObjectStore (FS) |
 
 ### 1.2 コンテンツ層 (Phase P4 — 別途詳細設計)
@@ -79,7 +81,7 @@ src/native/sqlite/                (NEW: rusqlite ラッパ)
 
 ## 3. 後方互換性の保証 (守るもの)
 
-1. **自動取り込み**: 起動時に `novels.db` が無く legacy YAML があれば、サイレントに 1 回 import (全処理単一トランザクション)。完了後、元 YAML は `*.yaml.imported-<ts>` へ退避 (削除しない)。
+1. **自動取り込み**: 起動時に `.narou/db.sqlite` が無く legacy YAML があれば、サイレントに 1 回 import (全処理単一トランザクション)。完了後、元 YAML は `*.yaml.imported-<ts>` へ退避 (削除しない)。
 2. **外部挙動不変**: CLI の引数/出力/終了コード、Web API、`--multiple` 等のグローバル機能は現状維持。差分は COMMANDS.md で ✅ を維持できなければならない。
 3. **ロールバック**: `narou db export-yaml [--out DIR]` で常に legacy 形式を再生成できる。旧バージョンへ戻す場合は export → 旧版起動、という手順を README に明記。
 4. **混在検知**: DB 使用中に legacy YAML が再出現した場合は警告して無視 (取り込まない)。逆に `--legacy` フラグ付き起動では DB を読まず YAML を読むデバッグ経路をテスト用に残す。
@@ -96,7 +98,7 @@ src/native/sqlite/                (NEW: rusqlite ラッパ)
 |---|---|---|
 | クレート | `rusqlite` (feature `bundled`) | デファクト。bundled でシステム sqlite3 依存を排除 |
 | 追加方法 | `cargo add rusqlite --features bundled` → features 節は手編集 (Dependency Policy の例外理由: feature gate 必須のため) | |
-| 配置 | `db.sqlite` (名前仮) を archive root 直下 | 単一ファイル配布・backup 容易 |
+| 配置 | `.narou/db.sqlite` (当初は archive root 直下に `novels.db` 案) | 単一ファイル配布・backup 容易 |
 | ジャーナル | WAL + `synchronous=NORMAL` | tray/web/CLI の複数プロセス同時接続に耐える |
 | 同時書込 | busy_timeout + 書込は既存 queue lane の直列性を尊重 | fs2 lock 廃止 |
 
@@ -125,7 +127,7 @@ src/native/sqlite/                (NEW: rusqlite ラッパ)
 | リスク | 緩和 |
 |---|---|
 | Windows の AV/索引による db ファイル掴み | WAL + busy_timeout、open retry (既存 Windows retry ロジックを接続層へ移植) |
-| DB 破損 | migrate 前自動 backup (`novels.db.bak-<ts>` 1 世代)、`narou db verify` (=integrity_check)、export-yaml による脱出路 |
+| DB 破損 | migrate 前自動 backup (`db.sqlite.bak-<ts>` 1 世代)、`narou db verify` (=integrity_check)、export-yaml による脱出路 |
 | 複数プロセス (tray/web/queue 子プロセス) の書込競合 | 単一 writer 原則 (queue lane 直列を利用) + BEGIN IMMEDIATE |
 | bundled sqlite の cross compile (armv6/7) | release CI の cross ビルドで早期検出、失敗時は `libsqlite3-sys` の系統調整 |
 | 大規模ライブラリでの移行時間 | import は prepared batch + 単一 tx。10k 件 < 30s 目標、超えたら chunked commit に切替 |
@@ -196,10 +198,10 @@ update 実行 → 差分検出 (既存ロジック)
 | 操作 | 従来 | 変更後 |
 |---|---|---|
 | `narou diff <id>` | diff.txt の最新差分表示 | **同一出力**を head version の unified_diff から表示 |
-| `narou diff <id> --list` | (なし・追加) | version 一覧 (`id, origin, created_at, sections, summary`) |
+| `narou diff <id> --list` | (なし・追加) | version 一覧 (`id, origin, created_at, sections, summary`) ※実装ではフラグ名 `--history` |
 | `narou diff <id> --show <ver>` | (追加) | 指定版の unified diff 表示 |
-| `narou diff <id> --restore <ver>` | (追加) rollback | 対象版の sections を**コピーして新 head にする** (非破壊。`--drop-newer` で後続版 pruning を明示指定時のみ) |
-| `narou diff <id> --merge-from <ver> [--section N,...]` | (追加) merge | 指定版 (省略時は全指定 section) を現行へ上書き複写し新 head 作成 |
+| `narou diff <id> --restore <ver>` | (追加) rollback | 対象版の sections を**コピーして新 head にする** (非破壊。※計画の `--drop-newer` オプションは未実装、常に copy-forward) |
+| `narou diff <id> --merge-from <ver> [--merge-sections N,...]` | (追加) merge | 指定版 (省略時は全指定 section) を現行へ上書き複写し新 head 作成 ※実装フラグ名は `--merge-sections` |
 | Web `POST api_diff` | 単一差分 JSON | 最新差分 + 履歴リスト (フィールド追加のみ・既存キー不変) |
 | Web `api_diff_clean` | diff.txt 削除 | 履歴全削除 (= prune all)。挙動名は維持 |
 

@@ -1,6 +1,6 @@
 # narou.rs コマンド互換性ドキュメント
 
-narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状況・要件を整理する。Rust 拡張の `illust` (挿絵メンテナンス) と `login` (ログイン情報管理) を含む 26 コマンドを網羅する。
+narou.rb 全24コマンドのオプション・挙動と、Rust 側の実装状況・要件を整理する。Rust 拡張の `db` (SQLite 管理 DB 保守)・`illust` (挿絵メンテナンス)・`login` (ログイン情報管理) を含む 27 コマンドを網羅する。
 
 ---
 
@@ -76,7 +76,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | init | | | ショートカット無し（`i` / `in` は inspect） |
 | db（Rust 拡張） | | `db` | narou.rb コマンドのショートカットを奪わない |
 | illust（Rust 拡張） | | `il` | 同上 |
-| login（Rust 拡張） | | `log` は `log` コマンド | narou.rb コマンドのショートカットを奪わない |
+| login（Rust 拡張） | | | ショートカット無し。`lo` は `log` に解決されるため、フル名でのみ呼べる |
 
 **注意**: v0.4.0 では `COMMAND_NAMES` の先頭に Rust 拡張の `db` が入っていたため `narou d` が `db` に解決されていた。現在は upstream と同じ並び（Rust 拡張は末尾）で、`d` は `download`。`src/cli.rs` のテストで並び順と主要な解決結果を固定している。
 
@@ -87,22 +87,23 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | コマンド | narou.rb | Rust 完了度 | 備考 |
 |---------|:--------:|:-----------:|------|
 | `init` | ✅ | ✅ 完了 | AozoraEpub3 設定含め完全 |
-| `download` | ✅ | 🟡 部分 | `--mail` と保存フォルダ欠落時の再DL確認まで実装。`mail` 系の end-to-end は `tests/mail_e2e.rs` で完了済み |
-| `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、section hash cache 永続化、digest選択肢、差分cache退避、Ctrl+C 中断、hotentryのcopy/send/mailまでは実装済み。hotentry 周辺の細部が残る |
-| `convert` | ✅ | 🟡 部分 | `--output` / `--enc` / テキストファイル入力 / `--inspect` / `convert.inspect` / `--no-open` / `--no-epub` / `--no-mobi` / `--no-strip` / `--make-zip` / `--no-zip` / `--verbose` / `device` 設定反映 / `convert.multi-device` / `convert.copy-to` / `convert.copy-zip-to` / `convert.copy-to-grouping` / `--ignore-default` / `--ignore-force` / `dc:subject` 埋め込み / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript`、表紙タイトルの `title_date` / 完結装飾反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFOまでは実装。実機 send 最終確認が残る |
-| `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--echo` と pipe 時ID出力まで実装 |
+| `download` | ✅ | 🟡 部分 | `--mail` と保存フォルダ欠落時の再DL確認まで実装。Pixiv (小説/小説シリーズ/イラスト・漫画/漫画シリーズ)、サイト定義の `headers:`/`min_interval:`、`narou login` のログイン Cookie フォールバックまで対応。`mail` 系の end-to-end は `tests/mail_e2e.rs` で完了済み |
+| `update` | ✅ | 🟡 部分 | Ruby版ターゲット解決、freeze.yaml参照、完結タグ同期、`--gl`主要挙動、`update.strong` 相当の同日本文比較、section hash cache 永続化、digest選択肢、差分cache退避、Ctrl+C 中断、ドメイン別並列DL (`update.max-parallel-domains`)、hotentryのcopy/send/mailまでは実装済み。hotentry 周辺の細部が残る |
+| `convert` | ✅ | 🟡 部分 | `--output` / `--enc` / テキストファイル入力 / `--inspect` / `convert.inspect` / `--no-open` / `--no-epub` / `--no-mobi` / `--no-strip` / `--make-zip` / `--no-zip` / `--verbose` / `device` 設定反映 / `convert.multi-device` / `convert.copy-to` / `convert.copy-zip-to` / `convert.copy-to-grouping` / `--ignore-default` / `--ignore-force` / `dc:subject` 埋め込み / `調査ログ.txt` 生成、`enable_erase_introduction` / `enable_erase_postscript`、表紙タイトルの `title_date` / 完結装飾反映、Ruby式の auto-indent 判定、保存済み/未保存の挿絵ローカル注記化と保存INFO、`lite` feature の組み込み EPUB エンジン (AozoraEpub3_Lite) フォールバックまでは実装。実機 send 最終確認が残る |
+| `list` | ✅ | ✅ 完了 | `limit`, `--latest`, `--gl`, `--reverse`, `--url`, `--kind`, `--site`, `--author`, `--filter`, `--grep`, `--tag`, `--sort-by`, `--echo` と pipe 時ID出力まで実装 |
 | `tag` | ✅ | ✅ 完了 | `--add`, `--delete`, `--color`, `--clear`、引数なしタグ一覧、タグ検索、`tag_colors.yaml` 自動色ローテーションと `webui.new-tag-color` 既定色まで実装 |
 | `freeze` | ✅ | ✅ 完了 | `--list` / `--on` / `--off`、freeze.yaml 同期、URL/Nコード/alias/tag 解決まで実装 |
 | `remove` | ✅ | ✅ 完了 | `--yes`, `--with-file`, `--all-ss`、確認、freeze/lock チェックを実装 |
-| `web` | ✅ | 🟡 部分 | API / queue worker / auto-scheduler に加え、pure JS / pure CSS の分割 frontend、JP/EN 切替、theme/performance/reload 設定反映までは実装済み。frontend は全件取得+client-side 描画のため narou.rb 細部 parity は継続中 |
-| `setting` | ✅ | ✅ 完了 | 基本読み書き、`--burn`、dynamic `default/force/default_args`、hidden select 値検証、`setting -a` の全変数一覧まで Ruby 互換に揃えた |
+| `web` | ✅ | 🟡 部分 | API / queue worker (自動リトライ含む) / auto-scheduler に加え、pure JS / pure CSS の分割 frontend、JP/EN 切替、theme/performance/reload 設定反映、「ログイン」設定タブ、`self-update.variant` によるセルフアップデート variant 選択、バージョン別機能ツアー (`/api/feature_tour/*`)、SQLite 移行の opt-in (`/api/storage/mode`) までは実装済み。frontend は全件取得+client-side 描画のため narou.rb 細部 parity は継続中 |
+| `setting` | ✅ | ✅ 完了 | 基本読み書き、`--burn`、dynamic `default/force/default_args`、hidden select 値検証、`setting -a` の全変数一覧まで Ruby 互換に揃えた。`self-update.variant` / `narou-compat` など Rust 拡張変数も管理する |
 | `diff` | ✅ | ✅ 完了 | 外部 diff ツール、raw データ管理 |
 | `send` | ✅ | ✅ 完了 | Kindle/Kobo/Reader 送信、`--without-freeze`、栞 backup/restore、hotentry を実装 |
 | `mail` | ✅ | ✅ 完了 | `mail_setting.yaml` bootstrap / 不完全設定 path 表示 / spinner / hotentry / `last_mail_date` 差分送信、Pony寄りの SMTP/TLS オプション受理、添付ファイル名の正規表現置換まで実装。`smtp` 経路は `tests/mail_e2e.rs` の end-to-end テストで sender 側・受信側ヘッダまで自動確認済み |
 | `backup` | ✅ | ✅ 完了 | `narou backup`/複数 target、`backup/` 除外、180バイト切り詰めまで対応 |
 | `clean` | ✅ | ✅ 完了 | `latest_convert` 既定値、`--all`、`--force`/`--dry-run`、freeze スキップ、`raw/*.txt|*.html` と `本文/*.yaml` の orphan 判定を実装 |
-| `illust` | ✅ | ✅ 完了 | v0.2.11 で導入した `.illustration_cache.yaml` 運用のための `narou illust <sub>` 新設。サブコマンド `orphan`/`migrate`/`fix-ext`/`rebuild` を実装し、削除/改名/移行はいずれも既定 dry-run (`-f` で実行) |
-| `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`set`/`add`/`order`/`clear` を実装。サイトごとに複数の資格情報を試行順つきで保持できる。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET/DELETE /api/login`、`POST /api/login/import`、`POST /api/login/set`、`DELETE /api/login/{host}` も対応 |
+| `illust` | — (Rust 拡張) | ✅ 完了 | `.illustration_cache.yaml` 運用のための `narou illust <sub>`。`orphan`/`migrate`/`fix-ext`/`rebuild` を実装し、削除/改名/移行はいずれも既定 dry-run (`-f` で実行) |
+| `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`set`/`add`/`order`/`clear` を実装。サイトごとに複数の資格情報を試行順つきで保持できる。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET/DELETE /api/login`、`POST /api/login/import`、`POST /api/login/set`、`POST /api/login/add`、`POST /api/login/order`、`DELETE /api/login/{host}`、`DELETE /api/login/{host}/{index}` も対応 |
+| `db` | — (Rust 拡張) | ✅ 完了 | SQLite 管理 DB の保守。`verify` / `export-yaml [--out|--in-place]` / `vacuum`。既定は YAML 管理で、SQLite は Web UI 初回ツアーまたは `.narou/storage-backend` マーカーによる opt-in |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
 | `version` | ✅ | ✅ 完了 | `-v`/`--version` と `--more` を実装。出力順序、help 文言、AozoraEpub3 探索、失敗時メッセージを Ruby 版に揃えた |
 | `log` | ✅ | ✅ 完了 | `--num`, `--tail`, `--source-convert`, `<path>` を実装。最新ログ選択、`.narou/local_setting.yaml` の `log.*` 既定値、`*_convert` フィルタも対応 |
@@ -139,7 +140,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `--force` | `-f` | flag | false | 全話強制再DL | ✅ |
 | `--no-convert` | `-n` | flag | false | DLのみ、変換スキップ | ✅ |
 | `--freeze` | `-z` | flag | false | DL後に凍結 | ✅ |
-| `--remove` | `-r` | flag | false | DL後に削除(変換+送信のみ) | ✅ |
+| `--remove` | `-r` | flag | false | DL・変換・送信後にDBのインデックスから削除（変換済みファイルは残る） | ✅ |
 | `--mail` | `-m` | flag | false | DL後にメール送信 | ✅ |
 | targets | | Vec\<String\> | — | URL/Nコード/ID/タイトル | ✅ |
 
@@ -151,7 +152,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `-m`/`--mail`: 変換後に `mail` コマンドと同じ helper で送信。設定未作成時は `mail_setting.yaml` を生成し、注意メッセージも Ruby版に寄せた
 - DL後の自動変換は `update` と同じ共通変換経路を使い、`convert.multi-device` / `convert.copy-to` / `convert.copy-to-grouping` を反映する
 - 引数なしでインタラクティブモード (stdin から URL 入力、TTY時のみ)
-- 凍結チェック: Ruby版と同じ `.narou/freeze.yaml` を優先し、移行互換として `frozen` タグも補助的に認識した上で凍結済み小説をスキップ
+- 凍結チェック: Ruby版と同じ `.narou/freeze.yaml` を優先し、移行互換として `frozen` タグも補助的に認識して凍結済み小説をスキップ
 - ダウンロード済みチェック: 既存小説はスキップ（`--force`で上書き）
 - DB に記録があるのに保存フォルダが消えていた場合は、Ruby版同様に DB インデックスを削除して `再ダウンロードしますか (y/n)?` を確認する。非TTYでは yes 扱いで再DLへ進む
 - タグ展開: `tag:NAME` → 該当IDに展開、`^tag:NAME` → 補集合
@@ -165,12 +166,15 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - ハーメルンのタグ抽出は `webnovel/syosetu.org.yaml` の詳細表・目次ページ両方のパターンで行い、短編ページのあらすじ・本文をタグとして取り込まない
 - Pixiv (`webnovel/www.pixiv.net.yaml`) は小説 / 小説シリーズ / イラスト・漫画 (`/artworks/A`) / 漫画シリーズ (`/user/U/series/S`) の 4 種を扱い、ncode は `n`/`s`/`a`/`c` + ID。イラストは 1 話・本文がページ画像のみ、漫画シリーズは各作品を 1 話とする連載。取得先 API は `toc_url` の `by_target` (ターゲット URL ごとのテンプレート) で切り替える
 - Pixiv (`webnovel/www.pixiv.net.yaml`) は `/ajax/*` の JSON を `preprocess:` DSL で中間テキスト化して取得する。単体作品 URL (`/novel/show.php?id=N`) は短編 (novel_type 2) として 1 話、シリーズ URL (`/novel/series/S`) は目次 30 話ずつの複数ページ取得で全話を登録する。シリーズの 1 話 URL はその話だけを単体作品として登録する
-- Pixiv の ncode はサイト定義の `ncode:` キーで `n` + 数値 (小説) / `s` + 数値 (シリーズ) を組み立てる。URL の数値だけでは作品種別をまたいで衝突するため
+- Pixiv の ncode はサイト定義の `ncode:` キーで `n` + 数値 (小説) / `s` + 数値 (小説シリーズ) / `a` + 数値 (イラスト・漫画) / `c` + 数値 (漫画シリーズ) を組み立てる。URL の数値だけでは作品種別をまたいで衝突するため
 - なろう式の ncode 判定 (`n\d+[a-z]+`) に当たらない ncode は、タイトル一致が無いときに ncode 一致で解決する (`n29204764` / `s16299140` などを `update` / `convert` の対象に指定できる)
 - Pixiv の挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は DSL の `fetch_json` で画像 URL を解決し (`[uploadedimage:]` は同じ応答から解決)、`illust_grep_pattern` が `挿絵/` へローカライズする。解決できなかった参照は `<!--...-->` の目印だけ残す
+- Pixiv のアニメーション挿絵（うごイラ）はフレーム ZIP として取得され、native 版 (`illustration-animation` feature、既定で有効) では APNG に組み立てて `挿絵/` へ保存する。Worker / wasm ポータブル版は image/zip 依存を持たないため ZIP のまま保存する
+- サイト定義の `min_interval:` でサイトごとの最低リクエスト間隔 (秒) の下限を宣言でき、該当サイトのレートリミットスコープにだけ適用される
 - サイト定義の `headers:` キーで任意のリクエストヘッダを宣言できる (Pixiv は画像ホスト用に `Referer`、ハーメルン R18 は Cloudflare challenge 回避用に `Sec-Fetch-*` を指定)。値は `\k<...>` 補間され、危険な名前・値は無視される
 - リダイレクトを自前で辿るモード (`resolve_final_url`) も curl ティアを先に試す。CDN challenge 下のホストでは reqwest が 403 でも libcurl が 200 を返すことがあるため
 - `preprocess:` DSL は `request(url)` / `fetch_json(url)` で追加取得を要求できる。実行側がサイトの取得ポリシー経由で取得し、定義を再実行する (最大 4 ラウンド)。結果は `fetched["<url>"]`、失敗は null。ジョブは URL 単位で、結果は 1 小説分だけ保持する
+- 保存済みログイン Cookie のフォールバックを実装。TOC 取得がログイン壁 (404 やサイト定義の `login_pattern`) / 部分一覧 (`login_partial_pattern`) に当たったとき `narou login` の資格情報を試行順に試し、成功した資格情報の ID を小説レコードの `login_session` に保存して次回から最初のリクエストで使う。取得側の `narou_rs_login` は親ドメインの Cookie も拾い、サイト全体で使える資格情報として保存する。`update` でも同じ経路を通る
 
 ---
 
@@ -193,7 +197,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `-a`/`--convert-only-new-arrival`: 新着がある場合のみ変換（設定 `update.convert-only-new-arrival` にも対応）
 - `--gl [OPT]`: なろう API バッチで `general_lastup` を更新し、API が title を返さない/返せない小説は Ruby版同様 individual TOC 取得へフォールバックする。`modified` タグは Ruby版に合わせて `novelupdated_at` が手元の `last_check_date` / `last_update` より新しい時だけ付与し、修正が無い時は外す。`novelupdated_at` 未取得サイトは従来どおり `general_lastup` 差分ベースを維持する。OPT省略=全、`narou`=なろうAPI対応のみ、`other`=非なろうのみ
 - `-f`/`--force`: 凍結小説も更新
-- `-s`/`--sort-by KEY`: 更新順ソート（設定 `update.sort-by` にも対応）。有効キー: `id`, `last_update`, `title`, `author`, `new_arrivals_date`, `general_lastup`
+- `-s`/`--sort-by KEY`: 更新順ソート（設定 `update.sort-by` にも対応）。有効キーは `db::sort_keys` (`src/db/sort.rs`) の `id`, `last_update`, `general_lastup`, `last_check_date`, `title`, `author`, `sitename`, `novel_type`, `tags`, `general_all_no`, `length`, `status`, `toc_url`, `new_arrivals_date`
 - `-i`/`--ignore-all`: 引数なし時の全更新を無効化
 - 標準入力からのターゲット読み取りに対応。Ruby版同様 `narou tag ... | narou u` や `narou l -t "foo bar" | narou u` のようなパイプ入力を解決
 - ターゲット解決: Ruby版 `tagname_to_ids`/`Downloader.get_data_by_target` 相当に合わせ、ID、URL、Nコード、タイトル、`.narou/alias.yaml` 別名、通常タグ名、`tag:NAME`、`^tag:NAME` を解決
@@ -226,6 +230,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - 終了コード: エラー数（最大127）、中断時126
 - Ctrl+C 割り込み時はフラグを検知して `アップデートを中断しました` を表示し、終了コード126で終了
 - `--all` は Ruby版に存在しないRust独自オプションだったため削除
+- ログイン Cookie のフォールバックは `download` と共通の downloader 経路を通るため、保存済みの `login` 資格情報によるログイン壁/部分一覧の再取得は update でも動く
 
 **完了扱いにしない理由 / 不足動作**:
 - Ruby版の詳細表示・hotentry後処理など、周辺出力/イベント処理の細部は追加突合が必要
@@ -243,13 +248,12 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 | `export-yaml --in-place` | `.narou/*.yaml`・`~/.narousetting/global_setting.yaml` を実位置へ書き戻し、`storage-backend` を `yaml` に戻す。narou.rb への完全復帰用 |
 | `vacuum` | VACUUM で容量回収 |
 
-**前方互換モード**: `narou setting narou-compat=true` で `.narou/*.yaml` (database.yaml, freeze.yaml, alias.yaml, tag_colors.yaml, latest_convert.yaml, local_setting.yaml, queue.yaml, notepad.txt) と `~/.narousetting/global_setting.yaml` をファイルとして維持し、narou.rb がそのまま読める状態を保つ。ファイルが正で SQLite はミラー。OFF(既定) ではファイルを `*.imported-*` へ退避し SQLite のみで管理する。
+**前方互換モード**: `narou setting narou-compat=true` で `.narou/*.yaml` (database.yaml, freeze.yaml, alias.yaml, tag_colors.yaml, login_cookie.yaml, latest_convert.yaml, local_setting.yaml, queue.yaml, notepad.txt) をファイルとして維持し、narou.rb がそのまま読める状態を保つ。ファイルが正で SQLite はミラー。OFF(既定) ではファイルを `*.imported-*` へ退避し SQLite のみで管理する。`~/.narousetting/global_setting.yaml` はライブラリ状態ではないため narou-compat/SQLite の有無にかかわらず常にファイルのまま維持され、SQLite への取込・退避は行わない (旧ビルドが `app_state` の global/global_setting に残した行は、ファイルが無いとき初回読み出しでファイルへ書き戻してその行を削除する)
 
 ---
 
 ### 3.y `login` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
-
-ブラウザのある端末とダウンロード実行ホストが別であることを前提にしたログイン情報管理コマンド。取得側は別実行ファイル `narou_rs_login` が担当し、本コマンドは受け入れ・書き出し・一覧・削除を行う。
+ブラウザのある端末とダウンロード実行ホストが別であることを前提にしたログイン情報管理コマンド。取得側は別実行ファイル `narou_rs_login` が担当し、本コマンドは受け入れ・書き出し・一覧・登録・追加・並べ替え・削除を行う。
 
 | サブコマンド | 内容 |
 |---|---|
@@ -261,7 +265,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 | `order <host> 2,1,3` | 現在の位置 (1 始まり) を新しい順に並べ替える。件数・重複は検証 |
 | `clear [host] [--index N]` | 1 サイト分 / `--index` で 1 件だけ / 引数なしですべて削除 |
 
-**保存形式**: `login_cookie` inventory (SQLite `app_state` / `.narou/login_cookie.yaml`) に、**1 ホスト = 順序つき資格情報リスト** (`LoginCredential` の JSON 配列) を `enc:v1:<nonce>:<payload>` として暗号化保存。並び順がそのまま試行順になる。鍵は `.narou/login.key` (初回作成、Unix では 0600) または `NAROU_RS_LOGIN_KEY` (base64)。ホスト名を AEAD の associated data に束ねるため別ホストへの流用は不可。旧形式 (プレーンな Cookie 文字列) は 1 件として読み取り、次回保存時に暗号化された新形式へ移行する。
+**保存形式**: `login_cookie` inventory に、**1 ホスト = 順序つき資格情報リスト** (`LoginCredential` の JSON 配列) を `enc:v1:<nonce>:<payload>` として暗号化保存 (SQLite 管理時は `app_state`、YAML/前方互換モードでは `.narou/login_cookie.yaml`)。並び順がそのまま試行順になる。鍵は `.narou/login.key` (初回作成、Unix では 0600) または `NAROU_RS_LOGIN_KEY` (base64)。ホスト名を AEAD の associated data に束ねるため別ホストへの流用は不可。旧形式 (プレーンな Cookie 文字列) は 1 件として読み取り、次回保存時に暗号化された新形式へ移行する。
 
 **セッション ID**: 各資格情報に UUID を振り（保存値に含める）、小説レコードは `requires_login` に加えて `login_session`（成功した資格情報の ID）を持つ。フラグ付きの小説は次回以降その ID の資格情報を最初のリクエストから送るため、一覧の総当たりをしない。ID の無い旧データはストア読み込み時に採番・保存される。
 
@@ -270,6 +274,8 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 **書き出し形式**: `version`/`exported_at`/`library`/`encrypted`/`kdf`/`salt`/`payload`/`credentials` を持つ YAML エンベロープ (version 2)。`narou_rs_login --export <file>` が生成し、ライブラリ外ではそれが既定の出力になる。version 1 (`cookies:` のホスト→Cookie マップ) も読み取り可能。
 
 **Web UI**: 設定ページ「ログイン」タブで一覧・取り込み・直接登録・追加・1 件削除・並べ替え (上下ボタン)。取り込みはファイル選択 (FileReader) と貼り付けの両方に対応。API: `GET/DELETE /api/login`、`POST /api/login/import`、`POST /api/login/set`、`POST /api/login/add`、`POST /api/login/order`、`DELETE /api/login/{host}`、`DELETE /api/login/{host}/{index}`。
+
+**注意**: `narou login -h` のヘルプには `add` / `order` と `clear --index` がまだ載っていない。各操作は `LoginAction` (`src/commands/login.rs`) に実装済みで、ヘルプ表示のみ更新が必要。
 
 ---
 
@@ -405,6 +411,7 @@ narou setting name         # 読み取り
 | `update.max-parallel-domains` | integer | ドメイン別並列DLのワーカー数 (既定4、1で逐次) |
 | `update.auto-schedule.enable` | boolean | 自動更新スケジューラ有効 |
 | `update.auto-schedule` | string | スケジュール時刻 (HHMM, カンマ区切り) |
+| `update.auto-schedule.timezone` | string | 自動アップデートの HHMM を評価する IANA タイムゾーン (Worker 既定 `Asia/Tokyo`) |
 | `convert.copy-to` | directory | 変換ファイルのコピー先 |
 | `convert.copy-zip-to` | directory | ZIP ファイルのコピー先 |
 | `convert.copy-to-grouping` | multiple | コピー先のグルーピング |
@@ -426,6 +433,7 @@ narou setting name         # 読み取り
 | `webui.new-tag-color` | select | 新規タグの既定色。`default`/未設定時は自動色ローテーション |
 | `queue.max-retries` | integer | 失敗 job を `available_at` 付きで自動再投入する最大回数。`0` でリトライ無効。既定 `3` |
 | `queue.retry-backoff` | string | リトライ時の待機秒数をカンマ区切りで指定（`s`/`m`/`h` 単位可、例: `1m,5m,15m`）。要素数を超えて失敗したときは最後の値を再利用。既定 `1m,5m,15m` |
+| `narou-compat` | boolean | (Rust 拡張) SQLite 管理時も `.narou/*.yaml` をファイルとして維持し narou.rb との前方互換を保つ。OFF (既定) で完全 SQLite 移行 |
 
 **主要 global_setting 項目**:
 
@@ -440,7 +448,7 @@ narou setting name         # 読み取り
 | `server-bind` | string | Web サーババインドアドレス |
 | `server-basic-auth.*` | bool/str | Basic 認証設定 |
 | `over18` | boolean | 18+ フラグ（未設定時は初回のみ確認、`false` 明示時はR18取得を中止） |
-| `self-update.variant` | select | セルフアップデートで取得するリリース variant（`gpl` = AozoraEpub3_Lite 組込み・GPL-3.0 / `standard` = 外部 AozoraEpub3・BSD）。未設定なら実行中のビルドと同じ variant |
+| `self-update.variant` | select | セルフアップデートで取得するリリース variant（`gpl` = GPL版（AozoraEpub3_Lite 組込み・GPL-3.0） / `standard` = 通常版（外部 AozoraEpub3・BSD））。未設定なら実行中のビルドと同じ variant |
 
 **実装済み (Rust)**:
 - `local_setting.yaml` / `global_setting.yaml` の読み書き (`Inventory`)
@@ -634,7 +642,7 @@ narou setting name         # 読み取り
 - hidden global `server-basic-auth.require-for-external-bind` は narou.rs 独自の外部公開ガード。既定値 `true` の間は `0.0.0.0` / 公開bindで Basic 認証未設定の起動を拒否し、`false` にするとこのガードだけ解除する（Web UI には表示しない）
 - hidden global `server-reverse-proxy.enable` は narou.rs 独自の reverse proxy モード。既定値 `false` で、`true` にすると nginx 等の前段 proxy が付ける外側の Host / Origin を受け入れ、same-origin の `/ws` 接続を使う（Web UI には表示しない）
 - global `server-add-accepted-hosts` は HTTP の `Host` ヘッダに追加で許可するホストのリスト（カンマ区切り）。`*.example.com` 形式の安全なワイルドカードに対応し、unsafe なパターン（`*` 単独、`*.com`、末尾ワイルドなど）は警告ログを出して無視。既定の許可集合（bind host + loopback + 自ホスト名）はそのまま残り、追加ホストだけを opt-in で広げる
-- hidden global `server-max-targets-per-request` は WEB UI が 1 リクエストで送れる小説 ID の最大数。既定値 `100000`、未設定または 0 以下は既定にフォールバック（Web UI には表示しない）。蔵書数が極端に多い環境で `narou setting --global server-max-targets-per-request=200000` のように上書きできる
+- hidden global `server-max-targets-per-request` は WEB UI が 1 リクエストで送れる小説 ID の最大数。既定値 `100000`、未設定または 0 以下は既定にフォールバック（Web UI には表示しない）。蔵書数が極端に多い環境で `narou setting server-max-targets-per-request=200000` のように上書きできる（`server-*` は変数名から自動で global スコープに振り分けられる）
 - API の凍結/解凍操作と一覧上の `frozen` 判定は CLI と同じ `.narou/freeze.yaml` を優先し、`frozen` タグは補助的に扱う
 - queue worker が `.narou/queue.yaml` 永続キューを読み書きし、download / update / auto_update / convert / send / backup / mail の queued job を別プロセスまたは worker 内処理で実行する。Ruby版同様 `pending` / `running` を分けて保持し、legacy `cmd` / `args` / `meta` / `status` / `created_at` / `started_at` を維持したまま復元できる。`concurrency` 有効時は外部通信あり(download/update/auto_update)とその他(convert/send/backup/mail)を別 lane で並列実行し、無効時は全 job を投入順に逐次実行する
 - 一時的なネットワーク失敗で夜間更新全体が止まらないよう、queue worker は失敗した job を `JobOutcome::Failed` 時に判定し、`retry_count < max_retries` かつ恒久失敗 (detail に "not found" / "invalid argument" / "no such file" / "permanent failure" / "永久失敗" / "恒久失敗" を含む) でなければ `available_at` 付きで `active_pending` へ自動再投入する。`available_at` 経過後の job だけが `pop` 系で取り出されるためスリープを挟まない。Web UI には `queue_retry` イベントを、追加試行なしで `failed` へ落ちた場合は従来どおり `queue_failed` イベントを通知する
@@ -649,11 +657,12 @@ narou setting name         # 読み取り
 - Web queue の restore/clear API は Ruby互換に、running 中の仕事を消さずに pending/復元待ちだけを消去し、復元フラグは restore 成功後にだけ下ろす。`reorder_pending_tasks` は失敗時に success=false を返し、`taginfo.json` は選択 ID ごとのタグ出現数 (`count`) と全体件数 (`total_count`) を返す selection-aware backend になっている
 - Web UI の一覧検索は既存のタイトル・作者・サイト・タグ・状態に加え、URL、N コード、小説 ID（整数）にも対応する。貼り付けた `https://` / `http://` URL は `https:` のフィールド指定として誤認せず全文を検索する。一覧は `/api/list?all=true` を取得してクライアント側で絞り込むため、判定 (`src/web/assets/js/ui/render.js`) はサーバ側 `search[value]` と同一規則（`toc_url` の部分一致（末尾 `/` は無視）、`ncode` の部分一致または `toc_url` 最終セグメントとの一致、レコード ID の一致）を持たせ、`/api/list` は `ncode` を返す。コンソール拡大時は右側にまだ出力がなくても左右両ペインの高さを揃える。
 - Web UI からのサーバ再起動では replacement process に `--no-browser` を付与し、hidden 起動中は `--hide-console` も維持したまま再起動待機ページから同じタブで元ページへ戻る
-- systemd の `.service` 配下で Web UI から本体更新するときは、通常の `setsid` 子プロセスではなく `systemd-run` の別 transient service に既存 updater を起動させる。本体の終了後に旧 updater が zip を適用したら、元の systemd service を `systemctl restart`（user service は `--user`）で再起動する。`Restart=always` / `KillMode=control-group` による updater 強制終了を回避する。引き渡し失敗時は API も success=false とし、本体を終了しない。\n- ソース checkout の `target/<profile>/narou_rs` は local-build 版として識別し、自動更新を開始せず `git pull` + `cargo build --release` または別ディレクトリへの GitHub Release 版展開を案内する。Release 版 updater は適用失敗時もダウンロード済み `.tmp` と展開用 `update_extract.tmp` の削除を試み、失敗理由は `update.log` に残す
+- systemd の `.service` 配下で Web UI から本体更新するときは、通常の `setsid` 子プロセスではなく `systemd-run` の別 transient service に既存 updater を起動させる。本体の終了後に旧 updater が zip を適用したら、元の systemd service を `systemctl restart`（user service は `--user`）で再起動する。`Restart=always` / `KillMode=control-group` による updater 強制終了を回避する。引き渡し失敗時は API も success=false とし、本体を終了しない。
+- ソース checkout の `target/<profile>/narou_rs` は local-build 版として識別し、自動更新を開始せず `git pull` + `cargo build --release` または別ディレクトリへの GitHub Release 版展開を案内する。Release 版 updater は適用失敗時もダウンロード済み `.tmp` と展開用 `update_extract.tmp` の削除を試み、失敗理由は `update.log` に残す
 - Windows の `narou web --hide-console` は GUI subsystem で起動し、通常 CLI 実行時は親コンソールへ再接続、hidden 実行時はタスクトレイの右クリックメニューから `終了` / `再起動` を呼べる。Web worker / auto-update / 即時 API 実行が起動する child process も hidden 状態を引き継ぎ、空のコンソールを開かない
 - 即時実行の `diff` / `folder` / `reboot` API は child command の失敗や replacement process 起動失敗を success=false として返し、false success を出さない
 - Web 設定画面は Ruby版同様、`tab` がある設定を `invisible` 指定でも表示する。`webui.theme` / `webui.table.reload-timing` / `webui.new-tag-color` / `webui.debug-mode` / `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `server-add-accepted-hosts` / `self-update.variant` / `over18` も設定画面に出る
-- セルフアップデートで取得する variant（GPL版 / 通常版）は Global タブの `self-update.variant` セレクト、または `narou setting self-update.variant=gpl|standard` で設定する。`narou setting` の一覧にも表示され、`narou setting --delete self-update.variant`（Web UI では「未設定」）で実行中のビルドと同じ variant に戻る。0.4.0 以下からの更新時に出る variant 選択モーダルは、この設定が既にあれば表示せず保存値で更新する
+- セルフアップデートで取得する variant（GPL版（AozoraEpub3_Lite 組込み） / 通常版（外部 AozoraEpub3））は Global タブの `self-update.variant` セレクト、または `narou setting self-update.variant=gpl|standard` で設定する。`narou setting` の一覧にも表示され、`narou setting self-update.variant=`（Web UI では「未設定」）で実行中のビルドと同じ variant に戻る。0.4.0 以下からの更新時に出る variant 選択モーダルは、この設定が既にあれば表示せず保存値で更新する
 - `webui.theme` / `webui.table.reload-timing` / `webui.performance-mode` / `webui.new-tag-color` / `webui.debug-mode` 保存時は、開いている Web UI に設定再読み込みイベントを送り、テーマメニューの変更も `webui.theme` へ保存する
 - `webui.debug-mode` が ON のときは、Web worker が失敗 child process の直近 stdout/stderr を要約して `queue_failed` イベントに載せ、Web UI 通知とコンソールに詳細エラーを出す。OFF のときは従来どおり簡潔な失敗通知だけにする
 - `/novels/{id}/download` は生成済み ebook を全量メモリへ読み込まず、`tokio::fs::File` から 64KiB チャンクでストリーミングする。大きい EPUB でも `Content-Length` / `Content-Disposition` を付けたまま返す
@@ -672,6 +681,7 @@ narou setting name         # 読み取り
 - 一覧 API の `frozen` 取得は DB 再入ロックによる deadlock を避けるよう修正済み
 - 一覧 API の `new_arrivals` 判定は `webnovel/*.yaml` の `timezone` に合わせたサイト現地時刻で行い、`domain` 未保存の既存データは `toc_url` のドメインからサイト定義を解決する
 - favicon は data URL で埋め込み、追加 route なしでブラウザ 404 を出さない
+- バージョン別の機能ツアーを `GET /api/feature_tour/pending` / `GET /api/feature_tour/all` / `POST /api/feature_tour/seen` / `POST /api/feature_tour/config` で提供し、アップデート後に新機能を Web UI で告知する。SQLite 管理への移行はツアー経由の opt-in で、`GET/POST /api/storage/mode` がモードの読み書きを担う（CLI 側の保守コマンドは `narou db`）
 
 **不足動作**:
 - narou.rb の HAML/UI と完全一致するレベルの細かな見た目・配置・文言差分の洗い込み
@@ -741,7 +751,7 @@ narou setting name         # 読み取り
 
 **実装** (`src/commands/help.rs`):
 - 未初期化時: `narou init` を促すメッセージ（`.narou/` ディレクトリ存在チェック）
-- 初期化済み: 全25コマンド一覧 + oneline_help（narou.rb の24コマンド + Rust 拡張の `illust`、narou.rb と同一順序・同一テキスト）
+- 初期化済み: 全26コマンド一覧 + oneline_help（narou.rb の24コマンドは元と同じ順序・文言で掲載。Rust 拡張の `illust` と `login` を追加。`db` は一覧に含まれない）
 - グローバルオプション表示（`--no-color`, `--multiple`, `--time`, `--backtrace`）
 - ショートカット説明（`d`, `fr` 等の例示付き）
 - `NO_COLOR` 環境変数対応（ANSIエスケープコード条件付き出力）
@@ -749,7 +759,7 @@ narou setting name         # 読み取り
 
 **Rust 実装**:
 - 未初期化時 / 初期化済み時のトップレベル help を Ruby版相当に表示
-- 全25コマンドの oneline help、グローバルオプション、ショートカット説明を同一順序で表示
+- 全26コマンドの oneline help とグローバルオプション、ショートカット説明を表示（既存24コマンドは narou.rb と同じ順序）
 - `narou <command> -h` の banner、説明文、Examples、Options を Ruby版各 command に合わせて整備
 - `convert` の `Configuration:` 節、`setting -h` の Variable List、`update --gl` の詳細説明表も表示
 

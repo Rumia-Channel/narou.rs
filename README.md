@@ -41,6 +41,8 @@ README では、導入方法、基本操作、主な注意点をまとめます�
 
 [GitHub Releases](https://github.com/Rumia-Channel/narou.rs/releases) から利用環境に合う配布 zip をダウンロードし、任意の場所に展開してください。
 
+配布 zip はプラットフォームごとに GPL 版（AozoraEpub3_Lite 組込み）と通常版（外部 AozoraEpub3）の 2 種類があります。`narou_rs_win_x64-GPL.zip` のように `-GPL` が付くのが GPL 版、付かないのが通常版です。GPL 版は EPUB 変換を組み込みの AozoraEpub3_Lite (GPL-3.0) で実行するため外部ツールなしで使えますが、配布物全体が GPL-3.0 の扱いになります。通常版は BSD-2-Clause で、EPUB 変換には別途 AozoraEpub3 が必要です。
+
 配布 zip は `narou/` ディレクトリをルートに持つ構成です。実行に必要なファイルはその中にまとまっています。
 
 ```text
@@ -58,6 +60,8 @@ narou/
 ```
 
 `narou_rs` は、実行ファイルの近くにある `webnovel/`、`preset/`、`commitversion` を参照します。これらを分離しないでください。
+
+どちらの版も zip の展開後の手順は同じです。`self-update.variant` は今後のセルフアップデートで取得する版を決める設定で、実行中のバイナリは切り替わりません。Web UI の設定画面 (Global タブ) で選ぶか、`narou_rs setting self-update.variant=gpl` または `narou_rs setting self-update.variant=standard` で変更できます。
 
 Windows では、展開した `narou/` を `Path` に追加してから、小説を管理したいフォルダで `narou_rs init` を実行します。`$narouDir` は自分が zip を展開した `narou/` フォルダ、`$novelDir` は小説を管理したいフォルダに置き換えてください。
 
@@ -110,7 +114,7 @@ Release と同じ構成の `narou/` フォルダをリポジトリ直下に作�
 cargo local-build
 ```
 
-`cargo local-build` は GitHub Actions の release と同じ構成の `narou/` フォルダを作成します。release ビルドした `narou_rs(.exe)`、`narou_rs_updater(.exe).new`、`narou_rs_backup(.exe)`、`narou_rs_login(.exe)`、`webnovel/`、`preset/`、`LICENSE`、`README.md`、`Third-Party-License.md`、`commitversion` を `narou/` に配置します。
+`cargo local-build` は GitHub Actions の release と同じ構成の `narou/` フォルダを作成します。release ビルドした `narou_rs(.exe)`、`narou_rs_updater(.exe).new`、`narou_rs_backup(.exe)`、`narou_rs_login(.exe)`、`webnovel/`、`preset/`、`LICENSE`、`README.md`、`Third-Party-License.md`、`commitversion` を `narou/` に配置します。`cargo local-build` が作るのは通常版相当のバイナリで、同梱される `Third-Party-License.md` も copyleft を含まない側 (`Third-Party-License-non-GPL.md`) です。GPL 版相当を作りたい場合は `cargo build --release --features lite` を使います。
 
 作成された `narou/` は Release 版と同じように `Path` に追加し、小説を管理したいフォルダで `narou_rs init` を実行してください。`narou/` の中を作業ディレクトリにはしません。
 
@@ -123,10 +127,10 @@ cargo run -- init -p $aozoraDir -l 1.8
 
 ## 初期化後のディレクトリ
 
-`narou init` を実行すると、作業ディレクトリに主に以下を作成します。
+`narou_rs init` を実行すると、作業ディレクトリに主に以下を作成します。
 
 ```text
-.narou/                  ローカル設定、DB、キュー、タグ色など
+.narou/                  ローカル設定、キュー、タグ色、ログイン Cookie など
 小説データ/             ダウンロードした小説データ
 webnovel/               ユーザー編集用のサイト定義 YAML
 ```
@@ -177,6 +181,9 @@ narou_rs web
 | `version` | バージョン情報表示 |
 | `login` | ログイン Cookie の取り込み・管理 (Rust 拡張) |
 | `illust` | 挿絵キャッシュのメンテナンス (Rust 拡張) |
+| `db` | SQLite 管理データの保守 (verify / export-yaml / vacuum。Rust 拡張) |
+
+コマンドは narou.rb と同じ短縮規則（先頭 1〜2 文字）で呼べます。`w` / `we` は `web`、`s` / `se` は `setting` に解決されます。
 
 すべてのコマンド仕様、オプション、完了度は `COMMANDS.md` にまとめています。
 
@@ -218,7 +225,7 @@ narou_rs web --hide-console
 
 ### Web 公開時の上級者向け設定
 
-通常の `web` 利用は localhost 前提です。外部公開や reverse proxy 配下で使う場合だけ、CLI から hidden 設定を変更してください。なお `s` は `setting` サブコマンドの短縮であり、`web` の短縮ではありません（`web` の短縮は未定義です）。
+通常の `web` 利用は localhost 前提です。LAN やリバースプロキシ経由で公開する場合は、接続先と認証、許可ホストを確認してください。一部の詳細設定は CLI からのみ変更できます。
 
 ```powershell
 # LAN から直接アクセスさせたいとき（どちらでも可）
@@ -240,11 +247,11 @@ narou_rs setting server-basic-auth.require-for-external-bind=false
   narou_rs setting server-add-accepted-hosts=narou.example.com,*.lan.example
   ```
   unsafe なワイルドカードパターン（`*` 単独、`*.com`、末尾ワイルドなど）は警告ログを出して無視されます。
-- これらのうち Web UI の設定画面に出るのは `server-bind` だけで、それ以外は hidden のまま CLI からのみ変更します。
+- このうち Web UI 設定画面 (Global タブ) に出るのは `server-bind`、`server-basic-auth.*`、`server-ws-add-accepted-domains`、`server-add-accepted-hosts` などです。`server-reverse-proxy.enable` と `server-basic-auth.require-for-external-bind` は hidden のままなので、CLI からのみ変更してください。
 
 ### ログインが必要な小説
 
-ログインが必要なサイトの小説は、ブラウザで取得した Cookie を保存してからダウンロードします。Cookie の取得は同梱の `narou_rs_login` が担当し、保存した値は `.narou/login.key` の鍵で暗号化されます。
+ログインが必要なサイトの小説は、ブラウザで取得したログイン Cookie を保存してからダウンロードします。Cookie の取得は同梱の `narou_rs_login` が担当し、保存した値は `.narou/login.key` の鍵で暗号化されます。1 サイトに複数のログイン Cookie を保存でき、一覧の順に試行されます。
 
 ブラウザと narou_rs が同じマシンにある場合は、ライブラリのフォルダで次を実行します。
 
@@ -280,6 +287,7 @@ narou_rs login import login.yaml --passphrase <パスフレーズ>
 | `--export <ファイル>` | 取得した Cookie を書き出しファイル (YAML) に出力 |
 | `--passphrase <パス>` | 書き出しファイルを暗号化 |
 | `--clear-text` | パスフレーズ指定時でも平文で書き出す |
+| `--profile <DIR>` | ブラウザプロファイルの保管先 (既定はサイトごとの固定フォルダ) |
 | `--list` | 保存済みの Cookie を表示 (値ではなく名前のみ) |
 | `--clear` | 指定サイトの Cookie を削除 |
 | `--port <ポート>` | ブラウザのリモートデバッグポート (既定 9222) |
@@ -288,13 +296,18 @@ narou_rs login import login.yaml --passphrase <パスフレーズ>
 保存済みの情報は `narou_rs login` サブコマンドでも管理できます。
 
 ```powershell
-narou_rs login list                              # 一覧 (値は伏せて表示)
-narou_rs login set <ホスト> --cookie "..."        # 1 サイト分を直接保存
-narou_rs login export login.yaml --passphrase P  # 書き出し
-narou_rs login import login.yaml --replace       # 取り込みに無いサイトを削除
-narou_rs login clear <ホスト>                    # 1 サイト分を削除
-narou_rs login clear                             # すべて削除
+narou_rs login list                                       # 一覧 (値は伏せて表示)
+narou_rs login set <ホスト> --cookie "..."                 # そのサイトの既存ログインを置き換え
+narou_rs login add <ホスト> --cookie "..." --label R18用   # ログインを末尾に追加
+narou_rs login order <ホスト> 2,1                          # 試行順を入れ替え (現在の位置の新しい並び)
+narou_rs login export login.yaml --passphrase P           # 書き出し
+narou_rs login import login.yaml --replace                # 取り込みに無いサイトを削除
+narou_rs login clear <ホスト>                              # 1 サイト分を削除
+narou_rs login clear <ホスト> --index 1                    # そのサイトの 1 件だけ削除
+narou_rs login clear                                      # すべて削除
 ```
+
+複数のログイン Cookie は一覧の順に試行され、成功した資格情報は小説レコードに記憶されるため、同じ小説の次回以降は最初のリクエストからその Cookie が使われます。
 
 保存した Cookie は、ダウンロード時に 404 またはサイト定義の `login_pattern` に一致するログイン壁が返った場合に自動で使われます。`webnovel/*.yaml` に `login_url` (ログイン用 bin が開く URL) と `login_pattern` (ログイン壁を検出する正規表現) を定義すると、サイトごとの挙動を調整できます。
 
@@ -319,8 +332,8 @@ narou_rs login clear                             # すべて削除
 - 作業ディレクトリ単位で `.narou/` を持つ設計です。`download`、`update`、`convert` などは基本的に初期化済みディレクトリで実行してください。
 - サイトごとの取得・抽出ルールは `webnovel/*.yaml` を使います。ユーザーがこの YAML を編集すると、挙動もそれに追従します。
 - 保存データや設定ファイルは [narou.rb](https://github.com/whiteleaf7/narou) 互換の YAML / ディレクトリ構成を重視しています。
-- Pixiv は本文・目次・作品情報を `/ajax/*` の JSON から取得します (`webnovel/www.pixiv.net.yaml`)。挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は画像 URL を追加 API から解決して `挿絵/` に取り込みます。ログイン限定作品は `narou_rs_login` で保存した Cookie を使って再試行します。
-- Pixiv のイラスト・漫画 (`/artworks/A`) と漫画シリーズ (`/user/U/series/S`) も扱えます。うごイラはフレーム集約 zip から APNG を組み立てて `挿絵/` に取り込みます。イラストは 1 話・本文がページ画像のみの作品として、漫画シリーズは各作品を 1 話とする連載として登録し、画像は `挿絵/` に取り込みます。R18 作品はログインしていないと一覧に現れないため、含むシリーズは先に `narou_rs_login` で Cookie を保存してください。
+- Pixiv は本文・目次・作品情報を `/ajax/*` の JSON から取得します (`webnovel/www.pixiv.net.yaml`)。挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は画像 URL を追加 API から解決して `挿絵/` に取り込みます。ログイン限定作品やログインでしか全部見えない作品一覧は、保存したログイン Cookie を順に試して再取得します。
+- Pixiv のイラスト・漫画 (`/artworks/A`) と漫画シリーズ (`/user/U/series/S`) も扱えます。イラストは 1 話・本文がページ画像のみの作品として、漫画シリーズは各作品を 1 話とする連載として登録し、画像は `挿絵/` に取り込みます。うごイラ (フレーム集約 zip) は、ネイティブ版では APNG に組み立てて取り込みます。APNG 化に必要なコーデックは `illustration-animation` feature にあり、`native-runtime` が有効にします。Worker / wasm 版では組み立てず、取得した zip をそのまま保存します。R18 作品はログインしていないと一覧に現れないため、含むシリーズは先に `narou_rs_login` で Cookie を保存してください。
 - 変換結果は青空文庫向け整形を基準にし、設定や device 指定に応じて追加出力を行います。
 - `update` は `general_lastup`、差分 cache、strong update、freeze などの挙動を持ちます。
 - `web` は localhost 利用を基本にしています。非 loopback で公開する場合は認証設定を行ってください。
@@ -328,11 +341,13 @@ narou_rs login clear                             # すべて削除
 
 ## 注意点
 
-- `narou init` 前に多くのコマンドを実行しても、初期化を促す表示になります。
+- `narou_rs init` 前に多くのコマンドを実行しても、初期化を促す表示になります。
 - `webnovel/*.yaml` を Rust 側のハードコードより優先する方針です。サイト追従が必要な場合は、まず YAML の更新を検討してください。
 - 配布物を移動するときは、実行ファイルだけでなく `webnovel/` と `preset/` も一緒に配置してください。
 - `send`、`mail`、AozoraEpub3 連携は、端末や SMTP の実環境設定が前提です。
 - `mail` 機能と Kindle / Kobo などの実機送信は、開発者の手元に端末が無いため十分な実地確認ができていません。動作確認や不具合報告、再現情報、修正提案に協力してもらえると助かります。
+- 管理データの保存形式は既定で従来どおりの YAML / ファイル構成です。SQLite 管理はオプトインで、Web UI の初回ツアーか `.narou/storage-backend` (`sqlite` / `yaml`) で切り替えます。`narou_rs db verify` / `export-yaml` / `vacuum` で SQLite 側を保守できます。
+- 新機能ツアーは Web UI 起動時に、まだ見ていないバージョンの項目だけを表示します。表示メニューの「新機能ツアーを表示」から全項目を再表示でき、「以降新機能ツアーは表示しない」で自動表示を止められます。既読バージョンと表示設定はライブラリのローカル設定に保存されます。
 
 ## 開発用コマンド
 

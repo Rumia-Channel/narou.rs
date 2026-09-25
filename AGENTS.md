@@ -1,19 +1,19 @@
 # narou.rs — Rust Port of narou.rb
 
 ## Overview
-narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウェア）のサーバー実行部分をRustに移植するプロジェクト。なろう・カクヨム等のサイトからのDL・変換が動作し、narou.rbの出力フォーマットと完全互換性を持つことを目指す。
+narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウェア）の互換実装をRustで作るプロジェクト。CLI・Web UI・変換出力など、外部から観測できる挙動の narou.rb 互換を目指す。
 
 ## 実装状況
-`COMMANDS.md` が narou.rb 全24コマンドのオプション・挙動とRust側実装状況を管理するマスタードキュメントである。最新の実装状況はそこを参照すること。
+`COMMANDS.md` が narou.rb 全24コマンドと Rust 拡張 (`db`/`illust`/`login`) 計27コマンドのオプション・挙動・実装状況を管理するマスタードキュメントである。最新の実装状況はそこを参照すること。
 
 | 完了度 | コマンド数 | 内訳 |
 |:------:|:---------:|------|
-| ✅ 完了 | 21 | init, list, tag, freeze, remove, setting, diff, send, mail, backup, clean, illust, help, version, log, folder, browser, alias, inspect, csv, trace |
+| ✅ 完了 | 23 | init, list, tag, freeze, remove, setting, diff, send, mail, backup, clean, illust, help, version, log, folder, browser, alias, inspect, csv, trace, db, login |
 | 🟡 部分 | 4 | download, update, convert, web |
 | ❌ 未実装 | 0 | — (全コマンド実装済み) |
 
 ## Porting Policy
-- このプログラムは `sample/narou` にある本家 narou.rb を Rust へ移行するための互換実装である。
+- このプログラムは本家 narou.rb を Rust へ移行するための互換実装である。Ruby 版ソースは `sample/narou`（gitignore 済みのローカルコピー、upstream: whiteleaf7/narou）に置いて参照する。`sample/` はリポジトリ管理外のため、手元に無い場合は upstream を clone して当てる。
 - 内部ライブラリ、データ構造、処理系統、実装アルゴリズムは Ruby 版と同一である必要はない。Rust 側で保守しやすく、安全で、検証しやすい構成を優先してよい。
 - 互換性の主対象は外部から観測できる挙動である。特に CLI/API の引数・戻り値・エラー挙動、`webnovel/*.yaml` や `converter.yaml` などの YAML 構文理解、`.narou/` 配下のデータ読み書き、最終的なファイル出力を narou.rb と徹底的に合わせる。
 - Ruby 実装は仕様の参照元として扱う。処理手順をそのまま写すことよりも、同じ入力から同じ外部挙動・同じ出力を得ることを優先する。
@@ -51,7 +51,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - 実装が完了したコマンドは「部分」→「完了」に昇格させる。
 - 全24コマンドが narou.rb と完全互換になるまで、この同期作業を継続する。
 - Serena メモリにも常に最新の実装状況を反映する。
-- **完了判定の注意**: `COMMANDS.md` の ✅ 完了は、Rust 側に該当処理や help 表示が存在するだけでは付けない。必ず Ruby 版 `sample/narou/lib/command/*.rb` と、CLI オプション、help 文、Examples、設定項目、終了コード、エラー文、未実装の周辺動作を細かく突き合わせ、外部から観測できる挙動が一致していることを確認してから完了にする。
+- **完了判定の注意**: `COMMANDS.md` の ✅ 完了は、Rust 側に該当処理や help 表示が存在するだけでは付けない。必ず Ruby 版 `sample/narou/lib/command/*.rb`（ローカルコピー）と、CLI オプション、help 文、Examples、設定項目、終了コード、エラー文、未実装の周辺動作を細かく突き合わせ、外部から観測できる挙動が一致していることを確認してから完了にする。
 - 特に `help` は未実装コマンド分も narou.rb から移植する方針のため、Rust 側の実装済みコマンド集合と比較して完了判定しない。`narou <command> -h` の詳細文、Options、Configuration、Variable List、Examples を Ruby 版の各 command ファイルと比較して判断する。
 - 既に ✅ と書かれているコマンドでも、同じ節に「未実装」「不足動作」が残っている場合や Ruby 版 help/挙動との差分がある場合は、実態に合わせて 🟡 部分へ戻す。完了度は楽観的に維持せず、互換性確認の粒度を優先する。
 
@@ -67,7 +67,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - `~/.narousetting/global_setting.yaml` は**ライブラリ状態ではない**ため、storage-backend が `sqlite` のときもファイルのまま維持する。`SQLITE_MANAGED_NAMES` から `global_setting` を外してあり、SQLite への取込・退避 (`*.imported-*`) は行わない。
 - 理由: narou.rb はこのファイルしか読まないため、退避すると narou.rb 側で `aozoraepub3dir` 等が消える。また SQLite 側の実体は「そのライブラリの `.narou/db.sqlite`」なので、別ライブラリ (YAML モード) からは設定が見えなくなる。
 - 旧ビルドが `app_state(scope='global', key='global_setting')` に残した行は、ファイルが無いときに初回読み出しでファイルへ書き戻し、その行を削除する (一度きりの復旧)。`tests/global_settings_storage.rs` がモード往復と復旧を固定している。
-- ローカル側 (`local_setting` / `freeze` / `alias` / `tag_colors` / `latest_convert` / `login_cookie`) は従来どおり SQLite 管理で、`narou-compat` の挙動も変更なし。
+- ローカル側 (`local_setting` / `freeze` / `alias` / `tag_colors` / `latest_convert` / `login_cookie`) は SQLite モード時も管理対象のまま (YAML モードでは従来どおりファイル)。`narou-compat` の挙動も変更なし。
 
 ## 設定データの I/O 境界
 - `local_setting` / `global_setting` の本番コードからの読み書きは `src/db/settings.rs`（`load` / `save` / `update` / `value` 等）を共通入口とする。CLI・Web・converter・downloader・logger・init・self-update から設定 YAML を直接 `fs::read_to_string` / `fs::write` で操作しない。
@@ -86,13 +86,11 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - **別端末・サーバーへの持ち込み**: `narou_rs_login` はブラウザのある端末で動かし、`--export <file>` でポータブルな書き出しファイル (YAML) を作る。`--passphrase` 指定時は Argon2id → XChaCha20-Poly1305 で暗号化される。ライブラリ外では書き出しが既定の出力になる。取り込み側は `narou login import <file>`（CLI）または Web UI 設定の「ログイン」タブで受け付ける。
 - **暗号化保存**: 保存値は `.narou/login.key`（または `NAROU_RS_LOGIN_KEY`）の鍵で `enc:v1:<nonce>:<payload>` として暗号化され、ホスト名を AEAD の associated data に束ねるため別ホストへの流用はできない。旧形式の平文値は読み取り可能で、次回保存時に暗号化される。
 - **セッション ID と小説の対応**: 保存した資格情報には UUID を振り (`LoginCredential.id`)、小説レコードは「どのセッションで成功したか」を `login_session` に持つ (SQLite `novels.login_session` / `*.yaml` の `login_session:`)。`requires_login` は「Cookie が要る」、`login_session` は「どれを使うか」を表す。フラグ付きの小説は次回以降、その ID の資格情報を最初のリクエストから送るので、一覧を毎回総当たりしない。ID が無い旧データはストア読み込み時に採番して書き戻す (小説側が覚える値なので不変)。採用した資格情報が消えていた場合は先頭にフォールバックし、次の成功で ID を書き直す。
-- **複数ログインと試行順**: 保存は 1 ホストにつき **順序つきの資格情報リスト**（`LoginCredential`）で、並び順がそのまま試行順になる。ダウンロード時は保存済みを順に試し、ログイン壁は成功した時点で、部分一覧は「欠けが消えた／話数が増えた」時点で打ち切る。採用した資格情報はその後の本文取得にも使う。在庫の値は JSON 配列で保存し、旧形式（host → Cookie 文字列）は 1 件として読んで次の書き込みで移行する。`Set-Cookie` の書き戻しは「その応答で実際に送った資格情報」だけを更新する（同じサイトの別アカウントのセッションを壊さないため）。
-- **CLI / Web**: `narou login list` はサイトごとに番号と短縮 ID つきで表示、`set`（置き換え）/`add`（末尾に追加）/`order <host> 2,1,3`（並べ替え）/`clear --index N`（1 件削除）を備える。Web UI の設定ページ「ログイン」タブも同じ操作（追加・置き換え・1 件削除・サイト削除・上下ボタンでの並べ替え）ができる。API は `GET/DELETE /api/login`、`POST /api/login/set|add|order|import`、`DELETE /api/login/{host}`、`DELETE /api/login/{host}/{index}`。
-- **書き出し形式**: `narou_login_export.yaml` は version 2（`credentials:` に順序つきリスト）。version 1（`cookies:` の host→cookie マップ）も読める。
-- **Cookie の取得範囲**: 取得側はサイトのドメインファミリー（サイト自身・親ドメイン・兄弟サブドメイン）をまとめて保存する。Pixiv のように `.pixiv.net` にセッションを置くサイトで `www.pixiv.net` だけを見るとセッションを取り落とす。親ドメインで保存した Cookie は、サブドメイン宛のリクエストでも `CookieStore::load` がマージして送る（`Set-Cookie` の書き戻しも同じキーへ行う）。
-- **ブラウザプロファイル**: `narou_rs_login` はサイト単位の固定プロファイル（`%TEMP%/narou-rs-login/<domain>`、`--profile` で変更可）を使い回す。ログイン状態が次回以降も残るため毎回サインインし直さなくてよい。取得後は対象 URL を 1 回取得し、サイト定義の `error_message` / `login_pattern` に当たる場合は「ログインできていない」と警告する（Python ブリッジの `/dashboard` リダイレクト判定に相当）。
-- **CLI**: `narou login`（`list` / `import` / `export` / `set` / `clear`）で取り込み・書き出し・一覧・削除を行う。`list` は値を伏せて表示する。
-- **Web UI**: 設定ページの「ログイン」タブで一覧・取り込み・直接登録・削除を行う。API は `GET/DELETE /api/login`、`POST /api/login/import`、`POST /api/login/set`、`DELETE /api/login/{host}`。
+- **複数ログインと試行順**: 1 ホストにつき資格情報を順序付きリスト（`LoginCredential`）として保存し、一覧の順に試す。ログインが必要なページは取得に成功した時点で、部分的な一覧は「欠けが解消した／話数が増えた」時点で試行を終える。採用した資格情報はその後の本文取得にも使う。保存形式は JSON 配列で、旧形式（host → Cookie 文字列）は 1 件として読み、次の書き込み時に移行する。`Set-Cookie` の書き戻しは、その応答で実際に送った資格情報だけを更新する（同じサイトの別アカウントのセッションを壊さないため）。
+- **CLI / Web**: `narou login list`（値は伏せて表示）/`set`（置き換え）/`add`（末尾に追加）/`order <host> 2,1,3`（並べ替え）/`clear --index N`（1 件削除）/`import` / `export` を備える。Web UI の設定ページ「ログイン」タブも同じ操作（追加・置き換え・1 件削除・サイト削除・上下ボタンでの並べ替え・取り込み）ができる。API は `GET/DELETE /api/login`、`POST /api/login/set|add|order|import`、`DELETE /api/login/{host}`、`DELETE /api/login/{host}/{index}`。
+- **書き出し形式**: `narou_login_export.yaml` は version 2（`credentials:` に順序付きリスト）。version 1（`cookies:` の host → Cookie 文字列）も読み込める。
+- **Cookie の取得範囲**: サイト自身・親ドメイン・兄弟サブドメインを含むドメイン群の Cookie を保存する。Pixiv のように `.pixiv.net` にセッションを置くサイトでは、`www.pixiv.net` だけを見ると取り落とす。親ドメインの Cookie はサブドメイン宛のリクエストにも `CookieStore::load` がマージして送り、`Set-Cookie` も同じキーへ書き戻す。
+- **ブラウザプロファイル**: `narou_rs_login` はサイトごとの固定プロファイル（`%TEMP%/narou-rs-login/<domain>`、`--profile` で変更可）を使い回すため、次回以降もログイン状態が残る。Cookie 取得後は対象 URL に一度アクセスし、サイト定義の `error_message` / `login_pattern` に一致すればログインできていない可能性を警告する。
 - 配布物: `narou_rs_login` もリリース zip に同梱する（`scripts/package-release.ps1` の `-LoginBinaryPath`、`.github/workflows/release.yml` の helper build / sign / package、`cargo local-build` のすべてに対応済み）。Windows では他のサブ実行ファイルと同じく署名対象に含める。
 
 ## Git 運用ルール
@@ -152,7 +150,7 @@ cargo run -- convert 1  # なろう小説を変換
 cargo check              # Type-check
 ```
 
-**重要**: `cargo run` は `sample/novel/` をCWDとして実行する必要がある（`.narou/` ディレクトリが必要なため）。
+**重要**: `cargo run` は `.narou/` を持つ初期化済みライブラリをCWDとして実行する必要がある（例: `sample/novel/`、gitignore 済みのローカル用ディレクトリ）。
 
 ## Edition 2024 注意事項
 - `{}`フォーマット直後に文字列を書くとprefix扱いされるためスペースが必要
@@ -167,8 +165,12 @@ src/
   error.rs                         - NarouError enum + Result type
   queue.rs                         - PersistentQueue (YAMLベース永続化ジョブキュー)
   epub_lite.rs                     - AozoraEpub3_Lite 組み込み EPUB 生成 (feature "lite", ストリーミング書き出し)
+  illustration_animation.rs        - うごイラ等アニメ挿絵の APNG 組み立て (feature "illustration-animation")
+  illustration_store.rs            - 挿絵キャッシュ index + IllustrationStorageService (AssetStore)
   assets/aozora_lite/              - 同梱 chuki テーブル (GPL-3.0-only, Lite由来)
   lib.rs                           - クレートルート (pub mod定義)
+  application/                     - Web/Worker 共通の use-case 層 (jobs/novel_actions/settings/scheduler/self_update 等)
+  login/                           - ログイン Cookie 保存・暗号化・export/import (crypto/mod/transfer)
   platform/
     mod.rs                         - プラットフォーム抽象層 (traits re-export, 設計: docs/platform-abstraction.md)
     http.rs                        - HttpClient trait + HttpRequest/HttpResponse (coreはreqwest/curlを直接呼ばない)
@@ -178,7 +180,7 @@ src/
     repository.rs                  - NovelRepository trait + NovelId/NovelQuery
     mocks.rs                       - MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter
   native/
-    sqlite/                        - SQLite管理基盤 (P1-P4: repository/state/bulk/content/versions)
+    sqlite/                        - SQLite管理基盤 (repository/state/bulk/content/versions/object_store/migrations)
     mod.rs                         - native 実装 (core から参照しない)
     http.rs                        - NativeHttpClient (3-tier: curl crate → reqwest → wget fallback, spawn_blocking 隔離)
   commands/
@@ -197,6 +199,8 @@ src/
     log.rs, trace.rs               - log / trace
     alias.rs, folder.rs, browser.rs - alias / folder / browser
     inspect.rs, csv.rs             - inspect / csv
+    db.rs                          - narou db (verify / export-yaml / vacuum)
+    login.rs                       - narou login (list/import/export/set/add/order/clear)
     web_tray.rs                    - Windows タスクトレイ
   db/
     mod.rs                         - シングルトン (DATABASE static, init_database, with_database/mut)
@@ -268,14 +272,17 @@ src/
     sort_state.rs                  - 一覧ソート状態保存
     tag_colors.rs                  - タグ色管理
     update.rs                      - セルフアップデート API
+    login.rs                       - ログイン Cookie 管理 API (/api/login)
+    feature_tour.rs                - 機能ツアー API (/api/feature_tour)
+    library_backup.rs              - ライブラリ一括バックアップ API (/api/library_backup)
     assets/                        - 静的アセット (CSS, JS)
-sample/
+sample/  (gitignore 済みのローカル用ディレクトリ)
   novel/                           - テスト用CWD (.narou/ + webnovel/*.yaml)
-  narou/                           - Ruby参照ソース (git submodule的な位置, .gitignore)
+  narou/                           - Ruby参照ソース (whiteleaf7/narou のローカルコピー)
   1177354055617350769 .../         - カクヨム参照データ (narou.rb出力, 25,273行)
 ```
 
-## Reference Files (Ruby, 読取専用)
+## Reference Files (Ruby, 読取専用, `sample/narou/` のローカルコピー)
 - `sample/narou/lib/converterbase.rb` — テキスト変換エンジン (1503行) — **最も重要な参照**
 - `sample/narou/lib/novelconverter.rb` — コンバーター全体オーケストレータ (1209行)
 - `sample/narou/lib/html.rb` — HTML→青空変換 (124行) — Rustの `html.rs` はこれに準拠
@@ -283,17 +290,18 @@ sample/
 - `sample/narou/lib/novelsetting.rb` — 設定定義
 - `sample/narou/lib/command/*.rb` — 各コマンド実装 (help/CLI挙動の参照元)
 
-## Current Status (2026-08-25)
+## Current Status (2026-09)
 
-### SQLite 管理基盤移行 (P0-P4 完了、詳細: docs/sqlite-storage-migration-plan.md)
-- P1 `src/native/sqlite/` エンジン + dual-run テスト、P2 メタデータ全面移行 (database/freeze/alias/tag_colors/local+global_setting/queue/notepad/latest_convert → db.sqlite)、レガシー自動import(元ファイルは *.imported-* 退避)、`narou db verify|export-yaml|vacuum`
+### SQLite 管理基盤移行 (P0〜P4c 完了 / P5 一部、詳細: docs/sqlite-storage-migration-plan.md)
+- P1 `src/native/sqlite/` エンジン + dual-run テスト、P2 メタデータ全面移行 (database/freeze/alias/tag_colors/local_setting/queue/notepad/latest_convert → `.narou/db.sqlite`)、レガシー自動import(元ファイルは *.imported-* 退避)、`narou db verify|export-yaml|vacuum`。`global_setting` は 2026-09 修正で移行対象から外れファイル管理のまま (前節「グローバル設定の保存先」参照)
 - P3 デュアルモード化: **既定は従来どおり YAML 管理**。`.narou/storage-backend` マーカー(`sqlite`)または Web UI ツアーの選択で Lite(SQLite) へ切替。`NAROU_RS_LEGACY_YAML=1` は強制レガシー。API: `GET/POST /api/storage/mode`
 - P4a コンテンツミラー (novel_sections/novel_outputs) — convert時に書込み、Web DL時EPUBはDB優先
 - P4b バージョン履歴 (novel_versions/_sections/_diffs) + `narou diff --history|--show|--restore|--merge-from`。update時自動snapshotはconvertフック経由
+- P4c オブジェクト格納: `objects`/`object_chunks` (BLOB + brotli + crc32) に小説データ・生成物を格納。native は FS ミラー + 読みフォールバック、worker は D1 のみ
 - 後方互換: 旧ライブラリからの自動取込と `narou db export-yaml` によるロールバックを保証。`narou setting narou-compat=true` で `.narou/*.yaml` を維持する前方互換モードあり (既定 OFF)。`export-yaml --in-place` は実位置へ書き戻して YAML モードへ復帰する
 
-### プラットフォーム抽象化 (Phase 1-7 完了、Phase 8: 2026-08)
-- **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。Phase 4のsmall object / large asset境界、logical key、native mapping、remaining native FSも記録。Phase 7のD1/Worker read-only adapterも記録。
+### プラットフォーム抽象化 (Phase 1-8 実装完了、2026-08)
+- **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。Phase 4のsmall object / large asset境界、logical key、native mapping、remaining native FS、Phase 7のD1/Worker read-only adapter、Phase 8のQueue/crawler/scheduler境界も記録。
 - **Phase 1 完了**: `src/platform/` に traits（HttpClient / Clock / RateLimiter / ObjectStore / NovelRepository）+ テスト用 mock（MockHttpClient / MemoryObjectStore / MemoryNovelRepository / FakeRateLimiter / SystemClock）を導入。
 - `NarouError::Http` は `reqwest::Error` の直接 `#[from]` をやめ String 化。`Platform(String)` variant 追加。core から reqwest 型が error 経由で漏れるのを防止。
 - **Phase 2 完了**: downloader を trait 利用へ全面移行。
@@ -321,15 +329,15 @@ sample/
   - `MemoryObjectStore` async/paged/chunked fake、PersistenceService fixed-clock、NativeObjectStore layout/existing-data compatibility testsを追加。
 - **Phase 5 remaining native boundary**: Inventory/settings、site definition loader、downloader info cache、Web固有FS、converter/settings/ini/inspector/user-converter/section-convert-cache、converter/deviceのsubprocess/tempdirはnative-only capabilityとして残る。content blobをLISTでmetadata DB化しない。
 
-### Phase 6-7 Worker backend (2026-08-10)
+### Phase 6-8 Worker backend (2026-08)
 - `narou_rs` の `worker-runtime` feature は `application`、`platform`、portable `db`/`converter::ini` のみを公開する。CLI、Web、native HTTP、filesystem、process、settings adapters は `native-runtime` gate の内側に置く。
 - `worker_entry/` は `workers-rs 0.8.5` の `fetch` / `scheduled` / `queue` eventを公開する。`composition.rs` は D1 novel/freeze/settings/tag-color adapters と D1 `ObjectStore`(`objects`/`object_chunks` BLOB+brotli+crc32 テーブル) を構成し、Worker固有型をcoreへ逆流させない。
 - `WorkerHttpClient` は Fetch APIを既存 `HttpClient` traitへ接続し、request/response body上限を強制する。`D1ObjectStore` は logical-key prefix、paged LIST、bounded small read/write、streaming AssetStore を D1 上に実装する。
 - `D1NovelRepository` はprepared statements/migrationsでtyped filter/sort、keyset `scan_ids`、atomic sequence allocation、batch mutationをSQL化する。settings、freeze、tag colorsもD1 state/tableへ接続する。
-- `/health/live`、`/health/ready`、認証付きread-only `/api/novels`/`/api/novels/:id`を公開する。`NAROU_ADMIN_TOKEN`はconstant-time比較し、未知queue envelopeはretryする。Queue実ジョブ実行はPhase 8へ残す。
+- `/health/live`、`/health/ready`、認証付きread-only `/api/novels`/`/api/novels/:id`を公開する。`NAROU_ADMIN_TOKEN`はconstant-time比較。未知queue envelopeはledgerへ記録して安全にackする (retryしない)。Queue実ジョブ実行 (D1 ledger・bounded retry・checkpoint resume) は Phase 8 で実装済み。
 - Worker production readinessはD1 `DB` bindingと `NAROU_ADMIN_TOKEN` secretを要求する。秘密値はリポジトリへ置かない。
 
-### 最近の追加 (2026-05〜07)
+### 最近の追加 (2026-05〜09)
 - **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1 で従来の逐次動作、フォース指定・ウェブモード・ドメインが1種類のときは自動的に逐次にフォールバック
 - **ジョブ自動リトライ** (B): queue worker に exponential backoff 付き自動リトライ（`queue.retry-backoff` 既定 `1m,5m,15m`）を実装
 - **挿絵メンテナンスコマンド** (A): `narou illust <sub>`（`orphan` / `migrate` / `fix-ext` / `rebuild`）を新設し、`.illustration_cache.yaml` 運用の保守ヘルパーを CLI から呼び出せるようにした。削除・改名・移行系はいずれも既定 dry-run
@@ -403,7 +411,7 @@ sample/
 - Windows タスクトレイ常駐 (`--hide-console`)
 
 ### コマンド実装状況 (詳細は `COMMANDS.md`)
-- ✅ 完了 (21): init, list, tag, freeze, remove, setting, diff, send, mail, backup, clean, illust, help, version, log, folder, browser, alias, inspect, csv, trace
+- ✅ 完了 (23): init, list, tag, freeze, remove, setting, diff, send, mail, backup, clean, illust, help, version, log, folder, browser, alias, inspect, csv, trace, db, login
 - 🟡 部分 (4): download, update, convert, web
 - ❌ 未実装 (0): 全コマンド何らかの実装あり
 
@@ -500,6 +508,6 @@ For each section:
 - **WebSocket**: tokio-tungstenite
 - **HTTP client (low-level)**: curl crate
 - **Random UA**: ua_generator
-- **管理DB**: SQLite (`rusqlite` bundled, optional dep / native-runtime)。`NAROU_RS_LEGACY_YAML=1` でレガシーYAML運用に切替
+- **管理DB**: SQLite (`rusqlite` bundled, optional dep / native-runtime)。**既定は従来の YAML 管理**で、`.narou/storage-backend` マーカー (`sqlite`) または Web UI ツアーでの選択で `.narou/db.sqlite` 管理へ切り替えるオプトイン方式。`NAROU_RS_LEGACY_YAML=1` は SQLite を完全に無効化する
 - **EPUB エンジン (オプション)**: `aozora_epub3_lite` (git 依存, rev pin) — cargo feature `lite` で有効化。`worker-runtime` は自動的に `lite` を含む。`lite` ビルドは GPL-3.0-only (assets/aozora_lite/LICENSE.md)、無しは従来どおり BSD-2-Clause + 外部 AozoraEpub3 プロセス。
 - **サードパーティライセンス**: `cargo-about` で 2 種類生成する。GPL 側は `about.toml` + `--workspace` → `Third-Party-License.md`（`aozora_epub3_lite` と `narou_worker` に限り GPL-3.0-only を crate 単位で許可）。非 GPL 側は `about-non-gpl.toml` + `about-probe/`（`lite` 無しの `narou_rs` に依存する切り離し manifest）→ `Third-Party-License-non-GPL.md` で、GPL を一切許可しないゲートを兼ねる。`worker_entry` が `worker-runtime` 経由で `lite` を常時有効化するため、workspace 直下の走査は必ず GPL 側になる。生成コマンドは `about.hbs` の冒頭に記載。CI (`platform.yml` の `license` job) が両方を再生成して差分ゼロを検証するため、依存を変更したらノーティスも再生成して同時にコミットすること（生成器は `cargo-about` 0.9.2 に固定）。第 3 節の直接依存テーブルは手書きなので、`scripts/check-license-table.py` が `Cargo.toml` と突き合わせる（同じく CI で実行）。依存の追加・削除・要求バージョン変更時は `about.hbs` のテーブルも直すこと。

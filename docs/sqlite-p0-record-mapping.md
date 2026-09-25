@@ -55,3 +55,5 @@ SQLite 移行 P0 成果物。列定義は `worker_entry/migrations/0001_core.sql
 - マッピング実装: `src/native/sqlite/{record_map.rs, query.rs, repository.rs}`
 - SQL 断片 (UPSERT/STATUS式): `src/native/sqlite/sql/*.sql` (D1 ソースから機械抽出、byte 等価)
 - dual-run/golden テスト: `src/native/sqlite/repository.rs#tests`, `tests/golden/{records-a.json, library-a/}`
+
+※この表は P0 時点 (migrations 0001〜0004) の対応表。native 側はその後 `0005`〜`0010` (queue / versions / objects / section_bodies) と `0011` (`novels.requires_login`)、`0012` (`novels.login_session`) が追加されており、ログイン関連列は AGENTS.md「ログインが必要なサイト」節を参照。
