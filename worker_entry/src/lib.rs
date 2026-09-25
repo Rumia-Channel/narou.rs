@@ -278,6 +278,10 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         cover_from_first_image: !prefetched.is_empty(),
         assets_dir: None,
         kindle: false,
+        // The dakuten font and its stylesheet are read from `preset/` on
+        // disk (`dakuten_font::lite_font_assets`), which this runtime has no
+        // filesystem for; the Worker EPUB keeps the engine's own fonts.
+        extra_assets: Vec::new(),
     };
     let build = match narou_rs::epub_lite::build_book_from_source(
         std::sync::Arc::new(MemorySource::new(text.clone(), prefetched)),

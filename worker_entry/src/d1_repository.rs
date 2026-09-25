@@ -541,6 +541,7 @@ struct StateRow {
 enum BindValue {
     Text(String),
     Int(i64),
+    Null,
 }
 
 fn bind_statement(statement: D1PreparedStatement, values: Vec<BindValue>) -> Result<D1PreparedStatement> {
@@ -549,6 +550,7 @@ fn bind_statement(statement: D1PreparedStatement, values: Vec<BindValue>) -> Res
         .map(|value| match value {
             BindValue::Text(value) => JsValue::from_str(&value),
             BindValue::Int(value) => JsValue::from_f64(value as f64),
+            BindValue::Null => JsValue::NULL,
         })
         .collect();
     statement.bind(&values).map_err(worker_error)
@@ -688,7 +690,7 @@ fn record_binds(record: &NovelRecord) -> Result<Vec<BindValue>> {
         BindValue::Int(record.convert_failure as i64),
         BindValue::Int(record.requires_login as i64),
     match record.login_session.as_deref() {
-        Some(value) => BindValue::Text(value),
+        Some(value) => BindValue::Text(value.to_string()),
         None => BindValue::Null,
     },
         BindValue::Text(extra_fields_yaml.clone()),
