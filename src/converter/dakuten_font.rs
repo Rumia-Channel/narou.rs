@@ -50,6 +50,64 @@ fn format_line_height(line_height: f64) -> String {
     text
 }
 
+/// `preset/vertical_font_with_dakuten.css` を行高だけ差し替えて返す。
+///
+/// 外部 AozoraEpub3 にはファイルとして流し込む (`activate`) が、組み込み
+/// エンジン (Lite) には同じ内容を EPUB 内のスタイルシートとして渡す。
+pub fn dakuten_css_text() -> Result<String> {
+    let preset = preset_dir()?;
+    let text = std::fs::read_to_string(preset.join(DAKUTEN_CSS_NAME))?;
+    Ok(text.replace("<%= line_height %>", &format_line_height(current_line_height())))
+}
+
+/// `preset/DMincho.ttf` (濁点フォント本体) の中身。
+pub fn dakuten_font_bytes() -> Result<Vec<u8>> {
+    let preset = preset_dir()?;
+    Ok(std::fs::read(preset.join(DAKUTEN_FONT_NAME))?)
+}
+
+/// 本文全体を濁点フォントで組む CSS (組み込みエンジン向けの opt-in)。
+///
+/// `dakuten_css_text()` に本文フォントの指定を足したもの。Reader が EPUB 内の
+/// フォントを使う実装なら、全角スペース等の字形もこのフォントから供給される。
+pub fn body_font_css_text() -> Result<String> {
+    let mut text = dakuten_css_text()?;
+    text.push_str(
+        "\n/* narou: convert.epub-font=always — 本文全体を DMincho で組む */\n\nbody, p {\n\tfont-family: \"DakutenAokinMincho\", serif;\n}\n",
+    );
+    Ok(text)
+}
+
+/// 組み込みエンジンへ渡す濁点フォントのアセット一式。
+///
+/// `lite` feature (組み込み EPUB エンジン) 専用。
+#[cfg(feature = "lite")]
+///
+/// `use_dakuten_font` (テキストに濁点注記があった) か、設定
+/// `convert.epub-font = always` のときだけ返す。
+pub fn lite_font_assets(use_dakuten_font: bool) -> Result<Vec<aozora_epub3_lite::EpubAsset>> {
+    use aozora_epub3_lite::EpubAsset;
+
+    let always = crate::compat::load_global_setting_string("convert.epub-font")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("always"));
+    if !use_dakuten_font && !always {
+        return Ok(Vec::new());
+    }
+    let css = if always {
+        body_font_css_text()?
+    } else {
+        dakuten_css_text()?
+    };
+    Ok(vec![
+        EpubAsset::new("style/vertical_font.css", "text/css", css.into_bytes()),
+        EpubAsset::new(
+            "fonts/DMincho.ttf",
+            "application/font-sfnt",
+            dakuten_font_bytes()?,
+        ),
+    ])
+}
+
 fn dst_css(aozora_dir: &Path) -> PathBuf {
     aozora_dir
         .join("template")

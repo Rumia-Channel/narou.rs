@@ -9,8 +9,18 @@ use std::sync::Arc;
 
 use crate::downloader::Downloader;
 use crate::platform::{
-    AssetStore, HttpClient, NovelRepository, ObjectStore, RateLimiter, SystemClock,
+    AssetStore, CookieStore, HttpClient, NovelRepository, ObjectStore, RateLimiter, SystemClock,
 };
+
+/// Login cookies for the library the current directory belongs to.
+///
+/// `None` outside a library: the downloader then stays anonymous, exactly like
+/// the Worker and the in-memory tests.
+fn cookie_store() -> Option<Arc<dyn CookieStore>> {
+    crate::native::cookie_store::InventoryCookieStore::for_current_root()
+        .ok()
+        .map(|store| Arc::new(store) as Arc<dyn CookieStore>)
+}
 
 impl Downloader {
     pub fn new() -> crate::error::Result<Self> {
@@ -28,14 +38,19 @@ impl Downloader {
         let store = Arc::new(store);
         let objects: Arc<dyn ObjectStore> = store.clone();
         let assets: Arc<dyn AssetStore> = store;
-        Self::with_platform_and_storage(
+        let cookies = cookie_store();
+        let downloader = Self::with_platform_and_storage(
             http,
             rate_limiter,
             novels,
             objects,
             assets,
             Arc::new(SystemClock),
-        )
+        )?;
+        Ok(match cookies {
+            Some(cookies) => downloader.with_cookie_store(cookies),
+            None => downloader,
+        })
     }
 
     pub fn with_user_agent(user_agent: Option<&str>) -> crate::error::Result<Self> {
@@ -43,19 +58,28 @@ impl Downloader {
             user_agent,
             crate::compat::load_local_setting_string("user-agent"),
         );
-        let http = Arc::new(crate::native::http::NativeHttpClient::new(&ua)?);
+        let cookies = cookie_store();
+        let client = crate::native::http::NativeHttpClient::new(&ua)?;
+        let http: Arc<dyn HttpClient> = match cookies.clone() {
+            Some(cookies) => Arc::new(client.with_cookie_store(cookies)),
+            None => Arc::new(client),
+        };
         let rate_limiter = Arc::new(crate::downloader::rate_limit::RateLimiter::new(false));
         let novels = Arc::new(crate::native::novel_repository::NativeNovelRepository::new());
         let store = Arc::new(crate::native::object_store::NativeStore::for_current_root()?);
         let objects: Arc<dyn ObjectStore> = store.clone();
         let assets: Arc<dyn AssetStore> = store;
-        Self::with_platform_and_storage(
+        let downloader = Self::with_platform_and_storage(
             http,
             rate_limiter,
             novels,
             objects,
             assets,
             Arc::new(SystemClock),
-        )
+        )?;
+        Ok(match cookies {
+            Some(cookies) => downloader.with_cookie_store(cookies),
+            None => downloader,
+        })
     }
 }

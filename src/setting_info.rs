@@ -156,6 +156,8 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "server-basic-auth.password"
         | "server-ws-add-accepted-domains"
         | "server-add-accepted-hosts"
+        | "convert.epub-font"
+        | "self-update.variant"
         | "over18" => Some("global"),
 
         _ => None,
@@ -544,6 +546,25 @@ mod tests {
             .expect("server-add-accepted-hosts must be registered as a global var");
         assert!(matches!(info.var_type, VarType::String));
         assert!(info.invisible, "global-only setting should stay invisible on webui tab");
+    }
+
+    #[test]
+    fn self_update_variant_is_selectable_from_settings() {
+        assert_eq!(tab_for_setting("self-update.variant"), Some("global"));
+
+        let vars = setting_variables();
+        let info = vars
+            .get("self-update.variant")
+            .expect("self-update.variant must be registered as a global var");
+        assert!(matches!(info.var_type, VarType::Select));
+        assert!(
+            !info.invisible,
+            "the variant must be listed by `narou setting` and shown on the Web UI settings page"
+        );
+        assert_eq!(
+            info.select_keys,
+            Some(vec!["gpl".to_string(), "standard".to_string()])
+        );
     }
 
     #[test]
@@ -1095,6 +1116,13 @@ pub fn setting_variables() -> SettingVariables {
             ),
         ),
         (
+            "convert.epub-font",
+            sel(
+                "EPUB の本文フォント。auto: 濁点注記のある小説だけ濁点フォント (DMincho) を使う / always: 常に DMincho を埋め込んで本文を組む (Reader が全角スペース等を描けない場合の回避策)",
+                vec!["auto", "always"],
+            ),
+        ),
+        (
             "server-port",
             vis(
                 VarType::Integer,
@@ -1158,8 +1186,8 @@ pub fn setting_variables() -> SettingVariables {
         ("over18", invis(VarType::Boolean, "18歳以上かどうか")),
         (
             "self-update.variant",
-            invis_sel(
-                "セルフアップデートで取得するリリース variant。gpl: AozoraEpub3_Lite 組込み(GPL-3.0) / standard: 外部 AozoraEpub3 を利用(BSD)",
+            sel(
+                "セルフアップデートで取得するリリース variant。gpl: AozoraEpub3_Lite 組込み(GPL-3.0) / standard: 外部 AozoraEpub3 を利用(BSD)。未設定なら実行中のビルドと同じ variant を使う",
                 vec!["gpl", "standard"],
             ),
         ),

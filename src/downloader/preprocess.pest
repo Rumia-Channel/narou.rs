@@ -51,39 +51,65 @@ expr       = _{ or_expr }
 or_expr    = { and_expr ~ ("||" ~ and_expr)* }
 and_expr   = { unary_expr ~ ("&&" ~ unary_expr)* }
 unary_expr = { "!" ~ unary_expr | cmp_expr }
-cmp_expr   = { primary ~ (("==" | "!=") ~ primary)? }
+cmp_expr   = { add_expr ~ (cmp_op ~ add_expr)? }
+cmp_op     = { "==" | "!=" }
+// 整数の加減算。数値でない被演算数は null になる (暗黙の文字列連結はしない)。
+add_expr   = { primary ~ (add_op ~ primary)* }
+add_op     = { "+" | "-" }
 
 primary = _{
     string
     | extract_json_expr
+    | call_chain_expr
+    | request_expr
+    | fetch_json_expr
     | chain_expr
     | array_chain_expr
     | array_literal
     | null_lit
+    | int_lit
     | "(" ~ expr ~ ")"
 }
 
 // --- JSON extraction ---
 extract_json_expr = { "extract_json" ~ "(" ~ regex ~ ")" }
 
+// --- extra fetch request ---
+// 追加の取得要求。実行は async 側 (サイトの FetchPolicy 経由) が行い、結果は
+// 次の実行で `fetched["<url>"]` として見える。
+request_expr = { "request" ~ "(" ~ string ~ ")" }
+// 取得要求と結果参照の糖衣。未解決・失敗なら null を返す。
+fetch_json_expr = { "fetch_json" ~ "(" ~ string ~ ")" }
+// `fetch_json(...).body[0].urls.original` のように呼び出し結果を辿る形。
+call_chain_expr = { (request_expr | fetch_json_expr) ~ chain_part+ }
+
 // --- accessor + method chain ---
 chain_expr = { ident ~ chain_part* }
 chain_part = _{ method | dot_access | bracket_access }
 dot_access   = { "." ~ ident }
 bracket_access = { "[" ~ bracket_inner ~ "]" }
-bracket_inner  = _{ string | chain_expr }
+bracket_inner  = _{ int_lit | string | expr }
 
 method = {
     ".map" ~ block
     | ".flat_map" ~ block
-    | ".flatten"
-    | ".compact"
+    | ".flatten" ~ method_end
+    | ".compact" ~ method_end
     | ".join" ~ "(" ~ string ~ ")"
-    | ".gsub" ~ "(" ~ string ~ "," ~ string ~ ")"
+    | ".gsub" ~ "(" ~ (regex | string) ~ ")" ~ block
+    | ".gsub" ~ "(" ~ (regex | string) ~ "," ~ string ~ ")"
     | ".replace" ~ "(" ~ string ~ "," ~ string ~ ")"
-    | ".is_array"
-    | ".empty"
+    | ".is_array" ~ method_end
+    | ".empty" ~ method_end
+    | ".size" ~ method_end
+    | ".first" ~ method_end
+    | ".last" ~ method_end
+    | ".reverse" ~ method_end
 }
+
+// 引数を取らないメソッドは、名前の続きがあるときは識別子アクセスとして扱う
+// (`.last` が `.lastEpisodePublishedAt` に食い込まないようにする)。
+method_end = _{ !(ASCII_ALPHANUMERIC | "_") }
 
 BLOCK_OPEN = _{ "{" }
 BLOCK_CLOSE = _{ "}" }
@@ -94,11 +120,12 @@ block = { BLOCK_OPEN ~ PIPE ~ ident ~ PIPE ~ expr ~ BLOCK_CLOSE }
 string   = _{ i_string | r_string }
 i_string = { "\"" ~ i_part* ~ "\"" }
 i_part   = _{ interp | i_text }
-interp   = { "${" ~ chain_expr ~ "}" }
-i_text   = @{ (!(("\"") | ("${")) ~ ANY)+ }
+interp   = { "${" ~ expr ~ "}" }
+i_text   = @{ (escape_char | (!(("\"") | ("${")) ~ ANY))+ }
 
 r_string = { "'" ~ r_text ~ "'" }
-r_text   = @{ (!"'" ~ ANY)* }
+r_text   = @{ (escape_char | (!"'" ~ ANY))* }
+escape_char = _{ "\\" ~ ANY }
 
 // ---------- regex ----------
 regex       = { "/" ~ regex_body ~ "/" ~ regex_flags? }
@@ -110,6 +137,7 @@ regex_flags = @{ ("s" | "m" | "i")* }
 array_literal = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
 array_chain_expr = { array_literal ~ method+ }
 null_lit      = { "null" }
+int_lit       = @{ ASCII_DIGIT+ }
 
 // ---------- identifier ----------
 ident = @{

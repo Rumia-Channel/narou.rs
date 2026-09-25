@@ -41,6 +41,11 @@ const TABS: &[(&str, &str, &str)] = &[
         "default_args.* 系の設定はコマンド実行時のオプションを省略した場合のデフォルト値を指定します",
     ),
     ("replace", "置換設定", ""),
+    (
+        "login",
+        "ログイン",
+        "ブラウザのある端末で取得したログイン情報を取り込みます",
+    ),
 ];
 
 /// GET /api/setting — returns all settings with metadata
@@ -289,6 +294,14 @@ fn select_summaries_for_setting(name: &str, info: &VarInfo) -> Option<Vec<String
             "自動判定".to_string(),
             "常に有効".to_string(),
             "常に無効".to_string(),
+        ],
+        "convert.epub-font" => vec![
+            "自動 (濁点注記のある小説だけ)".to_string(),
+            "常に埋め込む".to_string(),
+        ],
+        "self-update.variant" => vec![
+            "GPL版（AozoraEpub3_Lite 組込み）".to_string(),
+            "通常版（外部 AozoraEpub3）".to_string(),
         ],
         "webui.new-tag-color" => vec![
             "自動 (巡回)".to_string(),

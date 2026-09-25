@@ -118,12 +118,30 @@ cp -r assets/aozora C:/path/to/tools/
 
 ## ライブラリ組み込み実装 (2026-08-25, feature `lite`)
 
+※この節は初回組み込み時点の記録。pin rev・実装構成は後続の「更新 (2026-09-15)」「更新 (2026-09-25)」節が最新 (現在 pin: v0.1.4 `cd67ddb`)。
+
 - cargo feature `lite`: `aozora_epub3_lite` を git 依存 (rev `8e0e3f6` に pin) で追加。**`worker-runtime` は `lite` を自動的に内包**し、Worker ビルドは常にライブラリ変換になる。GPL-3.0-only のため CI 成果物は `-GPL` 付きで頒布する
 - `src/epub_lite.rs`: chuki テーブル7種 + replace.txt を `include_str!` 埋め込みした `embedded_config()`、テキスト→`EpubBook` 組立 (`build_book`)、seek 不要の ZIP data descriptor 書き出し (`stream_epub`)。画像は provider 経由で書き出し時に都度解決 (省メモリ)。単体テスト6件 (+`NAROU_EPUB_SMOKE_TXT` で実データ smoke を opt-in)
 - Worker: `GET /api/novels/:id/download.epub` — ObjectStore 上の `novel.txt` (= 新設 `NovelObjectKeys::converted_text()`) を DL 時に EPUB 化して返す。挿絵は 512 枚 / 64 MiB 上限の prefetch 後にメモリ解決。未生成時は 409
 - Native Web: 既存 `/novels/{id}/download` で EPUB が見つからない場合、`lite` ビルドなら変換済み txt からその場で EPUB 生成して返す
 - Native 変換後、固定名ミラー `novel.txt` を小説ディレクトリへ併せて書き出し (feature `lite` 時)。ObjectStore レイアウト経由で Worker と同じキーで参照できる
 - CI: platform.yml に `native-gpl` job (`--features lite` の check/test/build)。release.yml は全8プラットフォームに GPL 版を追加 (`narou_rs_{plat}_{arch}-GPL.zip`)、package-release.ps1 に `-Variant` 引数を追加。タグ push に加え `workflow_dispatch` で任意ブランチから両 variant の zip を生成可能 (dispatch 時は GitHub Release を作成しない)
+
+### 更新 (2026-09-25): v0.1.4 で濁点フォントを組み込みエンジンでも使う
+
+外部ツール (`DakutenFontGuard`) は `aozoraepub3dir/template/OPS/fonts/DMincho.ttf`
+と `css_custom/vertical_font.css` を流し込んで効かせるが、組み込みエンジンはその
+ディレクトリを見ていなかった。crate 側 (v0.1.4) が呼び出し側の `style/*.css`
+アセットを本文からリンクするようになったので、narou は同じ内容を
+`EpubBuildOptions::extra_assets` で渡す。
+
+- pin: `aozora_epub3_lite` = `cd67ddb` (v0.1.4)。`Cargo.toml` の `rev` を書き換えて
+  `cargo update -p aozora_epub3_lite`
+- 設定 `convert.epub-font`: `auto` (既定。濁点注記のある小説だけ DMincho) /
+  `always` (本文全体を `DakutenAokinMincho` で組む。`U+3000` を描けない Reader 向け)
+- 検証: 該当小説 (pixiv n29131692) を組み込みエンジン + `always` で変換し、
+  `item/style/vertical_font.css` (`@font-face` + `body, p` ルール)・
+  `item/fonts/DMincho.ttf`・本文の `<link>`・OPF の manifest を確認
 
 ### 更新 (2026-09-15): v0.1.3 で Java 出力とほぼ完全一致
 
@@ -160,6 +178,6 @@ Lite 側に資産注入の口が揃ったため、`src/epub_lite.rs` を組み�
 
 ## 未検証リスク
 
-- 濁点注記 (`［＃濁点］` 等): テストデータに該当なし。DakutenFontGuard との相互作用未検証
+- 濁点注記 (`［＃濁点］` 等): 初回評価時は未検証だったが、組み込みエンジン側は「更新 (2026-09-25)」で `convert.epub-font` 実装 + 実機確認済み。外部ツール経路 (DakutenFontGuard) との併存は引き続き未検証
 - mobi/kindle (kindlegen 連鎖)、ibunko zip は対象外
 - GUI・ネットワーク取得機能は Lite の設計上対象外 (narou.rs 側で担う範囲のみ)

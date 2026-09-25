@@ -56,7 +56,10 @@ impl SiteSetting {
         vars.insert("scheme".to_string(), self.scheme.clone());
         vars.insert("domain".to_string(), self.domain.clone());
         vars.insert("top_url".to_string(), self.top_url.clone());
-        vars.insert("toc_url".to_string(), self.toc_url.clone());
+        vars.insert(
+            "toc_url".to_string(),
+            self.toc_url.selected(None).unwrap_or_default().to_string(),
+        );
         vars.insert("name".to_string(), self.name.clone());
         vars.insert("sitename".to_string(), self.sitename.clone());
         vars.insert("encoding".to_string(), self.encoding.clone());

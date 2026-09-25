@@ -18,6 +18,106 @@ use crate::platform::{
 
 use super::security::{MAX_REDIRECTS, is_safe_header_value, validate_public_url};
 
+/// Everything a site fetch needs beyond the URL: the site's static headers
+/// (cookie jar value plus any `headers:` declared in the site definition) and
+/// whether it uses the narou rate-limit scope.
+///
+/// Every outbound request for a site carries one of these, so the site
+/// definition is the single place that decides what is sent.
+#[derive(Debug, Clone, Default)]
+pub struct FetchPolicy {
+    headers: Vec<(String, String)>,
+    narou: bool,
+    /// Site definition's `min_interval`, applied to the rate-limit scope.
+    min_interval: Option<f64>,
+}
+
+impl FetchPolicy {
+    /// Build the policy from a site definition. Header names/values that could
+    /// inject a second request are dropped here rather than at send time.
+    pub fn for_site(setting: &super::site_setting::SiteSetting) -> Self {
+        let mut headers = Vec::new();
+        if let Some(cookie) = setting.cookie() {
+            headers.push(("Cookie".to_string(), cookie.to_string()));
+        }
+        headers.extend(setting.header_list());
+        headers.retain(|(name, value)| is_safe_header_name(name) && is_safe_header_value(value));
+        Self {
+            headers,
+            narou: setting.is_narou,
+            min_interval: setting.min_interval,
+        }
+    }
+
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        let (name, value) = (name.into(), value.into());
+        if is_safe_header_name(&name) && is_safe_header_value(&value) {
+            self.headers.push((name, value));
+        }
+        self
+    }
+
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
+    /// The site definition's `min_interval`, when it declares one.
+    pub fn min_interval(&self) -> Option<f64> {
+        self.min_interval
+    }
+
+    pub fn narou(&self) -> bool {
+        self.narou
+    }
+}
+
+/// Header names must be tokens; anything else (spaces, colons, CR/LF) is
+/// rejected so a site definition cannot smuggle a second header.
+fn is_safe_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn hameln_definition_carries_browser_fetch_metadata() {
+        // R18 分離ドメインの Cloudflare challenge を避けるためのヘッダが
+        // サイト定義から実際に policy へ流れていることを固定する。
+        let setting: super::super::site_setting::SiteSetting = serde_yaml::from_str(
+            include_str!("../../webnovel/syosetu.org.yaml"),
+        )
+        .unwrap();
+        let policy = FetchPolicy::for_site(&setting);
+
+        for name in [
+            "Sec-Fetch-Dest",
+            "Sec-Fetch-Mode",
+            "Sec-Fetch-Site",
+            "Sec-Fetch-User",
+            "Upgrade-Insecure-Requests",
+            "Accept-Language",
+        ] {
+            assert!(
+                policy.headers().iter().any(|(key, _)| key == name),
+                "missing {name} in {:?}",
+                policy.headers()
+            );
+        }
+        assert!(
+            policy
+                .headers()
+                .iter()
+                .any(|(key, value)| key == "Cookie" && value == "over18=off")
+        );
+    }
+}
+
 /// Decode response bytes using the site's declared encoding.
 ///
 /// `None`/`utf-8` uses lossy UTF-8; other labels go through `encoding_rs`
@@ -91,11 +191,10 @@ pub async fn resolve_final_url(
     http: &dyn HttpClient,
     rate_limiter: &dyn RateLimiter,
     url: &str,
-    cookie: Option<&str>,
-    narou: bool,
+    policy: &FetchPolicy,
 ) -> Result<String> {
     Ok(
-        resolve_final_url_with_body(http, rate_limiter, url, cookie, narou)
+        resolve_final_url_with_body(http, rate_limiter, url, policy)
             .await?
             .0,
     )
@@ -110,25 +209,21 @@ pub async fn resolve_final_url_with_body(
     http: &dyn HttpClient,
     rate_limiter: &dyn RateLimiter,
     url: &str,
-    cookie: Option<&str>,
-    narou: bool,
+    policy: &FetchPolicy,
 ) -> Result<(String, Option<HttpResponse>)> {
     validate_public_url(url).map_err(|e| NarouError::Http(e.to_string()))?;
     let mut current = url::Url::parse(url).map_err(|e| NarouError::Http(e.to_string()))?;
-    let mut current_cookie = cookie.map(ToString::to_string);
+    let mut headers = policy.headers().to_vec();
 
     for hop in 0..=MAX_REDIRECTS {
         validate_public_url(current.as_str()).map_err(|e| NarouError::Http(e.to_string()))?;
         rate_limiter
-            .acquire(&scope_for(host_of(current.as_str()), narou))
+            .acquire(&scope_for(host_of(current.as_str()), policy))
             .await?;
 
         let mut request = HttpRequest::get(current.as_str()).with_redirect(RedirectMode::Manual);
-        if let Some(cookie) = current_cookie.as_deref() {
-            if !is_safe_header_value(cookie) {
-                return Err(NarouError::Http("unsafe Cookie header value".into()));
-            }
-            request = request.with_header("Cookie", cookie);
+        for (name, value) in &headers {
+            request = request.with_header(name.clone(), value.clone());
         }
 
         let response = http.send(request).await?;
@@ -140,7 +235,9 @@ pub async fn resolve_final_url_with_body(
                 .join(location)
                 .map_err(|e| NarouError::Http(format!("invalid redirect location: {e}")))?;
             if !same_site_hosts(next.host_str(), current.host_str()) {
-                current_cookie = None;
+                // A hop that leaves the site must not carry the cookie jar,
+                // however the site definition spelled the header name.
+                headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Cookie"));
             }
             current = next;
             continue;
@@ -162,11 +259,10 @@ pub async fn fetch_text(
     http: &dyn HttpClient,
     rate_limiter: &dyn RateLimiter,
     url: &str,
-    cookie: Option<&str>,
+    policy: &FetchPolicy,
     encoding: Option<&str>,
-    narou: bool,
 ) -> Result<String> {
-    let response = fetch_bytes(http, rate_limiter, url, cookie, narou).await?;
+    let response = fetch_bytes(http, rate_limiter, url, policy).await?;
     Ok(decode_with_encoding(&response.body, encoding))
 }
 
@@ -175,32 +271,29 @@ pub async fn fetch_bytes(
     http: &dyn HttpClient,
     rate_limiter: &dyn RateLimiter,
     url: &str,
-    cookie: Option<&str>,
-    narou: bool,
+    policy: &FetchPolicy,
 ) -> Result<HttpResponse> {
     validate_public_url(url).map_err(|e| NarouError::Http(e.to_string()))?;
     rate_limiter
-        .acquire(&scope_for(host_of(url), narou))
+        .acquire(&scope_for(host_of(url), policy))
         .await?;
 
     let mut request = HttpRequest::get(url);
-    if let Some(cookie) = cookie {
-        if !is_safe_header_value(cookie) {
-            return Err(NarouError::Http("unsafe Cookie header value".into()));
-        }
-        request = request.with_header("Cookie", cookie);
+    for (name, value) in policy.headers() {
+        request = request.with_header(name.clone(), value.clone());
     }
 
     let response = http.send(request).await?;
     ensure_success_response(url, response)
 }
 
-fn scope_for(host: String, narou: bool) -> RateLimitScope {
-    if narou {
+fn scope_for(host: String, policy: &FetchPolicy) -> RateLimitScope {
+    let scope = if policy.narou {
         RateLimitScope::narou(host)
     } else {
         RateLimitScope::site(host)
-    }
+    };
+    scope.with_min_interval(policy.min_interval)
 }
 
 pub(crate) fn host_of(url: &str) -> String {
@@ -276,6 +369,92 @@ mod tests {
         };
         let err = ensure_success_response("https://e.com/", server_error).unwrap_err();
         assert!(err.to_string().contains("HTTP 500"));
+    }
+
+    #[test]
+    fn fetch_policy_carries_site_headers_and_cookie() {
+        let setting: super::super::site_setting::SiteSetting = serde_yaml::from_str(
+            r#"
+name: Example
+domain: example.com
+top_url: https://example.com
+sitename: Example
+toc_url: https://example.com/\k<ncode>
+cookie: over18=yes
+headers:
+  Referer: https://example.com/
+"#,
+        )
+        .unwrap();
+        let policy = FetchPolicy::for_site(&setting);
+
+        assert_eq!(
+            policy.headers(),
+            &[
+                ("Cookie".to_string(), "over18=yes".to_string()),
+                ("Referer".to_string(), "https://example.com/".to_string()),
+            ]
+        );
+        assert!(!policy.narou());
+    }
+
+    #[test]
+    fn fetch_policy_drops_headers_that_could_inject_a_second_request() {
+        let setting: super::super::site_setting::SiteSetting = serde_yaml::from_str(
+            r#"
+name: Example
+domain: example.com
+top_url: https://example.com
+sitename: Example
+toc_url: https://example.com/\k<ncode>
+headers:
+  "X-Bad\r\nInjected": value
+  Referer: "https://example.com/\r\nX-Injected: 1"
+"#,
+        )
+        .unwrap();
+        let policy = FetchPolicy::for_site(&setting);
+
+        assert!(
+            policy.headers().is_empty(),
+            "unsafe headers should be dropped: {:?}",
+            policy.headers()
+        );
+    }
+
+    #[test]
+    fn fetch_policy_drops_the_cookie_when_a_hop_leaves_the_site() {
+        // サイト定義が小文字で Cookie を書いても、サイト外へのホップでは
+        // クッキージャーを落とす。
+        let setting: super::super::site_setting::SiteSetting = serde_yaml::from_str(
+            r#"
+name: Example
+domain: example.com
+top_url: https://example.com
+sitename: Example
+toc_url: https://example.com/\k<ncode>
+headers:
+  cookie: "over18=yes"
+  Referer: https://example.com/
+"#,
+        )
+        .unwrap();
+        let policy = FetchPolicy::for_site(&setting);
+        let mut headers = policy.headers().to_vec();
+
+        assert!(
+            headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("Cookie"))
+        );
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Cookie"));
+        assert!(
+            !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("Cookie")),
+            "cookie should be gone, headers: {headers:?}"
+        );
+        assert!(headers.iter().any(|(name, _)| name == "Referer"));
     }
 
     #[test]

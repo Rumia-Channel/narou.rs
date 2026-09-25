@@ -12,9 +12,9 @@ use parking_lot::Mutex;
 use crate::db::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::platform::{
-    AssetStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, NovelFilter, NovelId,
-    NovelMutation, NovelQuery, NovelRepository, ObjectKey, ObjectListPage, ObjectListRequest,
-    ObjectMetadata, ObjectStore, PlatformFuture, RateLimitScope, RateLimiter,
+    AssetStore, CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, LoginCredential,
+    NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, ObjectKey, ObjectListPage,
+    ObjectListRequest, ObjectMetadata, ObjectStore, PlatformFuture, RateLimitScope, RateLimiter,
 };
 
 /// HTTP client backed by a caller-provided responder closure.
@@ -474,6 +474,81 @@ impl RateLimiter for FakeRateLimiter {
     }
 }
 
+/// In-memory [`CookieStore`] for tests and the Worker runtime.
+#[derive(Debug, Default, Clone)]
+pub struct MemoryCookieStore {
+    cookies: std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, Vec<LoginCredential>>>,
+    >,
+}
+
+impl MemoryCookieStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.cookies.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl CookieStore for MemoryCookieStore {
+    fn load_all<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<Vec<LoginCredential>>> {
+        let host = host.to_ascii_lowercase();
+        Box::pin(async move {
+            let cookies = self.cookies.lock().unwrap();
+            let mut credentials: Vec<LoginCredential> = Vec::new();
+            for key in crate::platform::cookie_lookup_hosts(&host) {
+                let Some(entries) = cookies.get(&key) else {
+                    continue;
+                };
+                for credential in entries {
+                    if !credentials.iter().any(|seen| seen.same_cookie(credential)) {
+                        credentials.push(credential.clone());
+                    }
+                }
+            }
+            Ok(credentials)
+        })
+    }
+
+    fn save_all<'a>(
+        &'a self,
+        host: &'a str,
+        credentials: &'a [LoginCredential],
+    ) -> PlatformFuture<'a, Result<()>> {
+        let host = host.to_ascii_lowercase();
+        let credentials: Vec<LoginCredential> = credentials.to_vec();
+        Box::pin(async move {
+            let mut cookies = self.cookies.lock().unwrap();
+            if credentials.is_empty() {
+                cookies.remove(&host);
+            } else {
+                cookies.insert(host, credentials);
+            }
+            Ok(())
+        })
+    }
+
+    fn clear<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<()>> {
+        let host = host.to_ascii_lowercase();
+        Box::pin(async move {
+            self.cookies.lock().unwrap().remove(&host);
+            Ok(())
+        })
+    }
+
+    fn list(
+        &self,
+    ) -> PlatformFuture<'_, Result<std::collections::BTreeMap<String, Vec<LoginCredential>>>> {
+        Box::pin(async move { Ok(self.cookies.lock().unwrap().clone()) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +582,8 @@ mod tests {
             is_narou: false,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
+            login_session: None,
             extra_fields: Default::default(),
         }
     }

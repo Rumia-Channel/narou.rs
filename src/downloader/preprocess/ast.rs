@@ -30,6 +30,9 @@ pub enum Expr {
     String(Vec<StrPart>),
     Regex(String, String),
     ExtractJson(String, String),
+    Request(Box<Expr>),
+    FetchJson(Box<Expr>),
+    Arith(Box<Expr>, ArithOp, Box<Expr>),
     Access(Accessor),
     Chain {
         base: Accessor,
@@ -41,6 +44,7 @@ pub enum Expr {
     },
     Array(Vec<Expr>),
     Null,
+    Int(i64),
     Not(Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
     And(Box<Expr>, Box<Expr>),
@@ -48,10 +52,16 @@ pub enum Expr {
     Ne(Box<Expr>, Box<Expr>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+}
+
 #[derive(Debug, Clone)]
 pub enum StrPart {
     Lit(String),
-    Interp(Accessor),
+    Interp(Expr),
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +79,8 @@ pub enum AccessPart {
 #[derive(Debug, Clone)]
 pub enum BracketKey {
     Str(Vec<StrPart>),
-    Accessor(Accessor),
+    Expr(Expr),
+    Index(i64),
 }
 
 #[derive(Debug, Clone)]
@@ -89,9 +100,32 @@ pub enum Method {
     Compact,
     Join(Vec<StrPart>),
     Gsub(Vec<StrPart>, Vec<StrPart>),
+    GsubRegex {
+        pattern: String,
+        flags: String,
+        to: Vec<StrPart>,
+    },
+    /// `gsub(/re/) { |m| … }` — the block receives `[full, group1, …]` and its
+    /// result replaces each match, so per-match values (e.g. a fetched URL) can
+    /// be substituted.
+    GsubBlock {
+        pattern: String,
+        flags: String,
+        var: String,
+        body: Box<Expr>,
+    },
     Replace(Vec<StrPart>, Vec<StrPart>),
+    /// `.field` inside a chain — kept in `Method` so chain steps keep their
+    /// written order instead of being split into access-then-method phases.
+    Field(String),
+    /// `[...]` inside a chain.
+    Bracket(BracketKey),
     IsArray,
     Empty,
+    Size,
+    First,
+    Last,
+    Reverse,
 }
 
 pub fn val_to_string(val: &Value) -> String {

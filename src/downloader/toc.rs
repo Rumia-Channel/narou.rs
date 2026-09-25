@@ -8,8 +8,10 @@ use super::http_policy;
 use super::novel_info::NovelInfo;
 use super::site_setting::SiteSetting;
 use super::types::SubtitleInfo;
+use super::preprocess::PreprocessJobs;
 use super::util::{
-    load_length_limit, pretreatment_source, sanitize_filename, sanitize_filename_with_limit,
+    load_length_limit, pretreatment_source_with_jobs, sanitize_filename,
+    sanitize_filename_with_limit,
 };
 
 pub async fn fetch_toc(
@@ -17,17 +19,28 @@ pub async fn fetch_toc(
     rate_limiter: &dyn RateLimiter,
     setting: &SiteSetting,
     toc_url: &str,
+    jobs: &mut PreprocessJobs,
 ) -> Result<String> {
+    let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
     let mut body = http_policy::fetch_text(
         http,
         rate_limiter,
         toc_url,
-        setting.cookie(),
+        &policy,
         Some(setting.encoding()),
-        setting.is_narou,
     )
     .await?;
-    pretreatment_source(&mut body, setting.encoding(), Some(setting));
+    pretreatment_source_with_jobs(
+        http,
+        rate_limiter,
+        &policy,
+        &mut body,
+        setting.encoding(),
+        Some(setting),
+        jobs,
+        toc_url,
+    )
+    .await?;
 
     if let Some(re) = setting.compiled_error_message_pattern()
         && re.is_match(&body)
@@ -135,7 +148,8 @@ pub async fn parse_subtitles_multipage(
     url_captures: &HashMap<String, String>,
     title: &str,
     progress: Option<&dyn ProgressReporter>,
-) -> Result<Vec<SubtitleInfo>> {
+    jobs: &mut PreprocessJobs,
+) -> Result<(Vec<SubtitleInfo>, bool)> {
     parse_subtitles_multipage_with(
         http,
         rate_limiter,
@@ -144,8 +158,9 @@ pub async fn parse_subtitles_multipage(
         url_captures,
         title,
         progress,
-        |http, rate_limiter, setting, url| {
-            Box::pin(async move { fetch_toc(http, rate_limiter, setting, &url).await })
+        jobs,
+        |http, rate_limiter, setting, url, jobs| {
+            Box::pin(async move { fetch_toc(http, rate_limiter, setting, &url, jobs).await })
         },
     )
     .await
@@ -159,20 +174,24 @@ fn parse_subtitles_multipage_with<'a, F>(
     url_captures: &'a HashMap<String, String>,
     title: &'a str,
     progress: Option<&'a dyn ProgressReporter>,
+    jobs: &'a mut PreprocessJobs,
     mut fetch_next_toc: F,
-) -> PlatformFuture<'a, Result<Vec<SubtitleInfo>>>
+) -> PlatformFuture<'a, Result<(Vec<SubtitleInfo>, bool)>>
 where
-    F: FnMut(
-            &'a dyn HttpClient,
-            &'a dyn RateLimiter,
-            &'a SiteSetting,
+    F: for<'b> FnMut(
+            &'b dyn HttpClient,
+            &'b dyn RateLimiter,
+            &'b SiteSetting,
             String,
-        ) -> PlatformFuture<'a, Result<String>>
+            &'b mut PreprocessJobs,
+        ) -> PlatformFuture<'b, Result<String>>
         + Send
         + 'a,
 {
     Box::pin(async move {
         let mut all_subtitles = Vec::new();
+        // 本文一覧のページが「未ログインで欠けている」と報告したか。
+        let mut partial_listing = false;
         let mut current_toc_source = toc_source.to_string();
         let mut page = 0;
         let max_pages = if let Some(pattern) = setting.toc_page_max_pattern() {
@@ -195,6 +214,9 @@ where
         }
 
         loop {
+            if setting.is_partial_login_view(&current_toc_source) {
+                partial_listing = true;
+            }
             let page_subs = parse_subtitles(setting, &current_toc_source, url_captures)?;
             all_subtitles.extend(page_subs);
 
@@ -231,7 +253,8 @@ where
             };
             let next_url = setting.get_next_url_with_captures(&next_url_val, &next_captures);
 
-            current_toc_source = fetch_next_toc(http, rate_limiter, setting, next_url).await?;
+            current_toc_source =
+                fetch_next_toc(http, rate_limiter, setting, next_url, &mut *jobs).await?;
         }
 
         if show_progress {
@@ -240,7 +263,7 @@ where
             }
         }
 
-        Ok(all_subtitles)
+        Ok((all_subtitles, partial_listing))
     })
 }
 
@@ -312,8 +335,10 @@ mod tests {
             &HashMap::new(),
             "テスト作品",
             Some(&progress),
+            &mut PreprocessJobs::new(),
         ))
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert!(subtitles.is_empty() || subtitles.len() == 1);
         assert_eq!(*progress.lengths.lock().unwrap(), vec![5]);
@@ -323,6 +348,50 @@ mod tests {
             vec!["目次 テスト作品".to_string()]
         );
         assert_eq!(*progress.positions.lock().unwrap(), vec![0, 0]);
+    }
+
+    #[test]
+    fn multipage_reports_a_partial_listing_from_any_page() {
+        // 目次は複数ページに分かれるので、2 ページ目以降の目印も拾う。
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|s| s.domain == "www.pixiv.net")
+            .unwrap();
+        assert!(setting.is_partial_login_view("login_partial::1"));
+        // 429 を避けるための間隔の下限 (サイト定義由来)。
+        assert_eq!(setting.min_interval, Some(5.0));
+        let scope = crate::downloader::http_policy::FetchPolicy::for_site(setting);
+        assert_eq!(scope.min_interval(), Some(5.0));
+
+        let first_page = "Episode;1;https://www.pixiv.net/ajax/novel/1;2020-01-01T00:00:00+00:00;一話\n\
+             next::/ajax/novel/series_content/1?limit=30&last_order=1&order_by=asc\n";
+        let second_page = "login_partial::1\n\
+             Episode;2;https://www.pixiv.net/ajax/novel/2;2020-01-01T00:00:00+00:00;二話\n";
+        let http = MockHttpClient::new();
+        let rate_limiter = FakeRateLimiter::new();
+
+        let (subtitles, partial) = futures::executor::block_on(parse_subtitles_multipage_with(
+            &http,
+            &rate_limiter,
+            setting,
+            first_page,
+            &HashMap::new(),
+            "",
+            None,
+            &mut PreprocessJobs::new(),
+            {
+                let page = second_page.to_string();
+                move |_, _, _, _, _| {
+                    let page = page.clone();
+                    Box::pin(async move { Ok(page) })
+                }
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(subtitles.len(), 2);
+        assert!(partial, "2 ページ目の目印を拾えていない");
     }
 
     #[test]
@@ -368,16 +437,18 @@ mod tests {
             &HashMap::new(),
             "",
             None,
+            &mut PreprocessJobs::new(),
             {
                 let fetched_urls = std::sync::Arc::clone(&fetched_urls);
-                move |_, _, _, next_url| {
+                move |_, _, _, next_url, _| {
                     fetched_urls.lock().unwrap().push(next_url.clone());
                     let page = second_page.to_string();
                     Box::pin(async move { Ok(page) })
                 }
             },
         ))
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert_eq!(
             *fetched_urls.lock().unwrap(),
@@ -449,9 +520,10 @@ mod tests {
             &HashMap::new(),
             "",
             None,
+            &mut PreprocessJobs::new(),
             {
                 let fetched_urls = std::sync::Arc::clone(&fetched_urls);
-                move |_, _, _, next_url| {
+                move |_, _, _, next_url, _| {
                     fetched_urls.lock().unwrap().push(next_url.clone());
                     let page = if fetched_urls.lock().unwrap().len() == 1 {
                         second_page.to_string()
@@ -462,7 +534,8 @@ mod tests {
                 }
             },
         ))
-        .unwrap();
+        .unwrap()
+        .0;
 
         let fetched_urls = fetched_urls.lock().unwrap();
         assert_eq!(fetched_urls.len(), 2);

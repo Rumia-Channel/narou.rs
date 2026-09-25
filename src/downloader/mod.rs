@@ -33,6 +33,8 @@ use self::narou_api::narou_api_batch_update;
 use self::novel_info::NovelInfo;
 use self::persistence::section_filename;
 use self::persistence::{PersistenceService, compute_section_hash};
+
+use crate::platform::{CookieStore, LoginCredential};
 use self::section::{SectionCache, download_section};
 use self::security::is_safe_public_url;
 use self::settings::DownloaderSettings;
@@ -131,8 +133,15 @@ pub struct Downloader {
     section_cache: SectionCache,
     section_hash_cache: HashMap<String, HashMap<String, String>>,
     section_hash_cache_dirty: bool,
+    /// Stored login cookies. `None` keeps the downloader anonymous (tests and
+    /// the Worker); the native constructors inject the inventory-backed store.
+    cookies: Option<Arc<dyn CookieStore>>,
     settings: Arc<dyn DownloaderSettings>,
     progress: Option<Box<dyn ProgressReporter>>,
+    /// Results of URLs that `preprocess:` runs asked for. Lives for one novel
+    /// download so repeated references (e.g. one illustration used by many
+    /// sections of a series) resolve once.
+    preprocess_jobs: super::downloader::preprocess::PreprocessJobs,
 }
 
 /// Report a status line. Native prints to stdout atomically; Worker routes to
@@ -612,6 +621,24 @@ fn illustration_sources<'a>(
 impl Downloader {
     /// Native constructor: loads site definitions from the filesystem and the
     /// section hash cache from the Inventory. Worker builds use
+    /// Inject the store that keeps login cookies for authenticated sites.
+    pub fn with_cookie_store(mut self, cookies: Arc<dyn CookieStore>) -> Self {
+        self.cookies = Some(cookies);
+        self
+    }
+
+    /// Load the stored login cookie for `host`, when a store is available.
+    /// 保存済みの資格情報を試行順で返す。
+    async fn stored_credentials_for(&self, host: Option<&str>) -> Vec<LoginCredential> {
+        let Some(cookies) = self.cookies.as_ref() else {
+            return Vec::new();
+        };
+        let Some(host) = host else {
+            return Vec::new();
+        };
+        cookies.load_all(host).await.unwrap_or_default()
+    }
+
     /// [`Self::with_platform_and_storage_and_settings`] with bundled values.
     #[cfg(feature = "native-runtime")]
     pub fn with_platform_and_storage(
@@ -691,9 +718,11 @@ impl Downloader {
             site_settings,
             section_cache: SectionCache::new(),
             section_hash_cache,
+            cookies: None,
             section_hash_cache_dirty: false,
             settings,
             progress: None,
+            preprocess_jobs: super::downloader::preprocess::PreprocessJobs::new(),
         })
     }
 
@@ -722,7 +751,7 @@ impl Downloader {
     }
 
     async fn load_novel_info(
-        &self,
+        &mut self,
         setting: &SiteSetting,
         toc_source: &str,
         url_captures: &HashMap<String, String>,
@@ -735,6 +764,7 @@ impl Downloader {
             toc_source,
             url_captures,
             toc_url,
+            &mut self.preprocess_jobs,
         )
         .await
     }
@@ -769,6 +799,7 @@ impl Downloader {
             self.rate_limiter.as_ref(),
             &setting,
             &toc_url,
+            &mut self.preprocess_jobs,
         )
         .await?;
         let info = self
@@ -797,9 +828,11 @@ impl Downloader {
                     &url_captures,
                     title,
                     self.progress.as_deref(),
+                    &mut self.preprocess_jobs,
                 )
                 .await
                 .ok()
+                .map(|(subtitles, _partial)| subtitles)
             };
             if let Some(subs) = &subtitles {
                 if novelupdated_at.is_none() {
@@ -936,6 +969,9 @@ impl Downloader {
         let re = compile_html_pattern(illust_url_pattern).map_err(NarouError::Regex)?;
         let storage =
             crate::illustration_store::IllustrationStorageService::new(self.assets.clone());
+        // Illustration hosts (i.pximg.net) reject requests without the site's
+        // headers, and login-only images need the same cookie jar.
+        let illustration_policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
 
         // Parsed sections may omit site-specific image markup. Search the raw
         // HTML from this fetch as well, while keeping all persistence logical.
@@ -967,14 +1003,29 @@ impl Downloader {
                     self.http.as_ref(),
                     self.rate_limiter.as_ref(),
                     url,
-                    None,
-                    setting.is_narou,
+                    &illustration_policy,
                 )
                 .await
                 {
                     Ok(response) => {
                         let content_type =
                             response.header("Content-Type").unwrap_or("").to_string();
+                        // Animated works arrive as a frame archive; the site
+                        // definition declares the frame timings on the URL.
+                        let (body, content_type) =
+                            match crate::illustration_animation::assemble_animation(
+                                url,
+                                &response.body,
+                            ) {
+                                Some(Ok(apng)) => (apng, "image/png".to_string()),
+                                Some(Err(err)) => {
+                                    report_warn(&format!(
+                                        "WARN: failed to assemble animation {url}: {err}"
+                                    ));
+                                    (response.body.clone(), content_type)
+                                }
+                                None => (response.body.clone(), content_type),
+                            };
                         let ext =
                             crate::illustration_store::illustration_extension_from_content_type(
                                 &content_type,
@@ -983,7 +1034,7 @@ impl Downloader {
                                 crate::illustration_store::guessed_extension_from_url(url)
                             });
                         if let Err(err) = storage
-                            .store_bytes(object_keys, illustration_store, url, &response.body, ext)
+                            .store_bytes(object_keys, illustration_store, url, &body, ext)
                             .await
                         {
                             report_warn(&format!(
@@ -1026,9 +1077,8 @@ impl Downloader {
             self.http.as_ref(),
             self.rate_limiter.as_ref(),
             target,
-            setting.cookie(),
+            &crate::downloader::http_policy::FetchPolicy::for_site(&setting),
             Some(setting.encoding()),
-            setting.is_narou,
         )
         .await?;
         crate::downloader::util::pretreatment_source(&mut body, setting.encoding(), None);
@@ -1099,6 +1149,9 @@ impl Downloader {
         let force = options.force;
         let resume_from_section = options.resume_from_section;
         let mut budget = options.budget.take();
+        // Preprocess job results belong to one novel: a new download starts
+        // with an empty set so nothing leaks between works.
+        self.preprocess_jobs.reset();
         let (existing_id, mut setting) = self.resolve_target_for_download(target).await?;
         let provisional_id = match existing_id {
             Some(id) => id,
@@ -1125,18 +1178,50 @@ impl Downloader {
         let toc_url = if let Some(ref url) = db_toc_url {
             url.clone()
         } else if url_captures.is_empty() {
-            setting.interpolate(&setting.toc_url)
+            setting.toc_url()
         } else {
-            setting.interpolate_with_captures(&setting.toc_url, &url_captures)
+            let mut selects = url_captures.clone();
+            selects.insert("__target_url".to_string(), target.to_string());
+            setting.get_toc_url_with_captures(&selects)
         };
         let toc_url = Self::ageauth_redirect_target(&toc_url).unwrap_or(toc_url);
+        // Login fallback: a novel already flagged as needing authentication
+        // sends the stored cookie from the first request; every other novel
+        // stays anonymous until a fetch actually fails.
+        let login_host = crate::platform::cookie_host_for_url(&toc_url);
+        let login_cookie = match existing_id {
+            Some(id) => {
+                let record = self.novels.get(id.into()).await.ok().flatten();
+                let requires = record.as_ref().is_some_and(|record| record.requires_login);
+                if requires {
+                    // その小説で前に成功したセッションがあればそれを、無ければ
+                    // 一覧の先頭を最初のリクエストから送る。
+                    let credentials = self.stored_credentials_for(login_host.as_deref()).await;
+                    let chosen = record
+                        .as_ref()
+                        .and_then(|record| record.login_session.as_deref())
+                        .and_then(|id| credentials.iter().find(|credential| credential.id == id))
+                        .or_else(|| credentials.first());
+                    chosen.map(|credential| credential.cookie.clone())
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        let mut requires_login = login_cookie.is_some();
+        // 採用した資格情報の ID。小説レコードに残して次回の最初の
+        // リクエストで同じセッションを使う。
+        let mut login_session: Option<String> = None;
+        if let Some(cookie) = login_cookie.as_deref() {
+            apply_login_cookie(&mut setting, cookie);
+        }
         let (resolved_toc_url, prefetched_toc) =
             match crate::downloader::http_policy::resolve_final_url_with_body(
                 self.http.as_ref(),
                 self.rate_limiter.as_ref(),
                 &toc_url,
-                setting.cookie(),
-                setting.is_narou,
+                &crate::downloader::http_policy::FetchPolicy::for_site(&setting),
             )
             .await
             {
@@ -1189,7 +1274,22 @@ impl Downloader {
                             &response.body,
                             Some(setting.encoding()),
                         );
-                        pretreatment_source(&mut body, setting.encoding(), Some(&setting));
+                        // The redirect probe already spent the GET, so run the
+                        // definition (and any requests it makes) here rather
+                        // than re-fetching the same URL through `fetch_toc`.
+                        let policy =
+                            crate::downloader::http_policy::FetchPolicy::for_site(&setting);
+                        crate::downloader::util::pretreatment_source_with_jobs(
+                            self.http.as_ref(),
+                            self.rate_limiter.as_ref(),
+                            &policy,
+                            &mut body,
+                            setting.encoding(),
+                            Some(&setting),
+                            &mut self.preprocess_jobs,
+                            &toc_url,
+                        )
+                        .await?;
                         if let Some(re) = setting.compiled_error_message_pattern()
                             && re.is_match(&body)
                         {
@@ -1207,9 +1307,63 @@ impl Downloader {
                 self.rate_limiter.as_ref(),
                 &setting,
                 &toc_url,
+                &mut self.preprocess_jobs,
             )
             .await,
         };
+        // Login fallback: retry once with the stored cookie before treating the
+        // novel as deleted. Nothing is sent when no cookie is stored, so sites
+        // the user never signed in to behave exactly as before.
+        let mut toc_source = toc_source;
+        let login_wall = should_retry_with_login(&setting, &toc_source);
+        let partial_view = !login_wall && is_partial_login_view(&setting, &toc_source);
+        if login_cookie.is_none() && (login_wall || partial_view) {
+            // 保存済みの資格情報を順に試す。ログイン壁は成功した時点で、
+            // 部分一覧は「欠けが消えた／話数が増えた」時点で打ち切る。
+            let credentials = self.stored_credentials_for(login_host.as_deref()).await;
+            if !credentials.is_empty() {
+                report_line("ログインが必要な可能性があります。保存済みのログイン情報で再試行します");
+                let base_cookie = setting.cookie.clone();
+                let mut winner: Option<LoginCredential> = None;
+                for credential in &credentials {
+                    setting.cookie = base_cookie.clone();
+                    apply_login_cookie(&mut setting, &credential.cookie);
+                    let retried = fetch_toc(
+                        self.http.as_ref(),
+                        self.rate_limiter.as_ref(),
+                        &setting,
+                        &toc_url,
+                        &mut self.preprocess_jobs,
+                    )
+                    .await;
+                    if partial_view {
+                        if is_improved_toc(&setting, toc_source.as_ref(), retried.as_ref()) {
+                            let resolved = retried
+                                .as_ref()
+                                .is_ok_and(|source| !setting.is_partial_login_view(source));
+                            requires_login = true;
+                            login_session = Some(credential.id.clone());
+                            toc_source = retried;
+                            winner = Some(credential.clone());
+                            if resolved {
+                                break;
+                            }
+                        }
+                    } else if retried.is_ok() {
+                        requires_login = true;
+                        login_session = Some(credential.id.clone());
+                        toc_source = retried;
+                        winner = Some(credential.clone());
+                        break;
+                    }
+                }
+                // 採用した資格情報を最終状態に残す（本文も同じ Cookie で取る）。
+                setting.cookie = base_cookie;
+                if let Some(winner) = &winner {
+                    apply_login_cookie(&mut setting, &winner.cookie);
+                }
+            }
+        }
         let toc_source = match toc_source {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
@@ -1346,8 +1500,11 @@ impl Downloader {
 
         let (novel_type, is_end) = resolve_novel_type(&setting, &toc_source, &url_captures, &info);
 
-        let subtitles = if novel_type == 2 {
-            create_short_story_subtitles(&setting, &toc_source, &info)?
+        let (mut subtitles, partial_listing) = if novel_type == 2 {
+            (
+                create_short_story_subtitles(&setting, &toc_source, &info)?,
+                false,
+            )
         } else {
             parse_subtitles_multipage(
                 self.http.as_ref(),
@@ -1357,9 +1514,54 @@ impl Downloader {
                 &url_captures,
                 &title,
                 self.progress.as_deref(),
+                &mut self.preprocess_jobs,
             )
             .await?
         };
+
+        // 目次ページの途中で「一覧が欠けている」と分かった場合 (Pixiv の小説
+        // シリーズは未ログインだと本文一覧が 0 件になる) は、保存済み Cookie で
+        // 取り直し、話数が増えたときだけ採用する。
+        if partial_listing && login_cookie.is_none() {
+            let credentials = self.stored_credentials_for(login_host.as_deref()).await;
+            if !credentials.is_empty() {
+                report_line("ログインが必要な可能性があります。保存済みのログイン情報で再試行します");
+                let base_cookie = setting.cookie.clone();
+                let mut winner: Option<LoginCredential> = None;
+                for credential in &credentials {
+                    setting.cookie = base_cookie.clone();
+                    apply_login_cookie(&mut setting, &credential.cookie);
+                    let Ok((retried, retried_partial)) = parse_subtitles_multipage(
+                        self.http.as_ref(),
+                        self.rate_limiter.as_ref(),
+                        &setting,
+                        &toc_source,
+                        &url_captures,
+                        &title,
+                        self.progress.as_deref(),
+                        &mut self.preprocess_jobs,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if !retried_partial || retried.len() > subtitles.len() {
+                        let resolved = !retried_partial;
+                        subtitles = retried;
+                        requires_login = true;
+                        login_session = Some(credential.id.clone());
+                        winner = Some(credential.clone());
+                        if resolved {
+                            break;
+                        }
+                    }
+                }
+                setting.cookie = base_cookie;
+                if let Some(winner) = &winner {
+                    apply_login_cookie(&mut setting, &winner.cookie);
+                }
+            }
+        }
 
         let use_subdirectory = self.download_use_subdirectory(existing_record.as_ref());
         let ncode = self
@@ -1623,6 +1825,7 @@ impl Downloader {
                         &setting,
                         subtitle,
                         &toc_url,
+                        &mut self.preprocess_jobs,
                     )
                     .await?
                 };
@@ -1841,6 +2044,8 @@ impl Downloader {
             is_narou: setting.is_narou,
             last_check_date: None,
             convert_failure: false,
+            requires_login,
+            login_session: login_session.clone(),
             extra_fields: Default::default(),
         };
         if track_raw_title {
@@ -1896,6 +2101,10 @@ impl Downloader {
                     updated.domain = record.domain.clone();
                     updated.suspend = false;
                     updated.is_narou = record.is_narou;
+                    updated.requires_login |= requires_login;
+                    if login_session.is_some() {
+                        updated.login_session = login_session.clone();
+                    }
                     for tag in &auto_tags {
                         if !updated.tags.contains(tag) {
                             updated.tags.push(tag.clone());
@@ -2037,6 +2246,7 @@ impl Downloader {
                     setting,
                     latest,
                     toc_url,
+                    &mut self.preprocess_jobs,
                 )
                 .await?;
                 let new_hash = compute_section_hash(&downloaded.0);
@@ -2149,6 +2359,7 @@ impl Downloader {
                     .novels
                     .find_by_title(target)
                     .await?
+                    .or(self.novels.find_by_ncode(target).await?)
                     .map(|record| record.id);
                 if let Some(id) = existing_id {
                     let record = self.novels.get(id.into()).await?.ok_or_else(|| {
@@ -2366,6 +2577,61 @@ impl Downloader {
     }
 }
 
+/// Merge the stored login cookie into the site's static cookie value.
+fn apply_login_cookie(setting: &mut SiteSetting, login_cookie: &str) {
+    setting.cookie = crate::platform::merge_cookie_headers(setting.cookie(), Some(login_cookie));
+}
+
+/// Whether a retry after a partial listing is worth keeping.
+///
+/// A signed-in visitor can still see fewer works than a series holds (Pixiv
+/// マイピク restricts some to mutual followers), so the marker disappearing is
+/// not the only success: collecting more sections also counts. A retry that
+/// changes nothing keeps the earlier result.
+fn is_improved_toc(
+    setting: &SiteSetting,
+    before: std::result::Result<&String, &NarouError>,
+    after: std::result::Result<&String, &NarouError>,
+) -> bool {
+    let (Ok(before), Ok(after)) = (before, after) else {
+        return false;
+    };
+    !setting.is_partial_login_view(after)
+        || count_toc_entries(setting, after) > count_toc_entries(setting, before)
+}
+
+/// Sections a preprocessed TOC source yields, using the definition's own
+/// subtitles pattern.
+fn count_toc_entries(setting: &SiteSetting, source: &str) -> usize {
+    setting
+        .subtitles_pattern()
+        .map_or(0, |pattern| pattern.find_iter(source).count())
+}
+
+/// Whether a *successful* fetch still shows only part of the works.
+///
+/// A definition reports this itself (Pixiv hides R-18 works while answering
+/// HTTP 200), so the request is retried with the stored cookie — but unlike a
+/// login wall, an unimproved retry must not replace the anonymous result.
+fn is_partial_login_view(setting: &SiteSetting, toc_source: &Result<String>) -> bool {
+    match toc_source {
+        Ok(source) => setting.is_partial_login_view(source),
+        Err(_) => false,
+    }
+}
+
+/// A missing page (404) or a login wall served with HTTP 200 both mean the
+/// fetch may need authentication; every other error is a real failure.
+fn should_retry_with_login(setting: &SiteSetting, toc_source: &Result<String>) -> bool {
+    match toc_source {
+        Err(NarouError::NotFound(_)) => true,
+        Ok(source) => setting
+            .compiled_login_pattern()
+            .is_some_and(|pattern| pattern.is_match(source)),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::novel_info::NovelInfo;
@@ -2451,6 +2717,9 @@ mod tests {
 
     #[test]
     fn repository_injection_resolves_existing_ncode_without_database_global() {
+        // `with_platform` loads サイト定義 from the working directory, so this
+        // test must not overlap another one that changes it.
+        let _state = crate::test_support::global_state_guard();
         let mut record = sample_record(chrono::Utc::now());
         record.id = 42;
         record.toc_url = "https://ncode.syosetu.com/n1234ab/".to_string();
@@ -2491,6 +2760,7 @@ mod tests {
         assert!(downloader.section_hash_cache.is_empty());
     }
 
+
     #[tokio::test]
     async fn memory_storage_download_pipeline_persists_toc_section_raw_and_record() {
         let mut setting: SiteSetting =
@@ -2520,7 +2790,13 @@ mod tests {
         );
 
         let toc_source =
-            super::toc::fetch_toc(http.as_ref(), &FakeRateLimiter::new(), &setting, toc_url)
+            super::toc::fetch_toc(
+                http.as_ref(),
+                &FakeRateLimiter::new(),
+                &setting,
+                toc_url,
+                &mut super::preprocess::PreprocessJobs::new(),
+            )
                 .await
                 .unwrap();
         let captures = HashMap::from([("ncode".to_string(), "n1234ab".to_string())]);
@@ -2535,6 +2811,7 @@ mod tests {
             &setting,
             &subtitles[0],
             toc_url,
+            &mut super::preprocess::PreprocessJobs::new(),
         )
         .await
         .unwrap();
@@ -2924,6 +3201,8 @@ is_narou: false
             is_narou: false,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
+            login_session: None,
             extra_fields: Default::default(),
         }
     }
@@ -3084,6 +3363,596 @@ is_narou: false
             subtitles[1].subupdate.as_deref(),
             Some("2021-01-14T16:13:02Z")
         );
+    }
+
+    fn pixiv_setting() -> &'static SiteSetting {
+        static SETTING: std::sync::OnceLock<SiteSetting> = std::sync::OnceLock::new();
+        SETTING.get_or_init(|| {
+            let settings = SiteSetting::load_all().unwrap();
+            settings
+                .iter()
+                .find(|s| s.domain == "www.pixiv.net")
+                .cloned()
+                .expect("bundled www.pixiv.net.yaml should load")
+        })
+    }
+
+    fn run_pixiv_preprocess(json: &str) -> String {
+        let setting = pixiv_setting();
+        let mut source = json.to_string();
+        super::util::pretreatment_source(&mut source, "UTF-8", Some(setting));
+        source
+    }
+
+    #[test]
+    fn pixiv_targets_resolve_to_their_own_api_endpoint() {
+        let setting = pixiv_setting();
+
+        for (target, expected) in [
+            (
+                "https://www.pixiv.net/novel/show.php?id=29204764",
+                "https://www.pixiv.net/ajax/novel/29204764",
+            ),
+            (
+                "https://www.pixiv.net/novel/series/16299140",
+                "https://www.pixiv.net/ajax/novel/series/16299140",
+            ),
+            (
+                "https://www.pixiv.net/artworks/143868144",
+                "https://www.pixiv.net/ajax/illust/143868144",
+            ),
+            (
+                "https://www.pixiv.net/user/855548/series/205917?p=1#seriesContents",
+                "https://www.pixiv.net/ajax/series/205917?p=1&lang=ja",
+            ),
+            // 保存済みレコードの toc_url (API 側) も同じ定義で解決できる。
+            (
+                "https://www.pixiv.net/ajax/illust/143868144",
+                "https://www.pixiv.net/ajax/illust/143868144",
+            ),
+            (
+                "https://www.pixiv.net/ajax/series/205917",
+                "https://www.pixiv.net/ajax/series/205917?p=1&lang=ja",
+            ),
+        ] {
+            assert_eq!(
+                setting.toc_url_with_url_captures(target).as_deref(),
+                Some(expected),
+                "target: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn pixiv_artwork_emits_short_story_metadata_and_page_images() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "id":"143868144","illustType":1,"title":"アイドル一騎打ち","illustTitle":"アイドル一騎打ち",
+                "userName":"mini_La（ミニラ）","description":"漫画です","pageCount":2,
+                "createDate":"2026-04-22T13:02:00+00:00","uploadDate":"2026-04-22T13:02:00+00:00",
+                "seriesNavData":null,
+                "urls":{"original":"https://i.pximg.net/img/143868144_p0.png"},
+                "tags":{"tags":[{"tag":"漫画"}]}}}"#,
+        );
+
+        assert!(html.contains("ncode::a143868144"), "got: {html}");
+        assert!(html.contains("title::アイドル一騎打ち"));
+        assert!(html.contains("author::mini_La（ミニラ）"));
+        assert!(html.contains("story::漫画です"));
+        assert!(html.contains("novel_type::短編"));
+        assert!(html.contains("tag::漫画"));
+        // ページ画像は追加 API の結果を待つので、未解決のうちは代表画像に落ちる
+        assert!(html.contains("<img src=\"https://i.pximg.net/img/143868144_p0.png\">"));
+    }
+
+    #[test]
+    fn pixiv_ugoira_emits_the_frame_archive_with_its_delays() {
+        // うごイラは静止画ではなくフレーム集約 zip と表示時間を渡す。
+        let setting = pixiv_setting();
+        let http = MockHttpClient::new();
+        http.add_text(
+            "https://www.pixiv.net/ajax/illust/69642452/ugoira_meta?lang=ja",
+            200,
+            r#"{"error":false,"body":{"originalSrc":"https://i.pximg.net/img-zip-ugoira/img/x/69642452_ugoira1920x1080.zip","frames":[{"file":"000000.jpg","delay":120},{"file":"000001.jpg","delay":80}]}}"#,
+        );
+        http.add_text(
+            "https://www.pixiv.net/ajax/illust/69642452/pages",
+            200,
+            r#"{"error":false,"body":[{"urls":{"original":"https://i.pximg.net/img-original/img/x/69642452_ugoira0.png"}}]}"#,
+        );
+        let mut jobs = super::preprocess::PreprocessJobs::new();
+        let mut source = r#"{"error":false,"message":"","body":{
+            "id":"69642452","illustType":2,"title":"うごイラ作品","illustTitle":"うごイラ作品",
+            "userName":"hamati","description":"","pageCount":1,
+            "createDate":"2018-07-11T10:47:00+00:00","uploadDate":"2018-07-11T10:47:00+00:00",
+            "seriesNavData":null,
+            "urls":{"original":null},
+            "tags":{"tags":[{"tag":"うごイラ"}]}}}"#
+            .to_string();
+
+        futures::executor::block_on(super::util::pretreatment_source_with_jobs(
+            &http,
+            &FakeRateLimiter::new(),
+            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+            &mut source,
+            "UTF-8",
+            Some(setting),
+            &mut jobs,
+            "https://www.pixiv.net/ajax/illust/69642452",
+        ))
+        .unwrap();
+
+        let body = setting_body(&source);
+        assert_eq!(
+            body,
+            "<img src=\"https://i.pximg.net/img-zip-ugoira/img/x/69642452_ugoira1920x1080.zip?ugoira=120,80\">",
+            "ugoira should pass the archive and its frame delays"
+        );
+        assert_eq!(
+            crate::illustration_animation::frame_delays(
+                "https://i.pximg.net/x.zip?ugoira=120,80"
+            ),
+            Some(vec![120, 80])
+        );
+    }
+
+    #[test]
+    fn pixiv_plain_illustration_is_treated_as_an_artwork() {
+        // illustType 0 (イラスト) でも作品として扱う。数値 0 は DSL では偽なので
+        // 判定は illustTitle の有無で行う。
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "id":"141939696","illustType":0,"title":"花火vs火花（仮）","illustTitle":"花火vs火花（仮）",
+                "userName":"猫目ミト","description":"","pageCount":1,
+                "createDate":"2026-03-01T00:00:00+00:00","uploadDate":"2026-03-01T00:00:00+00:00",
+                "seriesNavData":null,
+                "urls":{"original":"https://i.pximg.net/img/141939696_p0.jpg"},
+                "tags":{"tags":[{"tag":"イラスト"}]}}}"#,
+        );
+
+        assert!(html.contains("ncode::a141939696"), "got: {html}");
+        assert!(html.contains("novel_type::短編"));
+        assert!(html.contains("<img src=\"https://i.pximg.net/img/141939696_p0.jpg\">"));
+        assert!(
+            !html.contains("login_required::1"),
+            "an illustration must not be read as a login wall: {html}"
+        );
+    }
+
+    #[test]
+    fn pixiv_artwork_pages_resolve_into_image_tags() {
+        let setting = pixiv_setting();
+        let http = MockHttpClient::new();
+        http.add_text(
+            "https://www.pixiv.net/ajax/illust/143868144/pages",
+            200,
+            r#"{"error":false,"body":[{"urls":{"original":"https://i.pximg.net/img/143868144_p0.png"}},{"urls":{"original":"https://i.pximg.net/img/143868144_p1.png"}}]}"#,
+        );
+        let mut jobs = super::preprocess::PreprocessJobs::new();
+        let mut source = r#"{"error":false,"message":"","body":{
+            "id":"143868144","illustType":1,"title":"アイドル一騎打ち","illustTitle":"アイドル一騎打ち",
+            "userName":"mini_La（ミニラ）","description":"漫画です","pageCount":2,
+            "createDate":"2026-04-22T13:02:00+00:00","uploadDate":"2026-04-22T13:02:00+00:00",
+            "seriesNavData":null,
+            "urls":{"original":"https://i.pximg.net/img/143868144_p0.png"},
+            "tags":{"tags":[{"tag":"漫画"}]}}}"#
+            .to_string();
+
+        futures::executor::block_on(super::util::pretreatment_source_with_jobs(
+            &http,
+            &FakeRateLimiter::new(),
+            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+            &mut source,
+            "UTF-8",
+            Some(setting),
+            &mut jobs,
+            "https://www.pixiv.net/ajax/illust/143868144",
+        ))
+        .unwrap();
+
+        let body = setting_body(&source);
+        assert_eq!(
+            body,
+            "<img src=\"https://i.pximg.net/img/143868144_p0.png\"><br><img src=\"https://i.pximg.net/img/143868144_p1.png\">"
+        );
+    }
+
+    #[test]
+    fn pixiv_manga_series_emits_ascending_episodes_and_pages_on() {
+        let setting = pixiv_setting();
+        let http = MockHttpClient::new();
+        for (id, title) in [("139115096", "第19話"), ("139115097", "第20話")] {
+            http.add_text(
+                &format!("https://www.pixiv.net/ajax/illust/{id}"),
+                200,
+                &format!(
+                    r#"{{"error":false,"body":{{"id":"{id}","title":"{title}","userName":"作者名","uploadDate":"2026-01-02T03:04:05+09:00"}}}}"#
+                ),
+            );
+        }
+        let mut jobs = super::preprocess::PreprocessJobs::new();
+        // API は order の降順で返す。
+        let mut source = r#"{"error":false,"message":"","body":{
+            "illustSeries":[{"id":"205917","title":"靈夢と訓練する","description":"シリーズの説明",
+                             "total":21,"createDate":"2025-01-01T00:00:00+09:00","updateDate":"2026-01-02T00:00:00+09:00"}],
+            "page":{"seriesId":"205917","total":3,
+                    "series":[{"workId":"139115097","order":20},{"workId":"139115096","order":19}]}}}"#
+            .to_string();
+
+        futures::executor::block_on(super::util::pretreatment_source_with_jobs(
+            &http,
+            &FakeRateLimiter::new(),
+            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+            &mut source,
+            "UTF-8",
+            Some(setting),
+            &mut jobs,
+            "https://www.pixiv.net/ajax/series/205917?p=1&lang=ja",
+        ))
+        .unwrap();
+
+        assert!(source.contains("ncode::c205917"), "got: {source}");
+        assert!(source.contains("title::靈夢と訓練する"));
+        assert!(source.contains("story::シリーズの説明"));
+        assert!(source.contains("novel_type::連載中"));
+        // 公開話数はシリーズ情報の total
+        assert!(source.contains("general_all_no::21"));
+        // 作者は各話ページから拾う
+        assert!(source.contains("author::作者名"), "got: {source}");
+        // 目次は order の昇順で出る
+        let first = source.find("Episode;19;https://www.pixiv.net/ajax/illust/139115096")
+            .expect("order 19 entry");
+        let second = source.find("Episode;20;https://www.pixiv.net/ajax/illust/139115097")
+            .expect("order 20 entry");
+        assert!(first < second, "episodes must be ascending: {source}");
+        assert!(source.contains(";第19話"), "titles come from each work: {source}");
+        // order 1 に到達していないので次ページを要求する
+        assert!(
+            source.contains("next::/ajax/series/205917?p=2&lang=ja"),
+            "got: {source}"
+        );
+
+        let mut url_captures = HashMap::new();
+        url_captures.insert("series_id".to_string(), "205917".to_string());
+        let subtitles = super::toc::parse_subtitles(setting, &source, &url_captures).unwrap();
+        assert_eq!(subtitles.len(), 2);
+        assert_eq!(subtitles[0].index, "19");
+        assert_eq!(subtitles[0].subtitle, "第19話");
+        assert_eq!(subtitles[1].index, "20");
+    }
+
+    #[test]
+    fn pixiv_manga_series_stops_paging_at_order_one() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "illustSeries":[{"id":"311834","title":"もここのグルメ","description":"説明","total":5,
+                                 "createDate":"2025-11-18T11:48:54+09:00","updateDate":"2025-12-11T07:54:14+09:00"}],
+                "page":{"seriesId":"311834","total":1,"series":[{"workId":"138467437","order":1}]}}}"#,
+        );
+        assert!(html.contains("ncode::c311834"));
+        assert!(!html.contains("next::"), "got: {html}");
+    }
+
+    #[test]
+    fn pixiv_series_detail_emits_info_and_first_content_page() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "id":"16299140","title":"トゥルースヒーローズ設定集","userId":"92017217","userName":"ゆっきー593",
+                "caption":"設定をまとめます","total":6,"isConcluded":false,
+                "publishedTotalCharacterCount":80418,
+                "tags":["トゥルースヒーローズ","設定"],
+                "createDate":"2026-08-03T22:26:01+09:00","updateDate":"2026-09-23T17:04:49+09:00"}}"#,
+        );
+
+        assert!(html.contains("PixivPreprocessEvalMagicWord"));
+        assert!(html.contains("title::トゥルースヒーローズ設定集"));
+        assert!(html.contains("author::ゆっきー593"));
+        assert!(html.contains("story::設定をまとめます"));
+        assert!(html.contains("novel_type::連載中"));
+        assert!(html.contains("general_all_no::6"));
+        assert!(html.contains("general_firstup::2026-08-03T22:26:01+09:00"));
+        assert!(html.contains("general_lastup::2026-09-23T17:04:49+09:00"));
+        assert!(html.contains("length::80418"));
+        assert!(html.contains("tag::トゥルースヒーローズ"));
+        assert!(html.contains(
+            "next::/ajax/novel/series_content/16299140?limit=30&last_order=0&order_by=asc"
+        ));
+
+        let setting = pixiv_setting();
+        let next = setting
+            .next_toc_pattern()
+            .unwrap()
+            .captures(&html)
+            .and_then(|caps| caps.name("next_page").map(|m| m.as_str().to_string()))
+            .unwrap();
+        assert_eq!(
+            next,
+            "/ajax/novel/series_content/16299140?limit=30&last_order=0&order_by=asc"
+        );
+        assert_eq!(
+            setting.get_next_url_with_captures(setting.next_url.as_deref().unwrap(), &{
+                let mut captures = HashMap::new();
+                captures.insert("next_page".to_string(), next);
+                captures
+            }),
+            "https://www.pixiv.net/ajax/novel/series_content/16299140?limit=30&last_order=0&order_by=asc"
+        );
+    }
+
+    #[test]
+    fn pixiv_series_content_emits_episodes_and_follows_a_full_page() {
+        let mut entries = String::new();
+        for order in 1..=30 {
+            if order > 1 {
+                entries.push(',');
+            }
+            entries.push_str(&format!(
+                r#"{{"id":"20{order:06}","title":"第{order}話","seriesContentOrder":{order},"seriesId":"11075024","createDate":"2026-09-21T22:36:52+09:00","updateDate":"2026-09-22T00:12:53+09:00"}}"#
+            ));
+        }
+        let html = run_pixiv_preprocess(&format!(
+            r#"{{"error":false,"message":"","body":{{
+                "thumbnails":{{"novel":[{entries}]}},
+                "page":{{"seriesContents":[{{"id":"20000001","series":{{"id":11075024,"contentOrder":1}}}}]}}}}}}"#
+        ));
+
+        assert!(html.contains(
+            "Episode;1;https://www.pixiv.net/ajax/novel/20000001;2026-09-21T22:36:52+09:00;第1話"
+        ));
+        assert!(html.contains(
+            "Episode;30;https://www.pixiv.net/ajax/novel/20000030;2026-09-21T22:36:52+09:00;第30話"
+        ));
+        assert!(html.contains(
+            "next::/ajax/novel/series_content/11075024?limit=30&last_order=30&order_by=asc"
+        ));
+
+        let setting = pixiv_setting();
+        let mut url_captures = HashMap::new();
+        url_captures.insert("ncode".to_string(), "s11075024".to_string());
+        let subtitles = super::toc::parse_subtitles(setting, &html, &url_captures).unwrap();
+        assert_eq!(subtitles.len(), 30);
+        assert_eq!(subtitles[0].index, "1");
+        assert_eq!(
+            subtitles[0].href,
+            "https://www.pixiv.net/ajax/novel/20000001"
+        );
+        assert_eq!(subtitles[0].subtitle, "第1話");
+        assert_eq!(subtitles[0].subdate, "2026-09-21T22:36:52+09:00");
+        assert_eq!(subtitles[29].index, "30");
+        assert_eq!(subtitles[29].subtitle, "第30話");
+    }
+
+    #[test]
+    fn pixiv_partial_series_content_page_stops_pagination() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "thumbnails":{"novel":[{"id":"28776498","title":"設定集","seriesContentOrder":1,"seriesId":"16299140","createDate":"2026-08-04T22:49:29+09:00"}]},
+                "page":{"seriesContents":[{"id":"28776498","series":{"id":16299140,"contentOrder":1}}]}}}"#,
+        );
+
+        assert!(html.contains("Episode;1;https://www.pixiv.net/ajax/novel/28776498"));
+        assert!(!html.contains("next::"));
+    }
+
+    #[test]
+    fn pixiv_single_novel_emits_metadata_and_converts_body_markup() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "id":"29204764","title":"短編集","userName":"沼月時雨","description":"あらすじです",
+                "content":"1行目\n2行目\n[[rb:漢字 > かんじ]]\n[chapter:第二章]\n[newpage]\n[[jumpuri:作者サイト > https://example.com/]]\n[pixivimage:83791147-1]\n[uploadedimage:22638629]\n[jump:2]",
+                "createDate":"2026-09-23T07:48:07+00:00","uploadDate":"2026-09-23T07:48:07+00:00",
+                "characterCount":1274,"seriesNavData":null,
+                "tags":{"tags":[{"tag":"タグA"},{"tag":"タグB"}]}}}"#,
+        );
+
+        assert!(html.contains("ncode::n29204764"));
+        assert!(html.contains("title::短編集"));
+        assert!(html.contains("author::沼月時雨"));
+        assert!(html.contains("story::あらすじです"));
+        assert!(html.contains("novel_type::短編"));
+        assert!(html.contains("general_all_no::1"));
+        assert!(html.contains("general_lastup::2026-09-23T07:48:07+00:00"));
+        assert!(html.contains("length::1274"));
+        assert!(html.contains("tag::タグA"));
+        assert!(html.contains("tag::タグB"));
+        // 短編は目次を出さない (href 付きの目次があると連載中と判定される)
+        assert!(!html.contains("Episode;"), "got: {html}");
+        assert!(!html.contains("next::"));
+
+        // 短編として扱われ、本文ページはこの URL 自身になる
+        let setting = pixiv_setting();
+        let mut url_captures = HashMap::new();
+        url_captures.insert("work_id".to_string(), "29204764".to_string());
+        let (novel_type, _) =
+            super::resolve_novel_type(setting, &html, &url_captures, &pixiv_info(&html));
+        assert_eq!(novel_type, 2);
+
+        // 本文は Aozora へ渡せる HTML へ変換される (素の改行は to_aozora が落とす)
+        let body = setting_body(&html);
+        assert_eq!(
+            body,
+            "1行目<br>2行目<br><ruby>漢字<rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby><br>第二章<br>［＃改ページ］<br><a href=\"https://example.com/\">作者サイト</a><br><!--pixivimage:83791147-1--><br><!--uploadedimage:22638629--><br>（2ページ目へ）"
+        );
+        assert!(!body.contains("[pixivimage"), "raw tag leaked: {body}");
+        // 単体作品の description はあらすじなので前書きには回さない
+        assert!(!html.contains("introduction::"));
+
+        let aozora = super::html::to_aozora(&body);
+        assert!(aozora.contains("｜漢字《かんじ》"));
+        assert!(aozora.contains("［＃改ページ］"));
+        // narou.rb と同じく <a> は落としてリンク文字列だけ残す
+        assert!(aozora.contains("作者サイト"));
+        assert!(!aozora.contains("<a href"));
+        // 挿絵・ジャンプは本文を汚さない形にする
+        assert!(aozora.contains("（2ページ目へ）"), "got: {aozora}");
+        assert!(!aozora.contains("pixivimage"));
+        assert!(!aozora.contains("uploadedimage"));
+    }
+
+    #[test]
+    fn pixiv_series_episode_emits_introduction_and_poll_postscript() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "id":"29205030","title":"純血とマグル","userName":"ラギー","description":"前書き<br />二行目",
+                "content":"本文です","createDate":"2026-09-23T08:20:09+00:00","uploadDate":"2026-09-23T08:20:09+00:00",
+                "characterCount":4444,
+                "seriesNavData":{"seriesId":14889031,"title":"魔法学園ヘタリア","order":2},
+                "pollData":{"question":"どれ？","total":10,"choices":[{"text":"A","count":6},{"text":"B","count":4}]},
+                "tags":{"tags":[{"tag":"夢小説"}]}}}"#,
+        );
+
+        // シリーズの各話でもレコードは話そのもの
+        assert!(html.contains("ncode::n29205030"), "got: {html}");
+        assert!(html.contains("introduction::"));
+        assert!(html.contains("前書き<br />二行目"));
+        assert!(html.contains("::introduction_end"));
+        // 同じ文を あらすじ と 前書き の両方には出さない
+        assert!(!html.contains("story::前書き"), "got: {html}");
+        assert!(html.contains("postscript::"));
+        assert!(html.contains("アンケート　\"どれ？\"　　票数10票<br>　　　A　　6票<br>　　　B　　4票"));
+        assert!(html.contains("::postscript_end"));
+        assert_eq!(setting_body(&html), "本文です");
+    }
+
+    #[test]
+    fn pixiv_illustration_references_resolve_through_the_job_queue() {
+        // 挿絵 URL は同じ応答に無いので、DSL が追加 API を要求し、実行側が
+        // 取得して再実行した結果として <img> に変わる。
+        let setting = pixiv_setting();
+        let http = MockHttpClient::new();
+        http.add_text(
+            "https://www.pixiv.net/ajax/illust/83791147/pages",
+            200,
+            r#"{"error":false,"body":[{"urls":{"original":"https://i.pximg.net/img/83791147_p0.jpg"}}]}"#,
+        );
+        let mut jobs = super::preprocess::PreprocessJobs::new();
+        let mut source = r#"{"error":false,"message":"","body":{
+            "id":"29204764","title":"短編集","userName":"沼月時雨","description":"あらすじ",
+            "content":"前\n[pixivimage:83791147-1]\n[uploadedimage:22638629]\n後",
+            "createDate":"2026-09-23T07:48:07+00:00","uploadDate":"2026-09-23T07:48:07+00:00",
+            "characterCount":10,"seriesNavData":null,
+            "textEmbeddedImages":{"22638629":{"urls":{"original":"https://i.pximg.net/img/uploaded.png"}}},
+            "tags":{"tags":[{"tag":"タグA"}]}}}"#
+            .to_string();
+
+        futures::executor::block_on(super::util::pretreatment_source_with_jobs(
+            &http,
+            &FakeRateLimiter::new(),
+            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+            &mut source,
+            "UTF-8",
+            Some(setting),
+            &mut jobs,
+            "https://www.pixiv.net/ajax/novel/29204764",
+        ))
+        .unwrap();
+
+        assert_eq!(
+            http.requested_urls(),
+            vec!["GET https://www.pixiv.net/ajax/illust/83791147/pages"],
+            "the definition should ask for the illustration pages once"
+        );
+        assert_eq!(jobs.len(), 1);
+        let body = setting_body(&source);
+        assert!(
+            body.contains(r#"<img src="https://i.pximg.net/img/83791147_p0.jpg">"#),
+            "got: {body}"
+        );
+        // 同じ応答にある挿絵は追加取得なしで解決する
+        assert!(
+            body.contains(r#"<img src="https://i.pximg.net/img/uploaded.png">"#),
+            "got: {body}"
+        );
+        assert!(!body.contains("pixivimage"), "got: {body}");
+    }
+
+    #[test]
+    fn pixiv_unresolved_illustration_keeps_only_a_marker() {
+        // 取得に失敗しても本文は落とさず、目印だけ残す。
+        let setting = pixiv_setting();
+        let http = MockHttpClient::new();
+        let mut jobs = super::preprocess::PreprocessJobs::new();
+        let mut source = r#"{"error":false,"message":"","body":{
+            "id":"29204764","title":"短編集","userName":"沼月時雨","description":"あらすじ",
+            "content":"前\n[pixivimage:83791147-1]\n後",
+            "createDate":"2026-09-23T07:48:07+00:00","uploadDate":"2026-09-23T07:48:07+00:00",
+            "characterCount":10,"seriesNavData":null,"tags":{"tags":[{"tag":"タグA"}]}}}"#
+            .to_string();
+
+        futures::executor::block_on(super::util::pretreatment_source_with_jobs(
+            &http,
+            &FakeRateLimiter::new(),
+            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+            &mut source,
+            "UTF-8",
+            Some(setting),
+            &mut jobs,
+            "https://www.pixiv.net/ajax/novel/29204764",
+        ))
+        .unwrap();
+
+        let body = setting_body(&source);
+        assert_eq!(body, "前<br><!--pixivimage:83791147-1--><br>後");
+        // 失敗したジョブは null として残り、無駄に再取得しない
+        assert_eq!(jobs.len(), 1);
+    }
+
+    #[test]
+    fn pixiv_error_envelope_is_reported_as_missing_novel() {
+        let html = run_pixiv_preprocess(
+            r#"{"error":true,"message":"作品がありません","body":[]}"#,
+        );
+
+        let setting = pixiv_setting();
+        let pattern = setting.compiled_error_message_pattern().unwrap();
+        assert!(
+            pattern.is_match(&html),
+            "error envelope should match error_message: {html}"
+        );
+    }
+
+    #[test]
+    fn pixiv_login_only_novel_asks_for_a_stored_cookie() {
+        // ログイン限定作品は HTTP 200 のまま content だけが欠ける。
+        let html = run_pixiv_preprocess(
+            r#"{"error":false,"message":"","body":{
+                "id":"26352975","title":"技術テスト","userName":"るみゃ","description":"技術テストです",
+                "content":null,"isLoginOnly":true,
+                "createDate":"2025-11-02T03:18:05+00:00","uploadDate":"2025-11-02T03:18:05+00:00",
+                "characterCount":36,"seriesNavData":null,
+                "tags":{"tags":[{"tag":"技術畑"}]}}}"#,
+        );
+
+        assert!(html.contains("login_required::1"), "got: {html}");
+        assert!(!html.contains("body::"));
+        assert!(!html.contains("title::技術テスト"));
+
+        let setting = pixiv_setting();
+        assert!(
+            setting
+                .compiled_error_message_pattern()
+                .unwrap()
+                .is_match(&html),
+            "login wall should also read as missing so the download fails without a cookie"
+        );
+        assert!(
+            setting.compiled_login_pattern().unwrap().is_match(&html),
+            "login wall should match login_pattern so the stored cookie is retried"
+        );
+        // 本文が無いので本文パターンは一致しない
+        let (element, _) =
+            super::section::parse_section_html(setting, html.clone()).unwrap();
+        assert_eq!(element.body, "");
+    }
+
+    fn pixiv_info(html: &str) -> super::novel_info::NovelInfo {
+        super::novel_info::NovelInfo::from_novel_info_source(pixiv_setting(), html)
+    }
+
+    fn setting_body(html: &str) -> String {
+        let setting = pixiv_setting();
+        let (element, _) = super::section::parse_section_html(setting, html.to_string()).unwrap();
+        element.body
     }
 
     #[test]

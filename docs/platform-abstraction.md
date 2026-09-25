@@ -76,7 +76,7 @@
 - `src/downloader/security.rs`（URL 検証・SSRF 防止）
 - `src/downloader/toc.rs` / `section.rs` の parse 系
 - `src/converter/converter_base/*`（文字変換・行処理・ルビ）※ `render.rs` も pure
-- `src/error.rs` の `NarouError` は reqwest::Error に直接 `#[from]` している（要修正）
+- `src/error.rs` の `NarouError` — ~~reqwest::Error に直接 `#[from]`~~ → Phase 1 で `Platform(String)` 化済み
 - `src/db/novel_record.rs` / `index_store.rs` / `ruby_time.rs`
 - `src/title.rs` のタイトル変換（rename のみ FS）
 
@@ -344,6 +344,14 @@ Shared Downloader portability is preserved at the capability boundary:
 execution constructs a fresh Downloader per invocation; bundled site definitions
 are loaded from the Worker bundle rather than a second HTTP stack.
 
+Animated illustrations (Pixiv うごイラ) are assembled by
+`src/illustration_animation.rs`, which decodes JPEG/PNG frames and reads the
+frame archive. Both the `image` codecs and the ZIP reader sit behind the
+`illustration-animation` feature, which `native-runtime` enables. The Worker
+build leaves them out — the ZIP reader narou uses (default features: bzip2,
+zstd, lzma) does not build for wasm — so `assemble_animation` reports the
+archive as unsupported there and the callers keep the bytes they downloaded.
+
 Local D1 verification (`wrangler d1 migrations apply narou-rs --local`) applies
 all six migrations. Local smoke checks cover atomic job claiming, retryable
 transition clearing the lease, scheduler generation ownership, and rejection of
@@ -400,7 +408,7 @@ Worker (worker_entry)
 ```
 
 - `platform/` から native 固有型（`reqwest::Response`, `curl::Easy`, `std::path::Path`）を trait interface に漏らさない。
-- `NarouError` は `reqwest::Error` の直接 `#[from]` をやめ、`Platform(String)` のような variant + context に置き換える（全 match 箇所の修正が必要。Phase 1 で実施）。
+- `NarouError` は `reqwest::Error` の直接 `#[from]` をやめ、`Platform(String)` + context に置き換えた (Phase 1 で実施済み)。
 
 ## 9. migration phases
 
@@ -484,8 +492,8 @@ Worker (worker_entry)
 2. **`NarouError` の variant 追加方針**: `reqwest::Error` を String 化すると原因追跡が落ちる。`Platform { context: String, source: Option<String> }` 的な形を検討。curl の `Error` / wget の `io::Error` も同様に String 化してよいか要判断。
 3. **~~`std::thread` / `mpsc` の扱い~~（一部解決）**: core からは排除した。update.rs の domain 別並列 worker は `tokio::spawn` に移行済み。mail.rs は native 専用として残す。
 4. **`Clock` の導入範囲**: 全 `chrono::Utc::now()` を置き換えると変更が膨大になる。テスト容易性が必要な箇所（crawler / scheduler / 更新判定）から段階的に注入する。
-5. **wasm32 での chrono**: `chrono` は wasm32-unknown-unknown でデフォルト機能だと `std::time` に依存する箇所があるため、Worker build 時に feature 調整（`wasmbind` or `clock` feature 無効）が必要になる可能性。Phase 6 で検証。
-6. **`webnovel/*.yaml` の loader**: `site_setting/loader.rs` は `read_dir` + `read_to_string` で native のファイル探索（exe parent / CARGO_MANIFEST_DIR / current_dir）をしている。Worker ではバンドル or D1 等から読むことになる。loader を trait 化するかは Phase 4-6 で判断。
+5. **~~wasm32 での chrono~~（解決）**: `worker_entry` は `chrono` + `chrono-tz` のまま wasm32-unknown-unknown で `worker-build --release` まで通っている (worker_entry/Cargo.toml)。
+6. **~~`webnovel/*.yaml` の loader~~（判断済み）**: loader (`site_setting/loader.rs`) は trait 化せず native のまま。Worker ではバンドルされたサイト定義を Worker bundle から読む (`composition.rs` 側)。
 7. **`illustration_store.rs` の扱い**: 現行legacy filesystem APIはnative互換層として維持し、新規binary保存は`IllustrationStorageService` + `AssetStore`へ移行した。pure index型の完全分離は既存cache APIとの互換制約が残るため、後続で段階的に分離する。
 8. **queue.yaml の atomic write**: `db::inventory` の atomic write は native の fs2 lock + tempfile に依存。Worker では D1 + Queues が置き換えるため、queue 永続化層は Phase 8 で再設計。
 9. **logger**: tracing subscriber は native / worker で切り替える。`logger.rs` のファイル出力は native 専用にできる。Phase 1 では触らない。

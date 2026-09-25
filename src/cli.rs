@@ -913,6 +913,11 @@ pub enum Commands {
         #[arg(short = 'm', long)]
         more: bool,
     },
+    /// Login credentials shared with a browser machine (import/export).
+    Login {
+        #[command(subcommand)]
+        action: crate::commands::login::LoginAction,
+    },
     Illust {
         #[arg(short = 'f', long)]
         force: bool,

@@ -10,7 +10,7 @@ pub(crate) const STATUS_SEARCH_EXPRESSION: &str = include_str!("sql/status_searc
 pub(crate) const STATUS_SORT_EXPRESSION: &str = include_str!("sql/status_sort_expression.sql");
 
 pub(crate) fn select_sql() -> &'static str {
-    "SELECT n.id, n.author, n.author_fold, n.title, n.file_title, n.toc_url, n.sitename, n.novel_type, n.end, n.last_update, n.new_arrivals_date, n.use_subdirectory, n.general_firstup, n.novelupdated_at, n.general_lastup, n.last_mail_date, n.tags_json, n.ncode, n.domain, n.general_all_no, n.length, n.suspend, n.is_narou, n.last_check_date, n.convert_failure, n.extra_fields_yaml FROM novels n"
+    "SELECT n.id, n.author, n.author_fold, n.title, n.file_title, n.toc_url, n.sitename, n.novel_type, n.end, n.last_update, n.new_arrivals_date, n.use_subdirectory, n.general_firstup, n.novelupdated_at, n.general_lastup, n.last_mail_date, n.tags_json, n.ncode, n.domain, n.general_all_no, n.length, n.suspend, n.is_narou, n.last_check_date, n.convert_failure, n.extra_fields_yaml, n.requires_login, n.login_session FROM novels n"
 }
 
 pub(crate) struct WhereBuilder {

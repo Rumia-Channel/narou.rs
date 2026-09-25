@@ -41,6 +41,26 @@ pub struct SiteSetting {
     pub confirm_over18: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookie: Option<String>,
+    /// Extra request headers sent with every fetch for this site (e.g. the
+    /// `Referer` some image hosts require). Names/values that could inject a
+    /// second header are dropped when the policy is built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    /// Login page the `narou_rs_login` executable opens for this site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_url: Option<String>,
+    /// Page content that marks a login wall (a page served with HTTP 200 that
+    /// asks for authentication). Matching it retries with the stored cookie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_pattern: Option<SiteSettingValue>,
+    /// Marker a definition emits when an anonymous fetch returned only part of
+    /// the list (a retry with the stored cookie may see more).
+    #[serde(default)]
+    pub login_partial_pattern: Option<SiteSettingValue>,
+    /// Minimum seconds between requests to this site. Sites that rate-limit
+    /// aggressively (Pixiv) declare a floor; `None` uses `download.interval`.
+    #[serde(default)]
+    pub min_interval: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub over18_pattern: Option<SiteSettingValue>,
     pub sitename: String,
@@ -50,7 +70,7 @@ pub struct SiteSetting {
     pub append_title_to_folder_name: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_strip_pattern: Option<String>,
-    pub toc_url: String,
+    pub toc_url: SiteUrlTemplate,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitles: Option<SiteSettingValue>,
 
@@ -70,6 +90,11 @@ pub struct SiteSetting {
     pub postscript_pattern: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub novel_info_url: Option<String>,
+    /// Pattern that yields the record's `ncode` from the fetched page. Used by
+    /// sites whose URL carries no site-specific prefix (e.g. pixiv, where the
+    /// numeric work id alone would collide between novels and series).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ncode: Option<SiteSettingValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     #[serde(default)]
@@ -132,9 +157,51 @@ pub struct SiteSetting {
     #[serde(skip)]
     pub(super) compiled_over18_pattern: Option<Regex>,
     #[serde(skip)]
+    pub(super) compiled_login_pattern: Option<Regex>,
+    #[serde(skip)]
+    pub(super) compiled_login_partial_pattern: Option<Regex>,
+    #[serde(skip)]
     pub(super) compiled_next_toc: Option<Regex>,
     #[serde(skip)]
     pub(super) compiled_toc_page_max: Option<Regex>,
+}
+
+/// A URL template that may depend on the shape of the target URL.
+///
+/// Sites that expose several kinds of target under one domain (Pixiv has
+/// novels, novel series, artworks and manga series) need a different API URL
+/// for each. The list form picks the first entry whose `match` regex applies
+/// to the target URL; the plain string form is the single-template case.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SiteUrlTemplate {
+    Single(String),
+    ByTarget { by_target: Vec<SiteUrlTemplateEntry> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteUrlTemplateEntry {
+    #[serde(rename = "match")]
+    pub pattern: String,
+    pub url: String,
+}
+
+impl SiteUrlTemplate {
+    fn selected(&self, target_url: Option<&str>) -> Option<&str> {
+        match self {
+            SiteUrlTemplate::Single(url) => Some(url.as_str()),
+            SiteUrlTemplate::ByTarget { by_target } => by_target
+                .iter()
+                .find(|entry| {
+                    target_url.is_some_and(|target| {
+                        Regex::new(&entry.pattern)
+                            .map(|re| re.is_match(target))
+                            .unwrap_or(false)
+                    })
+                })
+                .map(|entry| entry.url.as_str()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +296,14 @@ impl SiteSetting {
             .and_then(|s| crate::downloader::util::compile_html_pattern(s).ok());
         self.compiled_over18_pattern = self
             .over18_pattern
+            .as_ref()
+            .and_then(|v| self.compile_value(v));
+        self.compiled_login_pattern = self
+            .login_pattern
+            .as_ref()
+            .and_then(|v| self.compile_value(v));
+        self.compiled_login_partial_pattern = self
+            .login_partial_pattern
             .as_ref()
             .and_then(|v| self.compile_value(v));
         self.compiled_next_toc = self.next_toc.as_deref().and_then(|s| Regex::new(s).ok());
@@ -334,7 +409,20 @@ impl SiteSetting {
     }
 
     pub fn toc_url(&self) -> String {
-        self.interpolate(&self.toc_url)
+        match self.toc_url.selected(None) {
+            Some(template) => self.interpolate(template),
+            None => String::new(),
+        }
+    }
+
+    /// Resolve `toc_url` for a concrete target URL, so definitions with several
+    /// target shapes pick the right API endpoint. The selected template is also
+    /// exposed as `\k<toc_url>` so `novel_info_url: \k<toc_url>` keeps working.
+    pub fn toc_url_with_url_captures(&self, url: &str) -> Option<String> {
+        let mut captures = self.extract_url_captures(url)?;
+        let template = self.toc_url.selected(Some(url))?.to_string();
+        captures.insert("toc_url".to_string(), template.clone());
+        Some(self.interpolate_with_captures(&template, &captures))
     }
 
     pub fn extract_url_captures(&self, url: &str) -> Option<HashMap<String, String>> {
@@ -343,11 +431,6 @@ impl SiteSetting {
 
     pub fn extract_series_url_captures(&self, url: &str) -> Option<HashMap<String, String>> {
         extract_captures_from_patterns(&self.compiled_series_url, url)
-    }
-
-    pub fn toc_url_with_url_captures(&self, url: &str) -> Option<String> {
-        let captures = self.extract_url_captures(url)?;
-        Some(self.interpolate_with_captures(&self.toc_url, &captures))
     }
 
     pub fn compile_series_item_pattern(&self) -> Option<Regex> {
@@ -384,16 +467,30 @@ impl SiteSetting {
                 captures.insert(name.to_string(), m.as_str().to_string());
             }
         }
-        (!captures.is_empty()).then(|| self.interpolate_with_captures(&self.toc_url, &captures))
+        (!captures.is_empty()).then(|| {
+            let template = self.toc_url.selected(None).unwrap_or_default();
+            self.interpolate_with_captures(template, &captures)
+        })
     }
 
+    /// Resolve `novel_info_url`. `\k<toc_url>` inside it means "the same page as
+    /// the table of contents", so the template for the current target is
+    /// substituted first — a definition with several target shapes must not
+    /// resolve it to another shape's endpoint.
     pub fn novel_info_url_with_captures(
         &self,
         url_captures: &HashMap<String, String>,
     ) -> Option<String> {
+        let mut captures = url_captures.clone();
+        if let Some(template) = self
+            .toc_url
+            .selected(captures.get("__target_url").map(String::as_str))
+        {
+            captures.insert("toc_url".to_string(), template.to_string());
+        }
         self.novel_info_url
             .as_ref()
-            .map(|u| self.interpolate_with_captures(u, url_captures))
+            .map(|u| self.interpolate_with_captures(u, &captures))
     }
 
     pub fn top_url(&self) -> String {
@@ -410,6 +507,33 @@ impl SiteSetting {
 
     pub fn cookie(&self) -> Option<&str> {
         self.cookie.as_deref()
+    }
+
+    /// Site-declared request headers, in a stable order, with `\k<...>`
+    /// placeholders resolved (the values usually embed `top_url`).
+    pub fn header_list(&self) -> Vec<(String, String)> {
+        self.headers
+            .iter()
+            .flat_map(|map| map.iter())
+            .map(|(name, value)| (name.clone(), self.interpolate(value)))
+            .collect()
+    }
+
+    /// Login page for this site, with `\k<...>` placeholders resolved.
+    pub fn login_url(&self) -> Option<String> {
+        self.login_url.as_ref().map(|url| self.interpolate(url))
+    }
+
+    pub fn compiled_login_pattern(&self) -> Option<&Regex> {
+        self.compiled_login_pattern.as_ref()
+    }
+
+    /// Whether `source` shows only part of the list because the request was
+    /// anonymous.
+    pub fn is_partial_login_view(&self, source: &str) -> bool {
+        self.compiled_login_partial_pattern
+            .as_ref()
+            .is_some_and(|pattern| pattern.is_match(source))
     }
 
     pub fn error_message(&self) -> Option<&str> {
@@ -470,7 +594,11 @@ impl SiteSetting {
     }
 
     pub fn get_toc_url_with_captures(&self, captures: &HashMap<String, String>) -> String {
-        self.interpolate_with_captures(&self.toc_url, captures)
+        let target = captures.get("__target_url").map(String::as_str);
+        match self.toc_url.selected(target) {
+            Some(template) => self.interpolate_with_captures(template, captures),
+            None => String::new(),
+        }
     }
 
     pub fn get_next_url_with_captures(
@@ -503,6 +631,31 @@ fn extract_captures_from_patterns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_login_pattern_detects_an_incomplete_listing() {
+        let yaml = r#"
+name: Example
+domain: example.com
+top_url: https://example.com
+sitename: Example
+toc_url: https://example.com/\k<url>
+login_partial_pattern: ^login_partial::1$
+"#;
+        let mut setting: SiteSetting = serde_yaml::from_str(yaml).unwrap();
+        setting.compile();
+
+        assert!(setting.is_partial_login_view("login_partial::1\nEpisode;1;..."));
+        assert!(!setting.is_partial_login_view("Episode;1;..."));
+
+        // Definitions without the key never report a partial view.
+        let mut plain: SiteSetting = serde_yaml::from_str(
+            "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Example\ntoc_url: x\\k<url>\n",
+        )
+        .unwrap();
+        plain.compile();
+        assert!(!plain.is_partial_login_view("login_partial::1"));
+    }
 
     #[test]
     fn user_webnovel_yaml_merges_over_bundled_yaml_by_name() {

@@ -44,11 +44,18 @@ const ILLUSTRATION_LOCALIZATION_VERSION: &str = "illustration-localization:v4";
 pub struct ConverterCapabilities {
     pub http: Arc<dyn HttpClient>,
     pub rate_limiter: Arc<dyn RateLimiter>,
+    /// Site headers used for illustration downloads (a host such as
+    /// i.pximg.net rejects requests without a `Referer`).
+    pub fetch_policy: crate::downloader::http_policy::FetchPolicy,
     pub assets: Option<Arc<dyn AssetStore>>,
     pub objects: Option<Arc<dyn ObjectStore>>,
     pub illustration_index: Option<IllustrationIndex>,
     pub illustration_prefix: Option<ObjectKey>,
     pub novel_record_resolver: Option<Arc<dyn Fn(i64) -> Option<NovelRecord> + Send + Sync>>,
+    /// Resolves the fetch policy (site headers/cookie) used for illustration
+    /// downloads. Native callers map the record's site definition onto it.
+    pub fetch_policy_resolver:
+        Option<Arc<dyn Fn(&NovelRecord) -> crate::downloader::http_policy::FetchPolicy + Send + Sync>>,
 }
 
 impl ConverterCapabilities {
@@ -56,11 +63,13 @@ impl ConverterCapabilities {
         Self {
             http,
             rate_limiter,
+            fetch_policy: crate::downloader::http_policy::FetchPolicy::default(),
             assets: None,
             objects: None,
             illustration_index: None,
             illustration_prefix: None,
             novel_record_resolver: None,
+            fetch_policy_resolver: None,
         }
     }
 }
@@ -173,6 +182,21 @@ impl NovelConverter {
             capabilities,
             target_device: None,
         }
+    }
+
+    /// Site headers/cookie for illustration downloads, replaced whenever the
+    /// converter learns which novel (and therefore which site) it is handling.
+    fn apply_record_fetch_policy(&mut self, record: Option<&NovelRecord>) {
+        let Some(capabilities) = self.capabilities.as_mut() else {
+            return;
+        };
+        let Some(record) = record else {
+            return;
+        };
+        let Some(resolver) = capabilities.fetch_policy_resolver.as_ref() else {
+            return;
+        };
+        capabilities.fetch_policy = resolver(record);
     }
 
     fn resolve_novel_record(&self, id: i64) -> Option<NovelRecord> {
@@ -718,9 +742,23 @@ impl NovelConverter {
         let (bytes, content_type) = match fetch_illustration_bytes(
             capabilities.http.clone(),
             capabilities.rate_limiter.clone(),
+            capabilities.fetch_policy.clone(),
             url.clone(),
         ) {
-            Ok((bytes, content_type)) => (bytes, content_type),
+            Ok((bytes, content_type)) => {
+                // Animated works arrive as a frame archive; the site
+                // definition declares the frame timings on the URL.
+                match crate::illustration_animation::assemble_animation(&url, &bytes) {
+                    Some(Ok(apng)) => (apng, "image/png".to_string()),
+                    Some(Err(err)) => {
+                        self.inspector.borrow_mut().error(format!(
+                            "Illustration#assemble_animation: {url} の組み立てに失敗しました({err})"
+                        ));
+                        (bytes, content_type)
+                    }
+                    None => (bytes, content_type),
+                }
+            }
             Err(err) => {
                 self.inspector.borrow_mut().error(format!(
                     "Illustration#download_image: {} を処理中に例外が発生しました({})",
@@ -871,6 +909,7 @@ impl NovelConverter {
 
         let sections = load_sections_from_dir(novel_dir, &toc_object.subtitles)?;
         let record = self.resolve_novel_record(id);
+        self.apply_record_fetch_policy(record.as_ref());
 
         let aozora_text = self.convert_novel_with_id(Some(id), &toc_object, &sections)?;
         self.flush_section_convert_cache()?;
@@ -941,6 +980,7 @@ impl NovelConverter {
         no_strip: bool,
         verbose: bool,
     ) -> Result<PathBuf> {
+        self.apply_record_fetch_policy(self.resolve_novel_record(_id).as_ref());
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();
         let toc_path = novel_dir.join("toc.yaml");
@@ -1397,6 +1437,7 @@ fn find_saved_section_illustration_filename(
 fn fetch_illustration_bytes(
     http: Arc<dyn HttpClient>,
     rate_limiter: Arc<dyn RateLimiter>,
+    policy: crate::downloader::http_policy::FetchPolicy,
     url: String,
 ) -> std::result::Result<(Vec<u8>, String), String> {
     std::thread::spawn(move || {
@@ -1409,8 +1450,7 @@ fn fetch_illustration_bytes(
                 http.as_ref(),
                 rate_limiter.as_ref(),
                 &url,
-                None,
-                false,
+                &policy,
             ))
             .map_err(|error| error.to_string())?;
         let content_type = response.header("Content-Type").unwrap_or("").to_string();

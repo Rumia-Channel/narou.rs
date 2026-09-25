@@ -53,13 +53,16 @@ fn persist_variant_preference(variant: SelfUpdateVariant) -> Result<()> {
 }
 
 /// Whether the update flow must ask the user which variant to install.
-/// True only for builds at or below `VARIANT_PROMPT_MAX_VERSION` — the first
-/// release line that predates the GPL/standard asset split.
+/// True only for builds at or below `VARIANT_PROMPT_MAX_VERSION` that have no
+/// stored preference yet — the first release line that predates the
+/// GPL/standard asset split. Once `self-update.variant` is set (Web UI
+/// settings or `narou setting`), that choice is used without asking again.
 pub fn variant_choice_required() -> bool {
-    crate::version::version_at_most(
-        &crate::version::create_version_string(),
-        VARIANT_PROMPT_MAX_VERSION,
-    )
+    saved_variant_preference().is_none()
+        && crate::version::version_at_most(
+            &crate::version::create_version_string(),
+            VARIANT_PROMPT_MAX_VERSION,
+        )
 }
 
 /// Effective variant for this update: explicit request > saved preference >
@@ -577,6 +580,80 @@ pub fn current_asset_name() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Restores `USERPROFILE` / `HOME` so the isolated global settings
+    /// directory does not leak into other tests.
+    struct HomeDirGuard {
+        userprofile: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+    }
+
+    impl HomeDirGuard {
+        fn set(root: &Path) -> Self {
+            let userprofile = std::env::var_os("USERPROFILE");
+            let home = std::env::var_os("HOME");
+            // SAFETY: the caller holds the shared global state guard.
+            unsafe {
+                std::env::set_var("USERPROFILE", root);
+                std::env::set_var("HOME", root);
+            }
+            Self { userprofile, home }
+        }
+    }
+
+    impl Drop for HomeDirGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.userprofile {
+                    Some(value) => std::env::set_var("USERPROFILE", value),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
+                match &self.home {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    /// `self-update.variant` is the single source for the update variant: the
+    /// settings UI and `narou setting` write it, the update flow reads it, and
+    /// an explicit request still wins over it.
+    #[test]
+    fn saved_variant_preference_drives_the_update_variant() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
+        let _legacy = crate::test_support::legacy_yaml_guard();
+        let _home = HomeDirGuard::set(temp.path());
+
+        assert_eq!(saved_variant_preference(), None);
+        crate::db::settings::update(SettingScope::Global, |settings| {
+            settings.insert(
+                VARIANT_SETTING_KEY.to_string(),
+                serde_yaml::Value::String("gpl".to_string()),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(saved_variant_preference(), Some(SelfUpdateVariant::Gpl));
+        assert!(
+            !variant_choice_required(),
+            "a stored preference must not be asked for again"
+        );
+        assert_eq!(
+            resolve_variant(&SelfUpdateRequest::default()),
+            SelfUpdateVariant::Gpl
+        );
+        assert_eq!(
+            resolve_variant(&SelfUpdateRequest {
+                variant: Some(SelfUpdateVariant::Standard),
+                ..Default::default()
+            }),
+            SelfUpdateVariant::Standard
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

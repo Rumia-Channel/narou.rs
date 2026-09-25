@@ -52,6 +52,7 @@ pub struct NovelListItem {
     pub suspend: bool,
     pub length: Option<i64>,
     pub toc_url: String,
+    pub ncode: Option<String>,
     pub general_all_no: Option<i64>,
 }
 

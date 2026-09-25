@@ -107,6 +107,8 @@ pub struct NovelSummary {
     pub suspend: bool,
     pub length: Option<i64>,
     pub toc_url: String,
+    /// N-code (なろう系) or the site's numeric work id, when the record has one.
+    pub ncode: Option<String>,
     pub general_all_no: Option<i64>,
 }
 
@@ -273,6 +275,7 @@ impl LibraryService {
                 suspend: record.suspend,
                 length: record.length,
                 toc_url: record.toc_url,
+                ncode: record.ncode,
                 general_all_no: record.general_all_no,
             });
         }
@@ -612,6 +615,8 @@ mod tests {
             is_narou: false,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
+            login_session: None,
             extra_fields: Default::default(),
         }
     }

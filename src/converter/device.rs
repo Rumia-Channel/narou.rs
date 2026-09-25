@@ -343,7 +343,7 @@ impl OutputManager {
         }
 
         args.push(OsString::from("-dst"));
-        args.push(absolutize_path(output_dir).into_os_string());
+        args.push(resolved_path_for_aozora(output_dir).into_os_string());
 
         if let Some(ext_option) = self.aozora_ext_option(output_ext) {
             args.push(OsString::from("-ext"));
@@ -354,7 +354,7 @@ impl OutputManager {
             args.push(OsString::from("-hor"));
         }
 
-        args.push(absolutize_path(input_txt).into_os_string());
+        args.push(resolved_path_for_aozora(input_txt).into_os_string());
         args
     }
 
@@ -758,6 +758,7 @@ impl OutputManager {
             cover_from_first_image: input_txt.parent().is_some_and(has_cover_image),
             assets_dir: crate::compat::aozora_assets_dir(),
             kindle: matches!(self.device, Device::Mobi),
+            extra_assets: super::dakuten_font::lite_font_assets(self.use_dakuten_font)?,
         };
         let build = crate::epub_lite::build_book(input_txt, &options)?;
 
@@ -1252,6 +1253,19 @@ fn absolutize_path(path: &Path) -> PathBuf {
     }
 }
 
+/// ファイルシステムが報告する実パスへ解決してから AozoraEpub3 へ渡す。
+///
+/// AozoraEpub3 (JDK21 版) は出力パスが `-dst` の *実パス* 配下かを検査し、
+/// 外れていれば「出力パスが許可されたディレクトリ外です」で失敗する。検査は
+/// 出力ファイルが無い時点で字句的に正規化したパスと比較されるため、`-dst` が
+/// junction / シンボリックリンク / 8.3 短縮名 を含む形だと、実際には同じ場所でも
+/// 一致せず失敗する。解決できない場合は従来どおり絶対パス化して返す。
+fn resolved_path_for_aozora(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .map(|resolved| normalize_windows_verbatim_path(&resolved))
+        .unwrap_or_else(|_| absolutize_path(path))
+}
+
 fn has_cover_image(dir: &Path) -> bool {
     [".jpg", ".png", ".jpeg"]
         .iter()
@@ -1400,7 +1414,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        Device, OutputManager, StripError, absolutize_path, build_aozora_output_summary,
+        Device, OutputManager, StripError, build_aozora_output_summary,
         decode_ibunko_html_entities, path_contains_windows_aozora_risky_chars,
         prepare_aozora_invocation, normalize_windows_verbatim_path, strip_mobi_sources,
         truncate_output_for_error,
@@ -1568,7 +1582,52 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-c", "0"]));
         assert!(args.contains(&"-hor".to_string()));
         assert!(!args.contains(&"-ext".to_string()));
-        assert_eq!(PathBuf::from(args.last().unwrap()), absolutize_path(&input));
+        // The paths handed over are resolved, so AozoraEpub3 still has to see
+        // the same file (its output check compares real paths).
+        let input_arg = PathBuf::from(args.last().unwrap());
+        assert_eq!(
+            fs::canonicalize(&input_arg).unwrap(),
+            fs::canonicalize(&input).unwrap()
+        );
+    }
+
+    /// AozoraEpub3 (JDK21) rejects an output whose `-dst` directory resolves
+    /// elsewhere, so the arguments must carry the resolved path.
+    #[cfg(windows)]
+    #[test]
+    fn aozora_args_resolve_the_output_directory() {
+        let dir = create_test_dir("junction-args");
+        let target = dir.join("target");
+        fs::create_dir_all(target.join("novel")).unwrap();
+        let link = dir.join("link");
+        let created = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+            && link.is_dir();
+        if !created {
+            // Junction creation needs NTFS and a permitted parent directory.
+            return;
+        }
+        let novel_dir = link.join("novel");
+        let input = novel_dir.join("novel.txt");
+        fs::write(&input, "test").unwrap();
+
+        let manager = test_output_manager(Device::Epub);
+        let args = stringify_args(manager.build_aozora_epub3_args(&input, &novel_dir, ".epub"));
+
+        let dst_index = args.iter().position(|arg| arg == "-dst").unwrap();
+        let dst = PathBuf::from(&args[dst_index + 1]);
+        let resolved = normalize_windows_verbatim_path(&fs::canonicalize(&dst).unwrap());
+        assert_eq!(dst, resolved, "-dst must already be the resolved directory");
+        let input_arg = PathBuf::from(args.last().unwrap());
+        assert_eq!(
+            fs::canonicalize(&input_arg).unwrap(),
+            fs::canonicalize(&input).unwrap()
+        );
     }
 
     #[test]

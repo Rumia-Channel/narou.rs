@@ -579,6 +579,7 @@ mod tests {
 
     #[test]
     fn database_parity_create_new_id_starts_at_zero() {
+        let _global = crate::test_support::global_state_guard();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
         let db = Database::with_inventory(Inventory::new(temp.path().to_path_buf())).unwrap();
@@ -587,6 +588,7 @@ mod tests {
 
     #[test]
     fn database_parity_save_preserves_unknown_fields_and_zero_id() {
+    let _global = crate::test_support::global_state_guard();
     let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let narou_dir = temp.path().join(".narou");
@@ -637,6 +639,7 @@ mod tests {
 
     #[test]
     fn update_records_merges_against_current_database_yaml() {
+    let _global = crate::test_support::global_state_guard();
     let _legacy = crate::test_support::legacy_yaml_guard();
         let temp = tempfile::tempdir().unwrap();
         let narou_dir = temp.path().join(".narou");
@@ -668,6 +671,7 @@ mod tests {
 
     #[test]
     fn sort_by_uses_typed_ordering_and_stable_none_order() {
+        let _global = crate::test_support::global_state_guard();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
         let inventory = Inventory::new(temp.path().to_path_buf());
@@ -721,6 +725,7 @@ mod tests {
 
     #[test]
     fn sort_by_last_check_date_uses_compare_optional() {
+        let _global = crate::test_support::global_state_guard();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
         let inventory = Inventory::new(temp.path().to_path_buf());
@@ -755,6 +760,7 @@ mod tests {
 
     #[test]
     fn sort_by_general_all_no_handles_missing_values() {
+        let _global = crate::test_support::global_state_guard();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
         let inventory = Inventory::new(temp.path().to_path_buf());
@@ -777,6 +783,7 @@ mod tests {
 
     #[test]
     fn sort_by_tags_and_status_use_dedicated_keys() {
+        let _global = crate::test_support::global_state_guard();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
         let inventory = Inventory::new(temp.path().to_path_buf());
@@ -815,6 +822,7 @@ mod tests {
 
     #[test]
     fn sort_by_new_arrivals_date_matches_option_cmp_semantics() {
+        let _global = crate::test_support::global_state_guard();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
         let inventory = Inventory::new(temp.path().to_path_buf());
@@ -847,6 +855,7 @@ mod tests {
 
     #[test]
     fn sort_by_unknown_key_falls_back_to_id() {
+        let _global = crate::test_support::global_state_guard();
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
         let inventory = Inventory::new(temp.path().to_path_buf());
@@ -889,6 +898,8 @@ mod tests {
             is_narou: true,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
+            login_session: None,
             extra_fields: Default::default(),
         }
     }
