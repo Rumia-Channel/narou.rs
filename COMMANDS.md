@@ -440,6 +440,7 @@ narou setting name         # 読み取り
 | `server-bind` | string | Web サーババインドアドレス |
 | `server-basic-auth.*` | bool/str | Basic 認証設定 |
 | `over18` | boolean | 18+ フラグ（未設定時は初回のみ確認、`false` 明示時はR18取得を中止） |
+| `self-update.variant` | select | セルフアップデートで取得するリリース variant（`gpl` = AozoraEpub3_Lite 組込み・GPL-3.0 / `standard` = 外部 AozoraEpub3・BSD）。未設定なら実行中のビルドと同じ variant |
 
 **実装済み (Rust)**:
 - `local_setting.yaml` / `global_setting.yaml` の読み書き (`Inventory`)
@@ -651,7 +652,8 @@ narou setting name         # 読み取り
 - systemd の `.service` 配下で Web UI から本体更新するときは、通常の `setsid` 子プロセスではなく `systemd-run` の別 transient service に既存 updater を起動させる。本体の終了後に旧 updater が zip を適用したら、元の systemd service を `systemctl restart`（user service は `--user`）で再起動する。`Restart=always` / `KillMode=control-group` による updater 強制終了を回避する。引き渡し失敗時は API も success=false とし、本体を終了しない。\n- ソース checkout の `target/<profile>/narou_rs` は local-build 版として識別し、自動更新を開始せず `git pull` + `cargo build --release` または別ディレクトリへの GitHub Release 版展開を案内する。Release 版 updater は適用失敗時もダウンロード済み `.tmp` と展開用 `update_extract.tmp` の削除を試み、失敗理由は `update.log` に残す
 - Windows の `narou web --hide-console` は GUI subsystem で起動し、通常 CLI 実行時は親コンソールへ再接続、hidden 実行時はタスクトレイの右クリックメニューから `終了` / `再起動` を呼べる。Web worker / auto-update / 即時 API 実行が起動する child process も hidden 状態を引き継ぎ、空のコンソールを開かない
 - 即時実行の `diff` / `folder` / `reboot` API は child command の失敗や replacement process 起動失敗を success=false として返し、false success を出さない
-- Web 設定画面は Ruby版同様、`tab` がある設定を `invisible` 指定でも表示する。`webui.theme` / `webui.table.reload-timing` / `webui.new-tag-color` / `webui.debug-mode` / `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `server-add-accepted-hosts` / `over18` も設定画面に出る
+- Web 設定画面は Ruby版同様、`tab` がある設定を `invisible` 指定でも表示する。`webui.theme` / `webui.table.reload-timing` / `webui.new-tag-color` / `webui.debug-mode` / `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `server-add-accepted-hosts` / `self-update.variant` / `over18` も設定画面に出る
+- セルフアップデートで取得する variant（GPL版 / 通常版）は Global タブの `self-update.variant` セレクト、または `narou setting self-update.variant=gpl|standard` で設定する。`narou setting` の一覧にも表示され、`narou setting --delete self-update.variant`（Web UI では「未設定」）で実行中のビルドと同じ variant に戻る。0.4.0 以下からの更新時に出る variant 選択モーダルは、この設定が既にあれば表示せず保存値で更新する
 - `webui.theme` / `webui.table.reload-timing` / `webui.performance-mode` / `webui.new-tag-color` / `webui.debug-mode` 保存時は、開いている Web UI に設定再読み込みイベントを送り、テーマメニューの変更も `webui.theme` へ保存する
 - `webui.debug-mode` が ON のときは、Web worker が失敗 child process の直近 stdout/stderr を要約して `queue_failed` イベントに載せ、Web UI 通知とコンソールに詳細エラーを出す。OFF のときは従来どおり簡潔な失敗通知だけにする
 - `/novels/{id}/download` は生成済み ebook を全量メモリへ読み込まず、`tokio::fs::File` から 64KiB チャンクでストリーミングする。大きい EPUB でも `Content-Length` / `Content-Disposition` を付けたまま返す

@@ -648,6 +648,20 @@ Rust版では以下のように CSRF ガードと両立する same-origin 方式
 
 Web UI 設定画面に出る関連項目: `server-bind` / `server-basic-auth.*` / `server-ws-add-accepted-domains` / `server-add-accepted-hosts` / `over18`。`server-reverse-proxy.enable` と `server-basic-auth.require-for-external-bind` は hidden のため CLI からのみ変更します。
 
+### 8.2 セルフアップデートの variant
+
+Global タブの `self-update.variant` セレクトで、アップデート時に取得するリリースを選びます。
+
+| 選択肢 | 保存値 | 取得するファイル |
+|--------|--------|------------------|
+| GPL版（AozoraEpub3_Lite 組込み） | `gpl` | `narou_rs_<platform>-GPL.zip` |
+| 通常版（外部 AozoraEpub3） | `standard` | `narou_rs_<platform>.zip` |
+| 未設定 | （設定を削除） | 実行中のビルドと同じ variant |
+
+- CLI からも同じ設定を扱えます: `narou setting self-update.variant=gpl` / `narou setting self-update.variant`（読み取り）/ `narou setting self-update.variant=`（削除）。
+- 0.4.0 以下から更新するときの variant 選択モーダルは、この設定が未設定のときだけ表示されます。設定済みならモーダルは出ず、保存値の variant を取得します。
+- 更新 API（`POST /api/update/start`）に `variant` を付けた場合は、その指定が最優先され、以後の更新のために保存されます。
+
 ---
 
 ## 9. JP/EN 言語切替
