@@ -1414,7 +1414,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        Device, OutputManager, StripError, absolutize_path, build_aozora_output_summary,
+        Device, OutputManager, StripError, build_aozora_output_summary,
         decode_ibunko_html_entities, path_contains_windows_aozora_risky_chars,
         prepare_aozora_invocation, normalize_windows_verbatim_path, strip_mobi_sources,
         truncate_output_for_error,
