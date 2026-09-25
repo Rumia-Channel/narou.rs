@@ -2601,7 +2601,7 @@ insights.
 ### GNU General Public License v3.0 only (`GPL-3.0-only`)
 
 Used by:
-- aozora_epub3_lite 0.1.3
+- aozora_epub3_lite 0.1.4
 - narou_worker 0.4.2
 
 ```text

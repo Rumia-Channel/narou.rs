@@ -125,6 +125,22 @@ cp -r assets/aozora C:/path/to/tools/
 - Native 変換後、固定名ミラー `novel.txt` を小説ディレクトリへ併せて書き出し (feature `lite` 時)。ObjectStore レイアウト経由で Worker と同じキーで参照できる
 - CI: platform.yml に `native-gpl` job (`--features lite` の check/test/build)。release.yml は全8プラットフォームに GPL 版を追加 (`narou_rs_{plat}_{arch}-GPL.zip`)、package-release.ps1 に `-Variant` 引数を追加。タグ push に加え `workflow_dispatch` で任意ブランチから両 variant の zip を生成可能 (dispatch 時は GitHub Release を作成しない)
 
+### 更新 (2026-09-25): v0.1.4 で濁点フォントを組み込みエンジンでも使う
+
+外部ツール (`DakutenFontGuard`) は `aozoraepub3dir/template/OPS/fonts/DMincho.ttf`
+と `css_custom/vertical_font.css` を流し込んで効かせるが、組み込みエンジンはその
+ディレクトリを見ていなかった。crate 側 (v0.1.4) が呼び出し側の `style/*.css`
+アセットを本文からリンクするようになったので、narou は同じ内容を
+`EpubBuildOptions::extra_assets` で渡す。
+
+- pin: `aozora_epub3_lite` = `cd67ddb` (v0.1.4)。`Cargo.toml` の `rev` を書き換えて
+  `cargo update -p aozora_epub3_lite`
+- 設定 `convert.epub-font`: `auto` (既定。濁点注記のある小説だけ DMincho) /
+  `always` (本文全体を `DakutenAokinMincho` で組む。`U+3000` を描けない Reader 向け)
+- 検証: 該当小説 (pixiv n29131692) を組み込みエンジン + `always` で変換し、
+  `item/style/vertical_font.css` (`@font-face` + `body, p` ルール)・
+  `item/fonts/DMincho.ttf`・本文の `<link>`・OPF の manifest を確認
+
 ### 更新 (2026-09-15): v0.1.3 で Java 出力とほぼ完全一致
 
 Lite 側に資産注入の口が揃ったため、`src/epub_lite.rs` を組み込みエンジンの公開
