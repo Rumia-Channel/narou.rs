@@ -263,7 +263,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 | `set <host> [--cookie V] [--label L]` | そのホストの一覧を 1 件に置き換えて保存 (`--cookie` 省略時は標準入力) |
 | `add <host> [--cookie V] [--label L]` | 同じホストに資格情報を追加。**試行順は保存順で、追加分は末尾** |
 | `order <host> 2,1,3` | 現在の位置 (1 始まり) を新しい順に並べ替える。件数・重複は検証 |
-| `clear [host] [--index N]` | 1 サイト分 / `--index` で 1 件だけ / 引数なしですべて削除 |
+| `clear [host] [--index N]` | 1 サイト分 / `--index` で 1 件だけ (`host` 必須。省略時はエラー) / 引数なしですべて削除 |
 
 **保存形式**: `login_cookie` inventory に、**1 ホスト = 順序つき資格情報リスト** (`LoginCredential` の JSON 配列) を `enc:v1:<nonce>:<payload>` として暗号化保存 (SQLite 管理時は `app_state`、YAML/前方互換モードでは `.narou/login_cookie.yaml`)。並び順がそのまま試行順になる。鍵は `.narou/login.key` (初回作成、Unix では 0600) または `NAROU_RS_LOGIN_KEY` (base64)。ホスト名を AEAD の associated data に束ねるため別ホストへの流用は不可。旧形式 (プレーンな Cookie 文字列) は 1 件として読み取り、次回保存時に暗号化された新形式へ移行する。
 
@@ -275,7 +275,7 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 **Web UI**: 設定ページ「ログイン」タブで一覧・取り込み・直接登録・追加・1 件削除・並べ替え (上下ボタン)。取り込みはファイル選択 (FileReader) と貼り付けの両方に対応。API: `GET/DELETE /api/login`、`POST /api/login/import`、`POST /api/login/set`、`POST /api/login/add`、`POST /api/login/order`、`DELETE /api/login/{host}`、`DELETE /api/login/{host}/{index}`。
 
-**注意**: `narou login -h` のヘルプには `add` / `order` と `clear --index` がまだ載っていない。各操作は `LoginAction` (`src/commands/login.rs`) に実装済みで、ヘルプ表示のみ更新が必要。
+**ヘルプ**: トップレベル一覧と `narou login -h` は実装と同期している。`-h` の `<sub>` 一覧は `list`/`import`/`export`/`set`/`add`/`order`/`clear` を、Examples は `add`・`order`・`clear --index` を含む主要形を、オプション一覧は `--passphrase`/`--replace`/`--clear-text`/`--cookie`/`--label`/`--index` を表示する。
 
 ---
 

@@ -62,7 +62,7 @@ pub enum LoginAction {
         #[arg(long)]
         label: Option<String>,
     },
-    /// Reorder a host's credentials, e.g. `-- 1,2,0` (current positions).
+    /// Reorder a host's credentials, e.g. `2,1` (1-based current positions).
     Order {
         /// Request host whose order is being changed.
         host: String,
@@ -331,6 +331,12 @@ fn clear(store: &InventoryCookieStore, host: Option<&str>, index: Option<usize>)
             }
         }
         None => {
+            if index.is_some() {
+                return Err(NarouError::Login(
+                    "1 件だけ削除するときは対象のサイトを指定してください: narou login clear <host> --index N"
+                        .to_string(),
+                ));
+            }
             let count = store.credentials_by_host()?.len();
             store.clear_all()?;
             println!("ログイン情報をすべて削除しました ({count} サイト)。");
