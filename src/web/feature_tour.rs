@@ -100,6 +100,45 @@ const FEATURE_TOURS: &[FeatureTourEntry] = &[
             "narou diff --history / --restore で小説本文のバージョン履歴を参照・復元",
         ],
     },
+    FeatureTourEntry {
+        version: "0.4.3",
+        title: "Pixiv の小説・イラスト・漫画に対応",
+        body: "Pixiv の URL から作品を登録し、本文やページ画像を取得できるようになりました。",
+        items: &[
+            "小説・小説シリーズ・イラスト/漫画・漫画シリーズの URL に対応",
+            "挿絵や漫画のページ画像を保存。うごイラは対応するネイティブ版で APNG に変換",
+            "R18・ログイン限定作品は、先にログイン Cookie を登録してから取得",
+        ],
+    },
+    FeatureTourEntry {
+        version: "0.4.3",
+        title: "ログインが必要な作品を取得",
+        body: "保存したログイン Cookie を使い、ログイン壁に当たった作品の取得を再試行できます。",
+        items: &[
+            "同梱の narou_rs_login でブラウザから Cookie を取得。別端末からは書き出し・取り込みも可能",
+            "環境設定の「ログイン」タブや narou login で登録・管理。複数のログインは試行順を変更可能",
+            "保存した Cookie は暗号化。ログイン不要な作品には通常送信しない",
+        ],
+    },
+    FeatureTourEntry {
+        version: "0.4.3",
+        title: "ライブラリの検索が便利に",
+        body: "Web UI 右上のフィルター欄で、作品の URL や ID を貼り付けて探せます。",
+        items: &[
+            "作品 URL、なろうの N コード、数値の作品 ID・登録 ID で検索",
+            "従来のタイトル・タグ・作者などの検索も引き続き利用可能",
+        ],
+    },
+    FeatureTourEntry {
+        version: "0.4.3",
+        title: "更新時の GPL 版・通常版を選択",
+        body: "環境設定の Global タブで、今後のセルフアップデートで取得する版を選べます。",
+        items: &[
+            "GPL 版は AozoraEpub3_Lite を組み込み、通常版は外部 AozoraEpub3 を利用",
+            "self-update.variant を GPL 版 / 通常版 / 未設定から選択。CLI の narou setting でも変更可能",
+            "未設定なら実行中のビルドと同じ版を取得",
+        ],
+    },
 ];
 
 pub async fn pending(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -318,6 +357,17 @@ mod tests {
                 .all(|entry| version_greater(entry.version, "0.2.0"))
         );
         assert!(entries.iter().any(|entry| entry.version == "0.2.3"));
+    }
+
+    #[test]
+    fn release_043_tours_appear_only_when_current_and_unseen() {
+        let before_release = pending_entries(Some("0.4.2"), "0.4.2");
+        assert!(before_release.is_empty());
+
+        let new_entries = pending_entries(Some("0.4.2"), "0.4.3");
+        assert_eq!(new_entries.len(), 4);
+        assert!(new_entries.iter().all(|entry| entry.version == "0.4.3"));
+        assert!(pending_entries(Some("0.4.3"), "0.4.3").is_empty());
     }
 
     #[test]
