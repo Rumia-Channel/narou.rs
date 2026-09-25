@@ -133,6 +133,7 @@ async fn api_list_inner(
             suspend: record.suspend,
             length: record.length,
             toc_url: record.toc_url,
+            ncode: record.ncode,
             general_all_no: record.general_all_no,
         })
         .collect();
@@ -169,6 +170,7 @@ mod tests {
             suspend: false,
             length: Some(1234),
             toc_url: "https://example.com".to_string(),
+            ncode: Some("n1234ab".to_string()),
             general_all_no: Some(99),
         };
 

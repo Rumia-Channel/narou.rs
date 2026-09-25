@@ -187,6 +187,10 @@ function parseFilterToken(rawToken) {
   const token = rawToken.trim();
   const negate = token.startsWith('-') || token.startsWith('^') || token.startsWith('!');
   const body = negate ? token.slice(1) : token;
+  // A pasted URL is a plain search value, not an "https:" field token.
+  if (/^https?:\/\//i.test(body)) {
+    return { negate, field: '', value: body.trim().toLowerCase() };
+  }
   const colon = body.indexOf(':');
   const field = colon > 0 ? body.slice(0, colon).toLowerCase() : '';
   const value = (colon > 0 ? body.slice(colon + 1) : body).trim().toLowerCase();
@@ -240,6 +244,17 @@ function matchFilterToken(novel, token) {
     statusText,
     ...tags,
   ].join(' ');
+  // The same identities the server-side search accepts: a pasted page URL, the
+  // N-code or numeric id in it, and the record id itself.
+  const pageUrl = target(novel.toc_url).replace(/\/+$/, '');
+  const urlSegment = pageUrl.split('/').pop() || '';
+  const matchIdentity = (value) => {
+    if (!value) return false;
+    if (value.includes('://')) return pageUrl.includes(value.replace(/\/+$/, ''));
+    return String(novel.id) === value
+      || target(novel.ncode).includes(value)
+      || urlSegment === value;
+  };
 
   switch (token.field) {
     case 'tag':
@@ -265,8 +280,8 @@ function matchFilterToken(novel, token) {
       break;
     default:
       matched = values.length > 0
-        ? values.some(v => plainText.includes(v))
-        : plainText.includes(token.value);
+        ? values.some(v => plainText.includes(v) || matchIdentity(v))
+        : plainText.includes(token.value) || matchIdentity(token.value);
       break;
   }
 

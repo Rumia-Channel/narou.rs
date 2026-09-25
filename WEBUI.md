@@ -117,6 +117,13 @@ narou.rb WEB UI と Rust版 WEB UI の要素・動作・レイアウトの互換
 | クリアボタン | `#myFilter-clear` (.glyphicon-remove-circle) | `#filter-clear` (×) | ✅ |
 | placeholder | "Filter" | "Filter" | ✅ |
 | タグフィルタ構文 | `tag:xxx` | `tag:xxx` | ✅ |
+| URL / Nコード / 数値ID 検索 | — | 貼り付けた URL (`https://ncode.syosetu.com/n0421du/`)、Nコード (`n0421du`)、URL 末尾の数値 ID (`16818093093698047858`)、レコード ID (`3`) | ✅ |
+
+一致規則はサーバ側の検索 (`/api/list` の `search[value]`) と同じで、URL は
+レコードの `toc_url` に対する部分一致（末尾 `/` は無視）、Nコードは
+`ncode` の部分一致または `toc_url` 最終セグメントとの完全一致、数値 ID は
+レコード ID との完全一致。`-`/`^`/`!` の否定、`|` の OR、`tag:` / `author:` /
+`site:` / `title:` / `status:` / `id:` のフィールド指定も同じ入力欄で使える。
 
 ---
 
