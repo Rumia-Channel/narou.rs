@@ -91,7 +91,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - **書き出し形式**: `narou_login_export.yaml` は version 2（`credentials:` に順序付きリスト）。version 1（`cookies:` の host → Cookie 文字列）も読み込める。
 - **Cookie の取得範囲**: サイト自身・親ドメイン・兄弟サブドメインを含むドメイン群の Cookie を保存する。Pixiv のように `.pixiv.net` にセッションを置くサイトでは、`www.pixiv.net` だけを見ると取り落とす。親ドメインの Cookie はサブドメイン宛のリクエストにも `CookieStore::load` がマージして送り、`Set-Cookie` も同じキーへ書き戻す。
 - **ブラウザプロファイル**: `narou_rs_login` はサイトごとの固定プロファイル（`%TEMP%/narou-rs-login/<domain>`、`--profile` で変更可）を使い回すため、次回以降もログイン状態が残る。Cookie 取得後は対象 URL に一度アクセスし、サイト定義の `error_message` / `login_pattern` に一致すればログインできていない可能性を警告する。
-- 配布物: `narou_rs_login` もリリース zip に同梱する（`scripts/package-release.ps1` の `-LoginBinaryPath`、`.github/workflows/release.yml` の helper build / sign / package、`cargo local-build` のすべてに対応済み）。Windows では他のサブ実行ファイルと同じく署名対象に含める。
+- 配布物: `narou_rs_login` もリリース zip に同梱する（`scripts/package-release.ps1` の `-LoginBinaryPath`、`.github/workflows/release.yml` の helper build / sign / package、`cargo local-build` のすべてに対応済み）。Windows では他のサブ実行ファイルと同じく署名対象に含める。`scripts/package-release.ps1` は `-Platform win` のとき本体・updater・backup・login の Authenticode 署名を梱包前に検証し、未署名なら失敗する（`-SkipSignatureCheck` は署名できないローカル確認専用で、リリース CI からは指定しない）。
 
 ## Git 運用ルール
 - 通常の修正・軽微な機能追加・ドキュメント更新は `develop` 上で行う。作業開始前に現在ブランチと作業ツリーを確認し、`main` 上で直接作業しない。

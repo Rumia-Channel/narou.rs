@@ -27,7 +27,11 @@ param(
     [string]$CommitVersion,
 
     # Optional build variant tag appended to the archive name (e.g. "GPL").
-    [string]$Variant = ""
+    [string]$Variant = "",
+
+    # 署名検証を省く。署名できないローカル検証用の抜け道で、
+    # リリース CI では指定しない (未署名のまま配布する事故を防ぐ)。
+    [switch]$SkipSignatureCheck
 )
 
 Set-StrictMode -Version Latest
@@ -53,6 +57,30 @@ $resolvedUpdaterBinary = (Resolve-Path -Path $UpdaterBinaryPath).Path
 $resolvedBackupBinary = (Resolve-Path -Path $BackupBinaryPath).Path
 $resolvedLoginBinary = (Resolve-Path -Path $LoginBinaryPath).Path
 $resolvedOutputDir = (Resolve-Path -Path $OutputDir).Path
+
+# Windows 版は本体とサブ実行ファイルすべてに Authenticode 署名が要る。
+# 署名ジョブが成果物を落とした場合に未署名のまま zip へ入るのを防ぐため、
+# 梱包前に検証する。
+function Assert-WindowsBinarySigned {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $signature = Get-AuthenticodeSignature -FilePath $Path
+    if ($signature.Status -ne "Valid") {
+        throw "Windows binary is not signed: $Path (status: $($signature.Status))"
+    }
+}
+
+if ($Platform -eq "win" -and -not $SkipSignatureCheck) {
+    foreach ($windowsBinary in @(
+            $resolvedBinary,
+            $resolvedUpdaterBinary,
+            $resolvedBackupBinary,
+            $resolvedLoginBinary
+        )) {
+        Assert-WindowsBinarySigned -Path $windowsBinary
+    }
+}
+
 $variantSuffix = if ([string]::IsNullOrWhiteSpace($Variant)) { "" } else { "-$Variant" }
 $archiveName = "narou_rs_{0}_{1}{2}.zip" -f $Platform, $Arch, $variantSuffix
 $archivePath = Join-Path -Path $resolvedOutputDir -ChildPath $archiveName

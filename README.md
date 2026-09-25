@@ -61,6 +61,8 @@ narou/
 
 `narou_rs` は、実行ファイルの近くにある `webnovel/`、`preset/`、`commitversion` を参照します。これらを分離しないでください。
 
+Windows 版の zip に含まれる実行ファイル (`narou_rs.exe`、`narou_rs_updater.exe.new`、`narou_rs_backup.exe`、`narou_rs_login.exe`) は Authenticode 署名済みです。署名のないバイナリは梱包時に検出して失敗するため、リリース zip に未署名の実行ファイルは入りません。
+
 どちらの版も zip の展開後の手順は同じです。`self-update.variant` は今後のセルフアップデートで取得する版を決める設定で、実行中のバイナリは切り替わりません。Web UI の設定画面 (Global タブ) で選ぶか、`narou_rs setting self-update.variant=gpl` または `narou_rs setting self-update.variant=standard` で変更できます。
 
 Windows では、展開した `narou/` を `Path` に追加してから、小説を管理したいフォルダで `narou_rs init` を実行します。`$narouDir` は自分が zip を展開した `narou/` フォルダ、`$novelDir` は小説を管理したいフォルダに置き換えてください。
