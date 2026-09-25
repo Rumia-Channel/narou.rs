@@ -129,6 +129,12 @@ pub struct EpubBuildOptions {
     pub assets_dir: Option<PathBuf>,
     /// Java `-device kindle` 相当。
     pub kindle: bool,
+    /// 呼び出し側が足す EPUB 内アセット。
+    ///
+    /// 組み込みエンジン (Lite) には外部ツールのような `aozoraepub3dir` への
+    /// ファイル流し込みが無いので、濁点フォント (`style/vertical_font.css` +
+    /// `fonts/DMincho.ttf`) はここで渡す。
+    pub extra_assets: Vec<EpubAsset>,
 }
 
 /// 書き出し時に読み出す挿絵。
@@ -439,6 +445,11 @@ fn build_from_input(input: Input, options: &EpubBuildOptions) -> Result<EpubBuil
         title_page_markup.as_deref(),
     )
     .map_err(|error| NarouError::Conversion(format!("外字フォントを収集できません: {error}")))?;
+    for asset in &options.extra_assets {
+        if !epub_assets.iter().any(|existing| existing.path == asset.path) {
+            epub_assets.push(asset.clone());
+        }
+    }
 
     let title_page_selected = config.title_page_write && matches!(config.title_page_type, 1 | 2);
     let mut book = EpubBook::from_sections(metadata, sections)
@@ -523,6 +534,7 @@ mod tests {
             cover_from_first_image: false,
             assets_dir: None,
             kindle: false,
+            extra_assets: Vec::new(),
         }
     }
 
@@ -689,6 +701,7 @@ mod tests {
         assert!(embedded.inline_notes.contains_key("傍点"));
         assert!(embedded.block_inline_tags.contains_key("一字下げ"));
     }
+
 
 
 }

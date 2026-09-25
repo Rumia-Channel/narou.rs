@@ -758,6 +758,7 @@ impl OutputManager {
             cover_from_first_image: input_txt.parent().is_some_and(has_cover_image),
             assets_dir: crate::compat::aozora_assets_dir(),
             kindle: matches!(self.device, Device::Mobi),
+            extra_assets: super::dakuten_font::lite_font_assets(self.use_dakuten_font)?,
         };
         let build = crate::epub_lite::build_book(input_txt, &options)?;
 

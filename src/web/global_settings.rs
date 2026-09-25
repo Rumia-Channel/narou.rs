@@ -295,6 +295,14 @@ fn select_summaries_for_setting(name: &str, info: &VarInfo) -> Option<Vec<String
             "常に有効".to_string(),
             "常に無効".to_string(),
         ],
+        "convert.epub-font" => vec![
+            "自動 (濁点注記のある小説だけ)".to_string(),
+            "常に埋め込む".to_string(),
+        ],
+        "self-update.variant" => vec![
+            "GPL版（AozoraEpub3_Lite 組込み）".to_string(),
+            "通常版（外部 AozoraEpub3）".to_string(),
+        ],
         "webui.new-tag-color" => vec![
             "自動 (巡回)".to_string(),
             "緑".to_string(),

@@ -613,7 +613,9 @@ async fn generate_epub_on_demand(
         // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
         assets_dir: crate::compat::aozora_assets_dir(),
         kindle: false,
-    };
+            extra_assets: crate::converter::dakuten_font::lite_font_assets(false)
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+};
     let build_path = txt_path.clone();
     let build = tokio::task::spawn_blocking(move || {
         crate::epub_lite::build_book(&build_path, &options)

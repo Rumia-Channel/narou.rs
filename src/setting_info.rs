@@ -156,6 +156,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "server-basic-auth.password"
         | "server-ws-add-accepted-domains"
         | "server-add-accepted-hosts"
+        | "convert.epub-font"
         | "over18" => Some("global"),
 
         _ => None,
@@ -1092,6 +1093,13 @@ pub fn setting_variables() -> SettingVariables {
             sel(
                 "コンソール上でのANSIカラーを表示する方法の選択(Windowsのみ)。system: システムに任せる(デフォルト) / self: Narou.rbで処理",
                 vec!["system", "self"],
+            ),
+        ),
+        (
+            "convert.epub-font",
+            sel(
+                "EPUB の本文フォント。auto: 濁点注記のある小説だけ濁点フォント (DMincho) を使う / always: 常に DMincho を埋め込んで本文を組む (Reader が全角スペース等を描けない場合の回避策)",
+                vec!["auto", "always"],
             ),
         ),
         (
