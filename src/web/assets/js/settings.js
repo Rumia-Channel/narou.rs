@@ -634,7 +634,7 @@
     const data = {};
 
     // Checkboxes (normal boolean)
-    document.querySelectorAll('.switch-light input[type="checkbox"]').forEach(function(input) {
+    document.querySelectorAll('.switch-light input[type="checkbox"][data-name]').forEach(function(input) {
       data[input.dataset.name] = input.checked;
     });
 
@@ -655,21 +655,21 @@
     });
 
     // Selects (single)
-    document.querySelectorAll('select.setting-select:not([multiple])').forEach(function(sel) {
+    document.querySelectorAll('select.setting-select:not([multiple])[data-name]').forEach(function(sel) {
       const name = sel.dataset.name;
       const val = sel.value;
       data[name] = val === '' ? null : val;
     });
 
     // Selects (multiple)
-    document.querySelectorAll('select.setting-select[multiple]').forEach(function(sel) {
+    document.querySelectorAll('select.setting-select[multiple][data-name]').forEach(function(sel) {
       const name = sel.dataset.name;
       const selected = Array.from(sel.selectedOptions).map(function(opt) { return opt.value; });
       data[name] = selected.length > 0 ? selected.join(',') : null;
     });
 
     // Text inputs
-    document.querySelectorAll('input.setting-input[type="text"]').forEach(function(input) {
+    document.querySelectorAll('input.setting-input[type="text"][data-name]').forEach(function(input) {
       const name = input.dataset.name;
       const val = input.value.trim();
       data[name] = val === '' ? null : val;
