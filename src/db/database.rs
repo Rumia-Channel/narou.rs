@@ -220,6 +220,11 @@ impl Database {
             if let Some(max_id) = self.data.keys().max().copied() {
                 self.next_id = self.next_id.max(max_id.saturating_add(1));
             }
+            // 索引 (`by_toc_url` / `by_title`) はリレーショナル側の全件から作り直す。
+            // `get_by_toc_url` / `find_by_title` は索引しか見ないため、SQLite モードで
+            // 退避済みの `database_index.yaml` を引き継ぐと、既に登録済みの URL を
+            // 再度ダウンロードしたときに重複レコードができる。
+            self.index.reconcile(&self.data);
             return Ok(());
         }
         let raw = self
@@ -240,9 +245,8 @@ impl Database {
         if let Some(max_id) = self.data.keys().max().copied() {
             self.next_id = self.next_id.max(max_id.saturating_add(1));
         }
-        if !self.using_sqlite() {
-            self.index.reconcile(&self.data);
-        }
+        // SQLite モードは上で return するため、ここは YAML モードのみ。
+        self.index.reconcile(&self.data);
         Ok(())
     }
 
@@ -340,6 +344,9 @@ impl Database {
                 }
             }
             self.data = updated.into_iter().collect();
+            // 書き込み後も索引を実データへ追随させる (SQLite モードでは
+            // database_index.yaml を正として使えないため)。
+            self.index.reconcile(&self.data);
             if self.compat_active() {
                 self.index.flush(&self.inventory)?;
             }
@@ -584,6 +591,75 @@ mod tests {
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
         let db = Database::with_inventory(Inventory::new(temp.path().to_path_buf())).unwrap();
         assert_eq!(db.create_new_id(), 0);
+    }
+
+    /// SQLite モードでも、開き直した後に toc_url / title で引けること。
+    /// 索引をリレーショナル側のデータから作り直さないと、既に登録済みの URL を
+    /// もう一度ダウンロードしたときに重複レコードができる。
+    #[test]
+    #[cfg(feature = "native-runtime")]
+    fn sqlite_mode_looks_up_novels_by_toc_url_and_title_after_reopen() {
+        use crate::native::sqlite::state::{self, StorageMode};
+
+        let _global = crate::test_support::global_state_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        state::write_mode(&root.join(".narou"), StorageMode::Sqlite).unwrap();
+
+        let toc_url = "https://kakuyomu.jp/works/1177354055617350769";
+        let mut db = Database::with_root(root.clone()).unwrap();
+        db.update_records(|mut records| {
+            records.insert(1, lookup_test_record(1, "テスト作品", toc_url));
+            Ok((records, ()))
+        })
+        .unwrap();
+        drop(db);
+
+        // 新しいプロセスで開き直したのと同じ状態。
+        let reopened = Database::with_root(root).unwrap();
+        assert_eq!(
+            reopened.get_by_toc_url(toc_url).map(|record| record.id),
+            Some(1),
+            "toc_url lookup must survive a reopen in SQLite mode"
+        );
+        assert_eq!(
+            reopened.find_by_title("テスト作品").map(|record| record.id),
+            Some(1),
+            "title lookup must survive a reopen in SQLite mode"
+        );
+    }
+
+    #[cfg(feature = "native-runtime")]
+    fn lookup_test_record(id: i64, title: &str, toc_url: &str) -> NovelRecord {
+        NovelRecord {
+            id,
+            author: "作者".to_string(),
+            title: title.to_string(),
+            file_title: title.to_string(),
+            toc_url: toc_url.to_string(),
+            sitename: "カクヨム".to_string(),
+            novel_type: 1,
+            end: false,
+            last_update: Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap(),
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: None,
+            general_lastup: None,
+            last_mail_date: None,
+            tags: Vec::new(),
+            ncode: None,
+            domain: None,
+            general_all_no: None,
+            length: None,
+            suspend: false,
+            is_narou: false,
+            last_check_date: None,
+            convert_failure: false,
+            requires_login: false,
+            login_session: None,
+            extra_fields: Default::default(),
+        }
     }
 
     #[test]

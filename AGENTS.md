@@ -299,6 +299,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - P4b バージョン履歴 (novel_versions/_sections/_diffs) + `narou diff --history|--show|--restore|--merge-from`。update時自動snapshotはconvertフック経由
 - P4c オブジェクト格納: `objects`/`object_chunks` (BLOB + brotli + crc32) に小説データ・生成物を格納。native は FS ミラー + 読みフォールバック、worker は D1 のみ
 - 後方互換: 旧ライブラリからの自動取込と `narou db export-yaml` によるロールバックを保証。`narou setting narou-compat=true` で `.narou/*.yaml` を維持する前方互換モードあり (既定 OFF)。`export-yaml --in-place` は実位置へ書き戻して YAML モードへ復帰する
+- **索引は SQLite モードでも全件データから作り直す (2026-09 修正)**: `Database::refresh` / `update_records` はリレーショナル側のレコードから `IndexStore` を再構築する。`get_by_toc_url` / `find_by_title` はこの索引しか見ないため、退避済みの `database_index.yaml` をそのまま使うと登録済み URL の再ダウンロードが重複レコードになっていた (issue #30)。ファイル出力は従来どおり (`narou-compat` 時のみ書き出し、通常の SQLite モードでは書かない)
 
 ### プラットフォーム抽象化 (Phase 1-8 実装完了、2026-08)
 - **設計資料**: `docs/platform-abstraction.md` — Cloudflare Workers 対応のための全面プラットフォーム抽象化。Phase 4のsmall object / large asset境界、logical key、native mapping、remaining native FS、Phase 7のD1/Worker read-only adapter、Phase 8のQueue/crawler/scheduler境界も記録。
