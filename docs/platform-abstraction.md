@@ -344,6 +344,14 @@ Shared Downloader portability is preserved at the capability boundary:
 execution constructs a fresh Downloader per invocation; bundled site definitions
 are loaded from the Worker bundle rather than a second HTTP stack.
 
+Animated illustrations (Pixiv うごイラ) are assembled by
+`src/illustration_animation.rs`, which decodes JPEG/PNG frames and reads the
+frame archive. Both the `image` codecs and the ZIP reader sit behind the
+`illustration-animation` feature, which `native-runtime` enables. The Worker
+build leaves them out — the ZIP reader narou uses (default features: bzip2,
+zstd, lzma) does not build for wasm — so `assemble_animation` reports the
+archive as unsupported there and the callers keep the bytes they downloaded.
+
 Local D1 verification (`wrangler d1 migrations apply narou-rs --local`) applies
 all six migrations. Local smoke checks cover atomic job claiming, retryable
 transition clearing the lease, scheduler generation ownership, and rejection of
