@@ -133,47 +133,12 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
     Response::from_json(&value)
 }
 
-/// `ObjectStore` から取り込んだテキストと挿絵を、Lite の入力層へ渡すための
-/// メモリ実装。ファイルシステムを持たない wasm ではこの経路で EPUB を組む。
-#[derive(Debug)]
-struct MemorySource {
-    names: Vec<String>,
-    files: Vec<(String, Vec<u8>)>,
-}
-
-impl MemorySource {
-    fn new(text: String, mut images: Vec<(String, Vec<u8>)>) -> Self {
-        let mut files = vec![("novel.txt".to_string(), text.into_bytes())];
-        files.append(&mut images);
-        let names = files.iter().map(|(name, _)| name.clone()).collect();
-        Self { names, files }
-    }
-}
-
-impl narou_rs::epub_lite::FileSource for MemorySource {
-    fn list(&self) -> &[String] {
-        &self.names
-    }
-
-    fn open(
-        &self,
-        name: &str,
-    ) -> std::result::Result<Option<Box<dyn std::io::Read + Send>>, narou_rs::epub_lite::InputError>
-    {
-        Ok(self
-            .files
-            .iter()
-            .find(|(candidate, _)| candidate == name)
-            .map(|(_, bytes)| {
-                Box::new(std::io::Cursor::new(bytes.clone())) as Box<dyn std::io::Read + Send>
-            }))
-    }
-}
-
 /// GET /api/novels/:id/download.epub — build the EPUB from the stored
-/// converted text (`novel.txt` object) at download time and return it as the
-/// response body. Illustrations are read from the object store through a
-/// bounded prefetch so peak memory stays capped.
+/// converted text (`novel.txt` object) at download time and stream it as the
+/// response body: the book is written entry by entry and each chunk leaves as
+/// soon as it is produced, so the finished archive is never held in memory.
+/// Illustrations are prefetched first because the Lite build reads them for
+/// their dimensions, and the input source has no async read.
 async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Response> {
     if !authorized(&req, &env) {
         return Response::error("Unauthorized", 401);
@@ -217,25 +182,20 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         Err(_) => return Response::error("Stored text is not valid UTF-8", 500),
     };
 
-    // 挿絵は EPUB 書き出し時に同期的に解決する必要があるため先読みする。
-    // ここで持つ量がそのままピークになるので、合計バイト数で厳しく制限する
-    // (Workers の 128 MiB 予算: 先読み + 生成中の EPUB + 応答コピー + 本文)。
+    // 挿絵は Lite が構築時に寸法を読むため先読みが要る (入力源は同期 API で、
+    // D1 には範囲読み出しが無い)。ここで持つ量がピークになるので上限を守る。
+    // エントリ名は本文の参照と同じ相対パス (`挿絵/foo.jpg`) にする: Lite は
+    // この名前で解決するため、小説のプレフィックスを付けると一致しない。
     const MAX_IMAGES: usize = 512;
     const MAX_IMAGE_BYTES: usize = 24 * 1024 * 1024;
-    let mut prefetched: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut total = 0usize;
     let Ok(illust_prefix) = narou_rs::platform::ObjectPrefix::new(format!(
         "{}/挿絵",
-        keys.prefix()
+        keys.prefix().as_ref()
     )) else {
         return Response::error("Invalid illustration prefix", 500);
     };
-    // 挿絵は入力テキストの階層 (`<小説ディレクトリ>/挿絵/...`) にある前提で渡す。
-    let text_parent = text_key
-        .as_ref()
-        .rsplit_once('/')
-        .map(|(parent, _)| parent.to_owned())
-        .unwrap_or_default();
+    let mut prefetched: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut total = 0usize;
     let mut cursor = None;
     let mut truncated = false;
     loop {
@@ -244,26 +204,22 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         request.cursor = cursor.take();
         let page = match services.objects.list_page(&request).await {
             Ok(page) => page,
-            Err(_) => break,
+            Err(error) => {
+                return Response::error(&format!("Object store error: {error}"), 500);
+            }
         };
         for meta in page.objects {
+            let name = meta.key.as_ref().rsplit('/').next().unwrap_or_default().to_string();
+            if !narou_rs::epub_lite::is_supported_image(&name) {
+                continue;
+            }
             if prefetched.len() >= MAX_IMAGES {
                 truncated = true;
                 break;
             }
-            let key = meta.key;
-            let name = key.as_ref().rsplit('/').next().unwrap_or_default().to_string();
-            if !narou_rs::epub_lite::is_supported_image(&name) {
-                continue;
-            }
-            if let Ok(Some(bytes)) = services.objects.read_small(&key).await {
+            if let Ok(Some(bytes)) = services.objects.read_small(&meta.key).await {
                 total += bytes.len();
-                let entry = if text_parent.is_empty() {
-                    format!("挿絵/{name}")
-                } else {
-                    format!("{text_parent}/挿絵/{name}")
-                };
-                prefetched.push((entry, bytes));
+                prefetched.push((format!("挿絵/{name}"), bytes));
                 if total > MAX_IMAGE_BYTES {
                     truncated = true;
                     break;
@@ -279,16 +235,10 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         }
     }
     if truncated {
-        // 挿絵を落とした EPUB を「完全な作品」として返さない。Workers のメモリに
-        // 収まらない作品は、native 側の convert で作る必要がある。
-        console_log!(
-            "EPUB for novel {id} needs more than {} MiB of illustrations",
-            MAX_IMAGE_BYTES / 1024 / 1024
-        );
         return Response::error(
             format!(
-                "Illustrations exceed the Worker memory budget ({} MiB): \
-                 build this EPUB with the native convert instead",
+                "Illustrations exceed the Worker memory budget ({} images / {} MiB)",
+                MAX_IMAGES,
                 MAX_IMAGE_BYTES / 1024 / 1024
             ),
             413,
@@ -308,28 +258,115 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         extra_assets: Vec::new(),
     };
     let build = match narou_rs::epub_lite::build_book_from_source(
-        std::sync::Arc::new(MemorySource::new(text.clone(), prefetched)),
+        std::sync::Arc::new(MemorySource::new(text, prefetched)),
         &options,
     ) {
-        Ok(build) => build,
+        Ok(build) => std::sync::Arc::new(build),
         Err(error) => return Response::error(&format!("EPUB build failed: {error}"), 500),
     };
-    let mut body = Vec::new();
-    if let Err(error) =
-        narou_rs::epub_lite::stream_epub(&build.book, &mut body, |path| build.resolve(path))
-    {
-        return Response::error(&format!("EPUB write failed: {error}"), 500);
+    let sink = narou_rs::epub_lite::ChunkSink::new();
+    let writer = match build.book.stream_writer(sink.clone()) {
+        Ok(writer) => writer,
+        Err(error) => return Response::error(&format!("EPUB write failed: {error}"), 500),
+    };
+    let state = EpubStreamState {
+        writer: Some(writer),
+        sink,
+        build,
+    };
+    let stream = futures::stream::unfold(state, |mut state| async move {
+        loop {
+            if state.writer.is_none() {
+                return None;
+            }
+            let info = match state.writer.as_ref().and_then(|writer| writer.next_entry()) {
+                Some(info) => info,
+                None => {
+                    let writer = state.writer.take().expect("writer is present");
+                    if let Err(error) = writer.finish() {
+                        return Some((Err(stream_error(error)), state));
+                    }
+                    let tail = state.sink.take();
+                    return (!tail.is_empty()).then_some((Ok(tail), state));
+                }
+            };
+
+            let bytes = info
+                .asset_path
+                .as_deref()
+                .and_then(|path| state.build.resolve(path));
+
+            let Some(writer) = state.writer.as_mut() else {
+                return None;
+            };
+            if let Err(error) = writer.write_current(bytes.as_deref()) {
+                return Some((Err(stream_error(error)), state));
+            }
+            let chunk = state.sink.take();
+            if !chunk.is_empty() {
+                return Some((Ok(chunk), state));
+            }
+        }
+    });
+
+    worker::ResponseBuilder::new()
+        .with_header("Content-Type", "application/epub+zip")?
+        .with_header(
+            "Content-Disposition",
+            &format!("attachment; filename=\"novel-{id}.epub\""),
+        )?
+        .from_stream(stream)
+}
+
+fn stream_error(error: impl std::fmt::Display) -> worker::Error {
+    worker::Error::RustError(error.to_string())
+}
+
+/// `ObjectStore` から取り込んだテキストと挿絵を、Lite の入力層へ渡すための
+/// メモリ実装。ファイルシステムを持たない wasm ではこの経路で EPUB を組む。
+/// 挿絵のエントリ名は本文の参照と同じ相対パスにすること。
+#[derive(Debug)]
+struct MemorySource {
+    files: Vec<(String, Vec<u8>)>,
+    names: Vec<String>,
+}
+
+impl MemorySource {
+    fn new(text: String, mut images: Vec<(String, Vec<u8>)>) -> Self {
+        let mut files = vec![("novel.txt".to_string(), text.into_bytes())];
+        files.append(&mut images);
+        let names = files.iter().map(|(name, _)| name.clone()).collect();
+        Self { names, files }
+    }
+}
+
+impl narou_rs::epub_lite::FileSource for MemorySource {
+    fn list(&self) -> &[String] {
+        &self.names
     }
 
-    Ok(
-        worker::ResponseBuilder::new()
-            .with_header("Content-Type", "application/epub+zip")?
-            .with_header(
-                "Content-Disposition",
-                &format!("attachment; filename=\"novel-{id}.epub\""),
-            )?
-            .from_bytes(body)?,
-    )
+    fn open(
+        &self,
+        name: &str,
+    ) -> std::result::Result<
+        Option<Box<dyn std::io::Read + Send>>,
+        narou_rs::epub_lite::InputError,
+    > {
+        Ok(self
+            .files
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, bytes)| {
+                Box::new(std::io::Cursor::new(bytes.clone())) as Box<dyn std::io::Read + Send>
+            }))
+    }
+}
+
+/// 1 エントリずつ書き出しながら応答へ流すための状態。
+struct EpubStreamState {
+    writer: Option<narou_rs::epub_lite::EpubStreamWriter<narou_rs::epub_lite::ChunkSink>>,
+    sink: narou_rs::epub_lite::ChunkSink,
+    build: std::sync::Arc<narou_rs::epub_lite::EpubBuild>,
 }
 
 /// POST /api/jobs — plan a request, enqueue each discrete plan separately,
