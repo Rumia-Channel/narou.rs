@@ -51,13 +51,14 @@ native-runtime = [
 # engine. Binaries built with this feature are distributed under GPL-3.0;
 # see assets/aozora_lite/LICENSE.md. The Worker runtime enables it always.
 lite = ["dep:aozora_epub3_lite"]
-# At-rest credential decryption is needed on the Worker too (credentials may be
-# written by a native library); the AEAD stack is pure Rust, so only `base64`
-# and `chacha20poly1305` join this feature. Encryption needs a random source
-# (`getrandom`), which stays native for now.
+# At-rest credential decryption and encrypted-export import are needed on the
+# Worker too (credentials and envelopes may be written by a native library).
+# Argon2id, the AEAD stack and `getrandom` are all pure Rust, so they join this
+# feature; on wasm `getrandom` uses `crypto.getRandomValues` (`wasm_js`).
 worker-runtime = [
     "lite",
     "illustration-animation",
+    "dep:argon2",
     "dep:base64",
     "dep:chacha20poly1305",
     "dep:getrandom",

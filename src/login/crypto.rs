@@ -23,8 +23,7 @@ pub const AT_REST_PREFIX: &str = "enc:v1:";
 
 /// Associated data label for values encrypted at rest.
 const AT_REST_AAD: &str = "narou.rs/login-cookie";
-/// Associated data label for a portable export envelope (native transfer only).
-#[cfg(feature = "native-runtime")]
+/// Associated data label for a portable export envelope.
 pub(crate) const ENVELOPE_AAD: &str = "narou.rs/login-export";
 
 fn login_error(message: impl Into<String>) -> NarouError {
@@ -146,7 +145,6 @@ pub fn parse_key_base64(text: &str) -> Result<[u8; KEY_LEN]> {
 }
 
 /// Derive a key from a passphrase with Argon2id (19 MiB, t=2, p=1).
-#[cfg(feature = "native-runtime")]
 pub fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
     use argon2::{Algorithm, Argon2, Params, Version};
 
@@ -206,7 +204,6 @@ fn at_rest_aad(host: &str) -> String {
     format!("{AT_REST_AAD}:{host}")
 }
 
-#[cfg(all(test, feature = "native-runtime"))]
 /// 鍵の長さの扱い（`openssl rand -base64 24` 対応）を固定する。
 #[cfg(test)]
 mod length_tests {
