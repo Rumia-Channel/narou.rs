@@ -374,7 +374,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - ※米印変換、全角数字、ルビ、auto_join_line、各種文字変換も完全一致
 
 ### AozoraEpub3_Lite 組み込みエンジン (lite feature, 2026-09)
-- pin: `aozora_epub3_lite` = `c8c971f` (v0.1.6)。更新時は `Cargo.toml` の `rev` を書き換えて `cargo update -p aozora_epub3_lite`。
+- pin: `aozora_epub3_lite` = `214aabc` (v0.1.6)。更新時は `Cargo.toml` の `rev` を書き換えて `cargo update -p aozora_epub3_lite`。`214aabc` は wasm32-unknown-unknown で `SystemTime::now()` が panic していた問題（`dcterms:modified` の生成）を JS 時計で回避した修正を含む (`js-sys` は wasm 限定依存)。
 - 呼び出し側は書き出しを **1 エントリずつ**進められる (`EpubBook::stream_writer(sink)` → `next_entry()` / `write_current(bytes)` / `finish()`)。Worker の `download.epub` はこれと `worker::Response::from_stream` を組み合わせ、完成した EPUB を保持せずチャンクを流す (`ChunkSink` は `narou_rs::epub_lite` が提供)。挿絵は `LazyImageSource` に書き出し直前の 1 枚だけ注入する (構築はパス一覧しか読まないため先読み不要。列挙は 512 枚 / 1 枚 16 MiB で 413)。
 - 組み立ては Lite CLI (`main.rs::convert_input`) と同じ公開 API を使う。独自実装 (挿絵の連番化・外字フォント収集・UUID 生成) は持たない。
   - `config_for(aozoraepub3dir)` = `AozoraConfig::load_from_dirs([dir], <dir>/AozoraEpub3.ini)`。Java 版と同じ注記表・外字フォント・INI を読む。INI が無ければ `preset/AozoraEpub3.ini` 相当のフラグ。
