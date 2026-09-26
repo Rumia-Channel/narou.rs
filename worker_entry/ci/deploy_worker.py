@@ -109,6 +109,17 @@ def provision(target: str) -> dict[str, str]:
     return values
 
 
+def enable_read_replication(resources: dict[str, str]) -> None:
+    """D1 の read replication を有効にする（冪等・develop / production 共通）。
+
+    Sessions API を使わない限り全クエリは primary に行くため、有効化と
+    併せてアプリ側のセッション利用が前提になる（`build_ui` を参照）。
+    """
+    env = os.environ.copy()
+    env["NAROU_D1_DATABASE_ID"] = resources["database_id"]
+    run([sys.executable, "ci/enable_read_replication.py"], env=env)
+
+
 def render(target: str, resources: dict[str, str]) -> str:
     """`wrangler.ci.toml` を作り、D1 のデータベース名を返す。"""
     env = dict(os.environ)
@@ -261,6 +272,7 @@ def main() -> None:
     required("CLOUDFLARE_API_TOKEN")
 
     resources = provision(target)
+    enable_read_replication(resources)
     database = render(target, resources)
     run(
         [
