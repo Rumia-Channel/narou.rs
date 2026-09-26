@@ -48,10 +48,12 @@ native-runtime = [
 # engine. Binaries built with this feature are distributed under GPL-3.0;
 # see assets/aozora_lite/LICENSE.md. The Worker runtime enables it always.
 lite = ["dep:aozora_epub3_lite"]
-worker-runtime = ["lite"]
+worker-runtime = ["lite", "illustration-animation"]
 # Animated illustrations arrive as a frame archive and are assembled into an
-# APNG, which needs the image codecs and a ZIP reader. The portable (Worker /
-# wasm) build leaves both out and keeps the archive as it arrived.
+# APNG. The codecs (image: jpeg/png) and the ZIP reader are pure Rust, so the
+# portable (Worker / wasm) build enables them too; `zip` is pinned to the
+# deflate/flate2(zlib-rs) backend because its default features pull in C-backed
+# compressors that do not build for wasm32-unknown-unknown.
 illustration-animation = ["dep:image", "dep:zip"]
 
 [dependencies]
@@ -79,7 +81,7 @@ ua_generator = { git = "https://github.com/spider-rs/ua_generator.git", version 
 curl = { version = "0.4", features = ["static-ssl"], optional = true }
 indicatif = { version = "0.18", optional = true }
 encoding_rs = "0.8"
-zip = { version = "8.5", optional = true }
+zip = { version = "8.5", optional = true, default-features = false, features = ["deflate-flate2-zlib-rs"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "native-tls"], optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 similar = { version = "3.1", optional = true }

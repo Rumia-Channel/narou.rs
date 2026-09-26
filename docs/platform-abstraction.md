@@ -347,10 +347,13 @@ are loaded from the Worker bundle rather than a second HTTP stack.
 Animated illustrations (Pixiv うごイラ) are assembled by
 `src/illustration_animation.rs`, which decodes JPEG/PNG frames and reads the
 frame archive. Both the `image` codecs and the ZIP reader sit behind the
-`illustration-animation` feature, which `native-runtime` enables. The Worker
-build leaves them out — the ZIP reader narou uses (default features: bzip2,
-zstd, lzma) does not build for wasm — so `assemble_animation` reports the
-archive as unsupported there and the callers keep the bytes they downloaded.
+`illustration-animation` feature, which `native-runtime` and `worker-runtime`
+both enable. `zip` is pinned to `default-features = false` with the pure-Rust
+`deflate-flate2-zlib-rs` backend, because its default features pull in
+C-backed compressors (bzip2/zstd/lzma) that do not build for
+wasm32-unknown-unknown; with that pinning the assembly runs on the Worker too.
+A build without the feature keeps the downloaded archive and reports the
+archive as unsupported.
 
 Local D1 verification (`wrangler d1 migrations apply narou-rs --local`) applies
 all six migrations. Local smoke checks cover atomic job claiming, retryable

@@ -14,9 +14,11 @@
 //! frames of other formats fall back to the first decodable frame so the
 //! illustration is still usable.
 //!
-//! Decoding needs the `image` and `zip` crates, which the portable (Worker /
-//! wasm) build leaves out. There `assemble_animation` reports the archive as
-//! unsupported instead, so callers keep the bytes they downloaded.
+//! Decoding needs the `image` and `zip` crates. Both are pure Rust (`zip` は
+//! deflate/flate2(zlib-rs) のみを有効にしている)、ので portable (Worker / wasm)
+//! ビルドでも `worker-runtime` 経由で有効になっている。`illustration-animation`
+//! を外したビルドでは `assemble_animation` が未対応を返し、呼び出し側は取得した
+//! バイト列をそのまま保存する。
 
 #[cfg(feature = "illustration-animation")]
 use std::io::Read;
@@ -54,9 +56,9 @@ fn is_zip(bytes: &[u8]) -> bool {
     bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06")
 }
 
-/// Frame decoding and APNG assembly need the `zip` and `image` crates. The
-/// portable (Worker / wasm) build leaves both out; its callers keep the
-/// archive as it arrived and report this through their warning path.
+/// Frame decoding and APNG assembly need the `zip` and `image` crates.
+/// `illustration-animation` を外したビルドでは、呼び出し側が取得したアーカイブを
+/// そのまま保存し、警告経路でこの未対応を報告する。
 #[cfg(not(feature = "illustration-animation"))]
 fn build_apng(_archive: &[u8], _delays: &[u16]) -> Result<Vec<u8>> {
     Err(NarouError::Platform(

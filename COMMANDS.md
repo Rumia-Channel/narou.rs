@@ -169,7 +169,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - Pixiv の ncode はサイト定義の `ncode:` キーで `n` + 数値 (小説) / `s` + 数値 (小説シリーズ) / `a` + 数値 (イラスト・漫画) / `c` + 数値 (漫画シリーズ) を組み立てる。URL の数値だけでは作品種別をまたいで衝突するため
 - なろう式の ncode 判定 (`n\d+[a-z]+`) に当たらない ncode は、タイトル一致が無いときに ncode 一致で解決する (`n29204764` / `s16299140` などを `update` / `convert` の対象に指定できる)
 - Pixiv の挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は DSL の `fetch_json` で画像 URL を解決し (`[uploadedimage:]` は同じ応答から解決)、`illust_grep_pattern` が `挿絵/` へローカライズする。解決できなかった参照は `<!--...-->` の目印だけ残す
-- Pixiv のアニメーション挿絵（うごイラ）はフレーム ZIP として取得され、native 版 (`illustration-animation` feature、既定で有効) では APNG に組み立てて `挿絵/` へ保存する。Worker / wasm ポータブル版は image/zip 依存を持たないため ZIP のまま保存する
+- Pixiv のアニメーション挿絵（うごイラ）はフレーム ZIP として取得され、`illustration-animation` feature（native と Worker の両方で有効）で APNG に組み立てて `挿絵/` へ保存する。`zip` は wasm でも動くよう純 Rust の deflate バックエンドに絞ってある
 - サイト定義の `min_interval:` でサイトごとの最低リクエスト間隔 (秒) の下限を宣言でき、該当サイトのレートリミットスコープにだけ適用される
 - サイト定義の `headers:` キーで任意のリクエストヘッダを宣言できる (Pixiv は画像ホスト用に `Referer`、ハーメルン R18 は Cloudflare challenge 回避用に `Sec-Fetch-*` を指定)。値は `\k<...>` 補間され、危険な名前・値は無視される
 - リダイレクトを自前で辿るモード (`resolve_final_url`) も curl ティアを先に試す。CDN challenge 下のホストでは reqwest が 403 でも libcurl が 200 を返すことがあるため

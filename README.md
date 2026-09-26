@@ -335,7 +335,7 @@ narou_rs login clear                                      # すべて削除
 - サイトごとの取得・抽出ルールは `webnovel/*.yaml` を使います。ユーザーがこの YAML を編集すると、挙動もそれに追従します。
 - 保存データや設定ファイルは [narou.rb](https://github.com/whiteleaf7/narou) 互換の YAML / ディレクトリ構成を重視しています。
 - Pixiv は本文・目次・作品情報を `/ajax/*` の JSON から取得します (`webnovel/www.pixiv.net.yaml`)。挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は画像 URL を追加 API から解決して `挿絵/` に取り込みます。ログイン限定作品やログインでしか全部見えない作品一覧は、保存したログイン Cookie を順に試して再取得します。
-- Pixiv のイラスト・漫画 (`/artworks/A`) と漫画シリーズ (`/user/U/series/S`) も扱えます。イラストは 1 話・本文がページ画像のみの作品として、漫画シリーズは各作品を 1 話とする連載として登録し、画像は `挿絵/` に取り込みます。うごイラ (フレーム集約 zip) は、ネイティブ版では APNG に組み立てて取り込みます。APNG 化に必要なコーデックは `illustration-animation` feature にあり、`native-runtime` が有効にします。Worker / wasm 版では組み立てず、取得した zip をそのまま保存します。R18 作品はログインしていないと一覧に現れないため、含むシリーズは先に `narou_rs_login` で Cookie を保存してください。
+- Pixiv のイラスト・漫画 (`/artworks/A`) と漫画シリーズ (`/user/U/series/S`) も扱えます。イラストは 1 話・本文がページ画像のみの作品として、漫画シリーズは各作品を 1 話とする連載として登録し、画像は `挿絵/` に取り込みます。うごイラ (フレーム集約 zip) は APNG に組み立てて取り込みます。APNG 化に必要なコーデックは `illustration-animation` feature にあり、native と Worker の両方で有効です（`zip` は wasm でも動くよう純 Rust の deflate バックエンドに絞っています）。R18 作品はログインしていないと一覧に現れないため、含むシリーズは先に `narou_rs_login` で Cookie を保存してください。
 - 変換結果は青空文庫向け整形を基準にし、設定や device 指定に応じて追加出力を行います。
 - `update` は `general_lastup`、差分 cache、strong update、freeze などの挙動を持ちます。
 - `web` は localhost 利用を基本にしています。非 loopback で公開する場合は認証設定を行ってください。

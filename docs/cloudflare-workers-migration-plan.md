@@ -121,7 +121,7 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 
 - サイト YAML はビルド時埋め込みのみでユーザー差し替え不可（`SiteDefinitionProvider` は空実装）。
 - `setting_core` の `VarType::Directory` が `fs::canonicalize` を呼ぶ（`src/setting_core.rs:216,357`）。
-- APNG 挿絵（うごイラ）は wasm で無効で zip のまま保存（`Cargo.toml:55`）。
+- APNG 挿絵（うごイラ）は **Worker でも組み立てる**。`zip` を `default-features = false` + 純 Rust の deflate バックエンドに絞ることで wasm32-unknown-unknown でビルドでき、`worker-runtime` から `illustration-animation` を有効にした（実測: `image` (jpeg/png) + `zip` + `miniz_oxide` が wasm でコンパイル通過。native のユニットテスト 6 件も green）。
 - D1 に content mirror（`novel_outputs` / `novel_sections`）とバージョン履歴テーブルが無い。
   ※ 新設計では本文そのものをセクション行として持つ（P0d）ので、`novel_sections` 相当は必須になる。
 - Web UI は約 100 ルート（`src/web/mod.rs:567-640`）と `/ws` push。Worker 側に配信機構が無い。
@@ -175,7 +175,6 @@ Browser ──► Worker (fetch)
 | AozoraEpub3 jar / kindlegen / 外部 diff ツール | 同上（EPUB は Lite で代替済み） |
 | `folder` / `browser` / `login`(ブラウザ起動) / タスクトレイ | `501` |
 | `shutdown` / `reboot` / self-update / `narou db` 保守 | `501` |
-| APNG 挿絵 | zip のまま保存（native で convert した場合のみ APNG 化） |
 
 ---
 
@@ -261,8 +260,9 @@ npx wrangler deploy --config wrangler.ci.toml --secrets-file <json>
 - **S3 のバケット構成**: 1 バケット + prefix（環境同居）を既定とする。本番だけ別バケットにするかは
   P0e の実測後に決める。
 - **D1 の `objects`/`object_chunks` の扱い**: 本文の移行後もしばらく残す。削除（容量回収）は P4 の判断。
-- **APNG 挿絵**: wasm では zip 展開ができないため、うごイラは当面 zip のまま保存する
-  （native で変換した場合のみ APNG 化）。`miniz_oxide` 直叩きは P4 以降。
+- **APNG 挿絵**: `zip` の feature を純 Rust 構成に絞ったため Worker でも組み立て可能（`worker-runtime` が
+  `illustration-animation` を有効化済み）。フレーム数 × サイズ分の CPU/メモリを使うため、フレーム数と
+  合計バイト数に上限を設けて `cpu_ms` 内に収める（Paid プラン前提で運用）。
 - **バージョン履歴 / diff**: D1 にテーブルが無いため、P3 で `diff` を出すなら先にスキーマを追加する。
 - **ユーザー YAML の差し替え**: P1 でストア経由の読み込みに戻すが、UI から編集させるかは別判断。
 - **未コミットの移行ツール** (`worker_entry/src/object_migration.rs` + `lib.rs` の配線): P0d の
