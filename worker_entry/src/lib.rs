@@ -7,6 +7,7 @@ mod convert;
 mod global_settings;
 mod websocket;
 mod webui;
+mod push_hub;
 mod login;
 mod secrets;
 mod sites;

@@ -23,10 +23,14 @@ use narou_rs::application::{
 };
 use narou_rs::downloader::Downloader;
 use narou_rs::error::{NarouError, Result};
+use serde_json::json;
 use worker::{console_log, Env, Message, MessageBatch, MessageExt, QueueRetryOptionsBuilder};
 
 use crate::composition::WorkerRuntime;
 use crate::executor::{execute_job, JobOutcome};
+use crate::push_hub::{
+    broadcast_terminal_events, echo, event, notification_queue, PushHubClient,
+};
 
 /// Bounded retry budget: after this many retryable attempts a job is
 /// durably failed as `permanent`. There is no blanket retry-to-success.
@@ -39,6 +43,12 @@ fn retry_delay_secs(attempt: u32) -> u32 {
         .min(60)
 }
 
+/// Queue consumer におけるイベント配信。ジョブの台帳が変わるたびに
+/// (reject / 再キュー追加) キュー表示を更新させる。
+async fn notify_queue_changed(push: &PushHubClient) {
+    push.broadcast_best_effort(&[notification_queue()]).await;
+}
+
 /// Process a queue batch. Builds a fresh runtime and Downloader per
 /// invocation so no mutable state is shared across event handlers.
 pub async fn process_batch(
@@ -46,16 +56,28 @@ pub async fn process_batch(
     env: &Env,
 ) -> Result<()> {
     let runtime = WorkerRuntime::build(env).await.map_err(worker_error)?;
+    let push = PushHubClient::new(env, runtime.subrequests.clone());
     let mut downloader = runtime.new_downloader().await?;
     for message in message_batch.messages().map_err(worker_error)? {
-        process_envelope(&runtime, &mut downloader, message.body(), &message).await?;
+        process_envelope(&runtime, &mut downloader, &push, message.body(), &message).await?;
     }
     Ok(())
+}
+
+/// 台帳へ reject を書き込んだあと、キュー表示の更新を通知する
+/// (best-effort — 失敗しても処理は止めない)。
+async fn notify_rejected(push: &PushHubClient, message_id: &str, reason: &str) {
+    push.broadcast_best_effort(&[
+        echo(&format!("キュー投入を拒否しました ({message_id}): {reason}"), "stdout"),
+        notification_queue(),
+    ])
+    .await;
 }
 
 async fn process_envelope(
     runtime: &WorkerRuntime,
     downloader: &mut Downloader,
+    push: &PushHubClient,
     value: &serde_json::Value,
     message: &Message<serde_json::Value>,
 ) -> Result<()> {
@@ -75,6 +97,7 @@ async fn process_envelope(
                     let reason = format!("malformed v2 envelope: {error}");
                     console_log!("rejecting envelope {}: {reason}", message.id());
                     runtime.ledger.record_rejected(&message.id(), &reason).await?;
+                    notify_rejected(push, &message.id(), &reason).await;
                     message.ack();
                     return Ok(());
                 }
@@ -92,6 +115,7 @@ async fn process_envelope(
                 );
                 console_log!("rejecting envelope {}: {reason}", message.id());
                 runtime.ledger.record_rejected(&message.id(), &reason).await?;
+                notify_rejected(push, &message.id(), &reason).await;
                 message.ack();
                 return Ok(());
             }
@@ -106,12 +130,13 @@ async fn process_envelope(
                             format!("ledger has no row for queued job {}", envelope.job_id);
                         console_log!("rejecting envelope {}: {reason}", message.id());
                         runtime.ledger.record_rejected(&message.id(), &reason).await?;
+                        notify_rejected(push, &message.id(), &reason).await;
                         message.ack();
                         return Ok(());
                     }
                 },
             };
-            process_discrete(runtime, downloader, envelope.job_id, &plan, message).await
+            process_discrete(runtime, downloader, push, envelope.job_id, &plan, message).await
         }
         1 => {
             // Legacy envelope: one `JobRequest` body. Only a request that
@@ -124,6 +149,7 @@ async fn process_envelope(
                     let reason = format!("malformed v1 envelope: {error}");
                     console_log!("rejecting envelope {}: {reason}", message.id());
                     runtime.ledger.record_rejected(&message.id(), &reason).await?;
+                    notify_rejected(push, &message.id(), &reason).await;
                     message.ack();
                     return Ok(());
                 }
@@ -131,12 +157,13 @@ async fn process_envelope(
             match decode_legacy_envelope(&request) {
                 LegacyEnvelopeOutcome::Plan(job) => {
                     let queued = runtime.ledger.enqueue(job).await?;
-                    process_discrete(runtime, downloader, queued.job_id, &queued.job, message)
-                        .await
+                    notify_queue_changed(push).await;
+                    process_discrete(runtime, downloader, push, queued.job_id, &queued.job, message).await
                 }
                 LegacyEnvelopeOutcome::Reject { reason } => {
                     console_log!("rejecting legacy envelope {}: {reason}", message.id());
                     runtime.ledger.record_rejected(&message.id(), &reason).await?;
+                    notify_rejected(push, &message.id(), &reason).await;
                     message.ack();
                     Ok(())
                 }
@@ -146,6 +173,7 @@ async fn process_envelope(
             let reason = format!("unsupported envelope version {other}");
             console_log!("rejecting envelope {}: {reason}", message.id());
             runtime.ledger.record_rejected(&message.id(), &reason).await?;
+            notify_rejected(push, &message.id(), &reason).await;
             message.ack();
             Ok(())
         }
@@ -155,6 +183,7 @@ async fn process_envelope(
 async fn process_discrete(
     runtime: &WorkerRuntime,
     downloader: &mut Downloader,
+    push: &PushHubClient,
     job_id: JobId,
     job: &JobPlan,
     message: &Message<serde_json::Value>,
@@ -182,6 +211,23 @@ async fn process_discrete(
         }
     };
 
+    // 開始イベント: コンソールへ 1 行出し、キュー表示を更新させる。
+    // (native は subprocess の出力をそのまま echo する — worker では
+    // 実行本体が echo を吐かないので、consumer が節目の行を組み立てる)
+    push.broadcast_best_effort(&[
+        echo(
+            &format!(
+                "ジョブ {job_id} ({}: {}) を開始します",
+                job.kind.as_str(),
+                job.target.as_str()
+            ),
+            "stdout",
+        ),
+        event("queue_start", json!(job_id.as_str())),
+        notification_queue(),
+    ])
+    .await;
+
     let outcome = if job.kind == JobKind::Convert {
         // Convert は保存済みデータだけを見るので Downloader を使わない。
         crate::convert::execute_convert(runtime, job).await
@@ -194,6 +240,7 @@ async fn process_discrete(
             &runtime.subrequests,
             &runtime.ledger,
             &execution_token,
+            push,
         )
         .await
     };
@@ -208,6 +255,12 @@ async fn process_discrete(
                     None,
                 )
                 .await?;
+            broadcast_terminal_events(
+                push,
+                &job_id,
+                &[event("queue_complete", json!(job_id.as_str()))],
+            )
+            .await;
             message.ack();
         }
         JobOutcome::Partial {
@@ -220,6 +273,23 @@ async fn process_discrete(
                 .yield_for_continuation(&job_id, &execution_token, &checkpoint)
                 .await?;
             runtime.enqueue_plan(job.clone()).await?;
+            broadcast_terminal_events(
+                push,
+                &job_id,
+                &[
+                    echo(
+                        &format!(
+                            "ジョブ {job_id} は一部未完了です (次回は途中から再開します): {reason}"
+                        ),
+                        "stdout",
+                    ),
+                    event(
+                        "queue_partial",
+                        json!({ "job_id": job_id.as_str(), "reason": reason }),
+                    ),
+                ],
+            )
+            .await;
             message.ack();
         }
         JobOutcome::Blocked { reason } => {
@@ -233,6 +303,12 @@ async fn process_discrete(
                 )
                 .await?;
             console_log!("job {job_id} blocked: {reason}");
+            broadcast_terminal_events(
+                push,
+                &job_id,
+                &failure_events(&job_id, &reason),
+            )
+            .await;
             message.ack();
         }
         JobOutcome::Permanent { reason } => {
@@ -246,25 +322,86 @@ async fn process_discrete(
                 )
                 .await?;
             console_log!("job {job_id} failed permanently: {reason}");
+            broadcast_terminal_events(
+                push,
+                &job_id,
+                &failure_events(&job_id, &reason),
+            )
+            .await;
             message.ack();
         }
         JobOutcome::Retryable { reason } => {
-            retry_or_ack(runtime, &job_id, &execution_token, message, reason).await?;
+            match settle_retryable(runtime, &job_id, &execution_token, &reason).await? {
+                RetryDisposition::Rescheduled { attempts, delay } => {
+                    let options = QueueRetryOptionsBuilder::new()
+                        .with_delay_seconds(delay)
+                        .build();
+                    broadcast_terminal_events(
+                        push,
+                        &job_id,
+                        &[event(
+                            "queue_retry",
+                            json!({
+                                "job_id": job_id.as_str(),
+                                "retry_count": attempts,
+                                "max_retries": MAX_RETRYABLE_ATTEMPTS,
+                                "backoff_secs": delay,
+                                "available_at": (js_sys::Date::now() / 1000.0) as i64
+                                    + i64::from(delay),
+                                "reason": reason,
+                            }),
+                        )],
+                    )
+                    .await;
+                    message.retry_with_options(&options);
+                }
+                RetryDisposition::Exhausted { reason } => {
+                    broadcast_terminal_events(
+                        push,
+                        &job_id,
+                        &failure_events(&job_id, &reason),
+                    )
+                    .await;
+                    message.ack();
+                }
+            }
         }
     }
     Ok(())
 }
 
-async fn retry_or_ack(
+/// `queue_failed` + コンソール echo — Blocked / Permanent / リトライ枯渇の
+/// 共通イベント列 (native `JobOutcome::Failed` 相当)。
+fn failure_events(job_id: &JobId, reason: &str) -> Vec<serde_json::Value> {
+    vec![
+        echo(
+            &format!("ジョブ {job_id} が失敗しました: {reason}"),
+            "stdout",
+        ),
+        event(
+            "queue_failed",
+            json!({ "job_id": job_id.as_str(), "reason": reason }),
+        ),
+    ]
+}
+
+/// `Retryable` を台帳へ記録し、まだ試行枠が残っているかを返す。
+/// メッセージの ack/retry は呼び出し側がイベント送信のあとに行う
+/// (イベントを先に流さないと UI が再試行の前にキューを見逃す)。
+enum RetryDisposition {
+    Rescheduled { attempts: u32, delay: u32 },
+    Exhausted { reason: String },
+}
+
+async fn settle_retryable(
     runtime: &WorkerRuntime,
     job_id: &JobId,
     execution_token: &str,
-    message: &Message<serde_json::Value>,
-    reason: String,
-) -> Result<()> {
+    reason: &str,
+) -> Result<RetryDisposition> {
     let attempts = runtime
         .ledger
-        .record_attempt(job_id, execution_token, &reason)
+        .record_attempt(job_id, execution_token, reason)
         .await?;
     if attempts >= MAX_RETRYABLE_ATTEMPTS {
         let exhausted = format!("retries exhausted after {attempts} attempts: {reason}");
@@ -278,18 +415,14 @@ async fn retry_or_ack(
             )
             .await?;
         console_log!("job {job_id} permanently failed: {exhausted}");
-        message.ack();
+        Ok(RetryDisposition::Exhausted { reason: exhausted })
     } else {
         let delay = retry_delay_secs(attempts);
         console_log!(
             "job {job_id} retryable (attempt {attempts}), re-queueing in {delay}s: {reason}"
         );
-        let options = QueueRetryOptionsBuilder::new()
-            .with_delay_seconds(delay)
-            .build();
-        message.retry_with_options(&options);
+        Ok(RetryDisposition::Rescheduled { attempts, delay })
     }
-    Ok(())
 }
 
 fn worker_error(error: impl std::fmt::Display) -> NarouError {

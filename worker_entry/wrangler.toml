@@ -74,9 +74,19 @@ max_concurrency = 4
 name = "RATE_LIMITER"
 class_name = "SiteRateLimiter"
 
+# Web UI のコンソール/進捗イベントを WebSocket 接続へ配信する hub。
+# メモリ上の履歴リングバッファのみ (ストレージは使わない)。
+[[durable_objects.bindings]]
+name = "PUSH_HUB"
+class_name = "PushHub"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SiteRateLimiter"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["PushHub"]
 
 # 毎分実行。planner の D1 checkpoint が設定された HHMM スケジュールの到来を
 # 判定し、1 回の実行を 1 ページに制限する。

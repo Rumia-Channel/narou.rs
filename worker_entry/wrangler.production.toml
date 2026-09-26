@@ -81,9 +81,18 @@ max_concurrency = 4
 name = "RATE_LIMITER"
 class_name = "SiteRateLimiter"
 
+# Web UI のコンソール/進捗イベントを WebSocket 接続へ配信する hub (メモリのみ)。
+[[durable_objects.bindings]]
+name = "PUSH_HUB"
+class_name = "PushHub"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SiteRateLimiter"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["PushHub"]
 
 __CUSTOM_DOMAIN_BLOCK__
 [triggers]

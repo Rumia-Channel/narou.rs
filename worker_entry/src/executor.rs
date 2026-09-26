@@ -26,6 +26,7 @@ use narou_rs::downloader::{
 use narou_rs::error::{NarouError, Result};
 
 use crate::budget::{SubrequestBudget, WorkerBudget};
+use crate::push_hub::{echo, HubProgress, PushHubClient};
 
 /// Bounded wall-clock budget per job. It is checked only before starting the
 /// next section, so a section's fetch and persistence remain atomic from the
@@ -105,6 +106,7 @@ pub async fn execute_job(
     subrequests: &SubrequestBudget,
     ledger: &std::sync::Arc<crate::ledger::D1JobLedger>,
     execution_token: &str,
+    push: &PushHubClient,
 ) -> JobOutcome {
     if let Some(reason) = unsupported_reason(job) {
         return JobOutcome::Blocked { reason };
@@ -125,6 +127,14 @@ pub async fn execute_job(
             Err(reason) => return JobOutcome::Permanent { reason },
         };
 
+    // 進捗バーを PushHub 経由で UI へ (native の WebProgress 相当)。
+    // topic は job kind、scope は job id — consumer が終端で同じ scope の
+    // progressbar.clear を送って消す。
+    downloader.set_progress(Box::new(HubProgress::new(
+        push.clone(),
+        job.kind.as_str(),
+        job_id.as_str(),
+    )));
     let mut budget = WorkerBudget::new(JOB_TIME_BUDGET, subrequests).with_checkpoints(
         ledger.clone(),
         job_id.clone(),
@@ -146,6 +156,11 @@ pub async fn execute_job(
             console_log!(
                 "job {job_id}: invalid resume checkpoint ({reason}); restarting from section 0"
             );
+            push.broadcast_best_effort(&[echo(
+                &format!("再開チェックポイントが不正です ({reason})。先頭から実行し直します"),
+                "stdout",
+            )])
+            .await;
             let mut restart_budget = WorkerBudget::new(JOB_TIME_BUDGET, subrequests);
             downloader
                 .download_novel_with_execution_options(

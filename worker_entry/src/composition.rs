@@ -493,8 +493,8 @@ fn services_from(
 /// Readiness probe: every required binding and configuration must be real.
 ///
 /// - D1 answers `SELECT 1`
-/// - `NAROU_JOBS` queue producer and `RATE_LIMITER` Durable Object
-///   namespace are bound
+/// - `NAROU_JOBS` queue producer, `RATE_LIMITER` Durable Object namespace,
+///   and the `PUSH_HUB` Durable Object bindings are bound
 /// - full composition (bundled site definitions parse and compile)
 ///
 /// Nothing here performs network I/O; a missing binding or config fails
@@ -516,6 +516,7 @@ pub async fn check_ready(env: &Env) -> worker::Result<()> {
     }
     env.queue(JOB_QUEUE_BINDING)?;
     env.durable_object("RATE_LIMITER")?;
+    env.durable_object("PUSH_HUB")?;
     // Full composition validates bundled sites and all adapters.
     WorkerRuntime::build(env).await.map(|_| ())
 }
