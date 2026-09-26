@@ -106,7 +106,7 @@ new_sqlite_classes = ["SiteRateLimiter"]
 
 [[migrations]]
 tag = "v2"
-new_classes = ["PushHub"]
+new_sqlite_classes = ["PushHub"]
 
 __CUSTOM_DOMAIN_BLOCK__
 [triggers]
