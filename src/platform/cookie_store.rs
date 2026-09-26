@@ -11,9 +11,11 @@
 
 use std::collections::BTreeMap;
 
+use crate::login::KEY_LEN;
+
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{NarouError, Result};
 use crate::platform::PlatformFuture;
 
 /// One stored login credential (a `Cookie:` header captured for a site).
@@ -298,6 +300,106 @@ pub fn cookie_host_for_url(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
+/// Give every credential an id, returning whether anything changed.
+///
+/// Ids are generated on platforms that have a random source; a platform
+/// without one (wasm) keeps whatever id came with the data, which the
+/// downloader tolerates (it falls back to the first entry).
+pub fn assign_credential_ids(stored: &mut BTreeMap<String, Vec<LoginCredential>>) -> bool {
+    #[cfg(not(feature = "native-runtime"))]
+    {
+        let _ = stored;
+        false
+    }
+    #[cfg(feature = "native-runtime")]
+    {
+        let mut changed = false;
+        for credentials in stored.values_mut() {
+            for credential in credentials.iter_mut() {
+                if credential.id.is_empty()
+                    && let Ok(id) = crate::login::new_credential_id()
+                {
+                    credential.id = id;
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+}
+
+/// Normalize a credential before it is stored: surrounding space is never
+/// meaningful in a `Cookie:` header, and an empty one is not a credential.
+pub fn tidy_credentials(credentials: &[LoginCredential]) -> Vec<LoginCredential> {
+    credentials
+        .iter()
+        .filter_map(|credential| {
+            let cookie = credential.cookie.trim();
+            if cookie.is_empty() {
+                return None;
+            }
+            let mut credential = credential.clone();
+            credential.cookie = cookie.to_string();
+            #[cfg(feature = "native-runtime")]
+            if credential.id.is_empty()
+                && let Ok(id) = crate::login::new_credential_id()
+            {
+                credential.id = id;
+            }
+            Some(credential)
+        })
+        .collect()
+}
+
+/// 親ドメインも含めたキーから、そのホストで使える資格情報を組み立てる。
+pub fn merge_credentials_for(
+    stored: &BTreeMap<String, Vec<LoginCredential>>,
+    host: &str,
+) -> Vec<LoginCredential> {
+    let mut credentials: Vec<LoginCredential> = Vec::new();
+    for key in cookie_lookup_hosts(host) {
+        let Some(entries) = stored.get(&key) else {
+            continue;
+        };
+        for credential in entries {
+            if !credentials.iter().any(|seen| seen.same_cookie(credential)) {
+                credentials.push(credential.clone());
+            }
+        }
+    }
+    credentials
+}
+
+/// Decode the at-rest payload of one host map (`value_yaml` of the
+/// `login_cookie` inventory row) into credentials per host.
+///
+/// Values are either `enc:v1:<nonce>:<payload>` (needs `key`) or plaintext
+/// written by an older build. Hosts are normalized and entries that decode to
+/// nothing are dropped, mirroring the native store.
+pub fn decode_stored_credentials(
+    payload: &str,
+    key: Option<&[u8; KEY_LEN]>,
+) -> Result<BTreeMap<String, Vec<LoginCredential>>> {
+    if payload.trim().is_empty() || payload.trim() == "{}" {
+        return Ok(BTreeMap::new());
+    }
+    let raw: BTreeMap<String, String> = serde_yaml::from_str(payload)
+        .map_err(|error| NarouError::Platform(format!("malformed stored credentials: {error}")))?;
+    let mut stored = BTreeMap::new();
+    for (host, value) in raw {
+        let host = normalize_cookie_host(&host);
+        let plain = match crate::login::decrypt_stored_value(key, &host, &value)? {
+            Some(plain) => plain,
+            None => value,
+        };
+        let credentials = decode_credentials(&plain, &host);
+        if !credentials.is_empty() {
+            stored.insert(host, credentials);
+        }
+    }
+    Ok(stored)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,4 +469,32 @@ mod tests {
         assert_eq!(pairs, vec![("a".into(), "1".into()), ("b".into(), "2".into())]);
         assert_eq!(format_cookie_header(&pairs), "a=1; b=2");
     }
+    #[test]
+    fn decodes_a_pinned_at_rest_payload() {
+        // native が書いた値 (固定ベクタ) をそのまま読めること = 保存形式の互換。
+        let payload = "novel18.syosetu.com: enc:v1:/cz1hgNv95D2AzmkgLEX7Wo0h0k0Ha+b:ffxRux2SuqGy4+2eDjupAP/AY4b3Go41UeMvY6aPvSEwCu21sRljTXThhmHfqN87c6+TwQjUqYivE9CBoVHzvg8LaPJhwHEdR1fUX1GDYiS4PdPn1YDmEPhd9HockmAVcdN9iqr7WLqA85pY9mIhqBvQySz3iVLVqhJMMrbnLsYZm0gEEnnljuI=\n";
+        let key = [7u8; 32];
+        let stored = decode_stored_credentials(payload, Some(&key)).unwrap();
+        let credentials = stored.get("novel18.syosetu.com").expect("host entry");
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0].cookie, "over18=yes;");
+        assert_eq!(credentials[0].label.as_deref(), Some("サイト A"));
+        assert_eq!(credentials[0].id, "11111111-2222-4333-8444-555555555555");
+        assert_eq!(credentials[0].host, "novel18.syosetu.com");
+
+        // 鍵が無いときは黙って空にせずエラーにする。
+        assert!(decode_stored_credentials(payload, None).is_err());
+    }
+
+    #[test]
+    fn decodes_legacy_plaintext_and_merges_parent_domains() {
+        let payload = "syosetu.com: \"over18=yes;\"\nnovel18.syosetu.com: \"over18=yes;\"\n";
+        let stored = decode_stored_credentials(payload, None).unwrap();
+        assert_eq!(stored.len(), 2);
+        // 親ドメインの値も引ける (同じ Cookie は 1 件に畳まれる)。
+        let merged = merge_credentials_for(&stored, "novel18.syosetu.com");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].cookie, "over18=yes;");
+    }
+
 }

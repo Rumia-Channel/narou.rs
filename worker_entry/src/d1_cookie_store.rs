@@ -1,0 +1,169 @@
+//! ログイン資格情報の D1 実装（`narou_rs::platform::CookieStore`）。
+//!
+//! 保存形式は native と同じで、`app_state(scope='inv', key='login_cookie')` の
+//! 1 行に「host → 値」の YAML マップを入れる。値は `enc:v1:...`（復号鍵は
+//! secret `NAROU_RS_LOGIN_KEY`、native の環境変数と同じ名前）か、旧ビルドが
+//! 書いた平文。native が書いた行をそのまま読めることが要件なので、形式を
+//! 変えない。
+//!
+//! 書き込みのうち `save_all` は wasm に乱数源が無いため未対応にしてある
+//! （値の暗号化に nonce が要る）。資格情報の取り込みや Set-Cookie の書き戻しは
+//! native 側で行う。Downloader が使うのは `load_all` だけなので、読めれば
+//! DL・更新は動く。
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use narou_rs::error::{NarouError, Result};
+use narou_rs::platform::{
+    CookieStore, LoginCredential, PlatformFuture, cookie_lookup_hosts, merge_credentials_for,
+};
+use worker::{D1Database, wasm_bindgen::JsValue};
+
+/// native と同じ inventory 名（`.narou/login_cookie.yaml` 相当）。
+pub const INVENTORY_NAME: &str = "login_cookie";
+/// `InventoryScope::Local` の永続化スコープ（`src/db/inventory.rs`）。
+const INVENTORY_SCOPE: &str = "inv";
+/// 復号鍵の secret 名。native の環境変数と同名にする。
+pub const LOGIN_KEY_SECRET: &str = "NAROU_RS_LOGIN_KEY";
+/// 復号鍵のバイト長（`narou_rs::login::KEY_LEN`）。
+const KEY_LEN: usize = 32;
+
+fn db_error(error: impl std::fmt::Display) -> NarouError {
+    NarouError::Platform(format!("D1 {INVENTORY_NAME}: {error}"))
+}
+
+/// D1 の `app_state` 1 行を介した資格情報ストア。
+#[derive(Debug, Clone)]
+pub struct D1CookieStore {
+    db: Arc<D1Database>,
+    key: Option<[u8; KEY_LEN]>,
+}
+
+impl D1CookieStore {
+    pub fn new(db: Arc<D1Database>, key: Option<[u8; KEY_LEN]>) -> Self {
+        Self { db, key }
+    }
+
+    /// secret から復号鍵を読む。未設定なら平文の行だけを扱う。
+    pub fn key_from_env(env: &worker::Env) -> Option<[u8; KEY_LEN]> {
+        let value = match env.secret(LOGIN_KEY_SECRET) {
+            Ok(value) => value.to_string(),
+            Err(_) => return None,
+        };
+        match narou_rs::login::parse_key_base64(&value) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                worker::console_log!("ignoring malformed {LOGIN_KEY_SECRET}: {error}");
+                None
+            }
+        }
+    }
+
+    /// 保存されている payload（`value_yaml`、無ければ `value_json`）を返す。
+    async fn load_payload(&self) -> Result<String> {
+        let row: Option<(Option<String>, Option<String>)> = self
+            .db
+            .prepare("SELECT value_yaml, value_json FROM app_state WHERE scope = ? AND key = ?")
+            .bind(&[
+                JsValue::from_str(INVENTORY_SCOPE),
+                JsValue::from_str(INVENTORY_NAME),
+            ])
+            .map_err(db_error)?
+            .first(None)
+            .await
+            .map_err(db_error)?;
+        let Some((yaml, json)) = row else {
+            return Ok("{}".to_string());
+        };
+        // `value_yaml` を正とし、移行前の行 (`value_json` のみ) も読めるようにする。
+        Ok(match yaml {
+            Some(yaml) if !yaml.trim().is_empty() && yaml.trim() != "{}" => yaml,
+            _ => json.unwrap_or_else(|| "{}".to_string()),
+        })
+    }
+
+    /// 保存されている生の YAML マップ（値は暗号化されたまま）。
+    async fn load_raw(&self) -> Result<BTreeMap<String, String>> {
+        let payload = self.load_payload().await?;
+        if payload.trim() == "{}" || payload.trim().is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        serde_yaml::from_str(&payload).map_err(|error| {
+            NarouError::Platform(format!("malformed {INVENTORY_NAME} payload: {error}"))
+        })
+    }
+
+    async fn save_raw(&self, map: &BTreeMap<String, String>) -> Result<()> {
+        let payload = serde_yaml::to_string(map).map_err(|error| {
+            NarouError::Platform(format!("cannot serialize {INVENTORY_NAME}: {error}"))
+        })?;
+        // 行が無いときは作る（`app_state` の主キーは (scope, key)）。
+        self.db
+            .prepare(
+                "INSERT INTO app_state (scope, key, value_yaml, value_json) VALUES (?, ?, ?, '{}')
+                 ON CONFLICT(scope, key) DO UPDATE SET value_yaml = excluded.value_yaml",
+            )
+            .bind(&[
+                JsValue::from_str(INVENTORY_SCOPE),
+                JsValue::from_str(INVENTORY_NAME),
+                JsValue::from_str(&payload),
+            ])
+            .map_err(db_error)?
+            .run()
+            .await
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    /// 復号して「host → 資格情報」を返す。
+    async fn load_decoded(&self) -> Result<BTreeMap<String, Vec<LoginCredential>>> {
+        let payload = self.load_payload().await?;
+        narou_rs::platform::decode_stored_credentials(&payload, self.key.as_ref())
+    }
+}
+
+impl CookieStore for D1CookieStore {
+    fn load_all<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<Vec<LoginCredential>>> {
+        Box::pin(async move {
+            let stored = self.load_decoded().await?;
+            Ok(merge_credentials_for(&stored, host))
+        })
+    }
+
+    fn save_all<'a>(
+        &'a self,
+        host: &'a str,
+        credentials: &'a [LoginCredential],
+    ) -> PlatformFuture<'a, Result<()>> {
+        let _ = (host, credentials);
+        // 値の暗号化には nonce（乱数）が要る。wasm 側に乱数源を配線するまでは
+        // native で取り込む運用にする（Downloader は load_all しか使わない）。
+        Box::pin(async move {
+            Err(NarouError::Unsupported(
+                "storing login credentials is not available on the Worker yet: \
+                 import them natively (they are read-only here)"
+                    .to_string(),
+            ))
+        })
+    }
+
+    fn clear<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let mut raw = self.load_raw().await?;
+            let mut changed = false;
+            for key in cookie_lookup_hosts(host) {
+                changed |= raw.remove(&key).is_some();
+            }
+            if changed {
+                // 値は保存されたまま（復号もしない）なので、暗号文はそのまま残る。
+                self.save_raw(&raw).await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn list(&self) -> PlatformFuture<'_, Result<BTreeMap<String, Vec<LoginCredential>>>> {
+        Box::pin(self.load_decoded())
+    }
+}

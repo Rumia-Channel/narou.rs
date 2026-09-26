@@ -28,9 +28,9 @@ pub mod url_policy;
 pub use clock::{Clock, SystemClock};
 pub use cookie_store::{
     CookieStore, LoginCredential, apply_set_cookie, assign_credential_ids, cookie_host_for_url,
-    cookie_lookup_hosts, decode_credentials, encode_credentials, format_cookie_header,
-    merge_cookie_headers, merge_credentials_for, merge_stored_cookies, normalize_cookie_host,
-    parse_cookie_header, tidy_credentials,
+    cookie_lookup_hosts, decode_credentials, decode_stored_credentials, encode_credentials,
+    format_cookie_header, merge_cookie_headers, merge_credentials_for, merge_stored_cookies,
+    normalize_cookie_host, parse_cookie_header, tidy_credentials,
 };
 pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
 pub use object_store::{

@@ -91,6 +91,75 @@ pub fn default_settings() -> Arc<dyn DownloaderSettings> {
     }
 }
 
+/// A `DownloaderSettings` snapshot built from values read ahead of time.
+///
+/// The trait is synchronous while Worker storage (D1) is asynchronous, so
+/// the caller loads `app_state` rows once per invocation and injects this
+/// immutable view. Local bools default to `false` when the key is absent —
+/// matching the native inventory behavior where an unset local setting has
+/// no default entry — and `over18` stays `None` when unset so the age
+/// confirmation path is preserved (the default `confirm` returns
+/// `NarouError::Unsupported`, which the executor turns into `Blocked`).
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotDownloaderSettings {
+    local: HashMap<String, bool>,
+    over18: Option<bool>,
+    section_hash_cache: HashMap<String, HashMap<String, String>>,
+}
+
+impl SnapshotDownloaderSettings {
+    pub fn new(
+        local: HashMap<String, bool>,
+        over18: Option<bool>,
+        section_hash_cache: HashMap<String, HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            local,
+            over18,
+            section_hash_cache,
+        }
+    }
+}
+
+impl DownloaderSettings for SnapshotDownloaderSettings {
+    fn local_setting_bool(&self, key: &str) -> bool {
+        self.local.get(key).copied().unwrap_or(false)
+    }
+
+    fn global_setting_optional_bool(&self, key: &str) -> Option<bool> {
+        match key {
+            "over18" => self.over18,
+            _ => None,
+        }
+    }
+
+    /// No-op (`Ok(())`): the trait is synchronous but D1 is asynchronous, so
+    /// a snapshot cannot write back. Global settings such as `over18` are
+    /// set on the Web UI / native side; the Worker only reads them.
+    fn save_global_setting_bool(&self, _key: &str, _value: bool) -> Result<()> {
+        Ok(())
+    }
+
+    fn download_use_subdirectory(&self) -> bool {
+        self.local_setting_bool("download.use-subdirectory")
+    }
+
+    fn load_section_hash_cache(&self) -> HashMap<String, HashMap<String, String>> {
+        self.section_hash_cache.clone()
+    }
+
+    /// No-op (`Ok(())`): the trait is synchronous but D1 is asynchronous, so
+    /// the updated cache is not persisted from here. The cache is advisory
+    /// (strong-update comparison); a stale or lost cache only re-downloads
+    /// sections instead of corrupting state.
+    fn save_section_hash_cache(
+        &self,
+        _cache: &HashMap<String, HashMap<String, String>>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Native capability: reads the `.narou` Inventory and prompts on the
 /// terminal. Preserves the historical CLI settings/decision behavior.
 #[cfg(feature = "native-runtime")]
@@ -175,5 +244,57 @@ impl DownloaderSettings for NativeDownloaderSettings {
 
     fn confirm(&self, message: &str, default: bool, nontty_default: bool) -> Result<bool> {
         Ok(crate::compat::confirm(message, default, nontty_default))
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_defaults_match_unset_settings() {
+        let settings = SnapshotDownloaderSettings::default();
+        assert!(!settings.local_setting_bool("update.strong"));
+        assert!(!settings.local_setting_bool("guard-spoiler"));
+        assert!(!settings.local_setting_bool("auto-add-tags"));
+        assert!(!settings.local_setting_bool("download.use-subdirectory"));
+        assert!(!settings.download_use_subdirectory());
+        assert_eq!(settings.global_setting_optional_bool("over18"), None);
+        assert!(settings.load_section_hash_cache().is_empty());
+    }
+
+    #[test]
+    fn snapshot_reads_supplied_values() {
+        let local = HashMap::from([
+            ("update.strong".to_string(), true),
+            ("guard-spoiler".to_string(), false),
+            ("download.use-subdirectory".to_string(), true),
+        ]);
+        let cache = HashMap::from([(
+            "42".to_string(),
+            HashMap::from([("1/section.txt".to_string(), "abc".to_string())]),
+        )]);
+        let settings = SnapshotDownloaderSettings::new(local, Some(true), cache.clone());
+        assert!(settings.local_setting_bool("update.strong"));
+        assert!(!settings.local_setting_bool("guard-spoiler"));
+        assert!(!settings.local_setting_bool("auto-add-tags"));
+        assert!(settings.download_use_subdirectory());
+        assert_eq!(settings.global_setting_optional_bool("over18"), Some(true));
+        assert_eq!(settings.global_setting_optional_bool("other"), None);
+        assert_eq!(settings.load_section_hash_cache(), cache);
+    }
+
+    #[test]
+    fn snapshot_save_methods_are_noop_and_confirm_is_unsupported() {
+        let settings = SnapshotDownloaderSettings::default();
+        assert!(settings.save_global_setting_bool("over18", true).is_ok());
+        assert!(settings.save_section_hash_cache(&HashMap::new()).is_ok());
+        // `confirm` keeps the trait default: no terminal on this platform, so
+        // the caller (executor) turns the Unsupported error into `Blocked`.
+        assert!(matches!(
+            settings.confirm("?", false, false),
+            Err(crate::error::NarouError::Unsupported(_))
+        ));
     }
 }

@@ -23,14 +23,8 @@ Phase 1-8 の抽象化（`docs/platform-abstraction.md`）で port の境界は�
 - ✅ 実装済み: queue 実行系 (`worker_entry/src/consumer.rs`, `executor.rs`)。D1 台帳での claim、予算
   (`WorkerBudget` + section 境界チェックポイント)、bounded retry、`JobKind::is_worker_executable()` による
   種別判定まで動く。
-- ❌ `src/downloader/security.rs:19-40` の `validate_public_url` が無条件に `to_socket_addrs` を呼ぶため、
-  wasm では **全 HTTP 経路が検証で落ちる** (`http_policy.rs:214,219,276`, `narou_api.rs:73`)。DL/更新は
-  実行まで進んで失敗する状態 (§2.2 #1)。
-- ❌ CookieStore は未注入 (§2.2 #3)。ログイン必須サイトは `Blocked` のまま。
-- ❌ downloader の設定は `WorkerDownloaderSettings` (`src/downloader/settings.rs:78-90`) = 全既定値、
-  小説単位の上書きも `HashMap::new()` (`worker_entry/src/composition.rs:161`)。D1 の設定は
-  Web API 用 (`SettingsService`) には載っているが downloader には渡っていない (§2.2 #4)。
-- ❌ サイト定義はビルド時埋め込みのみ (`EmptySiteDefinitionProvider`, `worker_entry/src/composition.rs:339`)。
+- ✅ URL 検証・資格情報・設定の 3 点は解消済み (§2.2 #1/#3/#4)。
+- ❌ サイト定義はビルド時埋め込みのみ (`EmptySiteDefinitionProvider`, `worker_entry/src/composition.rs`)。
 
 改訂の要点: 保存先を「**オブジェクト全体を D1 か S3 のどちらかに置く**」から
 「**データ種別ごとに置き場を固定し、バイナリだけを D1/S3 で切り替える**」へ変更した。
@@ -169,12 +163,22 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 
 | # | 穴 | 根拠 |
 |---|---|---|
-| 1 | **SSRF 検証が DNS 解決を要求**し、全 HTTP 経路が通る（wasm には getaddrinfo が無い） | `src/downloader/security.rs:30-36`, `src/downloader/http_policy.rs:214,219,276` |
+| 1 | ~~SSRF 検証が DNS 解決を要求~~ → **解決済み**: 構文検証を `platform::url_policy` に分離し、`HttpClient::validate_url` の実装が DNS の有無に応じて判定する（native=解決先まで、worker=構文とアドレスリテラル） | `src/platform/url_policy.rs`, `src/platform/http.rs`, `src/downloader/security.rs`, `worker_entry/src/http.rs` |
 | 2 | **Convert が Worker に存在しない**。EPUB の前提 `<prefix>/novel.txt` を書く実装が無く常に 409 | `src/lib.rs:14-15`, `worker_entry/src/lib.rs:203-211` |
-| 3 | **CookieStore 未注入**（`cookies: None`）でログイン必須サイトは必ず `Blocked` | `worker_entry/src/composition.rs:125-136` |
-| 4 | **設定が Worker に届かない**（`WorkerDownloaderSettings` は全既定値） | `src/downloader/settings.rs:76-80` |
+| 3 | ~~CookieStore 未注入~~ → **読取は解決**: `D1CookieStore` を `new_downloader` に注入（保存形式は native と同じ `app_state(inv, login_cookie)`）。書込 (`save_all`) は wasm に乱数源が無いため未対応＝資格情報の取込と Set-Cookie の書き戻しは native 側で行う | `worker_entry/src/d1_cookie_store.rs`, `worker_entry/src/composition.rs` |
+| 4 | ~~設定が Worker に届かない~~ → **解決**: `SnapshotDownloaderSettings` に `app_state` の `local`/`global`（`update.strong` / `guard-spoiler` / `auto-add-tags` / `download.use-subdirectory` / `over18`）と `inv` の section hash cache を起動時に読んで注入。書き戻しは同期 API と非同期 D1 の都合で no-op（`over18` は Web UI 側で設定） | `src/downloader/settings.rs`, `worker_entry/src/composition.rs` |
 | 5 | **デプロイ設定が未完**（`database_id` 未設定・secret 投入手順なし・CI にデプロイ無し） | `worker_entry/wrangler.toml`, `.github/workflows/platform.yml:45-70` |
 | 6 | **worker のテストが CI で 1 件も走らない** | 同上 |
+
+### 2.2.1 URL 検証の分担（2026-09-26 実装）
+
+- 純粋な構文検証（scheme / host / port / アドレスリテラルの公開判定）は `src/platform/url_policy.rs`。
+  `HttpClient::validate_url` の**既定実装**がこれを使うので、DNS を持たない wasm でも全 HTTP 経路が通る。
+- native は上書きして解決先アドレスまで確認する（`src/native/http.rs`, `downloader::security::validate_public_url`）。
+- 同期文脈（挿絵 URL の足切り、DSL の `fetch` ガード）は `is_safe_public_url_syntax` を使う。ホスト名の
+  解決先は見ないが、実際の取得時に transport が確認するので防御は 2 段のまま。
+- 資格情報の保存形式は変えていない（native が書いた `enc:v1:...` を worker が復号できることを固定ベクタの
+  テストで確認: `src/platform/cookie_store.rs` の `decodes_a_pinned_at_rest_payload`）。
 
 ### 2.3 その他の差分
 

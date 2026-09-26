@@ -4,6 +4,7 @@ mod budget;
 mod bundled_sites;
 mod composition;
 mod consumer;
+mod d1_cookie_store;
 mod d1_object_store;
 mod d1_repository;
 mod executor;

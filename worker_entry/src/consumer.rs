@@ -45,7 +45,7 @@ pub async fn process_batch(
     env: &Env,
 ) -> Result<()> {
     let runtime = WorkerRuntime::build(env).await.map_err(worker_error)?;
-    let mut downloader = runtime.new_downloader()?;
+    let mut downloader = runtime.new_downloader().await?;
     for message in message_batch.messages().map_err(worker_error)? {
         process_envelope(&runtime, &mut downloader, message.body(), &message).await?;
     }
