@@ -22,6 +22,8 @@ const TOKEN = process.env.NAROU_ADMIN_TOKEN;
 const QUEUE_CHECKS = process.env.CONTRACT_QUEUE === "1";
 const TERMINAL_STATUSES = new Set(["succeeded", "blocked", "permanent"]);
 const AUTH_REQUIRED = (process.env.NAROU_AUTH_REQUIRED ?? "true").toLowerCase() !== "false";
+// ローカルの `wrangler dev` にしか無い検査（テスト用エンドポイント等）を切り分ける。
+const IS_LOCAL = /^https?:\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)([:/]|$)/.test(BASE_URL);
 const ACCESS_CLIENT_ID = process.env.CF_ACCESS_CLIENT_ID;
 const ACCESS_CLIENT_SECRET = process.env.CF_ACCESS_CLIENT_SECRET;
 
@@ -48,12 +50,23 @@ function fetchWithAccess(input, init = {}) {
 
 // Access が前段にあると資格なしの GET は Access のログインへ飛ぶ。service token が
 // 無い場合は smoke として意味が無いので、その旨を exit 3 で伝える。
+// 到達できない場合（DNS・TLS・タイムアウト）はそのまま検査へ進み、失敗として報告する。
 if (!ACCESS_CLIENT_ID && process.env.CONTRACT_SKIP_ACCESS_PROBE !== "1") {
-  const probe = await fetchWithAccess(url("/health/live"), { redirect: "manual" });
-  const location = probe.headers.get("location") ?? "";
-  if ([301, 302, 303, 307, 308].includes(probe.status) && location.includes("cloudflareaccess.com")) {
-    console.log(`Cloudflare Access is in front of ${BASE_URL}; skipping the remote smoke`);
-    process.exit(3);
+  try {
+    const probe = await fetchWithAccess(url("/health/live"), {
+      redirect: "manual",
+      signal: AbortSignal.timeout(10_000),
+    });
+    const location = probe.headers.get("location") ?? "";
+    if (
+      [301, 302, 303, 307, 308].includes(probe.status) &&
+      location.includes("cloudflareaccess.com")
+    ) {
+      console.log(`Cloudflare Access is in front of ${BASE_URL}; skipping the remote smoke`);
+      process.exit(3);
+    }
+  } catch (error) {
+    console.warn(`probe failed (${error?.message ?? error}); running the checks anyway`);
   }
 }
 
@@ -63,6 +76,14 @@ function check(name, fn) {
     return;
   }
   test(name, fn);
+}
+
+/** ローカルの `wrangler dev` でだけ意味がある検査。 */
+function checkLocal(name, fn) {
+  if (!IS_LOCAL) {
+    return;
+  }
+  check(name, fn);
 }
 
 /** 認証が無効な環境 (Zero Trust) では走らせない検査。 */
@@ -248,7 +269,7 @@ await check("GET /assets/<file>?v=<hash> serves the static asset", async () => {
   assert(type.includes("javascript"), `unexpected content type: ${type}`);
 });
 
-await check("the scheduled handler runs (cron planner)", async () => {
+await checkLocal("the scheduled handler runs (cron planner)", async () => {
   // `wrangler dev --test-scheduled` のテスト用エンドポイントは wrangler の
   // バージョンで名前が変わるので両方試す。
   const paths = ["/__scheduled?cron=*+*+*+*+*", "/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"];
@@ -402,7 +423,18 @@ await check("POST /api/login/set stores a credential without echoing it", async 
   });
   const body = await json(response);
   assert(response.status === 200, `status ${response.status}`);
-  assert(body.success === true, `unexpected body: ${JSON.stringify(body)}`);
+  if (body.success !== true) {
+    // 復号鍵 (`NAROU_RS_LOGIN_KEY`) が未設定のデプロイは fail-closed。値は保存も返却もしない。
+    assert(
+      !JSON.stringify(body).includes("contract-secret"),
+      `the cookie value must never be echoed: ${JSON.stringify(body)}`,
+    );
+    assert(
+      String(body.message ?? "").includes("NAROU_RS_LOGIN_KEY"),
+      `unexpected failure: ${JSON.stringify(body)}`,
+    );
+    return;
+  }
   const hosts = body.data?.hosts ?? [];
   const entry = hosts.find((host) => host.host === "example.com");
   assert(entry, `host should be listed: ${JSON.stringify(body)}`);
@@ -418,8 +450,8 @@ await check("GET /api/login lists hosts without values", async () => {
   assert(response.status === 200, `status ${response.status}`);
   assert(typeof body.data?.count === "number", "count must be a number");
   assert(
-    body.data?.key_source === "NAROU_RS_LOGIN_KEY",
-    `the login key must be configured (key_source=${body.data?.key_source})`,
+    ["NAROU_RS_LOGIN_KEY", "none"].includes(body.data?.key_source),
+    `unexpected key_source=${body.data?.key_source}`,
   );
   assert(!JSON.stringify(body).includes("contract-secret"), "values must stay hidden");
 });

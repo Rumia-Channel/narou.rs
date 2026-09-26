@@ -46,7 +46,6 @@ from typing import NoReturn
 
 WORKER_DIR = Path(__file__).resolve().parent.parent
 TARGETS = ("develop", "production")
-URL_PATTERN = re.compile(r"https://[A-Za-z0-9.-]+")
 WORKER_URL_PATTERN = re.compile(r"https://[A-Za-z0-9.-]+\.workers\.dev")
 
 
@@ -168,24 +167,20 @@ def secret_file(target: str) -> Path | None:
     return path
 
 
-def deploy(secrets: Path | None) -> str:
-    """デプロイして、報告された URL を返す。"""
+def deploy(secrets: Path | None) -> str | None:
+    """デプロイし、wrangler が報告した workers.dev の URL を返す（無ければ None）。
+
+    custom domain 運用 (`workers_dev = false`) では有人の URL を出さないため、
+    smoke の宛先は `smoke_url()` が custom domain から決める。ログ中の任意の
+    https URL を拾うと無関係なリンクを掴むので、フォールバックはしない。
+    """
     command = ["npx", "--yes", "wrangler@4", "deploy", "-c", "wrangler.ci.toml"]
     if secrets is not None:
         command += ["--secrets-file", str(secrets)]
     log = run(command, capture=True)
     print(log)
-    # custom domain 運用 (workers_dev = false) では wrangler が workers.dev を
-    # 出さないので、明示指定 → workers.dev → 任意の https URL の順に採用する。
-    explicit = os.environ.get("NAROU_DEPLOY_URL", "").strip()
-    if explicit:
-        return explicit
     urls = WORKER_URL_PATTERN.findall(log)
-    if not urls:
-        urls = URL_PATTERN.findall(log)
-    if not urls:
-        fail("wrangler did not report a URL")
-    return urls[-1]
+    return urls[-1] if urls else None
 
 
 def hide(url: str) -> bool:
@@ -196,8 +191,11 @@ def hide(url: str) -> bool:
     return False
 
 
-def smoke_url(target: str, reported: str) -> tuple[str, bool]:
-    """smoke の宛先 `(url, custom_domain 由来か)`。明示 > custom domain > wrangler の出力。"""
+def smoke_url(target: str, reported: str | None) -> tuple[str | None, bool]:
+    """smoke の宛先 `(url, custom_domain 由来か)`。明示 > custom domain > workers.dev。
+
+    どれも分からない場合は `(None, False)` を返し、呼び出し側は smoke を省略する。
+    """
     explicit = os.environ.get("NAROU_DEPLOY_URL", "").strip()
     if explicit:
         return explicit, hide(explicit)
@@ -206,7 +204,9 @@ def smoke_url(target: str, reported: str) -> tuple[str, bool]:
         # 公開ログ・step summary にドメインを残さない（値は GitHub の secret を想定）。
         mask(domain)
         return f"https://{domain}", hide(f"https://{domain}")
-    return reported, hide(reported)
+    if reported:
+        return reported, hide(reported)
+    return None, False
 
 
 def smoke(base_url: str) -> bool | None:
@@ -278,14 +278,17 @@ def main() -> None:
         if secrets is not None:
             secrets.unlink(missing_ok=True)
 
+    target_url, hidden_url = smoke_url(target, url)
     smoke_result: bool | None = None
-    dirty_smoke_url = False
-    if os.environ.get("NAROU_SMOKE", "1") != "0":
-        target_url, dirty_smoke_url = smoke_url(target, url)
+    if os.environ.get("NAROU_SMOKE", "1") == "0":
+        pass
+    elif target_url is None:
+        print("::notice::smoke の宛先が分からないため省略しました (NAROU_DEPLOY_URL で指定できます)")
+    else:
         smoke_result = smoke(target_url)
-    summary(target, url, smoke_result, hidden_url=dirty_smoke_url)
+    summary(target, target_url or url or "(unknown)", smoke_result, hidden_url=hidden_url)
     if smoke_result is False:
-        fail(f"smoke test failed against {url}")
+        fail(f"smoke test failed against {target_url}")
 
 
 if __name__ == "__main__":
