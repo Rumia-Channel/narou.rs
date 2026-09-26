@@ -344,6 +344,10 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
   何も書かなければ全部 (a)（`NAROU_S3_ENDPOINT` / `REGION` / `BUCKET` が必須）。
 - `NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME` だけは (b) の中でも独立に
   選べる（S3 は (a) のままトークンだけストア、が可能）。
+- **ストア側の secret 名は自由**（既存のストアをそのまま使える）。`*_SECRET_NAME` に渡すのは
+  名前だけなので、`WASABI_*` のような既存名でも、narou.rs 側の識別子（`S3_*`）に揃えた名前でもよい。
+  変更が要るのは「どの名前を読むか」を書く GitHub 側だけ。ストアの ID と secret 名の一覧は
+  `wrangler secrets-store store list` / `wrangler secrets-store secret list <store-id>` で確認できる。
 
 - 手で置かない派生値: `NAROU_DEPLOY_TARGET`（workflow が設定）と
   `NAROU_D1_DATABASE_NAME` / `NAROU_D1_DATABASE_ID` / `NAROU_JOB_QUEUE` / `NAROU_JOB_DLQ`
