@@ -269,9 +269,18 @@ impl D1FreezeStore {
     }
 }
 
+/// isolate ごとの凍結 ID キャッシュ。一覧の描画や検索のたびに読んでいた
+/// ため (1 回 = D1 往復 1 回)、書き込み側 (`set_frozen`) で即時無効化し、
+/// 他の isolate は TTL で追従する。
+static FROZEN_IDS_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<HashSet<i64>>> =
+    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+
 impl FreezeStore for D1FreezeStore {
     fn frozen_ids<'a>(&'a self) -> PlatformFuture<'a, Result<HashSet<i64>>> {
         Box::pin(async move {
+            if let Some(cached) = FROZEN_IDS_CACHE.get("frozen") {
+                return Ok(cached);
+            }
             let rows: Vec<IdRow> = self
                 .db
                 .prepare("SELECT novel_id AS id FROM frozen_novels ORDER BY novel_id")
@@ -280,7 +289,9 @@ impl FreezeStore for D1FreezeStore {
                 .map_err(worker_error)?
                 .results()
                 .map_err(worker_error)?;
-            Ok(rows.into_iter().map(|row| row.id).collect())
+            let ids: HashSet<i64> = rows.into_iter().map(|row| row.id).collect();
+            FROZEN_IDS_CACHE.put("frozen", ids.clone());
+            Ok(ids)
         })
     }
 }
@@ -315,7 +326,9 @@ impl FreezeMutationStore for D1FreezeStore {
                 )?);
             }
             let results = self.db.batch(statements).await.map_err(worker_error)?;
-            ensure_batch_success(&results)
+            ensure_batch_success(&results)?;
+            FROZEN_IDS_CACHE.invalidate("frozen");
+            Ok(())
         })
     }
 }
@@ -433,9 +446,16 @@ impl D1TagColorStore {
     }
 }
 
+/// isolate ごとのタグ色キャッシュ (`TagColorStore::load` 参照)。
+static TAG_COLORS_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<TagColors>> =
+    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+
 impl TagColorStore for D1TagColorStore {
     fn load<'a>(&'a self) -> PlatformFuture<'a, Result<TagColors>> {
         Box::pin(async move {
+            if let Some(cached) = TAG_COLORS_CACHE.get("colors") {
+                return Ok(cached);
+            }
             let row = self
                 .db
                 .prepare("SELECT value_json FROM app_state WHERE scope = 'tag_colors' AND key = 'colors'")
@@ -450,6 +470,7 @@ impl TagColorStore for D1TagColorStore {
                     colors.set(&tag, &color);
                 }
             }
+            TAG_COLORS_CACHE.put("colors", colors.clone());
             Ok(colors)
         })
     }
@@ -470,7 +491,9 @@ impl TagColorStore for D1TagColorStore {
                 ),
                 vec![BindValue::Text(value)],
             )?;
-            ensure_batch_success(&self.db.batch(vec![statement]).await.map_err(worker_error)?)
+            ensure_batch_success(&self.db.batch(vec![statement]).await.map_err(worker_error)?)?;
+            TAG_COLORS_CACHE.invalidate("colors");
+            Ok(())
         })
     }
 }
