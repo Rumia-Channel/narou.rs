@@ -90,14 +90,41 @@ impl S3ObjectStore {
         env.secret(name).map(|secret| secret.to_string())
     }
 
+    /// 設定値の解決順: Secrets Store (`<name>_STORE`) → vars → secrets。
+    ///
+    /// Dantalian と同じく、endpoint / region / bucket も Secrets Store に置ける
+    /// (リポジトリと CI には名前しか残らない)。
+    async fn config_value(env: &Env, name: &str) -> Option<String> {
+        let binding = format!("{name}_STORE");
+        if let Ok(store) = env.secret_store(&binding)
+            && let Ok(Some(value)) = store.get().await
+            && !value.is_empty()
+        {
+            return Some(value);
+        }
+        if let Ok(value) = env.var(name) {
+            let value = value.to_string();
+            if !value.trim().is_empty() {
+                return Some(value);
+            }
+        }
+        env.secret(name)
+            .ok()
+            .map(|secret| secret.to_string())
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    async fn require_config(env: &Env, name: &str) -> worker::Result<String> {
+        Self::config_value(env, name)
+            .await
+            .ok_or_else(|| worker::Error::RustError(format!("{name} is not configured")))
+    }
+
     pub async fn from_env(env: &Env) -> worker::Result<Self> {
-        let endpoint = required_var(env, "S3_ENDPOINT")?;
-        let bucket = required_var(env, "S3_BUCKET")?;
-        let region = required_var(env, "S3_REGION")?;
-        let prefix = env
-            .var("S3_PREFIX")
-            .map(|value| value.to_string())
-            .unwrap_or_default();
+        let endpoint = Self::require_config(env, "S3_ENDPOINT").await?;
+        let bucket = Self::require_config(env, "S3_BUCKET").await?;
+        let region = Self::require_config(env, "S3_REGION").await?;
+        let prefix = Self::config_value(env, "S3_PREFIX").await.unwrap_or_default();
         let access_key_id = Self::secret_or_store(env, "S3_ACCESS_KEY_ID").await?;
         let secret_access_key = Self::secret_or_store(env, "S3_SECRET_ACCESS_KEY").await?;
         if access_key_id.is_empty() || secret_access_key.is_empty() {

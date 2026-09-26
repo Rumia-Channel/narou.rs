@@ -29,6 +29,9 @@ html_handling = "auto-trailing-slash"
 # 見つからないパスは Worker に流す (API の 404 を Worker が返す)。
 not_found_handling = "none"
 
+# Secrets Store を使う場合、render_config.py がここに [[secrets_store_secrets]] を差し込む。
+__SECRET_STORE_BLOCKS__
+
 [build]
 command = "node build_assets.mjs && worker-build --release"
 

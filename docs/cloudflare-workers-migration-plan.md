@@ -336,6 +336,29 @@ PWA Service Worker（製品機能として別判断）。
 - **切り戻し**: `wrangler versions` で前バージョンへ戻す、または `asset_backend` を `d1` に戻す。
   native 側の `小説データ/` は Worker から書き換えないため影響しない。
 
+### 2.2.11 挿絵バケットの指定方法（Dantalian 方式に対応, 2026-09-26）
+
+Dantalian は**バケットの値をどこにも書かない**。5 つの値（access key id / secret access key /
+endpoint / region / bucket）を Cloudflare Secrets Store に置き、`wrangler.<env>.toml` には
+`[[secrets_store_secrets]]` の `store_id`（非秘密のリソース ID）と `secret_name` の**プレースホルダ**だけを
+書き、CI は GitHub secrets に「Cloudflare 側の secret 名」を入れてレンダラに渡す。バケット実体は
+手動作成で、環境の分離は `dantalian/<target>` の prefix をレンダラが導出して行う。
+（`worker/ci/render_config.py`, `worker/wrangler.production.toml`, `worker/src/wasabi_config.rs`）
+
+narou.rs も同じ 2 モードを持つようにした:
+
+| | 値の置き場 | CI が渡すもの | prefix |
+|---|---|---|---|
+| (a) vars（既定） | `wrangler.<env>.toml` の `[vars]`（GitHub の `vars.NAROU_S3_*`） | endpoint / region / bucket の値 | `NAROU_S3_PREFIX`（既定 `narou/<target>`） |
+| (b) Secrets Store | Cloudflare Secrets Store（手動作成の 5 エントリ） | `NAROU_SECRETS_STORE_ID` と 5 つの `NAROU_S3_*_SECRET_NAME`（**名前だけ**） | レンダラが `narou/<target>` を導出 |
+
+- どちらでも `[vars] S3_ENDPOINT` 等は空になる（(b) の場合）か値が入る（(a)）。Worker 側は
+  `<変数名>_STORE`（Secrets Store）→ `env.var` → `env.secret` の順に解決する。
+- `CLOUDFLARE_ACCOUNT_ID` は Dantalian の綴り（`CLOUDFLARE_ACCOUT_ID`）でも動くようにした
+  （workflow 側で `||` で受ける）。
+- 検証: `ci/render_config.py` を両モードで実行し、`tomllib` で読み戻して
+  `[vars]`・`[[secrets_store_secrets]]` 5 件・prefix を確認（ローカル、Cloudflare 不要）。
+
 ### 2.3 その他の差分
 
 - サイト YAML はビルド時埋め込みのみでユーザー差し替え不可（`SiteDefinitionProvider` は空実装）。

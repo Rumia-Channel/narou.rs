@@ -400,6 +400,14 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   `global` (`over18`)、`inv` の section hash cache を起動時に読んで渡す。同期 API と非同期 D1 の
   都合で書き戻しは no-op。`over18` 未設定は `None` のままにして年齢認証 `Blocked` 経路を保つ。
 
+### 挿絵バケットの設定 (2026-09)
+
+- 2 モード: (a) `[vars]` に値を置く（既定）、(b) Cloudflare Secrets Store に値を置き、CI には
+  `NAROU_SECRETS_STORE_ID` と `NAROU_S3_*_SECRET_NAME`（名前だけ）を渡す。(b) は
+  `ci/render_config.py` が `[[secrets_store_secrets]]` を差し込み、prefix を `narou/<target>` に導出する。
+- Worker 側の解決順は Secrets Store (`<変数名>_STORE`) → `env.var` → `env.secret`。
+- 検証はローカルで `python ci/render_config.py` を両モード実行し `tomllib` で読み戻す。
+
 ### Worker の大きなオブジェクト (2026-09)
 
 - `GET /api/novels/{id}/illustrations/{name}` は、S3 構成なら presigned URL へ 302 して Worker を
