@@ -212,6 +212,23 @@ await check("GET /api/jobs/:id returns 404 for an unknown job", async () => {
   assert(response.status === 404, `status ${response.status}`);
 });
 
+await check("POST /api/download rejects an unknown target", async () => {
+  // native の api_download はリクエスト単位の失敗も HTTP 200 + success:false で返す。
+  const response = await request("/api/download", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ targets: ["not-a-novel-target"] }),
+  });
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(body.success === false, `unexpected body: ${JSON.stringify(body).slice(0, 200)}`);
+  assert(Array.isArray(body.results) && body.results.length === 0, "results must be empty");
+  assert(
+    typeof body.message === "string" && body.message.length > 0,
+    "the failure must explain itself",
+  );
+});
+
 await check("GET /api/webui/config returns the UI configuration", async () => {
   const response = await request("/api/webui/config", auth());
   assert(response.status === 200, `status ${response.status}`);

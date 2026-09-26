@@ -6,6 +6,7 @@
 //! Worker で実現できない操作（ローカル FS 前提など）は、成功を偽装せず 501 と
 //! 機械可読な code を返す。
 
+pub mod download;
 pub mod library_backup;
 pub mod list;
 pub mod ui_prefs;

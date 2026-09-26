@@ -59,6 +59,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         "/api/tag_list" => webui::queue::handle(req, env).await,
         "/api/queue/status" => webui::queue::handle(req, env).await,
         "/api/get_pending_tasks" => webui::queue::handle(req, env).await,
+        "/api/download" => webui::download::handle(req, env).await,
         "/ws" => websocket::handle(req, env).await,
         _ if path.starts_with("/api/novels/") => api_novel(req, env).await,
         _ if path.starts_with("/api/login/") => api_login_host(req, env).await,
