@@ -10,8 +10,8 @@ Phase 1-8 の抽象化（`docs/platform-abstraction.md`）で port の境界は�
 |---|---|
 | P0a 足回り (環境分離・プロビジョニング) | ✅ 完了 (`56d5feb`) |
 | P0b 署名と S3 アダプタ | ✅ 完了 (`23338ec`, `ed87fcd`) |
-| P0c 保存先の振り分け (SplitStore) | ❌ 未着手 (当初の「全オブジェクト切替」を差し替える) |
-| P0d D1→S3 移行 (バイナリのみ) | ◐ 実装済みだが未コミット。振り分け前提に作り直す |
+| P0c 保存先の振り分け (SplitStore) | ✅ 完了 (`SplitStore` + `asset_backend`、mock 2 系統で固定) |
+| P0d D1→S3 移行 (バイナリのみ) | ✅ 完了 (`/api/admin/object-migration`、core の `migrate_page` にテスト)。本文の行構造化は別項目 |
 | P0e 契約テスト + CI デプロイ | ◐ 契約テストは CI で実行 (`worker-contract`)。デプロイは手動トリガーの `worker-deploy` を用意（実アカウント実行は未検証） |
 | P1 取得系を閉じる | ◐ 実行系は実装済み。SSRF・Cookie・設定の 3 点が未了 |
 | P2 変換を Worker へ | ◐ 変換テキスト生成は完了 (`ConvertService`)。残りは device 出力 (MOBI 等) の扱い |
@@ -28,7 +28,7 @@ Phase 1-8 の抽象化（`docs/platform-abstraction.md`）で port の境界は�
 
 改訂の要点: 保存先を「**オブジェクト全体を D1 か S3 のどちらかに置く**」から
 「**データ種別ごとに置き場を固定し、バイナリだけを D1/S3 で切り替える**」へ変更した。
-当初の全切替 (`ed87fcd` の `object_backend`) は P0c で置き換える。
+当初の全切替 (`ed87fcd` の `object_backend`) は P0c で `asset_backend` に置き換え済み（挿絵だけが S3、他は D1）。
 
 ---
 
@@ -207,6 +207,30 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
   `job j... failed permanently: Platform error: 小説 999999999 がありません` が出ており、Convert の
   実行経路 (plan → queue → claim → ConvertService → 終端) が workerd 上で動くことを確認した。
 
+### 2.2.4 保存先の振り分け (P0c, 2026-09-26 実装)
+
+- `SplitStore` (`src/platform/split_store.rs`) が「挿絵（うごイラの APNG を含む）のバイナリだけ S3、
+  それ以外は D1」を 1 箇所で決める。`ObjectStore` / `AssetStore` の両方を実装し、キーで経路を選ぶ。
+- 挿絵判定は **末尾 2 セグメントが `挿絵/<画像拡張子>`**。小説ディレクトリ名が偶然 `挿絵` のとき
+  (`novels/<site>/挿絵/toc.yaml`) を巻き込まないため、拡張子まで見る。`.illustration_cache.yaml` は
+  メタデータなので D1 に残る。
+- 一覧は `<小説プレフィックス>/挿絵` の形だけ挿絵側へ回す（セグメント数でも区別）。
+- ストアをまたぐ `copy` / `move_or_copy` は経路が決まらないので明示的に失敗させる。
+- 切り替えは `app_state('inv','asset_backend')` (`d1` | `s3`)。`s3` で資格情報が欠けていれば起動を
+  失敗させる (fail-closed)。旧 `object_backend` は撤去した。
+- 検証: `src/platform/split_store.rs` のテストが振り分け（書き込み・読み出し・一覧・交差コピー拒否）と
+  判定規則を `MemoryObjectStore` 2 系統で固定する。
+
+### 2.2.5 挿絵の D1→S3 移行 (P0d, 2026-09-26 実装)
+
+- `asset_backend` を `s3` に切り替える**前に** `POST /api/admin/object-migration {"action":"copy"}` を
+  繰り返し呼ぶ。1 回 `limit` 件 (既定 100・上限 500) で区切り、`app_state` のカーソルで再開する。
+  `verify` は 1 件ずつ突き合わせ、欠落・不一致・上限超過を `failed` に集める。
+- 移行後も D1 側は消さない。`asset_backend` を `d1` に戻せば即座に元の経路へ戻せる。
+- コアは `narou_rs::platform::store_migration`。`MemoryObjectStore` 2 系統で「挿絵だけ動く」
+  「verify が欠落と不一致を報告する」を固定している。
+- 既知の制約: `verify` は 16 MiB を超えるオブジェクトを「上限超過」として報告する (bounded read と同値)。
+
 ### 2.3 その他の差分
 
 - サイト YAML はビルド時埋め込みのみでユーザー差し替え不可（`SiteDefinitionProvider` は空実装）。
@@ -291,7 +315,7 @@ CF Access を唯一のユーザー境界にする設計、音声向けの instan
 |---|---|---|
 | **P0a 足回り** ✅ | 環境分離テンプレート、`ci/render_config.py`、`ci/provision_resources.py`、ローカル設定の分離 | 3 環境がレンダリングでき、未解決プレースホルダと不正値を拒否する（検証済み） |
 | **P0b 署名と S3 アダプタ** ✅ | `s3_sigv4`（署名）、`s3_request`（URL + ListObjectsV2）、`s3_object_store`（ObjectStore/AssetStore） | botocore と一致する署名 9 ケース、wasm ビルド通過（検証済み） |
-| **P0c 挿絵を S3 へ** | core の `is_illustration_key`（`挿絵` セグメント判定、テスト付き）、`SplitStore`（core）、`composition` の差し替え、`asset_backend`（`d1`/`s3`）、当初の全切替 (`object_backend`) の撤去 | 挿絵だけが S3 に出て、他のキーは D1 に残る（mock 2 系統で固定）。`asset_backend` を戻せば旧経路で読める |
+| **P0c 挿絵を S3 へ** ✅ | core の `is_illustration_key`（`挿絵` セグメント + 拡張子判定、テスト付き）、`SplitStore`（core）、`composition` の差し替え、`asset_backend`（`d1`/`s3`）、`object_backend` の撤去 | 挿絵だけが S3 に出て、他のキーは D1 に残る（`MemoryObjectStore` 2 系統で固定）。`asset_backend` を `d1` に戻せば旧経路で読める |
 | **P0d 本文の構造化と移行** | セクション用 D1 テーブル（migration 追加）、**YAML を列へ分解して保存するアダプタ**（往復一致テスト）、raw を書かない経路、既存 YAML blob → 行の移行（再開可能 + `verify`） | 同じ小説で native と同一の EPUB / 変換出力が得られる。移行後も旧 blob 経路へ戻せる |
 | **P0e 契約テスト + CI** | `worker_entry/tests/*.mjs`（health / 認証 fail-closed / オブジェクト往復）、CI に worker テスト + `d1 migrations apply --remote` + deploy を追加 | ローカルと CI で契約テストが green、デプロイが 3 環境で通る |
 | **P1 取得系** | SSRF 検証の port 化、`DownloaderSettings` を D1 読みに、`CookieStore`(D1) 注入、`SiteDefinitionProvider` をストア経由に、`setting_core` の Directory 検証 port 化 | ログイン必須サイトを含む DL/更新が Worker で完走し、native と同じキー集合・本文バイトになる |
@@ -373,5 +397,7 @@ npx wrangler deploy --config wrangler.ci.toml --secrets-file <json>
   超えたら OOM ではなく明示エラーにし、呼び出し側は取得したアーカイブをそのまま保存する。
 - **バージョン履歴 / diff**: D1 にテーブルが無いため、P3 で `diff` を出すなら先にスキーマを追加する。
 - **ユーザー YAML の差し替え**: P1 でストア経由の読み込みに戻すが、UI から編集させるかは別判断。
-- **未コミットの移行ツール** (`worker_entry/src/object_migration.rs` + `lib.rs` の配線): P0d の
-  「テキスト blob → 行」「挿絵 blob → S3」に作り直す前提。それまでの間は作業ツリーに残す。
+- **移行ツール (挿絵)**: `worker_entry/src/object_migration.rs` + `lib.rs` の
+  `/api/admin/object-migration`。挿絵だけを D1 から S3 へ写し、`copy` / `verify` / `status` を持つ。
+  進捗は `app_state('inv','migrate_illustrations')` のカーソルで再開できる。
+- **未着手 (P0d の残り)**: 本文の行構造化 (「テキスト blob → セクション行」) と raw を書かない経路。

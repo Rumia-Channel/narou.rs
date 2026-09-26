@@ -159,6 +159,27 @@ await check("a Convert plan for a missing novel is not reported as blocked", asy
   assert(body.blocked.length === 1, `Send must be blocked: ${JSON.stringify(body)}`);
 });
 
+await check("POST /api/admin/object-migration status reports progress", async () => {
+  const response = await request("/api/admin/object-migration", {
+    method: "POST",
+    ...auth(),
+    body: JSON.stringify({ action: "status" }),
+  });
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(body.action === "status", `unexpected action: ${JSON.stringify(body)}`);
+  assert(typeof body.copied === "number", "copied must be a number");
+  assert(Array.isArray(body.failed), "failed must be an array");
+});
+
+await check("POST /api/admin/object-migration requires auth", async () => {
+  const response = await request("/api/admin/object-migration", {
+    method: "POST",
+    body: JSON.stringify({ action: "status" }),
+  });
+  assert(response.status === 401, `status ${response.status}`);
+});
+
 if (QUEUE_CHECKS) {
   await check("Convert job for a missing novel reaches a terminal state", async () => {
     assert(convertJobId, "the Convert plan was not accepted");

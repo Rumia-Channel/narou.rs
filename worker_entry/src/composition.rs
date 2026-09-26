@@ -15,7 +15,8 @@ use narou_rs::downloader::settings::{DownloaderSettings, SnapshotDownloaderSetti
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::Result;
 use narou_rs::platform::{
-    AssetStore, Clock, HttpClient, NovelRepository, ObjectStore, RateLimiter, SystemClock,
+    AssetStore, Clock, HttpClient, NovelRepository, ObjectStore, RateLimiter, SplitStore,
+    SystemClock,
 };
 use narou_rs::setting_core::SettingScope;
 use serde::Deserialize;
@@ -69,13 +70,14 @@ pub struct WorkerRuntime {
     pub subrequests: crate::budget::SubrequestBudget,
 }
 
-/// 現在の保存先を読む。未設定・読み取り失敗は `None` (= D1 扱い)。
+/// 挿絵の保存先を読む。未設定・読み取り失敗は `None` (= D1 扱い)。
 ///
-/// 保存先は `app_state('inv','object_backend')` の 1 行で決める。`s3` 以外は
-/// すべて D1 として扱うので、移行前に戻すときはこの行を書き換えるだけでよい。
-async fn read_object_backend(db: &D1Database) -> Option<String> {
+/// 保存先は `app_state('inv','asset_backend')` の 1 行で決める。`s3` 以外は
+/// 挿絵も D1 に置くので、切り替えはこの行を書き換えるだけでよい。
+/// 本文・メタデータは常に D1 (`SplitStore` が振り分ける)。
+async fn read_asset_backend(db: &D1Database) -> Option<String> {
     let statement = db
-        .prepare("SELECT value_json FROM app_state WHERE scope = 'inv' AND key = 'object_backend'");
+        .prepare("SELECT value_json FROM app_state WHERE scope = 'inv' AND key = 'asset_backend'");
     let value = statement
         .first::<serde_json::Value>(Some("value_json"))
         .await
@@ -93,17 +95,21 @@ async fn build_object_stores(
     env: &Env,
     db: &Arc<D1Database>,
 ) -> worker::Result<(Arc<dyn ObjectStore>, Arc<dyn AssetStore>)> {
-    match read_object_backend(db).await.as_deref() {
-        Some("s3") => {
-            let store: Arc<crate::s3_object_store::S3ObjectStore> =
-                Arc::new(crate::s3_object_store::S3ObjectStore::from_env(env)?);
-            Ok((store.clone(), store))
-        }
-        _ => {
-            let store: Arc<D1ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
-            Ok((store.clone(), store))
-        }
-    }
+    let d1: Arc<D1ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
+    let illustrations: (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) =
+        match read_asset_backend(db).await.as_deref() {
+            // S3 が選ばれていて資格情報が欠けている場合は起動を失敗させ、
+            // 黙って D1 へ落とさない (fail-closed)。
+            Some("s3") => {
+                let store: Arc<crate::s3_object_store::S3ObjectStore> =
+                    Arc::new(crate::s3_object_store::S3ObjectStore::from_env(env)?);
+                (store.clone(), store)
+            }
+            _ => (d1.clone(), d1.clone()),
+        };
+    let split: Arc<SplitStore> =
+        Arc::new(SplitStore::new((d1.clone(), d1.clone()), illustrations));
+    Ok((split.clone(), split))
 }
 
 /// `app_state(scope='inv', key='section_hash_cache')` を読む。

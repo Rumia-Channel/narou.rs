@@ -11,6 +11,7 @@ mod d1_repository;
 mod executor;
 pub mod http;
 mod ledger;
+mod object_migration;
 mod rate_limiter;
 mod s3_object_store;
 mod scheduler;
@@ -37,6 +38,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         },
         "/api/novels" => api_novels(req, env).await,
         "/api/jobs" => api_jobs(req, env).await,
+        "/api/admin/object-migration" => api_object_migration(req, env).await,
         _ if path.starts_with("/api/novels/") => api_novel(req, env).await,
         _ if path.starts_with("/api/jobs/") => api_job(req, env).await,
         _ => Response::error("Not Found", 404),
@@ -437,6 +439,50 @@ async fn api_job(req: Request, env: Env) -> Result<Response> {
         Ok(Some(view)) => Response::from_json(&view),
         Ok(None) => Response::error("Not Found", 404),
         Err(error) => Response::error(format!("ledger read failed: {error}"), 500),
+    }
+}
+
+/// POST /api/admin/object-migration — D1 のオブジェクトを S3 へ写す (P0 の移行)。
+///
+/// body: `{"action": "copy" | "verify" | "status", "limit": 100}`。
+/// 1 回の呼び出しは `limit` 件で区切り、進捗は `app_state` に残る。
+async fn api_object_migration(mut req: Request, env: Env) -> Result<Response> {
+    if req.method() != Method::Post {
+        return Response::error("Method Not Allowed", 405);
+    }
+    if !authorized(&req, &env) {
+        return Response::error("Unauthorized", 401);
+    }
+
+    #[derive(serde::Deserialize, Default)]
+    struct Request {
+        action: Option<String>,
+        limit: Option<usize>,
+    }
+    let body: Request = req.json().await.unwrap_or_default();
+    let action = body.action.unwrap_or_else(|| "status".to_string());
+
+    let db = match env.d1("DB") {
+        Ok(db) => std::sync::Arc::new(db),
+        Err(error) => {
+            console_log!("D1 binding missing: {error}");
+            return Response::error("Service unavailable", 503);
+        }
+    };
+    let result = if action == "status" {
+        object_migration::status(&db).await
+    } else {
+        object_migration::run(
+            &env,
+            &db,
+            &action,
+            body.limit.unwrap_or(object_migration::DEFAULT_LIMIT),
+        )
+        .await
+    };
+    match result {
+        Ok(report) => Response::from_json(&report),
+        Err(error) => Response::error(format!("object migration failed: {error}"), 500),
     }
 }
 

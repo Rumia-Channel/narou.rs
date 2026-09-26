@@ -23,6 +23,8 @@ pub mod rate_limiter;
 pub mod repository;
 pub mod s3_request;
 pub mod s3_sigv4;
+pub mod split_store;
+pub mod store_migration;
 pub mod url_policy;
 
 pub use clock::{Clock, SystemClock};
@@ -41,6 +43,8 @@ pub use object_store::{
 };
 pub use progress::ProgressReporter;
 pub use rate_limiter::{normalize_site_key, RateLimitScope, RateLimiter};
+pub use split_store::{SplitStore, is_illustration_key};
+pub use store_migration::{StoreMigrationState, migrate_page};
 pub use url_policy::{is_safe_public_ip, validate_url_syntax};
 pub use repository::{
     NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, NovelSort, NovelSortKey,

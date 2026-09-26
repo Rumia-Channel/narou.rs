@@ -397,6 +397,21 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   `global` (`over18`)、`inv` の section hash cache を起動時に読んで渡す。同期 API と非同期 D1 の
   都合で書き戻しは no-op。`over18` 未設定は `None` のままにして年齢認証 `Blocked` 経路を保つ。
 
+### 挿絵の D1→S3 移行 (2026-09)
+
+- `POST /api/admin/object-migration` (`copy` / `verify` / `status`) で挿絵だけを S3 へ写す。
+  `asset_backend=s3` に切り替える前に実行し、進捗は `app_state('inv','migrate_illustrations')` に残す。
+- コアは `narou_rs::platform::store_migration::migrate_page`（`MemoryObjectStore` でテスト済み）。
+  Worker 側 (`worker_entry/src/object_migration.rs`) は D1/S3 と `app_state` を挿すだけにする。
+
+### 保存先の振り分け (SplitStore, 2026-09)
+
+- `src/platform/split_store.rs`: 挿絵（うごイラの APNG 含む）のバイナリだけ S3 互換ストアへ、
+  それ以外は D1 などの構造化ストアへ流す。判定は「末尾 2 セグメントが `挿絵/<画像拡張子>`」で、
+  小説ディレクトリ名が `挿絵` のケースを巻き込まない。切り替えは `app_state('inv','asset_backend')`
+  (`d1` | `s3`)。旧 `object_backend` は撤去済み。
+- ストアをまたぐ `copy` / `move_or_copy` は失敗させ、呼び出し側の想定違いを早期に検出する。
+
 ### Worker の契約テスト (2026-09)
 
 - `worker_entry/tests/contract.mjs` … HTTP 契約（health / 認証 fail-closed / 一覧・ジョブ API /
