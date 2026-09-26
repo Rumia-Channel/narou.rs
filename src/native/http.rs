@@ -845,6 +845,13 @@ impl NativeHttpClient {
 }
 
 impl HttpClient for NativeHttpClient {
+    /// DNS まで見る検証 (プラットフォーム既定は構文検証のみ)。
+    fn validate_url<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            validate_public_url(url).map_err(|error| NarouError::Http(error.to_string()))
+        })
+    }
+
     fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, Result<HttpResponse>> {
         let this = self.clone();
         Box::pin(async move {

@@ -16,7 +16,7 @@ use crate::platform::{
     HttpClient, HttpRequest, HttpResponse, RateLimitScope, RateLimiter, RedirectMode,
 };
 
-use super::security::{MAX_REDIRECTS, is_safe_header_value, validate_public_url};
+use super::security::{MAX_REDIRECTS, is_safe_header_value};
 
 /// Everything a site fetch needs beyond the URL: the site's static headers
 /// (cookie jar value plus any `headers:` declared in the site definition) and
@@ -211,12 +211,12 @@ pub async fn resolve_final_url_with_body(
     url: &str,
     policy: &FetchPolicy,
 ) -> Result<(String, Option<HttpResponse>)> {
-    validate_public_url(url).map_err(|e| NarouError::Http(e.to_string()))?;
+    http.validate_url(url).await?;
     let mut current = url::Url::parse(url).map_err(|e| NarouError::Http(e.to_string()))?;
     let mut headers = policy.headers().to_vec();
 
     for hop in 0..=MAX_REDIRECTS {
-        validate_public_url(current.as_str()).map_err(|e| NarouError::Http(e.to_string()))?;
+        http.validate_url(current.as_str()).await?;
         rate_limiter
             .acquire(&scope_for(host_of(current.as_str()), policy))
             .await?;
@@ -273,7 +273,7 @@ pub async fn fetch_bytes(
     url: &str,
     policy: &FetchPolicy,
 ) -> Result<HttpResponse> {
-    validate_public_url(url).map_err(|e| NarouError::Http(e.to_string()))?;
+    http.validate_url(url).await?;
     rate_limiter
         .acquire(&scope_for(host_of(url), policy))
         .await?;

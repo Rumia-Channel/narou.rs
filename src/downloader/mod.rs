@@ -36,7 +36,7 @@ use self::persistence::{PersistenceService, compute_section_hash};
 
 use crate::platform::{CookieStore, LoginCredential};
 use self::section::{SectionCache, download_section};
-use self::security::is_safe_public_url;
+use self::security::is_safe_public_url_syntax;
 use self::settings::DownloaderSettings;
 use self::site_setting::SiteSetting;
 use self::toc::{
@@ -986,7 +986,7 @@ impl Downloader {
                 }
                 let resolved = build_section_url(setting, toc_url, raw_url);
                 let url = resolved.as_str();
-                if !is_safe_public_url(url) {
+                if self.http.validate_url(url).await.is_err() {
                     report_warn(&format!("WARN: skipping unsafe illustration URL: {url}"));
                     continue;
                 }
@@ -2284,7 +2284,7 @@ impl Downloader {
         let target = parsed
             .query_pairs()
             .find_map(|(key, value)| (key == "url").then(|| value.into_owned()))?;
-        is_safe_public_url(&target).then_some(target)
+        is_safe_public_url_syntax(&target).then_some(target)
     }
 
     async fn resolve_target_for_download(

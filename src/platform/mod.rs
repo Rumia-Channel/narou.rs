@@ -23,12 +23,14 @@ pub mod rate_limiter;
 pub mod repository;
 pub mod s3_request;
 pub mod s3_sigv4;
+pub mod url_policy;
 
 pub use clock::{Clock, SystemClock};
 pub use cookie_store::{
-    CookieStore, LoginCredential, apply_set_cookie, cookie_host_for_url, cookie_lookup_hosts,
-    decode_credentials, encode_credentials, format_cookie_header, merge_cookie_headers,
-    merge_stored_cookies, normalize_cookie_host, parse_cookie_header,
+    CookieStore, LoginCredential, apply_set_cookie, assign_credential_ids, cookie_host_for_url,
+    cookie_lookup_hosts, decode_credentials, encode_credentials, format_cookie_header,
+    merge_cookie_headers, merge_credentials_for, merge_stored_cookies, normalize_cookie_host,
+    parse_cookie_header, tidy_credentials,
 };
 pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
 pub use object_store::{
@@ -39,6 +41,7 @@ pub use object_store::{
 };
 pub use progress::ProgressReporter;
 pub use rate_limiter::{normalize_site_key, RateLimitScope, RateLimiter};
+pub use url_policy::{is_safe_public_ip, validate_url_syntax};
 pub use repository::{
     NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, NovelSort, NovelSortKey,
     SearchField, SearchTerm,

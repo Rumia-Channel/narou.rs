@@ -47,7 +47,7 @@ impl<'a> Ctx<'a> {
     /// the DSL still gets the URL back so it can look the result up.
     fn request(&mut self, url: String) -> PreprocessResult<Value> {
         if !(url.starts_with("http://") || url.starts_with("https://"))
-            || !crate::downloader::security::is_safe_public_url(&url)
+            || !crate::downloader::security::is_safe_public_url_syntax(&url)
         {
             return Ok(Value::Null);
         }

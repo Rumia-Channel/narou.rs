@@ -48,7 +48,11 @@ native-runtime = [
 # engine. Binaries built with this feature are distributed under GPL-3.0;
 # see assets/aozora_lite/LICENSE.md. The Worker runtime enables it always.
 lite = ["dep:aozora_epub3_lite"]
-worker-runtime = ["lite", "illustration-animation"]
+# At-rest credential decryption is needed on the Worker too (credentials may be
+# written by a native library); the AEAD stack is pure Rust, so only `base64`
+# and `chacha20poly1305` join this feature. Encryption needs a random source
+# (`getrandom`), which stays native for now.
+worker-runtime = ["lite", "illustration-animation", "dep:base64", "dep:chacha20poly1305"]
 # Animated illustrations arrive as a frame archive and are assembled into an
 # APNG. The codecs (image: jpeg/png) and the ZIP reader are pure Rust, so the
 # portable (Worker / wasm) build enables them too; `zip` is pinned to the
@@ -104,7 +108,9 @@ miniz_oxide = "0.9"
 brotli = "9.0"
 crc32fast = "1.5"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
-chacha20poly1305 = { version = "0.11", optional = true }
+# Nonces come from our own random source (`login::crypto::random_bytes`), so the
+# crate's rng feature (which would pull `getrandom` into the wasm build) is off.
+chacha20poly1305 = { version = "0.11", optional = true, default-features = false, features = ["alloc"] }
 argon2 = { version = "0.6", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 hmac = "0.13"

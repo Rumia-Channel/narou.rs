@@ -81,6 +81,16 @@ impl WorkerHttpClient {
 }
 
 impl HttpClient for WorkerHttpClient {
+    /// wasm には DNS 解決手段が無いので、構文とアドレスリテラルの判定だけを
+    /// 行う (到達可否は Cloudflare の egress 側の制約に委ねる)。ホスト名が
+    /// 非公開アドレスに解決される場合を弾けない点が native との差。
+    fn validate_url<'a>(&'a self, url: &'a str) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            narou_rs::platform::url_policy::validate_url_syntax(url)
+                .map_err(narou_rs::error::NarouError::Http)
+        })
+    }
+
     fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
         Box::pin(self.send_request(request))
     }

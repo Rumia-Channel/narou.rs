@@ -19,7 +19,10 @@ use crate::error::Result;
 use crate::login::crypto::{decrypt_at_rest, encrypt_at_rest};
 use crate::native::login_key::LoginKey;
 use crate::native::object_store::run_blocking;
-use crate::platform::{CookieStore, LoginCredential, PlatformFuture, normalize_cookie_host};
+use crate::platform::{
+    CookieStore, LoginCredential, PlatformFuture, assign_credential_ids, merge_credentials_for,
+    normalize_cookie_host, tidy_credentials,
+};
 
 pub const INVENTORY_NAME: &str = "login_cookie";
 
@@ -134,7 +137,7 @@ impl InventoryCookieStore {
     ) -> Result<()> {
         let mut map = self.credentials()?;
         let host = normalize_cookie_host(host);
-        let credentials = tidy(credentials);
+        let credentials = tidy_credentials(credentials);
         if credentials.is_empty() {
             map.remove(&host);
         } else {
@@ -155,7 +158,7 @@ impl InventoryCookieStore {
         for (host, credentials) in entries {
             let host = normalize_cookie_host(host);
             let stored = map.entry(host).or_default();
-            for credential in tidy(credentials) {
+            for credential in tidy_credentials(credentials) {
                 if !stored.iter().any(|existing| existing.same_cookie(&credential)) {
                     stored.push(credential);
                 }
@@ -176,7 +179,7 @@ impl InventoryCookieStore {
     ) -> Result<usize> {
         let mut map: BTreeMap<String, Vec<LoginCredential>> = BTreeMap::new();
         for (host, credentials) in entries {
-            let credentials = tidy(credentials);
+            let credentials = tidy_credentials(credentials);
             if !credentials.is_empty() {
                 map.insert(normalize_cookie_host(host), credentials);
             }
@@ -213,63 +216,6 @@ impl InventoryCookieStore {
             .get(&normalize_cookie_host(host))
             .is_some_and(|value| crate::login::crypto::is_encrypted_at_rest(value)))
     }
-}
-
-/// Give every credential an id, returning whether anything changed.
-fn assign_credential_ids(stored: &mut BTreeMap<String, Vec<LoginCredential>>) -> bool {
-    let mut changed = false;
-    for credentials in stored.values_mut() {
-        for credential in credentials.iter_mut() {
-            if credential.id.is_empty()
-                && let Ok(id) = crate::login::new_credential_id()
-            {
-                credential.id = id;
-                changed = true;
-            }
-        }
-    }
-    changed
-}
-
-/// Normalize a credential before it is stored: surrounding space is never
-/// meaningful in a `Cookie:` header, and an empty one is not a credential.
-fn tidy(credentials: &[LoginCredential]) -> Vec<LoginCredential> {
-    credentials
-        .iter()
-        .filter_map(|credential| {
-            let cookie = credential.cookie.trim();
-            if cookie.is_empty() {
-                return None;
-            }
-            let mut credential = credential.clone();
-            credential.cookie = cookie.to_string();
-            if credential.id.is_empty()
-                && let Ok(id) = crate::login::new_credential_id()
-            {
-                credential.id = id;
-            }
-            Some(credential)
-        })
-        .collect()
-}
-
-/// 親ドメインも含めたキーから、そのホストで使える資格情報を組み立てる。
-fn merge_credentials_for(
-    stored: &BTreeMap<String, Vec<LoginCredential>>,
-    host: &str,
-) -> Vec<LoginCredential> {
-    let mut credentials: Vec<LoginCredential> = Vec::new();
-    for key in crate::platform::cookie_lookup_hosts(host) {
-        let Some(entries) = stored.get(&key) else {
-            continue;
-        };
-        for credential in entries {
-            if !credentials.iter().any(|seen| seen.same_cookie(credential)) {
-                credentials.push(credential.clone());
-            }
-        }
-    }
-    credentials
 }
 
 impl CookieStore for InventoryCookieStore {

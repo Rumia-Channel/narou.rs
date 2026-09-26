@@ -22,7 +22,8 @@ pub const AT_REST_PREFIX: &str = "enc:v1:";
 
 /// Associated data label for values encrypted at rest.
 const AT_REST_AAD: &str = "narou.rs/login-cookie";
-/// Associated data label for a portable export envelope.
+/// Associated data label for a portable export envelope (native transfer only).
+#[cfg(feature = "native-runtime")]
 pub(crate) const ENVELOPE_AAD: &str = "narou.rs/login-export";
 
 fn login_error(message: impl Into<String>) -> NarouError {
@@ -34,6 +35,7 @@ fn login_error(message: impl Into<String>) -> NarouError {
 ///
 /// Random rather than sequential so ids stay unique after exports move between
 /// machines. Generated wherever a credential is first stored.
+#[cfg(feature = "native-runtime")]
 pub fn new_credential_id() -> Result<String> {
     let mut bytes: [u8; 16] = random_bytes()?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -48,6 +50,7 @@ pub fn new_credential_id() -> Result<String> {
     Ok(out)
 }
 
+#[cfg(feature = "native-runtime")]
 pub fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes)
@@ -56,6 +59,7 @@ pub fn random_bytes<const N: usize>() -> Result<[u8; N]> {
 }
 
 /// A fresh login key.
+#[cfg(feature = "native-runtime")]
 pub fn random_key() -> Result<[u8; KEY_LEN]> {
     random_bytes()
 }
@@ -68,6 +72,7 @@ fn cipher(key: &[u8; KEY_LEN]) -> XChaCha20Poly1305 {
 ///
 /// The result is `base64(nonce):base64(ciphertext)`, safe to embed in YAML,
 /// JSON or a CLI argument.
+#[cfg(feature = "native-runtime")]
 pub fn encrypt_with_key(key: &[u8; KEY_LEN], aad: &str, plaintext: &str) -> Result<String> {
     let nonce_bytes: [u8; NONCE_LEN] = random_bytes()?;
     let nonce = XNonce::from(nonce_bytes);
@@ -120,7 +125,20 @@ fn decode_exact<const N: usize>(encoded: &str, what: &str) -> Result<[u8; N]> {
         .map_err(|_| login_error(format!("{what} has the wrong length")))
 }
 
+/// Parse a base64-encoded login key (the `login.key` file / `NAROU_RS_LOGIN_KEY`
+/// form). Portable: the Worker reads the same key from a secret.
+pub fn parse_key_base64(text: &str) -> Result<[u8; KEY_LEN]> {
+    let decoded = BASE64
+        .decode(text.trim())
+        .map_err(|error| login_error(format!("malformed login key: {error}")))?;
+    decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| login_error(format!("login key must be {KEY_LEN} bytes")))
+}
+
 /// Derive a key from a passphrase with Argon2id (19 MiB, t=2, p=1).
+#[cfg(feature = "native-runtime")]
 pub fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
     use argon2::{Algorithm, Argon2, Params, Version};
 
@@ -138,6 +156,7 @@ pub fn is_encrypted_at_rest(value: &str) -> bool {
 }
 
 /// Encrypt one host's cookie header for storage in the inventory.
+#[cfg(feature = "native-runtime")]
 pub fn encrypt_at_rest(key: &[u8; KEY_LEN], host: &str, cookie: &str) -> Result<String> {
     let token = encrypt_with_key(key, &at_rest_aad(host), cookie)?;
     Ok(format!("{AT_REST_PREFIX}{token}"))
@@ -155,11 +174,32 @@ pub fn decrypt_at_rest(key: &[u8; KEY_LEN], host: &str, value: &str) -> Result<O
     decrypt_with_key(key, &at_rest_aad(host), token).map(Some)
 }
 
+/// Decrypt a stored value with an optional key.
+///
+/// Plaintext (written by an older build) returns `None` so the caller keeps
+/// using it; an encrypted value without a key is an error rather than a silent
+/// "no credentials".
+pub fn decrypt_stored_value(
+    key: Option<&[u8; KEY_LEN]>,
+    host: &str,
+    value: &str,
+) -> Result<Option<String>> {
+    if !is_encrypted_at_rest(value) {
+        return Ok(None);
+    }
+    let Some(key) = key else {
+        return Err(login_error(format!(
+            "stored credentials for {host} are encrypted but no login key is configured"
+        )));
+    };
+    decrypt_at_rest(key, host, value)
+}
+
 fn at_rest_aad(host: &str) -> String {
     format!("{AT_REST_AAD}:{host}")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-runtime"))]
 mod tests {
     use super::*;
 

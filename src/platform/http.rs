@@ -11,8 +11,10 @@
 //! the native implementation isolates blocking transports behind
 //! `tokio::task::spawn_blocking`.
 //!
-//! URL safety validation lives in `downloader::security` (domain layer) and is
-//! applied by callers before handing a URL to an implementation.
+//! URL safety validation is split: the syntax/address-literal judgement lives in
+//! [`super::url_policy`] (usable without DNS) and is applied by callers before
+//! handing a URL to an implementation, while [`HttpClient::validate_url`] lets an
+//! implementation that *can* resolve DNS enforce the resolved-address check.
 
 use super::PlatformFuture;
 
@@ -130,6 +132,22 @@ pub trait HttpClient: Send + Sync {
         &'a self,
         request: HttpRequest,
     ) -> PlatformFuture<'a, crate::error::Result<HttpResponse>>;
+
+    /// Validate a URL before the request is sent.
+    ///
+    /// The default implementation checks the URL syntax and rejects
+    /// non-public address literals, which is all a platform without DNS
+    /// resolution (wasm) can do. Implementations that can resolve hosts must
+    /// override this to also reject hostnames resolving to non-public
+    /// addresses; native does so through `downloader::security`.
+    fn validate_url<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> PlatformFuture<'a, crate::error::Result<()>> {
+        Box::pin(async move {
+            super::url_policy::validate_url_syntax(url).map_err(crate::error::NarouError::Http)
+        })
+    }
 }
 
 /// Convenience blanket impl: any `&T` where `T: HttpClient` is itself an
@@ -140,6 +158,13 @@ impl<T: HttpClient + ?Sized> HttpClient for &T {
         request: HttpRequest,
     ) -> PlatformFuture<'a, crate::error::Result<HttpResponse>> {
         (*self).send(request)
+    }
+
+    fn validate_url<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> PlatformFuture<'a, crate::error::Result<()>> {
+        (*self).validate_url(url)
     }
 }
 

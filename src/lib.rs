@@ -27,7 +27,7 @@ pub mod illustration_animation;
 pub mod illustration_store;
 #[cfg(feature = "native-runtime")]
 pub mod logger;
-#[cfg(feature = "native-runtime")]
+#[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub mod login;
 #[cfg(feature = "native-runtime")]
 pub mod mail;
