@@ -4,6 +4,15 @@ on:
   push:
     branches: [develop, refactor-platform-abstraction]
   pull_request:
+  # デプロイは手動トリガーのみ。環境ごとの secret を設定するまで実行されない
+  # (下の worker-deploy を参照)。
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Deployment target
+        type: choice
+        options: [develop, staging, production]
+        default: develop
 
 permissions:
   contents: read
@@ -68,6 +77,84 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install worker-build --version 0.8.5 --locked
       - run: worker-build --release
+
+  worker-contract:
+    name: Worker contract tests (local workerd)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker_entry
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: cargo install worker-build --version 0.8.5 --locked
+      # tests/run.mjs builds, applies the local D1 migrations, starts
+      # `wrangler dev` and runs the contract checks (health, fail-closed auth,
+      # library/jobs APIs, and a queue-backed Convert job reaching a terminal
+      # state).
+      - run: node tests/run.mjs --release
+        env:
+          NAROU_ADMIN_TOKEN: contract-token
+
+  # デプロイはリポジトリの secret を設定したうえで手動実行する。
+  # 必要な値 (GitHub の environment = target 名で設定):
+  #   secrets.CLOUDFLARE_API_TOKEN / secrets.CLOUDFLARE_ACCOUNT_ID
+  #   vars/secrets: NAROU_D1_DATABASE_NAME / NAROU_D1_DATABASE_ID /
+  #                 NAROU_JOB_QUEUE / NAROU_JOB_DLQ /
+  #                 NAROU_S3_ENDPOINT / NAROU_S3_REGION / NAROU_S3_BUCKET
+  #                 (+ production のみ SERVICE_DOMAIN)
+  #   secrets.NAROU_ADMIN_TOKEN (デプロイ後の smoke test で使う)
+  # 未設定の間は workflow_dispatch から実行しても失敗するだけで、push では走らない。
+  worker-deploy:
+    name: Worker deploy (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target }}
+    defaults:
+      run:
+        working-directory: worker_entry
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      NAROU_DEPLOY_TARGET: ${{ inputs.target }}
+      NAROU_D1_DATABASE_NAME: ${{ vars.NAROU_D1_DATABASE_NAME }}
+      NAROU_D1_DATABASE_ID: ${{ vars.NAROU_D1_DATABASE_ID }}
+      NAROU_JOB_QUEUE: ${{ vars.NAROU_JOB_QUEUE }}
+      NAROU_JOB_DLQ: ${{ vars.NAROU_JOB_DLQ }}
+      NAROU_S3_ENDPOINT: ${{ vars.NAROU_S3_ENDPOINT }}
+      NAROU_S3_REGION: ${{ vars.NAROU_S3_REGION }}
+      NAROU_S3_BUCKET: ${{ vars.NAROU_S3_BUCKET }}
+      SERVICE_DOMAIN: ${{ vars.SERVICE_DOMAIN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cargo install worker-build --version 0.8.5 --locked
+      - run: python3 ci/render_config.py
+      - run: worker-build --release
+      - run: npx --yes wrangler@4 d1 migrations apply DB --remote -c wrangler.ci.toml
+      - run: npx --yes wrangler@4 deploy -c wrangler.ci.toml
+      # デプロイ後の契約テスト (失敗してもデプロイは巻き戻さない)。
+      - name: Smoke test the deployment
+        if: ${{ vars.NAROU_DEPLOY_URL != '' }}
+        run: node tests/contract.mjs
+        env:
+          BASE_URL: ${{ vars.NAROU_DEPLOY_URL }}
+          NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
 
   license:
     name: Third-party license notices

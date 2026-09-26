@@ -12,7 +12,7 @@ Phase 1-8 の抽象化（`docs/platform-abstraction.md`）で port の境界は�
 | P0b 署名と S3 アダプタ | ✅ 完了 (`23338ec`, `ed87fcd`) |
 | P0c 保存先の振り分け (SplitStore) | ❌ 未着手 (当初の「全オブジェクト切替」を差し替える) |
 | P0d D1→S3 移行 (バイナリのみ) | ◐ 実装済みだが未コミット。振り分け前提に作り直す |
-| P0e 契約テスト + CI デプロイ | ❌ 未着手 (CI は `cargo check` とローカル `worker-build` のみ) |
+| P0e 契約テスト + CI デプロイ | ◐ 契約テストは CI で実行 (`worker-contract`)。デプロイは手動トリガーの `worker-deploy` を用意（実アカウント実行は未検証） |
 | P1 取得系を閉じる | ◐ 実行系は実装済み。SSRF・Cookie・設定の 3 点が未了 |
 | P2 変換を Worker へ | ◐ 変換テキスト生成は完了 (`ConvertService`)。残りは device 出力 (MOBI 等) の扱い |
 | P3 Web UI 移植 | ❌ 未着手 |
@@ -167,8 +167,8 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 | 2 | ~~Convert が Worker に存在しない~~ → **解決**: `ConvertService`（core）が保存済み TOC と本文から変換テキストを組み、`<prefix>/novel.txt` へ書く。`JobKind::Convert` は worker 実行可能。native の `convert_novel_by_id` が書く固定名ミラーと同じキー | `src/application/convert.rs`, `worker_entry/src/convert.rs`, `src/application/jobs.rs` |
 | 3 | ~~CookieStore 未注入~~ → **読取は解決**: `D1CookieStore` を `new_downloader` に注入（保存形式は native と同じ `app_state(inv, login_cookie)`）。書込 (`save_all`) は wasm に乱数源が無いため未対応＝資格情報の取込と Set-Cookie の書き戻しは native 側で行う | `worker_entry/src/d1_cookie_store.rs`, `worker_entry/src/composition.rs` |
 | 4 | ~~設定が Worker に届かない~~ → **解決**: `SnapshotDownloaderSettings` に `app_state` の `local`/`global`（`update.strong` / `guard-spoiler` / `auto-add-tags` / `download.use-subdirectory` / `over18`）と `inv` の section hash cache を起動時に読んで注入。書き戻しは同期 API と非同期 D1 の都合で no-op（`over18` は Web UI 側で設定） | `src/downloader/settings.rs`, `worker_entry/src/composition.rs` |
-| 5 | **デプロイ設定が未完**（`database_id` 未設定・secret 投入手順なし・CI にデプロイ無し） | `worker_entry/wrangler.toml`, `.github/workflows/platform.yml:45-70` |
-| 6 | **worker のテストが CI で 1 件も走らない** | 同上 |
+| 5 | デプロイ設定: `wrangler.<target>.toml` + `ci/render_config.py` は完成。CI の `worker-deploy`（手動トリガー・environment ゲート）に必要な secret/vars を設定すれば動くが、**実アカウントでの実行は未検証** | `worker_entry/wrangler.develop.toml`, `.github/workflows/platform.yml` |
+| 6 | ~~worker のテストが CI で 1 件も走らない~~ → **解決**: `worker_entry/tests/contract.mjs`（HTTP 契約）と `tests/run.mjs`（ローカル workerd 起動）を CI の `worker-contract` ジョブで実行 | `.github/workflows/platform.yml` |
 
 ### 2.2.1 URL 検証の分担（2026-09-26 実装）
 
@@ -193,6 +193,19 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
   `replace.txt` は適用するが、インストール先の全体 `replace.txt` は native 専用のまま。セクション変換
   キャッシュは Worker では持たない（毎回変換する）。
 - `JobKind::Convert` は `is_worker_executable` に含めた。Send / Mail / Backup は従来どおり `blocked`。
+
+### 2.2.3 契約テスト (2026-09-26 追加)
+
+- `worker_entry/tests/contract.mjs` は HTTP だけを叩くので、ローカルの `wrangler dev` でもデプロイ済み環境でも
+  同じものを使える。検査内容: `/health/live` `/health/ready`、認証 fail-closed (未認証・誤トークン)、
+  `/api/novels` のページ形、405/404/400 の境界、`/api/jobs` の受理と `blocked` の区別、そして
+  **queue consumer が実際に回って Convert ジョブが終端状態になること**（`CONTRACT_QUEUE=0` で無効化）。
+- `worker_entry/tests/run.mjs` がビルド → ローカル D1 へ migration → `wrangler dev` 起動 → 契約テストまでを
+  1 コマンドで行う。`.dev.vars` と `wrangler.test.toml` は gitignore 済みで、後者は `wrangler.toml` から
+  `[build]` を外して生成する（毎回 release ビルドを走らせないため）。
+- 実測 (2026-09-26, wrangler 4.141 / worker-build 0.8.5): 15 チェックすべて green。ログに
+  `job j... failed permanently: Platform error: 小説 999999999 がありません` が出ており、Convert の
+  実行経路 (plan → queue → claim → ConvertService → 終端) が workerd 上で動くことを確認した。
 
 ### 2.3 その他の差分
 
@@ -309,10 +322,13 @@ CF Access を唯一のユーザー境界にする設計、音声向けの instan
 ## 7. 検証コマンド
 
 ```bash
-# ローカル
-npx wrangler d1 migrations apply narou-local --local
-npx wrangler dev --local --var NAROU_AUTH_REQUIRED:true
-node --test worker_entry/tests/*.mjs        # WORKER_BASE_URL / NAROU_ADMIN_TOKEN を env で渡す
+# ローカル (ビルド → ローカル D1 へ migration → wrangler dev → 契約テスト)
+cd worker_entry
+node tests/run.mjs              # debug build / --release で CI と同じ / --keep で dev を残す
+
+# 既に動いている環境に対する契約テスト (デプロイ後の smoke test もこれ)
+BASE_URL=https://... NAROU_ADMIN_TOKEN=... node worker_entry/tests/contract.mjs
+# queue consumer が回る前提の検査 (Convert の終端待ち) は既定で有効、CONTRACT_QUEUE=0 で無効
 
 # 型・ビルド
 cargo check -p narou_rs --target wasm32-unknown-unknown --no-default-features --features worker-runtime

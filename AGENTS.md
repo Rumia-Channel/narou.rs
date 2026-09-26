@@ -397,6 +397,16 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   `global` (`over18`)、`inv` の section hash cache を起動時に読んで渡す。同期 API と非同期 D1 の
   都合で書き戻しは no-op。`over18` 未設定は `None` のままにして年齢認証 `Blocked` 経路を保つ。
 
+### Worker の契約テスト (2026-09)
+
+- `worker_entry/tests/contract.mjs` … HTTP 契約（health / 認証 fail-closed / 一覧・ジョブ API /
+  queue 経由の Convert 終端）。`BASE_URL` と `NAROU_ADMIN_TOKEN` を env で渡す。
+- `worker_entry/tests/run.mjs` … ビルド → ローカル D1 へ migration → `wrangler dev` → 契約テスト。
+  `.dev.vars`（無ければ `NAROU_ADMIN_TOKEN` を書き込む）と `wrangler.test.toml`（`wrangler.toml` から
+  `[build]` を外した生成物）は gitignore 済み。
+- CI: `.github/workflows/platform.yml` の `worker-contract`（push で実行）。デプロイは手動トリガーの
+  `worker-deploy`（environment ゲート）で、必要な secret/vars はワークフローのコメント参照。
+
 ### Worker 内の変換 (2026-09)
 
 - `ConvertService` (`src/application/convert.rs`) が変換テキストを組む唯一のポータブル経路。
