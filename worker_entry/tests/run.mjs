@@ -59,7 +59,8 @@ const testConfig = join(root, "wrangler.test.toml");
 writeFileSync(testConfig, config);
 console.log(`wrote ${testConfig}`);
 
-// 3. ビルド。
+// 3. ビルド (設定から [build] を外しているのでアセットはここで作る)。
+run("node", ["build_assets.mjs"]);
 run("worker-build", release ? ["--release"] : []);
 
 // 4. ローカル D1 にマイグレーションを適用。
@@ -78,7 +79,16 @@ run(npx, [
 // 5. wrangler dev を起動して readiness を待つ。
 const dev = spawn(
   npx,
-  ["--yes", "wrangler@4", "dev", "-c", "wrangler.test.toml", "--port", port],
+  [
+    "--yes",
+    "wrangler@4",
+    "dev",
+    "-c",
+    "wrangler.test.toml",
+    "--port",
+    port,
+    "--test-scheduled",
+  ],
   { cwd: root, stdio: "inherit", shell: isWindows },
 );
 

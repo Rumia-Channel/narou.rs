@@ -464,16 +464,22 @@ pub struct QueuedJobView {
 pub struct WorkerJobEnvelope {
     pub version: u32,
     pub job_id: JobId,
-    pub job: JobPlan,
+    /// 計画本体。**キューには載せない**（D1 台帳が唯一の権威）。
+    /// 旧バージョンが積んだメッセージを読むためだけに残す。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobPlan>,
 }
 
 impl WorkerJobEnvelope {
-    /// Build a version-2 envelope for a queued job.
-    pub fn v2(job_id: JobId, job: JobPlan) -> Self {
+    /// Build a version-2 envelope: the id only.
+    ///
+    /// 台帳 (D1) に計画があるので、メッセージは id だけを運ぶ。メッセージが
+    /// 小さくなり、計画の書き換え・回復が台帳側だけで完結する。
+    pub fn v2(job_id: JobId) -> Self {
         Self {
             version: WORKER_JOB_ENVELOPE_VERSION,
             job_id,
-            job,
+            job: None,
         }
     }
 }
@@ -1081,7 +1087,7 @@ mod tests {
         assert_eq!(back, job);
         assert!(json.contains("42"), "target id should be inline: {json}");
 
-        let envelope = WorkerJobEnvelope::v2(JobId("job_1".into()), job);
+        let envelope = WorkerJobEnvelope::v2(JobId("job_1".into()));
         let json = serde_json::to_string(&envelope).unwrap();
         let back: WorkerJobEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back, envelope);
@@ -1337,10 +1343,8 @@ mod tests {
         };
         assert!(validate_request_limits(&long_option).is_some());
 
-        let envelope = WorkerJobEnvelope::v2(
-            JobId("j1".into()),
-            plan(JobKind::Update, JobTarget::Id(NovelId(42)), &["--force"]),
-        );
+        // メッセージは id だけを運ぶ (計画は台帳側)。
+        let envelope = WorkerJobEnvelope::v2(JobId("j1".into()));
         let size = envelope_bytes(&envelope).unwrap();
         assert!(size <= job_limits::MAX_ENVELOPE_BYTES);
     }

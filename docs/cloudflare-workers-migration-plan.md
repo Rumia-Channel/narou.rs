@@ -299,6 +299,25 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 - ロールバック: Workers の前バージョンへ戻す (`wrangler versions` / ダッシュボード) か、
   このワークフローを再実行する。native 側のデータ (`小説データ/`) は Worker から触らないので影響しない。
 
+### 2.2.9 Dantalian / Tiny-TID から取り込んだ運用 (2026-09-26)
+
+参考実装（`Rust/Dantalian`, `JR/Tiny-TID`）から、Workers 固有の作法を取り込んだ。
+
+| 項目 | 内容 | 実装 |
+|---|---|---|
+| 静的アセット | `src/web/assets` を `build_assets.mjs` が `public/` へ焼き込み、`?v=<内容ハッシュ>` を HTML/JS に埋める。`[assets]` が配信し、無いパスだけ Worker へ落ちる | `worker_entry/build_assets.mjs`, `worker_entry/wrangler*.toml` |
+| 契約テスト | アセット配信・`/` の HTML・scheduled handler も検査対象に追加 | `worker_entry/tests/contract.mjs` |
+| 機械可読な認証 | health が `authentication_required` / `authentication_configured` を返し、401 は `{error:{code:"authentication_required"}}`、トークン未設定は 500 + `authentication_not_configured` | `worker_entry/src/lib.rs` |
+| Secrets Store | S3 資格情報は `<変数名>_STORE` バインディングがあれば Cloudflare Secrets Store から読む（無ければ従来の secret） | `worker_entry/src/s3_object_store.rs` |
+| S3 メタデータ | `HEAD` はエッジで 403 になる環境があるため、`GET` + `Range: bytes=0-0` の `Content-Range` からサイズを取る | `worker_entry/src/s3_object_store.rs`, `src/platform/s3_request.rs` |
+| release プロファイル | `lto = true` / `codegen-units = 1`（wasm のサイズ・起動、配布バイナリの速度） | `Cargo.toml` |
+| キューのペイロード | メッセージは `job_id` だけを運び、計画は D1 台帳から読む（旧形式も読める） | `src/application/jobs.rs`, `worker_entry/src/consumer.rs` |
+| サイト定義の L1 | 実効サイト定義を isolate 内に 30 秒キャッシュし、書き込み時は即時無効化 | `worker_entry/src/bundled_sites.rs` |
+
+採用しなかったもの: Containers（外部プロセス前提を持たない方針）、`cargo fmt --check`（整形差分を禁止する規約と衝突）、
+メジャーのみのバージョン指定（現状の精密ピンを維持）、R2/KV/Browser Rendering（設計は D1 + S3 互換）、
+PWA Service Worker（製品機能として別判断）。
+
 ### 2.3 その他の差分
 
 - サイト YAML はビルド時埋め込みのみでユーザー差し替え不可（`SiteDefinitionProvider` は空実装）。

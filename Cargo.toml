@@ -161,3 +161,10 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32
 
 [dev-dependencies]
 mailparse = "0.17"
+
+# Worker (wasm) のサイズと起動時間、配布バイナリの実行速度を優先する。
+# native の release ビルドは遅くなるが、CI では native は check/test のみで、
+# release ビルドは release.yml (タグ時) だけなので許容する。
+[profile.release]
+lto = true
+codegen-units = 1

@@ -324,6 +324,30 @@ fn unescape_xml(value: &str) -> String {
     out
 }
 
+/// `Content-Range` ヘッダから全体サイズを取り出す (`bytes 0-0/12345`)。
+///
+/// S3 互換ストレージでは `HEAD` がエッジで 403 になることがあるため、
+/// `GET` + `Range: bytes=0-0` の応答からメタデータを読む経路で使う。
+pub fn parse_content_range_size(value: &str) -> Option<u64> {
+    let (_, total) = value.trim().rsplit_once('/')?;
+    total.trim().parse::<u64>().ok()
+}
+
+/// `Content-Length` からサイズを取り出す (Range を無視するサーバー向け)。
+pub fn parse_content_length(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
+}
+
+/// Range 応答 (`206`) か通常応答 (`200`) かに関わらず全体サイズを求める。
+pub fn object_size(status: u16, content_range: Option<&str>, content_length: Option<&str>) -> Option<u64> {
+    match status {
+        206 => content_range.and_then(parse_content_range_size),
+        _ => content_length
+            .and_then(parse_content_length)
+            .or_else(|| content_range.and_then(parse_content_range_size)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +466,20 @@ mod tests {
         let page = parse_list_objects_v2(xml).unwrap();
         assert!(page.objects.is_empty());
         assert_eq!(page.next_token, None);
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_total_size_from_a_range_response() {
+        assert_eq!(parse_content_range_size("bytes 0-0/12345"), Some(12345));
+        assert_eq!(parse_content_range_size("bytes 0-0/*"), None);
+        assert_eq!(parse_content_range_size("garbage"), None);
+        assert_eq!(object_size(206, Some("bytes 0-0/555"), Some("1")), Some(555));
+        // Range を無視して 200 を返すサーバーは Content-Length を使う。
+        assert_eq!(object_size(200, None, Some("777")), Some(777));
     }
 }

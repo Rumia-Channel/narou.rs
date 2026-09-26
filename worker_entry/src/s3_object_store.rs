@@ -49,22 +49,6 @@ fn required_var(env: &Env, name: &str) -> worker::Result<String> {
     }
 }
 
-fn required_secret(env: &Env, name: &str) -> worker::Result<String> {
-    match env.secret(name) {
-        Ok(value) => {
-            let value = value.to_string();
-            if value.trim().is_empty() {
-                Err(worker::Error::RustError(format!("{name} is empty")))
-            } else {
-                Ok(value)
-            }
-        }
-        Err(error) => Err(worker::Error::RustError(format!(
-            "{name} is not configured: {error}"
-        ))),
-    }
-}
-
 struct CredentialsOwned {
     access_key_id: String,
     secret_access_key: String,
@@ -90,7 +74,23 @@ pub struct S3ObjectStore {
 
 impl S3ObjectStore {
     /// バインディングから構成する。値が欠けていれば失敗させる (fail-closed)。
-    pub fn from_env(env: &Env) -> worker::Result<Self> {
+    /// Secrets Store のバインディング (`<name>_STORE`) があればそこから読む。
+    ///
+    /// Cloudflare Secrets Store を使うと、資格情報を Worker 個別の secret ではなく
+    /// アカウント共有のストアに置ける。値はランタイムが isolate ごとにキャッシュする
+    /// ので、リクエストごとに `get` しても実害は小さい。
+    async fn secret_or_store(env: &Env, name: &str) -> worker::Result<String> {
+        let binding = format!("{name}_STORE");
+        if let Ok(store) = env.secret_store(&binding)
+            && let Ok(Some(value)) = store.get().await
+            && !value.is_empty()
+        {
+            return Ok(value);
+        }
+        env.secret(name).map(|secret| secret.to_string())
+    }
+
+    pub async fn from_env(env: &Env) -> worker::Result<Self> {
         let endpoint = required_var(env, "S3_ENDPOINT")?;
         let bucket = required_var(env, "S3_BUCKET")?;
         let region = required_var(env, "S3_REGION")?;
@@ -98,9 +98,16 @@ impl S3ObjectStore {
             .var("S3_PREFIX")
             .map(|value| value.to_string())
             .unwrap_or_default();
+        let access_key_id = Self::secret_or_store(env, "S3_ACCESS_KEY_ID").await?;
+        let secret_access_key = Self::secret_or_store(env, "S3_SECRET_ACCESS_KEY").await?;
+        if access_key_id.is_empty() || secret_access_key.is_empty() {
+            return Err(worker::Error::RustError(
+                "S3 credentials are not configured (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY)".to_string(),
+            ));
+        }
         let credentials = CredentialsOwned {
-            access_key_id: required_secret(env, "S3_ACCESS_KEY_ID")?,
-            secret_access_key: required_secret(env, "S3_SECRET_ACCESS_KEY")?,
+            access_key_id,
+            secret_access_key,
         };
         let location = S3Location::new(endpoint, bucket, prefix)
             .map_err(|error| worker::Error::RustError(error.to_string()))?;
@@ -194,25 +201,44 @@ impl S3ObjectStore {
     }
 
     async fn stat_object(&self, key: &ObjectKey) -> Result<Option<ObjectMetadata>> {
+        // `HEAD` は Workers のエッジで 403 になる S3 互換サービスがあるため、
+        // `GET` + `Range: bytes=0-0` でメタデータだけ読む (本体は受け取らない)。
         let response = self
             .send(
-                Method::Head,
+                Method::Get,
                 &self.location.object_url(key),
                 &self.location.object_path(key),
                 "",
-                &[],
+                &[("range", "bytes=0-0")],
                 None,
             )
             .await?;
-        match response.status_code() {
-            200 => {
+        let status = response.status_code();
+        if status == 404 {
+            return Ok(None);
+        }
+        if !matches!(status, 200 | 206) {
+            return Err(NarouError::Platform(format!(
+                "S3 GET {} failed with status {status}",
+                key.as_ref()
+            )));
+        }
+        {
+            {
                 let headers = response.headers();
-                let size = headers
-                    .get("content-length")
-                    .ok()
-                    .flatten()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(0);
+                let content_range = headers.get("content-range").ok().flatten();
+                let content_length = headers.get("content-length").ok().flatten();
+                let size = narou_rs::platform::object_size(
+                    status,
+                    content_range.as_deref(),
+                    content_length.as_deref(),
+                )
+                .ok_or_else(|| {
+                    NarouError::Platform(format!(
+                        "S3 GET {} returned no size (content-range={content_range:?})",
+                        key.as_ref()
+                    ))
+                })?;
                 let etag = headers
                     .get("etag")
                     .ok()
@@ -233,11 +259,6 @@ impl S3ObjectStore {
                     last_modified,
                 }))
             }
-            404 => Ok(None),
-            status => Err(NarouError::Platform(format!(
-                "S3 HEAD {} failed with status {status}",
-                key.as_ref()
-            ))),
         }
     }
 

@@ -102,7 +102,7 @@ async fn build_object_stores(
             // 黙って D1 へ落とさない (fail-closed)。
             Some("s3") => {
                 let store: Arc<crate::s3_object_store::S3ObjectStore> =
-                    Arc::new(crate::s3_object_store::S3ObjectStore::from_env(env)?);
+                    Arc::new(crate::s3_object_store::S3ObjectStore::from_env(env).await?);
                 (store.clone(), store)
             }
             _ => (d1.clone(), d1.clone()),
@@ -318,12 +318,9 @@ impl WorkerRuntime {
         } else {
             None
         };
-        let oversized = envelope_bytes(&WorkerJobEnvelope::v2(
-            queued.job_id.clone(),
-            queued.job.clone(),
-        ))
-        .map(|size| size > job_limits::MAX_ENVELOPE_BYTES)
-        .unwrap_or(true);
+        let oversized = envelope_bytes(&WorkerJobEnvelope::v2(queued.job_id.clone()))
+            .map(|size| size > job_limits::MAX_ENVELOPE_BYTES)
+            .unwrap_or(true);
         let blocked_reason = unsupported.or_else(|| {
             oversized.then(|| {
                 format!(
@@ -372,7 +369,7 @@ impl WorkerRuntime {
                 blocked: None,
             });
         }
-        let envelope = WorkerJobEnvelope::v2(queued.job_id.clone(), queued.job);
+        let envelope = WorkerJobEnvelope::v2(queued.job_id.clone());
         self.queue.send(&envelope).await.map_err(|error| {
             narou_rs::error::NarouError::Platform(format!("queue send failed: {error}"))
         })?;

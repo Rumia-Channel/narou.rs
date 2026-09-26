@@ -400,6 +400,21 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   `global` (`over18`)、`inv` の section hash cache を起動時に読んで渡す。同期 API と非同期 D1 の
   都合で書き戻しは no-op。`over18` 未設定は `None` のままにして年齢認証 `Blocked` 経路を保つ。
 
+### Worker のフロント配信・認証・ストレージ (2026-09)
+
+- **静的アセット**: `worker_entry/build_assets.mjs` が `src/web/assets` を `public/` へ焼き込む
+  (`/assets/...` の配置 + ページはルート直下 + `?v=<内容ハッシュ>` + `__NAROU_RS_WEBUI_BUILD__`)。
+  `wrangler*.toml` の `[assets]` が配信し、`html_handling = "auto-trailing-slash"` で `/settings` を解決する。
+  `[build]` は `node build_assets.mjs && worker-build --release`。手動で `wrangler dev` する場合は
+  アセットを作り忘れないこと（`tests/run.mjs` は内部で作る）。
+- **認証**: health は無認証で `authentication_required` / `authentication_configured` を返す。
+  失敗は `{error:{code}}` 形式で、401 = `authentication_required`、トークン未設定 = 500 +
+  `authentication_not_configured`。`NAROU_AUTH_REQUIRED=false` はローカル開発用の抜け道。
+- **S3**: 資格情報は `<変数名>_STORE` バインディング (Secrets Store) 優先、無ければ secret。
+  メタデータは `GET` + `Range: bytes=0-0` で読む（`HEAD` が 403 になる互換ストレージがある）。
+- **キュー**: メッセージは `{version, job_id}` だけ。計画は D1 台帳が唯一の権威。
+- **サイト定義**: 実効定義は isolate 内に 30 秒キャッシュ（書き込みで即時無効化）。
+
 ### Worker の CI デプロイ (2026-09)
 
 - `.github/workflows/platform.yml` の `worker-deploy-{develop,staging,production}`。きっかけは

@@ -30,12 +30,12 @@ use crate::composition::{WorkerRuntime, check_ready};
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
     match path.as_str() {
-        "/" | "/health/live" => Response::ok("narou.rs worker is alive"),
+        "/health/live" => health_payload(&env, "alive"),
         "/health/ready" => match check_ready(&env).await {
-            Ok(()) => Response::ok("narou.rs worker is ready"),
+            Ok(()) => health_payload(&env, "ready"),
             Err(error) => {
                 console_log!("readiness failed: {error}");
-                Response::error("Not Ready", 503)
+                health_payload(&env, "not_ready").map(|response| response.with_status(503))
             }
         },
         "/api/novels" => api_novels(req, env).await,
@@ -56,8 +56,8 @@ async fn api_novels(req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
-    if !authorized(&req, &env) {
-        return Response::error("Unauthorized", 401);
+    if let Some(response) = auth_failure(&req, &env) {
+        return response;
     }
     let services = match composition::build_services(&env).await {
         Ok(services) => services,
@@ -114,8 +114,8 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
-    if !authorized(&req, &env) {
-        return Response::error("Unauthorized", 401);
+    if let Some(response) = auth_failure(&req, &env) {
+        return response;
     }
     let path = req.path();
     let rest = path.strip_prefix("/api/novels/").unwrap_or_default();
@@ -151,8 +151,8 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
 /// leaves as soon as it is produced. Neither the finished archive nor the image
 /// set is ever held in memory.
 async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Response> {
-    if !authorized(&req, &env) {
-        return Response::error("Unauthorized", 401);
+    if let Some(response) = auth_failure(&req, &env) {
+        return response;
     }
     let services = match composition::build_read_services(&env).await {
         Ok(services) => services,
@@ -369,10 +369,22 @@ struct EpubStreamState {
     prefix: String,
 }
 
+/// 無認証で返す health 応答。認証の要否と設定状況を機械可読で載せる
+/// (CLI / Web UI / 監視が、トークン未設定とトークン不一致を区別できる)。
+fn health_payload(env: &Env, status: &str) -> worker::Result<Response> {
+    let (required, configured) = auth_configuration(env);
+    Response::from_json(&serde_json::json!({
+        "status": status,
+        "service": "narou.rs worker",
+        "authentication_required": required,
+        "authentication_configured": configured,
+    }))
+}
+
 /// GET /api/sites — bundle 済み + ユーザー定義のサイト定義一覧。
 async fn api_sites(req: Request, env: Env) -> Result<Response> {
-    if !authorized(&req, &env) {
-        return Response::error("Unauthorized", 401);
+    if let Some(response) = auth_failure(&req, &env) {
+        return response;
     }
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
@@ -392,8 +404,8 @@ async fn api_sites(req: Request, env: Env) -> Result<Response> {
 /// PUT /api/sites/{name} — 1 件のユーザー定義を置き換える (YAML 本文)。
 /// DELETE /api/sites/{name} — ユーザー定義を消して bundle に戻す。
 async fn api_site(req: Request, env: Env) -> Result<Response> {
-    if !authorized(&req, &env) {
-        return Response::error("Unauthorized", 401);
+    if let Some(response) = auth_failure(&req, &env) {
+        return response;
     }
     let Some(name) = req
         .path()
@@ -420,8 +432,8 @@ async fn api_site(req: Request, env: Env) -> Result<Response> {
 /// GET /api/login — 保存済みログイン資格情報の一覧 (値は伏せる)。
 /// POST /api/login/set — 1 ホスト分を置き換える。
 async fn api_login(req: Request, env: Env) -> Result<Response> {
-    if !authorized(&req, &env) {
-        return Response::error("Unauthorized", 401);
+    if let Some(response) = auth_failure(&req, &env) {
+        return response;
     }
     match req.method() {
         Method::Get => {}
@@ -447,8 +459,8 @@ async fn api_login(req: Request, env: Env) -> Result<Response> {
 
 /// POST /api/login/set — `{host, cookie, label?}` で 1 ホスト分を置き換える。
 async fn api_login_set(req: Request, env: Env) -> Result<Response> {
-    if !authorized(&req, &env) {
-        return Response::error("Unauthorized", 401);
+    if let Some(response) = auth_failure(&req, &env) {
+        return response;
     }
     if req.method() != Method::Post {
         return Response::error("Method Not Allowed", 405);
@@ -467,8 +479,8 @@ async fn api_login_set(req: Request, env: Env) -> Result<Response> {
 
 /// DELETE /api/login/{host} — 1 ホスト分の資格情報を消す。
 async fn api_login_host(req: Request, env: Env) -> Result<Response> {
-    if !authorized(&req, &env) {
-        return Response::error("Unauthorized", 401);
+    if let Some(response) = auth_failure(&req, &env) {
+        return response;
     }
     if req.method() != Method::Delete {
         return Response::error("Method Not Allowed", 405);
@@ -501,8 +513,8 @@ async fn api_jobs(mut req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Post {
         return Response::error("Method Not Allowed", 405);
     }
-    if !authorized(&req, &env) {
-        return Response::error("Unauthorized", 401);
+    if let Some(response) = auth_failure(&req, &env) {
+        return response;
     }
     let request: narou_rs::application::JobRequest = match req.json().await {
         Ok(request) => request,
@@ -550,8 +562,8 @@ async fn api_job(req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
-    if !authorized(&req, &env) {
-        return Response::error("Unauthorized", 401);
+    if let Some(response) = auth_failure(&req, &env) {
+        return response;
     }
     let id = req.path().strip_prefix("/api/jobs/").map(str::to_string);
     let Some(id) = id else {
@@ -579,8 +591,8 @@ async fn api_object_migration(mut req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Post {
         return Response::error("Method Not Allowed", 405);
     }
-    if !authorized(&req, &env) {
-        return Response::error("Unauthorized", 401);
+    if let Some(response) = auth_failure(&req, &env) {
+        return response;
     }
 
     #[derive(serde::Deserialize, Default)]
@@ -615,18 +627,79 @@ async fn api_object_migration(mut req: Request, env: Env) -> Result<Response> {
     }
 }
 
-fn authorized(req: &Request, env: &Env) -> bool {
+/// 認証の判定結果。「トークンが要る」と「トークン未設定」を区別する。
+///
+/// 未設定を単なる 401 にすると、デプロイ直後の「トークンを入れ忘れた」状態が
+/// クライアントから見て「トークンが違う」と区別できない。CLI や Web UI が
+/// 診断できるよう、機械可読なコードを返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthState {
+    /// 通す (ヘッダが正しい、またはローカル開発用に認証を外している)。
+    Allowed,
+    /// トークンは設定済みで、ヘッダが無い/違う。
+    Required,
+    /// 認証が必要なのに `NAROU_ADMIN_TOKEN` が無い (fail-closed)。
+    NotConfigured,
+}
+
+/// 認証の設定状況 `(認証が必要か, トークンが設定済みか)`。
+fn auth_configuration(env: &Env) -> (bool, bool) {
+    // ローカル開発用の抜け道。既定は "true" (認証する)。
+    let required = env
+        .var("NAROU_AUTH_REQUIRED")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "true".to_string());
+    if required.eq_ignore_ascii_case("false") {
+        return (false, true);
+    }
+    (true, env.secret("NAROU_ADMIN_TOKEN").is_ok())
+}
+
+fn auth_state(req: &Request, env: &Env) -> AuthState {
+    let (required, configured) = auth_configuration(env);
+    if !required {
+        return AuthState::Allowed;
+    }
+    if !configured {
+        return AuthState::NotConfigured;
+    }
     let Ok(secret) = env.secret("NAROU_ADMIN_TOKEN") else {
-        return false;
+        return AuthState::NotConfigured;
     };
-    let expected = format!("Bearer {}", secret);
+    let expected = format!("Bearer {secret}");
     let Ok(actual) = req.headers().get("authorization") else {
-        return false;
+        return AuthState::Required;
     };
     let Some(actual) = actual else {
-        return false;
+        return AuthState::Required;
     };
-    actual.as_bytes().ct_eq(expected.as_bytes()).into()
+    if actual.as_bytes().ct_eq(expected.as_bytes()).into() {
+        AuthState::Allowed
+    } else {
+        AuthState::Required
+    }
+}
+
+/// 認証を要求し、失敗していればその応答を返す。
+fn auth_failure(req: &Request, env: &Env) -> Option<worker::Result<Response>> {
+    match auth_state(req, env) {
+        AuthState::Allowed => None,
+        AuthState::Required => Some(json_error(401, "authentication_required", None)),
+        AuthState::NotConfigured => Some(json_error(
+            500,
+            "authentication_not_configured",
+            Some("NAROU_ADMIN_TOKEN is not set for this Worker"),
+        )),
+    }
+}
+
+/// 機械可読なエラー応答 (`{error: {code, message?}}`)。
+fn json_error(status: u16, code: &str, message: Option<&str>) -> worker::Result<Response> {
+    let payload = match message {
+        Some(message) => serde_json::json!({ "error": { "code": code, "message": message } }),
+        None => serde_json::json!({ "error": { "code": code } }),
+    };
+    Response::from_json(&payload).map(|response| response.with_status(status))
 }
 
 fn query_param(url: &worker::Url, name: &str) -> Option<String> {

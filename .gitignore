@@ -61,6 +61,7 @@ __pycache__/
 /worker_entry/.deploy-secrets-*.json
 /worker_entry/.provision-output
 /worker_entry/public/
+/worker_entry/.asset-version
 
 # ログイン Cookie の書き出しファイル（資格情報を含むため追跡しない）
 /narou_login_export.yaml

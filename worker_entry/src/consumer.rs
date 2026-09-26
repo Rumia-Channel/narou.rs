@@ -95,7 +95,23 @@ async fn process_envelope(
                 message.ack();
                 return Ok(());
             }
-            process_discrete(runtime, downloader, envelope.job_id, &envelope.job, message).await
+            // 計画は台帳が持つ。旧形式 (メッセージに計画を積んだもの) だけ
+            // そのまま使う。
+            let plan = match envelope.job {
+                Some(plan) => plan,
+                None => match runtime.ledger.get(&envelope.job_id).await? {
+                    Some(view) => view.job,
+                    None => {
+                        let reason =
+                            format!("ledger has no row for queued job {}", envelope.job_id);
+                        console_log!("rejecting envelope {}: {reason}", message.id());
+                        runtime.ledger.record_rejected(&message.id(), &reason).await?;
+                        message.ack();
+                        return Ok(());
+                    }
+                },
+            };
+            process_discrete(runtime, downloader, envelope.job_id, &plan, message).await
         }
         1 => {
             // Legacy envelope: one `JobRequest` body. Only a request that

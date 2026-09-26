@@ -25,8 +25,19 @@ S3_PREFIX = "narou/local"
 # 資格情報は `wrangler dev --var S3_ACCESS_KEY_ID:... --var S3_SECRET_ACCESS_KEY:...`
 # または gitignore 済みの `.dev.vars` で渡す (リポジトリに置かない)。
 
+# Web UI (src/web/assets) を `build_assets.mjs` が `public/` へ焼き込む。
+# 既定 (run_worker_first なし) では静的アセットが先に解決され、無いパスだけが
+# Worker へ落ちる。`/api/*` と `/health/*` はアセットに無いので Worker が受ける。
+[assets]
+directory = "public"
+binding = "ASSETS"
+# `/settings` のような拡張子なし URL を `settings.html` に解決する。
+html_handling = "auto-trailing-slash"
+# 見つからないパスは Worker に流す (API の 404 を Worker が返す)。
+not_found_handling = "none"
+
 [build]
-command = "worker-build --release"
+command = "node build_assets.mjs && worker-build --release"
 
 [[d1_databases]]
 binding = "DB"

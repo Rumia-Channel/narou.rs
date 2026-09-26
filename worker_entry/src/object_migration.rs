@@ -42,7 +42,9 @@ pub async fn run(
     let d1: Arc<dyn ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
     let d1_assets: Arc<dyn AssetStore> = Arc::new(D1ObjectStore::new(db.clone()));
     let s3: Arc<S3ObjectStore> = Arc::new(
-        S3ObjectStore::from_env(env).map_err(|error| NarouError::Platform(error.to_string()))?,
+        S3ObjectStore::from_env(env)
+            .await
+            .map_err(|error| NarouError::Platform(error.to_string()))?,
     );
 
     let mut state = load_state(db).await?;

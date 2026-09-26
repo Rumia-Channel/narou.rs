@@ -60,7 +60,7 @@ pub fn site_definitions(
 ///
 /// ユーザー定義が無ければ bundle のキャッシュ済み結果をそのまま返す
 /// （isolate ごとに 1 回の parse + compile で済む）。1 件でもあればマージして
-/// 読み直す。
+/// 読み直し、結果を **L1 に TTL 付きで** 載せる（リクエストごとに D1 を読まない）。
 pub async fn load_site_settings(
     objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
 ) -> Result<Vec<SiteSetting>> {
@@ -68,7 +68,39 @@ pub async fn load_site_settings(
     if store.list().await?.is_empty() {
         return load_bundled_site_settings();
     }
+    if let Some(cached) = cached_site_settings() {
+        return Ok(cached);
+    }
     let effective = site_definitions(objects.clone()).effective().await?;
     let contents: Vec<&str> = effective.iter().map(|(_, yaml)| yaml.as_str()).collect();
-    SiteSetting::load_bundled(&contents)
+    let settings = SiteSetting::load_bundled(&contents)?;
+    store_site_settings(&settings);
+    Ok(settings)
+}
+
+/// L1 キャッシュの寿命。書き込みは同じ isolate なら即時、他の isolate は
+/// この時間で追従する (サイト定義は頻繁に変わらないので十分)。
+const SITE_SETTINGS_TTL_MS: f64 = 30_000.0;
+
+static SITE_SETTINGS_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<Option<(f64, Vec<SiteSetting>)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+fn cached_site_settings() -> Option<Vec<SiteSetting>> {
+    let cache = SITE_SETTINGS_CACHE.lock().ok()?;
+    let (stored_at, settings) = cache.as_ref()?;
+    (js_sys::Date::now() - stored_at < SITE_SETTINGS_TTL_MS).then(|| settings.clone())
+}
+
+fn store_site_settings(settings: &[SiteSetting]) {
+    if let Ok(mut cache) = SITE_SETTINGS_CACHE.lock() {
+        *cache = Some((js_sys::Date::now(), settings.to_vec()));
+    }
+}
+
+/// サイト定義を書き換えた直後に呼ぶ (同じ isolate のキャッシュを落とす)。
+pub fn invalidate_site_settings() {
+    if let Ok(mut cache) = SITE_SETTINGS_CACHE.lock() {
+        *cache = None;
+    }
 }

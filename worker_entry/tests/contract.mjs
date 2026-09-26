@@ -58,25 +58,47 @@ async function request(path, init = {}) {
   return fetch(url(path), init);
 }
 
-await check("GET /health/live returns 200 without auth", async () => {
+/** エラー応答の機械可読コードを取り出す。 */
+async function errorCode(response) {
+  const body = await json(response);
+  return body?.error?.code;
+}
+
+await check("GET /health/live reports the auth configuration", async () => {
   const response = await request("/health/live");
+  const body = await json(response);
   assert(response.status === 200, `status ${response.status}`);
+  assert(body.status === "alive", `unexpected status: ${JSON.stringify(body)}`);
+  assert(body.authentication_required === true, "auth must be required in this run");
+  assert(
+    body.authentication_configured === true,
+    "the token must be configured in this run",
+  );
 });
 
 await check("GET /health/ready returns 200 (D1 + queue + DO + composition)", async () => {
   const response = await request("/health/ready");
-  const body = await response.text();
-  assert(response.status === 200, `status ${response.status}: ${body.slice(0, 200)}`);
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}: ${JSON.stringify(body)}`);
+  assert(body.status === "ready", `unexpected status: ${JSON.stringify(body)}`);
 });
 
 await check("GET /api/novels is closed without a token", async () => {
   const response = await request("/api/novels");
   assert(response.status === 401, `status ${response.status}`);
+  assert(
+    (await errorCode(response)) === "authentication_required",
+    "the failure must be machine readable",
+  );
 });
 
 await check("GET /api/novels rejects a wrong token", async () => {
   const response = await request("/api/novels", auth("definitely-not-the-token"));
   assert(response.status === 401, `status ${response.status}`);
+  assert(
+    (await errorCode(response)) === "authentication_required",
+    "the failure must be machine readable",
+  );
 });
 
 await check("GET /api/novels returns the paged shape", async () => {
@@ -111,6 +133,7 @@ await check("GET /api/jobs/:id returns 404 for an unknown job", async () => {
 await check("POST /api/jobs requires auth", async () => {
   const response = await request("/api/jobs", { method: "POST", body: "{}" });
   assert(response.status === 401, `status ${response.status}`);
+  assert((await errorCode(response)) === "authentication_required", "code must be set");
 });
 
 await check("POST /api/jobs rejects a malformed body", async () => {
@@ -132,6 +155,43 @@ await check("POST /api/jobs rejects an unknown kind", async () => {
 });
 
 let convertJobId = null;
+
+await check("GET / serves the Web UI with versioned assets", async () => {
+  const response = await request("/");
+  assert(response.status === 200, `status ${response.status}`);
+  const html = await response.text();
+  assert(
+    html.includes("__NAROU_RS_WEBUI_BUILD__"),
+    "the build script must be injected into the page",
+  );
+  assert(
+    /main\.js\?v=[0-9a-f]{16}/.test(html),
+    "asset references must carry a content hash",
+  );
+});
+
+await check("GET /assets/<file>?v=<hash> serves the static asset", async () => {
+  const html = await (await request("/")).text();
+  const match = html.match(/\/assets\/([^"'?]*main\.js)\?v=([0-9a-f]{16})/);
+  assert(match, `the page should reference a versioned main.js: ${html.slice(0, 200)}`);
+  const response = await request(`/assets/${match[1]}?v=${match[2]}`);
+  assert(response.status === 200, `status ${response.status}`);
+  const type = response.headers.get("content-type") ?? "";
+  assert(type.includes("javascript"), `unexpected content type: ${type}`);
+});
+
+await check("the scheduled handler runs (cron planner)", async () => {
+  // `wrangler dev --test-scheduled` のテスト用エンドポイントは wrangler の
+  // バージョンで名前が変わるので両方試す。
+  const paths = ["/__scheduled?cron=*+*+*+*+*", "/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"];
+  const statuses = [];
+  for (const path of paths) {
+    const response = await request(path);
+    statuses.push(`${path} -> ${response.status}`);
+    if (response.status === 200) return;
+  }
+  throw new Error(`scheduled endpoint not reachable: ${statuses.join(", ")}`);
+});
 
 await check("POST /api/jobs accepts a Convert plan", async () => {
   const response = await request("/api/jobs", {
@@ -183,6 +243,7 @@ await check("GET /api/sites lists bundled definitions", async () => {
 await check("GET /api/sites is closed without a token", async () => {
   const response = await request("/api/sites");
   assert(response.status === 401, `status ${response.status}`);
+  assert((await errorCode(response)) === "authentication_required", "code must be set");
 });
 
 await check("PUT /api/sites/{name} rejects an invalid definition", async () => {
@@ -328,6 +389,7 @@ await check("POST /api/admin/object-migration requires auth", async () => {
     body: JSON.stringify({ action: "status" }),
   });
   assert(response.status === 401, `status ${response.status}`);
+  assert((await errorCode(response)) === "authentication_required", "code must be set");
 });
 
 if (QUEUE_CHECKS) {

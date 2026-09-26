@@ -55,6 +55,7 @@ pub async fn put(runtime: &WorkerRuntime, name: &str, mut request: Request) -> R
     if let Err(error) = service.put(name, &body).await {
         return error_response(&error.to_string());
     }
+    crate::bundled_sites::invalidate_site_settings();
     list(runtime).await
 }
 
@@ -64,6 +65,7 @@ pub async fn delete(runtime: &WorkerRuntime, name: &str) -> Result<Response> {
     if let Err(error) = service.delete(name).await {
         return error_response(&error.to_string());
     }
+    crate::bundled_sites::invalidate_site_settings();
     list(runtime).await
 }
 
