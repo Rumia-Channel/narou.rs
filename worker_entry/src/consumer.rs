@@ -214,7 +214,8 @@ async fn process_discrete(
 
     let outcome = if job.kind == JobKind::Convert {
         // Convert は保存済みデータだけを見るので Downloader を使わない。
-        crate::convert::execute_convert(runtime, job).await
+        // コンソール行は PushHubSink を内側で install/drain する。
+        crate::convert::execute_convert(runtime, job, push).await
     } else {
         execute_job(
             downloader,

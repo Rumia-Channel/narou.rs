@@ -180,11 +180,20 @@ pub struct PushHubSink {
 }
 
 impl PushHubSink {
-    pub fn new(client: PushHubClient) -> Self {
+    fn new(client: PushHubClient) -> Self {
         Self {
             client,
             buffer: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// sink を作り、深い呼び出し経路向けの既定 sink
+    /// (`narou_rs::application::messages::emit_default` が読む共有スロット) にも
+    /// 登録して返す。download / convert いずれのジョブ境界でも同じ手順。
+    pub fn install(client: PushHubClient) -> std::sync::Arc<Self> {
+        let sink = std::sync::Arc::new(Self::new(client));
+        narou_rs::application::messages::set_default_sink(sink.clone());
+        sink
     }
 
     /// 積まれた行をまとめて PushHub へ送る (best-effort)。ジョブ実行の

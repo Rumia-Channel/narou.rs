@@ -137,9 +137,9 @@ pub async fn execute_job(
     )));
     // native のコンソール行 = PushHub の echo イベント。Downloader 内の
     // report_line/report_warn と、sink を引き回せない既定 sink 経路の
-    // 両方へ同じバッファを指す sink をインストールする。
-    let push_sink = std::sync::Arc::new(PushHubSink::new(push.clone()));
-    narou_rs::application::messages::set_default_sink(push_sink.clone());
+    // 両方へ同じバッファを指す sink をインストールする
+    // (`PushHubSink::install` が既定 sink 登録まで担う — convert ジョブも同じ)。
+    let push_sink = PushHubSink::install(push.clone());
     downloader.set_message_sink(push_sink.clone());
     let mut budget = WorkerBudget::new(JOB_TIME_BUDGET, subrequests).with_checkpoints(
         ledger.clone(),
