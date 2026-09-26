@@ -212,6 +212,127 @@ await check("GET /api/jobs/:id returns 404 for an unknown job", async () => {
   assert(response.status === 404, `status ${response.status}`);
 });
 
+await check("GET /api/webui/config returns the UI configuration", async () => {
+  const response = await request("/api/webui/config", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(typeof body.theme === "string" && body.theme.length > 0, "theme must be a string");
+  assert(typeof body.performance_mode === "string", "performance_mode must be a string");
+  assert(typeof body.reload_timing === "string", "reload_timing must be a string");
+  assert(typeof body.debug_mode === "boolean", "debug_mode must be a boolean");
+  assert(
+    typeof body.ws_port === "number" && typeof body.port === "number",
+    "ports must be numbers",
+  );
+  assert(typeof body.concurrency_enabled === "boolean", "concurrency_enabled must be a boolean");
+});
+
+await check("GET /api/sort_state returns the current sort", async () => {
+  const response = await request("/api/sort_state", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(typeof body.column === "number", `column must be a number: ${JSON.stringify(body)}`);
+  assert(["asc", "desc"].includes(body.dir), `dir must be asc or desc: ${JSON.stringify(body)}`);
+});
+
+await check("POST /api/sort_state rejects an invalid column", async () => {
+  const response = await request("/api/sort_state", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ column: "not-a-number", dir: "sideways" }),
+  });
+  assert(response.status === 200, `status ${response.status}`);
+  assert((await json(response)).success === false, "an invalid sort must be rejected");
+});
+
+await check("GET /api/tag_list?format=json returns tags and colors", async () => {
+  const response = await request("/api/tag_list?format=json", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(Array.isArray(body.tags), "tags must be an array");
+  assert(body.tag_colors && typeof body.tag_colors === "object", "tag_colors must be an object");
+});
+
+await check("GET /api/queue/status returns the queue counters", async () => {
+  const response = await request("/api/queue/status", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  for (const key of ["pending", "completed", "partial", "failed", "cancelled", "running_count"]) {
+    assert(typeof body[key] === "number", `${key} must be a number: ${JSON.stringify(body)}`);
+  }
+  assert(
+    body.running === null || typeof body.running === "string",
+    "running must be null or a label",
+  );
+  assert(body.lane_sizes && typeof body.lane_sizes === "object", "lane_sizes must be an object");
+});
+
+await check("GET /api/get_pending_tasks returns pending and running lists", async () => {
+  const response = await request("/api/get_pending_tasks", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(Array.isArray(body.pending) && Array.isArray(body.running), "lists must be arrays");
+  assert(
+    typeof body.pending_count === "number" && typeof body.running_count === "number",
+    "counts must be numbers",
+  );
+});
+
+await check("GET /api/feature_tour/pending returns the tour state", async () => {
+  const response = await request("/api/feature_tour/pending", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(body.success === true, `unexpected body: ${JSON.stringify(body).slice(0, 200)}`);
+  assert(Array.isArray(body.entries), "entries must be an array");
+  assert(typeof body.current_version === "string", "current_version must be a string");
+});
+
+await check("GET /api/list?all=true returns the library shape", async () => {
+  const response = await request("/api/list?all=true", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  // native の NovelListResponse (`src/web/state.rs`) と同じ snake_case キー。
+  for (const key of ["draw", "records_total", "records_filtered", "data"]) {
+    assert(key in body, `missing key ${key}: ${JSON.stringify(body).slice(0, 200)}`);
+  }
+  assert(Array.isArray(body.data), "data must be an array");
+  assert(typeof body.records_total === "number", "records_total must be a number");
+  for (const item of body.data) {
+    for (const key of ["id", "title", "tags", "frozen", "suspend", "toc_url"]) {
+      assert(key in item, `item missing ${key}: ${JSON.stringify(item).slice(0, 200)}`);
+    }
+    assert(Array.isArray(item.tags), "tags must be an array");
+  }
+});
+
+await check("GET /api/list rejects an over-long search", async () => {
+  const response = await request(`/api/list?filter=${"a".repeat(5000)}`, auth());
+  assert(response.status === 400, `status ${response.status}`);
+  assert((await errorCode(response)) === "invalid_request", "the failure must be machine readable");
+});
+
+await check("GET /api/library_backup reports no pending offer", async () => {
+  const response = await request("/api/library_backup", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(body.pending === false, `pending must be false on the worker: ${JSON.stringify(body)}`);
+  assert(typeof body.running === "boolean", "running must be a boolean");
+});
+
+await check("POST /api/library_backup is not supported on the worker", async () => {
+  // ローカル FS に zip を書けないので、成功を偽装せず 501 を返す。
+  const response = await request("/api/library_backup", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ action: "create" }),
+  });
+  assert(response.status === 501, `status ${response.status}`);
+  assert(
+    (await errorCode(response)) === "library_backup_not_supported",
+    "the failure must be machine readable",
+  );
+});
+
 await check("GET /api/global_setting returns the settings page payload", async () => {
   const response = await request("/api/global_setting", auth());
   assert(response.status === 200, `status ${response.status}`);
