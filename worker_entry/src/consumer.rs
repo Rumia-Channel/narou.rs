@@ -211,18 +211,10 @@ async fn process_discrete(
         }
     };
 
-    // 開始イベント: コンソールへ 1 行出し、キュー表示を更新させる。
-    // (native は subprocess の出力をそのまま echo する — worker では
-    // 実行本体が echo を吐かないので、consumer が節目の行を組み立てる)
+    // 開始通知: キュー表示の更新だけを送る。native はここで echo 行を出さず
+    // CLI 子プロセスの出力が流れるだけなので、worker でも合成の開始行は
+    // 送らない (queue_start は UI の refresh トリガとしてだけ有用)。
     push.broadcast_best_effort(&[
-        echo(
-            &format!(
-                "ジョブ {job_id} ({}: {}) を開始します",
-                job.kind.as_str(),
-                job.target.as_str()
-            ),
-            "stdout",
-        ),
         event("queue_start", json!(job_id.as_str())),
         notification_queue(),
     ])
@@ -277,12 +269,7 @@ async fn process_discrete(
                 push,
                 &job_id,
                 &[
-                    echo(
-                        &format!(
-                            "ジョブ {job_id} は一部未完了です (次回は途中から再開します): {reason}"
-                        ),
-                        "stdout",
-                    ),
+                    echo(&reason, "stdout"),
                     event(
                         "queue_partial",
                         json!({ "job_id": job_id.as_str(), "reason": reason }),
@@ -303,12 +290,7 @@ async fn process_discrete(
                 )
                 .await?;
             console_log!("job {job_id} blocked: {reason}");
-            broadcast_terminal_events(
-                push,
-                &job_id,
-                &failure_events(&job_id, &reason),
-            )
-            .await;
+            broadcast_failure(runtime, push, &job_id, &reason).await;
             message.ack();
         }
         JobOutcome::Permanent { reason } => {
@@ -322,12 +304,7 @@ async fn process_discrete(
                 )
                 .await?;
             console_log!("job {job_id} failed permanently: {reason}");
-            broadcast_terminal_events(
-                push,
-                &job_id,
-                &failure_events(&job_id, &reason),
-            )
-            .await;
+            broadcast_failure(runtime, push, &job_id, &reason).await;
             message.ack();
         }
         JobOutcome::Retryable { reason } => {
@@ -348,20 +325,15 @@ async fn process_discrete(
                                 "backoff_secs": delay,
                                 "available_at": (js_sys::Date::now() / 1000.0) as i64
                                     + i64::from(delay),
-                                "reason": reason,
+                                "reason": first_non_empty_line(&reason),
                             }),
                         )],
                     )
                     .await;
                     message.retry_with_options(&options);
                 }
-                RetryDisposition::Exhausted { reason } => {
-                    broadcast_terminal_events(
-                        push,
-                        &job_id,
-                        &failure_events(&job_id, &reason),
-                    )
-                    .await;
+                RetryDisposition::Exhausted => {
+                    broadcast_failure(runtime, push, &job_id, &reason).await;
                     message.ack();
                 }
             }
@@ -372,17 +344,53 @@ async fn process_discrete(
 
 /// `queue_failed` + コンソール echo — Blocked / Permanent / リトライ枯渇の
 /// 共通イベント列 (native `JobOutcome::Failed` 相当)。
-fn failure_events(job_id: &JobId, reason: &str) -> Vec<serde_json::Value> {
-    vec![
-        echo(
-            &format!("ジョブ {job_id} が失敗しました: {reason}"),
-            "stdout",
-        ),
-        event(
-            "queue_failed",
-            json!({ "job_id": job_id.as_str(), "reason": reason }),
-        ),
-    ]
+///
+/// `reason` は台帳へ書き込んだ last_error 全文だが、UI には native の
+/// `failure_reason` (`src/web/worker.rs`) と同じ意味論 — **最初の非空行**
+/// — だけを出す。`detail` は native 同様 `webui.debug-mode` が ON のとき
+/// だけ `queue_failed.data.detail` に全文を載せる。
+async fn broadcast_failure(
+    runtime: &WorkerRuntime,
+    push: &PushHubClient,
+    job_id: &JobId,
+    reason: &str,
+) {
+    let mut data = json!({
+        "job_id": job_id.as_str(),
+        "reason": first_non_empty_line(reason),
+    });
+    if webui_debug_mode(runtime).await {
+        data["detail"] = serde_json::Value::String(reason.to_string());
+    }
+    broadcast_terminal_events(
+        push,
+        job_id,
+        &[echo(first_non_empty_line(reason), "stdout"), event("queue_failed", data)],
+    )
+    .await;
+}
+
+/// native `failure_reason` 相当: detail (= last_error) の最初の非空行を
+/// 採用する。見つからなければ trim 済みの全文にフォールバック。
+fn first_non_empty_line(text: &str) -> &str {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_else(|| text.trim())
+}
+
+/// `webui.debug-mode` (local スコープ)。読み取りに失敗しても表示用なので
+/// false (= detail を載せない) に倒す。
+async fn webui_debug_mode(runtime: &WorkerRuntime) -> bool {
+    runtime
+        .services
+        .settings
+        .get("webui.debug-mode")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 /// `Retryable` を台帳へ記録し、まだ試行枠が残っているかを返す。
@@ -390,7 +398,7 @@ fn failure_events(job_id: &JobId, reason: &str) -> Vec<serde_json::Value> {
 /// (イベントを先に流さないと UI が再試行の前にキューを見逃す)。
 enum RetryDisposition {
     Rescheduled { attempts: u32, delay: u32 },
-    Exhausted { reason: String },
+    Exhausted,
 }
 
 async fn settle_retryable(
@@ -415,7 +423,7 @@ async fn settle_retryable(
             )
             .await?;
         console_log!("job {job_id} permanently failed: {exhausted}");
-        Ok(RetryDisposition::Exhausted { reason: exhausted })
+        Ok(RetryDisposition::Exhausted)
     } else {
         let delay = retry_delay_secs(attempts);
         console_log!(
