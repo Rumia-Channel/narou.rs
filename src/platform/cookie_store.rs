@@ -306,26 +306,18 @@ pub fn cookie_host_for_url(url: &str) -> Option<String> {
 /// without one (wasm) keeps whatever id came with the data, which the
 /// downloader tolerates (it falls back to the first entry).
 pub fn assign_credential_ids(stored: &mut BTreeMap<String, Vec<LoginCredential>>) -> bool {
-    #[cfg(not(feature = "native-runtime"))]
-    {
-        let _ = stored;
-        false
-    }
-    #[cfg(feature = "native-runtime")]
-    {
-        let mut changed = false;
-        for credentials in stored.values_mut() {
-            for credential in credentials.iter_mut() {
-                if credential.id.is_empty()
-                    && let Ok(id) = crate::login::new_credential_id()
-                {
-                    credential.id = id;
-                    changed = true;
-                }
+    let mut changed = false;
+    for credentials in stored.values_mut() {
+        for credential in credentials.iter_mut() {
+            if credential.id.is_empty()
+                && let Ok(id) = crate::login::new_credential_id()
+            {
+                credential.id = id;
+                changed = true;
             }
         }
-        changed
     }
+    changed
 }
 
 /// Normalize a credential before it is stored: surrounding space is never
@@ -340,7 +332,6 @@ pub fn tidy_credentials(credentials: &[LoginCredential]) -> Vec<LoginCredential>
             }
             let mut credential = credential.clone();
             credential.cookie = cookie.to_string();
-            #[cfg(feature = "native-runtime")]
             if credential.id.is_empty()
                 && let Ok(id) = crate::login::new_credential_id()
             {
@@ -398,6 +389,34 @@ pub fn decode_stored_credentials(
         }
     }
     Ok(stored)
+}
+
+/// 一覧表示用に Cookie を伏せる（名前だけ残す）。
+pub fn mask_cookie(cookie: &str) -> String {
+    let pairs = parse_cookie_header(cookie);
+    let length = cookie.chars().count();
+    if pairs.is_empty() {
+        return format!("({length} 文字)");
+    }
+    let names = pairs
+        .iter()
+        .map(|(name, _)| format!("{name}=…"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("{names} ({} 件, {length} 文字)", pairs.len())
+}
+
+/// 送信した `Cookie:` ヘッダに対応する資格情報か。
+///
+/// `Set-Cookie` の書き戻し先を決めるのに使う: 送っていない資格情報を
+/// 更新すると、別アカウントのセッションを壊す。
+pub fn credential_was_sent(credential: &str, sent: &[(String, String)]) -> bool {
+    let pairs = parse_cookie_header(credential);
+    !pairs.is_empty()
+        && pairs.iter().all(|(name, value)| {
+            sent.iter()
+                .any(|(sent_name, sent_value)| sent_name == name && sent_value == value)
+        })
 }
 
 #[cfg(test)]

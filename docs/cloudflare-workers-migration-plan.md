@@ -165,7 +165,7 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 |---|---|---|
 | 1 | ~~SSRF 検証が DNS 解決を要求~~ → **解決済み**: 構文検証を `platform::url_policy` に分離し、`HttpClient::validate_url` の実装が DNS の有無に応じて判定する（native=解決先まで、worker=構文とアドレスリテラル） | `src/platform/url_policy.rs`, `src/platform/http.rs`, `src/downloader/security.rs`, `worker_entry/src/http.rs` |
 | 2 | ~~Convert が Worker に存在しない~~ → **解決**: `ConvertService`（core）が保存済み TOC と本文から変換テキストを組み、`<prefix>/novel.txt` へ書く。`JobKind::Convert` は worker 実行可能。native の `convert_novel_by_id` が書く固定名ミラーと同じキー | `src/application/convert.rs`, `worker_entry/src/convert.rs`, `src/application/jobs.rs` |
-| 3 | ~~CookieStore 未注入~~ → **読取は解決**: `D1CookieStore` を `new_downloader` に注入（保存形式は native と同じ `app_state(inv, login_cookie)`）。書込 (`save_all`) は wasm に乱数源が無いため未対応＝資格情報の取込と Set-Cookie の書き戻しは native 側で行う | `worker_entry/src/d1_cookie_store.rs`, `worker_entry/src/composition.rs` |
+| 3 | ~~CookieStore 未注入~~ → **解決**: `D1CookieStore` の読み書き両方を注入（native と同じ `app_state(inv, login_cookie)`、at-rest 暗号化）。`Set-Cookie` の書き戻しと `/api/login*`（一覧・置き換え・削除）も Worker で動く | `worker_entry/src/d1_cookie_store.rs`, `worker_entry/src/http.rs`, `worker_entry/src/login.rs` |
 | 4 | ~~設定が Worker に届かない~~ → **解決**: `SnapshotDownloaderSettings` に `app_state` の `local`/`global`（`update.strong` / `guard-spoiler` / `auto-add-tags` / `download.use-subdirectory` / `over18`）と `inv` の section hash cache を起動時に読んで注入。書き戻しは同期 API と非同期 D1 の都合で no-op（`over18` は Web UI 側で設定） | `src/downloader/settings.rs`, `worker_entry/src/composition.rs` |
 | 5 | デプロイ設定: `wrangler.<target>.toml` + `ci/render_config.py` は完成。CI の `worker-deploy`（手動トリガー・environment ゲート）に必要な secret/vars を設定すれば動くが、**実アカウントでの実行は未検証** | `worker_entry/wrangler.develop.toml`, `.github/workflows/platform.yml` |
 | 6 | ~~worker のテストが CI で 1 件も走らない~~ → **解決**: `worker_entry/tests/contract.mjs`（HTTP 契約）と `tests/run.mjs`（ローカル workerd 起動）を CI の `worker-contract` ジョブで実行 | `.github/workflows/platform.yml` |
@@ -230,6 +230,22 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 - コアは `narou_rs::platform::store_migration`。`MemoryObjectStore` 2 系統で「挿絵だけ動く」
   「verify が欠落と不一致を報告する」を固定している。
 - 既知の制約: `verify` は 16 MiB を超えるオブジェクトを「上限超過」として報告する (bounded read と同値)。
+
+### 2.2.6 ログイン資格情報の書き込み (P1, 2026-09-26 実装)
+
+- wasm でも at-rest 暗号化ができるようにした: `getrandom` を `worker-runtime` に足し、
+  `wasm_js` バックエンド (`crypto.getRandomValues`) を**ターゲット限定の依存**で有効にする。
+  native 側には `wasm-bindgen` が入らない (`cargo tree` で確認済み)。
+- `D1CookieStore::save_all` は native と同じく「JSON 配列 → XChaCha20-Poly1305 (host を AAD)」で
+  保存する。鍵 (`NAROU_RS_LOGIN_KEY`) が無ければ平文で書かずに失敗させる (fail-closed)。
+- `WorkerHttpClient` が `Set-Cookie` を書き戻す (native の `persist_set_cookie` と同じ規則:
+  送信した資格情報だけを更新し、別アカウントのセッションを壊さない)。
+- 管理 API: `GET /api/login`（値は伏せて一覧）、`POST /api/login/set`、`DELETE /api/login/{host}`。
+  応答形は native Web UI と同じ `{success, data|message}`。
+- 検証: 契約テストが「登録 → 暗号化されている (`encrypted: true`) → 値が応答に現れない →
+  一覧 → 削除」を workerd 上で確認する。乱数が wasm で動くことも同時に固定される。
+- 残り: `POST /api/login/import`（書き出しファイルの取り込み。argon2 依存のため
+  `login::transfer` は native のみ）と `add` / `order`。
 
 ### 2.3 その他の差分
 

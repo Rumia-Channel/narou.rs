@@ -388,10 +388,13 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   同期文脈 (挿絵 URL の足切り / preprocess DSL の `fetch`) は `is_safe_public_url_syntax` を使い、
   ホスト名の解決先は実際の取得時に transport が確認する。
 - **資格情報**: `D1CookieStore` (`worker_entry/src/d1_cookie_store.rs`) が native と同じ
-  `app_state(scope='inv', key='login_cookie')` を読む。復号鍵は secret `NAROU_RS_LOGIN_KEY`
-  (native の環境変数と同名)。**書き込みは wasm 非対応** (暗号化に乱数が要る) なので、資格情報の
-  取り込みと Set-Cookie の書き戻しは native 側で行う。保存形式の互換は
-  `src/platform/cookie_store.rs` の固定ベクタテストで担保する。
+  `app_state(scope='inv', key='login_cookie')` を読み書きする (at-rest 暗号化、鍵は secret
+  `NAROU_RS_LOGIN_KEY`)。`Set-Cookie` の書き戻しは `WorkerHttpClient`、管理は
+  `GET /api/login` / `POST /api/login/set` / `DELETE /api/login/{host}`。
+  保存形式の互換は `src/platform/cookie_store.rs` の固定ベクタテストで担保する。
+- **wasm の乱数**: `getrandom` の `wasm_js` を**ターゲット限定の依存**
+  (`[target.'cfg(target_arch = "wasm32")'.dependencies]`) で有効にしている。native の依存グラフに
+  `wasm-bindgen` を入れないための措置なので、`getrandom` の扱いを変えるときは `cargo tree` で確認する。
 - **設定**: `SnapshotDownloaderSettings` (`src/downloader/settings.rs`) に `app_state` の
   `local` (`update.strong` / `guard-spoiler` / `auto-add-tags` / `download.use-subdirectory`) と
   `global` (`over18`)、`inv` の section hash cache を起動時に読んで渡す。同期 API と非同期 D1 の

@@ -115,4 +115,4 @@ fn state_error(error: impl std::fmt::Display) -> NarouError {
 }
 
 /// API 側が使う既定・上限件数 (core と同じ値)。
-pub use narou_rs::platform::store_migration::{DEFAULT_LIMIT, MAX_LIMIT};
+pub use narou_rs::platform::store_migration::DEFAULT_LIMIT;

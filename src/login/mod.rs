@@ -22,10 +22,11 @@ pub mod transfer;
 
 pub use crypto::{
     AT_REST_PREFIX, KEY_LEN, decrypt_at_rest, decrypt_stored_value, decrypt_with_key,
-    is_encrypted_at_rest, parse_key_base64,
+    encrypt_at_rest, encrypt_with_key, is_encrypted_at_rest, new_credential_id, parse_key_base64,
+    random_bytes, random_key,
 };
 #[cfg(feature = "native-runtime")]
-pub use crypto::{derive_key, encrypt_at_rest, encrypt_with_key, new_credential_id, random_key};
+pub use crypto::derive_key;
 #[cfg(feature = "native-runtime")]
 pub use transfer::{
     CookieEnvelope, EXPORT_VERSION, build_export, group_credentials, parse_export,

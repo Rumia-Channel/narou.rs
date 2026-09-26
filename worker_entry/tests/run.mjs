@@ -38,10 +38,15 @@ function run(command, args, options = {}) {
 // 1. ローカル用の secret。既にあれば触らない (開発者の値を壊さない)。
 const devVars = join(root, ".dev.vars");
 if (!existsSync(devVars)) {
-  writeFileSync(devVars, `NAROU_ADMIN_TOKEN=${token}\n`);
+  // 資格情報は at-rest で暗号化されるので、テスト用の鍵も要る (32 バイトの base64)。
+  // 32 バイトちょうどでなければ復号鍵として拒否される。
+  const loginKey = Buffer.alloc(32, 7).toString("base64");
+  writeFileSync(devVars, `NAROU_ADMIN_TOKEN=${token}\nNAROU_RS_LOGIN_KEY=${loginKey}\n`);
   console.log(`wrote ${devVars}`);
 } else {
-  console.log(`${devVars} exists; using it as-is (NAROU_ADMIN_TOKEN must match)`);
+  console.log(
+    `${devVars} exists; using it as-is (NAROU_ADMIN_TOKEN and NAROU_RS_LOGIN_KEY must be set)`,
+  );
 }
 
 // 2. 実行用の設定。ビルドはこのスクリプトが行うので [build] を外す

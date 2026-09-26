@@ -15,8 +15,8 @@ use narou_rs::downloader::settings::{DownloaderSettings, SnapshotDownloaderSetti
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::Result;
 use narou_rs::platform::{
-    AssetStore, Clock, HttpClient, NovelRepository, ObjectStore, RateLimiter, SplitStore,
-    SystemClock,
+    AssetStore, Clock, CookieStore, HttpClient, NovelRepository, ObjectStore, RateLimiter,
+    SplitStore, SystemClock,
 };
 use narou_rs::setting_core::SettingScope;
 use serde::Deserialize;
@@ -63,8 +63,9 @@ pub struct WorkerRuntime {
     site_settings: Vec<SiteSetting>,
     /// D1 ハンドル（資格情報ストアと設定スナップショットが使う）。
     db: Arc<D1Database>,
-    /// 保存済み資格情報の復号鍵（secret 未設定なら `None`）。
-    login_key: Option<[u8; 32]>,
+    /// 保存済みログイン資格情報。Downloader・HTTP クライアント・管理 API が
+    /// 同じ実体を共有する。
+    cookie_store: Arc<crate::d1_cookie_store::D1CookieStore>,
     /// Shared subrequest counter for this invocation; the executor reads it
     /// at section boundaries via `WorkerBudget`.
     pub subrequests: crate::budget::SubrequestBudget,
@@ -159,15 +160,20 @@ impl WorkerRuntime {
         let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let freeze = Arc::new(D1FreezeStore::new(db.clone()));
-        let http: Arc<dyn HttpClient> =
-            Arc::new(WorkerHttpClient::new(subrequests.clone()));
+        let cookie_store: Arc<crate::d1_cookie_store::D1CookieStore> =
+            Arc::new(crate::d1_cookie_store::D1CookieStore::new(
+                db.clone(),
+                crate::d1_cookie_store::D1CookieStore::key_from_env(env),
+            ));
+        let http: Arc<dyn HttpClient> = Arc::new(
+            WorkerHttpClient::new(subrequests.clone()).with_cookie_store(cookie_store.clone()),
+        );
         let rate_limiter: Arc<dyn RateLimiter> = Arc::new(
             WorkerRateLimiter::new(env, subrequests.clone())
                 .map_err(|error| worker::Error::RustError(error.to_string()))?,
         );
         let site_settings = load_bundled_site_settings()
             .map_err(|error| worker::Error::RustError(error.to_string()))?;
-        let login_key = crate::d1_cookie_store::D1CookieStore::key_from_env(env);
         let ledger = Arc::new(D1JobLedger::new(db.clone(), clock.clone()));
         let checkpoint = D1SchedulerCheckpoint::new(db.clone());
         let queue = env.queue(JOB_QUEUE_BINDING)?;
@@ -194,7 +200,7 @@ impl WorkerRuntime {
             clock,
             site_settings,
             db,
-            login_key,
+            cookie_store,
         })
     }
 
@@ -217,10 +223,6 @@ impl WorkerRuntime {
     pub async fn new_downloader(&self) -> Result<Downloader> {
         let settings = self.downloader_settings().await?;
         let section_hash_cache = settings.load_section_hash_cache();
-        let cookies = Arc::new(crate::d1_cookie_store::D1CookieStore::new(
-            self.db.clone(),
-            self.login_key,
-        ));
         let downloader = Downloader::with_platform_and_storage_and_settings_and_support(
             self.http.clone(),
             self.rate_limiter.clone(),
@@ -232,7 +234,7 @@ impl WorkerRuntime {
             section_hash_cache,
             settings,
         )?;
-        Ok(downloader.with_cookie_store(cookies))
+        Ok(downloader.with_cookie_store(self.cookie_store.clone()))
     }
 
     /// `Downloader` に渡す設定スナップショットを D1 (`app_state`) から組み立てる。
@@ -265,6 +267,11 @@ impl WorkerRuntime {
             over18,
             section_hash_cache,
         )))
+    }
+
+    /// 管理 API 用の具体ハンドル（診断用メソッドを持つ）。
+    pub fn cookie_store(&self) -> &Arc<crate::d1_cookie_store::D1CookieStore> {
+        &self.cookie_store
     }
 
     /// 保存済み設定の読み出し (D1)。`ConvertService` が `default.*` / `force.*`

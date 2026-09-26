@@ -4,6 +4,7 @@ mod budget;
 mod bundled_sites;
 mod composition;
 mod convert;
+mod login;
 mod consumer;
 mod d1_cookie_store;
 mod d1_object_store;
@@ -37,9 +38,12 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         },
         "/api/novels" => api_novels(req, env).await,
+        "/api/login" => api_login(req, env).await,
+        "/api/login/set" => api_login_set(req, env).await,
         "/api/jobs" => api_jobs(req, env).await,
         "/api/admin/object-migration" => api_object_migration(req, env).await,
         _ if path.starts_with("/api/novels/") => api_novel(req, env).await,
+        _ if path.starts_with("/api/login/") => api_login_host(req, env).await,
         _ if path.starts_with("/api/jobs/") => api_job(req, env).await,
         _ => Response::error("Not Found", 404),
     }
@@ -360,6 +364,80 @@ struct EpubStreamState {
     source: std::sync::Arc<narou_rs::epub_lite::LazyImageSource>,
     objects: std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
     prefix: String,
+}
+
+/// GET /api/login — 保存済みログイン資格情報の一覧 (値は伏せる)。
+/// POST /api/login/set — 1 ホスト分を置き換える。
+async fn api_login(req: Request, env: Env) -> Result<Response> {
+    if !authorized(&req, &env) {
+        return Response::error("Unauthorized", 401);
+    }
+    match req.method() {
+        Method::Get => {}
+        Method::Post => {}
+        _ => return Response::error("Method Not Allowed", 405),
+    }
+    let runtime = match WorkerRuntime::build(&env).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            console_log!("service composition failed: {error}");
+            return Response::error("Service Unavailable", 503);
+        }
+    };
+    if req.method() == Method::Post {
+        return crate::login::set(&runtime, req)
+            .await
+            .map_err(|error| Error::RustError(error.to_string()));
+    }
+    crate::login::status(&runtime)
+        .await
+        .map_err(|error| Error::RustError(error.to_string()))
+}
+
+/// POST /api/login/set — `{host, cookie, label?}` で 1 ホスト分を置き換える。
+async fn api_login_set(req: Request, env: Env) -> Result<Response> {
+    if !authorized(&req, &env) {
+        return Response::error("Unauthorized", 401);
+    }
+    if req.method() != Method::Post {
+        return Response::error("Method Not Allowed", 405);
+    }
+    let runtime = match WorkerRuntime::build(&env).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            console_log!("service composition failed: {error}");
+            return Response::error("Service Unavailable", 503);
+        }
+    };
+    crate::login::set(&runtime, req)
+        .await
+        .map_err(|error| Error::RustError(error.to_string()))
+}
+
+/// DELETE /api/login/{host} — 1 ホスト分の資格情報を消す。
+async fn api_login_host(req: Request, env: Env) -> Result<Response> {
+    if !authorized(&req, &env) {
+        return Response::error("Unauthorized", 401);
+    }
+    if req.method() != Method::Delete {
+        return Response::error("Method Not Allowed", 405);
+    }
+    let Some(host) = req.path().strip_prefix("/api/login/").map(str::to_string) else {
+        return Response::error("Not Found", 404);
+    };
+    if host.is_empty() {
+        return Response::error("Not Found", 404);
+    }
+    let runtime = match WorkerRuntime::build(&env).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            console_log!("service composition failed: {error}");
+            return Response::error("Service Unavailable", 503);
+        }
+    };
+    crate::login::clear(&runtime, &host)
+        .await
+        .map_err(|error| Error::RustError(error.to_string()))
 }
 
 /// POST /api/jobs — plan a request, enqueue each discrete plan separately,

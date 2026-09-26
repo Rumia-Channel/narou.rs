@@ -159,6 +159,65 @@ await check("a Convert plan for a missing novel is not reported as blocked", asy
   assert(body.blocked.length === 1, `Send must be blocked: ${JSON.stringify(body)}`);
 });
 
+await check("POST /api/login/set stores a credential without echoing it", async () => {
+  const response = await request("/api/login/set", {
+    method: "POST",
+    ...auth(),
+    body: JSON.stringify({
+      host: "example.com",
+      cookie: "session=contract-secret",
+      label: "contract",
+    }),
+  });
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(body.success === true, `unexpected body: ${JSON.stringify(body)}`);
+  const hosts = body.data?.hosts ?? [];
+  const entry = hosts.find((host) => host.host === "example.com");
+  assert(entry, `host should be listed: ${JSON.stringify(body)}`);
+  assert(entry.encrypted === true, "the stored value must be encrypted at rest");
+  const raw = JSON.stringify(body);
+  assert(!raw.includes("contract-secret"), "the cookie value must never be returned");
+  assert(entry.credentials[0].cookies.includes("session=…"), "the value must be masked");
+});
+
+await check("GET /api/login lists hosts without values", async () => {
+  const response = await request("/api/login", auth());
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(typeof body.data?.count === "number", "count must be a number");
+  assert(
+    body.data?.key_source === "NAROU_RS_LOGIN_KEY",
+    `the login key must be configured (key_source=${body.data?.key_source})`,
+  );
+  assert(!JSON.stringify(body).includes("contract-secret"), "values must stay hidden");
+});
+
+await check("DELETE /api/login/{host} clears the credential", async () => {
+  const response = await request("/api/login/example.com", {
+    method: "DELETE",
+    ...auth(),
+  });
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  const hosts = body.data?.hosts ?? [];
+  assert(
+    !hosts.some((host) => host.host === "example.com"),
+    `host should be gone: ${JSON.stringify(body)}`,
+  );
+});
+
+await check("POST /api/login/set rejects an empty cookie", async () => {
+  const response = await request("/api/login/set", {
+    method: "POST",
+    ...auth(),
+    body: JSON.stringify({ host: "example.com", cookie: "  " }),
+  });
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(body.success === false, `unexpected body: ${JSON.stringify(body)}`);
+});
+
 await check("POST /api/admin/object-migration status reports progress", async () => {
   const response = await request("/api/admin/object-migration", {
     method: "POST",

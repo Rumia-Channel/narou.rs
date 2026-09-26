@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
 use narou_rs::error::{NarouError, Result};
-use narou_rs::platform::{HttpClient, HttpMethod, HttpRequest, HttpResponse, PlatformFuture, RedirectMode};
+use narou_rs::platform::{
+    CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, PlatformFuture, RedirectMode,
+};
 use wasm_bindgen::JsValue;
 use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect};
 
@@ -13,14 +17,91 @@ use crate::budget::SubrequestBudget;
 /// `illustration_animation` の上限 (40 MiB) で別に制限している。
 pub const MAX_WORKER_HTTP_BODY: usize = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct WorkerHttpClient {
     subrequests: SubrequestBudget,
+    /// 保存済みログイン Cookie。`Set-Cookie` の書き戻しにだけ使う。
+    cookie_store: Option<Arc<dyn CookieStore>>,
+}
+
+impl std::fmt::Debug for WorkerHttpClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerHttpClient")
+            .field("cookie_store", &self.cookie_store.is_some())
+            .finish()
+    }
 }
 
 impl WorkerHttpClient {
     pub fn new(subrequests: SubrequestBudget) -> Self {
-        Self { subrequests }
+        Self {
+            subrequests,
+            cookie_store: None,
+        }
+    }
+
+    /// 保存済み Cookie を `Set-Cookie` で更新できるようにする (native と同じ挙動)。
+    pub fn with_cookie_store(mut self, store: Arc<dyn CookieStore>) -> Self {
+        self.cookie_store = Some(store);
+        self
+    }
+
+    /// 送信した Cookie に対応する資格情報だけを `Set-Cookie` で更新する。
+    ///
+    /// サイトは複数のログイン情報を持てるので、送っていない資格情報を書き換えては
+    /// いけない (別アカウントのセッションを壊す)。保存値は暗号化されて書き戻る。
+    async fn persist_set_cookie(
+        &self,
+        url: &str,
+        response: &HttpResponse,
+        sent_cookie: Option<&str>,
+    ) {
+        let Some(store) = self.cookie_store.as_ref() else {
+            return;
+        };
+        let values: Vec<String> = response
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, value)| value.clone())
+            .collect();
+        if values.is_empty() {
+            return;
+        }
+        let Some(host) = narou_rs::platform::cookie_host_for_url(url) else {
+            return;
+        };
+        let Some(sent) = sent_cookie else {
+            return;
+        };
+        let sent_pairs = narou_rs::platform::parse_cookie_header(sent);
+        if sent_pairs.is_empty() {
+            return;
+        }
+        let Ok(all) = store.list().await else {
+            return;
+        };
+        for key in narou_rs::platform::cookie_lookup_hosts(&host) {
+            let Some(credentials) = all.get(&key) else {
+                continue;
+            };
+            let mut updated = credentials.clone();
+            let mut changed = false;
+            for credential in updated.iter_mut() {
+                if !narou_rs::platform::credential_was_sent(&credential.cookie, &sent_pairs) {
+                    continue;
+                }
+                let cookie = narou_rs::platform::apply_set_cookie(&credential.cookie, &values);
+                if cookie != credential.cookie {
+                    credential.cookie = cookie;
+                    changed = true;
+                }
+            }
+            if changed {
+                let _ = store.save_all(&key, &updated).await;
+            }
+        }
     }
 
     async fn send_request(&self, request: HttpRequest) -> Result<HttpResponse> {
@@ -92,7 +173,14 @@ impl HttpClient for WorkerHttpClient {
     }
 
     fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
-        Box::pin(self.send_request(request))
+        let url = request.url.clone();
+        let sent_cookie = request.header("Cookie").map(str::to_string);
+        Box::pin(async move {
+            let response = self.send_request(request).await?;
+            self.persist_set_cookie(&url, &response, sent_cookie.as_deref())
+                .await;
+            Ok(response)
+        })
     }
 }
 

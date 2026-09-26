@@ -63,15 +63,6 @@ pub struct NativeHttpClient {
 
 /// Whether every pair of a stored credential was part of the sent header,
 /// which is how a response is attributed to one of several stored logins.
-fn credential_was_sent(credential: &str, sent: &[(String, String)]) -> bool {
-    let pairs = crate::platform::parse_cookie_header(credential);
-    !pairs.is_empty()
-        && pairs.iter().all(|(name, value)| {
-            sent.iter()
-                .any(|(sent_name, sent_value)| sent_name == name && sent_value == value)
-        })
-}
-
 impl NativeHttpClient {
     /// Refresh stored login cookies from `Set-Cookie` responses.
     pub fn with_cookie_store(mut self, store: Arc<dyn crate::platform::CookieStore>) -> Self {
@@ -147,7 +138,7 @@ impl NativeHttpClient {
             let mut updated_credentials = credentials.clone();
             let mut changed = false;
             for credential in updated_credentials.iter_mut() {
-                if !credential_was_sent(&credential.cookie, &sent_pairs) {
+                if !crate::platform::credential_was_sent(&credential.cookie, &sent_pairs) {
                     continue;
                 }
                 let updated = crate::platform::apply_set_cookie(&credential.cookie, &values);

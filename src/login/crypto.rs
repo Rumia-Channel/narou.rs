@@ -35,7 +35,6 @@ fn login_error(message: impl Into<String>) -> NarouError {
 ///
 /// Random rather than sequential so ids stay unique after exports move between
 /// machines. Generated wherever a credential is first stored.
-#[cfg(feature = "native-runtime")]
 pub fn new_credential_id() -> Result<String> {
     let mut bytes: [u8; 16] = random_bytes()?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -50,7 +49,6 @@ pub fn new_credential_id() -> Result<String> {
     Ok(out)
 }
 
-#[cfg(feature = "native-runtime")]
 pub fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes)
@@ -59,7 +57,6 @@ pub fn random_bytes<const N: usize>() -> Result<[u8; N]> {
 }
 
 /// A fresh login key.
-#[cfg(feature = "native-runtime")]
 pub fn random_key() -> Result<[u8; KEY_LEN]> {
     random_bytes()
 }
@@ -72,7 +69,6 @@ fn cipher(key: &[u8; KEY_LEN]) -> XChaCha20Poly1305 {
 ///
 /// The result is `base64(nonce):base64(ciphertext)`, safe to embed in YAML,
 /// JSON or a CLI argument.
-#[cfg(feature = "native-runtime")]
 pub fn encrypt_with_key(key: &[u8; KEY_LEN], aad: &str, plaintext: &str) -> Result<String> {
     let nonce_bytes: [u8; NONCE_LEN] = random_bytes()?;
     let nonce = XNonce::from(nonce_bytes);
@@ -156,7 +152,6 @@ pub fn is_encrypted_at_rest(value: &str) -> bool {
 }
 
 /// Encrypt one host's cookie header for storage in the inventory.
-#[cfg(feature = "native-runtime")]
 pub fn encrypt_at_rest(key: &[u8; KEY_LEN], host: &str, cookie: &str) -> Result<String> {
     let token = encrypt_with_key(key, &at_rest_aad(host), cookie)?;
     Ok(format!("{AT_REST_PREFIX}{token}"))

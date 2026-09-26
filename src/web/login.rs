@@ -307,7 +307,7 @@ fn status_payload() -> Result<serde_json::Value, NarouError> {
                         "short_id": credential.short_id(),
                         "label": credential.label,
                         "host": credential.host,
-                        "cookies": mask_cookie(&credential.cookie),
+                        "cookies": crate::platform::mask_cookie(&credential.cookie),
                         "names": parse_cookie_header(&credential.cookie)
                             .into_iter()
                             .map(|(name, _)| name)
@@ -333,19 +333,6 @@ fn status_payload() -> Result<serde_json::Value, NarouError> {
 }
 
 /// Show which cookies a header carries without exposing their values.
-fn mask_cookie(cookie: &str) -> String {
-    let pairs = parse_cookie_header(cookie);
-    let length = cookie.chars().count();
-    if pairs.is_empty() {
-        return format!("({length} 文字)");
-    }
-    let names = pairs
-        .iter()
-        .map(|(name, _)| format!("{name}=…"))
-        .collect::<Vec<_>>()
-        .join("; ");
-    format!("{names} ({} 件, {length} 文字)", pairs.len())
-}
 
 fn failure(error: NarouError) -> serde_json::Value {
     serde_json::json!({ "success": false, "message": error.to_string() })
@@ -357,10 +344,10 @@ mod tests {
 
     #[test]
     fn masks_values_and_lists_the_cookie_names() {
-        let masked = mask_cookie("over18=yes; ses=abcdef");
+        let masked = crate::platform::mask_cookie("over18=yes; ses=abcdef");
         assert_eq!(masked, "over18=…; ses=… (2 件, 22 文字)");
         assert!(!masked.contains("abcdef"));
-        assert_eq!(mask_cookie(""), "(0 文字)");
+        assert_eq!(crate::platform::mask_cookie(""), "(0 文字)");
     }
 
     #[test]

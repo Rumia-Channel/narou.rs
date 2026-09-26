@@ -9,6 +9,9 @@ edition = "2024"
 license = "BSD-2-Clause"
 readme = "README.md"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", optional = true, features = ["wasm_js"] }
+
 [features]
 default = ["native-runtime"]
 native-runtime = [
@@ -52,7 +55,13 @@ lite = ["dep:aozora_epub3_lite"]
 # written by a native library); the AEAD stack is pure Rust, so only `base64`
 # and `chacha20poly1305` join this feature. Encryption needs a random source
 # (`getrandom`), which stays native for now.
-worker-runtime = ["lite", "illustration-animation", "dep:base64", "dep:chacha20poly1305"]
+worker-runtime = [
+    "lite",
+    "illustration-animation",
+    "dep:base64",
+    "dep:chacha20poly1305",
+    "dep:getrandom",
+]
 # Animated illustrations arrive as a frame archive and are assembled into an
 # APNG. The codecs (image: jpeg/png) and the ZIP reader are pure Rust, so the
 # portable (Worker / wasm) build enables them too; `zip` is pinned to the
@@ -97,6 +106,8 @@ fancy-regex = "0.19"
 socket2 = { version = "0.6", optional = true }
 chrono-tz = { version = "0.10", features = ["case-insensitive"] }
 subtle = "2.6"
+# wasm では crypto.getRandomValues をバックエンドに使う (`wasm_js`)。native の
+# ビルドに wasm-bindgen を持ち込まないよう、ターゲット限定で feature を足す。
 getrandom = { version = "0.4", optional = true }
 fs2 = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
