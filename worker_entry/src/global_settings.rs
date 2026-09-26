@@ -20,7 +20,7 @@ pub async fn api_global_setting(mut req: Request, env: Env) -> worker::Result<Re
     if method != Method::Get && method != Method::Post {
         return Response::error("Method Not Allowed", 405);
     }
-    let runtime = match WorkerRuntime::build(&env).await {
+    let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");

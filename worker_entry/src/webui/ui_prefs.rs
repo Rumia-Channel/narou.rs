@@ -60,7 +60,7 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
             return json_error(404, "not_found", Some("route is not handled by this Worker"));
         }
     };
-    let runtime = match WorkerRuntime::build(&env).await {
+    let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");

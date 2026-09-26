@@ -10,7 +10,7 @@
 //! `objects.data = NULL` and store all bytes in `object_chunks` (seq 0..N,
 //! 512 KiB each), matching the native `SqliteObjectStore` layout.
 
-use std::sync::Arc;
+
 
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
@@ -18,7 +18,9 @@ use narou_rs::platform::{
     ObjectStore, PlatformFuture, content_type_for_key, paginate_object_listing,
 };
 use serde::Deserialize;
-use worker::{D1Database, D1PreparedStatement, wasm_bindgen::JsValue};
+use worker::{D1PreparedStatement, wasm_bindgen::JsValue};
+
+use crate::db_handle::DbHandle;
 
 /// Payloads at or below this size are stored inline in `objects.data`.
 const INLINE_MAX: usize = 512 * 1024;
@@ -78,11 +80,11 @@ fn metadata_from(key: &ObjectKey, size: i64, updated_at: &str, content_type: Opt
 
 #[derive(Clone)]
 pub struct D1ObjectStore {
-    db: Arc<D1Database>,
+    db: DbHandle,
 }
 
 impl D1ObjectStore {
-    pub fn new(db: Arc<D1Database>) -> Self {
+    pub fn new(db: DbHandle) -> Self {
         Self { db }
     }
 

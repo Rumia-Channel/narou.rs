@@ -18,7 +18,7 @@
 //!
 //! The ledger does not expose listing primitives (`JobQueue` is per-id only),
 //! so reads go through a direct `env.d1("DB")` handle — the same binding
-//! `WorkerRuntime::build` wires into `D1JobLedger`.
+//! `WorkerRuntime::build_ui` wires into `D1JobLedger`.
 
 use std::collections::HashMap;
 
@@ -47,7 +47,7 @@ use super::{configured_tag_color, json_error, query_param};
 /// Build the runtime or finish with the native-style 503 error response.
 macro_rules! runtime_or_503 {
     ($env:expr) => {
-        match WorkerRuntime::build(&$env).await {
+        match WorkerRuntime::build_ui(&$env).await {
             Ok(runtime) => runtime,
             Err(error) => {
                 console_log!("service composition failed: {error}");
@@ -242,8 +242,13 @@ fn describe_update_targets(targets: &[String]) -> String {
     }
 }
 
-fn d1(env: &worker::Env) -> Result<worker::D1Database> {
-    env.d1("DB")
+/// UI のキュー一覧は読み取りだけなので、replica に逃がせるセッション
+/// (first-unconstrained) 経由にする。失敗時は `DbHandle::ui` が primary に
+/// フォールバックする。
+fn d1(env: &worker::Env) -> Result<crate::db_handle::DbHandle> {
+    Ok(crate::db_handle::DbHandle::ui(std::sync::Arc::new(
+        env.d1("DB")?,
+    )))
 }
 
 /// All active (pending / retryable / running) rows in FIFO order.

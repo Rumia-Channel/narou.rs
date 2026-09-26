@@ -104,7 +104,7 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
     } else {
         LibrarySortOrder::Ascending
     };
-    let runtime = match crate::composition::WorkerRuntime::build(env).await {
+    let runtime = match crate::composition::WorkerRuntime::build_ui(env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             worker::console_log!("service composition failed: {error}");

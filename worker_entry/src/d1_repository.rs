@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
 
 use narou_rs::application::tag_colors::{TagColorStore, TagColors};
 use narou_rs::application::events::FreezeStore;
@@ -17,7 +16,9 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 use wasm_bindgen::JsValue;
-use worker::{D1Database, D1PreparedStatement, D1Result};
+use worker::{D1PreparedStatement, D1Result};
+
+use crate::db_handle::DbHandle;
 
 /// D1 tolerates much larger statement payloads than the native store's
 /// `novel_codec::MAX_EXTRA_FIELDS_BYTES`; keep the historical D1 cap.
@@ -25,11 +26,11 @@ const MAX_EXTRA_FIELDS_BYTES: usize = 1_900_000;
 
 #[derive(Debug, Clone)]
 pub struct D1NovelRepository {
-    db: Arc<D1Database>,
+    db: DbHandle,
 }
 
 impl D1NovelRepository {
-    pub fn new(db: Arc<D1Database>) -> Self {
+    pub fn new(db: DbHandle) -> Self {
         Self { db }
     }
 
@@ -260,11 +261,11 @@ impl NovelRepository for D1NovelRepository {
 
 #[derive(Debug, Clone)]
 pub struct D1FreezeStore {
-    db: Arc<D1Database>,
+    db: DbHandle,
 }
 
 impl D1FreezeStore {
-    pub fn new(db: Arc<D1Database>) -> Self {
+    pub fn new(db: DbHandle) -> Self {
         Self { db }
     }
 }
@@ -345,11 +346,11 @@ static SETTINGS_CACHE: std::sync::LazyLock<
 
 #[derive(Debug, Clone)]
 pub struct D1SettingsStore {
-    db: Arc<D1Database>,
+    db: DbHandle,
 }
 
 impl D1SettingsStore {
-    pub fn new(db: Arc<D1Database>) -> Self {
+    pub fn new(db: DbHandle) -> Self {
         Self { db }
     }
 
@@ -437,11 +438,11 @@ impl SettingsStore for D1SettingsStore {
 
 #[derive(Debug, Clone)]
 pub struct D1TagColorStore {
-    db: Arc<D1Database>,
+    db: DbHandle,
 }
 
 impl D1TagColorStore {
-    pub fn new(db: Arc<D1Database>) -> Self {
+    pub fn new(db: DbHandle) -> Self {
         Self { db }
     }
 }

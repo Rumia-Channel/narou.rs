@@ -20,8 +20,9 @@ use narou_rs::platform::{
 };
 use narou_rs::setting_core::SettingScope;
 use serde::Deserialize;
-use worker::{D1Database, Env, Queue};
+use worker::{Env, Queue};
 
+use crate::db_handle::DbHandle;
 use crate::d1_object_store::D1ObjectStore;
 use crate::d1_repository::{D1FreezeStore, D1NovelRepository, D1SettingsStore, D1TagColorStore};
 use crate::http::WorkerHttpClient;
@@ -59,14 +60,27 @@ pub struct WorkerRuntime {
     assets: Arc<dyn AssetStore>,
     pub clock: Arc<dyn Clock>,
     site_settings: Vec<SiteSetting>,
-    /// D1 ハンドル（資格情報ストアと設定スナップショットが使う）。
-    db: Arc<D1Database>,
+    /// D1 ハンドル（資格情報ストアと設定スナップショットが使う）。UI 経路は
+    /// `first-unconstrained` セッション、ジョブ経路は primary 直行になる。
+    db: DbHandle,
     /// 保存済みログイン資格情報。Downloader・HTTP クライアント・管理 API が
     /// 同じ実体を共有する。
     cookie_store: Arc<crate::d1_cookie_store::D1CookieStore>,
     /// Shared subrequest counter for this invocation; the executor reads it
     /// at section boundaries via `WorkerBudget`.
     pub subrequests: crate::budget::SubrequestBudget,
+}
+
+/// `WorkerRuntime::build_with` が行う重い読み込みのプロファイル。
+///
+/// - `Job`: `site_settings` (bundle + ユーザー定義のコンパイル) を読む。
+///   Downloader が必要とする。
+/// - `Ui`: サイト定義を読まない。UI ハンドラは Downloader を組み立てず、
+///   サイト定義が必要な箇所 (`webui/job_actions.rs` など) は
+///   `bundled_sites::load_site_settings(&runtime.objects())` を自前で呼ぶ。
+enum CompositionProfile {
+    Job,
+    Ui,
 }
 
 /// isolate ごとの `asset_backend` キャッシュ。設定の切替は TTL (30 秒) で
@@ -79,7 +93,7 @@ static ASSET_BACKEND_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<Opt
 /// 保存先は `app_state('inv','asset_backend')` の 1 行で決める。`s3` 以外は
 /// 挿絵も D1 に置くので、切り替えはこの行を書き換えるだけでよい。
 /// 本文・メタデータは常に D1 (`SplitStore` が振り分ける)。
-async fn read_asset_backend(db: &D1Database) -> Option<String> {
+async fn read_asset_backend(db: &DbHandle) -> Option<String> {
     if let Some(cached) = ASSET_BACKEND_CACHE.get("asset_backend") {
         return cached;
     }
@@ -102,7 +116,7 @@ async fn read_asset_backend(db: &D1Database) -> Option<String> {
 /// (fail-closed)。
 async fn build_object_stores(
     env: &Env,
-    db: &Arc<D1Database>,
+    db: &DbHandle,
 ) -> worker::Result<(
     Arc<dyn ObjectStore>,
     Arc<dyn AssetStore>,
@@ -138,7 +152,7 @@ static SECTION_HASH_CACHE: std::sync::LazyLock<
     crate::isolate_cache::TtlMap<HashMap<String, HashMap<String, String>>>,
 > = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
 
-async fn load_section_hash_cache(db: &D1Database) -> HashMap<String, HashMap<String, String>> {
+async fn load_section_hash_cache(db: &DbHandle) -> HashMap<String, HashMap<String, String>> {
     if let Some(cached) = SECTION_HASH_CACHE.get("section_hash_cache") {
         return cached;
     }
@@ -177,8 +191,36 @@ fn setting_bool(value: &serde_yaml::Value) -> Option<bool> {
 impl WorkerRuntime {
     /// Build the runtime from the production bindings. Missing bindings fail
     /// composition (readiness 503), never an empty/partial service set.
+    ///
+    /// ジョブ実行系 (consumer / executor / scheduler / ledger) 用。
+    /// すべてのクエリは primary 直行になる `DbHandle::Primary` で組み立てる
+    /// — claim の UPDATE やリトライ判定が read-your-writes を前提にするため、
+    /// ここはセッションを通さない。
     pub async fn build(env: &Env) -> worker::Result<Self> {
-        let db = Arc::new(env.d1("DB")?);
+        let db = DbHandle::primary(Arc::new(env.d1("DB")?));
+        Self::build_with(env, db, CompositionProfile::Job).await
+    }
+
+    /// UI (fetch) 経路用のビルド。D1 は `first-unconstrained` セッション経由
+    /// (`DbHandle::ui`) になり、読み取りは read replica に逃がせる。
+    /// セッション生成に失敗した場合 (`wrangler dev` のローカル D1 など
+    /// セッション API 未対応の環境) は primary にフォールバックする。
+    ///
+    /// UI ハンドラはサイト定義のコンパイル済み設定を必要としないため、
+    /// ダウンローダ専用の重い読み込み (`load_site_settings` のオブジェクト
+    /// ストア LIST、`load_section_hash_cache`) は行わない。`site_settings`
+    /// は空になり、`new_downloader` は job 経路 (`build`) 専用。
+    pub async fn build_ui(env: &Env) -> worker::Result<Self> {
+        let db = DbHandle::ui(Arc::new(env.d1("DB")?));
+        Self::build_with(env, db, CompositionProfile::Ui).await
+    }
+
+    /// `db` に渡したハンドルをすべてのストアへ配線する共通ビルド。
+    async fn build_with(
+        env: &Env,
+        db: DbHandle,
+        profile: CompositionProfile,
+    ) -> worker::Result<Self> {
         let subrequests = crate::budget::SubrequestBudget::new();
         let (objects, assets, _s3_illustrations) = build_object_stores(env, &db).await?;
         let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
@@ -211,9 +253,15 @@ impl WorkerRuntime {
             WorkerRateLimiter::new(env, subrequests.clone())
                 .map_err(|error| worker::Error::RustError(error.to_string()))?,
         );
-        let site_settings = crate::bundled_sites::load_site_settings(&objects)
-            .await
-            .map_err(|error| worker::Error::RustError(error.to_string()))?;
+        // サイト定義の読み込みはオブジェクトストアの LIST を伴う重い経路。
+        // UI プロファイルは Downloader を組み立てないので省略する
+        // (`build_ui` 参照)。ジョブ系のみが必要とする。
+        let site_settings = match profile {
+            CompositionProfile::Job => crate::bundled_sites::load_site_settings(&objects)
+                .await
+                .map_err(|error| worker::Error::RustError(error.to_string()))?,
+            CompositionProfile::Ui => Vec::new(),
+        };
         let ledger = Arc::new(D1JobLedger::new(db.clone(), clock.clone()));
         let checkpoint = D1SchedulerCheckpoint::new(db.clone());
         let queue = env.queue(JOB_QUEUE_BINDING)?;
@@ -252,6 +300,7 @@ impl WorkerRuntime {
     }
 
     /// A fresh, exclusively-owned shared Downloader for one event invocation.
+    /// ジョブ経路 (`build`) 専用 — `build_ui` は `site_settings` を空にする。
     ///
     /// Bundled site settings are compiled at composition time. Downloader
     /// settings are a per-invocation snapshot of `app_state`: local scope
@@ -518,7 +567,9 @@ pub async fn build_services(env: &Env) -> worker::Result<AppServices> {
 }
 
 pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
-    let db = Arc::new(env.d1("DB")?);
+    // 読み取り系の API 面。UI 経路なので `DbHandle::ui` (first-unconstrained
+    // セッション、失敗時は primary) で組み立てる。
+    let db = DbHandle::ui(Arc::new(env.d1("DB")?));
     let (objects, _assets, s3_illustrations) = build_object_stores(env, &db).await?;
     let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -534,7 +585,7 @@ fn services_from(
     novels: Arc<dyn NovelRepository>,
     objects: Arc<dyn ObjectStore>,
     freeze: Arc<D1FreezeStore>,
-    db: Arc<D1Database>,
+    db: DbHandle,
     clock: Arc<dyn Clock>,
 ) -> AppServices {
     let library = Arc::new(narou_rs::application::LibraryService::new(

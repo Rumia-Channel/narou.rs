@@ -75,7 +75,7 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         Ok(body) => body,
         Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
     };
-    let runtime = match WorkerRuntime::build(&env).await {
+    let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");
@@ -177,6 +177,7 @@ pub(crate) async fn load_aliases(env: &Env) -> HashMap<String, String> {
     let Ok(db) = env.d1("DB") else {
         return Default::default();
     };
+    let db = crate::db_handle::DbHandle::ui(std::sync::Arc::new(db));
     let statement = match db
         .prepare("SELECT value_yaml, value_json FROM app_state WHERE scope = ? AND key = ?")
         .bind(&[

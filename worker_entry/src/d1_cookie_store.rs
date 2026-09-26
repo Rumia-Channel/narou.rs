@@ -12,14 +12,16 @@
 //! DL・更新は動く。
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+
 
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
     CookieStore, LoginCredential, PlatformFuture, cookie_lookup_hosts, merge_credentials_for,
     normalize_cookie_host,
 };
-use worker::{D1Database, wasm_bindgen::JsValue};
+use worker::wasm_bindgen::JsValue;
+
+use crate::db_handle::DbHandle;
 
 /// native と同じ inventory 名（`.narou/login_cookie.yaml` 相当）。
 pub const INVENTORY_NAME: &str = "login_cookie";
@@ -46,12 +48,12 @@ struct StateRow {
 /// D1 の `app_state` 1 行を介した資格情報ストア。
 #[derive(Debug, Clone)]
 pub struct D1CookieStore {
-    db: Arc<D1Database>,
+    db: DbHandle,
     key: Option<[u8; KEY_LEN]>,
 }
 
 impl D1CookieStore {
-    pub fn new(db: Arc<D1Database>, key: Option<[u8; KEY_LEN]>) -> Self {
+    pub fn new(db: DbHandle, key: Option<[u8; KEY_LEN]>) -> Self {
         Self { db, key }
     }
 

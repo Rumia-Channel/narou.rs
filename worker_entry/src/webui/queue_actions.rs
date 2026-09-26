@@ -84,7 +84,7 @@ fn api_failure(message: impl std::fmt::Display) -> worker::Result<Response> {
 /// (`webui/download.rs` と同じ形)。
 macro_rules! runtime_or_503 {
     ($env:expr) => {
-        match WorkerRuntime::build(&$env).await {
+        match WorkerRuntime::build_ui(&$env).await {
             Ok(runtime) => runtime,
             Err(error) => {
                 console_log!("service composition failed: {error}");

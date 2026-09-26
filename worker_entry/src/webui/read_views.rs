@@ -167,7 +167,7 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         _ => {}
     }
 
-    let runtime = match WorkerRuntime::build(&env).await {
+    let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");
@@ -662,6 +662,7 @@ async fn read_notepad(env: &Env) -> String {
     let Ok(db) = env.d1("DB") else {
         return String::new();
     };
+    let db = crate::db_handle::DbHandle::ui(std::sync::Arc::new(db));
     let statement = match db
         .prepare("SELECT value_yaml, value_json FROM app_state WHERE scope = ? AND key = ?")
         .bind(&[

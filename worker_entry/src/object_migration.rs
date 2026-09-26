@@ -14,8 +14,9 @@ use std::sync::Arc;
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::store_migration::{StoreMigrationState, migrate_page};
 use narou_rs::platform::{AssetStore, ObjectStore};
-use worker::{D1Database, Env, wasm_bindgen::JsValue};
+use worker::{Env, wasm_bindgen::JsValue};
 
+use crate::db_handle::DbHandle;
 use crate::d1_object_store::D1ObjectStore;
 use crate::s3_object_store::S3ObjectStore;
 
@@ -40,7 +41,7 @@ pub struct MigrationReport {
 /// `plan` は対象を数えるだけで書き込まない（本番前に件数と容量を確認する）。
 pub async fn run(
     env: &Env,
-    db: &Arc<D1Database>,
+    db: &DbHandle,
     action: &str,
     limit: usize,
 ) -> Result<MigrationReport> {
@@ -68,7 +69,7 @@ pub async fn run(
 }
 
 /// 現在の進捗を返す。
-pub async fn status(db: &Arc<D1Database>) -> Result<MigrationReport> {
+pub async fn status(db: &DbHandle) -> Result<MigrationReport> {
     let state = load_state(db).await?;
     Ok(report("status", &state))
 }
@@ -86,7 +87,7 @@ fn report(action: &str, state: &StoreMigrationState) -> MigrationReport {
     }
 }
 
-async fn load_state(db: &Arc<D1Database>) -> Result<StoreMigrationState> {
+async fn load_state(db: &DbHandle) -> Result<StoreMigrationState> {
     let raw = db
         .prepare("SELECT value_json FROM app_state WHERE scope = 'inv' AND key = ?")
         .bind(&[JsValue::from_str(STATE_KEY)])
@@ -101,7 +102,7 @@ async fn load_state(db: &Arc<D1Database>) -> Result<StoreMigrationState> {
     }
 }
 
-async fn save_state(db: &Arc<D1Database>, state: &StoreMigrationState) -> Result<()> {
+async fn save_state(db: &DbHandle, state: &StoreMigrationState) -> Result<()> {
     let payload = serde_json::to_string(state)
         .map_err(|error| NarouError::Platform(format!("cannot encode migration state: {error}")))?;
     db.prepare(

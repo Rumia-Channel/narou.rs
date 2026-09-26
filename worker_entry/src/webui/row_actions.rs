@@ -85,7 +85,7 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
     };
 
-    let runtime = match WorkerRuntime::build(&env).await {
+    let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");

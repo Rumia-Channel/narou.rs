@@ -12,6 +12,7 @@ mod login;
 mod secrets;
 mod sites;
 mod consumer;
+mod db_handle;
 mod d1_cookie_store;
 mod d1_object_store;
 mod d1_repository;
@@ -558,7 +559,7 @@ async fn api_sites(req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
-    let runtime = match WorkerRuntime::build(&env).await {
+    let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");
@@ -586,7 +587,7 @@ async fn api_site(req: Request, env: Env) -> Result<Response> {
     if name.is_empty() {
         return Response::error("Not Found", 404);
     }
-    let runtime = match WorkerRuntime::build(&env).await {
+    let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");
@@ -668,7 +669,7 @@ async fn api_login(req: Request, env: Env) -> Result<Response> {
         Method::Delete => {}
         _ => return Response::error("Method Not Allowed", 405),
     }
-    let runtime = match WorkerRuntime::build(&env).await {
+    let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");
@@ -694,7 +695,7 @@ async fn api_login_set(req: Request, env: Env, append: bool) -> Result<Response>
     if req.method() != Method::Post {
         return Response::error("Method Not Allowed", 405);
     }
-    let runtime = match WorkerRuntime::build(&env).await {
+    let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");
@@ -733,7 +734,7 @@ async fn api_login_host(req: Request, env: Env) -> Result<Response> {
     if host.is_empty() || host.contains('/') {
         return Response::error("Not Found", 404);
     }
-    let runtime = match WorkerRuntime::build(&env).await {
+    let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");
@@ -770,7 +771,7 @@ async fn api_jobs(mut req: Request, env: Env) -> Result<Response> {
     if let Some(reason) = narou_rs::application::validate_request_limits(&request) {
         return Response::error(format!("request exceeds payload limits: {reason}"), 400);
     }
-    let runtime = match WorkerRuntime::build(&env).await {
+    let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");
@@ -816,7 +817,7 @@ async fn api_job(req: Request, env: Env) -> Result<Response> {
     let Some(id) = id else {
         return Response::error("Not Found", 404);
     };
-    let runtime = match WorkerRuntime::build(&env).await {
+    let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");
@@ -851,7 +852,8 @@ async fn api_object_migration(mut req: Request, env: Env) -> Result<Response> {
     let action = body.action.unwrap_or_else(|| "status".to_string());
 
     let db = match env.d1("DB") {
-        Ok(db) => std::sync::Arc::new(db),
+        // 管理系の移行処理は常に primary へ (進捗を app_state に書き戻す)。
+        Ok(db) => crate::db_handle::DbHandle::primary(std::sync::Arc::new(db)),
         Err(error) => {
             console_log!("D1 binding missing: {error}");
             return Response::error("Service unavailable", 503);

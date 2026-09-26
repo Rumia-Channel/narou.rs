@@ -25,7 +25,9 @@ use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{Clock, PlatformFuture};
 use serde::Deserialize;
 use wasm_bindgen::JsValue;
-use worker::{D1Database, D1PreparedStatement, D1Result};
+use worker::{D1PreparedStatement, D1Result};
+
+use crate::db_handle::DbHandle;
 
 /// A running claim remains owned until this lease expires. The bounded
 /// execution guard is shorter than the lease, so a live redelivery is never
@@ -34,7 +36,7 @@ const JOB_LEASE: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 
 /// D1-backed [`JobQueue`] adapter.
 pub struct D1JobLedger {
-    db: Arc<D1Database>,
+    db: DbHandle,
     clock: Arc<dyn Clock>,
 }
 
@@ -54,7 +56,7 @@ impl Clone for D1JobLedger {
 }
 
 impl D1JobLedger {
-    pub fn new(db: Arc<D1Database>, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(db: DbHandle, clock: Arc<dyn Clock>) -> Self {
         Self { db, clock }
     }
 
@@ -648,14 +650,14 @@ impl JobQueue for D1JobLedger {
 /// D1-backed auto-update planner checkpoint (`app_state` row).
 #[derive(Debug, Clone)]
 pub struct D1SchedulerCheckpoint {
-    db: Arc<D1Database>,
+    db: DbHandle,
 }
 
 impl D1SchedulerCheckpoint {
     const SCOPE: &'static str = "scheduler";
     const KEY: &'static str = "auto_update";
 
-    pub fn new(db: Arc<D1Database>) -> Self {
+    pub fn new(db: DbHandle) -> Self {
         Self { db }
     }
 

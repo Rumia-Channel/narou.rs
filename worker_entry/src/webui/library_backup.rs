@@ -38,7 +38,7 @@ pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
 async fn status(env: &Env) -> worker::Result<Response> {
     // コンポジション全体を組み立てるのは、欠けた binding を native 同様に
     // 503 で報告するため (D1 だけの軽い経路は作らない)。
-    let _runtime = match WorkerRuntime::build(env).await {
+    let _runtime = match WorkerRuntime::build_ui(env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");
@@ -60,7 +60,7 @@ async fn status(env: &Env) -> worker::Result<Response> {
 
 /// 台帳上で実行中の backup ジョブ数。
 async fn running_backups(env: &Env) -> worker::Result<i64> {
-    let db = env.d1("DB")?;
+    let db = crate::db_handle::DbHandle::ui(std::sync::Arc::new(env.d1("DB")?));
     let statement = db
         .prepare("SELECT COUNT(*) AS n FROM worker_jobs WHERE kind = ? AND status = 'running'")
         .bind(&[JsValue::from_str("backup")])?;

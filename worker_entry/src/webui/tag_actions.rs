@@ -56,7 +56,7 @@ pub async fn handle(mut req: Request, env: worker::Env) -> worker::Result<Respon
         }
     };
 
-    let runtime = match WorkerRuntime::build(&env).await {
+    let runtime = match WorkerRuntime::build_ui(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");
