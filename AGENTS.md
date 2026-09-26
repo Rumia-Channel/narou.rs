@@ -346,6 +346,14 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - フェーズ: P0a 足回り (完了) → P0b 署名・S3 アダプタ (完了) → P0c 挿絵を S3 へ (SplitStore + `asset_backend`) → P0d 本文の構造化と移行 (セクション行 + YAML blob からの移行) → P0e 契約テスト + CI デプロイ → P1 取得系 (SSRF port 化・settings 注入・CookieStore・YAML provider) → P2 変換を Worker へ (変換済み本文を列に保存) → P3 Web UI 移植 → P4 運用。
 - 移行期間は `asset_backend`（挿絵）と `content_backend`（本文の blob → 行）を切り替え可能にし、フラグ 1 つで旧経路へ戻せる状態を保つ (D1 側の `objects`/`object_chunks` は移行後も消さない)。
 
+### Worker のジョブ実行・進捗配信・コンソール (2026-09)
+- **実行系**: `worker_entry/src/executor.rs` が queue から受けたジョブを実行し、`consumer.rs` が ack/retry を、`ledger.rs` が試行回数と実行トークンを担う。再試行の解釈 (`queue.max-retries` / `queue.retry-backoff`) は core の `application::retry_policy` が唯一の実装で、native の queue worker と Worker が同じ値を使う。
+- **進捗配信 (PushHub)**: Durable Object `PUSH_HUB` (`worker_entry/src/push_hub.rs`) が WebSocket を保持し、worker からは `POST /api/push/events` の HTTP でイベントを渡す (DO を直接 fetch すると "Cannot reconstruct" になるため HTTP 経由)。Web UI は `/websocket` に接続する。
+- **イベント payload**: ジョブイベントの生成は core の `application::push_events` が唯一の実装で、native の Web UI 経路と Worker が同一の JSON を出す。
+- **コンソール行**: ジョブのコンソール出力は core の `application::messages` が唯一の生成元。Worker 側は `messages::set_default_sink` に `PushHubSink` を挿し、ジョブ境界で `drain()` してまとめて送る (`stream` = `stdout` / `stderr`)。
+- **共有ヘルパ**: Web UI の入力検証・上限値・ソート状態・HTML ヘルパは core の `application::webui` が唯一の定義で、native の `src/web/**` と `worker_entry/src/webui/**` はそれを再エクスポートして使う。
+- **デプロイ**: `worker_entry/ci/deploy_worker.py` が `NAROU_DEPLOY_TARGET=develop|production` で D1 / Queue を用意し `wrangler.ci.toml` を描画してデプロイし、契約テストを流す。`CLOUDFLARE_API_TOKEN` が必要 (無い環境では手元からデプロイできない)。
+
 ### 最近の追加 (2026-05〜09)
 - **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1 で従来の逐次動作、フォース指定・ウェブモード・ドメインが1種類のときは自動的に逐次にフォールバック
 - **ジョブ自動リトライ** (B): queue worker に exponential backoff 付き自動リトライ（`queue.retry-backoff` 既定 `1m,5m,15m`）を実装
