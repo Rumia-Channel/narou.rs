@@ -595,7 +595,12 @@ fn parse_time(value: String) -> Result<DateTime<Utc>> {
 }
 
 fn parse_optional_time(value: Option<String>) -> Result<Option<DateTime<Utc>>> {
-    value.map(parse_time).transpose()
+    match value {
+        // UPSERT は任意日時を素のパラメータで書くため、欠けた日時は
+        // SQL NULL ではなく空文字で保存される (native と同じ規約)。
+        Some(text) if text.is_empty() => Ok(None),
+        other => other.map(parse_time).transpose(),
+    }
 }
 
 fn parse_extra_fields(value: &str) -> Result<BTreeMap<String, YamlValue>> {
@@ -688,13 +693,15 @@ fn record_binds(record: &NovelRecord) -> Result<Vec<BindValue>> {
         BindValue::Int(record.is_narou as i64),
         optional_text(format_time(record.last_check_date)),
         BindValue::Int(record.convert_failure as i64),
-        BindValue::Int(record.requires_login as i64),
-    match record.login_session.as_deref() {
-        Some(value) => BindValue::Text(value.to_string()),
-        None => BindValue::Null,
-    },
+        // 以降の 4 つは UPSERT_SQL の列順 (extra_fields_yaml, extra_fields_bytes,
+        // requires_login, login_session) と一致していなければならない。
         BindValue::Text(extra_fields_yaml.clone()),
         BindValue::Int(extra_fields_yaml.len() as i64),
+        BindValue::Int(record.requires_login as i64),
+        match record.login_session.as_deref() {
+            Some(value) => BindValue::Text(value.to_string()),
+            None => BindValue::Null,
+        },
     ])
 }
 
