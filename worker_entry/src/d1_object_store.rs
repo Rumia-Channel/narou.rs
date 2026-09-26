@@ -15,7 +15,7 @@ use std::sync::Arc;
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
     AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
-    ObjectStore, PlatformFuture,
+    ObjectStore, PlatformFuture, content_type_for_key,
 };
 use serde::Deserialize;
 use worker::{D1Database, D1PreparedStatement, wasm_bindgen::JsValue};
@@ -261,21 +261,6 @@ impl D1ObjectStore {
             ));
         }
         Ok(out)
-    }
-}
-
-fn content_type_for_key(key: &ObjectKey) -> Option<String> {
-    match key.as_ref().rsplit('.').next() {
-        Some("yaml") | Some("yml") => Some("application/yaml".to_string()),
-        Some("txt") => Some("text/plain; charset=utf-8".to_string()),
-        Some("ini") => Some("text/plain; charset=utf-8".to_string()),
-        Some("html") => Some("text/html; charset=utf-8".to_string()),
-        Some("epub") => Some("application/epub+zip".to_string()),
-        Some("zip") => Some("application/zip".to_string()),
-        Some("jpg") | Some("jpeg") => Some("image/jpeg".to_string()),
-        Some("png") => Some("image/png".to_string()),
-        Some("gif") => Some("image/gif".to_string()),
-        _ => None,
     }
 }
 

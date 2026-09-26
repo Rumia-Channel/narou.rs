@@ -21,6 +21,7 @@ pub mod object_store;
 pub mod progress;
 pub mod rate_limiter;
 pub mod repository;
+pub mod s3_request;
 pub mod s3_sigv4;
 
 pub use clock::{Clock, SystemClock};
@@ -33,7 +34,8 @@ pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
 pub use object_store::{
     AssetChunk, AssetStore, AssetStream, GeneratedAssetKey, NovelObjectKeys, ObjectEncoding,
     ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectStore,
-    compress_object_payload, decompress_object_payload, object_crc32, verify_object_crc32,
+    compress_object_payload, content_type_for_key, decompress_object_payload, object_crc32,
+    verify_object_crc32,
 };
 pub use progress::ProgressReporter;
 pub use rate_limiter::{normalize_site_key, RateLimitScope, RateLimiter};

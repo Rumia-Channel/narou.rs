@@ -24,7 +24,7 @@ pub const AUTO_UPDATE_PAGE_SIZE: usize = 100;
 /// Cron is only a probe. The persisted checkpoint owns the logical
 /// generation and cursor, so every minute does not reset an in-flight run.
 pub async fn run_scheduled_plan(event: ScheduledEvent, env: &Env) -> Result<()> {
-    let runtime = WorkerRuntime::build(env).map_err(|error| {
+    let runtime = WorkerRuntime::build(env).await.map_err(|error| {
         NarouError::Platform(format!("Worker runtime error: {error}"))
     })?;
     plan_auto_update(&runtime, event.schedule() as u64).await

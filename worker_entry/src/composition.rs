@@ -62,15 +62,50 @@ pub struct WorkerRuntime {
     pub subrequests: crate::budget::SubrequestBudget,
 }
 
+/// 現在の保存先を読む。未設定・読み取り失敗は `None` (= D1 扱い)。
+///
+/// 保存先は `app_state('inv','object_backend')` の 1 行で決める。`s3` 以外は
+/// すべて D1 として扱うので、移行前に戻すときはこの行を書き換えるだけでよい。
+async fn read_object_backend(db: &D1Database) -> Option<String> {
+    let statement = db
+        .prepare("SELECT value_json FROM app_state WHERE scope = 'inv' AND key = 'object_backend'");
+    let value = statement
+        .first::<serde_json::Value>(Some("value_json"))
+        .await
+        .ok()
+        .flatten()?;
+    value.as_str().map(str::to_string)
+}
+
+/// オブジェクトの保存先を組み立てる。
+///
+/// 移行期間中は `app_state` の 1 行で D1 と S3 を切り替える。S3 が選ばれて
+/// いて資格情報が欠けている場合は起動を失敗させ、黙って D1 へ落とさない
+/// (fail-closed)。
+async fn build_object_stores(
+    env: &Env,
+    db: &Arc<D1Database>,
+) -> worker::Result<(Arc<dyn ObjectStore>, Arc<dyn AssetStore>)> {
+    match read_object_backend(db).await.as_deref() {
+        Some("s3") => {
+            let store: Arc<crate::s3_object_store::S3ObjectStore> =
+                Arc::new(crate::s3_object_store::S3ObjectStore::from_env(env)?);
+            Ok((store.clone(), store))
+        }
+        _ => {
+            let store: Arc<D1ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
+            Ok((store.clone(), store))
+        }
+    }
+}
+
 impl WorkerRuntime {
     /// Build the runtime from the production bindings. Missing bindings fail
     /// composition (readiness 503), never an empty/partial service set.
-    pub fn build(env: &Env) -> worker::Result<Self> {
+    pub async fn build(env: &Env) -> worker::Result<Self> {
         let db = Arc::new(env.d1("DB")?);
         let subrequests = crate::budget::SubrequestBudget::new();
-        let store = Arc::new(D1ObjectStore::new(db.clone()));
-        let objects: Arc<dyn ObjectStore> = store.clone();
-        let assets: Arc<dyn AssetStore> = store;
+        let (objects, assets) = build_object_stores(env, &db).await?;
         let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let freeze = Arc::new(D1FreezeStore::new(db.clone()));
@@ -252,13 +287,13 @@ pub struct ReadServices {
 }
 
 /// Build the application services (read-only API surface).
-pub fn build_services(env: &Env) -> worker::Result<AppServices> {
-    Ok(build_read_services(env)?.app)
+pub async fn build_services(env: &Env) -> worker::Result<AppServices> {
+    Ok(build_read_services(env).await?.app)
 }
 
-pub fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
+pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
     let db = Arc::new(env.d1("DB")?);
-    let objects: Arc<dyn ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
+    let (objects, _assets) = build_object_stores(env, &db).await?;
     let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::new(db.clone()));
@@ -334,7 +369,7 @@ pub async fn check_ready(env: &Env) -> worker::Result<()> {
     env.queue(JOB_QUEUE_BINDING)?;
     env.durable_object("RATE_LIMITER")?;
     // Full composition validates bundled sites and all adapters.
-    WorkerRuntime::build(env).map(|_| ())
+    WorkerRuntime::build(env).await.map(|_| ())
 }
 
 #[derive(Debug, Deserialize)]

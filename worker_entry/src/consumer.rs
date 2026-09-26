@@ -44,7 +44,7 @@ pub async fn process_batch(
     message_batch: MessageBatch<serde_json::Value>,
     env: &Env,
 ) -> Result<()> {
-    let runtime = WorkerRuntime::build(env).map_err(worker_error)?;
+    let runtime = WorkerRuntime::build(env).await.map_err(worker_error)?;
     let mut downloader = runtime.new_downloader()?;
     for message in message_batch.messages().map_err(worker_error)? {
         process_envelope(&runtime, &mut downloader, message.body(), &message).await?;

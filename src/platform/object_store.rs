@@ -78,6 +78,23 @@ impl GeneratedAssetKey {
     }
 }
 
+/// 拡張子から保存時の `Content-Type` を決める。
+///
+/// ObjectStore / AssetStore の実装 (D1 / S3) で同じ判断を使うため core に置く。
+pub fn content_type_for_key(key: &ObjectKey) -> Option<&'static str> {
+    match key.as_ref().rsplit('.').next() {
+        Some("yaml") | Some("yml") => Some("application/yaml"),
+        Some("txt") | Some("ini") => Some("text/plain; charset=utf-8"),
+        Some("html") => Some("text/html; charset=utf-8"),
+        Some("epub") => Some("application/epub+zip"),
+        Some("zip") => Some("application/zip"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("png") => Some("image/png"),
+        Some("gif") => Some("image/gif"),
+        _ => None,
+    }
+}
+
 /// A validated prefix used for paginated listing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectPrefix(String);

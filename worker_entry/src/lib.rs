@@ -10,6 +10,7 @@ mod executor;
 pub mod http;
 mod ledger;
 mod rate_limiter;
+mod s3_object_store;
 mod scheduler;
 mod site_rate_limiter;
 use subtle::ConstantTimeEq;
@@ -47,7 +48,7 @@ async fn api_novels(req: Request, env: Env) -> Result<Response> {
     if !authorized(&req, &env) {
         return Response::error("Unauthorized", 401);
     }
-    let services = match composition::build_services(&env) {
+    let services = match composition::build_services(&env).await {
         Ok(services) => services,
         Err(_) => return Response::error("Service unavailable", 503),
     };
@@ -116,7 +117,7 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
     let Some(id) = rest.parse::<i64>().ok() else {
         return Response::error("Not Found", 404);
     };
-    let services = match composition::build_services(&env) {
+    let services = match composition::build_services(&env).await {
         Ok(services) => services,
         Err(_) => return Response::error("Service unavailable", 503),
     };
@@ -177,7 +178,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     if !authorized(&req, &env) {
         return Response::error("Unauthorized", 401);
     }
-    let services = match composition::build_read_services(&env) {
+    let services = match composition::build_read_services(&env).await {
         Ok(services) => services,
         Err(_) => return Response::error("Service unavailable", 503),
     };
@@ -328,7 +329,7 @@ async fn api_jobs(mut req: Request, env: Env) -> Result<Response> {
     if let Some(reason) = narou_rs::application::validate_request_limits(&request) {
         return Response::error(format!("request exceeds payload limits: {reason}"), 400);
     }
-    let runtime = match WorkerRuntime::build(&env) {
+    let runtime = match WorkerRuntime::build(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");
@@ -374,7 +375,7 @@ async fn api_job(req: Request, env: Env) -> Result<Response> {
     let Some(id) = id else {
         return Response::error("Not Found", 404);
     };
-    let runtime = match WorkerRuntime::build(&env) {
+    let runtime = match WorkerRuntime::build(&env).await {
         Ok(runtime) => runtime,
         Err(error) => {
             console_log!("service composition failed: {error}");
