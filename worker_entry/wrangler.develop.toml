@@ -48,8 +48,15 @@ command = "node build_assets.mjs && worker-build --release"
 
 # 資格情報は既定で Worker の secret (`wrangler secret` / `--secrets-file`) から読む。
 # アカウント共有の Cloudflare Secrets Store に置く場合は、次の 2 つを有効にする
-# （`store_id` はダッシュボードの Secrets Store の ID、`secret_name` はその中の名前。
+# （`store_id` は Secrets Store の ID、`secret_name` はその中の名前。
 #  binding 名は `<変数名>_STORE` にする決まりで、コード側がそれを見る）。
+#
+# 使い方は 2 通り。混ぜると同じバインディングが二重定義になるので、どちらか一方にする:
+#   1. ここに直書きする（Dantalian と同じ）。CI の `NAROU_SECRETS_STORE_ID` と
+#      `NAROU_S3_*_SECRET_NAME` は設定しない。
+#   2. CI から差し込む。このブロックはコメントのままにし、GitHub の `Cloudflare`
+#      環境に `NAROU_SECRETS_STORE_ID` と 5 つの `NAROU_S3_*_SECRET_NAME` を置く
+#      （アカウント固有の値をリポジトリに置かずに済む）。
 #
 # [[secrets_store_secrets]]
 # binding = "S3_ACCESS_KEY_ID_STORE"

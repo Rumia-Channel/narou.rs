@@ -344,6 +344,10 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
   何も書かなければ全部 (a)（`NAROU_S3_ENDPOINT` / `REGION` / `BUCKET` が必須）。
 - `NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME` だけは (b) の中でも独立に
   選べる（S3 は (a) のままトークンだけストア、が可能）。
+- **`wrangler.<target>.toml` に直書きする運用も可**（参考実装の Dantalian はこの形で、`store_id` を
+  3 テンプレートに直書きし、`secret_name` だけ CI から差し込んでいる）。直書きする場合は CI の
+  `NAROU_SECRETS_STORE_ID` / `NAROU_S3_*_SECRET_NAME` は設定しない（両方書くとバインディングが
+  二重定義になる）。CI 差し込みはアカウント固有の値をリポジトリに置かないための既定。
 - **ストア側の secret 名は自由**（既存のストアをそのまま使える）。`*_SECRET_NAME` に渡すのは
   名前だけなので、`WASABI_*` のような既存名でも、narou.rs 側の識別子（`S3_*`）に揃えた名前でもよい。
   変更が要るのは「どの名前を読むか」を書く GitHub 側だけ。ストアの ID と secret 名の一覧は
