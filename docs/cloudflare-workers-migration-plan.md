@@ -38,7 +38,7 @@ Phase 1-8 の抽象化（`docs/platform-abstraction.md`）で port の境界は�
 |---|---|---|
 | **ゴール** | **Web UI ごと Workers へ移行する**。native は CLI と、Workers で代替できない重量処理・ローカル操作のために残す | UI 移植は P3 |
 | **重量処理** | **Worker 内の AozoraEpub3_Lite (in-process) で完結**。外部プロセス前提の機能（AozoraEpub3 jar / kindlegen / SMTP / 端末送信 / セルフアップデート等）は **明示的に `blocked` / `501`** とし、黙って失敗させない | CF Containers は使わない |
-| **保存** | **メタデータと本文は D1（YAML/HTML をそのまま置かず、列に展開した形で保存）**、**挿絵（うごイラ含む）だけ S3 互換ストレージ**（本番の接続先は Wasabi を想定） | 詳細は §1 |
+| **保存** | **メタデータと本文は D1（YAML/HTML をそのまま置かず、列に展開した形で保存）**、**挿絵（うごイラ含む）だけ S3 互換ストレージ**（接続先は設定値で与える。識別子は `S3_*` / `s3_*` に統一） | 詳細は §1 |
 | **EPUB** | **保存しない**。Lite の機能で、Web UI の DL 要求時に保存済みデータからストリーミング生成する | 既存の `GET /api/novels/:id/download.epub` の形を維持 |
 | **raw / 余計なもの** | Workers 側では **raw HTML などのキャッシュを一切保存しない** | native は従来どおり（`.narou/` 互換に影響なし） |
 | **命名** | コード・binding・設定キーは `S3_*` / `s3_*`。ベンダ名を識別子に使わない | R2 / MinIO でも同じ経路 |
@@ -343,7 +343,7 @@ endpoint / region / bucket）を Cloudflare Secrets Store に置き、`wrangler.
 `[[secrets_store_secrets]]` の `store_id`（非秘密のリソース ID）と `secret_name` の**プレースホルダ**だけを
 書き、CI は GitHub secrets に「Cloudflare 側の secret 名」を入れてレンダラに渡す。バケット実体は
 手動作成で、環境の分離は `dantalian/<target>` の prefix をレンダラが導出して行う。
-（`worker/ci/render_config.py`, `worker/wrangler.production.toml`, `worker/src/wasabi_config.rs`）
+（参考実装側のファイル名: `worker/ci/render_config.py`, `worker/wrangler.production.toml`, `worker/src/wasabi_config.rs`）
 
 narou.rs も同じ 2 モードを持つようにした:
 
@@ -354,6 +354,9 @@ narou.rs も同じ 2 モードを持つようにした:
 
 - どちらでも `[vars] S3_ENDPOINT` 等は空になる（(b) の場合）か値が入る（(a)）。Worker 側は
   `<変数名>_STORE`（Secrets Store）→ `env.var` → `env.secret` の順に解決する。
+- **識別子は narou.rs 側の `S3_*` / `s3_*` に統一する**。参考実装の `WASABI_*` 名（環境変数・binding・
+  設定キー）は輸入しない。ベンダ名は設定値（endpoint / bucket）として外から与えるだけで、コードと
+  CI 変数には現れない。
 - `CLOUDFLARE_ACCOUNT_ID` は Dantalian の綴り（`CLOUDFLARE_ACCOUT_ID`）でも動くようにした
   （workflow 側で `||` で受ける）。
 - 検証: `ci/render_config.py` を両モードで実行し、`tomllib` で読み戻して
