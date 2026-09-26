@@ -19,6 +19,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # worker-build のピン。キャッシュのキーにも使う。
+  WORKER_BUILD_VERSION: 0.8.5
+
 jobs:
   native:
     name: Native check and tests
@@ -77,7 +81,13 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install worker-build --version 0.8.5 --locked
+      - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
+      # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
+      # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
       - run: worker-build --release
 
   worker-contract:
@@ -95,7 +105,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: cargo install worker-build --version 0.8.5 --locked
+      - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
+      # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
+      # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
       # tests/run.mjs builds, applies the local D1 migrations, starts
       # `wrangler dev` and runs the contract checks (health, fail-closed auth,
       # library/jobs APIs, and a queue-backed Convert job reaching a terminal
@@ -195,7 +211,13 @@ jobs:
         with:
           python-version: "3.12"
       # CI と同じ worker-build を固定する (ローカル・他のジョブと揃える)。
-      - run: cargo install worker-build --version 0.8.5 --locked
+      - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
+      # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
+      # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
       # 資格情報が無い環境 (fork / 未設定) では理由を出して省略する。
       - name: Check Cloudflare credentials
         id: credentials
@@ -273,7 +295,13 @@ jobs:
         with:
           python-version: "3.12"
       # CI と同じ worker-build を固定する (ローカル・他のジョブと揃える)。
-      - run: cargo install worker-build --version 0.8.5 --locked
+      - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
+      # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
+      # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
       # 資格情報が無い環境 (fork / 未設定) では理由を出して省略する。
       - name: Check Cloudflare credentials
         id: credentials
