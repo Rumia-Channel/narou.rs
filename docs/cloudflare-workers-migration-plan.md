@@ -359,6 +359,13 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 - Cloudflare 側に現れる形: `[vars]` は `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_PREFIX` /
   `NAROU_AUTH_REQUIRED`、Worker secret は `NAROU_ADMIN_TOKEN` / `NAROU_RS_LOGIN_KEY` /
   `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`、(b) モードでは `<NAME>_STORE` バインディング。
+- **実デプロイ検証 (2026-09-26, develop)**: 「Edit Cloudflare Workers」相当に D1 / Queues / Secrets Store を
+  足したトークンで、`d1 list/create` → `d1 migrations apply --remote`（10 件）→ `wrangler deploy` →
+  custom domain の作成 → Secrets Store バインディングの解決まで通過（run 36227905857）。smoke は Access が
+  前段にあるため省略（下記の service token を入れると実行される）。
+- smoke を Access の内側まで通すには、Access の application に **service token** を作り、ポリシーで許可した
+  うえで `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` を secrets に置く（`NAROU_AUTH_REQUIRED=false`
+  の環境では認証系の検査だけが自動で省略され、残り 25 件が実行される）。
 - デプロイ後の疎通先は `NAROU_DEPLOY_URL`（任意）→ custom domain → wrangler が報告した URL の順。
   custom domain が Access の内側にある場合は service token を渡すか smoke を省略する。
 - 検証: `ci/render_config.py` を両モード・2 target（domain あり/なし、`NAROU_AUTH_REQUIRED` /
