@@ -320,31 +320,15 @@ impl FreezeMutationStore for D1FreezeStore {
     }
 }
 
-/// isolate ごとの設定キャッシュ (scope 名 → 取得時刻と値)。
+/// isolate ごとの設定キャッシュ (scope 名 → 値)。
 ///
 /// Web UI のハンドラは `settings.get("webui.theme")` のようにキー単位で読む
 /// ため、キャッシュが無いと 1 リクエストで同じ scope を何度も D1 へ読みに
 /// 行っていた (1 回 = 往復 1 回)。書き込みは `save` で即時無効化し、他の
 /// isolate は TTL で追従する。
-const SETTINGS_CACHE_TTL_MS: f64 = 30_000.0;
-
 static SETTINGS_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<
-        std::collections::HashMap<&'static str, (f64, std::sync::Arc<HashMap<String, YamlValue>>)>,
-    >,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-fn cached_settings(scope_name: &'static str) -> Option<std::sync::Arc<HashMap<String, YamlValue>>> {
-    let cache = SETTINGS_CACHE.lock().ok()?;
-    let (stored_at, values) = cache.get(scope_name)?;
-    (js_sys::Date::now() - stored_at < SETTINGS_CACHE_TTL_MS).then(|| values.clone())
-}
-
-fn invalidate_settings_cache(scope_name: &'static str) {
-    if let Ok(mut cache) = SETTINGS_CACHE.lock() {
-        cache.remove(scope_name);
-    }
-}
+    crate::isolate_cache::TtlMap<std::sync::Arc<HashMap<String, YamlValue>>>,
+> = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
 
 #[derive(Debug, Clone)]
 pub struct D1SettingsStore {
@@ -368,7 +352,7 @@ impl SettingsStore for D1SettingsStore {
     fn load<'a>(&'a self, scope: SettingScope) -> PlatformFuture<'a, Result<HashMap<String, YamlValue>>> {
         Box::pin(async move {
             let scope_name = Self::scope_name(scope);
-            if let Some(cached) = cached_settings(scope_name) {
+            if let Some(cached) = SETTINGS_CACHE.get(scope_name) {
                 return Ok((*cached).clone());
             }
             let rows: Vec<StateRow> = self
@@ -385,12 +369,7 @@ impl SettingsStore for D1SettingsStore {
             for row in rows {
                 values.insert(row.key, parse_setting_value(&row.value_yaml, &row.value_json)?);
             }
-            if let Ok(mut cache) = SETTINGS_CACHE.lock() {
-                cache.insert(
-                    scope_name,
-                    (js_sys::Date::now(), std::sync::Arc::new(values.clone())),
-                );
-            }
+            SETTINGS_CACHE.put(scope_name, std::sync::Arc::new(values.clone()));
             Ok(values)
         })
     }
@@ -437,7 +416,7 @@ impl SettingsStore for D1SettingsStore {
             }
             let results = self.db.batch(statements).await.map_err(worker_error)?;
             ensure_batch_success(&results)?;
-            invalidate_settings_cache(scope_name);
+            SETTINGS_CACHE.invalidate(scope_name);
             Ok(())
         })
     }

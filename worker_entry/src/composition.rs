@@ -69,12 +69,20 @@ pub struct WorkerRuntime {
     pub subrequests: crate::budget::SubrequestBudget,
 }
 
+/// isolate ごとの `asset_backend` キャッシュ。設定の切替は TTL (30 秒) で
+/// 他 isolate に伝わる。
+static ASSET_BACKEND_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<Option<String>>> =
+    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+
 /// 挿絵の保存先を読む。未設定・読み取り失敗は `None` (= D1 扱い)。
 ///
 /// 保存先は `app_state('inv','asset_backend')` の 1 行で決める。`s3` 以外は
 /// 挿絵も D1 に置くので、切り替えはこの行を書き換えるだけでよい。
 /// 本文・メタデータは常に D1 (`SplitStore` が振り分ける)。
 async fn read_asset_backend(db: &D1Database) -> Option<String> {
+    if let Some(cached) = ASSET_BACKEND_CACHE.get("asset_backend") {
+        return cached;
+    }
     let statement = db
         .prepare("SELECT value_json FROM app_state WHERE scope = 'inv' AND key = 'asset_backend'");
     let value = statement
@@ -82,7 +90,9 @@ async fn read_asset_backend(db: &D1Database) -> Option<String> {
         .await
         .ok()
         .flatten()?;
-    value.as_str().map(str::to_string)
+    let resolved = value.as_str().map(str::to_string);
+    ASSET_BACKEND_CACHE.put("asset_backend", resolved.clone());
+    resolved
 }
 
 /// オブジェクトの保存先を組み立てる。
@@ -122,7 +132,16 @@ async fn build_object_stores(
 /// (`SECTION_HASH_CACHE_NAME`) と同じキー名。`Downloader` の起動時
 /// スナップショットとして渡すだけなので、行が無い・値が壊れている場合は
 /// 空 map にする（キャッシュは fail-open で良い）。
+/// isolate ごとの section hash cache。ダウンロードが書き換えても、
+/// 同じ値を使い続けても支障が無い (強更新の判定ヒント) ため TTL で十分。
+static SECTION_HASH_CACHE: std::sync::LazyLock<
+    crate::isolate_cache::TtlMap<HashMap<String, HashMap<String, String>>>,
+> = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+
 async fn load_section_hash_cache(db: &D1Database) -> HashMap<String, HashMap<String, String>> {
+    if let Some(cached) = SECTION_HASH_CACHE.get("section_hash_cache") {
+        return cached;
+    }
     let row: Option<(Option<String>, Option<String>)> = db
         .prepare(
             "SELECT value_yaml, value_json FROM app_state WHERE scope = 'inv' AND key = 'section_hash_cache'",
@@ -134,9 +153,11 @@ async fn load_section_hash_cache(db: &D1Database) -> HashMap<String, HashMap<Str
         return HashMap::new();
     };
     let payload = yaml.filter(|value| !value.trim().is_empty()).or(json);
-    payload
+    let resolved: HashMap<String, HashMap<String, String>> = payload
         .and_then(|value| serde_yaml::from_str(&value).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    SECTION_HASH_CACHE.put("section_hash_cache", resolved.clone());
+    resolved
 }
 
 /// `app_state` の値を bool として解釈する。YAML/JSON の真偽値と

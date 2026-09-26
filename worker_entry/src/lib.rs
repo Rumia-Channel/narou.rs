@@ -17,6 +17,7 @@ mod d1_object_store;
 mod d1_repository;
 mod executor;
 pub mod http;
+mod isolate_cache;
 mod ledger;
 mod object_migration;
 mod rate_limiter;
