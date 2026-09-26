@@ -217,10 +217,11 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         Err(_) => return Response::error("Stored text is not valid UTF-8", 500),
     };
 
-    // Prefetch illustrations with hard caps; the EPUB writer then resolves
-    // them from memory without touching storage mid-stream.
+    // 挿絵は EPUB 書き出し時に同期的に解決する必要があるため先読みする。
+    // ここで持つ量がそのままピークになるので、合計バイト数で厳しく制限する
+    // (Workers の 128 MiB 予算: 先読み + 生成中の EPUB + 応答コピー + 本文)。
     const MAX_IMAGES: usize = 512;
-    const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_IMAGE_BYTES: usize = 24 * 1024 * 1024;
     let mut prefetched: Vec<(String, Vec<u8>)> = Vec::new();
     let mut total = 0usize;
     let Ok(illust_prefix) = narou_rs::platform::ObjectPrefix::new(format!(
@@ -236,6 +237,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         .map(|(parent, _)| parent.to_owned())
         .unwrap_or_default();
     let mut cursor = None;
+    let mut truncated = false;
     loop {
         let mut request =
             narou_rs::platform::ObjectListRequest::new(illust_prefix.clone(), 100.try_into().unwrap());
@@ -246,6 +248,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         };
         for meta in page.objects {
             if prefetched.len() >= MAX_IMAGES {
+                truncated = true;
                 break;
             }
             let key = meta.key;
@@ -262,14 +265,34 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
                 };
                 prefetched.push((entry, bytes));
                 if total > MAX_IMAGE_BYTES {
+                    truncated = true;
                     break;
                 }
             }
+        }
+        if truncated {
+            break;
         }
         match page.next_cursor {
             Some(next) => cursor = Some(next),
             None => break,
         }
+    }
+    if truncated {
+        // 挿絵を落とした EPUB を「完全な作品」として返さない。Workers のメモリに
+        // 収まらない作品は、native 側の convert で作る必要がある。
+        console_log!(
+            "EPUB for novel {id} needs more than {} MiB of illustrations",
+            MAX_IMAGE_BYTES / 1024 / 1024
+        );
+        return Response::error(
+            format!(
+                "Illustrations exceed the Worker memory budget ({} MiB): \
+                 build this EPUB with the native convert instead",
+                MAX_IMAGE_BYTES / 1024 / 1024
+            ),
+            413,
+        );
     }
 
     let options = narou_rs::epub_lite::EpubBuildOptions {
