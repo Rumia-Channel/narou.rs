@@ -286,7 +286,6 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 | きっかけ | GitHub Environment | デプロイ先 |
 |---|---|---|
 | `develop` へ push | `develop` | develop |
-| `main` へ push | `staging` | staging |
 | タグ push (`v*` / 数字始まり) | `production` | production (custom domain) |
 | 手動 `workflow_dispatch` (target 選択) | 選択した環境 | 同左 |
 
@@ -365,14 +364,19 @@ narou.rs も同じ 2 モードを持つようにした:
   CI 変数には現れない。
 - `CLOUDFLARE_ACCOUNT_ID` は Dantalian の綴り（`CLOUDFLARE_ACCOUT_ID`）でも動くようにした
   （workflow 側で `||` で受ける）。
-- custom domain は target ごとの変数で入れる。production は `SERVICE_DOMAIN` が**必須**
-  （`workers_dev = false`）、develop / staging は `DEVELOP_DOMAIN` / `STAGING_DOMAIN` が**任意**で、
-  未設定なら route を足さず workers.dev の URL だけで動く。`[[routes]]` はレンダラが
-  `__CUSTOM_DOMAIN_BLOCK__` を差し替えて生成する。
-- デプロイ後の疎通先は `NAROU_DEPLOY_URL`（任意）→ wrangler が報告した workers.dev URL →
-  ログ中の https URL の順に決める。custom domain 運用（`workers_dev = false`）でも smoke が通る。
-- 検証: `ci/render_config.py` を両モード・3 target（domain あり/なし・不正値）で実行し、`tomllib` で
-  読み戻して `[vars]`・`[[secrets_store_secrets]]`・`[[routes]]`・prefix を確認（ローカル、Cloudflare 不要）。
+- custom domain は target ごとの変数で入れる。production は `SERVICE_DOMAIN` が**必須**、develop は
+  `DEVELOP_DOMAIN` が**任意**で、未設定なら route を足さず workers.dev の URL だけで動く。
+  `[[routes]]` はレンダラが `__CUSTOM_DOMAIN_BLOCK__` を差し替えて生成する。
+  **staging 環境は廃止した**（develop と production の 2 環境。環境名は `wrangler.<target>.toml` と
+  D1 / Queue の `<name>-<target>` 規則だけで分かれる）。
+- **route を入れた環境では `workers_dev` を閉じる（既定）**。Cloudflare Access (Zero Trust) を唯一の
+  境界にする前提では、workers.dev が開いていると Access を通らず Worker へ到達できてしまう。
+  `NAROU_WORKERS_DEV=true|false` で明示もできる。
+- デプロイ後の疎通先は `NAROU_DEPLOY_URL`（任意）→ custom domain → wrangler が報告した URL の順。
+  custom domain が Access の内側にある場合は service token を渡すか smoke を省略する。
+- 検証: `ci/render_config.py` を両モード・2 target（domain あり/なし、`NAROU_AUTH_REQUIRED` /
+  `NAROU_WORKERS_DEV` の明示と不正値）で実行し、`tomllib` で読み戻して `[vars]`・
+  `[[secrets_store_secrets]]`・`[[routes]]`・`workers_dev`・prefix を確認（ローカル、Cloudflare 不要）。
 
 ### 2.3 その他の差分
 
@@ -423,6 +427,12 @@ Browser ──► Worker (fetch)
 - API/CI は既存の `NAROU_ADMIN_TOKEN`（Bearer、定数時間比較）を継続。
 - ブラウザは token cookie（`narou_api_token`、HttpOnly / SameSite=Lax）+ 同一オリジン検査を追加（P3）。
 - secret 未設定時は fail-closed（401 ではなく 500 `authentication_not_configured` として設定不備を可視化）。
+- **Zero Trust (Cloudflare Access) を境界にする場合**は CI の `NAROU_AUTH_REQUIRED=false` で
+  Bearer トークン検査を切れる（`NAROU_ADMIN_TOKEN` は不要）。このときは workers.dev を閉じて
+  Access を通らない入口を残さないこと（route を入れた環境では既定で閉じる）。
+- CI の smoke は前段の Access に弾かれた場合（`tests/contract.mjs` が exit 3 で通知）に「省略」とし、
+  `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET`（Access の service token）を渡せば内側まで流せる。
+  `NAROU_AUTH_REQUIRED=false` の環境では未認証で通し、認証系の検査だけを自動で省略する。
 
 ### 3.3 Workers で提供しない機能（明示的に拒否する）
 
@@ -441,7 +451,7 @@ Browser ──► Worker (fetch)
 |---|---|
 | 環境分離 | `wrangler.<target>.toml` をテンプレート化し、CI が置換して `wrangler.ci.toml` を生成（生成物は gitignore）。置換前に形式検証 |
 | プロビジョニング | D1 と Queue(+DLQ) を list→create→再 list の冪等手順で用意し `GITHUB_OUTPUT` で受け渡す |
-| デプロイ | develop=push / staging=push main / production=`v*` タグ + タグが main の祖先かの検証。`needs: [native, worker]`、target 別 `concurrency`、**デプロイ前に `wrangler d1 migrations apply --remote`**、`--secrets-file`、`if: always()` で生成物削除 |
+| デプロイ | develop=push / production=`v*` タグ + タグが main の祖先かの検証。`needs: [native, worker]`、target 別 `concurrency`、**デプロイ前に `wrangler d1 migrations apply --remote`**、`--secrets-file`、`if: always()` で生成物削除 |
 | アセット | `[assets]` + ハッシュ付きアセット生成（P3） |
 | 契約テスト | `wrangler dev --local` + `node --test tests/*.mjs`。**トークン未設定時に fail-closed になること**も検証。`/cdn-cgi/local/scheduled` で cron を叩ける |
 | 自己修復 | `scheduled` でリース期限切れの回収と再 dispatch |

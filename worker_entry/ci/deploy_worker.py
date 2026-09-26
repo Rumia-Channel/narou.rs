@@ -10,14 +10,22 @@
 
 必須の環境変数:
 
-- `NAROU_DEPLOY_TARGET` … `develop` / `staging` / `production`
+- `NAROU_DEPLOY_TARGET` … `develop` / `production`
 - `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`
-- `NAROU_ADMIN_TOKEN` … Worker の API トークン（`--secrets-file` で投入）
-- `NAROU_RS_LOGIN_KEY` … 資格情報の at-rest 鍵（base64 32 バイト）
 - `NAROU_S3_ENDPOINT` / `NAROU_S3_REGION` / `NAROU_S3_BUCKET` … 挿絵の保存先
 - `SERVICE_DOMAIN` … production のみ（カスタムドメイン）
 
-任意: `NAROU_S3_PREFIX` / `NAROU_D1_BASE_NAME` / `NAROU_JOB_QUEUE_BASE` / `NAROU_SMOKE=0`。
+任意:
+
+- `NAROU_ADMIN_TOKEN` … Worker の API トークン（`--secrets-file` で投入）。
+  `NAROU_AUTH_REQUIRED=false`（Zero Trust を境界にする）ときは不要。
+- `NAROU_RS_LOGIN_KEY` … 資格情報の at-rest 鍵（base64 32 バイト）。無い場合は
+  平文の行だけを読む。
+- `NAROU_AUTH_REQUIRED` / `NAROU_WORKERS_DEV` / `DEVELOP_DOMAIN` /
+  `NAROU_S3_PREFIX` / `NAROU_D1_BASE_NAME` / `NAROU_JOB_QUEUE_BASE` / `NAROU_SMOKE=0`
+- `NAROU_DEPLOY_URL` … smoke の宛先を明示する（既定は domain → workers.dev）
+- `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` … Access の service token。
+  未設定で Access に弾かれた場合は smoke を省略する。
 
 ローカルからは実行しない（Cloudflare の資格情報が要る）。CI からのみ呼ぶ。
 """
@@ -33,7 +41,7 @@ from pathlib import Path
 from typing import NoReturn
 
 WORKER_DIR = Path(__file__).resolve().parent.parent
-TARGETS = ("develop", "staging", "production")
+TARGETS = ("develop", "production")
 URL_PATTERN = re.compile(r"https://[A-Za-z0-9.-]+")
 WORKER_URL_PATTERN = re.compile(r"https://[A-Za-z0-9.-]+\.workers\.dev")
 
@@ -58,6 +66,11 @@ def run(command: list[str], *, capture: bool = False, env: dict[str, str] | None
             sys.stderr.write(result.stderr or "")
         fail(f"{' '.join(command)} failed with {result.returncode}")
     return (result.stdout or "") if capture else ""
+
+
+def auth_required() -> bool:
+    """Bearer トークン検査が有効か（Zero Trust を境界にする場合は false）。"""
+    return os.environ.get("NAROU_AUTH_REQUIRED", "true").strip().lower() != "false"
 
 
 def required(name: str) -> str:
@@ -102,8 +115,9 @@ def render(target: str, resources: dict[str, str]) -> str:
 def secret_file(target: str) -> Path | None:
     """`--secrets-file` に渡す JSON を書く（終了時に必ず消す）。
 
-    Secrets Store (`NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME`) に
-    置く場合は値が無くてもよい（その場合はファイルを作らない）。
+    `NAROU_AUTH_REQUIRED=false`（Cloudflare Access などの Zero Trust が境界）なら
+    `NAROU_ADMIN_TOKEN` は要らない。`*_SECRET_NAME` を渡した項目は Secrets Store に
+    置くので、値が無くても失敗にしない。
     """
     stored = {
         "NAROU_ADMIN_TOKEN": os.environ.get("NAROU_ADMIN_TOKEN_SECRET_NAME", "").strip(),
@@ -114,8 +128,16 @@ def secret_file(target: str) -> Path | None:
         value = os.environ.get(name, "").strip()
         if value:
             secrets[name] = value
-        elif not store_name:
-            fail(f"{name} is required (or set {name}_SECRET_NAME to keep it in the Secrets Store)")
+        elif store_name:
+            continue
+        elif name == "NAROU_ADMIN_TOKEN":
+            if auth_required():
+                fail(
+                    "NAROU_ADMIN_TOKEN is required (or set NAROU_ADMIN_TOKEN_SECRET_NAME, "
+                    "or NAROU_AUTH_REQUIRED=false when Zero Trust is the boundary)"
+                )
+        else:
+            print(f"::notice::{name} is not set; stored credentials stay plaintext-only")
     if not secrets:
         return None
     path = WORKER_DIR / f".deploy-secrets-{target}.json"
@@ -143,8 +165,23 @@ def deploy(secrets: Path | None) -> str:
     return urls[-1]
 
 
-def smoke(base_url: str) -> bool:
-    """デプロイ先に契約テストを流す。失敗してもデプロイは巻き戻さない。"""
+def smoke_url(target: str, reported: str) -> str:
+    """smoke の宛先。明示 > custom domain > wrangler が報告した URL。"""
+    explicit = os.environ.get("NAROU_DEPLOY_URL", "").strip()
+    if explicit:
+        return explicit
+    domain = os.environ.get({"develop": "DEVELOP_DOMAIN", "production": "SERVICE_DOMAIN"}[target], "").strip()
+    if domain:
+        return f"https://{domain}"
+    return reported
+
+
+def smoke(base_url: str) -> bool | None:
+    """デプロイ先に契約テストを流す。失敗してもデプロイは巻き戻さない。
+
+    前段の Cloudflare Access に弾かれた場合（service token 未設定）は
+    `tests/contract.mjs` が exit 3 で知らせるので「省略」として扱う。
+    """
     env = dict(os.environ)
     env["BASE_URL"] = base_url
     result = subprocess.run(
@@ -155,6 +192,9 @@ def smoke(base_url: str) -> bool:
         encoding="utf-8",
         env=env,
     )
+    if result.returncode == 3:
+        print("::notice::Access が前段にあるため smoke を省略しました (CF_ACCESS_CLIENT_ID/SECRET で実行できます)")
+        return None
     return result.returncode == 0
 
 
@@ -176,7 +216,7 @@ def summary(target: str, url: str, smoke_ok: bool | None) -> None:
 def main() -> None:
     target = os.environ.get("NAROU_DEPLOY_TARGET", "").strip()
     if target not in TARGETS:
-        fail("NAROU_DEPLOY_TARGET must be develop, staging, or production")
+        fail("NAROU_DEPLOY_TARGET must be develop or production")
     # 資格情報は早めに検証する（デプロイ途中で落ちないように）。
     required("CLOUDFLARE_ACCOUNT_ID")
     required("CLOUDFLARE_API_TOKEN")
@@ -207,7 +247,7 @@ def main() -> None:
 
     smoke_result: bool | None = None
     if os.environ.get("NAROU_SMOKE", "1") != "0":
-        smoke_result = smoke(url)
+        smoke_result = smoke(smoke_url(target, url))
     summary(target, url, smoke_result)
     if smoke_result is False:
         fail(f"smoke test failed against {url}")

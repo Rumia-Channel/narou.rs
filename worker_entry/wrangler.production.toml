@@ -1,18 +1,21 @@
-# production 環境テンプレート。develop/staging との違いは
+# production 環境テンプレート。develop との違いは
 # ・name (サフィックス無し)
-# ・workers_dev = false + custom domain (SERVICE_DOMAIN / 必須)
+# ・custom domain (SERVICE_DOMAIN / 必須)。route を入れるので workers_dev は
+#   既定で false になる
 # だけ。値は CI が置換する。
 
 name = "narou-rs"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-08-10"
-workers_dev = false
+workers_dev = __WORKERS_DEV__
 
 [limits]
 cpu_ms = 300000
 
 [vars]
-NAROU_AUTH_REQUIRED = "true"
+# Zero Trust (Access) を境界にする場合は CI の `NAROU_AUTH_REQUIRED=false` で
+# Bearer トークン検査を切る (NAROU_ADMIN_TOKEN も不要になる)。
+NAROU_AUTH_REQUIRED = "__NAROU_AUTH_REQUIRED__"
 S3_ENDPOINT = "__S3_ENDPOINT__"
 S3_REGION = "__S3_REGION__"
 S3_BUCKET = "__S3_BUCKET__"

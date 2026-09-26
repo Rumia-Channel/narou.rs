@@ -431,8 +431,8 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 
 ### Worker の CI デプロイ (2026-09)
 
-- `.github/workflows/platform.yml` の `worker-deploy-{develop,staging,production}`。きっかけは
-  `develop` push / `main` push / タグ push（+ 手動 dispatch）。環境は GitHub Environments で分け、
+- `.github/workflows/platform.yml` の `worker-deploy-{develop,production}`。きっかけは
+  `develop` push / タグ push（+ 手動 dispatch）。staging 環境は持たない。環境は GitHub Environments で分け、
   そこに Cloudflare の secret と vars を置く（一覧は `docs/cloudflare-workers-migration-plan.md` §2.2.8）。
 - 実体は `worker_entry/ci/deploy_worker.py`（provision → render → migrate → secret 投入 → deploy → smoke）。
   D1/Queue は環境名から導出して冪等に作るので、初回デプロイでも手作業が要らない。

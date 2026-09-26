@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import NoReturn
 from uuid import UUID
 
-TARGETS = ("develop", "staging", "production")
+TARGETS = ("develop", "production")
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 BUCKET_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 REGION_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}$")
@@ -55,7 +55,7 @@ def unresolved_placeholders(template: str) -> list[str]:
 def main() -> None:
     target = required("NAROU_DEPLOY_TARGET")
     if target not in TARGETS:
-        fail("NAROU_DEPLOY_TARGET must be develop, staging, or production")
+        fail("NAROU_DEPLOY_TARGET must be develop or production")
 
     database_name = required("NAROU_D1_DATABASE_NAME")
     database_id = required("NAROU_D1_DATABASE_ID")
@@ -164,9 +164,10 @@ def main() -> None:
             if name
         )
         replacements["__SECRET_STORE_BLOCKS__"] = blocks
-    # custom domain の route。production は必須 (workers_dev = false)、
-    # develop/staging は任意で、未設定なら workers.dev の URL だけで動く。
-    domain_var = {"production": "SERVICE_DOMAIN", "develop": "DEVELOP_DOMAIN", "staging": "STAGING_DOMAIN"}[target]
+    # custom domain の route。production は必須、develop は任意で、未設定なら
+    # workers.dev の URL だけで動く。前段に Cloudflare Access (Zero Trust) を
+    # 置く前提なので、route を入れた環境では workers_dev を閉じる。
+    domain_var = {"production": "SERVICE_DOMAIN", "develop": "DEVELOP_DOMAIN"}[target]
     domain = required(domain_var) if target == "production" else optional(domain_var, "").strip()
     if domain:
         if not HOSTNAME_PATTERN.fullmatch(domain) or "." not in domain:
@@ -174,6 +175,18 @@ def main() -> None:
         replacements["__CUSTOM_DOMAIN_BLOCK__"] = (
             f'\n[[routes]]\npattern = "{domain}"\ncustom_domain = true\n'
         )
+    # workers_dev は domain の有無から決める (NAROU_WORKERS_DEV で明示もできる)。
+    workers_dev = optional("NAROU_WORKERS_DEV", "").strip().lower()
+    if not workers_dev:
+        workers_dev = "false" if domain else "true"
+    if workers_dev not in ("true", "false"):
+        fail("NAROU_WORKERS_DEV must be true or false")
+    replacements["WORKERS_DEV"] = workers_dev
+    # Zero Trust が境界なら false。既定は今までどおり true (fail-closed)。
+    auth_required = optional("NAROU_AUTH_REQUIRED", "true").strip().lower()
+    if auth_required not in ("true", "false"):
+        fail("NAROU_AUTH_REQUIRED must be true or false")
+    replacements["NAROU_AUTH_REQUIRED"] = auth_required
 
     template_path = WORKER_DIR / f"wrangler.{target}.toml"
     template = template_path.read_text(encoding="utf-8")

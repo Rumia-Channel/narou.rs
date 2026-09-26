@@ -5,6 +5,8 @@
 # account 固有の値 (database_id / S3 の接続先 / secret 名) はここに書かない。
 #
 # `DEVELOP_DOMAIN` を CI 側で設定すると custom domain の route が入る (任意)。
+# route を入れると workers_dev は自動で false になる (Cloudflare Access などの
+# Zero Trust を唯一の境界にする場合、workers.dev を残すと素通りになるため)。
 # 未設定なら workers.dev の URL だけで動く。
 #
 # ローカル開発は `wrangler.toml` (プレースホルダ無し) を使う。
@@ -12,14 +14,16 @@
 name = "narou-rs-develop"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-08-10"
-workers_dev = true
+workers_dev = __WORKERS_DEV__
 
 [limits]
 # 有料プラン前提の余裕。EPUB 生成と長い queue ジョブを 1 invocation で扱う。
 cpu_ms = 300000
 
 [vars]
-NAROU_AUTH_REQUIRED = "true"
+# Zero Trust (Access) を境界にする場合は CI の `NAROU_AUTH_REQUIRED=false` で
+# Bearer トークン検査を切る (NAROU_ADMIN_TOKEN も不要になる)。
+NAROU_AUTH_REQUIRED = "__NAROU_AUTH_REQUIRED__"
 S3_ENDPOINT = "__S3_ENDPOINT__"
 S3_REGION = "__S3_REGION__"
 S3_BUCKET = "__S3_BUCKET__"

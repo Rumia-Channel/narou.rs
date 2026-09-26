@@ -13,7 +13,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, NoReturn
 
-TARGETS = ("develop", "staging", "production")
+TARGETS = ("develop", "production")
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 UUID_PATTERN = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
@@ -148,7 +148,7 @@ def main() -> None:
     base_database = os.environ.get("NAROU_D1_BASE_NAME", "narou-rs").strip()
     base_queue = os.environ.get("NAROU_JOB_QUEUE_BASE", "narou-jobs").strip()
     if target not in TARGETS:
-        fail("NAROU_DEPLOY_TARGET must be develop, staging, or production")
+        fail("NAROU_DEPLOY_TARGET must be develop or production")
     for label, value in (
         ("NAROU_D1_BASE_NAME", base_database),
         ("NAROU_JOB_QUEUE_BASE", base_queue),

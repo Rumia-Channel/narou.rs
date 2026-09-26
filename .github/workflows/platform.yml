@@ -2,8 +2,8 @@ name: Platform portability
 
 on:
   push:
-    # develop 更新で develop 環境へ、main 更新で staging 環境へ、
-    # v* タグで production 環境へデプロイする (下の worker-deploy-* を参照)。
+    # develop 更新で develop 環境へ、v* タグで production 環境へデプロイする
+    # (下の worker-deploy-* を参照)。
     branches: [develop, refactor-platform-abstraction, main]
     # release.yml と同じタグ集合 (v* と数字始まり) で production へ。
     tags: ["v*", "[0-9]*"]
@@ -13,7 +13,7 @@ on:
       target:
         description: Deployment target
         type: choice
-        options: [develop, staging, production]
+        options: [develop, production]
         default: develop
 
 permissions:
@@ -113,21 +113,24 @@ jobs:
   #                 NAROU_JOB_QUEUE / NAROU_JOB_DLQ /
   #                 NAROU_S3_ENDPOINT / NAROU_S3_REGION / NAROU_S3_BUCKET
   #                 (+ production のみ SERVICE_DOMAIN)
-  #   secrets.NAROU_ADMIN_TOKEN (デプロイ後の smoke test で使う)
+  #   secrets.NAROU_ADMIN_TOKEN (デプロイ後の smoke test で使う。Zero Trust を
+  #                 境界にする場合は NAROU_AUTH_REQUIRED=false で不要になる)
   # 未設定の間は workflow_dispatch から実行しても失敗するだけで、push では走らない。
-  # 環境ごとのデプロイ。GitHub Environments (develop / staging / production) に
+  # 環境ごとのデプロイ。GitHub Environments (develop / production) に
   # Cloudflare の資格情報と secret を置く:
   #   secrets: CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN /
   #            NAROU_ADMIN_TOKEN / NAROU_RS_LOGIN_KEY
   #   vars:    NAROU_S3_ENDPOINT / NAROU_S3_REGION / NAROU_S3_BUCKET /
-  #            NAROU_S3_PREFIX (任意) / SERVICE_DOMAIN (production のみ)
+  #            NAROU_S3_PREFIX (任意) / SERVICE_DOMAIN (production のみ) /
+  #            DEVELOP_DOMAIN (任意) / NAROU_AUTH_REQUIRED (任意, Zero Trust なら false)
   # D1・Queue は `ci/provision_resources.py` が環境名から導出して冪等に作る。
-  # 環境ごとのデプロイ。GitHub Environments (develop / staging / production) に
+  # 環境ごとのデプロイ。GitHub Environments (develop / production) に
   # Cloudflare の資格情報と secret を置く:
   #   secrets: CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN /
   #            NAROU_ADMIN_TOKEN / NAROU_RS_LOGIN_KEY
   #   vars:    NAROU_S3_ENDPOINT / NAROU_S3_REGION / NAROU_S3_BUCKET /
-  #            NAROU_S3_PREFIX (任意) / SERVICE_DOMAIN (production のみ)
+  #            NAROU_S3_PREFIX (任意) / SERVICE_DOMAIN (production のみ) /
+  #            DEVELOP_DOMAIN (任意) / NAROU_AUTH_REQUIRED (任意, Zero Trust なら false)
   # D1・Queue は `ci/provision_resources.py` が環境名から導出して冪等に作る。
   worker-deploy-develop:
     name: Deploy Worker (develop)
@@ -168,6 +171,11 @@ jobs:
       # トークンと復号鍵も Secrets Store に置く場合だけ設定する。
       NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
       NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
+      # Zero Trust (Cloudflare Access) を境界にする場合は false にする。
+      NAROU_AUTH_REQUIRED: ${{ vars.NAROU_AUTH_REQUIRED || 'true' }}
+      # Access の service token (custom domain 越しに smoke を流す場合だけ)。
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -191,75 +199,6 @@ jobs:
           if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
             echo "configured=false" >> "$GITHUB_OUTPUT"
             echo "::notice::Cloudflare の secret が未設定のため develop へのデプロイを省略します"
-          else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          fi
-      - run: python3 ci/deploy_worker.py
-        if: steps.credentials.outputs.configured == 'true'
-
-
-  worker-deploy-staging:
-    name: Deploy Worker (staging)
-    if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
-      || (github.event_name == 'workflow_dispatch' && inputs.target == 'staging')
-    needs: [native, native-gpl, wasm, worker, worker-contract, license]
-    runs-on: ubuntu-latest
-    concurrency:
-      group: narou-worker-staging
-      cancel-in-progress: false
-    environment:
-      name: staging
-    permissions:
-      contents: read
-    defaults:
-      run:
-        working-directory: worker_entry
-    env:
-      # Dantalian と同じ綴り (`ACCOUT_ID`) でも動くようにしておく。
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      NAROU_DEPLOY_TARGET: staging
-      STAGING_DOMAIN: ${{ vars.STAGING_DOMAIN }}
-      NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
-      NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
-      NAROU_S3_ENDPOINT: ${{ vars.NAROU_S3_ENDPOINT }}
-      NAROU_S3_REGION: ${{ vars.NAROU_S3_REGION }}
-      NAROU_S3_BUCKET: ${{ vars.NAROU_S3_BUCKET }}
-      NAROU_S3_PREFIX: ${{ vars.NAROU_S3_PREFIX }}
-      # Secrets Store を使う場合だけ設定する (名前だけを渡し、値はストアに置く)。
-      NAROU_SECRETS_STORE_ID: ${{ vars.NAROU_SECRETS_STORE_ID }}
-      NAROU_S3_ACCESS_KEY_ID_SECRET_NAME: ${{ vars.NAROU_S3_ACCESS_KEY_ID_SECRET_NAME }}
-      NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME: ${{ vars.NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME }}
-      NAROU_S3_ENDPOINT_SECRET_NAME: ${{ vars.NAROU_S3_ENDPOINT_SECRET_NAME }}
-      NAROU_S3_REGION_SECRET_NAME: ${{ vars.NAROU_S3_REGION_SECRET_NAME }}
-      NAROU_S3_BUCKET_SECRET_NAME: ${{ vars.NAROU_S3_BUCKET_SECRET_NAME }}
-      # トークンと復号鍵も Secrets Store に置く場合だけ設定する。
-      NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
-      NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      # CI と同じ worker-build を固定する (ローカル・他のジョブと揃える)。
-      - run: cargo install worker-build --version 0.8.5 --locked
-      # 資格情報が無い環境 (fork / 未設定) では理由を出して省略する。
-      - name: Check Cloudflare credentials
-        id: credentials
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: |
-          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Cloudflare の secret が未設定のため staging へのデプロイを省略します"
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
@@ -306,6 +245,11 @@ jobs:
       # トークンと復号鍵も Secrets Store に置く場合だけ設定する。
       NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
       NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
+      # Zero Trust (Cloudflare Access) を境界にする場合は false にする。
+      NAROU_AUTH_REQUIRED: ${{ vars.NAROU_AUTH_REQUIRED || 'true' }}
+      # Access の service token (custom domain 越しに smoke を流す場合だけ)。
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -5,6 +5,11 @@
 //
 //   NAROU_ADMIN_TOKEN=... BASE_URL=http://127.0.0.1:8787 node tests/contract.mjs
 //
+// Zero Trust (Cloudflare Access) を境界にして `NAROU_AUTH_REQUIRED=false` で
+// 動かす場合は token 不要 (認証系の検査は自動で省略される)。Access の service
+// token (`CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET`) を渡すと、Access の
+// 内側へもそのまま流せる。前段が Access で弾く場合は exit 3 で「省略」を伝える。
+//
 // CONTRACT_QUEUE=1 のときだけ queue consumer が回る前提の検査 (Convert ジョブが
 // 終端状態になるまで待つ) を行う。ローカルでも `wrangler dev` は queue を
 // 処理するが、環境によっては配送されないので既定では無効にする。
@@ -16,11 +21,40 @@ const BASE_URL = process.env.BASE_URL ?? "http://127.0.0.1:8787";
 const TOKEN = process.env.NAROU_ADMIN_TOKEN;
 const QUEUE_CHECKS = process.env.CONTRACT_QUEUE === "1";
 const TERMINAL_STATUSES = new Set(["succeeded", "blocked", "permanent"]);
+const AUTH_REQUIRED = (process.env.NAROU_AUTH_REQUIRED ?? "true").toLowerCase() !== "false";
+const ACCESS_CLIENT_ID = process.env.CF_ACCESS_CLIENT_ID;
+const ACCESS_CLIENT_SECRET = process.env.CF_ACCESS_CLIENT_SECRET;
 
 const UNCONFIGURED = process.env.CONTRACT_EXPECT_UNCONFIGURED === "1";
-if (!TOKEN && !UNCONFIGURED) {
-  console.error("NAROU_ADMIN_TOKEN is required");
+if (!TOKEN && !UNCONFIGURED && AUTH_REQUIRED) {
+  console.error("NAROU_ADMIN_TOKEN is required (or set NAROU_AUTH_REQUIRED=false)");
   process.exit(2);
+}
+
+/** Access の service token を全リクエストへ載せる。 */
+function accessHeaders() {
+  if (!ACCESS_CLIENT_ID || !ACCESS_CLIENT_SECRET) {
+    return {};
+  }
+  return {
+    "cf-access-client-id": ACCESS_CLIENT_ID,
+    "cf-access-client-secret": ACCESS_CLIENT_SECRET,
+  };
+}
+
+function fetchWithAccess(input, init = {}) {
+  return fetch(input, { ...init, headers: { ...accessHeaders(), ...(init.headers ?? {}) } });
+}
+
+// Access が前段にあると資格なしの GET は Access のログインへ飛ぶ。service token が
+// 無い場合は smoke として意味が無いので、その旨を exit 3 で伝える。
+if (!ACCESS_CLIENT_ID && process.env.CONTRACT_SKIP_ACCESS_PROBE !== "1") {
+  const probe = await fetchWithAccess(url("/health/live"), { redirect: "manual" });
+  const location = probe.headers.get("location") ?? "";
+  if ([301, 302, 303, 307, 308].includes(probe.status) && location.includes("cloudflareaccess.com")) {
+    console.log(`Cloudflare Access is in front of ${BASE_URL}; skipping the remote smoke`);
+    process.exit(3);
+  }
 }
 
 /** 検査を 1 件定義する（`node --test` で走る）。 */
@@ -29,6 +63,14 @@ function check(name, fn) {
     return;
   }
   test(name, fn);
+}
+
+/** 認証が無効な環境 (Zero Trust) では走らせない検査。 */
+function checkWithAuth(name, fn) {
+  if (!AUTH_REQUIRED) {
+    return;
+  }
+  check(name, fn);
 }
 
 /** 認証ヘッダ付き (token 省略時は付けない = 未認証の検査用)。 */
@@ -50,7 +92,7 @@ async function json(response) {
 }
 
 async function request(path, init = {}) {
-  return fetch(url(path), init);
+  return fetchWithAccess(url(path), init);
 }
 
 /** エラー応答の機械可読コードを取り出す。 */
@@ -64,10 +106,13 @@ await check("GET /health/live reports the auth configuration", async () => {
   const body = await json(response);
   assert(response.status === 200, `status ${response.status}`);
   assert(body.status === "alive", `unexpected status: ${JSON.stringify(body)}`);
-  assert(body.authentication_required === true, "auth must be required in this run");
+  assert(
+    body.authentication_required === AUTH_REQUIRED,
+    `authentication_required must match NAROU_AUTH_REQUIRED (${AUTH_REQUIRED})`,
+  );
   assert(
     body.authentication_configured === true,
-    "the token must be configured in this run",
+    "the deployment must report a usable configuration",
   );
 });
 
@@ -78,7 +123,7 @@ await check("GET /health/ready returns 200 (D1 + queue + DO + composition)", asy
   assert(body.status === "ready", `unexpected status: ${JSON.stringify(body)}`);
 });
 
-await check("GET /api/novels is closed without a token", async () => {
+await checkWithAuth("GET /api/novels is closed without a token", async () => {
   const response = await request("/api/novels");
   assert(response.status === 401, `status ${response.status}`);
   assert(
@@ -87,7 +132,7 @@ await check("GET /api/novels is closed without a token", async () => {
   );
 });
 
-await check("GET /api/novels rejects a wrong token", async () => {
+await checkWithAuth("GET /api/novels rejects a wrong token", async () => {
   const response = await request("/api/novels", auth("definitely-not-the-token"));
   assert(response.status === 401, `status ${response.status}`);
   assert(
@@ -125,7 +170,7 @@ await check("GET /api/jobs/:id returns 404 for an unknown job", async () => {
   assert(response.status === 404, `status ${response.status}`);
 });
 
-await check("POST /api/jobs requires auth", async () => {
+await checkWithAuth("POST /api/jobs requires auth", async () => {
   const response = await request("/api/jobs", { method: "POST", body: "{}" });
   assert(response.status === 401, `status ${response.status}`);
   assert((await errorCode(response)) === "authentication_required", "code must be set");
@@ -188,7 +233,7 @@ await check("the scheduled handler runs (cron planner)", async () => {
   throw new Error(`scheduled endpoint not reachable: ${statuses.join(", ")}`);
 });
 
-await check("GET /api/novels/:id/illustrations/:name requires auth", async () => {
+await checkWithAuth("GET /api/novels/:id/illustrations/:name requires auth", async () => {
   const response = await request("/api/novels/1/illustrations/0001.jpg");
   assert(response.status === 401, `status ${response.status}`);
   assert((await errorCode(response)) === "authentication_required", "code must be set");
@@ -246,7 +291,7 @@ await check("GET /api/sites lists bundled definitions", async () => {
   );
 });
 
-await check("GET /api/sites is closed without a token", async () => {
+await checkWithAuth("GET /api/sites is closed without a token", async () => {
   const response = await request("/api/sites");
   assert(response.status === 401, `status ${response.status}`);
   assert((await errorCode(response)) === "authentication_required", "code must be set");
@@ -389,7 +434,7 @@ await check("POST /api/admin/object-migration status reports progress", async ()
   assert(Array.isArray(body.failed), "failed must be an array");
 });
 
-await check("POST /api/admin/object-migration requires auth", async () => {
+await checkWithAuth("POST /api/admin/object-migration requires auth", async () => {
   const response = await request("/api/admin/object-migration", {
     method: "POST",
     body: JSON.stringify({ action: "status" }),
@@ -421,7 +466,7 @@ if (QUEUE_CHECKS) {
 // 失敗する（設定漏れが「トークン違い」に見えないように）。
 if (process.env.CONTRACT_EXPECT_UNCONFIGURED === "1") {
   await check("an unconfigured Worker fails closed with a distinct code", async () => {
-    const response = await fetch(new URL("/api/novels", BASE_URL).toString());
+    const response = await fetchWithAccess(new URL("/api/novels", BASE_URL).toString());
     assert.equal(response.status, 500);
     const body = await response.json();
     assert.equal(body?.error?.code, "authentication_not_configured");
