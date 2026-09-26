@@ -114,10 +114,25 @@ def enable_read_replication(resources: dict[str, str]) -> None:
 
     Sessions API を使わない限り全クエリは primary に行くため、有効化と
     併せてアプリ側のセッション利用が前提になる（`build_ui` を参照）。
+
+    失敗してもデプロイは止めない: 資格情報の権限不足でリリースが止まるより、
+    警告を残して配信を続ける方が安全（有効化は冪等なので次回も試行される）。
     """
     env = os.environ.copy()
     env["NAROU_D1_DATABASE_ID"] = resources["database_id"]
-    run([sys.executable, "ci/enable_read_replication.py"], env=env)
+    result = subprocess.run(
+        [sys.executable, "ci/enable_read_replication.py"],
+        cwd=WORKER_DIR,
+        check=False,
+        text=True,
+        encoding="utf-8",
+        env=env,
+    )
+    if result.returncode != 0:
+        print(
+            "::warning::read replication を有効化できませんでした"
+            " (CLOUDFLARE_API_TOKEN に D1:Edit が必要です)。デプロイは続行します。"
+        )
 
 
 def render(target: str, resources: dict[str, str]) -> str:
