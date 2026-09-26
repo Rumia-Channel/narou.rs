@@ -135,10 +135,10 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
 
 /// GET /api/novels/:id/download.epub — build the EPUB from the stored
 /// converted text (`novel.txt` object) at download time and stream it as the
-/// response body: the book is written entry by entry and each chunk leaves as
-/// soon as it is produced, so the finished archive is never held in memory.
-/// Illustrations are prefetched first because the Lite build reads them for
-/// their dimensions, and the input source has no async read.
+/// response body: the book is written entry by entry, each illustration is read
+/// from the object store right before the entry that embeds it, and every chunk
+/// leaves as soon as it is produced. Neither the finished archive nor the image
+/// set is ever held in memory.
 async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Response> {
     if !authorized(&req, &env) {
         return Response::error("Unauthorized", 401);
@@ -182,22 +182,19 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         Err(_) => return Response::error("Stored text is not valid UTF-8", 500),
     };
 
-    // 挿絵は Lite が構築時に寸法を読むため先読みが要る (入力源は同期 API で、
-    // D1 には範囲読み出しが無い)。ここで持つ量がピークになるので上限を守る。
-    // エントリ名は本文の参照と同じ相対パス (`挿絵/foo.jpg`) にする: Lite は
-    // この名前で解決するため、小説のプレフィックスを付けると一致しない。
+    // 挿絵は名前とサイズだけを列挙し、バイト列は書き出し直前に 1 枚ずつ読む。
+    // 列挙した名前が本文の参照と同じ形 (`挿絵/foo.jpg`) でないと Lite は解決
+    // できないので、小説のプレフィックスは付けない。
     const MAX_IMAGES: usize = 512;
-    const MAX_IMAGE_BYTES: usize = 24 * 1024 * 1024;
+    const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
     let Ok(illust_prefix) = narou_rs::platform::ObjectPrefix::new(format!(
         "{}/挿絵",
         keys.prefix().as_ref()
     )) else {
         return Response::error("Invalid illustration prefix", 500);
     };
-    let mut prefetched: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut total = 0usize;
+    let mut image_names: Vec<String> = Vec::new();
     let mut cursor = None;
-    let mut truncated = false;
     loop {
         let mut request =
             narou_rs::platform::ObjectListRequest::new(illust_prefix.clone(), 100.try_into().unwrap());
@@ -213,43 +210,36 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
             if !narou_rs::epub_lite::is_supported_image(&name) {
                 continue;
             }
-            if prefetched.len() >= MAX_IMAGES {
-                truncated = true;
-                break;
+            // 応答を始める前に断れるものは断る (1 枚は 1 回の small read で
+            // 読めなければならない)。
+            if image_names.len() >= MAX_IMAGES {
+                return Response::error(
+                    format!("Illustrations exceed the Worker budget ({MAX_IMAGES} images)"),
+                    413,
+                );
             }
-            if let Ok(Some(bytes)) = services.objects.read_small(&meta.key).await {
-                total += bytes.len();
-                prefetched.push((format!("挿絵/{name}"), bytes));
-                if total > MAX_IMAGE_BYTES {
-                    truncated = true;
-                    break;
-                }
+            if meta.size > MAX_IMAGE_BYTES {
+                return Response::error(
+                    format!(
+                        "Illustration {name} exceeds the {} MiB read limit",
+                        MAX_IMAGE_BYTES / 1024 / 1024
+                    ),
+                    413,
+                );
             }
-        }
-        if truncated {
-            break;
+            image_names.push(format!("挿絵/{name}"));
         }
         match page.next_cursor {
             Some(next) => cursor = Some(next),
             None => break,
         }
     }
-    if truncated {
-        return Response::error(
-            format!(
-                "Illustrations exceed the Worker memory budget ({} images / {} MiB)",
-                MAX_IMAGES,
-                MAX_IMAGE_BYTES / 1024 / 1024
-            ),
-            413,
-        );
-    }
 
     let options = narou_rs::epub_lite::EpubBuildOptions {
         title: record.title.clone(),
         author: record.author.clone(),
         vertical: true,
-        cover_from_first_image: !prefetched.is_empty(),
+        cover_from_first_image: !image_names.is_empty(),
         assets_dir: None,
         kindle: false,
         // The dakuten font and its stylesheet are read from `preset/` on
@@ -257,10 +247,11 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         // filesystem for; the Worker EPUB keeps the engine's own fonts.
         extra_assets: Vec::new(),
     };
-    let build = match narou_rs::epub_lite::build_book_from_source(
-        std::sync::Arc::new(MemorySource::new(text, prefetched)),
-        &options,
-    ) {
+    let source = std::sync::Arc::new(narou_rs::epub_lite::LazyImageSource::new(
+        text,
+        image_names,
+    ));
+    let build = match narou_rs::epub_lite::build_book_from_source(source.clone(), &options) {
         Ok(build) => std::sync::Arc::new(build),
         Err(error) => return Response::error(&format!("EPUB build failed: {error}"), 500),
     };
@@ -273,6 +264,9 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         writer: Some(writer),
         sink,
         build,
+        source,
+        objects: services.objects.clone(),
+        prefix: keys.prefix().as_ref().to_string(),
     };
     let stream = futures::stream::unfold(state, |mut state| async move {
         loop {
@@ -291,10 +285,42 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
                 }
             };
 
-            let bytes = info
-                .asset_path
-                .as_deref()
-                .and_then(|path| state.build.resolve(path));
+            let bytes = match info.asset_path.as_deref() {
+                Some(path) => {
+                    let Some(relative) = path.strip_prefix("image/") else {
+                        return Some((
+                            Err(worker::Error::RustError(format!(
+                                "unexpected EPUB asset path: {path}"
+                            ))),
+                            state,
+                        ));
+                    };
+                    let key = match narou_rs::platform::ObjectKey::try_new(format!(
+                        "{}/{}",
+                        state.prefix, relative
+                    )) {
+                        Ok(key) => key,
+                        Err(error) => return Some((Err(stream_error(error)), state)),
+                    };
+                    match state.objects.read_small(&key).await {
+                        Ok(Some(raw)) => {
+                            state.source.insert_image(relative, raw.clone());
+                            let bytes = state.build.resolve(path).or(Some(raw));
+                            // 保持するのは書き出し中の 1 枚分だけにする。
+                            state.source.remove_image(relative);
+                            bytes
+                        }
+                        Ok(None) => {
+                            return Some((
+                                Err(worker::Error::RustError(format!("missing {relative}"))),
+                                state,
+                            ));
+                        }
+                        Err(error) => return Some((Err(stream_error(error)), state)),
+                    }
+                }
+                None => None,
+            };
 
             let Some(writer) = state.writer.as_mut() else {
                 return None;
@@ -322,51 +348,14 @@ fn stream_error(error: impl std::fmt::Display) -> worker::Error {
     worker::Error::RustError(error.to_string())
 }
 
-/// `ObjectStore` から取り込んだテキストと挿絵を、Lite の入力層へ渡すための
-/// メモリ実装。ファイルシステムを持たない wasm ではこの経路で EPUB を組む。
-/// 挿絵のエントリ名は本文の参照と同じ相対パスにすること。
-#[derive(Debug)]
-struct MemorySource {
-    files: Vec<(String, Vec<u8>)>,
-    names: Vec<String>,
-}
-
-impl MemorySource {
-    fn new(text: String, mut images: Vec<(String, Vec<u8>)>) -> Self {
-        let mut files = vec![("novel.txt".to_string(), text.into_bytes())];
-        files.append(&mut images);
-        let names = files.iter().map(|(name, _)| name.clone()).collect();
-        Self { names, files }
-    }
-}
-
-impl narou_rs::epub_lite::FileSource for MemorySource {
-    fn list(&self) -> &[String] {
-        &self.names
-    }
-
-    fn open(
-        &self,
-        name: &str,
-    ) -> std::result::Result<
-        Option<Box<dyn std::io::Read + Send>>,
-        narou_rs::epub_lite::InputError,
-    > {
-        Ok(self
-            .files
-            .iter()
-            .find(|(candidate, _)| candidate == name)
-            .map(|(_, bytes)| {
-                Box::new(std::io::Cursor::new(bytes.clone())) as Box<dyn std::io::Read + Send>
-            }))
-    }
-}
-
 /// 1 エントリずつ書き出しながら応答へ流すための状態。
 struct EpubStreamState {
     writer: Option<narou_rs::epub_lite::EpubStreamWriter<narou_rs::epub_lite::ChunkSink>>,
     sink: narou_rs::epub_lite::ChunkSink,
     build: std::sync::Arc<narou_rs::epub_lite::EpubBuild>,
+    source: std::sync::Arc<narou_rs::epub_lite::LazyImageSource>,
+    objects: std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
+    prefix: String,
 }
 
 /// POST /api/jobs — plan a request, enqueue each discrete plan separately,

@@ -554,6 +554,72 @@ impl Write for ChunkSink {
     }
 }
 
+/// 挿絵のバイト列を書き出し直前に注入できる入力源。
+///
+/// 構築 ([`build_book_from_source`]) は挿絵のパス一覧しか見ないので、バイト列は
+/// 一覧に載せた名前へ書き出し直前に [`LazyImageSource::insert_image`] で入れる。
+/// これで挿絵を全部はメモリに載せずに EPUB を組める (Worker は ObjectStore から
+/// 書き出し直前の 1 枚だけ読む)。
+#[derive(Debug)]
+pub struct LazyImageSource {
+    text: String,
+    names: Vec<String>,
+    images: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl LazyImageSource {
+    /// `image_names` は本文の参照と同じ相対パス (`挿絵/foo.jpg`) で渡す。
+    pub fn new(text: String, image_names: Vec<String>) -> Self {
+        let mut names = vec!["novel.txt".to_string()];
+        names.extend(image_names);
+        Self {
+            text,
+            names,
+            images: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 書き出し直前の挿絵 1 枚を差し込む。
+    pub fn insert_image(&self, name: &str, bytes: Vec<u8>) {
+        if let Ok(mut images) = self.images.lock() {
+            images.insert(name.to_string(), bytes);
+        }
+    }
+
+    /// 書き出しが済んだ挿絵を解放し、保持していればそのバイト列を返す。
+    /// 1 エントリ書き終えるごとに呼ぶことで、保持するのは常に 1 枚分になる。
+    pub fn remove_image(&self, name: &str) -> Option<Vec<u8>> {
+        self.images
+            .lock()
+            .ok()
+            .and_then(|mut images| images.remove(name))
+    }
+}
+
+impl FileSource for LazyImageSource {
+    fn list(&self) -> &[String] {
+        &self.names
+    }
+
+    fn open(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Box<dyn std::io::Read + Send>>, InputError> {
+        if name == "novel.txt" {
+            return Ok(Some(Box::new(std::io::Cursor::new(
+                self.text.clone().into_bytes(),
+            ))));
+        }
+        let bytes = self
+            .images
+            .lock()
+            .ok()
+            .and_then(|images| images.get(name).cloned());
+        Ok(bytes
+            .map(|bytes| Box::new(std::io::Cursor::new(bytes)) as Box<dyn std::io::Read + Send>))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,4 +843,49 @@ mod tests {
         assert!(chunks > 3, "1 エントリずつ流れていない: {chunks} chunks");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
+
+    /// 挿絵のバイト列を書き出し直前に注入する経路 (Worker と同じ) でも EPUB が
+    /// 組めること。構築はパス一覧しか見ないので注入前は解決できず、注入した
+    /// 1 枚だけが格納され、書き出し後は解放される (先読みと同じメモリに戻らない)。
+    #[test]
+    fn lazy_source_takes_illustrations_at_write_time() {
+        let png: &[u8] = b"\x89PNG\r\n\x1a\nstub";
+        let text = format!(
+            "{SAMPLE}\n　挿絵。［＃挿絵（挿絵/i1.png）入る］\n［＃挿絵（挿絵/i2.png）入る］\n"
+        );
+        let names = vec!["挿絵/i1.png".to_string(), "挿絵/i2.png".to_string()];
+        let source = Arc::new(LazyImageSource::new(text, names.clone()));
+        let build = build_book_from_source(source.clone(), &options()).unwrap();
+
+        assert_eq!(build.images.len(), 2);
+        let epub_path = build.images[0].epub_path.clone();
+        // 構築時にバイト列は要求されない (注入前は解決できない)。
+        assert!(build.resolve(&epub_path).is_none());
+
+        let sink = ChunkSink::new();
+        let mut writer = build.book.stream_writer(sink.clone()).unwrap();
+        let mut streamed = Vec::new();
+        while let Some(info) = writer.next_entry() {
+            let bytes = info.asset_path.as_deref().and_then(|path| {
+                let name = path.strip_prefix("image/")?;
+                source.insert_image(name, png.to_vec());
+                let bytes = build.resolve(path);
+                // 書き出したら解放する (保持するのは常に 1 枚分)。
+                assert!(source.remove_image(name).is_some());
+                bytes
+            });
+            writer.write_current(bytes.as_deref()).unwrap();
+            streamed.extend(sink.take());
+        }
+        writer.finish().unwrap();
+        streamed.extend(sink.take());
+
+        assert!(streamed.starts_with(b"PK\x03\x04"));
+        for name in &names {
+            let needle = format!("item/image/{name}");
+            assert!(streamed.windows(needle.len()).any(|window| window == needle.as_bytes()));
+            assert!(source.remove_image(name).is_none(), "{name} が解放されていない");
+        }
+    }
 }
+

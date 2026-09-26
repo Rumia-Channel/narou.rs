@@ -116,14 +116,15 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
    「変換済み本文」列へ保存する。native は `novel.txt` と出力ファイル（SQLite モードでは
    `novel_outputs` にもミラー）を作る。
 5. **EPUB ダウンロード**: Worker は `GET /api/novels/{id}/download.epub` で、作品メタ →
-   変換済み本文 → `挿絵/` を**上限つきで先読み**（512 枚 / 24 MiB、超えたら 413。Lite が構築時に
-   寸法を読むため、入力源が同期 API である以上ここは消せない）→ `epub_lite::build_book_from_source`
-   → Lite の `EpubStreamWriter` を **1 エントリずつ**進め（挿絵は `EpubBuild::resolve` が先読みした
-   バイト列から 1 枚ずつ解決）、できたチャンクを `Response::from_stream` でそのまま流す。
-   **完成した EPUB は保持しない**（従来の「本文全体 + 応答コピー」分が減る）。挿絵のエントリ名は
-   本文の参照と同じ相対パス (`挿絵/foo.jpg`) にする（プレフィックス付きだと Lite が解決できない）。
-   変換済み本文が無ければ 409（現状の未完成点）。native Web UI は生成済み EPUB
-   （`novel_outputs` か `output/*.epub`）を返す。
+   変換済み本文 → `挿絵/` の**名前とサイズだけ**を列挙（512 枚 / 1 枚 16 MiB を超えたら 413。
+   サイズは ObjectStore の small read 上限に合わせる）→ `epub_lite::build_book_from_source`
+   （構築は挿絵の**パス一覧しか読まない**）→ `EpubStreamWriter` を 1 エントリずつ進め、
+   挿絵を持つエントリの直前でその 1 枚を ObjectStore から読み、`LazyImageSource` に注入して
+   `EpubBuild::resolve` をかける → できたチャンクを `Response::from_stream` で流す。
+   **完成した EPUB も挿絵の集合も保持しない**（ピークは書き出し中の 1 エントリ + 挿絵 1 枚）。
+   挿絵のエントリ名は本文の参照と同じ相対パス (`挿絵/foo.jpg`) にする（プレフィックス付きだと
+   Lite が解決できない）。変換済み本文が無ければ 409（現状の未完成点）。native Web UI は
+   生成済み EPUB（`novel_outputs` か `output/*.epub`）を返す。
 
 不変条件: 論理キーはコアが決める / 挿絵は内容ハッシュ名 / EPUB と raw は保存しない /
 保存するのは作品を再現するのに必要な最小。
@@ -148,7 +149,7 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 | queue 実行 | `Download` / `Update` のみ。claim → 実行 → durable terminal → ack、retry は 5/10/20 秒・最大 3 回 | `src/application/jobs.rs:64-66`, `worker_entry/src/consumer.rs:32-39,236-270` |
 | cron | 毎分 planner が `Update` を enqueue（実行はしない） | `worker_entry/src/scheduler.rs:26-156` |
 | サイト定義 | build 時に `webnovel/*.yaml` を埋め込み、isolate 初回に compile | `worker_entry/build.rs:20-61`, `worker_entry/src/bundled_sites.rs` |
-| EPUB | `epub_lite::build_book_from_source` + `EpubStreamWriter` で 1 エントリずつ書き出し、`Response::from_stream` で応答へ流す（挿絵のみ先読み） | `worker_entry/src/lib.rs` (`api_novel_download_epub`) |
+| EPUB | `epub_lite::build_book_from_source` + `EpubStreamWriter` で 1 エントリずつ書き出し、挿絵はそのエントリの直前で 1 枚だけ読む（`LazyImageSource`）。チャンクは `Response::from_stream` で流す | `worker_entry/src/lib.rs` (`api_novel_download_epub`) |
 
 ### 2.2 本番化を止めている穴
 
@@ -265,7 +266,7 @@ CF Access を唯一のユーザー境界にする設計、音声向けの instan
 | S3 資格情報の漏洩・ログ混入 | Secrets Store / `env.secret` 優先、CI は `--secrets-file`、`if: always()` で生成物削除。値はリポジトリに置かない |
 | 振り分けの判定ミス（本文が S3 に出る / 挿絵が D1 に残る） | 判定は core の純関数にしてテストで固定。移行は `verify` でバイト一致を確認してからフラグを切り替える |
 | D1 容量・行サイズ | バイナリは S3 へ（本計画）。D1 はメタ・テキストのみ |
-| Worker の CPU / subrequest 上限 | `cpu_ms = 300000` を維持、`WorkerBudget` の section 境界 yield を継続、EPUB は 1 エントリずつ書き出し（挿絵の先読みは 512 枚 / 24 MiB 超で 413） |
+| Worker の CPU / subrequest 上限 | `cpu_ms = 300000` を維持、`WorkerBudget` の section 境界 yield を継続、EPUB は 1 エントリずつ書き出し（挿絵は 512 枚 / 1 枚 16 MiB 超で 413） |
 | cron 毎分の計画コスト | 100 件ページ + generation/lease の早期 exit を維持 |
 | 移行中の二重書き・欠落 | カーソル再開 + `verify`。D1 側は消さないので即時ロールバック可能 |
 | GPL 整合（worker は `lite` を含む） | `worker_entry/Cargo.toml` の license 表記と CI の license job を維持 |
@@ -303,14 +304,17 @@ npx wrangler deploy --config wrangler.ci.toml --secrets-file <json>
   必要になったら履歴テーブルを足す（native の `diff` とは別物として扱う）。
 - **S3 のバケット構成**: 1 バケット + prefix（環境同居）を既定とする。本番だけ別バケットにするかは
   P0e の実測後に決める。
-- **EPUB 応答のメモリ (2026-09 半分解消)**: `download.epub` は Lite の `EpubStreamWriter`
-  （`next_entry` / `write_current` / `finish`）で 1 エントリずつ書き出し、チャンクを
-  `worker::Response::from_stream` で流す。完成した EPUB とその応答コピーは保持しない
-  （isolate は単一スレッドだが、`wasm-streams` が HWM 0 で 1 プルずつ取り出すためストリーミングできる）。
-  **残る制約は挿絵の先読み**（512 枚 / 24 MiB、超えたら 413）で、これは Lite が構築時に各画像の
-  寸法を読むため。入力源 (`FileSource`) が同期 API で、D1/S3 の読み出しは非同期なので、
-  先読みを消すには Lite 側に「参照を 1 つずつ渡し、その場でバイト列を注入する収集 API」が要る
-  （native は FS 入力なので不要）。
+- **EPUB 応答のメモリ (2026-09 解消)**: `download.epub` は Lite の `EpubStreamWriter`
+  （`next_entry` / `write_current` / `finish`）で 1 エントリずつ書き出し、挿絵はそのエントリの
+  直前で 1 枚だけ ObjectStore から読んで `LazyImageSource` に注入する。チャンクは
+  `worker::Response::from_stream` で流す（isolate は単一スレッドだが、`wasm-streams` が HWM 0 で
+  1 プルずつ取り出すためストリーミングできる）。ピークは「書き出し中の 1 エントリ + 挿絵 1 枚」で、
+  完成アーカイブ・応答コピー・挿絵の集合をどれも保持しない。
+  当初は先読みが要ると見ていたが、narou の構築経路 (`build_book_from_source`) は挿絵の
+  **パス一覧しか読まない**（`read_image` を呼ぶのは書き出し時の `resolve` だけ）ため不要だった。
+  そのため Lite 側に逐次収集 API を足す必要も無い。
+  挿絵の読み出しに失敗すると応答は途中で切れる (ストリーム開始後にステータスは変えられない) ため、
+  列挙時に判定できるもの (枚数・1 枚のサイズ) は先に 413 で断る。
 - **D1 の `objects`/`object_chunks` の扱い**: 本文の移行後もしばらく残す。削除（容量回収）は P4 の判断。
 - **APNG 挿絵**: `zip` の feature を純 Rust 構成に絞ったため Worker でも組み立て可能（`worker-runtime` が
   `illustration-animation` を有効化済み）。組み立ては**フレームを 1 枚ずつ復号 → 符号化 → 追記して即解放**し、
