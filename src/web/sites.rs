@@ -18,6 +18,18 @@ async fn service() -> Result<narou_rs::application::site_definitions::SiteDefini
         .map_err(|error| error.to_string())
 }
 
+/// 保存直後にプロセス内の実効定義を差し替える。
+///
+/// これで「一覧は新しい定義を返すのにダウンロード経路だけ古い」状態にならない。
+/// 差し替えに失敗しても保存自体は成功しているので警告に留める（定期再読込が
+/// 30 秒以内に追随する）。
+async fn refresh_effective_site_settings() {
+    if let Err(error) = narou_rs::native::site_definitions::install_effective_site_settings().await
+    {
+        tracing::warn!("サイト定義の再読み込みに失敗しました: {error}");
+    }
+}
+
 /// `GET /api/sites` — bundle とユーザー定義の一覧。
 pub async fn sites_list() -> Json<serde_json::Value> {
     let service = match service().await {
@@ -52,6 +64,7 @@ pub async fn site_put(Path(name): Path<String>, body: String) -> Json<serde_json
     if let Err(error) = service.put(&name, &body).await {
         return Json(error_payload(&error.to_string()));
     }
+    refresh_effective_site_settings().await;
     match service.list().await {
         Ok(definitions) => Json(list_payload(&definitions)),
         Err(error) => Json(error_payload(&error.to_string())),
@@ -67,6 +80,7 @@ pub async fn site_delete(Path(name): Path<String>) -> Json<serde_json::Value> {
     if let Err(error) = service.delete(&name).await {
         return Json(error_payload(&error.to_string()));
     }
+    refresh_effective_site_settings().await;
     match service.list().await {
         Ok(definitions) => Json(list_payload(&definitions)),
         Err(error) => Json(error_payload(&error.to_string())),

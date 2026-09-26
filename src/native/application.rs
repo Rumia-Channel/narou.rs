@@ -190,17 +190,34 @@ impl SettingsStore for NativeSettingsStore {
 }
 
 /// Native adapter for `webnovel/*.yaml` site timezones and update capabilities.
+///
+/// サイト定義は [`crate::downloader::site_setting::effective_site_settings`] の
+/// 共有スナップショットを見るので、`install_effective_site_settings` で差し替
+/// わった後は次の呼び出しから新しい定義を使う（タイムゾーンのマップだけ
+/// `Arc` の同一性を見て再構築をキャッシュする）。
 #[derive(Clone)]
 pub struct NativeSiteTimezoneProvider {
+    snapshot: Arc<std::sync::RwLock<SiteProviderSnapshot>>,
+}
+
+#[derive(Clone)]
+struct SiteProviderSnapshot {
+    source: Arc<Vec<crate::downloader::site_setting::SiteSetting>>,
     timezones: Arc<HashMap<String, SiteTimezone>>,
-    site_settings: Arc<Vec<crate::downloader::site_setting::SiteSetting>>,
 }
 
 impl NativeSiteTimezoneProvider {
     pub fn load() -> Self {
-        let site_settings = crate::downloader::site_setting::SiteSetting::load_all()
-            .unwrap_or_default();
-        let timezones = site_settings
+        let source = crate::downloader::site_setting::effective_site_settings_shared();
+        Self {
+            snapshot: Arc::new(std::sync::RwLock::new(Self::snapshot_for(source))),
+        }
+    }
+
+    fn snapshot_for(
+        source: Arc<Vec<crate::downloader::site_setting::SiteSetting>>,
+    ) -> SiteProviderSnapshot {
+        let timezones = source
             .iter()
             .map(|setting| {
                 let domain = setting.domain.clone();
@@ -208,25 +225,40 @@ impl NativeSiteTimezoneProvider {
                 (domain, timezone)
             })
             .collect();
-        Self {
+        SiteProviderSnapshot {
+            source,
             timezones: Arc::new(timezones),
-            site_settings: Arc::new(site_settings),
         }
     }
-}
 
+    fn snapshot(&self) -> SiteProviderSnapshot {
+        let source = crate::downloader::site_setting::effective_site_settings_shared();
+        if let Ok(snapshot) = self.snapshot.read()
+            && Arc::ptr_eq(&snapshot.source, &source)
+        {
+            return snapshot.clone();
+        }
+        let snapshot = Self::snapshot_for(source);
+        if let Ok(mut current) = self.snapshot.write() {
+            *current = snapshot.clone();
+        }
+        snapshot
+    }
+}
 impl SiteTimezoneProvider for NativeSiteTimezoneProvider {
     fn timezone_for_domain<'a>(
         &'a self,
         domain: &'a str,
     ) -> PlatformFuture<'a, Result<Option<SiteTimezone>>> {
-        Box::pin(async move { Ok(self.timezones.get(domain).copied()) })
+        let timezone = self.snapshot().timezones.get(domain).copied();
+        Box::pin(async move { Ok(timezone) })
     }
 }
 
 impl SiteDefinitionProvider for NativeSiteTimezoneProvider {
     fn resolve_toc_url(&self, url: &str) -> Option<String> {
-        self.site_settings
+        self.snapshot()
+            .source
             .iter()
             .find(|setting| setting.matches_url(url))
             .map(|setting| {
@@ -237,7 +269,8 @@ impl SiteDefinitionProvider for NativeSiteTimezoneProvider {
     }
 
     fn url_patterns_for_validation(&self) -> Vec<String> {
-        self.site_settings
+        self.snapshot()
+            .source
             .iter()
             .flat_map(|setting| setting.url_patterns_for_validation())
             .collect()
@@ -245,7 +278,8 @@ impl SiteDefinitionProvider for NativeSiteTimezoneProvider {
 }
 impl crate::application::SiteUpdateCapabilityProvider for NativeSiteTimezoneProvider {
     fn supports_narou_api(&self, toc_url: &str) -> bool {
-        self.site_settings
+        self.snapshot()
+            .source
             .iter()
             .find(|setting| setting.matches_url(toc_url))
             .and_then(|setting| setting.narou_api_url.as_ref())
@@ -334,5 +368,89 @@ impl NativeAppServices {
 
     fn freeze_store(inventory: Arc<Inventory>) -> NativeFreezeStore {
         NativeFreezeStore::new(inventory)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::downloader::site_setting::{SiteSetting, install_effective_site_settings};
+
+    /// サイト定義を差し替えた直後に、タイムゾーン/URL 解決が新しい定義を
+    /// 使うこと（`OnceLock` 時代は起動時スナップショットに固定されていた）。
+    /// プロセスグローバルに触るので cwd ガードで直列化し、後始末として
+    /// ファイル由来の定義を install し直す。
+    /// `install_effective_site_settings` が内部で `futures::executor::block_on`
+    /// を使うため、外側は tokio の runtime で回す。
+    #[tokio::test]
+    async fn provider_follows_reinstalled_site_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let user_webnovel = temp.path().join("webnovel");
+        std::fs::create_dir_all(&user_webnovel).unwrap();
+
+        let yaml = |timezone: &str, toc: &str| {
+            format!(
+                "name: Example\ndomain: example.invalid\ntop_url: https://example.invalid\n\
+                 sitename: Example\nurl:\n  - https?://example\\.invalid/novel/(?<ncode>\\d+)\n\
+                 encoding: UTF-8\ntimezone: {timezone}\ntoc_url: {toc}\n"
+            )
+        };
+        let target = "https://example.invalid/novel/42";
+
+        std::fs::write(
+            user_webnovel.join("example.invalid.yaml"),
+            yaml("UTC", "https://example.invalid/ncode/\\k<ncode>"),
+        )
+        .unwrap();
+        crate::native::site_definitions::install_effective_site_settings()
+            .await
+            .unwrap();
+
+        let provider = NativeSiteTimezoneProvider::load();
+        let timezone = SiteTimezoneProvider::timezone_for_domain(&provider, "example.invalid")
+            .await
+            .unwrap();
+        assert_eq!(timezone, Some(SiteTimezone::Named(chrono_tz::UTC)));
+        assert_eq!(
+            SiteDefinitionProvider::resolve_toc_url(&provider, target).as_deref(),
+            Some("https://example.invalid/ncode/42")
+        );
+
+        // 定義を差し替えて再 install → 同じプロセスで新しい値が見える。
+        std::fs::write(
+            user_webnovel.join("example.invalid.yaml"),
+            yaml("America/New_York", "https://example.invalid/novel/\\k<ncode>"),
+        )
+        .unwrap();
+        crate::native::site_definitions::install_effective_site_settings()
+            .await
+            .unwrap();
+
+        let timezone = SiteTimezoneProvider::timezone_for_domain(&provider, "example.invalid")
+            .await
+            .unwrap();
+        assert_eq!(
+            timezone,
+            Some(SiteTimezone::Named(chrono_tz::America::New_York))
+        );
+        assert_eq!(
+            SiteDefinitionProvider::resolve_toc_url(&provider, target).as_deref(),
+            Some("https://example.invalid/novel/42")
+        );
+
+        // 内容が変わっていなければ再コンパイルしない（Arc の同一性で確認）。
+        let installed = crate::downloader::site_setting::effective_site_settings_shared();
+        crate::native::site_definitions::install_effective_site_settings()
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &installed,
+            &crate::downloader::site_setting::effective_site_settings_shared()
+        ));
+
+        drop(guard);
+        install_effective_site_settings(SiteSetting::load_all().unwrap_or_default());
     }
 }

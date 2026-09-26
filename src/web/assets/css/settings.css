@@ -96,6 +96,10 @@
   background: var(--danger-bg, #f2dede);
 }
 
+.list-group-item.setting-worker-ineffective {
+  opacity: 0.6;
+}
+
 .list-group-item-heading {
   font-size: 0.9375rem;
   font-weight: 600;

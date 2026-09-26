@@ -4,8 +4,11 @@ mod loader;
 mod serde_helpers;
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
@@ -222,23 +225,74 @@ pub enum SiteSettingEntry {
 
 /// プロセス内で有効なサイト定義。
 ///
-/// native は起動時に一度だけ確定させる (`install_effective_site_settings`)。SQLite
-/// モードではオブジェクトストアから読むので YAML ファイルに依存しない。未設定の
-/// ときは従来どおりファイルから読む ([`SiteSetting::load_all`]) ので、テストや
-/// 単発のツールでも動く。
-static EFFECTIVE_SITE_SETTINGS: std::sync::OnceLock<Vec<SiteSetting>> = std::sync::OnceLock::new();
+/// `install_effective_site_settings` で確定させる。`PUT /api/sites` や定期的な
+/// 再読込で差し替えられるので、書き換え後は同じプロセスでも新しい定義を使う。
+/// 未設定のときは従来どおりファイルから読む ([`SiteSetting::load_all`]) ので、
+/// テストや単発のツールでも動く。
+///
+/// `fingerprint` は実効定義の YAML 内容から計算したハッシュで、差し替え元が
+/// 「同じ内容を再コンパイルする」無駄を省くために使う
+/// (`install_effective_site_settings_fingerprinted` 参照)。
+struct EffectiveSiteSettings {
+    settings: Arc<Vec<SiteSetting>>,
+    fingerprint: Option<u64>,
+}
 
-/// 有効なサイト定義を確定させる（起動時に 1 回。2 回目以降は無視する）。
-pub fn install_effective_site_settings(settings: Vec<SiteSetting>) -> bool {
-    EFFECTIVE_SITE_SETTINGS.set(settings).is_ok()
+static EFFECTIVE_SITE_SETTINGS: RwLock<Option<EffectiveSiteSettings>> = RwLock::new(None);
+
+/// 有効なサイト定義を確定・差し替えする。
+pub fn install_effective_site_settings(settings: Vec<SiteSetting>) {
+    if let Ok(mut state) = EFFECTIVE_SITE_SETTINGS.write() {
+        *state = Some(EffectiveSiteSettings {
+            settings: Arc::new(settings),
+            fingerprint: None,
+        });
+    }
+}
+
+/// `fingerprint` 付きで差し替える。`fingerprint` は実効定義の並びから
+/// [`site_settings_fingerprint`] で計算した値を想定している。
+pub(crate) fn install_effective_site_settings_fingerprinted(
+    settings: Vec<SiteSetting>,
+    fingerprint: u64,
+) {
+    if let Ok(mut state) = EFFECTIVE_SITE_SETTINGS.write() {
+        *state = Some(EffectiveSiteSettings {
+            settings: Arc::new(settings),
+            fingerprint: Some(fingerprint),
+        });
+    }
+}
+
+/// 実効定義が `fingerprint` と一致するか。未確定・ハッシュ不明なら `false`。
+pub(crate) fn effective_site_settings_fingerprint_matches(fingerprint: u64) -> bool {
+    EFFECTIVE_SITE_SETTINGS
+        .read()
+        .ok()
+        .and_then(|state| state.as_ref().map(|s| s.fingerprint == Some(fingerprint)))
+        .unwrap_or(false)
+}
+
+/// 実効定義の並び `(name, yaml)` から差分検知用のハッシュを計算する。
+pub(crate) fn site_settings_fingerprint(effective: &[(String, String)]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    effective.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 有効なサイト定義を `Arc` 共有で返す。未設定ならファイルから読む（失敗時は空）。
+pub(crate) fn effective_site_settings_shared() -> Arc<Vec<SiteSetting>> {
+    if let Ok(state) = EFFECTIVE_SITE_SETTINGS.read()
+        && let Some(state) = state.as_ref()
+    {
+        return state.settings.clone();
+    }
+    Arc::new(SiteSetting::load_all().unwrap_or_default())
 }
 
 /// 有効なサイト定義。未設定ならファイルから読む（失敗時は空）。
 pub fn effective_site_settings() -> Vec<SiteSetting> {
-    EFFECTIVE_SITE_SETTINGS
-        .get()
-        .cloned()
-        .unwrap_or_else(|| SiteSetting::load_all().unwrap_or_default())
+    effective_site_settings_shared().as_ref().clone()
 }
 
 impl SiteSetting {

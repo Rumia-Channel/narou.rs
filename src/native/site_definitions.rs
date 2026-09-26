@@ -141,18 +141,29 @@ pub async fn site_definition_service() -> Result<SiteDefinitions> {
     ))
 }
 
-/// 起動時に有効なサイト定義を確定させる。
+/// 有効なサイト定義を確定・差し替えする。
 ///
 /// YAML モードでは `webnovel/` を、SQLite モードではオブジェクトストアを読み、
-/// どちらも bundle + ユーザー定義のマージ結果をプロセス内に固定する。以後の同期
-/// コードは [`crate::downloader::site_setting::effective_site_settings`] を使う。
+/// bundle + ユーザー定義のマージ結果をプロセス内に保持する。起動時だけでなく
+/// `PUT/DELETE /api/sites` の保存後や、外部編集を拾う定期再読込からも呼ぶ。
+/// 内容に変化がなければ再コンパイルはしない。以後の同期コードは
+/// [`crate::downloader::site_setting::effective_site_settings`] を使う。
 pub async fn install_effective_site_settings() -> Result<()> {
+    use crate::downloader::site_setting::{
+        effective_site_settings_fingerprint_matches,
+        install_effective_site_settings_fingerprinted, site_settings_fingerprint,
+    };
+
     let store = store_for_current_library().await?;
     let service = SiteDefinitions::new(shipped_bundle()?, store);
     let effective = service.effective().await?;
+    let fingerprint = site_settings_fingerprint(&effective);
+    if effective_site_settings_fingerprint_matches(fingerprint) {
+        return Ok(());
+    }
     let contents: Vec<&str> = effective.iter().map(|(_, yaml)| yaml.as_str()).collect();
     let settings = crate::downloader::site_setting::SiteSetting::load_bundled(&contents)?;
-    crate::downloader::site_setting::install_effective_site_settings(settings);
+    install_effective_site_settings_fingerprinted(settings, fingerprint);
     Ok(())
 }
 
