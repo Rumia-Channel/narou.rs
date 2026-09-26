@@ -1,60 +1,17 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize)]
-pub struct ApiResponse {
-    pub success: bool,
-    pub message: String,
-}
+/// 保存・削除などの応答、一覧の入出力は Worker と共有する。
+pub use crate::application::web_payloads::{
+    ApiResponse, ListParams, NovelListItem, NovelListResponse,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct IdPath {
     pub id: i64,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ListParams {
-    pub draw: Option<u64>,
-    pub start: Option<u64>,
-    pub length: Option<u64>,
-    pub all: Option<bool>,
-    pub filter: Option<String>,
-    #[serde(rename = "search[value]")]
-    pub search_value: Option<String>,
-    #[serde(rename = "order[0][column]")]
-    pub order_column: Option<u64>,
-    #[serde(rename = "order[0][dir]")]
-    pub order_dir: Option<String>,
-}
 
-#[derive(Debug, Serialize)]
-pub struct NovelListResponse {
-    pub draw: u64,
-    pub records_total: u64,
-    pub records_filtered: u64,
-    pub data: Vec<NovelListItem>,
-}
 
-#[derive(Debug, Serialize)]
-pub struct NovelListItem {
-    pub id: i64,
-    pub title: String,
-    pub author: String,
-    pub sitename: String,
-    pub novel_type: u8,
-    pub end: bool,
-    pub last_update: i64,
-    pub general_lastup: Option<i64>,
-    pub last_check_date: Option<i64>,
-    pub new_arrivals_date: Option<i64>,
-    pub tags: Vec<String>,
-    pub new_arrivals: bool,
-    pub frozen: bool,
-    pub suspend: bool,
-    pub length: Option<i64>,
-    pub toc_url: String,
-    pub ncode: Option<String>,
-    pub general_all_no: Option<i64>,
-}
 
 #[derive(Debug, Deserialize)]
 pub struct BatchIdsBody {

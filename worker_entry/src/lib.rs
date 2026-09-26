@@ -5,6 +5,8 @@ mod bundled_sites;
 mod composition;
 mod convert;
 mod global_settings;
+mod websocket;
+mod webui;
 mod login;
 mod secrets;
 mod sites;
@@ -49,6 +51,15 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         "/api/jobs" => api_jobs(req, env).await,
         "/api/global_setting" => global_settings::api_global_setting(req, env).await,
         "/api/admin/object-migration" => api_object_migration(req, env).await,
+        "/api/library_backup" => webui::library_backup::handle(req, env).await,
+        "/api/list" => webui::list::handle(req, env).await,
+        "/api/sort_state" => webui::ui_prefs::handle(req, env).await,
+        "/api/webui/config" => webui::ui_prefs::handle(req, env).await,
+        "/api/feature_tour/pending" => webui::ui_prefs::handle(req, env).await,
+        "/api/tag_list" => webui::queue::handle(req, env).await,
+        "/api/queue/status" => webui::queue::handle(req, env).await,
+        "/api/get_pending_tasks" => webui::queue::handle(req, env).await,
+        "/ws" => websocket::handle(req, env).await,
         _ if path.starts_with("/api/novels/") => api_novel(req, env).await,
         _ if path.starts_with("/api/login/") => api_login_host(req, env).await,
         _ if path.starts_with("/api/sites/") => api_site(req, env).await,
