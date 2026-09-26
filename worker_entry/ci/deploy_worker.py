@@ -21,6 +21,9 @@
   `NAROU_AUTH_REQUIRED=false`（Zero Trust を境界にする）ときは不要。
 - `NAROU_RS_LOGIN_KEY` … 資格情報の at-rest 鍵（base64 32 バイト）。無い場合は
   平文の行だけを読む。
+- `NAROU_S3_ACCESS_KEY_ID` / `NAROU_S3_SECRET_ACCESS_KEY` … S3 資格情報。`--secrets-file` で
+  Worker secret (`S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`) として投入する。無い場合は
+  Secrets Store の `*_SECRET_NAME` を使うか、`wrangler secret put` で別途投入する。
 - `NAROU_AUTH_REQUIRED` / `NAROU_WORKERS_DEV` / `DEVELOP_DOMAIN` /
   `NAROU_S3_PREFIX` / `NAROU_D1_BASE_NAME` / `NAROU_JOB_QUEUE_BASE` / `NAROU_SMOKE=0`
 - `SERVICE_DOMAIN` / `DEVELOP_DOMAIN` … custom domain。secret を推奨（ログへ出さない）
@@ -126,16 +129,24 @@ def secret_file(target: str) -> Path | None:
     `NAROU_ADMIN_TOKEN` は要らない。`*_SECRET_NAME` を渡した項目は Secrets Store に
     置くので、値が無くても失敗にしない。
     """
-    stored = {
-        "NAROU_ADMIN_TOKEN": os.environ.get("NAROU_ADMIN_TOKEN_SECRET_NAME", "").strip(),
-        "NAROU_RS_LOGIN_KEY": os.environ.get("NAROU_RS_LOGIN_KEY_SECRET_NAME", "").strip(),
-    }
+    # Worker 側の名前 -> GitHub 側の環境変数名。`*_SECRET_NAME` を渡した項目は
+    # Secrets Store に置くので値が無くてもよい。
+    plain = (
+        ("NAROU_ADMIN_TOKEN", "NAROU_ADMIN_TOKEN", "NAROU_ADMIN_TOKEN_SECRET_NAME"),
+        ("NAROU_RS_LOGIN_KEY", "NAROU_RS_LOGIN_KEY", "NAROU_RS_LOGIN_KEY_SECRET_NAME"),
+        ("S3_ACCESS_KEY_ID", "NAROU_S3_ACCESS_KEY_ID", "NAROU_S3_ACCESS_KEY_ID_SECRET_NAME"),
+        (
+            "S3_SECRET_ACCESS_KEY",
+            "NAROU_S3_SECRET_ACCESS_KEY",
+            "NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME",
+        ),
+    )
     secrets: dict[str, str] = {}
-    for name, store_name in stored.items():
-        value = os.environ.get(name, "").strip()
+    for name, source, store_var in plain:
+        value = os.environ.get(source, "").strip()
         if value:
             secrets[name] = value
-        elif store_name:
+        elif os.environ.get(store_var, "").strip():
             continue
         elif name == "NAROU_ADMIN_TOKEN":
             if auth_required():
@@ -143,8 +154,13 @@ def secret_file(target: str) -> Path | None:
                     "NAROU_ADMIN_TOKEN is required (or set NAROU_ADMIN_TOKEN_SECRET_NAME, "
                     "or NAROU_AUTH_REQUIRED=false when Zero Trust is the boundary)"
                 )
+        elif name == "NAROU_RS_LOGIN_KEY":
+            print(f"::notice::{source} is not set; stored login credentials stay plaintext-only")
         else:
-            print(f"::notice::{name} is not set; stored credentials stay plaintext-only")
+            print(
+                f"::notice::{source} is not set; the S3 illustration backend stays fail-closed "
+                f"(set {source} or {store_var})"
+            )
     if not secrets:
         return None
     path = WORKER_DIR / f".deploy-secrets-{target}.json"

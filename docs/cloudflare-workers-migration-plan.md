@@ -293,106 +293,45 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 - Cloudflare の資格情報が未設定のリポジトリ (fork など) では **理由を出してデプロイだけ省略**する
   (`check Cloudflare credentials` ステップ)。テストは通常どおり走る。
 - GitHub Environments は**用途で 2 つ**に分ける（target では分けない）:
-  - `Cloudflare` … デプロイ 2 ジョブ用。
-    secrets: `CLOUDFLARE_ACCOUNT_ID`（`CLOUDFLARE_ACCOUT_ID` でも可）/ `CLOUDFLARE_API_TOKEN` /
-    `SERVICE_DOMAIN`（production 必須）/ `DEVELOP_DOMAIN`（develop・任意）/
-    `NAROU_ADMIN_TOKEN`（Zero Trust が境界なら不要）/ `NAROU_RS_LOGIN_KEY`（任意）/
-    `CF_ACCESS_CLIENT_ID`・`CF_ACCESS_CLIENT_SECRET`（smoke 用・任意）/
-    vars: `NAROU_AUTH_REQUIRED`（任意）/ `NAROU_WORKERS_DEV`（任意）/
-    `NAROU_S3_ENDPOINT` / `NAROU_S3_REGION` / `NAROU_S3_BUCKET` / `NAROU_S3_PREFIX`（任意）/
-    `NAROU_SECRETS_STORE_ID` と `NAROU_S3_*_SECRET_NAME`（`+ NAROU_ADMIN_TOKEN_SECRET_NAME` /
-    `NAROU_RS_LOGIN_KEY_SECRET_NAME`。Secrets Store を使う場合だけ）
-- **ドメインは secret に置く**。公開リポジトリでは Actions のログと step summary が誰でも読めるため、
-  hostname も伏せる。`SERVICE_DOMAIN` / `DEVELOP_DOMAIN` は `secrets` を優先して読み（`vars` も
-  後方互換で受ける）、`ci/deploy_worker.py` は custom domain 由来の URL を `::add-mask::` で伏せ、
-  step summary には URL を書かない（workers.dev の URL だけを表示する）。
-  挿絵バケットの endpoint / bucket も伏せたい場合は Secrets Store モード (§2.2.11) を使う。
+  - `Cloudflare` … デプロイ 2 ジョブ用（下の表）
   - `CodeSining` … `release.yml` の Windows 署名。`CERTUM_USERNAME` / `CERTUM_OTP_URI`（secrets）と
     `CERTUM_KEY_ID`（var）。Workers のデプロイからは参照しない。
-- 1 環境で両 target を回すための約束:
-  - target ごとに違う値は**変数名を分ける**（`SERVICE_DOMAIN` と `DEVELOP_DOMAIN`）。同じ名前の
-    `NAROU_S3_PREFIX` は設定せず、レンダラの既定 `narou/<target>` に任せる（同じバケットを
-    prefix で共有する前提。バケットを分けるなら環境も分ける）。
-  - `NAROU_ADMIN_TOKEN` は両 target で同じ値になる。target ごとに別トークンにしたい場合だけ
-    `Cloudflare-production` のように環境を分ける。
-  - production だけに承認ゲート（Environment の protection rules）を掛けたい場合も同じく環境を分ける。
-- ロールバック: Workers の前バージョンへ戻す (`wrangler versions` / ダッシュボード) か、
-  このワークフローを再実行する。native 側のデータ (`小説データ/`) は Worker から触らないので影響しない。
 
-### 2.2.9 Dantalian / Tiny-TID から取り込んだ運用 (2026-09-26)
+#### `Cloudflare` に置く secret
 
-参考実装（`Rust/Dantalian`, `JR/Tiny-TID`）から、Workers 固有の作法を取り込んだ。
-
-| 項目 | 内容 | 実装 |
+| 名前 | 必須 | 用途と挙動 |
 |---|---|---|
-| 静的アセット | `src/web/assets` を `build_assets.mjs` が `public/` へ焼き込み、`?v=<内容ハッシュ>` を HTML/JS に埋める。`[assets]` が配信し、無いパスだけ Worker へ落ちる | `worker_entry/build_assets.mjs`, `worker_entry/wrangler*.toml` |
-| 契約テスト | アセット配信・`/` の HTML・scheduled handler も検査対象に追加 | `worker_entry/tests/contract.mjs` |
-| 機械可読な認証 | health が `authentication_required` / `authentication_configured` を返し、401 は `{error:{code:"authentication_required"}}`、トークン未設定は 500 + `authentication_not_configured` | `worker_entry/src/lib.rs` |
-| Secrets Store | S3 資格情報は `<変数名>_STORE` バインディングがあれば Cloudflare Secrets Store から読む（無ければ従来の secret） | `worker_entry/src/s3_object_store.rs` |
-| S3 メタデータ | `HEAD` はエッジで 403 になる環境があるため、`GET` + `Range: bytes=0-0` の `Content-Range` からサイズを取る | `worker_entry/src/s3_object_store.rs`, `src/platform/s3_request.rs` |
-| release プロファイル | `lto = true` / `codegen-units = 1`（wasm のサイズ・起動、配布バイナリの速度） | `Cargo.toml` |
-| キューのペイロード | メッセージは `job_id` だけを運び、計画は D1 台帳から読む（旧形式も読める） | `src/application/jobs.rs`, `worker_entry/src/consumer.rs` |
-| サイト定義の L1 | 実効サイト定義を isolate 内に 30 秒キャッシュし、書き込み時は即時無効化 | `worker_entry/src/bundled_sites.rs` |
+| `CLOUDFLARE_API_TOKEN` | 必須 | `wrangler` 用 API トークン。D1 / Queue の provision、`d1 migrations apply --remote`、`deploy` に使う。未設定だと「理由を出してデプロイだけ省略」（ジョブは緑のまま） |
+| `CLOUDFLARE_ACCOUNT_ID` | 必須 | アカウント ID。Dantalian 綴りの `CLOUDFLARE_ACCOUT_ID` でも動く（workflow が `\|\|` で受ける） |
+| `SERVICE_DOMAIN` | production 必須 | production の custom domain（ホスト名のみ。scheme / path 不可）。`[[routes]] pattern=… custom_domain=true` の生成と smoke の宛先に使い、**ログと step summary では伏せる** |
+| `DEVELOP_DOMAIN` | develop 任意 | 同様。未設定なら route を足さず workers.dev で動く |
+| `NAROU_ADMIN_TOKEN` | Zero Trust が境界なら不要 | Worker API の Bearer。`--secrets-file` で Worker secret として投入。auth 有効で未設定ならデプロイを失敗させる（fail-closed） |
+| `NAROU_RS_LOGIN_KEY` | 任意 | 保存したログイン Cookie の AEAD 鍵（base64 32 バイト）。未設定なら平文行だけを読み、notice を出す |
+| `NAROU_S3_ACCESS_KEY_ID` / `NAROU_S3_SECRET_ACCESS_KEY` | 任意 | S3 資格情報。`S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` という Worker secret として投入する。未設定なら Secrets Store か `wrangler secret put` で別途投入する（notice を出す） |
+| `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | 任意 | Access の service token。smoke を custom domain 越しに流す。未設定で Access に弾かれた場合は smoke を省略する |
 
-採用しなかったもの: Containers（外部プロセス前提を持たない方針）、`cargo fmt --check`（整形差分を禁止する規約と衝突）、
-メジャーのみのバージョン指定（現状の精密ピンを維持）、R2/KV/Browser Rendering（設計は D1 + S3 互換）、
-PWA Service Worker（製品機能として別判断）。
+#### `Cloudflare` に置く var
 
-### 2.2.10 大きなオブジェクトとデプロイ前確認 (2026-09-26)
+| 名前 | 既定 | 用途と挙動 |
+|---|---|---|
+| `NAROU_AUTH_REQUIRED` | `true` | `[vars]` に焼き込み、Worker の Bearer 検査を on/off する。`false` は Zero Trust 前提（`NAROU_ADMIN_TOKEN` 不要）。`true` でトークン未設定なら 500 `authentication_not_configured` |
+| `NAROU_WORKERS_DEV` | 「route があれば `false`」 | workers.dev の開閉。レンダラ専用（Cloudflare へは渡さない）。Access だけが境界のときに迂回口を残さないため |
+| `NAROU_S3_ENDPOINT` | (a) モードで必須 | `https://…`（query / fragment 不可）。`[vars] S3_ENDPOINT` に焼き込む |
+| `NAROU_S3_REGION` | (a) モードで必須 | 小文字のリージョン名（例 `us-east-1`） |
+| `NAROU_S3_BUCKET` | (a) モードで必須 | S3 のバケット名規則を検証する |
+| `NAROU_S3_PREFIX` | `narou/<target>` | キー前置。**設定しない**（両 target で同じバケットを prefix で共有する） |
+| `NAROU_SECRETS_STORE_ID` + `NAROU_S3_*_SECRET_NAME`（5 つ） | — | (b) モード。値ではなく Cloudflare 側の secret 名を渡す。片方だけ設定すると失敗（5 つ揃える） |
+| `NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME` | — | トークン・鍵も Secrets Store に置く。設定すると `--secrets-file` を作らない |
+| `NAROU_D1_BASE_NAME` / `NAROU_JOB_QUEUE_BASE` | `narou-rs` / `narou-jobs` | provision が `<base>-<target>` と `<queue>-dlq` を作る。target サフィックスを含めないこと |
+| `NAROU_DEPLOY_URL` | — | smoke の宛先を明示（workers.dev 以外は伏せる） |
+| `NAROU_SMOKE` | `1` | `0` で smoke を省略 |
 
-- **挿絵は Worker を通さない**: `GET /api/novels/{id}/illustrations/{name}` は、挿絵を S3 に置く構成
-  (`asset_backend = s3`) では **presigned URL へ 302** する（寿命 240 秒）。D1 に置く構成では
-  そのまま返す。presign は `s3_sigv4::presign_get` で、botocore の `S3SigV4QueryAuth`（時刻固定）で
-  生成した 3 ケースとバイト一致することをテストで固定している。
-- **移行の `plan`**: `POST /api/admin/object-migration {"action":"plan"}` は対象件数と合計バイトを数える
-  だけで書き込まない。本番前に規模を確認してから `copy` → `verify` の順に進める。
-- **デプロイ前チェックリスト**（Dantalian の運用に倣う）:
-  1. `cargo test --workspace --all-targets` / `cargo check --target wasm32-unknown-unknown` が緑
-  2. `node worker_entry/tests/run.mjs --release`（契約テスト 27 件）が緑
-  3. `ci/render_config.py` が未置換プレースホルダで失敗しない（＝secret / vars が揃っている）
-  4. リモート D1 の migration が適用済み（`deploy_worker.py` が実行する）
-  5. 挿絵を S3 に向ける場合は `plan` → `copy` → `verify` を済ませてから `asset_backend` を `s3` に
-  6. 資格情報・署名付き URL・Cookie をログや成果物に出さない
-- **切り戻し**: `wrangler versions` で前バージョンへ戻す、または `asset_backend` を `d1` に戻す。
-  native 側の `小説データ/` は Worker から書き換えないため影響しない。
-
-### 2.2.11 挿絵バケットの指定方法（Dantalian 方式に対応, 2026-09-26）
-
-Dantalian は**バケットの値をどこにも書かない**。5 つの値（access key id / secret access key /
-endpoint / region / bucket）を Cloudflare Secrets Store に置き、`wrangler.<env>.toml` には
-`[[secrets_store_secrets]]` の `store_id`（非秘密のリソース ID）と `secret_name` の**プレースホルダ**だけを
-書き、CI は GitHub secrets に「Cloudflare 側の secret 名」を入れてレンダラに渡す。バケット実体は
-手動作成で、環境の分離は `dantalian/<target>` の prefix をレンダラが導出して行う。
-（参考実装側のファイル名: `worker/ci/render_config.py`, `worker/wrangler.production.toml`, `worker/src/wasabi_config.rs`）
-
-narou.rs も同じ 2 モードを持つようにした:
-
-| | 値の置き場 | CI が渡すもの | prefix |
-|---|---|---|---|
-| (a) vars（既定） | `wrangler.<env>.toml` の `[vars]`（GitHub の `vars.NAROU_S3_*`） | endpoint / region / bucket の値 | `NAROU_S3_PREFIX`（既定 `narou/<target>`） |
-| (b) Secrets Store | Cloudflare Secrets Store（手動作成の 5 エントリ） | `NAROU_SECRETS_STORE_ID` と 5 つの `NAROU_S3_*_SECRET_NAME`（**名前だけ**） | レンダラが `narou/<target>` を導出 |
-
-- どちらでも `[vars] S3_ENDPOINT` 等は空になる（(b) の場合）か値が入る（(a)）。Worker 側は
-  `<変数名>_STORE`（Secrets Store）→ `env.var` → `env.secret` の順に解決する。
-- **アプリの 2 値も同じ仕組みに乗せた**。`NAROU_ADMIN_TOKEN`（API の Bearer トークン）と
-  `NAROU_RS_LOGIN_KEY`（資格情報の復号鍵）は既定で通常の Worker secret（`wrangler secret` /
-  `--secrets-file`）だが、`NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME` を
-  CI に渡せば Secrets Store の `NAROU_ADMIN_TOKEN_STORE` / `NAROU_RS_LOGIN_KEY_STORE` バインディングに
-  切り替わり、値はリポジトリにも CI にも残らない（その場合 `--secrets-file` は作らない）。
-  参考実装もこれらは Secrets Store ではなく `--secrets-file` で渡している（同じ既定）。
-- **識別子は narou.rs 側の `S3_*` / `s3_*` に統一する**。参考実装の `WASABI_*` 名（環境変数・binding・
-  設定キー）は輸入しない。ベンダ名は設定値（endpoint / bucket）として外から与えるだけで、コードと
-  CI 変数には現れない。
-- `CLOUDFLARE_ACCOUNT_ID` は Dantalian の綴り（`CLOUDFLARE_ACCOUT_ID`）でも動くようにした
-  （workflow 側で `||` で受ける）。
-- custom domain は target ごとの変数で入れる。production は `SERVICE_DOMAIN` が**必須**、develop は
-  `DEVELOP_DOMAIN` が**任意**で、未設定なら route を足さず workers.dev の URL だけで動く。
-  `[[routes]]` はレンダラが `__CUSTOM_DOMAIN_BLOCK__` を差し替えて生成する。
-  **staging 環境は廃止した**（develop と production の 2 環境。環境名は `wrangler.<target>.toml` と
-  D1 / Queue の `<name>-<target>` 規則だけで分かれる）。
-- **route を入れた環境では `workers_dev` を閉じる（既定）**。Cloudflare Access (Zero Trust) を唯一の
-  境界にする前提では、workers.dev が開いていると Access を通らず Worker へ到達できてしまう。
-  `NAROU_WORKERS_DEV=true|false` で明示もできる。
+- 手で置かない派生値: `NAROU_DEPLOY_TARGET`（workflow が設定）と
+  `NAROU_D1_DATABASE_NAME` / `NAROU_D1_DATABASE_ID` / `NAROU_JOB_QUEUE` / `NAROU_JOB_DLQ`
+  （`ci/provision_resources.py` が算出して `GITHUB_OUTPUT` で渡す）。
+- Cloudflare 側に現れる形: `[vars]` は `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_PREFIX` /
+  `NAROU_AUTH_REQUIRED`、Worker secret は `NAROU_ADMIN_TOKEN` / `NAROU_RS_LOGIN_KEY` /
+  `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`、(b) モードでは `<NAME>_STORE` バインディング。
 - デプロイ後の疎通先は `NAROU_DEPLOY_URL`（任意）→ custom domain → wrangler が報告した URL の順。
   custom domain が Access の内側にある場合は service token を渡すか smoke を省略する。
 - 検証: `ci/render_config.py` を両モード・2 target（domain あり/なし、`NAROU_AUTH_REQUIRED` /
