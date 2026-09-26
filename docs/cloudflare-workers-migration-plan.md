@@ -278,23 +278,39 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 2. `ci/render_config.py` で `wrangler.ci.toml` をレンダリング（未置換プレースホルダは失敗）
 3. `wrangler d1 migrations apply <db> --remote` でリモート D1 を更新
 4. `wrangler deploy --secrets-file <json>` で `NAROU_ADMIN_TOKEN` と `NAROU_RS_LOGIN_KEY` を投入してデプロイ
-   （secret ファイルは `finally` で必ず削除）
+   （secret ファイルは `finally` で必ず削除。Zero Trust が境界で両方とも不要な場合はファイルを作らない）
 5. デプロイ先の URL を wrangler の出力から拾い、契約テストを smoke として流す（`NAROU_SMOKE=0` で省略）
 
 トリガーは `.github/workflows/platform.yml`:
 
-| きっかけ | GitHub Environment | デプロイ先 |
+| きっかけ | GitHub Environment | デプロイ先 (`NAROU_DEPLOY_TARGET`) |
 |---|---|---|
-| `develop` へ push | `develop` | develop |
-| タグ push (`v*` / 数字始まり) | `production` | production (custom domain) |
-| 手動 `workflow_dispatch` (target 選択) | 選択した環境 | 同左 |
+| `develop` へ push | `Cloudflare` | develop |
+| タグ push (`v*` / 数字始まり) | `Cloudflare` | production (custom domain) |
+| 手動 `workflow_dispatch` (target 選択) | `Cloudflare` | 選択した target |
 
 - 各ジョブは `needs: [native, native-gpl, wasm, worker, worker-contract, license]` で、テストが緑のときだけ動く。
 - Cloudflare の資格情報が未設定のリポジトリ (fork など) では **理由を出してデプロイだけ省略**する
   (`check Cloudflare credentials` ステップ)。テストは通常どおり走る。
-- 必要な secret / vars は各 Environment に置く:
-  - secrets: `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` / `NAROU_ADMIN_TOKEN` / `NAROU_RS_LOGIN_KEY`
-  - vars: `NAROU_S3_ENDPOINT` / `NAROU_S3_REGION` / `NAROU_S3_BUCKET` / `NAROU_S3_PREFIX`(任意) / `SERVICE_DOMAIN`(production のみ)
+- GitHub Environments は**用途で 2 つ**に分ける（target では分けない）:
+  - `Cloudflare` … デプロイ 2 ジョブ用。
+    secrets: `CLOUDFLARE_ACCOUNT_ID`（`CLOUDFLARE_ACCOUT_ID` でも可）/ `CLOUDFLARE_API_TOKEN` /
+    `NAROU_ADMIN_TOKEN`（Zero Trust が境界なら不要）/ `NAROU_RS_LOGIN_KEY`（任意）/
+    `CF_ACCESS_CLIENT_ID`・`CF_ACCESS_CLIENT_SECRET`（smoke 用・任意）/
+    vars: `SERVICE_DOMAIN`（production 必須）/ `DEVELOP_DOMAIN`（develop・任意）/
+    `NAROU_AUTH_REQUIRED`（任意）/ `NAROU_WORKERS_DEV`（任意）/
+    `NAROU_S3_ENDPOINT` / `NAROU_S3_REGION` / `NAROU_S3_BUCKET` / `NAROU_S3_PREFIX`（任意）/
+    `NAROU_SECRETS_STORE_ID` と `NAROU_S3_*_SECRET_NAME`（`+ NAROU_ADMIN_TOKEN_SECRET_NAME` /
+    `NAROU_RS_LOGIN_KEY_SECRET_NAME`。Secrets Store を使う場合だけ）
+  - `CodeSining` … `release.yml` の Windows 署名。`CERTUM_USERNAME` / `CERTUM_OTP_URI`（secrets）と
+    `CERTUM_KEY_ID`（var）。Workers のデプロイからは参照しない。
+- 1 環境で両 target を回すための約束:
+  - target ごとに違う値は**変数名を分ける**（`SERVICE_DOMAIN` と `DEVELOP_DOMAIN`）。同じ名前の
+    `NAROU_S3_PREFIX` は設定せず、レンダラの既定 `narou/<target>` に任せる（同じバケットを
+    prefix で共有する前提。バケットを分けるなら環境も分ける）。
+  - `NAROU_ADMIN_TOKEN` は両 target で同じ値になる。target ごとに別トークンにしたい場合だけ
+    `Cloudflare-production` のように環境を分ける。
+  - production だけに承認ゲート（Environment の protection rules）を掛けたい場合も同じく環境を分ける。
 - ロールバック: Workers の前バージョンへ戻す (`wrangler versions` / ダッシュボード) か、
   このワークフローを再実行する。native 側のデータ (`小説データ/`) は Worker から触らないので影響しない。
 

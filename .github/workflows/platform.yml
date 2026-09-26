@@ -116,13 +116,22 @@ jobs:
   #   secrets.NAROU_ADMIN_TOKEN (デプロイ後の smoke test で使う。Zero Trust を
   #                 境界にする場合は NAROU_AUTH_REQUIRED=false で不要になる)
   # 未設定の間は workflow_dispatch から実行しても失敗するだけで、push では走らない。
-  # 環境ごとのデプロイ。GitHub Environments (develop / production) に
-  # Cloudflare の資格情報と secret を置く:
-  #   secrets: CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN /
-  #            NAROU_ADMIN_TOKEN / NAROU_RS_LOGIN_KEY
-  #   vars:    NAROU_S3_ENDPOINT / NAROU_S3_REGION / NAROU_S3_BUCKET /
-  #            NAROU_S3_PREFIX (任意) / SERVICE_DOMAIN (production のみ) /
-  #            DEVELOP_DOMAIN (任意) / NAROU_AUTH_REQUIRED (任意, Zero Trust なら false)
+  # デプロイ。GitHub Environments は用途で 2 つに分ける:
+  #   `Cloudflare` … この 2 ジョブ (develop / production) が使う Workers 用の値
+  #     secrets: CLOUDFLARE_ACCOUNT_ID (または CLOUDFLARE_ACCOUT_ID) / CLOUDFLARE_API_TOKEN /
+  #              NAROU_ADMIN_TOKEN (Zero Trust が境界なら不要) / NAROU_RS_LOGIN_KEY (任意) /
+  #              CF_ACCESS_CLIENT_ID・CF_ACCESS_CLIENT_SECRET (smoke 用・任意)
+  #     vars:    SERVICE_DOMAIN (production 必須) / DEVELOP_DOMAIN (develop・任意) /
+  #              NAROU_AUTH_REQUIRED (任意) / NAROU_WORKERS_DEV (任意) /
+  #              NAROU_S3_ENDPOINT / NAROU_S3_REGION / NAROU_S3_BUCKET /
+  #              NAROU_S3_PREFIX (任意。未設定なら narou/<target>) /
+  #              NAROU_SECRETS_STORE_ID と *_SECRET_NAME (Secrets Store を使う場合)
+  #   `CodeSining` … release.yml の Windows 署名 (CERTUM_USERNAME / CERTUM_OTP_URI /
+  #                  CERTUM_KEY_ID)
+  # 対象は `NAROU_DEPLOY_TARGET` (develop / production) で切り替えるので、
+  # target ごとに環境を分けずに同じ環境を共有している (SERVICE_DOMAIN と
+  # DEVELOP_DOMAIN は名前が違うため衝突しない)。
+  # D1・Queue は `ci/provision_resources.py` が target 名から導出して冪等に作る。
   # D1・Queue は `ci/provision_resources.py` が環境名から導出して冪等に作る。
   # 環境ごとのデプロイ。GitHub Environments (develop / production) に
   # Cloudflare の資格情報と secret を置く:
@@ -143,7 +152,8 @@ jobs:
       group: narou-worker-develop
       cancel-in-progress: false
     environment:
-      name: develop
+      # Workers 用の資格情報は用途別の 1 環境にまとめる (署名は CodeSining)。
+      name: Cloudflare
     permissions:
       contents: read
     defaults:
@@ -217,7 +227,8 @@ jobs:
       group: narou-worker-production
       cancel-in-progress: false
     environment:
-      name: production
+      # Workers 用の資格情報は用途別の 1 環境にまとめる (署名は CodeSining)。
+      name: Cloudflare
     permissions:
       contents: read
     defaults:
