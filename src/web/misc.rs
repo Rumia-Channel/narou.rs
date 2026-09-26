@@ -18,6 +18,7 @@ use super::sort_state::{
     current_sort_from_server_setting, default_current_sort_state, normalize_current_sort_request,
 };
 use super::state::{ApiResponse, LogsParams};
+use super::{html_escape, tag_color_class};
 
 #[derive(Debug, Deserialize)]
 pub struct TagListParams {
@@ -28,27 +29,6 @@ pub struct TagListParams {
 pub struct HistoryParams {
     stream: Option<String>,
     format: Option<String>,
-}
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-fn tag_color_class(color: &str) -> &'static str {
-    match color {
-        "green" => "tag-green",
-        "yellow" => "tag-yellow",
-        "blue" => "tag-blue",
-        "magenta" => "tag-magenta",
-        "cyan" => "tag-cyan",
-        "red" => "tag-red",
-        "white" => "tag-white",
-        _ => "tag-default",
-    }
 }
 
 pub async fn version_current(State(_state): State<AppState>) -> Json<serde_json::Value> {

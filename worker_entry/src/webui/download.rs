@@ -44,16 +44,11 @@ use narou_rs::platform::NovelId;
 use serde::Deserialize;
 use serde_json::json;
 use wasm_bindgen::JsValue;
-use worker::{console_log, Env, Method, Request, Response};
+use worker::{Env, Method, Request, Response, console_log};
 
 use crate::composition::WorkerRuntime;
 
-/// native `MAX_WEB_TARGETS_PER_REQUEST` — the fallback when the
-/// `server-max-targets-per-request` setting is absent or invalid
-/// (`SettingsService::web_target_limit`).
-const MAX_WEB_TARGETS_PER_REQUEST: usize = 100_000;
-/// native `MAX_WEB_TARGET_LENGTH` (`validate_web_target_value`).
-const MAX_WEB_TARGET_LENGTH: usize = 4096;
+use super::json_error;
 
 #[derive(Debug, Deserialize)]
 struct DownloadBody {
@@ -88,13 +83,8 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         }
     };
 
-    // `super::max_web_targets_per_request` parity: same setting key, same
-    // fallback.
-    let max_targets = runtime
-        .services
-        .settings
-        .web_target_limit(MAX_WEB_TARGETS_PER_REQUEST)
-        .await;
+    // `super::max_web_targets` parity: same setting key, same fallback.
+    let max_targets = super::max_web_targets(&runtime).await;
 
     // `queue_download_jobs` → `validate_download_targets` parity.
     if let Err(message) = validate_download_targets(&body.targets, max_targets) {
@@ -143,17 +133,6 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     Response::from_json(&json!({ "success": true, "results": results }))
 }
 
-/// `lib.rs::json_error` と同じ JSON 形 (`{error: {code, message?}}`)。あちらは
-/// private なので形だけ合わせてここに持つ (このファイルは HTTP 層のエラーに
-/// のみ使い、native が 200 で返す API 失敗には `download_failure` を使う)。
-fn json_error(status: u16, code: &str, message: Option<&str>) -> worker::Result<Response> {
-    let payload = match message {
-        Some(message) => json!({ "error": { "code": code, "message": message } }),
-        None => json!({ "error": { "code": code } }),
-    };
-    Response::from_json(&payload).map(|response| response.with_status(status))
-}
-
 /// native `api_download` の失敗応答: HTTP 200 + `{success:false, message,
 /// results:[]}`。
 fn download_failure(message: &str) -> worker::Result<Response> {
@@ -168,26 +147,17 @@ fn download_failure(message: &str) -> worker::Result<Response> {
 /// reject over the configured cap, empty/whitespace-only, overlong,
 /// flag-like (`-` prefix), or control-character targets. The raw string is
 /// what native enqueues; validation only gates it.
+///
+/// 共有実装 `application::webui::validate_web_target_value` の詳細な
+/// エラー文字列はこのハンドラでは単一の "invalid download target" に
+/// 潰す (native `jobs.rs::validate_download_targets` の `.map_err(|_| ...)` と同じ)。
 fn validate_download_targets(targets: &[String], max_targets: usize) -> Result<(), String> {
     if targets.len() > max_targets {
         return Err("too many targets".to_string());
     }
     for target in targets {
-        validate_web_target_value(target)?;
-    }
-    Ok(())
-}
-
-/// `src/web/mod.rs::validate_web_target_value`, error strings mapped to the
-/// download handler's single message ("invalid download target").
-fn validate_web_target_value(value: &str) -> Result<(), String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty()
-        || trimmed.len() > MAX_WEB_TARGET_LENGTH
-        || trimmed.starts_with('-')
-        || trimmed.chars().any(|ch| ch.is_control())
-    {
-        return Err("invalid download target".to_string());
+        narou_rs::application::webui::validate_web_target_value(target)
+            .map_err(|_| "invalid download target".to_string())?;
     }
     Ok(())
 }

@@ -29,6 +29,8 @@ use worker::{Env, Method, Request, Response, console_log};
 use crate::composition::WorkerRuntime;
 use crate::d1_cookie_store::D1CookieStore;
 
+use super::json_error;
+
 /// `POST /api/login/import` の本文 (native `LoginImportRequest`)。
 #[derive(Debug, Deserialize)]
 struct ImportBody {
@@ -268,19 +270,6 @@ async fn status_data(runtime: &WorkerRuntime) -> serde_json::Value {
 
 /// native `failure()`: HTTP 200 + `{success: false, message}`。
 fn api_failure(message: &str) -> worker::Result<Response> {
-    Response::from_json(&serde_json::json!({
-        "success": false,
-        "message": message,
-    }))
-}
-
-/// `lib.rs::json_error` と同じ JSON 形 (`{error: {code, message?}}`)。あちらは
-/// private なので形だけ合わせてここに持つ。
-fn json_error(status: u16, code: &str, message: Option<&str>) -> worker::Result<Response> {
-    let payload = match message {
-        Some(message) => serde_json::json!({ "error": { "code": code, "message": message } }),
-        None => serde_json::json!({ "error": { "code": code } }),
-    };
-    Response::from_json(&payload).map(|response| response.with_status(status))
+    Response::from_json(&super::api_response(false, message))
 }
 

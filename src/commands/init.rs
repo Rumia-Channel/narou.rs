@@ -91,9 +91,10 @@ fn copy_bundled_webnovel_files(destination: &Path) -> Result<usize> {
 fn bundled_webnovel_dir() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent() {
-            candidates.push(parent.join("webnovel"));
-        }
+        && let Some(parent) = exe.parent()
+    {
+        candidates.push(parent.join("webnovel"));
+    }
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("webnovel"));
 
     candidates.into_iter().find(|path| path.is_dir())
@@ -213,9 +214,7 @@ fn ask_aozoraepub3_path(
     }
 }
 
-fn ask_line_height(
-    settings: &std::collections::HashMap<String, serde_yaml::Value>,
-) -> Result<f64> {
+fn ask_line_height(settings: &std::collections::HashMap<String, serde_yaml::Value>) -> Result<f64> {
     let default = settings
         .get("line-height")
         .and_then(|value| value.as_f64())
@@ -318,9 +317,10 @@ fn rewrite_aozoraepub3_files(aozora_path: &str, line_height: f64) -> Result<()> 
 fn preset_dir() -> Result<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent() {
-            candidates.push(parent.join("preset"));
-        }
+        && let Some(parent) = exe.parent()
+    {
+        candidates.push(parent.join("preset"));
+    }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     candidates.push(manifest_dir.join("preset"));
     candidates.push(manifest_dir.join("sample").join("narou").join("preset"));
@@ -441,7 +441,9 @@ mod tests {
         let chuki = std::fs::read_to_string(aozora_dir.join("chuki_tag.txt")).unwrap();
         assert!(!chuki.contains("\nold\n"));
         assert_eq!(
-            chuki.matches("### Narou.rb embedded custom chuki ###").count(),
+            chuki
+                .matches("### Narou.rb embedded custom chuki ###")
+                .count(),
             2
         );
         assert!(chuki.contains("before\n"));
@@ -467,7 +469,10 @@ mod tests {
 
         let validated = validate_aozoraepub3_path(aozora_dir.to_str().unwrap()).unwrap();
 
-        assert_eq!(std::path::PathBuf::from(validated), std::fs::canonicalize(aozora_dir).unwrap());
+        assert_eq!(
+            std::path::PathBuf::from(validated),
+            std::fs::canonicalize(aozora_dir).unwrap()
+        );
     }
 
     #[test]
@@ -480,7 +485,10 @@ mod tests {
 
         let validated = validate_aozoraepub3_path("Aozora").unwrap();
 
-        assert_eq!(std::path::PathBuf::from(validated), std::fs::canonicalize(aozora_dir).unwrap());
+        assert_eq!(
+            std::path::PathBuf::from(validated),
+            std::fs::canonicalize(aozora_dir).unwrap()
+        );
     }
 
     #[cfg(windows)]

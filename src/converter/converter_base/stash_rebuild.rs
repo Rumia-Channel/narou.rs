@@ -14,8 +14,7 @@ static RE_ILLUST_TAG: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-static RE_URL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).unwrap());
+static RE_URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).unwrap());
 static RE_FORCE_INDENT_CHAPTER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\u{FF3B}\u{FF03}\u{7AE0}\u{898B}\u{51FA}\u{3057}\u{3063}\u{307D}\u{3044}\u{6587}\u{FF1D}(\d+)\u{FF3D}")
         .unwrap()

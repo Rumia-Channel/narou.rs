@@ -9,8 +9,8 @@
 use std::io::Read as _;
 
 use narou_rs::error::{NarouError, Result};
-use narou_rs::login::{build_export, parse_export};
 use narou_rs::login::group_credentials;
+use narou_rs::login::{build_export, parse_export};
 use narou_rs::native::cookie_store::InventoryCookieStore;
 
 /// Subcommands of `narou login`.
@@ -113,11 +113,16 @@ fn list(store: &InventoryCookieStore) -> Result<()> {
     let stored = store.credentials_by_host()?;
     if stored.is_empty() {
         println!("保存されたログイン情報はありません。");
-        println!("  narou_rs_login <サイト> で取得し、narou login import <ファイル> で取り込めます。");
+        println!(
+            "  narou_rs_login <サイト> で取得し、narou login import <ファイル> で取り込めます。"
+        );
         return Ok(());
     }
     let total: usize = stored.values().map(Vec::len).sum();
-    println!("保存されたログイン情報: {} サイト / {total} 件", stored.len());
+    println!(
+        "保存されたログイン情報: {} サイト / {total} 件",
+        stored.len()
+    );
     for (host, credentials) in &stored {
         let state = if store.is_encrypted(host)? {
             "暗号化済み"
@@ -163,7 +168,10 @@ fn import(
         store.merge_credentials(&grouped)?
     };
     println!("ログイン情報を取り込みました: {count} 件 / {hosts} サイト");
-    println!("  保存済み: {stored} サイト ({})", store.key_source()?.describe());
+    println!(
+        "  保存済み: {stored} サイト ({})",
+        store.key_source()?.describe()
+    );
     if replace {
         println!("  取り込みに含まれないサイトの情報は削除されました。");
     }
@@ -185,15 +193,11 @@ fn export(
     }
     let passphrase = if clear_text { None } else { passphrase };
     let exported_at = chrono::Local::now().to_rfc3339();
-    let library = std::env::current_dir()
-        .ok()
-        .and_then(|dir| dir.file_name().map(|name| name.to_string_lossy().into_owned()));
-    let text = build_export(
-        &credentials,
-        passphrase,
-        &exported_at,
-        library.as_deref(),
-    )?;
+    let library = std::env::current_dir().ok().and_then(|dir| {
+        dir.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    });
+    let text = build_export(&credentials, passphrase, &exported_at, library.as_deref())?;
     std::fs::write(file, text)?;
     println!(
         "ログイン情報を書き出しました: {file} ({} 件)",
@@ -367,10 +371,9 @@ fn mask_cookie(cookie: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use narou_rs::platform::LoginCredential;
     use super::*;
     use crate::test_support::{legacy_yaml_guard, set_current_dir_for_test};
-
+    use narou_rs::platform::LoginCredential;
 
     /// A throwaway library with the process working directory pointed at it.
     ///
@@ -404,13 +407,8 @@ mod tests {
         let file = temp.path().join("login.yaml");
         let file = file.to_string_lossy().into_owned();
         let source = vec![LoginCredential::new("example.com", "sid=abc")];
-        let exported = build_export(
-            &source,
-            Some("hunter2"),
-            "2026-09-20T00:00:00+09:00",
-            None,
-        )
-        .unwrap();
+        let exported =
+            build_export(&source, Some("hunter2"), "2026-09-20T00:00:00+09:00", None).unwrap();
         std::fs::write(&file, exported).unwrap();
 
         assert!(import(&store, &file, Some("wrong"), false).is_err());

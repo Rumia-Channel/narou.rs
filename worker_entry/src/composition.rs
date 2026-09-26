@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::SecondsFormat;
-use narou_rs::application::{
-    envelope_bytes, job_limits, JobClaim, JobLedgerStatus, JobPlan, JobQueue,
-    AppServiceDependencies, AppServices, EmptySiteDefinitionProvider, EmptySiteTimezoneProvider,
-    EmptyWebActionService, JobService, NoopSelfUpdateService, NovelActionService,
-    NovelContentService, NovelSettingsService, SchedulerService, SettingsService, TagColorService,
-    WorkerJobEnvelope,
-};
 use narou_rs::application::settings::SettingsStore;
+use narou_rs::application::{
+    AppServiceDependencies, AppServices, EmptySiteDefinitionProvider, EmptySiteTimezoneProvider,
+    EmptyWebActionService, JobClaim, JobLedgerStatus, JobPlan, JobQueue, JobService,
+    NoopSelfUpdateService, NovelActionService, NovelContentService, NovelSettingsService,
+    SchedulerService, SettingsService, TagColorService, WorkerJobEnvelope, envelope_bytes,
+    job_limits,
+};
 use narou_rs::downloader::Downloader;
 use narou_rs::downloader::settings::{DownloaderSettings, SnapshotDownloaderSettings};
 use narou_rs::downloader::site_setting::SiteSetting;
@@ -22,12 +22,11 @@ use narou_rs::setting_core::SettingScope;
 use serde::Deserialize;
 use worker::{D1Database, Env, Queue};
 
+use crate::d1_object_store::D1ObjectStore;
 use crate::d1_repository::{D1FreezeStore, D1NovelRepository, D1SettingsStore, D1TagColorStore};
 use crate::http::WorkerHttpClient;
 use crate::ledger::{D1JobLedger, D1SchedulerCheckpoint};
 use crate::rate_limiter::WorkerRateLimiter;
-use crate::d1_object_store::D1ObjectStore;
-
 
 /// Result of the complete ledger + Queue producer operation for one plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,8 +112,7 @@ async fn build_object_stores(
             }
             _ => (d1.clone(), d1.clone()),
         };
-    let split: Arc<SplitStore> =
-        Arc::new(SplitStore::new((d1.clone(), d1.clone()), illustrations));
+    let split: Arc<SplitStore> = Arc::new(SplitStore::new((d1.clone(), d1.clone()), illustrations));
     Ok((split.clone(), split, s3_handle))
 }
 
@@ -245,12 +243,14 @@ impl WorkerRuntime {
         let settings = self.downloader_settings().await?;
         let section_hash_cache = settings.load_section_hash_cache();
         let downloader = Downloader::with_platform_and_storage_and_settings_and_support(
-            self.http.clone(),
-            self.rate_limiter.clone(),
-            self.novels.clone(),
-            self.objects.clone(),
-            self.assets.clone(),
-            self.clock.clone(),
+            narou_rs::downloader::DownloaderPlatform {
+                http: self.http.clone(),
+                rate_limiter: self.rate_limiter.clone(),
+                novels: self.novels.clone(),
+                objects: self.objects.clone(),
+                assets: self.assets.clone(),
+                clock: self.clock.clone(),
+            },
             self.site_settings.clone(),
             section_hash_cache,
             settings,
@@ -322,13 +322,9 @@ impl WorkerRuntime {
     /// Pending/retryable rows are sent; a live running row is not duplicated.
     pub async fn enqueue_plan(&self, plan: JobPlan) -> Result<DispatchOutcome> {
         let queued = self.ledger.enqueue(plan.clone()).await?;
-        let view = self
-            .ledger
-            .get(&queued.job_id)
-            .await?
-            .ok_or_else(|| {
-                narou_rs::error::NarouError::Platform("queued job disappeared".to_string())
-            })?;
+        let view = self.ledger.get(&queued.job_id).await?.ok_or_else(|| {
+            narou_rs::error::NarouError::Platform("queued job disappeared".to_string())
+        })?;
         let unsupported = if !plan.kind.is_worker_executable() {
             Some(format!(
                 "unsupported job kind {:?} on the worker (no subprocess support)",
@@ -353,8 +349,7 @@ impl WorkerRuntime {
         if let Some(reason) = blocked_reason {
             match self.ledger.claim(&queued.job_id).await? {
                 JobClaim::Claimed {
-                    execution_token,
-                    ..
+                    execution_token, ..
                 } => {
                     self.ledger
                         .mark_terminal(
@@ -479,9 +474,7 @@ fn services_from(
         settings: Arc::new(SettingsService::new(Arc::new(D1SettingsStore::new(
             db.clone(),
         )))),
-        tag_colors: Arc::new(TagColorService::new(Arc::new(D1TagColorStore::new(
-            db,
-        )))),
+        tag_colors: Arc::new(TagColorService::new(Arc::new(D1TagColorStore::new(db)))),
         jobs: Arc::new(JobService),
         scheduler: Arc::new(SchedulerService::new(clock)),
         site_definitions: Arc::new(EmptySiteDefinitionProvider),

@@ -113,7 +113,9 @@ fn cmd_send_inner(opts: SendOptions, sink: &dyn MessageSink) -> Result<(), Strin
 
     let (device, raw_targets) = resolve_device_and_targets(&opts.args)?;
     if !device.physical_support() {
-        return Err(messages::send::direct_send_unsupported(device.display_name()));
+        return Err(messages::send::direct_send_unsupported(
+            device.display_name(),
+        ));
     }
 
     let manager = device
@@ -149,10 +151,11 @@ fn cmd_send_inner(opts: SendOptions, sink: &dyn MessageSink) -> Result<(), Strin
             continue;
         }
 
-        let (display_target, ebook_paths) = match resolve_send_target(&target, device, &titles, sink)? {
-            Some(data) => data,
-            None => continue,
-        };
+        let (display_target, ebook_paths) =
+            match resolve_send_target(&target, device, &titles, sink)? {
+                Some(data) => data,
+                None => continue,
+            };
 
         let Some(first_path) = ebook_paths.first() else {
             sink.emit(Stream::Stderr, &messages::target_missing(target));
@@ -324,7 +327,10 @@ fn copy_with_progress(
 
 fn process_backup_bookmark(device: SendDevice, manager: &OutputManager, sink: &dyn MessageSink) {
     if !device.bookmark_backup_supported() {
-        sink.emit(Stream::Stderr, messages::send::bookmark_backup_unsupported());
+        sink.emit(
+            Stream::Stderr,
+            messages::send::bookmark_backup_unsupported(),
+        );
         return;
     }
 
@@ -337,7 +343,10 @@ fn process_backup_bookmark(device: SendDevice, manager: &OutputManager, sink: &d
 
 fn process_restore_bookmark(device: SendDevice, manager: &OutputManager, sink: &dyn MessageSink) {
     if !device.bookmark_backup_supported() {
-        sink.emit(Stream::Stderr, messages::send::bookmark_backup_unsupported());
+        sink.emit(
+            Stream::Stderr,
+            messages::send::bookmark_backup_unsupported(),
+        );
         return;
     }
 

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use narou_rs::compat::yaml_value_to_string;
-use narou_rs::downloader::{Downloader, TargetType};
 use narou_rs::db::inventory::{Inventory, InventoryScope};
+use narou_rs::downloader::{Downloader, TargetType};
 use narou_rs::queue::{JobType, PersistentQueue};
 
 pub mod alias;
@@ -11,6 +11,7 @@ pub mod browser;
 pub mod clean;
 pub mod convert;
 pub mod csv;
+pub mod db;
 pub mod diff;
 pub mod download;
 pub mod folder;
@@ -22,7 +23,6 @@ pub mod log;
 pub mod login;
 pub mod mail;
 pub mod manage;
-pub mod db;
 pub mod send;
 pub mod setting;
 pub mod trace;
@@ -34,7 +34,9 @@ fn resolve_alias_target(target: &str) -> String {
     let aliases = narou_rs::db::with_database(|db| {
         let values: HashMap<String, serde_yaml::Value> =
             db.inventory().load("alias", InventoryScope::Local)?;
-        Ok(narou_rs::application::aliases::alias_map_from_values(values))
+        Ok(narou_rs::application::aliases::alias_map_from_values(
+            values,
+        ))
     })
     .unwrap_or_default();
     narou_rs::application::aliases::resolve_alias_target(&aliases, target)
@@ -146,7 +148,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
-        std::fs::write(temp.path().join(".narou").join("latest_convert.yaml"), "id: 0\n").unwrap();
+        std::fs::write(
+            temp.path().join(".narou").join("latest_convert.yaml"),
+            "id: 0\n",
+        )
+        .unwrap();
 
         assert_eq!(latest_convert_target().as_deref(), Some("0"));
     }
@@ -156,7 +162,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
-        std::fs::write(temp.path().join(".narou").join("alias.yaml"), "sample: n9669bk\n").unwrap();
+        std::fs::write(
+            temp.path().join(".narou").join("alias.yaml"),
+            "sample: n9669bk\n",
+        )
+        .unwrap();
 
         db::init_database().unwrap();
         db::with_database_mut(|db| {
@@ -172,7 +182,10 @@ mod tests {
 
         assert_eq!(resolve_target_to_id("0"), Some(0));
         assert_eq!(resolve_target_to_id("n9669bk"), Some(0));
-        assert_eq!(resolve_target_to_id("https://ncode.syosetu.com/n9669bk/"), Some(0));
+        assert_eq!(
+            resolve_target_to_id("https://ncode.syosetu.com/n9669bk/"),
+            Some(0)
+        );
         assert_eq!(resolve_target_to_id("sample"), Some(0));
     }
 }

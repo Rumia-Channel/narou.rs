@@ -252,11 +252,7 @@ impl NovelSettings {
         };
 
         settings = Self::apply_ini_defaults(&settings, &ini);
-        settings = Self::apply_force_and_default_settings(
-            &settings,
-            ignore_force,
-            ignore_default,
-        );
+        settings = Self::apply_force_and_default_settings(&settings, ignore_force, ignore_default);
 
         if settings.novel_title.is_empty() {
             settings.novel_title = source_name.to_string();
@@ -304,15 +300,13 @@ impl NovelSettings {
         let mut default_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
         let mut force_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
         for (key, value) in data {
-            if !ignore_default
-                && let Some(rest) = key.strip_prefix("default.") {
-                    default_settings.insert(rest, value);
-                    continue;
-                }
-            if !ignore_force
-                && let Some(rest) = key.strip_prefix("force.") {
-                    force_settings.insert(rest, value);
-                }
+            if !ignore_default && let Some(rest) = key.strip_prefix("default.") {
+                default_settings.insert(rest, value);
+                continue;
+            }
+            if !ignore_force && let Some(rest) = key.strip_prefix("force.") {
+                force_settings.insert(rest, value);
+            }
         }
         let defaults = NovelSettings::default();
         let original_defaults = Self::get_original_defaults(&defaults);
@@ -322,10 +316,11 @@ impl NovelSettings {
                 let ini_val = yaml_value_to_ini(force_settings[ini_key]);
                 Self::apply_single_setting(&mut s, ini_key, &ini_val);
             } else if s.has_default_setting(ini_key, default_val)
-                && let Some(val) = default_settings.get(ini_key) {
-                    let ini_val = yaml_value_to_ini(val);
-                    Self::apply_single_setting(&mut s, ini_key, &ini_val);
-                }
+                && let Some(val) = default_settings.get(ini_key)
+            {
+                let ini_val = yaml_value_to_ini(val);
+                Self::apply_single_setting(&mut s, ini_key, &ini_val);
+            }
         }
         s
     }
@@ -1153,10 +1148,20 @@ mod tests {
         std::fs::write(root.join(".narou").join("storage-backend"), "sqlite\n").unwrap();
 
         let mut map = crate::db::settings::SettingsMap::new();
-        map.insert("default.enable_yokogaki".into(), serde_yaml::Value::Bool(true));
-        map.insert("default.enable_illust".into(), serde_yaml::Value::Bool(false));
-        map.insert("default.enable_add_date_to_title".into(), serde_yaml::Value::Bool(true));
-        crate::db::settings::save_for_root(&root, crate::setting_core::SettingScope::Local, &map).unwrap();
+        map.insert(
+            "default.enable_yokogaki".into(),
+            serde_yaml::Value::Bool(true),
+        );
+        map.insert(
+            "default.enable_illust".into(),
+            serde_yaml::Value::Bool(false),
+        );
+        map.insert(
+            "default.enable_add_date_to_title".into(),
+            serde_yaml::Value::Bool(true),
+        );
+        crate::db::settings::save_for_root(&root, crate::setting_core::SettingScope::Local, &map)
+            .unwrap();
 
         // This stale file must not override settings saved to SQLite app_state.
         std::fs::write(
@@ -1173,10 +1178,17 @@ mod tests {
             assert!(settings.enable_add_date_to_title);
         }
 
-        map.insert("force.enable_yokogaki".into(), serde_yaml::Value::Bool(false));
+        map.insert(
+            "force.enable_yokogaki".into(),
+            serde_yaml::Value::Bool(false),
+        );
         map.insert("force.enable_illust".into(), serde_yaml::Value::Bool(true));
-        map.insert("force.enable_add_date_to_title".into(), serde_yaml::Value::Bool(false));
-        crate::db::settings::save_for_root(&root, crate::setting_core::SettingScope::Local, &map).unwrap();
+        map.insert(
+            "force.enable_add_date_to_title".into(),
+            serde_yaml::Value::Bool(false),
+        );
+        crate::db::settings::save_for_root(&root, crate::setting_core::SettingScope::Local, &map)
+            .unwrap();
 
         {
             let _guard = crate::test_support::set_current_dir_for_test(&archive_path);
@@ -1186,7 +1198,12 @@ mod tests {
             assert!(!forced.enable_add_date_to_title);
 
             let no_force = NovelSettings::load_for_novel_with_options(
-                1, "title", "author", &archive_path, true, false,
+                1,
+                "title",
+                "author",
+                &archive_path,
+                true,
+                false,
             );
             assert!(no_force.enable_yokogaki);
             assert!(!no_force.enable_illust);

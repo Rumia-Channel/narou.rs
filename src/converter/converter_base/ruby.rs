@@ -10,11 +10,9 @@ static RE_SESAME_RUBY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\u{FF5C}([^《\n]+?)《([・、]+)》").unwrap());
 static RE_GUILLEMET: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\u{226A}(.+?)\u{226B}").unwrap());
-static RE_PAREN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\u{FF08}(.+?)\u{FF09}").unwrap());
-static RE_RUBY_TEXT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[ぁ-んァ-ヶーゝゞ・]+[ 　]?[ぁ-んァ-ヶーゝゞ・]*$").unwrap()
-});
+static RE_PAREN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{FF08}(.+?)\u{FF09}").unwrap());
+static RE_RUBY_TEXT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[ぁ-んァ-ヶーゝゞ・]+[ 　]?[ぁ-んァ-ヶーゝゞ・]*$").unwrap());
 
 impl ConverterBase {
     pub(super) fn narou_ruby(&self, data: &mut String) {

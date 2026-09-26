@@ -140,10 +140,7 @@ impl PersistenceService {
     /// One `list_page` round trip (or one bounded directory walk on native)
     /// replaces a per-section `read_small`/`stat` probe. Callers that only
     /// need existence should prefer this over N individual reads.
-    pub async fn list_novel_object_names(
-        &self,
-        keys: &NovelObjectKeys,
-    ) -> Result<HashSet<String>> {
+    pub async fn list_novel_object_names(&self, keys: &NovelObjectKeys) -> Result<HashSet<String>> {
         let prefix = ObjectPrefix::from(keys.prefix().clone());
         let mut names = HashSet::new();
         let mut request = ObjectListRequest::new(prefix, NonZeroUsize::new(1000).unwrap());

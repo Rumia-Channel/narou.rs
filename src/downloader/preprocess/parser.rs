@@ -330,12 +330,12 @@ fn build_chain_parts<'a>(
 ) -> Vec<Method> {
     parts
         .map(|part| match part.as_rule() {
-            Rule::dot_access => Method::Field(
-                part.into_inner().next().unwrap().as_str().to_string(),
-            ),
-            Rule::bracket_access => Method::Bracket(build_bracket_key(
-                part.into_inner().next().unwrap(),
-            )),
+            Rule::dot_access => {
+                Method::Field(part.into_inner().next().unwrap().as_str().to_string())
+            }
+            Rule::bracket_access => {
+                Method::Bracket(build_bracket_key(part.into_inner().next().unwrap()))
+            }
             _ => build_method(part),
         })
         .collect()
@@ -391,11 +391,7 @@ fn build_method(pair: pest::iterators::Pair<Rule>) -> Method {
             let to = build_string_parts(parts[1].clone());
             if pattern_pair.as_rule() == Rule::regex {
                 let (pattern, flags) = build_regex(pattern_pair);
-                Method::GsubRegex {
-                    pattern,
-                    flags,
-                    to,
-                }
+                Method::GsubRegex { pattern, flags, to }
             } else {
                 Method::Gsub(build_string_parts(pattern_pair), to)
             }

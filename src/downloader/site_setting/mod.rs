@@ -176,7 +176,9 @@ pub struct SiteSetting {
 #[serde(untagged)]
 pub enum SiteUrlTemplate {
     Single(String),
-    ByTarget { by_target: Vec<SiteUrlTemplateEntry> },
+    ByTarget {
+        by_target: Vec<SiteUrlTemplateEntry>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,10 +315,7 @@ impl SiteSetting {
             match crate::downloader::preprocess::PreprocessPipeline::compile(src) {
                 Ok(pipeline) => self.compiled_preprocess = Some(pipeline),
                 Err(err) => {
-                    tracing::warn!(
-                        "preprocess compile failed for {}: {err}",
-                        self.name
-                    );
+                    tracing::warn!("preprocess compile failed for {}: {err}", self.name);
                 }
             }
         }
@@ -700,7 +699,6 @@ login_partial_pattern: ^login_partial::1$
         .unwrap();
         plain.compile();
         assert!(!plain.is_partial_login_view("login_partial::1"));
-
     }
 
     #[test]
@@ -812,9 +810,7 @@ toc_url: https://example.com/works/\\k<ncode>
         .unwrap();
         setting.compile();
 
-        assert!(setting.matches_series_url(
-            "https://example.com/users/author/collections/12345"
-        ));
+        assert!(setting.matches_series_url("https://example.com/users/author/collections/12345"));
         let pattern = setting.compile_series_item_pattern().unwrap();
         let caps = pattern
             .captures(r#"<a class="item" href="/works/67890">title</a>"#)
@@ -854,13 +850,11 @@ toc_url: https://example.com/works/\\k<ncode>
 
         let narou_pattern = narou.compile_series_item_pattern().unwrap();
         assert!(
-            narou_pattern
-                .is_match(r#"<a href="https://ncode.syosetu.com/n7826bd/">title</a>"#)
+            narou_pattern.is_match(r#"<a href="https://ncode.syosetu.com/n7826bd/">title</a>"#)
         );
         let novel18_pattern = novel18.compile_series_item_pattern().unwrap();
         assert!(
-            novel18_pattern
-                .is_match(r#"<a href="https://novel18.syosetu.com/n0001aa/">title</a>"#)
+            novel18_pattern.is_match(r#"<a href="https://novel18.syosetu.com/n0001aa/">title</a>"#)
         );
         assert!(novel18_pattern.is_match(r#"<a href="/n3412lp/">title</a>"#));
     }
@@ -869,8 +863,14 @@ toc_url: https://example.com/works/\\k<ncode>
     #[test]
     fn bundled_and_user_definitions_merge_by_name() {
         let bundled = [
-            ("example.com", "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Bundled\ntoc_url: https://example.com/\\k<url>\n"),
-            ("other.com", "name: Other\ndomain: other.com\ntop_url: https://other.com\nsitename: Other\ntoc_url: https://other.com/\\k<url>\n"),
+            (
+                "example.com",
+                "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Bundled\ntoc_url: https://example.com/\\k<url>\n",
+            ),
+            (
+                "other.com",
+                "name: Other\ndomain: other.com\ntop_url: https://other.com\nsitename: Other\ntoc_url: https://other.com/\\k<url>\n",
+            ),
         ];
         let user = vec![
             (
@@ -899,7 +899,10 @@ toc_url: https://example.com/works/\\k<ncode>
     /// 壊れたユーザー定義は黙って落とさず失敗させる (Worker は readiness で気付ける)。
     #[test]
     fn broken_user_definitions_fail_loudly() {
-        let bundled = [("example.com", "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Example\ntoc_url: https://example.com/\\k<url>\n")];
+        let bundled = [(
+            "example.com",
+            "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Example\ntoc_url: https://example.com/\\k<url>\n",
+        )];
         let user = vec![("broken.com".to_string(), "name: Broken\n".to_string())];
         assert!(SiteSetting::load_bundled_with_user(&bundled, &user).is_err());
     }

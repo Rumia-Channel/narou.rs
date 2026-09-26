@@ -50,8 +50,8 @@ impl LoggerState {
             return Self::disabled();
         };
 
-        let settings =
-            narou_rs::db::settings::load_for_root(&root_dir, SettingScope::Local).unwrap_or_default();
+        let settings = narou_rs::db::settings::load_for_root(&root_dir, SettingScope::Local)
+            .unwrap_or_default();
         let logging_enabled = yaml_bool(settings.get("logging"));
         let logging_enabled =
             logging_enabled && std::env::var("NAROU_ENV").ok().as_deref() != Some("test");
@@ -419,6 +419,11 @@ mod tests {
 
         let _ = fs::remove_dir_all(dir);
 
-        assert!(path.file_name().unwrap().to_string_lossy().contains("_convert"));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("_convert")
+        );
     }
 }

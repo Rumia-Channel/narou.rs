@@ -20,10 +20,11 @@ pub mod http;
 mod ledger;
 mod object_migration;
 mod rate_limiter;
-mod s3_object_store;
 mod scheduler;
+mod s3_object_store;
 mod site_rate_limiter;
 use subtle::ConstantTimeEq;
+use webui::{json_error, query_param};
 
 use serde_json::json;
 use worker::*;
@@ -820,21 +821,6 @@ async fn auth_failure(req: &Request, env: &Env) -> Option<worker::Result<Respons
             Some("NAROU_ADMIN_TOKEN is not set for this Worker"),
         )),
     }
-}
-
-/// 機械可読なエラー応答 (`{error: {code, message?}}`)。
-fn json_error(status: u16, code: &str, message: Option<&str>) -> worker::Result<Response> {
-    let payload = match message {
-        Some(message) => serde_json::json!({ "error": { "code": code, "message": message } }),
-        None => serde_json::json!({ "error": { "code": code } }),
-    };
-    Response::from_json(&payload).map(|response| response.with_status(status))
-}
-
-fn query_param(url: &worker::Url, name: &str) -> Option<String> {
-    url.query_pairs()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.into_owned())
 }
 
 #[event(scheduled)]

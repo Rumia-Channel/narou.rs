@@ -14,13 +14,13 @@
 use std::collections::BTreeMap;
 
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
 use crate::error::{NarouError, Result};
 use crate::platform::{
-    compress_object_payload, decompress_object_payload, object_crc32, verify_object_crc32,
-    ObjectEncoding,
+    ObjectEncoding, compress_object_payload, decompress_object_payload, object_crc32,
+    verify_object_crc32,
 };
 
 use super::sqlite_error;
@@ -74,12 +74,12 @@ pub fn load_body(conn: &Connection, hash: &[u8]) -> Result<Option<String>> {
         .map_err(|error| NarouError::Platform(format!("section body is not UTF-8: {error}")))
 }
 
+/// セクション本文の写し: `idx` → (`subtitle`, `body_yaml`)。working set
+/// (`novel_sections`) と version snapshot (`novel_version_sections`) で共通。
+pub type SectionMap = BTreeMap<String, (Option<String>, String)>;
+
 /// Store (or replace) the mirrored section set of one novel.
-pub fn store_sections(
-    conn: &mut Connection,
-    novel_id: i64,
-    sections: &BTreeMap<String, (Option<String>, String)>,
-) -> Result<()> {
+pub fn store_sections(conn: &mut Connection, novel_id: i64, sections: &SectionMap) -> Result<()> {
     // sections: idx -> (subtitle, body_yaml)
     let tx = conn.transaction().map_err(sqlite_error)?;
     tx.execute("DELETE FROM novel_sections WHERE novel_id = ?", [novel_id])
@@ -97,12 +97,11 @@ pub fn store_sections(
 
 /// Load the mirrored section set; `Ok(None)` when nothing is mirrored yet
 /// (caller falls back to the ObjectStore / lazy migration).
-pub fn load_sections(
-    conn: &Connection,
-    novel_id: i64,
-) -> Result<Option<BTreeMap<String, (Option<String>, String)>>> {
+pub fn load_sections(conn: &Connection, novel_id: i64) -> Result<Option<SectionMap>> {
     let mut statement = conn
-        .prepare("SELECT idx, subtitle, body_hash FROM novel_sections WHERE novel_id = ? ORDER BY idx")
+        .prepare(
+            "SELECT idx, subtitle, body_hash FROM novel_sections WHERE novel_id = ? ORDER BY idx",
+        )
         .map_err(sqlite_error)?;
     let rows = statement
         .query_map([novel_id], |row| {
@@ -115,8 +114,7 @@ pub fn load_sections(
         .map_err(sqlite_error)?;
     let mut map = BTreeMap::new();
     for row in rows {
-        let (idx, subtitle, hash) =
-            row.map_err(|error| NarouError::Platform(error.to_string()))?;
+        let (idx, subtitle, hash) = row.map_err(|error| NarouError::Platform(error.to_string()))?;
         let Some(hash) = hash else { continue };
         let Some(body) = load_body(conn, &hash)? else {
             continue;
@@ -161,8 +159,9 @@ pub fn load_output(conn: &Connection, novel_id: i64, kind: &str) -> Result<Optio
         .map_err(sqlite_error)?;
     match rows.next().map_err(sqlite_error)? {
         Some(row) => {
-            let payload: Vec<u8> =
-                row.get(0).map_err(|error| NarouError::Platform(error.to_string()))?;
+            let payload: Vec<u8> = row
+                .get(0)
+                .map_err(|error| NarouError::Platform(error.to_string()))?;
             let encoding: String = row
                 .get(1)
                 .map_err(|error| NarouError::Platform(error.to_string()))?;

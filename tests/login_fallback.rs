@@ -129,12 +129,14 @@ async fn login_fallback_retries_with_the_stored_cookie_and_flags_the_novel() {
     let assets: Arc<dyn AssetStore> = store;
     let repository = Arc::new(MemoryNovelRepository::new());
     let mut downloader = Downloader::with_platform_and_storage_and_settings(
-        http.clone(),
-        Arc::new(FakeRateLimiter::new()),
-        repository.clone(),
-        objects,
-        assets,
-        Arc::new(narou_rs::platform::SystemClock),
+        narou_rs::downloader::DownloaderPlatform {
+            http: http.clone(),
+            rate_limiter: Arc::new(FakeRateLimiter::new()),
+            novels: repository.clone(),
+            objects,
+            assets,
+            clock: Arc::new(narou_rs::platform::SystemClock),
+        },
         settings,
         Default::default(),
     )
@@ -155,7 +157,10 @@ async fn login_fallback_retries_with_the_stored_cookie_and_flags_the_novel() {
         .expect("the credential that worked is remembered by id");
     let stored = cookies.load_all("example.com").await.unwrap();
     assert_eq!(
-        stored.iter().filter(|credential| credential.id == session).count(),
+        stored
+            .iter()
+            .filter(|credential| credential.id == session)
+            .count(),
         1,
         "the recorded id must address the stored credential: {session}"
     );

@@ -31,35 +31,24 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-
+use narou_rs::application::webui::{
+    MAX_WEB_TAGS_PER_REQUEST, normalize_web_device_override,
+    sort_ids_from_records, sort_records, targets_to_strings, validate_web_tag_name,
+    validate_web_target_value,
+};
 use narou_rs::application::aliases::{alias_to_target_for_update, resolve_alias_target};
 use narou_rs::application::{JobKind, JobPlan, JobTarget};
-use narou_rs::db::{NovelRecord, compare_records_by_key, sort_keys};
+use narou_rs::db::NovelRecord;
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::downloader::{Downloader, TargetType};
 use narou_rs::platform::NovelId;
-use narou_rs::setting_core::SettingScope;
 use serde::Deserialize;
 use serde_json::json;
 use worker::{Env, Method, Request, Response, console_log};
 
 use crate::composition::WorkerRuntime;
 
-/// native `crate::web::MAX_WEB_TARGETS_PER_REQUEST` — `server-max-targets-
-/// per-request` 設定が無い/不正なときのフォールバック上限。
-const MAX_WEB_TARGETS_PER_REQUEST: usize = 100_000;
-/// native `crate::web::MAX_WEB_TARGET_LENGTH` (`validate_web_target_value`)。
-const MAX_WEB_TARGET_LENGTH: usize = 4096;
-/// native `crate::web::MAX_WEB_TAGS_PER_REQUEST` (`api_update_by_tag`)。
-const MAX_WEB_TAGS_PER_REQUEST: usize = 128;
-/// native `crate::web::MAX_WEB_TAG_LENGTH` (`validate_web_tag_name`)。
-const MAX_WEB_TAG_LENGTH: usize = 255;
-
-/// native `sort_state.rs` の既定ソート (current_sort 未保存時)。
-const DEFAULT_CURRENT_SORT_COLUMN: usize = 2;
-const DEFAULT_CURRENT_SORT_DIR: &str = "desc";
-/// native の `server_setting` 内キー名。Worker では global スコープの同名行。
-const CURRENT_SORT_KEY: &str = "current_sort";
+use super::{json_error, load_current_sort_state};
 
 /// native `UpdateBody` (`src/web/state.rs`) と同じ受理形。
 #[derive(Debug, Deserialize)]
@@ -175,17 +164,6 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     }
 }
 
-/// `lib.rs::json_error` と同じ JSON 形 (`{error: {code, message?}}`)。あちらは
-/// private なので形だけ合わせてここに持つ。HTTP 層のエラーにのみ使い、
-/// native が 200 で返す API 失敗には各種 `*_failure` ヘルパを使う。
-fn json_error(status: u16, code: &str, message: Option<&str>) -> worker::Result<Response> {
-    let payload = match message {
-        Some(message) => json!({ "error": { "code": code, "message": message } }),
-        None => json!({ "error": { "code": code } }),
-    };
-    Response::from_json(&payload).map(|response| response.with_status(status))
-}
-
 /// native `api_update` の失敗応答: HTTP 200 + `{success:false, message,
 /// count:0}`。
 fn update_failure(message: &str) -> worker::Result<Response> {
@@ -218,179 +196,13 @@ fn not_supported_on_worker(message: &str) -> worker::Result<Response> {
     .map(|response| response.with_status(501))
 }
 
-/// `super::max_web_targets_per_request` parity: 設定ポート経由で上限を解決。
-async fn max_targets(runtime: &WorkerRuntime) -> usize {
-    runtime
-        .services
-        .settings
-        .web_target_limit(MAX_WEB_TARGETS_PER_REQUEST)
-        .await
-}
-
-/// `src/web/mod.rs::validate_web_target_value` — エラー文字列も native の
-/// まま返す (api_update/api_convert はこの message をそのまま乗せる)。
-fn validate_web_target_value(value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("target is required".to_string());
-    }
-    if trimmed.len() > MAX_WEB_TARGET_LENGTH {
-        return Err("target is too long".to_string());
-    }
-    if trimmed.starts_with('-') {
-        return Err("invalid target".to_string());
-    }
-    if trimmed.chars().any(|ch| ch.is_control()) {
-        return Err("target contains invalid characters".to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
-/// `src/web/mod.rs::validate_web_tag_name` の写し。
-fn validate_web_tag_name(tag: &str) -> Result<String, String> {
-    let trimmed = tag.trim();
-    if trimmed.is_empty() {
-        return Err("tag is required".to_string());
-    }
-    if trimmed.starts_with('-') {
-        return Err("tag contains invalid characters".to_string());
-    }
-    if trimmed.len() > MAX_WEB_TAG_LENGTH {
-        return Err("tag is too long".to_string());
-    }
-    if trimmed.chars().any(|ch| ch.is_control()) {
-        return Err("target contains invalid characters".to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
-/// `src/web/mod.rs::normalize_web_device_override` の写し。
-fn normalize_web_device_override(value: Option<&str>) -> Result<Option<String>, String> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let normalized = value.to_ascii_lowercase();
-    match normalized.as_str() {
-        "text" | "kindle" | "kobo" | "epub" | "ibunko" | "reader" | "ibooks" => {
-            Ok(Some(normalized))
-        }
-        _ => Err("invalid device".to_string()),
-    }
-}
-
-/// native `targets_to_strings`: 数値・文字列・その他混在の JSON 値を
-/// 文字列ターゲットに変換する。
-fn targets_to_strings(targets: &[serde_json::Value]) -> Vec<String> {
-    targets
-        .iter()
-        .map(|value| match value {
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => s.clone(),
-            other => other.to_string(),
-        })
-        .collect()
-}
 
 // ---------------------------------------------------------------------------
 // sort_state (native `src/web/sort_state.rs` のサーバー側ソート)
-// `row_actions.rs` / `ui_prefs.rs` と同じ実装: リクエストの sort_state は
-// 常に無視し、global スコープの `current_sort` だけを真実源にする。
+// 型・正規化・比較は `narou_rs::application::webui` の共有実装を使う。
+// リクエストの sort_state は常に無視し、global スコープの `current_sort`
+// だけを真実源にする。
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CurrentSortState {
-    column: usize,
-    dir: String,
-}
-
-fn default_current_sort_state() -> CurrentSortState {
-    CurrentSortState {
-        column: DEFAULT_CURRENT_SORT_COLUMN,
-        dir: DEFAULT_CURRENT_SORT_DIR.to_string(),
-    }
-}
-
-/// native `normalize_current_sort_value` と同じ受理形式: `column`/`dir` キー
-/// (Ruby シンボル由来の `:column`/`:dir` も許容)、列は番号または数字文字列、
-/// 方向は `asc`/`desc` (先頭 `:` は剥がす)。
-fn normalize_current_sort_value(sort_state: &serde_yaml::Value) -> Option<CurrentSortState> {
-    let sort_state = sort_state.as_mapping()?;
-    let column = sort_state
-        .get(serde_yaml::Value::String("column".to_string()))
-        .or_else(|| sort_state.get(serde_yaml::Value::String(":column".to_string())))
-        .and_then(normalize_sort_column)?;
-    let dir = sort_state
-        .get(serde_yaml::Value::String("dir".to_string()))
-        .or_else(|| sort_state.get(serde_yaml::Value::String(":dir".to_string())))
-        .and_then(normalize_sort_dir)?;
-    Some(CurrentSortState { column, dir })
-}
-
-fn normalize_sort_column(value: &serde_yaml::Value) -> Option<usize> {
-    let column = match value {
-        serde_yaml::Value::Number(number) => number.as_u64().map(|value| value as usize)?,
-        serde_yaml::Value::String(text) if text.chars().all(|ch| ch.is_ascii_digit()) => {
-            text.parse::<usize>().ok()?
-        }
-        _ => return None,
-    };
-    sort_keys().get(column).map(|_| column)
-}
-
-fn normalize_sort_dir(value: &serde_yaml::Value) -> Option<String> {
-    let text = match value {
-        serde_yaml::Value::String(text) => text.as_str(),
-        _ => return None,
-    };
-    let text = text.trim_start_matches(':');
-    match text {
-        "asc" | "desc" => Some(text.to_string()),
-        _ => None,
-    }
-}
-
-/// native `load_current_sort_state`: `server_setting` (global) の
-/// `current_sort` キーを読み、無ければ既定値。Worker では global スコープの
-/// `current_sort` 行がその値そのもの (`webui::ui_prefs` の保存先と同じ)。
-async fn load_current_sort_state(runtime: &WorkerRuntime) -> CurrentSortState {
-    runtime
-        .services
-        .settings
-        .get_raw(SettingScope::Global, CURRENT_SORT_KEY)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| normalize_current_sort_value(&value))
-        .unwrap_or_else(default_current_sort_state)
-}
-
-/// native `sort_records` と同じ比較: 主キーが Equal のとき id で安定化し、
-/// `desc` なら反転する。
-fn sort_records(records: &mut [NovelRecord], sort_state: &CurrentSortState) {
-    let sort_key = sort_keys().get(sort_state.column).copied().unwrap_or("id");
-    let reverse = sort_state.dir == "desc";
-    records.sort_by(|a, b| {
-        let ordering = compare_records_by_key(a, b, sort_key).then_with(|| a.id.cmp(&b.id));
-        if reverse { ordering.reverse() } else { ordering }
-    });
-}
-
-/// native `sort_ids_from_records` の写し。選択 id を現在のサーバーソート順に
-/// 並べ直す。選択に無い id (= 存在しない行) は native 同様に捨てる。
-fn sort_ids_from_records(
-    ids: &[i64],
-    records: &[NovelRecord],
-    sort_state: &CurrentSortState,
-) -> Vec<i64> {
-    let selected: HashSet<i64> = ids.iter().copied().collect();
-    let mut records = records
-        .iter()
-        .filter(|record| selected.contains(&record.id))
-        .cloned()
-        .collect::<Vec<_>>();
-    sort_records(&mut records, sort_state);
-    records.into_iter().map(|record| record.id).collect()
-}
 
 /// native `sort_numeric_targets_for_state`: 全ターゲットが数値のときだけ
 /// サーバーソート順に並べ替える (1 つでも非数値があれば入力順のまま)。
@@ -627,7 +439,7 @@ async fn api_update(
     };
 
     let raw_targets = targets_to_strings(&body.targets);
-    let max_targets = max_targets(runtime).await;
+    let max_targets = super::max_web_targets(runtime).await;
     let targets = match normalize_update_targets(&raw_targets, max_targets) {
         Ok(targets) => targets,
         Err(message) => return update_failure(&message),
@@ -774,7 +586,7 @@ async fn api_convert(
         Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
     };
 
-    if body.targets.len() > max_targets(runtime).await {
+    if body.targets.len() > super::max_web_targets(runtime).await {
         return convert_failure("too many targets");
     }
     let targets: Vec<String> = match body

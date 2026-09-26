@@ -22,6 +22,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Duration, Instant};
 
+use crate::application::push_events;
 use super::AppState;
 
 const MAX_WS_CLIENTS: usize = 64;
@@ -204,28 +205,18 @@ impl PushServer {
     }
 
     pub fn broadcast(&self, event_type: &str, data: &str) {
-        self.publish_json(serde_json::json!({
-            "type": event_type,
-            "data": data,
-        }));
+        self.publish_json(push_events::event(event_type, data));
     }
 
     /// Send a control event (table.reload, queue_start, etc.) without polluting console history.
     pub fn broadcast_event(&self, event_type: &str, data: &str) {
-        self.publish_json(serde_json::json!({
-            "type": event_type,
-            "data": data,
-        }));
+        self.publish_json(push_events::event(event_type, data));
     }
 
     /// Send an echo event to stream subprocess output to the browser console.
     /// Matches Ruby's `{echo: {target_console: "stdout", body: "...", no_history: false}}`.
     pub fn broadcast_echo(&self, body: &str, target_console: &str) {
-        self.publish_json(serde_json::json!({
-            "type": "echo",
-            "body": body,
-            "target_console": target_console,
-        }));
+        self.publish_json(push_events::echo(body, target_console));
     }
 
     /// Send a pre-built JSON message directly (used by WebProgress interception in worker).
@@ -234,20 +225,11 @@ impl PushServer {
     }
 
     pub fn broadcast_progress(&self, current: usize, total: usize, message: &str) {
-        self.publish_json(serde_json::json!({
-            "type": "progress",
-            "current": current,
-            "total": total,
-            "message": message,
-        }));
+        self.publish_json(push_events::progress(current, total, message));
     }
 
     pub fn broadcast_log(&self, level: &str, message: &str) {
-        self.publish_json(serde_json::json!({
-            "type": "log",
-            "level": level,
-            "message": message,
-        }));
+        self.publish_json(push_events::log(level, message));
     }
 
     pub fn broadcast_error(&self, message: &str) {
@@ -259,11 +241,7 @@ impl PushServer {
     }
 
     pub fn broadcast_progressbar_init_to(&self, topic: &str, target_console: &str) {
-        self.publish_json(serde_json::json!({
-            "type": "progressbar.init",
-            "data": { "topic": topic },
-            "target_console": target_console,
-        }));
+        self.publish_json(push_events::progressbar_init(topic, target_console));
     }
 
     pub fn broadcast_progressbar_step(&self, percent: f64, topic: &str) {
@@ -271,11 +249,7 @@ impl PushServer {
     }
 
     pub fn broadcast_progressbar_step_to(&self, percent: f64, topic: &str, target_console: &str) {
-        self.publish_json(serde_json::json!({
-            "type": "progressbar.step",
-            "data": { "percent": percent, "topic": topic },
-            "target_console": target_console,
-        }));
+        self.publish_json(push_events::progressbar_step(percent, topic, target_console));
     }
 
     pub fn broadcast_progressbar_clear(&self, topic: &str) {
@@ -283,11 +257,7 @@ impl PushServer {
     }
 
     pub fn broadcast_progressbar_clear_to(&self, topic: &str, target_console: &str) {
-        self.publish_json(serde_json::json!({
-            "type": "progressbar.clear",
-            "data": { "topic": topic },
-            "target_console": target_console,
-        }));
+        self.publish_json(push_events::progressbar_clear(topic, target_console));
     }
 
     fn publish_json(&self, value: serde_json::Value) {

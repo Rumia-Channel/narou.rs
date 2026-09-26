@@ -46,13 +46,13 @@ use worker::{console_log, Env, Fetch, Headers, Method, Request, RequestInit, Res
 
 use crate::composition::WorkerRuntime;
 
-/// native `crate::web::MAX_WEB_TARGETS_PER_REQUEST` —
-/// `server-max-targets-per-request` 設定が無い/不正なときのフォールバック上限。
-const MAX_WEB_TARGETS_PER_REQUEST: usize = 100_000;
-/// native `crate::web::MAX_WEB_TARGET_LENGTH` (`validate_web_target_value`)。
-const MAX_WEB_TARGET_LENGTH: usize = 4096;
-/// native `crate::application::settings_view::MAX_WEB_TEXT_INPUT_BYTES`。
-const MAX_WEB_TEXT_INPUT_BYTES: usize = 1024 * 1024;
+use narou_rs::application::settings_view::MAX_WEB_TEXT_INPUT_BYTES;
+use narou_rs::application::webui::{
+    html_escape, tag_color_class, targets_to_strings, validate_web_target_value,
+};
+
+use super::{api_response, configured_tag_color, json_error, max_web_targets, query_param};
+
 /// native `SECTION_SAVE_DIR` (`本文`) — セクション/キャッシュが置かれる層。
 const SECTION_SAVE_DIR: &str = "本文";
 /// Worker が書く差分キャッシュ (`NovelObjectKeys::cached_section`) と
@@ -195,16 +195,6 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
 // shared helpers
 // ---------------------------------------------------------------------------
 
-/// `lib.rs::json_error` と同じ JSON 形 (`{error: {code, message?}}`)。
-/// あちらは private なので形だけ合わせてここに持つ。
-fn json_error(status: u16, code: &str, message: Option<&str>) -> worker::Result<Response> {
-    let payload = match message {
-        Some(message) => json!({ "error": { "code": code, "message": message } }),
-        None => json!({ "error": { "code": code } }),
-    };
-    Response::from_json(&payload).map(|response| response.with_status(status))
-}
-
 /// native `map_application_error` (`src/web/novels.rs`) と同じステータス割当。
 fn map_application_error(error: ApplicationError) -> worker::Result<Response> {
     let (status, code, message) = match error {
@@ -215,99 +205,9 @@ fn map_application_error(error: ApplicationError) -> worker::Result<Response> {
     json_error(status, code, Some(&message))
 }
 
-/// native `ApiResponse` と同じ形 (`{success, message}`)。
-fn api_response(success: bool, message: impl Into<String>) -> serde_json::Value {
-    json!({
-        "success": success,
-        "message": message.into(),
-    })
-}
-
 /// native `ApiResponse` を JSON ボディとして返す (ステータスは native 同様 200)。
 fn api_json_response(success: bool, message: impl Into<String>) -> worker::Result<Response> {
     Response::from_json(&api_response(success, message))
-}
-
-fn query_param(url: &worker::Url, name: &str) -> Option<String> {
-    url.query_pairs()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.into_owned())
-}
-
-/// native `src/web/misc.rs::html_escape` / `tag_color_class` の写し。
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-fn tag_color_class(color: &str) -> &'static str {
-    match color {
-        "green" => "tag-green",
-        "yellow" => "tag-yellow",
-        "blue" => "tag-blue",
-        "magenta" => "tag-magenta",
-        "cyan" => "tag-cyan",
-        "red" => "tag-red",
-        "white" => "tag-white",
-        _ => "tag-default",
-    }
-}
-
-/// `webui/queue.rs` と同じく `webui.new-tag-color` 設定を読み、
-/// 小文字化 + 有効色チェックを通す (native `configured_tag_color`)。
-async fn configured_tag_color(runtime: &WorkerRuntime) -> Option<String> {
-    runtime
-        .services
-        .settings
-        .get(narou_rs::application::tag_colors::NEW_TAG_COLOR_SETTING)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| narou_rs::application::tag_colors::is_valid_tag_color(value))
-}
-
-/// native `validate_web_target_value` (`src/web/mod.rs`) の写し。
-fn validate_web_target_value(value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("target is required".to_string());
-    }
-    if trimmed.len() > MAX_WEB_TARGET_LENGTH {
-        return Err("target is too long".to_string());
-    }
-    if trimmed.starts_with('-') {
-        return Err("invalid target".to_string());
-    }
-    if trimmed.chars().any(|ch| ch.is_control()) {
-        return Err("target contains invalid characters".to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
-/// native `targets_to_strings` (`src/web/jobs.rs`) の写し。
-fn targets_to_strings(targets: &[serde_json::Value]) -> Vec<String> {
-    targets
-        .iter()
-        .map(|v| match v {
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => s.clone(),
-            other => other.to_string(),
-        })
-        .collect()
-}
-
-/// native `max_web_targets_per_request` (`src/web/mod.rs`) 相当。
-async fn max_web_targets(runtime: &WorkerRuntime) -> usize {
-    runtime
-        .services
-        .settings
-        .web_target_limit(MAX_WEB_TARGETS_PER_REQUEST)
-        .await
 }
 
 // ---------------------------------------------------------------------------

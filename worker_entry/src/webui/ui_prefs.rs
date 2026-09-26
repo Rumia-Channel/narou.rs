@@ -11,12 +11,14 @@
 //!   ツアー定義テーブルと seen/disabled 設定キーは native と同じ。
 //!   ストレージ移行プロンプトは `not(native-runtime)` 側の固定値を返す。
 
-use narou_rs::db::sort_keys;
+use narou_rs::application::webui::{CURRENT_SORT_KEY, normalize_current_sort_request};
 use narou_rs::setting_core::SettingScope;
 use serde::Serialize;
 use worker::{Env, Method, Request, Response, console_log};
 
 use crate::composition::WorkerRuntime;
+
+use super::{api_response, json_error, load_current_sort_state};
 
 /// 親がこの 1 ハンドラを 3 ルートへ割り当てる。パスとメソッドで振り分ける。
 pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
@@ -74,24 +76,6 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         Route::FeatureTourSeen => feature_tour_seen(&mut req, &runtime).await,
         Route::FeatureTourConfig => feature_tour_config(&mut req, &runtime).await,
     }
-}
-
-/// `lib.rs::json_error` と同じ JSON 形 (`{error: {code, message?}}`)。あちらは
-/// private なので形だけ合わせてここに持つ。
-fn json_error(status: u16, code: &str, message: Option<&str>) -> worker::Result<Response> {
-    let payload = match message {
-        Some(message) => serde_json::json!({ "error": { "code": code, "message": message } }),
-        None => serde_json::json!({ "error": { "code": code } }),
-    };
-    Response::from_json(&payload).map(|response| response.with_status(status))
-}
-
-/// native `ApiResponse` と同じ形 (`{success, message}`)。
-fn api_response(success: bool, message: impl Into<String>) -> serde_json::Value {
-    serde_json::json!({
-        "success": success,
-        "message": message.into(),
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -153,105 +137,11 @@ async fn webui_config(req: &Request, runtime: &WorkerRuntime) -> worker::Result<
 //                             保存形式: src/web/sort_state.rs)
 // ---------------------------------------------------------------------------
 
-const DEFAULT_CURRENT_SORT_COLUMN: usize = 2;
-const DEFAULT_CURRENT_SORT_DIR: &str = "desc";
-/// native の `server_setting` 内キー名。
-const CURRENT_SORT_KEY: &str = "current_sort";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CurrentSortState {
-    column: usize,
-    dir: String,
-}
-
-impl CurrentSortState {
-    fn to_json_value(&self) -> serde_json::Value {
-        serde_json::json!({
-            "column": self.column,
-            "dir": self.dir,
-        })
-    }
-
-    /// native `CurrentSortState::to_yaml_value` と同じ形。
-    fn to_yaml_value(&self) -> serde_yaml::Value {
-        let mut mapping = serde_yaml::Mapping::new();
-        mapping.insert(
-            serde_yaml::Value::String("column".to_string()),
-            serde_yaml::to_value(self.column).expect("serialize sort column"),
-        );
-        mapping.insert(
-            serde_yaml::Value::String("dir".to_string()),
-            serde_yaml::Value::String(self.dir.clone()),
-        );
-        serde_yaml::Value::Mapping(mapping)
-    }
-}
-
-fn default_current_sort_state() -> CurrentSortState {
-    CurrentSortState {
-        column: DEFAULT_CURRENT_SORT_COLUMN,
-        dir: DEFAULT_CURRENT_SORT_DIR.to_string(),
-    }
-}
-
-/// native `normalize_current_sort_value` と同じ受理形式: `column`/`dir` キー
-/// (Ruby シンボル由来の `:column`/`:dir` も許容)、列は番号または数字文字列、
-/// 方向は `asc`/`desc` (先頭 `:` は剥がす)。
-fn normalize_current_sort_value(sort_state: &serde_yaml::Value) -> Option<CurrentSortState> {
-    let sort_state = sort_state.as_mapping()?;
-    let column = sort_state
-        .get(serde_yaml::Value::String("column".to_string()))
-        .or_else(|| sort_state.get(serde_yaml::Value::String(":column".to_string())))
-        .and_then(normalize_sort_column)?;
-    let dir = sort_state
-        .get(serde_yaml::Value::String("dir".to_string()))
-        .or_else(|| sort_state.get(serde_yaml::Value::String(":dir".to_string())))
-        .and_then(normalize_sort_dir)?;
-    Some(CurrentSortState { column, dir })
-}
-
-fn normalize_sort_column(value: &serde_yaml::Value) -> Option<usize> {
-    let column = match value {
-        serde_yaml::Value::Number(number) => number.as_u64().map(|value| value as usize)?,
-        serde_yaml::Value::String(text) if text.chars().all(|ch| ch.is_ascii_digit()) => {
-            text.parse::<usize>().ok()?
-        }
-        _ => return None,
-    };
-    sort_keys().get(column).map(|_| column)
-}
-
-fn normalize_sort_dir(value: &serde_yaml::Value) -> Option<String> {
-    let text = match value {
-        serde_yaml::Value::String(text) => text.as_str(),
-        _ => return None,
-    };
-    let text = text.trim_start_matches(':');
-    match text {
-        "asc" | "desc" => Some(text.to_string()),
-        _ => None,
-    }
-}
-
-/// native `normalize_current_sort_request` と同じく、リクエスト JSON 本体を
-/// そのままソート状態として正規化する。
-fn normalize_current_sort_request(body: &serde_json::Value) -> Option<CurrentSortState> {
-    let value = serde_yaml::to_value(body).ok()?;
-    normalize_current_sort_value(&value)
-}
-
 async fn get_sort_state(runtime: &WorkerRuntime) -> worker::Result<Response> {
     // native は `server_setting` (global) の `current_sort` キーを読む。
-    // Worker では global スコープの `current_sort` 行がその値そのもの。
-    let sort_state = runtime
-        .services
-        .settings
-        .get_raw(SettingScope::Global, CURRENT_SORT_KEY)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| normalize_current_sort_value(&value))
-        .unwrap_or_else(default_current_sort_state);
+    // Worker では global スコープの `current_sort` 行がその値そのもの
+    // (共有の `super::load_current_sort_state` がそのまま読む)。
+    let sort_state = load_current_sort_state(runtime).await;
     Response::from_json(&sort_state.to_json_value())
 }
 

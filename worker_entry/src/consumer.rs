@@ -29,21 +29,11 @@ use worker::{console_log, Env, Message, MessageBatch, MessageExt, QueueRetryOpti
 use crate::composition::WorkerRuntime;
 use crate::executor::{execute_job, JobOutcome};
 use narou_rs::application::messages;
+use narou_rs::application::retry_policy::{self, RetryPolicy};
 
 use crate::push_hub::{
     broadcast_terminal_events, echo, event, notification_queue, PushHubClient,
 };
-
-/// Bounded retry budget: after this many retryable attempts a job is
-/// durably failed as `permanent`. There is no blanket retry-to-success.
-pub const MAX_RETRYABLE_ATTEMPTS: u32 = 3;
-
-/// Backoff for attempt `n` (1-based): 5s, 10s, 20s, capped at 60s.
-fn retry_delay_secs(attempt: u32) -> u32 {
-    5u32
-        .saturating_mul(2u32.pow(attempt.saturating_sub(1)))
-        .min(60)
-}
 
 /// Queue consumer におけるイベント配信。ジョブの台帳が変わるたびに
 /// (reject / 再キュー追加) キュー表示を更新させる。
@@ -311,7 +301,14 @@ async fn process_discrete(
         }
         JobOutcome::Retryable { reason } => {
             match settle_retryable(runtime, &job_id, &execution_token, &reason).await? {
-                RetryDisposition::Rescheduled { attempts, delay } => {
+                RetryDisposition::Rescheduled {
+                    attempts,
+                    max_retries,
+                    backoff_secs,
+                } => {
+                    // Cloudflare Queues の遅延は秒整数なのでイベント値を
+                    // u32 にクランプして渡す (スケジュール値は非負)。
+                    let delay = backoff_secs.min(i64::from(u32::MAX)) as u32;
                     let options = QueueRetryOptionsBuilder::new()
                         .with_delay_seconds(delay)
                         .build();
@@ -323,10 +320,10 @@ async fn process_discrete(
                             json!({
                                 "job_id": job_id.as_str(),
                                 "retry_count": attempts,
-                                "max_retries": MAX_RETRYABLE_ATTEMPTS,
-                                "backoff_secs": delay,
+                                "max_retries": max_retries,
+                                "backoff_secs": backoff_secs,
                                 "available_at": (js_sys::Date::now() / 1000.0) as i64
-                                    + i64::from(delay),
+                                    + backoff_secs,
                                 "reason": first_non_empty_line(&reason),
                             }),
                         )],
@@ -407,7 +404,11 @@ async fn webui_debug_mode(runtime: &WorkerRuntime) -> bool {
 /// メッセージの ack/retry は呼び出し側がイベント送信のあとに行う
 /// (イベントを先に流さないと UI が再試行の前にキューを見逃す)。
 enum RetryDisposition {
-    Rescheduled { attempts: u32, delay: u32 },
+    Rescheduled {
+        attempts: u32,
+        max_retries: u32,
+        backoff_secs: i64,
+    },
     Exhausted,
 }
 
@@ -421,7 +422,27 @@ async fn settle_retryable(
         .ledger
         .record_attempt(job_id, execution_token, reason)
         .await?;
-    if attempts >= MAX_RETRYABLE_ATTEMPTS {
+    // リトライ方針は native と同じ local 設定から組み立てる
+    // (`queue.max-retries` / `queue.retry-backoff`)。読み取り失敗は既定値に
+    // 倒す — native の設定読み取り失敗と同じ扱い。
+    let values = runtime
+        .services
+        .settings
+        .get_many(&[
+            retry_policy::MAX_RETRIES_KEY,
+            retry_policy::RETRY_BACKOFF_KEY,
+        ])
+        .await
+        .unwrap_or_default();
+    let policy = RetryPolicy::resolve(
+        values.first().and_then(Option::as_ref),
+        values.get(1).and_then(Option::as_ref),
+    );
+    // 台帳の `attempts` は失敗ごとに後置インクリメントされるので、今回の
+    // 失敗までに完了した再キュー数 (= native `retry_count`) は
+    // `attempts - 1`。native `retry_count < max_retries` と同じ上限判定。
+    let retry_count = attempts.saturating_sub(1);
+    if !policy.can_retry(retry_count) {
         let exhausted = format!("retries exhausted after {attempts} attempts: {reason}");
         runtime
             .ledger
@@ -435,11 +456,15 @@ async fn settle_retryable(
         console_log!("job {job_id} permanently failed: {exhausted}");
         Ok(RetryDisposition::Exhausted)
     } else {
-        let delay = retry_delay_secs(attempts);
+        let backoff_secs = policy.backoff_secs(retry_count);
         console_log!(
-            "job {job_id} retryable (attempt {attempts}), re-queueing in {delay}s: {reason}"
+            "job {job_id} retryable (attempt {attempts}), re-queueing in {backoff_secs}s: {reason}"
         );
-        Ok(RetryDisposition::Rescheduled { attempts, delay })
+        Ok(RetryDisposition::Rescheduled {
+            attempts,
+            max_retries: policy.max_retries,
+            backoff_secs,
+        })
     }
 }
 
@@ -449,15 +474,7 @@ fn worker_error(error: impl std::fmt::Display) -> NarouError {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobOutcome, MAX_RETRYABLE_ATTEMPTS, retry_delay_secs};
-
-    #[test]
-    fn retry_backoff_is_one_based_and_bounded() {
-        assert_eq!(retry_delay_secs(1), 5);
-        assert_eq!(retry_delay_secs(2), 10);
-        assert_eq!(retry_delay_secs(MAX_RETRYABLE_ATTEMPTS), 20);
-        assert_eq!(retry_delay_secs(20), 60);
-    }
+    use super::JobOutcome;
 
     #[test]
     fn four_budget_yields_do_not_consume_failure_attempts() {

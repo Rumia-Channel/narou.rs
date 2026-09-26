@@ -146,9 +146,8 @@ impl RateLimiter {
 
         host_state.counter += 1;
         host_state.last_download = Some(allowed_at);
-        host_state.next_allowed = Some(
-            allowed_at + self.delay_after_request(host_state.counter, wait_steps, interval),
-        );
+        host_state.next_allowed =
+            Some(allowed_at + self.delay_after_request(host_state.counter, wait_steps, interval));
 
         allowed_at.checked_duration_since(now).unwrap_or_default()
     }
@@ -269,14 +268,20 @@ mod tests {
     fn interval_lower_than_zero_is_clamped() {
         let limiter = RateLimiter::from_values(-1.0, 0);
         assert_eq!(limiter.interval, std::time::Duration::from_secs(0));
-        assert_eq!(limiter.max_steps_wait_time, std::time::Duration::from_secs(5));
+        assert_eq!(
+            limiter.max_steps_wait_time,
+            std::time::Duration::from_secs(5)
+        );
     }
 
     #[test]
     fn default_interval_uses_ruby_compatible_value() {
         let limiter = RateLimiter::from_values(DEFAULT_INTERVAL_SECS, 0);
         assert_eq!(limiter.interval, std::time::Duration::from_millis(700));
-        assert_eq!(limiter.max_steps_wait_time, std::time::Duration::from_secs(5));
+        assert_eq!(
+            limiter.max_steps_wait_time,
+            std::time::Duration::from_secs(5)
+        );
     }
 
     #[test]
@@ -309,8 +314,16 @@ mod tests {
             .collect::<Vec<_>>();
         elapsed.sort();
 
-        assert!(elapsed[0] >= Duration::from_millis(60), "first wait was {:?}", elapsed[0]);
-        assert!(elapsed[1] >= Duration::from_millis(140), "second wait was {:?}", elapsed[1]);
+        assert!(
+            elapsed[0] >= Duration::from_millis(60),
+            "first wait was {:?}",
+            elapsed[0]
+        );
+        assert!(
+            elapsed[1] >= Duration::from_millis(140),
+            "second wait was {:?}",
+            elapsed[1]
+        );
 
         reset_state();
     }
@@ -340,7 +353,11 @@ mod tests {
         limiter.wait_for_host("beta.example");
         let elapsed = started.elapsed();
 
-        assert!(elapsed < Duration::from_millis(40), "different host waited {:?}", elapsed);
+        assert!(
+            elapsed < Duration::from_millis(40),
+            "different host waited {:?}",
+            elapsed
+        );
 
         sleeping_worker.join().expect("worker should finish");
         reset_state();

@@ -6,9 +6,9 @@ use crate::platform::{HttpClient, PlatformFuture, ProgressReporter, RateLimiter}
 use super::html::{delete_ruby_tag, slim_subtitle};
 use super::http_policy;
 use super::novel_info::NovelInfo;
+use super::preprocess::PreprocessJobs;
 use super::site_setting::SiteSetting;
 use super::types::SubtitleInfo;
-use super::preprocess::PreprocessJobs;
 use super::util::{
     load_length_limit, pretreatment_source_with_jobs, sanitize_filename,
     sanitize_filename_with_limit,
@@ -30,16 +30,16 @@ pub async fn fetch_toc(
         Some(setting.encoding()),
     )
     .await?;
-    pretreatment_source_with_jobs(
+    pretreatment_source_with_jobs(super::util::PretreatmentRequest {
         http,
         rate_limiter,
-        &policy,
-        &mut body,
-        setting.encoding(),
-        Some(setting),
+        policy: &policy,
+        src: &mut body,
+        encoding: setting.encoding(),
+        setting: Some(setting),
         jobs,
-        toc_url,
-    )
+        url: toc_url,
+    })
     .await?;
 
     if let Some(re) = setting.compiled_error_message_pattern()
@@ -140,41 +140,30 @@ pub fn parse_subtitles(
     Ok(subtitles)
 }
 
+/// Inputs shared by every page of a multipage TOC walk: the first page's
+/// source and captures plus the platform handles used to fetch follow-ups.
+pub struct MultipageTocRequest<'a> {
+    pub http: &'a dyn HttpClient,
+    pub rate_limiter: &'a dyn RateLimiter,
+    pub setting: &'a SiteSetting,
+    pub toc_source: &'a str,
+    pub url_captures: &'a HashMap<String, String>,
+    pub title: &'a str,
+    pub progress: Option<&'a dyn ProgressReporter>,
+    pub jobs: &'a mut PreprocessJobs,
+}
+
 pub async fn parse_subtitles_multipage(
-    http: &dyn HttpClient,
-    rate_limiter: &dyn RateLimiter,
-    setting: &SiteSetting,
-    toc_source: &str,
-    url_captures: &HashMap<String, String>,
-    title: &str,
-    progress: Option<&dyn ProgressReporter>,
-    jobs: &mut PreprocessJobs,
+    request: MultipageTocRequest<'_>,
 ) -> Result<(Vec<SubtitleInfo>, bool)> {
-    parse_subtitles_multipage_with(
-        http,
-        rate_limiter,
-        setting,
-        toc_source,
-        url_captures,
-        title,
-        progress,
-        jobs,
-        |http, rate_limiter, setting, url, jobs| {
-            Box::pin(async move { fetch_toc(http, rate_limiter, setting, &url, jobs).await })
-        },
-    )
+    parse_subtitles_multipage_with(request, |http, rate_limiter, setting, url, jobs| {
+        Box::pin(async move { fetch_toc(http, rate_limiter, setting, &url, jobs).await })
+    })
     .await
 }
 
 fn parse_subtitles_multipage_with<'a, F>(
-    http: &'a dyn HttpClient,
-    rate_limiter: &'a dyn RateLimiter,
-    setting: &'a SiteSetting,
-    toc_source: &'a str,
-    url_captures: &'a HashMap<String, String>,
-    title: &'a str,
-    progress: Option<&'a dyn ProgressReporter>,
-    jobs: &'a mut PreprocessJobs,
+    request: MultipageTocRequest<'a>,
     mut fetch_next_toc: F,
 ) -> PlatformFuture<'a, Result<(Vec<SubtitleInfo>, bool)>>
 where
@@ -189,6 +178,16 @@ where
         + 'a,
 {
     Box::pin(async move {
+        let MultipageTocRequest {
+            http,
+            rate_limiter,
+            setting,
+            toc_source,
+            url_captures,
+            title,
+            progress,
+            jobs,
+        } = request;
         let mut all_subtitles = Vec::new();
         // 本文一覧のページが「未ログインで欠けている」と報告したか。
         let mut partial_listing = false;
@@ -205,12 +204,11 @@ where
             50
         };
         let show_progress = max_pages >= 5 && !title.is_empty();
-        if show_progress
-            && let Some(progress) = progress {
-                progress.set_position(0);
-                progress.set_length(max_pages as u64);
-                progress.set_message(&format!("目次 {}", title));
-            }
+        if show_progress && let Some(progress) = progress {
+            progress.set_position(0);
+            progress.set_length(max_pages as u64);
+            progress.set_message(&format!("目次 {}", title));
+        }
 
         loop {
             if setting.is_partial_login_view(&current_toc_source) {
@@ -220,10 +218,9 @@ where
             all_subtitles.extend(page_subs);
 
             page += 1;
-            if show_progress
-                && let Some(progress) = progress {
-                    progress.inc(1);
-                }
+            if show_progress && let Some(progress) = progress {
+                progress.inc(1);
+            }
             if page >= max_pages {
                 break;
             }
@@ -255,10 +252,9 @@ where
                 fetch_next_toc(http, rate_limiter, setting, next_url, &mut *jobs).await?;
         }
 
-        if show_progress
-            && let Some(progress) = progress {
-                progress.set_position(0);
-            }
+        if show_progress && let Some(progress) = progress {
+            progress.set_position(0);
+        }
 
         Ok((all_subtitles, partial_listing))
     })
@@ -296,7 +292,10 @@ pub fn create_short_story_subtitles(
         file_subtitle: match load_length_limit("filename-length-limit", Some(50)) {
             Some(limit) => {
                 let reserved = "1".chars().count() + 1;
-                sanitize_filename_with_limit(&title_for_filename, Some(limit.saturating_sub(reserved)))
+                sanitize_filename_with_limit(
+                    &title_for_filename,
+                    Some(limit.saturating_sub(reserved)),
+                )
             }
             None => sanitize_filename(&title_for_filename),
         },
@@ -366,18 +365,19 @@ mod tests {
         let rate_limiter = FakeRateLimiter::new();
         let progress = MockProgress::default();
 
-        let subtitles = futures::executor::block_on(parse_subtitles_multipage(
-            &http,
-            &rate_limiter,
-            setting,
-            toc_source,
-            &HashMap::new(),
-            "テスト作品",
-            Some(&progress),
-            &mut PreprocessJobs::new(),
-        ))
-        .unwrap()
-        .0;
+        let subtitles =
+            futures::executor::block_on(parse_subtitles_multipage(MultipageTocRequest {
+                http: &http,
+                rate_limiter: &rate_limiter,
+                setting,
+                toc_source,
+                url_captures: &HashMap::new(),
+                title: "テスト作品",
+                progress: Some(&progress),
+                jobs: &mut PreprocessJobs::new(),
+            }))
+            .unwrap()
+            .0;
 
         assert!(subtitles.is_empty() || subtitles.len() == 1);
         assert_eq!(*progress.lengths.lock().unwrap(), vec![5]);
@@ -411,14 +411,16 @@ mod tests {
         let rate_limiter = FakeRateLimiter::new();
 
         let (subtitles, partial) = futures::executor::block_on(parse_subtitles_multipage_with(
-            &http,
-            &rate_limiter,
-            setting,
-            first_page,
-            &HashMap::new(),
-            "",
-            None,
-            &mut PreprocessJobs::new(),
+            MultipageTocRequest {
+                http: &http,
+                rate_limiter: &rate_limiter,
+                setting,
+                toc_source: first_page,
+                url_captures: &HashMap::new(),
+                title: "",
+                progress: None,
+                jobs: &mut PreprocessJobs::new(),
+            },
             {
                 let page = second_page.to_string();
                 move |_, _, _, _, _| {
@@ -469,14 +471,16 @@ mod tests {
         let fetched_urls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let subtitles = futures::executor::block_on(parse_subtitles_multipage_with(
-            &http,
-            &rate_limiter,
-            setting,
-            first_page,
-            &HashMap::new(),
-            "",
-            None,
-            &mut PreprocessJobs::new(),
+            MultipageTocRequest {
+                http: &http,
+                rate_limiter: &rate_limiter,
+                setting,
+                toc_source: first_page,
+                url_captures: &HashMap::new(),
+                title: "",
+                progress: None,
+                jobs: &mut PreprocessJobs::new(),
+            },
             {
                 let fetched_urls = std::sync::Arc::clone(&fetched_urls);
                 move |_, _, _, next_url, _| {
@@ -512,7 +516,10 @@ mod tests {
         assert_eq!(subtitles.len(), 2);
         assert_eq!(subtitles[0].chapter, "ゼンヒ巡査部長編");
         assert_eq!(subtitles[0].index, "313728");
-        assert_eq!(subtitles[0].subtitle, "プロローグ:新任巡査部長、扇皇 ゼンヒ");
+        assert_eq!(
+            subtitles[0].subtitle,
+            "プロローグ:新任巡査部長、扇皇 ゼンヒ"
+        );
         assert_eq!(
             subtitles[0].href,
             "/stories/view/313728/novel_id~31149".to_string()
@@ -552,14 +559,16 @@ mod tests {
         let fetched_urls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let subtitles = futures::executor::block_on(parse_subtitles_multipage_with(
-            &http,
-            &rate_limiter,
-            setting,
-            first_page,
-            &HashMap::new(),
-            "",
-            None,
-            &mut PreprocessJobs::new(),
+            MultipageTocRequest {
+                http: &http,
+                rate_limiter: &rate_limiter,
+                setting,
+                toc_source: first_page,
+                url_captures: &HashMap::new(),
+                title: "",
+                progress: None,
+                jobs: &mut PreprocessJobs::new(),
+            },
             {
                 let fetched_urls = std::sync::Arc::clone(&fetched_urls);
                 move |_, _, _, next_url, _| {
@@ -642,10 +651,7 @@ mod tests {
     #[test]
     fn hameln_episode_list_parses_ruby_titles() {
         let settings = SiteSetting::load_all().unwrap();
-        let setting = settings
-            .iter()
-            .find(|s| s.domain == "syosetu.org")
-            .unwrap();
+        let setting = settings.iter().find(|s| s.domain == "syosetu.org").unwrap();
         let r18_url = "https://h.syosetu.org/novel/420138/";
         assert!(setting.matches_url(r18_url));
         assert_eq!(
@@ -679,7 +685,10 @@ mod tests {
         let subtitles = parse_subtitles(setting, toc_source, &HashMap::new()).unwrap();
 
         assert_eq!(subtitles.len(), 2);
-        assert_eq!(subtitles[0].chapter, "『<ruby><rb>双花魔人譚</rb><rp>(</rp><rt>モンストルム・オラトリア</rt><rp>)</rp></ruby>』編");
+        assert_eq!(
+            subtitles[0].chapter,
+            "『<ruby><rb>双花魔人譚</rb><rp>(</rp><rt>モンストルム・オラトリア</rt><rp>)</rp></ruby>』編"
+        );
         assert_eq!(subtitles[0].subtitle, "〖神々の給仕(ゴッズプライド)〗");
         assert_eq!(subtitles[0].file_subtitle, "〖神々の給仕(ゴッズプライド)〗");
         assert_eq!(subtitles[0].subdate, "2023/06/04 11:14");

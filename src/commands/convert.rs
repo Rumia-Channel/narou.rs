@@ -9,29 +9,49 @@ use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
 use narou_rs::db::inventory::Inventory;
 use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
+use narou_rs::termcolor::bold_colored;
 use regex::Regex;
 use zip::write::SimpleFileOptions;
-use narou_rs::termcolor::bold_colored;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use super::resolve_target_to_id;
 
-pub fn cmd_convert(
-    targets: &[String],
-    output: Option<&str>,
-    encoding: Option<&str>,
-    no_epub: bool,
-    no_mobi: bool,
-    no_strip: bool,
-    no_zip: bool,
-    make_zip: bool,
-    inspect: bool,
-    no_open: bool,
-    verbose: bool,
-    ignore_default: bool,
-    ignore_force: bool,
-    sink: &dyn MessageSink,
-) {
+/// Shared switches and IO handles for one `narou convert` run.
+#[derive(Clone, Copy)]
+pub struct ConvertOptions<'a> {
+    pub targets: &'a [String],
+    pub output: Option<&'a str>,
+    pub encoding: Option<&'a str>,
+    pub no_epub: bool,
+    pub no_mobi: bool,
+    pub no_strip: bool,
+    pub no_zip: bool,
+    pub make_zip: bool,
+    pub inspect: bool,
+    pub no_open: bool,
+    pub verbose: bool,
+    pub ignore_default: bool,
+    pub ignore_force: bool,
+    pub sink: &'a dyn MessageSink,
+}
+
+pub fn cmd_convert(options: ConvertOptions<'_>) {
+    let ConvertOptions {
+        targets,
+        output,
+        encoding,
+        no_epub,
+        no_mobi,
+        no_strip,
+        no_zip,
+        make_zip,
+        inspect,
+        no_open,
+        verbose,
+        ignore_default,
+        ignore_force,
+        sink,
+    } = options;
     if let Err(e) = narou_rs::db::init_database() {
         sink.emit(Stream::Stderr, &messages::init_db_error(e));
         std::process::exit(1);
@@ -57,21 +77,31 @@ pub fn cmd_convert(
     for selected_device in selected_devices {
         let output_device = effective_convert_device(selected_device, no_epub, no_mobi, no_zip);
         let copy_device = effective_copy_device(selected_device, output_device);
-        let create_ibunko_side_epub =
-            matches!(selected_device, Some(narou_rs::converter::device::Device::Ibunko))
-                && !no_epub
-                && matches!(output_device, Some(narou_rs::converter::device::Device::Ibunko));
+        let create_ibunko_side_epub = matches!(
+            selected_device,
+            Some(narou_rs::converter::device::Device::Ibunko)
+        ) && !no_epub
+            && matches!(
+                output_device,
+                Some(narou_rs::converter::device::Device::Ibunko)
+            );
 
         if let Some(device) = selected_device {
             sink.emit(
                 Stream::Stdout,
-                &bold_colored(&messages::convert::converting_for(device.display_name()), "magenta"),
+                &bold_colored(
+                    &messages::convert::converting_for(device.display_name()),
+                    "magenta",
+                ),
             );
         }
 
         let total_count = targets.len();
         let mut completed_count = 0usize;
-        sink.emit(Stream::Stdout, &messages::convert::convert_started(total_count));
+        sink.emit(
+            Stream::Stdout,
+            &messages::convert::convert_started(total_count),
+        );
 
         for (index, target) in targets.iter().enumerate() {
             if index > 0 {
@@ -95,11 +125,11 @@ pub fn cmd_convert(
 
             let target_path = Path::new(target);
             if target_path.is_file() {
-                convert_text_target(
+                convert_text_target(TextConvertContext {
                     target,
                     target_path,
-                    output_filename.as_deref(),
-                    encoding.as_deref(),
+                    output_filename: output_filename.as_deref(),
+                    encoding: encoding.as_deref(),
                     inspect,
                     ignore_default,
                     ignore_force,
@@ -109,9 +139,9 @@ pub fn cmd_convert(
                     create_ibunko_side_epub,
                     no_strip,
                     verbose,
-                    &mut first_output_dir,
+                    first_output_dir: &mut first_output_dir,
                     sink,
-                );
+                });
                 continue;
             }
 
@@ -141,8 +171,11 @@ pub fn cmd_convert(
                     continue;
                 }
             };
-            let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-                .unwrap_or_else(|_| std::path::PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR));
+            let archive_root =
+                narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+                    .unwrap_or_else(|_| {
+                        std::path::PathBuf::from(narou_rs::downloader::ARCHIVE_ROOT_DIR)
+                    });
             let (novel_dir, title, author) = (
                 narou_rs::db::existing_novel_dir_for_record(&archive_root, &record),
                 record.title.clone(),
@@ -152,7 +185,10 @@ pub fn cmd_convert(
             let progress: Box<dyn narou_rs::progress::ProgressReporter> = if is_web_mode() {
                 Box::new(WebProgress::new("convert"))
             } else {
-                Box::new(CliProgress::with_multi(&format!("Convert {}", title), multi_clone.clone()))
+                Box::new(CliProgress::with_multi(
+                    &format!("Convert {}", title),
+                    multi_clone.clone(),
+                ))
             };
 
             let mut settings = NovelSettings::load_for_novel_with_options(
@@ -173,7 +209,7 @@ pub fn cmd_convert(
                     NovelConverter::with_user_converter(settings, user_converter)
                 } else {
                     NovelConverter::new(settings)
-            };
+                };
             converter.set_progress(progress);
             converter.set_display_inspector(inspect);
 
@@ -206,8 +242,12 @@ pub fn cmd_convert(
                                     dc_subjects.as_deref(),
                                     sink,
                                 );
-                                if let Some(fname) = epub_path.file_name().and_then(|n| n.to_str()) {
-                                    sink.emit(Stream::Stdout, &messages::convert::output_written(fname));
+                                if let Some(fname) = epub_path.file_name().and_then(|n| n.to_str())
+                                {
+                                    sink.emit(
+                                        Stream::Stdout,
+                                        &messages::convert::output_written(fname),
+                                    );
                                 }
                                 sink.emit(
                                     Stream::Stdout,
@@ -221,7 +261,9 @@ pub fn cmd_convert(
                         }
                     }
                     let output_lower = output_path.to_ascii_lowercase();
-                    if let Some(fname) = Path::new(&output_path).file_name().and_then(|n| n.to_str()) {
+                    if let Some(fname) =
+                        Path::new(&output_path).file_name().and_then(|n| n.to_str())
+                    {
                         sink.emit(Stream::Stdout, &messages::convert::output_written(fname));
                     }
                     if output_lower.ends_with(".mobi") || output_lower.ends_with(".azw3") {
@@ -229,7 +271,9 @@ pub fn cmd_convert(
                             Stream::Stdout,
                             &bold_colored(messages::convert::mobi_written(), "green"),
                         );
-                    } else if output_lower.ends_with(".epub") || output_lower.ends_with(".kepub.epub") {
+                    } else if output_lower.ends_with(".epub")
+                        || output_lower.ends_with(".kepub.epub")
+                    {
                         sink.emit(
                             Stream::Stdout,
                             &bold_colored(messages::convert::epub_written(), "green"),
@@ -240,21 +284,19 @@ pub fn cmd_convert(
                             .parent()
                             .map(|path| path.to_path_buf());
                     }
-                    if let Err(err) =
-                        print_copy_to_result(&output_path, copy_device, id, sink)
-                    {
+                    if let Err(err) = print_copy_to_result(&output_path, copy_device, id, sink) {
                         sink.emit(Stream::Stdout, &err);
                     }
                     if output_path.to_ascii_lowercase().ends_with(".zip")
-                        && let Err(err) = print_copy_zip_to_result(&output_path, sink) {
-                            sink.emit(Stream::Stdout, &err);
-                        }
+                        && let Err(err) = print_copy_zip_to_result(&output_path, sink)
+                    {
+                        sink.emit(Stream::Stdout, &err);
+                    }
                     if let Some(device) = copy_device
-                        && let Err(err) =
-                            print_send_result(&output_path, device)
-                        {
-                            sink.emit(Stream::Stdout, &err);
-                        }
+                        && let Err(err) = print_send_result(&output_path, device)
+                    {
+                        sink.emit(Stream::Stdout, &err);
+                    }
                     apply_dc_subjects_if_needed(
                         Path::new(&output_path),
                         dc_subjects.as_deref(),
@@ -284,17 +326,22 @@ pub fn cmd_convert(
 
     drop(multi);
 
-    if !no_open && !narou_rs::compat::load_local_setting_bool("convert.no-open")
-        && let Some(dir) = first_output_dir {
-            narou_rs::compat::open_directory(&dir, Some("小説の保存フォルダを開きますか"));
-        }
+    if !no_open
+        && !narou_rs::compat::load_local_setting_bool("convert.no-open")
+        && let Some(dir) = first_output_dir
+    {
+        narou_rs::compat::open_directory(&dir, Some("小説の保存フォルダを開きますか"));
+    }
 }
 
-fn convert_text_target(
-    target: &str,
-    target_path: &Path,
-    output_filename: Option<&str>,
-    encoding: Option<&str>,
+/// Everything [`convert_text_target`] needs for one text-file conversion:
+/// per-target naming plus the run-wide device/flag plan computed once per
+/// selected device in [`cmd_convert`].
+struct TextConvertContext<'a> {
+    target: &'a str,
+    target_path: &'a Path,
+    output_filename: Option<&'a str>,
+    encoding: Option<&'a str>,
     inspect: bool,
     ignore_default: bool,
     ignore_force: bool,
@@ -304,9 +351,28 @@ fn convert_text_target(
     create_ibunko_side_epub: bool,
     no_strip: bool,
     verbose: bool,
-    first_output_dir: &mut Option<PathBuf>,
-    sink: &dyn MessageSink,
-) {
+    first_output_dir: &'a mut Option<PathBuf>,
+    sink: &'a dyn MessageSink,
+}
+
+fn convert_text_target(ctx: TextConvertContext<'_>) {
+    let TextConvertContext {
+        target,
+        target_path,
+        output_filename,
+        encoding,
+        inspect,
+        ignore_default,
+        ignore_force,
+        selected_device,
+        output_device,
+        copy_device,
+        create_ibunko_side_epub,
+        no_strip,
+        verbose,
+        first_output_dir,
+        sink,
+    } = ctx;
     let text = match read_text_file(target_path, encoding) {
         Ok(text) => text,
         Err(message) => {
@@ -374,18 +440,18 @@ fn convert_text_target(
             }
             let output_lower = output_path.to_ascii_lowercase();
             if let Some(fname) = Path::new(&output_path).file_name().and_then(|n| n.to_str()) {
-                        sink.emit(Stream::Stdout, &messages::convert::output_written(fname));
+                sink.emit(Stream::Stdout, &messages::convert::output_written(fname));
             }
             if output_lower.ends_with(".mobi") || output_lower.ends_with(".azw3") {
-                        sink.emit(
-                            Stream::Stdout,
-                            &bold_colored(messages::convert::mobi_written(), "green"),
-                        );
+                sink.emit(
+                    Stream::Stdout,
+                    &bold_colored(messages::convert::mobi_written(), "green"),
+                );
             } else if output_lower.ends_with(".epub") || output_lower.ends_with(".kepub.epub") {
-                        sink.emit(
-                            Stream::Stdout,
-                            &bold_colored(messages::convert::epub_written(), "green"),
-                        );
+                sink.emit(
+                    Stream::Stdout,
+                    &bold_colored(messages::convert::epub_written(), "green"),
+                );
             }
             if first_output_dir.is_none() {
                 *first_output_dir = Path::new(&output_path)
@@ -396,13 +462,15 @@ fn convert_text_target(
                 sink.emit(Stream::Stdout, &err);
             }
             if output_path.to_ascii_lowercase().ends_with(".zip")
-                && let Err(err) = print_copy_zip_to_result(&output_path, sink) {
-                    sink.emit(Stream::Stdout, &err);
-                }
+                && let Err(err) = print_copy_zip_to_result(&output_path, sink)
+            {
+                sink.emit(Stream::Stdout, &err);
+            }
             if let Some(device) = copy_device
-                && let Err(err) = print_send_result(&output_path, device) {
-                    sink.emit(Stream::Stdout, &err);
-                }
+                && let Err(err) = print_send_result(&output_path, device)
+            {
+                sink.emit(Stream::Stdout, &err);
+            }
             print_inspection_output(&mut converter, sink);
         }
         Err(e) => {
@@ -472,9 +540,10 @@ fn resolve_selected_devices(
         return Err(());
     }
 
-    if let Some(index) = devices.iter().position(|device| {
-        matches!(device, Some(narou_rs::converter::device::Device::Mobi))
-    }) {
+    if let Some(index) = devices
+        .iter()
+        .position(|device| matches!(device, Some(narou_rs::converter::device::Device::Mobi)))
+    {
         let kindle = devices.remove(index);
         devices.insert(0, kindle);
     }
@@ -499,9 +568,7 @@ fn parse_device_name(name: &str) -> Option<narou_rs::converter::device::Device> 
     }
 }
 
-fn parse_web_worker_device_name(
-    name: &str,
-) -> Option<Option<narou_rs::converter::device::Device>> {
+fn parse_web_worker_device_name(name: &str) -> Option<Option<narou_rs::converter::device::Device>> {
     if name.trim().eq_ignore_ascii_case("text") {
         Some(None)
     } else {
@@ -553,9 +620,7 @@ fn create_ibunko_epub_output(
     if !txt_path.exists() {
         return Ok(None);
     }
-    let output_dir = txt_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let output_dir = txt_path.parent().unwrap_or_else(|| Path::new("."));
     let base_name = txt_path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -597,7 +662,8 @@ fn load_dc_subjects_for_novel(novel_id: i64) -> std::result::Result<Option<Vec<S
 }
 
 fn load_dc_subject_exclude_tags() -> std::result::Result<Vec<String>, String> {
-    if let Some(raw) = narou_rs::compat::load_local_setting_string("convert.dc-subject-exclude-tags")
+    if let Some(raw) =
+        narou_rs::compat::load_local_setting_string("convert.dc-subject-exclude-tags")
     {
         return Ok(raw
             .split(',')
@@ -644,7 +710,10 @@ fn apply_dc_subjects_if_needed(
 
     match add_dc_subject_to_epub(output_path, subjects) {
         Ok(()) => {
-            sink.emit(Stream::Stdout, &messages::convert::dc_subject_added(subjects.join(", ")));
+            sink.emit(
+                Stream::Stdout,
+                &messages::convert::dc_subject_added(subjects.join(", ")),
+            );
         }
         Err(err) => {
             sink.emit(Stream::Stdout, &messages::convert::dc_subject_error(err));
@@ -668,8 +737,8 @@ fn add_dc_subject_to_epub(
         return Ok(());
     }
 
-    let mut archive =
-        ZipArchive::new(File::open(epub_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let mut archive = ZipArchive::new(File::open(epub_path).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
     let mut entries = Vec::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
@@ -686,8 +755,8 @@ fn add_dc_subject_to_epub(
     };
 
     let mut content = String::from_utf8(entries[opf_index].1.clone()).map_err(|e| e.to_string())?;
-    let subject_re = Regex::new(r"(?ms)<dc:subject>.*?</dc:subject>\s*\n?\s*")
-        .map_err(|e| e.to_string())?;
+    let subject_re =
+        Regex::new(r"(?ms)<dc:subject>.*?</dc:subject>\s*\n?\s*").map_err(|e| e.to_string())?;
     content = subject_re.replace_all(&content, "").into_owned();
 
     let subject_lines: Vec<String> = subjects
@@ -702,7 +771,10 @@ fn add_dc_subject_to_epub(
             return Err(messages::convert::metadata_close_missing().to_string());
         }
         content = metadata_re
-            .replace(&content, format!("\n{}\n$1</metadata>", subject_lines.join("\n")))
+            .replace(
+                &content,
+                format!("\n{}\n$1</metadata>", subject_lines.join("\n")),
+            )
             .into_owned();
     }
     entries[opf_index].1 = content.into_bytes();
@@ -721,8 +793,7 @@ fn add_dc_subject_to_epub(
     {
         let file = File::create(&temp_path).map_err(|e| e.to_string())?;
         let mut writer = ZipWriter::new(file);
-        let stored =
-            SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
         writer
             .start_file("mimetype", stored)
             .map_err(|e| e.to_string())?;
@@ -804,8 +875,7 @@ fn print_copy_zip_to_result(
     output_path: &str,
     sink: &dyn MessageSink,
 ) -> std::result::Result<(), String> {
-    let Some(copy_to_dir) =
-        narou_rs::compat::load_local_setting_string("convert.copy-zip-to")
+    let Some(copy_to_dir) = narou_rs::compat::load_local_setting_string("convert.copy-zip-to")
     else {
         return Ok(());
     };
@@ -819,7 +889,10 @@ fn print_copy_zip_to_result(
             .ok_or_else(|| messages::convert::invalid_zip_filename().to_string())?,
     );
     std::fs::copy(output_path, &dst).map_err(|e| e.to_string())?;
-    sink.emit(Stream::Stdout, &messages::convert::zip_copied_to(dst.display()));
+    sink.emit(
+        Stream::Stdout,
+        &messages::convert::zip_copied_to(dst.display()),
+    );
     Ok(())
 }
 
@@ -879,7 +952,7 @@ fn resolve_text_file_encoding(label: &str) -> Option<&'static Encoding> {
 }
 
 fn read_text_file(path: &Path, encoding: Option<&str>) -> std::result::Result<String, String> {
-    let bytes = std::fs::read(path).map_err(|e| messages::indented_error(e))?;
+    let bytes = std::fs::read(path).map_err(messages::indented_error)?;
     let decoded = match encoding {
         Some(label) => decode_text_file_with_encoding(&bytes, label, path)?,
         None => decode_text_file_as_utf8(&bytes)?,
@@ -889,8 +962,7 @@ fn read_text_file(path: &Path, encoding: Option<&str>) -> std::result::Result<St
 
 fn decode_text_file_as_utf8(bytes: &[u8]) -> std::result::Result<String, String> {
     let bytes = strip_utf8_bom(bytes);
-    String::from_utf8(bytes.to_vec())
-        .map_err(|_| messages::convert::text_not_utf8().to_string())
+    String::from_utf8(bytes.to_vec()).map_err(|_| messages::convert::text_not_utf8().to_string())
 }
 
 fn decode_text_file_with_encoding(

@@ -12,6 +12,8 @@
 
 use worker::{Env, Method, Request, Response};
 
+use super::json_error;
+
 /// Entry point; `lib.rs` が担当ルートをここへ振る。
 pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
     if let Some(response) = crate::auth_failure(&req, &env).await {
@@ -101,15 +103,6 @@ pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
         ) => json_error(405, "method_not_allowed", None),
         _ => json_error(404, "not_found", Some("route is not handled by this Worker")),
     }
-}
-
-/// `lib.rs::json_error` と同形の `{error: {code, message?}}` 応答。
-fn json_error(status: u16, code: &str, message: Option<&str>) -> worker::Result<Response> {
-    let payload = match message {
-        Some(message) => serde_json::json!({ "error": { "code": code, "message": message } }),
-        None => serde_json::json!({ "error": { "code": code } }),
-    };
-    Response::from_json(&payload).map(|response| response.with_status(status))
 }
 
 /// 501 + `not_supported_on_worker`。§3.3 の「明示的に拒否する」要件。

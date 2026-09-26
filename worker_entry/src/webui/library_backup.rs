@@ -70,14 +70,12 @@ async fn running_backups(env: &Env) -> worker::Result<i64> {
 
 /// `POST /api/library_backup` — zip をローカル FS へ書けないので常に 501。
 ///
-/// `worker_entry/src/lib.rs` の `json_error` と同じ形
+/// `worker_entry::webui::json_error` の形
 /// (`{"error": {"code": ..., "message": ...}}`) で返す。
 fn not_supported() -> worker::Result<Response> {
-    let payload = serde_json::json!({
-        "error": {
-            "code": "library_backup_not_supported",
-            "message": "library backup writes a zip to the local filesystem, which does not exist on the worker; run it from the native UI or narou_rs_backup",
-        },
-    });
-    Response::from_json(&payload).map(|response| response.with_status(501))
+    super::json_error(
+        501,
+        "library_backup_not_supported",
+        Some("library backup writes a zip to the local filesystem, which does not exist on the worker; run it from the native UI or narou_rs_backup"),
+    )
 }

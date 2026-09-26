@@ -34,7 +34,6 @@ use self::novel_info::NovelInfo;
 use self::persistence::section_filename;
 use self::persistence::{PersistenceService, compute_section_hash};
 
-use crate::platform::{CookieStore, LoginCredential};
 use self::section::{SectionCache, download_section};
 use self::security::is_safe_public_url_syntax;
 use self::settings::DownloaderSettings;
@@ -46,13 +45,14 @@ use self::util::{
     build_section_url, compile_html_pattern, load_length_limit, mask_spoiler_text,
     sanitize_filename_with_limit,
 };
-use crate::db::novel_record::NovelRecord;
 use crate::application::messages;
+use crate::db::novel_record::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::platform::{
     AssetStore, Clock, HttpClient, NovelMutation, NovelObjectKeys, NovelRepository, ObjectStore,
     ProgressReporter, RateLimiter,
 };
+use crate::platform::{CookieStore, LoginCredential};
 
 pub use self::types::{
     ARCHIVE_ROOT_DIR, DownloadResult, NarouApiEntry, NarouApiResult, RAW_DATA_DIR,
@@ -82,6 +82,43 @@ pub struct DownloadExecutionOptions<'a> {
     pub force: bool,
     pub budget: Option<&'a mut dyn SectionBudget>,
     pub resume_from_section: Option<usize>,
+}
+
+/// Platform services every [`Downloader`] constructor needs. Bundles the
+/// injected ports so the constructors take them as one argument.
+pub struct DownloaderPlatform {
+    pub http: Arc<dyn HttpClient>,
+    pub rate_limiter: Arc<dyn RateLimiter>,
+    pub novels: Arc<dyn NovelRepository>,
+    pub objects: Arc<dyn ObjectStore>,
+    pub assets: Arc<dyn AssetStore>,
+    pub clock: Arc<dyn Clock>,
+}
+
+/// What [`Downloader::process_digest`] needs to drive the interactive digest
+/// prompt: the shrunk TOC counts plus the handles its actions touch.
+struct DigestContext<'a> {
+    existing_id: Option<i64>,
+    toc_url: &'a str,
+    novel_dir: &'a Path,
+    title: &'a str,
+    latest_story: &'a str,
+    old_count: usize,
+    latest_count: usize,
+}
+
+/// One [`Downloader::section_needs_download`] probe: the latest and stored
+/// subtitle rows plus the cache/state handles the decision consults.
+struct SectionDecision<'a> {
+    setting: &'a SiteSetting,
+    latest: &'a SubtitleInfo,
+    old: Option<&'a SubtitleInfo>,
+    existing_id: Option<i64>,
+    keys: &'a NovelObjectKeys,
+    toc_url: &'a str,
+    strong_update: bool,
+    timezone: SiteTimezone,
+    existed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -120,7 +157,6 @@ impl SiteTimezone {
             }
         }
     }
-
 }
 
 pub struct Downloader {
@@ -511,10 +547,7 @@ pub const DEFAULT_USER_AGENT: &str =
 
 /// Resolve the CLI/saved user-agent, randomizing the value for `auto`/
 /// `random`. `ua_generator` は native ビルドでのみ使う。
-pub fn resolve_user_agent(
-    user_agent: Option<&str>,
-    saved_user_agent: Option<String>,
-) -> String {
+pub fn resolve_user_agent(user_agent: Option<&str>, saved_user_agent: Option<String>) -> String {
     let is_auto = |ua: &str| {
         let trimmed = ua.trim();
         trimmed.is_empty()
@@ -661,49 +694,23 @@ impl Downloader {
 
     /// [`Self::with_platform_and_storage_and_settings`] with bundled values.
     #[cfg(feature = "native-runtime")]
-    pub fn with_platform_and_storage(
-        http: Arc<dyn HttpClient>,
-        rate_limiter: Arc<dyn RateLimiter>,
-        novels: Arc<dyn NovelRepository>,
-        objects: Arc<dyn ObjectStore>,
-        assets: Arc<dyn AssetStore>,
-        clock: Arc<dyn Clock>,
-    ) -> Result<Self> {
+    pub fn with_platform_and_storage(platform: DownloaderPlatform) -> Result<Self> {
         let site_settings = crate::downloader::site_setting::effective_site_settings();
         let settings = crate::downloader::settings::default_settings();
         let section_hash_cache = settings.load_section_hash_cache();
-        Self::with_platform_and_storage_and_settings(
-            http,
-            rate_limiter,
-            novels,
-            objects,
-            assets,
-            clock,
-            site_settings,
-            section_hash_cache,
-        )
+        Self::with_platform_and_storage_and_settings(platform, site_settings, section_hash_cache)
     }
 
     /// Build the downloader without loading site definitions or Inventory.
     ///
     /// Worker callers and filesystem-free tests supply both values explicitly.
     pub fn with_platform_and_storage_and_settings(
-        http: Arc<dyn HttpClient>,
-        rate_limiter: Arc<dyn RateLimiter>,
-        novels: Arc<dyn NovelRepository>,
-        objects: Arc<dyn ObjectStore>,
-        assets: Arc<dyn AssetStore>,
-        clock: Arc<dyn Clock>,
+        platform: DownloaderPlatform,
         site_settings: Vec<SiteSetting>,
         section_hash_cache: HashMap<String, HashMap<String, String>>,
     ) -> Result<Self> {
         Self::with_platform_and_storage_and_settings_and_support(
-            http,
-            rate_limiter,
-            novels,
-            objects,
-            assets,
-            clock,
+            platform,
             site_settings,
             section_hash_cache,
             crate::downloader::settings::default_settings(),
@@ -715,16 +722,19 @@ impl Downloader {
     /// shorter constructor). Worker callers can supply bundled settings here
     /// without any filesystem access.
     pub fn with_platform_and_storage_and_settings_and_support(
-        http: Arc<dyn HttpClient>,
-        rate_limiter: Arc<dyn RateLimiter>,
-        novels: Arc<dyn NovelRepository>,
-        objects: Arc<dyn ObjectStore>,
-        assets: Arc<dyn AssetStore>,
-        clock: Arc<dyn Clock>,
+        platform: DownloaderPlatform,
         site_settings: Vec<SiteSetting>,
         section_hash_cache: HashMap<String, HashMap<String, String>>,
         settings: Arc<dyn DownloaderSettings>,
     ) -> Result<Self> {
+        let DownloaderPlatform {
+            http,
+            rate_limiter,
+            novels,
+            objects,
+            assets,
+            clock,
+        } = platform;
         let persistence =
             PersistenceService::with_clock(objects.clone(), assets.clone(), clock.clone());
 
@@ -841,16 +851,16 @@ impl Downloader {
                 create_short_story_subtitles(&setting, &toc_source, &info).ok()
             } else {
                 let title = info.title.as_deref().unwrap_or("");
-                parse_subtitles_multipage(
-                    self.http.as_ref(),
-                    self.rate_limiter.as_ref(),
-                    &setting,
-                    &toc_source,
-                    &url_captures,
+                parse_subtitles_multipage(toc::MultipageTocRequest {
+                    http: self.http.as_ref(),
+                    rate_limiter: self.rate_limiter.as_ref(),
+                    setting: &setting,
+                    toc_source: &toc_source,
+                    url_captures: &url_captures,
                     title,
-                    self.progress.as_deref(),
-                    &mut self.preprocess_jobs,
-                )
+                    progress: self.progress.as_deref(),
+                    jobs: &mut self.preprocess_jobs,
+                })
                 .await
                 .ok()
                 .map(|(subtitles, _partial)| subtitles)
@@ -878,16 +888,16 @@ impl Downloader {
         Ok((novelupdated_at, general_lastup, info.length, is_end))
     }
 
-    async fn process_digest(
-        &self,
-        existing_id: Option<i64>,
-        toc_url: &str,
-        novel_dir: &Path,
-        title: &str,
-        latest_story: &str,
-        old_count: usize,
-        latest_count: usize,
-    ) -> Result<bool> {
+    async fn process_digest(&self, digest: DigestContext<'_>) -> Result<bool> {
+        let DigestContext {
+            existing_id,
+            toc_url,
+            novel_dir,
+            title,
+            latest_story,
+            old_count,
+            latest_count,
+        } = digest;
         #[cfg(feature = "native-runtime")]
         {
             if latest_count >= old_count {
@@ -1037,9 +1047,9 @@ impl Downloader {
                             ) {
                                 Some(Ok(apng)) => (apng, "image/png".to_string()),
                                 Some(Err(err)) => {
-                                    self.report_warn(
-                                        &messages::download::warn_animation_assemble(url, err),
-                                    );
+                                    self.report_warn(&messages::download::warn_animation_assemble(
+                                        url, err,
+                                    ));
                                     (response.body.clone(), content_type)
                                 }
                                 None => (response.body.clone(), content_type),
@@ -1055,15 +1065,11 @@ impl Downloader {
                             .store_bytes(object_keys, illustration_store, url, &body, ext)
                             .await
                         {
-                            self.report_warn(
-                                &messages::download::warn_illustration_save(url, err),
-                            );
+                            self.report_warn(&messages::download::warn_illustration_save(url, err));
                         }
                     }
                     Err(err) => {
-                        self.report_warn(
-                            &messages::download::warn_illustration_download(url, err),
-                        );
+                        self.report_warn(&messages::download::warn_illustration_download(url, err));
                     }
                 }
             }
@@ -1133,7 +1139,8 @@ impl Downloader {
         target: &str,
         force: bool,
     ) -> Result<DownloadResult> {
-        self.download_novel_with_force_budget(target, force, None).await
+        self.download_novel_with_force_budget(target, force, None)
+            .await
     }
 
     /// Download a novel while yielding only before a new section starts.
@@ -1244,8 +1251,7 @@ impl Downloader {
             .await
             {
                 Ok((final_url, _body)) if final_url != toc_url => {
-                    let final_url =
-                        Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
+                    let final_url = Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
                     if let Some(final_setting) = self.find_site_setting(&final_url) {
                         setting = final_setting;
                         (
@@ -1283,9 +1289,8 @@ impl Downloader {
             // The redirect probe already fetched the final URL with the same
             // cookie scope; reuse the body instead of a second GET.
             Some(response) => {
-                let response = crate::downloader::http_policy::ensure_success_response(
-                    &toc_url, response,
-                );
+                let response =
+                    crate::downloader::http_policy::ensure_success_response(&toc_url, response);
                 match response {
                     Ok(response) => {
                         let mut body = crate::downloader::http_policy::decode_with_encoding(
@@ -1298,36 +1303,38 @@ impl Downloader {
                         let policy =
                             crate::downloader::http_policy::FetchPolicy::for_site(&setting);
                         crate::downloader::util::pretreatment_source_with_jobs(
-                            self.http.as_ref(),
-                            self.rate_limiter.as_ref(),
-                            &policy,
-                            &mut body,
-                            setting.encoding(),
-                            Some(&setting),
-                            &mut self.preprocess_jobs,
-                            &toc_url,
+                            crate::downloader::util::PretreatmentRequest {
+                                http: self.http.as_ref(),
+                                rate_limiter: self.rate_limiter.as_ref(),
+                                policy: &policy,
+                                src: &mut body,
+                                encoding: setting.encoding(),
+                                setting: Some(&setting),
+                                jobs: &mut self.preprocess_jobs,
+                                url: &toc_url,
+                            },
                         )
                         .await?;
                         if let Some(re) = setting.compiled_error_message_pattern()
                             && re.is_match(&body)
                         {
-                            return Err(NarouError::NotFound(
-                                "Novel deleted or private".into(),
-                            ));
+                            return Err(NarouError::NotFound("Novel deleted or private".into()));
                         }
                         Ok(body)
                     }
                     Err(error) => Err(error),
                 }
             }
-            None => fetch_toc(
-                self.http.as_ref(),
-                self.rate_limiter.as_ref(),
-                &setting,
-                &toc_url,
-                &mut self.preprocess_jobs,
-            )
-            .await,
+            None => {
+                fetch_toc(
+                    self.http.as_ref(),
+                    self.rate_limiter.as_ref(),
+                    &setting,
+                    &toc_url,
+                    &mut self.preprocess_jobs,
+                )
+                .await
+            }
         };
         // Login fallback: retry once with the stored cookie before treating the
         // novel as deleted. Nothing is sent when no cookie is stored, so sites
@@ -1507,9 +1514,9 @@ impl Downloader {
         let previous_novel_dir = existing_record.as_ref().map(|record| {
             crate::db::existing_novel_dir_for_record(Path::new(types::ARCHIVE_ROOT_DIR), record)
         });
-        let strip_title_prefix = self
-            .settings
-            .strip_title_prefix_for(provisional_id, &raw_title, &author);
+        let strip_title_prefix =
+            self.settings
+                .strip_title_prefix_for(provisional_id, &raw_title, &author);
         let track_raw_title = strip_title_prefix
             || existing_record
                 .as_ref()
@@ -1524,16 +1531,16 @@ impl Downloader {
                 false,
             )
         } else {
-            parse_subtitles_multipage(
-                self.http.as_ref(),
-                self.rate_limiter.as_ref(),
-                &setting,
-                &toc_source,
-                &url_captures,
-                &title,
-                self.progress.as_deref(),
-                &mut self.preprocess_jobs,
-            )
+            parse_subtitles_multipage(toc::MultipageTocRequest {
+                http: self.http.as_ref(),
+                rate_limiter: self.rate_limiter.as_ref(),
+                setting: &setting,
+                toc_source: &toc_source,
+                url_captures: &url_captures,
+                title: &title,
+                progress: self.progress.as_deref(),
+                jobs: &mut self.preprocess_jobs,
+            })
             .await?
         };
 
@@ -1549,17 +1556,18 @@ impl Downloader {
                 for credential in &credentials {
                     setting.cookie = base_cookie.clone();
                     apply_login_cookie(&mut setting, &credential.cookie);
-                    let Ok((retried, retried_partial)) = parse_subtitles_multipage(
-                        self.http.as_ref(),
-                        self.rate_limiter.as_ref(),
-                        &setting,
-                        &toc_source,
-                        &url_captures,
-                        &title,
-                        self.progress.as_deref(),
-                        &mut self.preprocess_jobs,
-                    )
-                    .await
+                    let Ok((retried, retried_partial)) =
+                        parse_subtitles_multipage(toc::MultipageTocRequest {
+                            http: self.http.as_ref(),
+                            rate_limiter: self.rate_limiter.as_ref(),
+                            setting: &setting,
+                            toc_source: &toc_source,
+                            url_captures: &url_captures,
+                            title: &title,
+                            progress: self.progress.as_deref(),
+                            jobs: &mut self.preprocess_jobs,
+                        })
+                        .await
                     else {
                         continue;
                     };
@@ -1643,15 +1651,15 @@ impl Downloader {
                 title.clone()
             };
             if self
-                .process_digest(
+                .process_digest(DigestContext {
                     existing_id,
-                    &toc_url,
-                    &novel_dir,
-                    &title_for_digest,
-                    &digest_story,
-                    old_section_count,
-                    subtitles.len(),
-                )
+                    toc_url: &toc_url,
+                    novel_dir: &novel_dir,
+                    title: &title_for_digest,
+                    latest_story: &digest_story,
+                    old_count: old_section_count,
+                    latest_count: subtitles.len(),
+                })
                 .await?
             {
                 return Ok(DownloadResult {
@@ -1717,8 +1725,7 @@ impl Downloader {
             .persistence
             .list_novel_object_names(&object_keys)
             .await?;
-        let existing_sections =
-            PersistenceService::existing_section_indices(&existing_names);
+        let existing_sections = PersistenceService::existing_section_indices(&existing_names);
 
         struct SectionPlan {
             is_new_arrival: bool,
@@ -1744,25 +1751,24 @@ impl Downloader {
         let guard_spoiler = self.settings.local_setting_bool("guard-spoiler");
         for (section_index, subtitle) in subtitles.iter().enumerate() {
             let resumed = resumed_sections.remove(&section_index);
-            let is_new_arrival =
-                resumed.is_none() && !old_subtitles.contains_key(&subtitle.index);
+            let is_new_arrival = resumed.is_none() && !old_subtitles.contains_key(&subtitle.index);
             let existed = existing_sections.contains(&subtitle.index);
             let (needs_download, predownloaded) = if resumed.is_some() {
                 (false, None)
             } else if force {
                 (true, None)
             } else {
-                self.section_needs_download(
-                    &setting,
-                    subtitle,
-                    old_subtitles.get(&subtitle.index).copied(),
+                self.section_needs_download(SectionDecision {
+                    setting: &setting,
+                    latest: subtitle,
+                    old: old_subtitles.get(&subtitle.index).copied(),
                     existing_id,
-                    &object_keys,
-                    &toc_url,
+                    keys: &object_keys,
+                    toc_url: &toc_url,
                     strong_update,
-                    site_timezone,
+                    timezone: site_timezone,
                     existed,
-                )
+                })
                 .await?
             };
             if needs_download {
@@ -1788,11 +1794,7 @@ impl Downloader {
         let mut started_download = false;
         let mut downloaded_index = 0usize;
 
-        for (section_index, (subtitle, plan)) in subtitles
-            .iter()
-            .zip(section_plans)
-            .enumerate()
-        {
+        for (section_index, (subtitle, plan)) in subtitles.iter().zip(section_plans).enumerate() {
             if section_index >= resume_from
                 && budget
                     .as_deref_mut()
@@ -2191,16 +2193,19 @@ impl Downloader {
 
     async fn section_needs_download(
         &mut self,
-        setting: &SiteSetting,
-        latest: &SubtitleInfo,
-        old: Option<&SubtitleInfo>,
-        existing_id: Option<i64>,
-        keys: &NovelObjectKeys,
-        toc_url: &str,
-        strong_update: bool,
-        timezone: SiteTimezone,
-        existed: bool,
+        probe: SectionDecision<'_>,
     ) -> Result<(bool, Option<(SectionElement, String)>)> {
+        let SectionDecision {
+            setting,
+            latest,
+            old,
+            existing_id,
+            keys,
+            toc_url,
+            strong_update,
+            timezone,
+            existed,
+        } = probe;
         let Some(old) = old else {
             return Ok((true, None));
         };
@@ -2248,9 +2253,7 @@ impl Downloader {
             return Ok((false, None));
         }
 
-        if strong_update
-            && let Some(basis_date) = strong_basis_date
-        {
+        if strong_update && let Some(basis_date) = strong_basis_date {
             let Some(old_section) = self.persistence.load_section(keys, old).await? else {
                 return Ok((true, None));
             };
@@ -2415,18 +2418,19 @@ impl Downloader {
         existing_record: Option<&NovelRecord>,
     ) -> String {
         if let Some(record) = existing_record
-            && !record.file_title.is_empty() {
-                if append_title
-                    && ncode
-                        .as_deref()
-                        .is_some_and(|ncode| record.file_title.eq_ignore_ascii_case(ncode))
-                    && !title.is_empty()
-                {
-                    // Recover records created before the correct site/title was known.
-                } else {
-                    return record.file_title.clone();
-                }
+            && !record.file_title.is_empty()
+        {
+            if append_title
+                && ncode
+                    .as_deref()
+                    .is_some_and(|ncode| record.file_title.eq_ignore_ascii_case(ncode))
+                && !title.is_empty()
+            {
+                // Recover records created before the correct site/title was known.
+            } else {
+                return record.file_title.clone();
             }
+        }
 
         if let Some(ncode) = ncode {
             if !append_title {
@@ -2452,12 +2456,7 @@ impl Downloader {
         use_subdirectory: bool,
     ) -> PathBuf {
         let root = PathBuf::from(types::ARCHIVE_ROOT_DIR);
-        crate::db::paths::novel_dir_from_components(
-            &root,
-            sitename,
-            file_title,
-            use_subdirectory,
-        )
+        crate::db::paths::novel_dir_from_components(&root, sitename, file_title, use_subdirectory)
     }
 
     /// Remove the previous novel directory after a title change, but only when
@@ -2560,10 +2559,11 @@ impl Downloader {
             return;
         }
         if let Some(bucket) = self.section_hash_cache.remove(&from_id.to_string())
-            && !bucket.is_empty() {
-                self.section_hash_cache.insert(to_id.to_string(), bucket);
-                self.section_hash_cache_dirty = true;
-            }
+            && !bucket.is_empty()
+        {
+            self.section_hash_cache.insert(to_id.to_string(), bucket);
+            self.section_hash_cache_dirty = true;
+        }
     }
 
     fn flush_section_hash_cache(&mut self) -> Result<()> {
@@ -2584,10 +2584,7 @@ impl Downloader {
     /// `progress::direct_console_sink()` (従来の `safe_println` と同一の
     /// 出力先)、Worker のジョブ実行は PushHub へ `echo` する sink を渡す。
     /// 未設定のときは cfg 別のフォールバックで従来動作を維持する。
-    pub fn set_message_sink(
-        &mut self,
-        sink: Arc<dyn crate::application::messages::MessageSink>,
-    ) {
+    pub fn set_message_sink(&mut self, sink: Arc<dyn crate::application::messages::MessageSink>) {
         self.message_sink = Some(sink);
     }
 
@@ -2685,8 +2682,8 @@ mod tests {
     use super::types::{SectionElement, TocFile};
     use super::util::compile_html_pattern;
     use super::{
-        DownloadExecutionOptions, Downloader, Over18AccessDecision, SectionBudget,
-        illustration_sources, over18_access_decision, requires_over18_confirmation,
+        DownloadExecutionOptions, Downloader, DownloaderPlatform, Over18AccessDecision,
+        SectionBudget, illustration_sources, over18_access_decision, requires_over18_confirmation,
         resolve_novel_type, resolve_user_agent,
     };
     use crate::db::{self, Database};
@@ -2791,12 +2788,14 @@ mod tests {
         let objects: Arc<dyn ObjectStore> = store.clone();
         let assets: Arc<dyn AssetStore> = store;
         let downloader = Downloader::with_platform_and_storage_and_settings(
-            Arc::new(MockHttpClient::new()),
-            Arc::new(FakeRateLimiter::new()),
-            Arc::new(MemoryNovelRepository::new()),
-            objects,
-            assets,
-            Arc::new(SystemClock),
+            DownloaderPlatform {
+                http: Arc::new(MockHttpClient::new()),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new()),
+                objects,
+                assets,
+                clock: Arc::new(SystemClock),
+            },
             Vec::new(),
             HashMap::new(),
         )
@@ -2804,7 +2803,6 @@ mod tests {
         assert!(downloader.site_settings.is_empty());
         assert!(downloader.section_hash_cache.is_empty());
     }
-
 
     #[tokio::test]
     async fn memory_storage_download_pipeline_persists_toc_section_raw_and_record() {
@@ -2834,16 +2832,15 @@ mod tests {
             r#"<div class="js-novel-text p-novel__text">本文テスト</div>"#,
         );
 
-        let toc_source =
-            super::toc::fetch_toc(
-                http.as_ref(),
-                &FakeRateLimiter::new(),
-                &setting,
-                toc_url,
-                &mut super::preprocess::PreprocessJobs::new(),
-            )
-                .await
-                .unwrap();
+        let toc_source = super::toc::fetch_toc(
+            http.as_ref(),
+            &FakeRateLimiter::new(),
+            &setting,
+            toc_url,
+            &mut super::preprocess::PreprocessJobs::new(),
+        )
+        .await
+        .unwrap();
         let captures = HashMap::from([("ncode".to_string(), "n1234ab".to_string())]);
         let subtitles = super::toc::parse_subtitles(&setting, &toc_source, &captures).unwrap();
         assert_eq!(subtitles.len(), 1);
@@ -2981,12 +2978,14 @@ is_narou: false
         let objects: Arc<dyn ObjectStore> = store.clone();
         let assets: Arc<dyn AssetStore> = store;
         let mut downloader = Downloader::with_platform_and_storage_and_settings(
-            http.clone(),
-            Arc::new(FakeRateLimiter::new()),
-            Arc::new(MemoryNovelRepository::new()),
-            objects,
-            assets,
-            Arc::new(SystemClock),
+            DownloaderPlatform {
+                http: http.clone(),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new()),
+                objects,
+                assets,
+                clock: Arc::new(SystemClock),
+            },
             vec![setting],
             HashMap::new(),
         )
@@ -3518,14 +3517,16 @@ is_narou: false
             .to_string();
 
         futures::executor::block_on(super::util::pretreatment_source_with_jobs(
-            &http,
-            &FakeRateLimiter::new(),
-            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
-            &mut source,
-            "UTF-8",
-            Some(setting),
-            &mut jobs,
-            "https://www.pixiv.net/ajax/illust/69642452",
+            super::util::PretreatmentRequest {
+                http: &http,
+                rate_limiter: &FakeRateLimiter::new(),
+                policy: &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+                src: &mut source,
+                encoding: "UTF-8",
+                setting: Some(setting),
+                jobs: &mut jobs,
+                url: "https://www.pixiv.net/ajax/illust/69642452",
+            },
         ))
         .unwrap();
 
@@ -3536,9 +3537,7 @@ is_narou: false
             "ugoira should pass the archive and its frame delays"
         );
         assert_eq!(
-            crate::illustration_animation::frame_delays(
-                "https://i.pximg.net/x.zip?ugoira=120,80"
-            ),
+            crate::illustration_animation::frame_delays("https://i.pximg.net/x.zip?ugoira=120,80"),
             Some(vec![120, 80])
         );
     }
@@ -3586,14 +3585,16 @@ is_narou: false
             .to_string();
 
         futures::executor::block_on(super::util::pretreatment_source_with_jobs(
-            &http,
-            &FakeRateLimiter::new(),
-            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
-            &mut source,
-            "UTF-8",
-            Some(setting),
-            &mut jobs,
-            "https://www.pixiv.net/ajax/illust/143868144",
+            super::util::PretreatmentRequest {
+                http: &http,
+                rate_limiter: &FakeRateLimiter::new(),
+                policy: &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+                src: &mut source,
+                encoding: "UTF-8",
+                setting: Some(setting),
+                jobs: &mut jobs,
+                url: "https://www.pixiv.net/ajax/illust/143868144",
+            },
         ))
         .unwrap();
 
@@ -3627,14 +3628,16 @@ is_narou: false
             .to_string();
 
         futures::executor::block_on(super::util::pretreatment_source_with_jobs(
-            &http,
-            &FakeRateLimiter::new(),
-            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
-            &mut source,
-            "UTF-8",
-            Some(setting),
-            &mut jobs,
-            "https://www.pixiv.net/ajax/series/205917?p=1&lang=ja",
+            super::util::PretreatmentRequest {
+                http: &http,
+                rate_limiter: &FakeRateLimiter::new(),
+                policy: &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+                src: &mut source,
+                encoding: "UTF-8",
+                setting: Some(setting),
+                jobs: &mut jobs,
+                url: "https://www.pixiv.net/ajax/series/205917?p=1&lang=ja",
+            },
         ))
         .unwrap();
 
@@ -3647,12 +3650,17 @@ is_narou: false
         // 作者は各話ページから拾う
         assert!(source.contains("author::作者名"), "got: {source}");
         // 目次は order の昇順で出る
-        let first = source.find("Episode;19;https://www.pixiv.net/ajax/illust/139115096")
+        let first = source
+            .find("Episode;19;https://www.pixiv.net/ajax/illust/139115096")
             .expect("order 19 entry");
-        let second = source.find("Episode;20;https://www.pixiv.net/ajax/illust/139115097")
+        let second = source
+            .find("Episode;20;https://www.pixiv.net/ajax/illust/139115097")
             .expect("order 20 entry");
         assert!(first < second, "episodes must be ascending: {source}");
-        assert!(source.contains(";第19話"), "titles come from each work: {source}");
+        assert!(
+            source.contains(";第19話"),
+            "titles come from each work: {source}"
+        );
         // order 1 に到達していないので次ページを要求する
         assert!(
             source.contains("next::/ajax/series/205917?p=2&lang=ja"),
@@ -3856,7 +3864,9 @@ is_narou: false
         // 同じ文を あらすじ と 前書き の両方には出さない
         assert!(!html.contains("story::前書き"), "got: {html}");
         assert!(html.contains("postscript::"));
-        assert!(html.contains("アンケート　\"どれ？\"　　票数10票<br>　　　A　　6票<br>　　　B　　4票"));
+        assert!(
+            html.contains("アンケート　\"どれ？\"　　票数10票<br>　　　A　　6票<br>　　　B　　4票")
+        );
         assert!(html.contains("::postscript_end"));
         assert_eq!(setting_body(&html), "本文です");
     }
@@ -3883,14 +3893,16 @@ is_narou: false
             .to_string();
 
         futures::executor::block_on(super::util::pretreatment_source_with_jobs(
-            &http,
-            &FakeRateLimiter::new(),
-            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
-            &mut source,
-            "UTF-8",
-            Some(setting),
-            &mut jobs,
-            "https://www.pixiv.net/ajax/novel/29204764",
+            super::util::PretreatmentRequest {
+                http: &http,
+                rate_limiter: &FakeRateLimiter::new(),
+                policy: &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+                src: &mut source,
+                encoding: "UTF-8",
+                setting: Some(setting),
+                jobs: &mut jobs,
+                url: "https://www.pixiv.net/ajax/novel/29204764",
+            },
         ))
         .unwrap();
 
@@ -3927,14 +3939,16 @@ is_narou: false
             .to_string();
 
         futures::executor::block_on(super::util::pretreatment_source_with_jobs(
-            &http,
-            &FakeRateLimiter::new(),
-            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
-            &mut source,
-            "UTF-8",
-            Some(setting),
-            &mut jobs,
-            "https://www.pixiv.net/ajax/novel/29204764",
+            super::util::PretreatmentRequest {
+                http: &http,
+                rate_limiter: &FakeRateLimiter::new(),
+                policy: &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+                src: &mut source,
+                encoding: "UTF-8",
+                setting: Some(setting),
+                jobs: &mut jobs,
+                url: "https://www.pixiv.net/ajax/novel/29204764",
+            },
         ))
         .unwrap();
 
@@ -3946,9 +3960,7 @@ is_narou: false
 
     #[test]
     fn pixiv_error_envelope_is_reported_as_missing_novel() {
-        let html = run_pixiv_preprocess(
-            r#"{"error":true,"message":"作品がありません","body":[]}"#,
-        );
+        let html = run_pixiv_preprocess(r#"{"error":true,"message":"作品がありません","body":[]}"#);
 
         let setting = pixiv_setting();
         let pattern = setting.compiled_error_message_pattern().unwrap();
@@ -3987,8 +3999,7 @@ is_narou: false
             "login wall should match login_pattern so the stored cookie is retried"
         );
         // 本文が無いので本文パターンは一致しない
-        let (element, _) =
-            super::section::parse_section_html(setting, html.clone()).unwrap();
+        let (element, _) = super::section::parse_section_html(setting, html.clone()).unwrap();
         assert_eq!(element.body, "");
     }
 

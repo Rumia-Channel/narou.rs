@@ -9,24 +9,19 @@ use crate::converter::device::Device;
 static RE_AUTO_JOIN_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"([^、])、\n　([^「『\(（【<＜〈《≪・■…‥―　１-９一-九])").unwrap()
 });
-static RE_COMMENTS_BLOCK: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)^-{5,}.*$").unwrap());
-static RE_KUTEN_KAKKO: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\u{3002}\u{300D}").unwrap());
+static RE_COMMENTS_BLOCK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^-{5,}.*$").unwrap());
+static RE_KUTEN_KAKKO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{3002}\u{300D}").unwrap());
 static RE_KUTEN_NIJU_KAKKO: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\u{3002}\u{300F}").unwrap());
-static RE_KUTEN_PAREN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\u{3002}\u{FF09}").unwrap());
-static RE_KUTEN_SPACE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\u{3002}\u{3000}").unwrap());
+static RE_KUTEN_PAREN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{3002}\u{FF09}").unwrap());
+static RE_KUTEN_SPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{3002}\u{3000}").unwrap());
 static RE_HORIZONTAL_ELLIPSIS_TARGETS: [LazyLock<Regex>; 4] = [
     LazyLock::new(|| Regex::new("\u{30FB}{3,}").unwrap()),
     LazyLock::new(|| Regex::new("\u{3002}{3,}").unwrap()),
     LazyLock::new(|| Regex::new("\u{3001}{3,}").unwrap()),
     LazyLock::new(|| Regex::new("\u{FF0E}{3,}").unwrap()),
 ];
-static RE_BRACKET_LINE_BREAK: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"([…―])\n").unwrap());
+static RE_BRACKET_LINE_BREAK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([…―])\n").unwrap());
 static RE_KAGI_BRACKET: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"［＃かぎ括弧＝(\d+)］").unwrap());
 static RE_ELLIPSIS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\u{2026}+").unwrap());
@@ -94,14 +89,15 @@ impl ConverterBase {
             transformed.push_str(&result[last..]);
 
             if self.settings.enable_inspect
-                && let Some(ref inspector) = self.inspector {
-                    inspector.borrow_mut().inspect_invalid_openclose_brackets(
-                        &transformed,
-                        open,
-                        close,
-                        &replacements,
-                    );
-                }
+                && let Some(ref inspector) = self.inspector
+            {
+                inspector.borrow_mut().inspect_invalid_openclose_brackets(
+                    &transformed,
+                    open,
+                    close,
+                    &replacements,
+                );
+            }
 
             result = rebuild_brackets(&transformed, &replacements);
         }
@@ -130,17 +126,13 @@ impl ConverterBase {
     pub(super) fn convert_novel_rule(&self, text: &str) -> String {
         let mut result = text.to_string();
 
-        result = RE_KUTEN_KAKKO
-            .replace_all(&result, "\u{300D}")
-            .to_string();
+        result = RE_KUTEN_KAKKO.replace_all(&result, "\u{300D}").to_string();
 
         result = RE_KUTEN_NIJU_KAKKO
             .replace_all(&result, "\u{300F}")
             .to_string();
 
-        result = RE_KUTEN_PAREN
-            .replace_all(&result, "\u{FF09}")
-            .to_string();
+        result = RE_KUTEN_PAREN.replace_all(&result, "\u{FF09}").to_string();
 
         result = normalize_ellipsis(&result);
         result = normalize_ditto(&result);
@@ -384,7 +376,10 @@ fn is_word_connector(ch: char, kind: WordKind) -> bool {
 }
 
 fn is_opening_no_separator(ch: char) -> bool {
-    matches!(ch, '〔' | '「' | '『' | '(' | '（' | '【' | '〈' | '《' | '≪' | '〝')
+    matches!(
+        ch,
+        '〔' | '「' | '『' | '(' | '（' | '【' | '〈' | '《' | '≪' | '〝'
+    )
 }
 
 fn is_separator_symbol(ch: char) -> bool {
@@ -396,7 +391,9 @@ fn join_inner_bracket(text: &str) -> Option<String> {
         return None;
     }
 
-    let joined = RE_BRACKET_LINE_BREAK.replace_all(text, "$1。\n").to_string();
+    let joined = RE_BRACKET_LINE_BREAK
+        .replace_all(text, "$1。\n")
+        .to_string();
     Some(
         joined
             .split('\n')
@@ -407,14 +404,15 @@ fn join_inner_bracket(text: &str) -> Option<String> {
 }
 
 fn rebuild_brackets(text: &str, replacements: &[String]) -> String {
-    RE_KAGI_BRACKET.replace_all(text, |caps: &regex::Captures| {
-        let index = caps[1].parse::<usize>().unwrap_or(usize::MAX);
-        replacements
-            .get(index)
-            .cloned()
-            .unwrap_or_else(|| caps[0].to_string())
-    })
-    .to_string()
+    RE_KAGI_BRACKET
+        .replace_all(text, |caps: &regex::Captures| {
+            let index = caps[1].parse::<usize>().unwrap_or(usize::MAX);
+            replacements
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| caps[0].to_string())
+        })
+        .to_string()
 }
 
 pub fn zenkaku_rstrip(line: &str) -> Cow<'_, str> {
@@ -461,19 +459,21 @@ pub fn is_border_symbol(line: &str) -> bool {
 }
 
 fn normalize_ellipsis(text: &str) -> String {
-    RE_ELLIPSIS.replace_all(text, |caps: &regex::Captures| {
-        let count = caps[0].chars().count();
-        let even = count.div_ceil(2) * 2;
-        "\u{2026}".repeat(even)
-    })
-    .to_string()
+    RE_ELLIPSIS
+        .replace_all(text, |caps: &regex::Captures| {
+            let count = caps[0].chars().count();
+            let even = count.div_ceil(2) * 2;
+            "\u{2026}".repeat(even)
+        })
+        .to_string()
 }
 
 fn normalize_ditto(text: &str) -> String {
-    RE_DITTO.replace_all(text, |caps: &regex::Captures| {
-        let count = caps[0].chars().count();
-        let even = count.div_ceil(2) * 2;
-        "\u{2025}".repeat(even)
-    })
-    .to_string()
+    RE_DITTO
+        .replace_all(text, |caps: &regex::Captures| {
+            let count = caps[0].chars().count();
+            let even = count.div_ceil(2) * 2;
+            "\u{2025}".repeat(even)
+        })
+        .to_string()
 }

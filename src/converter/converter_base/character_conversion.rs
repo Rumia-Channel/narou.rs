@@ -23,9 +23,8 @@ static RE_KANJI_NUM_MARKER: LazyLock<Regex> =
 static RE_ASCII_ALPHA: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z]+").unwrap());
 static RE_ASCII_WORD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"[A-Za-z0-9_.,!?'" &:;-]+"#).unwrap());
-static RE_FRACTION_DATE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[0-9０-９〇一二三四五六七八九十百千万億兆京垓/／]+").unwrap()
-});
+static RE_FRACTION_DATE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[0-9０-９〇一二三四五六七八九十百千万億兆京垓/／]+").unwrap());
 static RE_EXCLAM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"！+").unwrap());
 static RE_EXCLAM_QUESTION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[！？]+").unwrap());
 static RE_HANKAKU_NUM_COMMA_MARKER: LazyLock<Regex> = LazyLock::new(|| {
@@ -89,17 +88,20 @@ impl ConverterBase {
     }
 
     pub(super) fn hankaku_num_to_zenkaku(&self, text: &str) -> String {
-        RE_ASCII_DIGITS.replace_all(text, |caps: &regex::Captures| {
-            let num = &caps[0];
-            let m = caps.get(0).unwrap();
-            let is_line_start = m.start() == 0 || text[..m.start()].ends_with('\n');
-            if num.len() == 2 || (num.len() == 3 && self.text_type == TextType::Subtitle && is_line_start) {
-                tcy(num)
-            } else {
-                num.chars().map(to_fullwidth_digit).collect::<String>()
-            }
-        })
-        .to_string()
+        RE_ASCII_DIGITS
+            .replace_all(text, |caps: &regex::Captures| {
+                let num = &caps[0];
+                let m = caps.get(0).unwrap();
+                let is_line_start = m.start() == 0 || text[..m.start()].ends_with('\n');
+                if num.len() == 2
+                    || (num.len() == 3 && self.text_type == TextType::Subtitle && is_line_start)
+                {
+                    tcy(num)
+                } else {
+                    num.chars().map(to_fullwidth_digit).collect::<String>()
+                }
+            })
+            .to_string()
     }
 
     /// 濁点合成 (`か゛` 等) を `［＃濁点］か［＃濁点終わり］` に変換し、
@@ -129,8 +131,8 @@ impl ConverterBase {
 
     pub(super) fn convert_rome_numeric(&self, text: &str) -> String {
         const FROM: &[&str] = &[
-            "II", "III", "IV", "VI", "VII", "VIII", "IX", "ii", "iii", "iv", "vi", "vii",
-            "viii", "ix",
+            "II", "III", "IV", "VI", "VII", "VIII", "IX", "ii", "iii", "iv", "vi", "vii", "viii",
+            "ix",
         ];
         const TO: &[&str] = &[
             "\u{2161}", "\u{2162}", "\u{2163}", "\u{2165}", "\u{2166}", "\u{2167}", "\u{2168}",
@@ -165,40 +167,42 @@ impl ConverterBase {
     }
 
     pub(super) fn stash_kanji_num(&mut self, text: &str) -> String {
-        RE_KANJI_NUM.replace_all(text, |caps: &regex::Captures| {
-            let matched = caps.get(0).unwrap();
-            let prev = text[..matched.start()].chars().next_back();
-            let next = text[matched.end()..].chars().next();
-            if prev.is_some_and(is_arabic_digit) || next.is_some_and(is_arabic_digit) {
-                return matched.as_str().to_string();
-            }
+        RE_KANJI_NUM
+            .replace_all(text, |caps: &regex::Captures| {
+                let matched = caps.get(0).unwrap();
+                let prev = text[..matched.start()].chars().next_back();
+                let next = text[matched.end()..].chars().next();
+                if prev.is_some_and(is_arabic_digit) || next.is_some_and(is_arabic_digit) {
+                    return matched.as_str().to_string();
+                }
 
-            let index = self.kanji_num_stash.len();
-            self.kanji_num_stash.push(matched.as_str().to_string());
-            format!("［＃漢数字＝{}］", usize_to_kanji_digits(index))
-        })
-        .to_string()
+                let index = self.kanji_num_stash.len();
+                self.kanji_num_stash.push(matched.as_str().to_string());
+                format!("［＃漢数字＝{}］", usize_to_kanji_digits(index))
+            })
+            .to_string()
     }
 
     pub(super) fn convert_kanji_num_with_unit(&self, text: &str, lower_digit_zero: i64) -> String {
-        RE_KANJI_NUM.replace_all(text, |caps: &regex::Captures| {
-            let matched = &caps[0];
-            let Some(total) = kanji_num_to_integer(matched) else {
-                return matched.to_string();
-            };
-            let total_string = total.to_string();
-            if total == 0 || total_string.len() > 20 {
-                return matched.to_string();
-            }
+        RE_KANJI_NUM
+            .replace_all(text, |caps: &regex::Captures| {
+                let matched = &caps[0];
+                let Some(total) = kanji_num_to_integer(matched) else {
+                    return matched.to_string();
+                };
+                let total_string = total.to_string();
+                if total == 0 || total_string.len() > 20 {
+                    return matched.to_string();
+                }
 
-            let kanji_digits = digits_to_kanji(&total_string);
-            if !has_trailing_kanji_zeros(&kanji_digits, lower_digit_zero) {
-                return matched.to_string();
-            }
+                let kanji_digits = digits_to_kanji(&total_string);
+                if !has_trailing_kanji_zeros(&kanji_digits, lower_digit_zero) {
+                    return matched.to_string();
+                }
 
-            kanji_digits_to_unit_expression(&kanji_digits)
-        })
-        .to_string()
+                kanji_digits_to_unit_expression(&kanji_digits)
+            })
+            .to_string()
     }
 
     pub(super) fn rebuild_kanji_num(&self, data: &mut String) {
@@ -224,17 +228,18 @@ impl ConverterBase {
                 .to_string();
         }
 
-        RE_ASCII_WORD.replace_all(text, |caps: &regex::Captures| {
-            let word = &caps[0];
-            if self.settings.disable_alphabet_word_to_zenkaku && has_ascii_alpha(word) {
-                let index = self.english_stash.len();
-                self.english_stash.push(word.to_string());
-                format!("\u{FF3B}\u{FF03}\u{82F1}\u{6587}\u{FF1D}{index}\u{FF3D}")
-            } else {
-                ascii_letters_to_fullwidth(word)
-            }
-        })
-        .to_string()
+        RE_ASCII_WORD
+            .replace_all(text, |caps: &regex::Captures| {
+                let word = &caps[0];
+                if self.settings.disable_alphabet_word_to_zenkaku && has_ascii_alpha(word) {
+                    let index = self.english_stash.len();
+                    self.english_stash.push(word.to_string());
+                    format!("\u{FF3B}\u{FF03}\u{82F1}\u{6587}\u{FF1D}{index}\u{FF3D}")
+                } else {
+                    ascii_letters_to_fullwidth(word)
+                }
+            })
+            .to_string()
     }
 
     pub(super) fn rebuild_english_sentences(&self, data: &mut String) {
@@ -249,30 +254,32 @@ impl ConverterBase {
             return text.to_string();
         }
 
-        RE_FRACTION_DATE.replace_all(text, |caps: &regex::Captures| {
-            let matched = &caps[0];
-            let numerics: Vec<&str> = matched.split(['/', '／']).collect();
-            match numerics.len() {
-                2 if self.settings.enable_transform_fraction => format!(
-                    "{}分の{}",
-                    zenkaku_num_to_kanji_literal(numerics[1]),
-                    zenkaku_num_to_kanji_literal(numerics[0])
-                ),
-                3 if self.settings.enable_transform_date => {
-                    let year = ruby_numeric_to_i(numerics[0]);
-                    let month = ruby_numeric_to_i(numerics[1]);
-                    let day = ruby_numeric_to_i(numerics[2]);
-                    let Some(date) = chrono::NaiveDate::from_ymd_opt(year, month as u32, day as u32)
-                    else {
-                        return matched.to_string();
-                    };
-                    let formatted = date.format(&self.settings.date_format).to_string();
-                    self.convert_numbers(&formatted)
+        RE_FRACTION_DATE
+            .replace_all(text, |caps: &regex::Captures| {
+                let matched = &caps[0];
+                let numerics: Vec<&str> = matched.split(['/', '／']).collect();
+                match numerics.len() {
+                    2 if self.settings.enable_transform_fraction => format!(
+                        "{}分の{}",
+                        zenkaku_num_to_kanji_literal(numerics[1]),
+                        zenkaku_num_to_kanji_literal(numerics[0])
+                    ),
+                    3 if self.settings.enable_transform_date => {
+                        let year = ruby_numeric_to_i(numerics[0]);
+                        let month = ruby_numeric_to_i(numerics[1]);
+                        let day = ruby_numeric_to_i(numerics[2]);
+                        let Some(date) =
+                            chrono::NaiveDate::from_ymd_opt(year, month as u32, day as u32)
+                        else {
+                            return matched.to_string();
+                        };
+                        let formatted = date.format(&self.settings.date_format).to_string();
+                        self.convert_numbers(&formatted)
+                    }
+                    _ => matched.to_string(),
                 }
-                _ => matched.to_string(),
-            }
-        })
-        .to_string()
+            })
+            .to_string()
     }
 
     pub(super) fn symbols_to_zenkaku(&self, text: &str) -> String {
@@ -543,7 +550,9 @@ fn kanji_num_to_integer(text: &str) -> Option<u128> {
 
     while index < chars.len() {
         let mut num = String::new();
-        while index < chars.len() && (is_kanji_digit(chars[index]) || is_small_kanji_unit(chars[index])) {
+        while index < chars.len()
+            && (is_kanji_digit(chars[index]) || is_small_kanji_unit(chars[index]))
+        {
             num.push(chars[index]);
             index += 1;
         }
@@ -680,7 +689,10 @@ fn kanji_digits_to_unit_expression(text: &str) -> String {
 }
 
 fn is_kanji_digit(ch: char) -> bool {
-    matches!(ch, '〇' | '一' | '二' | '三' | '四' | '五' | '六' | '七' | '八' | '九')
+    matches!(
+        ch,
+        '〇' | '一' | '二' | '三' | '四' | '五' | '六' | '七' | '八' | '九'
+    )
 }
 
 fn is_small_kanji_unit(ch: char) -> bool {
@@ -728,7 +740,10 @@ mod tests {
     fn ruby_parity_halfwidth_two_digits_in_subtitle_become_tcy() {
         // Ruby: \d (ASCII) matches "10" → tcy("10")
         let out = run("第四章10　『知識欲の権化』", TextType::Subtitle);
-        assert_eq!(out, "第四章［＃縦中横］10［＃縦中横終わり］　『知識欲の権化』");
+        assert_eq!(
+            out,
+            "第四章［＃縦中横］10［＃縦中横終わり］　『知識欲の権化』"
+        );
     }
 
     #[test]

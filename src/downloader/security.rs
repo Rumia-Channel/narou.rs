@@ -102,8 +102,11 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
         assert!(validate_resolved_addresses(&[IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]).is_ok());
         assert!(
-            validate_resolved_addresses(&[IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), IpAddr::V6(Ipv6Addr::LOCALHOST)])
-                .is_err()
+            validate_resolved_addresses(&[
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            ])
+            .is_err()
         );
     }
 

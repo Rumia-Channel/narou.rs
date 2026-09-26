@@ -157,10 +157,10 @@ fn cast_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> 
 }
 
 fn output_setting_list(inv: &Inventory) {
-    let local_settings: HashMap<String, serde_yaml::Value> = settings_store::load_with_inventory(inv, Scope::Local)
-        .unwrap_or_default();
-    let global_settings: HashMap<String, serde_yaml::Value> = settings_store::load_with_inventory(inv, Scope::Global)
-        .unwrap_or_default();
+    let local_settings: HashMap<String, serde_yaml::Value> =
+        settings_store::load_with_inventory(inv, Scope::Local).unwrap_or_default();
+    let global_settings: HashMap<String, serde_yaml::Value> =
+        settings_store::load_with_inventory(inv, Scope::Global).unwrap_or_default();
 
     println!("[Local Variables]");
     let mut local_sorted: Vec<_> = local_settings.iter().collect();
@@ -382,8 +382,8 @@ fn modify_settings_when_device_changed(settings: &mut HashMap<String, serde_yaml
 }
 
 fn load_settings_by_pattern(inv: &Inventory, pattern: &str) -> HashMap<String, serde_yaml::Value> {
-    let local: HashMap<String, serde_yaml::Value> = settings_store::load_with_inventory(inv, Scope::Local)
-        .unwrap_or_default();
+    let local: HashMap<String, serde_yaml::Value> =
+        settings_store::load_with_inventory(inv, Scope::Local).unwrap_or_default();
 
     let prefix = format!("{}.", pattern);
     let mut result = HashMap::new();

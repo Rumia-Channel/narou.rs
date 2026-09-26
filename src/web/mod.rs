@@ -30,7 +30,13 @@ use std::sync::{Arc, atomic::AtomicBool};
 use subtle::ConstantTimeEq;
 use tokio::task::JoinHandle;
 
-pub(crate) const MAX_WEB_TARGETS_PER_REQUEST: usize = 100_000;
+// 可搬の Web UI ヘルパ (バリデーション・ソート状態・上限値) は Worker と共有する
+// ため `crate::application::webui` が唯一の定義。ここでは名前を再エクスポートする。
+pub(crate) use crate::application::webui::{
+    MAX_WEB_TAGS_PER_REQUEST, MAX_WEB_TARGETS_PER_REQUEST, html_escape,
+    normalize_web_device_override, normalize_web_tag_name, tag_color_class, targets_to_strings,
+    validate_web_tag_name, validate_web_target_value,
+};
 
 /// Effective per-request target cap, resolved through the application
 /// settings port.
@@ -41,9 +47,6 @@ pub(crate) async fn max_web_targets_per_request(state: &AppState) -> usize {
         .web_target_limit(MAX_WEB_TARGETS_PER_REQUEST)
         .await
 }
-pub(crate) const MAX_WEB_TAGS_PER_REQUEST: usize = 128;
-pub(crate) const MAX_WEB_TARGET_LENGTH: usize = 4096;
-pub(crate) const MAX_WEB_TAG_LENGTH: usize = 255;
 pub(crate) use crate::application::settings_view::MAX_WEB_TEXT_INPUT_BYTES;
 pub(crate) const MAX_WEB_CSV_IMPORT_BYTES: usize = 5 * 1024 * 1024;
 pub(crate) const MAX_WEB_LOG_COUNT: usize = 1000;
@@ -138,19 +141,6 @@ pub(crate) async fn configured_tag_color(state: &AppState) -> Option<String> {
 }
 
 
-pub(crate) fn normalize_web_device_override(value: Option<&str>) -> Result<Option<String>, String> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let normalized = value.to_ascii_lowercase();
-    match normalized.as_str() {
-        "text" | "kindle" | "kobo" | "epub" | "ibunko" | "reader" | "ibooks" => {
-            Ok(Some(normalized))
-        }
-        _ => Err("invalid device".to_string()),
-    }
-}
-
 #[allow(dead_code)]
 pub(crate) fn removal_log_message(titles: &[String], with_file: bool) -> String {
     let suffix = if with_file {
@@ -178,46 +168,6 @@ pub(crate) fn removal_log_message(titles: &[String], with_file: bool) -> String 
             )
         }
     }
-}
-
-pub(crate) fn validate_web_target_value(value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("target is required".to_string());
-    }
-    if trimmed.len() > MAX_WEB_TARGET_LENGTH {
-        return Err("target is too long".to_string());
-    }
-    if trimmed.starts_with('-') {
-        return Err("invalid target".to_string());
-    }
-    if trimmed.chars().any(|ch| ch.is_control()) {
-        return Err("target contains invalid characters".to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
-pub(crate) fn validate_web_tag_name(tag: &str) -> Result<String, String> {
-    let trimmed = tag.trim();
-    if trimmed.is_empty() {
-        return Err("tag is required".to_string());
-    }
-    if trimmed.starts_with('-') {
-        return Err("tag contains invalid characters".to_string());
-    }
-    if trimmed.len() > MAX_WEB_TAG_LENGTH {
-        return Err("tag is too long".to_string());
-    }
-    if trimmed.chars().any(|ch| ch.is_control()) {
-        return Err("tag contains invalid characters".to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
-pub(crate) fn normalize_web_tag_name(tag: &str) -> Result<String, String> {
-    let trimmed = tag.trim();
-    let stripped = trimmed.strip_prefix("tag:").unwrap_or(trimmed);
-    validate_web_tag_name(stripped)
 }
 
 pub(crate) fn validate_web_text_size(

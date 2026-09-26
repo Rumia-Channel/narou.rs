@@ -4,9 +4,9 @@ use crate::error::Result;
 use crate::platform::{HttpClient, RateLimiter};
 
 use super::http_policy;
+use super::preprocess::PreprocessJobs;
 use super::site_setting::SiteSetting;
 use super::types::{MAX_SECTION_CACHE, SectionElement, SubtitleInfo};
-use super::preprocess::PreprocessJobs;
 use super::util::{build_section_url, pretreatment_source_with_jobs};
 
 pub struct SectionCache {
@@ -65,24 +65,19 @@ pub async fn download_section(
     }
 
     let policy = http_policy::FetchPolicy::for_site(setting);
-    let mut html_source = http_policy::fetch_text(
+    let mut html_source =
+        http_policy::fetch_text(http, rate_limiter, &url, &policy, Some(setting.encoding()))
+            .await?;
+    pretreatment_source_with_jobs(super::util::PretreatmentRequest {
         http,
         rate_limiter,
-        &url,
-        &policy,
-        Some(setting.encoding()),
-    )
-    .await?;
-    pretreatment_source_with_jobs(
-        http,
-        rate_limiter,
-        &policy,
-        &mut html_source,
-        setting.encoding(),
-        Some(setting),
+        policy: &policy,
+        src: &mut html_source,
+        encoding: setting.encoding(),
+        setting: Some(setting),
         jobs,
-        &url,
-    )
+        url: &url,
+    })
     .await?;
     let (element, raw_html) = parse_section_html(setting, html_source)?;
     cache.insert(url, element.clone());
@@ -101,28 +96,31 @@ pub fn parse_section_html(
     };
 
     if let Some(re) = setting.compiled_introduction_pattern()
-        && let Some(caps) = re.captures(&html_source) {
-            element.introduction = caps
-                .name("introduction")
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-        }
+        && let Some(caps) = re.captures(&html_source)
+    {
+        element.introduction = caps
+            .name("introduction")
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+    }
 
     if let Some(re) = setting.compiled_postscript_pattern()
-        && let Some(caps) = re.captures(&html_source) {
-            element.postscript = caps
-                .name("postscript")
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-        }
+        && let Some(caps) = re.captures(&html_source)
+    {
+        element.postscript = caps
+            .name("postscript")
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+    }
 
     if let Some(re) = setting.compiled_body_pattern()
-        && let Some(caps) = re.captures(&html_source) {
-            element.body = caps
-                .name("body")
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-        }
+        && let Some(caps) = re.captures(&html_source)
+    {
+        element.body = caps
+            .name("body")
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+    }
 
     Ok((element, html_source))
 }
@@ -163,10 +161,7 @@ mod tests {
     #[test]
     fn hameln_section_patterns_extract_ruby_body_and_author_notes() {
         let settings = SiteSetting::load_all().unwrap();
-        let setting = settings
-            .iter()
-            .find(|s| s.domain == "syosetu.org")
-            .unwrap();
+        let setting = settings.iter().find(|s| s.domain == "syosetu.org").unwrap();
         let html = r#"
 <div id="maegaki">前書き<ruby><rb>漢字</rb><rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby><br><hr><br></div>
 <div id="honbun"><p>本文<ruby><rb>死線</rb><rp>(</rp><rt>デッドライン</rt><rp>)</rp></ruby></p></div>
@@ -176,8 +171,14 @@ mod tests {
 
         let (section, _) = parse_section_html(setting, html.to_string()).unwrap();
 
-        assert_eq!(section.introduction, "前書き<ruby><rb>漢字</rb><rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby>");
-        assert_eq!(section.body, "<p>本文<ruby><rb>死線</rb><rp>(</rp><rt>デッドライン</rt><rp>)</rp></ruby></p>");
+        assert_eq!(
+            section.introduction,
+            "前書き<ruby><rb>漢字</rb><rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby>"
+        );
+        assert_eq!(
+            section.body,
+            "<p>本文<ruby><rb>死線</rb><rp>(</rp><rt>デッドライン</rt><rp>)</rp></ruby></p>"
+        );
         assert_eq!(section.postscript, "後書き");
     }
 }

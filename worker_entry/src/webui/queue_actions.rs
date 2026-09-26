@@ -33,6 +33,8 @@ use worker::{console_log, Env, Method, Request, Response};
 
 use crate::composition::WorkerRuntime;
 
+use super::json_error;
+
 /// `cancel_pending_task` などが `last_error` に残す理由 (台帳の記録用、
 /// Web UI の失敗理由表示と同じく英語の機械可読文字列)。
 const REASON_REMOVED: &str = "removed from queue by user via Web UI";
@@ -68,20 +70,10 @@ pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
     }
 }
 
-/// `lib.rs::json_error` と同じ形 (`{error: {code, message?}}`)。HTTP 層の
-/// エラー専用 — native が 200 で返す API 失敗には `api_failure` 等を使う。
-fn json_error(status: u16, code: &str, message: Option<&str>) -> worker::Result<Response> {
-    let payload = match message {
-        Some(message) => json!({ "error": { "code": code, "message": message } }),
-        None => json!({ "error": { "code": code } }),
-    };
-    Response::from_json(&payload).map(|response| response.with_status(status))
-}
-
 /// native `ApiResponse` (`{success, message}`)。成功時も失敗時も HTTP 200 —
 /// `queue_clear` / `remove_pending_task` はこの形で返す。
 fn api_response(success: bool, message: &str) -> worker::Result<Response> {
-    Response::from_json(&json!({ "success": success, "message": message }))
+    Response::from_json(&super::api_response(success, message))
 }
 
 fn api_failure(message: impl std::fmt::Display) -> worker::Result<Response> {

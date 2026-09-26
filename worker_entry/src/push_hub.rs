@@ -23,6 +23,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use narou_rs::application::push_events;
 use narou_rs::platform::ProgressReporter;
 use serde_json::{json, Value};
 use wasm_bindgen::JsValue;
@@ -61,27 +62,23 @@ fn history_replayable(message_type: &str) -> bool {
 
 /// `broadcast_event` 相当の制御イベント (`{"type": name, "data": data}`)。
 pub(crate) fn event(name: &str, data: Value) -> Value {
-    json!({ "type": name, "data": data })
+    push_events::event(name, data)
 }
 
 /// `broadcast_echo` 相当のコンソール行イベント。
 pub(crate) fn echo(body: &str, target_console: &str) -> Value {
-    json!({ "type": "echo", "body": body, "target_console": target_console })
+    push_events::echo(body, target_console)
 }
 
 /// native `clear_progress_for_job` 相当のスコープ単位クリア。
 /// (`data.scope` が job id、`target_console` が表示先)
 pub(crate) fn progressbar_scope_clear(scope: &str, target_console: &str) -> Value {
-    json!({
-        "type": "progressbar.clear",
-        "data": { "scope": scope },
-        "target_console": target_console,
-    })
+    push_events::progressbar_scope_clear(scope, target_console)
 }
 
 /// `notification.queue` — キュー表示の再読込トリガ。
 pub(crate) fn notification_queue() -> Value {
-    event("notification.queue", json!(""))
+    push_events::notification_queue()
 }
 
 /// `PUSH_HUB` binding からシングルトン stub を引く。
@@ -106,8 +103,8 @@ pub(crate) async fn broadcast_terminal_events(
     // clear_progress_for_job 相当 — 両コンソールの job スコープのバーを消す。
     batch.push(progressbar_scope_clear(job_id, "stdout"));
     batch.push(progressbar_scope_clear(job_id, "stdout2"));
-    batch.push(event("table.reload", json!("")));
-    batch.push(event("tag.updateCanvas", json!("")));
+    batch.push(push_events::table_reload());
+    batch.push(push_events::tag_update_canvas());
     batch.push(notification_queue());
     push.broadcast_best_effort(&batch).await;
 }
@@ -242,10 +239,10 @@ impl HubProgress {
             last_step_bucket: AtomicU64::new(0),
             cleared: AtomicBool::new(false),
         };
-        progress.publish([json!({
-            "type": "progressbar.init",
-            "data": { "topic": progress.topic, "scope": progress.scope },
-        })]);
+        progress.publish([push_events::progressbar_init_scoped(
+            &progress.topic,
+            &progress.scope,
+        )]);
         progress
     }
 
@@ -277,23 +274,17 @@ impl HubProgress {
             return;
         }
         let percent = (pos as f64 / len as f64) * 100.0;
-        self.publish([json!({
-            "type": "progressbar.step",
-            "data": {
-                "current": pos,
-                "total": len,
-                "percent": percent,
-                "topic": self.topic,
-                "scope": self.scope,
-            },
-        })]);
+        self.publish([push_events::progressbar_step_scoped(
+            pos,
+            len,
+            percent,
+            &self.topic,
+            &self.scope,
+        )]);
     }
 
     fn clear_event(&self) -> Value {
-        json!({
-            "type": "progressbar.clear",
-            "data": { "topic": self.topic, "scope": self.scope },
-        })
+        push_events::progressbar_clear_scoped(&self.topic, &self.scope)
     }
 }
 

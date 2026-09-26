@@ -119,8 +119,8 @@ fn resolve_novel_dir(target: &str) -> Option<PathBuf> {
 }
 
 fn run_orphan(archive_path: &Path, force: bool) -> Result<(), String> {
-    let orphans = illustration_store::find_orphan_illustrations(archive_path)
-        .map_err(|e| e.to_string())?;
+    let orphans =
+        illustration_store::find_orphan_illustrations(archive_path).map_err(|e| e.to_string())?;
     if orphans.is_empty() {
         println!("  孤児挿絵はありません。");
         return Ok(());
@@ -129,11 +129,7 @@ fn run_orphan(archive_path: &Path, force: bool) -> Result<(), String> {
     for path in &orphans {
         if force {
             if let Err(err) = std::fs::remove_file(path) {
-                log::report_error(&format!(
-                    "{} の削除に失敗しました: {}",
-                    path.display(),
-                    err
-                ));
+                log::report_error(&format!("{} の削除に失敗しました: {}", path.display(), err));
             } else {
                 println!("  [削除] {}", path.display());
             }
@@ -174,17 +170,15 @@ fn run_migrate(archive_path: &Path, force: bool) -> Result<(), String> {
         println!("  -f を指定すると実際に移行します。");
         return Ok(());
     }
-    let renamed =
-        illustration_store::apply_legacy_illustration_migrations(archive_path)
-            .map_err(|e| e.to_string())?;
+    let renamed = illustration_store::apply_legacy_illustration_migrations(archive_path)
+        .map_err(|e| e.to_string())?;
     println!("  移行完了: {} 件", renamed);
     Ok(())
 }
 
 fn run_fix_ext(archive_path: &Path, force: bool) -> Result<(), String> {
     let illust_dir = archive_path.join("挿絵");
-    let plans = illustration_store::plan_extension_fixes(&illust_dir)
-        .map_err(|e| e.to_string())?;
+    let plans = illustration_store::plan_extension_fixes(&illust_dir).map_err(|e| e.to_string())?;
     if plans.is_empty() {
         println!("  拡張子の修正対象はありません。");
         return Ok(());
@@ -192,11 +186,7 @@ fn run_fix_ext(archive_path: &Path, force: bool) -> Result<(), String> {
     println!("  拡張子の修正対象: {} 件", plans.len());
     for (old_path, new_path) in &plans {
         if force {
-            println!(
-                "  [予定] {} -> {}",
-                old_path.display(),
-                new_path.display()
-            );
+            println!("  [予定] {} -> {}", old_path.display(), new_path.display());
         } else {
             println!(
                 "  [dry-run] {} -> {}",
@@ -249,12 +239,30 @@ mod tests {
             0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
         ];
         let bmp = [0x42, 0x4D, 0x00, 0x00];
-        assert_eq!(illustration_store::detect_image_extension(&jpeg), Some("jpg"));
-        assert_eq!(illustration_store::detect_image_extension(&png), Some("png"));
-        assert_eq!(illustration_store::detect_image_extension(&gif), Some("gif"));
-        assert_eq!(illustration_store::detect_image_extension(&webp), Some("webp"));
-        assert_eq!(illustration_store::detect_image_extension(&bmp), Some("bmp"));
-        assert_eq!(illustration_store::detect_image_extension(b"plain text"), None);
+        assert_eq!(
+            illustration_store::detect_image_extension(&jpeg),
+            Some("jpg")
+        );
+        assert_eq!(
+            illustration_store::detect_image_extension(&png),
+            Some("png")
+        );
+        assert_eq!(
+            illustration_store::detect_image_extension(&gif),
+            Some("gif")
+        );
+        assert_eq!(
+            illustration_store::detect_image_extension(&webp),
+            Some("webp")
+        );
+        assert_eq!(
+            illustration_store::detect_image_extension(&bmp),
+            Some("bmp")
+        );
+        assert_eq!(
+            illustration_store::detect_image_extension(b"plain text"),
+            None
+        );
     }
 
     #[test]

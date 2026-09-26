@@ -157,8 +157,7 @@ fn expand_targets(targets: &[String]) -> Vec<String> {
         }
 
         if let Some(tag_name) = target.strip_prefix("^tag:") {
-            let exclude: std::collections::HashSet<i64> =
-                tag_ids(tag_name).into_iter().collect();
+            let exclude: std::collections::HashSet<i64> = tag_ids(tag_name).into_iter().collect();
             if !exclude.is_empty() {
                 expanded.extend(
                     all_sorted

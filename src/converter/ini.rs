@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum IniValue {
     Integer(i64),
     Float(f64),
@@ -16,7 +15,6 @@ pub enum IniValue {
     #[default]
     Null,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct IniData {

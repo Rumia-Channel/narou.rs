@@ -94,8 +94,14 @@ pub enum LValue {
 
 #[derive(Debug, Clone)]
 pub enum Method {
-    Map { var: String, body: Box<Expr> },
-    FlatMap { var: String, body: Box<Expr> },
+    Map {
+        var: String,
+        body: Box<Expr>,
+    },
+    FlatMap {
+        var: String,
+        body: Box<Expr>,
+    },
     Flatten,
     Compact,
     Join(Vec<StrPart>),

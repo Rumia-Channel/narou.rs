@@ -891,7 +891,12 @@ const ILLUST_HELP: CmdHelp = CmdHelp {
     narou illust fix-ext --all -f
     narou illust rebuild --all",
     options: &[
-        opt(Some("-f"), "--force", None, "実際に変更する (削除/改名/移行)"),
+        opt(
+            Some("-f"),
+            "--force",
+            None,
+            "実際に変更する (削除/改名/移行)",
+        ),
         opt(Some("-a"), "--all", None, "全小説を対象にする"),
     ],
 };
@@ -929,12 +934,42 @@ const LOGIN_HELP: CmdHelp = CmdHelp {
     narou login clear ncode.syosetu.com
     narou login clear",
     options: &[
-        opt(None, "--passphrase", Some("<pass>"), "書き出し/取り込みの暗号化パスフレーズ"),
-        opt(None, "--replace", None, "取り込みに含まれないサイトの情報を削除する"),
-        opt(None, "--clear-text", None, "パスフレーズ指定時でも平文で書き出す"),
-        opt(None, "--cookie", Some("<value>"), "set / add で保存する Cookie 文字列"),
-        opt(None, "--label", Some("<name>"), "set / add で一覧に表示するラベル"),
-        opt(None, "--index", Some("<n>"), "clear で削除する 1 始まりの位置"),
+        opt(
+            None,
+            "--passphrase",
+            Some("<pass>"),
+            "書き出し/取り込みの暗号化パスフレーズ",
+        ),
+        opt(
+            None,
+            "--replace",
+            None,
+            "取り込みに含まれないサイトの情報を削除する",
+        ),
+        opt(
+            None,
+            "--clear-text",
+            None,
+            "パスフレーズ指定時でも平文で書き出す",
+        ),
+        opt(
+            None,
+            "--cookie",
+            Some("<value>"),
+            "set / add で保存する Cookie 文字列",
+        ),
+        opt(
+            None,
+            "--label",
+            Some("<name>"),
+            "set / add で一覧に表示するラベル",
+        ),
+        opt(
+            None,
+            "--index",
+            Some("<n>"),
+            "clear で削除する 1 始まりの位置",
+        ),
     ],
 };
 

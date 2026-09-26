@@ -71,8 +71,7 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
                 i += 1;
             }
         } else if arg.starts_with("--user-agent=") {
-            flags.user_agent =
-                arg.strip_prefix("--user-agent=").map(|v| v.to_string());
+            flags.user_agent = arg.strip_prefix("--user-agent=").map(|v| v.to_string());
             args.remove(i);
         } else if arg == "-h" || arg == "--help" {
             if i > 0 {
@@ -173,11 +172,8 @@ fn load_multiple_delimiter() -> String {
 }
 
 fn load_global_no_color() -> bool {
-    narou_rs::db::settings::bool_value(
-        narou_rs::setting_core::SettingScope::Global,
-        "no-color",
-    )
-    .unwrap_or(false)
+    narou_rs::db::settings::bool_value(narou_rs::setting_core::SettingScope::Global, "no-color")
+        .unwrap_or(false)
 }
 
 fn args_before_double_dash(args: &[String]) -> &[String] {
@@ -261,10 +257,11 @@ fn inject_log_defaults(args: &mut Vec<String>) {
     let mut defaults = Vec::new();
 
     if !has_option(args, "-n", "--num")
-        && let Some(value) = load_local_setting_value("log.num") {
-            defaults.push("--num".to_string());
-            defaults.push(value);
-        }
+        && let Some(value) = load_local_setting_value("log.num")
+    {
+        defaults.push("--num".to_string());
+        defaults.push(value);
+    }
     if !has_option(args, "-t", "--tail") && load_local_setting_bool("log.tail").unwrap_or(false) {
         defaults.push("--tail".to_string());
     }

@@ -28,8 +28,9 @@ use zip::{CompressionMethod, ZipWriter};
 
 #[cfg(feature = "native-runtime")]
 use crate::compat::{
-    canonicalize_aozoraepub3_tool_path, canonicalize_existing_path, configure_hidden_console_command,
-    load_global_setting_string, resolve_java_command_path, sanitize_java_command,
+    canonicalize_aozoraepub3_tool_path, canonicalize_existing_path,
+    configure_hidden_console_command, load_global_setting_string, resolve_java_command_path,
+    sanitize_java_command,
 };
 #[cfg(feature = "native-runtime")]
 use crate::downloader::util::decode_numeric_entities;
@@ -234,9 +235,10 @@ impl OutputManager {
         }
 
         if name.eq_ignore_ascii_case("AozoraEpub3")
-            && let Some(path) = Self::find_aozora_epub3_from_settings() {
-                return Some(path);
-            }
+            && let Some(path) = Self::find_aozora_epub3_from_settings()
+        {
+            return Some(path);
+        }
 
         if name.eq_ignore_ascii_case("kindlegen") {
             if let Some(path) = Self::find_kindlegen_next_to_aozora() {
@@ -252,16 +254,17 @@ impl OutputManager {
         lookup.arg(name);
         configure_hidden_console_command(&mut lookup);
         if let Ok(output) = lookup.output()
-            && output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = path.lines().next()
-                    && !first_line.trim().is_empty()
-                        && let Some(canonical) =
-                            canonicalize_existing_path(PathBuf::from(first_line.trim()))
-                        {
-                            return Some(canonical);
-                        }
+            && output.status.success()
+        {
+            let path = String::from_utf8_lossy(&output.stdout);
+            if let Some(first_line) = path.lines().next()
+                && !first_line.trim().is_empty()
+                && let Some(canonical) =
+                    canonicalize_existing_path(PathBuf::from(first_line.trim()))
+            {
+                return Some(canonical);
             }
+        }
 
         if cfg!(windows) {
             let candidates = [
@@ -271,9 +274,10 @@ impl OutputManager {
             for candidate in &candidates {
                 let p = PathBuf::from(candidate);
                 if p.exists()
-                    && let Some(canonical) = canonicalize_existing_path(&p) {
-                        return Some(canonical);
-                    }
+                    && let Some(canonical) = canonicalize_existing_path(&p)
+                {
+                    return Some(canonical);
+                }
             }
         }
 
@@ -448,7 +452,9 @@ impl OutputManager {
         let (mut cmd, working_dir) = self.build_aozora_command()?;
         let needs_dakuten = self.use_dakuten_font || file_contains_dakuten_chuki(input_txt);
         let _dakuten_guard = if needs_dakuten {
-            Some(super::dakuten_font::DakutenFontGuard::activate(&working_dir)?)
+            Some(super::dakuten_font::DakutenFontGuard::activate(
+                &working_dir,
+            )?)
         } else {
             None
         };
@@ -469,7 +475,8 @@ impl OutputManager {
             })?;
         }
 
-        let invocation = prepare_aozora_invocation(input_txt, output_dir, output_ext, &output_path)?;
+        let invocation =
+            prepare_aozora_invocation(input_txt, output_dir, output_ext, &output_path)?;
         let actual_aozora_output_path = absolutize_path(&invocation.expected_output_path);
 
         for arg in
@@ -738,9 +745,10 @@ impl OutputManager {
                 }
 
                 if !self.no_strip
-                    && let Err(err) = strip_mobi_file(&mobi_output) {
-                        eprintln!("{}", err);
-                    }
+                    && let Err(err) = strip_mobi_file(&mobi_output)
+                {
+                    eprintln!("{}", err);
+                }
 
                 Ok(mobi_output)
             }
@@ -749,7 +757,12 @@ impl OutputManager {
 
     /// EPUB 出力の入口。外部 AozoraEpub3 が見つかればそれを使い、
     /// 見つからなければ `lite` feature の組み込みエンジンへフォールバックする。
-    fn epub_output(&self, input_txt: &Path, output_dir: &Path, output_ext: &str) -> Result<PathBuf> {
+    fn epub_output(
+        &self,
+        input_txt: &Path,
+        output_dir: &Path,
+        output_ext: &str,
+    ) -> Result<PathBuf> {
         if self.aozora_epub3_path.is_some() {
             return self.run_aozora_epub3(input_txt, output_dir, output_ext);
         }
@@ -766,7 +779,12 @@ impl OutputManager {
     /// `lite` feature の組み込み EPUB エンジンで生成する。挿絵は入力テキストの
     /// 階層から解決する (Java 版と同じ規約)。
     #[cfg(feature = "lite")]
-    fn run_lite_epub(&self, input_txt: &Path, output_dir: &Path, output_ext: &str) -> Result<PathBuf> {
+    fn run_lite_epub(
+        &self,
+        input_txt: &Path,
+        output_dir: &Path,
+        output_ext: &str,
+    ) -> Result<PathBuf> {
         let context = self.lite_epub.clone().unwrap_or_default();
         // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
         let options = crate::epub_lite::EpubBuildOptions {
@@ -1442,10 +1460,11 @@ fn volume_matches(root: &str, expected: &str) -> bool {
 fn find_unix_volume_root(volume_name: &str) -> Option<PathBuf> {
     let mut roots = vec![PathBuf::from("/media"), PathBuf::from("/mnt")];
     if let Some(home) = home_dir()
-        && let Some(user) = home.file_name().and_then(|v| v.to_str()) {
-            roots.push(PathBuf::from("/run/media").join(user));
-            roots.push(PathBuf::from("/media").join(user));
-        }
+        && let Some(user) = home.file_name().and_then(|v| v.to_str())
+    {
+        roots.push(PathBuf::from("/run/media").join(user));
+        roots.push(PathBuf::from("/media").join(user));
+    }
 
     for root in roots {
         let path = root.join(volume_name);
@@ -1463,13 +1482,13 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(windows)]
+    use super::normalize_windows_verbatim_path;
     use super::{
         Device, OutputManager, StripError, build_aozora_output_summary,
         decode_ibunko_html_entities, path_contains_windows_aozora_risky_chars,
         prepare_aozora_invocation, strip_mobi_sources, truncate_output_for_error,
     };
-    #[cfg(windows)]
-    use super::normalize_windows_verbatim_path;
 
     fn test_output_manager(device: Device) -> OutputManager {
         OutputManager {
@@ -1579,7 +1598,12 @@ mod tests {
         if cfg!(windows) {
             assert_ne!(invocation.input_txt, input);
             assert_eq!(
-                invocation.expected_output_path.file_name().unwrap().to_str().unwrap(),
+                invocation
+                    .expected_output_path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
                 "input.epub"
             );
             assert!(invocation.input_txt.exists());
@@ -1605,7 +1629,12 @@ mod tests {
         if cfg!(windows) {
             assert_ne!(invocation.input_txt, input);
             assert_eq!(
-                invocation.expected_output_path.file_name().unwrap().to_str().unwrap(),
+                invocation
+                    .expected_output_path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
                 "input.epub"
             );
             assert!(invocation.needs_final_copy());

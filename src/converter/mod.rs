@@ -26,9 +26,9 @@ use settings::NovelSettings;
 use user_converter::UserConverter;
 
 use crate::db::NovelRecord;
-use crate::downloader::{SECTION_SAVE_DIR, SectionFile, TocObject};
 #[cfg(feature = "native-runtime")]
 use crate::downloader::SectionElement;
+use crate::downloader::{SECTION_SAVE_DIR, SectionFile, TocObject};
 #[cfg(feature = "native-runtime")]
 use crate::error::NarouError;
 use crate::error::Result;
@@ -39,8 +39,8 @@ use crate::illustration_store::{
     find_saved_illustration_filename, illustration_extension_from_content_type,
     is_remote_illustration_source, legacy_basename_from_source, normalize_illustration_url,
 };
-use crate::platform::{AssetStore, HttpClient, ObjectKey, ObjectStore, RateLimiter};
 use crate::platform::ProgressReporter;
+use crate::platform::{AssetStore, HttpClient, ObjectKey, ObjectStore, RateLimiter};
 #[cfg(feature = "native-runtime")]
 use crate::termcolor::bold_colored;
 
@@ -54,6 +54,10 @@ const ILLUSTRATION_LOCALIZATION_VERSION: &str = "illustration-localization:v4";
 ///
 /// Text conversion remains pure; callers can provide mocks here and avoid
 /// curl, real network access, and filesystem-backed image storage.
+///
+/// `novel_record_resolver` looks a novel record up by id; `fetch_policy_resolver`
+/// maps a record's site onto the fetch policy (site headers/cookies) used for
+/// illustration downloads.
 #[derive(Clone)]
 pub struct ConverterCapabilities {
     pub http: Arc<dyn HttpClient>,
@@ -68,9 +72,12 @@ pub struct ConverterCapabilities {
     pub novel_record_resolver: Option<Arc<dyn Fn(i64) -> Option<NovelRecord> + Send + Sync>>,
     /// Resolves the fetch policy (site headers/cookie) used for illustration
     /// downloads. Native callers map the record's site definition onto it.
-    pub fetch_policy_resolver:
-        Option<Arc<dyn Fn(&NovelRecord) -> crate::downloader::http_policy::FetchPolicy + Send + Sync>>,
+    pub fetch_policy_resolver: Option<FetchPolicyResolver>,
 }
+
+/// Maps a novel record onto the `FetchPolicy` used for illustration downloads.
+pub type FetchPolicyResolver =
+    Arc<dyn Fn(&NovelRecord) -> crate::downloader::http_policy::FetchPolicy + Send + Sync>;
 
 impl ConverterCapabilities {
     pub fn new(http: Arc<dyn HttpClient>, rate_limiter: Arc<dyn RateLimiter>) -> Self {
@@ -196,7 +203,7 @@ impl NovelConverter {
             settings,
             user_converter,
             section_cache: HashMap::new(),
-#[cfg(feature = "native-runtime")]
+            #[cfg(feature = "native-runtime")]
             section_convert_cache: SectionConvertCache::default(),
             progress: None,
             inspector,
@@ -271,13 +278,14 @@ impl NovelConverter {
         let mut erased_post_count = 0usize;
         let mut converted_story = String::new();
         if let Some(ref story) = toc.story
-            && !story.is_empty() {
-                let mut converter =
-                    self.make_converter_with_parenthesized_ruby(!render::looks_like_html(story));
-                let story_text = render::normalize_story_source(story);
-                converted_story = converter.convert(&story_text, converter_base::TextType::Story);
-                self.use_dakuten_font |= converter.use_dakuten_font;
-            }
+            && !story.is_empty()
+        {
+            let mut converter =
+                self.make_converter_with_parenthesized_ruby(!render::looks_like_html(story));
+            let story_text = render::normalize_story_source(story);
+            converted_story = converter.convert(&story_text, converter_base::TextType::Story);
+            self.use_dakuten_font |= converter.use_dakuten_font;
+        }
 
         let mut converted_sections = Vec::new();
         let total = sections.len() as u64;
@@ -971,22 +979,23 @@ impl NovelConverter {
                     .find(|candidate| candidate.join(".narou").is_dir())
                     .map(|found| found.join(".narou"));
                 if let Some(narou_dir) = narou_dir
-                    && let Some(state) =
-                        crate::native::sqlite::state::active_for(&narou_dir)
+                    && let Some(state) = crate::native::sqlite::state::active_for(&narou_dir)
                 {
                     let conn = state.conn();
                     let mut guard = conn.lock().expect("sqlite mutex poisoned");
                     let mut sections_map = std::collections::BTreeMap::new();
                     for section in &sections {
-                        let body =
-                            serde_yaml::to_string(section).unwrap_or_else(|_| String::new());
+                        let body = serde_yaml::to_string(section).unwrap_or_else(|_| String::new());
                         sections_map.insert(
                             section.index.clone(),
                             (Some(section.subtitle.clone()), body),
                         );
                     }
-                    let _ =
-                        crate::native::sqlite::content::store_sections(&mut guard, id, &sections_map);
+                    let _ = crate::native::sqlite::content::store_sections(
+                        &mut guard,
+                        id,
+                        &sections_map,
+                    );
                     let _ = crate::native::sqlite::content::store_output(
                         &guard,
                         id,
@@ -1066,15 +1075,13 @@ impl NovelConverter {
                     .find(|candidate| candidate.join(".narou").is_dir())
                     .map(|found| found.join(".narou"));
                 if let Some(narou_dir) = narou_dir
-                    && let Some(state) =
-                        crate::native::sqlite::state::active_for(&narou_dir)
+                    && let Some(state) = crate::native::sqlite::state::active_for(&narou_dir)
                 {
                     let conn = state.conn();
                     let mut guard = conn.lock().expect("sqlite mutex poisoned");
                     let mut sections_map = std::collections::BTreeMap::new();
                     for section in &sections {
-                        let body =
-                            serde_yaml::to_string(section).unwrap_or_else(|_| String::new());
+                        let body = serde_yaml::to_string(section).unwrap_or_else(|_| String::new());
                         sections_map.insert(
                             section.index.clone(),
                             (Some(section.subtitle.clone()), body),
@@ -1164,7 +1171,7 @@ impl NovelConverter {
         println!("縦書用の変換が終了しました");
     }
 
-#[cfg(feature = "native-runtime")]
+    #[cfg(feature = "native-runtime")]
     fn fetch_cached_section(
         &mut self,
         novel_id: Option<i64>,
@@ -1180,7 +1187,7 @@ impl NovelConverter {
         Some((entry.converted_section.clone(), entry.use_dakuten_font))
     }
 
-#[cfg(feature = "native-runtime")]
+    #[cfg(feature = "native-runtime")]
     fn store_cached_section(
         &mut self,
         novel_id: Option<i64>,
@@ -1207,7 +1214,7 @@ impl NovelConverter {
         }
     }
 
-#[cfg(feature = "native-runtime")]
+    #[cfg(feature = "native-runtime")]
     fn flush_section_convert_cache(&mut self) -> Result<()> {
         self.section_convert_cache.flush()
     }
@@ -1432,27 +1439,27 @@ fn load_sections_from_dir(
 
     for sub in subtitles {
         let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
-        let path = match crate::native::legacy_persistence::resolve_section_file_path(&section_dir, sub)
-        {
-            Some(path) => path,
-            None => {
-                // SQLite storage keeps its own copy of every section, so a
-                // mirror file deleted outside narou can still be rebuilt here
-                // instead of failing the conversion.
-                crate::native::object_store::ensure_mirror_file(&section_dir.join(&filename));
-                crate::native::legacy_persistence::resolve_section_file_path(&section_dir, sub)
-                    .ok_or_else(|| {
-                        NarouError::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!(
-                                "section file not found: expected '{}' in {}",
-                                filename,
-                                section_dir.display()
-                            ),
-                        ))
-                    })?
-            }
-        };
+        let path =
+            match crate::native::legacy_persistence::resolve_section_file_path(&section_dir, sub) {
+                Some(path) => path,
+                None => {
+                    // SQLite storage keeps its own copy of every section, so a
+                    // mirror file deleted outside narou can still be rebuilt here
+                    // instead of failing the conversion.
+                    crate::native::object_store::ensure_mirror_file(&section_dir.join(&filename));
+                    crate::native::legacy_persistence::resolve_section_file_path(&section_dir, sub)
+                        .ok_or_else(|| {
+                            NarouError::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!(
+                                    "section file not found: expected '{}' in {}",
+                                    filename,
+                                    section_dir.display()
+                                ),
+                            ))
+                        })?
+                }
+            };
         let content = std::fs::read_to_string(&path).map_err(NarouError::Io)?;
         let section: crate::downloader::SectionFile =
             serde_yaml::from_str(&content).map_err(NarouError::Yaml)?;
@@ -2155,9 +2162,7 @@ before_settings:
         assert_eq!(objects.len(), 2);
         assert!(
             futures::executor::block_on(
-                objects.read_small(
-                    &ObjectKey::try_new("novels/.illustration_cache.yaml").unwrap()
-                )
+                objects.read_small(&ObjectKey::try_new("novels/.illustration_cache.yaml").unwrap())
             )
             .unwrap()
             .is_some()

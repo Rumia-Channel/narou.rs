@@ -5,8 +5,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_yaml::Value;
-use tokio::task::JoinHandle;
 use super::push::PushServer;
 use super::sort_state::sort_ids_from_records;
 use crate::application::LibraryService;
@@ -16,15 +14,15 @@ use crate::compat::{
 use crate::db::with_database_mut;
 use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
 use crate::queue::{
-    extract_novel_ids, JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane,
-    WEBUI_MESSAGE_TEXT_META_KEY, WEBUI_MESSAGE_TYPE_META_KEY, WEBUI_UPDATE_START_MESSAGE_TYPE,
+    JobType, PersistentQueue, QueueExecutionSpec, QueueJob, QueueLane, WEBUI_MESSAGE_TEXT_META_KEY,
+    WEBUI_MESSAGE_TYPE_META_KEY, WEBUI_UPDATE_START_MESSAGE_TYPE, extract_novel_ids,
 };
+use serde_yaml::Value;
+use tokio::task::JoinHandle;
 
 const MAX_FAILURE_DETAIL_LINES: usize = 8;
 const MAX_FAILURE_DETAIL_CHARS: usize = 600;
 const IDLE_EXTERNAL_QUEUE_POLL_SECS: u64 = 30;
-/// Default exponential backoff schedule (seconds) for failed jobs.
-const DEFAULT_RETRY_BACKOFF_SECS: &[i64] = &[60, 300, 900];
 /// Detail substrings that mark a job outcome as a *permanent* failure which
 /// must not be retried even when retries remain. Matching is case-insensitive.
 const PERMANENT_FAILURE_KEYWORDS: &[&str] = &[
@@ -73,15 +71,23 @@ enum WorkerLane {
     Secondary,
 }
 
+/// Shared handles every queue lane needs: the queue itself, the push server,
+/// library access, site-update capability, and the registries that track
+/// running jobs, child processes, and cancellations.
+#[derive(Clone)]
+pub struct QueueWorkerContext {
+    pub root_dir: PathBuf,
+    pub queue: Arc<PersistentQueue>,
+    pub push_server: Arc<PushServer>,
+    pub library: Arc<LibraryService>,
+    pub site_updates: Arc<dyn crate::application::SiteUpdateCapabilityProvider>,
+    pub running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
+    pub running_child_pids: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    pub cancelled_job_ids: Arc<parking_lot::Mutex<HashSet<String>>>,
+}
+
 pub fn start_queue_workers(
-    root_dir: PathBuf,
-    queue: Arc<PersistentQueue>,
-    push_server: Arc<PushServer>,
-    library: Arc<LibraryService>,
-    site_updates: Arc<dyn crate::application::SiteUpdateCapabilityProvider>,
-    running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
-    running_child_pids: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
-    cancelled_job_ids: Arc<parking_lot::Mutex<HashSet<String>>>,
+    workers: QueueWorkerContext,
     concurrency_enabled: bool,
 ) -> Vec<JoinHandle<()>> {
     let job_transition_lock = Arc::new(parking_lot::Mutex::new(()));
@@ -93,31 +99,13 @@ pub fn start_queue_workers(
     lanes
         .into_iter()
         .map(|lane| {
-            start_queue_worker_for_lane(
-                root_dir.clone(),
-                Arc::clone(&queue),
-                Arc::clone(&push_server),
-                Arc::clone(&library),
-                Arc::clone(&site_updates),
-                Arc::clone(&running_jobs),
-                Arc::clone(&running_child_pids),
-                Arc::clone(&cancelled_job_ids),
-                Arc::clone(&job_transition_lock),
-                lane,
-            )
+            start_queue_worker_for_lane(workers.clone(), Arc::clone(&job_transition_lock), lane)
         })
         .collect()
 }
 
 fn start_queue_worker_for_lane(
-    root_dir: PathBuf,
-    queue: Arc<PersistentQueue>,
-    push_server: Arc<PushServer>,
-    library: Arc<LibraryService>,
-    site_updates: Arc<dyn crate::application::SiteUpdateCapabilityProvider>,
-    running_jobs: Arc<parking_lot::Mutex<Vec<QueueJob>>>,
-    running_child_pids: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
-    cancelled_job_ids: Arc<parking_lot::Mutex<HashSet<String>>>,
+    workers: QueueWorkerContext,
     job_transition_lock: Arc<parking_lot::Mutex<()>>,
     lane: WorkerLane,
 ) -> JoinHandle<()> {
@@ -125,62 +113,48 @@ fn start_queue_worker_for_lane(
         loop {
             let job = {
                 let _guard = job_transition_lock.lock();
-                let job = pop_next_job(queue.as_ref(), lane, &running_jobs);
+                let job = pop_next_job(workers.queue.as_ref(), lane, &workers.running_jobs);
                 if let Some(job_ref) = job.as_ref() {
-                    register_running_job(&running_jobs, job_ref);
+                    register_running_job(&workers.running_jobs, job_ref);
                 }
                 job
             };
 
             let Some(job) = job else {
                 tokio::select! {
-                    _ = queue.wait_for_change() => {}
+                    _ = workers.queue.wait_for_change() => {}
                     _ = tokio::time::sleep(Duration::from_secs(IDLE_EXTERNAL_QUEUE_POLL_SECS)) => {}
                 }
                 continue;
             };
-            let root_dir = root_dir.clone();
+            let workers_for_run = workers.clone();
             let job_for_run = job.clone();
-            let ps = Arc::clone(&push_server);
-            let pid_ref = Arc::clone(&running_child_pids);
-            let cancelled_ref = Arc::clone(&cancelled_job_ids);
-            let queue_for_run = Arc::clone(&queue);
-            let library_for_run = Arc::clone(&library);
-            let site_updates_for_run = Arc::clone(&site_updates);
-            let result = tokio::task::spawn_blocking(move || {
-                execute_job(
-                    &root_dir,
-                    queue_for_run.as_ref(),
-                    &job_for_run,
-                    &ps,
-                    &pid_ref,
-                    &cancelled_ref,
-                    library_for_run.as_ref(),
-                    site_updates_for_run.as_ref(),
-                )
-            })
-            .await
-            .unwrap_or_default();
+            let result =
+                tokio::task::spawn_blocking(move || execute_job(&workers_for_run, &job_for_run))
+                    .await
+                    .unwrap_or_default();
 
             // Refresh in-memory database from disk (subprocess may have modified it)
             if let Err(e) = with_database_mut(|db| db.refresh()) {
-                push_server.broadcast_error(&format!("DB更新エラー: {}", e));
+                workers
+                    .push_server
+                    .broadcast_error(&format!("DB更新エラー: {}", e));
             }
 
             let (queue_result, retry_scheduled) = {
                 let _guard = job_transition_lock.lock();
                 let mut retry_scheduled = RetrySchedule::default();
                 let result = match result.outcome {
-                    JobOutcome::Completed => queue.complete(&job.id),
-                    JobOutcome::Partial => queue.partial(&job.id),
-                    JobOutcome::Cancelled => queue.cancel(&job.id),
+                    JobOutcome::Completed => workers.queue.complete(&job.id),
+                    JobOutcome::Partial => workers.queue.partial(&job.id),
+                    JobOutcome::Cancelled => workers.queue.cancel(&job.id),
                     JobOutcome::Failed => {
                         if should_retry_job(&result, &job) {
                             let schedule = load_retry_backoff_schedule();
                             let backoff_secs =
                                 compute_retry_backoff_secs(job.retry_count, &schedule);
                             let available_at = chrono::Utc::now().timestamp() + backoff_secs;
-                            match queue.requeue(&job.id, Some(available_at)) {
+                            match workers.queue.requeue(&job.id, Some(available_at)) {
                                 Ok(true) => {
                                     retry_scheduled = RetrySchedule {
                                         scheduled: true,
@@ -194,22 +168,24 @@ fn start_queue_worker_for_lane(
                                 Ok(false) => {
                                     // Lost the running slot to a concurrent worker; treat as
                                     // a permanent failure for this attempt.
-                                    queue.fail(&job.id)
+                                    workers.queue.fail(&job.id)
                                 }
                                 Err(error) => Err(error),
                             }
                         } else {
-                            queue.fail(&job.id)
+                            workers.queue.fail(&job.id)
                         }
                     }
                 };
-                unregister_running_job(&running_jobs, &job.id);
+                unregister_running_job(&workers.running_jobs, &job.id);
                 (result, retry_scheduled)
             };
             match result.outcome {
                 JobOutcome::Completed => {
                     let _ = queue_result;
-                    push_server.broadcast_event("queue_complete", &job.id);
+                    workers
+                        .push_server
+                        .broadcast_event("queue_complete", &job.id);
                 }
                 JobOutcome::Partial => {
                     let _ = queue_result;
@@ -217,14 +193,14 @@ fn start_queue_worker_for_lane(
                     if let Some(exit_code) = result.exit_code {
                         data["exit_code"] = serde_json::json!(exit_code);
                     }
-                    push_server.broadcast_raw(&serde_json::json!({
+                    workers.push_server.broadcast_raw(&serde_json::json!({
                         "type": "queue_partial",
                         "data": data,
                     }));
                 }
                 JobOutcome::Cancelled => {
                     let _ = queue_result;
-                    push_server.broadcast_raw(&serde_json::json!({
+                    workers.push_server.broadcast_raw(&serde_json::json!({
                         "type": "queue_cancelled",
                         "data": { "job_id": job.id },
                     }));
@@ -232,7 +208,7 @@ fn start_queue_worker_for_lane(
                 JobOutcome::Failed => {
                     let _ = queue_result;
                     if retry_scheduled.scheduled {
-                        push_server.broadcast_raw(&serde_json::json!({
+                        workers.push_server.broadcast_raw(&serde_json::json!({
                             "type": "queue_retry",
                             "data": {
                                 "job_id": job.id,
@@ -253,19 +229,21 @@ fn start_queue_worker_for_lane(
                         {
                             data["detail"] = serde_json::Value::String(detail.to_string());
                         }
-                        push_server.broadcast_raw(&serde_json::json!({
+                        workers.push_server.broadcast_raw(&serde_json::json!({
                             "type": "queue_failed",
                             "data": data,
                         }));
                     }
                 }
             }
-            clear_progress_for_job(&push_server, &job.id);
-            if should_reload_table_after_job(queue.as_ref(), &running_jobs) {
-                push_server.broadcast_event("table.reload", "");
-                push_server.broadcast_event("tag.updateCanvas", "");
+            clear_progress_for_job(&workers.push_server, &job.id);
+            if should_reload_table_after_job(workers.queue.as_ref(), &workers.running_jobs) {
+                workers.push_server.broadcast_event("table.reload", "");
+                workers.push_server.broadcast_event("tag.updateCanvas", "");
             }
-            push_server.broadcast_event("notification.queue", "");
+            workers
+                .push_server
+                .broadcast_event("notification.queue", "");
         }
     })
 }
@@ -372,24 +350,24 @@ fn clear_progress_for_job(push_server: &Arc<PushServer>, job_id: &str) {
         }));
     }
 }
-fn execute_job(
-    root_dir: &Path,
-    queue: &PersistentQueue,
-    job: &QueueJob,
-    push_server: &Arc<PushServer>,
-    running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
-    cancelled_job_ids: &Arc<parking_lot::Mutex<HashSet<String>>>,
-    library: &LibraryService,
-    site_updates: &dyn crate::application::SiteUpdateCapabilityProvider,
-) -> JobRunResult {
+fn execute_job(workers: &QueueWorkerContext, job: &QueueJob) -> JobRunResult {
+    let QueueWorkerContext {
+        root_dir,
+        queue,
+        push_server,
+        library,
+        site_updates,
+        running_child_pids: running_pids,
+        ..
+    } = workers;
     if matches!(job.job_type, JobType::AutoUpdate) {
         let success = crate::web::scheduler::execute_auto_update(
             root_dir,
             Arc::clone(push_server),
             &job.id,
             Arc::clone(running_pids),
-            library,
-            site_updates,
+            library.as_ref(),
+            site_updates.as_ref(),
         );
         return JobRunResult {
             outcome: if success {
@@ -416,17 +394,7 @@ fn execute_job(
     if let Some(spec) = spec.as_ref()
         && spec.cmd == "update_general_lastup"
     {
-        return execute_update_general_lastup_job(
-            root_dir,
-            &exe,
-            spec,
-            push_server,
-            running_pids,
-            cancelled_job_ids,
-            &job.id,
-            target_console,
-            library,
-        );
+        return execute_update_general_lastup_job(workers, &exe, spec, &job.id, target_console);
     }
 
     let mut command = new_web_subprocess_command(&exe, root_dir, &job.id);
@@ -521,16 +489,7 @@ fn execute_job(
                         exit_code: None,
                     };
                 }
-                return execute_diff_job(
-                    root_dir,
-                    &exe,
-                    &spec.args,
-                    push_server,
-                    running_pids,
-                    cancelled_job_ids,
-                    &job.id,
-                    target_console,
-                );
+                return execute_diff_job(workers, &exe, &spec.args, &job.id, target_console);
             }
             "diff_clean" => {
                 command.arg("diff").arg("--clean");
@@ -573,10 +532,10 @@ fn execute_job(
                     let spec = QueueExecutionSpec {
                         cmd: "update".to_string(),
                         args: job
-                        .target
-                        .split('\t')
-                        .map(|part| part.to_string())
-                        .collect(),
+                            .target
+                            .split('\t')
+                            .map(|part| part.to_string())
+                            .collect(),
                         meta: serde_yaml::Mapping::new(),
                     };
                     append_update_args(&mut command, push_server, target_console, &spec);
@@ -616,14 +575,7 @@ fn execute_job(
             JobType::AutoUpdate => unreachable!(),
         }
     }
-    spawn_and_stream_command(
-        command,
-        push_server,
-        running_pids,
-        cancelled_job_ids,
-        &job.id,
-        target_console,
-    )
+    spawn_and_stream_command(command, workers, &job.id, target_console)
 }
 
 fn new_web_subprocess_command(exe: &Path, root_dir: &Path, job_id: &str) -> std::process::Command {
@@ -684,8 +636,12 @@ fn execution_spec_meta_strings(spec: &QueueExecutionSpec, key: &str) -> Vec<Stri
     }
 }
 
-fn convert_targets_and_device(spec: &QueueExecutionSpec) -> Result<(Vec<String>, Option<String>), String> {
-    let device = super::normalize_web_device_override(execution_spec_meta_string(spec, "device").as_deref())?;
+fn convert_targets_and_device(
+    spec: &QueueExecutionSpec,
+) -> Result<(Vec<String>, Option<String>), String> {
+    let device = super::normalize_web_device_override(
+        execution_spec_meta_string(spec, "device").as_deref(),
+    )?;
     if device.is_some() {
         return Ok((spec.args.clone(), device));
     }
@@ -705,29 +661,23 @@ fn refresh_web_state(push_server: &Arc<PushServer>) {
     push_server.broadcast_event("table.reload", "");
     push_server.broadcast_event("tag.updateCanvas", "");
 }
-
 fn execute_update_general_lastup_job(
-    root_dir: &Path,
+    workers: &QueueWorkerContext,
     exe: &Path,
     spec: &QueueExecutionSpec,
-    push_server: &Arc<PushServer>,
-    running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
-    cancelled_job_ids: &Arc<parking_lot::Mutex<HashSet<String>>>,
     job_id: &str,
     target_console: &str,
-    library: &LibraryService,
 ) -> JobRunResult {
+    let QueueWorkerContext {
+        root_dir,
+        push_server,
+        library,
+        ..
+    } = workers;
     let mut command = new_web_subprocess_command(exe, root_dir, job_id);
     command.arg("update").arg("--gl");
     append_update_args(&mut command, push_server, target_console, spec);
-    let result = spawn_and_stream_command(
-        command,
-        push_server,
-        running_pids,
-        cancelled_job_ids,
-        job_id,
-        target_console,
-    );
+    let result = spawn_and_stream_command(command, workers, job_id, target_console);
     if !matches!(result.outcome, JobOutcome::Completed | JobOutcome::Partial)
         || !execution_spec_meta_bool(spec, "update_modified")
     {
@@ -739,8 +689,8 @@ fn execute_update_general_lastup_job(
         "<span style=\"color:#d7ba7d\">modified タグの付いた小説を更新します</span>",
         target_console,
     );
+    let modified_ids = current_modified_update_target_ids(library.as_ref());
 
-    let modified_ids = current_modified_update_target_ids(library);
     if modified_ids.is_empty() {
         push_server.broadcast_echo("modified タグの付いた小説はありません", target_console);
         return result;
@@ -751,14 +701,7 @@ fn execute_update_general_lastup_job(
     for id in modified_ids {
         followup.arg(id);
     }
-    spawn_and_stream_command(
-        followup,
-        push_server,
-        running_pids,
-        cancelled_job_ids,
-        job_id,
-        target_console,
-    )
+    spawn_and_stream_command(followup, workers, job_id, target_console)
 }
 
 fn update_by_tag_update_args(spec: &QueueExecutionSpec) -> Vec<String> {
@@ -817,15 +760,17 @@ fn append_update_args(
 }
 
 fn execute_diff_job(
-    root_dir: &Path,
+    workers: &QueueWorkerContext,
     exe: &Path,
     args: &[String],
-    push_server: &Arc<PushServer>,
-    running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
-    cancelled_job_ids: &Arc<parking_lot::Mutex<HashSet<String>>>,
     job_id: &str,
     target_console: &str,
 ) -> JobRunResult {
+    let QueueWorkerContext {
+        root_dir,
+        push_server,
+        ..
+    } = workers;
     if args.len() < 2 {
         push_server.broadcast_echo("diff task is missing the diff number", target_console);
         return JobRunResult {
@@ -861,14 +806,7 @@ fn execute_diff_job(
             .arg(number);
         configure_web_subprocess_command(&mut command);
         command.env(WEB_PROGRESS_SCOPE_ENV, job_id);
-        let result = spawn_and_stream_command(
-            command,
-            push_server,
-            running_pids,
-            cancelled_job_ids,
-            job_id,
-            target_console,
-        );
+        let result = spawn_and_stream_command(command, workers, job_id, target_console);
         match result.outcome {
             JobOutcome::Completed => {}
             JobOutcome::Partial => saw_partial = true,
@@ -896,12 +834,16 @@ fn execute_diff_job(
 
 fn spawn_and_stream_command(
     mut command: std::process::Command,
-    push_server: &Arc<PushServer>,
-    running_pids: &Arc<parking_lot::Mutex<HashMap<String, u32>>>,
-    cancelled_job_ids: &Arc<parking_lot::Mutex<HashSet<String>>>,
+    workers: &QueueWorkerContext,
     job_id: &str,
     target_console: &str,
 ) -> JobRunResult {
+    let QueueWorkerContext {
+        push_server,
+        running_child_pids: running_pids,
+        cancelled_job_ids,
+        ..
+    } = workers;
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -1040,7 +982,10 @@ fn summarize_failure_details(lines: &[String]) -> Option<String> {
         return None;
     }
     if text.chars().count() > MAX_FAILURE_DETAIL_CHARS {
-        text = text.chars().take(MAX_FAILURE_DETAIL_CHARS).collect::<String>();
+        text = text
+            .chars()
+            .take(MAX_FAILURE_DETAIL_CHARS)
+            .collect::<String>();
         text.push('…');
     }
     Some(text)
@@ -1080,56 +1025,21 @@ fn is_transient_failure(result: &JobRunResult) -> bool {
     true
 }
 
+/// `retry_count` 番目 (0-based) の再キューに使う待機秒数。
+/// 共有実装: `crate::application::retry_policy::backoff_secs`。
 fn compute_retry_backoff_secs(retry_count: u32, schedule: &[i64]) -> i64 {
-    if schedule.is_empty() {
-        return DEFAULT_RETRY_BACKOFF_SECS[0];
-    }
-    let idx = (retry_count as usize).min(schedule.len() - 1);
-    schedule[idx]
+    crate::application::retry_policy::backoff_secs(retry_count, schedule)
 }
 
+/// `queue.retry-backoff` 設定値の解釈。未設定・有効要素なしは既定スケジュール
+/// (`crate::application::retry_policy::backoff_schedule_from_spec`)。
 fn load_retry_backoff_schedule() -> Vec<i64> {
-    match crate::compat::load_local_setting_string("queue.retry-backoff") {
-        Some(spec) => {
-            let parsed = parse_backoff_spec(&spec);
-            if parsed.is_empty() {
-                DEFAULT_RETRY_BACKOFF_SECS.to_vec()
-            } else {
-                parsed
-            }
-        }
-        None => DEFAULT_RETRY_BACKOFF_SECS.to_vec(),
-    }
-}
-
-fn parse_backoff_spec(spec: &str) -> Vec<i64> {
-    spec.split(',')
-        .map(str::trim)
-        .filter_map(parse_backoff_value)
-        .collect()
-}
-
-fn parse_backoff_value(raw: &str) -> Option<i64> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let (num_str, multiplier): (&str, i64) =
-        if let Some(rest) = raw.strip_suffix(['s', 'S']) {
-            (rest, 1)
-        } else if let Some(rest) = raw.strip_suffix(['m', 'M']) {
-            (rest, 60)
-        } else if let Some(rest) = raw.strip_suffix(['h', 'H']) {
-            (rest, 3600)
-        } else {
-            (raw, 1)
-        };
-    let num_str = num_str.trim();
-    let parsed = num_str.parse::<i64>().ok()?;
-    if parsed < 0 {
-        return None;
-    }
-    Some(parsed * multiplier)
+    crate::application::retry_policy::backoff_schedule_from_spec(
+        crate::compat::load_local_setting_string(
+            crate::application::retry_policy::RETRY_BACKOFF_KEY,
+        )
+        .as_deref(),
+    )
 }
 
 fn console_target_for_job(job_type: JobType) -> &'static str {
@@ -1189,15 +1099,15 @@ mod tests {
     use std::os::windows::process::ExitStatusExt;
 
     use super::{
-        MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, JobOutcome, JobRunResult, WorkerLane,
+        JobOutcome, JobRunResult, MAX_FAILURE_DETAIL_CHARS, MAX_FAILURE_DETAIL_LINES, WorkerLane,
         classify_job_outcome, clear_progress_for_job, compute_retry_backoff_secs,
         console_target_for_job, convert_targets_and_device, execution_spec_meta_bool,
         execution_spec_meta_string, execution_spec_meta_strings, failure_reason,
-        is_transient_failure, job_conflicts_with_running, parse_backoff_spec,
-        parse_backoff_value, parse_convert_job_target, pop_next_job, remember_failure_line,
-        route_structured_web_message, should_retry_job, summarize_failure_details,
-        update_by_tag_update_args,
+        is_transient_failure, job_conflicts_with_running, parse_convert_job_target, pop_next_job,
+        remember_failure_line, route_structured_web_message, should_retry_job,
+        summarize_failure_details, update_by_tag_update_args,
     };
+    use crate::application::retry_policy::{parse_backoff_spec, parse_backoff_value};
     use crate::queue::{JobType, PersistentQueue, QueueJob, QueueLane};
     use std::collections::{HashMap, HashSet};
 
@@ -1229,7 +1139,10 @@ mod tests {
         };
         assert_eq!(
             convert_targets_and_device(&spec).unwrap(),
-            (vec!["1".to_string(), "2".to_string()], Some("kindle".to_string()))
+            (
+                vec!["1".to_string(), "2".to_string()],
+                Some("kindle".to_string())
+            )
         );
     }
 
@@ -1573,8 +1486,12 @@ mod tests {
         clear_progress_for_job(&push_server, "job-123");
 
         let first: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
-        let second: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
-        let targets = [first["target_console"].as_str().unwrap(), second["target_console"].as_str().unwrap()];
+        let second: serde_json::Value =
+            serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+        let targets = [
+            first["target_console"].as_str().unwrap(),
+            second["target_console"].as_str().unwrap(),
+        ];
 
         assert_eq!(first["type"], "progressbar.clear");
         assert_eq!(second["type"], "progressbar.clear");
@@ -1632,7 +1549,10 @@ mod tests {
             meta,
         };
 
-        assert_eq!(execution_spec_meta_strings(&spec, "snapshot_ids"), vec!["12", "34"]);
+        assert_eq!(
+            execution_spec_meta_strings(&spec, "snapshot_ids"),
+            vec!["12", "34"]
+        );
         assert!(execution_spec_meta_strings(&spec, "missing").is_empty());
     }
 

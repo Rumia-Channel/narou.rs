@@ -170,9 +170,10 @@ async fn main() {
     // 親が渡した `NAROU_RS_RESTART_CWD` へ戻してから通常処理に入る。
     // 旧 updater でも環境変数は透過するため後方互換。
     if let Ok(dir) = std::env::var("NAROU_RS_RESTART_CWD")
-        && !dir.is_empty() {
-            let _ = std::env::set_current_dir(&dir);
-        }
+        && !dir.is_empty()
+    {
+        let _ = std::env::set_current_dir(&dir);
+    }
 
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -360,7 +361,10 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             unreachable!()
         }
         Commands::Mail { targets, force } => {
-            commands::mail::cmd_mail(commands::mail::MailOptions { targets, force }, &narou_rs::progress::console_sink());
+            commands::mail::cmd_mail(
+                commands::mail::MailOptions { targets, force },
+                &narou_rs::progress::console_sink(),
+            );
             0
         }
         Commands::Send {
@@ -413,10 +417,10 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                 eprintln!("Usage: narou convert <url|ncode|id>...");
                 1
             } else {
-                commands::convert::cmd_convert(
-                    &targets,
-                    output.as_deref(),
-                    encoding.as_deref(),
+                commands::convert::cmd_convert(commands::convert::ConvertOptions {
+                    targets: &targets,
+                    output: output.as_deref(),
+                    encoding: encoding.as_deref(),
                     no_epub,
                     no_mobi,
                     no_strip,
@@ -427,8 +431,8 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                     verbose,
                     ignore_default,
                     ignore_force,
-                    narou_rs::progress::console_sink().as_ref(),
-                );
+                    sink: narou_rs::progress::console_sink().as_ref(),
+                });
                 0
             }
         }

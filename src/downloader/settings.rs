@@ -177,13 +177,10 @@ impl DownloaderSettings for NativeDownloaderSettings {
     }
 
     fn save_global_setting_bool(&self, key: &str, value: bool) -> Result<()> {
-        crate::db::settings::update(
-            crate::setting_core::SettingScope::Global,
-            |settings| {
-                settings.insert(key.to_string(), serde_yaml::Value::Bool(value));
-                Ok(())
-            },
-        )
+        crate::db::settings::update(crate::setting_core::SettingScope::Global, |settings| {
+            settings.insert(key.to_string(), serde_yaml::Value::Bool(value));
+            Ok(())
+        })
     }
 
     fn download_use_subdirectory(&self) -> bool {
@@ -246,7 +243,6 @@ impl DownloaderSettings for NativeDownloaderSettings {
         Ok(crate::compat::confirm(message, default, nontty_default))
     }
 }
-
 
 #[cfg(test)]
 mod tests {

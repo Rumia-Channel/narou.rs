@@ -18,6 +18,8 @@ use narou_rs::application::{
 use std::collections::HashSet;
 use worker::{Env, Method, Request, Response};
 
+use super::json_error;
+
 /// native `crate::web::MAX_WEB_PAGE_LENGTH` と同じページ長上限。
 const MAX_WEB_PAGE_LENGTH: u64 = 500;
 /// native `crate::web::MAX_WEB_SEARCH_BYTES` と同じ検索語バイト上限。
@@ -280,12 +282,3 @@ fn map_application_error(error: ApplicationError) -> worker::Result<Response> {
     json_error(status, code, Some(&message))
 }
 
-/// `worker_entry::json_error` と同じ機械可読エラー形
-/// (`{error: {code, message?}}`)。
-fn json_error(status: u16, code: &str, message: Option<&str>) -> worker::Result<Response> {
-    let payload = match message {
-        Some(message) => serde_json::json!({ "error": { "code": code, "message": message } }),
-        None => serde_json::json!({ "error": { "code": code } }),
-    };
-    Response::from_json(&payload).map(|response| response.with_status(status))
-}

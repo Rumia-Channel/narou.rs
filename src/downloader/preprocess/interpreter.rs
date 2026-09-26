@@ -28,7 +28,12 @@ impl<'a> Ctx<'a> {
         let mut vars = HashMap::new();
         vars.insert(
             "fetched".to_string(),
-            Value::Object(jobs.results().iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            Value::Object(
+                jobs.results()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
         );
         // The URL this body came from, so definitions can derive follow-up
         // URLs (Pixiv pages its manga series listings).
@@ -207,11 +212,13 @@ fn eval_expr(ctx: &mut Ctx, expr: &Expr) -> PreprocessResult<Value> {
             let left = eval_expr(ctx, left)?;
             let right = eval_expr(ctx, right)?;
             match (as_integer(&left), as_integer(&right)) {
-                (Some(a), Some(b)) => Value::Number(match op {
-                    ArithOp::Add => a.saturating_add(b),
-                    ArithOp::Sub => a.saturating_sub(b),
-                }
-                .into()),
+                (Some(a), Some(b)) => Value::Number(
+                    match op {
+                        ArithOp::Add => a.saturating_add(b),
+                        ArithOp::Sub => a.saturating_sub(b),
+                    }
+                    .into(),
+                ),
                 _ => Value::Null,
             }
         }
@@ -356,11 +363,7 @@ fn eval_method(ctx: &mut Ctx, val: Value, method: &Method) -> PreprocessResult<V
                 None => val,
             }
         }
-        Method::GsubRegex {
-            pattern,
-            flags,
-            to,
-        } => {
+        Method::GsubRegex { pattern, flags, to } => {
             let replacement = ctx.resolve_str_parts(to)?;
             match val.as_str() {
                 Some(s) => {
@@ -674,10 +677,7 @@ mod tests {
              insert_at_match\n",
             "",
         );
-        assert_eq!(
-            out,
-            "size=3\nfirst=10\nlast=30\nindex0=10\nindex2=30\noob="
-        );
+        assert_eq!(out, "size=3\nfirst=10\nlast=30\nindex0=10\nindex2=30\noob=");
     }
 
     #[test]
@@ -790,7 +790,10 @@ mod tests {
         );
         let mut source = String::new();
         let run = run_stmts_checked(&stmts, &mut source, &settled, "").unwrap();
-        assert!(run.requested.is_empty(), "settled jobs are not re-requested");
+        assert!(
+            run.requested.is_empty(),
+            "settled jobs are not re-requested"
+        );
         assert_eq!(source, "url=https://i.example/11.jpg");
     }
 
@@ -859,7 +862,9 @@ mod tests {
     fn guard_stops_reprocessing_when_magic_word_present() {
         let stmts = vec![
             Stmt::Guard("MagicWord".to_string()),
-            Stmt::Emit(Expr::String(vec![StrPart::Lit("should_not_appear".to_string())])),
+            Stmt::Emit(Expr::String(vec![StrPart::Lit(
+                "should_not_appear".to_string(),
+            )])),
             Stmt::InsertAtMatch,
         ];
         let mut source = "MagicWord is here".to_string();
@@ -955,10 +960,12 @@ mod tests {
                 expr: Expr::Chain {
                     base: Accessor {
                         base: "result".to_string(),
-                        path: vec![AccessPart::Bracket(BracketKey::Expr(Expr::Access(Accessor {
-                            base: "key".to_string(),
-                            path: vec![],
-                        })))],
+                        path: vec![AccessPart::Bracket(BracketKey::Expr(Expr::Access(
+                            Accessor {
+                                base: "key".to_string(),
+                                path: vec![],
+                            },
+                        )))],
                     },
                     methods: vec![],
                 },
@@ -1030,7 +1037,8 @@ mod tests {
             Stmt::InsertAtMatch,
         ];
         let mut source =
-            r#"<script id="x" type="application/json">{"items":[{"a":1,"b":[2,3]}]}</script>"#.to_string();
+            r#"<script id="x" type="application/json">{"items":[{"a":1,"b":[2,3]}]}</script>"#
+                .to_string();
         run(&stmts, &mut source).unwrap();
         assert!(source.contains("1"));
         assert!(source.contains("2"));
@@ -1126,7 +1134,8 @@ mod tests {
             Stmt::InsertAtMatch,
         ];
         let mut source =
-            r#"<script id="x" type="application/json">{"work":{"title":"old"}}</script>"#.to_string();
+            r#"<script id="x" type="application/json">{"work":{"title":"old"}}</script>"#
+                .to_string();
         run(&stmts, &mut source).unwrap();
         assert!(source.contains("title::new_title"));
     }
@@ -1227,7 +1236,8 @@ mod tests {
             Stmt::InsertAtMatch,
         ];
         let mut source =
-            r#"<script id="x" type="application/json">{"empty_arr":[],"has_toc":true}</script>"#.to_string();
+            r#"<script id="x" type="application/json">{"empty_arr":[],"has_toc":true}</script>"#
+                .to_string();
         run(&stmts, &mut source).unwrap();
         assert!(source.contains("in_else"));
         assert!(!source.contains("in_then"));
@@ -1252,15 +1262,18 @@ mod tests {
                     },
                     methods: vec![],
                 },
-                body: vec![Stmt::Emit(Expr::String(vec![StrPart::Interp(Expr::Access(Accessor {
-                    base: "item".to_string(),
-                    path: vec![],
-                }))]))],
+                body: vec![Stmt::Emit(Expr::String(vec![StrPart::Interp(
+                    Expr::Access(Accessor {
+                        base: "item".to_string(),
+                        path: vec![],
+                    }),
+                )]))],
             },
             Stmt::InsertAtMatch,
         ];
         let mut source =
-            r#"<script id="x" type="application/json">{"items":["a","b","c"]}</script>"#.to_string();
+            r#"<script id="x" type="application/json">{"items":["a","b","c"]}</script>"#
+                .to_string();
         run(&stmts, &mut source).unwrap();
         assert!(source.contains("a"));
         assert!(source.contains("b"));
@@ -1292,9 +1305,7 @@ mod tests {
         let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
         assert_eq!(
             err,
-            format!(
-                "preprocess: string size limit exceeded ({PREPROCESS_MAX_STRING_BYTES} bytes)"
-            )
+            format!("preprocess: string size limit exceeded ({PREPROCESS_MAX_STRING_BYTES} bytes)")
         );
     }
 
@@ -1308,9 +1319,7 @@ mod tests {
         let err = run_stmts_checked(&stmts, &mut source, &PreprocessJobs::new(), "").unwrap_err();
         assert_eq!(
             err,
-            format!(
-                "preprocess: array size limit exceeded ({PREPROCESS_MAX_ARRAY_ITEMS} items)"
-            )
+            format!("preprocess: array size limit exceeded ({PREPROCESS_MAX_ARRAY_ITEMS} items)")
         );
     }
 }

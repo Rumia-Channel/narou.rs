@@ -12,7 +12,6 @@ use crate::error::{NarouError, Result};
 
 const MAX_PENDING_JOBS: usize = 10_000;
 const MAX_JOB_TARGET_CHARS: usize = 16 * 1024;
-const DEFAULT_MAX_RETRIES: u32 = 3;
 pub const WEBUI_MESSAGE_TYPE_META_KEY: &str = "webui_message_type";
 pub const WEBUI_MESSAGE_TEXT_META_KEY: &str = "webui_message_text";
 pub const WEBUI_UPDATE_START_MESSAGE_TYPE: &str = "update_start";
@@ -1198,20 +1197,9 @@ fn build_stored_job(
 }
 
 fn configured_max_retries() -> u32 {
-    crate::compat::load_local_setting_value("queue.max-retries")
-        .and_then(parse_max_retries_value)
-        .unwrap_or(DEFAULT_MAX_RETRIES)
-}
-
-fn parse_max_retries_value(value: Value) -> Option<u32> {
-    let parsed = match value {
-        Value::Number(number) => number
-            .as_i64()
-            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
-        Value::String(raw) => raw.trim().parse::<i64>().ok(),
-        _ => None,
-    }?;
-    Some(parsed.clamp(0, u32::MAX as i64) as u32)
+    crate::application::retry_policy::max_retries(
+        crate::compat::load_local_setting_value("queue.max-retries").as_ref(),
+    )
 }
 
 fn build_legacy_task(

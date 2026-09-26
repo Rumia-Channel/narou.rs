@@ -26,7 +26,6 @@ pub enum DbAction {
     Vacuum,
 }
 
-
 pub fn cmd_db(action: DbAction) -> narou_rs::error::Result<()> {
     // Every action operates on the live handle; this also triggers the
     // legacy import on first run.

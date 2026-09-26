@@ -89,10 +89,8 @@ mod policy_tests {
     fn hameln_definition_carries_browser_fetch_metadata() {
         // R18 分離ドメインの Cloudflare challenge を避けるためのヘッダが
         // サイト定義から実際に policy へ流れていることを固定する。
-        let setting: super::super::site_setting::SiteSetting = serde_yaml::from_str(
-            include_str!("../../webnovel/syosetu.org.yaml"),
-        )
-        .unwrap();
+        let setting: super::super::site_setting::SiteSetting =
+            serde_yaml::from_str(include_str!("../../webnovel/syosetu.org.yaml")).unwrap();
         let policy = FetchPolicy::for_site(&setting);
 
         for name in [
@@ -193,11 +191,9 @@ pub async fn resolve_final_url(
     url: &str,
     policy: &FetchPolicy,
 ) -> Result<String> {
-    Ok(
-        resolve_final_url_with_body(http, rate_limiter, url, policy)
-            .await?
-            .0,
-    )
+    Ok(resolve_final_url_with_body(http, rate_limiter, url, policy)
+        .await?
+        .0)
 }
 
 /// Same redirect-chain resolution as [`resolve_final_url`], additionally

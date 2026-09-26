@@ -2,9 +2,9 @@
 use chrono::{DateTime, Utc};
 
 use crate::error::Result;
-use crate::platform::{HttpClient, HttpRequest, RateLimitScope, RateLimiter};
 #[cfg(feature = "native-runtime")]
 use crate::platform::NovelRepository;
+use crate::platform::{HttpClient, HttpRequest, RateLimitScope, RateLimiter};
 
 use super::http_policy::{ensure_success_response, host_of};
 #[cfg(feature = "native-runtime")]
@@ -143,7 +143,6 @@ pub async fn narou_api_batch_update(
         .map(|record| (record.id, record.ncode.clone().unwrap()))
         .collect();
 
-
     if narou_ids.is_empty() {
         return Ok((0, 0));
     }
@@ -183,10 +182,7 @@ pub async fn narou_api_batch_update(
         // transaction per 50-novel chunk.
         let mut mutations = Vec::new();
         for entry in &entries {
-            let entry_ncode = entry
-                .get("ncode")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let entry_ncode = entry.get("ncode").and_then(|v| v.as_str()).unwrap_or("");
 
             if let Some(record) = narou_records
                 .iter()

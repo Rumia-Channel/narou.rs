@@ -84,50 +84,65 @@ async fn cmd_download_inner(
 
             if is_novel_frozen(&download_target) {
                 if let Some(ref rec) = data {
-                    sink.emit(Stream::Stdout, &messages::download::frozen_abort(&rec.title));
+                    sink.emit(
+                        Stream::Stdout,
+                        &messages::download::frozen_abort(&rec.title),
+                    );
                 }
                 mistook += 1;
                 break;
             }
 
             if !opts.force
-                && let Some(existing) = inspect_existing_download(&download_target, sink) {
-                    match existing {
-                        ExistingDownloadState::Present(rec) => {
-                            sink.emit(
-                                Stream::Stdout,
-                                &messages::download::already_downloaded(
-                                    &download_target,
-                                    rec.id,
-                                    &rec.title,
-                                ),
-                            );
-                            mistook += 1;
-                            break;
+                && let Some(existing) = inspect_existing_download(&download_target, sink)
+            {
+                match existing {
+                    ExistingDownloadState::Present(rec) => {
+                        sink.emit(
+                            Stream::Stdout,
+                            &messages::download::already_downloaded(
+                                &download_target,
+                                rec.id,
+                                &rec.title,
+                            ),
+                        );
+                        mistook += 1;
+                        break;
+                    }
+                    ExistingDownloadState::Missing { record, path } => {
+                        sink.emit(
+                            Stream::Stderr,
+                            &messages::download::missing_dir_index_removed(&path),
+                        );
+                        if confirm(
+                            &messages::download::confirm_yes_no("再ダウンロードしますか"),
+                            false,
+                            true,
+                            sink,
+                        ) {
+                            download_target = record.toc_url;
+                            continue;
                         }
-                        ExistingDownloadState::Missing { record, path } => {
-                            sink.emit(
-                                Stream::Stderr,
-                                &messages::download::missing_dir_index_removed(&path),
-                            );
-                            if confirm(&messages::download::confirm_yes_no("再ダウンロードしますか"), false, true, sink) {
-                                download_target = record.toc_url;
-                                continue;
-                            }
-                            mistook += 1;
-                            break;
-                        }
+                        mistook += 1;
+                        break;
                     }
                 }
+            }
 
             let progress: Box<dyn narou_rs::progress::ProgressReporter> = if is_web_mode() {
                 Box::new(WebProgress::new("download"))
             } else {
-                Box::new(CliProgress::with_multi(&format!("DL {}", download_target), multi_clone.clone()))
+                Box::new(CliProgress::with_multi(
+                    &format!("DL {}", download_target),
+                    multi_clone.clone(),
+                ))
             };
             downloader.set_progress(progress);
 
-            match downloader.download_novel_with_force(&download_target, opts.force).await {
+            match downloader
+                .download_novel_with_force(&download_target, opts.force)
+                .await
+            {
                 Ok(dl) => {
                     print_download_status(&dl, sink);
 
@@ -234,7 +249,10 @@ fn interactive_mode(downloader: &Downloader, sink: &Arc<dyn MessageSink>) -> Vec
 }
 
 fn print_prompt(count: usize, sink: &Arc<dyn MessageSink>) {
-    sink.emit_fragment(Stream::Stdout, &messages::download::interactive_prompt(count));
+    sink.emit_fragment(
+        Stream::Stdout,
+        &messages::download::interactive_prompt(count),
+    );
     let _ = io::stdout().flush();
 }
 
@@ -354,11 +372,15 @@ pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
     match target_type {
         TargetType::Id => {
             if let Ok(id) = target.parse::<i64>() {
-                novels.get_sync(id.into()).ok().flatten().map(|r| RecordInfo {
-                    id: r.id,
-                    title: r.title,
-                    toc_url: r.toc_url,
-                })
+                novels
+                    .get_sync(id.into())
+                    .ok()
+                    .flatten()
+                    .map(|r| RecordInfo {
+                        id: r.id,
+                        title: r.title,
+                        toc_url: r.toc_url,
+                    })
             } else {
                 None
             }
@@ -375,15 +397,17 @@ pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
                     toc_url: r.toc_url,
                 })
         }
-        TargetType::Ncode => novels
-            .find_by_ncode_sync(&target)
-            .ok()
-            .flatten()
-            .map(|r| RecordInfo {
-                id: r.id,
-                title: r.title,
-                toc_url: r.toc_url,
-            }),
+        TargetType::Ncode => {
+            novels
+                .find_by_ncode_sync(&target)
+                .ok()
+                .flatten()
+                .map(|r| RecordInfo {
+                    id: r.id,
+                    title: r.title,
+                    toc_url: r.toc_url,
+                })
+        }
         _ => novels
             .find_by_title_sync(&target)
             .ok()
@@ -410,7 +434,10 @@ fn resolve_toc_url_from_url(target: &str) -> Option<String> {
     None
 }
 
-fn inspect_existing_download(target: &str, sink: &Arc<dyn MessageSink>) -> Option<ExistingDownloadState> {
+fn inspect_existing_download(
+    target: &str,
+    sink: &Arc<dyn MessageSink>,
+) -> Option<ExistingDownloadState> {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     let record = get_record_for_target(target)?;
     let info = RecordInfo {
@@ -426,10 +453,13 @@ fn inspect_existing_download(target: &str, sink: &Arc<dyn MessageSink>) -> Optio
         return Some(ExistingDownloadState::Present(info));
     }
 
-    if let Err(err) = novels
-        .apply_batch_sync(vec![narou_rs::platform::NovelMutation::Remove(record.id.into())])
-    {
-        sink.emit(Stream::Stderr, &messages::download::stale_index_cleanup_warn(err));
+    if let Err(err) = novels.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Remove(
+        record.id.into(),
+    )]) {
+        sink.emit(
+            Stream::Stderr,
+            &messages::download::stale_index_cleanup_warn(err),
+        );
     }
 
     Some(ExistingDownloadState::Missing {
@@ -449,9 +479,8 @@ fn get_record_for_target(target: &str) -> Option<narou_rs::db::NovelRecord> {
                 None
             }
         }
-        _ => get_data_by_target(target).and_then(|info| {
-            novels.get_sync(info.id.into()).ok().flatten()
-        }),
+        _ => get_data_by_target(target)
+            .and_then(|info| novels.get_sync(info.id.into()).ok().flatten()),
     }
 }
 
@@ -510,11 +539,20 @@ fn print_download_status(dl: &narou_rs::downloader::DownloadResult, sink: &Arc<d
                     ),
                 );
             } else if dl.title_changed {
-                sink.emit(Stream::Stdout, &messages::download::title_changed(dl.id, &dl.title));
+                sink.emit(
+                    Stream::Stdout,
+                    &messages::download::title_changed(dl.id, &dl.title),
+                );
             } else if dl.story_changed {
-                sink.emit(Stream::Stdout, &messages::download::story_changed(dl.id, &dl.title));
+                sink.emit(
+                    Stream::Stdout,
+                    &messages::download::story_changed(dl.id, &dl.title),
+                );
             } else if dl.author_changed {
-                sink.emit(Stream::Stdout, &messages::download::author_changed(dl.id, &dl.title));
+                sink.emit(
+                    Stream::Stdout,
+                    &messages::download::author_changed(dl.id, &dl.title),
+                );
             }
         }
         UpdateStatus::None => {
@@ -604,10 +642,12 @@ fn auto_convert_via_web_subprocess(id: i64) -> Result<(), String> {
         .take()
         .ok_or_else(|| messages::download::convert_stderr_unavailable().to_string())?;
 
-    let stdout_thread =
-        std::thread::spawn(move || narou_rs::compat::relay_web_stream_to_console(stdout, "stdout2"));
-    let stderr_thread =
-        std::thread::spawn(move || narou_rs::compat::relay_web_stream_to_console(stderr, "stdout2"));
+    let stdout_thread = std::thread::spawn(move || {
+        narou_rs::compat::relay_web_stream_to_console(stdout, "stdout2")
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        narou_rs::compat::relay_web_stream_to_console(stderr, "stdout2")
+    });
 
     let status = child.wait().map_err(|e| e.to_string())?;
     stdout_thread
@@ -713,8 +753,14 @@ mod tests {
         let queue = PersistentQueue::new(&temp.path().join(".narou").join("queue.yaml")).unwrap();
         assert_eq!(queue.pending_count(), 1);
         let snapshot = queue.snapshot();
-        assert_eq!(snapshot.jobs.front().map(|job| job.job_type), Some(JobType::Convert));
-        assert_eq!(snapshot.jobs.front().map(|job| job.target.as_str()), Some("3062"));
+        assert_eq!(
+            snapshot.jobs.front().map(|job| job.job_type),
+            Some(JobType::Convert)
+        );
+        assert_eq!(
+            snapshot.jobs.front().map(|job| job.target.as_str()),
+            Some("3062")
+        );
         *narou_rs::db::DATABASE.lock() = None;
     }
 }

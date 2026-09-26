@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::downloader::Downloader;
+use crate::downloader::{Downloader, DownloaderPlatform};
 use crate::platform::{
     AssetStore, CookieStore, HttpClient, NovelRepository, ObjectStore, RateLimiter, SystemClock,
 };
@@ -39,14 +39,14 @@ impl Downloader {
         let objects: Arc<dyn ObjectStore> = store.clone();
         let assets: Arc<dyn AssetStore> = store;
         let cookies = cookie_store();
-        let downloader = Self::with_platform_and_storage(
+        let downloader = Self::with_platform_and_storage(DownloaderPlatform {
             http,
             rate_limiter,
             novels,
             objects,
             assets,
-            Arc::new(SystemClock),
-        )?;
+            clock: Arc::new(SystemClock),
+        })?;
         Ok(match cookies {
             Some(cookies) => downloader.with_cookie_store(cookies),
             None => downloader,
@@ -69,14 +69,14 @@ impl Downloader {
         let store = Arc::new(crate::native::object_store::NativeStore::for_current_root()?);
         let objects: Arc<dyn ObjectStore> = store.clone();
         let assets: Arc<dyn AssetStore> = store;
-        let downloader = Self::with_platform_and_storage(
+        let downloader = Self::with_platform_and_storage(DownloaderPlatform {
             http,
             rate_limiter,
             novels,
             objects,
             assets,
-            Arc::new(SystemClock),
-        )?;
+            clock: Arc::new(SystemClock),
+        })?;
         Ok(match cookies {
             Some(cookies) => downloader.with_cookie_store(cookies),
             None => downloader,

@@ -3,9 +3,9 @@ use std::fs;
 #[cfg(feature = "native-runtime")]
 use std::path::PathBuf;
 
+use super::settings::NovelSettings;
 #[cfg(feature = "native-runtime")]
 use crate::termcolor::bold_colored;
-use super::settings::NovelSettings;
 
 pub const INSPECT_LOG_NAME: &str = "調査ログ.txt";
 const LINE_LENGTH_THRESHOLD: usize = 400;
@@ -44,7 +44,10 @@ pub struct Inspector {
 }
 
 impl Inspector {
-    pub fn new(#[cfg_attr(not(feature = "native-runtime"), allow(unused_variables))] settings: &NovelSettings) -> Self {
+    pub fn new(
+        #[cfg_attr(not(feature = "native-runtime"), allow(unused_variables))]
+        settings: &NovelSettings,
+    ) -> Self {
         Self {
             #[cfg(feature = "native-runtime")]
             archive_path: settings.archive_path.clone(),
@@ -62,7 +65,7 @@ impl Inspector {
         self.subtitle = subtitle.into();
     }
 
-#[cfg(feature = "native-runtime")]
+    #[cfg(feature = "native-runtime")]
     pub fn save(&self) -> std::io::Result<()> {
         let mut output = format!("※調査日時：{}\n", chrono::Local::now());
         let rendered = self.render_filtered(|_| true);
@@ -94,7 +97,7 @@ impl Inspector {
         ))
     }
 
-#[cfg(feature = "native-runtime")]
+    #[cfg(feature = "native-runtime")]
     pub fn display_text(&self) -> Option<String> {
         let mut sections = Vec::new();
 
@@ -301,9 +304,10 @@ impl Inspector {
             if ch == open {
                 stack.push(idx + ch.len_utf8());
             } else if ch == close
-                && let Some(start) = stack.pop() {
-                    results.push(&data[start..idx]);
-                }
+                && let Some(start) = stack.pop()
+            {
+                results.push(&data[start..idx]);
+            }
         }
 
         results
@@ -349,14 +353,15 @@ fn is_ignore_indent_char(ch: char) -> bool {
 fn rebuild_brackets(data: &str, replacements: &[String]) -> String {
     static RE_KAGI_BRACKET: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"［＃かぎ括弧＝(\d+)］").unwrap());
-    RE_KAGI_BRACKET.replace_all(data, |caps: &regex::Captures| {
-        let index = caps[1].parse::<usize>().unwrap_or(usize::MAX);
-        replacements
-            .get(index)
-            .cloned()
-            .unwrap_or_else(|| caps[0].to_string())
-    })
-    .to_string()
+    RE_KAGI_BRACKET
+        .replace_all(data, |caps: &regex::Captures| {
+            let index = caps[1].parse::<usize>().unwrap_or(usize::MAX);
+            replacements
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| caps[0].to_string())
+        })
+        .to_string()
 }
 
 fn tail_chars(text: &str, max_chars: usize) -> String {
@@ -382,13 +387,13 @@ mod tests {
     fn test_settings() -> NovelSettings {
         let settings = NovelSettings {
             archive_path: std::env::temp_dir().join(format!(
-            "narou-rs-inspector-test-{}-{}",
-            TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )),
+                "narou-rs-inspector-test-{}-{}",
+                TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )),
             ..NovelSettings::default()
         };
         std::fs::create_dir_all(&settings.archive_path).unwrap();

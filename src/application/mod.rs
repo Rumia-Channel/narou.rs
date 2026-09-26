@@ -13,6 +13,8 @@
 //!   `SiteTimezoneProvider`) plus their no-op defaults.
 //! - [`library`]: the novel library list service (search / filter /
 //!   pagination / frozen status / new-arrival marker).
+//! - [`webui`]: native の `src/web` と Worker の `webui` が共有する Web UI
+//!   ヘルパ（入力バリデーション、ソート状態、エラー応答ボディ、表示用小道具）。
 
 pub mod error;
 pub mod aliases;
@@ -28,10 +30,13 @@ pub mod scheduler;
 pub mod self_update;
 pub mod settings;
 pub mod settings_view;
+pub mod retry_policy;
 pub mod version_compare;
+pub mod push_events;
 pub mod web_payloads;
 pub mod tag_colors;
 pub mod web_actions;
+pub mod webui;
 pub use jobs::{
     CheckpointClaim, CheckpointState, ExecutionPhase, JobClaim, JobFailureClass, JobId, JobKind,
     JobLedgerStatus, JobPlan, JobPlanResult, JobQueue, JobRequest, JobService, JobTarget,

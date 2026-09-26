@@ -43,26 +43,7 @@ pub struct DiffListQuery {
     pub target: Option<String>,
 }
 
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-fn tag_color_class(color: &str) -> &'static str {
-    match color {
-        "green" => "tag-green",
-        "yellow" => "tag-yellow",
-        "blue" => "tag-blue",
-        "magenta" => "tag-magenta",
-        "cyan" => "tag-cyan",
-        "red" => "tag-red",
-        "white" => "tag-white",
-        _ => "tag-default",
-    }
-}
+use super::{html_escape, tag_color_class, targets_to_strings};
 
 fn validate_download_targets(targets: &[String], max_targets: usize) -> Result<(), String> {
     if targets.len() > max_targets {
@@ -1016,18 +997,6 @@ pub async fn queue_clear(State(state): State<AppState>) -> Json<ApiResponse> {
             message: e.to_string(),
         }),
     }
-}
-
-/// Helper: convert mixed JSON values (numbers or strings) into string targets
-fn targets_to_strings(targets: &[serde_json::Value]) -> Vec<String> {
-    targets
-        .iter()
-        .map(|v| match v {
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => s.clone(),
-            other => other.to_string(),
-        })
-        .collect()
 }
 
 fn encode_convert_job_target(targets: &[String]) -> String {

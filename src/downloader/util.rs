@@ -65,17 +65,31 @@ pub fn pretreatment_source(src: &mut String, _encoding: &str, setting: Option<&S
     src.retain(|c| c != '\r');
     decode_numeric_entities(src);
     if let Some(setting) = setting
-        && let Some(pipeline) = setting.preprocess_pipeline() {
-            let jobs = preprocess::PreprocessJobs::new();
-            let run = preprocess::run_preprocess(pipeline, src, &jobs, "");
-            if !run.requested.is_empty() {
-                tracing::warn!(
-                    "preprocess for {} requested {} URL(s) that this path cannot fetch",
-                    setting.name,
-                    run.requested.len()
-                );
-            }
+        && let Some(pipeline) = setting.preprocess_pipeline()
+    {
+        let jobs = preprocess::PreprocessJobs::new();
+        let run = preprocess::run_preprocess(pipeline, src, &jobs, "");
+        if !run.requested.is_empty() {
+            tracing::warn!(
+                "preprocess for {} requested {} URL(s) that this path cannot fetch",
+                setting.name,
+                run.requested.len()
+            );
         }
+    }
+}
+
+/// One pretreatment run: the fetched body to rewrite plus the platform
+/// handles needed when the `preprocess:` definition asks for more URLs.
+pub struct PretreatmentRequest<'a> {
+    pub http: &'a dyn HttpClient,
+    pub rate_limiter: &'a dyn RateLimiter,
+    pub policy: &'a crate::downloader::http_policy::FetchPolicy,
+    pub src: &'a mut String,
+    pub encoding: &'a str,
+    pub setting: Option<&'a SiteSetting>,
+    pub jobs: &'a mut preprocess::PreprocessJobs,
+    pub url: &'a str,
 }
 
 /// Rewrite a fetched body in place, executing any URLs the definition asks for.
@@ -85,16 +99,17 @@ pub fn pretreatment_source(src: &mut String, _encoding: &str, setting: Option<&S
 /// result depends only on the body and the settled job results. Jobs that have
 /// finished are visible immediately through `jobs`, which callers keep for the
 /// whole novel so repeated references resolve once.
-pub async fn pretreatment_source_with_jobs(
-    http: &dyn HttpClient,
-    rate_limiter: &dyn RateLimiter,
-    policy: &crate::downloader::http_policy::FetchPolicy,
-    src: &mut String,
-    _encoding: &str,
-    setting: Option<&SiteSetting>,
-    jobs: &mut preprocess::PreprocessJobs,
-    url: &str,
-) -> Result<()> {
+pub async fn pretreatment_source_with_jobs(request: PretreatmentRequest<'_>) -> Result<()> {
+    let PretreatmentRequest {
+        http,
+        rate_limiter,
+        policy,
+        src,
+        encoding: _encoding,
+        setting,
+        jobs,
+        url,
+    } = request;
     src.retain(|c| c != '\r');
     decode_numeric_entities(src);
     let Some(setting) = setting else {
@@ -213,7 +228,9 @@ pub fn sanitize_filename(name: &str) -> String {
 pub fn mask_spoiler_text(text: &str) -> String {
     text.chars()
         .map(|ch| match ch {
-            '0'..='9' | '０'..='９' | ' ' | '　' | '、' | '。' | '!' | '?' | '！' | '？' => ch,
+            '0'..='9' | '０'..='９' | ' ' | '　' | '、' | '。' | '!' | '?' | '！' | '？' => {
+                ch
+            }
             _ => '●',
         })
         .collect()
@@ -249,7 +266,10 @@ mod tests {
     #[test]
     fn sanitize_filename_with_limit_rejects_reserved_and_control_names() {
         assert_eq!(sanitize_filename_with_limit("CON.txt", None), "_CON.txt");
-        assert_eq!(sanitize_filename_with_limit("bad\0name\x7F", None), "badname");
+        assert_eq!(
+            sanitize_filename_with_limit("bad\0name\x7F", None),
+            "badname"
+        );
         assert_eq!(sanitize_filename_with_limit("trail. ", None), "trail");
     }
 

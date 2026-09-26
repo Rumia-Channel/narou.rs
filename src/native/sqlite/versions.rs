@@ -6,11 +6,12 @@
 use std::collections::BTreeMap;
 
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use similar::TextDiff;
 
 use crate::error::{NarouError, Result};
 
+use super::content::SectionMap;
 use super::sqlite_error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,10 +24,13 @@ pub struct VersionInfo {
     pub section_count: i64,
 }
 
-fn render_for_diff(sections: &BTreeMap<String, (Option<String>, String)>) -> String {
+fn render_for_diff(sections: &SectionMap) -> String {
     let mut text = String::new();
     for (idx, (subtitle, body)) in sections {
-        text.push_str(&format!("=== {idx} {}\n", subtitle.as_deref().unwrap_or("")));
+        text.push_str(&format!(
+            "=== {idx} {}\n",
+            subtitle.as_deref().unwrap_or("")
+        ));
         text.push_str(body);
         text.push('\n');
     }
@@ -81,10 +85,7 @@ pub fn snapshot_working_set(
     Ok(version_id)
 }
 
-fn current_and_prev(
-    conn: &Connection,
-    novel_id: i64,
-) -> Result<Option<(BTreeMap<String, (Option<String>, String)>, Option<i64>)>> {
+fn current_and_prev(conn: &Connection, novel_id: i64) -> Result<Option<(SectionMap, Option<i64>)>> {
     let working = super::content::load_sections(conn, novel_id)?;
     let Some(working) = working else {
         return Ok(None);
@@ -100,21 +101,14 @@ fn current_and_prev(
     Ok(Some((working, prev)))
 }
 
-fn load_sections_text(
-    conn: &Connection,
-    version_id: i64,
-) -> Result<String> {
+fn load_sections_text(conn: &Connection, version_id: i64) -> Result<String> {
     let sections = version_sections(conn, version_id)?.unwrap_or_default();
     Ok(render_for_diff(&sections))
 }
 
 /// Insert one version's section rows, storing each body once in
 /// `section_bodies` and linking by hash.
-fn write_version_sections(
-    tx: &Connection,
-    version_id: i64,
-    sections: &BTreeMap<String, (Option<String>, String)>,
-) -> Result<()> {
+fn write_version_sections(tx: &Connection, version_id: i64, sections: &SectionMap) -> Result<()> {
     for (idx, (subtitle, body)) in sections {
         let hash = super::content::store_body(tx, body)?;
         tx.execute(
@@ -178,8 +172,9 @@ pub fn version_diff(conn: &Connection, version_id: i64) -> Result<Option<String>
     let mut rows = statement.query([version_id]).map_err(sqlite_error)?;
     match rows.next().map_err(sqlite_error)? {
         Some(row) => {
-            let stored: Vec<u8> =
-                row.get(0).map_err(|error| NarouError::Platform(error.to_string()))?;
+            let stored: Vec<u8> = row
+                .get(0)
+                .map_err(|error| NarouError::Platform(error.to_string()))?;
             let encoding: String = row
                 .get(1)
                 .map_err(|error| NarouError::Platform(error.to_string()))?;
@@ -193,10 +188,7 @@ pub fn version_diff(conn: &Connection, version_id: i64) -> Result<Option<String>
     }
 }
 /// Sections stored in one version; `None` when the version does not exist.
-pub fn version_sections(
-    conn: &Connection,
-    version_id: i64,
-) -> Result<Option<BTreeMap<String, (Option<String>, String)>>> {
+pub fn version_sections(conn: &Connection, version_id: i64) -> Result<Option<SectionMap>> {
     let mut statement = conn
         .prepare("SELECT idx, subtitle, body_hash FROM novel_version_sections WHERE version_id = ? ORDER BY idx")
         .map_err(sqlite_error)?;
@@ -211,8 +203,7 @@ pub fn version_sections(
         .map_err(sqlite_error)?;
     let mut map = BTreeMap::new();
     for row in rows {
-        let (idx, subtitle, hash) =
-            row.map_err(|error| NarouError::Platform(error.to_string()))?;
+        let (idx, subtitle, hash) = row.map_err(|error| NarouError::Platform(error.to_string()))?;
         let Some(hash) = hash else { continue };
         let Some(body) = super::content::load_body(conn, &hash)? else {
             continue;
@@ -247,7 +238,9 @@ pub fn restore_version(
     drop_newer: bool,
 ) -> Result<i64> {
     if !version_exists(conn, novel_id, version_id)? {
-        return Err(NarouError::Platform(format!("version {version_id} not found")));
+        return Err(NarouError::Platform(format!(
+            "version {version_id} not found"
+        )));
     }
     let target = version_sections(conn, version_id)?
         .ok_or_else(|| NarouError::Platform(format!("version {version_id} has no sections")))?;

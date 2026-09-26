@@ -178,14 +178,16 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
     }
 
     let worker_tasks = web::worker::start_queue_workers(
-        root_dir.clone(),
-        queue.clone(),
-        push_server.clone(),
-        services.library.clone(),
-        site_updates,
-        running_jobs.clone(),
-        running_child_pids,
-        cancelled_job_ids,
+        web::worker::QueueWorkerContext {
+            root_dir: root_dir.clone(),
+            queue: queue.clone(),
+            push_server: push_server.clone(),
+            library: services.library.clone(),
+            site_updates,
+            running_jobs: running_jobs.clone(),
+            running_child_pids,
+            cancelled_job_ids,
+        },
         narou_rs::compat::load_local_setting_bool("concurrency"),
     );
     web::scheduler::start_or_restart_auto_update_scheduler(
@@ -275,8 +277,8 @@ fn fill_general_all_no_in_database() -> Result<(), String> {
 
 fn resolve_web_address(user_port: Option<u16>) -> Result<WebAddress, String> {
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let mut global_setting: HashMap<String, Value> = settings_store::load_with_inventory(&inventory, SettingScope::Global)
-        .unwrap_or_default();
+    let mut global_setting: HashMap<String, Value> =
+        settings_store::load_with_inventory(&inventory, SettingScope::Global).unwrap_or_default();
     let host = normalize_bind_host(yaml_string(global_setting.get("server-bind")));
     let port = if let Some(port) = user_port {
         port
@@ -513,8 +515,8 @@ struct WebSecuritySettings {
 
 fn load_web_security_settings() -> Result<WebSecuritySettings, String> {
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let global_setting: HashMap<String, Value> = settings_store::load_with_inventory(&inventory, SettingScope::Global)
-        .unwrap_or_default();
+    let global_setting: HashMap<String, Value> =
+        settings_store::load_with_inventory(&inventory, SettingScope::Global).unwrap_or_default();
     Ok(WebSecuritySettings {
         basic_auth_header: basic_auth_header_from_settings(&global_setting),
         require_basic_auth_for_external_bind: require_basic_auth_for_external_bind_from_settings(
@@ -567,8 +569,8 @@ fn load_ws_accepted_domains(host: &str, reverse_proxy_mode: bool) -> Result<Vec<
         return Ok(Vec::new());
     }
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let global_setting: HashMap<String, Value> = settings_store::load_with_inventory(&inventory, SettingScope::Global)
-        .unwrap_or_default();
+    let global_setting: HashMap<String, Value> =
+        settings_store::load_with_inventory(&inventory, SettingScope::Global).unwrap_or_default();
     let mut accepted_domains = default_ws_accepted_domains(host);
     if let Some(extra) = yaml_string(global_setting.get("server-ws-add-accepted-domains")) {
         accepted_domains.extend(
@@ -620,8 +622,8 @@ fn load_http_allowed_request_hosts(
     }
     let mut allowed = narou_rs::web::default_allowed_request_hosts(host);
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let global_setting: HashMap<String, Value> = settings_store::load_with_inventory(&inventory, SettingScope::Global)
-        .unwrap_or_default();
+    let global_setting: HashMap<String, Value> =
+        settings_store::load_with_inventory(&inventory, SettingScope::Global).unwrap_or_default();
     if let Some(extra) = yaml_string(global_setting.get("server-add-accepted-hosts")) {
         allowed.extend(parse_extra_allowed_hosts(&extra));
     }

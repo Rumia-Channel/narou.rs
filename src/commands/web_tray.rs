@@ -40,11 +40,12 @@ fn run_web_tray(host: String, port: u16, control_token: String) -> Result<(), St
             None
         };
         if let Some(endpoint) = endpoint
-            && send_control_request(&action_host, port, Some(&action_token), endpoint) {
-                unsafe {
-                    PostQuitMessage(0);
-                }
+            && send_control_request(&action_host, port, Some(&action_token), endpoint)
+        {
+            unsafe {
+                PostQuitMessage(0);
             }
+        }
     }));
 
     let _tray_icon = TrayIconBuilder::new()

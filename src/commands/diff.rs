@@ -11,10 +11,10 @@ use crate::commands::download;
 use crate::commands::log;
 use crate::logger;
 use narou_rs::compat;
-use narou_rs::setting_core::SettingScope;
 use narou_rs::db::{self, NovelRecord};
 use narou_rs::downloader::html;
 use narou_rs::downloader::types::{CACHE_SAVE_DIR, SECTION_SAVE_DIR, SectionFile};
+use narou_rs::setting_core::SettingScope;
 
 pub struct DiffOptions {
     pub target: Option<String>,
@@ -81,9 +81,10 @@ fn cmd_diff_inner(opts: DiffOptions) -> std::result::Result<(), String> {
     }
 
     if let Some(version) = opts.view_diff_version.as_deref()
-        && invalid_diff_version_string(version) {
-            return Err("差分指定の書式が違います(正しい例:2013.02.21@01.39.46)".to_string());
-        }
+        && invalid_diff_version_string(version)
+    {
+        return Err("差分指定の書式が違います(正しい例:2013.02.21@01.39.46)".to_string());
+    }
 
     if opts.list {
         display_diff_list(&context)?;
@@ -127,8 +128,9 @@ fn resolve_context(target: Option<&str>) -> std::result::Result<Option<NovelCont
                 .get_sync(data.id.into())
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("ID: {}", data.id))?;
-            let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-                .map_err(|e| e.to_string())?;
+            let archive_root =
+                narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+                    .map_err(|e| e.to_string())?;
             Ok(Some(NovelContext {
                 record,
                 archive_root,
@@ -144,9 +146,14 @@ fn resolve_context(target: Option<&str>) -> std::result::Result<Option<NovelCont
             );
             let mut query = query;
             query.sort.reverse = true;
-            let latest = novels.query_sync(&query).map_err(|e| e.to_string())?.into_iter().next();
-            let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
-                .map_err(|e| e.to_string())?;
+            let latest = novels
+                .query_sync(&query)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .next();
+            let archive_root =
+                narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
+                    .map_err(|e| e.to_string())?;
             Ok(latest.map(|record| NovelContext {
                 record,
                 archive_root,
@@ -442,12 +449,9 @@ fn clean_diff(context: &NovelContext) -> std::result::Result<(), String> {
     {
         if let Ok(conn) = version_conn() {
             let guard = conn.lock().expect("sqlite mutex poisoned");
-            let pruned = narou_rs::native::sqlite::versions::prune_history(
-                &guard,
-                context.record.id,
-                0,
-            )
-            .map_err(|e| e.to_string())?;
+            let pruned =
+                narou_rs::native::sqlite::versions::prune_history(&guard, context.record.id, 0)
+                    .map_err(|e| e.to_string())?;
             removed = removed || pruned > 0;
         }
     }
@@ -659,7 +663,8 @@ fn bold_yellow(s: &str) -> String {
 }
 
 #[cfg(feature = "native-runtime")]
-fn version_conn() -> std::result::Result<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>, String> {
+fn version_conn()
+-> std::result::Result<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>, String> {
     use narou_rs::native::sqlite::state;
     if state::legacy_yaml_active() {
         return Err("SQLiteバックエンドが無効です (NAROU_RS_LEGACY_YAML)".to_string());
@@ -667,8 +672,7 @@ fn version_conn() -> std::result::Result<std::sync::Arc<std::sync::Mutex<rusqlit
     let narou_dir = narou_rs::db::inventory::Inventory::with_default_root()
         .map_err(|error| error.to_string())?
         .root_dir()
-        .join(".narou")
-        ;
+        .join(".narou");
     let handle = state::active_for(&narou_dir)
         .ok_or_else(|| "SQLiteバックエンドが有効ではありません".to_string())?;
     Ok(handle.conn_ref().clone())
@@ -688,7 +692,10 @@ fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Re
             println!("バージョン履歴はありません");
             return Ok(());
         }
-        println!("{:>6}  {:<8}  {:<24}  {:>8}  {}", "ID", "ORIGIN", "CREATED", "SECTIONS", "NOTE");
+        println!(
+            "{:>6}  {:<8}  {:<24}  {:>8}  {}",
+            "ID", "ORIGIN", "CREATED", "SECTIONS", "NOTE"
+        );
         for version in versions {
             println!(
                 "{:>6}  {:<8}  {:<24}  {:>8}  {}",
@@ -759,8 +766,7 @@ fn write_back_working_set(
 
     let mut expected = std::collections::HashSet::new();
     for (idx, (subtitle, body_yaml)) in &sections {
-        let section: SectionFile =
-            serde_yaml::from_str(body_yaml).map_err(|e| e.to_string())?;
+        let section: SectionFile = serde_yaml::from_str(body_yaml).map_err(|e| e.to_string())?;
         let info = SubtitleInfo {
             index: idx.clone(),
             href: section.href.clone(),

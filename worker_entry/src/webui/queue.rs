@@ -39,20 +39,9 @@ pub async fn handle(req: Request, env: worker::Env) -> Result<Response> {
     }
 }
 
-/// Same error shape as `lib.rs::json_error` (`{error: {code, message?}}`).
-fn json_error(status: u16, code: &str, message: Option<&str>) -> Result<Response> {
-    let payload = match message {
-        Some(message) => json!({ "error": { "code": code, "message": message } }),
-        None => json!({ "error": { "code": code } }),
-    };
-    Response::from_json(&payload).map(|response| response.with_status(status))
-}
+use narou_rs::application::webui::{html_escape, tag_color_class};
 
-fn query_param(url: &worker::Url, name: &str) -> Option<String> {
-    url.query_pairs()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.into_owned())
-}
+use super::{configured_tag_color, json_error, query_param};
 
 /// Build the runtime or finish with the native-style 503 error response.
 macro_rules! runtime_or_503 {
@@ -65,42 +54,6 @@ macro_rules! runtime_or_503 {
             }
         }
     };
-}
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-fn tag_color_class(color: &str) -> &'static str {
-    match color {
-        "green" => "tag-green",
-        "yellow" => "tag-yellow",
-        "blue" => "tag-blue",
-        "magenta" => "tag-magenta",
-        "cyan" => "tag-cyan",
-        "red" => "tag-red",
-        "white" => "tag-white",
-        _ => "tag-default",
-    }
-}
-
-/// `web.mod.rs::configured_tag_color`: `webui.new-tag-color` setting,
-/// normalized to lowercase and checked against the valid color list.
-async fn configured_tag_color(runtime: &WorkerRuntime) -> Option<String> {
-    runtime
-        .services
-        .settings
-        .get(narou_rs::application::tag_colors::NEW_TAG_COLOR_SETTING)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| narou_rs::application::tag_colors::is_valid_tag_color(value))
 }
 
 async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
