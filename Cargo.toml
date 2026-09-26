@@ -98,7 +98,7 @@ fs2 = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
 url = "2"
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
-aozora_epub3_lite = { git = "https://github.com/Rumia-Channel/AozoraEpub3_Lite", rev = "cd67ddb", optional = true }
+aozora_epub3_lite = { git = "https://github.com/Rumia-Channel/AozoraEpub3_Lite", rev = "c8c971f", optional = true }
 base64 = { version = "0.23", optional = true }
 miniz_oxide = "0.9"
 brotli = "9.0"

@@ -30,6 +30,8 @@ use crate::error::{NarouError, Result};
 
 /// ライブラリ利用側 (Worker など) が入力源を実装するために使う。
 pub use aozora_epub3_lite::{FileSource, InputError};
+/// 1 エントリずつ書き出すための Lite の型 (Worker のストリーミング応答で使う)。
+pub use aozora_epub3_lite::{EpubEntryInfo, EpubStreamWriter};
 
 /// chuki tables vendored from the Lite crate's bundled assets so that wasm
 /// builds (no filesystem) see the same note definitions as CLI runs.
@@ -519,6 +521,39 @@ pub fn stream_epub<W: Write>(
         .map_err(|error| NarouError::Conversion(format!("EPUB書き出しに失敗しました: {error}")))
 }
 
+/// EPUB 書き出しのシンク。1 エントリ分のバイト列を溜め、書き出し側が
+/// エントリを書き終えるたびに [`ChunkSink::take`] で引き取る。
+///
+/// `Clone` しても同じバッファを共有するので、`EpubStreamWriter` に渡した
+/// clone が書いた内容を呼び出し側のハンドルから読める (Worker の応答のように
+/// チャンクを 1 つずつ外へ流す用途を想定)。
+#[derive(Clone, Default)]
+pub struct ChunkSink {
+    buffer: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+}
+
+impl ChunkSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 溜まっているバイト列を取り出してバッファを空にする。
+    pub fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.buffer.borrow_mut())
+    }
+}
+
+impl Write for ChunkSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buffer.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +737,44 @@ mod tests {
         assert!(embedded.block_inline_tags.contains_key("一字下げ"));
     }
 
+    /// 1 エントリずつ書き出す経路 (Worker の `download.epub` と同じ手順) が
+    /// 一括書き出しと同一バイトを返すこと。エントリごとにチャンクが取れることと、
+    /// 最後のチャンク (ZIP の集中ディレクトリ) を取りこぼさないことも固定する。
+    #[test]
+    fn entry_by_entry_writer_matches_batch_output() {
+        let png: &[u8] = b"\x89PNG\r\n\x1a\nstub";
+        let text = format!("{SAMPLE}\n　挿絵。［＃挿絵（挿絵/i1.png）入る］\n");
+        let path = text_file("stream", &text, Some(png));
+        let build = build_book(&path, &options()).unwrap();
 
+        let mut batch = Vec::new();
+        stream_epub(&build.book, &mut batch, |path| build.resolve(path)).unwrap();
 
+        let sink = ChunkSink::new();
+        let mut writer = build.book.stream_writer(sink.clone()).unwrap();
+        let mut streamed = Vec::new();
+        let mut chunks = 0;
+        while let Some(info) = writer.next_entry() {
+            let bytes = info
+                .asset_path
+                .as_deref()
+                .and_then(|path| build.resolve(path));
+            writer.write_current(bytes.as_deref()).unwrap();
+            let chunk = sink.take();
+            if !chunk.is_empty() {
+                chunks += 1;
+                streamed.extend_from_slice(&chunk);
+            }
+        }
+        writer.finish().unwrap();
+        let tail = sink.take();
+        if !tail.is_empty() {
+            chunks += 1;
+            streamed.extend_from_slice(&tail);
+        }
+
+        assert_eq!(streamed, batch);
+        assert!(chunks > 3, "1 エントリずつ流れていない: {chunks} chunks");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
 }
