@@ -341,9 +341,9 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 ### Cloudflare Workers 移行 (2026-09-26 決定、詳細: docs/cloudflare-workers-migration-plan.md)
 - **ゴール**: Web UI ごと Workers へ移行する。native は CLI と、Workers で代替できない重量処理・ローカル操作のために残す。
 - **重量処理**: Worker 内の AozoraEpub3_Lite (in-process) で完結。外部プロセス前提の機能 (AozoraEpub3 jar / kindlegen / SMTP / 端末送信 / セルフアップデート / `folder` / `browser` 等) は `blocked` / `501` で明示的に拒否し、CF Containers は使わない。
-- **保存**: メタデータは D1、オブジェクト (sections / 挿絵 / 生成 EPUB) は S3 互換ストレージ。**実装・binding・設定キーは `S3_*` / `s3_*` で統一し、ベンダ名 (Wasabi 等) を識別子に使わない**。本番の接続先が Wasabi であることは設定値として外から与える。
-- フェーズ: P0 足回りと保存基盤 (env 分離テンプレート / CI deploy / S3 adapter / D1→S3 移行 / 契約テスト) → P1 取得系 (SSRF port 化・settings 注入・CookieStore・YAML provider) → P2 変換を Worker へ → P3 Web UI 移植 → P4 運用。
-- P0 の移行期間は `app_state` の `object_backend` (`d1` | `s3`) で保存先を切替可能にし、フラグ 1 つで旧経路へ戻せる状態を保つ。
+- **保存**: メタデータとテキスト系オブジェクト (本文・toc・raw・setting・`novel.txt`) は **D1**、バイナリ系 (挿絵・`generated/` 配下の生成物) だけ **S3 互換ストレージ**。切替は `app_state('inv','asset_backend')` (`d1` | `s3`) でバイナリ側にのみ効かせ、本文は常に D1 固定。振り分けは core の `is_bulk_object_key` + `SplitStore` が担う。**実装・binding・設定キーは `S3_*` / `s3_*` で統一し、ベンダ名 (Wasabi 等) を識別子に使わない**。本番の接続先が Wasabi であることは設定値として外から与える。
+- フェーズ: P0a 足回り (完了) → P0b 署名・S3 アダプタ (完了) → P0c 保存先の振り分け (SplitStore) → P0d バイナリのみの移行 → P0e 契約テスト + CI デプロイ → P1 取得系 (SSRF port 化・settings 注入・CookieStore・YAML provider) → P2 変換を Worker へ → P3 Web UI 移植 → P4 運用。
+- P0 の移行期間は `asset_backend` でバイナリの保存先を切替可能にし、フラグ 1 つで旧経路へ戻せる状態を保つ (D1 側の `objects`/`object_chunks` は移行後も消さない)。
 
 ### 最近の追加 (2026-05〜09)
 - **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1 で従来の逐次動作、フォース指定・ウェブモード・ドメインが1種類のときは自動的に逐次にフォールバック
