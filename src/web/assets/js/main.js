@@ -72,17 +72,21 @@ async function init() {
   // refresh of the page does not re-prompt with the same URL.
   handleBookmarkletRegisterParam();
 
-  // Load config from server
+  // Load config and sort state from server。
+  // 互いに独立なので直列に待たず、1 往復分の待ち時間で済ませる
+  // (以前は config の応答を待ってから sort_state を投げていた)。
+  const [config, sortState] = await Promise.all([
+    fetchJson('/api/webui/config').catch(() => null),
+    fetchJson('/api/sort_state').catch(() => null),
+  ]);
+
   try {
-    const config = await fetchJson('/api/webui/config');
     if (config) {
       applyWebConfig(config);
     }
   } catch { /* use defaults */ }
 
-  // Load sort state from server
   try {
-    const sortState = await fetchJson('/api/sort_state');
     if (sortState) {
       const colMap = { 0: 'id', 1: 'last_update', 2: 'general_lastup', 3: 'last_check_date',
         4: 'title', 5: 'author', 6: 'sitename', 7: 'novel_type', 9: 'general_all_no', 10: 'length' };

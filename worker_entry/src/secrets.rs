@@ -11,10 +11,32 @@
 //! Secrets Store の値はランタイムが isolate ごとにキャッシュするので、
 //! リクエストごとに `get` しても実害は小さい。
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use worker::{Env, Result};
+
+/// isolate ごとの解決済みキャッシュ。秘密値は isolate の寿命の間は不変
+/// (更新は新しい isolate で反映される) なので、リクエストごとに
+/// Secrets Store / バインディングを引き直さない。
+static RESOLVED: LazyLock<Mutex<HashMap<String, Option<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// `<NAME>_STORE` → `NAME`(var) → `NAME`(secret) の順に解決する。
 pub async fn value(env: &Env, name: &str) -> Option<String> {
+    if let Ok(cache) = RESOLVED.lock()
+        && let Some(hit) = cache.get(name)
+    {
+        return hit.clone();
+    }
+    let resolved = resolve(env, name).await;
+    if let Ok(mut cache) = RESOLVED.lock() {
+        cache.insert(name.to_string(), resolved.clone());
+    }
+    resolved
+}
+
+async fn resolve(env: &Env, name: &str) -> Option<String> {
     let binding = format!("{name}_STORE");
     if let Ok(store) = env.secret_store(&binding)
         && let Ok(Some(value)) = store.get().await

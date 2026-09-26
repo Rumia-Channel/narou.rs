@@ -64,16 +64,20 @@ pub fn site_definitions(
 pub async fn load_site_settings(
     objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
 ) -> Result<Vec<SiteSetting>> {
-    let store = ObjectStoreSiteDefinitions::new(objects.clone());
-    if store.list().await?.is_empty() {
-        return load_bundled_site_settings();
-    }
+    // L1 を最優先で見る。ここで当たればオブジェクトストアの LIST も投げない
+    // (以前は LIST → 空なら同梱定義を毎回パース、という順で全リクエストが
+    //  D1 往復 + YAML parse + compile を払っていた)。
     if let Some(cached) = cached_site_settings() {
         return Ok(cached);
     }
-    let effective = site_definitions(objects.clone()).effective().await?;
-    let contents: Vec<&str> = effective.iter().map(|(_, yaml)| yaml.as_str()).collect();
-    let settings = SiteSetting::load_bundled(&contents)?;
+    let store = ObjectStoreSiteDefinitions::new(objects.clone());
+    let settings = if store.list().await?.is_empty() {
+        load_bundled_site_settings()?
+    } else {
+        let effective = site_definitions(objects.clone()).effective().await?;
+        let contents: Vec<&str> = effective.iter().map(|(_, yaml)| yaml.as_str()).collect();
+        SiteSetting::load_bundled(&contents)?
+    };
     store_site_settings(&settings);
     Ok(settings)
 }
