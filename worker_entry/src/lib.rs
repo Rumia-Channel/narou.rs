@@ -3,6 +3,7 @@
 mod budget;
 mod bundled_sites;
 mod composition;
+mod convert;
 mod consumer;
 mod d1_cookie_store;
 mod d1_object_store;
@@ -362,7 +363,7 @@ struct EpubStreamState {
 /// POST /api/jobs — plan a request, enqueue each discrete plan separately,
 /// and return ids / invalid / duplicates / blocked.
 ///
-/// Unsupported kinds (Convert/Send/Mail/Backup) and targetless auto-update
+/// Unsupported kinds (Send/Mail/Backup) and targetless auto-update
 /// are routed to a durable `blocked` ledger state — never a subprocess,
 /// never a silent ack.
 async fn api_jobs(mut req: Request, env: Env) -> Result<Response> {

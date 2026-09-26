@@ -1,8 +1,10 @@
 pub mod converter_base;
+#[cfg(feature = "native-runtime")]
 pub mod dakuten_font;
 pub mod device;
 pub mod ini;
 pub mod inspector;
+#[cfg(feature = "native-runtime")]
 pub mod output;
 pub mod render;
 pub mod settings;
@@ -10,29 +12,41 @@ pub mod user_converter;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+#[cfg(feature = "native-runtime")]
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+#[cfg(feature = "native-runtime")]
+use serde::Deserialize;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use settings::NovelSettings;
 use user_converter::UserConverter;
 
 use crate::db::NovelRecord;
-use crate::downloader::{SECTION_SAVE_DIR, SectionElement, SectionFile, TocObject};
-use crate::error::{NarouError, Result};
+use crate::downloader::{SECTION_SAVE_DIR, SectionFile, TocObject};
+#[cfg(feature = "native-runtime")]
+use crate::downloader::SectionElement;
+#[cfg(feature = "native-runtime")]
+use crate::error::NarouError;
+use crate::error::Result;
+use crate::illustration_store::IllustrationIndex;
+#[cfg(feature = "native-runtime")]
 use crate::illustration_store::{
-    IllustrationIndex, IllustrationStorageService, IllustrationStore, StoredIllustration,
+    IllustrationStorageService, IllustrationStore, StoredIllustration,
     find_saved_illustration_filename, illustration_extension_from_content_type,
     is_remote_illustration_source, legacy_basename_from_source, normalize_illustration_url,
 };
 use crate::platform::{AssetStore, HttpClient, ObjectKey, ObjectStore, RateLimiter};
-use crate::progress::ProgressReporter;
+use crate::platform::ProgressReporter;
+#[cfg(feature = "native-runtime")]
 use crate::termcolor::bold_colored;
 
+#[cfg(feature = "native-runtime")]
 const SECTION_CONVERT_CACHE_NAME: &str = "section_convert_cache";
+#[cfg(feature = "native-runtime")]
 const SECTION_CONVERT_CACHE_DIR_NAME: &str = "section_convert_cache";
 const ILLUSTRATION_LOCALIZATION_VERSION: &str = "illustration-localization:v4";
 
@@ -78,6 +92,7 @@ pub struct NovelConverter {
     settings: NovelSettings,
     user_converter: Option<UserConverter>,
     section_cache: HashMap<String, render::ConvertedSection>,
+    #[cfg(feature = "native-runtime")]
     section_convert_cache: SectionConvertCache,
     progress: Option<Box<dyn ProgressReporter>>,
     inspector: Rc<RefCell<inspector::Inspector>>,
@@ -90,6 +105,7 @@ pub struct NovelConverter {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(feature = "native-runtime")]
 struct CacheEntry {
     digest: String,
     converted_section: render::ConvertedSection,
@@ -98,6 +114,7 @@ struct CacheEntry {
 }
 
 #[derive(Default)]
+#[cfg(feature = "native-runtime")]
 struct SectionConvertCache {
     buckets: HashMap<String, HashMap<String, CacheEntry>>,
     dirty_ids: std::collections::HashSet<String>,
@@ -153,7 +170,7 @@ struct CacheSettingsSignature<'a> {
 }
 
 impl NovelConverter {
-    pub(crate) fn build(
+    pub fn build(
         settings: NovelSettings,
         user_converter: Option<UserConverter>,
         capabilities: Option<ConverterCapabilities>,
@@ -163,15 +180,23 @@ impl NovelConverter {
             .as_ref()
             .and_then(|caps| caps.illustration_index.clone())
             .unwrap_or_else(|| {
-                IllustrationIndex::from_store(
-                    IllustrationStore::load(&settings.archive_path)
-                        .unwrap_or_else(|_| IllustrationStore::default()),
-                )
+                #[cfg(feature = "native-runtime")]
+                {
+                    IllustrationIndex::from_store(
+                        IllustrationStore::load(&settings.archive_path)
+                            .unwrap_or_else(|_| IllustrationStore::default()),
+                    )
+                }
+                #[cfg(not(feature = "native-runtime"))]
+                {
+                    IllustrationIndex::default()
+                }
             });
         Self {
             settings,
             user_converter,
             section_cache: HashMap::new(),
+#[cfg(feature = "native-runtime")]
             section_convert_cache: SectionConvertCache::default(),
             progress: None,
             inspector,
@@ -186,6 +211,7 @@ impl NovelConverter {
 
     /// Site headers/cookie for illustration downloads, replaced whenever the
     /// converter learns which novel (and therefore which site) it is handling.
+    #[cfg(feature = "native-runtime")]
     fn apply_record_fetch_policy(&mut self, record: Option<&NovelRecord>) {
         let Some(capabilities) = self.capabilities.as_mut() else {
             return;
@@ -230,15 +256,11 @@ impl NovelConverter {
         self.last_inspection_output.take()
     }
 
-    pub fn use_dakuten_font(&self) -> bool {
-        self.use_dakuten_font
-    }
-
     pub fn convert_novel(&mut self, toc: &TocObject, sections: &[SectionFile]) -> Result<String> {
         self.convert_novel_with_id(None, toc, sections)
     }
 
-    fn convert_novel_with_id(
+    pub fn convert_novel_with_id(
         &mut self,
         novel_id: Option<i64>,
         toc: &TocObject,
@@ -290,10 +312,19 @@ impl NovelConverter {
 
             let is_html =
                 section.element.data_type != "text" && section.element.data_type != "text/plain";
-            let resolved_element = if is_html && self.settings.enable_illust {
-                self.resolve_section_html_illustrations(section)
-            } else {
-                section.element.clone()
+            let resolved_element = {
+                #[cfg(feature = "native-runtime")]
+                {
+                    if is_html && self.settings.enable_illust {
+                        self.resolve_section_html_illustrations(section)
+                    } else {
+                        section.element.clone()
+                    }
+                }
+                #[cfg(not(feature = "native-runtime"))]
+                {
+                    section.element.clone()
+                }
             };
             let digest = self.compute_digest(section);
 
@@ -452,6 +483,7 @@ impl NovelConverter {
         ))
     }
 
+    #[cfg(feature = "native-runtime")]
     pub fn convert_subtitles_for_hotentry(
         &mut self,
         toc: &TocObject,
@@ -623,6 +655,7 @@ impl NovelConverter {
         )
     }
 
+    #[cfg(feature = "native-runtime")]
     fn resolve_section_html_illustrations(
         &mut self,
         section: &crate::downloader::SectionFile,
@@ -652,6 +685,7 @@ impl NovelConverter {
         }
     }
 
+    #[cfg(feature = "native-runtime")]
     fn resolve_html_img_sources(
         &mut self,
         html: &str,
@@ -677,6 +711,7 @@ impl NovelConverter {
         .to_string()
     }
 
+    #[cfg(feature = "native-runtime")]
     fn resolve_section_illustration_source(
         &mut self,
         illust_dir: &Path,
@@ -736,6 +771,7 @@ impl NovelConverter {
         self.download_section_illustration(illust_dir, source)
     }
 
+    #[cfg(feature = "native-runtime")]
     fn download_section_illustration(&mut self, illust_dir: &Path, source: &str) -> Option<String> {
         let url = normalize_illustration_url(source);
         let capabilities = self.capabilities.clone()?;
@@ -801,6 +837,7 @@ impl NovelConverter {
         }
     }
 
+    #[cfg(feature = "native-runtime")]
     fn store_illustration_with_capabilities(
         &mut self,
         capabilities: &ConverterCapabilities,
@@ -833,6 +870,7 @@ impl NovelConverter {
         self.section_cache.clear();
     }
 
+    #[cfg(feature = "native-runtime")]
     pub fn convert_text_file(&mut self, text: &str) -> Result<String> {
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();
@@ -858,6 +896,7 @@ impl NovelConverter {
         Ok(txt_path.display().to_string())
     }
 
+    #[cfg(feature = "native-runtime")]
     pub fn convert_text_file_with_device(
         &mut self,
         text: &str,
@@ -888,6 +927,7 @@ impl NovelConverter {
         Ok(final_path.display().to_string())
     }
 
+    #[cfg(feature = "native-runtime")]
     pub fn convert_novel_by_id(&mut self, id: i64, novel_dir: &std::path::Path) -> Result<String> {
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();
@@ -972,6 +1012,7 @@ impl NovelConverter {
         Ok(txt_path.display().to_string())
     }
 
+    #[cfg(feature = "native-runtime")]
     pub fn convert_novel_by_id_with_device(
         &mut self,
         _id: i64,
@@ -1090,6 +1131,7 @@ impl NovelConverter {
         Ok(final_path)
     }
 
+    #[cfg(feature = "native-runtime")]
     fn inspect_converted_text(&mut self, aozora_text: &str) -> Result<()> {
         if self.settings.enable_inspect {
             self.inspector
@@ -1110,6 +1152,7 @@ impl NovelConverter {
     }
 
     /// Ruby: display_header — "ID:{id}　{title} の変換を開始"
+    #[cfg(feature = "native-runtime")]
     fn display_header(&self, id: i64, title: &str) {
         println!(
             "{}",
@@ -1118,10 +1161,12 @@ impl NovelConverter {
     }
 
     /// Ruby: display_footer — "縦書用の変換が終了しました"
+    #[cfg(feature = "native-runtime")]
     fn display_footer(&self) {
         println!("縦書用の変換が終了しました");
     }
 
+#[cfg(feature = "native-runtime")]
     fn fetch_cached_section(
         &mut self,
         novel_id: Option<i64>,
@@ -1137,6 +1182,7 @@ impl NovelConverter {
         Some((entry.converted_section.clone(), entry.use_dakuten_font))
     }
 
+#[cfg(feature = "native-runtime")]
     fn store_cached_section(
         &mut self,
         novel_id: Option<i64>,
@@ -1163,10 +1209,41 @@ impl NovelConverter {
         }
     }
 
+#[cfg(feature = "native-runtime")]
     fn flush_section_convert_cache(&mut self) -> Result<()> {
         self.section_convert_cache.flush()
     }
 
+    /// Worker にはセクション変換キャッシュも挿絵ローカライズも無いので、
+    /// 参照・保存・flush を no-op にする (常に再変換し、結果は保存済みの
+    /// セクションとテキストが正)。
+    #[cfg(not(feature = "native-runtime"))]
+    fn fetch_cached_section(
+        &mut self,
+        _novel_id: Option<i64>,
+        _section_key: &str,
+        _digest: &str,
+    ) -> Option<(render::ConvertedSection, bool)> {
+        None
+    }
+
+    #[cfg(not(feature = "native-runtime"))]
+    fn store_cached_section(
+        &mut self,
+        _novel_id: Option<i64>,
+        _section_key: &str,
+        _digest: &str,
+        _converted_section: &render::ConvertedSection,
+        _use_dakuten_font: bool,
+    ) {
+    }
+
+    #[cfg(not(feature = "native-runtime"))]
+    fn flush_illustration_store(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "native-runtime")]
     fn flush_illustration_store(&mut self) -> Result<()> {
         if let Some(capabilities) = self.capabilities.clone()
             && let (Some(objects), Some(prefix)) =
@@ -1208,6 +1285,7 @@ fn target_device_cache_key(device: Option<device::Device>) -> &'static str {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 impl SectionConvertCache {
     fn bucket(&mut self, novel_id: i64) -> Result<&HashMap<String, CacheEntry>> {
         self.load_bucket_if_needed(novel_id)?;
@@ -1250,6 +1328,7 @@ impl SectionConvertCache {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 pub fn clear_section_convert_cache(id: i64) -> Result<()> {
     migrate_legacy_section_convert_cache()?;
     let path = section_convert_cache_file_path(&id.to_string())?;
@@ -1267,6 +1346,7 @@ pub fn clear_section_convert_cache(id: i64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native-runtime")]
 fn section_convert_cache_dir() -> Result<PathBuf> {
     crate::db::with_database(|db| {
         Ok(db
@@ -1277,10 +1357,12 @@ fn section_convert_cache_dir() -> Result<PathBuf> {
     })
 }
 
+#[cfg(feature = "native-runtime")]
 fn section_convert_cache_file_path(id: &str) -> Result<PathBuf> {
     Ok(section_convert_cache_dir()?.join(format!("{}.yaml", id)))
 }
 
+#[cfg(feature = "native-runtime")]
 fn load_section_convert_bucket(novel_id: i64) -> Result<HashMap<String, CacheEntry>> {
     let path = section_convert_cache_file_path(&novel_id.to_string())?;
     let raw = match std::fs::read_to_string(path) {
@@ -1294,6 +1376,7 @@ fn load_section_convert_bucket(novel_id: i64) -> Result<HashMap<String, CacheEnt
     Ok(serde_yaml::from_str(&raw)?)
 }
 
+#[cfg(feature = "native-runtime")]
 fn save_section_convert_bucket(id: &str, bucket: &HashMap<String, CacheEntry>) -> Result<()> {
     let path = section_convert_cache_file_path(id)?;
     crate::db::inventory::update_locked_yaml_file::<(), HashMap<String, CacheEntry>, _>(
@@ -1303,6 +1386,7 @@ fn save_section_convert_bucket(id: &str, bucket: &HashMap<String, CacheEntry>) -
     Ok(())
 }
 
+#[cfg(feature = "native-runtime")]
 fn migrate_legacy_section_convert_cache() -> Result<()> {
     let legacy_path = crate::db::with_database(|db| {
         Ok(db
@@ -1327,6 +1411,7 @@ fn migrate_legacy_section_convert_cache() -> Result<()> {
     rename_legacy_section_convert_cache(&legacy_path)
 }
 
+#[cfg(feature = "native-runtime")]
 fn rename_legacy_section_convert_cache(path: &Path) -> Result<()> {
     let migrated_path = path.with_extension("yaml.migrated");
     match std::fs::rename(path, &migrated_path) {
@@ -1339,6 +1424,7 @@ fn rename_legacy_section_convert_cache(path: &Path) -> Result<()> {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn load_sections_from_dir(
     novel_dir: &std::path::Path,
     subtitles: &[crate::downloader::SubtitleInfo],
@@ -1378,6 +1464,7 @@ fn load_sections_from_dir(
     Ok(sections)
 }
 
+#[cfg(feature = "native-runtime")]
 fn save_latest_convert(id: i64) -> Result<()> {
     let inventory = crate::db::inventory::Inventory::with_default_root()?;
     let mut latest: std::collections::HashMap<String, serde_yaml::Value> = inventory.load(
@@ -1396,6 +1483,7 @@ fn save_latest_convert(id: i64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native-runtime")]
 fn strip_book_header_and_footer(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let Some(first_page_break) = lines.iter().position(|line| *line == "［＃改ページ］")
@@ -1434,6 +1522,7 @@ fn find_saved_section_illustration_filename(
     find_saved_illustration_filename(illust_dir, &basename)
 }
 
+#[cfg(feature = "native-runtime")]
 fn fetch_illustration_bytes(
     http: Arc<dyn HttpClient>,
     rate_limiter: Arc<dyn RateLimiter>,

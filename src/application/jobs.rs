@@ -57,12 +57,14 @@ impl JobKind {
     }
 
     /// Kinds the Worker queue consumer can execute with the shared portable
-    /// [`crate::downloader::Downloader`]. Anything else is routed to a durable
-    /// blocked state. Convert becomes executable once section→text assembly
+    /// capabilities (`Downloader` / `ConvertService`). Anything else is routed
+    /// to a durable blocked state.
     /// is ported; download-time EPUB already reads the `novel.txt` object
     /// ([`crate::platform::NovelObjectKeys::converted_text`]) instead.
     pub fn is_worker_executable(self) -> bool {
-        matches!(self, Self::Download | Self::Update)
+        // Convert は保存済みの TOC と本文から変換テキストを組むだけで、
+        // 外部プロセスを使わない (`ConvertService`)。
+        matches!(self, Self::Download | Self::Update | Self::Convert)
     }
 }
 

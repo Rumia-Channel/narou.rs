@@ -1,22 +1,39 @@
-use std::ffi::OsString;
+#[cfg(feature = "native-runtime")]
 use std::fmt;
+use std::path::Path;
+
+#[cfg(feature = "native-runtime")]
+use std::ffi::OsString;
+#[cfg(feature = "native-runtime")]
 use std::io::{BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "native-runtime")]
+use std::path::PathBuf;
+#[cfg(feature = "native-runtime")]
 use std::process::{Command, Stdio};
+#[cfg(feature = "native-runtime")]
 use std::sync::mpsc;
+#[cfg(feature = "native-runtime")]
 use std::thread;
+#[cfg(feature = "native-runtime")]
 use std::time::SystemTime;
 
+#[cfg(feature = "native-runtime")]
 use encoding_rs::SHIFT_JIS;
+#[cfg(feature = "native-runtime")]
 use regex::Regex;
+#[cfg(feature = "native-runtime")]
 use zip::write::SimpleFileOptions;
+#[cfg(feature = "native-runtime")]
 use zip::{CompressionMethod, ZipWriter};
 
+#[cfg(feature = "native-runtime")]
 use crate::compat::{
     canonicalize_aozoraepub3_tool_path, canonicalize_existing_path, configure_hidden_console_command,
     load_global_setting_string, resolve_java_command_path, sanitize_java_command,
 };
+#[cfg(feature = "native-runtime")]
 use crate::downloader::util::decode_numeric_entities;
+#[cfg(feature = "native-runtime")]
 use crate::error::{NarouError, Result};
 
 #[cfg(windows)]
@@ -129,6 +146,7 @@ impl Device {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 pub struct OutputManager {
     device: Device,
     aozora_epub3_path: Option<PathBuf>,
@@ -145,11 +163,13 @@ pub struct OutputManager {
 /// `None` 項目は変換済みテキストから検出する。
 #[cfg(feature = "lite")]
 #[derive(Debug, Clone, Default)]
+#[cfg(feature = "native-runtime")]
 pub struct LiteEpubContext {
     pub title: String,
     pub author: String,
 }
 
+#[cfg(feature = "native-runtime")]
 fn file_contains_dakuten_chuki(path: &Path) -> bool {
     match std::fs::read_to_string(path) {
         Ok(s) => s.contains("［＃濁点］"),
@@ -157,6 +177,7 @@ fn file_contains_dakuten_chuki(path: &Path) -> bool {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 impl OutputManager {
     pub fn new(device: Device) -> Self {
         Self {
@@ -882,6 +903,7 @@ impl OutputManager {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn home_dir() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
         return Some(PathBuf::from(home));
@@ -895,8 +917,10 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "native-runtime")]
 struct StripError(String);
 
+#[cfg(feature = "native-runtime")]
 impl StripError {
     fn invalid_format() -> Self {
         Self("invalid file format".to_string())
@@ -911,12 +935,14 @@ impl StripError {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 impl fmt::Display for StripError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn strip_mobi_file(path: &Path) -> std::result::Result<(), StripError> {
     let data = std::fs::read(path).map_err(|e| StripError(e.to_string()))?;
     let stripped = strip_mobi_sources(&data)?;
@@ -924,6 +950,7 @@ fn strip_mobi_file(path: &Path) -> std::result::Result<(), StripError> {
     Ok(())
 }
 
+#[cfg(feature = "native-runtime")]
 fn strip_mobi_sources(datain: &[u8]) -> std::result::Result<Vec<u8>, StripError> {
     if slice_range(datain, 0x3c, 0x44)? != b"BOOKMOBI" {
         return Err(StripError::invalid_format());
@@ -1004,6 +1031,7 @@ fn strip_mobi_sources(datain: &[u8]) -> std::result::Result<Vec<u8>, StripError>
     Ok(data_file)
 }
 
+#[cfg(feature = "native-runtime")]
 fn update_exth121(mobiheader: &mut [u8], srcs_secnum: u32, srcs_cnt: u32) {
     let Ok(mobi_length) = read_be_u32(mobiheader, 0x14) else {
         return;
@@ -1052,16 +1080,19 @@ fn update_exth121(mobiheader: &mut [u8], srcs_secnum: u32, srcs_cnt: u32) {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn read_be_u16(data: &[u8], offset: usize) -> std::result::Result<u16, StripError> {
     let bytes = slice_range(data, offset, offset + 2)?;
     Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
+#[cfg(feature = "native-runtime")]
 fn read_be_u32(data: &[u8], offset: usize) -> std::result::Result<u32, StripError> {
     let bytes = slice_range(data, offset, offset + 4)?;
     Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+#[cfg(feature = "native-runtime")]
 fn patch_range(
     data: &mut [u8],
     offset: usize,
@@ -1074,14 +1105,17 @@ fn patch_range(
     Ok(())
 }
 
+#[cfg(feature = "native-runtime")]
 fn slice_range(data: &[u8], start: usize, end: usize) -> std::result::Result<&[u8], StripError> {
     data.get(start..end).ok_or_else(StripError::invalid_format)
 }
 
+#[cfg(feature = "native-runtime")]
 fn slice_from(data: &[u8], start: usize) -> std::result::Result<&[u8], StripError> {
     data.get(start..).ok_or_else(StripError::invalid_format)
 }
 
+#[cfg(feature = "native-runtime")]
 struct AozoraInvocation {
     _temp_dir: Option<tempfile::TempDir>,
     input_txt: PathBuf,
@@ -1090,6 +1124,7 @@ struct AozoraInvocation {
     final_output_path: PathBuf,
 }
 
+#[cfg(feature = "native-runtime")]
 impl AozoraInvocation {
     fn direct(input_txt: &Path, output_dir: &Path, final_output_path: &Path) -> Self {
         Self {
@@ -1124,6 +1159,7 @@ impl AozoraInvocation {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn prepare_aozora_invocation(
     input_txt: &Path,
     output_dir: &Path,
@@ -1141,23 +1177,27 @@ fn prepare_aozora_invocation(
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn should_use_aozora_temp_workspace(input_txt: &Path, output_dir: &Path) -> bool {
     cfg!(windows)
         && (path_contains_windows_aozora_risky_chars(input_txt)
             || path_contains_windows_aozora_risky_chars(output_dir))
 }
 
+#[cfg(feature = "native-runtime")]
 fn path_contains_windows_aozora_risky_chars(path: &Path) -> bool {
     let path_text = path.to_string_lossy();
     windows_31j_encode_has_errors(&path_text)
         || path_text.chars().any(is_windows_aozora_mapping_risky_char)
 }
 
+#[cfg(feature = "native-runtime")]
 fn windows_31j_encode_has_errors(text: &str) -> bool {
     let (_, _, had_errors) = SHIFT_JIS.encode(text);
     had_errors
 }
 
+#[cfg(feature = "native-runtime")]
 fn is_windows_aozora_mapping_risky_char(ch: char) -> bool {
     matches!(
         ch,
@@ -1180,6 +1220,7 @@ fn is_windows_aozora_mapping_risky_char(ch: char) -> bool {
     )
 }
 
+#[cfg(feature = "native-runtime")]
 fn copy_aozora_companion_files(input_txt: &Path, temp_root: &Path) -> Result<()> {
     let Some(src_dir) = input_txt.parent() else {
         return Ok(());
@@ -1196,6 +1237,7 @@ fn copy_aozora_companion_files(input_txt: &Path, temp_root: &Path) -> Result<()>
     copy_dir_contents_if_exists(&src_dir.join("挿絵"), &temp_root.join("挿絵"))
 }
 
+#[cfg(feature = "native-runtime")]
 fn copy_dir_contents_if_exists(src: &Path, dst: &Path) -> Result<()> {
     if !src.is_dir() {
         return Ok(());
@@ -1218,6 +1260,7 @@ fn copy_dir_contents_if_exists(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native-runtime")]
 fn move_aozora_output(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1233,6 +1276,7 @@ fn move_aozora_output(src: &Path, dst: &Path) -> Result<()> {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn normalize_windows_verbatim_path(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     if cfg!(windows) && raw.starts_with(r"\\?\") {
@@ -1242,6 +1286,7 @@ fn normalize_windows_verbatim_path(path: &Path) -> PathBuf {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn absolutize_path(path: &Path) -> PathBuf {
     if path.is_absolute() {
         return normalize_windows_verbatim_path(path);
@@ -1260,18 +1305,21 @@ fn absolutize_path(path: &Path) -> PathBuf {
 /// 出力ファイルが無い時点で字句的に正規化したパスと比較されるため、`-dst` が
 /// junction / シンボリックリンク / 8.3 短縮名 を含む形だと、実際には同じ場所でも
 /// 一致せず失敗する。解決できない場合は従来どおり絶対パス化して返す。
+#[cfg(feature = "native-runtime")]
 fn resolved_path_for_aozora(path: &Path) -> PathBuf {
     std::fs::canonicalize(path)
         .map(|resolved| normalize_windows_verbatim_path(&resolved))
         .unwrap_or_else(|_| absolutize_path(path))
 }
 
+#[cfg(feature = "native-runtime")]
 fn has_cover_image(dir: &Path) -> bool {
     [".jpg", ".png", ".jpeg"]
         .iter()
         .any(|ext| dir.join(format!("cover{}", ext)).is_file())
 }
 
+#[cfg(feature = "native-runtime")]
 fn aozora_output_looks_generated(output_path: &Path, started_at: SystemTime) -> Result<bool> {
     let metadata = std::fs::metadata(output_path)?;
     let modified_is_newer = metadata
@@ -1281,6 +1329,7 @@ fn aozora_output_looks_generated(output_path: &Path, started_at: SystemTime) -> 
     Ok(modified_is_newer || metadata.len() > 0)
 }
 
+#[cfg(feature = "native-runtime")]
 fn build_aozora_output_summary(stdout: Option<Vec<u8>>, stderr: Option<Vec<u8>>) -> String {
     let stdout_text = stdout
         .filter(|b| !b.is_empty())
@@ -1301,6 +1350,7 @@ fn build_aozora_output_summary(stdout: Option<Vec<u8>>, stderr: Option<Vec<u8>>)
     summary
 }
 
+#[cfg(feature = "native-runtime")]
 fn truncate_output_for_error(text: &str) -> String {
     const MAX_LINES: usize = 80;
     const MAX_BYTES: usize = 16 * 1024;
@@ -1323,6 +1373,7 @@ fn truncate_output_for_error(text: &str) -> String {
     result
 }
 
+#[cfg(feature = "native-runtime")]
 fn decode_ibunko_html_entities(text: &str) -> String {
     let mut data = text
         .replace("&quot;", "\"")
@@ -1350,7 +1401,7 @@ fn find_windows_volume_root(volume_name: &str) -> Option<PathBuf> {
     None
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), feature = "native-runtime"))]
 fn find_windows_volume_root(_volume_name: &str) -> Option<PathBuf> {
     None
 }
@@ -1389,6 +1440,7 @@ fn volume_matches(root: &str, expected: &str) -> bool {
     label.eq_ignore_ascii_case(expected) || serial_text.eq_ignore_ascii_case(expected)
 }
 
+#[cfg(feature = "native-runtime")]
 fn find_unix_volume_root(volume_name: &str) -> Option<PathBuf> {
     let mut roots = vec![PathBuf::from("/media"), PathBuf::from("/mnt")];
     if let Some(home) = home_dir() {
@@ -1408,6 +1460,7 @@ fn find_unix_volume_root(volume_name: &str) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+#[cfg(feature = "native-runtime")]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};

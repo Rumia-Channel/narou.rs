@@ -261,6 +261,29 @@ impl WorkerRuntime {
         )))
     }
 
+    /// 保存済み設定の読み出し (D1)。`ConvertService` が `default.*` / `force.*`
+    /// を適用するのに使う。
+    pub fn settings_store(&self) -> Arc<dyn narou_rs::application::settings::SettingsStore> {
+        Arc::new(D1SettingsStore::new(self.db.clone()))
+    }
+
+    /// 変換 (`ConvertService`) と HTTP 系が共有する平台能力。
+    pub fn http_client(&self) -> Arc<dyn HttpClient> {
+        self.http.clone()
+    }
+
+    pub fn rate_limiter(&self) -> Arc<dyn RateLimiter> {
+        self.rate_limiter.clone()
+    }
+
+    pub fn objects(&self) -> Arc<dyn ObjectStore> {
+        self.objects.clone()
+    }
+
+    pub fn assets(&self) -> Arc<dyn AssetStore> {
+        self.assets.clone()
+    }
+
     /// Enqueue one plan through the ledger and Queue binding as one operation.
     /// Pending/retryable rows are sent; a live running row is not duplicated.
     pub async fn enqueue_plan(&self, plan: JobPlan) -> Result<DispatchOutcome> {

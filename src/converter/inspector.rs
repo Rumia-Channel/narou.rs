@@ -1,6 +1,9 @@
+#[cfg(feature = "native-runtime")]
 use std::fs;
+#[cfg(feature = "native-runtime")]
 use std::path::PathBuf;
 
+#[cfg(feature = "native-runtime")]
 use crate::termcolor::bold_colored;
 use super::settings::NovelSettings;
 
@@ -34,14 +37,16 @@ struct Message {
 }
 
 pub struct Inspector {
+    #[cfg(feature = "native-runtime")]
     archive_path: PathBuf,
     messages: Vec<Message>,
     subtitle: String,
 }
 
 impl Inspector {
-    pub fn new(settings: &NovelSettings) -> Self {
+    pub fn new(#[cfg_attr(not(feature = "native-runtime"), allow(unused_variables))] settings: &NovelSettings) -> Self {
         Self {
+            #[cfg(feature = "native-runtime")]
             archive_path: settings.archive_path.clone(),
             messages: Vec::new(),
             subtitle: String::new(),
@@ -57,6 +62,7 @@ impl Inspector {
         self.subtitle = subtitle.into();
     }
 
+#[cfg(feature = "native-runtime")]
     pub fn save(&self) -> std::io::Result<()> {
         let mut output = format!("※調査日時：{}\n", chrono::Local::now());
         let rendered = self.render_filtered(|_| true);
@@ -88,6 +94,7 @@ impl Inspector {
         ))
     }
 
+#[cfg(feature = "native-runtime")]
     pub fn display_text(&self) -> Option<String> {
         let mut sections = Vec::new();
 
@@ -363,6 +370,7 @@ fn tail_chars(text: &str, max_chars: usize) -> String {
 }
 
 #[cfg(test)]
+#[cfg(feature = "native-runtime")]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};

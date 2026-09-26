@@ -15,6 +15,7 @@
 
 pub mod error;
 pub mod events;
+pub mod convert;
 pub mod jobs;
 pub mod novel_actions;
 pub mod novel_settings;

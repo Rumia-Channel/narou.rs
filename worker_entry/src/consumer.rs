@@ -17,6 +17,7 @@
 //! DLQ); there is no `catch_unwind` and no silent acknowledgment.
 
 use narou_rs::application::{
+    JobKind,
     decode_legacy_envelope, JobClaim, JobId, JobLedgerStatus, JobPlan, JobQueue, JobRequest,
     LegacyEnvelopeOutcome, WorkerJobEnvelope, WORKER_JOB_ENVELOPE_VERSION,
 };
@@ -165,16 +166,21 @@ async fn process_discrete(
         }
     };
 
-    let outcome = execute_job(
-        downloader,
-        job,
-        &job_id,
-        checkpoint.as_ref(),
-        &runtime.subrequests,
-        &runtime.ledger,
-        &execution_token,
-    )
-    .await;
+    let outcome = if job.kind == JobKind::Convert {
+        // Convert は保存済みデータだけを見るので Downloader を使わない。
+        crate::convert::execute_convert(runtime, job).await
+    } else {
+        execute_job(
+            downloader,
+            job,
+            &job_id,
+            checkpoint.as_ref(),
+            &runtime.subrequests,
+            &runtime.ledger,
+            &execution_token,
+        )
+        .await
+    };
     match outcome {
         JobOutcome::Succeeded => {
             runtime

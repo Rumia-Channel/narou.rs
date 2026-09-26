@@ -12,7 +12,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::db::inventory::Inventory;
-use crate::error::{NarouError, Result};
+use crate::error::Result;
 use crate::login::crypto::{KEY_LEN, parse_key_base64, random_key};
 
 /// File holding the library login key, inside `.narou`.

@@ -379,6 +379,37 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - 実データ検証 (2026-09-15, v0.1.3): `WebNovel` の n0421du (401 セクション) で Java 版と **422/423 ファイルがバイト完全一致**、挿絵入りでも **425/426 がバイト完全一致**（単ページ画像化・連番・表紙処理を含む）。残差は `dcterms:modified` のみ（Java はローカル時刻に `Z`、Lite は UTC。Lite 側の意図的な非再現）。
 - 検証手順は `docs/aozora_lite_evaluation_2026-08-23.md` の「更新 (2026-09-15)」節。
 
+### Worker の HTTP 検証・資格情報・設定 (2026-09)
+
+- **URL 検証の分担**: 構文判定 (scheme / host / port / アドレスリテラルの公開判定) は
+  `src/platform/url_policy.rs` にあり、`HttpClient::validate_url` の**既定実装**がこれを使う。
+  native は上書きして DNS 解決先まで確認する (`src/native/http.rs`)。wasm には解決手段が無いため
+  worker は既定実装のまま (= 構文とリテラルのみ) で、到達可否は Cloudflare の egress に委ねる。
+  同期文脈 (挿絵 URL の足切り / preprocess DSL の `fetch`) は `is_safe_public_url_syntax` を使い、
+  ホスト名の解決先は実際の取得時に transport が確認する。
+- **資格情報**: `D1CookieStore` (`worker_entry/src/d1_cookie_store.rs`) が native と同じ
+  `app_state(scope='inv', key='login_cookie')` を読む。復号鍵は secret `NAROU_RS_LOGIN_KEY`
+  (native の環境変数と同名)。**書き込みは wasm 非対応** (暗号化に乱数が要る) なので、資格情報の
+  取り込みと Set-Cookie の書き戻しは native 側で行う。保存形式の互換は
+  `src/platform/cookie_store.rs` の固定ベクタテストで担保する。
+- **設定**: `SnapshotDownloaderSettings` (`src/downloader/settings.rs`) に `app_state` の
+  `local` (`update.strong` / `guard-spoiler` / `auto-add-tags` / `download.use-subdirectory`) と
+  `global` (`over18`)、`inv` の section hash cache を起動時に読んで渡す。同期 API と非同期 D1 の
+  都合で書き戻しは no-op。`over18` 未設定は `None` のままにして年齢認証 `Blocked` 経路を保つ。
+
+### Worker 内の変換 (2026-09)
+
+- `ConvertService` (`src/application/convert.rs`) が変換テキストを組む唯一のポータブル経路。
+  ObjectStore 上の `toc.yaml` / `本文/*.yaml` / `setting.ini` / `replace.txt` / `converter.yaml` と
+  `SettingsStore` の `default.*` / `force.*` を入力に `NovelConverter::build` → `convert_novel` を実行し、
+  `<prefix>/novel.txt` へ書く（native の `convert_novel_by_id` と同じ固定名ミラー）。
+- `converter/**` は `native-runtime` ゲートで fs/プロセス経路を切り離してある。Worker 側では
+  セクション変換キャッシュ・挿絵ローカライズ・device 出力を持たない（毎回変換する）。native 専用の
+  補助が未使用になるため、`worker-runtime` 構成に限り `converter` モジュールの dead_code を許可する。
+- 新しい converter の機能を足すときは、`#[cfg(feature = "native-runtime")]` を付けた関数から
+  fs/プロセスを触るようにし、純関数 (`NovelSettings::from_sources` / `parse_replace_patterns` /
+  `UserConverter::from_yaml` など) を worker から使う。
+
 ### Pixiv 対応 (webnovel/www.pixiv.net.yaml, 2026-09)
 - 4 種の対象に対応: 小説 (`/novel/show.php?id=N`) / 小説シリーズ (`/novel/series/S`) / イラスト・漫画 (`/artworks/A`) / 漫画シリーズ (`/user/U/series/S`)。ncode は種別ごとに接頭辞を付ける (`n` 小説, `s` 小説シリーズ, `a` イラスト・漫画, `c` 漫画シリーズ)。作品ページの HTML は Next.js の SPA シェルで本文を含まないため、`/ajax/*` の JSON API だけを使う。サイト固有の Rust 処理は無く、すべて YAML + `preprocess:` DSL で表現している。
 - 取得元: シリーズ詳細 `/ajax/novel/series/{id}` (作品情報 + 目次 1 ページ目への誘導)、シリーズ目次 `/ajax/novel/series_content/{id}?limit=30&last_order=N&order_by=asc` (30 話ずつ、続きがあれば `next_toc` で辿る)、本文 `/ajax/novel/{id}`。

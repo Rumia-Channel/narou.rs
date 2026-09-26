@@ -14,7 +14,7 @@ Phase 1-8 の抽象化（`docs/platform-abstraction.md`）で port の境界は�
 | P0d D1→S3 移行 (バイナリのみ) | ◐ 実装済みだが未コミット。振り分け前提に作り直す |
 | P0e 契約テスト + CI デプロイ | ❌ 未着手 (CI は `cargo check` とローカル `worker-build` のみ) |
 | P1 取得系を閉じる | ◐ 実行系は実装済み。SSRF・Cookie・設定の 3 点が未了 |
-| P2 変換を Worker へ | ❌ 未着手 (EPUB 応答のストリーミングは完了 `b47a108`) |
+| P2 変換を Worker へ | ◐ 変換テキスト生成は完了 (`ConvertService`)。残りは device 出力 (MOBI 等) の扱い |
 | P3 Web UI 移植 | ❌ 未着手 |
 | P4 運用 | ❌ 未着手 |
 
@@ -164,7 +164,7 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 | # | 穴 | 根拠 |
 |---|---|---|
 | 1 | ~~SSRF 検証が DNS 解決を要求~~ → **解決済み**: 構文検証を `platform::url_policy` に分離し、`HttpClient::validate_url` の実装が DNS の有無に応じて判定する（native=解決先まで、worker=構文とアドレスリテラル） | `src/platform/url_policy.rs`, `src/platform/http.rs`, `src/downloader/security.rs`, `worker_entry/src/http.rs` |
-| 2 | **Convert が Worker に存在しない**。EPUB の前提 `<prefix>/novel.txt` を書く実装が無く常に 409 | `src/lib.rs:14-15`, `worker_entry/src/lib.rs:203-211` |
+| 2 | ~~Convert が Worker に存在しない~~ → **解決**: `ConvertService`（core）が保存済み TOC と本文から変換テキストを組み、`<prefix>/novel.txt` へ書く。`JobKind::Convert` は worker 実行可能。native の `convert_novel_by_id` が書く固定名ミラーと同じキー | `src/application/convert.rs`, `worker_entry/src/convert.rs`, `src/application/jobs.rs` |
 | 3 | ~~CookieStore 未注入~~ → **読取は解決**: `D1CookieStore` を `new_downloader` に注入（保存形式は native と同じ `app_state(inv, login_cookie)`）。書込 (`save_all`) は wasm に乱数源が無いため未対応＝資格情報の取込と Set-Cookie の書き戻しは native 側で行う | `worker_entry/src/d1_cookie_store.rs`, `worker_entry/src/composition.rs` |
 | 4 | ~~設定が Worker に届かない~~ → **解決**: `SnapshotDownloaderSettings` に `app_state` の `local`/`global`（`update.strong` / `guard-spoiler` / `auto-add-tags` / `download.use-subdirectory` / `over18`）と `inv` の section hash cache を起動時に読んで注入。書き戻しは同期 API と非同期 D1 の都合で no-op（`over18` は Web UI 側で設定） | `src/downloader/settings.rs`, `worker_entry/src/composition.rs` |
 | 5 | **デプロイ設定が未完**（`database_id` 未設定・secret 投入手順なし・CI にデプロイ無し） | `worker_entry/wrangler.toml`, `.github/workflows/platform.yml:45-70` |
@@ -179,6 +179,20 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
   解決先は見ないが、実際の取得時に transport が確認するので防御は 2 段のまま。
 - 資格情報の保存形式は変えていない（native が書いた `enc:v1:...` を worker が復号できることを固定ベクタの
   テストで確認: `src/platform/cookie_store.rs` の `decodes_a_pinned_at_rest_payload`）。
+
+### 2.2.2 Convert の現状 (2026-09-26 実装)
+
+- `ConvertService` (`src/application/convert.rs`) が `<prefix>/toc.yaml` と `本文/*.yaml` を
+  ObjectStore から読み、`setting.ini` / `replace.txt` / `converter.yaml`（いずれも ObjectStore 上）と
+  `SettingsStore` の `default.*` / `force.*` を適用して `NovelConverter::build` → `convert_novel` を実行し、
+  `<prefix>/novel.txt` に書く。native の `convert_novel_by_id` と同じ固定名ミラーなので `download.epub`
+  がそのまま配信できる（409 が消える）。
+- 検証: `src/application/convert.rs` のテストが MemoryObjectStore 上で往復（TOC + 本文 →
+  `novel.txt`、本文が無ければ失敗）を固定する。
+- 既知の差: 挿絵のローカライズ能力は native の CLI 変換と同じく渡さない（device 側の仕事）。小説ごとの
+  `replace.txt` は適用するが、インストール先の全体 `replace.txt` は native 専用のまま。セクション変換
+  キャッシュは Worker では持たない（毎回変換する）。
+- `JobKind::Convert` は `is_worker_executable` に含めた。Send / Mail / Backup は従来どおり `blocked`。
 
 ### 2.3 その他の差分
 

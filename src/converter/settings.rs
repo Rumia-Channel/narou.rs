@@ -1,9 +1,14 @@
 use std::collections::HashMap;
+#[cfg(feature = "native-runtime")]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+#[cfg(feature = "native-runtime")]
+use std::path::Path;
 
 use serde::Serialize;
 
+#[cfg(feature = "native-runtime")]
 use crate::setting_core::SettingScope;
 
 use super::ini::{IniData, IniValue};
@@ -125,6 +130,7 @@ impl Default for NovelSettings {
 }
 
 impl NovelSettings {
+    #[cfg(feature = "native-runtime")]
     pub fn load_for_novel(
         novel_id: i64,
         novel_title: &str,
@@ -141,6 +147,48 @@ impl NovelSettings {
         )
     }
 
+    /// `setting.ini` と保存済み設定マップから小説設定を組み立てる (純関数)。
+    ///
+    /// native は fs から、Worker は ObjectStore と D1 から読んだ値を渡す。
+    /// `default.*` / `force.*` の適用規則は native と共通。
+    pub fn from_sources(
+        novel_id: Option<i64>,
+        novel_title: &str,
+        novel_author: &str,
+        ini: &IniData,
+        settings_map: &HashMap<String, serde_yaml::Value>,
+        ignore_force: bool,
+        ignore_default: bool,
+    ) -> Self {
+        let mut settings = Self::default();
+        settings.id = novel_id;
+        settings.title = Some(novel_title.to_string());
+        settings.author = Some(novel_author.to_string());
+
+        settings = Self::apply_ini_defaults(&settings, ini);
+        if let Some(novel_id) = novel_id {
+            settings = Self::apply_ini_novel(&settings, ini, novel_id);
+        }
+        settings = Self::apply_force_and_default_settings_from(
+            &settings,
+            ignore_force,
+            ignore_default,
+            settings_map,
+        );
+        settings.novel_title = if settings.novel_title.is_empty() {
+            novel_title.to_string()
+        } else {
+            settings.novel_title.clone()
+        };
+        settings.novel_author = if settings.novel_author.is_empty() {
+            novel_author.to_string()
+        } else {
+            settings.novel_author.clone()
+        };
+        settings
+    }
+
+    #[cfg(feature = "native-runtime")]
     pub fn load_for_novel_with_options(
         novel_id: i64,
         novel_title: &str,
@@ -159,32 +207,18 @@ impl NovelSettings {
             Err(_) => IniData::new(),
         };
 
-        let mut settings = Self::default();
-        settings.id = Some(novel_id);
-        settings.title = Some(novel_title.to_string());
-        settings.author = Some(novel_author.to_string());
-        settings.archive_path = archive_path.to_path_buf();
-        settings.replace_patterns = load_replace_patterns_with_global(&replace_path, archive_path);
-
-        settings = Self::apply_ini_defaults(&settings, &ini);
-        settings = Self::apply_ini_novel(&settings, &ini, novel_id);
-        settings = Self::apply_force_and_default_settings(
-            &settings,
+        let data = crate::db::settings::load(SettingScope::Local).unwrap_or_default();
+        let mut settings = Self::from_sources(
+            Some(novel_id),
+            novel_title,
+            novel_author,
+            &ini,
+            &data,
             ignore_force,
             ignore_default,
         );
-
-        settings.novel_title = if settings.novel_title.is_empty() {
-            novel_title.to_string()
-        } else {
-            settings.novel_title.clone()
-        };
-        settings.novel_author = if settings.novel_author.is_empty() {
-            novel_author.to_string()
-        } else {
-            settings.novel_author.clone()
-        };
-
+        settings.archive_path = archive_path.to_path_buf();
+        settings.replace_patterns = load_replace_patterns_with_global(&replace_path, archive_path);
         settings
     }
 
@@ -198,6 +232,7 @@ impl NovelSettings {
         crate::title::project_title(title, self.enable_strip_title_prefix)
     }
 
+    #[cfg(feature = "native-runtime")]
     pub fn create_for_text_file_with_options(
         archive_path: &Path,
         source_name: &str,
@@ -256,19 +291,21 @@ impl NovelSettings {
         s
     }
 
-    fn apply_force_and_default_settings(
+    /// `default.*` / `force.*` を適用する (純関数)。
+    ///
+    /// native は保存済み設定 (`crate::db::settings::load`) を、Worker は D1 から
+    /// 読んだ同じ形のマップを渡す。
+    pub fn apply_force_and_default_settings_from(
         settings: &Self,
         ignore_force: bool,
         ignore_default: bool,
+        data: &HashMap<String, serde_yaml::Value>,
     ) -> Self {
         let mut s = settings.clone();
-        let Ok(data) = crate::db::settings::load(SettingScope::Local) else {
-            return s;
-        };
 
         let mut default_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
         let mut force_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
-        for (key, value) in &data {
+        for (key, value) in data {
             if !ignore_default {
                 if let Some(rest) = key.strip_prefix("default.") {
                     default_settings.insert(rest, value);
@@ -296,6 +333,18 @@ impl NovelSettings {
             }
         }
         s
+    }
+
+    #[cfg(feature = "native-runtime")]
+    fn apply_force_and_default_settings(
+        settings: &Self,
+        ignore_force: bool,
+        ignore_default: bool,
+    ) -> Self {
+        let Ok(data) = crate::db::settings::load(SettingScope::Local) else {
+            return settings.clone();
+        };
+        Self::apply_force_and_default_settings_from(settings, ignore_force, ignore_default, &data)
     }
 
     fn has_default_setting(&self, key: &str, default_val: &IniValue) -> bool {
@@ -1164,15 +1213,11 @@ mod tests {
     }
 }
 
-pub fn load_replace_patterns(path: &Path) -> Vec<(String, String)> {
-    if !path.exists() {
-        return Vec::new();
-    }
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-
+/// `replace.txt` の中身を (置換前, 置換後) の並びにする。
+///
+/// fs を使わないので Worker でも同じ規則で読める (`replace.txt` は
+/// ObjectStore 上の小説データから読む)。
+pub fn parse_replace_patterns(content: &str) -> Vec<(String, String)> {
     let mut patterns = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim();
@@ -1186,6 +1231,19 @@ pub fn load_replace_patterns(path: &Path) -> Vec<(String, String)> {
     patterns
 }
 
+#[cfg(feature = "native-runtime")]
+pub fn load_replace_patterns(path: &Path) -> Vec<(String, String)> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    parse_replace_patterns(&content)
+}
+
+#[cfg(feature = "native-runtime")]
 fn load_replace_patterns_with_global(
     local_path: &Path,
     archive_path: &Path,
@@ -1201,6 +1259,7 @@ fn load_replace_patterns_with_global(
     patterns
 }
 
+#[cfg(feature = "native-runtime")]
 fn find_narou_root_from(start: &Path) -> Option<PathBuf> {
     let mut current = if start.is_file() {
         start.parent()?.to_path_buf()
