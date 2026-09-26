@@ -4,15 +4,23 @@ v0.4.x 系で進めてきた Worker 対応を「本番で使える状態」ま�
 Phase 1-8 の抽象化（`docs/platform-abstraction.md`）で port の境界は既に引かれており、
 本計画はその上に載る**足回り・保存基盤・機能の穴埋め**を扱う。
 
-## 実装状況 (2026-09-26): **計画策定済み / P0 未着手**
+## 実装状況 (2026-09-26): **計画策定済み / P0 着手**
 
 | Phase | 状態 |
 |---|---|
-| P0 足回りと保存基盤 | ❌ 未着手 |
+| P0 足回りと保存基盤 | ◐ 進行中 (環境分離テンプレート + provision/render スクリプト完了、S3 adapter / D1→S3 移行 / 契約テスト / CI デプロイは未着手) |
 | P1 取得系を閉じる | ❌ 未着手 |
 | P2 変換を Worker へ | ❌ 未着手 |
 | P3 Web UI 移植 | ❌ 未着手 |
 | P4 運用 | ❌ 未着手 |
+
+P0 で追加済みのもの:
+
+- `worker_entry/wrangler.develop.toml` / `wrangler.staging.toml` / `wrangler.production.toml` (プレースホルダ入りテンプレート)
+- `worker_entry/ci/render_config.py` (置換 + 形式検証。未解決プレースホルダは失敗)
+- `worker_entry/ci/provision_resources.py` (D1 / Queue / DLQ の冪等作成と `GITHUB_OUTPUT`)
+- `worker_entry/wrangler.toml` はローカル専用値 (D1 `narou-local` / queue `narou-jobs-local` / S3 prefix `narou/local`) に変更し、デプロイには使わない方針を明記
+- `.gitignore` に生成物 (`wrangler.ci.toml` / `build/` / `.wrangler/` / `.dev.vars` / `public/`) を追加
 
 ---
 

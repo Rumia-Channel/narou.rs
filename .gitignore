@@ -45,5 +45,13 @@ errors.txt
 /dist/
 /narou
 
+# Cloudflare Workers (worker_entry)
+# 生成物とローカル専用ファイルは追跡しない。
+/worker_entry/build/
+/worker_entry/.wrangler/
+/worker_entry/wrangler.ci.toml
+/worker_entry/.dev.vars
+/worker_entry/public/
+
 # ログイン Cookie の書き出しファイル（資格情報を含むため追跡しない）
 /narou_login_export.yaml

@@ -1,0 +1,48 @@
+# staging 環境テンプレート。構造は wrangler.develop.toml と同じで、
+# 名前と workers_dev だけが違う (値は CI が置換する)。
+
+name = "narou-rs-staging"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-08-10"
+workers_dev = true
+
+[limits]
+cpu_ms = 300000
+
+[vars]
+NAROU_AUTH_REQUIRED = "true"
+S3_ENDPOINT = "__S3_ENDPOINT__"
+S3_REGION = "__S3_REGION__"
+S3_BUCKET = "__S3_BUCKET__"
+S3_PREFIX = "__S3_PREFIX__"
+
+[build]
+command = "worker-build --release"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "__NAROU_D1_DATABASE_NAME__"
+database_id = "__NAROU_D1_DATABASE_ID__"
+migrations_dir = "migrations"
+
+[[queues.producers]]
+binding = "NAROU_JOBS"
+queue = "__NAROU_JOB_QUEUE__"
+
+[[queues.consumers]]
+queue = "__NAROU_JOB_QUEUE__"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "__NAROU_JOB_DLQ__"
+max_concurrency = 4
+
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "SiteRateLimiter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SiteRateLimiter"]
+
+[triggers]
+crons = ["* * * * *"]

@@ -1,0 +1,60 @@
+# develop 環境テンプレート。
+#
+# `worker_entry/ci/render_config.py` が `__PLACEHOLDER__` を CI の環境変数で
+# 置換し、`wrangler.ci.toml` を生成する (生成物は .gitignore 済み)。
+# account 固有の値 (database_id / S3 の接続先 / secret 名) はここに書かない。
+#
+# ローカル開発は `wrangler.toml` (プレースホルダ無し) を使う。
+
+name = "narou-rs-develop"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-08-10"
+workers_dev = true
+
+[limits]
+# 有料プラン前提の余裕。EPUB 生成と長い queue ジョブを 1 invocation で扱う。
+cpu_ms = 300000
+
+[vars]
+NAROU_AUTH_REQUIRED = "true"
+S3_ENDPOINT = "__S3_ENDPOINT__"
+S3_REGION = "__S3_REGION__"
+S3_BUCKET = "__S3_BUCKET__"
+S3_PREFIX = "__S3_PREFIX__"
+
+[build]
+command = "worker-build --release"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "__NAROU_D1_DATABASE_NAME__"
+database_id = "__NAROU_D1_DATABASE_ID__"
+migrations_dir = "migrations"
+
+# --- jobs queue ---------------------------------------------------------
+# Producer: POST /api/jobs と cron planner が version-2 envelope を送る。
+[[queues.producers]]
+binding = "NAROU_JOBS"
+queue = "__NAROU_JOB_QUEUE__"
+
+# Consumer: D1 ledger で claim し、durable terminal を書いてから ack する。
+# max_retries は ledger の attempt cap (3) 以上にする必要がある
+# (explicit な retry_with_options も max_retries に数えられるため)。
+[[queues.consumers]]
+queue = "__NAROU_JOB_QUEUE__"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "__NAROU_JOB_DLQ__"
+max_concurrency = 4
+
+# --- per-site rate limiting Durable Object -------------------------------
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "SiteRateLimiter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SiteRateLimiter"]
+
+[triggers]
+crons = ["* * * * *"]

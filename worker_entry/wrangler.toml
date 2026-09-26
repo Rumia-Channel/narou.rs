@@ -1,57 +1,64 @@
-name = "narou-rs"
+# ローカル開発用の設定。デプロイには使わない
+# (`wrangler.<target>.toml` を CI がレンダリングした `wrangler.ci.toml` を使う)。
+#
+# ローカルの D1 は名前も ID も開発専用の値にしてある。実体は
+# `.wrangler/state/v3/d1/` 配下の miniflare SQLite。
+
+name = "narou-rs-local"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-08-10"
+workers_dev = true
 
 [limits]
-# Paid-plan headroom for in-process EPUB generation and long queue jobs.
+# 有料プラン前提の余裕。EPUB 生成と長い queue ジョブを 1 invocation で扱う。
 cpu_ms = 300000
 
-[[d1_databases]]
-binding = "DB"
-database_name = "narou-rs"
-migrations_dir = "migrations"
-
-# Set the remote database_id before deployment (or in an environment-specific
-# Wrangler config). Keep NAROU_ADMIN_TOKEN and other secrets outside this file.
-# Object payloads live in the D1 `objects`/`object_chunks` tables (migration
-# 0008); no external bucket is required.
+[vars]
+# 認証は既定で有効。ローカルで外すときだけ false にする。
+NAROU_AUTH_REQUIRED = "true"
+# S3 互換ストレージ。ローカルは MinIO 等を想定した既定値で、
+# 実際に使うときは `--var` か `.dev.vars` で上書きする。
+S3_ENDPOINT = "http://127.0.0.1:9000"
+S3_REGION = "us-east-1"
+S3_BUCKET = "narou-local"
+S3_PREFIX = "narou/local"
+# 資格情報は `wrangler dev --var S3_ACCESS_KEY_ID:... --var S3_SECRET_ACCESS_KEY:...`
+# または gitignore 済みの `.dev.vars` で渡す (リポジトリに置かない)。
 
 [build]
 command = "worker-build --release"
 
-# --- Phase 8: jobs queue ------------------------------------------------
-# Producer: POST /api/jobs and the cron planner send version-2 envelopes
-# (WorkerJobEnvelope {version, job_id, job}) here.
+[[d1_databases]]
+binding = "DB"
+database_name = "narou-local"
+database_id = "local-narou"
+migrations_dir = "migrations"
+
+# --- jobs queue ---------------------------------------------------------
+# Producer: POST /api/jobs と cron planner が version-2 envelopes
+# (WorkerJobEnvelope {version, job_id, job}) を送る。
 
 [[queues.producers]]
 binding = "NAROU_JOBS"
-queue = "narou-jobs"
+queue = "narou-jobs-local"
 
-# Consumer: the queue handler claims each job against the D1 ledger and acks
-# only after a durable terminal state. Conservative settings: one message at
-# a time. max_retries must be >= the ledger's attempt cap, because Cloudflare
-# counts *explicit* `retry_with_options` calls against max_retries too; the
-# ledger cap (3 attempts, then durable permanent) is what actually stops
-# retries, and crashed messages land in the DLQ for operator inspection.
-
+# Consumer: D1 ledger で claim し、durable terminal を書いてから ack する。
+# max_retries は ledger の attempt cap 以上にする (Cloudflare は explicit な
+# `retry_with_options` も max_retries に数えるため、実効停止点は ledger 側の
+# 3 回で、crash したメッセージは DLQ に落ちる)。
 [[queues.consumers]]
-queue = "narou-jobs"
+queue = "narou-jobs-local"
 max_batch_size = 1
 max_retries = 3
-dead_letter_queue = "narou-jobs-dlq"
+dead_letter_queue = "narou-jobs-local-dlq"
 max_concurrency = 4
-# Concurrency above 1 is safe: every invocation builds its own runtime and
-# Downloader, the D1 ledger claim is atomic, and the SiteRateLimiter DO
-# serializes per-site pacing across consumers.
+# concurrency > 1 は安全: invocation ごとに runtime と Downloader を作り、
+# D1 ledger の claim は atomic、SiteRateLimiter DO が per-site ペーシングを直列化する。
 
-# There is intentionally no DLQ consumer binding. DLQ messages remain
-# operator-inspection artifacts; ordinary execution never drains or re-enqueues
-# them. A later operator action can replay a selected envelope explicitly.
+# DLQ の consumer は意図的に作らない。DLQ は運用者が中身を確認するための
+# 退避先で、通常実行が drain / 再投入することはない。
 
-# --- Phase 8: per-site rate limiting Durable Object ----------------------
-# One SiteRateLimiter instance per normalized site key; the runtime
-# serializes permit allocation per instance.
-
+# --- per-site rate limiting Durable Object ------------------------------
 [[durable_objects.bindings]]
 name = "RATE_LIMITER"
 class_name = "SiteRateLimiter"
@@ -60,7 +67,7 @@ class_name = "SiteRateLimiter"
 tag = "v1"
 new_sqlite_classes = ["SiteRateLimiter"]
 
-# Run every minute; the planner's D1 checkpoint decides whether the configured
-# HHMM wall-clock schedule is due and bounds each invocation to one page.
+# 毎分実行。planner の D1 checkpoint が設定された HHMM スケジュールの到来を
+# 判定し、1 回の実行を 1 ページに制限する。
 [triggers]
 crons = ["* * * * *"]
