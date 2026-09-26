@@ -14,8 +14,8 @@
 //! `WorkerRuntime::enqueue_plan` で discrete なジョブを積む。
 //!
 //! 対象解決は `webui/download.rs` と同じ手順 (エイリアス → id / ncode / URL →
-//! タイトル / ncode 検索)。`download.rs` の private 実装は呼べないので、
-//! `alias` 読み込みをこのファイル内に写している。
+//! タイトル / ncode 検索)。別名表の読み込みは `webui::download::load_aliases`、
+//! 解決自体は可搬層 `narou_rs::application::aliases` を共有する。
 //!
 //! native との JSON 一致の要点:
 //! - 成功/失敗はいずれも HTTP 200。失敗は `{success:false, message, ...}`
@@ -32,6 +32,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use narou_rs::application::aliases::{alias_to_target_for_update, resolve_alias_target};
 use narou_rs::application::{JobKind, JobPlan, JobTarget};
 use narou_rs::db::{NovelRecord, compare_records_by_key, sort_keys};
 use narou_rs::downloader::site_setting::SiteSetting;
@@ -40,7 +41,6 @@ use narou_rs::platform::NovelId;
 use narou_rs::setting_core::SettingScope;
 use serde::Deserialize;
 use serde_json::json;
-use wasm_bindgen::JsValue;
 use worker::{Env, Method, Request, Response, console_log};
 
 use crate::composition::WorkerRuntime;
@@ -54,11 +54,6 @@ const MAX_WEB_TARGET_LENGTH: usize = 4096;
 const MAX_WEB_TAGS_PER_REQUEST: usize = 128;
 /// native `crate::web::MAX_WEB_TAG_LENGTH` (`validate_web_tag_name`)。
 const MAX_WEB_TAG_LENGTH: usize = 255;
-
-/// `app_state` row holding the alias map (native `alias.yaml`, Local
-/// inventory scope — same scope name `d1_cookie_store` uses).
-const ALIAS_INVENTORY_SCOPE: &str = "inv";
-const ALIAS_INVENTORY_KEY: &str = "alias";
 
 /// native `sort_state.rs` の既定ソート (current_sort 未保存時)。
 const DEFAULT_CURRENT_SORT_COLUMN: usize = 2;
@@ -432,64 +427,6 @@ async fn sorted_update_all_ids(runtime: &WorkerRuntime) -> Vec<i64> {
     records.into_iter().map(|record| record.id).collect()
 }
 
-// ---------------------------------------------------------------------------
-// 対象解決 (webui/download.rs の private 実装と同じ手順)
-// ---------------------------------------------------------------------------
-
-/// `app_state('inv','alias')` の行 (YAML 優先、旧 `value_json` はフォールバック)。
-#[derive(Debug, Deserialize)]
-struct AliasRow {
-    #[serde(default)]
-    value_yaml: Option<String>,
-    #[serde(default)]
-    value_json: Option<String>,
-}
-
-/// native `alias_to_target` が読むエイリアス表。読めない/行が無いときは
-/// 空表 (= native が load に失敗したときと同じく別名なしとして扱う)。
-/// `download.rs::load_aliases` と同じ実装。
-async fn load_aliases(env: &Env) -> HashMap<String, String> {
-    let Ok(db) = env.d1("DB") else {
-        return Default::default();
-    };
-    let statement = match db
-        .prepare("SELECT value_yaml, value_json FROM app_state WHERE scope = ? AND key = ?")
-        .bind(&[
-            JsValue::from_str(ALIAS_INVENTORY_SCOPE),
-            JsValue::from_str(ALIAS_INVENTORY_KEY),
-        ]) {
-        Ok(statement) => statement,
-        Err(_) => return Default::default(),
-    };
-    let row: Option<AliasRow> = statement.first::<AliasRow>(None).await.unwrap_or_default();
-    let Some(row) = row else {
-        return Default::default();
-    };
-    // `value_yaml` を正とし、移行前の行 (`value_json` のみ) も読めるようにする
-    // (`D1CookieStore::load_payload` と同じ規則)。
-    let payload = match row.value_yaml.as_deref() {
-        Some(yaml) if !yaml.trim().is_empty() && yaml.trim() != "{}" => yaml.to_string(),
-        _ => row.value_json.unwrap_or_else(|| "{}".to_string()),
-    };
-    let mapping: HashMap<String, serde_yaml::Value> =
-        serde_yaml::from_str(&payload).unwrap_or_default();
-    mapping
-        .into_iter()
-        .filter_map(|(name, value)| yaml_scalar_to_string(&value).map(|s| (name, s)))
-        .collect()
-}
-
-/// native `yaml_value_to_string`: 文字列・数値・真偽値スカラーだけを取る
-/// (配列やマップは別名の値として無効なので無視 = native 同様フォールバック)。
-fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String> {
-    match value {
-        serde_yaml::Value::String(s) => Some(s.clone()),
-        serde_yaml::Value::Number(n) => Some(n.to_string()),
-        serde_yaml::Value::Bool(b) => Some(b.to_string()),
-        _ => None,
-    }
-}
-
 /// native `narou_rs::downloader::site_setting::effective_site_settings` 相当。
 /// Worker 側は `bundled_sites::load_site_settings` (bundle + ユーザー定義の
 /// マージ、30s L1 キャッシュ) が同じ役割。
@@ -503,30 +440,6 @@ async fn site_settings(runtime: &WorkerRuntime) -> Vec<SiteSetting> {
 // native `src/commands/mod.rs` / `update.rs` のターゲット解決
 // (native は子プロセス側でこれをやるので、Worker では投入時に済ませる)
 // ---------------------------------------------------------------------------
-
-/// `commands/mod.rs::resolve_alias_target`: 完全一致のエイリアス名だけ解決し、
-/// 無ければ入力をそのまま返す (convert 側。小文字化しない)。
-fn resolve_alias_target(aliases: &HashMap<String, String>, target: &str) -> String {
-    aliases
-        .get(target)
-        .cloned()
-        .unwrap_or_else(|| target.to_string())
-}
-
-/// `commands/update.rs::alias_to_target`: convert 側と同じだが、エイリアスが
-/// 無い非数値ターゲットは小文字化してから返す。
-fn alias_to_target_for_update(aliases: &HashMap<String, String>, target: &str) -> String {
-    match aliases.get(target) {
-        Some(alias) => alias.clone(),
-        None => {
-            if target.chars().all(|c| c.is_ascii_digit()) {
-                target.to_string()
-            } else {
-                target.to_lowercase()
-            }
-        }
-    }
-}
 
 /// `commands/mod.rs::resolve_target_to_id` (convert 用): alias → 数値 id →
 /// URL → ncode → title/ncode の順で既存レコードの id に解決する。
@@ -742,7 +655,7 @@ async fn api_update(
             .unwrap_or_default();
         let sorted = sort_numeric_targets_for_state(runtime, &records, &targets).await;
         let expanded = expand_tag_targets(&records, &sorted);
-        let aliases = load_aliases(env).await;
+        let aliases = super::download::load_aliases(env).await;
         let site_settings = site_settings(runtime).await;
         let mut resolved = Vec::new();
         let mut seen = HashSet::new();
@@ -891,7 +804,7 @@ async fn api_convert(
     // 解決 (commands/mod.rs::resolve_target_to_id) を行い、解決できない
     // ターゲットは native の実行時スキップ ("<target> は存在しません") と
     // 同じく落とす。
-    let aliases = load_aliases(env).await;
+    let aliases = super::download::load_aliases(env).await;
     let site_settings = site_settings(runtime).await;
     let mut resolved: Vec<(String, i64)> = Vec::new();
     for target in &ordered_targets {

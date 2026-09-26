@@ -7,6 +7,7 @@
 //! on `serde`/`chrono`, the domain [`NovelRecord`], and the platform traits.
 //!
 //! Modules:
+//! - [`aliases`]: novel-target alias resolution shared by the CLI and Worker.
 //! - [`error`]: the application-layer error type (no HTTP status).
 //! - [`events`]: application-owned platform ports (`FreezeStore`,
 //!   `SiteTimezoneProvider`) plus their no-op defaults.
@@ -14,6 +15,7 @@
 //!   pagination / frozen status / new-arrival marker).
 
 pub mod error;
+pub mod aliases;
 pub mod events;
 pub mod convert;
 pub mod site_definitions;

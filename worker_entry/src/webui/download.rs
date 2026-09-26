@@ -36,6 +36,9 @@
 
 use std::collections::HashMap;
 
+use narou_rs::application::aliases::{
+    ALIAS_INVENTORY_KEY, ALIAS_INVENTORY_SCOPE, parse_alias_map, resolve_alias_target,
+};
 use narou_rs::application::{JobKind, JobPlan, JobTarget};
 use narou_rs::platform::NovelId;
 use serde::Deserialize;
@@ -51,11 +54,6 @@ use crate::composition::WorkerRuntime;
 const MAX_WEB_TARGETS_PER_REQUEST: usize = 100_000;
 /// native `MAX_WEB_TARGET_LENGTH` (`validate_web_target_value`).
 const MAX_WEB_TARGET_LENGTH: usize = 4096;
-
-/// `app_state` row holding the alias map (native `alias.yaml`, Local
-/// inventory scope — same scope name `d1_cookie_store` uses).
-const ALIAS_INVENTORY_SCOPE: &str = "inv";
-const ALIAS_INVENTORY_KEY: &str = "alias";
 
 #[derive(Debug, Deserialize)]
 struct DownloadBody {
@@ -205,7 +203,7 @@ struct AliasRow {
 
 /// native `alias_to_target` が読むエイリアス表。読めない/行が無いときは
 /// 空表 (= native が load に失敗したときと同じく別名なしとして扱う)。
-async fn load_aliases(env: &Env) -> HashMap<String, String> {
+pub(crate) async fn load_aliases(env: &Env) -> HashMap<String, String> {
     let Ok(db) = env.d1("DB") else {
         return Default::default();
     };
@@ -228,23 +226,7 @@ async fn load_aliases(env: &Env) -> HashMap<String, String> {
         Some(yaml) if !yaml.trim().is_empty() && yaml.trim() != "{}" => yaml.to_string(),
         _ => row.value_json.unwrap_or_else(|| "{}".to_string()),
     };
-    let mapping: HashMap<String, serde_yaml::Value> =
-        serde_yaml::from_str(&payload).unwrap_or_default();
-    mapping
-        .into_iter()
-        .filter_map(|(name, value)| yaml_scalar_to_string(&value).map(|s| (name, s)))
-        .collect()
-}
-
-/// native `yaml_value_to_string`: 文字列・数値・真偽値スカラーだけを取る
-/// (配列やマップは別名の値として無効なので無視 = native 同様フォールバック)。
-fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String> {
-    match value {
-        serde_yaml::Value::String(s) => Some(s.clone()),
-        serde_yaml::Value::Number(n) => Some(n.to_string()),
-        serde_yaml::Value::Bool(b) => Some(b.to_string()),
-        _ => None,
-    }
+    parse_alias_map(&payload)
 }
 
 /// One raw target → a ledger-safe `JobTarget`, following native's resolution
@@ -255,10 +237,7 @@ async fn resolve_plan_target(
     raw: &str,
 ) -> Result<JobTarget, String> {
     // `alias_to_target`: exact-key lookup, unmapped names pass through.
-    let effective = aliases
-        .get(raw)
-        .cloned()
-        .unwrap_or_else(|| raw.to_string());
+    let effective = resolve_alias_target(aliases, raw);
     let effective = effective.trim();
     if effective.is_empty() {
         return Err("invalid download target".to_string());

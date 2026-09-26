@@ -31,14 +31,13 @@ pub mod version;
 pub mod web;
 
 fn resolve_alias_target(target: &str) -> String {
-    narou_rs::db::with_database(|db| {
-        let aliases: HashMap<String, serde_yaml::Value> =
+    let aliases = narou_rs::db::with_database(|db| {
+        let values: HashMap<String, serde_yaml::Value> =
             db.inventory().load("alias", InventoryScope::Local)?;
-        Ok(aliases.get(target).and_then(yaml_value_to_string))
+        Ok(narou_rs::application::aliases::alias_map_from_values(values))
     })
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| target.to_string())
+    .unwrap_or_default();
+    narou_rs::application::aliases::resolve_alias_target(&aliases, target)
 }
 
 fn resolve_target_to_id(target: &str) -> Option<i64> {
