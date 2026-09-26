@@ -12,11 +12,25 @@ Phase 1-8 の抽象化（`docs/platform-abstraction.md`）で port の境界は�
 | P0b 署名と S3 アダプタ | ✅ 完了 (`23338ec`, `ed87fcd`) |
 | P0c 保存先の振り分け (SplitStore) | ❌ 未着手 (当初の「全オブジェクト切替」を差し替える) |
 | P0d D1→S3 移行 (バイナリのみ) | ◐ 実装済みだが未コミット。振り分け前提に作り直す |
-| P0e 契約テスト + CI デプロイ | ❌ 未着手 |
-| P1 取得系を閉じる | ❌ 未着手 |
-| P2 変換を Worker へ | ❌ 未着手 |
+| P0e 契約テスト + CI デプロイ | ❌ 未着手 (CI は `cargo check` とローカル `worker-build` のみ) |
+| P1 取得系を閉じる | ◐ 実行系は実装済み。SSRF・Cookie・設定の 3 点が未了 |
+| P2 変換を Worker へ | ❌ 未着手 (EPUB 応答のストリーミングは完了 `b47a108`) |
 | P3 Web UI 移植 | ❌ 未着手 |
 | P4 運用 | ❌ 未着手 |
+
+### P1 の内訳 (2026-09-26 時点の実測)
+
+- ✅ 実装済み: queue 実行系 (`worker_entry/src/consumer.rs`, `executor.rs`)。D1 台帳での claim、予算
+  (`WorkerBudget` + section 境界チェックポイント)、bounded retry、`JobKind::is_worker_executable()` による
+  種別判定まで動く。
+- ❌ `src/downloader/security.rs:19-40` の `validate_public_url` が無条件に `to_socket_addrs` を呼ぶため、
+  wasm では **全 HTTP 経路が検証で落ちる** (`http_policy.rs:214,219,276`, `narou_api.rs:73`)。DL/更新は
+  実行まで進んで失敗する状態 (§2.2 #1)。
+- ❌ CookieStore は未注入 (§2.2 #3)。ログイン必須サイトは `Blocked` のまま。
+- ❌ downloader の設定は `WorkerDownloaderSettings` (`src/downloader/settings.rs:78-90`) = 全既定値、
+  小説単位の上書きも `HashMap::new()` (`worker_entry/src/composition.rs:161`)。D1 の設定は
+  Web API 用 (`SettingsService`) には載っているが downloader には渡っていない (§2.2 #4)。
+- ❌ サイト定義はビルド時埋め込みのみ (`EmptySiteDefinitionProvider`, `worker_entry/src/composition.rs:339`)。
 
 改訂の要点: 保存先を「**オブジェクト全体を D1 か S3 のどちらかに置く**」から
 「**データ種別ごとに置き場を固定し、バイナリだけを D1/S3 で切り替える**」へ変更した。
