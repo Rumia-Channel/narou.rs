@@ -400,6 +400,20 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   `global` (`over18`)、`inv` の section hash cache を起動時に読んで渡す。同期 API と非同期 D1 の
   都合で書き戻しは no-op。`over18` 未設定は `None` のままにして年齢認証 `Blocked` 経路を保つ。
 
+### サイト定義の差し替え経路 (2026-09)
+
+- `src/application/site_definitions.rs` が唯一の入り口（`SiteDefinitions` + `SiteDefinitionStore` port）。
+  bundle（配布物の `webnovel/*.yaml`）が種とフォールバック、ユーザー定義が同名で上書きする。
+  名前はファイル名そのもの（`ncode.syosetu.com.yaml`）。
+- 置き場は保存方式で選ぶ: native YAML モード = `webnovel/` フォルダ、native SQLite モード = オブジェクト
+  ストア（切り替え時に一度だけ取り込み、以後ファイルを読まない）、Worker = D1。
+- API は native / Worker 共通: `GET /api/sites`、`GET /api/sites/{name}`（本文つき）、
+  `PUT /api/sites/{name}`、`DELETE /api/sites/{name}`。`put` は保存前にコンパイル検証する。
+- 起動時に `native::site_definitions::install_effective_site_settings()` を呼び、同期コードは
+  `downloader::site_setting::effective_site_settings()` を使う（未設定ならファイルから読む）。
+- オブジェクトストアの一覧上限は `platform::prefix_upper_bound` を使う（`{prefix}0` は CJK や英字名を
+  落とすので使わない）。
+
 ### 挿絵の D1→S3 移行 (2026-09)
 
 - `POST /api/admin/object-migration` (`copy` / `verify` / `status`) で挿絵だけを S3 へ写す。

@@ -218,6 +218,27 @@ pub enum SiteSettingEntry {
     Eval { eval: String },
 }
 
+/// プロセス内で有効なサイト定義。
+///
+/// native は起動時に一度だけ確定させる (`install_effective_site_settings`)。SQLite
+/// モードではオブジェクトストアから読むので YAML ファイルに依存しない。未設定の
+/// ときは従来どおりファイルから読む ([`SiteSetting::load_all`]) ので、テストや
+/// 単発のツールでも動く。
+static EFFECTIVE_SITE_SETTINGS: std::sync::OnceLock<Vec<SiteSetting>> = std::sync::OnceLock::new();
+
+/// 有効なサイト定義を確定させる（起動時に 1 回。2 回目以降は無視する）。
+pub fn install_effective_site_settings(settings: Vec<SiteSetting>) -> bool {
+    EFFECTIVE_SITE_SETTINGS.set(settings).is_ok()
+}
+
+/// 有効なサイト定義。未設定ならファイルから読む（失敗時は空）。
+pub fn effective_site_settings() -> Vec<SiteSetting> {
+    EFFECTIVE_SITE_SETTINGS
+        .get()
+        .cloned()
+        .unwrap_or_else(|| SiteSetting::load_all().unwrap_or_default())
+}
+
 impl SiteSetting {
     pub fn load_all() -> Result<Vec<Self>> {
         let mut load_dirs = Vec::new();
@@ -257,6 +278,30 @@ impl SiteSetting {
             setting.compile();
         }
         Ok(settings)
+    }
+
+    /// Bundle と、ストア等から読んだユーザー定義を**名前でマージ**して読み込む。
+    ///
+    /// 名前は `webnovel/<name>.yaml` の `<name>`。同じ名前はユーザー側が勝つ
+    /// (native の初期化フォルダではユーザーの `webnovel/` がそのまま使われる
+    /// ため、その関係を保存先が別でも再現する)。YAML が壊れていれば
+    /// [`Self::load_bundled`] と同じく失敗させる。
+    pub fn load_bundled_with_user(
+        bundled: &[(&str, &str)],
+        user: &[(String, String)],
+    ) -> Result<Vec<Self>> {
+        let mut merged: Vec<(String, String)> = bundled
+            .iter()
+            .map(|(name, content)| ((*name).to_string(), (*content).to_string()))
+            .collect();
+        for (name, content) in user {
+            match merged.iter_mut().find(|(existing, _)| existing == name) {
+                Some(entry) => entry.1 = content.clone(),
+                None => merged.push((name.clone(), content.clone())),
+            }
+        }
+        let contents: Vec<&str> = merged.iter().map(|(_, content)| content.as_str()).collect();
+        Self::load_bundled(&contents)
     }
 
     pub(super) fn compile(&mut self) {
@@ -655,6 +700,7 @@ login_partial_pattern: ^login_partial::1$
         .unwrap();
         plain.compile();
         assert!(!plain.is_partial_login_view("login_partial::1"));
+
     }
 
     #[test]
@@ -817,5 +863,44 @@ toc_url: https://example.com/works/\\k<ncode>
                 .is_match(r#"<a href="https://novel18.syosetu.com/n0001aa/">title</a>"#)
         );
         assert!(novel18_pattern.is_match(r#"<a href="/n3412lp/">title</a>"#));
+    }
+
+    /// Bundle とユーザー定義のマージ: 同名はユーザーが勝ち、新規名は追加される。
+    #[test]
+    fn bundled_and_user_definitions_merge_by_name() {
+        let bundled = [
+            ("example.com", "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Bundled\ntoc_url: https://example.com/\\k<url>\n"),
+            ("other.com", "name: Other\ndomain: other.com\ntop_url: https://other.com\nsitename: Other\ntoc_url: https://other.com/\\k<url>\n"),
+        ];
+        let user = vec![
+            (
+                "example.com".to_string(),
+                "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: User\ntoc_url: https://example.com/\\k<url>\n"
+                    .to_string(),
+            ),
+            (
+                "new.com".to_string(),
+                "name: New\ndomain: new.com\ntop_url: https://new.com\nsitename: New\ntoc_url: https://new.com/\\k<url>\n"
+                    .to_string(),
+            ),
+        ];
+
+        let settings = SiteSetting::load_bundled_with_user(&bundled, &user).unwrap();
+        assert_eq!(settings.len(), 3);
+        let example = settings
+            .iter()
+            .find(|setting| setting.domain == "example.com")
+            .expect("bundled site stays");
+        assert_eq!(example.sitename, "User", "the user definition must win");
+        assert!(settings.iter().any(|setting| setting.domain == "other.com"));
+        assert!(settings.iter().any(|setting| setting.domain == "new.com"));
+    }
+
+    /// 壊れたユーザー定義は黙って落とさず失敗させる (Worker は readiness で気付ける)。
+    #[test]
+    fn broken_user_definitions_fail_loudly() {
+        let bundled = [("example.com", "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Example\ntoc_url: https://example.com/\\k<url>\n")];
+        let user = vec![("broken.com".to_string(), "name: Broken\n".to_string())];
+        assert!(SiteSetting::load_bundled_with_user(&bundled, &user).is_err());
     }
 }

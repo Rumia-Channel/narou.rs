@@ -13,6 +13,7 @@ pub mod http;
 pub mod login_key;
 pub mod legacy_persistence;
 pub mod novel_repository;
+pub mod site_definitions;
 pub mod sqlite;
 pub mod application;
 pub mod object_store;

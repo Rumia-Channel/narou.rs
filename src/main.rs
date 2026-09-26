@@ -283,6 +283,12 @@ async fn run_command(
     let ua = user_agent.clone().or(cli.user_agent);
     logger::use_convert_log_postfix(matches!(&cli.command, Commands::Convert { .. }));
 
+    // サイト定義は保存方式に応じて読み込む（SQLite モードではオブジェクトストア）。
+    if let Err(error) = narou_rs::native::site_definitions::install_effective_site_settings().await
+    {
+        eprintln!("[WARN] サイト定義の読み込みに失敗しました: {error}");
+    }
+
     match cli.command {
         Commands::Web {
             port,

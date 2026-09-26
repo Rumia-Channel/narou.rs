@@ -159,6 +159,97 @@ await check("a Convert plan for a missing novel is not reported as blocked", asy
   assert(body.blocked.length === 1, `Send must be blocked: ${JSON.stringify(body)}`);
 });
 
+const SITE_YAML = [
+  "name: Contract Test",
+  "domain: contract-test.example",
+  "top_url: https://contract-test.example",
+  "sitename: Contract Test",
+  "toc_url: https://contract-test.example/\\k<url>",
+  "",
+].join("\n");
+
+await check("GET /api/sites lists bundled definitions", async () => {
+  const response = await request("/api/sites", auth());
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  const sites = body.data?.sites ?? [];
+  assert(sites.length > 0, "bundled sites must be listed");
+  assert(
+    sites.some((site) => site.origin === "bundled"),
+    `expected a bundled entry: ${JSON.stringify(sites.slice(0, 3))}`,
+  );
+});
+
+await check("GET /api/sites is closed without a token", async () => {
+  const response = await request("/api/sites");
+  assert(response.status === 401, `status ${response.status}`);
+});
+
+await check("PUT /api/sites/{name} rejects an invalid definition", async () => {
+  const response = await request("/api/sites/contract-test", {
+    method: "PUT",
+    ...auth(),
+    body: "name: Broken\n",
+  });
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(body.success === false, `unexpected body: ${JSON.stringify(body)}`);
+});
+
+await check("GET /api/sites/{name} returns the effective definition", async () => {
+  const response = await request("/api/sites/contract-test", auth());
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(body.success === false, `unknown name must fail: ${JSON.stringify(body)}`);
+});
+
+await check("PUT /api/sites/{name} stores a user definition", async () => {
+  const response = await request("/api/sites/contract-test", {
+    method: "PUT",
+    ...auth(),
+    body: SITE_YAML,
+  });
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(body.success === true, `unexpected body: ${JSON.stringify(body)}`);
+  const entry = (body.data?.sites ?? []).find(
+    (site) => site.name === "contract-test.yaml",
+  );
+  assert(entry, `stored definition must be listed: ${JSON.stringify(body.data)}`);
+  assert(entry.origin === "user", `origin must be user: ${JSON.stringify(entry)}`);
+
+  // 実効定義として本文が返り、bundle の定義も読める。
+  const stored = await request("/api/sites/contract-test.yaml", auth());
+  const storedBody = await json(stored);
+  assert(storedBody.success === true, `unexpected body: ${JSON.stringify(storedBody)}`);
+  assert(storedBody.data.origin === "user", "the override must win");
+  assert(storedBody.data.yaml.includes("contract-test.example"), "the body must round-trip");
+
+  const bundled = await request("/api/sites/ncode.syosetu.com.yaml", auth());
+  const bundledBody = await json(bundled);
+  assert(bundledBody.success === true, `bundled lookup failed: ${JSON.stringify(bundledBody)}`);
+  assert(bundledBody.data.origin === "bundled", "an untouched site stays bundled");
+
+  // ユーザー定義を足しても構成は壊れない (readiness は 200 のまま)。
+  const ready = await request("/health/ready");
+  assert(ready.status === 200, `readiness regressed: ${ready.status}`);
+});
+
+await check("DELETE /api/sites/{name} reverts to the bundled set", async () => {
+  const response = await request("/api/sites/contract-test", {
+    method: "DELETE",
+    ...auth(),
+  });
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(
+    !(body.data?.sites ?? []).some((site) => site.name === "contract-test.yaml"),
+    `the override must be gone: ${JSON.stringify(body.data)}`,
+  );
+  const gone = await request("/api/sites/contract-test.yaml", auth());
+  assert((await json(gone)).success === false, "the override must not resolve");
+});
+
 await check("POST /api/login/set stores a credential without echoing it", async () => {
   const response = await request("/api/login/set", {
     method: "POST",

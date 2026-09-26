@@ -302,7 +302,7 @@ fn resolve_targets(
     if let Some(targets) = ids {
         let mut resolved = Vec::new();
         let mut unresolved_count = 0usize;
-        let site_settings = SiteSetting::load_all().unwrap_or_default();
+        let site_settings = narou_rs::downloader::site_setting::effective_site_settings();
         for target in expand_tag_targets(targets) {
             if let Some(id) = resolve_target_to_id(&target, &site_settings) {
                 if !resolved.contains(&id) {
@@ -1150,7 +1150,7 @@ async fn update_general_lastup(gl_opt: Option<&str>, user_agent: Option<&str>) {
 
     println!("最新話掲載日を確認しています...");
 
-    let site_settings = SiteSetting::load_all().unwrap_or_default();
+    let site_settings = narou_rs::downloader::site_setting::effective_site_settings();
 
     let (narou_novels, other_novels) = partition_novels_by_api_support(&site_settings);
     let progress = general_lastup_progress();

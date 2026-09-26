@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod sites;
 pub mod feature_tour;
 pub mod frontend;
 pub mod global_settings;
@@ -584,6 +585,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/tag_list", get(misc::tag_list))
         .route("/api/tag/change_color", post(misc::tag_change_color))
         .route("/api/novels/all_ids", get(misc::all_novel_ids))
+        .route("/api/sites", get(sites::sites_list))
+        .route(
+            "/api/sites/{name}",
+            get(sites::site_show)
+                .put(sites::site_put)
+                .delete(sites::site_delete),
+        )
         .route("/api/login", get(login::login_status))
         .route("/api/login", delete(login::login_clear_all))
         .route("/api/login/import", post(login::login_import))

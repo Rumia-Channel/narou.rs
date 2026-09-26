@@ -649,7 +649,7 @@ impl Downloader {
         assets: Arc<dyn AssetStore>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
-        let site_settings = SiteSetting::load_all()?;
+        let site_settings = crate::downloader::site_setting::effective_site_settings();
         let settings = crate::downloader::settings::default_settings();
         let section_hash_cache = settings.load_section_hash_cache();
         Self::with_platform_and_storage_and_settings(

@@ -37,6 +37,7 @@ pub use cookie_store::{
 };
 pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
 pub use object_store::{
+    prefix_upper_bound,
     AssetChunk, AssetStore, AssetStream, GeneratedAssetKey, NovelObjectKeys, ObjectEncoding,
     ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectStore,
     compress_object_payload, content_type_for_key, decompress_object_payload, object_crc32,

@@ -15,14 +15,13 @@ use narou_rs::downloader::settings::{DownloaderSettings, SnapshotDownloaderSetti
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::Result;
 use narou_rs::platform::{
-    AssetStore, Clock, CookieStore, HttpClient, NovelRepository, ObjectStore, RateLimiter,
-    SplitStore, SystemClock,
+    AssetStore, Clock, HttpClient, NovelRepository, ObjectStore, RateLimiter, SplitStore,
+    SystemClock,
 };
 use narou_rs::setting_core::SettingScope;
 use serde::Deserialize;
 use worker::{D1Database, Env, Queue};
 
-use crate::bundled_sites::load_bundled_site_settings;
 use crate::d1_repository::{D1FreezeStore, D1NovelRepository, D1SettingsStore, D1TagColorStore};
 use crate::http::WorkerHttpClient;
 use crate::ledger::{D1JobLedger, D1SchedulerCheckpoint};
@@ -172,7 +171,8 @@ impl WorkerRuntime {
             WorkerRateLimiter::new(env, subrequests.clone())
                 .map_err(|error| worker::Error::RustError(error.to_string()))?,
         );
-        let site_settings = load_bundled_site_settings()
+        let site_settings = crate::bundled_sites::load_site_settings(&objects)
+            .await
             .map_err(|error| worker::Error::RustError(error.to_string()))?;
         let ledger = Arc::new(D1JobLedger::new(db.clone(), clock.clone()));
         let checkpoint = D1SchedulerCheckpoint::new(db.clone());

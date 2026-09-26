@@ -390,7 +390,7 @@ pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
 }
 
 fn resolve_toc_url_from_url(target: &str) -> Option<String> {
-    let settings = narou_rs::downloader::site_setting::SiteSetting::load_all().ok()?;
+    let settings = narou_rs::downloader::site_setting::effective_site_settings();
     for setting in &settings {
         if setting.matches_url(target) {
             return Some(

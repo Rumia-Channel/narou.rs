@@ -175,6 +175,15 @@ pub struct ObjectListPage {
     pub next_cursor: Option<String>,
 }
 
+/// String-prefix range bound for a `WHERE key >= ? AND key < ?` scan.
+///
+/// Appending the highest code point makes the bound cover every key that starts
+/// with the prefix — including keys whose next character sorts above `'0'`
+/// (a naive `{prefix}0` bound hides every CJK or letter-leading name).
+pub fn prefix_upper_bound(prefix: &str) -> String {
+    format!("{prefix}\u{10FFFF}")
+}
+
 /// Blob store for bounded control objects.
 ///
 /// `read_small`/`write_small` deliberately make the buffering contract
@@ -539,6 +548,14 @@ fn validate_logical_key(key: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefix_upper_bound_covers_every_child() {
+        let bound = super::prefix_upper_bound("webnovel/");
+        assert!("webnovel/contract-test.yaml" < bound.as_str());
+        assert!("webnovel/挿絵/0001.jpg" < bound.as_str());
+        assert!(super::prefix_upper_bound("").as_str() > "novels/site/title/本文/1 x.yaml");
+    }
+
     use super::*;
 
     #[test]

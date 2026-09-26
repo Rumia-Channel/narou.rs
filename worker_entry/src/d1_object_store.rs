@@ -207,7 +207,9 @@ impl D1ObjectStore {
                 )?);
             }
         }
-        self.db.batch(statements).await.map_err(worker_error)?;
+        // D1 のバッチは 1 文ずつ成否を確認しないと失敗を握りつぶす。
+        let results = self.db.batch(statements).await.map_err(worker_error)?;
+        crate::d1_repository::ensure_batch_success(&results)?;
         Ok(())
     }
 
@@ -222,7 +224,9 @@ impl D1ObjectStore {
                 vec![JsValue::from_str(key.as_ref())],
             )?,
         ];
-        self.db.batch(statements).await.map_err(worker_error)?;
+        // D1 のバッチは 1 文ずつ成否を確認しないと失敗を握りつぶす。
+        let results = self.db.batch(statements).await.map_err(worker_error)?;
+        crate::d1_repository::ensure_batch_success(&results)?;
         Ok(())
     }
 
@@ -230,7 +234,7 @@ impl D1ObjectStore {
     /// sorted ascending. D1 returns whole result sets, so pagination is
     /// applied in memory after the filtered sort.
     async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, ObjectMetadata)>> {
-        let upper = format!("{prefix}0");
+        let upper = narou_rs::platform::prefix_upper_bound(prefix);
         let statement = self.prepare(
             "SELECT object_key, size, updated_at, content_type FROM objects \
              WHERE object_key >= ? AND object_key < ? ORDER BY object_key",

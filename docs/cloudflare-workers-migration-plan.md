@@ -247,6 +247,29 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 - 残り: `POST /api/login/import`（書き出しファイルの取り込み。argon2 依存のため
   `login::transfer` は native のみ）と `add` / `order`。
 
+### 2.2.7 サイト定義の差し替え経路 (P1, 2026-09-26 実装)
+
+- モデルは全プラットフォーム共通: **bundle が種（seed）+ フォールバック**、**ユーザー定義が同名で上書き**。
+  名前は `webnovel/` のファイル名そのもの（`ncode.syosetu.com.yaml`）で、拡張子を省いて渡しても補完する。
+- 置き場は保存方式に従う:
+  - native / YAML モード … ライブラリの `webnovel/` フォルダ（narou.rb と同じ場所）
+  - native / SQLite モード … オブジェクトストア（`objects` テーブル）の `webnovel/<name>.yaml`。
+    切り替え時に既存の `webnovel/` から一度だけ取り込む（元ファイルは残す）。以後ファイルを読まないので
+    SQLite 構成は YAML に依存しない。
+  - Worker … 同じオブジェクトストア（D1）
+- 実体は `src/application/site_definitions.rs` の `SiteDefinitions`（+ `SiteDefinitionStore` port）。
+  `put` は保存前に必ずコンパイル検証するので、壊れた定義で readiness を落とせない。
+- 起動時に実効定義を 1 回だけ確定させ (`install_effective_site_settings`)、以後の同期コード
+  （CLI のターゲット解決など）は `effective_site_settings()` を読む。
+- API は native の Axum と Worker の両方に同じ形で用意した:
+  `GET /api/sites` / `GET /api/sites/{name}`（実効定義の本文つき） / `PUT /api/sites/{name}` /
+  `DELETE /api/sites/{name}`。応答は `{success, data|message}`。
+- 残り: `AppServices.site_definitions`（`EmptySiteDefinitionProvider`）は旧 API で、いまは誰も中身を
+  使っていない。`AppServices` の差し替え時に撤去する。
+- **副産物のバグ修正**: `D1ObjectStore::list_keys` の範囲上限が `{prefix}0` で、`0` より後ろの文字で
+  始まるキー（`本文/…` や英字名）が一覧から漏れていた。`platform::prefix_upper_bound` に置き換え、
+  CJK・空プレフィックスを含むテストを追加した（挿絵の一覧も同じ理由で壊れていた）。
+
 ### 2.3 その他の差分
 
 - サイト YAML はビルド時埋め込みのみでユーザー差し替え不可（`SiteDefinitionProvider` は空実装）。

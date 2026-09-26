@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use narou_rs::compat::yaml_value_to_string;
-use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::downloader::{Downloader, TargetType};
 use narou_rs::db::inventory::{Inventory, InventoryScope};
 use narou_rs::queue::{JobType, PersistentQueue};
@@ -54,7 +53,7 @@ fn resolve_target_to_id(target: &str) -> Option<i64> {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     match Downloader::get_target_type(&target) {
         TargetType::Url => {
-            let site_settings = SiteSetting::load_all().ok()?;
+            let site_settings = narou_rs::downloader::site_setting::effective_site_settings();
             let setting = site_settings.iter().find(|s| s.matches_url(&target))?;
             let toc_url = setting
                 .toc_url_with_url_captures(&target)

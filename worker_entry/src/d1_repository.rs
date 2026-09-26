@@ -565,7 +565,7 @@ fn rows_from_result(result: D1Result) -> Result<Vec<NovelRecord>> {
     rows.into_iter().map(NovelRow::into_record).collect()
 }
 
-fn ensure_batch_success(results: &[D1Result]) -> Result<()> {
+pub(crate) fn ensure_batch_success(results: &[D1Result]) -> Result<()> {
     for result in results {
         if !result.success() {
             return Err(NarouError::Platform(
