@@ -21,6 +21,10 @@ use narou_rs::application::JobQueue;
 use narou_rs::downloader::SectionBudget;
 
 /// Hard platform limit: 1,000 subrequests per invocation.
+///
+/// 実行時に強制はしない（超えたらプラットフォーム側が失敗させる）が、
+/// ジョブの予算がこの上限を踏まないことをテストで固定するために置く。
+#[cfg(test)]
 pub const SUBREQUEST_HARD_LIMIT: u64 = 1_000;
 
 /// Soft yield point for one job. Leaves headroom for the ledger writes,

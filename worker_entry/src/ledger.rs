@@ -78,7 +78,7 @@ impl D1JobLedger {
     async fn select_row(&self, job_id: &str) -> Result<Option<JobRow>> {
         let statement = self.prepare(
             "SELECT job_id, kind, target, options, status, attempts, last_error, created_at, updated_at,
-                    lease_until, execution_token, checkpoint_json
+                    lease_until, checkpoint_json
              FROM worker_jobs WHERE job_id = ? LIMIT 1",
             vec![BindValue::Text(job_id.to_string())],
         )?;
@@ -90,7 +90,7 @@ impl D1JobLedger {
     async fn select_active_by_dedupe(&self, dedupe_key: &str) -> Result<Option<JobRow>> {
         let statement = self.prepare(
             "SELECT job_id, kind, target, options, status, attempts, last_error, created_at, updated_at,
-                    lease_until, execution_token, checkpoint_json
+                    lease_until, checkpoint_json
              FROM worker_jobs WHERE dedupe_key = ? AND status IN ('pending', 'running', 'retryable') LIMIT 1",
             vec![BindValue::Text(dedupe_key.to_string())],
         )?;
@@ -639,35 +639,6 @@ impl D1SchedulerCheckpoint {
         ))
     }
 
-    /// Persist the checkpoint (upsert on the `(scope, key)` primary key).
-    pub async fn save(&self, checkpoint: &SchedulerCheckpoint) -> Result<()> {
-        let value_json = serde_json::to_string(checkpoint).map_err(|error| {
-            NarouError::Platform(format!("scheduler checkpoint JSON serialization: {error}"))
-        })?;
-        let value_yaml = serde_yaml::to_string(checkpoint).map_err(|error| {
-            NarouError::Platform(format!("scheduler checkpoint YAML serialization: {error}"))
-        })?;
-        let statement = self.prepare(
-            "INSERT INTO app_state (scope, key, value_yaml, value_json) VALUES (?, ?, ?, ?)
-             ON CONFLICT (scope, key) DO UPDATE SET
-               value_yaml = excluded.value_yaml, value_json = excluded.value_json",
-            vec![
-                BindValue::Text(Self::SCOPE.to_string()),
-                BindValue::Text(Self::KEY.to_string()),
-                BindValue::Text(value_yaml),
-                BindValue::Text(value_json),
-            ],
-        )?;
-        let result = statement.run().await.map_err(worker_error)?;
-        if !result.success() {
-            return Err(NarouError::Platform(
-                result
-                    .error()
-                    .unwrap_or_else(|| "D1 checkpoint save failed".to_string()),
-            ));
-        }
-        Ok(())
-    }
 
 
     /// Persist a claimed checkpoint only while the planner still owns its
@@ -823,20 +794,6 @@ impl D1SchedulerCheckpoint {
         Ok(())
     }
 
-    /// Compatibility wrapper for callers that still provide a generation.
-    pub async fn claim(
-        &self,
-        generation: u64,
-        started_at: &str,
-    ) -> Result<CheckpointClaim> {
-        let current = self.load().await?;
-        if current.state == narou_rs::application::CheckpointState::Running {
-            self.claim_running_probe(started_at).await
-        } else {
-            self.claim_new_generation(current.generation, generation, started_at)
-                .await
-        }
-    }
 }
 
 // Row types and helpers
@@ -854,7 +811,6 @@ struct JobRow {
     created_at: String,
     updated_at: String,
     lease_until: Option<String>,
-    execution_token: Option<String>,
     checkpoint_json: Option<String>,
 }
 
