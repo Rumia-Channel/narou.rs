@@ -1,10 +1,9 @@
 //! Native SQLite storage engine (P1 of the SQLite migration plan).
 //!
-//! See `docs/sqlite-storage-migration-plan.md`. This module introduces a
-//! rusqlite-backed [`NovelRepository`] alongside the legacy YAML path; P2
-//! switches the default. The SQL and record mapping are ported verbatim from
-//! the Worker D1 adapter (`worker_entry/src/d1_repository.rs`) so both
-//! backends share semantics; the shared-SQL extraction is tracked in the plan.
+//! SQL semantics mirror the Worker D1 adapter exactly (same WHERE building,
+//! sort expressions, status materialization, sequence allocation). The novel
+//! record codec — column lists, bind values, upsert/select SQL — lives in
+//! `crate::db::novel_codec`, shared with the Worker so they cannot drift.
 //!
 //! Connection policy: WAL journal, `busy_timeout = 5s`, `foreign_keys = ON`.
 //! Every trait call runs on a blocking thread (`tokio::task::spawn_blocking`)

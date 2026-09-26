@@ -11,7 +11,8 @@ use rusqlite::Connection;
 use crate::db::NovelRecord;
 use crate::error::Result;
 
-use super::repository::{record_from_row, upsert_record_conn};
+use super::record_map::record_from_row;
+use super::repository::upsert_record_conn;
 use super::sqlite_error;
 
 /// Load every novel as `(id, record)`, ordered by id.

@@ -1,16 +1,16 @@
 //! Query construction, ported verbatim from `worker_entry/src/d1_repository.rs`
-//! (`select_sql` / `build_where` / `term_expression` / sort helpers /
-//! `UPSERT_SQL`). The status expressions and the UPSERT live in sibling SQL
-//! fragment files so the long literals stay byte-identical to the D1 source.
+//! (`build_where` / `term_expression` / sort helpers). The UPSERT and novel
+//! SELECT statements live in `crate::db::novel_codec`, shared with the Worker;
+//! the status expressions stay in sibling SQL fragment files.
 
 use crate::platform::{NovelFilter, NovelSortKey, SearchField};
 
-pub(crate) const UPSERT_SQL: &str = include_str!("sql/upsert.sql");
+pub(crate) use crate::db::novel_codec::{NOVEL_SELECT_SQL, NOVEL_UPSERT_SQL as UPSERT_SQL};
 pub(crate) const STATUS_SEARCH_EXPRESSION: &str = include_str!("sql/status_search_expression.sql");
 pub(crate) const STATUS_SORT_EXPRESSION: &str = include_str!("sql/status_sort_expression.sql");
 
 pub(crate) fn select_sql() -> &'static str {
-    "SELECT n.id, n.author, n.author_fold, n.title, n.file_title, n.toc_url, n.sitename, n.novel_type, n.end, n.last_update, n.new_arrivals_date, n.use_subdirectory, n.general_firstup, n.novelupdated_at, n.general_lastup, n.last_mail_date, n.tags_json, n.ncode, n.domain, n.general_all_no, n.length, n.suspend, n.is_narou, n.last_check_date, n.convert_failure, n.extra_fields_yaml, n.requires_login, n.login_session FROM novels n"
+    NOVEL_SELECT_SQL
 }
 
 pub(crate) struct WhereBuilder {
@@ -48,7 +48,7 @@ pub(crate) fn build_where(filter: &NovelFilter) -> WhereBuilder {
         }
     }
     if let Some(keyword) = &filter.keyword {
-        let keyword = crate::native::sqlite::record_map::fold(keyword);
+        let keyword = crate::db::novel_codec::fold(keyword);
         builder.sql.push_str(
             " AND EXISTS (SELECT 1 FROM json_each(?) WHERE instr(n.title_fold, value) > 0 OR instr(n.author_fold, value) > 0)",
         );
@@ -56,11 +56,11 @@ pub(crate) fn build_where(filter: &NovelFilter) -> WhereBuilder {
     }
     if let Some(site) = &filter.site {
         builder.sql.push_str(" AND n.sitename_fold = ?");
-        push_param(&mut builder, crate::native::sqlite::record_map::fold(site));
+        push_param(&mut builder, crate::db::novel_codec::fold(site));
     }
     if let Some(domain) = &filter.domain {
         builder.sql.push_str(" AND n.domain_fold = ?");
-        push_param(&mut builder, crate::native::sqlite::record_map::fold(domain));
+        push_param(&mut builder, crate::db::novel_codec::fold(domain));
     }
     if let Some(tag) = &filter.tag {
         builder.sql.push_str(" AND EXISTS (SELECT 1 FROM novel_tags t WHERE t.novel_id = n.id AND t.tag = ?)");
@@ -68,7 +68,7 @@ pub(crate) fn build_where(filter: &NovelFilter) -> WhereBuilder {
     }
     if let Some(ncode) = &filter.ncode {
         builder.sql.push_str(" AND n.ncode_fold = ?");
-        push_param(&mut builder, crate::native::sqlite::record_map::fold(ncode));
+        push_param(&mut builder, crate::db::novel_codec::fold(ncode));
     }
     if let Some(is_narou) = filter.is_narou {
         builder.sql.push_str(" AND n.is_narou = ?");
@@ -102,7 +102,7 @@ pub(crate) fn build_where(filter: &NovelFilter) -> WhereBuilder {
         let values = term
             .values
             .iter()
-            .map(|value| crate::native::sqlite::record_map::fold(value))
+            .map(|value| crate::db::novel_codec::fold(value))
             .collect::<Vec<_>>();
         builder.sql.push_str(if term.negated {
             " AND NOT EXISTS (SELECT 1 FROM json_each(?) WHERE "

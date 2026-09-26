@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use chrono::{DateTime, SecondsFormat, Utc};
 use narou_rs::application::tag_colors::{TagColorStore, TagColors};
 use narou_rs::application::events::FreezeStore;
 use narou_rs::application::novel_actions::FreezeMutationStore;
 use narou_rs::application::settings::SettingsStore;
+use narou_rs::db::novel_codec::{self, fold, NovelBind, NOVEL_SELECT_SQL, NOVEL_UPSERT_SQL};
 use narou_rs::db::NovelRecord;
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
@@ -19,6 +19,8 @@ use serde_yaml::Value as YamlValue;
 use wasm_bindgen::JsValue;
 use worker::{D1Database, D1PreparedStatement, D1Result};
 
+/// D1 tolerates much larger statement payloads than the native store's
+/// `novel_codec::MAX_EXTRA_FIELDS_BYTES`; keep the historical D1 cap.
 const MAX_EXTRA_FIELDS_BYTES: usize = 1_900_000;
 
 #[derive(Debug, Clone)]
@@ -482,39 +484,48 @@ struct NovelRow {
 }
 
 impl NovelRow {
+    /// Column values as the codec's named binds. Serde only types the cells;
+    /// the column→field mapping itself is shared (`record_from_columns`).
+    fn into_binds(self) -> Vec<(&'static str, NovelBind)> {
+        fn nullable_text(value: Option<String>) -> NovelBind {
+            value.map(NovelBind::Text).unwrap_or(NovelBind::Null)
+        }
+        fn nullable_int(value: Option<i64>) -> NovelBind {
+            value.map(NovelBind::Int).unwrap_or(NovelBind::Null)
+        }
+        vec![
+            ("id", NovelBind::Int(self.id)),
+            ("author", NovelBind::Text(self.author)),
+            ("title", NovelBind::Text(self.title)),
+            ("file_title", NovelBind::Text(self.file_title)),
+            ("toc_url", NovelBind::Text(self.toc_url)),
+            ("sitename", NovelBind::Text(self.sitename)),
+            ("novel_type", NovelBind::Int(self.novel_type)),
+            ("end", NovelBind::Int(self.end)),
+            ("last_update", NovelBind::Text(self.last_update)),
+            ("new_arrivals_date", nullable_text(self.new_arrivals_date)),
+            ("use_subdirectory", NovelBind::Int(self.use_subdirectory)),
+            ("general_firstup", nullable_text(self.general_firstup)),
+            ("novelupdated_at", nullable_text(self.novelupdated_at)),
+            ("general_lastup", nullable_text(self.general_lastup)),
+            ("last_mail_date", nullable_text(self.last_mail_date)),
+            ("tags_json", NovelBind::Text(self.tags_json)),
+            ("ncode", nullable_text(self.ncode)),
+            ("domain", nullable_text(self.domain)),
+            ("general_all_no", nullable_int(self.general_all_no)),
+            ("length", nullable_int(self.length)),
+            ("suspend", NovelBind::Int(self.suspend)),
+            ("is_narou", NovelBind::Int(self.is_narou)),
+            ("last_check_date", nullable_text(self.last_check_date)),
+            ("convert_failure", NovelBind::Int(self.convert_failure)),
+            ("extra_fields_yaml", NovelBind::Text(self.extra_fields_yaml)),
+            ("requires_login", NovelBind::Int(self.requires_login)),
+            ("login_session", nullable_text(self.login_session)),
+        ]
+    }
+
     fn into_record(self) -> Result<NovelRecord> {
-        let tags = serde_json::from_str(&self.tags_json)
-            .map_err(|error| NarouError::Platform(format!("invalid D1 tags JSON: {error}")))?;
-        let extra_fields = parse_extra_fields(&self.extra_fields_yaml)?;
-        Ok(NovelRecord {
-            id: self.id,
-            author: self.author,
-            title: self.title,
-            file_title: self.file_title,
-            toc_url: self.toc_url,
-            sitename: self.sitename,
-            novel_type: u8::try_from(self.novel_type).unwrap_or_default(),
-            end: self.end != 0,
-            last_update: parse_time(self.last_update)?,
-            new_arrivals_date: parse_optional_time(self.new_arrivals_date)?,
-            use_subdirectory: self.use_subdirectory != 0,
-            general_firstup: parse_optional_time(self.general_firstup)?,
-            novelupdated_at: parse_optional_time(self.novelupdated_at)?,
-            general_lastup: parse_optional_time(self.general_lastup)?,
-            last_mail_date: parse_optional_time(self.last_mail_date)?,
-            tags,
-            ncode: self.ncode,
-            domain: self.domain,
-            general_all_no: self.general_all_no,
-            length: self.length,
-            suspend: self.suspend != 0,
-            is_narou: self.is_narou != 0,
-            last_check_date: parse_optional_time(self.last_check_date)?,
-            convert_failure: self.convert_failure != 0,
-            requires_login: self.requires_login != 0,
-            login_session: self.login_session,
-            extra_fields,
-        })
+        novel_codec::record_from_columns(self.into_binds(), parse_extra_fields)
     }
 }
 
@@ -536,13 +547,9 @@ struct StateRow {
     value_yaml: String,
     value_json: String,
 }
-
-#[derive(Debug, Clone)]
-enum BindValue {
-    Text(String),
-    Int(i64),
-    Null,
-}
+/// D1 bind values come from the shared codec; `BindValue` stays as the local
+/// alias so `build_where` and call sites read naturally.
+type BindValue = NovelBind;
 
 fn bind_statement(statement: D1PreparedStatement, values: Vec<BindValue>) -> Result<D1PreparedStatement> {
     let values: Vec<JsValue> = values
@@ -576,31 +583,9 @@ pub(crate) fn ensure_batch_success(results: &[D1Result]) -> Result<()> {
     Ok(())
 }
 
-fn fold(value: &str) -> String {
-    value.trim().to_lowercase()
-}
-
-fn format_time(value: Option<DateTime<Utc>>) -> Option<String> {
-    value.map(|value| value.to_rfc3339_opts(SecondsFormat::Nanos, true))
-}
-
 #[derive(Debug, Deserialize)]
 struct StateValueRow {
     value_json: String,
-}
-fn parse_time(value: String) -> Result<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(&value)
-        .map(|value| value.with_timezone(&Utc))
-        .map_err(|error| NarouError::Platform(format!("invalid D1 timestamp: {error}")))
-}
-
-fn parse_optional_time(value: Option<String>) -> Result<Option<DateTime<Utc>>> {
-    match value {
-        // UPSERT は任意日時を素のパラメータで書くため、欠けた日時は
-        // SQL NULL ではなく空文字で保存される (native と同じ規約)。
-        Some(text) if text.is_empty() => Ok(None),
-        other => other.map(parse_time).transpose(),
-    }
 }
 
 fn parse_extra_fields(value: &str) -> Result<BTreeMap<String, YamlValue>> {
@@ -621,15 +606,7 @@ fn parse_extra_fields(value: &str) -> Result<BTreeMap<String, YamlValue>> {
                 .map_err(|error| NarouError::Platform(format!("invalid D1 extra fields: {error}")))?
         }
     };
-    let YamlValue::Mapping(mapping) = yaml else {
-        return Err(NarouError::Platform(
-            "D1 extra fields must be a mapping".to_string(),
-        ));
-    };
-    Ok(mapping
-        .into_iter()
-        .filter_map(|(key, value)| key.as_str().map(|key| (key.to_string(), value)))
-        .collect())
+    novel_codec::extra_fields_mapping(yaml)
 }
 
 /// Parse one `app_state` setting value: YAML text first, with the legacy
@@ -651,71 +628,20 @@ fn parse_setting_value(value_yaml: &str, legacy_value_json: &str) -> Result<Yaml
 }
 
 fn record_binds(record: &NovelRecord) -> Result<Vec<BindValue>> {
-    let tags_json = serde_json::to_string(&record.tags)
-        .map_err(|error| NarouError::Platform(format!("cannot serialize D1 tags: {error}")))?;
-    let tags_fold = record.tags.iter().map(|tag| fold(tag)).collect::<Vec<_>>().join("\n");
-    let tags_sort = record.tags.iter().map(|tag| fold(tag)).collect::<Vec<_>>().join("\u{1f}");
-    let extra_fields_yaml = serde_yaml::to_string(&record.extra_fields)
-        .map_err(|error| NarouError::Platform(format!("cannot serialize D1 extra fields: {error}")))?;
-    if extra_fields_yaml.len() > MAX_EXTRA_FIELDS_BYTES {
-        return Err(NarouError::Platform("D1 extra fields payload exceeds limit".to_string()));
-    }
-    Ok(vec![
-        BindValue::Int(record.id),
-        BindValue::Text(record.author.clone()),
-        BindValue::Text(fold(&record.author)),
-        BindValue::Text(record.title.clone()),
-        BindValue::Text(fold(&record.title)),
-        BindValue::Text(record.file_title.clone()),
-        BindValue::Text(record.toc_url.clone()),
-        BindValue::Text(fold(&record.toc_url)),
-        BindValue::Text(record.sitename.clone()),
-        BindValue::Text(fold(&record.sitename)),
-        BindValue::Int(i64::from(record.novel_type)),
-        BindValue::Int(record.end as i64),
-        BindValue::Text(format_time(Some(record.last_update)).unwrap_or_default()),
-        optional_text(format_time(record.new_arrivals_date)),
-        BindValue::Int(record.use_subdirectory as i64),
-        optional_text(format_time(record.general_firstup)),
-        optional_text(format_time(record.novelupdated_at)),
-        optional_text(format_time(record.general_lastup)),
-        optional_text(format_time(record.last_mail_date)),
-        BindValue::Text(tags_json),
-        BindValue::Text(tags_fold),
-        BindValue::Text(tags_sort),
-        optional_text(record.ncode.clone()),
-        optional_text(record.ncode.as_deref().map(fold)),
-        optional_text(record.domain.clone()),
-        optional_text(record.domain.as_deref().map(fold)),
-        optional_int(record.general_all_no),
-        optional_int(record.length),
-        BindValue::Int(record.suspend as i64),
-        BindValue::Int(record.is_narou as i64),
-        optional_text(format_time(record.last_check_date)),
-        BindValue::Int(record.convert_failure as i64),
-        // 以降の 4 つは UPSERT_SQL の列順 (extra_fields_yaml, extra_fields_bytes,
-        // requires_login, login_session) と一致していなければならない。
-        BindValue::Text(extra_fields_yaml.clone()),
-        BindValue::Int(extra_fields_yaml.len() as i64),
-        BindValue::Int(record.requires_login as i64),
-        match record.login_session.as_deref() {
-            Some(value) => BindValue::Text(value.to_string()),
-            None => BindValue::Null,
-        },
-    ])
+    let binds = novel_codec::novel_binds(record)?;
+    novel_codec::check_extra_fields_limit(&binds, MAX_EXTRA_FIELDS_BYTES)?;
+    // Positional order comes from the SQL itself, never from list order here —
+    // a name that does not match the UPSERT columns fails instead of skewing.
+    Ok(novel_codec::ordered_binds(UPSERT_SQL, &binds)?
+        .into_iter()
+        .map(|(_, value)| value.clone())
+        .collect())
 }
 
-fn optional_text(value: Option<String>) -> BindValue {
-    value.map(BindValue::Text).unwrap_or_else(|| BindValue::Text(String::new()))
-}
-fn optional_int(value: Option<i64>) -> BindValue {
-    BindValue::Int(value.unwrap_or(-1))
-}
-
-const UPSERT_SQL: &str = "INSERT INTO novels (id, author, author_fold, title, title_fold, file_title, toc_url, toc_url_fold, sitename, sitename_fold, novel_type, end, last_update, new_arrivals_date, use_subdirectory, general_firstup, novelupdated_at, general_lastup, last_mail_date, tags_json, tags_fold, tags_sort, ncode, ncode_fold, domain, domain_fold, general_all_no, length, suspend, is_narou, last_check_date, convert_failure, extra_fields_yaml, extra_fields_bytes, requires_login, login_session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, -1), NULLIF(?, -1), ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET author=excluded.author, author_fold=excluded.author_fold, title=excluded.title, title_fold=excluded.title_fold, file_title=excluded.file_title, toc_url=excluded.toc_url, toc_url_fold=excluded.toc_url_fold, sitename=excluded.sitename, sitename_fold=excluded.sitename_fold, novel_type=excluded.novel_type, end=excluded.end, last_update=excluded.last_update, new_arrivals_date=excluded.new_arrivals_date, use_subdirectory=excluded.use_subdirectory, general_firstup=excluded.general_firstup, novelupdated_at=excluded.novelupdated_at, general_lastup=excluded.general_lastup, last_mail_date=excluded.last_mail_date, tags_json=excluded.tags_json, tags_fold=excluded.tags_fold, tags_sort=excluded.tags_sort, ncode=excluded.ncode, ncode_fold=excluded.ncode_fold, domain=excluded.domain, domain_fold=excluded.domain_fold, general_all_no=excluded.general_all_no, length=excluded.length, suspend=excluded.suspend, is_narou=excluded.is_narou, last_check_date=excluded.last_check_date, convert_failure=excluded.convert_failure, extra_fields_yaml=excluded.extra_fields_yaml, extra_fields_bytes=excluded.extra_fields_bytes, requires_login=excluded.requires_login, login_session=excluded.login_session";
+const UPSERT_SQL: &str = NOVEL_UPSERT_SQL;
 
 fn select_sql() -> &'static str {
-    "SELECT n.id, n.author, n.author_fold, n.title, n.file_title, n.toc_url, n.sitename, n.novel_type, n.end, n.last_update, n.new_arrivals_date, n.use_subdirectory, n.general_firstup, n.novelupdated_at, n.general_lastup, n.last_mail_date, n.tags_json, n.ncode, n.domain, n.general_all_no, n.length, n.suspend, n.is_narou, n.last_check_date, n.convert_failure, n.extra_fields_yaml, n.requires_login, n.login_session FROM novels n"
+    NOVEL_SELECT_SQL
 }
 
 struct WhereBuilder {
@@ -850,6 +776,7 @@ fn sort_expression(key: NovelSortKey) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
     use narou_rs::platform::{SearchTerm, SearchField};
 
     fn ids_filter(ids: Option<Vec<i64>>) -> NovelFilter {
@@ -896,6 +823,8 @@ mod tests {
             is_narou: true,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
+            login_session: None,
             extra_fields,
         }
     }
@@ -1185,8 +1114,8 @@ mod tests {
             ("answer".to_string(), YamlValue::Number(serde_yaml::Number::from(42_i64))),
         ]));
         let binds = record_binds(&record).unwrap();
-        assert_eq!(binds.len(), 35);
-        assert_eq!(UPSERT_SQL.matches('?').count(), 35);
+        assert_eq!(binds.len(), 36);
+        assert_eq!(UPSERT_SQL.matches('?').count(), 36);
         let BindValue::Text(yaml) = &binds[32] else {
             panic!("extra fields bind must be text");
         };

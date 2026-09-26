@@ -10,13 +10,12 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{params_from_iter, Connection, Row};
 
 use crate::db::NovelRecord;
+use crate::db::novel_codec::fold;
 use crate::error::{NarouError, Result};
 use crate::native::sqlite::query::{
     build_where, select_sql, sort_direction, sort_expression, STATUS_SORT_EXPRESSION, UPSERT_SQL,
 };
-use crate::native::sqlite::record_map::{
-    fold, parse_extra_fields, parse_optional_time, parse_time, record_params,
-};
+use crate::native::sqlite::record_map::{record_from_row, record_params};
 use crate::platform::{NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository};
 
 /// Shared guarded connection. Every operation runs on a blocking thread; the
@@ -45,62 +44,9 @@ where
     .expect("sqlite blocking task panicked")
 }
 
-
-/// `extra_fields_yaml` keeps its own index: it sits before the columns added
-/// later (`requires_login`), so the last column no longer addresses it.
-const EXTRA_FIELDS_COLUMN: usize = 25;
-
-pub(crate) fn record_from_row(row: &Row<'_>) -> Result<NovelRecord> {
-    let tags_json: String = row.get(16).map_err(|error| NarouError::Platform(error.to_string()))?;
-    let extra_yaml: String = row
-        .get(EXTRA_FIELDS_COLUMN)
-        .map_err(|error| NarouError::Platform(error.to_string()))?;
-    let tags: Vec<String> = serde_json::from_str(&tags_json)
-        .map_err(|error| NarouError::Platform(format!("invalid tags JSON: {error}")))?;
-    let extra_fields = parse_extra_fields(&extra_yaml)?;
-    Ok(NovelRecord {
-        id: column(row, 0)?,
-        author: column(row, 1)?,
-        // index 2 is the derived author_fold; not part of NovelRecord
-        title: column(row, 3)?,
-        file_title: column(row, 4)?,
-        toc_url: column(row, 5)?,
-        sitename: column(row, 6)?,
-        novel_type: {
-            let raw: i64 = column(row, 7)?;
-            u8::try_from(raw).unwrap_or_default()
-        },
-        end: int_flag(row, 8)?,
-        last_update: parse_time(column(row, 9)?)?,
-        new_arrivals_date: parse_optional_time(column(row, 10)?)?,
-        use_subdirectory: int_flag(row, 11)?,
-        general_firstup: parse_optional_time(column(row, 12)?)?,
-        novelupdated_at: parse_optional_time(column(row, 13)?)?,
-        general_lastup: parse_optional_time(column(row, 14)?)?,
-        last_mail_date: parse_optional_time(column(row, 15)?)?,
-        tags,
-        ncode: column(row, 17)?,
-        domain: column(row, 18)?,
-        general_all_no: column(row, 19)?,
-        length: column(row, 20)?,
-        suspend: int_flag(row, 21)?,
-        is_narou: int_flag(row, 22)?,
-        last_check_date: parse_optional_time(column(row, 23)?)?,
-        convert_failure: int_flag(row, 24)?,
-        requires_login: int_flag(row, 26)?,
-        login_session: column(row, 27)?,
-        extra_fields,
-    })
-}
-
 fn column<T: rusqlite::types::FromSql>(row: &Row<'_>, index: usize) -> Result<T> {
     row.get(index)
         .map_err(|error| NarouError::Platform(format!("sqlite column {index}: {error}")))
-}
-
-fn int_flag(row: &Row<'_>, index: usize) -> Result<bool> {
-    let raw: i64 = column(row, index)?;
-    Ok(raw != 0)
 }
 
 impl SqliteNovelRepository {
@@ -149,7 +95,7 @@ pub(crate) fn upsert_record_conn(conn: &Connection, record: &NovelRecord) -> Res
     normalized.tags.retain(|tag| seen.insert(tag.clone()));
     let record = &normalized;
     let params = record_params(record)?;
-    conn.execute(UPSERT_SQL, params_from_iter(params.values.iter()))
+    conn.execute(UPSERT_SQL, params_from_iter(params.iter()))
         .map_err(super::sqlite_error)?;
     conn.execute(
         "DELETE FROM novel_tags WHERE novel_id = ?",
