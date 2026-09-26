@@ -497,11 +497,16 @@ pub fn parse_datetime_with_timezone(value: &str, timezone: Option<&str>) -> Opti
     parse_loose_datetime_with_timezone(value, site_timezone(timezone))
 }
 
+/// ブラウザ風の既定 User-Agent。`ua_generator` を持たないビルド (Worker) 用。
+///
+/// 空の User-Agent で送ると多くのサイトが 403 を返すため、どちらのビルドでも
+/// 必ず何かしらの UA を送る (native は `ua_generator` のランダム値)。
+pub const DEFAULT_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0";
+
 /// Resolve the CLI/saved user-agent, randomizing the value for `auto`/
-/// `random`. Native-only: requires the `ua_generator` randomizer; Worker
-/// builds inject their own user agent through the platform `HttpClient`.
-#[cfg(feature = "native-runtime")]
-pub(crate) fn resolve_user_agent(
+/// `random`. `ua_generator` は native ビルドでのみ使う。
+pub fn resolve_user_agent(
     user_agent: Option<&str>,
     saved_user_agent: Option<String>,
 ) -> String {
@@ -511,13 +516,23 @@ pub(crate) fn resolve_user_agent(
             || trimmed.eq_ignore_ascii_case("auto")
             || trimmed.eq_ignore_ascii_case("random")
     };
+    let randomized = || -> String {
+        #[cfg(feature = "native-runtime")]
+        {
+            ua_generator::ua::spoof_firefox_ua().to_string()
+        }
+        #[cfg(not(feature = "native-runtime"))]
+        {
+            DEFAULT_USER_AGENT.to_string()
+        }
+    };
     match user_agent {
-        Some(ua) if is_auto(ua) => ua_generator::ua::spoof_firefox_ua().to_string(),
+        Some(ua) if is_auto(ua) => randomized(),
         Some(ua) if !ua.trim().is_empty() => ua.to_string(),
         _ => match saved_user_agent {
-            Some(ua) if is_auto(&ua) => ua_generator::ua::spoof_firefox_ua().to_string(),
+            Some(ua) if is_auto(&ua) => randomized(),
             Some(ua) if !ua.trim().is_empty() => ua,
-            _ => ua_generator::ua::spoof_firefox_ua().to_string(),
+            _ => randomized(),
         },
     }
 }

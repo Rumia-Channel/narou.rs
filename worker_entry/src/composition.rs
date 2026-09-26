@@ -170,8 +170,23 @@ impl WorkerRuntime {
                 db.clone(),
                 crate::d1_cookie_store::D1CookieStore::key_from_env(env).await,
             ));
+        // User-Agent は保存済み設定から解決する (native の `with_user_agent` と同じ規則)。
+        // 送らないと多くのサイトが 403 を返すため、必ず何かしら送る。
+        let saved_user_agent = D1SettingsStore::new(db.clone())
+            .load(SettingScope::Local)
+            .await
+            .ok()
+            .and_then(|values| {
+                values
+                    .get("user-agent")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            });
+        let user_agent = narou_rs::downloader::resolve_user_agent(None, saved_user_agent);
         let http: Arc<dyn HttpClient> = Arc::new(
-            WorkerHttpClient::new(subrequests.clone()).with_cookie_store(cookie_store.clone()),
+            WorkerHttpClient::new(subrequests.clone())
+                .with_user_agent(user_agent)
+                .with_cookie_store(cookie_store.clone()),
         );
         let rate_limiter: Arc<dyn RateLimiter> = Arc::new(
             WorkerRateLimiter::new(env, subrequests.clone())

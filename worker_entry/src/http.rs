@@ -22,6 +22,9 @@ pub struct WorkerHttpClient {
     subrequests: SubrequestBudget,
     /// 保存済みログイン Cookie。`Set-Cookie` の書き戻しにだけ使う。
     cookie_store: Option<Arc<dyn CookieStore>>,
+    /// 送信する User-Agent。native の `NativeHttpClient` と同じ役割で、
+    /// リクエストが自前の UA を持たないときだけ付ける (サイト別の UA を尊重)。
+    user_agent: String,
 }
 
 impl std::fmt::Debug for WorkerHttpClient {
@@ -38,7 +41,14 @@ impl WorkerHttpClient {
         Self {
             subrequests,
             cookie_store: None,
+            user_agent: String::new(),
         }
+    }
+
+    /// 送信する User-Agent を設定する (`narou_rs::downloader::resolve_user_agent`)。
+    pub fn with_user_agent(mut self, user_agent: String) -> Self {
+        self.user_agent = user_agent;
+        self
     }
 
     /// 保存済み Cookie を `Set-Cookie` で更新できるようにする (native と同じ挙動)。
@@ -117,6 +127,17 @@ impl WorkerHttpClient {
         for (name, value) in &request.headers {
             headers
                 .append(name, value)
+                .map_err(|error| NarouError::Platform(format!("invalid HTTP header: {error}")))?;
+        }
+        // UA が無いリクエストは多くのサイトで 403 になるので、必ず 1 つ送る。
+        if !self.user_agent.is_empty()
+            && !request
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        {
+            headers
+                .append("user-agent", &self.user_agent)
                 .map_err(|error| NarouError::Platform(format!("invalid HTTP header: {error}")))?;
         }
         let mut init = RequestInit::new();
