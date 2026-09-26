@@ -44,15 +44,18 @@ pub use object_store::{
     verify_object_crc32,
 };
 pub use progress::ProgressReporter;
-pub use rate_limiter::{normalize_site_key, RateLimitScope, RateLimiter};
+pub use rate_limiter::{
+    DownloadPacing, RateLimitScope, RateLimiter, ScopedPacing, normalize_site_key,
+    normalize_wait_steps,
+};
 pub use s3_request::{object_size, parse_content_range_size};
+pub use repository::{
+    NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, NovelSort, NovelSortKey,
+    SearchField, SearchTerm, resolve_update_scan_sort,
+};
 pub use split_store::{SplitStore, is_illustration_key};
 pub use store_migration::{StoreMigrationState, migrate_page};
 pub use url_policy::{is_safe_public_ip, validate_url_syntax};
-pub use repository::{
-    NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, NovelSort, NovelSortKey,
-    SearchField, SearchTerm,
-};
 
 /// Target-aware future type used by every async platform trait.
 ///

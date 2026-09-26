@@ -229,6 +229,11 @@ pub async fn execute_job(
     // ジョブの sink を isolate から外す (残すと以後の emit_default が
     // 死んだバッファに書き込む)。
     narou_rs::application::messages::take_default_sink();
+    // ダウンロードが更新した section hash cache を D1 へ書き戻す
+    // (強更新の判定ヒント。失敗は再 DL だけに効くのでログだけ残す)。
+    if let Err(error) = runtime.persist_pending_section_hash_cache().await {
+        console_log!("job {job_id}: section hash cache write-back failed: {error}");
+    }
     match result {
         Err(NarouError::DownloadBudgetExpired {
             next_section_index,

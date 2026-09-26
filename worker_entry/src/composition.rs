@@ -69,6 +69,12 @@ pub struct WorkerRuntime {
     /// Shared subrequest counter for this invocation; the executor reads it
     /// at section boundaries via `WorkerBudget`.
     pub subrequests: crate::budget::SubrequestBudget,
+    /// ダウンロード中に更新された section hash cache の書き戻し窓口。
+    /// `SnapshotDownloaderSettings::save_section_hash_cache` (同期) がここへ
+    /// 置き、ジョブ終了時に [`Self::persist_pending_section_hash_cache`] が
+    /// D1 (`app_state('inv','section_hash_cache')`) へ flush する。
+    pub pending_section_hash_cache:
+        Arc<parking_lot::Mutex<Option<HashMap<String, HashMap<String, String>>>>>,
 }
 
 /// `WorkerRuntime::build_with` が行う重い読み込みのプロファイル。
@@ -83,10 +89,13 @@ enum CompositionProfile {
     Ui,
 }
 
-/// isolate ごとの `asset_backend` キャッシュ。設定の切替は TTL (30 秒) で
-/// 他 isolate に伝わる。
+/// isolate ごとの `asset_backend` キャッシュ。設定の切替は TTL で
+/// 他 isolate に伝わる。切替直後に「D1 に書き・S3 から読む」混在が起きる
+/// 可能性があるため、他キャッシュ (30 秒) より短い 5 秒にしておく
+/// (`/api/storage/mode` は 501 で Worker からは書き換わらないが、手動 SQL
+/// などで切り替えた直後のずれを最小化する)。
 static ASSET_BACKEND_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<Option<String>>> =
-    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(5_000.0));
 
 /// 挿絵の保存先を読む。未設定・読み取り失敗は `None` (= D1 扱い)。
 ///
@@ -188,6 +197,71 @@ fn setting_bool(value: &serde_yaml::Value) -> Option<bool> {
     }
 }
 
+/// `app_state` の値を f64 として解釈する。Number と数値文字列を受け付け、
+/// それ以外は未設定として `None` (native `load_interval_secs` と同じ規則)。
+fn setting_f64(value: &serde_yaml::Value) -> Option<f64> {
+    match value {
+        serde_yaml::Value::Number(number) => number.as_f64(),
+        serde_yaml::Value::String(value) => value.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// `app_state` の値を i64 として解釈する。Number と数値文字列を受け付け、
+/// それ以外は未設定として `None` (native `load_wait_steps` と同じ規則)。
+fn setting_i64(value: &serde_yaml::Value) -> Option<i64> {
+    match value {
+        serde_yaml::Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|v| i64::try_from(v).ok())),
+        serde_yaml::Value::String(value) => value.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// ダウンロードで更新された section hash cache を `app_state` へ書き戻す。
+///
+/// `SnapshotDownloaderSettings` は同期 trait なので直接 D1 を書けず、代わりに
+/// 最新のキャッシュを pending スロットへ置く。ここでは pending 値を、保存済みの
+/// 行 (読みは `load_section_hash_cache` と同じ fail-open 規則) に小説ごと
+/// マージしてから上書きする — 1 冊だけ更新したジョブが他冊のハッシュを消さない
+/// ようにするため。書き戻した値で isolate キャッシュも更新する。
+async fn persist_section_hash_cache(
+    db: &DbHandle,
+    pending: HashMap<String, HashMap<String, String>>,
+) -> Result<()> {
+    let mut merged = load_section_hash_cache(db).await;
+    for (novel_id, digests) in pending {
+        merged.insert(novel_id, digests);
+    }
+    let value_yaml = serde_yaml::to_string(&merged).map_err(|error| {
+        narou_rs::error::NarouError::Platform(format!(
+            "section hash cache YAML serialization: {error}"
+        ))
+    })?;
+    let value_json = serde_json::to_string(&merged).map_err(|error| {
+        narou_rs::error::NarouError::Platform(format!(
+            "section hash cache JSON serialization: {error}"
+        ))
+    })?;
+    db.prepare(
+        "INSERT INTO app_state (scope, key, value_yaml, value_json)
+         VALUES ('inv', 'section_hash_cache', ?, ?)
+         ON CONFLICT (scope, key) DO UPDATE SET
+           value_yaml = excluded.value_yaml, value_json = excluded.value_json",
+    )
+    .bind(&[
+        wasm_bindgen::JsValue::from_str(&value_yaml),
+        wasm_bindgen::JsValue::from_str(&value_json),
+    ])
+    .map_err(|error| narou_rs::error::NarouError::Platform(format!("{error}")))?
+    .run()
+    .await
+    .map_err(|error| narou_rs::error::NarouError::Platform(format!("{error}")))?;
+    SECTION_HASH_CACHE.put("section_hash_cache", merged);
+    Ok(())
+}
+
 impl WorkerRuntime {
     /// Build the runtime from the production bindings. Missing bindings fail
     /// composition (readiness 503), never an empty/partial service set.
@@ -231,27 +305,42 @@ impl WorkerRuntime {
                 db.clone(),
                 crate::d1_cookie_store::D1CookieStore::key_from_env(env).await,
             ));
-        // User-Agent は保存済み設定から解決する (native の `with_user_agent` と同じ規則)。
-        // 送らないと多くのサイトが 403 を返すため、必ず何かしら送る。
-        let saved_user_agent = D1SettingsStore::new(db.clone())
+        // local 設定は 1 回だけ読んで User-Agent とレート制限の両方に使う
+        // (D1SettingsStore 経由なので同一 isolate ではキャッシュ済み)。
+        let local_values = D1SettingsStore::new(db.clone())
             .load(SettingScope::Local)
             .await
-            .ok()
-            .and_then(|values| {
-                values
-                    .get("user-agent")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned)
-            });
+            .unwrap_or_default();
+        // User-Agent は保存済み設定から解決する (native の `with_user_agent` と同じ規則)。
+        // 送らないと多くのサイトが 403 を返すため、必ず何かしら送る。
+        let saved_user_agent = local_values
+            .get("user-agent")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
         let user_agent = narou_rs::downloader::resolve_user_agent(None, saved_user_agent);
         let http: Arc<dyn HttpClient> = Arc::new(
             WorkerHttpClient::new(subrequests.clone())
                 .with_user_agent(user_agent)
                 .with_cookie_store(cookie_store.clone()),
         );
+        // `download.interval` / `download.wait-steps` を設定から読む
+        // (native `load_interval_secs` / `load_wait_steps` と同じ規則:
+        // Number または数値文字列、それ以外は未設定扱い)。ジョブ単位の
+        // `build` で読み直すので設定変更は次の実行から効く。
+        let download_interval_secs = local_values
+            .get("download.interval")
+            .and_then(setting_f64);
+        let download_wait_steps = local_values
+            .get("download.wait-steps")
+            .and_then(setting_i64);
         let rate_limiter: Arc<dyn RateLimiter> = Arc::new(
-            WorkerRateLimiter::new(env, subrequests.clone())
-                .map_err(|error| worker::Error::RustError(error.to_string()))?,
+            WorkerRateLimiter::new(
+                env,
+                subrequests.clone(),
+                download_interval_secs,
+                download_wait_steps,
+            )
+            .map_err(|error| worker::Error::RustError(error.to_string()))?,
         );
         // サイト定義の読み込みはオブジェクトストアの LIST を伴う重い経路。
         // UI プロファイルは Downloader を組み立てないので省略する
@@ -289,6 +378,7 @@ impl WorkerRuntime {
             site_settings,
             db,
             cookie_store,
+            pending_section_hash_cache: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 
@@ -353,11 +443,26 @@ impl WorkerRuntime {
         let global_values = store.load(SettingScope::Global).await?;
         let over18 = global_values.get("over18").and_then(setting_bool);
         let section_hash_cache = load_section_hash_cache(&self.db).await;
-        Ok(Arc::new(SnapshotDownloaderSettings::new(
-            local,
-            over18,
-            section_hash_cache,
-        )))
+        Ok(Arc::new(
+            SnapshotDownloaderSettings::new(local, over18, section_hash_cache)
+                .with_pending_section_hash_save(self.pending_section_hash_cache.clone()),
+        ))
+    }
+
+    /// ダウンロードで更新された section hash cache があれば D1 へ書き戻す。
+    ///
+    /// `Downloader::flush_section_hash_cache` は `save_section_hash_cache`
+    /// (同期) 経由で `pending_section_hash_cache` に置くだけなので、ジョブ
+    /// 1 件ごとの区切りでここを呼んで `app_state('inv','section_hash_cache')`
+    /// を永続化する (`update.strong` のヒット率が native と揃う)。
+    /// 保存するのは「最新スナップショット」なので、未配線・未更新なら何もしない。
+    /// 書き戻しは判定ヒントの延長で、失敗しても呼び出し側でログだけ残す。
+    pub async fn persist_pending_section_hash_cache(&self) -> Result<()> {
+        let pending = self.pending_section_hash_cache.lock().take();
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        persist_section_hash_cache(&self.db, pending).await
     }
 
     /// 管理 API 用の具体ハンドル（診断用メソッドを持つ）。

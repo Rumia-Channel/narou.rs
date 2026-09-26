@@ -425,6 +425,14 @@ async fn webui_debug_mode(runtime: &WorkerRuntime) -> bool {
         .unwrap_or(false)
 }
 
+/// `queue.max-retries` の設定値をクランプする Cloudflare 側の上限。
+/// `wrangler.toml` の `[[queues.consumers]] max_retries = 3` はデプロイ時の
+/// 値で、Cloudflare は explicit な `retry_with_options` も同じ回数までしか
+/// 再配信しない。設定値をこれより大きくしても 3 回目で DLQ に落ちて台帳が
+/// `retryable` のまま残るため、ledger 側もここで同じ上限に丸める。上限を
+/// 上げたい場合は wrangler の `max_retries` を先に上げ、この定数も合わせること。
+const CF_CONSUMER_MAX_RETRIES: u32 = 3;
+
 /// `Retryable` を台帳へ記録し、まだ試行枠が残っているかを返す。
 /// メッセージの ack/retry は呼び出し側がイベント送信のあとに行う
 /// (イベントを先に流さないと UI が再試行の前にキューを見逃す)。
@@ -455,10 +463,22 @@ async fn settle_retryable(
         ])
         .await
         .unwrap_or_default();
-    let policy = RetryPolicy::resolve(
+    let mut policy = RetryPolicy::resolve(
         values.first().and_then(Option::as_ref),
         values.get(1).and_then(Option::as_ref),
     );
+    // `queue.max-retries` を CF の consumer `max_retries` (デプロイ値 3)
+    // を超えて設定しても、Cloudflare 側がそれ以上再配信しないため
+    // DLQ 行きになるだけ。ここで台帳側の上限へ丸めておく
+    // (`CF_CONSUMER_MAX_RETRIES` を参照)。
+    if policy.max_retries > CF_CONSUMER_MAX_RETRIES {
+        console_log!(
+            "queue.max-retries {} exceeds the deployed consumer max_retries {}; clamping",
+            policy.max_retries,
+            CF_CONSUMER_MAX_RETRIES
+        );
+        policy.max_retries = CF_CONSUMER_MAX_RETRIES;
+    }
     // 台帳の `attempts` は失敗ごとに後置インクリメントされる。今回の失敗
     // までに完了した再キュー数 (= native `retry_count`) は記録前の
     // `attempts` で、native `retry_count < max_retries` と同じ上限判定。

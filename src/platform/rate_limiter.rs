@@ -94,6 +94,72 @@ pub fn normalize_site_key(site: &str) -> Option<String> {
     Some(key)
 }
 
+/// `download.wait-steps` の正規化。なろう系スコープは 0・10 超を 10 に
+/// 丸める (API 制約)、それ以外のサイトは設定値をそのまま使う
+/// (未設定 = 0 = wait-steps 無し)。native (`src/downloader/rate_limit.rs`)
+/// と Worker (`worker_entry/src/rate_limiter.rs`) の共通規則。
+pub fn normalize_wait_steps(raw: i64, narou: bool) -> u32 {
+    let wait_steps = if raw > 0 { raw.min(u32::MAX as i64) as u32 } else { 0 };
+    if narou && (wait_steps == 0 || wait_steps > 10) { 10 } else { wait_steps }
+}
+
+/// `download.interval` / `download.wait-steps` の設定値を展開した
+/// ペーシング設定。`RateLimiter` 実装 (native / Worker) が共有する。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DownloadPacing {
+    /// リクエスト間の最小間隔 (`download.interval`、0 許容 = 間隔なし)。
+    pub interval: std::time::Duration,
+    /// `download.wait-steps` の生設定値。スコープの `narou` フラグで
+    /// `normalize_wait_steps` に掛けてから使う。
+    pub wait_steps: i64,
+    /// `wait_steps` ごとの休止の基準 (`STEPS_WAIT_TIME.max(interval)`)。
+    /// native と同じく設定値だけで決め、サイト下限は `for_scope` で畳む。
+    pub max_steps_wait_time: std::time::Duration,
+}
+
+/// `download.interval` が未設定のときの既定値 (native `DEFAULT_INTERVAL_SECS`)。
+pub const DEFAULT_DOWNLOAD_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(700);
+/// `wait_steps` ごとの休止の既定 (native `STEPS_WAIT_TIME`)。
+pub const STEPS_WAIT_TIME: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl DownloadPacing {
+    /// `interval_secs` は `download.interval` の秒 (`None` で 0.7s)、
+    /// `wait_steps` は `download.wait-steps` の生値 (`None` で 0)。
+    pub fn new(interval_secs: Option<f64>, wait_steps: Option<i64>) -> Self {
+        let interval = interval_secs
+            .map(|secs| std::time::Duration::from_secs_f64(secs.max(0.0)))
+            .unwrap_or(DEFAULT_DOWNLOAD_INTERVAL);
+        Self {
+            interval,
+            wait_steps: wait_steps.unwrap_or(0),
+            max_steps_wait_time: STEPS_WAIT_TIME.max(interval),
+        }
+    }
+
+    /// スコープへ適用するペーシング。サイト定義が `min_interval` を宣言して
+    /// いれば全体設定より優先し (native `reserve_wait_duration_for_scope`)、
+    /// `wait_steps` は `narou` フラグで正規化する。`max_steps_wait_time` は
+    /// `max(基準, min_interval)` — DO 側はこの単一値を「`wait_steps` ごとの
+    /// 休止」と「長い静寂後のバーストカウンタのリセット窓」の両方に使う。
+    pub fn for_scope(&self, scope: &RateLimitScope) -> ScopedPacing {
+        let min_interval = scope.min_interval.unwrap_or(std::time::Duration::ZERO);
+        ScopedPacing {
+            interval: self.interval.max(min_interval),
+            wait_steps: normalize_wait_steps(self.wait_steps, scope.narou),
+            max_steps_wait_time: self.max_steps_wait_time.max(min_interval),
+        }
+    }
+}
+
+/// `DownloadPacing` をスコープへ適用した結果 (DO / 各実装がそのまま使う形)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopedPacing {
+    pub interval: std::time::Duration,
+    pub wait_steps: u32,
+    pub max_steps_wait_time: std::time::Duration,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +198,67 @@ mod tests {
         // Empty keys are unusable.
         assert_eq!(normalize_site_key("   "), None);
         assert_eq!(normalize_site_key(""), None);
+    }
+
+    #[test]
+    fn wait_steps_normalization_mirrors_native() {
+        // なろう: 0・10 超は 10、それ以外は設定値。
+        assert_eq!(normalize_wait_steps(0, true), 10);
+        assert_eq!(normalize_wait_steps(11, true), 10);
+        assert_eq!(normalize_wait_steps(4, true), 4);
+        assert_eq!(normalize_wait_steps(-1, true), 10);
+        // 非なろう: 0/負は 0、正はそのまま。
+        assert_eq!(normalize_wait_steps(0, false), 0);
+        assert_eq!(normalize_wait_steps(20, false), 20);
+        assert_eq!(normalize_wait_steps(-3, false), 0);
+    }
+
+    #[test]
+    fn pacing_defaults_match_native_constants() {
+        let pacing = DownloadPacing::new(None, None);
+        assert_eq!(pacing.interval, std::time::Duration::from_millis(700));
+        assert_eq!(pacing.wait_steps, 0);
+        assert_eq!(pacing.max_steps_wait_time, std::time::Duration::from_secs(5));
+
+        // なろうスコープ: 既定の wait-steps 10 が効く。
+        let scoped = pacing.for_scope(&RateLimitScope::narou("ncode.syosetu.com"));
+        assert_eq!(scoped.wait_steps, 10);
+        assert_eq!(scoped.interval, std::time::Duration::from_millis(700));
+    }
+
+    #[test]
+    fn pacing_uses_configured_values() {
+        let pacing = DownloadPacing::new(Some(2.5), Some(4));
+        let scoped = pacing.for_scope(&RateLimitScope::narou("n"));
+        assert_eq!(scoped.interval, std::time::Duration::from_millis(2_500));
+        assert_eq!(scoped.wait_steps, 4);
+        // `interval = 0` は「間隔なし」。
+        assert_eq!(
+            DownloadPacing::new(Some(0.0), None)
+                .for_scope(&RateLimitScope::site("x"))
+                .interval,
+            std::time::Duration::ZERO
+        );
+        // 設定値が 5s を超えると wait-steps の休止もそれに引き上げられる。
+        assert_eq!(
+            DownloadPacing::new(Some(8.0), None).max_steps_wait_time,
+            std::time::Duration::from_secs(8)
+        );
+    }
+
+    #[test]
+    fn site_min_interval_overrides_global_interval() {
+        let pacing = DownloadPacing::new(Some(0.7), None);
+        let pixiv = RateLimitScope::site("www.pixiv.net").with_min_interval(Some(5.0));
+        let scoped = pacing.for_scope(&pixiv);
+        assert_eq!(scoped.interval, std::time::Duration::from_secs(5));
+        assert_eq!(scoped.max_steps_wait_time, std::time::Duration::from_secs(5));
+
+        // 下限が設定値を下回るなら設定値が効く。
+        let mild = RateLimitScope::site("www.pixiv.net").with_min_interval(Some(0.1));
+        assert_eq!(
+            pacing.for_scope(&mild).interval,
+            std::time::Duration::from_millis(700)
+        );
     }
 }

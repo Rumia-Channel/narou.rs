@@ -11,26 +11,27 @@
 //! cached per site and consumed by later `acquire` calls. This keeps the
 //! per-site pacing identical while cutting the DO subrequest count — and
 //! its billed request/duration — by the batch factor.
+//!
+//! The pacing parameters come from the `download.interval` /
+//! `download.wait-steps` settings (read once per `WorkerRuntime::build`)
+//! via the shared [`DownloadPacing`] rules; the site definition's
+//! `min_interval` floor is applied per scope exactly like the native
+//! limiter's `reserve_wait_duration_for_scope`.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
-    normalize_site_key, PlatformFuture, RateLimitScope, RateLimiter,
+    normalize_site_key, DownloadPacing, PlatformFuture, RateLimitScope, RateLimiter,
 };
 use wasm_bindgen::JsValue;
 use worker::{Env, Method, ObjectNamespace, Request, RequestInit};
 
 use crate::budget::SubrequestBudget;
 use crate::site_rate_limiter::{PermitRequest, PermitResponse};
-
-/// Pacing defaults mirroring the native limiter
-/// (`DEFAULT_INTERVAL_SECS = 0.7`, なろう wait-steps default 10,
-/// `STEPS_WAIT_TIME = 5s`).
-const DEFAULT_INTERVAL_MS: u64 = 700;
-const MAX_STEPS_WAIT_TIME_MS: u64 = 5_000;
 
 /// Permits claimed per Durable Object call. Small enough that an abandoned
 /// remainder only delays the site by a few seconds; large enough to keep DO
@@ -44,10 +45,21 @@ pub struct WorkerRateLimiter {
     subrequests: SubrequestBudget,
     /// Cached permit timestamps per normalized site key, in claim order.
     permits: Mutex<HashMap<String, VecDeque<u64>>>,
+    /// `download.interval` / `download.wait-steps` の展開済み設定。
+    pacing: DownloadPacing,
 }
 
 impl WorkerRateLimiter {
-    pub fn new(env: &Env, subrequests: SubrequestBudget) -> Result<Self> {
+    /// `interval_secs` / `wait_steps` は `download.interval` /
+    /// `download.wait-steps` の設定値 (`None` で既定値)。値はジョブ単位で
+    /// 読み直されるため、設定変更は次の実行から効く (D1SettingsStore の
+    /// TTL 30 秒を上限とする遅延を除く)。
+    pub fn new(
+        env: &Env,
+        subrequests: SubrequestBudget,
+        interval_secs: Option<f64>,
+        wait_steps: Option<i64>,
+    ) -> Result<Self> {
         let namespace = env
             .durable_object("RATE_LIMITER")
             .map_err(worker_error)?;
@@ -55,11 +67,12 @@ impl WorkerRateLimiter {
             namespace,
             subrequests,
             permits: Mutex::new(HashMap::new()),
+            pacing: DownloadPacing::new(interval_secs, wait_steps),
         })
     }
 
     fn pop_cached_permit(&self, site: &str) -> Option<u64> {
-        let mut permits = self.permits.lock().expect("permit cache poisoned");
+        let mut permits = self.permits.lock();
         let queue = permits.get_mut(site)?;
         let permit = queue.pop_front();
         if queue.is_empty() {
@@ -69,11 +82,23 @@ impl WorkerRateLimiter {
     }
 
     fn cache_permits(&self, site: &str, permit_ats: Vec<u64>) {
-        let mut permits = self.permits.lock().expect("permit cache poisoned");
+        let mut permits = self.permits.lock();
         permits
             .entry(site.to_string())
             .or_default()
             .extend(permit_ats);
+    }
+
+    /// スコープと設定値から DO へ送る `PermitRequest` を組み立てる。
+    fn permit_request(&self, scope: &RateLimitScope) -> PermitRequest {
+        let scoped = self.pacing.for_scope(scope);
+        PermitRequest {
+            interval_ms: u64::try_from(scoped.interval.as_millis()).unwrap_or(u64::MAX),
+            wait_steps: scoped.wait_steps,
+            max_steps_wait_time_ms: u64::try_from(scoped.max_steps_wait_time.as_millis())
+                .unwrap_or(u64::MAX),
+            count: PERMIT_BATCH_SIZE,
+        }
     }
 
     async fn claim_batch(&self, site: &str, scope: &RateLimitScope) -> Result<Vec<u64>> {
@@ -82,12 +107,7 @@ impl WorkerRateLimiter {
             .get_by_name(site)
             .map_err(worker_error)?;
 
-        let permit = PermitRequest {
-            interval_ms: DEFAULT_INTERVAL_MS,
-            wait_steps: if scope.narou { 10 } else { 0 },
-            max_steps_wait_time_ms: MAX_STEPS_WAIT_TIME_MS,
-            count: PERMIT_BATCH_SIZE,
-        };
+        let permit = self.permit_request(scope);
         let body = serde_json::to_string(&permit)
             .map_err(|error| NarouError::Platform(format!("permit request serialization: {error}")))?;
 

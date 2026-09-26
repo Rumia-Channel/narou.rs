@@ -93,14 +93,21 @@
   }
 
   function renderSettingItem(setting) {
-    let html = '<div class="list-group-item" data-setting="' + escapeAttr(setting.name) + '">';
-    html += '<h4 class="list-group-item-heading">' + escapeHtml(setting.name) + '</h4>';
+    const ineffective = setting.worker_ineffective === true;
+    let html = '<div class="list-group-item' + (ineffective ? ' setting-worker-ineffective' : '') +
+               '" data-setting="' + escapeAttr(setting.name) + '">';
+    html += '<h4 class="list-group-item-heading">' + escapeHtml(setting.name) +
+            (ineffective ? ' <small class="text-muted">(Worker では無効)</small>' : '') + '</h4>';
     html += '<div class="list-group-item-text">';
     html += renderControl(setting);
 
     // Help text
     if (setting.help) {
       html += '<p class="setting-help">' + renderHelpHtml(setting.help) + '</p>';
+    }
+    // Worker では経路が無い項目への注記 (API の worker_note)。
+    if (setting.worker_note) {
+      html += '<p class="setting-help">⚠ ' + escapeHtml(setting.worker_note) + '</p>';
     }
 
     html += '</div></div>';

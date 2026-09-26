@@ -12,7 +12,7 @@ use narou_rs::application::{
     events::FreezeStore, CheckpointClaim, JobKind, JobPlan, JobTarget, SchedulerCheckpoint,
 };
 use narou_rs::error::{NarouError, Result};
-use narou_rs::platform::{NovelFilter, NovelId};
+use narou_rs::platform::{NovelFilter, NovelId, NovelQuery, NovelSort, NovelSortKey};
 use serde_yaml::Value as YamlValue;
 use worker::{console_log, Env, ScheduledEvent};
 
@@ -109,16 +109,11 @@ async fn plan_page(
     checkpoint: &mut narou_rs::application::SchedulerCheckpoint,
 ) -> Result<bool> {
     let frozen_ids: HashSet<i64> = runtime.freeze.frozen_ids().await?;
-    let after_id = checkpoint.cursor.map(NovelId);
-    let ids = runtime
-        .novels
-        .scan_ids(&NovelFilter::default(), after_id, AUTO_UPDATE_PAGE_SIZE)
-        .await?;
+    let (ids, next_cursor) = scan_page(runtime, checkpoint).await?;
     if ids.is_empty() {
         return Ok(true);
     }
     let page_full = ids.len() == AUTO_UPDATE_PAGE_SIZE;
-    let next_cursor = ids.last().map(|id| id.0);
     let plans: Vec<JobPlan> = ids
         .into_iter()
         .filter(|id| !frozen_ids.contains(&id.0))
@@ -131,11 +126,91 @@ async fn plan_page(
     let dispatch = runtime.enqueue_batch(&plans).await.map(|_| ());
     apply_page_dispatch(checkpoint, next_cursor, dispatch)?;
     console_log!(
-        "auto-update: dispatched page up to id {:?} (full: {page_full}, jobs: {})",
+        "auto-update: dispatched page up to cursor {:?} (full: {page_full}, jobs: {})",
         next_cursor,
         plans.len()
     );
     Ok(!page_full)
+}
+
+/// 1 ページ分の対象 ID と次カーソルを返す。
+///
+/// `update.sort-by` が設定されていれば native `commands::update` と同じ順序
+/// (`sort_update_ids_by_key`: 日付系は新しい順) で `novels.query` を捲る。
+/// ソート順は id 順と一致しないためキーセットカーソルは張れず、checkpoint の
+/// `cursor` は「消費済み行数 (offset)」になる。`scan_sort_key` に使用中の
+/// キーを記録し、世代途中で設定が変わったときはカーソルをリセットして
+/// 先頭から読み直す (再 enqueue されても台帳側で更新済み扱いになるだけ)。
+/// 未設定・`id`・未知キー・読み取り失敗は既定の id キーセットスキャン。
+async fn scan_page(
+    runtime: &WorkerRuntime,
+    checkpoint: &mut SchedulerCheckpoint,
+) -> Result<(Vec<NovelId>, Option<i64>)> {
+    let sort = configured_scan_sort(runtime).await;
+    let sort_key = sort.map(|sort| sort.key.as_db_key());
+    if checkpoint.scan_sort_key.as_deref() != sort_key {
+        checkpoint.cursor = None;
+        checkpoint.scan_sort_key = sort_key.map(str::to_string);
+    }
+    match sort {
+        None => {
+            let after_id = checkpoint.cursor.map(NovelId);
+            let ids = runtime
+                .novels
+                .scan_ids(&NovelFilter::default(), after_id, AUTO_UPDATE_PAGE_SIZE)
+                .await?;
+            let next_cursor = ids.last().map(|id| id.0);
+            Ok((ids, next_cursor))
+        }
+        Some(sort) => {
+            let offset = usize::try_from(checkpoint.cursor.unwrap_or(0).max(0))
+                .unwrap_or(usize::MAX);
+            let records = runtime
+                .novels
+                .query(&NovelQuery::page(
+                    NovelFilter::default(),
+                    sort,
+                    offset,
+                    AUTO_UPDATE_PAGE_SIZE,
+                ))
+                .await?;
+            let ids: Vec<NovelId> = records
+                .iter()
+                .map(|record| NovelId(record.id))
+                .collect();
+            let next_cursor = i64::try_from(offset + ids.len()).ok();
+            Ok((ids, next_cursor))
+        }
+    }
+}
+
+/// `update.sort-by` の設定値を `NovelSort` へ解決する。
+async fn configured_scan_sort(runtime: &WorkerRuntime) -> Option<NovelSort> {
+    let raw = match runtime.services.settings.get("update.sort-by").await {
+        Ok(value) => value,
+        Err(error) => {
+            console_log!(
+                "auto-update: cannot read update.sort-by ({error}); scanning in id order"
+            );
+            return None;
+        }
+    };
+    resolve_scan_sort(&yaml_string(raw))
+}
+
+/// `update.sort-by` の文字列を `NovelSort` に変換する。空・未知キー・`id`
+/// (キーセットスキャンと同順) は `None` = 既定の id スキャン。キーの
+/// 解釈 (日付系は降順) は platform 側の共有規則に委ねる。
+fn resolve_scan_sort(configured: &str) -> Option<NovelSort> {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return None;
+    }
+    if NovelSortKey::from_db_key(&configured.to_lowercase()).is_none() {
+        console_log!("auto-update: unknown update.sort-by {configured:?}; scanning in id order");
+        return None;
+    }
+    narou_rs::platform::resolve_update_scan_sort(configured)
 }
 
 /// Commit a successful queue page and only then advance the durable cursor.
@@ -153,7 +228,6 @@ fn apply_page_dispatch(
     }
     Ok(())
 }
-
 
 fn yaml_timezone(value: Option<YamlValue>) -> Result<chrono_tz::Tz> {
     let text = match value {
@@ -216,4 +290,5 @@ mod tests {
         apply_page_dispatch(&mut checkpoint, Some(200), Ok(())).unwrap();
         assert_eq!(checkpoint.cursor, Some(200));
     }
+
 }

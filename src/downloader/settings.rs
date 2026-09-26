@@ -99,12 +99,21 @@ pub fn default_settings() -> Arc<dyn DownloaderSettings> {
 /// matching the native inventory behavior where an unset local setting has
 /// no default entry — and `over18` stays `None` when unset so the age
 /// confirmation path is preserved (the default `confirm` returns
+/// `save_section_hash_cache` の書き戻し先 (Worker が非同期で D1 へ書く)。
+pub type PendingSectionHashSave =
+    Arc<parking_lot::Mutex<Option<HashMap<String, HashMap<String, String>>>>>;
+
 /// `NarouError::Unsupported`, which the executor turns into `Blocked`).
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotDownloaderSettings {
     local: HashMap<String, bool>,
     over18: Option<bool>,
     section_hash_cache: HashMap<String, HashMap<String, String>>,
+    /// Worker の書き戻し先。`save_section_hash_cache` は同期 API なので
+    /// 呼び出し側が非同期で書き戻せるよう、最新のキャッシュをここへ置く。
+    /// `None` (= 未配線) のときは従来どおり no-op。
+    pending_section_hash_cache:
+        Option<PendingSectionHashSave>,
 }
 
 impl SnapshotDownloaderSettings {
@@ -117,7 +126,18 @@ impl SnapshotDownloaderSettings {
             local,
             over18,
             section_hash_cache,
+            pending_section_hash_cache: None,
         }
+    }
+
+    /// ジョブ終了時に呼び出し側が drain する書き戻しスロットを配線する
+    /// (Worker の `WorkerRuntime` が D1 への永続化を担う)。
+    pub fn with_pending_section_hash_save(
+        mut self,
+        pending: PendingSectionHashSave,
+    ) -> Self {
+        self.pending_section_hash_cache = Some(pending);
+        self
     }
 }
 
@@ -148,14 +168,20 @@ impl DownloaderSettings for SnapshotDownloaderSettings {
         self.section_hash_cache.clone()
     }
 
-    /// No-op (`Ok(())`): the trait is synchronous but D1 is asynchronous, so
-    /// the updated cache is not persisted from here. The cache is advisory
-    /// (strong-update comparison); a stale or lost cache only re-downloads
-    /// sections instead of corrupting state.
+    /// 配線されていれば pending スロットへ最新キャッシュを置き、呼び出し側
+    /// (WorkerRuntime) がジョブ終了時に D1 へ書き戻す。未配線のときは従来
+    /// どおり no-op (`Ok(())`)。trait が同期 API なのでここでは書き込み
+    /// せず、置くだけに留める。キャッシュは強更新の判定ヒントであり、
+    /// 書き戻しに失敗しても再 DL するだけで状態は壊れない。
     fn save_section_hash_cache(
         &self,
-        _cache: &HashMap<String, HashMap<String, String>>,
+        cache: &HashMap<String, HashMap<String, String>>,
     ) -> Result<()> {
+        let Some(pending) = &self.pending_section_hash_cache else {
+            return Ok(());
+        };
+        let mut slot = pending.lock();
+        *slot = Some(cache.clone());
         Ok(())
     }
 }
@@ -292,5 +318,24 @@ mod tests {
             settings.confirm("?", false, false),
             Err(crate::error::NarouError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn snapshot_section_hash_save_fills_pending_slot() {
+        let pending: PendingSectionHashSave =
+            Arc::new(parking_lot::Mutex::new(None));
+        let settings = SnapshotDownloaderSettings::default()
+            .with_pending_section_hash_save(pending.clone());
+        let updated = HashMap::from([(
+            "7".to_string(),
+            HashMap::from([("0/section.txt".to_string(), "digest".to_string())]),
+        )]);
+        settings.save_section_hash_cache(&updated).unwrap();
+        assert_eq!(*pending.lock(), Some(updated));
+
+        // 未配線のスナップショットは従来どおり書き込みを捨てる。
+        assert!(SnapshotDownloaderSettings::default()
+            .save_section_hash_cache(&HashMap::new())
+            .is_ok());
     }
 }

@@ -810,8 +810,16 @@ pub struct SchedulerCheckpoint {
     /// generations; a generation changes only when a due run starts.
     pub generation: u64,
     pub state: CheckpointState,
-    /// Last novel id already enqueued by the current generation.
+    /// Last novel id already enqueued by the current generation. When
+    /// `scan_sort_key` is set this is instead the *offset* into the sorted
+    /// scan (the Worker planner pages `novels.query` instead of `scan_ids`).
     pub cursor: Option<i64>,
+    /// Sort key (`update.sort-by` / `NovelSortKey::as_db_key`) the running
+    /// generation is paging by, or `None` for the default `id` keyset scan.
+    /// A configured sort is not id-keyset-paginable, so the cursor becomes
+    /// an offset and this key guards against mid-run setting changes.
+    #[serde(default)]
+    pub scan_sort_key: Option<String>,
     /// When the current logical generation was claimed.
     pub started_at: Option<String>,
     /// When the last completed generation finished (drives catch-up).
@@ -830,6 +838,7 @@ impl Default for SchedulerCheckpoint {
             generation: 0,
             state: CheckpointState::Done,
             cursor: None,
+            scan_sort_key: None,
             started_at: None,
             last_run: None,
             planner_lease_until: None,
@@ -881,6 +890,7 @@ impl SchedulerCheckpoint {
                 generation,
                 state: CheckpointState::Running,
                 cursor: None,
+                scan_sort_key: None,
                 started_at: Some(started_at.to_string()),
                 last_run: self.last_run.clone(),
                 planner_lease_until: None,
@@ -907,6 +917,7 @@ impl SchedulerCheckpoint {
                 generation: self.generation,
                 state: CheckpointState::Running,
                 cursor: self.cursor,
+                scan_sort_key: self.scan_sort_key.clone(),
                 started_at: self.started_at.clone().or_else(|| Some(now.to_string())),
                 last_run: self.last_run.clone(),
                 planner_lease_until: Some(planner_lease_until),
@@ -920,6 +931,7 @@ impl SchedulerCheckpoint {
             generation,
             state: CheckpointState::Running,
             cursor: None,
+            scan_sort_key: None,
             started_at: Some(now.to_string()),
             last_run: self.last_run.clone(),
             planner_lease_until: Some(planner_lease_until),
@@ -947,6 +959,7 @@ impl SchedulerCheckpoint {
             generation: self.generation,
             state: self.state,
             cursor: Some(cursor),
+            scan_sort_key: self.scan_sort_key.clone(),
             started_at: self.started_at.clone(),
             last_run: self.last_run.clone(),
             planner_lease_until: self.planner_lease_until.clone(),
@@ -961,6 +974,7 @@ impl SchedulerCheckpoint {
             generation: self.generation,
             state: CheckpointState::Done,
             cursor: None,
+            scan_sort_key: None,
             started_at: None,
             last_run: Some(finished_at.to_string()),
             planner_lease_until: None,
@@ -1603,6 +1617,32 @@ mod tests {
         assert!(final_page.done);
         assert_eq!(final_page.next_cursor, None);
         assert_eq!(seen, ids.iter().map(|id| id.0).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn scheduler_checkpoint_keeps_scan_sort_key_across_transitions() {
+        // 既存の JSON (フィールド無し) も読める (`#[serde(default)]`)。
+        let legacy: SchedulerCheckpoint = serde_json::from_str(
+            r#"{"generation":3,"state":"running","cursor":42,"started_at":null,"last_run":null}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.scan_sort_key, None);
+
+        // 実行中世代のリース引き継ぎとカーソル前進はソートキーを保持する。
+        let mut running = legacy.clone();
+        running.scan_sort_key = Some("title".to_string());
+        let CheckpointClaim::Claimed(claimed) = running.begin_with_lease(
+            running.generation,
+            "2026-09-27T00:00:00Z",
+            "token".to_string(),
+            "2026-09-27T00:02:00Z".to_string(),
+        ) else {
+            panic!("running generation should be reclaimable")
+        };
+        assert_eq!(claimed.scan_sort_key.as_deref(), Some("title"));
+        assert_eq!(claimed.advance(7).scan_sort_key.as_deref(), Some("title"));
+        // 完了・新規世代では消える。
+        assert_eq!(claimed.finish("2026-09-27T00:03:00Z").scan_sort_key, None);
     }
 
     #[test]

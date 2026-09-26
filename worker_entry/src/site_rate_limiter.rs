@@ -104,9 +104,8 @@ impl DurableObject for SiteRateLimiter {
             .json()
             .await
             .map_err(|error| Error::RustError(format!("invalid permit request: {error}")))?;
-        if permit.interval_ms == 0 {
-            return Response::error("interval_ms must be positive", 400);
-        }
+        // `interval_ms == 0` (`download.interval = 0`) は「間隔なし」として
+        // 許容する — native は interval 0 で各要求を即時許可するため。
         let count = permit.count.clamp(1, MAX_PERMIT_BATCH);
         let storage = self.state.storage();
         let now_ms = js_sys::Date::now() as u64;
