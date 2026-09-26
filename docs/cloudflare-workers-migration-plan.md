@@ -299,10 +299,17 @@ npx wrangler deploy --config wrangler.ci.toml --secrets-file <json>
   必要になったら履歴テーブルを足す（native の `diff` とは別物として扱う）。
 - **S3 のバケット構成**: 1 バケット + prefix（環境同居）を既定とする。本番だけ別バケットにするかは
   P0e の実測後に決める。
+- **EPUB 応答のメモリ**: 現在の `download.epub` は組み立てた EPUB を `Vec<u8>` に全部持ってから返し、
+  先読みした挿絵（最大 512 枚 / 64 MiB）も同時に保持する。APNG を軽くしたのと同じ理屈で、**次はここを
+  削る**（挿絵は 1 枚ずつ `EpubBuild::resolve` で引く、応答はストリームで返す）。それまでは先読み上限を
+  下げる（例: 32 MiB）ことで 128 MiB 予算を守る。
 - **D1 の `objects`/`object_chunks` の扱い**: 本文の移行後もしばらく残す。削除（容量回収）は P4 の判断。
 - **APNG 挿絵**: `zip` の feature を純 Rust 構成に絞ったため Worker でも組み立て可能（`worker-runtime` が
-  `illustration-animation` を有効化済み）。フレーム数 × サイズ分の CPU/メモリを使うため、フレーム数と
-  合計バイト数に上限を設けて `cpu_ms` 内に収める（Paid プラン前提で運用）。
+  `illustration-animation` を有効化済み）。組み立ては**フレームを 1 枚ずつ復号 → 符号化 → 追記して即解放**し、
+  全フレームを溜めない（`src/illustration_animation.rs` の `build_apng`）。実測（Pixiv 69642452, 19 フレーム
+  1920×1080, zip 4.3 MiB → APNG 20.3 MiB）で **ピーク 48.7 MiB**。旧実装（全フレーム保持）なら復号だけで
+  150 MiB を超え、Workers の 128 MiB に収まらない。上限はフレーム 512 / 1 フレーム 2048×2048 画素 /
+  出力 40 MiB で、超えたら OOM ではなく明示エラーにする。
 - **バージョン履歴 / diff**: D1 にテーブルが無いため、P3 で `diff` を出すなら先にスキーマを追加する。
 - **ユーザー YAML の差し替え**: P1 でストア経由の読み込みに戻すが、UI から編集させるかは別判断。
 - **未コミットの移行ツール** (`worker_entry/src/object_migration.rs` + `lib.rs` の配線): P0d の

@@ -49,83 +49,253 @@ pub fn assemble_animation(url: &str, bytes: &[u8]) -> Option<Result<Vec<u8>>> {
         return None;
     }
     let delays = frame_delays(url)?;
-    Some(build_apng(bytes, &delays))
+    Some(build_apng(bytes, &delays, DEFAULT_LIMITS))
 }
 
 fn is_zip(bytes: &[u8]) -> bool {
     bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06")
 }
 
+/// 組み立ての上限。
+///
+/// Workers は 1 isolate 128 MiB なので、「入力アーカイブ + 出力 APNG + 1 フレーム」
+/// だけを同時に保持する前提で決めている。フレームは復号 → 符号化 → 追記のたびに
+/// 解放し、全フレームを溜め込まない。
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    max_frames: usize,
+    max_frame_pixels: u64,
+    max_output_bytes: usize,
+}
+
+/// 既定の上限。
+///
+/// Workers の 128 MiB に対する予算:
+/// 入力アーカイブ (22 MiB) + 出力 APNG (40 MiB) + 1 フレーム RGBA (2048×2048 =
+/// 16.8 MiB) + 符号化中バッファ (数 MiB) ≈ 85 MiB。超過は OOM ではなく明示エラーで
+/// 止める (isolate を落とすより、その作品だけ諦めるほうが被害が小さい)。
+const DEFAULT_LIMITS: Limits = Limits {
+    max_frames: 512,
+    max_frame_pixels: 2048 * 2048,
+    max_output_bytes: 40 * 1024 * 1024,
+};
+
 /// Frame decoding and APNG assembly need the `zip` and `image` crates.
 /// `illustration-animation` を外したビルドでは、呼び出し側が取得したアーカイブを
 /// そのまま保存し、警告経路でこの未対応を報告する。
 #[cfg(not(feature = "illustration-animation"))]
-fn build_apng(_archive: &[u8], _delays: &[u16]) -> Result<Vec<u8>> {
+fn build_apng(_archive: &[u8], _delays: &[u16], _limits: Limits) -> Result<Vec<u8>> {
     Err(NarouError::Platform(
         "assembling an animated illustration needs the zip and image crates".into(),
     ))
 }
 
 #[cfg(feature = "illustration-animation")]
-fn build_apng(archive: &[u8], delays: &[u16]) -> Result<Vec<u8>> {
-    let frames = decode_frames(archive)?;
-    let first = frames
-        .first()
-        .ok_or_else(|| NarouError::Platform("animation archive has no frames".into()))?;
-    let (width, height) = (first.width(), first.height());
-
-    if frames.len() == 1 {
-        // Nothing to animate; a plain PNG is the honest output.
-        return encode_png(first);
+fn build_apng(archive: &[u8], delays: &[u16], limits: Limits) -> Result<Vec<u8>> {
+    let names = frame_names(archive)?;
+    if names.len() > limits.max_frames {
+        return Err(NarouError::Platform(format!(
+            "animation archive has {} frames, over the limit of {}",
+            names.len(),
+            limits.max_frames
+        )));
     }
 
-    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    let mut out: Vec<u8> = Vec::new();
+    let mut work: Vec<u8> = Vec::new();
+    // 単一フレームのアーカイブは通常の PNG を返すので、2 フレーム目が現れるまで
+    // 1 枚目の符号化結果を保持する (現れなければこれをそのまま返す)。
+    let mut first_png: Option<Vec<u8>> = None;
     let mut sequence = 0u32;
-    for (index, frame) in frames.iter().enumerate() {
-        if frame.width() != width || frame.height() != height {
+    let mut frames = 0usize;
+    let mut dimensions: Option<(u32, u32)> = None;
+    let mut actl_count_offset = 0usize;
+    let mut actl_crc_offset = 0usize;
+
+    for name in &names {
+        let Some(frame) = decode_frame(archive, name)? else {
+            continue;
+        };
+        let (width, height) = (frame.width(), frame.height());
+        if u64::from(width) * u64::from(height) > limits.max_frame_pixels {
             return Err(NarouError::Platform(format!(
-                "animation frame {} is {}x{}, expected {width}x{height}",
-                index,
-                frame.width(),
-                frame.height()
+                "animation frame {name} is {width}x{height}, over the pixel limit"
             )));
         }
-        let delay = u16::from(*delays.get(index).unwrap_or(&delays[delays.len() - 1]));
-        let png = encode_png(frame)?;
-        let (ihdr, idat) = split_png(&png)?;
-
-        if index == 0 {
-            chunks.push(png_chunk(b"IHDR", &ihdr));
-            // acTL: num_frames (u32) then num_plays (u32, 0 = loop forever).
-            let mut actl = Vec::with_capacity(8);
-            actl.extend_from_slice(&(frames.len() as u32).to_be_bytes());
-            actl.extend_from_slice(&0u32.to_be_bytes());
-            chunks.push(png_chunk(b"acTL", &actl));
-            chunks.push(frame_control(sequence, width, height, delay));
-            sequence += 1;
-            chunks.push(png_chunk(b"IDAT", &idat));
-            continue;
+        match dimensions {
+            Some(expected) if expected != (width, height) => {
+                return Err(NarouError::Platform(format!(
+                    "animation frame {name} is {width}x{height}, expected {}x{}",
+                    expected.0, expected.1
+                )));
+            }
+            None => dimensions = Some((width, height)),
+            _ => {}
         }
 
-        chunks.push(frame_control(sequence, width, height, delay));
+        encode_png_into(&frame, &mut work)?;
+        drop(frame); // RGBA バッファはここで解放する (同時に持つのは常に 1 フレーム)
+
+        if frames == 0 {
+            // 1 枚目は単一フレームの可能性があるので、2 枚目が来るまで書かない。
+            first_png = Some(std::mem::take(&mut work));
+            frames = 1;
+            continue;
+        }
+        if frames == 1 {
+            let first = first_png.take().expect("the first frame is buffered");
+            out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+            let (ihdr, idat) = png_payloads(&first)?;
+            write_png_chunk(&mut out, b"IHDR", &first[ihdr]);
+            // acTL の num_frames は最後まで確定しないので、後で書き戻す。
+            let actl_start = out.len();
+            write_png_chunk(&mut out, b"acTL", &[0, 0, 0, 0, 0, 0, 0, 0]);
+            actl_count_offset = actl_start + 8;
+            actl_crc_offset = actl_start + 16;
+            write_png_chunk(
+                &mut out,
+                b"fcTL",
+                &frame_control_payload(sequence, width, height, delay_at(delays, 0)),
+            );
+            sequence += 1;
+            for range in &idat {
+                write_png_chunk(&mut out, b"IDAT", &first[range.clone()]);
+            }
+        }
+
+        // 2 枚目以降は fcTL + fdAT を追記する。
+        write_png_chunk(
+            &mut out,
+            b"fcTL",
+            &frame_control_payload(sequence, width, height, delay_at(delays, frames)),
+        );
         sequence += 1;
-        let mut payload = sequence.to_be_bytes().to_vec();
-        payload.extend_from_slice(&idat);
-        chunks.push(png_chunk(b"fdAT", &payload));
-        sequence += 1;
+        for range in png_payloads(&work)?.1 {
+            let mut payload = sequence.to_be_bytes().to_vec();
+            payload.extend_from_slice(&work[range]);
+            write_png_chunk(&mut out, b"fdAT", &payload);
+            sequence += 1;
+        }
+
+        frames += 1;
+        if out.len() > limits.max_output_bytes {
+            return Err(NarouError::Platform(format!(
+                "assembled animation exceeds {} bytes",
+                limits.max_output_bytes
+            )));
+        }
     }
 
-    let mut out = Vec::new();
-    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-    for chunk in chunks {
-        out.extend_from_slice(&chunk);
+    if frames == 0 {
+        return Err(NarouError::Platform(
+            "animation archive has no decodable frames".into(),
+        ));
     }
+    if frames == 1 {
+        return Ok(first_png.expect("single frame stays a PNG"));
+    }
+
+    // acTL の num_frames と CRC を確定してから IEND を置く。
+    out[actl_count_offset..actl_count_offset + 4].copy_from_slice(&(frames as u32).to_be_bytes());
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(b"acTL");
+    hasher.update(&out[actl_count_offset..actl_count_offset + 8]);
+    let crc = hasher.finalize();
+    out[actl_crc_offset..actl_crc_offset + 4].copy_from_slice(&crc.to_be_bytes());
     out.extend_from_slice(&png_chunk(b"IEND", &[]));
     Ok(out)
 }
 
 #[cfg(feature = "illustration-animation")]
-fn frame_control(sequence: u32, width: u32, height: u32, delay_ms: u16) -> Vec<u8> {
+fn png_payloads(png: &[u8]) -> Result<(std::ops::Range<usize>, Vec<std::ops::Range<usize>>)> {
+    let mut cursor = 8usize; // signature
+    let mut ihdr = None;
+    let mut idat = Vec::new();
+    while cursor + 8 <= png.len() {
+        let length = u32::from_be_bytes(
+            png[cursor..cursor + 4]
+                .try_into()
+                .map_err(|_| NarouError::Platform("truncated PNG chunk".into()))?,
+        ) as usize;
+        let kind = &png[cursor + 4..cursor + 8];
+        let start = cursor + 8;
+        let end = start + length;
+        if end > png.len() {
+            break;
+        }
+        match kind {
+            b"IHDR" => ihdr = Some(start..end),
+            b"IDAT" => idat.push(start..end),
+            _ => {}
+        }
+        cursor = end + 4; // CRC
+    }
+    let ihdr = ihdr.ok_or_else(|| NarouError::Platform("PNG encode produced no IHDR".into()))?;
+    if idat.is_empty() {
+        return Err(NarouError::Platform("PNG encode produced no IDAT".into()));
+    }
+    Ok((ihdr, idat))
+}
+
+/// 1 フレームを PNG へ符号化する。`buffer` は呼び出し側が再利用する。
+#[cfg(feature = "illustration-animation")]
+fn encode_png_into(frame: &image::RgbaImage, buffer: &mut Vec<u8>) -> Result<()> {
+    use image::ImageEncoder as _;
+
+    buffer.clear();
+    let encoder = image::codecs::png::PngEncoder::new(&mut *buffer);
+    encoder
+        .write_image(
+            frame.as_raw(),
+            frame.width(),
+            frame.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| NarouError::Platform(format!("animation frame encode: {error}")))
+}
+
+#[cfg(feature = "illustration-animation")]
+fn frame_names(archive: &[u8]) -> Result<Vec<String>> {
+    let cursor = std::io::Cursor::new(archive);
+    let mut zip = zip::ZipArchive::new(cursor)
+        .map_err(|error| NarouError::Platform(format!("animation archive: {error}")))?;
+    let mut names: Vec<String> = (0..zip.len())
+        .filter_map(|index| zip.by_index(index).ok().map(|file| file.name().to_string()))
+        .filter(|name| !name.ends_with('/'))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// 1 フレームだけ読み出して復号する (アーカイブは毎回開き直す)。
+#[cfg(feature = "illustration-animation")]
+fn decode_frame(archive: &[u8], name: &str) -> Result<Option<image::RgbaImage>> {
+    let cursor = std::io::Cursor::new(archive);
+    let mut zip = zip::ZipArchive::new(cursor)
+        .map_err(|error| NarouError::Platform(format!("animation archive: {error}")))?;
+    let Ok(mut file) = zip.by_name(name) else {
+        return Ok(None);
+    };
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)
+        .map_err(|error| NarouError::Io(error))?;
+    match image::load_from_memory(&data) {
+        Ok(decoded) => Ok(Some(decoded.to_rgba8())),
+        Err(error) => {
+            tracing::debug!("animation frame {name} could not be decoded: {error}");
+            Ok(None)
+        }
+    }
+}
+
+/// フレーム番号に対応する表示時間 (足りなければ最後の値を使う)。
+#[cfg(feature = "illustration-animation")]
+fn delay_at(delays: &[u16], index: usize) -> u16 {
+    u16::from(*delays.get(index).unwrap_or(&delays[delays.len() - 1]))
+}
+
+#[cfg(feature = "illustration-animation")]
+fn frame_control_payload(sequence: u32, width: u32, height: u32, delay_ms: u16) -> Vec<u8> {
     let mut payload = Vec::with_capacity(26);
     payload.extend_from_slice(&sequence.to_be_bytes());
     payload.extend_from_slice(&width.to_be_bytes());
@@ -136,99 +306,26 @@ fn frame_control(sequence: u32, width: u32, height: u32, delay_ms: u16) -> Vec<u
     payload.extend_from_slice(&1000u16.to_be_bytes());
     payload.push(0); // dispose op: none
     payload.push(0); // blend op: source
-    png_chunk(b"fcTL", &payload)
+    payload
+}
+
+/// PNG チャンクを `out` へ直接書く (中間 Vec を作らない)。
+#[cfg(feature = "illustration-animation")]
+fn write_png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]) {
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(payload);
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(kind);
+    hasher.update(payload);
+    out.extend_from_slice(&hasher.finalize().to_be_bytes());
 }
 
 #[cfg(feature = "illustration-animation")]
 fn png_chunk(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut chunk = Vec::with_capacity(payload.len() + 12);
-    chunk.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    chunk.extend_from_slice(kind);
-    chunk.extend_from_slice(payload);
-    let mut crc_input = Vec::with_capacity(payload.len() + 4);
-    crc_input.extend_from_slice(kind);
-    crc_input.extend_from_slice(payload);
-    chunk.extend_from_slice(&crc32fast::hash(&crc_input).to_be_bytes());
+    write_png_chunk(&mut chunk, kind, payload);
     chunk
-}
-
-#[cfg(feature = "illustration-animation")]
-fn decode_frames(archive: &[u8]) -> Result<Vec<image::RgbaImage>> {
-    let cursor = std::io::Cursor::new(archive);
-    let mut zip = zip::ZipArchive::new(cursor)
-        .map_err(|error| NarouError::Platform(format!("animation archive: {error}")))?;
-
-    let mut names: Vec<String> = (0..zip.len())
-        .filter_map(|index| zip.by_index(index).ok().map(|file| file.name().to_string()))
-        .filter(|name| !name.ends_with('/'))
-        .collect();
-    names.sort();
-
-    let mut frames = Vec::with_capacity(names.len());
-    for name in names {
-        let Ok(mut file) = zip.by_name(&name) else {
-            continue;
-        };
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)
-            .map_err(|error| NarouError::Io(error))?;
-        match image::load_from_memory(&data) {
-            Ok(decoded) => frames.push(decoded.to_rgba8()),
-            Err(error) => {
-                tracing::debug!("animation frame {name} could not be decoded: {error}");
-            }
-        }
-    }
-
-    if frames.is_empty() {
-        return Err(NarouError::Platform(
-            "animation archive has no decodable frames".into(),
-        ));
-    }
-    Ok(frames)
-}
-
-/// Encode one frame. Frames stay RGBA: an animated work may carry
-/// transparency, and keeping one colour type for every frame is what the APNG
-/// requires anyway.
-#[cfg(feature = "illustration-animation")]
-fn encode_png(frame: &image::RgbaImage) -> Result<Vec<u8>> {
-    let mut png = Vec::new();
-    image::DynamicImage::ImageRgba8(frame.clone())
-        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .map_err(|error| NarouError::Platform(format!("animation frame encode: {error}")))?;
-    Ok(png)
-}
-
-/// Split a PNG into its `IHDR` payload and the concatenated `IDAT` payload.
-#[cfg(feature = "illustration-animation")]
-fn split_png(png: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-    let mut cursor = 8usize; // skip the signature
-    let mut ihdr = Vec::new();
-    let mut idat = Vec::new();
-    while cursor + 8 <= png.len() {
-        let length = u32::from_be_bytes(
-            png[cursor..cursor + 4]
-                .try_into()
-                .map_err(|_| NarouError::Platform("truncated PNG chunk".into()))?,
-        ) as usize;
-        let kind = &png[cursor + 4..cursor + 8];
-        let payload_start = cursor + 8;
-        let payload_end = payload_start + length;
-        if payload_end > png.len() {
-            break;
-        }
-        match kind {
-            b"IHDR" => ihdr = png[payload_start..payload_end].to_vec(),
-            b"IDAT" => idat.extend_from_slice(&png[payload_start..payload_end]),
-            _ => {}
-        }
-        cursor = payload_end + 4; // skip the CRC
-    }
-    if ihdr.is_empty() || idat.is_empty() {
-        return Err(NarouError::Platform("PNG encode produced no data".into()));
-    }
-    Ok((ihdr, idat))
 }
 
 #[cfg(all(test, feature = "illustration-animation"))]
@@ -379,5 +476,57 @@ mod tests {
         // A zip without declared delays is left to the caller as well.
         let archive = zip_of(&[("000000.png", png_frame(2, 2, [0, 0, 0, 255]))]);
         assert!(assemble_animation("https://i.pximg.net/x.zip", &archive).is_none());
+    }
+
+    /// 上限は「Workers のメモリに収める」ための安全弁で、超えたら OOM ではなく
+    /// 明示エラーで止める。
+    #[test]
+    fn limits_reject_oversized_archives() {
+        let two_frames = zip_of(&[
+            ("000000.png", png_frame(2, 2, [255, 0, 0, 255])),
+            ("000001.png", png_frame(2, 2, [0, 255, 0, 255])),
+        ]);
+        let delays = [50u16, 50];
+
+        let too_many = Limits {
+            max_frames: 1,
+            ..DEFAULT_LIMITS
+        };
+        assert!(build_apng(&two_frames, &delays, too_many).is_err());
+
+        let too_many_pixels = Limits {
+            max_frame_pixels: 1,
+            ..DEFAULT_LIMITS
+        };
+        assert!(build_apng(&two_frames, &delays, too_many_pixels).is_err());
+
+        let too_large = Limits {
+            max_output_bytes: 16,
+            ..DEFAULT_LIMITS
+        };
+        assert!(build_apng(&two_frames, &delays, too_large).is_err());
+
+        // 既定の上限なら通る。
+        assert!(build_apng(&two_frames, &delays, DEFAULT_LIMITS).is_ok());
+    }
+
+    #[test]
+    fn delays_shorter_than_frames_reuse_the_last_value() {
+        let archive = zip_of(&[
+            ("000000.png", png_frame(2, 2, [1, 1, 1, 255])),
+            ("000001.png", png_frame(2, 2, [2, 2, 2, 255])),
+            ("000002.png", png_frame(2, 2, [3, 3, 3, 255])),
+        ]);
+        let apng = build_apng(&archive, &[120, 80], DEFAULT_LIMITS).unwrap();
+        let controls: Vec<Vec<u8>> = chunks(&apng)
+            .into_iter()
+            .filter(|(kind, _)| kind == "fcTL")
+            .map(|(_, payload)| payload)
+            .collect();
+        assert_eq!(controls.len(), 3);
+        let delay = |payload: &[u8]| u16::from_be_bytes(payload[20..22].try_into().unwrap());
+        assert_eq!(delay(&controls[0]), 120);
+        assert_eq!(delay(&controls[1]), 80);
+        assert_eq!(delay(&controls[2]), 80, "3 枚目は最後の値を再利用する");
     }
 }

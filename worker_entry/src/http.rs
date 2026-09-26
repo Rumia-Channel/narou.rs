@@ -5,6 +5,12 @@ use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect};
 
 use crate::budget::SubrequestBudget;
 
+/// 1 レスポンスの上限。
+///
+/// Workers の 128 MiB 予算のうち、取得したバイト列に許す枠。実データのうごイラは
+/// zip 4.3 MiB (19 フレーム 1920×1080) で、挿絵も数 MB なので 16 MiB で足りる。
+/// 大きいのは「入力」ではなく APNG の出力側で、そちらは
+/// `illustration_animation` の上限 (40 MiB) で別に制限している。
 pub const MAX_WORKER_HTTP_BODY: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
