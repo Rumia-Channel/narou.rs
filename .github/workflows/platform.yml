@@ -344,8 +344,8 @@ jobs:
         run: |
           set -o pipefail
           {
-            cargo-about generate --workspace --locked --offline -c about.toml -o Third-Party-License.md about.hbs
-            cargo-about generate -m about-probe/Cargo.toml -c about-non-gpl.toml --locked --offline -o Third-Party-License-non-GPL.md about.hbs
+            cargo-about generate --workspace --locked -c about.toml -o Third-Party-License.md about.hbs
+            cargo-about generate -m about-probe/Cargo.toml -c about-non-gpl.toml --locked -o Third-Party-License-non-GPL.md about.hbs
           } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Committed notices are current
         run: git diff --exit-code -- Third-Party-License.md Third-Party-License-non-GPL.md
