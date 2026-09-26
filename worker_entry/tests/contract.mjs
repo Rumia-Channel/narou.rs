@@ -229,6 +229,192 @@ await check("POST /api/download rejects an unknown target", async () => {
   );
 });
 
+await check("GET /api/notepad/read returns the notepad shape", async () => {
+  const response = await request("/api/notepad/read", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(typeof body.content === "string", "content must be a string");
+  assert(typeof body.text === "string", "text must be a string");
+  assert("object_id" in body, "object_id must be present");
+});
+
+await check("POST /api/notepad/save round-trips the notepad", async () => {
+  // native は object_id (本文の SHA-256) で楽観ロックする。読み出した値をそのまま返す。
+  const before = await json(await request("/api/notepad/read", auth()));
+  const saved = await request("/api/notepad/save", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ content: "contract notepad", object_id: before.object_id }),
+  });
+  assert(saved.status === 200, `status ${saved.status}`);
+  const result = await json(saved);
+  assert(result.success === true, `saving must succeed: ${JSON.stringify(result).slice(0, 200)}`);
+  const read = await json(await request("/api/notepad/read", auth()));
+  assert(read.content === "contract notepad", `unexpected content: ${read.content}`);
+  assert(read.object_id === result.object_id, "the saved object_id must come back");
+});
+
+await check("GET /api/story returns 404 for an unknown novel", async () => {
+  const response = await request("/api/story?id=999999999", auth());
+  assert(response.status === 404, `status ${response.status}`);
+});
+
+await check("GET /api/taginfo.json returns an array", async () => {
+  const response = await request("/api/taginfo.json", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  assert(Array.isArray(await json(response)), "taginfo must be an array");
+});
+
+await check("GET /api/history returns the empty history", async () => {
+  const response = await request("/api/history", auth());
+  assert(response.status === 200, `status ${response.status}`);
+});
+
+await check("GET /api/version/current.json reports the version", async () => {
+  const response = await request("/api/version/current.json", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(typeof body.version === "string" && body.version.length > 0, "version must be set");
+});
+
+await check("POST /api/inspect is refused on the worker", async () => {
+  // 調査ログはローカルファイル前提なので、成功を偽装せず 501 を返す。
+  const response = await request("/api/inspect", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ targets: ["999999999"] }),
+  });
+  assert(response.status === 501, `status ${response.status}`);
+});
+
+await check("POST /api/convert rejects an invalid target", async () => {
+  const response = await request("/api/convert", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ targets: ["--not-a-target"] }),
+  });
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(body.success === false, `unexpected body: ${JSON.stringify(body).slice(0, 200)}`);
+  assert(Array.isArray(body.results) && body.results.length === 0, "results must be empty");
+});
+
+await check("POST /api/update rejects an invalid target", async () => {
+  const response = await request("/api/update", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ targets: ["--not-a-target"] }),
+  });
+  assert(response.status === 200, `status ${response.status}`);
+  assert((await json(response)).success === false, "an invalid target must be rejected");
+});
+
+await check("POST /api/update_general_lastup is refused on the worker", async () => {
+  // 全 TOC の再取得が要る操作で、Worker の JobKind::Update では表現できない。
+  const response = await request("/api/update_general_lastup", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ option: "all" }),
+  });
+  assert(response.status === 501, `status ${response.status}`);
+  assert(
+    (await errorCode(response)) === "not_supported_on_worker",
+    "the refusal must be machine readable",
+  );
+});
+
+await check("POST /api/update/start is refused on the worker", async () => {
+  const response = await request("/api/update/start", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: "{}",
+  });
+  assert(response.status === 501, `status ${response.status}`);
+});
+
+await check("POST /api/login/import rejects an empty envelope", async () => {
+  const response = await request("/api/login/import", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ envelope: "" }),
+  });
+  assert(response.status === 200, `status ${response.status}`);
+  assert((await json(response)).success === false, "an empty import must be refused");
+});
+
+await check("POST /api/login/order rejects a mismatched order", async () => {
+  const response = await request("/api/login/order", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ host: "example.com", order: [0, 1] }),
+  });
+  assert(response.status === 200, `status ${response.status}`);
+  assert((await json(response)).success === false, "an unknown host must be refused");
+});
+
+await check("POST /api/queue/clear reports success", async () => {
+  const response = await request("/api/queue/clear", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: "{}",
+  });
+  assert(response.status === 200, `status ${response.status}`);
+  assert((await json(response)).success === true, "clearing an empty queue must succeed");
+});
+
+await check("POST /api/cancel reports success", async () => {
+  const response = await request("/api/cancel", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({}),
+  });
+  assert(response.status === 200, `status ${response.status}`);
+  assert((await json(response)).success === true, "cancelling with nothing running must succeed");
+});
+
+await check("POST /api/reorder_pending_tasks is refused on the worker", async () => {
+  // キュー配送順は送信時に固定されるため、表示順だけを偽装しない。
+  const response = await request("/api/reorder_pending_tasks", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ task_ids: [] }),
+  });
+  assert(response.status === 501, `status ${response.status}`);
+  assert(
+    (await errorCode(response)) === "queue_reorder_not_supported",
+    "the refusal must be machine readable",
+  );
+});
+
+await check("POST /api/tag/change_color rejects an unknown color", async () => {
+  const response = await request("/api/tag/change_color", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ tag: "contract-tag", color: "not-a-color" }),
+  });
+  assert(response.status === 200, `status ${response.status}`);
+  assert((await json(response)).success === false, "an unknown color must be rejected");
+});
+
+await check("POST /api/tag/change_color stores a color", async () => {
+  const response = await request("/api/tag/change_color", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ tag: "contract-tag", color: "green" }),
+  });
+  assert(response.status === 200, `status ${response.status}`);
+  assert((await json(response)).success === true, "the color must be stored");
+});
+
+await check("POST /api/edit_tag rejects a malformed body", async () => {
+  const response = await request("/api/edit_tag", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ ids: ["not-an-id"], tag: "" }),
+  });
+  assert([200, 400].includes(response.status), `unexpected status ${response.status}`);
+});
+
 await check("GET /api/feature_tour/all lists every tour", async () => {
   const response = await request("/api/feature_tour/all", auth());
   assert(response.status === 200, `status ${response.status}`);
@@ -261,6 +447,45 @@ await check("POST /api/feature_tour/config is reflected by pending", async () =>
   assert((await json(response)).success === true, "the config save must succeed");
   const pending = await json(await request("/api/feature_tour/pending", auth()));
   assert(pending.disabled === false, "pending must report the saved config");
+});
+
+// Worker では実現できない操作は、成功を偽装せず 501 + 機械可読なコードで断る。
+for (const path of [
+  "/api/shutdown",
+  "/api/reboot",
+  "/api/folder",
+  "/api/backup",
+  "/api/backup_bookmark",
+  "/api/setting_burn",
+  "/api/csv/import",
+  "/api/mail",
+  "/api/send",
+]) {
+  await check(`POST ${path} is refused on the worker`, async () => {
+    const response = await request(path, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...auth().headers },
+      body: "{}",
+    });
+    assert(response.status === 501, `status ${response.status}`);
+    assert(
+      (await errorCode(response)) === "not_supported_on_worker",
+      "the refusal must be machine readable",
+    );
+  });
+}
+
+await check("GET /api/csv/download is refused on the worker", async () => {
+  const response = await request("/api/csv/download", auth());
+  assert(response.status === 501, `status ${response.status}`);
+});
+
+await check("GET /api/storage/mode reports the worker storage", async () => {
+  const response = await request("/api/storage/mode", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(body.success === true, `unexpected body: ${JSON.stringify(body)}`);
+  assert(body.mode === "sqlite", `the worker stores in D1: ${JSON.stringify(body)}`);
 });
 
 await check("GET /api/webui/config returns the UI configuration", async () => {

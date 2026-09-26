@@ -200,6 +200,122 @@ impl D1JobLedger {
         }
         Ok(())
     }
+
+    // ------------------------------------------------------------------
+    // Web UI queue mutations (token-blind operator actions)
+    // ------------------------------------------------------------------
+    //
+    // These back `webui/queue_actions.rs`. The worker has no `cancelled`
+    // ledger status and the Cloudflare Queue keeps already-sent envelopes,
+    // so removing a job cannot be a row deletion: a delivered envelope for
+    // a deleted row is durably re-ledgered as a phantom `blocked` row by
+    // `record_rejected`, and `JobLedgerStatus::parse` rejects any
+    // non-canonical status (a custom tombstone would retry-storm the
+    // consumer). The only consistent "this job never runs" state is a
+    // terminal row, written unconditionally — these are operator actions,
+    // not executor outcomes, so no execution token is required and any live
+    // token/lease/checkpoint is cleared. The tombstoned job drops out of
+    // `pending` and the dedupe index; every later delivery claims it as
+    // `AlreadyTerminal` and acks. `queue/status` counts it under `failed`
+    // (the only terminal bucket the Web UI has for non-success rows) —
+    // documented in `webui/queue_actions.rs`.
+
+    /// Mark every pending / retryable row terminal (`permanent` + `reason`).
+    /// Returns the number of tombstoned rows. Running rows are untouched —
+    /// native `clear_non_running` parity.
+    pub async fn cancel_all_pending(&self, reason: &str) -> Result<usize> {
+        let statement = self.prepare(
+            "UPDATE worker_jobs
+             SET status = ?, last_error = ?, updated_at = ?,
+                 lease_until = NULL, execution_token = NULL, checkpoint_json = NULL
+             WHERE status IN ('pending', 'retryable')",
+            vec![
+                BindValue::Text(status_str(JobLedgerStatus::Permanent).to_string()),
+                BindValue::Text(reason.to_string()),
+                BindValue::Text(self.now_rfc3339()),
+            ],
+        )?;
+        changed_rows(&statement.run().await.map_err(worker_error)?)
+    }
+
+    /// Tombstone one pending / retryable row; `false` when no such row
+    /// exists (native `remove_pending` parity: running, terminal, and
+    /// unknown ids are not removable).
+    pub async fn cancel_pending_job(&self, job_id: &str, reason: &str) -> Result<bool> {
+        let statement = self.prepare(
+            "UPDATE worker_jobs
+             SET status = ?, last_error = ?, updated_at = ?,
+                 lease_until = NULL, execution_token = NULL, checkpoint_json = NULL
+             WHERE job_id = ? AND status IN ('pending', 'retryable')",
+            vec![
+                BindValue::Text(status_str(JobLedgerStatus::Permanent).to_string()),
+                BindValue::Text(reason.to_string()),
+                BindValue::Text(self.now_rfc3339()),
+                BindValue::Text(job_id.to_string()),
+            ],
+        )?;
+        Ok(changed_rows(&statement.run().await.map_err(worker_error)?)? > 0)
+    }
+
+    /// Tombstone one running row regardless of its execution lease. The
+    /// in-flight execution (if any) runs to its next boundary but can no
+    /// longer write an outcome — `mark_terminal`, `yield_for_continuation`
+    /// and `record_attempt` all require the execution token that this call
+    /// clears — and every redelivery claims the row as `AlreadyTerminal`
+    /// and acks. `false` when the row is not currently `running`.
+    pub async fn cancel_running_job(&self, job_id: &str, reason: &str) -> Result<bool> {
+        let statement = self.prepare(
+            "UPDATE worker_jobs
+             SET status = ?, last_error = ?, updated_at = ?,
+                 lease_until = NULL, execution_token = NULL, checkpoint_json = NULL
+             WHERE job_id = ? AND status = 'running'",
+            vec![
+                BindValue::Text(status_str(JobLedgerStatus::Permanent).to_string()),
+                BindValue::Text(reason.to_string()),
+                BindValue::Text(self.now_rfc3339()),
+                BindValue::Text(job_id.to_string()),
+            ],
+        )?;
+        Ok(changed_rows(&statement.run().await.map_err(worker_error)?)? > 0)
+    }
+
+    /// All currently-running job ids (any lease state), FIFO order.
+    pub async fn running_job_ids(&self) -> Result<Vec<String>> {
+        let statement = self.db.prepare(
+            "SELECT job_id FROM worker_jobs
+             WHERE status = 'running'
+             ORDER BY created_at ASC, job_id ASC",
+        );
+        let rows = statement
+            .all()
+            .await
+            .map_err(worker_error)?
+            .results::<JobIdRow>()
+            .map_err(worker_error)?;
+        Ok(rows.into_iter().map(|row| row.job_id).collect())
+    }
+
+    /// Running job ids whose lease expired (or was never written). These
+    /// are exactly the rows `claim`'s lease-expiry branch may reclaim — the
+    /// worker analogue of native "restorable" tasks (jobs left `running`
+    /// on disk when the server shut down). Lease timestamps are canonical
+    /// RFC3339 nanos written by this module, so lexicographic comparison
+    /// against `now` is sound.
+    pub async fn stale_running_job_ids(&self) -> Result<Vec<String>> {
+        let statement = self.prepare(
+            "SELECT job_id FROM worker_jobs
+             WHERE status = 'running' AND (lease_until IS NULL OR lease_until <= ?)
+             ORDER BY created_at ASC, job_id ASC",
+            vec![BindValue::Text(self.now_rfc3339())],
+        )?;
+        let rows = statement
+            .all()
+            .await
+            .map_err(worker_error)?
+            .results::<JobIdRow>()
+            .map_err(worker_error)?;
+        Ok(rows.into_iter().map(|row| row.job_id).collect())
+    }
 }
 
 impl JobQueue for D1JobLedger {
@@ -778,6 +894,11 @@ impl JobRow {
 #[derive(Debug, Deserialize)]
 struct AttemptRow {
     attempts: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobIdRow {
+    job_id: String,
 }
 
 #[derive(Debug, Deserialize)]

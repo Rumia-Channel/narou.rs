@@ -7,7 +7,14 @@
 //! 機械可読な code を返す。
 
 pub mod download;
+pub mod job_actions;
 pub mod library_backup;
+pub mod read_views;
+pub mod login_actions;
+pub mod queue_actions;
+pub mod row_actions;
+pub mod tag_actions;
+pub mod native_only;
 pub mod list;
 pub mod ui_prefs;
 pub mod queue;
