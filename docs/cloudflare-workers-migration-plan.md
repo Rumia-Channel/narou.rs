@@ -380,9 +380,24 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 - D1 に content mirror（`novel_outputs` / `novel_sections`）とバージョン履歴テーブルが無い。
   ※ 新設計では本文そのものをセクション行として持つ（P0d）ので、`novel_sections` 相当は必須になる。
 - Web UI のルートは native が約 100 本（`src/web/mod.rs`）+ `/ws` push。Worker 側は `[assets]` で
-  フロントエンド一式を配信し、API は `/api/novels*` / `/api/login*` / `/api/sites*` / `/api/jobs*` /
-  `/api/global_setting` / `/api/admin/object-migration` / `/health/*` まで移植済み。残りは novel
-  settings・タグ色・notepad・ログ・storage mode・self-update・`/ws` など（P3 の残タスク）。
+  フロントエンド一式を配信し、**フロントが呼ぶ API はすべて移植済み**（`src/web/assets/js/**` の
+  呼び出しと native ルート表を突き合わせて確認）:
+  - 表示: `/api/list`、`/api/sort_state`、`/api/webui/config`、`/api/tag_list`、`/api/queue/status`、
+    `/api/get_pending_tasks`、`/api/feature_tour/{pending,all,seen,config}`、`/api/global_setting`、
+    `/api/library_backup`
+  - 操作: `/api/download`、`/api/convert`、`/api/update`、`/api/update_by_tag`、`/api/freeze`、
+    `/api/novels/{freeze,unfreeze,remove}`、`/api/edit_tag`、`/api/tag/change_color`、
+    `/api/queue/clear`、`/api/cancel`、`/api/cancel_running_task`、`/api/remove_pending_task`、
+    `/api/restore_pending_tasks`、`/api/defer_restore_pending_tasks`
+  - 読み取り: `/api/story`、`/api/diff_list`（GET は HTML 断片 / POST は JSON）、`/api/diff_clean`、
+    `/api/notepad/read`・`/api/notepad/save`（`object_id` による楽観ロック）、`/api/history`、
+    `/api/clear_history`、`/api/taginfo.json`、`/api/version/current.json`・`/api/version/latest.json`
+  - ログイン: `/api/login`、`/api/login/set`、`/api/login/import`、`/api/login/order`、`/api/login/{host}`
+  - 実現不能なものは成功を偽装せず 501 + 機械可読コード: `/api/shutdown`、`/api/reboot`、
+    `/api/folder`、`/api/backup`、`/api/backup_bookmark`、`/api/setting_burn`、`/api/csv/*`、
+    `/api/mail`、`/api/send`、`/api/inspect`、`/api/reorder_pending_tasks`、`/api/update/start`、
+    `/api/update_general_lastup`、`/api/storage/mode`(POST)
+  - `/ws` は接続と hello 1 通のみ（push イベントは Durable Object 導入待ち）
 - 設定ページの JSON は `src/application/settings_view.rs` に集約し、native（axum ハンドラ）と Worker が
   同じコードで組み立てる。`SettingsService`（`SettingsStore` port の上）と `setting_core` /
   `setting_info` だけで完結するため、両方のビルドでそのまま動く。
