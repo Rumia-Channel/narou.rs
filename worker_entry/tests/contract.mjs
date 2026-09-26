@@ -170,6 +170,34 @@ await check("GET /api/jobs/:id returns 404 for an unknown job", async () => {
   assert(response.status === 404, `status ${response.status}`);
 });
 
+await check("GET /api/global_setting returns the settings page payload", async () => {
+  const response = await request("/api/global_setting", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(body.error === undefined, `unexpected error: ${body.error}`);
+  assert(Array.isArray(body.tabs) && body.tabs.length > 0, "tabs must be present");
+  assert(Array.isArray(body.settings) && body.settings.length > 0, "settings must be listed");
+  assert(
+    body.settings.every((item) => typeof item.name === "string" && typeof item.tab === "string"),
+    "every setting needs a name and a tab",
+  );
+});
+
+await check("POST /api/global_setting stores a value", async () => {
+  const post = await request("/api/global_setting", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ settings: { "webui.theme": "Darkly" } }),
+  });
+  assert(post.status === 200, `status ${post.status}`);
+  assert((await json(post)).success === true, "the save must succeed");
+
+  const after = await json(await request("/api/global_setting", auth()));
+  const theme = after.settings.find((item) => item.name === "webui.theme");
+  assert(theme, "webui.theme must be listed after saving");
+  assert.strictEqual(theme.value, "Darkly");
+});
+
 await checkWithAuth("POST /api/jobs requires auth", async () => {
   const response = await request("/api/jobs", { method: "POST", body: "{}" });
   assert(response.status === 401, `status ${response.status}`);

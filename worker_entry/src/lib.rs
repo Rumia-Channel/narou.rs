@@ -4,6 +4,7 @@ mod budget;
 mod bundled_sites;
 mod composition;
 mod convert;
+mod global_settings;
 mod login;
 mod secrets;
 mod sites;
@@ -46,6 +47,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         "/api/sites" => api_sites(req, env).await,
         "/api/login/set" => api_login_set(req, env).await,
         "/api/jobs" => api_jobs(req, env).await,
+        "/api/global_setting" => global_settings::api_global_setting(req, env).await,
         "/api/admin/object-migration" => api_object_migration(req, env).await,
         _ if path.starts_with("/api/novels/") => api_novel(req, env).await,
         _ if path.starts_with("/api/login/") => api_login_host(req, env).await,

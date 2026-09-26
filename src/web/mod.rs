@@ -44,7 +44,7 @@ pub(crate) async fn max_web_targets_per_request(state: &AppState) -> usize {
 pub(crate) const MAX_WEB_TAGS_PER_REQUEST: usize = 128;
 pub(crate) const MAX_WEB_TARGET_LENGTH: usize = 4096;
 pub(crate) const MAX_WEB_TAG_LENGTH: usize = 255;
-pub(crate) const MAX_WEB_TEXT_INPUT_BYTES: usize = 1024 * 1024;
+pub(crate) use crate::application::settings_view::MAX_WEB_TEXT_INPUT_BYTES;
 pub(crate) const MAX_WEB_CSV_IMPORT_BYTES: usize = 5 * 1024 * 1024;
 pub(crate) const MAX_WEB_LOG_COUNT: usize = 1000;
 pub(crate) const MAX_WEB_PAGE_LENGTH: u64 = 500;
@@ -221,14 +221,11 @@ pub(crate) fn normalize_web_tag_name(tag: &str) -> Result<String, String> {
 }
 
 pub(crate) fn validate_web_text_size(
-    value: &str,
-    max_bytes: usize,
+    content: &str,
+    limit: usize,
     label: &str,
 ) -> Result<(), String> {
-    if value.len() > max_bytes {
-        return Err(format!("{} is too large", label));
-    }
-    Ok(())
+    crate::application::settings_view::validate_web_text_size(content, limit, label)
 }
 
 pub(crate) fn safe_existing_novel_dir(

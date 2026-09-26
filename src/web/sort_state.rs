@@ -12,23 +12,10 @@ use crate::db::{
 pub use crate::db::SORT_KEYS as SORT_COLUMN_KEYS;
 
 /// Web UI の表示ラベル。`SORT_COLUMN_KEYS` (≒ `db::sort_keys()`) と長さを揃え、
-/// 同じインデックスで日本語ラベルを参照できるようにする。
-pub const SORT_COLUMN_LABELS: &[&str] = &[
-    "ID",             // 0  id
-    "最終更新日",     // 1  last_update
-    "最新話掲載日",   // 2  general_lastup
-    "最終確認日",     // 3  last_check_date
-    "タイトル",       // 4  title
-    "作者",           // 5  author
-    "サイト名",       // 6  sitename
-    "小説種別",       // 7  novel_type
-    "タグ",           // 8  tags
-    "話数",           // 9  general_all_no
-    "文字数",         // 10 length
-    "状態",           // 11 status
-    "URL",            // 12 toc_url
-    "新着日",         // 13 new_arrivals_date
-];
+/// 同じインデックスで日本語ラベルを参照できるようにする。定義は Worker と共有する
+/// [`crate::application::settings_view`] 側にある。
+pub use crate::application::settings_view::{SORT_COLUMN_LABELS, sort_column_label_for_key};
+
 
 pub(crate) const DEFAULT_CURRENT_SORT_COLUMN: usize = 2;
 pub(crate) const DEFAULT_CURRENT_SORT_DIR: &str = "desc";
@@ -124,10 +111,6 @@ pub fn normalize_sort_key(key: &str) -> Option<&'static str> {
     sort_keys().iter().copied().find(|candidate| *candidate == key)
 }
 
-pub fn sort_column_label_for_key(key: &str) -> Option<&'static str> {
-    let index = sort_keys().iter().position(|candidate| *candidate == key)?;
-    SORT_COLUMN_LABELS.get(index).copied()
-}
 
 /// `db::compare_records_by_key` の薄いラッパ。CLI / Web 双方から共有される
 /// 「ソートキー 1 個分の比較」であり、BUG-9 で導入された型付き + None 安定順の

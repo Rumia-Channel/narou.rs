@@ -379,7 +379,13 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 - APNG 挿絵（うごイラ）は **Worker でも組み立てる**。`zip` を `default-features = false` + 純 Rust の deflate バックエンドに絞ることで wasm32-unknown-unknown でビルドでき、`worker-runtime` から `illustration-animation` を有効にした（実測: `image` (jpeg/png) + `zip` + `miniz_oxide` が wasm でコンパイル通過。native のユニットテスト 6 件も green）。
 - D1 に content mirror（`novel_outputs` / `novel_sections`）とバージョン履歴テーブルが無い。
   ※ 新設計では本文そのものをセクション行として持つ（P0d）ので、`novel_sections` 相当は必須になる。
-- Web UI は約 100 ルート（`src/web/mod.rs:567-640`）と `/ws` push。Worker 側に配信機構が無い。
+- Web UI のルートは native が約 100 本（`src/web/mod.rs`）+ `/ws` push。Worker 側は `[assets]` で
+  フロントエンド一式を配信し、API は `/api/novels*` / `/api/login*` / `/api/sites*` / `/api/jobs*` /
+  `/api/global_setting` / `/api/admin/object-migration` / `/health/*` まで移植済み。残りは novel
+  settings・タグ色・notepad・ログ・storage mode・self-update・`/ws` など（P3 の残タスク）。
+- 設定ページの JSON は `src/application/settings_view.rs` に集約し、native（axum ハンドラ）と Worker が
+  同じコードで組み立てる。`SettingsService`（`SettingsStore` port の上）と `setting_core` /
+  `setting_info` だけで完結するため、両方のビルドでそのまま動く。
 
 ---
 

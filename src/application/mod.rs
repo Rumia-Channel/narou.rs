@@ -24,6 +24,7 @@ pub mod novel_content;
 pub mod scheduler;
 pub mod self_update;
 pub mod settings;
+pub mod settings_view;
 pub mod tag_colors;
 pub mod web_actions;
 pub use jobs::{
