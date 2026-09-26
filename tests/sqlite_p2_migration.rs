@@ -8,7 +8,9 @@ use narou_rs::db::{Database, NovelRecord};
 use narou_rs::native::sqlite::state::StorageMode;
 use narou_rs::platform::{NovelFilter, NovelId};
 
-static SERIES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// ライブラリの状態を共有するためテストを直列化する。await を跨いで保持するので
+// tokio の Mutex を使う（std の guard を跨ぐと clippy が警告し、実際に詰まり得る）。
+static SERIES_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn copy_fixture_library(target_root: &Path) {
     let source_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -22,7 +24,7 @@ fn copy_fixture_library(target_root: &Path) {
 
 #[test]
 fn p2_import_operate_export_roundtrip() {
-        let _series = SERIES_LOCK.lock().unwrap();
+        let _series = SERIES_LOCK.blocking_lock();
 let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     copy_fixture_library(&root);
@@ -118,8 +120,8 @@ let temp = tempfile::tempdir().unwrap();
 
 #[tokio::test]
 async fn filter_still_matches_after_import() {
-        let _series = SERIES_LOCK.lock().unwrap();
-let temp = tempfile::tempdir().unwrap();
+    let _series = SERIES_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     copy_fixture_library(&root);
     narou_rs::native::sqlite::state::write_mode(
@@ -140,7 +142,7 @@ let temp = tempfile::tempdir().unwrap();
 
 #[test]
 fn p3_default_flow_never_writes_yaml() {
-        let _series = SERIES_LOCK.lock().unwrap();
+        let _series = SERIES_LOCK.blocking_lock();
 let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     copy_fixture_library(&root);
@@ -171,7 +173,7 @@ let temp = tempfile::tempdir().unwrap();
 #[test]
 fn p3_perf_smoke_1000_records() {
     use std::time::Instant;
-    let _series = SERIES_LOCK.lock().unwrap();
+    let _series = SERIES_LOCK.blocking_lock();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     narou_rs::native::sqlite::state::write_mode(
@@ -227,7 +229,7 @@ fn p3_perf_smoke_1000_records() {
 
 #[test]
 fn p4b_version_snapshot_restore_merge_prune() {
-    let _series = SERIES_LOCK.lock().unwrap();
+    let _series = SERIES_LOCK.blocking_lock();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     narou_rs::native::sqlite::state::write_mode(
