@@ -55,12 +55,9 @@ impl D1CookieStore {
         Self { db, key }
     }
 
-    /// secret から復号鍵を読む。未設定なら平文の行だけを扱う。
-    pub fn key_from_env(env: &worker::Env) -> Option<[u8; KEY_LEN]> {
-        let value = match env.secret(LOGIN_KEY_SECRET) {
-            Ok(value) => value.to_string(),
-            Err(_) => return None,
-        };
+    /// secret（または Secrets Store）から復号鍵を読む。未設定なら平文の行だけを扱う。
+    pub async fn key_from_env(env: &worker::Env) -> Option<[u8; KEY_LEN]> {
+        let value = crate::secrets::value(env, LOGIN_KEY_SECRET).await?;
         match narou_rs::login::parse_key_base64(&value) {
             Ok(key) => Some(key),
             Err(error) => {

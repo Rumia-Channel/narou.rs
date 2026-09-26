@@ -5,6 +5,7 @@ mod bundled_sites;
 mod composition;
 mod convert;
 mod login;
+mod secrets;
 mod sites;
 mod consumer;
 mod d1_cookie_store;
@@ -30,12 +31,14 @@ use crate::composition::{WorkerRuntime, check_ready};
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
     match path.as_str() {
-        "/health/live" => health_payload(&env, "alive"),
+        "/health/live" => health_payload(&env, "alive").await,
         "/health/ready" => match check_ready(&env).await {
-            Ok(()) => health_payload(&env, "ready"),
+            Ok(()) => health_payload(&env, "ready").await,
             Err(error) => {
                 console_log!("readiness failed: {error}");
-                health_payload(&env, "not_ready").map(|response| response.with_status(503))
+                health_payload(&env, "not_ready")
+                    .await
+                    .map(|response| response.with_status(503))
             }
         },
         "/api/novels" => api_novels(req, env).await,
@@ -56,7 +59,7 @@ async fn api_novels(req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
-    if let Some(response) = auth_failure(&req, &env) {
+    if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
     let services = match composition::build_services(&env).await {
@@ -114,7 +117,7 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
-    if let Some(response) = auth_failure(&req, &env) {
+    if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
     let path = req.path();
@@ -157,7 +160,7 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
 /// leaves as soon as it is produced. Neither the finished archive nor the image
 /// set is ever held in memory.
 async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Response> {
-    if let Some(response) = auth_failure(&req, &env) {
+    if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
     let services = match composition::build_read_services(&env).await {
@@ -377,8 +380,8 @@ struct EpubStreamState {
 
 /// 無認証で返す health 応答。認証の要否と設定状況を機械可読で載せる
 /// (CLI / Web UI / 監視が、トークン未設定とトークン不一致を区別できる)。
-fn health_payload(env: &Env, status: &str) -> worker::Result<Response> {
-    let (required, configured) = auth_configuration(env);
+async fn health_payload(env: &Env, status: &str) -> worker::Result<Response> {
+    let (required, configured, _) = auth_configuration(env).await;
     Response::from_json(&serde_json::json!({
         "status": status,
         "service": "narou.rs worker",
@@ -389,7 +392,7 @@ fn health_payload(env: &Env, status: &str) -> worker::Result<Response> {
 
 /// GET /api/sites — bundle 済み + ユーザー定義のサイト定義一覧。
 async fn api_sites(req: Request, env: Env) -> Result<Response> {
-    if let Some(response) = auth_failure(&req, &env) {
+    if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
     if req.method() != Method::Get {
@@ -410,7 +413,7 @@ async fn api_sites(req: Request, env: Env) -> Result<Response> {
 /// PUT /api/sites/{name} — 1 件のユーザー定義を置き換える (YAML 本文)。
 /// DELETE /api/sites/{name} — ユーザー定義を消して bundle に戻す。
 async fn api_site(req: Request, env: Env) -> Result<Response> {
-    if let Some(response) = auth_failure(&req, &env) {
+    if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
     let Some(name) = req
@@ -443,7 +446,7 @@ async fn api_novel_illustration(req: Request, env: Env, id: i64, name: &str) -> 
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
-    if let Some(response) = auth_failure(&req, &env) {
+    if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
     let services = match composition::build_read_services(&env).await {
@@ -497,7 +500,7 @@ async fn api_novel_illustration(req: Request, env: Env, id: i64, name: &str) -> 
 /// GET /api/login — 保存済みログイン資格情報の一覧 (値は伏せる)。
 /// POST /api/login/set — 1 ホスト分を置き換える。
 async fn api_login(req: Request, env: Env) -> Result<Response> {
-    if let Some(response) = auth_failure(&req, &env) {
+    if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
     match req.method() {
@@ -524,7 +527,7 @@ async fn api_login(req: Request, env: Env) -> Result<Response> {
 
 /// POST /api/login/set — `{host, cookie, label?}` で 1 ホスト分を置き換える。
 async fn api_login_set(req: Request, env: Env) -> Result<Response> {
-    if let Some(response) = auth_failure(&req, &env) {
+    if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
     if req.method() != Method::Post {
@@ -544,7 +547,7 @@ async fn api_login_set(req: Request, env: Env) -> Result<Response> {
 
 /// DELETE /api/login/{host} — 1 ホスト分の資格情報を消す。
 async fn api_login_host(req: Request, env: Env) -> Result<Response> {
-    if let Some(response) = auth_failure(&req, &env) {
+    if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
     if req.method() != Method::Delete {
@@ -578,7 +581,7 @@ async fn api_jobs(mut req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Post {
         return Response::error("Method Not Allowed", 405);
     }
-    if let Some(response) = auth_failure(&req, &env) {
+    if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
     let request: narou_rs::application::JobRequest = match req.json().await {
@@ -627,7 +630,7 @@ async fn api_job(req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
-    if let Some(response) = auth_failure(&req, &env) {
+    if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
     let id = req.path().strip_prefix("/api/jobs/").map(str::to_string);
@@ -656,7 +659,7 @@ async fn api_object_migration(mut req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Post {
         return Response::error("Method Not Allowed", 405);
     }
-    if let Some(response) = auth_failure(&req, &env) {
+    if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
 
@@ -707,28 +710,29 @@ enum AuthState {
     NotConfigured,
 }
 
-/// 認証の設定状況 `(認証が必要か, トークンが設定済みか)`。
-fn auth_configuration(env: &Env) -> (bool, bool) {
+/// 認証の設定状況 `(認証が必要か, トークンが設定済みか, トークン)`。
+async fn auth_configuration(env: &Env) -> (bool, bool, Option<String>) {
     // ローカル開発用の抜け道。既定は "true" (認証する)。
     let required = env
         .var("NAROU_AUTH_REQUIRED")
         .map(|value| value.to_string())
         .unwrap_or_else(|_| "true".to_string());
     if required.eq_ignore_ascii_case("false") {
-        return (false, true);
+        return (false, true, None);
     }
-    (true, env.secret("NAROU_ADMIN_TOKEN").is_ok())
+    let token = crate::secrets::value(env, "NAROU_ADMIN_TOKEN").await;
+    (true, token.is_some(), token)
 }
 
-fn auth_state(req: &Request, env: &Env) -> AuthState {
-    let (required, configured) = auth_configuration(env);
+async fn auth_state(req: &Request, env: &Env) -> AuthState {
+    let (required, configured, token) = auth_configuration(env).await;
     if !required {
         return AuthState::Allowed;
     }
     if !configured {
         return AuthState::NotConfigured;
     }
-    let Ok(secret) = env.secret("NAROU_ADMIN_TOKEN") else {
+    let Some(secret) = token else {
         return AuthState::NotConfigured;
     };
     let expected = format!("Bearer {secret}");
@@ -746,8 +750,8 @@ fn auth_state(req: &Request, env: &Env) -> AuthState {
 }
 
 /// 認証を要求し、失敗していればその応答を返す。
-fn auth_failure(req: &Request, env: &Env) -> Option<worker::Result<Response>> {
-    match auth_state(req, env) {
+async fn auth_failure(req: &Request, env: &Env) -> Option<worker::Result<Response>> {
+    match auth_state(req, env).await {
         AuthState::Allowed => None,
         AuthState::Required => Some(json_error(401, "authentication_required", None)),
         AuthState::NotConfigured => Some(json_error(

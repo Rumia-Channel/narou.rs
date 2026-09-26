@@ -168,7 +168,7 @@ impl WorkerRuntime {
         let cookie_store: Arc<crate::d1_cookie_store::D1CookieStore> =
             Arc::new(crate::d1_cookie_store::D1CookieStore::new(
                 db.clone(),
-                crate::d1_cookie_store::D1CookieStore::key_from_env(env),
+                crate::d1_cookie_store::D1CookieStore::key_from_env(env).await,
             ));
         let http: Arc<dyn HttpClient> = Arc::new(
             WorkerHttpClient::new(subrequests.clone()).with_cookie_store(cookie_store.clone()),
