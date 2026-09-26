@@ -341,9 +341,10 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 ### Cloudflare Workers 移行 (2026-09-26 決定、詳細: docs/cloudflare-workers-migration-plan.md)
 - **ゴール**: Web UI ごと Workers へ移行する。native は CLI と、Workers で代替できない重量処理・ローカル操作のために残す。
 - **重量処理**: Worker 内の AozoraEpub3_Lite (in-process) で完結。外部プロセス前提の機能 (AozoraEpub3 jar / kindlegen / SMTP / 端末送信 / セルフアップデート / `folder` / `browser` 等) は `blocked` / `501` で明示的に拒否し、CF Containers は使わない。
-- **保存**: メタデータとテキスト系オブジェクト (本文・toc・raw・setting・`novel.txt`) は **D1**、バイナリ系 (挿絵・`generated/` 配下の生成物) だけ **S3 互換ストレージ**。切替は `app_state('inv','asset_backend')` (`d1` | `s3`) でバイナリ側にのみ効かせ、本文は常に D1 固定。振り分けは core の `is_bulk_object_key` + `SplitStore` が担う。**実装・binding・設定キーは `S3_*` / `s3_*` で統一し、ベンダ名 (Wasabi 等) を識別子に使わない**。本番の接続先が Wasabi であることは設定値として外から与える。
-- フェーズ: P0a 足回り (完了) → P0b 署名・S3 アダプタ (完了) → P0c 保存先の振り分け (SplitStore) → P0d バイナリのみの移行 → P0e 契約テスト + CI デプロイ → P1 取得系 (SSRF port 化・settings 注入・CookieStore・YAML provider) → P2 変換を Worker へ → P3 Web UI 移植 → P4 運用。
-- P0 の移行期間は `asset_backend` でバイナリの保存先を切替可能にし、フラグ 1 つで旧経路へ戻せる状態を保つ (D1 側の `objects`/`object_chunks` は移行後も消さない)。
+- **保存**: **メタデータと本文は D1**（`toc.yaml` / `本文/*.yaml` / raw HTML をそのまま置かず、セクション行と列へ展開して保存する）、**挿絵（うごイラ含む）だけ S3 互換ストレージ**。切替は `app_state('inv','asset_backend')` (`d1` | `s3`) で挿絵側にのみ効かせ、本文は常に D1 固定。振り分けは core の `is_illustration_key` + `SplitStore` が担う。**実装・binding・設定キーは `S3_*` / `s3_*` で統一し、ベンダ名 (Wasabi 等) を識別子に使わない**。本番の接続先が Wasabi であることは設定値として外から与える。
+- **EPUB は保存しない**: AozoraEpub3_Lite で、Web UI の DL 要求時に保存済みデータからストリーミング生成する。**Workers では raw HTML などのキャッシュを一切保存しない**（native は従来どおりで `.narou/` 互換に影響なし）。
+- フェーズ: P0a 足回り (完了) → P0b 署名・S3 アダプタ (完了) → P0c 挿絵を S3 へ (SplitStore + `asset_backend`) → P0d 本文の構造化と移行 (セクション行 + YAML blob からの移行) → P0e 契約テスト + CI デプロイ → P1 取得系 (SSRF port 化・settings 注入・CookieStore・YAML provider) → P2 変換を Worker へ (変換済み本文を列に保存) → P3 Web UI 移植 → P4 運用。
+- 移行期間は `asset_backend`（挿絵）と `content_backend`（本文の blob → 行）を切り替え可能にし、フラグ 1 つで旧経路へ戻せる状態を保つ (D1 側の `objects`/`object_chunks` は移行後も消さない)。
 
 ### 最近の追加 (2026-05〜09)
 - **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1 で従来の逐次動作、フォース指定・ウェブモード・ドメインが1種類のときは自動的に逐次にフォールバック
