@@ -17,15 +17,15 @@ pub fn cmd_log(
 }
 
 pub fn report_error(message: &str) {
-    logger::without_logging(|| {
-        if narou_rs::progress::is_web_mode() {
-            eprintln!("{} {}", bold_colored("[ERROR]", "red"), message);
-        } else if std::env::var_os("NO_COLOR").is_some() {
-            eprintln!("[ERROR] {}", message);
-        } else {
-            eprintln!("\x1b[1;31m[ERROR]\x1b[0m {}", message);
-        }
-    });
+    // Ruby narou_logger.rb の `error` は `$stdout.error str` なので
+    // stdout へ出力しつつログファイルにも残す (`emit_stdout` が両方を担う)。
+    if narou_rs::progress::is_web_mode() {
+        logger::emit_stdout(&format!("{} {}", bold_colored("[ERROR]", "red"), message), true);
+    } else if std::env::var_os("NO_COLOR").is_some() {
+        logger::emit_stdout(&format!("[ERROR] {}", message), true);
+    } else {
+        logger::emit_stdout(&format!("\x1b[1;31m[ERROR]\x1b[0m {}", message), true);
+    }
 }
 
 fn cmd_log_inner(
@@ -116,7 +116,11 @@ impl TailReader {
         let mut buf = String::new();
         file.read_to_string(&mut buf).map_err(|e| e.to_string())?;
         print!("{}", buf);
-        println!();
+        // Ruby の `stream_io.puts file.read` と同じく、内容が改行で
+        // 終わっていないときだけ改行を補う。
+        if !buf.ends_with('\n') {
+            println!();
+        }
         Ok(())
     }
 

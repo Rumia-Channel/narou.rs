@@ -564,16 +564,8 @@ fn sort_update_ids_by_key(ids: &mut [i64], key: &str) {
 }
 
 fn is_novel_frozen(id: i64) -> bool {
-    if load_frozen_ids().contains(&id) {
-        return true;
-    }
-
-    narou_rs::native::novel_repository::NativeNovelRepository::new()
-        .get_sync(id.into())
-        .ok()
-        .flatten()
-        .map(|r| r.tags.iter().any(|tag| tag == "frozen"))
-        .unwrap_or(false)
+    // upstream の Narou.novel_frozen? と同じく freeze.yaml だけを見る。
+    load_frozen_ids().contains(&id)
 }
 
 fn load_frozen_ids() -> HashSet<i64> {
@@ -1212,7 +1204,7 @@ fn partition_novels_by_api_support(site_settings: &[SiteSetting]) -> (NarouApiTa
         let Ok(Some(r)) = novels.get_sync(id) else {
             continue;
         };
-        if frozen_ids.contains(&r.id) || r.tags.iter().any(|tag| tag == "frozen") {
+        if frozen_ids.contains(&r.id) {
             continue;
         }
         let setting = site_settings.iter().find(|s| s.matches_url(&r.toc_url));

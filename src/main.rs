@@ -8,7 +8,7 @@ mod logger;
 mod test_support;
 
 use std::any::Any;
-use std::io::{IsTerminal, Read};
+use std::io::IsTerminal;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -123,11 +123,39 @@ fn read_targets_from_stdin() -> Vec<String> {
         return Vec::new();
     }
 
+    // narou.rb CommandLine.run は STDIN.gets で 1 行だけ読み込んで引数に
+    // 連結する。残りの入力はコマンド側が読むか捨てられる。
     let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
+    if std::io::stdin().read_line(&mut input).is_err() {
         return Vec::new();
     }
     parse_stdin_targets(&input)
+}
+
+/// stdin を引数ではなくデータとして読む Rust 拡張コマンドを判定する。
+/// narou.rb には stdin をデータとして読むコマンドが無いが、`csv --import -`
+/// (web UI の CSV インポートが使う) と `login set` (cookie を stdin から読む)
+/// は 1 行目を引数として奪われると壊れるため除外する。
+fn stdin_is_command_data(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("login") => true,
+        Some("csv") => {
+            let mut expects_path = false;
+            for arg in args.iter().skip(1) {
+                if expects_path {
+                    return arg == "-";
+                }
+                match arg.as_str() {
+                    "-i" | "--import" => expects_path = true,
+                    "--import=-" | "-i-" => return true,
+                    "--" => return false,
+                    _ => {}
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 #[cfg(windows)]
@@ -199,6 +227,13 @@ async fn main() {
     if !args.is_empty() {
         cli::inject_default_args(&mut args);
         cli::inject_command_defaults(&mut args);
+    }
+
+    // narou.rb CommandLine.run はパイプ接続時に stdin から 1 行だけ読み込み、
+    // 全コマンドの引数の末尾に連結する。stdin をデータとして読む拡張コマンド
+    // (csv --import - / login) だけは除外する。
+    if !stdin_is_command_data(&args) {
+        args.extend(read_targets_from_stdin());
     }
 
     // 0.4.0 未満からのアップデート後の初回起動では、小説データの
@@ -402,7 +437,7 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             }
         },
         Commands::Convert {
-            mut targets,
+            targets,
             output,
             encoding,
             no_epub,
@@ -416,7 +451,6 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             verbose,
             no_open,
         } => {
-            targets.extend(read_targets_from_stdin());
             if targets.is_empty() {
                 eprintln!("Usage: narou convert <url|ncode|id>...");
                 1

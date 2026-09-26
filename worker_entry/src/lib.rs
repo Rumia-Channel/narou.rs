@@ -28,7 +28,7 @@ use webui::{json_error, query_param};
 
 use serde_json::json;
 use worker::*;
-use narou_rs::application::JobQueue as _JobQueueTrait;
+use narou_rs::application::{JobQueue as _JobQueueTrait, TagAction};
 
 use crate::composition::{WorkerRuntime, check_ready};
 
@@ -49,7 +49,10 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         "/api/novels" => api_novels(req, env).await,
         "/api/login" => api_login(req, env).await,
         "/api/sites" => api_sites(req, env).await,
-        "/api/login/set" => api_login_set(req, env).await,
+        // native は `POST /api/login/set` と `POST /api/login/add` を
+        // `login_set_or_add(append)` で振り分ける (login.rs と同じ)。
+        "/api/login/set" => api_login_set(req, env, false).await,
+        "/api/login/add" => api_login_set(req, env, true).await,
         "/api/jobs" => api_jobs(req, env).await,
         "/api/global_setting" => global_settings::api_global_setting(req, env).await,
         "/api/admin/object-migration" => api_object_migration(req, env).await,
@@ -107,7 +110,13 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         "/api/mail" => webui::native_only::handle(req, env).await,
         "/api/send" => webui::native_only::handle(req, env).await,
         "/api/storage/mode" => webui::native_only::handle(req, env).await,
+        "/api/get_queue_size" => webui::queue::handle(req, env).await,
+        "/api/devices" => webui::settings::handle(req, env).await,
+        "/widget/drag_and_drop" => webui::pages::handle(req, env).await,
+        "/_rebooting" => webui::pages::handle(req, env).await,
         "/ws" => websocket::handle(req, env).await,
+        _ if path.starts_with("/api/settings/") => webui::settings::handle(req, env).await,
+        _ if path.starts_with("/novels/") => webui::pages::handle(req, env).await,
         _ if path.starts_with("/api/novels/") => api_novel(req, env).await,
         _ if path.starts_with("/api/login/") => api_login_host(req, env).await,
         _ if path.starts_with("/api/sites/") => api_site(req, env).await,
@@ -175,29 +184,118 @@ async fn api_novels(req: Request, env: Env) -> Result<Response> {
 }
 
 async fn api_novel(req: Request, env: Env) -> Result<Response> {
-    if req.method() != Method::Get {
-        return Response::error("Method Not Allowed", 405);
-    }
+    // 認証は native と同じく全メソッドに掛ける (書き込み系も Bearer が要る)。
     if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
     let path = req.path();
     let rest = path.strip_prefix("/api/novels/").unwrap_or_default();
-    if let Some(id) = rest.strip_suffix("/download.epub") {
-        return match id.parse::<i64>() {
-            Ok(id) => api_novel_download_epub(req, env, id).await,
-            Err(_) => Response::error("Not Found", 404),
+    let method = req.method();
+
+    // native `POST|DELETE /api/novels/tag` (`batch_tag` / `batch_untag`) は
+    // `{id}` より先に解決される ("tag" は数値 id ではない)。
+    if rest == "tag" {
+        let remove = match method {
+            Method::Post => false,
+            Method::Delete => true,
+            _ => return Response::error("Method Not Allowed", 405),
         };
-    }
-    if let Some((id, name)) = rest.split_once("/illustrations/") {
-        return match id.parse::<i64>() {
-            Ok(id) => api_novel_illustration(req, env, id, name).await,
-            Err(_) => Response::error("Not Found", 404),
+        let services = match composition::build_services(&env).await {
+            Ok(services) => services,
+            Err(_) => return Response::error("Service unavailable", 503),
         };
+        return webui::novels::batch_tag(&services, req, remove).await;
     }
-    let Some(id) = rest.parse::<i64>().ok() else {
+
+    let Some((id_str, tail)) = rest.split_once('/') else {
+        // bare `{id}`: GET=1 件取得, DELETE=remove_novel。
+        let Ok(id) = rest.parse::<i64>() else {
+            return Response::error("Not Found", 404);
+        };
+        return match method {
+            Method::Get => api_novel_get(req, env, id).await,
+            Method::Delete => {
+                let services = match composition::build_services(&env).await {
+                    Ok(services) => services,
+                    Err(_) => return Response::error("Service unavailable", 503),
+                };
+                webui::novels::remove_novel(&services, id.into(), req).await
+            }
+            _ => Response::error("Method Not Allowed", 405),
+        };
+    };
+    let Ok(id) = id_str.parse::<i64>() else {
         return Response::error("Not Found", 404);
     };
+
+    // `{id}/…` のサブパス。native と同じくパスに対応するメソッド以外は 405、
+    // 未対応のサブパスは 404。
+    let known = matches!(
+        tail,
+        "download.epub" | "author_comments" | "freeze" | "unfreeze" | "tag" | "tags"
+    ) || tail == "tags/remove"
+        || tail.starts_with("illustrations/");
+    if !known {
+        return Response::error("Not Found", 404);
+    }
+    let services = match composition::build_services(&env).await {
+        Ok(services) => services,
+        Err(_) => return Response::error("Service unavailable", 503),
+    };
+    match tail {
+        "download.epub" => match method {
+            Method::Get | Method::Head => api_novel_download_epub(req, env, id).await,
+            _ => Response::error("Method Not Allowed", 405),
+        },
+        "author_comments" => match method {
+            Method::Get | Method::Head => {
+                webui::novels::author_comments(&services, id.into()).await
+            }
+            _ => Response::error("Method Not Allowed", 405),
+        },
+        "freeze" => match method {
+            Method::Post => webui::novels::freeze_novel(&services, id.into()).await,
+            _ => Response::error("Method Not Allowed", 405),
+        },
+        "unfreeze" => match method {
+            Method::Post => webui::novels::unfreeze_novel(&services, id.into()).await,
+            _ => Response::error("Method Not Allowed", 405),
+        },
+        "tag" => match method {
+            Method::Post => webui::novels::novel_tag(&services, id.into(), req, false).await,
+            Method::Delete => webui::novels::novel_tag(&services, id.into(), req, true).await,
+            _ => Response::error("Method Not Allowed", 405),
+        },
+        "tags" => match method {
+            Method::Post => {
+                webui::novels::novel_tags(&services, id.into(), req, TagAction::Add).await
+            }
+            Method::Put => {
+                webui::novels::novel_tags(&services, id.into(), req, TagAction::Replace).await
+            }
+            _ => Response::error("Method Not Allowed", 405),
+        },
+        "tags/remove" => match method {
+            Method::Post => {
+                webui::novels::novel_tags(&services, id.into(), req, TagAction::Remove).await
+            }
+            _ => Response::error("Method Not Allowed", 405),
+        },
+        _ => {
+            // illustrations/{name}
+            let name = tail.strip_prefix("illustrations/").unwrap_or_default();
+            match method {
+                Method::Get | Method::Head => {
+                    api_novel_illustration(req, env, id, name).await
+                }
+                _ => Response::error("Method Not Allowed", 405),
+            }
+        }
+    }
+}
+
+/// GET /api/novels/:id — 1 件取得 (native `get_novel`)。
+async fn api_novel_get(_req: Request, env: Env, id: i64) -> Result<Response> {
     let services = match composition::build_services(&env).await {
         Ok(services) => services,
         Err(_) => return Response::error("Service unavailable", 503),
@@ -559,14 +657,14 @@ async fn api_novel_illustration(req: Request, env: Env, id: i64, name: &str) -> 
 }
 
 /// GET /api/login — 保存済みログイン資格情報の一覧 (値は伏せる)。
-/// POST /api/login/set — 1 ホスト分を置き換える。
+/// DELETE /api/login — 全削除 (native `login_clear_all`)。
 async fn api_login(req: Request, env: Env) -> Result<Response> {
     if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
     match req.method() {
         Method::Get => {}
-        Method::Post => {}
+        Method::Delete => {}
         _ => return Response::error("Method Not Allowed", 405),
     }
     let runtime = match WorkerRuntime::build(&env).await {
@@ -576,8 +674,8 @@ async fn api_login(req: Request, env: Env) -> Result<Response> {
             return Response::error("Service Unavailable", 503);
         }
     };
-    if req.method() == Method::Post {
-        return crate::login::set(&runtime, req)
+    if req.method() == Method::Delete {
+        return crate::login::clear_all(&runtime)
             .await
             .map_err(|error| Error::RustError(error.to_string()));
     }
@@ -586,8 +684,9 @@ async fn api_login(req: Request, env: Env) -> Result<Response> {
         .map_err(|error| Error::RustError(error.to_string()))
 }
 
-/// POST /api/login/set — `{host, cookie, label?}` で 1 ホスト分を置き換える。
-async fn api_login_set(req: Request, env: Env) -> Result<Response> {
+/// POST /api/login/set | /api/login/add — `{host, cookie, label?}`。
+/// `append` が真なら既存の後ろに足す (native `login_set_or_add`)。
+async fn api_login_set(req: Request, env: Env, append: bool) -> Result<Response> {
     if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
@@ -601,12 +700,14 @@ async fn api_login_set(req: Request, env: Env) -> Result<Response> {
             return Response::error("Service Unavailable", 503);
         }
     };
-    crate::login::set(&runtime, req)
+    crate::login::set_or_add(&runtime, req, append)
         .await
         .map_err(|error| Error::RustError(error.to_string()))
 }
 
-/// DELETE /api/login/{host} — 1 ホスト分の資格情報を消す。
+/// DELETE /api/login/{host} — 1 ホスト分の資格情報を消す (native
+/// `login_clear_host`)。`/{host}/{index}` は 1 件だけ消す (native
+/// `login_clear_credential`)。
 async fn api_login_host(req: Request, env: Env) -> Result<Response> {
     if let Some(response) = auth_failure(&req, &env).await {
         return response;
@@ -614,10 +715,21 @@ async fn api_login_host(req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Delete {
         return Response::error("Method Not Allowed", 405);
     }
-    let Some(host) = req.path().strip_prefix("/api/login/").map(str::to_string) else {
+    let path = req.path();
+    let Some(rest) = path.strip_prefix("/api/login/") else {
         return Response::error("Not Found", 404);
     };
-    if host.is_empty() {
+    // `{host}` と `{host}/{index}` の 2 形だけがルート。3 段以上は 404。
+    let (host, index) = match rest.rsplit_once('/') {
+        Some((host, index)) => match index.parse::<usize>() {
+            Ok(index) => (host, Some(index)),
+            // 最後のセグメントが数値でない = `{host}/{index}` の形に
+            // 該当しない (axum の Path 抽出失敗 = 404 と同じ)。
+            Err(_) => return Response::error("Not Found", 404),
+        },
+        None => (rest, None),
+    };
+    if host.is_empty() || host.contains('/') {
         return Response::error("Not Found", 404);
     }
     let runtime = match WorkerRuntime::build(&env).await {
@@ -627,9 +739,14 @@ async fn api_login_host(req: Request, env: Env) -> Result<Response> {
             return Response::error("Service Unavailable", 503);
         }
     };
-    crate::login::clear(&runtime, &host)
-        .await
-        .map_err(|error| Error::RustError(error.to_string()))
+    match index {
+        Some(index) => crate::login::clear_credential(&runtime, host, index)
+            .await
+            .map_err(|error| Error::RustError(error.to_string())),
+        None => crate::login::clear_host(&runtime, host)
+            .await
+            .map_err(|error| Error::RustError(error.to_string())),
+    }
 }
 
 /// POST /api/jobs — plan a request, enqueue each discrete plan separately,

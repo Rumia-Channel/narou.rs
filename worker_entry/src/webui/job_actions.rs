@@ -566,7 +566,9 @@ fn normalize_update_targets(targets: &[String], max_targets: usize) -> Result<Ve
             i += 2;
             continue;
         }
-        normalized.push(validate_web_target_value(target)?);
+        normalized.push(
+            validate_web_target_value(target).map_err(|_| "invalid target".to_string())?,
+        );
         i += 1;
     }
     Ok(normalized)

@@ -643,8 +643,7 @@ fn confirm_first_web_boot(no_browser: bool, hide_console: bool) -> Result<bool, 
     let mut server_setting: HashMap<String, Value> = inventory
         .load("server_setting", InventoryScope::Global)
         .unwrap_or_default();
-    let is_first = !yaml_bool(server_setting.get("already-server-boot")).unwrap_or(false);
-    if !is_first {
+    if !is_first_web_boot(&server_setting) {
         return Ok(false);
     }
 
@@ -666,11 +665,31 @@ fn confirm_first_web_boot(no_browser: bool, hide_console: bool) -> Result<bool, 
         let _ = io::stdin().read_line(&mut buffer);
     }
 
-    server_setting.insert("already-server-boot".to_string(), Value::Bool(true));
+    mark_first_web_boot_done(&mut server_setting);
     inventory
         .save("server_setting", InventoryScope::Global, &server_setting)
         .map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+/// `server_setting` の `already-server-boot` を読む。
+///
+/// narou.rb は素の文字列キー `"already-server-boot"` を読み書きするが、YAML
+/// ファイルには Ruby シンボル由来の `:already-server-boot:` キーが紛れ込む
+/// ことがあるため、読みは両形式を見る。
+fn is_first_web_boot(server_setting: &HashMap<String, Value>) -> bool {
+    let value = server_setting
+        .get("already-server-boot")
+        .or_else(|| server_setting.get(":already-server-boot"));
+    !yaml_bool(value).unwrap_or(false)
+}
+
+/// `already-server-boot = true` を narou.rb と同じ素の文字列キーで書く
+/// (`narou.rb` は `setting["already-server-boot"]` を読む)。シンボルキー
+/// 由来の `:already-server-boot:` が残っていれば消して一本化する。
+fn mark_first_web_boot_done(server_setting: &mut HashMap<String, Value>) {
+    server_setting.remove(":already-server-boot");
+    server_setting.insert("already-server-boot".to_string(), Value::Bool(true));
 }
 
 fn find_available_web_port(host: &str) -> Result<u16, String> {
@@ -788,6 +807,37 @@ mod tests {
         require_basic_auth_for_external_bind_from_settings, requires_basic_auth_for_bind,
         reverse_proxy_mode_from_settings,
     };
+
+    #[test]
+    fn first_boot_reads_both_key_forms() {
+        // narou.rb は素の文字列キー、紛れ込んだ YAML にはシンボルキー由来の
+        // `:already-server-boot` もある。どちらも「起動済み」として読む。
+        let mut settings = HashMap::new();
+        assert!(super::is_first_web_boot(&settings));
+        settings.insert("already-server-boot".to_string(), Value::Bool(true));
+        assert!(!super::is_first_web_boot(&settings));
+
+        let mut symbol_only = HashMap::new();
+        symbol_only.insert(":already-server-boot".to_string(), Value::Bool(true));
+        assert!(!super::is_first_web_boot(&symbol_only));
+
+        let mut symbol_false = HashMap::new();
+        symbol_false.insert(":already-server-boot".to_string(), Value::Bool(false));
+        assert!(super::is_first_web_boot(&symbol_false));
+    }
+
+    #[test]
+    fn first_boot_write_uses_plain_key_and_drops_symbol_key() {
+        // 書き込みは narou.rb が読む素のキー一本に揃える。
+        let mut settings = HashMap::new();
+        settings.insert(":already-server-boot".to_string(), Value::Bool(false));
+        super::mark_first_web_boot_done(&mut settings);
+        assert_eq!(
+            settings.get("already-server-boot"),
+            Some(&Value::Bool(true))
+        );
+        assert!(!settings.contains_key(":already-server-boot"));
+    }
 
     #[test]
     fn normalize_bind_host_defaults_to_loopback() {

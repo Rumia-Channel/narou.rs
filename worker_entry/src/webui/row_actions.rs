@@ -101,15 +101,12 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     }
 }
 
-/// native `map_application_error` と同じステータス対応。応答本体は Worker
-/// 共通の `json_error` 形 (native は文字列ボディだが、クライアントは非 2xx
-/// をテキストとして読むのでメッセージ本文は native の文字列をそのまま乗せる)。
+/// native `map_application_error` と同じステータス対応 (`webui::mod` の共有実装)。
+/// 応答本体は Worker 共通の `json_error` 形 (native は文字列ボディだが、
+/// クライアントは非 2xx をテキストとして読むのでメッセージ本文は native の
+/// 文字列をそのまま乗せる)。
 fn application_error(error: &ApplicationError) -> (u16, &'static str, String) {
-    match error {
-        ApplicationError::InvalidRequest(message) => (400, "bad_request", message.clone()),
-        ApplicationError::NotFound(message) => (404, "not_found", message.clone()),
-        ApplicationError::Platform(message) => (500, "internal_error", message.clone()),
-    }
+    super::application_error(error)
 }
 
 /// native `ensure_no_missing`: 先頭の missing id を 404 にする。
@@ -165,7 +162,9 @@ async fn freeze_toggle(
     Response::from_json(&serde_json::json!({
         "success": result.store_failed.is_empty(),
         "message": "凍結状態を切り替えました",
-        "count": body.ids.len(),
+        // native `batch_freeze_toggle` はソート後の実在 id 件数を返す
+        // (リクエスト件数ではない — 存在しない id はソートで落ちる)。
+        "count": ids.len(),
     }))
 }
 

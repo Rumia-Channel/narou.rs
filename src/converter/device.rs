@@ -1401,7 +1401,7 @@ fn decode_ibunko_html_entities(text: &str) -> String {
     data
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "native-runtime"))]
 fn find_windows_volume_root(volume_name: &str) -> Option<PathBuf> {
     for letter in b'A'..=b'Z' {
         let drive = format!("{}:\\", letter as char);

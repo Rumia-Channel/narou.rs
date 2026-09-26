@@ -14,19 +14,23 @@
 //! the queue runtime, which redelivers / dead-letters the message.
 
 use std::time::Duration;
+
 use worker::console_log;
 
 use narou_rs::application::{
-    classify_failure, ExecutionPhase, JobFailureClass, JobId, JobPlan, JobTarget,
-    WorkerExecutionCheckpoint,
+    classify_failure, messages, ExecutionPhase, JobFailureClass, JobId, JobKind, JobPlan,
+    JobTarget, WorkerExecutionCheckpoint,
 };
 use narou_rs::downloader::{
     DownloadExecutionOptions, DownloadResult, Downloader, UpdateStatus,
 };
 use narou_rs::error::{NarouError, Result};
+use narou_rs::platform::{NovelId, NovelRepository};
 
-use crate::budget::{SubrequestBudget, WorkerBudget};
+use crate::budget::WorkerBudget;
+use crate::composition::WorkerRuntime;
 use crate::push_hub::{HubProgress, PushHubClient, PushHubSink, echo};
+
 
 /// Bounded wall-clock budget per job. It is checked only before starting the
 /// next section, so a section's fetch and persistence remain atomic from the
@@ -37,6 +41,12 @@ pub const JOB_TIME_BUDGET: Duration = Duration::from_secs(60 * 10);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobOutcome {
     Succeeded,
+    /// Terminal skip: the job was eligible but its target was disallowed
+    /// (frozen novel without `--force`). Ledgers as `Partial` because that
+    /// is the native shape — a single-target frozen job exits the child
+    /// process with mistook=1, which the web worker reports as partial
+    /// rather than failed.
+    Skipped { reason: String },
     /// Soft-budget checkpoint produced before the next section starts. The
     /// checkpoint is resumable because preceding sections are already
     /// persisted and the next section index is explicit.
@@ -98,13 +108,14 @@ fn resume_section_for_checkpoint(
 /// Execute one job and classify the outcome.
 ///
 /// `downloader` is owned by the caller for the duration of a queue batch —
+/// `runtime` supplies the platform capabilities the lifecycle hooks need
+/// (freeze check, post-update record writes, checkpointing ledger).
 pub async fn execute_job(
     downloader: &mut Downloader,
     job: &JobPlan,
     job_id: &JobId,
     checkpoint: Option<&WorkerExecutionCheckpoint>,
-    subrequests: &SubrequestBudget,
-    ledger: &std::sync::Arc<crate::ledger::D1JobLedger>,
+    runtime: &WorkerRuntime,
     execution_token: &str,
     push: &PushHubClient,
 ) -> JobOutcome {
@@ -127,6 +138,37 @@ pub async fn execute_job(
             Err(reason) => return JobOutcome::Permanent { reason },
         };
 
+    // 最後の防波堤: 投入側 (job_actions / スケジューラ) での除外が漏れても、
+    // `--force` 無しの Download/Update は凍結中の小説を触らない。
+    // native の `commands::{update,download}` の凍結拒否と同じ規則で、単発
+    // ジョブは native と同じ通知行を出して終了する。
+    if !force && matches!(job.kind, JobKind::Download | JobKind::Update) {
+        match resolve_novel_id(runtime.novels.as_ref(), &job.target).await {
+            Some(id) if runtime.services.novel_actions.is_frozen(id).await => {
+                let title = runtime
+                    .novels
+                    .get(id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|record| record.title)
+                    .unwrap_or_default();
+                let line = match job.kind {
+                    JobKind::Update => messages::update::frozen_id(id.0, title),
+                    _ => messages::download::frozen_abort(title),
+                };
+                console_log!("job {job_id} skipped: {line}");
+                push.broadcast_best_effort(&[echo(&line, "stdout")]).await;
+                // native の単発 frozen 経路は子プロセスを mistook=1 で終了
+                // させ、Web worker がそれを「部分完了」(queue_partial) として
+                // 記録するので、ここでも terminal の Partial に写す
+                // (queue_failed にはしない)。
+                return JobOutcome::Skipped { reason: line };
+            }
+            _ => {}
+        }
+    }
+
     // 進捗バーを PushHub 経由で UI へ (native の WebProgress 相当)。
     // topic は job kind、scope は job id — consumer が終端で同じ scope の
     // progressbar.clear を送って消す。
@@ -141,12 +183,13 @@ pub async fn execute_job(
     // (`PushHubSink::install` が既定 sink 登録まで担う — convert ジョブも同じ)。
     let push_sink = PushHubSink::install(push.clone());
     downloader.set_message_sink(push_sink.clone());
-    let mut budget = WorkerBudget::new(JOB_TIME_BUDGET, subrequests).with_checkpoints(
-        ledger.clone(),
-        job_id.clone(),
-        execution_token.to_string(),
-        novel_id,
-    );
+    let mut budget = WorkerBudget::new(JOB_TIME_BUDGET, &runtime.subrequests)
+        .with_checkpoints(
+            runtime.ledger.clone(),
+            job_id.clone(),
+            execution_token.to_string(),
+            novel_id,
+        );
     let result = downloader
         .download_novel_with_execution_options(
             &target,
@@ -167,7 +210,7 @@ pub async fn execute_job(
                 "stdout",
             )])
             .await;
-            let mut restart_budget = WorkerBudget::new(JOB_TIME_BUDGET, subrequests);
+            let mut restart_budget = WorkerBudget::new(JOB_TIME_BUDGET, &runtime.subrequests);
             downloader
                 .download_novel_with_execution_options(
                     &target,
@@ -191,29 +234,99 @@ pub async fn execute_job(
             JobOutcome::Partial {
                 reason: format!(
                     "section-boundary {limit} budget expired before section {next_section_index} ({} subrequests used)",
-                    subrequests.used()
+                    runtime.subrequests.used()
                 ),
                 checkpoint: WorkerExecutionCheckpoint::planned(job_id.clone(), novel_id)
                     .advance(ExecutionPhase::Fetching, Some(next_section_index as u64)),
             }
         }
-        result => classify_result(result, job),
+        result => classify_result(result, job, job_id, runtime).await,
     }
 }
 
-fn classify_result(result: Result<DownloadResult>, job: &JobPlan) -> JobOutcome {
+/// Resolve a job target to a stored novel id (native `get_data_by_target`
+/// parity for the freeze check): `Id` is direct, `Ncode`/`Url` resolve
+/// through the repository, `All` is unreachable (rejected by
+/// [`unsupported_reason`]). Resolution failures behave like native —
+/// "no record" means "not frozen", so the download proceeds and reports
+/// its own not-found outcome.
+pub(crate) async fn resolve_novel_id(novels: &dyn NovelRepository, target: &JobTarget) -> Option<NovelId> {
+    match target {
+        JobTarget::Id(id) => Some(*id),
+        JobTarget::Ncode(ncode) => novels
+            .find_by_ncode(ncode)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| NovelId(record.id)),
+        JobTarget::Url(url) => novels
+            .find_by_toc_url(url)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| NovelId(record.id)),
+        JobTarget::All => None,
+    }
+}
+
+async fn classify_result(
+    result: Result<DownloadResult>,
+    job: &JobPlan,
+    job_id: &JobId,
+    runtime: &WorkerRuntime,
+) -> JobOutcome {
     match result {
         Ok(result) => match result.status {
-            UpdateStatus::Ok | UpdateStatus::None => JobOutcome::Succeeded,
+            UpdateStatus::Ok | UpdateStatus::None => {
+                // native `commands::update` parity: a checked update —
+                // changed or not — clears `modified`, stamps
+                // `last_check_date`, and syncs the `end` tag.
+                if job.kind == JobKind::Update {
+                    if let Err(error) = runtime
+                        .services
+                        .novel_actions
+                        .record_update_check(
+                            NovelId(result.id),
+                            runtime.clock.now_utc(),
+                        )
+                        .await
+                    {
+                        console_log!(
+                            "job {job_id}: post-update bookkeeping failed for novel {}: {error}",
+                            result.id
+                        );
+                    }
+                }
+                JobOutcome::Succeeded
+            }
             UpdateStatus::Canceled => JobOutcome::Blocked {
                 reason: format!(
                     "job {} canceled: an interactive decision (auth/adult/digest) has no terminal on the worker",
                     job.kind.as_str()
                 ),
             },
-            UpdateStatus::Failed => JobOutcome::Permanent {
-                reason: "download failed: novel was not found or the update was refused".to_string(),
-            },
+            UpdateStatus::Failed => {
+                // The only `Failed` producer is the existing-novel TOC 404
+                // (the downloader already echoed "小説が削除されているか
+                // 非公開な可能性があります"). Native freezes the novel with
+                // `frozen` + `404` tags so daily auto-update stops retrying
+                // it — do the same through the shared service.
+                if let Err(error) = runtime
+                    .services
+                    .novel_actions
+                    .mark_not_found_and_freeze(NovelId(result.id))
+                    .await
+                {
+                    console_log!(
+                        "job {job_id}: auto-freeze after 404 failed for novel {}: {error}",
+                        result.id
+                    );
+                }
+                JobOutcome::Permanent {
+                    reason: "download failed: novel was not found or the update was refused"
+                        .to_string(),
+                }
+            }
         },
         Err(error) => match classify_failure(&error) {
             JobFailureClass::Retryable => JobOutcome::Retryable {
@@ -228,7 +341,6 @@ fn classify_result(result: Result<DownloadResult>, job: &JobPlan) -> JobOutcome 
         },
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::resume_section_for_checkpoint;

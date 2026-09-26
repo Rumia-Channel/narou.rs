@@ -62,8 +62,11 @@ impl LoginCredential {
     }
 
     /// Short form for the CLI and Web UI (the full id stays in storage).
+    ///
+    /// The id is imported data, so the prefix is cut at a *character* boundary:
+    /// slicing by byte length would panic on a non-ASCII id.
     pub fn short_id(&self) -> &str {
-        let end = self.id.len().min(8);
+        let end = self.id.char_indices().nth(8).map_or(self.id.len(), |(index, _)| index);
         &self.id[..end]
     }
 
@@ -303,11 +306,18 @@ pub fn cookie_host_for_url(url: &str) -> Option<String> {
 ///
 /// Ids are generated on platforms that have a random source; a platform
 /// without one (wasm) keeps whatever id came with the data, which the
-/// downloader tolerates (it falls back to the first entry).
+/// downloader tolerates (it falls back to the first entry). An id that is not
+/// ASCII is not something this program would have issued, so it is dropped
+/// back to empty and re-issued where possible — a stored value can carry one
+/// from a hand-edited file or an unchecked import.
 pub fn assign_credential_ids(stored: &mut BTreeMap<String, Vec<LoginCredential>>) -> bool {
     let mut changed = false;
     for credentials in stored.values_mut() {
         for credential in credentials.iter_mut() {
+            if !credential.id.is_empty() && !credential.id.is_ascii() {
+                credential.id.clear();
+                changed = true;
+            }
             if credential.id.is_empty()
                 && let Ok(id) = crate::login::new_credential_id()
             {
@@ -320,7 +330,9 @@ pub fn assign_credential_ids(stored: &mut BTreeMap<String, Vec<LoginCredential>>
 }
 
 /// Normalize a credential before it is stored: surrounding space is never
-/// meaningful in a `Cookie:` header, and an empty one is not a credential.
+/// meaningful in a `Cookie:` header, an empty one is not a credential, and a
+/// non-ASCII id is dropped so it can be re-issued instead of crashing the
+/// list displays that read `short_id()`.
 pub fn tidy_credentials(credentials: &[LoginCredential]) -> Vec<LoginCredential> {
     credentials
         .iter()
@@ -331,6 +343,9 @@ pub fn tidy_credentials(credentials: &[LoginCredential]) -> Vec<LoginCredential>
             }
             let mut credential = credential.clone();
             credential.cookie = cookie.to_string();
+            if !credential.id.is_ascii() {
+                credential.id.clear();
+            }
             if credential.id.is_empty()
                 && let Ok(id) = crate::login::new_credential_id()
             {
@@ -340,6 +355,7 @@ pub fn tidy_credentials(credentials: &[LoginCredential]) -> Vec<LoginCredential>
         })
         .collect()
 }
+
 
 /// 親ドメインも含めたキーから、そのホストで使える資格情報を組み立てる。
 pub fn merge_credentials_for(
@@ -421,6 +437,45 @@ pub fn credential_was_sent(credential: &str, sent: &[(String, String)]) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_id_counts_characters_and_never_panics() {
+        let credential = LoginCredential::new("example.com", "a=1").with_id("日本語のID");
+        assert_eq!(credential.short_id(), "日本語のID");
+        // 8 chars 超は文字境界で切る (旧実装は byte 境界で panic した)。
+        let long = LoginCredential::new("example.com", "a=1").with_id("あいうえおかきくけこ");
+        assert_eq!(long.short_id(), "あいうえおかきく");
+        assert_eq!(long.short_id().chars().count(), 8);
+    }
+
+    #[test]
+    fn assign_credential_ids_replaces_non_ascii_ids() {
+        let mut stored = BTreeMap::from([(
+            "example.com".to_string(),
+            vec![
+                LoginCredential::new("example.com", "a=1").with_id("日本語のID"),
+                LoginCredential::new("example.com", "b=2").with_id("ascii-id-1"),
+            ],
+        )]);
+        assert!(assign_credential_ids(&mut stored));
+        let credentials = &stored["example.com"];
+        assert!(credentials[0].id.is_ascii());
+        assert_eq!(credentials[1].id, "ascii-id-1");
+        // 以後は変更なし (冪等)。
+        assert!(!assign_credential_ids(&mut stored));
+    }
+
+    #[test]
+    fn tidy_credentials_drops_non_ascii_ids() {
+        let tidied = tidy_credentials(&[
+            LoginCredential::new("example.com", " a=1 ").with_id("日本語のID"),
+            LoginCredential::new("example.com", "b=2").with_id("keep-me"),
+        ]);
+        assert_eq!(tidied.len(), 2);
+        assert_eq!(tidied[0].cookie, "a=1");
+        assert!(tidied[0].id.is_ascii());
+        assert_eq!(tidied[1].id, "keep-me");
+    }
 
     #[test]
     fn lookup_hosts_walk_up_to_the_parent_domain() {

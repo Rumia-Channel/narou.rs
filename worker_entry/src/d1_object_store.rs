@@ -15,7 +15,7 @@ use std::sync::Arc;
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
     AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
-    ObjectStore, PlatformFuture, content_type_for_key,
+    ObjectStore, PlatformFuture, content_type_for_key, paginate_object_listing,
 };
 use serde::Deserialize;
 use worker::{D1Database, D1PreparedStatement, wasm_bindgen::JsValue};
@@ -322,22 +322,13 @@ impl ObjectStore for D1ObjectStore {
     ) -> PlatformFuture<'a, Result<ObjectListPage>> {
         Box::pin(async move {
             let rows = self.list_keys(request.prefix.as_ref()).await?;
-            let start = match &request.cursor {
-                Some(cursor) => rows
-                    .iter()
-                    .position(|(key, _)| key.as_str() > cursor.as_str())
-                    .unwrap_or(rows.len()),
-                None => 0,
-            };
-            let mut objects = Vec::new();
-            let mut next_cursor = None;
-            for (key, meta) in rows.into_iter().skip(start) {
-                if objects.len() >= request.limit.get() {
-                    next_cursor = Some(key);
-                    break;
-                }
-                objects.push(meta);
-            }
+            let (objects, next_cursor) = paginate_object_listing(
+                rows,
+                request.cursor.as_deref(),
+                request.limit.get(),
+                |(key, _)| key,
+            );
+            let objects = objects.into_iter().map(|(_, meta)| meta).collect();
             Ok(ObjectListPage {
                 objects,
                 next_cursor,

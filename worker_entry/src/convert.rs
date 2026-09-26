@@ -7,7 +7,7 @@
 use narou_rs::application::convert::{
     ConvertItemReport, ConvertService, ConvertedNovel, emit_convert_item_lines,
 };
-use narou_rs::application::jobs::{JobPlan, JobTarget};
+use narou_rs::application::jobs::{JobFailureClass, JobPlan, JobTarget, classify_failure};
 use narou_rs::converter::ConverterCapabilities;
 use narou_rs::downloader::http_policy::FetchPolicy;
 use narou_rs::error::{NarouError, Result};
@@ -95,15 +95,69 @@ async fn convert(
     .map(Some)
 }
 
+/// 変換失敗をジョブ結果へ写す。分類は download 経路と同じ共有実装
+/// (`application::jobs::classify_failure`) に寄せる — 変換で起きる
+/// `NarouError` のうち Platform/Io は D1・オブジェクトストアの一時障害を
+/// 含み得るためリトライ対象、NotFound/InvalidTarget/Conversion は恒久失敗。
 fn classify(error: NarouError) -> JobOutcome {
-    match &error {
-        NarouError::Platform(_) | NarouError::Conversion(_) | NarouError::Yaml(_) => {
-            JobOutcome::Permanent {
-                reason: error.to_string(),
-            }
-        }
-        _ => JobOutcome::Retryable {
+    match classify_failure(&error) {
+        JobFailureClass::Retryable => JobOutcome::Retryable {
             reason: error.to_string(),
         },
+        JobFailureClass::Permanent => JobOutcome::Permanent {
+            reason: error.to_string(),
+        },
+        JobFailureClass::Blocked => JobOutcome::Blocked {
+            reason: error.to_string(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify;
+    use crate::executor::JobOutcome;
+    use narou_rs::error::NarouError;
+
+    /// convert の失敗分類は共有 `classify_failure` と同じ結果を返す。
+    /// かつてのローカル分岐と差がある点を固定する:
+    /// - Platform (D1/オブジェクトストア障害を含む) はリトライ対象
+    /// - 欠落セクションの Io(NotFound) もリトライ → 再実行で本文があれば
+    ///   成功し得る (枯渇時は Permanent)
+    /// - NotFound / InvalidTarget / Conversion は恒久失敗
+    /// - Yaml は恒久的リトライではなく Blocked (設定/データ不整合)
+    #[test]
+    fn classify_matches_shared_failure_classes() {
+        let platform = classify(NarouError::Platform("D1 timeout".into()));
+        assert!(
+            matches!(platform, JobOutcome::Retryable { .. }),
+            "{platform:?}"
+        );
+
+        let missing_section = classify(NarouError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "section file not found: expected '2 x.yaml' in novels/site/title/本文",
+        )));
+        assert!(
+            matches!(missing_section, JobOutcome::Retryable { .. }),
+            "{missing_section:?}"
+        );
+
+        for error in [
+            NarouError::NotFound("gone".into()),
+            NarouError::InvalidTarget("bad".into()),
+            NarouError::Conversion("broken".into()),
+        ] {
+            let outcome = classify(error);
+            assert!(
+                matches!(outcome, JobOutcome::Permanent { .. }),
+                "{outcome:?}"
+            );
+        }
+
+        let yaml = classify(NarouError::Yaml(
+            serde_yaml::from_str::<serde_yaml::Value>("a: [").unwrap_err(),
+        ));
+        assert!(matches!(yaml, JobOutcome::Blocked { .. }), "{yaml:?}");
     }
 }

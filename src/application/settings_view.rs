@@ -329,12 +329,11 @@ fn yaml_to_json(value: Option<serde_yaml::Value>) -> serde_json::Value {
             }
             serde_yaml::Value::String(s) => serde_json::Value::String(s),
             serde_yaml::Value::Sequence(seq) => {
-                let arr: Vec<serde_json::Value> = seq
-                    .into_iter()
-                    .filter_map(|v| yaml_to_json(Some(v)).as_str().map(String::from))
-                    .map(serde_json::Value::String)
-                    .collect();
-                serde_json::Value::Array(arr)
+                // 各要素をそのまま JSON 化する。数値・bool・null を文字列以外と
+                // して捨てると設定画面で選択が消える (例: `[1, 2]` → `[]`)。
+                serde_json::Value::Array(
+                    seq.into_iter().map(|v| yaml_to_json(Some(v))).collect(),
+                )
             }
             _ => serde_json::Value::Null,
         },
@@ -344,6 +343,7 @@ fn yaml_to_json(value: Option<serde_yaml::Value>) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::setting_core::{apply_device_related_settings, coerce_json_setting_value};
     use std::collections::HashMap;
 
@@ -450,5 +450,17 @@ mod tests {
         );
         assert_eq!(sort_column_label_for_key("new_arrivals_date"), Some("新着日"));
         assert_eq!(sort_column_label_for_key("unknown-key"), None);
+    }
+
+    #[test]
+    fn yaml_to_json_keeps_non_string_sequence_elements() {
+        // シーケンス内の数値・bool・null を捨てると設定画面の選択が消える。
+        let yaml: serde_yaml::Value = serde_yaml::from_str("[kindle, 1, true, ~]").unwrap();
+        assert_eq!(
+            yaml_to_json(Some(yaml)),
+            serde_json::json!(["kindle", 1, true, null])
+        );
+        let numbers: serde_yaml::Value = serde_yaml::from_str("[1, 2]").unwrap();
+        assert_eq!(yaml_to_json(Some(numbers)), serde_json::json!([1, 2]));
     }
 }

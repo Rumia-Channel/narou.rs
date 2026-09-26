@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use narou_rs::compat::confirm;
 use narou_rs::converter::ini::{IniData, IniValue};
 use narou_rs::converter::settings::NovelSettings;
-use narou_rs::db::inventory::Inventory;
+use narou_rs::db::inventory::{Inventory, InventoryScope};
 use narou_rs::db::novel_dir_for_record;
 use narou_rs::db::settings as settings_store;
 use narou_rs::setting_core::{
@@ -13,6 +13,7 @@ use narou_rs::setting_core::{
 use narou_rs::setting_info::{self, SettingVariables, VarInfo, VarType, default_arg_command_names};
 
 use super::download::{get_data_by_target, tagname_to_ids};
+use super::log;
 
 pub fn cmd_setting(args: &[String], list: bool, all: bool, burn: bool) {
     if let Err(e) = cmd_setting_inner(args, list, all, burn) {
@@ -59,7 +60,7 @@ fn cmd_setting_inner(
     for arg in args {
         let (name, value_str) = split_arg(arg);
         if name.is_empty() {
-            eprintln!("書式が間違っています。変数名=値 のように書いて下さい");
+            log::report_error("書式が間違っています。変数名=値 のように書いて下さい");
             error_count += 1;
             continue;
         }
@@ -77,7 +78,7 @@ fn cmd_setting_inner(
                     None => println!(),
                 }
             } else {
-                eprintln!("{} という変数は存在しません", name);
+                log::report_error(&format!("{} という変数は存在しません", name));
                 error_count += 1;
             }
             continue;
@@ -91,11 +92,11 @@ fn cmd_setting_inner(
                 if deleted {
                     println!("{} の設定を削除しました", name);
                 } else {
-                    eprintln!("{} という変数は存在しません", name);
+                    log::report_error(&format!("{} という変数は存在しません", name));
                     error_count += 1;
                 }
             } else {
-                eprintln!("{} という変数は設定出来ません", name);
+                log::report_error(&format!("{} という変数は設定出来ません", name));
                 error_count += 1;
             }
             continue;
@@ -121,7 +122,7 @@ fn cmd_setting_inner(
                     }
                 }
                 Err(msg) => {
-                    eprintln!("{}", msg);
+                    log::report_error(&msg);
                     error_count += 1;
                 }
             }
@@ -157,32 +158,30 @@ fn cast_value(name: &str, value_str: &str) -> Result<serde_yaml::Value, String> 
 }
 
 fn output_setting_list(inv: &Inventory) {
-    let local_settings: HashMap<String, serde_yaml::Value> =
-        settings_store::load_with_inventory(inv, Scope::Local).unwrap_or_default();
-    let global_settings: HashMap<String, serde_yaml::Value> =
-        settings_store::load_with_inventory(inv, Scope::Global).unwrap_or_default();
+    // Ruby の Inventory.load は YAML の記述順を保つので、
+    // --list の出力も格納順をそのまま出す（ソートしない）
+    let local_settings: serde_yaml::Mapping = inv
+        .load("local_setting", InventoryScope::Local)
+        .unwrap_or_default();
+    let global_settings: serde_yaml::Mapping = inv
+        .load("global_setting", InventoryScope::Global)
+        .unwrap_or_default();
 
-    println!("[Local Variables]");
-    let mut local_sorted: Vec<_> = local_settings.iter().collect();
-    local_sorted.sort_by_key(|(k, _)| *k);
-    for (name, value) in &local_sorted {
-        let display = format_yaml_value(value);
-        if display.contains(' ') {
-            println!("{}='{}'", name, display);
-        } else {
-            println!("{}={}", name, display);
-        }
-    }
-
-    println!("[Global Variables]");
-    let mut global_sorted: Vec<_> = global_settings.iter().collect();
-    global_sorted.sort_by_key(|(k, _)| *k);
-    for (name, value) in &global_sorted {
-        let display = format_yaml_value(value);
-        if display.contains(' ') {
-            println!("{}='{}'", name, display);
-        } else {
-            println!("{}={}", name, display);
+    for (header, settings) in [
+        ("[Local Variables]", &local_settings),
+        ("[Global Variables]", &global_settings),
+    ] {
+        println!("{}", header);
+        for (name, value) in settings {
+            let Some(name) = name.as_str() else {
+                continue;
+            };
+            let display = format_yaml_value(value);
+            if display.contains(' ') {
+                println!("{}='{}'", name, display);
+            } else {
+                println!("{}={}", name, display);
+            }
         }
     }
 }
@@ -202,14 +201,24 @@ fn sweep_dust_variable(
     deleted
 }
 
+/// narou.rb の `get_variable_list_strings(scope).gsub(/^ {4}/, "")` 相当。
+/// 文字列を作る段階では upstream と同じく各行4スペースで始め、
+/// 出力時に各行の先頭4スペースを取り除く（複数行 help の継続行も同じく処理）。
+fn strip_leading4(text: &str) -> String {
+    text.lines()
+        .map(|line| line.strip_prefix("    ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn print_variable_entry(name: &str, info: &VarInfo, newline_help: bool) {
     let type_desc = var_type_description(info.var_type);
-    if newline_help {
-        println!("    {:32} {}", name, type_desc);
-        println!("      {}", info.help);
+    let text = if newline_help {
+        format!("    {:<18} {} \n      {}", name, type_desc, info.help)
     } else {
-        println!("    {:32} {} {}", name, type_desc, info.help);
-    }
+        format!("    {:<18} {} {}", name, type_desc, info.help)
+    };
+    println!("{}", strip_leading4(&text));
 }
 
 fn display_variable_list(show_all: bool) {
@@ -229,10 +238,13 @@ fn display_variable_list(show_all: bool) {
         }
         for cmd in default_arg_command_names() {
             println!(
-                "    {:32} {} {} コマンドのデフォルトオプション",
-                format!("default_args.{}", cmd),
-                var_type_description(VarType::String),
-                cmd
+                "{}",
+                strip_leading4(&format!(
+                    "    {:<18} {} {} コマンドのデフォルトオプション",
+                    format!("default_args.{}", cmd),
+                    var_type_description(VarType::String),
+                    cmd
+                ))
             );
         }
     }
@@ -304,7 +316,7 @@ fn burn_default_settings(
     targets: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if targets.is_empty() {
-        eprintln!("対象小説を指定して下さい");
+        log::report_error("対象小説を指定して下さい");
         std::process::exit(127);
     }
 
@@ -324,7 +336,7 @@ fn burn_default_settings(
         let data = match get_data_by_target(&target) {
             Some(data) => data,
             None => {
-                eprintln!("{} は存在しません", target);
+                log::report_error(&format!("{} は存在しません", target));
                 continue;
             }
         };
@@ -333,7 +345,7 @@ fn burn_default_settings(
         {
             Ok(Some(r)) => r,
             _ => {
-                eprintln!("{} は存在しません", target);
+                log::report_error(&format!("{} は存在しません", target));
                 continue;
             }
         };

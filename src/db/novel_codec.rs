@@ -11,7 +11,7 @@
 //! wrong order is structurally impossible and a wrong name set is a loud
 //! error instead of silent column skew.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
@@ -120,6 +120,19 @@ pub enum NovelBind {
 /// Folded form used for `*_fold` columns and tag indexes.
 pub fn fold(value: &str) -> String {
     value.trim().to_lowercase()
+}
+
+/// Drop duplicate tags in place, preserving the order of first occurrence.
+///
+/// Registration paths can merge default tags with retained ones, so a record
+/// may carry the same name twice (`["favorite","end","favorite","end"]`).
+/// `novel_tags` enforces `UNIQUE (novel_id, tag)` and `tags_json`/`tags_fold`/
+/// `tags_sort` must agree with the indexed rows, so both storage drivers
+/// normalize `record.tags` through this before writing either
+/// representation.
+pub fn dedup_tags(tags: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    tags.retain(|tag| seen.insert(tag.clone()));
 }
 
 /// RFC 3339 with nanoseconds — the timestamp format every column stores.
@@ -767,5 +780,52 @@ mod tests {
             })
             .collect();
         assert!(record_from_columns(row, parse_extra_fields).is_err());
+    }
+
+    /// Mirrors the native `removed_novel_can_be_reregistered_with_duplicate_tags`
+    /// regression at the shared layer: both drivers normalize through
+    /// `dedup_tags` before encoding, so duplicate names reach neither
+    /// `novel_tags` (`UNIQUE (novel_id, tag)`) nor `tags_json`/`tags_fold`/
+    /// `tags_sort`.
+    #[test]
+    fn dedup_tags_drops_duplicates_keeping_first_occurrence_order() {
+        let mut tags = vec![
+            "favorite".to_string(),
+            "end".to_string(),
+            "favorite".to_string(),
+            "end".to_string(),
+        ];
+        dedup_tags(&mut tags);
+        assert_eq!(tags, vec!["favorite", "end"]);
+
+        // Exact-match semantics: case-folded twins are distinct tags.
+        let mut tags = vec!["Tag".to_string(), "tag".to_string(), "Tag".to_string()];
+        dedup_tags(&mut tags);
+        assert_eq!(tags, vec!["Tag", "tag"]);
+    }
+
+    #[test]
+    fn normalized_record_encodes_deduped_tag_binds() {
+        let mut record = sample_record();
+        record.tags = vec![
+            "favorite".to_string(),
+            "end".to_string(),
+            "favorite".to_string(),
+            "end".to_string(),
+        ];
+        dedup_tags(&mut record.tags);
+        let binds = novel_binds(&record).unwrap();
+        assert_eq!(
+            bind(&binds, "tags_json"),
+            &NovelBind::Text("[\"favorite\",\"end\"]".to_string())
+        );
+        assert_eq!(
+            bind(&binds, "tags_fold"),
+            &NovelBind::Text("favorite\nend".to_string())
+        );
+        assert_eq!(
+            bind(&binds, "tags_sort"),
+            &NovelBind::Text("favorite\u{1f}end".to_string())
+        );
     }
 }

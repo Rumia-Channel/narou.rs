@@ -185,12 +185,15 @@ pub fn default_current_sort_state() -> CurrentSortState {
 }
 
 /// `server_setting` マップから `current_sort` キーを取り出して正規化する。
+/// Ruby のシンボルキー由来の `:current_sort` も読む（内側の `:column`/`:dir`
+/// と同じ扱い — narou.rb/narou-mod が書く YAML にシンボルキー形式が混ざる）。
 pub fn current_sort_from_server_setting(
     server_setting: &serde_yaml::Value,
 ) -> Option<CurrentSortState> {
-    server_setting
-        .as_mapping()?
+    let mapping = server_setting.as_mapping()?;
+    mapping
         .get(serde_yaml::Value::String(CURRENT_SORT_KEY.to_string()))
+        .or_else(|| mapping.get(serde_yaml::Value::String(":current_sort".to_string())))
         .and_then(normalize_current_sort_value)
 }
 
@@ -583,6 +586,33 @@ mod tests {
         );
         let empty: serde_yaml::Value = serde_yaml::from_str("other: 1\n").unwrap();
         assert_eq!(current_sort_from_server_setting(&empty), None);
+    }
+
+    #[test]
+    fn current_sort_from_server_setting_reads_symbol_formed_key() {
+        // narou.rb/narou-mod が書く YAML にはシンボルキー (`:current_sort:`)
+        // が混ざる。内側の `:column`/`:dir` だけでなく外側キーも両形式で読む。
+        let setting: serde_yaml::Value =
+            serde_yaml::from_str(":current_sort:\n  :column: 4\n  :dir: :asc\n").unwrap();
+        assert_eq!(
+            current_sort_from_server_setting(&setting),
+            Some(CurrentSortState {
+                column: 4,
+                dir: "asc".to_string()
+            })
+        );
+        // 素のキーが優先される (両方あると stale な方を取らない)。
+        let mixed: serde_yaml::Value = serde_yaml::from_str(
+            ":current_sort:\n  column: 0\n  dir: asc\ncurrent_sort:\n  column: 5\n  dir: desc\n",
+        )
+        .unwrap();
+        assert_eq!(
+            current_sort_from_server_setting(&mixed),
+            Some(CurrentSortState {
+                column: 5,
+                dir: "desc".to_string()
+            })
+        );
     }
 
     // -- sort_records / sort_ids_from_records --------------------------------

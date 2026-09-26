@@ -257,14 +257,8 @@ fn reorder_credentials(
 /// `data` 部分だけを取り出す。値の伏せ方は `crate::login::status` と共有する
 /// (Cookie 本体は応答に含めない)。
 async fn status_data(runtime: &WorkerRuntime) -> serde_json::Value {
-    let Ok(mut response) = crate::login::status(runtime).await else {
-        return serde_json::Value::Null;
-    };
-    response
-        .json::<serde_json::Value>()
+    crate::login::status_payload(runtime)
         .await
-        .ok()
-        .and_then(|body| body.get("data").cloned())
         .unwrap_or(serde_json::Value::Null)
 }
 

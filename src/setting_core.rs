@@ -181,19 +181,17 @@ fn cast_value_for_type(
                 )),
             }
         }
-        VarType::Integer => value_str
-            .parse::<i64>()
-            .map(|i| serde_yaml::Value::Number(i.into()))
-            .map_err(|_| {
+        VarType::Integer => parse_ruby_integer(value_str)
+            .map(serde_yaml::Value::Number)
+            .ok_or_else(|| {
                 format!(
                     "値が {} ではありません",
                     var_type_description(VarType::Integer).trim_end()
                 )
             }),
-        VarType::Float => value_str
-            .parse::<f64>()
+        VarType::Float => parse_ruby_float(value_str)
             .map(|f| serde_yaml::Value::Number(serde_yaml::Number::from(f)))
-            .map_err(|_| {
+            .ok_or_else(|| {
                 format!(
                     "値が {} ではありません",
                     var_type_description(VarType::Float).trim_end()
@@ -221,6 +219,84 @@ fn cast_value_for_type(
             ))
         }
     }
+}
+
+/// Ruby の `Integer()` 相当のパース。前後の空白除去、符号、`0x`/`0o`/`0b`/`0d`
+/// プレフィックス、先頭 `0` の8進数、桁の間の `_` を受理する。
+fn parse_ruby_integer(value_str: &str) -> Option<serde_yaml::Number> {
+    let trimmed = value_str.trim();
+    let (negative, digits_str) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    let (radix, digits): (u32, &str) = if let Some(rest) = digits_str.strip_prefix("0x") {
+        (16, rest)
+    } else if let Some(rest) = digits_str.strip_prefix("0o") {
+        (8, rest)
+    } else if let Some(rest) = digits_str.strip_prefix("0b") {
+        (2, rest)
+    } else if let Some(rest) = digits_str.strip_prefix("0d") {
+        (10, rest)
+    } else if digits_str.len() > 1 && digits_str.starts_with('0') {
+        // Ruby の Integer() は先頭が 0 の数字列を8進数として解釈する
+        (8, &digits_str[1..])
+    } else {
+        (10, digits_str)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value: i128 = 0;
+    let mut prev_digit = false;
+    let mut chars = digits.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '_' {
+            // `_` は桁と桁の間だけ許可される
+            if !prev_digit || !chars.peek().is_some_and(|c| c.is_digit(radix)) {
+                return None;
+            }
+            continue;
+        }
+        let d = ch.to_digit(radix)? as i128;
+        value = value.checked_mul(radix as i128)?.checked_add(d)?;
+        prev_digit = true;
+    }
+    if !prev_digit {
+        return None;
+    }
+    let signed = if negative { -value } else { value };
+    if let Ok(v) = i64::try_from(signed) {
+        return Some(serde_yaml::Number::from(v));
+    }
+    if negative {
+        return None;
+    }
+    // YAML の整数は u64 まで表せるので、正の値は i64 を超えても受理する
+    u64::try_from(signed).ok().map(serde_yaml::Number::from)
+}
+
+/// Ruby の `Float()` 相当のパース。`Integer()` と同じく桁の間の `_` を許し、
+/// `NaN` / `Infinity` (大小無視) を受理する。`0x` などの基数指定は受理しない。
+fn parse_ruby_float(value_str: &str) -> Option<f64> {
+    let trimmed = value_str.trim();
+    // `_` は数字と数字の間だけ許可される
+    let mut cleaned = String::with_capacity(trimmed.len());
+    let mut prev_digit = false;
+    let mut chars = trimmed.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '_' {
+            if !prev_digit || !chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            continue;
+        }
+        prev_digit = ch.is_ascii_digit();
+        cleaned.push(ch);
+    }
+    if cleaned.is_empty() {
+        return None;
+    }
+    cleaned.parse::<f64>().ok()
 }
 
 fn coerce_value_for_type(
@@ -254,14 +330,13 @@ fn coerce_integer_value(value: &serde_json::Value) -> Result<serde_yaml::Value, 
     let number = match value {
         serde_json::Value::Number(raw) => raw
             .as_i64()
+            .map(serde_yaml::Number::from)
             .ok_or_else(|| "整数を指定して下さい".to_string())?,
-        serde_json::Value::String(raw) => raw
-            .trim()
-            .parse::<i64>()
-            .map_err(|_| "整数を指定して下さい".to_string())?,
+        serde_json::Value::String(raw) => parse_ruby_integer(raw)
+            .ok_or_else(|| "整数を指定して下さい".to_string())?,
         _ => return Err("整数を指定して下さい".to_string()),
     };
-    Ok(serde_yaml::Value::Number(serde_yaml::Number::from(number)))
+    Ok(serde_yaml::Value::Number(number))
 }
 
 fn coerce_float_value(value: &serde_json::Value) -> Result<serde_yaml::Value, String> {
@@ -269,10 +344,8 @@ fn coerce_float_value(value: &serde_json::Value) -> Result<serde_yaml::Value, St
         serde_json::Value::Number(raw) => raw
             .as_f64()
             .ok_or_else(|| "数値を指定して下さい".to_string())?,
-        serde_json::Value::String(raw) => raw
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| "数値を指定して下さい".to_string())?,
+        serde_json::Value::String(raw) => parse_ruby_float(raw)
+            .ok_or_else(|| "数値を指定して下さい".to_string())?,
         _ => return Err("数値を指定して下さい".to_string()),
     };
     Ok(serde_yaml::Value::Number(serde_yaml::Number::from(number)))

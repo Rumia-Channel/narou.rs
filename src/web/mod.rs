@@ -19,6 +19,7 @@ pub mod worker;
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     http::{HeaderMap, Method, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
@@ -49,6 +50,14 @@ pub(crate) async fn max_web_targets_per_request(state: &AppState) -> usize {
 }
 pub(crate) use crate::application::settings_view::MAX_WEB_TEXT_INPUT_BYTES;
 pub(crate) const MAX_WEB_CSV_IMPORT_BYTES: usize = 5 * 1024 * 1024;
+/// `/api/csv/import` が受け取る HTTP ボディ全体の上限。
+///
+/// `CsvImportBody { csv }` は JSON なので、5 MiB の CSV 本体に JSON の
+/// エスケープ (`\\n` 等で最大およそ 2 倍) とフレーム分の余裕を足す。
+/// これより小さいと axum 既定の 2 MiB 制限 (413 "length limit exceeded")
+/// が先に効き、アプリ側の「csv is too large」判定に到達しない。
+pub(crate) const MAX_WEB_CSV_IMPORT_BODY_BYTES: usize =
+    2 * MAX_WEB_CSV_IMPORT_BYTES + 4 * 1024;
 pub(crate) const MAX_WEB_LOG_COUNT: usize = 1000;
 pub(crate) const MAX_WEB_PAGE_LENGTH: u64 = 500;
 pub(crate) const MAX_WEB_SEARCH_BYTES: usize = 4096;
@@ -455,7 +464,7 @@ fn wildcard_host_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
             wildcard_host_match_bytes(&pattern[1..], text)
                 || (!text.is_empty() && wildcard_host_match_bytes(pattern, &text[1..]))
         }
-        b'?' => !text.is_empty() && wildcard_host_match_bytes(&pattern[1..], &text[1..]),
+        // `?` はグロブにしない。hostname に `?` は現れないのでリテラル一致のみ。
         c => {
             !text.is_empty() && c == text[0] && wildcard_host_match_bytes(&pattern[1..], &text[1..])
         }
@@ -472,6 +481,11 @@ pub fn is_safe_wildcard_pattern(pattern: &str) -> bool {
     }
     // Reject bare `*` — would match every domain
     if trimmed == "*" {
+        return false;
+    }
+    // `?` はサポートしない (hostname に `?` は存在しないため、グロブとして
+    // 働く余地を残さない)。
+    if trimmed.contains('?') {
         return false;
     }
     // Reject patterns containing `*` anywhere except as a leading subdomain wildcard.
@@ -620,7 +634,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/diff_show", get(jobs::api_diff_show))
         .route("/api/diff_restore", post(jobs::api_diff_restore))
         .route("/api/diff_merge", post(jobs::api_diff_merge))
-        .route("/api/csv/import", post(jobs::api_csv_import))
+        .route(
+            "/api/csv/import",
+            post(jobs::api_csv_import).layer(DefaultBodyLimit::max(
+                MAX_WEB_CSV_IMPORT_BODY_BYTES,
+            )),
+        )
         .route("/api/csv/download", get(jobs::api_csv_download))
         .route(
             "/api/validate_url_regexp_list",
@@ -762,11 +781,17 @@ mod tests {
     }
 
     fn test_artifact_dir(name: &str) -> std::path::PathBuf {
+        // 同名で呼ばれても衝突しないようカウンタで一意化する
+        // (host_allowed_* 系のテストが並行で同じディレクトリを消し合うと
+        // PersistentQueue::new が不安定になる)。
+        static COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::current_dir()
             .unwrap()
             .join("target")
             .join("test-artifacts")
-            .join(format!("web-mod-{name}-{}", std::process::id()));
+            .join(format!("web-mod-{name}-{}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -978,6 +1003,12 @@ mod tests {
         assert!(!is_safe_wildcard_pattern("example.com*"));
         // Embedded wildcard (`sub*.example.com`) must be rejected
         assert!(!is_safe_wildcard_pattern("sub*.example.com"));
+        // `?` is not a single-character wildcard: `?.example.com` and
+        // `?ocalhost` must not grant `a.example.com` / `localhost`.
+        assert!(!is_safe_wildcard_pattern("?.example.com"));
+        assert!(!is_safe_wildcard_pattern("?ocalhost"));
+        assert!(!wildcard_host_match("?.example.com", "a.example.com"));
+        assert!(!wildcard_host_match("?ocalhost", "localhost"));
         // Exact match still works
         assert!(is_safe_wildcard_pattern("localhost"));
         assert!(wildcard_host_match("localhost", "localhost"));
@@ -1031,9 +1062,92 @@ mod tests {
             "*.com".to_string(),       // too few labels after `*.`
             "example.com*".to_string(), // trailing wildcard
             "*".to_string(),            // bare wildcard
+            "?.example.com".to_string(), // `?` is not a wildcard
+            "?ocalhost".to_string(),
         ]);
         assert!(!host_allowed("foo.com", &state));
         assert!(!host_allowed("example.com", &state));
         assert!(!host_allowed("attacker.example.com", &state));
+        assert!(!host_allowed("a.example.com", &state));
+        assert!(!host_allowed("localhost", &state));
+    }
+
+    async fn post_json(
+        client: &reqwest::Client,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> reqwest::Response {
+        client
+            .post(url)
+            .header("authorization", "Basic dXNlcjpwYXNz")
+            .header("x-narou-internal-token", "control-token")
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(body).unwrap())
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn csv_import_body_limit_reaches_app_validation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut state = test_state();
+        state.port = port;
+        let app = super::create_router(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let import_url = format!("http://127.0.0.1:{port}/api/csv/import");
+
+        // axum 既定の 2 MiB を超える CSV でもアプリのハンドラまで届き、
+        // 413 の英語メッセージではなくアプリの JSON 応答が返る。
+        let csv = "a".repeat(2 * 1024 * 1024 + 512 * 1024);
+        let response =
+            post_json(&client, &import_url, &serde_json::json!({ "csv": csv })).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert!(body.get("success").is_some(), "unexpected body: {body}");
+
+        // アプリ側上限 (MAX_WEB_CSV_IMPORT_BYTES) 超過は
+        // アプリの「csv is too large」で拒否される。
+        let csv = "a".repeat(super::MAX_WEB_CSV_IMPORT_BYTES + 1);
+        let response =
+            post_json(&client, &import_url, &serde_json::json!({ "csv": csv })).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert_eq!(body["success"], false);
+        assert_eq!(body["message"], "csv is too large");
+
+        // ボディ全体の上限 (JSON エスケープ分の余裕込み) を超えたものは
+        // フレームワークが 413 で拒否する。
+        let csv = "a".repeat(super::MAX_WEB_CSV_IMPORT_BODY_BYTES);
+        let response =
+            post_json(&client, &import_url, &serde_json::json!({ "csv": csv })).await;
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 他ルートの既定 2 MiB は緩めない: 1 MiB 超の JSON は従来どおり
+        // アプリ側の検証で拒否され、2 MiB 超は 413 になる。
+        let notepad_url = format!("http://127.0.0.1:{port}/api/notepad/save");
+        let content = "a".repeat(1024 * 1024 + 1);
+        let response =
+            post_json(&client, &notepad_url, &serde_json::json!({ "content": content }))
+                .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert_eq!(body["success"], false);
+        assert_eq!(body["message"], "notepad content is too large");
+
+        let content = "a".repeat(2 * 1024 * 1024 + 1);
+        let response =
+            post_json(&client, &notepad_url, &serde_json::json!({ "content": content }))
+                .await;
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+
+        server.abort();
     }
 }

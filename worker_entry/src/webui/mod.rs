@@ -24,10 +24,13 @@ use crate::composition::WorkerRuntime;
 pub mod download;
 pub mod job_actions;
 pub mod library_backup;
-pub mod read_views;
 pub mod login_actions;
+pub mod novels;
+pub mod pages;
 pub mod queue_actions;
+pub mod read_views;
 pub mod row_actions;
+pub mod settings;
 pub mod tag_actions;
 pub mod native_only;
 pub mod list;
@@ -53,6 +56,27 @@ pub(crate) fn api_response(success: bool, message: impl Into<String>) -> serde_j
     .expect("ApiResponse serialization is infallible")
 }
 
+/// native `map_application_error` (`src/web/novels.rs` / `batch.rs` /
+/// `novel_settings.rs`) と同じステータス対応。
+pub(crate) fn application_error(
+    error: &narou_rs::application::ApplicationError,
+) -> (u16, &'static str, String) {
+    use narou_rs::application::ApplicationError;
+    match error {
+        ApplicationError::InvalidRequest(message) => (400, "bad_request", message.clone()),
+        ApplicationError::NotFound(message) => (404, "not_found", message.clone()),
+        ApplicationError::Platform(message) => (500, "internal_error", message.clone()),
+    }
+}
+
+/// `application_error` をそのまま `json_error` 応答へ変換する。
+pub(crate) fn application_error_response(
+    error: &narou_rs::application::ApplicationError,
+) -> worker::Result<Response> {
+    let (status, code, message) = application_error(error);
+    json_error(status, code, Some(&message))
+}
+
 /// URL のクエリパラメータを 1 件取り出す。
 pub(crate) fn query_param(url: &worker::Url, name: &str) -> Option<String> {
     url.query_pairs()
@@ -63,8 +87,16 @@ pub(crate) fn query_param(url: &worker::Url, name: &str) -> Option<String> {
 /// native `max_web_targets_per_request` (`src/web/mod.rs`) parity:
 /// `server-max-targets-per-request` 設定を読み、無い/不正なら既定上限を返す。
 pub(crate) async fn max_web_targets(runtime: &WorkerRuntime) -> usize {
-    runtime
-        .services
+    max_web_targets_for(&runtime.services).await
+}
+
+/// `max_web_targets` と同じ設定をフル `WorkerRuntime` 無しで読む版。
+/// `/api/novels/*` の読み書きハンドラは `build_services` (queue 等の
+/// バインディング不要) で組み立てるため、こちらを使う。
+pub(crate) async fn max_web_targets_for(
+    services: &narou_rs::application::AppServices,
+) -> usize {
+    services
         .settings
         .web_target_limit(MAX_WEB_TARGETS_PER_REQUEST)
         .await
@@ -75,8 +107,15 @@ pub(crate) async fn max_web_targets(runtime: &WorkerRuntime) -> usize {
 /// `current_sort` 行 (D1 `app_state`, `webui::ui_prefs` の保存先) がその値
 /// そのもの。
 pub(crate) async fn load_current_sort_state(runtime: &WorkerRuntime) -> CurrentSortState {
-    runtime
-        .services
+    load_current_sort_state_for(&runtime.services).await
+}
+
+/// `load_current_sort_state` と同じ設定をフル `WorkerRuntime` 無しで読む版
+/// (`max_web_targets_for` と同じ理由)。
+pub(crate) async fn load_current_sort_state_for(
+    services: &narou_rs::application::AppServices,
+) -> CurrentSortState {
+    services
         .settings
         .get_raw(SettingScope::Global, CURRENT_SORT_KEY)
         .await

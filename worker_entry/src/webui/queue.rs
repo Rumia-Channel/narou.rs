@@ -28,13 +28,14 @@ use worker::{Method, Request, Response, Result, console_log};
 
 use crate::composition::WorkerRuntime;
 
-/// Entry point; `lib.rs` routes `/api/tag_list`, `/api/queue/status` and
-/// `/api/get_pending_tasks` here.
+/// Entry point; `lib.rs` routes `/api/tag_list`, `/api/queue/status`,
+/// `/api/get_pending_tasks` and `/api/get_queue_size` here.
 pub async fn handle(req: Request, env: worker::Env) -> Result<Response> {
     match req.path().as_str() {
         "/api/tag_list" => tag_list(req, env).await,
         "/api/queue/status" => queue_status(req, env).await,
         "/api/get_pending_tasks" => get_pending_tasks(req, env).await,
+        "/api/get_queue_size" => get_queue_size(req, env).await,
         _ => Response::error("Not Found", 404),
     }
 }
@@ -369,4 +370,29 @@ async fn get_pending_tasks(req: Request, env: worker::Env) -> Result<Response> {
         "restorable_tasks_available": false,
         "restore_prompt_pending": false,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/get_queue_size (native: src/web/jobs.rs get_queue_size)
+// ---------------------------------------------------------------------------
+
+/// native `queue_lane_sizes`: `[default, secondary]` の
+/// (pending + running) 件数をそのまま 2 要素の配列で返す。
+async fn get_queue_size(req: Request, env: worker::Env) -> Result<Response> {
+    if let Some(response) = crate::auth_failure(&req, &env).await {
+        return response;
+    }
+    if req.method() != Method::Get {
+        return Response::error("Method Not Allowed", 405);
+    }
+    let _runtime = runtime_or_503!(env);
+    let rows = match select_active_rows(&env).await {
+        Ok(rows) => rows,
+        Err(_) => return json_error(500, "ledger_read_failed", None),
+    };
+    let mut lane_sizes = [0usize; 2];
+    for row in &rows {
+        lane_sizes[lane_index(&row.kind)] += 1;
+    }
+    Response::from_json(&json!([lane_sizes[0], lane_sizes[1]]))
 }

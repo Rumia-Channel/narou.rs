@@ -41,6 +41,9 @@ fn cmd_clean_inner(
         };
         if let Some(dir) = resolve_novel_dir(&target) {
             clean_novel_dir(&dir, remove)?;
+        } else {
+            // Ruby は直前に変換した小説が解決できない場合も error を出す。
+            log::report_error(&format!("{} は存在しません", target));
         }
         return Ok(());
     }

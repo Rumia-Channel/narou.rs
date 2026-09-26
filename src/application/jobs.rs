@@ -159,6 +159,149 @@ impl JobPlan {
     }
 }
 
+/// Extract the set of numeric novel IDs from a job target string.
+///
+/// Shared by the native queue (`crate::queue`) and the Worker ledger
+/// (`worker_jobs`) so both backends apply the same per-novel exclusion rule:
+/// a claim must not start while another job that touches the same novel is
+/// running. Native targets are tab-separated token lists (e.g.
+/// `"12\tkindle"`, `"--force\t12"`) while Worker ledger `target` values are
+/// canonical [`JobTarget::as_str`] strings; in both shapes only tokens that
+/// parse as `i64` count, so flag tokens, `tag:…` selectors and ncode/URL
+/// targets never trigger the lock. An empty result means the job is not
+/// tied to a specific novel id (e.g. `AutoUpdate` broadcasts).
+pub fn extract_novel_ids(target: &str) -> HashSet<i64> {
+    target
+        .split('\t')
+        .filter_map(|part| part.parse::<i64>().ok())
+        .collect()
+}
+
+/// Worker ledger (`worker_jobs` on D1) claim statements.
+///
+/// The claim UPDATEs are defined here — not inside the D1 adapter — so the
+/// host-side tests can execute the *same* SQL against rusqlite and pin the
+/// semantics that D1 cannot exercise locally: per-novel exclusion
+/// ([`extract_novel_ids`]) and the retry backoff hold (`resume_after`
+/// becomes `lease_until`, and a `retryable` row is not claimable until it
+/// elapses).
+///
+/// Conventions mirror `worker_entry/src/ledger.rs`: timestamps are
+/// canonical UTC RFC3339 strings so lexicographic comparison is sound, and
+/// novel ids are bound as canonical decimal `target` strings (worker
+/// targets are single normalized tokens, so an `i64` id and its decimal
+/// string are the same value — the same scope as the native
+/// `job_conflicts_with_running` check).
+pub mod worker_ledger {
+    use super::extract_novel_ids;
+    use std::collections::HashSet;
+
+    /// A fully-formed claim UPDATE: SQL text plus bind values in order.
+    /// Every bind is a `TEXT` string (RFC3339 timestamps, job id, canonical
+    /// target strings), matching the `BindValue::Text` usage in the D1
+    /// adapter.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ClaimStatement {
+        pub sql: String,
+        pub binds: Vec<String>,
+    }
+
+    /// Build the "fresh" claim: promote a `pending` row, or a `retryable`
+    /// row whose backoff hold (`lease_until`) has elapsed, to `running` —
+    /// but only when no *other* row covering the same novel id is running.
+    ///
+    /// - `now` / `lease_until` / `job_id`: canonical strings
+    /// - `execution_token`: the new claim token
+    /// - `target`: the candidate row's canonical target (for extraction)
+    ///
+    /// Bind order: `updated_at, lease_until, execution_token, job_id, now,
+    /// conflict target…`.
+    pub fn claim_fresh(
+        now: &str,
+        lease_until: &str,
+        execution_token: &str,
+        job_id: &str,
+        target: &str,
+    ) -> ClaimStatement {
+        let (clause, conflict) = conflict_clause(target);
+        let mut binds = vec![
+            now.to_string(),
+            lease_until.to_string(),
+            execution_token.to_string(),
+            job_id.to_string(),
+            now.to_string(),
+        ];
+        binds.extend(conflict);
+        ClaimStatement {
+            sql: format!(
+                "UPDATE worker_jobs \
+                 SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ? \
+                 WHERE job_id = ? \
+                   AND (status = 'pending' \
+                        OR (status = 'retryable' AND (lease_until IS NULL OR lease_until <= ?)))\
+                 {clause}"
+            ),
+            binds,
+        }
+    }
+
+    /// Build the lease-expired reclaim: take over a `running` row whose
+    /// lease elapsed (or was never written), under the same per-novel
+    /// exclusion as [`claim_fresh`].
+    ///
+    /// Bind order: `updated_at, lease_until, execution_token, job_id, now,
+    /// conflict target…`.
+    pub fn claim_reclaim(
+        now: &str,
+        lease_until: &str,
+        execution_token: &str,
+        job_id: &str,
+        target: &str,
+    ) -> ClaimStatement {
+        let (clause, conflict) = conflict_clause(target);
+        let mut binds = vec![
+            now.to_string(),
+            lease_until.to_string(),
+            execution_token.to_string(),
+            job_id.to_string(),
+            now.to_string(),
+        ];
+        binds.extend(conflict);
+        ClaimStatement {
+            sql: format!(
+                "UPDATE worker_jobs \
+                 SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ? \
+                 WHERE job_id = ? AND status = 'running' \
+                   AND (lease_until IS NULL OR lease_until <= ?)\
+                 {clause}"
+            ),
+            binds,
+        }
+    }
+
+    /// `AND NOT EXISTS …` clause plus the canonical target binds for the
+    /// candidate's novel ids, or an empty clause when the target carries no
+    /// numeric id. `other.job_id != worker_jobs.job_id` keeps the reclaim
+    /// statement from seeing its own still-`running` row as a conflict.
+    fn conflict_clause(target: &str) -> (String, Vec<String>) {
+        let novel_ids: HashSet<i64> = extract_novel_ids(target);
+        if novel_ids.is_empty() {
+            return (String::new(), Vec::new());
+        }
+        // Deterministic order keeps the generated SQL (and tests) stable.
+        let mut ids: Vec<i64> = novel_ids.into_iter().collect();
+        ids.sort_unstable();
+        let binds: Vec<String> = ids.iter().map(i64::to_string).collect();
+        let placeholders = binds.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let clause = format!(
+            " AND NOT EXISTS (SELECT 1 FROM worker_jobs AS other \
+             WHERE other.status = 'running' AND other.job_id != worker_jobs.job_id \
+               AND other.target IN ({placeholders}))"
+        );
+        (clause, binds)
+    }
+}
+
 /// The result of planning a request.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JobPlanResult {
@@ -548,10 +691,13 @@ pub fn validate_request_limits(request: &JobRequest) -> Option<String> {
         ));
     }
     for target in &request.targets {
-        if target.len() > job_limits::MAX_TARGET_CHARS {
+        // 定数名・doc・エラー文言が揃って「文字数」を指すので chars() で数える。
+        // バイト長は `envelope_bytes` が別途直列化後に検査する。
+        let chars = target.chars().count();
+        if chars > job_limits::MAX_TARGET_CHARS {
             return Some(format!(
                 "target too long: {} chars (max {})",
-                target.len(),
+                chars,
                 job_limits::MAX_TARGET_CHARS
             ));
         }
@@ -564,10 +710,11 @@ pub fn validate_request_limits(request: &JobRequest) -> Option<String> {
         ));
     }
     for option in &request.options {
-        if option.len() > job_limits::MAX_OPTION_CHARS {
+        let chars = option.chars().count();
+        if chars > job_limits::MAX_OPTION_CHARS {
             return Some(format!(
                 "option too long: {} chars (max {})",
-                option.len(),
+                chars,
                 job_limits::MAX_OPTION_CHARS
             ));
         }
@@ -873,11 +1020,18 @@ pub trait JobQueue: Send + Sync {
 
     /// Durably record one retryable attempt for the current execution token;
     /// returns the new attempt count. A stale token is an error.
+    ///
+    /// `resume_after` is the scheduled queue backoff for this attempt: the
+    /// ledger keeps the row unclaimable until then, so a redelivery that
+    /// arrives before the delay fires cannot short-circuit the backoff.
+    /// Passing `Duration::ZERO` (or an already-elapsed duration) makes the
+    /// row immediately claimable.
     fn record_attempt<'a>(
         &'a self,
         job_id: &'a JobId,
         execution_token: &'a str,
         error: &'a str,
+        resume_after: Duration,
     ) -> PlatformFuture<'a, crate::error::Result<u32>>;
 
     /// Durably record a terminal state for the current execution token.
@@ -1343,6 +1497,28 @@ mod tests {
         };
         assert!(validate_request_limits(&long_option).is_some());
 
+        // 上限は「文字数」: 日本語 90 文字 (=270 bytes) は受理、257 文字は拒否。
+        let multibyte_ok = JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["あ".repeat(job_limits::MAX_TARGET_CHARS)],
+            options: Vec::new(),
+        };
+        assert_eq!(validate_request_limits(&multibyte_ok), None);
+        let multibyte_ng = JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["あ".repeat(job_limits::MAX_TARGET_CHARS + 1)],
+            options: Vec::new(),
+        };
+        let reason = validate_request_limits(&multibyte_ng).unwrap();
+        assert_eq!(
+            reason,
+            format!(
+                "target too long: {} chars (max {})",
+                job_limits::MAX_TARGET_CHARS + 1,
+                job_limits::MAX_TARGET_CHARS
+            )
+        );
+
         // メッセージは id だけを運ぶ (計画は台帳側)。
         let envelope = WorkerJobEnvelope::v2(JobId("j1".into()));
         let size = envelope_bytes(&envelope).unwrap();
@@ -1427,5 +1603,175 @@ mod tests {
         assert!(final_page.done);
         assert_eq!(final_page.next_cursor, None);
         assert_eq!(seen, ids.iter().map(|id| id.0).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn extract_novel_ids_matches_native_token_rule() {
+        // Same rule the native queue applies (`crate::queue::extract_novel_ids`
+        // delegates here): only bare i64 tokens count.
+        assert!(extract_novel_ids("").is_empty());
+        assert!(extract_novel_ids("tag:modified").is_empty());
+        assert!(extract_novel_ids("*").is_empty());
+        assert!(extract_novel_ids("n1234ab").is_empty());
+        assert!(extract_novel_ids("https://example.com/n/1").is_empty());
+        assert_eq!(extract_novel_ids("12"), HashSet::from([12]));
+        assert_eq!(extract_novel_ids("12\tkindle"), HashSet::from([12]));
+        assert_eq!(extract_novel_ids("1\t2\t3"), HashSet::from([1, 2, 3]));
+        assert_eq!(extract_novel_ids("--force\t12\ttag:modified"), HashSet::from([12]));
+        assert_eq!(extract_novel_ids("12\t\t34\tabc\t1.5"), HashSet::from([12, 34]));
+        assert_eq!(extract_novel_ids("-7"), HashSet::from([-7]));
+    }
+
+    /// The ledger claim statements run verbatim against rusqlite: two
+    /// envelopes for the same novel must never both become `running`, a
+    /// `retryable` row inside its backoff hold is not claimable, and the
+    /// exclusion never blocks unrelated novels or non-novel targets.
+    #[cfg(feature = "native-runtime")]
+    mod claim_sql {
+        use super::super::worker_ledger::{claim_fresh, claim_reclaim};
+        use rusqlite::Connection;
+
+        fn db() -> Connection {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE worker_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    options TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    dedupe_key TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    lease_until TEXT,
+                    execution_token TEXT,
+                    checkpoint_json TEXT
+                ) STRICT;",
+            )
+            .unwrap();
+            conn
+        }
+
+        fn insert(conn: &Connection, job_id: &str, target: &str, status: &str, lease: Option<&str>) {
+            conn.execute(
+                "INSERT INTO worker_jobs (job_id, kind, target, status, dedupe_key, created_at, updated_at, lease_until)
+                 VALUES (?, 'update', ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?)",
+                rusqlite::params![job_id, target, status, format!("{status}:{job_id}"), lease],
+            )
+            .unwrap();
+        }
+
+        fn status_of(conn: &Connection, job_id: &str) -> String {
+            conn.query_row(
+                "SELECT status FROM worker_jobs WHERE job_id = ?",
+                [job_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+
+        const NOW: &str = "2026-01-01T00:10:00Z";
+        const LEASE: &str = "2026-01-01T00:25:00Z";
+
+        #[test]
+        fn same_novel_cannot_run_twice_across_kinds() {
+            let conn = db();
+            // A running update for novel 42 (as produced by `update:42:`).
+            insert(&conn, "j-upd", "42", "running", Some(LEASE));
+            // A pending convert (`convert:42:`) — a different dedupe key and
+            // kind, but the same novel.
+            insert(&conn, "j-conv", "42", "pending", None);
+            // An unrelated pending update for novel 99.
+            insert(&conn, "j-99", "99", "pending", None);
+
+            // The conflicting claim must not flip j-conv to running.
+            let stmt = claim_fresh(NOW, LEASE, "tok-b", "j-conv", "42");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0, "conflicting claim must not run");
+            assert_eq!(status_of(&conn, "j-conv"), "pending");
+
+            // The unrelated novel claims normally.
+            let stmt = claim_fresh(NOW, LEASE, "tok-c", "j-99", "99");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+            assert_eq!(status_of(&conn, "j-99"), "running");
+        }
+
+        #[test]
+        fn conflicting_reclaim_is_blocked_and_self_row_is_not_a_conflict() {
+            let conn = db();
+            // j-stale is running with an expired lease for novel 7.
+            insert(&conn, "j-stale", "7", "running", Some("2026-01-01T00:01:00Z"));
+            // Another running job holds novel 7? Impossible in practice —
+            // the exclusion made it so — but a *different* novel running
+            // must not block the reclaim.
+            insert(&conn, "j-other", "8", "running", Some(LEASE));
+
+            // Reclaiming j-stale must succeed (its own running row is not a
+            // self-conflict).
+            let stmt = claim_reclaim(NOW, LEASE, "tok-r", "j-stale", "7");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1, "expired lease is reclaimable");
+
+            // But a pending job for novel 8 is blocked by j-other.
+            insert(&conn, "j-blocked", "8", "pending", None);
+            let stmt = claim_fresh(NOW, LEASE, "tok-x", "j-blocked", "8");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0);
+        }
+
+        #[test]
+        fn backoff_hold_keeps_retryable_unclaimable_until_due() {
+            let conn = db();
+            // record_attempt wrote lease_until = now + backoff.
+            insert(&conn, "j-retry", "42", "retryable", Some("2026-01-01T00:11:00Z"));
+
+            // Before the hold elapses the row is not claimable even though
+            // no conflicting job runs.
+            let stmt = claim_fresh(NOW, LEASE, "tok-e", "j-retry", "42");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0, "backoff hold must block the claim");
+            assert_eq!(status_of(&conn, "j-retry"), "retryable");
+
+            // At/after the hold the same row claims normally.
+            let stmt = claim_fresh("2026-01-01T00:11:00Z", LEASE, "tok-f", "j-retry", "42");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+
+            // Legacy retryable rows without a hold remain claimable.
+            insert(&conn, "j-legacy", "55", "retryable", None);
+            let stmt = claim_fresh(NOW, LEASE, "tok-g", "j-legacy", "55");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+        }
+
+        #[test]
+        fn non_novel_targets_never_conflict() {
+            let conn = db();
+            insert(&conn, "j-nc", "n1234ab", "running", Some(LEASE));
+            insert(&conn, "j-nc2", "n1234ab", "pending", None);
+            // ncode targets carry no numeric id: native parity says no lock.
+            let stmt = claim_fresh(NOW, LEASE, "tok-h", "j-nc2", "n1234ab");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+        }
     }
 }

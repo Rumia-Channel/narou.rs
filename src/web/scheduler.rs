@@ -806,11 +806,15 @@ mod tests {
 
     #[test]
     fn auto_update_target_split_skips_frozen_records() {
-        let records = [sample_record(1, "https://example.com/1", &[]),
+        let records = [
+            sample_record(1, "https://example.com/1", &[]),
             sample_record(2, "https://example.com/2", &[]),
+            // タグだけでは凍結にならない (凍結判定は freeze.yaml のみ)。
             sample_record(3, "https://example.com/3", &["frozen"]),
             sample_record(4, "https://example.com/4", &[]),
-            sample_record(5, "https://example.com/5", &[])];
+            sample_record(5, "https://example.com/5", &[]),
+            sample_record(6, "https://example.com/6", &["frozen"]),
+        ];
         let modified_ids = BTreeSet::from([1, 3]);
         let frozen_ids = HashSet::from([4]);
 
@@ -819,7 +823,7 @@ mod tests {
                 record.id == 2
             });
 
-        assert_eq!(modified, vec!["1".to_string()]);
-        assert_eq!(other, vec!["5".to_string()]);
+        assert_eq!(modified, vec!["1".to_string(), "3".to_string()]);
+        assert_eq!(other, vec!["5".to_string(), "6".to_string()]);
     }
 }

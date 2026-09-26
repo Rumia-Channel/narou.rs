@@ -316,13 +316,12 @@ impl ProgressReporter for HubProgress {
         // native の WebProgress と同じく、バーにメッセージは出さない。
     }
 
-    fn finish_with_message(&self, msg: &str) {
-        // clear と完了行の echo を 1 POST にまとめる。clear は Drop でも
-        // 再送されないようフラグで抑止する (native は毎回送るが等価)。
-        if self.cleared.swap(true, Ordering::AcqRel) {
-            self.publish([echo(msg, "stdout")]);
-        } else {
-            self.publish([self.clear_event(), echo(msg, "stdout")]);
+    fn finish_with_message(&self, _msg: &str) {
+        // native の WebProgress と同じく完了メッセージ自体はコンソールへ出さず、
+        // `progressbar.clear` だけ送る。clear は Drop でも再送されないよう
+        // フラグで抑止する (native は毎回送るが等価)。
+        if !self.cleared.swap(true, Ordering::AcqRel) {
+            self.publish([self.clear_event()]);
         }
     }
 

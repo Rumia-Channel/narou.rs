@@ -148,7 +148,9 @@ impl ConvertService {
     /// 戻り値の `output` は native の出力ファイルパス相当 (表示名は末尾の
     /// `novel.txt`) で、コンソールの `{name} を出力しました` 行が使う。
     ///
-    /// 本文は目次順に、保存されているセクションだけを読む (未取得の話は飛ばす)。
+    /// 本文は目次順に全話読む。native `load_sections_from_dir` と同じく、
+    /// 目次にあるのに本文が無い話はエラーで止める (不完全な novel.txt を
+    /// 成功として書かない)。
     pub async fn convert_and_store(&self, record: &NovelRecord) -> Result<ConvertedNovel> {
         let keys = NovelObjectKeys::new(
             &record.sitename,
@@ -160,16 +162,25 @@ impl ConvertService {
             NarouError::Platform(format!("toc がありません: {}", keys.toc().as_ref()))
         })?;
 
-        let names = persistence.list_novel_object_names(&keys).await?;
-        let stored = PersistenceService::existing_section_indices(&names);
         let mut sections: Vec<SectionFile> = Vec::new();
         for subtitle in &toc.subtitles {
-            if !stored.contains(&subtitle.index) {
-                continue;
-            }
-            if let Some(section) = persistence.load_section(&keys, subtitle).await? {
-                sections.push(section);
-            }
+            let section_key = keys.section(&subtitle.index, &subtitle.file_subtitle);
+            let Some(section) = persistence.load_section(&keys, subtitle).await? else {
+                // native の `section file not found: expected '{index}
+                // {file_subtitle}.yaml' in {section_dir}` に対応する。
+                // ObjectStore では見たキー自体が「期待した場所」なので、
+                // ファイル名相当部分は実際に探したキーの末尾を出す。
+                let key: &str = section_key.as_ref();
+                let filename = key.rsplit('/').next().unwrap_or(key);
+                return Err(NarouError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "section file not found: expected '{filename}' in {}/本文",
+                        keys.prefix().as_ref()
+                    ),
+                )));
+            };
+            sections.push(section);
         }
         if sections.is_empty() {
             return Err(NarouError::Platform(format!(
@@ -362,6 +373,91 @@ mod tests {
         let mut missing = record(8);
         missing.file_title = "missing".to_string();
         assert!(block_on(service.convert_and_store(&missing)).is_err());
+    }
+
+    /// 目次にあるのに本文オブジェクトが無い話を含む小説は失敗する。
+    /// native `load_sections_from_dir` の `section file not found` と同じく、
+    /// 不完全な `novel.txt` を成功として書き出さない。
+    #[test]
+    fn fails_when_a_toc_section_body_is_missing() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let settings = Arc::new(crate::application::settings::MemorySettingsStore::new());
+        let service = ConvertService::new(store.clone(), store.clone(), settings);
+        let target = record(9);
+        let keys = NovelObjectKeys::new(&target.sitename, &target.file_title, false).unwrap();
+
+        let subtitle = |index: &str| SubtitleInfo {
+            index: index.to_string(),
+            href: format!("https://example.com/novel/9/{index}"),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: format!("第{index}話"),
+            file_subtitle: format!("第{index}話"),
+            subdate: "2026-09-26 00:00:00".to_string(),
+            subupdate: None,
+            download_time: None,
+        };
+        let first = subtitle("1");
+        let missing = subtitle("2");
+        let toc = TocFile {
+            title: target.title.clone(),
+            author: target.author.clone(),
+            toc_url: target.toc_url.clone(),
+            story: Some("あらすじ".to_string()),
+            subtitles: vec![first.clone(), missing.clone()],
+            novel_type: Some(1),
+        };
+        let section = SectionFile {
+            index: first.index.clone(),
+            href: first.href.clone(),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: first.subtitle.clone(),
+            file_subtitle: first.file_subtitle.clone(),
+            subdate: first.subdate.clone(),
+            subupdate: None,
+            download_time: None,
+            element: SectionElement {
+                data_type: "text".to_string(),
+                introduction: String::new(),
+                postscript: String::new(),
+                body: "　一話だけ本文がある。".to_string(),
+            },
+        };
+
+        block_on(async {
+            store
+                .write_small(&keys.toc(), serialize_toc(&toc).unwrap().into_bytes())
+                .await
+                .unwrap();
+            // 2 話ある目次に対し本文は 1 話分だけしか保存しない。
+            store
+                .write_small(
+                    &keys.section(&first.index, &first.file_subtitle),
+                    serialize_section(&section).unwrap().into_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let error = service.convert_and_store(&target).await.unwrap_err();
+            let message = error.to_string();
+            let expected = format!("{} {}.yaml", missing.index, missing.file_subtitle);
+            assert!(
+                message.contains("section file not found"),
+                "expected native-style missing-section error, got: {message}"
+            );
+            assert!(
+                message.contains(&expected),
+                "error should name the expected section file '{expected}', got: {message}"
+            );
+            assert!(
+                store
+                    .read_small(&keys.converted_text())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
     }
 
     /// `emit_convert_item_lines` が native `narou convert <id>` と同じ行を

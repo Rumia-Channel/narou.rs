@@ -446,52 +446,39 @@ fn current_lock_timestamp() -> serde_yaml::Value {
 }
 
 pub fn record_is_frozen(record: &crate::db::NovelRecord, frozen_ids: &HashSet<i64>) -> bool {
-    frozen_ids.contains(&record.id) || record.tags.iter().any(|tag| tag == "frozen")
+    // upstream の Narou.novel_frozen? は freeze inventory だけを見る。
+    // `frozen` という名前のタグは upstream では意味を持たない。
+    frozen_ids.contains(&record.id)
 }
 
 pub fn is_frozen_id(id: i64) -> bool {
-    let frozen_ids = load_frozen_ids().unwrap_or_default();
-    if frozen_ids.contains(&id) {
-        return true;
-    }
-
-    crate::db::with_database(|db| {
-        Ok(db
-            .get(id)
-            .map(|record| record_is_frozen(record, &frozen_ids))
-            .unwrap_or(false))
-    })
-    .unwrap_or(false)
+    load_frozen_ids()
+        .map(|frozen_ids| frozen_ids.contains(&id))
+        .unwrap_or(false)
 }
 
 pub fn set_frozen_state(id: i64, frozen: bool) -> Result<()> {
-    crate::db::with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
+    crate::db::with_database(|db| {
+        if db.get(id).is_none() {
+            return Err(NarouError::NotFound(format!("ID: {}", id)));
+        }
 
         let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-        let _ = crate::db::inventory::update_locked_yaml_file::<
+        crate::db::inventory::update_locked_yaml_file::<
             (),
             HashMap<i64, serde_yaml::Value>,
             _,
         >(&freeze_path, |mut frozen_list| {
+            // upstream の Command::Freeze.execute! 相当: freeze.yaml だけを
+            // 更新し、レコードのタグには触れない。
             if frozen {
                 frozen_list.insert(id, serde_yaml::Value::Bool(true));
-                if !updated.tags.iter().any(|tag| tag == "frozen") {
-                    updated.tags.push("frozen".to_string());
-                }
             } else {
                 frozen_list.remove(&id);
-                updated.tags.retain(|tag| tag != "frozen" && tag != "404");
             }
-
-            db.insert(updated.clone());
             Ok((frozen_list, ()))
         })?;
-        db.save()
+        Ok(())
     })
 }
 
@@ -504,15 +491,14 @@ pub fn mark_not_found_and_freeze(id: i64) -> Result<()> {
         let mut updated = record;
 
         let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-        let _ = crate::db::inventory::update_locked_yaml_file::<
+        crate::db::inventory::update_locked_yaml_file::<
             (),
             HashMap<i64, serde_yaml::Value>,
             _,
         >(&freeze_path, |mut frozen_list| {
+            // upstream: `narou tag --add 404` + `narou freeze --on`。
+            // freeze 側は freeze.yaml だけを更新するので `frozen` タグは付けない。
             frozen_list.insert(id, serde_yaml::Value::Bool(true));
-            if !updated.tags.iter().any(|tag| tag == "frozen") {
-                updated.tags.push("frozen".to_string());
-            }
             if !updated.tags.iter().any(|tag| tag == "404") {
                 updated.tags.push("404".to_string());
             }
@@ -523,7 +509,6 @@ pub fn mark_not_found_and_freeze(id: i64) -> Result<()> {
         db.save()
     })
 }
-
 pub fn open_directory(path: &Path, confirm_message: Option<&str>) {
     if let Some(message) = confirm_message
         && !confirm(message, false, false) {
@@ -1107,12 +1092,14 @@ mod tests {
     }
 
     #[test]
-    fn record_is_frozen_checks_freeze_inventory_before_tags() {
+    fn record_is_frozen_uses_only_freeze_inventory() {
+        // upstream の Narou.novel_frozen? は freeze inventory だけを見る。
+        // `frozen` タグを手動で付けても凍結扱いにはならない。
         let mut frozen_ids = std::collections::HashSet::new();
         frozen_ids.insert(1);
 
         assert!(record_is_frozen(&sample_record(1, &[]), &frozen_ids));
-        assert!(record_is_frozen(
+        assert!(!record_is_frozen(
             &sample_record(2, &["frozen"]),
             &frozen_ids
         ));
@@ -1155,7 +1142,8 @@ mod tests {
 
         let record = crate::db::with_database(|db| Ok(db.get(7).cloned().unwrap())).unwrap();
         assert!(record.tags.contains(&"404".to_string()));
-        assert!(record.tags.contains(&"frozen".to_string()));
+        // upstream の freeze --on 相当なので `frozen` タグは付けない。
+        assert!(!record.tags.contains(&"frozen".to_string()));
 
         let inventory = Inventory::new(temp.path().to_path_buf());
         let frozen_ids = load_frozen_ids_from_inventory(&inventory).unwrap();

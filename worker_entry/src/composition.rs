@@ -57,7 +57,7 @@ pub struct WorkerRuntime {
     rate_limiter: Arc<dyn RateLimiter>,
     objects: Arc<dyn ObjectStore>,
     assets: Arc<dyn AssetStore>,
-    clock: Arc<dyn Clock>,
+    pub clock: Arc<dyn Clock>,
     site_settings: Vec<SiteSetting>,
     /// D1 ハンドル（資格情報ストアと設定スナップショットが使う）。
     db: Arc<D1Database>,
@@ -325,6 +325,23 @@ impl WorkerRuntime {
         let view = self.ledger.get(&queued.job_id).await?.ok_or_else(|| {
             narou_rs::error::NarouError::Platform("queued job disappeared".to_string())
         })?;
+        // 凍結小説の除外はここでも行う (native の update/download 拒否と
+        // 同じ規則、`--force` 指定時のみ通す)。キューへ流さず、代わりに
+        // 台帳行を `partial` で閉じて理由を残す — native の単発 mistook=1
+        // → queue_partial と同じ終端。bulk 呼び出し (`job_actions`) が
+        // `blocked` を致命的に扱うため、凍結スキップは `blocked` ではなく
+        // `sent: false` + 終端行として報告する。
+        if let Some(reason) = self.frozen_skip_reason(&plan).await? {
+            self.ledger
+                .settle_skipped(&queued.job_id, &reason)
+                .await?;
+            return Ok(DispatchOutcome {
+                job_id: queued.job_id.as_str().to_string(),
+                sent: false,
+                blocked: None,
+            });
+        }
+
         let unsupported = if !plan.kind.is_worker_executable() {
             Some(format!(
                 "unsupported job kind {:?} on the worker (no subprocess support)",
@@ -395,6 +412,52 @@ impl WorkerRuntime {
             blocked: None,
         })
     }
+
+
+    /// Frozen-target exclusion for the planning boundary: without `--force`,
+    /// a Download/Update plan whose target resolves to a frozen novel is
+    /// folded into a terminal `partial` row instead of entering the runnable
+    /// queue (native `commands::{update,download}` skip parity — a queued
+    /// job that must not run). The native notice text is recorded as
+    /// `last_error` so the queue row shows why it settled.
+    ///
+    /// Returns `None` when the plan is not frozen-skippable (force, other
+    /// kinds, unresolved/new targets — all proceed as before). The executor
+    /// keeps an identical check as the last line of defense for envelopes
+    /// that bypass `enqueue_plan` (legacy v1, direct ledger writes).
+    async fn frozen_skip_reason(&self, plan: &JobPlan) -> Result<Option<String>> {
+        use narou_rs::application::{JobKind, messages};
+        if !matches!(plan.kind, JobKind::Download | JobKind::Update) {
+            return Ok(None);
+        }
+        let force = plan
+            .options
+            .iter()
+            .any(|option| option == "--force" || option == "-f");
+        if force {
+            return Ok(None);
+        }
+        let Some(id) = crate::executor::resolve_novel_id(self.novels.as_ref(), &plan.target).await
+        else {
+            return Ok(None);
+        };
+        if !self.services.novel_actions.is_frozen(id).await {
+            return Ok(None);
+        }
+        let title = self
+            .novels
+            .get(id)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| record.title)
+            .unwrap_or_default();
+        Ok(Some(match plan.kind {
+            JobKind::Update => messages::update::frozen_id(id.0, title),
+            _ => messages::download::frozen_abort(title),
+        }))
+    }
+
 
     /// Dispatch a bounded page, attempting every plan before returning a
     /// partial failure. Failed sends remain active in the ledger for repair.

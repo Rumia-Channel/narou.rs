@@ -86,8 +86,8 @@ fn generate_csv() -> Result<String, String> {
         let Ok(Some(record)) = novels.get_sync(id.into()) else {
             continue;
         };
-        let is_frozen =
-            frozen.contains_key(&record.id) || record.tags.iter().any(|tag| tag == "frozen");
+        // upstream の csv.rb は Narou.novel_frozen? (freeze.yaml) だけを見る。
+        let is_frozen = frozen.contains_key(&record.id);
         let general_lastup = record
             .general_lastup
             .map(|date| date.timestamp().to_string())

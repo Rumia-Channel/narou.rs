@@ -15,6 +15,7 @@ use crate::platform::{
     AssetStore, CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, LoginCredential,
     NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, ObjectKey, ObjectListPage,
     ObjectListRequest, ObjectMetadata, ObjectStore, PlatformFuture, RateLimitScope, RateLimiter,
+    paginate_object_listing,
 };
 
 /// HTTP client backed by a caller-provided responder closure.
@@ -147,33 +148,25 @@ impl ObjectStore for MemoryObjectStore {
     ) -> PlatformFuture<'a, Result<ObjectListPage>> {
         Box::pin(async move {
             let objects = self.objects.lock();
-            let mut page = Vec::with_capacity(request.limit.get());
-            let mut started = request.cursor.is_none();
-            let mut next_cursor = None;
+            let mut items = Vec::new();
             for (key, data) in objects.iter() {
                 let object_key = ObjectKey::try_new(key.clone())?;
-                if !request.prefix.matches(&object_key) {
-                    continue;
+                if request.prefix.matches(&object_key) {
+                    items.push(ObjectMetadata {
+                        key: object_key,
+                        size: data.len() as u64,
+                        etag: None,
+                        content_type: None,
+                        last_modified: None,
+                    });
                 }
-                if !started {
-                    if request.cursor.as_deref().is_some_and(|cursor| key.as_str() > cursor) {
-                        started = true;
-                    } else {
-                        continue;
-                    }
-                }
-                if page.len() == request.limit.get() {
-                    next_cursor = page.last().map(|item: &ObjectMetadata| item.key.as_ref().to_string());
-                    break;
-                }
-                page.push(ObjectMetadata {
-                    key: object_key,
-                    size: data.len() as u64,
-                    etag: None,
-                    content_type: None,
-                    last_modified: None,
-                });
             }
+            let (page, next_cursor) = paginate_object_listing(
+                items,
+                request.cursor.as_deref(),
+                request.limit.get(),
+                |item| item.key.as_ref(),
+            );
             Ok(ObjectListPage {
                 objects: page,
                 next_cursor,

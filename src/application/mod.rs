@@ -42,7 +42,8 @@ pub use jobs::{
     JobLedgerStatus, JobPlan, JobPlanResult, JobQueue, JobRequest, JobService, JobTarget,
     LegacyEnvelopeOutcome, QueuedJob, QueuedJobView, SchedulerCheckpoint, UpdateScanPage,
     WorkerExecutionCheckpoint, WorkerJobEnvelope, WORKER_JOB_ENVELOPE_VERSION, classify_failure,
-    decode_legacy_envelope, envelope_bytes, job_limits, validate_request_limits,
+    decode_legacy_envelope, envelope_bytes, extract_novel_ids, job_limits, validate_request_limits,
+    worker_ledger,
 };
 pub use novel_actions::{
     FileDeletionStatus, FreezeMutationStore, FreezeRequest, FreezeResult,

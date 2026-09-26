@@ -283,7 +283,16 @@ pub fn active_for(narou_dir: &Path) -> Option<StateDb> {
             cache.insert(dir, handle.clone());
             Some(handle)
         }
-        Err(_) => None,
+        // SQLite was opted into (storage-backend marker) but the database
+        // could not be opened — keep the legacy-YAML fallback, but surface
+        // the cause instead of silently degrading.
+        Err(error) => {
+            eprintln!(
+                "warning: sqlite storage unavailable for {}: {error}; falling back to YAML file storage",
+                dir.display()
+            );
+            None
+        }
     }
 }
 

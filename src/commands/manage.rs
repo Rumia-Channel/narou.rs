@@ -860,18 +860,13 @@ pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
         };
         let id = data.id;
 
-        let result = db::with_database_mut(|db| {
-            let record = db
-                .get(id)
-                .cloned()
-                .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
-            let title = record.title.clone();
-            let mut updated = record;
-            let mut frozen_state = false;
-
+        // narou.rb の Command::Freeze は .narou/freeze.yaml だけを更新し、
+        // レコードのタグには触れない (凍結状態の判定は Narou.novel_frozen? =
+        // freeze.yaml で行う)。frozen/404 タグの付け替えはしない。
+        let result = db::with_database(|db| {
             let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-            let _ = narou_rs::db::inventory::update_locked_yaml_file::<
-                (),
+            let (_, should_freeze) = narou_rs::db::inventory::update_locked_yaml_file::<
+                bool,
                 std::collections::HashMap<i64, serde_yaml::Value>,
                 _,
             >(&freeze_path, |mut frozen_list| {
@@ -885,31 +880,19 @@ pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
                 };
 
                 if should_freeze {
-                    if !is_frozen {
-                        updated.tags.push("frozen".to_string());
-                    }
                     frozen_list.insert(id, serde_yaml::Value::Bool(true));
                 } else {
-                    if is_frozen {
-                        updated.tags.retain(|t| t != "frozen");
-                    }
-                    if updated.tags.contains(&"404".to_string()) {
-                        updated.tags.retain(|t| t != "404");
-                    }
                     frozen_list.remove(&id);
                 }
 
-                frozen_state = should_freeze;
-                db.insert(updated.clone());
-                Ok((frozen_list, ()))
+                Ok((frozen_list, should_freeze))
             })?;
-            db.save()?;
-            Ok::<(String, bool), narou_rs::error::NarouError>((title, frozen_state))
+            Ok::<bool, narou_rs::error::NarouError>(should_freeze)
         });
 
         match result {
-            Ok((title, true)) => println!("{} を凍結しました", title),
-            Ok((title, false)) => println!("{} の凍結を解除しました", title),
+            Ok(true) => println!("{} を凍結しました", data.title),
+            Ok(false) => println!("{} の凍結を解除しました", data.title),
             Err(e) => eprintln!("  Error: {}", e),
         }
     }
@@ -995,26 +978,19 @@ pub fn freeze_by_target(target: &str) {
     };
     let id = data.id;
 
-    let result = db::with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
+    // `narou download --freeze` は upstream では `Command::Freeze.execute!`
+    // を呼ぶだけなので、cmd_freeze と同様に freeze.yaml だけを更新する。
+    let result = db::with_database(|db| {
         let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-        let _ = narou_rs::db::inventory::update_locked_yaml_file::<
+        narou_rs::db::inventory::update_locked_yaml_file::<
             (),
             std::collections::HashMap<i64, serde_yaml::Value>,
             _,
         >(&freeze_path, |mut frozen_list| {
-            if !updated.tags.contains(&"frozen".to_string()) {
-                updated.tags.push("frozen".to_string());
-            }
             frozen_list.insert(id, serde_yaml::Value::Bool(true));
-            db.insert(updated.clone());
             Ok((frozen_list, ()))
         })?;
-        db.save()
+        Ok::<(), narou_rs::error::NarouError>(())
     });
 
     match result {

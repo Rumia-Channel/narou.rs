@@ -16,6 +16,8 @@
 //! A panic or a ledger failure propagates to the queue runtime (redelivery /
 //! DLQ); there is no `catch_unwind` and no silent acknowledgment.
 
+use std::time::Duration;
+
 use narou_rs::application::{
     JobKind,
     decode_legacy_envelope, JobClaim, JobId, JobLedgerStatus, JobPlan, JobQueue, JobRequest,
@@ -222,8 +224,7 @@ async fn process_discrete(
             job,
             &job_id,
             checkpoint.as_ref(),
-            &runtime.subrequests,
-            &runtime.ledger,
+            runtime,
             &execution_token,
             push,
         )
@@ -244,6 +245,29 @@ async fn process_discrete(
                 push,
                 &job_id,
                 &[event("queue_complete", json!(job_id.as_str()))],
+            )
+            .await;
+            message.ack();
+        }
+        JobOutcome::Skipped { reason } => {
+            // native の単発 frozen 経路 (子プロセス mistook=1 → queue_partial)
+            // と同じ終端: 実行結果は既に echo 済み、台帳は Partial で閉じる。
+            runtime
+                .ledger
+                .mark_terminal(
+                    &job_id,
+                    &execution_token,
+                    JobLedgerStatus::Partial,
+                    Some(&reason),
+                )
+                .await?;
+            broadcast_terminal_events(
+                push,
+                &job_id,
+                &[event(
+                    "queue_partial",
+                    json!({ "job_id": job_id.as_str(), "reason": reason }),
+                )],
             )
             .await;
             message.ack();
@@ -419,10 +443,6 @@ async fn settle_retryable(
     execution_token: &str,
     reason: &str,
 ) -> Result<RetryDisposition> {
-    let attempts = runtime
-        .ledger
-        .record_attempt(job_id, execution_token, reason)
-        .await?;
     // リトライ方針は native と同じ local 設定から組み立てる
     // (`queue.max-retries` / `queue.retry-backoff`)。読み取り失敗は既定値に
     // 倒す — native の設定読み取り失敗と同じ扱い。
@@ -439,11 +459,32 @@ async fn settle_retryable(
         values.first().and_then(Option::as_ref),
         values.get(1).and_then(Option::as_ref),
     );
-    // 台帳の `attempts` は失敗ごとに後置インクリメントされるので、今回の
-    // 失敗までに完了した再キュー数 (= native `retry_count`) は
-    // `attempts - 1`。native `retry_count < max_retries` と同じ上限判定。
-    let retry_count = attempts.saturating_sub(1);
-    if !policy.can_retry(retry_count) {
+    // 台帳の `attempts` は失敗ごとに後置インクリメントされる。今回の失敗
+    // までに完了した再キュー数 (= native `retry_count`) は記録前の
+    // `attempts` で、native `retry_count < max_retries` と同じ上限判定。
+    // 記録前に読むのは、今回の試行に対応するバックオフを record_attempt と
+    // 同時に lease_until へ書くため (バックオフ中の二重クレーム防止)。
+    let completed_retries = match runtime.ledger.get(job_id).await? {
+        Some(view) => view.attempts,
+        None => {
+            return Err(NarouError::Platform(format!(
+                "execution claim for job {job_id} is no longer valid"
+            )));
+        }
+    };
+    let rescheduled = policy.can_retry(completed_retries);
+    let resume_after = if rescheduled {
+        Duration::from_secs(
+            u64::try_from(policy.backoff_secs(completed_retries).max(0)).unwrap_or(0),
+        )
+    } else {
+        Duration::ZERO
+    };
+    let attempts = runtime
+        .ledger
+        .record_attempt(job_id, execution_token, reason, resume_after)
+        .await?;
+    if !rescheduled {
         let exhausted = format!("retries exhausted after {attempts} attempts: {reason}");
         runtime
             .ledger
@@ -457,7 +498,7 @@ async fn settle_retryable(
         console_log!("job {job_id} permanently failed: {exhausted}");
         Ok(RetryDisposition::Exhausted)
     } else {
-        let backoff_secs = policy.backoff_secs(retry_count);
+        let backoff_secs = policy.backoff_secs(completed_retries);
         console_log!(
             "job {job_id} retryable (attempt {attempts}), re-queueing in {backoff_secs}s: {reason}"
         );

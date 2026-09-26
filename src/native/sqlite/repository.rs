@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{params_from_iter, Connection, Row};
 
 use crate::db::NovelRecord;
-use crate::db::novel_codec::fold;
+use crate::db::novel_codec::{dedup_tags, fold};
 use crate::error::{NarouError, Result};
 use crate::native::sqlite::query::{
     build_where, select_sql, sort_direction, sort_expression, STATUS_SORT_EXPRESSION, UPSERT_SQL,
@@ -91,8 +91,7 @@ pub(crate) fn upsert_record_conn(conn: &Connection, record: &NovelRecord) -> Res
     // Normalize before encoding tags_json/tags_sort as well as novel_tags, so
     // the denormalized and indexed representations never disagree.
     let mut normalized = record.clone();
-    let mut seen = HashSet::new();
-    normalized.tags.retain(|tag| seen.insert(tag.clone()));
+    dedup_tags(&mut normalized.tags);
     let record = &normalized;
     let params = record_params(record)?;
     conn.execute(UPSERT_SQL, params_from_iter(params.iter()))

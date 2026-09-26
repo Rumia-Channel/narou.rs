@@ -41,6 +41,8 @@ fn cmd_browser_inner(targets: &[String], vote: bool) -> Result<(), String> {
         };
 
         open_browser(&url);
+        // Ruby は開いた URL を表示する (browser.rb: `puts open_url`)。
+        println!("{}", url);
     }
 
     Ok(())
@@ -60,17 +62,14 @@ fn resolve_target_urls(target: &str) -> Option<(String, PathBuf)> {
 
 fn build_vote_target_url(toc_url: &str, novel_dir: &Path) -> Option<String> {
     let toc = load_toc_file(novel_dir)?;
-    let latest_index = toc.subtitles.last()?.index.trim();
-    if latest_index.is_empty() {
-        return None;
-    }
+    let latest_index = &toc.subtitles.last()?.index;
     Some(build_vote_url(toc_url, latest_index))
 }
 
+/// Ruby は単純に `toc_url + latest_index + "/#my_novelpoint"` と連結する
+/// (末尾スラッシュの正規化はしない)。
 fn build_vote_url(toc_url: &str, latest_index: &str) -> String {
-    let mut base = toc_url.trim_end_matches('/').to_string();
-    base.push('/');
-    format!("{}{}/#my_novelpoint", base, latest_index)
+    format!("{}{}/#my_novelpoint", toc_url, latest_index)
 }
 
 #[cfg(test)]
@@ -79,13 +78,16 @@ mod tests {
 
     #[test]
     fn vote_url_appends_latest_index() {
+        // Ruby の単純連結をそのまま再現する。toc_url が `/` 終わりなら
+        // そのまま index が続き、無ければ二重スラッシュにはならない代わりに
+        // パスがそのまま連結される (upstream と同じ挙動)。
         assert_eq!(
             build_vote_url("https://example.com/novel/1/", "123"),
             "https://example.com/novel/1/123/#my_novelpoint"
         );
         assert_eq!(
             build_vote_url("https://example.com/novel/1", "123"),
-            "https://example.com/novel/1/123/#my_novelpoint"
+            "https://example.com/novel/1123/#my_novelpoint"
         );
     }
 }

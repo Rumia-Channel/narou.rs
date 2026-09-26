@@ -207,8 +207,16 @@ impl NovelRepository for D1NovelRepository {
             for mutation in mutations {
                 match mutation {
                     NovelMutation::Upsert(record) => {
+                        // Same contract as the native driver's
+                        // `upsert_record_conn`: registration paths can merge
+                        // default tags with retained ones, so normalize before
+                        // encoding — `novel_tags` is UNIQUE (novel_id, tag)
+                        // and tags_json must agree with the indexed rows.
+                        let mut normalized = record;
+                        novel_codec::dedup_tags(&mut normalized.tags);
+                        let record = &normalized;
                         let max_id = record.id.saturating_add(1);
-                        statements.push(self.prepare(UPSERT_SQL, record_binds(&record)?)?);
+                        statements.push(self.prepare(UPSERT_SQL, record_binds(record)?)?);
                         statements.push(self.prepare(
                             "DELETE FROM novel_tags WHERE novel_id = ?",
                             vec![BindValue::Int(record.id)],

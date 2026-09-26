@@ -31,6 +31,10 @@ pub const MAX_TAGS_PER_REQUEST: usize = 128;
 /// Maximum length of a single tag (mirrors the web layer).
 pub const MAX_TAG_LENGTH: usize = 255;
 
+/// The `modified` tag native `--gl` checks set and a successful update clears
+/// (`commands::update::MODIFIED_TAG` — kept identical by name and value so
+/// the Worker writes the same tag rows).
+const MODIFIED_TAG: &str = "modified";
 /// What to do with the requested tags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TagAction {
@@ -275,14 +279,15 @@ impl NovelActionService {
         })
     }
 
-    /// Freeze the given novels: add the `frozen` tag and persist the ids in
-    /// the freeze store.
+    /// Freeze the given novels: persist the ids in the freeze store.
+    /// Tags are not written (upstream `Freeze.execute!` parity — frozen
+    /// state lives in the store, not on the record).
     pub async fn freeze(&self, ids: &[NovelId]) -> Result<FreezeResult, ApplicationError> {
         self.set_frozen(ids, true).await
     }
 
-    /// Unfreeze the given novels: remove the `frozen` and legacy `404` tags
-    /// and drop the ids from the freeze store.
+    /// Unfreeze the given novels: drop the ids from the freeze store.
+    /// Tags are not touched (upstream parity).
     pub async fn unfreeze(&self, ids: &[NovelId]) -> Result<FreezeResult, ApplicationError> {
         self.set_frozen(ids, false).await
     }
@@ -380,6 +385,12 @@ impl NovelActionService {
         })
     }
 
+    /// Store-only freeze write, mirroring upstream `Command::Freeze.execute!`
+    /// and native `compat::set_frozen_state`: the freeze store (native
+    /// `freeze.yaml`, Worker `frozen_novels`) is the only state written;
+    /// record tags are left alone. `frozen`/`404` tags on older rows keep
+    /// meaning only on the *read* side (`record_is_frozen*` fallbacks), so
+    /// legacy tag-only freezes still render as frozen.
     async fn set_frozen(
         &self,
         ids: &[NovelId],
@@ -389,33 +400,24 @@ impl NovelActionService {
         let mut unfrozen_ids = Vec::new();
         let mut persisted_ids = Vec::new();
         let mut missing = Vec::new();
-        let mut mutations = Vec::new();
 
         for id in ids {
-            let Some(mut record) = self.novels.get(*id).await.map_err(ApplicationError::platform)?
-            else {
+            let exists = self
+                .novels
+                .get(*id)
+                .await
+                .map_err(ApplicationError::platform)?
+                .is_some();
+            if !exists {
                 missing.push(*id);
                 continue;
-            };
-            let was_frozen = record.tags.iter().any(|tag| tag == "frozen");
+            }
             if frozen {
-                if !was_frozen {
-                    record.tags.push("frozen".to_string());
-                }
                 frozen_ids.push(*id);
             } else {
-                record.tags.retain(|tag| tag != "frozen" && tag != "404");
                 unfrozen_ids.push(*id);
             }
             persisted_ids.push(*id);
-            mutations.push(NovelMutation::Upsert(record));
-        }
-
-        if !mutations.is_empty() {
-            self.novels
-                .apply_batch(mutations)
-                .await
-                .map_err(ApplicationError::platform)?;
         }
 
         let mut store_failed = Vec::new();
@@ -435,6 +437,112 @@ impl NovelActionService {
             missing,
             store_failed,
         })
+    }
+
+    /// `true` when `id` is frozen. The freeze store is authoritative
+    /// (upstream `Narou.novel_frozen?` reads `freeze.yaml` only); the
+    /// record's `frozen` tag is still honored as a read-side fallback for
+    /// legacy rows written when Worker freezes also stamped the tag.
+    ///
+    /// Read failures fall back to "not frozen": a store/listing hiccup must
+    /// never turn into a phantom freeze that skips work.
+    pub async fn is_frozen(&self, id: NovelId) -> bool {
+        if self
+            .freeze_store
+            .frozen_ids()
+            .await
+            .map(|ids| ids.contains(&id.0))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        self.novels
+            .get(id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.tags.iter().any(|tag| tag == "frozen"))
+    }
+
+    /// Register `id` as gone upstream (404): freeze it and tag the record
+    /// `404` — the worker parity of native `compat::mark_not_found_and_freeze`
+    /// (upstream `narou tag --add 404` + `narou freeze --on`; the `frozen`
+    /// tag is not written because freeze state lives in the store).
+    ///
+    /// Returns `Ok(false)` when the id has no record (nothing to freeze).
+    /// A freeze-store write failure surfaces as `Err` — callers treat it
+    /// best-effort like the native `let _ =` call site.
+    pub async fn mark_not_found_and_freeze(
+        &self,
+        id: NovelId,
+    ) -> Result<bool, ApplicationError> {
+        let Some(mut record) = self.novels.get(id).await.map_err(ApplicationError::platform)?
+        else {
+            return Ok(false);
+        };
+        if !record.tags.iter().any(|existing| existing == "404") {
+            record.tags.push("404".to_string());
+        }
+        self.novels
+            .apply_batch(vec![NovelMutation::Upsert(record)])
+            .await
+            .map_err(ApplicationError::platform)?;
+        self.freeze_mutations
+            .set_frozen(&[id], true)
+            .await
+            .map_err(ApplicationError::platform)?;
+        Ok(true)
+    }
+
+    /// Post-update bookkeeping that native `commands::update` runs after a
+    /// successful *or* unchanged `update` (its `remove_modified_tag` /
+    /// `update_last_check_date` / `sync_end_tag`, in that order):
+    ///
+    /// 1. drop the `modified` tag (the novel was just checked),
+    /// 2. stamp `last_check_date = now`,
+    /// 3. synchronize the `end` tag with the record's `end` flag.
+    ///
+    /// One repository read + one conditional write: the three native
+    /// helpers collapse into a single mutation because they only touch the
+    /// same record. `Ok(false)` when the id has no record. The caller picks
+    /// `now` so tests can pin the timestamp.
+    pub async fn record_update_check(
+        &self,
+        id: NovelId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, ApplicationError> {
+        let Some(mut record) = self.novels.get(id).await.map_err(ApplicationError::platform)?
+        else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        if record.tags.iter().any(|tag| tag == MODIFIED_TAG) {
+            record.tags.retain(|tag| tag != MODIFIED_TAG);
+            changed = true;
+        }
+        if record.last_check_date != Some(now) {
+            record.last_check_date = Some(now);
+            changed = true;
+        }
+        let has_end_tag = record.tags.iter().any(|tag| tag == "end");
+        match (record.end, has_end_tag) {
+            (true, false) => {
+                record.tags.push("end".to_string());
+                changed = true;
+            }
+            (false, true) => {
+                record.tags.retain(|tag| tag != "end");
+                changed = true;
+            }
+            _ => {}
+        }
+        if changed {
+            self.novels
+                .apply_batch(vec![NovelMutation::Upsert(record)])
+                .await
+                .map_err(ApplicationError::platform)?;
+        }
+        Ok(true)
     }
 }
 
@@ -607,22 +715,33 @@ mod tests {
         assert_eq!(result.missing, vec![NovelId(99)]);
     }
 
+    /// Upstream `Freeze.execute!` parity: freeze/unfreeze only touch the
+    /// freeze store — the record's tags are never written (a legacy `404`
+    /// tag survives both directions).
     #[test]
-    fn freeze_adds_tag_and_unfreeze_removes_frozen_and_404() {
+    fn freeze_writes_only_the_store_and_leaves_tags_alone() {
         let mut record = sample_record(1);
         record.tags = vec!["404".into()];
         let repo = Arc::new(MemoryNovelRepository::from_records(vec![record]));
-        let service = service(repo.clone(), None);
+        let freeze_mutations = Arc::new(MemoryFreezeMutationStore::new());
+        let service = NovelActionService::new(
+            repo.clone(),
+            Arc::new(crate::application::events::SystemFreezeStore),
+            freeze_mutations.clone(),
+            None,
+        );
 
         let result = futures::executor::block_on(service.freeze(&[NovelId(1)])).unwrap();
         assert_eq!(result.frozen, vec![NovelId(1)]);
+        assert_eq!(freeze_mutations.frozen_ids(), HashSet::from([1]));
         let record = futures::executor::block_on(repo.get(NovelId(1))).unwrap().unwrap();
-        assert_eq!(record.tags, vec!["404", "frozen"]);
+        assert_eq!(record.tags, vec!["404"]);
 
         let result = futures::executor::block_on(service.unfreeze(&[NovelId(1)])).unwrap();
         assert_eq!(result.unfrozen, vec![NovelId(1)]);
+        assert!(freeze_mutations.frozen_ids().is_empty());
         let record = futures::executor::block_on(repo.get(NovelId(1))).unwrap().unwrap();
-        assert!(record.tags.is_empty());
+        assert_eq!(record.tags, vec!["404"]);
     }
 
     #[test]
@@ -674,6 +793,103 @@ mod tests {
         }))
         .unwrap_err();
         assert!(matches!(err, ApplicationError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn mark_not_found_and_freeze_freezes_and_tags_404_only() {
+        let repo = Arc::new(MemoryNovelRepository::from_records(vec![sample_record(7)]));
+        let freeze_mutations = Arc::new(MemoryFreezeMutationStore::new());
+        let service = NovelActionService::new(
+            repo.clone(),
+            Arc::new(crate::application::events::SystemFreezeStore),
+            freeze_mutations.clone(),
+            None,
+        );
+
+        // Missing record → nothing to freeze (native NotFound parity).
+        let done = futures::executor::block_on(service.mark_not_found_and_freeze(NovelId(9)))
+            .unwrap();
+        assert!(!done);
+
+        let done = futures::executor::block_on(service.mark_not_found_and_freeze(NovelId(7)))
+            .unwrap();
+        assert!(done);
+        assert_eq!(freeze_mutations.frozen_ids(), HashSet::from([7]));
+        let record = futures::executor::block_on(repo.get(NovelId(7))).unwrap().unwrap();
+        // upstream `tag --add 404` + `freeze --on`: only the `404` tag is
+        // written; `frozen` belongs to the store, not the record.
+        assert_eq!(record.tags, vec!["404"]);
+
+        // Idempotent: a second 404 must not duplicate the tag.
+        futures::executor::block_on(service.mark_not_found_and_freeze(NovelId(7))).unwrap();
+        let record = futures::executor::block_on(repo.get(NovelId(7))).unwrap().unwrap();
+        assert_eq!(record.tags, vec!["404"]);
+    }
+
+    #[test]
+    fn record_update_check_clears_modified_stamps_date_and_syncs_end() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-27T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // modified + stale end tag + no last_check_date → all three fixed.
+        let mut record = sample_record(1);
+        record.tags = vec!["modified".into(), "end".into()];
+        record.end = false;
+        let repo = Arc::new(MemoryNovelRepository::from_records(vec![record]));
+        let actions = service(repo.clone(), None);
+        futures::executor::block_on(actions.record_update_check(NovelId(1), now)).unwrap();
+        let record = futures::executor::block_on(repo.get(NovelId(1))).unwrap().unwrap();
+        assert!(record.tags.is_empty(), "modified and stale end must go: {:?}", record.tags);
+        assert_eq!(record.last_check_date, Some(now));
+
+        // Finished novel without the tag gains `end`.
+        let record = { let mut r = sample_record(2); r.end = true; r };
+        let repo = Arc::new(MemoryNovelRepository::from_records(vec![record]));
+        let actions = service(repo.clone(), None);
+        futures::executor::block_on(actions.record_update_check(NovelId(2), now)).unwrap();
+        let record = futures::executor::block_on(repo.get(NovelId(2))).unwrap().unwrap();
+        assert_eq!(record.tags, vec!["end"]);
+
+        // Missing id is a clean no-op.
+        let repo = Arc::new(MemoryNovelRepository::new());
+        let actions = service(repo, None);
+        let done = futures::executor::block_on(actions.record_update_check(NovelId(5), now)).unwrap();
+        assert!(!done);
+    }
+
+    /// FreezeStore backed by an in-memory set for `is_frozen` tests.
+    struct TestFreezeStore(HashSet<i64>);
+
+    impl crate::application::events::FreezeStore for TestFreezeStore {
+        fn frozen_ids<'a>(
+            &'a self,
+        ) -> PlatformFuture<'a, crate::error::Result<HashSet<i64>>> {
+            Box::pin(async move { Ok(self.0.clone()) })
+        }
+    }
+
+    #[test]
+    fn is_frozen_reads_store_with_legacy_tag_fallback() {
+        let repo = Arc::new(MemoryNovelRepository::from_records(vec![
+            sample_record(1),
+            {
+                let mut r = sample_record(2);
+                r.tags = vec!["frozen".into()];
+                r
+            },
+        ]));
+        let actions = NovelActionService::new(
+            repo,
+            Arc::new(TestFreezeStore(HashSet::from([1]))),
+            Arc::new(MemoryFreezeMutationStore::new()),
+            None,
+        );
+        // Store membership wins.
+        assert!(futures::executor::block_on(actions.is_frozen(NovelId(1))));
+        // Legacy tag-only freeze is still honored on the read side.
+        assert!(futures::executor::block_on(actions.is_frozen(NovelId(2))));
+        assert!(!futures::executor::block_on(actions.is_frozen(NovelId(3))));
     }
 
     #[test]

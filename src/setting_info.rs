@@ -151,6 +151,10 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "color-parser"
         | "server-port"
         | "server-bind"
+        | "server-digest-auth.enable"
+        | "server-digest-auth.user"
+        | "server-digest-auth.password"
+        | "server-digest-auth.hashed-password"
         | "server-basic-auth.enable"
         | "server-basic-auth.user"
         | "server-basic-auth.password"
@@ -965,6 +969,28 @@ pub fn setting_variables() -> SettingVariables {
             invis(
                 VarType::String,
                 "WEBサーバのホスト制限(未設定時:起動PCのIP)。頻繁にローカルIPが変わってしまう場合は127.0.0.1の指定を推奨",
+            ),
+        ),
+        (
+            "server-digest-auth.enable",
+            invis(VarType::Boolean, "WEBサーバでDigest認証を使用するかどうか"),
+        ),
+        (
+            "server-digest-auth.user",
+            invis(VarType::String, "WEBサーバでDigest認証をするユーザ名"),
+        ),
+        (
+            "server-digest-auth.password",
+            invis(
+                VarType::String,
+                "WEBサーバのDigest認証のパスワード。hashed-passwordも設定した場合はそちらが優先される",
+            ),
+        ),
+        (
+            "server-digest-auth.hashed-password",
+            invis(
+                VarType::String,
+                "WEBサーバのDigest認証のパスワードを、Realmを\"narou.rb\"としてハッシュにしたもの。下記のようなコマンドで生成できる\n$ ruby -r 'digest/md5' -e 'puts Digest::MD5.hexdigest \"#{$*[0]}:narou.rb:#{$*[1]}\"' user password",
             ),
         ),
         (

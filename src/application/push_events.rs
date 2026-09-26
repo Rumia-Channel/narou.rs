@@ -215,6 +215,19 @@ pub fn queue_failed(job_id: &str, reason: &str, detail: Option<&str>) -> Value {
     event("queue_failed", data)
 }
 
+/// `library_backup.done` — native のライブラリバックアップ完了通知。
+/// `main.js` は `msg.data.path` を読むので `data` はオブジェクトで送る
+/// (`src/web/library_backup.rs` が emit、Worker 側に同等機能は無い)。
+pub fn library_backup_done(path: &str) -> Value {
+    event("library_backup.done", json!({ "path": path }))
+}
+
+/// `library_backup.failed` — 同失敗通知。`main.js` は `msg.data.message`
+/// を読む。
+pub fn library_backup_failed(message: &str) -> Value {
+    event("library_backup.failed", json!({ "message": message }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +260,26 @@ mod tests {
         assert_eq!(
             queue_start("job-1"),
             json!({ "type": "queue_start", "data": "job-1" })
+        );
+    }
+
+    #[test]
+    fn library_backup_events_carry_object_data() {
+        // main.js は `msg.data.path` / `msg.data.message` を読むので
+        // `data` は JSON 文字列ではなくオブジェクトでなければならない。
+        assert_eq!(
+            library_backup_done("C:\\backups\\narou-backup-1.zip"),
+            json!({
+                "type": "library_backup.done",
+                "data": { "path": "C:\\backups\\narou-backup-1.zip" }
+            })
+        );
+        assert_eq!(
+            library_backup_failed("disk full"),
+            json!({
+                "type": "library_backup.failed",
+                "data": { "message": "disk full" }
+            })
         );
     }
 

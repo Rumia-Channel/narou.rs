@@ -196,7 +196,10 @@ impl PushServer {
         }
         self.accepted_domains.iter().any(|pattern| {
             pattern == "*"
-                || wildcard_match(&pattern.to_ascii_lowercase(), &domain.to_ascii_lowercase())
+                || super::wildcard_host_match(
+                    &pattern.to_ascii_lowercase(),
+                    &domain.to_ascii_lowercase(),
+                )
         })
     }
 
@@ -671,24 +674,6 @@ fn origin_to_domain(origin: &str) -> String {
     host.split(':').next().unwrap_or(host).to_string()
 }
 
-fn wildcard_match(pattern: &str, text: &str) -> bool {
-    wildcard_match_bytes(pattern.as_bytes(), text.as_bytes())
-}
-
-fn wildcard_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
-    if pattern.is_empty() {
-        return text.is_empty();
-    }
-    match pattern[0] {
-        b'*' => {
-            wildcard_match_bytes(&pattern[1..], text)
-                || (!text.is_empty() && wildcard_match_bytes(pattern, &text[1..]))
-        }
-        b'?' => !text.is_empty() && wildcard_match_bytes(&pattern[1..], &text[1..]),
-        c => !text.is_empty() && c == text[0] && wildcard_match_bytes(&pattern[1..], &text[1..]),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,6 +685,10 @@ mod tests {
         assert!(server.accepts_origin("http://localhost:3000"));
         assert!(server.accepts_origin("https://api.example.com"));
         assert!(!server.accepts_origin("https://evil.test"));
+        // `?` is not a single-character wildcard: `?.example.com` must not
+        // grant `a.example.com`.
+        server.set_accepted_domains(["?.example.com"]);
+        assert!(!server.accepts_origin("https://a.example.com"));
     }
 
     #[test]

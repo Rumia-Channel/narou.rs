@@ -1329,10 +1329,10 @@ fn split_job_target(target: &str) -> Vec<&str> {
 /// or tag prefixes. An empty result means the job is not tied to any
 /// specific novel ID (e.g. `AutoUpdate` jobs that broadcast to the queue).
 pub fn extract_novel_ids(target: &str) -> HashSet<i64> {
-    target
-        .split('\t')
-        .filter_map(|part| part.parse::<i64>().ok())
-        .collect()
+    // Shared implementation lives with the job contract
+    // (`crate::application::jobs::extract_novel_ids`) so the Worker ledger
+    // applies the identical per-novel exclusion rule.
+    crate::application::jobs::extract_novel_ids(target)
 }
 
 fn flatten_values(values: &[Value]) -> Vec<String> {

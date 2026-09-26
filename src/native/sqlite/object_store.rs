@@ -294,23 +294,12 @@ impl SqliteObjectStore {
             }
         }
         let objects: Vec<ObjectMetadata> = merged.into_values().collect();
-        let start = request
-            .cursor
-            .as_deref()
-            .map(|cursor| {
-                objects
-                    .iter()
-                    .position(|item| item.key.as_ref() > cursor)
-                    .unwrap_or(objects.len())
-            })
-            .unwrap_or(0);
-        let end = (start + request.limit.get()).min(objects.len());
-        let page = objects[start.min(objects.len())..end].to_vec();
-        let next_cursor = if end < objects.len() {
-            page.last().map(|item| item.key.as_ref().to_string())
-        } else {
-            None
-        };
+        let (page, next_cursor) = crate::platform::paginate_object_listing(
+            objects,
+            request.cursor.as_deref(),
+            request.limit.get(),
+            |item| item.key.as_ref(),
+        );
         Ok(ObjectListPage {
             objects: page,
             next_cursor,

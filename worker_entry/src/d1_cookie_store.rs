@@ -149,6 +149,26 @@ impl D1CookieStore {
         let payload = self.load_payload().await?;
         narou_rs::platform::decode_stored_credentials(&payload, self.key.as_ref())
     }
+
+    /// 正規化したホスト名と完全に一致するエントリだけを消す
+    /// (native `InventoryCookieStore::remove`)。親ドメインのエントリ
+    /// (`.example.com` が `www.example.com` に効く形) は対象にしない。
+    /// 削除の有無を返す (無いときは書き込まない)。
+    pub async fn remove(&self, host: &str) -> Result<bool> {
+        let mut raw = self.load_raw().await?;
+        if raw.remove(&normalize_cookie_host(host)).is_none() {
+            return Ok(false);
+        }
+        self.save_raw(&raw).await?;
+        Ok(true)
+    }
+
+    /// すべてのホストの資格情報を消す (native `InventoryCookieStore::clear_all`)。
+    /// 復号不要 — 行ごと空のマップで上書きするので、壊れた値や鍵なしの
+    /// 状態でも確実に消える。
+    pub async fn clear_all(&self) -> Result<()> {
+        self.save_raw(&BTreeMap::new()).await
+    }
 }
 
 impl CookieStore for D1CookieStore {
@@ -165,13 +185,6 @@ impl CookieStore for D1CookieStore {
         credentials: &'a [LoginCredential],
     ) -> PlatformFuture<'a, Result<()>> {
         Box::pin(async move {
-            // 保存値は常に暗号化する (native と同じ形式)。鍵が無ければ
-            // 平文で書かずに失敗させる。
-            let Some(key) = self.key else {
-                return Err(NarouError::Platform(format!(
-                    "{LOGIN_KEY_SECRET} is required to store credentials"
-                )));
-            };
             let host = normalize_cookie_host(host);
             let mut raw = self.load_raw().await?;
             let cleaned: Vec<LoginCredential> =
@@ -183,8 +196,18 @@ impl CookieStore for D1CookieStore {
                     })
                     .collect();
             if cleaned.is_empty() {
+                // 空スライスはエントリ削除 (native `save_credentials_for`)。
+                // 書き込みが無いので復号鍵は要らない — `DELETE /api/login/*`
+                // の最終段でも `NAROU_RS_LOGIN_KEY` 無しで動く。
                 raw.remove(&host);
             } else {
+                // 保存値は常に暗号化する (native と同じ形式)。鍵が無ければ
+                // 平文で書かずに失敗させる。
+                let Some(key) = self.key else {
+                    return Err(NarouError::Platform(format!(
+                        "{LOGIN_KEY_SECRET} is required to store credentials"
+                    )));
+                };
                 let encoded = narou_rs::platform::encode_credentials(&cleaned)?;
                 raw.insert(
                     host.clone(),

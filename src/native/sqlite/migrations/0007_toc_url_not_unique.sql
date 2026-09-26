@@ -8,11 +8,19 @@
 -- semantics, which a non-unique index serves identically.
 --
 -- SQLite cannot drop a column constraint in place; the table is rebuilt.
--- PRAGMA foreign_keys is off inside this migration transaction so the
--- dependent tables (novel_tags, frozen_novels, novel_outputs,
--- novel_sections, novel_versions) keep their rows untouched.
-
-PRAGMA foreign_keys = OFF;
+--
+-- Foreign-key handling differs per backend:
+-- - D1 always enforces foreign keys, and `PRAGMA foreign_keys` is a no-op
+--   inside a transaction anyway (`PRAGMA defer_foreign_keys` only defers
+--   constraint *checks* — ON DELETE CASCADE still fires immediately). So
+--   the children that exist on both backends (novel_tags, frozen_novels)
+--   are copied to staging tables and emptied before the DROP, then restored
+--   afterwards.
+-- - The native runner disables `PRAGMA foreign_keys` *outside* the
+--   transaction around this file, which additionally protects the
+--   native-only children (novel_outputs, novel_sections, novel_versions,
+--   novel_version_sections, novel_version_diffs) that do not exist in the
+--   D1 schema at this version and so cannot be named here.
 
 CREATE TABLE novels_new (
     id INTEGER PRIMARY KEY,
@@ -53,9 +61,102 @@ CREATE TABLE novels_new (
     extra_fields_bytes INTEGER NOT NULL DEFAULT 2
 ) STRICT;
 
-INSERT INTO novels_new SELECT * FROM novels;
+-- Column lists are explicit: ALTER TABLE ADD COLUMN appends, so the old
+-- table's physical tail order (…, convert_failure, extra_fields_json,
+-- extra_fields_bytes, status_sort, extra_fields_yaml) differs from
+-- novels_new's declared order. A positional `SELECT *` would land those
+-- five columns into the wrong targets (and fail STRICT type checks).
+INSERT INTO novels_new (
+    id,
+    author,
+    author_fold,
+    title,
+    title_fold,
+    file_title,
+    toc_url,
+    toc_url_fold,
+    sitename,
+    sitename_fold,
+    novel_type,
+    "end",
+    last_update,
+    new_arrivals_date,
+    use_subdirectory,
+    general_firstup,
+    novelupdated_at,
+    general_lastup,
+    last_mail_date,
+    tags_json,
+    tags_fold,
+    tags_sort,
+    ncode,
+    ncode_fold,
+    domain,
+    domain_fold,
+    general_all_no,
+    length,
+    suspend,
+    is_narou,
+    last_check_date,
+    status_sort,
+    convert_failure,
+    extra_fields_json,
+    extra_fields_yaml,
+    extra_fields_bytes
+)
+SELECT
+    id,
+    author,
+    author_fold,
+    title,
+    title_fold,
+    file_title,
+    toc_url,
+    toc_url_fold,
+    sitename,
+    sitename_fold,
+    novel_type,
+    "end",
+    last_update,
+    new_arrivals_date,
+    use_subdirectory,
+    general_firstup,
+    novelupdated_at,
+    general_lastup,
+    last_mail_date,
+    tags_json,
+    tags_fold,
+    tags_sort,
+    ncode,
+    ncode_fold,
+    domain,
+    domain_fold,
+    general_all_no,
+    length,
+    suspend,
+    is_narou,
+    last_check_date,
+    status_sort,
+    convert_failure,
+    extra_fields_json,
+    extra_fields_yaml,
+    extra_fields_bytes
+FROM novels;
+
+-- Evacuate the children present on both backends so D1's always-on
+-- ON DELETE CASCADE does not erase them when novels is dropped.
+CREATE TABLE novel_tags_bak AS SELECT * FROM novel_tags;
+CREATE TABLE frozen_novels_bak AS SELECT * FROM frozen_novels;
+DELETE FROM novel_tags;
+DELETE FROM frozen_novels;
+
 DROP TABLE novels;
 ALTER TABLE novels_new RENAME TO novels;
+
+INSERT INTO novel_tags SELECT * FROM novel_tags_bak;
+INSERT INTO frozen_novels SELECT * FROM frozen_novels_bak;
+DROP TABLE novel_tags_bak;
+DROP TABLE frozen_novels_bak;
 
 CREATE INDEX IF NOT EXISTS novels_toc_url_idx ON novels(toc_url);
 CREATE INDEX IF NOT EXISTS novels_toc_url_fold_idx ON novels(toc_url_fold);
@@ -67,7 +168,7 @@ CREATE INDEX IF NOT EXISTS novels_last_update_idx ON novels(last_update, id);
 CREATE INDEX IF NOT EXISTS novels_general_lastup_idx ON novels(general_lastup, id);
 CREATE INDEX IF NOT EXISTS novels_last_check_date_idx ON novels(last_check_date, id);
 CREATE INDEX IF NOT EXISTS novels_new_arrivals_date_idx ON novels(new_arrivals_date, id);
-CREATE INDEX IF NOT EXISTS novels_status_sort_idx ON novels(suspend, "end", id);
+-- Same key columns 0003 established; recreating the dropped index must not
+-- revert to the pre-0003 (suspend, "end", id) definition.
+CREATE INDEX IF NOT EXISTS novels_status_sort_idx ON novels(status_sort, id);
 CREATE INDEX IF NOT EXISTS novels_tags_sort_idx ON novels(tags_sort, id);
-
-PRAGMA foreign_keys = ON;
