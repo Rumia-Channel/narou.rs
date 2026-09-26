@@ -406,13 +406,27 @@ await check("POST /api/tag/change_color stores a color", async () => {
   assert((await json(response)).success === true, "the color must be stored");
 });
 
-await check("POST /api/edit_tag rejects a malformed body", async () => {
+await check("POST /api/edit_tag requires states", async () => {
+  // native の EditTagBody は `states` 必須（欠けると axum の JSON 拒否 = 400）。
   const response = await request("/api/edit_tag", {
     method: "POST",
     headers: { "content-type": "application/json", ...auth().headers },
-    body: JSON.stringify({ ids: ["not-an-id"], tag: "" }),
+    body: JSON.stringify({ ids: [] }),
   });
-  assert([200, 400].includes(response.status), `unexpected status ${response.status}`);
+  assert(response.status === 400, `status ${response.status}`);
+});
+
+await check("POST /api/edit_tag reports no valid ids at 200", async () => {
+  // native は「対象なし」を 200 + {success:false,error} で返す（HTTP エラーにしない）。
+  const response = await request("/api/edit_tag", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ ids: [], states: {} }),
+  });
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(body.success === false, "an empty edit must be reported as such");
+  assert(typeof body.error === "string", `the reason must be set: ${JSON.stringify(body)}`);
 });
 
 await check("GET /api/feature_tour/all lists every tour", async () => {
