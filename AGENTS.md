@@ -354,6 +354,8 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **共有ヘルパ**: Web UI の入力検証・上限値・ソート状態・HTML ヘルパは core の `application::webui` が唯一の定義で、native の `src/web/**` と `worker_entry/src/webui/**` はそれを再エクスポートして使う。
 - **ローカル検証**: `worker_entry` で `npx wrangler dev --config wrangler.toml` を起動し、`POST /api/download` → `POST /api/convert` を流せば DL から変換まで通る。fetch は手元のマシンから出るため、本番で 403 になるサイトもここでは取得できる (実測: なろう / カクヨム / syosetu.org)。ジョブのコンソール行は `ws://127.0.0.1:8787/ws` に `Authorization: Bearer <NAROU_ADMIN_TOKEN>` で接続すると `echo` イベント (`{"type":"echo","target_console":"stdout","body":"…"}`) として見える。Web UI の `fetch` は Bearer を付けられないため、ローカルで画面まで見るときは `.dev.vars` に `NAROU_AUTH_REQUIRED=false` を足す (本番は Access を境界にするときだけ false)。
 - **注意**: ソースを変更すると `wrangler dev` は資産ディレクトリ `public/` の削除に失敗して (Windows の EBUSY) 無言で停止する。変更後は起動し直すこと。
+- **ホットリロード**: Worker は再起動・再デプロイを前提にしない。サイト定義 / 設定 / `asset_backend` / section hash / 凍結 ID / タグ色 / secret はすべて isolate 内キャッシュ (`isolate_cache::TtlMap`) で、TTL (既定 30 秒) か書き込み時の無効化で反映する。**設定変更・secret ローテーション・`webnovel/*.yaml` の差し替えに再デプロイは不要** (反映は最大 30 秒、書き込んだ isolate では即時)。キャッシュを足すときは同じ規則に従うこと。
+- **D1 read replication**: `deploy_worker.py` が `ci/enable_read_replication.py` で有効化する (REST API のみ、`wrangler d1` に該当コマンド無し)。Cloudflare の仕様上 **Sessions API を使わない限り全クエリは primary に行く** ため、UI の読み取りは `build_ui` の `first-unconstrained` セッション、ジョブ実行系は primary 固定という分担にしている。
 - **デプロイ**: `worker_entry/ci/deploy_worker.py` が `NAROU_DEPLOY_TARGET=develop|production` で D1 / Queue を用意し `wrangler.ci.toml` を描画してデプロイし、契約テストを流す。`CLOUDFLARE_API_TOKEN` が必要 (無い環境では手元からデプロイできない)。
 
 ### 最近の追加 (2026-05〜09)

@@ -11,28 +11,27 @@
 //! Secrets Store の値はランタイムが isolate ごとにキャッシュするので、
 //! リクエストごとに `get` しても実害は小さい。
 
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
 use worker::{Env, Result};
 
-/// isolate ごとの解決済みキャッシュ。秘密値は isolate の寿命の間は不変
-/// (更新は新しい isolate で反映される) なので、リクエストごとに
-/// Secrets Store / バインディングを引き直さない。
-static RESOLVED: LazyLock<Mutex<HashMap<String, Option<String>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// isolate ごとの解決済みキャッシュ (TTL 付き)。
+///
+/// 秘密値は isolate の寿命の間ほぼ不変だが、`wrangler secret put` や
+/// Secrets Store の更新で**再デプロイ無しに変えられる**ため、固定キャッシュ
+/// にはしない (`isolate_cache::TtlMap` の TTL で追従する)。
+const SECRET_TTL_MS: f64 = 30_000.0;
+
+static RESOLVED: LazyLock<crate::isolate_cache::TtlMap<Option<String>>> =
+    LazyLock::new(|| crate::isolate_cache::TtlMap::new(SECRET_TTL_MS));
 
 /// `<NAME>_STORE` → `NAME`(var) → `NAME`(secret) の順に解決する。
 pub async fn value(env: &Env, name: &str) -> Option<String> {
-    if let Ok(cache) = RESOLVED.lock()
-        && let Some(hit) = cache.get(name)
-    {
-        return hit.clone();
+    if let Some(cached) = RESOLVED.get(name) {
+        return cached;
     }
     let resolved = resolve(env, name).await;
-    if let Ok(mut cache) = RESOLVED.lock() {
-        cache.insert(name.to_string(), resolved.clone());
-    }
+    RESOLVED.put(name, resolved.clone());
     resolved
 }
 
