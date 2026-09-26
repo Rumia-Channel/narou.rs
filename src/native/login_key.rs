@@ -17,7 +17,9 @@ use crate::login::crypto::{KEY_LEN, parse_key_base64, random_key};
 
 /// File holding the library login key, inside `.narou`.
 pub const KEY_FILE_NAME: &str = "login.key";
-/// Environment variable overriding the key file (base64 of 32 bytes).
+/// Environment variable overriding the key file (base64; 32 bytes are used as-is,
+/// longer/shorter values from [`crate::login::MIN_KEY_LEN`] up are SHA-256
+/// expanded, so `openssl rand -base64 24` works).
 pub const KEY_ENV_VAR: &str = "NAROU_RS_LOGIN_KEY";
 
 /// Where a [`LoginKey`] came from.

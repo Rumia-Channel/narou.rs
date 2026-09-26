@@ -306,7 +306,7 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 | `SERVICE_DOMAIN` | production 必須 | production の custom domain（ホスト名のみ。scheme / path 不可）。`[[routes]] pattern=… custom_domain=true` の生成と smoke の宛先に使い、**ログと step summary では伏せる** |
 | `DEVELOP_DOMAIN` | develop 任意 | 同様。未設定なら route を足さず workers.dev で動く |
 | `NAROU_ADMIN_TOKEN` | Zero Trust が境界なら不要 | Worker API の Bearer。`--secrets-file` で Worker secret として投入。auth 有効で未設定ならデプロイを失敗させる（fail-closed） |
-| `NAROU_RS_LOGIN_KEY` | 任意 | 保存したログイン Cookie の AEAD 鍵（base64 32 バイト）。未設定なら平文行だけを読み、notice を出す |
+| `NAROU_RS_LOGIN_KEY` | 任意 | 保存したログイン Cookie の AEAD 鍵。base64 で、32 バイトはそのまま、16 バイト以上（例 `openssl rand -base64 24`）は SHA-256 で伸長。native の `.narou/login.key` と同じ値にすると資格情報を共有できる。未設定なら平文行だけを読み、notice を出す |
 | `NAROU_S3_ACCESS_KEY_ID` / `NAROU_S3_SECRET_ACCESS_KEY` | 任意 | S3 資格情報。`S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` という Worker secret として投入する。未設定なら Secrets Store か `wrangler secret put` で別途投入する（notice を出す） |
 | `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | 任意 | Access の service token。smoke を custom domain 越しに流す。未設定で Access に弾かれた場合は smoke を省略する |
 

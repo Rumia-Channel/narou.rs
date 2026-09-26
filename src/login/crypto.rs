@@ -8,6 +8,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use sha2::{Digest, Sha256};
 
 use crate::error::{NarouError, Result};
 
@@ -123,14 +124,25 @@ fn decode_exact<const N: usize>(encoded: &str, what: &str) -> Result<[u8; N]> {
 
 /// Parse a base64-encoded login key (the `login.key` file / `NAROU_RS_LOGIN_KEY`
 /// form). Portable: the Worker reads the same key from a secret.
+///
+/// `KEY_LEN` バイトはそのまま鍵に使う（既存ライブラリ互換）。それ以外の長さは
+/// SHA-256 で `KEY_LEN` バイトへ伸長するので、`openssl rand -base64 24` の
+/// 24 バイト（base64 32 文字）でも指定できる。
+pub const MIN_KEY_LEN: usize = 16;
+
 pub fn parse_key_base64(text: &str) -> Result<[u8; KEY_LEN]> {
     let decoded = BASE64
         .decode(text.trim())
         .map_err(|error| login_error(format!("malformed login key: {error}")))?;
-    decoded
-        .as_slice()
-        .try_into()
-        .map_err(|_| login_error(format!("login key must be {KEY_LEN} bytes")))
+    if decoded.len() < MIN_KEY_LEN {
+        return Err(login_error(format!(
+            "login key must be at least {MIN_KEY_LEN} bytes of base64 (e.g. `openssl rand -base64 24`)"
+        )));
+    }
+    if decoded.len() == KEY_LEN {
+        return Ok(decoded.as_slice().try_into().expect("length checked"));
+    }
+    Ok(Sha256::digest(&decoded).into())
 }
 
 /// Derive a key from a passphrase with Argon2id (19 MiB, t=2, p=1).
@@ -195,6 +207,36 @@ fn at_rest_aad(host: &str) -> String {
 }
 
 #[cfg(all(test, feature = "native-runtime"))]
+/// 鍵の長さの扱い（`openssl rand -base64 24` 対応）を固定する。
+#[cfg(test)]
+mod length_tests {
+    use super::*;
+
+    #[test]
+    fn parse_key_base64_keeps_a_thirty_two_byte_key() {
+        let raw = [7u8; KEY_LEN];
+        let encoded = BASE64.encode(raw);
+        assert_eq!(parse_key_base64(&encoded).unwrap(), raw);
+    }
+
+    #[test]
+    fn parse_key_base64_expands_a_twenty_four_byte_key() {
+        let raw = [9u8; 24];
+        let encoded = BASE64.encode(raw);
+        let key = parse_key_base64(&encoded).unwrap();
+        assert_eq!(key.len(), KEY_LEN);
+        assert_eq!(parse_key_base64(&encoded).unwrap(), key, "the mapping must be stable");
+        assert_ne!(key, [0u8; KEY_LEN]);
+    }
+
+    #[test]
+    fn parse_key_base64_rejects_short_and_malformed_values() {
+        assert!(parse_key_base64(&BASE64.encode([1u8; 8])).is_err());
+        assert!(parse_key_base64("not base64!!").is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
