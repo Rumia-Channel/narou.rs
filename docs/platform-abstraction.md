@@ -515,14 +515,15 @@ Worker (worker_entry)
 | `application::version_compare` | バージョン比較（自己更新と `/api/version/*`） |
 | `login::transfer` / `login::crypto` | ログイン書き出しの解析・グループ化・Argon2id 復号・鍵解釈（`parse_key_base64` は 32 バイトそのまま／16 バイト以上は SHA-256 展開） |
 | `downloader::resolve_user_agent` | UA 解決（native はランダム、Worker は既定ブラウザ UA） |
+| `application::messages` + `MessageSink` | ジョブ実行系コマンドの文言。native は stdout/stderr、Worker は PushHub への `echo` に流す（失敗行は両方 `  Error: …`） |
+| `application::aliases` | エイリアス解決（表の読み込みだけが native=Inventory / Worker=app_state と異なる） |
 | `platform::*` + `downloader::http_policy` | HTTP の decode/status/redirect ポリシー（アダプタは transport だけを持つ） |
 
 ### 残っている重複（次の候補）
 
 | 対象 | 現状 | 方針 |
 |---|---|---|
-| **ジョブ実行コマンドのメッセージ** | native は CLI の stdout を子プロセスから流し、Worker は in-process 実行なので文言が別実装 | `application/messages/` に文言を集約し、出力先 (stdout/stderr ↔ PushHub の echo) だけ port で差し替える（進行中） |
-| **エイリアス解決** | `webui/download.rs` と `webui/job_actions.rs` に private 実装が二重、native 側にも別実装 | `application::aliases` へ集約（進行中） |
+| **Worker の convert ジョブの出力** | 文言は `messages::convert` にあるが、`ConvertService` に sink を渡していないため Worker のコンソールに出ない | convert 経路へ sink を通す（未着手。`#console-stdout2` もこれで埋まる） |
 | **リトライ方針** | `src/queue.rs`（native）が `queue.max-retries` / `queue.retry-backoff` を解釈し、Worker は `consumer.rs`/`ledger.rs` に独自実装 | 設定の解釈と backoff スケジュールを可搬層へ（未着手） |
 | **push イベントの組み立て** | native `web/push.rs` と Worker `push_hub.rs` が同じ JSON 形をそれぞれ構築 | イベント生成を可搬層へ（未着手） |
 | **引数の袋** | `too_many_arguments` 14 件・`type_complexity` 5 件 | request struct / 型エイリアスへ畳む（未着手） |
