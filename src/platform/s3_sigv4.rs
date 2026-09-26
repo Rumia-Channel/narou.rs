@@ -44,6 +44,45 @@ pub struct SignedHeaders {
     pub x_amz_content_sha256: String,
 }
 
+/// GET 用の presigned URL を作る（クエリ認証）。
+///
+/// 大きなオブジェクトを Worker 経由で配らず、クライアントに S3 から直接
+/// 取らせるために使う。`path` は **percent-encode 前**の生パス（`/` 区切り）、
+/// `expires` は秒（S3 の上限は 604800）。期待値は botocore の
+/// `S3SigV4QueryAuth` で生成したものと突き合わせている。
+pub fn presign_get(
+    host: &str,
+    path: &str,
+    credentials: &Credentials<'_>,
+    region: &str,
+    expires: u64,
+    at: DateTime<Utc>,
+) -> String {
+    let amz_date = amz_date(at);
+    let date = amz_date.get(..8).unwrap_or(&amz_date).to_string();
+    let scope = format!("{date}/{region}/s3/{TERMINATOR}");
+    let canonical_path = canonical_path(path);
+    let query = canonical_query(&[
+        ("X-Amz-Algorithm".to_string(), ALGORITHM.to_string()),
+        (
+            "X-Amz-Credential".to_string(),
+            format!("{}/{scope}", credentials.access_key_id),
+        ),
+        ("X-Amz-Date".to_string(), amz_date.clone()),
+        ("X-Amz-Expires".to_string(), expires.to_string()),
+        ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
+    ]);
+    // presigned GET はボディを送らないので `UNSIGNED-PAYLOAD` を使う。
+    let canonical_request = format!(
+        "GET\n{canonical_path}\n{query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD"
+    );
+    let request_digest = sha256_hex(canonical_request.as_bytes());
+    let string_to_sign = format!("{ALGORITHM}\n{amz_date}\n{scope}\n{request_digest}");
+    let key = signing_key(credentials.secret_access_key, &date, region, "s3");
+    let signature = hex::encode(hmac_sha256(&key, string_to_sign.as_bytes()));
+    format!("https://{host}{canonical_path}?{query}&X-Amz-Signature={signature}")
+}
+
 /// SigV4 の署名ヘッダを計算する。
 pub fn sign(
     request: &RequestToSign<'_>,
@@ -363,5 +402,67 @@ mod tests {
     fn amz_date_is_utc_without_punctuation() {
         let at = Utc.with_ymd_and_hms(2026, 9, 26, 12, 0, 0).unwrap();
         assert_eq!(amz_date(at), "20260926T120000Z");
+    }
+}
+
+#[cfg(test)]
+mod presign_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn credentials() -> Credentials<'static> {
+        Credentials {
+            access_key_id: "AKIDEXAMPLE",
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        }
+    }
+
+    fn fixed_at() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 26, 12, 0, 0).unwrap()
+    }
+
+    /// 期待値は botocore `S3SigV4QueryAuth`（時刻を固定）で生成した。
+    #[test]
+    fn presigned_get_matches_botocore() {
+        assert_eq!(
+            presign_get(
+                "s3.example.com",
+                "/narou-local/novels/example.com/test/data.txt",
+                &credentials(),
+                "us-east-1",
+                300,
+                fixed_at(),
+            ),
+            "https://s3.example.com/narou-local/novels/example.com/test/data.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20260926%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260926T120000Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=ce9e6a126b2a42b6dba671899f3a31dc8a6bbd99c2d34668d76c0f9cc92e18b7"
+        );
+    }
+
+    /// 日本語（挿絵）のパスは percent-encode される。
+    #[test]
+    fn presigned_get_encodes_non_ascii_paths() {
+        assert_eq!(
+            presign_get(
+                "s3.example.com",
+                "/narou-local/novels/example.com/test/挿絵/0001.jpg",
+                &credentials(),
+                "us-east-1",
+                300,
+                fixed_at(),
+            ),
+            "https://s3.example.com/narou-local/novels/example.com/test/%E6%8C%BF%E7%B5%B5/0001.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20260926%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260926T120000Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=ea153d3d88b9b22248f065964de68c5857a2d6dd938b4e236c33c587dab87f21"
+        );
+    }
+
+    #[test]
+    fn presigned_get_binds_the_expiry() {
+        assert!(presign_get(
+            "s3.example.com",
+            "/narou-local/novels/example.com/test/data.txt",
+            &credentials(),
+            "us-east-1",
+            60,
+            fixed_at(),
+        )
+        .ends_with("X-Amz-Signature=88992a69c00741c0403c2742ee6a4dedff248d2b4669927273bb021d004941e6"));
     }
 }

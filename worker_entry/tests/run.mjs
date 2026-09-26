@@ -9,7 +9,7 @@
 //   wrangler.test.toml  … wrangler.toml から [build] を外した実行用設定
 //   .wrangler/state     … ローカルの D1 (miniflare SQLite)
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
@@ -108,18 +108,74 @@ try {
   }
   console.log(`wrangler dev is ready on ${base}`);
 
-  // 6. 契約テスト本体。
-  const contract = spawnSync(process.execPath, [join(here, "contract.mjs")], {
-    cwd: root,
-    stdio: "inherit",
-    env: {
-      ...process.env,
-      BASE_URL: base,
-      NAROU_ADMIN_TOKEN: token,
-      CONTRACT_QUEUE: process.env.CONTRACT_QUEUE ?? "1",
-    },
-  });
+  // 6. 契約テスト本体（`node --test`）。
+  const runContract = (extraEnv) =>
+    spawnSync(process.execPath, ["--test", join(here, "contract.mjs")], {
+      cwd: root,
+      stdio: "inherit",
+      env: { ...process.env, BASE_URL: base, NAROU_ADMIN_TOKEN: token, ...extraEnv },
+    });
+  const contract = runContract({ CONTRACT_QUEUE: process.env.CONTRACT_QUEUE ?? "1" });
   exitCode = contract.status ?? 1;
+
+  // 7. トークンを外した構成で fail-closed を確かめる（任意・既定 off）。
+  if (exitCode === 0 && process.env.NAROU_CHECK_UNCONFIGURED === "1") {
+    console.log("checking the unconfigured Worker (no admin token)");
+    // `.dev.vars` の secret を読ませないため、起動の間だけ退避する
+    // （起動済みの 1 台目はメモリ上の値を保つので影響しない）。
+    const savedVars = join(root, ".dev.vars.saved");
+    const hadVars = existsSync(devVars);
+    if (hadVars) renameSync(devVars, savedVars);
+    const authPid = spawn(
+      npx,
+      [
+        "--yes",
+        "wrangler@4",
+        "dev",
+        "-c",
+        "wrangler.test.toml",
+        "--port",
+        "8788",
+        "--var",
+        "NAROU_AUTH_REQUIRED:true",
+      ],
+      { cwd: root, stdio: "inherit", shell: isWindows },
+    );
+    try {
+      const unconfiguredBase = "http://127.0.0.1:8788";
+      const deadline = Date.now() + 120_000;
+      for (;;) {
+        try {
+          const response = await fetch(`${unconfiguredBase}/health/live`);
+          if (response.status === 200) break;
+        } catch {}
+        if (Date.now() > deadline) throw new Error("second wrangler dev did not become ready");
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+      const unconfigured = spawnSync(
+        process.execPath,
+        ["--test", join(here, "contract.mjs")],
+        {
+          cwd: root,
+          stdio: "inherit",
+          env: {
+            ...process.env,
+            BASE_URL: unconfiguredBase,
+            NAROU_ADMIN_TOKEN: "",
+            CONTRACT_EXPECT_UNCONFIGURED: "1",
+          },
+        },
+      );
+      if ((unconfigured.status ?? 1) !== 0) exitCode = unconfigured.status ?? 1;
+    } finally {
+      if (isWindows) {
+        spawnSync("taskkill", ["/pid", String(authPid.pid), "/T", "/F"], { stdio: "ignore" });
+      } else {
+        authPid.kill("SIGTERM");
+      }
+      if (hadVars && existsSync(savedVars)) renameSync(savedVars, devVars);
+    }
+  }
 } finally {
   if (!keep) {
     if (isWindows) {

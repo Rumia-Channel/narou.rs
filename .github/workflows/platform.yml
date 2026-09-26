@@ -103,6 +103,8 @@ jobs:
       - run: node tests/run.mjs --release
         env:
           NAROU_ADMIN_TOKEN: contract-token
+          # トークンを外した構成で fail-closed も確かめる。
+          NAROU_CHECK_UNCONFIGURED: "1"
 
   # デプロイはリポジトリの secret を設定したうえで手動実行する。
   # 必要な値 (GitHub の environment = target 名で設定):

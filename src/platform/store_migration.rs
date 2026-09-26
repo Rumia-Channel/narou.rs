@@ -29,6 +29,10 @@ pub struct StoreMigrationState {
     pub cursor: Option<String>,
     pub copied: u64,
     pub verified: u64,
+    /// `plan` が数えた「移行対象の件数」（書き込みはしない）。
+    pub planned: u64,
+    /// `plan` が数えた対象の合計バイト数。
+    pub planned_bytes: u64,
     pub failed: Vec<String>,
     pub done: bool,
 }
@@ -65,7 +69,7 @@ pub async fn migrate_page(
     limit: usize,
     state: &mut StoreMigrationState,
 ) -> Result<()> {
-    if action != "copy" && action != "verify" {
+    if action != "copy" && action != "verify" && action != "plan" {
         return Err(NarouError::Platform(format!(
             "unknown store migration action: {action:?}"
         )));
@@ -83,6 +87,11 @@ pub async fn migrate_page(
     for metadata in &page.objects {
         let key = &metadata.key;
         if !is_illustration_key(key) {
+            continue;
+        }
+        if action == "plan" {
+            state.planned += 1;
+            state.planned_bytes += metadata.size;
             continue;
         }
         if action == "copy" {
@@ -190,6 +199,32 @@ mod tests {
             assert!(s3.read_small(&section).await.unwrap().is_none());
             assert!(s3.read_small(&cache).await.unwrap().is_none());
             assert!(d1.read_small(&section).await.unwrap().is_some());
+        });
+    }
+
+    /// `plan` は対象を数えるだけで書き込まないこと。
+    #[test]
+    fn plan_counts_targets_without_writing() {
+        futures::executor::block_on(async {
+            let d1_store = Arc::new(MemoryObjectStore::new());
+            let d1: Arc<dyn ObjectStore> = d1_store.clone();
+            let d1_assets: Arc<dyn AssetStore> = d1_store.clone();
+            let s3_store = Arc::new(MemoryObjectStore::new());
+            let s3: Arc<dyn ObjectStore> = s3_store.clone();
+            let s3_assets: Arc<dyn AssetStore> = s3_store;
+
+            let picture = key("novels/site/title/挿絵/0001.jpg");
+            d1.write_small(&picture, b"picture".to_vec()).await.unwrap();
+
+            let mut state = StoreMigrationState::default();
+            migrate_page(&d1, &d1_assets, &s3_assets, &s3, "plan", 100, &mut state)
+                .await
+                .unwrap();
+
+            assert_eq!(state.planned, 1);
+            assert_eq!(state.planned_bytes, 7);
+            assert_eq!(state.copied, 0);
+            assert!(s3.read_small(&picture).await.unwrap().is_none());
         });
     }
 

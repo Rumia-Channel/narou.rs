@@ -27,12 +27,17 @@ pub struct MigrationReport {
     pub action: String,
     pub copied: u64,
     pub verified: u64,
+    /// `plan` が数えた対象件数と合計バイト。
+    pub planned: u64,
+    pub planned_bytes: u64,
     pub failed: Vec<String>,
     pub done: bool,
     pub next_cursor: Option<String>,
 }
 
-/// `copy` / `verify` を `limit` 件だけ進める。
+/// `plan` / `copy` / `verify` を `limit` 件だけ進める。
+///
+/// `plan` は対象を数えるだけで書き込まない（本番前に件数と容量を確認する）。
 pub async fn run(
     env: &Env,
     db: &Arc<D1Database>,
@@ -73,6 +78,8 @@ fn report(action: &str, state: &StoreMigrationState) -> MigrationReport {
         action: action.to_string(),
         copied: state.copied,
         verified: state.verified,
+        planned: state.planned,
+        planned_bytes: state.planned_bytes,
         failed: state.failed.clone(),
         done: state.done,
         next_cursor: state.cursor.clone(),

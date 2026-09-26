@@ -8,32 +8,27 @@
 // CONTRACT_QUEUE=1 のときだけ queue consumer が回る前提の検査 (Convert ジョブが
 // 終端状態になるまで待つ) を行う。ローカルでも `wrangler dev` は queue を
 // 処理するが、環境によっては配送されないので既定では無効にする。
+import assert from "node:assert/strict";
 import process from "node:process";
+import test from "node:test";
 
 const BASE_URL = process.env.BASE_URL ?? "http://127.0.0.1:8787";
 const TOKEN = process.env.NAROU_ADMIN_TOKEN;
 const QUEUE_CHECKS = process.env.CONTRACT_QUEUE === "1";
 const TERMINAL_STATUSES = new Set(["succeeded", "blocked", "permanent"]);
 
-if (!TOKEN) {
+const UNCONFIGURED = process.env.CONTRACT_EXPECT_UNCONFIGURED === "1";
+if (!TOKEN && !UNCONFIGURED) {
   console.error("NAROU_ADMIN_TOKEN is required");
   process.exit(2);
 }
 
-let failures = 0;
-
-function assert(condition, message) {
-  if (!condition) throw new Error(message);
-}
-
-async function check(name, fn) {
-  try {
-    await fn();
-    console.log(`ok   ${name}`);
-  } catch (error) {
-    failures += 1;
-    console.error(`FAIL ${name}: ${error.message}`);
+/** 検査を 1 件定義する（`node --test` で走る）。 */
+function check(name, fn) {
+  if (process.env.CONTRACT_EXPECT_UNCONFIGURED === "1") {
+    return;
   }
+  test(name, fn);
 }
 
 /** 認証ヘッダ付き (token 省略時は付けない = 未認証の検査用)。 */
@@ -191,6 +186,17 @@ await check("the scheduled handler runs (cron planner)", async () => {
     if (response.status === 200) return;
   }
   throw new Error(`scheduled endpoint not reachable: ${statuses.join(", ")}`);
+});
+
+await check("GET /api/novels/:id/illustrations/:name requires auth", async () => {
+  const response = await request("/api/novels/1/illustrations/0001.jpg");
+  assert(response.status === 401, `status ${response.status}`);
+  assert((await errorCode(response)) === "authentication_required", "code must be set");
+});
+
+await check("GET /api/novels/:id/illustrations/:name is 404 for an unknown novel", async () => {
+  const response = await request("/api/novels/999999999/illustrations/0001.jpg", auth());
+  assert(response.status === 404, `status ${response.status}`);
 });
 
 await check("POST /api/jobs accepts a Convert plan", async () => {
@@ -411,8 +417,13 @@ if (QUEUE_CHECKS) {
   console.log("skip Convert job terminal-state check (set CONTRACT_QUEUE=1 to enable)");
 }
 
-if (failures > 0) {
-  console.error(`${failures} contract check(s) failed`);
-  process.exit(1);
+// トークン未設定の Worker は 401 ではなく 500 + `authentication_not_configured` で
+// 失敗する（設定漏れが「トークン違い」に見えないように）。
+if (process.env.CONTRACT_EXPECT_UNCONFIGURED === "1") {
+  await check("an unconfigured Worker fails closed with a distinct code", async () => {
+    const response = await fetch(new URL("/api/novels", BASE_URL).toString());
+    assert.equal(response.status, 500);
+    const body = await response.json();
+    assert.equal(body?.error?.code, "authentication_not_configured");
+  });
 }
-console.log("all contract checks passed");

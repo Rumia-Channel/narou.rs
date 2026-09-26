@@ -122,6 +122,25 @@ impl S3ObjectStore {
         })
     }
 
+    /// ダウンロード用の presigned URL を作る（クエリ認証）。
+    ///
+    /// 挿絵のような大きなオブジェクトは Worker で中継せず、クライアントに
+    /// S3 から直接取らせる（native の Web UI が静的配信するのと同じ発想）。
+    pub fn presign_get_url(&self, key: &ObjectKey, expires_secs: u64) -> String {
+        let credentials = Credentials {
+            access_key_id: &self.credentials.access_key_id,
+            secret_access_key: &self.credentials.secret_access_key,
+        };
+        s3_sigv4::presign_get(
+            &self.host,
+            &self.location.object_path(key),
+            &credentials,
+            &self.region,
+            expires_secs,
+            chrono::Utc::now(),
+        )
+    }
+
     /// 署名済みリクエストを送る。`path` と `query` は署名対象と一致させる。
     async fn send(
         &self,

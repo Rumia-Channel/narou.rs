@@ -318,6 +318,24 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 メジャーのみのバージョン指定（現状の精密ピンを維持）、R2/KV/Browser Rendering（設計は D1 + S3 互換）、
 PWA Service Worker（製品機能として別判断）。
 
+### 2.2.10 大きなオブジェクトとデプロイ前確認 (2026-09-26)
+
+- **挿絵は Worker を通さない**: `GET /api/novels/{id}/illustrations/{name}` は、挿絵を S3 に置く構成
+  (`asset_backend = s3`) では **presigned URL へ 302** する（寿命 240 秒）。D1 に置く構成では
+  そのまま返す。presign は `s3_sigv4::presign_get` で、botocore の `S3SigV4QueryAuth`（時刻固定）で
+  生成した 3 ケースとバイト一致することをテストで固定している。
+- **移行の `plan`**: `POST /api/admin/object-migration {"action":"plan"}` は対象件数と合計バイトを数える
+  だけで書き込まない。本番前に規模を確認してから `copy` → `verify` の順に進める。
+- **デプロイ前チェックリスト**（Dantalian の運用に倣う）:
+  1. `cargo test --workspace --all-targets` / `cargo check --target wasm32-unknown-unknown` が緑
+  2. `node worker_entry/tests/run.mjs --release`（契約テスト 27 件）が緑
+  3. `ci/render_config.py` が未置換プレースホルダで失敗しない（＝secret / vars が揃っている）
+  4. リモート D1 の migration が適用済み（`deploy_worker.py` が実行する）
+  5. 挿絵を S3 に向ける場合は `plan` → `copy` → `verify` を済ませてから `asset_backend` を `s3` に
+  6. 資格情報・署名付き URL・Cookie をログや成果物に出さない
+- **切り戻し**: `wrangler versions` で前バージョンへ戻す、または `asset_backend` を `d1` に戻す。
+  native 側の `小説データ/` は Worker から書き換えないため影響しない。
+
 ### 2.3 その他の差分
 
 - サイト YAML はビルド時埋め込みのみでユーザー差し替え不可（`SiteDefinitionProvider` は空実装）。
@@ -436,6 +454,7 @@ CF Access を唯一のユーザー境界にする設計、音声向けの instan
 # ローカル (ビルド → ローカル D1 へ migration → wrangler dev → 契約テスト)
 cd worker_entry
 node tests/run.mjs              # debug build / --release で CI と同じ / --keep で dev を残す
+# NAROU_CHECK_UNCONFIGURED=1 で、トークンを外した構成の fail-closed も確認する（CI は有効）
 
 # 既に動いている環境に対する契約テスト (デプロイ後の smoke test もこれ)
 BASE_URL=https://... NAROU_ADMIN_TOKEN=... node worker_entry/tests/contract.mjs

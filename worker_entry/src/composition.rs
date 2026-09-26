@@ -94,8 +94,13 @@ async fn read_asset_backend(db: &D1Database) -> Option<String> {
 async fn build_object_stores(
     env: &Env,
     db: &Arc<D1Database>,
-) -> worker::Result<(Arc<dyn ObjectStore>, Arc<dyn AssetStore>)> {
+) -> worker::Result<(
+    Arc<dyn ObjectStore>,
+    Arc<dyn AssetStore>,
+    Option<Arc<crate::s3_object_store::S3ObjectStore>>,
+)> {
     let d1: Arc<D1ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
+    let mut s3_handle: Option<Arc<crate::s3_object_store::S3ObjectStore>> = None;
     let illustrations: (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) =
         match read_asset_backend(db).await.as_deref() {
             // S3 が選ばれていて資格情報が欠けている場合は起動を失敗させ、
@@ -103,13 +108,14 @@ async fn build_object_stores(
             Some("s3") => {
                 let store: Arc<crate::s3_object_store::S3ObjectStore> =
                     Arc::new(crate::s3_object_store::S3ObjectStore::from_env(env).await?);
+                s3_handle = Some(store.clone());
                 (store.clone(), store)
             }
             _ => (d1.clone(), d1.clone()),
         };
     let split: Arc<SplitStore> =
         Arc::new(SplitStore::new((d1.clone(), d1.clone()), illustrations));
-    Ok((split.clone(), split))
+    Ok((split.clone(), split, s3_handle))
 }
 
 /// `app_state(scope='inv', key='section_hash_cache')` を読む。
@@ -155,7 +161,7 @@ impl WorkerRuntime {
     pub async fn build(env: &Env) -> worker::Result<Self> {
         let db = Arc::new(env.d1("DB")?);
         let subrequests = crate::budget::SubrequestBudget::new();
-        let (objects, assets) = build_object_stores(env, &db).await?;
+        let (objects, assets, _s3_illustrations) = build_object_stores(env, &db).await?;
         let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let freeze = Arc::new(D1FreezeStore::new(db.clone()));
@@ -408,6 +414,8 @@ impl WorkerRuntime {
 pub struct ReadServices {
     pub app: AppServices,
     pub objects: Arc<dyn ObjectStore>,
+    /// 挿絵を S3 に置く構成のときだけ入る（presigned URL を作るのに使う）。
+    pub s3_illustrations: Option<Arc<crate::s3_object_store::S3ObjectStore>>,
 }
 
 /// Build the application services (read-only API surface).
@@ -417,13 +425,14 @@ pub async fn build_services(env: &Env) -> worker::Result<AppServices> {
 
 pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
     let db = Arc::new(env.d1("DB")?);
-    let (objects, _assets) = build_object_stores(env, &db).await?;
+    let (objects, _assets, s3_illustrations) = build_object_stores(env, &db).await?;
     let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::new(db.clone()));
     Ok(ReadServices {
         app: services_from(novels, objects.clone(), freeze, db, clock),
         objects,
+        s3_illustrations,
     })
 }
 

@@ -125,6 +125,12 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
             Err(_) => Response::error("Not Found", 404),
         };
     }
+    if let Some((id, name)) = rest.split_once("/illustrations/") {
+        return match id.parse::<i64>() {
+            Ok(id) => api_novel_illustration(req, env, id, name).await,
+            Err(_) => Response::error("Not Found", 404),
+        };
+    }
     let Some(id) = rest.parse::<i64>().ok() else {
         return Response::error("Not Found", 404);
     };
@@ -427,6 +433,65 @@ async fn api_site(req: Request, env: Env) -> Result<Response> {
     crate::sites::handle(&runtime, req, Some(&name))
         .await
         .map_err(|error| Error::RustError(error.to_string()))
+}
+
+/// GET /api/novels/:id/illustrations/:name — 挿絵 1 枚。
+///
+/// S3 に置く構成 (`asset_backend = s3`) では **presigned URL へ 302** し、
+/// 大きいオブジェクトを Worker で中継しない。D1 に置く構成ではそのまま返す。
+async fn api_novel_illustration(req: Request, env: Env, id: i64, name: &str) -> Result<Response> {
+    if req.method() != Method::Get {
+        return Response::error("Method Not Allowed", 405);
+    }
+    if let Some(response) = auth_failure(&req, &env) {
+        return response;
+    }
+    let services = match composition::build_read_services(&env).await {
+        Ok(services) => services,
+        Err(_) => return Response::error("Service unavailable", 503),
+    };
+    let record = services
+        .app
+        .library
+        .get(narou_rs::platform::NovelId(id))
+        .await
+        .map_err(|error| Error::RustError(error.to_string()))?;
+    let Some(record) = record else {
+        return Response::error("Not Found", 404);
+    };
+    let keys = match narou_rs::platform::NovelObjectKeys::new(
+        &record.sitename,
+        &record.file_title,
+        record.use_subdirectory,
+    ) {
+        Ok(keys) => keys,
+        Err(error) => return Response::error(&format!("Invalid key: {error}"), 500),
+    };
+    let key = match keys.illustration(name) {
+        Ok(key) => key,
+        Err(_) => return Response::error("Not Found", 404),
+    };
+
+    if let Some(s3) = services.s3_illustrations.as_ref() {
+        // Worker を経由させない。URL の寿命は短くして、共有を避ける。
+        let presigned = s3.presign_get_url(&key, 240);
+        let url = worker::Url::parse(&presigned)
+            .map_err(|error| Error::RustError(error.to_string()))?;
+        return Response::redirect(url);
+    }
+
+    match services.objects.read_small(&key).await {
+        Ok(Some(bytes)) => {
+            let content_type =
+                narou_rs::platform::content_type_for_key(&key).unwrap_or("application/octet-stream");
+            Ok(worker::ResponseBuilder::new()
+                .with_header("Content-Type", content_type)?
+                .with_header("Cache-Control", "private, max-age=240")?
+                .from_bytes(bytes)?)
+        }
+        Ok(None) => Response::error("Not Found", 404),
+        Err(error) => Response::error(&format!("Object store error: {error}"), 500),
+    }
 }
 
 /// GET /api/login — 保存済みログイン資格情報の一覧 (値は伏せる)。

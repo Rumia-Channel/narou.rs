@@ -400,6 +400,12 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   `global` (`over18`)、`inv` の section hash cache を起動時に読んで渡す。同期 API と非同期 D1 の
   都合で書き戻しは no-op。`over18` 未設定は `None` のままにして年齢認証 `Blocked` 経路を保つ。
 
+### Worker の大きなオブジェクト (2026-09)
+
+- `GET /api/novels/{id}/illustrations/{name}` は、S3 構成なら presigned URL へ 302 して Worker を
+  中継させない（`s3_sigv4::presign_get` + botocore 突き合わせテスト）。D1 構成ではそのまま返す。
+- 移行は `plan`（件数と容量を数えるだけ）→ `copy` → `verify` の順。`asset_backend` の切替は最後。
+
 ### Worker のフロント配信・認証・ストレージ (2026-09)
 
 - **静的アセット**: `worker_entry/build_assets.mjs` が `src/web/assets` を `public/` へ焼き込む
