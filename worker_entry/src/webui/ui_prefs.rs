@@ -31,13 +31,27 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         SaveSortState,
         WebuiConfig,
         FeatureTourPending,
+        FeatureTourAll,
+        FeatureTourSeen,
+        FeatureTourConfig,
     }
     let route = match (req.method(), path.as_str()) {
         (Method::Get, "/api/sort_state") => Route::GetSortState,
         (Method::Post, "/api/sort_state") => Route::SaveSortState,
         (Method::Get, "/api/webui/config") => Route::WebuiConfig,
         (Method::Get, "/api/feature_tour/pending") => Route::FeatureTourPending,
-        (_, "/api/sort_state" | "/api/webui/config" | "/api/feature_tour/pending") => {
+        (Method::Get, "/api/feature_tour/all") => Route::FeatureTourAll,
+        (Method::Post, "/api/feature_tour/seen") => Route::FeatureTourSeen,
+        (Method::Post, "/api/feature_tour/config") => Route::FeatureTourConfig,
+        (
+            _,
+            "/api/sort_state"
+            | "/api/webui/config"
+            | "/api/feature_tour/pending"
+            | "/api/feature_tour/all"
+            | "/api/feature_tour/seen"
+            | "/api/feature_tour/config",
+        ) => {
             return json_error(405, "method_not_allowed", None);
         }
         _ => {
@@ -56,6 +70,9 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         Route::SaveSortState => save_sort_state(&mut req, &runtime).await,
         Route::WebuiConfig => webui_config(&req, &runtime).await,
         Route::FeatureTourPending => feature_tour_pending(&runtime).await,
+        Route::FeatureTourAll => feature_tour_all(&runtime).await,
+        Route::FeatureTourSeen => feature_tour_seen(&mut req, &runtime).await,
+        Route::FeatureTourConfig => feature_tour_config(&mut req, &runtime).await,
     }
 }
 
@@ -446,6 +463,130 @@ async fn feature_tour_pending(runtime: &WorkerRuntime) -> worker::Result<Respons
         "entries": if disabled { Vec::new() } else { entries },
         "storage_migration": storage_migration,
     }))
+}
+
+/// `GET /api/feature_tour/all` — 既知のツアー全件（native: `feature_tour::all`）。
+async fn feature_tour_all(runtime: &WorkerRuntime) -> worker::Result<Response> {
+    let settings = &runtime.services.settings;
+    let seen_version = load_local_str(settings, SEEN_VERSION_KEY).await;
+    let disabled = load_local_bool(settings, DISABLED_KEY).await;
+    Response::from_json(&serde_json::json!({
+        "success": true,
+        "current_version": WORKER_VERSION,
+        "seen_version": seen_version,
+        "disabled": disabled,
+        "latest_pending_version": latest_tour_version(),
+        "entries": current_entries(WORKER_VERSION),
+    }))
+}
+
+/// `POST /api/feature_tour/seen` — 既読バージョンを記録する。
+async fn feature_tour_seen(
+    req: &mut Request,
+    runtime: &WorkerRuntime,
+) -> worker::Result<Response> {
+    let body: serde_json::Value = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
+    };
+    let requested = body["version"].as_str().unwrap_or("").trim().to_string();
+    if requested.is_empty() {
+        return Response::from_json(&api_response(false, "version is required"));
+    }
+    if !is_known_tour_version(&requested) {
+        return Response::from_json(&api_response(false, "unknown tour version"));
+    }
+    let settings = &runtime.services.settings;
+    let version_to_save = load_local_str(settings, SEEN_VERSION_KEY)
+        .await
+        .filter(|seen| version_greater(seen, &requested))
+        .unwrap_or(requested);
+    match settings
+        .set_raw(
+            SettingScope::Local,
+            SEEN_VERSION_KEY,
+            serde_yaml::Value::String(version_to_save),
+        )
+        .await
+    {
+        Ok(()) => Response::from_json(&api_response(true, "OK")),
+        Err(error) => Response::from_json(&api_response(false, error.to_string())),
+    }
+}
+
+/// `POST /api/feature_tour/config` — ツアー表示の on/off。
+async fn feature_tour_config(
+    req: &mut Request,
+    runtime: &WorkerRuntime,
+) -> worker::Result<Response> {
+    let body: serde_json::Value = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
+    };
+    let disabled = body["disabled"].as_bool().unwrap_or(false);
+    match runtime
+        .services
+        .settings
+        .set_raw(
+            SettingScope::Local,
+            DISABLED_KEY,
+            serde_yaml::Value::Bool(disabled),
+        )
+        .await
+    {
+        Ok(()) => Response::from_json(&api_response(true, "OK")),
+        Err(error) => Response::from_json(&api_response(false, error.to_string())),
+    }
+}
+
+/// local スコープの生設定（文字列）。
+async fn load_local_str(
+    settings: &narou_rs::application::SettingsService,
+    key: &str,
+) -> Option<String> {
+    settings
+        .get_raw(SettingScope::Local, key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_str().map(str::to_owned))
+}
+
+/// local スコープの生設定（真偽値）。
+async fn load_local_bool(
+    settings: &narou_rs::application::SettingsService,
+    key: &str,
+) -> bool {
+    settings
+        .get_raw(SettingScope::Local, key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+/// 現在のバージョンまでに存在するツアー（native: `current_entries`）。
+fn current_entries(current_version: &str) -> Vec<FeatureTourEntry> {
+    FEATURE_TOURS
+        .iter()
+        .copied()
+        .filter(|entry| !version_greater(entry.version, current_version))
+        .collect()
+}
+
+/// 既知のツアーのうち最新のバージョン（native: `latest_tour_version`）。
+fn latest_tour_version() -> &'static str {
+    FEATURE_TOURS
+        .iter()
+        .map(|entry| entry.version)
+        .max_by(|a, b| compare_versions(a, b))
+        .unwrap_or("")
+}
+
+/// テーブルに存在するツアーのバージョンか（native: `is_known_tour_version`）。
+fn is_known_tour_version(version: &str) -> bool {
+    FEATURE_TOURS.iter().any(|entry| entry.version == version)
 }
 
 fn pending_entries(seen_version: Option<&str>, current_version: &str) -> Vec<FeatureTourEntry> {

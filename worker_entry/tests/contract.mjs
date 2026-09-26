@@ -229,6 +229,40 @@ await check("POST /api/download rejects an unknown target", async () => {
   );
 });
 
+await check("GET /api/feature_tour/all lists every tour", async () => {
+  const response = await request("/api/feature_tour/all", auth());
+  assert(response.status === 200, `status ${response.status}`);
+  const body = await json(response);
+  assert(body.success === true, `unexpected body: ${JSON.stringify(body).slice(0, 200)}`);
+  assert(Array.isArray(body.entries), "entries must be an array");
+  assert(
+    typeof body.latest_pending_version === "string",
+    "latest_pending_version must be a string",
+  );
+});
+
+await check("POST /api/feature_tour/seen rejects an unknown version", async () => {
+  const response = await request("/api/feature_tour/seen", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ version: "0.0.0-not-a-tour" }),
+  });
+  assert(response.status === 200, `status ${response.status}`);
+  assert((await json(response)).success === false, "an unknown version must be rejected");
+});
+
+await check("POST /api/feature_tour/config is reflected by pending", async () => {
+  const response = await request("/api/feature_tour/config", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ disabled: false }),
+  });
+  assert(response.status === 200, `status ${response.status}`);
+  assert((await json(response)).success === true, "the config save must succeed");
+  const pending = await json(await request("/api/feature_tour/pending", auth()));
+  assert(pending.disabled === false, "pending must report the saved config");
+});
+
 await check("GET /api/webui/config returns the UI configuration", async () => {
   const response = await request("/api/webui/config", auth());
   assert(response.status === 200, `status ${response.status}`);
