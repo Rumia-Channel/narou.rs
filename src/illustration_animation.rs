@@ -71,13 +71,14 @@ struct Limits {
 /// 既定の上限。
 ///
 /// Workers の 128 MiB に対する予算:
-/// 入力アーカイブ (22 MiB) + 出力 APNG (40 MiB) + 1 フレーム RGBA (2048×2048 =
-/// 16.8 MiB) + 符号化中バッファ (数 MiB) ≈ 85 MiB。超過は OOM ではなく明示エラーで
-/// 止める (isolate を落とすより、その作品だけ諦めるほうが被害が小さい)。
+/// 入力アーカイブ (16 MiB, 転送上限) + 出力 APNG (56 MiB) + 1 フレーム
+/// (1920×1080 RGBA = 8.3 MiB + 符号化バッファ) + isolate 分 ≈ 105 MiB。
+/// Pixiv のうごイラは 1920×1080 までなので、それを超えるフレームは対象外にする。
+/// 超過は OOM ではなく明示エラーで止める (呼び出し側はアーカイブをそのまま保存する)。
 const DEFAULT_LIMITS: Limits = Limits {
     max_frames: 512,
-    max_frame_pixels: 2048 * 2048,
-    max_output_bytes: 40 * 1024 * 1024,
+    max_frame_pixels: 1920 * 1080,
+    max_output_bytes: 56 * 1024 * 1024,
 };
 
 /// Frame decoding and APNG assembly need the `zip` and `image` crates.
