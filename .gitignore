@@ -45,6 +45,10 @@ errors.txt
 /dist/
 /narou
 
+# Python (worker_entry/ci)
+__pycache__/
+*.pyc
+
 # Cloudflare Workers (worker_entry)
 # 生成物とローカル専用ファイルは追跡しない。
 /worker_entry/build/
