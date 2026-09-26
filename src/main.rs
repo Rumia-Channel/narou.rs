@@ -271,7 +271,11 @@ async fn run_command(
     logger::use_convert_log_postfix(matches!(&cli.command, Commands::Convert { .. }));
 
     // サイト定義は保存方式に応じて読み込む（SQLite モードではオブジェクトストア）。
-    if let Err(error) = narou_rs::native::site_definitions::install_effective_site_settings().await
+    // 未初期化のディレクトリ (.narou/ が無い) には読み込む対象が無いので、警告を
+    // 出さずに飛ばす。init はこの後で .narou/ を作る。
+    if narou_rs::db::narou_root_exists()
+        && let Err(error) =
+            narou_rs::native::site_definitions::install_effective_site_settings().await
     {
         eprintln!("[WARN] サイト定義の読み込みに失敗しました: {error}");
     }

@@ -563,6 +563,12 @@ fn process_write_lock_for(path: &Path) -> Arc<StdMutex<()>> {
         .clone()
 }
 
+/// `.narou/` を持つディレクトリが CWD かその親にあるか。未初期化のディレクトリでは
+/// 設定やサイト定義の読み込み対象が無いので、呼び出し側で読み込みを省く判断に使う。
+pub fn narou_root_exists() -> bool {
+    find_narou_root().is_ok()
+}
+
 pub(crate) fn find_narou_root() -> Result<PathBuf> {
     let mut current = std::env::current_dir()?;
     loop {
