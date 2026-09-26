@@ -59,7 +59,8 @@ pub use scheduler::{
     ScheduleDecision, SchedulerService,
 };
 pub use settings::{
-    MemorySettingsStore, SettingEntry, SettingsEffect, SettingsService, SettingsStore,
+    LIVE_WEBUI_CONFIG_NAMES, MemorySettingsStore, SettingEntry, SettingsEffect, SettingsService,
+    SettingsStore,
 };
 pub use web_actions::{
     EmptyWebActionService, WebActionOutput, WebActionService,

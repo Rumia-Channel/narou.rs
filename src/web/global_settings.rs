@@ -54,6 +54,20 @@ pub async fn save_global_settings(
     {
         state.push_server.broadcast_event("webui.config.reload", "");
     }
+    if effects
+        .iter()
+        .any(|effect| matches!(effect, SettingsEffect::ServerSecurityChanged))
+    {
+        match state.reload_server_security() {
+            Ok(_) => state
+                .push_server
+                .broadcast_echo("server-* 設定を再適用しました", "stdout"),
+            Err(message) => state.push_server.broadcast_echo(
+                &format!("server-* 設定の再適用に失敗しました: {message}"),
+                "stdout",
+            ),
+        }
+    }
 
     Json(ApiResponse {
         success: true,

@@ -657,7 +657,7 @@ pub fn setting_variables() -> SettingVariables {
             "update.auto-schedule.timezone",
             vis(
                 VarType::String,
-                "自動アップデートのHHMMを評価するIANAタイムゾーン。Workerの既定値は Asia/Tokyo",
+                "自動アップデートのHHMMを評価するIANAタイムゾーン。未設定ならローカル時間(Worker の既定値は Asia/Tokyo)",
             ),
         ),
         (
@@ -903,7 +903,7 @@ pub fn setting_variables() -> SettingVariables {
             "queue.max-retries",
             invis(
                 VarType::Integer,
-                "ジョブが失敗したときに自動リトライする最大回数。0 でリトライ無効。既定は 3",
+                "ジョブが失敗したときに自動リトライする最大回数。0 でリトライ無効。既定は 3。※Cloudflare Workers 版はキューの consumer max_retries (デプロイ時の値) を超えても効かず、その値に丸められる",
             ),
         ),
         (
@@ -961,14 +961,14 @@ pub fn setting_variables() -> SettingVariables {
             "server-port",
             vis(
                 VarType::Integer,
-                "WEBサーバ起動時のポート。server-port + 1 のポートも WebSocket で使用",
+                "WEBサーバ起動時のポート。server-port + 1 のポートも WebSocket で使用\n※要サーバ再起動",
             ),
         ),
         (
             "server-bind",
             invis(
                 VarType::String,
-                "WEBサーバのホスト制限(未設定時:起動PCのIP)。頻繁にローカルIPが変わってしまう場合は127.0.0.1の指定を推奨",
+                "WEBサーバのホスト制限(未設定時:起動PCのIP)。頻繁にローカルIPが変わってしまう場合は127.0.0.1の指定を推奨\n※要サーバ再起動",
             ),
         ),
         (
@@ -1009,7 +1009,7 @@ pub fn setting_variables() -> SettingVariables {
             "server-basic-auth.require-for-external-bind",
             invis(
                 VarType::Boolean,
-                "外部公開bind時にBasic認証未設定での起動を拒否するかどうか",
+                "外部公開bind時にBasic認証未設定での起動を拒否するかどうか\n※サーバ起動時のみ評価",
             ),
         ),
         (
@@ -1077,13 +1077,9 @@ pub fn webui_help_override(name: &str, base_help: &str) -> Option<String> {
         "send.without-freeze" => {
             "一括送信時に凍結された小説は対象外にする。（個別送信時は凍結済みでも送信可能）"
         }
-        "server-basic-auth.enable" => {
-            "%%ORIG%%\n※basic-auth関連の設定を変更した場合サーバの再起動が必要"
+        "concurrency" => {
+            "%%ORIG%% ※キューワーカーのレーン構成のみサーバ再起動が必要（ログ分割は即時反映）"
         }
-        "concurrency" => "%%ORIG%% ※要サーバ再起動",
-        "logging" => "%%ORIG%%\n※要サーバ再起動",
-        "logging.format-filename" => "%%ORIG%%\n※要サーバ再起動",
-        "logging.format-timestamp" => "%%ORIG%%\n※要サーバ再起動",
         "auto-add-tags" => "小説サイトから取得したタグを自動的に小説データに追加する",
         "convert.add-dc-subject-to-epub" => {
             "EPUB変換時にstandard.opfファイルにdc:subject要素を追加する。\n小説のタグ情報がdc:subjectとして埋め込まれ、\n電子書籍リーダーでの検索やカテゴリ分類に活用できます。\n除外するタグは下の設定で指定できます"

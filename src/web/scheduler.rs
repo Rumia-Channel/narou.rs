@@ -50,7 +50,8 @@ pub fn start_auto_update_scheduler(
         return None;
     }
 
-    let catch_up_run = missed_run_time(&times, load_last_auto_update_run(), Local::now());
+    let timezone = load_schedule_timezone(&push_server);
+    let catch_up_run = missed_run_time(&times, load_last_auto_update_run(), Local::now(), timezone);
     Some(tokio::spawn(async move {
         if let Some(missed_run) = catch_up_run {
             run_scheduled_auto_update(
@@ -63,7 +64,7 @@ pub fn start_auto_update_scheduler(
         }
 
         loop {
-            let Some(next_run) = calculate_next_run_time(&times) else {
+            let Some(next_run) = calculate_next_run_time(&times, timezone) else {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 continue;
             };
@@ -78,6 +79,33 @@ pub fn start_auto_update_scheduler(
             );
         }
     }))
+}
+
+/// `update.auto-schedule.timezone` を IANA 名で解決する。
+/// 未設定・空・不正値はローカルタイムゾーン (`None`) にフォールバックする。
+fn load_schedule_timezone(push_server: &PushServer) -> Option<chrono_tz::Tz> {
+    let name = load_local_setting_string("update.auto-schedule.timezone")?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    match name.parse::<chrono_tz::Tz>() {
+        Ok(timezone) => Some(timezone),
+        Err(_) => {
+            eprintln!(
+                "update.auto-schedule.timezone の値が不正です (IANA 名で指定): {}",
+                name
+            );
+            push_server.broadcast_echo(
+                &format!(
+                    "update.auto-schedule.timezone の値が不正です (IANA 名で指定): {}",
+                    name
+                ),
+                "stdout",
+            );
+            None
+        }
+    }
 }
 
 pub fn start_or_restart_auto_update_scheduler(
@@ -166,8 +194,19 @@ fn parse_schedule_times(schedule_string: &str) -> Vec<(u32, u32)> {
     Schedule::parse(schedule_string).times
 }
 
-fn calculate_next_run_time(times: &[(u32, u32)]) -> Option<chrono::DateTime<Local>> {
-    calculate_next_run_time_after(times, Local::now())
+fn calculate_next_run_time(
+    times: &[(u32, u32)],
+    timezone: Option<chrono_tz::Tz>,
+) -> Option<chrono::DateTime<Local>> {
+    // タイムゾーン指定時はそのゾーンの壁時計で HHMM を解決し、結果だけを
+    // Local に戻す (sleep/display は Local ベースで統一するため)。
+    match timezone {
+        Some(tz) => {
+            calculate_next_run_time_after(times, Utc::now().with_timezone(&tz))
+                .map(|value| value.with_timezone(&Local))
+        }
+        None => calculate_next_run_time_after(times, Local::now()),
+    }
 }
 
 fn calculate_next_run_time_after<Tz>(
@@ -238,12 +277,22 @@ fn missed_run_time(
     times: &[(u32, u32)],
     last_run: Option<DateTime<Local>>,
     now: DateTime<Local>,
+    timezone: Option<chrono_tz::Tz>,
 ) -> Option<DateTime<Local>> {
     let last_run = last_run?;
     if last_run >= now {
         return None;
     }
-    let missed = calculate_next_run_time_after(times, last_run)?;
+    // `candidate > after` の比較は instant 同士なのでゾーン混在でも安全。
+    // ただし HHMM の壁時計解決自体は after.timezone() で行われるため、
+    // タイムゾーン指定時は last_run をそのゾーンに写してから次回を求める。
+    let missed = match timezone {
+        Some(tz) => {
+            calculate_next_run_time_after(times, last_run.with_timezone(&tz))?
+                .with_timezone(&Local)
+        }
+        None => calculate_next_run_time_after(times, last_run)?,
+    };
     (missed < now).then_some(missed)
 }
 
@@ -720,7 +769,7 @@ mod tests {
 
     #[test]
     fn calculate_next_run_time_returns_future_time() {
-        let next = calculate_next_run_time(&[(0, 0)]).unwrap();
+        let next = calculate_next_run_time(&[(0, 0)], None).unwrap();
         assert!(next > chrono::Local::now());
     }
 
@@ -740,7 +789,7 @@ mod tests {
     fn missed_run_time_triggers_single_catch_up_after_downtime() {
         let last_run = Local.with_ymd_and_hms(2026, 4, 20, 8, 0, 0).single().unwrap();
         let now = Local.with_ymd_and_hms(2026, 4, 20, 12, 0, 0).single().unwrap();
-        let missed = missed_run_time(&[(9, 0), (18, 0)], Some(last_run), now).unwrap();
+        let missed = missed_run_time(&[(9, 0), (18, 0)], Some(last_run), now, None).unwrap();
 
         assert_eq!(missed.hour(), 9);
         assert_eq!(missed.minute(), 0);

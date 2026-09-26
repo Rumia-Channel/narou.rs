@@ -2401,24 +2401,27 @@ pub async fn api_reboot(
     State(state): State<AppState>,
     Json(_body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => {
-            return Json(ApiResponse {
-                success: false,
-                message: e.to_string(),
-            });
+    match schedule_server_reboot(state.clone()).await {
+        Ok(()) => {
+            state.push_server.broadcast_event("reboot", "");
+            Json(ApiResponse {
+                success: true,
+                message: "Rebooting".to_string(),
+            })
         }
-    };
-    let current_dir = match std::env::current_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            return Json(ApiResponse {
-                success: false,
-                message: e.to_string(),
-            });
-        }
-    };
+        Err(message) => Json(ApiResponse {
+            success: false,
+            message,
+        }),
+    }
+}
+
+/// Spawns a replacement server process with the same CLI args, then exits this
+/// process after the new one is running. Used by `POST /api/reboot` and by
+/// `POST /api/storage/mode` (backend switch requires a restart).
+pub(crate) async fn schedule_server_reboot(state: AppState) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let current_dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let hide_console = crate::compat::inherited_hide_console_requested();
     let args = reboot_args_with_no_browser(std::env::args().skip(1).collect(), hide_console);
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2442,21 +2445,8 @@ pub async fn api_reboot(
         }
     });
     match rx.await {
-        Ok(Ok(())) => {
-            state.push_server.broadcast_event("reboot", "");
-            Json(ApiResponse {
-                success: true,
-                message: "Rebooting".to_string(),
-            })
-        }
-        Ok(Err(message)) => Json(ApiResponse {
-            success: false,
-            message,
-        }),
-        Err(_) => Json(ApiResponse {
-            success: false,
-            message: "failed to schedule reboot".to_string(),
-        }),
+        Ok(result) => result,
+        Err(_) => Err("failed to schedule reboot".to_string()),
     }
 }
 
@@ -3044,10 +3034,13 @@ mod tests {
             services: crate::web::default_app_services(Arc::new(
                 crate::platform::mocks::MemoryNovelRepository::new(),
             )),
-            basic_auth_header: None,
+            server_security: crate::web::test_server_security(
+                None,
+                vec!["localhost".to_string()],
+                false,
+            ),
+            bind_host: "localhost".into(),
             control_token: "control-token".to_string(),
-            allowed_request_hosts: vec!["localhost".to_string()],
-            reverse_proxy_mode: false,
             queue,
             restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(true)),

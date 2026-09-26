@@ -388,57 +388,70 @@ pub async fn storage_mode_get() -> Json<serde_json::Value> {
 /// `sqlite` writes the marker and re-initializes the database handle, which
 /// performs the one-time legacy import (originals are renamed, never deleted).
 /// `yaml` records the explicit choice so the tour never re-prompts.
+///
+/// `AppState` が保持する `Inventory` / `NativeStore` は構築時のストレージ
+/// モードを保持したままなので、モードが実際に変わる場合はこのプロセスを
+/// 再起動して差し替える (差し替え可能にすると読み書き経路が二重管理になる)。
 pub async fn storage_mode_set(
+    State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
-) -> Json<ApiResponse> {
+) -> Json<serde_json::Value> {
     #[cfg(feature = "native-runtime")]
     {
         use crate::native::sqlite::state;
+        let fail = |message: String| serde_json::json!({ "success": false, "message": message });
         let requested = body["mode"].as_str().unwrap_or("").trim().to_string();
         let mode = match requested.as_str() {
             "sqlite" => state::StorageMode::Sqlite,
             "yaml" => state::StorageMode::Yaml,
-            _ => {
-                return Json(ApiResponse {
-                    success: false,
-                    message: "mode must be 'sqlite' or 'yaml'".to_string(),
-                })
-            }
+            _ => return Json(fail("mode must be 'sqlite' or 'yaml'".to_string())),
         };
         let narou_dir = match crate::db::inventory::Inventory::with_default_root() {
             Ok(inventory) => inventory.root_dir().join(".narou"),
-            Err(error) => {
-                return Json(ApiResponse {
-                    success: false,
-                    message: error.to_string(),
-                })
-            }
+            Err(error) => return Json(fail(error.to_string())),
         };
+        let previous = state::read_mode(&narou_dir);
         match state::write_mode(&narou_dir, mode) {
             Ok(()) => match crate::db::init_database() {
-                Ok(()) => Json(ApiResponse {
-                    success: true,
-                    message: match mode {
-                        state::StorageMode::Sqlite => "SQLite管理へ移行しました".to_string(),
-                        state::StorageMode::Yaml => "YAML管理を継続します".to_string(),
-                    },
-                }),
-                Err(error) => Json(ApiResponse {
-                    success: false,
-                    message: error.to_string(),
-                }),
+                Ok(()) => {
+                    // モードが変わった場合だけ再起動する。同一モードへの書き込み
+                    // (ツアーの「YAML を継続」など) は即座に完了でよい。
+                    if previous != mode {
+                        return match super::jobs::schedule_server_reboot(state.clone()).await {
+                            Ok(()) => {
+                                state.push_server.broadcast_event("reboot", "");
+                                Json(serde_json::json!({
+                                    "success": true,
+                                    "reboot": true,
+                                    "message": "管理バックエンドを切り替えました。サーバを再起動します",
+                                }))
+                            }
+                            Err(error) => Json(serde_json::json!({
+                                "success": true,
+                                "reboot": false,
+                                "message": format!("管理バックエンドを切り替えました。自動再起動に失敗したのでサーバを手動で再起動して下さい: {error}"),
+                            })),
+                        };
+                    }
+                    Json(serde_json::json!({
+                        "success": true,
+                        "reboot": false,
+                        "message": match mode {
+                            state::StorageMode::Sqlite => "SQLite管理へ移行しました",
+                            state::StorageMode::Yaml => "YAML管理を継続します",
+                        },
+                    }))
+                }
+                Err(error) => Json(fail(error.to_string())),
             },
-            Err(error) => Json(ApiResponse {
-                success: false,
-                message: error.to_string(),
-            }),
+            Err(error) => Json(fail(error.to_string())),
         }
     }
     #[cfg(not(feature = "native-runtime"))]
-    Json(ApiResponse {
-        success: false,
-        message: "unsupported on this runtime".to_string(),
-    })
+    Json(serde_json::json!({
+        "success": false,
+        "message": "unsupported on this runtime",
+    }))
 }
 
 #[cfg(test)]

@@ -132,7 +132,7 @@ pub struct PushServer {
     console_history: Mutex<ConsoleHistoryState>,
     max_history: usize,
     max_clients: usize,
-    accepted_domains: Vec<String>,
+    accepted_domains: parking_lot::RwLock<Vec<String>>,
 }
 
 impl PushServer {
@@ -145,7 +145,7 @@ impl PushServer {
             console_history: Mutex::new(ConsoleHistoryState::default()),
             max_history: 10000,
             max_clients: MAX_WS_CLIENTS,
-            accepted_domains: vec!["127.0.0.1".to_string(), "localhost".to_string()],
+            accepted_domains: parking_lot::RwLock::new(vec!["127.0.0.1".to_string(), "localhost".to_string()]),
         }
     }
 
@@ -159,7 +159,7 @@ impl PushServer {
             console_history: Mutex::new(ConsoleHistoryState::default()),
             max_history,
             max_clients,
-            accepted_domains: vec!["127.0.0.1".to_string(), "localhost".to_string()],
+            accepted_domains: parking_lot::RwLock::new(vec!["127.0.0.1".to_string(), "localhost".to_string()]),
         }
     }
 
@@ -167,7 +167,10 @@ impl PushServer {
         &self.channel
     }
 
-    pub fn set_accepted_domains<I, S>(&mut self, domains: I)
+    /// Replaces the accepted WS origin domain list. `&self` so the
+    /// server-settings watcher can re-apply `server-ws-add-accepted-domains`
+    /// on a live server.
+    pub fn set_accepted_domains<I, S>(&self, domains: I)
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -178,15 +181,15 @@ impl PushServer {
             .map(|domain| domain.trim().to_string())
             .filter(|domain| !domain.is_empty())
             .collect();
-        self.accepted_domains = if collected.is_empty() {
+        *self.accepted_domains.write() = if collected.is_empty() {
             vec!["*".to_string()]
         } else {
             collected
         };
     }
 
-    pub fn accepted_domains(&self) -> &[String] {
-        &self.accepted_domains
+    pub fn accepted_domains(&self) -> Vec<String> {
+        self.accepted_domains.read().clone()
     }
 
     pub fn accepts_origin(&self, origin: &str) -> bool {
@@ -194,7 +197,7 @@ impl PushServer {
         if domain == "null" {
             return false;
         }
-        self.accepted_domains.iter().any(|pattern| {
+        self.accepted_domains.read().iter().any(|pattern| {
             pattern == "*"
                 || super::wildcard_host_match(
                     &pattern.to_ascii_lowercase(),
@@ -462,7 +465,7 @@ fn validate_ws_request(headers: &HeaderMap, state: &AppState) -> Result<(), Stat
     if !super::request_host_allowed_for_ports(headers, state, &allowed_ports) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if !super::basic_auth_matches(headers, state.basic_auth_header.as_deref()) {
+    if !super::basic_auth_matches(headers, state.server_security.read().basic_auth_header.as_deref()) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     let origin = headers
@@ -680,7 +683,7 @@ mod tests {
 
     #[test]
     fn accepts_origin_respects_wildcards() {
-        let mut server = PushServer::new();
+        let server = PushServer::new();
         server.set_accepted_domains(["127.0.0.1", "localhost", "*.example.com"]);
         assert!(server.accepts_origin("http://localhost:3000"));
         assert!(server.accepts_origin("https://api.example.com"));
@@ -703,7 +706,7 @@ mod tests {
 
     #[test]
     fn accepts_origin_allows_ip_literals_only_when_enabled() {
-        let mut server = PushServer::new();
+        let server = PushServer::new();
         server.set_accepted_domains(["localhost"]);
         assert!(!server.accepts_origin("http://192.168.1.10:4001"));
         server.set_accepted_domains(["localhost", "192.168.1.10"]);
@@ -720,7 +723,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&queue_dir);
         std::fs::create_dir_all(&queue_dir).unwrap();
 
-        let mut push_server = PushServer::new();
+        let push_server = PushServer::new();
         push_server.set_accepted_domains(["localhost"]);
         let state = AppState {
             port: 4000,
@@ -729,10 +732,13 @@ mod tests {
             services: crate::web::default_app_services(Arc::new(
                 crate::platform::mocks::MemoryNovelRepository::new(),
             )),
-            basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
+            server_security: crate::web::test_server_security(
+                Some("Basic dXNlcjpwYXNz"),
+                vec!["localhost".to_string()],
+                false,
+            ),
+            bind_host: "localhost".into(),
             control_token: "control-token".to_string(),
-            allowed_request_hosts: vec!["localhost".to_string()],
-            reverse_proxy_mode: false,
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -785,7 +791,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&queue_dir);
         std::fs::create_dir_all(&queue_dir).unwrap();
 
-        let mut push_server = PushServer::new();
+        let push_server = PushServer::new();
         push_server.set_accepted_domains(Vec::<String>::new());
         let state = AppState {
             port: 4000,
@@ -794,10 +800,13 @@ mod tests {
             services: crate::web::default_app_services(Arc::new(
                 crate::platform::mocks::MemoryNovelRepository::new(),
             )),
-            basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
+            server_security: crate::web::test_server_security(
+                Some("Basic dXNlcjpwYXNz"),
+                vec!["localhost".to_string()],
+                true,
+            ),
+            bind_host: "localhost".into(),
             control_token: "control-token".to_string(),
-            allowed_request_hosts: vec!["localhost".to_string()],
-            reverse_proxy_mode: true,
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -993,7 +1002,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&queue_dir);
         std::fs::create_dir_all(&queue_dir).unwrap();
 
-        let mut push_server = PushServer::new();
+        let push_server = PushServer::new();
         push_server.set_accepted_domains(["localhost"]);
         let state = AppState {
             port: 4000,
@@ -1002,10 +1011,13 @@ mod tests {
             services: crate::web::default_app_services(Arc::new(
                 crate::platform::mocks::MemoryNovelRepository::new(),
             )),
-            basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
+            server_security: crate::web::test_server_security(
+                Some("Basic dXNlcjpwYXNz"),
+                vec!["localhost".to_string()],
+                false,
+            ),
+            bind_host: "localhost".into(),
             control_token: "control-token".to_string(),
-            allowed_request_hosts: vec!["localhost".to_string()],
-            reverse_proxy_mode: false,
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),

@@ -11,6 +11,7 @@ pub mod novel_settings;
 pub mod novels;
 pub mod push;
 pub mod scheduler;
+pub mod server_security;
 pub mod sort_state;
 pub mod state;
 pub mod tags;
@@ -69,10 +70,13 @@ pub struct AppState {
     pub ws_port: u16,
     pub push_server: Arc<push::PushServer>,
     pub services: Arc<crate::application::AppServices>,
-    pub basic_auth_header: Option<String>,
+    /// Runtime-mutable `server-*` settings (basic-auth header, Host allow-list,
+    /// reverse-proxy mode). Re-applied by `AppState::reload_server_security`.
+    pub server_security: Arc<parking_lot::RwLock<server_security::ServerSecurity>>,
+    /// Host the listeners were bound to; seeds `default_allowed_request_hosts`
+    /// when the security settings are reloaded.
+    pub bind_host: Arc<str>,
     pub control_token: String,
-    pub allowed_request_hosts: Vec<String>,
-    pub reverse_proxy_mode: bool,
     pub queue: Arc<crate::queue::PersistentQueue>,
     pub restore_prompt_pending: Arc<AtomicBool>,
     pub restorable_tasks_available: Arc<AtomicBool>,
@@ -136,6 +140,21 @@ pub(crate) fn default_app_services(
         },
     ))
 }
+#[cfg(test)]
+pub(crate) fn test_server_security(
+    basic_auth_header: Option<&str>,
+    allowed_request_hosts: Vec<String>,
+    reverse_proxy_mode: bool,
+) -> Arc<parking_lot::RwLock<server_security::ServerSecurity>> {
+    Arc::new(parking_lot::RwLock::new(server_security::ServerSecurity {
+        basic_auth_header: basic_auth_header.map(str::to_string),
+        allowed_request_hosts,
+        accepted_ws_domains: Vec::new(),
+        reverse_proxy_mode,
+        require_basic_auth_for_external_bind: true,
+    }))
+}
+
 pub(crate) async fn configured_tag_color(state: &AppState) -> Option<String> {
     state
         .services
@@ -276,7 +295,7 @@ pub(crate) fn request_host_allowed_for_ports(
     else {
         return false;
     };
-    if state.reverse_proxy_mode {
+    if state.server_security.read().reverse_proxy_mode {
         return parse_authority_host_and_port(host, false).is_some();
     }
     authority_matches_state(host, state, expected_ports, false)
@@ -302,7 +321,7 @@ pub(crate) fn origin_allowed_for_ports(
     let Some(origin) = origin else {
         return false;
     };
-    if state.reverse_proxy_mode {
+    if state.server_security.read().reverse_proxy_mode {
         return origin_matches_forwarded_host(headers, origin);
     }
     authority_matches_state(origin, state, expected_ports, true)
@@ -381,7 +400,7 @@ fn host_allowed(host: &str, state: &AppState) -> bool {
     if normalized.is_empty() {
         return false;
     }
-    state.allowed_request_hosts.iter().any(|allowed| {
+    state.server_security.read().allowed_request_hosts.iter().any(|allowed| {
         let pattern = normalize_host_name(allowed);
         if pattern == normalized {
             return true;
@@ -721,10 +740,11 @@ async fn basic_auth_middleware(
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
-    if state.basic_auth_header.is_none() {
+    let expected = state.server_security.read().basic_auth_header.clone();
+    let Some(expected) = expected else {
         return next.run(request).await;
-    }
-    if basic_auth_matches(request.headers(), state.basic_auth_header.as_deref()) {
+    };
+    if basic_auth_matches(request.headers(), Some(expected.as_str())) {
         return next.run(request).await;
     }
 
@@ -799,7 +819,7 @@ mod tests {
 
     fn test_state() -> AppState {
         let queue_dir = test_artifact_dir("security-state");
-        let mut push_server = crate::web::push::PushServer::new();
+        let push_server = crate::web::push::PushServer::new();
         push_server.set_accepted_domains(["127.0.0.1", "localhost", "*.example.com"]);
         AppState {
             port: 8080,
@@ -808,10 +828,13 @@ mod tests {
             services: super::default_app_services(Arc::new(
                 crate::platform::mocks::MemoryNovelRepository::new(),
             )),
-            basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
+            server_security: super::test_server_security(
+                Some("Basic dXNlcjpwYXNz"),
+                vec!["127.0.0.1".to_string(), "localhost".to_string()],
+                false,
+            ),
+            bind_host: "127.0.0.1".into(),
             control_token: "control-token".to_string(),
-            allowed_request_hosts: vec!["127.0.0.1".to_string(), "localhost".to_string()],
-            reverse_proxy_mode: false,
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -827,7 +850,7 @@ mod tests {
 
     fn test_state_with_allowed_hosts(extra_hosts: Vec<String>) -> AppState {
         let queue_dir = test_artifact_dir("host-allowed");
-        let mut push_server = crate::web::push::PushServer::new();
+        let push_server = crate::web::push::PushServer::new();
         push_server.set_accepted_domains(["127.0.0.1", "localhost"]);
         AppState {
             port: 8080,
@@ -836,10 +859,13 @@ mod tests {
             services: super::default_app_services(Arc::new(
                 crate::platform::mocks::MemoryNovelRepository::new(),
             )),
-            basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
+            server_security: super::test_server_security(
+                Some("Basic dXNlcjpwYXNz"),
+                extra_hosts,
+                false,
+            ),
+            bind_host: "127.0.0.1".into(),
             control_token: "control-token".to_string(),
-            allowed_request_hosts: extra_hosts,
-            reverse_proxy_mode: false,
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -963,8 +989,8 @@ mod tests {
 
     #[test]
     fn reverse_proxy_mode_accepts_forwarded_same_origin_hosts() {
-        let mut state = test_state();
-        state.reverse_proxy_mode = true;
+        let state = test_state();
+        state.server_security.write().reverse_proxy_mode = true;
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             axum::http::header::HOST,
