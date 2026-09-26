@@ -86,8 +86,8 @@ async fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, D
                 break;
             }
 
-            if !opts.force {
-                if let Some(existing) = inspect_existing_download(&download_target) {
+            if !opts.force
+                && let Some(existing) = inspect_existing_download(&download_target) {
                     match existing {
                         ExistingDownloadState::Present(rec) => {
                             println!(
@@ -111,7 +111,6 @@ async fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, D
                         }
                     }
                 }
-            }
 
             let progress: Box<dyn narou_rs::progress::ProgressReporter> = if is_web_mode() {
                 Box::new(WebProgress::new("download"))
@@ -257,8 +256,7 @@ pub(crate) fn tagname_to_ids(targets: &[String]) -> Vec<String> {
     };
 
     for target in targets {
-        if target.starts_with("tag:") {
-            let tag_name = &target[4..];
+        if let Some(tag_name) = target.strip_prefix("tag:") {
             let ids = tag_ids(tag_name);
             if ids.is_empty() {
                 expanded.push(tag_name.to_string());
@@ -270,8 +268,7 @@ pub(crate) fn tagname_to_ids(targets: &[String]) -> Vec<String> {
                     }
                 }
             }
-        } else if target.starts_with("^tag:") {
-            let tag_name = &target[5..];
+        } else if let Some(tag_name) = target.strip_prefix("^tag:") {
             let exclude_ids: std::collections::HashSet<i64> =
                 tag_ids(tag_name).into_iter().collect();
             let filter = narou_rs::platform::NovelFilter::all();

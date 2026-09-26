@@ -146,42 +146,6 @@ async fn api_list_inner(
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::NovelListItem;
-    use serde_json::json;
-
-    #[test]
-    fn novel_list_item_serializes_dates_as_epoch_integers() {
-        let item = NovelListItem {
-            id: 5,
-            title: "title".to_string(),
-            author: "author".to_string(),
-            sitename: "site".to_string(),
-            novel_type: 1,
-            end: false,
-            last_update: 1_776_384_000,
-            general_lastup: Some(1_776_470_400),
-            last_check_date: Some(1_776_556_800),
-            new_arrivals_date: Some(1_776_384_000),
-            tags: vec!["tag".to_string()],
-            new_arrivals: true,
-            frozen: false,
-            suspend: false,
-            length: Some(1234),
-            toc_url: "https://example.com".to_string(),
-            ncode: Some("n1234ab".to_string()),
-            general_all_no: Some(99),
-        };
-
-        let value = serde_json::to_value(item).unwrap();
-        assert_eq!(value["last_update"], json!(1_776_384_000));
-        assert_eq!(value["general_lastup"], json!(1_776_470_400));
-        assert_eq!(value["last_check_date"], json!(1_776_556_800));
-        assert_eq!(value["new_arrivals_date"], json!(1_776_384_000));
-    }
-}
-
 pub async fn get_novel(
     State(state): State<AppState>,
     Path(IdPath { id }): Path<IdPath>,
@@ -553,7 +517,7 @@ async fn generate_epub_on_demand(
             .ok()
             .map(|inventory| inventory.root_dir().join(".narou"))
         && let Some(state) = crate::native::sqlite::state::active_for(&narou_dir)
-        && let Some(payload) = (|| {
+        && let Some(payload) = {
             let conn = state.conn_ref();
             conn.lock()
                 .expect("sqlite mutex poisoned")
@@ -563,7 +527,7 @@ async fn generate_epub_on_demand(
                     |row| row.get::<_, Vec<u8>>(0),
                 )
                 .ok()
-        })()
+        }
         && !payload.is_empty()
     {
         let filename = format!("novel-{id}.epub");
@@ -656,4 +620,40 @@ fn serve_epub_bytes(bytes: Vec<u8>, filename: &str) -> Result<Response, (StatusC
         .headers_mut()
         .insert(header::CONTENT_DISPOSITION, disposition_value);
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NovelListItem;
+    use serde_json::json;
+
+    #[test]
+    fn novel_list_item_serializes_dates_as_epoch_integers() {
+        let item = NovelListItem {
+            id: 5,
+            title: "title".to_string(),
+            author: "author".to_string(),
+            sitename: "site".to_string(),
+            novel_type: 1,
+            end: false,
+            last_update: 1_776_384_000,
+            general_lastup: Some(1_776_470_400),
+            last_check_date: Some(1_776_556_800),
+            new_arrivals_date: Some(1_776_384_000),
+            tags: vec!["tag".to_string()],
+            new_arrivals: true,
+            frozen: false,
+            suspend: false,
+            length: Some(1234),
+            toc_url: "https://example.com".to_string(),
+            ncode: Some("n1234ab".to_string()),
+            general_all_no: Some(99),
+        };
+
+        let value = serde_json::to_value(item).unwrap();
+        assert_eq!(value["last_update"], json!(1_776_384_000));
+        assert_eq!(value["general_lastup"], json!(1_776_470_400));
+        assert_eq!(value["last_check_date"], json!(1_776_556_800));
+        assert_eq!(value["new_arrivals_date"], json!(1_776_384_000));
+    }
 }

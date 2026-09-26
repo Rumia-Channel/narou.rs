@@ -279,7 +279,7 @@ fn decode_frame(archive: &[u8], name: &str) -> Result<Option<image::RgbaImage>> 
     };
     let mut data = Vec::new();
     file.read_to_end(&mut data)
-        .map_err(|error| NarouError::Io(error))?;
+        .map_err(NarouError::Io)?;
     match image::load_from_memory(&data) {
         Ok(decoded) => Ok(Some(decoded.to_rgba8())),
         Err(error) => {
@@ -292,7 +292,7 @@ fn decode_frame(archive: &[u8], name: &str) -> Result<Option<image::RgbaImage>> 
 /// フレーム番号に対応する表示時間 (足りなければ最後の値を使う)。
 #[cfg(feature = "illustration-animation")]
 fn delay_at(delays: &[u16], index: usize) -> u16 {
-    u16::from(*delays.get(index).unwrap_or(&delays[delays.len() - 1]))
+    *delays.get(index).unwrap_or(&delays[delays.len() - 1])
 }
 
 #[cfg(feature = "illustration-animation")]

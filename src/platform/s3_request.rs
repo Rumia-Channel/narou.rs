@@ -196,11 +196,10 @@ pub fn parse_list_objects_v2(xml: &str) -> Result<S3ListPage> {
         cursor = content_start + end + "</Contents>".len();
     }
 
-    if let Some(value) = element_text(xml, "NextContinuationToken") {
-        if !value.is_empty() {
+    if let Some(value) = element_text(xml, "NextContinuationToken")
+        && !value.is_empty() {
             next_token = Some(value);
         }
-    }
     if element_text(xml, "IsTruncated").is_some_and(|value| value.trim() == "true") && next_token.is_none() {
         return Err(NarouError::Platform(
             "ListObjectsV2 response is truncated without a continuation token".to_string(),

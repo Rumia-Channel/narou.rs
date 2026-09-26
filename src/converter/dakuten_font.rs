@@ -16,11 +16,10 @@ const DAKUTEN_FONT_NAME: &str = "DMincho.ttf";
 
 fn preset_dir() -> Result<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent() {
             candidates.push(parent.join("preset"));
         }
-    }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     candidates.push(manifest_dir.join("preset"));
     candidates.push(manifest_dir.join("sample").join("narou").join("preset"));

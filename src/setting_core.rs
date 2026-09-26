@@ -45,11 +45,9 @@ pub fn cast_setting_value(name: &str, value_str: &str) -> Result<serde_yaml::Val
     if let Some(rest) = name
         .strip_prefix("default.")
         .or_else(|| name.strip_prefix("force."))
-    {
-        if let Some(info) = original_setting_var_info(rest) {
+        && let Some(info) = original_setting_var_info(rest) {
             return cast_value_for_type(info.var_type, value_str, info.select_keys.as_deref());
         }
-    }
 
     if setting_info::is_known_default_arg_name(name) {
         return Ok(serde_yaml::Value::String(value_str.to_string()));
@@ -68,11 +66,9 @@ pub fn coerce_json_setting_value(
     if let Some(base_name) = name
         .strip_prefix("default.")
         .or_else(|| name.strip_prefix("force."))
-    {
-        if let Some(info) = original_setting_var_info(base_name) {
+        && let Some(info) = original_setting_var_info(base_name) {
             return coerce_value_for_type(&info, value);
         }
-    }
     if setting_info::is_known_default_arg_name(name) {
         return coerce_string_value(value);
     }
@@ -152,14 +148,13 @@ fn cast_value_for_type(
 ) -> Result<serde_yaml::Value, String> {
     match var_type {
         VarType::Select => {
-            if let Some(keys) = select_keys {
-                if !keys.iter().any(|k| k == value_str) {
+            if let Some(keys) = select_keys
+                && !keys.iter().any(|k| k == value_str) {
                     return Err(format!(
                         "不明な値です。{} の中から指定して下さい",
                         keys.join(", ")
                     ));
                 }
-            }
             Ok(serde_yaml::Value::String(value_str.to_string()))
         }
         VarType::Multiple => {
@@ -300,14 +295,13 @@ fn coerce_select_value(
         serde_json::Value::String(raw) => raw.clone(),
         _ => return Err("選択肢の中から指定して下さい".to_string()),
     };
-    if let Some(keys) = select_keys {
-        if !keys.iter().any(|key| key == &selected) {
+    if let Some(keys) = select_keys
+        && !keys.iter().any(|key| key == &selected) {
             return Err(format!(
                 "不明な値です。{} の中から指定して下さい",
                 keys.join(", ")
             ));
         }
-    }
     Ok(serde_yaml::Value::String(selected))
 }
 

@@ -121,7 +121,7 @@ pub fn sort_record_ordering(a: &NovelRecord, b: &NovelRecord, sort_key: &str) ->
     compare_records_by_key(a, b, sort_key)
 }
 
-pub(crate) fn sort_records(records: &mut Vec<NovelRecord>, sort_state: &CurrentSortState) {
+pub(crate) fn sort_records(records: &mut [NovelRecord], sort_state: &CurrentSortState) {
     let sort_key = sort_column_key(sort_state).unwrap_or("id");
     let reverse = sort_state.dir == "desc";
     records.sort_by(|a, b| {

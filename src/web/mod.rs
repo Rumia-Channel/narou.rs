@@ -405,8 +405,8 @@ fn split_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
             .and_then(|value| value.parse::<u16>().ok());
         return Some((host, port));
     }
-    if let Some((host, port)) = trimmed.rsplit_once(':') {
-        if !host.contains(':') {
+    if let Some((host, port)) = trimmed.rsplit_once(':')
+        && !host.contains(':') {
             let host = host.trim().to_ascii_lowercase();
             if host.is_empty() {
                 return None;
@@ -414,7 +414,6 @@ fn split_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
             let port = port.parse::<u16>().ok();
             return Some((host, port));
         }
-    }
     Some((trimmed.to_ascii_lowercase(), None))
 }
 

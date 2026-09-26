@@ -64,8 +64,8 @@ pub fn compile_html_pattern(pattern: &str) -> std::result::Result<regex::Regex, 
 pub fn pretreatment_source(src: &mut String, _encoding: &str, setting: Option<&SiteSetting>) {
     src.retain(|c| c != '\r');
     decode_numeric_entities(src);
-    if let Some(setting) = setting {
-        if let Some(pipeline) = setting.preprocess_pipeline() {
+    if let Some(setting) = setting
+        && let Some(pipeline) = setting.preprocess_pipeline() {
             let jobs = preprocess::PreprocessJobs::new();
             let run = preprocess::run_preprocess(pipeline, src, &jobs, "");
             if !run.requested.is_empty() {
@@ -76,7 +76,6 @@ pub fn pretreatment_source(src: &mut String, _encoding: &str, setting: Option<&S
                 );
             }
         }
-    }
 }
 
 /// Rewrite a fetched body in place, executing any URLs the definition asks for.

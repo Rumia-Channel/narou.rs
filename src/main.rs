@@ -130,19 +130,6 @@ fn read_targets_from_stdin() -> Vec<String> {
     parse_stdin_targets(&input)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_stdin_targets;
-
-    #[test]
-    fn parse_stdin_targets_splits_piped_ids_like_ruby_argv() {
-        assert_eq!(
-            parse_stdin_targets("3 2\r\n1\t4\n"),
-            vec!["3", "2", "1", "4"]
-        );
-    }
-}
-
 #[cfg(windows)]
 fn raw_hide_console_requested() -> bool {
     if narou_rs::compat::inherited_hide_console_requested() {
@@ -182,11 +169,10 @@ async fn main() {
     // cwd にして本体を起動する。`.narou` はライブラリ dir にあるため、
     // 親が渡した `NAROU_RS_RESTART_CWD` へ戻してから通常処理に入る。
     // 旧 updater でも環境変数は透過するため後方互換。
-    if let Ok(dir) = std::env::var("NAROU_RS_RESTART_CWD") {
-        if !dir.is_empty() {
+    if let Ok(dir) = std::env::var("NAROU_RS_RESTART_CWD")
+        && !dir.is_empty() {
             let _ = std::env::set_current_dir(&dir);
         }
-    }
 
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -343,6 +329,10 @@ async fn run_command(
             .await;
             0
         }
+        Commands::Csv { output, import } => {
+            // CSV 取り込みは download コマンド経由で取得するため非同期側で処理する。
+            commands::csv::cmd_csv(output.as_deref(), import.as_deref()).await
+        }
         other => run_sync_command(other, trace_args, backtrace),
     }
 }
@@ -360,7 +350,9 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                 0
             }
         }
-        Commands::Download { .. } | Commands::Update { .. } => unreachable!(),
+        Commands::Download { .. } | Commands::Update { .. } | Commands::Csv { .. } => {
+            unreachable!()
+        }
         Commands::Mail { targets, force } => {
             commands::mail::cmd_mail(commands::mail::MailOptions { targets, force });
             0
@@ -537,9 +529,6 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             all,
         } => commands::clean::cmd_clean(&targets, force, dry_run, all),
         Commands::Inspect { targets } => commands::inspect::cmd_inspect(&targets),
-        Commands::Csv { output, import } => {
-            commands::csv::cmd_csv(output.as_deref(), import.as_deref())
-        }
         Commands::Trace => match commands::trace::cmd_trace() {
             Ok(_) => 0,
             Err(e) => {
@@ -605,5 +594,18 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             }
             127
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_stdin_targets;
+
+    #[test]
+    fn parse_stdin_targets_splits_piped_ids_like_ruby_argv() {
+        assert_eq!(
+            parse_stdin_targets("3 2\r\n1\t4\n"),
+            vec!["3", "2", "1", "4"]
+        );
     }
 }

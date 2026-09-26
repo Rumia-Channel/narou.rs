@@ -263,8 +263,8 @@ mod tests {
         let illust_dir = dir.join("挿絵");
         std::fs::create_dir_all(&illust_dir).unwrap();
         let png_bytes = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00];
-        std::fs::write(illust_dir.join("cover.jpg"), &png_bytes).unwrap();
-        std::fs::write(illust_dir.join("ok.png"), &png_bytes).unwrap();
+        std::fs::write(illust_dir.join("cover.jpg"), png_bytes).unwrap();
+        std::fs::write(illust_dir.join("ok.png"), png_bytes).unwrap();
 
         let plans = illustration_store::plan_extension_fixes(&illust_dir).unwrap();
 

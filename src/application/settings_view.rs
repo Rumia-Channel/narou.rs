@@ -261,7 +261,7 @@ fn select_summaries_for_setting(name: &str, info: &VarInfo) -> Option<Vec<String
     Some(match base_name {
         "device" | "convert.multi-device" => keys
             .iter()
-            .map(|key| Device::from_str(key).display_name().to_string())
+            .map(|key| key.parse::<Device>().unwrap_or(Device::Text).display_name().to_string())
             .collect(),
         "update.sort-by" => keys
             .iter()

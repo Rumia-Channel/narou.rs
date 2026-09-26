@@ -172,10 +172,7 @@ pub async fn cmd_update(opts: UpdateOptions) {
         && !is_web_mode()
         && !opts.force;
 
-    let domain_records = match collect_record_domains(&target_ids) {
-        Ok(map) => map,
-        Err(_) => HashMap::new(),
-    };
+    let domain_records = collect_record_domains(&target_ids).unwrap_or_default();
 
     let update_result = if parallel_eligible {
         let domain_groups = build_domain_groups(
@@ -373,9 +370,7 @@ fn merge_cli_and_stdin_targets(
 fn resolve_sort_key(key: Option<&str>) -> Option<String> {
     let key = key?;
     let key_lower = key.to_lowercase();
-    if SORT_COLUMN_KEYS
-        .iter()
-        .any(|candidate| *candidate == key_lower.as_str())
+    if SORT_COLUMN_KEYS.contains(&key_lower.as_str())
         || key_lower == "new_arrivals_date"
     {
         return Some(key_lower);
@@ -615,14 +610,11 @@ fn repair_empty_titles() {
         let novel_dir = narou_rs::db::novel_dir_for_record(&archive_root, &r);
         let toc_path = novel_dir.join("toc.yaml");
         let mut fixed_fields: Option<(String, String)> = None;
-        if let Ok(toc_content) = std::fs::read_to_string(&toc_path) {
-            if let Ok(toc) = serde_yaml::from_str::<narou_rs::downloader::TocFile>(&toc_content)
-            {
-                if !toc.title.is_empty() || !toc.author.is_empty() {
+        if let Ok(toc_content) = std::fs::read_to_string(&toc_path)
+            && let Ok(toc) = serde_yaml::from_str::<narou_rs::downloader::TocFile>(&toc_content)
+                && (!toc.title.is_empty() || !toc.author.is_empty()) {
                     fixed_fields = Some((toc.title, toc.author));
                 }
-            }
-        }
         let (title, author) = fixed_fields.unwrap_or_else(|| {
             let title = extract_title_from_file_title(&r.file_title);
             (title, String::new())
@@ -662,12 +654,11 @@ fn extract_title_from_file_title(file_title: &str) -> String {
 
 fn remove_modified_tag(id: i64) {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    if let Ok(Some(mut r)) = novels.get_sync(id.into()) {
-        if r.tags.iter().any(|tag| tag == MODIFIED_TAG) {
+    if let Ok(Some(mut r)) = novels.get_sync(id.into())
+        && r.tags.iter().any(|tag| tag == MODIFIED_TAG) {
             r.tags.retain(|t| t != MODIFIED_TAG);
             let _ = novels.apply_batch_sync(vec![narou_rs::platform::NovelMutation::Upsert(r)]);
         }
-    }
     narou_rs::progress::emit_novel_refresh(id);
 }
 
@@ -1092,15 +1083,14 @@ fn copy_to_hotentry_output(
         ));
     }
     let mut dst_dir = base;
-    if let Some(device) = _device {
-        if narou_rs::compat::load_local_setting_list("convert.copy-to-grouping")
+    if let Some(device) = _device
+        && narou_rs::compat::load_local_setting_list("convert.copy-to-grouping")
             .iter()
             .any(|value| value.eq_ignore_ascii_case("device"))
         {
             dst_dir.push(device.display_name());
             std::fs::create_dir_all(&dst_dir).map_err(|e| e.to_string())?;
         }
-    }
     let dst = dst_dir.join(
         src_path
             .file_name()
@@ -1797,10 +1787,7 @@ async fn process_novel_for_update(
             };
 
             if needs_convert && has_convert_failure {
-                safe_println_fn(&format!(
-                    "{}",
-                    colored("前回変換できなかったので再変換します", "yellow")
-                ));
+                safe_println_fn(&colored("前回変換できなかったので再変換します", "yellow").to_string());
             }
 
             if needs_convert {
@@ -2136,7 +2123,7 @@ mod tests {
             (6, Some("kakuyomu.jp")),
         ];
 
-        let groups = build_domain_groups(records.into_iter());
+        let groups = build_domain_groups(records);
 
         let mut by_name: HashMap<String, Vec<i64>> = HashMap::new();
         for (key, ids) in groups {
@@ -2180,7 +2167,7 @@ mod tests {
             (10, Some("syosetu.org")),
             (11, Some("syosetu.org")),
         ];
-        let groups = build_domain_groups(records.into_iter());
+        let groups = build_domain_groups(records);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0, "syosetu.org");
         assert_eq!(groups[0].1, vec![10, 11]);

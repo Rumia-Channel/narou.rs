@@ -270,15 +270,14 @@ impl NovelConverter {
         let mut erased_intro_count = 0usize;
         let mut erased_post_count = 0usize;
         let mut converted_story = String::new();
-        if let Some(ref story) = toc.story {
-            if !story.is_empty() {
+        if let Some(ref story) = toc.story
+            && !story.is_empty() {
                 let mut converter =
                     self.make_converter_with_parenthesized_ruby(!render::looks_like_html(story));
                 let story_text = render::normalize_story_source(story);
                 converted_story = converter.convert(&story_text, converter_base::TextType::Story);
                 self.use_dakuten_font |= converter.use_dakuten_font;
             }
-        }
 
         let mut converted_sections = Vec::new();
         let total = sections.len() as u64;
@@ -424,8 +423,7 @@ impl NovelConverter {
             let conv_body = results[ri].clone();
             ri += 1;
             let conv_post = if has_post {
-                let r = results[ri].clone();
-                r
+                results[ri].clone()
             } else {
                 String::new()
             };
@@ -932,9 +930,9 @@ impl NovelConverter {
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();
         let toc_path = novel_dir.join("toc.yaml");
-        let toc_content = std::fs::read_to_string(&toc_path).map_err(|e| NarouError::Io(e))?;
+        let toc_content = std::fs::read_to_string(&toc_path).map_err(NarouError::Io)?;
         let toc: crate::downloader::TocFile =
-            serde_yaml::from_str(&toc_content).map_err(|e| NarouError::Yaml(e))?;
+            serde_yaml::from_str(&toc_content).map_err(NarouError::Yaml)?;
 
         let toc_object = crate::downloader::TocObject {
             title: toc.title,
@@ -990,7 +988,7 @@ impl NovelConverter {
                     let _ =
                         crate::native::sqlite::content::store_sections(&mut guard, id, &sections_map);
                     let _ = crate::native::sqlite::content::store_output(
-                        &mut guard,
+                        &guard,
                         id,
                         "converted_text",
                         aozora_text.as_bytes(),
@@ -1025,9 +1023,9 @@ impl NovelConverter {
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();
         let toc_path = novel_dir.join("toc.yaml");
-        let toc_content = std::fs::read_to_string(&toc_path).map_err(|e| NarouError::Io(e))?;
+        let toc_content = std::fs::read_to_string(&toc_path).map_err(NarouError::Io)?;
         let toc: crate::downloader::TocFile =
-            serde_yaml::from_str(&toc_content).map_err(|e| NarouError::Yaml(e))?;
+            serde_yaml::from_str(&toc_content).map_err(NarouError::Yaml)?;
 
         let toc_object = crate::downloader::TocObject {
             title: toc.title,
@@ -1088,7 +1086,7 @@ impl NovelConverter {
                         &sections_map,
                     );
                     let _ = crate::native::sqlite::content::store_output(
-                        &mut guard,
+                        &guard,
                         _id,
                         "converted_text",
                         aozora_text.as_bytes(),
@@ -1455,9 +1453,9 @@ fn load_sections_from_dir(
                     })?
             }
         };
-        let content = std::fs::read_to_string(&path).map_err(|e| NarouError::Io(e))?;
+        let content = std::fs::read_to_string(&path).map_err(NarouError::Io)?;
         let section: crate::downloader::SectionFile =
-            serde_yaml::from_str(&content).map_err(|e| NarouError::Yaml(e))?;
+            serde_yaml::from_str(&content).map_err(NarouError::Yaml)?;
         sections.push(section);
     }
 
@@ -1819,8 +1817,10 @@ mod tests {
         std::fs::write(illust_dir.join("i422674.png"), b"dummy").unwrap();
         let hash = hash_bytes(b"dummy");
 
-        let mut settings = NovelSettings::default();
-        settings.archive_path = root.clone();
+        let settings = NovelSettings {
+            archive_path: root.clone(),
+            ..NovelSettings::default()
+        };
         let section = make_illustration_section();
         let mut converter = NovelConverter::new(settings);
         let resolved = converter.resolve_section_html_illustrations(&section);
@@ -1872,8 +1872,10 @@ mod tests {
         std::fs::create_dir_all(&illust_dir).unwrap();
         std::fs::write(illust_dir.join("i422674.jpg"), b"dummy").unwrap();
 
-        let mut settings = NovelSettings::default();
-        settings.archive_path = root.clone();
+        let settings = NovelSettings {
+            archive_path: root.clone(),
+            ..NovelSettings::default()
+        };
         let mut section = make_illustration_section();
         section.element.body = format!("{}{}", section.element.body, section.element.body);
         let mut converter = NovelConverter::new(settings);
@@ -1894,8 +1896,10 @@ mod tests {
         std::fs::create_dir_all(&illust_dir).unwrap();
         std::fs::write(illust_dir.join("i422674.jpg"), b"dummy").unwrap();
 
-        let mut settings = NovelSettings::default();
-        settings.archive_path = root.clone();
+        let settings = NovelSettings {
+            archive_path: root.clone(),
+            ..NovelSettings::default()
+        };
         let toc = TocObject {
             title: "title".to_string(),
             author: "author".to_string(),
@@ -2007,11 +2011,13 @@ mod tests {
     fn convert_text_file_records_enchant_midashi_recommendation() {
         let root = make_temp_illustration_root();
 
-        let mut settings = NovelSettings::default();
-        settings.archive_path = root.clone();
-        settings.output_filename = "converted.txt".to_string();
-        settings.enable_enchant_midashi = false;
-        settings.enable_inspect = true;
+        let settings = NovelSettings {
+            archive_path: root.clone(),
+            output_filename: "converted.txt".to_string(),
+            enable_enchant_midashi: false,
+            enable_inspect: true,
+            ..NovelSettings::default()
+        };
 
         let mut converter = NovelConverter::new(settings);
         converter.set_display_inspector(true);
@@ -2055,13 +2061,17 @@ mod tests {
 
         let baseline = NovelConverter::new(NovelSettings::default()).compute_digest(&section);
 
-        let mut settings_changed = NovelSettings::default();
-        settings_changed.enable_strip_decoration_tag = true;
+        let settings_changed = NovelSettings {
+            enable_strip_decoration_tag: true,
+            ..NovelSettings::default()
+        };
         let settings_digest = NovelConverter::new(settings_changed).compute_digest(&section);
         assert_ne!(baseline, settings_digest);
 
-        let mut replace_changed = NovelSettings::default();
-        replace_changed.replace_patterns = vec![("本文".to_string(), "置換本文".to_string())];
+        let replace_changed = NovelSettings {
+            replace_patterns: vec![("本文".to_string(), "置換本文".to_string())],
+            ..NovelSettings::default()
+        };
         let replace_digest = NovelConverter::new(replace_changed).compute_digest(&section);
         assert_ne!(baseline, replace_digest);
 
@@ -2131,8 +2141,10 @@ before_settings:
             Some(crate::illustration_store::IllustrationIndex::default());
         capabilities.illustration_prefix = Some(ObjectKey::try_new("novels").unwrap());
 
-        let mut settings = NovelSettings::default();
-        settings.archive_path = Path::new("not-a-native-path").to_path_buf();
+        let settings = NovelSettings {
+            archive_path: Path::new("not-a-native-path").to_path_buf(),
+            ..NovelSettings::default()
+        };
         let mut converter = NovelConverter::with_capabilities(settings, capabilities);
         let localized = converter
             .download_section_illustration(Path::new("not-a-native-path/挿絵"), source)

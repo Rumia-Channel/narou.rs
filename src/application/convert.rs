@@ -120,7 +120,7 @@ impl ConvertService {
             toc_url: toc.toc_url.clone(),
             story: toc.story.clone(),
             subtitles: toc.subtitles.clone(),
-            novel_type: toc.novel_type.clone(),
+            novel_type: toc.novel_type,
         };
         let text = converter.convert_novel(&toc_object, &sections)?;
         self.objects
@@ -153,7 +153,6 @@ mod tests {
     use super::*;
     use crate::downloader::persistence::{serialize_section, serialize_toc};
     use crate::downloader::types::{SectionElement, SubtitleInfo, TocFile};
-    use crate::platform::NovelId;
     use crate::platform::mocks::MemoryObjectStore;
     use futures::executor::block_on;
 

@@ -160,10 +160,12 @@ impl NovelSettings {
         ignore_force: bool,
         ignore_default: bool,
     ) -> Self {
-        let mut settings = Self::default();
-        settings.id = novel_id;
-        settings.title = Some(novel_title.to_string());
-        settings.author = Some(novel_author.to_string());
+        let mut settings = Self {
+            id: novel_id,
+            title: Some(novel_title.to_string()),
+            author: Some(novel_author.to_string()),
+            ..Self::default()
+        };
 
         settings = Self::apply_ini_defaults(&settings, ini);
         if let Some(novel_id) = novel_id {
@@ -202,10 +204,7 @@ impl NovelSettings {
         let ini_path = archive_path.join("setting.ini");
         let replace_path = archive_path.join("replace.txt");
 
-        let ini = match IniData::load_file(&ini_path) {
-            Ok(i) => i,
-            Err(_) => IniData::new(),
-        };
+        let ini = IniData::load_file(&ini_path).unwrap_or_default();
 
         let data = crate::db::settings::load(SettingScope::Local).unwrap_or_default();
         let mut settings = Self::from_sources(
@@ -242,16 +241,15 @@ impl NovelSettings {
         let ini_path = archive_path.join("setting.ini");
         let replace_path = archive_path.join("replace.txt");
 
-        let ini = match IniData::load_file(&ini_path) {
-            Ok(i) => i,
-            Err(_) => IniData::new(),
-        };
+        let ini = IniData::load_file(&ini_path).unwrap_or_default();
 
-        let mut settings = Self::default();
-        settings.title = Some(source_name.to_string());
-        settings.author = Some(String::new());
-        settings.archive_path = archive_path.to_path_buf();
-        settings.replace_patterns = load_replace_patterns_with_global(&replace_path, archive_path);
+        let mut settings = Self {
+            title: Some(source_name.to_string()),
+            author: Some(String::new()),
+            archive_path: archive_path.to_path_buf(),
+            replace_patterns: load_replace_patterns_with_global(&replace_path, archive_path),
+            ..Self::default()
+        };
 
         settings = Self::apply_ini_defaults(&settings, &ini);
         settings = Self::apply_force_and_default_settings(
@@ -306,17 +304,15 @@ impl NovelSettings {
         let mut default_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
         let mut force_settings: HashMap<&str, &serde_yaml::Value> = HashMap::new();
         for (key, value) in data {
-            if !ignore_default {
-                if let Some(rest) = key.strip_prefix("default.") {
+            if !ignore_default
+                && let Some(rest) = key.strip_prefix("default.") {
                     default_settings.insert(rest, value);
                     continue;
                 }
-            }
-            if !ignore_force {
-                if let Some(rest) = key.strip_prefix("force.") {
+            if !ignore_force
+                && let Some(rest) = key.strip_prefix("force.") {
                     force_settings.insert(rest, value);
                 }
-            }
         }
         let defaults = NovelSettings::default();
         let original_defaults = Self::get_original_defaults(&defaults);
@@ -325,12 +321,11 @@ impl NovelSettings {
             if force_settings.contains_key(ini_key) {
                 let ini_val = yaml_value_to_ini(force_settings[ini_key]);
                 Self::apply_single_setting(&mut s, ini_key, &ini_val);
-            } else if s.has_default_setting(ini_key, default_val) {
-                if let Some(val) = default_settings.get(ini_key) {
+            } else if s.has_default_setting(ini_key, default_val)
+                && let Some(val) = default_settings.get(ini_key) {
                     let ini_val = yaml_value_to_ini(val);
                     Self::apply_single_setting(&mut s, ini_key, &ini_val);
                 }
-            }
         }
         s
     }
@@ -1014,6 +1009,69 @@ fn yaml_value_to_ini(value: &serde_yaml::Value) -> IniValue {
     }
 }
 
+/// `replace.txt` の中身を (置換前, 置換後) の並びにする。
+///
+/// fs を使わないので Worker でも同じ規則で読める (`replace.txt` は
+/// ObjectStore 上の小説データから読む)。
+pub fn parse_replace_patterns(content: &str) -> Vec<(String, String)> {
+    let mut patterns = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(';') {
+            continue;
+        }
+        if let Some((pattern, replacement)) = trimmed.split_once('\t') {
+            patterns.push((pattern.to_string(), replacement.to_string()));
+        }
+    }
+    patterns
+}
+
+#[cfg(feature = "native-runtime")]
+pub fn load_replace_patterns(path: &Path) -> Vec<(String, String)> {
+    if !path.exists() {
+        return Vec::new();
+    }
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    parse_replace_patterns(&content)
+}
+
+#[cfg(feature = "native-runtime")]
+fn load_replace_patterns_with_global(
+    local_path: &Path,
+    archive_path: &Path,
+) -> Vec<(String, String)> {
+    let mut patterns = load_replace_patterns(local_path);
+    let Some(root) = find_narou_root_from(archive_path) else {
+        return patterns;
+    };
+    let global_path = root.join("replace.txt");
+    if global_path != local_path {
+        patterns.extend(load_replace_patterns(&global_path));
+    }
+    patterns
+}
+
+#[cfg(feature = "native-runtime")]
+fn find_narou_root_from(start: &Path) -> Option<PathBuf> {
+    let mut current = if start.is_file() {
+        start.parent()?.to_path_buf()
+    } else {
+        start.to_path_buf()
+    };
+    loop {
+        if current.join(".narou").is_dir() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1031,10 +1089,12 @@ mod tests {
     #[test]
     fn output_title_projection_preserves_raw_title_fields() {
         let raw_title = "【書籍化】作品名";
-        let mut settings = NovelSettings::default();
-        settings.title = Some(raw_title.to_string());
-        settings.novel_title = raw_title.to_string();
-        settings.enable_strip_title_prefix = true;
+        let settings = NovelSettings {
+            title: Some(raw_title.to_string()),
+            novel_title: raw_title.to_string(),
+            enable_strip_title_prefix: true,
+            ..NovelSettings::default()
+        };
 
         assert_eq!(settings.title_for_output(raw_title), "作品名");
         assert_eq!(settings.title.as_deref(), Some(raw_title));
@@ -1210,68 +1270,5 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
-    }
-}
-
-/// `replace.txt` の中身を (置換前, 置換後) の並びにする。
-///
-/// fs を使わないので Worker でも同じ規則で読める (`replace.txt` は
-/// ObjectStore 上の小説データから読む)。
-pub fn parse_replace_patterns(content: &str) -> Vec<(String, String)> {
-    let mut patterns = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with(';') {
-            continue;
-        }
-        if let Some((pattern, replacement)) = trimmed.split_once('\t') {
-            patterns.push((pattern.to_string(), replacement.to_string()));
-        }
-    }
-    patterns
-}
-
-#[cfg(feature = "native-runtime")]
-pub fn load_replace_patterns(path: &Path) -> Vec<(String, String)> {
-    if !path.exists() {
-        return Vec::new();
-    }
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    parse_replace_patterns(&content)
-}
-
-#[cfg(feature = "native-runtime")]
-fn load_replace_patterns_with_global(
-    local_path: &Path,
-    archive_path: &Path,
-) -> Vec<(String, String)> {
-    let mut patterns = load_replace_patterns(local_path);
-    let Some(root) = find_narou_root_from(archive_path) else {
-        return patterns;
-    };
-    let global_path = root.join("replace.txt");
-    if global_path != local_path {
-        patterns.extend(load_replace_patterns(&global_path));
-    }
-    patterns
-}
-
-#[cfg(feature = "native-runtime")]
-fn find_narou_root_from(start: &Path) -> Option<PathBuf> {
-    let mut current = if start.is_file() {
-        start.parent()?.to_path_buf()
-    } else {
-        start.to_path_buf()
-    };
-    loop {
-        if current.join(".narou").is_dir() {
-            return Some(current);
-        }
-        if !current.pop() {
-            return None;
-        }
     }
 }

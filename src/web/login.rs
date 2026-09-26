@@ -332,8 +332,6 @@ fn status_payload() -> Result<serde_json::Value, NarouError> {
     }))
 }
 
-/// Show which cookies a header carries without exposing their values.
-
 fn failure(error: NarouError) -> serde_json::Value {
     serde_json::json!({ "success": false, "message": error.to_string() })
 }

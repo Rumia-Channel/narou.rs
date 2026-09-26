@@ -102,11 +102,10 @@ pub fn encode_credentials(credentials: &[LoginCredential]) -> Result<String> {
 /// working (and is upgraded on the next write).
 pub fn decode_credentials(value: &str, host: &str) -> Vec<LoginCredential> {
     let trimmed = value.trim();
-    if trimmed.starts_with('[') {
-        if let Ok(credentials) = serde_json::from_str::<Vec<LoginCredential>>(trimmed) {
+    if trimmed.starts_with('[')
+        && let Ok(credentials) = serde_json::from_str::<Vec<LoginCredential>>(trimmed) {
             return credentials;
         }
-    }
     if trimmed.is_empty() {
         return Vec::new();
     }

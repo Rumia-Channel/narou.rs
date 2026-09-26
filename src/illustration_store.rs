@@ -43,13 +43,9 @@ pub struct IllustrationStore {
 /// storage services.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
+#[derive(Default)]
 pub struct IllustrationIndex(IllustrationStore);
 
-impl Default for IllustrationIndex {
-    fn default() -> Self {
-        Self(IllustrationStore::default())
-    }
-}
 
 impl IllustrationIndex {
     pub fn filename_for_source(&self, source: &str) -> Option<&str> {
@@ -897,7 +893,7 @@ pub fn rebuild_illustration_cache(archive_path: &Path) -> Result<usize> {
         let hash = hash_bytes(&bytes);
         if let Some(existing) = hashes.get(&hash) {
             // Same content under a different name: keep the first, drop duplicates later via orphan.
-            if existing != &filename {
+            if existing != filename {
                 // Skip recording duplicate; orphan detection will surface it.
             }
             continue;
@@ -1192,9 +1188,7 @@ pub fn legacy_basename_from_source(source: &str) -> Option<String> {
     let normalized = normalize_illustration_url(source);
     let parsed = url::Url::parse(&normalized).ok()?;
     let segment = parsed
-        .path_segments()?
-        .filter(|part| !part.is_empty())
-        .next_back()?;
+        .path_segments()?.rfind(|part| !part.is_empty())?;
     let stem = segment
         .rsplit_once('.')
         .map(|(stem, _)| stem)
@@ -1538,7 +1532,7 @@ mod tests {
 
     fn png_bytes(seed: u8) -> Vec<u8> {
         let mut bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        bytes.extend(std::iter::repeat(seed).take(32));
+        bytes.extend(std::iter::repeat_n(seed, 32));
         bytes
     }
 

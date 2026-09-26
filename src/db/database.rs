@@ -176,7 +176,7 @@ impl Database {
             let guard = conn.lock().expect("sqlite mutex poisoned");
             let status: String = guard
                 .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-                .map_err(|error| crate::native::sqlite::sqlite_error(error))?;
+                .map_err(crate::native::sqlite::sqlite_error)?;
             return Ok(Some(status));
         }
         #[allow(unreachable_code)]
@@ -425,12 +425,7 @@ impl Database {
             return self.data.get(&id);
         }
         let lower = title.to_lowercase();
-        for record in self.data.values() {
-            if record.title.to_lowercase() == lower {
-                return Some(record);
-            }
-        }
-        None
+        self.data.values().find(|&record| record.title.to_lowercase() == lower).map(|v| v as _)
     }
 
     /// Legacy read-only candidate; repository callers must use `allocate_id`.
@@ -542,7 +537,7 @@ pub fn sort_keys() -> &'static [&'static str] {
 /// 未知のキーを `sort_by` に渡した場合のデフォルト。CLI/Web 双方の検証失敗時に
 /// 同じ挙動を提供するために `sort_keys` と並べて公開する。
 pub fn sort_key_valid(key: &str) -> bool {
-    SORT_KEYS.iter().any(|candidate| *candidate == key)
+    SORT_KEYS.contains(&key)
 }
 
 pub(crate) fn compare_optional<T: Ord>(a: Option<T>, b: Option<T>) -> std::cmp::Ordering {
@@ -575,6 +570,51 @@ pub(crate) fn record_status_key(record: &NovelRecord) -> String {
         status.push("中断");
     }
     status.join(", ").to_lowercase()
+}
+
+#[cfg(feature = "native-runtime")]
+fn rename_imported_file(path: &std::path::Path) {
+    if !path.exists() {
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let name = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => format!("{name}.imported-{stamp}"),
+        None => return,
+    };
+    let _ = std::fs::rename(path, path.with_file_name(name));
+}
+
+
+#[cfg(feature = "native-runtime")]
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(data);
+    hex::encode(digest)
+}
+
+/// Write `database.yaml` from the current SQLite records and remember its
+/// SHA-256 in `app_state` so the next open can detect external edits.
+#[cfg(feature = "native-runtime")]
+fn mirror_records_yaml(
+    state: &crate::native::sqlite::state::StateDb,
+    repo: &crate::native::sqlite::SqliteNovelRepository,
+    yaml_path: &std::path::Path,
+) -> Result<()> {
+    let conn = repo.conn_handle();
+    let records = crate::native::sqlite::bulk::load_all_records(
+        &conn.lock().expect("sqlite mutex poisoned"),
+    )?;
+    let content = serde_yaml::to_string(&records)?;
+    if let Some(parent) = yaml_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::db::inventory::atomic_write(yaml_path, &content)?;
+    let _ = state.set_raw_db("meta", "database_yaml_sha", &sha256_hex(content.as_bytes()));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -979,49 +1019,4 @@ mod tests {
             extra_fields: Default::default(),
         }
     }
-}
-
-#[cfg(feature = "native-runtime")]
-fn rename_imported_file(path: &std::path::Path) {
-    if !path.exists() {
-        return;
-    }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
-    let name = match path.file_name().and_then(|name| name.to_str()) {
-        Some(name) => format!("{name}.imported-{stamp}"),
-        None => return,
-    };
-    let _ = std::fs::rename(path, path.with_file_name(name));
-}
-
-
-#[cfg(feature = "native-runtime")]
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::Digest;
-    let digest = sha2::Sha256::digest(data);
-    hex::encode(digest)
-}
-
-/// Write `database.yaml` from the current SQLite records and remember its
-/// SHA-256 in `app_state` so the next open can detect external edits.
-#[cfg(feature = "native-runtime")]
-fn mirror_records_yaml(
-    state: &crate::native::sqlite::state::StateDb,
-    repo: &crate::native::sqlite::SqliteNovelRepository,
-    yaml_path: &std::path::Path,
-) -> Result<()> {
-    let conn = repo.conn_handle();
-    let records = crate::native::sqlite::bulk::load_all_records(
-        &conn.lock().expect("sqlite mutex poisoned"),
-    )?;
-    let content = serde_yaml::to_string(&records)?;
-    if let Some(parent) = yaml_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    crate::db::inventory::atomic_write(yaml_path, &content)?;
-    let _ = state.set_raw_db("meta", "database_yaml_sha", &sha256_hex(content.as_bytes()));
-    Ok(())
 }

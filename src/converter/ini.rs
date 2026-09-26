@@ -7,23 +7,26 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default)]
 pub enum IniValue {
     Integer(i64),
     Float(f64),
     Boolean(bool),
     String(String),
+    #[default]
     Null,
 }
 
-impl Default for IniValue {
-    fn default() -> Self {
-        IniValue::Null
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct IniData {
     pub sections: HashMap<String, HashMap<String, IniValue>>,
+}
+
+impl Default for IniData {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IniData {

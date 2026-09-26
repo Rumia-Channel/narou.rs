@@ -25,6 +25,12 @@ pub struct LibraryBackupState {
     running: AtomicBool,
 }
 
+impl Default for LibraryBackupState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LibraryBackupState {
     pub fn new() -> Self {
         Self {
@@ -211,10 +217,8 @@ fn run_backup_subprocess(
     let console = target_console.to_string();
     let stdout_thread = std::thread::spawn(move || {
         if let Some(out) = stdout {
-            for line in BufReader::new(out).lines() {
-                if let Ok(text) = line {
-                    ps_out.broadcast_echo(&text, &console);
-                }
+            for text in BufReader::new(out).lines().map_while(Result::ok) {
+                ps_out.broadcast_echo(&text, &console);
             }
         }
     });
@@ -222,10 +226,8 @@ fn run_backup_subprocess(
     let console = target_console.to_string();
     let stderr_thread = std::thread::spawn(move || {
         if let Some(err) = stderr {
-            for line in BufReader::new(err).lines() {
-                if let Ok(text) = line {
-                    ps_err.broadcast_echo(&text, &console);
-                }
+            for text in BufReader::new(err).lines().map_while(Result::ok) {
+                ps_err.broadcast_echo(&text, &console);
             }
         }
     });

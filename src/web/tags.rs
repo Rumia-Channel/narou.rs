@@ -231,8 +231,8 @@ pub async fn edit_tag(
         }
     }
 
-    if !tags_to_delete.is_empty() {
-        if let Err((_, error)) = apply_tag_change(
+    if !tags_to_delete.is_empty()
+        && let Err((_, error)) = apply_tag_change(
             &state,
             &ids,
             crate::application::TagAction::Remove,
@@ -243,9 +243,8 @@ pub async fn edit_tag(
         {
             return serde_json::json!({ "success": false, "error": error }).into();
         }
-    }
-    if !tags_to_add.is_empty() {
-        if let Err((_, error)) = apply_tag_change(
+    if !tags_to_add.is_empty()
+        && let Err((_, error)) = apply_tag_change(
             &state,
             &ids,
             crate::application::TagAction::Add,
@@ -256,7 +255,6 @@ pub async fn edit_tag(
         {
             return serde_json::json!({ "success": false, "error": error }).into();
         }
-    }
 
     serde_json::json!({ "success": true }).into()
 }

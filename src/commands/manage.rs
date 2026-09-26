@@ -181,10 +181,10 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
     };
 
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    let records = match (|| -> narou_rs::error::Result<Vec<NovelRecord>> {
-        let sort = resolve_list_sort(&options, sort_key);
-        // CLI list は全件表示: display 用 query ではなく全件を取得する
-        // (既存挙動: フィルタは表示後に適用される)。
+    // CLI list は全件表示: display 用 query ではなく全件を取得する
+    // (既存挙動: フィルタは表示後に適用される)。
+    let all_records = {
+        let sort = resolve_list_sort(options, sort_key);
         let query = narou_rs::platform::NovelQuery::page(
             narou_rs::platform::NovelFilter::all(),
             sort,
@@ -192,7 +192,8 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
             usize::MAX,
         );
         novels.query_sync(&query)
-    })() {
+    };
+    let records = match all_records {
         Ok(records) => records,
         Err(err) => {
             log::report_error(&err.to_string());
@@ -256,12 +257,11 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         })
         .collect::<Vec<_>>();
 
-    if colors_changed {
-        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
+    if colors_changed
+        && let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
             log::report_error(&err.to_string());
             return 127;
         }
-    }
 
     let limit = options.limit.unwrap_or(lines.len());
     let taken = lines.into_iter().take(limit).collect::<Vec<_>>();
@@ -314,12 +314,11 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         }
     }
 
-    if explicit_color_changed {
-        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
+    if explicit_color_changed
+        && let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
             log::report_error(&err.to_string());
             return 127;
         }
-    }
 
     if options.targets.is_empty() {
         if matches!(mode, TagMode::List) {
@@ -423,12 +422,11 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         }
     };
 
-    if auto_color_changed {
-        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
+    if auto_color_changed
+        && let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
             log::report_error(&err.to_string());
             return 127;
         }
-    }
 
     for output in outputs {
         match output {
@@ -590,11 +588,10 @@ fn decorate_line(
     if options.url {
         parts.push(record.toc_url.clone());
     }
-    if options.show_tags() {
-        if let Some(tags) = decorate_tags(&record.tags, tag_colors, colored) {
+    if options.show_tags()
+        && let Some(tags) = decorate_tags(&record.tags, tag_colors, colored) {
             parts.push(tags);
         }
-    }
 
     parts.join(" | ")
 }
@@ -626,11 +623,10 @@ fn decorate_date(record: &NovelRecord, options: &ListOptions, colored: bool) -> 
     let now = Utc::now();
     let limit = Duration::seconds(ANNOTATION_COLOR_TIME_LIMIT);
 
-    if let Some(new_arrival) = new_arrivals_date {
-        if new_arrival >= last_update && new_arrival + limit >= now {
+    if let Some(new_arrival) = new_arrivals_date
+        && new_arrival >= last_update && new_arrival + limit >= now {
             return format_date(new_arrival, colored.then_some("magenta"));
         }
-    }
 
     if last_update + limit >= now {
         return format_date(base_time.unwrap_or(last_update), colored.then_some("green"));
@@ -763,12 +759,11 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
         tag_colors,
         tag_list.iter().map(|(tag, _)| tag.as_str()),
     );
-    if changed {
-        if let Err(err) = tag_colors::save_tag_colors(&inventory, tag_colors) {
+    if changed
+        && let Err(err) = tag_colors::save_tag_colors(&inventory, tag_colors) {
             log::report_error(&err.to_string());
             return 127;
         }
-    }
 
     println!("タグ一覧");
     println!(
@@ -816,22 +811,20 @@ fn get_tag_list() -> Result<Vec<(String, usize)>, String> {
 
 fn render_tag_count(tag: &str, count: usize, tag_colors: &TagColors) -> String {
     let text = format!("{}({})", tag, count);
-    if std::io::stdout().is_terminal() {
-        if let Some(color) = tag_colors.color_for(tag) {
+    if std::io::stdout().is_terminal()
+        && let Some(color) = tag_colors.color_for(tag) {
             return paint(&text, color, true);
         }
-    }
     text
 }
 
 fn render_tags(tags: &[String], tag_colors: &TagColors, separator: &str, colored: bool) -> String {
     tags.iter()
         .map(|tag| {
-            if colored && std::io::stdout().is_terminal() {
-                if let Some(color) = tag_colors.color_for(tag) {
+            if colored && std::io::stdout().is_terminal()
+                && let Some(color) = tag_colors.color_for(tag) {
                     return paint(tag, color, true);
                 }
-            }
             tag.clone()
         })
         .collect::<Vec<_>>()

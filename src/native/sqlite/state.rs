@@ -391,7 +391,7 @@ fn rename_imported(paths: Vec<PathBuf>) {
         .unwrap_or(0);
     for path in paths {
         let mut target = path.clone().into_os_string();
-        target.push(&format!(".imported-{stamp}"));
+        target.push(format!(".imported-{stamp}"));
         let _ = std::fs::rename(&path, PathBuf::from(target));
     }
 }

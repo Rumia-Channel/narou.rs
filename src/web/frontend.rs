@@ -97,10 +97,7 @@ fn relative_module_specifier(from_asset_path: &str, to_asset_path: &str) -> Stri
         common += 1;
     }
 
-    let mut rel_parts = Vec::new();
-    for _ in common..from_parts.len() {
-        rel_parts.push("..");
-    }
+    let mut rel_parts = vec![".."; from_parts.len() - common];
     rel_parts.extend(to_parts[common..].iter().copied());
 
     if rel_parts.first() == Some(&"..") {

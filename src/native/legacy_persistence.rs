@@ -15,7 +15,7 @@ use crate::downloader::{SectionElement, SectionFile, SubtitleInfo, TocFile};
 use crate::error::Result;
 
 pub fn section_needs_update(
-    section_dir: &PathBuf,
+    section_dir: &Path,
     subtitle: &SubtitleInfo,
     new_section: &SectionElement,
 ) -> bool {
@@ -53,13 +53,13 @@ pub fn find_section_file_by_index(section_dir: &Path, index: &str) -> Option<Pat
     None
 }
 
-pub fn load_section_file(path: &PathBuf) -> Option<SectionFile> {
+pub fn load_section_file(path: &Path) -> Option<SectionFile> {
     let content = std::fs::read_to_string(path).ok()?;
     serde_yaml::from_str(&content).ok()
 }
 
 pub fn save_section_file(
-    section_dir: &PathBuf,
+    section_dir: &Path,
     subtitle: &SubtitleInfo,
     section: &SectionElement,
 ) -> Result<()> {
@@ -83,7 +83,7 @@ pub fn save_section_file(
     Ok(())
 }
 
-pub fn save_raw_file(raw_dir: &PathBuf, subtitle: &SubtitleInfo, raw_html: &str) -> Result<()> {
+pub fn save_raw_file(raw_dir: &Path, subtitle: &SubtitleInfo, raw_html: &str) -> Result<()> {
     if raw_html.is_empty() {
         return Ok(());
     }
@@ -113,13 +113,13 @@ pub fn remove_dir_if_empty(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn load_toc_file(novel_dir: &PathBuf) -> Option<TocFile> {
+pub fn load_toc_file(novel_dir: &Path) -> Option<TocFile> {
     let path = novel_dir.join("toc.yaml");
     let content = std::fs::read_to_string(&path).ok()?;
     serde_yaml::from_str(&content).ok()
 }
 
-pub fn save_toc_file(novel_dir: &PathBuf, toc: &TocFile) -> Result<()> {
+pub fn save_toc_file(novel_dir: &Path, toc: &TocFile) -> Result<()> {
     let novel_dir = validate_archive_write_dir(novel_dir, 1)?;
     std::fs::create_dir_all(&novel_dir)?;
     let path = novel_dir.join("toc.yaml");
@@ -128,7 +128,7 @@ pub fn save_toc_file(novel_dir: &PathBuf, toc: &TocFile) -> Result<()> {
     Ok(())
 }
 
-pub fn ensure_default_files(novel_dir: &PathBuf, title: &str, author: &str, toc_url: &str) {
+pub fn ensure_default_files(novel_dir: &Path, title: &str, author: &str, toc_url: &str) {
     let Ok(novel_dir) = validate_archive_write_dir(novel_dir, 1) else {
         return;
     };

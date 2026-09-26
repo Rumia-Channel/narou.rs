@@ -107,7 +107,7 @@ fn clean_novel_dir(novel_dir: &Path, remove: bool) -> Result<(), String> {
 }
 
 fn find_orphan_files(novel_dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let Some(toc) = load_toc_file(&novel_dir.to_path_buf()) else {
+    let Some(toc) = load_toc_file(novel_dir) else {
         return Ok(Vec::new());
     };
 

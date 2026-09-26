@@ -93,8 +93,8 @@ impl ConverterBase {
             }
             transformed.push_str(&result[last..]);
 
-            if self.settings.enable_inspect {
-                if let Some(ref inspector) = self.inspector {
+            if self.settings.enable_inspect
+                && let Some(ref inspector) = self.inspector {
                     inspector.borrow_mut().inspect_invalid_openclose_brackets(
                         &transformed,
                         open,
@@ -102,7 +102,6 @@ impl ConverterBase {
                         &replacements,
                     );
                 }
-            }
 
             result = rebuild_brackets(&transformed, &replacements);
         }
@@ -464,7 +463,7 @@ pub fn is_border_symbol(line: &str) -> bool {
 fn normalize_ellipsis(text: &str) -> String {
     RE_ELLIPSIS.replace_all(text, |caps: &regex::Captures| {
         let count = caps[0].chars().count();
-        let even = (count + 1) / 2 * 2;
+        let even = count.div_ceil(2) * 2;
         "\u{2026}".repeat(even)
     })
     .to_string()
@@ -473,7 +472,7 @@ fn normalize_ellipsis(text: &str) -> String {
 fn normalize_ditto(text: &str) -> String {
     RE_DITTO.replace_all(text, |caps: &regex::Captures| {
         let count = caps[0].chars().count();
-        let even = (count + 1) / 2 * 2;
+        let even = count.div_ceil(2) * 2;
         "\u{2025}".repeat(even)
     })
     .to_string()

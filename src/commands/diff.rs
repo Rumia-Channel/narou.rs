@@ -80,11 +80,10 @@ fn cmd_diff_inner(opts: DiffOptions) -> std::result::Result<(), String> {
         return run_version_ops(&context, opts);
     }
 
-    if let Some(version) = opts.view_diff_version.as_deref() {
-        if invalid_diff_version_string(version) {
+    if let Some(version) = opts.view_diff_version.as_deref()
+        && invalid_diff_version_string(version) {
             return Err("差分指定の書式が違います(正しい例:2013.02.21@01.39.46)".to_string());
         }
-    }
 
     if opts.list {
         display_diff_list(&context)?;
@@ -659,19 +658,6 @@ fn bold_yellow(s: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::invalid_diff_version_string;
-
-    #[test]
-    fn diff_version_validation_matches_ruby_format() {
-        assert!(!invalid_diff_version_string("2024.01.03@04.05.06"));
-        assert!(!invalid_diff_version_string("2024.01.03@04;05;06"));
-        assert!(invalid_diff_version_string("2024-01-03@04.05.06"));
-        assert!(invalid_diff_version_string("2024.01.03 04.05.06"));
-    }
-}
-
 #[cfg(feature = "native-runtime")]
 fn version_conn() -> std::result::Result<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>, String> {
     use narou_rs::native::sqlite::state;
@@ -811,6 +797,19 @@ fn write_back_working_set(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::invalid_diff_version_string;
+
+    #[test]
+    fn diff_version_validation_matches_ruby_format() {
+        assert!(!invalid_diff_version_string("2024.01.03@04.05.06"));
+        assert!(!invalid_diff_version_string("2024.01.03@04;05;06"));
+        assert!(invalid_diff_version_string("2024-01-03@04.05.06"));
+        assert!(invalid_diff_version_string("2024.01.03 04.05.06"));
+    }
 }
 
 #[cfg(not(feature = "native-runtime"))]

@@ -263,7 +263,7 @@ fn queue_lane_sizes(queue: &PersistentQueue) -> [usize; 2] {
     ]
 }
 
-fn sort_records_for_web_update(records: &mut Vec<crate::db::NovelRecord>, sort_state: &CurrentSortState) {
+fn sort_records_for_web_update(records: &mut [crate::db::NovelRecord], sort_state: &CurrentSortState) {
     sort_records(records, sort_state);
 }
 
@@ -2254,8 +2254,8 @@ pub async fn api_taginfo(
         .unwrap_or_default();
     let mut selected_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    for id in selected_ids.iter().copied() {
-        if let Some(tags) = record_tags.get(&id) {
+    for id in selected_ids.iter() {
+        if let Some(tags) = record_tags.get(id) {
             for tag in tags {
                 *selected_counts.entry(tag.clone()).or_insert(0) += 1;
             }

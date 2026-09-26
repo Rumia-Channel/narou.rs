@@ -226,18 +226,16 @@ pub fn cmd_convert(
                     {
                         println!("{}", err);
                     }
-                    if output_path.to_ascii_lowercase().ends_with(".zip") {
-                        if let Err(err) = print_copy_zip_to_result(&output_path) {
+                    if output_path.to_ascii_lowercase().ends_with(".zip")
+                        && let Err(err) = print_copy_zip_to_result(&output_path) {
                             println!("{}", err);
                         }
-                    }
-                    if let Some(device) = copy_device {
-                        if let Err(err) =
+                    if let Some(device) = copy_device
+                        && let Err(err) =
                             print_send_result(&output_path, device)
                         {
                             println!("{}", err);
                         }
-                    }
                     apply_dc_subjects_if_needed(
                         Path::new(&output_path),
                         dc_subjects.as_deref(),
@@ -264,11 +262,10 @@ pub fn cmd_convert(
 
     drop(multi);
 
-    if !no_open && !narou_rs::compat::load_local_setting_bool("convert.no-open") {
-        if let Some(dir) = first_output_dir {
+    if !no_open && !narou_rs::compat::load_local_setting_bool("convert.no-open")
+        && let Some(dir) = first_output_dir {
             narou_rs::compat::open_directory(&dir, Some("小説の保存フォルダを開きますか"));
         }
-    }
 }
 
 fn convert_text_target(
@@ -366,16 +363,14 @@ fn convert_text_target(
             if let Err(err) = print_copy_to_result(&output_path, copy_device, 0) {
                 println!("{}", err);
             }
-            if output_path.to_ascii_lowercase().ends_with(".zip") {
-                if let Err(err) = print_copy_zip_to_result(&output_path) {
+            if output_path.to_ascii_lowercase().ends_with(".zip")
+                && let Err(err) = print_copy_zip_to_result(&output_path) {
                     println!("{}", err);
                 }
-            }
-            if let Some(device) = copy_device {
-                if let Err(err) = print_send_result(&output_path, device) {
+            if let Some(device) = copy_device
+                && let Err(err) = print_send_result(&output_path, device) {
                     println!("{}", err);
                 }
-            }
             print_inspection_output(&mut converter);
         }
         Err(e) => {
@@ -485,9 +480,7 @@ fn effective_copy_device(
     selected_device: Option<narou_rs::converter::device::Device>,
     output_device: Option<narou_rs::converter::device::Device>,
 ) -> Option<narou_rs::converter::device::Device> {
-    if output_device.is_none() {
-        return None;
-    }
+    output_device?;
     match (selected_device, output_device) {
         (
             Some(narou_rs::converter::device::Device::Ibunko),

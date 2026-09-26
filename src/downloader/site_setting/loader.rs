@@ -21,11 +21,10 @@ fn load_settings_from_dir(dir: PathBuf, settings: &mut Vec<SiteSetting>) {
         let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
         paths.sort();
         for path in paths {
-            if path.extension().and_then(|e| e.to_str()) == Some("yaml")
-                || path.extension().and_then(|e| e.to_str()) == Some("yml")
-            {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(raw_yaml) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+            if (path.extension().and_then(|e| e.to_str()) == Some("yaml")
+                || path.extension().and_then(|e| e.to_str()) == Some("yml"))
+                && let Ok(content) = std::fs::read_to_string(&path)
+                    && let Ok(raw_yaml) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
                         let name = raw_yaml
                             .get("name")
                             .and_then(|v| v.as_str())
@@ -36,18 +35,15 @@ fn load_settings_from_dir(dir: PathBuf, settings: &mut Vec<SiteSetting>) {
                             .and_then(|name| settings.iter_mut().find(|s| s.name == *name))
                         {
                             let incoming_version = raw_yaml.get("version").and_then(|v| v.as_f64());
-                            if should_merge_site_setting(existing, incoming_version) {
-                                if let Ok(merged) = merge_site_setting(existing, &content) {
+                            if should_merge_site_setting(existing, incoming_version)
+                                && let Ok(merged) = merge_site_setting(existing, &content) {
                                     *existing = merged;
                                 }
-                            }
                         } else if let Ok(setting) = serde_yaml::from_value::<SiteSetting>(raw_yaml)
                         {
                             settings.push(setting);
                         }
                     }
-                }
-            }
         }
     }
 }

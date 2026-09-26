@@ -300,11 +300,10 @@ impl Inspector {
         for (idx, ch) in data.char_indices() {
             if ch == open {
                 stack.push(idx + ch.len_utf8());
-            } else if ch == close {
-                if let Some(start) = stack.pop() {
+            } else if ch == close
+                && let Some(start) = stack.pop() {
                     results.push(&data[start..idx]);
                 }
-            }
         }
 
         results
@@ -381,15 +380,17 @@ mod tests {
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     fn test_settings() -> NovelSettings {
-        let mut settings = NovelSettings::default();
-        settings.archive_path = std::env::temp_dir().join(format!(
+        let settings = NovelSettings {
+            archive_path: std::env::temp_dir().join(format!(
             "narou-rs-inspector-test-{}-{}",
             TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
+        )),
+            ..NovelSettings::default()
+        };
         std::fs::create_dir_all(&settings.archive_path).unwrap();
         settings
     }

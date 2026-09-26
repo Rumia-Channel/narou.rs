@@ -154,7 +154,7 @@ impl RateLimiter {
     }
 
     fn delay_after_request(&self, counter: u32, wait_steps: u32, interval: Duration) -> Duration {
-        if wait_steps > 0 && counter % wait_steps == 0 && counter >= wait_steps {
+        if wait_steps > 0 && counter.is_multiple_of(wait_steps) && counter >= wait_steps {
             self.max_steps_wait_time.max(interval)
         } else if counter > 0 {
             interval

@@ -245,11 +245,9 @@ pub fn aozora_assets_dir() -> Option<PathBuf> {
 pub fn resolve_java_command_path() -> Option<PathBuf> {
     if let Some(path) =
         load_global_setting_string_with_aliases(&["java_path", "java-path", "javapath"])
-    {
-        if let Some(canonical) = canonicalize_existing_path(PathBuf::from(path)) {
+        && let Some(canonical) = canonicalize_existing_path(PathBuf::from(path)) {
             return Some(canonical);
         }
-    }
 
     if let Some(java_home) = std::env::var_os("JAVA_HOME") {
         let java_name = if cfg!(windows) { "java.exe" } else { "java" };
@@ -321,8 +319,8 @@ pub fn relay_web_stream_to_console<R: io::Read>(
 }
 
 pub fn reroute_web_line_to_console(text: &str, target_console: &str) -> String {
-    if let Some(json_str) = text.strip_prefix(crate::progress::WS_LINE_PREFIX) {
-        if let Ok(mut message) =
+    if let Some(json_str) = text.strip_prefix(crate::progress::WS_LINE_PREFIX)
+        && let Ok(mut message) =
             serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json_str)
         {
             message.insert(
@@ -335,7 +333,6 @@ pub fn reroute_web_line_to_console(text: &str, target_console: &str) -> String {
                 serde_json::Value::Object(message)
             );
         }
-    }
     format!(
         "{}{}",
         crate::progress::WS_LINE_PREFIX,
@@ -374,7 +371,7 @@ pub fn yaml_value_to_string(value: &serde_yaml::Value) -> Option<String> {
 
 pub fn current_device() -> Option<Device> {
     let raw = load_local_setting_string("device")?;
-    let device = Device::from_str(&raw);
+    let device = raw.parse::<Device>().unwrap_or(Device::Text);
     (device != Device::Text).then_some(device)
 }
 
@@ -528,11 +525,10 @@ pub fn mark_not_found_and_freeze(id: i64) -> Result<()> {
 }
 
 pub fn open_directory(path: &Path, confirm_message: Option<&str>) {
-    if let Some(message) = confirm_message {
-        if !confirm(message, false, false) {
+    if let Some(message) = confirm_message
+        && !confirm(message, false, false) {
             return;
         }
-    }
 
     let path = path.to_string_lossy().to_string();
     if cfg!(windows) {
@@ -821,11 +817,9 @@ fn get_copy_to_directory(
     if grouping
         .iter()
         .any(|value| value.eq_ignore_ascii_case("device"))
-    {
-        if let Some(device) = device {
+        && let Some(device) = device {
             dir.push(device.display_name());
         }
-    }
     if grouping
         .iter()
         .any(|value| value.eq_ignore_ascii_case("site"))
@@ -951,7 +945,7 @@ fn sanitize_backup_name(title: &str) -> String {
     if load_local_setting_bool("normalize-filename") {
         cleaned = cleaned.nfc().collect();
     }
-    while cleaned.as_bytes().len() > 180 {
+    while cleaned.len() > 180 {
         cleaned.pop();
     }
     cleaned
@@ -967,12 +961,13 @@ mod tests {
 
     use super::{
         DigestChoice, NovelLockGuard, canonicalize_aozoraepub3_tool_path,
-        canonicalize_existing_path, choose_digest_action_with_auto_choices,
-        configure_process_group_command, configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
+        canonicalize_existing_path, choose_digest_action_with_auto_choices, configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
         load_locked_ids_from_inventory, mark_not_found_and_freeze, parse_digest_auto_choices,
         record_is_frozen, reroute_web_line_to_console, resolve_auto_convert_devices,
         sanitize_backup_name, terminate_process,
     };
+    #[cfg(unix)]
+    use super::configure_process_group_command;
     use crate::converter::device::Device;
     use crate::db::NovelRecord;
 
@@ -1019,7 +1014,7 @@ mod tests {
     #[test]
     fn sanitize_backup_name_truncates_by_byte_length() {
         let name = sanitize_backup_name(&"あ".repeat(100));
-        assert!(name.as_bytes().len() <= 180);
+        assert!(name.len() <= 180);
         assert!(name.chars().all(|ch| ch == 'あ'));
     }
 

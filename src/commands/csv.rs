@@ -12,8 +12,8 @@ use super::log;
 
 const HR_TEXT: &str = "―――――――――――――――――――――――――――――――――――";
 
-pub fn cmd_csv(output: Option<&str>, import: Option<&str>) -> i32 {
-    match cmd_csv_inner(output, import) {
+pub async fn cmd_csv(output: Option<&str>, import: Option<&str>) -> i32 {
+    match cmd_csv_inner(output, import).await {
         Ok(code) => code,
         Err(err) => {
             log::report_error(&err);
@@ -22,11 +22,11 @@ pub fn cmd_csv(output: Option<&str>, import: Option<&str>) -> i32 {
     }
 }
 
-fn cmd_csv_inner(output: Option<&str>, import: Option<&str>) -> Result<i32, String> {
+async fn cmd_csv_inner(output: Option<&str>, import: Option<&str>) -> Result<i32, String> {
     db::init_database().map_err(|e| e.to_string())?;
 
     if let Some(path) = import {
-        import_csv(path)?;
+        import_csv(path).await?;
         return Ok(0);
     }
 
@@ -120,10 +120,12 @@ fn generate_csv() -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
-fn import_csv(path: &str) -> Result<(), String> {
+async fn import_csv(path: &str) -> Result<(), String> {
     let content = load_import_csv_content(path)?;
     let urls = parse_csv_urls(&content)?;
     for url in urls {
+        // 取り込んだ URL は native と同じく download コマンド経由で取得する
+        // (以前は future を捨てていて、実際には何も取得していなかった)。
         let _ = download::cmd_download(download::DownloadOptions {
             targets: vec![url],
             force: false,
@@ -132,7 +134,8 @@ fn import_csv(path: &str) -> Result<(), String> {
             remove: false,
             mail: false,
             user_agent: None,
-        });
+        })
+        .await;
         println!("{}", HR_TEXT);
     }
     Ok(())

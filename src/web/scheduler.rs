@@ -464,7 +464,7 @@ fn queue_auto_update_job_if_needed(
         targets: Vec::new(),
         options: Vec::new(),
     });
-    if plan.invalid.len() != 0 || plan.plans.len() != 1 {
+    if !plan.invalid.is_empty() || plan.plans.len() != 1 {
         return Err("自動アップデートジョブの計画に失敗しました".to_string());
     }
 
@@ -806,13 +806,11 @@ mod tests {
 
     #[test]
     fn auto_update_target_split_skips_frozen_records() {
-        let records = vec![
-            sample_record(1, "https://example.com/1", &[]),
+        let records = [sample_record(1, "https://example.com/1", &[]),
             sample_record(2, "https://example.com/2", &[]),
             sample_record(3, "https://example.com/3", &["frozen"]),
             sample_record(4, "https://example.com/4", &[]),
-            sample_record(5, "https://example.com/5", &[]),
-        ];
+            sample_record(5, "https://example.com/5", &[])];
         let modified_ids = BTreeSet::from([1, 3]);
         let frozen_ids = HashSet::from([4]);
 

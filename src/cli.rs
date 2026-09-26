@@ -71,7 +71,8 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
                 i += 1;
             }
         } else if arg.starts_with("--user-agent=") {
-            flags.user_agent = Some(arg["--user-agent=".len()..].to_string());
+            flags.user_agent =
+                arg.strip_prefix("--user-agent=").map(|v| v.to_string());
             args.remove(i);
         } else if arg == "-h" || arg == "--help" {
             if i > 0 {
@@ -126,7 +127,7 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
     flags
 }
 
-fn resolve_command_shortcut(args: &mut Vec<String>, cmd_index: usize) {
+fn resolve_command_shortcut(args: &mut [String], cmd_index: usize) {
     let shortcuts = build_shortcuts();
     if let Some(resolved) = shortcuts.get(&args[cmd_index].to_lowercase()) {
         args[cmd_index] = resolved.to_string();
@@ -259,12 +260,11 @@ fn load_local_setting_raw_value(key: &str) -> Option<serde_yaml::Value> {
 fn inject_log_defaults(args: &mut Vec<String>) {
     let mut defaults = Vec::new();
 
-    if !has_option(args, "-n", "--num") {
-        if let Some(value) = load_local_setting_value("log.num") {
+    if !has_option(args, "-n", "--num")
+        && let Some(value) = load_local_setting_value("log.num") {
             defaults.push("--num".to_string());
             defaults.push(value);
         }
-    }
     if !has_option(args, "-t", "--tail") && load_local_setting_bool("log.tail").unwrap_or(false) {
         defaults.push("--tail".to_string());
     }

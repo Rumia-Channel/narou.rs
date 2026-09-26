@@ -221,10 +221,7 @@ pub async fn tag_list(
     Query(params): Query<TagListParams>,
 ) -> Response {
     let new_tag_color = super::configured_tag_color(&state).await;
-    let records = match state.services.library.records().await {
-        Ok(records) => records,
-        Err(_) => Vec::new(),
-    };
+    let records = state.services.library.records().await.unwrap_or_default();
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for record in &records {
         for tag in &record.tags {
@@ -232,7 +229,7 @@ pub async fn tag_list(
         }
     }
     let mut list: Vec<(String, usize)> = counts.into_iter().collect();
-    list.sort_by(|a, b| b.1.cmp(&a.1));
+    list.sort_by_key(|item| std::cmp::Reverse(item.1));
     let tags = list.into_iter().map(|(tag, _)| tag).collect::<Vec<_>>();
     let tag_colors = state
         .services

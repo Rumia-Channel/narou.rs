@@ -293,7 +293,7 @@ impl PersistentQueue {
             .iter()
             .any(|job| {
                 job.job.job_type.lane() == lane
-                    && job.job.available_at.map_or(true, |at| at <= now)
+                    && job.job.available_at.is_none_or(|at| at <= now)
             })
     }
 
@@ -393,7 +393,7 @@ impl PersistentQueue {
             let index = state
                 .active_pending
                 .iter()
-                .position(|job| job.job.available_at.map_or(true, |at| at <= now))?;
+                .position(|job| job.job.available_at.is_none_or(|at| at <= now))?;
             let mut stored = state.active_pending.remove(index)?;
             stored.mark_running();
             let job = stored.job.clone();
@@ -425,7 +425,7 @@ impl PersistentQueue {
                 .position(|job| {
                     job.job.job_type.lane() == lane
                         && !is_blocked(&job.job)
-                        && job.job.available_at.map_or(true, |at| at <= now)
+                        && job.job.available_at.is_none_or(|at| at <= now)
                 })?;
             let mut stored = state.active_pending.remove(index)?;
             stored.mark_running();
@@ -1270,7 +1270,7 @@ fn queue_job_to_legacy_parts(job_type: JobType, target: &str) -> (String, Vec<Va
     let parts = split_job_target(target);
     let (cmd, args) = match job_type {
         JobType::Download => {
-            if parts.first() == Some(&"--force") && !parts.iter().any(|part| *part == "--mail") {
+            if parts.first() == Some(&"--force") && !parts.contains(&"--mail") {
                 (
                     "download_force".to_string(),
                     parts[1..]
@@ -1777,7 +1777,7 @@ mod tests {
         assert_eq!(spec.cmd, "update_by_tag");
         assert_eq!(spec.args, vec!["tag:modified".to_string()]);
         assert_eq!(
-            spec.meta.get(&Value::String("source".to_string())),
+            spec.meta.get(Value::String("source".to_string())),
             Some(&Value::String("web".to_string()))
         );
     }

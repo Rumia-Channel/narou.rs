@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// 保存・削除などの応答、一覧の入出力は Worker と共有する。
 pub use crate::application::web_payloads::{

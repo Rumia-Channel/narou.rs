@@ -414,14 +414,13 @@ fn rollback(backups: &[BackupEntry], logger: &mut Logger) {
 
 fn cleanup_backups(backups: &[BackupEntry], logger: &mut Logger) {
     for entry in backups {
-        if entry.backup.exists() {
-            if let Err(e) = fs::remove_file(&entry.backup) {
+        if entry.backup.exists()
+            && let Err(e) = fs::remove_file(&entry.backup) {
                 logger.log(format!(
                     "cleanup: cannot remove {:?}: {} (will retry on next update)",
                     entry.backup, e
                 ));
             }
-        }
     }
 }
 

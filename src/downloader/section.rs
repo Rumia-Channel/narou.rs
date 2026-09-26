@@ -14,6 +14,12 @@ pub struct SectionCache {
     order: VecDeque<String>,
 }
 
+impl Default for SectionCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SectionCache {
     pub fn new() -> Self {
         Self {
@@ -94,32 +100,29 @@ pub fn parse_section_html(
         body: String::new(),
     };
 
-    if let Some(re) = setting.compiled_introduction_pattern() {
-        if let Some(caps) = re.captures(&html_source) {
+    if let Some(re) = setting.compiled_introduction_pattern()
+        && let Some(caps) = re.captures(&html_source) {
             element.introduction = caps
                 .name("introduction")
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_default();
         }
-    }
 
-    if let Some(re) = setting.compiled_postscript_pattern() {
-        if let Some(caps) = re.captures(&html_source) {
+    if let Some(re) = setting.compiled_postscript_pattern()
+        && let Some(caps) = re.captures(&html_source) {
             element.postscript = caps
                 .name("postscript")
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_default();
         }
-    }
 
-    if let Some(re) = setting.compiled_body_pattern() {
-        if let Some(caps) = re.captures(&html_source) {
+    if let Some(re) = setting.compiled_body_pattern()
+        && let Some(caps) = re.captures(&html_source) {
             element.body = caps
                 .name("body")
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_default();
         }
-    }
 
     Ok((element, html_source))
 }

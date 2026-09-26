@@ -151,8 +151,10 @@ mod tests {
 
     #[test]
     fn output_filename_strips_title_prefix_when_enabled() {
-        let mut settings = NovelSettings::default();
-        settings.enable_strip_title_prefix = true;
+        let settings = NovelSettings {
+            enable_strip_title_prefix: true,
+            ..NovelSettings::default()
+        };
         let toc = TocObject {
             title: "【3/17第1巻発売】《コミカライズ企画進行中》悪役令息が破滅フラグ".to_string(),
             author: "作者".to_string(),
@@ -180,8 +182,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
 
-        let mut settings = NovelSettings::default();
-        settings.archive_path = root.clone();
+        let settings = NovelSettings {
+            archive_path: root.clone(),
+            ..NovelSettings::default()
+        };
 
         let path = create_output_text_path_for_textfile(&settings, "タイトル\n作者\n本文");
         assert_eq!(

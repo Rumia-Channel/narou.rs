@@ -490,175 +490,6 @@ pub fn original_setting_var_infos() -> Vec<(&'static str, VarInfo)> {
     ]
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_arg_command_names_cover_web_and_alias() {
-        assert!(default_arg_command_names().contains(&"web"));
-        assert!(default_arg_command_names().contains(&"alias"));
-        assert!(is_known_default_arg_name("default_args.convert"));
-        assert!(!is_known_default_arg_name("default_args.not_exists"));
-    }
-
-    #[test]
-    fn external_bind_auth_override_has_no_webui_tab() {
-        assert_eq!(
-            tab_for_setting("server-basic-auth.require-for-external-bind"),
-            None
-        );
-        assert!(
-            setting_variables()
-                .get("server-basic-auth.require-for-external-bind")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn reverse_proxy_mode_has_no_webui_tab() {
-        assert_eq!(tab_for_setting("server-reverse-proxy.enable"), None);
-        assert!(
-            setting_variables()
-                .get("server-reverse-proxy.enable")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn webui_debug_mode_is_visible_on_webui_tab() {
-        assert_eq!(tab_for_setting("webui.debug-mode"), Some("webui"));
-        assert!(setting_variables().get("webui.debug-mode").is_some());
-    }
-
-    #[test]
-    fn webui_new_tag_color_is_visible_on_webui_tab() {
-        assert_eq!(tab_for_setting("webui.new-tag-color"), Some("webui"));
-        assert!(setting_variables().get("webui.new-tag-color").is_some());
-    }
-
-    #[test]
-    fn server_add_accepted_hosts_has_global_tab() {
-        assert_eq!(tab_for_setting("server-add-accepted-hosts"), Some("global"));
-        let vars = setting_variables();
-        let info = vars
-            .get("server-add-accepted-hosts")
-            .expect("server-add-accepted-hosts must be registered as a global var");
-        assert!(matches!(info.var_type, VarType::String));
-        assert!(info.invisible, "global-only setting should stay invisible on webui tab");
-    }
-
-    #[test]
-    fn self_update_variant_is_selectable_from_settings() {
-        assert_eq!(tab_for_setting("self-update.variant"), Some("global"));
-
-        let vars = setting_variables();
-        let info = vars
-            .get("self-update.variant")
-            .expect("self-update.variant must be registered as a global var");
-        assert!(matches!(info.var_type, VarType::Select));
-        assert!(
-            !info.invisible,
-            "the variant must be listed by `narou setting` and shown on the Web UI settings page"
-        );
-        assert_eq!(
-            info.select_keys,
-            Some(vec!["gpl".to_string(), "standard".to_string()])
-        );
-    }
-
-    #[test]
-    fn queue_retry_settings_have_detail_tab_and_defaults() {
-        assert_eq!(tab_for_setting("queue.max-retries"), Some("detail"));
-        assert_eq!(tab_for_setting("queue.retry-backoff"), Some("detail"));
-
-        let vars = setting_variables();
-        let max = vars
-            .get("queue.max-retries")
-            .expect("queue.max-retries must be registered as a local var");
-        assert!(matches!(max.var_type, VarType::Integer));
-        assert!(max.invisible, "queue settings stay invisible on webui tab");
-
-        let backoff = vars
-            .get("queue.retry-backoff")
-            .expect("queue.retry-backoff must be registered as a local var");
-        assert!(matches!(backoff.var_type, VarType::String));
-        assert!(backoff.invisible);
-
-        // Default values must surface through `default_local_setting_value` so
-        // the user does not have to write them by hand.
-        let max_default = default_local_setting_value("queue.max-retries")
-            .expect("queue.max-retries default");
-        assert_eq!(max_default.as_i64(), Some(3));
-        let backoff_default = default_local_setting_value("queue.retry-backoff")
-            .expect("queue.retry-backoff default");
-        assert_eq!(
-            backoff_default.as_str(),
-            Some("1m,5m,15m"),
-        );
-    }
-
-    #[test]
-    fn update_max_parallel_domains_has_general_tab_and_default() {
-        assert_eq!(tab_for_setting("update.max-parallel-domains"), Some("general"));
-
-        let vars = setting_variables();
-        let info = vars
-            .get("update.max-parallel-domains")
-            .expect("update.max-parallel-domains must be registered as a local var");
-        assert!(matches!(info.var_type, VarType::Integer));
-        assert!(!info.invisible);
-
-        let default = default_local_setting_value("update.max-parallel-domains")
-            .expect("update.max-parallel-domains default");
-        assert_eq!(default.as_i64(), Some(4));
-    }
-
-    #[test]
-    fn mail_attachment_filename_settings_are_visible_on_detail_tab() {
-        assert_eq!(
-            tab_for_setting("mail.attachment-filename-pattern"),
-            Some("detail")
-        );
-        assert_eq!(
-            tab_for_setting("mail.attachment-filename-replacement"),
-            Some("detail")
-        );
-
-        let vars = setting_variables();
-        for name in [
-            "mail.attachment-filename-pattern",
-            "mail.attachment-filename-replacement",
-        ] {
-            let info = vars.get(name).expect("mail attachment filename setting");
-            assert!(matches!(info.var_type, VarType::String));
-            assert!(!info.invisible);
-        }
-    }
-
-    #[test]
-    fn mail_attachment_filename_webui_help_includes_usage_notes() {
-        let vars = setting_variables();
-        let pattern = vars
-            .get("mail.attachment-filename-pattern")
-            .expect("mail attachment filename pattern setting");
-        let replacement = vars
-            .get("mail.attachment-filename-replacement")
-            .expect("mail attachment filename replacement setting");
-
-        let pattern_help =
-            webui_help_override("mail.attachment-filename-pattern", pattern.help).unwrap();
-        let replacement_help =
-            webui_help_override("mail.attachment-filename-replacement", replacement.help).unwrap();
-
-        assert!(pattern_help.contains(r"^\[[^\]]+\](.*)$"));
-        assert!(pattern_help.contains("フォルダ名は含みません"));
-        assert!(replacement_help.contains("$1"));
-        assert!(replacement_help.contains("mail_setting.yaml"));
-        assert!(replacement_help.contains("優先"));
-    }
-}
-
 /// Local setting variable metadata
 pub fn setting_variables() -> SettingVariables {
     let vis = |vt: VarType, help: &'static str| VarInfo {
@@ -1245,4 +1076,173 @@ pub fn webui_help_override(name: &str, base_help: &str) -> Option<String> {
         _ => return None,
     };
     Some(raw.replace("%%ORIG%%", base_help))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_arg_command_names_cover_web_and_alias() {
+        assert!(default_arg_command_names().contains(&"web"));
+        assert!(default_arg_command_names().contains(&"alias"));
+        assert!(is_known_default_arg_name("default_args.convert"));
+        assert!(!is_known_default_arg_name("default_args.not_exists"));
+    }
+
+    #[test]
+    fn external_bind_auth_override_has_no_webui_tab() {
+        assert_eq!(
+            tab_for_setting("server-basic-auth.require-for-external-bind"),
+            None
+        );
+        assert!(
+            setting_variables()
+                .get("server-basic-auth.require-for-external-bind")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn reverse_proxy_mode_has_no_webui_tab() {
+        assert_eq!(tab_for_setting("server-reverse-proxy.enable"), None);
+        assert!(
+            setting_variables()
+                .get("server-reverse-proxy.enable")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn webui_debug_mode_is_visible_on_webui_tab() {
+        assert_eq!(tab_for_setting("webui.debug-mode"), Some("webui"));
+        assert!(setting_variables().get("webui.debug-mode").is_some());
+    }
+
+    #[test]
+    fn webui_new_tag_color_is_visible_on_webui_tab() {
+        assert_eq!(tab_for_setting("webui.new-tag-color"), Some("webui"));
+        assert!(setting_variables().get("webui.new-tag-color").is_some());
+    }
+
+    #[test]
+    fn server_add_accepted_hosts_has_global_tab() {
+        assert_eq!(tab_for_setting("server-add-accepted-hosts"), Some("global"));
+        let vars = setting_variables();
+        let info = vars
+            .get("server-add-accepted-hosts")
+            .expect("server-add-accepted-hosts must be registered as a global var");
+        assert!(matches!(info.var_type, VarType::String));
+        assert!(info.invisible, "global-only setting should stay invisible on webui tab");
+    }
+
+    #[test]
+    fn self_update_variant_is_selectable_from_settings() {
+        assert_eq!(tab_for_setting("self-update.variant"), Some("global"));
+
+        let vars = setting_variables();
+        let info = vars
+            .get("self-update.variant")
+            .expect("self-update.variant must be registered as a global var");
+        assert!(matches!(info.var_type, VarType::Select));
+        assert!(
+            !info.invisible,
+            "the variant must be listed by `narou setting` and shown on the Web UI settings page"
+        );
+        assert_eq!(
+            info.select_keys,
+            Some(vec!["gpl".to_string(), "standard".to_string()])
+        );
+    }
+
+    #[test]
+    fn queue_retry_settings_have_detail_tab_and_defaults() {
+        assert_eq!(tab_for_setting("queue.max-retries"), Some("detail"));
+        assert_eq!(tab_for_setting("queue.retry-backoff"), Some("detail"));
+
+        let vars = setting_variables();
+        let max = vars
+            .get("queue.max-retries")
+            .expect("queue.max-retries must be registered as a local var");
+        assert!(matches!(max.var_type, VarType::Integer));
+        assert!(max.invisible, "queue settings stay invisible on webui tab");
+
+        let backoff = vars
+            .get("queue.retry-backoff")
+            .expect("queue.retry-backoff must be registered as a local var");
+        assert!(matches!(backoff.var_type, VarType::String));
+        assert!(backoff.invisible);
+
+        // Default values must surface through `default_local_setting_value` so
+        // the user does not have to write them by hand.
+        let max_default = default_local_setting_value("queue.max-retries")
+            .expect("queue.max-retries default");
+        assert_eq!(max_default.as_i64(), Some(3));
+        let backoff_default = default_local_setting_value("queue.retry-backoff")
+            .expect("queue.retry-backoff default");
+        assert_eq!(
+            backoff_default.as_str(),
+            Some("1m,5m,15m"),
+        );
+    }
+
+    #[test]
+    fn update_max_parallel_domains_has_general_tab_and_default() {
+        assert_eq!(tab_for_setting("update.max-parallel-domains"), Some("general"));
+
+        let vars = setting_variables();
+        let info = vars
+            .get("update.max-parallel-domains")
+            .expect("update.max-parallel-domains must be registered as a local var");
+        assert!(matches!(info.var_type, VarType::Integer));
+        assert!(!info.invisible);
+
+        let default = default_local_setting_value("update.max-parallel-domains")
+            .expect("update.max-parallel-domains default");
+        assert_eq!(default.as_i64(), Some(4));
+    }
+
+    #[test]
+    fn mail_attachment_filename_settings_are_visible_on_detail_tab() {
+        assert_eq!(
+            tab_for_setting("mail.attachment-filename-pattern"),
+            Some("detail")
+        );
+        assert_eq!(
+            tab_for_setting("mail.attachment-filename-replacement"),
+            Some("detail")
+        );
+
+        let vars = setting_variables();
+        for name in [
+            "mail.attachment-filename-pattern",
+            "mail.attachment-filename-replacement",
+        ] {
+            let info = vars.get(name).expect("mail attachment filename setting");
+            assert!(matches!(info.var_type, VarType::String));
+            assert!(!info.invisible);
+        }
+    }
+
+    #[test]
+    fn mail_attachment_filename_webui_help_includes_usage_notes() {
+        let vars = setting_variables();
+        let pattern = vars
+            .get("mail.attachment-filename-pattern")
+            .expect("mail attachment filename pattern setting");
+        let replacement = vars
+            .get("mail.attachment-filename-replacement")
+            .expect("mail attachment filename replacement setting");
+
+        let pattern_help =
+            webui_help_override("mail.attachment-filename-pattern", pattern.help).unwrap();
+        let replacement_help =
+            webui_help_override("mail.attachment-filename-replacement", replacement.help).unwrap();
+
+        assert!(pattern_help.contains(r"^\[[^\]]+\](.*)$"));
+        assert!(pattern_help.contains("フォルダ名は含みません"));
+        assert!(replacement_help.contains("$1"));
+        assert!(replacement_help.contains("mail_setting.yaml"));
+        assert!(replacement_help.contains("優先"));
+    }
 }

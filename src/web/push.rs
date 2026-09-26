@@ -39,6 +39,12 @@ pub struct BroadcastChannel {
     pub sender: broadcast::Sender<String>,
 }
 
+impl Default for BroadcastChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BroadcastChannel {
     pub fn new() -> Self {
         let (sender, _) = broadcast::channel(4096);

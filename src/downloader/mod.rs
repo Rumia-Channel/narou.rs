@@ -90,7 +90,7 @@ pub(crate) enum SiteTimezone {
 }
 
 impl SiteTimezone {
-    fn from_local_datetime(self, dt: NaiveDateTime) -> Option<DateTime<Utc>> {
+    fn resolve_local_datetime(self, dt: NaiveDateTime) -> Option<DateTime<Utc>> {
         match self {
             Self::Named(tz) => match tz.from_local_datetime(&dt) {
                 LocalResult::Single(local) | LocalResult::Ambiguous(local, _) => {
@@ -418,12 +418,12 @@ fn parse_loose_datetime_with_timezone(
 
     for fmt in &formats {
         if let Ok(dt) = NaiveDateTime::parse_from_str(&value, fmt) {
-            return timezone.from_local_datetime(dt);
+            return timezone.resolve_local_datetime(dt);
         }
         if let Ok(date) = NaiveDate::parse_from_str(&value, fmt) {
             return date
                 .and_hms_opt(0, 0, 0)
-                .and_then(|dt| timezone.from_local_datetime(dt));
+                .and_then(|dt| timezone.resolve_local_datetime(dt));
         }
     }
 
@@ -1742,7 +1742,7 @@ impl Downloader {
         for (section_index, subtitle) in subtitles.iter().enumerate() {
             let resumed = resumed_sections.remove(&section_index);
             let is_new_arrival =
-                resumed.is_none() && old_subtitles.get(&subtitle.index).is_none();
+                resumed.is_none() && !old_subtitles.contains_key(&subtitle.index);
             let existed = existing_sections.contains(&subtitle.index);
             let (needs_download, predownloaded) = if resumed.is_some() {
                 (false, None)
@@ -1787,7 +1787,7 @@ impl Downloader {
 
         for (section_index, (subtitle, plan)) in subtitles
             .iter()
-            .zip(section_plans.into_iter())
+            .zip(section_plans)
             .enumerate()
         {
             if section_index >= resume_from
@@ -2411,8 +2411,8 @@ impl Downloader {
         append_title: bool,
         existing_record: Option<&NovelRecord>,
     ) -> String {
-        if let Some(record) = existing_record {
-            if !record.file_title.is_empty() {
+        if let Some(record) = existing_record
+            && !record.file_title.is_empty() {
                 if append_title
                     && ncode
                         .as_deref()
@@ -2424,7 +2424,6 @@ impl Downloader {
                     return record.file_title.clone();
                 }
             }
-        }
 
         if let Some(ncode) = ncode {
             if !append_title {
@@ -2557,12 +2556,11 @@ impl Downloader {
         if from_id == to_id {
             return;
         }
-        if let Some(bucket) = self.section_hash_cache.remove(&from_id.to_string()) {
-            if !bucket.is_empty() {
+        if let Some(bucket) = self.section_hash_cache.remove(&from_id.to_string())
+            && !bucket.is_empty() {
                 self.section_hash_cache.insert(to_id.to_string(), bucket);
                 self.section_hash_cache_dirty = true;
             }
-        }
     }
 
     fn flush_section_hash_cache(&mut self) -> Result<()> {
@@ -2899,10 +2897,12 @@ mod tests {
         let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
         let db = Database::new().unwrap();
-        let mut db_slot = db::DATABASE.lock();
-        let previous_db = db_slot.take();
-        *db_slot = Some(db);
-        drop(db_slot);
+        let previous_db = {
+            let mut db_slot = db::DATABASE.lock();
+            let previous_db = db_slot.take();
+            *db_slot = Some(db);
+            previous_db
+        };
         let _db_guard = DatabaseGuard(previous_db);
 
         struct YieldBeforeSection(usize);
@@ -3578,9 +3578,9 @@ is_narou: false
         let http = MockHttpClient::new();
         for (id, title) in [("139115096", "第19話"), ("139115097", "第20話")] {
             http.add_text(
-                &format!("https://www.pixiv.net/ajax/illust/{id}"),
+                format!("https://www.pixiv.net/ajax/illust/{id}"),
                 200,
-                &format!(
+                format!(
                     r#"{{"error":false,"body":{{"id":"{id}","title":"{title}","userName":"作者名","uploadDate":"2026-01-02T03:04:05+09:00"}}}}"#
                 ),
             );

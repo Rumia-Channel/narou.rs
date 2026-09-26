@@ -66,12 +66,10 @@ fn version_more() {
     if aozora_output.status.success()
         && lines.get(2).is_some_and(|line| line.starts_with(" -c,"))
         && lines.last().is_some_and(|line| line.starts_with(" -tf"))
-    {
-        if let Some(version_line) = lines.get(1) {
+        && let Some(version_line) = lines.get(1) {
             println!("AozoraEpub3 {}", version_line.trim());
             return;
         }
-    }
 
     print_stream(&stdout_text);
     print_stream(&stderr_text);

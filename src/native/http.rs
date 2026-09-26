@@ -278,8 +278,8 @@ impl NativeHttpClient {
 
         let response = req.send().map_err(|e| NarouError::Http(e.to_string()))?;
         let status = response.status().as_u16();
-        if (400..600).contains(&status) {
-            if let Ok((code, Some(location))) = self.curl_probe_redirect(request, user_agent)
+        if (400..600).contains(&status)
+            && let Ok((code, Some(location))) = self.curl_probe_redirect(request, user_agent)
                 && (300..400).contains(&code)
             {
                 return Ok(HttpResponse {
@@ -288,7 +288,6 @@ impl NativeHttpClient {
                     body: Vec::new(),
                 });
             }
-        }
 
         let headers = content_type_header(content_type_of(&response));
         let body = read_response_bytes(response)?;
@@ -865,9 +864,8 @@ fn build_reqwest_client(
 ) -> Result<reqwest::blocking::Client> {
     let redirect_policy = if follow_redirects {
         reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= MAX_REDIRECTS {
-                attempt.stop()
-            } else if validate_public_url(attempt.url().as_str()).is_err() {
+            if attempt.previous().len() >= MAX_REDIRECTS
+                || validate_public_url(attempt.url().as_str()).is_err() {
                 attempt.stop()
             } else {
                 attempt.follow()

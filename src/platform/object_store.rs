@@ -108,9 +108,6 @@ impl ObjectPrefix {
         validate_logical_key(prefix.trim_end_matches('/'))?;
         Ok(Self(prefix))
     }
-    pub fn as_ref(&self) -> &str {
-        &self.0
-    }
 
     pub fn matches(&self, key: &ObjectKey) -> bool {
         let prefix = self.0.trim_end_matches('/');
@@ -118,6 +115,12 @@ impl ObjectPrefix {
             || key.as_ref() == prefix
             || (key.as_ref().starts_with(prefix)
                 && key.as_ref().as_bytes().get(prefix.len()) == Some(&b'/'))
+    }
+}
+
+impl AsRef<str> for ObjectPrefix {
+    fn as_ref(&self) -> &str {
+        &self.0
     }
 }
 

@@ -179,15 +179,15 @@ fn start_queue_worker_for_lane(
                             let schedule = load_retry_backoff_schedule();
                             let backoff_secs =
                                 compute_retry_backoff_secs(job.retry_count, &schedule);
-                            let available_at = Some(chrono::Utc::now().timestamp() + backoff_secs);
-                            match queue.requeue(&job.id, available_at) {
+                            let available_at = chrono::Utc::now().timestamp() + backoff_secs;
+                            match queue.requeue(&job.id, Some(available_at)) {
                                 Ok(true) => {
                                     retry_scheduled = RetrySchedule {
                                         scheduled: true,
                                         retry_count: job.retry_count + 1,
                                         max_retries: job.max_retries,
                                         backoff_secs,
-                                        available_at: available_at.unwrap_or(0),
+                                        available_at,
                                     };
                                     Ok(())
                                 }
@@ -1319,12 +1319,12 @@ mod tests {
 
         assert!(job_conflicts_with_running(
             &same_novel_convert,
-            &[running_update.clone()],
+            std::slice::from_ref(&running_update),
             &empty_running_by_lane,
         ));
         assert!(!job_conflicts_with_running(
             &other_novel_convert,
-            &[running_update.clone()],
+            std::slice::from_ref(&running_update),
             &empty_running_by_lane,
         ));
         assert!(!job_conflicts_with_running(
@@ -1447,7 +1447,7 @@ mod tests {
 
     #[test]
     fn summarize_failure_details_truncates_long_output() {
-        let detail = summarize_failure_details(&[String::from("x".repeat(MAX_FAILURE_DETAIL_CHARS + 10))])
+        let detail = summarize_failure_details(&["x".repeat(MAX_FAILURE_DETAIL_CHARS + 10)])
             .expect("detail");
         assert!(detail.ends_with('…'));
         assert!(detail.chars().count() <= MAX_FAILURE_DETAIL_CHARS + 1);

@@ -90,11 +90,10 @@ fn copy_bundled_webnovel_files(destination: &Path) -> Result<usize> {
 
 fn bundled_webnovel_dir() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent() {
             candidates.push(parent.join("webnovel"));
         }
-    }
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("webnovel"));
 
     candidates.into_iter().find(|path| path.is_dir())
@@ -318,11 +317,10 @@ fn rewrite_aozoraepub3_files(aozora_path: &str, line_height: f64) -> Result<()> 
 
 fn preset_dir() -> Result<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent() {
             candidates.push(parent.join("preset"));
         }
-    }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     candidates.push(manifest_dir.join("preset"));
     candidates.push(manifest_dir.join("sample").join("narou").join("preset"));
@@ -350,6 +348,28 @@ fn format_line_height(line_height: f64) -> String {
         }
     }
     text
+}
+
+fn normalize_path_string(path: &str) -> String {
+    path.trim().trim_matches('"').to_string()
+}
+
+fn is_disallowed_aozora_path(path: &str) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    path.starts_with("\\\\?\\")
+        || path.starts_with("\\\\")
+        || path
+            .as_bytes()
+            .get(1)
+            .copied()
+            .filter(|byte| *byte == b':')
+            .map(|_| {
+                let rest = &path[2..];
+                rest.is_empty() || !(rest.starts_with('\\') || rest.starts_with('/'))
+            })
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -471,26 +491,4 @@ mod tests {
         assert!(validate_aozoraepub3_path(r"C:relative\Aozora").is_none());
         assert!(validate_aozoraepub3_path("C:").is_none());
     }
-}
-
-fn normalize_path_string(path: &str) -> String {
-    path.trim().trim_matches('"').to_string()
-}
-
-fn is_disallowed_aozora_path(path: &str) -> bool {
-    if !cfg!(windows) {
-        return false;
-    }
-    path.starts_with("\\\\?\\")
-        || path.starts_with("\\\\")
-        || path
-            .as_bytes()
-            .get(1)
-            .copied()
-            .filter(|byte| *byte == b':')
-            .map(|_| {
-                let rest = &path[2..];
-                rest.is_empty() || !(rest.starts_with('\\') || rest.starts_with('/'))
-            })
-            .unwrap_or(false)
 }

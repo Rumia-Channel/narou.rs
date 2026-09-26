@@ -205,13 +205,12 @@ where
             50
         };
         let show_progress = max_pages >= 5 && !title.is_empty();
-        if show_progress {
-            if let Some(progress) = progress {
+        if show_progress
+            && let Some(progress) = progress {
                 progress.set_position(0);
                 progress.set_length(max_pages as u64);
                 progress.set_message(&format!("目次 {}", title));
             }
-        }
 
         loop {
             if setting.is_partial_login_view(&current_toc_source) {
@@ -221,11 +220,10 @@ where
             all_subtitles.extend(page_subs);
 
             page += 1;
-            if show_progress {
-                if let Some(progress) = progress {
+            if show_progress
+                && let Some(progress) = progress {
                     progress.inc(1);
                 }
-            }
             if page >= max_pages {
                 break;
             }
@@ -257,14 +255,55 @@ where
                 fetch_next_toc(http, rate_limiter, setting, next_url, &mut *jobs).await?;
         }
 
-        if show_progress {
-            if let Some(progress) = progress {
+        if show_progress
+            && let Some(progress) = progress {
                 progress.set_position(0);
             }
-        }
 
         Ok((all_subtitles, partial_listing))
     })
+}
+
+pub fn create_short_story_subtitles(
+    setting: &SiteSetting,
+    toc_source: &str,
+    info: &NovelInfo,
+) -> Result<Vec<SubtitleInfo>> {
+    let title = info
+        .title
+        .clone()
+        .or_else(|| setting.resolve_info_pattern("t", toc_source))
+        .unwrap_or_else(|| "短編".to_string());
+    let subdate = info.raw_captures.get("gf").cloned().unwrap_or_default();
+    let subupdate = info
+        .raw_captures
+        .get("nu")
+        .cloned()
+        .or_else(|| info.raw_captures.get("gl").cloned())
+        .or_else(|| info.raw_captures.get("gf").cloned());
+
+    // narou.rb の `create_short_story_subtitles` と同じく、title に対しても
+    // ruby タグ落としと改行除去を行う。
+    let subtitle_clean = slim_subtitle(&title);
+    let title_for_filename = delete_ruby_tag(&title);
+
+    Ok(vec![SubtitleInfo {
+        index: "1".to_string(),
+        href: String::new(),
+        chapter: String::new(),
+        subchapter: String::new(),
+        subtitle: subtitle_clean,
+        file_subtitle: match load_length_limit("filename-length-limit", Some(50)) {
+            Some(limit) => {
+                let reserved = "1".chars().count() + 1;
+                sanitize_filename_with_limit(&title_for_filename, Some(limit.saturating_sub(reserved)))
+            }
+            None => sanitize_filename(&title_for_filename),
+        },
+        subdate,
+        subupdate,
+        download_time: None,
+    }])
 }
 
 #[cfg(test)]
@@ -648,46 +687,4 @@ mod tests {
         assert_eq!(subtitles[1].chapter, "");
         assert_eq!(subtitles[1].subtitle, "通常タイトル");
     }
-}
-
-pub fn create_short_story_subtitles(
-    setting: &SiteSetting,
-    toc_source: &str,
-    info: &NovelInfo,
-) -> Result<Vec<SubtitleInfo>> {
-    let title = info
-        .title
-        .clone()
-        .or_else(|| setting.resolve_info_pattern("t", toc_source))
-        .unwrap_or_else(|| "短編".to_string());
-    let subdate = info.raw_captures.get("gf").cloned().unwrap_or_default();
-    let subupdate = info
-        .raw_captures
-        .get("nu")
-        .cloned()
-        .or_else(|| info.raw_captures.get("gl").cloned())
-        .or_else(|| info.raw_captures.get("gf").cloned());
-
-    // narou.rb の `create_short_story_subtitles` と同じく、title に対しても
-    // ruby タグ落としと改行除去を行う。
-    let subtitle_clean = slim_subtitle(&title);
-    let title_for_filename = delete_ruby_tag(&title);
-
-    Ok(vec![SubtitleInfo {
-        index: "1".to_string(),
-        href: String::new(),
-        chapter: String::new(),
-        subchapter: String::new(),
-        subtitle: subtitle_clean,
-        file_subtitle: match load_length_limit("filename-length-limit", Some(50)) {
-            Some(limit) => {
-                let reserved = "1".chars().count() + 1;
-                sanitize_filename_with_limit(&title_for_filename, Some(limit.saturating_sub(reserved)))
-            }
-            None => sanitize_filename(&title_for_filename),
-        },
-        subdate,
-        subupdate,
-        download_time: None,
-    }])
 }

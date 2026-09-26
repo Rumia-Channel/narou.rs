@@ -45,11 +45,10 @@ fn try_regex_captures(
     if let Ok(re) = re {
         if let Some(caps) = re.captures(source) {
             for name in re.capture_names().flatten() {
-                if capture_name_matches_key(key, name) {
-                    if let Some(m) = caps.name(name) {
+                if capture_name_matches_key(key, name)
+                    && let Some(m) = caps.name(name) {
                         return Some(decode_html_text(m.as_str()));
                     }
-                }
             }
             if let Some(m) = caps.get(1) {
                 return Some(decode_html_text(m.as_str()));
@@ -66,20 +65,18 @@ fn try_regex_captures(
         .dot_matches_new_line(true)
         .multi_line(true)
         .build();
-    if let Ok(fre) = fre {
-        if let Ok(Some(caps)) = fre.captures(source) {
+    if let Ok(fre) = fre
+        && let Ok(Some(caps)) = fre.captures(source) {
             for name in fre.capture_names().flatten() {
-                if capture_name_matches_key(key, name) {
-                    if let Some(m) = caps.name(name) {
+                if capture_name_matches_key(key, name)
+                    && let Some(m) = caps.name(name) {
                         return Some(decode_html_text(m.as_str()));
                     }
-                }
             }
             if let Some(m) = caps.get(1) {
                 return Some(decode_html_text(m.as_str()));
             }
         }
-    }
     None
 }
 

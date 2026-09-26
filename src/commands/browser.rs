@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use narou_rs::compat::open_browser;
 use narou_rs::db;
@@ -58,7 +58,7 @@ fn resolve_target_urls(target: &str) -> Option<(String, PathBuf)> {
     ))
 }
 
-fn build_vote_target_url(toc_url: &str, novel_dir: &PathBuf) -> Option<String> {
+fn build_vote_target_url(toc_url: &str, novel_dir: &Path) -> Option<String> {
     let toc = load_toc_file(novel_dir)?;
     let latest_index = toc.subtitles.last()?.index.trim();
     if latest_index.is_empty() {

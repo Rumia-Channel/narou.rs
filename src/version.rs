@@ -37,14 +37,13 @@ pub fn runtime_description() -> String {
     let mut command = Command::new("rustc");
     command.arg("--version");
     configure_hidden_console_command(&mut command);
-    if let Ok(output) = command.output() {
-        if output.status.success() {
+    if let Ok(output) = command.output()
+        && output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !text.is_empty() {
                 return text;
             }
         }
-    }
 
     format!(
         "Rust {} ({}/{})",
@@ -223,16 +222,9 @@ mod tests {
 
     #[test]
     fn build_variant_matches_lite_feature() {
-        #[cfg(feature = "lite")]
-        {
-            assert!(EMBEDS_AOZORA_LITE);
-            assert_eq!(BUILD_VARIANT, "gpl");
-        }
-        #[cfg(not(feature = "lite"))]
-        {
-            assert!(!EMBEDS_AOZORA_LITE);
-            assert_eq!(BUILD_VARIANT, "standard");
-        }
+        assert_eq!(EMBEDS_AOZORA_LITE, cfg!(feature = "lite"));
+        let expected = if cfg!(feature = "lite") { "gpl" } else { "standard" };
+        assert_eq!(BUILD_VARIANT, expected);
     }
 }
 

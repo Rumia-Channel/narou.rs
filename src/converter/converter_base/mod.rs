@@ -174,11 +174,10 @@ impl ConverterBase {
         let mut result = text.to_string();
 
         match self.text_type {
-            TextType::Body | TextType::TextFile => {
-                if self.settings.enable_convert_page_break {
+            TextType::Body | TextType::TextFile
+                if self.settings.enable_convert_page_break => {
                     result = self.convert_page_break(&result);
                 }
-            }
             _ => {}
         }
 
@@ -202,7 +201,7 @@ impl ConverterBase {
         self.replace_illust_tag(&mut result);
         result = self.replace_url(&result);
         result = self.replace_narou_tag(&result);
-        result = self.convert_numbers(&mut result);
+        result = self.convert_numbers(&result);
         result = self.exception_reconvert_kanji_to_num(&result);
         if self.settings.enable_convert_num_to_kanji
             && self.text_type != TextType::Subtitle

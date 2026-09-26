@@ -62,7 +62,7 @@ impl ConverterBase {
 
     pub(super) fn convert_numbers_to_kanji(&mut self, text: &str) -> String {
         let text = self.stash_kanji_num(text);
-        let result = RE_NUM_RUN
+        RE_NUM_RUN
             .replace_all(&text, |caps: &regex::Captures| {
                 let num_str = &caps[0];
                 if num_str.contains(',') || num_str.contains('\u{FF0C}') {
@@ -85,8 +85,7 @@ impl ConverterBase {
                     })
                     .collect::<String>()
             })
-            .to_string();
-        result
+            .to_string()
     }
 
     pub(super) fn hankaku_num_to_zenkaku(&self, text: &str) -> String {
@@ -785,8 +784,10 @@ mod tests {
 
     #[test]
     fn ruby_parity_disable_alphabet_word_to_zenkaku_keeps_short_words_halfwidth() {
-        let mut settings = NovelSettings::default();
-        settings.disable_alphabet_word_to_zenkaku = true;
+        let settings = NovelSettings {
+            disable_alphabet_word_to_zenkaku: true,
+            ..NovelSettings::default()
+        };
         let mut cb = ConverterBase::new(settings);
         let out = cb.convert("API", TextType::Story);
         assert_eq!(out, "API");
@@ -794,9 +795,11 @@ mod tests {
 
     #[test]
     fn ruby_parity_fraction_and_date_settings_are_applied() {
-        let mut settings = NovelSettings::default();
-        settings.enable_transform_fraction = true;
-        settings.enable_transform_date = true;
+        let settings = NovelSettings {
+            enable_transform_fraction: true,
+            enable_transform_date: true,
+            ..NovelSettings::default()
+        };
         let mut cb = ConverterBase::new(settings);
         let out = cb.convert("1/2 2026/7/8", TextType::Story);
         assert!(out.contains("二分の一"), "{out}");
@@ -805,8 +808,10 @@ mod tests {
 
     #[test]
     fn ruby_parity_kanji_numbers_with_units_are_applied_after_digit_conversion() {
-        let mut settings = NovelSettings::default();
-        settings.enable_kanji_num_with_units_explicit = true;
+        let settings = NovelSettings {
+            enable_kanji_num_with_units_explicit: true,
+            ..NovelSettings::default()
+        };
         let mut cb = ConverterBase::new(settings);
         let out = cb.convert("1000円と8001000円と一万歩", TextType::Body);
         assert!(out.contains("千円"), "{out}");
@@ -823,9 +828,11 @@ mod tests {
 
     #[test]
     fn ruby_parity_kanji_numbers_with_units_respects_setting() {
-        let mut settings = NovelSettings::default();
-        settings.enable_kanji_num_with_units = false;
-        settings.enable_kanji_num_with_units_explicit = true;
+        let settings = NovelSettings {
+            enable_kanji_num_with_units: false,
+            enable_kanji_num_with_units_explicit: true,
+            ..NovelSettings::default()
+        };
         let mut cb = ConverterBase::new(settings);
         let out = cb.convert("1000円", TextType::Body);
         assert!(out.contains("一〇〇〇円"), "{out}");
@@ -833,8 +840,10 @@ mod tests {
 
     #[test]
     fn ruby_parity_kindle_arrow_and_zws_are_device_gated() {
-        let mut settings = NovelSettings::default();
-        settings.enable_insert_char_separator = true;
+        let settings = NovelSettings {
+            enable_insert_char_separator: true,
+            ..NovelSettings::default()
+        };
         let mut cb = ConverterBase::new(settings);
         cb.target_device = Some(Device::Mobi);
 
@@ -847,8 +856,10 @@ mod tests {
 
     #[test]
     fn ruby_parity_dakuten_font_off_does_not_convert() {
-        let mut settings = NovelSettings::default();
-        settings.enable_dakuten_font = false;
+        let settings = NovelSettings {
+            enable_dakuten_font: false,
+            ..NovelSettings::default()
+        };
         let mut cb = ConverterBase::new(settings);
         let out = cb.convert_dakuten_char_to_font("あ\u{309B}い");
         assert_eq!(out, "あ\u{309B}い");
@@ -857,8 +868,10 @@ mod tests {
 
     #[test]
     fn ruby_parity_dakuten_font_fullwidth_mark_replaced() {
-        let mut settings = NovelSettings::default();
-        settings.enable_dakuten_font = true;
+        let settings = NovelSettings {
+            enable_dakuten_font: true,
+            ..NovelSettings::default()
+        };
         let mut cb = ConverterBase::new(settings);
         let out = cb.convert_dakuten_char_to_font("あ\u{309B}い");
         assert_eq!(out, "［＃濁点］あ［＃濁点終わり］い");
@@ -867,8 +880,10 @@ mod tests {
 
     #[test]
     fn ruby_parity_dakuten_font_halfwidth_mark_replaced() {
-        let mut settings = NovelSettings::default();
-        settings.enable_dakuten_font = true;
+        let settings = NovelSettings {
+            enable_dakuten_font: true,
+            ..NovelSettings::default()
+        };
         let mut cb = ConverterBase::new(settings);
         // U+FF9E (halfwidth katakana voiced sound mark) on katakana ヴ-base char.
         let out = cb.convert_dakuten_char_to_font("カ\u{FF9E}");
@@ -878,8 +893,10 @@ mod tests {
 
     #[test]
     fn ruby_parity_dakuten_font_no_match_keeps_flag_false() {
-        let mut settings = NovelSettings::default();
-        settings.enable_dakuten_font = true;
+        let settings = NovelSettings {
+            enable_dakuten_font: true,
+            ..NovelSettings::default()
+        };
         let mut cb = ConverterBase::new(settings);
         let out = cb.convert_dakuten_char_to_font("あいうえお");
         assert_eq!(out, "あいうえお");

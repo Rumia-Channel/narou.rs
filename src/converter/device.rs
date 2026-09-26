@@ -64,9 +64,11 @@ pub enum Device {
     Ibooks,
 }
 
-impl Device {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl std::str::FromStr for Device {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
             "epub" => Device::Epub,
             "mobi" | "kindle" => Device::Mobi,
             "kobo" => Device::Kobo,
@@ -74,9 +76,11 @@ impl Device {
             "reader" => Device::Reader,
             "ibooks" => Device::Ibooks,
             _ => Device::Text,
-        }
+        })
     }
+}
 
+impl Device {
     pub fn extension(&self) -> &str {
         match self {
             Device::Text => ".txt",
@@ -229,11 +233,10 @@ impl OutputManager {
             return resolve_java_command_path();
         }
 
-        if name.eq_ignore_ascii_case("AozoraEpub3") {
-            if let Some(path) = Self::find_aozora_epub3_from_settings() {
+        if name.eq_ignore_ascii_case("AozoraEpub3")
+            && let Some(path) = Self::find_aozora_epub3_from_settings() {
                 return Some(path);
             }
-        }
 
         if name.eq_ignore_ascii_case("kindlegen") {
             if let Some(path) = Self::find_kindlegen_next_to_aozora() {
@@ -248,20 +251,17 @@ impl OutputManager {
         let mut lookup = Command::new(locator);
         lookup.arg(name);
         configure_hidden_console_command(&mut lookup);
-        if let Ok(output) = lookup.output() {
-            if output.status.success() {
+        if let Ok(output) = lookup.output()
+            && output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = path.lines().next() {
-                    if !first_line.trim().is_empty() {
-                        if let Some(canonical) =
+                if let Some(first_line) = path.lines().next()
+                    && !first_line.trim().is_empty()
+                        && let Some(canonical) =
                             canonicalize_existing_path(PathBuf::from(first_line.trim()))
                         {
                             return Some(canonical);
                         }
-                    }
-                }
             }
-        }
 
         if cfg!(windows) {
             let candidates = [
@@ -270,11 +270,10 @@ impl OutputManager {
             ];
             for candidate in &candidates {
                 let p = PathBuf::from(candidate);
-                if p.exists() {
-                    if let Some(canonical) = canonicalize_existing_path(&p) {
+                if p.exists()
+                    && let Some(canonical) = canonicalize_existing_path(&p) {
                         return Some(canonical);
                     }
-                }
             }
         }
 
@@ -738,11 +737,10 @@ impl OutputManager {
                     )));
                 }
 
-                if !self.no_strip {
-                    if let Err(err) = strip_mobi_file(&mobi_output) {
+                if !self.no_strip
+                    && let Err(err) = strip_mobi_file(&mobi_output) {
                         eprintln!("{}", err);
                     }
-                }
 
                 Ok(mobi_output)
             }
@@ -757,7 +755,7 @@ impl OutputManager {
         }
         #[cfg(feature = "lite")]
         {
-            return self.run_lite_epub(input_txt, output_dir, output_ext);
+            self.run_lite_epub(input_txt, output_dir, output_ext)
         }
         #[cfg(not(feature = "lite"))]
         {
@@ -1443,12 +1441,11 @@ fn volume_matches(root: &str, expected: &str) -> bool {
 #[cfg(feature = "native-runtime")]
 fn find_unix_volume_root(volume_name: &str) -> Option<PathBuf> {
     let mut roots = vec![PathBuf::from("/media"), PathBuf::from("/mnt")];
-    if let Some(home) = home_dir() {
-        if let Some(user) = home.file_name().and_then(|v| v.to_str()) {
+    if let Some(home) = home_dir()
+        && let Some(user) = home.file_name().and_then(|v| v.to_str()) {
             roots.push(PathBuf::from("/run/media").join(user));
             roots.push(PathBuf::from("/media").join(user));
         }
-    }
 
     for root in roots {
         let path = root.join(volume_name);
@@ -1469,9 +1466,10 @@ mod tests {
     use super::{
         Device, OutputManager, StripError, build_aozora_output_summary,
         decode_ibunko_html_entities, path_contains_windows_aozora_risky_chars,
-        prepare_aozora_invocation, normalize_windows_verbatim_path, strip_mobi_sources,
-        truncate_output_for_error,
+        prepare_aozora_invocation, strip_mobi_sources, truncate_output_for_error,
     };
+    #[cfg(windows)]
+    use super::normalize_windows_verbatim_path;
 
     fn test_output_manager(device: Device) -> OutputManager {
         OutputManager {
