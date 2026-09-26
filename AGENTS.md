@@ -352,6 +352,8 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **イベント payload**: ジョブイベントの生成は core の `application::push_events` が唯一の実装で、native の Web UI 経路と Worker が同一の JSON を出す。
 - **コンソール行**: ジョブのコンソール出力は core の `application::messages` が唯一の生成元。Worker 側は `messages::set_default_sink` に `PushHubSink` を挿し、ジョブ境界で `drain()` してまとめて送る (`stream` = `stdout` / `stderr`)。
 - **共有ヘルパ**: Web UI の入力検証・上限値・ソート状態・HTML ヘルパは core の `application::webui` が唯一の定義で、native の `src/web/**` と `worker_entry/src/webui/**` はそれを再エクスポートして使う。
+- **ローカル検証**: `worker_entry` で `npx wrangler dev --config wrangler.toml` を起動し、`POST /api/download` → `POST /api/convert` を流せば DL から変換まで通る。fetch は手元のマシンから出るため、本番で 403 になるサイトもここでは取得できる (実測: なろう / カクヨム / syosetu.org)。ジョブのコンソール行は `ws://127.0.0.1:8787/ws` に `Authorization: Bearer <NAROU_ADMIN_TOKEN>` で接続すると `echo` イベント (`{"type":"echo","target_console":"stdout","body":"…"}`) として見える。Web UI の `fetch` は Bearer を付けられないため、ローカルで画面まで見るときは `.dev.vars` に `NAROU_AUTH_REQUIRED=false` を足す (本番は Access を境界にするときだけ false)。
+- **注意**: ソースを変更すると `wrangler dev` は資産ディレクトリ `public/` の削除に失敗して (Windows の EBUSY) 無言で停止する。変更後は起動し直すこと。
 - **デプロイ**: `worker_entry/ci/deploy_worker.py` が `NAROU_DEPLOY_TARGET=develop|production` で D1 / Queue を用意し `wrangler.ci.toml` を描画してデプロイし、契約テストを流す。`CLOUDFLARE_API_TOKEN` が必要 (無い環境では手元からデプロイできない)。
 
 ### 最近の追加 (2026-05〜09)
