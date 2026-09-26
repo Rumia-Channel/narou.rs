@@ -316,15 +316,34 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 |---|---|---|
 | `NAROU_AUTH_REQUIRED` | `true` | `[vars]` に焼き込み、Worker の Bearer 検査を on/off する。`false` は Zero Trust 前提（`NAROU_ADMIN_TOKEN` 不要）。`true` でトークン未設定なら 500 `authentication_not_configured` |
 | `NAROU_WORKERS_DEV` | 「route があれば `false`」 | workers.dev の開閉。レンダラ専用（Cloudflare へは渡さない）。Access だけが境界のときに迂回口を残さないため |
-| `NAROU_S3_ENDPOINT` | (a) モードで必須 | `https://…`（query / fragment 不可）。`[vars] S3_ENDPOINT` に焼き込む |
-| `NAROU_S3_REGION` | (a) モードで必須 | 小文字のリージョン名（例 `us-east-1`） |
-| `NAROU_S3_BUCKET` | (a) モードで必須 | S3 のバケット名規則を検証する |
-| `NAROU_S3_PREFIX` | `narou/<target>` | キー前置。**設定しない**（両 target で同じバケットを prefix で共有する） |
-| `NAROU_SECRETS_STORE_ID` + `NAROU_S3_*_SECRET_NAME`（5 つ） | — | (b) モード。値ではなく Cloudflare 側の secret 名を渡す。片方だけ設定すると失敗（5 つ揃える） |
-| `NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME` | — | トークン・鍵も Secrets Store に置く。設定すると `--secrets-file` を作らない |
+| `NAROU_S3_ENDPOINT` | (a) で必須 | `https://…`（query / fragment 不可）。`[vars] S3_ENDPOINT` に焼き込む |
+| `NAROU_S3_REGION` | (a) で必須 | 小文字のリージョン名（例 `us-east-1`） |
+| `NAROU_S3_BUCKET` | (a) で必須 | S3 のバケット名規則を検証する |
+| `NAROU_S3_PREFIX` | `narou/<target>` | キー前置。**設定しない**（両 target で同じバケットを prefix で共有する）。(b) でも GitHub 側に置く |
+| `NAROU_SECRETS_STORE_ID` | (b) で必須 | Secrets Store の ID。(b) の共通値（下の表の名前とセットで使う） |
+| `NAROU_S3_*_SECRET_NAME`（5 つ） | (b) で必須 | 下の表の (b) 列。値ではなく Cloudflare 側の secret 名 |
+| `NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME` | 任意 | トークン・鍵も Secrets Store に置く。(b) の ID が必要で、設定すると `--secrets-file` を作らない |
 | `NAROU_D1_BASE_NAME` / `NAROU_JOB_QUEUE_BASE` | `narou-rs` / `narou-jobs` | provision が `<base>-<target>` と `<queue>-dlq` を作る。target サフィックスを含めないこと |
 | `NAROU_DEPLOY_URL` | — | smoke の宛先を明示（workers.dev 以外は伏せる） |
 | `NAROU_SMOKE` | `1` | `0` で smoke を省略 |
+
+##### 値ごとの対応（(a) 値を GitHub から渡す / (b) Secrets Store に置く）
+
+| 値（Worker が読む名前） | (a) GitHub 側 | (b) GitHub 側 | Worker の解決順 |
+|---|---|---|---|
+| `S3_ACCESS_KEY_ID` | secret `NAROU_S3_ACCESS_KEY_ID` | `NAROU_S3_ACCESS_KEY_ID_SECRET_NAME` | `S3_ACCESS_KEY_ID_STORE` → var → secret |
+| `S3_SECRET_ACCESS_KEY` | secret `NAROU_S3_SECRET_ACCESS_KEY` | `NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME` | 同上 |
+| `S3_ENDPOINT` | var `NAROU_S3_ENDPOINT` | `NAROU_S3_ENDPOINT_SECRET_NAME` | 同上（(b) では `[vars] S3_ENDPOINT` を空にする） |
+| `S3_REGION` | var `NAROU_S3_REGION` | `NAROU_S3_REGION_SECRET_NAME` | 同上 |
+| `S3_BUCKET` | var `NAROU_S3_BUCKET` | `NAROU_S3_BUCKET_SECRET_NAME` | 同上 |
+| `NAROU_ADMIN_TOKEN` | secret `NAROU_ADMIN_TOKEN` | `NAROU_ADMIN_TOKEN_SECRET_NAME` | 同上（既定は `--secrets-file` で入れる secret のみ） |
+| `NAROU_RS_LOGIN_KEY` | secret `NAROU_RS_LOGIN_KEY` | `NAROU_RS_LOGIN_KEY_SECRET_NAME` | 同上 |
+
+- 選び方は値ごとではなく**モード単位**。`NAROU_SECRETS_STORE_ID` か `NAROU_S3_*_SECRET_NAME` を
+  1 つでも設定したら (b) になり、S3 の 5 値は **5 つ揃えて**書く必要がある（欠けると失敗）。
+  何も書かなければ全部 (a)（`NAROU_S3_ENDPOINT` / `REGION` / `BUCKET` が必須）。
+- `NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME` だけは (b) の中でも独立に
+  選べる（S3 は (a) のままトークンだけストア、が可能）。
 
 - 手で置かない派生値: `NAROU_DEPLOY_TARGET`（workflow が設定）と
   `NAROU_D1_DATABASE_NAME` / `NAROU_D1_DATABASE_ID` / `NAROU_JOB_QUEUE` / `NAROU_JOB_DLQ`
