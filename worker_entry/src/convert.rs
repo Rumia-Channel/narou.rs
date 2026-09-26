@@ -43,6 +43,8 @@ pub async fn execute_convert(
     })
     .await;
     push_sink.drain().await;
+    // ジョブの sink を isolate から外す (executor と同じ理由)。
+    narou_rs::application::messages::take_default_sink();
 
     match report {
         ConvertItemReport::Written { .. } => JobOutcome::Succeeded,

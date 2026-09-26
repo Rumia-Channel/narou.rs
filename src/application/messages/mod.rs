@@ -76,6 +76,15 @@ pub fn set_default_sink(sink: std::sync::Arc<dyn MessageSink>) {
     }
 }
 
+/// 既定 sink を取り外して返す。Worker のジョブ終了時に呼ぶ。
+///
+/// 外さないと isolate は最後のジョブの sink (PushHub への参照と、drain
+/// されないバッファ) を保持し続け、その後の `emit_default` (cron 中の
+/// 警告など) が届かない行を isolate のメモリに溜め込む。
+pub fn take_default_sink() -> Option<std::sync::Arc<dyn MessageSink>> {
+    DEFAULT_SINK.write().ok().and_then(|mut slot| slot.take())
+}
+
 /// 既定 sink 経由で 1 行出す。未設定の場合は `println!`/`eprintln!`
 /// (native では logger 経由の従来動作、Worker ではコンソールログ) に
 /// フォールバックする。

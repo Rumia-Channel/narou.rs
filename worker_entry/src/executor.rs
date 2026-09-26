@@ -226,6 +226,9 @@ pub async fn execute_job(
     };
     // バッファに積まれた行をジョブの区切りでまとめて送信する。
     push_sink.drain().await;
+    // ジョブの sink を isolate から外す (残すと以後の emit_default が
+    // 死んだバッファに書き込む)。
+    narou_rs::application::messages::take_default_sink();
     match result {
         Err(NarouError::DownloadBudgetExpired {
             next_section_index,
