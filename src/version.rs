@@ -78,50 +78,12 @@ pub const EMBEDS_AOZORA_LITE: bool = cfg!(feature = "lite");
 /// Self-update asset variant this binary belongs to: `"gpl"` or `"standard"`.
 pub const BUILD_VARIANT: &str = if EMBEDS_AOZORA_LITE { "gpl" } else { "standard" };
 
-/// Extract the numeric `x.y.z` core from a version string, ignoring `v`
-/// prefixes, suffixes like `(develop)`/`(local-build)`, and any invisible
-/// characters that may slip into release metadata.
-pub fn version_core(version: &str) -> String {
-    let mut core = String::new();
-    for ch in version.chars() {
-        if ch.is_ascii_digit() || ch == '.' {
-            core.push(ch);
-        } else if !core.is_empty() {
-            break;
-        }
-    }
-    core.trim_end_matches('.').to_string()
-}
 
-/// Numeric semver-style comparison of two version cores.
-/// Returns `Some(Ordering)` when both sides parse, `None` otherwise.
-pub fn version_compare(a: &str, b: &str) -> Option<std::cmp::Ordering> {
-    let parse = |v: &str| -> Option<Vec<u64>> {
-        let parts: Option<Vec<u64>> = v.split('.').map(|p| p.parse().ok()).collect();
-        parts.filter(|p| !p.is_empty())
-    };
-    let (av, bv) = (parse(a)?, parse(b)?);
-    let len = av.len().max(bv.len());
-    for i in 0..len {
-        let x = av.get(i).copied().unwrap_or(0);
-        let y = bv.get(i).copied().unwrap_or(0);
-        match x.cmp(&y) {
-            std::cmp::Ordering::Equal => {}
-            ord => return Some(ord),
-        }
-    }
-    Some(std::cmp::Ordering::Equal)
-}
 
-/// `true` when `current` is at most `boundary` (e.g. `version_at_most("0.4.0")`
-/// for the self-update variant prompt). Unparseable input returns `false`.
-pub fn version_at_most(current: &str, boundary: &str) -> bool {
-    matches!(
-        version_compare(&version_core(current), boundary),
-        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
-    )
-}
 const DISABLE_SELF_UPDATE_ENV: &str = "NAROU_RS_DISABLE_SELF_UPDATE";
+
+/// バージョン比較は Worker と共有する（`src/application/version_compare.rs`）。
+pub use crate::application::version_compare::{version_at_most, version_compare, version_core};
 
 pub fn commit_version_exists() -> bool {
     if IS_RELEASE_BUILD {
