@@ -1,6 +1,6 @@
 # production 環境テンプレート。develop/staging との違いは
 # ・name (サフィックス無し)
-# ・workers_dev = false + custom domain (__SERVICE_DOMAIN__)
+# ・workers_dev = false + custom domain (SERVICE_DOMAIN / 必須)
 # だけ。値は CI が置換する。
 
 name = "narou-rs"
@@ -75,9 +75,6 @@ class_name = "SiteRateLimiter"
 tag = "v1"
 new_sqlite_classes = ["SiteRateLimiter"]
 
-[[routes]]
-pattern = "__SERVICE_DOMAIN__"
-custom_domain = true
-
+__CUSTOM_DOMAIN_BLOCK__
 [triggers]
 crons = ["* * * * *"]

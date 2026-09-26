@@ -136,6 +136,18 @@ def main() -> None:
         "S3_BUCKET": bucket,
         "S3_PREFIX": prefix,
     }
+    # アプリのトークンと復号鍵も Secrets Store に置ける（任意）。
+    # 名前を渡した項目だけ <NAME>_STORE バインディングを足す。
+    token_secrets = {
+        "NAROU_ADMIN_TOKEN": optional("NAROU_ADMIN_TOKEN_SECRET_NAME", "").strip(),
+        "NAROU_RS_LOGIN_KEY": optional("NAROU_RS_LOGIN_KEY_SECRET_NAME", "").strip(),
+    }
+    for label, value in token_secrets.items():
+        if value and not SECRET_NAME_PATTERN.fullmatch(value):
+            fail(f"{label}_SECRET_NAME has an invalid Secrets Store name")
+    if any(token_secrets.values()) and not secret_store_id:
+        fail("NAROU_SECRETS_STORE_ID is required to place the admin token in the Secrets Store")
+
     if store_mode:
         blocks = "".join(
             f'\n[[secrets_store_secrets]]\nbinding = "{binding}"\n'
@@ -146,21 +158,28 @@ def main() -> None:
                 ("S3_ENDPOINT_STORE", secret_names["S3_ENDPOINT_SECRET_NAME"]),
                 ("S3_REGION_STORE", secret_names["S3_REGION_SECRET_NAME"]),
                 ("S3_BUCKET_STORE", secret_names["S3_BUCKET_SECRET_NAME"]),
+                ("NAROU_ADMIN_TOKEN_STORE", token_secrets["NAROU_ADMIN_TOKEN"]),
+                ("NAROU_RS_LOGIN_KEY_STORE", token_secrets["NAROU_RS_LOGIN_KEY"]),
             )
+            if name
         )
         replacements["__SECRET_STORE_BLOCKS__"] = blocks
-    if target == "production":
-        service_domain = required("SERVICE_DOMAIN")
-        if not HOSTNAME_PATTERN.fullmatch(service_domain) or "." not in service_domain:
-            fail("SERVICE_DOMAIN must be a hostname without a scheme or path")
-        replacements["SERVICE_DOMAIN"] = service_domain
+    # custom domain の route。production は必須 (workers_dev = false)、
+    # develop/staging は任意で、未設定なら workers.dev の URL だけで動く。
+    domain_var = {"production": "SERVICE_DOMAIN", "develop": "DEVELOP_DOMAIN", "staging": "STAGING_DOMAIN"}[target]
+    domain = required(domain_var) if target == "production" else optional(domain_var, "").strip()
+    if domain:
+        if not HOSTNAME_PATTERN.fullmatch(domain) or "." not in domain:
+            fail(f"{domain_var} must be a hostname without a scheme or path")
+        replacements["__CUSTOM_DOMAIN_BLOCK__"] = (
+            f'\n[[routes]]\npattern = "{domain}"\ncustom_domain = true\n'
+        )
 
     template_path = WORKER_DIR / f"wrangler.{target}.toml"
     template = template_path.read_text(encoding="utf-8")
-    if "__SECRET_STORE_BLOCKS__" in template:
-        template = template.replace("__SECRET_STORE_BLOCKS__", replacements.pop("__SECRET_STORE_BLOCKS__", ""))
-    else:
-        replacements.pop("__SECRET_STORE_BLOCKS__", None)
+    # ブロック単位のプレースホルダは「値があれば差し込み、無ければ空にする」。
+    for block in ("__SECRET_STORE_BLOCKS__", "__CUSTOM_DOMAIN_BLOCK__"):
+        template = template.replace(block, replacements.pop(block, ""))
     for name, value in replacements.items():
         template = template.replace("__" + name + "__", value)
     remaining = unresolved_placeholders(template)

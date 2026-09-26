@@ -354,13 +354,25 @@ narou.rs も同じ 2 モードを持つようにした:
 
 - どちらでも `[vars] S3_ENDPOINT` 等は空になる（(b) の場合）か値が入る（(a)）。Worker 側は
   `<変数名>_STORE`（Secrets Store）→ `env.var` → `env.secret` の順に解決する。
+- **アプリの 2 値も同じ仕組みに乗せた**。`NAROU_ADMIN_TOKEN`（API の Bearer トークン）と
+  `NAROU_RS_LOGIN_KEY`（資格情報の復号鍵）は既定で通常の Worker secret（`wrangler secret` /
+  `--secrets-file`）だが、`NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME` を
+  CI に渡せば Secrets Store の `NAROU_ADMIN_TOKEN_STORE` / `NAROU_RS_LOGIN_KEY_STORE` バインディングに
+  切り替わり、値はリポジトリにも CI にも残らない（その場合 `--secrets-file` は作らない）。
+  参考実装もこれらは Secrets Store ではなく `--secrets-file` で渡している（同じ既定）。
 - **識別子は narou.rs 側の `S3_*` / `s3_*` に統一する**。参考実装の `WASABI_*` 名（環境変数・binding・
   設定キー）は輸入しない。ベンダ名は設定値（endpoint / bucket）として外から与えるだけで、コードと
   CI 変数には現れない。
 - `CLOUDFLARE_ACCOUNT_ID` は Dantalian の綴り（`CLOUDFLARE_ACCOUT_ID`）でも動くようにした
   （workflow 側で `||` で受ける）。
-- 検証: `ci/render_config.py` を両モードで実行し、`tomllib` で読み戻して
-  `[vars]`・`[[secrets_store_secrets]]` 5 件・prefix を確認（ローカル、Cloudflare 不要）。
+- custom domain は target ごとの変数で入れる。production は `SERVICE_DOMAIN` が**必須**
+  （`workers_dev = false`）、develop / staging は `DEVELOP_DOMAIN` / `STAGING_DOMAIN` が**任意**で、
+  未設定なら route を足さず workers.dev の URL だけで動く。`[[routes]]` はレンダラが
+  `__CUSTOM_DOMAIN_BLOCK__` を差し替えて生成する。
+- デプロイ後の疎通先は `NAROU_DEPLOY_URL`（任意）→ wrangler が報告した workers.dev URL →
+  ログ中の https URL の順に決める。custom domain 運用（`workers_dev = false`）でも smoke が通る。
+- 検証: `ci/render_config.py` を両モード・3 target（domain あり/なし・不正値）で実行し、`tomllib` で
+  読み戻して `[vars]`・`[[secrets_store_secrets]]`・`[[routes]]`・prefix を確認（ローカル、Cloudflare 不要）。
 
 ### 2.3 その他の差分
 

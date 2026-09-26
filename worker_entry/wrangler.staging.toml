@@ -1,5 +1,7 @@
 # staging 環境テンプレート。構造は wrangler.develop.toml と同じで、
 # 名前と workers_dev だけが違う (値は CI が置換する)。
+#
+# `STAGING_DOMAIN` を CI 側で設定すると custom domain の route が入る (任意)。
 
 name = "narou-rs-staging"
 main = "build/worker/shim.mjs"
@@ -73,5 +75,6 @@ class_name = "SiteRateLimiter"
 tag = "v1"
 new_sqlite_classes = ["SiteRateLimiter"]
 
+__CUSTOM_DOMAIN_BLOCK__
 [triggers]
 crons = ["* * * * *"]

@@ -4,6 +4,9 @@
 # 置換し、`wrangler.ci.toml` を生成する (生成物は .gitignore 済み)。
 # account 固有の値 (database_id / S3 の接続先 / secret 名) はここに書かない。
 #
+# `DEVELOP_DOMAIN` を CI 側で設定すると custom domain の route が入る (任意)。
+# 未設定なら workers.dev の URL だけで動く。
+#
 # ローカル開発は `wrangler.toml` (プレースホルダ無し) を使う。
 
 name = "narou-rs-develop"
@@ -85,5 +88,6 @@ class_name = "SiteRateLimiter"
 tag = "v1"
 new_sqlite_classes = ["SiteRateLimiter"]
 
+__CUSTOM_DOMAIN_BLOCK__
 [triggers]
 crons = ["* * * * *"]

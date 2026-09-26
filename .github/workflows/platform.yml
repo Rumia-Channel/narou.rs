@@ -151,6 +151,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       NAROU_DEPLOY_TARGET: develop
+      DEVELOP_DOMAIN: ${{ vars.DEVELOP_DOMAIN }}
       NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
       NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
       NAROU_S3_ENDPOINT: ${{ vars.NAROU_S3_ENDPOINT }}
@@ -164,6 +165,9 @@ jobs:
       NAROU_S3_ENDPOINT_SECRET_NAME: ${{ vars.NAROU_S3_ENDPOINT_SECRET_NAME }}
       NAROU_S3_REGION_SECRET_NAME: ${{ vars.NAROU_S3_REGION_SECRET_NAME }}
       NAROU_S3_BUCKET_SECRET_NAME: ${{ vars.NAROU_S3_BUCKET_SECRET_NAME }}
+      # トークンと復号鍵も Secrets Store に置く場合だけ設定する。
+      NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
+      NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -216,6 +220,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       NAROU_DEPLOY_TARGET: staging
+      STAGING_DOMAIN: ${{ vars.STAGING_DOMAIN }}
       NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
       NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
       NAROU_S3_ENDPOINT: ${{ vars.NAROU_S3_ENDPOINT }}
@@ -229,6 +234,9 @@ jobs:
       NAROU_S3_ENDPOINT_SECRET_NAME: ${{ vars.NAROU_S3_ENDPOINT_SECRET_NAME }}
       NAROU_S3_REGION_SECRET_NAME: ${{ vars.NAROU_S3_REGION_SECRET_NAME }}
       NAROU_S3_BUCKET_SECRET_NAME: ${{ vars.NAROU_S3_BUCKET_SECRET_NAME }}
+      # トークンと復号鍵も Secrets Store に置く場合だけ設定する。
+      NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
+      NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -281,6 +289,7 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       NAROU_DEPLOY_TARGET: production
+      SERVICE_DOMAIN: ${{ vars.SERVICE_DOMAIN }}
       NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
       NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
       NAROU_S3_ENDPOINT: ${{ vars.NAROU_S3_ENDPOINT }}
@@ -294,7 +303,9 @@ jobs:
       NAROU_S3_ENDPOINT_SECRET_NAME: ${{ vars.NAROU_S3_ENDPOINT_SECRET_NAME }}
       NAROU_S3_REGION_SECRET_NAME: ${{ vars.NAROU_S3_REGION_SECRET_NAME }}
       NAROU_S3_BUCKET_SECRET_NAME: ${{ vars.NAROU_S3_BUCKET_SECRET_NAME }}
-      SERVICE_DOMAIN: ${{ vars.SERVICE_DOMAIN }}
+      # トークンと復号鍵も Secrets Store に置く場合だけ設定する。
+      NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
+      NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

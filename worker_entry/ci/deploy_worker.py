@@ -34,6 +34,7 @@ from typing import NoReturn
 
 WORKER_DIR = Path(__file__).resolve().parent.parent
 TARGETS = ("develop", "staging", "production")
+URL_PATTERN = re.compile(r"https://[A-Za-z0-9.-]+")
 WORKER_URL_PATTERN = re.compile(r"https://[A-Za-z0-9.-]+\.workers\.dev")
 
 
@@ -98,36 +99,47 @@ def render(target: str, resources: dict[str, str]) -> str:
     return resources["database_name"]
 
 
-def secret_file(target: str) -> Path:
-    """`--secrets-file` に渡す JSON を書く（終了時に必ず消す）。"""
-    secrets = {
-        "NAROU_ADMIN_TOKEN": required("NAROU_ADMIN_TOKEN"),
-        "NAROU_RS_LOGIN_KEY": required("NAROU_RS_LOGIN_KEY"),
+def secret_file(target: str) -> Path | None:
+    """`--secrets-file` に渡す JSON を書く（終了時に必ず消す）。
+
+    Secrets Store (`NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME`) に
+    置く場合は値が無くてもよい（その場合はファイルを作らない）。
+    """
+    stored = {
+        "NAROU_ADMIN_TOKEN": os.environ.get("NAROU_ADMIN_TOKEN_SECRET_NAME", "").strip(),
+        "NAROU_RS_LOGIN_KEY": os.environ.get("NAROU_RS_LOGIN_KEY_SECRET_NAME", "").strip(),
     }
+    secrets: dict[str, str] = {}
+    for name, store_name in stored.items():
+        value = os.environ.get(name, "").strip()
+        if value:
+            secrets[name] = value
+        elif not store_name:
+            fail(f"{name} is required (or set {name}_SECRET_NAME to keep it in the Secrets Store)")
+    if not secrets:
+        return None
     path = WORKER_DIR / f".deploy-secrets-{target}.json"
     path.write_text(json.dumps(secrets), encoding="utf-8")
     return path
 
 
-def deploy(secrets: Path) -> str:
+def deploy(secrets: Path | None) -> str:
     """デプロイして、報告された URL を返す。"""
-    log = run(
-        [
-            "npx",
-            "--yes",
-            "wrangler@4",
-            "deploy",
-            "-c",
-            "wrangler.ci.toml",
-            "--secrets-file",
-            str(secrets),
-        ],
-        capture=True,
-    )
+    command = ["npx", "--yes", "wrangler@4", "deploy", "-c", "wrangler.ci.toml"]
+    if secrets is not None:
+        command += ["--secrets-file", str(secrets)]
+    log = run(command, capture=True)
     print(log)
+    # custom domain 運用 (workers_dev = false) では wrangler が workers.dev を
+    # 出さないので、明示指定 → workers.dev → 任意の https URL の順に採用する。
+    explicit = os.environ.get("NAROU_DEPLOY_URL", "").strip()
+    if explicit:
+        return explicit
     urls = WORKER_URL_PATTERN.findall(log)
     if not urls:
-        fail("wrangler did not report a workers.dev URL")
+        urls = URL_PATTERN.findall(log)
+    if not urls:
+        fail("wrangler did not report a URL")
     return urls[-1]
 
 
@@ -190,7 +202,8 @@ def main() -> None:
     try:
         url = deploy(secrets)
     finally:
-        secrets.unlink(missing_ok=True)
+        if secrets is not None:
+            secrets.unlink(missing_ok=True)
 
     smoke_result: bool | None = None
     if os.environ.get("NAROU_SMOKE", "1") != "0":
