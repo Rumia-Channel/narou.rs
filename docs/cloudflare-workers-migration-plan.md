@@ -84,7 +84,47 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
   （`app_state('inv','asset_backend')` は挿絵用、テキストの移行は `content_backend` を持つ）。
 - 移行完了後もしばらく blob は消さない。容量回収は P4 の判断。
 
-### 1.4 確認事項（実装前に決めたい）
+### 1.5 取得から EPUB ダウンロードまでの流れ
+
+```text
+[サイト] ──HTTP──▶ Worker(queue/fetch) or CLI
+                     │ サイト定義 + DSL で抽出
+                     ▼
+            保存（D1 の行 / S3 の挿絵）── 作品を再現する最小
+                     │ 変換（P2）
+                     ▼
+            変換済み本文（行の列）
+                     │ ユーザーが DL を押す
+                     ▼
+            Lite で EPUB を組み立て → ストリーミング応答
+```
+
+1. **起動**: Worker は `POST /api/jobs` → `JobService::plan` → D1 台帳 (`worker_jobs`) に claim →
+   Queue → `#[event(queue)]` (`worker_entry/src/lib.rs:421`) → `consumer::process_batch` →
+   `executor::execute_job` → `Downloader`。native Web UI はキュー（`.narou/queue.yaml`）経由で
+   子プロセス `narou_rs download` を起動し、CLI は直接実行する。
+2. **取得と抽出**: サイト定義（native=実行時の `webnovel/*.yaml`、Worker=ビルド時埋め込み）から
+   `toc_url` と各パターンを得て、`HttpClient` + `RateLimiter` で取得 → TOC 解析
+   （`title`/`author`/`story` + 話一覧）→ 各話 HTML を本文テキスト化 → 挿絵を取得。
+   **うごイラはフレーム集約 zip を APNG に組み立ててから保存**する
+   (`src/downloader/mod.rs:1015-1035`、失敗時は zip のまま)。
+3. **保存**: §1.1 の表のとおり。論理キーは `NovelObjectKeys`（`src/platform/object_store.rs:270-330`）が
+   決め、挿絵のファイル名は**内容ハッシュ**（みてみんは作品 ID）で、インデックス
+   （元 URL → ファイル名・ハッシュ）を別に持つ (`src/illustration_store.rs:129-175`)。
+4. **変換**: Worker では `JobKind::Convert` が `blocked`（`src/application/jobs.rs:64-66`）なので、
+   現状は変換済み本文が存在しない。P2 で worker-executable にし、結果をセクション行の
+   「変換済み本文」列へ保存する。native は `novel.txt` と出力ファイル（SQLite モードでは
+   `novel_outputs` にもミラー）を作る。
+5. **EPUB ダウンロード**: Worker は `GET /api/novels/{id}/download.epub`
+   (`worker_entry/src/lib.rs:196-315`) で、作品メタ → 変換済み本文 → `挿絵/` を**上限つきで先読み**
+   （512 枚 / 64 MiB）→ `epub_lite::build_book_from_source` → `stream_epub` でそのまま返す。
+   **EPUB は保存しない**。変換済み本文が無ければ 409（現状の未完成点）。native Web UI は
+   生成済み EPUB（`novel_outputs` か `output/*.epub`）を返す。
+
+不変条件: 論理キーはコアが決める / 挿絵は内容ハッシュ名 / EPUB と raw は保存しない /
+保存するのは作品を再現するのに必要な最小。
+
+### 1.6 確認事項（実装前に決めたい）
 
 - **変換済み本文を行に持つか、毎回変換するか**。DLEPUB の応答時間を考えると行に持つのが自然だが、
   変換（P2 で Worker へ移植）が未実装の間は「変換済み本文」をどう用意するかを決める必要がある。
