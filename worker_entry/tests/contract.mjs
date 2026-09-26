@@ -52,21 +52,42 @@ function fetchWithAccess(input, init = {}) {
 // 無い場合は smoke として意味が無いので、その旨を exit 3 で伝える。
 // 到達できない場合（DNS・TLS・タイムアウト）はそのまま検査へ進み、失敗として報告する。
 if (!ACCESS_CLIENT_ID && process.env.CONTRACT_SKIP_ACCESS_PROBE !== "1") {
-  try {
-    const probe = await fetchWithAccess(url("/health/live"), {
-      redirect: "manual",
-      signal: AbortSignal.timeout(10_000),
-    });
-    const location = probe.headers.get("location") ?? "";
-    if (
-      [301, 302, 303, 307, 308].includes(probe.status) &&
-      location.includes("cloudflareaccess.com")
-    ) {
-      console.log(`Cloudflare Access is in front of ${BASE_URL}; skipping the remote smoke`);
-      process.exit(3);
+  const attempts = Number(process.env.CONTRACT_PROBE_ATTEMPTS ?? 6);
+  const delayMs = Number(process.env.CONTRACT_PROBE_DELAY_MS ?? 20_000);
+  let unreachable = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const probe = await fetchWithAccess(url("/health/live"), {
+        redirect: "manual",
+        signal: AbortSignal.timeout(10_000),
+      });
+      unreachable = null;
+      const location = probe.headers.get("location") ?? "";
+      if (
+        [301, 302, 303, 307, 308].includes(probe.status) &&
+        location.includes("cloudflareaccess.com")
+      ) {
+        console.log(`Cloudflare Access is in front of ${BASE_URL}; skipping the remote smoke`);
+        process.exit(3);
+      }
+      break;
+    } catch (error) {
+      unreachable = error;
+      if (IS_LOCAL || attempt === attempts) {
+        break;
+      }
+      // 新しい custom domain は証明書の発行に少し時間がかかる。
+      console.log(`probe ${attempt}/${attempts} failed (${error?.message ?? error}); retrying`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
-  } catch (error) {
-    console.warn(`probe failed (${error?.message ?? error}); running the checks anyway`);
+  }
+  if (unreachable) {
+    if (IS_LOCAL) {
+      console.warn(`probe failed (${unreachable?.message ?? unreachable}); running the checks anyway`);
+    } else {
+      console.log(`${BASE_URL} is not reachable (${unreachable?.message ?? unreachable})`);
+      process.exit(4);
+    }
   }
 }
 

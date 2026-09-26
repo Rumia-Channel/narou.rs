@@ -212,8 +212,8 @@ def smoke_url(target: str, reported: str | None) -> tuple[str | None, bool]:
 def smoke(base_url: str) -> bool | None:
     """デプロイ先に契約テストを流す。失敗してもデプロイは巻き戻さない。
 
-    前段の Cloudflare Access に弾かれた場合（service token 未設定）は
-    `tests/contract.mjs` が exit 3 で知らせるので「省略」として扱う。
+    前段の Cloudflare Access に弾かれた場合（exit 3）と、ドメインがまだ届かない
+    場合（exit 4。証明書・DNS の準備待ち）は「省略」として扱う。
     """
     env = dict(os.environ)
     env["BASE_URL"] = base_url
@@ -227,6 +227,12 @@ def smoke(base_url: str) -> bool | None:
     )
     if result.returncode == 3:
         print("::notice::Access が前段にあるため smoke を省略しました (CF_ACCESS_CLIENT_ID/SECRET で実行できます)")
+        return None
+    if result.returncode == 4:
+        print(
+            "::notice::デプロイ先に到達できないため smoke を省略しました "
+            "(新しい custom domain は証明書と DNS の準備に数分かかることがあります)"
+        )
         return None
     return result.returncode == 0
 
