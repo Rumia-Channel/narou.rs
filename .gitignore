@@ -57,6 +57,9 @@ __pycache__/
 # tests/run.mjs が生成する実行用設定
 /worker_entry/wrangler.test.toml
 /worker_entry/.dev.vars
+# deploy_worker.py が一時的に作る secret ファイル (終了時に消すが念のため)
+/worker_entry/.deploy-secrets-*.json
+/worker_entry/.provision-output
 /worker_entry/public/
 
 # ログイン Cookie の書き出しファイル（資格情報を含むため追跡しない）

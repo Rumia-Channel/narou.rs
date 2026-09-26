@@ -12,7 +12,7 @@ Phase 1-8 の抽象化（`docs/platform-abstraction.md`）で port の境界は�
 | P0b 署名と S3 アダプタ | ✅ 完了 (`23338ec`, `ed87fcd`) |
 | P0c 保存先の振り分け (SplitStore) | ✅ 完了 (`SplitStore` + `asset_backend`、mock 2 系統で固定) |
 | P0d D1→S3 移行 (バイナリのみ) | ✅ 完了 (`/api/admin/object-migration`、core の `migrate_page` にテスト)。本文の行構造化は別項目 |
-| P0e 契約テスト + CI デプロイ | ◐ 契約テストは CI で実行 (`worker-contract`)。デプロイは手動トリガーの `worker-deploy` を用意（実アカウント実行は未検証） |
+| P0e 契約テスト + CI デプロイ | ✅ 契約テストは CI (`worker-contract`)、デプロイは develop/main/タグで環境別に自動 (`worker-deploy-*`)。実アカウントでの初回実行のみ未検証 |
 | P1 取得系を閉じる | ◐ 実行系は実装済み。SSRF・Cookie・設定の 3 点が未了 |
 | P2 変換を Worker へ | ◐ 変換テキスト生成は完了 (`ConvertService`)。残りは device 出力 (MOBI 等) の扱い |
 | P3 Web UI 移植 | ❌ 未着手 |
@@ -269,6 +269,35 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 - **副産物のバグ修正**: `D1ObjectStore::list_keys` の範囲上限が `{prefix}0` で、`0` より後ろの文字で
   始まるキー（`本文/…` や英字名）が一覧から漏れていた。`platform::prefix_upper_bound` に置き換え、
   CJK・空プレフィックスを含むテストを追加した（挿絵の一覧も同じ理由で壊れていた）。
+
+### 2.2.8 CI からのデプロイ (P0e, 2026-09-26 実装)
+
+`worker_entry/ci/deploy_worker.py` が 1 環境分のデプロイを最後まで行う:
+
+1. `ci/provision_resources.py` で D1 と Queue(+DLQ) を冪等に用意（名前は環境名から導出）
+2. `ci/render_config.py` で `wrangler.ci.toml` をレンダリング（未置換プレースホルダは失敗）
+3. `wrangler d1 migrations apply <db> --remote` でリモート D1 を更新
+4. `wrangler deploy --secrets-file <json>` で `NAROU_ADMIN_TOKEN` と `NAROU_RS_LOGIN_KEY` を投入してデプロイ
+   （secret ファイルは `finally` で必ず削除）
+5. デプロイ先の URL を wrangler の出力から拾い、契約テストを smoke として流す（`NAROU_SMOKE=0` で省略）
+
+トリガーは `.github/workflows/platform.yml`:
+
+| きっかけ | GitHub Environment | デプロイ先 |
+|---|---|---|
+| `develop` へ push | `develop` | develop |
+| `main` へ push | `staging` | staging |
+| タグ push (`v*` / 数字始まり) | `production` | production (custom domain) |
+| 手動 `workflow_dispatch` (target 選択) | 選択した環境 | 同左 |
+
+- 各ジョブは `needs: [native, native-gpl, wasm, worker, worker-contract, license]` で、テストが緑のときだけ動く。
+- Cloudflare の資格情報が未設定のリポジトリ (fork など) では **理由を出してデプロイだけ省略**する
+  (`check Cloudflare credentials` ステップ)。テストは通常どおり走る。
+- 必要な secret / vars は各 Environment に置く:
+  - secrets: `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` / `NAROU_ADMIN_TOKEN` / `NAROU_RS_LOGIN_KEY`
+  - vars: `NAROU_S3_ENDPOINT` / `NAROU_S3_REGION` / `NAROU_S3_BUCKET` / `NAROU_S3_PREFIX`(任意) / `SERVICE_DOMAIN`(production のみ)
+- ロールバック: Workers の前バージョンへ戻す (`wrangler versions` / ダッシュボード) か、
+  このワークフローを再実行する。native 側のデータ (`小説データ/`) は Worker から触らないので影響しない。
 
 ### 2.3 その他の差分
 

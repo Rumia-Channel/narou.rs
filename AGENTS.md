@@ -400,6 +400,15 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   `global` (`over18`)、`inv` の section hash cache を起動時に読んで渡す。同期 API と非同期 D1 の
   都合で書き戻しは no-op。`over18` 未設定は `None` のままにして年齢認証 `Blocked` 経路を保つ。
 
+### Worker の CI デプロイ (2026-09)
+
+- `.github/workflows/platform.yml` の `worker-deploy-{develop,staging,production}`。きっかけは
+  `develop` push / `main` push / タグ push（+ 手動 dispatch）。環境は GitHub Environments で分け、
+  そこに Cloudflare の secret と vars を置く（一覧は `docs/cloudflare-workers-migration-plan.md` §2.2.8）。
+- 実体は `worker_entry/ci/deploy_worker.py`（provision → render → migrate → secret 投入 → deploy → smoke）。
+  D1/Queue は環境名から導出して冪等に作るので、初回デプロイでも手作業が要らない。
+- 資格情報が無いリポジトリではデプロイだけ理由付きで省略する（テストは走る）。
+
 ### サイト定義の差し替え経路 (2026-09)
 
 - `src/application/site_definitions.rs` が唯一の入り口（`SiteDefinitions` + `SiteDefinitionStore` port）。
