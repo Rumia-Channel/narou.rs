@@ -502,3 +502,27 @@ Worker (worker_entry)
 9. **logger**: tracing subscriber は native / worker で切り替える。`logger.rs` のファイル出力は native 専用にできる。Phase 1 では触らない。
 10. **`converter/mod.rs` のcurl直接使用**: 解消済み。挿絵fetchは`ConverterCapabilities`の`HttpClient` / `RateLimiter`経由へ移行し、native wiringは`src/native/converter.rs`に隔離した。
 11. **`web/misc.rs` / `web/update.rs` の async reqwest**: 自己更新・GitHub API は native 専用パスとして残置（Phase 2 の対象外）。
+
+## 共有層（native と Worker で 1 実装）
+
+外部挙動を揃えるため、native 専用層にあったロジックを可搬層 (`src/application/`, `src/login/`, `src/downloader/`) へ
+移し、両ビルドから同じコードを呼ぶ。2026-09-26 時点:
+
+| 共有モジュール | 共有しているもの |
+|---|---|
+| `application::settings_view` | 設定ページの JSON（タブ・項目メタデータ・置換設定・`object_id` ではなく表示用の値） |
+| `application::web_payloads` | 一覧 API の入出力型（`ListParams` / `NovelListResponse` / `NovelListItem` / `ApiResponse`） |
+| `application::version_compare` | バージョン比較（自己更新と `/api/version/*`） |
+| `login::transfer` / `login::crypto` | ログイン書き出しの解析・グループ化・Argon2id 復号・鍵解釈（`parse_key_base64` は 32 バイトそのまま／16 バイト以上は SHA-256 展開） |
+| `downloader::resolve_user_agent` | UA 解決（native はランダム、Worker は既定ブラウザ UA） |
+| `platform::*` + `downloader::http_policy` | HTTP の decode/status/redirect ポリシー（アダプタは transport だけを持つ） |
+
+### 残っている重複（次の候補）
+
+| 対象 | 現状 | 方針 |
+|---|---|---|
+| **ジョブ実行コマンドのメッセージ** | native は CLI の stdout を子プロセスから流し、Worker は in-process 実行なので文言が別実装 | `application/messages/` に文言を集約し、出力先 (stdout/stderr ↔ PushHub の echo) だけ port で差し替える（進行中） |
+| **エイリアス解決** | `webui/download.rs` と `webui/job_actions.rs` に private 実装が二重、native 側にも別実装 | `application::aliases` へ集約（進行中） |
+| **リトライ方針** | `src/queue.rs`（native）が `queue.max-retries` / `queue.retry-backoff` を解釈し、Worker は `consumer.rs`/`ledger.rs` に独自実装 | 設定の解釈と backoff スケジュールを可搬層へ（未着手） |
+| **push イベントの組み立て** | native `web/push.rs` と Worker `push_hub.rs` が同じ JSON 形をそれぞれ構築 | イベント生成を可搬層へ（未着手） |
+| **引数の袋** | `too_many_arguments` 14 件・`type_complexity` 5 件 | request struct / 型エイリアスへ畳む（未着手） |
