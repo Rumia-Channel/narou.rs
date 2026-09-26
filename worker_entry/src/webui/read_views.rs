@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use narou_rs::application::ApplicationError;
+use narou_rs::application::aliases::resolve_alias_target;
 use narou_rs::downloader::{Downloader, SectionFile, TargetType};
 use narou_rs::platform::{
     NovelId, NovelObjectKeys, ObjectKey, ObjectListRequest, ObjectPrefix,
@@ -57,10 +58,10 @@ const SECTION_SAVE_DIR: &str = "本文";
 /// Worker が書く差分キャッシュ (`NovelObjectKeys::cached_section`) と
 /// native レイアウト由来の移行物 (`cache/`) の双方を対象にする。
 const CACHE_DIR_NAMES: [&str; 2] = [".cache", "cache"];
-/// `app_state` の notepad / alias 行 (native `StateDb` の scope/key と同じ)。
+/// `app_state` の notepad 行 (native `StateDb` の scope/key と同じ)。
+/// alias 行の scope/key は `narou_rs::application::aliases` が持つ。
 const INVENTORY_SCOPE: &str = "inv";
 const NOTEPAD_KEY: &str = "notepad";
-const ALIAS_KEY: &str = "alias";
 /// native `src/web/misc.rs::version_latest` と同じ参照先。
 const RELEASES_API_URL: &str =
     "https://api.github.com/repos/Rumia-Channel/narou.rs/releases/latest";
@@ -401,56 +402,6 @@ async fn resolve_existing_id(runtime: &WorkerRuntime, target: &str) -> Option<i6
     }
 }
 
-/// `app_state('inv','alias')` のエイリアス表。native `resolve_alias_target` が
-/// 読むものと同じ行。読めない・行が無いときは空表 (= 別名なしとして扱う)。
-#[derive(Debug, Deserialize)]
-struct AliasRow {
-    #[serde(default)]
-    value_yaml: Option<String>,
-    #[serde(default)]
-    value_json: Option<String>,
-}
-
-async fn load_aliases(env: &Env) -> HashMap<String, String> {
-    let Ok(db) = env.d1("DB") else {
-        return Default::default();
-    };
-    let statement = match db
-        .prepare("SELECT value_yaml, value_json FROM app_state WHERE scope = ? AND key = ?")
-        .bind(&[
-            JsValue::from_str(INVENTORY_SCOPE),
-            JsValue::from_str(ALIAS_KEY),
-        ]) {
-        Ok(statement) => statement,
-        Err(_) => return Default::default(),
-    };
-    let row: Option<AliasRow> = statement.first::<AliasRow>(None).await.unwrap_or_default();
-    let Some(row) = row else {
-        return Default::default();
-    };
-    let payload = match row.value_yaml.as_deref() {
-        Some(yaml) if !yaml.trim().is_empty() && yaml.trim() != "{}" => yaml.to_string(),
-        _ => row.value_json.unwrap_or_else(|| "{}".to_string()),
-    };
-    let mapping: HashMap<String, serde_yaml::Value> =
-        serde_yaml::from_str(&payload).unwrap_or_default();
-    mapping
-        .into_iter()
-        .filter_map(|(name, value)| yaml_scalar_to_string(&value).map(|s| (name, s)))
-        .collect()
-}
-
-/// native `yaml_value_to_string`: 文字列・数値・真偽値スカラーだけを取る
-/// (配列やマップは別名の値として無効なので無視 = native 同様フォールバック)。
-fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String> {
-    match value {
-        serde_yaml::Value::String(s) => Some(s.clone()),
-        serde_yaml::Value::Number(n) => Some(n.to_string()),
-        serde_yaml::Value::Bool(b) => Some(b.to_string()),
-        _ => None,
-    }
-}
-
 /// `narou diff --clean <target>` がサブプロセス内で通る解決順
 /// (`commands::resolve_target_to_id`): エイリアス → ID → URL → ncode → タイトル
 /// (Other はタイトル→ncode の順でフォールバック)。
@@ -459,8 +410,8 @@ async fn resolve_diff_target_id(
     env: &Env,
     target: &str,
 ) -> Option<i64> {
-    let aliases = load_aliases(env).await;
-    let effective = aliases.get(target).cloned().unwrap_or_else(|| target.to_string());
+    let aliases = super::download::load_aliases(env).await;
+    let effective = resolve_alias_target(&aliases, target);
     let effective = effective.trim();
     if effective.is_empty() {
         return None;
