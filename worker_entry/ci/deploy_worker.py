@@ -23,6 +23,7 @@
   平文の行だけを読む。
 - `NAROU_AUTH_REQUIRED` / `NAROU_WORKERS_DEV` / `DEVELOP_DOMAIN` /
   `NAROU_S3_PREFIX` / `NAROU_D1_BASE_NAME` / `NAROU_JOB_QUEUE_BASE` / `NAROU_SMOKE=0`
+- `SERVICE_DOMAIN` / `DEVELOP_DOMAIN` … custom domain。secret を推奨（ログへ出さない）
 - `NAROU_DEPLOY_URL` … smoke の宛先を明示する（既定は domain → workers.dev）
 - `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` … Access の service token。
   未設定で Access に弾かれた場合は smoke を省略する。
@@ -66,6 +67,12 @@ def run(command: list[str], *, capture: bool = False, env: dict[str, str] | None
             sys.stderr.write(result.stderr or "")
         fail(f"{' '.join(command)} failed with {result.returncode}")
     return (result.stdout or "") if capture else ""
+
+
+def mask(value: str) -> None:
+    """GitHub のログで値を伏せる（`::add-mask::` は以降の出力に効く）。"""
+    if value:
+        print(f"::add-mask::{value}")
 
 
 def auth_required() -> bool:
@@ -165,15 +172,25 @@ def deploy(secrets: Path | None) -> str:
     return urls[-1]
 
 
-def smoke_url(target: str, reported: str) -> str:
-    """smoke の宛先。明示 > custom domain > wrangler が報告した URL。"""
+def hide(url: str) -> bool:
+    """workers.dev 以外（= custom domain）なら伏せる。"""
+    if url and ".workers.dev" not in url:
+        mask(url)
+        return True
+    return False
+
+
+def smoke_url(target: str, reported: str) -> tuple[str, bool]:
+    """smoke の宛先 `(url, custom_domain 由来か)`。明示 > custom domain > wrangler の出力。"""
     explicit = os.environ.get("NAROU_DEPLOY_URL", "").strip()
     if explicit:
-        return explicit
+        return explicit, hide(explicit)
     domain = os.environ.get({"develop": "DEVELOP_DOMAIN", "production": "SERVICE_DOMAIN"}[target], "").strip()
     if domain:
-        return f"https://{domain}"
-    return reported
+        # 公開ログ・step summary にドメインを残さない（値は GitHub の secret を想定）。
+        mask(domain)
+        return f"https://{domain}", hide(f"https://{domain}")
+    return reported, hide(reported)
 
 
 def smoke(base_url: str) -> bool | None:
@@ -198,11 +215,11 @@ def smoke(base_url: str) -> bool | None:
     return result.returncode == 0
 
 
-def summary(target: str, url: str, smoke_ok: bool | None) -> None:
+def summary(target: str, url: str, smoke_ok: bool | None, *, hidden_url: bool = False) -> None:
     lines = [
         f"### Worker deploy ({target})",
         "",
-        f"- URL: {url}",
+        f"- URL: {'（custom domain。ログでは伏せています）' if hidden_url else url}",
         f"- smoke: {'ok' if smoke_ok else 'skipped' if smoke_ok is None else 'failed'}",
     ]
     path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -246,9 +263,11 @@ def main() -> None:
             secrets.unlink(missing_ok=True)
 
     smoke_result: bool | None = None
+    dirty_smoke_url = False
     if os.environ.get("NAROU_SMOKE", "1") != "0":
-        smoke_result = smoke(smoke_url(target, url))
-    summary(target, url, smoke_result)
+        target_url, dirty_smoke_url = smoke_url(target, url)
+        smoke_result = smoke(target_url)
+    summary(target, url, smoke_result, hidden_url=dirty_smoke_url)
     if smoke_result is False:
         fail(f"smoke test failed against {url}")
 

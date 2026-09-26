@@ -295,13 +295,18 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 - GitHub Environments は**用途で 2 つ**に分ける（target では分けない）:
   - `Cloudflare` … デプロイ 2 ジョブ用。
     secrets: `CLOUDFLARE_ACCOUNT_ID`（`CLOUDFLARE_ACCOUT_ID` でも可）/ `CLOUDFLARE_API_TOKEN` /
+    `SERVICE_DOMAIN`（production 必須）/ `DEVELOP_DOMAIN`（develop・任意）/
     `NAROU_ADMIN_TOKEN`（Zero Trust が境界なら不要）/ `NAROU_RS_LOGIN_KEY`（任意）/
     `CF_ACCESS_CLIENT_ID`・`CF_ACCESS_CLIENT_SECRET`（smoke 用・任意）/
-    vars: `SERVICE_DOMAIN`（production 必須）/ `DEVELOP_DOMAIN`（develop・任意）/
-    `NAROU_AUTH_REQUIRED`（任意）/ `NAROU_WORKERS_DEV`（任意）/
+    vars: `NAROU_AUTH_REQUIRED`（任意）/ `NAROU_WORKERS_DEV`（任意）/
     `NAROU_S3_ENDPOINT` / `NAROU_S3_REGION` / `NAROU_S3_BUCKET` / `NAROU_S3_PREFIX`（任意）/
     `NAROU_SECRETS_STORE_ID` と `NAROU_S3_*_SECRET_NAME`（`+ NAROU_ADMIN_TOKEN_SECRET_NAME` /
     `NAROU_RS_LOGIN_KEY_SECRET_NAME`。Secrets Store を使う場合だけ）
+- **ドメインは secret に置く**。公開リポジトリでは Actions のログと step summary が誰でも読めるため、
+  hostname も伏せる。`SERVICE_DOMAIN` / `DEVELOP_DOMAIN` は `secrets` を優先して読み（`vars` も
+  後方互換で受ける）、`ci/deploy_worker.py` は custom domain 由来の URL を `::add-mask::` で伏せ、
+  step summary には URL を書かない（workers.dev の URL だけを表示する）。
+  挿絵バケットの endpoint / bucket も伏せたい場合は Secrets Store モード (§2.2.11) を使う。
   - `CodeSining` … `release.yml` の Windows 署名。`CERTUM_USERNAME` / `CERTUM_OTP_URI`（secrets）と
     `CERTUM_KEY_ID`（var）。Workers のデプロイからは参照しない。
 - 1 環境で両 target を回すための約束:

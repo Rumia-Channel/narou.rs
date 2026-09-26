@@ -119,10 +119,11 @@ jobs:
   # デプロイ。GitHub Environments は用途で 2 つに分ける:
   #   `Cloudflare` … この 2 ジョブ (develop / production) が使う Workers 用の値
   #     secrets: CLOUDFLARE_ACCOUNT_ID (または CLOUDFLARE_ACCOUT_ID) / CLOUDFLARE_API_TOKEN /
+  #              SERVICE_DOMAIN (production 必須) / DEVELOP_DOMAIN (develop・任意。ドメインは
+  #              公開ログに残さないため secrets 推奨) /
   #              NAROU_ADMIN_TOKEN (Zero Trust が境界なら不要) / NAROU_RS_LOGIN_KEY (任意) /
   #              CF_ACCESS_CLIENT_ID・CF_ACCESS_CLIENT_SECRET (smoke 用・任意)
-  #     vars:    SERVICE_DOMAIN (production 必須) / DEVELOP_DOMAIN (develop・任意) /
-  #              NAROU_AUTH_REQUIRED (任意) / NAROU_WORKERS_DEV (任意) /
+  #     vars:    NAROU_AUTH_REQUIRED (任意) / NAROU_WORKERS_DEV (任意) /
   #              NAROU_S3_ENDPOINT / NAROU_S3_REGION / NAROU_S3_BUCKET /
   #              NAROU_S3_PREFIX (任意。未設定なら narou/<target>) /
   #              NAROU_SECRETS_STORE_ID と *_SECRET_NAME (Secrets Store を使う場合)
@@ -164,7 +165,8 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       NAROU_DEPLOY_TARGET: develop
-      DEVELOP_DOMAIN: ${{ vars.DEVELOP_DOMAIN }}
+      # ドメインは公開ログに出さないため secrets を推奨 (vars も後方互換で動く)。
+      DEVELOP_DOMAIN: ${{ secrets.DEVELOP_DOMAIN || vars.DEVELOP_DOMAIN }}
       NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
       NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
       NAROU_S3_ENDPOINT: ${{ vars.NAROU_S3_ENDPOINT }}
@@ -239,7 +241,8 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       NAROU_DEPLOY_TARGET: production
-      SERVICE_DOMAIN: ${{ vars.SERVICE_DOMAIN }}
+      # ドメインは公開ログに出さないため secrets を推奨 (vars も後方互換で動く)。
+      SERVICE_DOMAIN: ${{ secrets.SERVICE_DOMAIN || vars.SERVICE_DOMAIN }}
       NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
       NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
       NAROU_S3_ENDPOINT: ${{ vars.NAROU_S3_ENDPOINT }}
