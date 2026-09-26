@@ -193,16 +193,7 @@ fn load_wait_steps(is_narou: bool) -> u32 {
 }
 
 fn normalize_wait_steps(raw_wait_steps: i64, is_narou: bool) -> u32 {
-    let wait_steps = if raw_wait_steps > 0 {
-        raw_wait_steps as u32
-    } else {
-        0
-    };
-    if is_narou && (wait_steps == 0 || wait_steps > 10) {
-        10
-    } else {
-        wait_steps
-    }
+    crate::platform::normalize_wait_steps(raw_wait_steps, is_narou)
 }
 
 #[cfg(test)]
