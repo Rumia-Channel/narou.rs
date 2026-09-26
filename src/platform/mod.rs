@@ -21,6 +21,7 @@ pub mod object_store;
 pub mod progress;
 pub mod rate_limiter;
 pub mod repository;
+pub mod s3_sigv4;
 
 pub use clock::{Clock, SystemClock};
 pub use cookie_store::{

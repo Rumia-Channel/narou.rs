@@ -105,6 +105,7 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 chacha20poly1305 = { version = "0.11", optional = true }
 argon2 = { version = "0.6", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+hmac = "0.13"
 
 [build-dependencies]
 base64 = "0.22"
