@@ -1736,9 +1736,9 @@ Apache License
 Used by:
 - ryu 1.0.23
 - sync_wrapper 1.0.2
-- worker-macros 0.8.5
-- worker-sys 0.8.5
-- worker 0.8.5
+- worker-macros 0.8.7
+- worker-sys 0.8.7
+- worker 0.8.7
 
 ```text
 Apache License
@@ -3348,7 +3348,7 @@ Used by:
 - cc 1.4.6
 - cfg-if 1.0.4
 - find-msvc-tools 0.1.12
-- js-sys 0.3.105
+- js-sys 0.3.106
 - openssl-probe 0.1.6
 - openssl-probe 0.2.1
 - openssl-src 300.6.1+3.6.3
@@ -3356,12 +3356,12 @@ Used by:
 - pkg-config 0.3.34
 - socket2 0.6.5
 - toml_datetime 0.6.3
-- wasm-bindgen-futures 0.4.78
-- wasm-bindgen-macro-support 0.2.128
-- wasm-bindgen-macro 0.2.128
-- wasm-bindgen-shared 0.2.128
-- wasm-bindgen 0.2.128
-- web-sys 0.3.105
+- wasm-bindgen-futures 0.4.79
+- wasm-bindgen-macro-support 0.2.129
+- wasm-bindgen-macro 0.2.129
+- wasm-bindgen-shared 0.2.129
+- wasm-bindgen 0.2.129
+- web-sys 0.3.106
 
 ```text
 Copyright (c) 2014 Alex Crichton
@@ -7317,8 +7317,8 @@ SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- strum 0.27.2
-- strum_macros 0.27.2
+- strum 0.28.0
+- strum_macros 0.28.0
 
 ```text
 MIT License
@@ -8030,7 +8030,7 @@ Used by:
 - typed-path 0.12.3
 - unicode-ident 1.0.24
 - unsafe-libyaml 0.2.11
-- wasm-streams 0.6.0
+- wasm-streams 0.7.0
 - x11 2.21.0
 - zmij 1.0.23
 
