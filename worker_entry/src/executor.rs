@@ -26,7 +26,7 @@ use narou_rs::downloader::{
 use narou_rs::error::{NarouError, Result};
 
 use crate::budget::{SubrequestBudget, WorkerBudget};
-use crate::push_hub::{echo, HubProgress, PushHubClient};
+use crate::push_hub::{HubProgress, PushHubClient, PushHubSink, echo};
 
 /// Bounded wall-clock budget per job. It is checked only before starting the
 /// next section, so a section's fetch and persistence remain atomic from the
@@ -135,6 +135,12 @@ pub async fn execute_job(
         job.kind.as_str(),
         job_id.as_str(),
     )));
+    // native のコンソール行 = PushHub の echo イベント。Downloader 内の
+    // report_line/report_warn と、sink を引き回せない既定 sink 経路の
+    // 両方へ同じバッファを指す sink をインストールする。
+    let push_sink = std::sync::Arc::new(PushHubSink::new(push.clone()));
+    narou_rs::application::messages::set_default_sink(push_sink.clone());
+    downloader.set_message_sink(push_sink.clone());
     let mut budget = WorkerBudget::new(JOB_TIME_BUDGET, subrequests).with_checkpoints(
         ledger.clone(),
         job_id.clone(),
@@ -175,6 +181,8 @@ pub async fn execute_job(
         }
         other => other,
     };
+    // バッファに積まれた行をジョブの区切りでまとめて送信する。
+    push_sink.drain().await;
     match result {
         Err(NarouError::DownloadBudgetExpired {
             next_section_index,

@@ -296,15 +296,18 @@ async fn run_command(
                 eprintln!("Usage: narou download <url|ncode|id>...");
                 return 127;
             }
-            commands::download::cmd_download(commands::download::DownloadOptions {
-                targets,
-                force,
-                no_convert,
-                freeze,
-                remove,
-                mail,
-                user_agent: ua,
-            })
+            commands::download::cmd_download(
+                commands::download::DownloadOptions {
+                    targets,
+                    force,
+                    no_convert,
+                    freeze,
+                    remove,
+                    mail,
+                    user_agent: ua,
+                },
+                &narou_rs::progress::console_sink(),
+            )
             .await
         }
         Commands::Update {
@@ -316,16 +319,19 @@ async fn run_command(
             sort_by,
             ignore_all,
         } => {
-            commands::update::cmd_update(commands::update::UpdateOptions {
-                ids,
-                force,
-                no_convert,
-                convert_only_new_arrival,
-                gl,
-                sort_by,
-                ignore_all,
-                user_agent: ua,
-            })
+            commands::update::cmd_update(
+                commands::update::UpdateOptions {
+                    ids,
+                    force,
+                    no_convert,
+                    convert_only_new_arrival,
+                    gl,
+                    sort_by,
+                    ignore_all,
+                    user_agent: ua,
+                },
+                &narou_rs::progress::console_sink(),
+            )
             .await;
             0
         }
@@ -354,7 +360,7 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             unreachable!()
         }
         Commands::Mail { targets, force } => {
-            commands::mail::cmd_mail(commands::mail::MailOptions { targets, force });
+            commands::mail::cmd_mail(commands::mail::MailOptions { targets, force }, &narou_rs::progress::console_sink());
             0
         }
         Commands::Send {
@@ -363,13 +369,16 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             force,
             backup_bookmark,
             restore_bookmark,
-        } => commands::send::cmd_send(commands::send::SendOptions {
-            args,
-            without_freeze,
-            force,
-            backup_bookmark,
-            restore_bookmark,
-        }),
+        } => commands::send::cmd_send(
+            commands::send::SendOptions {
+                args,
+                without_freeze,
+                force,
+                backup_bookmark,
+                restore_bookmark,
+            },
+            &narou_rs::progress::console_sink(),
+        ),
         Commands::Db { action } => match commands::db::cmd_db(action) {
             Ok(_) => 0,
             Err(e) => {
@@ -418,6 +427,7 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                     verbose,
                     ignore_default,
                     ignore_force,
+                    narou_rs::progress::console_sink().as_ref(),
                 );
                 0
             }

@@ -44,6 +44,64 @@ pub fn safe_stderr_println(line: &str) {
     let _ = writeln!(stderr, "{line}");
 }
 
+/// Console-backed [`MessageSink`] — the default sink for native execution.
+///
+/// Line output (`emit`) takes [`STDOUT_LOCK`] so parallel workers don't
+/// interleave bytes mid-line, then goes through the logger (`println!` /
+/// `eprintln!` override) so messages also land in the log file exactly like
+/// the pre-sink call sites did. `emit_fragment` is the `print!` equivalent
+/// (interactive prompts) and writes without the trailing newline.
+pub struct ConsoleSink;
+
+impl crate::application::messages::MessageSink for ConsoleSink {
+    fn emit(&self, stream: crate::application::messages::Stream, text: &str) {
+        use crate::application::messages::Stream;
+        let _guard = STDOUT_LOCK.lock();
+        match stream {
+            Stream::Stdout => crate::logger::emit_stdout(text, true),
+            Stream::Stderr => crate::logger::emit_stderr(text, true),
+        }
+    }
+
+    fn emit_fragment(&self, stream: crate::application::messages::Stream, text: &str) {
+        use crate::application::messages::Stream;
+        let _guard = STDOUT_LOCK.lock();
+        match stream {
+            Stream::Stdout => crate::logger::emit_stdout(text, false),
+            Stream::Stderr => crate::logger::emit_stderr(text, false),
+        }
+    }
+}
+
+/// `Arc<dyn MessageSink>` で CLI コマンドへ渡す共有コンソール sink を作る。
+pub fn console_sink() -> Arc<dyn crate::application::messages::MessageSink> {
+    Arc::new(ConsoleSink)
+}
+
+/// `safe_println`/`safe_stderr_println` 直結の sink — `Downloader` 内部の
+/// report 行など、従来から logger を介さず直接 stdout/stderr へ書いていた
+/// 経路に使う。`ConsoleSink` と違いログファイルへも転送しない。
+pub struct DirectConsoleSink;
+
+impl crate::application::messages::MessageSink for DirectConsoleSink {
+    fn emit(&self, stream: crate::application::messages::Stream, text: &str) {
+        use crate::application::messages::Stream;
+        match stream {
+            Stream::Stdout => safe_println(text),
+            Stream::Stderr => safe_stderr_println(text),
+        }
+    }
+
+    fn emit_fragment(&self, stream: crate::application::messages::Stream, text: &str) {
+        self.emit(stream, text);
+    }
+}
+
+/// Downloader 系 (従来 `safe_println` 系で出していた経路) に渡す共有 sink。
+pub fn direct_console_sink() -> Arc<dyn crate::application::messages::MessageSink> {
+    Arc::new(DirectConsoleSink)
+}
+
 /// Check if running under the web server (subprocess mode)
 pub fn is_web_mode() -> bool {
     std::env::var("NAROU_RS_WEB_MODE").is_ok()

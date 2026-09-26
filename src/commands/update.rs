@@ -10,10 +10,11 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use indicatif::MultiProgress;
 
+use narou_rs::application::messages::{self, MessageSink, Stream};
 use narou_rs::compat::{
     configure_web_subprocess_command, convert_existing_novel, current_device,
     load_local_setting_bool, load_local_setting_string, load_local_setting_value,
-    relay_web_stream_to_console, yaml_value_to_string,
+    relay_web_stream_to_console,
 };
 use narou_rs::converter::NovelConverter;
 use narou_rs::converter::device::{Device, OutputManager};
@@ -31,7 +32,6 @@ use narou_rs::mail::{
 use narou_rs::progress::{CliProgress, ProgressReporter, WebProgress, is_web_mode};
 use narou_rs::termcolor::{bold_colored, colored};
 use narou_rs::web::sort_state::{SORT_COLUMN_KEYS, sort_column_label_for_key, sort_record_ordering};
-use narou_rs::progress::safe_println as safe_println_fn;
 
 const MODIFIED_TAG: &str = "modified";
 const INTERVAL_MIN_SECS: f64 = 2.5;
@@ -74,6 +74,7 @@ struct UpdateContext {
     convert_only_new_arrival: bool,
     web_debug_mode: bool,
     multi: Arc<MultiProgress>,
+    sink: Arc<dyn MessageSink>,
 }
 
 /// Outcome of a parallel dispatch so the caller knows whether to
@@ -97,13 +98,13 @@ impl UpdateContext {
     }
 }
 
-pub async fn cmd_update(opts: UpdateOptions) {
+pub async fn cmd_update(opts: UpdateOptions, sink: &Arc<dyn MessageSink>) {
     if let Err(e) = narou_rs::db::init_database() {
-        eprintln!("Error initializing database: {}", e);
+        sink.emit(Stream::Stderr, &messages::init_db_error(e));
         std::process::exit(1);
     }
 
-    let interrupted = match update_interrupt_flag() {
+    let interrupted = match update_interrupt_flag(sink) {
         Ok(flag) => flag,
         Err(code) => std::process::exit(code),
     };
@@ -112,12 +113,12 @@ pub async fn cmd_update(opts: UpdateOptions) {
     repair_empty_titles();
 
     if let Some(gl_opt) = &opts.gl {
-        update_general_lastup(gl_opt.as_deref(), opts.user_agent.as_deref()).await;
+        update_general_lastup(gl_opt.as_deref(), opts.user_agent.as_deref(), sink).await;
         return;
     }
 
     let setting_sort_by = load_local_setting_string("update.sort-by");
-    let sort_by = resolve_sort_key(opts.sort_by.as_deref().or(setting_sort_by.as_deref()));
+    let sort_by = resolve_sort_key(opts.sort_by.as_deref().or(setting_sort_by.as_deref()), sink);
 
     let convert_only_new_arrival = opts.convert_only_new_arrival
         || load_local_setting_bool("update.convert-only-new-arrival");
@@ -128,7 +129,7 @@ pub async fn cmd_update(opts: UpdateOptions) {
     let merged_ids = merge_cli_and_stdin_targets(opts.ids.clone(), stdin_targets);
     let is_bulk = merged_ids.is_none();
     let (target_ids, unresolved_count) =
-        resolve_targets(merged_ids.as_deref(), opts.ignore_all, sort_by.as_deref());
+        resolve_targets(merged_ids.as_deref(), opts.ignore_all, sort_by.as_deref(), sink);
     if target_ids.is_empty() {
         if unresolved_count > 0 {
             std::process::exit(unresolved_count.min(127) as i32);
@@ -153,6 +154,7 @@ pub async fn cmd_update(opts: UpdateOptions) {
         convert_only_new_arrival,
         web_debug_mode,
         multi: multi.clone(),
+        sink: sink.clone(),
     };
 
     // -- Decide between serial and per-domain parallel dispatch --
@@ -220,7 +222,7 @@ pub async fn cmd_update(opts: UpdateOptions) {
     };
 
     if let Err(UpdateInterrupted) = update_result {
-        println!("アップデートを中断しました");
+        sink.emit(Stream::Stdout, messages::update::update_interrupted());
         std::process::exit(126);
     }
 
@@ -228,17 +230,17 @@ pub async fn cmd_update(opts: UpdateOptions) {
 
     if hotentry_enabled {
         if abort_if_interrupted(interrupted.as_ref()).is_err() {
-            println!("アップデートを中断しました");
+            sink.emit(Stream::Stdout, messages::update::update_interrupted());
             std::process::exit(126);
         }
-        if let Err(e) = process_hotentry(&hotentries) {
-            println!("hotentry の処理に失敗しました\n  {}", e);
+        if let Err(e) = process_hotentry(&hotentries, sink) {
+            sink.emit(Stream::Stdout, &messages::update::hotentry_failed(e));
             mistook += 1;
         }
     }
 
     if mistook > 0 {
-        println!("\n{} 件のエラーが発生しました", mistook);
+        sink.emit(Stream::Stdout, &messages::update::errors_occurred(mistook));
     }
     drop(multi);
 
@@ -247,7 +249,7 @@ pub async fn cmd_update(opts: UpdateOptions) {
     }
 }
 
-fn update_interrupt_flag() -> Result<Arc<AtomicBool>, i32> {
+fn update_interrupt_flag(sink: &Arc<dyn MessageSink>) -> Result<Arc<AtomicBool>, i32> {
     if let Some(flag) = UPDATE_INTERRUPT_FLAG.get() {
         return Ok(flag.clone());
     }
@@ -258,7 +260,7 @@ fn update_interrupt_flag() -> Result<Arc<AtomicBool>, i32> {
         handler_flag.store(true, AtomicOrdering::SeqCst);
     })
     .map_err(|e| {
-        eprintln!("Error: {}", e);
+        sink.emit(Stream::Stderr, &messages::error_line(e));
         1
     })?;
 
@@ -295,6 +297,7 @@ fn resolve_targets(
     ids: Option<&[String]>,
     ignore_all: bool,
     sort_by: Option<&str>,
+    sink: &Arc<dyn MessageSink>,
 ) -> (Vec<i64>, usize) {
     if let Some(targets) = ids {
         let mut resolved = Vec::new();
@@ -306,7 +309,10 @@ fn resolve_targets(
                     resolved.push(id);
                 }
             } else {
-                eprintln!("{} {} は管理小説の中に存在しません", bold_colored("[ERROR]", "red"), target);
+                sink.emit(
+                    Stream::Stderr,
+                    &messages::update::unmanaged_target(bold_colored("[ERROR]", "red"), target),
+                );
                 unresolved_count += 1;
             }
         }
@@ -367,7 +373,7 @@ fn merge_cli_and_stdin_targets(
     }
 }
 
-fn resolve_sort_key(key: Option<&str>) -> Option<String> {
+fn resolve_sort_key(key: Option<&str>, sink: &Arc<dyn MessageSink>) -> Option<String> {
     let key = key?;
     let key_lower = key.to_lowercase();
     if SORT_COLUMN_KEYS.contains(&key_lower.as_str())
@@ -379,17 +385,16 @@ fn resolve_sort_key(key: Option<&str>) -> Option<String> {
         .iter()
         .map(|k| {
             let label = sort_column_label_for_key(k).unwrap_or(*k);
-            format!("  {:>20}   {}", k, label)
+            messages::update::sort_key_summary_entry(k, label)
         })
-        .chain(std::iter::once(format!(
-            "  {:>20}   {}",
-            "new_arrivals_date", "新着日"
-        )))
+        .chain(std::iter::once(
+            messages::update::sort_key_summary_entry("new_arrivals_date", "新着日"),
+        ))
         .collect::<Vec<_>>()
         .join("\n");
-    eprintln!(
-        "{} は正しいキーではありません。次の中から選択して下さい\n{}",
-        key, summaries
+    sink.emit(
+        Stream::Stderr,
+        &messages::update::invalid_sort_key(key, summaries),
     );
     std::process::exit(127);
 }
@@ -509,20 +514,13 @@ fn resolve_ncode_to_id(target: &str) -> Option<i64> {
 }
 
 fn alias_to_target(target: &str) -> String {
-    let alias = narou_rs::db::with_database(|db| {
-        let aliases: HashMap<String, serde_yaml::Value> =
+    let aliases = narou_rs::db::with_database(|db| {
+        let values: HashMap<String, serde_yaml::Value> =
             db.inventory().load("alias", InventoryScope::Local)?;
-        Ok(aliases.get(target).and_then(yaml_value_to_string))
+        Ok(narou_rs::application::aliases::alias_map_from_values(values))
     })
-    .ok()
-    .flatten();
-    alias.unwrap_or_else(|| {
-        if target.chars().all(|c| c.is_ascii_digit()) {
-            target.to_string()
-        } else {
-            target.to_lowercase()
-        }
-    })
+    .unwrap_or_default();
+    narou_rs::application::aliases::alias_to_target_for_update(&aliases, target)
 }
 
 fn sort_update_ids_by_key(ids: &mut [i64], key: &str) {
@@ -753,40 +751,34 @@ fn clear_convert_failure(id: i64) {
     }
 }
 
-fn print_status_messages(dl: &DownloadResult) {
+fn print_status_messages(dl: &DownloadResult, sink: &Arc<dyn MessageSink>) {
     match dl.status {
         UpdateStatus::Ok => {
             if dl.new_novel {
-                println!(
-                    "{} のDL完了 (ID:{}, {}セクション)",
-                    dl.title, dl.id, dl.total_count
+                sink.emit(
+                    Stream::Stdout,
+                    &messages::dl_completed_new(&dl.title, dl.id, dl.total_count),
                 );
             } else if dl.sections_deleted {
-                println!(
-                    "ID:{}　{} は一部の話が削除されています",
-                    dl.id, dl.title
+                sink.emit(
+                    Stream::Stdout,
+                    &messages::update::sections_deleted(dl.id, &dl.title),
                 );
             } else if dl.updated_count > 0 {
-                println!("{} の更新が完了しました", dl.title);
+                sink.emit(
+                    Stream::Stdout,
+                    &messages::update::update_completed(&dl.title),
+                );
             } else if dl.title_changed {
-                println!(
-                    "ID:{}　{} のタイトルが更新されています",
-                    dl.id, dl.title
-                );
+                sink.emit(Stream::Stdout, &messages::update::title_changed(dl.id, &dl.title));
             } else if dl.story_changed {
-                println!(
-                    "ID:{}　{} のあらすじが更新されています",
-                    dl.id, dl.title
-                );
+                sink.emit(Stream::Stdout, &messages::update::story_changed(dl.id, &dl.title));
             } else if dl.author_changed {
-                println!(
-                    "ID:{}　{} の作者名が更新されています",
-                    dl.id, dl.title
-                );
+                sink.emit(Stream::Stdout, &messages::update::author_changed(dl.id, &dl.title));
             }
         }
         UpdateStatus::None => {
-            println!("{} に更新はありません", dl.title);
+            sink.emit(Stream::Stdout, &messages::no_update(&dl.title));
         }
         UpdateStatus::Canceled => {}
         UpdateStatus::Failed => {}
@@ -823,8 +815,8 @@ fn auto_convert_via_web_subprocess(id: i64, no_open: bool) -> Result<(), String>
     configure_web_subprocess_command(&mut command);
 
     let mut child = command.spawn().map_err(|e| e.to_string())?;
-    let stdout = child.stdout.take().ok_or_else(|| "convert stdout を取得できません".to_string())?;
-    let stderr = child.stderr.take().ok_or_else(|| "convert stderr を取得できません".to_string())?;
+    let stdout = child.stdout.take().ok_or_else(|| messages::download::convert_stdout_unavailable().to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| messages::download::convert_stderr_unavailable().to_string())?;
 
     let stdout_thread = std::thread::spawn(move || relay_web_convert_stream(stdout));
     let stderr_thread = std::thread::spawn(move || relay_web_convert_stream(stderr));
@@ -832,17 +824,17 @@ fn auto_convert_via_web_subprocess(id: i64, no_open: bool) -> Result<(), String>
     let status = child.wait().map_err(|e| e.to_string())?;
     stdout_thread
         .join()
-        .map_err(|_| "convert stdout relay thread が panic しました".to_string())??;
+        .map_err(|_| messages::download::convert_stdout_relay_panicked().to_string())??;
     stderr_thread
         .join()
-        .map_err(|_| "convert stderr relay thread が panic しました".to_string())??;
+        .map_err(|_| messages::download::convert_stderr_relay_panicked().to_string())??;
 
     if status.success() {
         Ok(())
     } else {
         Err(match status.code() {
-            Some(code) => format!("convert が終了コード {} で失敗しました", code),
-            None => "convert が異常終了しました".to_string(),
+            Some(code) => messages::download::convert_exit_code_failed(code),
+            None => messages::download::convert_abnormal_exit().to_string(),
         })
     }
 }
@@ -853,6 +845,7 @@ fn relay_web_convert_stream<R: io::Read>(reader: R) -> Result<(), String> {
 
 fn process_hotentry(
     hotentries: &HashMap<i64, Vec<SubtitleInfo>>,
+    sink: &Arc<dyn MessageSink>,
 ) -> Result<(), String> {
     if hotentries.is_empty() {
         return Ok(());
@@ -884,8 +877,8 @@ fn process_hotentry(
         return Ok(());
     }
 
-    println!("{}", "\u{2015}".repeat(35));
-    println!("hotentry の変換を開始");
+    sink.emit(Stream::Stdout, &messages::separator());
+    sink.emit(Stream::Stdout, messages::update::hotentry_convert_started());
 
     let mut converted_entries = Vec::new();
     for (id, novel_dir, toc, subtitles) in &collected {
@@ -942,6 +935,7 @@ fn process_hotentry(
         } else {
             Some(device)
         },
+        sink.as_ref(),
     );
     let _ = send_hotentry_output(
         &final_path,
@@ -950,14 +944,18 @@ fn process_hotentry(
         } else {
             Some(device)
         },
+        sink.as_ref(),
     );
-    mail_hotentry_if_enabled();
+    mail_hotentry_if_enabled(sink);
 
-    println!("hotentry を生成しました: {}", final_path.display());
+    sink.emit(
+        Stream::Stdout,
+        &messages::update::hotentry_generated(final_path.display()),
+    );
     Ok(())
 }
 
-fn mail_hotentry_if_enabled() {
+fn mail_hotentry_if_enabled(sink: &Arc<dyn MessageSink>) {
     if !load_local_setting_bool("hotentry.auto-mail") {
         return;
     }
@@ -965,27 +963,23 @@ fn mail_hotentry_if_enabled() {
     match load_mail_setting() {
         Ok(setting) => {
             if let Err(e) = send_target_with_setting(&setting, "hotentry", false, false) {
-                eprintln!("{}", e);
+                sink.emit(Stream::Stderr, &e);
             }
         }
         Err(MailSettingLoadError::NotFound(_)) => match ensure_mail_setting_file() {
             Ok(path) => {
-                println!("created {}", path.display());
-                println!(
-                    "メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。"
-                );
+                sink.emit(Stream::Stdout, &messages::mail::mail_setting_created(&path));
+                sink.emit(Stream::Stdout, messages::mail::mail_setting_file_notice());
             }
             Err(e) => {
-                eprintln!("Error: {}", e);
+                sink.emit(Stream::Stderr, &messages::error_line(e));
             }
         },
         Err(MailSettingLoadError::Incomplete(_)) => {
-            eprintln!(
-                "設定ファイルの書き換えが終了していないようです。\n設定ファイルは mail_setting.yaml にあります"
-            );
+            sink.emit(Stream::Stderr, messages::mail::mail_setting_incomplete_fixed());
         }
         Err(e) => {
-            eprintln!("Error: {}", e);
+            sink.emit(Stream::Stderr, &messages::error_line(e));
         }
     }
 }
@@ -1069,6 +1063,7 @@ fn load_setting_float(key: &str, default: f64) -> f64 {
 fn copy_to_hotentry_output(
     src_path: &Path,
     _device: Option<Device>,
+    sink: &dyn MessageSink,
 ) -> Result<Option<PathBuf>, String> {
     let copy_to_dir = load_local_setting_string("convert.copy-to")
         .or_else(|| load_local_setting_string("convert.copy_to"));
@@ -1077,10 +1072,7 @@ fn copy_to_hotentry_output(
     };
     let base = PathBuf::from(&copy_to_dir);
     if !base.is_dir() {
-        return Err(format!(
-            "{} はフォルダではないかすでに削除されています。コピー出来ませんでした",
-            copy_to_dir
-        ));
+        return Err(messages::copy_dest_not_dir(copy_to_dir));
     }
     let mut dst_dir = base;
     if let Some(device) = _device
@@ -1094,16 +1086,17 @@ fn copy_to_hotentry_output(
     let dst = dst_dir.join(
         src_path
             .file_name()
-            .ok_or_else(|| "Invalid converted filename".to_string())?,
+            .ok_or_else(|| messages::convert::invalid_converted_filename().to_string())?,
     );
     std::fs::copy(src_path, &dst).map_err(|e| e.to_string())?;
-    println!("{} へコピーしました", dst.display());
+    sink.emit(Stream::Stdout, &messages::copied_to(dst.display()));
     Ok(Some(dst))
 }
 
 fn send_hotentry_output(
     ebook_file: &Path,
     device: Option<Device>,
+    sink: &dyn MessageSink,
 ) -> Result<(), String> {
     let Some(device) = device else {
         return Ok(());
@@ -1116,29 +1109,30 @@ fn send_hotentry_output(
     if !manager.ebook_file_old(ebook_file) {
         return Ok(());
     }
-    println!("{}へ送信しています", device.display_name());
+    sink.emit(Stream::Stdout, &messages::sending_to(device.display_name()));
     match manager
         .copy_to_documents(ebook_file)
         .map_err(|e| e.to_string())?
     {
         Some(path) => {
-            println!("{} へコピーしました", path.display());
+            sink.emit(Stream::Stdout, &messages::copied_to(path.display()));
             Ok(())
         }
-        None => Err(format!(
-            "{}が見つからなかったためコピー出来ませんでした",
-            device.display_name()
-        )),
+        None => Err(messages::copy_device_missing(device.display_name())),
     }
 }
 
-async fn update_general_lastup(gl_opt: Option<&str>, user_agent: Option<&str>) {
+async fn update_general_lastup(
+    gl_opt: Option<&str>,
+    user_agent: Option<&str>,
+    sink: &Arc<dyn MessageSink>,
+) {
     if gl_opt.is_some() && !matches!(gl_opt, Some("narou") | Some("other")) {
-        eprintln!("--gl で指定可能なオプションではありません。詳細は narou u -h を参照");
+        sink.emit(Stream::Stderr, messages::update::gl_option_invalid());
         std::process::exit(127);
     }
 
-    println!("最新話掲載日を確認しています...");
+    sink.emit(Stream::Stdout, messages::update::checking_lastup());
 
     let site_settings = narou_rs::downloader::site_setting::effective_site_settings();
 
@@ -1174,11 +1168,11 @@ async fn update_general_lastup(gl_opt: Option<&str>, user_agent: Option<&str>) {
     let _ = narou_rs::db::with_database_mut(|db| db.save());
 
     if had_api_error {
-        eprintln!("最新話掲載日の確認に失敗しました");
+        sink.emit(Stream::Stderr, messages::update::lastup_check_failed());
         std::process::exit(1);
     }
 
-    println!("確認が完了しました");
+    sink.emit(Stream::Stdout, messages::update::check_completed());
 }
 
 fn partition_novels_by_api_support(
@@ -1516,10 +1510,11 @@ async fn run_serial_update(
     let mut downloader = match Downloader::with_user_agent(ctx.opts.user_agent.as_deref()) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("Error creating downloader: {}", e);
+            ctx.sink.emit(Stream::Stderr, &messages::downloader_create_error(e));
             std::process::exit(1);
         }
     };
+    downloader.set_message_sink(narou_rs::progress::direct_console_sink());
     let mut last_started_by_domain = HashMap::new();
 
     for (i, &id) in target_ids.iter().enumerate() {
@@ -1527,7 +1522,7 @@ async fn run_serial_update(
             return Err(UpdateInterrupted);
         }
         if i > 0 {
-            println!("{}", "\u{2015}".repeat(35));
+            ctx.sink.emit(Stream::Stdout, &messages::separator());
         }
         let inc = process_novel_for_update(
             &mut downloader,
@@ -1602,13 +1597,14 @@ async fn run_parallel_per_domain_update(
             {
                 Ok(d) => d,
                 Err(e) => {
-                    safe_println_fn(&format!(
-                        "[worker {}] Error creating downloader: {}",
-                        worker_idx, e
-                    ));
+                    ctx.sink.emit(
+                        Stream::Stdout,
+                        &messages::update::parallel_worker_downloader_error(worker_idx, e),
+                    );
                     return Ok((0, HashMap::new()));
                 }
             };
+            downloader.set_message_sink(narou_rs::progress::direct_console_sink());
             let mut last_started_by_domain = HashMap::new();
             let mut local_mistook = 0usize;
             let mut local_hotentries: HashMap<i64, Vec<SubtitleInfo>> = HashMap::new();
@@ -1627,7 +1623,10 @@ async fn run_parallel_per_domain_update(
                 let Some(ids) = group_lookup.get(&domain) else {
                     continue;
                 };
-                safe_println_fn(&format!("[{}] starting ({} novel(s))", domain, ids.len()));
+                ctx.sink.emit(
+                    Stream::Stdout,
+                    &messages::update::domain_starting(&domain, ids.len()),
+                );
                 for &id in ids {
                     if interrupted.load(AtomicOrdering::SeqCst) {
                         break;
@@ -1647,7 +1646,7 @@ async fn run_parallel_per_domain_update(
                         Err(UpdateInterrupted) => break,
                     }
                 }
-                safe_println_fn(&format!("[{}] done", domain));
+                ctx.sink.emit(Stream::Stdout, &messages::update::domain_done(&domain));
             }
             Ok((local_mistook, local_hotentries))
         }));
@@ -1699,7 +1698,7 @@ async fn process_novel_for_update(
             return Ok(0);
         }
         let title = get_novel_title(id);
-        safe_println_fn(&format!("ID:{}　{} は凍結中です", id, title));
+        ctx.sink.emit(Stream::Stdout, &messages::update::frozen_id(id, title));
         return Ok(1);
     }
 
@@ -1719,7 +1718,7 @@ async fn process_novel_for_update(
 
     match downloader.download_novel(&id.to_string()).await {
         Ok(dl) => {
-            print_status_messages(&dl);
+            print_status_messages(&dl, &ctx.sink);
 
             if ctx.hotentry_enabled && !dl.new_arrival_subtitles.is_empty() {
                 hotentries
@@ -1780,14 +1779,20 @@ async fn process_novel_for_update(
                     } else {
                         dl.title.clone()
                     };
-                    safe_println_fn(&format!("ID:{}　{} の更新はキャンセルされました", id, title));
+                    ctx.sink.emit(
+                        Stream::Stdout,
+                        &messages::update::update_canceled(id, title),
+                    );
                     new_mistook += 1;
                     return Ok(new_mistook);
                 }
             };
 
             if needs_convert && has_convert_failure {
-                safe_println_fn(&colored("前回変換できなかったので再変換します", "yellow").to_string());
+                ctx.sink.emit(
+                    Stream::Stdout,
+                    &colored(messages::update::reconvert_after_failure(), "yellow").to_string(),
+                );
             }
 
             if needs_convert {
@@ -1796,7 +1801,10 @@ async fn process_novel_for_update(
                         clear_convert_failure(dl.id);
                     }
                     Err(e) => {
-                        safe_println_fn(&format!("  Convert error: {}", e));
+                        ctx.sink.emit(
+                            Stream::Stdout,
+                            &messages::download::convert_error_line(e),
+                        );
                         set_convert_failure(dl.id);
                         new_mistook += 1;
                     }
@@ -1809,9 +1817,12 @@ async fn process_novel_for_update(
                 return Err(UpdateInterrupted);
             }
             let title = get_novel_title(id);
-            safe_println_fn(&format!("ID:{}　{} の更新は失敗しました", id, title));
+            ctx.sink.emit(
+                Stream::Stdout,
+                &messages::update::update_failed(id, title),
+            );
             if ctx.web_debug_mode {
-                safe_println_fn(&format!("  Error detail: {}", e));
+                ctx.sink.emit(Stream::Stdout, &messages::update::error_detail(e));
             }
             new_mistook += 1;
             Ok(new_mistook)

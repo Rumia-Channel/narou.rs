@@ -167,6 +167,51 @@ impl PushHubClient {
     }
 }
 
+/// ユーザーに見える行を PushHub の `echo` イベントへ流す
+/// [`narou_rs::application::messages::MessageSink`] 実装。
+///
+/// `emit` は同期 API なので行はバッファへ積み、ジョブの区切りで
+/// [`Self::drain`] が `broadcast_best_effort` でまとめて送る。Worker は
+/// 単一スレッドで jobs を直列実行するため `Mutex` が競合しない
+/// (`MessageSink: Send + Sync` への適合のために `RefCell` ではなく
+/// `Mutex` を使う)。`target_console` は [`Stream::target_console`]
+/// (native の stdout=`"stdout"` / stderr=`"stdout2"` 対応) に委譲する。
+#[derive(Debug)]
+pub struct PushHubSink {
+    client: PushHubClient,
+    buffer: std::sync::Mutex<Vec<Value>>,
+}
+
+impl PushHubSink {
+    pub fn new(client: PushHubClient) -> Self {
+        Self {
+            client,
+            buffer: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 積まれた行をまとめて PushHub へ送る (best-effort)。ジョブ実行の
+    /// 区切りごとに呼ぶ。
+    pub async fn drain(&self) {
+        let events = self
+            .buffer
+            .lock()
+            .map(|mut buffer| std::mem::take(&mut *buffer))
+            .unwrap_or_default();
+        if !events.is_empty() {
+            self.client.broadcast_best_effort(&events).await;
+        }
+    }
+}
+
+impl narou_rs::application::messages::MessageSink for PushHubSink {
+    fn emit(&self, stream: narou_rs::application::messages::Stream, text: &str) {
+        if let Ok(mut buffer) = self.buffer.lock() {
+            buffer.push(echo(text, stream.target_console()));
+        }
+    }
+}
+
 /// Worker 内で動く [`ProgressReporter`]。native の `WebProgress`
 /// (`src/progress.rs`) と同じイベント列を吐く:
 /// `progressbar.init` → `progressbar.step` → `progressbar.clear`。

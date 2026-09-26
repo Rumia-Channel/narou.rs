@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+use narou_rs::application::messages::{self, MessageSink, Stream};
 use narou_rs::compat::{load_local_setting_bool, load_local_setting_string};
 use narou_rs::converter::device::{Device, OutputManager};
 use narou_rs::db;
@@ -97,32 +98,29 @@ impl SendDevice {
     }
 }
 
-pub fn cmd_send(opts: SendOptions) -> i32 {
-    match cmd_send_inner(opts) {
+pub fn cmd_send(opts: SendOptions, sink: &std::sync::Arc<dyn MessageSink>) -> i32 {
+    match cmd_send_inner(opts, sink.as_ref()) {
         Ok(()) => 0,
         Err(message) => {
-            eprintln!("{}", message);
+            sink.emit(Stream::Stderr, &message);
             127
         }
     }
 }
 
-fn cmd_send_inner(opts: SendOptions) -> Result<(), String> {
+fn cmd_send_inner(opts: SendOptions, sink: &dyn MessageSink) -> Result<(), String> {
     db::init_database().map_err(|e| e.to_string())?;
 
     let (device, raw_targets) = resolve_device_and_targets(&opts.args)?;
     if !device.physical_support() {
-        return Err(format!(
-            "{} への直接送信は対応していません",
-            device.display_name()
-        ));
+        return Err(messages::send::direct_send_unsupported(device.display_name()));
     }
 
     let manager = device
         .manager()
-        .ok_or_else(|| "送信に使う端末設定が不正です".to_string())?;
+        .ok_or_else(|| messages::send::invalid_device_setting().to_string())?;
     if !manager.connecting() {
-        return Err(format!("{} が接続されていません", device.display_name()));
+        return Err(messages::send::device_not_connected(device.display_name()));
     }
 
     let hotentry_enabled = load_local_setting_bool("hotentry");
@@ -134,11 +132,11 @@ fn cmd_send_inner(opts: SendOptions) -> Result<(), String> {
     };
 
     if opts.backup_bookmark {
-        process_backup_bookmark(device, &manager);
+        process_backup_bookmark(device, &manager, sink);
         return Ok(());
     }
     if opts.restore_bookmark {
-        process_restore_bookmark(device, &manager);
+        process_restore_bookmark(device, &manager, sink);
         return Ok(());
     }
 
@@ -151,23 +149,25 @@ fn cmd_send_inner(opts: SendOptions) -> Result<(), String> {
             continue;
         }
 
-        let (display_target, ebook_paths) = match resolve_send_target(&target, device, &titles)? {
+        let (display_target, ebook_paths) = match resolve_send_target(&target, device, &titles, sink)? {
             Some(data) => data,
             None => continue,
         };
 
         let Some(first_path) = ebook_paths.first() else {
-            eprintln!("{} は存在しません", target);
+            sink.emit(Stream::Stderr, &messages::target_missing(target));
             continue;
         };
         if !first_path.exists() {
             if !send_all {
-                eprintln!(
-                    "まだファイル({})が無いようです",
-                    first_path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default()
+                sink.emit(
+                    Stream::Stderr,
+                    &messages::send::file_not_yet(
+                        first_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or_default(),
+                    ),
                 );
             }
             continue;
@@ -177,23 +177,20 @@ fn cmd_send_inner(opts: SendOptions) -> Result<(), String> {
             continue;
         }
 
-        println!("{}", highlight_target(&display_target));
+        sink.emit(Stream::Stdout, &highlight_target(&display_target));
         for ebook_path in ebook_paths {
-            let copied_to = copy_with_progress(device, &ebook_path)?;
+            let copied_to = copy_with_progress(device, &ebook_path, sink)?;
             match copied_to {
-                Some(path) => println!("{} へコピーしました", path.display()),
+                Some(path) => sink.emit(Stream::Stdout, &messages::copied_to(path.display())),
                 None => {
-                    return Err(format!(
-                        "{}が見つからなかったためコピー出来ませんでした",
-                        device.name()
-                    ));
+                    return Err(messages::copy_device_missing(device.name()));
                 }
             }
         }
     }
 
     if send_all && auto_backup_bookmark {
-        process_backup_bookmark(device, &manager);
+        process_backup_bookmark(device, &manager, sink);
     }
 
     Ok(())
@@ -214,11 +211,8 @@ fn resolve_device_and_targets(args: &[String]) -> Result<(SendDevice, Vec<String
         return Ok((device, targets));
     }
 
-    Err(format!(
-        "デバイス名が指定されていないか、間違っています。\n\
-narou setting device=デバイス名 で指定出来ます。\n\
-指定出来るデバイス名：{}",
-        SEND_DEVICE_NAMES.join(", ")
+    Err(messages::send::device_name_unspecified(
+        SEND_DEVICE_NAMES.join(", "),
     ))
 }
 
@@ -269,6 +263,7 @@ fn resolve_send_target(
     target: &str,
     device: SendDevice,
     titles: &HashMap<String, String>,
+    sink: &dyn MessageSink,
 ) -> Result<Option<(String, Vec<PathBuf>)>, String> {
     if target == "hotentry" {
         let path = newest_hotentry_file_path(device.ebook_file_ext())?;
@@ -276,7 +271,7 @@ fn resolve_send_target(
     }
 
     let Some(data) = download::get_data_by_target(target) else {
-        eprintln!("{} は存在しません", target);
+        sink.emit(Stream::Stderr, &messages::target_missing(target));
         return Ok(None);
     };
     let record = load_record(data.id)?;
@@ -295,14 +290,18 @@ fn load_record(id: i64) -> Result<NovelRecord, String> {
     narou_rs::native::novel_repository::NativeNovelRepository::new()
         .get_sync(id.into())
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("{} は存在しません", id))
+        .ok_or_else(|| messages::target_missing(id))
 }
 
-fn copy_with_progress(device: SendDevice, ebook_path: &Path) -> Result<Option<PathBuf>, String> {
+fn copy_with_progress(
+    device: SendDevice,
+    ebook_path: &Path,
+    sink: &dyn MessageSink,
+) -> Result<Option<PathBuf>, String> {
     let manager_device = device
         .manager_device()
-        .ok_or_else(|| "送信先端末が不正です".to_string())?;
-    print!("{}へ送信しています", device.name());
+        .ok_or_else(|| messages::send::send_destination_invalid().to_string())?;
+    sink.emit_fragment(Stream::Stdout, &messages::sending_to(device.name()));
     let src_file = ebook_path.to_path_buf();
     let handle =
         thread::spawn(move || OutputManager::new(manager_device).copy_to_documents(&src_file));
@@ -310,42 +309,42 @@ fn copy_with_progress(device: SendDevice, ebook_path: &Path) -> Result<Option<Pa
     while !handle.is_finished() {
         thread::sleep(Duration::from_millis(500));
         if !handle.is_finished() {
-            print!(".");
+            sink.emit_fragment(Stream::Stdout, messages::send::progress_dot());
         }
     }
 
-    println!();
+    sink.emit_fragment(Stream::Stdout, "\n");
 
     let copied_to = handle
         .join()
-        .map_err(|_| "送信を中断しました".to_string())?
+        .map_err(|_| messages::send::send_interrupted().to_string())?
         .map_err(|e| e.to_string())?;
     Ok(copied_to)
 }
 
-fn process_backup_bookmark(device: SendDevice, manager: &OutputManager) {
+fn process_backup_bookmark(device: SendDevice, manager: &OutputManager, sink: &dyn MessageSink) {
     if !device.bookmark_backup_supported() {
-        eprintln!("ご利用の端末での栞データのバックアップは対応していません");
+        sink.emit(Stream::Stderr, messages::send::bookmark_backup_unsupported());
         return;
     }
 
     match backup_bookmark_files(device, manager) {
-        Ok(count) if count > 0 => println!("端末の栞データをバックアップしました"),
+        Ok(count) if count > 0 => sink.emit(Stream::Stdout, messages::send::bookmark_backed_up()),
         Ok(_) => {}
-        Err(message) => eprintln!("{}", message),
+        Err(message) => sink.emit(Stream::Stderr, &message),
     }
 }
 
-fn process_restore_bookmark(device: SendDevice, manager: &OutputManager) {
+fn process_restore_bookmark(device: SendDevice, manager: &OutputManager, sink: &dyn MessageSink) {
     if !device.bookmark_backup_supported() {
-        eprintln!("ご利用の端末での栞データのバックアップは対応していません");
+        sink.emit(Stream::Stderr, messages::send::bookmark_backup_unsupported());
         return;
     }
 
     match restore_bookmark_files(device, manager) {
-        Ok(count) if count > 0 => println!("栞データを端末にコピーしました"),
-        Ok(_) => println!("栞データが無いようです"),
-        Err(message) => eprintln!("{}", message),
+        Ok(count) if count > 0 => sink.emit(Stream::Stdout, messages::send::bookmark_restored()),
+        Ok(_) => sink.emit(Stream::Stdout, messages::send::bookmark_absent()),
+        Err(message) => sink.emit(Stream::Stderr, &message),
     }
 }
 

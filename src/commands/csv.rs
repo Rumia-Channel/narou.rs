@@ -126,15 +126,18 @@ async fn import_csv(path: &str) -> Result<(), String> {
     for url in urls {
         // 取り込んだ URL は native と同じく download コマンド経由で取得する
         // (以前は future を捨てていて、実際には何も取得していなかった)。
-        let _ = download::cmd_download(download::DownloadOptions {
-            targets: vec![url],
-            force: false,
-            no_convert: false,
-            freeze: false,
-            remove: false,
-            mail: false,
-            user_agent: None,
-        })
+        let _ = download::cmd_download(
+            download::DownloadOptions {
+                targets: vec![url],
+                force: false,
+                no_convert: false,
+                freeze: false,
+                remove: false,
+                mail: false,
+                user_agent: None,
+            },
+            &narou_rs::progress::console_sink(),
+        )
         .await;
         println!("{}", HR_TEXT);
     }

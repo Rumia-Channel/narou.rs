@@ -47,6 +47,7 @@ use self::util::{
     sanitize_filename_with_limit,
 };
 use crate::db::novel_record::NovelRecord;
+use crate::application::messages;
 use crate::error::{NarouError, Result};
 use crate::platform::{
     AssetStore, Clock, HttpClient, NovelMutation, NovelObjectKeys, NovelRepository, ObjectStore,
@@ -138,33 +139,37 @@ pub struct Downloader {
     cookies: Option<Arc<dyn CookieStore>>,
     settings: Arc<dyn DownloaderSettings>,
     progress: Option<Box<dyn ProgressReporter>>,
+    /// ユーザーに見える行の送り先。`None` は従来動作 (native は
+    /// `safe_println` / `safe_stderr_println`、Worker は tracing) に
+    /// フォールバックする。`set_message_sink` で差し替える。
+    message_sink: Option<Arc<dyn crate::application::messages::MessageSink>>,
     /// Results of URLs that `preprocess:` runs asked for. Lives for one novel
     /// download so repeated references (e.g. one illustration used by many
     /// sections of a series) resolve once.
     preprocess_jobs: super::downloader::preprocess::PreprocessJobs,
 }
 
-/// Report a status line. Native prints to stdout atomically; Worker routes to
-/// the trace log (no terminal on the platform).
+/// Fallback used when no message sink is installed (native: the original
+/// `safe_println`; Worker: the trace log — no terminal on the platform).
 #[cfg(feature = "native-runtime")]
-fn report_line(line: &str) {
+fn default_report_line(line: &str) {
     crate::progress::safe_println(line);
 }
 
 #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
-fn report_line(line: &str) {
+fn default_report_line(line: &str) {
     tracing::debug!("{line}");
 }
 
-/// Report a warning line. Native prints to stderr; Worker routes to the trace
-/// log.
+/// Fallback used when no message sink is installed (native: the original
+/// `safe_stderr_println`; Worker: the trace log).
 #[cfg(feature = "native-runtime")]
-fn report_warn(line: &str) {
+fn default_report_warn(line: &str) {
     crate::progress::safe_stderr_println(line);
 }
 
 #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
-fn report_warn(line: &str) {
+fn default_report_warn(line: &str) {
     tracing::warn!("{line}");
 }
 
@@ -737,6 +742,7 @@ impl Downloader {
             section_hash_cache_dirty: false,
             settings,
             progress: None,
+            message_sink: None,
             preprocess_jobs: super::downloader::preprocess::PreprocessJobs::new(),
         })
     }
@@ -888,10 +894,7 @@ impl Downloader {
                 return Ok(false);
             }
 
-            let mut message = format!(
-                "更新後の話数が保存されている話数より減少していることを検知しました。\nダイジェスト化されている可能性があるので、更新に関しての処理を選択して下さい。\n\n保存済み話数: {}\n更新後の話数: {}\n\n",
-                old_count, latest_count
-            );
+            let mut message = messages::download::digest_detected_prompt(old_count, latest_count);
 
             let mut auto_choices = crate::compat::load_digest_auto_choices();
 
@@ -911,11 +914,11 @@ impl Downloader {
                     }
                     crate::compat::DigestChoice::Backup => {
                         let backup_name = crate::compat::create_backup(novel_dir, title)?;
-                        println!("{} を作成しました", backup_name);
+                        self.report_line(&messages::download::backup_created(backup_name));
                     }
                     crate::compat::DigestChoice::ShowStory => {
-                        println!("あらすじ");
-                        println!("{}", latest_story);
+                        self.report_line(messages::download::story_label());
+                        self.report_line(latest_story);
                     }
                     crate::compat::DigestChoice::OpenBrowser => {
                         crate::compat::open_browser(toc_url);
@@ -1002,7 +1005,7 @@ impl Downloader {
                 let resolved = build_section_url(setting, toc_url, raw_url);
                 let url = resolved.as_str();
                 if self.http.validate_url(url).await.is_err() {
-                    report_warn(&format!("WARN: skipping unsafe illustration URL: {url}"));
+                    self.report_warn(&messages::download::warn_unsafe_illustration_url(url));
                     continue;
                 }
 
@@ -1034,9 +1037,9 @@ impl Downloader {
                             ) {
                                 Some(Ok(apng)) => (apng, "image/png".to_string()),
                                 Some(Err(err)) => {
-                                    report_warn(&format!(
-                                        "WARN: failed to assemble animation {url}: {err}"
-                                    ));
+                                    self.report_warn(
+                                        &messages::download::warn_animation_assemble(url, err),
+                                    );
                                     (response.body.clone(), content_type)
                                 }
                                 None => (response.body.clone(), content_type),
@@ -1052,15 +1055,15 @@ impl Downloader {
                             .store_bytes(object_keys, illustration_store, url, &body, ext)
                             .await
                         {
-                            report_warn(&format!(
-                                "WARN: failed to save illustration {url}: {err}"
-                            ));
+                            self.report_warn(
+                                &messages::download::warn_illustration_save(url, err),
+                            );
                         }
                     }
                     Err(err) => {
-                        report_warn(&format!(
-                            "WARN: failed to download illustration {url}: {err}"
-                        ));
+                        self.report_warn(
+                            &messages::download::warn_illustration_download(url, err),
+                        );
                     }
                 }
             }
@@ -1337,7 +1340,7 @@ impl Downloader {
             // 部分一覧は「欠けが消えた／話数が増えた」時点で打ち切る。
             let credentials = self.stored_credentials_for(login_host.as_deref()).await;
             if !credentials.is_empty() {
-                report_line("ログインが必要な可能性があります。保存済みのログイン情報で再試行します");
+                self.report_line(messages::download::login_retry());
                 let base_cookie = setting.cookie.clone();
                 let mut winner: Option<LoginCredential> = None;
                 for credential in &credentials {
@@ -1383,7 +1386,7 @@ impl Downloader {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
                 let id = existing_id.unwrap();
-                report_line("小説が削除されているか非公開な可能性があります");
+                self.report_line(messages::download::novel_unavailable());
                 #[cfg(feature = "native-runtime")]
                 {
                     let _ = crate::compat::mark_not_found_and_freeze(id);
@@ -1540,7 +1543,7 @@ impl Downloader {
         if partial_listing && login_cookie.is_none() {
             let credentials = self.stored_credentials_for(login_host.as_deref()).await;
             if !credentials.is_empty() {
-                report_line("ログインが必要な可能性があります。保存済みのログイン情報で再試行します");
+                self.report_line(messages::download::login_retry());
                 let base_cookie = setting.cookie.clone();
                 let mut winner: Option<LoginCredential> = None;
                 for credential in &credentials {
@@ -1806,8 +1809,8 @@ impl Downloader {
                 resumed.download_time
             } else if needs_download {
                 if !started_download {
-                    report_line(&colorize(
-                        &format!("ID:{display_id}　{title} のDL開始"),
+                    self.report_line(&colorize(
+                        &messages::download::download_started(display_id, &title),
                         "green",
                     ));
                     started_download = true;
@@ -1822,11 +1825,11 @@ impl Downloader {
                 }
 
                 if !subtitle.chapter.is_empty() && subtitle.chapter != last_chapter {
-                    report_line(&subtitle.chapter);
+                    self.report_line(&subtitle.chapter);
                     last_chapter = subtitle.chapter.clone();
                 }
                 if !subtitle.subchapter.is_empty() && subtitle.subchapter != last_subchapter {
-                    report_line(&subtitle.subchapter);
+                    self.report_line(&subtitle.subchapter);
                     last_subchapter = subtitle.subchapter.clone();
                 }
 
@@ -1942,7 +1945,7 @@ impl Downloader {
                         line.push_str(" (更新あり)");
                     }
                 }
-                report_line(&line);
+                self.report_line(&line);
                 if let Some(ref p) = self.progress {
                     p.inc(1);
                 }
@@ -2575,6 +2578,35 @@ impl Downloader {
 
     pub fn set_progress(&mut self, progress: Box<dyn ProgressReporter>) {
         self.progress = Some(progress);
+    }
+
+    /// ユーザーに見える行の送り先を差し替える。native のコマンドは
+    /// `progress::direct_console_sink()` (従来の `safe_println` と同一の
+    /// 出力先)、Worker のジョブ実行は PushHub へ `echo` する sink を渡す。
+    /// 未設定のときは cfg 別のフォールバックで従来動作を維持する。
+    pub fn set_message_sink(
+        &mut self,
+        sink: Arc<dyn crate::application::messages::MessageSink>,
+    ) {
+        self.message_sink = Some(sink);
+    }
+
+    /// `println!` (stdout 行) 相当の送出。
+    fn report_line(&self, line: &str) {
+        use crate::application::messages::Stream;
+        match &self.message_sink {
+            Some(sink) => sink.emit(Stream::Stdout, line),
+            None => default_report_line(line),
+        }
+    }
+
+    /// `eprintln!` (stderr 行) 相当の送出。
+    fn report_warn(&self, line: &str) {
+        use crate::application::messages::Stream;
+        match &self.message_sink {
+            Some(sink) => sink.emit(Stream::Stderr, line),
+            None => default_report_warn(line),
+        }
     }
 
     pub fn site_setting_matches_url(&self, url: &str) -> bool {

@@ -23,11 +23,17 @@ fn build_standard_regex(pattern: &str) -> std::result::Result<regex::Regex, rege
 
 fn fancy_regex_allowed(pattern: &str, source: &str, key: &str) -> bool {
     if pattern.len() > MAX_YAML_REGEX_PATTERN_LEN {
-        eprintln!("WARN: skipping fancy-regex for {key}: pattern is too large");
+        crate::application::messages::emit_default(
+            crate::application::messages::Stream::Stderr,
+            &crate::application::messages::download::warn_fancy_pattern_large(key),
+        );
         return false;
     }
     if source.len() > MAX_REGEX_INPUT_LEN {
-        eprintln!("WARN: skipping fancy-regex for {key}: input is too large");
+        crate::application::messages::emit_default(
+            crate::application::messages::Stream::Stderr,
+            &crate::application::messages::download::warn_fancy_input_large(key),
+        );
         return false;
     }
     true

@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use narou_rs::application::messages::{self, MessageSink, Stream};
 use narou_rs::mail::{
     MAIL_INTERRUPTED_MESSAGE, MailSettingLoadError, ensure_mail_setting_file, load_mail_setting,
     send_target_with_setting_interruptible,
@@ -13,41 +14,42 @@ pub struct MailOptions {
 
 static MAIL_INTERRUPT_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
-pub fn cmd_mail(opts: MailOptions) {
-    if let Err(code) = cmd_mail_inner(opts) {
+pub fn cmd_mail(opts: MailOptions, sink: &Arc<dyn MessageSink>) {
+    if let Err(code) = cmd_mail_inner(opts, sink.as_ref()) {
         std::process::exit(code);
     }
 }
 
-fn cmd_mail_inner(opts: MailOptions) -> Result<(), i32> {
+fn cmd_mail_inner(opts: MailOptions, sink: &dyn MessageSink) -> Result<(), i32> {
     if let Err(e) = narou_rs::db::init_database() {
-        eprintln!("Error initializing database: {}", e);
+        sink.emit(Stream::Stderr, &messages::init_db_error(e));
         return Err(1);
     }
 
-    let interrupted = mail_interrupt_flag()?;
+    let interrupted = mail_interrupt_flag(sink)?;
     interrupted.store(false, Ordering::SeqCst);
 
     let setting = match load_mail_setting() {
         Ok(setting) => setting,
         Err(MailSettingLoadError::NotFound(_)) => {
             let path = ensure_mail_setting_file().map_err(|e| {
-                eprintln!("Error: {}", e);
+                sink.emit(Stream::Stderr, &messages::error_line(e));
                 1
             })?;
-            println!("created {}", path.display());
-            println!(
-                "メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。"
+            sink.emit(Stream::Stdout, &messages::mail::mail_setting_created(&path));
+            sink.emit(Stream::Stdout, messages::mail::mail_setting_file_notice());
+            sink.emit(
+                Stream::Stdout,
+                messages::mail::mail_setting_next_update_notice(),
             );
-            println!("注意：次回以降のupdateで新着があった場合に送信可能フラグが立ちます");
             return Ok(());
         }
         Err(e @ MailSettingLoadError::Incomplete(_)) => {
-            eprintln!("{}", e);
+            sink.emit(Stream::Stderr, &e.to_string());
             return Err(127);
         }
         Err(e) => {
-            eprintln!("Error: {}", e);
+            sink.emit(Stream::Stderr, &messages::error_line(e));
             return Err(127);
         }
     };
@@ -68,10 +70,10 @@ fn cmd_mail_inner(opts: MailOptions) -> Result<(), i32> {
             Some(interrupted.as_ref()),
         ) {
             if e == MAIL_INTERRUPTED_MESSAGE {
-                println!("{}", e);
+                sink.emit(Stream::Stdout, &e);
                 return Err(126);
             }
-            eprintln!("{}", e);
+            sink.emit(Stream::Stderr, &e);
             return Err(127);
         }
     }
@@ -79,7 +81,7 @@ fn cmd_mail_inner(opts: MailOptions) -> Result<(), i32> {
     Ok(())
 }
 
-fn mail_interrupt_flag() -> Result<Arc<AtomicBool>, i32> {
+fn mail_interrupt_flag(sink: &dyn MessageSink) -> Result<Arc<AtomicBool>, i32> {
     if let Some(flag) = MAIL_INTERRUPT_FLAG.get() {
         return Ok(flag.clone());
     }
@@ -90,7 +92,7 @@ fn mail_interrupt_flag() -> Result<Arc<AtomicBool>, i32> {
         handler_flag.store(true, Ordering::SeqCst);
     })
     .map_err(|e| {
-        eprintln!("Error: {}", e);
+        sink.emit(Stream::Stderr, &messages::error_line(e));
         1
     })?;
 

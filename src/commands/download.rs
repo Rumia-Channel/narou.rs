@@ -1,6 +1,8 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
+use narou_rs::application::messages::{self, MessageSink, Stream};
 use narou_rs::compat::{configure_web_subprocess_command, convert_existing_novel};
 use narou_rs::downloader::{DownloadResult, Downloader, TargetType, UpdateStatus};
 use narou_rs::mail::{
@@ -24,34 +26,38 @@ pub struct DownloadOptions {
     pub user_agent: Option<String>,
 }
 
-pub async fn cmd_download(opts: DownloadOptions) -> i32 {
-    match cmd_download_inner(opts).await {
+pub async fn cmd_download(opts: DownloadOptions, sink: &Arc<dyn MessageSink>) -> i32 {
+    match cmd_download_inner(opts, sink).await {
         Ok(code) => code,
         Err(DownloadInterrupted) => {
-            println!("ダウンロードを中断しました");
+            sink.emit(Stream::Stdout, messages::download::download_interrupted());
             EXIT_INTERRUPT
         }
     }
 }
 
-async fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, DownloadInterrupted> {
+async fn cmd_download_inner(
+    opts: DownloadOptions,
+    sink: &Arc<dyn MessageSink>,
+) -> std::result::Result<i32, DownloadInterrupted> {
     if let Err(e) = narou_rs::db::init_database() {
-        eprintln!("Error initializing database: {}", e);
+        sink.emit(Stream::Stderr, &messages::init_db_error(e));
         return Ok(127);
     }
 
     let mut downloader = match Downloader::with_user_agent(opts.user_agent.as_deref()) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("Error creating downloader: {}", e);
+            sink.emit(Stream::Stderr, &messages::downloader_create_error(e));
             return Ok(127);
         }
     };
+    downloader.set_message_sink(narou_rs::progress::direct_console_sink());
 
     let mut targets = opts.targets.clone();
 
     if targets.is_empty() {
-        targets = interactive_mode(&downloader);
+        targets = interactive_mode(&downloader, sink);
         if targets.is_empty() {
             return Ok(0);
         }
@@ -62,13 +68,14 @@ async fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, D
     let multi = CliProgress::multi();
     let multi_clone = multi.clone();
     let mut mistook = 0usize;
-    let (expanded_targets, series_mistook) = expand_series_targets(&mut downloader, &targets).await;
+    let (expanded_targets, series_mistook) =
+        expand_series_targets(&mut downloader, &targets, sink).await;
     targets = expanded_targets;
     mistook += series_mistook;
 
     for (i, target) in targets.iter().enumerate() {
         if i > 0 {
-            println!("{}", "\u{2015}".repeat(35));
+            sink.emit(Stream::Stdout, &messages::separator());
         }
 
         let mut download_target = target.clone();
@@ -77,32 +84,33 @@ async fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, D
 
             if is_novel_frozen(&download_target) {
                 if let Some(ref rec) = data {
-                    println!(
-                        "{} は凍結中です\nダウンロードを中止しました",
-                        rec.title
-                    );
+                    sink.emit(Stream::Stdout, &messages::download::frozen_abort(&rec.title));
                 }
                 mistook += 1;
                 break;
             }
 
             if !opts.force
-                && let Some(existing) = inspect_existing_download(&download_target) {
+                && let Some(existing) = inspect_existing_download(&download_target, sink) {
                     match existing {
                         ExistingDownloadState::Present(rec) => {
-                            println!(
-                                "{} はダウンロード済みです。\nID: {}\ntitle: {}",
-                                download_target, rec.id, rec.title
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::download::already_downloaded(
+                                    &download_target,
+                                    rec.id,
+                                    &rec.title,
+                                ),
                             );
                             mistook += 1;
                             break;
                         }
                         ExistingDownloadState::Missing { record, path } => {
-                            eprintln!(
-                                "{} が見つかりません。\n保存フォルダが消去されていたため、データベースのインデックスを削除しました。",
-                                path.display()
+                            sink.emit(
+                                Stream::Stderr,
+                                &messages::download::missing_dir_index_removed(&path),
                             );
-                            if confirm("再ダウンロードしますか", false, true) {
+                            if confirm(&messages::download::confirm_yes_no("再ダウンロードしますか"), false, true, sink) {
                                 download_target = record.toc_url;
                                 continue;
                             }
@@ -121,7 +129,7 @@ async fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, D
 
             match downloader.download_novel_with_force(&download_target, opts.force).await {
                 Ok(dl) => {
-                    print_download_status(&dl);
+                    print_download_status(&dl, sink);
 
                     match dl.status {
                         UpdateStatus::Ok => {}
@@ -132,19 +140,19 @@ async fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, D
                     }
 
                     if opts.no_convert {
-                        after_process(&download_target, &opts);
+                        after_process(&download_target, &opts, sink);
                     } else {
                         if let Err(e) = auto_convert(&dl) {
-                            println!("  Convert error: {}", e);
+                            sink.emit(Stream::Stdout, &messages::download::convert_error_line(e));
                         }
-                        after_process(&download_target, &opts);
+                        after_process(&download_target, &opts, sink);
                     }
                 }
                 Err(e) => {
                     if matches!(e, narou_rs::error::NarouError::SuspendDownload(_)) {
                         return Err(DownloadInterrupted);
                     }
-                    println!("  Error: {}", e);
+                    sink.emit(Stream::Stdout, &messages::indented_error(e));
                     mistook += 1;
                 }
             }
@@ -161,18 +169,25 @@ async fn cmd_download_inner(opts: DownloadOptions) -> std::result::Result<i32, D
     })
 }
 
-async fn expand_series_targets(downloader: &mut Downloader, targets: &[String]) -> (Vec<String>, usize) {
+async fn expand_series_targets(
+    downloader: &mut Downloader,
+    targets: &[String],
+    sink: &Arc<dyn MessageSink>,
+) -> (Vec<String>, usize) {
     let mut expanded = Vec::new();
     let mut mistook = 0usize;
     for target in targets {
         match downloader.expand_series_target(target).await {
             Ok(Some(items)) => {
-                println!("{} を {} 件の小説URLに展開しました", target, items.len());
+                sink.emit(
+                    Stream::Stdout,
+                    &messages::download::series_expanded(target, items.len()),
+                );
                 expanded.extend(items);
             }
             Ok(None) => expanded.push(target.clone()),
             Err(err) => {
-                println!("  Error: {}", err);
+                sink.emit(Stream::Stdout, &messages::indented_error(err));
                 mistook += 1;
             }
         }
@@ -180,23 +195,18 @@ async fn expand_series_targets(downloader: &mut Downloader, targets: &[String]) 
     (expanded, mistook)
 }
 
-fn interactive_mode(downloader: &Downloader) -> Vec<String> {
+fn interactive_mode(downloader: &Downloader, sink: &Arc<dyn MessageSink>) -> Vec<String> {
     if !std::io::stdin().is_terminal() {
         return Vec::new();
     }
 
-    println!("【対話モード】");
-    println!("ダウンロードしたい小説のNコードもしくはURLを入力して下さい。(1行に1つ)");
-    println!("連続して複数の小説を入力していきます。");
-    println!(
-        "対応サイトは小説家になろう(小説を読もう)、ノクターンノベルズ、ムーンライトノベルズ、Arcadia、ハーメルン、暁、カクヨムです。"
-    );
-    println!("入力を終了してダウンロードを開始するには未入力のままエンターを押して下さい。");
-    println!();
+    for line in messages::download::interactive_banner() {
+        sink.emit(Stream::Stdout, line);
+    }
 
     let mut targets = Vec::new();
     let stdin = io::stdin();
-    print_prompt(targets.len());
+    print_prompt(targets.len(), sink);
 
     loop {
         let mut input = String::new();
@@ -210,21 +220,21 @@ fn interactive_mode(downloader: &Downloader) -> Vec<String> {
 
         if valid_target(downloader, input) {
             if targets.contains(&input.to_string()) {
-                println!("入力済みです");
+                sink.emit(Stream::Stdout, messages::download::already_entered());
             } else {
                 targets.push(input.to_string());
             }
         } else {
-            println!("対応外の小説です");
+            sink.emit(Stream::Stdout, messages::download::unsupported_novel());
         }
-        print_prompt(targets.len());
+        print_prompt(targets.len(), sink);
     }
 
     targets
 }
 
-fn print_prompt(count: usize) {
-    print!("{}件をダウンロードしますか？ [Y/n]> ", count);
+fn print_prompt(count: usize, sink: &Arc<dyn MessageSink>) {
+    sink.emit_fragment(Stream::Stdout, &messages::download::interactive_prompt(count));
     let _ = io::stdout().flush();
 }
 
@@ -400,7 +410,7 @@ fn resolve_toc_url_from_url(target: &str) -> Option<String> {
     None
 }
 
-fn inspect_existing_download(target: &str) -> Option<ExistingDownloadState> {
+fn inspect_existing_download(target: &str, sink: &Arc<dyn MessageSink>) -> Option<ExistingDownloadState> {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     let record = get_record_for_target(target)?;
     let info = RecordInfo {
@@ -419,7 +429,7 @@ fn inspect_existing_download(target: &str) -> Option<ExistingDownloadState> {
     if let Err(err) = novels
         .apply_batch_sync(vec![narou_rs::platform::NovelMutation::Remove(record.id.into())])
     {
-        eprintln!("Warning: stale database index cleanup failed: {}", err);
+        sink.emit(Stream::Stderr, &messages::download::stale_index_cleanup_warn(err));
     }
 
     Some(ExistingDownloadState::Missing {
@@ -445,13 +455,13 @@ fn get_record_for_target(target: &str) -> Option<narou_rs::db::NovelRecord> {
     }
 }
 
-fn confirm(message: &str, default: bool, nontty_default: bool) -> bool {
+fn confirm(prompt: &str, default: bool, nontty_default: bool, sink: &Arc<dyn MessageSink>) -> bool {
     if !std::io::stdin().is_terminal() {
         return nontty_default;
     }
 
     loop {
-        print!("{} (y/n)?: ", message);
+        sink.emit_fragment(Stream::Stdout, prompt);
         let _ = io::stdout().flush();
         let mut input = String::new();
         if io::stdin().read_line(&mut input).unwrap_or(0) == 0 {
@@ -481,82 +491,79 @@ fn is_novel_frozen(target: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn print_download_status(dl: &narou_rs::downloader::DownloadResult) {
+fn print_download_status(dl: &narou_rs::downloader::DownloadResult, sink: &Arc<dyn MessageSink>) {
     match dl.status {
         UpdateStatus::Ok => {
             if dl.new_novel {
-                println!(
-                    "{} のDL完了 (ID:{}, {}セクション)",
-                    dl.title, dl.id, dl.total_count
+                sink.emit(
+                    Stream::Stdout,
+                    &messages::dl_completed_new(&dl.title, dl.id, dl.total_count),
                 );
             } else if dl.updated_count > 0 {
-                println!(
-                    "{} の更新完了 (ID:{}, {}/{}話更新)",
-                    dl.title, dl.id, dl.updated_count, dl.total_count
+                sink.emit(
+                    Stream::Stdout,
+                    &messages::download::update_completed(
+                        &dl.title,
+                        dl.id,
+                        dl.updated_count,
+                        dl.total_count,
+                    ),
                 );
             } else if dl.title_changed {
-                println!(
-                    "ID:{} {} のタイトルが更新されています",
-                    dl.id, dl.title
-                );
+                sink.emit(Stream::Stdout, &messages::download::title_changed(dl.id, &dl.title));
             } else if dl.story_changed {
-                println!(
-                    "ID:{} {} のあらすじが更新されています",
-                    dl.id, dl.title
-                );
+                sink.emit(Stream::Stdout, &messages::download::story_changed(dl.id, &dl.title));
             } else if dl.author_changed {
-                println!(
-                    "ID:{} {} の作者名が更新されています",
-                    dl.id, dl.title
-                );
+                sink.emit(Stream::Stdout, &messages::download::author_changed(dl.id, &dl.title));
             }
         }
         UpdateStatus::None => {
-            println!("{} に更新はありません", dl.title);
+            sink.emit(Stream::Stdout, &messages::no_update(&dl.title));
         }
         UpdateStatus::Canceled => {
-            println!(
-                "ID:{} {} の更新はキャンセルされました",
-                dl.id, dl.title
+            sink.emit(
+                Stream::Stdout,
+                &messages::download::update_canceled(dl.id, &dl.title),
             );
         }
         UpdateStatus::Failed => {}
     }
 }
 
-fn after_process(target: &str, opts: &DownloadOptions) {
+fn after_process(target: &str, opts: &DownloadOptions, sink: &Arc<dyn MessageSink>) {
     if opts.mail {
         match load_mail_setting() {
             Ok(setting) => {
                 if let Err(e) = send_target_with_setting(&setting, target, false, true) {
-                    eprintln!("{}", e);
+                    sink.emit(Stream::Stderr, &e);
                 }
             }
             Err(MailSettingLoadError::NotFound(_)) => {
                 if let Ok(path) = ensure_mail_setting_file() {
-                    println!("created {}", path.display());
-                    println!("メールの設定用ファイルを作成しました。設定ファイルを書き換えることで mail コマンドが有効になります。");
-                    println!(
-                        "注意：次回以降のupdateで新着があった場合に送信可能フラグが立ちます",
+                    sink.emit(Stream::Stdout, &messages::mail::mail_setting_created(&path));
+                    sink.emit(Stream::Stdout, messages::mail::mail_setting_file_notice());
+                    sink.emit(
+                        Stream::Stdout,
+                        messages::mail::mail_setting_next_update_notice(),
                     );
                 }
             }
             Err(MailSettingLoadError::Incomplete(path)) => {
-                eprintln!(
-                    "設定ファイルの書き換えが終了していないようです。\n設定ファイルは {} にあります",
-                    path.display()
+                sink.emit(
+                    Stream::Stderr,
+                    &messages::mail::mail_setting_incomplete(&path),
                 );
             }
             Err(e) => {
-                eprintln!("Error: {}", e);
+                sink.emit(Stream::Stderr, &messages::error_line(e));
             }
         }
     }
     if opts.freeze {
-        println!("凍結: {}", target);
+        sink.emit(Stream::Stdout, &messages::download::freeze_target(target));
         super::manage::freeze_by_target(target);
     } else if opts.remove {
-        println!("削除: {}", target);
+        sink.emit(Stream::Stdout, &messages::download::remove_target(target));
         super::manage::remove_by_target(target);
     }
 }
@@ -591,11 +598,11 @@ fn auto_convert_via_web_subprocess(id: i64) -> Result<(), String> {
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "convert stdout を取得できません".to_string())?;
+        .ok_or_else(|| messages::download::convert_stdout_unavailable().to_string())?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "convert stderr を取得できません".to_string())?;
+        .ok_or_else(|| messages::download::convert_stderr_unavailable().to_string())?;
 
     let stdout_thread =
         std::thread::spawn(move || narou_rs::compat::relay_web_stream_to_console(stdout, "stdout2"));
@@ -605,17 +612,17 @@ fn auto_convert_via_web_subprocess(id: i64) -> Result<(), String> {
     let status = child.wait().map_err(|e| e.to_string())?;
     stdout_thread
         .join()
-        .map_err(|_| "convert stdout relay thread が panic しました".to_string())??;
+        .map_err(|_| messages::download::convert_stdout_relay_panicked().to_string())??;
     stderr_thread
         .join()
-        .map_err(|_| "convert stderr relay thread が panic しました".to_string())??;
+        .map_err(|_| messages::download::convert_stderr_relay_panicked().to_string())??;
 
     if status.success() {
         Ok(())
     } else {
         Err(match status.code() {
-            Some(code) => format!("convert が終了コード {} で失敗しました", code),
-            None => "convert が異常終了しました".to_string(),
+            Some(code) => messages::download::convert_exit_code_failed(code),
+            None => messages::download::convert_abnormal_exit().to_string(),
         })
     }
 }

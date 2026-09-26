@@ -28,6 +28,8 @@ use worker::{console_log, Env, Message, MessageBatch, MessageExt, QueueRetryOpti
 
 use crate::composition::WorkerRuntime;
 use crate::executor::{execute_job, JobOutcome};
+use narou_rs::application::messages;
+
 use crate::push_hub::{
     broadcast_terminal_events, echo, event, notification_queue, PushHubClient,
 };
@@ -365,7 +367,15 @@ async fn broadcast_failure(
     broadcast_terminal_events(
         push,
         job_id,
-        &[echo(first_non_empty_line(reason), "stdout"), event("queue_failed", data)],
+        &[
+            // native は CLI の stdout をそのまま流すので、失敗行は
+            // `  Error: …` の形で出る (messages::error_line と同じ書式)。
+            echo(
+                &messages::error_line(first_non_empty_line(reason)),
+                "stdout",
+            ),
+            event("queue_failed", data),
+        ],
     )
     .await;
 }

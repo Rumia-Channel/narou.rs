@@ -3,14 +3,15 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use encoding_rs::{Encoding, UTF_8};
+use narou_rs::application::messages::{self, MessageSink, Stream};
 use narou_rs::converter::NovelConverter;
 use narou_rs::converter::settings::NovelSettings;
 use narou_rs::converter::user_converter::UserConverter;
 use narou_rs::db::inventory::Inventory;
 use narou_rs::progress::{CliProgress, WebProgress, is_web_mode};
-use narou_rs::termcolor::bold_colored;
 use regex::Regex;
 use zip::write::SimpleFileOptions;
+use narou_rs::termcolor::bold_colored;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use super::resolve_target_to_id;
@@ -29,9 +30,10 @@ pub fn cmd_convert(
     verbose: bool,
     ignore_default: bool,
     ignore_force: bool,
+    sink: &dyn MessageSink,
 ) {
     if let Err(e) = narou_rs::db::init_database() {
-        eprintln!("Error initializing database: {}", e);
+        sink.emit(Stream::Stderr, &messages::init_db_error(e));
         std::process::exit(1);
     }
 
@@ -40,14 +42,14 @@ pub fn cmd_convert(
     let mut first_output_dir = None;
     let output_parts = output.map(split_output_name);
     let _ = no_strip;
-    let selected_devices = match resolve_selected_devices(make_zip) {
+    let selected_devices = match resolve_selected_devices(make_zip, sink) {
         Ok(devices) => devices,
         Err(()) => return,
     };
     let encoding = match normalize_text_file_encoding_name(encoding) {
         Ok(encoding) => encoding,
         Err(message) => {
-            println!("{}", message);
+            sink.emit(Stream::Stdout, message);
             return;
         }
     };
@@ -61,18 +63,24 @@ pub fn cmd_convert(
                 && matches!(output_device, Some(narou_rs::converter::device::Device::Ibunko));
 
         if let Some(device) = selected_device {
-            println!("{}", bold_colored(&format!(">> {}用に変換します", device.display_name()), "magenta"));
+            sink.emit(
+                Stream::Stdout,
+                &bold_colored(&messages::convert::converting_for(device.display_name()), "magenta"),
+            );
         }
 
         let total_count = targets.len();
         let mut completed_count = 0usize;
-        println!("変換処理開始: {}件の小説を処理します", total_count);
+        sink.emit(Stream::Stdout, &messages::convert::convert_started(total_count));
 
         for (index, target) in targets.iter().enumerate() {
             if index > 0 {
-                println!("{}", "\u{2015}".repeat(35));
+                sink.emit(Stream::Stdout, &messages::separator());
             }
-            println!("[{}/{}] 処理中: {}", index + 1, total_count, target);
+            sink.emit(
+                Stream::Stdout,
+                &messages::convert::processing(index + 1, total_count, target),
+            );
             let output_filename = output_parts.as_ref().map(|(basename, ext)| {
                 build_output_filename(
                     basename,
@@ -102,25 +110,26 @@ pub fn cmd_convert(
                     no_strip,
                     verbose,
                     &mut first_output_dir,
+                    sink,
                 );
                 continue;
             }
 
             let Some(id) = resolve_target_to_id(target) else {
-                println!("{} は存在しません", target);
+                sink.emit(Stream::Stdout, &messages::target_missing(target));
                 continue;
             };
 
             let dc_subjects = match load_dc_subjects_for_novel(id) {
                 Ok(subjects) => subjects,
                 Err(err) => {
-                    println!("{}", err);
+                    sink.emit(Stream::Stdout, &err);
                     None
                 }
             };
 
             if let Err(err) = narou_rs::title::sync_title_projection(id) {
-                println!("  Error: {}", err);
+                sink.emit(Stream::Stdout, &messages::indented_error(err));
                 continue;
             }
 
@@ -128,7 +137,7 @@ pub fn cmd_convert(
             let record = match novels.get_sync(id.into()) {
                 Ok(Some(record)) => record,
                 _ => {
-                    println!("  Error: ID: {} は存在しません", id);
+                    sink.emit(Stream::Stdout, &messages::convert::id_missing(id));
                     continue;
                 }
             };
@@ -171,7 +180,7 @@ pub fn cmd_convert(
             let _lock = match narou_rs::compat::NovelLockGuard::acquire(Some(id)) {
                 Ok(lock) => lock,
                 Err(e) => {
-                    println!("  Error: {}", e);
+                    sink.emit(Stream::Stdout, &messages::indented_error(e));
                     continue;
                 }
             };
@@ -195,26 +204,36 @@ pub fn cmd_convert(
                                 apply_dc_subjects_if_needed(
                                     &epub_path,
                                     dc_subjects.as_deref(),
+                                    sink,
                                 );
                                 if let Some(fname) = epub_path.file_name().and_then(|n| n.to_str()) {
-                                    println!("{} を出力しました", fname);
+                                    sink.emit(Stream::Stdout, &messages::convert::output_written(fname));
                                 }
-                                println!("{}", bold_colored("EPUBファイルを出力しました", "green"));
+                                sink.emit(
+                                    Stream::Stdout,
+                                    &bold_colored(messages::convert::epub_written(), "green"),
+                                );
                             }
                             Ok(None) => {}
                             Err(err) => {
-                                println!("{}", err);
+                                sink.emit(Stream::Stdout, &err);
                             }
                         }
                     }
                     let output_lower = output_path.to_ascii_lowercase();
                     if let Some(fname) = Path::new(&output_path).file_name().and_then(|n| n.to_str()) {
-                        println!("{} を出力しました", fname);
+                        sink.emit(Stream::Stdout, &messages::convert::output_written(fname));
                     }
                     if output_lower.ends_with(".mobi") || output_lower.ends_with(".azw3") {
-                        println!("{}", bold_colored("MOBIファイルを出力しました", "green"));
+                        sink.emit(
+                            Stream::Stdout,
+                            &bold_colored(messages::convert::mobi_written(), "green"),
+                        );
                     } else if output_lower.ends_with(".epub") || output_lower.ends_with(".kepub.epub") {
-                        println!("{}", bold_colored("EPUBファイルを出力しました", "green"));
+                        sink.emit(
+                            Stream::Stdout,
+                            &bold_colored(messages::convert::epub_written(), "green"),
+                        );
                     }
                     if first_output_dir.is_none() {
                         first_output_dir = std::path::Path::new(&output_path)
@@ -222,41 +241,44 @@ pub fn cmd_convert(
                             .map(|path| path.to_path_buf());
                     }
                     if let Err(err) =
-                        print_copy_to_result(&output_path, copy_device, id)
+                        print_copy_to_result(&output_path, copy_device, id, sink)
                     {
-                        println!("{}", err);
+                        sink.emit(Stream::Stdout, &err);
                     }
                     if output_path.to_ascii_lowercase().ends_with(".zip")
-                        && let Err(err) = print_copy_zip_to_result(&output_path) {
-                            println!("{}", err);
+                        && let Err(err) = print_copy_zip_to_result(&output_path, sink) {
+                            sink.emit(Stream::Stdout, &err);
                         }
                     if let Some(device) = copy_device
                         && let Err(err) =
                             print_send_result(&output_path, device)
                         {
-                            println!("{}", err);
+                            sink.emit(Stream::Stdout, &err);
                         }
                     apply_dc_subjects_if_needed(
                         Path::new(&output_path),
                         dc_subjects.as_deref(),
+                        sink,
                     );
-                    if let Some(inspection) = converter.take_inspection_output() {
-                        for line in inspection.split('\n') {
-                            println!("{}", line);
-                        }
-                    }
+                    print_inspection_output(&mut converter, sink);
                     completed_count += 1;
-                    println!("[{}/{}] 完了: {}", index + 1, total_count, target);
+                    sink.emit(
+                        Stream::Stdout,
+                        &messages::convert::completed(index + 1, total_count, target),
+                    );
                 }
                 Err(e) => {
-                    println!("[{}/{}] エラー: {} - {}", index + 1, total_count, target, e);
+                    sink.emit(
+                        Stream::Stdout,
+                        &messages::convert::item_error(index + 1, total_count, target, e),
+                    );
                 }
             }
         }
 
-        println!(
-            "変換処理完了: {}/{}件が正常に変換されました",
-            completed_count, total_count
+        sink.emit(
+            Stream::Stdout,
+            &messages::convert::convert_finished(completed_count, total_count),
         );
     }
 
@@ -283,12 +305,13 @@ fn convert_text_target(
     no_strip: bool,
     verbose: bool,
     first_output_dir: &mut Option<PathBuf>,
+    sink: &dyn MessageSink,
 ) {
     let text = match read_text_file(target_path, encoding) {
         Ok(text) => text,
         Err(message) => {
             for line in message.lines() {
-                println!("{}", line);
+                sink.emit(Stream::Stdout, line);
             }
             return;
         }
@@ -336,45 +359,54 @@ fn convert_text_target(
                 ) {
                     Ok(Some(epub_path)) => {
                         if let Some(fname) = epub_path.file_name().and_then(|n| n.to_str()) {
-                            println!("{} を出力しました", fname);
+                            sink.emit(Stream::Stdout, &messages::convert::output_written(fname));
                         }
-                        println!("{}", bold_colored("EPUBファイルを出力しました", "green"));
+                        sink.emit(
+                            Stream::Stdout,
+                            &bold_colored(messages::convert::epub_written(), "green"),
+                        );
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        println!("{}", err);
+                        sink.emit(Stream::Stdout, &err);
                     }
                 }
             }
             let output_lower = output_path.to_ascii_lowercase();
             if let Some(fname) = Path::new(&output_path).file_name().and_then(|n| n.to_str()) {
-                println!("{} を出力しました", fname);
+                        sink.emit(Stream::Stdout, &messages::convert::output_written(fname));
             }
             if output_lower.ends_with(".mobi") || output_lower.ends_with(".azw3") {
-                println!("{}", bold_colored("MOBIファイルを出力しました", "green"));
+                        sink.emit(
+                            Stream::Stdout,
+                            &bold_colored(messages::convert::mobi_written(), "green"),
+                        );
             } else if output_lower.ends_with(".epub") || output_lower.ends_with(".kepub.epub") {
-                println!("{}", bold_colored("EPUBファイルを出力しました", "green"));
+                        sink.emit(
+                            Stream::Stdout,
+                            &bold_colored(messages::convert::epub_written(), "green"),
+                        );
             }
             if first_output_dir.is_none() {
                 *first_output_dir = Path::new(&output_path)
                     .parent()
                     .map(|path| path.to_path_buf());
             }
-            if let Err(err) = print_copy_to_result(&output_path, copy_device, 0) {
-                println!("{}", err);
+            if let Err(err) = print_copy_to_result(&output_path, copy_device, 0, sink) {
+                sink.emit(Stream::Stdout, &err);
             }
             if output_path.to_ascii_lowercase().ends_with(".zip")
-                && let Err(err) = print_copy_zip_to_result(&output_path) {
-                    println!("{}", err);
+                && let Err(err) = print_copy_zip_to_result(&output_path, sink) {
+                    sink.emit(Stream::Stdout, &err);
                 }
             if let Some(device) = copy_device
                 && let Err(err) = print_send_result(&output_path, device) {
-                    println!("{}", err);
+                    sink.emit(Stream::Stdout, &err);
                 }
-            print_inspection_output(&mut converter);
+            print_inspection_output(&mut converter, sink);
         }
         Err(e) => {
-            println!("  Error: {}", e);
+            sink.emit(Stream::Stdout, &messages::indented_error(e));
         }
     }
 }
@@ -405,6 +437,7 @@ fn effective_convert_device(
 
 fn resolve_selected_devices(
     make_zip: bool,
+    sink: &dyn MessageSink,
 ) -> std::result::Result<Vec<Option<narou_rs::converter::device::Device>>, ()> {
     if make_zip {
         return Ok(vec![Some(narou_rs::converter::device::Device::Ibunko)]);
@@ -427,15 +460,15 @@ fn resolve_selected_devices(
         if let Some(device) = parsed {
             devices.push(Some(device));
         } else {
-            println!(
-                "[convert.multi-device] {} は有効な端末名ではありません",
-                name
+            sink.emit(
+                Stream::Stdout,
+                &messages::convert::invalid_device_name(name),
             );
         }
     }
 
     if devices.is_empty() {
-        println!("有効な端末名がひとつもありませんでした");
+        sink.emit(Stream::Stdout, messages::convert::no_valid_devices());
         return Err(());
     }
 
@@ -600,6 +633,7 @@ fn load_dc_subject_exclude_tags() -> std::result::Result<Vec<String>, String> {
 fn apply_dc_subjects_if_needed(
     output_path: &Path,
     subjects: Option<&[String]>,
+    sink: &dyn MessageSink,
 ) {
     let Some(subjects) = subjects else {
         return;
@@ -610,11 +644,11 @@ fn apply_dc_subjects_if_needed(
 
     match add_dc_subject_to_epub(output_path, subjects) {
         Ok(()) => {
-            println!("dc:subjectを追加しました: {}", subjects.join(", "));
+            sink.emit(Stream::Stdout, &messages::convert::dc_subject_added(subjects.join(", ")));
         }
         Err(err) => {
-            println!("dc:subject追加中にエラーが発生しました: {}", err);
-            println!("dc:subject埋め込み処理に失敗しましたが、変換を続行します");
+            sink.emit(Stream::Stdout, &messages::convert::dc_subject_error(err));
+            sink.emit(Stream::Stdout, messages::convert::dc_subject_continue());
         }
     }
 }
@@ -648,7 +682,7 @@ fn add_dc_subject_to_epub(
         .iter()
         .position(|(name, _)| name.ends_with("standard.opf"))
     else {
-        return Err("standard.opfファイルが見つかりませんでした".to_string());
+        return Err(messages::convert::opf_missing().to_string());
     };
 
     let mut content = String::from_utf8(entries[opf_index].1.clone()).map_err(|e| e.to_string())?;
@@ -665,7 +699,7 @@ fn add_dc_subject_to_epub(
     if !subject_lines.is_empty() {
         let metadata_re = Regex::new(r"(?s)(\s*)</metadata>").map_err(|e| e.to_string())?;
         if !metadata_re.is_match(&content) {
-            return Err("</metadata> が見つかりませんでした".to_string());
+            return Err(messages::convert::metadata_close_missing().to_string());
         }
         content = metadata_re
             .replace(&content, format!("\n{}\n$1</metadata>", subject_lines.join("\n")))
@@ -674,7 +708,7 @@ fn add_dc_subject_to_epub(
     entries[opf_index].1 = content.into_bytes();
 
     let Some(mimetype_index) = entries.iter().position(|(name, _)| name == "mimetype") else {
-        return Err("mimetypeファイルが見つかりません".to_string());
+        return Err(messages::convert::mimetype_missing().to_string());
     };
 
     let temp_path = epub_path.with_file_name(format!(
@@ -734,10 +768,10 @@ fn text_output_archive_path(target_path: &Path, output_filename: Option<&str>) -
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-fn print_inspection_output(converter: &mut NovelConverter) {
+fn print_inspection_output(converter: &mut NovelConverter, sink: &dyn MessageSink) {
     if let Some(inspection) = converter.take_inspection_output() {
         for line in inspection.split('\n') {
-            println!("{}", line);
+            sink.emit(Stream::Stdout, line);
         }
     }
 }
@@ -746,6 +780,7 @@ fn print_copy_to_result(
     output_path: &str,
     device: Option<narou_rs::converter::device::Device>,
     novel_id: i64,
+    sink: &dyn MessageSink,
 ) -> std::result::Result<(), String> {
     let Some(device) = device else {
         return Ok(());
@@ -753,7 +788,7 @@ fn print_copy_to_result(
     if let Some(path) =
         narou_rs::compat::copy_to_converted_file(Path::new(output_path), Some(device), novel_id)?
     {
-        println!("{} へコピーしました", path.display());
+        sink.emit(Stream::Stdout, &messages::copied_to(path.display()));
     }
     Ok(())
 }
@@ -767,6 +802,7 @@ fn print_send_result(
 
 fn print_copy_zip_to_result(
     output_path: &str,
+    sink: &dyn MessageSink,
 ) -> std::result::Result<(), String> {
     let Some(copy_to_dir) =
         narou_rs::compat::load_local_setting_string("convert.copy-zip-to")
@@ -775,18 +811,15 @@ fn print_copy_zip_to_result(
     };
     let base = PathBuf::from(&copy_to_dir);
     if !base.is_dir() {
-        return Err(format!(
-            "{} はフォルダではないかすでに削除されています。ZIPをコピー出来ませんでした",
-            copy_to_dir
-        ));
+        return Err(messages::convert::zip_copy_dest_not_dir(copy_to_dir));
     }
     let dst = base.join(
         Path::new(output_path)
             .file_name()
-            .ok_or_else(|| "Invalid ZIP filename".to_string())?,
+            .ok_or_else(|| messages::convert::invalid_zip_filename().to_string())?,
     );
     std::fs::copy(output_path, &dst).map_err(|e| e.to_string())?;
-    println!("{} へZIPをコピーしました", dst.display());
+    sink.emit(Stream::Stdout, &messages::convert::zip_copied_to(dst.display()));
     Ok(())
 }
 
@@ -824,9 +857,7 @@ fn normalize_text_file_encoding_name(
         return Ok(None);
     }
     if resolve_text_file_encoding(normalized).is_none() {
-        return Err(
-            "--enc で指定された文字コードは存在しません。sjis, eucjp, utf-8 等を指定して下さい",
-        );
+        return Err(messages::convert::enc_invalid());
     }
     if normalized.eq_ignore_ascii_case("utf8") {
         Ok(Some("utf-8".to_string()))
@@ -848,7 +879,7 @@ fn resolve_text_file_encoding(label: &str) -> Option<&'static Encoding> {
 }
 
 fn read_text_file(path: &Path, encoding: Option<&str>) -> std::result::Result<String, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("  Error: {}", e))?;
+    let bytes = std::fs::read(path).map_err(|e| messages::indented_error(e))?;
     let decoded = match encoding {
         Some(label) => decode_text_file_with_encoding(&bytes, label, path)?,
         None => decode_text_file_as_utf8(&bytes)?,
@@ -858,9 +889,8 @@ fn read_text_file(path: &Path, encoding: Option<&str>) -> std::result::Result<St
 
 fn decode_text_file_as_utf8(bytes: &[u8]) -> std::result::Result<String, String> {
     let bytes = strip_utf8_bom(bytes);
-    String::from_utf8(bytes.to_vec()).map_err(|_| {
-        "テキストファイルの文字コードがUTF-8ではありません。--enc オプションでテキストの文字コードを指定して下さい".to_string()
-    })
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| messages::convert::text_not_utf8().to_string())
 }
 
 fn decode_text_file_with_encoding(
@@ -868,28 +898,17 @@ fn decode_text_file_with_encoding(
     label: &str,
     path: &Path,
 ) -> std::result::Result<String, String> {
-    let encoding = resolve_text_file_encoding(label).ok_or_else(|| {
-        "--enc で指定された文字コードは存在しません。sjis, eucjp, utf-8 等を指定して下さい"
-            .to_string()
-    })?;
+    let encoding = resolve_text_file_encoding(label)
+        .ok_or_else(|| messages::convert::enc_invalid().to_string())?;
 
     if encoding == UTF_8 {
-        return String::from_utf8(strip_utf8_bom(bytes).to_vec()).map_err(|_| {
-            format!(
-                "{}:\nテキストファイルの文字コードは{}ではありませんでした。\n正しい文字コードを指定して下さい",
-                path.display(),
-                label
-            )
-        });
+        return String::from_utf8(strip_utf8_bom(bytes).to_vec())
+            .map_err(|_| messages::convert::encoding_mismatch(path.display(), label));
     }
 
     let (decoded, _, had_errors) = encoding.decode(bytes);
     if had_errors {
-        return Err(format!(
-            "{}:\nテキストファイルの文字コードは{}ではありませんでした。\n正しい文字コードを指定して下さい",
-            path.display(),
-            label
-        ));
+        return Err(messages::convert::encoding_mismatch(path.display(), label));
     }
     Ok(decoded.into_owned())
 }
@@ -905,6 +924,13 @@ mod tests {
         normalize_text_file_encoding_name, parse_device_name, parse_web_worker_device_name,
         print_copy_to_result, split_output_name,
     };
+
+    /// 出力を捨てるだけの sink (コピー処理の副作用だけを検証するテスト用)。
+    struct TestSink;
+
+    impl narou_rs::application::messages::MessageSink for TestSink {
+        fn emit(&self, _stream: narou_rs::application::messages::Stream, _text: &str) {}
+    }
 
     #[test]
     fn split_output_name_ignores_directory_part() {
@@ -989,7 +1015,7 @@ mod tests {
         let output = temp.path().join("novel.txt");
         std::fs::write(&output, "text").unwrap();
 
-        print_copy_to_result(output.to_str().unwrap(), None, 0).unwrap();
+        print_copy_to_result(output.to_str().unwrap(), None, 0, &TestSink).unwrap();
 
         assert!(!copy_to.join("novel.txt").exists());
     }
