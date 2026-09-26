@@ -122,6 +122,7 @@ jobs:
   #              SERVICE_DOMAIN (production 必須) / DEVELOP_DOMAIN (develop・任意。ドメインは
   #              公開ログに残さないため secrets 推奨) /
   #              NAROU_ADMIN_TOKEN (Zero Trust が境界なら不要) / NAROU_RS_LOGIN_KEY (任意) /
+  #              NAROU_S3_ACCESS_KEY_ID・NAROU_S3_SECRET_ACCESS_KEY (任意。S3 資格情報) /
   #              CF_ACCESS_CLIENT_ID・CF_ACCESS_CLIENT_SECRET (smoke 用・任意)
   #     vars:    NAROU_AUTH_REQUIRED (任意) / NAROU_WORKERS_DEV (任意) /
   #              NAROU_S3_ENDPOINT / NAROU_S3_REGION / NAROU_S3_BUCKET /
@@ -133,15 +134,6 @@ jobs:
   # target ごとに環境を分けずに同じ環境を共有している (SERVICE_DOMAIN と
   # DEVELOP_DOMAIN は名前が違うため衝突しない)。
   # D1・Queue は `ci/provision_resources.py` が target 名から導出して冪等に作る。
-  # D1・Queue は `ci/provision_resources.py` が環境名から導出して冪等に作る。
-  # 環境ごとのデプロイ。GitHub Environments (develop / production) に
-  # Cloudflare の資格情報と secret を置く:
-  #   secrets: CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN /
-  #            NAROU_ADMIN_TOKEN / NAROU_RS_LOGIN_KEY
-  #   vars:    NAROU_S3_ENDPOINT / NAROU_S3_REGION / NAROU_S3_BUCKET /
-  #            NAROU_S3_PREFIX (任意) / SERVICE_DOMAIN (production のみ) /
-  #            DEVELOP_DOMAIN (任意) / NAROU_AUTH_REQUIRED (任意, Zero Trust なら false)
-  # D1・Queue は `ci/provision_resources.py` が環境名から導出して冪等に作る。
   worker-deploy-develop:
     name: Deploy Worker (develop)
     if: >-
