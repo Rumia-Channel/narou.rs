@@ -540,6 +540,23 @@ Worker (worker_entry)
 **全アドレスが Cloudflare の公開レンジ内にあるサイト（例: ハーメルン）は `connect()` 自体が
 ランタイムに拒否される**ため、外部の踏み台（SORAHOST の `scripts/sorahost-proxy/` など）が別途必要。
 
+#### 3 段目: 外部リレー（SORAHOST）
+
+Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト（全アドレスが Cloudflare の
+公開レンジ内にあり、`connect()` 自体が拒否されるもの）のために、外部の取得リレーを 3 段目に持つ。
+
+- プロトコル: `src/platform/relay.rs`（`GET /proxy?url=..&headers=<base64 JSON>` と
+  `X-Proxy-Token`、応答は `{status, contentType, location, body(base64)}`）。純粋な
+  エンコード/デコードのみで、トランスポートは呼び出し側が持つ。
+- 送信は `worker_entry/src/http.rs` の `send_via_relay`。リレーは平文 http なので
+  `platform::http1` の `SocketTarget` + `connect()` で GET する（Worker の `fetch` は
+  `http://` を拒否するため）。サイト定義のヘッダはそのまま転送する。
+- 設定は Worker secret `SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY`。接続先は
+  パス込みで渡してよく、`RelayRequest` がオリジンに正規化する。未設定ならこの段は無効。
+- リレー本体は `scripts/sorahost-proxy/`（PteWorker のコンテナに curl が無いため、
+  CI が静的 curl と CA バンドルを同梱して配布する）。配布は `platform.yml` の
+  `relay-deploy` ジョブが行い、develop / production のデプロイはその後に直列で走る。
+
 ### 残っている重複（次の候補）
 
 | 対象 | 現状 | 方針 |
