@@ -12,7 +12,7 @@
 //   POST /proxy  { "url": "...", "headers": {...}, "redirect": "follow"|"manual" }
 //   → { "status": 200, "contentType": "...", "body": "<base64>" }
 //
-// 認証: X-Proxy-Token ヘッダが環境変数 PROXY_KEY と一致しない限り 403。
+// 認証: X-Proxy-Token ヘッダが環境変数 SORAHOST_KEY と一致しない限り 403。
 
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
 
@@ -31,8 +31,8 @@ export default {
       new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 
     const url = new URL(request.url);
-    const token = env?.PROXY_KEY ?? "";
-    if (!token) return json(500, { error: "PROXY_KEY is not set" });
+    const token = env?.SORAHOST_KEY ?? "";
+    if (!token) return json(500, { error: "SORAHOST_KEY is not set" });
     if (url.pathname === "/health") return json(200, { ok: true });
     if (url.pathname !== "/proxy") return json(404, { error: "not found" });
     if (request.headers.get("x-proxy-token") !== token) return json(403, { error: "forbidden" });
