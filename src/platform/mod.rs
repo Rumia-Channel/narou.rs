@@ -16,6 +16,9 @@
 pub mod clock;
 pub mod cookie_store;
 pub mod http;
+/// HTTP/1.1 wire codec for transports without an HTTP stack (the Worker's
+/// `connect()` socket fallback). Byte-oriented and platform-neutral.
+pub mod http1;
 pub mod mocks;
 pub mod object_store;
 pub mod progress;

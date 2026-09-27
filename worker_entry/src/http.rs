@@ -1,11 +1,24 @@
+use std::future::Future;
+use std::pin::pin;
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures::FutureExt;
+use futures::future::{self, Either};
+use narou_rs::downloader::http_policy::same_site_hosts;
+use narou_rs::downloader::security::{
+    CONNECT_TIMEOUT_SECS, MAX_REDIRECTS, READ_TIMEOUT_SECS, TOTAL_TIMEOUT_SECS,
+};
 use narou_rs::error::{NarouError, Result};
+use narou_rs::platform::http1::{Http1ResponseDecoder, SocketTarget, encode_request};
 use narou_rs::platform::{
     CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, PlatformFuture, RedirectMode,
 };
-use wasm_bindgen::JsValue;
-use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect};
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
+use worker::web_sys::{ReadableStreamDefaultReader, WritableStreamDefaultWriter};
+use worker::worker_sys;
+use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect, console_warn};
 
 use crate::budget::SubrequestBudget;
 
@@ -114,7 +127,45 @@ impl WorkerHttpClient {
         }
     }
 
-    async fn send_request(&self, request: HttpRequest) -> Result<HttpResponse> {
+    /// GET over a raw `connect()` socket, following the request's redirect
+    /// policy. Returns `Err` whenever the socket path cannot produce a
+    /// trustworthy response (connection refused by the runtime, timeout,
+    /// truncated body, malformed head) so the caller keeps the fetch result.
+    async fn send_via_socket(&self, request: &HttpRequest) -> Result<HttpResponse> {
+        let mut target = SocketTarget::parse(&request.url)?;
+        // RedirectMode::Follow は fetch 経路と揃えてソケット側でも辿る。
+        // native と同じく、サイトの外に出る hop では認証系ヘッダを落とす
+        // (fetch は Cookie を勝手に付けないので寄せる意味もある)。
+        let mut headers = request.headers.clone();
+        let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
+        for hop in 0..=MAX_REDIRECTS {
+            // `connect()` もサブリクエスト枠を消費するので fetch と同じく計上する。
+            self.subrequests.record();
+            let response = socket_exchange(&target, &headers, deadline_ms).await?;
+            if request.redirect != RedirectMode::Follow || !response.is_redirection() {
+                return Ok(response);
+            }
+            let Some(location) = response.header("Location").map(str::to_string) else {
+                return Ok(response);
+            };
+            let next = target.join(&location)?;
+            if !same_site_hosts(Some(&next.host), Some(&target.host)) {
+                headers.retain(|(name, _)| {
+                    !name.eq_ignore_ascii_case("cookie")
+                        && !name.eq_ignore_ascii_case("authorization")
+                });
+            }
+            if hop == MAX_REDIRECTS {
+                return Err(NarouError::Http(
+                    "redirect limit exceeded on socket transport".to_string(),
+                ));
+            }
+            target = next;
+        }
+        unreachable!("redirect loop returns within MAX_REDIRECTS")
+    }
+
+    async fn send_request(&self, request: &HttpRequest) -> Result<HttpResponse> {
         let method = match request.method {
             HttpMethod::Get => Method::Get,
             HttpMethod::Post => Method::Post,
@@ -144,11 +195,13 @@ impl WorkerHttpClient {
         init.with_method(method);
         init.with_redirect(redirect);
         init.with_headers(headers);
-        if let Some(body) = request.body {
+        if let Some(body) = request.body.as_deref() {
             if body.len() > MAX_WORKER_HTTP_BODY {
-                return Err(NarouError::Platform("Worker HTTP request body exceeds limit".to_string()));
+                return Err(NarouError::Platform(
+                    "Worker HTTP request body exceeds limit".to_string(),
+                ));
             }
-            init.with_body(Some(JsValue::from(js_sys::Uint8Array::from(body.as_slice()))));
+            init.with_body(Some(JsValue::from(js_sys::Uint8Array::from(body))));
         }
         let request = Request::new_with_init(&request.url, &init)
             .map_err(|error| NarouError::Platform(format!("invalid HTTP request: {error}")))?;
@@ -158,27 +211,34 @@ impl WorkerHttpClient {
             .await
             .map_err(|error| NarouError::Http(error.to_string()))?;
         let status = response.status_code();
-        let headers = response
-            .headers()
-            .entries()
-            .collect::<Vec<_>>();
+        let headers = response.headers().entries().collect::<Vec<_>>();
         if response
             .headers()
             .get("content-length")
-            .map_err(|error| NarouError::Platform(format!("invalid HTTP response headers: {error}")))?
+            .map_err(|error| {
+                NarouError::Platform(format!("invalid HTTP response headers: {error}"))
+            })?
             .and_then(|value| value.parse::<usize>().ok())
             .is_some_and(|size| size > MAX_WORKER_HTTP_BODY)
         {
-            return Err(NarouError::Platform("Worker HTTP response body exceeds limit".to_string()));
+            return Err(NarouError::Platform(
+                "Worker HTTP response body exceeds limit".to_string(),
+            ));
         }
         let body = response
             .bytes()
             .await
             .map_err(|error| NarouError::Http(error.to_string()))?;
         if body.len() > MAX_WORKER_HTTP_BODY {
-            return Err(NarouError::Platform("Worker HTTP response body exceeds limit".to_string()));
+            return Err(NarouError::Platform(
+                "Worker HTTP response body exceeds limit".to_string(),
+            ));
         }
-        Ok(HttpResponse { status, headers, body })
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
     }
 }
 
@@ -197,11 +257,229 @@ impl HttpClient for WorkerHttpClient {
         let url = request.url.clone();
         let sent_cookie = request.header("Cookie").map(str::to_string);
         Box::pin(async move {
-            let response = self.send_request(request).await?;
+            let fetch_response = self.send_request(&request).await?;
+            // fetch は Cloudflare 配下のサイトでエッジから 403 が返ることが
+            // ある (`cf-mitigated`)。`connect()` は fetch とは別の egress
+            // プレフィックスを使うため、403 のときだけ生ソケットで取り直す。
+            // GET のみ (encoder が GET しか組み立てない)。
+            let response = if fetch_response.status == 403 && request.method == HttpMethod::Get {
+                match self.send_via_socket(&request).await {
+                    // 通常の応答が取れたときだけ採用する。接続拒否・タイム
+                    // アウト・中途切断・ソケット側の 4xx/5xx は fetch の
+                    // 403 をそのまま返す (挙動を変えない)。
+                    Ok(socket_response)
+                        if socket_response.is_success() || socket_response.is_redirection() =>
+                    {
+                        socket_response
+                    }
+                    Ok(socket_response) => {
+                        console_warn!(
+                            "socket transport returned {}, keeping fetch 403",
+                            socket_response.status
+                        );
+                        fetch_response
+                    }
+                    Err(error) => {
+                        console_warn!("socket transport failed, keeping fetch 403: {error}");
+                        fetch_response
+                    }
+                }
+            } else {
+                fetch_response
+            };
             self.persist_set_cookie(&url, &response, sent_cookie.as_deref())
                 .await;
             Ok(response)
         })
+    }
+}
+
+/// A `connect()` TCP/TLS socket driven directly through its web streams.
+///
+/// `worker::Socket` implements tokio's AsyncRead/AsyncWrite, which this crate
+/// does not depend on, so the readable/writable streams are consumed
+/// manually. The writer is deliberately **never** closed: on Workers,
+/// closing the writable side first also tears down the readable side and the
+/// response arrives as zero bytes (measured, not documented).
+struct RawSocket {
+    inner: worker_sys::Socket,
+    writer: WritableStreamDefaultWriter,
+    reader: ReadableStreamDefaultReader,
+}
+
+/// Milliseconds remaining until `deadline_ms` (`Date.now()` clock), or an
+/// error once the total budget is spent.
+fn deadline_left(deadline_ms: f64, what: &str) -> Result<f64> {
+    let left = deadline_ms - js_sys::Date::now();
+    if left <= 0.0 {
+        return Err(NarouError::Http(format!("socket {what}: total timeout")));
+    }
+    Ok(left)
+}
+
+/// `fut` with a deadline, whichever fires first. The loser is dropped — for
+/// `read()`/`write()` that abandons the pending promise, which the socket's
+/// `close()` then settles.
+async fn with_timeout<T>(fut: impl Future<Output = Result<T>>, ms: f64, what: &str) -> Result<T> {
+    match future::select(
+        pin!(fut),
+        pin!(worker::Delay::from(Duration::from_millis(
+            ms.max(1.0) as u64
+        ))),
+    )
+    .await
+    {
+        Either::Left((result, _delay)) => result,
+        Either::Right(((), _pending)) => Err(NarouError::Http(format!("socket {what} timed out"))),
+    }
+}
+
+fn js_error(value: JsValue) -> NarouError {
+    NarouError::Http(match value.as_string() {
+        Some(message) => format!("socket I/O: {message}"),
+        None => format!("socket I/O: {value:?}"),
+    })
+}
+
+/// Open the socket: `connect()` returns synchronously, `opened()` resolves
+/// once TLS negotiation (when requested) and the TCP handshake complete.
+async fn connect_socket(target: &SocketTarget, deadline_ms: f64) -> Result<RawSocket> {
+    let address = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &address,
+        &JsValue::from_str("hostname"),
+        &JsValue::from_str(&target.host),
+    )
+    .map_err(js_error)?;
+    js_sys::Reflect::set(
+        &address,
+        &JsValue::from_str("port"),
+        &JsValue::from_f64(f64::from(target.port)),
+    )
+    .map_err(js_error)?;
+    let options = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &options,
+        &JsValue::from_str("secureTransport"),
+        &JsValue::from_str(if target.tls { "on" } else { "off" }),
+    )
+    .map_err(js_error)?;
+    // We never half-close; keep the flag explicit anyway.
+    js_sys::Reflect::set(
+        &options,
+        &JsValue::from_str("allowHalfOpen"),
+        &JsValue::TRUE,
+    )
+    .map_err(js_error)?;
+
+    let inner = worker_sys::connect(address.into(), options.into()).map_err(js_error)?;
+    let left = deadline_left(deadline_ms, "connect")?;
+    with_timeout(
+        JsFuture::from(inner.opened().map_err(js_error)?)
+            .map(|result| result.map(|_| ()).map_err(js_error)),
+        left.min(CONNECT_TIMEOUT_SECS as f64 * 1_000.0),
+        "connect",
+    )
+    .await?;
+
+    let readable = inner.readable().map_err(js_error)?;
+    let reader: ReadableStreamDefaultReader = readable
+        .get_reader()
+        .dyn_into()
+        .map_err(|value| NarouError::Http(format!("socket reader unavailable: {value:?}")))?;
+    let writable = inner.writable().map_err(js_error)?;
+    let writer = WritableStreamDefaultWriter::new(&writable).map_err(js_error)?;
+    Ok(RawSocket {
+        inner,
+        writer,
+        reader,
+    })
+}
+
+impl RawSocket {
+    /// One atomic write — request heads are a few hundred bytes, far below
+    /// the stream's internal queue, so a single `write()` suffices.
+    async fn write_all(&self, bytes: &[u8], deadline_ms: f64) -> Result<()> {
+        let left = deadline_left(deadline_ms, "write")?;
+        with_timeout(
+            JsFuture::from(
+                self.writer
+                    .write_with_chunk(&JsValue::from(js_sys::Uint8Array::from(bytes))),
+            )
+            .map(|result| result.map(|_| ()).map_err(js_error)),
+            left.min(READ_TIMEOUT_SECS as f64 * 1_000.0),
+            "write",
+        )
+        .await
+    }
+
+    /// Next chunk of response bytes; `None` at EOF.
+    async fn read_chunk(&mut self, deadline_ms: f64) -> Result<Option<Vec<u8>>> {
+        let left = deadline_left(deadline_ms, "read")?;
+        let value = with_timeout(
+            JsFuture::from(self.reader.read()).map(|result| result.map_err(js_error)),
+            left.min(READ_TIMEOUT_SECS as f64 * 1_000.0),
+            "read",
+        )
+        .await?;
+        let done = js_sys::Reflect::get(&value, &JsValue::from_str("done"))
+            .map_err(js_error)?
+            .is_truthy();
+        if done {
+            return Ok(None);
+        }
+        let chunk = js_sys::Reflect::get(&value, &JsValue::from_str("value"))
+            .map_err(js_error)?
+            .unchecked_into::<js_sys::Uint8Array>();
+        Ok(Some(chunk.to_vec()))
+    }
+
+    /// Release stream locks and close the socket. Best-effort: a stuck close
+    /// must not hang the request (the runtime reclaims the socket anyway).
+    async fn close(self) {
+        self.reader.release_lock();
+        self.writer.release_lock();
+        if let Ok(promise) = self.inner.close() {
+            let _ = with_timeout(
+                JsFuture::from(promise).map(|result| result.map(|_| ()).map_err(js_error)),
+                5_000.0,
+                "close",
+            )
+            .await;
+        }
+    }
+}
+
+/// One socket round-trip: connect → write request head → parse the response.
+async fn socket_exchange(
+    target: &SocketTarget,
+    headers: &[(String, String)],
+    deadline_ms: f64,
+) -> Result<HttpResponse> {
+    let mut socket = connect_socket(target, deadline_ms).await?;
+    let result = socket_roundtrip(&mut socket, target, headers, deadline_ms).await;
+    socket.close().await;
+    result
+}
+
+async fn socket_roundtrip(
+    socket: &mut RawSocket,
+    target: &SocketTarget,
+    headers: &[(String, String)],
+    deadline_ms: f64,
+) -> Result<HttpResponse> {
+    let request = encode_request(target, headers);
+    socket.write_all(&request, deadline_ms).await?;
+    let mut decoder = Http1ResponseDecoder::new(MAX_WORKER_HTTP_BODY);
+    loop {
+        match socket.read_chunk(deadline_ms).await? {
+            Some(chunk) => {
+                if decoder.feed(&chunk)? {
+                    return decoder.into_response();
+                }
+            }
+            None => return decoder.finish(),
+        }
     }
 }
 
