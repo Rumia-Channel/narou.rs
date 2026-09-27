@@ -10,9 +10,6 @@ pub struct IdPath {
     pub id: i64,
 }
 
-
-
-
 #[derive(Debug, Deserialize)]
 pub struct BatchIdsBody {
     pub ids: Vec<i64>,

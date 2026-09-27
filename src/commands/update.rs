@@ -243,6 +243,26 @@ pub async fn cmd_update(opts: UpdateOptions, sink: &Arc<dyn MessageSink>) {
         }
     }
 
+    // 追跡中の作者を確認し、新しく公開された作品を追加する (`narou author add`)。
+    // 小説の更新が終わった後に行うので、作者が公開したばかりの作品も同じ実行で入る。
+    let author_tracking = !load_local_setting_bool("update.disabled-author-tracking");
+    if author_tracking && narou_rs::author::authors_for_current_root().is_ok_and(|a| !a.is_empty()) {
+        if abort_if_interrupted(interrupted.as_ref()).is_err() {
+            println!("アップデートを中断しました");
+            std::process::exit(126);
+        }
+        match crate::commands::author::check_tracked_authors(opts.user_agent.as_deref(), false).await {
+            Ok(report) => {
+                report.print();
+                mistook += report.failed;
+            }
+            Err(e) => {
+                println!("作者の確認に失敗しました\n  {}", e);
+                mistook += 1;
+            }
+        }
+    }
+
     if mistook > 0 {
         sink.emit(Stream::Stdout, &messages::update::errors_occurred(mistook));
     }
@@ -1718,7 +1738,12 @@ async fn process_novel_for_update(
 
     let mut new_mistook = 0usize;
 
-    match downloader.download_novel(&id.to_string()).await {
+    // ダウンロード中はこの小説をロックする (別レーンの変換と同時に触らない)。
+    let download_result = {
+        let _lock = narou_rs::compat::NovelLockGuard::acquire(Some(id));
+        downloader.download_novel(&id.to_string()).await
+    };
+    match download_result {
         Ok(dl) => {
             print_status_messages(&dl, &ctx.sink);
 

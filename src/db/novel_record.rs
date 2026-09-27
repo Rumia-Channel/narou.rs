@@ -96,6 +96,34 @@ impl NovelRecord {
             serde_yaml::Value::String(raw_title.into()),
         );
     }
+
+    /// Page the novel was registered from, when it differs from `toc_url`.
+    ///
+    /// `toc_url` is what gets fetched and is not always the page a reader
+    /// knows: Pixiv keeps the API endpoint there, so the page the user typed
+    /// (`/novel/series/<id>`, `/works/<id>`) is remembered separately and shown
+    /// as the link in the Web UI.
+    pub const ORIGINAL_URL_KEY: &'static str = "original_url";
+
+    pub fn original_url(&self) -> Option<&str> {
+        self.extra_fields
+            .get(Self::ORIGINAL_URL_KEY)
+            .and_then(serde_yaml::Value::as_str)
+            .filter(|url| !url.is_empty())
+    }
+
+    pub fn set_original_url(&mut self, url: impl Into<String>) {
+        self.extra_fields.insert(
+            Self::ORIGINAL_URL_KEY.to_string(),
+            serde_yaml::Value::String(url.into()),
+        );
+    }
+
+    /// Link to show for this novel: the page it was registered from, falling
+    /// back to `toc_url`.
+    pub fn display_url(&self) -> &str {
+        self.original_url().unwrap_or(&self.toc_url)
+    }
 }
 
 fn deserialize_nilable_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>

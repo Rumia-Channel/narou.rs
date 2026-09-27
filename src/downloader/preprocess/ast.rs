@@ -126,6 +126,8 @@ pub enum Method {
     Field(String),
     /// `[...]` inside a chain.
     Bracket(BracketKey),
+    /// `keys` — the keys of an object, in JSON order.
+    Keys,
     IsArray,
     Empty,
     Size,

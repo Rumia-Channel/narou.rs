@@ -102,6 +102,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `backup` | ✅ | ✅ 完了 | `narou backup`/複数 target、`backup/` 除外、180バイト切り詰めまで対応 |
 | `clean` | ✅ | ✅ 完了 | `latest_convert` 既定値、`--all`、`--force`/`--dry-run`、freeze スキップ、`raw/*.txt|*.html` と `本文/*.yaml` の orphan 判定を実装 |
 | `illust` | — (Rust 拡張) | ✅ 完了 | `.illustration_cache.yaml` 運用のための `narou illust <sub>`。`orphan`/`migrate`/`fix-ext`/`rebuild` を実装し、削除/改名/移行はいずれも既定 dry-run (`-f` で実行) |
+| `author` | — (Rust 拡張) | ✅ 完了 | 追跡する作者を登録すると (`narou author add <作者ページURL>`)、`narou update` の後段で新しい作品を自動追加する。`add`/`list`/`remove`/`check`。作者ページの認識と作品一覧の取得はサイト定義 (`author_url` / `author_api_url` / `author_novel_pattern` / `author_work_url`) が担う。Pixiv は `preprocess:` の DSL が `author_novel::` / `author_series::` / `author_comic_series::` を emit し、シリーズに属する話/ページは `author_series_episodes_url` / `author_comic_series_pages_url` で除く (作品単位 = 単体小説 + 小説シリーズ + 漫画シリーズ + 単体イラスト・漫画)。`check --dry-run` は追加予定の URL だけを表示 |
 | `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`rename`/`order`/`clear` を実装。**サイトごとに複数の「名前つきログイン」を試行順つきで保持**し、1 ログインが複数ホストの Cookie を持つ (ブラウザのセッションがホストをまたぐため)。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET /api/login`、`POST /api/login/import\|rename\|order`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}` も対応 |
 | `db` | — (Rust 拡張) | ✅ 完了 | SQLite 管理 DB の保守。`verify` / `export-yaml [--out|--in-place]` / `vacuum`。既定は YAML 管理で、SQLite は Web UI 初回ツアーまたは `.narou/storage-backend` マーカーによる opt-in |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
@@ -252,6 +253,23 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 ---
 
+### 3.x `author` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
+
+作者ページを登録しておくと、`narou update` の後段で毎回その作者を確認し、**まだ管理していない作品**を通常のダウンロード経路で追加する。
+
+| サブコマンド | 内容 |
+|---|---|
+| `add <URL>` | 作者ページを登録。`author_url` に一致するサイト定義が必要 |
+| `list` | 登録済みの作者（サイト / ページ URL） |
+| `remove <URL\|番号>` | `list` の番号か URL で解除 |
+| `check` | いま全作者を確認して新規作品を追加（`update` と同じ処理） |
+
+**保存形式**: 小説とは別の inventory `author`（SQLite `app_state` / `.narou/author.yaml`）に、**作者ページ URL（ユニーク）→ サイト名** だけを持つ。名前や日時などの帳簿は持たない。
+
+**サイト定義**: `author_url`（作者ページを認識する正規表現）/ `author_api_url`（作品一覧の取得先の雛形。任意）/ `author_novel_pattern`（作品を抜く正規表現。`novel_url` か、`author_work_url` 用の capture）/ `author_work_url`（capture から作品 URL を作る雛形）/ `author_next_pattern`（ページ分けされた一覧の次ページ。ハーメルンで使用。終了は次ページが無いか訪問済みに戻ったとき）。
+
+---
+
 ### 3.y `login` — ✅ 完了 (narou.rs 独自, Ruby版対応外)
 ブラウザのある端末とダウンロード実行ホストが別であることを前提にしたログイン情報管理コマンド。取得側は別実行ファイル `narou_rs_login` が担当し、本コマンドは受け入れ・書き出し・一覧・登録・追加・並べ替え・削除を行う。
 
@@ -275,6 +293,8 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 **セッション ID**: 各ログインに UUID を振り（保存値に含める）、小説レコードは `requires_login` に加えて `login_session`（成功したログインの ID）を持つ。フラグ付きの小説は次回以降その ID のログインを最初のリクエストから送るため、一覧の総当たりをしない。ID の無い旧データはストア読み込み時に採番・保存される。
 
 **試行順の使われ方**: ダウンロード時、ログイン壁 (404 / `login_pattern`) か部分一覧 (`login_partial_pattern`) のときに保存済みを**順に試す**。ログイン壁は成功した時点で、部分一覧は「欠けが消えた／取得話数が増えた」時点で打ち切る。採用したログインはその後の本文取得にも使う。`Set-Cookie` の書き戻しは、その応答で実際に送ったログインだけを更新する (別アカウントのセッションを壊さない)。
+
+**データ管理方式 (YAML / SQLite)**: 設定ページの WEB UI タブに「データ管理方式」があり、現在のモード表示・SQLite 管理への移行・YAML 管理への復帰ができる。API は `GET/POST /api/storage/mode` (実装 `src/web/storage.rs`、`narou db export-yaml --in-place` と同じ書き出しを先に行う)。`NAROU_RS_LEGACY_YAML=1` のときは固定され、API は `locked_by_env: true` を返す。
 
 **書き出し形式**: `version`/`exported_at`/`library`/`encrypted`/`kdf`/`salt`/`payload`/`sites` を持つ YAML エンベロープ (version 3)。`narou_rs_login --export <file>` が生成し、ライブラリ外ではそれが既定の出力になる。version 2 (`credentials:` にホストごとの 1 本) と version 1 (`cookies:` のホスト→Cookie マップ) も読み取り可能。
 
@@ -337,7 +357,7 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 - Windows の `\\?\\C:\\...\\AozoraEpub3.jar` 形式パスは Java classpath にそのまま渡すと失敗するため、Ruby版同様に jar の basename を current_dir 基準で渡すよう修正した。`sample\\novel` で `device=epub` 実変換と `--no-epub` 抑止を確認済み
 - Windows で `〜` / `～` / `−` / `‼` / `⁇` / `⁈` / `⁉` / variation selector や CP932/Windows-31J 未定義文字 (`♠` / `♡` / `♢` / `♣` / `𠮷` など) を含み、Java/AozoraEpub3 側で出力名がずれやすい小説パスは、AozoraEpub3 に本文・表紙・`挿絵/` を安全な一時ファイル名で渡し、生成後に本来の Unicode ファイル名へ戻す。`C:\Users\rumia\Documents\Narou` の n5853lh で EPUB 生成を確認済み
 - AozoraEpub3-JDK21 (1.6.x) は出力ファイルが `-dst` の **実パス** 配下かを検査するため、`-dst` が junction / シンボリックリンク / 8.3 短縮名 を含む形だと、実際には同じ場所でも `java.io.IOException: 出力パスが許可されたディレクトリ外です` で失敗する (検査は出力ファイルが未生成の時点で字句的に正規化したパスと比較されるため)。narou は `-dst` と入力パスを実パスへ解決してから渡す (一時ワークスペース使用時・通常出力時とも)。一時ワークスペースが `%TEMP%` 配下にある場合も同じ理由で失敗していた
-- `lite` feature 有効時は、外部 AozoraEpub3 が見つからない場合に組み込み `epub_lite` エンジンへフォールバックする（外部ツール (jar / `AozoraEpub3_Lite.exe`) が見つかればそちらを優先する。narou.rb と同じ挙動）。`device=epub` / `kobo` / `reader` / `ibooks` / `mobi` の中間 EPUB 生成を外部ツールなしで行える。**Java 版と同じ資産と組み立て**: `aozoraepub3dir` があれば `chuki_*.txt` (narou カスタム注記込み)・`gaiji/*.ttf`・`AozoraEpub3.ini` を読み、無ければ同梱の `preset/AozoraEpub3.ini` と `preset/custom_chuki_tag.txt` で同じフラグを再現する（外字フォントだけは同梱できないので入らない）。Lite の公開パイプライン (`collect_assets` / `decorate_image_tags` / `reflow_image_sections` / `build_title_page_markup` / `append_gaiji_assets` / `build_metadata`) を CLI と同じ順で使う。挿絵は書き出し時に 1 枚ずつ読み、Java と同じ前処理 (余白除去・リサイズ・回転) をかける。実データ検証: `C:\Users\rumia\Documents\WebNovel` の n0421du (401セクション) で Java 版 `AozoraEpub3.jar` の出力と **422/423 ファイルがバイト完全一致**（`aozoraepub3dir` 未設定でも **419/423**）、挿絵入りでも **425/426 がバイト完全一致**。残差は `dcterms:modified` のみ (Java はローカル時刻に `Z`、Lite は UTC) 濁点フォント (`vertical_font_with_dakuten.css` + `DMincho.ttf`) は外部ツールと同じ内容を組み込みエンジンにも渡す。設定 `convert.epub-font` = `auto`(濁点注記のある小説だけ)/`always`(本文全体を DMincho、`U+3000` を描けない Reader 向け) で選ぶ。
+- `lite` feature 有効時は、外部 AozoraEpub3 が見つからない場合に組み込み `epub_lite` エンジンへフォールバックする (設定 `convert.epub-engine` = `auto`/`lite`/`external` で選ぶ。設定ページの「一般」タブからも切替可。1 回だけなら環境変数 `NAROU_RS_EPUB_ENGINE=lite`/`=external` で上書き)（外部ツール (jar / `AozoraEpub3_Lite.exe`) が見つかればそちらを優先する。narou.rb と同じ挙動）。`device=epub` / `kobo` / `reader` / `ibooks` / `mobi` の中間 EPUB 生成を外部ツールなしで行える。**Java 版と同じ資産と組み立て**: `aozoraepub3dir` があれば `chuki_*.txt` (narou カスタム注記込み)・`gaiji/*.ttf`・`AozoraEpub3.ini` を読み、無ければ同梱の `preset/AozoraEpub3.ini` と `preset/custom_chuki_tag.txt` で同じフラグを再現する（外字フォントだけは同梱できないので入らない）。Lite の公開パイプライン (`collect_assets` / `decorate_image_tags` / `reflow_image_sections` / `build_title_page_markup` / `append_gaiji_assets` / `build_metadata`) を CLI と同じ順で使う。挿絵は書き出し時に 1 枚ずつ読み、Java と同じ前処理 (余白除去・リサイズ・回転) をかける。実データ検証: `C:\Users\rumia\Documents\WebNovel` の n0421du (401セクション) で Java 版 `AozoraEpub3.jar` の出力と **422/423 ファイルがバイト完全一致**（`aozoraepub3dir` 未設定でも **419/423**）、挿絵入りでも **425/426 がバイト完全一致**。残差は `dcterms:modified` のみ (Java はローカル時刻に `Z`、Lite は UTC) 濁点フォント (`vertical_font_with_dakuten.css` + `DMincho.ttf`) は外部ツールと同じ内容を組み込みエンジンにも渡す。設定 `convert.epub-font` = `auto`(濁点注記のある小説だけ)/`always`(本文全体を DMincho、`U+3000` を描けない Reader 向け) で選ぶ。
 
 **注**: EPUB/MOBI 生成は AozoraEpub3 (Java 版 `AozoraEpub3.jar`、または Rust 製代替 [AozoraEpub3_Lite](https://github.com/Rumia-Channel/AozoraEpub3_Lite)) と kindlegen への依存がある。`aozoraepub3dir` 設定は jar を優先し、無ければ `AozoraEpub3_Lite.exe` / `AozoraEpub3.exe` バイナリを受理する (`canonicalize_aozoraepub3_tool_path`)。詳細は `docs/aozora_lite_evaluation_2026-08-23.md`。
 

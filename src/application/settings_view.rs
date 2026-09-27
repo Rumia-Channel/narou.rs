@@ -294,6 +294,11 @@ fn select_summaries_for_setting(name: &str, info: &VarInfo) -> Option<Vec<String
             "自動 (濁点注記のある小説だけ)".to_string(),
             "常に埋め込む".to_string(),
         ],
+        "convert.epub-engine" => vec![
+            "自動 (外部があれば外部)".to_string(),
+            "組み込み (AozoraEpub3_Lite)".to_string(),
+            "外部 AozoraEpub3".to_string(),
+        ],
         "self-update.variant" => vec![
             "GPL版（AozoraEpub3_Lite 組込み）".to_string(),
             "通常版（外部 AozoraEpub3）".to_string(),
