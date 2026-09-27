@@ -15,6 +15,9 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    # 接続先とデプロイトークンは GitHub の SORAHOST environment に置く
+    # (environment を宣言しないとそのシークレットは見えない)。
+    environment: SORAHOST
     steps:
       - uses: actions/checkout@v4
 
