@@ -25,7 +25,8 @@
 
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, copyFileSync, chmodSync } from "node:fs";
+import { tmpdir } from "node:os";
 
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.PROXY_TOKEN || "";
@@ -37,7 +38,22 @@ const CURL_TIMEOUT_SECS = 30;
 // (Pterodactyl のコンテナには curl / wget / python3 が入っていないため)
 const BUNDLED_CURL = "./curl";
 const BUNDLED_CACERT = "./cacert.pem";
-const CURL_BIN = existsSync(BUNDLED_CURL) ? BUNDLED_CURL : "curl";
+// デプロイ先は読み取り専用で実行ビットも落ちるため、書き込み可能な場所へ
+// コピーしてから実行権限を付ける。
+const prepareCurl = () => {
+  if (!existsSync(BUNDLED_CURL)) return "curl";
+  for (const candidate of [`${tmpdir()}/.narou-relay-curl`, "./.relay-curl"]) {
+    try {
+      copyFileSync(BUNDLED_CURL, candidate);
+      chmodSync(candidate, 0o755);
+      return candidate;
+    } catch {
+      /* 次の候補へ */
+    }
+  }
+  return "curl";
+};
+const CURL_BIN = prepareCurl();
 
 if (!TOKEN) {
   console.error("PROXY_TOKEN が未設定です。長いランダム文字列を設定してください。");
