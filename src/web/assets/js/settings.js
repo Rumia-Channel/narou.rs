@@ -56,12 +56,18 @@
         pane.innerHTML = renderReplaceTab();
       } else if (tab.id === 'login') {
         pane.innerHTML = renderLoginTab();
-        bindLoginPane(pane);
       } else {
         pane.innerHTML = renderSettingsPanel(tab);
       }
 
       container.appendChild(pane);
+
+      // ログインタブの初期化は DOM に挿入した後に行う。loadLoginHosts は
+      // document から #login-hosts を探すため、未挿入だと null で静かに戻り、
+      // 一覧が「読み込み中…」のままになる。
+      if (tab.id === 'login') {
+        bindLoginPane(pane);
+      }
     });
   }
 
