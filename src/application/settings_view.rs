@@ -299,6 +299,12 @@ fn select_summaries_for_setting(name: &str, info: &VarInfo) -> Option<Vec<String
             "組み込み (AozoraEpub3_Lite)".to_string(),
             "外部 AozoraEpub3".to_string(),
         ],
+        "convert.rotate-image" => vec![
+            "自動 (AozoraEpub3.ini の RotateImage に従う)".to_string(),
+            "回転しない".to_string(),
+            "右へ90° (RotateImage=1)".to_string(),
+            "左へ90° (RotateImage=2)".to_string(),
+        ],
         "self-update.variant" => vec![
             "GPL版（AozoraEpub3_Lite 組込み）".to_string(),
             "通常版（外部 AozoraEpub3）".to_string(),

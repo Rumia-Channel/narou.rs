@@ -33,6 +33,7 @@ use worker::*;
 use narou_rs::application::settings::SettingsStore;
 use narou_rs::application::{JobQueue as _JobQueueTrait, TagAction};
 use narou_rs::setting_core::SettingScope;
+use std::collections::HashMap;
 
 use crate::composition::{WorkerRuntime, check_ready};
 use crate::db_handle::DbHandle;
@@ -350,7 +351,14 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         Err(error) => return Response::error(&format!("Invalid key: {error}"), 500),
     };
 
-    let filename = match epub_download_filename(&env, services.objects.clone(), &record, &keys).await
+    let local_map = load_local_settings_map(&env).await;
+    let filename = match epub_download_filename(
+        services.objects.clone(),
+        &record,
+        &keys,
+        &local_map,
+    )
+    .await
     {
         Ok(name) => name,
         Err(error) => return Response::error(&format!("Naming error: {error}"), 500),
@@ -436,6 +444,13 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         // disk (`dakuten_font::lite_font_assets`), which this runtime has no
         // filesystem for; the Worker EPUB keeps the engine's own fonts.
         extra_assets: Vec::new(),
+        // `convert.rotate-image` (D1 ローカル設定)。未指定は INI 準拠
+        // (この経路は挿絵を回転しない)。指定時だけ Lite の INI へ
+        // `RotateImage` を上書きし、書き出し直前に寸法から回転角を決める。
+        rotate_image: local_map
+            .get("convert.rotate-image")
+            .and_then(setting_text)
+            .and_then(|value| narou_rs::converter::settings::ImageRotation::from_setting(&value)),
     };
     let source = std::sync::Arc::new(narou_rs::epub_lite::LazyImageSource::new(
         text,
@@ -534,6 +549,29 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         .from_stream(stream)
 }
 
+/// D1 のローカルスコープ設定を読む (fs が無いので `app_state` 経由)。
+async fn load_local_settings_map(env: &Env) -> HashMap<String, serde_yaml::Value> {
+    let Ok(db) = env.d1("DB") else {
+        return HashMap::new();
+    };
+    let handle = DbHandle::ui(std::sync::Arc::new(db));
+    D1SettingsStore::new(handle)
+        .load(SettingScope::Local)
+        .await
+        .unwrap_or_default()
+}
+
+/// 設定マップの値を文字列にする。文字列以外 (bool/数値) も文字列表現で返す
+/// (native の `compat::yaml_value_to_string` と同じ扱い)。
+fn setting_text(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 /// `download.epub` の Content-Disposition 名を native の保存済み EPUB と同じ
 /// 規則 (`converter::output` の変換出力名に `.epub` を付けたもの) で決める。
 ///
@@ -543,10 +581,10 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
 /// (`OutputNamingEnv::from_local_map`)。fs が無いので local 設定は D1 の
 /// `app_state` スコープ `local` から読む。
 async fn epub_download_filename(
-    env: &Env,
     objects: std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
     record: &narou_rs::db::NovelRecord,
     keys: &narou_rs::platform::NovelObjectKeys,
+    local_map: &HashMap<String, serde_yaml::Value>,
 ) -> narou_rs::error::Result<String> {
     let ini = match objects.read_small(&keys.setting()).await? {
         Some(bytes) => {
@@ -554,23 +592,12 @@ async fn epub_download_filename(
         }
         None => narou_rs::converter::ini::IniData::new(),
     };
-    let local_settings = env
-        .d1("DB")
-        .ok()
-        .map(|db| DbHandle::ui(std::sync::Arc::new(db)));
-    let local_map = match local_settings {
-        Some(handle) => D1SettingsStore::new(handle)
-            .load(SettingScope::Local)
-            .await
-            .unwrap_or_default(),
-        None => Default::default(),
-    };
     let settings = narou_rs::converter::settings::NovelSettings::from_sources(
         Some(record.id),
         &record.title,
         &record.author,
         &ini,
-        &local_map,
+        local_map,
         false,
         false,
     );
@@ -586,7 +613,7 @@ async fn epub_download_filename(
         subtitles: Vec::new(),
         novel_type: Some(record.novel_type),
     };
-    let naming_env = narou_rs::converter::output::OutputNamingEnv::from_local_map(&local_map);
+    let naming_env = narou_rs::converter::output::OutputNamingEnv::from_local_map(local_map);
     Ok(narou_rs::converter::output::epub_output_filename(
         &settings,
         &toc,

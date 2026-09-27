@@ -1004,6 +1004,46 @@ fn yaml_value_to_ini(value: &serde_yaml::Value) -> IniValue {
     }
 }
 
+/// EPUB 生成時の挿絵自動回転。`convert.rotate-image` の値を AozoraEpub3 の
+/// INI 項目 `RotateImage` に対応させたもの。
+///
+/// AozoraEpub3 では `RotateImage=1` が +90°、`RotateImage=2` が -90°、それ
+/// 以外 (未設定・0・空など) が「回転しない」。`None` は設定未指定 = INI の
+/// `RotateImage` をそのまま使う (本家準拠の既定)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageRotation {
+    /// 回転しない (INI の `RotateImage=0` 相当)。
+    Off,
+    /// `RotateImage=1` (+90°)。
+    Cw90,
+    /// `RotateImage=2` (-90°)。
+    Ccw90,
+}
+
+impl ImageRotation {
+    /// `convert.rotate-image` の保存値を解釈する。未指定 / `auto` / `ini` /
+    /// 空文字は `None` (= INI に従う)。`1`/`90` と `2`/`-90` は対応する角度、
+    /// それ以外 (INI と同じ規則) は `Off`。
+    pub fn from_setting(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" | "ini" => None,
+            "1" | "90" => Some(Self::Cw90),
+            "2" | "-90" => Some(Self::Ccw90),
+            _ => Some(Self::Off),
+        }
+    }
+
+    /// AozoraEpub3 の INI に書く `RotateImage` の値。外部 Java 版の `-i` INI
+    /// と組み込みエンジンの `config.ini` 上書きの両方で同じ文字列を使う。
+    pub fn ini_value(self) -> &'static str {
+        match self {
+            Self::Off => "0",
+            Self::Cw90 => "1",
+            Self::Ccw90 => "2",
+        }
+    }
+}
+
 /// `replace.txt` の中身を (置換前, 置換後) の並びにする。
 ///
 /// fs を使わないので Worker でも同じ規則で読める (`replace.txt` は
@@ -1090,6 +1130,28 @@ mod tests {
         assert_eq!(settings.title_for_output(raw_title), "作品名");
         assert_eq!(settings.title.as_deref(), Some(raw_title));
         assert_eq!(settings.novel_title, raw_title);
+    }
+
+    #[test]
+    fn rotate_image_setting_maps_ini_semantics() {
+        use super::ImageRotation;
+        // 未指定・auto・ini・空文字は INI の RotateImage に従う。
+        for value in ["", "auto", "INI", " auto "] {
+            assert_eq!(ImageRotation::from_setting(value), None, "{value:?}");
+        }
+        // INI と同じ意味: 1=+90°, 2=-90°、それ以外は回転しない。
+        assert_eq!(ImageRotation::from_setting("1"), Some(ImageRotation::Cw90));
+        assert_eq!(ImageRotation::from_setting("2"), Some(ImageRotation::Ccw90));
+        for value in ["0", "off", "false", "true", "bogus"] {
+            assert_eq!(
+                ImageRotation::from_setting(value),
+                Some(ImageRotation::Off),
+                "{value:?}"
+            );
+        }
+        assert_eq!(ImageRotation::Off.ini_value(), "0");
+        assert_eq!(ImageRotation::Cw90.ini_value(), "1");
+        assert_eq!(ImageRotation::Ccw90.ini_value(), "2");
     }
 
     #[test]

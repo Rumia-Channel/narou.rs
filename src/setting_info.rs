@@ -107,6 +107,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "convert.filename-to-ncode"
         | "convert.add-dc-subject-to-epub"
         | "convert.dc-subject-exclude-tags"
+        | "convert.rotate-image"
         | "send.without-freeze"
         | "auto-add-tags" => Some("general"),
 
@@ -750,6 +751,13 @@ pub fn setting_variables() -> SettingVariables {
             vis(
                 VarType::String,
                 "dc:subjectから除外するタグをカンマ区切りで指定する。初期値は「404,end」（初回実行時に自動設定される）。すべてのタグを埋め込みたい場合は空文字列を設定",
+            ),
+        ),
+        (
+            "convert.rotate-image",
+            sel(
+                "EPUB 変換時の挿絵自動回転 (AozoraEpub3 の RotateImage 相当)。auto: AozoraEpub3.ini の設定に従う / 0: 回転しない / 1: 横長を右へ90° / 2: 横長を左へ90°。組み込みエンジン・外部 AozoraEpub3_Lite.exe・Worker に効く (Java 版 AozoraEpub3.jar は INI 差し替えが出来ないため対象外)",
+                vec!["auto", "0", "1", "2"],
             ),
         ),
         (

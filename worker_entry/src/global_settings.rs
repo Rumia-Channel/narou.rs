@@ -117,8 +117,9 @@ fn result_body(success: bool, message: &str) -> serde_json::Value {
 /// `webui::max_web_targets` が D1 から読む)、`update.convert-only-new-arrival`
 /// (`executor.rs` の自動変換連鎖が読む)、`convert.filename-to-ncode` /
 /// `ebook-filename-length-limit` (`lib.rs::epub_download_filename` が
-/// `OutputNamingEnv::from_local_map` で読む)、および個別変換設定の
-/// `default.*` / `force.*` 全般 (`ConvertService` が
+/// `OutputNamingEnv::from_local_map` で読む)、`convert.rotate-image`
+/// (`lib.rs` の `download.epub` が `EpubBuildOptions::rotate_image` へ渡す)、
+/// および個別変換設定の `default.*` / `force.*` 全般 (`ConvertService` が
 /// `NovelSettings::from_sources` 経由で適用)。
 fn mark_worker_ineffective(view: &mut serde_json::Value) {
     const NOTE: &str = "この設定は Cloudflare Workers 版では効きません (実行経路が native 専用)";
@@ -218,8 +219,9 @@ mod tests {
             "webui.new-tag-color",
             // server- prefix でも Worker が読む唯一の例外
             "server-max-targets-per-request",
-            // download.epub のファイル名に効く命名設定
+            // download.epub のファイル名に効く命名設定と挿絵回転
             "convert.filename-to-ncode",
+            "convert.rotate-image",
             "ebook-filename-length-limit",
             // 個別変換設定の default.*/force.* は ConvertService が適用する
             "default.enable_yokogaki",

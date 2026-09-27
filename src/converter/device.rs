@@ -349,12 +349,21 @@ impl OutputManager {
         input_txt: &Path,
         output_dir: &Path,
         output_ext: &str,
+        rotate_ini: Option<&Path>,
     ) -> Vec<OsString> {
         let mut args = vec![
             OsString::from("-enc"),
             OsString::from("UTF-8"),
             OsString::from("-of"),
         ];
+
+        // `convert.rotate-image` が指定されたときだけ、差し替えた INI を
+        // `-i` で渡す (Lite CLI の INI パスオプション。呼び出し側が
+        // `prepare_rotate_image_ini` で Lite exe のときだけ Some を返す)。
+        if let Some(rotate_ini) = rotate_ini {
+            args.push(OsString::from("-i"));
+            args.push(resolved_path_for_aozora(rotate_ini).into_os_string());
+        }
 
         if let Some(device_name) = self.aozora_device_name() {
             args.push(OsString::from("-device"));
@@ -458,6 +467,18 @@ impl OutputManager {
         } else {
             None
         };
+        // `convert.rotate-image` が指定されていれば、RotateImage を差し替えた
+        // 一時 INI を `-i` で渡す。対象は外部ツールが Lite の exe のときだけ
+        // (Java jar は INI 差し替えオプションを持たない)。子プロセスの起動
+        // より前に作り、関数が返るまで生存させる。
+        let _rotate_ini_guard = match rotate_image_override() {
+            Some(rotation) => self.prepare_rotate_image_ini(rotation)?,
+            None => None,
+        };
+        let rotate_ini_path = _rotate_ini_guard
+            .as_ref()
+            .map(|guard| guard.path().to_path_buf());
+
         let base_name = input_txt
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -479,9 +500,12 @@ impl OutputManager {
             prepare_aozora_invocation(input_txt, output_dir, output_ext, &output_path)?;
         let actual_aozora_output_path = absolutize_path(&invocation.expected_output_path);
 
-        for arg in
-            self.build_aozora_epub3_args(&invocation.input_txt, &invocation.output_dir, output_ext)
-        {
+        for arg in self.build_aozora_epub3_args(
+            &invocation.input_txt,
+            &invocation.output_dir,
+            output_ext,
+            rotate_ini_path.as_deref(),
+        ) {
             cmd.arg(arg);
         }
         if !self.verbose {
@@ -802,6 +826,7 @@ impl OutputManager {
             assets_dir: crate::compat::aozora_assets_dir(),
             kindle: matches!(self.device, Device::Mobi),
             extra_assets: super::dakuten_font::lite_font_assets(self.use_dakuten_font)?,
+            rotate_image: rotate_image_override(),
         };
         let build = crate::epub_lite::build_book(input_txt, &options)?;
 
@@ -923,6 +948,52 @@ impl OutputManager {
         }
         Ok(Some(dst_path))
     }
+
+    /// `convert.rotate-image` 用の一時 INI を作る。
+    ///
+    /// 対象は外部ツールが AozoraEpub3_Lite の実行ファイル (`AozoraEpub3_Lite.exe`
+    /// 等、Java ではないもの) のときだけ。Lite CLI は `-i <file>` で指定した
+    /// INI を `AozoraConfig` に読み、`-i` 無しでは INI を読まない (Java CLI と
+    /// 同じ空プロファイルで動く)。空プロファイルは `from_ini` の既定値と同じ
+    /// ため、差し替えるのは `RotateImage` 1 項目だけで現行と同じ挙動になる。
+    ///
+    /// Java 版 `AozoraEpub3.jar` は INI パスを受け取るオプションを持たず、
+    /// 起動ディレクトリの `AozoraEpub3.ini` を必ず読む。インストール先の
+    /// INI は書き換えない方針のため jar には `None` を返し (本項目は効かない)、
+    /// 組み込みエンジン (`epub-engine=lite`) で同じ効果を得られる。
+    #[cfg(feature = "native-runtime")]
+    fn prepare_rotate_image_ini(
+        &self,
+        rotation: crate::converter::settings::ImageRotation,
+    ) -> Result<Option<tempfile::NamedTempFile>> {
+        let tool_path = self
+            .aozora_epub3_path
+            .as_ref()
+            .ok_or_else(|| NarouError::Conversion("AozoraEpub3 not found".into()))?;
+        if tool_path.extension().and_then(|ext| ext.to_str()) == Some("jar") {
+            return Ok(None);
+        }
+
+        // 一時ファイルは子プロセスが読み終わるまで生存させる (`Drop` で削除)。
+        let mut file = tempfile::Builder::new()
+            .prefix("narou-aozora-ini-")
+            .suffix(".ini")
+            .tempfile()?;
+        file.write_all(format!("RotateImage={}\n", rotation.ini_value()).as_bytes())?;
+        file.flush()?;
+        Ok(Some(file))
+    }
+}
+
+/// `convert.rotate-image` の設定値を解決する。未設定・`auto`・`ini`・空文字は
+/// `None` (= ツール側の `RotateImage` (ini) に従う = 本家準拠の既定)。
+///
+/// ローカル設定 (`narou setting convert.rotate-image …`) を読む。Worker の
+/// `download.epub` は D1 の同じキーを `lib.rs` で読む。
+#[cfg(feature = "native-runtime")]
+fn rotate_image_override() -> Option<crate::converter::settings::ImageRotation> {
+    crate::compat::load_local_setting_string("convert.rotate-image")
+        .and_then(|value| crate::converter::settings::ImageRotation::from_setting(&value))
 }
 
 #[cfg(feature = "native-runtime")]
@@ -1698,7 +1769,7 @@ mod tests {
         fs::write(dir.join("cover.jpg"), b"cover").unwrap();
 
         let manager = test_output_manager(Device::Mobi).with_yokogaki(true);
-        let args = stringify_args(manager.build_aozora_epub3_args(&input, &dir, ".epub"));
+        let args = stringify_args(manager.build_aozora_epub3_args(&input, &dir, ".epub", None));
 
         assert_eq!(args[0], "-enc");
         assert_eq!(args[1], "UTF-8");
@@ -1742,7 +1813,7 @@ mod tests {
         fs::write(&input, "test").unwrap();
 
         let manager = test_output_manager(Device::Epub);
-        let args = stringify_args(manager.build_aozora_epub3_args(&input, &novel_dir, ".epub"));
+        let args = stringify_args(manager.build_aozora_epub3_args(&input, &novel_dir, ".epub", None));
 
         let dst_index = args.iter().position(|arg| arg == "-dst").unwrap();
         let dst = PathBuf::from(&args[dst_index + 1]);
@@ -1762,7 +1833,7 @@ mod tests {
         fs::write(&input, "test").unwrap();
 
         let manager = test_output_manager(Device::Kobo);
-        let args = stringify_args(manager.build_aozora_epub3_args(&input, &dir, ".kepub.epub"));
+        let args = stringify_args(manager.build_aozora_epub3_args(&input, &dir, ".kepub.epub", None));
 
         assert!(args.windows(2).any(|pair| pair == ["-ext", ".kepub.epub"]));
         assert!(!args.contains(&"-device".to_string()));
