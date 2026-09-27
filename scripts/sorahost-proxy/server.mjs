@@ -134,18 +134,40 @@ const handler = async (req, res) => {
   if (req.method === "GET" && req.url.startsWith("/health")) {
     return json(200, { ok: true });
   }
-  if (req.method !== "POST" || !req.url.startsWith("/proxy")) {
+  const requestUrl = new URL(req.url, "http://localhost");
+  if (requestUrl.pathname !== "/proxy") {
     return json(404, { error: "not found" });
   }
   if (req.headers["x-proxy-token"] !== TOKEN) {
     return json(403, { error: "forbidden" });
   }
 
+  // POST (JSON ボディ) と GET (クエリ) の両方を受け付ける。Worker の生ソケット
+  // 経路は HTTP/1.1 の GET しか話せないため、GET も必須。
   let payload;
-  try {
-    payload = JSON.parse(await readBody(req));
-  } catch (error) {
-    return json(400, { error: `bad request: ${error.message}` });
+  if (req.method === "POST") {
+    try {
+      payload = JSON.parse(await readBody(req));
+    } catch (error) {
+      return json(400, { error: `bad request: ${error.message}` });
+    }
+  } else if (req.method === "GET") {
+    let headers = {};
+    const rawHeaders = requestUrl.searchParams.get("headers");
+    if (rawHeaders) {
+      try {
+        headers = JSON.parse(Buffer.from(rawHeaders, "base64").toString("utf8"));
+      } catch {
+        return json(400, { error: "bad request: headers must be base64 JSON" });
+      }
+    }
+    payload = {
+      url: requestUrl.searchParams.get("url") || "",
+      headers,
+      redirect: requestUrl.searchParams.get("redirect") || "follow",
+    };
+  } else {
+    return json(405, { error: "method not allowed" });
   }
 
   const target = String(payload.url || "");
