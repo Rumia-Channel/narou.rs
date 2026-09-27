@@ -244,12 +244,13 @@ jobs:
   relay-deploy:
     name: Deploy SORAHOST relay
     if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/develop')
-      || (github.event_name == 'workflow_dispatch' && inputs.target == 'develop')
+      (github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' || github.ref_type == 'tag'))
+      || (github.event_name == 'workflow_dispatch' && (inputs.target == 'develop' || inputs.target == 'production'))
     needs: [native, native-gpl, wasm, worker, worker-contract, license]
     runs-on: ubuntu-latest
     concurrency:
-      group: narou-relay-develop
+      # リレーは PteWorker 1 台を共有するので、develop / production で排他する
+      group: narou-relay
       cancel-in-progress: false
     environment:
       name: Cloudflare
@@ -286,7 +287,7 @@ jobs:
     if: >-
       (github.event_name == 'push' && github.ref_type == 'tag')
       || (github.event_name == 'workflow_dispatch' && inputs.target == 'production')
-    needs: [native, native-gpl, wasm, worker, worker-contract, license]
+    needs: [native, native-gpl, wasm, worker, worker-contract, license, relay-deploy]
     runs-on: ubuntu-latest
     concurrency:
       group: narou-worker-production
