@@ -230,9 +230,12 @@ pub async fn execute_job(
     if let Err(error) = &result
         && !matches!(error, NarouError::DownloadBudgetExpired { .. })
     {
+        // ネイティブはエラーも stdout に出す (`error()` -> `$stdout.error`)。
+        // Web UI は target_console が stdout 以外だと 2 番目のコンソールへ
+        // 流すため、ここも stdout に揃える。
         messages::MessageSink::emit(
             &*push_sink,
-            messages::Stream::Stderr,
+            messages::Stream::Stdout,
             &messages::indented_error(error),
         );
     }
