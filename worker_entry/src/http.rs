@@ -137,6 +137,17 @@ impl WorkerHttpClient {
         // native と同じく、サイトの外に出る hop では認証系ヘッダを落とす
         // (fetch は Cookie を勝手に付けないので寄せる意味もある)。
         let mut headers = request.headers.clone();
+        // ソケット経路でも UA 無しは送らない (fetch 経路と同じフォールバック)。
+        // カクヨムの CloudFront は User-Agent なしの接続を 403 で弾くため、
+        // これが無いと生ソケットでも同じ 403 が返りフォールバックが無意味になる
+        // (一時アカウントで実測: UA 無し→CloudFront 403、UA 有り→200)。
+        if !self.user_agent.is_empty()
+            && !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        {
+            headers.push(("User-Agent".to_string(), self.user_agent.clone()));
+        }
         let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
         for hop in 0..=MAX_REDIRECTS {
             // `connect()` もサブリクエスト枠を消費するので fetch と同じく計上する。
