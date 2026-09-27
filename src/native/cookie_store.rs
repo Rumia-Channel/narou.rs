@@ -420,7 +420,7 @@ mod tests {
         assert_eq!(loaded.len(), 1, "1 セッション: {loaded:?}");
         assert_eq!(loaded[0].cookies.len(), 3);
         assert_eq!(loaded[0].merged_cookie(), "yuid_b=1; p_ab_id=2; PHPSESSID=abc");
-        assert!(loaded[0].id.is_empty() == false, "識別子はどれか 1 つを引き継ぐ");
+        assert!(!loaded[0].id.is_empty(), "識別子はどれか 1 つを引き継ぐ");
 
         // 別アカウントは名前が衝突するので畳まない。
         store
