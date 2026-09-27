@@ -511,6 +511,35 @@ async fn generate_epub_on_demand(
     record: &crate::db::novel_record::NovelRecord,
     novel_dir: &std::path::Path,
 ) -> Result<(Vec<u8>, String), (StatusCode, String)> {
+    // 保存済み EPUB と同じ命名規則で Content-Disposition 名を決める
+    // (変換時の txt basename に `.epub` を付けたもの)。
+    // `convert.filename` / `convert.filename-to-ncode` は
+    // `NovelSettings::load_for_novel` と `OutputNamingEnv` が反映する。
+    let settings = crate::converter::settings::NovelSettings::load_for_novel(
+        id,
+        &record.title,
+        &record.author,
+        novel_dir,
+    );
+    let filename = {
+        // 命名には TocObject の title/author/toc_url だけが使われるため、
+        // toc.yaml を読まずに record から組み立てる。
+        let naming_toc = crate::downloader::TocObject {
+            title: record.title.clone(),
+            author: record.author.clone(),
+            toc_url: record.toc_url.clone(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(record.novel_type),
+        };
+        crate::converter::output::epub_output_filename(
+            &settings,
+            &naming_toc,
+            Some(record),
+            &crate::converter::output::local_output_naming_env(),
+        )
+    };
+
     // P4a: prefer the SQLite mirror of the converted text when present.
     if !crate::native::sqlite::state::legacy_yaml_active()
         && let Some(narou_dir) = crate::db::inventory::Inventory::with_default_root()
@@ -530,16 +559,9 @@ async fn generate_epub_on_demand(
         }
         && !payload.is_empty()
     {
-        let filename = format!("novel-{id}.epub");
         return Ok((payload, filename));
     }
 
-    let settings = crate::converter::settings::NovelSettings::load_for_novel(
-        id,
-        &record.title,
-        &record.author,
-        novel_dir,
-    );
     let toc_content = std::fs::read_to_string(novel_dir.join("toc.yaml"))
         .map_err(|e| (StatusCode::CONFLICT, format!("toc.yaml: {e}")))?;
     let toc: crate::downloader::TocFile = serde_yaml::from_str(&toc_content)
@@ -552,6 +574,14 @@ async fn generate_epub_on_demand(
         subtitles: toc.subtitles,
         novel_type: toc.novel_type,
     };
+    // 保存済み EPUB と同じ名: 実際に生成される txt の basename に `.epub`
+    // を付けたもの (native `device.rs` の `{file_stem(txt)}.epub` 経路と同じ規則)。
+    let filename = crate::converter::output::epub_output_filename(
+        &settings,
+        &toc_object,
+        Some(record),
+        &crate::converter::output::local_output_naming_env(),
+    );
     let txt_path = crate::converter::output::create_output_text_path(
         &settings,
         id,
@@ -594,11 +624,6 @@ async fn generate_epub_on_demand(
     crate::epub_lite::stream_epub(&build.book, &mut bytes, |epub_path| build.resolve(epub_path))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let filename = txt_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| format!("{}.epub", n.trim_end_matches(".txt")))
-        .unwrap_or_else(|| format!("novel-{id}.epub"));
     Ok((bytes, filename))
 }
 

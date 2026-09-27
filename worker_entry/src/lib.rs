@@ -30,9 +30,13 @@ use webui::{json_error, query_param};
 
 use serde_json::json;
 use worker::*;
+use narou_rs::application::settings::SettingsStore;
 use narou_rs::application::{JobQueue as _JobQueueTrait, TagAction};
+use narou_rs::setting_core::SettingScope;
 
 use crate::composition::{WorkerRuntime, check_ready};
+use crate::db_handle::DbHandle;
+use crate::d1_repository::D1SettingsStore;
 
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
@@ -347,6 +351,12 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         Err(error) => return Response::error(&format!("Invalid key: {error}"), 500),
     };
 
+    let filename = match epub_download_filename(&env, services.objects.clone(), &record, &keys).await
+    {
+        Ok(name) => name,
+        Err(error) => return Response::error(&format!("Naming error: {error}"), 500),
+    };
+
     let text_key = keys.converted_text();
     let text_bytes = match services.objects.read_small(&text_key).await {
         Ok(Some(bytes)) => bytes,
@@ -520,9 +530,85 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         .with_header("Content-Type", "application/epub+zip")?
         .with_header(
             "Content-Disposition",
-            &format!("attachment; filename=\"novel-{id}.epub\""),
+            &format!("attachment; filename=\"{}\"", sanitize_header_filename(&filename)),
         )?
         .from_stream(stream)
+}
+
+/// `download.epub` の Content-Disposition 名を native の保存済み EPUB と同じ
+/// 規則 (`converter::output` の変換出力名に `.epub` を付けたもの) で決める。
+///
+/// 反映される設定は native の変換時と同じ: `setting.ini` /
+/// `default.*` / `force.*` (`NovelSettings::from_sources`) と
+/// `convert.filename-to-ncode` / `ebook-filename-length-limit`
+/// (`OutputNamingEnv::from_local_map`)。fs が無いので local 設定は D1 の
+/// `app_state` スコープ `local` から読む。
+async fn epub_download_filename(
+    env: &Env,
+    objects: std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
+    record: &narou_rs::db::NovelRecord,
+    keys: &narou_rs::platform::NovelObjectKeys,
+) -> narou_rs::error::Result<String> {
+    let ini = match objects.read_small(&keys.setting()).await? {
+        Some(bytes) => {
+            narou_rs::converter::ini::IniData::load(&String::from_utf8_lossy(&bytes))
+        }
+        None => narou_rs::converter::ini::IniData::new(),
+    };
+    let local_settings = env
+        .d1("DB")
+        .ok()
+        .map(|db| DbHandle::ui(std::sync::Arc::new(db)));
+    let local_map = match local_settings {
+        Some(handle) => D1SettingsStore::new(handle)
+            .load(SettingScope::Local)
+            .await
+            .unwrap_or_default(),
+        None => Default::default(),
+    };
+    let settings = narou_rs::converter::settings::NovelSettings::from_sources(
+        Some(record.id),
+        &record.title,
+        &record.author,
+        &ini,
+        &local_map,
+        false,
+        false,
+    );
+    // 命名には TocObject の title/author/toc_url だけが使われる。
+    // `from_sources` が novel_title/novel_author を record で埋めるため、
+    // native (`generate_epub_on_demand` が toc.yaml から組み立てる TocObject)
+    // と同じ名になる最小の TocObject を record から組み立てる。
+    let toc = narou_rs::downloader::TocObject {
+        title: record.title.clone(),
+        author: record.author.clone(),
+        toc_url: record.toc_url.clone(),
+        story: None,
+        subtitles: Vec::new(),
+        novel_type: Some(record.novel_type),
+    };
+    let naming_env = narou_rs::converter::output::OutputNamingEnv::from_local_map(&local_map);
+    Ok(narou_rs::converter::output::epub_output_filename(
+        &settings,
+        &toc,
+        Some(record),
+        &naming_env,
+    ))
+}
+
+/// Content-Disposition に埋め込むため、引用符と制御文字を `_` に置き換える。
+/// (native `sanitize_content_disposition` と同じ規則)
+fn sanitize_header_filename(filename: &str) -> String {
+    filename
+        .chars()
+        .map(|c| {
+            if c == '"' || c.is_ascii_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 fn stream_error(error: impl std::fmt::Display) -> worker::Error {

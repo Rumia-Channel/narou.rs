@@ -4,7 +4,8 @@ pub mod dakuten_font;
 pub mod device;
 pub mod ini;
 pub mod inspector;
-#[cfg(feature = "native-runtime")]
+/// 出力ファイル名の命名規則。native (Inventory) と Worker (D1) の両方が
+/// 使うため fs に依存しない pure なコアを持つ。
 pub mod output;
 pub mod render;
 pub mod settings;
