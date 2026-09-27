@@ -528,6 +528,17 @@ Worker (worker_entry)
 | `application::messages` + `MessageSink` | ジョブ実行系コマンドの文言。native は stdout/stderr、Worker は PushHub への `echo` に流す（失敗行は両方 `  Error: …`） |
 | `application::aliases` | エイリアス解決（表の読み込みだけが native=Inventory / Worker=app_state と異なる） |
 | `platform::*` + `downloader::http_policy` | HTTP の decode/status/redirect ポリシー（アダプタは transport だけを持つ） |
+| `platform::http1` | HTTP/1.1 のリクエスト生成と応答解析（Byte 指向・依存なし）。wasm 専用クレート内のテストは実行されないため可搬層に置き、Worker のソケット transport が使う。native は curl/reqwest があるため未使用 |
+
+### Worker の取得段（2026-09-27）
+
+`worker_entry/src/http.rs` は `fetch` を第一段とし、**403 を返した GET に限り** `connect()`
+（`cloudflare:sockets`）で取り直す。理由は実測で、`fetch` は Cloudflare の公開 IP レンジから、
+`connect()` は公開レンジ外のプレフィックス（実測 `104.28.157.13`）から出るため、Cloudflare の
+レンジを弾くサイト（例: CloudFront 配信のカクヨム）でも後者なら 200 が返る。ソケット側で
+2xx/3xx が得られたときだけ採用し、接続拒否・タイムアウト・解析失敗は元の 403 を保つ。
+**全アドレスが Cloudflare の公開レンジ内にあるサイト（例: ハーメルン）は `connect()` 自体が
+ランタイムに拒否される**ため、外部の踏み台（SORAHOST の `scripts/sorahost-proxy/` など）が別途必要。
 
 ### 残っている重複（次の候補）
 
