@@ -34,14 +34,31 @@ export default {
     const token = env?.PROXY_TOKEN ?? "";
     if (!token) return json(500, { error: "PROXY_TOKEN is not set" });
     if (url.pathname === "/health") return json(200, { ok: true });
-    if (request.method !== "POST" || url.pathname !== "/proxy") return json(404, { error: "not found" });
+    if (url.pathname !== "/proxy") return json(404, { error: "not found" });
     if (request.headers.get("x-proxy-token") !== token) return json(403, { error: "forbidden" });
 
+    // POST (JSON body) と GET (クエリ) の両方を受け付ける。Cloudflare Workers の
+    // `connect()` 経由で呼ぶ場合、HTTP/1.1 の GET が最も素直なため。
     let payload;
-    try {
-      payload = await request.json();
-    } catch {
-      return json(400, { error: "bad request: expected JSON body" });
+    if (request.method === "POST") {
+      try {
+        payload = await request.json();
+      } catch {
+        return json(400, { error: "bad request: expected JSON body" });
+      }
+    } else if (request.method === "GET") {
+      const rawHeaders = url.searchParams.get("headers");
+      let headers = {};
+      if (rawHeaders) {
+        try {
+          headers = JSON.parse(atob(rawHeaders));
+        } catch {
+          return json(400, { error: "bad request: headers must be base64 JSON" });
+        }
+      }
+      payload = { url: url.searchParams.get("url") || "", headers, redirect: url.searchParams.get("redirect") || "follow" };
+    } else {
+      return json(405, { error: "method not allowed" });
     }
 
     const target = String(payload.url || "");
