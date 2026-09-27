@@ -26,10 +26,10 @@
   Secrets Store の `*_SECRET_NAME` を使うか、`wrangler secret put` で別途投入する。
 - `NAROU_AUTH_REQUIRED` / `NAROU_WORKERS_DEV` / `DEVELOP_DOMAIN` /
   `NAROU_S3_PREFIX` / `NAROU_D1_BASE_NAME` / `NAROU_JOB_QUEUE_BASE` / `NAROU_SMOKE=0`
-- `SORAHOST_ENDPOINT` / `SORAHOST_KEY` … 外部の取得リレー（任意）。接続先（例:
-  `http://<IP>:<port>/_sorahost/...`）を `SORAHOST_ENDPOINT` に、リレーの合言葉
-  （PteWorker の `.env` に置く `SORAHOST_KEY` と同じ値）を `SORAHOST_KEY` に入れる。
-  Worker secret (`SORAHOST_ENDPOINT` / `SORAHOST_KEY`) として投入する。
+- `SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY` … 外部の取得リレー（任意）。接続先（例:
+  `http://<IP>:<port>/_sorahost/...`）を `SORAHOST_PROXY_ENDPOINT` に、リレーの合言葉
+  （PteWorker の `.env` に置く `SORAHOST_PROXY_KEY` と同じ値）を `SORAHOST_PROXY_KEY` に入れる。
+  Worker secret (`SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY`) として投入する。
 - `SERVICE_DOMAIN` / `DEVELOP_DOMAIN` … custom domain。secret を推奨（ログへ出さない）
 - `NAROU_DEPLOY_URL` … smoke の宛先を明示する（既定は domain → workers.dev）
 - `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` … Access の service token。
@@ -192,7 +192,7 @@ def secret_file(target: str) -> Path | None:
             )
     # SORAHOST の取得リレー（任意）。値があるときだけ Worker secret として渡す。
     # 未設定なら Worker 側のリレー段は無効のまま（Cloudflare から取れないサイトが残る）。
-    for name in ("SORAHOST_ENDPOINT", "SORAHOST_KEY"):
+    for name in ("SORAHOST_PROXY_ENDPOINT", "SORAHOST_PROXY_KEY"):
         value = os.environ.get(name, "").strip()
         if value:
             secrets[name] = value

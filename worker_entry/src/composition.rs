@@ -318,11 +318,11 @@ impl WorkerRuntime {
             .and_then(|value| value.as_str())
             .map(str::to_owned);
         let user_agent = narou_rs::downloader::resolve_user_agent(None, saved_user_agent);
-        // 踏み台 (SORAHOST リレー) は `SORAHOST_ENDPOINT` と
-        // `SORAHOST_KEY` が揃ったときだけ有効にする。スキーム無しの
+        // 踏み台 (SORAHOST リレー) は `SORAHOST_PROXY_ENDPOINT` と
+        // `SORAHOST_PROXY_KEY` が揃ったときだけ有効にする。スキーム無しの
         // `<IP>:<port>` 形式も受け付ける (http.rs の `with_relay` が補完)。
-        let relay_base = crate::secrets::value(env, "SORAHOST_ENDPOINT").await;
-        let relay_token = crate::secrets::value(env, "SORAHOST_KEY").await;
+        let relay_base = crate::secrets::value(env, "SORAHOST_PROXY_ENDPOINT").await;
+        let relay_token = crate::secrets::value(env, "SORAHOST_PROXY_KEY").await;
         let mut http_client =
             WorkerHttpClient::new(subrequests.clone()).with_user_agent(user_agent);
         if let (Some(base), Some(token)) = (relay_base, relay_token) {

@@ -11,11 +11,11 @@
 //! GET|POST /proxy
 //!   GET : ?url=<URL エンコード>&headers=<base64(JSON オブジェクト)>&redirect=follow|manual
 //!   POST: {"url": "...", "headers": {...}, "redirect": "follow"|"manual"}
-//! 認証: X-Proxy-Token: <SORAHOST_KEY>
+//! 認証: X-Proxy-Token: <SORAHOST_PROXY_KEY>
 //! 応答: {"status": 200, "contentType": "...", "location": "...",
 //!        "via": "curl", "body": "<base64>"}
 //! 失敗: {"status": <上流>, "error": "..."} /
-//!       HTTP 403 {"error":"forbidden"} / 500 {"error":"SORAHOST_KEY is not set"}
+//!       HTTP 403 {"error":"forbidden"} / 500 {"error":"SORAHOST_PROXY_KEY is not set"}
 //! ```
 //!
 //! `headers` はサイト定義 (`FetchPolicy::for_site`) が組み立てた
@@ -99,7 +99,7 @@ impl RelayRequest {
     ///
     /// - `base_url`: 踏み台のベース URL (`http://<IP>:<port>/`)。オリジン
     ///   (scheme://host:port) だけが使われ、パスがあっても `/proxy` に固定される。
-    /// - `token`: `SORAHOST_KEY`。空・制御文字入りは拒否する。
+    /// - `token`: `SORAHOST_PROXY_KEY`。空・制御文字入りは拒否する。
     /// - `target_url`: 中継してほしい取得先。`http(s)` 以外は踏み台が 400 を
     ///   返すため、ここで弾く。
     /// - `headers`: 取得先に転送するヘッダ (例: `FetchPolicy::headers()`)。

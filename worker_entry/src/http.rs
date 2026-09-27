@@ -40,7 +40,7 @@ pub struct WorkerHttpClient {
     /// リクエストが自前の UA を持たないときだけ付ける (サイト別の UA を尊重)。
     user_agent: String,
     /// 踏み台 (SORAHOST リレー) の接続先と認証トークン。
-    /// `SORAHOST_ENDPOINT` / `SORAHOST_KEY` が揃ったときだけ Some。
+    /// `SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY` が揃ったときだけ Some。
     relay: Option<RelayConfig>,
 }
 
