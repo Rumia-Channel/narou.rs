@@ -615,26 +615,58 @@ async fn api_convert(
     // native の convert ジョブは複合 target 1 つを子プロセスへ渡し、
     // `narou convert` が `resolve_target_to_id` で id に落として処理する。
     // Worker の convert は `JobTarget::Id` しか実行できないので、ここで同じ
-    // 解決 (commands/mod.rs::resolve_target_to_id) を行い、解決できない
-    // ターゲットは native の実行時スキップ ("<target> は存在しません") と
-    // 同じく落とす。
+    // 解決 (commands/mod.rs::resolve_target_to_id) を行う。
+    //
+    // 解決できないターゲットの扱いは native と揃える:
+    // - 数値 id はそのままキューに積む (native は resolve_target_to_id が
+    //   None でも convert を実行し、「<target> は存在しません」を実行時に
+    //   出す)。レコード無しの id を黙って落とすと results が空になり、
+    //   UI から見て「変換が走らない」原因が分からなくなる。
+    // - 数値でないターゲットは `JobTarget` で表せないためキューに積めず、
+    //   `status: "unresolved"` として results に残す (落とさない)。
     let aliases = super::download::load_aliases(env).await;
     let site_settings = site_settings(runtime).await;
-    let mut resolved: Vec<(String, i64)> = Vec::new();
-    for target in &ordered_targets {
-        if let Some(id) =
-            resolve_convert_target_to_id(runtime, &aliases, &site_settings, target).await
-        {
-            resolved.push((target.clone(), id));
-        }
-    }
 
     // `NAROU_RS_WEB_DEVICE` (native meta `device`) は現在の Worker convert
     // (`convert.rs::execute_convert` → `ConvertService::convert_and_store`)
     // では使われない。device 固有の出力量を偽らないため plan.options には
     // 載せず、応答の `device` フィールドだけ native と同じく echo する。
+    // ターゲットごとに (表示用文字列, 解決した id) を保持する。同一 id に
+    // 解決したターゲットが複数あっても native 同様に行は出す (enqueue の
+    // dedupe が同一 job_id を返す)。
+    let mut resolved: Vec<(String, Option<i64>)> = Vec::with_capacity(ordered_targets.len());
+    for target in &ordered_targets {
+        let id = match resolve_convert_target_to_id(runtime, &aliases, &site_settings, target).await
+        {
+            Some(id) => Some(id),
+            // 数値 id は解決を通さずそのままキューへ (native がミスを実行時に
+            // 報告するのと同じ)。
+            None => target.parse::<i64>().ok(),
+        };
+        resolved.push((target.clone(), id));
+    }
+    // `sort_numeric_targets_for_state` はレコードに無い数値 id を捨てるので、
+    // 元の targets から欠落した数値 id を拾ってキューに積む (実行時に
+    // 「小説 N がありません」として見えるようにする)。
+    for target in &targets {
+        if let Ok(id) = target.parse::<i64>()
+            && !resolved.iter().any(|(existing, _)| existing == target)
+        {
+            resolved.push((target.clone(), Some(id)));
+        }
+    }
+
     let mut results = Vec::with_capacity(resolved.len());
     for (target, id) in &resolved {
+        let Some(id) = id else {
+            results.push(json!({
+                "target": target,
+                "device": device.as_deref(),
+                "status": "unresolved",
+            }));
+            continue;
+        };
+
         let plan = JobPlan {
             kind: JobKind::Convert,
             target: JobTarget::Id(NovelId(*id)),

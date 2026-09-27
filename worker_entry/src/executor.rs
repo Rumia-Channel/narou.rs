@@ -25,7 +25,7 @@ use narou_rs::downloader::{
     DownloadExecutionOptions, DownloadResult, Downloader, UpdateStatus,
 };
 use narou_rs::error::{NarouError, Result};
-use narou_rs::platform::{NovelId, NovelRepository};
+use narou_rs::platform::{NovelId, NovelObjectKeys, NovelRepository};
 
 use crate::budget::WorkerBudget;
 use crate::composition::WorkerRuntime;
@@ -304,8 +304,8 @@ async fn classify_result(
                 // native `commands::update` parity: a checked update —
                 // changed or not — clears `modified`, stamps
                 // `last_check_date`, and syncs the `end` tag.
-                if job.kind == JobKind::Update {
-                    if let Err(error) = runtime
+                if job.kind == JobKind::Update
+                    && let Err(error) = runtime
                         .services
                         .novel_actions
                         .record_update_check(
@@ -313,14 +313,21 @@ async fn classify_result(
                             runtime.clock.now_utc(),
                         )
                         .await
-                    {
-                        console_log!(
-                            "job {job_id}: post-update bookkeeping failed for novel {}: {error}",
-                            result.id
-                        );
-                    }
+                {
+                    console_log!(
+                        "job {job_id}: post-update bookkeeping failed for novel {}: {error}",
+                        result.id
+                    );
                 }
-                JobOutcome::Succeeded
+                // native `commands::{download,update}` は成功した小説を直後に
+                // 変換する (`narou download` → `narou convert`)。Worker では
+                // `/api/convert` と同じ Convert ジョブを積む。投入自体が
+                // 失敗したらジョブ全体を Retryable に倒す — 変換テキストが
+                // 無いまま「成功」で閉じないため。
+                match enqueue_followup_convert(runtime, job, &result).await {
+                    Ok(()) => JobOutcome::Succeeded,
+                    Err(reason) => JobOutcome::Retryable { reason },
+                }
             }
             UpdateStatus::Canceled => JobOutcome::Blocked {
                 reason: format!(
@@ -364,6 +371,116 @@ async fn classify_result(
         },
     }
 }
+/// ダウンロード成功後の自動変換 (native `commands::{download,update}::auto_convert`
+/// の Web 経路と同じ形)。`/api/convert` が積むのと同じ Convert ジョブを
+/// `enqueue_plan` で積む。台帳の dedupe (`kind:target:options`) が同じ投入を
+/// べき等にするので、再配信で二重に走ることはない。
+///
+/// 戻り値 `Err` は「変換ジョブを積めなかった」= 台帳/キューの障害。
+/// 呼び出し側はジョブ全体をリトライ対象に倒し、変換テキストが無いまま
+/// 成功で閉じない。
+async fn enqueue_followup_convert(
+    runtime: &WorkerRuntime,
+    job: &JobPlan,
+    result: &DownloadResult,
+) -> std::result::Result<(), String> {
+    // 連鎖するのは Download / Update のみ。Convert 自身がここを通らない
+    // (consumer が execute_convert に分岐する) ので無限連鎖は起きない。
+    if !matches!(job.kind, JobKind::Download | JobKind::Update) {
+        return Ok(());
+    }
+    // `--no-convert` / `-n` は native と同じく変換を完全に止める。
+    if has_option(&job.options, &["--no-convert", "-n"]) {
+        return Ok(());
+    }
+    let convert = match result.status {
+        UpdateStatus::Ok => {
+            // `--convert-only-new-arrival` / `-a` オプションと
+            // `update.convert-only-new-arrival` 設定は Update の `Ok` にだけ
+            // 効く (native `commands::update` の needs_convert 分岐と同じ)。
+            // Download は native 同様、取得成功なら無条件で変換する。
+            let only_new = job.kind == JobKind::Update
+                && (has_option(&job.options, &["--convert-only-new-arrival", "-a"])
+                    || convert_only_new_arrival_setting(runtime).await);
+            !only_new || result.new_arrivals
+        }
+        // `None` (差分なし) の native 更新パリティは `convert_failure`
+        // フラグが立つときだけ再変換する。加えて「変換テキストが無い」
+        // (ダウンロード直後/前回変換の取りこぼし) も変換する — EPUB
+        // 配信がこのオブジェクトを読むので、無いまま進めない。
+        UpdateStatus::None => {
+            needs_convert_after_unchanged(runtime, NovelId(result.id)).await
+        }
+        _ => false,
+    };
+    if !convert {
+        return Ok(());
+    }
+
+    let outcome = runtime
+        .enqueue_plan(JobPlan {
+            kind: JobKind::Convert,
+            target: JobTarget::Id(NovelId(result.id)),
+            options: Vec::new(),
+        })
+        .await
+        .map_err(|error| format!("failed to enqueue convert for novel {}: {error}", result.id))?;
+    if let Some(reason) = outcome.blocked {
+        return Err(format!(
+            "convert job for novel {} could not be dispatched: {reason}",
+            result.id
+        ));
+    }
+    console_log!(
+        "job: queued convert job {} for novel {} (sent={})",
+        outcome.job_id,
+        result.id,
+        outcome.sent
+    );
+    Ok(())
+}
+
+fn has_option(options: &[String], names: &[&str]) -> bool {
+    options.iter().any(|option| names.contains(&option.as_str()))
+}
+
+/// `update.convert-only-new-arrival` (native `load_local_setting_bool` 相当)。
+/// 読めないときは native の設定なしと同じ `false` に倒す。
+async fn convert_only_new_arrival_setting(runtime: &WorkerRuntime) -> bool {
+    runtime
+        .services
+        .settings
+        .get("update.convert-only-new-arrival")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+/// 差分なし (`UpdateStatus::None`) での再変換判定。native はレコードの
+/// `convert_failure` フラグを見る。それに加えて「変換テキストのオブジェクトが
+/// 無い」場合も変換する — 失敗の取りこぼしや手動削除を自己修復し、
+/// `download.epub` の 409 を起こさないため。
+async fn needs_convert_after_unchanged(runtime: &WorkerRuntime, id: NovelId) -> bool {
+    let Ok(Some(record)) = runtime.novels.get(id).await else {
+        // レコードを読めないならキュー自身も読めない可能性が高い。
+        // 保守側に倒さず、後続実行で判定し直す。
+        return false;
+    };
+    if record.convert_failure {
+        return true;
+    }
+    let Ok(keys) = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
+    else {
+        return false;
+    };
+    // 存在確認がエラーでも「無い」とみなして変換に回す: ストア障害時でも
+    // convert ジョブが queue_failed として失敗を表面化する (黙って
+    // 「テキスト無しのまま成功」にしないため)。
+    !runtime.objects().exists(&keys.converted_text()).await.unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::resume_section_for_checkpoint;

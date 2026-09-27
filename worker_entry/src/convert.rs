@@ -11,6 +11,8 @@ use narou_rs::application::jobs::{JobFailureClass, JobPlan, JobTarget, classify_
 use narou_rs::converter::ConverterCapabilities;
 use narou_rs::downloader::http_policy::FetchPolicy;
 use narou_rs::error::{NarouError, Result};
+use narou_rs::platform::NovelMutation;
+use worker::console_log;
 
 use crate::composition::WorkerRuntime;
 use crate::executor::JobOutcome;
@@ -47,13 +49,44 @@ pub async fn execute_convert(
     narou_rs::application::messages::take_default_sink();
 
     match report {
-        ConvertItemReport::Written { .. } => JobOutcome::Succeeded,
+        ConvertItemReport::Written { .. } => {
+            // native `clear_convert_failure` 相当: 成功したら失敗フラグを落とす。
+            set_convert_failure_flag(runtime, target, false).await;
+            JobOutcome::Succeeded
+        }
         // レコード不在: ledger / queue_failed には従来通りのエラー文言を残す
         // (コンソール行は id_missing で既に出ている)。
         ConvertItemReport::Missing => JobOutcome::Permanent {
             reason: format!("小説 {} がありません", target.0),
         },
-        ConvertItemReport::Failed { error } => classify(error),
+        // native `set_convert_failure` 相当: 失敗した変換はレコードに記録し、
+        // 次回 update の差分なし (`None`) 実行で再変換されるようにする。
+        ConvertItemReport::Failed { error } => {
+            set_convert_failure_flag(runtime, target, true).await;
+            classify(error)
+        }
+    }
+}
+
+/// `commands::update.rs::set_convert_failure` / `clear_convert_failure` の
+/// Worker 版。失敗してもジョブ結果を変えない (ログだけ残す best-effort)。
+async fn set_convert_failure_flag(runtime: &WorkerRuntime, id: narou_rs::platform::NovelId, failed: bool) {
+    let result: Result<()> = async {
+        let Some(mut record) = runtime.novels.get(id).await? else {
+            return Ok(());
+        };
+        if record.convert_failure != failed {
+            record.convert_failure = failed;
+            runtime
+                .novels
+                .apply_batch(vec![NovelMutation::Upsert(record)])
+                .await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        console_log!("convert flag update failed for novel {}: {error}", id.0);
     }
 }
 
