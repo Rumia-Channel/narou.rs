@@ -224,6 +224,18 @@ pub async fn execute_job(
         }
         other => other,
     };
+    // 失敗はコンソール行としても積む (イベントだけだと UI のコンソールが
+    // 空のままになり、「追加したのに何も起きない」ように見える)。
+    // 予算切れは下の Partial 分岐が理由を説明するので除く。
+    if let Err(error) = &result
+        && !matches!(error, NarouError::DownloadBudgetExpired { .. })
+    {
+        messages::MessageSink::emit(
+            &*push_sink,
+            messages::Stream::Stderr,
+            &messages::indented_error(error),
+        );
+    }
     // バッファに積まれた行をジョブの区切りでまとめて送信する。
     push_sink.drain().await;
     // ジョブの sink を isolate から外す (残すと以後の emit_default が
