@@ -96,13 +96,16 @@ async function init() {
     }
   } catch { /* use defaults */ }
 
+  // 一覧の取得を待たずに投げておく (モーダル/通知の表示自体は各関数が
+  // データを受け取ってから行うので、体感の順序は変わらない)。
+  void maybeShowPendingFeatureTour();
+  void maybeOfferLibraryBackup();
+
   // Initial data load
   await Promise.all([refreshListWithUiState(), refreshQueue(), refreshQueueDetailed(), refreshTags()]);
 
   // Sync UI state (check marks, wide mode, footer)
   syncViewChecks();
-  void maybeShowPendingFeatureTour();
-  void maybeOfferLibraryBackup();
 
   // WebSocket
   connectWebSocket();
