@@ -11,6 +11,12 @@ name: SORAHOST relay
 
 on:
   workflow_dispatch:
+  # リレー本体やこの定義を触ったときは自動でデプロイし直す
+  # (develop ブランチでも push トリガーはそのブランチの定義で動く)。
+  push:
+    paths:
+      - "scripts/sorahost-proxy/**"
+      - ".github/workflows/sorahost-relay.yml"
 
 jobs:
   build-and-deploy:
