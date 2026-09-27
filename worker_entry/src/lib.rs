@@ -122,6 +122,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         "/ws" => websocket::handle(req, env).await,
         _ if path.starts_with("/api/settings/") => webui::settings::handle(req, env).await,
         _ if path.starts_with("/novels/") => webui::pages::handle(req, env).await,
+        _ if path.starts_with("/api/novels/") => api_novel(req, env).await,
         _ if path.starts_with("/api/login/") => api_login_site(req, env).await,
         _ if path.starts_with("/api/sites/") => api_site(req, env).await,
         _ if path.starts_with("/api/jobs/") => api_job(req, env).await,

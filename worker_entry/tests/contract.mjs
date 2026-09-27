@@ -346,10 +346,11 @@ await check("POST /api/login/order rejects a mismatched order", async () => {
   const response = await request("/api/login/order", {
     method: "POST",
     headers: { "content-type": "application/json", ...auth().headers },
-    body: JSON.stringify({ host: "example.com", order: [0, 1] }),
+    body: JSON.stringify({ site: "not-a-site.example", order: [0, 1] }),
   });
   assert(response.status === 200, `status ${response.status}`);
-  assert((await json(response)).success === false, "an unknown host must be refused");
+  // サイト無し = 保存 0 件に対して [0, 1] は件数不一致。
+  assert((await json(response)).success === false, "a mismatched order must be refused");
 });
 
 await check("POST /api/queue/clear reports success", async () => {
@@ -843,15 +844,55 @@ await check("DELETE /api/sites/{name} reverts to the bundled set", async () => {
   assert((await json(gone)).success === false, "the override must not resolve");
 });
 
-await check("POST /api/login/set stores a credential without echoing it", async () => {
-  const response = await request("/api/login/set", {
+// ─── ログイン (サイト単位の LoginGroup。native `src/web/login.rs` と同じ形) ──
+//
+// Cookie の直接登録 (旧 `POST /api/login/set` / `/add`) は廃止: 登録経路は
+// `narou_rs_login` の書き出しファイルを `POST /api/login/import` で取り込むだけ。
+// 一覧は `GET /api/login` の `data.sites[].logins[]` (host ではなく site がキー)。
+//
+// `NAROU_RS_LOGIN_KEY` 未設定のデプロイは fail-closed: 保存系は失敗し、値は
+// 保存も返却もしない。その場合の後続チェックは「成功扱いで中身を見ない」
+// 旧来の挙動に揃えて skip する。
+const LOGIN_SITE = "contract-login.example";
+const LOGIN_EXTRA_SITE = "contract-extra.example";
+const LOGIN_ENVELOPE = [
+  "version: 3",
+  "exported_at: 2026-09-27T00:00:00+09:00",
+  "encrypted: false",
+  "sites:",
+  "  contract-login.example:",
+  "  - site: contract-login.example",
+  "    cookies:",
+  "    - host: contract-login.example",
+  "      cookie: session=contract-secret",
+  "  - site: contract-login.example",
+  "    cookies:",
+  "    - host: contract-login.example",
+  "      cookie: session=contract-alt-secret",
+  "  contract-extra.example:",
+  "  - site: contract-extra.example",
+  "    cookies:",
+  "    - host: contract-extra.example",
+  "      cookie: token=contract-extra-secret",
+  "",
+].join("\n");
+
+// 保存系の検査は、import が書けた (= 鍵あり) 環境でのみ意味がある。
+// `null` = 未判定、それ以外は GET /api/login の key_source で決める。
+let loginsWritable = null;
+async function loginWritable() {
+  if (loginsWritable === null) {
+    const body = await json(await request("/api/login", auth()));
+    loginsWritable = body.data?.key_source !== "none";
+  }
+  return loginsWritable;
+}
+
+await check("POST /api/login/import stores named logins without echoing cookies", async () => {
+  const response = await request("/api/login/import", {
     method: "POST",
-    ...auth(),
-    body: JSON.stringify({
-      host: "example.com",
-      cookie: "session=contract-secret",
-      label: "contract",
-    }),
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ envelope: LOGIN_ENVELOPE, name: "契約" }),
   });
   const body = await json(response);
   assert(response.status === 200, `status ${response.status}`);
@@ -867,50 +908,141 @@ await check("POST /api/login/set stores a credential without echoing it", async 
     );
     return;
   }
-  const hosts = body.data?.hosts ?? [];
-  const entry = hosts.find((host) => host.host === "example.com");
-  assert(entry, `host should be listed: ${JSON.stringify(body)}`);
-  assert(entry.encrypted === true, "the stored value must be encrypted at rest");
+  const site = (body.data?.sites ?? []).find((entry) => entry.site === LOGIN_SITE);
+  assert(site, `site should be listed: ${JSON.stringify(body)}`);
+  assert(site.encrypted === true, "the stored value must be encrypted at rest");
   const raw = JSON.stringify(body);
   assert(!raw.includes("contract-secret"), "the cookie value must never be returned");
-  assert(entry.credentials[0].cookies.includes("session=…"), "the value must be masked");
+  assert(
+    !raw.includes("contract-alt-secret") && !raw.includes("contract-extra-secret"),
+    "no cookie value may be returned",
+  );
+  // 1 ファイルの 2 セッションは別ログインのまま (ホストが重なるので畳まれない)。
+  assert.strictEqual(site.logins.length, 2, `two sessions stay two logins: ${JSON.stringify(site)}`);
+  // `name` で取り込んだので 1 サイト複数件には連番が付く。
+  assert.deepStrictEqual(
+    site.logins.map((login) => login.label),
+    ["契約 1", "契約 2"],
+    `the import name must label each session: ${JSON.stringify(site.logins)}`,
+  );
+  assert(site.logins[0].hosts[0].cookies.includes("session=…"), "the value must be masked");
 });
 
-await check("GET /api/login lists hosts without values", async () => {
+await checkWithAuth("GET /api/login is closed without a token", async () => {
+  const response = await request("/api/login");
+  assert(response.status === 401, `status ${response.status}`);
+  assert((await errorCode(response)) === "authentication_required", "code must be set");
+});
+
+await check("GET /api/login lists sites without values", async () => {
   const response = await request("/api/login", auth());
   const body = await json(response);
   assert(response.status === 200, `status ${response.status}`);
-  assert(typeof body.data?.count === "number", "count must be a number");
+  assert(Array.isArray(body.data?.sites), "sites must be an array");
+  assert(typeof body.data?.sites_count === "number", "sites_count must be a number");
+  assert(typeof body.data?.logins_count === "number", "logins_count must be a number");
   assert(
     ["NAROU_RS_LOGIN_KEY", "none"].includes(body.data?.key_source),
     `unexpected key_source=${body.data?.key_source}`,
   );
-  assert(!JSON.stringify(body).includes("contract-secret"), "values must stay hidden");
+  const raw = JSON.stringify(body);
+  assert(!raw.includes("contract-secret"), "values must stay hidden");
+  assert(!raw.includes("contract-extra-secret"), "values must stay hidden");
 });
 
-await check("DELETE /api/login/{host} clears the credential", async () => {
-  const response = await request("/api/login/example.com", {
+await check("POST /api/login/rename labels one login", async () => {
+  if (!(await loginWritable())) return;
+  const response = await request("/api/login/rename", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ site: LOGIN_SITE, index: 0, label: "リネーム済み" }),
+  });
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(body.success === true, `rename must succeed: ${JSON.stringify(body).slice(0, 200)}`);
+  const site = (body.data?.sites ?? []).find((entry) => entry.site === LOGIN_SITE);
+  assert.strictEqual(site?.logins[0]?.label, "リネーム済み", "the label must be stored");
+});
+
+await check("POST /api/login/order reorders a site's logins", async () => {
+  if (!(await loginWritable())) return;
+  const response = await request("/api/login/order", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ site: LOGIN_SITE, order: [1, 0] }),
+  });
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(body.success === true, `order must succeed: ${JSON.stringify(body).slice(0, 200)}`);
+  const site = (body.data?.sites ?? []).find((entry) => entry.site === LOGIN_SITE);
+  // 並べ替え前は [リネーム済み, 契約 2]。
+  assert.deepStrictEqual(
+    site?.logins?.map((login) => login.label),
+    ["契約 2", "リネーム済み"],
+    `the order must be applied: ${JSON.stringify(site)}`,
+  );
+});
+
+await check("DELETE /api/login/{site}/{index} removes one login", async () => {
+  if (!(await loginWritable())) return;
+  const response = await request(`/api/login/${LOGIN_SITE}/0`, {
     method: "DELETE",
     ...auth(),
   });
   const body = await json(response);
   assert(response.status === 200, `status ${response.status}`);
-  const hosts = body.data?.hosts ?? [];
-  assert(
-    !hosts.some((host) => host.host === "example.com"),
-    `host should be gone: ${JSON.stringify(body)}`,
+  assert(body.success === true, `delete must succeed: ${JSON.stringify(body).slice(0, 200)}`);
+  const site = (body.data?.sites ?? []).find((entry) => entry.site === LOGIN_SITE);
+  assert.deepStrictEqual(
+    site?.logins?.map((login) => login.label),
+    ["リネーム済み"],
+    `only the other login may remain: ${JSON.stringify(site)}`,
   );
 });
 
-await check("POST /api/login/set rejects an empty cookie", async () => {
-  const response = await request("/api/login/set", {
-    method: "POST",
+await check("DELETE /api/login/{site} clears a site's logins", async () => {
+  if (!(await loginWritable())) return;
+  const response = await request(`/api/login/${LOGIN_SITE}`, {
+    method: "DELETE",
     ...auth(),
-    body: JSON.stringify({ host: "example.com", cookie: "  " }),
   });
   const body = await json(response);
   assert(response.status === 200, `status ${response.status}`);
-  assert(body.success === false, `unexpected body: ${JSON.stringify(body)}`);
+  assert(body.success === true, `clear_site must succeed: ${JSON.stringify(body).slice(0, 200)}`);
+  const sites = body.data?.sites ?? [];
+  assert(
+    !sites.some((entry) => entry.site === LOGIN_SITE),
+    `site should be gone: ${JSON.stringify(body)}`,
+  );
+});
+
+await check("DELETE /api/login/{site}/{index} removes a site's last login", async () => {
+  if (!(await loginWritable())) return;
+  const response = await request(`/api/login/${LOGIN_EXTRA_SITE}/0`, {
+    method: "DELETE",
+    ...auth(),
+  });
+  const body = await json(response);
+  assert(response.status === 200, `status ${response.status}`);
+  assert(body.success === true, `delete must succeed: ${JSON.stringify(body).slice(0, 200)}`);
+  const sites = body.data?.sites ?? [];
+  assert(
+    !sites.some((entry) => entry.site === LOGIN_EXTRA_SITE),
+    `site should be gone: ${JSON.stringify(body)}`,
+  );
+});
+
+await check("the retired direct-cookie routes stay unavailable", async () => {
+  // `set` / `add` は `{site}` として DELETE 専用ルートに落ちるので
+  // 登録は 405 で断られる (native の `/{site}` DELETE と同じ応答)。
+  for (const path of ["/api/login/set", "/api/login/add"]) {
+    const response = await request(path, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...auth().headers },
+      body: JSON.stringify({ host: "example.com", cookie: "session=x" }),
+    });
+    assert(response.status === 405, `${path} must not register cookies: ${response.status}`);
+  }
 });
 
 await check("POST /api/admin/object-migration status reports progress", async () => {
