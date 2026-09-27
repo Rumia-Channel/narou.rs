@@ -18,20 +18,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build a static curl (musl)
+      # 実測で動作を確認した配布物を使う（ソースビルドより速く、ハッシュで改ざん検出できる）。
+      - name: Fetch the verified static curl
         run: |
           mkdir -p build
-          docker run --rm -v "$PWD/build:/out" alpine:3.21 sh -euxc '
-            apk add --no-cache build-base openssl-dev openssl-libs-static zlib-dev zlib-static \
-              nghttp2-dev nghttp2-static brotli-dev brotli-static libidn2-dev libidn2-static perl
-            curl -fsSLo curl.tar.gz https://curl.se/download/curl-8.11.1.tar.gz
-            tar xzf curl.tar.gz
-            cd curl-8.11.1
-            ./configure --disable-shared --enable-static --with-openssl --with-zlib --with-brotli \
-              --with-nghttp2 --without-libpsl --disable-ldap --disable-ldaps --disable-manual CFLAGS="-O2"
-            make -j"$(nproc)"
-            cp src/curl /out/curl
-          '
+          base=https://github.com/moparisthebest/static-curl/releases/download/v8.21.0
+          curl -fsSL -o build/curl "$base/curl-amd64"
+          curl -fsSL -o sha256sum.txt "$base/sha256sum.txt"
+          (cd build && grep 'curl-amd64' ../sha256sum.txt | sed 's|\./curl-amd64|curl|' | sha256sum -c -)
+          chmod +x build/curl
+          file build/curl
 
       - name: Assemble the deploy bundle
         run: |
