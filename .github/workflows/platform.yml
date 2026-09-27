@@ -236,6 +236,46 @@ jobs:
         if: steps.credentials.outputs.configured == 'true'
 
 
+  # SORAHOST の取得リレーを配布する。Worker と同じ Cloudflare environment の
+  # シークレット (SORAHOST_PROXY_ENDPOINT / SORAHOST_PROXY_TOKEN) を使い、
+  # PteWorker のコンテナに curl が無いため静的 curl と CA バンドルを同梱する。
+  relay-deploy:
+    if: github.ref == 'refs/heads/develop'
+    needs: [native, native-gpl, wasm, worker, worker-contract, license]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: narou-relay-develop
+      cancel-in-progress: false
+    environment:
+      name: Cloudflare
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fetch the verified static curl
+        run: |
+          mkdir -p build
+          base=https://github.com/moparisthebest/static-curl/releases/download/v8.21.0
+          curl -fsSL -o build/curl "$base/curl-amd64"
+          curl -fsSL -o sha256sum.txt "$base/sha256sum.txt"
+          (cd build && grep 'curl-amd64' ../sha256sum.txt | sed 's|\./curl-amd64|curl|' | sha256sum -c -)
+          chmod +x build/curl
+          file build/curl
+      - name: Assemble the deploy bundle
+        run: |
+          cp /etc/ssl/certs/ca-certificates.crt build/cacert.pem
+          cp scripts/sorahost-proxy/server.mjs build/server.mjs
+          chmod +x build/curl
+          cat > build/sorahost.json <<'JSON'
+          { "mode": "node", "framework": "node", "start": "node server.mjs", "include": ["server.mjs", "curl", "cacert.pem"] }
+          JSON
+          ls -la build
+      - name: Deploy to SORAHOST
+        env:
+          SORAHOST_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
+          SORAHOST_TOKEN: ${{ secrets.SORAHOST_PROXY_TOKEN }}
+        run: |
+          cd build
+          npx --yes sorahost-cli deploy --yes --json
+
   worker-deploy-production:
     name: Deploy Worker (production)
     if: >-
