@@ -1,0 +1,6 @@
+{
+  "mode": "node",
+  "framework": "node",
+  "start": "node server.mjs",
+  "include": ["server.mjs"]
+}
