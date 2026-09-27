@@ -2,32 +2,29 @@
 //!
 //! - `POST /api/login/import` — `narou_rs_login` が書き出したエクスポート
 //!   エンベロープ (YAML) を取り込む。`{success, message, data}` の応答形と
-//!   エラーメッセージは native `login_import` に揃える。
-//! - `POST /api/login/order` — 1 ホストの資格情報の試行順を並べ替える。
+//!   エラーメッセージは native `login_import` に揃える。`name` でその
+//!   ファイルが持ち込むログインに名前を付ける。
+//! - `POST /api/login/rename` — 1 件のログインに名前を付ける。
+//! - `POST /api/login/order` — 1 サイトのログインの試行順を並べ替える。
 //!   native `login_order` と同じく、現在の添字の並び順を受け取る。
 //!
 //! native との差異:
 //! - エンベロープの解析・復号 (Argon2id → XChaCha20-Poly1305) は native と同じ
-//!   `narou_rs::login::{parse_export, group_credentials}` を使うので、暗号化
+//!   `narou_rs::login::{parse_export, apply_import_name}` を使うので、暗号化
 //!   エクスポートもエラー文言も native と一致する。
 //! - 保存は `D1CookieStore` (`app_state` の `login_cookie` 行) 経由。値は
-//!   `save_all` が `enc:v1:` で暗号化して書く (native と同じ形式)。復号鍵の
-//!   secret `NAROU_RS_LOGIN_KEY` が無いときは平文で書かず失敗する
-//!   (fail-closed、`crate::login::set` と同じ判断)。
+//!   `enc:v1:` で暗号化して書く (native と同じ形式)。復号鍵の secret
+//!   `NAROU_RS_LOGIN_KEY` が無いときは平文で書かず失敗する (fail-closed)。
 //! - native は資格情報変更を push_server でブロードキャストするが、Worker
 //!   には同等の経路が無いので通知は行わない。
 
-use std::collections::BTreeMap;
-
 use narou_rs::application::settings_view::{MAX_WEB_TEXT_INPUT_BYTES, validate_web_text_size};
-use narou_rs::error::Result as NarouResult;
-use narou_rs::login::{group_credentials, parse_export};
-use narou_rs::platform::{CookieStore, LoginCredential, normalize_cookie_host, tidy_credentials};
+use narou_rs::login::{apply_import_name, parse_export};
+use narou_rs::platform::{LoginGroup, normalize_cookie_host};
 use serde::Deserialize;
 use worker::{Env, Method, Request, Response, console_log};
 
 use crate::composition::WorkerRuntime;
-use crate::d1_cookie_store::D1CookieStore;
 
 use super::json_error;
 
@@ -39,21 +36,36 @@ struct ImportBody {
     /// 暗号化エクスポートのパスフレーズ。
     #[serde(default)]
     passphrase: Option<String>,
-    /// 取り込みに含まれないホストを消すか。
+    /// 取り込みに含まれないサイトを消すか。
     #[serde(default)]
     replace: bool,
+    /// このファイルが持ち込むログインにつける名前 ("本垢", "サブ垢", …)。
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// `POST /api/login/rename` の本文 (native `LoginRenameRequest`)。
+#[derive(Debug, Deserialize)]
+struct RenameBody {
+    /// ログインが属するサイト (`www.pixiv.net`)。
+    site: String,
+    /// リスト内の位置 (0 始まり)。
+    index: usize,
+    /// 表示名。空文字は消す。
+    #[serde(default)]
+    label: String,
 }
 
 /// `POST /api/login/order` の本文 (native `LoginOrderRequest`)。
 #[derive(Debug, Deserialize)]
 struct OrderBody {
-    /// 並べ替える資格情報を持つリクエストホスト。
-    host: String,
+    /// 並べ替えるログインを持つサイト。
+    site: String,
     /// 新しい順序で並べた現在の添字 (例: `[1, 0, 2]`)。
     order: Vec<usize>,
 }
 
-/// 親がこの 1 ハンドラを 2 ルートへ割り当てる。パスとメソッドで振り分ける
+/// 親がこの 1 ハンドラを各ルートへ割り当てる。パスとメソッドで振り分ける
 /// (`/api/login/` の prefix ガードより先に置く前提)。
 pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     if let Some(response) = crate::auth_failure(&req, &env).await {
@@ -62,12 +74,14 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     let path = req.path();
     enum Route {
         Import,
+        Rename,
         Order,
     }
     let route = match (req.method(), path.as_str()) {
         (Method::Post, "/api/login/import") => Route::Import,
+        (Method::Post, "/api/login/rename") => Route::Rename,
         (Method::Post, "/api/login/order") => Route::Order,
-        (_, "/api/login/import" | "/api/login/order") => {
+        (_, "/api/login/import" | "/api/login/rename" | "/api/login/order") => {
             return json_error(405, "method_not_allowed", None);
         }
         _ => {
@@ -87,6 +101,7 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     };
     match route {
         Route::Import => login_import(&mut req, &runtime).await,
+        Route::Rename => login_rename(&mut req, &runtime).await,
         Route::Order => login_order(&mut req, &runtime).await,
     }
 }
@@ -106,20 +121,23 @@ async fn login_import(req: &mut Request, runtime: &WorkerRuntime) -> worker::Res
     {
         return api_failure(&message);
     }
-    let credentials = match parse_export(&body.envelope, body.passphrase.as_deref()) {
-        Ok(credentials) => credentials,
+    let mut sites = match parse_export(&body.envelope, body.passphrase.as_deref()) {
+        Ok(sites) => sites,
         Err(error) => return api_failure(&error.to_string()),
     };
-    if credentials.is_empty() {
-        return api_failure("書き出しファイルに Cookie が含まれていません");
+    if let Some(name) = body.name.as_deref() {
+        apply_import_name(&mut sites, name);
+    }
+    let logins: usize = sites.values().map(Vec::len).sum();
+    if logins == 0 {
+        return api_failure("書き出しファイルにログイン情報が含まれていません");
     }
     let store = runtime.cookie_store();
-    let imported = credentials.len();
-    let grouped = group_credentials(credentials);
+    let site_count = sites.len();
     let stored = match if body.replace {
-        replace_credentials(store, &grouped).await
+        store.replace_groups(&sites).await
     } else {
-        merge_credentials(store, &grouped).await
+        store.merge_groups(&sites).await
     } {
         Ok(stored) => stored,
         Err(error) => return api_failure(&error.to_string()),
@@ -127,7 +145,42 @@ async fn login_import(req: &mut Request, runtime: &WorkerRuntime) -> worker::Res
     let data = status_data(runtime).await;
     Response::from_json(&serde_json::json!({
         "success": true,
-        "message": format!("{imported} サイトを取り込みました (保存済み {stored} サイト)"),
+        "message": format!("{logins} 件を取り込みました ({site_count} サイト / 保存済み {stored} サイト)"),
+        "data": data,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/login/rename (native: src/web/login.rs login_rename)
+// ---------------------------------------------------------------------------
+
+async fn login_rename(req: &mut Request, runtime: &WorkerRuntime) -> worker::Result<Response> {
+    let body: RenameBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
+    };
+    let store = runtime.cookie_store();
+    let site = normalize_cookie_host(&body.site);
+    let mut groups = match store.groups_for(&site).await {
+        Ok(groups) => groups,
+        Err(error) => return api_failure(&error.to_string()),
+    };
+    if body.index >= groups.len() {
+        return api_failure(&format!(
+            "{site} の {} 番目のログイン情報はありません",
+            body.index + 1
+        ));
+    }
+    let label = body.label.trim();
+    groups[body.index].label = (!label.is_empty()).then(|| label.to_string());
+    let name = groups[body.index].display_name().to_string();
+    if let Err(error) = store.save_groups_for(&site, &groups).await {
+        return api_failure(&error.to_string());
+    }
+    let data = status_data(runtime).await;
+    Response::from_json(&serde_json::json!({
+        "success": true,
+        "message": format!("{site} の {} 番目を「{name}」にしました", body.index + 1),
         "data": data,
     }))
 }
@@ -142,98 +195,32 @@ async fn login_order(req: &mut Request, runtime: &WorkerRuntime) -> worker::Resu
         Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
     };
     let store = runtime.cookie_store();
-    let host = normalize_cookie_host(&body.host);
-    // `load_all` は親ドメインのエントリも畳み込む (native `credentials_for`
-    // と同じ `merge_credentials_for` 経路)。
-    let stored = match store.load_all(&host).await {
+    let site = normalize_cookie_host(&body.site);
+    let stored = match store.groups_for(&site).await {
         Ok(stored) => stored,
         Err(error) => return api_failure(&error.to_string()),
     };
-    let reordered = match reorder_credentials(&stored, &body.order) {
+    let reordered = match reorder_groups(&stored, &body.order) {
         Ok(reordered) => reordered,
         Err(message) => return api_failure(&message),
     };
-    if let Err(error) = store.save_all(&host, &reordered).await {
+    if let Err(error) = store.save_groups_for(&site, &reordered).await {
         return api_failure(&error.to_string());
     }
     let data = status_data(runtime).await;
     Response::from_json(&serde_json::json!({
         "success": true,
-        "message": format!("{host} の試行順を変更しました"),
+        "message": format!("{site} の試行順を変更しました"),
         "data": data,
     }))
 }
 
-// ---------------------------------------------------------------------------
-// D1 ストアへの書き戻し (native: InventoryCookieStore::merge/replace_credentials)
-// ---------------------------------------------------------------------------
-
-/// 資格情報を取り込み、既に持っているホストには後ろに足す。
-///
-/// 同じ値が既に保存済みなら重複追加しない (native `merge_credentials`)。
-/// 戻り値は書き込まれたホスト数。D1 にはマップ全体の一括書き込みが無いので、
-/// 取り込み対象のホストだけ `save_all` で書き戻す。
-async fn merge_credentials(
-    store: &D1CookieStore,
-    entries: &BTreeMap<String, Vec<LoginCredential>>,
-) -> NarouResult<usize> {
-    let mut map = store.list().await?;
-    for (host, credentials) in entries {
-        let host = normalize_cookie_host(host);
-        let stored = map.entry(host).or_default();
-        for credential in tidy_credentials(credentials) {
-            if !stored
-                .iter()
-                .any(|existing| existing.same_cookie(&credential))
-            {
-                stored.push(credential);
-            }
-        }
-    }
-    map.retain(|_, credentials| !credentials.is_empty());
-    let written = map.len();
-    for (host, _) in entries {
-        let host = normalize_cookie_host(host);
-        match map.get(&host) {
-            Some(credentials) => store.save_all(&host, credentials).await?,
-            // 取り込み分がすべて空なら既存のエントリも消える。
-            None => store.save_all(&host, &[]).await?,
-        }
-    }
-    Ok(written)
-}
-
-/// 資格情報を取り込み、取り込みに含まれないホストはすべて消す
-/// (native `replace_credentials`)。戻り値は書き込まれたホスト数。
-async fn replace_credentials(
-    store: &D1CookieStore,
-    entries: &BTreeMap<String, Vec<LoginCredential>>,
-) -> NarouResult<usize> {
-    let mut map: BTreeMap<String, Vec<LoginCredential>> = BTreeMap::new();
-    for (host, credentials) in entries {
-        let credentials = tidy_credentials(credentials);
-        if !credentials.is_empty() {
-            map.insert(normalize_cookie_host(host), credentials);
-        }
-    }
-    let written = map.len();
-    for host in store.list().await?.keys() {
-        if !map.contains_key(host) {
-            store.save_all(host, &[]).await?;
-        }
-    }
-    for (host, credentials) in &map {
-        store.save_all(host, credentials).await?;
-    }
-    Ok(written)
-}
-
 /// 並び順の指定（現在の添字の並び）を検証して適用する
-/// (native `reorder_credentials` と同じ検証とエラーメッセージ)。
-fn reorder_credentials(
-    stored: &[LoginCredential],
+/// (native `reorder_groups` と同じ検証とエラーメッセージ)。
+fn reorder_groups(
+    stored: &[LoginGroup],
     order: &[usize],
-) -> std::result::Result<Vec<LoginCredential>, String> {
+) -> std::result::Result<Vec<LoginGroup>, String> {
     if order.len() != stored.len() {
         return Err("並び順の指定が保存済みの件数と一致しません".to_string());
     }
@@ -266,4 +253,3 @@ async fn status_data(runtime: &WorkerRuntime) -> serde_json::Value {
 fn api_failure(message: &str) -> worker::Result<Response> {
     Response::from_json(&super::api_response(false, message))
 }
-

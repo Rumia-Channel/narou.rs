@@ -103,12 +103,7 @@ impl WorkerHttpClient {
     ///
     /// サイトは複数のログイン情報を持てるので、送っていない資格情報を書き換えては
     /// いけない (別アカウントのセッションを壊す)。保存値は暗号化されて書き戻る。
-    async fn persist_set_cookie(
-        &self,
-        url: &str,
-        response: &HttpResponse,
-        sent_cookie: Option<&str>,
-    ) {
+    async fn persist_set_cookie(&self, response: &HttpResponse, sent_cookie: Option<&str>) {
         let Some(store) = self.cookie_store.as_ref() else {
             return;
         };
@@ -121,9 +116,9 @@ impl WorkerHttpClient {
         if values.is_empty() {
             return;
         }
-        let Some(host) = narou_rs::platform::cookie_host_for_url(url) else {
-            return;
-        };
+        // 送った Cookie を含むホストを持つログインだけを更新する。サイトは
+        // 複数のログインを持てるので、別アカウントのセッションは触らない
+        // (native `persist_set_cookie` と同じ)。
         let Some(sent) = sent_cookie else {
             return;
         };
@@ -131,27 +126,26 @@ impl WorkerHttpClient {
         if sent_pairs.is_empty() {
             return;
         }
-        let Ok(all) = store.list().await else {
+        let Ok(all) = store.list_groups().await else {
             return;
         };
-        for key in narou_rs::platform::cookie_lookup_hosts(&host) {
-            let Some(credentials) = all.get(&key) else {
-                continue;
-            };
-            let mut updated = credentials.clone();
+        for (site, groups) in all {
+            let mut updated_groups = groups.clone();
             let mut changed = false;
-            for credential in updated.iter_mut() {
-                if !narou_rs::platform::credential_was_sent(&credential.cookie, &sent_pairs) {
+            for group in updated_groups.iter_mut() {
+                let Some(host) = group.host_for_sent(&sent_pairs).map(str::to_string) else {
                     continue;
-                }
-                let cookie = narou_rs::platform::apply_set_cookie(&credential.cookie, &values);
-                if cookie != credential.cookie {
-                    credential.cookie = cookie;
-                    changed = true;
+                };
+                if let Some(entry) = group.cookies.iter_mut().find(|entry| entry.host == host) {
+                    let updated = narou_rs::platform::apply_set_cookie(&entry.cookie, &values);
+                    if updated != entry.cookie {
+                        entry.cookie = updated;
+                        changed = true;
+                    }
                 }
             }
             if changed {
-                let _ = store.save_all(&key, &updated).await;
+                let _ = store.save_groups(&site, &updated_groups).await;
             }
         }
     }
@@ -348,7 +342,6 @@ impl HttpClient for WorkerHttpClient {
     }
 
     fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
-        let url = request.url.clone();
         let sent_cookie = request.header("Cookie").map(str::to_string);
         Box::pin(async move {
             let fetch_response = self.send_request(&request).await?;
@@ -406,7 +399,7 @@ impl HttpClient for WorkerHttpClient {
             } else {
                 fetch_response
             };
-            self.persist_set_cookie(&url, &response, sent_cookie.as_deref())
+            self.persist_set_cookie(&response, sent_cookie.as_deref())
                 .await;
             Ok(response)
         })
