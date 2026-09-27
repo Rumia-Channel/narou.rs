@@ -1,0 +1,53 @@
+name: SORAHOST relay
+
+# PteWorker のコンテナには curl / wget / python3 が入っていないため、静的 curl を
+# CI でビルドして取得リレーと一緒にデプロイする。手動実行のみ（通常の push では動かさない）。
+#
+# 必要なシークレット:
+#   SORAHOST_ENDPOINT  PteWorker のコンソールに出る接続先
+#   SORAHOST_TOKEN     同じくコンソールのデプロイトークン（`token rotate` で再発行可）
+#
+# アプリ側の PROXY_TOKEN は Pterodactyl の .env に設定する（このワークフローでは扱わない）。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build a static curl (musl)
+        run: |
+          mkdir -p build
+          docker run --rm -v "$PWD/build:/out" alpine:3.21 sh -euxc '
+            apk add --no-cache build-base openssl-dev openssl-libs-static zlib-dev zlib-static \
+              nghttp2-dev nghttp2-static brotli-dev brotli-static libidn2-dev libidn2-static perl
+            curl -fsSLo curl.tar.gz https://curl.se/download/curl-8.11.1.tar.gz
+            tar xzf curl.tar.gz
+            cd curl-8.11.1
+            ./configure --disable-shared --enable-static --with-openssl --with-zlib --with-brotli \
+              --with-nghttp2 --without-libpsl --disable-ldap --disable-ldaps --disable-manual CFLAGS="-O2"
+            make -j"$(nproc)"
+            cp src/curl /out/curl
+          '
+
+      - name: Assemble the deploy bundle
+        run: |
+          cp /etc/ssl/certs/ca-certificates.crt build/cacert.pem
+          cp scripts/sorahost-proxy/server.mjs build/server.mjs
+          chmod +x build/curl
+          cat > build/sorahost.json <<'JSON'
+          { "mode": "node", "framework": "node", "start": "node server.mjs", "include": ["server.mjs", "curl", "cacert.pem"] }
+          JSON
+          file build/curl
+          ls -la build
+
+      - name: Deploy to SORAHOST
+        env:
+          SORAHOST_ENDPOINT: ${{ secrets.SORAHOST_ENDPOINT }}
+          SORAHOST_TOKEN: ${{ secrets.SORAHOST_TOKEN }}
+        run: |
+          cd build
+          npx --yes sorahost-cli deploy --yes --json

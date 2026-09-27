@@ -25,12 +25,19 @@
 
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN = process.env.PROXY_TOKEN || "";
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 30_000;
 const CURL_TIMEOUT_SECS = 30;
+
+// CI でビルドした静的 curl をデプロイに同梱している場合はそれを使う。
+// (Pterodactyl のコンテナには curl / wget / python3 が入っていないため)
+const BUNDLED_CURL = "./curl";
+const BUNDLED_CACERT = "./cacert.pem";
+const CURL_BIN = existsSync(BUNDLED_CURL) ? BUNDLED_CURL : "curl";
 
 if (!TOKEN) {
   console.error("PROXY_TOKEN が未設定です。長いランダム文字列を設定してください。");
@@ -62,11 +69,14 @@ const viaCurl = (url, headers, manual) =>
       "--max-filesize",
       String(MAX_BODY_BYTES),
     ];
+    if (existsSync(BUNDLED_CACERT)) {
+      args.push("--cacert", BUNDLED_CACERT);
+    }
     for (const [name, value] of Object.entries(headers)) {
       args.push("-H", `${name}: ${value}`);
     }
     args.push("--", url);
-    execFile("curl", args, { maxBuffer: MAX_BODY_BYTES, encoding: "buffer" }, (error, stdout) => {
+    execFile(CURL_BIN, args, { maxBuffer: MAX_BODY_BYTES, encoding: "buffer" }, (error, stdout) => {
       if (error && !stdout?.length) {
         return reject(new Error(`curl failed: ${error.message}`));
       }
