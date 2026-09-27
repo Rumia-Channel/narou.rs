@@ -63,7 +63,7 @@ pub async fn process_batch(
 /// (best-effort — 失敗しても処理は止めない)。
 async fn notify_rejected(push: &PushHubClient, message_id: &str, reason: &str) {
     push.broadcast_best_effort(&[
-        echo(&format!("キュー投入を拒否しました ({message_id}): {reason}"), "stdout"),
+        echo(&messages::jobs::enqueue_rejected(message_id, reason), "stdout"),
         notification_queue(),
     ])
     .await;
@@ -414,7 +414,7 @@ fn first_non_empty_line(text: &str) -> &str {
 
 /// `webui.debug-mode` (local スコープ)。読み取りに失敗しても表示用なので
 /// false (= detail を載せない) に倒す。
-async fn webui_debug_mode(runtime: &WorkerRuntime) -> bool {
+pub(crate) async fn webui_debug_mode(runtime: &WorkerRuntime) -> bool {
     runtime
         .services
         .settings

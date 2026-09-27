@@ -206,7 +206,7 @@ pub async fn execute_job(
                 "job {job_id}: invalid resume checkpoint ({reason}); restarting from section 0"
             );
             push.broadcast_best_effort(&[echo(
-                &format!("再開チェックポイントが不正です ({reason})。先頭から実行し直します"),
+                &messages::jobs::resume_checkpoint_invalid(&reason),
                 "stdout",
             )])
             .await;
@@ -224,47 +224,113 @@ pub async fn execute_job(
         }
         other => other,
     };
-    // 失敗はコンソール行としても積む (イベントだけだと UI のコンソールが
-    // 空のままになり、「追加したのに何も起きない」ように見える)。
+    // 1 件分の結果行は native `commands::{download,update}` と同じ文言を
+    // 共有実装 (`emit_download_result_lines`) で出す。エラー系も native と
+    // 同じ行を使う (download は `  {error}`、update は `ID:{id} {title} の
+    // 更新は失敗しました` + debug-mode 時の `  Error detail: {error}`)。
     // 予算切れは下の Partial 分岐が理由を説明するので除く。
-    if let Err(error) = &result
-        && !matches!(error, NarouError::DownloadBudgetExpired { .. })
-    {
-        // ネイティブはエラーも stdout に出す (`error()` -> `$stdout.error`)。
-        // Web UI は target_console が stdout 以外だと 2 番目のコンソールへ
-        // 流すため、ここも stdout に揃える。
-        messages::MessageSink::emit(
-            &*push_sink,
-            messages::Stream::Stdout,
-            &messages::indented_error(error),
-        );
+    match &result {
+        Ok(result) => {
+            // native `commands::update` は `DownloadResult.title` が空のとき
+            // キャンセル行のタイトルをレコードから引き直すので、同じ解決を
+            // ここでも行う (Download では使われない)。
+            let canceled_title = if job.kind == JobKind::Update
+                && result.status == UpdateStatus::Canceled
+                && result.title.is_empty()
+            {
+                runtime
+                    .novels
+                    .get(NovelId(result.id))
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|record| record.title)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            narou_rs::application::emit_download_result_lines(
+                push_sink.as_ref(),
+                job.kind,
+                result,
+                Some(&canceled_title),
+            );
+        }
+        Err(error) if !matches!(error, NarouError::DownloadBudgetExpired { .. }) => {
+            // ネイティブはエラーも stdout に出す (`error()` -> `$stdout.error`)。
+            // Web UI は target_console が stdout 以外だと 2 番目のコンソールへ
+            // 流すため、ここも stdout に揃える。
+            use narou_rs::application::messages::MessageSink as _;
+            // `SuspendDownload` は対話/中断 (native は update/download 全体を
+            // 中断して専用行を出す)。Worker ではジョブ単位なので、kind ごとに
+            // native の中断行を出してから終端分類へ進む。
+            let line = match (job.kind, error) {
+                (_, NarouError::SuspendDownload(_)) if job.kind == JobKind::Update => {
+                    messages::update::update_interrupted().to_string()
+                }
+                (_, NarouError::SuspendDownload(_)) => {
+                    messages::download::download_interrupted().to_string()
+                }
+                (JobKind::Update, _) => {
+                    let title = match novel_id {
+                        Some(id) => runtime
+                            .novels
+                            .get(id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|record| record.title)
+                            .unwrap_or_default(),
+                        None => job.target.as_str(),
+                    };
+                    messages::update::update_failed(
+                        novel_id.map(|id| id.0).unwrap_or_default(),
+                        title,
+                    )
+                }
+                (_, _) => messages::indented_error(error),
+            };
+            push_sink.emit(messages::Stream::Stdout, &line);
+            if job.kind == JobKind::Update && crate::consumer::webui_debug_mode(runtime).await {
+                push_sink.emit(
+                    messages::Stream::Stdout,
+                    &messages::update::error_detail(error),
+                );
+            }
+        }
+        _ => {}
     }
-    // バッファに積まれた行をジョブの区切りでまとめて送信する。
-    push_sink.drain().await;
-    // ジョブの sink を isolate から外す (残すと以後の emit_default が
-    // 死んだバッファに書き込む)。
-    narou_rs::application::messages::take_default_sink();
     // ダウンロードが更新した section hash cache を D1 へ書き戻す
     // (強更新の判定ヒント。失敗は再 DL だけに効くのでログだけ残す)。
     if let Err(error) = runtime.persist_pending_section_hash_cache().await {
         console_log!("job {job_id}: section hash cache write-back failed: {error}");
     }
-    match result {
+    // バッファに積まれた行の送信は全ての emit (上の結果行と
+    // `classify_result` 内の変換案内/失敗行) が終わったジョブの区切りで
+    // まとめて行う。先に drain すると変換系の行が取り残される。
+    let outcome = match result {
         Err(NarouError::DownloadBudgetExpired {
             next_section_index,
         }) => {
             let limit = budget.exceeded_reason().unwrap_or("wall-clock");
             JobOutcome::Partial {
-                reason: format!(
-                    "section-boundary {limit} budget expired before section {next_section_index} ({} subrequests used)",
-                    runtime.subrequests.used()
+                reason: messages::jobs::budget_expired_partial(
+                    limit,
+                    next_section_index,
+                    runtime.subrequests.used(),
                 ),
                 checkpoint: WorkerExecutionCheckpoint::planned(job_id.clone(), novel_id)
                     .advance(ExecutionPhase::Fetching, Some(next_section_index as u64)),
             }
         }
-        result => classify_result(result, job, job_id, runtime).await,
-    }
+        result => classify_result(result, job, job_id, runtime, push_sink.as_ref()).await,
+    };
+    // バッファに積まれた行をジョブの区切りでまとめて送信する。
+    push_sink.drain().await;
+    // ジョブの sink を isolate から外す (残すと以後の emit_default が
+    // 死んだバッファに書き込む)。
+    narou_rs::application::messages::take_default_sink();
+    outcome
 }
 
 /// Resolve a job target to a stored novel id (native `get_data_by_target`
@@ -297,6 +363,7 @@ async fn classify_result(
     job: &JobPlan,
     job_id: &JobId,
     runtime: &WorkerRuntime,
+    sink: &dyn messages::MessageSink,
 ) -> JobOutcome {
     match result {
         Ok(result) => match result.status {
@@ -324,9 +391,18 @@ async fn classify_result(
                 // `/api/convert` と同じ Convert ジョブを積む。投入自体が
                 // 失敗したらジョブ全体を Retryable に倒す — 変換テキストが
                 // 無いまま「成功」で閉じないため。
-                match enqueue_followup_convert(runtime, job, &result).await {
+                match enqueue_followup_convert(runtime, job, &result, sink).await {
                     Ok(()) => JobOutcome::Succeeded,
-                    Err(reason) => JobOutcome::Retryable { reason },
+                    // native は変換失敗を `convert_error_line` でユーザーへ
+                    // 通知する (`commands::{download,update}` の
+                    // `convert_error_line` emit) ので、ここでも同じ行を出す。
+                    Err(reason) => {
+                        sink.emit(
+                            messages::Stream::Stdout,
+                            &messages::download::convert_error_line(&reason),
+                        );
+                        JobOutcome::Retryable { reason }
+                    }
                 }
             }
             UpdateStatus::Canceled => JobOutcome::Blocked {
@@ -383,6 +459,7 @@ async fn enqueue_followup_convert(
     runtime: &WorkerRuntime,
     job: &JobPlan,
     result: &DownloadResult,
+    sink: &dyn messages::MessageSink,
 ) -> std::result::Result<(), String> {
     // 連鎖するのは Download / Update のみ。Convert 自身がここを通らない
     // (consumer が execute_convert に分岐する) ので無限連鎖は起きない。
@@ -409,9 +486,33 @@ async fn enqueue_followup_convert(
         // (ダウンロード直後/前回変換の取りこぼし) も変換する — EPUB
         // 配信がこのオブジェクトを読むので、無いまま進めない。
         UpdateStatus::None => {
-            needs_convert_after_unchanged(runtime, NovelId(result.id)).await
+            // native `commands::update` の needs_convert: `convert_failure`
+            // フラグが立っていれば再変換し、そのとき
+            // `reconvert_after_failure` の行を出す。
+            let convert = needs_convert_after_unchanged(runtime, NovelId(result.id)).await;
+            if convert {
+                let reconvert = runtime
+                    .novels
+                    .get(NovelId(result.id))
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|record| record.convert_failure)
+                    .unwrap_or(false);
+                if reconvert {
+                    // native は web mode で `colored(..., "yellow")` が
+                    // goldenrod の span になる。同じ出力を共有形で出す
+                    // (`termcolor` は native-runtime 限定なのでここでは
+                    // console 形を使う)。
+                    sink.emit(
+                        messages::Stream::Stdout,
+                        &messages::jobs::console_reconvert_note(),
+                    );
+                }
+            }
+            convert
         }
-        _ => false,
+        UpdateStatus::Canceled | UpdateStatus::Failed => false,
     };
     if !convert {
         return Ok(());

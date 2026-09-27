@@ -721,7 +721,7 @@ fn append_update_args(
 ) {
     if let Some(message) = execution_spec_update_start_message(spec) {
         push_server.broadcast_echo(
-            &format!("<span style=\"color:#bbb\">{}</span>", message),
+            &crate::application::messages::jobs::console_note(message),
             target_console,
         );
     }

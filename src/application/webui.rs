@@ -254,6 +254,26 @@ pub fn sort_column_label(sort_state: &CurrentSortState) -> Option<&'static str> 
         .copied()
 }
 
+/// 「{列ラベル}{昇順/降順}」の表示名を組み立てる (native `src/web/jobs.rs`
+/// の `current_sort_display_string` / `requested_sort_display_string` が
+/// 使う `"ID順"` フォールバック込みの形)。列番号が範囲外なら "不明"、
+/// `dir` が "desc" 以外なら "昇順" とするのも native と同じ規則。
+/// `None` (ソート状態が未保存/不正) は "ID順"。
+pub fn sort_display_label(sort_state: Option<&CurrentSortState>) -> String {
+    match sort_state {
+        Some(sort_state) => {
+            let label = sort_column_label(sort_state).unwrap_or("不明");
+            let dir_label = if sort_state.dir == "desc" {
+                "降順"
+            } else {
+                "昇順"
+            };
+            format!("{label}{dir_label}")
+        }
+        None => "ID順".to_string(),
+    }
+}
+
 /// 主キーが Equal のとき id で安定化し、`desc` なら反転する。未知キーは
 /// `compare_records_by_key` と同じく id 比較へフォールバックする。
 pub fn sort_records(records: &mut [NovelRecord], sort_state: &CurrentSortState) {

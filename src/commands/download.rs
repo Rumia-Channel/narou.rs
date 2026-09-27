@@ -555,52 +555,16 @@ fn is_novel_frozen(target: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `narou download` の 1 件分の結果行。文言・順序・ストリームは Worker の
+/// ジョブ経路 (`worker_entry::executor`) と揃える共有実装
+/// (`application::emit_download_result_lines`) に寄せる。
 fn print_download_status(dl: &narou_rs::downloader::DownloadResult, sink: &Arc<dyn MessageSink>) {
-    match dl.status {
-        UpdateStatus::Ok => {
-            if dl.new_novel {
-                sink.emit(
-                    Stream::Stdout,
-                    &messages::dl_completed_new(&dl.title, dl.id, dl.total_count),
-                );
-            } else if dl.updated_count > 0 {
-                sink.emit(
-                    Stream::Stdout,
-                    &messages::download::update_completed(
-                        &dl.title,
-                        dl.id,
-                        dl.updated_count,
-                        dl.total_count,
-                    ),
-                );
-            } else if dl.title_changed {
-                sink.emit(
-                    Stream::Stdout,
-                    &messages::download::title_changed(dl.id, &dl.title),
-                );
-            } else if dl.story_changed {
-                sink.emit(
-                    Stream::Stdout,
-                    &messages::download::story_changed(dl.id, &dl.title),
-                );
-            } else if dl.author_changed {
-                sink.emit(
-                    Stream::Stdout,
-                    &messages::download::author_changed(dl.id, &dl.title),
-                );
-            }
-        }
-        UpdateStatus::None => {
-            sink.emit(Stream::Stdout, &messages::no_update(&dl.title));
-        }
-        UpdateStatus::Canceled => {
-            sink.emit(
-                Stream::Stdout,
-                &messages::download::update_canceled(dl.id, &dl.title),
-            );
-        }
-        UpdateStatus::Failed => {}
-    }
+    narou_rs::application::emit_download_result_lines(
+        sink.as_ref(),
+        narou_rs::application::JobKind::Download,
+        dl,
+        None,
+    );
 }
 
 fn after_process(target: &str, opts: &DownloadOptions, sink: &Arc<dyn MessageSink>) {

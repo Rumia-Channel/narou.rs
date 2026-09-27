@@ -20,7 +20,7 @@ use crate::queue::{
 use super::AppState;
 use super::sort_state::{
     CurrentSortState, current_sort_from_server_setting, load_current_sort_state, request_sort_state,
-    sort_column_key, sort_column_label, sort_ids_from_records, sort_records,
+    sort_column_key, sort_display_label, sort_ids_from_records, sort_records,
 };
 use super::state::{
     ApiResponse, ConfirmRunningTasksBody, ConvertBody, CsvImportBody, DiffBody, DiffCleanBody,
@@ -330,11 +330,8 @@ fn build_update_by_tag_queue_payload(
 }
 
 fn build_webui_update_start_message(is_update_all: bool, count: usize, sort_display: &str) -> String {
-    if is_update_all {
-        format!("全ての小説の更新を開始します（{}件を{}で処理）", count, sort_display)
-    } else {
-        format!("更新を開始します（{}件を{}で処理）", count, sort_display)
-    }
+    // 文言は Worker (`worker_entry` の update 投入経路) と同じ共有実装。
+    crate::application::messages::jobs::update_started(is_update_all, count, sort_display)
 }
 
 fn build_update_start_message_meta(message: String) -> Mapping {
@@ -2460,7 +2457,9 @@ fn reboot_args_with_no_browser(mut args: Vec<String>, hide_console: bool) -> Vec
     args
 }
 
-/// Ruby parity: build sort display string like "タイトル昇順" or "ID順"
+/// Ruby parity: build sort display string like "タイトル昇順" or "ID順".
+/// 文言組み立て自体は Worker でも使う共有実装 (`application::webui::
+/// sort_display_label`) に寄せる — 両環境の更新開始案内が同じ表示名になる。
 fn current_sort_display_string() -> String {
     let sort_state = (|| {
         let inv = crate::db::inventory::Inventory::with_default_root().ok()?;
@@ -2473,34 +2472,18 @@ fn current_sort_display_string() -> String {
         current_sort_from_server_setting(&server_setting)
     })();
 
-    match sort_state {
-        Some(sort_state) => {
-            let label = sort_column_label(&sort_state).unwrap_or("不明");
-            let dir_label = if sort_state.dir == "desc" {
-                "降順"
-            } else {
-                "昇順"
-            };
-            format!("{}{}", label, dir_label)
-        }
-        None => "ID順".to_string(),
-    }
+    sort_display_label(sort_state.as_ref())
 }
 
 fn requested_sort_display_string(
     sort_state: Option<&serde_json::Value>,
     timestamp: Option<u64>,
 ) -> String {
+    // `request_sort_state` は常に None (サーバー保存のソートが真実源) なので、
+    // 実質 `current_sort_display_string` に委譲する。Some が返る経路ができても
+    // native と同じく保存済み表示名へ倒す。
     match request_sort_state(sort_state, timestamp) {
-        Some(sort_state) => {
-            let label = sort_column_label(&sort_state).unwrap_or("不明");
-            let dir_label = if sort_state.dir == "desc" {
-                "降順"
-            } else {
-                "昇順"
-            };
-            format!("{}{}", label, dir_label)
-        }
+        Some(sort_state) => sort_display_label(Some(&sort_state)),
         None => current_sort_display_string(),
     }
 }

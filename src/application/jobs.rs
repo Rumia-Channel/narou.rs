@@ -5,7 +5,10 @@
 //! handed to the queue. This service owns that planning logic: target
 //! normalization, deduplication, and validation. It deliberately contains
 //! no queue, process, or async-execution APIs — the queue layer consumes
-//! [`JobPlan`] values and does the actual work.
+//! [`JobPlan`] values and does the actual work. The one exception is
+//! [`emit_download_result_lines`]: the per-novel console report both the
+//! native commands and the worker executor must print identically, so the
+//! wording dispatch lives here next to [`JobKind`].
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -13,6 +16,8 @@ use std::time::Duration;
 use chrono::DateTime;
 
 use crate::application::error::ApplicationError;
+use crate::application::messages::{self, MessageSink, Stream};
+use crate::downloader::{DownloadResult, UpdateStatus};
 use crate::error::NarouError;
 use crate::platform::{NovelId, PlatformFuture};
 
@@ -672,6 +677,116 @@ pub fn classify_failure(error: &NarouError) -> JobFailureClass {
     }
 }
 
+/// Emit the per-novel result lines of `narou download` / `narou update` for one
+/// [`DownloadResult`]. Shared by the native CLI (`commands::download` /
+/// `commands::update`) and the worker executor so both surfaces print the
+/// same wording in the same order on `Stream::Stdout`.
+///
+/// `narou download` と `narou update` は同じ `DownloadResult` に対して別の
+/// 文言を出す (`update_completed` の件数の有無、update だけの
+/// `sections_deleted`、全角/半角空白の差)。ここでは両コマンドが
+/// `UpdateStatus` で分岐するのと同じ形を 1 箇所に集約し、文言差は
+/// `kind` で切り替える。`UpdateStatus::Failed` は downloader 自体が
+/// `novel_unavailable` を済ませているので両コマンドとも無出力。
+///
+/// `canceled_title` は `narou update` がキャンセルされた小説に使うタイトル。
+/// native は `DownloadResult.title` が空のとき (新規対象を中断した場合など)
+/// レコードから引き直すので、呼び出し側で同じ解決を済ませて渡す。
+/// `Download` やタイトルが空にならない呼び出しでは `None` でよい
+/// (`result.title` が使われる)。
+pub fn emit_download_result_lines(
+    sink: &dyn MessageSink,
+    kind: JobKind,
+    result: &DownloadResult,
+    canceled_title: Option<&str>,
+) {
+    match result.status {
+        UpdateStatus::Ok => {
+            if result.new_novel {
+                sink.emit(
+                    Stream::Stdout,
+                    &messages::dl_completed_new(&result.title, result.id, result.total_count),
+                );
+            } else {
+                match kind {
+                    JobKind::Update => {
+                        if result.sections_deleted {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::update::sections_deleted(result.id, &result.title),
+                            );
+                        } else if result.updated_count > 0 {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::update::update_completed(&result.title),
+                            );
+                        } else if result.title_changed {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::update::title_changed(result.id, &result.title),
+                            );
+                        } else if result.story_changed {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::update::story_changed(result.id, &result.title),
+                            );
+                        } else if result.author_changed {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::update::author_changed(result.id, &result.title),
+                            );
+                        }
+                    }
+                    _ => {
+                        if result.updated_count > 0 {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::download::update_completed(
+                                    &result.title,
+                                    result.id,
+                                    result.updated_count,
+                                    result.total_count,
+                                ),
+                            );
+                        } else if result.title_changed {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::download::title_changed(result.id, &result.title),
+                            );
+                        } else if result.story_changed {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::download::story_changed(result.id, &result.title),
+                            );
+                        } else if result.author_changed {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::download::author_changed(result.id, &result.title),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        UpdateStatus::None => {
+            sink.emit(Stream::Stdout, &messages::no_update(&result.title));
+        }
+        UpdateStatus::Canceled => {
+            let title = if result.title.is_empty() {
+                canceled_title.unwrap_or_default()
+            } else {
+                result.title.as_str()
+            };
+            let line = match kind {
+                JobKind::Update => messages::update::update_canceled(result.id, title),
+                _ => messages::download::update_canceled(result.id, title),
+            };
+            sink.emit(Stream::Stdout, &line);
+        }
+        UpdateStatus::Failed => {}
+    }
+}
+
 /// A queued job together with its ledger state (for `GET /api/jobs/:id`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QueuedJobView {
@@ -1184,6 +1299,135 @@ mod tests {
         assert!(result.invalid.is_empty());
     }
 
+    /// `emit_download_result_lines` が native の `print_download_status`
+    /// (`narou download`) / `print_status_messages` (`narou update`) と同じ
+    /// 行を同じ順序で出すことを固定する。文言そのもののテストは
+    /// `messages` 側にあり、ここでは分岐・順序・ストリームだけを見る。
+    struct Lines(parking_lot::Mutex<Vec<(Stream, String)>>);
+
+    impl Lines {
+        fn new() -> Self {
+            Self(parking_lot::Mutex::new(Vec::new()))
+        }
+        fn emitted(&self) -> Vec<(Stream, String)> {
+            self.0.lock().clone()
+        }
+    }
+
+    impl MessageSink for Lines {
+        fn emit(&self, stream: Stream, text: &str) {
+            self.0.lock().push((stream, text.to_string()));
+        }
+    }
+
+    fn download_result(status: UpdateStatus) -> DownloadResult {
+        DownloadResult {
+            id: 42,
+            title: "タイトル".into(),
+            author: "作者".into(),
+            novel_dir: std::path::PathBuf::new(),
+            new_novel: false,
+            new_arrivals: false,
+            new_arrival_subtitles: Vec::new(),
+            updated_count: 0,
+            total_count: 10,
+            status,
+            title_changed: false,
+            author_changed: false,
+            story_changed: false,
+            sections_deleted: false,
+        }
+    }
+
+    #[test]
+    fn emit_download_result_lines_matches_command_wording() {
+        // `narou update` の完了行は件数を出さない。
+        let mut result = download_result(UpdateStatus::Ok);
+        result.updated_count = 2;
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Update, &result, None);
+        assert_eq!(
+            sink.emitted(),
+            [(Stream::Stdout, "タイトル の更新が完了しました".to_string())]
+        );
+
+        // `narou download` の完了行は更新件数を出す。
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Download, &result, None);
+        assert_eq!(
+            sink.emitted(),
+            [(
+                Stream::Stdout,
+                "タイトル の更新完了 (ID:42, 2/10話更新)".to_string()
+            )]
+        );
+
+        // `sections_deleted` は update だけが報告する (download は
+        // updated_count > 0 のまま完了行を出す)。
+        result.sections_deleted = true;
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Update, &result, None);
+        assert_eq!(
+            sink.emitted(),
+            [(
+                Stream::Stdout,
+                "ID:42　タイトル は一部の話が削除されています".to_string()
+            )]
+        );
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Download, &result, None);
+        assert_eq!(
+            sink.emitted(),
+            [(
+                Stream::Stdout,
+                "タイトル の更新完了 (ID:42, 2/10話更新)".to_string()
+            )]
+        );
+
+        // キャンセル行も両コマンドで区切りが違う (update=全角 / download=半角)。
+        // update は title が空のとき呼び出し側が解決したタイトルを使う。
+        result = download_result(UpdateStatus::Canceled);
+        result.title.clear();
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Update, &result, Some("復帰タイトル"));
+        assert_eq!(
+            sink.emitted(),
+            [(
+                Stream::Stdout,
+                "ID:42　復帰タイトル の更新はキャンセルされました".to_string()
+            )]
+        );
+        result.title = "タイトル".into();
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Download, &result, None);
+        assert_eq!(
+            sink.emitted(),
+            [(
+                Stream::Stdout,
+                "ID:42 タイトル の更新はキャンセルされました".to_string()
+            )]
+        );
+
+        // Failed (downloader が novel_unavailable を済ませる) と新規 DL は
+        // どちらも kind に依らない。
+        let result = download_result(UpdateStatus::Failed);
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Update, &result, None);
+        assert!(sink.emitted().is_empty());
+
+        let mut result = download_result(UpdateStatus::Ok);
+        result.new_novel = true;
+        result.total_count = 3;
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Update, &result, None);
+        assert_eq!(
+            sink.emitted(),
+            [(
+                Stream::Stdout,
+                "タイトル のDL完了 (ID:42, 3セクション)".to_string()
+            )]
+        );
+    }
     #[test]
     fn plan_normalizes_ncodes_and_deduplicates_case_insensitively() {
         let result = service().plan(&JobRequest {

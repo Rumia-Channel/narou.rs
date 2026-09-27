@@ -770,47 +770,24 @@ fn clear_convert_failure(id: i64) {
     }
 }
 
-fn print_status_messages(dl: &DownloadResult, sink: &Arc<dyn MessageSink>) {
-    match dl.status {
-        UpdateStatus::Ok => {
-            if dl.new_novel {
-                sink.emit(
-                    Stream::Stdout,
-                    &messages::dl_completed_new(&dl.title, dl.id, dl.total_count),
-                );
-            } else if dl.sections_deleted {
-                sink.emit(
-                    Stream::Stdout,
-                    &messages::update::sections_deleted(dl.id, &dl.title),
-                );
-            } else if dl.updated_count > 0 {
-                sink.emit(
-                    Stream::Stdout,
-                    &messages::update::update_completed(&dl.title),
-                );
-            } else if dl.title_changed {
-                sink.emit(
-                    Stream::Stdout,
-                    &messages::update::title_changed(dl.id, &dl.title),
-                );
-            } else if dl.story_changed {
-                sink.emit(
-                    Stream::Stdout,
-                    &messages::update::story_changed(dl.id, &dl.title),
-                );
-            } else if dl.author_changed {
-                sink.emit(
-                    Stream::Stdout,
-                    &messages::update::author_changed(dl.id, &dl.title),
-                );
-            }
-        }
-        UpdateStatus::None => {
-            sink.emit(Stream::Stdout, &messages::no_update(&dl.title));
-        }
-        UpdateStatus::Canceled => {}
-        UpdateStatus::Failed => {}
-    }
+/// `narou update` の 1 件分の結果行。文言・順序・ストリームは Worker の
+/// ジョブ経路 (`worker_entry::executor`) と揃える共有実装
+/// (`application::emit_download_result_lines`) に寄せる。
+///
+/// `canceled_title` は `DownloadResult.title` が空のとき (新規小説の中断など)
+/// のタイトル代替 — 呼び出し側が `get_novel_title` で解決した値を渡す。
+/// Worker の executor も同じ解決を行ってからこの関数を呼ぶ。
+fn print_status_messages(
+    dl: &DownloadResult,
+    sink: &Arc<dyn MessageSink>,
+    canceled_title: Option<&str>,
+) {
+    narou_rs::application::emit_download_result_lines(
+        sink.as_ref(),
+        narou_rs::application::JobKind::Update,
+        dl,
+        canceled_title,
+    );
 }
 
 fn auto_convert(dl: &DownloadResult, no_open: bool) -> Result<(), String> {
@@ -1745,8 +1722,14 @@ async fn process_novel_for_update(
     };
     match download_result {
         Ok(dl) => {
-            print_status_messages(&dl, &ctx.sink);
-
+            // キャンセル時のタイトル代替は emit 前に解決する (native と
+            // Worker で同じフォールバック規則になるよう呼び出し側に置く)。
+            let canceled_title = if dl.status == UpdateStatus::Canceled && dl.title.is_empty() {
+                get_novel_title(id)
+            } else {
+                String::new()
+            };
+            print_status_messages(&dl, &ctx.sink, Some(&canceled_title));
             if ctx.hotentry_enabled && !dl.new_arrival_subtitles.is_empty() {
                 hotentries
                     .entry(dl.id)
@@ -1798,15 +1781,8 @@ async fn process_novel_for_update(
                     return Ok(new_mistook);
                 }
                 UpdateStatus::Canceled => {
-                    let title = if dl.title.is_empty() {
-                        get_novel_title(id)
-                    } else {
-                        dl.title.clone()
-                    };
-                    ctx.sink.emit(
-                        Stream::Stdout,
-                        &messages::update::update_canceled(id, title),
-                    );
+                    // キャンセル行は `print_status_messages` が
+                    // `emit_download_result_lines` 経由で既に出している。
                     new_mistook += 1;
                     return Ok(new_mistook);
                 }

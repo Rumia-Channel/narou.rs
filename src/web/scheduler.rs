@@ -8,6 +8,7 @@ use std::time::Duration;
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, LocalResult, NaiveDate, TimeZone, Utc};
 use serde_yaml::{Number, Value};
 use tokio::task::JoinHandle;
+use crate::application::messages::jobs as job_msgs;
 use crate::application::{JobKind, JobRequest, JobService, Schedule};
 use crate::compat::{
     configure_web_subprocess_command, load_local_setting_bool, load_local_setting_string,
@@ -17,7 +18,6 @@ use crate::db;
 use crate::db::inventory::{Inventory, InventoryScope};
 use crate::progress::{WEB_PROGRESS_SCOPE_ENV, WS_LINE_PREFIX};
 use crate::queue::{JobType, PersistentQueue, QueueJob};
-use crate::termcolor::colored;
 
 use super::push::PushServer;
 use super::sort_state::{current_sort_from_server_setting, normalize_sort_key, sort_column_key};
@@ -36,17 +36,12 @@ pub fn start_auto_update_scheduler(
 
     let times = parse_schedule_times(&schedule_string);
     if times.is_empty() {
-        eprintln!(
-            "自動アップデートスケジューラーの時刻指定が不正です: {}",
-            schedule_string
+        // eprintln 経由でも同じ文言を出す (headless 実行時に stderr へ残す)。
+        let message = crate::application::messages::jobs::auto_update_schedule_invalid(
+            &schedule_string,
         );
-        push_server.broadcast_echo(
-            &format!(
-                "自動アップデートスケジューラーの時刻指定が不正です: {}",
-                schedule_string
-            ),
-            "stdout",
-        );
+        eprintln!("{message}");
+        push_server.broadcast_echo(&message, "stdout");
         return None;
     }
 
@@ -92,17 +87,10 @@ fn load_schedule_timezone(push_server: &PushServer) -> Option<chrono_tz::Tz> {
     match name.parse::<chrono_tz::Tz>() {
         Ok(timezone) => Some(timezone),
         Err(_) => {
-            eprintln!(
-                "update.auto-schedule.timezone の値が不正です (IANA 名で指定): {}",
-                name
-            );
-            push_server.broadcast_echo(
-                &format!(
-                    "update.auto-schedule.timezone の値が不正です (IANA 名で指定): {}",
-                    name
-                ),
-                "stdout",
-            );
+            let message =
+                crate::application::messages::jobs::auto_update_timezone_invalid(name);
+            eprintln!("{message}");
+            push_server.broadcast_echo(&message, "stdout");
             None
         }
     }
@@ -143,41 +131,30 @@ fn run_scheduled_auto_update(
     let now = Local::now();
     if let Err(message) = persist_last_auto_update_run(now) {
         push_server.broadcast_echo(
-            &format!("自動アップデート最終実行時刻の保存に失敗しました: {}", message),
+            &job_msgs::auto_update_last_run_save_failed(message),
             "stdout",
         );
     }
 
+    let scheduled_at = scheduled_time.format("%Y/%m/%d %H:%M:%S");
     let heading = if catch_up {
-        format!(
-            "自動アップデートを catch-up 実行します: {}",
-            scheduled_time.format("%Y/%m/%d %H:%M:%S")
-        )
+        job_msgs::auto_update_catch_up(scheduled_at)
     } else {
-        format!(
-            "自動アップデートが予定されています: {}",
-            scheduled_time.format("%Y/%m/%d %H:%M:%S")
-        )
+        job_msgs::auto_update_scheduled(scheduled_at)
     };
     push_server.broadcast_echo(&heading, "stdout");
 
     match queue_auto_update_job_if_needed(queue, running_jobs) {
         Ok((job_id, true)) => {
-            push_server.broadcast_echo(
-                &format!("自動アップデートをキューに追加しました ({})", job_id),
-                "stdout",
-            );
+            push_server.broadcast_echo(&job_msgs::auto_update_queued(job_id), "stdout");
             push_server.broadcast_event("notification.queue", "");
         }
         Ok((_, false)) => {
-            push_server.broadcast_echo(
-                "自動アップデートは既にキューまたは実行中に存在します",
-                "stdout",
-            );
+            push_server.broadcast_echo(job_msgs::auto_update_already_queued(), "stdout");
         }
         Err(message) => {
             push_server.broadcast_echo(
-                &format!("自動アップデートのキュー追加に失敗しました: {}", message),
+                &job_msgs::auto_update_enqueue_failed(message),
                 "stdout",
             );
         }
@@ -338,10 +315,7 @@ pub fn execute_auto_update(
 ) -> bool {
     auto_update_echo(
         push_server.as_ref(),
-        &format!(
-            "自動アップデートを実行中... ({})",
-            Local::now().format("%Y/%m/%d %H:%M:%S")
-        ),
+        &job_msgs::auto_update_running(Local::now().format("%Y/%m/%d %H:%M:%S")),
     );
 
     let sort_args = build_auto_update_sort_args(push_server.as_ref());
@@ -355,28 +329,19 @@ pub fn execute_auto_update(
     ) {
         auto_update_echo(
             push_server.as_ref(),
-            "自動アップデート失敗: なろうAPI更新確認",
+            &job_msgs::auto_update_failed("なろうAPI更新確認"),
         );
         return false;
     }
 
     let (modified_ids, other_ids) = collect_auto_update_target_ids(library, site_updates);
     if modified_ids.is_empty() {
-        auto_update_echo(
-            push_server.as_ref(),
-            "自動アップデート: modified タグの付いた小説はありません",
-        );
+        auto_update_echo(push_server.as_ref(), job_msgs::auto_update_no_modified());
     } else {
+        auto_update_echo(push_server.as_ref(), &job_msgs::auto_update_modified_note());
         auto_update_echo(
             push_server.as_ref(),
-            &colored("modified タグの付いた小説を更新します", "yellow"),
-        );
-        auto_update_echo(
-            push_server.as_ref(),
-            &format!(
-                "自動アップデート: modified タグの付いた小説を更新します ({}件)",
-                modified_ids.len()
-            ),
+            &job_msgs::auto_update_modified(modified_ids.len()),
         );
         let mut args = sort_args.clone();
         args.extend(modified_ids.iter().map(String::as_str));
@@ -390,24 +355,18 @@ pub fn execute_auto_update(
         ) {
             auto_update_echo(
                 push_server.as_ref(),
-                "自動アップデート失敗: modified タグ更新",
+                &job_msgs::auto_update_failed("modified タグ更新"),
             );
             return false;
         }
     }
 
     if other_ids.is_empty() {
-        auto_update_echo(
-            push_server.as_ref(),
-            "自動アップデート: 通常更新の対象となるその他小説はありません",
-        );
+        auto_update_echo(push_server.as_ref(), job_msgs::auto_update_no_others());
     } else {
         auto_update_echo(
             push_server.as_ref(),
-            &format!(
-                "自動アップデート: その他小説を通常更新します ({}件)",
-                other_ids.len()
-            ),
+            &job_msgs::auto_update_others(other_ids.len()),
         );
         let mut args = sort_args;
         args.extend(other_ids.iter().map(String::as_str));
@@ -419,12 +378,15 @@ pub fn execute_auto_update(
             job_id,
             &running_pids,
         ) {
-            auto_update_echo(push_server.as_ref(), "自動アップデート失敗: その他小説更新");
+            auto_update_echo(
+                push_server.as_ref(),
+                &job_msgs::auto_update_failed("その他小説更新"),
+            );
             return false;
         }
     }
 
-    auto_update_echo(push_server.as_ref(), "自動アップデートが正常に完了しました");
+    auto_update_echo(push_server.as_ref(), job_msgs::auto_update_completed());
     push_server.broadcast_event("table.reload", "");
     push_server.broadcast_event("tag.updateCanvas", "");
     true
@@ -432,17 +394,16 @@ pub fn execute_auto_update(
 
 fn build_auto_update_sort_args(push_server: &PushServer) -> Vec<&'static str> {
     let Some(sort_key) = read_auto_update_sort_key() else {
-        auto_update_echo(push_server, "自動アップデート: デフォルトソート順序で実行");
+        auto_update_echo(push_server, job_msgs::auto_update_default_sort());
         return Vec::new();
     };
 
     auto_update_echo(
         push_server,
-        &format!("自動アップデート: WebUIソート設定を適用 ({})", sort_key),
+        &job_msgs::auto_update_sort_applied(sort_key),
     );
     vec!["--sort-by", sort_key]
 }
-
 fn read_auto_update_sort_key() -> Option<&'static str> {
     let inventory = Inventory::with_default_root().ok()?;
     let server_setting: Value = inventory
@@ -552,10 +513,7 @@ fn run_update_phase(
     let Ok(exe) = std::env::current_exe() else {
         auto_update_echo(
             push_server.as_ref(),
-            &format!(
-                "{} で重大なエラーが発生しました（実行ファイルを取得できません）",
-                label
-            ),
+            &job_msgs::auto_update_fatal(label, job_msgs::auto_update_fatal_no_exe()),
         );
         return false;
     };
@@ -576,10 +534,7 @@ fn run_update_phase(
         Err(e) => {
             auto_update_echo(
                 push_server.as_ref(),
-                &format!(
-                    "{} で重大なエラーが発生しました（update を起動できません: {}）",
-                    label, e
-                ),
+                &job_msgs::auto_update_fatal(label, job_msgs::auto_update_fatal_spawn(e)),
             );
             return false;
         }
@@ -597,10 +552,7 @@ fn run_update_phase(
     let Ok(status) = status else {
         auto_update_echo(
             push_server.as_ref(),
-            &format!(
-                "{} で重大なエラーが発生しました（update の終了待機に失敗しました）",
-                label
-            ),
+            &job_msgs::auto_update_fatal(label, job_msgs::auto_update_fatal_wait()),
         );
         return false;
     };
@@ -608,33 +560,30 @@ fn run_update_phase(
     let Some(code) = status.code() else {
         auto_update_echo(
             push_server.as_ref(),
-            &format!("{} で重大なエラーが発生しました（終了コード不明）", label),
+            &job_msgs::auto_update_fatal(
+                label,
+                job_msgs::auto_update_fatal_no_exit_code(),
+            ),
         );
         return false;
     };
 
     match code {
         0 => {
-            auto_update_echo(push_server.as_ref(), &format!("{} が完了しました", label));
+            auto_update_echo(push_server.as_ref(), &job_msgs::auto_update_phase_done(label));
             refresh_database_after_phase(label, push_server.as_ref())
         }
         1..=127 => {
             auto_update_echo(
                 push_server.as_ref(),
-                &format!(
-                    "{} が完了しました（{}件の小説でエラーがありました）",
-                    label, code
-                ),
+                &job_msgs::auto_update_phase_done_with_errors(label, code),
             );
             refresh_database_after_phase(label, push_server.as_ref())
         }
         _ => {
             auto_update_echo(
                 push_server.as_ref(),
-                &format!(
-                    "{} で重大なエラーが発生しました（終了コード: {}）",
-                    label, code
-                ),
+                &job_msgs::auto_update_fatal(label, job_msgs::auto_update_fatal_exit_code(code)),
             );
             false
         }
@@ -647,7 +596,7 @@ fn refresh_database_after_phase(label: &str, push_server: &PushServer) -> bool {
         Err(e) => {
             auto_update_echo(
                 push_server,
-                &format!("{} 後のDB再読み込みに失敗しました: {}", label, e),
+                &job_msgs::auto_update_db_refresh_failed(label, e),
             );
             false
         }

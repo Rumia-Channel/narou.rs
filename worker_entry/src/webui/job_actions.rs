@@ -32,10 +32,11 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use narou_rs::application::webui::{
-    MAX_WEB_TAGS_PER_REQUEST, normalize_web_device_override,
+    MAX_WEB_TAGS_PER_REQUEST, normalize_web_device_override, sort_display_label,
     sort_ids_from_records, sort_records, targets_to_strings, validate_web_tag_name,
     validate_web_target_value,
 };
+use narou_rs::application::messages::jobs as job_msgs;
 use narou_rs::application::aliases::{alias_to_target_for_update, resolve_alias_target};
 use narou_rs::application::{JobKind, JobPlan, JobTarget};
 use narou_rs::db::NovelRecord;
@@ -159,7 +160,7 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     match route {
         Route::Convert => api_convert(&mut req, &env, &runtime).await,
         Route::Update => api_update(&mut req, &env, &runtime).await,
-        Route::UpdateByTag => api_update_by_tag(&mut req, &runtime).await,
+        Route::UpdateByTag => api_update_by_tag(&mut req, &env, &runtime).await,
         Route::UpdateStart | Route::UpdateGeneralLastup => unreachable!(),
     }
 }
@@ -506,7 +507,6 @@ async fn api_update(
     // (d) `push_update_job_if_needed` parity: native は結合 target 文字列の
     //     完全一致で重複を弾く。Worker の ledger dedupe は kind+target+
     //     options 単位なので、同一リクエスト内の重複 id と既キューイング済み
-    //     の id が自動で潰れる (dedupe-hit で job_id が再利用される)。
     let mut job_ids = Vec::with_capacity(ids.len());
     let mut queued_any = false;
     for id in &ids {
@@ -528,6 +528,20 @@ async fn api_update(
             queued_any = true;
         }
         job_ids.push(outcome.job_id);
+    }
+
+    // native は更新開始案内 ("全ての小説の更新を開始します…" / "更新を開始
+    // します…") をキュー投入時に `webui.message_text` メタへ積み、子プロセス
+    // の拾い上げでコンソールへ echo する。Worker はメタを持たないので、受理
+    // した時点で同じ文言を同じ形 (灰色 span = `console_note`) で送る。
+    if queued_any {
+        let sort_state = load_current_sort_state(runtime).await;
+        let message = job_msgs::update_started(
+            is_update_all,
+            count,
+            sort_display_label(Some(&sort_state)),
+        );
+        broadcast_console_note(env, runtime, &message).await;
     }
 
     Response::from_json(&json!({
@@ -694,7 +708,11 @@ async fn api_convert(
 // POST /api/update_by_tag — native `api_update_by_tag`
 // ---------------------------------------------------------------------------
 
-async fn api_update_by_tag(req: &mut Request, runtime: &WorkerRuntime) -> worker::Result<Response> {
+async fn api_update_by_tag(
+    req: &mut Request,
+    env: &Env,
+    runtime: &WorkerRuntime,
+) -> worker::Result<Response> {
     let body: UpdateByTagBody = match req.json().await {
         Ok(body) => body,
         Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
@@ -809,11 +827,33 @@ async fn api_update_by_tag(req: &mut Request, runtime: &WorkerRuntime) -> worker
         }
     }
 
+    // native と同じ更新開始案内 (タグ更新は `is_update_all=false` の形)。
+    if queued_any {
+        let message = job_msgs::update_started(
+            false,
+            count,
+            sort_display_label(Some(&server_sort_state)),
+        );
+        broadcast_console_note(env, runtime, &message).await;
+    }
+
     Response::from_json(&json!({
         "success": true,
         "count": count,
         "status": if queued_any { "queued" } else { "already_queued" },
     }))
+}
+
+/// `console_note` 形 (灰色 span) の 1 行を PushHub の `echo` で送る。
+/// native `src/web/worker.rs` が `webui.message_text` を broadcast_echo する
+/// のと同じ見え方になる。送信失敗はユーザーをブロックしない (best-effort)。
+async fn broadcast_console_note(env: &Env, runtime: &WorkerRuntime, text: &str) {
+    let push = crate::push_hub::PushHubClient::new(env, runtime.subrequests.clone());
+    push.broadcast_best_effort(&[crate::push_hub::echo(
+        &job_msgs::console_note(text),
+        "stdout",
+    )])
+    .await;
 }
 
 // ---------------------------------------------------------------------------

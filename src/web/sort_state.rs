@@ -20,7 +20,7 @@ pub use crate::application::settings_view::{SORT_COLUMN_LABELS, sort_column_labe
 // 唯一の定義を可搬層 `crate::application::webui` に置き、ここでは再エクスポートする。
 pub(crate) use crate::application::webui::{
     CurrentSortState, current_sort_from_server_setting, default_current_sort_state,
-    normalize_current_sort_request, sort_column_key, sort_column_label, sort_records,
+    normalize_current_sort_request, sort_column_key, sort_display_label, sort_records,
 };
 pub use crate::application::webui::sort_record_ordering;
 
@@ -78,11 +78,14 @@ mod tests {
     use super::{
         CurrentSortState, current_sort_from_server_setting, default_current_sort_state,
         normalize_current_sort_request, normalize_sort_key, request_preserves_input_order,
-        request_sort_state, sort_column_key, sort_column_label, sort_column_label_for_key,
-        sort_record_ordering, sort_records,
+        request_sort_state, sort_column_key, sort_column_label_for_key, sort_record_ordering,
+        sort_records,
     };
-    // 既定値は可搬層が唯一の定義（native / Worker で同じ値を使う）。
-    use crate::application::webui::{DEFAULT_CURRENT_SORT_COLUMN, DEFAULT_CURRENT_SORT_DIR};
+    // `sort_column_label` はテスト側だけが使うので本体の再エクスポートからは
+    // 外し、ここで可搬層から直接取る。
+    use crate::application::webui::{
+        DEFAULT_CURRENT_SORT_COLUMN, DEFAULT_CURRENT_SORT_DIR, sort_column_label,
+    };
     use crate::db::NovelRecord;
     use crate::web::sort_state::SORT_COLUMN_KEYS;
     use chrono::{TimeZone, Utc};

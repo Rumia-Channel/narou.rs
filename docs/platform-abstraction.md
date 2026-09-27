@@ -557,6 +557,23 @@ Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト（�
   CI が静的 curl と CA バンドルを同梱して配布する）。配布は `platform.yml` の
   `relay-deploy` ジョブが行い、develop / production のデプロイはその後に直列で走る。
 
+### 操作ごとのメッセージ（native CLI / Worker Web コンソール）
+
+文言は `src/application/messages.rs`（および `messages::jobs`）が唯一の出所。native は端末へ、
+Worker は `PushHubSink` 経由で Web コンソールの `#console` へ流す。**通常のメッセージもエラー行も
+`Stream::Stdout`**（native がエラーを stdout に出しているのに合わせる。Web UI は `target_console`
+が `stdout` 以外だと 2 番目のコンソールへ回すため）。
+
+| 操作 | メッセージ（例） | native | Worker | タイミング |
+|---|---|---|---|---|
+| download | `ID:n <title> のDL開始` / `第N部分 <subtitle> (n/m)` / `… のDL完了` | ✅ | ✅ `emit_download_result_lines` | DL開始・各話・完了 |
+| update | `更新を開始します（N件を…で処理）` / `… を更新しました` / `更新はありません` / 中断・失敗行 | ✅ | ✅（開始は API の enqueue 時、結果はジョブ実行時） | 開始・結果 |
+| convert | `変換処理開始: …` / `[1/1] 処理中: …` / `novel.txt を出力しました` / `変換処理完了: …` | ✅ | ✅ `emit_convert_item_lines` | 開始・進捗・完了 |
+| ダウンロード後の自動変換 | 再変換の通知（`前回変換失敗した小説の再変換…` 等）／enqueue 失敗行 | ✅ | ✅ | 変換ジョブ投入時 |
+| 予算切れ・チェックポイント無効 | `budget_expired_partial` / `resume_checkpoint_invalid` | ✅ | ✅ | ジョブ中断時 |
+| auto-update（スケジューラ） | `自動アップデートが予定されています` / catch-up 実行 | ✅ | ❌ 文言は `messages::jobs::*` に用意済みだが、Worker の planner には投稿点が無い（既知の差分） | 予約・実行 |
+| send / mail / backup | 各種 | ✅ | ❌ Worker では実行不可（サブプロセス・シリアルメール前提） | — |
+
 ### 残っている重複（次の候補）
 
 | 対象 | 現状 | 方針 |
