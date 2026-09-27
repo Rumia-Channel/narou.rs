@@ -94,12 +94,18 @@
 
   function renderSettingItem(setting) {
     const ineffective = setting.worker_ineffective === true;
+    // disabled 属性に加えて行自体にも理由を title で出す (コントロールの
+    // ツールチップはブラウザによって disabled で出ないため)。
+    const reason = ineffective
+      ? (setting.worker_note || 'この設定はこの環境では効きません')
+      : '';
     let html = '<div class="list-group-item' + (ineffective ? ' setting-worker-ineffective' : '') +
-               '" data-setting="' + escapeAttr(setting.name) + '">';
+               '" data-setting="' + escapeAttr(setting.name) + '"' +
+               (ineffective ? ' aria-disabled="true" title="' + escapeAttr(reason) + '"' : '') + '>';
     html += '<h4 class="list-group-item-heading">' + escapeHtml(setting.name) +
             (ineffective ? ' <small class="text-muted">(Worker では無効)</small>' : '') + '</h4>';
     html += '<div class="list-group-item-text">';
-    html += renderControl(setting);
+    html += renderControl(setting, ineffective);
 
     // Help text
     if (setting.help) {
@@ -114,59 +120,60 @@
     return html;
   }
 
-  function renderControl(setting) {
+  function renderControl(setting, disabled) {
     const name = setting.name;
     const value = setting.value;
     const type = setting.var_type;
+    const dis = disabled ? ' disabled' : '';
 
     if (type === 'boolean') {
       if (setting.three_way) {
-        return renderThreeWay(name, value);
+        return renderThreeWay(name, value, dis);
       }
-      return renderToggle(name, value);
+      return renderToggle(name, value, dis);
     }
 
     if (type === 'select') {
-      return renderSelect(name, value, setting.select_keys || [], setting.select_summaries || []);
+      return renderSelect(name, value, setting.select_keys || [], setting.select_summaries || [], dis);
     }
 
     if (type === 'multiple') {
-      return renderMultiple(name, value, setting.select_keys || [], setting.select_summaries || []);
+      return renderMultiple(name, value, setting.select_keys || [], setting.select_summaries || [], dis);
     }
 
     // text / integer / float / string / directory
     const placeholder = getPlaceholder(type);
     const strVal = (value !== null && value !== undefined) ? String(value) : '';
     return '<input type="text" class="setting-input" data-name="' + escapeAttr(name) +
-           '" value="' + escapeAttr(strVal) + '" placeholder="' + escapeAttr(placeholder) + '">';
+           '" value="' + escapeAttr(strVal) + '" placeholder="' + escapeAttr(placeholder) + '"' + dis + '>';
   }
 
-  function renderToggle(name, value) {
+  function renderToggle(name, value, dis) {
     const checked = value === true ? ' checked' : '';
     return '<label class="switch-light">' +
-           '<input type="checkbox" data-name="' + escapeAttr(name) + '"' + checked + '>' +
+           '<input type="checkbox" data-name="' + escapeAttr(name) + '"' + checked + dis + '>' +
            '<span class="switch-track"></span>' +
            '<span class="switch-label-text">' + (value ? 'はい' : 'いいえ') + '</span>' +
            '</label>';
   }
 
-  function renderThreeWay(name, value) {
+  function renderThreeWay(name, value, dis) {
     const nilChecked = (value === null || value === undefined) ? ' checked' : '';
     const offChecked = (value === false) ? ' checked' : '';
     const onChecked = (value === true) ? ' checked' : '';
 
     return '<div class="switch-3way">' +
-           '<input type="radio" id="' + escapeAttr(name) + '-nil" name="' + escapeAttr(name) + '" value="nil"' + nilChecked + '>' +
+           '<input type="radio" id="' + escapeAttr(name) + '-nil" name="' + escapeAttr(name) + '" value="nil"' + nilChecked + dis + '>' +
            '<label for="' + escapeAttr(name) + '-nil">未設定</label>' +
-           '<input type="radio" id="' + escapeAttr(name) + '-off" name="' + escapeAttr(name) + '" value="off"' + offChecked + '>' +
+           '<input type="radio" id="' + escapeAttr(name) + '-off" name="' + escapeAttr(name) + '" value="off"' + offChecked + dis + '>' +
            '<label for="' + escapeAttr(name) + '-off">いいえ</label>' +
-           '<input type="radio" id="' + escapeAttr(name) + '-on" name="' + escapeAttr(name) + '" value="on"' + onChecked + '>' +
+           '<input type="radio" id="' + escapeAttr(name) + '-on" name="' + escapeAttr(name) + '" value="on"' + onChecked + dis + '>' +
            '<label for="' + escapeAttr(name) + '-on">はい</label>' +
            '</div>';
   }
 
-  function renderSelect(name, value, keys, summaries) {
-    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '">';
+  function renderSelect(name, value, keys, summaries, dis) {
+    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '"' + dis + '>';
     const isTheme = (name === 'webui.theme');
     const isNewTagColor = (name === 'webui.new-tag-color');
     if (!isNewTagColor) {
@@ -181,7 +188,7 @@
     return html;
   }
 
-  function renderMultiple(name, value, keys, summaries) {
+  function renderMultiple(name, value, keys, summaries, dis) {
     let selectedItems = [];
     if (Array.isArray(value)) {
       selectedItems = value;
@@ -189,7 +196,7 @@
       selectedItems = value.split(',').map(function(s) { return s.trim(); });
     }
 
-    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '" multiple>';
+    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '" multiple' + dis + '>';
     keys.forEach(function(key, index) {
       const selected = selectedItems.includes(key) ? ' selected' : '';
       const label = summaries[index] || key;
@@ -640,14 +647,17 @@
   function collectFormData() {
     const data = {};
 
-    // Checkboxes (normal boolean)
+    // Worker 版で無効化されたコントロール (disabled) は値を送らない。
+    // サーバー側でも同じ名前を拒否するが、送らなければ他の項目の保存を
+    // 巻き込んで失敗させることがない。
     document.querySelectorAll('.switch-light input[type="checkbox"][data-name]').forEach(function(input) {
+      if (input.disabled) return;
       data[input.dataset.name] = input.checked;
     });
 
     // Radio buttons (3-way)
     document.querySelectorAll('.switch-3way').forEach(function(group) {
-      const checked = group.querySelector('input[type="radio"]:checked');
+      const checked = group.querySelector('input[type="radio"]:checked:not(:disabled)');
       if (checked) {
         const name = checked.name;
         const val = checked.value;
@@ -663,6 +673,7 @@
 
     // Selects (single)
     document.querySelectorAll('select.setting-select:not([multiple])[data-name]').forEach(function(sel) {
+      if (sel.disabled) return;
       const name = sel.dataset.name;
       const val = sel.value;
       data[name] = val === '' ? null : val;
@@ -670,6 +681,7 @@
 
     // Selects (multiple)
     document.querySelectorAll('select.setting-select[multiple][data-name]').forEach(function(sel) {
+      if (sel.disabled) return;
       const name = sel.dataset.name;
       const selected = Array.from(sel.selectedOptions).map(function(opt) { return opt.value; });
       data[name] = selected.length > 0 ? selected.join(',') : null;
@@ -677,6 +689,7 @@
 
     // Text inputs
     document.querySelectorAll('input.setting-input[type="text"][data-name]').forEach(function(input) {
+      if (input.disabled) return;
       const name = input.dataset.name;
       const val = input.value.trim();
       data[name] = val === '' ? null : val;

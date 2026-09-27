@@ -100,6 +100,12 @@
   opacity: 0.6;
 }
 
+.list-group-item.setting-worker-ineffective input,
+.list-group-item.setting-worker-ineffective select,
+.list-group-item.setting-worker-ineffective label {
+  cursor: not-allowed;
+}
+
 .list-group-item-heading {
   font-size: 0.9375rem;
   font-weight: 600;
