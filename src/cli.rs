@@ -969,6 +969,11 @@ pub enum Commands {
         #[arg(short = 'm', long)]
         more: bool,
     },
+    /// Authors whose works are tracked (add/list/remove/check).
+    Author {
+        #[command(subcommand)]
+        action: crate::commands::author::AuthorAction,
+    },
     /// Login credentials shared with a browser machine (list/import/export/rename/order/clear).
     Login {
         #[command(subcommand)]

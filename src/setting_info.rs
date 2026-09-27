@@ -160,8 +160,9 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "server-basic-auth.password"
         | "server-ws-add-accepted-domains"
         | "server-add-accepted-hosts"
-        | "convert.epub-font"
         | "self-update.variant"
+        | "convert.epub-engine"
+        | "convert.epub-font"
         | "over18" => Some("global"),
 
         _ => None,
@@ -955,6 +956,13 @@ pub fn setting_variables() -> SettingVariables {
             sel(
                 "EPUB の本文フォント。auto: 濁点注記のある小説だけ濁点フォント (DMincho) を使う / always: 常に DMincho を埋め込んで本文を組む (Reader が全角スペース等を描けない場合の回避策)",
                 vec!["auto", "always"],
+            ),
+        ),
+        (
+            "convert.epub-engine",
+            sel(
+                "EPUB 生成エンジンの選択。auto: 外部 AozoraEpub3 があればそれを使い、無ければ組み込み (Lite) / lite: 組み込みを強制 (要 lite ビルド) / external: 外部を強制",
+                vec!["auto", "lite", "external"],
             ),
         ),
         (

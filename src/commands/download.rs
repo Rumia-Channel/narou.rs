@@ -139,10 +139,16 @@ async fn cmd_download_inner(
             };
             downloader.set_progress(progress);
 
-            match downloader
-                .download_novel_with_force(&download_target, opts.force)
-                .await
-            {
+            // 数値 ID が分かっているときはダウンロード中ロックする
+            // (別レーンの変換と同時に触らない)。
+            let locked_id = download_target.trim().parse::<i64>().ok();
+            let download_result = {
+                let _lock = narou_rs::compat::NovelLockGuard::acquire(locked_id);
+                downloader
+                    .download_novel_with_force(&download_target, opts.force)
+                    .await
+            };
+            match download_result {
                 Ok(dl) => {
                     print_download_status(&dl, sink);
 
@@ -418,6 +424,35 @@ pub(crate) fn get_data_by_target(target: &str) -> Option<RecordInfo> {
                 toc_url: r.toc_url,
             }),
     }
+}
+
+/// Whether `target` is already managed.
+///
+/// Used by the author check to skip works that are already in the library
+/// before going through the whole download path.
+pub fn target_is_known(target: &str) -> bool {
+    if let Some(toc_url) = resolve_toc_url_from_url(target)
+        && let Ok(Some(_)) = narou_rs::native::novel_repository::NativeNovelRepository::new()
+            .find_by_toc_url_sync(&toc_url)
+    {
+        return true;
+    }
+    let settings = match narou_rs::downloader::site_setting::SiteSetting::load_all() {
+        Ok(settings) => settings,
+        Err(_) => return false,
+    };
+    settings
+        .iter()
+        .filter(|setting| setting.matches_url(target))
+        .filter_map(|setting| setting.extract_url_captures(target))
+        .filter_map(|captures| captures.get("ncode").cloned())
+        .any(|ncode| {
+            narou_rs::native::novel_repository::NativeNovelRepository::new()
+                .find_by_ncode_sync(&ncode)
+                .ok()
+                .flatten()
+                .is_some()
+        })
 }
 
 fn resolve_toc_url_from_url(target: &str) -> Option<String> {

@@ -132,6 +132,7 @@ async fn api_list_inner(
             frozen: record.frozen,
             suspend: record.suspend,
             length: record.length,
+            display_url: record.display_url,
             toc_url: record.toc_url,
             ncode: record.ncode,
             general_all_no: record.general_all_no,
@@ -145,6 +146,7 @@ async fn api_list_inner(
         data,
     }))
 }
+
 
 pub async fn get_novel(
     State(state): State<AppState>,
@@ -672,6 +674,7 @@ mod tests {
             length: Some(1234),
             toc_url: "https://example.com".to_string(),
             ncode: Some("n1234ab".to_string()),
+            display_url: "https://example.com".to_string(),
             general_all_no: Some(99),
         };
 

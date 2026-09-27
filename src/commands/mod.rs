@@ -10,6 +10,7 @@ pub mod backup;
 pub mod browser;
 pub mod clean;
 pub mod convert;
+pub mod author;
 pub mod csv;
 pub mod db;
 pub mod diff;

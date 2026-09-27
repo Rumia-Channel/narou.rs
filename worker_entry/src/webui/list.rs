@@ -147,6 +147,7 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
             suspend: record.suspend,
             length: record.length,
             toc_url: record.toc_url,
+            display_url: record.display_url,
             ncode: record.ncode,
             general_all_no: record.general_all_no,
         })

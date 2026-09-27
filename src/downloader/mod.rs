@@ -692,6 +692,195 @@ impl Downloader {
             .unwrap_or_default()
     }
 
+    /// Fetch an author page and list the work URLs its definition finds.
+    ///
+    /// Uses the same transport and rate limiter as a novel fetch, so a site
+    /// that spaces requests (Pixiv, なろう) is spaced here too. A definition
+    /// without `author_novel_pattern` yields no URLs.
+    pub async fn author_novel_urls(
+        &self,
+        setting: &SiteSetting,
+        page_url: &str,
+    ) -> Result<Vec<String>> {
+        if setting.author_novel_urls("").is_none() {
+            return Err(NarouError::SiteSetting(format!(
+                "{} に author_novel_pattern がありません",
+                setting.sitename
+            )));
+        }
+        let mut setting = setting.clone();
+        // 保存済みのログインがあれば作者ページにも送る (ログインが要る作者ページ
+        // のため)。無ければ定義の cookie だけで取得する。
+        let groups = self.stored_groups_for(&setting).await;
+        if let Some(group) = groups.first().map(|group| group.merged_cookie()) {
+            setting.cookie = crate::platform::merge_cookie_headers(setting.cookie(), Some(&group));
+        }
+        let setting = &setting;
+        let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
+        // Sites with an author API (なろう) answer with JSON instead of HTML.
+        let mut fetch_url = setting.author_fetch_url(page_url);
+        let mut urls: Vec<String> = Vec::new();
+        // Pixiv は 1 話ずつが作者の作品一覧に混ざる。定義が出す
+        // `author_series::<id>` を集めておき、その回の話を後で除く。
+        let mut series: Vec<String> = Vec::new();
+        // 漫画シリーズの各ページも単体イラスト一覧に混ざる。
+        let mut comic_series: Vec<String> = Vec::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // 一覧がページ分けされているサイト (ハーメルン) は次ページを辿る。
+        // 次ページが無くなるか、既に訪れた URL に戻ったら終わり。訪問済みを
+        // 覚えているのでページ数の上限は要らない。
+        loop {
+            if !visited.insert(fetch_url.clone()) {
+                break;
+            }
+            let mut body = crate::downloader::http_policy::fetch_text(
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
+                &fetch_url,
+                &policy,
+                Some(setting.encoding()),
+            )
+            .await?;
+            // `preprocess:` の DSL が `author_novel::` / `author_series::` を
+            // 出せるように、本文を定義に通してから読み取る。
+            crate::downloader::util::pretreatment_source(
+                &mut body,
+                setting.encoding(),
+                Some(setting),
+            );
+            for url in setting.author_novel_urls(&body).unwrap_or_default() {
+                if !urls.contains(&url) {
+                    urls.push(url);
+                }
+            }
+            for id in setting.author_series_ids(&body) {
+                if !series.contains(&id) {
+                    series.push(id);
+                }
+            }
+            for id in setting.author_comic_series_ids(&body) {
+                if !comic_series.contains(&id) {
+                    comic_series.push(id);
+                }
+            }
+            match setting.author_next_url(&body) {
+                Some(next) => fetch_url = next,
+                None => break,
+            }
+        }
+        // シリーズに属する話/ページは作者の作品ではないので落とす (取得できなければ
+        // そのまま返す: 一覧の取りこぼしより、余分に足さない方が害が小さい)。
+        let mut inside_series: Vec<String> = Vec::new();
+        if !series.is_empty()
+            && setting.author_series_episodes_url.is_some()
+            && let Ok(ids) = self.author_series_episodes(setting, page_url, &series).await
+        {
+            inside_series.extend(ids);
+        }
+        if !comic_series.is_empty()
+            && setting.author_comic_series_pages_url.is_some()
+            && let Ok(ids) = self.author_comic_series_pages(setting, page_url, &comic_series).await
+        {
+            inside_series.extend(ids);
+        }
+        if !inside_series.is_empty() {
+            urls.retain(|url| !inside_series.iter().any(|id| url_mentions_id(url, id)));
+        }
+        Ok(urls)
+    }
+
+    /// Artwork ids of the given comic series, read page by page until a page
+    /// stops adding anything (Pixiv returns 12 artworks per page).
+    ///
+    /// Best effort like [`Self::author_series_episodes`].
+    async fn author_comic_series_pages(
+        &self,
+        setting: &SiteSetting,
+        page_url: &str,
+        series: &[String],
+    ) -> Result<Vec<String>> {
+        const MAX_PAGES: usize = 100;
+        let captures = setting
+            .extract_author_url_captures(page_url)
+            .unwrap_or_default();
+        let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
+        let mut pages: Vec<String> = Vec::new();
+        for series_id in series {
+            for page in 1..=MAX_PAGES {
+                let Some(url) =
+                    setting.author_comic_series_pages_fetch_url(&captures, series_id, page)
+                else {
+                    break;
+                };
+                let Ok(body) = crate::downloader::http_policy::fetch_text(
+                    self.http.as_ref(),
+                    self.rate_limiter.as_ref(),
+                    &url,
+                    &policy,
+                    Some(setting.encoding()),
+                )
+                .await
+                else {
+                    break;
+                };
+                let ids = setting.author_comic_series_page_ids(&body);
+                if ids.is_empty() {
+                    break;
+                }
+                let before = pages.len();
+                for id in ids {
+                    if !pages.contains(&id) {
+                        pages.push(id);
+                    }
+                }
+                if pages.len() == before {
+                    // 同じページが返り続ける定義でも止まる。
+                    break;
+                }
+            }
+        }
+        Ok(pages)
+    }
+
+    /// Episode ids of the given series, fetched through the definition.
+    ///
+    /// Best effort: a series that cannot be read contributes nothing, so its
+    /// episodes stay in the listing instead of silently vanishing.
+    async fn author_series_episodes(
+        &self,
+        setting: &SiteSetting,
+        page_url: &str,
+        series: &[String],
+    ) -> Result<Vec<String>> {
+        let captures = setting
+            .extract_author_url_captures(page_url)
+            .unwrap_or_default();
+        let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
+        let mut episodes: Vec<String> = Vec::new();
+        for series_id in series {
+            let Some(url) = setting.author_series_episodes_fetch_url(&captures, series_id) else {
+                continue;
+            };
+            let Ok(body) = crate::downloader::http_policy::fetch_text(
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
+                &url,
+                &policy,
+                Some(setting.encoding()),
+            )
+            .await
+            else {
+                continue;
+            };
+            for id in setting.author_series_episode_ids(&body) {
+                if !episodes.contains(&id) {
+                    episodes.push(id);
+                }
+            }
+        }
+        Ok(episodes)
+    }
+
 
     /// [`Self::with_platform_and_storage_and_settings`] with bundled values.
     #[cfg(feature = "native-runtime")]
@@ -2070,6 +2259,12 @@ impl Downloader {
             login_session: login_session.clone(),
             extra_fields: Default::default(),
         };
+        // 取得に使う URL (toc_url) と利用者が指定した URL が違う場合、後者を
+        // 控えておく。Pixiv は toc_url が API なので、Web UI のリンクが
+        // API を開いてしまうのを避ける (通常サイトは両者同じなので記録しない)。
+        if target != record.toc_url {
+            record.set_original_url(target.to_string());
+        }
         if track_raw_title {
             record.set_raw_title(raw_title);
         }
@@ -2126,6 +2321,10 @@ impl Downloader {
                     updated.requires_login |= requires_login;
                     if login_session.is_some() {
                         updated.login_session = login_session.clone();
+                    }
+                    // 既存の小説をページ URL 指定で取り直したときも控え直す。
+                    if target != updated.toc_url && updated.original_url().is_none() {
+                        updated.set_original_url(target.to_string());
                     }
                     for tag in &auto_tags {
                         if !updated.tags.contains(tag) {
@@ -2632,6 +2831,17 @@ fn apply_login_cookie(setting: &mut SiteSetting, login_cookie: &str) {
 /// マイピク restricts some to mutual followers), so the marker disappearing is
 /// not the only success: collecting more sections also counts. A retry that
 /// changes nothing keeps the earlier result.
+/// Whether a work URL names the given id (`?id=123`, `/123/`, …).
+///
+/// Ids are compared as whole tokens so `123` never matches `1234`.
+fn url_mentions_id(url: &str, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    url.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == id)
+}
+
 fn is_improved_toc(
     setting: &SiteSetting,
     before: std::result::Result<&String, &NarouError>,
@@ -2679,6 +2889,7 @@ fn should_retry_with_login(setting: &SiteSetting, toc_source: &Result<String>) -
 #[cfg(test)]
 mod tests {
     use super::novel_info::NovelInfo;
+    use super::url_mentions_id;
     use super::persistence::PersistenceService;
     use super::site_setting::{SiteSetting, SiteSettingValue};
     use super::types::{SectionElement, TocFile};
@@ -3430,6 +3641,220 @@ is_narou: false
         let mut source = json.to_string();
         super::util::pretreatment_source(&mut source, "UTF-8", Some(setting));
         source
+    }
+
+    #[test]
+    fn a_target_that_differs_from_the_toc_url_is_remembered() {
+        // Pixiv は取得に API を使うため toc_url が API になる。利用者が指定した
+        // ページ URL を控えておかないと、Web UI のリンクが API を開いてしまう。
+        let record = crate::db::novel_record::NovelRecord {
+            toc_url: "https://www.pixiv.net/ajax/novel/series/768265".to_string(),
+            ..sample_record(chrono::Utc::now())
+        };
+        assert_eq!(record.display_url(), record.toc_url, "未記録なら toc_url");
+
+        let mut record = record;
+        record.set_original_url("https://www.pixiv.net/novel/series/768265");
+        assert_eq!(
+            record.display_url(),
+            "https://www.pixiv.net/novel/series/768265"
+        );
+        // 追加フィールドとして保存され、往復しても保たれる。
+        let yaml = serde_yaml::to_string(&record).unwrap();
+        assert!(yaml.contains("original_url:"), "got {yaml}");
+        let back: crate::db::novel_record::NovelRecord = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.display_url(), record.display_url());
+    }
+
+    #[test]
+    fn paged_author_listings_are_followed_to_the_end() {
+        // ハーメルンの作者ページは検索ページの一覧を page=2, 3… と辿る。
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|setting| setting.domain == "syosetu.org")
+            .unwrap();
+        let page = "https://syosetu.org/user/495125/";
+        let first = "https://syosetu.org/search/?mode=search_user_novel_list&uid=495125";
+        assert_eq!(setting.author_fetch_url(page), first);
+        assert!(setting.matches_author_url(page));
+        assert!(!setting.matches_author_url("https://syosetu.org/novel/388533/"));
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            first,
+            200,
+            r#"<a href="https://h.syosetu.org/novel/388533/">作品1</a>
+               <a href="https://h.syosetu.org/novel/388533/1.html">第1話</a>
+               <li><a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=2">>></a></li>"#,
+        );
+        http.add_text(
+            "https://syosetu.org/search/?mode=search_user_novel_list&word=&uid=495125&page=2",
+            200,
+            r#"<a href="https://syosetu.org/novel/388855/">作品2</a>
+               <li><a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=1"><<</a></li>
+               <li><a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=3">>></a></li>"#,
+        );
+        http.add_text(
+            "https://syosetu.org/search/?mode=search_user_novel_list&word=&uid=495125&page=3",
+            200,
+            r#"<a href="https://syosetu.org/novel/400001/">作品3</a>"#,
+        );
+        let downloader = Downloader::with_platform(
+            Arc::new(http),
+            Arc::new(FakeRateLimiter::new()),
+            Arc::new(MemoryNovelRepository::new()),
+        )
+        .unwrap();
+        let urls = futures::executor::block_on(downloader.author_novel_urls(setting, page)).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://h.syosetu.org/novel/388533/".to_string(),
+                "https://syosetu.org/novel/388855/".to_string(),
+                "https://syosetu.org/novel/400001/".to_string()
+            ],
+            "話ページを作品として数えず、>> の付いた次ページだけを辿る (上限なしで終端まで)"
+        );
+    }
+
+    #[test]
+    fn a_pager_that_links_back_does_not_loop() {
+        // 終端で先頭に戻るページャでも、訪問済みなら止まる (上限は設けない)。
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|setting| setting.domain == "syosetu.org")
+            .unwrap();
+        let page = "https://syosetu.org/user/495125/";
+        let first = "https://syosetu.org/search/?mode=search_user_novel_list&uid=495125";
+        let second = "https://syosetu.org/search/?mode=search_user_novel_list&word=&uid=495125&page=2";
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            first,
+            200,
+            r#"<a href="https://syosetu.org/novel/1/">作品1</a>
+               <a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=2">>></a>"#,
+        );
+        http.add_text(
+            second,
+            200,
+            r#"<a href="https://syosetu.org/novel/2/">作品2</a>
+               <a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;uid=495125">>></a>"#,
+        );
+        let downloader = Downloader::with_platform(
+            Arc::new(http),
+            Arc::new(FakeRateLimiter::new()),
+            Arc::new(MemoryNovelRepository::new()),
+        )
+        .unwrap();
+        let urls = futures::executor::block_on(downloader.author_novel_urls(setting, page)).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://syosetu.org/novel/1/".to_string(),
+                "https://syosetu.org/novel/2/".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn author_pages_fall_back_to_the_sites_own_api() {
+        // なろうの作者ページは小説API から作品を取る: 定義の `author_api_url`
+        // に作者ページの capture が流し込まれ、応答の `ncode` から作品 URL を
+        // 組み立てる (大文字の ncode は小文字化する)。
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|setting| setting.domain == "ncode.syosetu.com")
+            .unwrap();
+        let page = "https://mypage.syosetu.com/2842627/";
+        assert_eq!(
+            setting.author_fetch_url(page),
+            "https://api.syosetu.com/novelapi/api/?out=json&userid=2842627&lim=500"
+        );
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            setting.author_fetch_url(page),
+            200,
+            r#"[{"allcount":2},{"ncode":"N5181MT","title":"作品1"},{"ncode":"N6275MR","title":"作品2"}]"#,
+        );
+        let downloader = Downloader::with_platform(
+            Arc::new(http),
+            Arc::new(FakeRateLimiter::new()),
+            Arc::new(MemoryNovelRepository::new()),
+        )
+        .unwrap();
+        let urls = futures::executor::block_on(downloader.author_novel_urls(setting, page)).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://ncode.syosetu.com/n5181mt/".to_string(),
+                "https://ncode.syosetu.com/n6275mr/".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn pixiv_author_listing_yields_novels_and_series() {
+        // 作者ページの作品一覧 (/ajax/user/{id}/profile/all) を preprocess に通すと、
+        // 単体小説と小説シリーズが作品として並ぶ。
+        let json = r#"{"error":false,"message":"","body":{"novels":{"2594847":null,"2610142":null},
+            "novelSeries":[{"id":"272850","userId":"1"},{"id":"551006","userId":"1"}],
+            "mangaSeries":[{"id":"329992","userId":"1"}],
+            "illusts":{"149803200":null,"149768354":null},
+            "manga":[]}}"#;
+        let html = run_pixiv_preprocess(json);
+
+        assert!(html.contains("author_novel::https://www.pixiv.net/novel/show.php?id=2594847"));
+        assert!(html.contains("author_novel::https://www.pixiv.net/novel/show.php?id=2610142"));
+        assert!(html.contains("author_novel::https://www.pixiv.net/novel/series/272850"));
+        assert!(html.contains("author_novel::https://www.pixiv.net/novel/series/551006"));
+        // 漫画シリーズも作品として並ぶ。
+        assert!(html.contains("author_novel::https://www.pixiv.net/ajax/series/329992"));
+        assert!(html.contains("author_comic_series::329992"));
+        // 単体イラストも作品。古い順に並べる (一覧は新しい順で返る)。
+        assert!(html.contains("author_novel::https://www.pixiv.net/artworks/149803200"));
+        assert!(html.contains("author_novel::https://www.pixiv.net/artworks/149768354"));
+        // 並びは一覧の JSON 順 (id の文字列昇順) で、narou_bridge の sorted() と同じ。
+        assert!(
+            html.find("artworks/149768354") < html.find("artworks/149803200"),
+            "一覧の順に並べる: {html}"
+        );
+        // 空のときは配列で返るので、その場合は何も出さない。
+        assert!(!html.contains("artworks/manga"));
+
+        let setting = pixiv_setting();
+        let urls = setting.author_novel_urls(&html).expect("Pixiv lists works");
+        assert_eq!(urls.len(), 7, "got {urls:?}");
+        assert!(urls.iter().any(|url| url.ends_with("/ajax/series/329992")));
+        assert_eq!(setting.author_comic_series_ids(&html), vec!["329992"]);
+        assert_eq!(
+            setting.author_comic_series_page_ids(r#"{"page":{"series":[{"workId":"138467437","order":5}]}}"#),
+            vec!["138467437"]
+        );
+        let mut captures = HashMap::new();
+        captures.insert("user_id".to_string(), "6519870".to_string());
+        assert_eq!(
+            setting.author_comic_series_pages_fetch_url(&captures, "329992", 2),
+            Some("https://www.pixiv.net/ajax/series/329992?p=2&lang=ja".to_string())
+        );
+        assert_eq!(setting.author_series_ids(&html), vec!["272850", "551006"]);
+
+        // シリーズの 1 話は content_titles から取り出して作品一覧から除く。
+        let episodes = setting
+            .author_series_episode_ids(r#"{"body":[{"id":"2594847","title":"x","available":true}]}"#);
+        assert_eq!(episodes, vec!["2594847"]);
+        assert!(url_mentions_id(
+            "https://www.pixiv.net/novel/show.php?id=2594847",
+            "2594847"
+        ));
+        assert!(!url_mentions_id(
+            "https://www.pixiv.net/novel/show.php?id=25948471",
+            "2594847"
+        ));
     }
 
     #[test]

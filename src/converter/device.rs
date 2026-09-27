@@ -757,13 +757,12 @@ impl OutputManager {
 
     /// EPUB 出力の入口。外部 AozoraEpub3 が見つかればそれを使い、
     /// 見つからなければ `lite` feature の組み込みエンジンへフォールバックする。
-    fn epub_output(
-        &self,
-        input_txt: &Path,
-        output_dir: &Path,
-        output_ext: &str,
-    ) -> Result<PathBuf> {
-        if self.aozora_epub3_path.is_some() {
+    ///
+    /// `NAROU_RS_EPUB_ENGINE=lite` (または `builtin`) で組み込みを、`external`
+    /// (または `java`) で外部ツールを強制できる — 組み込みエンジンの動作確認用。
+    fn epub_output(&self, input_txt: &Path, output_dir: &Path, output_ext: &str) -> Result<PathBuf> {
+        let preference = epub_engine_preference();
+        if preference != EpubEngine::Lite && self.aozora_epub3_path.is_some() {
             return self.run_aozora_epub3(input_txt, output_dir, output_ext);
         }
         #[cfg(feature = "lite")]
@@ -772,6 +771,13 @@ impl OutputManager {
         }
         #[cfg(not(feature = "lite"))]
         {
+            if preference == EpubEngine::Lite {
+                return Err(NarouError::Conversion(
+                    "NAROU_RS_EPUB_ENGINE=lite ですが、この実行ファイルは組み込み EPUB \
+                     エンジン入りでビルドされていません (cargo build --features lite)"
+                        .into(),
+                ));
+            }
             self.run_aozora_epub3(input_txt, output_dir, output_ext)
         }
     }
@@ -955,6 +961,45 @@ impl StripError {
 impl fmt::Display for StripError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// Which EPUB engine the environment asks for.
+#[cfg(feature = "native-runtime")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpubEngine {
+    /// External tool when found, otherwise the embedded engine.
+    Auto,
+    /// Embedded engine (`lite` feature builds).
+    Lite,
+    /// External AozoraEpub3, even if the embedded engine is available.
+    External,
+}
+
+/// `convert.epub-engine` picks the engine; `NAROU_RS_EPUB_ENGINE` overrides it
+/// for one run (the Web UI starts conversions as child processes, so the
+/// setting is what the browser switches).
+#[cfg(feature = "native-runtime")]
+fn epub_engine_preference() -> EpubEngine {
+    if let Ok(value) = std::env::var("NAROU_RS_EPUB_ENGINE")
+        && let Some(engine) = parse_epub_engine(&value)
+    {
+        return engine;
+    }
+    crate::compat::load_global_setting_string("convert.epub-engine")
+        .and_then(|value| parse_epub_engine(&value))
+        .unwrap_or(EpubEngine::Auto)
+}
+
+/// `auto` / `lite` (builtin) / `external` (java); unknown values mean "no
+/// preference".
+#[cfg(feature = "native-runtime")]
+fn parse_epub_engine(value: &str) -> Option<EpubEngine> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(EpubEngine::Auto),
+        "lite" | "builtin" => Some(EpubEngine::Lite),
+        "external" | "java" => Some(EpubEngine::External),
+        _ => None,
     }
 }
 
