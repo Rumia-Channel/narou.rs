@@ -55,10 +55,8 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         "/api/novels" => api_novels(req, env).await,
         "/api/login" => api_login(req, env).await,
         "/api/sites" => api_sites(req, env).await,
-        // native は `POST /api/login/set` と `POST /api/login/add` を
-        // `login_set_or_add(append)` で振り分ける (login.rs と同じ)。
-        "/api/login/set" => api_login_set(req, env, false).await,
-        "/api/login/add" => api_login_set(req, env, true).await,
+        // Cookie の直接登録 (set/add) は廃止: 取り込みとブラウザ取得だけが
+        // 登録経路 (native `src/web/mod.rs` と同じルート構成)。
         "/api/jobs" => api_jobs(req, env).await,
         "/api/global_setting" => global_settings::api_global_setting(req, env).await,
         "/api/admin/object-migration" => api_object_migration(req, env).await,
@@ -91,6 +89,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         "/api/update_by_tag" => webui::job_actions::handle(req, env).await,
         "/api/update_general_lastup" => webui::job_actions::handle(req, env).await,
         "/api/login/import" => webui::login_actions::handle(req, env).await,
+        "/api/login/rename" => webui::login_actions::handle(req, env).await,
         "/api/login/order" => webui::login_actions::handle(req, env).await,
         "/api/queue/clear" => webui::queue_actions::handle(req, env).await,
         "/api/cancel" => webui::queue_actions::handle(req, env).await,
@@ -123,8 +122,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         "/ws" => websocket::handle(req, env).await,
         _ if path.starts_with("/api/settings/") => webui::settings::handle(req, env).await,
         _ if path.starts_with("/novels/") => webui::pages::handle(req, env).await,
-        _ if path.starts_with("/api/novels/") => api_novel(req, env).await,
-        _ if path.starts_with("/api/login/") => api_login_host(req, env).await,
+        _ if path.starts_with("/api/login/") => api_login_site(req, env).await,
         _ if path.starts_with("/api/sites/") => api_site(req, env).await,
         _ if path.starts_with("/api/jobs/") => api_job(req, env).await,
         _ => Response::error("Not Found", 404),
@@ -772,31 +770,10 @@ async fn api_login(req: Request, env: Env) -> Result<Response> {
         .map_err(|error| Error::RustError(error.to_string()))
 }
 
-/// POST /api/login/set | /api/login/add — `{host, cookie, label?}`。
-/// `append` が真なら既存の後ろに足す (native `login_set_or_add`)。
-async fn api_login_set(req: Request, env: Env, append: bool) -> Result<Response> {
-    if let Some(response) = auth_failure(&req, &env).await {
-        return response;
-    }
-    if req.method() != Method::Post {
-        return Response::error("Method Not Allowed", 405);
-    }
-    let runtime = match WorkerRuntime::build_ui(&env).await {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            console_log!("service composition failed: {error}");
-            return Response::error("Service Unavailable", 503);
-        }
-    };
-    crate::login::set_or_add(&runtime, req, append)
-        .await
-        .map_err(|error| Error::RustError(error.to_string()))
-}
-
-/// DELETE /api/login/{host} — 1 ホスト分の資格情報を消す (native
-/// `login_clear_host`)。`/{host}/{index}` は 1 件だけ消す (native
-/// `login_clear_credential`)。
-async fn api_login_host(req: Request, env: Env) -> Result<Response> {
+/// DELETE /api/login/{site} — 1 サイト分のログインを消す (native
+/// `login_clear_site`)。`/{site}/{index}` は 1 件だけ消す (native
+/// `login_clear_group`)。
+async fn api_login_site(req: Request, env: Env) -> Result<Response> {
     if let Some(response) = auth_failure(&req, &env).await {
         return response;
     }
@@ -807,17 +784,17 @@ async fn api_login_host(req: Request, env: Env) -> Result<Response> {
     let Some(rest) = path.strip_prefix("/api/login/") else {
         return Response::error("Not Found", 404);
     };
-    // `{host}` と `{host}/{index}` の 2 形だけがルート。3 段以上は 404。
-    let (host, index) = match rest.rsplit_once('/') {
-        Some((host, index)) => match index.parse::<usize>() {
-            Ok(index) => (host, Some(index)),
-            // 最後のセグメントが数値でない = `{host}/{index}` の形に
+    // `{site}` と `{site}/{index}` の 2 形だけがルート。3 段以上は 404。
+    let (site, index) = match rest.rsplit_once('/') {
+        Some((site, index)) => match index.parse::<usize>() {
+            Ok(index) => (site, Some(index)),
+            // 最後のセグメントが数値でない = `{site}/{index}` の形に
             // 該当しない (axum の Path 抽出失敗 = 404 と同じ)。
             Err(_) => return Response::error("Not Found", 404),
         },
         None => (rest, None),
     };
-    if host.is_empty() || host.contains('/') {
+    if site.is_empty() || site.contains('/') {
         return Response::error("Not Found", 404);
     }
     let runtime = match WorkerRuntime::build_ui(&env).await {
@@ -828,10 +805,10 @@ async fn api_login_host(req: Request, env: Env) -> Result<Response> {
         }
     };
     match index {
-        Some(index) => crate::login::clear_credential(&runtime, host, index)
+        Some(index) => crate::login::clear_group(&runtime, site, index)
             .await
             .map_err(|error| Error::RustError(error.to_string())),
-        None => crate::login::clear_host(&runtime, host)
+        None => crate::login::clear_site(&runtime, site)
             .await
             .map_err(|error| Error::RustError(error.to_string())),
     }

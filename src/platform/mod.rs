@@ -35,11 +35,10 @@ pub mod url_policy;
 
 pub use clock::{Clock, SystemClock};
 pub use cookie_store::{
-    CookieStore, LoginCredential, apply_set_cookie, assign_credential_ids, cookie_host_for_url,
-    cookie_lookup_hosts, credential_was_sent, decode_credentials, decode_stored_credentials,
-    encode_credentials, format_cookie_header, mask_cookie, merge_cookie_headers,
-    merge_credentials_for, merge_stored_cookies, normalize_cookie_host, parse_cookie_header,
-    tidy_credentials,
+    CookieStore, DecodedGroups, HostCookie, LoginGroup, apply_set_cookie, cookie_host_for_url,
+    cookie_lookup_hosts, decode_groups, fold_per_host_lists, site_for_host, site_for_host_with,
+    tidy_groups, assign_group_ids, encode_groups, format_cookie_header, mask_cookie,
+    merge_cookie_headers, merge_stored_cookies, normalize_cookie_host, parse_cookie_header,
 };
 pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
 pub use object_store::{

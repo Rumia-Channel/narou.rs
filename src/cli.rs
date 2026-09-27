@@ -969,7 +969,7 @@ pub enum Commands {
         #[arg(short = 'm', long)]
         more: bool,
     },
-    /// Login credentials shared with a browser machine (import/export).
+    /// Login credentials shared with a browser machine (list/import/export/rename/order/clear).
     Login {
         #[command(subcommand)]
         action: crate::commands::login::LoginAction,
