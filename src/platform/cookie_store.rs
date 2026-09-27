@@ -277,12 +277,26 @@ impl LegacyCredential {
 /// (`www.pixiv.net`) so one browser session stays in one place.
 pub fn site_for_host(host: &str) -> String {
     let host = host.trim().to_ascii_lowercase();
+    // The Worker cannot read the site definitions from disk; callers with an
+    // in-memory list (bundled definitions) use `site_for_host_with`.
+    let settings = crate::downloader::site_setting::SiteSetting::load_all()
+        .unwrap_or_default();
+    site_for_host_with(&settings, &host)
+}
+
+/// `site_for_host` over a caller-supplied definition list. Empty behaves like
+/// an unloadable set: the registrable-looking parent domain.
+pub fn site_for_host_with(
+    settings: &[crate::downloader::site_setting::SiteSetting],
+    host: &str,
+) -> String {
+    let host = host.trim().to_ascii_lowercase();
     let domain_of = |setting: &crate::downloader::site_setting::SiteSetting| {
         setting.domain.to_ascii_lowercase()
     };
-    let Ok(settings) = crate::downloader::site_setting::SiteSetting::load_all() else {
+    if settings.is_empty() {
         return parent_domain(&host);
-    };
+    }
     // 1. 定義そのもの、その配下、またはその定義が使うホスト。
     if let Some(setting) = settings.iter().find(|setting| {
         let domain = domain_of(setting);
@@ -434,6 +448,70 @@ impl LoginGroup {
         folded
     }
 }
+
+/// Give every login an id, returning whether anything changed.
+///
+/// Ids are generated on platforms that have a random source; a platform
+/// without one keeps whatever id came with the data, which the downloader
+/// tolerates (it falls back to the first entry). A non-ASCII id is dropped
+/// back to empty and re-issued where possible — a stored value can carry one
+/// from a hand-edited file or an unchecked import.
+pub fn assign_group_ids(stored: &mut BTreeMap<String, Vec<LoginGroup>>) -> bool {
+    let mut changed = false;
+    for groups in stored.values_mut() {
+        for group in groups.iter_mut() {
+            if !group.id.is_empty() && !group.id.is_ascii() {
+                group.id.clear();
+                changed = true;
+            }
+            if group.id.is_empty()
+                && let Ok(id) = crate::login::new_credential_id()
+            {
+                group.id = id;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Normalize logins before they are stored: trim cookies, drop empty ones,
+/// assign ids and make sure each carries its site.
+pub fn tidy_groups(groups: &[LoginGroup], site: &str) -> Vec<LoginGroup> {
+    let mut tidied: Vec<LoginGroup> = Vec::new();
+    for group in groups {
+        let mut group = group.clone();
+        group.site = site.to_string();
+        group.cookies = group
+            .cookies
+            .iter()
+            .filter_map(|entry| {
+                let cookie = entry.cookie.trim();
+                if cookie.is_empty() {
+                    return None;
+                }
+                Some(HostCookie {
+                    host: normalize_cookie_host(&entry.host),
+                    cookie: cookie.to_string(),
+                })
+            })
+            .collect();
+        if group.cookies.is_empty() {
+            continue;
+        }
+        if group.id.is_empty()
+            && let Ok(id) = crate::login::new_credential_id()
+        {
+            group.id = id;
+        }
+        if tidied.iter().any(|existing| existing.same_cookies(&group)) {
+            continue;
+        }
+        tidied.push(group);
+    }
+    tidied
+}
+
 
 /// Cookie persistence boundary.
 pub trait CookieStore: Send + Sync {

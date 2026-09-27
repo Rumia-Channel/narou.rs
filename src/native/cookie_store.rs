@@ -19,7 +19,7 @@ use crate::error::Result;
 use crate::login::crypto::{decrypt_at_rest, encrypt_at_rest};
 use crate::native::login_key::LoginKey;
 use crate::native::object_store::run_blocking;
-use crate::platform::{CookieStore, LoginGroup, PlatformFuture, normalize_cookie_host};
+use crate::platform::{CookieStore, LoginGroup, PlatformFuture, assign_group_ids, tidy_groups};
 
 pub const INVENTORY_NAME: &str = "login_cookie";
 
@@ -250,58 +250,6 @@ fn site_for_key(key: &str) -> String {
     crate::platform::site_for_host(key)
 }
 
-/// Give every login an id, returning whether anything changed.
-fn assign_group_ids(stored: &mut BTreeMap<String, Vec<LoginGroup>>) -> bool {
-    let mut changed = false;
-    for groups in stored.values_mut() {
-        for group in groups.iter_mut() {
-            if group.id.is_empty()
-                && let Ok(id) = crate::login::new_credential_id()
-            {
-                group.id = id;
-                changed = true;
-            }
-        }
-    }
-    changed
-}
-
-/// Normalize logins before they are stored: trim cookies, drop empty ones,
-/// assign ids and make sure each carries its site.
-fn tidy_groups(groups: &[LoginGroup], site: &str) -> Vec<LoginGroup> {
-    let mut tidied: Vec<LoginGroup> = Vec::new();
-    for group in groups {
-        let mut group = group.clone();
-        group.site = site.to_string();
-        group.cookies = group
-            .cookies
-            .iter()
-            .filter_map(|entry| {
-                let cookie = entry.cookie.trim();
-                if cookie.is_empty() {
-                    return None;
-                }
-                Some(crate::platform::HostCookie {
-                    host: normalize_cookie_host(&entry.host),
-                    cookie: cookie.to_string(),
-                })
-            })
-            .collect();
-        if group.cookies.is_empty() {
-            continue;
-        }
-        if group.id.is_empty()
-            && let Ok(id) = crate::login::new_credential_id()
-        {
-            group.id = id;
-        }
-        if tidied.iter().any(|existing| existing.same_cookies(&group)) {
-            continue;
-        }
-        tidied.push(group);
-    }
-    tidied
-}
 
 impl CookieStore for InventoryCookieStore {
     fn load_groups<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<Vec<LoginGroup>>> {
