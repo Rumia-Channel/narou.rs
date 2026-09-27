@@ -457,10 +457,20 @@ Worker (worker_entry)
 - Queue consumer は `succeeded`、`blocked`、`permanent`、retry 上限到達後の
   `permanent` を記録してから ack する。`running` の lease が有効な再配信は
   `Busy` として ack せず、Queue の再配信/DLQ経路へ返す。
-- 一時エラーは ledger の `attempts` を増やし、最大 3 回まで 5/10/20 秒の
-  bounded retry を行う。上限後は `permanent` として ack するため、無限 retry
-  ループや暗黙の DLQ 再投入は行わない。DLQ は Queue binding の運用設定で保持し、
+- 一時エラーは ledger の `attempts` を増やし、`queue.max-retries` (既定 3) 回
+  まで `queue.retry-backoff` (既定 `1m,5m,15m`) の bounded retry を行う。
+  上限後は `permanent` として ack するため、無限 retry ループや暗黙の DLQ
+  再投入は行わない。DLQ は Queue binding の運用設定で保持し、
   `worker_jobs` の `last_error` と attempt 数を調査の source of truth とする。
+- Cloudflare の consumer `max_retries` (既定 3) は ledger の retry 予定とは
+  独立に消費される (`Busy` の遅延再配信や consumer 内部エラーも消費する)
+  ため、台帳が retryable のまま配信だけが DLQ に落ちることがある。毎分の
+  cron が `scheduler::reap_stuck_jobs` を走らせ、バックオフ予定時刻
+  (`lease_until`) または更新時刻から猶予 (2 分) を過ぎても進まない
+  active 行を拾う: リトライ枠が残る行は新しい envelope を再送し (新しい
+  配信予算で通常経路へ復帰)、枠を使い切った retryable 行は `permanent`
+  に確定する。これにより UI の「待機中」は常に「再試行または終端確定が
+  予定されている」状態と一致する。
 - Worker のサイト単位 rate limiter は Durable Object 1 instance をサイトごとに
   使用する。DO内でpermit timestampを予約し、callerが`worker::Delay`で待機する。
   `SiteRateLimiter`はalarmを使わない。設定の `download.interval` /

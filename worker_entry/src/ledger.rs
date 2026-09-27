@@ -347,6 +347,68 @@ impl D1JobLedger {
             .map_err(worker_error)?;
         Ok(rows.into_iter().map(|row| row.job_id).collect())
     }
+
+    /// Active rows whose scheduled progress point passed `stuck_before`
+    /// (canonical RFC3339). See
+    /// [`narou_rs::application::worker_ledger::select_stuck`]; `limit` caps
+    /// how many rows one call returns (one cron page).
+    pub async fn stuck_jobs(&self, stuck_before: &str, limit: usize) -> Result<Vec<StuckJob>> {
+        let statement = narou_rs::application::worker_ledger::select_stuck(stuck_before, limit);
+        let statement = self.prepare(
+            &statement.sql,
+            statement.binds.into_iter().map(BindValue::Text).collect(),
+        )?;
+        let rows = statement
+            .all()
+            .await
+            .map_err(worker_error)?
+            .results::<StuckJob>()
+            .map_err(worker_error)?;
+        Ok(rows)
+    }
+
+    /// Throttle-mark one stuck row before re-sending its envelope
+    /// (`worker_ledger::mark_reenqueue`). Returns `true` when the row was
+    /// still active and still stuck — only then may the caller send a fresh
+    /// envelope. `false` means a live delivery or a concurrent reaper tick
+    /// already moved the row, and no duplicate must be produced.
+    pub async fn touch_for_reenqueue(&self, job_id: &str, stuck_before: &str) -> Result<bool> {
+        let statement = narou_rs::application::worker_ledger::mark_reenqueue(
+            &self.now_rfc3339(),
+            job_id,
+            stuck_before,
+        );
+        let statement = self.prepare(
+            &statement.sql,
+            statement.binds.into_iter().map(BindValue::Text).collect(),
+        )?;
+        Ok(changed_rows(&statement.run().await.map_err(worker_error)?)? > 0)
+    }
+
+    /// Durably close one stuck `retryable` row whose retry budget is spent
+    /// (`worker_ledger::finalize_stuck`). Returns `true` when the row was
+    /// tombstoned; `false` when it moved on (a live delivery claimed it or
+    /// it already settled).
+    pub async fn finalize_stuck(
+        &self,
+        job_id: &str,
+        stuck_before: &str,
+        min_attempts: u32,
+        reason: &str,
+    ) -> Result<bool> {
+        let statement = narou_rs::application::worker_ledger::finalize_stuck(
+            reason,
+            &self.now_rfc3339(),
+            job_id,
+            stuck_before,
+            min_attempts,
+        );
+        let statement = self.prepare(
+            &statement.sql,
+            statement.binds.into_iter().map(BindValue::Text).collect(),
+        )?;
+        Ok(changed_rows(&statement.run().await.map_err(worker_error)?)? > 0)
+    }
 }
 
 impl JobQueue for D1JobLedger {
@@ -409,7 +471,7 @@ impl JobQueue for D1JobLedger {
 
             let now = self.now_rfc3339();
             let execution_token = Self::new_execution_token();
-            let claim = |statement: narou_rs::application::worker_ledger::ClaimStatement| {
+            let claim = |statement: narou_rs::application::worker_ledger::Statement| {
                 self.prepare(
                     &statement.sql,
                     statement
@@ -919,6 +981,18 @@ struct AttemptRow {
 #[derive(Debug, Deserialize)]
 struct JobIdRow {
     job_id: String,
+}
+
+/// One stuck active row selected by
+/// [`narou_rs::application::worker_ledger::select_stuck`] for the cron
+/// reaper. `attempts` is the ledger attempt counter (a `retryable` row
+/// with `attempts >= max_retries` has spent its retry budget).
+#[derive(Debug, Deserialize)]
+pub struct StuckJob {
+    pub job_id: String,
+    pub status: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

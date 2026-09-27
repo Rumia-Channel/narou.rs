@@ -7,16 +7,19 @@
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use narou_rs::application::{
-    events::FreezeStore, CheckpointClaim, JobKind, JobPlan, JobTarget, SchedulerCheckpoint,
+    events::FreezeStore, retry_policy, CheckpointClaim, JobId, JobKind, JobPlan, JobTarget,
+    SchedulerCheckpoint, WorkerJobEnvelope,
 };
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{NovelFilter, NovelId, NovelQuery, NovelSort, NovelSortKey};
 use serde_yaml::Value as YamlValue;
-use worker::{console_log, Env, ScheduledEvent};
+use worker::{console_log, console_warn, Env, ScheduledEvent};
 
 use crate::composition::WorkerRuntime;
+use crate::consumer::{broadcast_failure, notify_queue_changed, CF_CONSUMER_MAX_RETRIES};
+use crate::push_hub::PushHubClient;
 
 /// Bounded D1 scan page for one planner invocation.
 pub const AUTO_UPDATE_PAGE_SIZE: usize = 100;
@@ -27,7 +30,130 @@ pub async fn run_scheduled_plan(event: ScheduledEvent, env: &Env) -> Result<()> 
     let runtime = WorkerRuntime::build(env).await.map_err(|error| {
         NarouError::Platform(format!("Worker runtime error: {error}"))
     })?;
+    // DLQ 行きで取り残された行の回収は auto-update の有無と無関係に毎分走らせる。
+    // 失敗しても planner は続行する (次の tick で再試行される)。
+    let push = PushHubClient::new(env, runtime.subrequests.clone());
+    if let Err(error) = reap_stuck_jobs(&runtime, &push).await {
+        console_warn!("job reaper failed: {error}");
+    }
     plan_auto_update(&runtime, event.schedule() as u64).await
+}
+
+/// 1 回の cron で reaper が処理する行数の上限。
+/// 滞留がこれを超える場合は次の tick が続きを拾う (重い滞留で planner を
+/// 押し出さないための制限)。
+const REAPER_PAGE_SIZE: usize = 50;
+
+/// アクティブ行の「予定された進行時点」に対する検出猶予。cron 間隔
+/// (1 分) ちょうどでは CF Queue の遅延再配信が到着する前に拾い過ぎるので、
+/// 配信・消費の遅れ分として 1 tick 分を上乗せする。重複配信が起きても
+/// claim の Busy 分岐が直列化するため安全側に倒す。
+const STUCK_GRACE: chrono::TimeDelta = chrono::TimeDelta::minutes(2);
+
+/// Cloudflare Queues の再配信予算 (`max_retries`) を使い切って DLQ に落ちた
+/// メッセージは二度と届かず、対応する台帳行は `pending` / `retryable` /
+/// `running` (lease 切れ) のまま残る。UI では `pending`/`retryable` が
+/// 「待機中」と表示されるため、配信が失われた行は「永遠に待機中」になる。
+///
+/// この reaper は毎分の cron で、バックオフ予定時刻 (`lease_until`) または
+/// 更新時刻から `STUCK_GRACE` 経っても進んでいないアクティブ行を拾い、
+///
+/// - `retryable` でリトライ枠を使い切った行 (`attempts >= max_retries`) は
+///   再投入しても次の失敗で即枯渇するだけなので、その場で `permanent` に
+///   確定する (consumer と同じ `queue_failed` イベントを出す)。
+/// - それ以外の行は新しい v2 envelope を Queue に再送する。新しい
+///   メッセージは `max_retries` の配信予算を持ち直すので、以後は通常の
+///   claim/retry 経路に復帰する。
+///
+/// 再送前の `touch_for_reenqueue` CAS と finalize の CAS が、生存している
+/// 配信 (claim 済み) や並行 cron とのレースを排除する。
+pub async fn reap_stuck_jobs(runtime: &WorkerRuntime, push: &PushHubClient) -> Result<()> {
+    let stuck_before =
+        (runtime.clock.now_utc() - STUCK_GRACE).to_rfc3339_opts(SecondsFormat::Nanos, true);
+    let stuck = runtime
+        .ledger
+        .stuck_jobs(&stuck_before, REAPER_PAGE_SIZE)
+        .await?;
+    if stuck.is_empty() {
+        return Ok(());
+    }
+    let max_retries = effective_max_retries(runtime).await;
+    let mut changed = false;
+    for job in &stuck {
+        match reap_one(runtime, push, job, &stuck_before, max_retries).await {
+            Ok(row_changed) => changed |= row_changed,
+            Err(error) => {
+                console_warn!("job reaper failed for {}: {error}", job.job_id);
+            }
+        }
+    }
+    if changed {
+        notify_queue_changed(push).await;
+    }
+    Ok(())
+}
+
+/// consumer の `settle_retryable` と同じ解釈で `queue.max-retries` を読み、
+/// Cloudflare 側の配信上限 (`CF_CONSUMER_MAX_RETRIES`) にクランプする。
+async fn effective_max_retries(runtime: &WorkerRuntime) -> u32 {
+    let value = runtime
+        .services
+        .settings
+        .get(retry_policy::MAX_RETRIES_KEY)
+        .await
+        .ok()
+        .flatten();
+    retry_policy::max_retries(value.as_ref()).min(CF_CONSUMER_MAX_RETRIES)
+}
+
+async fn reap_one(
+    runtime: &WorkerRuntime,
+    push: &PushHubClient,
+    job: &crate::ledger::StuckJob,
+    stuck_before: &str,
+    max_retries: u32,
+) -> Result<bool> {
+    let attempts = u32::try_from(job.attempts).unwrap_or(u32::MAX);
+    if job.status == "retryable" && attempts >= max_retries {
+        let reason = format!(
+            "retries exhausted after {attempts} attempts and the scheduled \
+             redelivery was lost (dead-lettered): {}",
+            job.last_error.as_deref().unwrap_or("unknown error")
+        );
+        if !runtime
+            .ledger
+            .finalize_stuck(&job.job_id, stuck_before, max_retries, &reason)
+            .await?
+        {
+            // CAS が外れた = 生存している配信が先に claim した。何もしない。
+            return Ok(false);
+        }
+        console_warn!("job {} permanently failed: {reason}", job.job_id);
+        broadcast_failure(runtime, push, &JobId(job.job_id.clone()), &reason).await;
+        return Ok(true);
+    }
+
+    // 生存している配信・並行 cron とのレースを CAS で排除してから送る。
+    // `updated_at`/`lease_until` の bump は次の検出を STUCK_GRACE 先送りし、
+    // send 失敗時の再送頻度も同じ粒度に揃える。
+    if !runtime
+        .ledger
+        .touch_for_reenqueue(&job.job_id, stuck_before)
+        .await?
+    {
+        return Ok(false);
+    }
+    let envelope = WorkerJobEnvelope::v2(JobId(job.job_id.clone()));
+    if let Err(error) = runtime.queue.send(&envelope).await {
+        console_warn!("job reaper could not re-send {}: {error}", job.job_id);
+        return Ok(false);
+    }
+    console_log!(
+        "job reaper re-enqueued {} (status={}, attempts={attempts})",
+        job.job_id,
+        job.status
+    );
+    Ok(true)
 }
 
 /// Plan + enqueue one bounded auto-update page.

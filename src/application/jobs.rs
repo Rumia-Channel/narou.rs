@@ -196,12 +196,13 @@ pub mod worker_ledger {
     use super::extract_novel_ids;
     use std::collections::HashSet;
 
-    /// A fully-formed claim UPDATE: SQL text plus bind values in order.
+    /// A fully-formed statement: SQL text plus bind values in order.
     /// Every bind is a `TEXT` string (RFC3339 timestamps, job id, canonical
     /// target strings), matching the `BindValue::Text` usage in the D1
-    /// adapter.
+    /// adapter. Integer predicates (LIMIT, attempts) are inlined by the
+    /// builders — they are always internal constants or validated counts.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ClaimStatement {
+    pub struct Statement {
         pub sql: String,
         pub binds: Vec<String>,
     }
@@ -222,7 +223,7 @@ pub mod worker_ledger {
         execution_token: &str,
         job_id: &str,
         target: &str,
-    ) -> ClaimStatement {
+    ) -> Statement {
         let (clause, conflict) = conflict_clause(target);
         let mut binds = vec![
             now.to_string(),
@@ -232,7 +233,7 @@ pub mod worker_ledger {
             now.to_string(),
         ];
         binds.extend(conflict);
-        ClaimStatement {
+        Statement {
             sql: format!(
                 "UPDATE worker_jobs \
                  SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ? \
@@ -257,7 +258,7 @@ pub mod worker_ledger {
         execution_token: &str,
         job_id: &str,
         target: &str,
-    ) -> ClaimStatement {
+    ) -> Statement {
         let (clause, conflict) = conflict_clause(target);
         let mut binds = vec![
             now.to_string(),
@@ -267,7 +268,7 @@ pub mod worker_ledger {
             now.to_string(),
         ];
         binds.extend(conflict);
-        ClaimStatement {
+        Statement {
             sql: format!(
                 "UPDATE worker_jobs \
                  SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ? \
@@ -276,6 +277,91 @@ pub mod worker_ledger {
                  {clause}"
             ),
             binds,
+        }
+    }
+
+    /// Select at most `limit` active rows whose scheduled progress point has
+    /// passed `stuck_before`: `pending` rows whose `updated_at` is old
+    /// (their envelope was never delivered or `queue.send` failed),
+    /// `retryable` rows whose backoff hold (`lease_until`) already elapsed
+    /// (their redelivery was lost to the DLQ or a consumer error), and
+    /// `running` rows whose execution lease expired (the claiming
+    /// invocation died). These are exactly the rows the cron reaper must
+    /// either re-enqueue or finalize — without it they would stay active
+    /// (UI「待機中」) forever.
+    ///
+    /// Bind order: `stuck_before`.
+    pub fn select_stuck(stuck_before: &str, limit: usize) -> Statement {
+        Statement {
+            sql: format!(
+                "SELECT job_id, status, attempts, last_error FROM worker_jobs \
+                 WHERE status IN ('pending', 'running', 'retryable') \
+                   AND COALESCE(lease_until, updated_at) <= ? \
+                 ORDER BY COALESCE(lease_until, updated_at) ASC, job_id ASC \
+                 LIMIT {limit}"
+            ),
+            binds: vec![stuck_before.to_string()],
+        }
+    }
+
+    /// CAS used by the reaper right before `queue.send`: bump `updated_at`
+    /// only while the row is still active and still past `stuck_before`.
+    /// `lease_until` is also pinned to `now` — for retryable/running rows
+    /// it has already elapsed (that is why the row is stuck), so writing
+    /// "now" keeps the row claimable while taking it out of the stuck
+    /// set; a `pending` row's fresh lease is already past and `claim`
+    /// ignores it. A live claim (status moved to `running`, or a fresh
+    /// `lease_until` was written) or a concurrent reaper tick (already
+    /// bumped both columns) makes this a no-op, so each stuck episode
+    /// produces at most one fresh envelope and re-sends are throttled by
+    /// the grace period instead of flooding the queue.
+    ///
+    /// Bind order: `now`, `now`, `job_id`, `stuck_before`.
+    pub fn mark_reenqueue(now: &str, job_id: &str, stuck_before: &str) -> Statement {
+        Statement {
+            sql: "UPDATE worker_jobs SET updated_at = ?, lease_until = ? \
+                  WHERE job_id = ? \
+                    AND status IN ('pending', 'running', 'retryable') \
+                    AND COALESCE(lease_until, updated_at) <= ?"
+                .to_string(),
+            binds: vec![
+                now.to_string(),
+                now.to_string(),
+                job_id.to_string(),
+                stuck_before.to_string(),
+            ],
+        }
+    }
+
+    /// CAS used by the reaper to close a `retryable` row that has already
+    /// spent its retry budget (`attempts >= min_attempts`) but whose
+    /// scheduled redelivery never arrived. Re-enqueueing such a row would
+    /// only produce an execution that immediately exhausts retries, so the
+    /// honest terminal state is `permanent` with the delivery-loss reason
+    /// recorded in `last_error`.
+    ///
+    /// Bind order: `reason`, `now`, `job_id`, `stuck_before`.
+    pub fn finalize_stuck(
+        reason: &str,
+        now: &str,
+        job_id: &str,
+        stuck_before: &str,
+        min_attempts: u32,
+    ) -> Statement {
+        Statement {
+            sql: format!(
+                "UPDATE worker_jobs \
+                 SET status = 'permanent', last_error = ?, updated_at = ?, \
+                     lease_until = NULL, execution_token = NULL, checkpoint_json = NULL \
+                 WHERE job_id = ? AND status = 'retryable' AND attempts >= {min_attempts} \
+                   AND COALESCE(lease_until, updated_at) <= ?"
+            ),
+            binds: vec![
+                reason.to_string(),
+                now.to_string(),
+                job_id.to_string(),
+                stuck_before.to_string(),
+            ],
         }
     }
 
@@ -1812,6 +1898,238 @@ mod tests {
                 .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
                 .unwrap();
             assert_eq!(changed, 1);
+        }
+    }
+
+    /// The reaper statements run verbatim against rusqlite — the regression
+    /// pin for "a `retryable` row whose scheduled redelivery was lost to the
+    /// DLQ stays `待機中` forever": before the reaper existed nothing moved
+    /// such a row, and these statements are the ones that either re-enqueue
+    /// it (fresh delivery budget → normal claim path) or finalize it once
+    /// its retry budget is spent.
+    #[cfg(feature = "native-runtime")]
+    mod reaper_sql {
+        use super::super::worker_ledger::{finalize_stuck, mark_reenqueue, select_stuck};
+        use rusqlite::Connection;
+
+        fn db() -> Connection {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE worker_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    options TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    dedupe_key TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    lease_until TEXT,
+                    execution_token TEXT,
+                    checkpoint_json TEXT
+                ) STRICT;",
+            )
+            .unwrap();
+            conn
+        }
+
+        fn insert(
+            conn: &Connection,
+            job_id: &str,
+            status: &str,
+            attempts: i64,
+            updated_at: &str,
+            lease: Option<&str>,
+        ) {
+            conn.execute(
+                "INSERT INTO worker_jobs (job_id, kind, target, status, dedupe_key, attempts, created_at, updated_at, lease_until)
+                 VALUES (?, 'update', '42', ?, ?, ?, '2026-01-01T00:00:00Z', ?, ?)",
+                rusqlite::params![
+                    job_id,
+                    status,
+                    format!("{status}:{job_id}"),
+                    attempts,
+                    updated_at,
+                    lease
+                ],
+            )
+            .unwrap();
+        }
+
+        fn row_of(conn: &Connection, job_id: &str) -> (String, String) {
+            conn.query_row(
+                "SELECT status, updated_at FROM worker_jobs WHERE job_id = ?",
+                [job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        }
+
+        fn stuck_ids(conn: &Connection, stuck_before: &str) -> Vec<String> {
+            let statement = select_stuck(stuck_before, 50);
+            let mut query = conn.prepare(&statement.sql).unwrap();
+            query
+                .query_map(rusqlite::params_from_iter(statement.binds.iter()), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        }
+
+        /// `2026-01-01T00:10:00Z` を reaper の実行時刻とし、猶予 2 分
+        /// (worker_entry::scheduler::STUCK_GRACE) を引いた検出境界。
+        const STUCK_BEFORE: &str = "2026-01-01T00:08:00Z";
+        const NOW: &str = "2026-01-01T00:10:00Z";
+
+        #[test]
+        fn lost_retryable_redelivery_is_requeued_then_finalized() {
+            let conn = db();
+            // 403 失敗 → record_attempt が attempts=1, lease=backoff 終了済み。
+            // 配信が DLQ に落ちて二度と来ない行。
+            insert(
+                &conn,
+                "j-lost",
+                "retryable",
+                1,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:01:00Z"),
+            );
+
+            // 検出: ホールド切れの retryable が拾える。
+            assert_eq!(stuck_ids(&conn, STUCK_BEFORE), vec!["j-lost"]);
+
+            // 再投入: CAS が通り updated_at が進む → 1 通だけ envelope を送る。
+            let stmt = mark_reenqueue(NOW, "j-lost", STUCK_BEFORE);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+            assert_eq!(row_of(&conn, "j-lost"), ("retryable".into(), NOW.into()));
+
+            // 同じ tick の CAS は二度目を通さない (updated_at > stuck_before)。
+            let stmt = mark_reenqueue(NOW, "j-lost", STUCK_BEFORE);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0, "a touched row must not be re-sent twice");
+            // 検出対象からも外れる (次の猶予までは再送しない)。
+            assert!(stuck_ids(&conn, STUCK_BEFORE).is_empty());
+
+            // リトライ枠を使い切った行 (attempts >= max_retries=3) は
+            // permanent に確定する。
+            insert(
+                &conn,
+                "j-spent",
+                "retryable",
+                3,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:01:00Z"),
+            );
+            let stmt = finalize_stuck(
+                "retries exhausted and the scheduled redelivery was lost",
+                NOW,
+                "j-spent",
+                STUCK_BEFORE,
+                3,
+            );
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+            assert_eq!(
+                row_of(&conn, "j-spent").0,
+                "permanent",
+                "spent retryable must finalize instead of re-enqueue"
+            );
+        }
+
+        #[test]
+        fn stuck_selection_covers_pending_and_expired_running_only() {
+            let conn = db();
+            // 配信が失われた pending (lease NULL → updated_at で判定)。
+            insert(&conn, "j-pend", "pending", 0, "2026-01-01T00:00:00Z", None);
+            // まだ新しい pending は拾わない (配信中の可能性を潰さない)。
+            insert(&conn, "j-fresh", "pending", 0, "2026-01-01T00:09:00Z", None);
+            // バックオフ中の retryable は拾わない (再配信が予定されている)。
+            insert(
+                &conn,
+                "j-held",
+                "retryable",
+                1,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:30:00Z"),
+            );
+            // lease 切れ running (claim 側が死亡) は拾う。
+            insert(
+                &conn,
+                "j-dead",
+                "running",
+                0,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:05:00Z"),
+            );
+            // 生きている running は拾わない。
+            insert(
+                &conn,
+                "j-live",
+                "running",
+                0,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:30:00Z"),
+            );
+            // 終端行は拾わない。
+            insert(
+                &conn,
+                "j-done",
+                "permanent",
+                3,
+                "2026-01-01T00:00:00Z",
+                None,
+            );
+
+            let ids = stuck_ids(&conn, STUCK_BEFORE);
+            assert_eq!(ids.len(), 2);
+            assert!(ids.contains(&"j-pend".to_string()));
+            assert!(ids.contains(&"j-dead".to_string()));
+        }
+
+        #[test]
+        fn finalize_cas_refuses_rows_that_moved_on() {
+            let conn = db();
+            // まだ枠が残っている retryable は finalize しない (再投入される)。
+            insert(
+                &conn,
+                "j-young",
+                "retryable",
+                1,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:01:00Z"),
+            );
+            let stmt = finalize_stuck("reason", NOW, "j-young", STUCK_BEFORE, 3);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0);
+            assert_eq!(row_of(&conn, "j-young").0, "retryable");
+
+            // 配信が既に claim して running へ進んだ行は finalize しない。
+            insert(
+                &conn,
+                "j-claimed",
+                "running",
+                3,
+                "2026-01-01T00:09:00Z",
+                Some("2026-01-01T00:25:00Z"),
+            );
+            let stmt = finalize_stuck("reason", NOW, "j-claimed", STUCK_BEFORE, 3);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0);
+            assert_eq!(row_of(&conn, "j-claimed").0, "running");
         }
     }
 }

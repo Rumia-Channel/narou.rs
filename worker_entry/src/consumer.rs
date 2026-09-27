@@ -38,8 +38,9 @@ use crate::push_hub::{
 };
 
 /// Queue consumer におけるイベント配信。ジョブの台帳が変わるたびに
-/// (reject / 再キュー追加) キュー表示を更新させる。
-async fn notify_queue_changed(push: &PushHubClient) {
+/// (reject / 再キュー追加 / cron reaper の再投入・終端確定) キュー表示を
+/// 更新させる。
+pub(crate) async fn notify_queue_changed(push: &PushHubClient) {
     push.broadcast_best_effort(&[notification_queue()]).await;
 }
 
@@ -366,14 +367,14 @@ async fn process_discrete(
     Ok(())
 }
 
-/// `queue_failed` + コンソール echo — Blocked / Permanent / リトライ枯渇の
-/// 共通イベント列 (native `JobOutcome::Failed` 相当)。
+/// `queue_failed` + コンソール echo — Blocked / Permanent / リトライ枯渇・
+/// reaper による配信喪失確定の共通イベント列 (native `JobOutcome::Failed` 相当)。
 ///
 /// `reason` は台帳へ書き込んだ last_error 全文だが、UI には native の
 /// `failure_reason` (`src/web/worker.rs`) と同じ意味論 — **最初の非空行**
 /// — だけを出す。`detail` は native 同様 `webui.debug-mode` が ON のとき
 /// だけ `queue_failed.data.detail` に全文を載せる。
-async fn broadcast_failure(
+pub(crate) async fn broadcast_failure(
     runtime: &WorkerRuntime,
     push: &PushHubClient,
     job_id: &JobId,
@@ -429,9 +430,11 @@ async fn webui_debug_mode(runtime: &WorkerRuntime) -> bool {
 /// `wrangler.toml` の `[[queues.consumers]] max_retries = 3` はデプロイ時の
 /// 値で、Cloudflare は explicit な `retry_with_options` も同じ回数までしか
 /// 再配信しない。設定値をこれより大きくしても 3 回目で DLQ に落ちて台帳が
-/// `retryable` のまま残るため、ledger 側もここで同じ上限に丸める。上限を
-/// 上げたい場合は wrangler の `max_retries` を先に上げ、この定数も合わせること。
-const CF_CONSUMER_MAX_RETRIES: u32 = 3;
+/// `retryable` のまま残るため、ledger 側もここで同じ上限に丸める。cron
+/// reaper (`scheduler::reap_stuck_jobs`) もこの上限で枯渇判定を揃える。
+/// 上限を上げたい場合は wrangler の `max_retries` を先に上げ、この定数も
+/// 合わせること。
+pub(crate) const CF_CONSUMER_MAX_RETRIES: u32 = 3;
 
 /// `Retryable` を台帳へ記録し、まだ試行枠が残っているかを返す。
 /// メッセージの ack/retry は呼び出し側がイベント送信のあとに行う

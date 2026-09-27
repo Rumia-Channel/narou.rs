@@ -238,7 +238,8 @@ async fn restore_pending_tasks(req: Request, env: Env) -> worker::Result<Respons
     // pending/retryable 行は再送不要 — それらのメッセージは Queue 側に
     // 生存中か、配信が消えたか区別できないため、無条件再送は二重投入に
     // なり得る (dedupe は active 行を見るので Ledger 側は防げても Queue 側
-    // の順序は汚れる)。
+    // の順序は汚れる)。配信が消えた行は cron の reaper
+    // (`scheduler::reap_stuck_jobs`) が猶予付きで検出して再送・確定する。
     let stale_ids = match runtime.ledger.stale_running_job_ids().await {
         Ok(ids) => ids,
         Err(error) => {
