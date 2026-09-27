@@ -155,7 +155,9 @@ jobs:
     if: >-
       (github.event_name == 'push' && github.ref == 'refs/heads/develop')
       || (github.event_name == 'workflow_dispatch' && inputs.target == 'develop')
-    needs: [native, native-gpl, wasm, worker, worker-contract, license]
+    # リレーを先に配布する。Worker はリレー経由でしか取得できないサイトがあるため、
+    # リレーの配布が失敗したら Worker もデプロイしない (壊れた組み合わせを出さない)。
+    needs: [native, native-gpl, wasm, worker, worker-contract, license, relay-deploy]
     runs-on: ubuntu-latest
     concurrency:
       group: narou-worker-develop
