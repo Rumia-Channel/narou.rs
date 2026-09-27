@@ -561,7 +561,7 @@ Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト（�
 
 | 対象 | 現状 | 方針 |
 |---|---|---|
-| **Worker の convert ジョブの出力** | 文言は `messages::convert` にあるが、`ConvertService` に sink を渡していないため Worker のコンソールに出ない | convert 経路へ sink を通す（未着手。`#console-stdout2` もこれで埋まる） |
+| ~~**Worker の convert ジョブの出力**~~ | 解消済み。`worker_entry/src/convert.rs` が `PushHubSink::install` で既定 sink を入れ、`application::convert::emit_convert_item_lines` が `Stream::Stdout` で送る（native と同じ経路・同じストリーム） | — |
 | **リトライ方針** | `src/queue.rs`（native）が `queue.max-retries` / `queue.retry-backoff` を解釈し、Worker は `consumer.rs`/`ledger.rs` に独自実装 | 設定の解釈と backoff スケジュールを可搬層へ（未着手） |
 | **push イベントの組み立て** | native `web/push.rs` と Worker `push_hub.rs` が同じ JSON 形をそれぞれ構築 | イベント生成を可搬層へ（未着手） |
 | **引数の袋** | `too_many_arguments` 14 件・`type_complexity` 5 件 | request struct / 型エイリアスへ畳む（未着手） |
