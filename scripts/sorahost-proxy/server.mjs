@@ -12,7 +12,7 @@
 // 127.0.0.1:$PORT で待ち受ける。
 //
 // 使い方:
-//   PROXY_TOKEN=<長いランダム文字列> node server.mjs
+//   PROXY_KEY=<長いランダム文字列> node server.mjs
 //
 // 呼び出し (Worker 側):
 //   POST /proxy  { "url": "https://syosetu.org/novel/426898/1.html",
@@ -20,8 +20,8 @@
 //                  "redirect": "follow" | "manual" }
 //   → { "status": 200, "contentType": "text/html; charset=UTF-8", "body": "<base64>" }
 //
-// 認証: X-Proxy-Token ヘッダが PROXY_TOKEN と一致しない限り 403 を返す。
-// オープンプロキシ化を防ぐため PROXY_TOKEN 未設定では起動しない。
+// 認証: X-Proxy-Token ヘッダが PROXY_KEY と一致しない限り 403 を返す。
+// オープンプロキシ化を防ぐため PROXY_KEY 未設定では起動しない。
 
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
@@ -29,7 +29,7 @@ import { existsSync, copyFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const PORT = Number(process.env.PORT || 3000);
-const TOKEN = process.env.PROXY_TOKEN || "";
+const TOKEN = process.env.PROXY_KEY || "";
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 30_000;
 const CURL_TIMEOUT_SECS = 30;
@@ -56,7 +56,7 @@ const prepareCurl = () => {
 const CURL_BIN = prepareCurl();
 
 if (!TOKEN) {
-  console.error("PROXY_TOKEN が未設定です。長いランダム文字列を設定してください。");
+  console.error("PROXY_KEY が未設定です。長いランダム文字列を設定してください。");
   process.exit(1);
 }
 

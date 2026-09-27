@@ -4,8 +4,8 @@ name: SORAHOST relay
 # CI でビルドして取得リレーと一緒にデプロイする。手動実行のみ（通常の push では動かさない）。
 #
 # 必要なシークレット:
-#   SORAHOST_ENDPOINT  PteWorker のコンソールに出る接続先
-#   SORAHOST_TOKEN     同じくコンソールのデプロイトークン（`token rotate` で再発行可）
+#   PROXY_ENDPOINT  PteWorker のコンソールに出る接続先
+#   PROXY_TOKEN     同じくコンソールのデプロイトークン（`token rotate` で再発行可）
 #
 # アプリ側の PROXY_TOKEN は Pterodactyl の .env に設定する（このワークフローでは扱わない）。
 
@@ -45,8 +45,8 @@ jobs:
 
       - name: Deploy to SORAHOST
         env:
-          SORAHOST_ENDPOINT: ${{ secrets.SORAHOST_ENDPOINT }}
-          SORAHOST_TOKEN: ${{ secrets.SORAHOST_TOKEN }}
+          PROXY_ENDPOINT: ${{ secrets.PROXY_ENDPOINT }}
+          PROXY_TOKEN: ${{ secrets.PROXY_TOKEN }}
         run: |
           cd build
           npx --yes sorahost-cli deploy --yes --json
