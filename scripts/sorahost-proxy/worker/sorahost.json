@@ -1,0 +1,6 @@
+{
+  "mode": "worker",
+  "framework": "worker",
+  "entry": "worker.mjs",
+  "compatibilityDate": "2026-09-01"
+}
