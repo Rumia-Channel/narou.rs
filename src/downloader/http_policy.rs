@@ -49,6 +49,24 @@ impl FetchPolicy {
         }
     }
 
+    /// Build the policy for the site a novel record belongs to.
+    ///
+    /// The record's `toc_url` selects the site definition (`matches_url` —
+    /// the same rule the native CLI uses); records matching no known site
+    /// get the headerless default. Converter-side illustration fetches ride
+    /// on this: image hosts such as `i.pximg.net` reject requests without
+    /// the site's `Referer`.
+    pub fn for_record(
+        site_settings: &[super::site_setting::SiteSetting],
+        record: &crate::db::NovelRecord,
+    ) -> Self {
+        site_settings
+            .iter()
+            .find(|setting| setting.matches_url(&record.toc_url))
+            .map(Self::for_site)
+            .unwrap_or_default()
+    }
+
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         let (name, value) = (name.into(), value.into());
         if is_safe_header_name(&name) && is_safe_header_value(&value) {
@@ -392,6 +410,121 @@ headers:
             ]
         );
         assert!(!policy.narou());
+    }
+
+    /// The real pixiv definition declares `Referer: \k<top_url>/`, and a
+    /// record whose `toc_url` is one of the pixiv `url:` shapes (including
+    /// the `/ajax/novel/{id}` form saved records use) resolves to a policy
+    /// carrying that `Referer` — `i.pximg.net` rejects image fetches
+    /// without it.
+    #[test]
+    fn for_record_carries_pixiv_referer() {
+        let settings = super::super::site_setting::SiteSetting::load_bundled(&[
+            include_str!("../../webnovel/www.pixiv.net.yaml"),
+        ])
+        .unwrap();
+
+        for toc_url in [
+            "https://www.pixiv.net/novel/show.php?id=12345",
+            "https://www.pixiv.net/ajax/novel/12345",
+        ] {
+            let mut record = pixiv_record();
+            record.toc_url = toc_url.to_string();
+            let policy = FetchPolicy::for_record(&settings, &record);
+            let referer = policy
+                .headers()
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
+                .map(|(_, value)| value.as_str());
+            assert_eq!(
+                referer,
+                Some("https://www.pixiv.net/"),
+                "site-defined Referer must ride on fetches for {toc_url}"
+            );
+        }
+
+        let mut record = pixiv_record();
+        record.toc_url = "https://unknown.example/work/1".to_string();
+        assert!(FetchPolicy::for_record(&settings, &record).headers().is_empty());
+    }
+
+    /// The whole path an illustration fetch takes on the Worker:
+    /// `FetchPolicy::for_record` → `fetch_bytes` → `HttpClient::send`. The
+    /// mock records request heads, so this asserts the `Referer` actually
+    /// leaves the process, not just that the policy struct carries it.
+    #[test]
+    fn illustration_fetch_sends_site_referer() {
+        use crate::platform::mocks::{FakeRateLimiter, MockHttpClient};
+
+        let settings = super::super::site_setting::SiteSetting::load_bundled(&[
+            include_str!("../../webnovel/www.pixiv.net.yaml"),
+        ])
+        .unwrap();
+        let mut record = pixiv_record();
+        record.toc_url = "https://www.pixiv.net/ajax/novel/12345".to_string();
+        let policy = FetchPolicy::for_record(&settings, &record);
+
+        let image_url = "https://i.pximg.net/img-original/img/2020/01/01/00/00/00/1_p0.jpg";
+        let http = MockHttpClient::new();
+        http.add_response(
+            image_url,
+            HttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".into(), "image/jpeg".into())],
+                body: b"jpg".to_vec(),
+            },
+        );
+        let response = futures::executor::block_on(fetch_bytes(
+            &http,
+            &FakeRateLimiter::new(),
+            image_url,
+            &policy,
+        ))
+        .expect("canned image response");
+        assert_eq!(response.body, b"jpg");
+
+        let sent = http.sent_requests();
+        let (_, headers) = sent
+            .iter()
+            .find(|(url, _)| url == image_url)
+            .expect("image request was sent");
+        let referer = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(referer, Some("https://www.pixiv.net/"));
+    }
+
+    fn pixiv_record() -> crate::db::NovelRecord {
+        crate::db::NovelRecord {
+            id: 1,
+            author: String::new(),
+            title: String::new(),
+            file_title: String::new(),
+            toc_url: String::new(),
+            sitename: String::new(),
+            novel_type: 1,
+            end: false,
+            last_update: chrono::Utc::now(),
+            new_arrivals_date: None,
+            use_subdirectory: false,
+            general_firstup: None,
+            novelupdated_at: None,
+            general_lastup: None,
+            last_mail_date: None,
+            tags: Vec::new(),
+            ncode: None,
+            domain: None,
+            general_all_no: None,
+            length: None,
+            suspend: false,
+            is_narou: false,
+            last_check_date: None,
+            convert_failure: false,
+            requires_login: false,
+            login_session: None,
+            extra_fields: Default::default(),
+        }
     }
 
     #[test]

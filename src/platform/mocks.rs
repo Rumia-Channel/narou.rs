@@ -27,7 +27,12 @@ use crate::platform::{
 pub struct MockHttpClient {
     responses: Mutex<BTreeMap<String, HttpResponse>>,
     requests: Mutex<Vec<String>>,
+    /// Full request heads (url + headers) so tests can assert what was sent.
+    sent: Mutex<Vec<RequestHead>>,
 }
+
+/// One sent request head: `(url, headers)` in send order.
+type RequestHead = (String, Vec<(String, String)>);
 
 impl MockHttpClient {
     pub fn new() -> Self {
@@ -59,11 +64,19 @@ impl MockHttpClient {
     pub fn request_count(&self) -> usize {
         self.requests.lock().len()
     }
+
+    /// All request heads sent so far: `(url, headers)` in send order.
+    pub fn sent_requests(&self) -> Vec<RequestHead> {
+        self.sent.lock().clone()
+    }
 }
 
 impl HttpClient for MockHttpClient {
     fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
         Box::pin(async move {
+            self.sent
+                .lock()
+                .push((request.url.clone(), request.headers.clone()));
             self.requests
                 .lock()
                 .push(format!("{} {}", method_name(request.method), request.url));

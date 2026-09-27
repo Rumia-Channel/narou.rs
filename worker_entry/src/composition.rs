@@ -483,6 +483,14 @@ impl WorkerRuntime {
         Arc::new(D1SettingsStore::new(self.db.clone()))
     }
 
+    /// コンパイル済みサイト定義のスナップショット。`build` (Job) 経路では
+    /// bundle + ユーザー定義が読み込まれ、`build_ui` では空。
+    /// `new_downloader` と同じ一覧を、小説単位の `FetchPolicy` 解決
+    /// (挿絵取得のサイトヘッダ) が共有する。
+    pub fn site_settings(&self) -> &[SiteSetting] {
+        &self.site_settings
+    }
+
     /// 変換 (`ConvertService`) と HTTP 系が共有する平台能力。
     pub fn http_client(&self) -> Arc<dyn HttpClient> {
         self.http.clone()

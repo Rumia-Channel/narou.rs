@@ -4,12 +4,15 @@
 //! 書く。native の `convert_novel_by_id` が書く固定名ミラーと同じキーなので、
 //! 続けて `download.epub` がそのまま配信できる（外部プロセスは使わない）。
 
+use std::sync::Arc;
+
 use narou_rs::application::convert::{
     ConvertItemReport, ConvertService, ConvertedNovel, emit_convert_item_lines,
 };
 use narou_rs::application::jobs::{JobFailureClass, JobPlan, JobTarget, classify_failure};
 use narou_rs::converter::ConverterCapabilities;
 use narou_rs::downloader::http_policy::FetchPolicy;
+use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::NovelMutation;
 use worker::console_log;
@@ -107,16 +110,23 @@ async fn convert(
 
     // native の CLI 変換と同じく、挿絵のローカライズ能力は渡さない
     // (`native::converter::native_capabilities` も assets/objects を None にする)。
+    // 挿絵を取るリクエストはサイト定義のヘッダが要る (i.pximg.net は Referer
+    // 無しを 403 で弾く)。`fetch_policy` は対象小説のサイトのもの、
+    // `fetch_policy_resolver` は native と同じ レコード→サイト定義→policy
+    // 解決 (`FetchPolicy::for_record`) で、小説ごとの切替に対応する。
+    let site_settings: Arc<[SiteSetting]> = runtime.site_settings().into();
     let capabilities = ConverterCapabilities {
         http: runtime.http_client(),
         rate_limiter: runtime.rate_limiter(),
-        fetch_policy: FetchPolicy::default(),
+        fetch_policy: FetchPolicy::for_record(&site_settings, &record),
         assets: None,
         objects: None,
         illustration_index: None,
         illustration_prefix: None,
         novel_record_resolver: None,
-        fetch_policy_resolver: None,
+        fetch_policy_resolver: Some(Arc::new(move |record| {
+            FetchPolicy::for_record(&site_settings, record)
+        })),
     };
 
     ConvertService::new(
