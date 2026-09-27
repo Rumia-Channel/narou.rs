@@ -240,7 +240,10 @@ jobs:
   # シークレット (SORAHOST_PROXY_ENDPOINT / SORAHOST_PROXY_TOKEN) を使い、
   # PteWorker のコンテナに curl が無いため静的 curl と CA バンドルを同梱する。
   relay-deploy:
-    if: github.ref == 'refs/heads/develop'
+    name: Deploy SORAHOST relay
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+      || (github.event_name == 'workflow_dispatch' && inputs.target == 'develop')
     needs: [native, native-gpl, wasm, worker, worker-contract, license]
     runs-on: ubuntu-latest
     concurrency:
