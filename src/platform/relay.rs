@@ -325,7 +325,7 @@ fn base64_decode(input: &str) -> std::result::Result<Vec<u8>, RelayError> {
     }
 
     let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(malformed(format!(
             "base64 length {} is not a multiple of 4",
             bytes.len()

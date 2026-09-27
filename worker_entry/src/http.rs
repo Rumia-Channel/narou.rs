@@ -11,6 +11,7 @@ use narou_rs::downloader::security::{
 };
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::http1::{Http1ResponseDecoder, SocketTarget, encode_request};
+use narou_rs::platform::relay::{RelayRequest, RelayResponse, TOKEN_HEADER};
 use narou_rs::platform::{
     CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, PlatformFuture, RedirectMode,
 };
@@ -38,6 +39,18 @@ pub struct WorkerHttpClient {
     /// 送信する User-Agent。native の `NativeHttpClient` と同じ役割で、
     /// リクエストが自前の UA を持たないときだけ付ける (サイト別の UA を尊重)。
     user_agent: String,
+    /// 踏み台 (SORAHOST リレー) の接続先と認証トークン。
+    /// `SORAHOST_PROXY_IP` / `SORAHOST_PROXY_KEY` が揃ったときだけ Some。
+    relay: Option<RelayConfig>,
+}
+
+/// 踏み台リレーの接続情報。
+#[derive(Clone)]
+struct RelayConfig {
+    /// 踏み台のベース URL (`http://<IP>:<port>`)。オリジン部分だけが使われる。
+    base_url: String,
+    /// `X-Proxy-Token` に入れる共有トークン。
+    token: String,
 }
 
 impl std::fmt::Debug for WorkerHttpClient {
@@ -55,12 +68,28 @@ impl WorkerHttpClient {
             subrequests,
             cookie_store: None,
             user_agent: String::new(),
+            relay: None,
         }
     }
 
     /// 送信する User-Agent を設定する (`narou_rs::downloader::resolve_user_agent`)。
     pub fn with_user_agent(mut self, user_agent: String) -> Self {
         self.user_agent = user_agent;
+        self
+    }
+
+    /// SORAHOST リレー経由の取得段を有効にする。
+    ///
+    /// `base_url` は `http://<IP>:<port>` 形式。スキームが無い値
+    /// (`<IP>:<port>` だけの環境変数) は `http://` を補う。末尾の `/` の有無は
+    /// `RelayRequest::new` が origin に正規化するため問わない。
+    pub fn with_relay(mut self, base_url: String, token: String) -> Self {
+        let base_url = if base_url.starts_with("http://") || base_url.starts_with("https://") {
+            base_url
+        } else {
+            format!("http://{base_url}")
+        };
+        self.relay = Some(RelayConfig { base_url, token });
         self
     }
 
@@ -176,6 +205,60 @@ impl WorkerHttpClient {
         unreachable!("redirect loop returns within MAX_REDIRECTS")
     }
 
+    /// GET via the SORAHOST relay, reached over a plain-http `connect()`
+    /// socket (`RelayRequest` keeps the full site URL and headers inside the
+    /// query, so the wire request is a GET to the relay's `/proxy`).
+    ///
+    /// Returns `Ok(None)` when the relay is not configured. `Err` covers every
+    /// way the relay path cannot produce a trustworthy response (bad config,
+    /// connect/timeout/malformed head, `RelayError`) so the caller keeps the
+    /// fetch result — same policy as [`Self::send_via_socket`].
+    ///
+    /// リダイレクトは踏み台側が辿る (`redirect` パラメータ)。`Manual` のときは
+    /// 上流の 3xx が `status`/`location` に載って返り、そのまま採用する。
+    async fn send_via_relay(&self, request: &HttpRequest) -> Result<Option<HttpResponse>> {
+        let Some(relay) = self.relay.as_ref() else {
+            return Ok(None);
+        };
+        // サイト定義のヘッダはそのまま転送する。UA が無いときは socket 経路と
+        // 同じフォールバックを足す (UA 無しは上流で 403 になりやすい)。
+        let mut headers = request.headers.clone();
+        if !self.user_agent.is_empty()
+            && !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        {
+            headers.push(("User-Agent".to_string(), self.user_agent.clone()));
+        }
+        let relay_request = RelayRequest::new(
+            &relay.base_url,
+            &relay.token,
+            &request.url,
+            &headers,
+            request.redirect,
+        )?;
+        let target = SocketTarget::parse(relay_request.url())?;
+        // 踏み台への認証はトランスポート層のヘッダで送る (クエリには載せない)。
+        let wire_headers = vec![(TOKEN_HEADER.to_string(), relay_request.token().to_string())];
+        let deadline_ms = js_sys::Date::now() + TOTAL_TIMEOUT_SECS as f64 * 1_000.0;
+        // `connect()` もサブリクエスト枠を消費するので fetch と同じく計上する。
+        self.subrequests.record();
+        let wire_response = socket_exchange(&target, &wire_headers, deadline_ms).await?;
+        let relay_response = RelayResponse::parse(wire_response.status, &wire_response.body)?;
+        let mut response_headers = Vec::new();
+        if let Some(content_type) = relay_response.content_type {
+            response_headers.push(("content-type".to_string(), content_type));
+        }
+        if let Some(location) = relay_response.location {
+            response_headers.push(("location".to_string(), location));
+        }
+        Ok(Some(HttpResponse {
+            status: relay_response.status,
+            headers: response_headers,
+            body: relay_response.body,
+        }))
+    }
+
     async fn send_request(&self, request: &HttpRequest) -> Result<HttpResponse> {
         let method = match request.method {
             HttpMethod::Get => Method::Get,
@@ -272,27 +355,52 @@ impl HttpClient for WorkerHttpClient {
             // fetch は Cloudflare 配下のサイトでエッジから 403 が返ることが
             // ある (`cf-mitigated`)。`connect()` は fetch とは別の egress
             // プレフィックスを使うため、403 のときだけ生ソケットで取り直す。
-            // GET のみ (encoder が GET しか組み立てない)。
+            // それでも 2xx/3xx が得られないときは SORAHOST リレー (設定済みの
+            // 場合のみ) で最後に取り直す。GET のみ (encoder が GET しか
+            // 組み立てない)。
             let response = if fetch_response.status == 403 && request.method == HttpMethod::Get {
                 match self.send_via_socket(&request).await {
-                    // 通常の応答が取れたときだけ採用する。接続拒否・タイム
-                    // アウト・中途切断・ソケット側の 4xx/5xx は fetch の
-                    // 403 をそのまま返す (挙動を変えない)。
+                    // 通常の応答が取れたときだけ採用する。
                     Ok(socket_response)
                         if socket_response.is_success() || socket_response.is_redirection() =>
                     {
                         socket_response
                     }
-                    Ok(socket_response) => {
-                        console_warn!(
-                            "socket transport returned {}, keeping fetch 403",
-                            socket_response.status
-                        );
-                        fetch_response
-                    }
-                    Err(error) => {
-                        console_warn!("socket transport failed, keeping fetch 403: {error}");
-                        fetch_response
+                    socket_result => {
+                        // 第三段: 踏み台経由 (設定済みの場合のみ)。こちらも
+                        // 2xx/3xx が取れたときだけ採用する。
+                        match self.send_via_relay(&request).await {
+                            Ok(Some(relay_response))
+                                if relay_response.is_success()
+                                    || relay_response.is_redirection() =>
+                            {
+                                relay_response
+                            }
+                            relay_result => {
+                                // どの経路でも採用できないので fetch の 403 を
+                                // そのまま返す (挙動を変えない)。
+                                match socket_result {
+                                    Ok(socket_response) => console_warn!(
+                                        "socket transport returned {}, keeping fetch 403",
+                                        socket_response.status
+                                    ),
+                                    Err(error) => console_warn!(
+                                        "socket transport failed, keeping fetch 403: {error}"
+                                    ),
+                                }
+                                match relay_result {
+                                    Ok(Some(relay_response)) => console_warn!(
+                                        "relay transport returned {}, keeping fetch 403",
+                                        relay_response.status
+                                    ),
+                                    Ok(None) => {}
+                                    Err(error) => console_warn!(
+                                        "relay transport failed, keeping fetch 403: {error}"
+                                    ),
+                                }
+                                fetch_response
+                            }
+                        }
                     }
                 }
             } else {

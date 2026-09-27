@@ -318,11 +318,18 @@ impl WorkerRuntime {
             .and_then(|value| value.as_str())
             .map(str::to_owned);
         let user_agent = narou_rs::downloader::resolve_user_agent(None, saved_user_agent);
-        let http: Arc<dyn HttpClient> = Arc::new(
-            WorkerHttpClient::new(subrequests.clone())
-                .with_user_agent(user_agent)
-                .with_cookie_store(cookie_store.clone()),
-        );
+        // 踏み台 (SORAHOST リレー) は `SORAHOST_PROXY_IP` と
+        // `SORAHOST_PROXY_KEY` が揃ったときだけ有効にする。スキーム無しの
+        // `<IP>:<port>` 形式も受け付ける (http.rs の `with_relay` が補完)。
+        let relay_base = crate::secrets::value(env, "SORAHOST_PROXY_IP").await;
+        let relay_token = crate::secrets::value(env, "SORAHOST_PROXY_KEY").await;
+        let mut http_client =
+            WorkerHttpClient::new(subrequests.clone()).with_user_agent(user_agent);
+        if let (Some(base), Some(token)) = (relay_base, relay_token) {
+            http_client = http_client.with_relay(base, token);
+        }
+        let http: Arc<dyn HttpClient> =
+            Arc::new(http_client.with_cookie_store(cookie_store.clone()));
         // `download.interval` / `download.wait-steps` を設定から読む
         // (native `load_interval_secs` / `load_wait_steps` と同じ規則:
         // Number または数値文字列、それ以外は未設定扱い)。ジョブ単位の
