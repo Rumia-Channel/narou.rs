@@ -45,14 +45,15 @@ pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
     let Some(rest) = path.strip_prefix("/novels/") else {
         return Response::error("Not Found", 404);
     };
-    // native は `Path<i64>` で非数値を弾く。JS が正規表現 `\d+` でしか
-    // 開かないので、パースできないパスは 404 (既存 `api_novel` と同じ規則)。
+    // native は `Path<i64>` で非数値を弾く (axum は抽出失敗を 400 で返す)。
+    // JS が正規表現 `\d+` でしか開かないので通常は到達しないが、API と同じ
+    // ステータスに合わせておく。
     if let Some(id) = rest.strip_suffix("/setting") {
         return match req.method() {
             Method::Get | Method::Head if id.parse::<i64>().is_ok() => {
                 serve_asset(&req, &env, "novel_setting.html").await
             }
-            Method::Get | Method::Head => Response::error("Not Found", 404),
+            Method::Get | Method::Head => json_error(400, "invalid_path_parameter", None),
             _ => json_error(405, "method_not_allowed", None),
         };
     }
@@ -61,7 +62,7 @@ pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
             Method::Get | Method::Head if id.parse::<i64>().is_ok() => {
                 serve_asset(&req, &env, "author_comments.html").await
             }
-            Method::Get | Method::Head => Response::error("Not Found", 404),
+            Method::Get | Method::Head => json_error(400, "invalid_path_parameter", None),
             _ => json_error(405, "method_not_allowed", None),
         };
     }
@@ -70,7 +71,9 @@ pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
             (Method::Get | Method::Head, Ok(id)) => {
                 crate::api_novel_download_epub(req, env, id).await
             }
-            (Method::Get | Method::Head, Err(_)) => Response::error("Not Found", 404),
+            (Method::Get | Method::Head, Err(_)) => {
+                json_error(400, "invalid_path_parameter", None)
+            }
             _ => json_error(405, "method_not_allowed", None),
         };
     }

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use crate::downloader::site_setting::SiteSetting;
+use crate::downloader::site_setting::{SiteSetting, merge_user_definition_yaml};
 use crate::error::{NarouError, Result};
 use crate::platform::{
     ObjectKey, ObjectListRequest, ObjectPrefix, ObjectStore, PlatformFuture, PlatformService,
@@ -260,6 +260,10 @@ impl SiteDefinitions {
     }
 
     /// 実効定義の並び（`<(name, yaml)>`）。bundle を土台にユーザー定義で上書きする。
+    ///
+    /// 管理 API（native / Worker 共通）が使う表示・保存経路の実効定義で、
+    /// ユーザー定義の `version` を問わずユーザー本文をそのまま返す。
+    /// fetch policy に渡す実効定義は [`Self::effective_runtime`] を使う。
     pub async fn effective(&self) -> Result<Vec<(String, String)>> {
         let user = self.store.list().await?;
         let mut merged: Vec<(String, String)> = self.bundled.clone();
@@ -269,6 +273,30 @@ impl SiteDefinitions {
             };
             match merged.iter_mut().find(|(existing, _)| existing == &name) {
                 Some(entry) => entry.1 = yaml,
+                None => merged.push((name, yaml)),
+            }
+        }
+        Ok(merged)
+    }
+
+    /// ランタイム（fetch policy / Worker のダウンローダ）向けの実効定義の並び。
+    ///
+    /// native の `SiteSetting::load_all()`（`loader::load_all_from_dirs`）が
+    /// フォルダ読み込みで掛ける version gate を [`merge_user_definition_yaml`] で
+    /// 再現する: ユーザー定義の `version` が bundle より低ければ bundle を勝たせ、
+    /// 同版以上ならキー単位でマージする（`name` / `version` は bundle の値を保持）。
+    /// bundle に無い名前のユーザー定義はそのまま追加する。
+    /// 表示・保存経路の [`Self::effective`] は native `/api/sites` と揃えるため
+    /// この gate を掛けない（差はここ）。
+    pub async fn effective_runtime(&self) -> Result<Vec<(String, String)>> {
+        let user = self.store.list().await?;
+        let mut merged: Vec<(String, String)> = self.bundled.clone();
+        for name in user {
+            let Some(yaml) = self.store.get(&name).await? else {
+                continue;
+            };
+            match merged.iter_mut().find(|(existing, _)| existing == &name) {
+                Some(entry) => entry.1 = merge_user_definition_yaml(&entry.1, &yaml),
                 None => merged.push((name, yaml)),
             }
         }
@@ -318,10 +346,22 @@ mod tests {
     const BUNDLED_EXAMPLE: &str = "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Bundled\ntoc_url: https://example.com/\\k<url>\n";
     const USER_EXAMPLE: &str = "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: User\ntoc_url: https://example.com/\\k<url>\n";
     const USER_NEW: &str = "name: New\ndomain: new.example\ntop_url: https://new.example\nsitename: New\ntoc_url: https://new.example/\\k<url>\n";
+    /// version gate 検証用の bundle 側 fixture (`version: 2.0`)。ユーザー側
+    /// fixture は `name: UserExample` にして、「`name` / `version` は bundle の
+    /// 値が残ること」を検証できるようにしている。
+    const BUNDLED_EXAMPLE_V2: &str = "name: Example\ndomain: example.com\ntop_url: https://example.com\nsitename: Bundled\ntoc_url: https://example.com/\\k<url>\nversion: 2.0\n";
+    const USER_OLD_EXAMPLE: &str = "name: UserExample\ndomain: example.com\ntop_url: https://example.com\nsitename: User\ntoc_url: https://example.com/\\k<url>\nversion: 1.0\n";
+    const USER_EQUAL_EXAMPLE: &str = "name: UserExample\ndomain: example.com\ntop_url: https://example.com\nsitename: User\ntoc_url: https://example.com/\\k<url>\nversion: 2.0\n";
+    const USER_NEWER_EXAMPLE: &str = "name: UserExample\ndomain: example.com\ntop_url: https://example.com\nsitename: User\ntoc_url: https://example.com/\\k<url>\nversion: 3.0\n";
+    const USER_UNVERSIONED_EXAMPLE: &str = "name: UserExample\ndomain: example.com\ntop_url: https://example.com\nsitename: User\ntoc_url: https://example.com/\\k<url>\n";
 
     fn service() -> (SiteDefinitions, Arc<MemoryObjectStore>) {
+        service_with_bundled(BUNDLED_EXAMPLE)
+    }
+
+    fn service_with_bundled(bundled_yaml: &str) -> (SiteDefinitions, Arc<MemoryObjectStore>) {
         let store = Arc::new(MemoryObjectStore::new());
-        let bundled = vec![("example.com.yaml".to_string(), BUNDLED_EXAMPLE.to_string())];
+        let bundled = vec![("example.com.yaml".to_string(), bundled_yaml.to_string())];
         (
             SiteDefinitions::new(bundled, Arc::new(ObjectStoreSiteDefinitions::new(store.clone()))),
             store,
@@ -411,6 +451,71 @@ mod tests {
                     .sitename,
                 "User"
             );
+        });
+    }
+
+    #[test]
+    fn effective_runtime_ignores_a_user_definition_below_the_bundled_version() {
+        futures::executor::block_on(async {
+            let (service, _store) = service_with_bundled(BUNDLED_EXAMPLE_V2);
+            service.put("example.com.yaml", USER_OLD_EXAMPLE).await.unwrap();
+
+            // version gate: ユーザー側 (1.0) が bundle (2.0) より低いので
+            // bundle 定義がそのまま残る。
+            let effective = service.effective_runtime().await.unwrap();
+            assert_eq!(effective.len(), 1);
+            assert_eq!(effective[0].1, BUNDLED_EXAMPLE_V2);
+
+            // 表示・保存経路の effective() は gate を掛けない (native API と揃える)。
+            let listed = service.effective().await.unwrap();
+            assert_eq!(listed[0].1, USER_OLD_EXAMPLE);
+        });
+    }
+
+    #[test]
+    fn effective_runtime_merges_a_user_definition_at_or_above_the_bundled_version() {
+        futures::executor::block_on(async {
+            // 同版 (2.0) と新版 (3.0) はどちらもキー単位でマージされる。
+            for user_yaml in [USER_EQUAL_EXAMPLE, USER_NEWER_EXAMPLE] {
+                let (service, _store) = service_with_bundled(BUNDLED_EXAMPLE_V2);
+                service.put("example.com.yaml", user_yaml).await.unwrap();
+
+                let effective = service.effective_runtime().await.unwrap();
+                let settings = SiteSetting::load_bundled(
+                    &effective
+                        .iter()
+                        .map(|(_, yaml)| yaml.as_str())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                assert_eq!(settings.len(), 1);
+                // `name` / `version` は bundle の値のまま、それ以外はユーザー側が勝つ。
+                assert_eq!(settings[0].name, "Example");
+                assert_eq!(settings[0].version, 2.0);
+                assert_eq!(settings[0].sitename, "User");
+            }
+        });
+    }
+
+    #[test]
+    fn effective_runtime_merges_a_user_definition_without_a_version() {
+        futures::executor::block_on(async {
+            let (service, _store) = service_with_bundled(BUNDLED_EXAMPLE_V2);
+            service.put("example.com.yaml", USER_UNVERSIONED_EXAMPLE).await.unwrap();
+
+            let effective = service.effective_runtime().await.unwrap();
+            let settings = SiteSetting::load_bundled(
+                &effective
+                    .iter()
+                    .map(|(_, yaml)| yaml.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            assert_eq!(settings.len(), 1);
+            // version 無しはマージ。`version` は bundle の 2.0 が残る。
+            assert_eq!(settings[0].name, "Example");
+            assert_eq!(settings[0].version, 2.0);
+            assert_eq!(settings[0].sitename, "User");
         });
     }
 }

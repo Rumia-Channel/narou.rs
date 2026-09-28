@@ -440,7 +440,12 @@ Browser ──► Worker (fetch)
 ### 3.2 認証
 
 - API/CI は既存の `NAROU_ADMIN_TOKEN`（Bearer、定数時間比較）を継続。
-- ブラウザは token cookie（`narou_api_token`、HttpOnly / SameSite=Lax）+ 同一オリジン検査を追加（P3）。
+- ブラウザは token cookie（`narou_api_token`、HttpOnly / SameSite=Lax）+ 同一オリジン検査。
+  実装: `GET /login` が Worker 専用のログインページを返し、`POST /api/auth/login`（本文の
+  トークンを定数時間で照合）が Cookie を配る。Cookie は base64url で持ち、認証は
+  Cookie 復号 + 定数時間照合。Cookie 経由のリクエストは `Origin` がリクエスト URL と
+  一致することを要求する（SameSite=Lax と二重の CSRF 対策）。共有フロントエンドは
+  401 `authentication_required` を受けると `/login?return=<path>` へ誘導する。
 - secret 未設定時は fail-closed（401 ではなく 500 `authentication_not_configured` として設定不備を可視化）。
 - **Zero Trust (Cloudflare Access) を境界にする場合**は CI の `NAROU_AUTH_REQUIRED=false` で
   Bearer トークン検査を切れる（`NAROU_ADMIN_TOKEN` は不要）。このときは workers.dev を閉じて
@@ -457,6 +462,19 @@ Browser ──► Worker (fetch)
 | AozoraEpub3 jar / kindlegen / 外部 diff ツール | 同上（EPUB は Lite で代替済み） |
 | `folder` / `browser` / `login`(ブラウザ起動) / タスクトレイ | `501` |
 | `shutdown` / `reboot` / self-update / `narou db` 保守 | `501` |
+| バージョン履歴系 (`/api/diff` / `diff_history` / `diff_show` / `diff_restore` / `diff_merge`) | `501` (`not_supported_on_worker`)。Workers 側に `novel_versions` 相当の履歴が無い |
+| `/api/download` の `mail:true` | `501` (`mail_not_supported_on_worker`)。送れないオプションを黙って受理しない |
+| `/api/reorder_pending_tasks` | `501` (`queue_reorder_not_supported`)。Cloudflare Queue の配送順は Worker から制御できない |
+
+**既知の差分 (成功はするが native と語彙・文言が違う)**:
+- `/api/update` / `/api/convert` の未解決ターゲットは `results[].status = "unresolved"` として明示し、
+  1 件も投入できなかった場合は `success:false` + 説明を返す (native は文字列のまま子プロセスへ渡し、
+  子プロセスが「存在しません」行を出す)。共有フロントエンドは `success` を見るため、
+  無言の no-op にはならない。
+- `/api/update` の `count` は tag 展開後の計画件数 (native はコマンド引数の個数)。
+- `get_pending_tasks` の `display_target` は 1 ジョブ = 1 作品の文言 (native は 1 ジョブに多数の作品を積む)。
+- `/api/history` は常に空で、`/api/clear_history` は no-op (native の PushServer 履歴に相当するものを持たない)。
+  復元は WebSocket のリプレイ (直近 200 件) が担う。
 
 ---
 
@@ -488,7 +506,7 @@ CF Access を唯一のユーザー境界にする設計、音声向けの instan
 | **P0e 契約テスト + CI** | `worker_entry/tests/*.mjs`（health / 認証 fail-closed / オブジェクト往復）、CI に worker テスト + `d1 migrations apply --remote` + deploy を追加 | ローカルと CI で契約テストが green、デプロイが 3 環境で通る |
 | **P1 取得系** | SSRF 検証の port 化、`DownloaderSettings` を D1 読みに、`CookieStore`(D1) 注入、`SiteDefinitionProvider` をストア経由に、`setting_core` の Directory 検証 port 化 | ログイン必須サイトを含む DL/更新が Worker で完走し、native と同じキー集合・本文バイトになる |
 | **P2 変換** | `converter/**` の feature 分割（`device`/`inspector`/`settings` を native gate へ）、`JobKind::Convert` を worker-executable に、変換結果をセクション行の「変換済み本文」として保存（**EPUB は保存せず、DL 要求時にストリーミング生成**） | Worker 単独で download → convert → EPUB が閉じる（409 が消える）。native と同一の変換出力 |
-| **P3 Web UI** | ルート移植、`[assets]` 配信、`/ws` を `PUSH_HUB` で実装、token cookie 認証、非対応機能の `501` | ブラウザから一覧・タグ・凍結・設定・キュー・進捗・EPUB DL が native UI と同等に操作できる |
+| **P3 Web UI** | ルート移植、`[assets]` 配信、`/ws` を `PUSH_HUB` で実装、token cookie 認証（`/login` + `POST /api/auth/login` 実装済み）、非対応機能の `501` | ブラウザから一覧・タグ・凍結・設定・キュー・進捗・EPUB DL が native UI と同等に操作できる |
 | **P4 運用** | ロールバック手順（`wrangler versions` + `asset_backend` + prefix 切替）、D1/S3 の容量・コスト設計、バックアップ経路の再定義、runbook | runbook に沿って前バージョンへ戻せる。検証記録が残る |
 
 各 Phase は独立 commit 単位。P1 完了までは「Worker はまだ本番運用しない」前提を維持する。

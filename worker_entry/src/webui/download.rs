@@ -9,6 +9,12 @@
 //! - validation / enqueue failure: HTTP 200 `{"success": false, "message",
 //!   "results": []}` — the native handler reports every request-level failure
 //!   this way (never a 4xx/5xx for a well-formed request body).
+//! - `"mail": true` → HTTP 501 `{"error": {"code":
+//!   "mail_not_supported_on_worker", ...}}` — native passes `--mail` to the
+//!   downloader subprocess, but the worker execution path has no consumer for
+//!   it (`/api/mail` is 501 too), so the request is refused instead of being
+//!   queued as a download that pretends mail will be sent
+//!   (migration plan §3.3).
 //!
 //! Native pushes the raw target string onto `PersistentQueue` and resolves
 //! aliases/titles lazily inside the downloader subprocess. The worker ledger
@@ -91,13 +97,27 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         return download_failure(&message);
     }
 
+    // native `queue_download_jobs` は `mail: true` を `--mail` として子プロ
+    // セスに渡し、ダウンロード後にメール送信する。Worker の実行経路には
+    // `--mail` の消費者が無く (`/api/mail` 自体が native_only で 501)、
+    // 受け入れて「送信されるはず」の要求を黙って置き去りにすることは
+    // できない (migration plan §3.3: 実行不能な操作は成功に見せない)。
+    // native と同じ option 検証を先に行い、検証を通った要求だけ 501 で拒否
+    // する — それ以外の検証順は native のまま。
+    if body.mail {
+        return json_error(
+            501,
+            "mail_not_supported_on_worker",
+            Some("この Worker 環境ではダウンロード後のメール送信 (--mail) は利用できません"),
+        );
+    }
+
     let mut options = Vec::new();
     if body.force {
         options.push("--force".to_string());
     }
-    if body.mail {
-        options.push("--mail".to_string());
-    }
+    // `--mail` は上の 501 で拒否されるので積まない (積っても実行経路に
+    // 消費者が無く、送信されない要求を黙って受理することになる)。
 
     let aliases = load_aliases(&env).await;
     let mut plans = Vec::with_capacity(body.targets.len());
@@ -128,6 +148,14 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
             "job_id": outcome.job_id,
             "status": "queued",
         }));
+    }
+
+    // native `api_download` は受理できたジョブを積んだあとに
+    // `notification.queue` を送る。1 件も積めなかった (対象 0 件) 要求は
+    // キューが変わらないので送らない — 投入が受理されたときだけ 1 回。
+    if !results.is_empty() {
+        let push = crate::push_hub::PushHubClient::new(&env, runtime.subrequests.clone());
+        crate::consumer::notify_queue_changed(&push).await;
     }
 
     Response::from_json(&json!({ "success": true, "results": results }))

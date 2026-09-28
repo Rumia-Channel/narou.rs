@@ -175,7 +175,11 @@ fn tail_offset(file: &mut File, count: usize) -> std::io::Result<u64> {
         for i in 0..chunk.len() {
             let idx = chunk.len() - i - 1;
             let chr = chunk[idx];
-            if chr == b'\n' || (offset == 0 && i == 0 && chr != b'\n') {
+            // 改行は行の終端。ファイル末尾が改行で終わっていない場合
+            // (`offset == 0 && i == 0`) は、その末尾自体を最終行の終端として
+            // 数える (`chr == b'\n'` が成り立たない位置なので `chr != b'\n'`
+            // の確認は不要)。
+            if chr == b'\n' || (offset == 0 && i == 0) {
                 remaining -= 1;
                 if remaining < 0 {
                     offset += i as u64;

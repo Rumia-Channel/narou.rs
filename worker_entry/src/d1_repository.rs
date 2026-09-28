@@ -343,6 +343,13 @@ impl FreezeMutationStore for D1FreezeStore {
 static SETTINGS_CACHE: std::sync::LazyLock<
     crate::isolate_cache::TtlMap<std::sync::Arc<HashMap<String, YamlValue>>>,
 > = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+const GLOBAL_REPLACE_SCOPE: &str = "global_replace";
+const GLOBAL_REPLACE_KEY: &str = "replace.txt";
+const TAG_COLORS_SCOPE: &str = "inv";
+const TAG_COLORS_KEY: &str = "tag_colors";
+const LEGACY_TAG_COLORS_SCOPE: &str = "tag_colors";
+const LEGACY_TAG_COLORS_KEY: &str = "colors";
+const TAG_COLORS_CACHE_KEY: &str = "inv/tag_colors";
 
 #[derive(Debug, Clone)]
 pub struct D1SettingsStore {
@@ -434,6 +441,41 @@ impl SettingsStore for D1SettingsStore {
             Ok(())
         })
     }
+    fn load_replace_content<'a>(&'a self) -> PlatformFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let row: Option<StateYamlRow> = self
+                .db
+                .prepare("SELECT value_yaml FROM app_state WHERE scope = ? AND key = ?")
+                .bind(&[
+                    JsValue::from_str(GLOBAL_REPLACE_SCOPE),
+                    JsValue::from_str(GLOBAL_REPLACE_KEY),
+                ])
+                .map_err(worker_error)?
+                .first(None)
+                .await
+                .map_err(worker_error)?;
+            Ok(row.map(|row| row.value_yaml).unwrap_or_default())
+        })
+    }
+
+    fn save_replace_content<'a>(&'a self, content: &'a str) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let statement = bind_statement(
+                self.db.prepare(
+                    "INSERT INTO app_state (scope, key, value_yaml, value_json) VALUES (?, ?, ?, '{}')
+                     ON CONFLICT(scope, key) DO UPDATE SET
+                       value_yaml = excluded.value_yaml, value_json = '{}'",
+                ),
+                vec![
+                    BindValue::Text(GLOBAL_REPLACE_SCOPE.to_string()),
+                    BindValue::Text(GLOBAL_REPLACE_KEY.to_string()),
+                    BindValue::Text(content.to_string()),
+                ],
+            )?;
+            ensure_batch_success(&self.db.batch(vec![statement]).await.map_err(worker_error)?)?;
+            Ok(())
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -454,48 +496,91 @@ static TAG_COLORS_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<TagCol
 impl TagColorStore for D1TagColorStore {
     fn load<'a>(&'a self) -> PlatformFuture<'a, Result<TagColors>> {
         Box::pin(async move {
-            if let Some(cached) = TAG_COLORS_CACHE.get("colors") {
+            if let Some(cached) = TAG_COLORS_CACHE.get(TAG_COLORS_CACHE_KEY) {
                 return Ok(cached);
             }
-            let row = self
+            let rows: Vec<TagColorRow> = self
                 .db
-                .prepare("SELECT value_json FROM app_state WHERE scope = 'tag_colors' AND key = 'colors'")
-                .first::<StateValueRow>(None)
+                .prepare(
+                    "SELECT scope, value_yaml, value_json FROM app_state
+                     WHERE (scope = ? AND key = ?) OR (scope = ? AND key = ?)",
+                )
+                .bind(&[
+                    JsValue::from_str(TAG_COLORS_SCOPE),
+                    JsValue::from_str(TAG_COLORS_KEY),
+                    JsValue::from_str(LEGACY_TAG_COLORS_SCOPE),
+                    JsValue::from_str(LEGACY_TAG_COLORS_KEY),
+                ])
+                .map_err(worker_error)?
+                .all()
                 .await
+                .map_err(worker_error)?
+                .results()
                 .map_err(worker_error)?;
-            let mut colors = TagColors::default();
-            if let Some(row) = row {
-                let map: HashMap<String, String> = serde_json::from_str(&row.value_json)
-                    .map_err(|error| NarouError::Platform(format!("invalid D1 tag colors: {error}")))?;
-                for (tag, color) in map {
-                    colors.set(&tag, &color);
+
+            let mut canonical = TagColors::default();
+            let mut legacy = None;
+            for row in rows {
+                let colors = parse_tag_colors_row(row.value_yaml.as_deref(), row.value_json.as_deref())?;
+                if row.scope == TAG_COLORS_SCOPE {
+                    canonical = colors;
+                } else if row.scope == LEGACY_TAG_COLORS_SCOPE {
+                    legacy = Some(colors);
                 }
             }
-            TAG_COLORS_CACHE.put("colors", colors.clone());
+
+            let colors = if let Some(legacy) = legacy {
+                let colors = merge_tag_colors(legacy, canonical);
+                self.save_canonical_tag_colors(&colors).await?;
+                colors
+            } else {
+                canonical
+            };
+            TAG_COLORS_CACHE.put(TAG_COLORS_CACHE_KEY, colors.clone());
             Ok(colors)
         })
     }
 
     fn save<'a>(&'a self, colors: &'a TagColors) -> PlatformFuture<'a, Result<()>> {
-        let value = match serde_json::to_string(&colors.clone().into_map()) {
-            Ok(value) => value,
-            Err(error) => {
-                return Box::pin(async move {
-                    Err(NarouError::Platform(format!("cannot serialize D1 tag colors: {error}")))
-                });
-            }
-        };
         Box::pin(async move {
-            let statement = bind_statement(
-                self.db.prepare(
-                    "INSERT INTO app_state (scope, key, value_json) VALUES ('tag_colors', 'colors', ?) ON CONFLICT(scope, key) DO UPDATE SET value_json = excluded.value_json",
-                ),
-                vec![BindValue::Text(value)],
-            )?;
-            ensure_batch_success(&self.db.batch(vec![statement]).await.map_err(worker_error)?)?;
-            TAG_COLORS_CACHE.invalidate("colors");
+            self.save_canonical_tag_colors(colors).await?;
+            TAG_COLORS_CACHE.invalidate(TAG_COLORS_CACHE_KEY);
             Ok(())
         })
+    }
+}
+
+impl D1TagColorStore {
+    async fn save_canonical_tag_colors(&self, colors: &TagColors) -> Result<()> {
+        let value = serde_yaml::to_string(&colors.clone().into_map()).map_err(|error| {
+            NarouError::Platform(format!("cannot serialize D1 tag colors: {error}"))
+        })?;
+        let upsert = bind_statement(
+            self.db.prepare(
+                "INSERT INTO app_state (scope, key, value_yaml, value_json) VALUES (?, ?, ?, '{}')
+                 ON CONFLICT(scope, key) DO UPDATE SET
+                   value_yaml = excluded.value_yaml, value_json = '{}'",
+            ),
+            vec![
+                BindValue::Text(TAG_COLORS_SCOPE.to_string()),
+                BindValue::Text(TAG_COLORS_KEY.to_string()),
+                BindValue::Text(value),
+            ],
+        )?;
+        let remove_legacy = bind_statement(
+            self.db.prepare("DELETE FROM app_state WHERE scope = ? AND key = ?"),
+            vec![
+                BindValue::Text(LEGACY_TAG_COLORS_SCOPE.to_string()),
+                BindValue::Text(LEGACY_TAG_COLORS_KEY.to_string()),
+            ],
+        )?;
+        ensure_batch_success(
+            &self
+                .db
+                .batch(vec![upsert, remove_legacy])
+                .await
+                .map_err(worker_error)?,
+        )
     }
 }
 
@@ -633,8 +718,15 @@ pub(crate) fn ensure_batch_success(results: &[D1Result]) -> Result<()> {
 }
 
 #[derive(Debug, Deserialize)]
-struct StateValueRow {
-    value_json: String,
+struct StateYamlRow {
+    value_yaml: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TagColorRow {
+    scope: String,
+    value_yaml: Option<String>,
+    value_json: Option<String>,
 }
 
 fn parse_extra_fields(value: &str) -> Result<BTreeMap<String, YamlValue>> {
@@ -674,6 +766,43 @@ fn parse_setting_value(value_yaml: &str, legacy_value_json: &str) -> Result<Yaml
                 .map_err(|error| NarouError::Platform(format!("invalid D1 setting value: {error}")))
         }
     }
+}
+
+fn parse_tag_colors_row(value_yaml: Option<&str>, value_json: Option<&str>) -> Result<TagColors> {
+    if let Some(yaml) = value_yaml.filter(|value| !value.trim().is_empty() && value.trim() != "{}") {
+        return parse_tag_colors_payload(yaml);
+    }
+    if let Some(json) = value_json.filter(|value| !value.trim().is_empty() && value.trim() != "{}") {
+        return parse_tag_colors_payload(json);
+    }
+    if let Some(yaml) = value_yaml {
+        return parse_tag_colors_payload(yaml);
+    }
+    Ok(TagColors::default())
+}
+
+fn parse_tag_colors_payload(payload: &str) -> Result<TagColors> {
+    let value: YamlValue = serde_yaml::from_str(payload)
+        .map_err(|error| NarouError::Platform(format!("invalid D1 tag colors: {error}")))?;
+    let mut colors = TagColors::default();
+    if let Some(mapping) = value.as_mapping() {
+        for (tag, color) in mapping {
+            if let (Some(tag), Some(color)) = (tag.as_str(), color.as_str()) {
+                colors.set(tag, color);
+            }
+        }
+    }
+    Ok(colors)
+}
+
+fn merge_tag_colors(legacy: TagColors, canonical: TagColors) -> TagColors {
+    let mut merged = legacy.into_map();
+    merged.extend(canonical.into_map());
+    let mut colors = TagColors::default();
+    for (tag, color) in merged {
+        colors.set(&tag, &color);
+    }
+    colors
 }
 
 fn record_binds(record: &NovelRecord) -> Result<Vec<BindValue>> {
@@ -1185,6 +1314,25 @@ mod tests {
         )]));
         let error = record_binds(&record).unwrap_err();
         assert!(error.to_string().contains("exceeds limit"));
+    }
+
+    #[test]
+    fn tag_colors_use_native_yaml_mapping_and_merge_legacy_worker_rows() {
+        let canonical = parse_tag_colors_payload("shared: blue\ncurrent: green\n").unwrap();
+        let legacy = parse_tag_colors_row(
+            Some("{}"),
+            Some(r#"{"shared":"red","legacy":"yellow"}"#),
+        )
+        .unwrap();
+        let merged = merge_tag_colors(legacy, canonical);
+        assert_eq!(merged.color_for("shared"), Some("blue"));
+        assert_eq!(merged.color_for("current"), Some("green"));
+        assert_eq!(merged.color_for("legacy"), Some("yellow"));
+
+        let persisted = serde_yaml::to_string(&merged.clone().into_map()).unwrap();
+        let value: YamlValue = serde_yaml::from_str(&persisted).unwrap();
+        assert!(value.is_mapping());
+        assert_eq!(parse_tag_colors_payload(&persisted).unwrap().color_for("legacy"), Some("yellow"));
     }
 
     #[test]

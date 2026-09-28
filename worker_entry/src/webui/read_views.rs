@@ -440,6 +440,12 @@ async fn diff_list_get(req: &Request, runtime: &WorkerRuntime) -> worker::Result
     Response::from_html(html)
 }
 
+/// 差分一覧 1 行分の `(index, file_name, object key)`。
+type VersionSection = (usize, String, String);
+
+/// バージョン 1 件分の `(version, sections)`。
+type VersionGroup = (String, Vec<VersionSection>);
+
 /// native `render_diff_list_html_for_target` の写し。解決失敗・記録なし・
 /// キャッシュ列挙失敗・キャッシュ空は全部空文字列を返す (= native 同様)。
 async fn render_diff_list_html(runtime: &WorkerRuntime, target: &str) -> String {
@@ -466,7 +472,7 @@ async fn render_diff_list_html(runtime: &WorkerRuntime, target: &str) -> String 
 
     // (version, [(index, file_name, key)]) に畳み込み、version 名の降順に並べる
     // (native `read_sorted_cache_dirs` の降順と同じ)。
-    let mut versions: HashMap<String, Vec<(usize, String, String)>> = HashMap::new();
+    let mut versions: HashMap<String, Vec<VersionSection>> = HashMap::new();
     for key in keys.drain(..) {
         let Some((version, file_name)) = cached_section_key(&prefix, &key) else {
             continue;
@@ -480,8 +486,7 @@ async fn render_diff_list_html(runtime: &WorkerRuntime, target: &str) -> String 
             .or_default()
             .push((index, file_name.to_string(), key));
     }
-    let mut ordered: Vec<(String, Vec<(usize, String, String)>)> =
-        versions.into_iter().collect();
+    let mut ordered: Vec<VersionGroup> = versions.into_iter().collect();
     ordered.sort_by(|a, b| b.0.cmp(&a.0));
 
     let mut html = String::new();
@@ -656,6 +661,17 @@ struct NotepadRow {
     value_json: Option<String>,
 }
 
+fn notepad_content(row: NotepadRow) -> String {
+    match row.value_yaml.as_deref() {
+        Some(yaml) if !yaml.trim().is_empty() && yaml.trim() != "{}" => yaml.to_string(),
+        _ => row
+            .value_json
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default(),
+    }
+}
+
 /// native `read_notepad` 相当: `value_yaml` の生テキストを返す。行が無い・
 /// 読めない場合は空文字列 (native の `unwrap_or_default` と同じ)。
 async fn read_notepad(env: &Env) -> String {
@@ -673,17 +689,7 @@ async fn read_notepad(env: &Env) -> String {
         Err(_) => return String::new(),
     };
     let row: Option<NotepadRow> = statement.first::<NotepadRow>(None).await.unwrap_or_default();
-    let Some(row) = row else {
-        return String::new();
-    };
-    match row.value_yaml.as_deref() {
-        Some(yaml) if !yaml.trim().is_empty() && yaml.trim() != "{}" => yaml.to_string(),
-        _ => row
-            .value_json
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_default(),
-    }
+    row.map(notepad_content).unwrap_or_default()
 }
 
 /// native `set_raw_db` と同じ SQL: `value_yaml` に生テキストを置く
@@ -693,7 +699,8 @@ async fn write_notepad(env: &Env, content: &str) -> Result<(), String> {
     let statement = db
         .prepare(
             "INSERT INTO app_state (scope, key, value_json, value_yaml) VALUES (?, ?, '{}', ?)
-             ON CONFLICT(scope, key) DO UPDATE SET value_yaml = excluded.value_yaml",
+             ON CONFLICT(scope, key) DO UPDATE SET
+               value_json = excluded.value_json, value_yaml = excluded.value_yaml",
         )
         .bind(&[
             JsValue::from_str(INVENTORY_SCOPE),
@@ -835,8 +842,8 @@ async fn taginfo(req_ids: Vec<serde_json::Value>, with_exclusion: bool, runtime:
         .await
         .unwrap_or_default();
     let mut selected_counts: HashMap<String, usize> = HashMap::new();
-    for id in selected_ids.iter().copied() {
-        if let Some(tags) = record_tags.get(&id) {
+    for id in selected_ids.iter() {
+        if let Some(tags) = record_tags.get(id) {
             for tag in tags {
                 *selected_counts.entry(tag.clone()).or_insert(0) += 1;
             }
@@ -982,5 +989,25 @@ async fn version_latest() -> worker::Result<Response> {
             "message": error.to_string(),
             "url": url_fallback,
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NotepadRow, notepad_content};
+
+    #[test]
+    fn cleared_canonical_notepad_value_cannot_fall_back_to_stale_json() {
+        let legacy = notepad_content(NotepadRow {
+            value_yaml: Some("{}".to_string()),
+            value_json: Some(r#""old note""#.to_string()),
+        });
+        assert_eq!(legacy, "old note");
+
+        let cleared = notepad_content(NotepadRow {
+            value_yaml: Some(String::new()),
+            value_json: Some("{}".to_string()),
+        });
+        assert_eq!(cleared, "");
     }
 }

@@ -5,16 +5,15 @@
 //! - `src/web/jobs.rs` `queue_status` / `get_pending_tasks`
 //!
 //! Status mapping (native `PersistentQueue` → worker ledger):
-//! - `pending`   ← `pending` + `retryable` (both wait for execution; native
-//!                 failed-retry jobs stay in the pending set, so retryable
-//!                 ledger rows are the same thing for the UI)
-//! - `running`   ← `running`
+//! - `pending` ← `pending` + `retryable` (both wait for execution; native
+//!   failed-retry jobs stay in the pending set, so retryable ledger rows are
+//!   the same thing for the UI)
+//! - `running` ← `running`
 //! - `completed` ← `succeeded`
-//! - `partial`   ← `partial`
+//! - `partial` ← `partial`
 //! - `cancelled` ← none (the worker ledger has no cancelled state)
-//! - `failed`    ← `permanent` + `blocked` (both are terminal states that need
-//!                 the operator to look at them; the UI only has a failed
-//!                 bucket)
+//! - `failed` ← `permanent` + `blocked` (both are terminal states that need
+//!   the operator to look at them; the UI only has a failed bucket)
 //!
 //! The ledger does not expose listing primitives (`JobQueue` is per-id only),
 //! so reads go through a direct `env.d1("DB")` handle — the same binding
@@ -71,10 +70,12 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
         .and_then(|url| query_param(&url, "format"));
 
     let new_tag_color = configured_tag_color(&runtime).await;
-    let records = match runtime.services.library.records().await {
-        Ok(records) => records,
-        Err(_) => Vec::new(),
-    };
+    let records = runtime
+        .services
+        .library
+        .records()
+        .await
+        .unwrap_or_default();
     let mut counts: HashMap<String, usize> = HashMap::new();
     for record in &records {
         for tag in &record.tags {
@@ -82,7 +83,8 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
         }
     }
     let mut list: Vec<(String, usize)> = counts.into_iter().collect();
-    list.sort_by(|a, b| b.1.cmp(&a.1));
+    // 件数の降順 (native のタグ一覧と同じ並び)。
+    list.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     let tags = list.into_iter().map(|(tag, _)| tag).collect::<Vec<_>>();
     let tag_colors = runtime
         .services

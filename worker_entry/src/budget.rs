@@ -64,8 +64,6 @@ impl SubrequestBudget {
     }
 }
 
-/// Section-boundary budget combining wall-clock and subrequest limits.
-
 /// Persist a resume checkpoint every this many completed sections, so a
 /// crashed invocation restarts near the last finished section instead of
 /// re-scanning the whole novel.
@@ -110,6 +108,8 @@ impl CheckpointSink {
         });
     }
 }
+
+/// Section-boundary budget combining wall-clock and subrequest limits.
 ///
 /// `should_yield` is checked only before a section starts, so whichever
 /// limit trips first produces a resumable `Partial` outcome instead of a
@@ -197,6 +197,9 @@ mod tests {
 
     #[test]
     fn job_budget_stays_below_hard_limit() {
-        assert!(JOB_SUBREQUEST_BUDGET < SUBREQUEST_HARD_LIMIT);
+        // 定数どうしの比較は const ブロックで行う (コンパイル時に検証される)。
+        const {
+            assert!(JOB_SUBREQUEST_BUDGET < SUBREQUEST_HARD_LIMIT);
+        }
     }
 }

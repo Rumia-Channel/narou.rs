@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::SecondsFormat;
 use narou_rs::application::settings::SettingsStore;
@@ -39,6 +40,14 @@ pub struct DispatchOutcome {
 /// Queue producer binding that carries version-2 job envelopes.
 pub const JOB_QUEUE_BINDING: &str = "NAROU_JOBS";
 
+/// ジョブ中に更新された section hash cache の保留分
+/// (`app_state('inv','section_hash_cache')` と同じ `小説 → (section → digest)` の形)。
+pub type PendingSectionHashCache =
+    Arc<parking_lot::Mutex<Option<HashMap<String, HashMap<String, String>>>>>;
+
+/// `update.interval` の既定値・下限 — native `commands::update::INTERVAL_MIN_SECS`。
+const UPDATE_INTERVAL_MIN_SECS: f64 = 2.5;
+
 /// Everything the Worker event handlers need: the application services plus
 /// the Phase 8 queue/ledger/checkpoint/rate-limiter wiring.
 ///
@@ -55,7 +64,9 @@ pub struct WorkerRuntime {
     pub freeze: Arc<D1FreezeStore>,
     pub novels: Arc<dyn NovelRepository>,
     http: Arc<dyn HttpClient>,
-    rate_limiter: Arc<dyn RateLimiter>,
+    rate_limiter: Arc<WorkerRateLimiter>,
+    /// `update.interval` (作品開始の間隔、native と同じく最低 2.5 秒)。
+    update_interval_secs: f64,
     objects: Arc<dyn ObjectStore>,
     assets: Arc<dyn AssetStore>,
     pub clock: Arc<dyn Clock>,
@@ -73,8 +84,7 @@ pub struct WorkerRuntime {
     /// `SnapshotDownloaderSettings::save_section_hash_cache` (同期) がここへ
     /// 置き、ジョブ終了時に [`Self::persist_pending_section_hash_cache`] が
     /// D1 (`app_state('inv','section_hash_cache')`) へ flush する。
-    pub pending_section_hash_cache:
-        Arc<parking_lot::Mutex<Option<HashMap<String, HashMap<String, String>>>>>,
+    pub pending_section_hash_cache: PendingSectionHashCache,
 }
 
 /// `WorkerRuntime::build_with` が行う重い読み込みのプロファイル。
@@ -284,6 +294,8 @@ impl WorkerRuntime {
     /// ダウンローダ専用の重い読み込み (`load_site_settings` のオブジェクト
     /// ストア LIST、`load_section_hash_cache`) は行わない。`site_settings`
     /// は空になり、`new_downloader` は job 経路 (`build`) 専用。
+    /// (旧ホストキーを畳む `D1CookieStore` は必要なときだけ同じ
+    ///  `load_site_settings` を遅延呼び出しする。ビルド時には読まない。)
     pub async fn build_ui(env: &Env) -> worker::Result<Self> {
         let db = DbHandle::ui(Arc::new(env.d1("DB")?));
         Self::build_with(env, db, CompositionProfile::Ui).await
@@ -304,6 +316,10 @@ impl WorkerRuntime {
             Arc::new(crate::d1_cookie_store::D1CookieStore::new(
                 db.clone(),
                 crate::d1_cookie_store::D1CookieStore::key_from_env(env).await,
+                // 旧ホストキーの畳み (key_site_settings) が Worker runtime と
+                // 同じ effective 定義 (bundle + ユーザー、version gate 済み) を
+                // 読めるように注入する。
+                objects.clone(),
             ));
         // local 設定は 1 回だけ読んで User-Agent とレート制限の両方に使う
         // (D1SettingsStore 経由なので同一 isolate ではキャッシュ済み)。
@@ -340,7 +356,14 @@ impl WorkerRuntime {
         let download_wait_steps = local_values
             .get("download.wait-steps")
             .and_then(setting_i64);
-        let rate_limiter: Arc<dyn RateLimiter> = Arc::new(
+        // native `commands::update` と同じ規則 (`load_setting_float`):
+        // 数値として読めない値は既定 2.5 秒、既定未満の値も 2.5 秒へ切り上げる。
+        let update_interval_secs = local_values
+            .get("update.interval")
+            .and_then(setting_f64)
+            .map(|secs| if secs >= UPDATE_INTERVAL_MIN_SECS { secs } else { UPDATE_INTERVAL_MIN_SECS })
+            .unwrap_or(UPDATE_INTERVAL_MIN_SECS);
+        let rate_limiter = Arc::new(
             WorkerRateLimiter::new(
                 env,
                 subrequests.clone(),
@@ -378,6 +401,7 @@ impl WorkerRuntime {
             novels,
             http,
             rate_limiter,
+            update_interval_secs,
             objects,
             assets,
             subrequests,
@@ -498,6 +522,16 @@ impl WorkerRuntime {
 
     pub fn rate_limiter(&self) -> Arc<dyn RateLimiter> {
         self.rate_limiter.clone()
+    }
+
+    /// native `commands::update` の `update.interval` を、同じドメインの Update
+    /// ジョブの開始間隔として適用する。native は update コマンドのプロセス内で
+    /// 数えるが、Worker ではジョブが別 isolate で走りうるので、サイト別 DO と
+    /// 同じ仕組み (`update-start:` バケット) に永続化して数える。
+    pub async fn pace_update_start(&self, domain: &str) -> Result<()> {
+        self.rate_limiter
+            .acquire_work_start(domain, Duration::from_secs_f64(self.update_interval_secs))
+            .await
     }
 
     pub fn objects(&self) -> Arc<dyn ObjectStore> {

@@ -28,6 +28,10 @@
 //!   (`webui/native_only.rs` と同じ code)。
 //! - `POST /api/update/start` — 同梱 updater のダウンロードとプロセス再起動
 //!   は Worker では原理的に不可能。同じく 501 + `not_supported_on_worker`。
+//! - `POST /api/update` — 解決できなかったターゲットは native では子プロセスが
+//!   実行時に報告するが、Worker には子プロセスが無いため応答の `results` に
+//!   `status: "unresolved"` として載せる。1 件もキューに入れられなければ
+//!   `success: false` + `message` (native の not-found 出力と同じ意味論)。
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -331,11 +335,11 @@ fn expand_tag_targets(records: &[NovelRecord], targets: &[String]) -> Vec<String
 
     let mut expanded = Vec::new();
     for target in targets {
-        if let Ok(id) = target.parse::<i64>() {
-            if existing.contains(&id) {
-                expanded.push(id.to_string());
-                continue;
-            }
+        if let Ok(id) = target.parse::<i64>()
+            && existing.contains(&id)
+        {
+            expanded.push(id.to_string());
+            continue;
         }
 
         if let Some(tag_name) = target.strip_prefix("^tag:") {
@@ -457,6 +461,15 @@ async fn api_update(
     // (a) 更新対象 id の列を作る。native では web 層がソート済みの文字列列を
     //     作り、子プロセス (`narou update`) が tag: 展開と id 解決を行う。
     //     Worker ではここで両方を済ませて id ごとの plan にする。
+    //
+    //     deviation from native: 解決できなかったターゲットは native では生の
+    //     文字列のまま子プロセスに渡り、実行時に
+    //     "[ERROR] <target> は管理小説の中に存在しません" (`messages::update::
+    //     unmanaged_target`) を出して続行する。Worker には子プロセスが無く、
+    //     ここで黙って落とすと UI から「積んだのに動かない」原因が分からなく
+    //     なるので、落とした対象を `unresolved` に残し応答の `results` で
+    //     報告する (キューに積める対象の扱いは native と同じ)。
+    let mut unresolved: Vec<String> = Vec::new();
     let ids: Vec<i64> = if is_update_all {
         sorted_update_all_ids(runtime).await
     } else {
@@ -473,11 +486,15 @@ async fn api_update(
         let mut resolved = Vec::new();
         let mut seen = HashSet::new();
         for target in &expanded {
-            if let Some(id) =
-                resolve_update_target_to_id(runtime, &aliases, &site_settings, target).await
-                && seen.insert(id)
-            {
-                resolved.push(id);
+            match resolve_update_target_to_id(runtime, &aliases, &site_settings, target).await {
+                Some(id) => {
+                    // 同一 id への重複解決は native 同様 1 ジョブに束ねる
+                    // (落とさない・未解決でもない)。
+                    if seen.insert(id) {
+                        resolved.push(id);
+                    }
+                }
+                None => unresolved.push(target.clone()),
             }
         }
         resolved
@@ -488,6 +505,18 @@ async fn api_update(
     //     件数が実行単位なので、ここでは plan 件数を入れる。
     let count = ids.len();
     if count == 0 {
+        // 何もキューに入れられなかったのに success に見せない (native の子
+        // プロセスが not-found を出して失敗扱いにするのと同じ意思表示)。
+        // 解決できた対象が 0 件で未解決も 0 件 (= 空の update-all) のときだけ
+        // native と同じ `count: 0` の成功を返す。
+        if !unresolved.is_empty() {
+            return Response::from_json(&json!({
+                "success": false,
+                "message": unresolved_update_message(&unresolved),
+                "count": 0,
+                "results": unresolved_results(&unresolved),
+            }));
+        }
         return Response::from_json(&json!({
             "success": true,
             "status": "queued",
@@ -535,6 +564,9 @@ async fn api_update(
     // の拾い上げでコンソールへ echo する。Worker はメタを持たないので、受理
     // した時点で同じ文言を同じ形 (灰色 span = `console_note`) で送る。
     if queued_any {
+        // native `api_update` は `queued` のときだけ `notification.queue` を
+        // 送る (既キューイング済みで重複が弾かれたときは送らない)。
+        notify_queue_changed(env, runtime).await;
         let sort_state = load_current_sort_state(runtime).await;
         let message = job_msgs::update_started(
             is_update_all,
@@ -544,12 +576,34 @@ async fn api_update(
         broadcast_console_note(env, runtime, &message).await;
     }
 
-    Response::from_json(&json!({
+    // 未解決の対象が 1 つでもあれば `results` に載せる (native は子プロセス
+    // の実行時出力で報告するため応答に持たない — 上の deviation コメント参)。
+    // 解決できた対象は従来どおり `count` / `job_ids` で返す。
+    let mut response = json!({
         "success": true,
         "status": if queued_any { "queued" } else { "already_queued" },
         "count": count,
         "job_ids": job_ids,
-    }))
+    });
+    if !unresolved.is_empty() {
+        response["results"] = serde_json::Value::Array(unresolved_results(&unresolved));
+    }
+    Response::from_json(&response)
+}
+
+/// 未解決ターゲットの `results` 行 — `/api/convert` と同じ語彙
+/// (`status: "unresolved"`)。
+fn unresolved_results(unresolved: &[String]) -> Vec<serde_json::Value> {
+    unresolved
+        .iter()
+        .map(|target| json!({ "target": target, "status": "unresolved" }))
+        .collect()
+}
+
+/// 未解決ターゲットを列挙した失敗メッセージ (front-end は
+/// `result.message` を通知に表示する)。
+fn unresolved_update_message(unresolved: &[String]) -> String {
+    format!("更新対象を解決できませんでした: {}", unresolved.join(", "))
 }
 
 /// native `normalize_update_targets` の写し。`--tag=<name>` / `--tag <name>`
@@ -671,6 +725,7 @@ async fn api_convert(
     }
 
     let mut results = Vec::with_capacity(resolved.len());
+    let mut queued_any = false;
     for (target, id) in &resolved {
         let Some(id) = id else {
             results.push(json!({
@@ -693,12 +748,20 @@ async fn api_convert(
         if let Some(reason) = &outcome.blocked {
             return convert_failure(reason);
         }
+        queued_any = true;
         results.push(json!({
             "target": target,
             "device": device.as_deref(),
             "job_id": outcome.job_id,
             "status": "queued",
         }));
+    }
+
+    // native `api_convert` は受理したジョブを積んだあとに
+    // `notification.queue` を送る (request 単位で 1 回)。1 ジョブも積めなかった
+    // (= 全ターゲット unresolved) 要求ではキューが変わらないので送らない。
+    if queued_any {
+        notify_queue_changed(env, runtime).await;
     }
 
     Response::from_json(&json!({ "success": true, "results": results }))
@@ -829,6 +892,9 @@ async fn api_update_by_tag(
 
     // native と同じ更新開始案内 (タグ更新は `is_update_all=false` の形)。
     if queued_any {
+        // native `api_update_by_tag` は `queued` のときだけ
+        // `notification.queue` を送る。
+        notify_queue_changed(env, runtime).await;
         let message = job_msgs::update_started(
             false,
             count,
@@ -854,6 +920,14 @@ async fn broadcast_console_note(env: &Env, runtime: &WorkerRuntime, text: &str) 
         "stdout",
     )])
     .await;
+}
+
+/// native `src/web/jobs.rs::notify_queue_changed` 相当。受理した投入のあとに
+/// `notification.queue` を送る (native は request 単位で 1 回、`queued` の
+/// ときだけ)。表시更新なので best-effort — 送信失敗でも応答は変えない。
+async fn notify_queue_changed(env: &Env, runtime: &WorkerRuntime) {
+    let push = crate::push_hub::PushHubClient::new(env, runtime.subrequests.clone());
+    crate::consumer::notify_queue_changed(&push).await;
 }
 
 // ---------------------------------------------------------------------------

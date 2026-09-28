@@ -78,11 +78,11 @@ pub async fn status_payload(runtime: &WorkerRuntime) -> Result<serde_json::Value
 /// `login_status`)。
 pub async fn status(runtime: &WorkerRuntime) -> Result<Response> {
     let data = status_payload(runtime).await?;
-    Ok(Response::from_json(&serde_json::json!({
+    Response::from_json(&serde_json::json!({
         "success": true,
         "data": data,
     }))
-    .map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))?)
+    .map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))
 }
 
 /// `DELETE /api/login/{site}` — native `login_clear_site`。サイト名と
@@ -133,12 +133,12 @@ pub async fn clear_group(
     let data = status_payload(runtime)
         .await
         .unwrap_or(serde_json::Value::Null);
-    Ok(Response::from_json(&serde_json::json!({
+    Response::from_json(&serde_json::json!({
         "success": true,
         "message": format!("{site} の「{}」を削除しました", removed.display_name()),
         "data": data,
     }))
-    .map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))?)
+    .map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))
 }
 
 /// `DELETE /api/login` — native `login_clear_all`。全サイトを消す。
@@ -155,19 +155,19 @@ pub async fn clear_all(runtime: &WorkerRuntime) -> Result<Response> {
     let data = status_payload(runtime)
         .await
         .unwrap_or(serde_json::Value::Null);
-    Ok(Response::from_json(&serde_json::json!({
+    Response::from_json(&serde_json::json!({
         "success": true,
         "message": format!("ログイン情報をすべて削除しました ({removed} サイト)"),
         "data": data,
     }))
-    .map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))?)
+    .map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))
 }
 
 /// native `failure()`: HTTP 200 + `{success: false, message}`。
 fn json_error(message: &str) -> Result<Response> {
-    Ok(Response::from_json(&serde_json::json!({
+    Response::from_json(&serde_json::json!({
         "success": false,
         "message": message,
     }))
-    .map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))?)
+    .map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))
 }

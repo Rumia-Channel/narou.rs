@@ -1,6 +1,8 @@
 //! 小説 1 件を対象にする JSON API (native: `src/web/novels.rs` /
 //! `src/web/tags.rs` / `src/web/batch.rs`)。
 //!
+//! - `GET  /api/novels/count` / `GET /api/novels/all_ids` — 作品件数と全 id
+//!   一覧 (native `novels_count` / `misc::all_novel_ids`)。
 //! - `GET  /api/novels/{id}/author_comments` — native `author_comments`
 //!   (TOC + 各セクションのまえがき/あとがきを集計して返す)。
 //! - `POST /api/novels/{id}/freeze` / `unfreeze` — native `freeze_novel` /
@@ -35,6 +37,31 @@ use serde_json::json;
 use worker::{Request, Response};
 
 use super::{api_response, application_error_response, json_error};
+
+// ---------------------------------------------------------------------------
+// GET /api/novels/count / GET /api/novels/all_ids
+// (native: novels.rs novels_count / misc.rs all_novel_ids)
+// ---------------------------------------------------------------------------
+
+/// native `novels_count`: `{"count": N}`。native と同じく読めないときは
+/// エラーにせず 0 件として返す (一覧ヘッダの表示用)。
+pub async fn count(services: &AppServices) -> worker::Result<Response> {
+    let count = services.library.count().await.unwrap_or(0);
+    Response::from_json(&json!({ "count": count }))
+}
+
+/// native `all_novel_ids`: `{"ids": [...]}` (全件・ソート順なし)。
+pub async fn all_ids(services: &AppServices) -> worker::Result<Response> {
+    let ids = services
+        .library
+        .records()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| record.id)
+        .collect::<Vec<i64>>();
+    Response::from_json(&json!({ "ids": ids }))
+}
 
 // ---------------------------------------------------------------------------
 // GET /api/novels/{id}/author_comments (native: novels.rs author_comments)
@@ -180,18 +207,16 @@ pub async fn remove_novel(
     id: NovelId,
     mut req: Request,
 ) -> worker::Result<Response> {
-    // native は `Option<Json<Value>>`: 空本文は None (= with_file:false)、
-    // 壊れた JSON は 400。こちらも同じ受理範囲にする。
+    // native は `body: Option<Json<Value>>`: 本文が無ければ `with_file:false`
+    // でそのまま削除する。native は本文を読めない場合も削除を止めない
+    // (壊れた本文で 400 を返して打ち切るのは Worker 独自の挙動だった)。
+    // なので本文が空・不正 JSON でも `with_file:false` で削除を続行する。
     let with_file = match req.text().await {
-        Ok(text) if text.trim().is_empty() => false,
-        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(body) => body
-                .get("with_file")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
-        },
-        Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|body| body.get("with_file").and_then(|value| value.as_bool()))
+            .unwrap_or(false),
+        Err(_) => false,
     };
     let result = match services
         .novel_actions

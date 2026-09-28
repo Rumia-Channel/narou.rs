@@ -44,6 +44,15 @@ pub(crate) async fn notify_queue_changed(push: &PushHubClient) {
     push.broadcast_best_effort(&[notification_queue()]).await;
 }
 
+/// running 行を中断するときに `webui/queue_actions.rs` が `last_error` へ
+/// 書く理由 (`ledger::cancel_running_job` の tombstone)。
+///
+/// この値で終わる terminal 行は「実行中にユーザーがキャンセルされた」ことを
+/// 意味する — native の子プロセス kill → `JobOutcome::Cancelled` と同じ
+/// 終了状態。終端書き込みが execution token 失効で失敗したときに、この
+/// 文字列で判定して `queue_cancelled` を送出する ([`settle_user_cancel`])。
+pub(crate) const USER_CANCEL_REASON: &str = "cancelled by user via Web UI";
+
 /// Process a queue batch. Builds a fresh runtime and Downloader per
 /// invocation so no mutable state is shared across event handlers.
 pub async fn process_batch(
@@ -233,7 +242,7 @@ async fn process_discrete(
     };
     match outcome {
         JobOutcome::Succeeded => {
-            runtime
+            if let Err(error) = runtime
                 .ledger
                 .mark_terminal(
                     &job_id,
@@ -241,7 +250,13 @@ async fn process_discrete(
                     JobLedgerStatus::Succeeded,
                     None,
                 )
-                .await?;
+                .await
+            {
+                // 実行中に行が tombstone されていれば queue_cancelled で閉じる
+                // (`queue_complete` は送らない)。
+                settle_user_cancel(runtime, push, &job_id, message, error).await?;
+                return Ok(());
+            }
             broadcast_terminal_events(
                 push,
                 &job_id,
@@ -253,7 +268,7 @@ async fn process_discrete(
         JobOutcome::Skipped { reason } => {
             // native の単発 frozen 経路 (子プロセス mistook=1 → queue_partial)
             // と同じ終端: 実行結果は既に echo 済み、台帳は Partial で閉じる。
-            runtime
+            if let Err(error) = runtime
                 .ledger
                 .mark_terminal(
                     &job_id,
@@ -261,7 +276,11 @@ async fn process_discrete(
                     JobLedgerStatus::Partial,
                     Some(&reason),
                 )
-                .await?;
+                .await
+            {
+                settle_user_cancel(runtime, push, &job_id, message, error).await?;
+                return Ok(());
+            }
             broadcast_terminal_events(
                 push,
                 &job_id,
@@ -278,10 +297,15 @@ async fn process_discrete(
             checkpoint,
         } => {
             console_log!("job {job_id} yielded for continuation: {reason}");
-            runtime
+            if let Err(error) = runtime
                 .ledger
                 .yield_for_continuation(&job_id, &execution_token, &checkpoint)
-                .await?;
+                .await
+            {
+                // 中断されたジョブを再投入しない (行は terminal 済み)。
+                settle_user_cancel(runtime, push, &job_id, message, error).await?;
+                return Ok(());
+            }
             runtime.enqueue_plan(job.clone()).await?;
             broadcast_terminal_events(
                 push,
@@ -298,7 +322,7 @@ async fn process_discrete(
             message.ack();
         }
         JobOutcome::Blocked { reason } => {
-            runtime
+            if let Err(error) = runtime
                 .ledger
                 .mark_terminal(
                     &job_id,
@@ -306,13 +330,18 @@ async fn process_discrete(
                     JobLedgerStatus::Blocked,
                     Some(&reason),
                 )
-                .await?;
+                .await
+            {
+                // 実行中にキャンセルされたなら queue_failed は出さない。
+                settle_user_cancel(runtime, push, &job_id, message, error).await?;
+                return Ok(());
+            }
             console_log!("job {job_id} blocked: {reason}");
             broadcast_failure(runtime, push, &job_id, &reason).await;
             message.ack();
         }
         JobOutcome::Permanent { reason } => {
-            runtime
+            if let Err(error) = runtime
                 .ledger
                 .mark_terminal(
                     &job_id,
@@ -320,18 +349,30 @@ async fn process_discrete(
                     JobLedgerStatus::Permanent,
                     Some(&reason),
                 )
-                .await?;
+                .await
+            {
+                // 実行中にキャンセルされたなら queue_failed は出さない。
+                settle_user_cancel(runtime, push, &job_id, message, error).await?;
+                return Ok(());
+            }
             console_log!("job {job_id} failed permanently: {reason}");
             broadcast_failure(runtime, push, &job_id, &reason).await;
             message.ack();
         }
         JobOutcome::Retryable { reason } => {
-            match settle_retryable(runtime, &job_id, &execution_token, &reason).await? {
-                RetryDisposition::Rescheduled {
+            match settle_retryable(runtime, &job_id, &execution_token, &reason).await {
+                Err(error) => {
+                    // `record_attempt` / 二次 `mark_terminal` が token 失効で
+                    // 失敗 = 実行中にキャンセルされた。queue_retry /
+                    // queue_failed は送らず queue_cancelled で閉じる。
+                    settle_user_cancel(runtime, push, &job_id, message, error).await?;
+                    return Ok(());
+                }
+                Ok(RetryDisposition::Rescheduled {
                     attempts,
                     max_retries,
                     backoff_secs,
-                } => {
+                }) => {
                     // Cloudflare Queues の遅延は秒整数なのでイベント値を
                     // u32 にクランプして渡す (スケジュール値は非負)。
                     let delay = backoff_secs.min(i64::from(u32::MAX)) as u32;
@@ -357,13 +398,53 @@ async fn process_discrete(
                     .await;
                     message.retry_with_options(&options);
                 }
-                RetryDisposition::Exhausted => {
+                Ok(RetryDisposition::Exhausted) => {
                     broadcast_failure(runtime, push, &job_id, &reason).await;
                     message.ack();
                 }
             }
         }
     }
+    Ok(())
+}
+
+/// 終端書き込み (`mark_terminal` / `yield_for_continuation` /
+/// `record_attempt`) が execution token の失効で失敗したときに呼ぶ。
+///
+/// running 行は `webui/queue_actions.rs` の cancel 系が
+/// `ledger::cancel_running_job` で tombstone する (terminal status +
+/// [`USER_CANCEL_REASON`]、token 消去) ので、その形をしていれば native の
+/// killed child と同じ `queue_cancelled` を送って message を ack し
+/// `Ok(())` を返す — `queue_complete` / `queue_partial` / `queue_failed` は
+/// 送らない。それ以外の失敗 (lease を別の実行に奪われた・D1 エラー等) は
+/// 元のエラーを `Err` で返し、従来どおり redelivery / DLQ に委ねる。
+///
+/// `Wasm` は途中で殺せないので、キャンセルされたジョブは「次の終端書き込み
+/// が 0 行に終わる」ことで初めて中断を知る (native の SIGKILL と同じ
+/// 観測位置)。
+async fn settle_user_cancel(
+    runtime: &WorkerRuntime,
+    push: &PushHubClient,
+    job_id: &JobId,
+    message: &Message<serde_json::Value>,
+    error: NarouError,
+) -> std::result::Result<(), NarouError> {
+    let cancelled = matches!(
+        runtime.ledger.get(job_id).await,
+        Ok(Some(view))
+            if view.status.is_terminal() && view.last_error.as_deref() == Some(USER_CANCEL_REASON)
+    );
+    if !cancelled {
+        return Err(error);
+    }
+    console_log!("job {job_id} was cancelled by the user while running");
+    broadcast_terminal_events(
+        push,
+        job_id,
+        &[narou_rs::application::push_events::queue_cancelled(job_id.as_str())],
+    )
+    .await;
+    message.ack();
     Ok(())
 }
 

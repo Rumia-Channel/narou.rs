@@ -102,13 +102,18 @@ impl WorkerRateLimiter {
     }
 
     async fn claim_batch(&self, site: &str, scope: &RateLimitScope) -> Result<Vec<u64>> {
+        let permit = self.permit_request(scope);
+        self.claim(site, &permit).await
+    }
+
+    /// 1 回分の permit 要求を DO へ送り、許可時刻の一覧を受け取る。
+    async fn claim(&self, site: &str, permit: &PermitRequest) -> Result<Vec<u64>> {
         let stub = self
             .namespace
             .get_by_name(site)
             .map_err(worker_error)?;
 
-        let permit = self.permit_request(scope);
-        let body = serde_json::to_string(&permit)
+        let body = serde_json::to_string(permit)
             .map_err(|error| NarouError::Platform(format!("permit request serialization: {error}")))?;
 
         let mut init = RequestInit::new();
@@ -151,11 +156,52 @@ impl WorkerRateLimiter {
             }
         };
         let now_ms = js_sys::Date::now() as u64;
-        let wait_ms = permit_at_ms.saturating_sub(now_ms);
-        if wait_ms > 0 {
-            worker::Delay::from(Duration::from_millis(wait_ms)).await;
-        }
+        wait_until_ms(permit_at_ms, now_ms).await;
         Ok(())
+    }
+
+    /// native `commands::update` の `update.interval`（同じドメインの作品開始を
+    /// 一定時間空ける）を DO で数える。HTTP リクエストの間隔 (`download.interval`)
+    /// とは別のバケット (`update-start:<domain>`) を使うので、本文取得のペーシング
+    /// には影響しない。DO が state を永続化するため、別 isolate で走るジョブ間でも
+    /// 間隔が保たれる。
+    pub(crate) async fn acquire_work_start(
+        &self,
+        domain: &str,
+        interval: Duration,
+    ) -> Result<()> {
+        if interval.is_zero() {
+            return Ok(());
+        }
+        let site = normalize_site_key(&format!("update-start:{domain}")).ok_or_else(|| {
+            NarouError::Platform("update-start domain is empty".to_string())
+        })?;
+        let interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+        // 作品開始の間隔だけを数えるので、wait-steps の段差もまとめ取りもしない
+        // (`count = 1` が 1 作品の開始時刻そのものを表す)。
+        let permit = PermitRequest {
+            interval_ms,
+            wait_steps: 0,
+            max_steps_wait_time_ms: interval_ms,
+            count: 1,
+        };
+        let permit_at_ms = self
+            .claim(&site, &permit)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| NarouError::Platform("rate limiter DO returned no permits".to_string()))?;
+        let now_ms = js_sys::Date::now() as u64;
+        wait_until_ms(permit_at_ms, now_ms).await;
+        Ok(())
+    }
+}
+
+/// 許可時刻まで待つ (既に過ぎていれば待たない)。
+async fn wait_until_ms(permit_at_ms: u64, now_ms: u64) {
+    let wait_ms = permit_at_ms.saturating_sub(now_ms);
+    if wait_ms > 0 {
+        worker::Delay::from(Duration::from_millis(wait_ms)).await;
     }
 }
 

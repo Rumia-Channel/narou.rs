@@ -1034,9 +1034,7 @@ export function renderQueueDetailed() {
             const swapIdx = idx + direction;
             if (swapIdx >= 0 && swapIdx < ids.length) {
               [ids[idx], ids[swapIdx]] = [ids[swapIdx], ids[idx]];
-              await postJson('/api/reorder_pending_tasks', { task_ids: ids });
-              const { refreshQueueDetailed } = await import('./actions.js');
-              await refreshQueueDetailed();
+              await reorderPendingTaskIds(ids);
             }
           });
         });
@@ -1130,9 +1128,19 @@ async function reorderQueuedTask(sourceId, targetId, before) {
   } else {
     ids.push(sourceId);
   }
-  await postJson('/api/reorder_pending_tasks', { task_ids: ids });
-  const { refreshQueueDetailed } = await import('./actions.js');
-  await refreshQueueDetailed();
+  await reorderPendingTaskIds(ids);
+}
+
+async function reorderPendingTaskIds(ids) {
+  const errorMessage = 'キューの並べ替えに失敗しました';
+  try {
+    const result = await postJson('/api/reorder_pending_tasks', { task_ids: ids });
+    assertQueueActionSuccess(result, errorMessage);
+    const { refreshQueueDetailed } = await import('./actions.js');
+    await refreshQueueDetailed();
+  } catch (error) {
+    showNotification(error.message || errorMessage, 'error');
+  }
 }
 
 /* ===== Notifications ===== */

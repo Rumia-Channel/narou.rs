@@ -59,8 +59,10 @@ pub fn site_definitions(
 /// Downloader に渡す実効定義を組み立てる。
 ///
 /// ユーザー定義が無ければ bundle のキャッシュ済み結果をそのまま返す
-/// （isolate ごとに 1 回の parse + compile で済む）。1 件でもあればマージして
-/// 読み直し、結果を **L1 に TTL 付きで** 載せる（リクエストごとに D1 を読まない）。
+/// （isolate ごとに 1 回の parse + compile で済む）。1 件でもあれば
+/// [`SiteDefinitions::effective_runtime`]（native の `SiteSetting::load_all()`
+/// と同じ version gate）でマージして読み直し、結果を **L1 に TTL 付きで**
+/// 載せる（リクエストごとに D1 を読まない）。
 pub async fn load_site_settings(
     objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
 ) -> Result<Vec<SiteSetting>> {
@@ -74,7 +76,7 @@ pub async fn load_site_settings(
     let settings = if store.list().await?.is_empty() {
         load_bundled_site_settings()?
     } else {
-        let effective = site_definitions(objects.clone()).effective().await?;
+        let effective = site_definitions(objects.clone()).effective_runtime().await?;
         let contents: Vec<&str> = effective.iter().map(|(_, yaml)| yaml.as_str()).collect();
         SiteSetting::load_bundled(&contents)?
     };
@@ -86,9 +88,11 @@ pub async fn load_site_settings(
 /// この時間で追従する (サイト定義は頻繁に変わらないので十分)。
 const SITE_SETTINGS_TTL_MS: f64 = 30_000.0;
 
-static SITE_SETTINGS_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<Option<(f64, Vec<SiteSetting>)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+/// L1 キャッシュの中身: `(書き込み時刻 (ms), コンパイル済み定義)`。
+type SiteSettingsCache = Option<(f64, Vec<SiteSetting>)>;
+
+static SITE_SETTINGS_CACHE: std::sync::LazyLock<std::sync::Mutex<SiteSettingsCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 fn cached_site_settings() -> Option<Vec<SiteSetting>> {
     let cache = SITE_SETTINGS_CACHE.lock().ok()?;

@@ -227,10 +227,10 @@ src/
     narou_api.rs                   - narou_api_batch_update (なろうAPI一括更新)
     util.rs                        - build_section_url, pretreatment_source, sanitize_filename 等
     site_setting/
-      mod.rs                       - SiteSetting struct, accessor methods, compile, load_all, tests
+      mod.rs                       - SiteSetting struct, accessor methods, compile, load_all, merge_user_definition_yaml, tests
       interpolate.rs               - \k<name> テンプレートエンジン
       info_extraction.rs           - resolve_info_pattern, multi_match, get_novel_type_from_string
-      loader.rs                    - load_all_from_dirs, load_settings_from_dir, merge_site_setting
+      loader.rs                    - load_all_from_dirs, load_settings_from_dir
       serde_helpers.rs             - deserialize_yes_no_bool
     preprocess/
       mod.rs                       - PreprocessPipeline struct, run_preprocess
@@ -361,7 +361,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **イベント payload**: ジョブイベントの生成は core の `application::push_events` が唯一の実装で、native の Web UI 経路と Worker が同一の JSON を出す。
 - **コンソール行**: ジョブのコンソール出力は core の `application::messages` が唯一の生成元。Worker 側は `messages::set_default_sink` に `PushHubSink` を挿し、ジョブ境界で `drain()` してまとめて送る (`stream` = `stdout` / `stderr`)。
 - **共有ヘルパ**: Web UI の入力検証・上限値・ソート状態・HTML ヘルパは core の `application::webui` が唯一の定義で、native の `src/web/**` と `worker_entry/src/webui/**` はそれを再エクスポートして使う。
-- **ローカル検証**: `worker_entry` で `npx wrangler dev --config wrangler.toml` を起動し、`POST /api/download` → `POST /api/convert` を流せば DL から変換まで通る。fetch は手元のマシンから出るため、本番で 403 になるサイトもここでは取得できる (実測: なろう / カクヨム / syosetu.org)。ジョブのコンソール行は `ws://127.0.0.1:8787/ws` に `Authorization: Bearer <NAROU_ADMIN_TOKEN>` で接続すると `echo` イベント (`{"type":"echo","target_console":"stdout","body":"…"}`) として見える。Web UI の `fetch` は Bearer を付けられないため、ローカルで画面まで見るときは `.dev.vars` に `NAROU_AUTH_REQUIRED=false` を足す (本番は Access を境界にするときだけ false)。
+- **ローカル検証**: `worker_entry` で `npx wrangler dev --config wrangler.toml` を起動し、`POST /api/download` → `POST /api/convert` を流せば DL から変換まで通る。fetch は手元のマシンから出るため、本番で 403 になるサイトもここでは取得できる (実測: なろう / カクヨム / syosetu.org)。ジョブのコンソール行は `ws://127.0.0.1:8787/ws` に `Authorization: Bearer <NAROU_ADMIN_TOKEN>` で接続すると `echo` イベント (`{"type":"echo","target_console":"stdout","body":"…"}`) として見える。ブラウザは `/login` で管理トークンを Cookie (`narou_api_token`、HttpOnly / SameSite=Lax) に入れれば Bearer 無しで UI 全体を操作できる (fetch / EPUB リンク / WebSocket すべて Cookie が付く)。`.dev.vars` に `NAROU_AUTH_REQUIRED=false` を足すのは、Cookie を経由せず素通しさせたい場合だけ (本番は Access を境界にするときだけ false)。
 - **注意**: ソースを変更すると `wrangler dev` は資産ディレクトリ `public/` の削除に失敗して (Windows の EBUSY) 無言で停止する。変更後は起動し直すこと。
 - **ホットリロード (native)**: `narou web` は設定変更を再起動なしで反映する。`server-*`（Host 許可リスト / WS Origin / reverse proxy / Basic 認証）は `src/web/server_security.rs` の `ServerSecurity` を `RwLock` で持ち、保存 API が `SettingsEffect::ServerSecurityChanged` で即時再適用、外部からの変更（CLI・手編集）は `commands/web.rs` の 30 秒 watcher が拾う。watcher は `update.auto-schedule(.timezone)` でスケジューラを再起動し、`webui.*` を `webui.config.reload` で再配信、`logging*` でロガーを再 init する。`webnovel/*.yaml` は `EFFECTIVE_SITE_SETTINGS`（差し替え可能・fingerprint で再コンパイル抑制）を sites API の保存後に更新＋30 秒ポーリングで外部編集を拾い、`site_timezone` は毎呼び出しで現スナップショットを参照する。再起動が要るのは `server-port` / `server-bind`（リスナー再バインド）、`server-basic-auth.require-for-external-bind`（起動時ガード）、`no-color`（tracing subscriber）、`concurrency` のレーン数、`.narou/storage-backend` の切替（DB 層の差し替えで、切替時に明示的に再起動）だけ。
 - **ホットリロード**: Worker は再起動・再デプロイを前提にしない。サイト定義 / 設定 / `asset_backend` / section hash / 凍結 ID / タグ色 / secret はすべて isolate 内キャッシュ (`isolate_cache::TtlMap`) で、TTL (既定 30 秒) か書き込み時の無効化で反映する。**設定変更・secret ローテーション・`webnovel/*.yaml` の差し替えに再デプロイは不要** (反映は最大 30 秒、書き込んだ isolate では即時)。キャッシュを足すときは同じ規則に従うこと。
@@ -473,6 +473,11 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   `PUT /api/sites/{name}`、`DELETE /api/sites/{name}`。`put` は保存前にコンパイル検証する。
 - 起動時に `native::site_definitions::install_effective_site_settings()` を呼び、同期コードは
   `downloader::site_setting::effective_site_settings()` を使う（未設定ならファイルから読む）。
+- 実効定義は 2 経路がある。管理 API の表示・保存は `SiteDefinitions::effective()`
+  （ユーザー本文をそのまま返す。native `/api/sites` と同一）、fetch policy / Worker の
+  ダウンローダ (`bundled_sites::load_site_settings`) は `SiteDefinitions::effective_runtime()`
+  （`downloader::site_setting::merge_user_definition_yaml` の version gate を掛ける）。
+  Worker のログイン Cookie 保存キーの畳み (`D1CookieStore::key_site_settings`) も後者を使う。
 - オブジェクトストアの一覧上限は `platform::prefix_upper_bound` を使う（`{prefix}0` は CJK や英字名を
   落とすので使わない）。
 
@@ -526,7 +531,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - 漫画シリーズ (`/user/U/series/S`) は `c{S}` の連載として登録し、各話 = シリーズ内の作品。一覧 API `/ajax/series/{id}?p=N&lang=ja` は 12 件ずつ・`order` の **降順** で返るため `.reverse` して昇順にし、`order 1` に到達するまで `next::` で次ページを要求する。各話の題名・作者・掲載日は作品ページ (`/ajax/illust/{workId}`) から取る (一覧には ID と順序しか無い)。公開話数は `illustSeries[0].total`。
 - ログインしていないと R18 作品は一覧から**黙って除かれる** (404 にならないので再試行も走らない)。R18 を含むシリーズは `narou_rs_login` で先に Cookie を保存しておくこと。
 - 分岐の注意: `illustType` はイラストで 0 になり、DSL では数値 0 が偽になる。作品ページ判定は `illustTitle` の有無で行う。
-- **サイト定義の `version`**: `webnovel/*.yaml` は `name` で照合し、**ユーザー側コピーの version が同梱版以上 (`>=`)** のときだけ、そのファイルのキーを同梱版へ上書きマージする (キー単位のマージなので、ユーザーが書いていないキーは同梱版が残る。`loader.rs` の `should_merge_site_setting` / `merge_site_setting`)。挙動を実測すると: 2.3 のユーザー定義は同梱 2.4 に**無視され**、2.4 のユーザー定義は**優先される**。したがって **同梱定義の既存キーを変更したら version を必ず上げる** (上げないと初期化時にコピーされた古い値が優先される)。新しいキーの追加だけなら version を上げなくても届くが、まとめて反映させる意味でも変更のたびに +0.1 を目安に上げる。
+- **サイト定義の `version`**: `webnovel/*.yaml` は `name` で照合し、**ユーザー側コピーの version が同梱版以上 (`>=`)** のときだけ、そのファイルのキーを同梱版へ上書きマージする (キー単位のマージなので、ユーザーが書いていないキーは同梱版が残る。唯一の実装は `downloader::site_setting::merge_user_definition_yaml` — native の `loader.rs` と core の `SiteDefinitions::effective_runtime()` (Worker の fetch policy / Cookie のサイト畳みも) が共有する。管理 API 表示用の `SiteDefinitions::effective()` は gate を掛けない)。挙動を実測すると: 2.3 のユーザー定義は同梱 2.4 に**無視され**、2.4 のユーザー定義は**優先される**。したがって **同梱定義の既存キーを変更したら version を必ず上げる** (上げないと初期化時にコピーされた古い値が優先される)。新しいキーの追加だけなら version を上げなくても届くが、まとめて反映させる意味でも変更のたびに +0.1 を目安に上げる。
 - **表示用 URL (`original_url`)**: 取得に使う `toc_url` と利用者が指定した URL が違う場合、後者をレコードの追加フィールド `original_url` に控える (`NovelRecord::set_original_url` / `display_url`。`narou.rb` は未知キーとして無視する)。Pixiv は `toc_url` が API (`/ajax/...`) になるため、これが無いと Web UI のリンクが API を開いてしまう。通常サイトは両者同じなので記録しない (`target != toc_url` のときだけ)。Web UI は API の `display_url` を優先し、無ければ `toc_url` にフォールバックする。既存レコードは再ダウンロード時に埋まる。
 - **アクセス間隔**: サイト定義の `min_interval` (秒) がそのサイトへのリクエスト間隔の下限になる (全体設定 `download.interval` より優先)。`RateLimitScope` がサイト定義の値を持ち、native limiter は `max(download.interval, min_interval)` で待つ。Pixiv は短時間の連続アクセスで 429 を返すため `min_interval: 5` を置いている (運用要件は最低 2 秒・できれば 5 秒)。
 - **Pixiv の欠けの見分け方**: 匿名でも `/ajax/novel/series_content/{id}` の `page.seriesContents` には全話の id と話数が入っており、中身を伏せられている話だけ `series.viewableType` が 0 以外になる (ログイン時は全部 0)。見える話だけを持つ `thumbnails.novel` との差が「空のデータ + 実データ」の実データ側なので、これを欠けの判定に使う (0 件 / 1 話目から始まらない、は viewableType が無い応答向けの保険)。漫画シリーズの `/ajax/series/{id}` は匿名だと R-18 の id 自体を落とすため、そちらは 1 ページ目の最新 order と `series.total` で判定する。

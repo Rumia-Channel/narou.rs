@@ -129,8 +129,8 @@ impl PushHubClient {
         }
     }
 
-    /// イベント群を 1 POST で DO へ送る。エラーはそのまま返すので、
-    /// 呼び出し側は [`Self::broadcast_best_effort`] 経由で握り潰す。
+    /// Send one event batch to the DO. The caller limits each batch to
+    /// [`MAX_EVENTS_PER_POST`]; errors are returned for best-effort handling.
     async fn broadcast(&self, events: &[Value]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
@@ -156,12 +156,19 @@ impl PushHubClient {
         Ok(())
     }
 
-    /// best-effort 送信。失敗してもジョブを落とさず trace に残すだけ。
+    /// Best-effort delivery. Each request stays within the DO's event limit;
+    /// a failed batch is logged but does not prevent later batches from sending.
     pub(crate) async fn broadcast_best_effort(&self, events: &[Value]) {
-        if let Err(error) = self.broadcast(events).await {
-            console_log!("push hub broadcast failed: {error}");
+        for batch in event_batches(events) {
+            if let Err(error) = self.broadcast(batch).await {
+                console_log!("push hub broadcast failed: {error}");
+            }
         }
     }
+}
+
+fn event_batches<'a>(events: &'a [Value]) -> impl Iterator<Item = &'a [Value]> + 'a {
+    events.chunks(MAX_EVENTS_PER_POST)
 }
 
 /// ユーザーに見える行を PushHub の `echo` イベントへ流す
@@ -196,8 +203,8 @@ impl PushHubSink {
         sink
     }
 
-    /// 積まれた行をまとめて PushHub へ送る (best-effort)。ジョブ実行の
-    /// 区切りごとに呼ぶ。
+    /// 積まれた行を PushHub へ送る (best-effort)。ジョブ実行の区切りごとに
+    /// 呼び、上限を超える場合は複数 POST に分ける。
     pub async fn drain(&self) {
         let events = self
             .buffer
@@ -215,6 +222,29 @@ impl narou_rs::application::messages::MessageSink for PushHubSink {
         if let Ok(mut buffer) = self.buffer.lock() {
             buffer.push(echo(text, stream.target_console()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{event_batches, MAX_EVENTS_PER_POST};
+    use serde_json::json;
+
+    #[test]
+    fn event_batches_preserve_order_across_the_post_limit() {
+        let events: Vec<_> = (0..=MAX_EVENTS_PER_POST)
+            .map(|index| json!({ "index": index }))
+            .collect();
+        let batches: Vec<_> = event_batches(&events).collect();
+
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+            vec![MAX_EVENTS_PER_POST, 1]
+        );
+        assert_eq!(
+            batches.into_iter().flatten().cloned().collect::<Vec<_>>(),
+            events
+        );
     }
 }
 
@@ -430,7 +460,7 @@ impl DurableObject for PushHub {
                 }
                 self.accept_client()
             }
-            (Method::Post, path) if path == "/broadcast" => self.broadcast(&mut req).await,
+            (Method::Post, "/broadcast") => self.broadcast(&mut req).await,
             _ => Response::error("Not Found", 404),
         }
     }

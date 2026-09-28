@@ -7,18 +7,20 @@
 //! ログインが複数ホストの Cookie を持つ。native が書いた行をそのまま読める
 //! ことが要件なので、形式を変えない。
 //!
-//! ホスト単位で書かれた旧形式（版 1 / 版 2）は読み込み時にサイト定義
-//! （worker には埋め込み済み）でサイト名へ畳み、版 2 の「ホストごとの並び」は
+//! ホスト単位で書かれた旧形式（版 1 / 版 2）は読み込み時に実効サイト定義
+//! （bundle + ユーザー定義を version gate でマージしたもの。Worker runtime の
+//! fetch policy と同じ一覧）でサイト名へ畳み、版 2 の「ホストごとの並び」は
 //! 同じ位置のエントリを 1 ログインにまとめてから書き戻す。暗号化も鍵生成も
 //! wasm 上で動く（`getrandom` の `wasm_js` バックエンド）ので、取り込みや
 //! `Set-Cookie` の書き戻しも D1 だけで完結する。
 
 use std::collections::BTreeMap;
 
+use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
-    CookieStore, DecodedGroups, LoginGroup, PlatformFuture, assign_group_ids, decode_groups,
-    encode_groups, fold_per_host_lists, site_for_host_with, tidy_groups,
+    CookieStore, DecodedGroups, LoginGroup, ObjectStore, PlatformFuture, assign_group_ids,
+    decode_groups, encode_groups, fold_per_host_lists, site_for_host_with, tidy_groups,
 };
 use worker::wasm_bindgen::JsValue;
 
@@ -46,16 +48,51 @@ struct StateRow {
     value_json: Option<String>,
 }
 
+fn cookie_payload(yaml: Option<String>, json: Option<String>) -> String {
+    match yaml {
+        Some(yaml) if !yaml.trim().is_empty() && yaml.trim() != "{}" => yaml,
+        _ => json.unwrap_or_else(|| "{}".to_string()),
+    }
+}
+
 /// D1 の `app_state` 1 行を介した資格情報ストア。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct D1CookieStore {
     db: DbHandle,
     key: Option<[u8; KEY_LEN]>,
+    /// 古いホストキーを畳むための実効サイト定義を読む場所。`key_site_settings`
+    /// が Worker runtime と同じ一覧 (`bundled_sites::load_site_settings`) を
+    /// 手で持つためだけに注入する。
+    ///
+    /// wasm では `PlatformService` が `Send + Sync` を要求しないため
+    /// `dyn ObjectStore` はそのままでは `CookieStore: Send + Sync` を満たせない。
+    /// ここは単一スレッドの wasm でしか動かないので、リポジトリの他箇所
+    /// (`budget.rs`) と同じ `SendWrapper` で包む。
+    objects: send_wrapper::SendWrapper<std::sync::Arc<dyn ObjectStore>>,
+}
+
+/// `objects` は `Debug` を実装しないので、鍵の中身も出さない手書きにする。
+impl std::fmt::Debug for D1CookieStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("D1CookieStore")
+            .field("db", &self.db)
+            .field("key_source", &self.key_source())
+            .finish()
+    }
 }
 
 impl D1CookieStore {
-    pub fn new(db: DbHandle, key: Option<[u8; KEY_LEN]>) -> Self {
-        Self { db, key }
+    pub fn new(
+        db: DbHandle,
+        key: Option<[u8; KEY_LEN]>,
+        objects: std::sync::Arc<dyn ObjectStore>,
+    ) -> Self {
+        Self {
+            db,
+            key,
+            objects: send_wrapper::SendWrapper::new(objects),
+        }
     }
 
     /// secret（または Secrets Store）から復号鍵を読む。未設定なら平文の行だけを扱う。
@@ -83,18 +120,11 @@ impl D1CookieStore {
             .first(None)
             .await
             .map_err(db_error)?;
-        let Some(StateRow {
-            value_yaml: yaml,
-            value_json: json,
-        }) = row
-        else {
+        let Some(row) = row else {
             return Ok("{}".to_string());
         };
         // `value_yaml` を正とし、移行前の行 (`value_json` のみ) も読めるようにする。
-        Ok(match yaml {
-            Some(yaml) if !yaml.trim().is_empty() && yaml.trim() != "{}" => yaml,
-            _ => json.unwrap_or_else(|| "{}".to_string()),
-        })
+        Ok(cookie_payload(row.value_yaml, row.value_json))
     }
 
     /// 保存されている生の YAML マップ（値は暗号化されたまま）。
@@ -112,11 +142,12 @@ impl D1CookieStore {
         let payload = serde_yaml::to_string(map).map_err(|error| {
             NarouError::Platform(format!("cannot serialize {INVENTORY_NAME}: {error}"))
         })?;
-        // 行が無いときは作る（`app_state` の主キーは (scope, key)）。
-        self.db
+        let result = self
+            .db
             .prepare(
                 "INSERT INTO app_state (scope, key, value_yaml, value_json) VALUES (?, ?, ?, '{}')
-                 ON CONFLICT(scope, key) DO UPDATE SET value_yaml = excluded.value_yaml",
+                 ON CONFLICT(scope, key) DO UPDATE SET
+                   value_yaml = excluded.value_yaml, value_json = excluded.value_json",
             )
             .bind(&[
                 JsValue::from_str(INVENTORY_SCOPE),
@@ -127,6 +158,9 @@ impl D1CookieStore {
             .run()
             .await
             .map_err(db_error)?;
+        if !result.success() {
+            return Err(db_error(result.error().unwrap_or_else(|| "D1 write failed".to_string())));
+        }
         Ok(())
     }
 
@@ -147,14 +181,22 @@ impl D1CookieStore {
         }
     }
 
-    /// 保存キーが属するサイト。今日のキーはサイト名で、旧ビルドが書いた
-    /// ホスト名のキーは埋め込みのサイト定義で畳み先を決める
-    /// (native `site_for_key`)。
-    fn key_site(&self, key: &str) -> String {
-        site_for_host_with(
-            &crate::bundled_sites::load_bundled_site_settings().unwrap_or_default(),
-            key,
-        )
+    /// 畳み先を決める実効サイト定義 (bundle + ユーザー定義、version gate 済み)。
+    ///
+    /// Worker runtime の fetch policy と同じ `bundled_sites::load_site_settings`
+    /// (L1 キャッシュ共有) を使うので、ユーザー定義がサイト集合を変えていても
+    /// UI 経路とジョブ経路の両方で同じ畳み先になる。同梱定義だけを使うと
+    /// ユーザー定義に追従できず、経路ごとに保存キーが食い違う (キーが往復
+    /// 書き換えになる) ので、bundle 専用にはしない。
+    ///
+    /// オブジェクトストアの読み出しに失敗したときだけ同梱定義へ下がる。
+    /// 差が出るのは「ユーザー定義が存在する かつ 読み出しが失敗した」場合
+    /// のみで、そうならなければ fix 前 (常に同梱定義) と同じ畳みになる。
+    async fn key_site_settings(&self) -> Vec<SiteSetting> {
+        match crate::bundled_sites::load_site_settings(&self.objects).await {
+            Ok(settings) => settings,
+            Err(_) => crate::bundled_sites::load_bundled_site_settings().unwrap_or_default(),
+        }
     }
 
     /// 全サイトのログインを復号して返す。旧形式はサイト名へ畳んで書き戻す
@@ -164,6 +206,9 @@ impl D1CookieStore {
         if raw.is_empty() {
             return Ok(BTreeMap::new());
         }
+        // 保存キーが属するサイト。今日のキーはサイト名で、旧ビルドが書いた
+        // ホスト名のキーは実効サイト定義で畳み先を決める (native `site_for_key`)。
+        let site_settings = self.key_site_settings().await;
         let mut stored: BTreeMap<String, Vec<LoginGroup>> = BTreeMap::new();
         let mut legacy_per_site: BTreeMap<String, Vec<Vec<LoginGroup>>> = BTreeMap::new();
         let mut needs_rekey = false;
@@ -177,7 +222,7 @@ impl D1CookieStore {
                 Some(cookie) => cookie,
                 None => value,
             };
-            let site = self.key_site(&key_name);
+            let site = site_for_host_with(&site_settings, &key_name);
             if site != key_name {
                 needs_rekey = true;
             }
@@ -355,5 +400,22 @@ impl CookieStore for D1CookieStore {
 
     fn list_groups(&self) -> PlatformFuture<'_, Result<BTreeMap<String, Vec<LoginGroup>>>> {
         Box::pin(self.groups_by_site())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cookie_payload;
+
+    #[test]
+    fn cleared_canonical_cookie_value_cannot_fall_back_to_stale_json() {
+        let legacy = cookie_payload(
+            Some("{}".to_string()),
+            Some(r#"{"site":"old-cookie"}"#.to_string()),
+        );
+        assert_eq!(legacy, r#"{"site":"old-cookie"}"#);
+
+        let cleared = cookie_payload(Some("{}".to_string()), Some("{}".to_string()));
+        assert_eq!(cleared, "{}");
     }
 }
