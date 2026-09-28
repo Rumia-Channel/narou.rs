@@ -49,6 +49,11 @@ use crate::termcolor::bold_colored;
 const SECTION_CONVERT_CACHE_NAME: &str = "section_convert_cache";
 #[cfg(feature = "native-runtime")]
 const SECTION_CONVERT_CACHE_DIR_NAME: &str = "section_convert_cache";
+/// 変換キャッシュの保存形式。本文と同様、生 YAML のままだと 3 倍以上に
+/// 膨らむため、brotli (または無圧縮) を 1 行のヘッダで示して格納する。
+/// ヘッダが無いファイルは旧形式 (生 YAML) として読む。
+#[cfg(feature = "native-runtime")]
+const SECTION_CONVERT_CACHE_MAGIC: &str = "narou-section-cache:v1";
 const ILLUSTRATION_LOCALIZATION_VERSION: &str = "illustration-localization:v4";
 
 /// I/O capabilities used only by converter-side illustration localization.
@@ -1315,8 +1320,12 @@ impl SectionConvertCache {
             return Ok(());
         }
         migrate_legacy_section_convert_cache()?;
-        let bucket = load_section_convert_bucket(novel_id)?;
-        self.buckets.insert(key, bucket);
+        let (bucket, legacy_format) = load_section_convert_bucket(novel_id)?;
+        self.buckets.insert(key.clone(), bucket);
+        if legacy_format {
+            // 旧形式 (生 YAML) は次の flush で圧縮して書き直す。
+            self.dirty_ids.insert(key);
+        }
         Ok(())
     }
 
@@ -1368,27 +1377,64 @@ fn section_convert_cache_file_path(id: &str) -> Result<PathBuf> {
     Ok(section_convert_cache_dir()?.join(format!("{}.yaml", id)))
 }
 
+/// 保存済みバケットを読む。戻り値の `bool` は「旧形式 (生 YAML) だった」
+/// ことを示し、呼び出し側が dirty として扱って次の flush で圧縮し直す。
 #[cfg(feature = "native-runtime")]
-fn load_section_convert_bucket(novel_id: i64) -> Result<HashMap<String, CacheEntry>> {
+fn load_section_convert_bucket(novel_id: i64) -> Result<(HashMap<String, CacheEntry>, bool)> {
     let path = section_convert_cache_file_path(&novel_id.to_string())?;
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((HashMap::new(), false)),
         Err(e) => return Err(NarouError::Io(e)),
     };
-    if raw.trim().is_empty() {
-        return Ok(HashMap::new());
+    if bytes.is_empty() {
+        return Ok((HashMap::new(), false));
     }
-    Ok(serde_yaml::from_str(&raw)?)
+    let legacy = !bytes.starts_with(SECTION_CONVERT_CACHE_MAGIC.as_bytes());
+    let yaml = decode_section_convert_cache(&bytes)?;
+    if yaml.iter().all(u8::is_ascii_whitespace) {
+        return Ok((HashMap::new(), legacy));
+    }
+    Ok((serde_yaml::from_slice(&yaml)?, legacy))
+}
+
+/// 保存形式のヘッダを剥がして YAML 本体を返す。ヘッダが無ければ旧形式
+/// (生 YAML) としてそのまま返す。
+#[cfg(feature = "native-runtime")]
+fn decode_section_convert_cache(bytes: &[u8]) -> Result<Vec<u8>> {
+    let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+        return Ok(bytes.to_vec());
+    };
+    let Ok(header) = std::str::from_utf8(&bytes[..newline]) else {
+        return Ok(bytes.to_vec());
+    };
+    let Some(encoding) = header.strip_prefix(SECTION_CONVERT_CACHE_MAGIC) else {
+        return Ok(bytes.to_vec());
+    };
+    let encoding = crate::platform::ObjectEncoding::parse(encoding.trim())?;
+    crate::platform::decompress_object_payload(&bytes[newline + 1..], encoding)
+}
+
+#[cfg(feature = "native-runtime")]
+fn encode_section_convert_cache(yaml: &[u8]) -> Result<Vec<u8>> {
+    let (payload, encoding) = crate::platform::compress_object_payload(yaml);
+    let mut out = format!("{} {}\n", SECTION_CONVERT_CACHE_MAGIC, encoding.as_str()).into_bytes();
+    out.extend_from_slice(&payload);
+    Ok(out)
 }
 
 #[cfg(feature = "native-runtime")]
 fn save_section_convert_bucket(id: &str, bucket: &HashMap<String, CacheEntry>) -> Result<()> {
     let path = section_convert_cache_file_path(id)?;
-    crate::db::inventory::update_locked_yaml_file::<(), HashMap<String, CacheEntry>, _>(
-        &path,
-        |_| Ok((bucket.clone(), ())),
-    )?;
+    let mut yaml = serde_yaml::to_string(bucket)?;
+    if yaml.starts_with("---\n") {
+        yaml.drain(..4);
+    }
+    let encoded = encode_section_convert_cache(yaml.as_bytes())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::native::object_store::atomic_write_bytes(&path, &encoded)?;
     Ok(())
 }
 
@@ -1758,9 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn section_convert_cache_supports_large_per_novel_files() {
-        const OLD_SECTION_CACHE_LIMIT: usize = 32 * 1024 * 1024;
-
+    fn a_legacy_cache_file_is_rewritten_compressed_on_flush() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
@@ -1768,6 +1812,46 @@ mod tests {
         *crate::db::DATABASE.lock() = None;
         crate::db::init_database().unwrap();
 
+        // 旧形式 (生 YAML) を置き、読み込み後の flush で圧縮して書き直すこと。
+        let body = "a".repeat(200_000);
+        let legacy = HashMap::from([("本文\\1.yaml".to_string(), make_cache_entry(&body))]);
+        let path = temp
+            .path()
+            .join(".narou")
+            .join("section_convert_cache")
+            .join("3062.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_yaml::to_string(&legacy).unwrap()).unwrap();
+        let before = path.metadata().unwrap().len();
+
+        let mut cache = super::SectionConvertCache::default();
+        cache.bucket(3062).unwrap();
+        cache.flush().unwrap();
+
+        let after = path.metadata().unwrap().len();
+        assert!(
+            after < before,
+            "legacy cache must be rewritten compressed: {before} -> {after}"
+        );
+
+        let mut reopened = super::SectionConvertCache::default();
+        let loaded = reopened.bucket(3062).unwrap();
+        assert_eq!(loaded["本文\\1.yaml"].converted_section.body.len(), body.len());
+
+        *crate::db::DATABASE.lock() = None;
+    }
+
+    #[test]
+    fn section_convert_cache_supports_large_per_novel_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        // 旧実装は 1 ファイル 32MB 上限だった。今は小説ごとのファイルに分け、
+        // 中身は圧縮して持つ (生 YAML のままより大幅に小さくなる)。
         let body = "a".repeat(32 * 1024 * 1024 + 1024);
         let bucket = HashMap::from([("本文\\1.yaml".to_string(), make_cache_entry(&body))]);
         save_section_convert_bucket("3062", &bucket).unwrap();
@@ -1777,7 +1861,12 @@ mod tests {
             .join(".narou")
             .join("section_convert_cache")
             .join("3062.yaml");
-        assert!(path.metadata().unwrap().len() > OLD_SECTION_CACHE_LIMIT as u64);
+        let stored = path.metadata().unwrap().len();
+        assert!(
+            stored < (body.len() / 10) as u64,
+            "cache must be stored compressed: {stored} bytes for a {} byte body",
+            body.len()
+        );
 
         let mut cache = super::SectionConvertCache::default();
         let loaded = cache.bucket(3062).unwrap();
