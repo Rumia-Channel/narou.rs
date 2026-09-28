@@ -72,6 +72,10 @@ if [ ! -d "$LIB/.narou" ]; then
   "$NAROU" init < /dev/null
   # SQLite 管理 (Lite) にする。YAML に戻すときは `narou db export-yaml --in-place`。
   printf 'sqlite\n' > "$LIB/.narou/storage-backend"
+  # 容量節約の既定 (初回だけ入れるので、後から変えても上書きされない):
+  #   nosave_diff  更新のたびに作られる差分スナップショットを保存しない
+  #   no-epub      EPUB を保存しない (Web UI の「EPUB をダウンロード」は都度生成)
+  "$NAROU" setting economy=nosave_diff convert.no-epub=true < /dev/null
 fi
 
 # 公開はトンネル経由なので、ループバックだけを向き、Host / Origin は前段が

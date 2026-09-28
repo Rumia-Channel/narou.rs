@@ -521,6 +521,10 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   ローカルから S3 へ写す。`narou illust s3-verify` がバイト単位で突き合わせる。どちらも
   ライブラリ全体が対象で、`s3.asset-backend=s3` と接続情報が必要
   (`platform::store_migration::migrate_page` を共有)。
+- **SORAHOST の既定は容量優先**: `sorahost/start.sh` が初回に `convert.section-cache=false`
+  (話ごとの変換キャッシュ無し)・`economy=nosave_diff` (更新ごとの差分スナップショット無し)・
+  `convert.no-epub=true` (EPUB を保存しない。Web UI のダウンロードは都度生成) を入れる。
+  さらに削る場合は `economy=nosave_raw` (raw HTML を保存しない) を利用者が選ぶ。
 - **話ごとの変換キャッシュは容量の厳しい環境で切れる**: `convert.section-cache`
   (local 設定、既定 true、環境変数 `NAROU_RS_SECTION_CACHE=0` で無効)。無効時は読み書きせず、flush 時に既存の
   `section_convert_cache/<id>.yaml` を削除する (再有効化しても壊れない)。既定では

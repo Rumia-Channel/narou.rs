@@ -124,6 +124,17 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
 - 挿絵を S3 に置くと、ローカルのミラーと `db.sqlite` の両方から消える (この構成で -73 MB)
 - `start.sh` は `convert.section-cache=false` を設定する。無効にすると変換のたびに
   全話を変換し直す代わりに、容量を使わない (有効時の実測で 1 作品あたり約 1.5 MB)
+- `start.sh` は初回に `economy=nosave_diff` と `convert.no-epub=true` を入れる。
+  前者は更新のたびに作られる差分スナップショット (実測 1 作品で 6.7 MB) を止め、
+  後者は保存 EPUB (テキスト作品で 2 MB、画像主体で 40〜55 MB) を止める。
+  Web UI の「EPUB をダウンロード」は保存済みテキストから都度生成するので影響しない
+- さらに削るなら `narou setting economy=nosave_raw` を足す (raw HTML を保存しない)。
+  実測 1 作品あたり 19 MB と大きいが、挿絵の再ローカライズと `narou illust rebuild` が
+  raw/*.html を見られなくなる
+- **古い出力ファイルは残る**: 出力名の設定 (`convert.filename-to-ncode` や
+  `[作者名]` 接頭辞) を変えると、同じ本文の `novel.txt` / `.epub` が別名で増える。
+  手元のライブラリをそのまま持ち込むと重複を引き継ぐので、気になる場合は削除する
+  (実測: なろう長編 1 作品で txt 3 重複 14.9 MB + epub 2 重複 4.4 MB)
 - **EPUB を溜めないのが一番効く**: 画像主体の作品は 1 冊 40〜55 MB になる。Web UI の
   「EPUB をダウンロード」は保存済みテキストから都度生成するので、`narou convert` で
   EPUB を作らない設定 (`convert.no-epub=true`) にしておけばディスクを消費しない
