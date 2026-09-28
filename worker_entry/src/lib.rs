@@ -28,7 +28,7 @@ mod ledger;
 mod object_migration;
 mod rate_limiter;
 mod scheduler;
-mod s3_object_store;
+mod s3_store;
 mod site_rate_limiter;
 use subtle::ConstantTimeEq;
 use webui::{json_error, query_param};
@@ -1309,6 +1309,7 @@ async fn api_object_migration(mut req: Request, env: Env) -> Result<Response> {
             &db,
             &action,
             body.limit.unwrap_or(object_migration::DEFAULT_LIMIT),
+            crate::budget::SubrequestBudget::new(),
         )
         .await
     };

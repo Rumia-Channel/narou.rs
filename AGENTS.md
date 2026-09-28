@@ -496,6 +496,35 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   (`d1` | `s3`)。旧 `object_backend` は撤去済み。
 - ストアをまたぐ `copy` / `move_or_copy` は失敗させ、呼び出し側の想定違いを早期に検出する。
 
+### native の S3 ストレージ (Wasabi など, 2026-09)
+
+- 保存先の実装は core の `src/platform/s3_store.rs` 1 つで、native と Worker が同じコードを使う
+  (Worker 側の `worker_entry/src/s3_store.rs` は環境から接続情報を読んで組み立てるだけ)。
+  path-style URL、SigV4 署名と presigned GET、stat は `GET` + `Range`。1 オブジェクトの上限は
+  64 MiB、`read_small`/`write_small` は 16 MiB (multipart は未実装で、上限超過は黙って
+  切り捨てず失敗させる)。
+- native の設定は `local_setting` の `s3.endpoint` / `s3.bucket` / `s3.region` / `s3.prefix` /
+  `s3.access-key-id` / `s3.secret-access-key`。`narou setting` から読み書きでき、環境変数 (`S3_*`)
+  があればそちらを優先する (SORAHOST のようなコンテナは環境変数だけで完結する)。
+- 挿絵を S3 に置くかは `s3.asset-backend` (`local` | `s3`、環境変数 `NAROU_RS_ASSET_BACKEND`)。
+  **Worker 側の切替は従来どおり `app_state('inv','asset_backend')`** で、native は設定ファイル側に
+  置く (native から `app_state` を書く口が無いため)。`s3` を選んで接続情報が欠けていれば
+  **fail-closed** で失敗する (黙ってローカル保存へ落とすとディスクを食い潰す)。
+- native の保存先は `src/native/object_store.rs` の `NativeStores` が組む。`SplitStore` により
+  挿絵のバイナリだけが S3 へ流れ、本文・メタデータ・`.illustration_cache.yaml` は従来どおり
+  ローカル (YAML / SQLite ミラー) に残る。downloader と Web のアプリサービスはこのペアを使う。
+- **EPUB 生成はファイルパスを要求する**ため (`epub_lite` も外部 AozoraEpub3 もディレクトリを読む)、
+  生成直前にだけ S3 から取り出し、スコープを抜けた時点で削除する
+  (`native::illustrations::Materialized`)。Web のオンデマンド EPUB と CLI 変換の Lite 経路の
+  両方に接続済み。
+- **既存ライブラリの移行**: `narou illust s3-push` が件数と容量を数え (既定 dry-run)、`-f` で
+  ローカルから S3 へ写す。`narou illust s3-verify` がバイト単位で突き合わせる。どちらも
+  ライブラリ全体が対象で、`s3.asset-backend=s3` と接続情報が必要
+  (`platform::store_migration::migrate_page` を共有)。
+- HTTP 層に `HttpMethod::{Put, Delete}` と `HttpRequest::trusted_endpoint` を追加した。後者は
+  保存先が利用者自身の設定値であることを示し、公開アドレス判定を掛けず (ローカル MinIO を許可)、
+  応答ヘッダを全部返す (`ETag` / `Content-Range` が保存先の契約)。
+
 ### Worker の契約テスト (2026-09)
 
 - `worker_entry/tests/contract.mjs` … HTTP 契約（health / 認証 fail-closed / 一覧・ジョブ API /

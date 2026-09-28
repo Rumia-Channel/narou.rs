@@ -598,6 +598,13 @@ async fn generate_epub_on_demand(
         ));
     }
 
+    // 挿絵を S3 に置く構成ではローカルに実体が無い。EPUB 生成はファイルを
+    // 要求するので、ここで取り出し、スコープを抜けた時点で片付ける。
+    let _materialized = crate::native::illustrations::Materialized::new(
+        crate::native::illustrations::materialize(novel_dir)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+    );
     let options = crate::epub_lite::EpubBuildOptions {
         title: record.title.clone(),
         author: record.author.clone(),

@@ -1,0 +1,139 @@
+# SORAHOST で narou.rs を動かす
+
+SORAHOST (Pterodactyl) のコンテナで native 版 `narou_rs` を常駐させ、Web UI を
+Cloudflare Tunnel 経由で公開する手順。**Workers は使わない** (無料枠の CPU・
+接続数・ポート制約を受けない)。
+
+```
+Browser ──https──▶ Cloudflare (TLS / WAF / Tunnel)
+                      │ cloudflared が張る外向き接続 (7844/TCP+UDP)
+                      ▼
+              SORAHOST コンテナ内
+                cloudflared ──▶ http://127.0.0.1:8080 ──▶ narou_rs web
+                                                  │
+                                                  └─ 挿絵だけ S3 (Wasabi など) へ
+```
+
+- 受信ポートは不要。SORAHOST の割当ポート番号 (`nagoya.sorahost.net:50071` 等) には依存しない
+- メタデータ・本文はライブラリ内の SQLite (`.narou/db.sqlite`)、挿絵だけ S3 に置く
+- アプリはループバックにしかバインドしないので、外部から直接叩けない
+
+## 1. ビルド
+
+組み込み EPUB エンジン (Lite) を有効にしてビルドする。外部 AozoraEpub3 (Java) は
+コンテナに置かない。
+
+```sh
+cargo build --release --features lite
+```
+
+Linux 向けの実行ファイルと、同梱のサイト定義 (`webnovel/`) を用意する。
+`narou init` は実行ファイルの隣の `webnovel/` から定義をコピーするため、
+**`webnovel/` を同梱しないとサイト定義が空になる**。
+
+配置先 (コンテナ内):
+
+```
+/home/container/narou/
+  narou_rs            実行ファイル (chmod +x)
+  webnovel/*.yaml     同梱のサイト定義
+  start.sh            このリポジトリの sorahost/start.sh
+  library/            .narou / 小説データ / webnovel (初回起動で作られる)
+  bin/cloudflared     start.sh が取得 (手元で置いてもよい)
+  .cloudflared-token  トンネルのトークン (chmod 600)
+```
+
+`/home/container` 配下は再デプロイで消えない。デプロイ用のディレクトリを
+使い捨ての置き場にしないこと。
+
+## 2. Cloudflare Tunnel
+
+1. Cloudflare ダッシュボード → **Networking → Tunnels → Create Tunnel**
+   (コネクタは `cloudflared` を選ぶ)
+2. 表示される**トークン**を控える (再表示できない。失くしたら rotate)
+3. **Public hostname** を追加する
+   - Hostname: `narou.example.com` (自分のドメイン)
+   - Service: `http://127.0.0.1:8080` (`NAROU_RS_PORT` を変えたら合わせる)
+4. DNS レコードはダッシュボードが自動作成する (CNAME → `<UUID>.cfargotunnel.com`)
+5. **SSL/TLS モードを Off 以外にする** (Off だと WebSocket が通らない)
+6. **Network → WebSockets を On** にする
+
+トークンはコンテナ内の `/home/container/narou/.cloudflared-token` に置く。
+
+```sh
+printf '%s' '<TOKEN>' > /home/container/narou/.cloudflared-token
+chmod 600 /home/container/narou/.cloudflared-token
+```
+
+## 3. 環境変数
+
+Pterodactyl の Startup 変数、またはコンテナ内の環境変数として設定する
+(ひな形は `sorahost/narou.env.example`)。
+
+| 変数 | 用途 |
+| --- | --- |
+| `NAROU_WEB_PASSWORD` | Web UI の basic 認証パスワード (**必須**。公開されるため) |
+| `NAROU_WEB_USER` | basic 認証のユーザ名 (既定は設定しない = narou 側の既定) |
+| `NAROU_RS_ASSET_BACKEND` | `s3` で挿絵を S3 へ。未設定はローカル保存 |
+| `S3_ENDPOINT` / `S3_BUCKET` / `S3_REGION` | 接続先 (Wasabi は `https://s3.<region>.wasabisys.com`) |
+| `S3_PREFIX` | バケット内の接頭辞 (例 `narou/library`) |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | 資格情報 |
+| `NAROU_RS_PORT` | ローカルの待受ポート (既定 8080) |
+| `TUNNEL_TOKEN_FILE` | トークンのパス (既定 `$NAROU_RS_ROOT/.cloudflared-token`) |
+
+`narou setting s3.endpoint=...` のように設定ファイル側へ書いてもよい
+(環境変数があるときは環境変数が優先)。
+
+## 4. 起動
+
+Pterodactyl の起動コマンドに次を設定する。
+
+```
+bash /home/container/narou/start.sh
+```
+
+初回起動でライブラリを作り、`storage-backend` を `sqlite` に切り替え、
+`server-bind=127.0.0.1` / `server-reverse-proxy.enable=true` を設定する。
+
+## 5. 既存ライブラリの移行
+
+手元のライブラリ (`.narou` + `小説データ`) を SORAHOST へ持って行き、挿絵だけを
+S3 へ逃がす場合:
+
+```sh
+narou setting s3.asset-backend=s3          # 以降 this ライブラリは S3 を使う
+narou illust s3-push                       # 件数と容量を数えるだけ (dry-run)
+narou illust s3-push -f                    # 実際に S3 へ写す
+narou illust s3-verify                     # バイト単位で突き合わせる
+```
+
+`narou setting s3.asset-backend=local` に戻せば、移行前のローカル保存へ即座に
+戻せる (S3 側は消さない)。
+
+## 6. 更新
+
+1. 新しい `narou_rs` をビルドして配置する
+2. Pterodactyl からサーバーを再起動する
+
+`self-update` は使わない (実行ファイルの置き場が読み取り専用になりうるため)。
+`webnovel/*.yaml` を差し替えたときも再起動で反映される。
+
+## 7. 使えない機能
+
+SORAHOST のコンテナで動かすため、次は動かない (Web UI 側では 501 相当):
+
+- `browser` / `folder` (デスクトップ操作)
+- `send` / `mail` (端末送信・SMTP。設定の読み書きはできる)
+- 外部 AozoraEpub3 (`aozoraepub3dir` は設定しない。Lite を同梱して使う)
+- `narou_rs_login` (ブラウザのある端末で実行し、`narou login import` で取り込む)
+
+## 8. 確認
+
+```sh
+curl -I https://narou.example.com/            # basic 認証のチャレンジが返る
+curl -u admin:<password> https://narou.example.com/api/novels/count
+```
+
+ブラウザで開き、ジョブの進捗 (WebSocket) が出ることを確認する。
+Cloudflare はサーバー再起動時に WebSocket を切ることがあるが、Web UI は
+再接続する。

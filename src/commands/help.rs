@@ -108,7 +108,7 @@ const COMMANDS: &[CmdInfo] = &[
     },
     CmdInfo {
         name: "illust",
-        oneline: "挿絵ハッシュストアの運用補助 (orphan/migrate/fix-ext/rebuild)",
+        oneline: "挿絵ハッシュストアの運用補助 (orphan/migrate/fix-ext/rebuild/s3-push/s3-verify)",
     },
     CmdInfo {
         name: "author",
@@ -883,6 +883,11 @@ const ILLUST_HELP: CmdHelp = CmdHelp {
                ハッシュ名 / ソースマップへ一括移行。
       fix-ext  マジックバイト判定で .jpg/.png 等を実体に合わせて改名。
       rebuild  挿絵/ と raw/*.html から .illustration_cache.yaml を再構築。
+      s3-push  挿絵を S3 互換ストレージ (Wasabi など) へ写す。既定は件数と
+               容量を数えるだけで、-f で実行。
+      s3-verify ローカルの挿絵と S3 の内容をバイト単位で突き合わせる。
+  ・s3-push / s3-verify はライブラリ全体が対象です (s3.asset-backend=s3 と
+    S3 の接続情報が必要。<target> は使いません)。
   ・<target> を省略した場合、直前に変換した小説が対象になります。
   ・全小説を対象にしたい場合は --all を使います。
   ・削除・改名・移行はいずれも既定で dry-run (-f を付けると実行)。
@@ -893,7 +898,10 @@ const ILLUST_HELP: CmdHelp = CmdHelp {
     narou illust orphan 1 -f       # 実際に削除
     narou illust migrate 1
     narou illust fix-ext --all -f
-    narou illust rebuild --all",
+    narou illust rebuild --all
+    narou illust s3-push              # 移行対象の件数と容量を確認
+    narou illust s3-push -f           # S3 へ写す
+    narou illust s3-verify            # 突き合わせ",
     options: &[
         opt(
             Some("-f"),

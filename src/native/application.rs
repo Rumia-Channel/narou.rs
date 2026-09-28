@@ -309,9 +309,11 @@ impl NativeAppServices {
         let root_dir = inventory.root_dir().to_path_buf();
         let novels: Arc<dyn crate::platform::NovelRepository> =
             Arc::new(crate::native::novel_repository::NativeNovelRepository::new());
-        let objects: Arc<dyn crate::platform::ObjectStore> = Arc::new(
-            crate::native::object_store::NativeStore::for_narou_root(&root_dir)?,
-        );
+        let stores = crate::native::object_store::NativeStores::for_narou_root(&root_dir)?;
+        let objects = stores.objects;
+        // 挿絵だけ S3 へ流す構成でも削除・読み出しが同じ経路になるよう、
+        // SplitStore 自体を objects として渡す (AssetStore も兼ねる)。
+        let _assets = stores.assets;
         let freeze_native = Arc::new(Self::freeze_store(inventory.clone()));
         let site_provider = Arc::new(NativeSiteTimezoneProvider::load());
         let library = Arc::new(crate::application::LibraryService::new(

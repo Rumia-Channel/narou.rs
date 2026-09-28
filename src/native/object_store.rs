@@ -13,9 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures::StreamExt;
 
 use crate::error::{NarouError, Result};
+use std::sync::Arc;
+
 use crate::platform::{
     AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
-    ObjectPrefix, ObjectStore, PlatformFuture,
+    ObjectPrefix, ObjectStore, PlatformFuture, S3Store, SplitStore,
 };
 
 pub(crate) const MAX_SMALL_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
@@ -601,6 +603,62 @@ pub fn ensure_mirror_file(path: &Path) -> bool {
     NativeStore::for_narou_root(inventory.root_dir())
         .and_then(|store| store.restore_mirror_file(path))
         .unwrap_or(false)
+}
+
+/// native の保存先ペア。
+///
+/// 挿絵のバイナリだけ S3 互換ストレージへ流し、本文やメタデータは
+/// 従来どおりローカル (YAML / SQLite ミラー) に残す。構成は
+/// `s3.asset-backend` (`local` | `s3`) で決まり、`s3` のときに接続情報が
+/// 欠けていれば [`crate::native::s3::illustration_store`] が失敗する
+/// (fail-closed。黙ってローカルへ落とさない)。
+pub struct NativeStores {
+    pub objects: Arc<dyn ObjectStore>,
+    pub assets: Arc<dyn AssetStore>,
+    /// S3 を使うときだけ入る (presigned URL と移行で使う)。
+    pub s3: Option<Arc<S3Store>>,
+}
+
+impl NativeStores {
+    /// ライブラリルート (` .narou` を持つディレクトリ) から保存先を組む。
+    pub fn for_narou_root(narou_root: &Path) -> Result<Self> {
+        let primary: Arc<NativeStore> = Arc::new(NativeStore::for_narou_root(narou_root)?);
+        let Some(s3) = crate::native::s3::illustration_store()? else {
+            let objects: Arc<dyn ObjectStore> = primary.clone();
+            let assets: Arc<dyn AssetStore> = primary;
+            return Ok(Self {
+                objects,
+                assets,
+                s3: None,
+            });
+        };
+        let primary_objects: Arc<dyn ObjectStore> = primary.clone();
+        let primary_assets: Arc<dyn AssetStore> = primary;
+        let s3_objects: Arc<dyn ObjectStore> = s3.clone();
+        let s3_assets: Arc<dyn AssetStore> = s3.clone();
+        let split: Arc<SplitStore> = Arc::new(SplitStore::new(
+            (primary_objects, primary_assets),
+            (s3_objects, s3_assets),
+        ));
+        let objects: Arc<dyn ObjectStore> = split.clone();
+        let assets: Arc<dyn AssetStore> = split;
+        Ok(Self {
+            objects,
+            assets,
+            s3: Some(s3),
+        })
+    }
+
+    /// プロセス全体のデータベースルートから保存先を組む
+    /// (`NativeStore::for_current_root` と同じ解決)。
+    pub fn for_current_root() -> Result<Self> {
+        let root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))?;
+        let narou_root = root
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::for_narou_root(&narou_root)
+    }
 }
 
 impl ObjectStore for NativeStore {

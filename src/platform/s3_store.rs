@@ -94,7 +94,11 @@ pub struct S3Store {
 }
 
 impl S3Store {
-    pub fn new(config: S3StoreConfig, http: Arc<dyn HttpClient>, clock: Arc<dyn Clock>) -> Result<Self> {
+    pub fn new(
+        config: S3StoreConfig,
+        http: Arc<dyn HttpClient>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
         config.validate()?;
         let scheme = config
             .endpoint
@@ -221,17 +225,13 @@ impl S3Store {
         }
         let content_range = response.header("content-range").map(str::to_string);
         let content_length = response.header("content-length").map(str::to_string);
-        let size = super::object_size(
-            status,
-            content_range.as_deref(),
-            content_length.as_deref(),
-        )
-        .ok_or_else(|| {
-            NarouError::Platform(format!(
-                "S3 GET {} returned no size (content-range={content_range:?})",
-                key.as_ref()
-            ))
-        })?;
+        let size = super::object_size(status, content_range.as_deref(), content_length.as_deref())
+            .ok_or_else(|| {
+                NarouError::Platform(format!(
+                    "S3 GET {} returned no size (content-range={content_range:?})",
+                    key.as_ref()
+                ))
+            })?;
         let etag = response
             .header("etag")
             .map(|value| value.trim_matches('"').to_string());
@@ -441,7 +441,10 @@ fn status_and_body(response: super::http::HttpResponse) -> Result<(u16, Vec<u8>)
 }
 
 impl ObjectStore for S3Store {
-    fn stat<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+    fn stat<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
         Box::pin(self.stat_object(key))
     }
 
@@ -491,7 +494,10 @@ impl ObjectStore for S3Store {
 }
 
 impl AssetStore for S3Store {
-    fn stat<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
+    fn stat<'a>(
+        &'a self,
+        key: &'a ObjectKey,
+    ) -> PlatformFuture<'a, Result<Option<ObjectMetadata>>> {
         Box::pin(self.stat_object(key))
     }
 
@@ -606,9 +612,11 @@ mod tests {
             },
         );
         let store = store(http.clone());
-        futures::executor::block_on(
-            ObjectStore::write_small(&store, &key("novels/site/title/toc.yaml"), b"body".to_vec()),
-        )
+        futures::executor::block_on(ObjectStore::write_small(
+            &store,
+            &key("novels/site/title/toc.yaml"),
+            b"body".to_vec(),
+        ))
         .unwrap();
 
         assert_eq!(
@@ -623,8 +631,16 @@ mod tests {
                 .map(|(_, value)| value.clone())
         };
         assert_eq!(header("content-type").as_deref(), Some("application/yaml"));
-        assert!(header("authorization").unwrap().starts_with("AWS4-HMAC-SHA256 "));
-        assert!(header("authorization").unwrap().contains("SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date"));
+        assert!(
+            header("authorization")
+                .unwrap()
+                .starts_with("AWS4-HMAC-SHA256 ")
+        );
+        assert!(
+            header("authorization")
+                .unwrap()
+                .contains("SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date")
+        );
         assert_eq!(http.sent_bodies(), vec![Some(b"body".to_vec())]);
     }
 
@@ -731,7 +747,10 @@ mod tests {
         );
         let page = futures::executor::block_on(ObjectStore::list_page(&store, &request)).unwrap();
         assert_eq!(page.objects.len(), 1);
-        assert_eq!(page.objects[0].key.as_ref(), "novels/site/title/挿絵/0001.jpg");
+        assert_eq!(
+            page.objects[0].key.as_ref(),
+            "novels/site/title/挿絵/0001.jpg"
+        );
         assert_eq!(page.objects[0].size, 2048);
         assert_eq!(page.next_cursor.as_deref(), Some("next-token"));
     }
@@ -755,7 +774,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             http.requested_urls(),
-            vec!["DELETE https://s3.example.com/bucket/narou/test/novels/site/title/%E6%8C%BF%E7%B5%B5/0001.jpg"]
+            vec![
+                "DELETE https://s3.example.com/bucket/narou/test/novels/site/title/%E6%8C%BF%E7%B5%B5/0001.jpg"
+            ]
         );
     }
 
@@ -764,7 +785,10 @@ mod tests {
         let http = Arc::new(MockHttpClient::new());
         let store = store(http);
         let url = store.presign_get_url(&key("novels/site/title/挿絵/0001.jpg"), 3600);
-        assert!(url.starts_with("https://s3.example.com/bucket/narou/test/"), "{url}");
+        assert!(
+            url.starts_with("https://s3.example.com/bucket/narou/test/"),
+            "{url}"
+        );
         assert!(url.contains("X-Amz-Signature="), "{url}");
         assert!(url.contains("X-Amz-Expires=3600"), "{url}");
 

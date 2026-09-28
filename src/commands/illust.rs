@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use narou_rs::db;
 use narou_rs::db::paths::novel_dir_for_record;
 use narou_rs::illustration_store;
+use narou_rs::platform::{AssetStore, ObjectStore, StoreMigrationState};
 
 use super::download;
 use super::log;
@@ -14,6 +16,10 @@ pub enum IllustSubcommand {
     Migrate,
     FixExt,
     Rebuild,
+    /// 挿絵をローカルから S3 互換ストレージへ写す (既定 dry-run)。
+    S3Push,
+    /// ローカルと S3 の挿絵を突き合わせる。
+    S3Verify,
 }
 
 /// Run the `narou illust <sub>` command.
@@ -38,6 +44,13 @@ fn cmd_illust_inner(
 ) -> Result<(), String> {
     db::init_database().map_err(|e| e.to_string())?;
 
+    // S3 への移行と突き合わせは小説単位ではなくライブラリ全体の操作。
+    match sub {
+        IllustSubcommand::S3Push => return run_s3_push(force),
+        IllustSubcommand::S3Verify => return run_s3_verify(),
+        _ => {}
+    }
+
     let dirs = resolve_target_dirs(targets, all)?;
 
     if dirs.is_empty() {
@@ -56,8 +69,123 @@ fn cmd_illust_inner(
             IllustSubcommand::Migrate => run_migrate(&dir, force)?,
             IllustSubcommand::FixExt => run_fix_ext(&dir, force)?,
             IllustSubcommand::Rebuild => run_rebuild(&dir)?,
+            // ライブラリ全体の操作なので、この小説単位のループには来ない
+            // (手前で return する)。
+            IllustSubcommand::S3Push | IllustSubcommand::S3Verify => {
+                unreachable!("S3 subcommands run before the per-novel loop")
+            }
         }
     }
+    Ok(())
+}
+
+
+/// 移行用のストア (移行元 = ローカル、移行先 = S3)。
+///
+/// 挿絵の保存先が S3 になっていなければ失敗させる。ここでローカルへ
+/// フォールバックすると、利用者が「移行した」と誤解する。
+#[allow(clippy::type_complexity)]
+fn s3_migration_stores() -> Result<
+    (
+        Arc<dyn ObjectStore>,
+        Arc<dyn AssetStore>,
+        Arc<dyn ObjectStore>,
+        Arc<dyn AssetStore>,
+    ),
+    String,
+> {
+    let root = narou_rs::db::inventory::Inventory::with_default_root()
+        .map_err(|error| error.to_string())?
+        .root_dir()
+        .to_path_buf();
+    let local = Arc::new(
+        narou_rs::native::object_store::NativeStore::for_narou_root(&root)
+            .map_err(|error| error.to_string())?,
+    );
+    let s3 = narou_rs::native::s3::illustration_store()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "挿絵の保存先が S3 になっていません (narou setting s3.asset-backend=s3 と S3 の接続情報が必要です)"
+                .to_string()
+        })?;
+    let from_objects: Arc<dyn ObjectStore> = local.clone();
+    let from_assets: Arc<dyn AssetStore> = local;
+    let to_objects: Arc<dyn ObjectStore> = s3.clone();
+    let to_assets: Arc<dyn AssetStore> = s3;
+    Ok((from_objects, from_assets, to_objects, to_assets))
+}
+
+fn migration_runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn report_migration_failures(state: &StoreMigrationState) {
+    if state.failed.is_empty() {
+        return;
+    }
+    println!("失敗 {} 件:", state.failed.len());
+    for entry in state.failed.iter().take(20) {
+        println!("  {}", entry);
+    }
+    if state.failed.len() > 20 {
+        println!("  ... 他 {} 件", state.failed.len() - 20);
+    }
+}
+
+/// 挿絵をローカルから S3 へ写す。既定は数えるだけで、`--force` で実行する。
+fn run_s3_push(force: bool) -> Result<(), String> {
+    let (from_objects, from_assets, to_objects, to_assets) = s3_migration_stores()?;
+    let action = if force { "copy" } else { "plan" };
+    let runtime = migration_runtime()?;
+    let mut state = StoreMigrationState::default();
+    while !state.done {
+        runtime
+            .block_on(narou_rs::platform::migrate_page(
+                &from_objects,
+                &from_assets,
+                &to_assets,
+                &to_objects,
+                action,
+                narou_rs::platform::store_migration::DEFAULT_LIMIT,
+                &mut state,
+            ))
+            .map_err(|error| error.to_string())?;
+    }
+    if force {
+        println!("S3 へ写しました: {} 件", state.copied);
+    } else {
+        println!(
+            "移行対象: {} 件 / {} バイト (実行するには --force)",
+            state.planned, state.planned_bytes
+        );
+    }
+    report_migration_failures(&state);
+    Ok(())
+}
+
+/// ローカルと S3 の挿絵をバイト単位で突き合わせる (書き込みはしない)。
+fn run_s3_verify() -> Result<(), String> {
+    let (from_objects, from_assets, to_objects, to_assets) = s3_migration_stores()?;
+    let runtime = migration_runtime()?;
+    let mut state = StoreMigrationState::default();
+    while !state.done {
+        runtime
+            .block_on(narou_rs::platform::migrate_page(
+                &from_objects,
+                &from_assets,
+                &to_assets,
+                &to_objects,
+                "verify",
+                narou_rs::platform::store_migration::DEFAULT_LIMIT,
+                &mut state,
+            ))
+            .map_err(|error| error.to_string())?;
+    }
+    println!("一致: {} 件", state.verified);
+    report_migration_failures(&state);
     Ok(())
 }
 
