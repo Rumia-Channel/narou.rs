@@ -208,6 +208,19 @@ impl D1JobLedger {
         Ok(())
     }
 
+    /// `GET /api/jobs/:id` 用の読み取り (`lib.rs::api_job`)。
+    ///
+    /// [`JobQueue::get`] (実行経路) は計画が必須なので未知の `kind` を拒否
+    /// するが、HTTP の閲覧では `record_rejected` が書く `kind='unknown'` の
+    /// poison 行も閲覧できなければならない — 行は存在するので 404 も 500 も
+    /// なく、生の kind 文字列のまま [`JobView`] で返す。
+    pub async fn get_view(&self, job_id: &JobId) -> Result<Option<JobView>> {
+        let Some(row) = self.select_row(job_id.as_str()).await? else {
+            return Ok(None);
+        };
+        row.into_view().map(Some)
+    }
+
     // ------------------------------------------------------------------
     // Web UI queue mutations (token-blind operator actions)
     // ------------------------------------------------------------------
@@ -449,7 +462,9 @@ impl JobQueue for D1JobLedger {
             let Some(row) = self.select_row(job_id.as_str()).await? else {
                 return Ok(None);
             };
-            row.into_view().map(Some)
+            // 実行経路は計画が必須: 未知の kind は従来どおりエラー
+            // (閲覧専用の生 kind 表現は `get_view` を参照)。
+            row.into_view()?.try_into_typed().map(Some)
         })
     }
 
@@ -941,10 +956,16 @@ struct JobRow {
 }
 
 impl JobRow {
-    fn into_view(self) -> Result<QueuedJobView> {
-        let kind = JobKind::parse(&self.kind).ok_or_else(|| {
-            NarouError::Platform(format!("unknown job kind in ledger: {:?}", self.kind))
-        })?;
+    /// Row → [`JobView`]. Everything except `kind` must parse (a corrupt
+    /// target / options / status / timestamp is still an error), but an
+    /// unparsable `kind` is carried through as the raw string: rows written
+    /// by [`D1JobLedger::record_rejected`] use `kind='unknown'`, which has
+    /// no [`JobKind`] counterpart.
+    fn into_view(self) -> Result<JobView> {
+        let kind = match JobKind::parse(&self.kind) {
+            Some(kind) => JobKindView::Known(kind),
+            None => JobKindView::Unparsed(self.kind),
+        };
         let target = JobTarget::parse(&self.target).ok_or_else(|| {
             NarouError::Platform(format!("unknown job target in ledger: {:?}", self.target))
         })?;
@@ -957,9 +978,9 @@ impl JobRow {
         })?;
         let created_at = parse_rfc3339(&self.created_at)?;
         let updated_at = parse_rfc3339(&self.updated_at)?;
-        Ok(QueuedJobView {
+        Ok(JobView {
             job_id: JobId(self.job_id),
-            job: JobPlan {
+            job: JobPlanView {
                 kind,
                 target,
                 options,
@@ -969,6 +990,81 @@ impl JobRow {
             last_error: self.last_error,
             created_at,
             updated_at,
+        })
+    }
+}
+
+/// One ledger row as `GET /api/jobs/:id` renders it.
+///
+/// The JSON is field-for-field identical to [`QueuedJobView`]; the only
+/// difference is `job.kind`, which keeps the raw ledger string when the row
+/// carries a kind [`JobKind::parse`] rejects (e.g. the `kind='unknown'`
+/// poison rows written by [`D1JobLedger::record_rejected`]) — the row stays
+/// viewable (status / attempts / last_error) instead of failing the read.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JobView {
+    pub job_id: JobId,
+    pub job: JobPlanView,
+    pub status: JobLedgerStatus,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// [`JobPlan`] with the raw-kind escape hatch (see [`JobView`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JobPlanView {
+    pub kind: JobKindView,
+    pub target: JobTarget,
+    pub options: Vec<String>,
+}
+
+/// A row's kind: parsed for canonical ledger values, the raw string for
+/// values that have no [`JobKind`] (`kind='unknown'` poison rows).
+#[derive(Debug, Clone)]
+pub enum JobKindView {
+    Known(JobKind),
+    Unparsed(String),
+}
+
+impl serde::Serialize for JobKindView {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Known(kind) => kind.serialize(serializer),
+            Self::Unparsed(raw) => serializer.serialize_str(raw),
+        }
+    }
+}
+
+impl JobView {
+    /// The typed view [`JobQueue::get`] hands to execution planning: an
+    /// unknown kind can never be planned, so it keeps the original error
+    /// (only the HTTP read path in [`D1JobLedger::get_view`] shows it).
+    fn try_into_typed(self) -> Result<QueuedJobView> {
+        let kind = match self.job.kind {
+            JobKindView::Known(kind) => kind,
+            JobKindView::Unparsed(raw) => {
+                return Err(NarouError::Platform(format!(
+                    "unknown job kind in ledger: {raw:?}"
+                )));
+            }
+        };
+        Ok(QueuedJobView {
+            job_id: self.job_id,
+            job: JobPlan {
+                kind,
+                target: self.job.target,
+                options: self.job.options,
+            },
+            status: self.status,
+            attempts: self.attempts,
+            last_error: self.last_error,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
         })
     }
 }

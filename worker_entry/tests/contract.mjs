@@ -183,6 +183,97 @@ await checkWithAuth("GET /api/novels rejects a wrong token", async () => {
   );
 });
 
+/** `/api/auth/login` でブラウザ用トークン Cookie を取得する。 */
+async function loginCookie() {
+  const response = await request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: TOKEN }),
+  });
+  assert(response.status === 200, `login status ${response.status}`);
+  const setCookie = response.headers.get("set-cookie") ?? "";
+  assert(setCookie.includes("narou_api_token="), `missing cookie: ${setCookie}`);
+  return setCookie.split(";")[0];
+}
+
+await checkWithAuth("POST /api/auth/login rejects a wrong token", async () => {
+  const response = await request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: "definitely-not-the-token" }),
+  });
+  assert(response.status === 401, `status ${response.status}`);
+  assert(
+    (await errorCode(response)) === "authentication_required",
+    "the failure must be machine readable",
+  );
+});
+
+await checkWithAuth("POST /api/auth/login rejects a cross-origin request", async () => {
+  const response = await request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "https://evil.example" },
+    body: JSON.stringify({ token: TOKEN }),
+  });
+  assert(response.status === 403, `status ${response.status}`);
+  assert((await errorCode(response)) === "cross_origin_rejected", "machine readable code");
+});
+
+await checkWithAuth("the login cookie authenticates later requests", async () => {
+  const response = await request("/api/auth/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: TOKEN }),
+  });
+  const setCookie = response.headers.get("set-cookie") ?? "";
+  assert(setCookie.toLowerCase().includes("httponly"), `cookie must be HttpOnly: ${setCookie}`);
+  assert(
+    setCookie.toLowerCase().includes("samesite=lax"),
+    `cookie must be SameSite=Lax: ${setCookie}`,
+  );
+
+  const cookie = setCookie.split(";")[0];
+  const list = await request("/api/novels?limit=1", { headers: { cookie } });
+  assert(list.status === 200, `cookie-authenticated status ${list.status}`);
+});
+
+await checkWithAuth("a cookie request from another origin is rejected", async () => {
+  const cookie = await loginCookie();
+  const response = await request("/api/novels?limit=1", {
+    headers: { cookie, origin: "https://evil.example" },
+  });
+  assert(response.status === 401, `status ${response.status}`);
+});
+
+await checkWithAuth("a same-origin cookie request is accepted", async () => {
+  const cookie = await loginCookie();
+  const response = await request("/api/novels?limit=1", {
+    headers: { cookie, origin: new URL(BASE_URL).origin },
+  });
+  assert(response.status === 200, `status ${response.status}`);
+});
+
+await checkWithAuth("GET /login serves the token login page", async () => {
+  const response = await request("/login", { redirect: "manual" });
+  assert(response.status === 200, `status ${response.status}`);
+  const html = await response.text();
+  assert(html.includes("/api/auth/login"), "the page must post to the login endpoint");
+});
+
+await checkWithAuth("GET /login returns an authenticated browser to the UI", async () => {
+  const cookie = await loginCookie();
+  const response = await request("/login?return=/settings", {
+    headers: { cookie },
+    redirect: "manual",
+  });
+  assert(
+    [301, 302, 303, 307, 308].includes(response.status),
+    `status ${response.status}`,
+  );
+  const location = response.headers.get("location") ?? "";
+  assert(location.endsWith("/settings"), `unexpected location: ${location}`);
+});
+
 await check("GET /api/novels returns the paged shape", async () => {
   const response = await request("/api/novels?limit=5", auth());
   assert(response.status === 200, `status ${response.status}`);

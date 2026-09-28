@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="none">
+    <title>Narou.rs WEB UI — ログイン</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%232b4c7e'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='white' font-family='Arial,sans-serif'%3EN%3C/text%3E%3C/svg%3E">
+    <link rel="stylesheet" href="/assets/css/theme.css">
+    <link rel="stylesheet" href="/assets/css/base.css">
+    <style>
+      /* ログインページは Worker が直接返す (assets に置かない) ため、
+         テーマ変数だけ共有して最小限のスタイルをここで組む。 */
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--body-bg);
+        color: var(--text-color);
+      }
+      .login-card {
+        width: min(24em, 92vw);
+        padding: 2em;
+        background: var(--table-even-bg);
+        border: 0.0625em solid var(--border-color);
+        border-radius: var(--border-radius);
+        box-shadow: 0 0.25em 1em rgba(0, 0, 0, 0.15);
+      }
+      .login-card h1 {
+        margin: 0 0 0.5em;
+        font-size: 1.25rem;
+      }
+      .login-card p.description {
+        margin: 0 0 1.25em;
+        color: var(--text-muted);
+        font-size: 0.85rem;
+        line-height: 1.5;
+      }
+      .login-card label {
+        display: block;
+        margin-bottom: 0.35em;
+        font-size: 0.9rem;
+      }
+      .login-card input[type="password"] {
+        width: 100%;
+        padding: 0.5em 0.6em;
+        margin-bottom: 1em;
+        font-size: 1rem;
+        background: var(--input-bg);
+        color: var(--text-color);
+        border: 0.0625em solid var(--input-border);
+        border-radius: var(--border-radius);
+      }
+      .login-card button {
+        width: 100%;
+        padding: 0.6em;
+        font-size: 1rem;
+        color: var(--btn-text);
+        background: var(--btn-primary-bg);
+        border: 0.0625em solid var(--btn-primary-border);
+        border-radius: var(--border-radius);
+        cursor: pointer;
+      }
+      .login-card button:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
+      .login-message {
+        min-height: 1.5em;
+        margin-top: 1em;
+        font-size: 0.85rem;
+        color: var(--btn-danger-bg);
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="login-card">
+      <h1>Narou.rs WEB UI</h1>
+      <p class="description">
+        この Worker は API トークンで保護されています。管理トークン
+        (<code>NAROU_ADMIN_TOKEN</code>) を入力してください。<br>
+        This Worker is protected by an API token. Enter the admin token.
+      </p>
+      <form id="login-form">
+        <label for="token">管理トークン / Admin token</label>
+        <input id="token" name="token" type="password" autocomplete="current-password" autofocus required>
+        <button id="login-submit" type="submit">ログイン / Sign in</button>
+      </form>
+      <p class="login-message" id="login-message" role="status" aria-live="polite"></p>
+    </main>
+    <script type="module">
+      import { request } from "/assets/js/core/http.js";
+
+      const form = document.getElementById("login-form");
+      const input = document.getElementById("token");
+      const button = document.getElementById("login-submit");
+      const message = document.getElementById("login-message");
+
+      // オープンリダイレクト防止: 同一サイト内の絶対パスだけを戻り先にする。
+      function returnTarget() {
+        const raw = new URLSearchParams(window.location.search).get("return") || "/";
+        if (!raw.startsWith("/") || raw.startsWith("//") || raw.includes("\\")) {
+          return "/";
+        }
+        return raw;
+      }
+
+      form.addEventListener("submit", async function (event) {
+        event.preventDefault();
+        const token = input.value;
+        if (!token) {
+          message.textContent = "トークンを入力してください。";
+          return;
+        }
+        button.disabled = true;
+        message.textContent = "";
+        try {
+          // 失敗時は共有ラッパが応答本文のメッセージ付きで throw する
+          // (401 のログイン誘導は /login 上では何もしない)。
+          await request("/api/auth/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ token: token }),
+          });
+          window.location.assign(returnTarget());
+        } catch (error) {
+          message.textContent = String((error && error.message) || error);
+        } finally {
+          button.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

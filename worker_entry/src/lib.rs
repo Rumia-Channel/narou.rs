@@ -31,7 +31,7 @@ use webui::{json_error, query_param};
 use serde_json::json;
 use worker::*;
 use narou_rs::application::settings::SettingsStore;
-use narou_rs::application::{JobQueue as _JobQueueTrait, TagAction};
+use narou_rs::application::TagAction;
 use narou_rs::setting_core::SettingScope;
 use std::collections::HashMap;
 
@@ -41,6 +41,40 @@ use crate::d1_repository::D1SettingsStore;
 
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    // native (axum) は GET ルートに HEAD も通す。Worker の各ハンドラは
+    // GET/POST 前提で 405 を返すので、HEAD は GET として処理し、応答から
+    // 本文だけを落として返す (method とヘッダを引き継いだ複製を作る)。
+    if req.method() == Method::Head {
+        let get_request = request_as_get(&req)?;
+        return route(get_request, env).await.and_then(head_response);
+    }
+    route(req, env).await
+}
+
+/// HEAD を GET として処理するための複製 (本文なし・Content-Length なし)。
+fn request_as_get(req: &Request) -> Result<Request> {
+    let url = req.url().map_err(|error| Error::RustError(error.to_string()))?;
+    let headers = req.headers().clone();
+    headers.delete("content-length")?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Get);
+    init.with_headers(headers);
+    Request::new_with_init(url.as_str(), &init)
+        .map_err(|error| Error::RustError(error.to_string()))
+}
+
+/// HEAD 応答: ステータスとヘッダはそのまま、本文だけ落とす。
+fn head_response(response: Response) -> Result<Response> {
+    let status = response.status_code();
+    let headers = response.headers().clone();
+    headers.delete("content-length")?;
+    worker::ResponseBuilder::new()
+        .with_status(status)
+        .with_headers(headers)
+        .from_bytes(Vec::new())
+}
+
+async fn route(req: Request, env: Env) -> Result<Response> {
     let path = req.path();
     match path.as_str() {
         "/health/live" => health_payload(&env, "alive").await,
@@ -54,6 +88,14 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
         },
         "/api/novels" => api_novels(req, env).await,
+        // native `src/web/mod.rs` では `{id}` より先に解決される数値以外の
+        // `/api/novels/*` 路 (native: `novels_count` / `all_novel_ids`)。
+        "/api/novels/count" => api_novels_count(req, env).await,
+        "/api/novels/all_ids" => api_novels_all_ids(req, env).await,
+        // ブラウザ用の入口 (migration plan §3.2): API/CI は Bearer のまま、
+        // ブラウザは `/login` で受け取った HttpOnly Cookie で通す。
+        "/login" => auth_login_page(req, env).await,
+        "/api/auth/login" => api_auth_login(req, env).await,
         "/api/login" => api_login(req, env).await,
         "/api/sites" => api_sites(req, env).await,
         // Cookie の直接登録 (set/add) は廃止: 取り込みとブラウザ取得だけが
@@ -73,6 +115,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         "/api/queue/status" => webui::queue::handle(req, env).await,
         "/api/get_pending_tasks" => webui::queue::handle(req, env).await,
         "/api/download" => webui::download::handle(req, env).await,
+        // native `jobs::api_download_force`: `{"ids": [...]}` を
+        // `force: true` の `/api/download` に変換して流し込む。
+        "/api/download_force" => api_download_force(req, env).await,
         "/api/story" => webui::read_views::handle(req, env).await,
         "/api/diff_list" => webui::read_views::handle(req, env).await,
         "/api/diff_clean" => webui::read_views::handle(req, env).await,
@@ -93,16 +138,32 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         "/api/login/rename" => webui::login_actions::handle(req, env).await,
         "/api/login/order" => webui::login_actions::handle(req, env).await,
         "/api/queue/clear" => webui::queue_actions::handle(req, env).await,
+        // native `jobs::queue_cancel`: running 中断 + pending 消去の合成路。
+        "/api/queue/cancel" => api_queue_cancel(req, env).await,
         "/api/cancel" => webui::queue_actions::handle(req, env).await,
         "/api/cancel_running_task" => webui::queue_actions::handle(req, env).await,
         "/api/remove_pending_task" => webui::queue_actions::handle(req, env).await,
         "/api/restore_pending_tasks" => webui::queue_actions::handle(req, env).await,
         "/api/defer_restore_pending_tasks" => webui::queue_actions::handle(req, env).await,
+        // native `jobs::confirm_running_tasks`: `rerun` で復元/延期に分岐。
+        "/api/confirm_running_tasks" => api_confirm_running_tasks(req, env).await,
         "/api/reorder_pending_tasks" => webui::queue_actions::handle(req, env).await,
         "/api/freeze" => webui::row_actions::handle(req, env).await,
         "/api/novels/freeze" => webui::row_actions::handle(req, env).await,
         "/api/novels/unfreeze" => webui::row_actions::handle(req, env).await,
         "/api/novels/remove" => webui::row_actions::handle(req, env).await,
+        // native の同義エイリアス (src/web/mod.rs): canonical ルートの
+        // ハンドラをそのまま使う (`alias_route` が本文ごと再ディスパッチする)。
+        "/api/remove" => {
+            alias_route(req, env, "/api/novels/remove", webui::row_actions::handle).await
+        }
+        "/api/remove_with_file" => api_remove_with_file(req, env).await,
+        "/api/freeze_on" => {
+            alias_route(req, env, "/api/novels/freeze", webui::row_actions::handle).await
+        }
+        "/api/freeze_off" => {
+            alias_route(req, env, "/api/novels/unfreeze", webui::row_actions::handle).await
+        }
         "/api/edit_tag" => webui::tag_actions::handle(req, env).await,
         "/api/tag/change_color" => webui::tag_actions::handle(req, env).await,
         "/api/shutdown" => webui::native_only::handle(req, env).await,
@@ -116,6 +177,17 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         "/api/mail" => webui::native_only::handle(req, env).await,
         "/api/send" => webui::native_only::handle(req, env).await,
         "/api/storage/mode" => webui::native_only::handle(req, env).await,
+        // 小説本文の版履歴を要する差分 API: Worker は版履歴を持たないので
+        // `native_only.rs` の 501 (`not_supported_on_worker`) で拒否する。
+        "/api/diff" => webui::native_only::handle(req, env).await,
+        "/api/diff_history" => webui::native_only::handle(req, env).await,
+        "/api/diff_show" => webui::native_only::handle(req, env).await,
+        "/api/diff_restore" => webui::native_only::handle(req, env).await,
+        "/api/diff_merge" => webui::native_only::handle(req, env).await,
+        // native `misc.rs` / `jobs.rs` の読取系 (ログ・URL 正規表現・GIF)。
+        "/api/log/recent" => api_log_recent(req, env).await,
+        "/api/validate_url_regexp_list" => api_validate_url_regexp_list(req, env).await,
+        "/api/downloadable.gif" => api_downloadable_gif(req, env).await,
         "/api/get_queue_size" => webui::queue::handle(req, env).await,
         "/api/devices" => webui::settings::handle(req, env).await,
         "/widget/drag_and_drop" => webui::pages::handle(req, env).await,
@@ -189,6 +261,36 @@ async fn api_novels(req: Request, env: Env) -> Result<Response> {
     }))
 }
 
+/// GET /api/novels/count — native `src/web/novels.rs::novels_count`。
+async fn api_novels_count(req: Request, env: Env) -> Result<Response> {
+    if !matches!(req.method(), Method::Get | Method::Head) {
+        return Response::error("Method Not Allowed", 405);
+    }
+    if let Some(response) = auth_failure(&req, &env).await {
+        return response;
+    }
+    let services = match composition::build_services(&env).await {
+        Ok(services) => services,
+        Err(_) => return Response::error("Service unavailable", 503),
+    };
+    webui::novels::count(&services).await
+}
+
+/// GET /api/novels/all_ids — native `src/web/misc.rs::all_novel_ids`。
+async fn api_novels_all_ids(req: Request, env: Env) -> Result<Response> {
+    if !matches!(req.method(), Method::Get | Method::Head) {
+        return Response::error("Method Not Allowed", 405);
+    }
+    if let Some(response) = auth_failure(&req, &env).await {
+        return response;
+    }
+    let services = match composition::build_services(&env).await {
+        Ok(services) => services,
+        Err(_) => return Response::error("Service unavailable", 503),
+    };
+    webui::novels::all_ids(&services).await
+}
+
 async fn api_novel(req: Request, env: Env) -> Result<Response> {
     // 認証は native と同じく全メソッドに掛ける (書き込み系も Bearer が要る)。
     if let Some(response) = auth_failure(&req, &env).await {
@@ -215,8 +317,10 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
 
     let Some((id_str, tail)) = rest.split_once('/') else {
         // bare `{id}`: GET=1 件取得, DELETE=remove_novel。
+        // native の `Path<i64>` は数値でないセグメントを 400 で弾く
+        // (404 ではない) ので、ここも同じステータスに合わせる。
         let Ok(id) = rest.parse::<i64>() else {
-            return Response::error("Not Found", 404);
+            return json_error(400, "invalid_path_parameter", None);
         };
         return match method {
             Method::Get => api_novel_get(req, env, id).await,
@@ -230,8 +334,9 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
             _ => Response::error("Method Not Allowed", 405),
         };
     };
+    // native の `Path<i64>` と同じく、数値でない id は 400 (404 ではない)。
     let Ok(id) = id_str.parse::<i64>() else {
-        return Response::error("Not Found", 404);
+        return json_error(400, "invalid_path_parameter", None);
     };
 
     // `{id}/…` のサブパス。native と同じくパスに対応するメソッド以外は 405、
@@ -897,6 +1002,10 @@ async fn api_jobs(mut req: Request, env: Env) -> Result<Response> {
 }
 
 /// GET /api/jobs/:id — one ledger row with status/attempts/timestamps.
+///
+/// `record_rejected` が書く `kind='unknown'` の poison 行も閲覧できるよう
+/// `ledger::get_view` を使う (実行経路の `JobQueue::get` は計画が必須で
+/// 未知の kind を拒否するが、閲覧で 500 にはしない)。
 async fn api_job(req: Request, env: Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
@@ -915,11 +1024,252 @@ async fn api_job(req: Request, env: Env) -> Result<Response> {
             return Response::error("Service unavailable", 503);
         }
     };
-    match runtime.ledger.get(&narou_rs::application::JobId(id)).await {
+    match runtime.ledger.get_view(&narou_rs::application::JobId(id)).await {
         Ok(Some(view)) => Response::from_json(&view),
         Ok(None) => Response::error("Not Found", 404),
         Err(error) => Response::error(format!("ledger read failed: {error}"), 500),
     }
+}
+
+// ---------------------------------------------------------------------------
+// native の同義エイリアス (`src/web/mod.rs`): 本文・応答形・ステータスは
+// canonical ルートのハンドラがそのまま担う。各 webui モジュールは受取パス
+// で振り分けているので、エイリアスは canonical パスへ作り直したリクエスト
+// を再ディスパッチして共有する (実装の複製を避けるため)。
+// ---------------------------------------------------------------------------
+
+/// canonical `path` 向けに `req` を作り直す。method とヘッダ (認証・
+/// Origin 検査) は呼び出し元のまま運び、`body` を本文にする
+/// (`None` = 本文なし)。URL は呼び出し元の URL を基に組むので
+/// 同一オリジン判定と残りのクエリがそのまま効く。
+fn forwarded_request(req: &Request, path: &str, body: Option<String>) -> Result<Request> {
+    let mut url = req.url().map_err(|error| Error::RustError(error.to_string()))?;
+    url.set_path(path);
+    let headers = req.headers().clone();
+    // 本文を作り直すので、元の Content-Length は新しい本文と食い違う。
+    // そのまま運ぶと workerd が古い長さで本文を切ることがあるため必ず外す
+    // (新しい長さは本文から算定される)。
+    headers.delete("content-length")?;
+    let mut init = RequestInit::new();
+    init.with_method(req.method());
+    init.with_headers(headers);
+    if let Some(body) = body {
+        init.with_body(Some(wasm_bindgen::JsValue::from_str(&body)));
+    }
+    Request::new_with_init(url.as_str(), &init)
+        .map_err(|error| Error::RustError(error.to_string()))
+}
+
+/// 本文まで canonical と同じエイリアス (`/api/remove` → `/api/novels/remove`
+/// など): 呼び出し元の本文をそのまま運ぶ。読めない本文は native と同様に
+/// 下段ハンドラの 400 判定へ回る。
+async fn alias_route<F, Fut>(req: Request, env: Env, path: &str, handler: F) -> Result<Response>
+where
+    F: FnOnce(Request, Env) -> Fut,
+    Fut: Future<Output = worker::Result<Response>>,
+{
+    let mut req = req;
+    let body = req.text().await.unwrap_or_default();
+    let forwarded = forwarded_request(&req, path, Some(body))?;
+    handler(forwarded, env).await
+}
+
+/// native `src/web/state.rs` の `IdsBody` (`/api/download_force` 本文)。
+#[derive(Debug, serde::Deserialize)]
+struct IdsBody {
+    ids: Vec<serde_json::Value>,
+}
+
+/// POST /api/download_force — native `src/web/jobs.rs::api_download_force`:
+/// `{"ids": [...]}` を `force: true` の `DownloadBody` に組み替えて
+/// canonical の `/api/download` へ流す (計画・キュー投入は下段に任せる)。
+async fn api_download_force(mut req: Request, env: Env) -> Result<Response> {
+    if req.method() != Method::Post {
+        return Response::error("Method Not Allowed", 405);
+    }
+    // native はミドルウェアで認証してから `Json<IdsBody>` を解くので、こちらも
+    // 本文を解く前に認証を通す (下段の `/api/download` も同じ認証を再実行する)。
+    if let Some(response) = auth_failure(&req, &env).await {
+        return response;
+    }
+    let body: IdsBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
+    };
+    // native と同じ id → 文字列変換 (数値はそのまま、それ以外は JSON 表現)。
+    let targets = body
+        .ids
+        .iter()
+        .map(|value| match value {
+            serde_json::Value::Number(number) => number.to_string(),
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>();
+    let download_body = json!({ "targets": targets, "force": true }).to_string();
+    let forwarded = forwarded_request(&req, "/api/download", Some(download_body))?;
+    webui::download::handle(forwarded, env).await
+}
+
+/// POST /api/remove_with_file — native `src/web/batch.rs::
+/// batch_remove_with_file`: 本文の `with_file` を問わず常に `true` で
+/// canonical の `/api/novels/remove` へ渡す。
+async fn api_remove_with_file(mut req: Request, env: Env) -> Result<Response> {
+    if req.method() != Method::Post {
+        return Response::error("Method Not Allowed", 405);
+    }
+    let text = req.text().await.unwrap_or_default();
+    let body = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(mut value) if value.is_object() => {
+            value["with_file"] = serde_json::Value::Bool(true);
+            value.to_string()
+        }
+        // オブジェクト以外 (不正 JSON・配列・空) は素通しして、下段の
+        // `BatchIdsBody` 解析が native と同じ 400 を返すようにする。
+        _ => text,
+    };
+    let forwarded = forwarded_request(&req, "/api/novels/remove", Some(body))?;
+    webui::row_actions::handle(forwarded, env).await
+}
+
+/// POST /api/queue/cancel — native `src/web/jobs.rs::queue_cancel`:
+/// running を中断して pending を消す (=`/api/cancel` の後に
+/// `/api/queue/clear`)。native と同順 (kill → clear) に実行し、
+/// どちらも成功して初めて native と同じ `{"success": true,
+/// "message": "キャンセルしました"}` を返す。
+async fn api_queue_cancel(req: Request, env: Env) -> Result<Response> {
+    let mut cancel = webui::queue_actions::handle(
+        forwarded_request(&req, "/api/cancel", None)?,
+        env.clone(),
+    )
+    .await?;
+    if cancel.status_code() != 200 {
+        return Ok(cancel);
+    }
+    let cancel_value: serde_json::Value = cancel.json().await?;
+    if cancel_value.get("success") != Some(&json!(true)) {
+        return Response::from_json(&cancel_value);
+    }
+    let mut clear =
+        webui::queue_actions::handle(forwarded_request(&req, "/api/queue/clear", None)?, env)
+            .await?;
+    if clear.status_code() != 200 {
+        return Ok(clear);
+    }
+    let clear_value: serde_json::Value = clear.json().await?;
+    if clear_value.get("success") != Some(&json!(true)) {
+        return Response::from_json(&clear_value);
+    }
+    // native `queue_cancel` の応答 (= cancel の成功応答と同じ形)。
+    Response::from_json(&cancel_value)
+}
+
+/// native `src/web/state.rs::ConfirmRunningTasksBody`。
+#[derive(Debug, serde::Deserialize)]
+struct ConfirmRunningTasksBody {
+    #[serde(default)]
+    rerun: Option<String>,
+}
+
+/// POST /api/confirm_running_tasks — native `src/web/jobs.rs::
+/// confirm_running_tasks`: `rerun == "true"` なら停止時に running だった
+/// ジョブの復元 (`/api/restore_pending_tasks`)、それ以外は延期
+/// (`/api/defer_restore_pending_tasks`)。応答形も下段のまま native と一致
+/// (`{"status":"ok"[, "count"]}` / 失敗時 `{"error": ...}` を 200 で)。
+async fn api_confirm_running_tasks(mut req: Request, env: Env) -> Result<Response> {
+    if req.method() != Method::Post {
+        return Response::error("Method Not Allowed", 405);
+    }
+    if let Some(response) = auth_failure(&req, &env).await {
+        return response;
+    }
+    let body: ConfirmRunningTasksBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return json_error(400, "bad_request", Some("invalid JSON body")),
+    };
+    let path = if body.rerun.as_deref() == Some("true") {
+        "/api/restore_pending_tasks"
+    } else {
+        "/api/defer_restore_pending_tasks"
+    };
+    // 下段は本文を読まないので無本文で再ディスパッチする。
+    let forwarded = forwarded_request(&req, path, None)?;
+    webui::queue_actions::handle(forwarded, env).await
+}
+
+/// GET /api/log/recent — native `src/web/misc.rs::recent_logs`
+/// (`{"logs": [...]}`)。worker には PushServer のログバッファが無い
+/// (`webui/read_views.rs` の `console_history` と同じ扱い): 保持している
+/// ログが無いので空配列を返す = 「直近ログ 0 件」という事実。偽の行は
+/// 返さないし、UI のログ欄を 501 で壊さない。
+async fn api_log_recent(req: Request, env: Env) -> Result<Response> {
+    if !matches!(req.method(), Method::Get | Method::Head) {
+        return Response::error("Method Not Allowed", 405);
+    }
+    if let Some(response) = auth_failure(&req, &env).await {
+        return response;
+    }
+    Response::from_json(&json!({ "logs": [] }))
+}
+
+/// GET /api/validate_url_regexp_list — native `src/web/misc.rs::
+/// validate_url_regexp_list`: 全サイト定義 (bundle + ユーザー定義) の URL
+/// 検証正規表現を 1 つの JSON 配列で返す。native の
+/// `site_definitions.url_patterns_for_validation()` と同じ flat_map。
+async fn api_validate_url_regexp_list(req: Request, env: Env) -> Result<Response> {
+    if !matches!(req.method(), Method::Get | Method::Head) {
+        return Response::error("Method Not Allowed", 405);
+    }
+    if let Some(response) = auth_failure(&req, &env).await {
+        return response;
+    }
+    let runtime = match WorkerRuntime::build_ui(&env).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            console_log!("service composition failed: {error}");
+            return Response::error("Service unavailable", 503);
+        }
+    };
+    let settings = match crate::bundled_sites::load_site_settings(&runtime.objects()).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            // native は定義を起動時スナップショットから読むが、worker は
+            // ユーザー定義をオブジェクトストアから読む。読めないときに空を
+            // 返すと正規表現検証が全滅する (通す誤判定) ので 503。
+            console_log!("site definitions unavailable: {error}");
+            return Response::error("Service unavailable", 503);
+        }
+    };
+    let patterns = settings
+        .iter()
+        .flat_map(|setting| setting.url_patterns_for_validation())
+        .collect::<Vec<_>>();
+    Response::from_json(&json!(patterns))
+}
+
+/// native `src/web/jobs.rs` の `TRANSPARENT_GIF` (1x1 透明 GIF)。
+const TRANSPARENT_GIF: &[u8] = &[
+    71, 73, 70, 56, 57, 97, 1, 0, 1, 0, 128, 0, 0, 0, 0, 0, 255, 255, 255, 33, 249, 4, 1, 0, 0, 0,
+    0, 44, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 68, 1, 0, 59,
+];
+
+/// GET /api/downloadable.gif — native `src/web/jobs.rs::
+/// api_downloadable_gif`。native は `target` の登録状態を計算した値を
+/// 破棄して (`let _number`) 常に同じ透明 GIF を返すので、worker もクエリ
+/// を問わず同じバイト列を返す (native の画像切替未実装と同じ挙動)。
+async fn api_downloadable_gif(req: Request, env: Env) -> Result<Response> {
+    if !matches!(req.method(), Method::Get | Method::Head) {
+        return Response::error("Method Not Allowed", 405);
+    }
+    if let Some(response) = auth_failure(&req, &env).await {
+        return response;
+    }
+    let mut response = Response::from_bytes(TRANSPARENT_GIF.to_vec())?;
+    response.headers_mut().set("content-type", "image/gif")?;
+    response
+        .headers_mut()
+        .set("cache-control", "no-store")?;
+    Ok(response)
 }
 
 /// POST /api/admin/object-migration — D1 のオブジェクトを S3 へ写す (P0 の移行)。
@@ -967,6 +1317,13 @@ async fn api_object_migration(mut req: Request, env: Env) -> Result<Response> {
     }
 }
 
+/// ブラウザ用トークン Cookie の名前 (migration plan §3.2)。
+const AUTH_COOKIE_NAME: &str = "narou_api_token";
+
+/// Worker 専用のログインページ。assets には置かない (`/login` は assets に
+/// 無いので Worker が受ける)。
+const LOGIN_PAGE: &str = include_str!("login.html");
+
 /// 認証の判定結果。「トークンが要る」と「トークン未設定」を区別する。
 ///
 /// 未設定を単なる 401 にすると、デプロイ直後の「トークンを入れ忘れた」状態が
@@ -1007,18 +1364,61 @@ async fn auth_state(req: &Request, env: &Env) -> AuthState {
     let Some(secret) = token else {
         return AuthState::NotConfigured;
     };
-    let expected = format!("Bearer {secret}");
-    let Ok(actual) = req.headers().get("authorization") else {
-        return AuthState::Required;
-    };
-    let Some(actual) = actual else {
-        return AuthState::Required;
-    };
-    if actual.as_bytes().ct_eq(expected.as_bytes()).into() {
-        AuthState::Allowed
-    } else {
-        AuthState::Required
+    if bearer_matches(req, &secret) {
+        return AuthState::Allowed;
     }
+    // ブラウザは HttpOnly Cookie でトークンを運ぶ (migration plan §3.2)。
+    // Cookie は自動で付く資格情報なので、同一オリジン検査を併せて要求する
+    // (SameSite=Lax と二重の CSRF 対策)。
+    if cookie_matches(req, &secret) && same_origin(req) {
+        return AuthState::Allowed;
+    }
+    AuthState::Required
+}
+
+/// `Authorization: Bearer <secret>` の定数時間照合。
+fn bearer_matches(req: &Request, secret: &str) -> bool {
+    let Ok(Some(actual)) = req.headers().get("authorization") else {
+        return false;
+    };
+    let expected = format!("Bearer {secret}");
+    actual.as_bytes().ct_eq(expected.as_bytes()).into()
+}
+
+/// トークン Cookie の値を復号し、`secret` と定数時間で照合する。
+/// Cookie は base64url で持つため、トークンに `;` などが含まれても壊れない。
+fn cookie_matches(req: &Request, secret: &str) -> bool {
+    use base64::Engine as _;
+
+    let Some(value) = request_cookie(req, AUTH_COOKIE_NAME) else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value.as_bytes())
+    else {
+        return false;
+    };
+    decoded.ct_eq(secret.as_bytes()).into()
+}
+
+/// `Cookie` ヘッダから 1 件だけ取り出す。
+fn request_cookie(req: &Request, name: &str) -> Option<String> {
+    let cookies = req.headers().get("cookie").ok().flatten()?;
+    cookies.split(';').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key.trim() == name).then(|| value.trim().to_string())
+    })
+}
+
+/// Cookie 認証時の同一オリジン検査。`Origin` が無いリクエスト (トップレベル
+/// 遷移や非ブラウザ) は通し、ある場合はリクエスト URL の origin と一致を要求する。
+fn same_origin(req: &Request) -> bool {
+    let Ok(Some(origin)) = req.headers().get("origin") else {
+        return true;
+    };
+    let Ok(url) = req.url() else {
+        return false;
+    };
+    url.origin().ascii_serialization() == origin
 }
 
 /// 認証を要求し、失敗していればその応答を返す。
@@ -1032,6 +1432,117 @@ async fn auth_failure(req: &Request, env: &Env) -> Option<worker::Result<Respons
             Some("NAROU_ADMIN_TOKEN is not set for this Worker"),
         )),
     }
+}
+
+/// `GET /login` — Worker 専用のログインページ。
+///
+/// 認証不要 (トークンを配る入口そのもの)。既に認証済み (Cookie / Bearer) なら
+/// `?return=` の同一サイト内パスへ戻す。`NAROU_AUTH_REQUIRED=false` の構成でも
+/// 認証済み扱いになるので UI へ戻る。
+async fn auth_login_page(req: Request, env: Env) -> Result<Response> {
+    if req.method() != Method::Get && req.method() != Method::Head {
+        return json_error(405, "method_not_allowed", None);
+    }
+    if matches!(auth_state(&req, &env).await, AuthState::Allowed) {
+        let target = login_return_target(&req);
+        let origin = req
+            .url()
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_default();
+        let url = Url::parse(&format!("{origin}{target}"))
+            .map_err(|error| Error::RustError(error.to_string()))?;
+        return Response::redirect(url);
+    }
+    Response::from_html(LOGIN_PAGE)
+}
+
+/// `?return=` の戻り先。オープンリダイレクト防止のため、同一サイト内の絶対
+/// パス (`/` で始まり `//` と `\` を含まない) だけを許可する。
+fn login_return_target(req: &Request) -> String {
+    let target = req
+        .url()
+        .ok()
+        .and_then(|url| query_param(&url, "return"));
+    match target {
+        Some(target)
+            if target.starts_with('/')
+                && !target.starts_with("//")
+                && !target.contains('\\') =>
+        {
+            target
+        }
+        _ => "/".to_string(),
+    }
+}
+
+/// `POST /api/auth/login` — ブラウザにトークン Cookie を配る。
+///
+/// Bearer を持てないブラウザ UI の入口。本文のトークンを定数時間で照合し、
+/// 一致したときだけ HttpOnly / SameSite=Lax の Cookie を設定する。API/CI の
+/// Bearer 経路と `NAROU_AUTH_REQUIRED=false` の構成は従来どおり。
+async fn api_auth_login(mut req: Request, env: Env) -> Result<Response> {
+    use base64::Engine as _;
+
+    if req.method() != Method::Post {
+        return json_error(405, "method_not_allowed", None);
+    }
+    // Cookie を付ける要求なので、他サイトのページから叩かせない。
+    if !same_origin(&req) {
+        return json_error(
+            403,
+            "cross_origin_rejected",
+            Some("login requires a same-origin request"),
+        );
+    }
+    let (required, configured, token) = auth_configuration(&env).await;
+    if !required {
+        // 認証を無効にしている構成では何も配らない (そのまま通るため)。
+        return Response::from_json(&json!({ "success": true }));
+    }
+    let Some(secret) = token else {
+        return json_error(
+            500,
+            "authentication_not_configured",
+            Some("NAROU_ADMIN_TOKEN is not set for this Worker"),
+        );
+    };
+    if !configured {
+        return json_error(
+            500,
+            "authentication_not_configured",
+            Some("NAROU_ADMIN_TOKEN is not set for this Worker"),
+        );
+    }
+    #[derive(serde::Deserialize)]
+    struct LoginBody {
+        token: String,
+    }
+    let body: LoginBody = match req.json().await {
+        Ok(body) => body,
+        Err(_) => {
+            return json_error(400, "bad_request", Some("expected {\"token\": \"...\"}"));
+        }
+    };
+    if !bool::from(body.token.as_bytes().ct_eq(secret.as_bytes())) {
+        return json_error(
+            401,
+            "authentication_required",
+            Some("管理トークンが正しくありません"),
+        );
+    }
+    let secure = req.url().map(|url| url.scheme() == "https").unwrap_or(true);
+    let mut cookie = format!(
+        "{AUTH_COOKIE_NAME}={}; Path=/; HttpOnly; SameSite=Lax",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret.as_bytes())
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    let response = worker::ResponseBuilder::new()
+        .with_header("Set-Cookie", &cookie)?
+        .with_header("Cache-Control", "no-store")?
+        .from_json(&json!({ "success": true }))?;
+    Ok(response)
 }
 
 #[event(scheduled)]

@@ -1,5 +1,7 @@
 //! Web UI の操作系エンドポイントのうち、Cloudflare Workers では原理的に
-//! 実現できないもの (native: `src/web/jobs.rs` / `src/web/feature_tour.rs`)。
+//! 実現できないもの (native: `src/web/jobs.rs` / `src/web/feature_tour.rs`。
+//! 小説本文の版履歴を要する `/api/diff*` も対象 — Worker の D1/R2 は本文を
+//! 1 世代しか持たない)。
 //!
 //! `docs/cloudflare-workers-migration-plan.md` §3.3 に従い、成功を偽装せず
 //! `501 Not Implemented` + 機械可読な `code` (`not_supported_on_worker`) を返す。
@@ -86,6 +88,28 @@ pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
         (Method::Post, "/api/storage/mode") => {
             not_supported("この Worker 環境では管理方式は D1 に固定です")
         }
+        // POST /api/diff — native は保存済みの版履歴 (novel_versions) と
+        // 作業セットの差分を取る。Worker の D1/R2 には版履歴が存在しない
+        // (本文は 1 世代だけ保持)。成功を偽装せず 501。
+        (Method::Post, "/api/diff") => {
+            not_supported("この Worker 環境では小説本文のバージョン差分は利用できません")
+        }
+        // GET /api/diff_history — 版履歴そのものが無い。
+        (Method::Get, "/api/diff_history") => {
+            not_supported("この Worker 環境ではバージョン履歴は利用できません")
+        }
+        // GET /api/diff_show — 保存済みの unified diff (履歴) が無い。
+        (Method::Get, "/api/diff_show") => {
+            not_supported("この Worker 環境では保存済み差分の表示は利用できません")
+        }
+        // POST /api/diff_restore — 過去バージョンへの復元元が無い。
+        (Method::Post, "/api/diff_restore") => {
+            not_supported("この Worker 環境ではバージョンへの復元は利用できません")
+        }
+        // POST /api/diff_merge — マージ元のバージョンが無い。
+        (Method::Post, "/api/diff_merge") => {
+            not_supported("この Worker 環境ではバージョンのマージは利用できません")
+        }
         // 担当パスだがメソッドが違う場合は native と同じく 405。
         (
             _,
@@ -99,7 +123,12 @@ pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
             | "/api/csv/import"
             | "/api/mail"
             | "/api/send"
-            | "/api/storage/mode",
+            | "/api/storage/mode"
+            | "/api/diff"
+            | "/api/diff_history"
+            | "/api/diff_show"
+            | "/api/diff_restore"
+            | "/api/diff_merge",
         ) => json_error(405, "method_not_allowed", None),
         _ => json_error(404, "not_found", Some("route is not handled by this Worker")),
     }
