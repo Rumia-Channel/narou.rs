@@ -210,13 +210,65 @@ impl NativeHttpClient {
 
     /// Synchronous entry point used by `send` inside `spawn_blocking`.
     fn send_blocking(&self, request: &HttpRequest) -> Result<HttpResponse> {
+        if request.trusted_endpoint {
+            return self.send_trusted(request);
+        }
         match request.method {
             HttpMethod::Get => match request.redirect {
                 RedirectMode::Follow => self.send_follow(request),
                 RedirectMode::Manual => self.send_manual(request),
             },
             HttpMethod::Post => self.send_post(request),
+            HttpMethod::Put | HttpMethod::Delete => self.send_trusted(request),
         }
+    }
+
+    /// Infrastructure request (object storage endpoint).
+    ///
+    /// The URL comes from the user's own configuration, so the public-address
+    /// check does not apply (a local MinIO is legitimate) and every response
+    /// header is preserved (`ETag` / `Content-Range` are part of the
+    /// object-storage contract). No site fetch tiers: object storage is a plain
+    /// HTTPS API, and the caller chooses whether redirects are followed.
+    fn send_trusted(&self, request: &HttpRequest) -> Result<HttpResponse> {
+        crate::platform::url_policy::validate_url_syntax(&request.url).map_err(io_error)?;
+        let client = match request.redirect {
+            RedirectMode::Follow => &self.client,
+            RedirectMode::Manual => &self.manual_redirect_client,
+        };
+        let mut builder = match request.method {
+            HttpMethod::Get => client.get(&request.url),
+            HttpMethod::Post => client.post(&request.url),
+            HttpMethod::Put => client.put(&request.url),
+            HttpMethod::Delete => client.delete(&request.url),
+        };
+        for (name, value) in &request.headers {
+            if !is_safe_header_value(value) {
+                return Err(io_error("unsafe header value"));
+            }
+            builder = builder.header(name, value);
+        }
+        if let Some(body) = &request.body {
+            builder = builder.body(body.clone());
+        }
+        let response = builder.send().map_err(|e| NarouError::Http(e.to_string()))?;
+        let status = response.status().as_u16();
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let body = read_response_bytes(response)?;
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
     }
 
     /// Follow-mode GET: tiered curl → reqwest → subprocess fallback.

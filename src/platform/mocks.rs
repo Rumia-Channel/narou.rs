@@ -29,6 +29,8 @@ pub struct MockHttpClient {
     requests: Mutex<Vec<String>>,
     /// Full request heads (url + headers) so tests can assert what was sent.
     sent: Mutex<Vec<RequestHead>>,
+    /// Bodies of the sent requests, aligned with `sent`.
+    bodies: Mutex<Vec<Option<Vec<u8>>>>,
 }
 
 /// One sent request head: `(url, headers)` in send order.
@@ -69,6 +71,11 @@ impl MockHttpClient {
     pub fn sent_requests(&self) -> Vec<RequestHead> {
         self.sent.lock().clone()
     }
+
+    /// Bodies of the requests sent so far, aligned with [`Self::sent_requests`].
+    pub fn sent_bodies(&self) -> Vec<Option<Vec<u8>>> {
+        self.bodies.lock().clone()
+    }
 }
 
 impl HttpClient for MockHttpClient {
@@ -77,6 +84,7 @@ impl HttpClient for MockHttpClient {
             self.sent
                 .lock()
                 .push((request.url.clone(), request.headers.clone()));
+            self.bodies.lock().push(request.body.clone());
             self.requests
                 .lock()
                 .push(format!("{} {}", method_name(request.method), request.url));
@@ -93,6 +101,8 @@ fn method_name(method: HttpMethod) -> &'static str {
     match method {
         HttpMethod::Get => "GET",
         HttpMethod::Post => "POST",
+        HttpMethod::Put => "PUT",
+        HttpMethod::Delete => "DELETE",
     }
 }
 

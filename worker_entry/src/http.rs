@@ -257,6 +257,8 @@ impl WorkerHttpClient {
         let method = match request.method {
             HttpMethod::Get => Method::Get,
             HttpMethod::Post => Method::Post,
+            HttpMethod::Put => Method::Put,
+            HttpMethod::Delete => Method::Delete,
         };
         let redirect = match request.redirect {
             RedirectMode::Follow => RequestRedirect::Follow,
@@ -351,7 +353,10 @@ impl HttpClient for WorkerHttpClient {
             // それでも 2xx/3xx が得られないときは SORAHOST リレー (設定済みの
             // 場合のみ) で最後に取り直す。GET のみ (encoder が GET しか
             // 組み立てない)。
-            let response = if fetch_response.status == 403 && request.method == HttpMethod::Get {
+            let response = if fetch_response.status == 403
+                && request.method == HttpMethod::Get
+                && !request.trusted_endpoint
+            {
                 match self.send_via_socket(&request).await {
                     // 通常の応答が取れたときだけ採用する。
                     Ok(socket_response)

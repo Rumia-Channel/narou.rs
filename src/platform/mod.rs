@@ -29,6 +29,7 @@ pub mod relay;
 pub mod repository;
 pub mod s3_request;
 pub mod s3_sigv4;
+pub mod s3_store;
 pub mod split_store;
 pub mod store_migration;
 pub mod url_policy;
@@ -54,6 +55,7 @@ pub use rate_limiter::{
     normalize_wait_steps,
 };
 pub use s3_request::{object_size, parse_content_range_size};
+pub use s3_store::{S3Store, S3StoreConfig, MAX_OBJECT_BYTES, SMALL_CAP};
 pub use repository::{
     NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, NovelSort, NovelSortKey,
     SearchField, SearchTerm, resolve_update_scan_sort,
