@@ -995,4 +995,8 @@ pub enum IllustSubcommand {
     Migrate,
     FixExt,
     Rebuild,
+    /// 挿絵をローカルから S3 互換ストレージへ写す (既定 dry-run)。
+    S3Push,
+    /// ローカルと S3 の挿絵を突き合わせる。
+    S3Verify,
 }

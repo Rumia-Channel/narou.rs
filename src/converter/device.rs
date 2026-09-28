@@ -816,6 +816,12 @@ impl OutputManager {
         output_ext: &str,
     ) -> Result<PathBuf> {
         let context = self.lite_epub.clone().unwrap_or_default();
+        // 挿絵を S3 に置く構成ではローカルに実体が無い。EPUB 生成はファイルを
+        // 要求するので、ここで取り出し、この関数を抜ける時点で片付ける。
+        let novel_dir = input_txt.parent().unwrap_or(input_txt);
+        let _materialized = crate::native::illustrations::Materialized::new(
+            crate::native::illustrations::materialize_blocking(novel_dir)?,
+        );
         // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
         let options = crate::epub_lite::EpubBuildOptions {
             title: context.title.clone(),

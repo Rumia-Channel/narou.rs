@@ -6,7 +6,7 @@
 //!
 //! 取り出したファイルは呼び出し側が使い終わったら消す。ローカルに残すと
 //! S3 へ逃がした意味が無くなるため、[`materialize`] は自分が取り出したパス
-//! だけを返し、[`remove`] がそれを片付ける。
+//! だけを返し、[`Materialized`] がスコープを抜けた時点で片付ける。
 
 use std::io::Write;
 use std::num::NonZeroUsize;
@@ -14,19 +14,27 @@ use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
 
-use crate::db::novel_record::NovelRecord;
 use crate::error::Result;
-use crate::platform::{NovelObjectKeys, ObjectListRequest, ObjectPrefix};
+use crate::platform::split_store::ILLUSTRATION_SEGMENT;
+use crate::platform::{ObjectListRequest, ObjectPrefix};
 
-/// 小説 1 件分の挿絵を取り出す。ローカル保存の構成では何もしない。
-pub async fn materialize(record: &NovelRecord, novel_dir: &Path) -> Result<Vec<PathBuf>> {
-    let stores = crate::native::object_store::NativeStores::for_current_root()?;
-    if stores.s3.is_none() {
+/// 小説ディレクトリ 1 件分の挿絵を取り出す。
+///
+/// 挿絵がローカルにある構成では、対象が既に存在するので何も取り出さない
+/// (戻り値は空)。
+pub async fn materialize(novel_dir: &Path) -> Result<Vec<PathBuf>> {
+    let inventory = crate::db::inventory::Inventory::with_default_root()?;
+    let archive_root = inventory
+        .root_dir()
+        .join(crate::downloader::types::ARCHIVE_ROOT_DIR);
+    let Some(novel_key) =
+        crate::native::object_store::logical_key_for_native_path(&archive_root, novel_dir)
+    else {
         return Ok(Vec::new());
-    }
-    let keys = NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)?;
-    let prefix = ObjectPrefix::new(keys.prefix().join(crate::platform::split_store::ILLUSTRATION_SEGMENT)?.as_ref())?;
-    let local_dir = novel_dir.join(crate::platform::split_store::ILLUSTRATION_SEGMENT);
+    };
+    let stores = crate::native::object_store::NativeStores::for_narou_root(inventory.root_dir())?;
+    let prefix = ObjectPrefix::new(novel_key.join(ILLUSTRATION_SEGMENT)?.as_ref())?;
+    let local_dir = novel_dir.join(ILLUSTRATION_SEGMENT);
 
     let mut materialized = Vec::new();
     let mut cursor: Option<String> = None;
@@ -66,6 +74,15 @@ pub async fn materialize(record: &NovelRecord, novel_dir: &Path) -> Result<Vec<P
     Ok(materialized)
 }
 
+/// 同期文脈 (converter) から [`materialize`] を呼ぶ。
+pub fn materialize_blocking(novel_dir: &Path) -> Result<Vec<PathBuf>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| crate::error::NarouError::Platform(error.to_string()))?;
+    runtime.block_on(materialize(novel_dir))
+}
+
 /// [`materialize`] が取り出したファイルを片付ける。
 pub fn remove(paths: &[PathBuf]) {
     for path in paths {
@@ -75,8 +92,8 @@ pub fn remove(paths: &[PathBuf]) {
 
 /// 取り出したファイルを、スコープを抜けた時点で必ず片付けるガード。
 ///
-/// EPUB 生成は途中で失敗しうる (`?` で抜ける) ので、呼び出し側で
-/// 明示的に消す代わりにこれを持たせる。
+/// EPUB 生成は途中で失敗しうる (`?` で抜ける) ので、呼び出し側で明示的に
+/// 消す代わりにこれを持たせる。
 pub struct Materialized(Vec<PathBuf>);
 
 impl Materialized {
