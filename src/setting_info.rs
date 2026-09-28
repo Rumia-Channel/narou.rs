@@ -109,7 +109,14 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "convert.dc-subject-exclude-tags"
         | "convert.rotate-image"
         | "send.without-freeze"
-        | "auto-add-tags" => Some("general"),
+        | "auto-add-tags"
+        | "s3.asset-backend"
+        | "s3.endpoint"
+        | "s3.bucket"
+        | "s3.region"
+        | "s3.prefix"
+        | "s3.access-key-id"
+        | "s3.secret-access-key" => Some("general"),
 
         // local → detail
         "hotentry.auto-mail"
@@ -964,6 +971,49 @@ pub fn setting_variables() -> SettingVariables {
             sel(
                 "EPUB の本文フォント。auto: 濁点注記のある小説だけ濁点フォント (DMincho) を使う / always: 常に DMincho を埋め込んで本文を組む (Reader が全角スペース等を描けない場合の回避策)",
                 vec!["auto", "always"],
+            ),
+        ),
+        (
+            "s3.asset-backend",
+            invis_sel(
+                "挿絵の保存先。local: ライブラリ内に保存 / s3: S3 互換ストレージ (Wasabi など) へ保存",
+                vec!["local", "s3"],
+            ),
+        ),
+        (
+            "s3.endpoint",
+            invis(
+                VarType::String,
+                "S3 互換ストレージの endpoint (例: https://s3.ap-northeast-1.wasabisys.com)。環境変数 S3_ENDPOINT でも指定可",
+            ),
+        ),
+        (
+            "s3.bucket",
+            invis(VarType::String, "S3 のバケット名。環境変数 S3_BUCKET でも指定可"),
+        ),
+        (
+            "s3.region",
+            invis(VarType::String, "S3 のリージョン (署名に必須)。環境変数 S3_REGION でも指定可"),
+        ),
+        (
+            "s3.prefix",
+            invis(
+                VarType::String,
+                "バケット内の接頭辞 (例: narou/library)。環境変数 S3_PREFIX でも指定可",
+            ),
+        ),
+        (
+            "s3.access-key-id",
+            invis(
+                VarType::String,
+                "S3 のアクセスキー ID。環境変数 S3_ACCESS_KEY_ID でも指定可",
+            ),
+        ),
+        (
+            "s3.secret-access-key",
+            invis(
+                VarType::String,
+                "S3 のシークレットアクセスキー。環境変数 S3_SECRET_ACCESS_KEY でも指定可",
             ),
         ),
         (
