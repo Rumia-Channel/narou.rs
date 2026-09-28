@@ -360,10 +360,49 @@ pub fn effective_site_settings() -> Vec<SiteSetting> {
 }
 /// Preprocess marker carrying one work URL of an author listing.
 const AUTHOR_NOVEL_MARKER: &str = "author_novel::";
-/// Preprocess marker carrying a series whose episodes must be left out.
+/// Preprocess marker carrying a series whose pages must be left out.
 const AUTHOR_SERIES_MARKER: &str = "author_series::";
 /// Preprocess marker carrying a comic series whose pages must be left out.
 const AUTHOR_COMIC_SERIES_MARKER: &str = "author_comic_series::";
+
+/// bundle 定義とユーザー定義を 1 件マージした実効 YAML を返す。
+///
+/// native のフォルダ読み込み (`loader::load_all_from_dirs`) と core の
+/// `SiteDefinitions::effective_runtime()` が**共有する唯一の規則**で、
+/// どちらからでも同じ結果になる:
+///
+/// - ユーザー側に `version` が無ければマージする。
+/// - 有るときは bundle 側より低ければ「bundle 勝ち」の YAML をそのまま返す
+///   (同版 `>=` 以上ならマージ)。
+/// - `name` / `version` は bundle 定義の値を常に保つ (ユーザー側では上書き不可)。
+/// - どちらかの YAML が parse できなければ bundle の YAML をそのまま返す。
+pub fn merge_user_definition_yaml(bundled_yaml: &str, user_yaml: &str) -> String {
+    let Ok(mut bundled) = serde_yaml::from_str::<serde_yaml::Value>(bundled_yaml) else {
+        return bundled_yaml.to_string();
+    };
+    let Ok(user) = serde_yaml::from_str::<serde_yaml::Value>(user_yaml) else {
+        return bundled_yaml.to_string();
+    };
+    // `version` 無しの bundle は構造体の `#[serde(default)]` と同じ 0.0 扱い。
+    let bundled_version = bundled
+        .get("version")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0);
+    let user_version = user.get("version").and_then(|value| value.as_f64());
+    if user_version.is_some_and(|version| version < bundled_version) {
+        return bundled_yaml.to_string();
+    }
+    let (Some(base), Some(incoming)) = (bundled.as_mapping_mut(), user.as_mapping()) else {
+        return bundled_yaml.to_string();
+    };
+    for (key, value) in incoming {
+        if matches!(key.as_str(), Some("name" | "version")) {
+            continue;
+        }
+        base.insert(key.clone(), value.clone());
+    }
+    serde_yaml::to_string(&bundled).unwrap_or_else(|_| bundled_yaml.to_string())
+}
 
 impl SiteSetting {
     pub fn load_all() -> Result<Vec<Self>> {

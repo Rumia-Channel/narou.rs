@@ -656,6 +656,17 @@ struct NotepadRow {
     value_json: Option<String>,
 }
 
+fn notepad_content(row: NotepadRow) -> String {
+    match row.value_yaml.as_deref() {
+        Some(yaml) if !yaml.trim().is_empty() && yaml.trim() != "{}" => yaml.to_string(),
+        _ => row
+            .value_json
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default(),
+    }
+}
+
 /// native `read_notepad` 相当: `value_yaml` の生テキストを返す。行が無い・
 /// 読めない場合は空文字列 (native の `unwrap_or_default` と同じ)。
 async fn read_notepad(env: &Env) -> String {
@@ -673,17 +684,7 @@ async fn read_notepad(env: &Env) -> String {
         Err(_) => return String::new(),
     };
     let row: Option<NotepadRow> = statement.first::<NotepadRow>(None).await.unwrap_or_default();
-    let Some(row) = row else {
-        return String::new();
-    };
-    match row.value_yaml.as_deref() {
-        Some(yaml) if !yaml.trim().is_empty() && yaml.trim() != "{}" => yaml.to_string(),
-        _ => row
-            .value_json
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_default(),
-    }
+    row.map(notepad_content).unwrap_or_default()
 }
 
 /// native `set_raw_db` と同じ SQL: `value_yaml` に生テキストを置く
@@ -693,7 +694,8 @@ async fn write_notepad(env: &Env, content: &str) -> Result<(), String> {
     let statement = db
         .prepare(
             "INSERT INTO app_state (scope, key, value_json, value_yaml) VALUES (?, ?, '{}', ?)
-             ON CONFLICT(scope, key) DO UPDATE SET value_yaml = excluded.value_yaml",
+             ON CONFLICT(scope, key) DO UPDATE SET
+               value_json = excluded.value_json, value_yaml = excluded.value_yaml",
         )
         .bind(&[
             JsValue::from_str(INVENTORY_SCOPE),
@@ -982,5 +984,25 @@ async fn version_latest() -> worker::Result<Response> {
             "message": error.to_string(),
             "url": url_fallback,
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NotepadRow, notepad_content};
+
+    #[test]
+    fn cleared_canonical_notepad_value_cannot_fall_back_to_stale_json() {
+        let legacy = notepad_content(NotepadRow {
+            value_yaml: Some("{}".to_string()),
+            value_json: Some(r#""old note""#.to_string()),
+        });
+        assert_eq!(legacy, "old note");
+
+        let cleared = notepad_content(NotepadRow {
+            value_yaml: Some(String::new()),
+            value_json: Some("{}".to_string()),
+        });
+        assert_eq!(cleared, "");
     }
 }
