@@ -7,6 +7,7 @@
 //! performs the actual work.
 
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
 
 use chrono::{DateTime, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc};
@@ -73,14 +74,14 @@ impl Schedule {
 }
 
 /// The auto-update policy: whether it is enabled, which targets it covers,
-/// and how often it runs.
+/// and its daily schedule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoUpdatePolicy {
     pub enabled: bool,
     /// Target selection: `All` updates every non-frozen novel; `Tag` updates
     /// novels carrying any of the given tags.
     pub targets: AutoUpdateTargets,
-    /// How often to run: at fixed daily times, or every `interval`.
+    /// The daily times when it runs.
     pub schedule: AutoUpdateSchedule,
 }
 
@@ -93,13 +94,11 @@ pub enum AutoUpdateTargets {
     Tag(Vec<String>),
 }
 
-/// How often the auto-update runs.
+/// Daily schedule for auto-update runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoUpdateSchedule {
     /// At fixed daily times (parsed from `update.auto-schedule`).
     Daily(Schedule),
-    /// Every `interval` (parsed from `update.interval`).
-    Interval(Duration),
 }
 
 /// The decision for one check: whether to run now, and when the next run is.
@@ -129,29 +128,15 @@ impl SchedulerService {
         Schedule::parse(schedule)
     }
 
-    /// Build an [`AutoUpdatePolicy`] from the raw setting values.
+    /// Build an [`AutoUpdatePolicy`] from a parsed daily schedule and targets.
     ///
-    /// `schedule_string` is the `update.auto-schedule` value (comma-separated
-    /// `HHMM` times); `interval_secs` is the `update.interval` value in
-    /// seconds, used when no fixed times are configured. `tags` selects the
-    /// `Tag` target mode; an empty tag list falls back to `All`.
+    /// An empty schedule is never due. An empty tag list falls back to `All`.
     pub fn policy(
         &self,
         enabled: bool,
-        schedule_string: &str,
-        interval_secs: Option<f64>,
+        schedule: Schedule,
         tags: Vec<String>,
     ) -> AutoUpdatePolicy {
-        let schedule = Schedule::parse(schedule_string);
-        let schedule = if schedule.is_enabled() {
-            AutoUpdateSchedule::Daily(schedule)
-        } else {
-            let secs = interval_secs
-                .filter(|value| value.is_finite())
-                .unwrap_or(0.0)
-                .max(0.0);
-            AutoUpdateSchedule::Interval(Duration::from_secs_f64(secs))
-        };
         let targets = if tags.is_empty() {
             AutoUpdateTargets::All
         } else {
@@ -160,7 +145,7 @@ impl SchedulerService {
         AutoUpdatePolicy {
             enabled,
             targets,
-            schedule,
+            schedule: AutoUpdateSchedule::Daily(schedule),
         }
     }
 
@@ -174,8 +159,6 @@ impl SchedulerService {
     }
 
     /// Decide using the configured IANA timezone for daily HHMM schedules.
-    /// Interval schedules remain absolute durations and therefore ignore the
-    /// timezone argument.
     pub fn decide_in_timezone(
         &self,
         policy: &AutoUpdatePolicy,
@@ -201,13 +184,7 @@ impl SchedulerService {
                 };
                 (run_now, next)
             }
-            AutoUpdateSchedule::Interval(interval) => {
-                let interval_delta = chrono::TimeDelta::from_std(*interval)
-                    .unwrap_or_else(|_| chrono::TimeDelta::try_seconds(i64::MAX).unwrap());
-                let due = last_run.is_none_or(|last| now - last >= interval_delta);
-                let next = last_run.map(|last| last + *interval);
-                (due, next)
-            }
+
         };
 
         ScheduleDecision {
@@ -382,35 +359,6 @@ mod tests {
         assert_eq!(decision.next_run, Some(utc(2026, 1, 2, 8, 0)));
     }
 
-    #[test]
-    fn interval_schedule_runs_when_interval_elapsed() {
-        let policy = AutoUpdatePolicy {
-            enabled: true,
-            targets: AutoUpdateTargets::All,
-            schedule: AutoUpdateSchedule::Interval(Duration::from_secs(3600)),
-        };
-        let last_run = utc(2026, 1, 1, 8, 0);
-        let now = utc(2026, 1, 1, 9, 0);
-        let service = service_at(now.timestamp());
-        let decision = service.decide(&policy, Some(last_run));
-        assert!(decision.run_now);
-        assert_eq!(decision.next_run, Some(utc(2026, 1, 1, 9, 0)));
-    }
-
-    #[test]
-    fn interval_schedule_not_due_before_interval() {
-        let policy = AutoUpdatePolicy {
-            enabled: true,
-            targets: AutoUpdateTargets::All,
-            schedule: AutoUpdateSchedule::Interval(Duration::from_secs(3600)),
-        };
-        let last_run = utc(2026, 1, 1, 8, 0);
-        let now = utc(2026, 1, 1, 8, 30);
-        let service = service_at(now.timestamp());
-        let decision = service.decide(&policy, Some(last_run));
-        assert!(!decision.run_now);
-        assert_eq!(decision.next_run, Some(utc(2026, 1, 1, 9, 0)));
-    }
 
     #[test]
     fn disabled_policy_never_runs() {
@@ -462,21 +410,25 @@ mod tests {
     }
 
     #[test]
-    fn policy_builds_from_raw_settings() {
+    fn policy_builds_from_schedule_and_targets() {
         let service = service_at(0);
-        let policy = service.policy(true, "0800,1200", Some(0.7), vec!["modified".into()]);
+        let policy = service.policy(true, Schedule::parse("0800,1200"), vec!["modified".into()]);
         assert!(policy.enabled);
         assert_eq!(policy.targets, AutoUpdateTargets::Tag(vec!["modified".into()]));
         assert_eq!(
             policy.schedule,
             AutoUpdateSchedule::Daily(Schedule::parse("0800,1200"))
         );
+    }
 
-        let policy = service.policy(true, "", Some(0.7), vec![]);
-        assert_eq!(
-            policy.schedule,
-            AutoUpdateSchedule::Interval(Duration::from_secs_f64(0.7))
-        );
-        assert_eq!(policy.targets, AutoUpdateTargets::All);
+    #[test]
+    fn empty_or_invalid_schedules_never_run() {
+        let service = service_at(utc(2026, 1, 1, 10, 0).timestamp());
+        for schedule in ["", "9999"] {
+            let policy = service.policy(true, Schedule::parse(schedule), vec![]);
+            let decision = service.decide(&policy, None);
+            assert!(!decision.run_now, "schedule {schedule:?} ran unexpectedly");
+            assert_eq!(decision.next_run, None);
+        }
     }
 }
