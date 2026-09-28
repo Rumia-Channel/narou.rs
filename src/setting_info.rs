@@ -110,6 +110,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "convert.rotate-image"
         | "send.without-freeze"
         | "convert.section-cache"
+        | "convert.keep-txt"
         | "auto-add-tags"
         | "s3.asset-backend"
         | "s3.endpoint"
@@ -766,6 +767,13 @@ pub fn setting_variables() -> SettingVariables {
             sel(
                 "EPUB 変換時の挿絵自動回転 (AozoraEpub3 の RotateImage 相当)。auto: AozoraEpub3.ini の設定に従う / 0: 回転しない / 1: 横長を右へ90° / 2: 横長を左へ90°。組み込みエンジン・外部 AozoraEpub3_Lite.exe・Worker に効く (Java 版 AozoraEpub3.jar は INI 差し替えが出来ないため対象外)",
                 vec!["auto", "0", "1", "2"],
+            ),
+        ),
+        (
+            "convert.keep-txt",
+            vis(
+                VarType::Boolean,
+                "変換した txt をファイルとして残す (既定 true)。false では SQLite の変換済みテキストだけを残し、Web UI の EPUB はそこから生成する (環境変数 NAROU_RS_KEEP_TXT=0 でも切れる)",
             ),
         ),
         (

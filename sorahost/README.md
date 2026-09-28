@@ -124,13 +124,16 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
 - 挿絵を S3 に置くと、ローカルのミラーと `db.sqlite` の両方から消える (この構成で -73 MB)
 - `start.sh` は `convert.section-cache=false` を設定する。無効にすると変換のたびに
   全話を変換し直す代わりに、容量を使わない (有効時の実測で 1 作品あたり約 1.5 MB)
-- `start.sh` は初回に `economy=nosave_diff` と `convert.no-epub=true` を入れる。
-  前者は更新のたびに作られる差分スナップショット (実測 1 作品で 6.7 MB) を止め、
-  後者は保存 EPUB (テキスト作品で 2 MB、画像主体で 40〜55 MB) を止める。
-  Web UI の「EPUB をダウンロード」は保存済みテキストから都度生成するので影響しない
-- さらに削るなら `narou setting economy=nosave_raw` を足す (raw HTML を保存しない)。
-  実測 1 作品あたり 19 MB と大きいが、挿絵の再ローカライズと `narou illust rebuild` が
-  raw/*.html を見られなくなる
+- `start.sh` は初回に `economy=nosave_diff,nosave_raw` / `convert.no-epub=true` /
+  `convert.keep-txt=false` を入れる。止まるものと実測 (1 作品あたり):
+  - 差分スナップショット (`nosave_diff`): 6.7 MB
+  - raw HTML (`nosave_raw`): 19.4 MB。挿絵のローカライズは取得時にメモリ上の HTML で
+    行うので、新規話の挿絵は従来どおり保存される
+  - 保存 EPUB (`no-epub`): テキスト作品で 2 MB、画像主体で 40〜55 MB
+  - txt (`keep-txt`): 5.2 MB。変換結果は SQLite に残り、Web UI の
+    「EPUB をダウンロード」はそこから都度生成する
+- 挿絵の削除を伴う `narou illust orphan -f` は、raw が無い構成ではキャッシュを唯一の
+  参照源にする (キャッシュは保存時に必ず書かれるが、これを失っていると孤児と判定される)
 - **古い出力ファイルは残る**: 出力名の設定 (`convert.filename-to-ncode` や
   `[作者名]` 接頭辞) を変えると、同じ本文の `novel.txt` / `.epub` が別名で増える。
   手元のライブラリをそのまま持ち込むと重複を引き継ぐので、気になる場合は削除する

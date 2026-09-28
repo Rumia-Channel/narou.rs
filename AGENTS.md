@@ -522,9 +522,24 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   ライブラリ全体が対象で、`s3.asset-backend=s3` と接続情報が必要
   (`platform::store_migration::migrate_page` を共有)。
 - **SORAHOST の既定は容量優先**: `sorahost/start.sh` が初回に `convert.section-cache=false`
-  (話ごとの変換キャッシュ無し)・`economy=nosave_diff` (更新ごとの差分スナップショット無し)・
-  `convert.no-epub=true` (EPUB を保存しない。Web UI のダウンロードは都度生成) を入れる。
-  さらに削る場合は `economy=nosave_raw` (raw HTML を保存しない) を利用者が選ぶ。
+  (話ごとの変換キャッシュ無し)・`economy=nosave_diff,nosave_raw` (更新ごとの差分スナップショットと
+  raw HTML を保存しない)・`convert.no-epub=true` (EPUB を保存しない)・`convert.keep-txt=false`
+  (txt を残さない) を入れる。どちらも Web UI の EPUB ダウンロードは SQLite の変換済みテキスト
+  (`novel_outputs`) から都度生成するので影響しない。
+- **生データ (raw HTML) を保存しない構成**:
+  - `DownloaderSettings::save_raw_html()` が唯一の判定。native は `economy` に `nosave_raw` が
+    あれば false、**Worker は常に false** (`WorkerDownloaderSettings` / `SnapshotDownloaderSettings`)。
+    raw は取得時にメモリ上にある HTML を使って挿絵を走査するので、保存を切っても新規話の挿絵は
+    従来どおりローカライズされる。保存済み raw を読むのは `narou illust orphan` /
+    `rebuild` / mitemin 移行だけで、いずれも raw が無ければ「参照が減る」方向に倒れる
+    (キャッシュ由来の到達可能性は変わらない)。
+  - 挿絵の削除を伴う `illust orphan -f` を raw 無しで使うと、キャッシュに載っていない
+    挿絵は孤児と判定される点に注意 (キャッシュは保存時に必ず書かれる)。
+- **変換済みテキストを保存しない構成** (`convert.keep-txt`、既定 true。環境変数
+  `NAROU_RS_KEEP_TXT=0` でも切れる): native は `novel.txt` の固定名ミラーを書かず、変換後の
+  txt を変換コマンドが削除する (結果は SQLite の `novel_outputs` に残る)。Worker は
+  `ConvertService::convert_only` で保存せず、`GET /api/novels/{id}/download.epub` が
+  保存済みセクションから組み立て直す (ダウンロードのたびに変換の CPU を払う)。
 - **話ごとの変換キャッシュは容量の厳しい環境で切れる**: `convert.section-cache`
   (local 設定、既定 true、環境変数 `NAROU_RS_SECTION_CACHE=0` で無効)。無効時は読み書きせず、flush 時に既存の
   `section_convert_cache/<id>.yaml` を削除する (再有効化しても壊れない)。既定では

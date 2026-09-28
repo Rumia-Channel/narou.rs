@@ -107,6 +107,9 @@ pub struct NovelConverter {
     section_cache: HashMap<String, render::ConvertedSection>,
     #[cfg(feature = "native-runtime")]
     section_convert_cache: SectionConvertCache,
+    /// 直近の変換で書いた txt のパス (`convert.keep-txt=false` の後始末用)。
+    #[cfg(feature = "native-runtime")]
+    last_text_path: Option<std::path::PathBuf>,
     progress: Option<Box<dyn ProgressReporter>>,
     inspector: Rc<RefCell<inspector::Inspector>>,
     display_inspector: bool,
@@ -144,6 +147,21 @@ impl Default for SectionConvertCache {
             enabled: section_cache_enabled(),
         }
     }
+}
+
+/// 変換済みテキストをファイルとして残すか (`convert.keep-txt`、既定 true)。
+///
+/// false のときは `novel.txt` の固定名ミラーを書かず、呼び出し側が変換後の
+/// txt を削除する。変換結果そのものは SQLite の `novel_outputs` に残るので、
+/// Web UI のオンデマンド EPUB はそのまま動く (二重に持たないための設定)。
+/// 環境変数 `NAROU_RS_KEEP_TXT=0` でも切れる。
+#[cfg(feature = "native-runtime")]
+pub fn keep_converted_text_file() -> bool {
+    if let Ok(value) = std::env::var("NAROU_RS_KEEP_TXT") {
+        let value = value.trim().to_ascii_lowercase();
+        return !matches!(value.as_str(), "0" | "false" | "no" | "off");
+    }
+    crate::compat::load_local_setting_bool_or("convert.keep-txt", true)
 }
 
 /// セクション変換キャッシュを作るか。
@@ -238,6 +256,8 @@ impl NovelConverter {
             section_cache: HashMap::new(),
             #[cfg(feature = "native-runtime")]
             section_convert_cache: SectionConvertCache::default(),
+            #[cfg(feature = "native-runtime")]
+            last_text_path: None,
             progress: None,
             inspector,
             display_inspector: false,
@@ -294,6 +314,13 @@ impl NovelConverter {
 
     pub fn take_inspection_output(&mut self) -> Option<String> {
         self.last_inspection_output.take()
+    }
+
+    /// 直近の変換で書いた txt のパス。`convert.keep-txt=false` のとき
+    /// 呼び出し側がこれを削除する。
+    #[cfg(feature = "native-runtime")]
+    pub fn last_converted_text_path(&self) -> Option<&std::path::Path> {
+        self.last_text_path.as_deref()
     }
 
     pub fn convert_novel(&mut self, toc: &TocObject, sections: &[SectionFile]) -> Result<String> {
@@ -1000,12 +1027,19 @@ impl NovelConverter {
             record.as_ref(),
         );
         std::fs::write(&txt_path, &aozora_text)?;
+        #[cfg(feature = "native-runtime")]
+        {
+            self.last_text_path = Some(txt_path.clone());
+        }
         #[cfg(feature = "lite")]
         {
             // Fixed-name mirror so the portable object-store layout (and the
             // Worker's download-time EPUB) can address the text without the
-            // per-title output naming rules.
-            let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
+            // per-title output naming rules. `convert.keep-txt=false` では
+            // SQLite 側の `converted_text` だけを残す。
+            if keep_converted_text_file() {
+                let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
+            }
             if !crate::native::sqlite::state::legacy_yaml_active() {
                 let narou_dir = novel_dir
                     .ancestors()
@@ -1097,9 +1131,15 @@ impl NovelConverter {
             record.as_ref(),
         );
         std::fs::write(&txt_path, &aozora_text)?;
+        #[cfg(feature = "native-runtime")]
+        {
+            self.last_text_path = Some(txt_path.clone());
+        }
         #[cfg(feature = "lite")]
         {
-            let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
+            if keep_converted_text_file() {
+                let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
+            }
             // P4a/P4b mirror: converted text + mirrored working set + version
             // snapshot live in the SQLite backend when active.
             if !crate::native::sqlite::state::legacy_yaml_active() {

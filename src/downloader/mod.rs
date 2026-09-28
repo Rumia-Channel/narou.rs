@@ -2065,9 +2065,13 @@ impl Downloader {
                 } else {
                     pending_section_hashes.insert(relative_path, digest);
                 }
-                self.persistence
-                    .save_raw(&object_keys, subtitle, &raw_html)
-                    .await?;
+                // 生データの保存は環境で切れる (Worker は常に切る)。
+                // 挿絵の走査はこの直後、メモリ上の raw_html で行う。
+                if self.settings.save_raw_html() {
+                    self.persistence
+                        .save_raw(&object_keys, subtitle, &raw_html)
+                        .await?;
+                }
                 if let Some(store) = illustration_store.as_mut() {
                     self.download_illustration(
                         &setting,
@@ -2904,7 +2908,11 @@ mod tests {
     use crate::platform::mocks::{
         FakeRateLimiter, MemoryNovelRepository, MemoryObjectStore, MockHttpClient,
     };
-    use crate::platform::{AssetStore, NovelMutation, NovelObjectKeys, ObjectStore, SystemClock};
+    use crate::downloader::settings::DownloaderSettings;
+    use crate::platform::{
+        AssetStore, NovelMutation, NovelObjectKeys, ObjectListRequest, ObjectPrefix, ObjectStore,
+        SystemClock,
+    };
     use chrono::TimeZone;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -3131,6 +3139,105 @@ mod tests {
             "テスト作品"
         );
         assert_eq!(http.request_count(), 2);
+    }
+
+    /// 設定ポートが生データを拒否したら `raw/*.html` を保存しないこと。
+    /// (Worker は常に拒否し、native は `economy: nosave_raw` で拒否する)
+    #[tokio::test]
+    async fn raw_html_is_skipped_when_the_settings_disable_it() {
+        struct NoRawSettings;
+
+        impl DownloaderSettings for NoRawSettings {
+            fn save_raw_html(&self) -> bool {
+                false
+            }
+        }
+
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            r#"
+name: No Raw Test
+domain: example.com
+top_url: https://example.com
+url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+sitename: No Raw Test
+toc_url: 'https://example.com/\k<ncode>/'
+subtitles: |-
+  <a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a>
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+is_narou: false
+"#,
+        )
+        .unwrap();
+        setting.compile();
+
+        let target = "https://example.com/n1234ab/";
+        let http = Arc::new(MockHttpClient::new());
+        http.add_text(
+            target,
+            200,
+            r#"
+<h1>No Raw Test</h1><span>Author</span>
+<a href="/n1234ab/1/">第1話</a>
+"#,
+        );
+        http.add_text(
+            "https://example.com/n1234ab/1/",
+            200,
+            r#"<div class="body">本文1</div>"#,
+        );
+
+        let store = Arc::new(MemoryObjectStore::new());
+        let objects: Arc<dyn ObjectStore> = store.clone();
+        let assets: Arc<dyn AssetStore> = store;
+        let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+            DownloaderPlatform {
+                http: http.clone(),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new()),
+                objects: objects.clone(),
+                assets,
+                clock: Arc::new(SystemClock),
+            },
+            vec![setting],
+            HashMap::new(),
+            Arc::new(NoRawSettings),
+        )
+        .unwrap();
+
+        downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: true,
+                    budget: None,
+                    resume_from_section: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let page = objects
+            .list_page(&ObjectListRequest::new(
+                ObjectPrefix::new("").unwrap(),
+                std::num::NonZeroUsize::new(500).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let keys: Vec<String> = page
+            .objects
+            .iter()
+            .map(|metadata| metadata.key.as_ref().to_string())
+            .collect();
+        assert!(
+            keys.iter().all(|key| !key.contains("/raw/")),
+            "raw HTML must not be stored: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|key| key.contains("/本文/")),
+            "sections must still be stored: {keys:?}"
+        );
     }
 
     #[tokio::test]

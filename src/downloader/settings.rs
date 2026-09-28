@@ -39,6 +39,16 @@ pub trait DownloaderSettings: Send + Sync {
         false
     }
 
+    /// Whether fetched raw HTML is stored (`raw/<話>.html`).
+    ///
+    /// narou.rb の `economy: nosave_raw` で切る。Worker は常に保存しない
+    /// (D1 を食うだけで、挿絵の再ローカライズにも差分にも使わない)。
+    /// 挿絵のローカライズは取得時のメモリ上の HTML を使うので、切っても
+    /// 新規話の挿絵は従来どおり保存される。
+    fn save_raw_html(&self) -> bool {
+        true
+    }
+
     /// Whether the novel's `setting.ini` strips bracketed title prefixes
     /// (`enable_strip_title_prefix`). Worker: no converter settings on disk,
     /// so `false`.
@@ -77,7 +87,12 @@ pub trait DownloaderSettings: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WorkerDownloaderSettings;
 
-impl DownloaderSettings for WorkerDownloaderSettings {}
+impl DownloaderSettings for WorkerDownloaderSettings {
+    /// Worker は生データを保存しない (D1 の容量を食うだけで参照されない)。
+    fn save_raw_html(&self) -> bool {
+        false
+    }
+}
 
 /// Platform default capability used by `Downloader::with_platform_and_storage_and_settings`.
 pub fn default_settings() -> Arc<dyn DownloaderSettings> {
@@ -144,6 +159,11 @@ impl SnapshotDownloaderSettings {
 impl DownloaderSettings for SnapshotDownloaderSettings {
     fn local_setting_bool(&self, key: &str) -> bool {
         self.local.get(key).copied().unwrap_or(false)
+    }
+
+    /// Worker は生データを保存しない (`economy` の設定に関わらず常に false)。
+    fn save_raw_html(&self) -> bool {
+        false
     }
 
     fn global_setting_optional_bool(&self, key: &str) -> Option<bool> {
@@ -217,6 +237,13 @@ impl DownloaderSettings for NativeDownloaderSettings {
         .unwrap_or(false)
     }
 
+    /// `economy` に `nosave_raw` があれば生データを保存しない。
+    fn save_raw_html(&self) -> bool {
+        !crate::compat::load_local_setting_list("economy")
+            .iter()
+            .any(|value| value == "nosave_raw")
+    }
+
     fn strip_title_prefix_for(&self, novel_id: i64, raw_title: &str, author: &str) -> bool {
         let previous_novel_dir = crate::db::with_database(|db| {
             Ok(db.get(novel_id).map(|record| {
@@ -273,6 +300,13 @@ impl DownloaderSettings for NativeDownloaderSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Worker は生データを保存しない (native は `economy: nosave_raw` で切る)。
+    #[test]
+    fn the_worker_never_stores_raw_html() {
+        assert!(!WorkerDownloaderSettings.save_raw_html());
+        assert!(!SnapshotDownloaderSettings::default().save_raw_html());
+    }
 
     #[test]
     fn snapshot_defaults_match_unset_settings() {

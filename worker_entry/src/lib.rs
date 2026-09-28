@@ -477,11 +477,21 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     let text_key = keys.converted_text();
     let text_bytes = match services.objects.read_small(&text_key).await {
         Ok(Some(bytes)) => bytes,
+        // 変換済みテキストを保存しない構成 (`convert.keep-txt=false`) では
+        // ここで組み立て直す。保存済みならそのまま使うので通常経路は変わらない。
         Ok(None) => {
-            return Response::error(
-                "Converted text not found: run convert (text-only) for this novel first",
-                409,
-            );
+            let runtime = match composition::WorkerRuntime::build(&env).await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return Response::error(format!("Service unavailable: {error}"), 503);
+                }
+            };
+            match crate::convert::convert_text_only(&runtime, &record).await {
+                Ok(text) => text.into_bytes(),
+                Err(error) => {
+                    return Response::error(format!("Convert failed: {error}"), 409);
+                }
+            }
         }
         Err(error) => return Response::error(format!("Object store error: {error}"), 500),
     };

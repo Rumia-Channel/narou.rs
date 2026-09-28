@@ -303,6 +303,15 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                         sink,
                     );
                     print_inspection_output(&mut converter, sink);
+                    // `convert.keep-txt=false` のときは中間の txt を残さない
+                    // (変換結果は SQLite の novel_outputs にある)。
+                    if !narou_rs::converter::keep_converted_text_file() {
+                        if let Some(txt) = converter.last_converted_text_path() {
+                            let _ = std::fs::remove_file(txt);
+                        }
+                        // 固定名ミラーも残さない (過去の実行で残っていれば消す)。
+                        let _ = std::fs::remove_file(novel_dir.join("novel.txt"));
+                    }
                     completed_count += 1;
                     sink.emit(
                         Stream::Stdout,

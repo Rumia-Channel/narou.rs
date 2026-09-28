@@ -74,8 +74,14 @@ if [ ! -d "$LIB/.narou" ]; then
   printf 'sqlite\n' > "$LIB/.narou/storage-backend"
   # 容量節約の既定 (初回だけ入れるので、後から変えても上書きされない):
   #   nosave_diff  更新のたびに作られる差分スナップショットを保存しない
+  #   nosave_raw   取得した raw HTML を保存しない (挿絵のローカライズは取得時に
+  #                メモリ上で行うので、新規話の挿絵は従来どおり保存される)
   #   no-epub      EPUB を保存しない (Web UI の「EPUB をダウンロード」は都度生成)
-  "$NAROU" setting economy=nosave_diff convert.no-epub=true < /dev/null
+  #   keep-txt     txt を残さない (変換結果は SQLite にあり EPUB はそこから生成)
+  "$NAROU" setting \
+    economy=nosave_diff,nosave_raw \
+    convert.no-epub=true \
+    convert.keep-txt=false < /dev/null
 fi
 
 # 公開はトンネル経由なので、ループバックだけを向き、Host / Origin は前段が

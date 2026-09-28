@@ -152,6 +152,18 @@ impl ConvertService {
     /// 目次にあるのに本文が無い話はエラーで止める (不完全な novel.txt を
     /// 成功として書かない)。
     pub async fn convert_and_store(&self, record: &NovelRecord) -> Result<ConvertedNovel> {
+        self.convert_inner(record, true).await
+    }
+
+    /// 変換だけを行う (`convert_and_store` と同じだが、結果を保存しない)。
+    ///
+    /// 変換済みテキストを保存しない構成 (`convert.keep-txt=false`) で、
+    /// 必要になった時点で組み立て直すために使う。
+    pub async fn convert_only(&self, record: &NovelRecord) -> Result<ConvertedNovel> {
+        self.convert_inner(record, false).await
+    }
+
+    async fn convert_inner(&self, record: &NovelRecord, store: bool) -> Result<ConvertedNovel> {
         let keys = NovelObjectKeys::new(
             &record.sitename,
             &record.file_title,
@@ -229,9 +241,11 @@ impl ConvertService {
         };
         let text = converter.convert_novel(&toc_object, &sections)?;
         let output = keys.converted_text();
-        self.objects
-            .write_small(&output, text.clone().into_bytes())
-            .await?;
+        if store {
+            self.objects
+                .write_small(&output, text.clone().into_bytes())
+                .await?;
+        }
         Ok(ConvertedNovel { text, output })
     }
 

@@ -108,17 +108,45 @@ async fn convert(
         return Ok(None);
     };
 
-    // native の CLI 変換と同じく、挿絵のローカライズ能力は渡さない
-    // (`native::converter::native_capabilities` も assets/objects を None にする)。
-    // 挿絵を取るリクエストはサイト定義のヘッダが要る (i.pximg.net は Referer
-    // 無しを 403 で弾く)。`fetch_policy` は対象小説のサイトのもの、
-    // `fetch_policy_resolver` は native と同じ レコード→サイト定義→policy
-    // 解決 (`FetchPolicy::for_record`) で、小説ごとの切替に対応する。
+    let service = convert_service(runtime, &record);
+    // `convert.keep-txt=false` では変換済みテキストを保存しない
+    // (EPUB のダウンロード時に組み立て直す。CPU と引き換えに D1 を節約する)。
+    let converted = if keep_converted_text(runtime).await {
+        service.convert_and_store(&record).await?
+    } else {
+        service.convert_only(&record).await?
+    };
+    Ok(Some(converted))
+}
+
+/// 変換テキストだけを組み立てる (保存しない)。
+///
+/// 変換済みテキストを保存しない構成で、EPUB のダウンロード時に使う。
+pub(crate) async fn convert_text_only(
+    runtime: &WorkerRuntime,
+    record: &narou_rs::db::NovelRecord,
+) -> Result<String> {
+    let service = convert_service(runtime, record);
+    service
+        .convert_only(record)
+        .await
+        .map(|converted| converted.text)
+}
+
+/// 1 小説ぶんの ConverterCapabilities を組む。
+///
+/// native の CLI 変換と同じく、挿絵のローカライズ能力は渡さない
+/// (`native::converter::native_capabilities` も assets/objects を None にする)。
+/// 挿絵を取るリクエストはサイト定義のヘッダが要る (i.pximg.net は Referer
+/// 無しを 403 で弾く)。`fetch_policy` は対象小説のサイトのもの、
+/// `fetch_policy_resolver` は native と同じ レコード→サイト定義→policy
+/// 解決 (`FetchPolicy::for_record`) で、小説ごとの切替に対応する。
+fn convert_service(runtime: &WorkerRuntime, record: &narou_rs::db::NovelRecord) -> ConvertService {
     let site_settings: Arc<[SiteSetting]> = runtime.site_settings().into();
     let capabilities = ConverterCapabilities {
         http: runtime.http_client(),
         rate_limiter: runtime.rate_limiter(),
-        fetch_policy: FetchPolicy::for_record(&site_settings, &record),
+        fetch_policy: FetchPolicy::for_record(&site_settings, record),
         assets: None,
         objects: None,
         illustration_index: None,
@@ -128,16 +156,37 @@ async fn convert(
             FetchPolicy::for_record(&site_settings, record)
         })),
     };
-
     ConvertService::new(
         runtime.objects(),
         runtime.assets(),
         runtime.settings_store(),
     )
     .with_capabilities(capabilities)
-    .convert_and_store(&record)
-    .await
-    .map(Some)
+}
+
+/// 変換済みテキストを保存するか (`convert.keep-txt`、既定 true)。
+///
+/// 環境変数 `NAROU_RS_KEEP_TXT` (0/false/no/off) が最優先、次に D1 の
+/// local 設定。false のときは EPUB のダウンロード時に組み立て直す。
+async fn keep_converted_text(runtime: &WorkerRuntime) -> bool {
+    if let Ok(value) = std::env::var("NAROU_RS_KEEP_TXT") {
+        let value = value.trim().to_ascii_lowercase();
+        return !matches!(value.as_str(), "0" | "false" | "no" | "off");
+    }
+    match runtime
+        .settings_store()
+        .load(narou_rs::setting_core::SettingScope::Local)
+        .await
+        .ok()
+        .and_then(|settings| settings.get("convert.keep-txt").cloned())
+    {
+        Some(serde_yaml::Value::Bool(value)) => value,
+        Some(serde_yaml::Value::String(value)) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        _ => true,
+    }
 }
 
 /// 変換失敗をジョブ結果へ写す。分類は download 経路と同じ共有実装
