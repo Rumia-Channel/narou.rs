@@ -552,7 +552,7 @@ export function bindActions() {
     assertApiSuccess(result, '最新話掲載日確認の要求送信に失敗しました');
   };
 
-  on('gl-update-submit', () => {
+  on('gl-update-submit', (e) => {
     const glNarou = document.getElementById('gl-update-narou')?.checked;
     const glOther = document.getElementById('gl-update-other')?.checked;
     const isUpdateModified = document.getElementById('gl-update-modified')?.checked;
@@ -564,9 +564,13 @@ export function bindActions() {
       document.getElementById('gl-update-modal')?.classList.add('hide');
       return;
     }
-    let option = (glNarou && glOther) ? 'all' : (glNarou ? 'narou' : 'other');
-    queueGeneralLastupUpdate(option, isUpdateModified);
+    const option = (glNarou && glOther) ? 'all' : (glNarou ? 'narou' : 'other');
     document.getElementById('gl-update-modal')?.classList.add('hide');
+    void runGuardedAction(
+      e.currentTarget,
+      () => queueGeneralLastupUpdate(option, isUpdateModified),
+      '最新話掲載日確認の要求送信に失敗しました'
+    );
   });
 
   on('action-update-by-tag', (e) => {
@@ -708,10 +712,13 @@ export function bindActions() {
     openDiffList(ids);
   });
 
-  on('action-other-inspect', () => {
+  on('action-other-inspect', (e) => {
     const ids = requireSelectedIds();
     if (!ids) return;
-    postJson('/api/inspect', { targets: ids });
+    void runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/inspect', { targets: ids });
+      assertApiSuccess(result, '調査状況ログの表示に失敗しました');
+    }, '調査状況ログの表示に失敗しました');
   });
 
   on('action-other-folder', () => {
@@ -846,8 +853,10 @@ export function bindActions() {
     removeSingle: async (id) => {
       showRemoveModal([Number(id)]);
     },
-    convertSingle: (id) => postJson('/api/convert', { targets: [String(id)] }),
-    inspectSingle: (id) => postJson('/api/inspect', { targets: [String(id)] }),
+    inspectSingle: (id) => runGuardedAction(null, async () => {
+      const result = await postJson('/api/inspect', { targets: [String(id)] });
+      assertApiSuccess(result, '調査状況ログの表示に失敗しました');
+    }, '調査状況ログの表示に失敗しました'),
     folderSingle: (id) => openFolderTargets([String(id)]),
     backupSingle: (id) => postJson('/api/backup', { targets: [String(id)] }),
     downloadForceSingle: (id) => postJson('/api/download', { targets: [String(id)], force: true }),
