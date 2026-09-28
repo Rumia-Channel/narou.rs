@@ -39,7 +39,10 @@ use super::json_error;
 /// Web UI の失敗理由表示と同じく英語の機械可読文字列)。
 const REASON_REMOVED: &str = "removed from queue by user via Web UI";
 const REASON_QUEUE_CLEARED: &str = "queue cleared by user via Web UI";
-const REASON_CANCELLED: &str = "cancelled by user via Web UI";
+/// running 行の tombstone 理由。`crate::consumer` はこの文字列を「実行中に
+/// ユーザーがキャンセルした」判定に使う (native の killed child →
+/// `JobOutcome::Cancelled` 相当) ので、真実源は consumer 側に 1 つだけ置く。
+const REASON_CANCELLED: &str = crate::consumer::USER_CANCEL_REASON;
 
 /// `src/web/state.rs::TaskIdBody` と同じ形 (`{"task_id": "..."}`)。
 #[derive(Debug, Deserialize)]
@@ -80,6 +83,14 @@ fn api_failure(message: impl std::fmt::Display) -> worker::Result<Response> {
     api_response(false, &message.to_string())
 }
 
+/// native `src/web/jobs.rs::notify_queue_changed` 相当。キュー書き換えが
+/// 成功したことを UI (`main.js` の `notification.queue`) に知らせる。
+/// 表示更新なので best-effort — 送信失敗でも応答は変えない。
+async fn notify_queue_changed(env: &Env, runtime: &WorkerRuntime) {
+    let push = crate::push_hub::PushHubClient::new(env, runtime.subrequests.clone());
+    crate::consumer::notify_queue_changed(&push).await;
+}
+
 /// Build the runtime or finish with the native-style 503 error response
 /// (`webui/download.rs` と同じ形)。
 macro_rules! runtime_or_503 {
@@ -117,6 +128,10 @@ async fn queue_clear(req: Request, env: Env) -> worker::Result<Response> {
         Ok(ids) => ids.len(),
         Err(_) => return json_error(500, "ledger_read_failed", None),
     };
+    // native `queue_clear` は `clear_non_running` の Ok 分岐で送る。台帳を読む
+    // この分岐が成功した時点で書き換えは確定している (native の `running_count`
+    // は非 fallible なので、worker では fallible な読み込みの後に置く)。
+    notify_queue_changed(&env, &runtime).await;
     api_response(
         true,
         if running_count > 0 {
@@ -154,6 +169,9 @@ async fn cancel(req: Request, env: Env) -> worker::Result<Response> {
             return api_failure(error);
         }
     }
+    // native `api_cancel` は `kill_running_child` の直後に無条件で送る
+    // (対象 0 件でも成功応答では同じ)。
+    notify_queue_changed(&env, &runtime).await;
     api_response(true, "キャンセルしました")
 }
 
@@ -179,7 +197,11 @@ async fn cancel_running_task(mut req: Request, env: Env) -> worker::Result<Respo
         .cancel_running_job(&body.task_id, REASON_CANCELLED)
         .await
     {
-        Ok(true) => Response::from_json(&json!({ "status": "ok" })),
+        // native は kill 成功 (`Ok(true)`) のみで送り、失敗応答には送らない。
+        Ok(true) => {
+            notify_queue_changed(&env, &runtime).await;
+            Response::from_json(&json!({ "status": "ok" }))
+        }
         Ok(false) => Response::from_json(
             &json!({ "error": "実行中の処理を中断できませんでした" }),
         ),
@@ -211,7 +233,11 @@ async fn remove_pending_task(mut req: Request, env: Env) -> worker::Result<Respo
         .cancel_pending_job(&body.task_id, REASON_REMOVED)
         .await
     {
-        Ok(true) => api_response(true, "Task removed"),
+        // native は削除成功 (`Ok(true)`) のみで送る。
+        Ok(true) => {
+            notify_queue_changed(&env, &runtime).await;
+            api_response(true, "Task removed")
+        }
         Ok(false) => api_response(false, "キューから削除できませんでした"),
         Err(error) => api_failure(error),
     }
@@ -255,6 +281,9 @@ async fn restore_pending_tasks(req: Request, env: Env) -> worker::Result<Respons
             }));
         }
     }
+    // native `restore_pending_tasks` は `activate_restorable_tasks` の Ok 後に
+    // 無条件で送る (失敗応答 `{error}` では送らない — worker も同じ)。
+    notify_queue_changed(&env, &runtime).await;
     Response::from_json(&json!({ "status": "ok", "count": stale_ids.len() }))
 }
 
@@ -273,6 +302,12 @@ async fn defer_restore_pending_tasks(req: Request, env: Env) -> worker::Result<R
     // worker 側に deferred 集合は無く、lease 切れの running 行はいつでも
     // restore 可能なので、状態を持たないこの環境では承諾だけを返すのが
     // 正直な応答 (native 同様 `{"status": "ok"}`)。
+    //
+    // native は Ok 分岐で `notification.queue` を送る。このハンドラは runtime
+    // を組み立てない (組立失敗で 503 を新設したくない — 応答を変えない) ので、
+    // 送信専用の budget を新規に割り当てて送る。
+    let push = crate::push_hub::PushHubClient::new(&env, crate::budget::SubrequestBudget::new());
+    crate::consumer::notify_queue_changed(&push).await;
     Response::from_json(&json!({ "status": "ok" }))
 }
 

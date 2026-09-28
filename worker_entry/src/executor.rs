@@ -169,6 +169,17 @@ pub async fn execute_job(
         }
     }
 
+    // native `update.interval`: 同じドメインの作品開始を一定時間空ける。
+    // 凍結で読み飛ばす作品は native 同様に間隔を消費しない (frozen 判定の後)。
+    if job.kind == JobKind::Update {
+        let domain = update_domain(runtime, &job.target).await;
+        if let Err(error) = runtime.pace_update_start(&domain).await {
+            return JobOutcome::Retryable {
+                reason: format!("update start pacing failed: {error}"),
+            };
+        }
+    }
+
     // 進捗バーを PushHub 経由で UI へ (native の WebProgress 相当)。
     // topic は job kind、scope は job id — consumer が終端で同じ scope の
     // progressbar.clear を送って消す。
@@ -331,6 +342,27 @@ pub async fn execute_job(
     // 死んだバッファに書き込む)。
     narou_rs::application::messages::take_default_sink();
     outcome
+}
+
+/// native `commands::update` の `UNKNOWN_DOMAIN_KEY` と同じ見出し語。ドメインを
+/// 持たないレコード (取得直後など) は 1 つのバケットにまとめて直列化する。
+const UNKNOWN_DOMAIN_KEY: &str = "__unknown__";
+
+/// `update.interval` を数えるためのドメイン。native `collect_record_domains`
+/// と同じく `record.domain` を使い、空・未解決は共通バケットへ寄せる。
+async fn update_domain(runtime: &WorkerRuntime, target: &JobTarget) -> String {
+    let Some(id) = resolve_novel_id(runtime.novels.as_ref(), target).await else {
+        return UNKNOWN_DOMAIN_KEY.to_string();
+    };
+    runtime
+        .novels
+        .get(id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|record| record.domain)
+        .filter(|domain| !domain.is_empty())
+        .unwrap_or_else(|| UNKNOWN_DOMAIN_KEY.to_string())
 }
 
 /// Resolve a job target to a stored novel id (native `get_data_by_target`
