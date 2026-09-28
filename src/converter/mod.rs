@@ -126,11 +126,38 @@ struct CacheEntry {
     use_dakuten_font: bool,
 }
 
-#[derive(Default)]
 #[cfg(feature = "native-runtime")]
 struct SectionConvertCache {
     buckets: HashMap<String, HashMap<String, CacheEntry>>,
     dirty_ids: std::collections::HashSet<String>,
+    /// 容量の厳しい環境 (SORAHOST など) ではキャッシュを作らない。
+    /// `convert.section-cache` (既定 true) / `NAROU_RS_SECTION_CACHE=0` で切る。
+    enabled: bool,
+}
+
+#[cfg(feature = "native-runtime")]
+impl Default for SectionConvertCache {
+    fn default() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            dirty_ids: std::collections::HashSet::new(),
+            enabled: section_cache_enabled(),
+        }
+    }
+}
+
+/// セクション変換キャッシュを作るか。
+///
+/// 環境変数 `NAROU_RS_SECTION_CACHE` (0/false/no/off で無効) が最優先、
+/// 次に `local_setting` の `convert.section-cache` (未設定は有効)。
+/// 無効にすると変換のたびに全話を変換し直す代わりに、容量を使わない。
+#[cfg(feature = "native-runtime")]
+fn section_cache_enabled() -> bool {
+    if let Ok(value) = std::env::var("NAROU_RS_SECTION_CACHE") {
+        let value = value.trim().to_ascii_lowercase();
+        return !matches!(value.as_str(), "0" | "false" | "no" | "off");
+    }
+    crate::compat::load_local_setting_bool_or("convert.section-cache", true)
 }
 
 #[derive(Serialize)]
@@ -1319,6 +1346,11 @@ impl SectionConvertCache {
         if self.buckets.contains_key(&key) {
             return Ok(());
         }
+        if !self.enabled {
+            // キャッシュ無効: 読まずに空のバケットを作る。
+            self.buckets.insert(key, HashMap::new());
+            return Ok(());
+        }
         migrate_legacy_section_convert_cache()?;
         let (bucket, legacy_format) = load_section_convert_bucket(novel_id)?;
         self.buckets.insert(key.clone(), bucket);
@@ -1330,6 +1362,16 @@ impl SectionConvertCache {
     }
 
     fn flush(&mut self) -> Result<()> {
+        if !self.enabled {
+            // 無効に切り替えた後の初回変換で、残っているキャッシュを片付ける
+            // (容量節約のための設定なので、過去のファイルを残しても意味がない)。
+            for id in self.buckets.keys() {
+                let _ = clear_section_convert_cache_file(id);
+            }
+            self.buckets.clear();
+            self.dirty_ids.clear();
+            return Ok(());
+        }
         if self.dirty_ids.is_empty() {
             return Ok(());
         }
@@ -1343,22 +1385,25 @@ impl SectionConvertCache {
     }
 }
 
+/// 1 小説ぶんのキャッシュファイル (と旧ロック) を消す。存在しなければ何もしない。
+#[cfg(feature = "native-runtime")]
+fn clear_section_convert_cache_file(id: &str) -> Result<()> {
+    let path = section_convert_cache_file_path(id)?;
+    let lock_path = path.with_extension("yaml.lock");
+    for target in [path, lock_path] {
+        match std::fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(NarouError::Io(e)),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "native-runtime")]
 pub fn clear_section_convert_cache(id: i64) -> Result<()> {
     migrate_legacy_section_convert_cache()?;
-    let path = section_convert_cache_file_path(&id.to_string())?;
-    let lock_path = path.with_extension("yaml.lock");
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(NarouError::Io(e)),
-    }
-    match std::fs::remove_file(lock_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(NarouError::Io(e)),
-    }
-    Ok(())
+    clear_section_convert_cache_file(&id.to_string())
 }
 
 #[cfg(feature = "native-runtime")]
@@ -1799,6 +1844,45 @@ mod tests {
                 .join("section_convert_cache.yaml.migrated")
                 .is_file()
         );
+
+        *crate::db::DATABASE.lock() = None;
+    }
+
+    #[test]
+    fn a_disabled_cache_writes_nothing_and_clears_what_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        let path = temp
+            .path()
+            .join(".narou")
+            .join("section_convert_cache")
+            .join("3062.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = HashMap::from([(
+            "本文\\1.yaml".to_string(),
+            make_cache_entry(&"a".repeat(1024)),
+        )]);
+        std::fs::write(&path, serde_yaml::to_string(&legacy).unwrap()).unwrap();
+        assert!(path.is_file());
+
+        let mut cache = super::SectionConvertCache {
+            buckets: HashMap::new(),
+            dirty_ids: std::collections::HashSet::new(),
+            enabled: false,
+        };
+        cache.bucket(3062).unwrap();
+        cache.flush().unwrap();
+        assert!(
+            !path.is_file(),
+            "a disabled cache must not keep the stored file on disk"
+        );
+        // 二度目の flush も落ちないこと。
+        cache.flush().unwrap();
 
         *crate::db::DATABASE.lock() = None;
     }

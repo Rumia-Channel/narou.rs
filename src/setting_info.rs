@@ -109,6 +109,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "convert.dc-subject-exclude-tags"
         | "convert.rotate-image"
         | "send.without-freeze"
+        | "convert.section-cache"
         | "auto-add-tags"
         | "s3.asset-backend"
         | "s3.endpoint"
@@ -768,6 +769,69 @@ pub fn setting_variables() -> SettingVariables {
             ),
         ),
         (
+            "convert.section-cache",
+            vis(
+                VarType::Boolean,
+                "話ごとの変換結果をキャッシュする (既定 true)。容量の厳しい環境では false。環境変数 NAROU_RS_SECTION_CACHE=0 でも切れる",
+            ),
+        ),
+        (
+            "s3.asset-backend",
+            invis_sel(
+                "挿絵の保存先。local: ライブラリ内に保存 / s3: S3 互換ストレージ (Wasabi など) へ保存",
+                vec!["local", "s3"],
+            ),
+        ),
+        (
+            "s3.endpoint",
+            invis(
+                VarType::String,
+                "S3 互換ストレージの endpoint (例: https://s3.ap-northeast-1.wasabisys.com)。環境変数 S3_ENDPOINT でも指定可",
+            ),
+        ),
+        (
+            "s3.bucket",
+            invis(
+                VarType::String,
+                "S3 のバケット名。環境変数 S3_BUCKET でも指定可",
+            ),
+        ),
+        (
+            "s3.region",
+            invis(
+                VarType::String,
+                "S3 のリージョン (署名に必須)。環境変数 S3_REGION でも指定可",
+            ),
+        ),
+        (
+            "s3.prefix",
+            invis(
+                VarType::String,
+                "バケット内の接頭辞 (例: narou/library)。環境変数 S3_PREFIX でも指定可",
+            ),
+        ),
+        (
+            "s3.access-key-id",
+            invis(
+                VarType::String,
+                "S3 のアクセスキー ID。環境変数 S3_ACCESS_KEY_ID でも指定可",
+            ),
+        ),
+        (
+            "s3.secret-access-key",
+            invis(
+                VarType::String,
+                "S3 のシークレットアクセスキー。環境変数 S3_SECRET_ACCESS_KEY でも指定可",
+            ),
+        ),
+        (
+            "convert.epub-engine",
+            sel(
+                "EPUB 生成エンジンの選択。auto: 外部 AozoraEpub3 があればそれを使い、無ければ組み込み (Lite) / lite: 組み込みを強制 (要 lite ビルド) / external: 外部を強制",
+                vec!["auto", "lite", "external"],
+            ),
+        ),
+        (
             "download.interval",
             vis(VarType::Float, "各話DL時に指定秒数待機する"),
         ),
@@ -971,62 +1035,6 @@ pub fn setting_variables() -> SettingVariables {
             sel(
                 "EPUB の本文フォント。auto: 濁点注記のある小説だけ濁点フォント (DMincho) を使う / always: 常に DMincho を埋め込んで本文を組む (Reader が全角スペース等を描けない場合の回避策)",
                 vec!["auto", "always"],
-            ),
-        ),
-        (
-            "s3.asset-backend",
-            invis_sel(
-                "挿絵の保存先。local: ライブラリ内に保存 / s3: S3 互換ストレージ (Wasabi など) へ保存",
-                vec!["local", "s3"],
-            ),
-        ),
-        (
-            "s3.endpoint",
-            invis(
-                VarType::String,
-                "S3 互換ストレージの endpoint (例: https://s3.ap-northeast-1.wasabisys.com)。環境変数 S3_ENDPOINT でも指定可",
-            ),
-        ),
-        (
-            "s3.bucket",
-            invis(
-                VarType::String,
-                "S3 のバケット名。環境変数 S3_BUCKET でも指定可",
-            ),
-        ),
-        (
-            "s3.region",
-            invis(
-                VarType::String,
-                "S3 のリージョン (署名に必須)。環境変数 S3_REGION でも指定可",
-            ),
-        ),
-        (
-            "s3.prefix",
-            invis(
-                VarType::String,
-                "バケット内の接頭辞 (例: narou/library)。環境変数 S3_PREFIX でも指定可",
-            ),
-        ),
-        (
-            "s3.access-key-id",
-            invis(
-                VarType::String,
-                "S3 のアクセスキー ID。環境変数 S3_ACCESS_KEY_ID でも指定可",
-            ),
-        ),
-        (
-            "s3.secret-access-key",
-            invis(
-                VarType::String,
-                "S3 のシークレットアクセスキー。環境変数 S3_SECRET_ACCESS_KEY でも指定可",
-            ),
-        ),
-        (
-            "convert.epub-engine",
-            sel(
-                "EPUB 生成エンジンの選択。auto: 外部 AozoraEpub3 があればそれを使い、無ければ組み込み (Lite) / lite: 組み込みを強制 (要 lite ビルド) / external: 外部を強制",
-                vec!["auto", "lite", "external"],
             ),
         ),
         (

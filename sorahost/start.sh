@@ -81,6 +81,8 @@ SETTINGS=(
   "server-port=$PORT"
   "server-reverse-proxy.enable=true"
   "server-basic-auth.enable=true"
+  # 容量節約のため、話ごとの変換キャッシュは作らない (再変換が少し遅くなるだけ)。
+  "convert.section-cache=false"
 )
 if [ -n "${NAROU_WEB_USER:-}" ]; then
   SETTINGS+=("server-basic-auth.user=$NAROU_WEB_USER")

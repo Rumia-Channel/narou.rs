@@ -293,6 +293,19 @@ pub fn load_local_setting_string(key: &str) -> Option<String> {
     load_local_setting_value(key).and_then(|v| yaml_value_to_string(&v))
 }
 
+/// 未設定なら `default` を返す bool 設定。既定 true の設定を「明示的に
+/// false のときだけ切る」ために使う。
+pub fn load_local_setting_bool_or(key: &str, default: bool) -> bool {
+    load_local_setting_value(key)
+        .and_then(|v| match v {
+            serde_yaml::Value::Bool(b) => Some(b),
+            serde_yaml::Value::String(s) => Some(matches!(s.as_str(), "true" | "yes" | "on" | "1")),
+            serde_yaml::Value::Number(n) => Some(n.as_i64().unwrap_or(0) != 0),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
 pub fn load_local_setting_bool(key: &str) -> bool {
     load_local_setting_value(key)
         .and_then(|v| match v {

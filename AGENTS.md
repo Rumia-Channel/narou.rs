@@ -521,6 +521,13 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   ローカルから S3 へ写す。`narou illust s3-verify` がバイト単位で突き合わせる。どちらも
   ライブラリ全体が対象で、`s3.asset-backend=s3` と接続情報が必要
   (`platform::store_migration::migrate_page` を共有)。
+- **話ごとの変換キャッシュは容量の厳しい環境で切れる**: `convert.section-cache`
+  (local 設定、既定 true、環境変数 `NAROU_RS_SECTION_CACHE=0` で無効)。無効時は読み書きせず、flush 時に既存の
+  `section_convert_cache/<id>.yaml` を削除する (再有効化しても壊れない)。既定では
+  brotli 圧縮 + 1 行ヘッダ (`narou-section-cache:v1 <encoding>`) で保存し、ヘッダの無い
+  旧形式 (生 YAML) は読み込み時に dirty 扱いにして次の flush で圧縮し直す。
+  Worker (`worker-runtime`) はこのキャッシュ自体を持たない (該当コードが
+  `native-runtime` 限定で no-op)。
 - HTTP 層に `HttpMethod::{Put, Delete}` と `HttpRequest::trusted_endpoint` を追加した。後者は
   保存先が利用者自身の設定値であることを示し、公開アドレス判定を掛けず (ローカル MinIO を許可)、
   応答ヘッダを全部返す (`ETag` / `Content-Range` が保存先の契約)。

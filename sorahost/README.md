@@ -110,7 +110,26 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
 `narou setting s3.asset-backend=local` に戻せば、移行前のローカル保存へ即座に
 戻せる (S3 側は消さない)。
 
-## 6. 更新
+## 6. 容量
+
+実測 (13 作品・画像主体の Pixiv 作品を含む) の内訳と、SORAHOST での考え方:
+
+| 保存先 | 内容 | 実測 (13 作品) |
+| --- | --- | --- |
+| S3 | 挿絵のバイナリ | 36.8 MB (S3 へ移動) |
+| `db.sqlite` | メタデータ + 本文 + 変換済みテキスト (brotli 圧縮) | 79 MB |
+| `小説データ/` | 本文・raw HTML・変換済みテキスト・EPUB | 148 MB (挿絵を除く) |
+| 変換キャッシュ | `.narou/section_convert_cache/` | 0 (start.sh が無効化) |
+
+- 挿絵を S3 に置くと、ローカルのミラーと `db.sqlite` の両方から消える (この構成で -73 MB)
+- `start.sh` は `convert.section-cache=false` を設定する。無効にすると変換のたびに
+  全話を変換し直す代わりに、容量を使わない (有効時の実測で 1 作品あたり約 1.5 MB)
+- **EPUB を溜めないのが一番効く**: 画像主体の作品は 1 冊 40〜55 MB になる。Web UI の
+  「EPUB をダウンロード」は保存済みテキストから都度生成するので、`narou convert` で
+  EPUB を作らない設定 (`convert.no-epub=true`) にしておけばディスクを消費しない
+- バックアップ (`narou backup`) は挿絵が S3 にあるためテキスト主体で小さくなる
+
+## 7. 更新
 
 1. 新しい `narou_rs` をビルドして配置する
 2. Pterodactyl からサーバーを再起動する
@@ -118,7 +137,7 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
 `self-update` は使わない (実行ファイルの置き場が読み取り専用になりうるため)。
 `webnovel/*.yaml` を差し替えたときも再起動で反映される。
 
-## 7. 使えない機能
+## 8. 使えない機能
 
 SORAHOST のコンテナで動かすため、次は動かない (Web UI 側では 501 相当):
 
@@ -127,7 +146,7 @@ SORAHOST のコンテナで動かすため、次は動かない (Web UI 側で�
 - 外部 AozoraEpub3 (`aozoraepub3dir` は設定しない。Lite を同梱して使う)
 - `narou_rs_login` (ブラウザのある端末で実行し、`narou login import` で取り込む)
 
-## 8. 確認
+## 9. 確認
 
 ```sh
 curl -I https://narou.example.com/            # basic 認証のチャレンジが返る
