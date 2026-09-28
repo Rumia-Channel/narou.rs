@@ -13,12 +13,11 @@ use std::sync::Arc;
 
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::store_migration::{StoreMigrationState, migrate_page};
-use narou_rs::platform::{AssetStore, ObjectStore};
+use narou_rs::platform::{AssetStore, ObjectStore, S3Store};
 use worker::{Env, wasm_bindgen::JsValue};
 
 use crate::db_handle::DbHandle;
 use crate::d1_object_store::D1ObjectStore;
-use narou_rs::platform::S3Store;
 
 /// 進捗を置く `app_state` のキー（`scope='inv'`）。
 const STATE_KEY: &str = "migrate_illustrations";

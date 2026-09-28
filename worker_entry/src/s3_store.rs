@@ -25,7 +25,9 @@ pub async fn store_from_env(
         endpoint: crate::secrets::require(env, "S3_ENDPOINT").await?,
         bucket: crate::secrets::require(env, "S3_BUCKET").await?,
         region: crate::secrets::require(env, "S3_REGION").await?,
-        prefix: crate::secrets::value(env, "S3_PREFIX").await.unwrap_or_default(),
+        prefix: crate::secrets::value(env, "S3_PREFIX")
+            .await
+            .unwrap_or_default(),
         access_key_id: crate::secrets::require(env, "S3_ACCESS_KEY_ID").await?,
         secret_access_key: crate::secrets::require(env, "S3_SECRET_ACCESS_KEY").await?,
     };

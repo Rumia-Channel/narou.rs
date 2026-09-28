@@ -149,8 +149,7 @@ async fn build_object_stores(
             // S3 が選ばれていて資格情報が欠けている場合は起動を失敗させ、
             // 黙って D1 へ落とさない (fail-closed)。
             Some("s3") => {
-                let store: Arc<S3Store> =
-                    crate::s3_store::store_from_env(env, subrequests).await?;
+                let store: Arc<S3Store> = crate::s3_store::store_from_env(env, subrequests).await?;
                 s3_handle = Some(store.clone());
                 (store.clone(), store)
             }

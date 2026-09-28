@@ -128,12 +128,14 @@ mod tests {
         unsafe { std::env::set_var("NAROU_RS_ASSET_BACKEND", "s3") };
         // backend だけあって接続情報が無い: config は作られるが検証で落ちる。
         let config = store_config().unwrap();
-        assert!(S3Store::new(
-            config,
-            Arc::new(crate::platform::mocks::MockHttpClient::new()),
-            Arc::new(SystemClock),
-        )
-        .is_err());
+        assert!(
+            S3Store::new(
+                config,
+                Arc::new(crate::platform::mocks::MockHttpClient::new()),
+                Arc::new(SystemClock),
+            )
+            .is_err()
+        );
         clear_env();
     }
 }

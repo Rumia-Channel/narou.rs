@@ -989,11 +989,17 @@ pub fn setting_variables() -> SettingVariables {
         ),
         (
             "s3.bucket",
-            invis(VarType::String, "S3 のバケット名。環境変数 S3_BUCKET でも指定可"),
+            invis(
+                VarType::String,
+                "S3 のバケット名。環境変数 S3_BUCKET でも指定可",
+            ),
         ),
         (
             "s3.region",
-            invis(VarType::String, "S3 のリージョン (署名に必須)。環境変数 S3_REGION でも指定可"),
+            invis(
+                VarType::String,
+                "S3 のリージョン (署名に必須)。環境変数 S3_REGION でも指定可",
+            ),
         ),
         (
             "s3.prefix",
