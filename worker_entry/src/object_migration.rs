@@ -18,7 +18,7 @@ use worker::{Env, wasm_bindgen::JsValue};
 
 use crate::db_handle::DbHandle;
 use crate::d1_object_store::D1ObjectStore;
-use crate::s3_object_store::S3ObjectStore;
+use narou_rs::platform::S3Store;
 
 /// 進捗を置く `app_state` のキー（`scope='inv'`）。
 const STATE_KEY: &str = "migrate_illustrations";
@@ -44,14 +44,13 @@ pub async fn run(
     db: &DbHandle,
     action: &str,
     limit: usize,
+    subrequests: crate::budget::SubrequestBudget,
 ) -> Result<MigrationReport> {
     let d1: Arc<dyn ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
     let d1_assets: Arc<dyn AssetStore> = Arc::new(D1ObjectStore::new(db.clone()));
-    let s3: Arc<S3ObjectStore> = Arc::new(
-        S3ObjectStore::from_env(env)
-            .await
-            .map_err(|error| NarouError::Platform(error.to_string()))?,
-    );
+    let s3: Arc<S3Store> = crate::s3_store::store_from_env(env, subrequests)
+        .await
+        .map_err(|error| NarouError::Platform(error.to_string()))?;
 
     let mut state = load_state(db).await?;
     migrate_page(

@@ -16,7 +16,7 @@ use narou_rs::downloader::settings::{DownloaderSettings, SnapshotDownloaderSetti
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::Result;
 use narou_rs::platform::{
-    AssetStore, Clock, HttpClient, NovelRepository, ObjectStore, RateLimiter, SplitStore,
+    AssetStore, Clock, HttpClient, NovelRepository, ObjectStore, RateLimiter, S3Store, SplitStore,
     SystemClock,
 };
 use narou_rs::setting_core::SettingScope;
@@ -136,20 +136,21 @@ async fn read_asset_backend(db: &DbHandle) -> Option<String> {
 async fn build_object_stores(
     env: &Env,
     db: &DbHandle,
+    subrequests: crate::budget::SubrequestBudget,
 ) -> worker::Result<(
     Arc<dyn ObjectStore>,
     Arc<dyn AssetStore>,
-    Option<Arc<crate::s3_object_store::S3ObjectStore>>,
+    Option<Arc<S3Store>>,
 )> {
     let d1: Arc<D1ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
-    let mut s3_handle: Option<Arc<crate::s3_object_store::S3ObjectStore>> = None;
+    let mut s3_handle: Option<Arc<S3Store>> = None;
     let illustrations: (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) =
         match read_asset_backend(db).await.as_deref() {
             // S3 が選ばれていて資格情報が欠けている場合は起動を失敗させ、
             // 黙って D1 へ落とさない (fail-closed)。
             Some("s3") => {
-                let store: Arc<crate::s3_object_store::S3ObjectStore> =
-                    Arc::new(crate::s3_object_store::S3ObjectStore::from_env(env).await?);
+                let store: Arc<S3Store> =
+                    crate::s3_store::store_from_env(env, subrequests).await?;
                 s3_handle = Some(store.clone());
                 (store.clone(), store)
             }
@@ -308,7 +309,8 @@ impl WorkerRuntime {
         profile: CompositionProfile,
     ) -> worker::Result<Self> {
         let subrequests = crate::budget::SubrequestBudget::new();
-        let (objects, assets, _s3_illustrations) = build_object_stores(env, &db).await?;
+        let (objects, assets, _s3_illustrations) =
+            build_object_stores(env, &db, subrequests.clone()).await?;
         let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let freeze = Arc::new(D1FreezeStore::new(db.clone()));
@@ -712,7 +714,7 @@ pub struct ReadServices {
     pub app: AppServices,
     pub objects: Arc<dyn ObjectStore>,
     /// 挿絵を S3 に置く構成のときだけ入る（presigned URL を作るのに使う）。
-    pub s3_illustrations: Option<Arc<crate::s3_object_store::S3ObjectStore>>,
+    pub s3_illustrations: Option<Arc<S3Store>>,
 }
 
 /// Build the application services (read-only API surface).
@@ -724,7 +726,9 @@ pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
     // 読み取り系の API 面。UI 経路なので `DbHandle::ui` (first-unconstrained
     // セッション、失敗時は primary) で組み立てる。
     let db = DbHandle::ui(Arc::new(env.d1("DB")?));
-    let (objects, _assets, s3_illustrations) = build_object_stores(env, &db).await?;
+    let subrequests = crate::budget::SubrequestBudget::new();
+    let (objects, _assets, s3_illustrations) =
+        build_object_stores(env, &db, subrequests).await?;
     let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::new(db.clone()));
