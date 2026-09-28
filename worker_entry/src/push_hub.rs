@@ -460,7 +460,7 @@ impl DurableObject for PushHub {
                 }
                 self.accept_client()
             }
-            (Method::Post, path) if path == "/broadcast" => self.broadcast(&mut req).await,
+            (Method::Post, "/broadcast") => self.broadcast(&mut req).await,
             _ => Response::error("Not Found", 404),
         }
     }

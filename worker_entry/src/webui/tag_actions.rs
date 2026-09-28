@@ -206,21 +206,19 @@ async fn edit_tag(runtime: &WorkerRuntime, body: serde_json::Value) -> worker::R
         }
     }
 
-    if !tags_to_delete.is_empty() {
-        if let Err(error) = apply_tag_change(runtime, &ids, TagAction::Remove, tags_to_delete)
+    if !tags_to_delete.is_empty()
+        && let Err(error) = apply_tag_change(runtime, &ids, TagAction::Remove, tags_to_delete)
             .await
             .and_then(|result| ensure_all_ids_found(&result).map(|()| result))
-        {
-            return Response::from_json(&fail_response(error));
-        }
+    {
+        return Response::from_json(&fail_response(error));
     }
-    if !tags_to_add.is_empty() {
-        if let Err(error) = apply_tag_change(runtime, &ids, TagAction::Add, tags_to_add)
+    if !tags_to_add.is_empty()
+        && let Err(error) = apply_tag_change(runtime, &ids, TagAction::Add, tags_to_add)
             .await
             .and_then(|result| ensure_all_ids_found(&result).map(|()| result))
-        {
-            return Response::from_json(&fail_response(error));
-        }
+    {
+        return Response::from_json(&fail_response(error));
     }
 
     Response::from_json(&json!({ "success": true }))

@@ -4,7 +4,9 @@ mod loader;
 mod serde_helpers;
 
 use std::collections::HashMap;
+#[cfg(feature = "native-runtime")]
 use std::collections::hash_map::DefaultHasher;
+#[cfg(feature = "native-runtime")]
 use std::hash::{Hash, Hasher};
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
@@ -299,6 +301,9 @@ pub enum SiteSettingEntry {
 /// (`install_effective_site_settings_fingerprinted` 参照)。
 struct EffectiveSiteSettings {
     settings: Arc<Vec<SiteSetting>>,
+    /// native のホットリロード専用 (`PUT /api/sites` 後の再コンパイル抑制)。
+    /// worker ビルドには差し替え元が無いので、フィールドごと落とす。
+    #[cfg(feature = "native-runtime")]
     fingerprint: Option<u64>,
 }
 
@@ -309,6 +314,7 @@ pub fn install_effective_site_settings(settings: Vec<SiteSetting>) {
     if let Ok(mut state) = EFFECTIVE_SITE_SETTINGS.write() {
         *state = Some(EffectiveSiteSettings {
             settings: Arc::new(settings),
+            #[cfg(feature = "native-runtime")]
             fingerprint: None,
         });
     }
@@ -316,6 +322,7 @@ pub fn install_effective_site_settings(settings: Vec<SiteSetting>) {
 
 /// `fingerprint` 付きで差し替える。`fingerprint` は実効定義の並びから
 /// [`site_settings_fingerprint`] で計算した値を想定している。
+#[cfg(feature = "native-runtime")]
 pub(crate) fn install_effective_site_settings_fingerprinted(
     settings: Vec<SiteSetting>,
     fingerprint: u64,
@@ -329,6 +336,7 @@ pub(crate) fn install_effective_site_settings_fingerprinted(
 }
 
 /// 実効定義が `fingerprint` と一致するか。未確定・ハッシュ不明なら `false`。
+#[cfg(feature = "native-runtime")]
 pub(crate) fn effective_site_settings_fingerprint_matches(fingerprint: u64) -> bool {
     EFFECTIVE_SITE_SETTINGS
         .read()
@@ -338,6 +346,7 @@ pub(crate) fn effective_site_settings_fingerprint_matches(fingerprint: u64) -> b
 }
 
 /// 実効定義の並び `(name, yaml)` から差分検知用のハッシュを計算する。
+#[cfg(feature = "native-runtime")]
 pub(crate) fn site_settings_fingerprint(effective: &[(String, String)]) -> u64 {
     let mut hasher = DefaultHasher::new();
     effective.hash(&mut hasher);

@@ -190,7 +190,7 @@ fn is_worker_ineffective(name: &str) -> bool {
         "update.max-parallel-domains",
     ];
     PREFIXES.iter().any(|prefix| {
-        name.starts_with(prefix) && !(name == "server-max-targets-per-request")
+        name.starts_with(prefix) && (name != "server-max-targets-per-request")
     }) || NAMES.contains(&name)
 }
 

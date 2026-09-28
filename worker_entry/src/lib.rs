@@ -1,4 +1,9 @@
 #![cfg(target_arch = "wasm32")]
+// wasm は単一スレッドで、プラットフォーム抽象 (ObjectStore / AssetStore /
+// NovelRepository 等) は `PlatformService` の wasm 実装どおり Send + Sync を
+// 要求しない。そのため `Arc<dyn ...>` はこのクレートでは常に非 Send/Sync に
+// なり、この lint は常に誤検知になる。
+#![allow(clippy::arc_with_non_send_sync)]
 
 mod budget;
 mod bundled_sites;
@@ -445,7 +450,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     {
         Ok(Some(record)) => record,
         Ok(None) => return Response::error("Not Found", 404),
-        Err(error) => return Response::error(&format!("Repository error: {error}"), 500),
+        Err(error) => return Response::error(format!("Repository error: {error}"), 500),
     };
     let keys = match narou_rs::platform::NovelObjectKeys::new(
         &record.sitename,
@@ -453,7 +458,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         record.use_subdirectory,
     ) {
         Ok(keys) => keys,
-        Err(error) => return Response::error(&format!("Invalid key: {error}"), 500),
+        Err(error) => return Response::error(format!("Invalid key: {error}"), 500),
     };
 
     let local_map = load_local_settings_map(&env).await;
@@ -466,7 +471,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     .await
     {
         Ok(name) => name,
-        Err(error) => return Response::error(&format!("Naming error: {error}"), 500),
+        Err(error) => return Response::error(format!("Naming error: {error}"), 500),
     };
 
     let text_key = keys.converted_text();
@@ -478,7 +483,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
                 409,
             );
         }
-        Err(error) => return Response::error(&format!("Object store error: {error}"), 500),
+        Err(error) => return Response::error(format!("Object store error: {error}"), 500),
     };
     let text = match String::from_utf8(text_bytes) {
         Ok(text) => text,
@@ -505,7 +510,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         let page = match services.objects.list_page(&request).await {
             Ok(page) => page,
             Err(error) => {
-                return Response::error(&format!("Object store error: {error}"), 500);
+                return Response::error(format!("Object store error: {error}"), 500);
             }
         };
         for meta in page.objects {
@@ -563,12 +568,12 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     ));
     let build = match narou_rs::epub_lite::build_book_from_source(source.clone(), &options) {
         Ok(build) => std::sync::Arc::new(build),
-        Err(error) => return Response::error(&format!("EPUB build failed: {error}"), 500),
+        Err(error) => return Response::error(format!("EPUB build failed: {error}"), 500),
     };
     let sink = narou_rs::epub_lite::ChunkSink::new();
     let writer = match build.book.stream_writer(sink.clone()) {
         Ok(writer) => writer,
-        Err(error) => return Response::error(&format!("EPUB write failed: {error}"), 500),
+        Err(error) => return Response::error(format!("EPUB write failed: {error}"), 500),
     };
     let state = EpubStreamState {
         writer: Some(writer),
@@ -580,9 +585,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     };
     let stream = futures::stream::unfold(state, |mut state| async move {
         loop {
-            if state.writer.is_none() {
-                return None;
-            }
+            state.writer.as_ref()?;
             let info = match state.writer.as_ref().and_then(|writer| writer.next_entry()) {
                 Some(info) => info,
                 None => {
@@ -632,9 +635,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
                 None => None,
             };
 
-            let Some(writer) = state.writer.as_mut() else {
-                return None;
-            };
+            let writer = state.writer.as_mut()?;
             if let Err(error) = writer.write_current(bytes.as_deref()) {
                 return Some((Err(stream_error(error)), state));
             }
@@ -846,7 +847,7 @@ async fn api_novel_illustration(req: Request, env: Env, id: i64, name: &str) -> 
         record.use_subdirectory,
     ) {
         Ok(keys) => keys,
-        Err(error) => return Response::error(&format!("Invalid key: {error}"), 500),
+        Err(error) => return Response::error(format!("Invalid key: {error}"), 500),
     };
     let key = match keys.illustration(name) {
         Ok(key) => key,
@@ -871,7 +872,7 @@ async fn api_novel_illustration(req: Request, env: Env, id: i64, name: &str) -> 
                 .from_bytes(bytes)?)
         }
         Ok(None) => Response::error("Not Found", 404),
-        Err(error) => Response::error(&format!("Object store error: {error}"), 500),
+        Err(error) => Response::error(format!("Object store error: {error}"), 500),
     }
 }
 

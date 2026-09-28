@@ -335,11 +335,11 @@ fn expand_tag_targets(records: &[NovelRecord], targets: &[String]) -> Vec<String
 
     let mut expanded = Vec::new();
     for target in targets {
-        if let Ok(id) = target.parse::<i64>() {
-            if existing.contains(&id) {
-                expanded.push(id.to_string());
-                continue;
-            }
+        if let Ok(id) = target.parse::<i64>()
+            && existing.contains(&id)
+        {
+            expanded.push(id.to_string());
+            continue;
         }
 
         if let Some(tag_name) = target.strip_prefix("^tag:") {

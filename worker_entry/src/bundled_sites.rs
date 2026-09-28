@@ -88,9 +88,11 @@ pub async fn load_site_settings(
 /// この時間で追従する (サイト定義は頻繁に変わらないので十分)。
 const SITE_SETTINGS_TTL_MS: f64 = 30_000.0;
 
-static SITE_SETTINGS_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<Option<(f64, Vec<SiteSetting>)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+/// L1 キャッシュの中身: `(書き込み時刻 (ms), コンパイル済み定義)`。
+type SiteSettingsCache = Option<(f64, Vec<SiteSetting>)>;
+
+static SITE_SETTINGS_CACHE: std::sync::LazyLock<std::sync::Mutex<SiteSettingsCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 fn cached_site_settings() -> Option<Vec<SiteSetting>> {
     let cache = SITE_SETTINGS_CACHE.lock().ok()?;

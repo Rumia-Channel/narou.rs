@@ -40,6 +40,11 @@ pub struct DispatchOutcome {
 /// Queue producer binding that carries version-2 job envelopes.
 pub const JOB_QUEUE_BINDING: &str = "NAROU_JOBS";
 
+/// ジョブ中に更新された section hash cache の保留分
+/// (`app_state('inv','section_hash_cache')` と同じ `小説 → (section → digest)` の形)。
+pub type PendingSectionHashCache =
+    Arc<parking_lot::Mutex<Option<HashMap<String, HashMap<String, String>>>>>;
+
 /// `update.interval` の既定値・下限 — native `commands::update::INTERVAL_MIN_SECS`。
 const UPDATE_INTERVAL_MIN_SECS: f64 = 2.5;
 
@@ -79,8 +84,7 @@ pub struct WorkerRuntime {
     /// `SnapshotDownloaderSettings::save_section_hash_cache` (同期) がここへ
     /// 置き、ジョブ終了時に [`Self::persist_pending_section_hash_cache`] が
     /// D1 (`app_state('inv','section_hash_cache')`) へ flush する。
-    pub pending_section_hash_cache:
-        Arc<parking_lot::Mutex<Option<HashMap<String, HashMap<String, String>>>>>,
+    pub pending_section_hash_cache: PendingSectionHashCache,
 }
 
 /// `WorkerRuntime::build_with` が行う重い読み込みのプロファイル。

@@ -14,8 +14,8 @@ use worker::{Request, Response};
 use crate::composition::WorkerRuntime;
 
 fn json(value: serde_json::Value) -> Result<Response> {
-    Ok(Response::from_json(&value)
-        .map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))?)
+    Response::from_json(&value)
+        .map_err(|error| narou_rs::error::NarouError::Platform(error.to_string()))
 }
 
 fn error_response(message: &str) -> Result<Response> {

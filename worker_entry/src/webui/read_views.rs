@@ -440,6 +440,12 @@ async fn diff_list_get(req: &Request, runtime: &WorkerRuntime) -> worker::Result
     Response::from_html(html)
 }
 
+/// 差分一覧 1 行分の `(index, file_name, object key)`。
+type VersionSection = (usize, String, String);
+
+/// バージョン 1 件分の `(version, sections)`。
+type VersionGroup = (String, Vec<VersionSection>);
+
 /// native `render_diff_list_html_for_target` の写し。解決失敗・記録なし・
 /// キャッシュ列挙失敗・キャッシュ空は全部空文字列を返す (= native 同様)。
 async fn render_diff_list_html(runtime: &WorkerRuntime, target: &str) -> String {
@@ -466,7 +472,7 @@ async fn render_diff_list_html(runtime: &WorkerRuntime, target: &str) -> String 
 
     // (version, [(index, file_name, key)]) に畳み込み、version 名の降順に並べる
     // (native `read_sorted_cache_dirs` の降順と同じ)。
-    let mut versions: HashMap<String, Vec<(usize, String, String)>> = HashMap::new();
+    let mut versions: HashMap<String, Vec<VersionSection>> = HashMap::new();
     for key in keys.drain(..) {
         let Some((version, file_name)) = cached_section_key(&prefix, &key) else {
             continue;
@@ -480,8 +486,7 @@ async fn render_diff_list_html(runtime: &WorkerRuntime, target: &str) -> String 
             .or_default()
             .push((index, file_name.to_string(), key));
     }
-    let mut ordered: Vec<(String, Vec<(usize, String, String)>)> =
-        versions.into_iter().collect();
+    let mut ordered: Vec<VersionGroup> = versions.into_iter().collect();
     ordered.sort_by(|a, b| b.0.cmp(&a.0));
 
     let mut html = String::new();
@@ -837,8 +842,8 @@ async fn taginfo(req_ids: Vec<serde_json::Value>, with_exclusion: bool, runtime:
         .await
         .unwrap_or_default();
     let mut selected_counts: HashMap<String, usize> = HashMap::new();
-    for id in selected_ids.iter().copied() {
-        if let Some(tags) = record_tags.get(&id) {
+    for id in selected_ids.iter() {
+        if let Some(tags) = record_tags.get(id) {
             for tag in tags {
                 *selected_counts.entry(tag.clone()).or_insert(0) += 1;
             }

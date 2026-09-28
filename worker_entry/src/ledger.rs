@@ -765,10 +765,10 @@ impl D1SchedulerCheckpoint {
         let Some(row) = row else {
             return Ok(SchedulerCheckpoint::default());
         };
-        if let Some(value) = row.value_yaml.as_deref() {
-            if let Ok(checkpoint) = serde_yaml::from_str(value) {
-                return Ok(checkpoint);
-            }
+        if let Some(value) = row.value_yaml.as_deref()
+            && let Ok(checkpoint) = serde_yaml::from_str(value)
+        {
+            return Ok(checkpoint);
         }
         if let Some(value) = row.value_json.as_deref() {
             return serde_json::from_str(value).map_err(|error| {
@@ -1137,6 +1137,37 @@ fn bind_statement(
     statement.bind(&values).map_err(worker_error)
 }
 
+fn worker_error(error: impl std::fmt::Display) -> NarouError {
+    NarouError::Platform(format!("Worker storage error: {error}"))
+}
+
+/// Number of rows changed by a `run()`; `None` means "no meta" (treat as 0).
+fn changed_rows(result: &D1Result) -> Result<usize> {
+    if !result.success() {
+        return Err(NarouError::Platform(
+            result
+                .error()
+                .unwrap_or_else(|| "D1 statement failed".to_string()),
+        ));
+    }
+    Ok(result
+        .meta()
+        .map_err(worker_error)?
+        .and_then(|meta| meta.changes)
+        .unwrap_or(0))
+}
+
+fn ensure_batch_success(results: &[D1Result]) -> Result<()> {
+    for result in results {
+        if !result.success() {
+            return Err(NarouError::Platform(
+                result.error().unwrap_or_else(|| "D1 batch statement failed".to_string()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1173,34 +1204,4 @@ mod tests {
             Some(checkpoint)
         );
     }
-}
-fn worker_error(error: impl std::fmt::Display) -> NarouError {
-    NarouError::Platform(format!("Worker storage error: {error}"))
-}
-
-/// Number of rows changed by a `run()`; `None` means "no meta" (treat as 0).
-fn changed_rows(result: &D1Result) -> Result<usize> {
-    if !result.success() {
-        return Err(NarouError::Platform(
-            result
-                .error()
-                .unwrap_or_else(|| "D1 statement failed".to_string()),
-        ));
-    }
-    Ok(result
-        .meta()
-        .map_err(worker_error)?
-        .and_then(|meta| meta.changes)
-        .unwrap_or(0))
-}
-
-fn ensure_batch_success(results: &[D1Result]) -> Result<()> {
-    for result in results {
-        if !result.success() {
-            return Err(NarouError::Platform(
-                result.error().unwrap_or_else(|| "D1 batch statement failed".to_string()),
-            ));
-        }
-    }
-    Ok(())
 }

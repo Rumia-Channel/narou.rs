@@ -3,7 +3,7 @@
 //! JSON parity with the native handlers in `src/web/jobs.rs`:
 //! - `queue_clear`      → POST /api/queue/clear
 //! - `api_cancel`       → POST /api/cancel (Ruby parity: running only,
-//!                        pending は消さない。`/api/queue/cancel` は未割当)
+//!   pending は消さない。`/api/queue/cancel` は未割当)
 //! - `cancel_running_task` → POST /api/cancel_running_task
 //! - `remove_pending_task` → POST /api/remove_pending_task
 //! - `restore_pending_tasks` → POST /api/restore_pending_tasks
