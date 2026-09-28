@@ -608,6 +608,11 @@ async fn needs_convert_after_unchanged(runtime: &WorkerRuntime, id: NovelId) -> 
     else {
         return false;
     };
+    // 変換済みテキストを保存しない構成 (`convert.keep-txt=false`) では
+    // そもそも保存されないので、変換を挟む意味がない (EPUB 取得時に組む)。
+    if !crate::convert::keep_converted_text(runtime).await {
+        return false;
+    }
     // 存在確認がエラーでも「無い」とみなして変換に回す: ストア障害時でも
     // convert ジョブが queue_failed として失敗を表面化する (黙って
     // 「テキスト無しのまま成功」にしないため)。

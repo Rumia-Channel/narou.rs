@@ -164,11 +164,13 @@ fn convert_service(runtime: &WorkerRuntime, record: &narou_rs::db::NovelRecord) 
     .with_capabilities(capabilities)
 }
 
-/// 変換済みテキストを保存するか (`convert.keep-txt`、既定 true)。
+/// 変換済みテキストを保存するか (`convert.keep-txt`)。
 ///
 /// 環境変数 `NAROU_RS_KEEP_TXT` (0/false/no/off) が最優先、次に D1 の
-/// local 設定。false のときは EPUB のダウンロード時に組み立て直す。
-async fn keep_converted_text(runtime: &WorkerRuntime) -> bool {
+/// local 設定。Worker は D1 を食わないよう **既定 false** (保存しない) で、
+/// 変換テキストは EPUB のダウンロード時に組み立て直す。true にすると
+/// ダウンロードのたびの変換を省ける代わりに 1 作品あたり数 MB を D1 に持つ。
+pub(crate) async fn keep_converted_text(runtime: &WorkerRuntime) -> bool {
     if let Ok(value) = std::env::var("NAROU_RS_KEEP_TXT") {
         let value = value.trim().to_ascii_lowercase();
         return !matches!(value.as_str(), "0" | "false" | "no" | "off");
@@ -185,7 +187,8 @@ async fn keep_converted_text(runtime: &WorkerRuntime) -> bool {
             value.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "no" | "off"
         ),
-        _ => true,
+        // 未設定の Worker は保存しない (native は既定 true)。
+        _ => false,
     }
 }
 
