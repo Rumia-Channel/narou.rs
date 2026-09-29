@@ -161,6 +161,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "no-color"
         | "color-parser"
         | "server-port"
+        | "server-ws-port"
         | "server-bind"
         | "server-digest-auth.enable"
         | "server-digest-auth.user"
@@ -1058,6 +1059,13 @@ pub fn setting_variables() -> SettingVariables {
             vis(
                 VarType::Integer,
                 "WEBサーバ起動時のポート。server-port + 1 のポートも WebSocket で使用\n※要サーバ再起動",
+            ),
+        ),
+        (
+            "server-ws-port",
+            vis(
+                VarType::Integer,
+                "WebSocket の待受ポート。0 で併設リスナーを作らず、本体ポートの /ws だけで受ける\n※要サーバ再起動",
             ),
         ),
         (

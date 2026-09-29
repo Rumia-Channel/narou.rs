@@ -576,9 +576,13 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **公開は PteWorker が行う**。アプリはプラットフォームから渡される `PORT` にループバックで
   束縛する (`sorahost/start.sh`)。cloudflared / SFTP / パネル API を使う実装は 2026-09 に撤去した
   (任意だった tunnel も不要になったため)。
-- 配置は `sorahost/sorahost.json` (`mode: node` / `start: bash start.sh` /
-  `include: [app, start.sh, sorahost.json]`)。`app/` は配備で入れ替わり、`library/` は
-  `include` に入れないので作品データは残る (初回は 2 回配備して確認する)。
+- 配置は `sorahost/sorahost.json` (`mode: node` / `start: sh start.sh` /
+  `include: [app, start.sh, sorahost.json]`)。**PteWorker は配備ごとに
+  `/home/container/.sorahost/releases/<日時>-<hash>/` を作り直す**ので、ライブラリは
+  その外 (`$VOLUME_DIR/narou-library`) に置く (`start.sh` が自動で割り出す)。
+- **`server-ws-port=0` が必要**: narou.rb の `server-port + 1` は PteWorker が自分の
+  ルータ (workerd) に使う番号と衝突し、プラットフォーム側が `Address already in use`
+  で落ちる。`0` で併設リスナーを切ると本体ポートの `/ws` だけで受ける。
 - 取得リレー (`scripts/sorahost-proxy/`) は**別サーバー**に置くのが既定。同居させるときだけ
   `NAROU_RELAY=1` + `vars.SORAHOST_RELAY_START=bash start.sh` (そのときプラットフォームの
   `PORT` はリレーが使い、narou は 8080)。

@@ -108,7 +108,7 @@ Pterodactyl の Startup 変数、またはコンテナ内の環境変数とし�
 | `NAROU_RS_PORT` | 待受ポート (既定は PteWorker の `PORT`。リレー同居時のみ 8080) |
 | `NAROU_RELAY` | `1` で Worker 用の取得リレーも同じコンテナで起動する (§10) |
 | `SORAHOST_PROXY_KEY` | リレーの合言葉 (§10)。Worker secret の同名値と同じにする |
-| `NAROU_RS_APP` / `NAROU_RS_LIBRARY` | `app/` と `library/` の場所 (既定はルート直下) |
+| `NAROU_RS_APP` / `NAROU_RS_LIBRARY` | `app/` とライブラリの場所 (既定は配備パスから自動) |
 
 `narou setting s3.endpoint=...` のように設定ファイル側へ書いてもよい
 (環境変数があるときは環境変数が優先)。
@@ -121,6 +121,18 @@ Pterodactyl の Startup 変数、またはコンテナ内の環境変数とし�
 初回起動でライブラリを作り、`storage-backend` を `sqlite` に切り替え、
 `server-bind=127.0.0.1` / `server-port=$PORT` / `server-reverse-proxy.enable=true`
 を設定する。
+
+配備で消えない場所 (実測で確認した挙動):
+
+- **ライブラリは release ディレクトリの外**に置く。PteWorker は配備ごとに
+  `/home/container/.sorahost/releases/<日時>-<hash>/` を作り直すため、その中に
+  ライブラリを置くと配備のたびに作品が消える。`start.sh` は配備パスから
+  ボリューム直下を割り出して `$VOLUME_DIR/narou-library` を使う
+  (上書きは `NAROU_RS_LIBRARY`)
+- **`server-ws-port=0` を設定する**。narou.rb は `server-port + 1` も WebSocket に
+  使うが、PteWorker はその番号を自分のルータ (workerd, 例 18081) に使うため
+  `Address already in use` でプラットフォーム側が落ちる。`0` にすると併設リスナーを
+  作らず、本体ポートの `/ws` で受ける (Web UI の接続先は元から `/ws` のため機能は落ちない)
 
 ## 5. 既存ライブラリの移行
 

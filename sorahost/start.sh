@@ -20,7 +20,19 @@ set -eu
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP="${NAROU_RS_APP:-$SELF_DIR/app}"
-LIB="${NAROU_RS_LIBRARY:-$SELF_DIR/library}"
+
+# ライブラリは配備で消えない場所へ置く。PteWorker は配備ごとに
+# `.sorahost/releases/<日時>-<hash>/` を作り直すので、その外 (ボリューム直下) に置く。
+case "$SELF_DIR" in
+  */.sorahost/releases/*)
+    VOLUME_DIR="$(cd "$SELF_DIR/../../.." 2>/dev/null && pwd || echo "$SELF_DIR")"
+    ;;
+  *)
+    VOLUME_DIR="${HOME:-$SELF_DIR}"
+    ;;
+esac
+LIB="${NAROU_RS_LIBRARY:-$VOLUME_DIR/narou-library}"
+
 BIN="$APP/narou_rs"
 PIDS=""
 
@@ -81,11 +93,15 @@ fi
 # --- 毎回そろえる設定 -----------------------------------------------------
 # ループバックだけを向き、Host / Origin は前段 (PteWorker) が渡す公開ホスト名と
 # 一致させる。basic 認証は公開エンドポイントなので必須。
+# server-ws-port=0: 併設 WebSocket リスナーを作らない。narou.rb は
+# `server-port + 1` も使うが、PteWorker はその番号を自分のルータ (workerd) に
+# 使うため衝突する。WebSocket は本体ポートの `/ws` で受けるので機能は落ちない。
 set -- \
   "server-bind=127.0.0.1" \
   "server-port=$NAROU_PORT" \
   "server-reverse-proxy.enable=true" \
   "server-basic-auth.enable=true" \
+  "server-ws-port=0" \
   "convert.section-cache=false"
 if [ -n "${NAROU_WEB_USER:-}" ]; then
   set -- "$@" "server-basic-auth.user=$NAROU_WEB_USER"

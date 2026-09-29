@@ -19,7 +19,9 @@ mod web_tray;
 struct WebAddress {
     host: String,
     port: u16,
-    ws_port: u16,
+    /// 併設 WebSocket リスナーのポート。`server-ws-port=0` のときは None
+    /// (本体ポートの `/ws` だけで受ける)。
+    ws_port: Option<u16>,
 }
 
 pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: bool) {
@@ -50,7 +52,12 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
 
     info!(
         "Starting narou.rs web server on {}:{} (ws:{})",
-        address.host, address.port, address.ws_port
+        address.host,
+        address.port,
+        match address.ws_port {
+            Some(port) => port.to_string(),
+            None => "off (same port)".to_string(),
+        }
     );
 
     let server_security =
@@ -108,7 +115,8 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
     let auto_update_scheduler = Arc::new(parking_lot::Mutex::new(None));
     let app_state = web::AppState {
         port: address.port,
-        ws_port: address.ws_port,
+        // 併設リスナーを切っているときは本体ポートで受ける (`/ws` は本体のルータにもある)。
+        ws_port: address.ws_port.unwrap_or(address.port),
         push_server: push_server.clone(),
         services: services.clone(),
         server_security: Arc::new(parking_lot::RwLock::new(server_security)),
@@ -124,11 +132,10 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         library_backup: Arc::new(web::library_backup::LibraryBackupState::new()),
     };
     let app = web::create_router(app_state.clone());
-    let ws_app = web::push::create_push_router(app_state.clone());
+    let ws_app = address
+        .ws_port
+        .map(|_| web::push::create_push_router(app_state.clone()));
     let addr: SocketAddr = format!("{}:{}", address.host, address.port)
-        .parse()
-        .unwrap();
-    let ws_addr: SocketAddr = format!("{}:{}", address.host, address.ws_port)
         .parse()
         .unwrap();
     let url = format!("http://{}:{}/", display_host(&address.host), address.port);
@@ -143,8 +150,15 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
     }
 
     let listener = bind_or_shutdown_and_retry(addr, &address.host, address.port, "HTTP").await;
-    let ws_listener =
-        bind_or_shutdown_and_retry(ws_addr, &address.host, address.ws_port, "WebSocket").await;
+    let ws_listener = match address.ws_port {
+        Some(ws_port) => {
+            let ws_addr: SocketAddr = format!("{}:{}", address.host, ws_port)
+                .parse()
+                .unwrap();
+            Some(bind_or_shutdown_and_retry(ws_addr, &address.host, ws_port, "WebSocket").await)
+        }
+        None => None,
+    };
 
     // Write PID file for restart recovery
     write_pid_file(&control_token);
@@ -234,7 +248,12 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         eprintln!();
     };
 
-    let ws_task = tokio::spawn(async move { axum::serve(ws_listener, ws_app).await });
+    let ws_task = match (ws_listener, ws_app) {
+        (Some(listener), Some(app)) => {
+            Some(tokio::spawn(async move { axum::serve(listener, app).await }))
+        }
+        _ => None,
+    };
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal)
         .await
@@ -243,7 +262,9 @@ pub async fn run_web_server(port: Option<u16>, no_browser: bool, hide_console: b
         worker_task.abort();
     }
     web::scheduler::stop_auto_update_scheduler(&auto_update_scheduler);
-    ws_task.abort();
+    if let Some(task) = ws_task {
+        task.abort();
+    }
     site_definitions_poll.abort();
     settings_watch.abort();
     remove_pid_file();
@@ -298,9 +319,17 @@ fn resolve_web_address(user_port: Option<u16>) -> Result<WebAddress, String> {
             .map_err(|e| e.to_string())?;
         port
     };
-    let ws_port = port
-        .checked_add(1)
-        .ok_or_else(|| "server-port + 1 が不正な値になります".to_string())?;
+    // `server-ws-port`: 未設定は従来どおり server-port + 1。0 を指定すると
+    // 併設リスナーを作らない (本体ポートの `/ws` で受ける)。SORAHOST のように
+    // 前段が port + 1 を使うプラットフォーム向け。
+    let ws_port = match yaml_u16(global_setting.get("server-ws-port")) {
+        Some(0) => None,
+        Some(value) => Some(value),
+        None => Some(
+            port.checked_add(1)
+                .ok_or_else(|| "server-port + 1 が不正な値になります".to_string())?,
+        ),
+    };
     Ok(WebAddress {
         host,
         port,
