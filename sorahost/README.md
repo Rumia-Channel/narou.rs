@@ -143,6 +143,33 @@ Pterodactyl の Startup 変数 (または `.env`)。`start.sh` が起動のた�
 
 §3.1 の値は CI には置かない (PteWorker のパネルに置く)。
 
+### 3.3 鍵・資格情報の仕様
+
+| 値 | 仕様 (コードが受け付ける形) | 作り方 |
+| --- | --- | --- |
+| `NAROU_WEB_PASSWORD` | 任意の文字列。**空だと basic 認証が無効になる**実装なので空にしない | 未設定なら `start.sh` が 24 文字の英数を自動生成。自分の値にするならパネルに置く |
+| `NAROU_WEB_USER` | 任意の文字列 | 未設定なら `admin` を補う |
+| `NAROU_RS_LOGIN_KEY` | **base64** (標準・パディングあり)。復号後 **16 バイト以上**が必要。32 バイトはそのまま、16〜31 バイトは SHA-256 で 32 バイトへ伸長。前後の空白は無視、壊れた base64 はエラー | `openssl rand -base64 24` (または `-base64 32`) |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | 空でない文字列 (SigV4 の鍵。長さの規定なし) | ストレージ側で発行 |
+| `S3_ENDPOINT` | `scheme://host` (必要なら `:port`)。path-style で扱う | Wasabi: `https://s3.<region>.wasabisys.com` |
+| `S3_REGION` | 空でない文字列 (署名に必須) | 例 `ap-northeast-1` |
+| `SORAHOST_ENDPOINT` | URL。パス込みでよく、`<endpoint>/deploy` へ送る | PteWorker コンソールの「エンドポイント」 |
+| `SORAHOST_TOKEN` | 不透明な文字列。`Authorization: Bearer` で送る | 同「デプロイトークン」(`token rotate` で再発行) |
+| `SORAHOST_PROXY_KEY` | 空でない文字列。完全一致で照合 (定数時間比較ではない) | `openssl rand -hex 32` など |
+
+内部形式 (実装が決めているもの。手で作らない):
+
+- 保存するログイン Cookie は `enc:v1:<base64 nonce>:<base64 暗号文>`。XChaCha20-Poly1305、nonce 24 バイト、
+  AAD は `narou.rs/login-cookie` でサイト (ホスト) を束ねるため、別サイトへ流用できない。
+  旧形式の平文は読める (次回保存で暗号化)
+- `narou login export` の書き出しは version 3 (version 1 / 2 も読める)。
+  `--passphrase` 指定時は Argon2id (19 MiB / t=2 / p=1、salt 16 バイト) → XChaCha20-Poly1305
+  (AAD `narou.rs/login-export`)
+- 資格情報の ID は UUIDv4 形 (小文字 hex)
+- 鍵を変えると保存済み Cookie は復号できない (取り込み直す)
+- `NAROU_ADMIN_TOKEN` は Worker 用 (SORAHOST=T の間は未使用)。定数時間比較で、未設定なら 500
+  `authentication_not_configured`
+
 Worker 側の CI は別系統の値を使う (Environment `Cloudflare`): `CLOUDFLARE_API_TOKEN` /
 `CLOUDFLARE_ACCOUNT_ID` / `SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY` /
 `SORAHOST_PROXY_TOKEN` / `NAROU_S3_*`。**native の `S3_*` と Worker の `NAROU_S3_*` は
