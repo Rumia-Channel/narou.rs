@@ -526,6 +526,15 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   raw HTML を保存しない)・`convert.no-epub=true` (EPUB を保存しない)・`convert.keep-txt=false`
   (txt を残さない) を入れる。どちらも Web UI の EPUB ダウンロードは SQLite の変換済みテキスト
   (`novel_outputs`) から都度生成するので影響しない。
+- **実ファイルを書かない構成** (`sqlite.mirror-files`、既定 true。環境変数
+  `NAROU_RS_MIRROR_FILES=0` でも切れる): SQLite モードの `小説データ/` ミラーを
+  書かない。保存先は `objects`/`object_chunks` だけになる。読み出しは DB と
+  `objects` で完結し、変換が要求するファイル (`toc.yaml` / `本文/*.yaml` /
+  `setting.ini` / `replace.txt`) は `NativeStore::materialize_novel_files` が
+  スコープの間だけ実体化し、抜けると自分が書いた分だけ消す
+  (`MaterializedNovelFiles`)。実ファイル前提の補助 (`narou illust` の
+  orphan/rebuild/fix-ext、`narou clean`) は対象が無いため実質何もしない。
+  `narou backup` / `narou db export-yaml --in-place` は従来どおり動く。
 - **生データ (raw HTML) を保存しない構成**:
   - `DownloaderSettings::save_raw_html()` が唯一の判定。native は `economy` に `nosave_raw` が
     あれば false、**Worker は常に false** (`WorkerDownloaderSettings` / `SnapshotDownloaderSettings`)。

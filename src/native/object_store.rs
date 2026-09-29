@@ -573,6 +573,27 @@ impl NativeStore {
         Self::for_narou_root(&narou_root)
     }
 
+    /// 保存済みオブジェクトを小説ディレクトリへ実ファイルとして取り出す (同期)。
+    ///
+    /// ミラーを書かない構成 (`sqlite.mirror-files=false`) で、変換がファイルを
+    /// 要求するときに使う。ファイル保存の構成では実体があるので何もしない。
+    /// 返り値のガードがスコープを抜けると、取り出したファイルだけを消す。
+    pub fn materialize_novel_files(&self, novel_dir: &Path) -> Result<MaterializedNovelFiles> {
+        let NativeStore::Sqlite(store) = self else {
+            return Ok(MaterializedNovelFiles::default());
+        };
+        let root = store.archive_root();
+        let Some(prefix) = logical_key_for_native_path(root, novel_dir) else {
+            return Ok(MaterializedNovelFiles::default());
+        };
+        let paths = store.materialize_into(
+            novel_dir,
+            &prefix,
+            crate::platform::split_store::ILLUSTRATION_SEGMENT,
+        )?;
+        Ok(MaterializedNovelFiles::from_paths(paths))
+    }
+
     /// Rebuild a deleted mirror file from the stored object.
     ///
     /// Returns `false` when the backend has no second copy (filesystem mode) or
@@ -603,6 +624,36 @@ pub fn ensure_mirror_file(path: &Path) -> bool {
     NativeStore::for_narou_root(inventory.root_dir())
         .and_then(|store| store.restore_mirror_file(path))
         .unwrap_or(false)
+}
+
+/// 変換の間だけ、ストアの内容を小説ディレクトリへ取り出したもの。
+///
+/// `sqlite.mirror-files=false` の構成では `小説データ/` に実ファイルが無いため、
+/// 変換が要求する `toc.yaml` / `本文/*.yaml` / `setting.ini` / `replace.txt` を
+/// 一時的に取り出す。スコープを抜けると**自分が取り出したファイルだけ**を消す
+/// (元からあったファイルは触らない)。挿絵は別経路 (`native::illustrations`) が
+/// 受け持つので対象外。
+#[derive(Default)]
+pub struct MaterializedNovelFiles {
+    paths: Vec<PathBuf>,
+}
+
+impl MaterializedNovelFiles {
+    pub fn from_paths(paths: Vec<PathBuf>) -> Self {
+        Self { paths }
+    }
+
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+}
+
+impl Drop for MaterializedNovelFiles {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 /// native の保存先ペア。

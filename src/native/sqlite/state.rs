@@ -249,6 +249,21 @@ pub enum StorageMode {
     Sqlite,
 }
 
+/// 実ファイルのミラーを書くか (`sqlite.mirror-files`、既定 true)。
+///
+/// false のときは `objects`/`object_chunks` だけが保存先になり、`小説データ/`
+/// へは書かない (SORAHOST のような容量の厳しい環境向け)。読み出しは
+/// SQLite だけで完結する。環境変数 `NAROU_RS_MIRROR_FILES=0` でも切れる。
+pub fn mirror_files_enabled() -> bool {
+    match std::env::var("NAROU_RS_MIRROR_FILES") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => crate::compat::load_local_setting_bool_or("sqlite.mirror-files", true),
+    }
+}
+
 pub const MARKER_FILE: &str = "storage-backend";
 
 pub fn read_mode(narou_dir: &Path) -> StorageMode {

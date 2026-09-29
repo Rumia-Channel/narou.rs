@@ -149,6 +149,23 @@ impl Default for SectionConvertCache {
     }
 }
 
+/// 変換の間だけ、ストアの内容を小説ディレクトリへ取り出す。
+///
+/// `sqlite.mirror-files=false` の構成では `小説データ/` に実ファイルが無いため、
+/// 変換が要求する `toc.yaml` / `本文/*.yaml` / `setting.ini` / `replace.txt` を
+/// ここで実体化する (返り値のガードがスコープを抜けると、取り出した分だけ消える)。
+/// ミラーを書く構成では何もしない。
+#[cfg(feature = "native-runtime")]
+fn materialize_for_conversion(
+    novel_dir: &std::path::Path,
+) -> Result<crate::native::object_store::MaterializedNovelFiles> {
+    if crate::native::sqlite::state::mirror_files_enabled() {
+        return Ok(crate::native::object_store::MaterializedNovelFiles::default());
+    }
+    let store = crate::native::object_store::NativeStore::for_current_root()?;
+    store.materialize_novel_files(novel_dir)
+}
+
 /// 変換済みテキストをファイルとして残すか (`convert.keep-txt`、既定 true)。
 ///
 /// false のときは `novel.txt` の固定名ミラーを書かず、呼び出し側が変換後の
@@ -997,6 +1014,8 @@ impl NovelConverter {
     pub fn convert_novel_by_id(&mut self, id: i64, novel_dir: &std::path::Path) -> Result<String> {
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();
+        // ミラーを書かない構成では実ファイルが無いので、変換の間だけ取り出す。
+        let _materialized = materialize_for_conversion(novel_dir)?;
         let toc_path = novel_dir.join("toc.yaml");
         let toc_content = std::fs::read_to_string(&toc_path).map_err(NarouError::Io)?;
         let toc: crate::downloader::TocFile =
@@ -1098,6 +1117,8 @@ impl NovelConverter {
         self.apply_record_fetch_policy(self.resolve_novel_record(_id).as_ref());
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();
+        // ミラーを書かない構成では実ファイルが無いので、変換の間だけ取り出す。
+        let _materialized = materialize_for_conversion(novel_dir)?;
         let toc_path = novel_dir.join("toc.yaml");
         let toc_content = std::fs::read_to_string(&toc_path).map_err(NarouError::Io)?;
         let toc: crate::downloader::TocFile =
@@ -1960,7 +1981,10 @@ mod tests {
 
         let mut reopened = super::SectionConvertCache::default();
         let loaded = reopened.bucket(3062).unwrap();
-        assert_eq!(loaded["本文\\1.yaml"].converted_section.body.len(), body.len());
+        assert_eq!(
+            loaded["本文\\1.yaml"].converted_section.body.len(),
+            body.len()
+        );
 
         *crate::db::DATABASE.lock() = None;
     }

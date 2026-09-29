@@ -132,6 +132,12 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
   - 保存 EPUB (`no-epub`): テキスト作品で 2 MB、画像主体で 40〜55 MB
   - txt (`keep-txt`): 5.2 MB。変換結果は SQLite に残り、Web UI の
     「EPUB をダウンロード」はそこから都度生成する
+  - 実ファイルのミラー (`sqlite.mirror-files=false`): `小説データ/` を作らない。
+    **保存先は `.narou/db.sqlite` だけ**になり、変換は必要な間だけ
+    `toc.yaml` / `本文/*.yaml` / `setting.ini` / `replace.txt` を取り出して消す。
+    この構成では `narou illust orphan|rebuild|fix-ext` と `narou clean` は
+    (対象の実ファイルが無いので) 実質何もしない。`narou backup` と
+    `narou db export-yaml --in-place` によるロールバックは従来どおり動く
 - 挿絵の削除を伴う `narou illust orphan -f` は、raw が無い構成ではキャッシュを唯一の
   参照源にする (キャッシュは保存時に必ず書かれるが、これを失っていると孤児と判定される)
 - **古い出力ファイルは残る**: 出力名の設定 (`convert.filename-to-ncode` や

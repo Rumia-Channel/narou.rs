@@ -78,10 +78,13 @@ if [ ! -d "$LIB/.narou" ]; then
   #                メモリ上で行うので、新規話の挿絵は従来どおり保存される)
   #   no-epub      EPUB を保存しない (Web UI の「EPUB をダウンロード」は都度生成)
   #   keep-txt     txt を残さない (変換結果は SQLite にあり EPUB はそこから生成)
+  #   mirror-files 小説データ/ へ実ファイルを書かない (DB だけが保存先。変換は
+  #                必要な間だけ取り出して消す)
   "$NAROU" setting \
     economy=nosave_diff,nosave_raw \
     convert.no-epub=true \
-    convert.keep-txt=false < /dev/null
+    convert.keep-txt=false \
+    sqlite.mirror-files=false < /dev/null
 fi
 
 # 公開はトンネル経由なので、ループバックだけを向き、Host / Origin は前段が

@@ -111,6 +111,7 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "send.without-freeze"
         | "convert.section-cache"
         | "convert.keep-txt"
+        | "sqlite.mirror-files"
         | "auto-add-tags"
         | "s3.asset-backend"
         | "s3.endpoint"
@@ -767,6 +768,13 @@ pub fn setting_variables() -> SettingVariables {
             sel(
                 "EPUB 変換時の挿絵自動回転 (AozoraEpub3 の RotateImage 相当)。auto: AozoraEpub3.ini の設定に従う / 0: 回転しない / 1: 横長を右へ90° / 2: 横長を左へ90°。組み込みエンジン・外部 AozoraEpub3_Lite.exe・Worker に効く (Java 版 AozoraEpub3.jar は INI 差し替えが出来ないため対象外)",
                 vec!["auto", "0", "1", "2"],
+            ),
+        ),
+        (
+            "sqlite.mirror-files",
+            vis(
+                VarType::Boolean,
+                "SQLite 管理時に 小説データ/ へ実ファイルのミラーを書く (既定 true)。false では DB だけを保存先にし、変換の間だけ一時的に取り出す (容量の厳しい環境向け。環境変数 NAROU_RS_MIRROR_FILES=0 でも切れる)",
             ),
         ),
         (
