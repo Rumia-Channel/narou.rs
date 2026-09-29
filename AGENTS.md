@@ -521,6 +521,10 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   ローカルから S3 へ写す。`narou illust s3-verify` がバイト単位で突き合わせる。どちらも
   ライブラリ全体が対象で、`s3.asset-backend=s3` と接続情報が必要
   (`platform::store_migration::migrate_page` を共有)。
+- **SORAHOST は `concurrency=true`**: DL/update と convert/send を別レーンで並行に流す
+  (小説単位の排他は `.narou/lock.yaml`)。実測ピークは 2 ジョブ同時で約 120MB (debug) +
+  常駐 31MB なので、256MB のコンテナでも通常運用は収まる。うごイラ組み立て (~56MB) や
+  大きい挿絵入り EPUB が重なるときだけ注意。
 - **SORAHOST の既定は容量優先**: `sorahost/start.sh` が初回に `convert.section-cache=false`
   (話ごとの変換キャッシュ無し)・`economy=nosave_diff,nosave_raw` (更新ごとの差分スナップショットと
   raw HTML を保存しない)・`convert.no-epub=true` (EPUB を保存しない)・`convert.keep-txt=false`

@@ -149,7 +149,27 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
   EPUB を作らない設定 (`convert.no-epub=true`) にしておけばディスクを消費しない
 - バックアップ (`narou backup`) は挿絵が S3 にあるためテキスト主体で小さくなる
 
-## 7. 更新
+## 7. メモリ
+
+実測 (Windows の debug ビルド = 上限側の値。Linux の release は通常もっと小さい):
+
+| 構成要素 | 実測 |
+| --- | --- |
+| `narou web` 常駐 (13 作品・API 1 回) | 31 MB |
+| `narou convert` (391 話の長編) | ピーク 61 MB |
+| `narou convert` 2 本同時 (concurrency 相当) | 合計ピーク 120 MB |
+| cloudflared | 約 16 MB (Cloudflare 公式の systemd 例) |
+| SQLite | ディスク backed (ページキャッシュは既定で 2MB 程度) |
+
+`start.sh` は `concurrency=true` を設定する (DL/update と convert/send を別レーンで並行)。
+256MB のコンテナなら 常駐 + 2 ジョブ + トンネル + OS で **約 200MB** が目安。
+
+- 小説単位の排他 (`.narou/lock.yaml`) があるので、同じ小説が両レーンで同時に走らない
+- スパイクが大きいのは うごイラ (APNG) の組み立て (実例 19 フレームで約 56MB) と
+  挿絵入りの大きい EPUB (S3 は 1 オブジェクトを最大 64MB まで一括で読み書きする)
+- OOM で落ちる場合は `narou setting concurrency=false` にするか、メモリ割当を増やす
+
+## 8. 更新
 
 1. 新しい `narou_rs` をビルドして配置する
 2. Pterodactyl からサーバーを再起動する
@@ -157,7 +177,7 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
 `self-update` は使わない (実行ファイルの置き場が読み取り専用になりうるため)。
 `webnovel/*.yaml` を差し替えたときも再起動で反映される。
 
-## 8. 使えない機能
+## 9. 使えない機能
 
 SORAHOST のコンテナで動かすため、次は動かない (Web UI 側では 501 相当):
 
@@ -166,7 +186,7 @@ SORAHOST のコンテナで動かすため、次は動かない (Web UI 側で�
 - 外部 AozoraEpub3 (`aozoraepub3dir` は設定しない。Lite を同梱して使う)
 - `narou_rs_login` (ブラウザのある端末で実行し、`narou login import` で取り込む)
 
-## 9. 確認
+## 10. 確認
 
 ```sh
 curl -I https://narou.example.com/            # basic 認証のチャレンジが返る

@@ -80,11 +80,15 @@ if [ ! -d "$LIB/.narou" ]; then
   #   keep-txt     txt を残さない (変換結果は SQLite にあり EPUB はそこから生成)
   #   mirror-files 小説データ/ へ実ファイルを書かない (DB だけが保存先。変換は
   #                必要な間だけ取り出して消す)
+  # concurrency: DL/update と convert/send を別レーンで並行に流す (小説単位の
+  # 排他は .narou/lock.yaml が効くので、同じ小説が両方で走ることはない)。
+  # 実測のピークは 2 ジョブ同時で約 120MB (debug ビルド) + 常駐 31MB。
   "$NAROU" setting \
     economy=nosave_diff,nosave_raw \
     convert.no-epub=true \
     convert.keep-txt=false \
-    sqlite.mirror-files=false < /dev/null
+    sqlite.mirror-files=false \
+    concurrency=true < /dev/null
 fi
 
 # 公開はトンネル経由なので、ループバックだけを向き、Host / Origin は前段が
