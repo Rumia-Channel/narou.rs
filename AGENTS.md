@@ -567,6 +567,23 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   保存先が利用者自身の設定値であることを示し、公開アドレス判定を掛けず (ローカル MinIO を許可)、
   応答ヘッダを全部返す (`ETag` / `Content-Range` が保存先の契約)。
 
+### SORAHOST (PteWorker) への配備 (2026-09)
+
+- 専用サーバー 1 台で native `narou_rs` を動かす。配備は `sorahost-cli` に任せ、CI の必要値は
+  `SORAHOST_ENDPOINT` / `SORAHOST_TOKEN` の 2 つだけ (`.github/workflows/deploy-sorahost.yml`)。
+  Repository variable `SORAHOST` が `T` のときだけ動き、その間は `platform.yml` の Worker 系
+  ジョブ (wasm / worker / worker-contract / relay-deploy / worker-deploy-*) も skip する。
+- **公開は PteWorker が行う**。アプリはプラットフォームから渡される `PORT` にループバックで
+  束縛する (`sorahost/start.sh`)。cloudflared / SFTP / パネル API を使う実装は 2026-09 に撤去した
+  (任意だった tunnel も不要になったため)。
+- 配置は `sorahost/sorahost.json` (`mode: node` / `start: bash start.sh` /
+  `include: [app, start.sh, sorahost.json]`)。`app/` は配備で入れ替わり、`library/` は
+  `include` に入れないので作品データは残る (初回は 2 回配備して確認する)。
+- 取得リレー (`scripts/sorahost-proxy/`) は**別サーバー**に置くのが既定。同居させるときだけ
+  `NAROU_RELAY=1` + `vars.SORAHOST_RELAY_START=bash start.sh` (そのときプラットフォームの
+  `PORT` はリレーが使い、narou は 8080)。
+- 手順・実測値・注意は `sorahost/README.md`。
+
 ### Worker の契約テスト (2026-09)
 
 - `worker_entry/tests/contract.mjs` … HTTP 契約（health / 認証 fail-closed / 一覧・ジョブ API /

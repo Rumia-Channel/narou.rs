@@ -1,22 +1,34 @@
 # SORAHOST で narou.rs を動かす
 
-SORAHOST (Pterodactyl) のコンテナで native 版 `narou_rs` を常駐させ、Web UI を
-Cloudflare Tunnel 経由で公開する手順。**Workers は使わない** (無料枠の CPU・
-接続数・ポート制約を受けない)。
+SORAHOST (PteWorker の node モード) のコンテナで native 版 `narou_rs` を常駐させる
+手順。**Workers は使わない**。専用サーバー 1 台で完結し、公開は PteWorker が行うので
+Cloudflare Tunnel は要らない。CI から配備するのに必要な値は
+**`SORAHOST_ENDPOINT` と `SORAHOST_TOKEN` の 2 つだけ** (§9)。
 
 ```
-Browser ──https──▶ Cloudflare (TLS / WAF / Tunnel)
-                      │ cloudflared が張る外向き接続 (7844/TCP+UDP)
+Browser ──https──▶ PteWorker (公開 URL / TLS)
+                      │ ループバックへ転送
                       ▼
               SORAHOST コンテナ内
-                cloudflared ──▶ http://127.0.0.1:8080 ──▶ narou_rs web
-                                                  │
-                                                  └─ 挿絵だけ S3 (Wasabi など) へ
+                narou_rs web (127.0.0.1:$PORT)
+                      │
+                      └─ 挿絵だけ S3 (Wasabi など) へ
 ```
 
-- 受信ポートは不要。SORAHOST の割当ポート番号 (`nagoya.sorahost.net:50071` 等) には依存しない
+コンテナ (プロジェクトルート = ボリューム) の中身:
+
+```
+sorahost.json   配備の定義 (リポジトリの sorahost/sorahost.json)
+start.sh        起動スクリプト (リポジトリの sorahost/start.sh)
+app/            実行ファイル + webnovel/  (配備で入れ替わる)
+library/        narou のデータ (.narou / 小説データ / webnovel)。配備に含めない
+```
+
+- アプリは **PteWorker から渡される `PORT`** にループバックで束縛する
+  (外部へ直接公開しない。受信ポートの設定は不要)
 - メタデータ・本文はライブラリ内の SQLite (`.narou/db.sqlite`)、挿絵だけ S3 に置く
-- アプリはループバックにしかバインドしないので、外部から直接叩けない
+- 公開 URL は PteWorker が発行する (`sorahost-cli deploy` の出力 `url`、または
+  コンソールの `url` コマンド)
 
 ## 1. ビルド (Linux バイナリを用意する)
 
@@ -53,42 +65,32 @@ cargo build --release --features lite
 隣の `webnovel/` から定義をコピーするため、**`webnovel/` を同梱しないと
 サイト定義が空になる**。
 
-配置先 (コンテナ内):
+配置 (コンテナ内。プロジェクトルート = ボリュームの直下):
 
 ```
-/home/container/narou/
-  narou_rs            実行ファイル (chmod +x)
-  webnovel/*.yaml     同梱のサイト定義
-  start.sh            このリポジトリの sorahost/start.sh
-  library/            .narou / 小説データ / webnovel (初回起動で作られる)
-  bin/cloudflared     start.sh が取得 (手元で置いてもよい)
-  .cloudflared-token  トンネルのトークン (chmod 600)
+sorahost.json            リポジトリの sorahost/sorahost.json
+start.sh                 リポジトリの sorahost/start.sh
+app/narou_rs             実行ファイル (chmod +x)
+app/narou_rs_backup      バックアップ用ヘルパー (Web UI のバックアップが使う)
+app/webnovel/*.yaml      同梱のサイト定義 (初回 init が library/ へコピーする)
+library/                 初回起動で作られる (.narou / 小説データ / webnovel)
 ```
 
-`/home/container` 配下は再デプロイで消えない。デプロイ用のディレクトリを
-使い捨ての置き場にしないこと。
+`library/` は配備に含めないので、配備を繰り返しても作品データは残る (はず。
+初回は 2 回配備して残ることを確認する)。
 
-## 2. Cloudflare Tunnel
+## 2. 公開
 
-CI から配備する場合 (§9)、tunnel と DNS は `sorahost/ci/deploy_sorahost.py` が
-Cloudflare API で作る。手動で作るときの手順は次のとおり。
+PteWorker が公開する。アプリは渡された `PORT` にループバックで束縛するだけで、
+こちら側で TLS やトンネルを用意する必要はない。
 
-1. Cloudflare ダッシュボード → **Networking → Tunnels → Create Tunnel**
-   (コネクタは `cloudflared` を選ぶ)
-2. 表示される**トークン**を控える (再表示できない。失くしたら rotate)
-3. **Public hostname** を追加する
-   - Hostname: `narou.example.com` (自分のドメイン)
-   - Service: `http://127.0.0.1:8080` (`NAROU_RS_PORT` を変えたら合わせる)
-4. DNS レコードはダッシュボードが自動作成する (CNAME → `<UUID>.cfargotunnel.com`)
-5. **SSL/TLS モードを Off 以外にする** (Off だと WebSocket が通らない)
-6. **Network → WebSockets を On** にする
-
-トークンはコンテナ内の `/home/container/narou/.cloudflared-token` に置く。
-
-```sh
-printf '%s' '<TOKEN>' > /home/container/narou/.cloudflared-token
-chmod 600 /home/container/narou/.cloudflared-token
-```
+- 公開 URL はコンソールの `url` コマンドで再確認できる (`https://.../` の形)
+- basic 認証は narou 側で行う (`NAROU_WEB_PASSWORD` を設定する)
+- WebSocket (ジョブ進捗) は PteWorker のプロキシ経由で通る (進捗が出ない場合は
+  プロキシが upgrade を通しているかを確認する)
+- 自前のドメインや CDN を前段に置きたい場合だけ、別途トンネルやリバースプロキシを
+  挟む。そのときは `server-reverse-proxy.enable` の扱い (Host / Origin の判定) が
+  変わるので、`narou setting` で調整する
 
 ## 3. 環境変数
 
@@ -103,24 +105,22 @@ Pterodactyl の Startup 変数、またはコンテナ内の環境変数とし�
 | `S3_ENDPOINT` / `S3_BUCKET` / `S3_REGION` | 接続先 (Wasabi は `https://s3.<region>.wasabisys.com`) |
 | `S3_PREFIX` | バケット内の接頭辞 (例 `narou/library`) |
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | 資格情報 |
-| `NAROU_RS_PORT` | ローカルの待受ポート (既定 8080) |
+| `NAROU_RS_PORT` | 待受ポート (既定は PteWorker の `PORT`。リレー同居時のみ 8080) |
 | `NAROU_RELAY` | `1` で Worker 用の取得リレーも同じコンテナで起動する (§10) |
 | `SORAHOST_PROXY_KEY` | リレーの合言葉 (§10)。Worker secret の同名値と同じにする |
-| `TUNNEL_TOKEN_FILE` | トークンのパス (既定 `$NAROU_RS_ROOT/.cloudflared-token`) |
+| `NAROU_RS_APP` / `NAROU_RS_LIBRARY` | `app/` と `library/` の場所 (既定はルート直下) |
 
 `narou setting s3.endpoint=...` のように設定ファイル側へ書いてもよい
 (環境変数があるときは環境変数が優先)。
 
 ## 4. 起動
 
-Pterodactyl の起動コマンドに次を設定する。
-
-```
-bash /home/container/narou/start.sh
-```
+起動コマンドは `sorahost.json` が持つ (`"start": "bash start.sh"`)。Pterodactyl の
+画面で起動コマンドを設定する必要はない (`sorahost-cli deploy` が反映する)。
 
 初回起動でライブラリを作り、`storage-backend` を `sqlite` に切り替え、
-`server-bind=127.0.0.1` / `server-reverse-proxy.enable=true` を設定する。
+`server-bind=127.0.0.1` / `server-port=$PORT` / `server-reverse-proxy.enable=true`
+を設定する。
 
 ## 5. 既存ライブラリの移行
 
@@ -185,16 +185,15 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
 | `narou web` 常駐 (13 作品・API 1 回) | 31 MB |
 | `narou convert` (391 話の長編) | ピーク 61 MB |
 | `narou convert` 2 本同時 (concurrency 相当) | 合計ピーク 120 MB |
-| cloudflared | 約 16 MB (Cloudflare 公式の systemd 例) |
 | SQLite | ディスク backed (ページキャッシュは既定で 2MB 程度) |
 
 `start.sh` は `concurrency=true` を設定する (DL/update と convert/send を別レーンで並行)。
-常駐 + 2 ジョブ + トンネル + OS のピークは次のとおり:
+トンネルやリレーを同居させない構成 (既定) のピークは次のとおり:
 
 | メモリ割当 | 通常 (2 ジョブが普通サイズ) | スパイク含む最悪ケース |
 | --- | --- | --- |
-| 256 MB | 約 200 MB (余裕 50〜60 MB) | 超過し得る (うごイラ + 大きい EPUB が重なるとき) |
-| **384 MB** | 約 200 MB (余裕 180 MB) | 約 300〜320 MB で収まる見込み |
+| 256 MB | 約 180 MB (余裕 70 MB) | 超過し得る (うごイラ + 大きい EPUB が重なるとき) |
+| **384 MB** | 約 180 MB (余裕 200 MB) | 約 300〜320 MB で収まる見込み |
 
 スパイク込みでも安全側に倒すなら **384 MB** を推奨。256 MB でも通常運用は収まるが、
 画像の多い作品を同時に 2 本処理するときだけ余裕がなくなる。
@@ -206,11 +205,15 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
 
 ## 8. 更新
 
-1. 新しい `narou_rs` をビルドして配置する
-2. Pterodactyl からサーバーを再起動する
+`develop` に push する (§9 の CI が配備する) か、手元から:
 
-`self-update` は使わない (実行ファイルの置き場が読み取り専用になりうるため)。
-`webnovel/*.yaml` を差し替えたときも再起動で反映される。
+```sh
+cd <sorahost.json があるフォルダー>
+SORAHOST_ENDPOINT=... SORAHOST_TOKEN=... npx sorahost-cli deploy --yes
+```
+
+配備すると PteWorker が起動し直す。`self-update` は使わない。
+`app/webnovel/*.yaml` を差し替えたときも、配備 (か手動の `restart`) で反映される。
 
 ## 9. CI からの自動配備
 
@@ -218,74 +221,51 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
 ビルドから配備まで自動で流れる。**動くのは Repository variable の
 `SORAHOST` が `T` のときだけ** (未設定・`F` なら何もせず終わる)。
 
-`SORAHOST` が `T` の間は **Cloudflare Workers 側の CI も止まる** (`.github/workflows/platform.yml`
-の wasm / worker / worker-contract / relay-deploy / worker-deploy-develop /
-worker-deploy-production が skip される)。配備先を Worker に戻すときは `SORAHOST` を
-`F` にするか消す (native / native-gpl / license のテストは配備先に依存しないので常に走る)。
+`SORAHOST` が `T` の間は **Cloudflare Workers 側の CI も止まる**
+(`.github/workflows/platform.yml` の wasm / worker / worker-contract / relay-deploy /
+worker-deploy-develop / worker-deploy-production が skip)。Worker に戻すときは
+`SORAHOST` を `F` にするか消す (native / native-gpl / license は常に走る)。
 
 流れ:
 
 1. `.github/workflows/build-linux.yml` が Linux バイナリを作る (GitHub ホストの runner)
-2. Cloudflare API で tunnel を用意する (無ければ作成・あれば再利用)
-   - 公開ホスト名 → `http://127.0.0.1:8080` の ingress
-   - `<ホスト名>` の CNAME を `<tunnel-id>.cfargotunnel.com` に向ける (proxied)
-3. SFTP でバンドルを転送する (`narou_rs` 3 種 + `webnovel/` + `preset/` + `start.sh`)
-4. tunnel トークンを `.cloudflared-token` へ書く (値が変わったときだけ)
-5. パネルの API が設定されていればサーバーを再起動する
-6. `SORAHOST_SMOKE_URL` があれば応答を確認する
+2. `deploy/` に `app/` (narou_rs / narou_rs_backup / webnovel) + `start.sh` +
+   `sorahost.json` を集める
+3. `sorahost-cli deploy` で SORAHOST へ送る (`--json` の `url` が公開先)
+4. 公開先を叩いて応答を確認する (basic 認証があるので 401/403 でも「立っている」)
 
 ### Environment `SORAHOST` に置く値
 
 | 種別 | 名前 | 用途 |
 | --- | --- | --- |
-| var | `SORAHOST_HOST` | SFTP ホスト (パネルのアドレス) |
-| var | `SORAHOST_USER` | SFTP ユーザ |
-| var | `SORAHOST_TUNNEL_HOSTNAME` | 公開ホスト名 (例 `narou.example.com`) |
-| secret | `SORAHOST_PASSWORD` | SFTP パスワード |
-| secret | `SORAHOST_SSH_KEY` | 秘密鍵 (パスワードの代わり。任意) |
-| var | `SORAHOST_TUNNEL_NAME` | tunnel 名 (任意。既定 `narou-sorahost`) |
-| var | `SORAHOST_SFTP_PORT` | SFTP ポート (任意。既定 2022) |
-| var | `SORAHOST_REMOTE_DIR` | 配置先 (任意。既定 `/narou` = コンテナの `~/narou`) |
-| var | `SORAHOST_SERVICE_PORT` | コンテナ内の待受ポート (任意。既定 8080) |
-| var | `SORAHOST_PANEL_URL` | パネル URL (任意。再起動に使う) |
-| var | `SORAHOST_SERVER_ID` | サーバー ID (任意。再起動に使う) |
-| secret | `SORAHOST_CLIENT_API_KEY` | パネルのクライアント API キー (任意) |
-| var | `SORAHOST_SMOKE_URL` | 配備後の確認 URL (任意) |
+| secret | `SORAHOST_ENDPOINT` | PteWorker のコンソールに出るエンドポイント |
+| secret | `SORAHOST_TOKEN` | デプロイトークン (`Authorization: Bearer`) |
+| var | `SORAHOST_SMOKE_URL` | 任意。確認先 (未設定なら配備結果の `url` を使う) |
 
-Cloudflare の値も **この環境に置く** (`secrets.CLOUDFLARE_API_TOKEN` と
-`vars.CLOUDFLARE_ACCOUNT_ID`。環境 `Cloudflare` と同じものでよい)。
-API トークンの権限は **Account: Cloudflare Tunnel Edit** と **Zone: DNS Edit**。
+この 2 つ (と任意の 1 つ) だけ。SFTP も Cloudflare の資格情報も使わない。
 
-> なぜ環境を分けないのか: job が使える Environment は 1 つだけで、かつこの
-> リポジトリは public のため Actions の job 出力が誰でも読める。tunnel トークンを
-> job 間で渡す設計にすると秘密が公開されるので、1 つの job の中で完結させている。
-
-再起動の 3 値 (`SORAHOST_PANEL_URL` / `SORAHOST_SERVER_ID` /
-`SORAHOST_CLIENT_API_KEY`) を入れない場合は、配備後にパネルから手で再起動する。
-
-> Worker 側の配備 (`.github/workflows/platform.yml`) はこの変数の影響を受けない。
-> SORAHOST へ一本化するときは、同ワークフローの配備ジョブに
-> `if: vars.SORAHOST != 'T'` を足すか、ワークフロー自体を無効化する。
->
 > `SORAHOST` 環境に**同名の `SORAHOST` 変数を置かないこと** (Repository variable
 > の判定と混ざる)。
 
-## 10. Worker の取得リレーと同じサーバーで動かす
+アプリ側の設定 (`NAROU_WEB_PASSWORD` / `S3_*` / `NAROU_RS_ASSET_BACKEND` など) は
+CI ではなく **PteWorker の `.env`** に置く (§3、ひな形は `sorahost/narou.env.example`)。
 
-Worker の踏み台 (`scripts/sorahost-proxy/`) と同じ SORAHOST で narou も動かせる。
-PteWorker は **1 プロジェクト = 起動コマンド 1 つ** なので、起動コマンドを narou の
-`start.sh` に寄せ、リレーはそこから起動する。
+## 10. Worker の取得リレーと同じサーバーで動かす (任意)
 
-1. パネルの `.env` に `NAROU_RELAY=1` を足す (`SORAHOST_PROXY_KEY` は既にある値のまま。
-   narou 側の `NAROU_*` / `S3_*` と同居してよい)。
-2. リレーの起動コマンドを差し替える。CI から配備している場合は Repository variable
-   `SORAHOST_RELAY_START` = `bash narou/start.sh` を入れる (未設定なら従来どおり
-   `node server.mjs` で、リレーだけが動く)。
-3. narou を先に配備してからリレーを配備する (`narou/start.sh` が無いと起動しない)。
-4. 再起動し、ログに `取得リレーを起動しました` と `narou_rs` の起動が出ることを確認する。
+既定は **別サーバー** (専用サーバー 1 台で narou だけを動かす)。どうしても同じ
+サーバーへ同居させたい場合だけ、次の手順になる。PteWorker は
+**1 プロジェクト = 起動コマンド 1 つ** なので、起動コマンドを narou の `start.sh`
+に寄せて、リレーはそこから起動する。
 
-- ポート: リレーはプラットフォームの `PORT` (127.0.0.1)、narou は `NAROU_RS_PORT`
-  (既定 8080)。`start.sh` はプラットフォームの `PORT` を上書きしない。
+1. パネルの `.env` に `NAROU_RELAY=1` を足す (`SORAHOST_PROXY_KEY` は既にある値のまま)
+2. リレー側の起動コマンドを `bash start.sh` に差し替える。リレーを CI から配備して
+   いる場合は Repository variable `SORAHOST_RELAY_START` = `bash start.sh` を入れる
+   (未設定なら従来どおり `node server.mjs` で、リレーだけが動く)
+3. narou を先に配備してからリレーを配備する (`start.sh` が無いと起動しない)
+4. ログに `取得リレーを起動しました` と `narou` の起動が出ることを確認する
+
+- ポート: リレーがプラットフォームの `PORT` (127.0.0.1)、narou は `NAROU_RS_PORT`
+  (既定 8080)。`start.sh` は同居時にプラットフォームの `PORT` を narou へ渡さない
 - リレーの合言葉は Worker secret の `SORAHOST_PROXY_KEY` と**同じ値**にする。ずれると
   Worker からは 403 になり、取得できないサイトが黙って増える (Worker は元の取得結果へ
   戻るだけなので表面化しない)。`relay-deploy` ジョブが配備後に
@@ -296,12 +276,8 @@ PteWorker は **1 プロジェクト = 起動コマンド 1 つ** なので、�
     python3 scripts/sorahost-proxy/verify_auth.py
   ```
 
-- 別サーバーのままにする場合は何もしなくてよい (`NAROU_RELAY` 未設定なら `start.sh` は
-  リレーを起動しない)。
 - 注意: リレーの配備 (`sorahost-cli deploy`) はプロジェクトの起動コマンドを書き換える。
-  共有するときは `SORAHOST_RELAY_START` を常に設定しておくこと。
-- 注意: リレーの配備が `narou/` を消さないことは未確認 (`include` の 3 ファイルだけを
-  送る作りなので残る想定)。初回は配備後に `narou/narou_rs` が残っているかを見る。
+  同居させるときは常に `SORAHOST_RELAY_START` を設定しておくこと。
 
 ## 11. 使えない機能
 
@@ -315,10 +291,9 @@ SORAHOST のコンテナで動かすため、次は動かない (Web UI 側で�
 ## 12. 確認
 
 ```sh
-curl -I https://narou.example.com/            # basic 認証のチャレンジが返る
-curl -u admin:<password> https://narou.example.com/api/novels/count
+curl -I https://<公開 URL>/                     # basic 認証のチャレンジが返る
+curl -u admin:<password> https://<公開 URL>/api/novels/count
 ```
 
 ブラウザで開き、ジョブの進捗 (WebSocket) が出ることを確認する。
-Cloudflare はサーバー再起動時に WebSocket を切ることがあるが、Web UI は
-再接続する。
+配備直後は反映に数秒かかることがある (コンソールの `logs` で起動ログを確認できる)。

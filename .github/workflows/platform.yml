@@ -300,10 +300,10 @@ jobs:
       - name: Assemble the deploy bundle
         if: steps.credentials.outputs.configured == 'true'
         env:
-          # 同じ SORAHOST で narou 本体も動かす場合は `bash narou/start.sh` を
+          # 同じ SORAHOST で narou 本体も動かす場合 (任意) は `bash start.sh` を
           # Repository variable `SORAHOST_RELAY_START` に入れる。そのときリレーは
           # narou 側の start.sh が `NAROU_RELAY=1` のときだけ起動する
-          # (1 プロジェクトに置ける起動コマンドは 1 つ。sorahost/README.md 参照)。
+          # (1 プロジェクトに置ける起動コマンドは 1 つ。sorahost/README.md §10)。
           RELAY_START: ${{ vars.SORAHOST_RELAY_START || 'node server.mjs' }}
         run: |
           cp /etc/ssl/certs/ca-certificates.crt build/cacert.pem
