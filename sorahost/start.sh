@@ -10,8 +10,12 @@
 #   app/            実行ファイル + webnovel/ (配備で入れ替わる)
 #   library/        narou のデータ (配備に含めない。作品・設定はここだけ)
 #
-# 公開は PteWorker が行う。アプリは **PteWorker から渡される PORT** に
-# ループバックで束縛する (外部へ直接公開しない)。cloudflared は使わない。
+# 公開は 2 通り:
+#   (a) PteWorker の公開 URL をそのまま使う (平文 HTTP。basic 認証だけが頼り)
+#   (b) Cloudflare Tunnel + Access を前段に置く (推奨。TLS と本人確認が付く)
+#       TUNNEL_TOKEN を置いて NAROU_TUNNEL_HOST を設定すると (b) になり、直の
+#       IP:ポート宛は narou の Host 許可リストで弾かれる。
+# アプリはどちらでも **PteWorker から渡される PORT** にループバックで束縛する。
 #
 # コンソールは PTY なので、対話プロンプトを持つコマンドには `< /dev/null` を
 # 付けて stdin を端末でなくす (付けないと初回起動が止まる)。
@@ -32,6 +36,13 @@ case "$SELF_DIR" in
     ;;
 esac
 LIB="${NAROU_RS_LIBRARY:-$VOLUME_DIR/narou-library}"
+BIN_DIR="$VOLUME_DIR/bin"
+TOKEN_FILE="${TUNNEL_TOKEN_FILE:-$VOLUME_DIR/.cloudflared-token}"
+CF_BIN="$BIN_DIR/cloudflared"
+CF_TAG="2026.9.3"
+CF_SHA256="77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
+CF_URL="https://github.com/cloudflare/cloudflared/releases/download/${CF_TAG}/cloudflared-linux-amd64"
+TUNNEL_HOST="${NAROU_TUNNEL_HOST:-}"
 
 BIN="$APP/narou_rs"
 PIDS=""
@@ -120,13 +131,27 @@ fi
 # server-ws-port=0: 併設 WebSocket リスナーを作らない。narou.rb は
 # `server-port + 1` も使うが、PteWorker はその番号を自分のルータ (workerd) に
 # 使うため衝突する。WebSocket は本体ポートの `/ws` で受けるので機能は落ちない。
-set -- \
-  "server-bind=127.0.0.1" \
-  "server-port=$NAROU_PORT" \
-  "server-reverse-proxy.enable=true" \
-  "server-basic-auth.enable=true" \
-  "server-ws-port=0" \
-  "convert.section-cache=false"
+if [ -n "$TUNNEL_HOST" ]; then
+  # トンネル経由 (Host = 公開ホスト名) だけを受け付ける。直の IP:ポート宛は
+  # Host が許可リストに無いので 400 で落ちる。
+  set -- \
+    "server-bind=127.0.0.1" \
+    "server-port=$NAROU_PORT" \
+    "server-reverse-proxy.enable=false" \
+    "server-add-accepted-hosts=$TUNNEL_HOST" \
+    "server-ws-add-accepted-domains=$TUNNEL_HOST" \
+    "server-basic-auth.enable=true" \
+    "server-ws-port=0" \
+    "convert.section-cache=false"
+else
+  set -- \
+    "server-bind=127.0.0.1" \
+    "server-port=$NAROU_PORT" \
+    "server-reverse-proxy.enable=true" \
+    "server-basic-auth.enable=true" \
+    "server-ws-port=0" \
+    "convert.section-cache=false"
+fi
 if [ -n "${NAROU_WEB_USER:-}" ]; then
   set -- "$@" "server-basic-auth.user=$NAROU_WEB_USER"
 fi
@@ -144,6 +169,42 @@ cleanup() {
 # TERM/INT は明示的に抜ける (ハンドラから戻るとループが再開してしまうため)
 trap 'cleanup; exit 0' INT TERM
 trap cleanup EXIT
+
+# --- Cloudflare Tunnel (任意) ----------------------------------------------
+# TUNNEL_TOKEN (または TUNNEL_TOKEN_FILE) があるときだけ起動する。トークンは
+# Cloudflare のダッシュボード (Networks → Tunnels) で発行し、パネルの .env に置く。
+NAROU_TUNNEL_TOKEN="${TUNNEL_TOKEN:-}"
+if [ -z "$NAROU_TUNNEL_TOKEN" ] && [ -f "$TOKEN_FILE" ]; then
+  NAROU_TUNNEL_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+fi
+if [ -n "$NAROU_TUNNEL_TOKEN" ]; then
+  mkdir -p "$BIN_DIR"
+  if [ ! -x "$CF_BIN" ]; then
+    echo "[narou] cloudflared ${CF_TAG} を取得します"
+    if ! curl -fsSL -o "$CF_BIN.tmp" "$CF_URL"; then
+      echo "[narou] cloudflared を取得できませんでした (手動で $CF_BIN に置けば起動します)" >&2
+    fi
+  fi
+  if [ -f "$CF_BIN.tmp" ]; then
+    GOT="$(sha256sum "$CF_BIN.tmp" | cut -d' ' -f1)"
+    if [ "$GOT" = "$CF_SHA256" ]; then
+      mv "$CF_BIN.tmp" "$CF_BIN"
+      chmod +x "$CF_BIN"
+      echo "[narou] cloudflared のハッシュを確認しました"
+    else
+      rm -f "$CF_BIN.tmp"
+      echo "[narou] cloudflared のハッシュが一致しません (期待 $CF_SHA256 / 実際 $GOT)" >&2
+    fi
+  fi
+  if [ -x "$CF_BIN" ] && [ -z "$TUNNEL_HOST" ]; then
+    echo "[narou] 警告: NAROU_TUNNEL_HOST が未設定です (直の IP:ポート宛も受け付けます)" >&2
+  fi
+  if [ -x "$CF_BIN" ]; then
+    TUNNEL_TOKEN="$NAROU_TUNNEL_TOKEN" "$CF_BIN" tunnel --no-autoupdate --loglevel info run </dev/null &
+    PIDS="$PIDS $!"
+    echo "[narou] Cloudflare Tunnel を起動しました (向き先 127.0.0.1:${NAROU_PORT})"
+  fi
+fi
 
 # --- 取得リレー (任意・Worker の踏み台) ------------------------------------
 # 通常は別サーバーなので何もしない。同じサーバーで動かすときだけ NAROU_RELAY=1。
