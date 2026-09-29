@@ -1,0 +1,121 @@
+name: Deploy SORAHOST
+
+# SORAHOST へ配備する。動くのは Repository variable の `SORAHOST` が `T` のときだけ。
+# ビルドは GitHub ホストの runner、Cloudflare Tunnel の用意と SFTP 転送は
+# `sorahost/ci/deploy_sorahost.py` が行う。
+#
+# Environment `SORAHOST` に置く値 (ホスト側の情報):
+#   vars    SORAHOST_HOST              SFTP ホスト (パネルのアドレス。例 nagoya.sorahost.net)
+#   vars    SORAHOST_USER              SFTP ユーザ
+#   vars    SORAHOST_TUNNEL_HOSTNAME   公開ホスト名 (例 narou.example.com)
+#   secrets SORAHOST_PASSWORD          SFTP パスワード (鍵認証なら SORAHOST_SSH_KEY)
+#   secrets SORAHOST_SSH_KEY           秘密鍵 (任意。置くと鍵認証になる)
+#   vars    SORAHOST_TUNNEL_NAME       tunnel 名 (任意。既定 narou-sorahost)
+#   vars    SORAHOST_SFTP_PORT         SFTP ポート (任意。既定 2022)
+#   vars    SORAHOST_REMOTE_DIR        配置先 (任意。既定 /narou)
+#   vars    SORAHOST_SERVICE_PORT      コンテナ内の待受ポート (任意。既定 8080)
+#   vars    SORAHOST_PANEL_URL         パネル URL (任意。再起動に使う)
+#   vars    SORAHOST_SERVER_ID         サーバー ID (任意。再起動に使う)
+#   secrets SORAHOST_CLIENT_API_KEY    パネルのクライアント API キー (任意。再起動に使う)
+#   vars    SORAHOST_SMOKE_URL         配備後の確認 URL (任意。例 https://narou.example.com/api/novels/count)
+#
+# Cloudflare 側も **この環境に置く**:
+#   secrets CLOUDFLARE_API_TOKEN       (Account: Cloudflare Tunnel Edit / Zone: DNS Edit)
+#   vars    CLOUDFLARE_ACCOUNT_ID
+# 環境 `Cloudflare` の値と同じものでよい。環境は job につき 1 つしか指定できず、
+# このリポジトリは public で Actions の job 出力が誰でも読めるため、tunnel トークンを
+# job 間で渡す設計は取れない (受け渡すと秘密が公開される)。そのため SORAHOST 環境に
+# Cloudflare の値も置いて、1 つの job の中で完結させる。
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "転送せず tunnel と DNS の状態だけ確認する"
+        type: boolean
+        default: false
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-sorahost
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: vars.SORAHOST == 'T'
+    uses: ./.github/workflows/build-linux.yml
+
+  deploy:
+    needs: build
+    if: vars.SORAHOST == 'T'
+    runs-on: ubuntu-22.04
+    environment: SORAHOST
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      SORAHOST_HOST: ${{ vars.SORAHOST_HOST }}
+      SORAHOST_USER: ${{ vars.SORAHOST_USER }}
+      SORAHOST_PASSWORD: ${{ secrets.SORAHOST_PASSWORD }}
+      SORAHOST_SSH_KEY: ${{ secrets.SORAHOST_SSH_KEY }}
+      SORAHOST_TUNNEL_HOSTNAME: ${{ vars.SORAHOST_TUNNEL_HOSTNAME }}
+      SORAHOST_TUNNEL_NAME: ${{ vars.SORAHOST_TUNNEL_NAME }}
+      SORAHOST_SFTP_PORT: ${{ vars.SORAHOST_SFTP_PORT }}
+      SORAHOST_REMOTE_DIR: ${{ vars.SORAHOST_REMOTE_DIR }}
+      SORAHOST_SERVICE_PORT: ${{ vars.SORAHOST_SERVICE_PORT }}
+      SORAHOST_PANEL_URL: ${{ vars.SORAHOST_PANEL_URL }}
+      SORAHOST_SERVER_ID: ${{ vars.SORAHOST_SERVER_ID }}
+      SORAHOST_CLIENT_API_KEY: ${{ secrets.SORAHOST_CLIENT_API_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the deployment values
+        run: |
+          set -eu
+          missing=""
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID SORAHOST_HOST \
+                      SORAHOST_USER SORAHOST_TUNNEL_HOSTNAME; do
+            eval "value=\${$name:-}"
+            [ -n "$value" ] || missing="$missing $name"
+          done
+          if [ -z "${SORAHOST_PASSWORD:-}" ] && [ -z "${SORAHOST_SSH_KEY:-}" ]; then
+            missing="$missing SORAHOST_PASSWORD(SORAHOST_SSH_KEY)"
+          fi
+          if [ -n "$missing" ]; then
+            echo "::error::Environment 'SORAHOST' に次の値がありません:$missing"
+            exit 1
+          fi
+          echo "配備値を確認しました"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: narou_rs-linux-x86_64
+          path: dist
+
+      - name: Install paramiko
+        run: python -m pip install --quiet --disable-pip-version-check paramiko
+
+      - name: Deploy
+        run: |
+          python sorahost/ci/deploy_sorahost.py \
+            --bundle "dist/${{ needs.build.outputs.bundle }}" \
+            --start-sh sorahost/start.sh \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: Smoke check
+        if: ${{ vars.SORAHOST_SMOKE_URL != '' }}
+        run: |
+          set -u
+          for attempt in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+              "${{ vars.SORAHOST_SMOKE_URL }}" || true)
+            echo "attempt ${attempt}: HTTP ${code:-none}"
+            case "$code" in
+              2*|401|403) echo "応答を確認しました"; exit 0 ;;
+            esac
+            sleep 10
+          done
+          echo "::warning::${{ vars.SORAHOST_SMOKE_URL }} から期待した応答がありません"

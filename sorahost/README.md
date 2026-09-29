@@ -70,6 +70,9 @@ cargo build --release --features lite
 
 ## 2. Cloudflare Tunnel
 
+CI から配備する場合 (§9)、tunnel と DNS は `sorahost/ci/deploy_sorahost.py` が
+Cloudflare API で作る。手動で作るときの手順は次のとおり。
+
 1. Cloudflare ダッシュボード → **Networking → Tunnels → Create Tunnel**
    (コネクタは `cloudflared` を選ぶ)
 2. 表示される**トークン**を控える (再表示できない。失くしたら rotate)
@@ -207,7 +210,60 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
 `self-update` は使わない (実行ファイルの置き場が読み取り専用になりうるため)。
 `webnovel/*.yaml` を差し替えたときも再起動で反映される。
 
-## 9. 使えない機能
+## 9. CI からの自動配備
+
+`develop` へ push する (または Actions の **Deploy SORAHOST** を手で回す) と、
+ビルドから配備まで自動で流れる。**動くのは Repository variable の
+`SORAHOST` が `T` のときだけ** (未設定・`F` なら何もせず終わる)。
+
+流れ:
+
+1. `.github/workflows/build-linux.yml` が Linux バイナリを作る (GitHub ホストの runner)
+2. Cloudflare API で tunnel を用意する (無ければ作成・あれば再利用)
+   - 公開ホスト名 → `http://127.0.0.1:8080` の ingress
+   - `<ホスト名>` の CNAME を `<tunnel-id>.cfargotunnel.com` に向ける (proxied)
+3. SFTP でバンドルを転送する (`narou_rs` 3 種 + `webnovel/` + `preset/` + `start.sh`)
+4. tunnel トークンを `.cloudflared-token` へ書く (値が変わったときだけ)
+5. パネルの API が設定されていればサーバーを再起動する
+6. `SORAHOST_SMOKE_URL` があれば応答を確認する
+
+### Environment `SORAHOST` に置く値
+
+| 種別 | 名前 | 用途 |
+| --- | --- | --- |
+| var | `SORAHOST_HOST` | SFTP ホスト (パネルのアドレス) |
+| var | `SORAHOST_USER` | SFTP ユーザ |
+| var | `SORAHOST_TUNNEL_HOSTNAME` | 公開ホスト名 (例 `narou.example.com`) |
+| secret | `SORAHOST_PASSWORD` | SFTP パスワード |
+| secret | `SORAHOST_SSH_KEY` | 秘密鍵 (パスワードの代わり。任意) |
+| var | `SORAHOST_TUNNEL_NAME` | tunnel 名 (任意。既定 `narou-sorahost`) |
+| var | `SORAHOST_SFTP_PORT` | SFTP ポート (任意。既定 2022) |
+| var | `SORAHOST_REMOTE_DIR` | 配置先 (任意。既定 `/narou` = コンテナの `~/narou`) |
+| var | `SORAHOST_SERVICE_PORT` | コンテナ内の待受ポート (任意。既定 8080) |
+| var | `SORAHOST_PANEL_URL` | パネル URL (任意。再起動に使う) |
+| var | `SORAHOST_SERVER_ID` | サーバー ID (任意。再起動に使う) |
+| secret | `SORAHOST_CLIENT_API_KEY` | パネルのクライアント API キー (任意) |
+| var | `SORAHOST_SMOKE_URL` | 配備後の確認 URL (任意) |
+
+Cloudflare の値も **この環境に置く** (`secrets.CLOUDFLARE_API_TOKEN` と
+`vars.CLOUDFLARE_ACCOUNT_ID`。環境 `Cloudflare` と同じものでよい)。
+API トークンの権限は **Account: Cloudflare Tunnel Edit** と **Zone: DNS Edit**。
+
+> なぜ環境を分けないのか: job が使える Environment は 1 つだけで、かつこの
+> リポジトリは public のため Actions の job 出力が誰でも読める。tunnel トークンを
+> job 間で渡す設計にすると秘密が公開されるので、1 つの job の中で完結させている。
+
+再起動の 3 値 (`SORAHOST_PANEL_URL` / `SORAHOST_SERVER_ID` /
+`SORAHOST_CLIENT_API_KEY`) を入れない場合は、配備後にパネルから手で再起動する。
+
+> Worker 側の配備 (`.github/workflows/platform.yml`) はこの変数の影響を受けない。
+> SORAHOST へ一本化するときは、同ワークフローの配備ジョブに
+> `if: vars.SORAHOST != 'T'` を足すか、ワークフロー自体を無効化する。
+>
+> `SORAHOST` 環境に**同名の `SORAHOST` 変数を置かないこと** (Repository variable
+> の判定と混ざる)。
+
+## 10. 使えない機能
 
 SORAHOST のコンテナで動かすため、次は動かない (Web UI 側では 501 相当):
 
@@ -216,7 +272,7 @@ SORAHOST のコンテナで動かすため、次は動かない (Web UI 側で�
 - 外部 AozoraEpub3 (`aozoraepub3dir` は設定しない。Lite を同梱して使う)
 - `narou_rs_login` (ブラウザのある端末で実行し、`narou login import` で取り込む)
 
-## 10. 確認
+## 11. 確認
 
 ```sh
 curl -I https://narou.example.com/            # basic 認証のチャレンジが返る

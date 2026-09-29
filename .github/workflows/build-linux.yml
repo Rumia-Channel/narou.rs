@@ -18,6 +18,12 @@ on:
     tags:
       - "v*"
       - "[0-9]*"
+  # deploy-sorahost.yml から呼ぶ (同じ run の artifact をそのまま配備に使う)
+  workflow_call:
+    outputs:
+      bundle:
+        description: "作った tar.gz のファイル名"
+        value: ${{ jobs.build.outputs.bundle }}
 
 permissions:
   contents: read
@@ -26,6 +32,8 @@ jobs:
   build:
     name: narou_rs (linux x86_64, lite/GPL)
     runs-on: ubuntu-22.04
+    outputs:
+      bundle: ${{ steps.package.outputs.bundle }}
     steps:
       - uses: actions/checkout@v5
 
@@ -41,6 +49,7 @@ jobs:
             --bin narou_rs --bin narou_rs_backup --bin narou_rs_login
 
       - name: Assemble the bundle
+        id: package
         run: |
           set -eu
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -66,6 +75,7 @@ jobs:
           EOF
           tar czf "${dir}.tar.gz" "$dir"
           sha256sum "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
+          echo "bundle=${dir}.tar.gz" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
