@@ -11,19 +11,19 @@ name: Deploy SORAHOST
 #   secrets SORAHOST_ENDPOINT    PteWorker のコンソールに出るエンドポイント
 #   secrets SORAHOST_TOKEN       デプロイトークン (この 2 つが必須)
 #   vars    SORAHOST_SMOKE_URL   任意。配備後の確認先 (未設定なら deploy が返す url)
-#   ----- 前段に Cloudflare Tunnel + Access を置く場合だけ -----
+#   ----- 前段に Cloudflare のコネクタ + Access を置く場合だけ -----
 #   secrets CLOUDFLARE_API_TOKEN     Account: Cloudflare One Connectors /
 #                                   Cloudflare One Connector: cloudflared /
 #                                   Cloudflare Tunnel のいずれか (Write/Edit)、
 #                                   Zone: DNS (Write/Edit) + Zone (Read)、
 #                                   Access を使うなら Access: Apps and Policies (Write/Edit)
 #   vars    CLOUDFLARE_ACCOUNT_ID
-#   vars    SORAHOST_TUNNEL_HOSTNAME 公開ホスト名 (例 narou.example.com)
+#   vars    SORAHOST_PUBLIC_HOSTNAME 公開ホスト名 (例 narou.example.com)
 #   vars    SORAHOST_SERVICE_PORT    コンテナ内の待受ポート (既定 18080)
 #   vars    SORAHOST_ACCESS_EMAIL    Access で許可するメール (カンマ区切り)
 #   vars    SORAHOST_ACCESS_DOMAIN   Access で許可するメールドメイン
-# トンネルの接続トークンは CI では扱わない (ログに出さないため)。Cloudflare の
-# ダッシュボードで確認し、PteWorker の .env に TUNNEL_TOKEN として置く。
+# 接続トークンは CI では扱わない (ログに出さないため)。Cloudflare のダッシュボードで
+# 確認し、PteWorker の .env に NAROU_CONNECTOR_TOKEN として置く。
 #
 # パネル側の環境変数 (NAROU_WEB_PASSWORD / S3_* など) はここではなく
 # PteWorker の .env に置く。sorahost/README.md §9 を参照。
@@ -99,25 +99,25 @@ jobs:
           find deploy -maxdepth 2 | sort
           du -sh deploy
 
-      # 前段の Cloudflare Tunnel と Access を用意する (未設定なら何もしない)。
+      # 前段の Cloudflare コネクタと Access を用意する (未設定なら何もしない)。
       # アプリは 127.0.0.1:<SORAHOST_SERVICE_PORT> に居るので、そこへ向ける。
-      - name: Set up the Cloudflare tunnel and Access
+      - name: Set up the Cloudflare connector and Access
         if: steps.credentials.outputs.configured == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
-          SORAHOST_TUNNEL_HOSTNAME: ${{ vars.SORAHOST_TUNNEL_HOSTNAME }}
+          SORAHOST_PUBLIC_HOSTNAME: ${{ vars.SORAHOST_PUBLIC_HOSTNAME }}
           SORAHOST_SERVICE_PORT: ${{ vars.SORAHOST_SERVICE_PORT }}
-          SORAHOST_TUNNEL_NAME: ${{ vars.SORAHOST_TUNNEL_NAME }}
+          SORAHOST_CONNECTOR_NAME: ${{ vars.SORAHOST_CONNECTOR_NAME }}
           SORAHOST_ACCESS_EMAIL: ${{ vars.SORAHOST_ACCESS_EMAIL }}
           SORAHOST_ACCESS_DOMAIN: ${{ vars.SORAHOST_ACCESS_DOMAIN }}
           SORAHOST_ACCESS_SESSION: ${{ vars.SORAHOST_ACCESS_SESSION }}
         run: |
-          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${SORAHOST_TUNNEL_HOSTNAME:-}" ]; then
-            echo "::notice::CLOUDFLARE_API_TOKEN / SORAHOST_TUNNEL_HOSTNAME が未設定のため tunnel は触りません"
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${SORAHOST_PUBLIC_HOSTNAME:-}" ]; then
+            echo "::notice::CLOUDFLARE_API_TOKEN / SORAHOST_PUBLIC_HOSTNAME が未設定のため tunnel は触りません"
             exit 0
           fi
-          python3 sorahost/ci/provision_tunnel.py
+          python3 sorahost/ci/provision_connector.py
 
       - name: Deploy
         if: steps.credentials.outputs.configured == 'true'

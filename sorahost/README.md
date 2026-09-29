@@ -1,8 +1,8 @@
 # SORAHOST で narou.rs を動かす
 
 SORAHOST (PteWorker の node モード) のコンテナで native 版 `narou_rs` を常駐させる
-手順。**Workers は使わない**。専用サーバー 1 台で完結し、公開は PteWorker が行うので
-Cloudflare Tunnel は要らない。CI から配備するのに必要な値は
+手順。**Workers は使わない**。専用サーバー 1 台で完結し、公開は PteWorker が行う (前段に
+Cloudflare のコネクタと Access を置く構成も選べる §2)。CI から配備するのに必要な値は
 **`SORAHOST_ENDPOINT` と `SORAHOST_TOKEN` の 2 つだけ** (§9)。
 
 ```
@@ -83,21 +83,21 @@ library/                 初回起動で作られる (.narou / 小説データ /
 
 2 通り。どちらでもアプリは `127.0.0.1:$PORT` にだけ束縛する。
 
-### A. Cloudflare Tunnel + Access (推奨)
+### A. 前段に Cloudflare のコネクタ + Access を置く (推奨)
 
 TLS と本人確認 (Zero Trust) を前段に置く。直の IP:ポート宛は narou の Host 許可リストで
 弾かれるので、公開経路はトンネルだけになる。
 
 1. GitHub の Environment `SORAHOST` に値を置く (§3.2)
-2. `develop` へ push すると `deploy-sorahost.yml` が `sorahost/ci/provision_tunnel.py` を実行し、
-   tunnel / ingress / DNS /(設定していれば) Access を冪等に作る
-3. Cloudflare の **Networks → Tunnels → 該当 tunnel → Install connector** でトークンを確認し、
-   PteWorker の `.env` に `TUNNEL_TOKEN=<トークン>` と `NAROU_TUNNEL_HOST=<公開ホスト名>` を置いて再起動
+2. `develop` へ push すると `deploy-sorahost.yml` が `sorahost/ci/provision_connector.py` を実行し、
+   コネクタ / 向き先 (ingress) / DNS /(設定していれば) Access を冪等に作る
+3. Cloudflare の **Networks → Tunnels → 該当のコネクタ → Add a replica** でトークンを確認し、
+   PteWorker の `.env` に `NAROU_CONNECTOR_TOKEN=<トークン>` と `NAROU_PUBLIC_HOST=<公開ホスト名>` を置いて再起動
 4. `https://<公開ホスト名>/` が Access のログインを要求し、`http://<IP>:<PORT>/` が **400** になれば成功
 
-- `TUNNEL_TOKEN` は CI では扱わない (公開リポジトリのログに出さないため)。ダッシュボードで確認して
-  パネルに置く
-- ingress の向き先は `127.0.0.1:<SORAHOST_SERVICE_PORT>` (既定 18080 = PteWorker の `PORT`)。
+- `NAROU_CONNECTOR_TOKEN` は CI では扱わない (公開リポジトリのログに出さないため)。ダッシュボードで
+  確認してパネルに置く
+- 向き先 (ingress) は `127.0.0.1:<SORAHOST_SERVICE_PORT>` (既定 18080 = PteWorker の `PORT`)。
   `NAROU_RS_PORT` を変えたら合わせる
 - **トークンの権限 (UI の探し方)**: My Profile → API Tokens → Create Token → Custom token。
   - アカウント全体のポリシーに次を足して **Edit** (どれでも可。Cloudflare の API リファレンスが
@@ -147,9 +147,9 @@ Pterodactyl の Startup 変数 (または `.env`)。`start.sh` が起動のた�
 | `NAROU_RS_APP` / `NAROU_RS_LIBRARY` | `app/` とライブラリの場所 | 通常は未設定 (配備パスから自動) | start.sh |
 | `NAROU_RS_PORT` | 待受ポート | 通常は未設定 (プラットフォームの `PORT` を使う) | start.sh (リレー同居時のみ 8080) |
 | `NAROU_RELAY` / `SORAHOST_PROXY_KEY` | 同じサーバーで取得リレーも動かすときだけ (§10) | `1` / 合言葉 | start.sh |
-| `TUNNEL_TOKEN` | Cloudflare Tunnel の接続トークン (置くと cloudflared を起動) | ダッシュボードの Install connector の値 | start.sh |
-| `NAROU_TUNNEL_HOST` | 公開ホスト名。置くとその Host 以外を弾く | 例 `narou.example.com` | start.sh |
-| `TUNNEL_TOKEN_FILE` | トークンをファイルで渡す場合のパス | 既定 `$VOLUME_DIR/.cloudflared-token` | start.sh |
+| `NAROU_CONNECTOR_TOKEN` | コネクタ (cloudflared) の接続トークン。置くと起動する | ダッシュボードの Add a replica の値 | start.sh |
+| `NAROU_PUBLIC_HOST` | 公開ホスト名。置くとその Host 以外を弾く | 例 `narou.example.com` | start.sh |
+| `NAROU_CONNECTOR_TOKEN_FILE` | トークンをファイルで渡す場合のパス | 既定 `$VOLUME_DIR/.connector-token` | start.sh |
 
 - `PORT` はプラットフォームが渡す値で、**こちらから設定しない** (narou はこれに束縛する)
 - `s3` を選んで値を 1 つでも欠かすと**起動に失敗する** (黙ってローカル保存へ落ちない)
@@ -171,8 +171,9 @@ Pterodactyl の Startup 変数 (または `.env`)。`start.sh` が起動のた�
 | Environment `SORAHOST` variable | `SORAHOST_SMOKE_URL` | 任意。配備後の確認先 (未設定なら配備結果の `url`) |
 | Environment `SORAHOST` secret | `CLOUDFLARE_API_TOKEN` | 任意 (§2-A を使うとき)。Account: `Cloudflare Tunnel (Write/Edit)`、Zone: `DNS (Write/Edit)` と `Zone (Read)`、Access を使うなら Account: `Access: Apps and Policies (Write/Edit)` |
 | Environment `SORAHOST` variable | `CLOUDFLARE_ACCOUNT_ID` | 同上 |
-| Environment `SORAHOST` variable | `SORAHOST_TUNNEL_HOSTNAME` | 同上。公開ホスト名 (例 `narou.example.com`) |
+| Environment `SORAHOST` variable | `SORAHOST_PUBLIC_HOSTNAME` | 同上。公開ホスト名 (例 `narou.example.com`) |
 | Environment `SORAHOST` variable | `SORAHOST_SERVICE_PORT` | 同上。コンテナ内の待受ポート (既定 18080) |
+| Environment `SORAHOST` variable | `SORAHOST_CONNECTOR_NAME` | 同上。コネクタ名 (既定 `narou-sorahost`) |
 | Environment `SORAHOST` variable | `SORAHOST_ACCESS_EMAIL` | 同上。Access で許可するメール (カンマ区切り) |
 | Environment `SORAHOST` variable | `SORAHOST_ACCESS_DOMAIN` | 同上。許可するメールドメイン |
 

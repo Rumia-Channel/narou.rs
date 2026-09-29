@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""SORAHOST の前段に置く Cloudflare Tunnel と Access を用意する。
+"""SORAHOST の前段に置く Cloudflare のコネクタ (cloudflared) と Access を用意する。
 
 やること (何度実行しても同じ結果になる):
-  1. tunnel を名前で探し、無ければ作る (remotely managed)
+  1. コネクタを名前で探し、無ければ作る (remotely managed)
   2. ingress を `<公開ホスト名> -> http://127.0.0.1:<PORT>` に設定する
-  3. `<公開ホスト名>` の CNAME を `<tunnel-id>.cfargotunnel.com` に向ける (proxied)
+  3. `<公開ホスト名>` の CNAME を `<id>.cfargotunnel.com` に向ける (proxied)
   4. `SORAHOST_ACCESS_EMAIL` があれば、そのホストに Access のアプリと
      allow ポリシー (メール一致) を作る
 
 トークンはここでは出力しない (公開リポジトリのログに出さないため)。接続用の
-トークンは Cloudflare のダッシュボード (Networks → Tunnels → 該当の tunnel →
-Install connector) で確認し、PteWorker の .env に TUNNEL_TOKEN として置く。
+トークンは Cloudflare のダッシュボード (Networks → Tunnels → 該当のコネクタ →
+Add a replica) で確認し、PteWorker の .env に NAROU_CONNECTOR_TOKEN として置く。
 
 環境変数:
   CLOUDFLARE_API_TOKEN      Account: 次のいずれか (どれでも可)
@@ -22,11 +22,11 @@ Install connector) で確認し、PteWorker の .env に TUNNEL_TOKEN として�
                             ※ Argo Tunnel (Legacy) は旧版なので使わない
                             ※ ダッシュボードは Read/Edit、API リファレンスは Read/Write
   CLOUDFLARE_ACCOUNT_ID
-  SORAHOST_TUNNEL_HOSTNAME  公開ホスト名 (例 narou.example.com)
+  SORAHOST_PUBLIC_HOSTNAME  公開ホスト名 (例 narou.example.com)
   SORAHOST_SERVICE_PORT     コンテナ内の待受ポート (既定 18080 = PteWorker の PORT)
 
 任意:
-  SORAHOST_TUNNEL_NAME      tunnel 名 (既定 narou-sorahost)
+  SORAHOST_CONNECTOR_NAME   コネクタ名 (既定 narou-sorahost)
   SORAHOST_ACCESS_EMAIL     Access で許可するメール (カンマ区切りで複数可)
   SORAHOST_ACCESS_DOMAIN    Access で許可するメールドメイン (カンマ区切り)
   SORAHOST_ACCESS_SESSION   Access のセッション有効期限 (既定 24h)
@@ -82,26 +82,26 @@ def cf(method: str, path: str, token: str, body: dict[str, Any] | None = None) -
     return payload
 
 
-def ensure_tunnel(token: str, account: str, name: str) -> str:
+def ensure_connector(token: str, account: str, name: str) -> str:
     query = urllib.parse.urlencode({"name": name, "is_deleted": "false"})
-    for tunnel in cf("GET", f"/accounts/{account}/cfd_tunnel?{query}", token)["result"]:
-        if tunnel.get("name") == name and not tunnel.get("deleted_at"):
-            print(f"tunnel: 再利用 {name} ({tunnel['id']})")
-            return tunnel["id"]
+    for item in cf("GET", f"/accounts/{account}/cfd_tunnel?{query}", token)["result"]:
+        if item.get("name") == name and not item.get("deleted_at"):
+            print(f"コネクタ: 再利用 {name} ({item['id']})")
+            return item["id"]
     created = cf(
         "POST",
         f"/accounts/{account}/cfd_tunnel",
         token,
         {"name": name, "config_src": "cloudflare"},
     )["result"]
-    print(f"tunnel: 作成 {name} ({created['id']})")
+    print(f"コネクタ: 作成 {name} ({created['id']})")
     return created["id"]
 
 
-def configure_ingress(token: str, account: str, tunnel_id: str, hostname: str, port: str) -> None:
+def configure_ingress(token: str, account: str, connector_id: str, hostname: str, port: str) -> None:
     cf(
         "PUT",
-        f"/accounts/{account}/cfd_tunnel/{tunnel_id}/configurations",
+        f"/accounts/{account}/cfd_tunnel/{connector_id}/configurations",
         token,
         {
             "config": {
@@ -112,7 +112,7 @@ def configure_ingress(token: str, account: str, tunnel_id: str, hostname: str, p
             }
         },
     )
-    print(f"ingress: {hostname} -> http://127.0.0.1:{port}")
+    print(f"向き先: {hostname} -> http://127.0.0.1:{port}")
 
 
 def zone_for(token: str, hostname: str) -> str:
@@ -129,9 +129,9 @@ def zone_for(token: str, hostname: str) -> str:
     )
 
 
-def ensure_dns(token: str, hostname: str, tunnel_id: str) -> None:
+def ensure_dns(token: str, hostname: str, connector_id: str) -> None:
     zone_id = zone_for(token, hostname)
-    target = f"{tunnel_id}.cfargotunnel.com"
+    target = f"{connector_id}.cfargotunnel.com"
     query = urllib.parse.urlencode({"name": hostname, "type": "CNAME"})
     body = {"type": "CNAME", "name": hostname, "content": target, "proxied": True}
     for record in cf("GET", f"/zones/{zone_id}/dns_records?{query}", token)["result"]:
@@ -192,17 +192,17 @@ def ensure_access(
 def main() -> int:
     token = required("CLOUDFLARE_API_TOKEN")
     account = required("CLOUDFLARE_ACCOUNT_ID")
-    hostname = required("SORAHOST_TUNNEL_HOSTNAME")
+    hostname = required("SORAHOST_PUBLIC_HOSTNAME")
     port = optional("SORAHOST_SERVICE_PORT", "18080")
-    name = optional("SORAHOST_TUNNEL_NAME", "narou-sorahost")
+    name = optional("SORAHOST_CONNECTOR_NAME", "narou-sorahost")
     emails = [v.strip() for v in optional("SORAHOST_ACCESS_EMAIL", "").split(",") if v.strip()]
     domains = [v.strip() for v in optional("SORAHOST_ACCESS_DOMAIN", "").split(",") if v.strip()]
     session = optional("SORAHOST_ACCESS_SESSION", "24h")
 
     print(f"公開ホスト: {hostname} (-> 127.0.0.1:{port})")
-    tunnel_id = ensure_tunnel(token, account, name)
-    configure_ingress(token, account, tunnel_id, hostname, port)
-    ensure_dns(token, hostname, tunnel_id)
+    connector_id = ensure_connector(token, account, name)
+    configure_ingress(token, account, connector_id, hostname, port)
+    ensure_dns(token, hostname, connector_id)
 
     if emails or domains:
         ensure_access(token, account, hostname, emails, domains, session)
@@ -210,10 +210,10 @@ def main() -> int:
         print("access: 未設定 (SORAHOST_ACCESS_EMAIL / SORAHOST_ACCESS_DOMAIN を置くと作る)")
 
     print()
-    print("次: Cloudflare の Networks → Tunnels → 該当 tunnel → Install connector で")
+    print("次: Cloudflare の Networks → Tunnels → 該当のコネクタ → Add a replica で")
     print("    トークンを確認し、PteWorker の .env に次を置いて再起動する:")
-    print(f"      TUNNEL_TOKEN=<トークン>")
-    print(f"      NAROU_TUNNEL_HOST={hostname}")
+    print("      NAROU_CONNECTOR_TOKEN=<トークン>")
+    print(f"      NAROU_PUBLIC_HOST={hostname}")
     return 0
 
 

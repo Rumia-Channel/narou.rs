@@ -13,7 +13,7 @@
 # 公開は 2 通り:
 #   (a) PteWorker の公開 URL をそのまま使う (平文 HTTP。basic 認証だけが頼り)
 #   (b) Cloudflare Tunnel + Access を前段に置く (推奨。TLS と本人確認が付く)
-#       TUNNEL_TOKEN を置いて NAROU_TUNNEL_HOST を設定すると (b) になり、直の
+#       NAROU_CONNECTOR_TOKEN を置いて NAROU_PUBLIC_HOST を設定すると (b) になり、直の
 #       IP:ポート宛は narou の Host 許可リストで弾かれる。
 # アプリはどちらでも **PteWorker から渡される PORT** にループバックで束縛する。
 #
@@ -37,12 +37,12 @@ case "$SELF_DIR" in
 esac
 LIB="${NAROU_RS_LIBRARY:-$VOLUME_DIR/narou-library}"
 BIN_DIR="$VOLUME_DIR/bin"
-TOKEN_FILE="${TUNNEL_TOKEN_FILE:-$VOLUME_DIR/.cloudflared-token}"
+TOKEN_FILE="${NAROU_CONNECTOR_TOKEN_FILE:-$VOLUME_DIR/.connector-token}"
 CF_BIN="$BIN_DIR/cloudflared"
 CF_TAG="2026.9.3"
 CF_SHA256="77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
 CF_URL="https://github.com/cloudflare/cloudflared/releases/download/${CF_TAG}/cloudflared-linux-amd64"
-TUNNEL_HOST="${NAROU_TUNNEL_HOST:-}"
+PUBLIC_HOST="${NAROU_PUBLIC_HOST:-}"
 
 BIN="$APP/narou_rs"
 PIDS=""
@@ -131,15 +131,15 @@ fi
 # server-ws-port=0: 併設 WebSocket リスナーを作らない。narou.rb は
 # `server-port + 1` も使うが、PteWorker はその番号を自分のルータ (workerd) に
 # 使うため衝突する。WebSocket は本体ポートの `/ws` で受けるので機能は落ちない。
-if [ -n "$TUNNEL_HOST" ]; then
+if [ -n "$PUBLIC_HOST" ]; then
   # トンネル経由 (Host = 公開ホスト名) だけを受け付ける。直の IP:ポート宛は
   # Host が許可リストに無いので 400 で落ちる。
   set -- \
     "server-bind=127.0.0.1" \
     "server-port=$NAROU_PORT" \
     "server-reverse-proxy.enable=false" \
-    "server-add-accepted-hosts=$TUNNEL_HOST" \
-    "server-ws-add-accepted-domains=$TUNNEL_HOST" \
+    "server-add-accepted-hosts=$PUBLIC_HOST" \
+    "server-ws-add-accepted-domains=$PUBLIC_HOST" \
     "server-basic-auth.enable=true" \
     "server-ws-port=0" \
     "convert.section-cache=false"
@@ -170,19 +170,19 @@ cleanup() {
 trap 'cleanup; exit 0' INT TERM
 trap cleanup EXIT
 
-# --- Cloudflare Tunnel (任意) ----------------------------------------------
-# TUNNEL_TOKEN (または TUNNEL_TOKEN_FILE) があるときだけ起動する。トークンは
-# Cloudflare のダッシュボード (Networks → Tunnels) で発行し、パネルの .env に置く。
-NAROU_TUNNEL_TOKEN="${TUNNEL_TOKEN:-}"
-if [ -z "$NAROU_TUNNEL_TOKEN" ] && [ -f "$TOKEN_FILE" ]; then
-  NAROU_TUNNEL_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+# --- 前段のコネクタ (任意) -------------------------------------------------
+# NAROU_CONNECTOR_TOKEN (または NAROU_CONNECTOR_TOKEN_FILE) があるときだけ起動する。
+# トークンは Cloudflare のダッシュボード (Networks → Tunnels) で発行し、パネルの .env に置く。
+NAROU_CONNECTOR="${NAROU_CONNECTOR_TOKEN:-}"
+if [ -z "$NAROU_CONNECTOR" ] && [ -f "$TOKEN_FILE" ]; then
+  NAROU_CONNECTOR="$(tr -d '\r\n' < "$TOKEN_FILE")"
 fi
-if [ -n "$NAROU_TUNNEL_TOKEN" ]; then
+if [ -n "$NAROU_CONNECTOR" ]; then
   mkdir -p "$BIN_DIR"
   if [ ! -x "$CF_BIN" ]; then
-    echo "[narou] cloudflared ${CF_TAG} を取得します"
+    echo "[narou] コネクタ (cloudflared) ${CF_TAG} を取得します"
     if ! curl -fsSL -o "$CF_BIN.tmp" "$CF_URL"; then
-      echo "[narou] cloudflared を取得できませんでした (手動で $CF_BIN に置けば起動します)" >&2
+      echo "[narou] コネクタを取得できませんでした (手動で $CF_BIN に置けば起動します)" >&2
     fi
   fi
   if [ -f "$CF_BIN.tmp" ]; then
@@ -190,19 +190,19 @@ if [ -n "$NAROU_TUNNEL_TOKEN" ]; then
     if [ "$GOT" = "$CF_SHA256" ]; then
       mv "$CF_BIN.tmp" "$CF_BIN"
       chmod +x "$CF_BIN"
-      echo "[narou] cloudflared のハッシュを確認しました"
+      echo "[narou] コネクタのハッシュを確認しました"
     else
       rm -f "$CF_BIN.tmp"
-      echo "[narou] cloudflared のハッシュが一致しません (期待 $CF_SHA256 / 実際 $GOT)" >&2
+      echo "[narou] コネクタのハッシュが一致しません (期待 $CF_SHA256 / 実際 $GOT)" >&2
     fi
   fi
-  if [ -x "$CF_BIN" ] && [ -z "$TUNNEL_HOST" ]; then
-    echo "[narou] 警告: NAROU_TUNNEL_HOST が未設定です (直の IP:ポート宛も受け付けます)" >&2
+  if [ -x "$CF_BIN" ] && [ -z "$PUBLIC_HOST" ]; then
+    echo "[narou] 警告: NAROU_PUBLIC_HOST が未設定です (直の IP:ポート宛も受け付けます)" >&2
   fi
   if [ -x "$CF_BIN" ]; then
-    TUNNEL_TOKEN="$NAROU_TUNNEL_TOKEN" "$CF_BIN" tunnel --no-autoupdate --loglevel info run </dev/null &
+    NAROU_CONNECTOR_TOKEN="$NAROU_CONNECTOR" "$CF_BIN" tunnel --no-autoupdate --loglevel info run </dev/null &
     PIDS="$PIDS $!"
-    echo "[narou] Cloudflare Tunnel を起動しました (向き先 127.0.0.1:${NAROU_PORT})"
+    echo "[narou] 前段のコネクタを起動しました (向き先 127.0.0.1:${NAROU_PORT})"
   fi
 fi
 
