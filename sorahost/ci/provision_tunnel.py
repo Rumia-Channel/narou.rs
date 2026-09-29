@@ -13,10 +13,14 @@
 Install connector) で確認し、PteWorker の .env に TUNNEL_TOKEN として置く。
 
 環境変数:
-  CLOUDFLARE_API_TOKEN      Account: Cloudflare Tunnel (Write/Edit)
+  CLOUDFLARE_API_TOKEN      Account: 次のいずれか (どれでも可)
+                              Cloudflare One Connectors (Write/Edit)
+                              Cloudflare One Connector: cloudflared (Write/Edit)
+                              Cloudflare Tunnel (Write/Edit)
                             Zone: DNS (Write/Edit) と Zone: Zone (Read)
                             (+ Access を使うなら Account: Access: Apps and Policies (Write/Edit))
-                            ※ ダッシュボードの表記は Read/Write、旧表記は Read/Edit
+                            ※ Argo Tunnel (Legacy) は旧版なので使わない
+                            ※ ダッシュボードは Read/Edit、API リファレンスは Read/Write
   CLOUDFLARE_ACCOUNT_ID
   SORAHOST_TUNNEL_HOSTNAME  公開ホスト名 (例 narou.example.com)
   SORAHOST_SERVICE_PORT     コンテナ内の待受ポート (既定 18080 = PteWorker の PORT)

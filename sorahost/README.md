@@ -100,9 +100,10 @@ TLS と本人確認 (Zero Trust) を前段に置く。直の IP:ポート宛は 
 - ingress の向き先は `127.0.0.1:<SORAHOST_SERVICE_PORT>` (既定 18080 = PteWorker の `PORT`)。
   `NAROU_RS_PORT` を変えたら合わせる
 - **トークンの権限 (UI の探し方)**: My Profile → API Tokens → Create Token → Custom token。
-  - アカウント全体のポリシーに **`Cloudflare Tunnel`**(説明が "Grants access to create and delete
-    Cloudflare Tunnels")を足して **Edit**。似た名前の **`Argo Tunnel (Legacy)`** は旧版で
-    Read のみなので選ばない
+  - アカウント全体のポリシーに次を足して **Edit** (どれでも可。Cloudflare の API リファレンスが
+    3 つ併記している): **`Cloudflare One Connectors`** / **`Cloudflare One Connector: cloudflared`** /
+    **`Cloudflare Tunnel`**(説明が "Grants access to create and delete Cloudflare Tunnels")。
+    似た名前の **`Argo Tunnel (Legacy)`** は旧版なので選ばない
   - **DNS はゾーン スコープ**なので、ポリシーをもう 1 行足して「ゾーン」→ 対象ドメイン →
     `DNS: Edit` と `Zone: Read`(ゾーン ID の解決に必要)
   - Access を使うなら同じアカウント全体のポリシーに **`Access: Apps and Policies: Edit`**
