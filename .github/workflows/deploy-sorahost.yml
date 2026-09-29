@@ -114,7 +114,7 @@ jobs:
           SORAHOST_ACCESS_SESSION: ${{ vars.SORAHOST_ACCESS_SESSION }}
         run: |
           if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${SORAHOST_PUBLIC_HOSTNAME:-}" ]; then
-            echo "::notice::CLOUDFLARE_API_TOKEN / SORAHOST_PUBLIC_HOSTNAME が未設定のため tunnel は触りません"
+            echo "::notice::CLOUDFLARE_API_TOKEN / SORAHOST_PUBLIC_HOSTNAME が未設定のためコネクタは触りません"
             exit 0
           fi
           python3 sorahost/ci/provision_connector.py
