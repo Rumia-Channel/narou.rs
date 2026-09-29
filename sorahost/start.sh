@@ -17,6 +17,11 @@
 #       IP:ポート宛は narou の Host 許可リストで弾かれる。
 # アプリはどちらでも **PteWorker から渡される PORT** にループバックで束縛する。
 #
+# 設定 (環境変数): PteWorker のマニフェストに env を渡す項目が無いので、
+# **ボリューム直下の `.env`** に書く (パネルのファイルマネージャか SFTP で置く)。
+# 例: NAROU_WEB_PASSWORD=... / NAROU_CONNECTOR_TOKEN=... / NAROU_PUBLIC_HOST=...
+# 既に環境にある値 (プラットフォームの PORT や Startup 変数) の方が優先される。
+#
 # コンソールは PTY なので、対話プロンプトを持つコマンドには `< /dev/null` を
 # 付けて stdin を端末でなくす (付けないと初回起動が止まる)。
 
@@ -43,6 +48,31 @@ CF_TAG="2026.9.3"
 CF_SHA256="77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
 CF_URL="https://github.com/cloudflare/cloudflared/releases/download/${CF_TAG}/cloudflared-linux-amd64"
 PUBLIC_HOST="${NAROU_PUBLIC_HOST:-}"
+
+# --- 設定ファイル (.env) ---------------------------------------------------
+# PteWorker のマニフェストには環境変数を渡す項目が無く、Startup 変数の名前は
+# egg 側が決めているため、こちらで用意した名前は置けないことが多い。
+# そこで **ボリューム直下の .env** を読む (パネルのファイルマネージャか SFTP で置く)。
+# 既に環境にある値 (プラットフォーム由来や Startup 変数) の方が優先。
+ENV_FILE="${NAROU_RS_ENV_FILE:-$VOLUME_DIR/.env}"
+if [ -f "$ENV_FILE" ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      ''|*[!A-Za-z0-9_]*) continue ;;
+    esac
+    eval "current=\${$key:-}"
+    if [ -n "$current" ]; then
+      continue
+    fi
+    export "$key=$value"
+  done < "$ENV_FILE"
+  echo "[narou] $ENV_FILE を読み込みました"
+fi
 
 BIN="$APP/narou_rs"
 PIDS=""

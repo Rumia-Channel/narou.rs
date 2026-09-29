@@ -96,7 +96,7 @@ TLS と本人確認 (Zero Trust) を前段に置く。直の IP:ポート宛は 
 4. `https://<公開ホスト名>/` が Access のログインを要求し、`http://<IP>:<PORT>/` が **400** になれば成功
 
 - `NAROU_CONNECTOR_TOKEN` は CI では扱わない (公開リポジトリのログに出さないため)。ダッシュボードで
-  確認してパネルに置く
+  確認してサーバー直下の `.env` に置く
 - 向き先 (ingress) は `127.0.0.1:<SORAHOST_SERVICE_PORT>` (既定 18080 = PteWorker の `PORT`)。
   `NAROU_RS_PORT` を変えたら合わせる
 - **トークンの権限 (UI の探し方)**: My Profile → API Tokens → Create Token → Custom token。
@@ -120,12 +120,43 @@ basic 認証のパスワードが回線上を素で流れる。強いランダ�
 
 ## 3. 環境変数
 
-置き場は 2 つだけ。**アプリの値は PteWorker のパネル**、**CI の値は GitHub** に置く。
+置き場は 2 つだけ。**アプリの値はサーバー上の `.env`**、**CI の値は GitHub** に置く。
 ここに挙げた名前がコードの読む全部で、綴りが違うと無視される。
 
-### 3.1 パネルに置く (アプリの動作)
+### 3.0 アプリの値をどこに書くか
 
-Pterodactyl の Startup 変数 (または `.env`)。`start.sh` が起動のたびに読む。
+PteWorker の `sorahost.json` には環境変数を渡す項目が無く、Pterodactyl の
+**Startup 変数**は名前が egg 側で決まっているため、こちらで用意した名前
+(`NAROU_*`) を足せないことが多い。そこで `start.sh` は起動時に
+**ボリューム直下の `.env`** を読み込む:
+
+```
+<ボリューム直下>          = アプリのログに出る /home/container
+  .env                    ← これを置く (下記)
+  narou-library/          作品データ
+  bin/                    コネクタのバイナリ
+  .sorahost/releases/...  配備ごとの実行ファイル
+```
+
+`.env` の作り方 (どちらでもよい):
+
+- パネルの**ファイルマネージャ**で直下に `.env` を作って編集する
+- SFTP (`sorahost-cli` の接続情報と同じホスト) で置く
+
+```sh
+# 例 (/home/container/.env)
+NAROU_WEB_PASSWORD=長いランダム文字列
+NAROU_WEB_USER=admin
+NAROU_CONNECTOR_TOKEN=eyJ...            # ダッシュボードの Add a replica の値
+NAROU_PUBLIC_HOST=narou.example.com     # 公開ホスト名
+```
+
+- 形式は `KEY=VALUE` の行、`#` で始まる行は無視。値は前後の空白も含めてそのまま使われる
+- **既に環境にある値の方が優先**(プラットフォームの `PORT` や Startup 変数は上書きされない)
+- パスを変えたいときは `NAROU_RS_ENV_FILE` で指定する
+- 変更後は再起動(パネルの `restart`、または次の配備)で反映される
+
+### 3.1 サーバー側の `.env` に書く値 (アプリの動作)
 
 | 変数 | 何のため | 設定する値 | 設定ファイルとの優先 |
 | --- | --- | --- | --- |
@@ -161,7 +192,7 @@ Pterodactyl の Startup 変数 (または `.env`)。`start.sh` が起動のた�
   前のリリースを配り続けてしまうため)。意図的に認証なしで公開するなら
   `NAROU_ALLOW_NO_PASSWORD=1`
 
-### 3.2 GitHub 側に置く (CI)
+### 3.2 GitHub 側に置く値 (CI)
 
 | 種類 | 名前 | 値 |
 | --- | --- | --- |
@@ -177,13 +208,13 @@ Pterodactyl の Startup 変数 (または `.env`)。`start.sh` が起動のた�
 | Environment `SORAHOST` variable | `SORAHOST_ACCESS_EMAIL` | 同上。Access で許可するメール (カンマ区切り) |
 | Environment `SORAHOST` variable | `SORAHOST_ACCESS_DOMAIN` | 同上。許可するメールドメイン |
 
-§3.1 の値は CI には置かない (PteWorker のパネルに置く)。
+§3.1 の値は CI には置かない (サーバー直下の `.env` に置く)。
 
 ### 3.3 鍵・資格情報の仕様
 
 | 値 | 仕様 (コードが受け付ける形) | 作り方 |
 | --- | --- | --- |
-| `NAROU_WEB_PASSWORD` | 任意の文字列。**空だと basic 認証が無効になる**実装なので空にしない | 未設定なら `start.sh` が 24 文字の英数を自動生成。自分の値にするならパネルに置く |
+| `NAROU_WEB_PASSWORD` | 任意の文字列。**空だと basic 認証が無効になる**実装なので空にしない | 未設定なら `start.sh` が 24 文字の英数を自動生成。自分の値にするなら `.env` に置く |
 | `NAROU_WEB_USER` | 任意の文字列 | 未設定なら `admin` を補う |
 | `NAROU_RS_LOGIN_KEY` | **base64** (標準・パディングあり)。復号後 **16 バイト以上**が必要。32 バイトはそのまま、16〜31 バイトは SHA-256 で 32 バイトへ伸長。前後の空白は無視、壊れた base64 はエラー | `openssl rand -base64 24` (または `-base64 32`) |
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | 空でない文字列 (SigV4 の鍵。長さの規定なし) | ストレージ側で発行 |
@@ -367,7 +398,7 @@ CI ではなく **PteWorker の `.env`** に置く (§3、ひな形は `sorahost
 **1 プロジェクト = 起動コマンド 1 つ** なので、起動コマンドを narou の `start.sh`
 に寄せて、リレーはそこから起動する。
 
-1. パネルの `.env` に `NAROU_RELAY=1` を足す (`SORAHOST_PROXY_KEY` は既にある値のまま)
+1. サーバー直下の `.env` に `NAROU_RELAY=1` を足す (`SORAHOST_PROXY_KEY` は既にある値のまま)
 2. リレー側の起動コマンドを `bash start.sh` に差し替える。リレーを CI から配備して
    いる場合は Repository variable `SORAHOST_RELAY_START` = `bash start.sh` を入れる
    (未設定なら従来どおり `node server.mjs` で、リレーだけが動く)
