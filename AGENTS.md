@@ -580,6 +580,9 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   `include: [app, start.sh, sorahost.json]`)。**PteWorker は配備ごとに
   `/home/container/.sorahost/releases/<日時>-<hash>/` を作り直す**ので、ライブラリは
   その外 (`$VOLUME_DIR/narou-library`) に置く (`start.sh` が自動で割り出す)。
+- **basic 認証**: 資格情報が空だと narou は素通しにするため、`start.sh` は未設定なら
+  ランダムなパスワードを生成して設定し、コンソールに表示する (起動を止めると PteWorker が
+  デプロイ失敗 422 と見なし、前のリリースを配り続ける — 実測)。
 - **`server-ws-port=0` が必要**: narou.rb の `server-port + 1` は PteWorker が自分の
   ルータ (workerd) に使う番号と衝突し、プラットフォーム側が `Address already in use`
   で落ちる。`0` で併設リスナーを切ると本体ポートの `/ws` だけで受ける。

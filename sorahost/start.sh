@@ -90,9 +90,28 @@ if [ ! -d "$LIB/.narou" ]; then
     concurrency=true < /dev/null
 fi
 
+# --- basic 認証 (公開エンドポイントなので必須) -----------------------------
+# 資格情報が空だと narou は認証ヘッダを作らず素通しになるため、未設定のまま
+# 公開しない。ただし起動自体を止めると PteWorker がデプロイ失敗 (422) と見なし、
+# **前のリリースを配り続けてしまう** (実測) ので、その場でランダムなパスワードを
+# 設定して「誰も入れない状態」で起動する。値を決めたいときは NAROU_WEB_PASSWORD を
+# パネルの .env に置く。前段 (Cloudflare Access 等) で守る構成なら
+# NAROU_ALLOW_NO_PASSWORD=1 で認証なしのまま起動する。
+if [ -z "${NAROU_WEB_PASSWORD:-}" ] \
+  && [ -z "$("$BIN" setting server-basic-auth.password < /dev/null)" ]; then
+  if [ "${NAROU_ALLOW_NO_PASSWORD:-0}" = "1" ]; then
+    echo "[narou] 警告: basic 認証なしで公開します (NAROU_ALLOW_NO_PASSWORD=1)" >&2
+  else
+    NAROU_WEB_PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
+    echo "[narou] NAROU_WEB_PASSWORD が未設定のため、一時的なパスワードを設定しました:" >&2
+    echo "[narou]   ${NAROU_WEB_USER:-admin} / $NAROU_WEB_PASSWORD" >&2
+    echo "[narou]   パネルの .env に NAROU_WEB_PASSWORD を入れて再起動すると置き換わります" >&2
+  fi
+fi
+
 # --- 毎回そろえる設定 -----------------------------------------------------
 # ループバックだけを向き、Host / Origin は前段 (PteWorker) が渡す公開ホスト名と
-# 一致させる。basic 認証は公開エンドポイントなので必須。
+# 一致させる。
 # server-ws-port=0: 併設 WebSocket リスナーを作らない。narou.rb は
 # `server-port + 1` も使うが、PteWorker はその番号を自分のルータ (workerd) に
 # 使うため衝突する。WebSocket は本体ポートの `/ws` で受けるので機能は落ちない。
@@ -110,19 +129,6 @@ if [ -n "${NAROU_WEB_PASSWORD:-}" ]; then
   set -- "$@" "server-basic-auth.password=$NAROU_WEB_PASSWORD"
 fi
 "$BIN" setting "$@" < /dev/null
-
-# 公開エンドポイントなので、basic 認証が無いまま公開しない (fail closed)。
-# 前段 (Cloudflare Access 等) で守る構成のときだけ NAROU_ALLOW_NO_PASSWORD=1 で通す。
-if [ -z "${NAROU_WEB_PASSWORD:-}" ] \
-  && [ -z "$("$BIN" setting server-basic-auth.password < /dev/null)" ]; then
-  if [ "${NAROU_ALLOW_NO_PASSWORD:-0}" = "1" ]; then
-    echo "[narou] 警告: basic 認証なしで公開します (NAROU_ALLOW_NO_PASSWORD=1)" >&2
-  else
-    echo "[narou] NAROU_WEB_PASSWORD が未設定です。公開エンドポイントを認証なしで" >&2
-    echo "[narou] 公開しないため起動しません (意図的なら NAROU_ALLOW_NO_PASSWORD=1)。" >&2
-    exit 1
-  fi
-fi
 
 # --- 起動したプロセスをまとめて片付ける -----------------------------------
 cleanup() {
