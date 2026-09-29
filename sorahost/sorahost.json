@@ -1,5 +1,9 @@
 {
   "mode": "node",
-  "start": "bash start.sh",
-  "include": ["app", "start.sh", "sorahost.json"]
+  "start": "sh start.sh",
+  "include": [
+    "app",
+    "start.sh",
+    "sorahost.json"
+  ]
 }

@@ -1,28 +1,28 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # SORAHOST (PteWorker の node モード) で narou_rs を常駐させる起動スクリプト。
+#
+# POSIX sh で書いてある (コンテナの /bin/sh だけを前提にする。bash が入って
+# いない最小イメージでも動かすため)。
 #
 # 配置 (プロジェクトルート = コンテナのボリューム):
 #   sorahost.json   配備の定義 (PteWorker が読む)
 #   start.sh        このスクリプト。`sorahost.json` の start が呼ぶ
-#   app/            実行ファイル + webnovel/ + preset/ (配備で入れ替わる)
+#   app/            実行ファイル + webnovel/ (配備で入れ替わる)
 #   library/        narou のデータ (配備に含めない。作品・設定はここだけ)
-#
-#   → ライブラリを `include` に入れないので、配備で作品が消えない (はず。
-#     初回は配備を 2 回流して `library/` が残ることを確認する)。
 #
 # 公開は PteWorker が行う。アプリは **PteWorker から渡される PORT** に
 # ループバックで束縛する (外部へ直接公開しない)。cloudflared は使わない。
 #
-# 再起動: `sorahost-cli deploy` のあと PteWorker が起動し直す。手で再起動して
-# もよい (`restart` コマンド)。コンソールは PTY なので、対話プロンプトを持つ
-# コマンドには `< /dev/null` を付けて stdin を端末でなくす。
+# コンソールは PTY なので、対話プロンプトを持つコマンドには `< /dev/null` を
+# 付けて stdin を端末でなくす (付けないと初回起動が止まる)。
 
-set -euo pipefail
+set -eu
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP="${NAROU_RS_APP:-$SELF_DIR/app}"
 LIB="${NAROU_RS_LIBRARY:-$SELF_DIR/library}"
 BIN="$APP/narou_rs"
+PIDS=""
 
 # 相乗り (NAROU_RELAY=1) のときはプラットフォームの PORT をリレーが使うので、
 # narou 側は別ポートにする (sorahost/README.md §10)。
@@ -32,10 +32,10 @@ else
   NAROU_PORT="${NAROU_RS_PORT:-${PORT:-8080}}"
 fi
 
-[ -x "$BIN" ] || {
+if [ ! -x "$BIN" ]; then
   echo "[narou] $BIN がありません (配備が不完全です)" >&2
   exit 1
-}
+fi
 
 mkdir -p "$LIB"
 
@@ -45,10 +45,10 @@ if [ ! -d "$LIB/.narou" ]; then
   echo "[narou] ライブラリを初期化します: $LIB"
   # 同梱の webnovel/*.yaml は実行ファイルの隣 ($APP/webnovel) からコピーされる。
   "$BIN" init < /dev/null
-  [ -d "$LIB/.narou" ] || {
+  if [ ! -d "$LIB/.narou" ]; then
     echo "[narou] init がライブラリを作れませんでした: $LIB" >&2
     exit 1
-  }
+  fi
   # SQLite 管理 (Lite) にする。YAML に戻すときは `narou db export-yaml --in-place`。
   printf 'sqlite\n' > "$LIB/.narou/storage-backend"
   # 容量節約の既定 (初回だけ入れるので、後から変えても上書きされない):
@@ -71,22 +71,19 @@ fi
 # --- 毎回そろえる設定 -----------------------------------------------------
 # ループバックだけを向き、Host / Origin は前段 (PteWorker) が渡す公開ホスト名と
 # 一致させる。basic 認証は公開エンドポイントなので必須。
-SETTINGS=(
-  "server-bind=127.0.0.1"
-  "server-port=$NAROU_PORT"
-  "server-reverse-proxy.enable=true"
-  "server-basic-auth.enable=true"
-  # 容量節約のため、話ごとの変換キャッシュは作らない (再変換が少し遅くなるだけ)。
-  # 環境変数 NAROU_RS_SECTION_CACHE=0 で切る指定は従来どおり任意。
+set -- \
+  "server-bind=127.0.0.1" \
+  "server-port=$NAROU_PORT" \
+  "server-reverse-proxy.enable=true" \
+  "server-basic-auth.enable=true" \
   "convert.section-cache=false"
-)
 if [ -n "${NAROU_WEB_USER:-}" ]; then
-  SETTINGS+=("server-basic-auth.user=$NAROU_WEB_USER")
+  set -- "$@" "server-basic-auth.user=$NAROU_WEB_USER"
 fi
 if [ -n "${NAROU_WEB_PASSWORD:-}" ]; then
-  SETTINGS+=("server-basic-auth.password=$NAROU_WEB_PASSWORD")
+  set -- "$@" "server-basic-auth.password=$NAROU_WEB_PASSWORD"
 fi
-"$BIN" setting "${SETTINGS[@]}" < /dev/null
+"$BIN" setting "$@" < /dev/null
 
 if [ -z "${NAROU_WEB_PASSWORD:-}" ] \
   && [ -z "$("$BIN" setting server-basic-auth.password < /dev/null)" ]; then
@@ -94,12 +91,13 @@ if [ -z "${NAROU_WEB_PASSWORD:-}" ] \
 fi
 
 # --- 起動したプロセスをまとめて片付ける -----------------------------------
-PIDS=()
 cleanup() {
-  for pid in "${PIDS[@]}"; do
+  for pid in $PIDS; do
     kill "$pid" 2>/dev/null || true
   done
 }
+# TERM/INT は明示的に抜ける (ハンドラから戻るとループが再開してしまうため)
+trap 'cleanup; exit 0' INT TERM
 trap cleanup EXIT
 
 # --- 取得リレー (任意・Worker の踏み台) ------------------------------------
@@ -113,14 +111,23 @@ if [ "${NAROU_RELAY:-0}" = "1" ]; then
     echo "[narou] (Worker 側の SORAHOST_PROXY_KEY と同じ値を .env に置いて下さい)" >&2
   else
     node "$RELAY_JS" </dev/null &
-    PIDS+=("$!")
+    PIDS="$PIDS $!"
     echo "[narou] 取得リレーを起動しました (待受は 127.0.0.1:${PORT:-3000} / narou は ${NAROU_PORT})"
   fi
 fi
 
 echo "[narou] 起動します (127.0.0.1:${NAROU_PORT} / ライブラリ ${LIB})"
 "$BIN" web --port "$NAROU_PORT" --no-browser </dev/null &
-PIDS+=("$!")
+PIDS="$PIDS $!"
 
-# どれかが落ちたら全体を終了し、PteWorker に再起動させる。
-wait -n "${PIDS[@]}"
+# どれかが落ちたら全体を終了し、PteWorker に再起動させる (wait -n は POSIX に
+# 無いので、1 秒間隔で生存を確かめる)。
+while :; do
+  for pid in $PIDS; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[narou] プロセス $pid が終了しました。全体を止めます" >&2
+      exit 0
+    fi
+  done
+  sleep 2
+done
