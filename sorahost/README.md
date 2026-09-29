@@ -94,24 +94,55 @@ PteWorker が公開する。アプリは渡された `PORT` にループバッ�
 
 ## 3. 環境変数
 
-Pterodactyl の Startup 変数、またはコンテナ内の環境変数として設定する
-(ひな形は `sorahost/narou.env.example`)。
+置き場は 2 つだけ。**アプリの値は PteWorker のパネル**、**CI の値は GitHub** に置く。
+ここに挙げた名前がコードの読む全部で、綴りが違うと無視される。
 
-| 変数 | 用途 |
-| --- | --- |
-| `NAROU_WEB_PASSWORD` | Web UI の basic 認証パスワード (**必須**。公開されるため) |
-| `NAROU_WEB_USER` | basic 認証のユーザ名 (既定は設定しない = narou 側の既定) |
-| `NAROU_RS_ASSET_BACKEND` | `s3` で挿絵を S3 へ。未設定はローカル保存 |
-| `S3_ENDPOINT` / `S3_BUCKET` / `S3_REGION` | 接続先 (Wasabi は `https://s3.<region>.wasabisys.com`) |
-| `S3_PREFIX` | バケット内の接頭辞 (例 `narou/library`) |
-| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | 資格情報 |
-| `NAROU_RS_PORT` | 待受ポート (既定は PteWorker の `PORT`。リレー同居時のみ 8080) |
-| `NAROU_RELAY` | `1` で Worker 用の取得リレーも同じコンテナで起動する (§10) |
-| `SORAHOST_PROXY_KEY` | リレーの合言葉 (§10)。Worker secret の同名値と同じにする |
-| `NAROU_RS_APP` / `NAROU_RS_LIBRARY` | `app/` とライブラリの場所 (既定は配備パスから自動) |
+### 3.1 パネルに置く (アプリの動作)
 
-`narou setting s3.endpoint=...` のように設定ファイル側へ書いてもよい
-(環境変数があるときは環境変数が優先)。
+Pterodactyl の Startup 変数 (または `.env`)。`start.sh` が起動のたびに読む。
+
+| 変数 | 何のため | 設定する値 | 設定ファイルとの優先 |
+| --- | --- | --- | --- |
+| `NAROU_WEB_PASSWORD` | Web UI の basic 認証。**公開エンドポイントなので必須** | 長いランダム文字列 | start.sh が `server-basic-auth.password` に書く |
+| `NAROU_WEB_USER` | basic 認証のユーザ名 | 例 `admin` | 同 `server-basic-auth.user` (未設定なら narou 側の既定) |
+| `NAROU_ALLOW_NO_PASSWORD` | `1` で「パスワード無しでも起動する」 | 前段で守るときだけ `1` | — |
+| `NAROU_RS_ASSET_BACKEND` | `s3` で挿絵だけ S3 へ | `s3` (未設定 = ローカル保存) | **設定 `s3.asset-backend` が優先** |
+| `S3_ENDPOINT` | S3 互換の接続先 | Wasabi: `https://s3.ap-northeast-1.wasabisys.com` | 設定 `s3.endpoint` が優先 |
+| `S3_BUCKET` | バケット | 例 `mybucket` | 設定 `s3.bucket` が優先 |
+| `S3_REGION` | リージョン | 例 `ap-northeast-1` | 設定 `s3.region` が優先 |
+| `S3_PREFIX` | バケット内の接頭辞 | 例 `narou/library` | 設定 `s3.prefix` が優先 |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | 資格情報 | ストレージのキー | 設定 `s3.access-key-id` / `s3.secret-access-key` が優先 |
+| `NAROU_RS_LOGIN_KEY` | ログイン Cookie の暗号鍵 (base64) | `openssl rand -base64 24` | `.narou/login.key` より優先 |
+| `NAROU_RS_MIRROR_FILES` | `0` で `小説データ/` を作らない | 通常は未設定 (start.sh が `sqlite.mirror-files=false` を入れる) | **環境変数が設定より優先** |
+| `NAROU_RS_SECTION_CACHE` | `0` で話ごとの変換キャッシュを作らない | 通常は未設定 (start.sh が `convert.section-cache=false` を入れる) | **環境変数が優先** |
+| `NAROU_RS_KEEP_TXT` | `0` で変換 txt を残さない | 通常は未設定 (start.sh が `convert.keep-txt=false`) | **環境変数が優先** |
+| `NAROU_RS_LEGACY_YAML` | `1` で SQLite をやめ YAML 管理に戻す | 通常は未設定 | 環境変数のみ |
+| `NAROU_RS_EPUB_ENGINE` | EPUB エンジン | `lite` / `external` / `auto` (未設定 = auto) | **環境変数が `convert.epub-engine` より優先** |
+| `NAROU_RS_APP` / `NAROU_RS_LIBRARY` | `app/` とライブラリの場所 | 通常は未設定 (配備パスから自動) | start.sh |
+| `NAROU_RS_PORT` | 待受ポート | 通常は未設定 (プラットフォームの `PORT` を使う) | start.sh (リレー同居時のみ 8080) |
+| `NAROU_RELAY` / `SORAHOST_PROXY_KEY` | 同じサーバーで取得リレーも動かすときだけ (§10) | `1` / 合言葉 | start.sh |
+
+- `PORT` はプラットフォームが渡す値で、**こちらから設定しない** (narou はこれに束縛する)
+- `s3` を選んで値を 1 つでも欠かすと**起動に失敗する** (黙ってローカル保存へ落ちない)
+- ログインが要るサイトを使うなら `NAROU_RS_LOGIN_KEY` を決めておく (鍵を変えると保存済み Cookie は読めなくなる)
+- basic 認証は **資格情報が空だと無効** (素通し) になる実装なので、`NAROU_WEB_PASSWORD`
+  が無いまま公開しないこと。`start.sh` は未設定なら起動を止める (`NAROU_ALLOW_NO_PASSWORD=1` で回避)
+
+### 3.2 GitHub 側に置く (CI)
+
+| 種類 | 名前 | 値 |
+| --- | --- | --- |
+| Repository variable | `SORAHOST` | `T` で SORAHOST 配備が有効になり、Worker 側の CI が止まる (`F` / 未設定で逆) |
+| Environment `SORAHOST` secret | `SORAHOST_ENDPOINT` | PteWorker コンソールの「エンドポイント」 |
+| Environment `SORAHOST` secret | `SORAHOST_TOKEN` | 同「デプロイトークン」(`token rotate` で再発行) |
+| Environment `SORAHOST` variable | `SORAHOST_SMOKE_URL` | 任意。配備後の確認先 (未設定なら配備結果の `url`) |
+
+§3.1 の値は CI には置かない (PteWorker のパネルに置く)。
+
+Worker 側の CI は別系統の値を使う (Environment `Cloudflare`): `CLOUDFLARE_API_TOKEN` /
+`CLOUDFLARE_ACCOUNT_ID` / `SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY` /
+`SORAHOST_PROXY_TOKEN` / `NAROU_S3_*`。**native の `S3_*` と Worker の `NAROU_S3_*` は
+別物**なので混同しないこと (`SORAHOST=T` の間は使われない)。
 
 ## 4. 起動
 

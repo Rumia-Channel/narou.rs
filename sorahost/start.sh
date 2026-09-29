@@ -111,9 +111,17 @@ if [ -n "${NAROU_WEB_PASSWORD:-}" ]; then
 fi
 "$BIN" setting "$@" < /dev/null
 
+# 公開エンドポイントなので、basic 認証が無いまま公開しない (fail closed)。
+# 前段 (Cloudflare Access 等) で守る構成のときだけ NAROU_ALLOW_NO_PASSWORD=1 で通す。
 if [ -z "${NAROU_WEB_PASSWORD:-}" ] \
   && [ -z "$("$BIN" setting server-basic-auth.password < /dev/null)" ]; then
-  echo "[narou] 警告: Web UI の basic 認証が未設定です (NAROU_WEB_PASSWORD を設定して下さい)" >&2
+  if [ "${NAROU_ALLOW_NO_PASSWORD:-0}" = "1" ]; then
+    echo "[narou] 警告: basic 認証なしで公開します (NAROU_ALLOW_NO_PASSWORD=1)" >&2
+  else
+    echo "[narou] NAROU_WEB_PASSWORD が未設定です。公開エンドポイントを認証なしで" >&2
+    echo "[narou] 公開しないため起動しません (意図的なら NAROU_ALLOW_NO_PASSWORD=1)。" >&2
+    exit 1
+  fi
 fi
 
 # --- 起動したプロセスをまとめて片付ける -----------------------------------
