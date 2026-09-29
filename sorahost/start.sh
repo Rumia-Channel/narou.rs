@@ -32,8 +32,18 @@ else
   NAROU_PORT="${NAROU_RS_PORT:-${PORT:-8080}}"
 fi
 
+# 配備の経路 (tar / CLI / プラットフォームの展開) で実行ビットが落ちることが
+# あるので、読み込みが済んでいれば自分で付け直す。
+if [ -f "$BIN" ] && [ ! -x "$BIN" ]; then
+  chmod +x "$BIN" 2>/dev/null || true
+fi
+if [ -f "$APP/narou_rs_backup" ] && [ ! -x "$APP/narou_rs_backup" ]; then
+  chmod +x "$APP/narou_rs_backup" 2>/dev/null || true
+fi
+
 if [ ! -x "$BIN" ]; then
-  echo "[narou] $BIN がありません (配備が不完全です)" >&2
+  echo "[narou] $BIN が実行できません (配備が不完全か、実行属性がありません)" >&2
+  ls -l "$APP" >&2 || true
   exit 1
 fi
 
