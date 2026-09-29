@@ -111,6 +111,7 @@ jobs:
           SORAHOST_TUNNEL_NAME: ${{ vars.SORAHOST_TUNNEL_NAME }}
           SORAHOST_ACCESS_EMAIL: ${{ vars.SORAHOST_ACCESS_EMAIL }}
           SORAHOST_ACCESS_DOMAIN: ${{ vars.SORAHOST_ACCESS_DOMAIN }}
+          SORAHOST_ACCESS_SESSION: ${{ vars.SORAHOST_ACCESS_SESSION }}
         run: |
           if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${SORAHOST_TUNNEL_HOSTNAME:-}" ]; then
             echo "::notice::CLOUDFLARE_API_TOKEN / SORAHOST_TUNNEL_HOSTNAME が未設定のため tunnel は触りません"
