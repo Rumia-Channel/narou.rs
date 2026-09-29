@@ -218,6 +218,11 @@ narou illust s3-verify                     # バイト単位で突き合わせ�
 ビルドから配備まで自動で流れる。**動くのは Repository variable の
 `SORAHOST` が `T` のときだけ** (未設定・`F` なら何もせず終わる)。
 
+`SORAHOST` が `T` の間は **Cloudflare Workers 側の CI も止まる** (`.github/workflows/platform.yml`
+の wasm / worker / worker-contract / relay-deploy / worker-deploy-develop /
+worker-deploy-production が skip される)。配備先を Worker に戻すときは `SORAHOST` を
+`F` にするか消す (native / native-gpl / license のテストは配備先に依存しないので常に走る)。
+
 流れ:
 
 1. `.github/workflows/build-linux.yml` が Linux バイナリを作る (GitHub ホストの runner)
