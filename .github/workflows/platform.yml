@@ -238,8 +238,13 @@ jobs:
         if: steps.credentials.outputs.configured == 'true'
 
 
-  # SORAHOST の取得リレーを配布する。Worker と同じ Cloudflare environment の
-  # シークレット (SORAHOST_PROXY_ENDPOINT / SORAHOST_PROXY_TOKEN) を使い、
+  # SORAHOST の取得リレーを配布する。Worker は同じリレーへ
+  # `X-Proxy-Token: <SORAHOST_PROXY_KEY>` を付けて `POST /proxy` する (403 なら
+  # Worker は元の fetch 結果へ黙って戻るため、合言葉のずれはサイト不取得として現れる)。
+  # 使う資格情報は 3 つで、いずれも Cloudflare environment に置く:
+  #   SORAHOST_PROXY_ENDPOINT … リレーの公開先 (Worker の接続先 / CLI のエンドポイント)
+  #   SORAHOST_PROXY_TOKEN    … sorahost-cli のデプロイトークン (`Authorization: Bearer`)
+  #   SORAHOST_PROXY_KEY      … リレーの合言葉 (コンテナの .env と一致するかを配備後に確認する)
   # PteWorker のコンテナに curl が無いため静的 curl と CA バンドルを同梱する。
   relay-deploy:
     name: Deploy SORAHOST relay
@@ -256,7 +261,24 @@ jobs:
       name: Cloudflare
     steps:
       - uses: actions/checkout@v5
+
+      # 資格情報が無い環境 (fork / 未設定) では理由を出して省略する。
+      # `--yes` で走らせるので、無いまま実行すると CLI 側が認証情報不足で落ちる。
+      - name: Check the relay credentials
+        id: credentials
+        env:
+          SORAHOST_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
+          SORAHOST_TOKEN: ${{ secrets.SORAHOST_PROXY_TOKEN }}
+        run: |
+          if [ -z "$SORAHOST_ENDPOINT" ] || [ -z "$SORAHOST_TOKEN" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SORAHOST_PROXY_ENDPOINT / SORAHOST_PROXY_TOKEN が未設定のためリレーの配布を省略します"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Fetch the verified static curl
+        if: steps.credentials.outputs.configured == 'true'
         run: |
           mkdir -p build
           base=https://github.com/moparisthebest/static-curl/releases/download/v8.21.0
@@ -266,21 +288,38 @@ jobs:
           chmod +x build/curl
           file build/curl
       - name: Assemble the deploy bundle
+        if: steps.credentials.outputs.configured == 'true'
+        env:
+          # 同じ SORAHOST で narou 本体も動かす場合は `bash narou/start.sh` を
+          # Repository variable `SORAHOST_RELAY_START` に入れる。そのときリレーは
+          # narou 側の start.sh が `NAROU_RELAY=1` のときだけ起動する
+          # (1 プロジェクトに置ける起動コマンドは 1 つ。sorahost/README.md 参照)。
+          RELAY_START: ${{ vars.SORAHOST_RELAY_START || 'node server.mjs' }}
         run: |
           cp /etc/ssl/certs/ca-certificates.crt build/cacert.pem
           cp scripts/sorahost-proxy/server.mjs build/server.mjs
           chmod +x build/curl
-          cat > build/sorahost.json <<'JSON'
-          { "mode": "node", "framework": "node", "start": "node server.mjs", "include": ["server.mjs", "curl", "cacert.pem"] }
+          cat > build/sorahost.json <<JSON
+          { "mode": "node", "framework": "node", "start": "${RELAY_START}", "include": ["server.mjs", "curl", "cacert.pem"] }
           JSON
           ls -la build
       - name: Deploy to SORAHOST
+        if: steps.credentials.outputs.configured == 'true'
         env:
           SORAHOST_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
           SORAHOST_TOKEN: ${{ secrets.SORAHOST_PROXY_TOKEN }}
         run: |
           cd build
           npx --yes sorahost-cli deploy --yes --json
+
+      # 配備したリレーが Worker 側の合言葉を受け付けるかを実際に叩いて確かめる。
+      # 合言葉がずれていると Worker からは 403 になり、取得できないサイトが黙って増える。
+      - name: Verify the relay authentication
+        if: steps.credentials.outputs.configured == 'true'
+        env:
+          SORAHOST_PROXY_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
+          SORAHOST_PROXY_KEY: ${{ secrets.SORAHOST_PROXY_KEY }}
+        run: python3 scripts/sorahost-proxy/verify_auth.py
 
   worker-deploy-production:
     name: Deploy Worker (production)

@@ -104,6 +104,8 @@ Pterodactyl の Startup 変数、またはコンテナ内の環境変数とし�
 | `S3_PREFIX` | バケット内の接頭辞 (例 `narou/library`) |
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | 資格情報 |
 | `NAROU_RS_PORT` | ローカルの待受ポート (既定 8080) |
+| `NAROU_RELAY` | `1` で Worker 用の取得リレーも同じコンテナで起動する (§10) |
+| `SORAHOST_PROXY_KEY` | リレーの合言葉 (§10)。Worker secret の同名値と同じにする |
 | `TUNNEL_TOKEN_FILE` | トークンのパス (既定 `$NAROU_RS_ROOT/.cloudflared-token`) |
 
 `narou setting s3.endpoint=...` のように設定ファイル側へ書いてもよい
@@ -263,7 +265,40 @@ API トークンの権限は **Account: Cloudflare Tunnel Edit** と **Zone: DNS
 > `SORAHOST` 環境に**同名の `SORAHOST` 変数を置かないこと** (Repository variable
 > の判定と混ざる)。
 
-## 10. 使えない機能
+## 10. Worker の取得リレーと同じサーバーで動かす
+
+Worker の踏み台 (`scripts/sorahost-proxy/`) と同じ SORAHOST で narou も動かせる。
+PteWorker は **1 プロジェクト = 起動コマンド 1 つ** なので、起動コマンドを narou の
+`start.sh` に寄せ、リレーはそこから起動する。
+
+1. パネルの `.env` に `NAROU_RELAY=1` を足す (`SORAHOST_PROXY_KEY` は既にある値のまま。
+   narou 側の `NAROU_*` / `S3_*` と同居してよい)。
+2. リレーの起動コマンドを差し替える。CI から配備している場合は Repository variable
+   `SORAHOST_RELAY_START` = `bash narou/start.sh` を入れる (未設定なら従来どおり
+   `node server.mjs` で、リレーだけが動く)。
+3. narou を先に配備してからリレーを配備する (`narou/start.sh` が無いと起動しない)。
+4. 再起動し、ログに `取得リレーを起動しました` と `narou_rs` の起動が出ることを確認する。
+
+- ポート: リレーはプラットフォームの `PORT` (127.0.0.1)、narou は `NAROU_RS_PORT`
+  (既定 8080)。`start.sh` はプラットフォームの `PORT` を上書きしない。
+- リレーの合言葉は Worker secret の `SORAHOST_PROXY_KEY` と**同じ値**にする。ずれると
+  Worker からは 403 になり、取得できないサイトが黙って増える (Worker は元の取得結果へ
+  戻るだけなので表面化しない)。`relay-deploy` ジョブが配備後に
+  `scripts/sorahost-proxy/verify_auth.py` で一致を確認する。手元で確かめるなら:
+
+  ```sh
+  SORAHOST_PROXY_ENDPOINT=https://... SORAHOST_PROXY_KEY=... \
+    python3 scripts/sorahost-proxy/verify_auth.py
+  ```
+
+- 別サーバーのままにする場合は何もしなくてよい (`NAROU_RELAY` 未設定なら `start.sh` は
+  リレーを起動しない)。
+- 注意: リレーの配備 (`sorahost-cli deploy`) はプロジェクトの起動コマンドを書き換える。
+  共有するときは `SORAHOST_RELAY_START` を常に設定しておくこと。
+- 注意: リレーの配備が `narou/` を消さないことは未確認 (`include` の 3 ファイルだけを
+  送る作りなので残る想定)。初回は配備後に `narou/narou_rs` が残っているかを見る。
+
+## 11. 使えない機能
 
 SORAHOST のコンテナで動かすため、次は動かない (Web UI 側では 501 相当):
 
@@ -272,7 +307,7 @@ SORAHOST のコンテナで動かすため、次は動かない (Web UI 側で�
 - 外部 AozoraEpub3 (`aozoraepub3dir` は設定しない。Lite を同梱して使う)
 - `narou_rs_login` (ブラウザのある端末で実行し、`narou login import` で取り込む)
 
-## 11. 確認
+## 12. 確認
 
 ```sh
 curl -I https://narou.example.com/            # basic 認証のチャレンジが返る

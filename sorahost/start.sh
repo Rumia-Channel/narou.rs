@@ -20,7 +20,7 @@ set -euo pipefail
 
 ROOT="${NAROU_RS_ROOT:-/home/container/narou}"
 LIB="${NAROU_RS_LIBRARY:-$ROOT/library}"
-PORT="${NAROU_RS_PORT:-8080}"
+NAROU_PORT="${NAROU_RS_PORT:-8080}"
 BIN="$ROOT/bin"
 CF_BIN="$BIN/cloudflared"
 CF_TAG="2026.9.3"
@@ -95,7 +95,7 @@ fi
 # 渡す公開ホスト名と一致させる (server-add-accepted-hosts は不要)。
 SETTINGS=(
   "server-bind=127.0.0.1"
-  "server-port=$PORT"
+  "server-port=$NAROU_PORT"
   "server-reverse-proxy.enable=true"
   "server-basic-auth.enable=true"
   # 容量節約のため、話ごとの変換キャッシュは作らない (再変換が少し遅くなるだけ)。
@@ -114,24 +114,46 @@ if [ -z "${NAROU_WEB_PASSWORD:-}" ] \
   echo "[narou] 警告: Web UI の basic 認証が未設定です (NAROU_WEB_PASSWORD を設定して下さい)" >&2
 fi
 
-# --- cloudflared と本体を同時に動かす -------------------------------------
-CF_PID=""
+# --- 起動したプロセスをまとめて片付ける -----------------------------------
+PIDS=()
+cleanup() {
+  for pid in "${PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+}
+trap cleanup EXIT
+
+# --- cloudflared (トンネル) と本体を同時に動かす ---------------------------
 if [ -f "$TOKEN_FILE" ]; then
   "$CF_BIN" tunnel --no-autoupdate --loglevel info \
     run --token-file "$TOKEN_FILE" </dev/null &
-  CF_PID=$!
-  trap 'kill "$CF_PID" 2>/dev/null || true' EXIT
+  PIDS+=("$!")
 else
   echo "[narou] 警告: $TOKEN_FILE が無いため cloudflared を起動しません" >&2
   echo "[narou] (公開するには Cloudflare Tunnel のトークンを置いて下さい)" >&2
 fi
 
-"$NAROU" web --port "$PORT" --no-browser </dev/null &
-APP_PID=$!
-
-# どちらかが落ちたら全体を終了し、Pterodactyl に再起動させる。
-if [ -n "$CF_PID" ]; then
-  wait -n "$CF_PID" "$APP_PID"
-else
-  wait "$APP_PID"
+# --- 取得リレー (Worker の踏み台) ------------------------------------------
+# Worker から取れないサイト用のリレー (scripts/sorahost-proxy/server.mjs) を
+# **同じコンテナで** 動かすときだけ NAROU_RELAY=1 にする。リレーは 1 プロジェクトに
+# 1 つしか起動コマンドを置けないため、その場合は PteWorker 側の start を
+# このスクリプトにして、リレーはここから起動する (sorahost/README.md 参照)。
+RELAY_JS="$ROOT/../server.mjs"
+if [ "${NAROU_RELAY:-0}" = "1" ]; then
+  if [ ! -f "$RELAY_JS" ]; then
+    echo "[narou] 警告: NAROU_RELAY=1 ですが $RELAY_JS がありません" >&2
+  elif [ -z "${SORAHOST_PROXY_KEY:-}" ]; then
+    echo "[narou] 警告: SORAHOST_PROXY_KEY が無いためリレーを起動しません" >&2
+    echo "[narou] (Worker 側の SORAHOST_PROXY_KEY と同じ値を .env に置いて下さい)" >&2
+  else
+    node "$RELAY_JS" </dev/null &
+    PIDS+=("$!")
+    echo "[narou] 取得リレーを起動しました (待受は 127.0.0.1:${PORT:-3000} / narou は ${NAROU_PORT})"
+  fi
 fi
+
+"$NAROU" web --port "$NAROU_PORT" --no-browser </dev/null &
+PIDS+=("$!")
+
+# どれかが落ちたら全体を終了し、Pterodactyl に再起動させる。
+wait -n "${PIDS[@]}"

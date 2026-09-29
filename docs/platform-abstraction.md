@@ -552,10 +552,38 @@ Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト（�
   `platform::http1` の `SocketTarget` + `connect()` で GET する（Worker の `fetch` は
   `http://` を拒否するため）。サイト定義のヘッダはそのまま転送する。
 - 設定は Worker secret `SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY`。接続先は
-  パス込みで渡してよく、`RelayRequest` がオリジンに正規化する。未設定ならこの段は無効。
+  パス込みで渡してよく、`RelayRequest` がオリジンに正規化する (`http` / `https` の
+  どちらも可)。未設定ならこの段は無効。
 - リレー本体は `scripts/sorahost-proxy/`（PteWorker のコンテナに curl が無いため、
   CI が静的 curl と CA バンドルを同梱して配布する）。配布は `platform.yml` の
   `relay-deploy` ジョブが行い、develop / production のデプロイはその後に直列で走る。
+
+#### リレーの認証（2026-09-29 確認）
+
+合言葉は **HTTP ヘッダ 1 本**で、Worker とリレーが同じ値を突き合わせるだけの方式。
+
+| 向き | 実装 | 内容 |
+| --- | --- | --- |
+| Worker → リレー | `src/platform/relay.rs` (`TOKEN_HEADER = "x-proxy-token"`) | `GET|POST /proxy` に `X-Proxy-Token: <SORAHOST_PROXY_KEY>` を付ける |
+| リレー (node) | `scripts/sorahost-proxy/server.mjs` | `req.headers["x-proxy-token"] !== process.env.SORAHOST_PROXY_KEY` なら 403。未設定なら起動しない |
+| リレー (worker) | `scripts/sorahost-proxy/worker/worker.mjs` | 同じ比較。未設定なら 500 (`SORAHOST_PROXY_KEY is not set`) |
+| 死活確認 | 両方 | `GET /health` だけは認証なしで 200 `{ok:true}` |
+
+- **資格情報は 3 つあり、用途が違う**: `SORAHOST_PROXY_ENDPOINT`（リレーの公開先 =
+  Worker の接続先 = `sorahost-cli` のエンドポイント）、`SORAHOST_PROXY_TOKEN`
+  （`sorahost-cli` のデプロイトークン。`Authorization: Bearer` で `POST <endpoint>/deploy`
+  に送る）、`SORAHOST_PROXY_KEY`（リレーの合言葉 = `X-Proxy-Token`）。前 2 つは
+  Cloudflare environment の secret で、`SORAHOST_PROXY_KEY` は **コンテナの `.env`**
+  （PteWorker の画面）にも同じ値を置く。CLI は環境変数を注入できないため、
+  この二重管理は自動化できない。
+- **合言葉がずれると静かに壊れる**: 403 は `RelayError::Rejected` になり、Worker は
+  元の `fetch` の結果（多くは 403）へ戻る。つまり「一部のサイトだけ取得できない」という
+  形で現れる。そのため `relay-deploy` は配備直後に `scripts/sorahost-proxy/verify_auth.py`
+  を走らせ、①`/health` の到達性 ②**わざと違うトークンで 403**（認証が効いている）
+  ③**正しいトークンで 403/500 にならない**（`.env` と secret が一致）を確かめる。
+  不一致ならこのジョブが落ち、`needs` で Worker のデプロイも止まる。
+- 経路は平文 http でもよいが、その場合 `X-Proxy-Token` は平文で流れる。エンドポイントに
+  `https://` を置けるならそちらを使う（生ソケット経路も TLS を張れる）。
 
 ### 操作ごとのメッセージ（native CLI / Worker Web コンソール）
 
