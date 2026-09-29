@@ -99,6 +99,14 @@ TLS と本人確認 (Zero Trust) を前段に置く。直の IP:ポート宛は 
   パネルに置く
 - ingress の向き先は `127.0.0.1:<SORAHOST_SERVICE_PORT>` (既定 18080 = PteWorker の `PORT`)。
   `NAROU_RS_PORT` を変えたら合わせる
+- **トークンの権限 (UI の探し方)**: My Profile → API Tokens → Create Token → Custom token。
+  - アカウント全体のポリシーに **`Cloudflare Tunnel`**(説明が "Grants access to create and delete
+    Cloudflare Tunnels")を足して **Edit**。似た名前の **`Argo Tunnel (Legacy)`** は旧版で
+    Read のみなので選ばない
+  - **DNS はゾーン スコープ**なので、ポリシーをもう 1 行足して「ゾーン」→ 対象ドメイン →
+    `DNS: Edit` と `Zone: Read`(ゾーン ID の解決に必要)
+  - Access を使うなら同じアカウント全体のポリシーに **`Access: Apps and Policies: Edit`**
+  - ダッシュボードの表記は Read/Edit、API リファレンスは Read/Write (同じもの)
 - Zero Trust が未有効のアカウントでは Access の作成が 403 で止まる。ダッシュボードで有効化するか、
   `SORAHOST_ACCESS_EMAIL` / `SORAHOST_ACCESS_DOMAIN` を外して Access なしで進める
   (その場合は TLS だけが付く)
