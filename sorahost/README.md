@@ -104,7 +104,7 @@ Pterodactyl の Startup 変数 (または `.env`)。`start.sh` が起動のた�
 | 変数 | 何のため | 設定する値 | 設定ファイルとの優先 |
 | --- | --- | --- | --- |
 | `NAROU_WEB_PASSWORD` | Web UI の basic 認証。**公開エンドポイントなので必須** | 長いランダム文字列 | start.sh が `server-basic-auth.password` に書く |
-| `NAROU_WEB_USER` | basic 認証のユーザ名 | 例 `admin` | 同 `server-basic-auth.user` (未設定なら narou 側の既定) |
+| `NAROU_WEB_USER` | basic 認証のユーザ名 | 例 `admin` | 同 `server-basic-auth.user` (**未設定なら `admin` を補う**) |
 | `NAROU_ALLOW_NO_PASSWORD` | `1` で「パスワード無しでも起動する」 | 前段で守るときだけ `1` | — |
 | `NAROU_RS_ASSET_BACKEND` | `s3` で挿絵だけ S3 へ | `s3` (未設定 = ローカル保存) | **設定 `s3.asset-backend` が優先** |
 | `S3_ENDPOINT` | S3 互換の接続先 | Wasabi: `https://s3.ap-northeast-1.wasabisys.com` | 設定 `s3.endpoint` が優先 |
@@ -126,7 +126,7 @@ Pterodactyl の Startup 変数 (または `.env`)。`start.sh` が起動のた�
 - `s3` を選んで値を 1 つでも欠かすと**起動に失敗する** (黙ってローカル保存へ落ちない)
 - ログインが要るサイトを使うなら `NAROU_RS_LOGIN_KEY` を決めておく (鍵を変えると保存済み Cookie は読めなくなる)
 - basic 認証は **資格情報が空だと無効** (素通し) になる実装なので、`NAROU_WEB_PASSWORD`
-  は必ず設定すること。未設定のまま起動すると `start.sh` が**その場でランダムなパスワードを
+  は必ず設定すること (`NAROU_WEB_USER` は未設定なら `admin` が入る)。未設定のまま起動すると `start.sh` が**その場でランダムなパスワードを
   作って設定し**、コンソールに表示する (誰も入れない状態で公開だけは避ける)。
   起動自体は成功するので配備は成功する (止めると PteWorker がデプロイ失敗 422 と見なし、
   前のリリースを配り続けてしまうため)。意図的に認証なしで公開するなら

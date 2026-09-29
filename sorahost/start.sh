@@ -97,8 +97,8 @@ fi
 # 設定して「誰も入れない状態」で起動する。値を決めたいときは NAROU_WEB_PASSWORD を
 # パネルの .env に置く。前段 (Cloudflare Access 等) で守る構成なら
 # NAROU_ALLOW_NO_PASSWORD=1 で認証なしのまま起動する。
-if [ -z "${NAROU_WEB_PASSWORD:-}" ] \
-  && [ -z "$("$BIN" setting server-basic-auth.password < /dev/null)" ]; then
+STORED_PASSWORD="$("$BIN" setting server-basic-auth.password < /dev/null)"
+if [ -z "${NAROU_WEB_PASSWORD:-}" ] && [ -z "$STORED_PASSWORD" ]; then
   if [ "${NAROU_ALLOW_NO_PASSWORD:-0}" = "1" ]; then
     echo "[narou] 警告: basic 認証なしで公開します (NAROU_ALLOW_NO_PASSWORD=1)" >&2
   else
@@ -107,6 +107,11 @@ if [ -z "${NAROU_WEB_PASSWORD:-}" ] \
     echo "[narou]   ${NAROU_WEB_USER:-admin} / $NAROU_WEB_PASSWORD" >&2
     echo "[narou]   パネルの .env に NAROU_WEB_PASSWORD を入れて再起動すると置き換わります" >&2
   fi
+fi
+# narou は user と password の**両方**が埋まっていないと認証ヘッダを作らない
+# (片方だけだと素通しになる) ので、パスワードがあるときは user を既定で補う。
+if [ -n "${NAROU_WEB_PASSWORD:-}" ] || [ -n "$STORED_PASSWORD" ]; then
+  NAROU_WEB_USER="${NAROU_WEB_USER:-admin}"
 fi
 
 # --- 毎回そろえる設定 -----------------------------------------------------
