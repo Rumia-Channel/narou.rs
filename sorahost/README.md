@@ -18,18 +18,40 @@ Browser ──https──▶ Cloudflare (TLS / WAF / Tunnel)
 - メタデータ・本文はライブラリ内の SQLite (`.narou/db.sqlite`)、挿絵だけ S3 に置く
 - アプリはループバックにしかバインドしないので、外部から直接叩けない
 
-## 1. ビルド
+## 1. ビルド (Linux バイナリを用意する)
 
-組み込み EPUB エンジン (Lite) を有効にしてビルドする。外部 AozoraEpub3 (Java) は
-コンテナに置かない。
+Linux x86_64 の実行ファイルが必要。手元に Linux が無くてもよい。
+
+### A. GitHub Actions で作る (推奨)
+
+Actions の **Linux build (SORAHOST)** を `workflow_dispatch` で実行し、完了後に
+artifact `narou_rs-linux-x86_64` をダウンロードして展開する。中身:
+
+```
+narou_rs-<版>-linux-x86_64-gpl/
+  narou_rs / narou_rs_backup / narou_rs_login
+  webnovel/   同梱のサイト定義
+  preset/     外部 AozoraEpub3 を使う場合の雛形 (組み込みエンジンでは不要)
+  Third-Party-License.md
+```
+
+ビルドは GitHub ホストの runner (ubuntu-22.04 = glibc 2.35) で行うので、
+**self-hosted runner は使わない**(公開リポジトリの fork PR を手元で走らせないため)。
+`lto = true` のリンクは数 GB のメモリを使うので、VPS 上でのビルドも勧めない。
+
+置ける環境は glibc 2.35 以降 (Debian 12 / Ubuntu 22.04 以降)。それより古い
+コンテナなら、一致するイメージ内でビルドするか musl ターゲットに切り替える。
+
+### B. 手元の Linux / WSL で作る
 
 ```sh
 cargo build --release --features lite
 ```
 
-Linux 向けの実行ファイルと、同梱のサイト定義 (`webnovel/`) を用意する。
-`narou init` は実行ファイルの隣の `webnovel/` から定義をコピーするため、
-**`webnovel/` を同梱しないとサイト定義が空になる**。
+`target/release/` の `narou_rs`(+ `narou_rs_backup` / `narou_rs_login`)を、
+リポジトリの `webnovel/*.yaml` と一緒に配置する。`narou init` は実行ファイルの
+隣の `webnovel/` から定義をコピーするため、**`webnovel/` を同梱しないと
+サイト定義が空になる**。
 
 配置先 (コンテナ内):
 
