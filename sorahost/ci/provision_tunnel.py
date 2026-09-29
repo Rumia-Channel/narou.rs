@@ -13,8 +13,10 @@
 Install connector) で確認し、PteWorker の .env に TUNNEL_TOKEN として置く。
 
 環境変数:
-  CLOUDFLARE_API_TOKEN      Account: Cloudflare Tunnel Edit / Zone: DNS Edit
-                            (+ Access を使うなら Access: Apps and Policies Edit)
+  CLOUDFLARE_API_TOKEN      Account: Cloudflare Tunnel (Write/Edit)
+                            Zone: DNS (Write/Edit) と Zone: Zone (Read)
+                            (+ Access を使うなら Account: Access: Apps and Policies (Write/Edit))
+                            ※ ダッシュボードの表記は Read/Write、旧表記は Read/Edit
   CLOUDFLARE_ACCOUNT_ID
   SORAHOST_TUNNEL_HOSTNAME  公開ホスト名 (例 narou.example.com)
   SORAHOST_SERVICE_PORT     コンテナ内の待受ポート (既定 18080 = PteWorker の PORT)
@@ -117,7 +119,10 @@ def zone_for(token: str, hostname: str) -> str:
         for zone in cf("GET", f"/zones?{query}", token)["result"]:
             if zone.get("name") == candidate:
                 return zone["id"]
-    fail(f"{hostname} の zone がアカウントに見つかりません")
+    fail(
+        f"{hostname} の zone が見つかりません"
+        " (トークンに Zone:Zone:Read と対象ゾーンの Zone:DNS:Write が入っているか確認)"
+    )
 
 
 def ensure_dns(token: str, hostname: str, tunnel_id: str) -> None:

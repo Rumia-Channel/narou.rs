@@ -12,7 +12,9 @@ name: Deploy SORAHOST
 #   secrets SORAHOST_TOKEN       デプロイトークン (この 2 つが必須)
 #   vars    SORAHOST_SMOKE_URL   任意。配備後の確認先 (未設定なら deploy が返す url)
 #   ----- 前段に Cloudflare Tunnel + Access を置く場合だけ -----
-#   secrets CLOUDFLARE_API_TOKEN     Tunnel Edit / DNS Edit (+ Access Edit)
+#   secrets CLOUDFLARE_API_TOKEN     Account: Cloudflare Tunnel (Write/Edit),
+#                                   Zone: DNS (Write/Edit) + Zone (Read),
+#                                   Access を使うなら Access: Apps and Policies (Write/Edit)
 #   vars    CLOUDFLARE_ACCOUNT_ID
 #   vars    SORAHOST_TUNNEL_HOSTNAME 公開ホスト名 (例 narou.example.com)
 #   vars    SORAHOST_SERVICE_PORT    コンテナ内の待受ポート (既定 18080)

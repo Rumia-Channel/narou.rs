@@ -160,7 +160,7 @@ Pterodactyl の Startup 変数 (または `.env`)。`start.sh` が起動のた�
 | Environment `SORAHOST` secret | `SORAHOST_ENDPOINT` | PteWorker コンソールの「エンドポイント」 |
 | Environment `SORAHOST` secret | `SORAHOST_TOKEN` | 同「デプロイトークン」(`token rotate` で再発行) |
 | Environment `SORAHOST` variable | `SORAHOST_SMOKE_URL` | 任意。配備後の確認先 (未設定なら配備結果の `url`) |
-| Environment `SORAHOST` secret | `CLOUDFLARE_API_TOKEN` | 任意 (§2-A を使うとき)。Tunnel Edit / DNS Edit (+ Access Edit) |
+| Environment `SORAHOST` secret | `CLOUDFLARE_API_TOKEN` | 任意 (§2-A を使うとき)。Account: `Cloudflare Tunnel (Write/Edit)`、Zone: `DNS (Write/Edit)` と `Zone (Read)`、Access を使うなら Account: `Access: Apps and Policies (Write/Edit)` |
 | Environment `SORAHOST` variable | `CLOUDFLARE_ACCOUNT_ID` | 同上 |
 | Environment `SORAHOST` variable | `SORAHOST_TUNNEL_HOSTNAME` | 同上。公開ホスト名 (例 `narou.example.com`) |
 | Environment `SORAHOST` variable | `SORAHOST_SERVICE_PORT` | 同上。コンテナ内の待受ポート (既定 18080) |
