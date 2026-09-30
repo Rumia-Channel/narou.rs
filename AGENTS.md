@@ -521,6 +521,21 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   ローカルから S3 へ写す。`narou illust s3-verify` がバイト単位で突き合わせる。どちらも
   ライブラリ全体が対象で、`s3.asset-backend=s3` と接続情報が必要
   (`platform::store_migration::migrate_page` を共有)。
+- **挿絵のハッシュ dedup** (SQLite + S3 モードで既定 ON、2026-10): `S3Location::with_illustration_dedup` を
+  付けると、`挿絵/<sha256-hex>.<ext>` を作品を跨いで `illustrations/<base64url(sha256)>.<ext>` の
+  グローバルプールへ寄せる (同じ画像の二重保存を防ぐ)。小説別の配置は `挿絵/` ではなく pool 側が
+  正位置になり、`read`/`stat`/`read_stream` はプールに無ければ旧 `挿絵/` 配置へフォールバックする
+  (移行前の実オブジェクトをそのまま読める)。`delete` は旧配置だけを指し、pool は消さない
+  (他小説と共有されるため)。mitemin (`iNNN`) 名や hash でない名の挿絵は pool に出ず、
+  小説ごとの `挿絵/` 配置を保つ。dedup ON のとき新規挿絵のファイル名は常に `<sha256>.<ext>`
+  (mitemin 名も pool には出ない。index の `iNNN→hex` 対応で参照は辿れる)。
+  条件は `native::sqlite::state::illustration_dedup_enabled()` = storage-backend=sqlite +
+  `s3.asset-backend=s3` (S3 を実際に使っているときだけ)。Worker 側は `illustration_dedup: false`
+  で固定しており、D1+S3 構成でも小説ごとの `挿絵/` 名を維持する (native 専用機能)。
+- `narou illust s3-dedup`: 旧 `挿絵/` 配置の S3 オブジェクトを pool へ `copy` し、pool にある
+  ことが確認できたものだけ旧配置を `delete` する (既定 dry-run、`-f` で実行。SQLite+S3 限定)。
+  hex 名でない挿絵は小説ごとの配置を保つため対象外。`s3-push` は dedup ON なら新規 hex 挿絵が
+  そのまま pool に出るので、`s3-dedup` は「dedup を ON にする前に書かれた分」の後処理。
 - **SORAHOST は `concurrency=true`**: DL/update と convert/send を別レーンで並行に流す
   (小説単位の排他は `.narou/lock.yaml`)。実測ピークは 2 ジョブ同時で約 120MB (debug) +
   常駐 31MB で、256MB でも通常運用は収まるが、うごイラ組み立て (~56MB) や大きい挿絵入り

@@ -322,6 +322,24 @@ fn legacy_yaml_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// 挿絵の重複除去プール (`illustrations/<sha256>`) を使うか。
+///
+/// SQLite モード (`storage-backend` マーカーが `sqlite` で、`NAROU_RS_LEGACY_YAML`
+/// が無効) かつ挿絵の保存先が S3 (`s3.asset-backend=s3`) のときだけ真。
+/// `dedup_active()` も同じ関数を見るため、S3 を使わない環境で新規挿絵名が
+/// pool 向けの hex 名へ変わらないよう、S3 側の条件もここで必須にする。
+/// DB が未初期化でもマーカーと設定値だけで判断する。
+pub fn illustration_dedup_enabled() -> bool {
+    if legacy_yaml_active() || !crate::native::s3::illustrations_in_s3() {
+        return false;
+    }
+    let Ok(inventory) = crate::db::inventory::Inventory::with_default_root() else {
+        return false;
+    };
+    let narou_dir = inventory.root_dir().join(".narou");
+    read_mode(&narou_dir) == StorageMode::Sqlite
+}
+
 /// Process-wide shared handle. Configured on first use from the narou root;
 /// returns `None` before initialization is possible (no root) or when the
 /// legacy-YAML escape hatch is active.

@@ -28,6 +28,9 @@ pub async fn store_from_env(
         prefix: crate::secrets::value(env, "S3_PREFIX")
             .await
             .unwrap_or_default(),
+        // Worker は native の `storage-backend` マーカー外なので dedup は無効。
+        // (native SQLite+S3 専用の機能)
+        illustration_dedup: false,
         access_key_id: crate::secrets::require(env, "S3_ACCESS_KEY_ID").await?,
         secret_access_key: crate::secrets::require(env, "S3_SECRET_ACCESS_KEY").await?,
     };

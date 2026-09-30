@@ -999,4 +999,6 @@ pub enum IllustSubcommand {
     S3Push,
     /// ローカルと S3 の挿絵を突き合わせる。
     S3Verify,
+    /// 旧 `挿絵/` 配置の S3 オブジェクトを dedup プールへ移し、残ったものを消す。
+    S3Dedup,
 }

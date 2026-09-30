@@ -48,7 +48,12 @@ pub fn is_illustration_key(key: &ObjectKey) -> bool {
 /// 名が `挿絵` の場合（`novels/<site>/挿絵` を一覧する）は構造化ストア側に
 /// 残るよう、セグメント数でも区別する。
 fn is_illustration_prefix(prefix: &ObjectPrefix) -> bool {
-    let segments: Vec<&str> = prefix.as_ref().trim_end_matches('/').split('/').collect();
+    let trimmed = prefix.as_ref().trim_end_matches('/');
+    // dedup プール (`illustrations/` 以下) も挿絵側へ回す。
+    if trimmed.starts_with("illustrations/") {
+        return true;
+    }
+    let segments: Vec<&str> = trimmed.split('/').collect();
     segments.last() == Some(&ILLUSTRATION_SEGMENT) && segments.len() >= 4
 }
 

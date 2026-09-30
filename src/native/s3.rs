@@ -52,6 +52,9 @@ pub fn store_config() -> Option<S3StoreConfig> {
         bucket: resolve("s3.bucket", "S3_BUCKET").unwrap_or_default(),
         region: resolve("s3.region", "S3_REGION").unwrap_or_default(),
         prefix: resolve("s3.prefix", "S3_PREFIX").unwrap_or_default(),
+        // 挿絵の重複除去プールは SQLite モードと S3 が揃ったときだけ
+        // 有効にする。YAML モードでは従来どおり小説ごとの `挿絵/` 名。
+        illustration_dedup: crate::native::sqlite::state::illustration_dedup_enabled(),
         access_key_id: resolve("s3.access-key-id", "S3_ACCESS_KEY_ID").unwrap_or_default(),
         secret_access_key: resolve("s3.secret-access-key", "S3_SECRET_ACCESS_KEY")
             .unwrap_or_default(),

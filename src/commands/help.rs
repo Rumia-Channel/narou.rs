@@ -886,8 +886,10 @@ const ILLUST_HELP: CmdHelp = CmdHelp {
       s3-push  挿絵を S3 互換ストレージ (Wasabi など) へ写す。既定は件数と
                容量を数えるだけで、-f で実行。
       s3-verify ローカルの挿絵と S3 の内容をバイト単位で突き合わせる。
-  ・s3-push / s3-verify はライブラリ全体が対象です (s3.asset-backend=s3 と
-    S3 の接続情報が必要。<target> は使いません)。
+      s3-dedup  旧 挿絵/ 配置の S3 オブジェクトを dedup プールへ移し、
+               残ったものを消す。既定は件数だけ数える dry-run。
+  ・s3-push / s3-verify / s3-dedup はライブラリ全体が対象です (s3.asset-backend=s3 と
+    S3 の接続情報が必要。<target> は使いません。s3-dedup はさらに SQLite モードが必要)。
   ・<target> を省略した場合、直前に変換した小説が対象になります。
   ・全小説を対象にしたい場合は --all を使います。
   ・削除・改名・移行はいずれも既定で dry-run (-f を付けると実行)。
@@ -901,7 +903,9 @@ const ILLUST_HELP: CmdHelp = CmdHelp {
     narou illust rebuild --all
     narou illust s3-push              # 移行対象の件数と容量を確認
     narou illust s3-push -f           # S3 へ写す
-    narou illust s3-verify            # 突き合わせ",
+    narou illust s3-verify            # 突き合わせ
+    narou illust s3-dedup             # プール移行対象の件数を確認
+    narou illust s3-dedup -f          # 移行して旧 挿絵/ を掃除",
     options: &[
         opt(
             Some("-f"),

@@ -1185,8 +1185,10 @@ impl Downloader {
         };
 
         let re = compile_html_pattern(illust_url_pattern).map_err(NarouError::Regex)?;
-        let storage =
-            crate::illustration_store::IllustrationStorageService::new(self.assets.clone());
+        let storage = crate::illustration_store::IllustrationStorageService::new(
+            self.assets.clone(),
+        )
+        .with_dedup(crate::illustration_store::dedup_active());
         // Illustration hosts (i.pximg.net) reject requests without the site's
         // headers, and login-only images need the same cookie jar.
         let illustration_policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);

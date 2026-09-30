@@ -632,6 +632,7 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                     cli::IllustSubcommand::Rebuild => IllustSubcommand::Rebuild,
                     cli::IllustSubcommand::S3Push => IllustSubcommand::S3Push,
                     cli::IllustSubcommand::S3Verify => IllustSubcommand::S3Verify,
+                    cli::IllustSubcommand::S3Dedup => IllustSubcommand::S3Dedup,
                 };
                 commands::illust::cmd_illust(sub, &targets, force, all)
             }

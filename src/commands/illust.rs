@@ -20,6 +20,8 @@ pub enum IllustSubcommand {
     S3Push,
     /// ローカルと S3 の挿絵を突き合わせる。
     S3Verify,
+    /// 旧 `挿絵/` 配置の S3 オブジェクトを dedup プールへ移し、残ったものを消す。
+    S3Dedup,
 }
 
 /// Run the `narou illust <sub>` command.
@@ -44,10 +46,11 @@ fn cmd_illust_inner(
 ) -> Result<(), String> {
     db::init_database().map_err(|e| e.to_string())?;
 
-    // S3 への移行と突き合わせは小説単位ではなくライブラリ全体の操作。
+    // S3 への移行・突き合わせ・dedup は小説単位ではなくライブラリ全体の操作。
     match sub {
         IllustSubcommand::S3Push => return run_s3_push(force),
         IllustSubcommand::S3Verify => return run_s3_verify(),
+        IllustSubcommand::S3Dedup => return run_s3_dedup(force),
         _ => {}
     }
 
@@ -71,7 +74,7 @@ fn cmd_illust_inner(
             IllustSubcommand::Rebuild => run_rebuild(&dir)?,
             // ライブラリ全体の操作なので、この小説単位のループには来ない
             // (手前で return する)。
-            IllustSubcommand::S3Push | IllustSubcommand::S3Verify => {
+            IllustSubcommand::S3Push | IllustSubcommand::S3Verify | IllustSubcommand::S3Dedup => {
                 unreachable!("S3 subcommands run before the per-novel loop")
             }
         }
@@ -186,6 +189,106 @@ fn run_s3_verify() -> Result<(), String> {
     }
     println!("一致: {} 件", state.verified);
     report_migration_failures(&state);
+    Ok(())
+}
+/// 旧 `挿絵/` 配置の S3 オブジェクトを dedup プールへ寄せる。
+///
+/// 手順: 全小説の `挿絵/` を LIST → hex 名のものを pool へ `copy` →
+/// `pool_exists` で確認後、legacy の実オブジェクトを `delete`。
+/// 既定は dry-run (pool へ写さず件数だけ数える)。
+fn run_s3_dedup(force: bool) -> Result<(), String> {
+    if !narou_rs::native::sqlite::state::illustration_dedup_enabled() {
+        return Err(
+            "挿絵の dedup は SQLite モード + S3 保存のときだけ有効です (storage-backend=sqlite と s3.asset-backend=s3)"
+                .to_string(),
+        );
+    }
+    let (_from_objects, _from_assets, to_objects, to_assets) = s3_migration_stores()?;
+    let s3 = narou_rs::native::s3::illustration_store()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "S3 ストアが構成されていません".to_string())?;
+    let runtime = migration_runtime()?;
+
+    // S3 上の legacy `挿絵/` 実オブジェクトを全小説横断で集める。
+    // list は論理キーを返すので `挿絵` を含むものだけ拾う。
+    let mut cursor: Option<String> = None;
+    let mut migrated = 0usize;
+    let mut already_pooled = 0usize;
+    let mut skipped_non_hex = 0usize;
+    let mut failed = 0usize;
+    let action = if force { "migrating" } else { "would migrate" };
+    loop {
+        let request = narou_rs::platform::ObjectListRequest::new(
+            narou_rs::platform::ObjectPrefix::new("novels").unwrap(),
+            std::num::NonZeroUsize::new(1000).unwrap(),
+        );
+        let request = match &cursor {
+            Some(next) => request.after(next.clone()),
+            None => request,
+        };
+        let page = runtime
+            .block_on(to_objects.list_page(&request))
+            .map_err(|e| e.to_string())?;
+        for meta in &page.objects {
+            let key = &meta.key;
+            if !narou_rs::platform::is_illustration_key(key) {
+                continue;
+            }
+            // hex 名だけが pool へ寄る (非 hex は小説ごとの配置のまま)。
+            let file = key.as_ref().rsplit('/').next().unwrap_or("");
+            let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or("");
+            let is_hex = stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit());
+            if !is_hex {
+                skipped_non_hex += 1;
+                continue;
+            }
+            if !force {
+                migrated += 1;
+                continue;
+            }
+            // 既に pool にあれば書き換え不要、なければ read→write。
+            let in_pool = runtime.block_on(s3.pool_exists(key)).map_err(|e| e.to_string())?;
+            if in_pool {
+                already_pooled += 1;
+            } else {
+                match runtime.block_on(to_assets.read_stream(key)) {
+                    Ok(Some(stream)) => {
+                        if let Err(error) = runtime.block_on(to_assets.write_stream(key, stream)) {
+                            eprintln!("  {key}: pool write failed: {error}");
+                            failed += 1;
+                            continue;
+                        }
+                        migrated += 1;
+                    }
+                    Ok(None) => {
+                        eprintln!("  {key}: source object missing");
+                        failed += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("  {key}: source read failed: {error}");
+                        failed += 1;
+                        continue;
+                    }
+                }
+            }
+            // pool 確認後に legacy 実オブジェクトを消す (delete は旧 path)。
+            if let Err(error) = runtime.block_on(to_objects.delete(key)) {
+                eprintln!("  {key}: legacy delete failed: {error}");
+                failed += 1;
+            }
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    if !force {
+        println!("{action}: {migrated} 件 (実行するには --force)");
+    } else {
+        println!("dedup 完了: 移行 {migrated} 件 / 既に pool {already_pooled} 件 / 非hexスキップ {skipped_non_hex} 件 / 失敗 {failed} 件");
+    }
     Ok(())
 }
 

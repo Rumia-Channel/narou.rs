@@ -39,6 +39,9 @@ pub struct S3StoreConfig {
     pub region: String,
     /// バケット内の接頭辞 (`narou/develop` など)。空なら直下。
     pub prefix: String,
+    /// SQLite+S3 モードで、挿絵を `illustrations/<base64url(sha256)>.<ext>`
+    /// のグローバルプールへ寄せて重複を除去する。
+    pub illustration_dedup: bool,
     pub access_key_id: String,
     pub secret_access_key: String,
 }
@@ -105,7 +108,10 @@ impl S3Store {
             .split_once("://")
             .map(|(scheme, _)| scheme.to_string())
             .unwrap_or_else(|| "https".to_string());
-        let location = S3Location::new(config.endpoint, config.bucket, config.prefix)?;
+        let mut location = S3Location::new(config.endpoint, config.bucket, config.prefix)?;
+        if config.illustration_dedup {
+            location = location.with_illustration_dedup();
+        }
         let host = location.host()?;
         Ok(Self {
             location,
@@ -200,6 +206,44 @@ impl S3Store {
         self.http.send(request).await
     }
 
+    /// dedup プール (`illustrations/<b64>`) にだけオブジェクトがあるか。
+    /// legacy `挿絵/` fallback は付けない (移行判定に使う)。
+    async fn pool_stat(&self, key: &ObjectKey) -> Result<Option<u64>> {
+        if !self.location.has_pool_alternate(key) {
+            return Ok(None);
+        }
+        let response = self
+            .send(
+                HttpMethod::Get,
+                &self.location.object_url(key),
+                &self.location.object_path(key),
+                "",
+                &[("range", "bytes=0-0")],
+                None,
+            )
+            .await?;
+        let status = response.status;
+        if status == 404 {
+            return Ok(None);
+        }
+        if !matches!(status, 200 | 206) {
+            return Err(NarouError::Platform(format!(
+                "S3 GET {} failed with status {status}",
+                key.as_ref()
+            )));
+        }
+        Ok(super::object_size(
+            status,
+            response.header("content-range"),
+            response.header("content-length"),
+        ))
+    }
+
+    /// dedup プールにそのキーが存在するか (移行判定用)。
+    pub async fn pool_exists(&self, key: &ObjectKey) -> Result<bool> {
+        Ok(self.pool_stat(key).await?.is_some())
+    }
+
     async fn stat_object(&self, key: &ObjectKey) -> Result<Option<ObjectMetadata>> {
         // `HEAD` はエッジで 403 になる S3 互換サービスがあるため、
         // `GET` + `Range: bytes=0-0` でメタデータだけ読む。
@@ -213,6 +257,20 @@ impl S3Store {
                 None,
             )
             .await?;
+        // dedup 移行期: pool に無くても旧 `挿絵/` 位置に存在する挿絵を拾う。
+        let response = if response.status == 404 && self.location.has_pool_alternate(key) {
+            self.send(
+                HttpMethod::Get,
+                &self.location.legacy_object_url(key),
+                &self.location.legacy_object_path(key),
+                "",
+                &[("range", "bytes=0-0")],
+                None,
+            )
+            .await?
+        } else {
+            response
+        };
         let status = response.status;
         if status == 404 {
             return Ok(None);
@@ -263,6 +321,28 @@ impl S3Store {
         let (status, body) = status_and_body(response)?;
         match status {
             200 => Ok(Some(body)),
+            404 if self.location.has_pool_alternate(key) => {
+                // dedup 移行期: pool に無ければ旧 `挿絵/` 位置から読む。
+                let response = self
+                    .send(
+                        HttpMethod::Get,
+                        &self.location.legacy_object_url(key),
+                        &self.location.legacy_object_path(key),
+                        "",
+                        &[],
+                        None,
+                    )
+                    .await?;
+                let (status, body) = status_and_body(response)?;
+                match status {
+                    200 => Ok(Some(body)),
+                    404 => Ok(None),
+                    status => Err(NarouError::Platform(format!(
+                        "S3 GET {} failed with status {status}",
+                        key.as_ref()
+                    ))),
+                }
+            }
             404 => Ok(None),
             status => Err(NarouError::Platform(format!(
                 "S3 GET {} failed with status {status}",
@@ -305,8 +385,10 @@ impl S3Store {
         let response = self
             .send(
                 HttpMethod::Delete,
-                &self.location.object_url(key),
-                &self.location.object_path(key),
+                // dedup プールは共有なので小説削除では消さない。
+                // 消すのは移行前の旧 `挿絵/` 位置の物理オブジェクトだけ。
+                &self.location.legacy_object_url(key),
+                &self.location.legacy_object_path(key),
                 "",
                 &[],
                 None,
@@ -389,6 +471,12 @@ impl S3Store {
                 .strip_prefix('/')?
         };
         if rest.is_empty() || rest.ends_with('/') {
+            return None;
+        }
+        // dedup プール (`illustrations/<b64>`) は論理キーではなく S3 内部の
+        // 物理名。論理キーとして出すと読み戻しが `挿絵` 判定に合わず
+        // primary へ回るため、一覧では隠す。
+        if rest.starts_with("illustrations/") {
             return None;
         }
         ObjectKey::try_new(rest).ok()
@@ -584,6 +672,7 @@ mod tests {
                 bucket: "bucket".to_string(),
                 region: "ap-northeast-1".to_string(),
                 prefix: "narou/test".to_string(),
+                illustration_dedup: false,
                 access_key_id: "AKIAEXAMPLE".to_string(),
                 secret_access_key: "secret".to_string(),
             },
@@ -787,6 +876,33 @@ mod tests {
     }
 
     #[test]
+    fn logical_key_hides_the_dedup_illustration_pool() {
+        let http = Arc::new(MockHttpClient::new());
+        let body = r#"<?xml version="1.0"?><ListBucketResult>
+  <Contents><Key>narou/test/illustrations/EYcyfG0PCwsZszqyEaVJAjqppB81nG0Kgn172Z-NWZQ.png</Key><Size>10</Size></Contents>
+  <Contents><Key>narou/test/novels/site/title/挿絵/0001.jpg</Key><Size>20</Size></Contents>
+</ListBucketResult>"#;
+        http.add_response(
+            "https://s3.example.com/bucket?encoding-type=url&list-type=2&max-keys=10&prefix=narou%2Ftest%2F",
+            HttpResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "application/xml".to_string())],
+                body: body.as_bytes().to_vec(),
+            },
+        );
+        let store = store(http);
+        let request = ObjectListRequest::new(
+            ObjectPrefix::new("").unwrap(),
+            std::num::NonZeroUsize::new(10).unwrap(),
+        );
+        let page = futures::executor::block_on(ObjectStore::list_page(&store, &request)).unwrap();
+        let keys: Vec<&str> = page.objects.iter().map(|m| m.key.as_ref()).collect();
+        // プール (`illustrations/`) は論理キーに現れず、通常キーだけが残る。
+        assert!(!keys.iter().any(|k| k.starts_with("illustrations/")), "{keys:?}");
+        assert!(keys.contains(&"novels/site/title/挿絵/0001.jpg"), "{keys:?}");
+    }
+
+    #[test]
     fn delete_accepts_a_missing_object() {
         let http = Arc::new(MockHttpClient::new());
         http.add_response(
@@ -829,6 +945,7 @@ mod tests {
                 bucket: "bucket".to_string(),
                 region: "us-east-1".to_string(),
                 prefix: String::new(),
+                illustration_dedup: false,
                 access_key_id: "minio".to_string(),
                 secret_access_key: "minio123".to_string(),
             },
@@ -849,6 +966,7 @@ mod tests {
                 bucket: "bucket".to_string(),
                 region: "ap-northeast-1".to_string(),
                 prefix: String::new(),
+                illustration_dedup: false,
                 access_key_id: String::new(),
                 secret_access_key: "secret".to_string(),
             },

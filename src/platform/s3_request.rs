@@ -21,6 +21,9 @@ pub struct S3Location {
     endpoint: String,
     bucket: String,
     prefix: String,
+    /// SQLite+S3 モードで、挿絵だけを `illustrations/<base64url(sha256)>.<ext>`
+    /// のグローバルプールへ寄せる変換を有効にする。
+    dedup: bool,
 }
 
 impl S3Location {
@@ -48,7 +51,25 @@ impl S3Location {
             endpoint,
             bucket,
             prefix,
+            dedup: false,
         })
+    }
+
+    /// SQLite+S3 モードで挿絵をコンテンツハッシュ名のグローバルプールへ
+    /// 寄せる変換を有効にする。
+    pub fn with_illustration_dedup(mut self) -> Self {
+        self.dedup = true;
+        self
+    }
+
+    /// `illustrations/` プールに入る `挿絵/<sha256-hex>.<ext>` か。
+    /// hex 名でない挿絵は小説ごとの配置を保つ (衝突を避ける)。
+    fn illustration_pool_name(filename: &str) -> Option<String> {
+        let (stem, ext) = filename.rsplit_once('.')?;
+        if stem.len() != 64 || !stem.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(format!("{}.{}", sha256_hex_to_base64url(stem), ext))
     }
 
     pub fn bucket(&self) -> &str {
@@ -77,25 +98,85 @@ impl S3Location {
     }
 
     /// 論理キーを S3 のオブジェクトキーへ写像する (prefix を前置)。
+    ///
+    /// dedup 有効時は `…/挿絵/<sha256-hex>.<ext>` を
+    /// `illustrations/<base64url(sha256)>.<ext>` へ寄せ、作品を跨いで
+    /// 同一内容を 1 オブジェクトにする。hex 名でない挿絵は小説ごとの
+    /// 配置のまま残す (移行前・非ハッシュ名の名残)。
     pub fn storage_key(&self, key: &ObjectKey) -> String {
-        if self.prefix.is_empty() {
-            key.as_ref().to_string()
+        self.storage_key_dedup(key, self.dedup)
+    }
+
+    /// dedup 変換を無視した、従来どおりの配置 (`挿絵/`) のキー。
+    /// 移行前に置かれた物理オブジェクトを指す。
+    pub fn legacy_storage_key(&self, key: &ObjectKey) -> String {
+        self.storage_key_dedup(key, false)
+    }
+
+    fn storage_key_dedup(&self, key: &ObjectKey, dedup: bool) -> String {
+        let key = key.as_ref();
+        let mapped = if dedup {
+            match Self::illustration_pool_key(key) {
+                Some(pool) => pool,
+                None => key.to_string(),
+            }
         } else {
-            format!("{}/{}", self.prefix, key.as_ref())
+            key.to_string()
+        };
+        if self.prefix.is_empty() {
+            mapped
+        } else {
+            format!("{}/{}", self.prefix, mapped)
         }
     }
 
-    /// オブジェクトの URL。
+    /// `novels/…/挿絵/<file>` を `illustrations/<file>` へ寄せる。
+    /// hex 名だけがプールへ出る。
+    fn illustration_pool_key(key: &str) -> Option<String> {
+        let (_, file) = key.rsplit_once("挿絵/")?;
+        Self::illustration_pool_name(file).map(|name| format!("illustrations/{name}"))
+    }
+
+    /// dedup でこの論理キーがプール (`illustrations/`) へ寄るか。
+    pub fn has_pool_alternate(&self, key: &ObjectKey) -> bool {
+        self.dedup && Self::illustration_pool_key(key.as_ref()).is_some()
+    }
+
+    /// オブジェクトの URL (dedup 変換込みの正位置)。
     pub fn object_url(&self, key: &ObjectKey) -> String {
         format!("{}{}", self.endpoint, self.object_path(key))
     }
 
     /// 署名対象にもなるオブジェクトのパス (`/{bucket}/{encoded key}`)。
     pub fn object_path(&self, key: &ObjectKey) -> String {
+        self.object_path_of(&self.storage_key(key))
+    }
+
+    /// 移行前の `挿絵/` 配置を指す URL/パス。dedup の read fallback と
+    /// 移行処理で使う。
+    pub fn legacy_object_url(&self, key: &ObjectKey) -> String {
+        format!("{}{}", self.endpoint, self.legacy_object_path(key))
+    }
+
+    pub fn legacy_object_path(&self, key: &ObjectKey) -> String {
+        self.object_path_of(&self.legacy_storage_key(key))
+    }
+
+    /// 任意の物理オブジェクトキー (prefix 込みの生キー) のパス。
+    /// 移行が `illustrations/` や `挿絵/` の生キーを直接触るために使う。
+    pub fn raw_object_path(&self, storage_key: &str) -> String {
+        self.object_path_of(storage_key)
+    }
+
+    pub fn raw_object_url(&self, storage_key: &str) -> String {
+        format!("{}{}", self.endpoint, self.raw_object_path(storage_key))
+    }
+
+    fn object_path_of(&self, storage_key: &str) -> String {
         format!(
             "/{}/{}",
             self.bucket,
-            canonical_path(&self.storage_key(key)).trim_start_matches('/')
+            canonical_path(storage_key).trim_start_matches('/')
         )
     }
 
@@ -360,6 +441,34 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// SHA-256 の 64 文字 hex を Base64URL (padding 無し) へ変換する。
+/// dedup プールのオブジェクト名に使う。hex でない入力は `None`。
+fn sha256_hex_to_base64url(hex: &str) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut bytes = [0u8; 32];
+    for i in 0..32 {
+        let hi = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
+        bytes[i] = hi;
+    }
+    let mut out = String::with_capacity(43);
+    let mut i = 0usize;
+    while i + 3 <= 32 {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | bytes[i + 2] as u32;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 6) as usize & 63] as char);
+        out.push(ALPHABET[n as usize & 63] as char);
+        i += 3;
+    }
+    // 32 = 10*3 + 2 → 末尾 2 バイトを 3 文字で閉じる (padding 無し)。
+    let n = ((bytes[30] as u32) << 16) | ((bytes[31] as u32) << 8);
+    out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+    out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+    out.push(ALPHABET[(n >> 6) as usize & 63] as char);
+    out
+}
+
+
 
 /// `Content-Range` ヘッダから全体サイズを取り出す (`bytes 0-0/12345`)。
 ///
@@ -413,6 +522,41 @@ mod tests {
         assert_eq!(
             location.copy_source(&key("novels/site/title/toc.yaml")),
             "/narou-library/narou/develop/novels/site/title/toc.yaml"
+        );
+    }
+    #[test]
+    fn dedup_storage_key_pools_hash_named_illustrations() {
+        let location = location().with_illustration_dedup();
+        // sha256("test image") の hex → base64url
+        let hex = "1187327c6d0f0b0b19b33ab211a549023aa9a41f359c6d0a827d7bd99f8d5994";
+        assert_eq!(
+            location.storage_key(&key(&format!("novels/site/title/挿絵/{hex}.png"))),
+            "narou/develop/illustrations/EYcyfG0PCwsZszqyEaVJAjqppB81nG0Kgn172Z-NWZQ.png"
+        );
+        // 別作品でも同じ内容なら同じオブジェクトへ集約される。
+        assert_eq!(
+            location.storage_key(&key(&format!("novels/other/another/挿絵/{hex}.png"))),
+            "narou/develop/illustrations/EYcyfG0PCwsZszqyEaVJAjqppB81nG0Kgn172Z-NWZQ.png"
+        );
+        // hex でない挿絵名は小説ごとの配置を保つ (衝突回避)。
+        assert_eq!(
+            location.storage_key(&key("novels/site/title/挿絵/i422674.jpg")),
+            "narou/develop/novels/site/title/挿絵/i422674.jpg"
+        );
+        // 非挿絵キーは従来どおり。
+        assert_eq!(
+            location.storage_key(&key("novels/site/title/toc.yaml")),
+            "narou/develop/novels/site/title/toc.yaml"
+        );
+    }
+
+    #[test]
+    fn dedup_is_off_by_default() {
+        let location = location();
+        let hex = "1187327c6d0f0b0b19b33ab211a549023aa9a41f359c6d0a827d7bd99f8d5994";
+        assert_eq!(
+            location.storage_key(&key(&format!("novels/site/title/挿絵/{hex}.png"))),
+            format!("narou/develop/novels/site/title/挿絵/{hex}.png")
         );
     }
 

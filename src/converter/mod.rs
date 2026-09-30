@@ -934,7 +934,8 @@ impl NovelConverter {
         let Some(prefix) = capabilities.illustration_prefix.clone() else {
             return Ok(None);
         };
-        let service = IllustrationStorageService::new(assets);
+        let service = IllustrationStorageService::new(assets)
+            .with_dedup(crate::illustration_store::dedup_active());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
