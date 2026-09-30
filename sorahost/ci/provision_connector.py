@@ -12,7 +12,7 @@
 トークンは Cloudflare のダッシュボード (Networks → Tunnels → 該当のコネクタ →
 Add a replica) で確認し、PteWorker の .env に NAROU_CONNECTOR_TOKEN として置く。
 
-環境変数:
+環境変数 (GitHub の Environment `SORAHOST` に secret として置く):
   CLOUDFLARE_API_TOKEN      Account: 次のいずれか (どれでも可)
                               Cloudflare One Connectors (Write/Edit)
                               Cloudflare One Connector: cloudflared (Write/Edit)
@@ -21,9 +21,11 @@ Add a replica) で確認し、PteWorker の .env に NAROU_CONNECTOR_TOKEN と�
                             (+ Access を使うなら Account: Access: Apps and Policies (Write/Edit))
                             ※ Argo Tunnel (Legacy) は旧版なので使わない
                             ※ ダッシュボードは Read/Edit、API リファレンスは Read/Write
-  CLOUDFLARE_ACCOUNT_ID
+  CLOUDFLARE_ACCOUNT_ID     アカウント ID
   SORAHOST_PUBLIC_HOSTNAME  公開ホスト名 (例 narou.example.com)
-  SORAHOST_SERVICE_PORT     コンテナ内の待受ポート (既定 18080 = PteWorker の PORT)
+  SORAHOST_SERVICE_PORT     コネクタの向き先 = コンテナ内でアプリが待ち受ける
+                            ポート (既定 18080 = PteWorker の PORT)。
+                            `NAROU_RS_PORT` を変えたときだけ合わせる
 
 任意:
   SORAHOST_CONNECTOR_NAME   コネクタ名 (既定 narou-sorahost)

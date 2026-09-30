@@ -201,14 +201,15 @@ NAROU_PUBLIC_HOST=narou.example.com     # 公開ホスト名
 | Repository variable | `SORAHOST` | `T` で SORAHOST 配備が有効になり、Worker 側の CI が止まる (`F` / 未設定で逆) |
 | Environment `SORAHOST` secret | `SORAHOST_ENDPOINT` | PteWorker コンソールの「エンドポイント」 |
 | Environment `SORAHOST` secret | `SORAHOST_TOKEN` | 同「デプロイトークン」(`token rotate` で再発行) |
-| Environment `SORAHOST` variable | `SORAHOST_SMOKE_URL` | 任意。配備後の確認先 (未設定なら配備結果の `url`) |
-| Environment `SORAHOST` secret | `CLOUDFLARE_API_TOKEN` | 任意 (§2-A を使うとき)。Account: `Cloudflare Tunnel (Write/Edit)`、Zone: `DNS (Write/Edit)` と `Zone (Read)`、Access を使うなら Account: `Access: Apps and Policies (Write/Edit)` |
-| Environment `SORAHOST` variable | `CLOUDFLARE_ACCOUNT_ID` | 同上 |
-| Environment `SORAHOST` variable | `SORAHOST_PUBLIC_HOSTNAME` | 同上。公開ホスト名 (例 `narou.example.com`) |
-| Environment `SORAHOST` variable | `SORAHOST_SERVICE_PORT` | 同上。コンテナ内の待受ポート (既定 18080) |
-| Environment `SORAHOST` variable | `SORAHOST_CONNECTOR_NAME` | 同上。コネクタ名 (既定 `narou-sorahost`) |
-| Environment `SORAHOST` variable | `SORAHOST_ACCESS_EMAIL` | 同上。Access で許可するメール (カンマ区切り) |
-| Environment `SORAHOST` variable | `SORAHOST_ACCESS_DOMAIN` | 同上。許可するメールドメイン |
+| Environment `SORAHOST` secret | `SORAHOST_SMOKE_URL` | 任意。配備後の確認先 (未設定なら配備結果の `url`) |
+| Environment `SORAHOST` secret | `CLOUDFLARE_API_TOKEN` | 任意 (§2-A を使うとき)。権限は §2-A の箇条書きを参照 |
+| Environment `SORAHOST` secret | `CLOUDFLARE_ACCOUNT_ID` | アカウント ID (識別子だが外に見せたくないので secret) |
+| Environment `SORAHOST` secret | `SORAHOST_PUBLIC_HOSTNAME` | 公開ホスト名 (例 `narou.example.com`) |
+| Environment `SORAHOST` secret | `SORAHOST_SERVICE_PORT` | コネクタの向き先 = コンテナ内の待受ポート (既定 18080 = PteWorker の `PORT`) |
+| Environment `SORAHOST` secret | `SORAHOST_CONNECTOR_NAME` | コネクタ名 (既定 `narou-sorahost`) |
+| Environment `SORAHOST` secret | `SORAHOST_ACCESS_EMAIL` | Access で許可するメール (カンマ区切り) |
+| Environment `SORAHOST` secret | `SORAHOST_ACCESS_DOMAIN` | 許可するメールドメイン |
+| Environment `SORAHOST` secret | `SORAHOST_ACCESS_SESSION` | Access のセッション有効期限 (既定 24h) |
 
 §3.1 の値は CI には置かない (サーバー直下の `.env` に置く)。
 

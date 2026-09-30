@@ -7,26 +7,28 @@ name: Deploy SORAHOST
 # 配備は `sorahost-cli` に任せる。SFTP も Cloudflare Tunnel も使わない
 # (公開は PteWorker が行う。アプリは渡された PORT にループバックで束縛する)。
 #
-# Environment `SORAHOST` に置く値:
+# Environment `SORAHOST` に置く値 (外部に見えると面倒なものは secret に置く):
 #   secrets SORAHOST_ENDPOINT    PteWorker のコンソールに出るエンドポイント
 #   secrets SORAHOST_TOKEN       デプロイトークン (この 2 つが必須)
-#   vars    SORAHOST_SMOKE_URL   任意。配備後の確認先 (未設定なら deploy が返す url)
-#   ----- 前段に Cloudflare のコネクタ + Access を置く場合だけ -----
+#   secrets SORAHOST_SMOKE_URL   任意。配備後の確認先 (未設定なら deploy が返す url)
+#   ----- 前段に Cloudflare のコネクタ + Access を置く場合だけ (全部 secret) -----
 #   secrets CLOUDFLARE_API_TOKEN     Account: Cloudflare One Connectors /
 #                                   Cloudflare One Connector: cloudflared /
 #                                   Cloudflare Tunnel のいずれか (Write/Edit)、
 #                                   Zone: DNS (Write/Edit) + Zone (Read)、
 #                                   Access を使うなら Access: Apps and Policies (Write/Edit)
-#   vars    CLOUDFLARE_ACCOUNT_ID
-#   vars    SORAHOST_PUBLIC_HOSTNAME 公開ホスト名 (例 narou.example.com)
-#   vars    SORAHOST_SERVICE_PORT    コンテナ内の待受ポート (既定 18080)
-#   vars    SORAHOST_ACCESS_EMAIL    Access で許可するメール (カンマ区切り)
-#   vars    SORAHOST_ACCESS_DOMAIN   Access で許可するメールドメイン
+#   secrets CLOUDFLARE_ACCOUNT_ID    アカウント ID (識別子だが外に見せたくないので secret)
+#   secrets SORAHOST_PUBLIC_HOSTNAME 公開ホスト名 (例 narou.example.com)
+#   secrets SORAHOST_SERVICE_PORT    コネクタの向き先 = コンテナ内の待受ポート (既定 18080)
+#   secrets SORAHOST_CONNECTOR_NAME  コネクタ名 (既定 narou-sorahost)
+#   secrets SORAHOST_ACCESS_EMAIL    Access で許可するメール (カンマ区切り)
+#   secrets SORAHOST_ACCESS_DOMAIN   Access で許可するメールドメイン
+#   secrets SORAHOST_ACCESS_SESSION  Access のセッション有効期限 (既定 24h)
 # 接続トークンは CI では扱わない (ログに出さないため)。Cloudflare のダッシュボードで
-# 確認し、PteWorker の .env に NAROU_CONNECTOR_TOKEN として置く。
+# 確認し、サーバー直下の .env に NAROU_CONNECTOR_TOKEN として置く。
 #
-# パネル側の環境変数 (NAROU_WEB_PASSWORD / S3_* など) はここではなく
-# PteWorker の .env に置く。sorahost/README.md §9 を参照。
+# サーバー側の値 (NAROU_WEB_PASSWORD / S3_* など) はここではなく
+# ボリューム直下の .env に置く。sorahost/README.md §3 を参照。
 
 on:
   workflow_dispatch:
@@ -106,12 +108,12 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
-          SORAHOST_PUBLIC_HOSTNAME: ${{ vars.SORAHOST_PUBLIC_HOSTNAME }}
-          SORAHOST_SERVICE_PORT: ${{ vars.SORAHOST_SERVICE_PORT }}
-          SORAHOST_CONNECTOR_NAME: ${{ vars.SORAHOST_CONNECTOR_NAME }}
-          SORAHOST_ACCESS_EMAIL: ${{ vars.SORAHOST_ACCESS_EMAIL }}
-          SORAHOST_ACCESS_DOMAIN: ${{ vars.SORAHOST_ACCESS_DOMAIN }}
-          SORAHOST_ACCESS_SESSION: ${{ vars.SORAHOST_ACCESS_SESSION }}
+          SORAHOST_PUBLIC_HOSTNAME: ${{ secrets.SORAHOST_PUBLIC_HOSTNAME || vars.SORAHOST_PUBLIC_HOSTNAME }}
+          SORAHOST_SERVICE_PORT: ${{ secrets.SORAHOST_SERVICE_PORT || vars.SORAHOST_SERVICE_PORT }}
+          SORAHOST_CONNECTOR_NAME: ${{ secrets.SORAHOST_CONNECTOR_NAME || vars.SORAHOST_CONNECTOR_NAME }}
+          SORAHOST_ACCESS_EMAIL: ${{ secrets.SORAHOST_ACCESS_EMAIL || vars.SORAHOST_ACCESS_EMAIL }}
+          SORAHOST_ACCESS_DOMAIN: ${{ secrets.SORAHOST_ACCESS_DOMAIN || vars.SORAHOST_ACCESS_DOMAIN }}
+          SORAHOST_ACCESS_SESSION: ${{ secrets.SORAHOST_ACCESS_SESSION || vars.SORAHOST_ACCESS_SESSION }}
         run: |
           if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${SORAHOST_PUBLIC_HOSTNAME:-}" ]; then
             echo "::notice::CLOUDFLARE_API_TOKEN / SORAHOST_PUBLIC_HOSTNAME が未設定のためコネクタは触りません"
@@ -137,7 +139,7 @@ jobs:
           steps.credentials.outputs.configured == 'true'
           && !inputs.dry_run
         env:
-          SORAHOST_SMOKE_URL: ${{ vars.SORAHOST_SMOKE_URL }}
+          SORAHOST_SMOKE_URL: ${{ secrets.SORAHOST_SMOKE_URL || vars.SORAHOST_SMOKE_URL }}
         run: |
           set -u
           url="$(python3 -c 'import json; print(json.load(open("deploy-result.json")).get("url") or "")')"
