@@ -122,6 +122,9 @@ impl S3Location {
             ("list-type".to_string(), "2".to_string()),
             ("max-keys".to_string(), limit.to_string()),
             ("prefix".to_string(), storage_prefix),
+            // 非 ASCII のキーを持つバケットで AccessDenied/署名不一致を避けるため、
+            // SDK と同じく応答キーの URL エンコードを要求する。
+            ("encoding-type".to_string(), "url".to_string()),
         ];
         if let Some(token) = continuation_token {
             params.push(("continuation-token".to_string(), token.to_string()));
@@ -180,6 +183,9 @@ pub fn parse_list_objects_v2(xml: &str) -> Result<S3ListPage> {
         let key = element_text(body, "Key").ok_or_else(|| {
             NarouError::Platform("ListObjectsV2 <Contents> has no <Key>".to_string())
         })?;
+        // encoding-type=url を要求しているので、キーは percent-encoded。
+        // デコードしないと論理キーと一致せず、保存物が見えなくなる。
+        let key = percent_decode(&key);
         let size = element_text(body, "Size")
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(0);
@@ -198,7 +204,7 @@ pub fn parse_list_objects_v2(xml: &str) -> Result<S3ListPage> {
 
     if let Some(value) = element_text(xml, "NextContinuationToken")
         && !value.is_empty() {
-            next_token = Some(value);
+            next_token = Some(percent_decode(&value));
         }
     if element_text(xml, "IsTruncated").is_some_and(|value| value.trim() == "true") && next_token.is_none() {
         return Err(NarouError::Platform(
@@ -323,6 +329,38 @@ fn unescape_xml(value: &str) -> String {
     out
 }
 
+/// `encoding-type=url` 応答の percent-encoding を戻す。UTF-8 として読めない
+/// バイトはそのまま残す (キーは UTF-8 前提のため実害は無い)。
+fn percent_decode(value: &str) -> String {
+    if !value.contains('%') {
+        return value.to_string();
+    }
+    let mut out = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = |b: u8| -> Option<u8> {
+                match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                }
+            };
+            if let (Some(h), Some(l)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                out.push((h << 4) | l);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+
 /// `Content-Range` ヘッダから全体サイズを取り出す (`bytes 0-0/12345`)。
 ///
 /// S3 互換ストレージでは `HEAD` がエッジで 403 になることがあるため、
@@ -402,15 +440,18 @@ mod tests {
         let (url, query) = location.list_url("novels/", 100, Some("abc/def="));
         assert_eq!(
             query,
-            "continuation-token=abc%2Fdef%3D&list-type=2&max-keys=100&prefix=narou%2Fdevelop%2Fnovels%2F"
+            "continuation-token=abc%2Fdef%3D&encoding-type=url&list-type=2&max-keys=100&prefix=narou%2Fdevelop%2Fnovels%2F"
         );
         assert_eq!(
             url,
-            "https://s3.example.com/narou-library?continuation-token=abc%2Fdef%3D&list-type=2&max-keys=100&prefix=narou%2Fdevelop%2Fnovels%2F"
+            "https://s3.example.com/narou-library?continuation-token=abc%2Fdef%3D&encoding-type=url&list-type=2&max-keys=100&prefix=narou%2Fdevelop%2Fnovels%2F"
         );
 
         let (_, query) = location.list_url("", 10, None);
-        assert_eq!(query, "list-type=2&max-keys=10&prefix=narou%2Fdevelop%2F");
+        assert_eq!(
+            query,
+            "encoding-type=url&list-type=2&max-keys=10&prefix=narou%2Fdevelop%2F"
+        );
     }
 
     #[test]

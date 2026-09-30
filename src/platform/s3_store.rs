@@ -342,14 +342,18 @@ impl S3Store {
             .await?;
         let (status, body) = status_and_body(response)?;
         if status != 200 {
+            // S3 のエラーは XML で AccessDenied / SignatureDoesNotMatch /
+            // InvalidAccessKeyId を返す。本文を含めないと権限不足と署名
+            // 不一致が区別できないので、先頭だけを覗かせる。
+            let detail = String::from_utf8_lossy(&body);
+            let detail = detail.trim();
+            let snippet: String = detail.chars().take(300).collect();
             return Err(NarouError::Platform(format!(
-                "S3 LIST {} failed with status {status}",
+                "S3 LIST {} failed with status {status}: {snippet}",
                 request.prefix.as_ref()
             )));
         }
-        let xml = String::from_utf8(body)
-            .map_err(|_| NarouError::Platform("S3 LIST response is not UTF-8".to_string()))?;
-        let page = parse_list_objects_v2(&xml)?;
+        let page = parse_list_objects_v2(&String::from_utf8_lossy(&body))?;
 
         let mut objects = Vec::new();
         for summary in page.objects {
@@ -425,11 +429,12 @@ fn method_name(method: HttpMethod) -> &'static str {
     }
 }
 
-/// 応答のステータスとボディ。エラー応答のボディは捨てる。
+/// 応答のステータスとボディ。エラー応答でもボディは残す
+/// (S3 の XML エラーが AccessDenied か SignatureDoesNotMatch かで原因が変わる)。
 fn status_and_body(response: super::http::HttpResponse) -> Result<(u16, Vec<u8>)> {
     let status = response.status;
     if status != 200 {
-        return Ok((status, Vec::new()));
+        return Ok((status, response.body));
     }
     if response.body.len() as u64 > MAX_OBJECT_BYTES {
         return Err(NarouError::Platform(format!(
@@ -733,7 +738,7 @@ mod tests {
   </Contents>
 </ListBucketResult>"#;
         http.add_response(
-            "https://s3.example.com/bucket?list-type=2&max-keys=10&prefix=narou%2Ftest%2Fnovels%2Fsite%2Ftitle%2F%E6%8C%BF%E7%B5%B5",
+            "https://s3.example.com/bucket?encoding-type=url&list-type=2&max-keys=10&prefix=narou%2Ftest%2Fnovels%2Fsite%2Ftitle%2F%E6%8C%BF%E7%B5%B5",
             HttpResponse {
                 status: 200,
                 headers: vec![("content-type".to_string(), "application/xml".to_string())],
@@ -753,6 +758,32 @@ mod tests {
         );
         assert_eq!(page.objects[0].size, 2048);
         assert_eq!(page.next_cursor.as_deref(), Some("next-token"));
+    }
+
+    #[test]
+    fn list_page_includes_s3_error_body() {
+        let http = Arc::new(MockHttpClient::new());
+        http.add_response(
+            "https://s3.example.com/bucket?encoding-type=url&list-type=2&max-keys=10&prefix=narou%2Ftest%2Fnovels%2Fsite%2Ftitle%2F%E6%8C%BF%E7%B5%B5",
+            HttpResponse {
+                status: 403,
+                headers: vec![("content-type".to_string(), "application/xml".to_string())],
+                body: br#"<?xml version="1.0"?><Error><Code>AccessDenied</Code><Message>denied</Message></Error>"#
+                    .to_vec(),
+            },
+        );
+        let store = store(http);
+        let request = ObjectListRequest::new(
+            ObjectPrefix::new("novels/site/title/挿絵").unwrap(),
+            std::num::NonZeroUsize::new(10).unwrap(),
+        );
+        let error = match futures::executor::block_on(ObjectStore::list_page(&store, &request)) {
+            Ok(_) => panic!("a 403 LIST response must fail"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("403"), "{message}");
+        assert!(message.contains("AccessDenied"), "{message}");
     }
 
     #[test]
