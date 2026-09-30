@@ -154,8 +154,9 @@ jobs:
           npx --yes sorahost-cli deploy --yes --json \
             ${{ inputs.dry_run && '--dry-run' || '' }} | tee ../deploy-result.json
 
-      # 配備結果の url (無ければ SORAHOST_SMOKE_URL) を叩く。basic 認証があるので
-      # 401/403 でも「立っている」と見なす。
+      # 配備結果の url (無ければ SORAHOST_SMOKE_URL) を叩く。直の IP:ポート宛は
+      # narou の Host 許可リストで 400 になるので、それも「立っている」扱いにする
+      # (basic 認証の 401/403 と同じ考え方。応答があればアプリは起きている)。
       - name: Smoke check
         if: >-
           steps.credentials.outputs.configured == 'true'
@@ -174,8 +175,7 @@ jobs:
           for attempt in 1 2 3 4 5 6; do
             code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$url" || true)
             echo "attempt ${attempt}: HTTP ${code:-none}"
-            case "$code" in
-              2*|401|403) echo "応答を確認しました"; exit 0 ;;
+              2*|400|401|403) echo "応答を確認しました"; exit 0 ;;
             esac
             sleep 10
           done
