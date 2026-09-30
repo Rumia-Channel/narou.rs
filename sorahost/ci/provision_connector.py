@@ -147,6 +147,34 @@ def ensure_dns(token: str, hostname: str, connector_id: str) -> None:
     print(f"DNS: 作成 {hostname} -> {target}")
 
 
+def find_covering_app(
+    token: str, account: str, hostname: str
+) -> tuple[str | None, bool]:
+    """このホスト名をカバーする既存の Access アプリを返す。
+
+    `?domain=` の一致検索では wildcard (`*.example.com`) ・親ドメイン・
+    パス付きで登録されたアプリを拾えず、そのまま POST すると
+    "destination belongs to another application" (409) で競合するため、
+    全件を走査して包含するアプリを再利用する。
+    戻り値は (app_id, exact)。exact が True のときだけ domain が完全一致。
+    """
+    apps = cf("GET", f"/accounts/{account}/access/apps?per_page=200", token)["result"]
+    for app in apps:
+        if app.get("domain") == hostname:
+            return app["id"], True
+    for app in apps:
+        d = (app.get("domain") or "").split("://")[-1].split("/")[0]
+        if not d:
+            continue
+        if d.startswith("*."):
+            base = d[2:]
+            if hostname == base or hostname.endswith("." + base):
+                return app["id"], False
+        elif hostname == d or hostname.endswith("." + d):
+            return app["id"], False
+    return None, False
+
+
 def ensure_access(
     token: str,
     account: str,
@@ -160,17 +188,20 @@ def ensure_access(
     Zero Trust が未有効のアカウントでは API がエラーを返すので、その場合は
     ダッシュボードで有効化してもらう (ここでは失敗として伝える)。
     """
-    query = urllib.parse.urlencode({"domain": hostname})
-    apps = cf("GET", f"/accounts/{account}/access/apps?{query}", token)["result"]
-    app_id = next((app["id"] for app in apps if app.get("domain") == hostname), None)
+    app_id, exact = find_covering_app(token, account, hostname)
     body = {"name": f"narou.rs ({hostname})", "domain": hostname, "type": "self_hosted",
             "session_duration": session}
     if app_id is None:
         app_id = cf("POST", f"/accounts/{account}/access/apps", token, body)["result"]["id"]
         print(f"access: アプリを作成 ({hostname})")
-    else:
+    elif exact:
         cf("PUT", f"/accounts/{account}/access/apps/{app_id}", token, body)
         print(f"access: アプリを更新 ({hostname})")
+    else:
+        # domain が広い既存アプリ (wildcard / 親ドメイン / パス付き) がこの
+        # ホストを所有しており、POST すると 409 で競合する。ポリシーだけ
+        # そのアプリへ足す (アプリの domain/session は触らない)。
+        print(f"access: 既存アプリがこのホストを保護済み。ポリシーをそのアプリへ適用 ({hostname})")
 
     include: list[dict[str, Any]] = [{"email": {"email": email}} for email in emails]
     include += [{"email_domain": {"domain": domain}} for domain in domains]
