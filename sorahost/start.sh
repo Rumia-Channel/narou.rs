@@ -276,7 +276,17 @@ if [ -n "$NAROU_CONNECTOR" ]; then
     echo "[narou] 警告: NAROU_PUBLIC_HOST が未設定です (直の IP:ポート宛も受け付けます)" >&2
   fi
   if [ -x "$CF_BIN" ]; then
-    NAROU_CONNECTOR_TOKEN="$NAROU_CONNECTOR" "$CF_BIN" tunnel --no-autoupdate --loglevel info run </dev/null &
+    # cloudflared が読むのは TUNNEL_TOKEN (NAROU_CONNECTOR_TOKEN はこちら側の
+    # 名前なので渡し直す。`.env` 由来の値をそのまま子へ投げる)。
+    # コネクタだけを独立した再起動ループで動かす: 落ちても watchdog が
+    # narou 本体ごと止めない (トンネル復旧を待ちつつサイトは直でも残す)。
+    (
+      while :; do
+        TUNNEL_TOKEN="$NAROU_CONNECTOR" "$CF_BIN" tunnel --no-autoupdate --loglevel info run </dev/null || true
+        echo "[narou] コネクタが落ちました。5 秒後に再起動します" >&2
+        sleep 5
+      done
+    ) &
     PIDS="$PIDS $!"
     echo "[narou] 前段のコネクタを起動しました (向き先 127.0.0.1:${NAROU_PORT})"
   fi
