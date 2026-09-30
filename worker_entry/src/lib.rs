@@ -475,11 +475,21 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     };
 
     let text_key = keys.converted_text();
-    let text_bytes = match services.objects.read_small(&text_key).await {
-        Ok(Some(bytes)) => bytes,
-        // 変換済みテキストを保存しない構成 (`convert.keep-txt=false`) では
-        // ここで組み立て直す。保存済みならそのまま使うので通常経路は変わらない。
-        Ok(None) => {
+    // `convert.keep-txt=false` (既定) では変換済みテキストを保存しない構成
+    // なので、残っていても読まずに本文から組み立て直す。
+    let stored = if crate::convert::keep_converted_text_with(&local_map) {
+        match services.objects.read_small(&text_key).await {
+            Ok(found) => found,
+            Err(error) => {
+                return Response::error(format!("Object store error: {error}"), 500);
+            }
+        }
+    } else {
+        None
+    };
+    let text_bytes = match stored {
+        Some(bytes) => bytes,
+        None => {
             let runtime = match composition::WorkerRuntime::build(&env).await {
                 Ok(runtime) => runtime,
                 Err(error) => {
@@ -493,7 +503,6 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
                 }
             }
         }
-        Err(error) => return Response::error(format!("Object store error: {error}"), 500),
     };
     let text = match String::from_utf8(text_bytes) {
         Ok(text) => text,

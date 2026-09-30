@@ -241,12 +241,39 @@ impl ConvertService {
         };
         let text = converter.convert_novel(&toc_object, &sections)?;
         let output = keys.converted_text();
-        if store {
+        if store && self.keep_converted_text().await {
             self.objects
                 .write_small(&output, text.clone().into_bytes())
                 .await?;
         }
         Ok(ConvertedNovel { text, output })
+    }
+
+    /// 変換済みテキストを保存するか (`convert.keep-txt`)。
+    ///
+    /// 環境変数 `NAROU_RS_KEEP_TXT` (0/false/no/off) が最優先、次に local
+    /// 設定。未設定は保存する (Worker 側は `worker_entry::convert` が別途
+    /// 既定 false を与えるので、このフォールバックは主に native と共有の
+    /// テスト/ユースケース向け)。
+    async fn keep_converted_text(&self) -> bool {
+        if let Ok(value) = std::env::var("NAROU_RS_KEEP_TXT") {
+            let value = value.trim().to_ascii_lowercase();
+            return !matches!(value.as_str(), "0" | "false" | "no" | "off");
+        }
+        match self
+            .settings
+            .load(SettingScope::Local)
+            .await
+            .ok()
+            .and_then(|settings| settings.get("convert.keep-txt").cloned())
+        {
+            Some(serde_yaml::Value::Bool(value)) => value,
+            Some(serde_yaml::Value::String(value)) => !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ),
+            _ => true,
+        }
     }
 
     async fn load_ini(&self, keys: &NovelObjectKeys) -> Result<IniData> {
@@ -473,6 +500,88 @@ mod tests {
             );
         });
     }
+
+    /// `convert.keep-txt=false` のとき、変換は成功するが `novel.txt`
+    /// オブジェクトは書かれない (EPUB は都度再変換で組み立てる構成)。
+    #[test]
+    fn keeps_no_converted_text_when_keep_txt_is_disabled() {
+        let store = Arc::new(MemoryObjectStore::new());
+        let settings = Arc::new(crate::application::settings::MemorySettingsStore::new());
+        block_on(settings.save(
+            SettingScope::Local,
+            &std::collections::HashMap::from([(
+                "convert.keep-txt".to_string(),
+                serde_yaml::Value::Bool(false),
+            )]),
+        ))
+        .unwrap();
+        let service = ConvertService::new(store.clone(), store.clone(), settings);
+        let target = record(10);
+        let keys = NovelObjectKeys::new(&target.sitename, &target.file_title, false).unwrap();
+
+        let subtitle = SubtitleInfo {
+            index: "1".into(),
+            href: "https://example.com/novel/10/1".into(),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: "第一話".into(),
+            file_subtitle: "第一話".into(),
+            subdate: "2026-09-26 00:00:00".into(),
+            subupdate: None,
+            download_time: None,
+        };
+        let toc = TocFile {
+            title: target.title.clone(),
+            author: target.author.clone(),
+            toc_url: target.toc_url.clone(),
+            story: None,
+            subtitles: vec![subtitle.clone()],
+            novel_type: Some(1),
+        };
+        let section = SectionFile {
+            index: subtitle.index.clone(),
+            href: subtitle.href.clone(),
+            chapter: String::new(),
+            subchapter: String::new(),
+            subtitle: subtitle.subtitle.clone(),
+            file_subtitle: subtitle.file_subtitle.clone(),
+            subdate: subtitle.subdate.clone(),
+            subupdate: None,
+            download_time: None,
+            element: SectionElement {
+                data_type: "text".to_string(),
+                introduction: String::new(),
+                postscript: String::new(),
+                body: "　本文。".to_string(),
+            },
+        };
+
+        block_on(async {
+            store
+                .write_small(&keys.toc(), serialize_toc(&toc).unwrap().into_bytes())
+                .await
+                .unwrap();
+            store
+                .write_small(
+                    &keys.section(&subtitle.index, &subtitle.file_subtitle),
+                    serialize_section(&section).unwrap().into_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let converted = service.convert_and_store(&target).await.unwrap();
+            assert!(converted.text.contains("本文。"), "{}", converted.text);
+            assert!(
+                store
+                    .read_small(&keys.converted_text())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "keep-txt=false must not persist converted text"
+            );
+        });
+    }
+
 
     /// `emit_convert_item_lines` が native `narou convert <id>` と同じ行を
     /// 同じ順序で sink へ送ることを固定する (Worker の convert ジョブが

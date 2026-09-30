@@ -166,12 +166,12 @@ fn materialize_for_conversion(
     store.materialize_novel_files(novel_dir)
 }
 
-/// 変換済みテキストをファイルとして残すか (`convert.keep-txt`、既定 true)。
+/// 変換済みテキストを残すか (`convert.keep-txt`、既定 true)。
 ///
-/// false のときは `novel.txt` の固定名ミラーを書かず、呼び出し側が変換後の
-/// txt を削除する。変換結果そのものは SQLite の `novel_outputs` に残るので、
-/// Web UI のオンデマンド EPUB はそのまま動く (二重に持たないための設定)。
-/// 環境変数 `NAROU_RS_KEEP_TXT=0` でも切れる。
+/// false のときは `novel.txt` の固定名ミラーも SQLite の `novel_outputs`
+/// 行も残さず、呼び出し側が変換後の txt を削除する。Web UI のオンデマンド
+/// EPUB は保存済みの本文からその都度変換して組み立てる (二重に持たない
+/// ための設定)。環境変数 `NAROU_RS_KEEP_TXT=0` でも切れる。
 #[cfg(feature = "native-runtime")]
 pub fn keep_converted_text_file() -> bool {
     if let Ok(value) = std::env::var("NAROU_RS_KEEP_TXT") {
@@ -1055,7 +1055,7 @@ impl NovelConverter {
             // Fixed-name mirror so the portable object-store layout (and the
             // Worker's download-time EPUB) can address the text without the
             // per-title output naming rules. `convert.keep-txt=false` では
-            // SQLite 側の `converted_text` だけを残す。
+            // ファイルも DB の `converted_text` も残さない (EPUB は都度変換)。
             if keep_converted_text_file() {
                 let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
             }
@@ -1082,12 +1082,21 @@ impl NovelConverter {
                         id,
                         &sections_map,
                     );
-                    let _ = crate::native::sqlite::content::store_output(
-                        &guard,
-                        id,
-                        "converted_text",
-                        aozora_text.as_bytes(),
-                    );
+                    if keep_converted_text_file() {
+                        let _ = crate::native::sqlite::content::store_output(
+                            &guard,
+                            id,
+                            "converted_text",
+                            aozora_text.as_bytes(),
+                        );
+                    } else {
+                        // 以前の実行が残した変換済みテキストを掃除する。
+                        let _ = crate::native::sqlite::content::delete_output(
+                            &guard,
+                            id,
+                            "converted_text",
+                        );
+                    }
                     let _ = crate::native::sqlite::versions::snapshot_working_set(
                         &mut guard,
                         id,
@@ -1186,12 +1195,21 @@ impl NovelConverter {
                         _id,
                         &sections_map,
                     );
-                    let _ = crate::native::sqlite::content::store_output(
-                        &guard,
-                        _id,
-                        "converted_text",
-                        aozora_text.as_bytes(),
-                    );
+                    if keep_converted_text_file() {
+                        let _ = crate::native::sqlite::content::store_output(
+                            &guard,
+                            _id,
+                            "converted_text",
+                            aozora_text.as_bytes(),
+                        );
+                    } else {
+                        // 以前の実行が残した変換済みテキストを掃除する。
+                        let _ = crate::native::sqlite::content::delete_output(
+                            &guard,
+                            _id,
+                            "converted_text",
+                        );
+                    }
                     let _ = crate::native::sqlite::versions::snapshot_working_set(
                         &mut guard,
                         _id,

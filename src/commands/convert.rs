@@ -304,7 +304,7 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                     );
                     print_inspection_output(&mut converter, sink);
                     // `convert.keep-txt=false` のときは中間の txt を残さない
-                    // (変換結果は SQLite の novel_outputs にある)。
+                    // (変換済みテキストはどこにも保存せず、EPUB は都度再変換)。
                     if !narou_rs::converter::keep_converted_text_file() {
                         if let Some(txt) = converter.last_converted_text_path() {
                             let _ = std::fs::remove_file(txt);

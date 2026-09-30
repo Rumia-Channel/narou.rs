@@ -150,6 +150,20 @@ pub fn store_output(conn: &Connection, novel_id: i64, kind: &str, payload: &[u8]
     Ok(())
 }
 
+/// Remove a generated output blob (`kind` examples: `converted_text`).
+///
+/// `convert.keep-txt=false` (変換済みテキストを保存しない構成) で、以前の
+/// 実行が残した行を掃除するために使う。
+pub fn delete_output(conn: &Connection, novel_id: i64, kind: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM novel_outputs WHERE novel_id = ? AND kind = ?",
+        params![novel_id, kind],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
+
 pub fn load_output(conn: &Connection, novel_id: i64, kind: &str) -> Result<Option<Vec<u8>>> {
     let mut statement = conn
         .prepare("SELECT payload, encoding FROM novel_outputs WHERE novel_id = ? AND kind = ?")

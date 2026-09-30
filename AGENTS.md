@@ -548,14 +548,15 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
     (キャッシュ由来の到達可能性は変わらない)。
   - 挿絵の削除を伴う `illust orphan -f` を raw 無しで使うと、キャッシュに載っていない
     挿絵は孤児と判定される点に注意 (キャッシュは保存時に必ず書かれる)。
-- **変換済みテキストを保存しない構成** (`convert.keep-txt`): native は既定 true で、
-  false のときは `novel.txt` の固定名ミラーを書かず、変換コマンドが変換後の txt を削除する
-  (結果は SQLite の `novel_outputs` に残る)。**Worker は既定 false** で、
-  `ConvertService::convert_only` により保存せず、`GET /api/novels/{id}/download.epub` が
-  保存済みセクションから組み立て直す (ダウンロードのたびに変換の CPU を払う代わりに D1 を
-  食わない)。`executor` の「変換が必要か」判定も保存しない構成では常に false になる。
-  既に保存済みの `novel.txt` オブジェクトがあれば EPUB はそちらを使う (高速側に倒れる)。
-  環境変数 `NAROU_RS_KEEP_TXT=1` / D1 の `convert.keep-txt=true` で保存に戻せる。
+- **変換済みテキストを保存しない構成** (`convert.keep-txt`): false のとき変換済みテキストを
+  どこにも残さない — `novel.txt` 固定名ミラー・`novel_outputs` 行・オブジェクトの
+  `<prefix>/novel.txt` すべて対象で、変換後の txt ファイルも削除する。EPUB は
+  ダウンロードのたびに保存済み本文から組み立て直す (native の `generate_epub_on_demand` は
+  `ConvertService::convert_only`、Worker の `download.epub` も同じ)。以前に残った
+  `novel_outputs` 行・`novel.txt` オブジェクトは、false 状態で走った変換が掃除する。
+  **native は既定 true、Worker は既定 false** (D1 を食わないため)。`executor` の
+  「変換が必要か」判定も保存しない構成では常に false になる。
+  環境変数 `NAROU_RS_KEEP_TXT=0` / `=1`、D1 の `convert.keep-txt` で切り替える。
 - **話ごとの変換キャッシュは容量の厳しい環境で切れる**: `convert.section-cache`
   (local 設定、既定 true、環境変数 `NAROU_RS_SECTION_CACHE=0` で無効)。無効時は読み書きせず、flush 時に既存の
   `section_convert_cache/<id>.yaml` を削除する (再有効化しても壊れない)。既定では

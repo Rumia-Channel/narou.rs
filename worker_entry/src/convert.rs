@@ -114,7 +114,17 @@ async fn convert(
     let converted = if keep_converted_text(runtime).await {
         service.convert_and_store(&record).await?
     } else {
-        service.convert_only(&record).await?
+        let converted = service.convert_only(&record).await?;
+        // 以前に変換済みテキストが残っていれば掃除する
+        // (`convert.keep-txt=false` は何も保存しない構成)。
+        if let Ok(keys) = narou_rs::platform::NovelObjectKeys::new(
+            &record.sitename,
+            &record.file_title,
+            record.use_subdirectory,
+        ) {
+            let _ = runtime.objects().delete(&keys.converted_text()).await;
+        }
+        converted
     };
     Ok(Some(converted))
 }
@@ -171,18 +181,28 @@ fn convert_service(runtime: &WorkerRuntime, record: &narou_rs::db::NovelRecord) 
 /// 変換テキストは EPUB のダウンロード時に組み立て直す。true にすると
 /// ダウンロードのたびの変換を省ける代わりに 1 作品あたり数 MB を D1 に持つ。
 pub(crate) async fn keep_converted_text(runtime: &WorkerRuntime) -> bool {
+    let local = runtime
+        .settings_store()
+        .load(narou_rs::setting_core::SettingScope::Local)
+        .await
+        .unwrap_or_default();
+    keep_converted_text_with(&local)
+}
+
+/// 変換済みテキストを保存するか (設定 map 版)。
+///
+/// 環境変数 `NAROU_RS_KEEP_TXT` (0/false/no/off) が最優先、次に local
+/// 設定 (`convert.keep-txt`)。Worker は D1 を食わないよう **既定 false**
+/// (保存しない)。`download.epub` が保持した設定 map をそのまま渡せる形。
+pub(crate) fn keep_converted_text_with(
+    local: &std::collections::HashMap<String, serde_yaml::Value>,
+) -> bool {
     if let Ok(value) = std::env::var("NAROU_RS_KEEP_TXT") {
         let value = value.trim().to_ascii_lowercase();
         return !matches!(value.as_str(), "0" | "false" | "no" | "off");
     }
-    match runtime
-        .settings_store()
-        .load(narou_rs::setting_core::SettingScope::Local)
-        .await
-        .ok()
-        .and_then(|settings| settings.get("convert.keep-txt").cloned())
-    {
-        Some(serde_yaml::Value::Bool(value)) => value,
+    match local.get("convert.keep-txt") {
+        Some(serde_yaml::Value::Bool(value)) => *value,
         Some(serde_yaml::Value::String(value)) => !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "no" | "off"

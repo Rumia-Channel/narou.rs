@@ -782,7 +782,7 @@ pub fn setting_variables() -> SettingVariables {
             "convert.keep-txt",
             vis(
                 VarType::Boolean,
-                "変換した txt をファイルとして残す (既定 true)。false では SQLite の変換済みテキストだけを残し、Web UI の EPUB はそこから生成する (環境変数 NAROU_RS_KEEP_TXT=0 でも切れる)",
+                "変換した txt を残す (既定 true)。false では変換済みテキストをファイルにも SQLite にも残さず、Web UI の EPUB は保存済み本文からその都度変換して生成する (環境変数 NAROU_RS_KEEP_TXT=0 でも切れる)",
             ),
         ),
         (

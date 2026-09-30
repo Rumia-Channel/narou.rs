@@ -128,7 +128,8 @@ if [ ! -d "$LIB/.narou" ]; then
   #   nosave_raw   取得した raw HTML を保存しない (挿絵のローカライズは取得時に
   #                メモリ上で行うので、新規話の挿絵は従来どおり保存される)
   #   no-epub      EPUB を保存しない (Web UI の「EPUB をダウンロード」は都度生成)
-  #   keep-txt     txt を残さない (変換結果は SQLite にあり EPUB はそこから生成)
+  #   keep-txt     変換済みテキストを残さない (本文は SQLite にあり、
+  #                EPUB はダウンロードのたびに本文から再変換して生成)
   #   mirror-files 小説データ/ へ実ファイルを書かない (DB だけが保存先)
   # concurrency: DL/update と convert/send を別レーンで並行に流す (小説単位の
   # 排他は .narou/lock.yaml が効くので、同じ小説が両方で走ることはない)。

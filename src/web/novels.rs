@@ -543,7 +543,11 @@ async fn generate_epub_on_demand(
     };
 
     // P4a: prefer the SQLite mirror of the converted text when present.
-    if !crate::native::sqlite::state::legacy_yaml_active()
+    // `convert.keep-txt=false` では変換済みテキストを保存しない構成なので、
+    // 残っていても読まずに本文から組み立て直す (Worker の download.epub と
+    // 同じ扱い)。
+    if crate::converter::keep_converted_text_file()
+        && !crate::native::sqlite::state::legacy_yaml_active()
         && let Some(narou_dir) = crate::db::inventory::Inventory::with_default_root()
             .ok()
             .map(|inventory| inventory.root_dir().join(".narou"))
@@ -564,38 +568,104 @@ async fn generate_epub_on_demand(
         return Ok((payload, filename));
     }
 
-    let toc_content = std::fs::read_to_string(novel_dir.join("toc.yaml"))
-        .map_err(|e| (StatusCode::CONFLICT, format!("toc.yaml: {e}")))?;
-    let toc: crate::downloader::TocFile = serde_yaml::from_str(&toc_content)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("toc.yaml: {e}")))?;
-    let toc_object = crate::downloader::TocObject {
-        title: toc.title,
-        author: toc.author,
-        toc_url: toc.toc_url,
-        story: toc.story,
-        subtitles: toc.subtitles,
-        novel_type: toc.novel_type,
+    let keep_text = crate::converter::keep_converted_text_file();
+    // 変換済みテキストを保存しない構成では本文から組み立てた novel.txt を
+    // 使い、命名は record 由来の filename (fast path と同じ) を保つ。
+    // 保存する構成は従来どおり toc.yaml から命名・txt パスを解決する。
+    let mut filename = filename;
+    let toc_object = if keep_text {
+        let toc_content = std::fs::read_to_string(novel_dir.join("toc.yaml"))
+            .map_err(|e| (StatusCode::CONFLICT, format!("toc.yaml: {e}")))?;
+        let toc: crate::downloader::TocFile = serde_yaml::from_str(&toc_content)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("toc.yaml: {e}")))?;
+        let toc_object = crate::downloader::TocObject {
+            title: toc.title,
+            author: toc.author,
+            toc_url: toc.toc_url,
+            story: toc.story,
+            subtitles: toc.subtitles,
+            novel_type: toc.novel_type,
+        };
+        // 保存済み EPUB と同じ名: 実際に生成される txt の basename に `.epub`
+        // を付けたもの (native `device.rs` の `{file_stem(txt)}.epub` 経路と同じ規則)。
+        filename = crate::converter::output::epub_output_filename(
+            &settings,
+            &toc_object,
+            Some(record),
+            &crate::converter::output::local_output_naming_env(),
+        );
+        Some(toc_object)
+    } else {
+        None
     };
-    // 保存済み EPUB と同じ名: 実際に生成される txt の basename に `.epub`
-    // を付けたもの (native `device.rs` の `{file_stem(txt)}.epub` 経路と同じ規則)。
-    let filename = crate::converter::output::epub_output_filename(
-        &settings,
-        &toc_object,
-        Some(record),
-        &crate::converter::output::local_output_naming_env(),
-    );
-    let txt_path = crate::converter::output::create_output_text_path(
-        &settings,
-        id,
-        novel_dir,
-        &toc_object,
-        Some(record),
-    );
-    if !txt_path.is_file() {
-        return Err((
-            StatusCode::CONFLICT,
-            "Converted text not found: run convert first".to_string(),
+    // 変換済みテキストを保存しない構成では保存済みの本文からその都度
+    // 変換する。build_book はファイルを要求するため、材料を novel_dir へ
+    // 取り出し、組み立てた txt は消えるガードとして書き出す。
+    let (txt_path, _conversion_guard) = if let Some(toc_object) = &toc_object {
+        (
+            crate::converter::output::create_output_text_path(
+                &settings,
+                id,
+                novel_dir,
+                toc_object,
+                Some(record),
+            ),
+            None,
+        )
+    } else {
+        let stores = crate::native::object_store::NativeStores::for_current_root()
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        let narou_root = novel_dir
+            .ancestors()
+            .find(|candidate| candidate.join(".narou").is_dir())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let files =
+            crate::native::object_store::NativeStore::for_narou_root(&narou_root)
+                .and_then(|store| store.materialize_novel_files(novel_dir))
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        let inventory = crate::db::inventory::Inventory::with_default_root()
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        let service = std::sync::Arc::new(crate::application::convert::ConvertService::new(
+            stores.objects.clone(),
+            stores.assets.clone(),
+            std::sync::Arc::new(
+                crate::native::application::NativeSettingsStore::new(
+                    std::sync::Arc::new(inventory),
+                ),
+            ),
         ));
+        // NovelConverter が内部に Rc を持つため非 Send。スレッド内で block_on して
+        // そのスレッド上で完結させる (結果の String は Send)。
+        let record = record.clone();
+        let text = tokio::task::spawn_blocking(move || {
+            futures::executor::block_on(service.convert_only(&record))
+                .map(|converted| converted.text)
+        })
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| (StatusCode::CONFLICT, format!("convert: {error}")))?;
+        let on_demand_txt = novel_dir.join("novel.txt");
+        let _ = std::fs::create_dir_all(novel_dir);
+        std::fs::write(&on_demand_txt, text.as_bytes())
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        (
+            on_demand_txt.clone(),
+            Some((
+                files,
+                crate::native::object_store::MaterializedNovelFiles::from_paths(vec![
+                    on_demand_txt,
+                ]),
+            )),
+        )
+    };
+    if !txt_path.is_file() {
+        let message = if keep_text {
+            "Converted text not found: run convert first"
+        } else {
+            "Converted text could not be produced"
+        };
+        return Err((StatusCode::CONFLICT, message.to_string()));
     }
 
     // 挿絵を S3 に置く構成ではローカルに実体が無い。EPUB 生成はファイルを
@@ -634,6 +704,12 @@ async fn generate_epub_on_demand(
     let mut bytes = Vec::new();
     crate::epub_lite::stream_epub(&build.book, &mut bytes, |epub_path| build.resolve(epub_path))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // keep=false + 実ファイル無しの構成で作った空の novel_dir を片付ける
+    // (中身があれば失敗してそのまま残る)。
+    if !keep_text {
+        let _ = std::fs::remove_dir(novel_dir);
+    }
 
     Ok((bytes, filename))
 }

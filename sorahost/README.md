@@ -173,7 +173,7 @@ NAROU_PUBLIC_HOST=narou.example.com     # 公開ホスト名
 | `NAROU_RS_LOGIN_KEY` | ログイン Cookie の暗号鍵 (base64) | `openssl rand -base64 24` | `.narou/login.key` より優先 |
 | `NAROU_RS_MIRROR_FILES` | `0` で `小説データ/` を作らない | 通常は未設定 (start.sh が `sqlite.mirror-files=false` を入れる) | **環境変数が設定より優先** |
 | `NAROU_RS_SECTION_CACHE` | `0` で話ごとの変換キャッシュを作らない | 通常は未設定 (start.sh が `convert.section-cache=false` を入れる) | **環境変数が優先** |
-| `NAROU_RS_KEEP_TXT` | `0` で変換 txt を残さない | 通常は未設定 (start.sh が `convert.keep-txt=false`) | **環境変数が優先** |
+| `NAROU_RS_KEEP_TXT` | `0` で変換済みテキストを残さない (ファイルにも DB にも。EPUB は都度再変換) | 通常は未設定 (start.sh が `convert.keep-txt=false`) | **環境変数が優先** |
 | `NAROU_RS_LEGACY_YAML` | `1` で SQLite をやめ YAML 管理に戻す | 通常は未設定 | 環境変数のみ |
 | `NAROU_RS_EPUB_ENGINE` | EPUB エンジン | `lite` / `external` / `auto` (未設定 = auto) | **環境変数が `convert.epub-engine` より優先** |
 | `NAROU_RS_APP` / `NAROU_RS_LIBRARY` | `app/` とライブラリの場所 | 通常は未設定 (配備パスから自動) | start.sh |
