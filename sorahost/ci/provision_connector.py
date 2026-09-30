@@ -63,8 +63,14 @@ def optional(name: str, default: str) -> str:
     return os.environ.get(name, "").strip() or default
 
 
-def cf(method: str, path: str, token: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Cloudflare API を 1 回叩く。失敗はそのまま伝える。"""
+def cf(
+    method: str,
+    path: str,
+    token: str,
+    body: dict[str, Any] | None = None,
+    allow_error: bool = False,
+) -> dict[str, Any]:
+    """Cloudflare API を 1 回叩く。allow_error のとき失敗をそのまま返す。"""
     request = urllib.request.Request(
         f"{CF_API}{path}",
         data=json.dumps(body).encode("utf-8") if body is not None else None,
@@ -76,12 +82,70 @@ def cf(method: str, path: str, token: str, body: dict[str, Any] | None = None) -
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", "replace")[:400]
-        fail(f"Cloudflare {method} {path} が {error.code} を返しました: {detail}")
+        if not allow_error:
+            fail(f"Cloudflare {method} {path} が {error.code} を返しました: {detail}")
+        return {"success": False, "errors": [{"http": error.code}], "detail": detail}
     except urllib.error.URLError as error:
         fail(f"Cloudflare {method} {path} に接続できません: {error}")
-    if not payload.get("success", False):
+    if not payload.get("success", False) and not allow_error:
         fail(f"Cloudflare {method} {path} が失敗しました: {payload.get('errors')}")
     return payload
+
+
+def list_access_apps(token: str, account: str) -> list[dict[str, Any]]:
+    """Access アプリを全ページ取得する。"""
+    apps: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        payload = cf(
+            "GET",
+            f"/accounts/{account}/access/apps?page={page}&per_page=50",
+            token,
+        )
+        apps += payload["result"] or []
+        info = payload.get("result_info") or {}
+        if page >= info.get("total_pages", 1):
+            return apps
+        page += 1
+
+
+def normalize_domain(value: str) -> str:
+    """Access アプリの domain を比較用に正規化する。
+    スキーム・パス・ポート・末尾ドットを取り、小文字化する。"""
+    d = (value or "").strip().lower()
+    d = d.split("://")[-1].split("/")[0].split(":")[0].rstrip(".")
+    return d
+
+
+def find_covering_app(
+    token: str, account: str, hostname: str
+) -> tuple[str | None, bool]:
+    """このホスト名をカバーする既存の Access アプリを返す。
+
+    `?domain=` の一致検索では wildcard (`*.example.com`) ・親ドメイン・
+    パス付きで登録されたアプリを拾えず、そのまま POST すると
+    "destination belongs to another application" (409) で競合するため、
+    全件を走査して包含するアプリを再利用する。
+    戻り値は (app_id, exact)。exact が True のときだけ domain が完全一致。
+    """
+    host = normalize_domain(hostname)
+    apps = list_access_apps(token, account)
+    for app in apps:
+        if normalize_domain(app.get("domain") or "") == host:
+            return app["id"], True
+    for app in apps:
+        d = normalize_domain(app.get("domain") or "")
+        if not d:
+            continue
+        if d.startswith("*."):
+            base = d[2:]
+            if host == base or host.endswith("." + base):
+                return app["id"], False
+        elif host == d or host.endswith("." + d):
+            return app["id"], False
+    return None, False
+
+
 
 
 def ensure_connector(token: str, account: str, name: str) -> str:
@@ -146,35 +210,6 @@ def ensure_dns(token: str, hostname: str, connector_id: str) -> None:
     cf("POST", f"/zones/{zone_id}/dns_records", token, body)
     print(f"DNS: 作成 {hostname} -> {target}")
 
-
-def find_covering_app(
-    token: str, account: str, hostname: str
-) -> tuple[str | None, bool]:
-    """このホスト名をカバーする既存の Access アプリを返す。
-
-    `?domain=` の一致検索では wildcard (`*.example.com`) ・親ドメイン・
-    パス付きで登録されたアプリを拾えず、そのまま POST すると
-    "destination belongs to another application" (409) で競合するため、
-    全件を走査して包含するアプリを再利用する。
-    戻り値は (app_id, exact)。exact が True のときだけ domain が完全一致。
-    """
-    apps = cf("GET", f"/accounts/{account}/access/apps?per_page=200", token)["result"]
-    for app in apps:
-        if app.get("domain") == hostname:
-            return app["id"], True
-    for app in apps:
-        d = (app.get("domain") or "").split("://")[-1].split("/")[0]
-        if not d:
-            continue
-        if d.startswith("*."):
-            base = d[2:]
-            if hostname == base or hostname.endswith("." + base):
-                return app["id"], False
-        elif hostname == d or hostname.endswith("." + d):
-            return app["id"], False
-    return None, False
-
-
 def ensure_access(
     token: str,
     account: str,
@@ -192,7 +227,25 @@ def ensure_access(
     body = {"name": f"narou.rs ({hostname})", "domain": hostname, "type": "self_hosted",
             "session_duration": session}
     if app_id is None:
-        app_id = cf("POST", f"/accounts/{account}/access/apps", token, body)["result"]["id"]
+        created = cf(
+            "POST",
+            f"/accounts/{account}/access/apps",
+            token,
+            body,
+            allow_error=True,
+        )
+        if not created.get("success"):
+            # スキャンで見つからなかったのに Cloudflare が「このドメインは別
+            # アプリのもの」と競合を返すケース。既存アプリの一覧を出して
+            # どれがこのホストを抑えているか分かるようにする。
+            domains_seen = ", ".join(
+                app.get("domain") or "(無し)" for app in list_access_apps(token, account)
+            )
+            fail(
+                f"access/apps の作成が競合しました。アカウントの既存アプリ domain: "
+                f"{domains_seen or '(なし)'} — {created.get('detail', created)}"
+            )
+        app_id = created["result"]["id"]
         print(f"access: アプリを作成 ({hostname})")
     elif exact:
         cf("PUT", f"/accounts/{account}/access/apps/{app_id}", token, body)
