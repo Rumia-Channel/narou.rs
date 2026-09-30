@@ -69,7 +69,9 @@ fi
 
 APP="${NAROU_RS_APP:-$SELF_DIR/app}"
 LIB="${NAROU_RS_LIBRARY:-$VOLUME_DIR/narou-library}"
-BIN_DIR="$VOLUME_DIR/bin"
+# 同梱バイナリはリリースディレクトリ配下 (deploy が bin/ を入れる)。
+# トークンだけはリリースを跨いで残すボリューム側に置く。
+BIN_DIR="$SELF_DIR/bin"
 TOKEN_FILE="${NAROU_CONNECTOR_TOKEN_FILE:-$VOLUME_DIR/.connector-token}"
 CF_BIN="$BIN_DIR/cloudflared"
 CF_TAG="2026.9.3"
@@ -83,6 +85,31 @@ NAROU_CONNECTOR="${NAROU_CONNECTOR_TOKEN:-}"
 if [ -z "$NAROU_CONNECTOR" ] && [ -f "$TOKEN_FILE" ]; then
   NAROU_CONNECTOR="$(tr -d '\r\n' < "$TOKEN_FILE")"
 fi
+# HTTP 取得はコンテナに curl が無い前提に合わせ、同梱した静的 curl を優先する。
+# bin/curl が無い/実行できないときだけシステムの curl にフォールバックする。
+CURL_BIN=""
+if [ -x "$BIN_DIR/curl" ]; then
+  CURL_BIN="$BIN_DIR/curl"
+elif command -v curl >/dev/null 2>&1; then
+  CURL_BIN="curl"
+fi
+CACERT_BUNDLE="${NAROU_RS_CACERT:-$BIN_DIR/cacert.pem}"
+fetch() {
+  # $1 URL、$2 出力先。失敗時は非 0 を返す。
+  [ -n "$CURL_BIN" ] || return 1
+  if [ -f "$CACERT_BUNDLE" ]; then
+    "$CURL_BIN" -fsSL --cacert "$CACERT_BUNDLE" -o "$2" "$1"
+  else
+    "$CURL_BIN" -fsSL -o "$2" "$1"
+  fi
+}
+for f in "$BIN_DIR/cloudflared" "$BIN_DIR/curl"; do
+  if [ -f "$f" ] && [ ! -x "$f" ]; then
+    chmod +x "$f" 2>/dev/null || true
+  fi
+done
+
+
 BIN="$APP/narou_rs"
 PIDS=""
 
@@ -230,7 +257,7 @@ if [ -n "$NAROU_CONNECTOR" ]; then
   mkdir -p "$BIN_DIR"
   if [ ! -x "$CF_BIN" ]; then
     echo "[narou] コネクタ (cloudflared) ${CF_TAG} を取得します"
-    if ! curl -fsSL -o "$CF_BIN.tmp" "$CF_URL"; then
+    if ! fetch "$CF_URL" "$CF_BIN.tmp"; then
       echo "[narou] コネクタを取得できませんでした (手動で $CF_BIN に置けば起動します)" >&2
     fi
   fi

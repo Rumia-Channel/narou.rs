@@ -57,6 +57,12 @@ jobs:
     if: vars.SORAHOST == 'T'
     runs-on: ubuntu-22.04
     environment: SORAHOST
+    env:
+      # 前段コネクタのバージョン。sorahost/start.sh の CF_TAG / CF_SHA256 と
+      # 揃える (同梱されるバイナリと起動時に参照するタグが一致するように)。
+      CF_TAG: "2026.9.3"
+      CF_SHA256: "77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
+      CURL_TAG: "v8.21.0"
     steps:
       - uses: actions/checkout@v5
 
@@ -93,12 +99,28 @@ jobs:
           set -eu
           bundle="dist/${{ needs.build.outputs.bundle }}"
           root="$(basename "${bundle%.tar.gz}")"
-          mkdir -p deploy/app
+          mkdir -p deploy/app deploy/bin
           tar -xzf "$bundle" -C deploy/app --strip-components=1 \
             "$root/narou_rs" "$root/narou_rs_backup" "$root/webnovel"
           cp sorahost/start.sh deploy/start.sh
           cp sorahost/sorahost.json deploy/sorahost.json
-          find deploy -maxdepth 2 | sort
+          # コンテナには curl が無いので、コネクタ用の cloudflared と、
+          # start.sh から使う静的 curl + CA バンドルを CI 側で取得して同梱する
+          # (start.sh は $SELF_DIR/bin/ を見る。ハッシュはいずれも検証する)。
+          curl -fsSL -o deploy/bin/cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/download/${{ env.CF_TAG }}/cloudflared-linux-amd64"
+          echo "${{ env.CF_SHA256 }}  deploy/bin/cloudflared" | sha256sum -c -
+          chmod +x deploy/bin/cloudflared
+          curl -fsSL -o deploy/bin/curl \
+            "https://github.com/moparisthebest/static-curl/releases/download/${{ env.CURL_TAG }}/curl-amd64"
+          curl -fsSL -o curl-sha256sum.txt \
+            "https://github.com/moparisthebest/static-curl/releases/download/${{ env.CURL_TAG }}/sha256sum.txt"
+          curl -fsSL -o deploy/bin/cacert.pem "https://curl.se/ca/cacert.pem"
+          want="$(grep 'curl-amd64' curl-sha256sum.txt | awk '{print tolower($1)}')"
+          got="$(sha256sum deploy/bin/curl | awk '{print tolower($1)}')"
+          [ "$want" = "$got" ] || { echo "curl ハッシュ不一致: $want != $got" >&2; exit 1; }
+          chmod +x deploy/bin/curl
+          find deploy -maxdepth 3 | sort
           du -sh deploy
 
       # 前段の Cloudflare コネクタと Access を用意する (未設定なら何もしない)。
