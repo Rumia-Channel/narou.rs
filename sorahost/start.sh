@@ -28,7 +28,6 @@
 set -eu
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP="${NAROU_RS_APP:-$SELF_DIR/app}"
 
 # ライブラリは配備で消えない場所へ置く。PteWorker は配備ごとに
 # `.sorahost/releases/<日時>-<hash>/` を作り直すので、その外 (ボリューム直下) に置く。
@@ -40,20 +39,14 @@ case "$SELF_DIR" in
     VOLUME_DIR="${HOME:-$SELF_DIR}"
     ;;
 esac
-LIB="${NAROU_RS_LIBRARY:-$VOLUME_DIR/narou-library}"
-BIN_DIR="$VOLUME_DIR/bin"
-TOKEN_FILE="${NAROU_CONNECTOR_TOKEN_FILE:-$VOLUME_DIR/.connector-token}"
-CF_BIN="$BIN_DIR/cloudflared"
-CF_TAG="2026.9.3"
-CF_SHA256="77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
-CF_URL="https://github.com/cloudflare/cloudflared/releases/download/${CF_TAG}/cloudflared-linux-amd64"
-PUBLIC_HOST="${NAROU_PUBLIC_HOST:-}"
 
 # --- 設定ファイル (.env) ---------------------------------------------------
 # PteWorker のマニフェストには環境変数を渡す項目が無く、Startup 変数の名前は
 # egg 側が決めているため、こちらで用意した名前は置けないことが多い。
 # そこで **ボリューム直下の .env** を読む (パネルのファイルマネージャか SFTP で置く)。
 # 既に環境にある値 (プラットフォーム由来や Startup 変数) の方が優先。
+# このスクリプト自身が読む値 (NAROU_PUBLIC_HOST / NAROU_RS_LIBRARY 等) も含めて
+# 効くよう、環境変数を参照する代入の前に置く。
 ENV_FILE="${NAROU_RS_ENV_FILE:-$VOLUME_DIR/.env}"
 if [ -f "$ENV_FILE" ]; then
   while IFS= read -r line; do
@@ -74,6 +67,22 @@ if [ -f "$ENV_FILE" ]; then
   echo "[narou] $ENV_FILE を読み込みました"
 fi
 
+APP="${NAROU_RS_APP:-$SELF_DIR/app}"
+LIB="${NAROU_RS_LIBRARY:-$VOLUME_DIR/narou-library}"
+BIN_DIR="$VOLUME_DIR/bin"
+TOKEN_FILE="${NAROU_CONNECTOR_TOKEN_FILE:-$VOLUME_DIR/.connector-token}"
+CF_BIN="$BIN_DIR/cloudflared"
+CF_TAG="2026.9.3"
+CF_SHA256="77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
+CF_URL="https://github.com/cloudflare/cloudflared/releases/download/${CF_TAG}/cloudflared-linux-amd64"
+PUBLIC_HOST="${NAROU_PUBLIC_HOST:-}"
+
+# コネクタのトークンを先に解決する。前段に Access を置く構成では basic 認証は
+# 二重になるだけなので、これがあるかで basic 認証の既定を切り替える。
+NAROU_CONNECTOR="${NAROU_CONNECTOR_TOKEN:-}"
+if [ -z "$NAROU_CONNECTOR" ] && [ -f "$TOKEN_FILE" ]; then
+  NAROU_CONNECTOR="$(tr -d '\r\n' < "$TOKEN_FILE")"
+fi
 BIN="$APP/narou_rs"
 PIDS=""
 
@@ -131,27 +140,34 @@ if [ ! -d "$LIB/.narou" ]; then
     concurrency=true < /dev/null
 fi
 
-# --- basic 認証 (公開エンドポイントなので必須) -----------------------------
+# --- basic 認証 -------------------------------------------------------------
 # 資格情報が空だと narou は認証ヘッダを作らず素通しになるため、未設定のまま
 # 公開しない。ただし起動自体を止めると PteWorker がデプロイ失敗 (422) と見なし、
 # **前のリリースを配り続けてしまう** (実測) ので、その場でランダムなパスワードを
 # 設定して「誰も入れない状態」で起動する。値を決めたいときは NAROU_WEB_PASSWORD を
-# パネルの .env に置く。前段 (Cloudflare Access 等) で守る構成なら
-# NAROU_ALLOW_NO_PASSWORD=1 で認証なしのまま起動する。
+# .env に置く。前段のコネクタ (Cloudflare Access) を使うときは basic 認証を
+# 切る (二重になるだけのため)。明示的に NAROU_WEB_PASSWORD を置けばコネクタと
+# 併用できる。コネクタなしで認証なしにしたいときだけ NAROU_ALLOW_NO_PASSWORD=1。
 STORED_PASSWORD="$("$BIN" setting server-basic-auth.password < /dev/null)"
-if [ -z "${NAROU_WEB_PASSWORD:-}" ] && [ -z "$STORED_PASSWORD" ]; then
+BASIC_AUTH=on
+if [ -n "$NAROU_CONNECTOR" ] && [ -z "${NAROU_WEB_PASSWORD:-}" ]; then
+  BASIC_AUTH=off
+  echo "[narou] 前段のコネクタが有効なため basic 認証を無効にします" \
+    "(NAROU_WEB_PASSWORD を置くと有効に戻せます)"
+elif [ -z "${NAROU_WEB_PASSWORD:-}" ] && [ -z "$STORED_PASSWORD" ]; then
   if [ "${NAROU_ALLOW_NO_PASSWORD:-0}" = "1" ]; then
+    BASIC_AUTH=off
     echo "[narou] 警告: basic 認証なしで公開します (NAROU_ALLOW_NO_PASSWORD=1)" >&2
   else
     NAROU_WEB_PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
     echo "[narou] NAROU_WEB_PASSWORD が未設定のため、一時的なパスワードを設定しました:" >&2
     echo "[narou]   ${NAROU_WEB_USER:-admin} / $NAROU_WEB_PASSWORD" >&2
-    echo "[narou]   パネルの .env に NAROU_WEB_PASSWORD を入れて再起動すると置き換わります" >&2
+    echo "[narou]   .env に NAROU_WEB_PASSWORD を入れて再起動すると置き換わります" >&2
   fi
 fi
 # narou は user と password の**両方**が埋まっていないと認証ヘッダを作らない
 # (片方だけだと素通しになる) ので、パスワードがあるときは user を既定で補う。
-if [ -n "${NAROU_WEB_PASSWORD:-}" ] || [ -n "$STORED_PASSWORD" ]; then
+if [ "$BASIC_AUTH" = "on" ] && { [ -n "${NAROU_WEB_PASSWORD:-}" ] || [ -n "$STORED_PASSWORD" ]; }; then
   NAROU_WEB_USER="${NAROU_WEB_USER:-admin}"
 fi
 
@@ -161,8 +177,13 @@ fi
 # server-ws-port=0: 併設 WebSocket リスナーを作らない。narou.rb は
 # `server-port + 1` も使うが、PteWorker はその番号を自分のルータ (workerd) に
 # 使うため衝突する。WebSocket は本体ポートの `/ws` で受けるので機能は落ちない。
+if [ "$BASIC_AUTH" = "on" ]; then
+  AUTH_ENABLE=true
+else
+  AUTH_ENABLE=false
+fi
 if [ -n "$PUBLIC_HOST" ]; then
-  # トンネル経由 (Host = 公開ホスト名) だけを受け付ける。直の IP:ポート宛は
+  # コネクタ経由 (Host = 公開ホスト名) だけを受け付ける。直の IP:ポート宛は
   # Host が許可リストに無いので 400 で落ちる。
   set -- \
     "server-bind=127.0.0.1" \
@@ -170,7 +191,7 @@ if [ -n "$PUBLIC_HOST" ]; then
     "server-reverse-proxy.enable=false" \
     "server-add-accepted-hosts=$PUBLIC_HOST" \
     "server-ws-add-accepted-domains=$PUBLIC_HOST" \
-    "server-basic-auth.enable=true" \
+    "server-basic-auth.enable=$AUTH_ENABLE" \
     "server-ws-port=0" \
     "convert.section-cache=false"
 else
@@ -178,14 +199,14 @@ else
     "server-bind=127.0.0.1" \
     "server-port=$NAROU_PORT" \
     "server-reverse-proxy.enable=true" \
-    "server-basic-auth.enable=true" \
+    "server-basic-auth.enable=$AUTH_ENABLE" \
     "server-ws-port=0" \
     "convert.section-cache=false"
 fi
-if [ -n "${NAROU_WEB_USER:-}" ]; then
+if [ "$BASIC_AUTH" = "on" ] && [ -n "${NAROU_WEB_USER:-}" ]; then
   set -- "$@" "server-basic-auth.user=$NAROU_WEB_USER"
 fi
-if [ -n "${NAROU_WEB_PASSWORD:-}" ]; then
+if [ "$BASIC_AUTH" = "on" ] && [ -n "${NAROU_WEB_PASSWORD:-}" ]; then
   set -- "$@" "server-basic-auth.password=$NAROU_WEB_PASSWORD"
 fi
 "$BIN" setting "$@" < /dev/null
@@ -202,11 +223,8 @@ trap cleanup EXIT
 
 # --- 前段のコネクタ (任意) -------------------------------------------------
 # NAROU_CONNECTOR_TOKEN (または NAROU_CONNECTOR_TOKEN_FILE) があるときだけ起動する。
-# トークンは Cloudflare のダッシュボード (Networks → Tunnels) で発行し、パネルの .env に置く。
-NAROU_CONNECTOR="${NAROU_CONNECTOR_TOKEN:-}"
-if [ -z "$NAROU_CONNECTOR" ] && [ -f "$TOKEN_FILE" ]; then
-  NAROU_CONNECTOR="$(tr -d '\r\n' < "$TOKEN_FILE")"
-fi
+# トークンは Cloudflare のダッシュボード (Networks → Tunnels) で発行し、.env に置く。
+# (トークン自体は先に解決済み)
 if [ -n "$NAROU_CONNECTOR" ]; then
   mkdir -p "$BIN_DIR"
   if [ ! -x "$CF_BIN" ]; then
