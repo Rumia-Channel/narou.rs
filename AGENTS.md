@@ -503,6 +503,13 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   path-style URL、SigV4 署名と presigned GET、stat は `GET` + `Range`。1 オブジェクトの上限は
   64 MiB、`read_small`/`write_small` は 16 MiB (multipart は未実装で、上限超過は黙って
   切り捨てず失敗させる)。
+- **署名は URL から導出する** (2026-10): `S3Store::send` は渡された URL から
+  `path`/`query` を切り出して署名する (呼び出し側が canonical 値を別途渡すと
+  endpoint にパス成分がある構成で乖離し得た)。`SignatureDoesNotMatch` のエラーには
+  サーバーが返す `StringToSign` digest と自分側の digest の一致/不一致を示す診断が
+  付く (一致なら鍵/スコープ、不一致なら canonical request の差異)。presigned GET の
+  パスは生キーから組み立てる (`object_path()` の encode 済み値を渡すと二重
+  エンコードになる)。endpoint に `?`/`#` を含む値は拒否する。
 - native の設定は `local_setting` の `s3.endpoint` / `s3.bucket` / `s3.region` / `s3.prefix` /
   `s3.access-key-id` / `s3.secret-access-key`。`narou setting` から読み書きでき、環境変数 (`S3_*`)
   があればそちらを優先する (SORAHOST のようなコンテナは環境変数だけで完結する)。

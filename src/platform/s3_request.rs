@@ -27,7 +27,7 @@ pub struct S3Location {
 }
 
 impl S3Location {
-    /// `endpoint` は `https://host[:port]` (末尾スラッシュ無し)、`prefix` は
+    /// `endpoint` は `https://host[:port][/base]` (末尾スラッシュ無し)、`prefix` は
     /// 空か `narou/develop` のようなスラッシュ区切り。
     pub fn new(
         endpoint: impl Into<String>,
@@ -38,6 +38,11 @@ impl S3Location {
         if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
             return Err(NarouError::Platform(format!(
                 "S3 endpoint must be an http(s) URL: {endpoint:?}"
+            )));
+        }
+        if endpoint.contains('?') || endpoint.contains('#') {
+            return Err(NarouError::Platform(format!(
+                "S3 endpoint must not contain a query or fragment: {endpoint:?}"
             )));
         }
         let bucket = bucket.into();
@@ -95,6 +100,19 @@ impl S3Location {
             )));
         }
         Ok(host.to_string())
+    }
+
+    /// endpoint URL のパス成分 (`https://host/base` → `/base`)。無ければ空。
+    /// リバースプロキシ型の S3 互換ではリクエストパスの先頭に付くため、
+    /// presign の署名対象パスにも含める必要がある。
+    pub fn endpoint_path(&self) -> &str {
+        let Some((_, rest)) = self.endpoint.split_once("://") else {
+            return "";
+        };
+        match rest.find('/') {
+            Some(index) => &rest[index..],
+            None => "",
+        }
     }
 
     /// 論理キーを S3 のオブジェクトキーへ写像する (prefix を前置)。
@@ -185,13 +203,14 @@ impl S3Location {
         format!("/{}", self.bucket)
     }
 
-    /// 一覧 (ListObjectsV2) の URL と、署名に使う canonical query。
+    /// 一覧 (ListObjectsV2) の URL。クエリは署名対象と一致する canonical
+    /// form で組み立てる (呼び出し側はこの URL をそのまま送ればよい)。
     pub fn list_url(
         &self,
         prefix: &str,
         limit: usize,
         continuation_token: Option<&str>,
-    ) -> (String, String) {
+    ) -> String {
         let storage_prefix = if self.prefix.is_empty() {
             prefix.to_string()
         } else if prefix.is_empty() {
@@ -211,10 +230,7 @@ impl S3Location {
             params.push(("continuation-token".to_string(), token.to_string()));
         }
         let query = canonical_query(&params);
-        (
-            format!("{}{}?{}", self.endpoint, self.bucket_path(), query),
-            query,
-        )
+        format!("{}{}?{}", self.endpoint, self.bucket_path(), query)
     }
 
     /// サーバサイドコピー (`x-amz-copy-source`) に渡す値。
@@ -363,7 +379,7 @@ fn find_prefixed_close(haystack: &str, tag: &str) -> Option<usize> {
 }
 
 /// `<tag>...</tag>` の中身を実体参照込みで返す。
-fn element_text(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn element_text(xml: &str, tag: &str) -> Option<String> {
     let start = find_tag(xml, tag)?;
     let after_open = xml[start..].find('>')? + start + 1;
     let rest = &xml[after_open..];
@@ -581,20 +597,16 @@ mod tests {
     #[test]
     fn list_url_carries_the_canonical_query() {
         let location = location();
-        let (url, query) = location.list_url("novels/", 100, Some("abc/def="));
-        assert_eq!(
-            query,
-            "continuation-token=abc%2Fdef%3D&encoding-type=url&list-type=2&max-keys=100&prefix=narou%2Fdevelop%2Fnovels%2F"
-        );
+        let url = location.list_url("novels/", 100, Some("abc/def="));
         assert_eq!(
             url,
             "https://s3.example.com/narou-library?continuation-token=abc%2Fdef%3D&encoding-type=url&list-type=2&max-keys=100&prefix=narou%2Fdevelop%2Fnovels%2F"
         );
 
-        let (_, query) = location.list_url("", 10, None);
+        let url = location.list_url("", 10, None);
         assert_eq!(
-            query,
-            "encoding-type=url&list-type=2&max-keys=10&prefix=narou%2Fdevelop%2F"
+            url,
+            "https://s3.example.com/narou-library?encoding-type=url&list-type=2&max-keys=10&prefix=narou%2Fdevelop%2F"
         );
     }
 

@@ -42,6 +42,11 @@ pub struct SignedHeaders {
     pub authorization: String,
     pub x_amz_date: String,
     pub x_amz_content_sha256: String,
+    /// 署名に使った canonical request と string-to-sign。
+    /// エラー応答の `StringToSign` と突き合わせて、署名不一致が canonical
+    /// request の差異なのか鍵/スコープの差異なのかを切り分けるための診断値。
+    pub canonical_request: String,
+    pub string_to_sign: String,
 }
 
 /// GET 用の presigned URL を作る（クエリ認証）。
@@ -136,6 +141,8 @@ pub fn sign(
         ),
         x_amz_date: request.amz_date.to_string(),
         x_amz_content_sha256: request.payload_sha256.to_string(),
+        canonical_request,
+        string_to_sign,
     }
 }
 

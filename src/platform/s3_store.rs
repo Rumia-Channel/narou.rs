@@ -142,9 +142,19 @@ impl S3Store {
             access_key_id: &self.credentials.access_key_id,
             secret_access_key: &self.credentials.secret_access_key,
         };
+        // `presign_get` は生パスを期待して自分で percent-encode する。
+        // encode 済みの `object_path()` を渡すと `%` が再エンコードされて
+        // 非 ASCII キーの URL が壊れるため、ここでは生キーから組み立てる。
+        // endpoint にパス成分がある構成では、そのパスも署名対象に含める。
+        let path = format!(
+            "{}/{}/{}",
+            self.location.endpoint_path(),
+            self.location.bucket(),
+            self.location.storage_key(key)
+        );
         let url = s3_sigv4::presign_get(
             &self.host,
-            &self.location.object_path(key),
+            &path,
             &credentials,
             &self.region,
             expires_secs,
@@ -157,24 +167,32 @@ impl S3Store {
         }
     }
 
-    /// 署名済みリクエストを送る。`path` と `query` は署名対象と一致させる。
+    /// 署名済みリクエストを送る。
+    ///
+    /// 署名対象の path/query は `url` そのものから切り出す。呼び出し側が
+    /// 別途 canonical 値を渡す形だと、endpoint にパス成分が混ざる構成や
+    /// エンコード差で「送ったもの」と「署名したもの」が乖離する余地が残るため、
+    /// ここで wire bytes と署名対象を構造的に一致させる。
+    ///
+    /// 戻り値の [`SignedHeaders`] は署名に使った canonical request を持つ。
+    /// SignatureDoesNotMatch を切り分けるとき、サーバーが返した
+    /// `StringToSign` の digest と比較するのに使う。
     async fn send(
         &self,
         method: HttpMethod,
         url: &str,
-        path: &str,
-        query: &str,
         extra_headers: &[(&str, &str)],
         body: Option<Vec<u8>>,
-    ) -> Result<super::http::HttpResponse> {
+    ) -> Result<(super::http::HttpResponse, s3_sigv4::SignedHeaders)> {
+        let (path, query) = url_target(url);
         let payload_sha256 = s3_sigv4::payload_sha256(body.as_deref().unwrap_or(&[]));
         let amz_date = s3_sigv4::amz_date(self.clock.now_utc());
         let signed = s3_sigv4::sign(
             &RequestToSign {
                 method: method_name(method),
                 host: &self.host,
-                path,
-                query,
+                path: &path,
+                query: &query,
                 headers: extra_headers,
                 payload_sha256: &payload_sha256,
                 amz_date: &amz_date,
@@ -200,10 +218,10 @@ impl S3Store {
             request = request.with_header(*name, *value);
         }
         request = request
-            .with_header("x-amz-date", signed.x_amz_date)
-            .with_header("x-amz-content-sha256", signed.x_amz_content_sha256)
-            .with_header("authorization", signed.authorization);
-        self.http.send(request).await
+            .with_header("x-amz-date", &signed.x_amz_date)
+            .with_header("x-amz-content-sha256", &signed.x_amz_content_sha256)
+            .with_header("authorization", &signed.authorization);
+        Ok((self.http.send(request).await?, signed))
     }
 
     /// dedup プール (`illustrations/<b64>`) にだけオブジェクトがあるか。
@@ -212,12 +230,10 @@ impl S3Store {
         if !self.location.has_pool_alternate(key) {
             return Ok(None);
         }
-        let response = self
+        let (response, _) = self
             .send(
                 HttpMethod::Get,
                 &self.location.object_url(key),
-                &self.location.object_path(key),
-                "",
                 &[("range", "bytes=0-0")],
                 None,
             )
@@ -247,12 +263,10 @@ impl S3Store {
     async fn stat_object(&self, key: &ObjectKey) -> Result<Option<ObjectMetadata>> {
         // `HEAD` はエッジで 403 になる S3 互換サービスがあるため、
         // `GET` + `Range: bytes=0-0` でメタデータだけ読む。
-        let response = self
+        let (response, _) = self
             .send(
                 HttpMethod::Get,
                 &self.location.object_url(key),
-                &self.location.object_path(key),
-                "",
                 &[("range", "bytes=0-0")],
                 None,
             )
@@ -262,12 +276,11 @@ impl S3Store {
             self.send(
                 HttpMethod::Get,
                 &self.location.legacy_object_url(key),
-                &self.location.legacy_object_path(key),
-                "",
                 &[("range", "bytes=0-0")],
                 None,
             )
             .await?
+            .0
         } else {
             response
         };
@@ -308,12 +321,10 @@ impl S3Store {
     }
 
     async fn read_object(&self, key: &ObjectKey) -> Result<Option<Vec<u8>>> {
-        let response = self
+        let (response, _) = self
             .send(
                 HttpMethod::Get,
                 &self.location.object_url(key),
-                &self.location.object_path(key),
-                "",
                 &[],
                 None,
             )
@@ -323,12 +334,10 @@ impl S3Store {
             200 => Ok(Some(body)),
             404 if self.location.has_pool_alternate(key) => {
                 // dedup 移行期: pool に無ければ旧 `挿絵/` 位置から読む。
-                let response = self
+                let (response, _) = self
                     .send(
                         HttpMethod::Get,
                         &self.location.legacy_object_url(key),
-                        &self.location.legacy_object_path(key),
-                        "",
                         &[],
                         None,
                     )
@@ -360,12 +369,10 @@ impl S3Store {
             )));
         }
         let content_type = content_type_for_key(key).unwrap_or("application/octet-stream");
-        let response = self
+        let (response, _) = self
             .send(
                 HttpMethod::Put,
                 &self.location.object_url(key),
-                &self.location.object_path(key),
-                "",
                 &[("content-type", content_type)],
                 Some(data),
             )
@@ -382,14 +389,12 @@ impl S3Store {
     }
 
     async fn delete_object(&self, key: &ObjectKey) -> Result<()> {
-        let response = self
+        let (response, _) = self
             .send(
                 HttpMethod::Delete,
                 // dedup プールは共有なので小説削除では消さない。
                 // 消すのは移行前の旧 `挿絵/` 位置の物理オブジェクトだけ。
                 &self.location.legacy_object_url(key),
-                &self.location.legacy_object_path(key),
-                "",
                 &[],
                 None,
             )
@@ -407,21 +412,12 @@ impl S3Store {
     }
 
     async fn list_objects(&self, request: &ObjectListRequest) -> Result<ObjectListPage> {
-        let (url, query) = self.location.list_url(
+        let url = self.location.list_url(
             request.prefix.as_ref(),
             request.limit.get(),
             request.cursor.as_deref(),
         );
-        let response = self
-            .send(
-                HttpMethod::Get,
-                &url,
-                &self.location.bucket_path(),
-                &query,
-                &[],
-                None,
-            )
-            .await?;
+        let (response, signed) = self.send(HttpMethod::Get, &url, &[], None).await?;
         let (status, body) = status_and_body(response)?;
         if status != 200 {
             // S3 のエラーは XML で AccessDenied / SignatureDoesNotMatch /
@@ -430,8 +426,9 @@ impl S3Store {
             let detail = String::from_utf8_lossy(&body);
             let detail = detail.trim();
             let snippet: String = detail.chars().take(300).collect();
+            let hint = signature_mismatch_hint(detail, &signed);
             return Err(NarouError::Platform(format!(
-                "S3 LIST {} failed with status {status}: {snippet}",
+                "S3 LIST {} failed with status {status}: {snippet}{hint}",
                 request.prefix.as_ref()
             )));
         }
@@ -484,12 +481,10 @@ impl S3Store {
 
     async fn copy_object(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
         let copy_source = self.location.copy_source(source);
-        let response = self
+        let (response, _) = self
             .send(
                 HttpMethod::Put,
                 &self.location.object_url(destination),
-                &self.location.object_path(destination),
-                "",
                 &[("x-amz-copy-source", copy_source.as_str())],
                 Some(Vec::new()),
             )
@@ -504,6 +499,27 @@ impl S3Store {
                 destination.as_ref()
             )))
         }
+    }
+}
+
+/// URL 文字列から署名対象の `path` と `query` を切り出す。
+///
+/// `url` クレートで再パースすると percent-encoding が正規化されて署名対象と
+/// wire のバイト列がずれる余地があるため、単純な文字列分割で済ませる。
+/// `endpoint` 構築時に `?`/`#` を拒否しているので、ここで出る `?` は常に
+/// クエリの開始。
+fn url_target(url: &str) -> (String, String) {
+    let after_scheme = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url);
+    let target = match after_scheme.find('/') {
+        Some(index) => &after_scheme[index..],
+        None => "/",
+    };
+    match target.split_once('?') {
+        Some((path, query)) => (path.to_string(), query.to_string()),
+        None => (target.to_string(), String::new()),
     }
 }
 
@@ -531,6 +547,45 @@ fn status_and_body(response: super::http::HttpResponse) -> Result<(u16, Vec<u8>)
         )));
     }
     Ok((status, response.body))
+}
+
+/// `SignatureDoesNotMatch` の切り分けヒント。
+///
+/// S3 のエラー応答に含まれる `<StringToSign>` の末尾行は、サーバー側が
+/// 再構成した canonical request の SHA-256 digest。これと自分側の digest を
+/// 比較して、canonical request 自体が違うのか (エンコード/ヘッダ差異)、
+/// digest が一致して署名だけ違うのか (シークレット/スコープ値の差異) を示す。
+fn signature_mismatch_hint(body: &str, signed: &s3_sigv4::SignedHeaders) -> String {
+    if !body.contains("SignatureDoesNotMatch") {
+        return String::new();
+    }
+    let Some(server_to_sign) = super::s3_request::element_text(body, "StringToSign") else {
+        return String::new();
+    };
+    let server_digest = server_to_sign.trim().rsplit('\n').next().unwrap_or("").trim();
+    let our_digest = signed
+        .string_to_sign
+        .rsplit('\n')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if server_digest.is_empty() || our_digest.is_empty() {
+        return String::new();
+    }
+    if server_digest == our_digest {
+        // canonical request は一致しているのに署名だけが違う → 鍵やスコープ値。
+        format!(
+            " [narou: canonical-request digest matches ({our_digest}); \
+             the mismatch is in the signing key — check S3_SECRET_ACCESS_KEY, \
+             bucket region vs s3.region, and account type]"
+        )
+    } else {
+        format!(
+            " [narou: canonical-request digest differs (server: {server_digest}, \
+             ours: {our_digest}) — the request sent differs from what was signed; \
+             compare the server's StringToSign against the logged request]"
+        )
+    }
 }
 
 impl ObjectStore for S3Store {
@@ -955,6 +1010,9 @@ mod tests {
         .unwrap();
         let url = local.presign_get_url(&key("novels/site/title/挿絵/0001.jpg"), 60);
         assert!(url.starts_with("http://127.0.0.1:9000/bucket/"), "{url}");
+        // 非 ASCII キーは一度だけ encode される (`%25E3` は二重エンコードの兆候)。
+        assert!(url.contains("%E6%8C%BF%E7%B5%B5"), "{url}");
+        assert!(!url.contains("%25"), "{url}");
     }
 
     #[test]
@@ -978,5 +1036,84 @@ mod tests {
         };
         assert!(error.to_string().contains("credentials"), "{error}");
         assert_eq!(http.request_count(), 0);
+    }
+
+    #[test]
+    fn signature_hint_reports_matching_digests() {
+        let signed = s3_sigv4::sign(
+            &s3_sigv4::RequestToSign {
+                method: "GET",
+                host: "s3.example.com",
+                path: "/bucket",
+                query: "list-type=2",
+                headers: &[],
+                payload_sha256: &s3_sigv4::payload_sha256(&[]),
+                amz_date: "20261001T000000Z",
+            },
+            &s3_sigv4::Credentials {
+                access_key_id: "AK",
+                secret_access_key: "SK",
+            },
+            "us-east-1",
+            "s3",
+        );
+        // サーバーが同じ string-to-sign を再構成した応答 → digest 一致。
+        let body = format!(
+            "<Error><Code>SignatureDoesNotMatch</Code>\
+             <StringToSign>{}</StringToSign></Error>",
+            signed.string_to_sign
+        );
+        let hint = signature_mismatch_hint(&body, &signed);
+        assert!(hint.contains("digest matches"), "{hint}");
+    }
+
+    #[test]
+    fn signature_hint_reports_different_digests() {
+        let signed = s3_sigv4::sign(
+            &s3_sigv4::RequestToSign {
+                method: "GET",
+                host: "s3.example.com",
+                path: "/bucket",
+                query: "list-type=2",
+                headers: &[],
+                payload_sha256: &s3_sigv4::payload_sha256(&[]),
+                amz_date: "20261001T000000Z",
+            },
+            &s3_sigv4::Credentials {
+                access_key_id: "AK",
+                secret_access_key: "SK",
+            },
+            "us-east-1",
+            "s3",
+        );
+        let body = "<Error><Code>SignatureDoesNotMatch</Code>\
+            <StringToSign>AWS4-HMAC-SHA256\n20261001T000000Z\nscope\n\
+            0000000000000000000000000000000000000000000000000000000000000000\
+            </StringToSign></Error>";
+        let hint = signature_mismatch_hint(body, &signed);
+        assert!(hint.contains("digest differs"), "{hint}");
+    }
+
+    #[test]
+    fn signature_hint_is_silent_for_other_errors() {
+        let signed = s3_sigv4::sign(
+            &s3_sigv4::RequestToSign {
+                method: "GET",
+                host: "s3.example.com",
+                path: "/bucket",
+                query: "",
+                headers: &[],
+                payload_sha256: &s3_sigv4::payload_sha256(&[]),
+                amz_date: "20261001T000000Z",
+            },
+            &s3_sigv4::Credentials {
+                access_key_id: "AK",
+                secret_access_key: "SK",
+            },
+            "us-east-1",
+            "s3",
+        );
+        let body = "<Error><Code>AccessDenied</Code></Error>";
+        assert!(signature_mismatch_hint(body, &signed).is_empty());
     }
 }
