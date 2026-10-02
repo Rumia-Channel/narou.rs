@@ -1,0 +1,185 @@
+name: Deploy SORAHOST
+
+# narou.rs 専用の SORAHOST (PteWorker) サーバーへ配備する。動くのは Repository
+# variable `SORAHOST` が `T` のときだけで、その間は Cloudflare Workers 側の
+# ジョブも止まる (`platform.yml` を参照)。
+#
+# 配備は `sorahost-cli` に任せる。SFTP も Cloudflare Tunnel も使わない
+# (公開は PteWorker が行う。アプリは渡された PORT にループバックで束縛する)。
+#
+# Environment `SORAHOST` に置く値 (外部に見えると面倒なものは secret に置く):
+#   secrets SORAHOST_ENDPOINT    PteWorker のコンソールに出るエンドポイント
+#   secrets SORAHOST_TOKEN       デプロイトークン (この 2 つが必須)
+#   secrets SORAHOST_SMOKE_URL   任意。配備後の確認先 (未設定なら deploy が返す url)
+#   ----- 前段に Cloudflare のコネクタ + Access を置く場合だけ (全部 secret) -----
+#   secrets CLOUDFLARE_API_TOKEN     Account: Cloudflare One Connectors /
+#                                   Cloudflare One Connector: cloudflared /
+#                                   Cloudflare Tunnel のいずれか (Write/Edit)、
+#                                   Zone: DNS (Write/Edit) + Zone (Read)、
+#                                   Access を使うなら Access: Apps and Policies (Write/Edit)
+#   secrets CLOUDFLARE_ACCOUNT_ID    アカウント ID (識別子だが外に見せたくないので secret)
+#   secrets SORAHOST_PUBLIC_HOSTNAME 公開ホスト名 (例 narou.example.com)
+#   secrets SORAHOST_SERVICE_PORT    コネクタの向き先 = コンテナ内の待受ポート (既定 18080)
+#   secrets SORAHOST_CONNECTOR_NAME  コネクタ名 (既定 narou-sorahost)
+#   secrets SORAHOST_ACCESS_EMAIL    Access で許可するメール (カンマ区切り)
+#   secrets SORAHOST_ACCESS_DOMAIN   Access で許可するメールドメイン
+#   secrets SORAHOST_ACCESS_SESSION  Access のセッション有効期限 (既定 24h)
+# 接続トークンは CI では扱わない (ログに出さないため)。Cloudflare のダッシュボードで
+# 確認し、サーバー直下の .env に NAROU_CONNECTOR_TOKEN として置く。
+#
+# サーバー側の値 (NAROU_WEB_PASSWORD / S3_* など) はここではなく
+# ボリューム直下の .env に置く。sorahost/README.md §3 を参照。
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "アップロードせず送信内容だけ確認する"
+        type: boolean
+        default: false
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-sorahost
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: vars.SORAHOST == 'T'
+    uses: ./.github/workflows/build-linux.yml
+
+  deploy:
+    needs: build
+    if: vars.SORAHOST == 'T'
+    runs-on: ubuntu-22.04
+    environment: SORAHOST
+    env:
+      # 前段コネクタのバージョン。sorahost/start.sh の CF_TAG / CF_SHA256 と
+      # 揃える (同梱されるバイナリと起動時に参照するタグが一致するように)。
+      CF_TAG: "2026.9.3"
+      CF_SHA256: "77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
+      CURL_TAG: "v8.21.0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      # 資格情報が無い環境 (fork / 未設定) では理由を出して省略する。
+      # `--yes` で走らせるので、無いまま実行すると CLI 側がエラーで止まる。
+      - name: Check the deployment values
+        id: credentials
+        env:
+          SORAHOST_ENDPOINT: ${{ secrets.SORAHOST_ENDPOINT }}
+          SORAHOST_TOKEN: ${{ secrets.SORAHOST_TOKEN }}
+        run: |
+          if [ -z "$SORAHOST_ENDPOINT" ] || [ -z "$SORAHOST_TOKEN" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SORAHOST_ENDPOINT / SORAHOST_TOKEN が未設定のため配備を省略します"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v4
+        if: steps.credentials.outputs.configured == 'true'
+        with:
+          name: narou_rs-linux-x86_64
+          path: dist
+
+      # 配備するものだけを 1 つのフォルダーへ集める (`sorahost.json` の include と一致)。
+      # ライブラリ (`library/`) はコンテナ側にあってここには含めない = 配備で触らない。
+      - name: Assemble the deploy folder
+        if: steps.credentials.outputs.configured == 'true'
+        run: |
+          set -eu
+          bundle="dist/${{ needs.build.outputs.bundle }}"
+          root="$(basename "${bundle%.tar.gz}")"
+          mkdir -p deploy/app deploy/bin
+          tar -xzf "$bundle" -C deploy/app --strip-components=1 \
+            "$root/narou_rs" "$root/narou_rs_backup" "$root/webnovel"
+          cp sorahost/start.sh deploy/start.sh
+          cp sorahost/sorahost.json deploy/sorahost.json
+          # コンテナには curl が無いので、コネクタ用の cloudflared と、
+          # start.sh から使う静的 curl + CA バンドルを CI 側で取得して同梱する
+          # (start.sh は $SELF_DIR/bin/ を見る。ハッシュはいずれも検証する)。
+          curl -fsSL -o deploy/bin/cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/download/${{ env.CF_TAG }}/cloudflared-linux-amd64"
+          echo "${{ env.CF_SHA256 }}  deploy/bin/cloudflared" | sha256sum -c -
+          chmod +x deploy/bin/cloudflared
+          curl -fsSL -o deploy/bin/curl \
+            "https://github.com/moparisthebest/static-curl/releases/download/${{ env.CURL_TAG }}/curl-amd64"
+          curl -fsSL -o curl-sha256sum.txt \
+            "https://github.com/moparisthebest/static-curl/releases/download/${{ env.CURL_TAG }}/sha256sum.txt"
+          curl -fsSL -o deploy/bin/cacert.pem "https://curl.se/ca/cacert.pem"
+          want="$(grep 'curl-amd64' curl-sha256sum.txt | awk '{print tolower($1)}')"
+          got="$(sha256sum deploy/bin/curl | awk '{print tolower($1)}')"
+          [ "$want" = "$got" ] || { echo "curl ハッシュ不一致: $want != $got" >&2; exit 1; }
+          chmod +x deploy/bin/curl
+          find deploy -maxdepth 3 | sort
+          du -sh deploy
+
+      # 前段の Cloudflare コネクタと Access を用意する (未設定なら何もしない)。
+      # アプリは 127.0.0.1:<SORAHOST_SERVICE_PORT> に居るので、そこへ向ける。
+      - name: Set up the Cloudflare connector and Access
+        if: steps.credentials.outputs.configured == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || vars.CLOUDFLARE_ACCOUNT_ID }}
+          SORAHOST_PUBLIC_HOSTNAME: ${{ secrets.SORAHOST_PUBLIC_HOSTNAME || vars.SORAHOST_PUBLIC_HOSTNAME }}
+          SORAHOST_SERVICE_PORT: ${{ secrets.SORAHOST_SERVICE_PORT || vars.SORAHOST_SERVICE_PORT }}
+          SORAHOST_CONNECTOR_NAME: ${{ secrets.SORAHOST_CONNECTOR_NAME || vars.SORAHOST_CONNECTOR_NAME }}
+          SORAHOST_ACCESS_EMAIL: ${{ secrets.SORAHOST_ACCESS_EMAIL || vars.SORAHOST_ACCESS_EMAIL }}
+          SORAHOST_ACCESS_DOMAIN: ${{ secrets.SORAHOST_ACCESS_DOMAIN || vars.SORAHOST_ACCESS_DOMAIN }}
+          SORAHOST_ACCESS_SESSION: ${{ secrets.SORAHOST_ACCESS_SESSION || vars.SORAHOST_ACCESS_SESSION }}
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${SORAHOST_PUBLIC_HOSTNAME:-}" ]; then
+            echo "::notice::CLOUDFLARE_API_TOKEN / SORAHOST_PUBLIC_HOSTNAME が未設定のためコネクタは触りません"
+            exit 0
+          fi
+          python3 sorahost/ci/provision_connector.py
+
+      - name: Deploy
+        if: steps.credentials.outputs.configured == 'true'
+        env:
+          SORAHOST_ENDPOINT: ${{ secrets.SORAHOST_ENDPOINT }}
+          SORAHOST_TOKEN: ${{ secrets.SORAHOST_TOKEN }}
+        run: |
+          set -o pipefail
+          cd deploy
+          npx --yes sorahost-cli deploy --yes --json \
+            ${{ inputs.dry_run && '--dry-run' || '' }} | tee ../deploy-result.json
+
+      # 配備結果の url (無ければ SORAHOST_SMOKE_URL) を叩く。直の IP:ポート宛は
+      # narou の Host 許可リストで 400 になるので、それも「立っている」扱いにする
+      # (basic 認証の 401/403 と同じ考え方。応答があればアプリは起きている)。
+      - name: Smoke check
+        if: >-
+          steps.credentials.outputs.configured == 'true'
+          && !inputs.dry_run
+        env:
+          SORAHOST_SMOKE_URL: ${{ secrets.SORAHOST_SMOKE_URL || vars.SORAHOST_SMOKE_URL }}
+        run: |
+          set -u
+          url="$(python3 -c 'import json; print(json.load(open("deploy-result.json")).get("url") or "")')"
+          url="${SORAHOST_SMOKE_URL:-$url}"
+          if [ -z "$url" ]; then
+            echo "::notice::確認先が分かりませんでした (SORAHOST_SMOKE_URL を設定すると確認できます)"
+            exit 0
+          fi
+          echo "確認先: $url"
+          for attempt in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$url" || true)
+            echo "attempt ${attempt}: HTTP ${code:-none}"
+              2*|400|401|403) echo "応答を確認しました"; exit 0 ;;
+            esac
+            sleep 10
+          done
+          echo "::warning::$url から期待した応答がありません"
+          # 何が返っているか分かるように、最後にヘッダと本文の先頭を出す
+          # (プラットフォームの 404 か、アプリが落ちているのかを切り分ける)。
+          curl -sS -D - --max-time 30 "$url" 2>&1 | head -20 || true

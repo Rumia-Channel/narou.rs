@@ -488,8 +488,10 @@ function createRow(novel, rowIndex) {
   // Status
   const statusText = getStatusText(novel);
 
-  // TOC URL link button
-  const tocUrl = novel.toc_url || '';
+  // TOC URL link button. `display_url` is the page the novel was registered
+  // from; `toc_url` can be an API endpoint (Pixiv), which is not something to
+  // open in a browser.
+  const tocUrl = novel.display_url || novel.toc_url || '';
   const tocLink = tocUrl
     ? `<a href="${esc(tocUrl)}" target="_blank" rel="noopener" class="btn-link-icon" title="${esc(tocUrl)}">${materialIcon('link', 'icon-only')}</a>`
     : '';
@@ -1032,9 +1034,7 @@ export function renderQueueDetailed() {
             const swapIdx = idx + direction;
             if (swapIdx >= 0 && swapIdx < ids.length) {
               [ids[idx], ids[swapIdx]] = [ids[swapIdx], ids[idx]];
-              await postJson('/api/reorder_pending_tasks', { task_ids: ids });
-              const { refreshQueueDetailed } = await import('./actions.js');
-              await refreshQueueDetailed();
+              await reorderPendingTaskIds(ids);
             }
           });
         });
@@ -1128,9 +1128,19 @@ async function reorderQueuedTask(sourceId, targetId, before) {
   } else {
     ids.push(sourceId);
   }
-  await postJson('/api/reorder_pending_tasks', { task_ids: ids });
-  const { refreshQueueDetailed } = await import('./actions.js');
-  await refreshQueueDetailed();
+  await reorderPendingTaskIds(ids);
+}
+
+async function reorderPendingTaskIds(ids) {
+  const errorMessage = 'キューの並べ替えに失敗しました';
+  try {
+    const result = await postJson('/api/reorder_pending_tasks', { task_ids: ids });
+    assertQueueActionSuccess(result, errorMessage);
+    const { refreshQueueDetailed } = await import('./actions.js');
+    await refreshQueueDetailed();
+  } catch (error) {
+    showNotification(error.message || errorMessage, 'error');
+  }
 }
 
 /* ===== Notifications ===== */

@@ -153,11 +153,27 @@ pub enum SettingsEffect {
     /// The auto-update schedule (`update.auto-schedule.enable` /
     /// `update.auto-schedule`) changed.
     AutoScheduleChanged,
-    /// A live webui config value (`webui.*`) changed.
+    /// A live webui config value (`webui.*` or `concurrency`) changed.
     WebuiConfigChanged,
+    /// A `server-*` security setting (`server-basic-auth.*` /
+    /// `server-add-accepted-hosts` / `server-ws-add-accepted-domains` /
+    /// `server-reverse-proxy.enable`) changed.
+    ServerSecurityChanged,
     /// The `device` setting changed; device-related defaults were applied.
     DeviceRelatedDefaultsApplied,
 }
+
+/// Names whose values `GET /api/webui/config` serves live; a change to any of
+/// them is reported as [`SettingsEffect::WebuiConfigChanged`]. Also used by the
+/// native server-settings watcher to notice external edits.
+pub const LIVE_WEBUI_CONFIG_NAMES: &[&str] = &[
+    "webui.theme",
+    "webui.table.reload-timing",
+    "webui.performance-mode",
+    "webui.new-tag-color",
+    "webui.debug-mode",
+    "concurrency",
+];
 
 /// One setting value with its metadata, for listing.
 #[derive(Debug, Clone)]
@@ -497,6 +513,7 @@ impl SettingsService {
     ) -> Result<Vec<SettingsEffect>, ApplicationError> {
         let auto_schedule_before = auto_schedule_snapshot(settings);
         let webui_before = webui_config_snapshot(settings);
+        let server_security_before = server_security_snapshot(settings);
         let device_before = settings.get("device").cloned();
 
         for (name, value) in changes {
@@ -521,17 +538,52 @@ impl SettingsService {
                 effects.push(SettingsEffect::DeviceRelatedDefaultsApplied);
             }
         }
+        if scope == SettingScope::Global
+            && server_security_before != server_security_snapshot(settings)
+        {
+            effects.push(SettingsEffect::ServerSecurityChanged);
+        }
         Ok(effects)
     }
+}
+
+/// `server-*` values that `narou_rs::web::server_security` derives runtime
+/// behaviour from. Changing any of them re-applies the security snapshot
+/// without a restart.
+fn server_security_snapshot(
+    settings: &HashMap<String, serde_yaml::Value>,
+) -> Vec<(String, serde_yaml::Value)> {
+    const SERVER_SECURITY_NAMES: &[&str] = &[
+        "server-basic-auth.enable",
+        "server-basic-auth.user",
+        "server-basic-auth.password",
+        "server-add-accepted-hosts",
+        "server-ws-add-accepted-domains",
+        "server-reverse-proxy.enable",
+    ];
+    SERVER_SECURITY_NAMES
+        .iter()
+        .filter_map(|name| {
+            settings
+                .get(*name)
+                .cloned()
+                .map(|value| (name.to_string(), value))
+        })
+        .collect()
 }
 
 /// Snapshot of the auto-update schedule settings.
 fn auto_schedule_snapshot(
     settings: &HashMap<String, serde_yaml::Value>,
-) -> (Option<serde_yaml::Value>, Option<serde_yaml::Value>) {
+) -> (
+    Option<serde_yaml::Value>,
+    Option<serde_yaml::Value>,
+    Option<serde_yaml::Value>,
+) {
     (
         settings.get("update.auto-schedule.enable").cloned(),
         settings.get("update.auto-schedule").cloned(),
+        settings.get("update.auto-schedule.timezone").cloned(),
     )
 }
 
@@ -539,13 +591,6 @@ fn auto_schedule_snapshot(
 fn webui_config_snapshot(
     settings: &HashMap<String, serde_yaml::Value>,
 ) -> Vec<(String, serde_yaml::Value)> {
-    const LIVE_WEBUI_CONFIG_NAMES: &[&str] = &[
-        "webui.theme",
-        "webui.table.reload-timing",
-        "webui.performance-mode",
-        "webui.new-tag-color",
-        "webui.debug-mode",
-    ];
     LIVE_WEBUI_CONFIG_NAMES
         .iter()
         .filter_map(|name| {
@@ -629,6 +674,24 @@ mod tests {
         .unwrap();
         assert!(effects.contains(&SettingsEffect::WebuiConfigChanged));
     }
+    #[test]
+    fn server_security_change_reports_effect() {
+        let (service, _) = service();
+        let effects = futures::executor::block_on(service.set(
+            "server-basic-auth.enable",
+            &serde_json::json!(true),
+        ))
+        .unwrap();
+        assert!(effects.contains(&SettingsEffect::ServerSecurityChanged));
+        // 無関係な global 設定では発火しない。
+        let effects = futures::executor::block_on(service.set(
+            "server-port",
+            &serde_json::json!(33000),
+        ))
+        .unwrap();
+        assert!(!effects.contains(&SettingsEffect::ServerSecurityChanged));
+    }
+
 
     #[test]
     fn device_change_applies_related_defaults() {

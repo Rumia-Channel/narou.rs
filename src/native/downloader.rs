@@ -7,10 +7,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::downloader::Downloader;
-use crate::platform::{
-    AssetStore, CookieStore, HttpClient, NovelRepository, ObjectStore, RateLimiter, SystemClock,
-};
+use crate::downloader::{Downloader, DownloaderPlatform};
+use crate::platform::{CookieStore, HttpClient, NovelRepository, RateLimiter, SystemClock};
 
 /// Login cookies for the library the current directory belongs to.
 ///
@@ -32,21 +30,22 @@ impl Downloader {
         rate_limiter: Arc<dyn RateLimiter>,
         novels: Arc<dyn NovelRepository>,
     ) -> crate::error::Result<Self> {
-        let store = crate::native::object_store::NativeStore::for_current_root().or_else(|_| {
-            crate::native::object_store::NativeStore::for_narou_root(&PathBuf::from("."))
-        })?;
-        let store = Arc::new(store);
-        let objects: Arc<dyn ObjectStore> = store.clone();
-        let assets: Arc<dyn AssetStore> = store;
+        // 挿絵の保存先 (ローカル / S3) を含めて解決する。
+        let stores =
+            crate::native::object_store::NativeStores::for_current_root().or_else(|_| {
+                crate::native::object_store::NativeStores::for_narou_root(&PathBuf::from("."))
+            })?;
+        let objects = stores.objects;
+        let assets = stores.assets;
         let cookies = cookie_store();
-        let downloader = Self::with_platform_and_storage(
+        let downloader = Self::with_platform_and_storage(DownloaderPlatform {
             http,
             rate_limiter,
             novels,
             objects,
             assets,
-            Arc::new(SystemClock),
-        )?;
+            clock: Arc::new(SystemClock),
+        })?;
         Ok(match cookies {
             Some(cookies) => downloader.with_cookie_store(cookies),
             None => downloader,
@@ -66,17 +65,17 @@ impl Downloader {
         };
         let rate_limiter = Arc::new(crate::downloader::rate_limit::RateLimiter::new(false));
         let novels = Arc::new(crate::native::novel_repository::NativeNovelRepository::new());
-        let store = Arc::new(crate::native::object_store::NativeStore::for_current_root()?);
-        let objects: Arc<dyn ObjectStore> = store.clone();
-        let assets: Arc<dyn AssetStore> = store;
-        let downloader = Self::with_platform_and_storage(
+        let stores = crate::native::object_store::NativeStores::for_current_root()?;
+        let objects = stores.objects;
+        let assets = stores.assets;
+        let downloader = Self::with_platform_and_storage(DownloaderPlatform {
             http,
             rate_limiter,
             novels,
             objects,
             assets,
-            Arc::new(SystemClock),
-        )?;
+            clock: Arc::new(SystemClock),
+        })?;
         Ok(match cookies {
             Some(cookies) => downloader.with_cookie_store(cookies),
             None => downloader,

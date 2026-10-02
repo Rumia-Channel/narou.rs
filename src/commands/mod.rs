@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 
 use narou_rs::compat::yaml_value_to_string;
-use narou_rs::downloader::site_setting::SiteSetting;
-use narou_rs::downloader::{Downloader, TargetType};
 use narou_rs::db::inventory::{Inventory, InventoryScope};
+use narou_rs::downloader::{Downloader, TargetType};
 use narou_rs::queue::{JobType, PersistentQueue};
 
 pub mod alias;
@@ -11,7 +10,9 @@ pub mod backup;
 pub mod browser;
 pub mod clean;
 pub mod convert;
+pub mod author;
 pub mod csv;
+pub mod db;
 pub mod diff;
 pub mod download;
 pub mod folder;
@@ -23,7 +24,6 @@ pub mod log;
 pub mod login;
 pub mod mail;
 pub mod manage;
-pub mod db;
 pub mod send;
 pub mod setting;
 pub mod trace;
@@ -32,14 +32,15 @@ pub mod version;
 pub mod web;
 
 fn resolve_alias_target(target: &str) -> String {
-    narou_rs::db::with_database(|db| {
-        let aliases: HashMap<String, serde_yaml::Value> =
+    let aliases = narou_rs::db::with_database(|db| {
+        let values: HashMap<String, serde_yaml::Value> =
             db.inventory().load("alias", InventoryScope::Local)?;
-        Ok(aliases.get(target).and_then(yaml_value_to_string))
+        Ok(narou_rs::application::aliases::alias_map_from_values(
+            values,
+        ))
     })
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| target.to_string())
+    .unwrap_or_default();
+    narou_rs::application::aliases::resolve_alias_target(&aliases, target)
 }
 
 fn resolve_target_to_id(target: &str) -> Option<i64> {
@@ -54,7 +55,7 @@ fn resolve_target_to_id(target: &str) -> Option<i64> {
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
     match Downloader::get_target_type(&target) {
         TargetType::Url => {
-            let site_settings = SiteSetting::load_all().ok()?;
+            let site_settings = narou_rs::downloader::site_setting::effective_site_settings();
             let setting = site_settings.iter().find(|s| s.matches_url(&target))?;
             let toc_url = setting
                 .toc_url_with_url_captures(&target)
@@ -148,7 +149,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
-        std::fs::write(temp.path().join(".narou").join("latest_convert.yaml"), "id: 0\n").unwrap();
+        std::fs::write(
+            temp.path().join(".narou").join("latest_convert.yaml"),
+            "id: 0\n",
+        )
+        .unwrap();
 
         assert_eq!(latest_convert_target().as_deref(), Some("0"));
     }
@@ -158,7 +163,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
-        std::fs::write(temp.path().join(".narou").join("alias.yaml"), "sample: n9669bk\n").unwrap();
+        std::fs::write(
+            temp.path().join(".narou").join("alias.yaml"),
+            "sample: n9669bk\n",
+        )
+        .unwrap();
 
         db::init_database().unwrap();
         db::with_database_mut(|db| {
@@ -174,7 +183,10 @@ mod tests {
 
         assert_eq!(resolve_target_to_id("0"), Some(0));
         assert_eq!(resolve_target_to_id("n9669bk"), Some(0));
-        assert_eq!(resolve_target_to_id("https://ncode.syosetu.com/n9669bk/"), Some(0));
+        assert_eq!(
+            resolve_target_to_id("https://ncode.syosetu.com/n9669bk/"),
+            Some(0)
+        );
         assert_eq!(resolve_target_to_id("sample"), Some(0));
     }
 }

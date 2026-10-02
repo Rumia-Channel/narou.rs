@@ -43,13 +43,9 @@ pub struct IllustrationStore {
 /// storage services.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
+#[derive(Default)]
 pub struct IllustrationIndex(IllustrationStore);
 
-impl Default for IllustrationIndex {
-    fn default() -> Self {
-        Self(IllustrationStore::default())
-    }
-}
 
 impl IllustrationIndex {
     pub fn filename_for_source(&self, source: &str) -> Option<&str> {
@@ -119,11 +115,20 @@ pub struct StoredIllustration {
 #[derive(Clone)]
 pub struct IllustrationStorageService {
     assets: Arc<dyn AssetStore>,
+    /// SQLite+S3 モード: 新規挿絵のファイル名を `<sha256-hex>.<ext>` に揃え、
+    /// S3 側の `illustrations/<base64url>` プールへ寄せられる形にする。
+    dedup: bool,
 }
 
 impl IllustrationStorageService {
     pub fn new(assets: Arc<dyn AssetStore>) -> Self {
-        Self { assets }
+        Self { assets, dedup: false }
+    }
+
+    /// 新規ファイル名を内容ハッシュに揃えて S3 dedup プールと整合させる。
+    pub fn with_dedup(mut self, dedup: bool) -> Self {
+        self.dedup = dedup;
+        self
     }
 
     pub async fn store_bytes(
@@ -137,7 +142,6 @@ impl IllustrationStorageService {
         self.store_bytes_at(keys.prefix(), index, source, bytes, ext)
             .await
     }
-
     pub async fn store_bytes_at(
         &self,
         prefix: &ObjectKey,
@@ -155,7 +159,16 @@ impl IllustrationStorageService {
             .or_else(|| index.filename_for_source(source))
             .or_else(|| index.filename_for_hash(&hash))
             .map(str::to_string)
-            .unwrap_or_else(|| format!("{}.{}", id.as_deref().unwrap_or(&hash), normalized_ext));
+            .unwrap_or_else(|| {
+                // dedup では新規名を内容ハッシュに揃えて S3 pool へ出せる
+                // 形にする。従来は mitemin の iNNN 名を優先していた。
+                let basename = if self.dedup {
+                    hash.as_str()
+                } else {
+                    id.as_deref().unwrap_or(&hash)
+                };
+                format!("{basename}.{normalized_ext}")
+            });
         let key = prefix.join("挿絵")?.join(filename.as_str())?;
         let known_mapping = id
             .as_deref()
@@ -897,7 +910,7 @@ pub fn rebuild_illustration_cache(archive_path: &Path) -> Result<usize> {
         let hash = hash_bytes(&bytes);
         if let Some(existing) = hashes.get(&hash) {
             // Same content under a different name: keep the first, drop duplicates later via orphan.
-            if existing != &filename {
+            if existing != filename {
                 // Skip recording duplicate; orphan detection will surface it.
             }
             continue;
@@ -1192,15 +1205,27 @@ pub fn legacy_basename_from_source(source: &str) -> Option<String> {
     let normalized = normalize_illustration_url(source);
     let parsed = url::Url::parse(&normalized).ok()?;
     let segment = parsed
-        .path_segments()?
-        .filter(|part| !part.is_empty())
-        .next_back()?;
+        .path_segments()?.rfind(|part| !part.is_empty())?;
     let stem = segment
         .rsplit_once('.')
         .map(|(stem, _)| stem)
         .unwrap_or(segment);
     let sanitized = crate::downloader::util::sanitize_filename(stem);
     (!sanitized.is_empty()).then_some(sanitized)
+}
+
+/// SQLite+S3 モードで挿絵の重複除去プールを使うか。
+///
+/// native のみ有効。Worker (D1) は `storage-backend` マーカー外なので常に
+/// 偽を返し、従来どおり小説ごとの `挿絵/` 名を維持する。
+#[cfg(feature = "native-runtime")]
+pub fn dedup_active() -> bool {
+    crate::native::sqlite::state::illustration_dedup_enabled()
+}
+
+#[cfg(not(feature = "native-runtime"))]
+pub fn dedup_active() -> bool {
+    false
 }
 
 #[cfg(feature = "native-runtime")]
@@ -1538,7 +1563,7 @@ mod tests {
 
     fn png_bytes(seed: u8) -> Vec<u8> {
         let mut bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        bytes.extend(std::iter::repeat(seed).take(32));
+        bytes.extend(std::iter::repeat_n(seed, 32));
         bytes
     }
 

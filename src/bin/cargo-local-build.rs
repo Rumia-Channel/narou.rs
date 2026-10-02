@@ -241,13 +241,12 @@ fn resolve_commit_version(root: &Path) -> String {
         .args(["describe", "--always"])
         .current_dir(root)
         .output();
-    if let Ok(output) = output {
-        if output.status.success() {
+    if let Ok(output) = output
+        && output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !text.is_empty() {
                 return text;
             }
         }
-    }
     env!("CARGO_PKG_VERSION").to_string()
 }

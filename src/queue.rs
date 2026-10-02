@@ -12,7 +12,6 @@ use crate::error::{NarouError, Result};
 
 const MAX_PENDING_JOBS: usize = 10_000;
 const MAX_JOB_TARGET_CHARS: usize = 16 * 1024;
-const DEFAULT_MAX_RETRIES: u32 = 3;
 pub const WEBUI_MESSAGE_TYPE_META_KEY: &str = "webui_message_type";
 pub const WEBUI_MESSAGE_TEXT_META_KEY: &str = "webui_message_text";
 pub const WEBUI_UPDATE_START_MESSAGE_TYPE: &str = "update_start";
@@ -293,7 +292,7 @@ impl PersistentQueue {
             .iter()
             .any(|job| {
                 job.job.job_type.lane() == lane
-                    && job.job.available_at.map_or(true, |at| at <= now)
+                    && job.job.available_at.is_none_or(|at| at <= now)
             })
     }
 
@@ -393,7 +392,7 @@ impl PersistentQueue {
             let index = state
                 .active_pending
                 .iter()
-                .position(|job| job.job.available_at.map_or(true, |at| at <= now))?;
+                .position(|job| job.job.available_at.is_none_or(|at| at <= now))?;
             let mut stored = state.active_pending.remove(index)?;
             stored.mark_running();
             let job = stored.job.clone();
@@ -425,7 +424,7 @@ impl PersistentQueue {
                 .position(|job| {
                     job.job.job_type.lane() == lane
                         && !is_blocked(&job.job)
-                        && job.job.available_at.map_or(true, |at| at <= now)
+                        && job.job.available_at.is_none_or(|at| at <= now)
                 })?;
             let mut stored = state.active_pending.remove(index)?;
             stored.mark_running();
@@ -1198,20 +1197,9 @@ fn build_stored_job(
 }
 
 fn configured_max_retries() -> u32 {
-    crate::compat::load_local_setting_value("queue.max-retries")
-        .and_then(parse_max_retries_value)
-        .unwrap_or(DEFAULT_MAX_RETRIES)
-}
-
-fn parse_max_retries_value(value: Value) -> Option<u32> {
-    let parsed = match value {
-        Value::Number(number) => number
-            .as_i64()
-            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
-        Value::String(raw) => raw.trim().parse::<i64>().ok(),
-        _ => None,
-    }?;
-    Some(parsed.clamp(0, u32::MAX as i64) as u32)
+    crate::application::retry_policy::max_retries(
+        crate::compat::load_local_setting_value("queue.max-retries").as_ref(),
+    )
 }
 
 fn build_legacy_task(
@@ -1270,7 +1258,7 @@ fn queue_job_to_legacy_parts(job_type: JobType, target: &str) -> (String, Vec<Va
     let parts = split_job_target(target);
     let (cmd, args) = match job_type {
         JobType::Download => {
-            if parts.first() == Some(&"--force") && !parts.iter().any(|part| *part == "--mail") {
+            if parts.first() == Some(&"--force") && !parts.contains(&"--mail") {
                 (
                     "download_force".to_string(),
                     parts[1..]
@@ -1341,10 +1329,10 @@ fn split_job_target(target: &str) -> Vec<&str> {
 /// or tag prefixes. An empty result means the job is not tied to any
 /// specific novel ID (e.g. `AutoUpdate` jobs that broadcast to the queue).
 pub fn extract_novel_ids(target: &str) -> HashSet<i64> {
-    target
-        .split('\t')
-        .filter_map(|part| part.parse::<i64>().ok())
-        .collect()
+    // Shared implementation lives with the job contract
+    // (`crate::application::jobs::extract_novel_ids`) so the Worker ledger
+    // applies the identical per-novel exclusion rule.
+    crate::application::jobs::extract_novel_ids(target)
 }
 
 fn flatten_values(values: &[Value]) -> Vec<String> {
@@ -1777,7 +1765,7 @@ mod tests {
         assert_eq!(spec.cmd, "update_by_tag");
         assert_eq!(spec.args, vec!["tag:modified".to_string()]);
         assert_eq!(
-            spec.meta.get(&Value::String("source".to_string())),
+            spec.meta.get(Value::String("source".to_string())),
             Some(&Value::String("web".to_string()))
         );
     }

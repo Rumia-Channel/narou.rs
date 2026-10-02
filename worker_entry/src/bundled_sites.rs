@@ -5,6 +5,9 @@
 //! compiles the shared regex / preprocess DSL at composition time. There is
 //! no filesystem access at runtime.
 
+use narou_rs::application::site_definitions::{
+    ObjectStoreSiteDefinitions, SiteDefinitionStore, SiteDefinitions,
+};
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::Result;
 
@@ -29,5 +32,83 @@ pub fn load_bundled_site_settings() -> Result<Vec<SiteSetting>> {
     match &*SITE_SETTINGS {
         Ok(settings) => Ok(settings.clone()),
         Err(message) => Err(narou_rs::error::NarouError::SiteSetting(message.clone())),
+    }
+}
+
+/// bundle を `(ファイル名, YAML)` の並びで返す（core の `SiteDefinitions` に渡す形）。
+pub fn bundled_definitions() -> Vec<(String, String)> {
+    BUNDLED_SITE_YAML
+        .iter()
+        .map(|(name, yaml)| ((*name).to_string(), (*yaml).to_string()))
+        .collect()
+}
+
+/// サイト定義の管理サービス（bundle + オブジェクトストア）。
+///
+/// 保存も差し替えも core の [`SiteDefinitions`] 越しに行うので、native の
+/// `/api/sites*` と同じ規則・同じ応答形になる。
+pub fn site_definitions(
+    objects: std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
+) -> SiteDefinitions {
+    SiteDefinitions::new(
+        bundled_definitions(),
+        std::sync::Arc::new(ObjectStoreSiteDefinitions::new(objects)),
+    )
+}
+
+/// Downloader に渡す実効定義を組み立てる。
+///
+/// ユーザー定義が無ければ bundle のキャッシュ済み結果をそのまま返す
+/// （isolate ごとに 1 回の parse + compile で済む）。1 件でもあれば
+/// [`SiteDefinitions::effective_runtime`]（native の `SiteSetting::load_all()`
+/// と同じ version gate）でマージして読み直し、結果を **L1 に TTL 付きで**
+/// 載せる（リクエストごとに D1 を読まない）。
+pub async fn load_site_settings(
+    objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
+) -> Result<Vec<SiteSetting>> {
+    // L1 を最優先で見る。ここで当たればオブジェクトストアの LIST も投げない
+    // (以前は LIST → 空なら同梱定義を毎回パース、という順で全リクエストが
+    //  D1 往復 + YAML parse + compile を払っていた)。
+    if let Some(cached) = cached_site_settings() {
+        return Ok(cached);
+    }
+    let store = ObjectStoreSiteDefinitions::new(objects.clone());
+    let settings = if store.list().await?.is_empty() {
+        load_bundled_site_settings()?
+    } else {
+        let effective = site_definitions(objects.clone()).effective_runtime().await?;
+        let contents: Vec<&str> = effective.iter().map(|(_, yaml)| yaml.as_str()).collect();
+        SiteSetting::load_bundled(&contents)?
+    };
+    store_site_settings(&settings);
+    Ok(settings)
+}
+
+/// L1 キャッシュの寿命。書き込みは同じ isolate なら即時、他の isolate は
+/// この時間で追従する (サイト定義は頻繁に変わらないので十分)。
+const SITE_SETTINGS_TTL_MS: f64 = 30_000.0;
+
+/// L1 キャッシュの中身: `(書き込み時刻 (ms), コンパイル済み定義)`。
+type SiteSettingsCache = Option<(f64, Vec<SiteSetting>)>;
+
+static SITE_SETTINGS_CACHE: std::sync::LazyLock<std::sync::Mutex<SiteSettingsCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+fn cached_site_settings() -> Option<Vec<SiteSetting>> {
+    let cache = SITE_SETTINGS_CACHE.lock().ok()?;
+    let (stored_at, settings) = cache.as_ref()?;
+    (js_sys::Date::now() - stored_at < SITE_SETTINGS_TTL_MS).then(|| settings.clone())
+}
+
+fn store_site_settings(settings: &[SiteSetting]) {
+    if let Ok(mut cache) = SITE_SETTINGS_CACHE.lock() {
+        *cache = Some((js_sys::Date::now(), settings.to_vec()));
+    }
+}
+
+/// サイト定義を書き換えた直後に呼ぶ (同じ isolate のキャッシュを落とす)。
+pub fn invalidate_site_settings() {
+    if let Ok(mut cache) = SITE_SETTINGS_CACHE.lock() {
+        *cache = None;
     }
 }

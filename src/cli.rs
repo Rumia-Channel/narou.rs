@@ -71,7 +71,7 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
                 i += 1;
             }
         } else if arg.starts_with("--user-agent=") {
-            flags.user_agent = Some(arg["--user-agent=".len()..].to_string());
+            flags.user_agent = arg.strip_prefix("--user-agent=").map(|v| v.to_string());
             args.remove(i);
         } else if arg == "-h" || arg == "--help" {
             if i > 0 {
@@ -97,6 +97,16 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
 
     if args.is_empty() {
         args.push("help".to_string());
+    }
+
+    // narou.rb `take_command_name`: .narou が無いディレクトリでは
+    // help/version/init 以外のコマンド名を help に置き換え、トップレベルの
+    // help を表示して正常終了する。
+    if !narou_rs::db::narou_root_exists()
+        && let Some(name) = args.first()
+        && !matches!(name.as_str(), "help" | "version" | "init")
+    {
+        args[0] = "help".to_string();
     }
 
     let args_before_double_dash = args_before_double_dash(args);
@@ -126,7 +136,7 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
     flags
 }
 
-fn resolve_command_shortcut(args: &mut Vec<String>, cmd_index: usize) {
+fn resolve_command_shortcut(args: &mut [String], cmd_index: usize) {
     let shortcuts = build_shortcuts();
     if let Some(resolved) = shortcuts.get(&args[cmd_index].to_lowercase()) {
         args[cmd_index] = resolved.to_string();
@@ -141,12 +151,18 @@ fn apply_multiple(args: &mut Vec<String>) {
     };
     let rest: Vec<String> = args.drain((cmd_index + 1)..).collect();
     for arg in &rest {
-        for part in arg.split(&delimiter) {
-            let trimmed = part.trim();
-            if !trimmed.is_empty() {
-                args.push(trimmed.to_string());
-            }
+        // Ruby の String#split(delimiter) と同じく前後空白と空要素を保持する。
+        // ただし末尾の空文字だけは Ruby 側で抑制されるため捨てる。
+        // 区切り文字が空文字列のときは文字単位に分割される (Ruby 準拠)。
+        if delimiter.is_empty() {
+            args.extend(arg.chars().map(|ch| ch.to_string()));
+            continue;
         }
+        let mut parts: Vec<&str> = arg.split(delimiter.as_str()).collect();
+        while parts.last().is_some_and(|part| part.is_empty()) {
+            parts.pop();
+        }
+        args.extend(parts.iter().map(|part| part.to_string()));
     }
 }
 
@@ -172,11 +188,8 @@ fn load_multiple_delimiter() -> String {
 }
 
 fn load_global_no_color() -> bool {
-    narou_rs::db::settings::bool_value(
-        narou_rs::setting_core::SettingScope::Global,
-        "no-color",
-    )
-    .unwrap_or(false)
+    narou_rs::db::settings::bool_value(narou_rs::setting_core::SettingScope::Global, "no-color")
+        .unwrap_or(false)
 }
 
 fn args_before_double_dash(args: &[String]) -> &[String] {
@@ -186,23 +199,15 @@ fn args_before_double_dash(args: &[String]) -> &[String] {
     }
 }
 
-fn has_explicit_positional_args(args: &[String]) -> bool {
-    let rest = args.get(1..).unwrap_or(&[]);
-    match rest.iter().position(|arg| arg == "--") {
-        Some(index) => rest.get(index + 1).is_some(),
-        None => rest.iter().any(|arg| !arg.starts_with('-')),
-    }
-}
-
 pub fn inject_default_args(args: &mut Vec<String>) {
-    if args.len() < 2 {
+    // narou.rb `proc_default_arguments` は「コマンド名以外の argv が完全に空」
+    // のときだけ default_args.<command> を適用する。オプションだけでも argv が
+    // 残っていれば適用しない。
+    if args.len() != 1 {
         return;
     }
     let cmd_name = &args[0];
     if cmd_name.starts_with('-') {
-        return;
-    }
-    if has_explicit_positional_args(args) {
         return;
     }
     if !is_terminal_stdin() {
@@ -259,11 +264,11 @@ fn load_local_setting_raw_value(key: &str) -> Option<serde_yaml::Value> {
 fn inject_log_defaults(args: &mut Vec<String>) {
     let mut defaults = Vec::new();
 
-    if !has_option(args, "-n", "--num") {
-        if let Some(value) = load_local_setting_value("log.num") {
-            defaults.push("--num".to_string());
-            defaults.push(value);
-        }
+    if !has_option(args, "-n", "--num")
+        && let Some(value) = load_local_setting_value("log.num")
+    {
+        defaults.push("--num".to_string());
+        defaults.push(value);
     }
     if !has_option(args, "-t", "--tail") && load_local_setting_bool("log.tail").unwrap_or(false) {
         defaults.push("--tail".to_string());
@@ -394,13 +399,62 @@ mod tests {
         }
     }
 
+    /// `.narou` を持つ一時ディレクトリに cwd を移してから `f` を実行する。
+    /// preprocess_args は narou.rb の `Narou.already_init?` 相当として .narou の
+    /// 有無を見るため、通常のコマンド解釈のテストには初期化済みディレクトリが
+    /// 必要になる。
+    fn with_initialized_dir(f: impl FnOnce()) {
+        let root = std::env::temp_dir().join(format!(
+            "narou-rs-cli-init-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join(".narou")).unwrap();
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&root);
+            f();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn shortcut_resolves_through_global_flags() {
         // グローバルフラグが先頭にあってもコマンド位置の短縮を解決する。
-        let mut args = vec!["--no-color".to_string(), "d".to_string(), "0".to_string()];
-        let flags = preprocess_args(&mut args);
-        assert!(flags.no_color);
-        assert_eq!(args, vec!["download".to_string(), "0".to_string()]);
+        with_initialized_dir(|| {
+            let mut args = vec!["--no-color".to_string(), "d".to_string(), "0".to_string()];
+            let flags = preprocess_args(&mut args);
+            assert!(flags.no_color);
+            assert_eq!(args, vec!["download".to_string(), "0".to_string()]);
+        });
+    }
+
+    #[test]
+    fn uninitialized_dir_replaces_command_with_help() {
+        // narou.rb take_command_name: .narou が無いディレクトリでは
+        // help/version/init 以外のコマンド名を help に置き換える。
+        let root = std::env::temp_dir().join(format!(
+            "narou-rs-cli-uninit-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let _guard = crate::test_support::set_current_dir_for_test(&root);
+            let mut args = vec!["l".to_string(), "0".to_string()];
+            let _flags = preprocess_args(&mut args);
+            assert_eq!(args, vec!["help".to_string(), "0".to_string()]);
+
+            for allowed in ["help", "version", "init"] {
+                let mut args = vec![allowed.to_string()];
+                let _flags = preprocess_args(&mut args);
+                assert_eq!(args[0], allowed);
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -652,15 +706,17 @@ mod tests {
 
     #[test]
     fn download_targets_after_double_dash_are_not_treated_as_help() {
-        let mut args = vec!["download".to_string(), "--".to_string(), "-h".to_string()];
-        let _flags = preprocess_args(&mut args);
-        assert_eq!(args, vec!["download", "--", "-h"]);
+        with_initialized_dir(|| {
+            let mut args = vec!["download".to_string(), "--".to_string(), "-h".to_string()];
+            let _flags = preprocess_args(&mut args);
+            assert_eq!(args, vec!["download", "--", "-h"]);
 
-        let cli = Cli::try_parse_from(["narou", "download", "--", "-h"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Download { targets, .. } if targets == vec!["-h".to_string()]
-        ));
+            let cli = Cli::try_parse_from(["narou", "download", "--", "-h"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Download { targets, .. } if targets == vec!["-h".to_string()]
+            ));
+        });
     }
 }
 
@@ -913,7 +969,12 @@ pub enum Commands {
         #[arg(short = 'm', long)]
         more: bool,
     },
-    /// Login credentials shared with a browser machine (import/export).
+    /// Authors whose works are tracked (add/list/remove/check).
+    Author {
+        #[command(subcommand)]
+        action: crate::commands::author::AuthorAction,
+    },
+    /// Login credentials shared with a browser machine (list/import/export/rename/order/clear).
     Login {
         #[command(subcommand)]
         action: crate::commands::login::LoginAction,
@@ -934,4 +995,10 @@ pub enum IllustSubcommand {
     Migrate,
     FixExt,
     Rebuild,
+    /// 挿絵をローカルから S3 互換ストレージへ写す (既定 dry-run)。
+    S3Push,
+    /// ローカルと S3 の挿絵を突き合わせる。
+    S3Verify,
+    /// 旧 `挿絵/` 配置の S3 オブジェクトを dedup プールへ移し、残ったものを消す。
+    S3Dedup,
 }

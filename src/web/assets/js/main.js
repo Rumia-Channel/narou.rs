@@ -72,17 +72,21 @@ async function init() {
   // refresh of the page does not re-prompt with the same URL.
   handleBookmarkletRegisterParam();
 
-  // Load config from server
+  // Load config and sort state from server。
+  // 互いに独立なので直列に待たず、1 往復分の待ち時間で済ませる
+  // (以前は config の応答を待ってから sort_state を投げていた)。
+  const [config, sortState] = await Promise.all([
+    fetchJson('/api/webui/config').catch(() => null),
+    fetchJson('/api/sort_state').catch(() => null),
+  ]);
+
   try {
-    const config = await fetchJson('/api/webui/config');
     if (config) {
       applyWebConfig(config);
     }
   } catch { /* use defaults */ }
 
-  // Load sort state from server
   try {
-    const sortState = await fetchJson('/api/sort_state');
     if (sortState) {
       const colMap = { 0: 'id', 1: 'last_update', 2: 'general_lastup', 3: 'last_check_date',
         4: 'title', 5: 'author', 6: 'sitename', 7: 'novel_type', 9: 'general_all_no', 10: 'length' };
@@ -92,13 +96,16 @@ async function init() {
     }
   } catch { /* use defaults */ }
 
+  // 一覧の取得を待たずに投げておく (モーダル/通知の表示自体は各関数が
+  // データを受け取ってから行うので、体感の順序は変わらない)。
+  void maybeShowPendingFeatureTour();
+  void maybeOfferLibraryBackup();
+
   // Initial data load
   await Promise.all([refreshListWithUiState(), refreshQueue(), refreshQueueDetailed(), refreshTags()]);
 
   // Sync UI state (check marks, wide mode, footer)
   syncViewChecks();
-  void maybeShowPendingFeatureTour();
-  void maybeOfferLibraryBackup();
 
   // WebSocket
   connectWebSocket();
@@ -355,8 +362,15 @@ function handleWsMessage(msg) {
 async function maybeOfferLibraryBackup() {
   let status;
   try {
-    status = await fetchJson('/api/library_backup');
-  } catch {
+    status = assertLibraryBackupSuccess(
+      await fetchJson('/api/library_backup'),
+      'ライブラリのバックアップ情報を取得できませんでした'
+    );
+  } catch (error) {
+    showNotification(
+      readApiErrorMessage(error, 'ライブラリのバックアップ情報を取得できませんでした'),
+      'error'
+    );
     return;
   }
   if (!status || !status.pending) return;
@@ -383,26 +397,44 @@ async function maybeOfferLibraryBackup() {
   El.libraryBackupDismiss?.addEventListener('click', async () => {
     close();
     try {
-      await postJson('/api/library_backup', { action: 'dismiss' });
-    } catch { /* marker は次回起動時に再評価される */ }
+      const result = await postJson('/api/library_backup', { action: 'dismiss' });
+      assertLibraryBackupSuccess(result, 'バックアップの提案を閉じられませんでした');
+    } catch (error) {
+      showNotification(readApiErrorMessage(error, 'バックアップの提案を閉じられませんでした'), 'error');
+    }
   }, { once: true });
   El.libraryBackupCreate?.addEventListener('click', async () => {
     close();
     const output = El.libraryBackupOutput?.value?.trim() || '';
     try {
-      const result = await postJson('/api/library_backup', { action: 'create', output });
+      const result = assertLibraryBackupSuccess(
+        await postJson('/api/library_backup', { action: 'create', output }),
+        'バックアップの開始に失敗しました'
+      );
       if (result && result.started) {
         showNotification('ライブラリのバックアップを開始しました', 'info');
       }
     } catch (error) {
-      let message = error.message || 'バックアップの開始に失敗しました';
-      try {
-        const parsed = JSON.parse(message);
-        if (parsed && parsed.message) message = parsed.message;
-      } catch { /* raw text */ }
-      showNotification(message, 'error');
+      showNotification(readApiErrorMessage(error, 'バックアップの開始に失敗しました'), 'error');
     }
   }, { once: true });
+}
+
+function assertLibraryBackupSuccess(result, fallbackMessage) {
+  const error = result?.error;
+  if (result?.success === false || error) {
+    const message = result?.message
+      || error?.message
+      || (typeof error === 'string' ? error : '');
+    throw new Error(message || fallbackMessage);
+  }
+  return result;
+}
+
+function readApiErrorMessage(error, fallbackMessage) {
+  // `core/http.js` が応答本文のメッセージを抽出済みなので、そのまま使う。
+  const message = error?.message;
+  return typeof message === 'string' && message.trim() ? message : fallbackMessage;
 }
 
 function formatBytes(bytes) {

@@ -1,0 +1,113 @@
+# develop 環境テンプレート。
+#
+# `worker_entry/ci/render_config.py` が `__PLACEHOLDER__` を CI の環境変数で
+# 置換し、`wrangler.ci.toml` を生成する (生成物は .gitignore 済み)。
+# account 固有の値 (database_id / S3 の接続先 / secret 名) はここに書かない。
+#
+# `DEVELOP_DOMAIN` を CI 側で設定すると custom domain の route が入る (任意)。
+# route を入れると workers_dev は自動で false になる (Cloudflare Access などの
+# Zero Trust を唯一の境界にする場合、workers.dev を残すと素通りになるため)。
+# 未設定なら workers.dev の URL だけで動く。
+#
+# ローカル開発は `wrangler.toml` (プレースホルダ無し) を使う。
+
+name = "narou-rs-develop"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-08-10"
+workers_dev = __WORKERS_DEV__
+
+[limits]
+# 有料プラン前提の余裕。EPUB 生成と長い queue ジョブを 1 invocation で扱う。
+cpu_ms = 300000
+
+[vars]
+# Zero Trust (Access) を境界にする場合は CI の `NAROU_AUTH_REQUIRED=false` で
+# Bearer トークン検査を切る (NAROU_ADMIN_TOKEN も不要になる)。
+NAROU_AUTH_REQUIRED = "__NAROU_AUTH_REQUIRED__"
+S3_ENDPOINT = "__S3_ENDPOINT__"
+S3_REGION = "__S3_REGION__"
+S3_BUCKET = "__S3_BUCKET__"
+S3_PREFIX = "__S3_PREFIX__"
+
+# Web UI (src/web/assets) を `build_assets.mjs` が `public/` へ焼き込む。
+# 既定 (run_worker_first なし) では静的アセットが先に解決され、無いパスだけが
+# Worker へ落ちる。`/api/*` と `/health/*` はアセットに無いので Worker が受ける。
+[assets]
+directory = "public"
+binding = "ASSETS"
+# `/settings` のような拡張子なし URL を `settings.html` に解決する。
+html_handling = "auto-trailing-slash"
+# 見つからないパスは Worker に流す (API の 404 を Worker が返す)。
+not_found_handling = "none"
+
+# Secrets Store を使う場合、render_config.py がここに [[secrets_store_secrets]] を差し込む。
+__SECRET_STORE_BLOCKS__
+
+[build]
+command = "node build_assets.mjs && worker-build --release"
+
+# 資格情報は既定で Worker の secret (`wrangler secret` / `--secrets-file`) から読む。
+# アカウント共有の Cloudflare Secrets Store に置く場合は、次の 2 つを有効にする
+# （`store_id` は Secrets Store の ID、`secret_name` はその中の名前。
+#  binding 名は `<変数名>_STORE` にする決まりで、コード側がそれを見る）。
+#
+# 使い方は 2 通り。混ぜると同じバインディングが二重定義になるので、どちらか一方にする:
+#   1. ここに直書きする（Dantalian と同じ）。CI の `NAROU_SECRETS_STORE_ID` と
+#      `NAROU_S3_*_SECRET_NAME` は設定しない。
+#   2. CI から差し込む。このブロックはコメントのままにし、GitHub の `Cloudflare`
+#      環境に `NAROU_SECRETS_STORE_ID` と 5 つの `NAROU_S3_*_SECRET_NAME` を置く
+#      （アカウント固有の値をリポジトリに置かずに済む）。
+#
+# [[secrets_store_secrets]]
+# binding = "S3_ACCESS_KEY_ID_STORE"
+# store_id = "<store-id>"
+# secret_name = "narou-<env>-s3-access-key-id"
+#
+# [[secrets_store_secrets]]
+# binding = "S3_SECRET_ACCESS_KEY_STORE"
+# store_id = "<store-id>"
+# secret_name = "narou-<env>-s3-secret-access-key"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "__NAROU_D1_DATABASE_NAME__"
+database_id = "__NAROU_D1_DATABASE_ID__"
+migrations_dir = "migrations"
+
+# --- jobs queue ---------------------------------------------------------
+# Producer: POST /api/jobs と cron planner が version-2 envelope を送る。
+[[queues.producers]]
+binding = "NAROU_JOBS"
+queue = "__NAROU_JOB_QUEUE__"
+
+# Consumer: D1 ledger で claim し、durable terminal を書いてから ack する。
+# max_retries は ledger の attempt cap (3) 以上にする必要がある
+# (explicit な retry_with_options も max_retries に数えられるため)。
+[[queues.consumers]]
+queue = "__NAROU_JOB_QUEUE__"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "__NAROU_JOB_DLQ__"
+max_concurrency = 4
+
+# --- per-site rate limiting Durable Object -------------------------------
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "SiteRateLimiter"
+
+# Web UI のコンソール/進捗イベントを WebSocket 接続へ配信する hub (メモリのみ)。
+[[durable_objects.bindings]]
+name = "PUSH_HUB"
+class_name = "PushHub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SiteRateLimiter"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PushHub"]
+
+__CUSTOM_DOMAIN_BLOCK__
+[triggers]
+crons = ["* * * * *"]

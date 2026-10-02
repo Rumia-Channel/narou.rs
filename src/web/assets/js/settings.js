@@ -56,12 +56,18 @@
         pane.innerHTML = renderReplaceTab();
       } else if (tab.id === 'login') {
         pane.innerHTML = renderLoginTab();
-        bindLoginPane(pane);
       } else {
         pane.innerHTML = renderSettingsPanel(tab);
       }
 
       container.appendChild(pane);
+
+      // ログインタブの初期化は DOM に挿入した後に行う。loadLoginHosts は
+      // document から #login-hosts を探すため、未挿入だと null で静かに戻り、
+      // 一覧が「読み込み中…」のままになる。
+      if (tab.id === 'login') {
+        bindLoginPane(pane);
+      }
     });
   }
 
@@ -80,6 +86,7 @@
 
     if (items.length === 0) {
       html += '<div class="list-group"><div class="list-group-item"><em>この分類に該当する設定はありません</em></div></div>';
+      if (tab.id === 'webui') html += renderStorageModeBlock();
       html += '</div>';
       return html;
     }
@@ -88,78 +95,165 @@
     items.forEach(function(setting) {
       html += renderSettingItem(setting);
     });
-    html += '</div></div>';
+    html += '</div>';
+    if (tab.id === 'webui') html += renderStorageModeBlock();
+    html += '</div>';
     return html;
   }
 
+  // ─── データ管理方式 (YAML / SQLite) ──────────────────────
+  function renderStorageModeBlock() {
+    return '<div class="list-group" id="storage-mode-panel">' +
+      '<div class="list-group-item">' +
+      '<h4 class="list-group-item-heading">データ管理方式</h4>' +
+      '<div class="list-group-item-text">' +
+      '<div class="setting-help">作品データを従来の YAML ファイルで管理するか、SQLite データベースで管理するかを選びます。' +
+      'SQLite へ移行すると旧 YAML は <code>*.imported-*</code> へ退避され、戻すときは YAML を書き出してから切り替えます。' +
+      'どちらの方式でも作品データはそのまま使えます。</div>' +
+      '<div id="storage-mode-status"><em>読み込み中…</em></div>' +
+      '<div class="storage-mode-actions">' +
+      '<button type="button" class="btn btn-primary" id="storage-mode-to-sqlite">SQLite 管理へ移行</button>' +
+      '<button type="button" class="btn btn-default" id="storage-mode-to-yaml">YAML 管理へ戻す</button>' +
+      '</div>' +
+      '</div></div></div>';
+  }
+
+  async function loadStorageMode() {
+    const panel = document.getElementById('storage-mode-panel');
+    if (!panel) return;
+    const status = document.getElementById('storage-mode-status');
+    const toSqlite = document.getElementById('storage-mode-to-sqlite');
+    const toYaml = document.getElementById('storage-mode-to-yaml');
+    const bind = function(button, mode) {
+      if (!button || button.dataset.bound === '1') return;
+      button.dataset.bound = '1';
+      button.addEventListener('click', function() { switchStorageMode(mode, button); });
+    };
+    try {
+      const resp = await fetch('/api/storage/mode');
+      const data = await resp.json();
+      const sqlite = data.mode === 'sqlite';
+      const locked = Boolean(data.locked_by_env);
+      let html = '<p class="storage-mode-current">現在: <strong>' +
+        (sqlite ? 'SQLite 管理' : 'YAML 管理') + '</strong>' +
+        (locked ? '（' + escapeHtml(data.reason || 'この環境では固定されています') + '）' : '') + '</p>';
+      if (data.marker) {
+        html += '<p class="setting-help storage-mode-paths">切替ファイル: <code>' + escapeHtml(data.marker) + '</code>' +
+          (data.database ? ' / データベース: <code>' + escapeHtml(data.database) + '</code>' : '') + '</p>';
+      }
+      status.innerHTML = html;
+      if (toSqlite) toSqlite.classList.toggle('hide', sqlite || locked);
+      if (toYaml) toYaml.classList.toggle('hide', !sqlite || locked);
+      bind(toSqlite, 'sqlite');
+      bind(toYaml, 'yaml');
+    } catch (e) {
+      status.innerHTML = '<em>読み込みに失敗しました: ' + escapeHtml(e.message) + '</em>';
+    }
+  }
+
+  async function switchStorageMode(mode, button) {
+    if (button && button.disabled) return;
+    if (mode === 'sqlite' && !window.confirm('作品データの管理を SQLite へ移行します。旧 YAML は自動で退避されます。よろしいですか？')) return;
+    if (mode === 'yaml' && !window.confirm('YAML を書き出してから YAML 管理へ戻します。よろしいですか？')) return;
+    if (button) button.disabled = true;
+    try {
+      const resp = await fetch('/api/storage/mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: mode }),
+      });
+      const result = await resp.json();
+      if (!result.success) throw new Error(result.message || '切り替えに失敗しました');
+      showToast(result.message || '切り替えました', 'success');
+      setTimeout(function() { window.location.reload(); }, 1200);
+    } catch (e) {
+      showToast('切り替えに失敗しました: ' + e.message, 'error');
+      if (button) button.disabled = false;
+    }
+  }
+
   function renderSettingItem(setting) {
-    let html = '<div class="list-group-item" data-setting="' + escapeAttr(setting.name) + '">';
-    html += '<h4 class="list-group-item-heading">' + escapeHtml(setting.name) + '</h4>';
+    const ineffective = setting.worker_ineffective === true;
+    // disabled 属性に加えて行自体にも理由を title で出す (コントロールの
+    // ツールチップはブラウザによって disabled で出ないため)。
+    const reason = ineffective
+      ? (setting.worker_note || 'この設定はこの環境では効きません')
+      : '';
+    let html = '<div class="list-group-item' + (ineffective ? ' setting-worker-ineffective' : '') +
+               '" data-setting="' + escapeAttr(setting.name) + '"' +
+               (ineffective ? ' aria-disabled="true" title="' + escapeAttr(reason) + '"' : '') + '>';
+    html += '<h4 class="list-group-item-heading">' + escapeHtml(setting.name) +
+            (ineffective ? ' <small class="text-muted">(Worker では無効)</small>' : '') + '</h4>';
     html += '<div class="list-group-item-text">';
-    html += renderControl(setting);
+    html += renderControl(setting, ineffective);
 
     // Help text
     if (setting.help) {
       html += '<p class="setting-help">' + renderHelpHtml(setting.help) + '</p>';
     }
+    // Worker では経路が無い項目への注記 (API の worker_note)。
+    if (setting.worker_note) {
+      html += '<p class="setting-help">⚠ ' + escapeHtml(setting.worker_note) + '</p>';
+    }
 
     html += '</div></div>';
     return html;
   }
 
-  function renderControl(setting) {
+  function renderControl(setting, disabled) {
     const name = setting.name;
     const value = setting.value;
     const type = setting.var_type;
+    const dis = disabled ? ' disabled' : '';
 
     if (type === 'boolean') {
       if (setting.three_way) {
-        return renderThreeWay(name, value);
+        return renderThreeWay(name, value, dis);
       }
-      return renderToggle(name, value);
+      return renderToggle(name, value, dis);
     }
 
     if (type === 'select') {
-      return renderSelect(name, value, setting.select_keys || [], setting.select_summaries || []);
+      return renderSelect(name, value, setting.select_keys || [], setting.select_summaries || [], dis);
     }
 
     if (type === 'multiple') {
-      return renderMultiple(name, value, setting.select_keys || [], setting.select_summaries || []);
+      return renderMultiple(name, value, setting.select_keys || [], setting.select_summaries || [], dis);
     }
 
     // text / integer / float / string / directory
     const placeholder = getPlaceholder(type);
     const strVal = (value !== null && value !== undefined) ? String(value) : '';
     return '<input type="text" class="setting-input" data-name="' + escapeAttr(name) +
-           '" value="' + escapeAttr(strVal) + '" placeholder="' + escapeAttr(placeholder) + '">';
+           '" value="' + escapeAttr(strVal) + '" placeholder="' + escapeAttr(placeholder) + '"' + dis + '>';
   }
 
-  function renderToggle(name, value) {
+  function renderToggle(name, value, dis) {
     const checked = value === true ? ' checked' : '';
     return '<label class="switch-light">' +
-           '<input type="checkbox" data-name="' + escapeAttr(name) + '"' + checked + '>' +
+           '<input type="checkbox" data-name="' + escapeAttr(name) + '"' + checked + dis + '>' +
            '<span class="switch-track"></span>' +
            '<span class="switch-label-text">' + (value ? 'はい' : 'いいえ') + '</span>' +
            '</label>';
   }
 
-  function renderThreeWay(name, value) {
+  function renderThreeWay(name, value, dis) {
     const nilChecked = (value === null || value === undefined) ? ' checked' : '';
     const offChecked = (value === false) ? ' checked' : '';
     const onChecked = (value === true) ? ' checked' : '';
 
     return '<div class="switch-3way">' +
-           '<input type="radio" id="' + escapeAttr(name) + '-nil" name="' + escapeAttr(name) + '" value="nil"' + nilChecked + '>' +
+           '<input type="radio" id="' + escapeAttr(name) + '-nil" name="' + escapeAttr(name) + '" value="nil"' + nilChecked + dis + '>' +
            '<label for="' + escapeAttr(name) + '-nil">未設定</label>' +
-           '<input type="radio" id="' + escapeAttr(name) + '-off" name="' + escapeAttr(name) + '" value="off"' + offChecked + '>' +
+           '<input type="radio" id="' + escapeAttr(name) + '-off" name="' + escapeAttr(name) + '" value="off"' + offChecked + dis + '>' +
            '<label for="' + escapeAttr(name) + '-off">いいえ</label>' +
-           '<input type="radio" id="' + escapeAttr(name) + '-on" name="' + escapeAttr(name) + '" value="on"' + onChecked + '>' +
+           '<input type="radio" id="' + escapeAttr(name) + '-on" name="' + escapeAttr(name) + '" value="on"' + onChecked + dis + '>' +
            '<label for="' + escapeAttr(name) + '-on">はい</label>' +
            '</div>';
   }
 
-  function renderSelect(name, value, keys, summaries) {
-    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '">';
+  function renderSelect(name, value, keys, summaries, dis) {
+    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '"' + dis + '>';
     const isTheme = (name === 'webui.theme');
     const isNewTagColor = (name === 'webui.new-tag-color');
     if (!isNewTagColor) {
@@ -174,7 +268,7 @@
     return html;
   }
 
-  function renderMultiple(name, value, keys, summaries) {
+  function renderMultiple(name, value, keys, summaries, dis) {
     let selectedItems = [];
     if (Array.isArray(value)) {
       selectedItems = value;
@@ -182,7 +276,7 @@
       selectedItems = value.split(',').map(function(s) { return s.trim(); });
     }
 
-    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '" multiple>';
+    let html = '<select class="setting-select" data-name="' + escapeAttr(name) + '" multiple' + dis + '>';
     keys.forEach(function(key, index) {
       const selected = selectedItems.includes(key) ? ' selected' : '';
       const label = summaries[index] || key;
@@ -208,14 +302,13 @@
   // ─── Login tab ─────────────────────────────────────────
   // The browser half is the separate narou_rs_login executable; this pane is
   // the receiving end: it reads the export that writes (by picking the file or
-  // pasting its text, or pasting a cookie header) and stores the credentials
-  // encrypted at rest.
+  // pasting its text) and stores the credentials encrypted at rest.
   function renderLoginTab() {
     return '<div class="panel-settings">' +
       '<div class="panel-heading">ログイン情報 (Cookie) の管理</div>' +
       '<div class="list-group">' +
       '<div class="list-group-item">' +
-      '<h4 class="list-group-item-heading">保存済みのサイト</h4>' +
+      '<h4 class="list-group-item-heading">保存済みのログイン</h4>' +
       '<div id="login-hosts" class="login-hosts"><em>読み込み中…</em></div>' +
       '<div class="setting-help" id="login-list-help">上から順にログインを試行します。値はマスクして表示しています。</div>' +
       '<div style="margin-top:0.5rem">' +
@@ -230,6 +323,9 @@
       '<input type="file" class="login-envelope-file" id="login-envelope-file" accept=".yaml,.yml,.txt,.json">' +
       '<span class="login-file-name" id="login-file-name"></span>' +
       '</div>' +
+      '<div class="login-form">' +
+      '<input type="text" class="setting-input" id="login-import-name" placeholder="名前 (例: 本垢 / サブ垢。空ならファイルの名前を使います)">' +
+      '</div>' +
       '<textarea class="replace-textarea login-envelope" id="login-envelope" placeholder="version: 1&#10;encrypted: true&#10;…"></textarea>' +
       '<div class="login-form">' +
       '<input type="password" class="setting-input" id="login-passphrase" placeholder="パスフレーズ (暗号化されている場合)">' +
@@ -239,59 +335,57 @@
       '<button type="button" class="btn btn-primary" id="login-import">取り込む</button>' +
       '</div>' +
       '</div>' +
-      '<div class="list-group-item">' +
-      '<h4 class="list-group-item-heading">Cookie を直接登録する</h4>' +
-      '<div class="setting-help">ブラウザからコピーした Cookie 文字列を保存します。「追加する」はサイトの一覧の末尾に足し、「置き換える」はそのサイトの既存の情報をすべて入れ替えます。</div>' +
-      '<div class="login-form">' +
-      '<input type="text" class="setting-input" id="login-host" placeholder="サイト (例: ncode.syosetu.com)">' +
-      '<input type="text" class="setting-input" id="login-label" placeholder="ラベル (任意。例: メイン)">' +
-      '<input type="text" class="setting-input" id="login-cookie" placeholder="Cookie 文字列 (例: over18=yes; ses=…)">' +
-      '</div>' +
-      '<div style="margin-top:0.5rem">' +
-      '<button type="button" class="btn btn-primary" id="login-add">追加する</button> ' +
-      '<button type="button" class="btn btn-default" id="login-set">置き換える</button>' +
-      '</div>' +
-      '</div>' +
       '</div></div>';
   }
 
   function renderLoginSite(entry) {
-    const credentials = entry.credentials || [];
+    const logins = entry.logins || [];
     const state = entry.encrypted ? '暗号化済み' : '未暗号';
     let html = '<div class="login-site">' +
       '<div class="login-site-head">' +
-      '<span class="login-site-name">' + escapeHtml(entry.host) + '</span>' +
+      '<span class="login-site-name">' + escapeHtml(entry.site) + '</span>' +
       '<span class="login-site-state">' + state + '</span>' +
-      '<button type="button" class="btn btn-default login-remove-site" data-host="' + escapeAttr(entry.host) + '">サイトを削除</button>' +
+      '<button type="button" class="btn btn-default login-remove-site" data-site="' + escapeAttr(entry.site) + '">サイトを削除</button>' +
       '</div>';
-    html += credentials.map(function(credential, index) {
-      return renderLoginCredential(entry.host, credential, index, credentials.length);
+    html += logins.map(function(login, index) {
+      return renderLoginEntry(entry.site, login, index, logins.length);
     }).join('');
     html += '</div>';
     return html;
   }
 
-  function renderLoginCredential(host, credential, index, total) {
-    const label = credential.label || credential.host || host;
-    const names = (credential.names || []).join(', ');
+  function renderLoginEntry(site, login, index, total) {
+    const name = login.display_name || login.label || site;
+    const hosts = login.hosts || [];
     const up = index > 0
-      ? '<button type="button" class="login-cred-up" data-host="' + escapeAttr(host) + '" data-index="' + index + '" title="上へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_up</span></button>'
+      ? '<button type="button" class="login-cred-up" data-site="' + escapeAttr(site) + '" data-index="' + index + '" title="上へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_up</span></button>'
       : '<button type="button" class="login-cred-up" disabled title="上へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_up</span></button>';
     const down = index < total - 1
-      ? '<button type="button" class="login-cred-down" data-host="' + escapeAttr(host) + '" data-index="' + index + '" title="下へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_down</span></button>'
+      ? '<button type="button" class="login-cred-down" data-site="' + escapeAttr(site) + '" data-index="' + index + '" title="下へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_down</span></button>'
       : '<button type="button" class="login-cred-down" disabled title="下へ"><span class="material-symbols-outlined icon-only" aria-hidden="true">keyboard_arrow_down</span></button>';
+    const meta = [];
+    if (typeof login.host_count === 'number') meta.push(login.host_count + ' ホスト');
+    if (login.short_id) meta.push('ID: ' + login.short_id);
+    if (login.added_at) meta.push(formatLoginAddedAt(login.added_at));
     return '<div class="login-cred-row">' +
       '<span class="login-cred-index">' + (index + 1) + '.</span>' +
       '<div class="login-cred-info">' +
-      '<div class="login-cred-label">' + escapeHtml(label) +
-      (names ? ' <span class="login-cred-names">' + escapeHtml(names) + '</span>' : '') +
+      '<div class="login-cred-label">' + escapeHtml(name) + '</div>' +
+      (meta.length ? '<div class="login-cred-added">' + escapeHtml(meta.join(' · ')) + '</div>' : '') +
+      '<div class="login-cred-hosts">' +
+      hosts.map(function(host) {
+        const names = (host.names || []).join(', ');
+        return '<div class="login-cred-host">' + escapeHtml(host.host) +
+          (names ? ' <span class="login-cred-names">' + escapeHtml(names) + '</span>' : '') +
+          (host.cookies ? '<div class="login-cred-cookies">' + escapeHtml(host.cookies) + '</div>' : '') +
+          '</div>';
+      }).join('') +
       '</div>' +
-      '<div class="login-cred-cookies">' + escapeHtml(credential.cookies || '') + '</div>' +
-      (credential.added_at ? '<div class="login-cred-added">' + escapeHtml(formatLoginAddedAt(credential.added_at)) +
-        (credential.short_id ? ' · ID: ' + escapeHtml(credential.short_id) : '') + '</div>' : '') +
       '</div>' +
-      '<span class="login-cred-actions">' + up + down +
-      '<button type="button" class="btn btn-default login-cred-remove" data-host="' + escapeAttr(host) + '" data-index="' + index + '">削除</button>' +
+      '<span class="login-cred-actions">' +
+      '<button type="button" class="btn btn-default login-cred-rename" data-site="' + escapeAttr(site) + '" data-index="' + index + '" data-label="' + escapeAttr(login.label || '') + '">名前を変更</button>' +
+      up + down +
+      '<button type="button" class="btn btn-default login-cred-remove" data-site="' + escapeAttr(site) + '" data-index="' + index + '">削除</button>' +
       '</span>' +
       '</div>';
   }
@@ -306,16 +400,22 @@
     const refresh = pane.querySelector('#login-refresh');
     const clearAll = pane.querySelector('#login-clear-all');
     const importBtn = pane.querySelector('#login-import');
-    const setBtn = pane.querySelector('#login-set');
-    const addBtn = pane.querySelector('#login-add');
     const envelopeFile = pane.querySelector('#login-envelope-file');
     if (refresh) refresh.addEventListener('click', loadLoginHosts);
     if (clearAll) clearAll.addEventListener('click', clearAllLogin);
     if (importBtn) importBtn.addEventListener('click', importLoginEnvelope);
-    if (setBtn) setBtn.addEventListener('click', function() { saveLoginCookie('set'); });
-    if (addBtn) addBtn.addEventListener('click', function() { saveLoginCookie('add'); });
     if (envelopeFile) envelopeFile.addEventListener('change', readLoginEnvelopeFile);
-    loadLoginHosts();
+  }
+
+  /// The name to give what an import brings in: what the user typed, or the
+  /// file's own name (minus its extension) when they left it empty.
+  function importName() {
+    const input = document.getElementById('login-import-name');
+    const typed = input && input.value.trim();
+    if (typed) return typed;
+    const file = document.getElementById('login-envelope-file');
+    const name = file && file.files && file.files[0] ? file.files[0].name : '';
+    return name.replace(/\.[^.]*$/, '');
   }
 
   function readLoginEnvelopeFile() {
@@ -356,7 +456,7 @@
   // Re-render the list from a mutation response's `data` (same shape as
   // GET /api/login), refetching when the response carried none.
   function refreshLoginHosts(data) {
-    if (data && data.hosts) {
+    if (data && data.sites) {
       renderLoginHosts(data);
     } else {
       loadLoginHosts();
@@ -366,25 +466,30 @@
   function renderLoginHosts(data) {
     const container = document.getElementById('login-hosts');
     if (!container) return;
-    const hosts = (data && data.hosts) || [];
-    if (hosts.length === 0) {
-      container.innerHTML = '<em>保存されたログイン情報はありません。narou_rs_login で取得して取り込んでください。</em>';
+    const sites = (data && data.sites) || [];
+    if (sites.length === 0) {
+      container.innerHTML = '<em>保存されたログイン情報はありません。narou_rs_login で書き出したファイルを取り込んでください。</em>';
     } else {
-      container.innerHTML = hosts.map(renderLoginSite).join('');
+      container.innerHTML = sites.map(renderLoginSite).join('');
+      container.querySelectorAll('.login-cred-rename').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          renameLogin(btn.dataset.site, parseInt(btn.dataset.index, 10), btn.dataset.label || '');
+        });
+      });
       container.querySelectorAll('.login-cred-remove').forEach(function(btn) {
         btn.addEventListener('click', function() {
-          removeLoginCredential(btn.dataset.host, parseInt(btn.dataset.index, 10));
+          removeLoginEntry(btn.dataset.site, parseInt(btn.dataset.index, 10));
         });
       });
       container.querySelectorAll('.login-remove-site').forEach(function(btn) {
-        btn.addEventListener('click', function() { removeLoginHost(btn.dataset.host); });
+        btn.addEventListener('click', function() { removeLoginSite(btn.dataset.site); });
       });
       const wireReorder = function(selector, direction) {
         container.querySelectorAll(selector).forEach(function(btn) {
           btn.addEventListener('click', function() {
             const site = btn.closest('.login-site');
             const total = site ? site.querySelectorAll('.login-cred-row').length : 0;
-            moveLoginCredential(btn.dataset.host, parseInt(btn.dataset.index, 10), direction, total);
+            moveLogin(btn.dataset.site, parseInt(btn.dataset.index, 10), direction, total);
           });
         });
       };
@@ -393,9 +498,9 @@
     }
     const help = document.getElementById('login-list-help');
     if (help && data) {
-      const sites = (typeof data.count === 'number') ? data.count : hosts.length;
-      const credentials = (typeof data.credentials === 'number') ? data.credentials : 0;
-      let text = '保存中: ' + sites + ' サイト / ' + credentials + ' 件。上から順にログインを試行します。値はマスクして表示しています。';
+      const siteCount = (typeof data.sites_count === 'number') ? data.sites_count : sites.length;
+      const loginCount = (typeof data.logins_count === 'number') ? data.logins_count : 0;
+      let text = '保存済み: ' + siteCount + ' サイト / ' + loginCount + ' 件。上から順にログインを試行します。値はマスクして表示しています。';
       if (data.key_source) text += ' 鍵: ' + data.key_source;
       help.textContent = text;
     }
@@ -417,6 +522,7 @@
           envelope: envelope.value,
           passphrase: passphrase ? passphrase.value || null : null,
           replace: !!(replace && replace.checked),
+          name: importName() || null,
         }),
       });
       const result = await resp.json();
@@ -428,44 +534,35 @@
       const fileName = document.getElementById('login-file-name');
       if (fileInput) fileInput.value = '';
       if (fileName) fileName.textContent = '';
+      const nameInput = document.getElementById('login-import-name');
+      if (nameInput) nameInput.value = '';
       refreshLoginHosts(result.data);
     } catch (e) {
       showToast(e.message, 'error');
     }
   }
 
-  async function saveLoginCookie(mode) {
-    const host = document.getElementById('login-host');
-    const cookie = document.getElementById('login-cookie');
-    const label = document.getElementById('login-label');
-    if (!host || !cookie || !host.value.trim() || !cookie.value.trim()) {
-      showToast('サイトと Cookie の両方を入力してください', 'error');
-      return;
-    }
+  async function renameLogin(site, index, current) {
+    const input = window.prompt(site + ' の ' + (index + 1) + ' 番目のログインの名前を入力してください。空にすると名前を消します。', current || '');
+    if (input === null) return;
     try {
-      const resp = await fetch('/api/login/' + mode, {
+      const resp = await fetch('/api/login/rename', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          host: host.value.trim(),
-          cookie: cookie.value,
-          label: (label && label.value.trim()) ? label.value.trim() : null,
-        }),
+        body: JSON.stringify({ site: site, index: index, label: input.trim() }),
       });
       const result = await resp.json();
-      if (!result.success) throw new Error(result.message || '保存に失敗しました');
-      showToast(result.message || '保存しました', 'success');
-      cookie.value = '';
-      if (label) label.value = '';
+      if (!result.success) throw new Error(result.message || '名前の変更に失敗しました');
+      showToast(result.message || '名前を変更しました', 'success');
       refreshLoginHosts(result.data);
     } catch (e) {
       showToast(e.message, 'error');
     }
   }
 
-  async function removeLoginCredential(host, index) {
+  async function removeLoginEntry(site, index) {
     try {
-      const resp = await fetch('/api/login/' + encodeURIComponent(host) + '/' + index, { method: 'DELETE' });
+      const resp = await fetch('/api/login/' + encodeURIComponent(site) + '/' + index, { method: 'DELETE' });
       const result = await resp.json();
       if (!result.success) throw new Error(result.message || '削除に失敗しました');
       showToast(result.message || '削除しました', 'success');
@@ -475,7 +572,7 @@
     }
   }
 
-  async function moveLoginCredential(host, index, direction, total) {
+  async function moveLogin(site, index, direction, total) {
     const swap = index + direction;
     if (swap < 0 || swap >= total) return;
     const order = [];
@@ -487,7 +584,7 @@
       const resp = await fetch('/api/login/order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ host: host, order: order }),
+        body: JSON.stringify({ site: site, order: order }),
       });
       const result = await resp.json();
       if (!result.success) throw new Error(result.message || '並べ替えに失敗しました');
@@ -498,10 +595,10 @@
     }
   }
 
-  async function removeLoginHost(host) {
-    if (!window.confirm('サイト ' + host + ' のログイン情報をすべて削除します。よろしいですか？')) return;
+  async function removeLoginSite(site) {
+    if (!window.confirm('サイト ' + site + ' のログイン情報をすべて削除します。よろしいですか？')) return;
     try {
-      const resp = await fetch('/api/login/' + encodeURIComponent(host), { method: 'DELETE' });
+      const resp = await fetch('/api/login/' + encodeURIComponent(site), { method: 'DELETE' });
       const result = await resp.json();
       if (!result.success) throw new Error(result.message || '削除に失敗しました');
       showToast(result.message || '削除しました', 'success');
@@ -563,6 +660,8 @@
     });
     const targetPane = document.getElementById('tab-' + tabId);
     if (targetPane) targetPane.classList.add('active');
+    // 一覧は pane が DOM に乗ってから読む (タブを開くたびに最新化する)。
+    if (tabId === 'login') loadLoginHosts();
 
     // Remember active tab
     activeTab = tabId;
@@ -633,14 +732,17 @@
   function collectFormData() {
     const data = {};
 
-    // Checkboxes (normal boolean)
+    // Worker 版で無効化されたコントロール (disabled) は値を送らない。
+    // サーバー側でも同じ名前を拒否するが、送らなければ他の項目の保存を
+    // 巻き込んで失敗させることがない。
     document.querySelectorAll('.switch-light input[type="checkbox"][data-name]').forEach(function(input) {
+      if (input.disabled) return;
       data[input.dataset.name] = input.checked;
     });
 
     // Radio buttons (3-way)
     document.querySelectorAll('.switch-3way').forEach(function(group) {
-      const checked = group.querySelector('input[type="radio"]:checked');
+      const checked = group.querySelector('input[type="radio"]:checked:not(:disabled)');
       if (checked) {
         const name = checked.name;
         const val = checked.value;
@@ -656,6 +758,7 @@
 
     // Selects (single)
     document.querySelectorAll('select.setting-select:not([multiple])[data-name]').forEach(function(sel) {
+      if (sel.disabled) return;
       const name = sel.dataset.name;
       const val = sel.value;
       data[name] = val === '' ? null : val;
@@ -663,6 +766,7 @@
 
     // Selects (multiple)
     document.querySelectorAll('select.setting-select[multiple][data-name]').forEach(function(sel) {
+      if (sel.disabled) return;
       const name = sel.dataset.name;
       const selected = Array.from(sel.selectedOptions).map(function(opt) { return opt.value; });
       data[name] = selected.length > 0 ? selected.join(',') : null;
@@ -670,6 +774,7 @@
 
     // Text inputs
     document.querySelectorAll('input.setting-input[type="text"][data-name]').forEach(function(input) {
+      if (input.disabled) return;
       const name = input.dataset.name;
       const val = input.value.trim();
       data[name] = val === '' ? null : val;

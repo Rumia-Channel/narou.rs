@@ -20,7 +20,7 @@ use crate::queue::{
 use super::AppState;
 use super::sort_state::{
     CurrentSortState, current_sort_from_server_setting, load_current_sort_state, request_sort_state,
-    sort_column_key, sort_column_label, sort_ids_from_records, sort_records,
+    sort_column_key, sort_display_label, sort_ids_from_records, sort_records,
 };
 use super::state::{
     ApiResponse, ConfirmRunningTasksBody, ConvertBody, CsvImportBody, DiffBody, DiffCleanBody,
@@ -43,26 +43,7 @@ pub struct DiffListQuery {
     pub target: Option<String>,
 }
 
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-fn tag_color_class(color: &str) -> &'static str {
-    match color {
-        "green" => "tag-green",
-        "yellow" => "tag-yellow",
-        "blue" => "tag-blue",
-        "magenta" => "tag-magenta",
-        "cyan" => "tag-cyan",
-        "red" => "tag-red",
-        "white" => "tag-white",
-        _ => "tag-default",
-    }
-}
+use super::{html_escape, tag_color_class, targets_to_strings};
 
 fn validate_download_targets(targets: &[String], max_targets: usize) -> Result<(), String> {
     if targets.len() > max_targets {
@@ -263,7 +244,7 @@ fn queue_lane_sizes(queue: &PersistentQueue) -> [usize; 2] {
     ]
 }
 
-fn sort_records_for_web_update(records: &mut Vec<crate::db::NovelRecord>, sort_state: &CurrentSortState) {
+fn sort_records_for_web_update(records: &mut [crate::db::NovelRecord], sort_state: &CurrentSortState) {
     sort_records(records, sort_state);
 }
 
@@ -349,11 +330,8 @@ fn build_update_by_tag_queue_payload(
 }
 
 fn build_webui_update_start_message(is_update_all: bool, count: usize, sort_display: &str) -> String {
-    if is_update_all {
-        format!("全ての小説の更新を開始します（{}件を{}で処理）", count, sort_display)
-    } else {
-        format!("更新を開始します（{}件を{}で処理）", count, sort_display)
-    }
+    // 文言は Worker (`worker_entry` の update 投入経路) と同じ共有実装。
+    crate::application::messages::jobs::update_started(is_update_all, count, sort_display)
 }
 
 fn build_update_start_message_meta(message: String) -> Mapping {
@@ -1016,18 +994,6 @@ pub async fn queue_clear(State(state): State<AppState>) -> Json<ApiResponse> {
             message: e.to_string(),
         }),
     }
-}
-
-/// Helper: convert mixed JSON values (numbers or strings) into string targets
-fn targets_to_strings(targets: &[serde_json::Value]) -> Vec<String> {
-    targets
-        .iter()
-        .map(|v| match v {
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => s.clone(),
-            other => other.to_string(),
-        })
-        .collect()
 }
 
 fn encode_convert_job_target(targets: &[String]) -> String {
@@ -2254,8 +2220,8 @@ pub async fn api_taginfo(
         .unwrap_or_default();
     let mut selected_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    for id in selected_ids.iter().copied() {
-        if let Some(tags) = record_tags.get(&id) {
+    for id in selected_ids.iter() {
+        if let Some(tags) = record_tags.get(id) {
             for tag in tags {
                 *selected_counts.entry(tag.clone()).or_insert(0) += 1;
             }
@@ -2432,24 +2398,27 @@ pub async fn api_reboot(
     State(state): State<AppState>,
     Json(_body): Json<serde_json::Value>,
 ) -> Json<ApiResponse> {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => {
-            return Json(ApiResponse {
-                success: false,
-                message: e.to_string(),
-            });
+    match schedule_server_reboot(state.clone()).await {
+        Ok(()) => {
+            state.push_server.broadcast_event("reboot", "");
+            Json(ApiResponse {
+                success: true,
+                message: "Rebooting".to_string(),
+            })
         }
-    };
-    let current_dir = match std::env::current_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            return Json(ApiResponse {
-                success: false,
-                message: e.to_string(),
-            });
-        }
-    };
+        Err(message) => Json(ApiResponse {
+            success: false,
+            message,
+        }),
+    }
+}
+
+/// Spawns a replacement server process with the same CLI args, then exits this
+/// process after the new one is running. Used by `POST /api/reboot` and by
+/// `POST /api/storage/mode` (backend switch requires a restart).
+pub(crate) async fn schedule_server_reboot(state: AppState) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let current_dir = std::env::current_dir().map_err(|e| e.to_string())?;
     let hide_console = crate::compat::inherited_hide_console_requested();
     let args = reboot_args_with_no_browser(std::env::args().skip(1).collect(), hide_console);
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2473,21 +2442,8 @@ pub async fn api_reboot(
         }
     });
     match rx.await {
-        Ok(Ok(())) => {
-            state.push_server.broadcast_event("reboot", "");
-            Json(ApiResponse {
-                success: true,
-                message: "Rebooting".to_string(),
-            })
-        }
-        Ok(Err(message)) => Json(ApiResponse {
-            success: false,
-            message,
-        }),
-        Err(_) => Json(ApiResponse {
-            success: false,
-            message: "failed to schedule reboot".to_string(),
-        }),
+        Ok(result) => result,
+        Err(_) => Err("failed to schedule reboot".to_string()),
     }
 }
 
@@ -2501,7 +2457,9 @@ fn reboot_args_with_no_browser(mut args: Vec<String>, hide_console: bool) -> Vec
     args
 }
 
-/// Ruby parity: build sort display string like "タイトル昇順" or "ID順"
+/// Ruby parity: build sort display string like "タイトル昇順" or "ID順".
+/// 文言組み立て自体は Worker でも使う共有実装 (`application::webui::
+/// sort_display_label`) に寄せる — 両環境の更新開始案内が同じ表示名になる。
 fn current_sort_display_string() -> String {
     let sort_state = (|| {
         let inv = crate::db::inventory::Inventory::with_default_root().ok()?;
@@ -2514,34 +2472,18 @@ fn current_sort_display_string() -> String {
         current_sort_from_server_setting(&server_setting)
     })();
 
-    match sort_state {
-        Some(sort_state) => {
-            let label = sort_column_label(&sort_state).unwrap_or("不明");
-            let dir_label = if sort_state.dir == "desc" {
-                "降順"
-            } else {
-                "昇順"
-            };
-            format!("{}{}", label, dir_label)
-        }
-        None => "ID順".to_string(),
-    }
+    sort_display_label(sort_state.as_ref())
 }
 
 fn requested_sort_display_string(
     sort_state: Option<&serde_json::Value>,
     timestamp: Option<u64>,
 ) -> String {
+    // `request_sort_state` は常に None (サーバー保存のソートが真実源) なので、
+    // 実質 `current_sort_display_string` に委譲する。Some が返る経路ができても
+    // native と同じく保存済み表示名へ倒す。
     match request_sort_state(sort_state, timestamp) {
-        Some(sort_state) => {
-            let label = sort_column_label(&sort_state).unwrap_or("不明");
-            let dir_label = if sort_state.dir == "desc" {
-                "降順"
-            } else {
-                "昇順"
-            };
-            format!("{}{}", label, dir_label)
-        }
+        Some(sort_state) => sort_display_label(Some(&sort_state)),
         None => current_sort_display_string(),
     }
 }
@@ -3075,10 +3017,13 @@ mod tests {
             services: crate::web::default_app_services(Arc::new(
                 crate::platform::mocks::MemoryNovelRepository::new(),
             )),
-            basic_auth_header: None,
+            server_security: crate::web::test_server_security(
+                None,
+                vec!["localhost".to_string()],
+                false,
+            ),
+            bind_host: "localhost".into(),
             control_token: "control-token".to_string(),
-            allowed_request_hosts: vec!["localhost".to_string()],
-            reverse_proxy_mode: false,
             queue,
             restore_prompt_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             restorable_tasks_available: Arc::new(std::sync::atomic::AtomicBool::new(true)),

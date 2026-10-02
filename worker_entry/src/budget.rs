@@ -21,6 +21,10 @@ use narou_rs::application::JobQueue;
 use narou_rs::downloader::SectionBudget;
 
 /// Hard platform limit: 1,000 subrequests per invocation.
+///
+/// 実行時に強制はしない（超えたらプラットフォーム側が失敗させる）が、
+/// ジョブの予算がこの上限を踏まないことをテストで固定するために置く。
+#[cfg(test)]
 pub const SUBREQUEST_HARD_LIMIT: u64 = 1_000;
 
 /// Soft yield point for one job. Leaves headroom for the ledger writes,
@@ -59,8 +63,6 @@ impl SubrequestBudget {
         limit.saturating_sub(self.used())
     }
 }
-
-/// Section-boundary budget combining wall-clock and subrequest limits.
 
 /// Persist a resume checkpoint every this many completed sections, so a
 /// crashed invocation restarts near the last finished section instead of
@@ -106,6 +108,8 @@ impl CheckpointSink {
         });
     }
 }
+
+/// Section-boundary budget combining wall-clock and subrequest limits.
 ///
 /// `should_yield` is checked only before a section starts, so whichever
 /// limit trips first produces a resumable `Partial` outcome instead of a
@@ -193,6 +197,9 @@ mod tests {
 
     #[test]
     fn job_budget_stays_below_hard_limit() {
-        assert!(JOB_SUBREQUEST_BUDGET < SUBREQUEST_HARD_LIMIT);
+        // 定数どうしの比較は const ブロックで行う (コンパイル時に検証される)。
+        const {
+            assert!(JOB_SUBREQUEST_BUDGET < SUBREQUEST_HARD_LIMIT);
+        }
     }
 }

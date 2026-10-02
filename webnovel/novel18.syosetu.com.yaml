@@ -6,6 +6,14 @@ top_url: https://\\k<domain>
 url: https?://\\k<domain>/(?<ncode>n\d+[a-z]+)
 series_url: https?://\\k<domain>/(?<series>x?s\d+[a-z]+)
 series_item_url: (?:"|')(?:https?://(?:ncode|novel18)\.syosetu\.com)?(?<href>/n\d+[a-z]+/?)(?:"|')
+# 作者ページ (作者追跡)。`narou author add <作者ページURL>` で登録する。
+# R18 のマイページは `xmypage.syosetu.com/<x ID>/` で、年齢確認の Cookie が要る
+# (定義の cookie で送る)。
+author_url: ^https?://xmypage\.syosetu\.com/(?<author_id>[a-z0-9]+)/
+# R18 側は作品一覧 API が使えない: novel18api の userid は数値の利用者 ID 前提で、
+# xmypage の ID (x8094bm 形式) を渡しても絞り込まれず全件が返る。作者ページの
+# HTML から作品 URL を拾う。
+author_novel_pattern: (?<novel_url>https?://novel18\.syosetu\.com/n\d+[a-z]+/)
 encoding: UTF-8
 timezone: Asia/Tokyo
 confirm_over18: yes
@@ -18,7 +26,7 @@ sitename: |-
   <dt class="p-infotop-data__title">掲載サイト</dt>
   <dd class="p-infotop-data__value">(?<sitename>.+?)\(.+\)</dd>
 
-version: 2.3
+version: 2.4
 
 # ------------------------------------------------------------
 # 目次取得設定

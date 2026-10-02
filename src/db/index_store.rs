@@ -32,6 +32,12 @@ pub struct IndexStore {
     dirty: bool,
 }
 
+impl Default for IndexStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IndexStore {
     pub fn new() -> Self {
         Self {
@@ -152,9 +158,10 @@ impl IndexStore {
     }
 
     fn store_entry(&mut self, id: i64, record: &super::NovelRecord) {
-        let mut meta = MetaEntry::default();
-        meta.toc_url = Some(record.toc_url.clone());
-        meta.title = Some(record.title.clone());
+        let meta = MetaEntry {
+            toc_url: Some(record.toc_url.clone()),
+            title: Some(record.title.clone()),
+        };
 
         let toc_norm = normalize_url(&record.toc_url);
         if let Some(norm) = toc_norm {

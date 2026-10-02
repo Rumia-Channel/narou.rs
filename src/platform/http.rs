@@ -11,16 +11,23 @@
 //! the native implementation isolates blocking transports behind
 //! `tokio::task::spawn_blocking`.
 //!
-//! URL safety validation lives in `downloader::security` (domain layer) and is
-//! applied by callers before handing a URL to an implementation.
+//! URL safety validation is split: the syntax/address-literal judgement lives in
+//! [`super::url_policy`] (usable without DNS) and is applied by callers before
+//! handing a URL to an implementation, while [`HttpClient::validate_url`] lets an
+//! implementation that *can* resolve DNS enforce the resolved-address check.
 
 use super::PlatformFuture;
 
 /// HTTP method used by [`HttpRequest`].
+///
+/// `Put`/`Delete` exist for object storage (S3-compatible APIs write with
+/// `PUT` and remove with `DELETE`); site downloads only use `Get`/`Post`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
     Get,
     Post,
+    Put,
+    Delete,
 }
 
 /// How redirects are handled by the transport.
@@ -47,6 +54,15 @@ pub struct HttpRequest {
     /// POST body. `None` for GET or bodiless POST.
     pub body: Option<Vec<u8>>,
     pub redirect: RedirectMode,
+    /// `true` when the URL comes from the user's own configuration (an object
+    /// storage endpoint) instead of crawled content.
+    ///
+    /// Transports then skip the public-address check (a local MinIO endpoint is
+    /// legitimate), return every response header instead of the site-fetch
+    /// subset (`ETag` / `Content-Range` are part of the object-storage
+    /// contract), and do not apply site fetch fallbacks. Site fetches must
+    /// leave this `false`.
+    pub trusted_endpoint: bool,
 }
 
 impl HttpRequest {
@@ -57,6 +73,7 @@ impl HttpRequest {
             headers: Vec::new(),
             body: None,
             redirect: RedirectMode::Follow,
+            trusted_endpoint: false,
         }
     }
 
@@ -67,6 +84,31 @@ impl HttpRequest {
             headers: Vec::new(),
             body: Some(body.into()),
             redirect: RedirectMode::Follow,
+            trusted_endpoint: false,
+        }
+    }
+
+    /// `PUT` with a body, used by object storage writes.
+    pub fn put(url: impl Into<String>, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            url: url.into(),
+            method: HttpMethod::Put,
+            headers: Vec::new(),
+            body: Some(body.into()),
+            redirect: RedirectMode::Follow,
+            trusted_endpoint: false,
+        }
+    }
+
+    /// `DELETE` without a body, used by object storage removals.
+    pub fn delete(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            method: HttpMethod::Delete,
+            headers: Vec::new(),
+            body: None,
+            redirect: RedirectMode::Follow,
+            trusted_endpoint: false,
         }
     }
 
@@ -77,6 +119,14 @@ impl HttpRequest {
 
     pub fn with_redirect(mut self, mode: RedirectMode) -> Self {
         self.redirect = mode;
+        self
+    }
+
+    /// Mark the request as an infrastructure call (object storage endpoint).
+    ///
+    /// See [`HttpRequest::trusted_endpoint`] for what transports change.
+    pub fn with_trusted_endpoint(mut self) -> Self {
+        self.trusted_endpoint = true;
         self
     }
 
@@ -130,6 +180,22 @@ pub trait HttpClient: Send + Sync {
         &'a self,
         request: HttpRequest,
     ) -> PlatformFuture<'a, crate::error::Result<HttpResponse>>;
+
+    /// Validate a URL before the request is sent.
+    ///
+    /// The default implementation checks the URL syntax and rejects
+    /// non-public address literals, which is all a platform without DNS
+    /// resolution (wasm) can do. Implementations that can resolve hosts must
+    /// override this to also reject hostnames resolving to non-public
+    /// addresses; native does so through `downloader::security`.
+    fn validate_url<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> PlatformFuture<'a, crate::error::Result<()>> {
+        Box::pin(async move {
+            super::url_policy::validate_url_syntax(url).map_err(crate::error::NarouError::Http)
+        })
+    }
 }
 
 /// Convenience blanket impl: any `&T` where `T: HttpClient` is itself an
@@ -140,6 +206,13 @@ impl<T: HttpClient + ?Sized> HttpClient for &T {
         request: HttpRequest,
     ) -> PlatformFuture<'a, crate::error::Result<HttpResponse>> {
         (*self).send(request)
+    }
+
+    fn validate_url<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> PlatformFuture<'a, crate::error::Result<()>> {
+        (*self).validate_url(url)
     }
 }
 

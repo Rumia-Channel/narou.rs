@@ -196,7 +196,7 @@ pub fn sanitize_text(text: &str) -> String {
     result = restore_entities(&result);
 
     let ws_re = Regex::new(r"\s+").unwrap();
-    result = ws_re.replace_all(&result.trim(), " ").to_string();
+    result = ws_re.replace_all(result.trim(), " ").to_string();
 
     result
 }

@@ -18,7 +18,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Validate tag matches Cargo.toml version
         id: version
@@ -59,7 +59,7 @@ jobs:
             os: windows-11-arm
             target: aarch64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -333,7 +333,7 @@ jobs:
             features: lite
             variant: GPL
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -490,7 +490,7 @@ jobs:
     runs-on: windows-2025
     environment: CodeSining
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download unsigned binaries
         uses: actions/download-artifact@v4

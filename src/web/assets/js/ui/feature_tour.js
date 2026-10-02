@@ -116,6 +116,12 @@ async function chooseStorageMode(mode, button) {
   button.disabled = true;
   try {
     const result = await postJson('/api/storage/mode', { mode });
+    if (result.reboot) {
+      // サーバが再起動するので、WS の reboot イベントで /_rebooting へ遷移する。
+      // イベントが届かない場合の保険としてタイマーでも遷移する。
+      window.setTimeout(() => { window.location.href = '/_rebooting'; }, 1500);
+      return;
+    }
     window.alert(result.message || '設定しました');
     window.location.reload();
   } catch (error) {

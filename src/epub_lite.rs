@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use aozora_epub3_lite::{
-    AozoraConfig, EpubAsset, EpubBook, Input, NavChapter, StyleSettings, TitleType,
+    AozoraConfig, EpubAsset, EpubBook, IniSettings, Input, NavChapter, StyleSettings, TitleType,
     aozora_text_to_xhtml_sections_with_chapters, build_metadata, build_title_page_markup,
     collect_assets, collect_image_alts, decode_text, decorate_image_tags, detect_meta_with_gaiji,
     escape_html, image_references, inline_to_xhtml, is_auto_cover, remove_image_sources,
@@ -26,10 +26,13 @@ use aozora_epub3_lite::{
 };
 use aozora_epub3_lite::pipeline::append_gaiji_assets;
 
+use crate::converter::settings::ImageRotation;
 use crate::error::{NarouError, Result};
 
 /// ライブラリ利用側 (Worker など) が入力源を実装するために使う。
 pub use aozora_epub3_lite::{FileSource, InputError};
+/// 1 エントリずつ書き出すための Lite の型 (Worker のストリーミング応答で使う)。
+pub use aozora_epub3_lite::{EpubEntryInfo, EpubStreamWriter};
 
 /// chuki tables vendored from the Lite crate's bundled assets so that wasm
 /// builds (no filesystem) see the same note definitions as CLI runs.
@@ -116,6 +119,47 @@ pub fn config_for(assets_dir: Option<&Path>) -> AozoraConfig {
     config
 }
 
+/// INI 1 項目だけ差し替えた `IniSettings` を返す。`RotateImage` は回転角の
+/// 決定時 (`pipeline::image_rotation` / `rotate_for_image`) に都度読まれる
+/// ので、`AozoraConfig::from_ini` の派生フィールドには影響しない。
+///
+/// `IniSettings` にセッターが無いため、全項目を直列化して該当キーだけを
+/// 差し替えて再パースする。`iter()` はセクションを `Section.Key` の平坦な
+/// キーとして返し、`parse` はそのキーをそのまま保持するので往復で一致する。
+/// (考えられる限りのエッジケース: デコード済み値がリテラルな `\uXXXX` を含む
+/// と再パース時に 1 回展開される。実際の AozoraEpub3.ini には無い。)
+fn ini_with_rotate_image(ini: &IniSettings, value: &str) -> IniSettings {
+    let mut text = String::new();
+    let mut replaced = false;
+    for (key, item) in ini.iter() {
+        if key == "RotateImage" {
+            text.push_str("RotateImage=");
+            text.push_str(value);
+            text.push('\n');
+            replaced = true;
+        } else {
+            text.push_str(key);
+            text.push('=');
+            text.push_str(item);
+            text.push('\n');
+        }
+    }
+    if !replaced {
+        text.push_str("RotateImage=");
+        text.push_str(value);
+        text.push('\n');
+    }
+    IniSettings::parse(&text).unwrap_or_else(|_| ini.clone())
+}
+
+/// `convert.rotate-image` (未指定 = INI に従う) を `config.ini` の
+/// `RotateImage` へ反映する。
+fn apply_rotate_image(config: &mut AozoraConfig, rotation: Option<ImageRotation>) {
+    if let Some(rotation) = rotation {
+        config.ini = ini_with_rotate_image(&config.ini, rotation.ini_value());
+    }
+}
+
 /// Metadata and layout options for one EPUB build.
 #[derive(Debug, Clone)]
 pub struct EpubBuildOptions {
@@ -135,6 +179,12 @@ pub struct EpubBuildOptions {
     /// ファイル流し込みが無いので、濁点フォント (`style/vertical_font.css` +
     /// `fonts/DMincho.ttf`) はここで渡す。
     pub extra_assets: Vec<EpubAsset>,
+    /// `convert.rotate-image` の解決値。`None` (未指定) は INI の
+    /// `RotateImage` に従う (AozoraEpub3 と同じ挙動)。
+    ///
+    /// 角度自体ではなく本家の「回転する/しない・方向」の差し替え。回る条件
+    /// (向き・大きさ・ページ種別) は AozoraEpub3 の規則のまま。
+    pub rotate_image: Option<ImageRotation>,
 }
 
 /// 書き出し時に読み出す挿絵。
@@ -159,6 +209,13 @@ pub struct EpubBuild {
     pub images: Vec<EpubImageSource>,
     config: AozoraConfig,
     input: Input,
+    /// `FileSource` 入力 (`build_book_from_source`) は構築時に画像の寸法を
+    /// 読めないため、`rotate` を書き出し直前の [`Self::resolve`] で決める。
+    /// `convert.rotate-image` が指定されたときだけ立てる — 未指定ならこの
+    /// 経路は従来どおり一切回転しない (同梱プリセットの `RotateImage=2` を
+    /// 勝手に有効化しないため)。回転条件は Java のアーカイブ入力と同じ
+    /// (本文中の挿絵が画面に対して横長/縦長のときだけ回る)。
+    deferred_rotate: bool,
 }
 
 impl EpubBuild {
@@ -180,12 +237,32 @@ impl EpubBuild {
                 let base = self.input.path().parent()?;
                 std::fs::read(base.join(image.source.replace('\\', "/"))).ok()
             })?;
+        let rotate = if self.deferred_rotate {
+            // FileSource 経路の挿絵はバイト列が来た時点で Java の
+            // アーカイブ入力と同じ条件で回転角を決める。表紙は常に 0。
+            if image.is_cover {
+                0
+            } else {
+                aozora_epub3_lite::image::dimensions(&data, &image.media_type)
+                    .map(|(width, height)| {
+                        aozora_epub3_lite::pipeline::rotate_for_image(
+                            &self.config,
+                            aozora_epub3_lite::ImageDimensions { width, height },
+                            aozora_epub3_lite::ImagePageType::Inline,
+                            true,
+                        )
+                    })
+                    .unwrap_or(0)
+            }
+        } else {
+            image.rotate
+        };
         aozora_epub3_lite::image::process(
             &data,
             &image.media_type,
             &self.config.ini,
             image.is_cover,
-            image.rotate,
+            rotate,
         )
         .ok()
     }
@@ -247,6 +324,7 @@ pub fn build_book_from_source(
     })?;
 
     let mut config = config_for(options.assets_dir.as_deref());
+    apply_rotate_image(&mut config, options.rotate_image);
     let detected = detect_meta_with_gaiji(&text, TitleType::TitleAuthor, false, &config.gaiji);
     let body = remove_metadata_lines(&text, &detected);
     config.image_alt_map.clear();
@@ -309,6 +387,9 @@ pub fn build_book_from_source(
         images,
         config,
         input,
+        // ユーザーが回転を指定したときだけ、この経路でも書き出し直前に
+        // 回転角を決める (未指定なら従来どおり回転しない)。
+        deferred_rotate: options.rotate_image.is_some(),
     })
 }
 
@@ -340,6 +421,7 @@ fn nav_chapters(records: Vec<aozora_epub3_lite::ChapterRecord>, config: &AozoraC
 
 fn build_from_input(input: Input, options: &EpubBuildOptions) -> Result<EpubBuild> {
     let mut config = config_for(options.assets_dir.as_deref());
+    apply_rotate_image(&mut config, options.rotate_image);
     let Some(entry) = input.text_entries().first() else {
         return Err(NarouError::Conversion(
             "変換済みテキストが空です".to_string(),
@@ -497,6 +579,8 @@ fn build_from_input(input: Input, options: &EpubBuildOptions) -> Result<EpubBuil
         images,
         config,
         input,
+        // 回転角は collect_assets / decorate_image_tags が INI を反映済み。
+        deferred_rotate: false,
     })
 }
 
@@ -519,6 +603,105 @@ pub fn stream_epub<W: Write>(
         .map_err(|error| NarouError::Conversion(format!("EPUB書き出しに失敗しました: {error}")))
 }
 
+/// EPUB 書き出しのシンク。1 エントリ分のバイト列を溜め、書き出し側が
+/// エントリを書き終えるたびに [`ChunkSink::take`] で引き取る。
+///
+/// `Clone` しても同じバッファを共有するので、`EpubStreamWriter` に渡した
+/// clone が書いた内容を呼び出し側のハンドルから読める (Worker の応答のように
+/// チャンクを 1 つずつ外へ流す用途を想定)。
+#[derive(Clone, Default)]
+pub struct ChunkSink {
+    buffer: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+}
+
+impl ChunkSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 溜まっているバイト列を取り出してバッファを空にする。
+    pub fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.buffer.borrow_mut())
+    }
+}
+
+impl Write for ChunkSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.buffer.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 挿絵のバイト列を書き出し直前に注入できる入力源。
+///
+/// 構築 ([`build_book_from_source`]) は挿絵のパス一覧しか見ないので、バイト列は
+/// 一覧に載せた名前へ書き出し直前に [`LazyImageSource::insert_image`] で入れる。
+/// これで挿絵を全部はメモリに載せずに EPUB を組める (Worker は ObjectStore から
+/// 書き出し直前の 1 枚だけ読む)。
+#[derive(Debug)]
+pub struct LazyImageSource {
+    text: String,
+    names: Vec<String>,
+    images: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl LazyImageSource {
+    /// `image_names` は本文の参照と同じ相対パス (`挿絵/foo.jpg`) で渡す。
+    pub fn new(text: String, image_names: Vec<String>) -> Self {
+        let mut names = vec!["novel.txt".to_string()];
+        names.extend(image_names);
+        Self {
+            text,
+            names,
+            images: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// 書き出し直前の挿絵 1 枚を差し込む。
+    pub fn insert_image(&self, name: &str, bytes: Vec<u8>) {
+        if let Ok(mut images) = self.images.lock() {
+            images.insert(name.to_string(), bytes);
+        }
+    }
+
+    /// 書き出しが済んだ挿絵を解放し、保持していればそのバイト列を返す。
+    /// 1 エントリ書き終えるごとに呼ぶことで、保持するのは常に 1 枚分になる。
+    pub fn remove_image(&self, name: &str) -> Option<Vec<u8>> {
+        self.images
+            .lock()
+            .ok()
+            .and_then(|mut images| images.remove(name))
+    }
+}
+
+impl FileSource for LazyImageSource {
+    fn list(&self) -> &[String] {
+        &self.names
+    }
+
+    fn open(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<Box<dyn std::io::Read + Send>>, InputError> {
+        if name == "novel.txt" {
+            return Ok(Some(Box::new(std::io::Cursor::new(
+                self.text.clone().into_bytes(),
+            ))));
+        }
+        let bytes = self
+            .images
+            .lock()
+            .ok()
+            .and_then(|images| images.get(name).cloned());
+        Ok(bytes
+            .map(|bytes| Box::new(std::io::Cursor::new(bytes)) as Box<dyn std::io::Read + Send>))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,6 +718,7 @@ mod tests {
             assets_dir: None,
             kindle: false,
             extra_assets: Vec::new(),
+            rotate_image: None,
         }
     }
 
@@ -702,6 +886,270 @@ mod tests {
         assert!(embedded.block_inline_tags.contains_key("一字下げ"));
     }
 
+    /// 1 エントリずつ書き出す経路 (Worker の `download.epub` と同じ手順) が
+    /// 一括書き出しと同一バイトを返すこと。エントリごとにチャンクが取れることと、
+    /// 最後のチャンク (ZIP の集中ディレクトリ) を取りこぼさないことも固定する。
+    #[test]
+    fn entry_by_entry_writer_matches_batch_output() {
+        let png: &[u8] = b"\x89PNG\r\n\x1a\nstub";
+        let text = format!("{SAMPLE}\n　挿絵。［＃挿絵（挿絵/i1.png）入る］\n");
+        let path = text_file("stream", &text, Some(png));
+        let build = build_book(&path, &options()).unwrap();
 
+        let mut batch = Vec::new();
+        stream_epub(&build.book, &mut batch, |path| build.resolve(path)).unwrap();
 
+        let sink = ChunkSink::new();
+        let mut writer = build.book.stream_writer(sink.clone()).unwrap();
+        let mut streamed = Vec::new();
+        let mut chunks = 0;
+        while let Some(info) = writer.next_entry() {
+            let bytes = info
+                .asset_path
+                .as_deref()
+                .and_then(|path| build.resolve(path));
+            writer.write_current(bytes.as_deref()).unwrap();
+            let chunk = sink.take();
+            if !chunk.is_empty() {
+                chunks += 1;
+                streamed.extend_from_slice(&chunk);
+            }
+        }
+        writer.finish().unwrap();
+        let tail = sink.take();
+        if !tail.is_empty() {
+            chunks += 1;
+            streamed.extend_from_slice(&tail);
+        }
+
+        assert_eq!(streamed, batch);
+        assert!(chunks > 3, "1 エントリずつ流れていない: {chunks} chunks");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// 挿絵のバイト列を書き出し直前に注入する経路 (Worker と同じ) でも EPUB が
+    /// 組めること。構築はパス一覧しか見ないので注入前は解決できず、注入した
+    /// 1 枚だけが格納され、書き出し後は解放される (先読みと同じメモリに戻らない)。
+    #[test]
+    fn lazy_source_takes_illustrations_at_write_time() {
+        let png: &[u8] = b"\x89PNG\r\n\x1a\nstub";
+        let text = format!(
+            "{SAMPLE}\n　挿絵。［＃挿絵（挿絵/i1.png）入る］\n［＃挿絵（挿絵/i2.png）入る］\n"
+        );
+        let names = vec!["挿絵/i1.png".to_string(), "挿絵/i2.png".to_string()];
+        let source = Arc::new(LazyImageSource::new(text, names.clone()));
+        let build = build_book_from_source(source.clone(), &options()).unwrap();
+
+        assert_eq!(build.images.len(), 2);
+        let epub_path = build.images[0].epub_path.clone();
+        // 構築時にバイト列は要求されない (注入前は解決できない)。
+        assert!(build.resolve(&epub_path).is_none());
+
+        let sink = ChunkSink::new();
+        let mut writer = build.book.stream_writer(sink.clone()).unwrap();
+        let mut streamed = Vec::new();
+        while let Some(info) = writer.next_entry() {
+            let bytes = info.asset_path.as_deref().and_then(|path| {
+                let name = path.strip_prefix("image/")?;
+                source.insert_image(name, png.to_vec());
+                let bytes = build.resolve(path);
+                // 書き出したら解放する (保持するのは常に 1 枚分)。
+                assert!(source.remove_image(name).is_some());
+                bytes
+            });
+            writer.write_current(bytes.as_deref()).unwrap();
+            streamed.extend(sink.take());
+        }
+        writer.finish().unwrap();
+        streamed.extend(sink.take());
+
+        assert!(streamed.starts_with(b"PK\x03\x04"));
+        for name in &names {
+            let needle = format!("item/image/{name}");
+            assert!(streamed.windows(needle.len()).any(|window| window == needle.as_bytes()));
+            assert!(source.remove_image(name).is_none(), "{name} が解放されていない");
+        }
+    }
+
+    /// 実寸のある PNG (8bit グレースケール) を組み立てる。`image` crate への
+    /// 依存を増やさないよう、CRC と IDAT (stored deflate) を手で組む。
+    fn test_png(width: u32, height: u32) -> Vec<u8> {
+        fn chunk(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut out = (payload.len() as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(kind);
+            out.extend_from_slice(payload);
+            let mut crc_data = kind.to_vec();
+            crc_data.extend_from_slice(payload);
+            out.extend_from_slice(&crc32fast::hash(&crc_data).to_be_bytes());
+            out
+        }
+        let mut ihdr = width.to_be_bytes().to_vec();
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 0, 0, 0, 0]);
+        // 各行はフィルタバイト 0 + グレー 1 バイト/px。デコードできる PNG に
+        // するため、先頭のフィルタバイトは 0 のまま残す。
+        let row_bytes = 1 + width as usize;
+        let mut raw = vec![0u8; row_bytes * height as usize];
+        for (index, byte) in raw.iter_mut().enumerate() {
+            if index % row_bytes != 0 {
+                *byte = (index % 251) as u8;
+            }
+        }
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 1);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(chunk(b"IHDR", &ihdr));
+        png.extend(chunk(b"IDAT", &compressed));
+        png.extend(chunk(b"IEND", &[]));
+        png
+    }
+
+    /// `convert.rotate-image` が組み込みエンジンの `RotateImage` を上書きする
+    /// こと。横長の単ページ画像は同梱プリセット (RotateImage=2) で -90° 回るが、
+    /// 「回転しない」にすると回らず、未指定なら従来どおり INI に従う。
+    #[test]
+    fn rotate_image_setting_overrides_ini_for_page_images() {
+        use crate::converter::settings::ImageRotation;
+
+        // 800x400: SinglePageWidth(600) 以上かつ画面比 (658x905) より横長なので
+        // Java の単ページ画像条件で回転対象になる。
+        let wide = test_png(800, 400);
+        let text = format!("{SAMPLE}\n［＃挿絵（挿絵/i1.png）入る］\n");
+
+        // 未指定: 同梱プリセットの RotateImage=2 → -90° で寸法が入れ替わる。
+        let path = text_file("rotate-default", &text, Some(&wide));
+        let build = build_book(&path, &options()).unwrap();
+        assert_eq!(build.images[0].rotate, -90);
+        let resolved = build.resolve("image/0001.png").unwrap();
+        assert_eq!(
+            aozora_epub3_lite::image::dimensions(&resolved, "image/png"),
+            Some((400, 800))
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        // convert.rotate-image=0: INI を差し替えて回らない。
+        let path = text_file("rotate-off", &text, Some(&wide));
+        let build = build_book(
+            &path,
+            &EpubBuildOptions {
+                rotate_image: Some(ImageRotation::Off),
+                ..options()
+            },
+        )
+        .unwrap();
+        assert_eq!(build.images[0].rotate, 0);
+        let resolved = build.resolve("image/0001.png").unwrap();
+        assert_eq!(
+            aozora_epub3_lite::image::dimensions(&resolved, "image/png"),
+            Some((800, 400))
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        // convert.rotate-image=1: RotateImage=1 として +90° に回る。
+        let path = text_file("rotate-cw", &text, Some(&wide));
+        let build = build_book(
+            &path,
+            &EpubBuildOptions {
+                rotate_image: Some(ImageRotation::Cw90),
+                ..options()
+            },
+        )
+        .unwrap();
+        assert_eq!(build.images[0].rotate, 90);
+        let resolved = build.resolve("image/0001.png").unwrap();
+        assert_eq!(
+            aozora_epub3_lite::image::dimensions(&resolved, "image/png"),
+            Some((400, 800))
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// `aozoraepub3dir` の INI に `RotateImage` があれば、未指定時はそちらが
+    /// 優先される (ユーザーが本家ツール側で回転を切っている場合)。
+    #[test]
+    fn rotate_image_unset_follows_install_ini() {
+        let dir = std::env::temp_dir().join(format!("narou-lite-rot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AozoraEpub3.ini"), "RotateImage=1\n").unwrap();
+        let wide = test_png(800, 400);
+        let text = format!("{SAMPLE}\n［＃挿絵（挿絵/i1.png）入る］\n");
+        let path = text_file("rotate-ini", &text, Some(&wide));
+        let build = build_book(
+            &path,
+            &EpubBuildOptions {
+                assets_dir: Some(dir.clone()),
+                ..options()
+            },
+        )
+        .unwrap();
+        assert_eq!(build.images[0].rotate, 90);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `FileSource` 経路 (Worker) は構築時に寸法を読めないので、`rotate_image`
+    /// 指定時だけ書き出し直前に回転角を決める。未指定なら従来どおり回らない。
+    #[test]
+    fn rotate_image_applies_to_source_input_when_set() {
+        use crate::converter::settings::ImageRotation;
+
+        let wide = test_png(800, 400);
+        let text = format!("{SAMPLE}\n　挿絵。［＃挿絵（挿絵/i1.png）入る］\n");
+        let files = vec![
+            ("novel.txt".to_string(), text.into_bytes()),
+            ("挿絵/i1.png".to_string(), wide.clone()),
+        ];
+        #[derive(Debug)]
+        struct Memory {
+            files: Vec<(String, Vec<u8>)>,
+            names: Vec<String>,
+        }
+        impl FileSource for Memory {
+            fn list(&self) -> &[String] {
+                &self.names
+            }
+            fn open(
+                &self,
+                name: &str,
+            ) -> std::result::Result<Option<Box<dyn std::io::Read + Send>>, InputError> {
+                Ok(self
+                    .files
+                    .iter()
+                    .find(|(candidate, _)| candidate == name)
+                    .map(|(_, bytes)| {
+                        Box::new(std::io::Cursor::new(bytes.clone())) as Box<dyn std::io::Read + Send>
+                    }))
+            }
+        }
+        let source = |names: Vec<String>| {
+            Arc::new(Memory {
+                files: files.clone(),
+                names,
+            })
+        };
+        let names: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+
+        // 未指定: この経路は従来どおり回転しない (同梱プリセットに依らない)。
+        let build = build_book_from_source(source(names.clone()), &options()).unwrap();
+        let resolved = build.resolve("image/挿絵/i1.png").unwrap();
+        assert_eq!(
+            aozora_epub3_lite::image::dimensions(&resolved, "image/png"),
+            Some((800, 400))
+        );
+
+        // convert.rotate-image=2: Java のアーカイブ挿絵と同じ条件で回る。
+        let build = build_book_from_source(
+            source(names),
+            &EpubBuildOptions {
+                rotate_image: Some(ImageRotation::Ccw90),
+                ..options()
+            },
+        )
+        .unwrap();
+        let resolved = build.resolve("image/挿絵/i1.png").unwrap();
+        assert_eq!(
+            aozora_epub3_lite::image::dimensions(&resolved, "image/png"),
+            Some((400, 800))
+        );
+    }
 }
+

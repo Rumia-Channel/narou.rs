@@ -81,8 +81,8 @@ fn promote_with_expected_hash(install_dir: &Path, expected_hex: &str) -> Result<
     }
 
     // 既存 updater がいれば削除を試みる。失敗したら .bak へ退避。
-    if active.exists() {
-        if let Err(e) = fs::remove_file(&active) {
+    if active.exists()
+        && let Err(e) = fs::remove_file(&active) {
             let bak = active.with_extension({
                 let base = active
                     .extension()
@@ -101,7 +101,6 @@ fn promote_with_expected_hash(install_dir: &Path, expected_hex: &str) -> Result<
                 )
             })?;
         }
-    }
 
     fs::rename(&pending, &active)
         .map_err(|e| format!("rename {pending:?} -> {active:?}: {e}"))?;

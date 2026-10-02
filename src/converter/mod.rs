@@ -1,8 +1,11 @@
 pub mod converter_base;
+#[cfg(feature = "native-runtime")]
 pub mod dakuten_font;
 pub mod device;
 pub mod ini;
 pub mod inspector;
+/// 出力ファイル名の命名規則。native (Inventory) と Worker (D1) の両方が
+/// 使うため fs に依存しない pure なコアを持つ。
 pub mod output;
 pub mod render;
 pub mod settings;
@@ -10,36 +13,57 @@ pub mod user_converter;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+#[cfg(feature = "native-runtime")]
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+#[cfg(feature = "native-runtime")]
+use serde::Deserialize;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use settings::NovelSettings;
 use user_converter::UserConverter;
 
 use crate::db::NovelRecord;
-use crate::downloader::{SECTION_SAVE_DIR, SectionElement, SectionFile, TocObject};
-use crate::error::{NarouError, Result};
+#[cfg(feature = "native-runtime")]
+use crate::downloader::SectionElement;
+use crate::downloader::{SECTION_SAVE_DIR, SectionFile, TocObject};
+#[cfg(feature = "native-runtime")]
+use crate::error::NarouError;
+use crate::error::Result;
+use crate::illustration_store::IllustrationIndex;
+#[cfg(feature = "native-runtime")]
 use crate::illustration_store::{
-    IllustrationIndex, IllustrationStorageService, IllustrationStore, StoredIllustration,
+    IllustrationStorageService, IllustrationStore, StoredIllustration,
     find_saved_illustration_filename, illustration_extension_from_content_type,
     is_remote_illustration_source, legacy_basename_from_source, normalize_illustration_url,
 };
+use crate::platform::ProgressReporter;
 use crate::platform::{AssetStore, HttpClient, ObjectKey, ObjectStore, RateLimiter};
-use crate::progress::ProgressReporter;
+#[cfg(feature = "native-runtime")]
 use crate::termcolor::bold_colored;
 
+#[cfg(feature = "native-runtime")]
 const SECTION_CONVERT_CACHE_NAME: &str = "section_convert_cache";
+#[cfg(feature = "native-runtime")]
 const SECTION_CONVERT_CACHE_DIR_NAME: &str = "section_convert_cache";
+/// 変換キャッシュの保存形式。本文と同様、生 YAML のままだと 3 倍以上に
+/// 膨らむため、brotli (または無圧縮) を 1 行のヘッダで示して格納する。
+/// ヘッダが無いファイルは旧形式 (生 YAML) として読む。
+#[cfg(feature = "native-runtime")]
+const SECTION_CONVERT_CACHE_MAGIC: &str = "narou-section-cache:v1";
 const ILLUSTRATION_LOCALIZATION_VERSION: &str = "illustration-localization:v4";
 
 /// I/O capabilities used only by converter-side illustration localization.
 ///
 /// Text conversion remains pure; callers can provide mocks here and avoid
 /// curl, real network access, and filesystem-backed image storage.
+///
+/// `novel_record_resolver` looks a novel record up by id; `fetch_policy_resolver`
+/// maps a record's site onto the fetch policy (site headers/cookies) used for
+/// illustration downloads.
 #[derive(Clone)]
 pub struct ConverterCapabilities {
     pub http: Arc<dyn HttpClient>,
@@ -54,9 +78,12 @@ pub struct ConverterCapabilities {
     pub novel_record_resolver: Option<Arc<dyn Fn(i64) -> Option<NovelRecord> + Send + Sync>>,
     /// Resolves the fetch policy (site headers/cookie) used for illustration
     /// downloads. Native callers map the record's site definition onto it.
-    pub fetch_policy_resolver:
-        Option<Arc<dyn Fn(&NovelRecord) -> crate::downloader::http_policy::FetchPolicy + Send + Sync>>,
+    pub fetch_policy_resolver: Option<FetchPolicyResolver>,
 }
+
+/// Maps a novel record onto the `FetchPolicy` used for illustration downloads.
+pub type FetchPolicyResolver =
+    Arc<dyn Fn(&NovelRecord) -> crate::downloader::http_policy::FetchPolicy + Send + Sync>;
 
 impl ConverterCapabilities {
     pub fn new(http: Arc<dyn HttpClient>, rate_limiter: Arc<dyn RateLimiter>) -> Self {
@@ -78,7 +105,11 @@ pub struct NovelConverter {
     settings: NovelSettings,
     user_converter: Option<UserConverter>,
     section_cache: HashMap<String, render::ConvertedSection>,
+    #[cfg(feature = "native-runtime")]
     section_convert_cache: SectionConvertCache,
+    /// 直近の変換で書いた txt のパス (`convert.keep-txt=false` の後始末用)。
+    #[cfg(feature = "native-runtime")]
+    last_text_path: Option<std::path::PathBuf>,
     progress: Option<Box<dyn ProgressReporter>>,
     inspector: Rc<RefCell<inspector::Inspector>>,
     display_inspector: bool,
@@ -90,6 +121,7 @@ pub struct NovelConverter {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(feature = "native-runtime")]
 struct CacheEntry {
     digest: String,
     converted_section: render::ConvertedSection,
@@ -97,10 +129,70 @@ struct CacheEntry {
     use_dakuten_font: bool,
 }
 
-#[derive(Default)]
+#[cfg(feature = "native-runtime")]
 struct SectionConvertCache {
     buckets: HashMap<String, HashMap<String, CacheEntry>>,
     dirty_ids: std::collections::HashSet<String>,
+    /// 容量の厳しい環境 (SORAHOST など) ではキャッシュを作らない。
+    /// `convert.section-cache` (既定 true) / `NAROU_RS_SECTION_CACHE=0` で切る。
+    enabled: bool,
+}
+
+#[cfg(feature = "native-runtime")]
+impl Default for SectionConvertCache {
+    fn default() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            dirty_ids: std::collections::HashSet::new(),
+            enabled: section_cache_enabled(),
+        }
+    }
+}
+
+/// 変換の間だけ、ストアの内容を小説ディレクトリへ取り出す。
+///
+/// `sqlite.mirror-files=false` の構成では `小説データ/` に実ファイルが無いため、
+/// 変換が要求する `toc.yaml` / `本文/*.yaml` / `setting.ini` / `replace.txt` を
+/// ここで実体化する (返り値のガードがスコープを抜けると、取り出した分だけ消える)。
+/// ミラーを書く構成では何もしない。
+#[cfg(feature = "native-runtime")]
+fn materialize_for_conversion(
+    novel_dir: &std::path::Path,
+) -> Result<crate::native::object_store::MaterializedNovelFiles> {
+    if crate::native::sqlite::state::mirror_files_enabled() {
+        return Ok(crate::native::object_store::MaterializedNovelFiles::default());
+    }
+    let store = crate::native::object_store::NativeStore::for_current_root()?;
+    store.materialize_novel_files(novel_dir)
+}
+
+/// 変換済みテキストを残すか (`convert.keep-txt`、既定 true)。
+///
+/// false のときは `novel.txt` の固定名ミラーも SQLite の `novel_outputs`
+/// 行も残さず、呼び出し側が変換後の txt を削除する。Web UI のオンデマンド
+/// EPUB は保存済みの本文からその都度変換して組み立てる (二重に持たない
+/// ための設定)。環境変数 `NAROU_RS_KEEP_TXT=0` でも切れる。
+#[cfg(feature = "native-runtime")]
+pub fn keep_converted_text_file() -> bool {
+    if let Ok(value) = std::env::var("NAROU_RS_KEEP_TXT") {
+        let value = value.trim().to_ascii_lowercase();
+        return !matches!(value.as_str(), "0" | "false" | "no" | "off");
+    }
+    crate::compat::load_local_setting_bool_or("convert.keep-txt", true)
+}
+
+/// セクション変換キャッシュを作るか。
+///
+/// 環境変数 `NAROU_RS_SECTION_CACHE` (0/false/no/off で無効) が最優先、
+/// 次に `local_setting` の `convert.section-cache` (未設定は有効)。
+/// 無効にすると変換のたびに全話を変換し直す代わりに、容量を使わない。
+#[cfg(feature = "native-runtime")]
+fn section_cache_enabled() -> bool {
+    if let Ok(value) = std::env::var("NAROU_RS_SECTION_CACHE") {
+        let value = value.trim().to_ascii_lowercase();
+        return !matches!(value.as_str(), "0" | "false" | "no" | "off");
+    }
+    crate::compat::load_local_setting_bool_or("convert.section-cache", true)
 }
 
 #[derive(Serialize)]
@@ -153,7 +245,7 @@ struct CacheSettingsSignature<'a> {
 }
 
 impl NovelConverter {
-    pub(crate) fn build(
+    pub fn build(
         settings: NovelSettings,
         user_converter: Option<UserConverter>,
         capabilities: Option<ConverterCapabilities>,
@@ -163,16 +255,26 @@ impl NovelConverter {
             .as_ref()
             .and_then(|caps| caps.illustration_index.clone())
             .unwrap_or_else(|| {
-                IllustrationIndex::from_store(
-                    IllustrationStore::load(&settings.archive_path)
-                        .unwrap_or_else(|_| IllustrationStore::default()),
-                )
+                #[cfg(feature = "native-runtime")]
+                {
+                    IllustrationIndex::from_store(
+                        IllustrationStore::load(&settings.archive_path)
+                            .unwrap_or_else(|_| IllustrationStore::default()),
+                    )
+                }
+                #[cfg(not(feature = "native-runtime"))]
+                {
+                    IllustrationIndex::default()
+                }
             });
         Self {
             settings,
             user_converter,
             section_cache: HashMap::new(),
+            #[cfg(feature = "native-runtime")]
             section_convert_cache: SectionConvertCache::default(),
+            #[cfg(feature = "native-runtime")]
+            last_text_path: None,
             progress: None,
             inspector,
             display_inspector: false,
@@ -186,6 +288,7 @@ impl NovelConverter {
 
     /// Site headers/cookie for illustration downloads, replaced whenever the
     /// converter learns which novel (and therefore which site) it is handling.
+    #[cfg(feature = "native-runtime")]
     fn apply_record_fetch_policy(&mut self, record: Option<&NovelRecord>) {
         let Some(capabilities) = self.capabilities.as_mut() else {
             return;
@@ -230,15 +333,18 @@ impl NovelConverter {
         self.last_inspection_output.take()
     }
 
-    pub fn use_dakuten_font(&self) -> bool {
-        self.use_dakuten_font
+    /// 直近の変換で書いた txt のパス。`convert.keep-txt=false` のとき
+    /// 呼び出し側がこれを削除する。
+    #[cfg(feature = "native-runtime")]
+    pub fn last_converted_text_path(&self) -> Option<&std::path::Path> {
+        self.last_text_path.as_deref()
     }
 
     pub fn convert_novel(&mut self, toc: &TocObject, sections: &[SectionFile]) -> Result<String> {
         self.convert_novel_with_id(None, toc, sections)
     }
 
-    fn convert_novel_with_id(
+    pub fn convert_novel_with_id(
         &mut self,
         novel_id: Option<i64>,
         toc: &TocObject,
@@ -248,14 +354,14 @@ impl NovelConverter {
         let mut erased_intro_count = 0usize;
         let mut erased_post_count = 0usize;
         let mut converted_story = String::new();
-        if let Some(ref story) = toc.story {
-            if !story.is_empty() {
-                let mut converter =
-                    self.make_converter_with_parenthesized_ruby(!render::looks_like_html(story));
-                let story_text = render::normalize_story_source(story);
-                converted_story = converter.convert(&story_text, converter_base::TextType::Story);
-                self.use_dakuten_font |= converter.use_dakuten_font;
-            }
+        if let Some(ref story) = toc.story
+            && !story.is_empty()
+        {
+            let mut converter =
+                self.make_converter_with_parenthesized_ruby(!render::looks_like_html(story));
+            let story_text = render::normalize_story_source(story);
+            converted_story = converter.convert(&story_text, converter_base::TextType::Story);
+            self.use_dakuten_font |= converter.use_dakuten_font;
         }
 
         let mut converted_sections = Vec::new();
@@ -290,10 +396,19 @@ impl NovelConverter {
 
             let is_html =
                 section.element.data_type != "text" && section.element.data_type != "text/plain";
-            let resolved_element = if is_html && self.settings.enable_illust {
-                self.resolve_section_html_illustrations(section)
-            } else {
-                section.element.clone()
+            let resolved_element = {
+                #[cfg(feature = "native-runtime")]
+                {
+                    if is_html && self.settings.enable_illust {
+                        self.resolve_section_html_illustrations(section)
+                    } else {
+                        section.element.clone()
+                    }
+                }
+                #[cfg(not(feature = "native-runtime"))]
+                {
+                    section.element.clone()
+                }
             };
             let digest = self.compute_digest(section);
 
@@ -393,8 +508,7 @@ impl NovelConverter {
             let conv_body = results[ri].clone();
             ri += 1;
             let conv_post = if has_post {
-                let r = results[ri].clone();
-                r
+                results[ri].clone()
             } else {
                 String::new()
             };
@@ -452,6 +566,7 @@ impl NovelConverter {
         ))
     }
 
+    #[cfg(feature = "native-runtime")]
     pub fn convert_subtitles_for_hotentry(
         &mut self,
         toc: &TocObject,
@@ -623,6 +738,7 @@ impl NovelConverter {
         )
     }
 
+    #[cfg(feature = "native-runtime")]
     fn resolve_section_html_illustrations(
         &mut self,
         section: &crate::downloader::SectionFile,
@@ -652,6 +768,7 @@ impl NovelConverter {
         }
     }
 
+    #[cfg(feature = "native-runtime")]
     fn resolve_html_img_sources(
         &mut self,
         html: &str,
@@ -677,6 +794,7 @@ impl NovelConverter {
         .to_string()
     }
 
+    #[cfg(feature = "native-runtime")]
     fn resolve_section_illustration_source(
         &mut self,
         illust_dir: &Path,
@@ -736,6 +854,7 @@ impl NovelConverter {
         self.download_section_illustration(illust_dir, source)
     }
 
+    #[cfg(feature = "native-runtime")]
     fn download_section_illustration(&mut self, illust_dir: &Path, source: &str) -> Option<String> {
         let url = normalize_illustration_url(source);
         let capabilities = self.capabilities.clone()?;
@@ -801,6 +920,7 @@ impl NovelConverter {
         }
     }
 
+    #[cfg(feature = "native-runtime")]
     fn store_illustration_with_capabilities(
         &mut self,
         capabilities: &ConverterCapabilities,
@@ -814,7 +934,8 @@ impl NovelConverter {
         let Some(prefix) = capabilities.illustration_prefix.clone() else {
             return Ok(None);
         };
-        let service = IllustrationStorageService::new(assets);
+        let service = IllustrationStorageService::new(assets)
+            .with_dedup(crate::illustration_store::dedup_active());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -833,6 +954,7 @@ impl NovelConverter {
         self.section_cache.clear();
     }
 
+    #[cfg(feature = "native-runtime")]
     pub fn convert_text_file(&mut self, text: &str) -> Result<String> {
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();
@@ -858,6 +980,7 @@ impl NovelConverter {
         Ok(txt_path.display().to_string())
     }
 
+    #[cfg(feature = "native-runtime")]
     pub fn convert_text_file_with_device(
         &mut self,
         text: &str,
@@ -888,13 +1011,16 @@ impl NovelConverter {
         Ok(final_path.display().to_string())
     }
 
+    #[cfg(feature = "native-runtime")]
     pub fn convert_novel_by_id(&mut self, id: i64, novel_dir: &std::path::Path) -> Result<String> {
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();
+        // ミラーを書かない構成では実ファイルが無いので、変換の間だけ取り出す。
+        let _materialized = materialize_for_conversion(novel_dir)?;
         let toc_path = novel_dir.join("toc.yaml");
-        let toc_content = std::fs::read_to_string(&toc_path).map_err(|e| NarouError::Io(e))?;
+        let toc_content = std::fs::read_to_string(&toc_path).map_err(NarouError::Io)?;
         let toc: crate::downloader::TocFile =
-            serde_yaml::from_str(&toc_content).map_err(|e| NarouError::Yaml(e))?;
+            serde_yaml::from_str(&toc_content).map_err(NarouError::Yaml)?;
 
         let toc_object = crate::downloader::TocObject {
             title: toc.title,
@@ -921,40 +1047,57 @@ impl NovelConverter {
             record.as_ref(),
         );
         std::fs::write(&txt_path, &aozora_text)?;
+        #[cfg(feature = "native-runtime")]
+        {
+            self.last_text_path = Some(txt_path.clone());
+        }
         #[cfg(feature = "lite")]
         {
             // Fixed-name mirror so the portable object-store layout (and the
             // Worker's download-time EPUB) can address the text without the
-            // per-title output naming rules.
-            let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
+            // per-title output naming rules. `convert.keep-txt=false` では
+            // ファイルも DB の `converted_text` も残さない (EPUB は都度変換)。
+            if keep_converted_text_file() {
+                let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
+            }
             if !crate::native::sqlite::state::legacy_yaml_active() {
                 let narou_dir = novel_dir
                     .ancestors()
                     .find(|candidate| candidate.join(".narou").is_dir())
                     .map(|found| found.join(".narou"));
                 if let Some(narou_dir) = narou_dir
-                    && let Some(state) =
-                        crate::native::sqlite::state::active_for(&narou_dir)
+                    && let Some(state) = crate::native::sqlite::state::active_for(&narou_dir)
                 {
                     let conn = state.conn();
                     let mut guard = conn.lock().expect("sqlite mutex poisoned");
                     let mut sections_map = std::collections::BTreeMap::new();
                     for section in &sections {
-                        let body =
-                            serde_yaml::to_string(section).unwrap_or_else(|_| String::new());
+                        let body = serde_yaml::to_string(section).unwrap_or_else(|_| String::new());
                         sections_map.insert(
                             section.index.clone(),
                             (Some(section.subtitle.clone()), body),
                         );
                     }
-                    let _ =
-                        crate::native::sqlite::content::store_sections(&mut guard, id, &sections_map);
-                    let _ = crate::native::sqlite::content::store_output(
+                    let _ = crate::native::sqlite::content::store_sections(
                         &mut guard,
                         id,
-                        "converted_text",
-                        aozora_text.as_bytes(),
+                        &sections_map,
                     );
+                    if keep_converted_text_file() {
+                        let _ = crate::native::sqlite::content::store_output(
+                            &guard,
+                            id,
+                            "converted_text",
+                            aozora_text.as_bytes(),
+                        );
+                    } else {
+                        // 以前の実行が残した変換済みテキストを掃除する。
+                        let _ = crate::native::sqlite::content::delete_output(
+                            &guard,
+                            id,
+                            "converted_text",
+                        );
+                    }
                     let _ = crate::native::sqlite::versions::snapshot_working_set(
                         &mut guard,
                         id,
@@ -972,6 +1115,7 @@ impl NovelConverter {
         Ok(txt_path.display().to_string())
     }
 
+    #[cfg(feature = "native-runtime")]
     pub fn convert_novel_by_id_with_device(
         &mut self,
         _id: i64,
@@ -983,10 +1127,12 @@ impl NovelConverter {
         self.apply_record_fetch_policy(self.resolve_novel_record(_id).as_ref());
         self.last_inspection_output = None;
         self.inspector.borrow_mut().reset();
+        // ミラーを書かない構成では実ファイルが無いので、変換の間だけ取り出す。
+        let _materialized = materialize_for_conversion(novel_dir)?;
         let toc_path = novel_dir.join("toc.yaml");
-        let toc_content = std::fs::read_to_string(&toc_path).map_err(|e| NarouError::Io(e))?;
+        let toc_content = std::fs::read_to_string(&toc_path).map_err(NarouError::Io)?;
         let toc: crate::downloader::TocFile =
-            serde_yaml::from_str(&toc_content).map_err(|e| NarouError::Yaml(e))?;
+            serde_yaml::from_str(&toc_content).map_err(NarouError::Yaml)?;
 
         let toc_object = crate::downloader::TocObject {
             title: toc.title,
@@ -1016,9 +1162,15 @@ impl NovelConverter {
             record.as_ref(),
         );
         std::fs::write(&txt_path, &aozora_text)?;
+        #[cfg(feature = "native-runtime")]
+        {
+            self.last_text_path = Some(txt_path.clone());
+        }
         #[cfg(feature = "lite")]
         {
-            let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
+            if keep_converted_text_file() {
+                let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
+            }
             // P4a/P4b mirror: converted text + mirrored working set + version
             // snapshot live in the SQLite backend when active.
             if !crate::native::sqlite::state::legacy_yaml_active() {
@@ -1027,15 +1179,13 @@ impl NovelConverter {
                     .find(|candidate| candidate.join(".narou").is_dir())
                     .map(|found| found.join(".narou"));
                 if let Some(narou_dir) = narou_dir
-                    && let Some(state) =
-                        crate::native::sqlite::state::active_for(&narou_dir)
+                    && let Some(state) = crate::native::sqlite::state::active_for(&narou_dir)
                 {
                     let conn = state.conn();
                     let mut guard = conn.lock().expect("sqlite mutex poisoned");
                     let mut sections_map = std::collections::BTreeMap::new();
                     for section in &sections {
-                        let body =
-                            serde_yaml::to_string(section).unwrap_or_else(|_| String::new());
+                        let body = serde_yaml::to_string(section).unwrap_or_else(|_| String::new());
                         sections_map.insert(
                             section.index.clone(),
                             (Some(section.subtitle.clone()), body),
@@ -1046,12 +1196,21 @@ impl NovelConverter {
                         _id,
                         &sections_map,
                     );
-                    let _ = crate::native::sqlite::content::store_output(
-                        &mut guard,
-                        _id,
-                        "converted_text",
-                        aozora_text.as_bytes(),
-                    );
+                    if keep_converted_text_file() {
+                        let _ = crate::native::sqlite::content::store_output(
+                            &guard,
+                            _id,
+                            "converted_text",
+                            aozora_text.as_bytes(),
+                        );
+                    } else {
+                        // 以前の実行が残した変換済みテキストを掃除する。
+                        let _ = crate::native::sqlite::content::delete_output(
+                            &guard,
+                            _id,
+                            "converted_text",
+                        );
+                    }
                     let _ = crate::native::sqlite::versions::snapshot_working_set(
                         &mut guard,
                         _id,
@@ -1090,6 +1249,7 @@ impl NovelConverter {
         Ok(final_path)
     }
 
+    #[cfg(feature = "native-runtime")]
     fn inspect_converted_text(&mut self, aozora_text: &str) -> Result<()> {
         if self.settings.enable_inspect {
             self.inspector
@@ -1110,6 +1270,7 @@ impl NovelConverter {
     }
 
     /// Ruby: display_header — "ID:{id}　{title} の変換を開始"
+    #[cfg(feature = "native-runtime")]
     fn display_header(&self, id: i64, title: &str) {
         println!(
             "{}",
@@ -1118,10 +1279,12 @@ impl NovelConverter {
     }
 
     /// Ruby: display_footer — "縦書用の変換が終了しました"
+    #[cfg(feature = "native-runtime")]
     fn display_footer(&self) {
         println!("縦書用の変換が終了しました");
     }
 
+    #[cfg(feature = "native-runtime")]
     fn fetch_cached_section(
         &mut self,
         novel_id: Option<i64>,
@@ -1137,6 +1300,7 @@ impl NovelConverter {
         Some((entry.converted_section.clone(), entry.use_dakuten_font))
     }
 
+    #[cfg(feature = "native-runtime")]
     fn store_cached_section(
         &mut self,
         novel_id: Option<i64>,
@@ -1163,10 +1327,41 @@ impl NovelConverter {
         }
     }
 
+    #[cfg(feature = "native-runtime")]
     fn flush_section_convert_cache(&mut self) -> Result<()> {
         self.section_convert_cache.flush()
     }
 
+    /// Worker にはセクション変換キャッシュも挿絵ローカライズも無いので、
+    /// 参照・保存・flush を no-op にする (常に再変換し、結果は保存済みの
+    /// セクションとテキストが正)。
+    #[cfg(not(feature = "native-runtime"))]
+    fn fetch_cached_section(
+        &mut self,
+        _novel_id: Option<i64>,
+        _section_key: &str,
+        _digest: &str,
+    ) -> Option<(render::ConvertedSection, bool)> {
+        None
+    }
+
+    #[cfg(not(feature = "native-runtime"))]
+    fn store_cached_section(
+        &mut self,
+        _novel_id: Option<i64>,
+        _section_key: &str,
+        _digest: &str,
+        _converted_section: &render::ConvertedSection,
+        _use_dakuten_font: bool,
+    ) {
+    }
+
+    #[cfg(not(feature = "native-runtime"))]
+    fn flush_illustration_store(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "native-runtime")]
     fn flush_illustration_store(&mut self) -> Result<()> {
         if let Some(capabilities) = self.capabilities.clone()
             && let (Some(objects), Some(prefix)) =
@@ -1208,6 +1403,7 @@ fn target_device_cache_key(device: Option<device::Device>) -> &'static str {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 impl SectionConvertCache {
     fn bucket(&mut self, novel_id: i64) -> Result<&HashMap<String, CacheEntry>> {
         self.load_bucket_if_needed(novel_id)?;
@@ -1230,13 +1426,32 @@ impl SectionConvertCache {
         if self.buckets.contains_key(&key) {
             return Ok(());
         }
+        if !self.enabled {
+            // キャッシュ無効: 読まずに空のバケットを作る。
+            self.buckets.insert(key, HashMap::new());
+            return Ok(());
+        }
         migrate_legacy_section_convert_cache()?;
-        let bucket = load_section_convert_bucket(novel_id)?;
-        self.buckets.insert(key, bucket);
+        let (bucket, legacy_format) = load_section_convert_bucket(novel_id)?;
+        self.buckets.insert(key.clone(), bucket);
+        if legacy_format {
+            // 旧形式 (生 YAML) は次の flush で圧縮して書き直す。
+            self.dirty_ids.insert(key);
+        }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
+        if !self.enabled {
+            // 無効に切り替えた後の初回変換で、残っているキャッシュを片付ける
+            // (容量節約のための設定なので、過去のファイルを残しても意味がない)。
+            for id in self.buckets.keys() {
+                let _ = clear_section_convert_cache_file(id);
+            }
+            self.buckets.clear();
+            self.dirty_ids.clear();
+            return Ok(());
+        }
         if self.dirty_ids.is_empty() {
             return Ok(());
         }
@@ -1250,23 +1465,28 @@ impl SectionConvertCache {
     }
 }
 
-pub fn clear_section_convert_cache(id: i64) -> Result<()> {
-    migrate_legacy_section_convert_cache()?;
-    let path = section_convert_cache_file_path(&id.to_string())?;
+/// 1 小説ぶんのキャッシュファイル (と旧ロック) を消す。存在しなければ何もしない。
+#[cfg(feature = "native-runtime")]
+fn clear_section_convert_cache_file(id: &str) -> Result<()> {
+    let path = section_convert_cache_file_path(id)?;
     let lock_path = path.with_extension("yaml.lock");
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(NarouError::Io(e)),
-    }
-    match std::fs::remove_file(lock_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(NarouError::Io(e)),
+    for target in [path, lock_path] {
+        match std::fs::remove_file(&target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(NarouError::Io(e)),
+        }
     }
     Ok(())
 }
 
+#[cfg(feature = "native-runtime")]
+pub fn clear_section_convert_cache(id: i64) -> Result<()> {
+    migrate_legacy_section_convert_cache()?;
+    clear_section_convert_cache_file(&id.to_string())
+}
+
+#[cfg(feature = "native-runtime")]
 fn section_convert_cache_dir() -> Result<PathBuf> {
     crate::db::with_database(|db| {
         Ok(db
@@ -1277,32 +1497,73 @@ fn section_convert_cache_dir() -> Result<PathBuf> {
     })
 }
 
+#[cfg(feature = "native-runtime")]
 fn section_convert_cache_file_path(id: &str) -> Result<PathBuf> {
     Ok(section_convert_cache_dir()?.join(format!("{}.yaml", id)))
 }
 
-fn load_section_convert_bucket(novel_id: i64) -> Result<HashMap<String, CacheEntry>> {
+/// 保存済みバケットを読む。戻り値の `bool` は「旧形式 (生 YAML) だった」
+/// ことを示し、呼び出し側が dirty として扱って次の flush で圧縮し直す。
+#[cfg(feature = "native-runtime")]
+fn load_section_convert_bucket(novel_id: i64) -> Result<(HashMap<String, CacheEntry>, bool)> {
     let path = section_convert_cache_file_path(&novel_id.to_string())?;
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((HashMap::new(), false)),
         Err(e) => return Err(NarouError::Io(e)),
     };
-    if raw.trim().is_empty() {
-        return Ok(HashMap::new());
+    if bytes.is_empty() {
+        return Ok((HashMap::new(), false));
     }
-    Ok(serde_yaml::from_str(&raw)?)
+    let legacy = !bytes.starts_with(SECTION_CONVERT_CACHE_MAGIC.as_bytes());
+    let yaml = decode_section_convert_cache(&bytes)?;
+    if yaml.iter().all(u8::is_ascii_whitespace) {
+        return Ok((HashMap::new(), legacy));
+    }
+    Ok((serde_yaml::from_slice(&yaml)?, legacy))
 }
 
+/// 保存形式のヘッダを剥がして YAML 本体を返す。ヘッダが無ければ旧形式
+/// (生 YAML) としてそのまま返す。
+#[cfg(feature = "native-runtime")]
+fn decode_section_convert_cache(bytes: &[u8]) -> Result<Vec<u8>> {
+    let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+        return Ok(bytes.to_vec());
+    };
+    let Ok(header) = std::str::from_utf8(&bytes[..newline]) else {
+        return Ok(bytes.to_vec());
+    };
+    let Some(encoding) = header.strip_prefix(SECTION_CONVERT_CACHE_MAGIC) else {
+        return Ok(bytes.to_vec());
+    };
+    let encoding = crate::platform::ObjectEncoding::parse(encoding.trim())?;
+    crate::platform::decompress_object_payload(&bytes[newline + 1..], encoding)
+}
+
+#[cfg(feature = "native-runtime")]
+fn encode_section_convert_cache(yaml: &[u8]) -> Result<Vec<u8>> {
+    let (payload, encoding) = crate::platform::compress_object_payload(yaml);
+    let mut out = format!("{} {}\n", SECTION_CONVERT_CACHE_MAGIC, encoding.as_str()).into_bytes();
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+#[cfg(feature = "native-runtime")]
 fn save_section_convert_bucket(id: &str, bucket: &HashMap<String, CacheEntry>) -> Result<()> {
     let path = section_convert_cache_file_path(id)?;
-    crate::db::inventory::update_locked_yaml_file::<(), HashMap<String, CacheEntry>, _>(
-        &path,
-        |_| Ok((bucket.clone(), ())),
-    )?;
+    let mut yaml = serde_yaml::to_string(bucket)?;
+    if yaml.starts_with("---\n") {
+        yaml.drain(..4);
+    }
+    let encoded = encode_section_convert_cache(yaml.as_bytes())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::native::object_store::atomic_write_bytes(&path, &encoded)?;
     Ok(())
 }
 
+#[cfg(feature = "native-runtime")]
 fn migrate_legacy_section_convert_cache() -> Result<()> {
     let legacy_path = crate::db::with_database(|db| {
         Ok(db
@@ -1327,6 +1588,7 @@ fn migrate_legacy_section_convert_cache() -> Result<()> {
     rename_legacy_section_convert_cache(&legacy_path)
 }
 
+#[cfg(feature = "native-runtime")]
 fn rename_legacy_section_convert_cache(path: &Path) -> Result<()> {
     let migrated_path = path.with_extension("yaml.migrated");
     match std::fs::rename(path, &migrated_path) {
@@ -1339,6 +1601,7 @@ fn rename_legacy_section_convert_cache(path: &Path) -> Result<()> {
     }
 }
 
+#[cfg(feature = "native-runtime")]
 fn load_sections_from_dir(
     novel_dir: &std::path::Path,
     subtitles: &[crate::downloader::SubtitleInfo],
@@ -1348,36 +1611,37 @@ fn load_sections_from_dir(
 
     for sub in subtitles {
         let filename = format!("{} {}.yaml", sub.index, sub.file_subtitle);
-        let path = match crate::native::legacy_persistence::resolve_section_file_path(&section_dir, sub)
-        {
-            Some(path) => path,
-            None => {
-                // SQLite storage keeps its own copy of every section, so a
-                // mirror file deleted outside narou can still be rebuilt here
-                // instead of failing the conversion.
-                crate::native::object_store::ensure_mirror_file(&section_dir.join(&filename));
-                crate::native::legacy_persistence::resolve_section_file_path(&section_dir, sub)
-                    .ok_or_else(|| {
-                        NarouError::Io(std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!(
-                                "section file not found: expected '{}' in {}",
-                                filename,
-                                section_dir.display()
-                            ),
-                        ))
-                    })?
-            }
-        };
-        let content = std::fs::read_to_string(&path).map_err(|e| NarouError::Io(e))?;
+        let path =
+            match crate::native::legacy_persistence::resolve_section_file_path(&section_dir, sub) {
+                Some(path) => path,
+                None => {
+                    // SQLite storage keeps its own copy of every section, so a
+                    // mirror file deleted outside narou can still be rebuilt here
+                    // instead of failing the conversion.
+                    crate::native::object_store::ensure_mirror_file(&section_dir.join(&filename));
+                    crate::native::legacy_persistence::resolve_section_file_path(&section_dir, sub)
+                        .ok_or_else(|| {
+                            NarouError::Io(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!(
+                                    "section file not found: expected '{}' in {}",
+                                    filename,
+                                    section_dir.display()
+                                ),
+                            ))
+                        })?
+                }
+            };
+        let content = std::fs::read_to_string(&path).map_err(NarouError::Io)?;
         let section: crate::downloader::SectionFile =
-            serde_yaml::from_str(&content).map_err(|e| NarouError::Yaml(e))?;
+            serde_yaml::from_str(&content).map_err(NarouError::Yaml)?;
         sections.push(section);
     }
 
     Ok(sections)
 }
 
+#[cfg(feature = "native-runtime")]
 fn save_latest_convert(id: i64) -> Result<()> {
     let inventory = crate::db::inventory::Inventory::with_default_root()?;
     let mut latest: std::collections::HashMap<String, serde_yaml::Value> = inventory.load(
@@ -1396,6 +1660,7 @@ fn save_latest_convert(id: i64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native-runtime")]
 fn strip_book_header_and_footer(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let Some(first_page_break) = lines.iter().position(|line| *line == "［＃改ページ］")
@@ -1434,6 +1699,7 @@ fn find_saved_section_illustration_filename(
     find_saved_illustration_filename(illust_dir, &basename)
 }
 
+#[cfg(feature = "native-runtime")]
 fn fetch_illustration_bytes(
     http: Arc<dyn HttpClient>,
     rate_limiter: Arc<dyn RateLimiter>,
@@ -1663,9 +1929,7 @@ mod tests {
     }
 
     #[test]
-    fn section_convert_cache_supports_large_per_novel_files() {
-        const OLD_SECTION_CACHE_LIMIT: usize = 32 * 1024 * 1024;
-
+    fn a_disabled_cache_writes_nothing_and_clears_what_exists() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
@@ -1673,6 +1937,88 @@ mod tests {
         *crate::db::DATABASE.lock() = None;
         crate::db::init_database().unwrap();
 
+        let path = temp
+            .path()
+            .join(".narou")
+            .join("section_convert_cache")
+            .join("3062.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = HashMap::from([(
+            "本文\\1.yaml".to_string(),
+            make_cache_entry(&"a".repeat(1024)),
+        )]);
+        std::fs::write(&path, serde_yaml::to_string(&legacy).unwrap()).unwrap();
+        assert!(path.is_file());
+
+        let mut cache = super::SectionConvertCache {
+            buckets: HashMap::new(),
+            dirty_ids: std::collections::HashSet::new(),
+            enabled: false,
+        };
+        cache.bucket(3062).unwrap();
+        cache.flush().unwrap();
+        assert!(
+            !path.is_file(),
+            "a disabled cache must not keep the stored file on disk"
+        );
+        // 二度目の flush も落ちないこと。
+        cache.flush().unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+    }
+
+    #[test]
+    fn a_legacy_cache_file_is_rewritten_compressed_on_flush() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        // 旧形式 (生 YAML) を置き、読み込み後の flush で圧縮して書き直すこと。
+        let body = "a".repeat(200_000);
+        let legacy = HashMap::from([("本文\\1.yaml".to_string(), make_cache_entry(&body))]);
+        let path = temp
+            .path()
+            .join(".narou")
+            .join("section_convert_cache")
+            .join("3062.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_yaml::to_string(&legacy).unwrap()).unwrap();
+        let before = path.metadata().unwrap().len();
+
+        let mut cache = super::SectionConvertCache::default();
+        cache.bucket(3062).unwrap();
+        cache.flush().unwrap();
+
+        let after = path.metadata().unwrap().len();
+        assert!(
+            after < before,
+            "legacy cache must be rewritten compressed: {before} -> {after}"
+        );
+
+        let mut reopened = super::SectionConvertCache::default();
+        let loaded = reopened.bucket(3062).unwrap();
+        assert_eq!(
+            loaded["本文\\1.yaml"].converted_section.body.len(),
+            body.len()
+        );
+
+        *crate::db::DATABASE.lock() = None;
+    }
+
+    #[test]
+    fn section_convert_cache_supports_large_per_novel_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+
+        *crate::db::DATABASE.lock() = None;
+        crate::db::init_database().unwrap();
+
+        // 旧実装は 1 ファイル 32MB 上限だった。今は小説ごとのファイルに分け、
+        // 中身は圧縮して持つ (生 YAML のままより大幅に小さくなる)。
         let body = "a".repeat(32 * 1024 * 1024 + 1024);
         let bucket = HashMap::from([("本文\\1.yaml".to_string(), make_cache_entry(&body))]);
         save_section_convert_bucket("3062", &bucket).unwrap();
@@ -1682,7 +2028,12 @@ mod tests {
             .join(".narou")
             .join("section_convert_cache")
             .join("3062.yaml");
-        assert!(path.metadata().unwrap().len() > OLD_SECTION_CACHE_LIMIT as u64);
+        let stored = path.metadata().unwrap().len();
+        assert!(
+            stored < (body.len() / 10) as u64,
+            "cache must be stored compressed: {stored} bytes for a {} byte body",
+            body.len()
+        );
 
         let mut cache = super::SectionConvertCache::default();
         let loaded = cache.bucket(3062).unwrap();
@@ -1730,8 +2081,10 @@ mod tests {
         std::fs::write(illust_dir.join("i422674.png"), b"dummy").unwrap();
         let hash = hash_bytes(b"dummy");
 
-        let mut settings = NovelSettings::default();
-        settings.archive_path = root.clone();
+        let settings = NovelSettings {
+            archive_path: root.clone(),
+            ..NovelSettings::default()
+        };
         let section = make_illustration_section();
         let mut converter = NovelConverter::new(settings);
         let resolved = converter.resolve_section_html_illustrations(&section);
@@ -1783,8 +2136,10 @@ mod tests {
         std::fs::create_dir_all(&illust_dir).unwrap();
         std::fs::write(illust_dir.join("i422674.jpg"), b"dummy").unwrap();
 
-        let mut settings = NovelSettings::default();
-        settings.archive_path = root.clone();
+        let settings = NovelSettings {
+            archive_path: root.clone(),
+            ..NovelSettings::default()
+        };
         let mut section = make_illustration_section();
         section.element.body = format!("{}{}", section.element.body, section.element.body);
         let mut converter = NovelConverter::new(settings);
@@ -1805,8 +2160,10 @@ mod tests {
         std::fs::create_dir_all(&illust_dir).unwrap();
         std::fs::write(illust_dir.join("i422674.jpg"), b"dummy").unwrap();
 
-        let mut settings = NovelSettings::default();
-        settings.archive_path = root.clone();
+        let settings = NovelSettings {
+            archive_path: root.clone(),
+            ..NovelSettings::default()
+        };
         let toc = TocObject {
             title: "title".to_string(),
             author: "author".to_string(),
@@ -1918,11 +2275,13 @@ mod tests {
     fn convert_text_file_records_enchant_midashi_recommendation() {
         let root = make_temp_illustration_root();
 
-        let mut settings = NovelSettings::default();
-        settings.archive_path = root.clone();
-        settings.output_filename = "converted.txt".to_string();
-        settings.enable_enchant_midashi = false;
-        settings.enable_inspect = true;
+        let settings = NovelSettings {
+            archive_path: root.clone(),
+            output_filename: "converted.txt".to_string(),
+            enable_enchant_midashi: false,
+            enable_inspect: true,
+            ..NovelSettings::default()
+        };
 
         let mut converter = NovelConverter::new(settings);
         converter.set_display_inspector(true);
@@ -1966,13 +2325,17 @@ mod tests {
 
         let baseline = NovelConverter::new(NovelSettings::default()).compute_digest(&section);
 
-        let mut settings_changed = NovelSettings::default();
-        settings_changed.enable_strip_decoration_tag = true;
+        let settings_changed = NovelSettings {
+            enable_strip_decoration_tag: true,
+            ..NovelSettings::default()
+        };
         let settings_digest = NovelConverter::new(settings_changed).compute_digest(&section);
         assert_ne!(baseline, settings_digest);
 
-        let mut replace_changed = NovelSettings::default();
-        replace_changed.replace_patterns = vec![("本文".to_string(), "置換本文".to_string())];
+        let replace_changed = NovelSettings {
+            replace_patterns: vec![("本文".to_string(), "置換本文".to_string())],
+            ..NovelSettings::default()
+        };
         let replace_digest = NovelConverter::new(replace_changed).compute_digest(&section);
         assert_ne!(baseline, replace_digest);
 
@@ -2042,8 +2405,10 @@ before_settings:
             Some(crate::illustration_store::IllustrationIndex::default());
         capabilities.illustration_prefix = Some(ObjectKey::try_new("novels").unwrap());
 
-        let mut settings = NovelSettings::default();
-        settings.archive_path = Path::new("not-a-native-path").to_path_buf();
+        let settings = NovelSettings {
+            archive_path: Path::new("not-a-native-path").to_path_buf(),
+            ..NovelSettings::default()
+        };
         let mut converter = NovelConverter::with_capabilities(settings, capabilities);
         let localized = converter
             .download_section_illustration(Path::new("not-a-native-path/挿絵"), source)
@@ -2054,9 +2419,7 @@ before_settings:
         assert_eq!(objects.len(), 2);
         assert!(
             futures::executor::block_on(
-                objects.read_small(
-                    &ObjectKey::try_new("novels/.illustration_cache.yaml").unwrap()
-                )
+                objects.read_small(&ObjectKey::try_new("novels/.illustration_cache.yaml").unwrap())
             )
             .unwrap()
             .is_some()

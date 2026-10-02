@@ -1,9 +1,9 @@
-use std::cmp::Ordering;
-
-use serde_yaml::{Mapping, Value};
+use serde_yaml::Value;
 
 use crate::db::{
-    NovelRecord, compare_records_by_key, inventory::{Inventory, InventoryScope}, sort_keys,
+    NovelRecord,
+    inventory::{Inventory, InventoryScope},
+    sort_keys,
 };
 
 /// Web UI / CLI 共通のソートキー一覧。`db::SORT_KEYS` を再エクスポートして
@@ -12,61 +12,17 @@ use crate::db::{
 pub use crate::db::SORT_KEYS as SORT_COLUMN_KEYS;
 
 /// Web UI の表示ラベル。`SORT_COLUMN_KEYS` (≒ `db::sort_keys()`) と長さを揃え、
-/// 同じインデックスで日本語ラベルを参照できるようにする。
-pub const SORT_COLUMN_LABELS: &[&str] = &[
-    "ID",             // 0  id
-    "最終更新日",     // 1  last_update
-    "最新話掲載日",   // 2  general_lastup
-    "最終確認日",     // 3  last_check_date
-    "タイトル",       // 4  title
-    "作者",           // 5  author
-    "サイト名",       // 6  sitename
-    "小説種別",       // 7  novel_type
-    "タグ",           // 8  tags
-    "話数",           // 9  general_all_no
-    "文字数",         // 10 length
-    "状態",           // 11 status
-    "URL",            // 12 toc_url
-    "新着日",         // 13 new_arrivals_date
-];
+/// 同じインデックスで日本語ラベルを参照できるようにする。定義は Worker と共有する
+/// [`crate::application::settings_view`] 側にある。
+pub use crate::application::settings_view::{SORT_COLUMN_LABELS, sort_column_label_for_key};
 
-pub(crate) const DEFAULT_CURRENT_SORT_COLUMN: usize = 2;
-pub(crate) const DEFAULT_CURRENT_SORT_DIR: &str = "desc";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CurrentSortState {
-    pub(crate) column: usize,
-    pub(crate) dir: String,
-}
-
-impl CurrentSortState {
-    pub(crate) fn to_json_value(&self) -> serde_json::Value {
-        serde_json::json!({
-            "column": self.column,
-            "dir": self.dir,
-        })
-    }
-
-    pub(crate) fn to_yaml_value(&self) -> Value {
-        let mut mapping = Mapping::new();
-        mapping.insert(
-            Value::String("column".to_string()),
-            serde_yaml::to_value(self.column).expect("serialize sort column"),
-        );
-        mapping.insert(
-            Value::String("dir".to_string()),
-            Value::String(self.dir.clone()),
-        );
-        Value::Mapping(mapping)
-    }
-}
-
-pub(crate) fn default_current_sort_state() -> CurrentSortState {
-    CurrentSortState {
-        column: DEFAULT_CURRENT_SORT_COLUMN,
-        dir: DEFAULT_CURRENT_SORT_DIR.to_string(),
-    }
-}
+// ソート状態の型・既定値・正規化・レコード比較は Worker でも同じ規則を使うため、
+// 唯一の定義を可搬層 `crate::application::webui` に置き、ここでは再エクスポートする。
+pub(crate) use crate::application::webui::{
+    CurrentSortState, current_sort_from_server_setting, default_current_sort_state,
+    normalize_current_sort_request, sort_column_key, sort_display_label, sort_records,
+};
+pub use crate::application::webui::sort_record_ordering;
 
 pub(crate) fn load_current_sort_state() -> CurrentSortState {
     let sort_state = (|| {
@@ -75,18 +31,6 @@ pub(crate) fn load_current_sort_state() -> CurrentSortState {
         current_sort_from_server_setting(&server_setting)
     })();
     sort_state.unwrap_or_else(default_current_sort_state)
-}
-
-pub(crate) fn current_sort_from_server_setting(server_setting: &Value) -> Option<CurrentSortState> {
-    server_setting
-        .as_mapping()?
-        .get(Value::String("current_sort".to_string()))
-        .and_then(normalize_current_sort_value)
-}
-
-pub(crate) fn normalize_current_sort_request(body: &serde_json::Value) -> Option<CurrentSortState> {
-    let value = serde_yaml::to_value(body).ok()?;
-    normalize_current_sort_value(&value)
 }
 
 pub(crate) fn request_sort_state(
@@ -112,46 +56,8 @@ pub(crate) fn requested_or_current_sort_state(
     load_current_sort_state()
 }
 
-pub(crate) fn sort_column_key(sort_state: &CurrentSortState) -> Option<&'static str> {
-    sort_keys().get(sort_state.column).copied()
-}
-
-pub(crate) fn sort_column_label(sort_state: &CurrentSortState) -> Option<&'static str> {
-    SORT_COLUMN_LABELS.get(sort_state.column).copied()
-}
-
 pub fn normalize_sort_key(key: &str) -> Option<&'static str> {
     sort_keys().iter().copied().find(|candidate| *candidate == key)
-}
-
-pub fn sort_column_label_for_key(key: &str) -> Option<&'static str> {
-    let index = sort_keys().iter().position(|candidate| *candidate == key)?;
-    SORT_COLUMN_LABELS.get(index).copied()
-}
-
-/// `db::compare_records_by_key` の薄いラッパ。CLI / Web 双方から共有される
-/// 「ソートキー 1 個分の比較」であり、BUG-9 で導入された型付き + None 安定順の
-/// セマンティクス (`compare_optional` を経由) をそのまま使う。
-///
-/// 未知のキーは `db::compare_records_by_key` と同じく id 比較へフォールバックする。
-pub fn sort_record_ordering(a: &NovelRecord, b: &NovelRecord, sort_key: &str) -> Ordering {
-    compare_records_by_key(a, b, sort_key)
-}
-
-pub(crate) fn sort_records(records: &mut Vec<NovelRecord>, sort_state: &CurrentSortState) {
-    let sort_key = sort_column_key(sort_state).unwrap_or("id");
-    let reverse = sort_state.dir == "desc";
-    records.sort_by(|a, b| {
-        // 安定ソート: 主キーが Equal の場合は id で順序を決める。これにより
-        // 同じ general_lastup / length / タグなどを共有するレコード間の順序が
-        // db::sort_by と一致する。
-        let ordering = sort_record_ordering(a, b, sort_key).then_with(|| a.id.cmp(&b.id));
-        if reverse {
-            ordering.reverse()
-        } else {
-            ordering
-        }
-    });
 }
 
 pub(crate) fn sort_ids_from_records(
@@ -164,59 +70,21 @@ pub(crate) fn sort_ids_from_records(
         return ids.to_vec();
     }
     let sort_state = requested_or_current_sort_state(sort_state, timestamp);
-    let selected = ids.iter().copied().collect::<std::collections::HashSet<_>>();
-    let mut records = records
-        .iter()
-        .filter(|record| selected.contains(&record.id))
-        .cloned()
-        .collect::<Vec<_>>();
-    sort_records(&mut records, &sort_state);
-    records.into_iter().map(|record| record.id).collect()
-}
-
-fn normalize_current_sort_value(sort_state: &Value) -> Option<CurrentSortState> {
-    let sort_state = sort_state.as_mapping()?;
-    let column = sort_state
-        .get(Value::String("column".to_string()))
-        .or_else(|| sort_state.get(Value::String(":column".to_string())))
-        .and_then(normalize_sort_column)?;
-    let dir = sort_state
-        .get(Value::String("dir".to_string()))
-        .or_else(|| sort_state.get(Value::String(":dir".to_string())))
-        .and_then(normalize_sort_dir)?;
-    Some(CurrentSortState { column, dir })
-}
-
-fn normalize_sort_column(value: &Value) -> Option<usize> {
-    let column = match value {
-        Value::Number(number) => number.as_u64().map(|value| value as usize)?,
-        Value::String(text) if text.chars().all(|ch| ch.is_ascii_digit()) => {
-            text.parse::<usize>().ok()?
-        }
-        _ => return None,
-    };
-    sort_keys().get(column).map(|_| column)
-}
-
-fn normalize_sort_dir(value: &Value) -> Option<String> {
-    let text = match value {
-        Value::String(text) => text.as_str(),
-        _ => return None,
-    };
-    let text = text.trim_start_matches(':');
-    match text {
-        "asc" | "desc" => Some(text.to_string()),
-        _ => None,
-    }
+    crate::application::webui::sort_ids_from_records(ids, records, &sort_state)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CURRENT_SORT_COLUMN, DEFAULT_CURRENT_SORT_DIR, CurrentSortState,
-        current_sort_from_server_setting, default_current_sort_state, normalize_current_sort_request,
-        normalize_sort_key, request_preserves_input_order, request_sort_state, sort_column_key,
-        sort_column_label, sort_column_label_for_key, sort_record_ordering, sort_records,
+        CurrentSortState, current_sort_from_server_setting, default_current_sort_state,
+        normalize_current_sort_request, normalize_sort_key, request_preserves_input_order,
+        request_sort_state, sort_column_key, sort_column_label_for_key, sort_record_ordering,
+        sort_records,
+    };
+    // `sort_column_label` はテスト側だけが使うので本体の再エクスポートからは
+    // 外し、ここで可搬層から直接取る。
+    use crate::application::webui::{
+        DEFAULT_CURRENT_SORT_COLUMN, DEFAULT_CURRENT_SORT_DIR, sort_column_label,
     };
     use crate::db::NovelRecord;
     use crate::web::sort_state::SORT_COLUMN_KEYS;

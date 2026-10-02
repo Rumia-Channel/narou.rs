@@ -107,8 +107,19 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "convert.filename-to-ncode"
         | "convert.add-dc-subject-to-epub"
         | "convert.dc-subject-exclude-tags"
+        | "convert.rotate-image"
         | "send.without-freeze"
-        | "auto-add-tags" => Some("general"),
+        | "convert.section-cache"
+        | "convert.keep-txt"
+        | "sqlite.mirror-files"
+        | "auto-add-tags"
+        | "s3.asset-backend"
+        | "s3.endpoint"
+        | "s3.bucket"
+        | "s3.region"
+        | "s3.prefix"
+        | "s3.access-key-id"
+        | "s3.secret-access-key" => Some("general"),
 
         // local → detail
         "hotentry.auto-mail"
@@ -150,14 +161,20 @@ pub fn tab_for_setting(name: &str) -> Option<&'static str> {
         | "no-color"
         | "color-parser"
         | "server-port"
+        | "server-ws-port"
         | "server-bind"
+        | "server-digest-auth.enable"
+        | "server-digest-auth.user"
+        | "server-digest-auth.password"
+        | "server-digest-auth.hashed-password"
         | "server-basic-auth.enable"
         | "server-basic-auth.user"
         | "server-basic-auth.password"
         | "server-ws-add-accepted-domains"
         | "server-add-accepted-hosts"
-        | "convert.epub-font"
         | "self-update.variant"
+        | "convert.epub-engine"
+        | "convert.epub-font"
         | "over18" => Some("global"),
 
         _ => None,
@@ -490,6 +507,703 @@ pub fn original_setting_var_infos() -> Vec<(&'static str, VarInfo)> {
     ]
 }
 
+/// Local setting variable metadata
+pub fn setting_variables() -> SettingVariables {
+    let vis = |vt: VarType, help: &'static str| VarInfo {
+        var_type: vt,
+        help,
+        invisible: false,
+        select_keys: None,
+    };
+    let invis = |vt: VarType, help: &'static str| VarInfo {
+        var_type: vt,
+        help,
+        invisible: true,
+        select_keys: None,
+    };
+    let invis_sel = |help: &'static str, keys: Vec<&'static str>| VarInfo {
+        var_type: VarType::Select,
+        help,
+        invisible: true,
+        select_keys: Some(keys.iter().map(|s| s.to_string()).collect()),
+    };
+    let sel = |help: &'static str, keys: Vec<&'static str>| VarInfo {
+        var_type: VarType::Select,
+        help,
+        invisible: false,
+        select_keys: Some(keys.iter().map(|s| s.to_string()).collect()),
+    };
+    let multi = |help: &'static str, keys: Vec<&'static str>| VarInfo {
+        var_type: VarType::Multiple,
+        help,
+        invisible: false,
+        select_keys: Some(keys.iter().map(|s| s.to_string()).collect()),
+    };
+
+    let local_vars = vec![
+        (
+            "device",
+            sel(
+                "変換、送信対象の端末(sendの--help参照)",
+                vec!["kindle", "kobo", "epub", "ibunko", "reader", "ibooks"],
+            ),
+        ),
+        (
+            "hotentry",
+            vis(VarType::Boolean, "新着投稿だけをまとめたデータを作る"),
+        ),
+        (
+            "hotentry.auto-mail",
+            vis(
+                VarType::Boolean,
+                "hotentryをメールで送る(mail設定済みの場合)",
+            ),
+        ),
+        (
+            "mail.attachment-filename-pattern",
+            vis(
+                VarType::String,
+                "メール添付ファイル名だけに適用する正規表現。例: ^\\[[^\\]]+\\](.*)$",
+            ),
+        ),
+        (
+            "mail.attachment-filename-replacement",
+            vis(
+                VarType::String,
+                "一致部分の置換文字列。捕捉は $1 や $name で指定する。例: $1",
+            ),
+        ),
+        (
+            "concurrency",
+            vis(
+                VarType::Boolean,
+                "ダウンロードと変換の同時実行を有効にする。有効にするとログの出力方式が変更される",
+            ),
+        ),
+        (
+            "concurrency.format-queue-text",
+            invis(
+                VarType::String,
+                "同時実行時の変換キュー表示テキストのフォーマット",
+            ),
+        ),
+        (
+            "concurrency.format-queue-style",
+            vis(
+                VarType::String,
+                "同時実行時の変換キュー表示スタイルのフォーマット",
+            ),
+        ),
+        (
+            "logging",
+            vis(
+                VarType::Boolean,
+                "ログの保存を有効にする。保存場所はlogフォルダ。concurrencyが有効な場合、変換ログだけ別ファイルに出力される",
+            ),
+        ),
+        (
+            "logging.format-filename",
+            vis(
+                VarType::String,
+                "ログファイル名のフォーマット。日付でファイルを分けたくなければ固定ファイル名にする。書式は http://bit.ly/date_format 参照",
+            ),
+        ),
+        (
+            "logging.format-timestamp",
+            vis(
+                VarType::String,
+                "ログ内のタイムスタンプのフォーマット。タイムスタンプを記録したくなければ $none とだけ入力",
+            ),
+        ),
+        (
+            "update.interval",
+            vis(
+                VarType::Float,
+                "更新時に各作品間で指定した秒数待機する(処理時間を含む)",
+            ),
+        ),
+        (
+            "update.strong",
+            vis(
+                VarType::Boolean,
+                "改稿日当日の連続更新でも更新漏れが起きないように、中身もチェックして更新を検知する(やや処理が重くなる)",
+            ),
+        ),
+        (
+            "update.convert-only-new-arrival",
+            vis(VarType::Boolean, "更新時に新着がある場合のみ変換を実行する"),
+        ),
+        (
+            "update.sort-by",
+            sel(
+                "アップデートを指定した項目順で行う",
+                vec![
+                    "id",
+                    "last_update",
+                    "general_lastup",
+                    "last_check_date",
+                    "title",
+                    "author",
+                    "sitename",
+                    "novel_type",
+                    "tags",
+                    "general_all_no",
+                    "length",
+                    "status",
+                    "toc_url",
+                    "new_arrivals_date",
+                ],
+            ),
+        ),
+        (
+            "update.auto-schedule.enable",
+            vis(VarType::Boolean, "自動アップデート機能を有効にする"),
+        ),
+        (
+            "update.auto-schedule",
+            vis(
+                VarType::String,
+                "自動アップデートする時間を指定する。カンマ区切りで複数指定可能。\n      書式：HHMM (例: 0800,1200,1800 = 8時、12時、18時)",
+            ),
+        ),
+        (
+            "update.auto-schedule.timezone",
+            vis(
+                VarType::String,
+                "自動アップデートのHHMMを評価するIANAタイムゾーン。未設定ならローカル時間(Worker の既定値は Asia/Tokyo)",
+            ),
+        ),
+        (
+            "update.max-parallel-domains",
+            vis(
+                VarType::Integer,
+                "アップデート時にドメインごとにダウンロードワーカーを並列化する数。同一ドメイン内は常に直列で処理されるため対サイト礼儀は崩れない。1で従来の逐次動作。デフォルトは 4",
+            ),
+        ),
+        (
+            "convert.copy-to",
+            vis(
+                VarType::Directory,
+                "変換したらこのフォルダにコピーする\n      ※注意：存在しないフォルダだとエラーになる",
+            ),
+        ),
+        (
+            "convert.copy-zip-to",
+            vis(
+                VarType::Directory,
+                "生成したZIPファイルをこのフォルダにコピーする\n      ※注意：存在しないフォルダだとエラーになる",
+            ),
+        ),
+        (
+            "convert.copy-to-grouping",
+            multi(
+                "copy-toで指定したフォルダの中で更に指定の各種フォルダにまとめる",
+                vec!["device", "site"],
+            ),
+        ),
+        (
+            "convert.copy_to",
+            invis(VarType::Directory, "copy-toの昔の書き方(非推奨)"),
+        ),
+        (
+            "convert.no-epub",
+            invis(VarType::Boolean, "EPUB変換を無効にする"),
+        ),
+        (
+            "convert.no-mobi",
+            invis(VarType::Boolean, "MOBI変換を無効にする"),
+        ),
+        (
+            "convert.no-strip",
+            invis(VarType::Boolean, "MOBIのstripを無効にする"),
+        ),
+        (
+            "convert.no-zip",
+            invis(VarType::Boolean, "i文庫用のzipファイル作成を無効にする"),
+        ),
+        (
+            "convert.make-zip",
+            vis(
+                VarType::Boolean,
+                "ZIPファイルの作成を有効にする（対応端末: i文庫）",
+            ),
+        ),
+        (
+            "convert.no-open",
+            vis(VarType::Boolean, "変換時に保存フォルダを開かないようにする"),
+        ),
+        (
+            "convert.inspect",
+            vis(VarType::Boolean, "常に変換時に調査結果を表示する"),
+        ),
+        (
+            "convert.multi-device",
+            multi(
+                "複数の端末用に同時に変換する。deviceよりも優先される。端末名をカンマ区切りで入力。ただのEPUBを出力したい場合はepubを指定",
+                vec!["kindle", "kobo", "epub", "ibunko", "reader", "ibooks"],
+            ),
+        ),
+        (
+            "convert.filename-to-ncode",
+            vis(
+                VarType::Boolean,
+                "書籍ファイル名をNコードで出力する(ドメイン_Nコードの形式)",
+            ),
+        ),
+        (
+            "convert.add-dc-subject-to-epub",
+            vis(
+                VarType::Boolean,
+                "EPUB変換時にstandard.opfファイルにdc:subject要素を追加する。小説のタグ情報がdc:subjectとして埋め込まれます",
+            ),
+        ),
+        (
+            "convert.dc-subject-exclude-tags",
+            vis(
+                VarType::String,
+                "dc:subjectから除外するタグをカンマ区切りで指定する。初期値は「404,end」（初回実行時に自動設定される）。すべてのタグを埋め込みたい場合は空文字列を設定",
+            ),
+        ),
+        (
+            "convert.rotate-image",
+            sel(
+                "EPUB 変換時の挿絵自動回転 (AozoraEpub3 の RotateImage 相当)。auto: AozoraEpub3.ini の設定に従う / 0: 回転しない / 1: 横長を右へ90° / 2: 横長を左へ90°。組み込みエンジン・外部 AozoraEpub3_Lite.exe・Worker に効く (Java 版 AozoraEpub3.jar は INI 差し替えが出来ないため対象外)",
+                vec!["auto", "0", "1", "2"],
+            ),
+        ),
+        (
+            "sqlite.mirror-files",
+            vis(
+                VarType::Boolean,
+                "SQLite 管理時に 小説データ/ へ実ファイルのミラーを書く (既定 true)。false では DB だけを保存先にし、変換の間だけ一時的に取り出す (容量の厳しい環境向け。環境変数 NAROU_RS_MIRROR_FILES=0 でも切れる)",
+            ),
+        ),
+        (
+            "convert.keep-txt",
+            vis(
+                VarType::Boolean,
+                "変換した txt を残す (既定 true)。false では変換済みテキストをファイルにも SQLite にも残さず、Web UI の EPUB は保存済み本文からその都度変換して生成する (環境変数 NAROU_RS_KEEP_TXT=0 でも切れる)",
+            ),
+        ),
+        (
+            "convert.section-cache",
+            vis(
+                VarType::Boolean,
+                "話ごとの変換結果をキャッシュする (既定 true)。容量の厳しい環境では false。環境変数 NAROU_RS_SECTION_CACHE=0 でも切れる",
+            ),
+        ),
+        (
+            "s3.asset-backend",
+            invis_sel(
+                "挿絵の保存先。local: ライブラリ内に保存 / s3: S3 互換ストレージ (Wasabi など) へ保存",
+                vec!["local", "s3"],
+            ),
+        ),
+        (
+            "s3.endpoint",
+            invis(
+                VarType::String,
+                "S3 互換ストレージの endpoint (例: https://s3.ap-northeast-1.wasabisys.com)。環境変数 S3_ENDPOINT でも指定可",
+            ),
+        ),
+        (
+            "s3.bucket",
+            invis(
+                VarType::String,
+                "S3 のバケット名。環境変数 S3_BUCKET でも指定可",
+            ),
+        ),
+        (
+            "s3.region",
+            invis(
+                VarType::String,
+                "S3 のリージョン (署名に必須)。環境変数 S3_REGION でも指定可",
+            ),
+        ),
+        (
+            "s3.prefix",
+            invis(
+                VarType::String,
+                "バケット内の接頭辞 (例: narou/library)。環境変数 S3_PREFIX でも指定可",
+            ),
+        ),
+        (
+            "s3.access-key-id",
+            invis(
+                VarType::String,
+                "S3 のアクセスキー ID。環境変数 S3_ACCESS_KEY_ID でも指定可",
+            ),
+        ),
+        (
+            "s3.secret-access-key",
+            invis(
+                VarType::String,
+                "S3 のシークレットアクセスキー。環境変数 S3_SECRET_ACCESS_KEY でも指定可",
+            ),
+        ),
+        (
+            "convert.epub-engine",
+            sel(
+                "EPUB 生成エンジンの選択。auto: 外部 AozoraEpub3 があればそれを使い、無ければ組み込み (Lite) / lite: 組み込みを強制 (要 lite ビルド) / external: 外部を強制",
+                vec!["auto", "lite", "external"],
+            ),
+        ),
+        (
+            "download.interval",
+            vis(VarType::Float, "各話DL時に指定秒数待機する"),
+        ),
+        (
+            "download.wait-steps",
+            vis(
+                VarType::Integer,
+                "指定した話数ごとに長めのウェイトが入る\n      ※注意：11以上を設定してもなろうの場合は10話ごとにウェイトが入ります",
+            ),
+        ),
+        (
+            "download.narou-api.interval",
+            vis(
+                VarType::Float,
+                "なろうAPI（小説情報の一括更新等）リクエスト時の最小ウェイト秒数。未設定時 1.0",
+            ),
+        ),
+        (
+            "download.narou-api.user-agent",
+            vis(
+                VarType::String,
+                "なろうAPI リクエスト時に使用する User-Agent。未設定時 Narou RS",
+            ),
+        ),
+        (
+            "download.use-subdirectory",
+            vis(
+                VarType::Boolean,
+                "小説を一定数ごとにサブフォルダへ分けて保存する",
+            ),
+        ),
+        (
+            "download.choices-of-digest-options",
+            vis(
+                VarType::String,
+                "ダイジェスト化選択肢が出た場合に自動で項目を選択する",
+            ),
+        ),
+        (
+            "send.without-freeze",
+            vis(VarType::Boolean, "送信時に凍結された小説は対象外にする"),
+        ),
+        (
+            "send.backup-bookmark",
+            vis(
+                VarType::Boolean,
+                "一括送信時に栞データを自動でバックアップする(KindlePW系用)",
+            ),
+        ),
+        (
+            "multiple-delimiter",
+            vis(VarType::String, "--multiple指定時の区切り文字"),
+        ),
+        (
+            "economy",
+            multi(
+                "容量節約に関する設定。カンマ区切りで設定\n(cleanup_temp:変換後に作業ファイルを削除 send_delete:送信後に書籍ファイルを削除 nosave_diff:差分ファイルを保存しない nosave_raw:rawデータを保存しない)",
+                vec!["cleanup_temp", "send_delete", "nosave_diff", "nosave_raw"],
+            ),
+        ),
+        (
+            "guard-spoiler",
+            vis(
+                VarType::Boolean,
+                "ネタバレ防止機能。ダウンロード時の各話タイトルを伏せ字で表示する",
+            ),
+        ),
+        (
+            "auto-add-tags",
+            vis(
+                VarType::Boolean,
+                "サイトから取得したタグを自動的に小説データに追加する",
+            ),
+        ),
+        (
+            "normalize-filename",
+            vis(
+                VarType::Boolean,
+                "ファイル名の文字列をNFCで正規化する。※既存データとの互換性が無くなる可能性があるので、バックアップを取った上で機能を理解の上有効にして下さい",
+            ),
+        ),
+        (
+            "folder-length-limit",
+            vis(
+                VarType::Integer,
+                "小説を格納するフォルダ名の長さを制限する。デフォルトは50文字",
+            ),
+        ),
+        (
+            "filename-length-limit",
+            vis(
+                VarType::Integer,
+                "各話保存時のファイル名の長さを制限する。出力される電子書籍ファイル名の長さを制限する場合は ebook-filename-length-limit を設定すること。※この設定は既存小説にも影響が出るのでファイル名の長さでエラーが出ない限り基本的にはいじらないこと。デフォルトは50文字",
+            ),
+        ),
+        (
+            "ebook-filename-length-limit",
+            vis(
+                VarType::Integer,
+                "出力される電子書籍ファイル名の長さを制限する。保存時に長さでエラーが出る場合などに設定する。※デフォルトは無制限",
+            ),
+        ),
+        (
+            "user-agent",
+            vis(VarType::String, "User-Agent 設定\n未指定時 auto"),
+        ),
+        (
+            "time-zone",
+            vis(
+                VarType::String,
+                "サイト側日時にタイムゾーン表記がない場合の既定タイムゾーン。例: Asia/Tokyo",
+            ),
+        ),
+        (
+            "webui.theme",
+            invis_sel("WEB UI 用テーマ選択", WEBUI_THEME_NAMES.to_vec()),
+        ),
+        (
+            "webui.table.reload-timing",
+            invis_sel(
+                "小説リストの更新タイミングを選択。未設定時は１作品ごとに更新",
+                vec!["every", "queue"],
+            ),
+        ),
+        (
+            "webui.performance-mode",
+            sel(
+                "パフォーマンスモードを設定。autoの場合は小説数2000件以上で自動的に有効になります",
+                vec!["auto", "on", "off"],
+            ),
+        ),
+        (
+            "webui.new-tag-color",
+            sel(
+                "新規タグに自動割り当てする色。defaultの場合は従来どおりタグ追加順に巡回します",
+                vec![
+                    "default", "green", "yellow", "blue", "magenta", "cyan", "red", "white",
+                ],
+            ),
+        ),
+        (
+            "webui.debug-mode",
+            vis(
+                VarType::Boolean,
+                "WEB UI 上で失敗ジョブの詳細エラー表示を有効にする。ON のときだけ通知とコンソールに詳細を出す",
+            ),
+        ),
+        (
+            "queue.max-retries",
+            invis(
+                VarType::Integer,
+                "ジョブが失敗したときに自動リトライする最大回数。0 でリトライ無効。既定は 3。※Cloudflare Workers 版はキューの consumer max_retries (デプロイ時の値) を超えても効かず、その値に丸められる",
+            ),
+        ),
+        (
+            "queue.retry-backoff",
+            invis(
+                VarType::String,
+                "リトライ時の待機秒数をカンマ区切りで指定（s/m/h 単位可、例: 1m,5m,15m）。要素数より多く失敗したときは最後の値を再利用",
+            ),
+        ),
+        (
+            "narou-compat",
+            invis(
+                VarType::Boolean,
+                "SQLite 管理時も .narou/*.yaml を維持し narou.rb との前方互換を保つ。OFF(既定) で完全 SQLite 移行",
+            ),
+        ),
+    ];
+
+    let global_vars = vec![
+        (
+            "aozoraepub3dir",
+            invis(VarType::Directory, "AozoraEpub3のあるフォルダを指定"),
+        ),
+        (
+            "line-height",
+            invis(
+                VarType::Float,
+                "行間サイズ(narou init から指定しないと反映されません)",
+            ),
+        ),
+        (
+            "difftool",
+            vis(VarType::String, "diffで使うツールのパスを指定する"),
+        ),
+        (
+            "difftool.arg",
+            vis(VarType::String, "difftoolで使う引数を設定(オプション)"),
+        ),
+        ("no-color", vis(VarType::Boolean, "カラー表示を無効にする")),
+        (
+            "color-parser",
+            sel(
+                "コンソール上でのANSIカラーを表示する方法の選択(Windowsのみ)。system: システムに任せる(デフォルト) / self: Narou.rbで処理",
+                vec!["system", "self"],
+            ),
+        ),
+        (
+            "convert.epub-font",
+            sel(
+                "EPUB の本文フォント。auto: 濁点注記のある小説だけ濁点フォント (DMincho) を使う / always: 常に DMincho を埋め込んで本文を組む (Reader が全角スペース等を描けない場合の回避策)",
+                vec!["auto", "always"],
+            ),
+        ),
+        (
+            "server-port",
+            vis(
+                VarType::Integer,
+                "WEBサーバ起動時のポート。server-port + 1 のポートも WebSocket で使用\n※要サーバ再起動",
+            ),
+        ),
+        (
+            "server-ws-port",
+            vis(
+                VarType::Integer,
+                "WebSocket の待受ポート。0 で併設リスナーを作らず、本体ポートの /ws だけで受ける\n※要サーバ再起動",
+            ),
+        ),
+        (
+            "server-bind",
+            invis(
+                VarType::String,
+                "WEBサーバのホスト制限(未設定時:起動PCのIP)。頻繁にローカルIPが変わってしまう場合は127.0.0.1の指定を推奨\n※要サーバ再起動",
+            ),
+        ),
+        (
+            "server-digest-auth.enable",
+            invis(VarType::Boolean, "WEBサーバでDigest認証を使用するかどうか"),
+        ),
+        (
+            "server-digest-auth.user",
+            invis(VarType::String, "WEBサーバでDigest認証をするユーザ名"),
+        ),
+        (
+            "server-digest-auth.password",
+            invis(
+                VarType::String,
+                "WEBサーバのDigest認証のパスワード。hashed-passwordも設定した場合はそちらが優先される",
+            ),
+        ),
+        (
+            "server-digest-auth.hashed-password",
+            invis(
+                VarType::String,
+                "WEBサーバのDigest認証のパスワードを、Realmを\"narou.rb\"としてハッシュにしたもの。下記のようなコマンドで生成できる\n$ ruby -r 'digest/md5' -e 'puts Digest::MD5.hexdigest \"#{$*[0]}:narou.rb:#{$*[1]}\"' user password",
+            ),
+        ),
+        (
+            "server-basic-auth.enable",
+            invis(VarType::Boolean, "WEBサーバでBasic認証を使用するかどうか"),
+        ),
+        (
+            "server-basic-auth.user",
+            invis(VarType::String, "WEBサーバでBasic認証をするユーザ名"),
+        ),
+        (
+            "server-basic-auth.password",
+            invis(VarType::String, "WEBサーバのBasic認証のパスワード"),
+        ),
+        (
+            "server-basic-auth.require-for-external-bind",
+            invis(
+                VarType::Boolean,
+                "外部公開bind時にBasic認証未設定での起動を拒否するかどうか\n※サーバ起動時のみ評価",
+            ),
+        ),
+        (
+            "server-reverse-proxy.enable",
+            invis(
+                VarType::Boolean,
+                "reverse proxy 経由の Host / Origin を受け入れるモードを有効にするかどうか",
+            ),
+        ),
+        (
+            "server-max-targets-per-request",
+            invis(
+                VarType::Integer,
+                "WEB UI が 1 リクエストで送れる小説 ID の最大数（既定 100000）",
+            ),
+        ),
+        (
+            "server-ws-add-accepted-domains",
+            invis(
+                VarType::String,
+                "PushServer の accepted_domains に追加するホストのリスト（カンマ区切り）",
+            ),
+        ),
+        (
+            "server-add-accepted-hosts",
+            invis(
+                VarType::String,
+                "HTTP の Host ヘッダに追加で許可するホストのリスト（カンマ区切り、*.example.com 形式のワイルドカード対応）",
+            ),
+        ),
+        ("over18", invis(VarType::Boolean, "18歳以上かどうか")),
+        (
+            "self-update.variant",
+            sel(
+                "セルフアップデートで取得するリリース variant。gpl: AozoraEpub3_Lite 組込み(GPL-3.0) / standard: 外部 AozoraEpub3 を利用(BSD)。未設定なら実行中のビルドと同じ variant を使う",
+                vec!["gpl", "standard"],
+            ),
+        ),
+    ];
+
+    SettingVariables {
+        local: local_vars,
+        global: global_vars,
+    }
+}
+
+/// WEB UI specific help-text overrides.
+/// Matches narou.rb's `SETTING_VARIABLES_WEBUI_MESSAGES`.
+/// `%%ORIG%%` is replaced with the base help text at lookup time.
+pub fn webui_help_override(name: &str, base_help: &str) -> Option<String> {
+    let raw = match name {
+        "convert.multi-device" => {
+            "複数の端末用に同時に変換する。deviceよりも優先される。\nただのEPUBを出力したい場合はepubを指定"
+        }
+        "device" => "変換、送信対象の端末",
+        "difftool" => "%%ORIG%%。※WEB UIでは使われません",
+        "update.sort-by" => "アップデートを指定した項目順で行う",
+        "default.title_date_align" => "enable_add_date_to_title で付与する日付の位置",
+        "force.title_date_align" => "enable_add_date_to_title で付与する日付の位置",
+        "difftool.arg" => {
+            "difftoolで使う引数(指定しなければ単純に新旧ファイルを引数に呼び出す)\n特殊な変数\n<b>%NEW</b> : 最新データの差分用ファイルパス\n<b>%OLD</b> : 古い方の差分用ファイルパス"
+        }
+        "no-color" => "コンソールのカラー表示を無効にする\n※要サーバ再起動",
+        "economy" => "容量節約に関する設定",
+        "send.without-freeze" => {
+            "一括送信時に凍結された小説は対象外にする。（個別送信時は凍結済みでも送信可能）"
+        }
+        "concurrency" => {
+            "%%ORIG%% ※キューワーカーのレーン構成のみサーバ再起動が必要（ログ分割は即時反映）"
+        }
+        "auto-add-tags" => "小説サイトから取得したタグを自動的に小説データに追加する",
+        "convert.add-dc-subject-to-epub" => {
+            "EPUB変換時にstandard.opfファイルにdc:subject要素を追加する。\n小説のタグ情報がdc:subjectとして埋め込まれ、\n電子書籍リーダーでの検索やカテゴリ分類に活用できます。\n除外するタグは下の設定で指定できます"
+        }
+        "convert.dc-subject-exclude-tags" => {
+            "dc:subjectに埋め込まないタグをカンマ区切りで指定します。\n<b>初期値:</b> 404,end（初回実行時に自動設定）\n<b>404:</b> 削除された小説に付くタグ\n<b>end:</b> 完結を示すタグ\n※すべてのタグを埋め込みたい場合は空欄にしてください"
+        }
+        "convert.copy-zip-to" => "i文庫用などで生成したZIPを、変換完了時にコピーするフォルダを指定",
+        "convert.make-zip" => "ZIPファイルを出力するかどうか（対応端末: i文庫）",
+        "mail.attachment-filename-pattern" => {
+            "メール送信時の添付ファイル名だけに適用する正規表現。\n対象は変換済み電子書籍のファイル名部分のみで、フォルダ名は含みません。\n未設定なら元の添付ファイル名をそのまま使います。\n<b>例:</b> ^\\[[^\\]]+\\](.*)$"
+        }
+        "mail.attachment-filename-replacement" => {
+            "mail.attachment-filename-pattern に一致した部分の置換文字列。\n捕捉は $1 や $name で指定できます。置換結果が空文字になる場合は元のファイル名に戻します。\n<b>例:</b> $1\n※ mail_setting.yaml の attachment_filename_pattern / attachment_filename_replacement がある場合はそちらが優先されます"
+        }
+        _ => return None,
+    };
+    Some(raw.replace("%%ORIG%%", base_help))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,592 +1371,4 @@ mod tests {
         assert!(replacement_help.contains("mail_setting.yaml"));
         assert!(replacement_help.contains("優先"));
     }
-}
-
-/// Local setting variable metadata
-pub fn setting_variables() -> SettingVariables {
-    let vis = |vt: VarType, help: &'static str| VarInfo {
-        var_type: vt,
-        help,
-        invisible: false,
-        select_keys: None,
-    };
-    let invis = |vt: VarType, help: &'static str| VarInfo {
-        var_type: vt,
-        help,
-        invisible: true,
-        select_keys: None,
-    };
-    let invis_sel = |help: &'static str, keys: Vec<&'static str>| VarInfo {
-        var_type: VarType::Select,
-        help,
-        invisible: true,
-        select_keys: Some(keys.iter().map(|s| s.to_string()).collect()),
-    };
-    let sel = |help: &'static str, keys: Vec<&'static str>| VarInfo {
-        var_type: VarType::Select,
-        help,
-        invisible: false,
-        select_keys: Some(keys.iter().map(|s| s.to_string()).collect()),
-    };
-    let multi = |help: &'static str, keys: Vec<&'static str>| VarInfo {
-        var_type: VarType::Multiple,
-        help,
-        invisible: false,
-        select_keys: Some(keys.iter().map(|s| s.to_string()).collect()),
-    };
-
-    let local_vars = vec![
-        (
-            "device",
-            sel(
-                "変換、送信対象の端末(sendの--help参照)",
-                vec!["kindle", "kobo", "epub", "ibunko", "reader", "ibooks"],
-            ),
-        ),
-        (
-            "hotentry",
-            vis(VarType::Boolean, "新着投稿だけをまとめたデータを作る"),
-        ),
-        (
-            "hotentry.auto-mail",
-            vis(
-                VarType::Boolean,
-                "hotentryをメールで送る(mail設定済みの場合)",
-            ),
-        ),
-        (
-            "mail.attachment-filename-pattern",
-            vis(
-                VarType::String,
-                "メール添付ファイル名だけに適用する正規表現。例: ^\\[[^\\]]+\\](.*)$",
-            ),
-        ),
-        (
-            "mail.attachment-filename-replacement",
-            vis(
-                VarType::String,
-                "一致部分の置換文字列。捕捉は $1 や $name で指定する。例: $1",
-            ),
-        ),
-        (
-            "concurrency",
-            vis(
-                VarType::Boolean,
-                "ダウンロードと変換の同時実行を有効にする。有効にするとログの出力方式が変更される",
-            ),
-        ),
-        (
-            "concurrency.format-queue-text",
-            invis(
-                VarType::String,
-                "同時実行時の変換キュー表示テキストのフォーマット",
-            ),
-        ),
-        (
-            "concurrency.format-queue-style",
-            vis(
-                VarType::String,
-                "同時実行時の変換キュー表示スタイルのフォーマット",
-            ),
-        ),
-        (
-            "logging",
-            vis(
-                VarType::Boolean,
-                "ログの保存を有効にする。保存場所はlogフォルダ。concurrencyが有効な場合、変換ログだけ別ファイルに出力される",
-            ),
-        ),
-        (
-            "logging.format-filename",
-            vis(
-                VarType::String,
-                "ログファイル名のフォーマット。日付でファイルを分けたくなければ固定ファイル名にする。書式は http://bit.ly/date_format 参照",
-            ),
-        ),
-        (
-            "logging.format-timestamp",
-            vis(
-                VarType::String,
-                "ログ内のタイムスタンプのフォーマット。タイムスタンプを記録したくなければ $none とだけ入力",
-            ),
-        ),
-        (
-            "update.interval",
-            vis(
-                VarType::Float,
-                "更新時に各作品間で指定した秒数待機する(処理時間を含む)",
-            ),
-        ),
-        (
-            "update.strong",
-            vis(
-                VarType::Boolean,
-                "改稿日当日の連続更新でも更新漏れが起きないように、中身もチェックして更新を検知する(やや処理が重くなる)",
-            ),
-        ),
-        (
-            "update.convert-only-new-arrival",
-            vis(VarType::Boolean, "更新時に新着がある場合のみ変換を実行する"),
-        ),
-        (
-            "update.sort-by",
-            sel(
-                "アップデートを指定した項目順で行う",
-                vec![
-                    "id",
-                    "last_update",
-                    "general_lastup",
-                    "last_check_date",
-                    "title",
-                    "author",
-                    "sitename",
-                    "novel_type",
-                    "tags",
-                    "general_all_no",
-                    "length",
-                    "status",
-                    "toc_url",
-                    "new_arrivals_date",
-                ],
-            ),
-        ),
-        (
-            "update.auto-schedule.enable",
-            vis(VarType::Boolean, "自動アップデート機能を有効にする"),
-        ),
-        (
-            "update.auto-schedule",
-            vis(
-                VarType::String,
-                "自動アップデートする時間を指定する。カンマ区切りで複数指定可能。\n      書式：HHMM (例: 0800,1200,1800 = 8時、12時、18時)",
-            ),
-        ),
-        (
-            "update.auto-schedule.timezone",
-            vis(
-                VarType::String,
-                "自動アップデートのHHMMを評価するIANAタイムゾーン。Workerの既定値は Asia/Tokyo",
-            ),
-        ),
-        (
-            "update.max-parallel-domains",
-            vis(
-                VarType::Integer,
-                "アップデート時にドメインごとにダウンロードワーカーを並列化する数。同一ドメイン内は常に直列で処理されるため対サイト礼儀は崩れない。1で従来の逐次動作。デフォルトは 4",
-            ),
-        ),
-        (
-            "convert.copy-to",
-            vis(
-                VarType::Directory,
-                "変換したらこのフォルダにコピーする\n      ※注意：存在しないフォルダだとエラーになる",
-            ),
-        ),
-        (
-            "convert.copy-zip-to",
-            vis(
-                VarType::Directory,
-                "生成したZIPファイルをこのフォルダにコピーする\n      ※注意：存在しないフォルダだとエラーになる",
-            ),
-        ),
-        (
-            "convert.copy-to-grouping",
-            multi(
-                "copy-toで指定したフォルダの中で更に指定の各種フォルダにまとめる",
-                vec!["device", "site"],
-            ),
-        ),
-        (
-            "convert.copy_to",
-            invis(VarType::Directory, "copy-toの昔の書き方(非推奨)"),
-        ),
-        (
-            "convert.no-epub",
-            invis(VarType::Boolean, "EPUB変換を無効にする"),
-        ),
-        (
-            "convert.no-mobi",
-            invis(VarType::Boolean, "MOBI変換を無効にする"),
-        ),
-        (
-            "convert.no-strip",
-            invis(VarType::Boolean, "MOBIのstripを無効にする"),
-        ),
-        (
-            "convert.no-zip",
-            invis(VarType::Boolean, "i文庫用のzipファイル作成を無効にする"),
-        ),
-        (
-            "convert.make-zip",
-            vis(
-                VarType::Boolean,
-                "ZIPファイルの作成を有効にする（対応端末: i文庫）",
-            ),
-        ),
-        (
-            "convert.no-open",
-            vis(VarType::Boolean, "変換時に保存フォルダを開かないようにする"),
-        ),
-        (
-            "convert.inspect",
-            vis(VarType::Boolean, "常に変換時に調査結果を表示する"),
-        ),
-        (
-            "convert.multi-device",
-            multi(
-                "複数の端末用に同時に変換する。deviceよりも優先される。端末名をカンマ区切りで入力。ただのEPUBを出力したい場合はepubを指定",
-                vec!["kindle", "kobo", "epub", "ibunko", "reader", "ibooks"],
-            ),
-        ),
-        (
-            "convert.filename-to-ncode",
-            vis(
-                VarType::Boolean,
-                "書籍ファイル名をNコードで出力する(ドメイン_Nコードの形式)",
-            ),
-        ),
-        (
-            "convert.add-dc-subject-to-epub",
-            vis(
-                VarType::Boolean,
-                "EPUB変換時にstandard.opfファイルにdc:subject要素を追加する。小説のタグ情報がdc:subjectとして埋め込まれます",
-            ),
-        ),
-        (
-            "convert.dc-subject-exclude-tags",
-            vis(
-                VarType::String,
-                "dc:subjectから除外するタグをカンマ区切りで指定する。初期値は「404,end」（初回実行時に自動設定される）。すべてのタグを埋め込みたい場合は空文字列を設定",
-            ),
-        ),
-        (
-            "download.interval",
-            vis(VarType::Float, "各話DL時に指定秒数待機する"),
-        ),
-        (
-            "download.wait-steps",
-            vis(
-                VarType::Integer,
-                "指定した話数ごとに長めのウェイトが入る\n      ※注意：11以上を設定してもなろうの場合は10話ごとにウェイトが入ります",
-            ),
-        ),
-        (
-            "download.narou-api.interval",
-            vis(
-                VarType::Float,
-                "なろうAPI（小説情報の一括更新等）リクエスト時の最小ウェイト秒数。未設定時 1.0",
-            ),
-        ),
-        (
-            "download.narou-api.user-agent",
-            vis(
-                VarType::String,
-                "なろうAPI リクエスト時に使用する User-Agent。未設定時 Narou RS",
-            ),
-        ),
-        (
-            "download.use-subdirectory",
-            vis(
-                VarType::Boolean,
-                "小説を一定数ごとにサブフォルダへ分けて保存する",
-            ),
-        ),
-        (
-            "download.choices-of-digest-options",
-            vis(
-                VarType::String,
-                "ダイジェスト化選択肢が出た場合に自動で項目を選択する",
-            ),
-        ),
-        (
-            "send.without-freeze",
-            vis(VarType::Boolean, "送信時に凍結された小説は対象外にする"),
-        ),
-        (
-            "send.backup-bookmark",
-            vis(
-                VarType::Boolean,
-                "一括送信時に栞データを自動でバックアップする(KindlePW系用)",
-            ),
-        ),
-        (
-            "multiple-delimiter",
-            vis(VarType::String, "--multiple指定時の区切り文字"),
-        ),
-        (
-            "economy",
-            multi(
-                "容量節約に関する設定。カンマ区切りで設定\n(cleanup_temp:変換後に作業ファイルを削除 send_delete:送信後に書籍ファイルを削除 nosave_diff:差分ファイルを保存しない nosave_raw:rawデータを保存しない)",
-                vec!["cleanup_temp", "send_delete", "nosave_diff", "nosave_raw"],
-            ),
-        ),
-        (
-            "guard-spoiler",
-            vis(
-                VarType::Boolean,
-                "ネタバレ防止機能。ダウンロード時の各話タイトルを伏せ字で表示する",
-            ),
-        ),
-        (
-            "auto-add-tags",
-            vis(
-                VarType::Boolean,
-                "サイトから取得したタグを自動的に小説データに追加する",
-            ),
-        ),
-        (
-            "normalize-filename",
-            vis(
-                VarType::Boolean,
-                "ファイル名の文字列をNFCで正規化する。※既存データとの互換性が無くなる可能性があるので、バックアップを取った上で機能を理解の上有効にして下さい",
-            ),
-        ),
-        (
-            "folder-length-limit",
-            vis(
-                VarType::Integer,
-                "小説を格納するフォルダ名の長さを制限する。デフォルトは50文字",
-            ),
-        ),
-        (
-            "filename-length-limit",
-            vis(
-                VarType::Integer,
-                "各話保存時のファイル名の長さを制限する。出力される電子書籍ファイル名の長さを制限する場合は ebook-filename-length-limit を設定すること。※この設定は既存小説にも影響が出るのでファイル名の長さでエラーが出ない限り基本的にはいじらないこと。デフォルトは50文字",
-            ),
-        ),
-        (
-            "ebook-filename-length-limit",
-            vis(
-                VarType::Integer,
-                "出力される電子書籍ファイル名の長さを制限する。保存時に長さでエラーが出る場合などに設定する。※デフォルトは無制限",
-            ),
-        ),
-        (
-            "user-agent",
-            vis(VarType::String, "User-Agent 設定\n未指定時 auto"),
-        ),
-        (
-            "time-zone",
-            vis(
-                VarType::String,
-                "サイト側日時にタイムゾーン表記がない場合の既定タイムゾーン。例: Asia/Tokyo",
-            ),
-        ),
-        (
-            "webui.theme",
-            invis_sel("WEB UI 用テーマ選択", WEBUI_THEME_NAMES.to_vec()),
-        ),
-        (
-            "webui.table.reload-timing",
-            invis_sel(
-                "小説リストの更新タイミングを選択。未設定時は１作品ごとに更新",
-                vec!["every", "queue"],
-            ),
-        ),
-        (
-            "webui.performance-mode",
-            sel(
-                "パフォーマンスモードを設定。autoの場合は小説数2000件以上で自動的に有効になります",
-                vec!["auto", "on", "off"],
-            ),
-        ),
-        (
-            "webui.new-tag-color",
-            sel(
-                "新規タグに自動割り当てする色。defaultの場合は従来どおりタグ追加順に巡回します",
-                vec![
-                    "default", "green", "yellow", "blue", "magenta", "cyan", "red", "white",
-                ],
-            ),
-        ),
-        (
-            "webui.debug-mode",
-            vis(
-                VarType::Boolean,
-                "WEB UI 上で失敗ジョブの詳細エラー表示を有効にする。ON のときだけ通知とコンソールに詳細を出す",
-            ),
-        ),
-        (
-            "queue.max-retries",
-            invis(
-                VarType::Integer,
-                "ジョブが失敗したときに自動リトライする最大回数。0 でリトライ無効。既定は 3",
-            ),
-        ),
-        (
-            "queue.retry-backoff",
-            invis(
-                VarType::String,
-                "リトライ時の待機秒数をカンマ区切りで指定（s/m/h 単位可、例: 1m,5m,15m）。要素数より多く失敗したときは最後の値を再利用",
-            ),
-        ),
-        (
-            "narou-compat",
-            invis(
-                VarType::Boolean,
-                "SQLite 管理時も .narou/*.yaml を維持し narou.rb との前方互換を保つ。OFF(既定) で完全 SQLite 移行",
-            ),
-        ),
-    ];
-
-    let global_vars = vec![
-        (
-            "aozoraepub3dir",
-            invis(VarType::Directory, "AozoraEpub3のあるフォルダを指定"),
-        ),
-        (
-            "line-height",
-            invis(
-                VarType::Float,
-                "行間サイズ(narou init から指定しないと反映されません)",
-            ),
-        ),
-        (
-            "difftool",
-            vis(VarType::String, "diffで使うツールのパスを指定する"),
-        ),
-        (
-            "difftool.arg",
-            vis(VarType::String, "difftoolで使う引数を設定(オプション)"),
-        ),
-        ("no-color", vis(VarType::Boolean, "カラー表示を無効にする")),
-        (
-            "color-parser",
-            sel(
-                "コンソール上でのANSIカラーを表示する方法の選択(Windowsのみ)。system: システムに任せる(デフォルト) / self: Narou.rbで処理",
-                vec!["system", "self"],
-            ),
-        ),
-        (
-            "convert.epub-font",
-            sel(
-                "EPUB の本文フォント。auto: 濁点注記のある小説だけ濁点フォント (DMincho) を使う / always: 常に DMincho を埋め込んで本文を組む (Reader が全角スペース等を描けない場合の回避策)",
-                vec!["auto", "always"],
-            ),
-        ),
-        (
-            "server-port",
-            vis(
-                VarType::Integer,
-                "WEBサーバ起動時のポート。server-port + 1 のポートも WebSocket で使用",
-            ),
-        ),
-        (
-            "server-bind",
-            invis(
-                VarType::String,
-                "WEBサーバのホスト制限(未設定時:起動PCのIP)。頻繁にローカルIPが変わってしまう場合は127.0.0.1の指定を推奨",
-            ),
-        ),
-        (
-            "server-basic-auth.enable",
-            invis(VarType::Boolean, "WEBサーバでBasic認証を使用するかどうか"),
-        ),
-        (
-            "server-basic-auth.user",
-            invis(VarType::String, "WEBサーバでBasic認証をするユーザ名"),
-        ),
-        (
-            "server-basic-auth.password",
-            invis(VarType::String, "WEBサーバのBasic認証のパスワード"),
-        ),
-        (
-            "server-basic-auth.require-for-external-bind",
-            invis(
-                VarType::Boolean,
-                "外部公開bind時にBasic認証未設定での起動を拒否するかどうか",
-            ),
-        ),
-        (
-            "server-reverse-proxy.enable",
-            invis(
-                VarType::Boolean,
-                "reverse proxy 経由の Host / Origin を受け入れるモードを有効にするかどうか",
-            ),
-        ),
-        (
-            "server-max-targets-per-request",
-            invis(
-                VarType::Integer,
-                "WEB UI が 1 リクエストで送れる小説 ID の最大数（既定 100000）",
-            ),
-        ),
-        (
-            "server-ws-add-accepted-domains",
-            invis(
-                VarType::String,
-                "PushServer の accepted_domains に追加するホストのリスト（カンマ区切り）",
-            ),
-        ),
-        (
-            "server-add-accepted-hosts",
-            invis(
-                VarType::String,
-                "HTTP の Host ヘッダに追加で許可するホストのリスト（カンマ区切り、*.example.com 形式のワイルドカード対応）",
-            ),
-        ),
-        ("over18", invis(VarType::Boolean, "18歳以上かどうか")),
-        (
-            "self-update.variant",
-            sel(
-                "セルフアップデートで取得するリリース variant。gpl: AozoraEpub3_Lite 組込み(GPL-3.0) / standard: 外部 AozoraEpub3 を利用(BSD)。未設定なら実行中のビルドと同じ variant を使う",
-                vec!["gpl", "standard"],
-            ),
-        ),
-    ];
-
-    SettingVariables {
-        local: local_vars,
-        global: global_vars,
-    }
-}
-
-/// WEB UI specific help-text overrides.
-/// Matches narou.rb's `SETTING_VARIABLES_WEBUI_MESSAGES`.
-/// `%%ORIG%%` is replaced with the base help text at lookup time.
-pub fn webui_help_override(name: &str, base_help: &str) -> Option<String> {
-    let raw = match name {
-        "convert.multi-device" => {
-            "複数の端末用に同時に変換する。deviceよりも優先される。\nただのEPUBを出力したい場合はepubを指定"
-        }
-        "device" => "変換、送信対象の端末",
-        "difftool" => "%%ORIG%%。※WEB UIでは使われません",
-        "update.sort-by" => "アップデートを指定した項目順で行う",
-        "default.title_date_align" => "enable_add_date_to_title で付与する日付の位置",
-        "force.title_date_align" => "enable_add_date_to_title で付与する日付の位置",
-        "difftool.arg" => {
-            "difftoolで使う引数(指定しなければ単純に新旧ファイルを引数に呼び出す)\n特殊な変数\n<b>%NEW</b> : 最新データの差分用ファイルパス\n<b>%OLD</b> : 古い方の差分用ファイルパス"
-        }
-        "no-color" => "コンソールのカラー表示を無効にする\n※要サーバ再起動",
-        "economy" => "容量節約に関する設定",
-        "send.without-freeze" => {
-            "一括送信時に凍結された小説は対象外にする。（個別送信時は凍結済みでも送信可能）"
-        }
-        "server-basic-auth.enable" => {
-            "%%ORIG%%\n※basic-auth関連の設定を変更した場合サーバの再起動が必要"
-        }
-        "concurrency" => "%%ORIG%% ※要サーバ再起動",
-        "logging" => "%%ORIG%%\n※要サーバ再起動",
-        "logging.format-filename" => "%%ORIG%%\n※要サーバ再起動",
-        "logging.format-timestamp" => "%%ORIG%%\n※要サーバ再起動",
-        "auto-add-tags" => "小説サイトから取得したタグを自動的に小説データに追加する",
-        "convert.add-dc-subject-to-epub" => {
-            "EPUB変換時にstandard.opfファイルにdc:subject要素を追加する。\n小説のタグ情報がdc:subjectとして埋め込まれ、\n電子書籍リーダーでの検索やカテゴリ分類に活用できます。\n除外するタグは下の設定で指定できます"
-        }
-        "convert.dc-subject-exclude-tags" => {
-            "dc:subjectに埋め込まないタグをカンマ区切りで指定します。\n<b>初期値:</b> 404,end（初回実行時に自動設定）\n<b>404:</b> 削除された小説に付くタグ\n<b>end:</b> 完結を示すタグ\n※すべてのタグを埋め込みたい場合は空欄にしてください"
-        }
-        "convert.copy-zip-to" => "i文庫用などで生成したZIPを、変換完了時にコピーするフォルダを指定",
-        "convert.make-zip" => "ZIPファイルを出力するかどうか（対応端末: i文庫）",
-        "mail.attachment-filename-pattern" => {
-            "メール送信時の添付ファイル名だけに適用する正規表現。\n対象は変換済み電子書籍のファイル名部分のみで、フォルダ名は含みません。\n未設定なら元の添付ファイル名をそのまま使います。\n<b>例:</b> ^\\[[^\\]]+\\](.*)$"
-        }
-        "mail.attachment-filename-replacement" => {
-            "mail.attachment-filename-pattern に一致した部分の置換文字列。\n捕捉は $1 や $name で指定できます。置換結果が空文字になる場合は元のファイル名に戻します。\n<b>例:</b> $1\n※ mail_setting.yaml の attachment_filename_pattern / attachment_filename_replacement がある場合はそちらが優先されます"
-        }
-        _ => return None,
-    };
-    Some(raw.replace("%%ORIG%%", base_help))
 }

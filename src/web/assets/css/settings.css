@@ -96,6 +96,16 @@
   background: var(--danger-bg, #f2dede);
 }
 
+.list-group-item.setting-worker-ineffective {
+  opacity: 0.6;
+}
+
+.list-group-item.setting-worker-ineffective input,
+.list-group-item.setting-worker-ineffective select,
+.list-group-item.setting-worker-ineffective label {
+  cursor: not-allowed;
+}
+
 .list-group-item-heading {
   font-size: 0.9375rem;
   font-weight: 600;
@@ -425,6 +435,20 @@
   color: var(--text-muted, #777);
 }
 
+.login-cred-hosts {
+  margin-top: 0.25rem;
+}
+
+.login-cred-host {
+  font-size: 0.8125rem;
+  color: var(--text-color, #333);
+  word-break: break-all;
+}
+
+.login-cred-host + .login-cred-host {
+  margin-top: 0.25rem;
+}
+
 .login-cred-actions {
   display: flex;
   align-items: center;
@@ -488,4 +512,20 @@
 .login-file-name {
   font-size: 0.8125rem;
   color: var(--text-muted, #777);
+}
+
+/* データ管理方式 (設定 → WEB UI) */
+.storage-mode-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5em;
+  margin-top: 0.5em;
+}
+
+.storage-mode-current {
+  margin: 0.25em 0;
+}
+
+.storage-mode-paths {
+  word-break: break-all;
 }

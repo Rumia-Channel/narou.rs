@@ -131,16 +131,13 @@ pub fn list(scope: SettingScope, key: &str) -> Vec<String> {
                 _ => None,
             })
             .collect(),
-        Some(value) => match value {
-            Value::String(value) => value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .collect(),
-            _ => Vec::new(),
-        },
-        None => Vec::new(),
+        Some(Value::String(value)) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        Some(_) | None => Vec::new(),
     }
 }
 

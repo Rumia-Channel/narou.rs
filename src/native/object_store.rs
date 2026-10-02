@@ -13,9 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures::StreamExt;
 
 use crate::error::{NarouError, Result};
+use std::sync::Arc;
+
 use crate::platform::{
     AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
-    ObjectPrefix, ObjectStore, PlatformFuture,
+    ObjectPrefix, ObjectStore, PlatformFuture, S3Store, SplitStore,
 };
 
 pub(crate) const MAX_SMALL_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
@@ -373,23 +375,12 @@ impl ObjectStore for NativeObjectStore {
                 })
                 .collect::<Vec<_>>();
             objects.sort_by(|left, right| left.key.cmp(&right.key));
-            let start = request
-                .cursor
-                .as_deref()
-                .map(|cursor| {
-                    objects
-                        .iter()
-                        .position(|item| item.key.as_ref() > cursor)
-                        .unwrap_or(objects.len())
-                })
-                .unwrap_or(0);
-            let end = (start + request.limit.get()).min(objects.len());
-            let page = objects[start.min(objects.len())..end].to_vec();
-            let next_cursor = if end < objects.len() {
-                page.last().map(|item| item.key.as_ref().to_string())
-            } else {
-                None
-            };
+            let (page, next_cursor) = crate::platform::paginate_object_listing(
+                objects,
+                request.cursor.as_deref(),
+                request.limit.get(),
+                |item| item.key.as_ref(),
+            );
             Ok(ObjectListPage {
                 objects: page,
                 next_cursor,
@@ -582,6 +573,27 @@ impl NativeStore {
         Self::for_narou_root(&narou_root)
     }
 
+    /// 保存済みオブジェクトを小説ディレクトリへ実ファイルとして取り出す (同期)。
+    ///
+    /// ミラーを書かない構成 (`sqlite.mirror-files=false`) で、変換がファイルを
+    /// 要求するときに使う。ファイル保存の構成では実体があるので何もしない。
+    /// 返り値のガードがスコープを抜けると、取り出したファイルだけを消す。
+    pub fn materialize_novel_files(&self, novel_dir: &Path) -> Result<MaterializedNovelFiles> {
+        let NativeStore::Sqlite(store) = self else {
+            return Ok(MaterializedNovelFiles::default());
+        };
+        let root = store.archive_root();
+        let Some(prefix) = logical_key_for_native_path(root, novel_dir) else {
+            return Ok(MaterializedNovelFiles::default());
+        };
+        let paths = store.materialize_into(
+            novel_dir,
+            &prefix,
+            crate::platform::split_store::ILLUSTRATION_SEGMENT,
+        )?;
+        Ok(MaterializedNovelFiles::from_paths(paths))
+    }
+
     /// Rebuild a deleted mirror file from the stored object.
     ///
     /// Returns `false` when the backend has no second copy (filesystem mode) or
@@ -612,6 +624,92 @@ pub fn ensure_mirror_file(path: &Path) -> bool {
     NativeStore::for_narou_root(inventory.root_dir())
         .and_then(|store| store.restore_mirror_file(path))
         .unwrap_or(false)
+}
+
+/// 変換の間だけ、ストアの内容を小説ディレクトリへ取り出したもの。
+///
+/// `sqlite.mirror-files=false` の構成では `小説データ/` に実ファイルが無いため、
+/// 変換が要求する `toc.yaml` / `本文/*.yaml` / `setting.ini` / `replace.txt` を
+/// 一時的に取り出す。スコープを抜けると**自分が取り出したファイルだけ**を消す
+/// (元からあったファイルは触らない)。挿絵は別経路 (`native::illustrations`) が
+/// 受け持つので対象外。
+#[derive(Default)]
+pub struct MaterializedNovelFiles {
+    paths: Vec<PathBuf>,
+}
+
+impl MaterializedNovelFiles {
+    pub fn from_paths(paths: Vec<PathBuf>) -> Self {
+        Self { paths }
+    }
+
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+}
+
+impl Drop for MaterializedNovelFiles {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// native の保存先ペア。
+///
+/// 挿絵のバイナリだけ S3 互換ストレージへ流し、本文やメタデータは
+/// 従来どおりローカル (YAML / SQLite ミラー) に残す。構成は
+/// `s3.asset-backend` (`local` | `s3`) で決まり、`s3` のときに接続情報が
+/// 欠けていれば [`crate::native::s3::illustration_store`] が失敗する
+/// (fail-closed。黙ってローカルへ落とさない)。
+pub struct NativeStores {
+    pub objects: Arc<dyn ObjectStore>,
+    pub assets: Arc<dyn AssetStore>,
+    /// S3 を使うときだけ入る (presigned URL と移行で使う)。
+    pub s3: Option<Arc<S3Store>>,
+}
+
+impl NativeStores {
+    /// ライブラリルート (` .narou` を持つディレクトリ) から保存先を組む。
+    pub fn for_narou_root(narou_root: &Path) -> Result<Self> {
+        let primary: Arc<NativeStore> = Arc::new(NativeStore::for_narou_root(narou_root)?);
+        let Some(s3) = crate::native::s3::illustration_store()? else {
+            let objects: Arc<dyn ObjectStore> = primary.clone();
+            let assets: Arc<dyn AssetStore> = primary;
+            return Ok(Self {
+                objects,
+                assets,
+                s3: None,
+            });
+        };
+        let primary_objects: Arc<dyn ObjectStore> = primary.clone();
+        let primary_assets: Arc<dyn AssetStore> = primary;
+        let s3_objects: Arc<dyn ObjectStore> = s3.clone();
+        let s3_assets: Arc<dyn AssetStore> = s3.clone();
+        let split: Arc<SplitStore> = Arc::new(SplitStore::new(
+            (primary_objects, primary_assets),
+            (s3_objects, s3_assets),
+        ));
+        let objects: Arc<dyn ObjectStore> = split.clone();
+        let assets: Arc<dyn AssetStore> = split;
+        Ok(Self {
+            objects,
+            assets,
+            s3: Some(s3),
+        })
+    }
+
+    /// プロセス全体のデータベースルートから保存先を組む
+    /// (`NativeStore::for_current_root` と同じ解決)。
+    pub fn for_current_root() -> Result<Self> {
+        let root = crate::db::with_database(|db| Ok(db.archive_root().to_path_buf()))?;
+        let narou_root = root
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::for_narou_root(&narou_root)
+    }
 }
 
 impl ObjectStore for NativeStore {

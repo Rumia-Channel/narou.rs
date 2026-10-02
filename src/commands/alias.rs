@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use narou_rs::compat::yaml_value_to_string;
 use narou_rs::db;
 use narou_rs::db::inventory::{Inventory, InventoryScope};
@@ -8,7 +6,7 @@ use super::download;
 use super::help;
 use super::log;
 
-const BANNED_ALIAS_NAME: &str = "hotentry";
+const BAN_WORDS: &[&str] = &["hotentry"];
 
 pub fn cmd_alias(args: &[String], list: bool) -> i32 {
     match cmd_alias_inner(args, list) {
@@ -34,7 +32,7 @@ fn cmd_alias_inner(args: &[String], list: bool) -> Result<(), String> {
     }
 
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let mut aliases: HashMap<String, serde_yaml::Value> = inventory
+    let mut aliases: serde_yaml::Mapping = inventory
         .load("alias", InventoryScope::Local)
         .map_err(|e| e.to_string())?;
 
@@ -51,29 +49,30 @@ fn cmd_alias_inner(args: &[String], list: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn process_alias_arg(arg: &str, aliases: &mut HashMap<String, serde_yaml::Value>) {
-    let Some((alias_name, target)) = arg.split_once('=') else {
+fn process_alias_arg(arg: &str, aliases: &mut serde_yaml::Mapping) {
+    let (alias_name, target) = match arg.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (arg, None),
+    };
+
+    if BAN_WORDS.contains(&alias_name) {
+        log::report_error(&format!("{} は使用禁止ワードです", alias_name));
+        return;
+    }
+    if !is_valid_alias_name(alias_name) {
+        log::report_error("別名にはアルファベット・数字・アンダースコアしか使えません");
+        return;
+    }
+    let Some(target) = target else {
         log::report_error(&format!(
             "書式が間違っています。{}=別名 のように書いて下さい",
-            arg
+            alias_name
         ));
         return;
     };
 
-    if alias_name == BANNED_ALIAS_NAME {
-        log::report_error(&format!("{} は予約語のため使用出来ません", alias_name));
-        return;
-    }
-    if !is_valid_alias_name(alias_name) {
-        log::report_error(&format!(
-            "{} は別名に使用出来ません。半角英数字と_が使えます",
-            alias_name
-        ));
-        return;
-    }
-
     if target.is_empty() {
-        aliases.remove(alias_name);
+        aliases.shift_remove(alias_name);
         println!("{} を解除しました", alias_name);
         return;
     }
@@ -84,34 +83,28 @@ fn process_alias_arg(arg: &str, aliases: &mut HashMap<String, serde_yaml::Value>
     };
 
     aliases.insert(
-        alias_name.to_string(),
+        serde_yaml::Value::String(alias_name.to_string()),
         serde_yaml::Value::Number(serde_yaml::Number::from(data.id)),
     );
-    println!("{} に {} の別名を設定しました", data.title, alias_name);
+    println!("{} を {} の別名に設定しました", alias_name, data.title);
 }
 
 fn display_aliases() -> Result<(), String> {
     let inventory = Inventory::with_default_root().map_err(|e| e.to_string())?;
-    let aliases: HashMap<String, serde_yaml::Value> = inventory
+    // Ruby の Inventory.load が返す Hash は YAML の記述順を保つので、
+    // serde_yaml::Mapping (indexmap ベース) で同じく記述順に列挙する。
+    let aliases: serde_yaml::Mapping = inventory
         .load("alias", InventoryScope::Local)
         .map_err(|e| e.to_string())?;
 
-    if aliases.is_empty() {
-        return Ok(());
-    }
-
-    let mut rows = aliases
-        .iter()
-        .map(|(alias_name, value)| {
-            let target = yaml_value_to_string(value).unwrap_or_default();
-            let title = resolve_alias_title(&target);
-            (alias_name.clone(), title)
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-
-    for (alias_name, title) in rows {
-        println!("{}={}", alias_name, title);
+    for (name, value) in &aliases {
+        let target = yaml_value_to_string(value).unwrap_or_default();
+        let title = resolve_alias_title(&target);
+        println!(
+            "{}={}",
+            yaml_value_to_string(name).unwrap_or_default(),
+            title
+        );
     }
     Ok(())
 }
@@ -119,7 +112,7 @@ fn display_aliases() -> Result<(), String> {
 fn resolve_alias_title(target: &str) -> String {
     download::get_data_by_target(target)
         .map(|data| data.title)
-        .unwrap_or_else(|| target.to_string())
+        .unwrap_or_else(|| "(すでに削除されています)".to_string())
 }
 
 fn is_valid_alias_name(name: &str) -> bool {

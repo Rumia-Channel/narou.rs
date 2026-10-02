@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use narou_rs::db;
 use narou_rs::db::paths::novel_dir_for_record;
 use narou_rs::illustration_store;
+use narou_rs::platform::{AssetStore, ObjectStore, StoreMigrationState};
 
 use super::download;
 use super::log;
@@ -14,6 +16,12 @@ pub enum IllustSubcommand {
     Migrate,
     FixExt,
     Rebuild,
+    /// 挿絵をローカルから S3 互換ストレージへ写す (既定 dry-run)。
+    S3Push,
+    /// ローカルと S3 の挿絵を突き合わせる。
+    S3Verify,
+    /// 旧 `挿絵/` 配置の S3 オブジェクトを dedup プールへ移し、残ったものを消す。
+    S3Dedup,
 }
 
 /// Run the `narou illust <sub>` command.
@@ -38,6 +46,14 @@ fn cmd_illust_inner(
 ) -> Result<(), String> {
     db::init_database().map_err(|e| e.to_string())?;
 
+    // S3 への移行・突き合わせ・dedup は小説単位ではなくライブラリ全体の操作。
+    match sub {
+        IllustSubcommand::S3Push => return run_s3_push(force),
+        IllustSubcommand::S3Verify => return run_s3_verify(),
+        IllustSubcommand::S3Dedup => return run_s3_dedup(force),
+        _ => {}
+    }
+
     let dirs = resolve_target_dirs(targets, all)?;
 
     if dirs.is_empty() {
@@ -56,7 +72,222 @@ fn cmd_illust_inner(
             IllustSubcommand::Migrate => run_migrate(&dir, force)?,
             IllustSubcommand::FixExt => run_fix_ext(&dir, force)?,
             IllustSubcommand::Rebuild => run_rebuild(&dir)?,
+            // ライブラリ全体の操作なので、この小説単位のループには来ない
+            // (手前で return する)。
+            IllustSubcommand::S3Push | IllustSubcommand::S3Verify | IllustSubcommand::S3Dedup => {
+                unreachable!("S3 subcommands run before the per-novel loop")
+            }
         }
+    }
+    Ok(())
+}
+
+
+/// 移行用のストア (移行元 = ローカル、移行先 = S3)。
+///
+/// 挿絵の保存先が S3 になっていなければ失敗させる。ここでローカルへ
+/// フォールバックすると、利用者が「移行した」と誤解する。
+#[allow(clippy::type_complexity)]
+fn s3_migration_stores() -> Result<
+    (
+        Arc<dyn ObjectStore>,
+        Arc<dyn AssetStore>,
+        Arc<dyn ObjectStore>,
+        Arc<dyn AssetStore>,
+    ),
+    String,
+> {
+    let root = narou_rs::db::inventory::Inventory::with_default_root()
+        .map_err(|error| error.to_string())?
+        .root_dir()
+        .to_path_buf();
+    let local = Arc::new(
+        narou_rs::native::object_store::NativeStore::for_narou_root(&root)
+            .map_err(|error| error.to_string())?,
+    );
+    let s3 = narou_rs::native::s3::illustration_store()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "挿絵の保存先が S3 になっていません (narou setting s3.asset-backend=s3 と S3 の接続情報が必要です)"
+                .to_string()
+        })?;
+    let from_objects: Arc<dyn ObjectStore> = local.clone();
+    let from_assets: Arc<dyn AssetStore> = local;
+    let to_objects: Arc<dyn ObjectStore> = s3.clone();
+    let to_assets: Arc<dyn AssetStore> = s3;
+    Ok((from_objects, from_assets, to_objects, to_assets))
+}
+
+fn migration_runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn report_migration_failures(state: &StoreMigrationState) {
+    if state.failed.is_empty() {
+        return;
+    }
+    println!("失敗 {} 件:", state.failed.len());
+    for entry in state.failed.iter().take(20) {
+        println!("  {}", entry);
+    }
+    if state.failed.len() > 20 {
+        println!("  ... 他 {} 件", state.failed.len() - 20);
+    }
+}
+
+/// 挿絵をローカルから S3 へ写す。既定は数えるだけで、`--force` で実行する。
+fn run_s3_push(force: bool) -> Result<(), String> {
+    let (from_objects, from_assets, to_objects, to_assets) = s3_migration_stores()?;
+    let action = if force { "copy" } else { "plan" };
+    let runtime = migration_runtime()?;
+    let mut state = StoreMigrationState::default();
+    while !state.done {
+        runtime
+            .block_on(narou_rs::platform::migrate_page(
+                &from_objects,
+                &from_assets,
+                &to_assets,
+                &to_objects,
+                action,
+                narou_rs::platform::store_migration::DEFAULT_LIMIT,
+                &mut state,
+            ))
+            .map_err(|error| error.to_string())?;
+    }
+    if force {
+        println!("S3 へ写しました: {} 件", state.copied);
+    } else {
+        println!(
+            "移行対象: {} 件 / {} バイト (実行するには --force)",
+            state.planned, state.planned_bytes
+        );
+    }
+    report_migration_failures(&state);
+    Ok(())
+}
+
+/// ローカルと S3 の挿絵をバイト単位で突き合わせる (書き込みはしない)。
+fn run_s3_verify() -> Result<(), String> {
+    let (from_objects, from_assets, to_objects, to_assets) = s3_migration_stores()?;
+    let runtime = migration_runtime()?;
+    let mut state = StoreMigrationState::default();
+    while !state.done {
+        runtime
+            .block_on(narou_rs::platform::migrate_page(
+                &from_objects,
+                &from_assets,
+                &to_assets,
+                &to_objects,
+                "verify",
+                narou_rs::platform::store_migration::DEFAULT_LIMIT,
+                &mut state,
+            ))
+            .map_err(|error| error.to_string())?;
+    }
+    println!("一致: {} 件", state.verified);
+    report_migration_failures(&state);
+    Ok(())
+}
+/// 旧 `挿絵/` 配置の S3 オブジェクトを dedup プールへ寄せる。
+///
+/// 手順: 全小説の `挿絵/` を LIST → hex 名のものを pool へ `copy` →
+/// `pool_exists` で確認後、legacy の実オブジェクトを `delete`。
+/// 既定は dry-run (pool へ写さず件数だけ数える)。
+fn run_s3_dedup(force: bool) -> Result<(), String> {
+    if !narou_rs::native::sqlite::state::illustration_dedup_enabled() {
+        return Err(
+            "挿絵の dedup は SQLite モード + S3 保存のときだけ有効です (storage-backend=sqlite と s3.asset-backend=s3)"
+                .to_string(),
+        );
+    }
+    let (_from_objects, _from_assets, to_objects, to_assets) = s3_migration_stores()?;
+    let s3 = narou_rs::native::s3::illustration_store()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "S3 ストアが構成されていません".to_string())?;
+    let runtime = migration_runtime()?;
+
+    // S3 上の legacy `挿絵/` 実オブジェクトを全小説横断で集める。
+    // list は論理キーを返すので `挿絵` を含むものだけ拾う。
+    let mut cursor: Option<String> = None;
+    let mut migrated = 0usize;
+    let mut already_pooled = 0usize;
+    let mut skipped_non_hex = 0usize;
+    let mut failed = 0usize;
+    let action = if force { "migrating" } else { "would migrate" };
+    loop {
+        let request = narou_rs::platform::ObjectListRequest::new(
+            narou_rs::platform::ObjectPrefix::new("novels").unwrap(),
+            std::num::NonZeroUsize::new(1000).unwrap(),
+        );
+        let request = match &cursor {
+            Some(next) => request.after(next.clone()),
+            None => request,
+        };
+        let page = runtime
+            .block_on(to_objects.list_page(&request))
+            .map_err(|e| e.to_string())?;
+        for meta in &page.objects {
+            let key = &meta.key;
+            if !narou_rs::platform::is_illustration_key(key) {
+                continue;
+            }
+            // hex 名だけが pool へ寄る (非 hex は小説ごとの配置のまま)。
+            let file = key.as_ref().rsplit('/').next().unwrap_or("");
+            let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or("");
+            let is_hex = stem.len() == 64 && stem.chars().all(|c| c.is_ascii_hexdigit());
+            if !is_hex {
+                skipped_non_hex += 1;
+                continue;
+            }
+            if !force {
+                migrated += 1;
+                continue;
+            }
+            // 既に pool にあれば書き換え不要、なければ read→write。
+            let in_pool = runtime.block_on(s3.pool_exists(key)).map_err(|e| e.to_string())?;
+            if in_pool {
+                already_pooled += 1;
+            } else {
+                match runtime.block_on(to_assets.read_stream(key)) {
+                    Ok(Some(stream)) => {
+                        if let Err(error) = runtime.block_on(to_assets.write_stream(key, stream)) {
+                            eprintln!("  {key}: pool write failed: {error}");
+                            failed += 1;
+                            continue;
+                        }
+                        migrated += 1;
+                    }
+                    Ok(None) => {
+                        eprintln!("  {key}: source object missing");
+                        failed += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("  {key}: source read failed: {error}");
+                        failed += 1;
+                        continue;
+                    }
+                }
+            }
+            // pool 確認後に legacy 実オブジェクトを消す (delete は旧 path)。
+            if let Err(error) = runtime.block_on(to_objects.delete(key)) {
+                eprintln!("  {key}: legacy delete failed: {error}");
+                failed += 1;
+            }
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    if !force {
+        println!("{action}: {migrated} 件 (実行するには --force)");
+    } else {
+        println!("dedup 完了: 移行 {migrated} 件 / 既に pool {already_pooled} 件 / 非hexスキップ {skipped_non_hex} 件 / 失敗 {failed} 件");
     }
     Ok(())
 }
@@ -119,8 +350,8 @@ fn resolve_novel_dir(target: &str) -> Option<PathBuf> {
 }
 
 fn run_orphan(archive_path: &Path, force: bool) -> Result<(), String> {
-    let orphans = illustration_store::find_orphan_illustrations(archive_path)
-        .map_err(|e| e.to_string())?;
+    let orphans =
+        illustration_store::find_orphan_illustrations(archive_path).map_err(|e| e.to_string())?;
     if orphans.is_empty() {
         println!("  孤児挿絵はありません。");
         return Ok(());
@@ -129,11 +360,7 @@ fn run_orphan(archive_path: &Path, force: bool) -> Result<(), String> {
     for path in &orphans {
         if force {
             if let Err(err) = std::fs::remove_file(path) {
-                log::report_error(&format!(
-                    "{} の削除に失敗しました: {}",
-                    path.display(),
-                    err
-                ));
+                log::report_error(&format!("{} の削除に失敗しました: {}", path.display(), err));
             } else {
                 println!("  [削除] {}", path.display());
             }
@@ -174,17 +401,15 @@ fn run_migrate(archive_path: &Path, force: bool) -> Result<(), String> {
         println!("  -f を指定すると実際に移行します。");
         return Ok(());
     }
-    let renamed =
-        illustration_store::apply_legacy_illustration_migrations(archive_path)
-            .map_err(|e| e.to_string())?;
+    let renamed = illustration_store::apply_legacy_illustration_migrations(archive_path)
+        .map_err(|e| e.to_string())?;
     println!("  移行完了: {} 件", renamed);
     Ok(())
 }
 
 fn run_fix_ext(archive_path: &Path, force: bool) -> Result<(), String> {
     let illust_dir = archive_path.join("挿絵");
-    let plans = illustration_store::plan_extension_fixes(&illust_dir)
-        .map_err(|e| e.to_string())?;
+    let plans = illustration_store::plan_extension_fixes(&illust_dir).map_err(|e| e.to_string())?;
     if plans.is_empty() {
         println!("  拡張子の修正対象はありません。");
         return Ok(());
@@ -192,11 +417,7 @@ fn run_fix_ext(archive_path: &Path, force: bool) -> Result<(), String> {
     println!("  拡張子の修正対象: {} 件", plans.len());
     for (old_path, new_path) in &plans {
         if force {
-            println!(
-                "  [予定] {} -> {}",
-                old_path.display(),
-                new_path.display()
-            );
+            println!("  [予定] {} -> {}", old_path.display(), new_path.display());
         } else {
             println!(
                 "  [dry-run] {} -> {}",
@@ -249,12 +470,30 @@ mod tests {
             0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
         ];
         let bmp = [0x42, 0x4D, 0x00, 0x00];
-        assert_eq!(illustration_store::detect_image_extension(&jpeg), Some("jpg"));
-        assert_eq!(illustration_store::detect_image_extension(&png), Some("png"));
-        assert_eq!(illustration_store::detect_image_extension(&gif), Some("gif"));
-        assert_eq!(illustration_store::detect_image_extension(&webp), Some("webp"));
-        assert_eq!(illustration_store::detect_image_extension(&bmp), Some("bmp"));
-        assert_eq!(illustration_store::detect_image_extension(b"plain text"), None);
+        assert_eq!(
+            illustration_store::detect_image_extension(&jpeg),
+            Some("jpg")
+        );
+        assert_eq!(
+            illustration_store::detect_image_extension(&png),
+            Some("png")
+        );
+        assert_eq!(
+            illustration_store::detect_image_extension(&gif),
+            Some("gif")
+        );
+        assert_eq!(
+            illustration_store::detect_image_extension(&webp),
+            Some("webp")
+        );
+        assert_eq!(
+            illustration_store::detect_image_extension(&bmp),
+            Some("bmp")
+        );
+        assert_eq!(
+            illustration_store::detect_image_extension(b"plain text"),
+            None
+        );
     }
 
     #[test]
@@ -263,8 +502,8 @@ mod tests {
         let illust_dir = dir.join("挿絵");
         std::fs::create_dir_all(&illust_dir).unwrap();
         let png_bytes = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00];
-        std::fs::write(illust_dir.join("cover.jpg"), &png_bytes).unwrap();
-        std::fs::write(illust_dir.join("ok.png"), &png_bytes).unwrap();
+        std::fs::write(illust_dir.join("cover.jpg"), png_bytes).unwrap();
+        std::fs::write(illust_dir.join("ok.png"), png_bytes).unwrap();
 
         let plans = illustration_store::plan_extension_fixes(&illust_dir).unwrap();
 

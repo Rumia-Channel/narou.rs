@@ -10,15 +10,17 @@
 //! `objects.data = NULL` and store all bytes in `object_chunks` (seq 0..N,
 //! 512 KiB each), matching the native `SqliteObjectStore` layout.
 
-use std::sync::Arc;
+
 
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
     AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
-    ObjectStore, PlatformFuture,
+    ObjectStore, PlatformFuture, content_type_for_key, paginate_object_listing,
 };
 use serde::Deserialize;
-use worker::{D1Database, D1PreparedStatement, wasm_bindgen::JsValue};
+use worker::{D1PreparedStatement, wasm_bindgen::JsValue};
+
+use crate::db_handle::DbHandle;
 
 /// Payloads at or below this size are stored inline in `objects.data`.
 const INLINE_MAX: usize = 512 * 1024;
@@ -78,11 +80,11 @@ fn metadata_from(key: &ObjectKey, size: i64, updated_at: &str, content_type: Opt
 
 #[derive(Clone)]
 pub struct D1ObjectStore {
-    db: Arc<D1Database>,
+    db: DbHandle,
 }
 
 impl D1ObjectStore {
-    pub fn new(db: Arc<D1Database>) -> Self {
+    pub fn new(db: DbHandle) -> Self {
         Self { db }
     }
 
@@ -207,7 +209,9 @@ impl D1ObjectStore {
                 )?);
             }
         }
-        self.db.batch(statements).await.map_err(worker_error)?;
+        // D1 のバッチは 1 文ずつ成否を確認しないと失敗を握りつぶす。
+        let results = self.db.batch(statements).await.map_err(worker_error)?;
+        crate::d1_repository::ensure_batch_success(&results)?;
         Ok(())
     }
 
@@ -222,7 +226,9 @@ impl D1ObjectStore {
                 vec![JsValue::from_str(key.as_ref())],
             )?,
         ];
-        self.db.batch(statements).await.map_err(worker_error)?;
+        // D1 のバッチは 1 文ずつ成否を確認しないと失敗を握りつぶす。
+        let results = self.db.batch(statements).await.map_err(worker_error)?;
+        crate::d1_repository::ensure_batch_success(&results)?;
         Ok(())
     }
 
@@ -230,7 +236,7 @@ impl D1ObjectStore {
     /// sorted ascending. D1 returns whole result sets, so pagination is
     /// applied in memory after the filtered sort.
     async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, ObjectMetadata)>> {
-        let upper = format!("{prefix}0");
+        let upper = narou_rs::platform::prefix_upper_bound(prefix);
         let statement = self.prepare(
             "SELECT object_key, size, updated_at, content_type FROM objects \
              WHERE object_key >= ? AND object_key < ? ORDER BY object_key",
@@ -261,21 +267,6 @@ impl D1ObjectStore {
             ));
         }
         Ok(out)
-    }
-}
-
-fn content_type_for_key(key: &ObjectKey) -> Option<String> {
-    match key.as_ref().rsplit('.').next() {
-        Some("yaml") | Some("yml") => Some("application/yaml".to_string()),
-        Some("txt") => Some("text/plain; charset=utf-8".to_string()),
-        Some("ini") => Some("text/plain; charset=utf-8".to_string()),
-        Some("html") => Some("text/html; charset=utf-8".to_string()),
-        Some("epub") => Some("application/epub+zip".to_string()),
-        Some("zip") => Some("application/zip".to_string()),
-        Some("jpg") | Some("jpeg") => Some("image/jpeg".to_string()),
-        Some("png") => Some("image/png".to_string()),
-        Some("gif") => Some("image/gif".to_string()),
-        _ => None,
     }
 }
 
@@ -333,22 +324,13 @@ impl ObjectStore for D1ObjectStore {
     ) -> PlatformFuture<'a, Result<ObjectListPage>> {
         Box::pin(async move {
             let rows = self.list_keys(request.prefix.as_ref()).await?;
-            let start = match &request.cursor {
-                Some(cursor) => rows
-                    .iter()
-                    .position(|(key, _)| key.as_str() > cursor.as_str())
-                    .unwrap_or(rows.len()),
-                None => 0,
-            };
-            let mut objects = Vec::new();
-            let mut next_cursor = None;
-            for (key, meta) in rows.into_iter().skip(start) {
-                if objects.len() >= request.limit.get() {
-                    next_cursor = Some(key);
-                    break;
-                }
-                objects.push(meta);
-            }
+            let (objects, next_cursor) = paginate_object_listing(
+                rows,
+                request.cursor.as_deref(),
+                request.limit.get(),
+                |(key, _)| key,
+            );
+            let objects = objects.into_iter().map(|(_, meta)| meta).collect();
             Ok(ObjectListPage {
                 objects,
                 next_cursor,

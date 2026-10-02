@@ -12,8 +12,8 @@ use super::log;
 
 const HR_TEXT: &str = "―――――――――――――――――――――――――――――――――――";
 
-pub fn cmd_csv(output: Option<&str>, import: Option<&str>) -> i32 {
-    match cmd_csv_inner(output, import) {
+pub async fn cmd_csv(output: Option<&str>, import: Option<&str>) -> i32 {
+    match cmd_csv_inner(output, import).await {
         Ok(code) => code,
         Err(err) => {
             log::report_error(&err);
@@ -22,11 +22,11 @@ pub fn cmd_csv(output: Option<&str>, import: Option<&str>) -> i32 {
     }
 }
 
-fn cmd_csv_inner(output: Option<&str>, import: Option<&str>) -> Result<i32, String> {
+async fn cmd_csv_inner(output: Option<&str>, import: Option<&str>) -> Result<i32, String> {
     db::init_database().map_err(|e| e.to_string())?;
 
     if let Some(path) = import {
-        import_csv(path)?;
+        import_csv(path).await?;
         return Ok(0);
     }
 
@@ -86,8 +86,8 @@ fn generate_csv() -> Result<String, String> {
         let Ok(Some(record)) = novels.get_sync(id.into()) else {
             continue;
         };
-        let is_frozen =
-            frozen.contains_key(&record.id) || record.tags.iter().any(|tag| tag == "frozen");
+        // upstream の csv.rb は Narou.novel_frozen? (freeze.yaml) だけを見る。
+        let is_frozen = frozen.contains_key(&record.id);
         let general_lastup = record
             .general_lastup
             .map(|date| date.timestamp().to_string())
@@ -120,19 +120,25 @@ fn generate_csv() -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
-fn import_csv(path: &str) -> Result<(), String> {
+async fn import_csv(path: &str) -> Result<(), String> {
     let content = load_import_csv_content(path)?;
     let urls = parse_csv_urls(&content)?;
     for url in urls {
-        let _ = download::cmd_download(download::DownloadOptions {
-            targets: vec![url],
-            force: false,
-            no_convert: false,
-            freeze: false,
-            remove: false,
-            mail: false,
-            user_agent: None,
-        });
+        // 取り込んだ URL は native と同じく download コマンド経由で取得する
+        // (以前は future を捨てていて、実際には何も取得していなかった)。
+        let _ = download::cmd_download(
+            download::DownloadOptions {
+                targets: vec![url],
+                force: false,
+                no_convert: false,
+                freeze: false,
+                remove: false,
+                mail: false,
+                user_agent: None,
+            },
+            &narou_rs::progress::console_sink(),
+        )
+        .await;
         println!("{}", HR_TEXT);
     }
     Ok(())

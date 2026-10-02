@@ -245,11 +245,9 @@ pub fn aozora_assets_dir() -> Option<PathBuf> {
 pub fn resolve_java_command_path() -> Option<PathBuf> {
     if let Some(path) =
         load_global_setting_string_with_aliases(&["java_path", "java-path", "javapath"])
-    {
-        if let Some(canonical) = canonicalize_existing_path(PathBuf::from(path)) {
+        && let Some(canonical) = canonicalize_existing_path(PathBuf::from(path)) {
             return Some(canonical);
         }
-    }
 
     if let Some(java_home) = std::env::var_os("JAVA_HOME") {
         let java_name = if cfg!(windows) { "java.exe" } else { "java" };
@@ -295,6 +293,19 @@ pub fn load_local_setting_string(key: &str) -> Option<String> {
     load_local_setting_value(key).and_then(|v| yaml_value_to_string(&v))
 }
 
+/// 未設定なら `default` を返す bool 設定。既定 true の設定を「明示的に
+/// false のときだけ切る」ために使う。
+pub fn load_local_setting_bool_or(key: &str, default: bool) -> bool {
+    load_local_setting_value(key)
+        .and_then(|v| match v {
+            serde_yaml::Value::Bool(b) => Some(b),
+            serde_yaml::Value::String(s) => Some(matches!(s.as_str(), "true" | "yes" | "on" | "1")),
+            serde_yaml::Value::Number(n) => Some(n.as_i64().unwrap_or(0) != 0),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
 pub fn load_local_setting_bool(key: &str) -> bool {
     load_local_setting_value(key)
         .and_then(|v| match v {
@@ -321,8 +332,8 @@ pub fn relay_web_stream_to_console<R: io::Read>(
 }
 
 pub fn reroute_web_line_to_console(text: &str, target_console: &str) -> String {
-    if let Some(json_str) = text.strip_prefix(crate::progress::WS_LINE_PREFIX) {
-        if let Ok(mut message) =
+    if let Some(json_str) = text.strip_prefix(crate::progress::WS_LINE_PREFIX)
+        && let Ok(mut message) =
             serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json_str)
         {
             message.insert(
@@ -335,7 +346,6 @@ pub fn reroute_web_line_to_console(text: &str, target_console: &str) -> String {
                 serde_json::Value::Object(message)
             );
         }
-    }
     format!(
         "{}{}",
         crate::progress::WS_LINE_PREFIX,
@@ -374,7 +384,7 @@ pub fn yaml_value_to_string(value: &serde_yaml::Value) -> Option<String> {
 
 pub fn current_device() -> Option<Device> {
     let raw = load_local_setting_string("device")?;
-    let device = Device::from_str(&raw);
+    let device = raw.parse::<Device>().unwrap_or(Device::Text);
     (device != Device::Text).then_some(device)
 }
 
@@ -391,6 +401,37 @@ pub fn load_frozen_ids_from_inventory(inventory: &Inventory) -> Result<HashSet<i
 pub fn load_locked_ids_from_inventory(inventory: &Inventory) -> Result<HashSet<i64>> {
     let locked: HashMap<i64, serde_yaml::Value> = inventory.load("lock", InventoryScope::Local)?;
     Ok(locked.into_keys().collect())
+}
+
+/// Novels a running child says it is working on right now.
+///
+/// `lock.yaml` is written by the child that owns a novel (`convert`,
+/// `download`, `update`) and cleared when it finishes. Entries older than
+/// `max_age` are ignored so a killed child cannot block a novel forever.
+pub fn load_active_locked_ids(max_age: std::time::Duration) -> Result<HashSet<i64>> {
+    let inventory = Inventory::with_default_root()?;
+    let locked: HashMap<i64, serde_yaml::Value> = inventory.load("lock", InventoryScope::Local)?;
+    let now = chrono::Local::now();
+    Ok(locked
+        .into_iter()
+        .filter(|(_, value)| lock_is_fresh(value, now, max_age))
+        .map(|(id, _)| id)
+        .collect())
+}
+
+/// A lock value is `%Y-%m-%d %H:%M:%S%.9f %:z` in local time. Unparseable or
+/// future values count as fresh (a clock change must not unlock a novel).
+fn lock_is_fresh(value: &serde_yaml::Value, now: chrono::DateTime<chrono::Local>, max_age: std::time::Duration) -> bool {
+    let Some(text) = value.as_str() else {
+        return true;
+    };
+    let Ok(when) = chrono::DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.9f %:z") else {
+        return true;
+    };
+    match now.signed_duration_since(when.with_timezone(&chrono::Local)).to_std() {
+        Ok(age) => age <= max_age,
+        Err(_) => true,
+    }
 }
 
 pub struct NovelLockGuard {
@@ -449,52 +490,39 @@ fn current_lock_timestamp() -> serde_yaml::Value {
 }
 
 pub fn record_is_frozen(record: &crate::db::NovelRecord, frozen_ids: &HashSet<i64>) -> bool {
-    frozen_ids.contains(&record.id) || record.tags.iter().any(|tag| tag == "frozen")
+    // upstream の Narou.novel_frozen? は freeze inventory だけを見る。
+    // `frozen` という名前のタグは upstream では意味を持たない。
+    frozen_ids.contains(&record.id)
 }
 
 pub fn is_frozen_id(id: i64) -> bool {
-    let frozen_ids = load_frozen_ids().unwrap_or_default();
-    if frozen_ids.contains(&id) {
-        return true;
-    }
-
-    crate::db::with_database(|db| {
-        Ok(db
-            .get(id)
-            .map(|record| record_is_frozen(record, &frozen_ids))
-            .unwrap_or(false))
-    })
-    .unwrap_or(false)
+    load_frozen_ids()
+        .map(|frozen_ids| frozen_ids.contains(&id))
+        .unwrap_or(false)
 }
 
 pub fn set_frozen_state(id: i64, frozen: bool) -> Result<()> {
-    crate::db::with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
+    crate::db::with_database(|db| {
+        if db.get(id).is_none() {
+            return Err(NarouError::NotFound(format!("ID: {}", id)));
+        }
 
         let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-        let _ = crate::db::inventory::update_locked_yaml_file::<
+        crate::db::inventory::update_locked_yaml_file::<
             (),
             HashMap<i64, serde_yaml::Value>,
             _,
         >(&freeze_path, |mut frozen_list| {
+            // upstream の Command::Freeze.execute! 相当: freeze.yaml だけを
+            // 更新し、レコードのタグには触れない。
             if frozen {
                 frozen_list.insert(id, serde_yaml::Value::Bool(true));
-                if !updated.tags.iter().any(|tag| tag == "frozen") {
-                    updated.tags.push("frozen".to_string());
-                }
             } else {
                 frozen_list.remove(&id);
-                updated.tags.retain(|tag| tag != "frozen" && tag != "404");
             }
-
-            db.insert(updated.clone());
             Ok((frozen_list, ()))
         })?;
-        db.save()
+        Ok(())
     })
 }
 
@@ -507,15 +535,14 @@ pub fn mark_not_found_and_freeze(id: i64) -> Result<()> {
         let mut updated = record;
 
         let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-        let _ = crate::db::inventory::update_locked_yaml_file::<
+        crate::db::inventory::update_locked_yaml_file::<
             (),
             HashMap<i64, serde_yaml::Value>,
             _,
         >(&freeze_path, |mut frozen_list| {
+            // upstream: `narou tag --add 404` + `narou freeze --on`。
+            // freeze 側は freeze.yaml だけを更新するので `frozen` タグは付けない。
             frozen_list.insert(id, serde_yaml::Value::Bool(true));
-            if !updated.tags.iter().any(|tag| tag == "frozen") {
-                updated.tags.push("frozen".to_string());
-            }
             if !updated.tags.iter().any(|tag| tag == "404") {
                 updated.tags.push("404".to_string());
             }
@@ -526,13 +553,11 @@ pub fn mark_not_found_and_freeze(id: i64) -> Result<()> {
         db.save()
     })
 }
-
 pub fn open_directory(path: &Path, confirm_message: Option<&str>) {
-    if let Some(message) = confirm_message {
-        if !confirm(message, false, false) {
+    if let Some(message) = confirm_message
+        && !confirm(message, false, false) {
             return;
         }
-    }
 
     let path = path.to_string_lossy().to_string();
     if cfg!(windows) {
@@ -821,11 +846,9 @@ fn get_copy_to_directory(
     if grouping
         .iter()
         .any(|value| value.eq_ignore_ascii_case("device"))
-    {
-        if let Some(device) = device {
+        && let Some(device) = device {
             dir.push(device.display_name());
         }
-    }
     if grouping
         .iter()
         .any(|value| value.eq_ignore_ascii_case("site"))
@@ -951,7 +974,7 @@ fn sanitize_backup_name(title: &str) -> String {
     if load_local_setting_bool("normalize-filename") {
         cleaned = cleaned.nfc().collect();
     }
-    while cleaned.as_bytes().len() > 180 {
+    while cleaned.len() > 180 {
         cleaned.pop();
     }
     cleaned
@@ -967,12 +990,13 @@ mod tests {
 
     use super::{
         DigestChoice, NovelLockGuard, canonicalize_aozoraepub3_tool_path,
-        canonicalize_existing_path, choose_digest_action_with_auto_choices,
-        configure_process_group_command, configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
+        canonicalize_existing_path, choose_digest_action_with_auto_choices, configure_web_subprocess_command, get_copy_to_directory, load_frozen_ids_from_inventory,
         load_locked_ids_from_inventory, mark_not_found_and_freeze, parse_digest_auto_choices,
         record_is_frozen, reroute_web_line_to_console, resolve_auto_convert_devices,
         sanitize_backup_name, terminate_process,
     };
+    #[cfg(unix)]
+    use super::configure_process_group_command;
     use crate::converter::device::Device;
     use crate::db::NovelRecord;
 
@@ -1019,7 +1043,7 @@ mod tests {
     #[test]
     fn sanitize_backup_name_truncates_by_byte_length() {
         let name = sanitize_backup_name(&"あ".repeat(100));
-        assert!(name.as_bytes().len() <= 180);
+        assert!(name.len() <= 180);
         assert!(name.chars().all(|ch| ch == 'あ'));
     }
 
@@ -1112,12 +1136,14 @@ mod tests {
     }
 
     #[test]
-    fn record_is_frozen_checks_freeze_inventory_before_tags() {
+    fn record_is_frozen_uses_only_freeze_inventory() {
+        // upstream の Narou.novel_frozen? は freeze inventory だけを見る。
+        // `frozen` タグを手動で付けても凍結扱いにはならない。
         let mut frozen_ids = std::collections::HashSet::new();
         frozen_ids.insert(1);
 
         assert!(record_is_frozen(&sample_record(1, &[]), &frozen_ids));
-        assert!(record_is_frozen(
+        assert!(!record_is_frozen(
             &sample_record(2, &["frozen"]),
             &frozen_ids
         ));
@@ -1160,7 +1186,8 @@ mod tests {
 
         let record = crate::db::with_database(|db| Ok(db.get(7).cloned().unwrap())).unwrap();
         assert!(record.tags.contains(&"404".to_string()));
-        assert!(record.tags.contains(&"frozen".to_string()));
+        // upstream の freeze --on 相当なので `frozen` タグは付けない。
+        assert!(!record.tags.contains(&"frozen".to_string()));
 
         let inventory = Inventory::new(temp.path().to_path_buf());
         let frozen_ids = load_frozen_ids_from_inventory(&inventory).unwrap();

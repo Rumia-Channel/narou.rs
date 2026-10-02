@@ -132,6 +132,7 @@ async fn api_list_inner(
             frozen: record.frozen,
             suspend: record.suspend,
             length: record.length,
+            display_url: record.display_url,
             toc_url: record.toc_url,
             ncode: record.ncode,
             general_all_no: record.general_all_no,
@@ -146,41 +147,6 @@ async fn api_list_inner(
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::NovelListItem;
-    use serde_json::json;
-
-    #[test]
-    fn novel_list_item_serializes_dates_as_epoch_integers() {
-        let item = NovelListItem {
-            id: 5,
-            title: "title".to_string(),
-            author: "author".to_string(),
-            sitename: "site".to_string(),
-            novel_type: 1,
-            end: false,
-            last_update: 1_776_384_000,
-            general_lastup: Some(1_776_470_400),
-            last_check_date: Some(1_776_556_800),
-            new_arrivals_date: Some(1_776_384_000),
-            tags: vec!["tag".to_string()],
-            new_arrivals: true,
-            frozen: false,
-            suspend: false,
-            length: Some(1234),
-            toc_url: "https://example.com".to_string(),
-            ncode: Some("n1234ab".to_string()),
-            general_all_no: Some(99),
-        };
-
-        let value = serde_json::to_value(item).unwrap();
-        assert_eq!(value["last_update"], json!(1_776_384_000));
-        assert_eq!(value["general_lastup"], json!(1_776_470_400));
-        assert_eq!(value["last_check_date"], json!(1_776_556_800));
-        assert_eq!(value["new_arrivals_date"], json!(1_776_384_000));
-    }
-}
 
 pub async fn get_novel(
     State(state): State<AppState>,
@@ -547,13 +513,46 @@ async fn generate_epub_on_demand(
     record: &crate::db::novel_record::NovelRecord,
     novel_dir: &std::path::Path,
 ) -> Result<(Vec<u8>, String), (StatusCode, String)> {
+    // 保存済み EPUB と同じ命名規則で Content-Disposition 名を決める
+    // (変換時の txt basename に `.epub` を付けたもの)。
+    // `convert.filename` / `convert.filename-to-ncode` は
+    // `NovelSettings::load_for_novel` と `OutputNamingEnv` が反映する。
+    let settings = crate::converter::settings::NovelSettings::load_for_novel(
+        id,
+        &record.title,
+        &record.author,
+        novel_dir,
+    );
+    let filename = {
+        // 命名には TocObject の title/author/toc_url だけが使われるため、
+        // toc.yaml を読まずに record から組み立てる。
+        let naming_toc = crate::downloader::TocObject {
+            title: record.title.clone(),
+            author: record.author.clone(),
+            toc_url: record.toc_url.clone(),
+            story: None,
+            subtitles: Vec::new(),
+            novel_type: Some(record.novel_type),
+        };
+        crate::converter::output::epub_output_filename(
+            &settings,
+            &naming_toc,
+            Some(record),
+            &crate::converter::output::local_output_naming_env(),
+        )
+    };
+
     // P4a: prefer the SQLite mirror of the converted text when present.
-    if !crate::native::sqlite::state::legacy_yaml_active()
+    // `convert.keep-txt=false` では変換済みテキストを保存しない構成なので、
+    // 残っていても読まずに本文から組み立て直す (Worker の download.epub と
+    // 同じ扱い)。
+    if crate::converter::keep_converted_text_file()
+        && !crate::native::sqlite::state::legacy_yaml_active()
         && let Some(narou_dir) = crate::db::inventory::Inventory::with_default_root()
             .ok()
             .map(|inventory| inventory.root_dir().join(".narou"))
         && let Some(state) = crate::native::sqlite::state::active_for(&narou_dir)
-        && let Some(payload) = (|| {
+        && let Some(payload) = {
             let conn = state.conn_ref();
             conn.lock()
                 .expect("sqlite mutex poisoned")
@@ -563,45 +562,119 @@ async fn generate_epub_on_demand(
                     |row| row.get::<_, Vec<u8>>(0),
                 )
                 .ok()
-        })()
+        }
         && !payload.is_empty()
     {
-        let filename = format!("novel-{id}.epub");
         return Ok((payload, filename));
     }
 
-    let settings = crate::converter::settings::NovelSettings::load_for_novel(
-        id,
-        &record.title,
-        &record.author,
-        novel_dir,
-    );
-    let toc_content = std::fs::read_to_string(novel_dir.join("toc.yaml"))
-        .map_err(|e| (StatusCode::CONFLICT, format!("toc.yaml: {e}")))?;
-    let toc: crate::downloader::TocFile = serde_yaml::from_str(&toc_content)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("toc.yaml: {e}")))?;
-    let toc_object = crate::downloader::TocObject {
-        title: toc.title,
-        author: toc.author,
-        toc_url: toc.toc_url,
-        story: toc.story,
-        subtitles: toc.subtitles,
-        novel_type: toc.novel_type,
+    let keep_text = crate::converter::keep_converted_text_file();
+    // 変換済みテキストを保存しない構成では本文から組み立てた novel.txt を
+    // 使い、命名は record 由来の filename (fast path と同じ) を保つ。
+    // 保存する構成は従来どおり toc.yaml から命名・txt パスを解決する。
+    let mut filename = filename;
+    let toc_object = if keep_text {
+        let toc_content = std::fs::read_to_string(novel_dir.join("toc.yaml"))
+            .map_err(|e| (StatusCode::CONFLICT, format!("toc.yaml: {e}")))?;
+        let toc: crate::downloader::TocFile = serde_yaml::from_str(&toc_content)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("toc.yaml: {e}")))?;
+        let toc_object = crate::downloader::TocObject {
+            title: toc.title,
+            author: toc.author,
+            toc_url: toc.toc_url,
+            story: toc.story,
+            subtitles: toc.subtitles,
+            novel_type: toc.novel_type,
+        };
+        // 保存済み EPUB と同じ名: 実際に生成される txt の basename に `.epub`
+        // を付けたもの (native `device.rs` の `{file_stem(txt)}.epub` 経路と同じ規則)。
+        filename = crate::converter::output::epub_output_filename(
+            &settings,
+            &toc_object,
+            Some(record),
+            &crate::converter::output::local_output_naming_env(),
+        );
+        Some(toc_object)
+    } else {
+        None
     };
-    let txt_path = crate::converter::output::create_output_text_path(
-        &settings,
-        id,
-        novel_dir,
-        &toc_object,
-        Some(record),
-    );
-    if !txt_path.is_file() {
-        return Err((
-            StatusCode::CONFLICT,
-            "Converted text not found: run convert first".to_string(),
+    // 変換済みテキストを保存しない構成では保存済みの本文からその都度
+    // 変換する。build_book はファイルを要求するため、材料を novel_dir へ
+    // 取り出し、組み立てた txt は消えるガードとして書き出す。
+    let (txt_path, _conversion_guard) = if let Some(toc_object) = &toc_object {
+        (
+            crate::converter::output::create_output_text_path(
+                &settings,
+                id,
+                novel_dir,
+                toc_object,
+                Some(record),
+            ),
+            None,
+        )
+    } else {
+        let stores = crate::native::object_store::NativeStores::for_current_root()
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        let narou_root = novel_dir
+            .ancestors()
+            .find(|candidate| candidate.join(".narou").is_dir())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let files =
+            crate::native::object_store::NativeStore::for_narou_root(&narou_root)
+                .and_then(|store| store.materialize_novel_files(novel_dir))
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        let inventory = crate::db::inventory::Inventory::with_default_root()
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        let service = std::sync::Arc::new(crate::application::convert::ConvertService::new(
+            stores.objects.clone(),
+            stores.assets.clone(),
+            std::sync::Arc::new(
+                crate::native::application::NativeSettingsStore::new(
+                    std::sync::Arc::new(inventory),
+                ),
+            ),
         ));
+        // NovelConverter が内部に Rc を持つため非 Send。スレッド内で block_on して
+        // そのスレッド上で完結させる (結果の String は Send)。
+        let record = record.clone();
+        let text = tokio::task::spawn_blocking(move || {
+            futures::executor::block_on(service.convert_only(&record))
+                .map(|converted| converted.text)
+        })
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .map_err(|error| (StatusCode::CONFLICT, format!("convert: {error}")))?;
+        let on_demand_txt = novel_dir.join("novel.txt");
+        let _ = std::fs::create_dir_all(novel_dir);
+        std::fs::write(&on_demand_txt, text.as_bytes())
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        (
+            on_demand_txt.clone(),
+            Some((
+                files,
+                crate::native::object_store::MaterializedNovelFiles::from_paths(vec![
+                    on_demand_txt,
+                ]),
+            )),
+        )
+    };
+    if !txt_path.is_file() {
+        let message = if keep_text {
+            "Converted text not found: run convert first"
+        } else {
+            "Converted text could not be produced"
+        };
+        return Err((StatusCode::CONFLICT, message.to_string()));
     }
 
+    // 挿絵を S3 に置く構成ではローカルに実体が無い。EPUB 生成はファイルを
+    // 要求するので、ここで取り出し、スコープを抜けた時点で片付ける。
+    let _materialized = crate::native::illustrations::Materialized::new(
+        crate::native::illustrations::materialize(novel_dir)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+    );
     let options = crate::epub_lite::EpubBuildOptions {
         title: record.title.clone(),
         author: record.author.clone(),
@@ -615,9 +688,11 @@ async fn generate_epub_on_demand(
         // Java 版と同じ資産 (注記表・外字フォント・AozoraEpub3.ini) を読ませる。
         assets_dir: crate::compat::aozora_assets_dir(),
         kindle: false,
-            extra_assets: crate::converter::dakuten_font::lite_font_assets(false)
+        extra_assets: crate::converter::dakuten_font::lite_font_assets(false)
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
-};
+        rotate_image: crate::compat::load_local_setting_string("convert.rotate-image")
+            .and_then(|value| crate::converter::settings::ImageRotation::from_setting(&value)),
+    };
     let build_path = txt_path.clone();
     let build = tokio::task::spawn_blocking(move || {
         crate::epub_lite::build_book(&build_path, &options)
@@ -630,11 +705,12 @@ async fn generate_epub_on_demand(
     crate::epub_lite::stream_epub(&build.book, &mut bytes, |epub_path| build.resolve(epub_path))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let filename = txt_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| format!("{}.epub", n.trim_end_matches(".txt")))
-        .unwrap_or_else(|| format!("novel-{id}.epub"));
+    // keep=false + 実ファイル無しの構成で作った空の novel_dir を片付ける
+    // (中身があれば失敗してそのまま残る)。
+    if !keep_text {
+        let _ = std::fs::remove_dir(novel_dir);
+    }
+
     Ok((bytes, filename))
 }
 
@@ -656,4 +732,41 @@ fn serve_epub_bytes(bytes: Vec<u8>, filename: &str) -> Result<Response, (StatusC
         .headers_mut()
         .insert(header::CONTENT_DISPOSITION, disposition_value);
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NovelListItem;
+    use serde_json::json;
+
+    #[test]
+    fn novel_list_item_serializes_dates_as_epoch_integers() {
+        let item = NovelListItem {
+            id: 5,
+            title: "title".to_string(),
+            author: "author".to_string(),
+            sitename: "site".to_string(),
+            novel_type: 1,
+            end: false,
+            last_update: 1_776_384_000,
+            general_lastup: Some(1_776_470_400),
+            last_check_date: Some(1_776_556_800),
+            new_arrivals_date: Some(1_776_384_000),
+            tags: vec!["tag".to_string()],
+            new_arrivals: true,
+            frozen: false,
+            suspend: false,
+            length: Some(1234),
+            toc_url: "https://example.com".to_string(),
+            ncode: Some("n1234ab".to_string()),
+            display_url: "https://example.com".to_string(),
+            general_all_no: Some(99),
+        };
+
+        let value = serde_json::to_value(item).unwrap();
+        assert_eq!(value["last_update"], json!(1_776_384_000));
+        assert_eq!(value["general_lastup"], json!(1_776_470_400));
+        assert_eq!(value["last_check_date"], json!(1_776_556_800));
+        assert_eq!(value["new_arrivals_date"], json!(1_776_384_000));
+    }
 }

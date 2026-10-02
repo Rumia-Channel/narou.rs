@@ -8,7 +8,7 @@
 //! legacy illustration directory handling).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
@@ -17,7 +17,7 @@ use rusqlite::Connection;
 use crate::error::{NarouError, Result};
 use crate::platform::{
     AssetStore, AssetStream, ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata,
-    ObjectStore, PlatformFuture,
+    ObjectPrefix, ObjectStore, PlatformFuture,
 };
 
 use crate::native::object_store::{
@@ -36,11 +36,32 @@ pub(crate) const OBJECT_CHUNK_BYTES: usize = 512 * 1024;
 pub struct SqliteObjectStore {
     conn: Arc<Mutex<Connection>>,
     mirror: NativeObjectStore,
+    /// 実ファイルのミラーを書くか (`sqlite.mirror-files=false` で無効)。
+    /// 無効時は読み書きが SQLite だけで完結する。
+    mirror_files: bool,
 }
 
 impl SqliteObjectStore {
     pub fn new(conn: Arc<Mutex<Connection>>, mirror: NativeObjectStore) -> Self {
-        Self { conn, mirror }
+        Self::with_mirror_files(conn, mirror, crate::native::sqlite::state::mirror_files_enabled())
+    }
+
+    /// 実ファイルのミラーが置かれるルート (`小説データ/`)。
+    pub(crate) fn archive_root(&self) -> &Path {
+        self.mirror.root()
+    }
+
+    /// ミラー有無を明示して組み立てる (テスト用)。
+    pub fn with_mirror_files(
+        conn: Arc<Mutex<Connection>>,
+        mirror: NativeObjectStore,
+        mirror_files: bool,
+    ) -> Self {
+        Self {
+            conn,
+            mirror,
+            mirror_files,
+        }
     }
 
     fn now_rfc3339() -> String {
@@ -241,6 +262,53 @@ impl SqliteObjectStore {
     /// Merge DB metadata with filesystem entries not yet imported. DB rows
     /// win on conflict; the union keeps listings correct for files written
     /// before the import or through paths that bypass the store.
+    /// 保存済みオブジェクトを小説ディレクトリへ実ファイルとして取り出す (同期)。
+    ///
+    /// ミラーを書かない構成で、変換がファイルパスを要求するときに使う。
+    /// 既にあるファイルは触らず、自分が書いたパスだけを返す (呼び出し側が
+    /// 使い終わったら消す)。`skip_segment` に一致するパス要素を含むキー
+    /// (挿絵など) は対象外。
+    pub(crate) fn materialize_into(
+        &self,
+        novel_dir: &Path,
+        prefix: &ObjectKey,
+        skip_segment: &str,
+    ) -> Result<Vec<PathBuf>> {
+        let request = ObjectListRequest::new(
+            ObjectPrefix::new(prefix.as_ref())?,
+            std::num::NonZeroUsize::new(4096).expect("nonzero"),
+        );
+        // 1 ページに収まらない小説は稀なので、収まらない分は次の変換で拾う。
+        let page = self.list_blocking(&request)?;
+        let mut written = Vec::new();
+        for metadata in &page.objects {
+            let key = metadata.key.as_ref();
+            if key.split('/').any(|segment| segment == skip_segment) {
+                continue;
+            }
+            let relative = key
+                .strip_prefix(prefix.as_ref())
+                .map(|rest| rest.trim_start_matches('/'))
+                .unwrap_or_default();
+            if relative.is_empty() {
+                continue;
+            }
+            let path = novel_dir.join(relative);
+            if path.is_file() {
+                continue;
+            }
+            let Some(data) = self.read_blocking(&metadata.key)? else {
+                continue;
+            };
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, &data)?;
+            written.push(path);
+        }
+        Ok(written)
+    }
+
     fn list_blocking(&self, request: &ObjectListRequest) -> Result<ObjectListPage> {
         let mut merged: BTreeMap<String, ObjectMetadata> = BTreeMap::new();
         {
@@ -277,8 +345,9 @@ impl SqliteObjectStore {
             }
         }
         // Filesystem union: only for keys the DB does not already know.
+        // ミラーを書かない構成では実ファイルを見ない (古い残骸を拾わない)。
         let prefix_dir = self.mirror.resolve_prefix_dir(request.prefix.as_ref())?;
-        if prefix_dir.is_dir() {
+        if self.mirror_files && prefix_dir.is_dir() {
             let mut paths = Vec::new();
             NativeObjectStore::recursive_files(self.mirror.root(), &prefix_dir, &mut paths)?;
             for path in paths {
@@ -294,23 +363,12 @@ impl SqliteObjectStore {
             }
         }
         let objects: Vec<ObjectMetadata> = merged.into_values().collect();
-        let start = request
-            .cursor
-            .as_deref()
-            .map(|cursor| {
-                objects
-                    .iter()
-                    .position(|item| item.key.as_ref() > cursor)
-                    .unwrap_or(objects.len())
-            })
-            .unwrap_or(0);
-        let end = (start + request.limit.get()).min(objects.len());
-        let page = objects[start.min(objects.len())..end].to_vec();
-        let next_cursor = if end < objects.len() {
-            page.last().map(|item| item.key.as_ref().to_string())
-        } else {
-            None
-        };
+        let (page, next_cursor) = crate::platform::paginate_object_listing(
+            objects,
+            request.cursor.as_deref(),
+            request.limit.get(),
+            |item| item.key.as_ref(),
+        );
         Ok(ObjectListPage {
             objects: page,
             next_cursor,
@@ -385,7 +443,10 @@ impl ObjectStore for SqliteObjectStore {
                 )));
             }
             this.write_blocking(&key, &data)?;
-            this.mirror.write_bytes_blocking(&key, &data)
+            if this.mirror_files {
+                this.mirror.write_bytes_blocking(&key, &data)?;
+            }
+            Ok(())
         })
     }
 
@@ -394,6 +455,9 @@ impl ObjectStore for SqliteObjectStore {
         let key = key.clone();
         run_blocking(move || {
             this.delete_blocking(&key)?;
+            if !this.mirror_files {
+                return Ok(());
+            }
             let path = this.mirror.resolve_path(&key)?;
             match std::fs::remove_file(path) {
                 Ok(()) => Ok(()),
@@ -476,7 +540,10 @@ impl AssetStore for SqliteObjectStore {
             }
             run_blocking(move || {
                 this.write_blocking(&key, &data)?;
-                this.mirror.write_bytes_blocking(&key, &data)
+                if this.mirror_files {
+                    this.mirror.write_bytes_blocking(&key, &data)?;
+                }
+                Ok(())
             })
             .await
         })
@@ -496,6 +563,9 @@ impl AssetStore for SqliteObjectStore {
         let destination = destination.clone();
         run_blocking(move || {
             this.copy_blocking(&source, &destination)?;
+            if !this.mirror_files {
+                return Ok(());
+            }
             let source_path = this.mirror.resolve_path(&source)?;
             let destination_path = this.mirror.resolve_path(&destination)?;
             if source_path.exists() {
@@ -517,6 +587,9 @@ impl AssetStore for SqliteObjectStore {
         run_blocking(move || {
             this.copy_blocking(&source, &destination)?;
             this.delete_blocking(&source)?;
+            if !this.mirror_files {
+                return Ok(());
+            }
             let source_path = this.mirror.resolve_path(&source)?;
             let destination_path = this.mirror.resolve_path(&destination)?;
             if source_path.exists() {
@@ -678,6 +751,47 @@ mod tests {
             dir,
             SqliteObjectStore::new(Arc::new(Mutex::new(conn)), mirror),
         )
+    }
+
+    /// ミラー無効なら実ファイルを書かず、要求されたときだけ取り出すこと。
+    #[test]
+    fn mirror_files_can_be_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = {
+            let mut conn = Connection::open_in_memory().unwrap();
+            crate::native::sqlite::migrations::apply(&mut conn).unwrap();
+            conn
+        };
+        let mirror = NativeObjectStore::from_root(dir.path().to_path_buf()).unwrap();
+        let store = SqliteObjectStore::with_mirror_files(Arc::new(Mutex::new(conn)), mirror, false);
+
+        let key = ObjectKey::try_new("novels/site/title/本文/1 x.yaml").unwrap();
+        futures::executor::block_on(ObjectStore::write_small(&store, &key, b"body".to_vec()))
+            .unwrap();
+        let mirrored = dir.path().join("site/title/本文/1 x.yaml");
+        assert!(
+            !mirrored.exists(),
+            "no mirror file may be written when the mirror is off"
+        );
+
+        // 一覧は DB の内容だけを返す (実ファイルは混ぜない)。
+        let request = ObjectListRequest::new(
+            ObjectPrefix::new("novels/site").unwrap(),
+            NonZeroUsize::new(10).unwrap(),
+        );
+        let page = futures::executor::block_on(ObjectStore::list_page(&store, &request)).unwrap();
+        assert_eq!(page.objects.len(), 1);
+
+        // 必要なときだけ実体化し、返したパスを消せば元に戻る。
+        let prefix = ObjectKey::try_new("novels/site/title").unwrap();
+        let novel_dir = dir.path().join("site/title");
+        let written = store.materialize_into(&novel_dir, &prefix, "挿絵").unwrap();
+        assert_eq!(written, vec![mirrored.clone()]);
+        assert!(mirrored.is_file());
+        for path in written {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert!(!mirrored.exists());
     }
 
     #[test]

@@ -16,10 +16,10 @@ const DAKUTEN_FONT_NAME: &str = "DMincho.ttf";
 
 fn preset_dir() -> Result<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("preset"));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        candidates.push(parent.join("preset"));
     }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     candidates.push(manifest_dir.join("preset"));
@@ -57,7 +57,10 @@ fn format_line_height(line_height: f64) -> String {
 pub fn dakuten_css_text() -> Result<String> {
     let preset = preset_dir()?;
     let text = std::fs::read_to_string(preset.join(DAKUTEN_CSS_NAME))?;
-    Ok(text.replace("<%= line_height %>", &format_line_height(current_line_height())))
+    Ok(text.replace(
+        "<%= line_height %>",
+        &format_line_height(current_line_height()),
+    ))
 }
 
 /// `preset/DMincho.ttf` (濁点フォント本体) の中身。
@@ -133,8 +136,10 @@ fn restore_normal_css(aozora_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let css_text = std::fs::read_to_string(&src_normal_css)?
-        .replace("<%= line_height %>", &format_line_height(current_line_height()));
+    let css_text = std::fs::read_to_string(&src_normal_css)?.replace(
+        "<%= line_height %>",
+        &format_line_height(current_line_height()),
+    );
     std::fs::write(&dst_css_path, css_text)?;
     Ok(())
 }
@@ -154,7 +159,11 @@ fn cleanup_errors(aozora_dir: &Path) -> (Option<NarouError>, Option<NarouError>)
     )
 }
 
-fn warn_cleanup_errors(aozora_dir: &Path, css_error: Option<&NarouError>, font_error: Option<&NarouError>) {
+fn warn_cleanup_errors(
+    aozora_dir: &Path,
+    css_error: Option<&NarouError>,
+    font_error: Option<&NarouError>,
+) {
     if let Some(err) = css_error {
         tracing::warn!(
             path = %dst_css(aozora_dir).display(),
@@ -212,8 +221,10 @@ pub fn activate(aozora_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let css_text = std::fs::read_to_string(&src_css)?
-        .replace("<%= line_height %>", &format_line_height(current_line_height()));
+    let css_text = std::fs::read_to_string(&src_css)?.replace(
+        "<%= line_height %>",
+        &format_line_height(current_line_height()),
+    );
     std::fs::write(&dst_css_path, css_text)?;
     std::fs::copy(&src_font, &dst_font_path)?;
     Ok(())

@@ -181,10 +181,10 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
     };
 
     let novels = narou_rs::native::novel_repository::NativeNovelRepository::new();
-    let records = match (|| -> narou_rs::error::Result<Vec<NovelRecord>> {
-        let sort = resolve_list_sort(&options, sort_key);
-        // CLI list は全件表示: display 用 query ではなく全件を取得する
-        // (既存挙動: フィルタは表示後に適用される)。
+    // CLI list は全件表示: display 用 query ではなく全件を取得する
+    // (既存挙動: フィルタは表示後に適用される)。
+    let all_records = {
+        let sort = resolve_list_sort(options, sort_key);
         let query = narou_rs::platform::NovelQuery::page(
             narou_rs::platform::NovelFilter::all(),
             sort,
@@ -192,7 +192,8 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
             usize::MAX,
         );
         novels.query_sync(&query)
-    })() {
+    };
+    let records = match all_records {
         Ok(records) => records,
         Err(err) => {
             log::report_error(&err.to_string());
@@ -256,11 +257,9 @@ fn cmd_list_inner(options: &ListOptions) -> i32 {
         })
         .collect::<Vec<_>>();
 
-    if colors_changed {
-        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
-            log::report_error(&err.to_string());
-            return 127;
-        }
+    if colors_changed && let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
+        log::report_error(&err.to_string());
+        return 127;
     }
 
     let limit = options.limit.unwrap_or(lines.len());
@@ -314,11 +313,10 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         }
     }
 
-    if explicit_color_changed {
-        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
-            log::report_error(&err.to_string());
-            return 127;
-        }
+    if explicit_color_changed && let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors)
+    {
+        log::report_error(&err.to_string());
+        return 127;
     }
 
     if options.targets.is_empty() {
@@ -423,11 +421,9 @@ pub fn cmd_tag(options: TagOptions) -> i32 {
         }
     };
 
-    if auto_color_changed {
-        if let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
-            log::report_error(&err.to_string());
-            return 127;
-        }
+    if auto_color_changed && let Err(err) = tag_colors::save_tag_colors(&inventory, &tag_colors) {
+        log::report_error(&err.to_string());
+        return 127;
     }
 
     for output in outputs {
@@ -590,10 +586,10 @@ fn decorate_line(
     if options.url {
         parts.push(record.toc_url.clone());
     }
-    if options.show_tags() {
-        if let Some(tags) = decorate_tags(&record.tags, tag_colors, colored) {
-            parts.push(tags);
-        }
+    if options.show_tags()
+        && let Some(tags) = decorate_tags(&record.tags, tag_colors, colored)
+    {
+        parts.push(tags);
     }
 
     parts.join(" | ")
@@ -626,10 +622,11 @@ fn decorate_date(record: &NovelRecord, options: &ListOptions, colored: bool) -> 
     let now = Utc::now();
     let limit = Duration::seconds(ANNOTATION_COLOR_TIME_LIMIT);
 
-    if let Some(new_arrival) = new_arrivals_date {
-        if new_arrival >= last_update && new_arrival + limit >= now {
-            return format_date(new_arrival, colored.then_some("magenta"));
-        }
+    if let Some(new_arrival) = new_arrivals_date
+        && new_arrival >= last_update
+        && new_arrival + limit >= now
+    {
+        return format_date(new_arrival, colored.then_some("magenta"));
     }
 
     if last_update + limit >= now {
@@ -759,15 +756,11 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
             return 127;
         }
     };
-    let changed = tag_colors::ensure_tag_colors(
-        tag_colors,
-        tag_list.iter().map(|(tag, _)| tag.as_str()),
-    );
-    if changed {
-        if let Err(err) = tag_colors::save_tag_colors(&inventory, tag_colors) {
-            log::report_error(&err.to_string());
-            return 127;
-        }
+    let changed =
+        tag_colors::ensure_tag_colors(tag_colors, tag_list.iter().map(|(tag, _)| tag.as_str()));
+    if changed && let Err(err) = tag_colors::save_tag_colors(&inventory, tag_colors) {
+        log::report_error(&err.to_string());
+        return 127;
     }
 
     println!("タグ一覧");
@@ -783,8 +776,8 @@ fn display_tag_list(tag_colors: &mut TagColors) -> i32 {
 }
 
 fn get_tag_list() -> Result<Vec<(String, usize)>, String> {
-    use narou_rs::platform::NovelFilter;
     use narou_rs::native::novel_repository::NativeNovelRepository;
+    use narou_rs::platform::NovelFilter;
 
     let novels = NativeNovelRepository::new();
     let ids = novels
@@ -816,10 +809,10 @@ fn get_tag_list() -> Result<Vec<(String, usize)>, String> {
 
 fn render_tag_count(tag: &str, count: usize, tag_colors: &TagColors) -> String {
     let text = format!("{}({})", tag, count);
-    if std::io::stdout().is_terminal() {
-        if let Some(color) = tag_colors.color_for(tag) {
-            return paint(&text, color, true);
-        }
+    if std::io::stdout().is_terminal()
+        && let Some(color) = tag_colors.color_for(tag)
+    {
+        return paint(&text, color, true);
     }
     text
 }
@@ -827,10 +820,11 @@ fn render_tag_count(tag: &str, count: usize, tag_colors: &TagColors) -> String {
 fn render_tags(tags: &[String], tag_colors: &TagColors, separator: &str, colored: bool) -> String {
     tags.iter()
         .map(|tag| {
-            if colored && std::io::stdout().is_terminal() {
-                if let Some(color) = tag_colors.color_for(tag) {
-                    return paint(tag, color, true);
-                }
+            if colored
+                && std::io::stdout().is_terminal()
+                && let Some(color) = tag_colors.color_for(tag)
+            {
+                return paint(tag, color, true);
             }
             tag.clone()
         })
@@ -866,56 +860,39 @@ pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
         };
         let id = data.id;
 
-        let result = db::with_database_mut(|db| {
-            let record = db
-                .get(id)
-                .cloned()
-                .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
-            let title = record.title.clone();
-            let mut updated = record;
-            let mut frozen_state = false;
-
+        // narou.rb の Command::Freeze は .narou/freeze.yaml だけを更新し、
+        // レコードのタグには触れない (凍結状態の判定は Narou.novel_frozen? =
+        // freeze.yaml で行う)。frozen/404 タグの付け替えはしない。
+        let result = db::with_database(|db| {
             let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-            let _ = narou_rs::db::inventory::update_locked_yaml_file::<
-                (),
+            let (_, should_freeze) = narou_rs::db::inventory::update_locked_yaml_file::<
+                bool,
                 std::collections::HashMap<i64, serde_yaml::Value>,
                 _,
             >(&freeze_path, |mut frozen_list| {
-                    let is_frozen = frozen_list.contains_key(&id);
-                    let should_freeze = if on {
-                        true
-                    } else if off {
-                        false
-                    } else {
-                        !is_frozen
-                    };
+                let is_frozen = frozen_list.contains_key(&id);
+                let should_freeze = if on {
+                    true
+                } else if off {
+                    false
+                } else {
+                    !is_frozen
+                };
 
-                    if should_freeze {
-                        if !is_frozen {
-                            updated.tags.push("frozen".to_string());
-                        }
-                        frozen_list.insert(id, serde_yaml::Value::Bool(true));
-                    } else {
-                        if is_frozen {
-                            updated.tags.retain(|t| t != "frozen");
-                        }
-                        if updated.tags.contains(&"404".to_string()) {
-                            updated.tags.retain(|t| t != "404");
-                        }
-                        frozen_list.remove(&id);
-                    }
+                if should_freeze {
+                    frozen_list.insert(id, serde_yaml::Value::Bool(true));
+                } else {
+                    frozen_list.remove(&id);
+                }
 
-                    frozen_state = should_freeze;
-                    db.insert(updated.clone());
-                    Ok((frozen_list, ()))
+                Ok((frozen_list, should_freeze))
             })?;
-            db.save()?;
-            Ok::<(String, bool), narou_rs::error::NarouError>((title, frozen_state))
+            Ok::<bool, narou_rs::error::NarouError>(should_freeze)
         });
 
         match result {
-            Ok((title, true)) => println!("{} を凍結しました", title),
-            Ok((title, false)) => println!("{} の凍結を解除しました", title),
+            Ok(true) => println!("{} を凍結しました", data.title),
+            Ok(false) => println!("{} の凍結を解除しました", data.title),
             Err(e) => eprintln!("  Error: {}", e),
         }
     }
@@ -1001,26 +978,19 @@ pub fn freeze_by_target(target: &str) {
     };
     let id = data.id;
 
-    let result = db::with_database_mut(|db| {
-        let record = db
-            .get(id)
-            .cloned()
-            .ok_or_else(|| narou_rs::error::NarouError::NotFound(format!("ID: {}", id)))?;
-        let mut updated = record;
+    // `narou download --freeze` は upstream では `Command::Freeze.execute!`
+    // を呼ぶだけなので、cmd_freeze と同様に freeze.yaml だけを更新する。
+    let result = db::with_database(|db| {
         let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-        let _ = narou_rs::db::inventory::update_locked_yaml_file::<
+        narou_rs::db::inventory::update_locked_yaml_file::<
             (),
             std::collections::HashMap<i64, serde_yaml::Value>,
             _,
         >(&freeze_path, |mut frozen_list| {
-                if !updated.tags.contains(&"frozen".to_string()) {
-                    updated.tags.push("frozen".to_string());
-                }
-                frozen_list.insert(id, serde_yaml::Value::Bool(true));
-                db.insert(updated.clone());
-                Ok((frozen_list, ()))
+            frozen_list.insert(id, serde_yaml::Value::Bool(true));
+            Ok((frozen_list, ()))
         })?;
-        db.save()
+        Ok::<(), narou_rs::error::NarouError>(())
     });
 
     match result {
@@ -1068,8 +1038,8 @@ fn remove_novel_by_id(id: i64, with_file: bool) -> Result<RemoveOutcome, String>
 }
 
 fn collect_all_short_story_ids() -> Vec<String> {
-    use narou_rs::platform::{NovelFilter, NovelSort, NovelSortKey, NovelQuery};
     use narou_rs::native::novel_repository::NativeNovelRepository;
+    use narou_rs::platform::{NovelFilter, NovelQuery, NovelSort, NovelSortKey};
 
     let novels = NativeNovelRepository::new();
     let query = NovelQuery::page(
@@ -1341,26 +1311,48 @@ mod tests {
             let sort = resolve_list_sort(&opts, None);
             assert_eq!(
                 sort.key,
-                if gl { NovelSortKey::GeneralLastup } else { NovelSortKey::LastUpdate }
+                if gl {
+                    NovelSortKey::GeneralLastup
+                } else {
+                    NovelSortKey::LastUpdate
+                }
             );
             assert!(sort.reverse, "--latest must be newest first");
 
             let reversed = resolve_list_sort(
-                &ListOptions { reverse: true, ..opts.clone() },
+                &ListOptions {
+                    reverse: true,
+                    ..opts.clone()
+                },
                 None,
             );
             assert!(!reversed.reverse, "--latest --reverse must be oldest first");
         }
 
         assert!(!resolve_list_sort(&ListOptions::default(), None).reverse);
-        assert!(resolve_list_sort(&ListOptions { reverse: true, ..Default::default() }, None).reverse);
+        assert!(
+            resolve_list_sort(
+                &ListOptions {
+                    reverse: true,
+                    ..Default::default()
+                },
+                None
+            )
+            .reverse
+        );
     }
 
     #[test]
     fn list_explicit_sort_by_does_not_inherit_latest_direction() {
-        let opts = ListOptions { latest: true, ..Default::default() };
+        let opts = ListOptions {
+            latest: true,
+            ..Default::default()
+        };
         assert!(!resolve_list_sort(&opts, Some("title")).reverse);
-        let reversed = ListOptions { reverse: true, ..opts };
+        let reversed = ListOptions {
+            reverse: true,
+            ..opts
+        };
         assert!(resolve_list_sort(&reversed, Some("title")).reverse);
     }
 
@@ -1386,9 +1378,12 @@ mod tests {
         .unwrap();
 
         let store = narou_rs::native::object_store::NativeStore::for_current_root().unwrap();
-        let keys =
-            NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory)
-                .unwrap();
+        let keys = NovelObjectKeys::new(
+            &record.sitename,
+            &record.file_title,
+            record.use_subdirectory,
+        )
+        .unwrap();
         futures::executor::block_on(async {
             store
                 .write_small(&keys.toc(), b"toc".to_vec())
@@ -1414,14 +1409,16 @@ mod tests {
                 .is_none(),
             "section object must not survive remove --with-file"
         );
-        assert!(!temp
-            .path()
-            .join("小説データ")
-            .join("site")
-            .join("file_title")
-            .join("本文")
-            .join("1 第一話.yaml")
-            .exists());
+        assert!(
+            !temp
+                .path()
+                .join("小説データ")
+                .join("site")
+                .join("file_title")
+                .join("本文")
+                .join("1 第一話.yaml")
+                .exists()
+        );
 
         *narou_rs::db::DATABASE.lock() = None;
     }

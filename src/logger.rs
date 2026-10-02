@@ -50,8 +50,8 @@ impl LoggerState {
             return Self::disabled();
         };
 
-        let settings =
-            narou_rs::db::settings::load_for_root(&root_dir, SettingScope::Local).unwrap_or_default();
+        let settings = narou_rs::db::settings::load_for_root(&root_dir, SettingScope::Local)
+            .unwrap_or_default();
         let logging_enabled = yaml_bool(settings.get("logging"));
         let logging_enabled =
             logging_enabled && std::env::var("NAROU_ENV").ok().as_deref() != Some("test");
@@ -357,21 +357,17 @@ fn yaml_string(value: Option<&serde_yaml::Value>) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("narou_rs_{}_{}", prefix, nanos));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Temporary directory that cleans itself up, so a failing test does not
+    /// leave `narou_rs_*` directories behind in the system temp directory.
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
     }
 
     #[test]
     fn latest_log_path_filters_convert_logs() {
-        let dir = temp_dir("logger_latest");
+        let dir = temp_dir();
+        let dir = dir.path();
         let log_dir = dir.join("log");
         fs::create_dir_all(&log_dir).unwrap();
 
@@ -401,7 +397,8 @@ mod tests {
 
     #[test]
     fn convert_commands_use_convert_log_postfix_when_concurrency_is_enabled() {
-        let dir = temp_dir("logger_convert_postfix");
+        let dir = temp_dir();
+        let dir = dir.path();
         let narou_dir = dir.join(".narou");
         fs::create_dir_all(&narou_dir).unwrap();
         fs::write(
@@ -411,13 +408,11 @@ mod tests {
         .unwrap();
 
         let path = {
-            let _guard = crate::test_support::set_current_dir_for_test(&dir);
+            let _guard = crate::test_support::set_current_dir_for_test(dir);
             init();
             use_convert_log_postfix(true);
             state().lock().unwrap().current_log_path().unwrap()
         };
-
-        let _ = fs::remove_dir_all(dir);
 
         assert!(path.file_name().unwrap().to_string_lossy().contains("_convert"));
     }

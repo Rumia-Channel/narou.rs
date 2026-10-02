@@ -6,6 +6,7 @@ pub mod index_store;
 pub mod inventory;
 #[cfg(feature = "native-runtime")]
 pub mod settings;
+pub mod novel_codec;
 pub mod novel_record;
 pub mod paths;
 pub mod sort;
@@ -15,6 +16,8 @@ pub mod ruby_time;
 pub use database::{compare_records_by_key, sort_key_valid, sort_keys, Database, SORT_KEYS};
 #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
 pub use sort::{compare_records_by_key, sort_key_valid, sort_keys, SORT_KEYS};
+#[cfg(feature = "native-runtime")]
+pub use inventory::narou_root_exists;
 pub use novel_record::NovelRecord;
 #[cfg(feature = "native-runtime")]
 pub use paths::{

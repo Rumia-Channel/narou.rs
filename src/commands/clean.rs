@@ -41,6 +41,9 @@ fn cmd_clean_inner(
         };
         if let Some(dir) = resolve_novel_dir(&target) {
             clean_novel_dir(&dir, remove)?;
+        } else {
+            // Ruby は直前に変換した小説が解決できない場合も error を出す。
+            log::report_error(&format!("{} は存在しません", target));
         }
         return Ok(());
     }
@@ -107,7 +110,7 @@ fn clean_novel_dir(novel_dir: &Path, remove: bool) -> Result<(), String> {
 }
 
 fn find_orphan_files(novel_dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let Some(toc) = load_toc_file(&novel_dir.to_path_buf()) else {
+    let Some(toc) = load_toc_file(novel_dir) else {
         return Ok(Vec::new());
     };
 

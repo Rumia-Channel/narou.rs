@@ -196,6 +196,35 @@ impl NovelSort {
             key,
             reverse: false,
         }
+}
+}
+
+
+/// `update.sort-by` の設定値をスキャン順へ解決する。
+///
+/// native `commands::update` (`sort_update_ids_by_key`) と同じ規則: 日付系
+/// キー (`last_update` / `general_lastup` / `last_check_date` /
+/// `new_arrivals_date`) は新しい順 (降順)、それ以外は昇順。空・未知キー・
+/// `id` は `None` を返す — `id` 昇順は既定のキーセットスキャンと同じ順序
+/// なので、呼び出し側は従来どおり `scan_ids` を使えばよい。キーの大小文字は
+/// 吸収する (native `resolve_sort_key` が `to_lowercase` するのと同じ)。
+pub fn resolve_update_scan_sort(configured: &str) -> Option<NovelSort> {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return None;
+    }
+    match NovelSortKey::from_db_key(&configured.to_lowercase())? {
+        NovelSortKey::Id => None,
+        key => Some(NovelSort {
+            key,
+            reverse: matches!(
+                key,
+                NovelSortKey::LastUpdate
+                    | NovelSortKey::GeneralLastup
+                    | NovelSortKey::LastCheckDate
+                    | NovelSortKey::NewArrivalsDate
+            ),
+        }),
     }
 }
 
@@ -476,6 +505,24 @@ mod tests {
             assert_eq!(NovelSortKey::from_db_key(db_key), Some(*key));
         }
         assert_eq!(NovelSortKey::from_db_key("nonsense"), None);
+    }
+
+    #[test]
+    fn update_scan_sort_mirrors_native_update_order() {
+        // 未設定・id・未知キーは既定の id スキャン。
+        assert!(resolve_update_scan_sort("").is_none());
+        assert!(resolve_update_scan_sort("  ").is_none());
+        assert!(resolve_update_scan_sort("id").is_none());
+        assert!(resolve_update_scan_sort("no_such_key").is_none());
+        // 日付系は native `sort_update_ids_by_key` と同じく新しい順。
+        for key in ["last_update", "general_lastup", "last_check_date", "new_arrivals_date"] {
+            let sort = resolve_update_scan_sort(key).unwrap();
+            assert!(sort.reverse, "{key} should sort descending");
+        }
+        // それ以外は昇順、大小文字は吸収。
+        let sort = resolve_update_scan_sort("Title").unwrap();
+        assert_eq!(sort.key, NovelSortKey::Title);
+        assert!(!sort.reverse);
     }
 
     fn sample_record(id: i64) -> NovelRecord {

@@ -33,11 +33,11 @@ fn cmd_folder_inner(targets: &[String], no_open: bool) -> Result<(), String> {
             continue;
         };
 
-        if no_open {
-            println!("{}", dir.display());
-        } else {
+        // Ruby は open の有無に関わらずパスを表示する (folder.rb: `puts dir`)。
+        if !no_open {
             open_directory(&dir, None);
         }
+        println!("{}", dir.display());
     }
 
     Ok(())

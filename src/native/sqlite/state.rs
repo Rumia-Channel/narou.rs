@@ -34,6 +34,7 @@ const MANAGED_LOCAL: &[(&str, &str)] = &[
     ("tag_colors", "tag_colors.yaml"),
     ("login_cookie", "login_cookie.yaml"),
     ("latest_convert", "latest_convert.yaml"),
+    ("author", "author.yaml"),
     ("local_setting", "local_setting.yaml"),
     ("queue", "queue.yaml"),
     ("notepad", "notepad.txt"),
@@ -248,6 +249,21 @@ pub enum StorageMode {
     Sqlite,
 }
 
+/// 実ファイルのミラーを書くか (`sqlite.mirror-files`、既定 true)。
+///
+/// false のときは `objects`/`object_chunks` だけが保存先になり、`小説データ/`
+/// へは書かない (SORAHOST のような容量の厳しい環境向け)。読み出しは
+/// SQLite だけで完結する。環境変数 `NAROU_RS_MIRROR_FILES=0` でも切れる。
+pub fn mirror_files_enabled() -> bool {
+    match std::env::var("NAROU_RS_MIRROR_FILES") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => crate::compat::load_local_setting_bool_or("sqlite.mirror-files", true),
+    }
+}
+
 pub const MARKER_FILE: &str = "storage-backend";
 
 pub fn read_mode(narou_dir: &Path) -> StorageMode {
@@ -283,7 +299,16 @@ pub fn active_for(narou_dir: &Path) -> Option<StateDb> {
             cache.insert(dir, handle.clone());
             Some(handle)
         }
-        Err(_) => None,
+        // SQLite was opted into (storage-backend marker) but the database
+        // could not be opened — keep the legacy-YAML fallback, but surface
+        // the cause instead of silently degrading.
+        Err(error) => {
+            eprintln!(
+                "warning: sqlite storage unavailable for {}: {error}; falling back to YAML file storage",
+                dir.display()
+            );
+            None
+        }
     }
 }
 
@@ -295,6 +320,24 @@ fn legacy_yaml_disabled() -> bool {
     std::env::var("NAROU_RS_LEGACY_YAML")
         .map(|value| !value.is_empty() && value != "0" && value != "false")
         .unwrap_or(false)
+}
+
+/// 挿絵の重複除去プール (`illustrations/<sha256>`) を使うか。
+///
+/// SQLite モード (`storage-backend` マーカーが `sqlite` で、`NAROU_RS_LEGACY_YAML`
+/// が無効) かつ挿絵の保存先が S3 (`s3.asset-backend=s3`) のときだけ真。
+/// `dedup_active()` も同じ関数を見るため、S3 を使わない環境で新規挿絵名が
+/// pool 向けの hex 名へ変わらないよう、S3 側の条件もここで必須にする。
+/// DB が未初期化でもマーカーと設定値だけで判断する。
+pub fn illustration_dedup_enabled() -> bool {
+    if legacy_yaml_active() || !crate::native::s3::illustrations_in_s3() {
+        return false;
+    }
+    let Ok(inventory) = crate::db::inventory::Inventory::with_default_root() else {
+        return false;
+    };
+    let narou_dir = inventory.root_dir().join(".narou");
+    read_mode(&narou_dir) == StorageMode::Sqlite
 }
 
 /// Process-wide shared handle. Configured on first use from the narou root;
@@ -391,7 +434,7 @@ fn rename_imported(paths: Vec<PathBuf>) {
         .unwrap_or(0);
     for path in paths {
         let mut target = path.clone().into_os_string();
-        target.push(&format!(".imported-{stamp}"));
+        target.push(format!(".imported-{stamp}"));
         let _ = std::fs::rename(&path, PathBuf::from(target));
     }
 }

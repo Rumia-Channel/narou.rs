@@ -1,0 +1,10 @@
+{
+  "mode": "node",
+  "start": "sh start.sh",
+  "include": [
+    "app",
+    "bin",
+    "start.sh",
+    "sorahost.json"
+  ]
+}

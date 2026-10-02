@@ -347,10 +347,13 @@ are loaded from the Worker bundle rather than a second HTTP stack.
 Animated illustrations (Pixiv うごイラ) are assembled by
 `src/illustration_animation.rs`, which decodes JPEG/PNG frames and reads the
 frame archive. Both the `image` codecs and the ZIP reader sit behind the
-`illustration-animation` feature, which `native-runtime` enables. The Worker
-build leaves them out — the ZIP reader narou uses (default features: bzip2,
-zstd, lzma) does not build for wasm — so `assemble_animation` reports the
-archive as unsupported there and the callers keep the bytes they downloaded.
+`illustration-animation` feature, which `native-runtime` and `worker-runtime`
+both enable. `zip` is pinned to `default-features = false` with the pure-Rust
+`deflate-flate2-zlib-rs` backend, because its default features pull in
+C-backed compressors (bzip2/zstd/lzma) that do not build for
+wasm32-unknown-unknown; with that pinning the assembly runs on the Worker too.
+A build without the feature keeps the downloaded archive and reports the
+archive as unsupported.
 
 Local D1 verification (`wrangler d1 migrations apply narou-rs --local`) applies
 all six migrations. Local smoke checks cover atomic job claiming, retryable
@@ -454,10 +457,20 @@ Worker (worker_entry)
 - Queue consumer は `succeeded`、`blocked`、`permanent`、retry 上限到達後の
   `permanent` を記録してから ack する。`running` の lease が有効な再配信は
   `Busy` として ack せず、Queue の再配信/DLQ経路へ返す。
-- 一時エラーは ledger の `attempts` を増やし、最大 3 回まで 5/10/20 秒の
-  bounded retry を行う。上限後は `permanent` として ack するため、無限 retry
-  ループや暗黙の DLQ 再投入は行わない。DLQ は Queue binding の運用設定で保持し、
+- 一時エラーは ledger の `attempts` を増やし、`queue.max-retries` (既定 3) 回
+  まで `queue.retry-backoff` (既定 `1m,5m,15m`) の bounded retry を行う。
+  上限後は `permanent` として ack するため、無限 retry ループや暗黙の DLQ
+  再投入は行わない。DLQ は Queue binding の運用設定で保持し、
   `worker_jobs` の `last_error` と attempt 数を調査の source of truth とする。
+- Cloudflare の consumer `max_retries` (既定 3) は ledger の retry 予定とは
+  独立に消費される (`Busy` の遅延再配信や consumer 内部エラーも消費する)
+  ため、台帳が retryable のまま配信だけが DLQ に落ちることがある。毎分の
+  cron が `scheduler::reap_stuck_jobs` を走らせ、バックオフ予定時刻
+  (`lease_until`) または更新時刻から猶予 (2 分) を過ぎても進まない
+  active 行を拾う: リトライ枠が残る行は新しい envelope を再送し (新しい
+  配信予算で通常経路へ復帰)、枠を使い切った retryable 行は `permanent`
+  に確定する。これにより UI の「待機中」は常に「再試行または終端確定が
+  予定されている」状態と一致する。
 - Worker のサイト単位 rate limiter は Durable Object 1 instance をサイトごとに
   使用する。DO内でpermit timestampを予約し、callerが`worker::Delay`で待機する。
   `SiteRateLimiter`はalarmを使わない。設定の `download.interval` /
@@ -499,3 +512,101 @@ Worker (worker_entry)
 9. **logger**: tracing subscriber は native / worker で切り替える。`logger.rs` のファイル出力は native 専用にできる。Phase 1 では触らない。
 10. **`converter/mod.rs` のcurl直接使用**: 解消済み。挿絵fetchは`ConverterCapabilities`の`HttpClient` / `RateLimiter`経由へ移行し、native wiringは`src/native/converter.rs`に隔離した。
 11. **`web/misc.rs` / `web/update.rs` の async reqwest**: 自己更新・GitHub API は native 専用パスとして残置（Phase 2 の対象外）。
+
+## 共有層（native と Worker で 1 実装）
+
+外部挙動を揃えるため、native 専用層にあったロジックを可搬層 (`src/application/`, `src/login/`, `src/downloader/`) へ
+移し、両ビルドから同じコードを呼ぶ。2026-09-26 時点:
+
+| 共有モジュール | 共有しているもの |
+|---|---|
+| `application::settings_view` | 設定ページの JSON（タブ・項目メタデータ・置換設定・`object_id` ではなく表示用の値） |
+| `application::web_payloads` | 一覧 API の入出力型（`ListParams` / `NovelListResponse` / `NovelListItem` / `ApiResponse`） |
+| `application::version_compare` | バージョン比較（自己更新と `/api/version/*`） |
+| `login::transfer` / `login::crypto` | ログイン書き出しの解析・グループ化・Argon2id 復号・鍵解釈（`parse_key_base64` は 32 バイトそのまま／16 バイト以上は SHA-256 展開） |
+| `downloader::resolve_user_agent` | UA 解決（native はランダム、Worker は既定ブラウザ UA） |
+| `application::messages` + `MessageSink` | ジョブ実行系コマンドの文言。native は stdout/stderr、Worker は PushHub への `echo` に流す（失敗行は両方 `  Error: …`） |
+| `application::aliases` | エイリアス解決（表の読み込みだけが native=Inventory / Worker=app_state と異なる） |
+| `platform::*` + `downloader::http_policy` | HTTP の decode/status/redirect ポリシー（アダプタは transport だけを持つ） |
+| `platform::http1` | HTTP/1.1 のリクエスト生成と応答解析（Byte 指向・依存なし）。wasm 専用クレート内のテストは実行されないため可搬層に置き、Worker のソケット transport が使う。native は curl/reqwest があるため未使用 |
+
+### Worker の取得段（2026-09-27）
+
+`worker_entry/src/http.rs` は `fetch` を第一段とし、**403 を返した GET に限り** `connect()`
+（`cloudflare:sockets`）で取り直す。理由は実測で、`fetch` は Cloudflare の公開 IP レンジから、
+`connect()` は公開レンジ外のプレフィックス（実測 `104.28.157.13`）から出るため、Cloudflare の
+レンジを弾くサイト（例: CloudFront 配信のカクヨム）でも後者なら 200 が返る。ソケット側で
+2xx/3xx が得られたときだけ採用し、接続拒否・タイムアウト・解析失敗は元の 403 を保つ。
+**全アドレスが Cloudflare の公開レンジ内にあるサイト（例: ハーメルン）は `connect()` 自体が
+ランタイムに拒否される**ため、外部の踏み台（SORAHOST の `scripts/sorahost-proxy/` など）が別途必要。
+
+#### 3 段目: 外部リレー（SORAHOST）
+
+Cloudflare の `fetch` / `connect()` のどちらでも取れないサイト（全アドレスが Cloudflare の
+公開レンジ内にあり、`connect()` 自体が拒否されるもの）のために、外部の取得リレーを 3 段目に持つ。
+
+- プロトコル: `src/platform/relay.rs`（`GET /proxy?url=..&headers=<base64 JSON>` と
+  `X-Proxy-Token`、応答は `{status, contentType, location, body(base64)}`）。純粋な
+  エンコード/デコードのみで、トランスポートは呼び出し側が持つ。
+- 送信は `worker_entry/src/http.rs` の `send_via_relay`。リレーは平文 http なので
+  `platform::http1` の `SocketTarget` + `connect()` で GET する（Worker の `fetch` は
+  `http://` を拒否するため）。サイト定義のヘッダはそのまま転送する。
+- 設定は Worker secret `SORAHOST_PROXY_ENDPOINT` / `SORAHOST_PROXY_KEY`。接続先は
+  パス込みで渡してよく、`RelayRequest` がオリジンに正規化する (`http` / `https` の
+  どちらも可)。未設定ならこの段は無効。
+- リレー本体は `scripts/sorahost-proxy/`（PteWorker のコンテナに curl が無いため、
+  CI が静的 curl と CA バンドルを同梱して配布する）。配布は `platform.yml` の
+  `relay-deploy` ジョブが行い、develop / production のデプロイはその後に直列で走る。
+
+#### リレーの認証（2026-09-29 確認）
+
+合言葉は **HTTP ヘッダ 1 本**で、Worker とリレーが同じ値を突き合わせるだけの方式。
+
+| 向き | 実装 | 内容 |
+| --- | --- | --- |
+| Worker → リレー | `src/platform/relay.rs` (`TOKEN_HEADER = "x-proxy-token"`) | `GET|POST /proxy` に `X-Proxy-Token: <SORAHOST_PROXY_KEY>` を付ける |
+| リレー (node) | `scripts/sorahost-proxy/server.mjs` | `req.headers["x-proxy-token"] !== process.env.SORAHOST_PROXY_KEY` なら 403。未設定なら起動しない |
+| リレー (worker) | `scripts/sorahost-proxy/worker/worker.mjs` | 同じ比較。未設定なら 500 (`SORAHOST_PROXY_KEY is not set`) |
+| 死活確認 | 両方 | `GET /health` だけは認証なしで 200 `{ok:true}` |
+
+- **資格情報は 3 つあり、用途が違う**: `SORAHOST_PROXY_ENDPOINT`（リレーの公開先 =
+  Worker の接続先 = `sorahost-cli` のエンドポイント）、`SORAHOST_PROXY_TOKEN`
+  （`sorahost-cli` のデプロイトークン。`Authorization: Bearer` で `POST <endpoint>/deploy`
+  に送る）、`SORAHOST_PROXY_KEY`（リレーの合言葉 = `X-Proxy-Token`）。前 2 つは
+  Cloudflare environment の secret で、`SORAHOST_PROXY_KEY` は **コンテナの `.env`**
+  （PteWorker の画面）にも同じ値を置く。CLI は環境変数を注入できないため、
+  この二重管理は自動化できない。
+- **合言葉がずれると静かに壊れる**: 403 は `RelayError::Rejected` になり、Worker は
+  元の `fetch` の結果（多くは 403）へ戻る。つまり「一部のサイトだけ取得できない」という
+  形で現れる。そのため `relay-deploy` は配備直後に `scripts/sorahost-proxy/verify_auth.py`
+  を走らせ、①`/health` の到達性 ②**わざと違うトークンで 403**（認証が効いている）
+  ③**正しいトークンで 403/500 にならない**（`.env` と secret が一致）を確かめる。
+  不一致ならこのジョブが落ち、`needs` で Worker のデプロイも止まる。
+- 経路は平文 http でもよいが、その場合 `X-Proxy-Token` は平文で流れる。エンドポイントに
+  `https://` を置けるならそちらを使う（生ソケット経路も TLS を張れる）。
+
+### 操作ごとのメッセージ（native CLI / Worker Web コンソール）
+
+文言は `src/application/messages.rs`（および `messages::jobs`）が唯一の出所。native は端末へ、
+Worker は `PushHubSink` 経由で Web コンソールの `#console` へ流す。**通常のメッセージもエラー行も
+`Stream::Stdout`**（native がエラーを stdout に出しているのに合わせる。Web UI は `target_console`
+が `stdout` 以外だと 2 番目のコンソールへ回すため）。
+
+| 操作 | メッセージ（例） | native | Worker | タイミング |
+|---|---|---|---|---|
+| download | `ID:n <title> のDL開始` / `第N部分 <subtitle> (n/m)` / `… のDL完了` | ✅ | ✅ `emit_download_result_lines` | DL開始・各話・完了 |
+| update | `更新を開始します（N件を…で処理）` / `… を更新しました` / `更新はありません` / 中断・失敗行 | ✅ | ✅（開始は API の enqueue 時、結果はジョブ実行時） | 開始・結果 |
+| convert | `変換処理開始: …` / `[1/1] 処理中: …` / `novel.txt を出力しました` / `変換処理完了: …` | ✅ | ✅ `emit_convert_item_lines` | 開始・進捗・完了 |
+| ダウンロード後の自動変換 | 再変換の通知（`前回変換失敗した小説の再変換…` 等）／enqueue 失敗行 | ✅ | ✅ | 変換ジョブ投入時 |
+| 予算切れ・チェックポイント無効 | `budget_expired_partial` / `resume_checkpoint_invalid` | ✅ | ✅ | ジョブ中断時 |
+| auto-update（スケジューラ） | `自動アップデートが予定されています` / catch-up 実行 | ✅ | ❌ 文言は `messages::jobs::*` に用意済みだが、Worker の planner には投稿点が無い（既知の差分） | 予約・実行 |
+| send / mail / backup | 各種 | ✅ | ❌ Worker では実行不可（サブプロセス・シリアルメール前提） | — |
+
+### 残っている重複（次の候補）
+
+| 対象 | 現状 | 方針 |
+|---|---|---|
+| ~~**Worker の convert ジョブの出力**~~ | 解消済み。`worker_entry/src/convert.rs` が `PushHubSink::install` で既定 sink を入れ、`application::convert::emit_convert_item_lines` が `Stream::Stdout` で送る（native と同じ経路・同じストリーム） | — |
+| **リトライ方針** | `src/queue.rs`（native）が `queue.max-retries` / `queue.retry-backoff` を解釈し、Worker は `consumer.rs`/`ledger.rs` に独自実装 | 設定の解釈と backoff スケジュールを可搬層へ（未着手） |
+| **push イベントの組み立て** | native `web/push.rs` と Worker `push_hub.rs` が同じ JSON 形をそれぞれ構築 | イベント生成を可搬層へ（未着手） |
+| **引数の袋** | `too_many_arguments` 14 件・`type_complexity` 5 件 | request struct / 型エイリアスへ畳む（未着手） |

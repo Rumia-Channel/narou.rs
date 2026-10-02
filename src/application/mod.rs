@@ -7,14 +7,21 @@
 //! on `serde`/`chrono`, the domain [`NovelRecord`], and the platform traits.
 //!
 //! Modules:
+//! - [`aliases`]: novel-target alias resolution shared by the CLI and Worker.
 //! - [`error`]: the application-layer error type (no HTTP status).
 //! - [`events`]: application-owned platform ports (`FreezeStore`,
 //!   `SiteTimezoneProvider`) plus their no-op defaults.
 //! - [`library`]: the novel library list service (search / filter /
 //!   pagination / frozen status / new-arrival marker).
+//! - [`webui`]: native の `src/web` と Worker の `webui` が共有する Web UI
+//!   ヘルパ（入力バリデーション、ソート状態、エラー応答ボディ、表示用小道具）。
 
 pub mod error;
+pub mod aliases;
 pub mod events;
+pub mod convert;
+pub mod messages;
+pub mod site_definitions;
 pub mod jobs;
 pub mod novel_actions;
 pub mod novel_settings;
@@ -22,14 +29,21 @@ pub mod novel_content;
 pub mod scheduler;
 pub mod self_update;
 pub mod settings;
+pub mod settings_view;
+pub mod retry_policy;
+pub mod version_compare;
+pub mod push_events;
+pub mod web_payloads;
 pub mod tag_colors;
 pub mod web_actions;
+pub mod webui;
 pub use jobs::{
     CheckpointClaim, CheckpointState, ExecutionPhase, JobClaim, JobFailureClass, JobId, JobKind,
     JobLedgerStatus, JobPlan, JobPlanResult, JobQueue, JobRequest, JobService, JobTarget,
     LegacyEnvelopeOutcome, QueuedJob, QueuedJobView, SchedulerCheckpoint, UpdateScanPage,
     WorkerExecutionCheckpoint, WorkerJobEnvelope, WORKER_JOB_ENVELOPE_VERSION, classify_failure,
-    decode_legacy_envelope, envelope_bytes, job_limits, validate_request_limits,
+    decode_legacy_envelope, emit_download_result_lines, envelope_bytes, extract_novel_ids,
+    job_limits, validate_request_limits, worker_ledger,
 };
 pub use novel_actions::{
     FileDeletionStatus, FreezeMutationStore, FreezeRequest, FreezeResult,
@@ -45,7 +59,8 @@ pub use scheduler::{
     ScheduleDecision, SchedulerService,
 };
 pub use settings::{
-    MemorySettingsStore, SettingEntry, SettingsEffect, SettingsService, SettingsStore,
+    LIVE_WEBUI_CONFIG_NAMES, MemorySettingsStore, SettingEntry, SettingsEffect, SettingsService,
+    SettingsStore,
 };
 pub use web_actions::{
     EmptyWebActionService, WebActionOutput, WebActionService,

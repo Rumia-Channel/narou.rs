@@ -18,6 +18,7 @@ use super::sort_state::{
     current_sort_from_server_setting, default_current_sort_state, normalize_current_sort_request,
 };
 use super::state::{ApiResponse, LogsParams};
+use super::{html_escape, tag_color_class};
 
 #[derive(Debug, Deserialize)]
 pub struct TagListParams {
@@ -28,27 +29,6 @@ pub struct TagListParams {
 pub struct HistoryParams {
     stream: Option<String>,
     format: Option<String>,
-}
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-fn tag_color_class(color: &str) -> &'static str {
-    match color {
-        "green" => "tag-green",
-        "yellow" => "tag-yellow",
-        "blue" => "tag-blue",
-        "magenta" => "tag-magenta",
-        "cyan" => "tag-cyan",
-        "red" => "tag-red",
-        "white" => "tag-white",
-        _ => "tag-default",
-    }
 }
 
 pub async fn version_current(State(_state): State<AppState>) -> Json<serde_json::Value> {
@@ -221,10 +201,7 @@ pub async fn tag_list(
     Query(params): Query<TagListParams>,
 ) -> Response {
     let new_tag_color = super::configured_tag_color(&state).await;
-    let records = match state.services.library.records().await {
-        Ok(records) => records,
-        Err(_) => Vec::new(),
-    };
+    let records = state.services.library.records().await.unwrap_or_default();
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for record in &records {
         for tag in &record.tags {
@@ -232,7 +209,7 @@ pub async fn tag_list(
         }
     }
     let mut list: Vec<(String, usize)> = counts.into_iter().collect();
-    list.sort_by(|a, b| b.1.cmp(&a.1));
+    list.sort_by_key(|item| std::cmp::Reverse(item.1));
     let tags = list.into_iter().map(|(tag, _)| tag).collect::<Vec<_>>();
     let tag_colors = state
         .services

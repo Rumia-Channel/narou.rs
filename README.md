@@ -5,6 +5,16 @@ narou_rs は、日本の Web 小説を取得・管理・変換する CLI / Web U
 
 README では、導入方法、基本操作、主な注意点をまとめます。詳細なコマンド互換性や未完了項目は `COMMANDS.md` を参照してください。
 
+## v0.4.5 の主な変更
+
+- 半角カナを含むルビが別の文字に化ける不具合を修正しました（[#31](https://github.com/Rumia-Channel/narou.rs/issues/31)）。既に変換済みの作品は、更新後に再変換してください。
+- 話タイトル・章タイトルの変更後に更新が失敗する不具合を修正しました（[#32](https://github.com/Rumia-Channel/narou.rs/issues/32)）。旧タイトルで保存した本文を履歴へ退避してから新しい本文を保存し、その後の更新も継続できます。
+- 作者ページの追跡、複数ログインのサイト単位管理、EPUB エンジンの選択を追加しました。詳しい操作は `COMMANDS.md` を参照してください。
+- native の S3 互換挿絵ストレージ、SQLite + S3 構成での挿絵重複排除、省容量設定を追加しました。
+- Cloudflare Workers 向けの取得・変換・Web UI と、SORAHOST 向けの配備経路を追加しました。
+
+変更一覧は [v0.4.4...v0.4.5](https://github.com/Rumia-Channel/narou.rs/compare/v0.4.4...v0.4.5) を参照してください。
+
 ## 謝辞
 このソフトウェアは [whiteleaf氏](https://github.com/whiteleaf7) が作成した [narou.rb](https://github.com/whiteleaf7/narou) 及び [ponpon.USA氏](https://github.com/ponponusa) の [フォーク版](https://github.com/ponponusa/narou-mod) をベースに作成されています。
 
@@ -289,7 +299,8 @@ narou_rs login import login.yaml --passphrase <パスフレーズ>
 | `--export <ファイル>` | 取得した Cookie を書き出しファイル (YAML) に出力 |
 | `--passphrase <パス>` | 書き出しファイルを暗号化 |
 | `--clear-text` | パスフレーズ指定時でも平文で書き出す |
-| `--profile <DIR>` | ブラウザプロファイルの保管先 (既定はサイトごとの固定フォルダ) |
+| `--name <名前>` | 取得したログインに名前を付ける |
+| `--profile <DIR>` | 既存のブラウザプロファイルを使う (未指定時は毎回新しい一時プロファイル) |
 | `--list` | 保存済みの Cookie を表示 (値ではなく名前のみ) |
 | `--clear` | 指定サイトの Cookie を削除 |
 | `--port <ポート>` | ブラウザのリモートデバッグポート (既定 9222) |
@@ -299,15 +310,17 @@ narou_rs login import login.yaml --passphrase <パスフレーズ>
 
 ```powershell
 narou_rs login list                                       # 一覧 (値は伏せて表示)
-narou_rs login set <ホスト> --cookie "..."                 # そのサイトの既存ログインを置き換え
-narou_rs login add <ホスト> --cookie "..." --label R18用   # ログインを末尾に追加
-narou_rs login order <ホスト> 2,1                          # 試行順を入れ替え (現在の位置の新しい並び)
+narou_rs login import login.yaml --name 本垢              # 名前を付けて取り込み
+narou_rs login rename <サイト> 1 本垢                      # 保存済みログインの名前を変更
+narou_rs login order <サイト> 2,1                          # 全件を指定して試行順を入れ替え
 narou_rs login export login.yaml --passphrase P           # 書き出し
 narou_rs login import login.yaml --replace                # 取り込みに無いサイトを削除
-narou_rs login clear <ホスト>                              # 1 サイト分を削除
-narou_rs login clear <ホスト> --index 1                    # そのサイトの 1 件だけ削除
+narou_rs login clear <サイト>                              # 1 サイト分を削除
+narou_rs login clear <サイト> --index 1                    # そのサイトの 1 件だけ削除
 narou_rs login clear                                      # すべて削除
 ```
+
+本体の `login set` / `login add` は廃止しました。登録には `narou_rs_login` または書き出しファイルの取り込みを使ってください。
 
 複数のログイン Cookie は一覧の順に試行され、成功した資格情報は小説レコードに記憶されるため、同じ小説の次回以降は最初のリクエストからその Cookie が使われます。
 
@@ -335,7 +348,7 @@ narou_rs login clear                                      # すべて削除
 - サイトごとの取得・抽出ルールは `webnovel/*.yaml` を使います。ユーザーがこの YAML を編集すると、挙動もそれに追従します。
 - 保存データや設定ファイルは [narou.rb](https://github.com/whiteleaf7/narou) 互換の YAML / ディレクトリ構成を重視しています。
 - Pixiv は本文・目次・作品情報を `/ajax/*` の JSON から取得します (`webnovel/www.pixiv.net.yaml`)。挿絵 (`[pixivimage:]` / `[uploadedimage:]`) は画像 URL を追加 API から解決して `挿絵/` に取り込みます。ログイン限定作品やログインでしか全部見えない作品一覧は、保存したログイン Cookie を順に試して再取得します。
-- Pixiv のイラスト・漫画 (`/artworks/A`) と漫画シリーズ (`/user/U/series/S`) も扱えます。イラストは 1 話・本文がページ画像のみの作品として、漫画シリーズは各作品を 1 話とする連載として登録し、画像は `挿絵/` に取り込みます。うごイラ (フレーム集約 zip) は、ネイティブ版では APNG に組み立てて取り込みます。APNG 化に必要なコーデックは `illustration-animation` feature にあり、`native-runtime` が有効にします。Worker / wasm 版では組み立てず、取得した zip をそのまま保存します。R18 作品はログインしていないと一覧に現れないため、含むシリーズは先に `narou_rs_login` で Cookie を保存してください。
+- Pixiv のイラスト・漫画 (`/artworks/A`) と漫画シリーズ (`/user/U/series/S`) も扱えます。イラストは 1 話・本文がページ画像のみの作品として、漫画シリーズは各作品を 1 話とする連載として登録し、画像は `挿絵/` に取り込みます。うごイラ (フレーム集約 zip) は APNG に組み立てて取り込みます。APNG 化に必要なコーデックは `illustration-animation` feature にあり、native と Worker の両方で有効です（`zip` は wasm でも動くよう純 Rust の deflate バックエンドに絞っています）。R18 作品はログインしていないと一覧に現れないため、含むシリーズは先に `narou_rs_login` で Cookie を保存してください。
 - 変換結果は青空文庫向け整形を基準にし、設定や device 指定に応じて追加出力を行います。
 - `update` は `general_lastup`、差分 cache、strong update、freeze などの挙動を持ちます。
 - `web` は localhost 利用を基本にしています。非 loopback で公開する場合は認証設定を行ってください。

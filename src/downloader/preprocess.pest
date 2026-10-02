@@ -99,6 +99,7 @@ method = {
     | ".gsub" ~ "(" ~ (regex | string) ~ ")" ~ block
     | ".gsub" ~ "(" ~ (regex | string) ~ "," ~ string ~ ")"
     | ".replace" ~ "(" ~ string ~ "," ~ string ~ ")"
+    | ".keys" ~ method_end
     | ".is_array" ~ method_end
     | ".empty" ~ method_end
     | ".size" ~ method_end

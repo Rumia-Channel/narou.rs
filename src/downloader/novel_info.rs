@@ -83,14 +83,16 @@ impl NovelInfo {
         {
             Ok(mut body) => {
                 crate::downloader::util::pretreatment_source_with_jobs(
-                    http,
-                    rate_limiter,
-                    &policy,
-                    &mut body,
-                    setting.encoding(),
-                    Some(setting),
-                    jobs,
-                    &resolved_url,
+                    crate::downloader::util::PretreatmentRequest {
+                        http,
+                        rate_limiter,
+                        policy: &policy,
+                        src: &mut body,
+                        encoding: setting.encoding(),
+                        setting: Some(setting),
+                        jobs,
+                        url: &resolved_url,
+                    },
                 )
                 .await?;
                 Ok(Self::from_novel_info_source(setting, &body))
@@ -135,9 +137,10 @@ impl NovelInfo {
             .raw_captures
             .get("nu")
             .and_then(|s| parse_narou_date_with_timezone(s, timezone));
-        info.length = info.raw_captures.get("l").and_then(|s| {
-            s.replace(',', "").trim().parse().ok()
-        });
+        info.length = info
+            .raw_captures
+            .get("l")
+            .and_then(|s| s.replace(',', "").trim().parse().ok());
 
         info
     }
@@ -159,10 +162,7 @@ fn parse_narou_date(s: &str) -> Option<DateTime<Utc>> {
     parse_narou_date_with_timezone(s, super::site_timezone(None))
 }
 
-fn parse_narou_date_with_timezone(
-    s: &str,
-    timezone: super::SiteTimezone,
-) -> Option<DateTime<Utc>> {
+fn parse_narou_date_with_timezone(s: &str, timezone: super::SiteTimezone) -> Option<DateTime<Utc>> {
     super::parse_loose_datetime_with_timezone(s, timezone)
 }
 

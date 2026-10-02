@@ -1,15 +1,14 @@
 #[cfg(feature = "native-runtime")]
 use chrono::{DateTime, Utc};
 
-use crate::error::{NarouError, Result};
-use crate::platform::{HttpClient, HttpRequest, RateLimitScope, RateLimiter};
+use crate::error::Result;
 #[cfg(feature = "native-runtime")]
 use crate::platform::NovelRepository;
+use crate::platform::{HttpClient, HttpRequest, RateLimitScope, RateLimiter};
 
 use super::http_policy::{ensure_success_response, host_of};
 #[cfg(feature = "native-runtime")]
 use super::rate_limit::RateLimiter as NativeRateLimiter;
-use super::security::validate_public_url;
 
 const NAROU_API_DEFAULT_USER_AGENT: &str = "Narou RS";
 const NAROU_API_DEFAULT_INTERVAL_SECS: f64 = 1.0;
@@ -70,7 +69,7 @@ pub async fn fetch_narou_api_json(
     url: &str,
     user_agent: &str,
 ) -> Result<String> {
-    validate_public_url(url).map_err(|e| NarouError::Http(e.to_string()))?;
+    http.validate_url(url).await?;
     rate_limiter
         .acquire(&RateLimitScope::site(host_of(url)))
         .await?;
@@ -144,7 +143,6 @@ pub async fn narou_api_batch_update(
         .map(|record| (record.id, record.ncode.clone().unwrap()))
         .collect();
 
-
     if narou_ids.is_empty() {
         return Ok((0, 0));
     }
@@ -184,10 +182,7 @@ pub async fn narou_api_batch_update(
         // transaction per 50-novel chunk.
         let mut mutations = Vec::new();
         for entry in &entries {
-            let entry_ncode = entry
-                .get("ncode")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let entry_ncode = entry.get("ncode").and_then(|v| v.as_str()).unwrap_or("");
 
             if let Some(record) = narou_records
                 .iter()

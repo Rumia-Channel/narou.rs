@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod sites;
 pub mod feature_tour;
 pub mod frontend;
 pub mod global_settings;
@@ -10,14 +11,17 @@ pub mod novel_settings;
 pub mod novels;
 pub mod push;
 pub mod scheduler;
+pub mod server_security;
 pub mod sort_state;
 pub mod state;
+pub mod storage;
 pub mod tags;
 pub mod update;
 pub mod worker;
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     http::{HeaderMap, Method, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
@@ -29,7 +33,13 @@ use std::sync::{Arc, atomic::AtomicBool};
 use subtle::ConstantTimeEq;
 use tokio::task::JoinHandle;
 
-pub(crate) const MAX_WEB_TARGETS_PER_REQUEST: usize = 100_000;
+// 可搬の Web UI ヘルパ (バリデーション・ソート状態・上限値) は Worker と共有する
+// ため `crate::application::webui` が唯一の定義。ここでは名前を再エクスポートする。
+pub(crate) use crate::application::webui::{
+    MAX_WEB_TAGS_PER_REQUEST, MAX_WEB_TARGETS_PER_REQUEST, html_escape,
+    normalize_web_device_override, normalize_web_tag_name, tag_color_class, targets_to_strings,
+    validate_web_tag_name, validate_web_target_value,
+};
 
 /// Effective per-request target cap, resolved through the application
 /// settings port.
@@ -40,11 +50,16 @@ pub(crate) async fn max_web_targets_per_request(state: &AppState) -> usize {
         .web_target_limit(MAX_WEB_TARGETS_PER_REQUEST)
         .await
 }
-pub(crate) const MAX_WEB_TAGS_PER_REQUEST: usize = 128;
-pub(crate) const MAX_WEB_TARGET_LENGTH: usize = 4096;
-pub(crate) const MAX_WEB_TAG_LENGTH: usize = 255;
-pub(crate) const MAX_WEB_TEXT_INPUT_BYTES: usize = 1024 * 1024;
+pub(crate) use crate::application::settings_view::MAX_WEB_TEXT_INPUT_BYTES;
 pub(crate) const MAX_WEB_CSV_IMPORT_BYTES: usize = 5 * 1024 * 1024;
+/// `/api/csv/import` が受け取る HTTP ボディ全体の上限。
+///
+/// `CsvImportBody { csv }` は JSON なので、5 MiB の CSV 本体に JSON の
+/// エスケープ (`\\n` 等で最大およそ 2 倍) とフレーム分の余裕を足す。
+/// これより小さいと axum 既定の 2 MiB 制限 (413 "length limit exceeded")
+/// が先に効き、アプリ側の「csv is too large」判定に到達しない。
+pub(crate) const MAX_WEB_CSV_IMPORT_BODY_BYTES: usize =
+    2 * MAX_WEB_CSV_IMPORT_BYTES + 4 * 1024;
 pub(crate) const MAX_WEB_LOG_COUNT: usize = 1000;
 pub(crate) const MAX_WEB_PAGE_LENGTH: u64 = 500;
 pub(crate) const MAX_WEB_SEARCH_BYTES: usize = 4096;
@@ -56,10 +71,13 @@ pub struct AppState {
     pub ws_port: u16,
     pub push_server: Arc<push::PushServer>,
     pub services: Arc<crate::application::AppServices>,
-    pub basic_auth_header: Option<String>,
+    /// Runtime-mutable `server-*` settings (basic-auth header, Host allow-list,
+    /// reverse-proxy mode). Re-applied by `AppState::reload_server_security`.
+    pub server_security: Arc<parking_lot::RwLock<server_security::ServerSecurity>>,
+    /// Host the listeners were bound to; seeds `default_allowed_request_hosts`
+    /// when the security settings are reloaded.
+    pub bind_host: Arc<str>,
     pub control_token: String,
-    pub allowed_request_hosts: Vec<String>,
-    pub reverse_proxy_mode: bool,
     pub queue: Arc<crate::queue::PersistentQueue>,
     pub restore_prompt_pending: Arc<AtomicBool>,
     pub restorable_tasks_available: Arc<AtomicBool>,
@@ -123,6 +141,21 @@ pub(crate) fn default_app_services(
         },
     ))
 }
+#[cfg(test)]
+pub(crate) fn test_server_security(
+    basic_auth_header: Option<&str>,
+    allowed_request_hosts: Vec<String>,
+    reverse_proxy_mode: bool,
+) -> Arc<parking_lot::RwLock<server_security::ServerSecurity>> {
+    Arc::new(parking_lot::RwLock::new(server_security::ServerSecurity {
+        basic_auth_header: basic_auth_header.map(str::to_string),
+        allowed_request_hosts,
+        accepted_ws_domains: Vec::new(),
+        reverse_proxy_mode,
+        require_basic_auth_for_external_bind: true,
+    }))
+}
+
 pub(crate) async fn configured_tag_color(state: &AppState) -> Option<String> {
     state
         .services
@@ -136,19 +169,6 @@ pub(crate) async fn configured_tag_color(state: &AppState) -> Option<String> {
         .filter(|value| crate::tag_colors::is_valid_tag_color(value))
 }
 
-
-pub(crate) fn normalize_web_device_override(value: Option<&str>) -> Result<Option<String>, String> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let normalized = value.to_ascii_lowercase();
-    match normalized.as_str() {
-        "text" | "kindle" | "kobo" | "epub" | "ibunko" | "reader" | "ibooks" => {
-            Ok(Some(normalized))
-        }
-        _ => Err("invalid device".to_string()),
-    }
-}
 
 #[allow(dead_code)]
 pub(crate) fn removal_log_message(titles: &[String], with_file: bool) -> String {
@@ -179,55 +199,12 @@ pub(crate) fn removal_log_message(titles: &[String], with_file: bool) -> String 
     }
 }
 
-pub(crate) fn validate_web_target_value(value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("target is required".to_string());
-    }
-    if trimmed.len() > MAX_WEB_TARGET_LENGTH {
-        return Err("target is too long".to_string());
-    }
-    if trimmed.starts_with('-') {
-        return Err("invalid target".to_string());
-    }
-    if trimmed.chars().any(|ch| ch.is_control()) {
-        return Err("target contains invalid characters".to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
-pub(crate) fn validate_web_tag_name(tag: &str) -> Result<String, String> {
-    let trimmed = tag.trim();
-    if trimmed.is_empty() {
-        return Err("tag is required".to_string());
-    }
-    if trimmed.starts_with('-') {
-        return Err("tag contains invalid characters".to_string());
-    }
-    if trimmed.len() > MAX_WEB_TAG_LENGTH {
-        return Err("tag is too long".to_string());
-    }
-    if trimmed.chars().any(|ch| ch.is_control()) {
-        return Err("tag contains invalid characters".to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
-pub(crate) fn normalize_web_tag_name(tag: &str) -> Result<String, String> {
-    let trimmed = tag.trim();
-    let stripped = trimmed.strip_prefix("tag:").unwrap_or(trimmed);
-    validate_web_tag_name(stripped)
-}
-
 pub(crate) fn validate_web_text_size(
-    value: &str,
-    max_bytes: usize,
+    content: &str,
+    limit: usize,
     label: &str,
 ) -> Result<(), String> {
-    if value.len() > max_bytes {
-        return Err(format!("{} is too large", label));
-    }
-    Ok(())
+    crate::application::settings_view::validate_web_text_size(content, limit, label)
 }
 
 pub(crate) fn safe_existing_novel_dir(
@@ -319,7 +296,7 @@ pub(crate) fn request_host_allowed_for_ports(
     else {
         return false;
     };
-    if state.reverse_proxy_mode {
+    if state.server_security.read().reverse_proxy_mode {
         return parse_authority_host_and_port(host, false).is_some();
     }
     authority_matches_state(host, state, expected_ports, false)
@@ -345,7 +322,7 @@ pub(crate) fn origin_allowed_for_ports(
     let Some(origin) = origin else {
         return false;
     };
-    if state.reverse_proxy_mode {
+    if state.server_security.read().reverse_proxy_mode {
         return origin_matches_forwarded_host(headers, origin);
     }
     authority_matches_state(origin, state, expected_ports, true)
@@ -407,8 +384,8 @@ fn split_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
             .and_then(|value| value.parse::<u16>().ok());
         return Some((host, port));
     }
-    if let Some((host, port)) = trimmed.rsplit_once(':') {
-        if !host.contains(':') {
+    if let Some((host, port)) = trimmed.rsplit_once(':')
+        && !host.contains(':') {
             let host = host.trim().to_ascii_lowercase();
             if host.is_empty() {
                 return None;
@@ -416,7 +393,6 @@ fn split_host_and_port(authority: &str) -> Option<(String, Option<u16>)> {
             let port = port.parse::<u16>().ok();
             return Some((host, port));
         }
-    }
     Some((trimmed.to_ascii_lowercase(), None))
 }
 
@@ -425,7 +401,7 @@ fn host_allowed(host: &str, state: &AppState) -> bool {
     if normalized.is_empty() {
         return false;
     }
-    state.allowed_request_hosts.iter().any(|allowed| {
+    state.server_security.read().allowed_request_hosts.iter().any(|allowed| {
         let pattern = normalize_host_name(allowed);
         if pattern == normalized {
             return true;
@@ -508,7 +484,7 @@ fn wildcard_host_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
             wildcard_host_match_bytes(&pattern[1..], text)
                 || (!text.is_empty() && wildcard_host_match_bytes(pattern, &text[1..]))
         }
-        b'?' => !text.is_empty() && wildcard_host_match_bytes(&pattern[1..], &text[1..]),
+        // `?` はグロブにしない。hostname に `?` は現れないのでリテラル一致のみ。
         c => {
             !text.is_empty() && c == text[0] && wildcard_host_match_bytes(&pattern[1..], &text[1..])
         }
@@ -525,6 +501,11 @@ pub fn is_safe_wildcard_pattern(pattern: &str) -> bool {
     }
     // Reject bare `*` — would match every domain
     if trimmed == "*" {
+        return false;
+    }
+    // `?` はサポートしない (hostname に `?` は存在しないため、グロブとして
+    // 働く余地を残さない)。
+    if trimmed.contains('?') {
         return false;
     }
     // Reject patterns containing `*` anywhere except as a leading subdomain wildcard.
@@ -579,21 +560,27 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/feature_tour/all", get(feature_tour::all))
         .route("/api/feature_tour/seen", post(feature_tour::mark_seen))
         .route("/api/feature_tour/config", post(feature_tour::configure))
-        .route("/api/storage/mode", get(feature_tour::storage_mode_get).post(feature_tour::storage_mode_set))
+        .route("/api/storage/mode", get(storage::storage_mode_get).post(storage::storage_mode_set))
         .route("/api/webui/config", get(misc::webui_config))
         .route("/api/tag_list", get(misc::tag_list))
         .route("/api/tag/change_color", post(misc::tag_change_color))
         .route("/api/novels/all_ids", get(misc::all_novel_ids))
+        .route("/api/sites", get(sites::sites_list))
+        .route(
+            "/api/sites/{name}",
+            get(sites::site_show)
+                .put(sites::site_put)
+                .delete(sites::site_delete),
+        )
         .route("/api/login", get(login::login_status))
         .route("/api/login", delete(login::login_clear_all))
         .route("/api/login/import", post(login::login_import))
-        .route("/api/login/set", post(login::login_set))
-        .route("/api/login/add", post(login::login_add))
+        .route("/api/login/rename", post(login::login_rename))
         .route("/api/login/order", post(login::login_order))
-        .route("/api/login/{host}", delete(login::login_clear_host))
+        .route("/api/login/{site}", delete(login::login_clear_site))
         .route(
-            "/api/login/{host}/{index}",
-            delete(login::login_clear_credential),
+            "/api/login/{site}/{index}",
+            delete(login::login_clear_group),
         )
         .route("/api/notepad/read", get(misc::notepad_read))
         .route("/api/notepad/save", post(misc::notepad_save))
@@ -666,7 +653,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/diff_show", get(jobs::api_diff_show))
         .route("/api/diff_restore", post(jobs::api_diff_restore))
         .route("/api/diff_merge", post(jobs::api_diff_merge))
-        .route("/api/csv/import", post(jobs::api_csv_import))
+        .route(
+            "/api/csv/import",
+            post(jobs::api_csv_import).layer(DefaultBodyLimit::max(
+                MAX_WEB_CSV_IMPORT_BODY_BYTES,
+            )),
+        )
         .route("/api/csv/download", get(jobs::api_csv_download))
         .route(
             "/api/validate_url_regexp_list",
@@ -748,10 +740,11 @@ async fn basic_auth_middleware(
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
-    if state.basic_auth_header.is_none() {
+    let expected = state.server_security.read().basic_auth_header.clone();
+    let Some(expected) = expected else {
         return next.run(request).await;
-    }
-    if basic_auth_matches(request.headers(), state.basic_auth_header.as_deref()) {
+    };
+    if basic_auth_matches(request.headers(), Some(expected.as_str())) {
         return next.run(request).await;
     }
 
@@ -808,11 +801,17 @@ mod tests {
     }
 
     fn test_artifact_dir(name: &str) -> std::path::PathBuf {
+        // 同名で呼ばれても衝突しないようカウンタで一意化する
+        // (host_allowed_* 系のテストが並行で同じディレクトリを消し合うと
+        // PersistentQueue::new が不安定になる)。
+        static COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::current_dir()
             .unwrap()
             .join("target")
             .join("test-artifacts")
-            .join(format!("web-mod-{name}-{}", std::process::id()));
+            .join(format!("web-mod-{name}-{}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -820,7 +819,7 @@ mod tests {
 
     fn test_state() -> AppState {
         let queue_dir = test_artifact_dir("security-state");
-        let mut push_server = crate::web::push::PushServer::new();
+        let push_server = crate::web::push::PushServer::new();
         push_server.set_accepted_domains(["127.0.0.1", "localhost", "*.example.com"]);
         AppState {
             port: 8080,
@@ -829,10 +828,13 @@ mod tests {
             services: super::default_app_services(Arc::new(
                 crate::platform::mocks::MemoryNovelRepository::new(),
             )),
-            basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
+            server_security: super::test_server_security(
+                Some("Basic dXNlcjpwYXNz"),
+                vec!["127.0.0.1".to_string(), "localhost".to_string()],
+                false,
+            ),
+            bind_host: "127.0.0.1".into(),
             control_token: "control-token".to_string(),
-            allowed_request_hosts: vec!["127.0.0.1".to_string(), "localhost".to_string()],
-            reverse_proxy_mode: false,
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -848,7 +850,7 @@ mod tests {
 
     fn test_state_with_allowed_hosts(extra_hosts: Vec<String>) -> AppState {
         let queue_dir = test_artifact_dir("host-allowed");
-        let mut push_server = crate::web::push::PushServer::new();
+        let push_server = crate::web::push::PushServer::new();
         push_server.set_accepted_domains(["127.0.0.1", "localhost"]);
         AppState {
             port: 8080,
@@ -857,10 +859,13 @@ mod tests {
             services: super::default_app_services(Arc::new(
                 crate::platform::mocks::MemoryNovelRepository::new(),
             )),
-            basic_auth_header: Some("Basic dXNlcjpwYXNz".to_string()),
+            server_security: super::test_server_security(
+                Some("Basic dXNlcjpwYXNz"),
+                extra_hosts,
+                false,
+            ),
+            bind_host: "127.0.0.1".into(),
             control_token: "control-token".to_string(),
-            allowed_request_hosts: extra_hosts,
-            reverse_proxy_mode: false,
             queue: Arc::new(
                 crate::queue::PersistentQueue::new(&queue_dir.join("queue.yaml")).unwrap(),
             ),
@@ -984,8 +989,8 @@ mod tests {
 
     #[test]
     fn reverse_proxy_mode_accepts_forwarded_same_origin_hosts() {
-        let mut state = test_state();
-        state.reverse_proxy_mode = true;
+        let state = test_state();
+        state.server_security.write().reverse_proxy_mode = true;
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             axum::http::header::HOST,
@@ -1024,6 +1029,12 @@ mod tests {
         assert!(!is_safe_wildcard_pattern("example.com*"));
         // Embedded wildcard (`sub*.example.com`) must be rejected
         assert!(!is_safe_wildcard_pattern("sub*.example.com"));
+        // `?` is not a single-character wildcard: `?.example.com` and
+        // `?ocalhost` must not grant `a.example.com` / `localhost`.
+        assert!(!is_safe_wildcard_pattern("?.example.com"));
+        assert!(!is_safe_wildcard_pattern("?ocalhost"));
+        assert!(!wildcard_host_match("?.example.com", "a.example.com"));
+        assert!(!wildcard_host_match("?ocalhost", "localhost"));
         // Exact match still works
         assert!(is_safe_wildcard_pattern("localhost"));
         assert!(wildcard_host_match("localhost", "localhost"));
@@ -1077,9 +1088,92 @@ mod tests {
             "*.com".to_string(),       // too few labels after `*.`
             "example.com*".to_string(), // trailing wildcard
             "*".to_string(),            // bare wildcard
+            "?.example.com".to_string(), // `?` is not a wildcard
+            "?ocalhost".to_string(),
         ]);
         assert!(!host_allowed("foo.com", &state));
         assert!(!host_allowed("example.com", &state));
         assert!(!host_allowed("attacker.example.com", &state));
+        assert!(!host_allowed("a.example.com", &state));
+        assert!(!host_allowed("localhost", &state));
+    }
+
+    async fn post_json(
+        client: &reqwest::Client,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> reqwest::Response {
+        client
+            .post(url)
+            .header("authorization", "Basic dXNlcjpwYXNz")
+            .header("x-narou-internal-token", "control-token")
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(body).unwrap())
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn csv_import_body_limit_reaches_app_validation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut state = test_state();
+        state.port = port;
+        let app = super::create_router(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let import_url = format!("http://127.0.0.1:{port}/api/csv/import");
+
+        // axum 既定の 2 MiB を超える CSV でもアプリのハンドラまで届き、
+        // 413 の英語メッセージではなくアプリの JSON 応答が返る。
+        let csv = "a".repeat(2 * 1024 * 1024 + 512 * 1024);
+        let response =
+            post_json(&client, &import_url, &serde_json::json!({ "csv": csv })).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert!(body.get("success").is_some(), "unexpected body: {body}");
+
+        // アプリ側上限 (MAX_WEB_CSV_IMPORT_BYTES) 超過は
+        // アプリの「csv is too large」で拒否される。
+        let csv = "a".repeat(super::MAX_WEB_CSV_IMPORT_BYTES + 1);
+        let response =
+            post_json(&client, &import_url, &serde_json::json!({ "csv": csv })).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert_eq!(body["success"], false);
+        assert_eq!(body["message"], "csv is too large");
+
+        // ボディ全体の上限 (JSON エスケープ分の余裕込み) を超えたものは
+        // フレームワークが 413 で拒否する。
+        let csv = "a".repeat(super::MAX_WEB_CSV_IMPORT_BODY_BYTES);
+        let response =
+            post_json(&client, &import_url, &serde_json::json!({ "csv": csv })).await;
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 他ルートの既定 2 MiB は緩めない: 1 MiB 超の JSON は従来どおり
+        // アプリ側の検証で拒否され、2 MiB 超は 413 になる。
+        let notepad_url = format!("http://127.0.0.1:{port}/api/notepad/save");
+        let content = "a".repeat(1024 * 1024 + 1);
+        let response =
+            post_json(&client, &notepad_url, &serde_json::json!({ "content": content }))
+                .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.text().await.unwrap()).unwrap();
+        assert_eq!(body["success"], false);
+        assert_eq!(body["message"], "notepad content is too large");
+
+        let content = "a".repeat(2 * 1024 * 1024 + 1);
+        let response =
+            post_json(&client, &notepad_url, &serde_json::json!({ "content": content }))
+                .await;
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+
+        server.abort();
     }
 }

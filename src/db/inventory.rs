@@ -64,6 +64,7 @@ const SQLITE_MANAGED_NAMES: &[&str] = &[
     "latest_convert",
     "local_setting",
     "login_cookie",
+    "author",
 ];
 
 struct InventoryCache {
@@ -406,6 +407,7 @@ where
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&lock_path)?;
     lock_file.lock_exclusive()?;
     let result = operation();
@@ -560,6 +562,12 @@ fn process_write_lock_for(path: &Path) -> Arc<StdMutex<()>> {
         .entry(key)
         .or_insert_with(|| Arc::new(StdMutex::new(())))
         .clone()
+}
+
+/// `.narou/` を持つディレクトリが CWD かその親にあるか。未初期化のディレクトリでは
+/// 設定やサイト定義の読み込み対象が無いので、呼び出し側で読み込みを省く判断に使う。
+pub fn narou_root_exists() -> bool {
+    find_narou_root().is_ok()
 }
 
 pub(crate) fn find_narou_root() -> Result<PathBuf> {

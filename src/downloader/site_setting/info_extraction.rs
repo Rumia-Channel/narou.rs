@@ -23,11 +23,17 @@ fn build_standard_regex(pattern: &str) -> std::result::Result<regex::Regex, rege
 
 fn fancy_regex_allowed(pattern: &str, source: &str, key: &str) -> bool {
     if pattern.len() > MAX_YAML_REGEX_PATTERN_LEN {
-        eprintln!("WARN: skipping fancy-regex for {key}: pattern is too large");
+        crate::application::messages::emit_default(
+            crate::application::messages::Stream::Stderr,
+            &crate::application::messages::download::warn_fancy_pattern_large(key),
+        );
         return false;
     }
     if source.len() > MAX_REGEX_INPUT_LEN {
-        eprintln!("WARN: skipping fancy-regex for {key}: input is too large");
+        crate::application::messages::emit_default(
+            crate::application::messages::Stream::Stderr,
+            &crate::application::messages::download::warn_fancy_input_large(key),
+        );
         return false;
     }
     true
@@ -35,20 +41,16 @@ fn fancy_regex_allowed(pattern: &str, source: &str, key: &str) -> bool {
 
 /// Try matching with the standard regex crate first; fall back to fancy-regex
 /// for patterns that use lookahead/lookbehind (unsupported by the regex crate).
-fn try_regex_captures(
-    pattern: &str,
-    source: &str,
-    key: &str,
-) -> Option<String> {
+fn try_regex_captures(pattern: &str, source: &str, key: &str) -> Option<String> {
     let re = build_standard_regex(pattern);
 
     if let Ok(re) = re {
         if let Some(caps) = re.captures(source) {
             for name in re.capture_names().flatten() {
-                if capture_name_matches_key(key, name) {
-                    if let Some(m) = caps.name(name) {
-                        return Some(decode_html_text(m.as_str()));
-                    }
+                if capture_name_matches_key(key, name)
+                    && let Some(m) = caps.name(name)
+                {
+                    return Some(decode_html_text(m.as_str()));
                 }
             }
             if let Some(m) = caps.get(1) {
@@ -66,18 +68,18 @@ fn try_regex_captures(
         .dot_matches_new_line(true)
         .multi_line(true)
         .build();
-    if let Ok(fre) = fre {
-        if let Ok(Some(caps)) = fre.captures(source) {
-            for name in fre.capture_names().flatten() {
-                if capture_name_matches_key(key, name) {
-                    if let Some(m) = caps.name(name) {
-                        return Some(decode_html_text(m.as_str()));
-                    }
-                }
-            }
-            if let Some(m) = caps.get(1) {
+    if let Ok(fre) = fre
+        && let Ok(Some(caps)) = fre.captures(source)
+    {
+        for name in fre.capture_names().flatten() {
+            if capture_name_matches_key(key, name)
+                && let Some(m) = caps.name(name)
+            {
                 return Some(decode_html_text(m.as_str()));
             }
+        }
+        if let Some(m) = caps.get(1) {
+            return Some(decode_html_text(m.as_str()));
         }
     }
     None
@@ -99,9 +101,7 @@ fn try_regex_captures_all(pattern: &str, source: &str, key: &str) -> Vec<String>
                     break;
                 }
             }
-            if !matched
-                && let Some(m) = caps.get(1)
-            {
+            if !matched && let Some(m) = caps.get(1) {
                 values.push(decode_html_text(m.as_str()));
             }
         }
@@ -131,9 +131,7 @@ fn try_regex_captures_all(pattern: &str, source: &str, key: &str) -> Vec<String>
                     break;
                 }
             }
-            if !matched
-                && let Some(m) = caps.get(1)
-            {
+            if !matched && let Some(m) = caps.get(1) {
                 values.push(decode_html_text(m.as_str()));
             }
         }
@@ -307,9 +305,16 @@ mod tests {
         let source = "<dt class=\"p-infotop-data__title\">キーワード</dt>\n<dd class=\"p-infotop-data__value\">\nR15&nbsp;残酷な描写あり&nbsp;近未来 シムワールド 無敵\n</dd>";
 
         let result = try_regex_captures(pattern, source, "tags");
-        assert!(result.is_some(), "tags regex should match via fancy-regex fallback");
+        assert!(
+            result.is_some(),
+            "tags regex should match via fancy-regex fallback"
+        );
         let tag_val = result.unwrap();
-        assert!(tag_val.contains("R15"), "should contain R15, got: {}", tag_val);
+        assert!(
+            tag_val.contains("R15"),
+            "should contain R15, got: {}",
+            tag_val
+        );
     }
 
     #[test]

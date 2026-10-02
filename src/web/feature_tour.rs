@@ -336,163 +336,17 @@ fn normalize_version_parts(version: &str) -> [u64; 3] {
     parts
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{normalize_version_parts, pending_entries, version_greater};
-
-    #[test]
-    fn version_comparison_handles_multi_digit_segments() {
-        assert!(version_greater("0.10.0", "0.2.9"));
-        assert!(version_greater("v0.2.3", "0.2.2"));
-        assert!(!version_greater("0.2.3", "0.2.3"));
-        assert_eq!(normalize_version_parts("0.2.3 (local-build)"), [0, 2, 3]);
-    }
-
-    #[test]
-    fn pending_entries_returns_only_unseen_current_tours() {
-        let entries = pending_entries(Some("0.2.0"), "0.2.3");
-        assert!(
-            entries
-                .iter()
-                .all(|entry| version_greater(entry.version, "0.2.0"))
-        );
-        assert!(entries.iter().any(|entry| entry.version == "0.2.3"));
-    }
-
-    #[test]
-    fn release_043_tours_appear_only_when_current_and_unseen() {
-        let before_release = pending_entries(Some("0.4.2"), "0.4.2");
-        assert!(before_release.is_empty());
-
-        let new_entries = pending_entries(Some("0.4.2"), "0.4.3");
-        assert_eq!(new_entries.len(), 4);
-        assert!(new_entries.iter().all(|entry| entry.version == "0.4.3"));
-        assert!(pending_entries(Some("0.4.3"), "0.4.3").is_empty());
-    }
-
-    #[test]
-    fn pending_entries_does_not_return_future_tours() {
-        let entries = pending_entries(None, "0.2.2");
-        assert!(
-            entries
-                .iter()
-                .all(|entry| !version_greater(entry.version, "0.2.2"))
-        );
-    }
-
-    #[test]
-    fn pending_entries_without_seen_version_returns_current_tours() {
-        let entries = pending_entries(None, super::version::VERSION);
-        assert!(!entries.is_empty());
-        assert!(
-            entries
-                .iter()
-                .all(|entry| !version_greater(entry.version, super::version::VERSION))
-        );
-    }
-}
-
 #[cfg(feature = "native-runtime")]
 fn storage_migration_prompt() -> serde_json::Value {
-    use crate::native::sqlite::state;
-
-    if state::legacy_yaml_active() {
-        return serde_json::json!({ "available": false, "mode": "yaml" });
-    }
-    let narou_dir = match crate::db::inventory::Inventory::with_default_root() {
-        Ok(inventory) => inventory.root_dir().join(".narou"),
-        Err(_) => return serde_json::json!({ "available": false, "mode": "yaml" }),
-    };
-    let mode = state::read_mode(&narou_dir);
+    let status = crate::web::storage::status_payload();
+    let mode = status["mode"].clone();
     serde_json::json!({
-        "available": mode == state::StorageMode::Yaml,
-        "mode": match mode {
-            state::StorageMode::Sqlite => "sqlite",
-            state::StorageMode::Yaml => "yaml",
-        },
+        "available": mode == "yaml" && status["locked_by_env"] == serde_json::json!(false),
+        "mode": mode,
     })
 }
 
 #[cfg(not(feature = "native-runtime"))]
 fn storage_migration_prompt() -> serde_json::Value {
     serde_json::json!({ "available": false, "mode": "yaml" })
-}
-
-/// GET /api/storage/mode — current management backend of this library.
-pub async fn storage_mode_get() -> Json<serde_json::Value> {
-    #[cfg(feature = "native-runtime")]
-    {
-        use crate::native::sqlite::state;
-        if state::legacy_yaml_active() {
-            return Json(serde_json::json!({ "success": true, "mode": "yaml", "locked_by_env": true }));
-        }
-        let mode = crate::db::inventory::Inventory::with_default_root()
-            .map(|inventory| state::read_mode(&inventory.root_dir().join(".narou")))
-            .unwrap_or(state::StorageMode::Yaml);
-        let mode_str = match mode {
-            state::StorageMode::Sqlite => "sqlite",
-            state::StorageMode::Yaml => "yaml",
-        };
-        return Json(serde_json::json!({ "success": true, "mode": mode_str, "locked_by_env": false }));
-    }
-    #[cfg(not(feature = "native-runtime"))]
-    Json(serde_json::json!({ "success": true, "mode": "yaml", "locked_by_env": false }))
-}
-
-/// POST /api/storage/mode — switch the management backend for this library.
-///
-/// `sqlite` writes the marker and re-initializes the database handle, which
-/// performs the one-time legacy import (originals are renamed, never deleted).
-/// `yaml` records the explicit choice so the tour never re-prompts.
-pub async fn storage_mode_set(
-    Json(body): Json<serde_json::Value>,
-) -> Json<ApiResponse> {
-    #[cfg(feature = "native-runtime")]
-    {
-        use crate::native::sqlite::state;
-        let requested = body["mode"].as_str().unwrap_or("").trim().to_string();
-        let mode = match requested.as_str() {
-            "sqlite" => state::StorageMode::Sqlite,
-            "yaml" => state::StorageMode::Yaml,
-            _ => {
-                return Json(ApiResponse {
-                    success: false,
-                    message: "mode must be 'sqlite' or 'yaml'".to_string(),
-                })
-            }
-        };
-        let narou_dir = match crate::db::inventory::Inventory::with_default_root() {
-            Ok(inventory) => inventory.root_dir().join(".narou"),
-            Err(error) => {
-                return Json(ApiResponse {
-                    success: false,
-                    message: error.to_string(),
-                })
-            }
-        };
-        return match state::write_mode(&narou_dir, mode) {
-            Ok(()) => match crate::db::init_database() {
-                Ok(()) => Json(ApiResponse {
-                    success: true,
-                    message: match mode {
-                        state::StorageMode::Sqlite => "SQLite管理へ移行しました".to_string(),
-                        state::StorageMode::Yaml => "YAML管理を継続します".to_string(),
-                    },
-                }),
-                Err(error) => Json(ApiResponse {
-                    success: false,
-                    message: error.to_string(),
-                }),
-            },
-            Err(error) => Json(ApiResponse {
-                success: false,
-                message: error.to_string(),
-            }),
-        };
-    }
-    #[cfg(not(feature = "native-runtime"))]
-    Json(ApiResponse {
-        success: false,
-        message: "unsupported on this runtime".to_string(),
-    })
 }

@@ -94,8 +94,14 @@ pub enum LValue {
 
 #[derive(Debug, Clone)]
 pub enum Method {
-    Map { var: String, body: Box<Expr> },
-    FlatMap { var: String, body: Box<Expr> },
+    Map {
+        var: String,
+        body: Box<Expr>,
+    },
+    FlatMap {
+        var: String,
+        body: Box<Expr>,
+    },
     Flatten,
     Compact,
     Join(Vec<StrPart>),
@@ -120,6 +126,8 @@ pub enum Method {
     Field(String),
     /// `[...]` inside a chain.
     Bracket(BracketKey),
+    /// `keys` — the keys of an object, in JSON order.
+    Keys,
     IsArray,
     Empty,
     Size,

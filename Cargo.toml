@@ -4,10 +4,13 @@ resolver = "3"
 
 [package]
 name = "narou_rs"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 license = "BSD-2-Clause"
 readme = "README.md"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", optional = true, features = ["wasm_js"] }
 
 [features]
 default = ["native-runtime"]
@@ -48,10 +51,23 @@ native-runtime = [
 # engine. Binaries built with this feature are distributed under GPL-3.0;
 # see assets/aozora_lite/LICENSE.md. The Worker runtime enables it always.
 lite = ["dep:aozora_epub3_lite"]
-worker-runtime = ["lite"]
+# At-rest credential decryption and encrypted-export import are needed on the
+# Worker too (credentials and envelopes may be written by a native library).
+# Argon2id, the AEAD stack and `getrandom` are all pure Rust, so they join this
+# feature; on wasm `getrandom` uses `crypto.getRandomValues` (`wasm_js`).
+worker-runtime = [
+    "lite",
+    "illustration-animation",
+    "dep:argon2",
+    "dep:base64",
+    "dep:chacha20poly1305",
+    "dep:getrandom",
+]
 # Animated illustrations arrive as a frame archive and are assembled into an
-# APNG, which needs the image codecs and a ZIP reader. The portable (Worker /
-# wasm) build leaves both out and keeps the archive as it arrived.
+# APNG. The codecs (image: jpeg/png) and the ZIP reader are pure Rust, so the
+# portable (Worker / wasm) build enables them too; `zip` is pinned to the
+# deflate/flate2(zlib-rs) backend because its default features pull in C-backed
+# compressors that do not build for wasm32-unknown-unknown.
 illustration-animation = ["dep:image", "dep:zip"]
 
 [dependencies]
@@ -79,7 +95,7 @@ ua_generator = { git = "https://github.com/spider-rs/ua_generator.git", version 
 curl = { version = "0.4", features = ["static-ssl"], optional = true }
 indicatif = { version = "0.18", optional = true }
 encoding_rs = "0.8"
-zip = { version = "8.5", optional = true }
+zip = { version = "8.5", optional = true, default-features = false, features = ["deflate-flate2-zlib-rs"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "native-tls"], optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 similar = { version = "3.1", optional = true }
@@ -91,20 +107,25 @@ fancy-regex = "0.19"
 socket2 = { version = "0.6", optional = true }
 chrono-tz = { version = "0.10", features = ["case-insensitive"] }
 subtle = "2.6"
+# wasm では crypto.getRandomValues をバックエンドに使う (`wasm_js`)。native の
+# ビルドに wasm-bindgen を持ち込まないよう、ターゲット限定で feature を足す。
 getrandom = { version = "0.4", optional = true }
 fs2 = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
 url = "2"
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
-aozora_epub3_lite = { git = "https://github.com/Rumia-Channel/AozoraEpub3_Lite", rev = "cd67ddb", optional = true }
+aozora_epub3_lite = { git = "https://github.com/Rumia-Channel/AozoraEpub3_Lite", rev = "214aabc", optional = true }
 base64 = { version = "0.23", optional = true }
 miniz_oxide = "0.9"
 brotli = "9.0"
 crc32fast = "1.5"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
-chacha20poly1305 = { version = "0.11", optional = true }
+# Nonces come from our own random source (`login::crypto::random_bytes`), so the
+# crate's rng feature (which would pull `getrandom` into the wasm build) is off.
+chacha20poly1305 = { version = "0.11", optional = true, default-features = false, features = ["alloc"] }
 argon2 = { version = "0.6", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
+hmac = "0.13"
 
 [build-dependencies]
 base64 = "0.22"
@@ -141,3 +162,10 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32
 
 [dev-dependencies]
 mailparse = "0.17"
+
+# Worker (wasm) のサイズと起動時間、配布バイナリの実行速度を優先する。
+# native の release ビルドは遅くなるが、CI では native は check/test のみで、
+# release ビルドは release.yml (タグ時) だけなので許容する。
+[profile.release]
+lto = true
+codegen-units = 1

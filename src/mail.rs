@@ -212,15 +212,12 @@ pub fn send_target_with_setting_interruptible(
         }
     };
 
-    if send_all && !force {
-        if let (Some(new_arrivals_date), Some(last_mail_date)) =
+    if send_all && !force
+        && let (Some(new_arrivals_date), Some(last_mail_date)) =
             (record.new_arrivals_date, record.last_mail_date)
-        {
-            if new_arrivals_date < last_mail_date {
+            && new_arrivals_date < last_mail_date {
                 return Ok(false);
             }
-        }
-    }
 
     let novel_dir = crate::db::with_database(|db| -> Result<PathBuf> {
         Ok(crate::db::existing_novel_dir_for_record(
@@ -590,7 +587,7 @@ pub fn get_ebook_file_paths(
         subtitles: Vec::new(),
         novel_type: Some(record.novel_type),
     };
-    let txt_name = create_output_text_filename(&settings, record.id, &toc, Some(&record));
+    let txt_name = create_output_text_filename(&settings, record.id, &toc, Some(record));
     let base = PathBuf::from(txt_name)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -855,11 +852,10 @@ fn yaml_u16(value: Option<&serde_yaml::Value>) -> Option<u16> {
 
 fn preset_dir() -> Result<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent() {
             candidates.push(parent.join("preset"));
         }
-    }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     candidates.push(manifest_dir.join("preset"));
     candidates.push(manifest_dir.join("sample").join("narou").join("preset"));

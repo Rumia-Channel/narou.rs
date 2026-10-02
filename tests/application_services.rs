@@ -21,7 +21,11 @@ fn public_application_services_plan_targetless_auto_update() {
 #[test]
 fn scheduler_policy_is_composed_without_web_or_native_types() {
     let scheduler = SchedulerService::new(Arc::new(SystemClock));
-    let policy = scheduler.policy(true, "0800,1800", None, vec!["modified".to_string()]);
+    let policy = scheduler.policy(
+        true,
+        scheduler.parse_schedule("0800,1800"),
+        vec!["modified".to_string()],
+    );
 
     assert!(policy.enabled);
     assert!(matches!(policy.schedule, AutoUpdateSchedule::Daily(Schedule { times }) if times == vec![(8, 0), (18, 0)]));

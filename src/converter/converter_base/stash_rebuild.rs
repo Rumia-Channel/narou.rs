@@ -14,8 +14,7 @@ static RE_ILLUST_TAG: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-static RE_URL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).unwrap());
+static RE_URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>"']+"#).unwrap());
 static RE_FORCE_INDENT_CHAPTER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\u{FF3B}\u{FF03}\u{7AE0}\u{898B}\u{51FA}\u{3057}\u{3063}\u{307D}\u{3044}\u{6587}\u{FF1D}(\d+)\u{FF3D}")
         .unwrap()
@@ -42,15 +41,14 @@ impl ConverterBase {
     }
 
     pub(super) fn replace_url(&mut self, text: &str) -> String {
-        let result = RE_URL
+        RE_URL
             .replace_all(text, |caps: &regex::Captures| {
                 let url = caps[0].to_string();
                 let idx = self.url_stash.len();
                 self.url_stash.push(url);
                 encode_stash_token(URL_STASH_MARKER, idx)
             })
-            .to_string();
-        result
+            .to_string()
     }
 
     pub(super) fn replace_narou_tag(&self, text: &str) -> String {
@@ -150,8 +148,10 @@ mod tests {
 
     #[test]
     fn replace_illust_tag_removes_annotation_when_disabled() {
-        let mut settings = NovelSettings::default();
-        settings.enable_illust = false;
+        let settings = NovelSettings {
+            enable_illust: false,
+            ..NovelSettings::default()
+        };
         let mut converter = ConverterBase::new(settings);
         let mut text = "前\n［＃挿絵（挿絵/test.jpg）入る］\n後".to_string();
 

@@ -75,6 +75,20 @@ impl UserConverter {
         Some(converter)
     }
 
+    /// `converter.yaml` の中身から作る (fs を使わない)。
+    ///
+    /// `title` が空ならそのまま、 Novel のタイトルと一致するときだけ適用する
+    /// 規則は [`Self::load_with_title`] と同じ。
+    pub fn from_yaml(yaml: &str, novel_title: &str) -> Option<Self> {
+        let converter: UserConverter = serde_yaml::from_str(yaml).ok()?;
+        if converter.title.is_empty() || converter.title == novel_title {
+            Some(converter)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "native-runtime")]
     pub fn load_with_title(archive_path: &Path, novel_title: &str) -> Option<Self> {
         let converter = Self::load(archive_path)?;
         if converter.title.is_empty() {

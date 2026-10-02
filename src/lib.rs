@@ -11,13 +11,12 @@ pub mod application;
 pub mod epub_lite;
 #[cfg(feature = "native-runtime")]
 pub mod compat;
-#[cfg(feature = "native-runtime")]
+// `converter` は native の fs/プロセス経路と、Worker のポータブル経路の両方を含む。
+// worker ビルドでは native 専用の補助 (レポート整形・出力ファイル名など) が
+// 未使用になるため、その構成に限り dead_code を許可する。
+#[cfg_attr(not(feature = "native-runtime"), allow(dead_code))]
+#[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub mod converter;
-#[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
-pub mod converter {
-    #[path = "ini.rs"]
-    pub mod ini;
-}
 pub mod db;
 #[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub mod downloader;
@@ -27,7 +26,7 @@ pub mod illustration_animation;
 pub mod illustration_store;
 #[cfg(feature = "native-runtime")]
 pub mod logger;
-#[cfg(feature = "native-runtime")]
+#[cfg(any(feature = "native-runtime", feature = "worker-runtime"))]
 pub mod login;
 #[cfg(feature = "native-runtime")]
 pub mod mail;
@@ -42,6 +41,8 @@ pub mod setting_core;
 pub mod setting_info;
 #[cfg(feature = "native-runtime")]
 pub mod startup_backup;
+#[cfg(feature = "native-runtime")]
+pub mod author;
 #[cfg(feature = "native-runtime")]
 pub mod tag_colors;
 #[cfg(feature = "native-runtime")]

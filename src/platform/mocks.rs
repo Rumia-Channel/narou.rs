@@ -12,9 +12,10 @@ use parking_lot::Mutex;
 use crate::db::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::platform::{
-    AssetStore, CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, LoginCredential,
+    AssetStore, CookieStore, HttpClient, HttpMethod, HttpRequest, HttpResponse, LoginGroup,
     NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, ObjectKey, ObjectListPage,
     ObjectListRequest, ObjectMetadata, ObjectStore, PlatformFuture, RateLimitScope, RateLimiter,
+    paginate_object_listing,
 };
 
 /// HTTP client backed by a caller-provided responder closure.
@@ -26,7 +27,14 @@ use crate::platform::{
 pub struct MockHttpClient {
     responses: Mutex<BTreeMap<String, HttpResponse>>,
     requests: Mutex<Vec<String>>,
+    /// Full request heads (url + headers) so tests can assert what was sent.
+    sent: Mutex<Vec<RequestHead>>,
+    /// Bodies of the sent requests, aligned with `sent`.
+    bodies: Mutex<Vec<Option<Vec<u8>>>>,
 }
+
+/// One sent request head: `(url, headers)` in send order.
+type RequestHead = (String, Vec<(String, String)>);
 
 impl MockHttpClient {
     pub fn new() -> Self {
@@ -58,11 +66,25 @@ impl MockHttpClient {
     pub fn request_count(&self) -> usize {
         self.requests.lock().len()
     }
+
+    /// All request heads sent so far: `(url, headers)` in send order.
+    pub fn sent_requests(&self) -> Vec<RequestHead> {
+        self.sent.lock().clone()
+    }
+
+    /// Bodies of the requests sent so far, aligned with [`Self::sent_requests`].
+    pub fn sent_bodies(&self) -> Vec<Option<Vec<u8>>> {
+        self.bodies.lock().clone()
+    }
 }
 
 impl HttpClient for MockHttpClient {
     fn send<'a>(&'a self, request: HttpRequest) -> PlatformFuture<'a, Result<HttpResponse>> {
         Box::pin(async move {
+            self.sent
+                .lock()
+                .push((request.url.clone(), request.headers.clone()));
+            self.bodies.lock().push(request.body.clone());
             self.requests
                 .lock()
                 .push(format!("{} {}", method_name(request.method), request.url));
@@ -79,6 +101,8 @@ fn method_name(method: HttpMethod) -> &'static str {
     match method {
         HttpMethod::Get => "GET",
         HttpMethod::Post => "POST",
+        HttpMethod::Put => "PUT",
+        HttpMethod::Delete => "DELETE",
     }
 }
 
@@ -147,33 +171,25 @@ impl ObjectStore for MemoryObjectStore {
     ) -> PlatformFuture<'a, Result<ObjectListPage>> {
         Box::pin(async move {
             let objects = self.objects.lock();
-            let mut page = Vec::with_capacity(request.limit.get());
-            let mut started = request.cursor.is_none();
-            let mut next_cursor = None;
+            let mut items = Vec::new();
             for (key, data) in objects.iter() {
                 let object_key = ObjectKey::try_new(key.clone())?;
-                if !request.prefix.matches(&object_key) {
-                    continue;
+                if request.prefix.matches(&object_key) {
+                    items.push(ObjectMetadata {
+                        key: object_key,
+                        size: data.len() as u64,
+                        etag: None,
+                        content_type: None,
+                        last_modified: None,
+                    });
                 }
-                if !started {
-                    if request.cursor.as_deref().is_some_and(|cursor| key.as_str() > cursor) {
-                        started = true;
-                    } else {
-                        continue;
-                    }
-                }
-                if page.len() == request.limit.get() {
-                    next_cursor = page.last().map(|item: &ObjectMetadata| item.key.as_ref().to_string());
-                    break;
-                }
-                page.push(ObjectMetadata {
-                    key: object_key,
-                    size: data.len() as u64,
-                    etag: None,
-                    content_type: None,
-                    last_modified: None,
-                });
             }
+            let (page, next_cursor) = paginate_object_listing(
+                items,
+                request.cursor.as_deref(),
+                request.limit.get(),
+                |item| item.key.as_ref(),
+            );
             Ok(ObjectListPage {
                 objects: page,
                 next_cursor,
@@ -477,8 +493,8 @@ impl RateLimiter for FakeRateLimiter {
 /// In-memory [`CookieStore`] for tests and the Worker runtime.
 #[derive(Debug, Default, Clone)]
 pub struct MemoryCookieStore {
-    cookies: std::sync::Arc<
-        std::sync::Mutex<std::collections::BTreeMap<String, Vec<LoginCredential>>>,
+    groups: std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, Vec<LoginGroup>>>,
     >,
 }
 
@@ -488,7 +504,7 @@ impl MemoryCookieStore {
     }
 
     pub fn len(&self) -> usize {
-        self.cookies.lock().unwrap().len()
+        self.groups.lock().unwrap().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -497,55 +513,47 @@ impl MemoryCookieStore {
 }
 
 impl CookieStore for MemoryCookieStore {
-    fn load_all<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<Vec<LoginCredential>>> {
-        let host = host.to_ascii_lowercase();
+    fn load_groups<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<Vec<LoginGroup>>> {
+        let site = site.trim().to_ascii_lowercase();
         Box::pin(async move {
-            let cookies = self.cookies.lock().unwrap();
-            let mut credentials: Vec<LoginCredential> = Vec::new();
-            for key in crate::platform::cookie_lookup_hosts(&host) {
-                let Some(entries) = cookies.get(&key) else {
-                    continue;
-                };
-                for credential in entries {
-                    if !credentials.iter().any(|seen| seen.same_cookie(credential)) {
-                        credentials.push(credential.clone());
-                    }
-                }
-            }
-            Ok(credentials)
+            Ok(self
+                .groups
+                .lock()
+                .unwrap()
+                .get(&site)
+                .cloned()
+                .unwrap_or_default())
         })
     }
 
-    fn save_all<'a>(
+    fn save_groups<'a>(
         &'a self,
-        host: &'a str,
-        credentials: &'a [LoginCredential],
+        site: &'a str,
+        groups: &'a [LoginGroup],
     ) -> PlatformFuture<'a, Result<()>> {
-        let host = host.to_ascii_lowercase();
-        let credentials: Vec<LoginCredential> = credentials.to_vec();
+        let site = site.trim().to_ascii_lowercase();
+        let groups: Vec<LoginGroup> = groups.to_vec();
         Box::pin(async move {
-            let mut cookies = self.cookies.lock().unwrap();
-            if credentials.is_empty() {
-                cookies.remove(&host);
+            let mut stored = self.groups.lock().unwrap();
+            if groups.is_empty() {
+                stored.remove(&site);
             } else {
-                cookies.insert(host, credentials);
+                stored.insert(site, groups);
             }
             Ok(())
         })
     }
 
-    fn clear<'a>(&'a self, host: &'a str) -> PlatformFuture<'a, Result<()>> {
-        let host = host.to_ascii_lowercase();
+    fn clear<'a>(&'a self, site: &'a str) -> PlatformFuture<'a, Result<()>> {
+        let site = site.trim().to_ascii_lowercase();
         Box::pin(async move {
-            self.cookies.lock().unwrap().remove(&host);
+            self.groups.lock().unwrap().remove(&site);
             Ok(())
         })
     }
 
-    fn list(
-        &self,
-    ) -> PlatformFuture<'_, Result<std::collections::BTreeMap<String, Vec<LoginCredential>>>> {
-        Box::pin(async move { Ok(self.cookies.lock().unwrap().clone()) })
+    fn list_groups(&self) -> PlatformFuture<'_, Result<std::collections::BTreeMap<String, Vec<LoginGroup>>>> {
+        Box::pin(async move { Ok(self.groups.lock().unwrap().clone()) })
     }
 }
 

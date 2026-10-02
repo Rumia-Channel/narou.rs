@@ -5,7 +5,10 @@
 //! handed to the queue. This service owns that planning logic: target
 //! normalization, deduplication, and validation. It deliberately contains
 //! no queue, process, or async-execution APIs — the queue layer consumes
-//! [`JobPlan`] values and does the actual work.
+//! [`JobPlan`] values and does the actual work. The one exception is
+//! [`emit_download_result_lines`]: the per-novel console report both the
+//! native commands and the worker executor must print identically, so the
+//! wording dispatch lives here next to [`JobKind`].
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -13,6 +16,8 @@ use std::time::Duration;
 use chrono::DateTime;
 
 use crate::application::error::ApplicationError;
+use crate::application::messages::{self, MessageSink, Stream};
+use crate::downloader::{DownloadResult, UpdateStatus};
 use crate::error::NarouError;
 use crate::platform::{NovelId, PlatformFuture};
 
@@ -57,12 +62,14 @@ impl JobKind {
     }
 
     /// Kinds the Worker queue consumer can execute with the shared portable
-    /// [`crate::downloader::Downloader`]. Anything else is routed to a durable
-    /// blocked state. Convert becomes executable once section→text assembly
+    /// capabilities (`Downloader` / `ConvertService`). Anything else is routed
+    /// to a durable blocked state.
     /// is ported; download-time EPUB already reads the `novel.txt` object
     /// ([`crate::platform::NovelObjectKeys::converted_text`]) instead.
     pub fn is_worker_executable(self) -> bool {
-        matches!(self, Self::Download | Self::Update)
+        // Convert は保存済みの TOC と本文から変換テキストを組むだけで、
+        // 外部プロセスを使わない (`ConvertService`)。
+        matches!(self, Self::Download | Self::Update | Self::Convert)
     }
 }
 
@@ -154,6 +161,235 @@ impl JobPlan {
             self.target.as_str(),
             options.join(",")
         )
+    }
+}
+
+/// Extract the set of numeric novel IDs from a job target string.
+///
+/// Shared by the native queue (`crate::queue`) and the Worker ledger
+/// (`worker_jobs`) so both backends apply the same per-novel exclusion rule:
+/// a claim must not start while another job that touches the same novel is
+/// running. Native targets are tab-separated token lists (e.g.
+/// `"12\tkindle"`, `"--force\t12"`) while Worker ledger `target` values are
+/// canonical [`JobTarget::as_str`] strings; in both shapes only tokens that
+/// parse as `i64` count, so flag tokens, `tag:…` selectors and ncode/URL
+/// targets never trigger the lock. An empty result means the job is not
+/// tied to a specific novel id (e.g. `AutoUpdate` broadcasts).
+pub fn extract_novel_ids(target: &str) -> HashSet<i64> {
+    target
+        .split('\t')
+        .filter_map(|part| part.parse::<i64>().ok())
+        .collect()
+}
+
+/// Worker ledger (`worker_jobs` on D1) claim statements.
+///
+/// The claim UPDATEs are defined here — not inside the D1 adapter — so the
+/// host-side tests can execute the *same* SQL against rusqlite and pin the
+/// semantics that D1 cannot exercise locally: per-novel exclusion
+/// ([`extract_novel_ids`]) and the retry backoff hold (`resume_after`
+/// becomes `lease_until`, and a `retryable` row is not claimable until it
+/// elapses).
+///
+/// Conventions mirror `worker_entry/src/ledger.rs`: timestamps are
+/// canonical UTC RFC3339 strings so lexicographic comparison is sound, and
+/// novel ids are bound as canonical decimal `target` strings (worker
+/// targets are single normalized tokens, so an `i64` id and its decimal
+/// string are the same value — the same scope as the native
+/// `job_conflicts_with_running` check).
+pub mod worker_ledger {
+    use super::extract_novel_ids;
+    use std::collections::HashSet;
+
+    /// A fully-formed statement: SQL text plus bind values in order.
+    /// Every bind is a `TEXT` string (RFC3339 timestamps, job id, canonical
+    /// target strings), matching the `BindValue::Text` usage in the D1
+    /// adapter. Integer predicates (LIMIT, attempts) are inlined by the
+    /// builders — they are always internal constants or validated counts.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Statement {
+        pub sql: String,
+        pub binds: Vec<String>,
+    }
+
+    /// Build the "fresh" claim: promote a `pending` row, or a `retryable`
+    /// row whose backoff hold (`lease_until`) has elapsed, to `running` —
+    /// but only when no *other* row covering the same novel id is running.
+    ///
+    /// - `now` / `lease_until` / `job_id`: canonical strings
+    /// - `execution_token`: the new claim token
+    /// - `target`: the candidate row's canonical target (for extraction)
+    ///
+    /// Bind order: `updated_at, lease_until, execution_token, job_id, now,
+    /// conflict target…`.
+    pub fn claim_fresh(
+        now: &str,
+        lease_until: &str,
+        execution_token: &str,
+        job_id: &str,
+        target: &str,
+    ) -> Statement {
+        let (clause, conflict) = conflict_clause(target);
+        let mut binds = vec![
+            now.to_string(),
+            lease_until.to_string(),
+            execution_token.to_string(),
+            job_id.to_string(),
+            now.to_string(),
+        ];
+        binds.extend(conflict);
+        Statement {
+            sql: format!(
+                "UPDATE worker_jobs \
+                 SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ? \
+                 WHERE job_id = ? \
+                   AND (status = 'pending' \
+                        OR (status = 'retryable' AND (lease_until IS NULL OR lease_until <= ?)))\
+                 {clause}"
+            ),
+            binds,
+        }
+    }
+
+    /// Build the lease-expired reclaim: take over a `running` row whose
+    /// lease elapsed (or was never written), under the same per-novel
+    /// exclusion as [`claim_fresh`].
+    ///
+    /// Bind order: `updated_at, lease_until, execution_token, job_id, now,
+    /// conflict target…`.
+    pub fn claim_reclaim(
+        now: &str,
+        lease_until: &str,
+        execution_token: &str,
+        job_id: &str,
+        target: &str,
+    ) -> Statement {
+        let (clause, conflict) = conflict_clause(target);
+        let mut binds = vec![
+            now.to_string(),
+            lease_until.to_string(),
+            execution_token.to_string(),
+            job_id.to_string(),
+            now.to_string(),
+        ];
+        binds.extend(conflict);
+        Statement {
+            sql: format!(
+                "UPDATE worker_jobs \
+                 SET status = 'running', updated_at = ?, lease_until = ?, execution_token = ? \
+                 WHERE job_id = ? AND status = 'running' \
+                   AND (lease_until IS NULL OR lease_until <= ?)\
+                 {clause}"
+            ),
+            binds,
+        }
+    }
+
+    /// Select at most `limit` active rows whose scheduled progress point has
+    /// passed `stuck_before`: `pending` rows whose `updated_at` is old
+    /// (their envelope was never delivered or `queue.send` failed),
+    /// `retryable` rows whose backoff hold (`lease_until`) already elapsed
+    /// (their redelivery was lost to the DLQ or a consumer error), and
+    /// `running` rows whose execution lease expired (the claiming
+    /// invocation died). These are exactly the rows the cron reaper must
+    /// either re-enqueue or finalize — without it they would stay active
+    /// (UI「待機中」) forever.
+    ///
+    /// Bind order: `stuck_before`.
+    pub fn select_stuck(stuck_before: &str, limit: usize) -> Statement {
+        Statement {
+            sql: format!(
+                "SELECT job_id, status, attempts, last_error FROM worker_jobs \
+                 WHERE status IN ('pending', 'running', 'retryable') \
+                   AND COALESCE(lease_until, updated_at) <= ? \
+                 ORDER BY COALESCE(lease_until, updated_at) ASC, job_id ASC \
+                 LIMIT {limit}"
+            ),
+            binds: vec![stuck_before.to_string()],
+        }
+    }
+
+    /// CAS used by the reaper right before `queue.send`: bump `updated_at`
+    /// only while the row is still active and still past `stuck_before`.
+    /// `lease_until` is also pinned to `now` — for retryable/running rows
+    /// it has already elapsed (that is why the row is stuck), so writing
+    /// "now" keeps the row claimable while taking it out of the stuck
+    /// set; a `pending` row's fresh lease is already past and `claim`
+    /// ignores it. A live claim (status moved to `running`, or a fresh
+    /// `lease_until` was written) or a concurrent reaper tick (already
+    /// bumped both columns) makes this a no-op, so each stuck episode
+    /// produces at most one fresh envelope and re-sends are throttled by
+    /// the grace period instead of flooding the queue.
+    ///
+    /// Bind order: `now`, `now`, `job_id`, `stuck_before`.
+    pub fn mark_reenqueue(now: &str, job_id: &str, stuck_before: &str) -> Statement {
+        Statement {
+            sql: "UPDATE worker_jobs SET updated_at = ?, lease_until = ? \
+                  WHERE job_id = ? \
+                    AND status IN ('pending', 'running', 'retryable') \
+                    AND COALESCE(lease_until, updated_at) <= ?"
+                .to_string(),
+            binds: vec![
+                now.to_string(),
+                now.to_string(),
+                job_id.to_string(),
+                stuck_before.to_string(),
+            ],
+        }
+    }
+
+    /// CAS used by the reaper to close a `retryable` row that has already
+    /// spent its retry budget (`attempts >= min_attempts`) but whose
+    /// scheduled redelivery never arrived. Re-enqueueing such a row would
+    /// only produce an execution that immediately exhausts retries, so the
+    /// honest terminal state is `permanent` with the delivery-loss reason
+    /// recorded in `last_error`.
+    ///
+    /// Bind order: `reason`, `now`, `job_id`, `stuck_before`.
+    pub fn finalize_stuck(
+        reason: &str,
+        now: &str,
+        job_id: &str,
+        stuck_before: &str,
+        min_attempts: u32,
+    ) -> Statement {
+        Statement {
+            sql: format!(
+                "UPDATE worker_jobs \
+                 SET status = 'permanent', last_error = ?, updated_at = ?, \
+                     lease_until = NULL, execution_token = NULL, checkpoint_json = NULL \
+                 WHERE job_id = ? AND status = 'retryable' AND attempts >= {min_attempts} \
+                   AND COALESCE(lease_until, updated_at) <= ?"
+            ),
+            binds: vec![
+                reason.to_string(),
+                now.to_string(),
+                job_id.to_string(),
+                stuck_before.to_string(),
+            ],
+        }
+    }
+
+    /// `AND NOT EXISTS …` clause plus the canonical target binds for the
+    /// candidate's novel ids, or an empty clause when the target carries no
+    /// numeric id. `other.job_id != worker_jobs.job_id` keeps the reclaim
+    /// statement from seeing its own still-`running` row as a conflict.
+    fn conflict_clause(target: &str) -> (String, Vec<String>) {
+        let novel_ids: HashSet<i64> = extract_novel_ids(target);
+        if novel_ids.is_empty() {
+            return (String::new(), Vec::new());
+        }
+        // Deterministic order keeps the generated SQL (and tests) stable.
+        let mut ids: Vec<i64> = novel_ids.into_iter().collect();
+        ids.sort_unstable();
+        let binds: Vec<String> = ids.iter().map(i64::to_string).collect();
+        let placeholders = binds.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let clause = format!(
+            " AND NOT EXISTS (SELECT 1 FROM worker_jobs AS other \
+             WHERE other.status = 'running' AND other.job_id != worker_jobs.job_id \
+               AND other.target IN ({placeholders}))"
+        );
+        (clause, binds)
     }
 }
 
@@ -441,6 +677,116 @@ pub fn classify_failure(error: &NarouError) -> JobFailureClass {
     }
 }
 
+/// Emit the per-novel result lines of `narou download` / `narou update` for one
+/// [`DownloadResult`]. Shared by the native CLI (`commands::download` /
+/// `commands::update`) and the worker executor so both surfaces print the
+/// same wording in the same order on `Stream::Stdout`.
+///
+/// `narou download` と `narou update` は同じ `DownloadResult` に対して別の
+/// 文言を出す (`update_completed` の件数の有無、update だけの
+/// `sections_deleted`、全角/半角空白の差)。ここでは両コマンドが
+/// `UpdateStatus` で分岐するのと同じ形を 1 箇所に集約し、文言差は
+/// `kind` で切り替える。`UpdateStatus::Failed` は downloader 自体が
+/// `novel_unavailable` を済ませているので両コマンドとも無出力。
+///
+/// `canceled_title` は `narou update` がキャンセルされた小説に使うタイトル。
+/// native は `DownloadResult.title` が空のとき (新規対象を中断した場合など)
+/// レコードから引き直すので、呼び出し側で同じ解決を済ませて渡す。
+/// `Download` やタイトルが空にならない呼び出しでは `None` でよい
+/// (`result.title` が使われる)。
+pub fn emit_download_result_lines(
+    sink: &dyn MessageSink,
+    kind: JobKind,
+    result: &DownloadResult,
+    canceled_title: Option<&str>,
+) {
+    match result.status {
+        UpdateStatus::Ok => {
+            if result.new_novel {
+                sink.emit(
+                    Stream::Stdout,
+                    &messages::dl_completed_new(&result.title, result.id, result.total_count),
+                );
+            } else {
+                match kind {
+                    JobKind::Update => {
+                        if result.sections_deleted {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::update::sections_deleted(result.id, &result.title),
+                            );
+                        } else if result.updated_count > 0 {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::update::update_completed(&result.title),
+                            );
+                        } else if result.title_changed {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::update::title_changed(result.id, &result.title),
+                            );
+                        } else if result.story_changed {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::update::story_changed(result.id, &result.title),
+                            );
+                        } else if result.author_changed {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::update::author_changed(result.id, &result.title),
+                            );
+                        }
+                    }
+                    _ => {
+                        if result.updated_count > 0 {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::download::update_completed(
+                                    &result.title,
+                                    result.id,
+                                    result.updated_count,
+                                    result.total_count,
+                                ),
+                            );
+                        } else if result.title_changed {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::download::title_changed(result.id, &result.title),
+                            );
+                        } else if result.story_changed {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::download::story_changed(result.id, &result.title),
+                            );
+                        } else if result.author_changed {
+                            sink.emit(
+                                Stream::Stdout,
+                                &messages::download::author_changed(result.id, &result.title),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        UpdateStatus::None => {
+            sink.emit(Stream::Stdout, &messages::no_update(&result.title));
+        }
+        UpdateStatus::Canceled => {
+            let title = if result.title.is_empty() {
+                canceled_title.unwrap_or_default()
+            } else {
+                result.title.as_str()
+            };
+            let line = match kind {
+                JobKind::Update => messages::update::update_canceled(result.id, title),
+                _ => messages::download::update_canceled(result.id, title),
+            };
+            sink.emit(Stream::Stdout, &line);
+        }
+        UpdateStatus::Failed => {}
+    }
+}
+
 /// A queued job together with its ledger state (for `GET /api/jobs/:id`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QueuedJobView {
@@ -462,16 +808,22 @@ pub struct QueuedJobView {
 pub struct WorkerJobEnvelope {
     pub version: u32,
     pub job_id: JobId,
-    pub job: JobPlan,
+    /// 計画本体。**キューには載せない**（D1 台帳が唯一の権威）。
+    /// 旧バージョンが積んだメッセージを読むためだけに残す。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobPlan>,
 }
 
 impl WorkerJobEnvelope {
-    /// Build a version-2 envelope for a queued job.
-    pub fn v2(job_id: JobId, job: JobPlan) -> Self {
+    /// Build a version-2 envelope: the id only.
+    ///
+    /// 台帳 (D1) に計画があるので、メッセージは id だけを運ぶ。メッセージが
+    /// 小さくなり、計画の書き換え・回復が台帳側だけで完結する。
+    pub fn v2(job_id: JobId) -> Self {
         Self {
             version: WORKER_JOB_ENVELOPE_VERSION,
             job_id,
-            job,
+            job: None,
         }
     }
 }
@@ -540,10 +892,13 @@ pub fn validate_request_limits(request: &JobRequest) -> Option<String> {
         ));
     }
     for target in &request.targets {
-        if target.len() > job_limits::MAX_TARGET_CHARS {
+        // 定数名・doc・エラー文言が揃って「文字数」を指すので chars() で数える。
+        // バイト長は `envelope_bytes` が別途直列化後に検査する。
+        let chars = target.chars().count();
+        if chars > job_limits::MAX_TARGET_CHARS {
             return Some(format!(
                 "target too long: {} chars (max {})",
-                target.len(),
+                chars,
                 job_limits::MAX_TARGET_CHARS
             ));
         }
@@ -556,10 +911,11 @@ pub fn validate_request_limits(request: &JobRequest) -> Option<String> {
         ));
     }
     for option in &request.options {
-        if option.len() > job_limits::MAX_OPTION_CHARS {
+        let chars = option.chars().count();
+        if chars > job_limits::MAX_OPTION_CHARS {
             return Some(format!(
                 "option too long: {} chars (max {})",
-                option.len(),
+                chars,
                 job_limits::MAX_OPTION_CHARS
             ));
         }
@@ -655,8 +1011,16 @@ pub struct SchedulerCheckpoint {
     /// generations; a generation changes only when a due run starts.
     pub generation: u64,
     pub state: CheckpointState,
-    /// Last novel id already enqueued by the current generation.
+    /// Last novel id already enqueued by the current generation. When
+    /// `scan_sort_key` is set this is instead the *offset* into the sorted
+    /// scan (the Worker planner pages `novels.query` instead of `scan_ids`).
     pub cursor: Option<i64>,
+    /// Sort key (`update.sort-by` / `NovelSortKey::as_db_key`) the running
+    /// generation is paging by, or `None` for the default `id` keyset scan.
+    /// A configured sort is not id-keyset-paginable, so the cursor becomes
+    /// an offset and this key guards against mid-run setting changes.
+    #[serde(default)]
+    pub scan_sort_key: Option<String>,
     /// When the current logical generation was claimed.
     pub started_at: Option<String>,
     /// When the last completed generation finished (drives catch-up).
@@ -675,6 +1039,7 @@ impl Default for SchedulerCheckpoint {
             generation: 0,
             state: CheckpointState::Done,
             cursor: None,
+            scan_sort_key: None,
             started_at: None,
             last_run: None,
             planner_lease_until: None,
@@ -726,6 +1091,7 @@ impl SchedulerCheckpoint {
                 generation,
                 state: CheckpointState::Running,
                 cursor: None,
+                scan_sort_key: None,
                 started_at: Some(started_at.to_string()),
                 last_run: self.last_run.clone(),
                 planner_lease_until: None,
@@ -752,6 +1118,7 @@ impl SchedulerCheckpoint {
                 generation: self.generation,
                 state: CheckpointState::Running,
                 cursor: self.cursor,
+                scan_sort_key: self.scan_sort_key.clone(),
                 started_at: self.started_at.clone().or_else(|| Some(now.to_string())),
                 last_run: self.last_run.clone(),
                 planner_lease_until: Some(planner_lease_until),
@@ -765,6 +1132,7 @@ impl SchedulerCheckpoint {
             generation,
             state: CheckpointState::Running,
             cursor: None,
+            scan_sort_key: None,
             started_at: Some(now.to_string()),
             last_run: self.last_run.clone(),
             planner_lease_until: Some(planner_lease_until),
@@ -792,6 +1160,7 @@ impl SchedulerCheckpoint {
             generation: self.generation,
             state: self.state,
             cursor: Some(cursor),
+            scan_sort_key: self.scan_sort_key.clone(),
             started_at: self.started_at.clone(),
             last_run: self.last_run.clone(),
             planner_lease_until: self.planner_lease_until.clone(),
@@ -806,6 +1175,7 @@ impl SchedulerCheckpoint {
             generation: self.generation,
             state: CheckpointState::Done,
             cursor: None,
+            scan_sort_key: None,
             started_at: None,
             last_run: Some(finished_at.to_string()),
             planner_lease_until: None,
@@ -865,11 +1235,18 @@ pub trait JobQueue: Send + Sync {
 
     /// Durably record one retryable attempt for the current execution token;
     /// returns the new attempt count. A stale token is an error.
+    ///
+    /// `resume_after` is the scheduled queue backoff for this attempt: the
+    /// ledger keeps the row unclaimable until then, so a redelivery that
+    /// arrives before the delay fires cannot short-circuit the backoff.
+    /// Passing `Duration::ZERO` (or an already-elapsed duration) makes the
+    /// row immediately claimable.
     fn record_attempt<'a>(
         &'a self,
         job_id: &'a JobId,
         execution_token: &'a str,
         error: &'a str,
+        resume_after: Duration,
     ) -> PlatformFuture<'a, crate::error::Result<u32>>;
 
     /// Durably record a terminal state for the current execution token.
@@ -922,6 +1299,135 @@ mod tests {
         assert!(result.invalid.is_empty());
     }
 
+    /// `emit_download_result_lines` が native の `print_download_status`
+    /// (`narou download`) / `print_status_messages` (`narou update`) と同じ
+    /// 行を同じ順序で出すことを固定する。文言そのもののテストは
+    /// `messages` 側にあり、ここでは分岐・順序・ストリームだけを見る。
+    struct Lines(parking_lot::Mutex<Vec<(Stream, String)>>);
+
+    impl Lines {
+        fn new() -> Self {
+            Self(parking_lot::Mutex::new(Vec::new()))
+        }
+        fn emitted(&self) -> Vec<(Stream, String)> {
+            self.0.lock().clone()
+        }
+    }
+
+    impl MessageSink for Lines {
+        fn emit(&self, stream: Stream, text: &str) {
+            self.0.lock().push((stream, text.to_string()));
+        }
+    }
+
+    fn download_result(status: UpdateStatus) -> DownloadResult {
+        DownloadResult {
+            id: 42,
+            title: "タイトル".into(),
+            author: "作者".into(),
+            novel_dir: std::path::PathBuf::new(),
+            new_novel: false,
+            new_arrivals: false,
+            new_arrival_subtitles: Vec::new(),
+            updated_count: 0,
+            total_count: 10,
+            status,
+            title_changed: false,
+            author_changed: false,
+            story_changed: false,
+            sections_deleted: false,
+        }
+    }
+
+    #[test]
+    fn emit_download_result_lines_matches_command_wording() {
+        // `narou update` の完了行は件数を出さない。
+        let mut result = download_result(UpdateStatus::Ok);
+        result.updated_count = 2;
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Update, &result, None);
+        assert_eq!(
+            sink.emitted(),
+            [(Stream::Stdout, "タイトル の更新が完了しました".to_string())]
+        );
+
+        // `narou download` の完了行は更新件数を出す。
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Download, &result, None);
+        assert_eq!(
+            sink.emitted(),
+            [(
+                Stream::Stdout,
+                "タイトル の更新完了 (ID:42, 2/10話更新)".to_string()
+            )]
+        );
+
+        // `sections_deleted` は update だけが報告する (download は
+        // updated_count > 0 のまま完了行を出す)。
+        result.sections_deleted = true;
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Update, &result, None);
+        assert_eq!(
+            sink.emitted(),
+            [(
+                Stream::Stdout,
+                "ID:42　タイトル は一部の話が削除されています".to_string()
+            )]
+        );
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Download, &result, None);
+        assert_eq!(
+            sink.emitted(),
+            [(
+                Stream::Stdout,
+                "タイトル の更新完了 (ID:42, 2/10話更新)".to_string()
+            )]
+        );
+
+        // キャンセル行も両コマンドで区切りが違う (update=全角 / download=半角)。
+        // update は title が空のとき呼び出し側が解決したタイトルを使う。
+        result = download_result(UpdateStatus::Canceled);
+        result.title.clear();
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Update, &result, Some("復帰タイトル"));
+        assert_eq!(
+            sink.emitted(),
+            [(
+                Stream::Stdout,
+                "ID:42　復帰タイトル の更新はキャンセルされました".to_string()
+            )]
+        );
+        result.title = "タイトル".into();
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Download, &result, None);
+        assert_eq!(
+            sink.emitted(),
+            [(
+                Stream::Stdout,
+                "ID:42 タイトル の更新はキャンセルされました".to_string()
+            )]
+        );
+
+        // Failed (downloader が novel_unavailable を済ませる) と新規 DL は
+        // どちらも kind に依らない。
+        let result = download_result(UpdateStatus::Failed);
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Update, &result, None);
+        assert!(sink.emitted().is_empty());
+
+        let mut result = download_result(UpdateStatus::Ok);
+        result.new_novel = true;
+        result.total_count = 3;
+        let sink = Lines::new();
+        emit_download_result_lines(&sink, JobKind::Update, &result, None);
+        assert_eq!(
+            sink.emitted(),
+            [(
+                Stream::Stdout,
+                "タイトル のDL完了 (ID:42, 3セクション)".to_string()
+            )]
+        );
+    }
     #[test]
     fn plan_normalizes_ncodes_and_deduplicates_case_insensitively() {
         let result = service().plan(&JobRequest {
@@ -1079,7 +1585,7 @@ mod tests {
         assert_eq!(back, job);
         assert!(json.contains("42"), "target id should be inline: {json}");
 
-        let envelope = WorkerJobEnvelope::v2(JobId("job_1".into()), job);
+        let envelope = WorkerJobEnvelope::v2(JobId("job_1".into()));
         let json = serde_json::to_string(&envelope).unwrap();
         let back: WorkerJobEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back, envelope);
@@ -1335,10 +1841,30 @@ mod tests {
         };
         assert!(validate_request_limits(&long_option).is_some());
 
-        let envelope = WorkerJobEnvelope::v2(
-            JobId("j1".into()),
-            plan(JobKind::Update, JobTarget::Id(NovelId(42)), &["--force"]),
+        // 上限は「文字数」: 日本語 90 文字 (=270 bytes) は受理、257 文字は拒否。
+        let multibyte_ok = JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["あ".repeat(job_limits::MAX_TARGET_CHARS)],
+            options: Vec::new(),
+        };
+        assert_eq!(validate_request_limits(&multibyte_ok), None);
+        let multibyte_ng = JobRequest {
+            kind: JobKind::Download,
+            targets: vec!["あ".repeat(job_limits::MAX_TARGET_CHARS + 1)],
+            options: Vec::new(),
+        };
+        let reason = validate_request_limits(&multibyte_ng).unwrap();
+        assert_eq!(
+            reason,
+            format!(
+                "target too long: {} chars (max {})",
+                job_limits::MAX_TARGET_CHARS + 1,
+                job_limits::MAX_TARGET_CHARS
+            )
         );
+
+        // メッセージは id だけを運ぶ (計画は台帳側)。
+        let envelope = WorkerJobEnvelope::v2(JobId("j1".into()));
         let size = envelope_bytes(&envelope).unwrap();
         assert!(size <= job_limits::MAX_ENVELOPE_BYTES);
     }
@@ -1421,5 +1947,433 @@ mod tests {
         assert!(final_page.done);
         assert_eq!(final_page.next_cursor, None);
         assert_eq!(seen, ids.iter().map(|id| id.0).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn scheduler_checkpoint_keeps_scan_sort_key_across_transitions() {
+        // 既存の JSON (フィールド無し) も読める (`#[serde(default)]`)。
+        let legacy: SchedulerCheckpoint = serde_json::from_str(
+            r#"{"generation":3,"state":"running","cursor":42,"started_at":null,"last_run":null}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.scan_sort_key, None);
+
+        // 実行中世代のリース引き継ぎとカーソル前進はソートキーを保持する。
+        let mut running = legacy.clone();
+        running.scan_sort_key = Some("title".to_string());
+        let CheckpointClaim::Claimed(claimed) = running.begin_with_lease(
+            running.generation,
+            "2026-09-27T00:00:00Z",
+            "token".to_string(),
+            "2026-09-27T00:02:00Z".to_string(),
+        ) else {
+            panic!("running generation should be reclaimable")
+        };
+        assert_eq!(claimed.scan_sort_key.as_deref(), Some("title"));
+        assert_eq!(claimed.advance(7).scan_sort_key.as_deref(), Some("title"));
+        // 完了・新規世代では消える。
+        assert_eq!(claimed.finish("2026-09-27T00:03:00Z").scan_sort_key, None);
+    }
+
+    #[test]
+    fn extract_novel_ids_matches_native_token_rule() {
+        // Same rule the native queue applies (`crate::queue::extract_novel_ids`
+        // delegates here): only bare i64 tokens count.
+        assert!(extract_novel_ids("").is_empty());
+        assert!(extract_novel_ids("tag:modified").is_empty());
+        assert!(extract_novel_ids("*").is_empty());
+        assert!(extract_novel_ids("n1234ab").is_empty());
+        assert!(extract_novel_ids("https://example.com/n/1").is_empty());
+        assert_eq!(extract_novel_ids("12"), HashSet::from([12]));
+        assert_eq!(extract_novel_ids("12\tkindle"), HashSet::from([12]));
+        assert_eq!(extract_novel_ids("1\t2\t3"), HashSet::from([1, 2, 3]));
+        assert_eq!(extract_novel_ids("--force\t12\ttag:modified"), HashSet::from([12]));
+        assert_eq!(extract_novel_ids("12\t\t34\tabc\t1.5"), HashSet::from([12, 34]));
+        assert_eq!(extract_novel_ids("-7"), HashSet::from([-7]));
+    }
+
+    /// The ledger claim statements run verbatim against rusqlite: two
+    /// envelopes for the same novel must never both become `running`, a
+    /// `retryable` row inside its backoff hold is not claimable, and the
+    /// exclusion never blocks unrelated novels or non-novel targets.
+    #[cfg(feature = "native-runtime")]
+    mod claim_sql {
+        use super::super::worker_ledger::{claim_fresh, claim_reclaim};
+        use rusqlite::Connection;
+
+        fn db() -> Connection {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE worker_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    options TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    dedupe_key TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    lease_until TEXT,
+                    execution_token TEXT,
+                    checkpoint_json TEXT
+                ) STRICT;",
+            )
+            .unwrap();
+            conn
+        }
+
+        fn insert(conn: &Connection, job_id: &str, target: &str, status: &str, lease: Option<&str>) {
+            conn.execute(
+                "INSERT INTO worker_jobs (job_id, kind, target, status, dedupe_key, created_at, updated_at, lease_until)
+                 VALUES (?, 'update', ?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?)",
+                rusqlite::params![job_id, target, status, format!("{status}:{job_id}"), lease],
+            )
+            .unwrap();
+        }
+
+        fn status_of(conn: &Connection, job_id: &str) -> String {
+            conn.query_row(
+                "SELECT status FROM worker_jobs WHERE job_id = ?",
+                [job_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+
+        const NOW: &str = "2026-01-01T00:10:00Z";
+        const LEASE: &str = "2026-01-01T00:25:00Z";
+
+        #[test]
+        fn same_novel_cannot_run_twice_across_kinds() {
+            let conn = db();
+            // A running update for novel 42 (as produced by `update:42:`).
+            insert(&conn, "j-upd", "42", "running", Some(LEASE));
+            // A pending convert (`convert:42:`) — a different dedupe key and
+            // kind, but the same novel.
+            insert(&conn, "j-conv", "42", "pending", None);
+            // An unrelated pending update for novel 99.
+            insert(&conn, "j-99", "99", "pending", None);
+
+            // The conflicting claim must not flip j-conv to running.
+            let stmt = claim_fresh(NOW, LEASE, "tok-b", "j-conv", "42");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0, "conflicting claim must not run");
+            assert_eq!(status_of(&conn, "j-conv"), "pending");
+
+            // The unrelated novel claims normally.
+            let stmt = claim_fresh(NOW, LEASE, "tok-c", "j-99", "99");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+            assert_eq!(status_of(&conn, "j-99"), "running");
+        }
+
+        #[test]
+        fn conflicting_reclaim_is_blocked_and_self_row_is_not_a_conflict() {
+            let conn = db();
+            // j-stale is running with an expired lease for novel 7.
+            insert(&conn, "j-stale", "7", "running", Some("2026-01-01T00:01:00Z"));
+            // Another running job holds novel 7? Impossible in practice —
+            // the exclusion made it so — but a *different* novel running
+            // must not block the reclaim.
+            insert(&conn, "j-other", "8", "running", Some(LEASE));
+
+            // Reclaiming j-stale must succeed (its own running row is not a
+            // self-conflict).
+            let stmt = claim_reclaim(NOW, LEASE, "tok-r", "j-stale", "7");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1, "expired lease is reclaimable");
+
+            // But a pending job for novel 8 is blocked by j-other.
+            insert(&conn, "j-blocked", "8", "pending", None);
+            let stmt = claim_fresh(NOW, LEASE, "tok-x", "j-blocked", "8");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0);
+        }
+
+        #[test]
+        fn backoff_hold_keeps_retryable_unclaimable_until_due() {
+            let conn = db();
+            // record_attempt wrote lease_until = now + backoff.
+            insert(&conn, "j-retry", "42", "retryable", Some("2026-01-01T00:11:00Z"));
+
+            // Before the hold elapses the row is not claimable even though
+            // no conflicting job runs.
+            let stmt = claim_fresh(NOW, LEASE, "tok-e", "j-retry", "42");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0, "backoff hold must block the claim");
+            assert_eq!(status_of(&conn, "j-retry"), "retryable");
+
+            // At/after the hold the same row claims normally.
+            let stmt = claim_fresh("2026-01-01T00:11:00Z", LEASE, "tok-f", "j-retry", "42");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+
+            // Legacy retryable rows without a hold remain claimable.
+            insert(&conn, "j-legacy", "55", "retryable", None);
+            let stmt = claim_fresh(NOW, LEASE, "tok-g", "j-legacy", "55");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+        }
+
+        #[test]
+        fn non_novel_targets_never_conflict() {
+            let conn = db();
+            insert(&conn, "j-nc", "n1234ab", "running", Some(LEASE));
+            insert(&conn, "j-nc2", "n1234ab", "pending", None);
+            // ncode targets carry no numeric id: native parity says no lock.
+            let stmt = claim_fresh(NOW, LEASE, "tok-h", "j-nc2", "n1234ab");
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+        }
+    }
+
+    /// The reaper statements run verbatim against rusqlite — the regression
+    /// pin for "a `retryable` row whose scheduled redelivery was lost to the
+    /// DLQ stays `待機中` forever": before the reaper existed nothing moved
+    /// such a row, and these statements are the ones that either re-enqueue
+    /// it (fresh delivery budget → normal claim path) or finalize it once
+    /// its retry budget is spent.
+    #[cfg(feature = "native-runtime")]
+    mod reaper_sql {
+        use super::super::worker_ledger::{finalize_stuck, mark_reenqueue, select_stuck};
+        use rusqlite::Connection;
+
+        fn db() -> Connection {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE worker_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    options TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    dedupe_key TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    lease_until TEXT,
+                    execution_token TEXT,
+                    checkpoint_json TEXT
+                ) STRICT;",
+            )
+            .unwrap();
+            conn
+        }
+
+        fn insert(
+            conn: &Connection,
+            job_id: &str,
+            status: &str,
+            attempts: i64,
+            updated_at: &str,
+            lease: Option<&str>,
+        ) {
+            conn.execute(
+                "INSERT INTO worker_jobs (job_id, kind, target, status, dedupe_key, attempts, created_at, updated_at, lease_until)
+                 VALUES (?, 'update', '42', ?, ?, ?, '2026-01-01T00:00:00Z', ?, ?)",
+                rusqlite::params![
+                    job_id,
+                    status,
+                    format!("{status}:{job_id}"),
+                    attempts,
+                    updated_at,
+                    lease
+                ],
+            )
+            .unwrap();
+        }
+
+        fn row_of(conn: &Connection, job_id: &str) -> (String, String) {
+            conn.query_row(
+                "SELECT status, updated_at FROM worker_jobs WHERE job_id = ?",
+                [job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        }
+
+        fn stuck_ids(conn: &Connection, stuck_before: &str) -> Vec<String> {
+            let statement = select_stuck(stuck_before, 50);
+            let mut query = conn.prepare(&statement.sql).unwrap();
+            query
+                .query_map(rusqlite::params_from_iter(statement.binds.iter()), |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        }
+
+        /// `2026-01-01T00:10:00Z` を reaper の実行時刻とし、猶予 2 分
+        /// (worker_entry::scheduler::STUCK_GRACE) を引いた検出境界。
+        const STUCK_BEFORE: &str = "2026-01-01T00:08:00Z";
+        const NOW: &str = "2026-01-01T00:10:00Z";
+
+        #[test]
+        fn lost_retryable_redelivery_is_requeued_then_finalized() {
+            let conn = db();
+            // 403 失敗 → record_attempt が attempts=1, lease=backoff 終了済み。
+            // 配信が DLQ に落ちて二度と来ない行。
+            insert(
+                &conn,
+                "j-lost",
+                "retryable",
+                1,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:01:00Z"),
+            );
+
+            // 検出: ホールド切れの retryable が拾える。
+            assert_eq!(stuck_ids(&conn, STUCK_BEFORE), vec!["j-lost"]);
+
+            // 再投入: CAS が通り updated_at が進む → 1 通だけ envelope を送る。
+            let stmt = mark_reenqueue(NOW, "j-lost", STUCK_BEFORE);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+            assert_eq!(row_of(&conn, "j-lost"), ("retryable".into(), NOW.into()));
+
+            // 同じ tick の CAS は二度目を通さない (updated_at > stuck_before)。
+            let stmt = mark_reenqueue(NOW, "j-lost", STUCK_BEFORE);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0, "a touched row must not be re-sent twice");
+            // 検出対象からも外れる (次の猶予までは再送しない)。
+            assert!(stuck_ids(&conn, STUCK_BEFORE).is_empty());
+
+            // リトライ枠を使い切った行 (attempts >= max_retries=3) は
+            // permanent に確定する。
+            insert(
+                &conn,
+                "j-spent",
+                "retryable",
+                3,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:01:00Z"),
+            );
+            let stmt = finalize_stuck(
+                "retries exhausted and the scheduled redelivery was lost",
+                NOW,
+                "j-spent",
+                STUCK_BEFORE,
+                3,
+            );
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 1);
+            assert_eq!(
+                row_of(&conn, "j-spent").0,
+                "permanent",
+                "spent retryable must finalize instead of re-enqueue"
+            );
+        }
+
+        #[test]
+        fn stuck_selection_covers_pending_and_expired_running_only() {
+            let conn = db();
+            // 配信が失われた pending (lease NULL → updated_at で判定)。
+            insert(&conn, "j-pend", "pending", 0, "2026-01-01T00:00:00Z", None);
+            // まだ新しい pending は拾わない (配信中の可能性を潰さない)。
+            insert(&conn, "j-fresh", "pending", 0, "2026-01-01T00:09:00Z", None);
+            // バックオフ中の retryable は拾わない (再配信が予定されている)。
+            insert(
+                &conn,
+                "j-held",
+                "retryable",
+                1,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:30:00Z"),
+            );
+            // lease 切れ running (claim 側が死亡) は拾う。
+            insert(
+                &conn,
+                "j-dead",
+                "running",
+                0,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:05:00Z"),
+            );
+            // 生きている running は拾わない。
+            insert(
+                &conn,
+                "j-live",
+                "running",
+                0,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:30:00Z"),
+            );
+            // 終端行は拾わない。
+            insert(
+                &conn,
+                "j-done",
+                "permanent",
+                3,
+                "2026-01-01T00:00:00Z",
+                None,
+            );
+
+            let ids = stuck_ids(&conn, STUCK_BEFORE);
+            assert_eq!(ids.len(), 2);
+            assert!(ids.contains(&"j-pend".to_string()));
+            assert!(ids.contains(&"j-dead".to_string()));
+        }
+
+        #[test]
+        fn finalize_cas_refuses_rows_that_moved_on() {
+            let conn = db();
+            // まだ枠が残っている retryable は finalize しない (再投入される)。
+            insert(
+                &conn,
+                "j-young",
+                "retryable",
+                1,
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:01:00Z"),
+            );
+            let stmt = finalize_stuck("reason", NOW, "j-young", STUCK_BEFORE, 3);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0);
+            assert_eq!(row_of(&conn, "j-young").0, "retryable");
+
+            // 配信が既に claim して running へ進んだ行は finalize しない。
+            insert(
+                &conn,
+                "j-claimed",
+                "running",
+                3,
+                "2026-01-01T00:09:00Z",
+                Some("2026-01-01T00:25:00Z"),
+            );
+            let stmt = finalize_stuck("reason", NOW, "j-claimed", STUCK_BEFORE, 3);
+            let changed = conn
+                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
+                .unwrap();
+            assert_eq!(changed, 0);
+            assert_eq!(row_of(&conn, "j-claimed").0, "running");
+        }
     }
 }

@@ -72,7 +72,10 @@ mod tests {
 
         jobs.insert("https://example.com/a".to_string(), Value::Null);
         assert!(jobs.contains("https://example.com/a"));
-        assert_eq!(jobs.results().get("https://example.com/a"), Some(&Value::Null));
+        assert_eq!(
+            jobs.results().get("https://example.com/a"),
+            Some(&Value::Null)
+        );
 
         jobs.reset();
         assert!(jobs.is_empty());

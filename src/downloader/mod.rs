@@ -34,9 +34,9 @@ use self::novel_info::NovelInfo;
 use self::persistence::section_filename;
 use self::persistence::{PersistenceService, compute_section_hash};
 
-use crate::platform::{CookieStore, LoginCredential};
+use crate::platform::{CookieStore, LoginGroup};
 use self::section::{SectionCache, download_section};
-use self::security::is_safe_public_url;
+use self::security::is_safe_public_url_syntax;
 use self::settings::DownloaderSettings;
 use self::site_setting::SiteSetting;
 use self::toc::{
@@ -46,6 +46,7 @@ use self::util::{
     build_section_url, compile_html_pattern, load_length_limit, mask_spoiler_text,
     sanitize_filename_with_limit,
 };
+use crate::application::messages;
 use crate::db::novel_record::NovelRecord;
 use crate::error::{NarouError, Result};
 use crate::platform::{
@@ -83,6 +84,43 @@ pub struct DownloadExecutionOptions<'a> {
     pub resume_from_section: Option<usize>,
 }
 
+/// Platform services every [`Downloader`] constructor needs. Bundles the
+/// injected ports so the constructors take them as one argument.
+pub struct DownloaderPlatform {
+    pub http: Arc<dyn HttpClient>,
+    pub rate_limiter: Arc<dyn RateLimiter>,
+    pub novels: Arc<dyn NovelRepository>,
+    pub objects: Arc<dyn ObjectStore>,
+    pub assets: Arc<dyn AssetStore>,
+    pub clock: Arc<dyn Clock>,
+}
+
+/// What [`Downloader::process_digest`] needs to drive the interactive digest
+/// prompt: the shrunk TOC counts plus the handles its actions touch.
+struct DigestContext<'a> {
+    existing_id: Option<i64>,
+    toc_url: &'a str,
+    novel_dir: &'a Path,
+    title: &'a str,
+    latest_story: &'a str,
+    old_count: usize,
+    latest_count: usize,
+}
+
+/// One [`Downloader::section_needs_download`] probe: the latest and stored
+/// subtitle rows plus the cache/state handles the decision consults.
+struct SectionDecision<'a> {
+    setting: &'a SiteSetting,
+    latest: &'a SubtitleInfo,
+    old: Option<&'a SubtitleInfo>,
+    existing_id: Option<i64>,
+    keys: &'a NovelObjectKeys,
+    toc_url: &'a str,
+    strong_update: bool,
+    timezone: SiteTimezone,
+    existed: bool,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum SiteTimezone {
     Named(Tz),
@@ -90,7 +128,7 @@ pub(crate) enum SiteTimezone {
 }
 
 impl SiteTimezone {
-    fn from_local_datetime(self, dt: NaiveDateTime) -> Option<DateTime<Utc>> {
+    fn resolve_local_datetime(self, dt: NaiveDateTime) -> Option<DateTime<Utc>> {
         match self {
             Self::Named(tz) => match tz.from_local_datetime(&dt) {
                 LocalResult::Single(local) | LocalResult::Ambiguous(local, _) => {
@@ -119,7 +157,6 @@ impl SiteTimezone {
             }
         }
     }
-
 }
 
 pub struct Downloader {
@@ -138,33 +175,37 @@ pub struct Downloader {
     cookies: Option<Arc<dyn CookieStore>>,
     settings: Arc<dyn DownloaderSettings>,
     progress: Option<Box<dyn ProgressReporter>>,
+    /// ユーザーに見える行の送り先。`None` は従来動作 (native は
+    /// `safe_println` / `safe_stderr_println`、Worker は tracing) に
+    /// フォールバックする。`set_message_sink` で差し替える。
+    message_sink: Option<Arc<dyn crate::application::messages::MessageSink>>,
     /// Results of URLs that `preprocess:` runs asked for. Lives for one novel
     /// download so repeated references (e.g. one illustration used by many
     /// sections of a series) resolve once.
     preprocess_jobs: super::downloader::preprocess::PreprocessJobs,
 }
 
-/// Report a status line. Native prints to stdout atomically; Worker routes to
-/// the trace log (no terminal on the platform).
+/// Fallback used when no message sink is installed (native: the original
+/// `safe_println`; Worker: the trace log — no terminal on the platform).
 #[cfg(feature = "native-runtime")]
-fn report_line(line: &str) {
+fn default_report_line(line: &str) {
     crate::progress::safe_println(line);
 }
 
 #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
-fn report_line(line: &str) {
+fn default_report_line(line: &str) {
     tracing::debug!("{line}");
 }
 
-/// Report a warning line. Native prints to stderr; Worker routes to the trace
-/// log.
+/// Fallback used when no message sink is installed (native: the original
+/// `safe_stderr_println`; Worker: the trace log).
 #[cfg(feature = "native-runtime")]
-fn report_warn(line: &str) {
+fn default_report_warn(line: &str) {
     crate::progress::safe_stderr_println(line);
 }
 
 #[cfg(all(feature = "worker-runtime", not(feature = "native-runtime")))]
-fn report_warn(line: &str) {
+fn default_report_warn(line: &str) {
     tracing::warn!("{line}");
 }
 
@@ -418,12 +459,12 @@ fn parse_loose_datetime_with_timezone(
 
     for fmt in &formats {
         if let Ok(dt) = NaiveDateTime::parse_from_str(&value, fmt) {
-            return timezone.from_local_datetime(dt);
+            return timezone.resolve_local_datetime(dt);
         }
         if let Ok(date) = NaiveDate::parse_from_str(&value, fmt) {
             return date
                 .and_hms_opt(0, 0, 0)
-                .and_then(|dt| timezone.from_local_datetime(dt));
+                .and_then(|dt| timezone.resolve_local_datetime(dt));
         }
     }
 
@@ -497,27 +538,39 @@ pub fn parse_datetime_with_timezone(value: &str, timezone: Option<&str>) -> Opti
     parse_loose_datetime_with_timezone(value, site_timezone(timezone))
 }
 
+/// ブラウザ風の既定 User-Agent。`ua_generator` を持たないビルド (Worker) 用。
+///
+/// 空の User-Agent で送ると多くのサイトが 403 を返すため、どちらのビルドでも
+/// 必ず何かしらの UA を送る (native は `ua_generator` のランダム値)。
+pub const DEFAULT_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0";
+
 /// Resolve the CLI/saved user-agent, randomizing the value for `auto`/
-/// `random`. Native-only: requires the `ua_generator` randomizer; Worker
-/// builds inject their own user agent through the platform `HttpClient`.
-#[cfg(feature = "native-runtime")]
-pub(crate) fn resolve_user_agent(
-    user_agent: Option<&str>,
-    saved_user_agent: Option<String>,
-) -> String {
+/// `random`. `ua_generator` は native ビルドでのみ使う。
+pub fn resolve_user_agent(user_agent: Option<&str>, saved_user_agent: Option<String>) -> String {
     let is_auto = |ua: &str| {
         let trimmed = ua.trim();
         trimmed.is_empty()
             || trimmed.eq_ignore_ascii_case("auto")
             || trimmed.eq_ignore_ascii_case("random")
     };
+    let randomized = || -> String {
+        #[cfg(feature = "native-runtime")]
+        {
+            ua_generator::ua::spoof_firefox_ua().to_string()
+        }
+        #[cfg(not(feature = "native-runtime"))]
+        {
+            DEFAULT_USER_AGENT.to_string()
+        }
+    };
     match user_agent {
-        Some(ua) if is_auto(ua) => ua_generator::ua::spoof_firefox_ua().to_string(),
+        Some(ua) if is_auto(ua) => randomized(),
         Some(ua) if !ua.trim().is_empty() => ua.to_string(),
         _ => match saved_user_agent {
-            Some(ua) if is_auto(&ua) => ua_generator::ua::spoof_firefox_ua().to_string(),
+            Some(ua) if is_auto(&ua) => randomized(),
             Some(ua) if !ua.trim().is_empty() => ua,
-            _ => ua_generator::ua::spoof_firefox_ua().to_string(),
+            _ => randomized(),
         },
     }
 }
@@ -628,62 +681,226 @@ impl Downloader {
     }
 
     /// Load the stored login cookie for `host`, when a store is available.
-    /// 保存済みの資格情報を試行順で返す。
-    async fn stored_credentials_for(&self, host: Option<&str>) -> Vec<LoginCredential> {
+    /// そのサイトに保存されたログインを試行順で返す。
+    async fn stored_groups_for(&self, setting: &SiteSetting) -> Vec<LoginGroup> {
         let Some(cookies) = self.cookies.as_ref() else {
             return Vec::new();
         };
-        let Some(host) = host else {
-            return Vec::new();
-        };
-        cookies.load_all(host).await.unwrap_or_default()
+        cookies
+            .load_groups(&setting.domain)
+            .await
+            .unwrap_or_default()
     }
+
+    /// Fetch an author page and list the work URLs its definition finds.
+    ///
+    /// Uses the same transport and rate limiter as a novel fetch, so a site
+    /// that spaces requests (Pixiv, なろう) is spaced here too. A definition
+    /// without `author_novel_pattern` yields no URLs.
+    pub async fn author_novel_urls(
+        &self,
+        setting: &SiteSetting,
+        page_url: &str,
+    ) -> Result<Vec<String>> {
+        if setting.author_novel_urls("").is_none() {
+            return Err(NarouError::SiteSetting(format!(
+                "{} に author_novel_pattern がありません",
+                setting.sitename
+            )));
+        }
+        let mut setting = setting.clone();
+        // 保存済みのログインがあれば作者ページにも送る (ログインが要る作者ページ
+        // のため)。無ければ定義の cookie だけで取得する。
+        let groups = self.stored_groups_for(&setting).await;
+        if let Some(group) = groups.first().map(|group| group.merged_cookie()) {
+            setting.cookie = crate::platform::merge_cookie_headers(setting.cookie(), Some(&group));
+        }
+        let setting = &setting;
+        let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
+        // Sites with an author API (なろう) answer with JSON instead of HTML.
+        let mut fetch_url = setting.author_fetch_url(page_url);
+        let mut urls: Vec<String> = Vec::new();
+        // Pixiv は 1 話ずつが作者の作品一覧に混ざる。定義が出す
+        // `author_series::<id>` を集めておき、その回の話を後で除く。
+        let mut series: Vec<String> = Vec::new();
+        // 漫画シリーズの各ページも単体イラスト一覧に混ざる。
+        let mut comic_series: Vec<String> = Vec::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // 一覧がページ分けされているサイト (ハーメルン) は次ページを辿る。
+        // 次ページが無くなるか、既に訪れた URL に戻ったら終わり。訪問済みを
+        // 覚えているのでページ数の上限は要らない。
+        loop {
+            if !visited.insert(fetch_url.clone()) {
+                break;
+            }
+            let mut body = crate::downloader::http_policy::fetch_text(
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
+                &fetch_url,
+                &policy,
+                Some(setting.encoding()),
+            )
+            .await?;
+            // `preprocess:` の DSL が `author_novel::` / `author_series::` を
+            // 出せるように、本文を定義に通してから読み取る。
+            crate::downloader::util::pretreatment_source(
+                &mut body,
+                setting.encoding(),
+                Some(setting),
+            );
+            for url in setting.author_novel_urls(&body).unwrap_or_default() {
+                if !urls.contains(&url) {
+                    urls.push(url);
+                }
+            }
+            for id in setting.author_series_ids(&body) {
+                if !series.contains(&id) {
+                    series.push(id);
+                }
+            }
+            for id in setting.author_comic_series_ids(&body) {
+                if !comic_series.contains(&id) {
+                    comic_series.push(id);
+                }
+            }
+            match setting.author_next_url(&body) {
+                Some(next) => fetch_url = next,
+                None => break,
+            }
+        }
+        // シリーズに属する話/ページは作者の作品ではないので落とす (取得できなければ
+        // そのまま返す: 一覧の取りこぼしより、余分に足さない方が害が小さい)。
+        let mut inside_series: Vec<String> = Vec::new();
+        if !series.is_empty()
+            && setting.author_series_episodes_url.is_some()
+            && let Ok(ids) = self.author_series_episodes(setting, page_url, &series).await
+        {
+            inside_series.extend(ids);
+        }
+        if !comic_series.is_empty()
+            && setting.author_comic_series_pages_url.is_some()
+            && let Ok(ids) = self.author_comic_series_pages(setting, page_url, &comic_series).await
+        {
+            inside_series.extend(ids);
+        }
+        if !inside_series.is_empty() {
+            urls.retain(|url| !inside_series.iter().any(|id| url_mentions_id(url, id)));
+        }
+        Ok(urls)
+    }
+
+    /// Artwork ids of the given comic series, read page by page until a page
+    /// stops adding anything (Pixiv returns 12 artworks per page).
+    ///
+    /// Best effort like [`Self::author_series_episodes`].
+    async fn author_comic_series_pages(
+        &self,
+        setting: &SiteSetting,
+        page_url: &str,
+        series: &[String],
+    ) -> Result<Vec<String>> {
+        const MAX_PAGES: usize = 100;
+        let captures = setting
+            .extract_author_url_captures(page_url)
+            .unwrap_or_default();
+        let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
+        let mut pages: Vec<String> = Vec::new();
+        for series_id in series {
+            for page in 1..=MAX_PAGES {
+                let Some(url) =
+                    setting.author_comic_series_pages_fetch_url(&captures, series_id, page)
+                else {
+                    break;
+                };
+                let Ok(body) = crate::downloader::http_policy::fetch_text(
+                    self.http.as_ref(),
+                    self.rate_limiter.as_ref(),
+                    &url,
+                    &policy,
+                    Some(setting.encoding()),
+                )
+                .await
+                else {
+                    break;
+                };
+                let ids = setting.author_comic_series_page_ids(&body);
+                if ids.is_empty() {
+                    break;
+                }
+                let before = pages.len();
+                for id in ids {
+                    if !pages.contains(&id) {
+                        pages.push(id);
+                    }
+                }
+                if pages.len() == before {
+                    // 同じページが返り続ける定義でも止まる。
+                    break;
+                }
+            }
+        }
+        Ok(pages)
+    }
+
+    /// Episode ids of the given series, fetched through the definition.
+    ///
+    /// Best effort: a series that cannot be read contributes nothing, so its
+    /// episodes stay in the listing instead of silently vanishing.
+    async fn author_series_episodes(
+        &self,
+        setting: &SiteSetting,
+        page_url: &str,
+        series: &[String],
+    ) -> Result<Vec<String>> {
+        let captures = setting
+            .extract_author_url_captures(page_url)
+            .unwrap_or_default();
+        let policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
+        let mut episodes: Vec<String> = Vec::new();
+        for series_id in series {
+            let Some(url) = setting.author_series_episodes_fetch_url(&captures, series_id) else {
+                continue;
+            };
+            let Ok(body) = crate::downloader::http_policy::fetch_text(
+                self.http.as_ref(),
+                self.rate_limiter.as_ref(),
+                &url,
+                &policy,
+                Some(setting.encoding()),
+            )
+            .await
+            else {
+                continue;
+            };
+            for id in setting.author_series_episode_ids(&body) {
+                if !episodes.contains(&id) {
+                    episodes.push(id);
+                }
+            }
+        }
+        Ok(episodes)
+    }
+
 
     /// [`Self::with_platform_and_storage_and_settings`] with bundled values.
     #[cfg(feature = "native-runtime")]
-    pub fn with_platform_and_storage(
-        http: Arc<dyn HttpClient>,
-        rate_limiter: Arc<dyn RateLimiter>,
-        novels: Arc<dyn NovelRepository>,
-        objects: Arc<dyn ObjectStore>,
-        assets: Arc<dyn AssetStore>,
-        clock: Arc<dyn Clock>,
-    ) -> Result<Self> {
-        let site_settings = SiteSetting::load_all()?;
+    pub fn with_platform_and_storage(platform: DownloaderPlatform) -> Result<Self> {
+        let site_settings = crate::downloader::site_setting::effective_site_settings();
         let settings = crate::downloader::settings::default_settings();
         let section_hash_cache = settings.load_section_hash_cache();
-        Self::with_platform_and_storage_and_settings(
-            http,
-            rate_limiter,
-            novels,
-            objects,
-            assets,
-            clock,
-            site_settings,
-            section_hash_cache,
-        )
+        Self::with_platform_and_storage_and_settings(platform, site_settings, section_hash_cache)
     }
 
     /// Build the downloader without loading site definitions or Inventory.
     ///
     /// Worker callers and filesystem-free tests supply both values explicitly.
     pub fn with_platform_and_storage_and_settings(
-        http: Arc<dyn HttpClient>,
-        rate_limiter: Arc<dyn RateLimiter>,
-        novels: Arc<dyn NovelRepository>,
-        objects: Arc<dyn ObjectStore>,
-        assets: Arc<dyn AssetStore>,
-        clock: Arc<dyn Clock>,
+        platform: DownloaderPlatform,
         site_settings: Vec<SiteSetting>,
         section_hash_cache: HashMap<String, HashMap<String, String>>,
     ) -> Result<Self> {
         Self::with_platform_and_storage_and_settings_and_support(
-            http,
-            rate_limiter,
-            novels,
-            objects,
-            assets,
-            clock,
+            platform,
             site_settings,
             section_hash_cache,
             crate::downloader::settings::default_settings(),
@@ -695,16 +912,19 @@ impl Downloader {
     /// shorter constructor). Worker callers can supply bundled settings here
     /// without any filesystem access.
     pub fn with_platform_and_storage_and_settings_and_support(
-        http: Arc<dyn HttpClient>,
-        rate_limiter: Arc<dyn RateLimiter>,
-        novels: Arc<dyn NovelRepository>,
-        objects: Arc<dyn ObjectStore>,
-        assets: Arc<dyn AssetStore>,
-        clock: Arc<dyn Clock>,
+        platform: DownloaderPlatform,
         site_settings: Vec<SiteSetting>,
         section_hash_cache: HashMap<String, HashMap<String, String>>,
         settings: Arc<dyn DownloaderSettings>,
     ) -> Result<Self> {
+        let DownloaderPlatform {
+            http,
+            rate_limiter,
+            novels,
+            objects,
+            assets,
+            clock,
+        } = platform;
         let persistence =
             PersistenceService::with_clock(objects.clone(), assets.clone(), clock.clone());
 
@@ -722,6 +942,7 @@ impl Downloader {
             section_hash_cache_dirty: false,
             settings,
             progress: None,
+            message_sink: None,
             preprocess_jobs: super::downloader::preprocess::PreprocessJobs::new(),
         })
     }
@@ -820,16 +1041,16 @@ impl Downloader {
                 create_short_story_subtitles(&setting, &toc_source, &info).ok()
             } else {
                 let title = info.title.as_deref().unwrap_or("");
-                parse_subtitles_multipage(
-                    self.http.as_ref(),
-                    self.rate_limiter.as_ref(),
-                    &setting,
-                    &toc_source,
-                    &url_captures,
+                parse_subtitles_multipage(toc::MultipageTocRequest {
+                    http: self.http.as_ref(),
+                    rate_limiter: self.rate_limiter.as_ref(),
+                    setting: &setting,
+                    toc_source: &toc_source,
+                    url_captures: &url_captures,
                     title,
-                    self.progress.as_deref(),
-                    &mut self.preprocess_jobs,
-                )
+                    progress: self.progress.as_deref(),
+                    jobs: &mut self.preprocess_jobs,
+                })
                 .await
                 .ok()
                 .map(|(subtitles, _partial)| subtitles)
@@ -857,26 +1078,23 @@ impl Downloader {
         Ok((novelupdated_at, general_lastup, info.length, is_end))
     }
 
-    async fn process_digest(
-        &self,
-        existing_id: Option<i64>,
-        toc_url: &str,
-        novel_dir: &Path,
-        title: &str,
-        latest_story: &str,
-        old_count: usize,
-        latest_count: usize,
-    ) -> Result<bool> {
+    async fn process_digest(&self, digest: DigestContext<'_>) -> Result<bool> {
+        let DigestContext {
+            existing_id,
+            toc_url,
+            novel_dir,
+            title,
+            latest_story,
+            old_count,
+            latest_count,
+        } = digest;
         #[cfg(feature = "native-runtime")]
         {
             if latest_count >= old_count {
                 return Ok(false);
             }
 
-            let mut message = format!(
-                "更新後の話数が保存されている話数より減少していることを検知しました。\nダイジェスト化されている可能性があるので、更新に関しての処理を選択して下さい。\n\n保存済み話数: {}\n更新後の話数: {}\n\n",
-                old_count, latest_count
-            );
+            let mut message = messages::download::digest_detected_prompt(old_count, latest_count);
 
             let mut auto_choices = crate::compat::load_digest_auto_choices();
 
@@ -896,11 +1114,11 @@ impl Downloader {
                     }
                     crate::compat::DigestChoice::Backup => {
                         let backup_name = crate::compat::create_backup(novel_dir, title)?;
-                        println!("{} を作成しました", backup_name);
+                        self.report_line(&messages::download::backup_created(backup_name));
                     }
                     crate::compat::DigestChoice::ShowStory => {
-                        println!("あらすじ");
-                        println!("{}", latest_story);
+                        self.report_line(messages::download::story_label());
+                        self.report_line(latest_story);
                     }
                     crate::compat::DigestChoice::OpenBrowser => {
                         crate::compat::open_browser(toc_url);
@@ -967,8 +1185,10 @@ impl Downloader {
         };
 
         let re = compile_html_pattern(illust_url_pattern).map_err(NarouError::Regex)?;
-        let storage =
-            crate::illustration_store::IllustrationStorageService::new(self.assets.clone());
+        let storage = crate::illustration_store::IllustrationStorageService::new(
+            self.assets.clone(),
+        )
+        .with_dedup(crate::illustration_store::dedup_active());
         // Illustration hosts (i.pximg.net) reject requests without the site's
         // headers, and login-only images need the same cookie jar.
         let illustration_policy = crate::downloader::http_policy::FetchPolicy::for_site(setting);
@@ -986,8 +1206,8 @@ impl Downloader {
                 }
                 let resolved = build_section_url(setting, toc_url, raw_url);
                 let url = resolved.as_str();
-                if !is_safe_public_url(url) {
-                    report_warn(&format!("WARN: skipping unsafe illustration URL: {url}"));
+                if self.http.validate_url(url).await.is_err() {
+                    self.report_warn(&messages::download::warn_unsafe_illustration_url(url));
                     continue;
                 }
 
@@ -1019,8 +1239,8 @@ impl Downloader {
                             ) {
                                 Some(Ok(apng)) => (apng, "image/png".to_string()),
                                 Some(Err(err)) => {
-                                    report_warn(&format!(
-                                        "WARN: failed to assemble animation {url}: {err}"
+                                    self.report_warn(&messages::download::warn_animation_assemble(
+                                        url, err,
                                     ));
                                     (response.body.clone(), content_type)
                                 }
@@ -1037,15 +1257,11 @@ impl Downloader {
                             .store_bytes(object_keys, illustration_store, url, &body, ext)
                             .await
                         {
-                            report_warn(&format!(
-                                "WARN: failed to save illustration {url}: {err}"
-                            ));
+                            self.report_warn(&messages::download::warn_illustration_save(url, err));
                         }
                     }
                     Err(err) => {
-                        report_warn(&format!(
-                            "WARN: failed to download illustration {url}: {err}"
-                        ));
+                        self.report_warn(&messages::download::warn_illustration_download(url, err));
                     }
                 }
             }
@@ -1115,7 +1331,8 @@ impl Downloader {
         target: &str,
         force: bool,
     ) -> Result<DownloadResult> {
-        self.download_novel_with_force_budget(target, force, None).await
+        self.download_novel_with_force_budget(target, force, None)
+            .await
     }
 
     /// Download a novel while yielding only before a new section starts.
@@ -1188,21 +1405,22 @@ impl Downloader {
         // Login fallback: a novel already flagged as needing authentication
         // sends the stored cookie from the first request; every other novel
         // stays anonymous until a fetch actually fails.
-        let login_host = crate::platform::cookie_host_for_url(&toc_url);
         let login_cookie = match existing_id {
             Some(id) => {
                 let record = self.novels.get(id.into()).await.ok().flatten();
                 let requires = record.as_ref().is_some_and(|record| record.requires_login);
                 if requires {
-                    // その小説で前に成功したセッションがあればそれを、無ければ
+                    // その小説で前に成功したログインがあればそれを、無ければ
                     // 一覧の先頭を最初のリクエストから送る。
-                    let credentials = self.stored_credentials_for(login_host.as_deref()).await;
+                    let groups = self.stored_groups_for(&setting).await;
                     let chosen = record
                         .as_ref()
                         .and_then(|record| record.login_session.as_deref())
-                        .and_then(|id| credentials.iter().find(|credential| credential.id == id))
-                        .or_else(|| credentials.first());
-                    chosen.map(|credential| credential.cookie.clone())
+                        .and_then(|id| groups.iter().find(|group| group.id == id))
+                        .or_else(|| groups.first());
+                    chosen
+                        .map(|group| group.merged_cookie())
+                        .filter(|cookie| !cookie.is_empty())
                 } else {
                     None
                 }
@@ -1226,8 +1444,7 @@ impl Downloader {
             .await
             {
                 Ok((final_url, _body)) if final_url != toc_url => {
-                    let final_url =
-                        Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
+                    let final_url = Self::ageauth_redirect_target(&final_url).unwrap_or(final_url);
                     if let Some(final_setting) = self.find_site_setting(&final_url) {
                         setting = final_setting;
                         (
@@ -1265,9 +1482,8 @@ impl Downloader {
             // The redirect probe already fetched the final URL with the same
             // cookie scope; reuse the body instead of a second GET.
             Some(response) => {
-                let response = crate::downloader::http_policy::ensure_success_response(
-                    &toc_url, response,
-                );
+                let response =
+                    crate::downloader::http_policy::ensure_success_response(&toc_url, response);
                 match response {
                     Ok(response) => {
                         let mut body = crate::downloader::http_policy::decode_with_encoding(
@@ -1280,36 +1496,38 @@ impl Downloader {
                         let policy =
                             crate::downloader::http_policy::FetchPolicy::for_site(&setting);
                         crate::downloader::util::pretreatment_source_with_jobs(
-                            self.http.as_ref(),
-                            self.rate_limiter.as_ref(),
-                            &policy,
-                            &mut body,
-                            setting.encoding(),
-                            Some(&setting),
-                            &mut self.preprocess_jobs,
-                            &toc_url,
+                            crate::downloader::util::PretreatmentRequest {
+                                http: self.http.as_ref(),
+                                rate_limiter: self.rate_limiter.as_ref(),
+                                policy: &policy,
+                                src: &mut body,
+                                encoding: setting.encoding(),
+                                setting: Some(&setting),
+                                jobs: &mut self.preprocess_jobs,
+                                url: &toc_url,
+                            },
                         )
                         .await?;
                         if let Some(re) = setting.compiled_error_message_pattern()
                             && re.is_match(&body)
                         {
-                            return Err(NarouError::NotFound(
-                                "Novel deleted or private".into(),
-                            ));
+                            return Err(NarouError::NotFound("Novel deleted or private".into()));
                         }
                         Ok(body)
                     }
                     Err(error) => Err(error),
                 }
             }
-            None => fetch_toc(
-                self.http.as_ref(),
-                self.rate_limiter.as_ref(),
-                &setting,
-                &toc_url,
-                &mut self.preprocess_jobs,
-            )
-            .await,
+            None => {
+                fetch_toc(
+                    self.http.as_ref(),
+                    self.rate_limiter.as_ref(),
+                    &setting,
+                    &toc_url,
+                    &mut self.preprocess_jobs,
+                )
+                .await
+            }
         };
         // Login fallback: retry once with the stored cookie before treating the
         // novel as deleted. Nothing is sent when no cookie is stored, so sites
@@ -1320,14 +1538,14 @@ impl Downloader {
         if login_cookie.is_none() && (login_wall || partial_view) {
             // 保存済みの資格情報を順に試す。ログイン壁は成功した時点で、
             // 部分一覧は「欠けが消えた／話数が増えた」時点で打ち切る。
-            let credentials = self.stored_credentials_for(login_host.as_deref()).await;
-            if !credentials.is_empty() {
-                report_line("ログインが必要な可能性があります。保存済みのログイン情報で再試行します");
+            let groups = self.stored_groups_for(&setting).await;
+            if !groups.is_empty() {
+                self.report_line(messages::download::login_retry());
                 let base_cookie = setting.cookie.clone();
-                let mut winner: Option<LoginCredential> = None;
-                for credential in &credentials {
+                let mut winner: Option<LoginGroup> = None;
+                for group in &groups {
                     setting.cookie = base_cookie.clone();
-                    apply_login_cookie(&mut setting, &credential.cookie);
+                    apply_login_cookie(&mut setting, &group.merged_cookie());
                     let retried = fetch_toc(
                         self.http.as_ref(),
                         self.rate_limiter.as_ref(),
@@ -1342,25 +1560,25 @@ impl Downloader {
                                 .as_ref()
                                 .is_ok_and(|source| !setting.is_partial_login_view(source));
                             requires_login = true;
-                            login_session = Some(credential.id.clone());
+                            login_session = Some(group.id.clone());
                             toc_source = retried;
-                            winner = Some(credential.clone());
+                            winner = Some(group.clone());
                             if resolved {
                                 break;
                             }
                         }
                     } else if retried.is_ok() {
                         requires_login = true;
-                        login_session = Some(credential.id.clone());
+                        login_session = Some(group.id.clone());
                         toc_source = retried;
-                        winner = Some(credential.clone());
+                        winner = Some(group.clone());
                         break;
                     }
                 }
                 // 採用した資格情報を最終状態に残す（本文も同じ Cookie で取る）。
                 setting.cookie = base_cookie;
                 if let Some(winner) = &winner {
-                    apply_login_cookie(&mut setting, &winner.cookie);
+                    apply_login_cookie(&mut setting, &winner.merged_cookie());
                 }
             }
         }
@@ -1368,7 +1586,7 @@ impl Downloader {
             Ok(source) => source,
             Err(NarouError::NotFound(_)) if existing_id.is_some() => {
                 let id = existing_id.unwrap();
-                report_line("小説が削除されているか非公開な可能性があります");
+                self.report_line(messages::download::novel_unavailable());
                 #[cfg(feature = "native-runtime")]
                 {
                     let _ = crate::compat::mark_not_found_and_freeze(id);
@@ -1489,9 +1707,9 @@ impl Downloader {
         let previous_novel_dir = existing_record.as_ref().map(|record| {
             crate::db::existing_novel_dir_for_record(Path::new(types::ARCHIVE_ROOT_DIR), record)
         });
-        let strip_title_prefix = self
-            .settings
-            .strip_title_prefix_for(provisional_id, &raw_title, &author);
+        let strip_title_prefix =
+            self.settings
+                .strip_title_prefix_for(provisional_id, &raw_title, &author);
         let track_raw_title = strip_title_prefix
             || existing_record
                 .as_ref()
@@ -1506,16 +1724,16 @@ impl Downloader {
                 false,
             )
         } else {
-            parse_subtitles_multipage(
-                self.http.as_ref(),
-                self.rate_limiter.as_ref(),
-                &setting,
-                &toc_source,
-                &url_captures,
-                &title,
-                self.progress.as_deref(),
-                &mut self.preprocess_jobs,
-            )
+            parse_subtitles_multipage(toc::MultipageTocRequest {
+                http: self.http.as_ref(),
+                rate_limiter: self.rate_limiter.as_ref(),
+                setting: &setting,
+                toc_source: &toc_source,
+                url_captures: &url_captures,
+                title: &title,
+                progress: self.progress.as_deref(),
+                jobs: &mut self.preprocess_jobs,
+            })
             .await?
         };
 
@@ -1523,25 +1741,26 @@ impl Downloader {
         // シリーズは未ログインだと本文一覧が 0 件になる) は、保存済み Cookie で
         // 取り直し、話数が増えたときだけ採用する。
         if partial_listing && login_cookie.is_none() {
-            let credentials = self.stored_credentials_for(login_host.as_deref()).await;
-            if !credentials.is_empty() {
-                report_line("ログインが必要な可能性があります。保存済みのログイン情報で再試行します");
+            let groups = self.stored_groups_for(&setting).await;
+            if !groups.is_empty() {
+                self.report_line(messages::download::login_retry());
                 let base_cookie = setting.cookie.clone();
-                let mut winner: Option<LoginCredential> = None;
-                for credential in &credentials {
+                let mut winner: Option<LoginGroup> = None;
+                for group in &groups {
                     setting.cookie = base_cookie.clone();
-                    apply_login_cookie(&mut setting, &credential.cookie);
-                    let Ok((retried, retried_partial)) = parse_subtitles_multipage(
-                        self.http.as_ref(),
-                        self.rate_limiter.as_ref(),
-                        &setting,
-                        &toc_source,
-                        &url_captures,
-                        &title,
-                        self.progress.as_deref(),
-                        &mut self.preprocess_jobs,
-                    )
-                    .await
+                    apply_login_cookie(&mut setting, &group.merged_cookie());
+                    let Ok((retried, retried_partial)) =
+                        parse_subtitles_multipage(toc::MultipageTocRequest {
+                            http: self.http.as_ref(),
+                            rate_limiter: self.rate_limiter.as_ref(),
+                            setting: &setting,
+                            toc_source: &toc_source,
+                            url_captures: &url_captures,
+                            title: &title,
+                            progress: self.progress.as_deref(),
+                            jobs: &mut self.preprocess_jobs,
+                        })
+                        .await
                     else {
                         continue;
                     };
@@ -1549,8 +1768,8 @@ impl Downloader {
                         let resolved = !retried_partial;
                         subtitles = retried;
                         requires_login = true;
-                        login_session = Some(credential.id.clone());
-                        winner = Some(credential.clone());
+                        login_session = Some(group.id.clone());
+                        winner = Some(group.clone());
                         if resolved {
                             break;
                         }
@@ -1558,7 +1777,7 @@ impl Downloader {
                 }
                 setting.cookie = base_cookie;
                 if let Some(winner) = &winner {
-                    apply_login_cookie(&mut setting, &winner.cookie);
+                    apply_login_cookie(&mut setting, &winner.merged_cookie());
                 }
             }
         }
@@ -1625,15 +1844,15 @@ impl Downloader {
                 title.clone()
             };
             if self
-                .process_digest(
+                .process_digest(DigestContext {
                     existing_id,
-                    &toc_url,
-                    &novel_dir,
-                    &title_for_digest,
-                    &digest_story,
-                    old_section_count,
-                    subtitles.len(),
-                )
+                    toc_url: &toc_url,
+                    novel_dir: &novel_dir,
+                    title: &title_for_digest,
+                    latest_story: &digest_story,
+                    old_count: old_section_count,
+                    latest_count: subtitles.len(),
+                })
                 .await?
             {
                 return Ok(DownloadResult {
@@ -1699,8 +1918,7 @@ impl Downloader {
             .persistence
             .list_novel_object_names(&object_keys)
             .await?;
-        let existing_sections =
-            PersistenceService::existing_section_indices(&existing_names);
+        let existing_sections = PersistenceService::existing_section_indices(&existing_names);
 
         struct SectionPlan {
             is_new_arrival: bool,
@@ -1726,25 +1944,24 @@ impl Downloader {
         let guard_spoiler = self.settings.local_setting_bool("guard-spoiler");
         for (section_index, subtitle) in subtitles.iter().enumerate() {
             let resumed = resumed_sections.remove(&section_index);
-            let is_new_arrival =
-                resumed.is_none() && old_subtitles.get(&subtitle.index).is_none();
+            let is_new_arrival = resumed.is_none() && !old_subtitles.contains_key(&subtitle.index);
             let existed = existing_sections.contains(&subtitle.index);
             let (needs_download, predownloaded) = if resumed.is_some() {
                 (false, None)
             } else if force {
                 (true, None)
             } else {
-                self.section_needs_download(
-                    &setting,
-                    subtitle,
-                    old_subtitles.get(&subtitle.index).copied(),
+                self.section_needs_download(SectionDecision {
+                    setting: &setting,
+                    latest: subtitle,
+                    old: old_subtitles.get(&subtitle.index).copied(),
                     existing_id,
-                    &object_keys,
-                    &toc_url,
+                    keys: &object_keys,
+                    toc_url: &toc_url,
                     strong_update,
-                    site_timezone,
+                    timezone: site_timezone,
                     existed,
-                )
+                })
                 .await?
             };
             if needs_download {
@@ -1770,11 +1987,7 @@ impl Downloader {
         let mut started_download = false;
         let mut downloaded_index = 0usize;
 
-        for (section_index, (subtitle, plan)) in subtitles
-            .iter()
-            .zip(section_plans.into_iter())
-            .enumerate()
-        {
+        for (section_index, (subtitle, plan)) in subtitles.iter().zip(section_plans).enumerate() {
             if section_index >= resume_from
                 && budget
                     .as_deref_mut()
@@ -1791,8 +2004,8 @@ impl Downloader {
                 resumed.download_time
             } else if needs_download {
                 if !started_download {
-                    report_line(&colorize(
-                        &format!("ID:{display_id}　{title} のDL開始"),
+                    self.report_line(&colorize(
+                        &messages::download::download_started(display_id, &title),
                         "green",
                     ));
                     started_download = true;
@@ -1807,11 +2020,11 @@ impl Downloader {
                 }
 
                 if !subtitle.chapter.is_empty() && subtitle.chapter != last_chapter {
-                    report_line(&subtitle.chapter);
+                    self.report_line(&subtitle.chapter);
                     last_chapter = subtitle.chapter.clone();
                 }
                 if !subtitle.subchapter.is_empty() && subtitle.subchapter != last_subchapter {
-                    report_line(&subtitle.subchapter);
+                    self.report_line(&subtitle.subchapter);
                     last_subchapter = subtitle.subchapter.clone();
                 }
 
@@ -1831,15 +2044,17 @@ impl Downloader {
                 };
                 let had_existing = plan.existed;
                 if had_existing {
+                    // The stored section still has the previous TOC's filename.
+                    let previous = old_subtitles.get(&subtitle.index).copied().unwrap_or(subtitle);
                     if cache_dir.is_none() {
                         cache_dir = cache_timestamp(self.clock.as_ref());
                     }
                     if let Some(id) = existing_id {
-                        self.clear_section_digest(id, &section_relative_path(subtitle));
+                        self.clear_section_digest(id, &section_relative_path(previous));
                     }
                     if let Some(timestamp) = cache_dir.as_deref() {
                         self.persistence
-                            .move_section_to_cache(&object_keys, timestamp, subtitle)
+                            .move_section_to_cache(&object_keys, timestamp, previous)
                             .await?;
                     }
                 }
@@ -1854,9 +2069,13 @@ impl Downloader {
                 } else {
                     pending_section_hashes.insert(relative_path, digest);
                 }
-                self.persistence
-                    .save_raw(&object_keys, subtitle, &raw_html)
-                    .await?;
+                // 生データの保存は環境で切れる (Worker は常に切る)。
+                // 挿絵の走査はこの直後、メモリ上の raw_html で行う。
+                if self.settings.save_raw_html() {
+                    self.persistence
+                        .save_raw(&object_keys, subtitle, &raw_html)
+                        .await?;
+                }
                 if let Some(store) = illustration_store.as_mut() {
                     self.download_illustration(
                         &setting,
@@ -1927,7 +2146,7 @@ impl Downloader {
                         line.push_str(" (更新あり)");
                     }
                 }
-                report_line(&line);
+                self.report_line(&line);
                 if let Some(ref p) = self.progress {
                     p.inc(1);
                 }
@@ -2048,6 +2267,12 @@ impl Downloader {
             login_session: login_session.clone(),
             extra_fields: Default::default(),
         };
+        // 取得に使う URL (toc_url) と利用者が指定した URL が違う場合、後者を
+        // 控えておく。Pixiv は toc_url が API なので、Web UI のリンクが
+        // API を開いてしまうのを避ける (通常サイトは両者同じなので記録しない)。
+        if target != record.toc_url {
+            record.set_original_url(target.to_string());
+        }
         if track_raw_title {
             record.set_raw_title(raw_title);
         }
@@ -2104,6 +2329,10 @@ impl Downloader {
                     updated.requires_login |= requires_login;
                     if login_session.is_some() {
                         updated.login_session = login_session.clone();
+                    }
+                    // 既存の小説をページ URL 指定で取り直したときも控え直す。
+                    if target != updated.toc_url && updated.original_url().is_none() {
+                        updated.set_original_url(target.to_string());
                     }
                     for tag in &auto_tags {
                         if !updated.tags.contains(tag) {
@@ -2173,16 +2402,19 @@ impl Downloader {
 
     async fn section_needs_download(
         &mut self,
-        setting: &SiteSetting,
-        latest: &SubtitleInfo,
-        old: Option<&SubtitleInfo>,
-        existing_id: Option<i64>,
-        keys: &NovelObjectKeys,
-        toc_url: &str,
-        strong_update: bool,
-        timezone: SiteTimezone,
-        existed: bool,
+        probe: SectionDecision<'_>,
     ) -> Result<(bool, Option<(SectionElement, String)>)> {
+        let SectionDecision {
+            setting,
+            latest,
+            old,
+            existing_id,
+            keys,
+            toc_url,
+            strong_update,
+            timezone,
+            existed,
+        } = probe;
         let Some(old) = old else {
             return Ok((true, None));
         };
@@ -2230,9 +2462,7 @@ impl Downloader {
             return Ok((false, None));
         }
 
-        if strong_update
-            && let Some(basis_date) = strong_basis_date
-        {
+        if strong_update && let Some(basis_date) = strong_basis_date {
             let Some(old_section) = self.persistence.load_section(keys, old).await? else {
                 return Ok((true, None));
             };
@@ -2284,7 +2514,7 @@ impl Downloader {
         let target = parsed
             .query_pairs()
             .find_map(|(key, value)| (key == "url").then(|| value.into_owned()))?;
-        is_safe_public_url(&target).then_some(target)
+        is_safe_public_url_syntax(&target).then_some(target)
     }
 
     async fn resolve_target_for_download(
@@ -2396,18 +2626,18 @@ impl Downloader {
         append_title: bool,
         existing_record: Option<&NovelRecord>,
     ) -> String {
-        if let Some(record) = existing_record {
-            if !record.file_title.is_empty() {
-                if append_title
-                    && ncode
-                        .as_deref()
-                        .is_some_and(|ncode| record.file_title.eq_ignore_ascii_case(ncode))
-                    && !title.is_empty()
-                {
-                    // Recover records created before the correct site/title was known.
-                } else {
-                    return record.file_title.clone();
-                }
+        if let Some(record) = existing_record
+            && !record.file_title.is_empty()
+        {
+            if append_title
+                && ncode
+                    .as_deref()
+                    .is_some_and(|ncode| record.file_title.eq_ignore_ascii_case(ncode))
+                && !title.is_empty()
+            {
+                // Recover records created before the correct site/title was known.
+            } else {
+                return record.file_title.clone();
             }
         }
 
@@ -2435,12 +2665,7 @@ impl Downloader {
         use_subdirectory: bool,
     ) -> PathBuf {
         let root = PathBuf::from(types::ARCHIVE_ROOT_DIR);
-        crate::db::paths::novel_dir_from_components(
-            &root,
-            sitename,
-            file_title,
-            use_subdirectory,
-        )
+        crate::db::paths::novel_dir_from_components(&root, sitename, file_title, use_subdirectory)
     }
 
     /// Remove the previous novel directory after a title change, but only when
@@ -2542,11 +2767,11 @@ impl Downloader {
         if from_id == to_id {
             return;
         }
-        if let Some(bucket) = self.section_hash_cache.remove(&from_id.to_string()) {
-            if !bucket.is_empty() {
-                self.section_hash_cache.insert(to_id.to_string(), bucket);
-                self.section_hash_cache_dirty = true;
-            }
+        if let Some(bucket) = self.section_hash_cache.remove(&from_id.to_string())
+            && !bucket.is_empty()
+        {
+            self.section_hash_cache.insert(to_id.to_string(), bucket);
+            self.section_hash_cache_dirty = true;
         }
     }
 
@@ -2562,6 +2787,32 @@ impl Downloader {
 
     pub fn set_progress(&mut self, progress: Box<dyn ProgressReporter>) {
         self.progress = Some(progress);
+    }
+
+    /// ユーザーに見える行の送り先を差し替える。native のコマンドは
+    /// `progress::direct_console_sink()` (従来の `safe_println` と同一の
+    /// 出力先)、Worker のジョブ実行は PushHub へ `echo` する sink を渡す。
+    /// 未設定のときは cfg 別のフォールバックで従来動作を維持する。
+    pub fn set_message_sink(&mut self, sink: Arc<dyn crate::application::messages::MessageSink>) {
+        self.message_sink = Some(sink);
+    }
+
+    /// `println!` (stdout 行) 相当の送出。
+    fn report_line(&self, line: &str) {
+        use crate::application::messages::Stream;
+        match &self.message_sink {
+            Some(sink) => sink.emit(Stream::Stdout, line),
+            None => default_report_line(line),
+        }
+    }
+
+    /// `eprintln!` (stderr 行) 相当の送出。
+    fn report_warn(&self, line: &str) {
+        use crate::application::messages::Stream;
+        match &self.message_sink {
+            Some(sink) => sink.emit(Stream::Stderr, line),
+            None => default_report_warn(line),
+        }
     }
 
     pub fn site_setting_matches_url(&self, url: &str) -> bool {
@@ -2588,6 +2839,17 @@ fn apply_login_cookie(setting: &mut SiteSetting, login_cookie: &str) {
 /// マイピク restricts some to mutual followers), so the marker disappearing is
 /// not the only success: collecting more sections also counts. A retry that
 /// changes nothing keeps the earlier result.
+/// Whether a work URL names the given id (`?id=123`, `/123/`, …).
+///
+/// Ids are compared as whole tokens so `123` never matches `1234`.
+fn url_mentions_id(url: &str, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    url.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == id)
+}
+
 fn is_improved_toc(
     setting: &SiteSetting,
     before: std::result::Result<&String, &NarouError>,
@@ -2635,13 +2897,14 @@ fn should_retry_with_login(setting: &SiteSetting, toc_source: &Result<String>) -
 #[cfg(test)]
 mod tests {
     use super::novel_info::NovelInfo;
+    use super::url_mentions_id;
     use super::persistence::PersistenceService;
     use super::site_setting::{SiteSetting, SiteSettingValue};
     use super::types::{SectionElement, TocFile};
     use super::util::compile_html_pattern;
     use super::{
-        DownloadExecutionOptions, Downloader, Over18AccessDecision, SectionBudget,
-        illustration_sources, over18_access_decision, requires_over18_confirmation,
+        DownloadExecutionOptions, Downloader, DownloaderPlatform, Over18AccessDecision,
+        SectionBudget, illustration_sources, over18_access_decision, requires_over18_confirmation,
         resolve_novel_type, resolve_user_agent,
     };
     use crate::db::{self, Database};
@@ -2649,7 +2912,11 @@ mod tests {
     use crate::platform::mocks::{
         FakeRateLimiter, MemoryNovelRepository, MemoryObjectStore, MockHttpClient,
     };
-    use crate::platform::{AssetStore, NovelMutation, NovelObjectKeys, ObjectStore, SystemClock};
+    use crate::downloader::settings::DownloaderSettings;
+    use crate::platform::{
+        AssetStore, NovelMutation, NovelObjectKeys, ObjectListRequest, ObjectPrefix, ObjectStore,
+        SystemClock,
+    };
     use chrono::TimeZone;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -2746,12 +3013,14 @@ mod tests {
         let objects: Arc<dyn ObjectStore> = store.clone();
         let assets: Arc<dyn AssetStore> = store;
         let downloader = Downloader::with_platform_and_storage_and_settings(
-            Arc::new(MockHttpClient::new()),
-            Arc::new(FakeRateLimiter::new()),
-            Arc::new(MemoryNovelRepository::new()),
-            objects,
-            assets,
-            Arc::new(SystemClock),
+            DownloaderPlatform {
+                http: Arc::new(MockHttpClient::new()),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new()),
+                objects,
+                assets,
+                clock: Arc::new(SystemClock),
+            },
             Vec::new(),
             HashMap::new(),
         )
@@ -2759,7 +3028,6 @@ mod tests {
         assert!(downloader.site_settings.is_empty());
         assert!(downloader.section_hash_cache.is_empty());
     }
-
 
     #[tokio::test]
     async fn memory_storage_download_pipeline_persists_toc_section_raw_and_record() {
@@ -2789,16 +3057,15 @@ mod tests {
             r#"<div class="js-novel-text p-novel__text">本文テスト</div>"#,
         );
 
-        let toc_source =
-            super::toc::fetch_toc(
-                http.as_ref(),
-                &FakeRateLimiter::new(),
-                &setting,
-                toc_url,
-                &mut super::preprocess::PreprocessJobs::new(),
-            )
-                .await
-                .unwrap();
+        let toc_source = super::toc::fetch_toc(
+            http.as_ref(),
+            &FakeRateLimiter::new(),
+            &setting,
+            toc_url,
+            &mut super::preprocess::PreprocessJobs::new(),
+        )
+        .await
+        .unwrap();
         let captures = HashMap::from([("ncode".to_string(), "n1234ab".to_string())]);
         let subtitles = super::toc::parse_subtitles(&setting, &toc_source, &captures).unwrap();
         assert_eq!(subtitles.len(), 1);
@@ -2878,16 +3145,201 @@ mod tests {
         assert_eq!(http.request_count(), 2);
     }
 
+    /// 設定ポートが生データを拒否したら `raw/*.html` を保存しないこと。
+    /// (Worker は常に拒否し、native は `economy: nosave_raw` で拒否する)
+    #[tokio::test]
+    async fn raw_html_is_skipped_when_the_settings_disable_it() {
+        struct NoRawSettings;
+
+        impl DownloaderSettings for NoRawSettings {
+            fn save_raw_html(&self) -> bool {
+                false
+            }
+        }
+
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            r#"
+name: No Raw Test
+domain: example.com
+top_url: https://example.com
+url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+sitename: No Raw Test
+toc_url: 'https://example.com/\k<ncode>/'
+subtitles: |-
+  <a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a>
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+is_narou: false
+"#,
+        )
+        .unwrap();
+        setting.compile();
+
+        let target = "https://example.com/n1234ab/";
+        let http = Arc::new(MockHttpClient::new());
+        http.add_text(
+            target,
+            200,
+            r#"
+<h1>No Raw Test</h1><span>Author</span>
+<a href="/n1234ab/1/">第1話</a>
+"#,
+        );
+        http.add_text(
+            "https://example.com/n1234ab/1/",
+            200,
+            r#"<div class="body">本文1</div>"#,
+        );
+
+        let store = Arc::new(MemoryObjectStore::new());
+        let objects: Arc<dyn ObjectStore> = store.clone();
+        let assets: Arc<dyn AssetStore> = store;
+        let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+            DownloaderPlatform {
+                http: http.clone(),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new()),
+                objects: objects.clone(),
+                assets,
+                clock: Arc::new(SystemClock),
+            },
+            vec![setting],
+            HashMap::new(),
+            Arc::new(NoRawSettings),
+        )
+        .unwrap();
+
+        downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: true,
+                    budget: None,
+                    resume_from_section: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let page = objects
+            .list_page(&ObjectListRequest::new(
+                ObjectPrefix::new("").unwrap(),
+                std::num::NonZeroUsize::new(500).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let keys: Vec<String> = page
+            .objects
+            .iter()
+            .map(|metadata| metadata.key.as_ref().to_string())
+            .collect();
+        assert!(
+            keys.iter().all(|key| !key.contains("/raw/")),
+            "raw HTML must not be stored: {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|key| key.contains("/本文/")),
+            "sections must still be stored: {keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn renamed_subtitle_and_chapter_preserve_history_and_allow_later_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            r#"
+name: Rename Test
+domain: example.com
+top_url: https://example.com
+url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+sitename: Rename Test
+toc_url: 'https://example.com/\k<ncode>/'
+subtitles: |-
+  <h2>(?<chapter>[^<]+)</h2><a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a><time>(?<subdate>[^<]+)</time>
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+is_narou: false
+"#,
+        )
+        .unwrap();
+        setting.compile();
+        let target = "https://example.com/n1234ab/";
+        let section_url = "https://example.com/n1234ab/1/";
+        let store = Arc::new(MemoryObjectStore::new());
+        let novels = Arc::new(MemoryNovelRepository::new());
+        let http = Arc::new(MockHttpClient::new());
+        let persistence = PersistenceService::new(store.clone(), store.clone());
+        let mut record_id = None;
+        let mut keys = None;
+        for (chapter, subtitle, body, expected_updates) in [
+            ("第三章", "03_164 屍者の来訪", "旧本文", 1),
+            ("第三章", "03_164 冬の屍者", "新本文", 1),
+            ("第三章", "03_164 冬の屍者", "新本文", 0),
+            ("第三章 改題", "03_164 冬の屍者", "新本文", 1),
+        ] {
+            http.add_text(target, 200, format!(
+                r#"<h1>Rename Test</h1><span>Author</span><h2>{chapter}</h2><a href="/n1234ab/1/">{subtitle}</a><time>2026-09-29</time>"#
+            ));
+            http.add_text(section_url, 200, format!(r#"<div class="body">{body}</div>"#));
+            let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+                DownloaderPlatform {
+                    http: http.clone(),
+                    rate_limiter: Arc::new(FakeRateLimiter::new()),
+                    novels: novels.clone(),
+                    objects: store.clone(),
+                    assets: store.clone(),
+                    clock: Arc::new(SystemClock),
+                },
+                vec![setting.clone()],
+                HashMap::new(),
+                Arc::new(crate::downloader::settings::SnapshotDownloaderSettings::default()),
+            )
+            .unwrap();
+            let result = downloader.download_novel_with_force(target, false).await.unwrap();
+            assert_eq!(result.updated_count, expected_updates);
+            if let Some(id) = record_id {
+                assert_eq!(result.id, id);
+                assert!(!result.new_novel);
+                assert!(!result.new_arrivals);
+            } else {
+                record_id = Some(result.id);
+                let record = novels.get(result.id.into()).await.unwrap().unwrap();
+                keys = Some(NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).unwrap());
+            }
+            let toc = persistence.load_toc(keys.as_ref().unwrap()).await.unwrap().unwrap();
+            assert_eq!(toc.subtitles[0].subtitle, subtitle);
+            let saved = persistence.load_section(keys.as_ref().unwrap(), &toc.subtitles[0]).await.unwrap().unwrap();
+            assert_eq!(saved.chapter, chapter);
+            assert_eq!(saved.element.body, body);
+        }
+        let keys = keys.unwrap();
+        assert!(store.read_small(&keys.section("1", "03_164 屍者の来訪")).await.unwrap().is_none());
+        let names = persistence.list_novel_object_names(&keys).await.unwrap();
+        let archived = names.iter().find(|name| name.starts_with("本文/cache/") && name.ends_with("/1 03_164 屍者の来訪.yaml")).unwrap();
+        let archived_key = crate::platform::ObjectKey::try_new(format!("{}/{archived}", keys.prefix().as_ref())).unwrap();
+        let bytes = store.read_small(&archived_key).await.unwrap().unwrap();
+        let old: super::types::SectionFile = serde_yaml::from_slice(&bytes).unwrap();
+        assert_eq!(old.element.body, "旧本文");
+        assert_eq!(old.subtitle, "03_164 屍者の来訪");
+        assert_eq!(http.requested_urls().iter().filter(|url| url.ends_with(section_url)).count(), 3);
+    }
+
     #[tokio::test]
     async fn resumable_download_reuses_persisted_prefix_without_refetching() {
         let temp = tempfile::tempdir().unwrap();
         let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
         std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
         let db = Database::new().unwrap();
-        let mut db_slot = db::DATABASE.lock();
-        let previous_db = db_slot.take();
-        *db_slot = Some(db);
-        drop(db_slot);
+        let previous_db = {
+            let mut db_slot = db::DATABASE.lock();
+            let previous_db = db_slot.take();
+            *db_slot = Some(db);
+            previous_db
+        };
         let _db_guard = DatabaseGuard(previous_db);
 
         struct YieldBeforeSection(usize);
@@ -2934,12 +3386,14 @@ is_narou: false
         let objects: Arc<dyn ObjectStore> = store.clone();
         let assets: Arc<dyn AssetStore> = store;
         let mut downloader = Downloader::with_platform_and_storage_and_settings(
-            http.clone(),
-            Arc::new(FakeRateLimiter::new()),
-            Arc::new(MemoryNovelRepository::new()),
-            objects,
-            assets,
-            Arc::new(SystemClock),
+            DownloaderPlatform {
+                http: http.clone(),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new()),
+                objects,
+                assets,
+                clock: Arc::new(SystemClock),
+            },
             vec![setting],
             HashMap::new(),
         )
@@ -3385,6 +3839,220 @@ is_narou: false
     }
 
     #[test]
+    fn a_target_that_differs_from_the_toc_url_is_remembered() {
+        // Pixiv は取得に API を使うため toc_url が API になる。利用者が指定した
+        // ページ URL を控えておかないと、Web UI のリンクが API を開いてしまう。
+        let record = crate::db::novel_record::NovelRecord {
+            toc_url: "https://www.pixiv.net/ajax/novel/series/768265".to_string(),
+            ..sample_record(chrono::Utc::now())
+        };
+        assert_eq!(record.display_url(), record.toc_url, "未記録なら toc_url");
+
+        let mut record = record;
+        record.set_original_url("https://www.pixiv.net/novel/series/768265");
+        assert_eq!(
+            record.display_url(),
+            "https://www.pixiv.net/novel/series/768265"
+        );
+        // 追加フィールドとして保存され、往復しても保たれる。
+        let yaml = serde_yaml::to_string(&record).unwrap();
+        assert!(yaml.contains("original_url:"), "got {yaml}");
+        let back: crate::db::novel_record::NovelRecord = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.display_url(), record.display_url());
+    }
+
+    #[test]
+    fn paged_author_listings_are_followed_to_the_end() {
+        // ハーメルンの作者ページは検索ページの一覧を page=2, 3… と辿る。
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|setting| setting.domain == "syosetu.org")
+            .unwrap();
+        let page = "https://syosetu.org/user/495125/";
+        let first = "https://syosetu.org/search/?mode=search_user_novel_list&uid=495125";
+        assert_eq!(setting.author_fetch_url(page), first);
+        assert!(setting.matches_author_url(page));
+        assert!(!setting.matches_author_url("https://syosetu.org/novel/388533/"));
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            first,
+            200,
+            r#"<a href="https://h.syosetu.org/novel/388533/">作品1</a>
+               <a href="https://h.syosetu.org/novel/388533/1.html">第1話</a>
+               <li><a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=2">>></a></li>"#,
+        );
+        http.add_text(
+            "https://syosetu.org/search/?mode=search_user_novel_list&word=&uid=495125&page=2",
+            200,
+            r#"<a href="https://syosetu.org/novel/388855/">作品2</a>
+               <li><a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=1"><<</a></li>
+               <li><a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=3">>></a></li>"#,
+        );
+        http.add_text(
+            "https://syosetu.org/search/?mode=search_user_novel_list&word=&uid=495125&page=3",
+            200,
+            r#"<a href="https://syosetu.org/novel/400001/">作品3</a>"#,
+        );
+        let downloader = Downloader::with_platform(
+            Arc::new(http),
+            Arc::new(FakeRateLimiter::new()),
+            Arc::new(MemoryNovelRepository::new()),
+        )
+        .unwrap();
+        let urls = futures::executor::block_on(downloader.author_novel_urls(setting, page)).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://h.syosetu.org/novel/388533/".to_string(),
+                "https://syosetu.org/novel/388855/".to_string(),
+                "https://syosetu.org/novel/400001/".to_string()
+            ],
+            "話ページを作品として数えず、>> の付いた次ページだけを辿る (上限なしで終端まで)"
+        );
+    }
+
+    #[test]
+    fn a_pager_that_links_back_does_not_loop() {
+        // 終端で先頭に戻るページャでも、訪問済みなら止まる (上限は設けない)。
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|setting| setting.domain == "syosetu.org")
+            .unwrap();
+        let page = "https://syosetu.org/user/495125/";
+        let first = "https://syosetu.org/search/?mode=search_user_novel_list&uid=495125";
+        let second = "https://syosetu.org/search/?mode=search_user_novel_list&word=&uid=495125&page=2";
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            first,
+            200,
+            r#"<a href="https://syosetu.org/novel/1/">作品1</a>
+               <a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;word=&amp;uid=495125&amp;page=2">>></a>"#,
+        );
+        http.add_text(
+            second,
+            200,
+            r#"<a href="https://syosetu.org/novel/2/">作品2</a>
+               <a href="https://syosetu.org/search/?mode=search_user_novel_list&amp;uid=495125">>></a>"#,
+        );
+        let downloader = Downloader::with_platform(
+            Arc::new(http),
+            Arc::new(FakeRateLimiter::new()),
+            Arc::new(MemoryNovelRepository::new()),
+        )
+        .unwrap();
+        let urls = futures::executor::block_on(downloader.author_novel_urls(setting, page)).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://syosetu.org/novel/1/".to_string(),
+                "https://syosetu.org/novel/2/".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn author_pages_fall_back_to_the_sites_own_api() {
+        // なろうの作者ページは小説API から作品を取る: 定義の `author_api_url`
+        // に作者ページの capture が流し込まれ、応答の `ncode` から作品 URL を
+        // 組み立てる (大文字の ncode は小文字化する)。
+        let settings = SiteSetting::load_all().unwrap();
+        let setting = settings
+            .iter()
+            .find(|setting| setting.domain == "ncode.syosetu.com")
+            .unwrap();
+        let page = "https://mypage.syosetu.com/2842627/";
+        assert_eq!(
+            setting.author_fetch_url(page),
+            "https://api.syosetu.com/novelapi/api/?out=json&userid=2842627&lim=500"
+        );
+
+        let http = MockHttpClient::new();
+        http.add_text(
+            setting.author_fetch_url(page),
+            200,
+            r#"[{"allcount":2},{"ncode":"N5181MT","title":"作品1"},{"ncode":"N6275MR","title":"作品2"}]"#,
+        );
+        let downloader = Downloader::with_platform(
+            Arc::new(http),
+            Arc::new(FakeRateLimiter::new()),
+            Arc::new(MemoryNovelRepository::new()),
+        )
+        .unwrap();
+        let urls = futures::executor::block_on(downloader.author_novel_urls(setting, page)).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://ncode.syosetu.com/n5181mt/".to_string(),
+                "https://ncode.syosetu.com/n6275mr/".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn pixiv_author_listing_yields_novels_and_series() {
+        // 作者ページの作品一覧 (/ajax/user/{id}/profile/all) を preprocess に通すと、
+        // 単体小説と小説シリーズが作品として並ぶ。
+        let json = r#"{"error":false,"message":"","body":{"novels":{"2594847":null,"2610142":null},
+            "novelSeries":[{"id":"272850","userId":"1"},{"id":"551006","userId":"1"}],
+            "mangaSeries":[{"id":"329992","userId":"1"}],
+            "illusts":{"149803200":null,"149768354":null},
+            "manga":[]}}"#;
+        let html = run_pixiv_preprocess(json);
+
+        assert!(html.contains("author_novel::https://www.pixiv.net/novel/show.php?id=2594847"));
+        assert!(html.contains("author_novel::https://www.pixiv.net/novel/show.php?id=2610142"));
+        assert!(html.contains("author_novel::https://www.pixiv.net/novel/series/272850"));
+        assert!(html.contains("author_novel::https://www.pixiv.net/novel/series/551006"));
+        // 漫画シリーズも作品として並ぶ。
+        assert!(html.contains("author_novel::https://www.pixiv.net/ajax/series/329992"));
+        assert!(html.contains("author_comic_series::329992"));
+        // 単体イラストも作品。古い順に並べる (一覧は新しい順で返る)。
+        assert!(html.contains("author_novel::https://www.pixiv.net/artworks/149803200"));
+        assert!(html.contains("author_novel::https://www.pixiv.net/artworks/149768354"));
+        // 並びは一覧の JSON 順 (id の文字列昇順) で、narou_bridge の sorted() と同じ。
+        assert!(
+            html.find("artworks/149768354") < html.find("artworks/149803200"),
+            "一覧の順に並べる: {html}"
+        );
+        // 空のときは配列で返るので、その場合は何も出さない。
+        assert!(!html.contains("artworks/manga"));
+
+        let setting = pixiv_setting();
+        let urls = setting.author_novel_urls(&html).expect("Pixiv lists works");
+        assert_eq!(urls.len(), 7, "got {urls:?}");
+        assert!(urls.iter().any(|url| url.ends_with("/ajax/series/329992")));
+        assert_eq!(setting.author_comic_series_ids(&html), vec!["329992"]);
+        assert_eq!(
+            setting.author_comic_series_page_ids(r#"{"page":{"series":[{"workId":"138467437","order":5}]}}"#),
+            vec!["138467437"]
+        );
+        let mut captures = HashMap::new();
+        captures.insert("user_id".to_string(), "6519870".to_string());
+        assert_eq!(
+            setting.author_comic_series_pages_fetch_url(&captures, "329992", 2),
+            Some("https://www.pixiv.net/ajax/series/329992?p=2&lang=ja".to_string())
+        );
+        assert_eq!(setting.author_series_ids(&html), vec!["272850", "551006"]);
+
+        // シリーズの 1 話は content_titles から取り出して作品一覧から除く。
+        let episodes = setting
+            .author_series_episode_ids(r#"{"body":[{"id":"2594847","title":"x","available":true}]}"#);
+        assert_eq!(episodes, vec!["2594847"]);
+        assert!(url_mentions_id(
+            "https://www.pixiv.net/novel/show.php?id=2594847",
+            "2594847"
+        ));
+        assert!(!url_mentions_id(
+            "https://www.pixiv.net/novel/show.php?id=25948471",
+            "2594847"
+        ));
+    }
+
+    #[test]
     fn pixiv_targets_resolve_to_their_own_api_endpoint() {
         let setting = pixiv_setting();
 
@@ -3471,14 +4139,16 @@ is_narou: false
             .to_string();
 
         futures::executor::block_on(super::util::pretreatment_source_with_jobs(
-            &http,
-            &FakeRateLimiter::new(),
-            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
-            &mut source,
-            "UTF-8",
-            Some(setting),
-            &mut jobs,
-            "https://www.pixiv.net/ajax/illust/69642452",
+            super::util::PretreatmentRequest {
+                http: &http,
+                rate_limiter: &FakeRateLimiter::new(),
+                policy: &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+                src: &mut source,
+                encoding: "UTF-8",
+                setting: Some(setting),
+                jobs: &mut jobs,
+                url: "https://www.pixiv.net/ajax/illust/69642452",
+            },
         ))
         .unwrap();
 
@@ -3489,9 +4159,7 @@ is_narou: false
             "ugoira should pass the archive and its frame delays"
         );
         assert_eq!(
-            crate::illustration_animation::frame_delays(
-                "https://i.pximg.net/x.zip?ugoira=120,80"
-            ),
+            crate::illustration_animation::frame_delays("https://i.pximg.net/x.zip?ugoira=120,80"),
             Some(vec![120, 80])
         );
     }
@@ -3539,14 +4207,16 @@ is_narou: false
             .to_string();
 
         futures::executor::block_on(super::util::pretreatment_source_with_jobs(
-            &http,
-            &FakeRateLimiter::new(),
-            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
-            &mut source,
-            "UTF-8",
-            Some(setting),
-            &mut jobs,
-            "https://www.pixiv.net/ajax/illust/143868144",
+            super::util::PretreatmentRequest {
+                http: &http,
+                rate_limiter: &FakeRateLimiter::new(),
+                policy: &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+                src: &mut source,
+                encoding: "UTF-8",
+                setting: Some(setting),
+                jobs: &mut jobs,
+                url: "https://www.pixiv.net/ajax/illust/143868144",
+            },
         ))
         .unwrap();
 
@@ -3563,9 +4233,9 @@ is_narou: false
         let http = MockHttpClient::new();
         for (id, title) in [("139115096", "第19話"), ("139115097", "第20話")] {
             http.add_text(
-                &format!("https://www.pixiv.net/ajax/illust/{id}"),
+                format!("https://www.pixiv.net/ajax/illust/{id}"),
                 200,
-                &format!(
+                format!(
                     r#"{{"error":false,"body":{{"id":"{id}","title":"{title}","userName":"作者名","uploadDate":"2026-01-02T03:04:05+09:00"}}}}"#
                 ),
             );
@@ -3580,14 +4250,16 @@ is_narou: false
             .to_string();
 
         futures::executor::block_on(super::util::pretreatment_source_with_jobs(
-            &http,
-            &FakeRateLimiter::new(),
-            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
-            &mut source,
-            "UTF-8",
-            Some(setting),
-            &mut jobs,
-            "https://www.pixiv.net/ajax/series/205917?p=1&lang=ja",
+            super::util::PretreatmentRequest {
+                http: &http,
+                rate_limiter: &FakeRateLimiter::new(),
+                policy: &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+                src: &mut source,
+                encoding: "UTF-8",
+                setting: Some(setting),
+                jobs: &mut jobs,
+                url: "https://www.pixiv.net/ajax/series/205917?p=1&lang=ja",
+            },
         ))
         .unwrap();
 
@@ -3600,12 +4272,17 @@ is_narou: false
         // 作者は各話ページから拾う
         assert!(source.contains("author::作者名"), "got: {source}");
         // 目次は order の昇順で出る
-        let first = source.find("Episode;19;https://www.pixiv.net/ajax/illust/139115096")
+        let first = source
+            .find("Episode;19;https://www.pixiv.net/ajax/illust/139115096")
             .expect("order 19 entry");
-        let second = source.find("Episode;20;https://www.pixiv.net/ajax/illust/139115097")
+        let second = source
+            .find("Episode;20;https://www.pixiv.net/ajax/illust/139115097")
             .expect("order 20 entry");
         assert!(first < second, "episodes must be ascending: {source}");
-        assert!(source.contains(";第19話"), "titles come from each work: {source}");
+        assert!(
+            source.contains(";第19話"),
+            "titles come from each work: {source}"
+        );
         // order 1 に到達していないので次ページを要求する
         assert!(
             source.contains("next::/ajax/series/205917?p=2&lang=ja"),
@@ -3809,7 +4486,9 @@ is_narou: false
         // 同じ文を あらすじ と 前書き の両方には出さない
         assert!(!html.contains("story::前書き"), "got: {html}");
         assert!(html.contains("postscript::"));
-        assert!(html.contains("アンケート　\"どれ？\"　　票数10票<br>　　　A　　6票<br>　　　B　　4票"));
+        assert!(
+            html.contains("アンケート　\"どれ？\"　　票数10票<br>　　　A　　6票<br>　　　B　　4票")
+        );
         assert!(html.contains("::postscript_end"));
         assert_eq!(setting_body(&html), "本文です");
     }
@@ -3836,14 +4515,16 @@ is_narou: false
             .to_string();
 
         futures::executor::block_on(super::util::pretreatment_source_with_jobs(
-            &http,
-            &FakeRateLimiter::new(),
-            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
-            &mut source,
-            "UTF-8",
-            Some(setting),
-            &mut jobs,
-            "https://www.pixiv.net/ajax/novel/29204764",
+            super::util::PretreatmentRequest {
+                http: &http,
+                rate_limiter: &FakeRateLimiter::new(),
+                policy: &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+                src: &mut source,
+                encoding: "UTF-8",
+                setting: Some(setting),
+                jobs: &mut jobs,
+                url: "https://www.pixiv.net/ajax/novel/29204764",
+            },
         ))
         .unwrap();
 
@@ -3880,14 +4561,16 @@ is_narou: false
             .to_string();
 
         futures::executor::block_on(super::util::pretreatment_source_with_jobs(
-            &http,
-            &FakeRateLimiter::new(),
-            &crate::downloader::http_policy::FetchPolicy::for_site(setting),
-            &mut source,
-            "UTF-8",
-            Some(setting),
-            &mut jobs,
-            "https://www.pixiv.net/ajax/novel/29204764",
+            super::util::PretreatmentRequest {
+                http: &http,
+                rate_limiter: &FakeRateLimiter::new(),
+                policy: &crate::downloader::http_policy::FetchPolicy::for_site(setting),
+                src: &mut source,
+                encoding: "UTF-8",
+                setting: Some(setting),
+                jobs: &mut jobs,
+                url: "https://www.pixiv.net/ajax/novel/29204764",
+            },
         ))
         .unwrap();
 
@@ -3899,9 +4582,7 @@ is_narou: false
 
     #[test]
     fn pixiv_error_envelope_is_reported_as_missing_novel() {
-        let html = run_pixiv_preprocess(
-            r#"{"error":true,"message":"作品がありません","body":[]}"#,
-        );
+        let html = run_pixiv_preprocess(r#"{"error":true,"message":"作品がありません","body":[]}"#);
 
         let setting = pixiv_setting();
         let pattern = setting.compiled_error_message_pattern().unwrap();
@@ -3940,8 +4621,7 @@ is_narou: false
             "login wall should match login_pattern so the stored cookie is retried"
         );
         // 本文が無いので本文パターンは一致しない
-        let (element, _) =
-            super::section::parse_section_html(setting, html.clone()).unwrap();
+        let (element, _) = super::section::parse_section_html(setting, html.clone()).unwrap();
         assert_eq!(element.body, "");
     }
 

@@ -1,4 +1,4 @@
--- D1 schema for Worker application services.
+-- Shared schema (native SQLite and Worker D1) for Worker application services.
 -- Timestamps are canonical UTC RFC3339 strings with nanosecond precision;
 -- storing them as TEXT avoids JavaScript Number precision loss.
 CREATE TABLE IF NOT EXISTS novels (

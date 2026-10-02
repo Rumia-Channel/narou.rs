@@ -2,18 +2,38 @@ name: Platform portability
 
 on:
   push:
-    branches: [develop, refactor-platform-abstraction]
+    # develop 更新で develop 環境へ、v* タグで production 環境へデプロイする
+    # (下の worker-deploy-* を参照)。
+    branches: [develop, refactor-platform-abstraction, main]
+    # release.yml と同じタグ集合 (v* と数字始まり) で production へ。
+    tags: ["v*", "[0-9]*"]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Deployment target
+        type: choice
+        options: [develop, production]
+        default: develop
 
 permissions:
   contents: read
+
+# Worker 系 (wasm / worker / worker-contract / relay-deploy / worker-deploy-*) は
+# Repository variable `SORAHOST` が `T` のとき全部止める。配備先が SORAHOST 側へ
+# 移っている間は Cloudflare Workers を触らない (`deploy-sorahost.yml` が動く)。
+# native / native-gpl / license は配備先に依存しないので常に走る。
+
+env:
+  # worker-build のピン。キャッシュのキーにも使う。
+  WORKER_BUILD_VERSION: 0.8.5
 
 jobs:
   native:
     name: Native check and tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -32,7 +52,7 @@ jobs:
     name: Native check (lite/GPL)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -44,9 +64,10 @@ jobs:
 
   wasm:
     name: Portable wasm check
+    if: vars.SORAHOST != 'T'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -56,18 +77,346 @@ jobs:
 
   worker:
     name: Worker release artifact
+    if: vars.SORAHOST != 'T'
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: worker_entry
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install worker-build --version 0.8.5 --locked
+      - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
+      # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
+      # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
       - run: worker-build --release
+
+  worker-contract:
+    name: Worker contract tests (local workerd)
+    if: vars.SORAHOST != 'T'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker_entry
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
+      # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
+      # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
+      # tests/run.mjs builds, applies the local D1 migrations, starts
+      # `wrangler dev` and runs the contract checks (health, fail-closed auth,
+      # library/jobs APIs, and a queue-backed Convert job reaching a terminal
+      # state).
+      - run: node tests/run.mjs --release
+        env:
+          NAROU_ADMIN_TOKEN: contract-token
+          # トークンを外した構成で fail-closed も確かめる。
+          NAROU_CHECK_UNCONFIGURED: "1"
+
+  # デプロイはリポジトリの secret を設定したうえで手動実行する。
+  # 必要な値 (GitHub の environment = target 名で設定):
+  #   secrets.CLOUDFLARE_API_TOKEN / secrets.CLOUDFLARE_ACCOUNT_ID
+  #   vars/secrets: NAROU_D1_DATABASE_NAME / NAROU_D1_DATABASE_ID /
+  #                 NAROU_JOB_QUEUE / NAROU_JOB_DLQ /
+  #                 NAROU_S3_ENDPOINT / NAROU_S3_REGION / NAROU_S3_BUCKET
+  #                 (+ production のみ SERVICE_DOMAIN)
+  #   secrets.NAROU_ADMIN_TOKEN (デプロイ後の smoke test で使う。Zero Trust を
+  #                 境界にする場合は NAROU_AUTH_REQUIRED=false で不要になる)
+  # 未設定の間は workflow_dispatch から実行しても失敗するだけで、push では走らない。
+  # デプロイ。GitHub Environments は用途で 2 つに分ける:
+  #   `Cloudflare` … この 2 ジョブ (develop / production) が使う Workers 用の値
+  #     secrets: CLOUDFLARE_ACCOUNT_ID (または CLOUDFLARE_ACCOUT_ID) / CLOUDFLARE_API_TOKEN /
+  #              SERVICE_DOMAIN (production 必須) / DEVELOP_DOMAIN (develop・任意。ドメインは
+  #              公開ログに残さないため secrets 推奨) /
+  #              NAROU_ADMIN_TOKEN (Zero Trust が境界なら不要) / NAROU_RS_LOGIN_KEY (任意) /
+  #              NAROU_S3_ACCESS_KEY_ID・NAROU_S3_SECRET_ACCESS_KEY (任意。S3 資格情報) /
+  #              CF_ACCESS_CLIENT_ID・CF_ACCESS_CLIENT_SECRET (smoke 用・任意)
+  #     vars:    NAROU_AUTH_REQUIRED (任意) / NAROU_WORKERS_DEV (任意) /
+  #              NAROU_S3_ENDPOINT / NAROU_S3_REGION / NAROU_S3_BUCKET /
+  #              NAROU_S3_PREFIX (任意。未設定なら narou/<target>) /
+  #              NAROU_SECRETS_STORE_ID と *_SECRET_NAME (Secrets Store を使う場合)
+  #   `CodeSining` … release.yml の Windows 署名 (CERTUM_USERNAME / CERTUM_OTP_URI /
+  #                  CERTUM_KEY_ID)
+  # 対象は `NAROU_DEPLOY_TARGET` (develop / production) で切り替えるので、
+  # target ごとに環境を分けずに同じ環境を共有している (SERVICE_DOMAIN と
+  # DEVELOP_DOMAIN は名前が違うため衝突しない)。
+  # D1・Queue は `ci/provision_resources.py` が target 名から導出して冪等に作る。
+  worker-deploy-develop:
+    name: Deploy Worker (develop)
+    if: >-
+      vars.SORAHOST != 'T'
+      && ((github.event_name == 'push' && github.ref == 'refs/heads/develop')
+      || (github.event_name == 'workflow_dispatch' && inputs.target == 'develop'))
+    # リレーを先に配布する。Worker はリレー経由でしか取得できないサイトがあるため、
+    # リレーの配布が失敗したら Worker もデプロイしない (壊れた組み合わせを出さない)。
+    needs: [native, native-gpl, wasm, worker, worker-contract, license, relay-deploy]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: narou-worker-develop
+      cancel-in-progress: false
+    environment:
+      # Workers 用の資格情報は用途別の 1 環境にまとめる (署名は CodeSining)。
+      name: Cloudflare
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: worker_entry
+    env:
+      # Dantalian と同じ綴り (`ACCOUT_ID`) でも動くようにしておく。
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      NAROU_DEPLOY_TARGET: develop
+      # ドメインは公開ログに出さないため secrets を推奨 (vars も後方互換で動く)。
+      DEVELOP_DOMAIN: ${{ secrets.DEVELOP_DOMAIN || vars.DEVELOP_DOMAIN }}
+      NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
+      NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
+      SORAHOST_PROXY_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
+      SORAHOST_PROXY_KEY: ${{ secrets.SORAHOST_PROXY_KEY }}
+      NAROU_S3_ACCESS_KEY_ID: ${{ secrets.NAROU_S3_ACCESS_KEY_ID }}
+      NAROU_S3_SECRET_ACCESS_KEY: ${{ secrets.NAROU_S3_SECRET_ACCESS_KEY }}
+      NAROU_S3_ENDPOINT: ${{ vars.NAROU_S3_ENDPOINT }}
+      NAROU_S3_REGION: ${{ vars.NAROU_S3_REGION }}
+      NAROU_S3_BUCKET: ${{ vars.NAROU_S3_BUCKET }}
+      NAROU_S3_PREFIX: ${{ vars.NAROU_S3_PREFIX }}
+      # Secrets Store を使う場合だけ設定する (名前だけを渡し、値はストアに置く)。
+      NAROU_SECRETS_STORE_ID: ${{ secrets.NAROU_SECRETS_STORE_ID || vars.NAROU_SECRETS_STORE_ID }}
+      NAROU_S3_ACCESS_KEY_ID_SECRET_NAME: ${{ secrets.NAROU_S3_ACCESS_KEY_ID_SECRET_NAME || vars.NAROU_S3_ACCESS_KEY_ID_SECRET_NAME }}
+      NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME: ${{ secrets.NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME || vars.NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME }}
+      NAROU_S3_ENDPOINT_SECRET_NAME: ${{ secrets.NAROU_S3_ENDPOINT_SECRET_NAME || vars.NAROU_S3_ENDPOINT_SECRET_NAME }}
+      NAROU_S3_REGION_SECRET_NAME: ${{ secrets.NAROU_S3_REGION_SECRET_NAME || vars.NAROU_S3_REGION_SECRET_NAME }}
+      NAROU_S3_BUCKET_SECRET_NAME: ${{ secrets.NAROU_S3_BUCKET_SECRET_NAME || vars.NAROU_S3_BUCKET_SECRET_NAME }}
+      # トークンと復号鍵も Secrets Store に置く場合だけ設定する。
+      NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
+      NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
+      # Zero Trust (Cloudflare Access) を境界にする場合は false にする。
+      NAROU_AUTH_REQUIRED: ${{ vars.NAROU_AUTH_REQUIRED || 'true' }}
+      # Access の service token (custom domain 越しに smoke を流す場合だけ)。
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # CI と同じ worker-build を固定する (ローカル・他のジョブと揃える)。
+      - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
+      # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
+      # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
+      # 資格情報が無い環境 (fork / 未設定) では理由を出して省略する。
+      - name: Check Cloudflare credentials
+        id: credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Cloudflare の secret が未設定のため develop へのデプロイを省略します"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+      - run: python3 ci/deploy_worker.py
+        if: steps.credentials.outputs.configured == 'true'
+
+
+  # SORAHOST の取得リレーを配布する。Worker は同じリレーへ
+  # `X-Proxy-Token: <SORAHOST_PROXY_KEY>` を付けて `POST /proxy` する (403 なら
+  # Worker は元の fetch 結果へ黙って戻るため、合言葉のずれはサイト不取得として現れる)。
+  # 使う資格情報は 3 つで、いずれも Cloudflare environment に置く:
+  #   SORAHOST_PROXY_ENDPOINT … リレーの公開先 (Worker の接続先 / CLI のエンドポイント)
+  #   SORAHOST_PROXY_TOKEN    … sorahost-cli のデプロイトークン (`Authorization: Bearer`)
+  #   SORAHOST_PROXY_KEY      … リレーの合言葉 (コンテナの .env と一致するかを配備後に確認する)
+  # PteWorker のコンテナに curl が無いため静的 curl と CA バンドルを同梱する。
+  relay-deploy:
+    name: Deploy SORAHOST relay
+    if: >-
+      vars.SORAHOST != 'T'
+      && ((github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' || github.ref_type == 'tag'))
+      || (github.event_name == 'workflow_dispatch' && (inputs.target == 'develop' || inputs.target == 'production')))
+    needs: [native, native-gpl, wasm, worker, worker-contract, license]
+    runs-on: ubuntu-latest
+    concurrency:
+      # リレーは PteWorker 1 台を共有するので、develop / production で排他する
+      group: narou-relay
+      cancel-in-progress: false
+    environment:
+      name: Cloudflare
+    steps:
+      - uses: actions/checkout@v5
+
+      # 資格情報が無い環境 (fork / 未設定) では理由を出して省略する。
+      # `--yes` で走らせるので、無いまま実行すると CLI 側が認証情報不足で落ちる。
+      - name: Check the relay credentials
+        id: credentials
+        env:
+          SORAHOST_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
+          SORAHOST_TOKEN: ${{ secrets.SORAHOST_PROXY_TOKEN }}
+        run: |
+          if [ -z "$SORAHOST_ENDPOINT" ] || [ -z "$SORAHOST_TOKEN" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SORAHOST_PROXY_ENDPOINT / SORAHOST_PROXY_TOKEN が未設定のためリレーの配布を省略します"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch the verified static curl
+        if: steps.credentials.outputs.configured == 'true'
+        run: |
+          mkdir -p build
+          base=https://github.com/moparisthebest/static-curl/releases/download/v8.21.0
+          curl -fsSL -o build/curl "$base/curl-amd64"
+          curl -fsSL -o sha256sum.txt "$base/sha256sum.txt"
+          (cd build && grep 'curl-amd64' ../sha256sum.txt | sed 's|\./curl-amd64|curl|' | sha256sum -c -)
+          chmod +x build/curl
+          file build/curl
+      - name: Assemble the deploy bundle
+        if: steps.credentials.outputs.configured == 'true'
+        env:
+          # 同じ SORAHOST で narou 本体も動かす場合 (任意) は `bash start.sh` を
+          # Repository variable `SORAHOST_RELAY_START` に入れる。そのときリレーは
+          # narou 側の start.sh が `NAROU_RELAY=1` のときだけ起動する
+          # (1 プロジェクトに置ける起動コマンドは 1 つ。sorahost/README.md §10)。
+          RELAY_START: ${{ vars.SORAHOST_RELAY_START || 'node server.mjs' }}
+        run: |
+          cp /etc/ssl/certs/ca-certificates.crt build/cacert.pem
+          cp scripts/sorahost-proxy/server.mjs build/server.mjs
+          chmod +x build/curl
+          cat > build/sorahost.json <<JSON
+          { "mode": "node", "framework": "node", "start": "${RELAY_START}", "include": ["server.mjs", "curl", "cacert.pem"] }
+          JSON
+          ls -la build
+      - name: Deploy to SORAHOST
+        if: steps.credentials.outputs.configured == 'true'
+        env:
+          SORAHOST_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
+          SORAHOST_TOKEN: ${{ secrets.SORAHOST_PROXY_TOKEN }}
+        run: |
+          cd build
+          npx --yes sorahost-cli deploy --yes --json
+
+      # 配備したリレーが Worker 側の合言葉を受け付けるかを実際に叩いて確かめる。
+      # 合言葉がずれていると Worker からは 403 になり、取得できないサイトが黙って増える。
+      - name: Verify the relay authentication
+        if: steps.credentials.outputs.configured == 'true'
+        env:
+          SORAHOST_PROXY_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
+          SORAHOST_PROXY_KEY: ${{ secrets.SORAHOST_PROXY_KEY }}
+        run: python3 scripts/sorahost-proxy/verify_auth.py
+
+  worker-deploy-production:
+    name: Deploy Worker (production)
+    if: >-
+      vars.SORAHOST != 'T'
+      && ((github.event_name == 'push' && github.ref_type == 'tag')
+      || (github.event_name == 'workflow_dispatch' && inputs.target == 'production'))
+    needs: [native, native-gpl, wasm, worker, worker-contract, license, relay-deploy]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: narou-worker-production
+      cancel-in-progress: false
+    environment:
+      # Workers 用の資格情報は用途別の 1 環境にまとめる (署名は CodeSining)。
+      name: Cloudflare
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: worker_entry
+    env:
+      # Dantalian と同じ綴り (`ACCOUT_ID`) でも動くようにしておく。
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      NAROU_DEPLOY_TARGET: production
+      # ドメインは公開ログに出さないため secrets を推奨 (vars も後方互換で動く)。
+      SERVICE_DOMAIN: ${{ secrets.SERVICE_DOMAIN || vars.SERVICE_DOMAIN }}
+      NAROU_ADMIN_TOKEN: ${{ secrets.NAROU_ADMIN_TOKEN }}
+      NAROU_RS_LOGIN_KEY: ${{ secrets.NAROU_RS_LOGIN_KEY }}
+      SORAHOST_PROXY_ENDPOINT: ${{ secrets.SORAHOST_PROXY_ENDPOINT }}
+      SORAHOST_PROXY_KEY: ${{ secrets.SORAHOST_PROXY_KEY }}
+      NAROU_S3_ACCESS_KEY_ID: ${{ secrets.NAROU_S3_ACCESS_KEY_ID }}
+      NAROU_S3_SECRET_ACCESS_KEY: ${{ secrets.NAROU_S3_SECRET_ACCESS_KEY }}
+      NAROU_S3_ENDPOINT: ${{ vars.NAROU_S3_ENDPOINT }}
+      NAROU_S3_REGION: ${{ vars.NAROU_S3_REGION }}
+      NAROU_S3_BUCKET: ${{ vars.NAROU_S3_BUCKET }}
+      NAROU_S3_PREFIX: ${{ vars.NAROU_S3_PREFIX }}
+      # Secrets Store を使う場合だけ設定する (名前だけを渡し、値はストアに置く)。
+      NAROU_SECRETS_STORE_ID: ${{ secrets.NAROU_SECRETS_STORE_ID || vars.NAROU_SECRETS_STORE_ID }}
+      NAROU_S3_ACCESS_KEY_ID_SECRET_NAME: ${{ secrets.NAROU_S3_ACCESS_KEY_ID_SECRET_NAME || vars.NAROU_S3_ACCESS_KEY_ID_SECRET_NAME }}
+      NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME: ${{ secrets.NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME || vars.NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME }}
+      NAROU_S3_ENDPOINT_SECRET_NAME: ${{ secrets.NAROU_S3_ENDPOINT_SECRET_NAME || vars.NAROU_S3_ENDPOINT_SECRET_NAME }}
+      NAROU_S3_REGION_SECRET_NAME: ${{ secrets.NAROU_S3_REGION_SECRET_NAME || vars.NAROU_S3_REGION_SECRET_NAME }}
+      NAROU_S3_BUCKET_SECRET_NAME: ${{ secrets.NAROU_S3_BUCKET_SECRET_NAME || vars.NAROU_S3_BUCKET_SECRET_NAME }}
+      # トークンと復号鍵も Secrets Store に置く場合だけ設定する。
+      NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
+      NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
+      # Zero Trust (Cloudflare Access) を境界にする場合は false にする。
+      NAROU_AUTH_REQUIRED: ${{ vars.NAROU_AUTH_REQUIRED || 'true' }}
+      # Access の service token (custom domain 越しに smoke を流す場合だけ)。
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # CI と同じ worker-build を固定する (ローカル・他のジョブと揃える)。
+      - run: cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
+      # worker-build は wasm-opt (Binaryen) を GitHub Releases から取得する。
+      # 取得先の一時的な失敗でジョブが落ちないよう、展開済みのキャッシュを再利用する。
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
+      # 資格情報が無い環境 (fork / 未設定) では理由を出して省略する。
+      - name: Check Cloudflare credentials
+        id: credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Cloudflare の secret が未設定のため production へのデプロイを省略します"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+      - run: python3 ci/deploy_worker.py
+        if: steps.credentials.outputs.configured == 'true'
+
 
   license:
     name: Third-party license notices
@@ -77,7 +426,7 @@ jobs:
       # job fails on any output difference, so the generator must match.
       CARGO_ABOUT_VERSION: "0.9.2"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -93,8 +442,8 @@ jobs:
       # dependency reaches the non-GPL dependency graph (about-probe).
       - name: Regenerate notices
         run: |
-          cargo-about generate --workspace --locked --offline -c about.toml -o Third-Party-License.md about.hbs
-          cargo-about generate -m about-probe/Cargo.toml -c about-non-gpl.toml --locked --offline -o Third-Party-License-non-GPL.md about.hbs
+          cargo-about generate --workspace --locked -c about.toml -o Third-Party-License.md about.hbs
+          cargo-about generate -m about-probe/Cargo.toml -c about-non-gpl.toml --locked -o Third-Party-License-non-GPL.md about.hbs
       - name: Committed notices are current
         run: git diff --exit-code -- Third-Party-License.md Third-Party-License-non-GPL.md
       # Section 3 is written by hand; regenerating the notices would not notice

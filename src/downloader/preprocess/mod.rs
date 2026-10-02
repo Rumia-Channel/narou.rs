@@ -23,12 +23,7 @@ impl PreprocessPipeline {
     /// Run the definition over `source`, seeing the results of `jobs`.
     /// Returns the URLs this run asked for; the caller executes them and runs
     /// the definition again so the next pass can see their bodies.
-    pub fn execute(
-        &self,
-        source: &mut String,
-        jobs: &PreprocessJobs,
-        url: &str,
-    ) -> PreprocessRun {
+    pub fn execute(&self, source: &mut String, jobs: &PreprocessJobs, url: &str) -> PreprocessRun {
         run_stmts(&self.stmts, source, jobs, url)
     }
 }

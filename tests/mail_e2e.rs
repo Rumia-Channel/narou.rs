@@ -63,9 +63,7 @@ fn run_smtp_session(stream: TcpStream, tx: Sender<String>) {
         let upper = line.to_ascii_uppercase();
         if upper.starts_with("EHLO") || upper.starts_with("HELO") {
             let _ = writer.write_all(b"250-narou-rs-stub\r\n250 OK\r\n");
-        } else if upper.starts_with("MAIL FROM") {
-            let _ = writer.write_all(b"250 OK\r\n");
-        } else if upper.starts_with("RCPT TO") {
+        } else if upper.starts_with("MAIL FROM") || upper.starts_with("RCPT TO") {
             let _ = writer.write_all(b"250 OK\r\n");
         } else if upper.starts_with("DATA") {
             in_data = true;
@@ -73,9 +71,7 @@ fn run_smtp_session(stream: TcpStream, tx: Sender<String>) {
         } else if upper.starts_with("QUIT") {
             let _ = writer.write_all(b"221 Bye\r\n");
             break;
-        } else if upper.starts_with("RSET") {
-            let _ = writer.write_all(b"250 OK\r\n");
-        } else if upper.starts_with("NOOP") {
+        } else if upper.starts_with("RSET") || upper.starts_with("NOOP") {
             let _ = writer.write_all(b"250 OK\r\n");
         } else {
             // STARTTLS / AUTH / etc. We do not implement them; `lettre` is

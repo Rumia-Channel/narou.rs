@@ -16,30 +16,53 @@
 pub mod clock;
 pub mod cookie_store;
 pub mod http;
+/// HTTP/1.1 wire codec for transports without an HTTP stack (the Worker's
+/// `connect()` socket fallback). Byte-oriented and platform-neutral.
+pub mod http1;
 pub mod mocks;
 pub mod object_store;
 pub mod progress;
 pub mod rate_limiter;
+/// Codec for the SORAHOST fetch relay (`scripts/sorahost-proxy/`): builds
+/// `GET|POST /proxy` calls and decodes the JSON response. Transport-neutral.
+pub mod relay;
 pub mod repository;
+pub mod s3_request;
+pub mod s3_sigv4;
+pub mod s3_store;
+pub mod split_store;
+pub mod store_migration;
+pub mod url_policy;
 
 pub use clock::{Clock, SystemClock};
 pub use cookie_store::{
-    CookieStore, LoginCredential, apply_set_cookie, cookie_host_for_url, cookie_lookup_hosts,
-    decode_credentials, encode_credentials, format_cookie_header, merge_cookie_headers,
-    merge_stored_cookies, normalize_cookie_host, parse_cookie_header,
+    CookieStore, DecodedGroups, HostCookie, LoginGroup, apply_set_cookie, cookie_host_for_url,
+    cookie_lookup_hosts, decode_groups, fold_per_host_lists, site_for_host, site_for_host_with,
+    tidy_groups, assign_group_ids, encode_groups, format_cookie_header, mask_cookie,
+    merge_cookie_headers, merge_stored_cookies, normalize_cookie_host, parse_cookie_header,
 };
 pub use http::{HttpClient, HttpMethod, HttpRequest, HttpResponse, RedirectMode};
 pub use object_store::{
+    paginate_object_listing, prefix_upper_bound,
     AssetChunk, AssetStore, AssetStream, GeneratedAssetKey, NovelObjectKeys, ObjectEncoding,
     ObjectKey, ObjectListPage, ObjectListRequest, ObjectMetadata, ObjectPrefix, ObjectStore,
-    compress_object_payload, decompress_object_payload, object_crc32, verify_object_crc32,
+    compress_object_payload, content_type_for_key, decompress_object_payload, object_crc32,
+    verify_object_crc32,
 };
 pub use progress::ProgressReporter;
-pub use rate_limiter::{normalize_site_key, RateLimitScope, RateLimiter};
+pub use rate_limiter::{
+    DownloadPacing, RateLimitScope, RateLimiter, ScopedPacing, normalize_site_key,
+    normalize_wait_steps,
+};
+pub use s3_request::{object_size, parse_content_range_size};
+pub use s3_store::{S3Store, S3StoreConfig, MAX_OBJECT_BYTES, SMALL_CAP};
 pub use repository::{
     NovelFilter, NovelId, NovelMutation, NovelQuery, NovelRepository, NovelSort, NovelSortKey,
-    SearchField, SearchTerm,
+    SearchField, SearchTerm, resolve_update_scan_sort,
 };
+pub use split_store::{SplitStore, is_illustration_key};
+pub use store_migration::{StoreMigrationState, migrate_page};
+pub use url_policy::{is_safe_public_ip, validate_url_syntax};
 
 /// Target-aware future type used by every async platform trait.
 ///

@@ -66,12 +66,11 @@ pub fn sync_title_projection(id: i64) -> Result<()> {
     novels.apply_batch_sync(vec![crate::platform::NovelMutation::Upsert(projected)])?;
     rename_projected_outputs(&previous_dir, &record.author, &record.title, &display_title)?;
 
-    if let Some(mut toc) = crate::native::legacy_persistence::load_toc_file(&previous_dir) {
-        if toc.title != display_title {
+    if let Some(mut toc) = crate::native::legacy_persistence::load_toc_file(&previous_dir)
+        && toc.title != display_title {
             toc.title = display_title;
             crate::native::legacy_persistence::save_toc_file(&previous_dir, &toc)?;
         }
-    }
     Ok(())
 }
 

@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
 
-use chrono::{DateTime, SecondsFormat, Utc};
 use narou_rs::application::tag_colors::{TagColorStore, TagColors};
 use narou_rs::application::events::FreezeStore;
 use narou_rs::application::novel_actions::FreezeMutationStore;
 use narou_rs::application::settings::SettingsStore;
+use narou_rs::db::novel_codec::{self, fold, NovelBind, NOVEL_SELECT_SQL, NOVEL_UPSERT_SQL};
 use narou_rs::db::NovelRecord;
 use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
@@ -17,17 +16,21 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 use wasm_bindgen::JsValue;
-use worker::{D1Database, D1PreparedStatement, D1Result};
+use worker::{D1PreparedStatement, D1Result};
 
+use crate::db_handle::DbHandle;
+
+/// D1 tolerates much larger statement payloads than the native store's
+/// `novel_codec::MAX_EXTRA_FIELDS_BYTES`; keep the historical D1 cap.
 const MAX_EXTRA_FIELDS_BYTES: usize = 1_900_000;
 
 #[derive(Debug, Clone)]
 pub struct D1NovelRepository {
-    db: Arc<D1Database>,
+    db: DbHandle,
 }
 
 impl D1NovelRepository {
-    pub fn new(db: Arc<D1Database>) -> Self {
+    pub fn new(db: DbHandle) -> Self {
         Self { db }
     }
 
@@ -205,8 +208,16 @@ impl NovelRepository for D1NovelRepository {
             for mutation in mutations {
                 match mutation {
                     NovelMutation::Upsert(record) => {
+                        // Same contract as the native driver's
+                        // `upsert_record_conn`: registration paths can merge
+                        // default tags with retained ones, so normalize before
+                        // encoding — `novel_tags` is UNIQUE (novel_id, tag)
+                        // and tags_json must agree with the indexed rows.
+                        let mut normalized = record;
+                        novel_codec::dedup_tags(&mut normalized.tags);
+                        let record = &normalized;
                         let max_id = record.id.saturating_add(1);
-                        statements.push(self.prepare(UPSERT_SQL, record_binds(&record)?)?);
+                        statements.push(self.prepare(UPSERT_SQL, record_binds(record)?)?);
                         statements.push(self.prepare(
                             "DELETE FROM novel_tags WHERE novel_id = ?",
                             vec![BindValue::Int(record.id)],
@@ -250,18 +261,27 @@ impl NovelRepository for D1NovelRepository {
 
 #[derive(Debug, Clone)]
 pub struct D1FreezeStore {
-    db: Arc<D1Database>,
+    db: DbHandle,
 }
 
 impl D1FreezeStore {
-    pub fn new(db: Arc<D1Database>) -> Self {
+    pub fn new(db: DbHandle) -> Self {
         Self { db }
     }
 }
 
+/// isolate ごとの凍結 ID キャッシュ。一覧の描画や検索のたびに読んでいた
+/// ため (1 回 = D1 往復 1 回)、書き込み側 (`set_frozen`) で即時無効化し、
+/// 他の isolate は TTL で追従する。
+static FROZEN_IDS_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<HashSet<i64>>> =
+    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+
 impl FreezeStore for D1FreezeStore {
     fn frozen_ids<'a>(&'a self) -> PlatformFuture<'a, Result<HashSet<i64>>> {
         Box::pin(async move {
+            if let Some(cached) = FROZEN_IDS_CACHE.get("frozen") {
+                return Ok(cached);
+            }
             let rows: Vec<IdRow> = self
                 .db
                 .prepare("SELECT novel_id AS id FROM frozen_novels ORDER BY novel_id")
@@ -270,7 +290,9 @@ impl FreezeStore for D1FreezeStore {
                 .map_err(worker_error)?
                 .results()
                 .map_err(worker_error)?;
-            Ok(rows.into_iter().map(|row| row.id).collect())
+            let ids: HashSet<i64> = rows.into_iter().map(|row| row.id).collect();
+            FROZEN_IDS_CACHE.put("frozen", ids.clone());
+            Ok(ids)
         })
     }
 }
@@ -305,18 +327,37 @@ impl FreezeMutationStore for D1FreezeStore {
                 )?);
             }
             let results = self.db.batch(statements).await.map_err(worker_error)?;
-            ensure_batch_success(&results)
+            ensure_batch_success(&results)?;
+            FROZEN_IDS_CACHE.invalidate("frozen");
+            Ok(())
         })
     }
 }
 
+/// isolate ごとの設定キャッシュ (scope 名 → 値)。
+///
+/// Web UI のハンドラは `settings.get("webui.theme")` のようにキー単位で読む
+/// ため、キャッシュが無いと 1 リクエストで同じ scope を何度も D1 へ読みに
+/// 行っていた (1 回 = 往復 1 回)。書き込みは `save` で即時無効化し、他の
+/// isolate は TTL で追従する。
+static SETTINGS_CACHE: std::sync::LazyLock<
+    crate::isolate_cache::TtlMap<std::sync::Arc<HashMap<String, YamlValue>>>,
+> = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+const GLOBAL_REPLACE_SCOPE: &str = "global_replace";
+const GLOBAL_REPLACE_KEY: &str = "replace.txt";
+const TAG_COLORS_SCOPE: &str = "inv";
+const TAG_COLORS_KEY: &str = "tag_colors";
+const LEGACY_TAG_COLORS_SCOPE: &str = "tag_colors";
+const LEGACY_TAG_COLORS_KEY: &str = "colors";
+const TAG_COLORS_CACHE_KEY: &str = "inv/tag_colors";
+
 #[derive(Debug, Clone)]
 pub struct D1SettingsStore {
-    db: Arc<D1Database>,
+    db: DbHandle,
 }
 
 impl D1SettingsStore {
-    pub fn new(db: Arc<D1Database>) -> Self {
+    pub fn new(db: DbHandle) -> Self {
         Self { db }
     }
 
@@ -331,10 +372,14 @@ impl D1SettingsStore {
 impl SettingsStore for D1SettingsStore {
     fn load<'a>(&'a self, scope: SettingScope) -> PlatformFuture<'a, Result<HashMap<String, YamlValue>>> {
         Box::pin(async move {
+            let scope_name = Self::scope_name(scope);
+            if let Some(cached) = SETTINGS_CACHE.get(scope_name) {
+                return Ok((*cached).clone());
+            }
             let rows: Vec<StateRow> = self
                 .db
                 .prepare("SELECT key, value_yaml, value_json FROM app_state WHERE scope = ? ORDER BY key")
-                .bind(&[JsValue::from_str(Self::scope_name(scope))])
+                .bind(&[JsValue::from_str(scope_name)])
                 .map_err(worker_error)?
                 .all()
                 .await
@@ -345,6 +390,7 @@ impl SettingsStore for D1SettingsStore {
             for row in rows {
                 values.insert(row.key, parse_setting_value(&row.value_yaml, &row.value_json)?);
             }
+            SETTINGS_CACHE.put(scope_name, std::sync::Arc::new(values.clone()));
             Ok(values)
         })
     }
@@ -390,61 +436,151 @@ impl SettingsStore for D1SettingsStore {
                 )?);
             }
             let results = self.db.batch(statements).await.map_err(worker_error)?;
-            ensure_batch_success(&results)
+            ensure_batch_success(&results)?;
+            SETTINGS_CACHE.invalidate(scope_name);
+            Ok(())
+        })
+    }
+    fn load_replace_content<'a>(&'a self) -> PlatformFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let row: Option<StateYamlRow> = self
+                .db
+                .prepare("SELECT value_yaml FROM app_state WHERE scope = ? AND key = ?")
+                .bind(&[
+                    JsValue::from_str(GLOBAL_REPLACE_SCOPE),
+                    JsValue::from_str(GLOBAL_REPLACE_KEY),
+                ])
+                .map_err(worker_error)?
+                .first(None)
+                .await
+                .map_err(worker_error)?;
+            Ok(row.map(|row| row.value_yaml).unwrap_or_default())
+        })
+    }
+
+    fn save_replace_content<'a>(&'a self, content: &'a str) -> PlatformFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let statement = bind_statement(
+                self.db.prepare(
+                    "INSERT INTO app_state (scope, key, value_yaml, value_json) VALUES (?, ?, ?, '{}')
+                     ON CONFLICT(scope, key) DO UPDATE SET
+                       value_yaml = excluded.value_yaml, value_json = '{}'",
+                ),
+                vec![
+                    BindValue::Text(GLOBAL_REPLACE_SCOPE.to_string()),
+                    BindValue::Text(GLOBAL_REPLACE_KEY.to_string()),
+                    BindValue::Text(content.to_string()),
+                ],
+            )?;
+            ensure_batch_success(&self.db.batch(vec![statement]).await.map_err(worker_error)?)?;
+            Ok(())
         })
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct D1TagColorStore {
-    db: Arc<D1Database>,
+    db: DbHandle,
 }
 
 impl D1TagColorStore {
-    pub fn new(db: Arc<D1Database>) -> Self {
+    pub fn new(db: DbHandle) -> Self {
         Self { db }
     }
 }
 
+/// isolate ごとのタグ色キャッシュ (`TagColorStore::load` 参照)。
+static TAG_COLORS_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<TagColors>> =
+    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+
 impl TagColorStore for D1TagColorStore {
     fn load<'a>(&'a self) -> PlatformFuture<'a, Result<TagColors>> {
         Box::pin(async move {
-            let row = self
+            if let Some(cached) = TAG_COLORS_CACHE.get(TAG_COLORS_CACHE_KEY) {
+                return Ok(cached);
+            }
+            let rows: Vec<TagColorRow> = self
                 .db
-                .prepare("SELECT value_json FROM app_state WHERE scope = 'tag_colors' AND key = 'colors'")
-                .first::<StateValueRow>(None)
+                .prepare(
+                    "SELECT scope, value_yaml, value_json FROM app_state
+                     WHERE (scope = ? AND key = ?) OR (scope = ? AND key = ?)",
+                )
+                .bind(&[
+                    JsValue::from_str(TAG_COLORS_SCOPE),
+                    JsValue::from_str(TAG_COLORS_KEY),
+                    JsValue::from_str(LEGACY_TAG_COLORS_SCOPE),
+                    JsValue::from_str(LEGACY_TAG_COLORS_KEY),
+                ])
+                .map_err(worker_error)?
+                .all()
                 .await
+                .map_err(worker_error)?
+                .results()
                 .map_err(worker_error)?;
-            let mut colors = TagColors::default();
-            if let Some(row) = row {
-                let map: HashMap<String, String> = serde_json::from_str(&row.value_json)
-                    .map_err(|error| NarouError::Platform(format!("invalid D1 tag colors: {error}")))?;
-                for (tag, color) in map {
-                    colors.set(&tag, &color);
+
+            let mut canonical = TagColors::default();
+            let mut legacy = None;
+            for row in rows {
+                let colors = parse_tag_colors_row(row.value_yaml.as_deref(), row.value_json.as_deref())?;
+                if row.scope == TAG_COLORS_SCOPE {
+                    canonical = colors;
+                } else if row.scope == LEGACY_TAG_COLORS_SCOPE {
+                    legacy = Some(colors);
                 }
             }
+
+            let colors = if let Some(legacy) = legacy {
+                let colors = merge_tag_colors(legacy, canonical);
+                self.save_canonical_tag_colors(&colors).await?;
+                colors
+            } else {
+                canonical
+            };
+            TAG_COLORS_CACHE.put(TAG_COLORS_CACHE_KEY, colors.clone());
             Ok(colors)
         })
     }
 
     fn save<'a>(&'a self, colors: &'a TagColors) -> PlatformFuture<'a, Result<()>> {
-        let value = match serde_json::to_string(&colors.clone().into_map()) {
-            Ok(value) => value,
-            Err(error) => {
-                return Box::pin(async move {
-                    Err(NarouError::Platform(format!("cannot serialize D1 tag colors: {error}")))
-                });
-            }
-        };
         Box::pin(async move {
-            let statement = bind_statement(
-                self.db.prepare(
-                    "INSERT INTO app_state (scope, key, value_json) VALUES ('tag_colors', 'colors', ?) ON CONFLICT(scope, key) DO UPDATE SET value_json = excluded.value_json",
-                ),
-                vec![BindValue::Text(value)],
-            )?;
-            ensure_batch_success(&self.db.batch(vec![statement]).await.map_err(worker_error)?)
+            self.save_canonical_tag_colors(colors).await?;
+            TAG_COLORS_CACHE.invalidate(TAG_COLORS_CACHE_KEY);
+            Ok(())
         })
+    }
+}
+
+impl D1TagColorStore {
+    async fn save_canonical_tag_colors(&self, colors: &TagColors) -> Result<()> {
+        let value = serde_yaml::to_string(&colors.clone().into_map()).map_err(|error| {
+            NarouError::Platform(format!("cannot serialize D1 tag colors: {error}"))
+        })?;
+        let upsert = bind_statement(
+            self.db.prepare(
+                "INSERT INTO app_state (scope, key, value_yaml, value_json) VALUES (?, ?, ?, '{}')
+                 ON CONFLICT(scope, key) DO UPDATE SET
+                   value_yaml = excluded.value_yaml, value_json = '{}'",
+            ),
+            vec![
+                BindValue::Text(TAG_COLORS_SCOPE.to_string()),
+                BindValue::Text(TAG_COLORS_KEY.to_string()),
+                BindValue::Text(value),
+            ],
+        )?;
+        let remove_legacy = bind_statement(
+            self.db.prepare("DELETE FROM app_state WHERE scope = ? AND key = ?"),
+            vec![
+                BindValue::Text(LEGACY_TAG_COLORS_SCOPE.to_string()),
+                BindValue::Text(LEGACY_TAG_COLORS_KEY.to_string()),
+            ],
+        )?;
+        ensure_batch_success(
+            &self
+                .db
+                .batch(vec![upsert, remove_legacy])
+                .await
+                .map_err(worker_error)?,
+        )
     }
 }
 
@@ -482,39 +618,48 @@ struct NovelRow {
 }
 
 impl NovelRow {
+    /// Column values as the codec's named binds. Serde only types the cells;
+    /// the column→field mapping itself is shared (`record_from_columns`).
+    fn into_binds(self) -> Vec<(&'static str, NovelBind)> {
+        fn nullable_text(value: Option<String>) -> NovelBind {
+            value.map(NovelBind::Text).unwrap_or(NovelBind::Null)
+        }
+        fn nullable_int(value: Option<i64>) -> NovelBind {
+            value.map(NovelBind::Int).unwrap_or(NovelBind::Null)
+        }
+        vec![
+            ("id", NovelBind::Int(self.id)),
+            ("author", NovelBind::Text(self.author)),
+            ("title", NovelBind::Text(self.title)),
+            ("file_title", NovelBind::Text(self.file_title)),
+            ("toc_url", NovelBind::Text(self.toc_url)),
+            ("sitename", NovelBind::Text(self.sitename)),
+            ("novel_type", NovelBind::Int(self.novel_type)),
+            ("end", NovelBind::Int(self.end)),
+            ("last_update", NovelBind::Text(self.last_update)),
+            ("new_arrivals_date", nullable_text(self.new_arrivals_date)),
+            ("use_subdirectory", NovelBind::Int(self.use_subdirectory)),
+            ("general_firstup", nullable_text(self.general_firstup)),
+            ("novelupdated_at", nullable_text(self.novelupdated_at)),
+            ("general_lastup", nullable_text(self.general_lastup)),
+            ("last_mail_date", nullable_text(self.last_mail_date)),
+            ("tags_json", NovelBind::Text(self.tags_json)),
+            ("ncode", nullable_text(self.ncode)),
+            ("domain", nullable_text(self.domain)),
+            ("general_all_no", nullable_int(self.general_all_no)),
+            ("length", nullable_int(self.length)),
+            ("suspend", NovelBind::Int(self.suspend)),
+            ("is_narou", NovelBind::Int(self.is_narou)),
+            ("last_check_date", nullable_text(self.last_check_date)),
+            ("convert_failure", NovelBind::Int(self.convert_failure)),
+            ("extra_fields_yaml", NovelBind::Text(self.extra_fields_yaml)),
+            ("requires_login", NovelBind::Int(self.requires_login)),
+            ("login_session", nullable_text(self.login_session)),
+        ]
+    }
+
     fn into_record(self) -> Result<NovelRecord> {
-        let tags = serde_json::from_str(&self.tags_json)
-            .map_err(|error| NarouError::Platform(format!("invalid D1 tags JSON: {error}")))?;
-        let extra_fields = parse_extra_fields(&self.extra_fields_yaml)?;
-        Ok(NovelRecord {
-            id: self.id,
-            author: self.author,
-            title: self.title,
-            file_title: self.file_title,
-            toc_url: self.toc_url,
-            sitename: self.sitename,
-            novel_type: u8::try_from(self.novel_type).unwrap_or_default(),
-            end: self.end != 0,
-            last_update: parse_time(self.last_update)?,
-            new_arrivals_date: parse_optional_time(self.new_arrivals_date)?,
-            use_subdirectory: self.use_subdirectory != 0,
-            general_firstup: parse_optional_time(self.general_firstup)?,
-            novelupdated_at: parse_optional_time(self.novelupdated_at)?,
-            general_lastup: parse_optional_time(self.general_lastup)?,
-            last_mail_date: parse_optional_time(self.last_mail_date)?,
-            tags,
-            ncode: self.ncode,
-            domain: self.domain,
-            general_all_no: self.general_all_no,
-            length: self.length,
-            suspend: self.suspend != 0,
-            is_narou: self.is_narou != 0,
-            last_check_date: parse_optional_time(self.last_check_date)?,
-            convert_failure: self.convert_failure != 0,
-            requires_login: self.requires_login != 0,
-            login_session: self.login_session,
-            extra_fields,
-        })
+        novel_codec::record_from_columns(self.into_binds(), parse_extra_fields)
     }
 }
 
@@ -536,13 +681,9 @@ struct StateRow {
     value_yaml: String,
     value_json: String,
 }
-
-#[derive(Debug, Clone)]
-enum BindValue {
-    Text(String),
-    Int(i64),
-    Null,
-}
+/// D1 bind values come from the shared codec; `BindValue` stays as the local
+/// alias so `build_where` and call sites read naturally.
+type BindValue = NovelBind;
 
 fn bind_statement(statement: D1PreparedStatement, values: Vec<BindValue>) -> Result<D1PreparedStatement> {
     let values: Vec<JsValue> = values
@@ -565,7 +706,7 @@ fn rows_from_result(result: D1Result) -> Result<Vec<NovelRecord>> {
     rows.into_iter().map(NovelRow::into_record).collect()
 }
 
-fn ensure_batch_success(results: &[D1Result]) -> Result<()> {
+pub(crate) fn ensure_batch_success(results: &[D1Result]) -> Result<()> {
     for result in results {
         if !result.success() {
             return Err(NarouError::Platform(
@@ -576,26 +717,16 @@ fn ensure_batch_success(results: &[D1Result]) -> Result<()> {
     Ok(())
 }
 
-fn fold(value: &str) -> String {
-    value.trim().to_lowercase()
-}
-
-fn format_time(value: Option<DateTime<Utc>>) -> Option<String> {
-    value.map(|value| value.to_rfc3339_opts(SecondsFormat::Nanos, true))
+#[derive(Debug, Deserialize)]
+struct StateYamlRow {
+    value_yaml: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct StateValueRow {
-    value_json: String,
-}
-fn parse_time(value: String) -> Result<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(&value)
-        .map(|value| value.with_timezone(&Utc))
-        .map_err(|error| NarouError::Platform(format!("invalid D1 timestamp: {error}")))
-}
-
-fn parse_optional_time(value: Option<String>) -> Result<Option<DateTime<Utc>>> {
-    value.map(parse_time).transpose()
+struct TagColorRow {
+    scope: String,
+    value_yaml: Option<String>,
+    value_json: Option<String>,
 }
 
 fn parse_extra_fields(value: &str) -> Result<BTreeMap<String, YamlValue>> {
@@ -616,15 +747,7 @@ fn parse_extra_fields(value: &str) -> Result<BTreeMap<String, YamlValue>> {
                 .map_err(|error| NarouError::Platform(format!("invalid D1 extra fields: {error}")))?
         }
     };
-    let YamlValue::Mapping(mapping) = yaml else {
-        return Err(NarouError::Platform(
-            "D1 extra fields must be a mapping".to_string(),
-        ));
-    };
-    Ok(mapping
-        .into_iter()
-        .filter_map(|(key, value)| key.as_str().map(|key| (key.to_string(), value)))
-        .collect())
+    novel_codec::extra_fields_mapping(yaml)
 }
 
 /// Parse one `app_state` setting value: YAML text first, with the legacy
@@ -645,70 +768,58 @@ fn parse_setting_value(value_yaml: &str, legacy_value_json: &str) -> Result<Yaml
     }
 }
 
-fn record_binds(record: &NovelRecord) -> Result<Vec<BindValue>> {
-    let tags_json = serde_json::to_string(&record.tags)
-        .map_err(|error| NarouError::Platform(format!("cannot serialize D1 tags: {error}")))?;
-    let tags_fold = record.tags.iter().map(|tag| fold(tag)).collect::<Vec<_>>().join("\n");
-    let tags_sort = record.tags.iter().map(|tag| fold(tag)).collect::<Vec<_>>().join("\u{1f}");
-    let extra_fields_yaml = serde_yaml::to_string(&record.extra_fields)
-        .map_err(|error| NarouError::Platform(format!("cannot serialize D1 extra fields: {error}")))?;
-    if extra_fields_yaml.len() > MAX_EXTRA_FIELDS_BYTES {
-        return Err(NarouError::Platform("D1 extra fields payload exceeds limit".to_string()));
+fn parse_tag_colors_row(value_yaml: Option<&str>, value_json: Option<&str>) -> Result<TagColors> {
+    if let Some(yaml) = value_yaml.filter(|value| !value.trim().is_empty() && value.trim() != "{}") {
+        return parse_tag_colors_payload(yaml);
     }
-    Ok(vec![
-        BindValue::Int(record.id),
-        BindValue::Text(record.author.clone()),
-        BindValue::Text(fold(&record.author)),
-        BindValue::Text(record.title.clone()),
-        BindValue::Text(fold(&record.title)),
-        BindValue::Text(record.file_title.clone()),
-        BindValue::Text(record.toc_url.clone()),
-        BindValue::Text(fold(&record.toc_url)),
-        BindValue::Text(record.sitename.clone()),
-        BindValue::Text(fold(&record.sitename)),
-        BindValue::Int(i64::from(record.novel_type)),
-        BindValue::Int(record.end as i64),
-        BindValue::Text(format_time(Some(record.last_update)).unwrap_or_default()),
-        optional_text(format_time(record.new_arrivals_date)),
-        BindValue::Int(record.use_subdirectory as i64),
-        optional_text(format_time(record.general_firstup)),
-        optional_text(format_time(record.novelupdated_at)),
-        optional_text(format_time(record.general_lastup)),
-        optional_text(format_time(record.last_mail_date)),
-        BindValue::Text(tags_json),
-        BindValue::Text(tags_fold),
-        BindValue::Text(tags_sort),
-        optional_text(record.ncode.clone()),
-        optional_text(record.ncode.as_deref().map(fold)),
-        optional_text(record.domain.clone()),
-        optional_text(record.domain.as_deref().map(fold)),
-        optional_int(record.general_all_no),
-        optional_int(record.length),
-        BindValue::Int(record.suspend as i64),
-        BindValue::Int(record.is_narou as i64),
-        optional_text(format_time(record.last_check_date)),
-        BindValue::Int(record.convert_failure as i64),
-        BindValue::Int(record.requires_login as i64),
-    match record.login_session.as_deref() {
-        Some(value) => BindValue::Text(value.to_string()),
-        None => BindValue::Null,
-    },
-        BindValue::Text(extra_fields_yaml.clone()),
-        BindValue::Int(extra_fields_yaml.len() as i64),
-    ])
+    if let Some(json) = value_json.filter(|value| !value.trim().is_empty() && value.trim() != "{}") {
+        return parse_tag_colors_payload(json);
+    }
+    if let Some(yaml) = value_yaml {
+        return parse_tag_colors_payload(yaml);
+    }
+    Ok(TagColors::default())
 }
 
-fn optional_text(value: Option<String>) -> BindValue {
-    value.map(BindValue::Text).unwrap_or_else(|| BindValue::Text(String::new()))
-}
-fn optional_int(value: Option<i64>) -> BindValue {
-    BindValue::Int(value.unwrap_or(-1))
+fn parse_tag_colors_payload(payload: &str) -> Result<TagColors> {
+    let value: YamlValue = serde_yaml::from_str(payload)
+        .map_err(|error| NarouError::Platform(format!("invalid D1 tag colors: {error}")))?;
+    let mut colors = TagColors::default();
+    if let Some(mapping) = value.as_mapping() {
+        for (tag, color) in mapping {
+            if let (Some(tag), Some(color)) = (tag.as_str(), color.as_str()) {
+                colors.set(tag, color);
+            }
+        }
+    }
+    Ok(colors)
 }
 
-const UPSERT_SQL: &str = "INSERT INTO novels (id, author, author_fold, title, title_fold, file_title, toc_url, toc_url_fold, sitename, sitename_fold, novel_type, end, last_update, new_arrivals_date, use_subdirectory, general_firstup, novelupdated_at, general_lastup, last_mail_date, tags_json, tags_fold, tags_sort, ncode, ncode_fold, domain, domain_fold, general_all_no, length, suspend, is_narou, last_check_date, convert_failure, extra_fields_yaml, extra_fields_bytes, requires_login, login_session) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, -1), NULLIF(?, -1), ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET author=excluded.author, author_fold=excluded.author_fold, title=excluded.title, title_fold=excluded.title_fold, file_title=excluded.file_title, toc_url=excluded.toc_url, toc_url_fold=excluded.toc_url_fold, sitename=excluded.sitename, sitename_fold=excluded.sitename_fold, novel_type=excluded.novel_type, end=excluded.end, last_update=excluded.last_update, new_arrivals_date=excluded.new_arrivals_date, use_subdirectory=excluded.use_subdirectory, general_firstup=excluded.general_firstup, novelupdated_at=excluded.novelupdated_at, general_lastup=excluded.general_lastup, last_mail_date=excluded.last_mail_date, tags_json=excluded.tags_json, tags_fold=excluded.tags_fold, tags_sort=excluded.tags_sort, ncode=excluded.ncode, ncode_fold=excluded.ncode_fold, domain=excluded.domain, domain_fold=excluded.domain_fold, general_all_no=excluded.general_all_no, length=excluded.length, suspend=excluded.suspend, is_narou=excluded.is_narou, last_check_date=excluded.last_check_date, convert_failure=excluded.convert_failure, extra_fields_yaml=excluded.extra_fields_yaml, extra_fields_bytes=excluded.extra_fields_bytes, requires_login=excluded.requires_login, login_session=excluded.login_session";
+fn merge_tag_colors(legacy: TagColors, canonical: TagColors) -> TagColors {
+    let mut merged = legacy.into_map();
+    merged.extend(canonical.into_map());
+    let mut colors = TagColors::default();
+    for (tag, color) in merged {
+        colors.set(&tag, &color);
+    }
+    colors
+}
+
+fn record_binds(record: &NovelRecord) -> Result<Vec<BindValue>> {
+    let binds = novel_codec::novel_binds(record)?;
+    novel_codec::check_extra_fields_limit(&binds, MAX_EXTRA_FIELDS_BYTES)?;
+    // Positional order comes from the SQL itself, never from list order here —
+    // a name that does not match the UPSERT columns fails instead of skewing.
+    Ok(novel_codec::ordered_binds(UPSERT_SQL, &binds)?
+        .into_iter()
+        .map(|(_, value)| value.clone())
+        .collect())
+}
+
+const UPSERT_SQL: &str = NOVEL_UPSERT_SQL;
 
 fn select_sql() -> &'static str {
-    "SELECT n.id, n.author, n.author_fold, n.title, n.file_title, n.toc_url, n.sitename, n.novel_type, n.end, n.last_update, n.new_arrivals_date, n.use_subdirectory, n.general_firstup, n.novelupdated_at, n.general_lastup, n.last_mail_date, n.tags_json, n.ncode, n.domain, n.general_all_no, n.length, n.suspend, n.is_narou, n.last_check_date, n.convert_failure, n.extra_fields_yaml, n.requires_login FROM novels n"
+    NOVEL_SELECT_SQL
 }
 
 struct WhereBuilder {
@@ -843,6 +954,7 @@ fn sort_expression(key: NovelSortKey) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
     use narou_rs::platform::{SearchTerm, SearchField};
 
     fn ids_filter(ids: Option<Vec<i64>>) -> NovelFilter {
@@ -889,6 +1001,8 @@ mod tests {
             is_narou: true,
             last_check_date: None,
             convert_failure: false,
+            requires_login: false,
+            login_session: None,
             extra_fields,
         }
     }
@@ -1178,8 +1292,8 @@ mod tests {
             ("answer".to_string(), YamlValue::Number(serde_yaml::Number::from(42_i64))),
         ]));
         let binds = record_binds(&record).unwrap();
-        assert_eq!(binds.len(), 35);
-        assert_eq!(UPSERT_SQL.matches('?').count(), 35);
+        assert_eq!(binds.len(), 36);
+        assert_eq!(UPSERT_SQL.matches('?').count(), 36);
         let BindValue::Text(yaml) = &binds[32] else {
             panic!("extra fields bind must be text");
         };
@@ -1200,6 +1314,25 @@ mod tests {
         )]));
         let error = record_binds(&record).unwrap_err();
         assert!(error.to_string().contains("exceeds limit"));
+    }
+
+    #[test]
+    fn tag_colors_use_native_yaml_mapping_and_merge_legacy_worker_rows() {
+        let canonical = parse_tag_colors_payload("shared: blue\ncurrent: green\n").unwrap();
+        let legacy = parse_tag_colors_row(
+            Some("{}"),
+            Some(r#"{"shared":"red","legacy":"yellow"}"#),
+        )
+        .unwrap();
+        let merged = merge_tag_colors(legacy, canonical);
+        assert_eq!(merged.color_for("shared"), Some("blue"));
+        assert_eq!(merged.color_for("current"), Some("green"));
+        assert_eq!(merged.color_for("legacy"), Some("yellow"));
+
+        let persisted = serde_yaml::to_string(&merged.clone().into_map()).unwrap();
+        let value: YamlValue = serde_yaml::from_str(&persisted).unwrap();
+        assert!(value.is_mapping());
+        assert_eq!(parse_tag_colors_payload(&persisted).unwrap().color_for("legacy"), Some("yellow"));
     }
 
     #[test]

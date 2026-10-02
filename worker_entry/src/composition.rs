@@ -1,30 +1,34 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::SecondsFormat;
+use narou_rs::application::settings::SettingsStore;
 use narou_rs::application::{
-    envelope_bytes, job_limits, JobClaim, JobLedgerStatus, JobPlan, JobQueue,
     AppServiceDependencies, AppServices, EmptySiteDefinitionProvider, EmptySiteTimezoneProvider,
-    EmptyWebActionService, JobService, NoopSelfUpdateService, NovelActionService,
-    NovelContentService, NovelSettingsService, SchedulerService, SettingsService, TagColorService,
-    WorkerJobEnvelope,
+    EmptyWebActionService, JobClaim, JobLedgerStatus, JobPlan, JobQueue, JobService,
+    NoopSelfUpdateService, NovelActionService, NovelContentService, NovelSettingsService,
+    SchedulerService, SettingsService, TagColorService, WorkerJobEnvelope, envelope_bytes,
+    job_limits,
 };
 use narou_rs::downloader::Downloader;
+use narou_rs::downloader::settings::{DownloaderSettings, SnapshotDownloaderSettings};
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::error::Result;
 use narou_rs::platform::{
-    AssetStore, Clock, HttpClient, NovelRepository, ObjectStore, RateLimiter, SystemClock,
+    AssetStore, Clock, HttpClient, NovelRepository, ObjectStore, RateLimiter, S3Store, SplitStore,
+    SystemClock,
 };
+use narou_rs::setting_core::SettingScope;
 use serde::Deserialize;
-use worker::{D1Database, Env, Queue};
+use worker::{Env, Queue};
 
-use crate::bundled_sites::load_bundled_site_settings;
+use crate::db_handle::DbHandle;
+use crate::d1_object_store::D1ObjectStore;
 use crate::d1_repository::{D1FreezeStore, D1NovelRepository, D1SettingsStore, D1TagColorStore};
 use crate::http::WorkerHttpClient;
 use crate::ledger::{D1JobLedger, D1SchedulerCheckpoint};
 use crate::rate_limiter::WorkerRateLimiter;
-use crate::d1_object_store::D1ObjectStore;
-
 
 /// Result of the complete ledger + Queue producer operation for one plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +39,14 @@ pub struct DispatchOutcome {
 }
 /// Queue producer binding that carries version-2 job envelopes.
 pub const JOB_QUEUE_BINDING: &str = "NAROU_JOBS";
+
+/// ジョブ中に更新された section hash cache の保留分
+/// (`app_state('inv','section_hash_cache')` と同じ `小説 → (section → digest)` の形)。
+pub type PendingSectionHashCache =
+    Arc<parking_lot::Mutex<Option<HashMap<String, HashMap<String, String>>>>>;
+
+/// `update.interval` の既定値・下限 — native `commands::update::INTERVAL_MIN_SECS`。
+const UPDATE_INTERVAL_MIN_SECS: f64 = 2.5;
 
 /// Everything the Worker event handlers need: the application services plus
 /// the Phase 8 queue/ledger/checkpoint/rate-limiter wiring.
@@ -52,36 +64,324 @@ pub struct WorkerRuntime {
     pub freeze: Arc<D1FreezeStore>,
     pub novels: Arc<dyn NovelRepository>,
     http: Arc<dyn HttpClient>,
-    rate_limiter: Arc<dyn RateLimiter>,
+    rate_limiter: Arc<WorkerRateLimiter>,
+    /// `update.interval` (作品開始の間隔、native と同じく最低 2.5 秒)。
+    update_interval_secs: f64,
     objects: Arc<dyn ObjectStore>,
     assets: Arc<dyn AssetStore>,
-    clock: Arc<dyn Clock>,
+    pub clock: Arc<dyn Clock>,
     site_settings: Vec<SiteSetting>,
+    /// D1 ハンドル（資格情報ストアと設定スナップショットが使う）。UI 経路は
+    /// `first-unconstrained` セッション、ジョブ経路は primary 直行になる。
+    db: DbHandle,
+    /// 保存済みログイン資格情報。Downloader・HTTP クライアント・管理 API が
+    /// 同じ実体を共有する。
+    cookie_store: Arc<crate::d1_cookie_store::D1CookieStore>,
     /// Shared subrequest counter for this invocation; the executor reads it
     /// at section boundaries via `WorkerBudget`.
     pub subrequests: crate::budget::SubrequestBudget,
+    /// ダウンロード中に更新された section hash cache の書き戻し窓口。
+    /// `SnapshotDownloaderSettings::save_section_hash_cache` (同期) がここへ
+    /// 置き、ジョブ終了時に [`Self::persist_pending_section_hash_cache`] が
+    /// D1 (`app_state('inv','section_hash_cache')`) へ flush する。
+    pub pending_section_hash_cache: PendingSectionHashCache,
+}
+
+/// `WorkerRuntime::build_with` が行う重い読み込みのプロファイル。
+///
+/// - `Job`: `site_settings` (bundle + ユーザー定義のコンパイル) を読む。
+///   Downloader が必要とする。
+/// - `Ui`: サイト定義を読まない。UI ハンドラは Downloader を組み立てず、
+///   サイト定義が必要な箇所 (`webui/job_actions.rs` など) は
+///   `bundled_sites::load_site_settings(&runtime.objects())` を自前で呼ぶ。
+enum CompositionProfile {
+    Job,
+    Ui,
+}
+
+/// isolate ごとの `asset_backend` キャッシュ。設定の切替は TTL で
+/// 他 isolate に伝わる。切替直後に「D1 に書き・S3 から読む」混在が起きる
+/// 可能性があるため、他キャッシュ (30 秒) より短い 5 秒にしておく
+/// (`/api/storage/mode` は 501 で Worker からは書き換わらないが、手動 SQL
+/// などで切り替えた直後のずれを最小化する)。
+static ASSET_BACKEND_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<Option<String>>> =
+    std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(5_000.0));
+
+/// 挿絵の保存先を読む。未設定・読み取り失敗は `None` (= D1 扱い)。
+///
+/// 保存先は `app_state('inv','asset_backend')` の 1 行で決める。`s3` 以外は
+/// 挿絵も D1 に置くので、切り替えはこの行を書き換えるだけでよい。
+/// 本文・メタデータは常に D1 (`SplitStore` が振り分ける)。
+async fn read_asset_backend(db: &DbHandle) -> Option<String> {
+    if let Some(cached) = ASSET_BACKEND_CACHE.get("asset_backend") {
+        return cached;
+    }
+    let statement = db
+        .prepare("SELECT value_json FROM app_state WHERE scope = 'inv' AND key = 'asset_backend'");
+    let value = statement
+        .first::<serde_json::Value>(Some("value_json"))
+        .await
+        .ok()
+        .flatten()?;
+    let resolved = value.as_str().map(str::to_string);
+    ASSET_BACKEND_CACHE.put("asset_backend", resolved.clone());
+    resolved
+}
+
+/// オブジェクトの保存先を組み立てる。
+///
+/// 移行期間中は `app_state` の 1 行で D1 と S3 を切り替える。S3 が選ばれて
+/// いて資格情報が欠けている場合は起動を失敗させ、黙って D1 へ落とさない
+/// (fail-closed)。
+async fn build_object_stores(
+    env: &Env,
+    db: &DbHandle,
+    subrequests: crate::budget::SubrequestBudget,
+) -> worker::Result<(
+    Arc<dyn ObjectStore>,
+    Arc<dyn AssetStore>,
+    Option<Arc<S3Store>>,
+)> {
+    let d1: Arc<D1ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
+    let mut s3_handle: Option<Arc<S3Store>> = None;
+    let illustrations: (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) =
+        match read_asset_backend(db).await.as_deref() {
+            // S3 が選ばれていて資格情報が欠けている場合は起動を失敗させ、
+            // 黙って D1 へ落とさない (fail-closed)。
+            Some("s3") => {
+                let store: Arc<S3Store> = crate::s3_store::store_from_env(env, subrequests).await?;
+                s3_handle = Some(store.clone());
+                (store.clone(), store)
+            }
+            _ => (d1.clone(), d1.clone()),
+        };
+    let split: Arc<SplitStore> = Arc::new(SplitStore::new((d1.clone(), d1.clone()), illustrations));
+    Ok((split.clone(), split, s3_handle))
+}
+
+/// `app_state(scope='inv', key='section_hash_cache')` を読む。
+///
+/// native が Inventory に保存する強更新用ハッシュキャッシュ
+/// (`SECTION_HASH_CACHE_NAME`) と同じキー名。`Downloader` の起動時
+/// スナップショットとして渡すだけなので、行が無い・値が壊れている場合は
+/// 空 map にする（キャッシュは fail-open で良い）。
+/// isolate ごとの section hash cache。ダウンロードが書き換えても、
+/// 同じ値を使い続けても支障が無い (強更新の判定ヒント) ため TTL で十分。
+static SECTION_HASH_CACHE: std::sync::LazyLock<
+    crate::isolate_cache::TtlMap<HashMap<String, HashMap<String, String>>>,
+> = std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(30_000.0));
+
+async fn load_section_hash_cache(db: &DbHandle) -> HashMap<String, HashMap<String, String>> {
+    if let Some(cached) = SECTION_HASH_CACHE.get("section_hash_cache") {
+        return cached;
+    }
+    let row: Option<(Option<String>, Option<String>)> = db
+        .prepare(
+            "SELECT value_yaml, value_json FROM app_state WHERE scope = 'inv' AND key = 'section_hash_cache'",
+        )
+        .first(None)
+        .await
+        .unwrap_or_default();
+    let Some((yaml, json)) = row else {
+        return HashMap::new();
+    };
+    let payload = yaml.filter(|value| !value.trim().is_empty()).or(json);
+    let resolved: HashMap<String, HashMap<String, String>> = payload
+        .and_then(|value| serde_yaml::from_str(&value).ok())
+        .unwrap_or_default();
+    SECTION_HASH_CACHE.put("section_hash_cache", resolved.clone());
+    resolved
+}
+
+/// `app_state` の値を bool として解釈する。YAML/JSON の真偽値と
+/// `"true"` / `"false"` 文字列を受け付け、それ以外は未設定として `None`。
+fn setting_bool(value: &serde_yaml::Value) -> Option<bool> {
+    match value {
+        serde_yaml::Value::Bool(value) => Some(*value),
+        serde_yaml::Value::String(value) => match value.trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `app_state` の値を f64 として解釈する。Number と数値文字列を受け付け、
+/// それ以外は未設定として `None` (native `load_interval_secs` と同じ規則)。
+fn setting_f64(value: &serde_yaml::Value) -> Option<f64> {
+    match value {
+        serde_yaml::Value::Number(number) => number.as_f64(),
+        serde_yaml::Value::String(value) => value.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// `app_state` の値を i64 として解釈する。Number と数値文字列を受け付け、
+/// それ以外は未設定として `None` (native `load_wait_steps` と同じ規則)。
+fn setting_i64(value: &serde_yaml::Value) -> Option<i64> {
+    match value {
+        serde_yaml::Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|v| i64::try_from(v).ok())),
+        serde_yaml::Value::String(value) => value.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// ダウンロードで更新された section hash cache を `app_state` へ書き戻す。
+///
+/// `SnapshotDownloaderSettings` は同期 trait なので直接 D1 を書けず、代わりに
+/// 最新のキャッシュを pending スロットへ置く。ここでは pending 値を、保存済みの
+/// 行 (読みは `load_section_hash_cache` と同じ fail-open 規則) に小説ごと
+/// マージしてから上書きする — 1 冊だけ更新したジョブが他冊のハッシュを消さない
+/// ようにするため。書き戻した値で isolate キャッシュも更新する。
+async fn persist_section_hash_cache(
+    db: &DbHandle,
+    pending: HashMap<String, HashMap<String, String>>,
+) -> Result<()> {
+    let mut merged = load_section_hash_cache(db).await;
+    for (novel_id, digests) in pending {
+        merged.insert(novel_id, digests);
+    }
+    let value_yaml = serde_yaml::to_string(&merged).map_err(|error| {
+        narou_rs::error::NarouError::Platform(format!(
+            "section hash cache YAML serialization: {error}"
+        ))
+    })?;
+    let value_json = serde_json::to_string(&merged).map_err(|error| {
+        narou_rs::error::NarouError::Platform(format!(
+            "section hash cache JSON serialization: {error}"
+        ))
+    })?;
+    db.prepare(
+        "INSERT INTO app_state (scope, key, value_yaml, value_json)
+         VALUES ('inv', 'section_hash_cache', ?, ?)
+         ON CONFLICT (scope, key) DO UPDATE SET
+           value_yaml = excluded.value_yaml, value_json = excluded.value_json",
+    )
+    .bind(&[
+        wasm_bindgen::JsValue::from_str(&value_yaml),
+        wasm_bindgen::JsValue::from_str(&value_json),
+    ])
+    .map_err(|error| narou_rs::error::NarouError::Platform(format!("{error}")))?
+    .run()
+    .await
+    .map_err(|error| narou_rs::error::NarouError::Platform(format!("{error}")))?;
+    SECTION_HASH_CACHE.put("section_hash_cache", merged);
+    Ok(())
 }
 
 impl WorkerRuntime {
     /// Build the runtime from the production bindings. Missing bindings fail
     /// composition (readiness 503), never an empty/partial service set.
-    pub fn build(env: &Env) -> worker::Result<Self> {
-        let db = Arc::new(env.d1("DB")?);
+    ///
+    /// ジョブ実行系 (consumer / executor / scheduler / ledger) 用。
+    /// すべてのクエリは primary 直行になる `DbHandle::Primary` で組み立てる
+    /// — claim の UPDATE やリトライ判定が read-your-writes を前提にするため、
+    /// ここはセッションを通さない。
+    pub async fn build(env: &Env) -> worker::Result<Self> {
+        let db = DbHandle::primary(Arc::new(env.d1("DB")?));
+        Self::build_with(env, db, CompositionProfile::Job).await
+    }
+
+    /// UI (fetch) 経路用のビルド。D1 は `first-unconstrained` セッション経由
+    /// (`DbHandle::ui`) になり、読み取りは read replica に逃がせる。
+    /// セッション生成に失敗した場合 (`wrangler dev` のローカル D1 など
+    /// セッション API 未対応の環境) は primary にフォールバックする。
+    ///
+    /// UI ハンドラはサイト定義のコンパイル済み設定を必要としないため、
+    /// ダウンローダ専用の重い読み込み (`load_site_settings` のオブジェクト
+    /// ストア LIST、`load_section_hash_cache`) は行わない。`site_settings`
+    /// は空になり、`new_downloader` は job 経路 (`build`) 専用。
+    /// (旧ホストキーを畳む `D1CookieStore` は必要なときだけ同じ
+    ///  `load_site_settings` を遅延呼び出しする。ビルド時には読まない。)
+    pub async fn build_ui(env: &Env) -> worker::Result<Self> {
+        let db = DbHandle::ui(Arc::new(env.d1("DB")?));
+        Self::build_with(env, db, CompositionProfile::Ui).await
+    }
+
+    /// `db` に渡したハンドルをすべてのストアへ配線する共通ビルド。
+    async fn build_with(
+        env: &Env,
+        db: DbHandle,
+        profile: CompositionProfile,
+    ) -> worker::Result<Self> {
         let subrequests = crate::budget::SubrequestBudget::new();
-        let store = Arc::new(D1ObjectStore::new(db.clone()));
-        let objects: Arc<dyn ObjectStore> = store.clone();
-        let assets: Arc<dyn AssetStore> = store;
+        let (objects, assets, _s3_illustrations) =
+            build_object_stores(env, &db, subrequests.clone()).await?;
         let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let freeze = Arc::new(D1FreezeStore::new(db.clone()));
+        let cookie_store: Arc<crate::d1_cookie_store::D1CookieStore> =
+            Arc::new(crate::d1_cookie_store::D1CookieStore::new(
+                db.clone(),
+                crate::d1_cookie_store::D1CookieStore::key_from_env(env).await,
+                // 旧ホストキーの畳み (key_site_settings) が Worker runtime と
+                // 同じ effective 定義 (bundle + ユーザー、version gate 済み) を
+                // 読めるように注入する。
+                objects.clone(),
+            ));
+        // local 設定は 1 回だけ読んで User-Agent とレート制限の両方に使う
+        // (D1SettingsStore 経由なので同一 isolate ではキャッシュ済み)。
+        let local_values = D1SettingsStore::new(db.clone())
+            .load(SettingScope::Local)
+            .await
+            .unwrap_or_default();
+        // User-Agent は保存済み設定から解決する (native の `with_user_agent` と同じ規則)。
+        // 送らないと多くのサイトが 403 を返すため、必ず何かしら送る。
+        let saved_user_agent = local_values
+            .get("user-agent")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
+        let user_agent = narou_rs::downloader::resolve_user_agent(None, saved_user_agent);
+        // 踏み台 (SORAHOST リレー) は `SORAHOST_PROXY_ENDPOINT` と
+        // `SORAHOST_PROXY_KEY` が揃ったときだけ有効にする。スキーム無しの
+        // `<IP>:<port>` 形式も受け付ける (http.rs の `with_relay` が補完)。
+        let relay_base = crate::secrets::value(env, "SORAHOST_PROXY_ENDPOINT").await;
+        let relay_token = crate::secrets::value(env, "SORAHOST_PROXY_KEY").await;
+        let mut http_client =
+            WorkerHttpClient::new(subrequests.clone()).with_user_agent(user_agent);
+        if let (Some(base), Some(token)) = (relay_base, relay_token) {
+            http_client = http_client.with_relay(base, token);
+        }
         let http: Arc<dyn HttpClient> =
-            Arc::new(WorkerHttpClient::new(subrequests.clone()));
-        let rate_limiter: Arc<dyn RateLimiter> = Arc::new(
-            WorkerRateLimiter::new(env, subrequests.clone())
-                .map_err(|error| worker::Error::RustError(error.to_string()))?,
+            Arc::new(http_client.with_cookie_store(cookie_store.clone()));
+        // `download.interval` / `download.wait-steps` を設定から読む
+        // (native `load_interval_secs` / `load_wait_steps` と同じ規則:
+        // Number または数値文字列、それ以外は未設定扱い)。ジョブ単位の
+        // `build` で読み直すので設定変更は次の実行から効く。
+        let download_interval_secs = local_values
+            .get("download.interval")
+            .and_then(setting_f64);
+        let download_wait_steps = local_values
+            .get("download.wait-steps")
+            .and_then(setting_i64);
+        // native `commands::update` と同じ規則 (`load_setting_float`):
+        // 数値として読めない値は既定 2.5 秒、既定未満の値も 2.5 秒へ切り上げる。
+        let update_interval_secs = local_values
+            .get("update.interval")
+            .and_then(setting_f64)
+            .map(|secs| if secs >= UPDATE_INTERVAL_MIN_SECS { secs } else { UPDATE_INTERVAL_MIN_SECS })
+            .unwrap_or(UPDATE_INTERVAL_MIN_SECS);
+        let rate_limiter = Arc::new(
+            WorkerRateLimiter::new(
+                env,
+                subrequests.clone(),
+                download_interval_secs,
+                download_wait_steps,
+            )
+            .map_err(|error| worker::Error::RustError(error.to_string()))?,
         );
-        let site_settings = load_bundled_site_settings()
-            .map_err(|error| worker::Error::RustError(error.to_string()))?;
+        // サイト定義の読み込みはオブジェクトストアの LIST を伴う重い経路。
+        // UI プロファイルは Downloader を組み立てないので省略する
+        // (`build_ui` 参照)。ジョブ系のみが必要とする。
+        let site_settings = match profile {
+            CompositionProfile::Job => crate::bundled_sites::load_site_settings(&objects)
+                .await
+                .map_err(|error| worker::Error::RustError(error.to_string()))?,
+            CompositionProfile::Ui => Vec::new(),
+        };
         let ledger = Arc::new(D1JobLedger::new(db.clone(), clock.clone()));
         let checkpoint = D1SchedulerCheckpoint::new(db.clone());
         let queue = env.queue(JOB_QUEUE_BINDING)?;
@@ -90,7 +390,7 @@ impl WorkerRuntime {
             novels.clone(),
             objects.clone(),
             freeze.clone(),
-            db,
+            db.clone(),
             clock.clone(),
         );
         Ok(Self {
@@ -102,11 +402,15 @@ impl WorkerRuntime {
             novels,
             http,
             rate_limiter,
+            update_interval_secs,
             objects,
             assets,
             subrequests,
             clock,
             site_settings,
+            db,
+            cookie_store,
+            pending_section_hash_cache: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 
@@ -118,34 +422,151 @@ impl WorkerRuntime {
     }
 
     /// A fresh, exclusively-owned shared Downloader for one event invocation.
+    /// ジョブ経路 (`build`) 専用 — `build_ui` は `site_settings` を空にする。
     ///
-    /// Bundled site settings are compiled at composition time; the section
-    /// hash cache is the empty worker default (no Inventory on this
-    /// platform — reruns overwrite persisted sections idempotently).
-    pub fn new_downloader(&self) -> Result<Downloader> {
-        Downloader::with_platform_and_storage_and_settings(
-            self.http.clone(),
-            self.rate_limiter.clone(),
-            self.novels.clone(),
-            self.objects.clone(),
-            self.assets.clone(),
-            self.clock.clone(),
+    /// Bundled site settings are compiled at composition time. Downloader
+    /// settings are a per-invocation snapshot of `app_state`: local scope
+    /// (`update.strong` / `guard-spoiler` / `auto-add-tags` /
+    /// `download.use-subdirectory`), global scope (`over18`), and the
+    /// `inv`-scope section hash cache. Unset values keep the same defaults
+    /// as native (`false` / `None` — `None` leaves the age-confirmation path
+    /// intact and the executor reports `Blocked`).
+    pub async fn new_downloader(&self) -> Result<Downloader> {
+        let settings = self.downloader_settings().await?;
+        let section_hash_cache = settings.load_section_hash_cache();
+        let downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+            narou_rs::downloader::DownloaderPlatform {
+                http: self.http.clone(),
+                rate_limiter: self.rate_limiter.clone(),
+                novels: self.novels.clone(),
+                objects: self.objects.clone(),
+                assets: self.assets.clone(),
+                clock: self.clock.clone(),
+            },
             self.site_settings.clone(),
-            HashMap::new(),
-        )
+            section_hash_cache,
+            settings,
+        )?;
+        Ok(downloader.with_cookie_store(self.cookie_store.clone()))
+    }
+
+    /// `Downloader` に渡す設定スナップショットを D1 (`app_state`) から組み立てる。
+    ///
+    /// `DownloaderSettings` は同期 API だが D1 は非同期なので、呼び出し単位で
+    /// 値を読み切り `SnapshotDownloaderSettings` に固めて渡す。
+    async fn downloader_settings(&self) -> Result<Arc<dyn DownloaderSettings>> {
+        const LOCAL_BOOL_KEYS: [&str; 4] = [
+            "update.strong",
+            "guard-spoiler",
+            "auto-add-tags",
+            "download.use-subdirectory",
+        ];
+        let store = D1SettingsStore::new(self.db.clone());
+        let local_values = store.load(SettingScope::Local).await?;
+        let local: HashMap<String, bool> = LOCAL_BOOL_KEYS
+            .iter()
+            .filter_map(|key| {
+                local_values
+                    .get(*key)
+                    .and_then(setting_bool)
+                    .map(|value| ((*key).to_string(), value))
+            })
+            .collect();
+        let global_values = store.load(SettingScope::Global).await?;
+        let over18 = global_values.get("over18").and_then(setting_bool);
+        let section_hash_cache = load_section_hash_cache(&self.db).await;
+        Ok(Arc::new(
+            SnapshotDownloaderSettings::new(local, over18, section_hash_cache)
+                .with_pending_section_hash_save(self.pending_section_hash_cache.clone()),
+        ))
+    }
+
+    /// ダウンロードで更新された section hash cache があれば D1 へ書き戻す。
+    ///
+    /// `Downloader::flush_section_hash_cache` は `save_section_hash_cache`
+    /// (同期) 経由で `pending_section_hash_cache` に置くだけなので、ジョブ
+    /// 1 件ごとの区切りでここを呼んで `app_state('inv','section_hash_cache')`
+    /// を永続化する (`update.strong` のヒット率が native と揃う)。
+    /// 保存するのは「最新スナップショット」なので、未配線・未更新なら何もしない。
+    /// 書き戻しは判定ヒントの延長で、失敗しても呼び出し側でログだけ残す。
+    pub async fn persist_pending_section_hash_cache(&self) -> Result<()> {
+        let pending = self.pending_section_hash_cache.lock().take();
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        persist_section_hash_cache(&self.db, pending).await
+    }
+
+    /// 管理 API 用の具体ハンドル（診断用メソッドを持つ）。
+    pub fn cookie_store(&self) -> &Arc<crate::d1_cookie_store::D1CookieStore> {
+        &self.cookie_store
+    }
+
+    /// 保存済み設定の読み出し (D1)。`ConvertService` が `default.*` / `force.*`
+    /// を適用するのに使う。
+    pub fn settings_store(&self) -> Arc<dyn narou_rs::application::settings::SettingsStore> {
+        Arc::new(D1SettingsStore::new(self.db.clone()))
+    }
+
+    /// コンパイル済みサイト定義のスナップショット。`build` (Job) 経路では
+    /// bundle + ユーザー定義が読み込まれ、`build_ui` では空。
+    /// `new_downloader` と同じ一覧を、小説単位の `FetchPolicy` 解決
+    /// (挿絵取得のサイトヘッダ) が共有する。
+    pub fn site_settings(&self) -> &[SiteSetting] {
+        &self.site_settings
+    }
+
+    /// 変換 (`ConvertService`) と HTTP 系が共有する平台能力。
+    pub fn http_client(&self) -> Arc<dyn HttpClient> {
+        self.http.clone()
+    }
+
+    pub fn rate_limiter(&self) -> Arc<dyn RateLimiter> {
+        self.rate_limiter.clone()
+    }
+
+    /// native `commands::update` の `update.interval` を、同じドメインの Update
+    /// ジョブの開始間隔として適用する。native は update コマンドのプロセス内で
+    /// 数えるが、Worker ではジョブが別 isolate で走りうるので、サイト別 DO と
+    /// 同じ仕組み (`update-start:` バケット) に永続化して数える。
+    pub async fn pace_update_start(&self, domain: &str) -> Result<()> {
+        self.rate_limiter
+            .acquire_work_start(domain, Duration::from_secs_f64(self.update_interval_secs))
+            .await
+    }
+
+    pub fn objects(&self) -> Arc<dyn ObjectStore> {
+        self.objects.clone()
+    }
+
+    pub fn assets(&self) -> Arc<dyn AssetStore> {
+        self.assets.clone()
     }
 
     /// Enqueue one plan through the ledger and Queue binding as one operation.
     /// Pending/retryable rows are sent; a live running row is not duplicated.
     pub async fn enqueue_plan(&self, plan: JobPlan) -> Result<DispatchOutcome> {
         let queued = self.ledger.enqueue(plan.clone()).await?;
-        let view = self
-            .ledger
-            .get(&queued.job_id)
-            .await?
-            .ok_or_else(|| {
-                narou_rs::error::NarouError::Platform("queued job disappeared".to_string())
-            })?;
+        let view = self.ledger.get(&queued.job_id).await?.ok_or_else(|| {
+            narou_rs::error::NarouError::Platform("queued job disappeared".to_string())
+        })?;
+        // 凍結小説の除外はここでも行う (native の update/download 拒否と
+        // 同じ規則、`--force` 指定時のみ通す)。キューへ流さず、代わりに
+        // 台帳行を `partial` で閉じて理由を残す — native の単発 mistook=1
+        // → queue_partial と同じ終端。bulk 呼び出し (`job_actions`) が
+        // `blocked` を致命的に扱うため、凍結スキップは `blocked` ではなく
+        // `sent: false` + 終端行として報告する。
+        if let Some(reason) = self.frozen_skip_reason(&plan).await? {
+            self.ledger
+                .settle_skipped(&queued.job_id, &reason)
+                .await?;
+            return Ok(DispatchOutcome {
+                job_id: queued.job_id.as_str().to_string(),
+                sent: false,
+                blocked: None,
+            });
+        }
+
         let unsupported = if !plan.kind.is_worker_executable() {
             Some(format!(
                 "unsupported job kind {:?} on the worker (no subprocess support)",
@@ -156,12 +577,9 @@ impl WorkerRuntime {
         } else {
             None
         };
-        let oversized = envelope_bytes(&WorkerJobEnvelope::v2(
-            queued.job_id.clone(),
-            queued.job.clone(),
-        ))
-        .map(|size| size > job_limits::MAX_ENVELOPE_BYTES)
-        .unwrap_or(true);
+        let oversized = envelope_bytes(&WorkerJobEnvelope::v2(queued.job_id.clone()))
+            .map(|size| size > job_limits::MAX_ENVELOPE_BYTES)
+            .unwrap_or(true);
         let blocked_reason = unsupported.or_else(|| {
             oversized.then(|| {
                 format!(
@@ -173,8 +591,7 @@ impl WorkerRuntime {
         if let Some(reason) = blocked_reason {
             match self.ledger.claim(&queued.job_id).await? {
                 JobClaim::Claimed {
-                    execution_token,
-                    ..
+                    execution_token, ..
                 } => {
                     self.ledger
                         .mark_terminal(
@@ -210,7 +627,7 @@ impl WorkerRuntime {
                 blocked: None,
             });
         }
-        let envelope = WorkerJobEnvelope::v2(queued.job_id.clone(), queued.job);
+        let envelope = WorkerJobEnvelope::v2(queued.job_id.clone());
         self.queue.send(&envelope).await.map_err(|error| {
             narou_rs::error::NarouError::Platform(format!("queue send failed: {error}"))
         })?;
@@ -220,6 +637,52 @@ impl WorkerRuntime {
             blocked: None,
         })
     }
+
+
+    /// Frozen-target exclusion for the planning boundary: without `--force`,
+    /// a Download/Update plan whose target resolves to a frozen novel is
+    /// folded into a terminal `partial` row instead of entering the runnable
+    /// queue (native `commands::{update,download}` skip parity — a queued
+    /// job that must not run). The native notice text is recorded as
+    /// `last_error` so the queue row shows why it settled.
+    ///
+    /// Returns `None` when the plan is not frozen-skippable (force, other
+    /// kinds, unresolved/new targets — all proceed as before). The executor
+    /// keeps an identical check as the last line of defense for envelopes
+    /// that bypass `enqueue_plan` (legacy v1, direct ledger writes).
+    async fn frozen_skip_reason(&self, plan: &JobPlan) -> Result<Option<String>> {
+        use narou_rs::application::{JobKind, messages};
+        if !matches!(plan.kind, JobKind::Download | JobKind::Update) {
+            return Ok(None);
+        }
+        let force = plan
+            .options
+            .iter()
+            .any(|option| option == "--force" || option == "-f");
+        if force {
+            return Ok(None);
+        }
+        let Some(id) = crate::executor::resolve_novel_id(self.novels.as_ref(), &plan.target).await
+        else {
+            return Ok(None);
+        };
+        if !self.services.novel_actions.is_frozen(id).await {
+            return Ok(None);
+        }
+        let title = self
+            .novels
+            .get(id)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| record.title)
+            .unwrap_or_default();
+        Ok(Some(match plan.kind {
+            JobKind::Update => messages::update::frozen_id(id.0, title),
+            _ => messages::download::frozen_abort(title),
+        }))
+    }
+
 
     /// Dispatch a bounded page, attempting every plan before returning a
     /// partial failure. Failed sends remain active in the ledger for repair.
@@ -249,22 +712,29 @@ impl WorkerRuntime {
 pub struct ReadServices {
     pub app: AppServices,
     pub objects: Arc<dyn ObjectStore>,
+    /// 挿絵を S3 に置く構成のときだけ入る（presigned URL を作るのに使う）。
+    pub s3_illustrations: Option<Arc<S3Store>>,
 }
 
 /// Build the application services (read-only API surface).
-pub fn build_services(env: &Env) -> worker::Result<AppServices> {
-    Ok(build_read_services(env)?.app)
+pub async fn build_services(env: &Env) -> worker::Result<AppServices> {
+    Ok(build_read_services(env).await?.app)
 }
 
-pub fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
-    let db = Arc::new(env.d1("DB")?);
-    let objects: Arc<dyn ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
+pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
+    // 読み取り系の API 面。UI 経路なので `DbHandle::ui` (first-unconstrained
+    // セッション、失敗時は primary) で組み立てる。
+    let db = DbHandle::ui(Arc::new(env.d1("DB")?));
+    let subrequests = crate::budget::SubrequestBudget::new();
+    let (objects, _assets, s3_illustrations) =
+        build_object_stores(env, &db, subrequests).await?;
     let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::new(db.clone()));
     Ok(ReadServices {
         app: services_from(novels, objects.clone(), freeze, db, clock),
         objects,
+        s3_illustrations,
     })
 }
 
@@ -272,7 +742,7 @@ fn services_from(
     novels: Arc<dyn NovelRepository>,
     objects: Arc<dyn ObjectStore>,
     freeze: Arc<D1FreezeStore>,
-    db: Arc<D1Database>,
+    db: DbHandle,
     clock: Arc<dyn Clock>,
 ) -> AppServices {
     let library = Arc::new(narou_rs::application::LibraryService::new(
@@ -296,9 +766,7 @@ fn services_from(
         settings: Arc::new(SettingsService::new(Arc::new(D1SettingsStore::new(
             db.clone(),
         )))),
-        tag_colors: Arc::new(TagColorService::new(Arc::new(D1TagColorStore::new(
-            db,
-        )))),
+        tag_colors: Arc::new(TagColorService::new(Arc::new(D1TagColorStore::new(db)))),
         jobs: Arc::new(JobService),
         scheduler: Arc::new(SchedulerService::new(clock)),
         site_definitions: Arc::new(EmptySiteDefinitionProvider),
@@ -310,8 +778,8 @@ fn services_from(
 /// Readiness probe: every required binding and configuration must be real.
 ///
 /// - D1 answers `SELECT 1`
-/// - `NAROU_JOBS` queue producer and `RATE_LIMITER` Durable Object
-///   namespace are bound
+/// - `NAROU_JOBS` queue producer, `RATE_LIMITER` Durable Object namespace,
+///   and the `PUSH_HUB` Durable Object bindings are bound
 /// - full composition (bundled site definitions parse and compile)
 ///
 /// Nothing here performs network I/O; a missing binding or config fails
@@ -333,8 +801,9 @@ pub async fn check_ready(env: &Env) -> worker::Result<()> {
     }
     env.queue(JOB_QUEUE_BINDING)?;
     env.durable_object("RATE_LIMITER")?;
+    env.durable_object("PUSH_HUB")?;
     // Full composition validates bundled sites and all adapters.
-    WorkerRuntime::build(env).map(|_| ())
+    WorkerRuntime::build(env).await.map(|_| ())
 }
 
 #[derive(Debug, Deserialize)]

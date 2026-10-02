@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -43,34 +42,87 @@ use crate::platform::{HttpClient, HttpMethod, HttpRequest, HttpResponse, Redirec
 
 const FAIL_THRESHOLD: u8 = 5;
 
+/// フォールバック段の番号 (試行順は `TierState::order` が決める)。
+const TIER_CURL: usize = 0;
+const TIER_REQWEST: usize = 1;
+const TIER_SUBPROCESS: usize = 2;
+const TIER_COUNT: usize = 3;
+
+/// ドメインごとの段の実績。
+///
+/// `preferred` は「そのドメインで最後に成功した段」で、次のリクエストでは
+/// これを最初に試す。以前は libcurl の成功だけを覚えていたため、
+/// wget が勝つサイトでは毎回 curl と reqwest を空打ちしていた。
+/// 成功した段の失敗数は 0 に戻すので、一時的な障害だけで段が実行中ずっと
+/// 外れることもない。
+#[derive(Default)]
+struct TierState {
+    preferred: HashMap<String, usize>,
+    failures: HashMap<String, [u8; TIER_COUNT]>,
+}
+
+impl TierState {
+    /// このドメインで試す段の順序。直近で成功した段を先頭に置く。
+    fn order(&self, domain: &str) -> Vec<usize> {
+        let mut order = Vec::with_capacity(TIER_COUNT);
+        if let Some(&preferred) = self.preferred.get(domain)
+            && preferred < TIER_COUNT
+        {
+            order.push(preferred);
+        }
+        for tier in 0..TIER_COUNT {
+            if !order.contains(&tier) {
+                order.push(tier);
+            }
+        }
+        order
+    }
+
+    /// 連続失敗が閾値に達した段はそのドメインでは試さない。
+    fn should_try(&self, domain: &str, tier: usize) -> bool {
+        self.failures.get(domain).map_or(0, |f| f[tier]) < FAIL_THRESHOLD
+    }
+
+    fn note_success(&mut self, domain: &str, tier: usize) {
+        self.preferred.insert(domain.to_string(), tier);
+        if let Some(failures) = self.failures.get_mut(domain) {
+            failures[tier] = 0;
+        }
+    }
+
+    fn note_failure(&mut self, domain: &str, tier: usize) {
+        self.failures
+            .entry(domain.to_string())
+            .or_insert([0; TIER_COUNT])[tier] += 1;
+        if self.preferred.get(domain) == Some(&tier) {
+            self.preferred.remove(domain);
+        }
+    }
+
+    /// 全段が失敗閾値に達したドメインのカウンタを捨ててやり直せるようにする。
+    fn forget(&mut self, domain: &str) {
+        self.failures.remove(domain);
+        self.preferred.remove(domain);
+    }
+}
+
 /// Native HTTP transport with the curl → reqwest → subprocess fallback.
 ///
 /// `Clone` is cheap: the two reqwest clients are `Arc`-backed and the
-/// tier-failure / prefer-curl state is shared through `Arc`, so clones
-/// observe the same fallback bookkeeping (matching the old `HttpFetcher`
-/// semantics where one fetcher served a whole download run).
+/// per-domain tier state is shared through `Arc`, so clones observe the same
+/// fallback bookkeeping (matching the old `HttpFetcher` semantics where one
+/// fetcher served a whole download run).
 #[derive(Clone)]
 pub struct NativeHttpClient {
     client: reqwest::blocking::Client,
     manual_redirect_client: reqwest::blocking::Client,
     user_agent: String,
-    tier_failures: Arc<Mutex<HashMap<String, [u8; 3]>>>,
-    prefer_curl: Arc<AtomicBool>,
+    tiers: Arc<Mutex<TierState>>,
     /// Login cookies are only refreshed for hosts that already store one, so a
     /// site the user never signed in to never gains an entry here.
     cookie_store: Option<Arc<dyn crate::platform::CookieStore>>,
 }
 
-/// Whether every pair of a stored credential was part of the sent header,
-/// which is how a response is attributed to one of several stored logins.
-fn credential_was_sent(credential: &str, sent: &[(String, String)]) -> bool {
-    let pairs = crate::platform::parse_cookie_header(credential);
-    !pairs.is_empty()
-        && pairs.iter().all(|(name, value)| {
-            sent.iter()
-                .any(|(sent_name, sent_value)| sent_name == name && sent_value == value)
-        })
-}
 
 impl NativeHttpClient {
     /// Refresh stored login cookies from `Set-Cookie` responses.
@@ -100,8 +152,7 @@ impl NativeHttpClient {
             client,
             manual_redirect_client,
             user_agent: user_agent.to_string(),
-            tier_failures: Arc::new(Mutex::new(HashMap::new())),
-            prefer_curl: Arc::new(AtomicBool::new(false)),
+            tiers: Arc::new(Mutex::new(TierState::default())),
             cookie_store: None,
         })
     }
@@ -111,7 +162,7 @@ impl NativeHttpClient {
     /// Sessions rotate their cookies on most responses; writing them back keeps
     /// the stored value usable for the next run. Hosts without an entry are
     /// left alone.
-    async fn persist_set_cookie(&self, url: &str, response: &HttpResponse, sent_cookie: Option<&str>) {
+    async fn persist_set_cookie(&self, response: &HttpResponse, sent_cookie: Option<&str>) {
         let Some(store) = self.cookie_store.as_ref() else {
             return;
         };
@@ -124,12 +175,8 @@ impl NativeHttpClient {
         if values.is_empty() {
             return;
         }
-        let Some(host) = crate::platform::cookie_host_for_url(url) else {
-            return;
-        };
-        // 送信した Cookie に対応する資格情報だけを更新する。サイトは複数の
-        // ログイン情報を持てるので、他のアカウントのセッションをこの応答で
-        // 上書きしてはいけない。キーは要求ホストとその親ドメイン。
+        // 送った Cookie を含むホストを持つログインだけを更新する。サイトは
+        // 複数のログインを持てるので、別アカウントのセッションは触らない。
         let Some(sent) = sent_cookie else {
             return;
         };
@@ -137,40 +184,91 @@ impl NativeHttpClient {
         if sent_pairs.is_empty() {
             return;
         }
-        let Ok(all) = store.list().await else {
+        let Ok(all) = store.list_groups().await else {
             return;
         };
-        for key in crate::platform::cookie_lookup_hosts(&host) {
-            let Some(credentials) = all.get(&key) else {
-                continue;
-            };
-            let mut updated_credentials = credentials.clone();
+        for (site, groups) in all {
+            let mut updated_groups = groups.clone();
             let mut changed = false;
-            for credential in updated_credentials.iter_mut() {
-                if !credential_was_sent(&credential.cookie, &sent_pairs) {
+            for group in updated_groups.iter_mut() {
+                let Some(host) = group.host_for_sent(&sent_pairs).map(str::to_string) else {
                     continue;
-                }
-                let updated = crate::platform::apply_set_cookie(&credential.cookie, &values);
-                if updated != credential.cookie {
-                    credential.cookie = updated;
-                    changed = true;
+                };
+                if let Some(entry) = group.cookies.iter_mut().find(|entry| entry.host == host) {
+                    let updated = crate::platform::apply_set_cookie(&entry.cookie, &values);
+                    if updated != entry.cookie {
+                        entry.cookie = updated;
+                        changed = true;
+                    }
                 }
             }
             if changed {
-                let _ = store.save_all(&key, &updated_credentials).await;
+                let _ = store.save_groups(&site, &updated_groups).await;
             }
         }
     }
 
     /// Synchronous entry point used by `send` inside `spawn_blocking`.
     fn send_blocking(&self, request: &HttpRequest) -> Result<HttpResponse> {
+        if request.trusted_endpoint {
+            return self.send_trusted(request);
+        }
         match request.method {
             HttpMethod::Get => match request.redirect {
                 RedirectMode::Follow => self.send_follow(request),
                 RedirectMode::Manual => self.send_manual(request),
             },
             HttpMethod::Post => self.send_post(request),
+            HttpMethod::Put | HttpMethod::Delete => self.send_trusted(request),
         }
+    }
+
+    /// Infrastructure request (object storage endpoint).
+    ///
+    /// The URL comes from the user's own configuration, so the public-address
+    /// check does not apply (a local MinIO is legitimate) and every response
+    /// header is preserved (`ETag` / `Content-Range` are part of the
+    /// object-storage contract). No site fetch tiers: object storage is a plain
+    /// HTTPS API, and the caller chooses whether redirects are followed.
+    fn send_trusted(&self, request: &HttpRequest) -> Result<HttpResponse> {
+        crate::platform::url_policy::validate_url_syntax(&request.url).map_err(io_error)?;
+        let client = match request.redirect {
+            RedirectMode::Follow => &self.client,
+            RedirectMode::Manual => &self.manual_redirect_client,
+        };
+        let mut builder = match request.method {
+            HttpMethod::Get => client.get(&request.url),
+            HttpMethod::Post => client.post(&request.url),
+            HttpMethod::Put => client.put(&request.url),
+            HttpMethod::Delete => client.delete(&request.url),
+        };
+        for (name, value) in &request.headers {
+            if !is_safe_header_value(value) {
+                return Err(io_error("unsafe header value"));
+            }
+            builder = builder.header(name, value);
+        }
+        if let Some(body) = &request.body {
+            builder = builder.body(body.clone());
+        }
+        let response = builder.send().map_err(|e| NarouError::Http(e.to_string()))?;
+        let status = response.status().as_u16();
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let body = read_response_bytes(response)?;
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
     }
 
     /// Follow-mode GET: tiered curl → reqwest → subprocess fallback.
@@ -185,69 +283,45 @@ impl NativeHttpClient {
         let user_agent = request.header("User-Agent").unwrap_or(&self.user_agent);
         let domain = crate::downloader::http_policy::domain_of(url).to_string();
         let mut last_error = None;
-
-        if self.prefer_curl.load(Ordering::Relaxed) {
-            match self.fetch_tier_curl(request, user_agent) {
-                Ok(response) => return Ok(response),
-                Err(err) => last_error = Some(err),
-            }
-        }
-
-        let tier_failures = self.tier_failures.lock();
-        let skip_curl = tier_failures
-            .get(&domain)
-            .is_some_and(|f| f[0] >= FAIL_THRESHOLD);
-        let skip_reqwest = tier_failures
-            .get(&domain)
-            .is_some_and(|f| f[1] >= FAIL_THRESHOLD);
-        let skip_wget = tier_failures
-            .get(&domain)
-            .is_some_and(|f| f[2] >= FAIL_THRESHOLD);
-        drop(tier_failures);
-
-        if !skip_curl && !self.prefer_curl.load(Ordering::Relaxed) {
-            match self.fetch_tier_curl(request, user_agent) {
+        for tier in self.tier_order(&domain) {
+            let attempt = match tier {
+                TIER_CURL => self.fetch_tier_curl(request, user_agent),
+                TIER_REQWEST => self.fetch_tier_reqwest(request, user_agent),
+                TIER_SUBPROCESS => self.fetch_tier_subprocess(request, user_agent),
+                _ => unreachable!("tier index out of range: {tier}"),
+            };
+            match attempt {
                 Ok(response) => {
-                    self.prefer_curl.store(true, Ordering::Relaxed);
+                    self.tiers.lock().note_success(&domain, tier);
                     return Ok(response);
                 }
                 Err(err) => {
+                    self.tiers.lock().note_failure(&domain, tier);
                     last_error = Some(err);
-                    self.tier_failures
-                        .lock()
-                        .entry(domain.clone())
-                        .or_insert([0; 3])[0] += 1;
-                }
-            }
-        }
-
-        if !skip_reqwest {
-            match self.fetch_tier_reqwest(request, user_agent) {
-                Ok(response) => return Ok(response),
-                Err(err) => {
-                    last_error = Some(err);
-                    self.tier_failures
-                        .lock()
-                        .entry(domain.clone())
-                        .or_insert([0; 3])[1] += 1;
-                }
-            }
-        }
-
-        if !skip_wget {
-            match self.fetch_tier_subprocess(request, user_agent) {
-                Ok(response) => return Ok(response),
-                Err(err) => {
-                    last_error = Some(err);
-                    self.tier_failures
-                        .lock()
-                        .entry(domain.clone())
-                        .or_insert([0; 3])[2] += 1;
                 }
             }
         }
 
         Err(last_error.unwrap_or_else(|| NarouError::NotFound(url.to_string())))
+    }
+
+    /// このドメインで試す段を、直近成功した段を先頭にした順序で返す。
+    ///
+    /// 全段が失敗閾値に達している場合はカウンタを捨てて通常順序に戻す。
+    /// そうしないと一時的な障害で全段が外れ、以降そのドメインの取得が
+    /// すべて失敗してしまう。
+    fn tier_order(&self, domain: &str) -> Vec<usize> {
+        let mut state = self.tiers.lock();
+        let order: Vec<usize> = state
+            .order(domain)
+            .into_iter()
+            .filter(|&tier| state.should_try(domain, tier))
+            .collect();
+        if order.is_empty() {
+            state.forget(domain);
+            return (0..TIER_COUNT).collect();
+        }
+        order
     }
 
     /// Manual-mode GET: no redirect following; 3xx responses are returned
@@ -287,8 +361,8 @@ impl NativeHttpClient {
 
         let response = req.send().map_err(|e| NarouError::Http(e.to_string()))?;
         let status = response.status().as_u16();
-        if (400..600).contains(&status) {
-            if let Ok((code, Some(location))) = self.curl_probe_redirect(request, user_agent)
+        if (400..600).contains(&status)
+            && let Ok((code, Some(location))) = self.curl_probe_redirect(request, user_agent)
                 && (300..400).contains(&code)
             {
                 return Ok(HttpResponse {
@@ -297,7 +371,6 @@ impl NativeHttpClient {
                     body: Vec::new(),
                 });
             }
-        }
 
         let headers = content_type_header(content_type_of(&response));
         let body = read_response_bytes(response)?;
@@ -845,19 +918,70 @@ impl NativeHttpClient {
 }
 
 impl HttpClient for NativeHttpClient {
+    /// DNS まで見る検証 (プラットフォーム既定は構文検証のみ)。
+    fn validate_url<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            validate_public_url(url).map_err(|error| NarouError::Http(error.to_string()))
+        })
+    }
+
     fn send<'a>(&'a self, request: HttpRequest) -> BoxFuture<'a, Result<HttpResponse>> {
         let this = self.clone();
         Box::pin(async move {
-            let url = request.url.clone();
             let sent_cookie = request.header("Cookie").map(str::to_string);
             let worker = this.clone();
             let response = tokio::task::spawn_blocking(move || worker.send_blocking(&request))
                 .await
                 .map_err(|e| NarouError::Http(e.to_string()))??;
-            this.persist_set_cookie(&url, &response, sent_cookie.as_deref())
-                .await;
+            this.persist_set_cookie(&response, sent_cookie.as_deref()).await;
             Ok(response)
         })
+    }
+}
+
+#[cfg(test)]
+mod tier_state_tests {
+    use super::*;
+
+    #[test]
+    fn winning_tier_is_tried_first() {
+        let mut state = TierState::default();
+        assert_eq!(state.order("example.com"), vec![0, 1, 2]);
+        state.note_success("example.com", TIER_SUBPROCESS);
+        assert_eq!(state.order("example.com"), vec![2, 0, 1]);
+        assert_eq!(state.order("other.example"), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn success_clears_accumulated_failures() {
+        let mut state = TierState::default();
+        for _ in 0..FAIL_THRESHOLD {
+            state.note_failure("example.com", TIER_CURL);
+        }
+        assert!(!state.should_try("example.com", TIER_CURL));
+        state.note_success("example.com", TIER_CURL);
+        assert!(state.should_try("example.com", TIER_CURL));
+    }
+
+    #[test]
+    fn failing_preferred_tier_drops_the_preference() {
+        let mut state = TierState::default();
+        state.note_success("example.com", TIER_REQWEST);
+        state.note_failure("example.com", TIER_REQWEST);
+        assert_eq!(state.order("example.com"), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn forgetting_a_domain_restores_every_tier() {
+        let mut state = TierState::default();
+        for tier in 0..TIER_COUNT {
+            for _ in 0..FAIL_THRESHOLD {
+                state.note_failure("example.com", tier);
+            }
+        }
+        assert!((0..TIER_COUNT).all(|tier| !state.should_try("example.com", tier)));
+        state.forget("example.com");
+        assert!((0..TIER_COUNT).all(|tier| state.should_try("example.com", tier)));
     }
 }
 
@@ -867,9 +991,8 @@ fn build_reqwest_client(
 ) -> Result<reqwest::blocking::Client> {
     let redirect_policy = if follow_redirects {
         reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= MAX_REDIRECTS {
-                attempt.stop()
-            } else if validate_public_url(attempt.url().as_str()).is_err() {
+            if attempt.previous().len() >= MAX_REDIRECTS
+                || validate_public_url(attempt.url().as_str()).is_err() {
                 attempt.stop()
             } else {
                 attempt.follow()

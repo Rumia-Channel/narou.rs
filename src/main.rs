@@ -8,7 +8,7 @@ mod logger;
 mod test_support;
 
 use std::any::Any;
-use std::io::{IsTerminal, Read};
+use std::io::IsTerminal;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -123,23 +123,38 @@ fn read_targets_from_stdin() -> Vec<String> {
         return Vec::new();
     }
 
+    // narou.rb CommandLine.run は STDIN.gets で 1 行だけ読み込んで引数に
+    // 連結する。残りの入力はコマンド側が読むか捨てられる。
     let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
+    if std::io::stdin().read_line(&mut input).is_err() {
         return Vec::new();
     }
     parse_stdin_targets(&input)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_stdin_targets;
-
-    #[test]
-    fn parse_stdin_targets_splits_piped_ids_like_ruby_argv() {
-        assert_eq!(
-            parse_stdin_targets("3 2\r\n1\t4\n"),
-            vec!["3", "2", "1", "4"]
-        );
+/// stdin を引数ではなくデータとして読む Rust 拡張コマンドを判定する。
+/// narou.rb には stdin をデータとして読むコマンドが無いが、`csv --import -`
+/// (web UI の CSV インポートが使う) と `login set` (cookie を stdin から読む)
+/// は 1 行目を引数として奪われると壊れるため除外する。
+fn stdin_is_command_data(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("login") => true,
+        Some("csv") => {
+            let mut expects_path = false;
+            for arg in args.iter().skip(1) {
+                if expects_path {
+                    return arg == "-";
+                }
+                match arg.as_str() {
+                    "-i" | "--import" => expects_path = true,
+                    "--import=-" | "-i-" => return true,
+                    "--" => return false,
+                    _ => {}
+                }
+            }
+            false
+        }
+        _ => false,
     }
 }
 
@@ -182,10 +197,10 @@ async fn main() {
     // cwd にして本体を起動する。`.narou` はライブラリ dir にあるため、
     // 親が渡した `NAROU_RS_RESTART_CWD` へ戻してから通常処理に入る。
     // 旧 updater でも環境変数は透過するため後方互換。
-    if let Ok(dir) = std::env::var("NAROU_RS_RESTART_CWD") {
-        if !dir.is_empty() {
-            let _ = std::env::set_current_dir(&dir);
-        }
+    if let Ok(dir) = std::env::var("NAROU_RS_RESTART_CWD")
+        && !dir.is_empty()
+    {
+        let _ = std::env::set_current_dir(&dir);
     }
 
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -212,6 +227,13 @@ async fn main() {
     if !args.is_empty() {
         cli::inject_default_args(&mut args);
         cli::inject_command_defaults(&mut args);
+    }
+
+    // narou.rb CommandLine.run はパイプ接続時に stdin から 1 行だけ読み込み、
+    // 全コマンドの引数の末尾に連結する。stdin をデータとして読む拡張コマンド
+    // (csv --import - / login) だけは除外する。
+    if !stdin_is_command_data(&args) {
+        args.extend(read_targets_from_stdin());
     }
 
     // 0.4.0 未満からのアップデート後の初回起動では、小説データの
@@ -283,6 +305,16 @@ async fn run_command(
     let ua = user_agent.clone().or(cli.user_agent);
     logger::use_convert_log_postfix(matches!(&cli.command, Commands::Convert { .. }));
 
+    // サイト定義は保存方式に応じて読み込む（SQLite モードではオブジェクトストア）。
+    // 未初期化のディレクトリ (.narou/ が無い) には読み込む対象が無いので、警告を
+    // 出さずに飛ばす。init はこの後で .narou/ を作る。
+    if narou_rs::db::narou_root_exists()
+        && let Err(error) =
+            narou_rs::native::site_definitions::install_effective_site_settings().await
+    {
+        eprintln!("[WARN] サイト定義の読み込みに失敗しました: {error}");
+    }
+
     match cli.command {
         Commands::Web {
             port,
@@ -292,6 +324,13 @@ async fn run_command(
             commands::web::run_web_server(port, no_browser, hide_console).await;
             0
         }
+        Commands::Author { action } => match commands::author::cmd_author(action).await {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
         Commands::Download {
             targets,
             force,
@@ -304,15 +343,18 @@ async fn run_command(
                 eprintln!("Usage: narou download <url|ncode|id>...");
                 return 127;
             }
-            commands::download::cmd_download(commands::download::DownloadOptions {
-                targets,
-                force,
-                no_convert,
-                freeze,
-                remove,
-                mail,
-                user_agent: ua,
-            })
+            commands::download::cmd_download(
+                commands::download::DownloadOptions {
+                    targets,
+                    force,
+                    no_convert,
+                    freeze,
+                    remove,
+                    mail,
+                    user_agent: ua,
+                },
+                &narou_rs::progress::console_sink(),
+            )
             .await
         }
         Commands::Update {
@@ -324,18 +366,25 @@ async fn run_command(
             sort_by,
             ignore_all,
         } => {
-            commands::update::cmd_update(commands::update::UpdateOptions {
-                ids,
-                force,
-                no_convert,
-                convert_only_new_arrival,
-                gl,
-                sort_by,
-                ignore_all,
-                user_agent: ua,
-            })
+            commands::update::cmd_update(
+                commands::update::UpdateOptions {
+                    ids,
+                    force,
+                    no_convert,
+                    convert_only_new_arrival,
+                    gl,
+                    sort_by,
+                    ignore_all,
+                    user_agent: ua,
+                },
+                &narou_rs::progress::console_sink(),
+            )
             .await;
             0
+        }
+        Commands::Csv { output, import } => {
+            // CSV 取り込みは download コマンド経由で取得するため非同期側で処理する。
+            commands::csv::cmd_csv(output.as_deref(), import.as_deref()).await
         }
         other => run_sync_command(other, trace_args, backtrace),
     }
@@ -354,9 +403,14 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                 0
             }
         }
-        Commands::Download { .. } | Commands::Update { .. } => unreachable!(),
+        Commands::Download { .. } | Commands::Update { .. } | Commands::Csv { .. } | Commands::Author { .. } => {
+            unreachable!()
+        }
         Commands::Mail { targets, force } => {
-            commands::mail::cmd_mail(commands::mail::MailOptions { targets, force });
+            commands::mail::cmd_mail(
+                commands::mail::MailOptions { targets, force },
+                &narou_rs::progress::console_sink(),
+            );
             0
         }
         Commands::Send {
@@ -365,13 +419,16 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             force,
             backup_bookmark,
             restore_bookmark,
-        } => commands::send::cmd_send(commands::send::SendOptions {
-            args,
-            without_freeze,
-            force,
-            backup_bookmark,
-            restore_bookmark,
-        }),
+        } => commands::send::cmd_send(
+            commands::send::SendOptions {
+                args,
+                without_freeze,
+                force,
+                backup_bookmark,
+                restore_bookmark,
+            },
+            &narou_rs::progress::console_sink(),
+        ),
         Commands::Db { action } => match commands::db::cmd_db(action) {
             Ok(_) => 0,
             Err(e) => {
@@ -387,7 +444,7 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             }
         },
         Commands::Convert {
-            mut targets,
+            targets,
             output,
             encoding,
             no_epub,
@@ -401,15 +458,14 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             verbose,
             no_open,
         } => {
-            targets.extend(read_targets_from_stdin());
             if targets.is_empty() {
                 eprintln!("Usage: narou convert <url|ncode|id>...");
                 1
             } else {
-                commands::convert::cmd_convert(
-                    &targets,
-                    output.as_deref(),
-                    encoding.as_deref(),
+                commands::convert::cmd_convert(commands::convert::ConvertOptions {
+                    targets: &targets,
+                    output: output.as_deref(),
+                    encoding: encoding.as_deref(),
                     no_epub,
                     no_mobi,
                     no_strip,
@@ -420,7 +476,8 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                     verbose,
                     ignore_default,
                     ignore_force,
-                );
+                    sink: narou_rs::progress::console_sink().as_ref(),
+                });
                 0
             }
         }
@@ -531,9 +588,6 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             all,
         } => commands::clean::cmd_clean(&targets, force, dry_run, all),
         Commands::Inspect { targets } => commands::inspect::cmd_inspect(&targets),
-        Commands::Csv { output, import } => {
-            commands::csv::cmd_csv(output.as_deref(), import.as_deref())
-        }
         Commands::Trace => match commands::trace::cmd_trace() {
             Ok(_) => 0,
             Err(e) => {
@@ -576,6 +630,9 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
                     cli::IllustSubcommand::Migrate => IllustSubcommand::Migrate,
                     cli::IllustSubcommand::FixExt => IllustSubcommand::FixExt,
                     cli::IllustSubcommand::Rebuild => IllustSubcommand::Rebuild,
+                    cli::IllustSubcommand::S3Push => IllustSubcommand::S3Push,
+                    cli::IllustSubcommand::S3Verify => IllustSubcommand::S3Verify,
+                    cli::IllustSubcommand::S3Dedup => IllustSubcommand::S3Dedup,
                 };
                 commands::illust::cmd_illust(sub, &targets, force, all)
             }
@@ -599,5 +656,18 @@ fn run_sync_command(command: Commands, trace_args: Vec<String>, backtrace: bool)
             }
             127
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_stdin_targets;
+
+    #[test]
+    fn parse_stdin_targets_splits_piped_ids_like_ruby_argv() {
+        assert_eq!(
+            parse_stdin_targets("3 2\r\n1\t4\n"),
+            vec!["3", "2", "1", "4"]
+        );
     }
 }

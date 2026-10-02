@@ -155,7 +155,7 @@ pub(crate) fn render_novel_text(
             } else if style == "plain" {
                 output.push_str("\n\u{FF3B}\u{FF03}\u{533A}\u{5207}\u{308A}\u{7DDA}\u{FF3D}\n\n");
                 output.push_str(&trimmed_post);
-                output.push_str("\n");
+                output.push('\n');
             } else {
                 output.push_str(&format!(
                     "\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{304B}\u{3089}\u{5F8C}\u{66F8}\u{304D}\u{FF3D}\n{}\n\u{FF3B}\u{FF03}\u{3053}\u{3053}\u{3067}\u{5F8C}\u{66F8}\u{304D}\u{7D42}\u{308F}\u{308A}\u{FF3D}\n",
@@ -475,10 +475,12 @@ mod tests {
 
     #[test]
     fn rendered_title_uses_title_date_format_with_title_placeholder() {
-        let mut settings = NovelSettings::default();
-        settings.enable_add_date_to_title = true;
-        settings.title_date_format = "$t (%F) $ns".to_string();
-        settings.title_date_target = "general_lastup".to_string();
+        let settings = NovelSettings {
+            enable_add_date_to_title: true,
+            title_date_format: "$t (%F) $ns".to_string(),
+            title_date_target: "general_lastup".to_string(),
+            ..NovelSettings::default()
+        };
         let toc = TocObject {
             title: "作品".to_string(),
             author: "作者".to_string(),
@@ -497,11 +499,13 @@ mod tests {
 
     #[test]
     fn decorate_title_applies_left_align_end_marker_and_ruby_escape() {
-        let mut settings = NovelSettings::default();
-        settings.enable_add_date_to_title = true;
-        settings.title_date_format = "%F ".to_string();
-        settings.title_date_align = "left".to_string();
-        settings.enable_add_end_to_title = true;
+        let settings = NovelSettings {
+            enable_add_date_to_title: true,
+            title_date_format: "%F ".to_string(),
+            title_date_align: "left".to_string(),
+            enable_add_end_to_title: true,
+            ..NovelSettings::default()
+        };
         let mut record = sample_record();
         record.tags = vec!["end".to_string()];
 
@@ -577,10 +581,12 @@ mod tests {
 
     #[test]
     fn decorate_title_replaces_all_narou_rb_extended_format_symbols() {
-        let mut settings = NovelSettings::default();
-        settings.enable_add_date_to_title = true;
-        settings.title_date_format = "$t $s $ns $ntag $nt".to_string();
-        settings.title_date_target = "general_lastup".to_string();
+        let settings = NovelSettings {
+            enable_add_date_to_title: true,
+            title_date_format: "$t $s $ns $ntag $nt".to_string(),
+            title_date_target: "general_lastup".to_string(),
+            ..NovelSettings::default()
+        };
         let mut record = sample_record();
         record.sitename = "Site".to_string();
         record.novel_type = 2;
@@ -595,8 +601,10 @@ mod tests {
 
     #[test]
     fn rendered_title_strips_prefix_when_enabled() {
-        let mut settings = NovelSettings::default();
-        settings.enable_strip_title_prefix = true;
+        let settings = NovelSettings {
+            enable_strip_title_prefix: true,
+            ..NovelSettings::default()
+        };
         let toc = TocObject {
             title: "《コミカライズ企画進行中》マジカル".to_string(),
             author: "作者".to_string(),

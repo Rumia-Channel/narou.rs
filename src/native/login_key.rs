@@ -12,12 +12,14 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::db::inventory::Inventory;
-use crate::error::{NarouError, Result};
-use crate::login::crypto::{KEY_LEN, random_key};
+use crate::error::Result;
+use crate::login::crypto::{KEY_LEN, parse_key_base64, random_key};
 
 /// File holding the library login key, inside `.narou`.
 pub const KEY_FILE_NAME: &str = "login.key";
-/// Environment variable overriding the key file (base64 of 32 bytes).
+/// Environment variable overriding the key file (base64; 32 bytes are used as-is,
+/// longer/shorter values from [`crate::login::MIN_KEY_LEN`] up are SHA-256
+/// expanded, so `openssl rand -base64 24` works).
 pub const KEY_ENV_VAR: &str = "NAROU_RS_LOGIN_KEY";
 
 /// Where a [`LoginKey`] came from.
@@ -62,14 +64,14 @@ impl LoginKey {
         if let Some(value) = std::env::var_os(KEY_ENV_VAR) {
             let value = value.to_string_lossy().into_owned();
             return Ok(Self {
-                bytes: parse_key(&value)?,
+                bytes: parse_key_base64(&value)?,
                 source: KeySource::Environment,
             });
         }
         if path.is_file() {
             let text = std::fs::read_to_string(path)?;
             return Ok(Self {
-                bytes: parse_key(&text)?,
+                bytes: parse_key_base64(&text)?,
                 source: KeySource::File,
             });
         }
@@ -97,7 +99,7 @@ impl LoginKey {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let text = std::fs::read_to_string(path)?;
                 Ok(Self {
-                    bytes: parse_key(&text)?,
+                    bytes: parse_key_base64(&text)?,
                     source: KeySource::File,
                 })
             }
@@ -127,16 +129,6 @@ impl LoginKey {
     pub fn default_path(root: &Path) -> PathBuf {
         root.join(".narou").join(KEY_FILE_NAME)
     }
-}
-
-fn parse_key(text: &str) -> Result<[u8; KEY_LEN]> {
-    let decoded = BASE64
-        .decode(text.trim())
-        .map_err(|error| NarouError::Login(format!("malformed login key: {error}")))?;
-    decoded
-        .as_slice()
-        .try_into()
-        .map_err(|_| NarouError::Login(format!("login key must be {KEY_LEN} bytes")))
 }
 
 #[cfg(unix)]

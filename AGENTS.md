@@ -36,7 +36,7 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - Rust の production code に置いてよいのは、HTTP 取得、URL 解決、HTML エンティティ復元、共通抽出、DSL 実行基盤、実行制限など全サイトで再利用できる仕組みだけとする。サイト名・ドメイン名・サイト固有 CSS selector / 正規表現 / JSON path を条件にした分岐や専用関数は置かず、それらの値と処理手順は YAML / DSL 側に記述する。
 - 特定サイト名や実データを使う回帰テスト・fixture は許可するが、テスト対象の production code はサイト非依存でなければならない。DSL 拡張が安全性・互換性上どうしても不可能で暫定 Rust 処理が必要な場合は、実装前に理由と YAML へ戻す条件を明示し、ユーザーの了承を得る。
 - 2026-05 時点: ハードコードされた `kakuyomu_preprocess` は完全に除去され、`webnovel/kakuyomu.jp.yaml` の `preprocess:` DSL ブロックへ移行済み。pest 文法ベースの安全な DSL パーサー (`src/downloader/preprocess.pest`) + インタプリタ (`src/downloader/preprocess/interpreter.rs`) により、YAML 記述だけでカクヨム JSON → 中間テキストの展開が可能である。ユーザー側 YAML の `preprocess:` を編集するだけで前処理ロジックを差し替えられる。
-- pest 文法 (`src/downloader/preprocess.pest`) は以下の構文に対応: `guard`/`let`/`set`/`if`/`else`/`for`/`emit`/`insert_at_match`, 文字列補間 `${...}` (式を書ける), 正規表現 JSON 抽出 `extract_json(/.../)`, 追加取得 `request("...")` / `fetch_json("...")` と結果参照 `fetched["<url>"]`, メソッドチェイン `.map`/`.flat_map`/`.flatten`/`.compact`/`.join`/`.gsub`/`.replace`/`.is_array`/`.empty`/`.size`/`.first`/`.last`/`.reverse`, マッチ単位の置換 `.gsub(/re/) { |m| ... }` (`m` は `[全体, グループ1, ...]`), 添字アクセス `arr[0]`/`hash["key"]` (添字は式), 整数リテラルと `+`/`-` (数値文字列は自動変換、それ以外は null), 論理演算 `&&`/`||`/`!`/`==`/`!=`。実行時に step budget / 文字列サイズ上限 / 配列要素数上限による防御あり。
+- pest 文法 (`src/downloader/preprocess.pest`) は以下の構文に対応: `guard`/`let`/`set`/`if`/`else`/`for`/`emit`/`insert_at_match`, 文字列補間 `${...}` (式を書ける)、オブジェクトはキー昇順 (`.keys` の並びも昇順), 正規表現 JSON 抽出 `extract_json(/.../)`, 追加取得 `request("...")` / `fetch_json("...")` と結果参照 `fetched["<url>"]`, メソッドチェイン `.map`/`.flat_map`/`.flatten`/`.compact`/`.join`/`.gsub`/`.replace`/`.keys` (オブジェクトのキー)/`.is_array`/`.empty`/`.size`/`.first`/`.last`/`.reverse`, マッチ単位の置換 `.gsub(/re/) { |m| ... }` (`m` は `[全体, グループ1, ...]`), 添字アクセス `arr[0]`/`hash["key"]` (添字は式), 整数リテラルと `+`/`-` (数値文字列は自動変換、それ以外は null), 論理演算 `&&`/`||`/`!`/`==`/`!=`。実行時に step budget / 文字列サイズ上限 / 配列要素数上限による防御あり。
 - 注意: 真偽判定は Ruby 寄りで、**数値 0・空文字・空配列・null は偽**。`0` を取りうる数値フィールドを分岐に使わない (Pixiv の `illustType` が 0 になる例がある)。
 - `.gsub` は第 1 引数に正規表現リテラル (`/re/`) も取れる。置換文字列では `$1` / `${name}` が展開される。チェインの `.field` / `[...]` は書いた順に評価される (`.first.name` が `.name` → `.first` の順に化けない)。
 - **追加取得 (job キュー)**: `request(url)` / `fetch_json(url)` はその場では取得せず要求として記録し、実行側 (`util::pretreatment_source_with_jobs`) がサイトの `FetchPolicy` 経由で取得してから定義を再実行する。再実行は元の本文からやり直し、新しい要求が無くなるまで最大 4 ラウンド。結果は `fetched["<url>"]` で見え、失敗は null。ジョブの同一性は URL で、結果は `Downloader::preprocess_jobs` が 1 小説分保持する (同じ挿絵を多数の話が参照しても取得は 1 回)。完了したジョブはキューに残さず結果だけを保持するので Worker でも長命な状態を持たない。
@@ -81,16 +81,19 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - 再試行で取得できた小説はレコードの `requires_login`（SQLite `novels.requires_login` / `*.yaml` の `requires_login: true`）を立て、次回から最初のリクエストで Cookie を送る。オプション無しの小説は Cookie を一切送らないため、ログイン不要な小説の挙動は従来と変わらない。
 - 再試行しても取得できない場合は従来どおり 404 判定（`frozen` / `404` タグ + `freeze.yaml`）へ進む。`requires_login` が立っている小説は「Cookie 付きで取得 → 失敗なら凍結」の順になる。
 - サイト固有の値は `webnovel/*.yaml` に置く。追加キーは `login_url`（ログイン用 bin が開く URL、`\k<domain>` 補間あり）と `login_pattern`（HTTP 200 で返るログイン壁を検出する正規表現）。本体にサイト名・ドメイン固有の分岐は置かない。
-- Cookie は `Inventory` の `login_cookie`（SQLite `app_state` / `.narou/login_cookie.yaml`）にホスト単位で保存する。応答の `Set-Cookie` は、既に保存済みのホストに限り `src/native/http.rs` が書き戻してセッションを維持する（保存していないホストには新規エントリを作らない）。
+- Cookie は `Inventory` の `login_cookie`（SQLite `app_state` / `.narou/login_cookie.yaml`）に **サイト単位** で保存する。1 サイトの値は名前つきログインの配列で、各ログインが複数ホストの Cookie を持つ（`LoginGroup { id, site, label, cookies: [{ host, cookie }] }`）。応答の `Set-Cookie` は、その応答で実際に送ったログインのホストに限り `src/native/http.rs` が書き戻してセッションを維持する（保存していないホストには新規エントリを作らない）。
 - ログイン実行は別 bin `narou_rs_login`（`src/bin/login.rs`）が担当する。Chromium 系ブラウザを `--remote-debugging-port` 付きで起動し、DevTools protocol (`Storage.getCookies`) で Cookie を取得する（`ws://` のみなのでブラウザ自動化依存を追加しない）。2 段階認証や CAPTCHA は実ブラウザ操作なのでそのまま通る。ブラウザが無い環境向けに `--cookie "<Cookie 文字列>"` の貼り付け保存、`--list` / `--clear` も用意する。
 - **別端末・サーバーへの持ち込み**: `narou_rs_login` はブラウザのある端末で動かし、`--export <file>` でポータブルな書き出しファイル (YAML) を作る。`--passphrase` 指定時は Argon2id → XChaCha20-Poly1305 で暗号化される。ライブラリ外では書き出しが既定の出力になる。取り込み側は `narou login import <file>`（CLI）または Web UI 設定の「ログイン」タブで受け付ける。
-- **暗号化保存**: 保存値は `.narou/login.key`（または `NAROU_RS_LOGIN_KEY`）の鍵で `enc:v1:<nonce>:<payload>` として暗号化され、ホスト名を AEAD の associated data に束ねるため別ホストへの流用はできない。旧形式の平文値は読み取り可能で、次回保存時に暗号化される。
-- **セッション ID と小説の対応**: 保存した資格情報には UUID を振り (`LoginCredential.id`)、小説レコードは「どのセッションで成功したか」を `login_session` に持つ (SQLite `novels.login_session` / `*.yaml` の `login_session:`)。`requires_login` は「Cookie が要る」、`login_session` は「どれを使うか」を表す。フラグ付きの小説は次回以降、その ID の資格情報を最初のリクエストから送るので、一覧を毎回総当たりしない。ID が無い旧データはストア読み込み時に採番して書き戻す (小説側が覚える値なので不変)。採用した資格情報が消えていた場合は先頭にフォールバックし、次の成功で ID を書き直す。
-- **複数ログインと試行順**: 1 ホストにつき資格情報を順序付きリスト（`LoginCredential`）として保存し、一覧の順に試す。ログインが必要なページは取得に成功した時点で、部分的な一覧は「欠けが解消した／話数が増えた」時点で試行を終える。採用した資格情報はその後の本文取得にも使う。保存形式は JSON 配列で、旧形式（host → Cookie 文字列）は 1 件として読み、次の書き込み時に移行する。`Set-Cookie` の書き戻しは、その応答で実際に送った資格情報だけを更新する（同じサイトの別アカウントのセッションを壊さないため）。
-- **CLI / Web**: `narou login list`（値は伏せて表示）/`set`（置き換え）/`add`（末尾に追加）/`order <host> 2,1,3`（並べ替え）/`clear --index N`（1 件削除）/`import` / `export` を備える。Web UI の設定ページ「ログイン」タブも同じ操作（追加・置き換え・1 件削除・サイト削除・上下ボタンでの並べ替え・取り込み）ができる。API は `GET/DELETE /api/login`、`POST /api/login/set|add|order|import`、`DELETE /api/login/{host}`、`DELETE /api/login/{host}/{index}`。
-- **書き出し形式**: `narou_login_export.yaml` は version 2（`credentials:` に順序付きリスト）。version 1（`cookies:` の host → Cookie 文字列）も読み込める。
-- **Cookie の取得範囲**: サイト自身・親ドメイン・兄弟サブドメインを含むドメイン群の Cookie を保存する。Pixiv のように `.pixiv.net` にセッションを置くサイトでは、`www.pixiv.net` だけを見ると取り落とす。親ドメインの Cookie はサブドメイン宛のリクエストにも `CookieStore::load` がマージして送り、`Set-Cookie` も同じキーへ書き戻す。
-- **ブラウザプロファイル**: `narou_rs_login` はサイトごとの固定プロファイル（`%TEMP%/narou-rs-login/<domain>`、`--profile` で変更可）を使い回すため、次回以降もログイン状態が残る。Cookie 取得後は対象 URL に一度アクセスし、サイト定義の `error_message` / `login_pattern` に一致すればログインできていない可能性を警告する。
+- **暗号化保存**: 保存値は `.narou/login.key`（または `NAROU_RS_LOGIN_KEY`）の鍵で `enc:v1:<nonce>:<payload>` として暗号化され、在庫のキー（サイト名）を AEAD の associated data に束ねるため別サイトへの流用はできない。旧形式の平文値は読み取り可能で、次回保存時に暗号化される（ホスト名で束ねられた旧暗号文もそのまま読める）。鍵は base64 で、32 バイトはそのまま、16 バイト以上（例: `openssl rand -base64 24`）は SHA-256 で 32 バイトへ伸長して使う。Worker も同じ値・同じ実装（`narou_rs::login::parse_key_base64`）を使うので、`NAROU_RS_LOGIN_KEY` に同じ文字列を入れれば native と資格情報を共有できる。
+- **作者の追跡**: 追跡する作者は小説とは別のストア (`src/author.rs`、inventory `author` / SQLite `app_state` / レガシー `.narou/author.yaml`) に **作者ページ URL (ユニークなキー) → サイト名** だけを持つ。名前・追加日時・最終確認などの帳簿は持たない (表示や判定には不要で、サイト名も URL から引ける)。CLI は `narou author add <URL> | list | remove <URL|番号> | check`。`narou update` は小説の更新が終わった後 (hotentry の後) に全作者を確認し、**まだ管理下に無い作品だけ**を通常の download 経路で追加する (`update.disabled-author-tracking` で停止可)。作品の見つけ方はサイト定義側: `author_url` が作者ページを認識し、`author_api_url` (任意) があればその URL を取得、無ければ作者ページ本体を取得して `author_novel_pattern` を当てる。`novel_url` を capture しない定義では `author_work_url` に capture を流して作品 URL を作る (`\k<lower:ncode>` で小文字化。なろう API は大文字の ncode を返すため)。一覧がページ分けされるサイト (ハーメルン: `page=2, 3…`) は `author_next_pattern` の `author_next` capture を次ページとして辿る。終了条件は「次ページが無い」「既に訪れた URL に戻った」だけで、ページ数の上限は設けない (訪問済み集合が往復ページャを止める)。作者ページを扱う定義が複数ある場合は全部から集める (なろう と R18 版)。作者ページの HTML を直接読むより API を優先するのは、壊れにくくページ送りも不要なため。Pixiv (`www.pixiv.net`) は正規表現だけでは作品を切り分けられないため、`author_api_url` (`/ajax/user/{id}/profile/all`) を `preprocess:` の DSL に通し、`author_novel::<作品URL>` (単体小説 + 小説シリーズ + 漫画シリーズ + 単体イラスト・漫画) と `author_series::<シリーズID>` / `author_comic_series::<シリーズID>` を emit する (漫画シリーズは `/ajax/series/<id>`、単体イラストは `/artworks/<id>` の形)。作者の作品一覧にはシリーズに属する話/ページも混ざるので、narou 側は `author_series` ごとに `author_series_episodes_url` (`/ajax/novel/series/{id}/content_titles`) を、`author_comic_series` ごとに `author_comic_series_pages_url` (`/ajax/series/{id}?p=N&lang=ja`、12 件ずつなので空ページまで辿る) を読み、その分を作品一覧から除く (取得できなかったシリーズは除かずに残す)。`narou author check --dry-run` は追加予定の URL を並べるだけで DL しない (数千作品の作者でも確認できる)。
+- **セッション ID と小説の対応**: 保存したログインには UUID を振り (`LoginGroup.id`)、小説レコードは「どのセッションで成功したか」を `login_session` に持つ (SQLite `novels.login_session` / `*.yaml` の `login_session:`)。`requires_login` は「Cookie が要る」、`login_session` は「どれを使うか」を表す。フラグ付きの小説は次回以降、その ID の資格情報を最初のリクエストから送るので、一覧を毎回総当たりしない。ID が無い旧データはストア読み込み時に採番して書き戻す (小説側が覚える値なので不変)。採用した資格情報が消えていた場合は先頭にフォールバックし、次の成功で ID を書き直す。
+- **複数ログインと試行順**: 保存は 1 サイトにつき **順序つきのログインリスト**（`LoginGroup`）で、並び順がそのまま試行順になる。ダウンロード時は保存済みを順に試し、ログイン壁は成功した時点で、部分一覧は「欠けが消えた／話数が増えた」時点で打ち切る。採用したログインはその後の本文取得にも使う。送るヘッダは `merged_cookie()` が各ホストの Cookie を 1 本に畳んで作り、名前が衝突したときは具体的なホストを優先する。`Set-Cookie` の書き戻しは「その応答で実際に送ったログイン」だけを更新する（同じサイトの別アカウントのセッションを壊さないため）。
+- **CLI / Web**: `narou login list` はサイトごとに番号・名前・短縮 ID・ホスト数を表示する。`import <file> --name <名前>`（そのファイルが持ち込むログインに名前を付ける）、`rename <site> <番号> <名前>`（空文字で名前を消す）、`order <site> 2,1,3`（1 始まりの番号で試行順を指定。全件指定が必要）、`clear [<site>] [--index N]`（サイト内の 1 件、またはサイトごと削除）、`clear`（全削除）を備える。Cookie の直接登録は廃止し、取り込みとブラウザ取得 (`narou_rs_login`) だけが登録経路。Web UI の設定ページ「ログイン」タブも同じ操作（取り込み・名前変更・上下ボタンでの並べ替え・1 件削除・サイト削除・全削除）ができる。API は `GET /api/login`、`POST /api/login/import|rename|order`、`DELETE /api/login`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}`。
+- **書き出し形式**: `narou_login_export.yaml` は version 3（`sites:` にサイト → ログインの並び）。version 2（`credentials:` にホストごとの 1 本、同じ位置が同じアカウント）と version 1（`cookies:` の host→cookie マップ）も読める。サイト定義が読めない環境では、まとめ先が分からない旧データはホスト単位のまま残す。
+- **取り込み単位で名前をつける**: `narou login import <file> --name 本垢`（Web UI は取り込み欄の名前入力。空欄なら選択したファイル名から拡張子を除いた名前）で、そのファイルが持ち込むログインに名前が付く。ホストごとに分かれて書かれた旧形式（版 1 / 版 2）は読み込み時にホストごとに並べ直して 1 ログインへ畳むので、**1 ファイル = 1 セッション = 1 名前**になる（1 ファイルに複数セッションがあるときだけ `名前 1`, `名前 2` と番号が付く）。取得時に付けたければ `narou_rs_login --name 本垢`。
+- **過去に分解されたデータの修復**: 保存済みのログインが「ホストが重ならず Cookie 名も衝突しない」組み合わせなら、読み込み時に 1 ログインへ畳んで書き戻す（別アカウントは Cookie 名が衝突するので分かれたまま残る）。
+- **Cookie の取得範囲**: 取得側はサイトのドメインファミリー（サイト自身・親ドメイン・兄弟サブドメイン）を **1 つのログインにまとめて** 保存する。Pixiv のように `.pixiv.net` にセッションを置くサイトで `www.pixiv.net` だけを見るとセッションを取り落とす。まとめ先のサイト名はサイト定義のドメインで決め、定義が無ければホストをそのまま使う（親ドメインのキーは配下の定義があればそこへ寄せる）。`Set-Cookie` の書き戻しも同じログインへ行う。
+- **ブラウザプロファイル**: `narou_rs_login` は**毎回まっさらな一時プロファイル**（`%TEMP%/narou-rs-login-<pid>`）でブラウザを開く。前回のログインを持ち越すと、別アカウントで入るためにログアウト→ログインを挟むことになり、その途中でセッションが切れやすい。Cookie を保存・書き出ししたあとプロファイルは削除する（取得に失敗したときは残すので、原因を見たり再試行に使える）。使い回したい場合だけ `--profile <DIR>` を指定する（ブラウザの保存ログインや拡張を使いたいとき）。取得後は対象 URL を 1 回取得し、サイト定義の `error_message` / `login_pattern` に当たる場合は「ログインできていない」と警告する（Python ブリッジの `/dashboard` リダイレクト判定に相当）。
 - 配布物: `narou_rs_login` もリリース zip に同梱する（`scripts/package-release.ps1` の `-LoginBinaryPath`、`.github/workflows/release.yml` の helper build / sign / package、`cargo local-build` のすべてに対応済み）。Windows では他のサブ実行ファイルと同じく署名対象に含める。`scripts/package-release.ps1` は `-Platform win` のとき本体・updater・backup・login の Authenticode 署名を梱包前に検証し、未署名なら失敗する（`-SkipSignatureCheck` は署名できないローカル確認専用で、リリース CI からは指定しない）。
 
 ## Git 運用ルール
@@ -151,6 +154,10 @@ cargo check              # Type-check
 ```
 
 **重要**: `cargo run` は `.narou/` を持つ初期化済みライブラリをCWDとして実行する必要がある（例: `sample/novel/`、gitignore 済みのローカル用ディレクトリ）。
+
+## 検証用ライブラリ
+- 動作確認は **`C:\Users\rumia\Documents\WebNovel`** で行う。実データ入りの narou ライブラリ（なろう / カクヨム / ノクターンの 9 作品、`webnovel/*.yaml` も同梱版を配置済み）で、ユーザーが「中のデータの削除も含めて完全に自由にしていい」と許可している。検証用に小説を追加・削除してよい。
+- `%TEMP%` に検証用ライブラリを作らない（過去に 100 個・685MB の残骸を出した）。テストや検証が一時ディレクトリを作るときは `tempfile::TempDir` を使い、panic しても残さない（手動削除は panic で飛ぶ）。
 
 ## Edition 2024 注意事項
 - `{}`フォーマット直後に文字列を書くとprefix扱いされるためスペースが必要
@@ -220,10 +227,10 @@ src/
     narou_api.rs                   - narou_api_batch_update (なろうAPI一括更新)
     util.rs                        - build_section_url, pretreatment_source, sanitize_filename 等
     site_setting/
-      mod.rs                       - SiteSetting struct, accessor methods, compile, load_all, tests
+      mod.rs                       - SiteSetting struct, accessor methods, compile, load_all, merge_user_definition_yaml, tests
       interpolate.rs               - \k<name> テンプレートエンジン
       info_extraction.rs           - resolve_info_pattern, multi_match, get_novel_type_from_string
-      loader.rs                    - load_all_from_dirs, load_settings_from_dir, merge_site_setting
+      loader.rs                    - load_all_from_dirs, load_settings_from_dir
       serde_helpers.rs             - deserialize_yes_no_bool
     preprocess/
       mod.rs                       - PreprocessPipeline struct, run_preprocess
@@ -295,6 +302,8 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 ### SQLite 管理基盤移行 (P0〜P4c 完了 / P5 一部、詳細: docs/sqlite-storage-migration-plan.md)
 - P1 `src/native/sqlite/` エンジン + dual-run テスト、P2 メタデータ全面移行 (database/freeze/alias/tag_colors/local_setting/queue/notepad/latest_convert → `.narou/db.sqlite`)、レガシー自動import(元ファイルは *.imported-* 退避)、`narou db verify|export-yaml|vacuum`。`global_setting` は 2026-09 修正で移行対象から外れファイル管理のまま (前節「グローバル設定の保存先」参照)
 - P3 デュアルモード化: **既定は従来どおり YAML 管理**。`.narou/storage-backend` マーカー(`sqlite`)または Web UI ツアーの選択で Lite(SQLite) へ切替。`NAROU_RS_LEGACY_YAML=1` は強制レガシー。API: `GET/POST /api/storage/mode`
+- **設定ページからの切替**: 設定 → WEB UI タブの「データ管理方式」から現在のモード表示・SQLite への移行・YAML への復帰ができる (`GET/POST /api/storage/mode`、実装は `src/web/storage.rs`)。YAML へ戻すときは `narou db export-yaml --in-place` 相当 (実位置への書き出し + マーカー切替) を先に実行するので、切替で作品データは失われない。`NAROU_RS_LEGACY_YAML=1` のときは固定 (API が `locked_by_env` を返す)。
+- **アップデート版 (Lite / 通常)**: `self-update.variant` は設定ページの Global タブで選べる (`gpl` = AozoraEpub3_Lite 組込み / `standard` = 外部 AozoraEpub3)。更新時の版選択モーダルと同じ設定を書き換える。
 - P4a コンテンツミラー (novel_sections/novel_outputs) — convert時に書込み、Web DL時EPUBはDB優先
 - P4b バージョン履歴 (novel_versions/_sections/_diffs) + `narou diff --history|--show|--restore|--merge-from`。update時自動snapshotはconvertフック経由
 - P4c オブジェクト格納: `objects`/`object_chunks` (BLOB + brotli + crc32) に小説データ・生成物を格納。native は FS ミラー + 読みフォールバック、worker は D1 のみ
@@ -333,10 +342,31 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 ### Phase 6-8 Worker backend (2026-08)
 - `narou_rs` の `worker-runtime` feature は `application`、`platform`、portable `db`/`converter::ini` のみを公開する。CLI、Web、native HTTP、filesystem、process、settings adapters は `native-runtime` gate の内側に置く。
 - `worker_entry/` は `workers-rs 0.8.5` の `fetch` / `scheduled` / `queue` eventを公開する。`composition.rs` は D1 novel/freeze/settings/tag-color adapters と D1 `ObjectStore`(`objects`/`object_chunks` BLOB+brotli+crc32 テーブル) を構成し、Worker固有型をcoreへ逆流させない。
-- `WorkerHttpClient` は Fetch APIを既存 `HttpClient` traitへ接続し、request/response body上限を強制する。`D1ObjectStore` は logical-key prefix、paged LIST、bounded small read/write、streaming AssetStore を D1 上に実装する。
+- `WorkerHttpClient` は Fetch APIを既存 `HttpClient` traitへ接続する。request/response body上限を強制する。**403 を返した GET は `connect()`（生ソケット）で取り直す**（`platform::http1` の HTTP/1.1 実装）。Cloudflare の `fetch` と `connect()` は出口の IP レンジが異なり（後者は公開レンジ外）、`fetch` だけを弾くサイトがあるため。ソケット側で成功応答が得られたときだけ採用し、接続拒否・タイムアウト・解析失敗は元の 403 を保つ。**全アドレスが Cloudflare の公開レンジ内のサイト（例: ハーメルン）は `connect()` 自体が拒否される**ので、外部踏み台（`scripts/sorahost-proxy/`）が必要。 踏み台は `platform::relay` のプロトコルで呼び出し、送信は `platform::http1` の生ソケット（Worker の `fetch` は `http://` を拒否するため）。設定は Worker secret `SORAHOST_PROXY_ENDPOINT`（接続先。パス込みで可、オリジンに正規化される）と `SORAHOST_PROXY_KEY`（リレーの合言葉。PteWorker の `.env` と同値）。リレー本体 は `scripts/sorahost-proxy/`、配布は `platform.yml` の `relay-deploy` ジョブ（静的 curl と CA バンドルを同梱）で、develop / production の Worker デプロイはその後に直列で実行される。`D1ObjectStore` は logical-key prefix、paged LIST、bounded small read/write、streaming AssetStore を D1 上に実装する。
 - `D1NovelRepository` はprepared statements/migrationsでtyped filter/sort、keyset `scan_ids`、atomic sequence allocation、batch mutationをSQL化する。settings、freeze、tag colorsもD1 state/tableへ接続する。
-- `/health/live`、`/health/ready`、認証付きread-only `/api/novels`/`/api/novels/:id`を公開する。`NAROU_ADMIN_TOKEN`はconstant-time比較。未知queue envelopeはledgerへ記録して安全にackする (retryしない)。Queue実ジョブ実行 (D1 ledger・bounded retry・checkpoint resume) は Phase 8 で実装済み。
+- `/health/live`、`/health/ready` と認証付き API (`/api/novels*`、`/api/login*`、`/api/sites*`、`/api/jobs*`、`/api/global_setting`、`/api/admin/object-migration`) に加え、Web UI の表示・操作系ルート（`/api/list`、`/api/sort_state`、`/api/webui/config`、`/api/tag_list`、`/api/queue/*`、`/api/feature_tour/*`、`/api/freeze`、`/api/novels/{freeze,unfreeze,remove}`、`/api/edit_tag`、`/api/tag/change_color`、`/api/download`、`/api/convert`、`/api/update*`、`/api/story`、`/api/diff_*`、`/api/notepad/*`、`/api/history`、`/api/taginfo.json`、`/api/version/*.json`）を公開する。実現不能な操作は 501 + 機械可読コード。JSON は core の `application::settings_view` / `web_payloads` / `version_compare` を native と共有する。`NAROU_ADMIN_TOKEN`はconstant-time比較。未知queue envelopeはledgerへ記録して安全にackする (retryしない)。Queue実ジョブ実行 (D1 ledger・bounded retry・checkpoint resume) は Phase 8 で実装済み。
 - Worker production readinessはD1 `DB` bindingと `NAROU_ADMIN_TOKEN` secretを要求する。秘密値はリポジトリへ置かない。
+
+### Cloudflare Workers 移行 (2026-09-26 決定、詳細: docs/cloudflare-workers-migration-plan.md)
+- **ゴール**: Web UI ごと Workers へ移行する。native は CLI と、Workers で代替できない重量処理・ローカル操作のために残す。
+- **重量処理**: Worker 内の AozoraEpub3_Lite (in-process) で完結。外部プロセス前提の機能 (AozoraEpub3 jar / kindlegen / SMTP / 端末送信 / セルフアップデート / `folder` / `browser` 等) は `blocked` / `501` で明示的に拒否し、CF Containers は使わない。
+- **保存**: **メタデータと本文は D1**（`toc.yaml` / `本文/*.yaml` / raw HTML をそのまま置かず、セクション行と列へ展開して保存する）、**挿絵（うごイラ含む）だけ S3 互換ストレージ**。切替は `app_state('inv','asset_backend')` (`d1` | `s3`) で挿絵側にのみ効かせ、本文は常に D1 固定。振り分けは core の `is_illustration_key` + `SplitStore` が担う。**実装・binding・設定キーは `S3_*` / `s3_*` で統一し、ベンダ名 (Wasabi 等) を識別子に使わない**。本番の接続先が Wasabi であることは設定値として外から与える。
+- **EPUB は保存しない**: AozoraEpub3_Lite で、Web UI の DL 要求時に保存済みデータからストリーミング生成する。**Workers では raw HTML などのキャッシュを一切保存しない**（native は従来どおりで `.narou/` 互換に影響なし）。
+- フェーズ: P0a 足回り (完了) → P0b 署名・S3 アダプタ (完了) → P0c 挿絵を S3 へ (SplitStore + `asset_backend`) → P0d 本文の構造化と移行 (セクション行 + YAML blob からの移行) → P0e 契約テスト + CI デプロイ → P1 取得系 (SSRF port 化・settings 注入・CookieStore・YAML provider) → P2 変換を Worker へ (変換済み本文を列に保存) → P3 Web UI 移植 → P4 運用。
+- 移行期間は `asset_backend`（挿絵）と `content_backend`（本文の blob → 行）を切り替え可能にし、フラグ 1 つで旧経路へ戻せる状態を保つ (D1 側の `objects`/`object_chunks` は移行後も消さない)。
+
+### Worker のジョブ実行・進捗配信・コンソール (2026-09)
+- **実行系**: `worker_entry/src/executor.rs` が queue から受けたジョブを実行し、`consumer.rs` が ack/retry を、`ledger.rs` が試行回数と実行トークンを担う。再試行の解釈 (`queue.max-retries` / `queue.retry-backoff`) は core の `application::retry_policy` が唯一の実装で、native の queue worker と Worker が同じ値を使う。
+- **進捗配信 (PushHub)**: Durable Object `PUSH_HUB` (`worker_entry/src/push_hub.rs`) が WebSocket を保持し、worker からは `POST /api/push/events` の HTTP でイベントを渡す (DO を直接 fetch すると "Cannot reconstruct" になるため HTTP 経由)。Web UI は `/websocket` に接続する。
+- **イベント payload**: ジョブイベントの生成は core の `application::push_events` が唯一の実装で、native の Web UI 経路と Worker が同一の JSON を出す。
+- **コンソール行**: ジョブのコンソール出力は core の `application::messages` が唯一の生成元。Worker 側は `messages::set_default_sink` に `PushHubSink` を挿し、ジョブ境界で `drain()` してまとめて送る (`stream` = `stdout` / `stderr`)。
+- **共有ヘルパ**: Web UI の入力検証・上限値・ソート状態・HTML ヘルパは core の `application::webui` が唯一の定義で、native の `src/web/**` と `worker_entry/src/webui/**` はそれを再エクスポートして使う。
+- **ローカル検証**: `worker_entry` で `npx wrangler dev --config wrangler.toml` を起動し、`POST /api/download` → `POST /api/convert` を流せば DL から変換まで通る。fetch は手元のマシンから出るため、本番で 403 になるサイトもここでは取得できる (実測: なろう / カクヨム / syosetu.org)。ジョブのコンソール行は `ws://127.0.0.1:8787/ws` に `Authorization: Bearer <NAROU_ADMIN_TOKEN>` で接続すると `echo` イベント (`{"type":"echo","target_console":"stdout","body":"…"}`) として見える。ブラウザは `/login` で管理トークンを Cookie (`narou_api_token`、HttpOnly / SameSite=Lax) に入れれば Bearer 無しで UI 全体を操作できる (fetch / EPUB リンク / WebSocket すべて Cookie が付く)。`.dev.vars` に `NAROU_AUTH_REQUIRED=false` を足すのは、Cookie を経由せず素通しさせたい場合だけ (本番は Access を境界にするときだけ false)。
+- **注意**: ソースを変更すると `wrangler dev` は資産ディレクトリ `public/` の削除に失敗して (Windows の EBUSY) 無言で停止する。変更後は起動し直すこと。
+- **ホットリロード (native)**: `narou web` は設定変更を再起動なしで反映する。`server-*`（Host 許可リスト / WS Origin / reverse proxy / Basic 認証）は `src/web/server_security.rs` の `ServerSecurity` を `RwLock` で持ち、保存 API が `SettingsEffect::ServerSecurityChanged` で即時再適用、外部からの変更（CLI・手編集）は `commands/web.rs` の 30 秒 watcher が拾う。watcher は `update.auto-schedule(.timezone)` でスケジューラを再起動し、`webui.*` を `webui.config.reload` で再配信、`logging*` でロガーを再 init する。`webnovel/*.yaml` は `EFFECTIVE_SITE_SETTINGS`（差し替え可能・fingerprint で再コンパイル抑制）を sites API の保存後に更新＋30 秒ポーリングで外部編集を拾い、`site_timezone` は毎呼び出しで現スナップショットを参照する。再起動が要るのは `server-port` / `server-bind`（リスナー再バインド）、`server-basic-auth.require-for-external-bind`（起動時ガード）、`no-color`（tracing subscriber）、`concurrency` のレーン数、`.narou/storage-backend` の切替（DB 層の差し替えで、切替時に明示的に再起動）だけ。
+- **ホットリロード**: Worker は再起動・再デプロイを前提にしない。サイト定義 / 設定 / `asset_backend` / section hash / 凍結 ID / タグ色 / secret はすべて isolate 内キャッシュ (`isolate_cache::TtlMap`) で、TTL (既定 30 秒) か書き込み時の無効化で反映する。**設定変更・secret ローテーション・`webnovel/*.yaml` の差し替えに再デプロイは不要** (反映は最大 30 秒、書き込んだ isolate では即時)。キャッシュを足すときは同じ規則に従うこと。
+- **D1 read replication**: `deploy_worker.py` が `ci/enable_read_replication.py` で有効化する (REST API のみ、`wrangler d1` に該当コマンド無し)。Cloudflare の仕様上 **Sessions API を使わない限り全クエリは primary に行く** ため、UI の読み取りは `build_ui` の `first-unconstrained` セッション、ジョブ実行系は primary 固定という分担にしている。
+- **デプロイ**: `worker_entry/ci/deploy_worker.py` が `NAROU_DEPLOY_TARGET=develop|production` で D1 / Queue を用意し `wrangler.ci.toml` を描画してデプロイし、契約テストを流す。`CLOUDFLARE_API_TOKEN` が必要 (無い環境では手元からデプロイできない)。
 
 ### 最近の追加 (2026-05〜09)
 - **update の並列ダウンロード** (E): `update.max-parallel-domains` 設定（既定 4）で対象小説をサイトドメイン別にグルーピングし、ドメインごとにワーカースレッドを割り当てて並列ダウンロード。同一ドメイン内は常に直列を維持するため対サイト礼儀は崩れない。1 で従来の逐次動作、フォース指定・ウェブモード・ドメインが1種類のときは自動的に逐次にフォールバック
@@ -348,7 +378,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **self-update の Unix デタッチ** (D): Linux/macOS で self-update 中も本体が生存できるよう、updater を `setsid` で切り離して起動
 - **self-update の variant 選択** (2026-09): GPL版(Lite組込み)/通常版 の選択は global 設定 `self-update.variant` (`gpl` / `standard`) が唯一の保存先で、Web UI の環境設定 Global タブのセレクトと `narou setting self-update.variant=...` の両方から設定でき、`narou setting` の一覧にも表示される。0.4.0 以下からの更新時は未設定なら Web UI が選択モーダルを表示して保存し、設定済みならモーダルを出さず保存値で更新する。更新は 保存値 → ビルド variant の順で解決し (リクエストの明示指定が最優先)、GPL版は `narou_rs_*-GPL.zip` を取得する。未設定へ戻すと実行中のビルドと同じ variant になる
 - **ruby タグ除去** (I-4): サブタイトルとファイル名からルビ注記（`《…》` 形式）を除去し、Ruby版と表示を揃える
-- **小説単位の queue lane 跨ぎ exclusion** (C): 同じ小説が primary / secondary lane の両方で同時に走らないよう、novel 単位の排他を queue worker に追加
+- **小説単位の queue lane 跨ぎ exclusion** (C): 同じ小説が primary / secondary lane の両方で同時に走らないよう、novel 単位の排他を queue worker に追加。判定は**実行中の子プロセスが今まさに触っている小説**（`.narou/lock.yaml`、`NovelLockGuard`。convert / download / update が取得し、終了で消える。30 分を超えた残骸は無視）で行うので、全作品更新の最中でも別の小説の変換は並行できる（当初は「対象一覧」で判定していたため、全作品更新の間はどの変換も待機になっていた）
 
 ### 変換互換性
 - **なろう**: narou.rb参照データと完全互換確認済み
@@ -356,7 +386,8 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - ※米印変換、全角数字、ルビ、auto_join_line、各種文字変換も完全一致
 
 ### AozoraEpub3_Lite 組み込みエンジン (lite feature, 2026-09)
-- pin: `aozora_epub3_lite` = `cd67ddb` (v0.1.4)。更新時は `Cargo.toml` の `rev` を書き換えて `cargo update -p aozora_epub3_lite`。
+- pin: `aozora_epub3_lite` = `214aabc` (v0.1.6)。更新時は `Cargo.toml` の `rev` を書き換えて `cargo update -p aozora_epub3_lite`。`214aabc` は wasm32-unknown-unknown で `SystemTime::now()` が panic していた問題（`dcterms:modified` の生成）を JS 時計で回避した修正を含む (`js-sys` は wasm 限定依存)。
+- 呼び出し側は書き出しを **1 エントリずつ**進められる (`EpubBook::stream_writer(sink)` → `next_entry()` / `write_current(bytes)` / `finish()`)。Worker の `download.epub` はこれと `worker::Response::from_stream` を組み合わせ、完成した EPUB を保持せずチャンクを流す (`ChunkSink` は `narou_rs::epub_lite` が提供)。挿絵は `LazyImageSource` に書き出し直前の 1 枚だけ注入する (構築はパス一覧しか読まないため先読み不要。列挙は 512 枚 / 1 枚 16 MiB で 413)。
 - 組み立ては Lite CLI (`main.rs::convert_input`) と同じ公開 API を使う。独自実装 (挿絵の連番化・外字フォント収集・UUID 生成) は持たない。
   - `config_for(aozoraepub3dir)` = `AozoraConfig::load_from_dirs([dir], <dir>/AozoraEpub3.ini)`。Java 版と同じ注記表・外字フォント・INI を読む。INI が無ければ `preset/AozoraEpub3.ini` 相当のフラグ。
   - `build_book(input_txt, options)`: `collect_assets` → `decorate_image_tags` → `rewrite_image_source` → `remove_missing_image_sources` → `remove_image_sources` (自動表紙) → `reflow_image_sections` → `build_metadata` (`urn:uuid:` は Java と同じ `java_name_uuid`) → `build_title_page_markup` → `append_gaiji_assets`。
@@ -366,9 +397,245 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - 同梱 `replace.txt` は読み込まない (削除済み)。Java は narou.rb 構成では `replace.txt` を持たない (配布物は `replace_sample.txt`) ため、読み込むと `－`→`―` など不要な文字置換が入り Java とずれる。
 - 残差: 外字フォント (`gaiji/dakuten/*.ttf`) は `aozoraepub3dir` が無いと格納できない。`AozoraConfig::gaiji_fonts` がパス指定のため、同梱資産 (バイト列) からは渡せない。Java は濁点外字に `<span class="glyph u30fc-u309a">` を出すが Lite は素の文字になる (この差は外字を使う小説でのみ発生)。
 - **フォント (濁点フォント / 本文フォント)**: 外部ツールには `DakutenFontGuard` が `aozoraepub3dir/template/OPS/fonts/DMincho.ttf` と `css_custom/vertical_font.css` を流し込んで効かせる。組み込み (Lite) にはその経路が無いので、narou は同じ内容を `EpubBuildOptions::extra_assets` の `style/vertical_font.css` + `fonts/DMincho.ttf` として渡し、crate 側が本文 (`item/xhtml/*.xhtml`) からその CSS をリンクする (組み込み CSS より後ろに置くので同じ詳細度ならこちらが勝つ)。設定 `convert.epub-font` (`auto` / `always`) で選び、`always` は本文全体を `DakutenAokinMincho` で組む — U+3000 (全角スペース) を描けない Reader (超縦書き など) 向けの回避策で、`auto` は従来どおり濁点注記のある小説だけ。
-- **注意**: `aozoraepub3dir` を設定すると CLI は外部ツール (jar / Lite exe) を優先する (narou.rb と同じ)。組み込みエンジンを強制する設定は持たない。
+- **注意**: `aozoraepub3dir` を設定すると CLI は外部ツール (jar / Lite exe) を優先する (narou.rb と同じ)。エンジンは設定 `convert.epub-engine` (global、値: `auto` / `lite` / `external`) で選ぶ。未設定 = `auto` は従来どおり外部があれば外部・無ければ組み込み、`lite` は組み込みを強制 (組み込み入りでビルドされていなければエラー)、`external` は外部を強制する。設定ページの「一般」タブからも切り替えられ、Web UI の変換は子プロセスで走るためその設定がそのまま効く。1 回だけ試すときは環境変数 `NAROU_RS_EPUB_ENGINE=lite|external` (`builtin` / `java` も可) で上書きできる。
 - 実データ検証 (2026-09-15, v0.1.3): `WebNovel` の n0421du (401 セクション) で Java 版と **422/423 ファイルがバイト完全一致**、挿絵入りでも **425/426 がバイト完全一致**（単ページ画像化・連番・表紙処理を含む）。残差は `dcterms:modified` のみ（Java はローカル時刻に `Z`、Lite は UTC。Lite 側の意図的な非再現）。
 - 検証手順は `docs/aozora_lite_evaluation_2026-08-23.md` の「更新 (2026-09-15)」節。
+
+### Worker の HTTP 検証・資格情報・設定 (2026-09)
+
+- **URL 検証の分担**: 構文判定 (scheme / host / port / アドレスリテラルの公開判定) は
+  `src/platform/url_policy.rs` にあり、`HttpClient::validate_url` の**既定実装**がこれを使う。
+  native は上書きして DNS 解決先まで確認する (`src/native/http.rs`)。wasm には解決手段が無いため
+  worker は既定実装のまま (= 構文とリテラルのみ) で、到達可否は Cloudflare の egress に委ねる。
+  同期文脈 (挿絵 URL の足切り / preprocess DSL の `fetch`) は `is_safe_public_url_syntax` を使い、
+  ホスト名の解決先は実際の取得時に transport が確認する。
+- **資格情報**: `D1CookieStore` (`worker_entry/src/d1_cookie_store.rs`) が native と同じ
+  `app_state(scope='inv', key='login_cookie')` を読み書きする (at-rest 暗号化、鍵は secret
+  `NAROU_RS_LOGIN_KEY`)。`Set-Cookie` の書き戻しは `WorkerHttpClient`、管理は
+  `GET /api/login` / `POST /api/login/set` / `DELETE /api/login/{host}`。
+  保存形式の互換は `src/platform/cookie_store.rs` の固定ベクタテストで担保する。
+- **wasm の乱数**: `getrandom` の `wasm_js` を**ターゲット限定の依存**
+  (`[target.'cfg(target_arch = "wasm32")'.dependencies]`) で有効にしている。native の依存グラフに
+  `wasm-bindgen` を入れないための措置なので、`getrandom` の扱いを変えるときは `cargo tree` で確認する。
+- **設定**: `SnapshotDownloaderSettings` (`src/downloader/settings.rs`) に `app_state` の
+  `local` (`update.strong` / `guard-spoiler` / `auto-add-tags` / `download.use-subdirectory`) と
+  `global` (`over18`)、`inv` の section hash cache を起動時に読んで渡す。同期 API と非同期 D1 の
+  都合で書き戻しは no-op。`over18` 未設定は `None` のままにして年齢認証 `Blocked` 経路を保つ。
+
+### 挿絵バケットの設定 (2026-09)
+
+- 2 モード: (a) `[vars]` に値を置く（既定）、(b) Cloudflare Secrets Store に値を置き、CI には
+  `NAROU_SECRETS_STORE_ID` と `NAROU_S3_*_SECRET_NAME`（名前だけ）を渡す。(b) は
+  `ci/render_config.py` が `[[secrets_store_secrets]]` を差し込み、prefix を `narou/<target>` に導出する。
+- Worker 側の解決順は Secrets Store (`<変数名>_STORE`) → `env.var` → `env.secret`。
+- 検証はローカルで `python ci/render_config.py` を両モード実行し `tomllib` で読み戻す。
+
+### Worker の大きなオブジェクト (2026-09)
+
+- `GET /api/novels/{id}/illustrations/{name}` は、S3 構成なら presigned URL へ 302 して Worker を
+  中継させない（`s3_sigv4::presign_get` + botocore 突き合わせテスト）。D1 構成ではそのまま返す。
+- 移行は `plan`（件数と容量を数えるだけ）→ `copy` → `verify` の順。`asset_backend` の切替は最後。
+
+### Worker のフロント配信・認証・ストレージ (2026-09)
+
+- **静的アセット**: `worker_entry/build_assets.mjs` が `src/web/assets` を `public/` へ焼き込む
+  (`/assets/...` の配置 + ページはルート直下 + `?v=<内容ハッシュ>` + `__NAROU_RS_WEBUI_BUILD__`)。
+  `wrangler*.toml` の `[assets]` が配信し、`html_handling = "auto-trailing-slash"` で `/settings` を解決する。
+  `[build]` は `node build_assets.mjs && worker-build --release`。手動で `wrangler dev` する場合は
+  アセットを作り忘れないこと（`tests/run.mjs` は内部で作る）。
+- **認証**: health は無認証で `authentication_required` / `authentication_configured` を返す。
+  失敗は `{error:{code}}` 形式で、401 = `authentication_required`、トークン未設定 = 500 +
+  `authentication_not_configured`。`NAROU_AUTH_REQUIRED=false` はローカル開発用の抜け道。
+- **S3**: 資格情報は `<変数名>_STORE` バインディング (Secrets Store) 優先、無ければ secret。
+  メタデータは `GET` + `Range: bytes=0-0` で読む（`HEAD` が 403 になる互換ストレージがある）。
+- **キュー**: メッセージは `{version, job_id}` だけ。計画は D1 台帳が唯一の権威。
+- **サイト定義**: 実効定義は isolate 内に 30 秒キャッシュ（書き込みで即時無効化）。
+
+### Worker の CI デプロイ (2026-09)
+
+- `.github/workflows/platform.yml` の `worker-deploy-{develop,production}`。きっかけは
+  `develop` push / タグ push（+ 手動 dispatch）。staging 環境は持たない。GitHub Environments は
+  用途で `Cloudflare`（Workers の secret と vars）と `CodeSining`（release の署名）の 2 つだけを使い、
+  target は `NAROU_DEPLOY_TARGET` で切り替える（一覧は
+  `docs/cloudflare-workers-migration-plan.md` §2.2.8）。
+- 実体は `worker_entry/ci/deploy_worker.py`（provision → render → migrate → secret 投入 → deploy → smoke）。
+  D1/Queue は環境名から導出して冪等に作るので、初回デプロイでも手作業が要らない。
+- 資格情報が無いリポジトリではデプロイだけ理由付きで省略する（テストは走る）。
+
+### サイト定義の差し替え経路 (2026-09)
+
+- `src/application/site_definitions.rs` が唯一の入り口（`SiteDefinitions` + `SiteDefinitionStore` port）。
+  bundle（配布物の `webnovel/*.yaml`）が種とフォールバック、ユーザー定義が同名で上書きする。
+  名前はファイル名そのもの（`ncode.syosetu.com.yaml`）。
+- 置き場は保存方式で選ぶ: native YAML モード = `webnovel/` フォルダ、native SQLite モード = オブジェクト
+  ストア（切り替え時に一度だけ取り込み、以後ファイルを読まない）、Worker = D1。
+- API は native / Worker 共通: `GET /api/sites`、`GET /api/sites/{name}`（本文つき）、
+  `PUT /api/sites/{name}`、`DELETE /api/sites/{name}`。`put` は保存前にコンパイル検証する。
+- 起動時に `native::site_definitions::install_effective_site_settings()` を呼び、同期コードは
+  `downloader::site_setting::effective_site_settings()` を使う（未設定ならファイルから読む）。
+- 実効定義は 2 経路がある。管理 API の表示・保存は `SiteDefinitions::effective()`
+  （ユーザー本文をそのまま返す。native `/api/sites` と同一）、fetch policy / Worker の
+  ダウンローダ (`bundled_sites::load_site_settings`) は `SiteDefinitions::effective_runtime()`
+  （`downloader::site_setting::merge_user_definition_yaml` の version gate を掛ける）。
+  Worker のログイン Cookie 保存キーの畳み (`D1CookieStore::key_site_settings`) も後者を使う。
+- オブジェクトストアの一覧上限は `platform::prefix_upper_bound` を使う（`{prefix}0` は CJK や英字名を
+  落とすので使わない）。
+
+### 挿絵の D1→S3 移行 (2026-09)
+
+- `POST /api/admin/object-migration` (`copy` / `verify` / `status`) で挿絵だけを S3 へ写す。
+  `asset_backend=s3` に切り替える前に実行し、進捗は `app_state('inv','migrate_illustrations')` に残す。
+- コアは `narou_rs::platform::store_migration::migrate_page`（`MemoryObjectStore` でテスト済み）。
+  Worker 側 (`worker_entry/src/object_migration.rs`) は D1/S3 と `app_state` を挿すだけにする。
+
+### 保存先の振り分け (SplitStore, 2026-09)
+
+- `src/platform/split_store.rs`: 挿絵（うごイラの APNG 含む）のバイナリだけ S3 互換ストアへ、
+  それ以外は D1 などの構造化ストアへ流す。判定は「末尾 2 セグメントが `挿絵/<画像拡張子>`」で、
+  小説ディレクトリ名が `挿絵` のケースを巻き込まない。切り替えは `app_state('inv','asset_backend')`
+  (`d1` | `s3`)。旧 `object_backend` は撤去済み。
+- ストアをまたぐ `copy` / `move_or_copy` は失敗させ、呼び出し側の想定違いを早期に検出する。
+
+### native の S3 ストレージ (Wasabi など, 2026-09)
+
+- 保存先の実装は core の `src/platform/s3_store.rs` 1 つで、native と Worker が同じコードを使う
+  (Worker 側の `worker_entry/src/s3_store.rs` は環境から接続情報を読んで組み立てるだけ)。
+  path-style URL、SigV4 署名と presigned GET、stat は `GET` + `Range`。1 オブジェクトの上限は
+  64 MiB、`read_small`/`write_small` は 16 MiB (multipart は未実装で、上限超過は黙って
+  切り捨てず失敗させる)。
+- **署名は URL から導出する** (2026-10): `S3Store::send` は渡された URL から
+  `path`/`query` を切り出して署名する (呼び出し側が canonical 値を別途渡すと
+  endpoint にパス成分がある構成で乖離し得た)。`SignatureDoesNotMatch` のエラーには
+  サーバーが返す `StringToSign` digest と自分側の digest の一致/不一致を示す診断が
+  付く (一致なら鍵/スコープ、不一致なら canonical request の差異)。presigned GET の
+  パスは生キーから組み立てる (`object_path()` の encode 済み値を渡すと二重
+  エンコードになる)。endpoint に `?`/`#` を含む値は拒否する。
+- native の設定は `local_setting` の `s3.endpoint` / `s3.bucket` / `s3.region` / `s3.prefix` /
+  `s3.access-key-id` / `s3.secret-access-key`。`narou setting` から読み書きでき、環境変数 (`S3_*`)
+  があればそちらを優先する (SORAHOST のようなコンテナは環境変数だけで完結する)。
+- 挿絵を S3 に置くかは `s3.asset-backend` (`local` | `s3`、環境変数 `NAROU_RS_ASSET_BACKEND`)。
+  **Worker 側の切替は従来どおり `app_state('inv','asset_backend')`** で、native は設定ファイル側に
+  置く (native から `app_state` を書く口が無いため)。`s3` を選んで接続情報が欠けていれば
+  **fail-closed** で失敗する (黙ってローカル保存へ落とすとディスクを食い潰す)。
+- native の保存先は `src/native/object_store.rs` の `NativeStores` が組む。`SplitStore` により
+  挿絵のバイナリだけが S3 へ流れ、本文・メタデータ・`.illustration_cache.yaml` は従来どおり
+  ローカル (YAML / SQLite ミラー) に残る。downloader と Web のアプリサービスはこのペアを使う。
+- **EPUB 生成はファイルパスを要求する**ため (`epub_lite` も外部 AozoraEpub3 もディレクトリを読む)、
+  生成直前にだけ S3 から取り出し、スコープを抜けた時点で削除する
+  (`native::illustrations::Materialized`)。Web のオンデマンド EPUB と CLI 変換の Lite 経路の
+  両方に接続済み。
+- **既存ライブラリの移行**: `narou illust s3-push` が件数と容量を数え (既定 dry-run)、`-f` で
+  ローカルから S3 へ写す。`narou illust s3-verify` がバイト単位で突き合わせる。どちらも
+  ライブラリ全体が対象で、`s3.asset-backend=s3` と接続情報が必要
+  (`platform::store_migration::migrate_page` を共有)。
+- **挿絵のハッシュ dedup** (SQLite + S3 モードで既定 ON、2026-10): `S3Location::with_illustration_dedup` を
+  付けると、`挿絵/<sha256-hex>.<ext>` を作品を跨いで `illustrations/<base64url(sha256)>.<ext>` の
+  グローバルプールへ寄せる (同じ画像の二重保存を防ぐ)。小説別の配置は `挿絵/` ではなく pool 側が
+  正位置になり、`read`/`stat`/`read_stream` はプールに無ければ旧 `挿絵/` 配置へフォールバックする
+  (移行前の実オブジェクトをそのまま読める)。`delete` は旧配置だけを指し、pool は消さない
+  (他小説と共有されるため)。mitemin (`iNNN`) 名や hash でない名の挿絵は pool に出ず、
+  小説ごとの `挿絵/` 配置を保つ。dedup ON のとき新規挿絵のファイル名は常に `<sha256>.<ext>`
+  (mitemin 名も pool には出ない。index の `iNNN→hex` 対応で参照は辿れる)。
+  条件は `native::sqlite::state::illustration_dedup_enabled()` = storage-backend=sqlite +
+  `s3.asset-backend=s3` (S3 を実際に使っているときだけ)。Worker 側は `illustration_dedup: false`
+  で固定しており、D1+S3 構成でも小説ごとの `挿絵/` 名を維持する (native 専用機能)。
+- `narou illust s3-dedup`: 旧 `挿絵/` 配置の S3 オブジェクトを pool へ `copy` し、pool にある
+  ことが確認できたものだけ旧配置を `delete` する (既定 dry-run、`-f` で実行。SQLite+S3 限定)。
+  hex 名でない挿絵は小説ごとの配置を保つため対象外。`s3-push` は dedup ON なら新規 hex 挿絵が
+  そのまま pool に出るので、`s3-dedup` は「dedup を ON にする前に書かれた分」の後処理。
+- **SORAHOST は `concurrency=true`**: DL/update と convert/send を別レーンで並行に流す
+  (小説単位の排他は `.narou/lock.yaml`)。実測ピークは 2 ジョブ同時で約 120MB (debug) +
+  常駐 31MB で、256MB でも通常運用は収まるが、うごイラ組み立て (~56MB) や大きい挿絵入り
+  EPUB のスパイクを吸収するなら **384MB** を推奨 (ピーク約 300〜320MB の見込み)。
+- **SORAHOST の既定は容量優先**: `sorahost/start.sh` が初回に `convert.section-cache=false`
+  (話ごとの変換キャッシュ無し)・`economy=nosave_diff,nosave_raw` (更新ごとの差分スナップショットと
+  raw HTML を保存しない)・`convert.no-epub=true` (EPUB を保存しない)・`convert.keep-txt=false`
+  (txt を残さない) を入れる。どちらも Web UI の EPUB ダウンロードは SQLite の変換済みテキスト
+  (`novel_outputs`) から都度生成するので影響しない。
+- **実ファイルを書かない構成** (`sqlite.mirror-files`、既定 true。環境変数
+  `NAROU_RS_MIRROR_FILES=0` でも切れる): SQLite モードの `小説データ/` ミラーを
+  書かない。保存先は `objects`/`object_chunks` だけになる。読み出しは DB と
+  `objects` で完結し、変換が要求するファイル (`toc.yaml` / `本文/*.yaml` /
+  `setting.ini` / `replace.txt`) は `NativeStore::materialize_novel_files` が
+  スコープの間だけ実体化し、抜けると自分が書いた分だけ消す
+  (`MaterializedNovelFiles`)。実ファイル前提の補助 (`narou illust` の
+  orphan/rebuild/fix-ext、`narou clean`) は対象が無いため実質何もしない。
+  `narou backup` / `narou db export-yaml --in-place` は従来どおり動く。
+- **生データ (raw HTML) を保存しない構成**:
+  - `DownloaderSettings::save_raw_html()` が唯一の判定。native は `economy` に `nosave_raw` が
+    あれば false、**Worker は常に false** (`WorkerDownloaderSettings` / `SnapshotDownloaderSettings`)。
+    raw は取得時にメモリ上にある HTML を使って挿絵を走査するので、保存を切っても新規話の挿絵は
+    従来どおりローカライズされる。保存済み raw を読むのは `narou illust orphan` /
+    `rebuild` / mitemin 移行だけで、いずれも raw が無ければ「参照が減る」方向に倒れる
+    (キャッシュ由来の到達可能性は変わらない)。
+  - 挿絵の削除を伴う `illust orphan -f` を raw 無しで使うと、キャッシュに載っていない
+    挿絵は孤児と判定される点に注意 (キャッシュは保存時に必ず書かれる)。
+- **変換済みテキストを保存しない構成** (`convert.keep-txt`): false のとき変換済みテキストを
+  どこにも残さない — `novel.txt` 固定名ミラー・`novel_outputs` 行・オブジェクトの
+  `<prefix>/novel.txt` すべて対象で、変換後の txt ファイルも削除する。EPUB は
+  ダウンロードのたびに保存済み本文から組み立て直す (native の `generate_epub_on_demand` は
+  `ConvertService::convert_only`、Worker の `download.epub` も同じ)。以前に残った
+  `novel_outputs` 行・`novel.txt` オブジェクトは、false 状態で走った変換が掃除する。
+  **native は既定 true、Worker は既定 false** (D1 を食わないため)。`executor` の
+  「変換が必要か」判定も保存しない構成では常に false になる。
+  環境変数 `NAROU_RS_KEEP_TXT=0` / `=1`、D1 の `convert.keep-txt` で切り替える。
+- **話ごとの変換キャッシュは容量の厳しい環境で切れる**: `convert.section-cache`
+  (local 設定、既定 true、環境変数 `NAROU_RS_SECTION_CACHE=0` で無効)。無効時は読み書きせず、flush 時に既存の
+  `section_convert_cache/<id>.yaml` を削除する (再有効化しても壊れない)。既定では
+  brotli 圧縮 + 1 行ヘッダ (`narou-section-cache:v1 <encoding>`) で保存し、ヘッダの無い
+  旧形式 (生 YAML) は読み込み時に dirty 扱いにして次の flush で圧縮し直す。
+  Worker (`worker-runtime`) はこのキャッシュ自体を持たない (該当コードが
+  `native-runtime` 限定で no-op)。
+- HTTP 層に `HttpMethod::{Put, Delete}` と `HttpRequest::trusted_endpoint` を追加した。後者は
+  保存先が利用者自身の設定値であることを示し、公開アドレス判定を掛けず (ローカル MinIO を許可)、
+  応答ヘッダを全部返す (`ETag` / `Content-Range` が保存先の契約)。
+
+### SORAHOST (PteWorker) への配備 (2026-09)
+
+- 専用サーバー 1 台で native `narou_rs` を動かす。配備は `sorahost-cli` に任せ、CI の必要値は
+  `SORAHOST_ENDPOINT` / `SORAHOST_TOKEN` の 2 つだけ (`.github/workflows/deploy-sorahost.yml`)。
+  Repository variable `SORAHOST` が `T` のときだけ動き、その間は `platform.yml` の Worker 系
+  ジョブ (wasm / worker / worker-contract / relay-deploy / worker-deploy-*) も skip する。
+- **公開は PteWorker が行う**。アプリはプラットフォームから渡される `PORT` にループバックで
+  束縛する (`sorahost/start.sh`)。cloudflared / SFTP / パネル API を使う実装は 2026-09 に撤去した
+  (任意だった tunnel も不要になったため)。
+- 配置は `sorahost/sorahost.json` (`mode: node` / `start: sh start.sh` /
+  `include: [app, start.sh, sorahost.json]`)。**PteWorker は配備ごとに
+  `/home/container/.sorahost/releases/<日時>-<hash>/` を作り直す**ので、ライブラリは
+  その外 (`$VOLUME_DIR/narou-library`) に置く (`start.sh` が自動で割り出す)。
+- **basic 認証**: 資格情報が空だと narou は素通しにするため、`start.sh` は未設定なら
+  ランダムなパスワードを生成して設定し、コンソールに表示する (起動を止めると PteWorker が
+  デプロイ失敗 422 と見なし、前のリリースを配り続ける — 実測)。
+- **`server-ws-port=0` が必要**: narou.rb の `server-port + 1` は PteWorker が自分の
+  ルータ (workerd) に使う番号と衝突し、プラットフォーム側が `Address already in use`
+  で落ちる。`0` で併設リスナーを切ると本体ポートの `/ws` だけで受ける。
+- 取得リレー (`scripts/sorahost-proxy/`) は**別サーバー**に置くのが既定。同居させるときだけ
+  `NAROU_RELAY=1` + `vars.SORAHOST_RELAY_START=bash start.sh` (そのときプラットフォームの
+  `PORT` はリレーが使い、narou は 8080)。
+- 手順・実測値・注意は `sorahost/README.md`。
+
+### Worker の契約テスト (2026-09)
+
+- `worker_entry/tests/contract.mjs` … HTTP 契約（health / 認証 fail-closed / 一覧・ジョブ API /
+  queue 経由の Convert 終端）。`BASE_URL` と `NAROU_ADMIN_TOKEN` を env で渡す。
+- `worker_entry/tests/run.mjs` … ビルド → ローカル D1 へ migration → `wrangler dev` → 契約テスト。
+  `.dev.vars`（無ければ `NAROU_ADMIN_TOKEN` を書き込む）と `wrangler.test.toml`（`wrangler.toml` から
+  `[build]` を外した生成物）は gitignore 済み。
+- CI: `.github/workflows/platform.yml` の `worker-contract`（push で実行）。デプロイは手動トリガーの
+  `worker-deploy`（environment ゲート）で、必要な secret/vars はワークフローのコメント参照。
+
+### Worker 内の変換 (2026-09)
+
+- `ConvertService` (`src/application/convert.rs`) が変換テキストを組む唯一のポータブル経路。
+  ObjectStore 上の `toc.yaml` / `本文/*.yaml` / `setting.ini` / `replace.txt` / `converter.yaml` と
+  `SettingsStore` の `default.*` / `force.*` を入力に `NovelConverter::build` → `convert_novel` を実行し、
+  `<prefix>/novel.txt` へ書く（native の `convert_novel_by_id` と同じ固定名ミラー）。
+- `converter/**` は `native-runtime` ゲートで fs/プロセス経路を切り離してある。Worker 側では
+  セクション変換キャッシュ・挿絵ローカライズ・device 出力を持たない（毎回変換する）。native 専用の
+  補助が未使用になるため、`worker-runtime` 構成に限り `converter` モジュールの dead_code を許可する。
+- 新しい converter の機能を足すときは、`#[cfg(feature = "native-runtime")]` を付けた関数から
+  fs/プロセスを触るようにし、純関数 (`NovelSettings::from_sources` / `parse_replace_patterns` /
+  `UserConverter::from_yaml` など) を worker から使う。
 
 ### Pixiv 対応 (webnovel/www.pixiv.net.yaml, 2026-09)
 - 4 種の対象に対応: 小説 (`/novel/show.php?id=N`) / 小説シリーズ (`/novel/series/S`) / イラスト・漫画 (`/artworks/A`) / 漫画シリーズ (`/user/U/series/S`)。ncode は種別ごとに接頭辞を付ける (`n` 小説, `s` 小説シリーズ, `a` イラスト・漫画, `c` 漫画シリーズ)。作品ページの HTML は Next.js の SPA シェルで本文を含まないため、`/ajax/*` の JSON API だけを使う。サイト固有の Rust 処理は無く、すべて YAML + `preprocess:` DSL で表現している。
@@ -382,10 +649,12 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - 漫画シリーズ (`/user/U/series/S`) は `c{S}` の連載として登録し、各話 = シリーズ内の作品。一覧 API `/ajax/series/{id}?p=N&lang=ja` は 12 件ずつ・`order` の **降順** で返るため `.reverse` して昇順にし、`order 1` に到達するまで `next::` で次ページを要求する。各話の題名・作者・掲載日は作品ページ (`/ajax/illust/{workId}`) から取る (一覧には ID と順序しか無い)。公開話数は `illustSeries[0].total`。
 - ログインしていないと R18 作品は一覧から**黙って除かれる** (404 にならないので再試行も走らない)。R18 を含むシリーズは `narou_rs_login` で先に Cookie を保存しておくこと。
 - 分岐の注意: `illustType` はイラストで 0 になり、DSL では数値 0 が偽になる。作品ページ判定は `illustTitle` の有無で行う。
+- **サイト定義の `version`**: `webnovel/*.yaml` は `name` で照合し、**ユーザー側コピーの version が同梱版以上 (`>=`)** のときだけ、そのファイルのキーを同梱版へ上書きマージする (キー単位のマージなので、ユーザーが書いていないキーは同梱版が残る。唯一の実装は `downloader::site_setting::merge_user_definition_yaml` — native の `loader.rs` と core の `SiteDefinitions::effective_runtime()` (Worker の fetch policy / Cookie のサイト畳みも) が共有する。管理 API 表示用の `SiteDefinitions::effective()` は gate を掛けない)。挙動を実測すると: 2.3 のユーザー定義は同梱 2.4 に**無視され**、2.4 のユーザー定義は**優先される**。したがって **同梱定義の既存キーを変更したら version を必ず上げる** (上げないと初期化時にコピーされた古い値が優先される)。新しいキーの追加だけなら version を上げなくても届くが、まとめて反映させる意味でも変更のたびに +0.1 を目安に上げる。
+- **表示用 URL (`original_url`)**: 取得に使う `toc_url` と利用者が指定した URL が違う場合、後者をレコードの追加フィールド `original_url` に控える (`NovelRecord::set_original_url` / `display_url`。`narou.rb` は未知キーとして無視する)。Pixiv は `toc_url` が API (`/ajax/...`) になるため、これが無いと Web UI のリンクが API を開いてしまう。通常サイトは両者同じなので記録しない (`target != toc_url` のときだけ)。Web UI は API の `display_url` を優先し、無ければ `toc_url` にフォールバックする。既存レコードは再ダウンロード時に埋まる。
 - **アクセス間隔**: サイト定義の `min_interval` (秒) がそのサイトへのリクエスト間隔の下限になる (全体設定 `download.interval` より優先)。`RateLimitScope` がサイト定義の値を持ち、native limiter は `max(download.interval, min_interval)` で待つ。Pixiv は短時間の連続アクセスで 429 を返すため `min_interval: 5` を置いている (運用要件は最低 2 秒・できれば 5 秒)。
 - **Pixiv の欠けの見分け方**: 匿名でも `/ajax/novel/series_content/{id}` の `page.seriesContents` には全話の id と話数が入っており、中身を伏せられている話だけ `series.viewableType` が 0 以外になる (ログイン時は全部 0)。見える話だけを持つ `thumbnails.novel` との差が「空のデータ + 実データ」の実データ側なので、これを欠けの判定に使う (0 件 / 1 話目から始まらない、は viewableType が無い応答向けの保険)。漫画シリーズの `/ajax/series/{id}` は匿名だと R-18 の id 自体を落とすため、そちらは 1 ページ目の最新 order と `series.total` で判定する。
 - **一覧が欠けたまま成功する応答**: サイト定義に `login_partial_pattern` を置き、DSL が `login_partial::1` を emit すると「未ログインで一部の作品が落ちている」とみなす。保存済み Cookie で 1 回だけ再取得し、**欠けが解消したときだけ**採用する (解消しなければ匿名の結果をそのまま使うので 404 化しない)。Pixiv の漫画シリーズは未ログインだと R-18 が落ちて 16/21 件しか返らないため、1 ページ目の最新 order と `series.total` を比べてこの目印を出す。小説シリーズは本文一覧のページが未ログインで 0 件になるので、そこでも目印を出す (目次は複数ページに分かれるため、検知は `parse_subtitles_multipage` が全ページを見て行い、話数が増えたときだけ Cookie 付きの結果を採用する)。
-- **うごイラ**: `illustType == 2` の作品はフレーム集約 zip と各フレームの表示時間 (`/ajax/illust/{id}/ugoira_meta`) で配られる。DSL が `zip の URL + "?ugoira=" + 遅延ms のカンマ区切り` を `<img src>` として出し、`src/illustration_animation.rs` が APNG に組み立てる (ブリッジの Pillow 実装と同じ出力形式)。フレームは JPEG/PNG をデコードするので `image` クレート (jpeg, png のみ) を使う。両クレートは `illustration-animation` feature (`dep:image` + `dep:zip`) にまとめてあり、native では常時 ON、Worker/wasm では入れない (wasm には zip 8 の圧縮コーデックが載らない) ため `assemble_animation` は未対応エラーを返し、呼び出し側は落としたアーカイブをそのまま保持する。全フレームを RGBA で揃える (半透明を含む作品があるため、サイズより忠実さを優先)。単一フレームなら通常の PNG、遅延やアーカイブが無ければ呼び出し側の通常経路 (静止画) にフォールバックする。実機確認: `a69642452` (19 フレーム, 1077x690, 21.3MB の APNG、Chromium がフレーム 0 を正しく描画)。
+- **うごイラ**: `illustType == 2` の作品はフレーム集約 zip と各フレームの表示時間 (`/ajax/illust/{id}/ugoira_meta`) で配られる。DSL が `zip の URL + "?ugoira=" + 遅延ms のカンマ区切り` を `<img src>` として出し、`src/illustration_animation.rs` が APNG に組み立てる (ブリッジの Pillow 実装と同じ出力形式)。フレームは JPEG/PNG をデコードするので `image` クレート (jpeg, png のみ) を使う。両クレートは `illustration-animation` feature (`dep:image` + `dep:zip`) にまとめ、native と Worker (`worker-runtime` 経由) の両方で有効。`zip` は wasm でも動くよう `default-features = false` + `deflate-flate2-zlib-rs` (純 Rust の flate2) に絞ってある (既定 feature は bzip2/zstd/lzma 等の C 実装系を取り込むため wasm32-unknown-unknown に載らない)。feature を外したビルドでは `assemble_animation` が未対応エラーを返し、呼び出し側は落としたアーカイブをそのまま保持する。全フレームを RGBA で揃える (半透明を含む作品があるため、サイズより忠実さを優先)。単一フレームなら通常の PNG、遅延やアーカイブが無ければ呼び出し側の通常経路 (静止画) にフォールバックする。実機確認: `a69642452` (19 フレーム, 1077x690, 21.3MB の APNG、Chromium がフレーム 0 を正しく描画)。
 - 画像ホスト用ヘッダ: `i.pximg.net` は `Referer` 無しだと 403 を返すため、サイト定義の `headers:` キーで `Referer: \k<top_url>/` を宣言する (値は `\k<...>` 補間される)。
 - 実機確認 (2026-09-23): 単体作品 (短編, `n26352975`/`n29204764`)、シリーズ 6 話 (`s16299140`)、シリーズ 42 話 (`s16305923`, 目次 2 ページ)、シリーズの 1 話 (`n29205030`, 前書き/改ページ/章見出し/ルビ)、挿絵付き作品 (`n29198933`, `[pixivimage:]` → `挿絵/` へローカライズ) で DL・変換・再更新 (差分なし) を確認。ログイン限定作品は Cookie 無しで 404 判定になることも確認。
 - 追加確認 (2026-09-23): イラスト `a141939696` (1 枚) / 漫画 25 ページ `a143868144` (**挿絵 25 枚**) / 漫画シリーズ `c311834` (5 話・挿絵 16 枚) / 漫画シリーズ `c205917` (16 話を 2 ページに跨って取得・R18 の 5 作品は非ログインのため一覧から除外) で DL・変換・再更新 (差分なし) を確認。

@@ -78,6 +78,23 @@ impl GeneratedAssetKey {
     }
 }
 
+/// 拡張子から保存時の `Content-Type` を決める。
+///
+/// ObjectStore / AssetStore の実装 (D1 / S3) で同じ判断を使うため core に置く。
+pub fn content_type_for_key(key: &ObjectKey) -> Option<&'static str> {
+    match key.as_ref().rsplit('.').next() {
+        Some("yaml") | Some("yml") => Some("application/yaml"),
+        Some("txt") | Some("ini") => Some("text/plain; charset=utf-8"),
+        Some("html") => Some("text/html; charset=utf-8"),
+        Some("epub") => Some("application/epub+zip"),
+        Some("zip") => Some("application/zip"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("png") => Some("image/png"),
+        Some("gif") => Some("image/gif"),
+        _ => None,
+    }
+}
+
 /// A validated prefix used for paginated listing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectPrefix(String);
@@ -91,9 +108,6 @@ impl ObjectPrefix {
         validate_logical_key(prefix.trim_end_matches('/'))?;
         Ok(Self(prefix))
     }
-    pub fn as_ref(&self) -> &str {
-        &self.0
-    }
 
     pub fn matches(&self, key: &ObjectKey) -> bool {
         let prefix = self.0.trim_end_matches('/');
@@ -101,6 +115,12 @@ impl ObjectPrefix {
             || key.as_ref() == prefix
             || (key.as_ref().starts_with(prefix)
                 && key.as_ref().as_bytes().get(prefix.len()) == Some(&b'/'))
+    }
+}
+
+impl AsRef<str> for ObjectPrefix {
+    fn as_ref(&self) -> &str {
+        &self.0
     }
 }
 
@@ -156,6 +176,56 @@ impl ObjectListRequest {
 pub struct ObjectListPage {
     pub objects: Vec<ObjectMetadata>,
     pub next_cursor: Option<String>,
+}
+
+/// Apply the shared `ObjectListRequest` cursor/limit contract to a listing
+/// already sorted by key ascending.
+///
+/// Every backend (filesystem, SQLite, in-memory, D1) resolves its own key
+/// set, then delegates the page cut here so the contract lives once: the
+/// cursor is the key of the **last object returned** by the previous page
+/// (`next_cursor`), and resumption skips to the first key strictly greater
+/// than the cursor. Because the cursor names a returned key, deleting the
+/// object it points to does not lose the next page — unlike a cursor that
+/// names the first *unreturned* key, which is never emitted and would drop
+/// one object at every page boundary.
+///
+/// Returns the page plus the cursor for the next request (`None` when this
+/// page reached the end of the listing).
+pub fn paginate_object_listing<T>(
+    items: Vec<T>,
+    cursor: Option<&str>,
+    limit: usize,
+    key_of: impl Fn(&T) -> &str,
+) -> (Vec<T>, Option<String>) {
+    let start = match cursor {
+        Some(cursor) => items
+            .iter()
+            .position(|item| key_of(item) > cursor)
+            .unwrap_or(items.len()),
+        None => 0,
+    };
+    let end = start.saturating_add(limit).min(items.len());
+    let next_cursor = (end < items.len())
+        .then(|| &items[end - 1])
+        .map(|item| key_of(item).to_string());
+    (
+        items
+            .into_iter()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect(),
+        next_cursor,
+    )
+}
+
+/// String-prefix range bound for a `WHERE key >= ? AND key < ?` scan.
+///
+/// Appending the highest code point makes the bound cover every key that starts
+/// with the prefix — including keys whose next character sorts above `'0'`
+/// (a naive `{prefix}0` bound hides every CJK or letter-leading name).
+pub fn prefix_upper_bound(prefix: &str) -> String {
+    format!("{prefix}\u{10FFFF}")
 }
 
 /// Blob store for bounded control objects.
@@ -304,7 +374,7 @@ impl NovelObjectKeys {
 
     pub fn cached_section(&self, timestamp: &str, index: &str, file_subtitle: &str) -> ObjectKey {
         self.child(&format!(
-            "本文/.cache/{timestamp}/{} {}.yaml",
+            "本文/cache/{timestamp}/{} {}.yaml",
             index,
             sanitize_key_component_with_limit(file_subtitle, Some(80))
         ))
@@ -522,6 +592,14 @@ fn validate_logical_key(key: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefix_upper_bound_covers_every_child() {
+        let bound = super::prefix_upper_bound("webnovel/");
+        assert!("webnovel/contract-test.yaml" < bound.as_str());
+        assert!("webnovel/挿絵/0001.jpg" < bound.as_str());
+        assert!(super::prefix_upper_bound("").as_str() > "novels/site/title/本文/1 x.yaml");
+    }
+
     use super::*;
 
     #[test]
@@ -574,5 +652,97 @@ mod tests {
         assert!(!prefix.matches(
             &ObjectKey::try_new("novels/site-archive/book/toc.yaml").unwrap()
         ));
+    }
+
+    /// The D1 store used to emit the first *unreturned* key as
+    /// `next_cursor`, silently dropping one object at every page boundary.
+    /// These tests pin the shared contract every backend now delegates to:
+    /// the cursor is the last returned key and paging yields each object
+    /// exactly once.
+    fn metas(keys: &[&str]) -> Vec<ObjectMetadata> {
+        keys.iter()
+            .map(|key| ObjectMetadata {
+                key: ObjectKey::try_new(*key).unwrap(),
+                size: 1,
+                etag: None,
+                content_type: None,
+                last_modified: None,
+            })
+            .collect()
+    }
+
+    fn keys_of(page: &[ObjectMetadata]) -> Vec<String> {
+        page.iter()
+            .map(|meta| meta.key.as_ref().to_string())
+            .collect()
+    }
+
+    fn meta_key(meta: &ObjectMetadata) -> &str {
+        meta.key.as_ref()
+    }
+
+    #[test]
+    fn paginated_listing_yields_every_object_exactly_once() {
+        let all = metas(&["generated/a", "generated/b", "generated/c"]);
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (page, next) = paginate_object_listing(all.clone(), cursor.as_deref(), 2, meta_key);
+            seen.extend(keys_of(&page));
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen, vec!["generated/a", "generated/b", "generated/c"]);
+    }
+
+    #[test]
+    fn paginate_next_cursor_is_last_returned_key() {
+        let (page, next) = paginate_object_listing(
+            metas(&["generated/a", "generated/b", "generated/c"]),
+            None,
+            2,
+            meta_key,
+        );
+        assert_eq!(keys_of(&page), vec!["generated/a", "generated/b"]);
+        assert_eq!(next.as_deref(), Some("generated/b"));
+    }
+
+    #[test]
+    fn paginate_continues_when_cursor_object_is_deleted() {
+        let (page, next) = paginate_object_listing(
+            metas(&["generated/a", "generated/b", "generated/c"]),
+            None,
+            1,
+            meta_key,
+        );
+        assert_eq!(keys_of(&page), vec!["generated/a"]);
+        let cursor = next.unwrap();
+
+        // Delete the cursor's object before resuming, as a concurrent
+        // `delete` (or a failed migration entry) can do.
+        let remaining = metas(&["generated/b", "generated/c"]);
+        let (page, next) = paginate_object_listing(remaining, Some(&cursor), 1, meta_key);
+        assert_eq!(keys_of(&page), vec!["generated/b"]);
+        let (page, next) = paginate_object_listing(
+            metas(&["generated/c"]),
+            next.as_deref(),
+            1,
+            meta_key,
+        );
+        assert_eq!(keys_of(&page), vec!["generated/c"]);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn paginate_past_the_end_and_empty_listing() {
+        let (page, next) =
+            paginate_object_listing(metas(&["generated/a"]), Some("generated/z"), 2, meta_key);
+        assert!(page.is_empty());
+        assert_eq!(next, None);
+        let (page, next) = paginate_object_listing(metas(&[]), None, 2, meta_key);
+        assert!(page.is_empty());
+        assert_eq!(next, None);
     }
 }
