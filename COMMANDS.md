@@ -327,6 +327,7 @@ Cookie の直接登録 (`set`/`add`) は廃止した。登録経路は `narou_rs
 - 変換後の端末送信の実機最終検証
 
 **Rust 実装メモ**:
+- 半角カナは Ruby版 NKF 相当の対応表と濁点・半濁点合成で全角化し、ルビの読みも `ﾛｰﾙﾌﾟﾚｲﾝｸﾞｹﾞｰﾑ` → `ロールプレイングゲーム` と変換する。半角句読点にも対応し、全角英数字や互換文字は変更しない（issue #31）
 - `-o/--output` を direct convert に接続し、フォルダ部分を無視して保存先小説フォルダ配下へ出力する。複数 target 時は Ruby版同様 `basename (n).ext` を付ける
 - `-i/--inspect` を clap / `main.rs` / `commands::convert` に接続し、`local_setting.yaml` の `convert.inspect=true` も Ruby版同様に direct convert の既定値として注入する
 - `--no-open` と `convert.no-open=true` を direct convert に反映し、既定では最初に生成した出力ファイルの保存フォルダを開く

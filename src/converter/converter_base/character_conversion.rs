@@ -34,9 +34,23 @@ static RE_HANKAKU_NUM_COMMA_MARKER: LazyLock<Regex> = LazyLock::new(|| {
 impl ConverterBase {
     pub(super) fn hankakukana_to_zenkakukana(&self, text: &str) -> String {
         let mut result = String::with_capacity(text.len());
-        for ch in text.chars() {
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
             if is_halfwidth_katakana(ch) {
-                result.push(to_fullwidth_katakana(ch));
+                let base = to_fullwidth_katakana(ch);
+                // NKF composes only halfwidth kana followed by a halfwidth mark.
+                let voiced = match (ch, chars.peek().copied()) {
+                    ('ｳ', Some('ﾞ')) => Some('ヴ'),
+                    ('ｶ'..='ﾄ' | 'ﾊ'..='ﾎ', Some('ﾞ')) => char::from_u32(base as u32 + 1),
+                    ('ﾊ'..='ﾎ', Some('ﾟ')) => char::from_u32(base as u32 + 2),
+                    _ => None,
+                };
+                if let Some(voiced) = voiced {
+                    chars.next();
+                    result.push(voiced);
+                } else {
+                    result.push(base);
+                }
             } else {
                 result.push(ch);
             }
@@ -435,12 +449,17 @@ impl ConverterBase {
 }
 
 fn is_halfwidth_katakana(ch: char) -> bool {
-    matches!(ch as u32, 0xFF66..=0xFF9F)
+    matches!(ch as u32, 0xFF61..=0xFF9F)
 }
 
 fn to_fullwidth_katakana(ch: char) -> char {
-    let offset = ch as u32 - 0xFF66;
-    char::from_u32(0x30A2 + offset - 1).unwrap_or(ch)
+    const FULLWIDTH: [char; 63] = [
+        '。', '「', '」', '、', '・', 'ヲ', 'ァ', 'ィ', 'ゥ', 'ェ', 'ォ', 'ャ', 'ュ', 'ョ', 'ッ', 'ー',
+        'ア', 'イ', 'ウ', 'エ', 'オ', 'カ', 'キ', 'ク', 'ケ', 'コ', 'サ', 'シ', 'ス', 'セ', 'ソ',
+        'タ', 'チ', 'ツ', 'テ', 'ト', 'ナ', 'ニ', 'ヌ', 'ネ', 'ノ', 'ハ', 'ヒ', 'フ', 'ヘ', 'ホ',
+        'マ', 'ミ', 'ム', 'メ', 'モ', 'ヤ', 'ユ', 'ヨ', 'ラ', 'リ', 'ル', 'レ', 'ロ', 'ワ', 'ン', '゛', '゜',
+    ];
+    FULLWIDTH[(ch as u32 - 0xFF61) as usize]
 }
 
 fn ascii_letters_to_fullwidth(text: &str) -> String {
@@ -734,6 +753,34 @@ mod tests {
         let mut cb = ConverterBase::new(settings);
         cb.text_type = ty;
         cb.hankaku_num_to_zenkaku(text)
+    }
+
+    #[test]
+    fn halfwidth_html_ruby_reading_survives_conversion() {
+        let html = "<ruby><rb>ＲＰＧ</rb><rp>（</rp><rt>ﾛｰﾙﾌﾟﾚｲﾝｸﾞｹﾞｰﾑ</rt><rp>）</rp></ruby>のそれと酷似していた。";
+        let settings = NovelSettings {
+            enable_auto_indent: false,
+            ..NovelSettings::default()
+        };
+        let mut converter = ConverterBase::new(settings);
+        let text = crate::downloader::html::to_aozora(html);
+        assert_eq!(
+            converter.convert(&text, TextType::Body),
+            "｜ＲＰＧ《ロールプレイングゲーム》のそれと酷似していた。"
+        );
+    }
+
+    #[test]
+    fn halfwidth_kana_preserves_nkf_voicing_and_non_kana_characters() {
+        let converter = ConverterBase::new(NovelSettings::default());
+        assert_eq!(
+            converter.hankakukana_to_zenkakukana("｡｢｣､･ｶﾞｷﾞｸﾞｹﾞｺﾞｻﾞｼﾞｽﾞｾﾞｿﾞﾀﾞﾁﾞﾂﾞﾃﾞﾄﾞﾊﾞﾋﾞﾌﾞﾍﾞﾎﾞﾊﾟﾋﾟﾌﾟﾍﾟﾎﾟｳﾞ①Ａ㍑"),
+            "。「」、・ガギグゲゴザジズゼゾダヂヅデドバビブベボパピプペポヴ①Ａ㍑"
+        );
+        assert_eq!(
+            converter.hankakukana_to_zenkakukana("ﾞﾟｱﾞｶﾟカﾞハﾟﾜﾞｦﾞ"),
+            "゛゜ア゛カ゜カ゛ハ゜ワ゛ヲ゛"
+        );
     }
 
     #[test]
