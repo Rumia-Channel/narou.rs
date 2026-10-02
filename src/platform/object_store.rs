@@ -374,7 +374,7 @@ impl NovelObjectKeys {
 
     pub fn cached_section(&self, timestamp: &str, index: &str, file_subtitle: &str) -> ObjectKey {
         self.child(&format!(
-            "本文/.cache/{timestamp}/{} {}.yaml",
+            "本文/cache/{timestamp}/{} {}.yaml",
             index,
             sanitize_key_component_with_limit(file_subtitle, Some(80))
         ))

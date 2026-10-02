@@ -2044,15 +2044,17 @@ impl Downloader {
                 };
                 let had_existing = plan.existed;
                 if had_existing {
+                    // The stored section still has the previous TOC's filename.
+                    let previous = old_subtitles.get(&subtitle.index).copied().unwrap_or(subtitle);
                     if cache_dir.is_none() {
                         cache_dir = cache_timestamp(self.clock.as_ref());
                     }
                     if let Some(id) = existing_id {
-                        self.clear_section_digest(id, &section_relative_path(subtitle));
+                        self.clear_section_digest(id, &section_relative_path(previous));
                     }
                     if let Some(timestamp) = cache_dir.as_deref() {
                         self.persistence
-                            .move_section_to_cache(&object_keys, timestamp, subtitle)
+                            .move_section_to_cache(&object_keys, timestamp, previous)
                             .await?;
                     }
                 }
@@ -3240,6 +3242,90 @@ is_narou: false
             keys.iter().any(|key| key.contains("/本文/")),
             "sections must still be stored: {keys:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn renamed_subtitle_and_chapter_preserve_history_and_allow_later_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            r#"
+name: Rename Test
+domain: example.com
+top_url: https://example.com
+url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+sitename: Rename Test
+toc_url: 'https://example.com/\k<ncode>/'
+subtitles: |-
+  <h2>(?<chapter>[^<]+)</h2><a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a><time>(?<subdate>[^<]+)</time>
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+is_narou: false
+"#,
+        )
+        .unwrap();
+        setting.compile();
+        let target = "https://example.com/n1234ab/";
+        let section_url = "https://example.com/n1234ab/1/";
+        let store = Arc::new(MemoryObjectStore::new());
+        let novels = Arc::new(MemoryNovelRepository::new());
+        let http = Arc::new(MockHttpClient::new());
+        let persistence = PersistenceService::new(store.clone(), store.clone());
+        let mut record_id = None;
+        let mut keys = None;
+        for (chapter, subtitle, body, expected_updates) in [
+            ("第三章", "03_164 屍者の来訪", "旧本文", 1),
+            ("第三章", "03_164 冬の屍者", "新本文", 1),
+            ("第三章", "03_164 冬の屍者", "新本文", 0),
+            ("第三章 改題", "03_164 冬の屍者", "新本文", 1),
+        ] {
+            http.add_text(target, 200, format!(
+                r#"<h1>Rename Test</h1><span>Author</span><h2>{chapter}</h2><a href="/n1234ab/1/">{subtitle}</a><time>2026-09-29</time>"#
+            ));
+            http.add_text(section_url, 200, format!(r#"<div class="body">{body}</div>"#));
+            let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+                DownloaderPlatform {
+                    http: http.clone(),
+                    rate_limiter: Arc::new(FakeRateLimiter::new()),
+                    novels: novels.clone(),
+                    objects: store.clone(),
+                    assets: store.clone(),
+                    clock: Arc::new(SystemClock),
+                },
+                vec![setting.clone()],
+                HashMap::new(),
+                Arc::new(crate::downloader::settings::SnapshotDownloaderSettings::default()),
+            )
+            .unwrap();
+            let result = downloader.download_novel_with_force(target, false).await.unwrap();
+            assert_eq!(result.updated_count, expected_updates);
+            if let Some(id) = record_id {
+                assert_eq!(result.id, id);
+                assert!(!result.new_novel);
+                assert!(!result.new_arrivals);
+            } else {
+                record_id = Some(result.id);
+                let record = novels.get(result.id.into()).await.unwrap().unwrap();
+                keys = Some(NovelObjectKeys::new(&record.sitename, &record.file_title, record.use_subdirectory).unwrap());
+            }
+            let toc = persistence.load_toc(keys.as_ref().unwrap()).await.unwrap().unwrap();
+            assert_eq!(toc.subtitles[0].subtitle, subtitle);
+            let saved = persistence.load_section(keys.as_ref().unwrap(), &toc.subtitles[0]).await.unwrap().unwrap();
+            assert_eq!(saved.chapter, chapter);
+            assert_eq!(saved.element.body, body);
+        }
+        let keys = keys.unwrap();
+        assert!(store.read_small(&keys.section("1", "03_164 屍者の来訪")).await.unwrap().is_none());
+        let names = persistence.list_novel_object_names(&keys).await.unwrap();
+        let archived = names.iter().find(|name| name.starts_with("本文/cache/") && name.ends_with("/1 03_164 屍者の来訪.yaml")).unwrap();
+        let archived_key = crate::platform::ObjectKey::try_new(format!("{}/{archived}", keys.prefix().as_ref())).unwrap();
+        let bytes = store.read_small(&archived_key).await.unwrap().unwrap();
+        let old: super::types::SectionFile = serde_yaml::from_slice(&bytes).unwrap();
+        assert_eq!(old.element.body, "旧本文");
+        assert_eq!(old.subtitle, "03_164 屍者の来訪");
+        assert_eq!(http.requested_urls().iter().filter(|url| url.ends_with(section_url)).count(), 3);
     }
 
     #[tokio::test]
