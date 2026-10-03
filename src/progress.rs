@@ -44,7 +44,7 @@ pub fn safe_stderr_println(line: &str) {
     let _ = writeln!(stderr, "{line}");
 }
 
-/// Console-backed [`MessageSink`] — the default sink for native execution.
+/// Console-backed [`MessageSink`](crate::application::messages::MessageSink) — the default sink for native execution.
 ///
 /// Line output (`emit`) takes [`STDOUT_LOCK`] so parallel workers don't
 /// interleave bytes mid-line, then goes through the logger (`println!` /
