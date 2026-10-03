@@ -202,7 +202,7 @@ fn string_to_sign_bytes_comparison(value: Field<'_>, expected: &str) -> &'static
     let mut count = 0;
     let mut matches = true;
     for token in value.split_ascii_whitespace() {
-        if token.len() != 2 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !(1..=2).contains(&token.len()) || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
             return "malformed";
         }
         let Ok(byte) = u8::from_str_radix(token, 16) else {
@@ -460,6 +460,46 @@ mod tests {
     }
 
     #[test]
+    fn wasabi_unpadded_hex_compares_exact_string_to_sign_bytes() {
+        // Wasabi has emitted LF as `a` instead of `0a` in StringToSignBytes:
+        // https://forum.seafile.com/t/aws-v4-signatures-not-working-with-s3-compatible-backend-wasabi/11086
+        for encoded in ["41 57 53 34 a", "41 57 53 34 0a", "41 57 53 34 A"] {
+            assert_eq!(
+                string_to_sign_bytes_comparison(Field::Value(encoded), "AWS4\n"),
+                "match"
+            );
+        }
+        assert_eq!(
+            string_to_sign_bytes_comparison(Field::Value("41 d a"), "A\r\n"),
+            "match"
+        );
+        assert_eq!(
+            string_to_sign_bytes_comparison(Field::Value("41 d a"), "A\n"),
+            "mismatch"
+        );
+        assert_eq!(
+            string_to_sign_bytes_comparison(Field::Value("41 a"), "A\r\n"),
+            "mismatch"
+        );
+        assert_eq!(
+            string_to_sign_bytes_comparison(Field::Value("ff"), "A"),
+            "mismatch"
+        );
+        assert_eq!(
+            string_to_sign_bytes_comparison(Field::Value("4"), "A"),
+            "mismatch"
+        );
+        let mut signed = signed();
+        signed.string_to_sign = "AWS4\n".to_string();
+        let body = envelope("<StringToSignBytes>41 57 53 34 a</StringToSignBytes>");
+        assert!(signature_context(&body, &signed).contains("StringToSignBytes=match"));
+        let duplicate = envelope(
+            "<StringToSignBytes>a</StringToSignBytes><StringToSignBytes>a</StringToSignBytes>",
+        );
+        assert!(signature_context(&duplicate, &signed).contains("StringToSignBytes=malformed"));
+    }
+
+    #[test]
     fn strict_hex_byte_comparison_rejects_non_bytes_and_excess_size() {
         assert_eq!(
             string_to_sign_bytes_comparison(Field::Absent, "A"),
@@ -484,8 +524,8 @@ mod tests {
         for value in [
             "",
             " ",
-            "4",
             "041",
+            "100",
             "0x41",
             "4142",
             "41,42",
@@ -497,11 +537,13 @@ mod tests {
                 "malformed"
             );
         }
-        let oversized = "41 ".repeat(MAX_STRING_TO_SIGN_BYTES + 1);
-        assert_eq!(
-            string_to_sign_bytes_comparison(Field::Value(&oversized), "A"),
-            "malformed"
-        );
+        for token in ["41 ", "a "] {
+            let oversized = token.repeat(MAX_STRING_TO_SIGN_BYTES + 1);
+            assert_eq!(
+                string_to_sign_bytes_comparison(Field::Value(&oversized), "A"),
+                "malformed"
+            );
+        }
     }
 
     #[test]
