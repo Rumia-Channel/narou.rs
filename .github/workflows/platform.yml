@@ -41,6 +41,8 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
+      - name: SORAHOST smoke script regression
+        run: python3 -m unittest discover -s tests -p 'test_sorahost_smoke.py'
       - name: Web UI source-link escaping regressions
         run: node --test tests/render_links.test.mjs
       - run: cargo check --workspace --all-targets
