@@ -367,6 +367,58 @@ mod tests {
     }
 
     #[test]
+    fn signatures_match_published_aws_s3_examples() {
+        // Public example credentials, not an account credential.
+        // https://docs.aws.amazon.com/AmazonS3/latest/developerguide/sig-v4-header-based-auth.html
+        let credentials = Credentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE",
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        };
+        let payload = payload_sha256(b"");
+        for (path, query, headers, expected) in [
+            (
+                "/test.txt",
+                "",
+                vec![("range", "bytes=0-9")],
+                "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41",
+            ),
+            (
+                "/",
+                "lifecycle=",
+                vec![],
+                "fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543",
+            ),
+            (
+                "/",
+                "max-keys=2&prefix=J",
+                vec![],
+                "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7",
+            ),
+        ] {
+            let signed = sign(
+                &RequestToSign {
+                    method: "GET",
+                    host: "examplebucket.s3.amazonaws.com",
+                    path,
+                    query,
+                    headers: &headers,
+                    payload_sha256: &payload,
+                    amz_date: "20130524T000000Z",
+                },
+                &credentials,
+                "us-east-1",
+                "s3",
+            );
+            assert!(
+                signed
+                    .authorization
+                    .ends_with(&format!("Signature={expected}")),
+                "{path}?{query}"
+            );
+        }
+    }
+
+    #[test]
     fn canonical_path_encodes_each_segment() {
         assert_eq!(
             canonical_path("/narou/カクヨム/[作者] タイトル/本文/0001 第一話.yaml"),

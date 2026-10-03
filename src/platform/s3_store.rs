@@ -562,28 +562,47 @@ fn signature_mismatch_hint(body: &str, signed: &s3_sigv4::SignedHeaders) -> Stri
     let Some(server_to_sign) = super::s3_request::element_text(body, "StringToSign") else {
         return String::new();
     };
-    let server_digest = server_to_sign.trim().rsplit('\n').next().unwrap_or("").trim();
-    let our_digest = signed
-        .string_to_sign
-        .rsplit('\n')
-        .next()
-        .unwrap_or("")
-        .trim();
-    if server_digest.is_empty() || our_digest.is_empty() {
+    // Some S3-compatible services use literal \n / \r\n in the XML value.
+    // Normalize delimiters before comparing, never echo an unparsed value as a digest.
+    let server_to_sign = server_to_sign
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("&#13;", "\r")
+        .replace("&#xD;", "\r")
+        .replace("&#xd;", "\r")
+        .replace("&#10;", "\n")
+        .replace("&#xA;", "\n")
+        .replace("&#xa;", "\n");
+    let server_lines: Vec<&str> = server_to_sign.trim().lines().collect();
+    let our_lines: Vec<&str> = signed.string_to_sign.trim().lines().collect();
+    if server_lines.len() != 4 || our_lines.len() != 4 {
         return String::new();
     }
-    if server_digest == our_digest {
-        // canonical request は一致しているのに署名だけが違う → 鍵やスコープ値。
+    let server_digest = server_lines[3];
+    let our_digest = our_lines[3];
+    let is_digest =
+        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !is_digest(server_digest) || !is_digest(our_digest) {
+        return String::new();
+    }
+    if !server_digest.eq_ignore_ascii_case(our_digest) {
         format!(
-            " [narou: canonical-request digest matches ({our_digest}); \
-             the mismatch is in the signing key — check S3_SECRET_ACCESS_KEY, \
-             bucket region vs s3.region, and account type]"
+            " [narou: canonical-request digest differs (server: {server_digest}, \
+             ours: {our_digest}) — the server reconstructed a different canonical request; \
+             compare canonical URI, query, and signed headers]"
+        )
+    } else if server_lines != our_lines {
+        format!(
+            " [narou: canonical-request digest matches ({our_digest}), but \
+             string-to-sign differs; check algorithm, timestamp, region/service scope, \
+             and digest representation]"
         )
     } else {
         format!(
-            " [narou: canonical-request digest differs (server: {server_digest}, \
-             ours: {our_digest}) — the request sent differs from what was signed; \
-             compare the server's StringToSign against the logged request]"
+            " [narou: canonical-request digest matches ({our_digest}) and \
+             normalized string-to-sign matches; verify the active access-key/secret pair, \
+             credential source, signing-key derivation, and transmitted Authorization; \
+             reported canonical-request digests agree]"
         )
     }
 }
@@ -1057,14 +1076,55 @@ mod tests {
             "us-east-1",
             "s3",
         );
-        // サーバーが同じ string-to-sign を再構成した応答 → digest 一致。
+        for server_value in [
+            signed.string_to_sign.replace('\n', "\\n"),
+            signed.string_to_sign.clone(),
+            signed.string_to_sign.replace('\n', "\\r\\n"),
+            signed.string_to_sign.replace('\n', "\r\n"),
+            signed.string_to_sign.replace('\n', "&#10;"),
+            signed.string_to_sign.replace('\n', "&#xA;"),
+            signed.string_to_sign.replace('\n', "&#13;&#10;"),
+        ] {
+            let body = format!(
+                "<Error><Code>SignatureDoesNotMatch</Code>\
+                 <StringToSign>{server_value}</StringToSign></Error>",
+            );
+            let hint = signature_mismatch_hint(&body, &signed);
+            assert!(hint.contains("digest matches"), "{hint}");
+            assert!(hint.contains("string-to-sign matches"), "{hint}");
+            assert!(!hint.contains("digest differs"), "{hint}");
+        }
+        let different_scope = signed
+            .string_to_sign
+            .replace("/us-east-1/", "/ap-northeast-2/");
         let body = format!(
             "<Error><Code>SignatureDoesNotMatch</Code>\
-             <StringToSign>{}</StringToSign></Error>",
-            signed.string_to_sign
+             <StringToSign>{different_scope}</StringToSign></Error>",
+        );
+        let hint = signature_mismatch_hint(&body, &signed);
+        assert!(hint.contains("string-to-sign differs"), "{hint}");
+        assert!(!hint.contains("string-to-sign matches"), "{hint}");
+
+        let (prefix, digest) = signed.string_to_sign.rsplit_once('\n').unwrap();
+        let uppercase_digest = format!("{prefix}\n{}", digest.to_ascii_uppercase());
+        let body = format!(
+            "<Error><Code>SignatureDoesNotMatch</Code>\
+             <StringToSign>{uppercase_digest}</StringToSign></Error>",
         );
         let hint = signature_mismatch_hint(&body, &signed);
         assert!(hint.contains("digest matches"), "{hint}");
+        assert!(hint.contains("string-to-sign differs"), "{hint}");
+
+        for malformed in [
+            "unparsed response",
+            "AWS4-HMAC-SHA256\\nshort\\nscope\\nnot-a-digest",
+        ] {
+            let body = format!(
+                "<Error><Code>SignatureDoesNotMatch</Code>\
+                 <StringToSign>{malformed}</StringToSign></Error>",
+            );
+            assert!(signature_mismatch_hint(&body, &signed).is_empty());
+        }
     }
 
     #[test]
