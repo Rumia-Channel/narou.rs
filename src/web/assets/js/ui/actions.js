@@ -853,6 +853,10 @@ export function bindActions() {
     removeSingle: async (id) => {
       showRemoveModal([Number(id)]);
     },
+    convertSingle: (id) => runGuardedAction(null, async () => {
+      const result = await postJson('/api/convert', { targets: [String(id)] });
+      assertApiSuccess(result, '変換要求の送信に失敗しました');
+    }, '変換要求の送信に失敗しました'),
     inspectSingle: (id) => runGuardedAction(null, async () => {
       const result = await postJson('/api/inspect', { targets: [String(id)] });
       assertApiSuccess(result, '調査状況ログの表示に失敗しました');
