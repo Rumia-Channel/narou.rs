@@ -1,0 +1,164 @@
+name: Prepare validated v0.4.6
+
+on:
+  push:
+    branches: [verify-release-0-4-6]
+    paths: ['.github/workflows/prepare-release-0-4-6.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-release-0-4-6
+  cancel-in-progress: false
+
+# This workflow stays on the verification branch. The candidate is created
+# from the pinned develop commit, so this one-off workflow is NOT released.
+# No main/develop writes, tags, deployment credentials, or deployments here.
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      BASE_SHA: 0dbf4469cc40b6287cb601c2591985e63fd52f5e
+      RELEASE_BRANCH: release-v0-4-6
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: 0dbf4469cc40b6287cb601c2591985e63fd52f5e
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-preflight
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: Prepare version and release notes without committing
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          test -z "$(git status --porcelain)"
+          git switch -c "$RELEASE_BRANCH"
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import tomllib
+
+          base = '0dbf4469cc40b6287cb601c2591985e63fd52f5e'
+          remote = subprocess.check_output(['git', 'ls-remote', 'origin', 'refs/heads/develop'], text=True).split()
+          assert remote and remote[0] == base, 'develop advanced; stop for review'
+          for ref in ['refs/heads/release-v0-4-6', 'refs/tags/v0.4.6']:
+              assert not subprocess.check_output(['git', 'ls-remote', 'origin', ref], text=True).strip(), f'{ref} already exists'
+
+          # Only package versions change; dependencies and features stay pinned.
+          # cargo check below generates Cargo.lock before the version commit.
+          for filename, package in [('Cargo.toml', 'narou_rs'), ('worker_entry/Cargo.toml', 'narou_worker')]:
+              path = Path(filename)
+              data = path.read_bytes()
+              manifest = tomllib.loads(data.decode('utf-8'))
+              assert manifest['package']['name'] == package
+              assert manifest['package']['version'] == '0.4.5'
+              old = b'version = "0.4.5"'
+              assert data.count(old) == 1
+              path.write_bytes(data.replace(old, b'version = "0.4.6"', 1))
+
+          path = Path('README.md')
+          data = path.read_text(encoding='utf-8')
+          heading = '## 開発版の修正（未リリース）'
+          assert data.count(heading) == 1
+          notes = '''## v0.4.6 の主な変更
+
+          - Cloudflare Workers の小説一覧・全体設定・タグ・キュー表示から、不要な S3・ログイン・ダウンローダ等の初期化を取り除きました。
+          - タグとキュー件数を D1 側で集計し、画面表示のために全小説・全待機ジョブを転送する処理を削減しました。認証と既存の検索・設定保存の規則は維持しています。
+          - 対象 API に `Server-Timing` と比較用スクリプトを追加しました。計測方法は `docs/worker-ui-latency.md` を参照してください。EPUB・画像変換の最適化は今回の対象外です。'''
+          data = data.replace(heading, notes, 1)
+          old_heading = '## v0.4.5 の主な変更'
+          assert data.count(old_heading) == 1
+          data = data.replace(old_heading, '変更一覧は [v0.4.5...v0.4.6](https://github.com/Rumia-Channel/narou.rs/compare/v0.4.5...v0.4.6) を参照してください。\n\n' + old_heading, 1)
+          path.write_text(data, encoding='utf-8')
+          PY
+      - name: Cargo check and regenerate lockfile
+        run: cargo check --workspace --all-targets
+      - name: Check Lite build
+        run: cargo check --locked -p narou_rs --all-targets --features lite
+      - name: Check Worker wasm build
+        run: cargo check --locked -p narou_worker --target wasm32-unknown-unknown
+      - name: Run UI regression tests
+        run: |
+          python -m unittest discover -s worker_entry/tests -p 'test_ui_*.py' -v
+          node --test worker_entry/tests/ui_latency.test.mjs
+      - name: Verify exact lockfile change and prepare validation record
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import subprocess
+          import tomllib
+
+          original = subprocess.check_output(['git', 'show', 'HEAD:Cargo.lock'])
+          expected = original
+          for package in ['narou_rs', 'narou_worker']:
+              old = f'name = "{package}"\nversion = "0.4.5"'.encode()
+              assert expected.count(old) == 1
+              expected = expected.replace(old, f'name = "{package}"\nversion = "0.4.6"'.encode(), 1)
+          assert Path('Cargo.lock').read_bytes() == expected, 'Unexpected dependency/lockfile changes; stop for review'
+          for filename in ['Cargo.toml', 'worker_entry/Cargo.toml']:
+              assert tomllib.loads(Path(filename).read_text())['package']['version'] == '0.4.6'
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          assert changed == {'Cargo.toml', 'Cargo.lock', 'worker_entry/Cargo.toml', 'README.md'}, changed
+          log = Path('.serena/memories/porting_status/release_0_4_6_2026-10-03.md')
+          assert not log.exists()
+          log.parent.mkdir(parents=True, exist_ok=True)
+          run_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          log.write_text(f'''# v0.4.6 release preparation
+
+          Base: develop {os.environ['BASE_SHA']}.
+          Package versions: narou_rs / narou_worker 0.4.6.
+          Cargo.lock was regenerated by cargo check; only these two package versions changed.
+          README promotes the develop fixes and documents the Worker UI latency changes.
+          Includes PR #34 and the existing link/individual conversion fixes from develop.
+          No new dependencies, storage migrations or runtime behavior changes in this version bump.
+
+          Before the release commit, GitHub Actions successfully ran:
+          - cargo check --workspace --all-targets
+          - cargo check --locked -p narou_rs --all-targets --features lite
+          - cargo check --locked -p narou_worker --target wasm32-unknown-unknown
+          - SQL UI regression tests and Node latency-client tests
+
+          Validation run: {run_url}
+          Integration into develop/main and tag creation are separate reviewed steps.
+          No production latency reduction is claimed in milliseconds or percentages.
+          ''', encoding='utf-8')
+          PY
+          git diff --check
+          git status --short
+          git diff --stat
+          git diff -- Cargo.toml worker_entry/Cargo.toml Cargo.lock README.md
+      - name: Commit and push only the validated release candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin refs/heads/develop | cut -f1)" = "$BASE_SHA"
+          test -z "$(git ls-remote origin refs/heads/$RELEASE_BRANCH)"
+          test -z "$(git ls-remote origin refs/tags/v0.4.6)"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml worker_entry/Cargo.toml Cargo.lock README.md .serena/memories/porting_status/release_0_4_6_2026-10-03.md
+          git diff --cached --check
+          git commit -m 'Release v0.4.6'
+          test -z "$(git status --porcelain)"
+          gh auth setup-git
+          git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
+          printf 'Validated release candidate: %s\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          git show --stat --oneline HEAD
