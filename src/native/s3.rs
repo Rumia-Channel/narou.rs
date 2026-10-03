@@ -20,16 +20,31 @@ pub const ASSET_BACKEND_SETTING: &str = "s3.asset-backend";
 /// 設定 (`s3.*`) → 環境変数 (`S3_*`) の順に値を解決する。
 ///
 /// 空文字は未設定として扱う (コンテナの未設定変数がそのまま入るケース)。
+fn choose_value(
+    local: Option<String>,
+    environment: impl FnOnce() -> Option<String>,
+) -> (Option<String>, &'static str) {
+    let nonempty = |value: String| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    };
+    if let Some(value) = local.and_then(nonempty) {
+        return (Some(value), "local-setting");
+    }
+    match environment().and_then(nonempty) {
+        Some(value) => (Some(value), "environment"),
+        None => (None, "unset"),
+    }
+}
+
+fn resolve_with_source(setting: &str, env: &str) -> (Option<String>, &'static str) {
+    choose_value(crate::compat::load_local_setting_string(setting), || {
+        std::env::var(env).ok()
+    })
+}
+
 fn resolve(setting: &str, env: &str) -> Option<String> {
-    crate::compat::load_local_setting_string(setting)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            std::env::var(env)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
+    resolve_with_source(setting, env).0
 }
 
 /// 挿絵を S3 に置く構成か。
@@ -38,38 +53,57 @@ pub fn illustrations_in_s3() -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("s3"))
 }
 
+struct ResolvedConfig {
+    config: S3StoreConfig,
+    sources: (&'static str, &'static str),
+}
+
 /// S3 の接続情報を解決する。`s3.asset-backend=s3` でなければ `None`。
 ///
 /// 値が欠けていてもここでは失敗させない (何が足りないかは
 /// [`S3Store::new`] の検証が示す)。呼び出し側は `None` を「ローカル保存」と
 /// 読む。
 pub fn store_config() -> Option<S3StoreConfig> {
+    resolved_config().map(|resolved| resolved.config)
+}
+
+fn resolved_config() -> Option<ResolvedConfig> {
     if !illustrations_in_s3() {
         return None;
     }
-    Some(S3StoreConfig {
-        endpoint: resolve("s3.endpoint", "S3_ENDPOINT").unwrap_or_default(),
-        bucket: resolve("s3.bucket", "S3_BUCKET").unwrap_or_default(),
-        region: resolve("s3.region", "S3_REGION").unwrap_or_default(),
-        prefix: resolve("s3.prefix", "S3_PREFIX").unwrap_or_default(),
-        // 挿絵の重複除去プールは SQLite モードと S3 が揃ったときだけ
-        // 有効にする。YAML モードでは従来どおり小説ごとの `挿絵/` 名。
-        illustration_dedup: crate::native::sqlite::state::illustration_dedup_enabled(),
-        access_key_id: resolve("s3.access-key-id", "S3_ACCESS_KEY_ID").unwrap_or_default(),
-        secret_access_key: resolve("s3.secret-access-key", "S3_SECRET_ACCESS_KEY")
-            .unwrap_or_default(),
+    let endpoint = resolve("s3.endpoint", "S3_ENDPOINT").unwrap_or_default();
+    let bucket = resolve("s3.bucket", "S3_BUCKET").unwrap_or_default();
+    let region = resolve("s3.region", "S3_REGION").unwrap_or_default();
+    let prefix = resolve("s3.prefix", "S3_PREFIX").unwrap_or_default();
+    let illustration_dedup = crate::native::sqlite::state::illustration_dedup_enabled();
+    let (access_key_id, access_source) =
+        resolve_with_source("s3.access-key-id", "S3_ACCESS_KEY_ID");
+    let (secret_access_key, secret_source) =
+        resolve_with_source("s3.secret-access-key", "S3_SECRET_ACCESS_KEY");
+    Some(ResolvedConfig {
+        config: S3StoreConfig {
+            endpoint,
+            bucket,
+            region,
+            prefix,
+            illustration_dedup,
+            access_key_id: access_key_id.unwrap_or_default(),
+            secret_access_key: secret_access_key.unwrap_or_default(),
+        },
+        sources: (access_source, secret_source),
     })
 }
 
 /// 挿絵用の S3 ストアを作る。ローカル保存の構成では `None`。
 pub fn illustration_store() -> Result<Option<Arc<S3Store>>> {
-    let Some(config) = store_config() else {
+    let Some(resolved) = resolved_config() else {
         return Ok(None);
     };
     // 保存先は自分たちの設定値なので、サイト取得用のヘッダやティア
     // フォールバックは要らない (S3 は素の HTTPS API)。
     let http = Arc::new(crate::native::http::NativeHttpClient::new("narou_rs")?);
-    let store = S3Store::new(config, http, Arc::new(SystemClock))?;
+    let store = S3Store::new(resolved.config, http, Arc::new(SystemClock))?
+        .with_credential_sources(resolved.sources);
     Ok(Some(Arc::new(store)))
 }
 
@@ -92,6 +126,23 @@ mod tests {
         ] {
             unsafe { std::env::remove_var(key) };
         }
+    }
+
+    #[test]
+    fn diagnostic_sources_preserve_resolution_and_lazy_fallback() {
+        let resolved = choose_value(Some("  local-value  ".to_string()), || {
+            panic!("a local value must not inspect the environment")
+        });
+        assert_eq!(resolved, (Some("local-value".to_string()), "local-setting"));
+        assert_eq!(
+            choose_value(Some(" ".to_string()), || Some(" env-value\n".to_string())),
+            (Some("env-value".to_string()), "environment")
+        );
+        assert_eq!(
+            choose_value(None, || Some(" ".to_string())),
+            (None, "unset")
+        );
+        assert_eq!(choose_value(None, || None), (None, "unset"));
     }
 
     #[test]

@@ -503,6 +503,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
   path-style URL、SigV4 署名と presigned GET、stat は `GET` + `Range`。1 オブジェクトの上限は
   64 MiB、`read_small`/`write_small` は 16 MiB (multipart は未実装で、上限超過は黙って
   切り捨てず失敗させる)。
+- S3 LIST エラーは資格情報を含み得る XML 本文の先頭を表示しない。エラーコードは固定の許可リスト、任意の SignatureProvided / AWSAccessKeyId / StringToSignBytes はメモリ内比較のカテゴリだけを出す。欠落・重複・不正形式は原因を断定しない。署名失敗時だけ公開 AWS fixture の自己テストを初回実行・キャッシュする。実効 host/port は URL から userinfo/path/query を除去し、非標準 region は伏せる。native 資格情報の設定元は既存の解決時にラベルだけ捕捉し、優先順位・値の正規化を変えない。
 - **署名は URL から導出する** (2026-10): `S3Store::send` は渡された URL から
   `path`/`query` を切り出して署名する (呼び出し側が canonical 値を別途渡すと
   endpoint にパス成分がある構成で乖離し得た)。`SignatureDoesNotMatch` のエラーには
