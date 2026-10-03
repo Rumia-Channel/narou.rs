@@ -52,16 +52,59 @@ fn story_html_is_converted_before_text_pipeline() {
 }
 
 #[test]
+fn synthetic_html_entities_match_literal_spaces_through_conversion() {
+    // Original synthetic prose only; no untracked novel or network dependency.
+    let toc = TocObject {
+        title: "変換テスト".to_string(),
+        author: "テスト作者".to_string(),
+        toc_url: String::new(),
+        story: Some("<p>甲&nbsp;乙</p>".to_string()),
+        subtitles: Vec::new(),
+        novel_type: Some(1),
+    };
+    let section: SectionFile = serde_yaml::from_str(
+        r#"
+index: '1'
+href: '/1/'
+subtitle: 第一話
+file_subtitle: 第一話
+subdate: ''
+element:
+  data_type: html
+  introduction: '<p>前&nbsp;書き</p>'
+  body: '<p>&nbsp;本文&nbsp;甲。</p><p>乙&nbsp;丙。</p>'
+  postscript: '<p>後&nbsp;書き</p>'
+"#,
+    )
+    .unwrap();
+    let mut literal_toc = toc.clone();
+    literal_toc.story = toc.story.as_ref().map(|story| story.replace("&nbsp;", " "));
+    let mut literal_section = section.clone();
+    literal_section.element.introduction = section.element.introduction.replace("&nbsp;", " ");
+    literal_section.element.body = section.element.body.replace("&nbsp;", " ");
+    literal_section.element.postscript = section.element.postscript.replace("&nbsp;", " ");
+
+    let encoded = NovelConverter::new(NovelSettings::default())
+        .convert_novel(&toc, &[section])
+        .unwrap();
+    let literal = NovelConverter::new(NovelSettings::default())
+        .convert_novel(&literal_toc, &[literal_section])
+        .unwrap();
+    assert_eq!(encoded.as_bytes(), literal.as_bytes());
+    assert!(!encoded.contains('\u{00A0}'));
+    assert!(encoded.contains("本文"));
+}
+
+#[test]
+#[ignore = "requires local, untracked narou.rb reference novels; see tests/README.md"]
 fn kakuyomu_sample_matches_narou_rb_reference_byte_for_byte() {
-    let root = std::env::current_dir().unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let kakuyomu_root = root.join("sample").join("novel").join("小説データ").join("カクヨム");
-    if !kakuyomu_root.is_dir() {
-        eprintln!(
-            "skipping byte-for-byte parity test: {} not found",
-            kakuyomu_root.display()
-        );
-        return;
-    }
+    assert!(
+        kakuyomu_root.is_dir(),
+        "reference fixture directory is missing: {}",
+        kakuyomu_root.display()
+    );
     let mut checked = 0;
 
     for entry in fs::read_dir(&kakuyomu_root).expect("kakuyomu sample root") {

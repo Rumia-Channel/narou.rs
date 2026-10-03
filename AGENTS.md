@@ -382,7 +382,7 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 
 ### 変換互換性
 - **なろう**: narou.rb参照データと完全互換確認済み
-- **カクヨム (ID=1177354055617350769)**: **完全互換達成** — 行数完全一致 (25,273/25,273)、行単位 diff 0件。`cargo test` の `tests/convert_parity.rs` で byte-for-byte fixture テスト通過
+- **カクヨム (ID=1177354055617350769)**: **完全互換達成** — 行数完全一致 (25,273/25,273)、行単位 diff 0件。`tests/convert_parity.rs` のローカル参照 fixture で byte-for-byte 確認済み（通常の `cargo test` では ignored。参照データを用意して明示実行する手順は `tests/README.md`）
 - ※米印変換、全角数字、ルビ、auto_join_line、各種文字変換も完全一致
 
 ### AozoraEpub3_Lite 組み込みエンジン (lite feature, 2026-09)
