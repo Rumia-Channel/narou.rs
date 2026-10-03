@@ -20,7 +20,7 @@ pub fn errors_occurred(count: usize) -> String {
     format!("\n{count} 件のエラーが発生しました")
 }
 
-/// 対象が管理小説に無い (先頭の [ERROR] は呼び出し側が赤くする)。
+/// 対象が管理小説に無い (先頭の `[ERROR]` は呼び出し側が赤くする)。
 pub fn unmanaged_target(error_tag: impl Display, target: impl Display) -> String {
     format!("{error_tag} {target} は管理小説の中に存在しません")
 }

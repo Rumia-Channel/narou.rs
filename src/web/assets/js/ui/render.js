@@ -491,10 +491,7 @@ function createRow(novel, rowIndex) {
   // TOC URL link button. `display_url` is the page the novel was registered
   // from; `toc_url` can be an API endpoint (Pixiv), which is not something to
   // open in a browser.
-  const tocUrl = novel.display_url || novel.toc_url || '';
-  const tocLink = tocUrl
-    ? `<a href="${esc(tocUrl)}" target="_blank" rel="noopener" class="btn-link-icon" title="${esc(tocUrl)}">${materialIcon('link', 'icon-only')}</a>`
-    : '';
+  const tocLink = renderNovelSourceLink(novel);
 
   // Episode count with "話" suffix (narou.rb style)
   const episodes = getEpisodeCount(novel);
@@ -988,8 +985,11 @@ function renderTaskItem(task, isRunning, idx, total) {
 }
 
 function assertQueueActionSuccess(result, fallbackMessage) {
-  if (result && result.success === false) {
-    throw new Error(result.message || fallbackMessage);
+  if (result && (result.success === false || result.error)) {
+    const errorMessage = typeof result.error === 'string'
+      ? result.error
+      : result.error?.message;
+    throw new Error(errorMessage || result.message || fallbackMessage);
   }
   return result;
 }
@@ -1334,6 +1334,13 @@ function unitizeNumeric(num) {
     return (num / 10000).toFixed(1) + '万';
   }
   return num.toLocaleString();
+}
+
+function renderNovelSourceLink(novel) {
+  const tocUrl = novel.display_url || novel.toc_url || '';
+  return tocUrl
+    ? `<a href="${escAttr(tocUrl)}" target="_blank" rel="noopener" class="btn-link-icon" title="${escAttr(tocUrl)}">${materialIcon('link', 'icon-only')}</a>`
+    : '';
 }
 
 function esc(s) {

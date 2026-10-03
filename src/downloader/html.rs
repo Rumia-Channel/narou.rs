@@ -163,7 +163,7 @@ fn restore_entities(text: &str) -> String {
     let entities: &[(&str, &str)] = &[
         ("&quot;", "\""),
         ("&amp;", "&"),
-        ("&nbsp;", "\u{00A0}"),
+        ("&nbsp;", " "),
         ("&lt;", "<"),
         ("&gt;", ">"),
         ("&copy;", "(c)"),
@@ -213,6 +213,12 @@ mod tests {
 
         assert!(text.contains("［＃挿絵（挿絵/16-0.jpg）入る］"));
         assert!(!text.contains("［＃斜体］"));
+    }
+
+    #[test]
+    fn nbsp_matches_narou_rb_entity_restoration() {
+        assert_eq!(to_aozora("甲&nbsp;乙"), "甲 乙");
+        assert_eq!(to_aozora("&nbsp;本文&nbsp;"), " 本文 ");
     }
 
     #[test]

@@ -38,13 +38,24 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - name: Web UI source-link escaping regressions
+        run: node --test tests/render_links.test.mjs
       - run: cargo check --workspace --all-targets
+      - name: Web UI queue and refresh regressions
+        run: node --test tests/queue_refresh.test.mjs
       - name: Regression - SQLite converter settings (issue 22)
         run: cargo test -p narou_rs --lib converter_reads_sqlite_backed_default_and_force_settings
       - name: Regression - latest list ordering (issue 21)
         run: cargo test -p narou_rs --bin narou_rs list_latest_sorts_newest_first
       - run: cargo test --workspace --all-targets
-      - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Documentation warnings
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
       # Verify the non-GPL binaries actually link (check/test do not).
       - run: cargo build -p narou_rs --bins
 

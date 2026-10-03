@@ -4,7 +4,7 @@
 //! the database, inventory, or filesystem directly. Application code must
 //! not import the web framework, the web/native modules, database globals,
 //! the inventory type, filesystem/process, or HTTP clients; it depends only
-//! on `serde`/`chrono`, the domain [`NovelRecord`], and the platform traits.
+//! on `serde`/`chrono`, the domain [`NovelRecord`](crate::db::NovelRecord), and the platform traits.
 //!
 //! Modules:
 //! - [`aliases`]: novel-target alias resolution shared by the CLI and Worker.

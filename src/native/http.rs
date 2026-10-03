@@ -13,7 +13,7 @@
 //! fallback try the next transport.
 //!
 //! Rate limiting is *not* part of this transport; the downloader injects a
-//! separate [`RateLimiter`] and paces requests through
+//! separate [`RateLimiter`](crate::platform::RateLimiter) and paces requests through
 //! `downloader::http_policy` helpers.
 
 use std::collections::HashMap;

@@ -1322,7 +1322,7 @@ fn split_job_target(target: &str) -> Vec<&str> {
 
 /// Extract the set of numeric novel IDs from a queue job target string.
 ///
-/// Targets are tab-separated lists of arguments (see [`split_job_target`])
+/// Targets are tab-separated lists of arguments (see `split_job_target`)
 /// and may include non-numeric tokens such as `--force` or `tag:modified`.
 /// Only tokens that parse as `i64` are returned, so callers can use the
 /// resulting set to compare novel identities without worrying about flag

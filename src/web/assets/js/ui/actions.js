@@ -1906,9 +1906,13 @@ function closeMenuStyleModal() {
 
 /* ===== Data refresh ===== */
 
+let listRefreshGeneration = 0;
+
 export async function refreshList() {
+  const generation = ++listRefreshGeneration;
   try {
     const resp = await fetchJson('/api/list?all=true');
+    if (generation !== listRefreshGeneration) return;
     if (resp && Array.isArray(resp.data)) {
       State.novels = resp.data;
       State.frozenIds = new Set(
@@ -1917,7 +1921,7 @@ export async function refreshList() {
       pruneSelectedIdsToCurrentList();
     }
   } catch { /* ignore */ }
-  renderNovelList();
+  if (generation === listRefreshGeneration) renderNovelList();
 }
 
 export async function refreshQueue() {

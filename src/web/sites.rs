@@ -2,7 +2,7 @@
 //!
 //! 保存先は保存方式に応じて選ばれる（YAML モードは `webnovel/` フォルダ、SQLite
 //! モードはオブジェクトストア）。応答形は Worker の `/api/sites*` と同じで、
-//! 実体は core の [`SiteDefinitions`] に集約してある。
+//! 実体は core の [`SiteDefinitions`](crate::application::site_definitions::SiteDefinitions) に集約してある。
 
 use axum::Json;
 use axum::extract::Path;
