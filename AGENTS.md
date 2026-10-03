@@ -506,13 +506,16 @@ sample/  (gitignore 済みのローカル用ディレクトリ)
 - **署名は URL から導出する** (2026-10): `S3Store::send` は渡された URL から
   `path`/`query` を切り出して署名する (呼び出し側が canonical 値を別途渡すと
   endpoint にパス成分がある構成で乖離し得た)。`SignatureDoesNotMatch` のエラーには
-  サーバーが返す `StringToSign` digest と自分側の digest の一致/不一致を示す診断が
-  付く (一致なら鍵/スコープ、不一致なら canonical request の差異)。presigned GET の
+  サーバーが返す `StringToSign` は実改行・文字列 `\n` / `\r\n`・XML 改行参照を正規化し、
+  64 桁 hex digest とアルゴリズム・日時・スコープを分けて比較する。不正な応答は断定しない。
+  digest 一致だけで secret 不正と判断せず、全文一致なら有効な鍵ペア・設定元・鍵導出・送信した
+  Authorization の確認を促す（診断表示の修正自体は 403 の解決ではない）。presigned GET の
   パスは生キーから組み立てる (`object_path()` の encode 済み値を渡すと二重
   エンコードになる)。endpoint に `?`/`#` を含む値は拒否する。
 - native の設定は `local_setting` の `s3.endpoint` / `s3.bucket` / `s3.region` / `s3.prefix` /
   `s3.access-key-id` / `s3.secret-access-key`。`narou setting` から読み書きでき、環境変数 (`S3_*`)
-  があればそちらを優先する (SORAHOST のようなコンテナは環境変数だけで完結する)。
+  は各項目のローカル設定が空／未設定の場合に使う（ローカル設定が優先）。項目ごとの解決なので、
+  ローカルに片方の鍵だけ残ると環境変数のもう片方と組み合わさり得る。値は公開ログへ出さない。
 - 挿絵を S3 に置くかは `s3.asset-backend` (`local` | `s3`、環境変数 `NAROU_RS_ASSET_BACKEND`)。
   **Worker 側の切替は従来どおり `app_state('inv','asset_backend')`** で、native は設定ファイル側に
   置く (native から `app_state` を書く口が無いため)。`s3` を選んで接続情報が欠けていれば
