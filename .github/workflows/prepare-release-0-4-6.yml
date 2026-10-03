@@ -1,33 +1,23 @@
-name: Prepare validated v0.4.6
-
+name: Publish validated v0.4.6 and consolidate branches
 on:
   push:
     branches: [verify-release-0-4-6]
     paths: ['.github/workflows/prepare-release-0-4-6.yml']
-
 permissions:
   contents: read
-
 concurrency:
-  group: prepare-release-0-4-6
+  group: publish-release-0-4-6
   cancel-in-progress: false
-
-# This workflow stays on the verification branch. The candidate is created
-# from the pinned develop commit, so this one-off workflow is NOT released.
-# No main/develop writes, tags, deployment credentials, or deployments here.
 jobs:
-  prepare:
+  publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 180
     permissions:
       contents: write
-    env:
-      BASE_SHA: 0dbf4469cc40b6287cb601c2591985e63fd52f5e
-      RELEASE_BRANCH: release-v0-4-6
+      actions: write
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: 0dbf4469cc40b6287cb601c2591985e63fd52f5e
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -39,126 +29,163 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
-      - name: Prepare version and release notes without committing
+      - name: Preserve all histories with no-fast-forward merges
+        id: integrate
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$BASE_SHA"
-          test -z "$(git status --porcelain)"
-          git switch -c "$RELEASE_BRANCH"
-          python3 - <<'PY'
-          from pathlib import Path
-          import subprocess
-          import tomllib
-
-          base = '0dbf4469cc40b6287cb601c2591985e63fd52f5e'
-          remote = subprocess.check_output(['git', 'ls-remote', 'origin', 'refs/heads/develop'], text=True).split()
-          assert remote and remote[0] == base, 'develop advanced; stop for review'
-          for ref in ['refs/heads/release-v0-4-6', 'refs/tags/v0.4.6']:
-              assert not subprocess.check_output(['git', 'ls-remote', 'origin', ref], text=True).strip(), f'{ref} already exists'
-
-          # Only package versions change; dependencies and features stay pinned.
-          # cargo check below generates Cargo.lock before the version commit.
-          for filename, package in [('Cargo.toml', 'narou_rs'), ('worker_entry/Cargo.toml', 'narou_worker')]:
-              path = Path(filename)
-              data = path.read_bytes()
-              manifest = tomllib.loads(data.decode('utf-8'))
-              assert manifest['package']['name'] == package
-              assert manifest['package']['version'] == '0.4.5'
-              old = b'version = "0.4.5"'
-              assert data.count(old) == 1
-              path.write_bytes(data.replace(old, b'version = "0.4.6"', 1))
-
-          path = Path('README.md')
-          data = path.read_text(encoding='utf-8')
-          heading = '## 開発版の修正（未リリース）'
-          assert data.count(heading) == 1
-          notes = '''## v0.4.6 の主な変更
-
-          - Cloudflare Workers の小説一覧・全体設定・タグ・キュー表示から、不要な S3・ログイン・ダウンローダ等の初期化を取り除きました。
-          - タグとキュー件数を D1 側で集計し、画面表示のために全小説・全待機ジョブを転送する処理を削減しました。認証と既存の検索・設定保存の規則は維持しています。
-          - 対象 API に `Server-Timing` と比較用スクリプトを追加しました。計測方法は `docs/worker-ui-latency.md` を参照してください。EPUB・画像変換の最適化は今回の対象外です。'''
-          data = data.replace(heading, notes, 1)
-          old_heading = '## v0.4.5 の主な変更'
-          assert data.count(old_heading) == 1
-          data = data.replace(old_heading, '変更一覧は [v0.4.5...v0.4.6](https://github.com/Rumia-Channel/narou.rs/compare/v0.4.5...v0.4.6) を参照してください。\n\n' + old_heading, 1)
-          path.write_text(data, encoding='utf-8')
-          PY
-      - name: Cargo check and regenerate lockfile
-        run: cargo check --workspace --all-targets
-      - name: Check Lite build
-        run: cargo check --locked -p narou_rs --all-targets --features lite
-      - name: Check Worker wasm build
-        run: cargo check --locked -p narou_worker --target wasm32-unknown-unknown
-      - name: Run UI regression tests
-        run: |
-          python -m unittest discover -s worker_entry/tests -p 'test_ui_*.py' -v
-          node --test worker_entry/tests/ui_latency.test.mjs
-      - name: Verify exact lockfile change and prepare validation record
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
+          candidate=bfbaf45f7acdbd9a38e48c7b9a43a41d54ce488d
+          candidate_tree=13f3b6b2d72768b573af6e552a8b07c41ad72745
+          expected_main=d3b39e94d7042ea8750a0d68782c21ee9b3fee2e
+          expected_develop=0dbf4469cc40b6287cb601c2591985e63fd52f5e
+          cat > "$RUNNER_TEMP/original-heads.txt" <<'HEADS'
+          0dbf4469cc40b6287cb601c2591985e63fd52f5e develop
+          1a5563ff113eead5d6ea913da03f1120f20151bf feature-aozora-lite-support
+          b8dd0c85a417f5f1476ea6179ac03c992fc20ad6 feature-author-tracking
+          5eaef0cb0d13f9d4cc33e5a03f91063776ce4868 feature-lite-epub-engine
+          8956d0b183fc92dd247e50cb49dcf4bb6bc08f97 feature-login-support
+          45c6eab9a52cb0ebcb27c2bf5e73ae9ab658258f feature-sqlite-storage-p1
+          c7d966fd67ce6a0796ff209e6c27425ed001c3e3 feature-web-search-url-id
+          a223b69f3fe32a6b68d7ba90af7a3c36e08aae42 feature-worker-url-download
+          ae882100a187686a791654cf602b917cb881307b feature/lite-0.1.3-pipeline
+          d5a0c270bf003f8f43cf69661d53b850aea85827 feature/lite-aozora-assets
+          089dee8fa706392e639fc989fea016d2ca5e4412 feature/worker-epub-source
+          e469f7e1351f401e34de9363796cf4e09260996e fix-issue20-cli-lite
+          1e1793f5535358d88517ffc23b9d6437ad617e37 fix-ruby-section-updates
+          ea61fa6ad66522fa73c56a19a1ef1688f71d3eb1 fix-sqlite-novel-reregistration
+          aa8aa5a3348640e7f7da9f719a2ffd435e1fade8 fix-systemd-web-self-update
+          77b893183ebe09be22842308d5afbfae6bda91d4 fix-unified-settings-io
+          af60d395da1dd66705abce31b11e711dce326d7e fix-web-menu-actions
+          4531da6cff67dbd12eea0ff6ac97556878764607 fix-worker-parity
+          d3b39e94d7042ea8750a0d68782c21ee9b3fee2e main
+          c4bf0e90d4967ea5d3b06a88ec27a88643f69e62 perf-worker-ui-latency
+          df1012d9676cbecfe18075c9c12088224d7aae6f plan-sqlite-storage
+          1531552c0afbcf72933790c819c95ffb4f2146f0 refactor-platform-abstraction
+          bfbaf45f7acdbd9a38e48c7b9a43a41d54ce488d release-v0-4-6
+          575898affb1ae1727c5fa6e1e4ef1fc1cb09d553 verify-release-0-4-6
+          HEADS
+          # Only this reviewed workflow commit may change the verification branch.
+          python3 - <<'PYS'
           import os
-          import subprocess
-          import tomllib
-
-          original = subprocess.check_output(['git', 'show', 'HEAD:Cargo.lock'])
-          expected = original
-          for package in ['narou_rs', 'narou_worker']:
-              old = f'name = "{package}"\nversion = "0.4.5"'.encode()
-              assert expected.count(old) == 1
-              expected = expected.replace(old, f'name = "{package}"\nversion = "0.4.6"'.encode(), 1)
-          assert Path('Cargo.lock').read_bytes() == expected, 'Unexpected dependency/lockfile changes; stop for review'
-          for filename in ['Cargo.toml', 'worker_entry/Cargo.toml']:
-              assert tomllib.loads(Path(filename).read_text())['package']['version'] == '0.4.6'
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
-          assert changed == {'Cargo.toml', 'Cargo.lock', 'worker_entry/Cargo.toml', 'README.md'}, changed
-          log = Path('.serena/memories/porting_status/release_0_4_6_2026-10-03.md')
-          assert not log.exists()
-          log.parent.mkdir(parents=True, exist_ok=True)
-          run_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
-          log.write_text(f'''# v0.4.6 release preparation
-
-          Base: develop {os.environ['BASE_SHA']}.
-          Package versions: narou_rs / narou_worker 0.4.6.
-          Cargo.lock was regenerated by cargo check; only these two package versions changed.
-          README promotes the develop fixes and documents the Worker UI latency changes.
-          Includes PR #34 and the existing link/individual conversion fixes from develop.
-          No new dependencies, storage migrations or runtime behavior changes in this version bump.
-
-          Before the release commit, GitHub Actions successfully ran:
-          - cargo check --workspace --all-targets
-          - cargo check --locked -p narou_rs --all-targets --features lite
-          - cargo check --locked -p narou_worker --target wasm32-unknown-unknown
-          - SQL UI regression tests and Node latency-client tests
-
-          Validation run: {run_url}
-          Integration into develop/main and tag creation are separate reviewed steps.
-          No production latency reduction is claimed in milliseconds or percentages.
-          ''', encoding='utf-8')
-          PY
-          git diff --check
-          git status --short
-          git diff --stat
-          git diff -- Cargo.toml worker_entry/Cargo.toml Cargo.lock README.md
-      - name: Commit and push only the validated release candidate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git ls-remote origin refs/heads/develop | cut -f1)" = "$BASE_SHA"
-          test -z "$(git ls-remote origin refs/heads/$RELEASE_BRANCH)"
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])/'original-heads.txt'
+          lines=p.read_text().splitlines()
+          p.write_text('\n'.join((os.environ['GITHUB_SHA']+' verify-release-0-4-6') if line.endswith(' verify-release-0-4-6') else line for line in lines)+'\n')
+          PYS
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*' --tags
+          while read -r sha branch; do
+            test "$(git rev-parse "refs/remotes/origin/$branch")" = "$sha"
+          done < "$RUNNER_TEMP/original-heads.txt"
+          test "$(git ls-remote --heads origin | wc -l)" -eq 24
           test -z "$(git ls-remote origin refs/tags/v0.4.6)"
+          test "$(git rev-parse "$candidate^{tree}")" = "$candidate_tree"
+          git merge-base --is-ancestor 575898affb1ae1727c5fa6e1e4ef1fc1cb09d553 "$GITHUB_SHA"
+          git merge-base --is-ancestor af60d395da1dd66705abce31b11e711dce326d7e "$candidate"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Cargo.toml worker_entry/Cargo.toml Cargo.lock README.md .serena/memories/porting_status/release_0_4_6_2026-10-03.md
-          git diff --cached --check
-          git commit -m 'Release v0.4.6'
+          git switch -c develop "$expected_develop"
+          git merge --no-ff "$candidate" -m 'Merge release v0.4.6 into develop'
+          git merge --no-ff --no-commit "$GITHUB_SHA"
+          # This one-off orchestration file is preserved in history, never in release tree.
+          git rm -f .github/workflows/prepare-release-0-4-6.yml
+          git commit -m 'Merge release validation history and retire the one-off workflow'
+          test "$(git rev-parse HEAD^{tree})" = "$candidate_tree"
+          git switch -c main "$expected_main"
+          git merge --no-ff develop -m 'Merge develop into main (v0.4.6)'
+          test "$(git rev-parse HEAD^{tree})" = "$candidate_tree"
+          release_sha=$(git rev-parse HEAD)
+          git switch develop
+          git merge --no-ff main -m 'Merge released v0.4.6 history back into develop'
+          test "$(git rev-parse HEAD^{tree})" = "$candidate_tree"
+          git diff --exit-code "$candidate" main
+          git diff --exit-code "$candidate" develop
+          while read -r sha branch; do
+            git merge-base --is-ancestor "$sha" main
+            git merge-base --is-ancestor "$sha" develop
+          done < "$RUNNER_TEMP/original-heads.txt"
+          printf 'release_sha=%s\ndevelop_sha=%s\n' "$release_sha" "$(git rev-parse develop)" >> "$GITHUB_OUTPUT"
+          printf 'All 24 original heads are reachable from both final heads.\nRelease SHA: %s\nTree: %s\n' "$release_sha" "$candidate_tree" >> "$GITHUB_STEP_SUMMARY"
+      - name: Check exact integrated release tree
+        run: |
+          cargo check --locked --workspace --all-targets
+          cargo check --locked -p narou_rs --all-targets --features lite
+          cargo check --locked -p narou_worker --target wasm32-unknown-unknown
+          python -m unittest discover -s worker_entry/tests -p 'test_ui_*.py' -v
+          node --test worker_entry/tests/ui_latency.test.mjs
+          git diff --exit-code
+      - name: Publish main develop and v0.4.6 atomically
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.integrate.outputs.release_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
           test -z "$(git status --porcelain)"
+          while read -r sha branch; do
+            test "$(git ls-remote origin "refs/heads/$branch" | cut -f1)" = "$sha"
+          done < "$RUNNER_TEMP/original-heads.txt"
+          test "$(git ls-remote --heads origin | wc -l)" -eq 24
+          test -z "$(git ls-remote origin refs/tags/v0.4.6)"
+          git switch main
+          git tag -a v0.4.6 -m 'Release v0.4.6'
           gh auth setup-git
-          git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
-          printf 'Validated release candidate: %s\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
-          git show --stat --oneline HEAD
+          git push --atomic origin main develop refs/tags/v0.4.6
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$RELEASE_SHA"
+          test "$(git ls-remote origin 'refs/tags/v0.4.6^{}' | cut -f1)" = "$RELEASE_SHA"
+          # Pushes made by GITHUB_TOKEN do not trigger workflows; explicitly invoke the unchanged release workflow.
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref v0.4.6
+          printf 'Tag v0.4.6 published on main %s; release workflow dispatched.\n' "$RELEASE_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify release success and consolidate reachable branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.integrate.outputs.release_sha }}
+          DEVELOP_SHA: ${{ steps.integrate.outputs.develop_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYS'
+          import json, os, subprocess, time
+          repo=os.environ['GITHUB_REPOSITORY']; sha=os.environ['RELEASE_SHA']
+          def api(path): return json.loads(subprocess.check_output(['gh','api',f'repos/{repo}/{path}'],text=True))
+          while True:
+              runs=api('actions/workflows/release.yml/runs?event=workflow_dispatch&per_page=30')['workflow_runs']
+              matches=[r for r in runs if r['head_sha']==sha and r['head_branch']=='v0.4.6']
+              if len(matches)>1: raise RuntimeError('Multiple release runs match; stop for review')
+              if matches:
+                  run=matches[0]
+                  print(run['html_url'],run['status'],run['conclusion'],flush=True)
+                  if run['status']=='completed':
+                      assert run['conclusion']=='success', 'Release failed; keep branches for recovery'
+                      break
+              time.sleep(90)
+          release=api('releases/tags/v0.4.6')
+          assert not release['draft'] and not release['prerelease']
+          expected={f'narou_rs_{platform}_{arch}{variant}.zip' for platform,arch in [('win','x64'),('win','arm64'),('mac','x64'),('mac','arm64'),('linux','x64'),('linux','arm64'),('linux','armv7'),('linux','armv6')] for variant in ['', '-GPL']}
+          assets=release['assets']
+          assert {a['name'] for a in assets}==expected, [(a['name'],a['size']) for a in assets]
+          assert all(a['state']=='uploaded' and a['size']>0 for a in assets)
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+              f.write(f"Release verified: {release['html_url']}\nAll 16 expected nonempty release ZIPs uploaded.\n")
+          PYS
+          # Recheck every exact ref immediately before an atomic guarded cleanup.
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+          test "$(git rev-parse origin/main)" = "$RELEASE_SHA"
+          test "$(git rev-parse origin/develop)" = "$DEVELOP_SHA"
+          test "$(git ls-remote --heads origin | wc -l)" -eq 24
+          refs=()
+          leases=()
+          while read -r sha branch; do
+            case "$branch" in main|develop) continue;; esac
+            test "$(git ls-remote origin "refs/heads/$branch" | cut -f1)" = "$sha"
+            git merge-base --is-ancestor "$sha" origin/main
+            git merge-base --is-ancestor "$sha" origin/develop
+            refs+=(":refs/heads/$branch")
+            leases+=("--force-with-lease=refs/heads/$branch:$sha")
+          done < "$RUNNER_TEMP/original-heads.txt"
+          test "${#refs[@]}" -eq 22
+          git push --atomic "${leases[@]}" origin "${refs[@]}"
+          git ls-remote --heads origin | tee "$RUNNER_TEMP/final-heads.txt"
+          test "$(wc -l < "$RUNNER_TEMP/final-heads.txt")" -eq 2
+          printf '\nDeleted heads (all reachable from main and develop):\n' >> "$GITHUB_STEP_SUMMARY"
+          grep -Ev ' (main|develop)$' "$RUNNER_TEMP/original-heads.txt" >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/final-heads.txt" >> "$GITHUB_STEP_SUMMARY"
