@@ -5,11 +5,17 @@ narou_rs は、日本の Web 小説を取得・管理・変換する CLI / Web U
 
 README では、導入方法、基本操作、主な注意点をまとめます。詳細なコマンド互換性や未完了項目は `COMMANDS.md` を参照してください。
 
-## 開発版の修正（未リリース）
+## v0.4.6 の主な変更
+
+- Cloudflare Workers の小説一覧・全体設定・タグ・キュー表示から、不要な S3・ログイン・ダウンローダ等の初期化を取り除きました。
+- タグとキュー件数を D1 側で集計し、画面表示のために全小説・全待機ジョブを転送する処理を削減しました。認証と既存の検索・設定保存の規則は維持しています。
+- 対象 API に `Server-Timing` と比較用スクリプトを追加しました。計測方法は `docs/worker-ui-latency.md` を参照してください。EPUB・画像変換の最適化は今回の対象外です。
 
 - Web UI の「リンク」が localhost を開く不具合を修正しました（[#33](https://github.com/Rumia-Channel/narou.rs/issues/33)）。ID・Nコード・別名をページ URL として保存せず、既存の不正な値は取得 URL にフォールバックします。再ダウンロードは不要です。
 - 個別メニューの「変換」が要求を送らない不具合を修正しました（[#33](https://github.com/Rumia-Channel/narou.rs/issues/33)）。一覧の選択状態に関係なく、その作品を変換します。
 - SQLite + Lite の変換で設定ストアの接続ロックを再取得して停止する問題と、EPUB 用の挿絵取り出しが CLI の Tokio 文脈で panic する問題も修正しました。
+
+変更一覧は [v0.4.5...v0.4.6](https://github.com/Rumia-Channel/narou.rs/compare/v0.4.5...v0.4.6) を参照してください。
 
 ## v0.4.5 の主な変更
 
