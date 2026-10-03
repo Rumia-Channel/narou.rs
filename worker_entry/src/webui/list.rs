@@ -9,7 +9,7 @@
 //!
 //! 一覧の絞り込み・ソート・ページング・frozen/new マーカーは native と
 //! 同じ `narou_rs::application::LibraryService::list`
-//! (`runtime.services.library`) に委譲するので、行の意味も一致する。
+//! (`MetadataServices::library`) に委譲するので、行の意味も一致する。
 
 use narou_rs::application::web_payloads::{ListParams, NovelListItem, NovelListResponse};
 use narou_rs::application::{
@@ -63,6 +63,7 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
 
 /// native `api_list_inner` (`src/web/novels.rs`) の写し。
 async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Response> {
+    let started_ms = js_sys::Date::now();
     let draw = params.draw.unwrap_or(1);
     let return_all = params.all.unwrap_or(false);
     let start = if return_all {
@@ -104,15 +105,14 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
     } else {
         LibrarySortOrder::Ascending
     };
-    let runtime = match crate::composition::WorkerRuntime::build_ui(env).await {
-        Ok(runtime) => runtime,
+    let services = match super::metadata::MetadataServices::new(env) {
+        Ok(services) => services,
         Err(error) => {
             worker::console_log!("service composition failed: {error}");
             return json_error(503, "service_unavailable", None);
         }
     };
-    let page = match runtime
-        .services
+    let page = match services
         .library
         .list(&LibraryListRequest {
             search,
@@ -153,12 +153,13 @@ async fn api_list_inner(env: &Env, params: ListParams) -> worker::Result<Respons
         })
         .collect();
 
-    Response::from_json(&NovelListResponse {
+    let response = Response::from_json(&NovelListResponse {
         draw,
         records_total: page.records_total,
         records_filtered: page.records_filtered,
         data,
-    })
+    })?;
+    super::metadata::timed_response(response, "list", started_ms)
 }
 
 /// native `combine_search_terms` の写し。

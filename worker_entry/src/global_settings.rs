@@ -9,7 +9,7 @@
 use narou_rs::application::settings_view::{self, SAVE_MESSAGE};
 use worker::{console_log, Env, Method, Request, Response};
 
-use crate::composition::WorkerRuntime;
+use crate::webui::metadata;
 
 /// 設定一覧の取得と保存。
 pub async fn api_global_setting(mut req: Request, env: Env) -> worker::Result<Response> {
@@ -20,17 +20,18 @@ pub async fn api_global_setting(mut req: Request, env: Env) -> worker::Result<Re
     if method != Method::Get && method != Method::Post {
         return Response::error("Method Not Allowed", 405);
     }
-    let runtime = match WorkerRuntime::build_ui(&env).await {
-        Ok(runtime) => runtime,
+    let started_ms = js_sys::Date::now();
+    let settings = match metadata::settings(&env) {
+        Ok(settings) => settings,
         Err(error) => {
             console_log!("service composition failed: {error}");
             return Response::error("Service Unavailable", 503);
         }
     };
     if method == Method::Get {
-        let mut view = settings_view::load_view(&runtime.services.settings).await;
+        let mut view = settings_view::load_view(&settings).await;
         mark_worker_ineffective(&mut view);
-        return Response::from_json(&view);
+        return metadata::timed_response(Response::from_json(&view)?, "settings", started_ms);
     }
     let body: serde_json::Value = match req.json().await {
         Ok(body) => body,
@@ -54,7 +55,7 @@ pub async fn api_global_setting(mut req: Request, env: Env) -> worker::Result<Re
             ));
         }
     }
-    match settings_view::apply_save(&runtime.services.settings, &body).await {
+    match settings_view::apply_save(&settings, &body).await {
         Ok(_effects) => Response::from_json(&result_body(true, SAVE_MESSAGE)),
         Err(message) => Response::from_json(&result_body(false, &message)),
     }

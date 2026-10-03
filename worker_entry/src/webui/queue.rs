@@ -19,13 +19,11 @@
 //! so reads go through a direct `env.d1("DB")` handle — the same binding
 //! `WorkerRuntime::build_ui` wires into `D1JobLedger`.
 
-use std::collections::HashMap;
-
 use serde::Deserialize;
 use serde_json::json;
 use worker::{Method, Request, Response, Result, console_log};
 
-use crate::composition::WorkerRuntime;
+use crate::db_handle::DbHandle;
 
 /// Entry point; `lib.rs` routes `/api/tag_list`, `/api/queue/status`,
 /// `/api/get_pending_tasks` and `/api/get_queue_size` here.
@@ -41,19 +39,64 @@ pub async fn handle(req: Request, env: worker::Env) -> Result<Response> {
 
 use narou_rs::application::webui::{html_escape, tag_color_class};
 
-use super::{configured_tag_color, json_error, query_param};
+use super::{json_error, query_param};
+use super::metadata::{self, MetadataServices};
 
-/// Build the runtime or finish with the native-style 503 error response.
-macro_rules! runtime_or_503 {
+/// Construct only the D1 session required by ledger reads.
+macro_rules! database_or_503 {
     ($env:expr) => {
-        match WorkerRuntime::build_ui(&$env).await {
-            Ok(runtime) => runtime,
+        match metadata::database(&$env) {
+            Ok(db) => db,
             Err(error) => {
-                console_log!("service composition failed: {error}");
+                console_log!("D1 composition failed: {error}");
                 return Response::error("Service unavailable", 503);
             }
         }
     };
+}
+
+// Keep these SQL strings explicit: the SQLite regression tests execute the
+// production queries, including lane/status mappings and the bounded results.
+const TAG_NAMES_SQL: &str = r#"
+SELECT t.tag FROM novel_tags t
+INNER JOIN novels n ON n.id = t.novel_id
+GROUP BY t.tag COLLATE BINARY
+ORDER BY COUNT(*) DESC, t.tag COLLATE BINARY ASC
+"#;
+
+const QUEUE_COUNTS_SQL: &str = r#"
+SELECT status,
+       CASE WHEN kind IN ('convert', 'send', 'backup', 'mail') THEN 1 ELSE 0 END AS lane,
+       COUNT(*) AS n
+FROM worker_jobs
+WHERE status IN ('pending', 'retryable', 'running', 'succeeded', 'partial', 'blocked', 'permanent')
+GROUP BY status, lane
+"#;
+
+// The label needs a target only when exactly one job is running. Read at most
+// one row, in the same batch snapshot as QUEUE_COUNTS_SQL.
+const FIRST_RUNNING_SQL: &str = r#"
+SELECT job_id, kind, target, options, status, created_at
+FROM worker_jobs WHERE status = 'running'
+ORDER BY created_at ASC, job_id ASC LIMIT 1
+"#;
+
+const LANE_COUNTS_SQL: &str = r#"
+SELECT CASE WHEN kind IN ('convert', 'send', 'backup', 'mail') THEN 1 ELSE 0 END AS lane,
+       COUNT(*) AS n
+FROM worker_jobs
+WHERE status IN ('pending', 'retryable', 'running')
+GROUP BY lane
+"#;
+
+#[derive(Debug, Deserialize)]
+struct TagName {
+    tag: String,
+}
+
+async fn select_tag_names(db: &DbHandle) -> Result<Vec<String>> {
+    let result = db.prepare(TAG_NAMES_SQL).all().await?;
+    Ok(result.results::<TagName>()?.into_iter().map(|row| row.tag).collect())
 }
 
 async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
@@ -63,38 +106,37 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
-    let runtime = runtime_or_503!(env);
+    let started_ms = js_sys::Date::now();
+    let services = match MetadataServices::new(&env) {
+        Ok(services) => services,
+        Err(error) => {
+            console_log!("D1 composition failed: {error}");
+            return Response::error("Service unavailable", 503);
+        }
+    };
     let format = req
         .url()
         .ok()
         .and_then(|url| query_param(&url, "format"));
 
-    let new_tag_color = configured_tag_color(&runtime).await;
-    let records = runtime
-        .services
-        .library
-        .records()
-        .await
-        .unwrap_or_default();
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for record in &records {
-        for tag in &record.tags {
-            *counts.entry(tag.clone()).or_insert(0) += 1;
-        }
-    }
-    let mut list: Vec<(String, usize)> = counts.into_iter().collect();
-    // 件数の降順 (native のタグ一覧と同じ並び)。
-    list.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-    let tags = list.into_iter().map(|(tag, _)| tag).collect::<Vec<_>>();
-    let tag_colors = runtime
-        .services
+    // Independent reads overlap; never materialize all NovelRecords for tags.
+    let (new_tag_color, tags) = futures::join!(
+        metadata::configured_tag_color(&services.settings),
+        select_tag_names(&services.db),
+    );
+    // Preserve the old empty-list fallback on storage errors.
+    let tags = tags.unwrap_or_default();
+    let tag_colors = services
         .tag_colors
         .for_tags(tags.clone(), new_tag_color.as_deref())
         .await
         .unwrap_or_default();
 
     if format.as_deref() == Some("json") {
-        return Response::from_json(&json!({ "tags": tags, "tag_colors": tag_colors }));
+        return metadata::timed_response(
+            Response::from_json(&json!({ "tags": tags, "tag_colors": tag_colors }))?,
+            "tags", started_ms,
+        );
     }
 
     let mut html = String::from(
@@ -112,7 +154,7 @@ async fn tag_list(req: Request, env: worker::Env) -> Result<Response> {
             class, escaped_tag, escaped_tag, escaped_tag, class
         ));
     }
-    Response::from_html(html)
+    metadata::timed_response(Response::from_html(html)?, "tags", started_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -133,20 +175,18 @@ struct ActiveJobRow {
 #[derive(Debug, Deserialize)]
 struct StatusCount {
     status: String,
+    lane: usize,
+    n: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LaneCount {
+    lane: usize,
     n: i64,
 }
 
 fn is_pending_status(status: &str) -> bool {
     matches!(status, "pending" | "retryable")
-}
-
-/// Native `JobType::lane`: download/update/auto_update use the default lane;
-/// convert/send/backup/mail share the secondary lane.
-fn lane_index(kind: &str) -> usize {
-    match kind {
-        "convert" | "send" | "backup" | "mail" => 1,
-        _ => 0,
-    }
 }
 
 /// `created_at` is stored as canonical RFC3339; the Web UI expects Unix
@@ -244,18 +284,9 @@ fn describe_update_targets(targets: &[String]) -> String {
     }
 }
 
-/// UI のキュー一覧は読み取りだけなので、replica に逃がせるセッション
-/// (first-unconstrained) 経由にする。失敗時は `DbHandle::ui` が primary に
-/// フォールバックする。
-fn d1(env: &worker::Env) -> Result<crate::db_handle::DbHandle> {
-    Ok(crate::db_handle::DbHandle::ui(std::sync::Arc::new(
-        env.d1("DB")?,
-    )))
-}
-
 /// All active (pending / retryable / running) rows in FIFO order.
-async fn select_active_rows(env: &worker::Env) -> Result<Vec<ActiveJobRow>> {
-    let statement = d1(env)?.prepare(
+async fn select_active_rows(db: &DbHandle) -> Result<Vec<ActiveJobRow>> {
+    let statement = db.prepare(
         "SELECT job_id, kind, target, options, status, created_at
          FROM worker_jobs
          WHERE status IN ('pending', 'retryable', 'running')
@@ -268,20 +299,32 @@ async fn select_active_rows(env: &worker::Env) -> Result<Vec<ActiveJobRow>> {
         .map_err(|error| worker::Error::RustError(format!("worker_jobs read: {error}")))
 }
 
-/// Terminal-state counts, grouped by ledger status string.
-async fn select_terminal_counts(env: &worker::Env) -> Result<HashMap<String, i64>> {
-    let statement = d1(env)?.prepare(
-        "SELECT status, COUNT(*) AS n
-         FROM worker_jobs
-         WHERE status IN ('succeeded', 'partial', 'blocked', 'permanent')
-         GROUP BY status",
-    );
-    let rows = statement
-        .all()
-        .await
-        .and_then(|result| result.results::<StatusCount>())
-        .map_err(|error| worker::Error::RustError(format!("worker_jobs count: {error}")))?;
-    Ok(rows.into_iter().map(|row| (row.status, row.n)).collect())
+/// Both status queries share one D1 batch/request. Pending job payloads never
+/// cross the JS/Wasm boundary just to count them (at most 14 count rows + 1 job).
+async fn select_queue_status(db: &DbHandle) -> Result<(Vec<StatusCount>, Vec<ActiveJobRow>)> {
+    let results = db.batch(vec![
+        db.prepare(QUEUE_COUNTS_SQL),
+        db.prepare(FIRST_RUNNING_SQL),
+    ]).await?;
+    crate::d1_repository::ensure_batch_success(&results)
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    if results.len() != 2 {
+        return Err(worker::Error::RustError("incomplete queue status batch".into()));
+    }
+    Ok((results[0].results::<StatusCount>()?, results[1].results::<ActiveJobRow>()?))
+}
+
+async fn select_lane_sizes(db: &DbHandle) -> Result<[i64; 2]> {
+    let result = db.prepare(LANE_COUNTS_SQL).all().await?;
+    let rows = result.results::<LaneCount>()?;
+    let mut lanes = [0; 2];
+    for row in rows {
+        let Some(lane) = lanes.get_mut(row.lane) else {
+            return Err(worker::Error::RustError("invalid queue lane".into()));
+        };
+        *lane += row.n;
+    }
+    Ok(lanes)
 }
 
 // ---------------------------------------------------------------------------
@@ -295,46 +338,51 @@ async fn queue_status(req: Request, env: worker::Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
-    let _runtime = runtime_or_503!(env);
-    let rows = match select_active_rows(&env).await {
-        Ok(rows) => rows,
+    let started_ms = js_sys::Date::now();
+    let db = database_or_503!(env);
+    let (counts, running) = match select_queue_status(&db).await {
+        Ok(snapshot) => snapshot,
         Err(_) => return json_error(500, "ledger_read_failed", None),
     };
-    let terminal = match select_terminal_counts(&env).await {
-        Ok(counts) => counts,
-        Err(_) => return json_error(500, "ledger_read_failed", None),
-    };
-
-    let running: Vec<&ActiveJobRow> = rows
-        .iter()
-        .filter(|row| row.status == "running")
-        .collect();
-    let pending_count = rows
-        .iter()
-        .filter(|row| is_pending_status(&row.status))
-        .count();
-    let running_label = match running.as_slice() {
-        [] => serde_json::Value::Null,
-        [job] => serde_json::Value::String(display_target(job)),
-        jobs => serde_json::Value::String(format!("{} 件実行中", jobs.len())),
-    };
-    let mut lane_sizes = [0usize; 2];
-    for row in &rows {
-        lane_sizes[lane_index(&row.kind)] += 1;
+    let (mut pending_count, mut running_count, mut completed, mut partial, mut failed) =
+        (0i64, 0i64, 0i64, 0i64, 0i64);
+    let mut lane_sizes = [0i64; 2];
+    for row in &counts {
+        match row.status.as_str() {
+            "pending" | "retryable" => pending_count += row.n,
+            "running" => running_count += row.n,
+            "succeeded" => completed += row.n,
+            "partial" => partial += row.n,
+            "permanent" | "blocked" => failed += row.n,
+            _ => {}
+        }
+        if is_pending_status(&row.status) || row.status == "running" {
+            let Some(lane) = lane_sizes.get_mut(row.lane) else {
+                return json_error(500, "ledger_read_failed", None);
+            };
+            *lane += row.n;
+        }
     }
-
-    let failed = terminal.get("permanent").copied().unwrap_or(0)
-        + terminal.get("blocked").copied().unwrap_or(0);
-    Response::from_json(&json!({
+    let running_label = match running_count {
+        0 => serde_json::Value::Null,
+        1 => {
+            let Some(job) = running.first() else {
+                return json_error(500, "ledger_read_failed", None);
+            };
+            serde_json::Value::String(display_target(job))
+        }
+        n => serde_json::Value::String(format!("{} 件実行中", n)),
+    };
+    metadata::timed_response(Response::from_json(&json!({
         "pending": pending_count,
-        "completed": terminal.get("succeeded").copied().unwrap_or(0),
-        "partial": terminal.get("partial").copied().unwrap_or(0),
+        "completed": completed,
+        "partial": partial,
         "failed": failed,
         "cancelled": 0,
         "running": running_label,
-        "running_count": running.len(),
+        "running_count": running_count,
         "lane_sizes": lane_sizes,
-    }))
+    }))?, "queue", started_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -348,8 +396,8 @@ async fn get_pending_tasks(req: Request, env: worker::Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
-    let _runtime = runtime_or_503!(env);
-    let rows = match select_active_rows(&env).await {
+    let db = database_or_503!(env);
+    let rows = match select_active_rows(&db).await {
         Ok(rows) => rows,
         Err(_) => return json_error(500, "ledger_read_failed", None),
     };
@@ -392,14 +440,11 @@ async fn get_queue_size(req: Request, env: worker::Env) -> Result<Response> {
     if req.method() != Method::Get {
         return Response::error("Method Not Allowed", 405);
     }
-    let _runtime = runtime_or_503!(env);
-    let rows = match select_active_rows(&env).await {
-        Ok(rows) => rows,
+    let started_ms = js_sys::Date::now();
+    let db = database_or_503!(env);
+    let lanes = match select_lane_sizes(&db).await {
+        Ok(lanes) => lanes,
         Err(_) => return json_error(500, "ledger_read_failed", None),
     };
-    let mut lane_sizes = [0usize; 2];
-    for row in &rows {
-        lane_sizes[lane_index(&row.kind)] += 1;
-    }
-    Response::from_json(&json!([lane_sizes[0], lane_sizes[1]]))
+    metadata::timed_response(Response::from_json(&lanes)?, "queue_size", started_ms)
 }

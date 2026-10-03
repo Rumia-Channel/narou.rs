@@ -36,6 +36,7 @@ pub mod native_only;
 pub mod list;
 pub mod ui_prefs;
 pub mod queue;
+pub(crate) mod metadata;
 
 /// 機械可読なエラー応答 (`{error: {code, message?}}`)。
 ///
@@ -128,14 +129,5 @@ pub(crate) async fn load_current_sort_state_for(
 /// native `configured_tag_color` (`src/web/mod.rs`) parity:
 /// `webui.new-tag-color` 設定を読み、小文字化 + 有効色チェックを通す。
 pub(crate) async fn configured_tag_color(runtime: &WorkerRuntime) -> Option<String> {
-    runtime
-        .services
-        .settings
-        .get(narou_rs::application::tag_colors::NEW_TAG_COLOR_SETTING)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| narou_rs::application::tag_colors::is_valid_tag_color(value))
+    metadata::configured_tag_color(&runtime.services.settings).await
 }
