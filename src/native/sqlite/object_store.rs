@@ -274,37 +274,42 @@ impl SqliteObjectStore {
         prefix: &ObjectKey,
         skip_segment: &str,
     ) -> Result<Vec<PathBuf>> {
-        let request = ObjectListRequest::new(
+        let mut request = ObjectListRequest::new(
             ObjectPrefix::new(prefix.as_ref())?,
             std::num::NonZeroUsize::new(4096).expect("nonzero"),
         );
-        // 1 ページに収まらない小説は稀なので、収まらない分は次の変換で拾う。
-        let page = self.list_blocking(&request)?;
         let mut written = Vec::new();
-        for metadata in &page.objects {
-            let key = metadata.key.as_ref();
-            if key.split('/').any(|segment| segment == skip_segment) {
-                continue;
+        loop {
+            let page = self.list_blocking(&request)?;
+            for metadata in &page.objects {
+                let key = metadata.key.as_ref();
+                if key.split('/').any(|segment| segment == skip_segment) {
+                    continue;
+                }
+                let relative = key
+                    .strip_prefix(prefix.as_ref())
+                    .map(|rest| rest.trim_start_matches('/'))
+                    .unwrap_or_default();
+                if relative.is_empty() {
+                    continue;
+                }
+                let path = novel_dir.join(relative);
+                if path.is_file() {
+                    continue;
+                }
+                let Some(data) = self.read_blocking(&metadata.key)? else {
+                    continue;
+                };
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, &data)?;
+                written.push(path);
             }
-            let relative = key
-                .strip_prefix(prefix.as_ref())
-                .map(|rest| rest.trim_start_matches('/'))
-                .unwrap_or_default();
-            if relative.is_empty() {
-                continue;
+            match page.next_cursor {
+                Some(cursor) => request = request.after(cursor),
+                None => break,
             }
-            let path = novel_dir.join(relative);
-            if path.is_file() {
-                continue;
-            }
-            let Some(data) = self.read_blocking(&metadata.key)? else {
-                continue;
-            };
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, &data)?;
-            written.push(path);
         }
         Ok(written)
     }
@@ -792,6 +797,40 @@ mod tests {
             std::fs::remove_file(path).unwrap();
         }
         assert!(!mirrored.exists());
+    }
+
+    #[test]
+    fn materialize_reads_past_a_full_page_of_skipped_illustrations() {
+        let (dir, mut store) = temp_store();
+        store.mirror_files = false;
+        let prefix = ObjectKey::try_new("novels/site/title").unwrap();
+        // Illustrations sort before 本文 and fill the entire first page.
+        for index in 0..4096 {
+            let key = prefix
+                .join("挿絵")
+                .unwrap()
+                .join(format!("{index:04}.png"))
+                .unwrap();
+            store.write_blocking(&key, b"image").unwrap();
+        }
+        let body = prefix.join("本文").unwrap().join("1 body.yaml").unwrap();
+        store.write_blocking(&body, b"body").unwrap();
+        let existing = prefix.join("本文").unwrap().join("2 existing.yaml").unwrap();
+        store.write_blocking(&existing, b"stored").unwrap();
+        let novel_dir = dir.path().join("site/title");
+        let existing_path = novel_dir.join("本文/2 existing.yaml");
+        std::fs::create_dir_all(existing_path.parent().unwrap()).unwrap();
+        std::fs::write(&existing_path, b"keep local").unwrap();
+
+        let written = store.materialize_into(&novel_dir, &prefix, "挿絵").unwrap();
+        let body_path = novel_dir.join("本文/1 body.yaml");
+        assert_eq!(written, vec![body_path.clone()]);
+        assert_eq!(std::fs::read(&body_path).unwrap(), b"body");
+        assert!(!novel_dir.join("挿絵").exists());
+        let guard = crate::native::object_store::MaterializedNovelFiles::from_paths(written);
+        drop(guard);
+        assert!(!body_path.exists());
+        assert_eq!(std::fs::read(&existing_path).unwrap(), b"keep local");
     }
 
     #[test]
