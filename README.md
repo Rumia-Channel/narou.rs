@@ -5,6 +5,12 @@ narou_rs は、日本の Web 小説を取得・管理・変換する CLI / Web U
 
 README では、導入方法、基本操作、主な注意点をまとめます。詳細なコマンド互換性や未完了項目は `COMMANDS.md` を参照してください。
 
+## 開発版の修正（未リリース）
+
+- Web UI の「リンク」が localhost を開く不具合を修正しました（[#33](https://github.com/Rumia-Channel/narou.rs/issues/33)）。ID・Nコード・別名をページ URL として保存せず、既存の不正な値は取得 URL にフォールバックします。再ダウンロードは不要です。
+- 個別メニューの「変換」が要求を送らない不具合を修正しました（[#33](https://github.com/Rumia-Channel/narou.rs/issues/33)）。一覧の選択状態に関係なく、その作品を変換します。
+- SQLite + Lite の変換で設定ストアの接続ロックを再取得して停止する問題と、EPUB 用の挿絵取り出しが CLI の Tokio 文脈で panic する問題も修正しました。
+
 ## v0.4.5 の主な変更
 
 - 半角カナを含むルビが別の文字に化ける不具合を修正しました（[#31](https://github.com/Rumia-Channel/narou.rs/issues/31)）。既に変換済みの作品は、更新後に再変換してください。

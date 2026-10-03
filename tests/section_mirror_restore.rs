@@ -97,21 +97,39 @@ fn conversion_rebuilds_section_files_deleted_outside_narou() {
     ))
     .unwrap();
     let section_path = novel_dir.join("本文").join("1 第一話.yaml");
-    std::fs::remove_file(&section_path).unwrap();
-    assert!(!section_path.exists());
+    for device in [None, Some(narou_rs::converter::device::Device::Text)] {
+        std::fs::remove_file(&section_path).unwrap();
+        assert!(!section_path.exists());
 
-    let settings = NovelSettings::load_for_novel(1, "title", "author", &novel_dir);
-    let capabilities = ConverterCapabilities::new(
-        Arc::new(MockHttpClient::new()),
-        Arc::new(FakeRateLimiter::new()),
-    );
-    let mut converter = NovelConverter::with_capabilities(settings, capabilities);
-    converter
-        .convert_novel_by_id(1, &novel_dir)
+        let settings = NovelSettings::load_for_novel(1, "title", "author", &novel_dir);
+        let capabilities = ConverterCapabilities::new(
+            Arc::new(MockHttpClient::new()),
+            Arc::new(FakeRateLimiter::new()),
+        );
+        let mut converter = NovelConverter::with_capabilities(settings, capabilities);
+        match device {
+            Some(device) => converter
+                .convert_novel_by_id_with_device(1, &novel_dir, device, false, false)
+                .map(|path| path.display().to_string()),
+            None => converter.convert_novel_by_id(1, &novel_dir),
+        }
         .expect("conversion must rebuild the deleted section file");
 
-    assert!(
-        section_path.is_file(),
-        "the section mirror file must be restored from storage"
-    );
+        assert!(section_path.is_file(), "the section mirror must be restored");
+    }
+
+    let image_key = keys.illustration("fixture.png").unwrap();
+    let image_bytes = b"stored illustration bytes";
+    futures::executor::block_on(store.write_small(&image_key, image_bytes.to_vec())).unwrap();
+    let image_path = novel_dir.join("挿絵").join("fixture.png");
+    std::fs::remove_file(&image_path).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let materialized = runtime.block_on(async {
+        narou_rs::native::illustrations::Materialized::new(
+            narou_rs::native::illustrations::materialize_blocking(&novel_dir).unwrap(),
+        )
+    });
+    assert_eq!(std::fs::read(&image_path).unwrap(), image_bytes);
+    drop(materialized);
+    assert!(!image_path.exists(), "staged illustrations must be removed by the guard");
 }

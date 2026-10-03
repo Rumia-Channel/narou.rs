@@ -2271,7 +2271,7 @@ impl Downloader {
         // 控えておく。Pixiv は toc_url が API なので、Web UI のリンクが
         // API を開いてしまうのを避ける (通常サイトは両者同じなので記録しない)。
         if target != record.toc_url {
-            record.set_original_url(target.to_string());
+            record.set_original_url(target);
         }
         if track_raw_title {
             record.set_raw_title(raw_title);
@@ -2332,7 +2332,7 @@ impl Downloader {
                     }
                     // 既存の小説をページ URL 指定で取り直したときも控え直す。
                     if target != updated.toc_url && updated.original_url().is_none() {
-                        updated.set_original_url(target.to_string());
+                        updated.set_original_url(target);
                     }
                     for tag in &auto_tags {
                         if !updated.tags.contains(tag) {

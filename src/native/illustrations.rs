@@ -76,6 +76,14 @@ pub async fn materialize(novel_dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// 同期文脈 (converter) から [`materialize`] を呼ぶ。
 pub fn materialize_blocking(novel_dir: &Path) -> Result<Vec<PathBuf>> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::scope(|scope| {
+            let worker = std::thread::Builder::new()
+                .spawn_scoped(scope, || materialize_blocking(novel_dir))
+                .map_err(|error| crate::error::NarouError::Platform(error.to_string()))?;
+            worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

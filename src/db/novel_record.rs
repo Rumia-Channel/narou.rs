@@ -105,17 +105,28 @@ impl NovelRecord {
     /// as the link in the Web UI.
     pub const ORIGINAL_URL_KEY: &'static str = "original_url";
 
+    fn is_page_url(url: &str) -> bool {
+        url.split_once("://").is_some_and(|(scheme, address)| {
+            !address.is_empty()
+                && (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        })
+    }
+
     pub fn original_url(&self) -> Option<&str> {
         self.extra_fields
             .get(Self::ORIGINAL_URL_KEY)
             .and_then(serde_yaml::Value::as_str)
-            .filter(|url| !url.is_empty())
+            .filter(|url| Self::is_page_url(url))
     }
 
-    pub fn set_original_url(&mut self, url: impl Into<String>) {
+    /// Remember page URLs only; ID/N-code/alias updates must not replace them.
+    pub fn set_original_url(&mut self, url: &str) {
+        if !Self::is_page_url(url) {
+            return;
+        }
         self.extra_fields.insert(
             Self::ORIGINAL_URL_KEY.to_string(),
-            serde_yaml::Value::String(url.into()),
+            serde_yaml::Value::String(url.to_string()),
         );
     }
 
@@ -268,5 +279,30 @@ last_update: 2026-04-20 00:00:00.000000000 +09:00
         record.set_raw_title("【発売中】作品名");
         let dumped = serde_yaml::to_string(&record).unwrap();
         assert!(dumped.contains("raw_title: 【発売中】作品名"));
+    }
+
+    #[test]
+    fn original_url_does_not_turn_download_identifiers_into_links() {
+        let mut record: NovelRecord = serde_yaml::from_str(r#"---
+id: 42
+author: author
+title: title
+file_title: file title
+toc_url: https://example.com/api/novels/42
+original_url: '42'
+sitename: Example
+last_update: 2026-04-20 00:00:00.000000000 +09:00
+"#).unwrap();
+        assert_eq!(record.display_url(), record.toc_url);
+
+        record.extra_fields.remove(NovelRecord::ORIGINAL_URL_KEY);
+        record.set_original_url("n0000aa");
+        assert!(!record.extra_fields.contains_key(NovelRecord::ORIGINAL_URL_KEY));
+        assert_eq!(record.display_url(), record.toc_url);
+
+        let page_url = "HTTP://example.com/novels/42";
+        record.set_original_url(page_url);
+        record.set_original_url("42");
+        assert_eq!(record.display_url(), page_url);
     }
 }

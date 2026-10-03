@@ -1057,7 +1057,8 @@ impl NovelConverter {
             // Worker's download-time EPUB) can address the text without the
             // per-title output naming rules. `convert.keep-txt=false` では
             // ファイルも DB の `converted_text` も残さない (EPUB は都度変換)。
-            if keep_converted_text_file() {
+            let keep_text = keep_converted_text_file();
+            if keep_text {
                 let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
             }
             if !crate::native::sqlite::state::legacy_yaml_active() {
@@ -1083,7 +1084,7 @@ impl NovelConverter {
                         id,
                         &sections_map,
                     );
-                    if keep_converted_text_file() {
+                    if keep_text {
                         let _ = crate::native::sqlite::content::store_output(
                             &guard,
                             id,
@@ -1168,7 +1169,8 @@ impl NovelConverter {
         }
         #[cfg(feature = "lite")]
         {
-            if keep_converted_text_file() {
+            let keep_text = keep_converted_text_file();
+            if keep_text {
                 let _ = std::fs::write(novel_dir.join("novel.txt"), &aozora_text);
             }
             // P4a/P4b mirror: converted text + mirrored working set + version
@@ -1196,7 +1198,7 @@ impl NovelConverter {
                         _id,
                         &sections_map,
                     );
-                    if keep_converted_text_file() {
+                    if keep_text {
                         let _ = crate::native::sqlite::content::store_output(
                             &guard,
                             _id,
