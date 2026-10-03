@@ -1,0 +1,52 @@
+name: Worker UI latency regression
+
+on:
+  pull_request:
+    paths:
+      - 'worker_entry/**'
+      - 'src/application/**'
+      - 'src/platform/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/worker-ui-latency.yml'
+
+permissions:
+  contents: read
+
+# These checks never deploy. Keep them active even when SORAHOST disables the
+# deployment-oriented Worker jobs in platform.yml.
+jobs:
+  sql-and-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - run: python -m unittest discover -s worker_entry/tests -p 'test_ui_*.py' -v
+      - run: node --test worker_entry/tests/ui_latency.test.mjs
+
+  wasm-and-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: worker-ui-latency
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - run: cargo check --locked -p narou_worker --target wasm32-unknown-unknown
+      - run: cargo install worker-build --version 0.8.5 --locked
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/worker-build
+          key: worker-build-${{ runner.os }}-0.8.5
+      - run: node tests/run.mjs --release
+        working-directory: worker_entry
+        env:
+          NAROU_ADMIN_TOKEN: contract-token
+          NAROU_CHECK_UNCONFIGURED: '1'
