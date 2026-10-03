@@ -27,6 +27,7 @@ pub mod rate_limiter;
 /// `GET|POST /proxy` calls and decodes the JSON response. Transport-neutral.
 pub mod relay;
 pub mod repository;
+mod s3_diagnostics;
 pub mod s3_request;
 pub mod s3_sigv4;
 pub mod s3_store;

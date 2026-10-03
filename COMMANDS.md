@@ -771,7 +771,7 @@ narou setting name         # 読み取り
 - `fix-ext` — マジックバイト判定 (JPEG/PNG/GIF/WEBP/BMP) で拡張子を実体に合わせて改名。
 - `rebuild` — `挿絵/` + `raw/*.html` から `.illustration_cache.yaml` を再構築し永続化。
 - `s3-push` — 挿絵をローカルから S3 互換ストレージ (Wasabi など) へ写す。既定は件数と容量を数えるだけで、`-f` で実行。**ライブラリ全体が対象** (`<target>` は使わない) で、`s3.asset-backend=s3` と接続情報が必要。
-- S3 LIST の署名エラー診断は、改行表現を正規化して canonical digest と StringToSign 全体を別々に比較する。digest 一致だけで secret の誤りと断定せず、診断改善を 403 の解消とは扱わない。
+- S3 LIST の署名エラー診断は、改行表現を正規化して canonical digest と StringToSign 全体を別々に比較する。digest 一致だけで secret の誤りと断定せず、診断改善を 403 の解消とは扱わない。 生の XML 本文は表示せず、許可したエラーコードと任意のサーバー echo の比較結果（一致・不一致・欠落・不正）、公開 AWS サンプルの実行時自己テスト、実効接続先 host/port・標準的な region・native 設定元ラベルを表示する。鍵 ID・署名・資格情報の値やハッシュは表示しない。環境変数ラベルは `.env` と起動時の既存環境を区別しない。
 - `s3-verify` — ローカルの挿絵と S3 の内容をバイト単位で突き合わせる (書き込みなし)。同じくライブラリ全体が対象。
 - `s3-dedup` — 旧 `挿絵/` 配置の S3 オブジェクトを dedup プール (`illustrations/<base64url(sha256)>.<ext>`) へ移し、残ったものを消す。**SQLite モード + S3 保存のときだけ有効**。既定は件数だけ数える dry-run、`-f` で実行。hex 名でない挿絵は小説ごとの配置を保つ。
 

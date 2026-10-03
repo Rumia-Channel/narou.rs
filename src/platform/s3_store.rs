@@ -94,6 +94,7 @@ pub struct S3Store {
     credentials: Arc<CredentialsOwned>,
     http: Arc<dyn HttpClient>,
     clock: Arc<dyn Clock>,
+    credential_sources: Option<(&'static str, &'static str)>,
 }
 
 impl S3Store {
@@ -124,7 +125,36 @@ impl S3Store {
             }),
             http,
             clock,
+            credential_sources: None,
         })
+    }
+
+    #[cfg(feature = "native-runtime")]
+    pub(crate) fn with_credential_sources(mut self, sources: (&'static str, &'static str)) -> Self {
+        self.credential_sources = Some(sources);
+        self
+    }
+
+    fn diagnostic_location(&self) -> String {
+        // URL parsing drops userinfo/path/query. Never format the raw endpoint.
+        let host = url::Url::parse(&format!("{}://{}", self.scheme, self.host))
+            .ok()
+            .and_then(|url| {
+                let host = url.host_str()?;
+                Some(match url.port() {
+                    Some(port) => format!("{host}:{port}"),
+                    None => host.to_string(),
+                })
+            })
+            .unwrap_or_else(|| "<redacted>".to_string());
+        let region = diagnostic_region(&self.region);
+        let (access, secret) = self
+            .credential_sources
+            .unwrap_or(("unspecified", "unspecified"));
+        format!(
+            " [narou-config: endpoint-host={host}; region={region}; \
+             access-key-source={access}; secret-source={secret}]"
+        )
     }
 
     /// 保存先 (バケット / prefix) と host を覗く。ログや presign 用。
@@ -420,15 +450,15 @@ impl S3Store {
         let (response, signed) = self.send(HttpMethod::Get, &url, &[], None).await?;
         let (status, body) = status_and_body(response)?;
         if status != 200 {
-            // S3 のエラーは XML で AccessDenied / SignatureDoesNotMatch /
-            // InvalidAccessKeyId を返す。本文を含めないと権限不足と署名
-            // 不一致が区別できないので、先頭だけを覗かせる。
+            // Response XML can contain credential identifiers and signatures.
+            // Keep only allowlisted codes and categorical comparisons.
             let detail = String::from_utf8_lossy(&body);
-            let detail = detail.trim();
-            let snippet: String = detail.chars().take(300).collect();
-            let hint = signature_mismatch_hint(detail, &signed);
+            let code = super::s3_diagnostics::error_code(&detail);
+            let hint = signature_mismatch_hint(&detail, &signed);
+            let evidence = super::s3_diagnostics::signature_context(&detail, &signed);
+            let location = self.diagnostic_location();
             return Err(NarouError::Platform(format!(
-                "S3 LIST {} failed with status {status}: {snippet}{hint}",
+                "S3 LIST {} failed with status {status}: {code}{hint}{evidence}{location}",
                 request.prefix.as_ref()
             )));
         }
@@ -502,6 +532,22 @@ impl S3Store {
     }
 }
 
+// Keep an explicit diagnostic allowlist rather than reflecting an arbitrary
+// configuration string. Other/custom regions still sign exactly as configured.
+fn diagnostic_region(region: &str) -> &str {
+    match region {
+        "auto" | "default" | "us-east-1" | "us-east-2" | "us-west-1" | "us-west-2"
+        | "us-gov-east-1" | "us-gov-west-1" | "ca-central-1" | "ca-west-1" | "sa-east-1"
+        | "eu-central-1" | "eu-central-2" | "eu-west-1" | "eu-west-2" | "eu-west-3"
+        | "eu-north-1" | "eu-south-1" | "eu-south-2" | "ap-east-1" | "ap-south-1"
+        | "ap-south-2" | "ap-northeast-1" | "ap-northeast-2" | "ap-northeast-3"
+        | "ap-southeast-1" | "ap-southeast-2" | "ap-southeast-3" | "ap-southeast-4"
+        | "af-south-1" | "me-south-1" | "me-central-1" | "il-central-1" | "cn-north-1"
+        | "cn-northwest-1" => region,
+        _ => "<redacted>",
+    }
+}
+
 /// URL 文字列から署名対象の `path` と `query` を切り出す。
 ///
 /// `url` クレートで再パースすると percent-encoding が正規化されて署名対象と
@@ -554,12 +600,12 @@ fn status_and_body(response: super::http::HttpResponse) -> Result<(u16, Vec<u8>)
 /// S3 のエラー応答に含まれる `<StringToSign>` の末尾行は、サーバー側が
 /// 再構成した canonical request の SHA-256 digest。これと自分側の digest を
 /// 比較して、canonical request 自体が違うのか (エンコード/ヘッダ差異)、
-/// digest が一致して署名だけ違うのか (シークレット/スコープ値の差異) を示す。
+/// digest と StringToSign 全体の一致を分ける。資格情報の誤りとは断定しない。
 fn signature_mismatch_hint(body: &str, signed: &s3_sigv4::SignedHeaders) -> String {
-    if !body.contains("SignatureDoesNotMatch") {
+    if super::s3_diagnostics::error_code(body) != "SignatureDoesNotMatch" {
         return String::new();
     }
-    let Some(server_to_sign) = super::s3_request::element_text(body, "StringToSign") else {
+    let Some(server_to_sign) = super::s3_diagnostics::unique_text(body, "StringToSign") else {
         return String::new();
     };
     // Some S3-compatible services use literal \n / \r\n in the XML value.
@@ -586,24 +632,15 @@ fn signature_mismatch_hint(body: &str, signed: &s3_sigv4::SignedHeaders) -> Stri
         return String::new();
     }
     if !server_digest.eq_ignore_ascii_case(our_digest) {
-        format!(
-            " [narou: canonical-request digest differs (server: {server_digest}, \
-             ours: {our_digest}) — the server reconstructed a different canonical request; \
-             compare canonical URI, query, and signed headers]"
-        )
+        " [narou: canonical-request digest differs; compare canonical URI, query, and signed headers]".to_string()
     } else if server_lines != our_lines {
-        format!(
-            " [narou: canonical-request digest matches ({our_digest}), but \
-             string-to-sign differs; check algorithm, timestamp, region/service scope, \
-             and digest representation]"
-        )
+        " [narou: canonical-request digest matches, but string-to-sign differs; \
+         check algorithm, timestamp, region/service scope, and digest representation]"
+            .to_string()
     } else {
-        format!(
-            " [narou: canonical-request digest matches ({our_digest}) and \
-             normalized string-to-sign matches; verify the active access-key/secret pair, \
-             credential source, signing-key derivation, and transmitted Authorization; \
-             reported canonical-request digests agree]"
-        )
+        " [narou: canonical-request digest matches and normalized string-to-sign matches; \
+         use the server echo and runtime self-test results to distinguish the remaining causes]"
+            .to_string()
     }
 }
 
@@ -924,14 +961,14 @@ mod tests {
     }
 
     #[test]
-    fn list_page_includes_s3_error_body() {
+    fn list_page_redacts_s3_error_body() {
         let http = Arc::new(MockHttpClient::new());
         http.add_response(
             "https://s3.example.com/bucket?encoding-type=url&list-type=2&max-keys=10&prefix=narou%2Ftest%2Fnovels%2Fsite%2Ftitle%2F%E6%8C%BF%E7%B5%B5",
             HttpResponse {
                 status: 403,
                 headers: vec![("content-type".to_string(), "application/xml".to_string())],
-                body: br#"<?xml version="1.0"?><Error><Code>AccessDenied</Code><Message>denied</Message></Error>"#
+                body: br#"<?xml version="1.0"?><Error><Code>AccessDenied</Code><Message>PRIVATE_BODY_SENTINEL</Message><AWSAccessKeyId>PRIVATE_KEY_IDENTIFIER</AWSAccessKeyId><SignatureProvided>PRIVATE_SIGNATURE_SENTINEL</SignatureProvided></Error>"#
                     .to_vec(),
             },
         );
@@ -947,6 +984,12 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("403"), "{message}");
         assert!(message.contains("AccessDenied"), "{message}");
+        assert!(!message.contains("PRIVATE_"), "{message}");
+        assert!(!message.contains("<Error>"), "{message}");
+        assert!(
+            message.contains("endpoint-host=s3.example.com"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1055,6 +1098,92 @@ mod tests {
         };
         assert!(error.to_string().contains("credentials"), "{error}");
         assert_eq!(http.request_count(), 0);
+    }
+
+    #[test]
+    fn list_failure_compares_real_signed_request_without_echoing_it() {
+        struct FixedClock;
+        impl Clock for FixedClock {
+            fn now_utc(&self) -> chrono::DateTime<chrono::Utc> {
+                chrono::DateTime::from_timestamp(1_770_000_000, 0).unwrap()
+            }
+        }
+        let http = Arc::new(MockHttpClient::new());
+        let mut store = store(http.clone());
+        store.clock = Arc::new(FixedClock);
+        let request = ObjectListRequest::new(
+            ObjectPrefix::new("novels/site/title/挿絵").unwrap(),
+            std::num::NonZeroUsize::new(10).unwrap(),
+        );
+        let url = store.location.list_url(request.prefix.as_ref(), 10, None);
+        http.add_text(&url, 403, "<Error><Code>AccessDenied</Code></Error>");
+        let (_, signed) =
+            futures::executor::block_on(store.send(HttpMethod::Get, &url, &[], None)).unwrap();
+        let signature = signed.authorization.rsplit_once("Signature=").unwrap().1;
+        let bytes = signed
+            .string_to_sign
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        http.add_text(&url, 403, format!(
+            "<Error><Code>SignatureDoesNotMatch</Code><Message>PRIVATE_BODY_SENTINEL</Message>\
+             <AWSAccessKeyId>AKIAEXAMPLE</AWSAccessKeyId><SignatureProvided>{signature}</SignatureProvided>\
+             <StringToSign>{}</StringToSign><StringToSignBytes>{bytes}</StringToSignBytes></Error>",
+            signed.string_to_sign.replace('\n', "\\n"),
+        ));
+        let error = match futures::executor::block_on(store.list_objects(&request)) {
+            Ok(_) => panic!("a 403 LIST response must fail"),
+            Err(error) => error.to_string(),
+        };
+        for expected in [
+            "normalized string-to-sign matches",
+            "SignatureProvided=match",
+            "AWSAccessKeyId=match",
+            "StringToSignBytes=match",
+            "self-test=pass",
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
+        for private in [
+            "PRIVATE_BODY_SENTINEL",
+            "AKIAEXAMPLE",
+            signature,
+            &signed.authorization,
+            &bytes,
+        ] {
+            assert!(!error.contains(private));
+        }
+        assert!(!error.contains(signed.string_to_sign.rsplit_once('\n').unwrap().1));
+    }
+
+    #[test]
+    fn diagnostic_location_redacts_userinfo_paths_and_nonstandard_regions() {
+        let mut store = store(Arc::new(MockHttpClient::new()));
+        store.host =
+            "private-user:PRIVATE_PASSWORD@example.invalid:9443/private/path?token=PRIVATE_QUERY"
+                .to_string();
+        store.region = "PRIVATE_REGION_SENTINEL".to_string();
+        store.credential_sources = Some(("environment", "local-setting"));
+        let diagnostic = store.diagnostic_location();
+        assert!(diagnostic.contains("endpoint-host=example.invalid:9443"));
+        assert!(diagnostic.contains("region=<redacted>"));
+        assert!(diagnostic.contains("access-key-source=environment; secret-source=local-setting"));
+        assert!(!diagnostic.contains("PRIVATE"));
+        assert!(!diagnostic.contains("private"));
+        for region in ["ap-northeast-2", "us-east-1", "us-gov-west-1", "auto"] {
+            assert_eq!(diagnostic_region(region), region);
+        }
+        for region in [
+            "",
+            "secret",
+            "ap-PRIVATE-2",
+            "ap-northeast-2\nSECRET",
+            "us-secret-123",
+            "us-secret-1",
+        ] {
+            assert_eq!(diagnostic_region(region), "<redacted>");
+        }
     }
 
     #[test]
