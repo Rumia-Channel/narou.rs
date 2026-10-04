@@ -6,7 +6,9 @@
 2. `wrangler.ci.toml` をレンダリングする（`ci/render_config.py`）
 3. リモート D1 に schema migration を適用する
 4. secret を `--secrets-file` で投入してデプロイする
-5. 認証済み診断 API で実際の S3 backend と LIST を検証する（省略不可）
+5. 認証済み診断 API で実際の S3 backend と LIST を検証する（トークンが
+   Secrets Store 専用の場合は LIST を notice 付きで省略し、health と
+   未認証 401 の fail-closed 確認だけを行う）
 6. デプロイ先の URL に対して契約テストを流す（smoke。`NAROU_SMOKE=0` で省略）
 
 CI は NAROU_REQUIRE_S3=true 固定。旧 D1 の挿絵との互換性は維持せず、
@@ -23,7 +25,10 @@ runtime が挿絵の保存先を S3 に固定する。既存 D1 のマーカー�
 任意:
 
 - `NAROU_ADMIN_TOKEN` … Worker の API トークン（`--secrets-file` で投入）。
-  Bearer 認証が有効なら、Secrets Store を使う場合も CI の診断認証に必要。
+  Bearer 認証が有効なら、Secrets Store に置いた場合も CI の診断認証に必要
+  （ストアの値は読み戻せないため）。ストア専用運用で CI 側に値が無いときは
+  認証付きの S3 LIST 検証と smoke を明示 notice 付きで省略し、無認証の
+  health 検査と 401 の fail-closed 確認は必ず行う。
   `NAROU_AUTH_REQUIRED=false`（Zero Trust を境界にする）ときは不要。
 - `NAROU_RS_LOGIN_KEY` … 資格情報の at-rest 鍵（base64 32 バイト）。無い場合は
   平文の行だけを読む。
@@ -103,10 +108,28 @@ def required(name: str) -> str:
     return value
 
 
+def admin_token() -> str:
+    """CI 側で使える Bearer トークン。Secrets Store の値は API でも読み戻せない。"""
+    return os.environ.get("NAROU_ADMIN_TOKEN", "").strip()
+
+
 def require_probe_auth() -> None:
-    """必須の配備後診断に使う認証を、リソースの変更より前に検証する。"""
-    if auth_required() and not os.environ.get("NAROU_ADMIN_TOKEN", "").strip():
-        fail("NAROU_ADMIN_TOKEN is required for the mandatory S3 deployment check, including Secrets Store deployments")
+    """必須の配備後診断に使う認証を、リソースの変更より前に検証する。
+
+    トークンを Secrets Store だけに置く運用 (値は読み戻せない) では CI 側の
+    Bearer を要求しない。代わりに `verify_s3` が無認証の health 検査と
+    fail-closed の 401 確認だけを行い、認証付き検査は notice 付きで省略する。
+    """
+    if (
+        auth_required()
+        and not admin_token()
+        and not os.environ.get("NAROU_ADMIN_TOKEN_SECRET_NAME", "").strip()
+    ):
+        fail(
+            "NAROU_ADMIN_TOKEN is required (or set NAROU_ADMIN_TOKEN_SECRET_NAME to "
+            "keep the token in the Secrets Store, or NAROU_AUTH_REQUIRED=false "
+            "when Zero Trust is the boundary)"
+        )
     access_id = os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()
     access_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET", "").strip()
     if bool(access_id) != bool(access_secret):
@@ -124,9 +147,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def verify_s3(base_url: str) -> None:
-    """選択済み S3 handle の実 LIST を確認する。失敗・未実行は成功扱いしない。"""
-    require_probe_auth()
+def deployment_url(base_url: str) -> None:
+    """診断の宛先として安全な HTTPS URL か検証する (不適なら失敗)。"""
     try:
         parsed = urllib.parse.urlsplit(base_url)
         if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
@@ -135,41 +157,120 @@ def verify_s3(base_url: str) -> None:
             raise ValueError
         parsed.port  # Validate any explicit port before building authenticated headers.
     except ValueError:
-        fail("S3 verification requires an HTTPS deployment URL without credentials, query or fragment")
+        fail("deployment checks require an HTTPS deployment URL without credentials, query or fragment")
+
+
+def probe_headers(token: bool = True) -> dict[str, str]:
+    """診断 GET のヘッダ。Bearer は `token=True` かつ値があるときだけ載せる。"""
     headers = {"Accept": "application/json"}
-    token = os.environ.get("NAROU_ADMIN_TOKEN", "").strip()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    value = admin_token()
+    if token and value:
+        headers["Authorization"] = f"Bearer {value}"
     access_id = os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()
     if access_id:
         headers["CF-Access-Client-Id"] = access_id
         headers["CF-Access-Client-Secret"] = os.environ["CF_ACCESS_CLIENT_SECRET"].strip()
+    return headers
+
+
+def probe_get(base_url: str, path: str, *, token: bool = True) -> tuple[int, bytes]:
+    """`(status, body)` を返す GET。HTTP エラーは `HTTPError` として上げる。"""
     request = urllib.request.Request(
-        urllib.parse.urljoin(base_url, "/api/storage/mode?probe=s3"),
-        headers=headers,
+        urllib.parse.urljoin(base_url, path),
+        headers=probe_headers(token),
         method="GET",
     )
+    with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+        return response.status, response.read(16 * 1024 + 1)
+
+
+def probe_json(base_url: str, path: str, label: str, *, token: bool = True) -> dict:
+    """200 の JSON オブジェクトを返す。それ以外は {label} つきで失敗。"""
     try:
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
-            if response.status != 200:
-                fail(f"S3 verification failed (HTTP {response.status}); deployment is not verified")
-            raw = response.read(16 * 1024 + 1)
+        status, raw = probe_get(base_url, path, token=token)
+        if status != 200:
+            fail(f"{label} failed (HTTP {status}); deployment is not verified")
     except urllib.error.HTTPError as error:
-        fail(f"S3 verification failed (HTTP {error.code}); check Worker/Access authentication and S3 configuration")
+        error.close()
+        fail(f"{label} failed (HTTP {error.code}); check Worker/Access authentication and configuration")
     except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
-        fail("S3 verification could not reach the deployment; check DNS/TLS/network. Deployment is not verified")
+        fail(f"{label} could not reach the deployment; check DNS/TLS/network. Deployment is not verified")
     if len(raw) > 16 * 1024:
-        fail("S3 verification returned an oversized response; deployment is not verified")
+        fail(f"{label} returned an oversized response; deployment is not verified")
     try:
         payload = json.loads(raw)
     except (ValueError, UnicodeError):
-        fail("S3 verification returned invalid JSON; deployment is not verified")
-    if (not isinstance(payload, dict) or payload.get("success") is not True
+        fail(f"{label} returned invalid JSON; deployment is not verified")
+    if not isinstance(payload, dict):
+        fail(f"{label} returned an unexpected payload; deployment is not verified")
+    return payload
+
+
+def verify_health(base_url: str) -> None:
+    """無認証で通る配備確認。認証済み検査を省略する代わりの下限 (fail-closed)。
+
+    1. `/health/live` が `status=alive`、`authentication_required=true`
+       (Worker 側も auth 要求)、`authentication_configured=true` (ストアの
+       トークンが Worker で実際に解決できた証拠)。
+    2. `/health/ready` が `status=ready` (D1 / queue / DO の構成が通る)。
+    3. 認証付き probe は無認証だと 401 `authentication_required` で閉じる
+       (200/500 なら認証の構成が壊れているので失敗)。
+    """
+    live = probe_json(base_url, "/health/live", "health check")
+    if (live.get("status") != "alive" or live.get("authentication_required") is not True
+            or live.get("authentication_configured") is not True):
+        fail("health check did not confirm a live, authenticated and configured deployment")
+    ready = probe_json(base_url, "/health/ready", "readiness check")
+    if ready.get("status") != "ready":
+        fail("readiness check did not confirm the deployment stack")
+    try:
+        status, raw = probe_get(base_url, "/api/storage/mode?probe=s3", token=False)
+        if status != 401:
+            fail(
+                f"authenticated probe returned HTTP {status} without a token; "
+                "the deployment must fail closed"
+            )
+    except urllib.error.HTTPError as error:
+        with error:
+            status, raw = error.code, error.read(16 * 1024 + 1)
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
+        fail("deployment checks could not reach the deployment; check DNS/TLS/network. Deployment is not verified")
+    try:
+        code = json.loads(raw).get("error", {}).get("code")
+    except (ValueError, UnicodeError, AttributeError):
+        code = None
+    if status != 401 or code != "authentication_required":
+        fail("the deployment must answer 401 authentication_required without a token")
+
+
+def verify_s3(base_url: str) -> bool | None:
+    """選択済み S3 handle の実 LIST を確認する。失敗・未実行は成功扱いしない。
+
+    戻り値は `True`=検証済み、`None`=認証付き検査を省略 (トークンが Secrets
+    Store 専用で CI 側に値が無い場合。health と 401 の fail-closed は確認済み)。
+    """
+    require_probe_auth()
+    deployment_url(base_url)
+    token = admin_token()
+    if auth_required() and not token:
+        # Secrets Store の値は REST/wrangler とも読み戻せないため、CI 側に
+        # トークンが無いとき認証付きの LIST は打てない。空成功にせず、無認証で
+        # 確かめられる範囲だけ検査して「省略」として報告する。
+        verify_health(base_url)
+        print(
+            "::notice::NAROU_ADMIN_TOKEN が Secrets Store 専用のため認証付きの "
+            "S3 LIST 検証を省略しました (health の検査と未認証 401 の確認は実施済み)。"
+            "LIST まで検証するには secrets.NAROU_ADMIN_TOKEN にも同じ値を置いてください"
+        )
+        return None
+    payload = probe_json(base_url, "/api/storage/mode?probe=s3", "S3 verification")
+    if (payload.get("success") is not True
             or payload.get("metadata_backend") != "d1"
             or payload.get("illustration_backend") != "s3" or payload.get("s3_required") is not True
             or payload.get("s3_list") != "ok"):
         fail("S3 verification did not confirm D1 metadata, required S3 illustrations and a successful S3 LIST")
     print("S3 deployment check: selected backend and read-only LIST verified")
+    return True
 
 
 def provision(target: str) -> dict[str, str]:
@@ -330,8 +431,9 @@ def smoke_url(target: str, reported: str | None) -> tuple[str | None, bool]:
 def smoke(base_url: str) -> bool | None:
     """デプロイ先に契約テストを流す。失敗してもデプロイは巻き戻さない。
 
-    前段の Cloudflare Access に弾かれた場合（exit 3）と、ドメインがまだ届かない
-    場合（exit 4。証明書・DNS の準備待ち）は「省略」として扱う。
+    前段の Cloudflare Access に弾かれた場合（exit 3）、ドメインがまだ届かない
+    場合（exit 4。証明書・DNS の準備待ち）、CI 側にトークンが無く認証済み
+    検査を始められない場合（exit 2）は「省略」として扱う。
     """
     env = dict(os.environ)
     env["BASE_URL"] = base_url
@@ -352,15 +454,25 @@ def smoke(base_url: str) -> bool | None:
             "(新しい custom domain は証明書と DNS の準備に数分かかることがあります)"
         )
         return None
+    if result.returncode == 2 and auth_required() and not admin_token():
+        # Secrets Store の値は API でも読み戻せないため、CI 側にトークンが無い
+        # と認証済みの smoke は実行できない (verify_s3 の時点で health と
+        # fail-closed の 401 は検証済み)。空成功にはせず「省略」として報告する。
+        print(
+            "::notice::NAROU_ADMIN_TOKEN を CI 側で解決できないため認証済みの "
+            "smoke を省略しました (health と未認証 401 の検証は実施済み)。"
+            "smoke まで実行するには secrets.NAROU_ADMIN_TOKEN にも同じ値を置いてください"
+        )
+        return None
     return result.returncode == 0
 
 
-def summary(target: str, url: str, smoke_ok: bool | None, *, hidden_url: bool = False, s3_ok: bool = False) -> None:
+def summary(target: str, url: str, smoke_ok: bool | None, *, hidden_url: bool = False, s3_ok: bool | None = False) -> None:
     lines = [
         f"### Worker deploy ({target})",
         "",
         f"- URL: {'（custom domain。ログでは伏せています）' if hidden_url else url}",
-        f"- S3 backend + LIST: {'ok' if s3_ok else 'not verified'}",
+        f"- S3 backend + LIST: {'ok' if s3_ok else 'skipped (admin token store-only)' if s3_ok is None else 'not verified'}",
         f"- smoke: {'ok' if smoke_ok else 'skipped' if smoke_ok is None else 'failed'}",
     ]
     path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -408,13 +520,13 @@ def main() -> None:
     target_url, hidden_url = smoke_url(target, url)
     if target_url is None:
         fail("Mandatory S3 verification needs a deployment URL; configure NAROU_DEPLOY_URL or a deployment domain")
-    verify_s3(target_url)
+    s3_result = verify_s3(target_url)
     smoke_result: bool | None = None
     if os.environ.get("NAROU_SMOKE", "1") == "0":
         pass
     else:
         smoke_result = smoke(target_url)
-    summary(target, target_url, smoke_result, hidden_url=hidden_url, s3_ok=True)
+    summary(target, target_url, smoke_result, hidden_url=hidden_url, s3_ok=s3_result)
     if smoke_result is False:
         fail("smoke test failed against the deployment")
 

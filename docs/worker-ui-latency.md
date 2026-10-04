@@ -18,6 +18,12 @@ There is no production latency, memory, or CPU measurement in this change.
   in routes that actually use those dependencies.
 - Global settings continue to use `SettingsService` and `D1SettingsStore` for
   reads and writes, including the existing validation and cache invalidation.
+- Mutation pre-reads use primary-only services and bypass isolate settings,
+  freeze and tag-color caches; read-only GETs retain replica sessions and caches.
+  This prevents stale replica/cache snapshots from being written back. Notepad
+  saves additionally use a conditional primary UPSERT: competing saves with
+  the same `object_id` produce one success and one conflict. General settings
+  remain scope-level read-modify-write, not an atomic multi-request transaction.
 - Library lists continue to use `LibraryService::list`, preserving search,
   sort, pagination, frozen/new markers, and the JSON payload. The legacy
   `all=true` behavior is deliberately not changed by this performance fix.

@@ -21,18 +21,28 @@ pub async fn api_global_setting(mut req: Request, env: Env) -> worker::Result<Re
         return Response::error("Method Not Allowed", 405);
     }
     let started_ms = js_sys::Date::now();
-    let settings = match metadata::settings(&env) {
+    if method == Method::Get {
+        let settings = match metadata::settings(&env) {
+            Ok(settings) => settings,
+            Err(error) => {
+                console_log!("service composition failed: {error}");
+                return Response::error("Service Unavailable", 503);
+            }
+        };
+        let mut view = settings_view::load_view(&settings).await;
+        mark_worker_ineffective(&mut view);
+        return metadata::timed_response(Response::from_json(&view)?, "settings", started_ms);
+    }
+    // POST は load→save の read-modify-write なので、primary 直行 +
+    // isolate キャッシュ無しのストアを使う。replica/cached スナップ
+    // ショットで保存すると同時編集の値を黙って消す。
+    let settings = match metadata::settings_for_writes(&env) {
         Ok(settings) => settings,
         Err(error) => {
             console_log!("service composition failed: {error}");
             return Response::error("Service Unavailable", 503);
         }
     };
-    if method == Method::Get {
-        let mut view = settings_view::load_view(&settings).await;
-        mark_worker_ineffective(&mut view);
-        return metadata::timed_response(Response::from_json(&view)?, "settings", started_ms);
-    }
     let body: serde_json::Value = match req.json().await {
         Ok(body) => body,
         Err(_) => return Response::error("Bad Request", 400),

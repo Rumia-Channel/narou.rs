@@ -29,8 +29,24 @@ pub(crate) fn database(env: &Env) -> worker::Result<DbHandle> {
     Ok(DbHandle::ui(Arc::new(env.d1("DB")?)))
 }
 
+/// 更新系ハンドラ用の primary 直行ハンドル。書き込み判断の読み取りは
+/// セッション (replica) に流さず、常にこちらを使う。
+pub(crate) fn primary_database(env: &Env) -> worker::Result<DbHandle> {
+    Ok(DbHandle::primary(Arc::new(env.d1("DB")?)))
+}
+
 pub(crate) fn settings(env: &Env) -> worker::Result<SettingsService> {
     Ok(SettingsService::new(Arc::new(D1SettingsStore::new(database(env)?))))
+}
+
+/// 更新系ハンドラ用の `SettingsService`。`D1SettingsStore::for_writes` は
+/// `load` で isolate キャッシュを介さず、primary ハンドルへ読みに行くので、
+/// read-modify-write (`set` / `set_raw` / `apply`) が古いスナップショットを
+/// 書き戻さない。
+pub(crate) fn settings_for_writes(env: &Env) -> worker::Result<SettingsService> {
+    Ok(SettingsService::new(Arc::new(D1SettingsStore::for_writes(
+        primary_database(env)?,
+    ))))
 }
 
 impl MetadataServices {

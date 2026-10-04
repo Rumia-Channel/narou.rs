@@ -50,13 +50,23 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     if let Some(response) = crate::auth_failure(&req, &env).await {
         return response;
     }
-    let services = match crate::composition::build_services(&env).await {
-        Ok(services) => services,
-        Err(_) => return Response::error("Service unavailable", 503),
-    };
     match route {
-        Route::GetSettings(id) => get_settings(&services, id).await,
-        Route::SaveSettings(id) => save_settings(&mut req, &services, id).await,
+        Route::GetSettings(id) => {
+            let services = match crate::composition::build_services(&env).await {
+                Ok(services) => services,
+                Err(_) => return Response::error("Service unavailable", 503),
+            };
+            get_settings(&services, id).await
+        }
+        Route::SaveSettings(id) => {
+            // 設定保存は setting.ini / replace.txt の読み込み→書き換えなので
+            // primary 直行・キャッシュ無しのサービスを使う。
+            let services = match crate::composition::build_mutation_services(&env).await {
+                Ok(services) => services,
+                Err(_) => return Response::error("Service unavailable", 503),
+            };
+            save_settings(&mut req, &services, id).await
+        }
         Route::Devices => list_devices(),
     }
 }

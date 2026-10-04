@@ -202,10 +202,12 @@ struct AliasRow {
 /// native `alias_to_target` が読むエイリアス表。読めない/行が無いときは
 /// 空表 (= native が load に失敗したときと同じく別名なしとして扱う)。
 pub(crate) async fn load_aliases(env: &Env) -> HashMap<String, String> {
+    // 呼び出し側はすべて「エイリアス解決の結果をキュー投入・削除対象の
+    // 確定に使う」更新系なので、replica/セッションではなく primary を読む。
     let Ok(db) = env.d1("DB") else {
         return Default::default();
     };
-    let db = crate::db_handle::DbHandle::ui(std::sync::Arc::new(db));
+    let db = crate::db_handle::DbHandle::primary(std::sync::Arc::new(db));
     let statement = match db
         .prepare("SELECT value_yaml, value_json FROM app_state WHERE scope = ? AND key = ?")
         .bind(&[
@@ -255,7 +257,8 @@ async fn resolve_plan_target(
     // `TargetType::Other` parity: the downloader would try title first, then
     // ncode, against the library. Resolve to the record id now since the
     // ledger cannot store a title target.
-    let library = &runtime.services.library;
+    // enqueue 判断の材料なので primary + キャッシュ無しで読む。
+    let library = &runtime.write_services().library;
     let existing = match library
         .find_by_title(effective)
         .await

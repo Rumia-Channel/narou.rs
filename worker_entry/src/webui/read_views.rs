@@ -317,8 +317,9 @@ async fn resolve_diff_target_id(
         return None;
     }
     if let Ok(id) = effective.parse::<i64>() {
+        // diff_clean の削除対象を stale なキャッシュ/replica で確定しない。
         return runtime
-            .services
+            .write_services()
             .library
             .get(id.into())
             .await
@@ -329,12 +330,12 @@ async fn resolve_diff_target_id(
     match Downloader::get_target_type(effective) {
         TargetType::Url => {
             let toc_url = runtime
-                .services
+                .write_services()
                 .site_definitions
                 .resolve_toc_url(effective)
                 .unwrap_or_else(|| effective.to_string());
             runtime
-                .services
+                .write_services()
                 .library
                 .find_by_toc_url(&toc_url)
                 .await
@@ -343,7 +344,7 @@ async fn resolve_diff_target_id(
                 .map(|record| record.id)
         }
         TargetType::Ncode => runtime
-            .services
+            .write_services()
             .library
             .find_by_ncode(effective)
             .await
@@ -353,7 +354,7 @@ async fn resolve_diff_target_id(
         TargetType::Id => None,
         _ => {
             let by_title = runtime
-                .services
+                .write_services()
                 .library
                 .find_by_title(effective)
                 .await
@@ -363,7 +364,7 @@ async fn resolve_diff_target_id(
             match by_title {
                 Some(id) => Some(id),
                 None => runtime
-                    .services
+                    .write_services()
                     .library
                     .find_by_ncode(effective)
                     .await
@@ -399,7 +400,7 @@ fn cached_section_key<'a>(novel_prefix: &str, key: &'a str) -> Option<(&'a str, 
 /// `ObjectStore::list_page` はカーソル分割だが、D1 は全件を返す構造なので
 /// まとめて取得しきる。
 async fn list_cached_section_keys(
-    runtime: &WorkerRuntime,
+    objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
     novel_prefix: &str,
 ) -> Result<Vec<String>, String> {
     let sections_prefix = format!("{novel_prefix}/{SECTION_SAVE_DIR}/");
@@ -408,8 +409,7 @@ async fn list_cached_section_keys(
     let mut request =
         ObjectListRequest::new(prefix, NonZeroUsize::new(OBJECT_PAGE_LIMIT).unwrap());
     loop {
-        let page = runtime
-            .objects()
+        let page = objects
             .list_page(&request)
             .await
             .map_err(|error| error.to_string())?;
@@ -463,7 +463,7 @@ async fn render_diff_list_html(runtime: &WorkerRuntime, target: &str) -> String 
         return String::new();
     };
     let prefix = object_keys.prefix().as_ref().to_string();
-    let Ok(mut keys) = list_cached_section_keys(runtime, &prefix).await else {
+    let Ok(mut keys) = list_cached_section_keys(&runtime.objects(), &prefix).await else {
         return String::new();
     };
     if keys.is_empty() {
@@ -593,7 +593,9 @@ async fn diff_clean(
     let Some(id) = resolve_diff_target_id(runtime, env, &target).await else {
         return api_json_response(false, "差分の削除に失敗しました");
     };
-    let Ok(Some(record)) = runtime.services.library.get(id.into()).await else {
+    // 削除対象の確定と削除そのものを stale なスナップショットへ依存させない
+    // (読み取りも primary + キャッシュ無しの更新系で行う)。
+    let Ok(Some(record)) = runtime.write_services().library.get(id.into()).await else {
         return api_json_response(false, "差分の削除に失敗しました");
     };
     let Ok(keys) = NovelObjectKeys::new(
@@ -604,7 +606,7 @@ async fn diff_clean(
         return api_json_response(false, "差分の削除に失敗しました");
     };
     let prefix = keys.prefix().as_ref().to_string();
-    let cache_keys = match list_cached_section_keys(runtime, &prefix).await {
+    let cache_keys = match list_cached_section_keys(&runtime.write_objects(), &prefix).await {
         Ok(keys) => keys,
         Err(_) => return api_json_response(false, "差分の削除に失敗しました"),
     };
@@ -612,7 +614,7 @@ async fn diff_clean(
         let Ok(object_key) = ObjectKey::try_new(key.as_str()) else {
             continue;
         };
-        if runtime.objects().delete(&object_key).await.is_err() {
+        if runtime.write_objects().delete(&object_key).await.is_err() {
             return api_json_response(false, "差分の削除に失敗しました");
         }
     }
@@ -653,7 +655,7 @@ async fn inspect(req: &mut Request, runtime: &WorkerRuntime) -> worker::Result<R
 
 /// `app_state('inv','notepad')` の行。`value_yaml` を正とし、移行前の行
 /// (`value_json` のみ) も読めるようにする (`d1_repository` と同じ規則)。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct NotepadRow {
     #[serde(default)]
     value_yaml: Option<String>,
@@ -672,6 +674,22 @@ fn notepad_content(row: NotepadRow) -> String {
     }
 }
 
+/// `app_state('inv','notepad')` の生行を読む。失敗は呼び出し側で扱う
+/// (GET は空文字へ畳み、POST は保存を止めてエラー応答にする)。
+async fn read_notepad_row(db: &crate::db_handle::DbHandle) -> Result<Option<NotepadRow>, String> {
+    let statement = db
+        .prepare("SELECT value_yaml, value_json FROM app_state WHERE scope = ? AND key = ?")
+        .bind(&[
+            JsValue::from_str(INVENTORY_SCOPE),
+            JsValue::from_str(NOTEPAD_KEY),
+        ])
+        .map_err(|error| error.to_string())?;
+    statement
+        .first::<NotepadRow>(None)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// native `read_notepad` 相当: `value_yaml` の生テキストを返す。行が無い・
 /// 読めない場合は空文字列 (native の `unwrap_or_default` と同じ)。
 async fn read_notepad(env: &Env) -> String {
@@ -679,44 +697,84 @@ async fn read_notepad(env: &Env) -> String {
         return String::new();
     };
     let db = crate::db_handle::DbHandle::ui(std::sync::Arc::new(db));
-    let statement = match db
-        .prepare("SELECT value_yaml, value_json FROM app_state WHERE scope = ? AND key = ?")
-        .bind(&[
-            JsValue::from_str(INVENTORY_SCOPE),
-            JsValue::from_str(NOTEPAD_KEY),
-        ]) {
-        Ok(statement) => statement,
-        Err(_) => return String::new(),
-    };
-    let row: Option<NotepadRow> = statement.first::<NotepadRow>(None).await.unwrap_or_default();
-    row.map(notepad_content).unwrap_or_default()
+    read_notepad_row(&db)
+        .await
+        .ok()
+        .flatten()
+        .map(notepad_content)
+        .unwrap_or_default()
 }
 
-/// native `set_raw_db` と同じ SQL: `value_yaml` に生テキストを置く
-/// (`value_json` は `set_raw_db` 同様 `'{}'`)。
-async fn write_notepad(env: &Env, content: &str) -> Result<(), String> {
-    let db = env.d1("DB").map_err(|error| error.to_string())?;
-    let statement = db
+/// `write_notepad` の結果。`Conflict` は競合ガード (0 行適用) を表し、
+/// D1 エラーではない。
+enum NotepadSave {
+    Saved,
+    Conflict,
+    Failed(String),
+}
+
+/// native `set_raw_db` と同じ更新内容を、条件付きの UPSERT として primary
+/// へ書く。ガードは「読んだ時点の生カラム値がそのまま残っている」ことで、
+/// `IS` 比較 (NULL 同値) を使う。読み取り→書き込みを 1 文に畳むことで、
+/// 別 isolate の保存と競合したときに確実に負け側が 0 行適用になる
+/// (行が無いときは INSERT、競合行が生えていたら DO UPDATE の WHERE が
+/// 外れて 0 行 = Conflict)。
+async fn write_notepad(
+    db: &crate::db_handle::DbHandle,
+    expected: &Option<NotepadRow>,
+    content: &str,
+) -> NotepadSave {
+    let expected_yaml = expected
+        .as_ref()
+        .and_then(|row| row.value_yaml.as_deref())
+        .map(JsValue::from_str)
+        .unwrap_or(JsValue::NULL);
+    let expected_json = expected
+        .as_ref()
+        .and_then(|row| row.value_json.as_deref())
+        .map(JsValue::from_str)
+        .unwrap_or(JsValue::NULL);
+    let statement = match db
         .prepare(
             "INSERT INTO app_state (scope, key, value_json, value_yaml) VALUES (?, ?, '{}', ?)
              ON CONFLICT(scope, key) DO UPDATE SET
-               value_json = excluded.value_json, value_yaml = excluded.value_yaml",
+               value_json = excluded.value_json, value_yaml = excluded.value_yaml
+             WHERE app_state.value_yaml IS ? AND app_state.value_json IS ?",
         )
         .bind(&[
             JsValue::from_str(INVENTORY_SCOPE),
             JsValue::from_str(NOTEPAD_KEY),
             JsValue::from_str(content),
-        ])
-        .map_err(|error| error.to_string())?;
-    let result = statement.run().await.map_err(|error| error.to_string())?;
-    if result.success() {
-        Ok(())
+            expected_yaml,
+            expected_json,
+        ]) {
+        Ok(statement) => statement,
+        Err(error) => return NotepadSave::Failed(error.to_string()),
+    };
+    let result = match statement.run().await {
+        Ok(result) => result,
+        Err(error) => return NotepadSave::Failed(error.to_string()),
+    };
+    if !result.success() {
+        return NotepadSave::Failed(
+            result
+                .error()
+                .unwrap_or_else(|| "D1 write failed".to_string()),
+        );
+    }
+    let changed = result
+        .meta()
+        .ok()
+        .flatten()
+        .and_then(|meta| meta.changes)
+        .unwrap_or(0);
+    if changed >= 1 {
+        NotepadSave::Saved
     } else {
-        Err(result
-            .error()
-            .unwrap_or_else(|| "D1 write failed".to_string()))
+        NotepadSave::Conflict
     }
 }
+
 
 /// native `notepad_object_id` の写し: 本文の SHA-256 hex。
 fn notepad_object_id(content: &str) -> String {
@@ -755,7 +813,24 @@ async fn notepad_save(req: &mut Request, env: &Env) -> worker::Result<Response> 
     ) {
         return Response::from_json(&api_response(false, message));
     }
-    let current_content = read_notepad(env).await;
+    // 楽観ロックの比較は常に primary で行う — セッション (replica) に
+    // 読ませると他 isolate の直前の保存を見落として黙って上書きする。
+    // 読み取りエラーは「行が無い」と区別して保存を止める (native の
+    // `unwrap_or_default` と違い、失敗を成功に見せない)。
+    let db = crate::db_handle::DbHandle::primary(std::sync::Arc::new(match env.d1("DB") {
+        Ok(db) => db,
+        Err(error) => {
+            return Response::from_json(&api_response(false, error.to_string()));
+        }
+    }));
+    let current_row = match read_notepad_row(&db).await {
+        Ok(row) => row,
+        Err(message) => return Response::from_json(&api_response(false, message)),
+    };
+    let current_content = current_row
+        .clone()
+        .map(notepad_content)
+        .unwrap_or_default();
     let current_object_id = notepad_object_id(&current_content);
     let request_object_id = body["object_id"].as_str().unwrap_or("");
 
@@ -770,8 +845,10 @@ async fn notepad_save(req: &mut Request, env: &Env) -> worker::Result<Response> 
         }));
     }
 
-    match write_notepad(env, content).await {
-        Ok(()) => {
+    // CAS: 「読んだ行のままである」ことを条件に 1 文で書き換える。別
+    // isolate の保存が間に入った場合は 0 行適用で負け側になる。
+    match write_notepad(&db, &current_row, content).await {
+        NotepadSave::Saved => {
             // native はここで `notepad.change` を PushServer へ broadcast するが、
             // Worker には同等の経路が無い (websocket.rs 参照)。応答 JSON は同一。
             Response::from_json(&json!({
@@ -782,7 +859,20 @@ async fn notepad_save(req: &mut Request, env: &Env) -> worker::Result<Response> 
                 "object_id": notepad_object_id(content),
             }))
         }
-        Err(message) => Response::from_json(&api_response(false, message)),
+        NotepadSave::Conflict => {
+            // 書き込み競合 — 勝った側の内容を読み返して競合応答に載せる。
+            let conflict_row = read_notepad_row(&db).await.ok().flatten();
+            let conflict_content = conflict_row.map(notepad_content).unwrap_or_default();
+            Response::from_json(&json!({
+                "success": false,
+                "conflict": true,
+                "message": "他の画面でメモ帳が更新されたため再読み込みしました。内容を確認してからもう一度保存してください",
+                "content": conflict_content,
+                "text": conflict_content,
+                "object_id": notepad_object_id(&conflict_content),
+            }))
+        }
+        NotepadSave::Failed(message) => Response::from_json(&api_response(false, message)),
     }
 }
 

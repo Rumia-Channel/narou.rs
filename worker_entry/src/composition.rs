@@ -61,7 +61,15 @@ const UPDATE_INTERVAL_MIN_SECS: f64 = 2.5;
 /// queue batch running concurrently in one isolate never share a mutable
 /// downloader.
 pub struct WorkerRuntime {
+    /// UI 読み取り系のサービス (`DbHandle::ui` = first-unconstrained
+    /// セッション + isolate キャッシュありのストア)。GET 系はこちらだけを
+    /// 使い、read replica へ逃がす。
     pub services: AppServices,
+    /// 更新系のサービス (primary 直行 + キャッシュを介さないストア)。
+    /// 書き込みを伴うハンドラは、判断材料の読み取りも含めてこちらを使う
+    /// — `services` 側はキャッシュ済み・replica 遅延のスナップショットを
+    /// 返し得るため、read-modify-write には使えない。
+    pub write_services: AppServices,
     pub ledger: Arc<D1JobLedger>,
     pub checkpoint: D1SchedulerCheckpoint,
     pub queue: Queue,
@@ -71,15 +79,25 @@ pub struct WorkerRuntime {
     rate_limiter: Arc<WorkerRateLimiter>,
     /// `update.interval` (作品開始の間隔、native と同じく最低 2.5 秒)。
     update_interval_secs: f64,
+    /// UI 読み取り系のオブジェクトストア (セッション / キャッシュ済みの
+    /// asset_backend 解決)。
     objects: Arc<dyn ObjectStore>,
     assets: Arc<dyn AssetStore>,
+    /// 更新系のオブジェクトストア (primary 直行 + キャッシュを介さない
+    /// asset_backend 解決)。オブジェクトの削除・PUT とその直後の再読み込み
+    /// (read-your-writes) はこちらを使う。
+    write_objects: Arc<dyn ObjectStore>,
     pub clock: Arc<dyn Clock>,
     site_settings: Vec<SiteSetting>,
     /// D1 ハンドル（資格情報ストアと設定スナップショットが使う）。UI 経路は
     /// `first-unconstrained` セッション、ジョブ経路は primary 直行になる。
     db: DbHandle,
+    /// 更新系の D1 ハンドル。常に primary 直行 — read replica の遅延中に
+    /// 書き込み判断の読み取りを行わせない。ジョブ経路では `db` と同じ値。
+    write_db: DbHandle,
     /// 保存済みログイン資格情報。Downloader・HTTP クライアント・管理 API が
-    /// 同じ実体を共有する。
+    /// 同じ実体を共有する。`D1CookieStore` は読み取り自体が旧形式の畳み直し
+    /// 書き込みを含み得るため、常に `write_db` (primary) に結び付ける。
     cookie_store: Arc<crate::d1_cookie_store::D1CookieStore>,
     /// Shared subrequest counter for this invocation; the executor reads it
     /// at section boundaries via `WorkerBudget`.
@@ -117,8 +135,12 @@ static ASSET_BACKEND_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<Ass
 ///
 /// 行が無い standalone の旧構成だけは D1 とする。CI 構成では後段の
 /// `NAROU_REQUIRE_S3=true` が D1・未設定を含む有効な選択を S3 に解決する。
-async fn read_asset_backend(db: &DbHandle) -> worker::Result<AssetBackend> {
-    if let Some(cached) = ASSET_BACKEND_CACHE.get("asset_backend") {
+///
+/// `fresh = true` (更新系の組立) では isolate キャッシュを読まない。
+/// 保存先の読み違いはオブジェクトを誤ったバックエンドへ書く直結の問題
+/// なので、書き込み側はキャッシュ値を信じない。
+async fn read_asset_backend(db: &DbHandle, fresh: bool) -> worker::Result<AssetBackend> {
+    if !fresh && let Some(cached) = ASSET_BACKEND_CACHE.get("asset_backend") {
         return Ok(cached);
     }
     let statement = db
@@ -157,13 +179,14 @@ async fn build_object_stores(
     env: &Env,
     db: &DbHandle,
     subrequests: crate::budget::SubrequestBudget,
+    fresh: bool,
 ) -> worker::Result<(
     Arc<dyn ObjectStore>,
     Arc<dyn AssetStore>,
     Option<Arc<S3Store>>,
 )> {
     let required = required_s3(env)?;
-    let backend = read_asset_backend(db).await?.resolve(required);
+    let backend = read_asset_backend(db, fresh).await?.resolve(required);
     let d1: Arc<D1ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
     let mut s3_handle: Option<Arc<S3Store>> = None;
     let illustrations: (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) =
@@ -304,7 +327,7 @@ impl WorkerRuntime {
     /// ここはセッションを通さない。
     pub async fn build(env: &Env) -> worker::Result<Self> {
         let db = DbHandle::primary(Arc::new(env.d1("DB")?));
-        Self::build_with(env, db, CompositionProfile::Job).await
+        Self::build_with(env, db.clone(), db, CompositionProfile::Job).await
     }
 
     /// UI (fetch) 経路用のビルド。D1 は `first-unconstrained` セッション経由
@@ -320,33 +343,56 @@ impl WorkerRuntime {
     ///  `load_site_settings` を遅延呼び出しする。ビルド時には読まない。)
     pub async fn build_ui(env: &Env) -> worker::Result<Self> {
         let db = DbHandle::ui(Arc::new(env.d1("DB")?));
-        Self::build_with(env, db, CompositionProfile::Ui).await
+        let write_db = DbHandle::primary(Arc::new(env.d1("DB")?));
+        Self::build_with(env, db, write_db, CompositionProfile::Ui).await
     }
 
-    /// `db` に渡したハンドルをすべてのストアへ配線する共通ビルド。
+    /// `db` (読み取り系) と `write_db` (更新系、常に primary 直行) の 2 系統の
+    /// ハンドルをストアへ配線する共通ビルド。ジョブ経路では両者に同じ
+    /// primary ハンドルが渡る。
     async fn build_with(
         env: &Env,
         db: DbHandle,
+        write_db: DbHandle,
         profile: CompositionProfile,
     ) -> worker::Result<Self> {
         let subrequests = crate::budget::SubrequestBudget::new();
-        let (objects, assets, _s3_illustrations) =
-            build_object_stores(env, &db, subrequests.clone()).await?;
+        let (write_objects, write_assets, _s3_illustrations_write) =
+            build_object_stores(env, &write_db, subrequests.clone(), true).await?;
+        let (objects, assets) = match profile {
+            CompositionProfile::Job => (write_objects.clone(), write_assets),
+            CompositionProfile::Ui => {
+                let (objects, assets, _) =
+                    build_object_stores(env, &db, subrequests.clone(), false).await?;
+                (objects, assets)
+            }
+        };
         let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
+        // 更新系リポジトリ。`runtime.novels` は enqueue/frozen 判定の前段
+        // 読み取り (ジョブ経路) と同じく primary 直行にする。
+        let write_novels: Arc<dyn NovelRepository> =
+            Arc::new(D1NovelRepository::new(write_db.clone()));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let freeze = Arc::new(D1FreezeStore::new(db.clone()));
+        // 一覧・描画系の凍結集合は isolate キャッシュ込みの読み取り系、
+        // `runtime.freeze` (freeze 判定/更新前の読み取り) はキャッシュを
+        // 介さない更新系に分ける。
+        let read_freeze = Arc::new(D1FreezeStore::new(db.clone()));
+        let freeze = Arc::new(D1FreezeStore::for_writes(write_db.clone()));
         let cookie_store: Arc<crate::d1_cookie_store::D1CookieStore> =
             Arc::new(crate::d1_cookie_store::D1CookieStore::new(
-                db.clone(),
+                write_db.clone(),
                 crate::d1_cookie_store::D1CookieStore::key_from_env(env).await,
                 // 旧ホストキーの畳み (key_site_settings) が Worker runtime と
                 // 同じ effective 定義 (bundle + ユーザー、version gate 済み) を
                 // 読めるように注入する。
-                objects.clone(),
+                write_objects.clone(),
             ));
-        // local 設定は 1 回だけ読んで User-Agent とレート制限の両方に使う
-        // (D1SettingsStore 経由なので同一 isolate ではキャッシュ済み)。
-        let local_values = D1SettingsStore::new(db.clone())
+        // ジョブの設定は primary から現在値を読み、UI の GET はキャッシュを維持する。
+        let local_store = match profile {
+            CompositionProfile::Job => D1SettingsStore::for_writes(write_db.clone()),
+            CompositionProfile::Ui => D1SettingsStore::new(db.clone()),
+        };
+        let local_values = local_store
             .load(SettingScope::Local)
             .await
             .unwrap_or_default();
@@ -404,33 +450,48 @@ impl WorkerRuntime {
                 .map_err(|error| worker::Error::RustError(error.to_string()))?,
             CompositionProfile::Ui => Vec::new(),
         };
-        let ledger = Arc::new(D1JobLedger::new(db.clone(), clock.clone()));
-        let checkpoint = D1SchedulerCheckpoint::new(db.clone());
+        // 台帳・チェックポイントは更新系 (claim/状態遷移の read-your-writes)
+        // なので常に primary 直行。`/api/queue/*` の読み取りは webui/queue.rs
+        // 側がセッションハンドルを使う。
+        let ledger = Arc::new(D1JobLedger::new(write_db.clone(), clock.clone()));
+        let checkpoint = D1SchedulerCheckpoint::new(write_db.clone());
         let queue = env.queue(JOB_QUEUE_BINDING)?;
 
         let services = services_from(
             novels.clone(),
             objects.clone(),
+            read_freeze,
+            Arc::new(D1SettingsStore::new(db.clone())),
+            Arc::new(D1TagColorStore::new(db.clone())),
+            clock.clone(),
+        );
+        let write_services = services_from(
+            write_novels.clone(),
+            write_objects.clone(),
             freeze.clone(),
-            db.clone(),
+            Arc::new(D1SettingsStore::for_writes(write_db.clone())),
+            Arc::new(D1TagColorStore::for_writes(write_db.clone())),
             clock.clone(),
         );
         Ok(Self {
             services,
+            write_services,
             ledger,
             checkpoint,
             queue,
             freeze,
-            novels,
+            novels: write_novels,
             http,
             rate_limiter,
             update_interval_secs,
             objects,
             assets,
+            write_objects,
             subrequests,
             clock,
             site_settings,
             db,
+            write_db,
             cookie_store,
             pending_section_hash_cache: Arc::new(parking_lot::Mutex::new(None)),
         })
@@ -483,7 +544,9 @@ impl WorkerRuntime {
             "auto-add-tags",
             "download.use-subdirectory",
         ];
-        let store = D1SettingsStore::new(self.db.clone());
+        // ジョブの実行パラメータはキャッシュ済みスナップショットではなく
+        // 現在値を読む (job 経路のハンドル自体は primary)。
+        let store = D1SettingsStore::for_writes(self.write_db.clone());
         let local_values = store.load(SettingScope::Local).await?;
         let local: HashMap<String, bool> = LOCAL_BOOL_KEYS
             .iter()
@@ -516,7 +579,12 @@ impl WorkerRuntime {
         let Some(pending) = pending else {
             return Ok(());
         };
-        persist_section_hash_cache(&self.db, pending).await
+        // マージ元はキャッシュ値ではなく最新の行とする。キャッシュ済み
+        // スナップショットを起点にすると、他 isolate が書き込んだ冊の
+        // ハッシュを古い map で消してしまう (読み取り系のキャッシュ更新は
+        // `load_section_hash_cache` 側の通常経路に任せる)。
+        SECTION_HASH_CACHE.invalidate("section_hash_cache");
+        persist_section_hash_cache(&self.write_db, pending).await
     }
 
     /// 管理 API 用の具体ハンドル（診断用メソッドを持つ）。
@@ -527,7 +595,7 @@ impl WorkerRuntime {
     /// 保存済み設定の読み出し (D1)。`ConvertService` が `default.*` / `force.*`
     /// を適用するのに使う。
     pub fn settings_store(&self) -> Arc<dyn narou_rs::application::settings::SettingsStore> {
-        Arc::new(D1SettingsStore::new(self.db.clone()))
+        Arc::new(D1SettingsStore::for_writes(self.write_db.clone()))
     }
 
     /// コンパイル済みサイト定義のスナップショット。`build` (Job) 経路では
@@ -564,6 +632,19 @@ impl WorkerRuntime {
     pub fn assets(&self) -> Arc<dyn AssetStore> {
         self.assets.clone()
     }
+    /// 更新系サービスへのアクセサ。UI ハンドラは書き込み判断に必要な
+    /// 読み取りも含めてこちらを使う (`self.services` は read replica /
+    /// isolate キャッシュ系)。
+    pub fn write_services(&self) -> &AppServices {
+        &self.write_services
+    }
+
+    /// 更新系のオブジェクトストア (primary 直行)。削除・PUT 系の
+    /// read-your-writes と保存先解決はこちらを使う。
+    pub fn write_objects(&self) -> Arc<dyn ObjectStore> {
+        self.write_objects.clone()
+    }
+
 
     /// Enqueue one plan through the ledger and Queue binding as one operation.
     /// Pending/retryable rows are sent; a live running row is not duplicated.
@@ -688,7 +769,10 @@ impl WorkerRuntime {
         else {
             return Ok(None);
         };
-        if !self.services.novel_actions.is_frozen(id).await {
+        // 凍結判定は更新系サービス (primary + キャッシュ無し) で行う —
+        // 読み取り系の `services` は isolate キャッシュ・replica 遅延の
+        // 凍結集合を返し得て、直前の凍結/解除を見落とす。
+        if !self.write_services.novel_actions.is_frozen(id).await {
             return Ok(None);
         }
         let title = self
@@ -749,22 +833,52 @@ pub async fn build_read_services(env: &Env) -> worker::Result<ReadServices> {
     let db = DbHandle::ui(Arc::new(env.d1("DB")?));
     let subrequests = crate::budget::SubrequestBudget::new();
     let (objects, _assets, s3_illustrations) =
-        build_object_stores(env, &db, subrequests).await?;
+        build_object_stores(env, &db, subrequests, false).await?;
     let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let freeze = Arc::new(D1FreezeStore::new(db.clone()));
     Ok(ReadServices {
-        app: services_from(novels, objects.clone(), freeze, db, clock),
+        app: services_from(
+            novels,
+            objects.clone(),
+            freeze,
+            Arc::new(D1SettingsStore::new(db.clone())),
+            Arc::new(D1TagColorStore::new(db)),
+            clock,
+        ),
         objects,
         s3_illustrations,
     })
+}
+
+/// Build the application services for mutation paths. すべての読み取りを
+/// primary 直行・isolate キャッシュ無しで組み立てる (`WorkerRuntime::
+/// write_services` と同じ組立) — 更新系ハンドラは「書き込み判断のための
+/// 読み取り」も stale な replica/キャッシュ値を使えないため。
+pub async fn build_mutation_services(env: &Env) -> worker::Result<AppServices> {
+    let db = DbHandle::primary(Arc::new(env.d1("DB")?));
+    let subrequests = crate::budget::SubrequestBudget::new();
+    let (objects, _assets, _s3_illustrations) =
+        build_object_stores(env, &db, subrequests, true).await?;
+    let novels: Arc<dyn NovelRepository> = Arc::new(D1NovelRepository::new(db.clone()));
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let freeze = Arc::new(D1FreezeStore::for_writes(db.clone()));
+    Ok(services_from(
+        novels,
+        objects,
+        freeze,
+        Arc::new(D1SettingsStore::for_writes(db.clone())),
+        Arc::new(D1TagColorStore::for_writes(db)),
+        clock,
+    ))
 }
 
 fn services_from(
     novels: Arc<dyn NovelRepository>,
     objects: Arc<dyn ObjectStore>,
     freeze: Arc<D1FreezeStore>,
-    db: DbHandle,
+    settings: Arc<D1SettingsStore>,
+    tag_colors: Arc<D1TagColorStore>,
     clock: Arc<dyn Clock>,
 ) -> AppServices {
     let library = Arc::new(narou_rs::application::LibraryService::new(
@@ -785,10 +899,8 @@ fn services_from(
         novel_actions,
         novel_settings: Arc::new(NovelSettingsService::new(novels.clone(), objects.clone())),
         content: Arc::new(NovelContentService::new(novels, objects)),
-        settings: Arc::new(SettingsService::new(Arc::new(D1SettingsStore::new(
-            db.clone(),
-        )))),
-        tag_colors: Arc::new(TagColorService::new(Arc::new(D1TagColorStore::new(db)))),
+        settings: Arc::new(SettingsService::new(settings)),
+        tag_colors: Arc::new(TagColorService::new(tag_colors)),
         jobs: Arc::new(JobService),
         scheduler: Arc::new(SchedulerService::new(clock)),
         site_definitions: Arc::new(EmptySiteDefinitionProvider),
@@ -796,6 +908,7 @@ fn services_from(
         web_actions: Arc::new(EmptyWebActionService),
     })
 }
+
 
 /// Readiness probe: every required binding and configuration must be real.
 ///

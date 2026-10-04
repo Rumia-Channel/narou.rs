@@ -160,7 +160,7 @@ async fn save_sort_state(
         ));
     };
     match runtime
-        .services
+        .write_services()
         .settings
         .set_raw(
             SettingScope::Global,
@@ -386,7 +386,9 @@ async fn feature_tour_seen(
     if !is_known_tour_version(&requested) {
         return Response::from_json(&api_response(false, "unknown tour version"));
     }
-    let settings = &runtime.services.settings;
+    // 既読バージョンは read-modify-write (現行値と大きい方を残す) なので
+    // 更新系サービス (primary + キャッシュ無し) で読む。
+    let settings = &runtime.write_services().settings;
     let version_to_save = load_local_str(settings, SEEN_VERSION_KEY)
         .await
         .filter(|seen| version_greater(seen, &requested))
@@ -415,7 +417,7 @@ async fn feature_tour_config(
     };
     let disabled = body["disabled"].as_bool().unwrap_or(false);
     match runtime
-        .services
+        .write_services()
         .settings
         .set_raw(
             SettingScope::Local,

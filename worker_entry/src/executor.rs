@@ -144,7 +144,7 @@ pub async fn execute_job(
     // ジョブは native と同じ通知行を出して終了する。
     if !force && matches!(job.kind, JobKind::Download | JobKind::Update) {
         match resolve_novel_id(runtime.novels.as_ref(), &job.target).await {
-            Some(id) if runtime.services.novel_actions.is_frozen(id).await => {
+            Some(id) if runtime.write_services().novel_actions.is_frozen(id).await => {
                 let title = runtime
                     .novels
                     .get(id)
@@ -581,7 +581,7 @@ fn has_option(options: &[String], names: &[&str]) -> bool {
 /// 読めないときは native の設定なしと同じ `false` に倒す。
 async fn convert_only_new_arrival_setting(runtime: &WorkerRuntime) -> bool {
     runtime
-        .services
+        .write_services()
         .settings
         .get("update.convert-only-new-arrival")
         .await
@@ -616,7 +616,8 @@ async fn needs_convert_after_unchanged(runtime: &WorkerRuntime, id: NovelId) -> 
     // 存在確認がエラーでも「無い」とみなして変換に回す: ストア障害時でも
     // convert ジョブが queue_failed として失敗を表面化する (黙って
     // 「テキスト無しのまま成功」にしないため)。
-    !runtime.objects().exists(&keys.converted_text()).await.unwrap_or(false)
+    // 削除・上書きを伴う変換判定なので primary 直行のストアで存在確認する。
+    !runtime.write_objects().exists(&keys.converted_text()).await.unwrap_or(false)
 }
 
 #[cfg(test)]

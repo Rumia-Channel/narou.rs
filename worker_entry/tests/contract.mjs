@@ -345,6 +345,33 @@ await check("POST /api/notepad/save round-trips the notepad", async () => {
   assert(read.object_id === result.object_id, "the saved object_id must come back");
 });
 
+await checkLocal("competing notepad saves cannot overwrite the winner", async () => {
+  const before = await json(await request("/api/notepad/read", auth()));
+  const save = (content, objectId) => request("/api/notepad/save", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth().headers },
+    body: JSON.stringify({ content, object_id: objectId }),
+  }).then(json);
+  const contents = ["contract competing save A", "contract competing save B"];
+  try {
+    const results = await Promise.all(contents.map(content => save(content, before.object_id)));
+    const winner = results.findIndex(result => result.success === true);
+    assert.notEqual(winner, -1, "one save must succeed");
+    assert.equal(results.filter(result => result.success === true).length, 1);
+    const loser = results[1 - winner];
+    assert.equal(loser.conflict, true);
+    assert.equal(loser.content, contents[winner]);
+    assert.equal(loser.object_id, results[winner].object_id);
+    const current = await json(await request("/api/notepad/read", auth()));
+    assert.equal(current.content, contents[winner]);
+    assert.equal(current.object_id, results[winner].object_id);
+  } finally {
+    const current = await json(await request("/api/notepad/read", auth()));
+    const restored = await save(before.content, current.object_id);
+    assert.equal(restored.success, true, "restore the original local notepad");
+  }
+});
+
 await check("GET /api/story returns 404 for an unknown novel", async () => {
   const response = await request("/api/story?id=999999999", auth());
   assert(response.status === 404, `status ${response.status}`);
@@ -1190,7 +1217,7 @@ if (QUEUE_CHECKS) {
 // トークン未設定の Worker は 401 ではなく 500 + `authentication_not_configured` で
 // 失敗する（設定漏れが「トークン違い」に見えないように）。
 if (process.env.CONTRACT_EXPECT_UNCONFIGURED === "1") {
-  await check("an unconfigured Worker fails closed with a distinct code", async () => {
+  await test("an unconfigured Worker fails closed with a distinct code", async () => {
     const response = await fetchWithAccess(new URL("/api/novels", BASE_URL).toString());
     assert.equal(response.status, 500);
     const body = await response.json();

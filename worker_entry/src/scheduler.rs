@@ -172,7 +172,8 @@ pub async fn plan_auto_update(runtime: &WorkerRuntime, _probe_generation: u64) -
             CheckpointClaim::Claimed(checkpoint) => checkpoint,
         }
     } else {
-        let services = &runtime.services;
+        // スケジュール判断は投入判断の材料なので primary + キャッシュ無しで読む。
+        let services = &runtime.write_services();
         // One scoped load instead of three app_state scans per cron tick.
         let mut values = services
             .settings
@@ -316,7 +317,7 @@ async fn scan_page(
 
 /// `update.sort-by` の設定値を `NovelSort` へ解決する。
 async fn configured_scan_sort(runtime: &WorkerRuntime) -> Option<NovelSort> {
-    let raw = match runtime.services.settings.get("update.sort-by").await {
+    let raw = match runtime.write_services().settings.get("update.sort-by").await {
         Ok(value) => value,
         Err(error) => {
             console_log!(

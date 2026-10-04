@@ -91,7 +91,7 @@ def main() -> None:
     #       5 つの `<変数名>_SECRET_NAME` を渡し、値はストア側に置く。
     #       リポジトリと CI には「名前」しか残らない (Dantalian と同じ方式)。
     secret_store_id = optional("NAROU_SECRETS_STORE_ID", "").strip()
-    secret_names = {
+    s3_secret_names = {
         "S3_ACCESS_KEY_ID_SECRET_NAME": optional("NAROU_S3_ACCESS_KEY_ID_SECRET_NAME", "").strip(),
         "S3_SECRET_ACCESS_KEY_SECRET_NAME": optional(
             "NAROU_S3_SECRET_ACCESS_KEY_SECRET_NAME", ""
@@ -100,18 +100,39 @@ def main() -> None:
         "S3_REGION_SECRET_NAME": optional("NAROU_S3_REGION_SECRET_NAME", "").strip(),
         "S3_BUCKET_SECRET_NAME": optional("NAROU_S3_BUCKET_SECRET_NAME", "").strip(),
     }
-    store_mode = bool(secret_store_id) or any(secret_names.values())
-    if store_mode:
-        if not secret_store_id or not all(secret_names.values()):
-            fail(
-                "Secrets Store を使う場合は NAROU_SECRETS_STORE_ID と "
-                "NAROU_S3_*_SECRET_NAME を 5 つ揃えて渡す"
-            )
+    # S3 の store モードは 5 つ揃ったときだけ成立し、1 つでも欠ければ失敗。
+    # トークン系 (下) とは独立に選べる。
+    s3_store_mode = any(s3_secret_names.values())
+    if s3_store_mode and not all(s3_secret_names.values()):
+        fail(
+            "Secrets Store に S3 を置く場合は NAROU_S3_*_SECRET_NAME を 5 つ揃えて渡す"
+        )
+    # アプリのトークンと復号鍵も Secrets Store に置ける（任意）。名前を渡した
+    # 項目だけ <NAME>_STORE バインディングを足す。S3 を vars のままにして
+    # トークンだけストアへ置く組み合わせも可能。
+    token_secrets = {
+        "NAROU_ADMIN_TOKEN": optional("NAROU_ADMIN_TOKEN_SECRET_NAME", "").strip(),
+        "NAROU_RS_LOGIN_KEY": optional("NAROU_RS_LOGIN_KEY_SECRET_NAME", "").strip(),
+    }
+    store_consumers = s3_store_mode or any(token_secrets.values())
+    if store_consumers and not secret_store_id:
+        fail("NAROU_SECRETS_STORE_ID is required for Secrets Store bindings")
+    if secret_store_id:
+        # ID の形式は利用者の有無に関係なく検証する。
         if not SECRET_NAME_PATTERN.fullmatch(secret_store_id):
             fail("NAROU_SECRETS_STORE_ID has an invalid value")
-        for label, value in secret_names.items():
-            if not SECRET_NAME_PATTERN.fullmatch(value):
-                fail(f"{label} has an invalid Secrets Store name")
+        if not store_consumers:
+            fail(
+                "NAROU_SECRETS_STORE_ID is set but no *_SECRET_NAME uses it; "
+                "set the secret names or unset the store ID"
+            )
+    for label, value in s3_secret_names.items():
+        if value and not SECRET_NAME_PATTERN.fullmatch(value):
+            fail(f"{label} has an invalid Secrets Store name")
+    for label, value in token_secrets.items():
+        if value and not SECRET_NAME_PATTERN.fullmatch(value):
+            fail(f"{label}_SECRET_NAME has an invalid Secrets Store name")
+    if s3_store_mode:
         endpoint = region = bucket = ""
     else:
         endpoint = required("NAROU_S3_ENDPOINT")
@@ -137,28 +158,18 @@ def main() -> None:
         "S3_BUCKET": bucket,
         "S3_PREFIX": prefix,
     }
-    # アプリのトークンと復号鍵も Secrets Store に置ける（任意）。
-    # 名前を渡した項目だけ <NAME>_STORE バインディングを足す。
-    token_secrets = {
-        "NAROU_ADMIN_TOKEN": optional("NAROU_ADMIN_TOKEN_SECRET_NAME", "").strip(),
-        "NAROU_RS_LOGIN_KEY": optional("NAROU_RS_LOGIN_KEY_SECRET_NAME", "").strip(),
-    }
-    for label, value in token_secrets.items():
-        if value and not SECRET_NAME_PATTERN.fullmatch(value):
-            fail(f"{label}_SECRET_NAME has an invalid Secrets Store name")
-    if any(token_secrets.values()) and not secret_store_id:
-        fail("NAROU_SECRETS_STORE_ID is required to place the admin token in the Secrets Store")
-
-    if store_mode:
+    if secret_store_id:
+        # 名前を渡した項目だけ <NAME>_STORE バインディングを足す
+        # (S3 の 5 つは全部入るか全部入らないか。トークン系は個別)。
         blocks = "".join(
             f'\n[[secrets_store_secrets]]\nbinding = "{binding}"\n'
             f'store_id = "{secret_store_id}"\nsecret_name = "{name}"\n'
             for binding, name in (
-                ("S3_ACCESS_KEY_ID_STORE", secret_names["S3_ACCESS_KEY_ID_SECRET_NAME"]),
-                ("S3_SECRET_ACCESS_KEY_STORE", secret_names["S3_SECRET_ACCESS_KEY_SECRET_NAME"]),
-                ("S3_ENDPOINT_STORE", secret_names["S3_ENDPOINT_SECRET_NAME"]),
-                ("S3_REGION_STORE", secret_names["S3_REGION_SECRET_NAME"]),
-                ("S3_BUCKET_STORE", secret_names["S3_BUCKET_SECRET_NAME"]),
+                ("S3_ACCESS_KEY_ID_STORE", s3_secret_names["S3_ACCESS_KEY_ID_SECRET_NAME"]),
+                ("S3_SECRET_ACCESS_KEY_STORE", s3_secret_names["S3_SECRET_ACCESS_KEY_SECRET_NAME"]),
+                ("S3_ENDPOINT_STORE", s3_secret_names["S3_ENDPOINT_SECRET_NAME"]),
+                ("S3_REGION_STORE", s3_secret_names["S3_REGION_SECRET_NAME"]),
+                ("S3_BUCKET_STORE", s3_secret_names["S3_BUCKET_SECRET_NAME"]),
                 ("NAROU_ADMIN_TOKEN_STORE", token_secrets["NAROU_ADMIN_TOKEN"]),
                 ("NAROU_RS_LOGIN_KEY_STORE", token_secrets["NAROU_RS_LOGIN_KEY"]),
             )

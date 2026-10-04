@@ -31,7 +31,7 @@ use worker::{Env, Method, Request, Response, console_log};
 
 use crate::composition::WorkerRuntime;
 
-use super::{api_response, json_error, load_current_sort_state};
+use super::{api_response, json_error, load_current_sort_state_for_writes};
 
 // ソート状態の型・正規化・レコード比較は `narou_rs::application::webui` の共有実装。
 use narou_rs::application::webui::sort_ids_from_records;
@@ -126,9 +126,11 @@ fn missing_error(missing: &[NovelId]) -> Option<worker::Result<Response>> {
 /// (`request_preserves_input_order` は常に false)、選択 id を現在の
 /// サーバーソート順に並べ直す。選択外のレコードは捨てる。
 async fn sort_ids_for_request(runtime: &WorkerRuntime, ids: &[i64]) -> Vec<i64> {
-    let sort_state = load_current_sort_state(runtime).await;
+    // 並べ替えはこの後の凍結/削除を形作るので、判断材料の読み取りは
+    // 更新系サービス (primary + キャッシュ無し) で行う。
+    let sort_state = load_current_sort_state_for_writes(runtime).await;
     let records = runtime
-        .services
+        .write_services()
         .library
         .records()
         .await
@@ -149,7 +151,7 @@ async fn freeze_toggle(
     }
     let ids = sort_ids_for_request(runtime, &body.ids).await;
     let ids: Vec<NovelId> = ids.iter().copied().map(Into::into).collect();
-    let result = match runtime.services.novel_actions.toggle_freeze(&ids).await {
+    let result = match runtime.write_services().novel_actions.toggle_freeze(&ids).await {
         Ok(result) => result,
         Err(error) => {
             let (status, code, message) = application_error(&error);
@@ -182,7 +184,7 @@ async fn batch_freeze(
     }
     let ids = sort_ids_for_request(runtime, &body.ids).await;
     let result = match runtime
-        .services
+        .write_services()
         .novel_actions
         .apply_freeze(&FreezeRequest {
             ids: ids.iter().copied().map(Into::into).collect(),
@@ -218,7 +220,7 @@ async fn batch_remove(runtime: &WorkerRuntime, body: &BatchIdsBody) -> worker::R
     let with_file = body.with_file.unwrap_or(false);
     let ids = sort_ids_for_request(runtime, &body.ids).await;
     let result = match runtime
-        .services
+        .write_services()
         .novel_actions
         .remove(&RemoveRequest {
             ids: ids.iter().copied().map(Into::into).collect(),

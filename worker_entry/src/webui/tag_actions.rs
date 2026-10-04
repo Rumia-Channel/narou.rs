@@ -33,7 +33,7 @@ use worker::{Method, Request, Response, console_log};
 
 use crate::composition::WorkerRuntime;
 
-use super::{json_error, load_current_sort_state};
+use super::{json_error, load_current_sort_state_for_writes};
 
 /// 親がこのハンドラへ割り当てるルート: `POST /api/edit_tag`,
 /// `POST /api/tag/change_color`。
@@ -111,7 +111,7 @@ async fn apply_tag_change(
     tags: Vec<String>,
 ) -> Result<narou_rs::application::TagChangeResult, String> {
     runtime
-        .services
+        .write_services()
         .novel_actions
         .change_tags(&TagChangeRequest {
             ids: ids.iter().copied().map(NovelId::from).collect(),
@@ -142,13 +142,15 @@ fn ensure_all_ids_found(
 /// 並び替えるので、こちらも `current_sort` 設定 (D1 `app_state` global) を読む。
 /// 型・正規化・比較自体は `narou_rs::application::webui` の共有実装。
 async fn sort_ids_for_request(runtime: &WorkerRuntime, ids: &[i64]) -> Vec<i64> {
+    // ソート状態と現在のレコードはこの後のタグ更新を形作るので、判断材料の
+    // 読み取りは更新系サービス (primary + キャッシュ無し) で行う。
     let records = runtime
-        .services
+        .write_services()
         .library
         .records()
         .await
         .unwrap_or_default();
-    let sort_state = load_current_sort_state(runtime).await;
+    let sort_state = load_current_sort_state_for_writes(runtime).await;
     sort_ids_from_records(ids, &records, &sort_state)
 }
 
@@ -252,7 +254,7 @@ async fn tag_change_color(
         });
     }
     match runtime
-        .services
+        .write_services()
         .tag_colors
         .set(&tag, (!color.is_empty()).then_some(color))
         .await
