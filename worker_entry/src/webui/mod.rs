@@ -88,7 +88,9 @@ pub(crate) fn query_param(url: &worker::Url, name: &str) -> Option<String> {
 /// native `max_web_targets_per_request` (`src/web/mod.rs`) parity:
 /// `server-max-targets-per-request` 設定を読み、無い/不正なら既定上限を返す。
 pub(crate) async fn max_web_targets(runtime: &WorkerRuntime) -> usize {
-    max_web_targets_for(&runtime.services).await
+    // 一括操作 (タグ/キュー投入) の件数上限は書き込み判断の材料なので、
+    // 更新系サービス (primary + キャッシュ無し) から読む。
+    max_web_targets_for(runtime.write_services()).await
 }
 
 /// `max_web_targets` と同じ設定をフル `WorkerRuntime` 無しで読む版。
@@ -109,6 +111,15 @@ pub(crate) async fn max_web_targets_for(
 /// そのもの。
 pub(crate) async fn load_current_sort_state(runtime: &WorkerRuntime) -> CurrentSortState {
     load_current_sort_state_for(&runtime.services).await
+}
+
+/// `load_current_sort_state` の更新系版。ソート状態を書き込み判断
+/// (一括操作の対象順) の材料にするハンドラは、primary + キャッシュ無しの
+/// `write_services` 側から読む。
+pub(crate) async fn load_current_sort_state_for_writes(
+    runtime: &WorkerRuntime,
+) -> CurrentSortState {
+    load_current_sort_state_for(runtime.write_services()).await
 }
 
 /// `load_current_sort_state` と同じ設定をフル `WorkerRuntime` 無しで読む版

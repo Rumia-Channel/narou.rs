@@ -84,6 +84,21 @@ pub async fn load_site_settings(
     Ok(settings)
 }
 
+/// 更新系ハンドラ向けの非キャッシュ版。キュー投入 / convert のターゲット
+/// 解決とオプション計算は「いま保存されている定義」を見る必要があるので、
+/// 30 秒 L1 に乗せず常に primary 側のストアを読み直す。
+pub async fn load_site_settings_uncached(
+    objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
+) -> Result<Vec<SiteSetting>> {
+    let store = ObjectStoreSiteDefinitions::new(objects.clone());
+    if store.list().await?.is_empty() {
+        return load_bundled_site_settings();
+    }
+    let effective = site_definitions(objects.clone()).effective_runtime().await?;
+    let contents: Vec<&str> = effective.iter().map(|(_, yaml)| yaml.as_str()).collect();
+    SiteSetting::load_bundled(&contents)
+}
+
 /// L1 キャッシュの寿命。書き込みは同じ isolate なら即時、他の isolate は
 /// この時間で追従する (サイト定義は頻繁に変わらないので十分)。
 const SITE_SETTINGS_TTL_MS: f64 = 30_000.0;

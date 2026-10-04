@@ -53,7 +53,7 @@ use worker::{Env, Method, Request, Response, console_log};
 
 use crate::composition::WorkerRuntime;
 
-use super::{json_error, load_current_sort_state};
+use super::{json_error, load_current_sort_state_for_writes};
 
 /// native `UpdateBody` (`src/web/state.rs`) と同じ受理形。
 #[derive(Debug, Deserialize)]
@@ -223,7 +223,8 @@ async fn sort_numeric_targets_for_state(
     else {
         return targets.to_vec();
     };
-    let sort_state = load_current_sort_state(runtime).await;
+    // キュー投入計画 (update/convert 対象の並び) の材料なので更新系で読む。
+    let sort_state = load_current_sort_state_for_writes(runtime).await;
     sort_ids_from_records(&ids, records, &sort_state)
         .into_iter()
         .map(|id| id.to_string())
@@ -233,9 +234,9 @@ async fn sort_numeric_targets_for_state(
 /// native `sorted_update_all_ids`: 更新対象を全件スキャンし、サーバーソート順の
 /// id 列にする (native は文字列にするが、Worker では plan 化まで id のまま)。
 async fn sorted_update_all_ids(runtime: &WorkerRuntime) -> Vec<i64> {
-    let sort_state = load_current_sort_state(runtime).await;
+    let sort_state = load_current_sort_state_for_writes(runtime).await;
     let mut records = runtime
-        .services
+        .write_services()
         .library
         .records()
         .await
@@ -248,7 +249,10 @@ async fn sorted_update_all_ids(runtime: &WorkerRuntime) -> Vec<i64> {
 /// Worker 側は `bundled_sites::load_site_settings` (bundle + ユーザー定義の
 /// マージ、30s L1 キャッシュ) が同じ役割。
 async fn site_settings(runtime: &WorkerRuntime) -> Vec<SiteSetting> {
-    crate::bundled_sites::load_site_settings(&runtime.objects())
+    // update/convert 投入のサイト解決と変換オプションに使う (mutation 判断)。
+    // bundle + ユーザー定義は primary 直行の更新系ストアで読み、
+    // isolate 側の設定キャッシュもバイパスする。
+    crate::bundled_sites::load_site_settings_uncached(&runtime.write_objects())
         .await
         .unwrap_or_default()
 }
@@ -267,7 +271,7 @@ async fn resolve_convert_target_to_id(
     site_settings: &[SiteSetting],
     target: &str,
 ) -> Option<i64> {
-    let library = &runtime.services.library;
+    let library = &runtime.write_services().library;
     let target = resolve_alias_target(aliases, target);
     if let Ok(id) = target.parse::<i64>() {
         // `narou convert` は `get_sync` で存在確認してから使う。
@@ -388,7 +392,7 @@ async fn resolve_update_target_to_id(
     site_settings: &[SiteSetting],
     target: &str,
 ) -> Option<i64> {
-    let library = &runtime.services.library;
+    let library = &runtime.write_services().library;
     let target = alias_to_target_for_update(aliases, target);
     if let Ok(id) = target.parse::<i64>()
         && library.get(NovelId(id)).await.ok().flatten().is_some()
@@ -567,7 +571,7 @@ async fn api_update(
         // native `api_update` は `queued` のときだけ `notification.queue` を
         // 送る (既キューイング済みで重複が弾かれたときは送らない)。
         notify_queue_changed(env, runtime).await;
-        let sort_state = load_current_sort_state(runtime).await;
+        let sort_state = load_current_sort_state_for_writes(runtime).await;
         let message = job_msgs::update_started(
             is_update_all,
             count,
@@ -825,9 +829,11 @@ async fn api_update_by_tag(
     // 同じ経路 (snapshot_ids の列) で流す。native が meta に積む
     // `tag_params`/`snapshot_ids`/`sort_by` は Worker の ledger に入らない
     // (投入時点で id 展開済みなので実行には不要)。
-    let server_sort_state = load_current_sort_state(runtime).await;
+    let server_sort_state = load_current_sort_state_for_writes(runtime).await;
+    // タグ条件のマッチングがこの後のキュー投入を形作るので、スナップ
+    // ショットの材料は更新系サービス (primary + キャッシュ無し) で読む。
     let records = runtime
-        .services
+        .write_services()
         .library
         .records()
         .await

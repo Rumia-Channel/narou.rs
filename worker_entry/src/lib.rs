@@ -314,7 +314,9 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
             Method::Delete => true,
             _ => return Response::error("Method Not Allowed", 405),
         };
-        let services = match composition::build_services(&env).await {
+        // 一括タグ付け/外しは current_sort・レコードの読み取りを更新判断へ
+        // 使うので primary 直行・キャッシュ無しのサービスで組み立てる。
+        let services = match composition::build_mutation_services(&env).await {
             Ok(services) => services,
             Err(_) => return Response::error("Service unavailable", 503),
         };
@@ -331,7 +333,7 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
         return match method {
             Method::Get => api_novel_get(req, env, id).await,
             Method::Delete => {
-                let services = match composition::build_services(&env).await {
+                let services = match composition::build_mutation_services(&env).await {
                     Ok(services) => services,
                     Err(_) => return Response::error("Service unavailable", 503),
                 };
@@ -355,7 +357,16 @@ async fn api_novel(req: Request, env: Env) -> Result<Response> {
     if !known {
         return Response::error("Not Found", 404);
     }
-    let services = match composition::build_services(&env).await {
+    // 更新系サブパス (freeze/unfreeze/tag/tags) は書き込み判断の読み取りも
+    // primary 直行にする。download.epub / illustrations は `services` を
+    // 使わないので read 系ビルドで揃えておく (実際には呼ばれない)。
+    let mutation_tail =
+        matches!(tail, "freeze" | "unfreeze" | "tag" | "tags") || tail == "tags/remove";
+    let services = match if mutation_tail {
+        composition::build_mutation_services(&env).await
+    } else {
+        composition::build_services(&env).await
+    } {
         Ok(services) => services,
         Err(_) => return Response::error("Service unavailable", 503),
     };

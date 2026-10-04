@@ -8,6 +8,8 @@
 //! 実体は core の [`SiteDefinitions`] にあり、native の `/api/sites*` と
 //! 同じ規則・同じ応答形（`{success, data|message}`）を返す。
 
+use std::sync::Arc;
+
 use narou_rs::error::Result;
 use worker::{Request, Response};
 
@@ -24,7 +26,14 @@ fn error_response(message: &str) -> Result<Response> {
 
 /// 一覧（bundle + ユーザー定義）。
 pub async fn list(runtime: &WorkerRuntime) -> Result<Response> {
-    let service = crate::bundled_sites::site_definitions(runtime.objects());
+    list_with(&runtime.objects()).await
+}
+
+/// 一覧の内部実装。直前に書き込んだ行の反映が必要な更新系ハンドラは
+/// `write_objects()` 側を渡す (セッション経由では書き込み直後の read が
+/// replica へ行き得る)。
+async fn list_with(objects: &Arc<dyn narou_rs::platform::ObjectStore>) -> Result<Response> {
+    let service = crate::bundled_sites::site_definitions(objects.clone());
     match service.list().await {
         Ok(definitions) => json(narou_rs::application::site_definitions::list_payload(
             &definitions,
@@ -51,22 +60,24 @@ pub async fn put(runtime: &WorkerRuntime, name: &str, mut request: Request) -> R
         Ok(body) => body,
         Err(error) => return error_response(&error.to_string()),
     };
-    let service = crate::bundled_sites::site_definitions(runtime.objects());
+    // put は「現在の定義を読んで検証 → write」なので primary 直行の
+    // 更新系ストアを使う (replica/キャッシュ遅延での上書き衝突を避ける)。
+    let service = crate::bundled_sites::site_definitions(runtime.write_objects());
     if let Err(error) = service.put(name, &body).await {
         return error_response(&error.to_string());
     }
     crate::bundled_sites::invalidate_site_settings();
-    list(runtime).await
+    list_with(&runtime.write_objects()).await
 }
 
 /// 削除（bundle があればそれに戻る）。
 pub async fn delete(runtime: &WorkerRuntime, name: &str) -> Result<Response> {
-    let service = crate::bundled_sites::site_definitions(runtime.objects());
+    let service = crate::bundled_sites::site_definitions(runtime.write_objects());
     if let Err(error) = service.delete(name).await {
         return error_response(&error.to_string());
     }
     crate::bundled_sites::invalidate_site_settings();
-    list(runtime).await
+    list_with(&runtime.write_objects()).await
 }
 
 /// ルートから呼ぶ入口（認証は呼び出し側で済ませる）。

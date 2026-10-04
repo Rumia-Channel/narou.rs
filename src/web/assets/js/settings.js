@@ -818,6 +818,7 @@
     applyLoadedTheme();
     renderTabs();
     renderTabContent();
+    await loadStorageMode();
     restoreActiveTab(preferredTabId);
   }
 

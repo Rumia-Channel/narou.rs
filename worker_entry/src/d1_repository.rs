@@ -262,11 +262,27 @@ impl NovelRepository for D1NovelRepository {
 #[derive(Debug, Clone)]
 pub struct D1FreezeStore {
     db: DbHandle,
+    /// `Self::for_writes` は `frozen_ids` がキャッシュを介さず読む
+    /// (`D1SettingsStore::for_writes` と同じく、読み取りが書き込み判断の
+    /// 材料になる経路で古い凍結集合を使わないため)。
+    fresh_reads: bool,
 }
 
 impl D1FreezeStore {
     pub fn new(db: DbHandle) -> Self {
-        Self { db }
+        Self {
+            db,
+            fresh_reads: false,
+        }
+    }
+
+    /// 更新判断の読み取り用。`frozen_ids` が isolate キャッシュを介さず
+    /// ハンドル先を読む。
+    pub fn for_writes(db: DbHandle) -> Self {
+        Self {
+            db,
+            fresh_reads: true,
+        }
     }
 }
 
@@ -278,8 +294,9 @@ static FROZEN_IDS_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<HashSe
 
 impl FreezeStore for D1FreezeStore {
     fn frozen_ids<'a>(&'a self) -> PlatformFuture<'a, Result<HashSet<i64>>> {
+        let fresh_reads = self.fresh_reads;
         Box::pin(async move {
-            if let Some(cached) = FROZEN_IDS_CACHE.get("frozen") {
+            if !fresh_reads && let Some(cached) = FROZEN_IDS_CACHE.get("frozen") {
                 return Ok(cached);
             }
             let rows: Vec<IdRow> = self
@@ -354,11 +371,30 @@ const TAG_COLORS_CACHE_KEY: &str = "inv/tag_colors";
 #[derive(Debug, Clone)]
 pub struct D1SettingsStore {
     db: DbHandle,
+    /// 更新系ストア (`Self::for_writes`) は `load` で isolate キャッシュを
+    /// 読まない。`save` の全文 DELETE+INSERT は読んだ map をそのまま書き戻す
+    /// ため、読み取りが古いと同時期の他 isolate の変更を上書き消しする。
+    /// 変更要件の読み取りは常にハンドル先 (mutation 組立では primary) から
+    /// 取る。`save` 側のキャッシュ無効化は変わらない。
+    fresh_reads: bool,
 }
 
 impl D1SettingsStore {
+    /// UI 読み取り系のストア。`load` は isolate キャッシュ (30 秒 TTL) を使う。
     pub fn new(db: DbHandle) -> Self {
-        Self { db }
+        Self {
+            db,
+            fresh_reads: false,
+        }
+    }
+
+    /// 更新系のストア。`load` がキャッシュを介さずハンドル先を読むので、
+    /// read-modify-write が読み取り時点の最新値を基にする。
+    pub fn for_writes(db: DbHandle) -> Self {
+        Self {
+            db,
+            fresh_reads: true,
+        }
     }
 
     fn scope_name(scope: SettingScope) -> &'static str {
@@ -371,9 +407,10 @@ impl D1SettingsStore {
 
 impl SettingsStore for D1SettingsStore {
     fn load<'a>(&'a self, scope: SettingScope) -> PlatformFuture<'a, Result<HashMap<String, YamlValue>>> {
+        let fresh_reads = self.fresh_reads;
         Box::pin(async move {
             let scope_name = Self::scope_name(scope);
-            if let Some(cached) = SETTINGS_CACHE.get(scope_name) {
+            if !fresh_reads && let Some(cached) = SETTINGS_CACHE.get(scope_name) {
                 return Ok((*cached).clone());
             }
             let rows: Vec<StateRow> = self
@@ -481,11 +518,27 @@ impl SettingsStore for D1SettingsStore {
 #[derive(Debug, Clone)]
 pub struct D1TagColorStore {
     db: DbHandle,
+    /// `Self::for_writes` は `load` がキャッシュを介さず読む
+    /// (`TagColorService::set` は load→save の read-modify-write なので、
+    /// 変更要件の読み取りで古い色表を使わないため)。
+    fresh_reads: bool,
 }
 
 impl D1TagColorStore {
     pub fn new(db: DbHandle) -> Self {
-        Self { db }
+        Self {
+            db,
+            fresh_reads: false,
+        }
+    }
+
+    /// 更新系の読み取り用。`load` が isolate キャッシュを介さずハンドル先を
+    /// 読む。
+    pub fn for_writes(db: DbHandle) -> Self {
+        Self {
+            db,
+            fresh_reads: true,
+        }
     }
 }
 
@@ -495,8 +548,9 @@ static TAG_COLORS_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<TagCol
 
 impl TagColorStore for D1TagColorStore {
     fn load<'a>(&'a self) -> PlatformFuture<'a, Result<TagColors>> {
+        let fresh_reads = self.fresh_reads;
         Box::pin(async move {
-            if let Some(cached) = TAG_COLORS_CACHE.get(TAG_COLORS_CACHE_KEY) {
+            if !fresh_reads && let Some(cached) = TAG_COLORS_CACHE.get(TAG_COLORS_CACHE_KEY) {
                 return Ok(cached);
             }
             let rows: Vec<TagColorRow> = self
