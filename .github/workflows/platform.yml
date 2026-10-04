@@ -142,6 +142,9 @@ jobs:
         with:
           path: ~/.cache/worker-build
           key: worker-build-${{ runner.os }}-${{ env.WORKER_BUILD_VERSION }}
+      # CI のレンダリング契約 (Secrets Store の組み合わせ検証) もここで確認する。
+      # 認証情報・ネットワーク不要の unittest だけを走らせる。
+      - run: python3 -m unittest discover -s tests -p 'test_ci_*.py'
       # tests/run.mjs builds, applies the local D1 migrations, starts
       # `wrangler dev` and runs the contract checks (health, fail-closed auth,
       # library/jobs APIs, and a queue-backed Convert job reaching a terminal
@@ -226,8 +229,8 @@ jobs:
       NAROU_S3_REGION_SECRET_NAME: ${{ secrets.NAROU_S3_REGION_SECRET_NAME || vars.NAROU_S3_REGION_SECRET_NAME }}
       NAROU_S3_BUCKET_SECRET_NAME: ${{ secrets.NAROU_S3_BUCKET_SECRET_NAME || vars.NAROU_S3_BUCKET_SECRET_NAME }}
       # トークンと復号鍵も Secrets Store に置く場合だけ設定する。
-      NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
-      NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
+      NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ secrets.NAROU_ADMIN_TOKEN_SECRET_NAME || vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
+      NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ secrets.NAROU_RS_LOGIN_KEY_SECRET_NAME || vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
       # Zero Trust (Cloudflare Access) を境界にする場合は false にする。
       NAROU_AUTH_REQUIRED: ${{ vars.NAROU_AUTH_REQUIRED || 'true' }}
       # Access の service token (custom domain 越しに smoke を流す場合だけ)。
@@ -397,8 +400,8 @@ jobs:
       NAROU_S3_REGION_SECRET_NAME: ${{ secrets.NAROU_S3_REGION_SECRET_NAME || vars.NAROU_S3_REGION_SECRET_NAME }}
       NAROU_S3_BUCKET_SECRET_NAME: ${{ secrets.NAROU_S3_BUCKET_SECRET_NAME || vars.NAROU_S3_BUCKET_SECRET_NAME }}
       # トークンと復号鍵も Secrets Store に置く場合だけ設定する。
-      NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
-      NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
+      NAROU_ADMIN_TOKEN_SECRET_NAME: ${{ secrets.NAROU_ADMIN_TOKEN_SECRET_NAME || vars.NAROU_ADMIN_TOKEN_SECRET_NAME }}
+      NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ secrets.NAROU_RS_LOGIN_KEY_SECRET_NAME || vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
       # Zero Trust (Cloudflare Access) を境界にする場合は false にする。
       NAROU_AUTH_REQUIRED: ${{ vars.NAROU_AUTH_REQUIRED || 'true' }}
       # Access の service token (custom domain 越しに smoke を流す場合だけ)。

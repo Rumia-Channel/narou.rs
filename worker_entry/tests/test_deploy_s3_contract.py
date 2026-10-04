@@ -111,9 +111,48 @@ class DeploymentFlowTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             deploy.main()
 
-    def test_missing_bearer_for_store_only_auth_fails_before_provision(self):
+    def store_only_responder(self, *, probe_status=401):
+        def respond(request, timeout=None):
+            path = request.full_url
+            if path.endswith("/health/live"):
+                return FakeResponse({
+                    "status": "alive",
+                    "authentication_required": True,
+                    "authentication_configured": True,
+                })
+            if path.endswith("/health/ready"):
+                return FakeResponse({"status": "ready"})
+            if probe_status == 401:
+                raise urllib.error.HTTPError(
+                    path, 401, "Unauthorized", {},
+                    io.BytesIO(b'{"error":{"code":"authentication_required"}}'),
+                )
+            return FakeResponse(VERIFIED, probe_status)
+        return respond
+
+    def test_store_only_token_skips_authenticated_checks_but_verifies_health(self):
+        # Secrets Store values cannot be read back, so a store-only admin token
+        # means authenticated probes skip with a notice; health and the
+        # unauthenticated 401 still verify the deployment.
         os.environ.pop("NAROU_ADMIN_TOKEN")
         os.environ["NAROU_ADMIN_TOKEN_SECRET_NAME"] = "runtime-token"
+        self.http.return_value.open.side_effect = self.store_only_responder()
+        deploy.main()
+        self.calls.deploy.assert_called_once()
+        self.calls.smoke.assert_called_once()
+        self.assertIsNone(self.calls.summary.call_args.kwargs["s3_ok"])
+
+    def test_store_only_token_fails_when_probe_answers_without_auth(self):
+        # If the authenticated probe answers 200 without a token, the worker is
+        # not fail-closed and the deploy must fail rather than report a skip.
+        os.environ.pop("NAROU_ADMIN_TOKEN")
+        os.environ["NAROU_ADMIN_TOKEN_SECRET_NAME"] = "runtime-token"
+        self.http.return_value.open.side_effect = self.store_only_responder(probe_status=200)
+        with self.assertRaises(SystemExit):
+            deploy.main()
+
+    def test_missing_bearer_and_no_store_binding_fails_before_provision(self):
+        os.environ.pop("NAROU_ADMIN_TOKEN")
         with self.assertRaises(SystemExit):
             deploy.main()
         self.calls.provision.assert_not_called()

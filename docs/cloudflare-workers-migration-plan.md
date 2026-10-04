@@ -342,11 +342,16 @@ phase と対象を持たない共通カーソル/`done` は移行完了の証明
 | `NAROU_ADMIN_TOKEN` | secret `NAROU_ADMIN_TOKEN` | `NAROU_ADMIN_TOKEN_SECRET_NAME` | 同上（既定は `--secrets-file` で入れる secret のみ） |
 | `NAROU_RS_LOGIN_KEY` | secret `NAROU_RS_LOGIN_KEY` | `NAROU_RS_LOGIN_KEY_SECRET_NAME` | 同上 |
 
-- 選び方は値ごとではなく**モード単位**。`NAROU_SECRETS_STORE_ID` か `NAROU_S3_*_SECRET_NAME` を
-  1 つでも設定したら (b) になり、S3 の 5 値は **5 つ揃えて**書く必要がある（欠けると失敗）。
-  何も書かなければ全部 (a)（`NAROU_S3_ENDPOINT` / `REGION` / `BUCKET` が必須）。
-- `NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME` だけは (b) の中でも独立に
-  選べる（S3 は (a) のままトークンだけストア、が可能）。
+- S3 の保存先はモード単位で選ぶ。`NAROU_S3_*_SECRET_NAME` を 1 つでも
+  設定したら (b) になり、S3 の 5 値と `NAROU_SECRETS_STORE_ID` を揃える。
+  S3 の secret 名が無ければ (a)（`NAROU_S3_ENDPOINT` / `REGION` / `BUCKET` が必須）。
+- `NAROU_ADMIN_TOKEN_SECRET_NAME` / `NAROU_RS_LOGIN_KEY_SECRET_NAME` は S3 と独立。
+  `NAROU_SECRETS_STORE_ID` と組み合わせ、S3 は (a) のままトークンだけストアに置ける。
+- 認証が有効で管理トークンが Secrets Store にしか無い場合、CI は値を読み戻せない。
+  配備後は health/live・health/ready と未認証 API の 401 を検査し、認証付き S3 LIST と
+  契約 smoke は「省略」と明示する（成功とは扱わない）。全検査を実行するには
+  CI の secret `NAROU_ADMIN_TOKEN` にも同じ値を渡す。Access の前段認証は別途
+  `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` が必要で、403 を成功に変えない。
 - **`wrangler.<target>.toml` に直書きする運用も可**（参考実装の Dantalian はこの形で、`store_id` を
   3 テンプレートに直書きし、`secret_name` だけ CI から差し込んでいる）。直書きする場合は CI の
   `NAROU_SECRETS_STORE_ID` / `NAROU_S3_*_SECRET_NAME` は設定しない（両方書くとバインディングが

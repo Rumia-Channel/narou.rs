@@ -59,6 +59,9 @@ command = "node build_assets.mjs && worker-build --release"
 #   2. CI から差し込む。このブロックはコメントのままにし、GitHub の `Cloudflare`
 #      環境に `NAROU_SECRETS_STORE_ID` と 5 つの `NAROU_S3_*_SECRET_NAME` を置く
 #      （アカウント固有の値をリポジトリに置かずに済む）。
+#   S3 の 5 つは全部揃えるか全部省略か。`NAROU_ADMIN_TOKEN_SECRET_NAME` /
+#   `NAROU_RS_LOGIN_KEY_SECRET_NAME` は単独でも使える（S3 を vars のまま
+#   トークンだけストアに置く）。
 #
 # [[secrets_store_secrets]]
 # binding = "S3_ACCESS_KEY_ID_STORE"

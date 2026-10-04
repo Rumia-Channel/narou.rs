@@ -1,0 +1,8 @@
+# Worker consistency repairs (2026-10-04)
+- UI GET metadata keeps first-unconstrained D1 sessions and isolate caches. Mutation pre-reads use primary and fresh settings/freeze/tag-color stores (`for_writes`), via write_services/write_objects or build_mutation_services. Avoid replica/cached whole-scope writeback. General settings remain load/modify/save: simultaneous fresh writes are not a scope-level transaction.
+- Notepad POST uses primary read and conditional UPSERT comparing original value_yaml/value_json; same object_id competing saves yield one success, one conflict with latest content. Read errors abort save.
+- settings.js reloadSettingsView invokes loadStorageMode after render; fixed Worker environment hides SQLite/YAML buttons and no longer stays loading.
+- contract.mjs unconfigured auth assertion uses test directly, not the check helper that skips normal tests. Local smoke observed HTTP500 authentication_not_configured, 93 normal contracts passed including notepad race.
+- CI renderer permits token/key-only Secrets Store with ordinary S3 vars; S3 store names still all-or-nothing. Store-only admin token: health/ready and unauthenticated401 verified; authenticated S3 LIST/smoke explicitly skipped, not marked success (provide same token in CI for full checks). Access403 remains failure.
+- Existing develop CI run37164602466 deployed but post-deploy S3 probe failed403; CF Access service-token credentials missing. Do not disable gate.
+- COMMANDS.md web stays partial; docs/worker-ui-latency.md and cloudflare-workers-migration-plan.md updated. No dependencies/migrations added.
