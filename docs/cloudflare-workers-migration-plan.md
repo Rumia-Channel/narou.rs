@@ -223,6 +223,9 @@ native 側の互換のために残し、**Workers 側の保存形式には使わ
 
 ### 2.2.5 挿絵の D1→S3 移行 (P0d, 2026-09-26 実装)
 
+**切替の制限**: 以下は既存ツールの操作説明であり、安全な本番切替の完了証明ではない。
+phase と対象を持たない共通カーソル/`done` は移行完了の証明にならない。今回の CI は開発用旧挿絵を移行せず切り替える（末尾の「S3 必須配備」を参照）。
+
 - `asset_backend` を `s3` に切り替える**前に** `POST /api/admin/object-migration {"action":"copy"}` を
   繰り返し呼ぶ。1 回 `limit` 件 (既定 100・上限 500) で区切り、`app_state` のカーソルで再開する。
   `verify` は 1 件ずつ突き合わせ、欠落・不一致・上限超過を `failed` に集める。
@@ -588,3 +591,31 @@ npx wrangler deploy --config wrangler.ci.toml --secrets-file <json>
   `/api/admin/object-migration`。挿絵だけを D1 から S3 へ写し、`copy` / `verify` / `status` を持つ。
   進捗は `app_state('inv','migrate_illustrations')` のカーソルで再開できる。
 - **未着手 (P0d の残り)**: 本文の行構造化 (「テキスト blob → セクション行」) と raw を書かない経路。
+
+## S3 必須配備
+
+CI の develop/production テンプレートは `NAROU_REQUIRE_S3="true"` を固定する。
+管理・本文・設定は D1 のまま、挿絵は旧 `asset_backend=d1` または未設定でも S3 を選択する。
+これは開発用 D1 挿絵を移行せず切り替える方針であり、D1 の既存行を物理削除しない。
+旧挿絵の代替読取や自動コピーは行わない。S3 に無い旧挿絵は表示・EPUBへ埋め込まれない。
+旧 Worker の書込みが残っても、それを S3 へ移行したとは扱わない。
+
+保存済み marker は canonical JSON 文字列と既存の raw TEXT `d1`/`s3` を受け付ける。
+未知の値、SQL NULL、読取失敗、必須フラグの不正値は拒否する。
+S3 資格情報が無い・LIST などの要求が失敗する場合にも D1 へ fallback しない。
+ローカルの移行検証用構成では必須フラグなし・選択行なしに限り従来の D1 を維持する。
+
+旧実装では `value_json` の JSON 復号を欠いたため、JSON 文字列 `"s3"` で
+D1 を選んだ可能性がある。raw TEXT `s3` は旧実装でも S3 を選択できる。
+実運用の行形式は未確認であり、今回の変更は実際の過去保存先を断定しない。
+
+配備後は認証済み `/api/storage/mode?probe=s3` により、実際の選択が S3、
+必須フラグが true、S3 の LIST が成功することを確認する。
+一般 smoke を省略しても、この検査は省略しない。Access/DNS/認証で到達不能なら失敗する。
+LIST は読取のみ・最大1件で、キーや資格情報、プロバイダー本文を応答やログに出さない。
+HTTP200でも正しい ListBucketResult の外側要素が無い応答は成功としない。
+この確認は GET/PUT 権限や既存データの移行完了を証明せず、SORAHOST の署名403解消も主張しない。
+
+`SORAHOST=T` の通常 push は従来通り Workers を配備しない。明示的な
+`workflow_dispatch` で `run_workers=true` を選んだときだけ、wasm/Worker/contract/relay と
+選択した target の配備を実行する。入力の既定は false で、変数・資格情報・権限は変更しない。

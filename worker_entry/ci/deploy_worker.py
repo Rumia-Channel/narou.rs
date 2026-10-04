@@ -4,9 +4,14 @@
 
 1. D1 と Queue を冪等に用意する（`ci/provision_resources.py`）
 2. `wrangler.ci.toml` をレンダリングする（`ci/render_config.py`）
-3. リモート D1 に migration を適用する
+3. リモート D1 に schema migration を適用する
 4. secret を `--secrets-file` で投入してデプロイする
-5. デプロイ先の URL に対して契約テストを流す（smoke。`NAROU_SMOKE=0` で省略）
+5. 認証済み診断 API で実際の S3 backend と LIST を検証する（省略不可）
+6. デプロイ先の URL に対して契約テストを流す（smoke。`NAROU_SMOKE=0` で省略）
+
+CI は NAROU_REQUIRE_S3=true 固定。旧 D1 の挿絵との互換性は維持せず、
+runtime が挿絵の保存先を S3 に固定する。既存 D1 のマーカーや挿絵行を検査・
+変更・削除しない。メタデータと本文は引き続き D1 に置く。
 
 必須の環境変数:
 
@@ -18,6 +23,7 @@
 任意:
 
 - `NAROU_ADMIN_TOKEN` … Worker の API トークン（`--secrets-file` で投入）。
+  Bearer 認証が有効なら、Secrets Store を使う場合も CI の診断認証に必要。
   `NAROU_AUTH_REQUIRED=false`（Zero Trust を境界にする）ときは不要。
 - `NAROU_RS_LOGIN_KEY` … 資格情報の at-rest 鍵（base64 32 バイト）。無い場合は
   平文の行だけを読む。
@@ -33,18 +39,22 @@
 - `SERVICE_DOMAIN` / `DEVELOP_DOMAIN` … custom domain。secret を推奨（ログへ出さない）
 - `NAROU_DEPLOY_URL` … smoke の宛先を明示する（既定は domain → workers.dev）
 - `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` … Access の service token。
-  未設定で Access に弾かれた場合は smoke を省略する。
+  Access に遮られた場合、必須 S3 検証は失敗する。DNS/TLS エラーも省略しない。
 
 ローカルからは実行しない（Cloudflare の資格情報が要る）。CI からのみ呼ぶ。
 """
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import NoReturn
 
@@ -91,6 +101,75 @@ def required(name: str) -> str:
     if not value:
         fail(f"{name} is required")
     return value
+
+
+def require_probe_auth() -> None:
+    """必須の配備後診断に使う認証を、リソースの変更より前に検証する。"""
+    if auth_required() and not os.environ.get("NAROU_ADMIN_TOKEN", "").strip():
+        fail("NAROU_ADMIN_TOKEN is required for the mandatory S3 deployment check, including Secrets Store deployments")
+    access_id = os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()
+    access_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET", "").strip()
+    if bool(access_id) != bool(access_secret):
+        fail("CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET must be supplied together")
+    for name in ("NAROU_ADMIN_TOKEN", "CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET"):
+        value = os.environ.get(name, "").strip()
+        if any(ord(character) < 32 or ord(character) > 126 for character in value):
+            fail(f"{name} must be a valid ASCII HTTP header value")
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """認証ヘッダを別の宛先や Access のログイン画面へ送らない。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def verify_s3(base_url: str) -> None:
+    """選択済み S3 handle の実 LIST を確認する。失敗・未実行は成功扱いしない。"""
+    require_probe_auth()
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+                or parsed.password is not None or parsed.query or parsed.fragment
+                or any(ord(character) <= 32 for character in base_url)):
+            raise ValueError
+        parsed.port  # Validate any explicit port before building authenticated headers.
+    except ValueError:
+        fail("S3 verification requires an HTTPS deployment URL without credentials, query or fragment")
+    headers = {"Accept": "application/json"}
+    token = os.environ.get("NAROU_ADMIN_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    access_id = os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()
+    if access_id:
+        headers["CF-Access-Client-Id"] = access_id
+        headers["CF-Access-Client-Secret"] = os.environ["CF_ACCESS_CLIENT_SECRET"].strip()
+    request = urllib.request.Request(
+        urllib.parse.urljoin(base_url, "/api/storage/mode?probe=s3"),
+        headers=headers,
+        method="GET",
+    )
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+            if response.status != 200:
+                fail(f"S3 verification failed (HTTP {response.status}); deployment is not verified")
+            raw = response.read(16 * 1024 + 1)
+    except urllib.error.HTTPError as error:
+        fail(f"S3 verification failed (HTTP {error.code}); check Worker/Access authentication and S3 configuration")
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
+        fail("S3 verification could not reach the deployment; check DNS/TLS/network. Deployment is not verified")
+    if len(raw) > 16 * 1024:
+        fail("S3 verification returned an oversized response; deployment is not verified")
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeError):
+        fail("S3 verification returned invalid JSON; deployment is not verified")
+    if (not isinstance(payload, dict) or payload.get("success") is not True
+            or payload.get("metadata_backend") != "d1"
+            or payload.get("illustration_backend") != "s3" or payload.get("s3_required") is not True
+            or payload.get("s3_list") != "ok"):
+        fail("S3 verification did not confirm D1 metadata, required S3 illustrations and a successful S3 LIST")
+    print("S3 deployment check: selected backend and read-only LIST verified")
 
 
 def provision(target: str) -> dict[str, str]:
@@ -276,11 +355,12 @@ def smoke(base_url: str) -> bool | None:
     return result.returncode == 0
 
 
-def summary(target: str, url: str, smoke_ok: bool | None, *, hidden_url: bool = False) -> None:
+def summary(target: str, url: str, smoke_ok: bool | None, *, hidden_url: bool = False, s3_ok: bool = False) -> None:
     lines = [
         f"### Worker deploy ({target})",
         "",
         f"- URL: {'（custom domain。ログでは伏せています）' if hidden_url else url}",
+        f"- S3 backend + LIST: {'ok' if s3_ok else 'not verified'}",
         f"- smoke: {'ok' if smoke_ok else 'skipped' if smoke_ok is None else 'failed'}",
     ]
     path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -298,10 +378,11 @@ def main() -> None:
     # 資格情報は早めに検証する（デプロイ途中で落ちないように）。
     required("CLOUDFLARE_ACCOUNT_ID")
     required("CLOUDFLARE_API_TOKEN")
+    require_probe_auth()
 
     resources = provision(target)
-    enable_read_replication(resources)
     database = render(target, resources)
+    enable_read_replication(resources)
     run(
         [
             "npx",
@@ -325,16 +406,17 @@ def main() -> None:
             secrets.unlink(missing_ok=True)
 
     target_url, hidden_url = smoke_url(target, url)
+    if target_url is None:
+        fail("Mandatory S3 verification needs a deployment URL; configure NAROU_DEPLOY_URL or a deployment domain")
+    verify_s3(target_url)
     smoke_result: bool | None = None
     if os.environ.get("NAROU_SMOKE", "1") == "0":
         pass
-    elif target_url is None:
-        print("::notice::smoke の宛先が分からないため省略しました (NAROU_DEPLOY_URL で指定できます)")
     else:
         smoke_result = smoke(target_url)
-    summary(target, target_url or url or "(unknown)", smoke_result, hidden_url=hidden_url)
+    summary(target, target_url, smoke_result, hidden_url=hidden_url, s3_ok=True)
     if smoke_result is False:
-        fail(f"smoke test failed against {target_url}")
+        fail("smoke test failed against the deployment")
 
 
 if __name__ == "__main__":

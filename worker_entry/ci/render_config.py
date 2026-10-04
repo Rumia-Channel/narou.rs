@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import tomllib
 from pathlib import Path
 from typing import NoReturn
 from uuid import UUID
@@ -199,6 +200,15 @@ def main() -> None:
     if remaining:
         names = ", ".join(sorted(set(remaining)))
         fail(f"{template_path.name} still contains unresolved placeholders: {names}")
+
+    # CI は必ず挿絵を S3 へ保存する。ローカル wrangler.toml の互換モードと
+    # 分け、環境変数やテンプレートの編集でこの契約を無効化させない。
+    try:
+        config = tomllib.loads(template)
+    except tomllib.TOMLDecodeError:
+        fail(f"{template_path.name} is not valid TOML")
+    if config.get("vars", {}).get("NAROU_REQUIRE_S3") != "true":
+        fail(f'{template_path.name} must set vars.NAROU_REQUIRE_S3 = "true" for CI')
 
     output_path = WORKER_DIR / "wrangler.ci.toml"
     output_path.write_text(template, encoding="utf-8")

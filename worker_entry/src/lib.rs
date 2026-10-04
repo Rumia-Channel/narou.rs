@@ -29,6 +29,7 @@ mod object_migration;
 mod rate_limiter;
 mod scheduler;
 mod s3_store;
+mod storage_probe;
 mod site_rate_limiter;
 use subtle::ConstantTimeEq;
 use webui::{json_error, query_param};

@@ -961,6 +961,92 @@ mod tests {
     }
 
     #[test]
+    fn list_page_rejects_non_listing_success_bodies() {
+        for body in [
+            "",
+            " \r\n\t ",
+            "<html><body>PRIVATE_BODY_SENTINEL</body></html>",
+            "<Error><Code>AccessDenied</Code><Message>PRIVATE_BODY_SENTINEL</Message></Error>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated>",
+            "<ListBucketResult></OtherResult>",
+            "<s3:ListBucketResult xmlns:s3=\"urn:s3\"></other:ListBucketResult>",
+            "<:ListBucketResult></:ListBucketResult>",
+            "<a:b:ListBucketResult></a:b:ListBucketResult>",
+            "<html><ListBucketResult></ListBucketResult></html>",
+            "<!-- <ListBucketResult></ListBucketResult> -->",
+            "<![CDATA[<ListBucketResult></ListBucketResult>]]>",
+            "<ListBucketResult><!-- </ListBucketResult>",
+            "<ListBucketResult><![CDATA[</ListBucketResult>",
+            "<ListBucketResult></ListBucketResult>PRIVATE_BODY_SENTINEL",
+            "<ListBucketResult></ListBucketResult><ListBucketResult></ListBucketResult>",
+        ] {
+            let error = match list_page_from_response(body) {
+                Ok(_) => panic!("a non-listing HTTP 200 response must fail"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, NarouError::Platform(ref message)
+                if message == "ListObjectsV2 response has an invalid ListBucketResult envelope"));
+        }
+    }
+
+    #[test]
+    fn list_page_accepts_empty_listing_envelope_variants() {
+        for body in [
+            "<ListBucketResult></ListBucketResult>",
+            "<ListBucketResult/>",
+            "<ListBucketResult><!-- </ListBucketResult> --></ListBucketResult>",
+            "<ListBucketResult><![CDATA[</ListBucketResult>]]></ListBucketResult>",
+            "<ListBucketResult note=\"a > b\"><IsTruncated>false</IsTruncated></ListBucketResult>",
+            "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>false</IsTruncated></ListBucketResult>\n",
+            "<s3:ListBucketResult xmlns:s3=\"http://s3.amazonaws.com/doc/2006-03-01/\"><s3:IsTruncated>false</s3:IsTruncated></s3:ListBucketResult>",
+            "<s3:ListBucketResult xmlns:s3=\"http://s3.amazonaws.com/doc/2006-03-01/\" />",
+        ] {
+            let page = list_page_from_response(body).unwrap();
+            assert!(page.objects.is_empty());
+            assert!(page.next_cursor.is_none());
+        }
+    }
+
+    #[test]
+    fn list_page_accepts_populated_namespace_variants() {
+        for (prefix, second) in [("", ""), ("s3:", "s3:"), ("s3:", "")] {
+            let namespace = if prefix.is_empty() { "xmlns" } else { "xmlns:s3" };
+            let body = format!(
+                "<?xml version=\"1.0\"?><{prefix}ListBucketResult {namespace}=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <{prefix}IsTruncated>true</{prefix}IsTruncated>\
+                 <{prefix}NextContinuationToken>next%2Ftoken</{prefix}NextContinuationToken>\
+                 <{prefix}Contents><{prefix}Key>narou/test/novels/a%20%26%20b.yaml</{prefix}Key>\
+                 <{prefix}Size>12</{prefix}Size><{prefix}ETag>&quot;etag&quot;</{prefix}ETag></{prefix}Contents>\
+                 <{second}Contents><{second}Key>narou/test/novels/c.yaml</{second}Key>\
+                 <{second}Size>34</{second}Size></{second}Contents>\
+                 </{prefix}ListBucketResult>"
+            );
+            let page = list_page_from_response(&body).unwrap();
+            assert_eq!(page.objects.len(), 2);
+            assert_eq!(page.objects[0].key.as_ref(), "novels/a & b.yaml");
+            assert_eq!(page.objects[0].size, 12);
+            assert_eq!(page.objects[0].etag.as_deref(), Some("etag"));
+            assert_eq!(page.objects[1].key.as_ref(), "novels/c.yaml");
+            assert_eq!(page.objects[1].size, 34);
+            assert_eq!(page.next_cursor.as_deref(), Some("next/token"));
+        }
+    }
+
+    fn list_page_from_response(body: &str) -> Result<ObjectListPage> {
+        let http = Arc::new(MockHttpClient::new());
+        let store = store(http.clone());
+        let request = ObjectListRequest::new(
+            ObjectPrefix::new("novels/").unwrap(),
+            std::num::NonZeroUsize::new(10).unwrap(),
+        );
+        let url = store.location.list_url(request.prefix.as_ref(), 10, None);
+        http.add_text(&url, 200, body);
+        let result = futures::executor::block_on(ObjectStore::list_page(&store, &request));
+        assert_eq!(http.requested_urls(), vec![format!("GET {url}")]);
+        result
+    }
+
+    #[test]
     fn list_page_redacts_s3_error_body() {
         let http = Arc::new(MockHttpClient::new());
         http.add_response(

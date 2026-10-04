@@ -30,6 +30,10 @@ use crate::http::WorkerHttpClient;
 use crate::ledger::{D1JobLedger, D1SchedulerCheckpoint};
 use crate::rate_limiter::WorkerRateLimiter;
 
+#[path = "asset_backend.rs"]
+mod asset_backend;
+use asset_backend::AssetBackend;
+
 /// Result of the complete ledger + Queue producer operation for one plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchOutcome {
@@ -104,35 +108,51 @@ enum CompositionProfile {
 /// 可能性があるため、他キャッシュ (30 秒) より短い 5 秒にしておく
 /// (`/api/storage/mode` は 501 で Worker からは書き換わらないが、手動 SQL
 /// などで切り替えた直後のずれを最小化する)。
-static ASSET_BACKEND_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<Option<String>>> =
+static ASSET_BACKEND_CACHE: std::sync::LazyLock<crate::isolate_cache::TtlMap<AssetBackend>> =
     std::sync::LazyLock::new(|| crate::isolate_cache::TtlMap::new(5_000.0));
 
-/// 挿絵の保存先を読む。未設定・読み取り失敗は `None` (= D1 扱い)。
+/// 挿絵の保存先を読む。D1 の TEXT は JSON を含む文字列なので明示的に
+/// decode する。旧構成の raw TEXT `d1` / `s3` も明示的に受け付ける。
+/// 読み取り失敗・不正値は起動失敗で、D1 に落とさない。
 ///
-/// 保存先は `app_state('inv','asset_backend')` の 1 行で決める。`s3` 以外は
-/// 挿絵も D1 に置くので、切り替えはこの行を書き換えるだけでよい。
-/// 本文・メタデータは常に D1 (`SplitStore` が振り分ける)。
-async fn read_asset_backend(db: &DbHandle) -> Option<String> {
+/// 行が無い standalone の旧構成だけは D1 とする。CI 構成では後段の
+/// `NAROU_REQUIRE_S3=true` が D1・未設定を含む有効な選択を S3 に解決する。
+async fn read_asset_backend(db: &DbHandle) -> worker::Result<AssetBackend> {
     if let Some(cached) = ASSET_BACKEND_CACHE.get("asset_backend") {
-        return cached;
+        return Ok(cached);
     }
     let statement = db
         .prepare("SELECT value_json FROM app_state WHERE scope = 'inv' AND key = 'asset_backend'");
-    let value = statement
-        .first::<serde_json::Value>(Some("value_json"))
-        .await
-        .ok()
-        .flatten()?;
-    let resolved = value.as_str().map(str::to_string);
-    ASSET_BACKEND_CACHE.put("asset_backend", resolved.clone());
-    resolved
+    let row = statement
+        .first::<asset_backend::AssetBackendRow>(None)
+        .await;
+    let resolved = asset_backend::parse_asset_backend(row.map_err(|_| ()))
+        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+    ASSET_BACKEND_CACHE.put("asset_backend", resolved);
+    Ok(resolved)
+}
+
+/// Read the non-secret deployment guard without treating invalid bindings as
+/// absent. Only an undefined binding preserves the standalone legacy policy.
+pub(crate) fn required_s3(env: &Env) -> worker::Result<bool> {
+    let value = js_sys::Reflect::get(env, &wasm_bindgen::JsValue::from_str("NAROU_REQUIRE_S3"))
+        .map_err(|_| worker::Error::RustError("failed to read NAROU_REQUIRE_S3".to_string()))?;
+    let value = if value.is_undefined() {
+        None
+    } else {
+        Some(value.as_string().ok_or_else(|| {
+            worker::Error::RustError(asset_backend::BackendError::InvalidRequirement.to_string())
+        })?)
+    };
+    asset_backend::required_s3(value.as_deref())
+        .map_err(|error| worker::Error::RustError(error.to_string()))
 }
 
 /// オブジェクトの保存先を組み立てる。
 ///
-/// 移行期間中は `app_state` の 1 行で D1 と S3 を切り替える。S3 が選ばれて
-/// いて資格情報が欠けている場合は起動を失敗させ、黙って D1 へ落とさない
-/// (fail-closed)。
+/// `NAROU_REQUIRE_S3=true` は検証済みの保存先を S3 に解決し、保存済みの
+/// marker・D1 の本文・挿絵の行は変更しない。資格情報が欠けている場合は
+/// 起動を失敗させ、黙って D1 へ落とさない (fail-closed)。
 async fn build_object_stores(
     env: &Env,
     db: &DbHandle,
@@ -142,18 +162,20 @@ async fn build_object_stores(
     Arc<dyn AssetStore>,
     Option<Arc<S3Store>>,
 )> {
+    let required = required_s3(env)?;
+    let backend = read_asset_backend(db).await?.resolve(required);
     let d1: Arc<D1ObjectStore> = Arc::new(D1ObjectStore::new(db.clone()));
     let mut s3_handle: Option<Arc<S3Store>> = None;
     let illustrations: (Arc<dyn ObjectStore>, Arc<dyn AssetStore>) =
-        match read_asset_backend(db).await.as_deref() {
+        match backend {
             // S3 が選ばれていて資格情報が欠けている場合は起動を失敗させ、
             // 黙って D1 へ落とさない (fail-closed)。
-            Some("s3") => {
+            AssetBackend::S3 => {
                 let store: Arc<S3Store> = crate::s3_store::store_from_env(env, subrequests).await?;
                 s3_handle = Some(store.clone());
                 (store.clone(), store)
             }
-            _ => (d1.clone(), d1.clone()),
+            AssetBackend::D1 => (d1.clone(), d1.clone()),
         };
     let split: Arc<SplitStore> = Arc::new(SplitStore::new((d1.clone(), d1.clone()), illustrations));
     Ok((split.clone(), split, s3_handle))

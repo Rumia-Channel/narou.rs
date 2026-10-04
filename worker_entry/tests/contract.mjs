@@ -591,7 +591,17 @@ await check("GET /api/storage/mode reports the worker storage", async () => {
   assert(response.status === 200, `status ${response.status}`);
   const body = await json(response);
   assert(body.success === true, `unexpected body: ${JSON.stringify(body)}`);
-  assert(body.mode === "sqlite", `the worker stores in D1: ${JSON.stringify(body)}`);
+  assert(body.mode === "sqlite", "metadata mode must remain sqlite");
+  assert(body.metadata_backend === "d1", "metadata backend must be D1");
+  assert(["d1", "s3"].includes(body.illustration_backend), "illustration backend must be explicit");
+  if (process.env.NAROU_REQUIRE_S3 === "true") {
+    assert(body.s3_required === true, "deployed runtime must enforce S3");
+    assert(body.illustration_backend === "s3", "deployed illustrations must use S3");
+    const probe = await request("/api/storage/mode?probe=s3", auth());
+    assert(probe.status === 200, `S3 LIST probe status ${probe.status}`);
+    const result = await json(probe);
+    assert(result.success === true && result.s3_list === "ok", "S3 LIST must succeed");
+  }
 });
 
 await check("GET /api/webui/config returns the UI configuration", async () => {
