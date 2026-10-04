@@ -998,3 +998,13 @@ narou setting name         # 読み取り
 | `:directory` | ディレクトリパス (存在チェック) | `"/path/to/dir"` |
 | `:select` | 選択肢から一つ | `device`: `kindle`, `kobo`, 等 |
 | `:multiple` | 選択肢から複数 (カンマ区切り) | `economy`: `cleanup_temp,send_delete` |
+
+### Worker の挿絵ストア確認
+
+`GET /api/storage/mode` は管理方式 `sqlite` に加え、`metadata_backend=d1`、
+`illustration_backend=d1|s3`、`s3_required` を返す（既存の認証を適用）。
+`?probe=s3` は選択された S3 に上限 1 件の LIST を行い、`s3_list=ok|failed|not_selected`
+だけを返す。失敗は HTTP 503。キー、保存先設定、プロバイダーのエラー本文は返さない。
+HTTP 200 でも正しい `ListBucketResult` 外側要素を持たない本文は LIST 成功としない。
+CI の S3 必須配備では旧 D1 marker・未設定より S3 指定を優先する。旧 D1 挿絵は移行・削除・代替参照せず、管理と本文は D1 に保持する。設定不備や S3 要求失敗で D1 へ戻さず、配備後の実 LIST 成功も要求する。
+この確認は LIST 権限・接続の確認であり、挿絵の既存データ移行や GET/PUT の検証ではない。

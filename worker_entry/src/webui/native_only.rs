@@ -77,11 +77,7 @@ pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
         // GET /api/storage/mode — Worker の管理ストアは D1 (SQLite 系) で
         // 固定。native の `mode`/`locked_by_env` キーで実態を返す
         // (`locked_by_env`: プラットフォームがモードを固定している = true)。
-        (Method::Get, "/api/storage/mode") => Response::from_json(&serde_json::json!({
-            "success": true,
-            "mode": "sqlite",
-            "locked_by_env": true,
-        })),
+        (Method::Get, "/api/storage/mode") => storage_mode(&req, &env).await,
         // POST /api/storage/mode — 管理方式の切替はローカル FS の
         // `.narou` マーカー書き換えと DB 再初期化を伴う。Worker では
         // ストアは D1 に固定で切替先が存在しない。
@@ -137,4 +133,22 @@ pub async fn handle(req: Request, env: Env) -> worker::Result<Response> {
 /// 501 + `not_supported_on_worker`。§3.3 の「明示的に拒否する」要件。
 fn not_supported(message: &str) -> worker::Result<Response> {
     json_error(501, "not_supported_on_worker", Some(message))
+}
+
+/// Report the selected stores without exposing configuration or object names.
+/// The optional authenticated probe performs a bounded, read-only S3 LIST.
+async fn storage_mode(req: &Request, env: &Env) -> worker::Result<Response> {
+    let probe = req.url()?.query_pairs().any(|(key, value)| key == "probe" && value == "s3");
+    let required = match crate::composition::required_s3(env) {
+        Ok(required) => required,
+        Err(_) => return json_error(503, "storage_configuration_invalid", None),
+    };
+    let services = match crate::composition::build_read_services(env).await {
+        Ok(services) => services,
+        Err(_) => return json_error(503, "storage_configuration_unavailable", None),
+    };
+    let s3 = services.s3_illustrations.as_deref()
+        .map(|store| store as &dyn narou_rs::platform::ObjectStore);
+    let (status, payload) = crate::storage_probe::storage_mode_response(s3, required, probe).await;
+    Ok(Response::from_json(&payload)?.with_status(status))
 }

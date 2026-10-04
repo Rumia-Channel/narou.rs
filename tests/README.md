@@ -26,3 +26,18 @@ The synthetic HTML entity expectations follow narou.rb's
 Run `node --test tests/render_links.test.mjs` for the Web UI source-link
 attribute-escaping regressions. This checks the actual rendering helpers with
 a minimal DOM text-serialization stub; it does not claim full-browser coverage.
+
+Worker S3 selection/deployment regressions use only fake values and local stores:
+
+```sh
+cargo test -p narou_rs --test worker_asset_backend --test worker_storage_probe
+python3 -m unittest discover -s worker_entry/tests -p 'test_*s3*.py'
+cargo check -p narou_worker --target wasm32-unknown-unknown
+```
+
+These verify backend policy, mandatory deployment verification, and sanitized bounded LIST probes.
+They do not run a live migration, Cloudflare deployment, or production S3 request.
+
+`node --test tests/worker_dispatch.test.mjs` verifies the actual GitHub Actions
+job conditions: normal SORAHOST routing stays unchanged, and an explicit manual
+Workers opt-in runs the selected deployment and its prerequisites.

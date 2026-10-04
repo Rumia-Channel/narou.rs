@@ -15,13 +15,18 @@ on:
         type: choice
         options: [develop, production]
         default: develop
+      run_workers:
+        description: Run Workers checks and selected deployment even when SORAHOST is enabled
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 # Worker 系 (wasm / worker / worker-contract / relay-deploy / worker-deploy-*) は
 # Repository variable `SORAHOST` が `T` のとき全部止める。配備先が SORAHOST 側へ
-# 移っている間は Cloudflare Workers を触らない (`deploy-sorahost.yml` が動く)。
+# 移っている間は通常 Cloudflare Workers を触らない (`deploy-sorahost.yml` が動く)。
+# 手動実行で run_workers=true を明示した場合のみ、選択した Workers 配備を許可する。
 # native / native-gpl / license は配備先に依存しないので常に走る。
 
 env:
@@ -41,6 +46,10 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
+      - name: Worker dispatch policy regressions
+        run: node --test tests/worker_dispatch.test.mjs
+      - name: Worker S3 deployment regressions
+        run: python3 -m unittest discover -s worker_entry/tests -p 'test_*s3*.py'
       - name: SORAHOST smoke script regression
         run: python3 -m unittest discover -s tests -p 'test_sorahost_smoke.py'
       - name: Web UI source-link escaping regressions
@@ -77,7 +86,7 @@ jobs:
 
   wasm:
     name: Portable wasm check
-    if: vars.SORAHOST != 'T'
+    if: (vars.SORAHOST != 'T' || (github.event_name == 'workflow_dispatch' && inputs.run_workers))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -90,7 +99,7 @@ jobs:
 
   worker:
     name: Worker release artifact
-    if: vars.SORAHOST != 'T'
+    if: (vars.SORAHOST != 'T' || (github.event_name == 'workflow_dispatch' && inputs.run_workers))
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -112,7 +121,7 @@ jobs:
 
   worker-contract:
     name: Worker contract tests (local workerd)
-    if: vars.SORAHOST != 'T'
+    if: (vars.SORAHOST != 'T' || (github.event_name == 'workflow_dispatch' && inputs.run_workers))
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -174,7 +183,7 @@ jobs:
   worker-deploy-develop:
     name: Deploy Worker (develop)
     if: >-
-      vars.SORAHOST != 'T'
+      (vars.SORAHOST != 'T' || (github.event_name == 'workflow_dispatch' && inputs.run_workers))
       && ((github.event_name == 'push' && github.ref == 'refs/heads/develop')
       || (github.event_name == 'workflow_dispatch' && inputs.target == 'develop'))
     # リレーを先に配布する。Worker はリレー経由でしか取得できないサイトがあるため、
@@ -271,7 +280,7 @@ jobs:
   relay-deploy:
     name: Deploy SORAHOST relay
     if: >-
-      vars.SORAHOST != 'T'
+      (vars.SORAHOST != 'T' || (github.event_name == 'workflow_dispatch' && inputs.run_workers))
       && ((github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main' || github.ref_type == 'tag'))
       || (github.event_name == 'workflow_dispatch' && (inputs.target == 'develop' || inputs.target == 'production')))
     needs: [native, native-gpl, wasm, worker, worker-contract, license]
@@ -347,7 +356,7 @@ jobs:
   worker-deploy-production:
     name: Deploy Worker (production)
     if: >-
-      vars.SORAHOST != 'T'
+      (vars.SORAHOST != 'T' || (github.event_name == 'workflow_dispatch' && inputs.run_workers))
       && ((github.event_name == 'push' && github.ref_type == 'tag')
       || (github.event_name == 'workflow_dispatch' && inputs.target == 'production'))
     needs: [native, native-gpl, wasm, worker, worker-contract, license, relay-deploy]

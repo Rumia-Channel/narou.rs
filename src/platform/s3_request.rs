@@ -265,6 +265,9 @@ pub struct S3ListPage {
 /// 必要な要素だけを拾う小さな走査で、外部の XML クレートを持ち込まない。
 /// キーは自分たちの論理キーなので、要素の入れ子より実体参照の復元を重視する。
 pub fn parse_list_objects_v2(xml: &str) -> Result<S3ListPage> {
+    let xml = list_bucket_result_body(xml).ok_or_else(|| {
+        NarouError::Platform("ListObjectsV2 response has an invalid ListBucketResult envelope".to_string())
+    })?;
     let mut objects = Vec::new();
     let mut next_token = None;
     let mut cursor = 0usize;
@@ -296,7 +299,8 @@ pub fn parse_list_objects_v2(xml: &str) -> Result<S3ListPage> {
             etag,
             last_modified,
         });
-        cursor = content_start + end + "</Contents>".len();
+        let close_start = content_start + end;
+        cursor = close_start + xml[close_start..].find('>').unwrap() + 1;
     }
 
     if let Some(value) = element_text(xml, "NextContinuationToken")
@@ -313,6 +317,82 @@ pub fn parse_list_objects_v2(xml: &str) -> Result<S3ListPage> {
         objects,
         next_token,
     })
+}
+
+/// HTTP 200 だけでは一覧の成功としない。外側の要素と閉じタグを確認し、
+/// 本文以外 (HTML / Error / 途中で切れた応答 / 後続の別文書) を拒否する。
+/// 要素の値や属性の意味は既存の小さなパーサーに任せる。
+fn list_bucket_result_body(xml: &str) -> Option<&str> {
+    let mut xml = xml.strip_prefix('\u{feff}').unwrap_or(xml).trim();
+    if let Some(declaration) = xml.strip_prefix("<?xml") {
+        if !declaration.starts_with(char::is_whitespace) {
+            return None;
+        }
+        xml = declaration.split_once("?>")?.1.trim_start();
+    }
+    let open_end = xml_tag_end(xml)?;
+    let open = xml.get(1..open_end)?;
+    let root_name = open.split_ascii_whitespace().next()?.trim_end_matches('/');
+    let local_name = match root_name.split_once(':') {
+        Some((prefix, local)) if !prefix.is_empty() => local,
+        _ => root_name,
+    };
+    if !xml.starts_with('<') || local_name != "ListBucketResult" {
+        return None;
+    }
+    if open.ends_with('/') {
+        return xml[open_end + 1..].trim().is_empty().then_some("");
+    }
+    let body_start = open_end + 1;
+    let mut cursor = body_start;
+    let mut elements = vec![root_name];
+    while let Some(offset) = xml[cursor..].find('<') {
+        let start = cursor + offset;
+        let rest = &xml[start..];
+        // タグ風の文字列をコメントや CDATA 内の閉じタグと取り違えない。
+        if rest.starts_with("<!--") {
+            cursor = start + rest.find("-->")? + 3;
+            continue;
+        }
+        if rest.starts_with("<![CDATA[") {
+            cursor = start + rest.find("]]>")? + 3;
+            continue;
+        }
+        let end = start + xml_tag_end(rest)?;
+        let tag = &xml[start + 1..end];
+        if let Some(close_name) = tag.strip_prefix('/') {
+            if elements.pop()? != close_name.trim_end() {
+                return None;
+            }
+            if elements.is_empty() {
+                return xml[end + 1..].trim().is_empty().then_some(&xml[body_start..start]);
+            }
+        } else {
+            let name = tag.split_ascii_whitespace().next()?.trim_end_matches('/');
+            if name.is_empty() || name.starts_with(['!', '?']) {
+                return None;
+            }
+            if !tag.ends_with('/') {
+                elements.push(name);
+            }
+        }
+        cursor = end + 1;
+    }
+    None
+}
+
+/// 引用符内の `>` をタグ終端として扱わない。
+fn xml_tag_end(xml: &str) -> Option<usize> {
+    let mut quote = None;
+    for (index, ch) in xml.char_indices() {
+        match (quote, ch) {
+            (Some(expected), actual) if actual == expected => quote = None,
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, '>') => return Some(index),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `<Contents>` 開始タグの位置を返す (名前空間接頭辞つきも許容)。
@@ -342,9 +422,7 @@ fn find_close(haystack: &str, tag: &str) -> Option<usize> {
     while depth > 0 {
         let rest = &haystack[cursor..];
         let next_open = find_tag(rest, tag);
-        let close_offset = rest
-            .find(&format!("</{tag}>"))
-            .or_else(|| find_prefixed_close(rest, tag));
+        let close_offset = find_element_close(rest, tag);
         match (next_open, close_offset) {
             (Some(open), Some(close)) if open < close => {
                 depth += 1;
@@ -355,7 +433,7 @@ fn find_close(haystack: &str, tag: &str) -> Option<usize> {
                 if depth == 0 {
                     return Some(cursor + close);
                 }
-                cursor += close + format!("</{tag}>").len();
+                cursor += close + rest[close..].find('>')? + 1;
             }
             // 閉じタグが無い (壊れた XML) か、ネストの対応が取れない。
             _ => return None,
@@ -364,13 +442,13 @@ fn find_close(haystack: &str, tag: &str) -> Option<usize> {
     None
 }
 
-fn find_prefixed_close(haystack: &str, tag: &str) -> Option<usize> {
-    let needle = format!(":{tag}>");
+fn find_element_close(haystack: &str, tag: &str) -> Option<usize> {
     let mut search_from = 0usize;
     while let Some(offset) = haystack[search_from..].find("</") {
         let start = search_from + offset;
         let rest = &haystack[start + 2..];
-        if rest.starts_with(&needle) {
+        let end = rest.find('>')?;
+        if rest[..end].trim_end().rsplit(':').next() == Some(tag) {
             return Some(start);
         }
         search_from = start + 2;
@@ -383,9 +461,7 @@ pub(crate) fn element_text(xml: &str, tag: &str) -> Option<String> {
     let start = find_tag(xml, tag)?;
     let after_open = xml[start..].find('>')? + start + 1;
     let rest = &xml[after_open..];
-    let close = rest
-        .find(&format!("</{tag}>"))
-        .or_else(|| find_prefixed_close(rest, tag))?;
+    let close = find_element_close(rest, tag)?;
     Some(unescape_xml(&rest[..close]))
 }
 
