@@ -126,6 +126,57 @@ pub(crate) fn refresh_status_sort(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Project the freeze inventory (`app_state('inv','freeze')` / `freeze.yaml`)
+/// onto the relational `frozen_novels` table.
+///
+/// The payload stays canonical — native reads freeze state through
+/// `Inventory` (see `NativeFreezeStore`) — while the shared status *search*
+/// expression (`sql/status_search_expression.sql`, also used by the Worker D1
+/// adapter where `frozen_novels` *is* the store) queries the table. Without
+/// this projection the table stayed empty and status filtering silently
+/// disagreed with `narou list`.
+///
+/// `novels.status_sort` needs no refresh: the sort expression deliberately
+/// covers only 完結 / 削除 / 中断, not 凍結.
+///
+/// IDs without a `novels` row are dropped: the table has a foreign key to
+/// `novels`, and the payload may outlive a removed novel.
+pub(crate) fn sync_frozen_novels(conn: &Connection, frozen_ids: &[i64]) -> Result<()> {
+    let mut current: Vec<i64> = Vec::new();
+    {
+        let mut statement = conn
+            .prepare("SELECT novel_id FROM frozen_novels")
+            .map_err(super::sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(super::sqlite_error)?;
+        for row in rows {
+            current.push(row.map_err(|error| NarouError::Platform(error.to_string()))?);
+        }
+    }
+
+    let desired: HashSet<i64> = frozen_ids.iter().copied().collect();
+    let current_set: HashSet<i64> = current.iter().copied().collect();
+    if desired == current_set {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction().map_err(super::sqlite_error)?;
+    for id in current_set.difference(&desired) {
+        tx.execute("DELETE FROM frozen_novels WHERE novel_id = ?", [id])
+            .map_err(super::sqlite_error)?;
+    }
+    for id in desired.difference(&current_set) {
+        tx.execute(
+            "INSERT OR IGNORE INTO frozen_novels (novel_id)
+             SELECT id FROM novels WHERE id = ?",
+            [id],
+        )
+        .map_err(super::sqlite_error)?;
+    }
+    tx.commit().map_err(super::sqlite_error)
+}
+
 impl NovelRepository for SqliteNovelRepository {
     fn get<'a>(
         &'a self,
