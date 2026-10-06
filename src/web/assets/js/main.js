@@ -216,6 +216,23 @@ function normalizeTheme(theme) {
   return (theme === 'Cerulean' || theme === 'default') ? 'default' : theme;
 }
 
+// Debug Mode (`webui.debug-mode`) では、Web コンソールに出る行をブラウザの
+// 開発者コンソールへも流す。Web コンソールを見ていなくても、挿絵が EPUB に
+// 入らない等の内部判断を DevTools で追えるようにするための転送で、表示内容は
+// 変えない (OFF のときは何もしない)。
+function mirrorConsoleToDevtools(text, targetConsole) {
+  if (!State.debugMode || typeof console === 'undefined' || !text) return;
+  const line = String(text);
+  const label = '[narou]';
+  if (line.startsWith('[debug]')) {
+    console.debug(`${label} ${line}`, targetConsole || 'stdout');
+  } else if (targetConsole && targetConsole !== 'stdout') {
+    console.error(`${label} ${line}`, targetConsole);
+  } else {
+    console.log(`${label} ${line}`, targetConsole || 'stdout');
+  }
+}
+
 async function reloadWebConfig() {
   try {
     const config = await fetchJson('/api/webui/config');
@@ -735,6 +752,8 @@ var lastLineComplete = true;
 function appendConsole(text, targetConsole) {
   const con = getConsoleEl(targetConsole);
   if (!con) return;
+
+  mirrorConsoleToDevtools(text, targetConsole);
 
   // Ensure text ends with newline (worker strips \n from BufReader::lines())
   if (text.length > 0 && !text.endsWith('\n')) {

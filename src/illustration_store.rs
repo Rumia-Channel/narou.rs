@@ -60,6 +60,11 @@ impl IllustrationIndex {
         self.0.filename_for_hash(hash)
     }
 
+    /// 索引が持つ取得元 (URL) の件数。デバッグ表示用。
+    pub fn source_count(&self) -> usize {
+        self.0.sources.len()
+    }
+
     pub fn hash_for_mitemin_id(&self, id: &str) -> Option<&str> {
         self.0.hash_for_mitemin_id(id)
     }

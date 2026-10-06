@@ -57,6 +57,12 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
         std::process::exit(1);
     }
 
+    // Web UI から起動された変換 (子プロセス) では、`webui.debug-mode` が ON
+    // なら挿絵のローカライズや EPUB 組立の内訳を Web コンソールへ流す。
+    narou_rs::application::debug::set_enabled(
+        is_web_mode() && narou_rs::compat::load_local_setting_bool("webui.debug-mode"),
+    );
+
     let multi = CliProgress::multi();
     let multi_clone = multi.clone();
     let mut first_output_dir = None;

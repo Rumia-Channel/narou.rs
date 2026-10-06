@@ -587,6 +587,16 @@ npx wrangler deploy --config wrangler.ci.toml --secrets-file <json>
   そのため Lite 側に逐次収集 API を足す必要も無い。
   挿絵の読み出しに失敗すると応答は途中で切れる (ストリーム開始後にステータスは変えられない) ため、
   列挙時に判定できるもの (枚数・1 枚のサイズ) は先に 413 で断る。
+- **Worker の本文に残る挿絵 URL (2026-10-06 修正)**: Worker の変換は native と違い挿絵を
+  ローカライズしない (`src/converter/mod.rs` の非 native 経路は no-op) ため、変換済みテキストの
+  挿絵注記は取得元 URL のままになる。保存済みの実体は `.illustration_cache.yaml`
+  (取得元 URL → ファイル名) が知っているので、`download.epub` は
+  `epub_lite::rewrite_illustration_references` で参照を `挿絵/<file>` へ寄せてから組み立てる。
+  併せて、本文が参照している挿絵が入力に無い場合は `warn_illustration_missing` を必ず出し、
+  内訳 (参照数・未解決・除外した拡張子・一覧件数) を `webui.debug-mode` の詳細ログへ流す。
+  注意: Lite の `image_references` はパス正規化で空セグメントを弾くため `https://…` を参照として
+  認識しない。narou.rs 側の URL 対応スキャナ (`epub_lite::illustration_references`) を使うこと
+  (AozoraEpub3_Lite 側は無改造)。
 - **D1 の `objects`/`object_chunks` の扱い**: 本文の移行後もしばらく残す。削除（容量回収）は P4 の判断。
 - **APNG 挿絵**: `zip` の feature を純 Rust 構成に絞ったため Worker でも組み立て可能（`worker-runtime` が
   `illustration-animation` を有効化済み）。組み立ては**フレームを 1 枚ずつ復号 → 符号化 → 追記して即解放**し、

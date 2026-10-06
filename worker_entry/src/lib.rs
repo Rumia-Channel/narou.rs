@@ -474,6 +474,13 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
     };
 
     let local_map = load_local_settings_map(&env).await;
+    // `webui.debug-mode` が ON なら、この要求の間は詳細ログを Web コンソールへ
+    // 流す (挿絵が EPUB に入らない等の原因を追えるようにする)。
+    narou_rs::application::debug::apply_settings(&local_map);
+    narou_rs::application::debug::emit(format!(
+        "EPUB: 生成開始 (id={id}, keep-txt={})",
+        crate::convert::keep_converted_text_with(&local_map)
+    ));
     let filename = match epub_download_filename(
         services.objects.clone(),
         &record,
@@ -521,6 +528,44 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         Err(_) => return Response::error("Stored text is not valid UTF-8", 500),
     };
 
+    // Worker の変換は native と違って挿絵をローカライズしないので、本文には
+    // 取得元 URL がそのまま残る。ダウンロード時に保存した実体は
+    // `.illustration_cache.yaml` (取得元 → ファイル名) が知っているため、
+    // ここで参照を `挿絵/<file>` へ寄せてから EPUB を組む。
+    let index = load_illustration_index(&services.objects, &keys).await;
+    let (text, unresolved) = match index.as_ref() {
+        Some(index) => narou_rs::epub_lite::rewrite_illustration_references(&text, |reference| {
+            // 既にローカルな `挿絵/<file>` はそのまま使う (対応表には無い)。
+            if reference.starts_with("挿絵/") {
+                return Some(reference.to_string());
+            }
+            index
+                .filename_for_source(reference)
+                .map(str::to_string)
+                .or_else(|| {
+                    narou_rs::illustration_store::mitemin_illustration_id(reference)
+                        .and_then(|id| index.filename_for_mitemin_id(&id).map(str::to_string))
+                })
+                .map(|filename| format!("挿絵/{filename}"))
+        }),
+        None => (text.clone(), narou_rs::epub_lite::illustration_references(&text)),
+    };
+    if narou_rs::application::debug::enabled() {
+        let references = narou_rs::epub_lite::illustration_reference_count(&text);
+        narou_rs::application::debug::emit(format!(
+            "EPUB: 挿絵索引 {} / 本文の挿絵参照 {} 件 (未解決 {} 件)",
+            match index.as_ref() {
+                Some(index) => format!("{} エントリ", index.source_count()),
+                None => "なし".to_string(),
+            },
+            references,
+            unresolved.len()
+        ));
+        for reference in &unresolved {
+            narou_rs::application::debug::emit(format!("EPUB: 未解決の挿絵参照: {reference}"));
+        }
+    }
+
     // 挿絵は名前とサイズだけを列挙し、バイト列は書き出し直前に 1 枚ずつ読む。
     // 列挙した名前が本文の参照と同じ形 (`挿絵/foo.jpg`) でないと Lite は解決
     // できないので、小説のプレフィックスは付けない。
@@ -533,6 +578,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         return Response::error("Invalid illustration prefix", 500);
     };
     let mut image_names: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
     let mut cursor = None;
     loop {
         let mut request =
@@ -547,6 +593,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         for meta in page.objects {
             let name = meta.key.as_ref().rsplit('/').next().unwrap_or_default().to_string();
             if !narou_rs::epub_lite::is_supported_image(&name) {
+                skipped.push(format!("{name} (画像として扱えない拡張子)"));
                 continue;
             }
             // 応答を始める前に断れるものは断る (1 枚は 1 回の small read で
@@ -574,6 +621,16 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         }
     }
 
+    narou_rs::application::debug::emit(format!(
+        "EPUB: 挿絵一覧 {} 件 (除外 {} 件) prefix={}",
+        image_names.len(),
+        skipped.len(),
+        illust_prefix.as_ref()
+    ));
+    for name in &skipped {
+        narou_rs::application::debug::emit(format!("EPUB: 挿絵を除外: {name}"));
+    }
+
     let options = narou_rs::epub_lite::EpubBuildOptions {
         title: record.title.clone(),
         author: record.author.clone(),
@@ -597,9 +654,21 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         text,
         image_names,
     ));
-    let build = match narou_rs::epub_lite::build_book_from_source(source.clone(), &options) {
-        Ok(build) => std::sync::Arc::new(build),
-        Err(error) => return Response::error(format!("EPUB build failed: {error}"), 500),
+    // 組立中の警告 (本文が参照している挿絵が一覧に無い等) を Web コンソールへ
+    // 流すため、組立の間だけ PushHub sink を入れる (ジョブではないので
+    // 既定 sink は誰も用意していない)。組立は同期なので短時間で戻る。
+    let build = {
+        let push_sink = crate::push_hub::PushHubSink::install(crate::push_hub::PushHubClient::new(
+            &env,
+            crate::budget::SubrequestBudget::new(),
+        ));
+        let built = narou_rs::epub_lite::build_book_from_source(source.clone(), &options);
+        push_sink.drain().await;
+        narou_rs::application::messages::take_default_sink();
+        match built {
+            Ok(build) => std::sync::Arc::new(build),
+            Err(error) => return Response::error(format!("EPUB build failed: {error}"), 500),
+        }
     };
     let sink = narou_rs::epub_lite::ChunkSink::new();
     let writer = match build.book.stream_writer(sink.clone()) {
@@ -613,6 +682,7 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         source,
         objects: services.objects.clone(),
         prefix: keys.prefix().as_ref().to_string(),
+        push: crate::push_hub::PushHubClient::new(&env, crate::budget::SubrequestBudget::new()),
     };
     let stream = futures::stream::unfold(state, |mut state| async move {
         loop {
@@ -648,6 +718,11 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
                     };
                     match state.objects.read_small(&key).await {
                         Ok(Some(raw)) => {
+                            push_debug_line(
+                                &state.push,
+                                format!("EPUB: 挿絵 {relative} を読み込み ({} bytes)", raw.len()),
+                            )
+                            .await;
                             state.source.insert_image(relative, raw.clone());
                             let bytes = state.build.resolve(path).or(Some(raw));
                             // 保持するのは書き出し中の 1 枚分だけにする。
@@ -655,6 +730,11 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
                             bytes
                         }
                         Ok(None) => {
+                            push_debug_line(
+                                &state.push,
+                                format!("EPUB: 挿絵が見つかりません: {key}"),
+                            )
+                            .await;
                             return Some((
                                 Err(worker::Error::RustError(format!("missing {relative}"))),
                                 state,
@@ -696,6 +776,32 @@ async fn load_local_settings_map(env: &Env) -> HashMap<String, serde_yaml::Value
         .load(SettingScope::Local)
         .await
         .unwrap_or_default()
+}
+
+/// `<prefix>/.illustration_cache.yaml` (取得元 URL → ファイル名) を読む。
+/// 未保存・破損は `None` (詳細は debug ログ)。
+async fn load_illustration_index(
+    objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
+    keys: &narou_rs::platform::NovelObjectKeys,
+) -> Option<narou_rs::illustration_store::IllustrationIndex> {
+    let bytes = match objects.read_small(&keys.illustration_cache()).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            narou_rs::application::debug::emit("EPUB: 挿絵索引 (.illustration_cache.yaml) がありません");
+            return None;
+        }
+        Err(error) => {
+            narou_rs::application::debug::emit_error(format!("挿絵索引を読めません: {error}"));
+            return None;
+        }
+    };
+    match serde_yaml::from_slice(&bytes) {
+        Ok(index) => Some(index),
+        Err(error) => {
+            narou_rs::application::debug::emit_error(format!("挿絵索引を解釈できません: {error}"));
+            None
+        }
+    }
 }
 
 /// 設定マップの値を文字列にする。文字列以外 (bool/数値) も文字列表現で返す
@@ -778,6 +884,21 @@ fn stream_error(error: impl std::fmt::Display) -> worker::Error {
     worker::Error::RustError(error.to_string())
 }
 
+/// ジョブではない要求ハンドラから Web コンソールへ debug 行を 1 つ流す。
+///
+/// `messages::emit_default` はジョブ sink が無いと Worker のログへ落ちて
+/// Web コンソールには出ないため、EPUB のストリーム中は PushHub へ直接送る。
+async fn push_debug_line(push: &crate::push_hub::PushHubClient, message: String) {
+    if !narou_rs::application::debug::enabled() {
+        return;
+    }
+    push.broadcast_best_effort(&[crate::push_hub::echo(
+        &format!("{} {message}", narou_rs::application::debug::PREFIX),
+        "stdout",
+    )])
+    .await;
+}
+
 /// 1 エントリずつ書き出しながら応答へ流すための状態。
 struct EpubStreamState {
     writer: Option<narou_rs::epub_lite::EpubStreamWriter<narou_rs::epub_lite::ChunkSink>>,
@@ -786,6 +907,8 @@ struct EpubStreamState {
     source: std::sync::Arc<narou_rs::epub_lite::LazyImageSource>,
     objects: std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
     prefix: String,
+    /// ストリーム中の debug 行を Web コンソールへ送るためのクライアント。
+    push: crate::push_hub::PushHubClient,
 }
 
 /// 無認証で返す health 応答。認証の要否と設定状況を機械可読で載せる

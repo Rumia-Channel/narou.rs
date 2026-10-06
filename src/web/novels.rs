@@ -513,6 +513,10 @@ async fn generate_epub_on_demand(
     record: &crate::db::novel_record::NovelRecord,
     novel_dir: &std::path::Path,
 ) -> Result<(Vec<u8>, String), (StatusCode, String)> {
+    // `webui.debug-mode` なら挿絵の解決状況などを Web コンソールへ流す。
+    crate::application::debug::set_enabled(crate::compat::load_local_setting_bool(
+        "webui.debug-mode",
+    ));
     // 保存済み EPUB と同じ命名規則で Content-Disposition 名を決める
     // (変換時の txt basename に `.epub` を付けたもの)。
     // `convert.filename` / `convert.filename-to-ncode` は

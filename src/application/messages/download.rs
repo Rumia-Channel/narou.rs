@@ -207,6 +207,11 @@ pub fn warn_illustration_download(url: impl Display, error: impl Display) -> Str
     format!("WARN: failed to download illustration {url}: {error}")
 }
 
+/// 本文が参照している挿絵が EPUB の入力に見つからない (その挿絵は落ちる)。
+pub fn warn_illustration_missing(reference: impl Display) -> String {
+    format!("WARN: illustration {reference} is not stored; it will be missing from the EPUB")
+}
+
 // --- サイト定義の fancy-regex ガード (info_extraction.rs, stderr) ---
 
 pub fn warn_fancy_pattern_large(key: impl Display) -> String {

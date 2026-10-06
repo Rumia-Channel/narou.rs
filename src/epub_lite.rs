@@ -294,6 +294,138 @@ pub fn build_book(input_txt: &Path, options: &EpubBuildOptions) -> Result<EpubBu
     build_from_input(input, options)
 }
 
+/// 挿絵参照の解決結果を報告する。
+///
+/// 本文が参照している挿絵が入力に無い場合、EPUB からその挿絵が落ちる —
+/// 見た目は「挿絵が入っていない EPUB」になるだけで、既定では何も出ない。
+/// 原因を追えるよう、未解決は常に警告し、判断の内訳は `webui.debug-mode` の
+/// ときだけ詳細ログへ流す。
+fn report_illustration_resolution(unresolved: &[String], unsupported: &[String], resolved: usize) {
+    use crate::application::debug;
+    use crate::application::messages;
+
+    for reference in unresolved {
+        messages::emit_default(
+            messages::Stream::Stderr,
+            &messages::download::warn_illustration_missing(reference),
+        );
+    }
+    if !debug::enabled() {
+        return;
+    }
+    debug::emit(format!(
+        "挿絵: 解決 {} 件 / 未解決 {} 件 / 未対応の拡張子 {} 件",
+        resolved,
+        unresolved.len(),
+        unsupported.len()
+    ));
+    for reference in unresolved {
+        debug::emit(format!("挿絵: 本文の参照が入力に見つかりません: {reference}"));
+    }
+    for source in unsupported {
+        debug::emit(format!("挿絵: 画像として扱えない拡張子です: {source}"));
+    }
+}
+
+/// 本文が参照している挿絵の一覧 (重複なし)。詳細ログ・診断用。
+///
+/// Lite の `image_references` はパス区切りを正規化するため `https://…` の
+/// ような URL を参照として認識しない (空セグメントを弾く)。Worker の本文は
+/// 取得元 URL のままなので、URL も参照として拾う。
+pub fn illustration_references(text: &str) -> Vec<String> {
+    let mut references = Vec::new();
+    for caps in note_pattern().captures_iter(text) {
+        push_reference(&mut references, &caps[1]);
+    }
+    for caps in image_pattern().captures_iter(text) {
+        push_reference(&mut references, &caps[2]);
+    }
+    references
+}
+
+/// 本文が参照している挿絵の数 (重複なし)。詳細ログ用。
+pub fn illustration_reference_count(text: &str) -> usize {
+    illustration_references(text).len()
+}
+
+/// 挿絵注記 (`［＃挿絵（PATH、説明）入る］`) の PATH を捕まえる。
+fn note_pattern() -> &'static regex::Regex {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    PATTERN.get_or_init(|| {
+        regex::Regex::new(r"［＃挿絵（([^、）]+)(?:、[^）]*)?）入る］")
+            .expect("illustration note pattern is valid")
+    })
+}
+
+/// 生の `<img src="…">` を捕まえる (1: src= まで, 2: 値, 3: 閉じ引用符)。
+fn image_pattern() -> &'static regex::Regex {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    PATTERN.get_or_init(|| {
+        regex::Regex::new(r#"(?i)(<img[^>]+src=["'])([^"']+)(["'])"#)
+            .expect("illustration img pattern is valid")
+    })
+}
+
+fn push_reference(references: &mut Vec<String>, reference: &str) {
+    let reference = reference.trim();
+    if !reference.is_empty() && !references.iter().any(|known| known == reference) {
+        references.push(reference.to_string());
+    }
+}
+
+/// 本文の挿絵参照を、保存済みの名前 (`挿絵/<file>`) へ寄せる。
+///
+/// Worker の変換は native と違い挿絵をローカライズしないため、本文には
+/// サイト上の URL がそのまま残る。ダウンロード時に保存した実体は
+/// `.illustration_cache.yaml` (取得元 → ファイル名) が知っているので、EPUB を
+/// 組む前にここで参照を差し替える。`resolve` が `None` を返した参照は元の
+/// まま残し、戻り値の 2 番目に (重複なしで) 集める。
+///
+/// 置換は注記 (`［＃挿絵（X、説明）入る］`) と生の `src="X"` の両方の書き方を
+/// 見る。注記では説明文をそのまま残す。
+pub fn rewrite_illustration_references(
+    text: &str,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> (String, Vec<String>) {
+    let mut unresolved: Vec<String> = Vec::new();
+    let mut rewritten = String::with_capacity(text.len());
+    let mut last = 0;
+    for caps in note_pattern().captures_iter(text) {
+        let whole = caps.get(0).expect("whole match");
+        let path_match = caps.get(1).expect("path group");
+        let reference = path_match.as_str().trim();
+        let Some(localized) = resolve(reference) else {
+            push_reference(&mut unresolved, reference);
+            continue;
+        };
+        rewritten.push_str(&text[last..whole.start()]);
+        rewritten.push_str(&text[whole.start()..path_match.start()]);
+        rewritten.push_str(&localized);
+        rewritten.push_str(&text[path_match.end()..whole.end()]);
+        last = whole.end();
+    }
+    rewritten.push_str(&text[last..]);
+
+    let rewritten = image_pattern()
+        .replace_all(&rewritten, |caps: &regex::Captures| {
+            let reference = caps.get(2).expect("source group").as_str().trim();
+            match resolve(reference) {
+                Some(localized) => format!(
+                    "{}{}{}",
+                    caps.get(1).expect("prefix group").as_str(),
+                    localized,
+                    caps.get(3).expect("quote group").as_str()
+                ),
+                None => {
+                    push_reference(&mut unresolved, reference);
+                    caps.get(0).expect("whole match").as_str().to_string()
+                }
+            }
+        })
+        .into_owned();
+    (rewritten, unresolved)
+}
+
 /// ファイルシステムの無いランタイム (wasm / ObjectStore) 向け。入力テキストと
 /// 挿絵を [`FileSource`] から供給して EPUB を組み立てる。
 ///
@@ -336,16 +468,21 @@ pub fn build_book_from_source(
     // 注記のパスをそのまま EPUB の格納先にする (レンダラが同じパスを参照する)。
     let mut images = Vec::new();
     let mut epub_assets = Vec::new();
-    for reference in image_references(&text) {
+    let mut unresolved: Vec<String> = Vec::new();
+    let mut unsupported: Vec<String> = Vec::new();
+    for reference in illustration_references(&text) {
         let Some(source_path) = input.resolve_image_path(entry, &reference) else {
+            unresolved.push(reference);
             continue;
         };
         let Some(extension) = source_path.rsplit_once('.').map(|(_, extension)| extension) else {
+            unsupported.push(source_path);
             continue;
         };
         let Some(media_type) =
             aozora_epub3_lite::pipeline::media_type_for_extension(extension)
         else {
+            unsupported.push(source_path);
             continue;
         };
         let epub_path = format!("image/{source_path}");
@@ -358,6 +495,7 @@ pub fn build_book_from_source(
             rotate: 0,
         });
     }
+    report_illustration_resolution(&unresolved, &unsupported, images.len());
 
     let chapters = nav_chapters(records, &config);
     let title = if options.title.is_empty() {
@@ -803,6 +941,47 @@ mod tests {
         let needle = b"item/image/0001.png";
         assert!(bytes.windows(needle.len()).any(|window| window == needle));
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn rewrites_illustration_references_to_stored_names() {
+        // Worker の本文は取得元 URL のままなので、保存済みの名前へ寄せる。
+        let text = format!("{SAMPLE}\n　挿絵。［＃挿絵（https://example.invalid/a.png）入る］\n");
+        let (rewritten, unresolved) = rewrite_illustration_references(&text, |reference| {
+            (reference == "https://example.invalid/a.png").then(|| "挿絵/0001.png".to_string())
+        });
+        assert!(
+            rewritten.contains("［＃挿絵（挿絵/0001.png）入る］"),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("example.invalid"), "{rewritten}");
+        assert!(unresolved.is_empty());
+    }
+
+    #[test]
+    fn keeps_unresolved_references_and_reports_each_once() {
+        let text = format!(
+            "{SAMPLE}\n［＃挿絵（https://example.invalid/a.png）入る］\n\
+             ［＃挿絵（https://example.invalid/a.png）入る］\n［＃挿絵（挿絵/local.png）入る］\n"
+        );
+        let (rewritten, unresolved) = rewrite_illustration_references(&text, |_| None);
+        assert_eq!(rewritten, text, "解決できない参照は書き換えない");
+        assert_eq!(
+            unresolved,
+            vec![
+                "https://example.invalid/a.png".to_string(),
+                "挿絵/local.png".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrites_raw_img_sources_too() {
+        let text = format!("{SAMPLE}\n<img src=\"https://example.invalid/b.jpg\" alt=\"x\">\n");
+        let (rewritten, unresolved) =
+            rewrite_illustration_references(&text, |_| Some("挿絵/b.jpg".to_string()));
+        assert!(rewritten.contains(r#"src="挿絵/b.jpg""#), "{rewritten}");
+        assert!(unresolved.is_empty());
     }
 
     #[test]

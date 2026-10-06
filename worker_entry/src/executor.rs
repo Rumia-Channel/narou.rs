@@ -123,6 +123,11 @@ pub async fn execute_job(
         return JobOutcome::Blocked { reason };
     }
 
+    // `webui.debug-mode` なら、このジョブの間は詳細ログ (挿絵の取り込み判断や
+    // EPUB 組立の内訳など) を Web コンソールへ流す。ジョブごとに 1 回だけ
+    // D1 の設定を読む (convert ジョブもこの経路を通る)。
+    narou_rs::application::debug::set_enabled(crate::consumer::webui_debug_mode(runtime).await);
+
     let force = job
         .options
         .iter()

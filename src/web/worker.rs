@@ -324,6 +324,9 @@ fn clear_progress_for_job(push_server: &Arc<PushServer>, job_id: &str) {
     }
 }
 fn execute_job(workers: &QueueWorkerContext, job: &QueueJob) -> JobRunResult {
+    // `webui.debug-mode` の詳細ログをこのジョブの間だけ有効にする (子プロセス
+    // 側でも `commands::convert` などが自前で有効化する)。
+    crate::application::debug::set_enabled(load_local_setting_bool("webui.debug-mode"));
     let QueueWorkerContext {
         root_dir,
         queue,

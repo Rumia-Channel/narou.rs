@@ -1181,7 +1181,13 @@ impl Downloader {
     ) -> Result<()> {
         let illust_url_pattern = match &setting.illust_grep_pattern {
             Some(p) => p,
-            None => return Ok(()),
+            None => {
+                crate::application::debug::emit(format!(
+                    "挿絵: サイト定義に illust_grep_pattern が無いため取得しません ({})",
+                    setting.domain
+                ));
+                return Ok(());
+            }
         };
 
         let re = compile_html_pattern(illust_url_pattern).map_err(NarouError::Regex)?;
@@ -1216,6 +1222,7 @@ impl Downloader {
                         .and_then(|id| illustration_store.filename_for_mitemin_id(&id))
                         .is_some()
                 {
+                    crate::application::debug::emit(format!("挿絵: 取得済みのため再取得しません: {url}"));
                     continue;
                 }
 
@@ -1257,10 +1264,24 @@ impl Downloader {
                             .store_bytes(object_keys, illustration_store, url, &body, ext)
                             .await
                         {
+                            crate::application::debug::emit_error(format!(
+                                "挿絵の保存に失敗 ({url}): {err}"
+                            ));
                             self.report_warn(&messages::download::warn_illustration_save(url, err));
+                        } else {
+                            crate::application::debug::emit(format!(
+                                "挿絵を保存しました: {url} → 挿絵/{}.{ext} ({} bytes)",
+                                illustration_store
+                                    .filename_for_source(url)
+                                    .unwrap_or("(unknown)"),
+                                body.len()
+                            ));
                         }
                     }
                     Err(err) => {
+                        crate::application::debug::emit_error(format!(
+                            "挿絵の取得に失敗 ({url}): {err}"
+                        ));
                         self.report_warn(&messages::download::warn_illustration_download(url, err));
                     }
                 }

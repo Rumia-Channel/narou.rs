@@ -18,6 +18,7 @@
 
 pub mod error;
 pub mod aliases;
+pub mod debug;
 pub mod events;
 pub mod convert;
 pub mod messages;
