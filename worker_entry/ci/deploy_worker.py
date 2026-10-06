@@ -44,7 +44,9 @@ runtime が挿絵の保存先を S3 に固定する。既存 D1 のマーカー�
 - `SERVICE_DOMAIN` / `DEVELOP_DOMAIN` … custom domain。secret を推奨（ログへ出さない）
 - `NAROU_DEPLOY_URL` … smoke の宛先を明示する（既定は domain → workers.dev）
 - `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` … Access の service token。
-  Access に遮られた場合、必須 S3 検証は失敗する。DNS/TLS エラーも省略しない。
+  custom domain が Access の内側にある場合は必須。無いままでは必須の S3 検証が
+  Worker に到達できず 403 で失敗する (S3 LIST の失敗は Worker が 503 で返し、
+  この経路で 403 は返さない。403 は前段で弾かれた印)。DNS/TLS エラーも省略しない。
 
 ローカルからは実行しない（Cloudflare の資格情報が要る）。CI からのみ呼ぶ。
 """
@@ -66,6 +68,18 @@ from typing import NoReturn
 WORKER_DIR = Path(__file__).resolve().parent.parent
 TARGETS = ("develop", "production")
 WORKER_URL_PATTERN = re.compile(r"https://[A-Za-z0-9.-]+\.workers\.dev")
+
+# 必須の S3 検証が 403 で返ったときの説明。Worker 自身は S3 LIST の失敗を
+# 503 で返し、この経路で 403 は返さないため、403 は前段 (Cloudflare Access や
+# WAF) で弾かれたことを意味する。custom domain が Access の内側にある構成では
+# service token を CI に渡すまでこの検証は通らない。
+ACCESS_BLOCKED_HINT = (
+    "the request was blocked before the Worker (Cloudflare Access or WAF). "
+    "This route answers 503 for a failing S3 LIST and never 403, so the deployment "
+    "itself was not reached. Set secrets CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET "
+    "(an Access service token allowed by the application policy) in the Cloudflare "
+    "environment, or bypass Access for the probed path"
+)
 
 
 def fail(message: str) -> NoReturn:
@@ -184,17 +198,19 @@ def probe_get(base_url: str, path: str, *, token: bool = True) -> tuple[int, byt
         return response.status, response.read(16 * 1024 + 1)
 
 
-def probe_json(base_url: str, path: str, label: str, *, token: bool = True) -> dict:
+def probe_json(base_url: str, path: str, label: str, *, token: bool = True,
+               blocked_hint: str | None = None) -> dict:
     """200 の JSON オブジェクトを返す。それ以外は {label} つきで失敗。"""
     try:
         status, raw = probe_get(base_url, path, token=token)
-        if status != 200:
-            fail(f"{label} failed (HTTP {status}); deployment is not verified")
     except urllib.error.HTTPError as error:
-        error.close()
-        fail(f"{label} failed (HTTP {error.code}); check Worker/Access authentication and configuration")
+        with error:
+            status = error.code
+        fail(probe_failure(label, status, blocked_hint))
     except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
         fail(f"{label} could not reach the deployment; check DNS/TLS/network. Deployment is not verified")
+    if status != 200:
+        fail(probe_failure(label, status, blocked_hint))
     if len(raw) > 16 * 1024:
         fail(f"{label} returned an oversized response; deployment is not verified")
     try:
@@ -204,6 +220,13 @@ def probe_json(base_url: str, path: str, label: str, *, token: bool = True) -> d
     if not isinstance(payload, dict):
         fail(f"{label} returned an unexpected payload; deployment is not verified")
     return payload
+
+
+def probe_failure(label: str, status: int, blocked_hint: str | None) -> str:
+    """診断失敗の文言。403 は「Worker の前段で弾かれた」ことを示す。"""
+    if status == 403 and blocked_hint:
+        return f"{label} failed (HTTP 403); {blocked_hint}"
+    return f"{label} failed (HTTP {status}); check Worker/Access authentication and configuration"
 
 
 def verify_health(base_url: str) -> None:
@@ -263,7 +286,12 @@ def verify_s3(base_url: str) -> bool | None:
             "LIST まで検証するには secrets.NAROU_ADMIN_TOKEN にも同じ値を置いてください"
         )
         return None
-    payload = probe_json(base_url, "/api/storage/mode?probe=s3", "S3 verification")
+    payload = probe_json(
+        base_url,
+        "/api/storage/mode?probe=s3",
+        "S3 verification",
+        blocked_hint=ACCESS_BLOCKED_HINT,
+    )
     if (payload.get("success") is not True
             or payload.get("metadata_backend") != "d1"
             or payload.get("illustration_backend") != "s3" or payload.get("s3_required") is not True

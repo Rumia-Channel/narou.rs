@@ -221,6 +221,44 @@ class ProbeTests(unittest.TestCase):
             with self.subTest(status=status), self.assertRaises(SystemExit):
                 self.probe(VERIFIED, status)
 
+    def test_access_blocked_probe_names_the_service_token_remedy(self):
+        # Access in front of the custom domain answers 403 before the Worker
+        # (a failing S3 LIST answers 503 on this route, never 403). The failure
+        # must name the two secrets that let CI through.
+        opener = Mock()
+        opener.open.side_effect = urllib.error.HTTPError(
+            "https://worker.example.invalid/api/storage/mode?probe=s3",
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(b""),
+        )
+        with patch.object(deploy.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaises(SystemExit) as failure:
+                deploy.verify_s3("https://worker.example.invalid")
+        message = str(failure.exception)
+        self.assertIn("HTTP 403", message)
+        self.assertIn("CF_ACCESS_CLIENT_ID", message)
+        self.assertIn("CF_ACCESS_CLIENT_SECRET", message)
+        self.assertNotIn("worker.example.invalid", message)
+        self.assertNotIn("fake-admin-token", message)
+
+    def test_other_probe_failures_keep_the_generic_message(self):
+        opener = Mock()
+        opener.open.side_effect = urllib.error.HTTPError(
+            "https://worker.example.invalid/api/storage/mode?probe=s3",
+            401,
+            "Unauthorized",
+            {},
+            io.BytesIO(b""),
+        )
+        with patch.object(deploy.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaises(SystemExit) as failure:
+                deploy.verify_s3("https://worker.example.invalid")
+        message = str(failure.exception)
+        self.assertIn("HTTP 401", message)
+        self.assertNotIn("CF_ACCESS_CLIENT_ID", message)
+
     def test_provider_failures_do_not_leak_credentials_or_urls(self):
         for error in (urllib.error.HTTPError("https://private.invalid", 403, "secret-detail", {}, None), urllib.error.URLError("secret-detail"), TimeoutError("secret-detail"), ValueError("secret-detail"), deploy.http.client.HTTPException("secret-detail")):
             with self.subTest(error=error), patch.object(deploy.urllib.request, "build_opener") as factory:
