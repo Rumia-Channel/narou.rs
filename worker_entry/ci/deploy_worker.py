@@ -72,6 +72,14 @@ WORKER_DIR = Path(__file__).resolve().parent.parent
 TARGETS = ("develop", "production")
 WORKER_URL_PATTERN = re.compile(r"https://[A-Za-z0-9.-]+\.workers\.dev")
 
+# 配備後の診断 GET に載せる User-Agent。アプリ本体の既定値と同じブラウザ風の
+# 文字列を使う (`src/downloader/mod.rs` の `DEFAULT_USER_AGENT`)。urllib の既定
+# (`Python-urllib/3.x`) は Cloudflare のボット判定に掛かり、Worker の手前で
+# 403 になる。
+PROBE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0"
+)
+
 # 必須の S3 検証が 403 で返ったときの説明。Worker 自身は S3 LIST の失敗を
 # 503 で返し、この経路で 403 は返さないため、403 は前段 (Cloudflare Access や
 # WAF) で弾かれたことを意味する。custom domain が Access の内側にある構成では
@@ -87,7 +95,25 @@ ACCESS_BLOCKED_NOTICE = (
 
 
 class AccessBlocked(Exception):
-    """前段 (Cloudflare Access / WAF) が Worker より先に 403 を返した。"""
+    """前段 (Cloudflare Access / WAF) が Worker より先に 403 を返した。
+
+    `detail` は前段が付けた手掛かり (`cf-mitigated` / `content-type`) で、
+    原因の切り分け用。秘密値は含めない。
+    """
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+def blocked_detail(headers) -> str:
+    """403 応答から原因の手掛かりだけを取り出す (秘密・本文は含めない)。"""
+    parts = []
+    for name in ("cf-mitigated", "content-type"):
+        value = (headers.get(name) or "").strip() if headers else ""
+        if value:
+            parts.append(f"{name}={value[:40]}")
+    return ", ".join(parts)
 
 
 def fail(message: str) -> NoReturn:
@@ -184,7 +210,10 @@ def deployment_url(base_url: str) -> None:
 
 def probe_headers(token: bool = True) -> dict[str, str]:
     """診断 GET のヘッダ。Bearer は `token=True` かつ値があるときだけ載せる。"""
-    headers = {"Accept": "application/json"}
+    # urllib 既定の `Python-urllib/3.x` は Cloudflare のボット判定で 403 になる
+    # (同じ配備へ Node の fetch で流す contract.mjs は通る)。アプリ本体と同じく
+    # ブラウザ風の UA を必ず送る。
+    headers = {"Accept": "application/json", "User-Agent": PROBE_USER_AGENT}
     value = admin_token()
     if token and value:
         headers["Authorization"] = f"Bearer {value}"
@@ -218,8 +247,9 @@ def probe_json(base_url: str, path: str, label: str, *, token: bool = True,
     except urllib.error.HTTPError as error:
         with error:
             status = error.code
+            detail = blocked_detail(error.headers) if status == 403 else ""
         if status == 403 and blocked_is_access:
-            raise AccessBlocked from None
+            raise AccessBlocked(detail) from None
         fail(probe_failure(label, status))
     except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
         fail(f"{label} could not reach the deployment; check DNS/TLS/network. Deployment is not verified")
@@ -239,7 +269,7 @@ def probe_json(base_url: str, path: str, label: str, *, token: bool = True,
 
 
 def probe_failure(label: str, status: int) -> str:
-    """診断失敗の文言。403 以外は認証・構成の確認を促す。"""
+    """診断失敗の一般文言。403 を [`AccessBlocked`] として扱わない呼び出しで使う。"""
     return f"{label} failed (HTTP {status}); check Worker/Access authentication and configuration"
 
 
@@ -311,8 +341,9 @@ def verify_s3(base_url: str) -> str:
             "S3 verification",
             blocked_is_access=True,
         )
-    except AccessBlocked:
-        print(f"::warning::{ACCESS_BLOCKED_NOTICE}")
+    except AccessBlocked as blocked:
+        detail = f" (edge response headers: {blocked.detail})" if blocked.detail else ""
+        print(f"::warning::{ACCESS_BLOCKED_NOTICE}{detail}")
         return "skipped: blocked before the Worker (Cloudflare Access or WAF); not verified"
     if (payload.get("success") is not True
             or payload.get("metadata_backend") != "d1"

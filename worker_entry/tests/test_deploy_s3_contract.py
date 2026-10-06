@@ -223,6 +223,10 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), "Bearer fake-admin-token")
         self.assertEqual(request.get_header("Cf-access-client-id"), "fake-access-id")
         self.assertEqual(request.get_header("Cf-access-client-secret"), "fake-access-secret")
+        # Cloudflare's bot rules answer 403 to urllib's default user agent while
+        # the Node smoke passes, so the probe must identify itself as a browser.
+        self.assertEqual(request.get_header("User-agent"), deploy.PROBE_USER_AGENT)
+        self.assertNotIn("Python-urllib", request.get_header("User-agent") or "")
         self.assertLessEqual(call.kwargs["timeout"], 60)
 
     def test_wrong_backend_flag_or_list_result_is_not_success(self):
@@ -250,7 +254,7 @@ class ProbeTests(unittest.TestCase):
             "https://worker.example.invalid/api/storage/mode?probe=s3",
             403,
             "Forbidden",
-            {},
+            {"cf-mitigated": "challenge"},
             io.BytesIO(b""),
         )
         output = io.StringIO()
@@ -264,6 +268,8 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("CF_ACCESS_CLIENT_ID", printed)
         self.assertIn("CF_ACCESS_CLIENT_SECRET", printed)
         self.assertIn("NOT verified", printed)
+        # The edge's own marker is logged for diagnosis (never secrets or bodies).
+        self.assertIn("cf-mitigated=challenge", printed)
         self.assertNotIn("worker.example.invalid", printed)
         self.assertNotIn("fake-admin-token", printed)
 
