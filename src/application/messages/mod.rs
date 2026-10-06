@@ -16,6 +16,7 @@
 
 pub mod convert;
 pub mod download;
+pub mod flush;
 pub mod jobs;
 pub mod mail;
 pub mod send;

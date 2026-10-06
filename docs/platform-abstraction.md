@@ -592,6 +592,12 @@ Worker は `PushHubSink` 経由で Web コンソールの `#console` へ流す�
 `Stream::Stdout`**（native がエラーを stdout に出しているのに合わせる。Web UI は `target_console`
 が `stdout` 以外だと 2 番目のコンソールへ回すため）。
 
+Worker の `PushHubSink` は行ごとに送信タスク (`spawn_local`) を起動して**その場で**送る（順序・
+取りこぼし・最小送信間隔は `messages::flush::FlushQueue` が管理する）。ジョブ境界の `drain()` は
+送信タスクを待って残りを送る最後の砦で、ジョブの終端イベントより先にコンソール行を届ける
+（2026-10-06 修正: 以前は境界までバッファしていたため、DL の 1 話ごとの進捗が完了時にまとめて
+表示されていた）。
+
 | 操作 | メッセージ（例） | native | Worker | タイミング |
 |---|---|---|---|---|
 | download | `ID:n <title> のDL開始` / `第N部分 <subtitle> (n/m)` / `… のDL完了` | ✅ | ✅ `emit_download_result_lines` | DL開始・各話・完了 |

@@ -21,8 +21,10 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use narou_rs::application::messages;
 use narou_rs::application::push_events;
 use narou_rs::platform::ProgressReporter;
 use serde_json::{json, Value};
@@ -43,6 +45,11 @@ const MAX_EVENTS_PER_POST: usize = 64;
 /// `HubProgress` が `progressbar.step` を送る percent 刻み。1 ジョブあたり
 /// 高々 4 通の step POST に抑え、DO subrequest を食い潰さない。
 const STEP_PERCENT_INCREMENT: u64 = 25;
+/// ジョブ終端 (`PushHubSink::drain`) で送信タスクの完了を待つときの
+/// ポーリング間隔 (ms) と上限回数。送信タスクは空になったら即座に終了する
+/// ので通常は 1〜2 回で抜ける (間引き中に積まれた分を送る場合だけ延びる)。
+const DRAIN_POLL_MS: u64 = 10;
+const DRAIN_WAIT_STEPS: usize = 50;
 
 /// 履歴リプレイ対象のイベント種別。native の `history_type_replayable`
 /// (`src/web/push.rs`) と同じ集合 — `table.reload` 等の制御イベントは
@@ -174,23 +181,32 @@ fn event_batches<'a>(events: &'a [Value]) -> impl Iterator<Item = &'a [Value]> +
 /// ユーザーに見える行を PushHub の `echo` イベントへ流す
 /// [`narou_rs::application::messages::MessageSink`] 実装。
 ///
-/// `emit` は同期 API なので行はバッファへ積み、ジョブの区切りで
-/// [`Self::drain`] が `broadcast_best_effort` でまとめて送る。Worker は
-/// 単一スレッドで jobs を直列実行するため `Mutex` が競合しない
-/// (`MessageSink: Send + Sync` への適合のために `RefCell` ではなく
-/// `Mutex` を使う)。`target_console` は [`Stream::target_console`]
+/// `emit` は同期 API なので、行はバッファへ積んでから送信タスク
+/// (`wasm_bindgen_futures::spawn_local`) を起動する。タスクは常に 1 本で、
+/// 積まれた行をまとめて 1 POST にしつつ、送信のたびに最小間隔だけ間引く
+/// ([`messages::flush::FlushQueue`] が順序・取りこぼし・間隔を管理する)。
+///
+/// 以前はジョブの区切りでだけ `drain()` していたため、ダウンロードの
+/// 1 話ごとの進捗行が完了時にまとめて出ていた。ジョブ境界の `drain()` は
+/// 残りの送信を保証する最後の砦として残す。
+///
+/// Worker は単一スレッドで jobs を直列実行するため `Mutex` が競合しない
+/// (`MessageSink: Send + Sync` への適合のために `RefCell` ではなく `Mutex`)。
+/// `target_console` は [`Stream::target_console`](narou_rs::application::messages::Stream::target_console)
 /// (native の stdout=`"stdout"` / stderr=`"stdout2"` 対応) に委譲する。
 #[derive(Debug)]
 pub struct PushHubSink {
     client: PushHubClient,
-    buffer: std::sync::Mutex<Vec<Value>>,
+    queue: Arc<messages::flush::FlushQueue<Value>>,
 }
 
 impl PushHubSink {
     fn new(client: PushHubClient) -> Self {
         Self {
             client,
-            buffer: std::sync::Mutex::new(Vec::new()),
+            queue: Arc::new(messages::flush::FlushQueue::new(
+                messages::flush::DEFAULT_MIN_INTERVAL_MS,
+            )),
         }
     }
 
@@ -203,15 +219,46 @@ impl PushHubSink {
         sink
     }
 
+    /// 積まれた行を送るタスクを起動する (既に動いていれば何もしない)。
+    fn spawn_sender(&self) {
+        let client = self.client.clone();
+        let queue = Arc::clone(&self.queue);
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                while let Some(events) = queue.take() {
+                    client.broadcast_best_effort(&events).await;
+                    queue.mark_sent(now_ms());
+                    // まだ積まれているときだけ間隔を空ける (サブリクエスト保護)。
+                    // 空なら即座にループを抜けるので、完了時の遅延は増えない。
+                    if queue.is_pending() {
+                        let wait = queue.wait_ms(now_ms());
+                        if wait > 0 {
+                            worker::Delay::from(std::time::Duration::from_millis(wait)).await;
+                        }
+                    }
+                }
+                // idle に戻す直前に積まれた行は、自分でもう一周して送る。
+                if !queue.finish() {
+                    break;
+                }
+            }
+        });
+    }
+
     /// 積まれた行を PushHub へ送る (best-effort)。ジョブ実行の区切りごとに
     /// 呼び、上限を超える場合は複数 POST に分ける。
+    ///
+    /// 送信タスクが動いている間はそれが捌くのを待つ: ジョブの終端イベントは
+    /// `drain()` の後に送られるため、ここで待たないと最後の行が「完了」より
+    /// 後に届きうる。待ち切れなかった分はこの場で送る (POST は発行順に届く)。
     pub async fn drain(&self) {
-        let events = self
-            .buffer
-            .lock()
-            .map(|mut buffer| std::mem::take(&mut *buffer))
-            .unwrap_or_default();
-        if !events.is_empty() {
+        for _ in 0..DRAIN_WAIT_STEPS {
+            if !self.queue.is_sending() {
+                break;
+            }
+            worker::Delay::from(std::time::Duration::from_millis(DRAIN_POLL_MS)).await;
+        }
+        if let Some(events) = self.queue.take() {
             self.client.broadcast_best_effort(&events).await;
         }
     }
@@ -219,10 +266,15 @@ impl PushHubSink {
 
 impl narou_rs::application::messages::MessageSink for PushHubSink {
     fn emit(&self, stream: narou_rs::application::messages::Stream, text: &str) {
-        if let Ok(mut buffer) = self.buffer.lock() {
-            buffer.push(echo(text, stream.target_console()));
+        if self.queue.push(echo(text, stream.target_console())) {
+            self.spawn_sender();
         }
     }
+}
+
+/// `js_sys::Date::now()` のミリ秒 (間引きの基準にだけ使う単調ではない時計)。
+fn now_ms() -> u64 {
+    js_sys::Date::now() as u64
 }
 
 #[cfg(test)]
