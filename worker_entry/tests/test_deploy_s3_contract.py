@@ -140,7 +140,24 @@ class DeploymentFlowTests(unittest.TestCase):
         deploy.main()
         self.calls.deploy.assert_called_once()
         self.calls.smoke.assert_called_once()
-        self.assertIsNone(self.calls.summary.call_args.kwargs["s3_ok"])
+        self.assertTrue(self.calls.summary.call_args.kwargs["s3_status"].startswith("skipped:"))
+
+    def test_access_blocked_deployment_completes_as_skipped(self):
+        # The whole deployment sits behind Cloudflare Access: the mandatory S3
+        # check cannot run, so the job reports it as skipped instead of failing,
+        # and the step summary never claims the S3 backend was verified.
+        self.http.return_value.open.side_effect = urllib.error.HTTPError(
+            "https://worker.example.invalid/api/storage/mode?probe=s3",
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(b""),
+        )
+        deploy.main()
+        self.calls.deploy.assert_called_once()
+        status = self.calls.summary.call_args.kwargs["s3_status"]
+        self.assertTrue(status.startswith("skipped:"), status)
+        self.assertIn("Access", status)
 
     def test_store_only_token_fails_when_probe_answers_without_auth(self):
         # If the authenticated probe answers 200 without a token, the worker is
@@ -217,14 +234,17 @@ class ProbeTests(unittest.TestCase):
                 self.probe(payload)
 
     def test_redirect_auth_and_server_errors_are_failures(self):
-        for status in (301, 302, 307, 401, 403, 404, 503):
+        # 403 is handled separately: it means the edge answered before the
+        # Worker (see the Access-blocked tests).
+        for status in (301, 302, 307, 401, 404, 500, 503):
             with self.subTest(status=status), self.assertRaises(SystemExit):
                 self.probe(VERIFIED, status)
 
-    def test_access_blocked_probe_names_the_service_token_remedy(self):
+    def test_access_blocked_probe_skips_with_a_warning(self):
         # Access in front of the custom domain answers 403 before the Worker
-        # (a failing S3 LIST answers 503 on this route, never 403). The failure
-        # must name the two secrets that let CI through.
+        # (a failing S3 LIST answers 503 on this route, never 403). CI cannot
+        # get past that, so the check is skipped with a warning naming the two
+        # secrets -- never reported as verified.
         opener = Mock()
         opener.open.side_effect = urllib.error.HTTPError(
             "https://worker.example.invalid/api/storage/mode?probe=s3",
@@ -233,34 +253,30 @@ class ProbeTests(unittest.TestCase):
             {},
             io.BytesIO(b""),
         )
-        with patch.object(deploy.urllib.request, "build_opener", return_value=opener):
-            with self.assertRaises(SystemExit) as failure:
-                deploy.verify_s3("https://worker.example.invalid")
-        message = str(failure.exception)
-        self.assertIn("HTTP 403", message)
-        self.assertIn("CF_ACCESS_CLIENT_ID", message)
-        self.assertIn("CF_ACCESS_CLIENT_SECRET", message)
-        self.assertNotIn("worker.example.invalid", message)
-        self.assertNotIn("fake-admin-token", message)
+        output = io.StringIO()
+        with patch.object(deploy.urllib.request, "build_opener", return_value=opener), \
+                contextlib.redirect_stdout(output):
+            status = deploy.verify_s3("https://worker.example.invalid")
+        self.assertTrue(status.startswith("skipped:"), status)
+        self.assertIn("Access", status)
+        printed = output.getvalue()
+        self.assertIn("::warning::", printed)
+        self.assertIn("CF_ACCESS_CLIENT_ID", printed)
+        self.assertIn("CF_ACCESS_CLIENT_SECRET", printed)
+        self.assertIn("NOT verified", printed)
+        self.assertNotIn("worker.example.invalid", printed)
+        self.assertNotIn("fake-admin-token", printed)
 
-    def test_other_probe_failures_keep_the_generic_message(self):
+    def test_unreachable_deployment_is_not_skipped(self):
+        # Only an edge 403 is a skip: DNS/TLS/network failures still fail.
         opener = Mock()
-        opener.open.side_effect = urllib.error.HTTPError(
-            "https://worker.example.invalid/api/storage/mode?probe=s3",
-            401,
-            "Unauthorized",
-            {},
-            io.BytesIO(b""),
-        )
+        opener.open.side_effect = urllib.error.URLError("no route")
         with patch.object(deploy.urllib.request, "build_opener", return_value=opener):
-            with self.assertRaises(SystemExit) as failure:
+            with self.assertRaises(SystemExit):
                 deploy.verify_s3("https://worker.example.invalid")
-        message = str(failure.exception)
-        self.assertIn("HTTP 401", message)
-        self.assertNotIn("CF_ACCESS_CLIENT_ID", message)
 
     def test_provider_failures_do_not_leak_credentials_or_urls(self):
-        for error in (urllib.error.HTTPError("https://private.invalid", 403, "secret-detail", {}, None), urllib.error.URLError("secret-detail"), TimeoutError("secret-detail"), ValueError("secret-detail"), deploy.http.client.HTTPException("secret-detail")):
+        for error in (urllib.error.HTTPError("https://private.invalid", 500, "secret-detail", {}, None), urllib.error.URLError("secret-detail"), TimeoutError("secret-detail"), ValueError("secret-detail"), deploy.http.client.HTTPException("secret-detail")):
             with self.subTest(error=error), patch.object(deploy.urllib.request, "build_opener") as factory:
                 factory.return_value.open.side_effect = error
                 with self.assertRaises(SystemExit) as failure:

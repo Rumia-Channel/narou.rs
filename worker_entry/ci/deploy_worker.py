@@ -8,7 +8,9 @@
 4. secret を `--secrets-file` で投入してデプロイする
 5. 認証済み診断 API で実際の S3 backend と LIST を検証する（トークンが
    Secrets Store 専用の場合は LIST を notice 付きで省略し、health と
-   未認証 401 の fail-closed 確認だけを行う）
+   未認証 401 の fail-closed 確認だけを行う。custom domain が Cloudflare
+   Access の内側にあり CI に service token が無い場合は、前段の 403 を
+   警告つきのスキップとして報告し、成功扱いにはしない）
 6. デプロイ先の URL に対して契約テストを流す（smoke。`NAROU_SMOKE=0` で省略）
 
 CI は NAROU_REQUIRE_S3=true 固定。旧 D1 の挿絵との互換性は維持せず、
@@ -44,9 +46,10 @@ runtime が挿絵の保存先を S3 に固定する。既存 D1 のマーカー�
 - `SERVICE_DOMAIN` / `DEVELOP_DOMAIN` … custom domain。secret を推奨（ログへ出さない）
 - `NAROU_DEPLOY_URL` … smoke の宛先を明示する（既定は domain → workers.dev）
 - `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` … Access の service token。
-  custom domain が Access の内側にある場合は必須。無いままでは必須の S3 検証が
-  Worker に到達できず 403 で失敗する (S3 LIST の失敗は Worker が 503 で返し、
-  この経路で 403 は返さない。403 は前段で弾かれた印)。DNS/TLS エラーも省略しない。
+  custom domain が Access の内側にある場合は、無いと必須の S3 検証が Worker に
+  到達できない (S3 LIST の失敗は Worker が 503 で返し、この経路で 403 は返さない。
+  403 は前段で弾かれた印)。その場合は失敗にせず、警告つきのスキップとして報告する
+  (ステップサマリも `skipped`)。DNS/TLS エラーは省略しない。
 
 ローカルからは実行しない（Cloudflare の資格情報が要る）。CI からのみ呼ぶ。
 """
@@ -72,14 +75,19 @@ WORKER_URL_PATTERN = re.compile(r"https://[A-Za-z0-9.-]+\.workers\.dev")
 # 必須の S3 検証が 403 で返ったときの説明。Worker 自身は S3 LIST の失敗を
 # 503 で返し、この経路で 403 は返さないため、403 は前段 (Cloudflare Access や
 # WAF) で弾かれたことを意味する。custom domain が Access の内側にある構成では
-# service token を CI に渡すまでこの検証は通らない。
-ACCESS_BLOCKED_HINT = (
-    "the request was blocked before the Worker (Cloudflare Access or WAF). "
-    "This route answers 503 for a failing S3 LIST and never 403, so the deployment "
-    "itself was not reached. Set secrets CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET "
-    "(an Access service token allowed by the application policy) in the Cloudflare "
-    "environment, or bypass Access for the probed path"
+# service token を CI に渡すまでこの検証は通らない。CI 側からは手の打ちようが
+# ないので、失敗ではなく警告つきスキップとして報告し、成功とは扱わない。
+ACCESS_BLOCKED_NOTICE = (
+    "the mandatory S3 check did not run: HTTP 403 was answered before the Worker "
+    "(Cloudflare Access or WAF). This route answers 503 for a failing S3 LIST and never 403, "
+    "so the deployment was not reached and is NOT verified. Set secrets CF_ACCESS_CLIENT_ID "
+    "and CF_ACCESS_CLIENT_SECRET (an Access service token allowed by the application policy) "
+    "in the Cloudflare environment, or bypass Access for the probed path, to run the full check"
 )
+
+
+class AccessBlocked(Exception):
+    """前段 (Cloudflare Access / WAF) が Worker より先に 403 を返した。"""
 
 
 def fail(message: str) -> NoReturn:
@@ -199,18 +207,26 @@ def probe_get(base_url: str, path: str, *, token: bool = True) -> tuple[int, byt
 
 
 def probe_json(base_url: str, path: str, label: str, *, token: bool = True,
-               blocked_hint: str | None = None) -> dict:
-    """200 の JSON オブジェクトを返す。それ以外は {label} つきで失敗。"""
+               blocked_is_access: bool = False) -> dict:
+    """200 の JSON オブジェクトを返す。それ以外は {label} つきで失敗。
+
+    `blocked_is_access=True` のときだけ 403 を [`AccessBlocked`] として上げる
+    (この経路で Worker が 403 を返すことはないため、前段で弾かれた印になる)。
+    """
     try:
         status, raw = probe_get(base_url, path, token=token)
     except urllib.error.HTTPError as error:
         with error:
             status = error.code
-        fail(probe_failure(label, status, blocked_hint))
+        if status == 403 and blocked_is_access:
+            raise AccessBlocked from None
+        fail(probe_failure(label, status))
     except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
         fail(f"{label} could not reach the deployment; check DNS/TLS/network. Deployment is not verified")
+    if status == 403 and blocked_is_access:
+        raise AccessBlocked
     if status != 200:
-        fail(probe_failure(label, status, blocked_hint))
+        fail(probe_failure(label, status))
     if len(raw) > 16 * 1024:
         fail(f"{label} returned an oversized response; deployment is not verified")
     try:
@@ -222,10 +238,8 @@ def probe_json(base_url: str, path: str, label: str, *, token: bool = True,
     return payload
 
 
-def probe_failure(label: str, status: int, blocked_hint: str | None) -> str:
-    """診断失敗の文言。403 は「Worker の前段で弾かれた」ことを示す。"""
-    if status == 403 and blocked_hint:
-        return f"{label} failed (HTTP 403); {blocked_hint}"
+def probe_failure(label: str, status: int) -> str:
+    """診断失敗の文言。403 以外は認証・構成の確認を促す。"""
     return f"{label} failed (HTTP {status}); check Worker/Access authentication and configuration"
 
 
@@ -266,11 +280,15 @@ def verify_health(base_url: str) -> None:
         fail("the deployment must answer 401 authentication_required without a token")
 
 
-def verify_s3(base_url: str) -> bool | None:
+def verify_s3(base_url: str) -> str:
     """選択済み S3 handle の実 LIST を確認する。失敗・未実行は成功扱いしない。
 
-    戻り値は `True`=検証済み、`None`=認証付き検査を省略 (トークンが Secrets
-    Store 専用で CI 側に値が無い場合。health と 401 の fail-closed は確認済み)。
+    戻り値はステップサマリに出す状態文字列で、`"ok"` か
+    `"skipped: <理由>"`。401 / 503 / 到達不可などの失敗は例外で終わる。
+
+    403 だけは前段 (Cloudflare Access / WAF) が Worker より先に返した印であり、
+    CI 側からは回避できないため、警告つきのスキップとして報告する (`summary` も
+    `skipped` と表示する)。成功扱いにはしない。
     """
     require_probe_auth()
     deployment_url(base_url)
@@ -285,20 +303,24 @@ def verify_s3(base_url: str) -> bool | None:
             "S3 LIST 検証を省略しました (health の検査と未認証 401 の確認は実施済み)。"
             "LIST まで検証するには secrets.NAROU_ADMIN_TOKEN にも同じ値を置いてください"
         )
-        return None
-    payload = probe_json(
-        base_url,
-        "/api/storage/mode?probe=s3",
-        "S3 verification",
-        blocked_hint=ACCESS_BLOCKED_HINT,
-    )
+        return "skipped: admin token is available only in the Secrets Store"
+    try:
+        payload = probe_json(
+            base_url,
+            "/api/storage/mode?probe=s3",
+            "S3 verification",
+            blocked_is_access=True,
+        )
+    except AccessBlocked:
+        print(f"::warning::{ACCESS_BLOCKED_NOTICE}")
+        return "skipped: blocked before the Worker (Cloudflare Access or WAF); not verified"
     if (payload.get("success") is not True
             or payload.get("metadata_backend") != "d1"
             or payload.get("illustration_backend") != "s3" or payload.get("s3_required") is not True
             or payload.get("s3_list") != "ok"):
         fail("S3 verification did not confirm D1 metadata, required S3 illustrations and a successful S3 LIST")
     print("S3 deployment check: selected backend and read-only LIST verified")
-    return True
+    return "ok"
 
 
 def provision(target: str) -> dict[str, str]:
@@ -495,12 +517,13 @@ def smoke(base_url: str) -> bool | None:
     return result.returncode == 0
 
 
-def summary(target: str, url: str, smoke_ok: bool | None, *, hidden_url: bool = False, s3_ok: bool | None = False) -> None:
+def summary(target: str, url: str, smoke_ok: bool | None, *, hidden_url: bool = False,
+            s3_status: str = "not verified") -> None:
     lines = [
         f"### Worker deploy ({target})",
         "",
         f"- URL: {'（custom domain。ログでは伏せています）' if hidden_url else url}",
-        f"- S3 backend + LIST: {'ok' if s3_ok else 'skipped (admin token store-only)' if s3_ok is None else 'not verified'}",
+        f"- S3 backend + LIST: {s3_status}",
         f"- smoke: {'ok' if smoke_ok else 'skipped' if smoke_ok is None else 'failed'}",
     ]
     path = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -548,13 +571,13 @@ def main() -> None:
     target_url, hidden_url = smoke_url(target, url)
     if target_url is None:
         fail("Mandatory S3 verification needs a deployment URL; configure NAROU_DEPLOY_URL or a deployment domain")
-    s3_result = verify_s3(target_url)
+    s3_status = verify_s3(target_url)
     smoke_result: bool | None = None
     if os.environ.get("NAROU_SMOKE", "1") == "0":
         pass
     else:
         smoke_result = smoke(target_url)
-    summary(target, target_url, smoke_result, hidden_url=hidden_url, s3_ok=s3_result)
+    summary(target, target_url, smoke_result, hidden_url=hidden_url, s3_status=s3_status)
     if smoke_result is False:
         fail("smoke test failed against the deployment")
 

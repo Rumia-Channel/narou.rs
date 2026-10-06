@@ -311,7 +311,7 @@ phase と対象を持たない共通カーソル/`done` は移行完了の証明
 | `NAROU_ADMIN_TOKEN` | Zero Trust が境界なら不要 | Worker API の Bearer。`--secrets-file` で Worker secret として投入。auth 有効で未設定ならデプロイを失敗させる（fail-closed） |
 | `NAROU_RS_LOGIN_KEY` | 任意 | 保存したログイン Cookie の AEAD 鍵。base64 で、32 バイトはそのまま、16 バイト以上（例 `openssl rand -base64 24`）は SHA-256 で伸長。native の `.narou/login.key` と同じ値にすると資格情報を共有できる。未設定なら平文行だけを読み、notice を出す |
 | `NAROU_S3_ACCESS_KEY_ID` / `NAROU_S3_SECRET_ACCESS_KEY` | 任意 | S3 資格情報。`S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` という Worker secret として投入する。未設定なら Secrets Store か `wrangler secret put` で別途投入する（notice を出す） |
-| `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | 任意 | Access の service token。smoke を custom domain 越しに流す。未設定で Access に弾かれた場合は smoke を省略する |
+| `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | 任意 | Access の service token。smoke と必須の S3 検証を custom domain 越しに流す。未設定で Access に弾かれた場合（HTTP 403）は警告つきでスキップし、成功扱いにしない |
 
 #### `Cloudflare` に置く var
 
@@ -351,7 +351,9 @@ phase と対象を持たない共通カーソル/`done` は移行完了の証明
   配備後は health/live・health/ready と未認証 API の 401 を検査し、認証付き S3 LIST と
   契約 smoke は「省略」と明示する（成功とは扱わない）。全検査を実行するには
   CI の secret `NAROU_ADMIN_TOKEN` にも同じ値を渡す。Access の前段認証は別途
-  `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` が必要で、403 を成功に変えない。
+  `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` が必要で、403 を成功にはしない
+  (2026-10-06: service token が無い場合は必須の S3 検証も `::warning::` 付きの
+  スキップとして報告し、ステップサマリを `skipped: …; not verified` にする)。
 - **`wrangler.<target>.toml` に直書きする運用も可**（参考実装の Dantalian はこの形で、`store_id` を
   3 テンプレートに直書きし、`secret_name` だけ CI から差し込んでいる）。直書きする場合は CI の
   `NAROU_SECRETS_STORE_ID` / `NAROU_S3_*_SECRET_NAME` は設定しない（両方書くとバインディングが
@@ -616,7 +618,9 @@ D1 を選んだ可能性がある。raw TEXT `s3` は旧実装でも S3 を選�
 
 配備後は認証済み `/api/storage/mode?probe=s3` により、実際の選択が S3、
 必須フラグが true、S3 の LIST が成功することを確認する。
-一般 smoke を省略しても、この検査は省略しない。Access/DNS/認証で到達不能なら失敗する。
+一般 smoke を省略しても、この検査は省略しない。ただし前段の Cloudflare Access が
+403 を返した場合だけは、CI から回避できないため `::warning::` 付きのスキップとして
+報告する (成功扱いにはせず、サマリも `skipped`)。401 / 503 / 到達不可は失敗させる。
 LIST は読取のみ・最大1件で、キーや資格情報、プロバイダー本文を応答やログに出さない。
 HTTP200でも正しい ListBucketResult の外側要素が無い応答は成功としない。
 この確認は GET/PUT 権限や既存データの移行完了を証明せず、SORAHOST の署名403解消も主張しない。
