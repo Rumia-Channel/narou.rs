@@ -233,6 +233,12 @@ jobs:
       NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ secrets.NAROU_RS_LOGIN_KEY_SECRET_NAME || vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
       # Zero Trust (Cloudflare Access) を境界にする場合は false にする。
       NAROU_AUTH_REQUIRED: ${{ vars.NAROU_AUTH_REQUIRED || 'true' }}
+      # 配備後の smoke (contract.mjs) でも S3 必須を確認する。contract.mjs は
+      # `NAROU_REQUIRE_S3=true` のときだけ `/api/storage/mode?probe=s3` を検査する。
+      # Python プローブが前段の 403 で警告つきスキップになった場合でも、Node 側の
+      # この検査が必須確認を維持する (secret ではなく固定値。render_config.py は
+      # 環境変数では NAROU_REQUIRE_S3 を変えられない)。
+      NAROU_REQUIRE_S3: "true"
       # Access の service token (custom domain 越しに smoke を流す場合だけ)。
       CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
       CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
@@ -404,6 +410,8 @@ jobs:
       NAROU_RS_LOGIN_KEY_SECRET_NAME: ${{ secrets.NAROU_RS_LOGIN_KEY_SECRET_NAME || vars.NAROU_RS_LOGIN_KEY_SECRET_NAME }}
       # Zero Trust (Cloudflare Access) を境界にする場合は false にする。
       NAROU_AUTH_REQUIRED: ${{ vars.NAROU_AUTH_REQUIRED || 'true' }}
+      # 配備後の smoke でも S3 必須を確認する (develop と同じ理由)。
+      NAROU_REQUIRE_S3: "true"
       # Access の service token (custom domain 越しに smoke を流す場合だけ)。
       CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
       CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}

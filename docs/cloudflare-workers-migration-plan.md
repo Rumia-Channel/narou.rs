@@ -463,6 +463,9 @@ Browser ──► Worker (fetch)
 - CI の smoke は前段の Access に弾かれた場合（`tests/contract.mjs` が exit 3 で通知）に「省略」とし、
   `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET`（Access の service token）を渡せば内側まで流せる。
   `NAROU_AUTH_REQUIRED=false` の環境では未認証で通し、認証系の検査だけを自動で省略する。
+- 配備ジョブの env には `NAROU_REQUIRE_S3=true` を置き、smoke 自身にも
+  `/api/storage/mode?probe=s3` の検査をさせる（contract.mjs はこの env が true のときだけ検査する）。
+  Python プローブが前段の 403 でスキップになった場合でも必須の S3 検証が残る。
 
 ### 3.3 Workers で提供しない機能（明示的に拒否する）
 
