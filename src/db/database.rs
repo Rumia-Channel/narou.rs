@@ -114,6 +114,9 @@ impl Database {
                             rename_imported_file(&index_path);
                         }
                     }
+                    // Novel rows exist now, so the freeze projection (skipped or
+                    // partial while `novels` was still empty) can be completed.
+                    state.resync_frozen_novels()?;
                     Some(repo)
                 }
                 None => None,

@@ -14,7 +14,7 @@
 //! environment variable `NAROU_RS_LEGACY_YAML=1` disables SQLite entirely and
 //! restores the pure-file behavior (debug / rollback escape hatch).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -136,14 +136,55 @@ impl StateDb {
     }
 
     /// `app_state` write that bypasses the compat file layer.
+    ///
+    /// The freeze payload additionally maintains the relational projection
+    /// (`frozen_novels`) so the shared status search expression keeps agreeing
+    /// with the inventory (see [`Self::project_frozen_novels`]).
     pub(crate) fn set_raw_db(&self, scope: &str, key: &str, value_yaml: &str) -> Result<()> {
+        {
+            let conn = self.conn.lock().expect("state db mutex poisoned");
+            conn.execute(
+                "INSERT INTO app_state (scope, key, value_json, value_yaml) VALUES (?, ?, '{}', ?)
+                 ON CONFLICT(scope, key) DO UPDATE SET value_yaml = excluded.value_yaml",
+                rusqlite::params![scope, key, value_yaml],
+            )
+            .map_err(super::sqlite_error)?;
+        }
+        if scope == "inv" && key == "freeze" {
+            self.project_frozen_novels(value_yaml)?;
+        }
+        Ok(())
+    }
+
+    /// Project the freeze payload onto `frozen_novels`.
+    ///
+    /// The payload is authoritative for native reads, but the shared status
+    /// expression (`sql/status_search_expression.sql`, which the Worker D1
+    /// adapter also uses with `frozen_novels` as its store) queries the table.
+    /// An unparseable payload is skipped rather than fatal: the write already
+    /// succeeded, and the next valid freeze write repairs the projection.
+    fn project_frozen_novels(&self, value_yaml: &str) -> Result<()> {
+        let ids = frozen_ids_from_payload(value_yaml);
+        let Some(ids) = ids else {
+            eprintln!(
+                "warning: could not parse the freeze state; frozen_novels was left unchanged"
+            );
+            return Ok(());
+        };
         let conn = self.conn.lock().expect("state db mutex poisoned");
-        conn.execute(
-            "INSERT INTO app_state (scope, key, value_json, value_yaml) VALUES (?, ?, '{}', ?)
-             ON CONFLICT(scope, key) DO UPDATE SET value_yaml = excluded.value_yaml",
-            rusqlite::params![scope, key, value_yaml],
-        )
-        .map_err(super::sqlite_error)?;
+        super::repository::sync_frozen_novels(&conn, &ids)
+    }
+
+    /// Re-derive `frozen_novels` from the stored freeze payload.
+    ///
+    /// Cheap and idempotent. Called once the novel records are available: the
+    /// first `reconcile_managed_files` run imports the freeze payload before
+    /// `database.yaml` has populated `novels`, so that projection has nothing
+    /// to attach to, and later launches do not revisit the renamed-away file.
+    pub fn resync_frozen_novels(&self) -> Result<()> {
+        if let Some(payload) = self.get_raw_db("inv", "freeze")? {
+            self.project_frozen_novels(&payload)?;
+        }
         Ok(())
     }
 
@@ -387,7 +428,9 @@ pub fn configure(narou_dir: &Path) -> Result<StateDb> {
 /// - `narou-compat` ON: files are authoritative — file content refreshes
 ///   `app_state`, and missing files are recreated from `app_state`.
 /// - `narou-compat` OFF (default): files are imported into `app_state` and
-///   renamed to `<name>.imported-<unix_ts>` (never deleted).
+///   renamed to `<name>.imported-<unix_ts>` (never deleted). `freeze` is
+///   imported as a union with the stored payload so a stale fragment file
+///   cannot unfreeze other novels (see [`merge_freeze_payload`]).
 ///
 /// Runs unconditionally (not only on a fresh database) so toggling the flag
 /// in either direction converges on the next launch.
@@ -408,7 +451,12 @@ fn reconcile_managed_files(state: &StateDb) -> Result<()> {
             }
         } else if let Some(content) = file_content {
             if !content.trim().is_empty() {
-                state.set_raw_db("inv", key, &content)?;
+                let payload = if *key == "freeze" {
+                    merge_freeze_payload(state.get_raw_db("inv", key)?.as_deref(), &content)
+                } else {
+                    content
+                };
+                state.set_raw_db("inv", key, &payload)?;
             }
             imported.push(path);
         }
@@ -417,6 +465,49 @@ fn reconcile_managed_files(state: &StateDb) -> Result<()> {
         rename_imported(imported);
     }
     Ok(())
+}
+
+/// Frozen novel ids in a freeze payload (`<id>: true` entries), ascending.
+/// `None` when the payload is not a mapping; callers decide whether that is
+/// fatal (the SQLite projection skips it, the importer keeps it verbatim).
+fn frozen_ids_from_payload(value_yaml: &str) -> Option<Vec<i64>> {
+    if value_yaml.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let parsed: HashMap<i64, serde_yaml::Value> = serde_yaml::from_str(value_yaml).ok()?;
+    let mut ids: Vec<i64> = parsed.into_keys().collect();
+    ids.sort_unstable();
+    Some(ids)
+}
+
+/// Union a stray legacy `freeze.yaml` with the payload already in `app_state`.
+///
+/// Builds before the freeze-state fix wrote a fresh fragment on every `freeze`
+/// run (the previous file had already been imported and renamed away), so
+/// importing such a file verbatim drops every other frozen novel. A non-empty
+/// freeze file only ever *adds* frozen ids — unfreezing happens through
+/// `narou freeze --off` or the Web UI, never by editing the file — therefore
+/// the import is a union. Falls back to the file content verbatim when either
+/// side is not a mapping, preserving the pre-existing behavior.
+fn merge_freeze_payload(existing: Option<&str>, incoming: &str) -> String {
+    let parsed_incoming: Option<HashMap<i64, serde_yaml::Value>> = if incoming.trim().is_empty() {
+        None
+    } else {
+        serde_yaml::from_str(incoming).ok()
+    };
+    let Some(mut merged) = parsed_incoming else {
+        return incoming.to_string();
+    };
+    if let Some(existing) = existing
+        && let Ok(previous) = serde_yaml::from_str::<HashMap<i64, serde_yaml::Value>>(existing)
+    {
+        for (id, value) in previous {
+            merged.entry(id).or_insert(value);
+        }
+    }
+    let ordered: BTreeMap<i64, serde_yaml::Value> = merged.into_iter().collect();
+    crate::db::inventory::serialize_yaml_content(&ordered)
+        .unwrap_or_else(|_| incoming.to_string())
 }
 
 fn dirs_home() -> Option<PathBuf> {

@@ -104,7 +104,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 | `illust` | — (Rust 拡張) | ✅ 完了 | `.illustration_cache.yaml` 運用のための `narou illust <sub>`。`orphan`/`migrate`/`fix-ext`/`rebuild` に加え、挿絵を S3 互換ストレージへ写す `s3-push` / 突き合わせる `s3-verify` を実装。削除/改名/移行 (および `s3-push`) は既定 dry-run (`-f` で実行) |
 | `author` | — (Rust 拡張) | ✅ 完了 | 追跡する作者を登録すると (`narou author add <作者ページURL>`)、`narou update` の後段で新しい作品を自動追加する。`add`/`list`/`remove`/`check`。作者ページの認識と作品一覧の取得はサイト定義 (`author_url` / `author_api_url` / `author_novel_pattern` / `author_work_url`) が担う。Pixiv は `preprocess:` の DSL が `author_novel::` / `author_series::` / `author_comic_series::` を emit し、シリーズに属する話/ページは `author_series_episodes_url` / `author_comic_series_pages_url` で除く (作品単位 = 単体小説 + 小説シリーズ + 漫画シリーズ + 単体イラスト・漫画)。`check --dry-run` は追加予定の URL だけを表示 |
 | `login` | — (Rust 拡張) | ✅ 完了 | ブラウザ端末で `narou_rs_login` が取得したログイン Cookie の受け入れ側。`list`/`import`/`export`/`rename`/`order`/`clear` を実装。**サイトごとに複数の「名前つきログイン」を試行順つきで保持**し、1 ログインが複数ホストの Cookie を持つ (ブラウザのセッションがホストをまたぐため)。保存値は `.narou/login.key` (または `NAROU_RS_LOGIN_KEY`) の鍵で `enc:v1:` 暗号化され、書き出しファイルは `--passphrase` で Argon2id→XChaCha20-Poly1305 暗号化。Web UI 設定の「ログイン」タブと `GET /api/login`、`POST /api/login/import\|rename\|order`、`DELETE /api/login/{site}`、`DELETE /api/login/{site}/{index}` も対応 |
-| `db` | — (Rust 拡張) | ✅ 完了 | SQLite 管理 DB の保守。`verify` / `export-yaml [--out|--in-place]` / `vacuum`。既定は YAML 管理で、SQLite は Web UI 初回ツアーまたは `.narou/storage-backend` マーカーによる opt-in |
+| `db` | — (Rust 拡張) | ✅ 完了 | SQLite 管理 DB の保守。`verify` / `export-yaml [--out\|--in-place]` / `vacuum` / `repair-freeze [--dry-run]`。既定は YAML 管理で、SQLite は Web UI 初回ツアーまたは `.narou/storage-backend` マーカーによる opt-in。`repair-freeze` は旧ビルドが残した `freeze.yaml.imported-*` から失われた凍結状態を復旧する |
 | `help` | ✅ | ✅ 完了 | トップレベル help、初回未初期化 help、各コマンド `-h` の詳細文・Examples・convert Configuration・setting Variable List まで同期 |
 | `version` | ✅ | ✅ 完了 | `-v`/`--version` と `--more` を実装。出力順序、help 文言、AozoraEpub3 探索、失敗時メッセージを Ruby 版に揃えた |
 | `log` | ✅ | ✅ 完了 | `--num`, `--tail`, `--source-convert`, `<path>` を実装。最新ログ選択、`.narou/local_setting.yaml` の `log.*` 既定値、`*_convert` フィルタも対応 |
@@ -245,10 +245,13 @@ SQLite 管理データベースの保守。**0.4.0 既定は YAML 管理のま�
 
 | サブコマンド | 内容 |
 |---|---|
-| `verify` | `PRAGMA integrity_check` + 全 payload の CRC-32 検査 |
+| `verify` | `PRAGMA integrity_check` + 全 payload の CRC-32 検査。取込済み `freeze.yaml.imported-*` があれば `repair-freeze` を案内する |
 | `export-yaml [--out DIR]` | レガシー YAML/TXT バンドルを再生成 (旧バージョンへのロールバック用) |
 | `export-yaml --in-place` | `.narou/*.yaml`・`~/.narousetting/global_setting.yaml` を実位置へ書き戻し、`storage-backend` を `yaml` に戻す。narou.rb への完全復帰用 |
 | `vacuum` | VACUUM で容量回収 |
+| `repair-freeze [--dry-run]` | 旧ビルドが残した `freeze.yaml.imported-*` を全て合算し、保存済みの凍結状態に無い ID を凍結へ戻す（和集合のみで、解除はしない）。`--dry-run` は復旧予定の表示のみ。取り込んだファイルは削除しない |
+
+**凍結状態の保存先**: YAML 管理では `.narou/freeze.yaml`、SQLite 管理では `app_state('inv','freeze')` で、どちらも Inventory の共通入口 (`Inventory::update_yaml`) を通す。SQLite 側では同じ内容が `frozen_novels` へ投影され、状態の検索 (`status` 検索式) が `narou list` と一致する。`freeze.yaml` の取込は和集合で行うため、残っていた断片ファイルが他の凍結を解除することはない (issue #35)。
 
 **前方互換モード**: `narou setting narou-compat=true` で `.narou/*.yaml` (database.yaml, freeze.yaml, alias.yaml, tag_colors.yaml, login_cookie.yaml, latest_convert.yaml, local_setting.yaml, queue.yaml, notepad.txt) をファイルとして維持し、narou.rb がそのまま読める状態を保つ。ファイルが正で SQLite はミラー。OFF(既定) ではファイルを `*.imported-*` へ退避し SQLite のみで管理する。`~/.narousetting/global_setting.yaml` はライブラリ状態ではないため narou-compat/SQLite の有無にかかわらず常にファイルのまま維持され、SQLite への取込・退避は行わない (旧ビルドが `app_state` の global/global_setting に残した行は、ファイルが無いとき初回読み出しでファイルへ書き戻してその行を削除する)
 

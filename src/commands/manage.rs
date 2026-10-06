@@ -863,13 +863,16 @@ pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
         // narou.rb の Command::Freeze は .narou/freeze.yaml だけを更新し、
         // レコードのタグには触れない (凍結状態の判定は Narou.novel_frozen? =
         // freeze.yaml で行う)。frozen/404 タグの付け替えはしない。
+        // 保存先は Inventory の共通入口に任せる: YAML 管理では freeze.yaml、
+        // SQLite 管理では app_state('inv','freeze') (+ frozen_novels への投影)。
+        // ファイルを直接書くと SQLite 側の状態が更新されず、次回起動の
+        // レガシー取込で他の凍結が失われる。
         let result = db::with_database(|db| {
-            let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-            let (_, should_freeze) = narou_rs::db::inventory::update_locked_yaml_file::<
+            db.inventory().update_yaml::<
                 bool,
                 std::collections::HashMap<i64, serde_yaml::Value>,
                 _,
-            >(&freeze_path, |mut frozen_list| {
+            >("freeze", InventoryScope::Local, |mut frozen_list| {
                 let is_frozen = frozen_list.contains_key(&id);
                 let should_freeze = if on {
                     true
@@ -886,8 +889,7 @@ pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
                 }
 
                 Ok((frozen_list, should_freeze))
-            })?;
-            Ok::<bool, narou_rs::error::NarouError>(should_freeze)
+            })
         });
 
         match result {
@@ -979,18 +981,16 @@ pub fn freeze_by_target(target: &str) {
     let id = data.id;
 
     // `narou download --freeze` は upstream では `Command::Freeze.execute!`
-    // を呼ぶだけなので、cmd_freeze と同様に freeze.yaml だけを更新する。
+    // を呼ぶだけなので、cmd_freeze と同様に凍結状態だけを更新する。
     let result = db::with_database(|db| {
-        let freeze_path = db.inventory().root_dir().join(".narou").join("freeze.yaml");
-        narou_rs::db::inventory::update_locked_yaml_file::<
+        db.inventory().update_yaml::<
             (),
             std::collections::HashMap<i64, serde_yaml::Value>,
             _,
-        >(&freeze_path, |mut frozen_list| {
+        >("freeze", InventoryScope::Local, |mut frozen_list| {
             frozen_list.insert(id, serde_yaml::Value::Bool(true));
             Ok((frozen_list, ()))
-        })?;
-        Ok::<(), narou_rs::error::NarouError>(())
+        })
     });
 
     match result {

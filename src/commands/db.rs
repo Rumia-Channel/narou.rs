@@ -4,6 +4,8 @@
 //! - `export-yaml`: regenerate the legacy file bundle for rollback to
 //!   pre-P2 versions (backward-compatibility escape hatch)
 //! - `vacuum`: reclaim space after history pruning
+//! - `repair-freeze`: restore freeze state from `freeze.yaml.imported-*`
+//!   fragments written by builds before the freeze-state fix (issue #35)
 
 use clap::Subcommand;
 
@@ -24,6 +26,13 @@ pub enum DbAction {
     },
     /// Rebuild the database file to reclaim free space.
     Vacuum,
+    /// Restore frozen novels that older builds lost to `freeze.yaml.imported-*`
+    /// fragments (union of every fragment, never unfreezes anything).
+    RepairFreeze {
+        /// Only report what would be restored.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub fn cmd_db(action: DbAction) -> narou_rs::error::Result<()> {
@@ -34,6 +43,7 @@ pub fn cmd_db(action: DbAction) -> narou_rs::error::Result<()> {
         DbAction::Verify => cmd_verify(),
         DbAction::ExportYaml { out, in_place } => cmd_export_yaml(out, in_place),
         DbAction::Vacuum => cmd_vacuum(),
+        DbAction::RepairFreeze { dry_run } => cmd_repair_freeze(dry_run),
     }
 }
 
@@ -49,6 +59,18 @@ fn cmd_verify() -> narou_rs::error::Result<()> {
         Some(0) => println!("payloads: ok"),
         Some(bad) => println!("payloads: {bad} corrupted"),
         None => {}
+    }
+    // Freeze fragments written by older builds still hold ids the stored
+    // payload may have lost (issue #35); point at the repair command.
+    if let Ok(inventory) = narou_rs::db::inventory::Inventory::with_default_root() {
+        let narou_dir = inventory.root_dir().join(".narou");
+        let fragments =
+            narou_rs::native::sqlite::freeze_repair::imported_freeze_files(&narou_dir).len();
+        if fragments > 0 {
+            println!(
+                "freeze: 取り込み済み freeze.yaml が {fragments} 件あります（`narou db repair-freeze` で復旧できます）"
+            );
+        }
     }
     Ok(())
 }
@@ -85,4 +107,62 @@ fn cmd_vacuum() -> narou_rs::error::Result<()> {
     }
     println!("SQLite バックエンドが無効のため、最適化は不要です");
     Ok(())
+}
+
+/// Restore freeze state that older builds scattered across
+/// `freeze.yaml.imported-*` fragments (issue #35).
+///
+/// The stored payload is the source of truth, so the command only ever *adds*
+/// the ids found in the fragments; it never unfreezes a novel. That is the
+/// intended direction: the old builds could only lose frozen ids, and a novel
+/// that was unfrozen on purpose can be released again with `narou freeze --off`.
+fn cmd_repair_freeze(dry_run: bool) -> narou_rs::error::Result<()> {
+    use narou_rs::native::sqlite::freeze_repair;
+
+    let inventory = narou_rs::db::inventory::Inventory::with_default_root()?;
+    let plan = freeze_repair::plan(&inventory)?;
+    if plan.files == 0 {
+        println!("freeze.yaml.imported-* が見つかりません（修復の必要はありません）");
+        return Ok(());
+    }
+    println!("取り込み済み freeze.yaml: {} 件", plan.files);
+    if plan.unreadable > 0 {
+        println!("  読み取れなかったファイル: {} 件", plan.unreadable);
+    }
+    if plan.is_empty() {
+        println!("凍結状態は最新です（修復対象なし）");
+        return Ok(());
+    }
+
+    let titles = freeze_titles(&plan.missing_ids);
+    if dry_run {
+        println!("復旧予定: {} 件", plan.missing_ids.len());
+        for (id, title) in plan.missing_ids.iter().zip(&titles) {
+            println!("  {id}: {title}");
+        }
+        println!("--dry-run のため変更していません");
+        return Ok(());
+    }
+
+    freeze_repair::apply(&inventory, &plan.missing_ids)?;
+    println!("{} 件の凍結状態を復旧しました", plan.missing_ids.len());
+    for (id, title) in plan.missing_ids.iter().zip(&titles) {
+        println!("  {id}: {title}");
+    }
+    Ok(())
+}
+
+/// Titles for the repaired ids, `"<不明>"` for records that no longer exist.
+fn freeze_titles(ids: &[i64]) -> Vec<String> {
+    narou_rs::db::with_database(|db| {
+        Ok(ids
+            .iter()
+            .map(|id| {
+                db.get(*id)
+                    .map(|record| record.title.clone())
+                    .unwrap_or_else(|| "<不明>".to_string())
+            })
+            .collect::<Vec<_>>())
+    })
+    .unwrap_or_else(|_| ids.iter().map(|_| "<不明>".to_string()).collect())
 }

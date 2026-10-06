@@ -41,7 +41,7 @@
 | `database.yaml` | `novels` (33+ 列) | Worker D1 の `0001_core`〜`0003_status_sort` スキーマをほぼ踏襲 |
 | `database_index.yaml` (SHA256 fingerprint) | SQLite では廃止 | SQLite モードでは DB が索引を持つ。YAML / narou-compat モードでは引き続き使用 |
 | ID 採番 | `novel_id_sequence` | D1 と同一 (atomic allocate) |
-| `freeze.yaml` (+lock) | `frozen_novels` | fs2 lock 不要化 |
+| `freeze.yaml` (+lock) | `app_state('inv','freeze')` + `frozen_novels` へ投影 | fs2 lock 不要化。payload が正で、`frozen_novels` は状態検索式 (`status_search_expression.sql`) 用の派生 (issue #35: ファイル直接書きは payload を素通りするため廃止。取込は和集合、復旧は `narou db repair-freeze`) |
 | タグ | `novel_tags` (position, tag, tag_fold) | `database.rs` の tag index 置換 |
 | `tag_colors.yaml` | `app_state('tag_colors','colors')` | D1 実装と同一キー |
 | `alias.yaml` | `app_state('alias', ncode→id)` | |
