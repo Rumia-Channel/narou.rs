@@ -658,6 +658,15 @@ fn section_timestamp_ymd(download_time: Option<&str>, timezone: SiteTimezone) ->
     download_time.and_then(|value| date_string_to_ymd_with_timezone(value, timezone))
 }
 
+/// narou.rb `HTML#initialize` の既定挿絵パターン。
+///
+/// サイト定義の `illust_grep_pattern` が `null` (または未定義) のとき、
+/// narou.rb の `HTML#set_illust_setting` は上書きしないためこの既定が使われ、
+/// 本文中の `<img src="...">` が挿絵注釈になる。取得自体は変換時に行われるが、
+/// Rust 版はダウンロード時に前倒ししているので、同じ既定をここでも使う
+/// (なろう / R18なろう / カクヨム / Arcadia が該当する)。
+pub const DEFAULT_ILLUST_GREP_PATTERN: &str = r#"<img.+?src="(?<src>.+?)".*?>"#;
+
 fn illustration_sources<'a>(
     section: &'a SectionElement,
     raw_html: Option<&'a str>,
@@ -1179,18 +1188,28 @@ impl Downloader {
         toc_url: &str,
         raw_html: Option<&str>,
     ) -> Result<()> {
-        let illust_url_pattern = match &setting.illust_grep_pattern {
-            Some(p) => p,
-            None => {
-                crate::application::debug::emit(format!(
-                    "挿絵: サイト定義に illust_grep_pattern が無いため取得しません ({})",
-                    setting.domain
-                ));
-                return Ok(());
-            }
-        };
+        // サイト定義がパターンを持たない場合は narou.rb の既定パターンを使う。
+        let default_pattern = setting.illust_grep_pattern.is_none();
+        if default_pattern {
+            crate::application::debug::emit(format!(
+                "挿絵: サイト定義に illust_grep_pattern が無いので既定の <img> パターンで取得します ({})",
+                setting.domain
+            ));
+        }
 
-        let re = compile_html_pattern(illust_url_pattern).map_err(NarouError::Regex)?;
+        // 既定パターンは全サイト共通の定数なので、セクションごとに
+        // コンパイルし直さない。
+        static DEFAULT_ILLUST_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            compile_html_pattern(DEFAULT_ILLUST_GREP_PATTERN).expect("valid default pattern")
+        });
+        let compiled_pattern;
+        let re: &Regex = match setting.illust_grep_pattern.as_deref() {
+            Some(pattern) => {
+                compiled_pattern = compile_html_pattern(pattern).map_err(NarouError::Regex)?;
+                &compiled_pattern
+            }
+            None => &DEFAULT_ILLUST_RE,
+        };
         let storage = crate::illustration_store::IllustrationStorageService::new(
             self.assets.clone(),
         )
@@ -1210,7 +1229,21 @@ impl Downloader {
                 if raw_url.is_empty() {
                     continue;
                 }
-                let resolved = build_section_url(setting, toc_url, raw_url);
+                // 既定パターンは本文のあらゆる `<img>` に当たるため、narou.rb
+                // `Illustration#scanner` と同じく URL でない注記 (相対パス) は
+                // 取得対象にしない。明示パターンはサイト定義が対象を選んでいる
+                // ので従来どおり本文基準で解決する。
+                if default_pattern
+                    && !crate::illustration_store::is_remote_illustration_source(raw_url)
+                {
+                    continue;
+                }
+                // `//host/...` (protocol-relative) を本文のスキームで解決し、
+                // mitemin は取得用 URL (`viewimagebig` → `viewimage`) へ寄せる
+                // (narou.rb `Illustration#transform_mitemin_url` と同じ)。
+                let resolved = crate::illustration_store::normalize_illustration_url(
+                    &build_section_url(setting, toc_url, raw_url),
+                );
                 let url = resolved.as_str();
                 if self.http.validate_url(url).await.is_err() {
                     self.report_warn(&messages::download::warn_unsafe_illustration_url(url));
@@ -1899,16 +1932,13 @@ impl Downloader {
             }
         }
 
-        let mut illustration_store = if setting.illust_grep_pattern.is_some() {
-            Some(
-                self.persistence
-                    .load_cache(&object_keys)
-                    .await?
-                    .unwrap_or_default(),
-            )
-        } else {
-            None
-        };
+        // サイト定義に `illust_grep_pattern` が無い場合は narou.rb の既定
+        // パターンで取得するので、どのサイトでも索引を読む。
+        let mut illustration_store = self
+            .persistence
+            .load_cache(&object_keys)
+            .await?
+            .unwrap_or_default();
 
         let resume_from = resume_from_section.unwrap_or(0);
         if resume_from > subtitles.len() {
@@ -2097,32 +2127,29 @@ impl Downloader {
                         .save_raw(&object_keys, subtitle, &raw_html)
                         .await?;
                 }
-                if let Some(store) = illustration_store.as_mut() {
-                    self.download_illustration(
-                        &setting,
-                        &section,
-                        &object_keys,
-                        store,
-                        &toc_url,
-                        Some(raw_html.as_str()),
-                    )
-                    .await?;
-                }
+                self.download_illustration(
+                    &setting,
+                    &section,
+                    &object_keys,
+                    &mut illustration_store,
+                    &toc_url,
+                    Some(raw_html.as_str()),
+                )
+                .await?;
                 updated_count += 1;
                 downloaded_index += 1;
                 Some(download_time)
             } else {
-                if let Some(store) = illustration_store.as_mut()
-                    && let Some(section_file) = self
-                        .persistence
-                        .load_section(&object_keys, subtitle)
-                        .await?
+                if let Some(section_file) = self
+                    .persistence
+                    .load_section(&object_keys, subtitle)
+                    .await?
                 {
                     self.download_illustration(
                         &setting,
                         &section_file.element,
                         &object_keys,
-                        store,
+                        &mut illustration_store,
                         &toc_url,
                         None,
                     )
@@ -2174,8 +2201,12 @@ impl Downloader {
             }
         }
 
-        if let Some(store) = illustration_store.as_ref() {
-            self.persistence.save_cache(&object_keys, store).await?;
+        // 挿絵を 1 枚も扱わなかった小説には空の索引を作らない (変化が無ければ
+        // 書き戻さない)。
+        if illustration_store.is_dirty() {
+            self.persistence
+                .save_cache(&object_keys, &illustration_store)
+                .await?;
         }
 
         if let Some(ref p) = self.progress {
@@ -2979,6 +3010,160 @@ mod tests {
             }
         }
         assert_eq!(urls, vec!["http://syosetu.org/img/user/10193/110088.jpg"]);
+    }
+
+    /// なろうのサイト定義は `illust_grep_pattern: null` で、narou.rb は
+    /// `HTML#initialize` の既定 `<img>` パターンを使う。なろうの挿絵 URL は
+    /// protocol-relative (`//host/...`) なので、本文 URL 基準で解決してから
+    /// mitemin の取得用 URL (`viewimagebig` → `viewimage`) へ寄せる。
+    /// 本文は実際の n9364bq (12話「※【囁くラタトスク】挿絵」) の形。
+    #[test]
+    fn narou_definition_uses_the_default_img_pattern_for_mitemin_illustrations() {
+        let setting: SiteSetting =
+            serde_yaml::from_str(include_str!("../../webnovel/ncode.syosetu.com.yaml")).unwrap();
+        assert!(setting.illust_grep_pattern.is_none());
+
+        let re = compile_html_pattern(super::DEFAULT_ILLUST_GREP_PATTERN).unwrap();
+        let body = r#"<p>前</p><p><a href="//9496.mitemin.net/i88657/" target="_blank"><img src="//9496.mitemin.net/userpageimage/viewimagebig/icode/i88657/" alt="挿絵(By みてみん)" border="0" /></a></p>"#;
+        let captured = re.captures(body).expect("default img pattern matches");
+        let source = captured.get(1).unwrap().as_str();
+        assert_eq!(
+            source,
+            "//9496.mitemin.net/userpageimage/viewimagebig/icode/i88657/"
+        );
+
+        let resolved = crate::illustration_store::normalize_illustration_url(
+            &crate::downloader::util::build_section_url(
+                &setting,
+                "https://ncode.syosetu.com/n9364bq/12/",
+                source,
+            ),
+        );
+        assert_eq!(
+            resolved,
+            "https://9496.mitemin.net/userpageimage/viewimage/icode/i88657/"
+        );
+        assert_eq!(
+            crate::illustration_store::mitemin_illustration_id(&resolved).as_deref(),
+            Some("i88657")
+        );
+    }
+
+    /// サイト定義に挿絵パターンが無いサイト (なろう等) でも、ダウンロード時に
+    /// narou.rb 既定の `<img>` パターンで挿絵を取得し、挿絵側のストア
+    /// (Worker では S3) へ保存すること。`SplitStore` で Worker と同じ配線にする。
+    #[tokio::test]
+    async fn default_img_pattern_stores_illustrations_in_the_illustration_store() {
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            r#"
+name: Illustration Default Test
+domain: example.com
+top_url: https://example.com
+url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+sitename: Illustration Default Test
+toc_url: 'https://example.com/\k<ncode>/'
+subtitles: |-
+  <a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a>
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+is_narou: false
+"#,
+        )
+        .unwrap();
+        setting.compile();
+        assert!(setting.illust_grep_pattern.is_none());
+
+        let target = "https://example.com/n1234ab/";
+        let http = Arc::new(MockHttpClient::new());
+        http.add_text(
+            target,
+            200,
+            r#"<h1>挿絵テスト</h1><span>作者</span><a href="/n1234ab/1/">第1話</a>"#,
+        );
+        http.add_text(
+            "https://example.com/n1234ab/1/",
+            200,
+            r#"<div class="body"><a href="//9496.mitemin.net/i88657/"><img src="//9496.mitemin.net/userpageimage/viewimagebig/icode/i88657/" alt="挿絵(By みてみん)" border="0" /></a>本文</div>"#,
+        );
+        http.add_response(
+            "https://9496.mitemin.net/userpageimage/viewimage/icode/i88657/",
+            crate::platform::HttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".to_string(), "image/jpeg".to_string())],
+                body: b"jpeg-bytes".to_vec(),
+            },
+        );
+
+        let primary = Arc::new(MemoryObjectStore::new());
+        let illustrations = Arc::new(MemoryObjectStore::new());
+        let split = Arc::new(crate::platform::SplitStore::new(
+            (primary.clone(), primary.clone()),
+            (illustrations.clone(), illustrations.clone()),
+        ));
+        let objects: Arc<dyn ObjectStore> = split.clone();
+        let assets: Arc<dyn AssetStore> = split;
+
+        let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+            DownloaderPlatform {
+                http: http.clone(),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new()),
+                objects,
+                assets,
+                clock: Arc::new(SystemClock),
+            },
+            vec![setting],
+            HashMap::new(),
+            Arc::new(crate::downloader::settings::SnapshotDownloaderSettings::default()),
+        )
+        .unwrap();
+
+        downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: true,
+                    budget: None,
+                    resume_from_section: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        async fn keys_of(store: Arc<MemoryObjectStore>) -> Vec<String> {
+            store
+                .list_page(&ObjectListRequest::new(
+                    ObjectPrefix::new("").unwrap(),
+                    std::num::NonZeroUsize::new(100).unwrap(),
+                ))
+                .await
+                .unwrap()
+                .objects
+                .iter()
+                .map(|metadata| metadata.key.as_ref().to_string())
+                .collect()
+        }
+
+        let illustration_keys = keys_of(illustrations).await;
+        assert!(
+            illustration_keys
+                .iter()
+                .any(|key| key.ends_with("/挿絵/i88657.jpg")),
+            "the illustration must be stored on the illustration side: {illustration_keys:?}"
+        );
+        let primary_keys = keys_of(primary).await;
+        assert!(
+            primary_keys.iter().all(|key| !key.contains("挿絵/")),
+            "illustrations must not be stored on the primary side: {primary_keys:?}"
+        );
+        assert!(
+            http.requested_urls()
+                .iter()
+                .any(|url| url.contains("viewimage/icode/i88657")),
+            "the fetch must use the normalized mitemin URL: {:?}",
+            http.requested_urls()
+        );
     }
 
     #[test]
