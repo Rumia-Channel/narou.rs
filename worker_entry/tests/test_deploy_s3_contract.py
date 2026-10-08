@@ -358,8 +358,10 @@ class RenderTests(unittest.TestCase):
 
     def test_route_mode_keeps_the_existing_hostname_record(self):
         # SORAHOST のコネクタが持つ DNS レコードを消さずに Workers を載せる形。
+        # route ブロックを差し込むプレースホルダは実テンプレートにあるので、
+        # 本番テンプレートをそのまま使う。
         rendered = self.render_template(
-            '[vars]\nNAROU_REQUIRE_S3 = "true"\n',
+            (WORKER / "wrangler.production.toml").read_text(encoding="utf-8"),
             target="production",
             extra_env={"NAROU_DOMAIN_MODE": "route", "NAROU_ZONE_NAME": "example.invalid"},
         )
@@ -369,7 +371,10 @@ class RenderTests(unittest.TestCase):
         self.assertIn('workers_dev = "false"', rendered)
 
     def test_custom_domain_mode_stays_the_default(self):
-        rendered = self.render_template('[vars]\nNAROU_REQUIRE_S3 = "true"\n', target="production")
+        rendered = self.render_template(
+            (WORKER / "wrangler.production.toml").read_text(encoding="utf-8"),
+            target="production",
+        )
         self.assertIn('pattern = "production.example.invalid"', rendered)
         self.assertIn("custom_domain = true", rendered)
 
