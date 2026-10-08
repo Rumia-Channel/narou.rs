@@ -5,6 +5,15 @@ narou_rs は、日本の Web 小説を取得・管理・変換する CLI / Web U
 
 README では、導入方法、基本操作、主な注意点をまとめます。詳細なコマンド互換性や未完了項目は `COMMANDS.md` を参照してください。
 
+## v0.4.8 の主な変更
+
+- 新規ダウンロードで ID が 2 つ消費され、`ID:n のDL開始` の ID と実際のレコード ID が食い違う不具合を修正しました。確保した ID をそのままレコードに使うため、一覧の ID が飛ばなくなります（native / Cloudflare Workers 共通。既に登録済みの作品の ID は変わりません）。
+- Web UI の進捗バーが、ジョブの終了後に残って積み重なる不具合を修正しました。同じコンソール・同じ種類のバーは 1 本にまとめ、ジョブの終端イベントとキューが空になった時点でスコープ単位に消去します。
+- 配備の修正: SORAHOST と Cloudflare Workers が同じホスト名を共有する構成で、動いている側がホスト名を持てるようにしました。Workers が後から配備される場合は、SORAHOST のコネクタが作った DNS レコードに触れずに route へ切り替えます。
+- 配備の修正: 前段の Cloudflare Access が答えた 403 を S3 プローブのスキップとして扱い、成功とは区別して報告するようにしました。
+
+変更一覧は [v0.4.7...v0.4.8](https://github.com/Rumia-Channel/narou.rs/compare/v0.4.7...v0.4.8) を参照してください。
+
 ## v0.4.7 の主な変更
 
 - SQLite 管理のライブラリで `freeze` を実行すると、それまでの凍結が外れて `.narou/freeze.yaml.imported-*` が増え続ける不具合を修正しました（[#35](https://github.com/Rumia-Channel/narou.rs/issues/35)）。凍結状態の保存先を YAML / SQLite の共通入口に統一し、取り込みを和集合にしたうえで `frozen_novels` へ投影します。既に失われた凍結は更新後に `narou db repair-freeze --dry-run` で確認し、`narou db repair-freeze` で復旧できます。

@@ -2157,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "narou_rs"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "argon2",
  "axum",
