@@ -1179,12 +1179,29 @@ impl Downloader {
         }
     }
 
+    /// 小説ディレクトリに実際に保存されている挿絵のファイル名。
+    ///
+    /// 一覧は `PersistenceService` が持つ (ストアに触るのはそこだけ)。
+    /// 上限ページ数を超えた・一覧に失敗した場合は `None` で、呼び出し側は
+    /// 従来どおり索引だけで判断する。
+    async fn stored_illustration_names(
+        &self,
+        object_keys: &NovelObjectKeys,
+    ) -> Option<std::collections::HashSet<String>> {
+        /// 1 ページ 1000 件 × このページ数まで見る。
+        const MAX_LIST_PAGES: usize = 10;
+        self.persistence
+            .list_illustration_names(object_keys, MAX_LIST_PAGES)
+            .await
+    }
+
     async fn download_illustration(
         &mut self,
         setting: &SiteSetting,
         section: &SectionElement,
         object_keys: &NovelObjectKeys,
         illustration_store: &mut crate::illustration_store::IllustrationIndex,
+        stored_illustrations: Option<&std::collections::HashSet<String>>,
         toc_url: &str,
         raw_html: Option<&str>,
     ) -> Result<()> {
@@ -1244,13 +1261,32 @@ impl Downloader {
                     continue;
                 }
 
-                if illustration_store.filename_for_source(url).is_some()
-                    || crate::illustration_store::mitemin_illustration_id(url)
-                        .and_then(|id| illustration_store.filename_for_mitemin_id(&id))
-                        .is_some()
-                {
-                    crate::application::debug::emit(format!("挿絵: 取得済みのため再取得しません: {url}"));
-                    continue;
+                // 索引が知っていても、実体が保存先に無ければ取り直す
+                // (ストアの切替・手動削除・別環境での取得で索引だけが残る)。
+                let known = illustration_store
+                    .filename_for_source(url)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        crate::illustration_store::mitemin_illustration_id(url)
+                            .and_then(|id| {
+                                illustration_store
+                                    .filename_for_mitemin_id(&id)
+                                    .map(str::to_string)
+                            })
+                    });
+                if let Some(filename) = known {
+                    let stored = stored_illustrations
+                        .map(|names| names.contains(&filename))
+                        .unwrap_or(true);
+                    if stored {
+                        crate::application::debug::emit(format!(
+                            "挿絵: 取得済みのため再取得しません: {url}"
+                        ));
+                        continue;
+                    }
+                    crate::application::debug::emit(format!(
+                        "挿絵: 索引にはありますが実体が無いので取り直します: 挿絵/{filename} ({url})"
+                    ));
                 }
 
                 match crate::downloader::http_policy::fetch_bytes(
@@ -1944,6 +1980,22 @@ impl Downloader {
                 setting.domain
             ));
         }
+        // 索引が空なら突き合わせる相手が無いので一覧は取らない (小説 1 件に
+        // つき 1〜2 サブリクエスト増えるため、必要なときだけ)。
+        let stored_illustrations = if illustration_store.source_count() > 0 {
+            let names = self.stored_illustration_names(&object_keys).await;
+            if crate::application::debug::enabled() {
+                crate::application::debug::emit(format!(
+                    "挿絵: 保存済み {} 件 / 索引 {} 件 ({})",
+                    names.as_ref().map(|names| names.len()).unwrap_or(0),
+                    illustration_store.source_count(),
+                    object_keys.prefix().as_ref(),
+                ));
+            }
+            names
+        } else {
+            None
+        };
 
         let resume_from = resume_from_section.unwrap_or(0);
         if resume_from > subtitles.len() {
@@ -2137,6 +2189,7 @@ impl Downloader {
                     &section,
                     &object_keys,
                     &mut illustration_store,
+                    stored_illustrations.as_ref(),
                     &toc_url,
                     Some(raw_html.as_str()),
                 )
@@ -2155,6 +2208,7 @@ impl Downloader {
                         &section_file.element,
                         &object_keys,
                         &mut illustration_store,
+                        stored_illustrations.as_ref(),
                         &toc_url,
                         None,
                     )
@@ -3165,31 +3219,31 @@ is_narou: false
             .await
             .unwrap();
 
-        // 取り込みを止めてから検証する (他のテストの行が混ざらないように)。
-        crate::application::debug::set_enabled(false);
-        crate::application::messages::take_default_sink();
-        let captured: Vec<String> = capture.0.0.lock().unwrap().clone();
-        let mine: Vec<&String> = captured
-            .iter()
-            .filter(|line| line.contains("illust-default.test"))
-            .collect();
-        assert_eq!(
-            mine.iter()
-                .filter(|line| line.contains("既定の <img> パターン"))
-                .count(),
-            1,
-            "既定パターンの案内は小説 1 件につき 1 行だけ出す: {captured:?}"
-        );
-        assert!(
-            captured
+        // 1 回目の検証。取り込みは止めない (このあと 2 回目も走らせる)。
+        {
+            let captured: Vec<String> = capture.0.0.lock().unwrap().clone();
+            let mine: Vec<&String> = captured
                 .iter()
-                .any(|line| line.contains("挿絵/i88657.jpg (")),
-            "保存行は拡張子を二重にしない: {captured:?}"
-        );
-        assert!(
-            !captured.iter().any(|line| line.contains(".jpg.jpg")),
-            "保存行は拡張子を二重にしない: {captured:?}"
-        );
+                .filter(|line| line.contains("illust-default.test"))
+                .collect();
+            assert_eq!(
+                mine.iter()
+                    .filter(|line| line.contains("既定の <img> パターン"))
+                    .count(),
+                1,
+                "既定パターンの案内は小説 1 件につき 1 行だけ出す: {captured:?}"
+            );
+            assert!(
+                captured
+                    .iter()
+                    .any(|line| line.contains("挿絵/i88657.jpg (")),
+                "保存行は拡張子を二重にしない: {captured:?}"
+            );
+            assert!(
+                !captured.iter().any(|line| line.contains(".jpg.jpg")),
+                "保存行は拡張子を二重にしない: {captured:?}"
+            );
+        }
 
         async fn keys_of(store: Arc<MemoryObjectStore>) -> Vec<String> {
             store
@@ -3205,7 +3259,7 @@ is_narou: false
                 .collect()
         }
 
-        let illustration_keys = keys_of(illustrations).await;
+        let illustration_keys = keys_of(illustrations.clone()).await;
         assert!(
             illustration_keys
                 .iter()
@@ -3223,6 +3277,49 @@ is_narou: false
                 .any(|url| url.contains("viewimage/icode/i88657")),
             "the fetch must use the normalized mitemin URL: {:?}",
             http.requested_urls()
+        );
+
+        // 索引には残っているが実体が無い状態 (ストアの切替・手動削除) を作り、
+        // 次の実行が取り直すこと (索引だけを信じると永久に取り逃す)。
+        let picture = crate::platform::ObjectKey::try_new(
+            illustration_keys
+                .iter()
+                .find(|key| key.ends_with("/挿絵/i88657.jpg"))
+                .expect("stored illustration key")
+                .clone(),
+        )
+        .unwrap();
+        ObjectStore::delete(illustrations.as_ref(), &picture)
+            .await
+            .unwrap();
+        assert!(keys_of(illustrations.clone()).await.is_empty());
+
+        downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: false,
+                    budget: None,
+                    resume_from_section: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        crate::application::debug::set_enabled(false);
+        crate::application::messages::take_default_sink();
+        let after: Vec<String> = capture.0.0.lock().unwrap().clone();
+        assert!(
+            after.iter().any(|line| line
+                .contains("索引にはありますが実体が無いので取り直します: 挿絵/i88657.jpg")),
+            "索引と実体のずれを検出して取り直す: {after:?}"
+        );
+        assert!(
+            keys_of(illustrations)
+                .await
+                .iter()
+                .any(|key| key.ends_with("/挿絵/i88657.jpg")),
+            "取り直した挿絵が挿絵側のストアへ戻る"
         );
     }
 

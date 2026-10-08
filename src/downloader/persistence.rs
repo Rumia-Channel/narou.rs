@@ -253,6 +253,48 @@ impl PersistenceService {
         Ok(())
     }
 
+    /// `<prefix>/挿絵` に実際に置かれているファイル名。
+    ///
+    /// 索引 (`.illustration_cache.yaml`) はメタデータなので実体の存在を保証
+    /// しない (ストアの切替・手動削除・別環境での取得)。索引だけを信じると
+    /// 「索引にあるのに実体が無い」挿絵を永久に取り逃すため、保存先を直接見る。
+    /// 上限ページ数を超えた場合と一覧に失敗した場合は `None` を返し、呼び出し
+    /// 側は索引だけで判断する従来の挙動へ戻る。
+    pub async fn list_illustration_names(
+        &self,
+        keys: &NovelObjectKeys,
+        max_pages: usize,
+    ) -> Option<HashSet<String>> {
+        let prefix = ObjectPrefix::new(format!("{}/挿絵", keys.prefix().as_ref())).ok()?;
+        let mut names = HashSet::new();
+        let mut cursor = None;
+        for _ in 0..max_pages {
+            let mut request =
+                ObjectListRequest::new(prefix.clone(), NonZeroUsize::new(1000).unwrap());
+            request.cursor = cursor.take();
+            match self.objects.list_page(&request).await {
+                Ok(page) => {
+                    for metadata in page.objects {
+                        if let Some(name) = metadata.key.as_ref().rsplit('/').next() {
+                            names.insert(name.to_string());
+                        }
+                    }
+                    match page.next_cursor {
+                        Some(next) => cursor = Some(next),
+                        None => return Some(names),
+                    }
+                }
+                Err(error) => {
+                    crate::application::debug::emit_error(format!(
+                        "挿絵: 保存済みの一覧を取れません ({error})"
+                    ));
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
     pub async fn load_cache(
         &self,
         keys: &NovelObjectKeys,

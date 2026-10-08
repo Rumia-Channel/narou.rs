@@ -615,6 +615,12 @@ npx wrangler deploy --config wrangler.ci.toml --secrets-file <json>
   protocol-relative (`//host/...`) を本文のスキームで解決し (`build_section_url` が以前は
   `<top_url>//host/...` に壊していた)、mitemin は取得用 URL (`viewimagebig` → `viewimage`) へ
   寄せる。挿絵が 1 枚も無い小説には空の `.illustration_cache.yaml` を作らない。
+- **索引と実体の突き合わせ (自己修復, 2026-10-08 修正)**: `.illustration_cache.yaml` は
+  メタデータなので実体の存在を保証しない。索引が「取得済み」と言っていても `<prefix>/挿絵` の
+  一覧に無ければ取り直す (`PersistenceService::list_illustration_names`)。索引が空でない
+  ときだけ 1 小説 1 回の一覧なので、通常の更新に余分な往復は付かない。この経路は
+  「挿絵が S3 に無い (別ストアに書かれた・手で消した) のに EPUB が実体を見つけられない」を
+  次の更新で自動的に直す。debug-mode では `挿絵: 保存済み N 件 / 索引 M 件 (<prefix>)` を出す。
 - **D1 の `objects`/`object_chunks` の扱い**: 本文の移行後もしばらく残す。削除（容量回収）は P4 の判断。
 - **APNG 挿絵**: `zip` の feature を純 Rust 構成に絞ったため Worker でも組み立て可能（`worker-runtime` が
   `illustration-animation` を有効化済み）。組み立ては**フレームを 1 枚ずつ復号 → 符号化 → 追記して即解放**し、

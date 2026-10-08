@@ -165,6 +165,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - `webnovel/*.yaml` の `series_url` / `series_item_url` に一致するシリーズ URL は、個別小説 URL に展開してから通常の download 処理に渡す。小説家になろう、R18 なろう、カクヨムのシリーズ/コレクション URL に対応
 - 新規取得したセクションは解析済みの本文・前書き・後書きに加えて raw HTML も `illust_grep_pattern` の検索対象にし、本文として保存しないサイト固有マークアップ内の挿絵を先取り保存する。未更新セクションは従来どおり保存済み section のみを検索する
 - サイト定義に `illust_grep_pattern` が無いサイト (なろう / R18なろう / カクヨム / Arcadia) は narou.rb `HTML#initialize` の既定 `<img>` パターン (`downloader::DEFAULT_ILLUST_GREP_PATTERN`) で挿絵を先取り保存する。既定パターンでは URL でない注記 (相対パス) は対象外にし、挿絵 URL の protocol-relative (`//host/...`) は本文のスキームで解決し、mitemin は取得用 URL (`viewimagebig` → `viewimage`) へ寄せる。挿絵が 1 枚も無い小説には空の `.illustration_cache.yaml` を作らない (2026-10-08 修正)
+- 索引 (`.illustration_cache.yaml`) が知っている挿絵でも、`<prefix>/挿絵` の一覧に実体が無ければ取り直す (自己修復)。索引が空でないときだけ 1 小説 1 回一覧するので、通常の更新に余分な往復は付かない (2026-10-08 修正)
 - ハーメルンのタグ抽出は `webnovel/syosetu.org.yaml` の詳細表・目次ページ両方のパターンで行い、短編ページのあらすじ・本文をタグとして取り込まない
 - Pixiv (`webnovel/www.pixiv.net.yaml`) は小説 / 小説シリーズ / イラスト・漫画 (`/artworks/A`) / 漫画シリーズ (`/user/U/series/S`) の 4 種を扱い、ncode は `n`/`s`/`a`/`c` + ID。イラストは 1 話・本文がページ画像のみ、漫画シリーズは各作品を 1 話とする連載。取得先 API は `toc_url` の `by_target` (ターゲット URL ごとのテンプレート) で切り替える
 - Pixiv (`webnovel/www.pixiv.net.yaml`) は `/ajax/*` の JSON を `preprocess:` DSL で中間テキスト化して取得する。単体作品 URL (`/novel/show.php?id=N`) は短編 (novel_type 2) として 1 話、シリーズ URL (`/novel/series/S`) は目次 30 話ずつの複数ページ取得で全話を登録する。シリーズの 1 話 URL はその話だけを単体作品として登録する
