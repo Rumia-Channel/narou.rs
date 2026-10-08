@@ -65,6 +65,21 @@ impl IllustrationIndex {
         self.0.sources.len()
     }
 
+    /// 索引が知っているファイル名 (重複なし、昇順)。
+    ///
+    /// 実体の確認 (`stat`) のように、一覧 (LIST) を使わずに保存物を突き合わせたい
+    /// ときに使う。ストアの一覧が prefix の解釈差などで空を返す環境でも、保存側と
+    /// 同じキー生成で 1 枚ずつ確かめられる。
+    pub fn filenames(&self) -> std::collections::BTreeSet<String> {
+        self.0
+            .sources
+            .values()
+            .chain(self.0.mitemin_ids.values())
+            .chain(self.0.hashes.values())
+            .cloned()
+            .collect()
+    }
+
     pub fn hash_for_mitemin_id(&self, id: &str) -> Option<&str> {
         self.0.hash_for_mitemin_id(id)
     }
@@ -182,7 +197,9 @@ impl IllustrationStorageService {
                 };
                 format!("{basename}.{normalized_ext}")
             });
-        let key = prefix.join("挿絵")?.join(filename.as_str())?;
+        // キーは保存側・読み出し側で同じ関数を通す (`NovelObjectKeys::illustration`
+        // と同じ `platform::illustration_key`)。ここで独自に組み立てない。
+        let key = crate::platform::illustration_key(prefix, &filename)?;
         let known_mapping = id
             .as_deref()
             .and_then(|id| index.filename_for_mitemin_id(id))

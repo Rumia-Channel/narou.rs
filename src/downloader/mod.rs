@@ -1195,6 +1195,43 @@ impl Downloader {
             .await
     }
 
+    /// 索引が知っている挿絵の実体を 1 枚ずつ確認する (一覧が使えないときの保険)。
+    ///
+    /// `NovelObjectKeys::illustration` (保存側と同じキー生成) と `stat` だけを使うので、
+    /// ストアの一覧 (LIST) が prefix の解釈差などで空を返す環境でも実体を見つけられる。
+    /// 上限件数を超える場合と確認に失敗した場合は `None` (呼び出し側は従来どおり
+    /// 索引だけで判断する)。
+    async fn verify_indexed_illustrations(
+        &self,
+        object_keys: &NovelObjectKeys,
+        illustration_store: &crate::illustration_store::IllustrationIndex,
+    ) -> Option<std::collections::HashSet<String>> {
+        /// 1 小説につき 1 枚ずつ確認する上限。これを超える小説は一覧が使える
+        /// 前提に任せる (索引だけで判断する従来の挙動へ戻す)。
+        const MAX_VERIFY: usize = 64;
+        let filenames = illustration_store.filenames();
+        if filenames.is_empty() || filenames.len() > MAX_VERIFY {
+            return None;
+        }
+        let mut stored = std::collections::HashSet::new();
+        for filename in filenames {
+            let key = object_keys.illustration(&filename).ok()?;
+            match self.assets.stat(&key).await {
+                Ok(Some(_)) => {
+                    stored.insert(filename);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    crate::application::debug::emit_error(format!(
+                        "挿絵: 実体の確認に失敗 ({error})"
+                    ));
+                    return None;
+                }
+            }
+        }
+        Some(stored)
+    }
+
     async fn download_illustration(
         &mut self,
         setting: &SiteSetting,
@@ -1983,7 +2020,17 @@ impl Downloader {
         // 索引が空なら突き合わせる相手が無いので一覧は取らない (小説 1 件に
         // つき 1〜2 サブリクエスト増えるため、必要なときだけ)。
         let stored_illustrations = if illustration_store.source_count() > 0 {
-            let names = self.stored_illustration_names(&object_keys).await;
+            let names = match self.stored_illustration_names(&object_keys).await {
+                // 一覧が取れて空でなければそれを信じる (通常経路)。
+                Some(names) if !names.is_empty() => Some(names),
+                // 一覧が空・失敗のときは索引のファイルを 1 枚ずつ確認する。
+                // LIST が prefix の解釈差で空を返す環境でも「実体がある」と
+                // 判定でき、本当に無いときだけ取り直せる。
+                _ => {
+                    self.verify_indexed_illustrations(&object_keys, &illustration_store)
+                        .await
+                }
+            };
             if crate::application::debug::enabled() {
                 crate::application::debug::emit(format!(
                     "挿絵: 保存済み {} 件 / 索引 {} 件 ({})",

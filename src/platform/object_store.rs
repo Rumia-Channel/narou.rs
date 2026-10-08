@@ -364,8 +364,7 @@ impl NovelObjectKeys {
     }
 
     pub fn illustration(&self, filename: &str) -> Result<ObjectKey> {
-        let filename = sanitize_key_component(filename);
-        self.child_checked(&format!("挿絵/{filename}"))
+        illustration_key(&self.prefix, filename)
     }
 
     pub fn illustration_cache(&self) -> ObjectKey {
@@ -391,6 +390,17 @@ impl NovelObjectKeys {
 
 pub fn sanitize_key_component(value: &str) -> String {
     sanitize_key_component_with_limit(value, None)
+}
+
+/// 挿絵の論理キー (`<小説プレフィックス>/挿絵/<file>`) を組み立てる。
+///
+/// **保存側と読み出し側は必ずこの関数を通す** (`IllustrationStorageService` も
+/// `NovelObjectKeys::illustration` も同じ実装を呼ぶ)。ファイル名の sanitize を
+/// 片側だけに掛けると、書いたキーと読むキーがずれて「保存したのに見つからない」
+/// 状態になるため、キーの作り方はここ 1 箇所に閉じ込める。
+pub fn illustration_key(prefix: &ObjectKey, filename: &str) -> Result<ObjectKey> {
+    let filename = sanitize_key_component(filename);
+    ObjectKey::try_new(format!("{}/挿絵/{filename}", prefix.as_ref()))
 }
 
 pub fn sanitize_key_component_with_limit(value: &str, limit: Option<usize>) -> String {
@@ -624,6 +634,27 @@ mod tests {
         assert_eq!(
             keys.raw_section("1", "第1話"),
             ObjectKey::try_new("novels/site/12/n1234ab/raw/1 第1話.html").unwrap()
+        );
+    }
+
+    #[test]
+    fn illustration_key_is_shared_by_writers_and_readers() {
+        let keys = NovelObjectKeys::new("site", "n1234ab", false).unwrap();
+        let prefix = keys.prefix();
+        // 書き込み側 (`IllustrationStorageService`) と読み出し側
+        // (`NovelObjectKeys::illustration`) は同じ関数を通る。
+        assert_eq!(
+            illustration_key(&prefix, "i422674.jpg").unwrap(),
+            keys.illustration("i422674.jpg").unwrap()
+        );
+        // sanitize が掛かる名前でも一致する (片側だけ掛けるとキーがずれる)。
+        assert_eq!(
+            illustration_key(&prefix, "a:b.jpg").unwrap().as_ref(),
+            "novels/site/n1234ab/挿絵/a_b.jpg"
+        );
+        assert_eq!(
+            illustration_key(&prefix, "a:b.jpg").unwrap(),
+            keys.illustration("a:b.jpg").unwrap()
         );
     }
 
