@@ -2379,8 +2379,11 @@ impl Downloader {
                 }
             }
         } else {
-            // 新規: コミット時点で一意 ID を予約する (従来の max+1 と同セマンティクス)。
-            let new_id = self.novels.allocate_id().await?.0;
+            // 新規: 先頭で確保した provisional_id をそのまま使う。ここで採番し
+            // 直すと DL開始行の ID と実際のレコード ID が食い違い、誰も使わない
+            // ID が 1 つ消費される (Ruby 版も Downloader 初期化時の
+            // `create_new_id` をそのままレコードの ID に使う)。
+            let new_id = provisional_id;
             let mut rec = record.clone();
             rec.id = new_id;
             rec.tags = auto_tags.clone();
