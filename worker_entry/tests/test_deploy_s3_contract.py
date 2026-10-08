@@ -273,6 +273,25 @@ class ProbeTests(unittest.TestCase):
         self.assertNotIn("worker.example.invalid", printed)
         self.assertNotIn("fake-admin-token", printed)
 
+    def test_access_login_redirect_is_treated_as_blocked(self):
+        # ルートで Worker を受けるホスト名では、Access が 302 でログインへ
+        # 飛ばす = Worker に到達していない (403 と同じ扱い)。
+        opener = Mock()
+        opener.open.side_effect = urllib.error.HTTPError(
+            "https://worker.example.invalid/api/storage/mode?probe=s3",
+            302,
+            "Found",
+            {"Location": "https://team.cloudflareaccess.com/cdn-cgi/access/login/app"},
+            io.BytesIO(b""),
+        )
+        output = io.StringIO()
+        with patch.object(deploy.urllib.request, "build_opener", return_value=opener), \
+                contextlib.redirect_stdout(output):
+            status = deploy.verify_s3("https://worker.example.invalid")
+        self.assertTrue(status.startswith("skipped:"), status)
+        self.assertIn("::warning::", output.getvalue())
+        self.assertIn("NOT verified", output.getvalue())
+
     def test_unreachable_deployment_is_not_skipped(self):
         # Only an edge 403 is a skip: DNS/TLS/network failures still fail.
         opener = Mock()

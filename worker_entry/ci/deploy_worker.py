@@ -84,6 +84,10 @@ PROBE_USER_AGENT = (
 # 100117)。SORAHOST のコネクタ等が同じホスト名の DNS レコードを持っていると出る。
 DNS_CONFLICT_MARKER = "externally managed DNS records"
 
+# Cloudflare Access のログインリダイレクト先。ルートで Worker を受けている
+# ホスト名では、302 でここへ飛ばされるのも「前段で弾かれた」印になる。
+ACCESS_REDIRECT_MARKER = "cloudflareaccess.com"
+
 # 必須の S3 検証が 403 で返ったときの説明。Worker 自身は S3 LIST の失敗を
 # 503 で返し、この経路で 403 は返さないため、403 は前段 (Cloudflare Access や
 # WAF) で弾かれたことを意味する。custom domain が Access の内側にある構成では
@@ -254,15 +258,22 @@ def probe_json(base_url: str, path: str, label: str, *, token: bool = True,
                blocked_is_access: bool = False) -> dict:
     """200 の JSON オブジェクトを返す。それ以外は {label} つきで失敗。
 
-    `blocked_is_access=True` のときだけ 403 を [`AccessBlocked`] として上げる
-    (この経路で Worker が 403 を返すことはないため、前段で弾かれた印になる)。
+    `blocked_is_access=True` のときだけ 403 と Access のログインリダイレクト
+    (302 → cloudflareaccess.com) を [`AccessBlocked`] として上げる。どちらも
+    Worker に到達していない印で、CI からは回避できない。
     """
     try:
         status, raw = probe_get(base_url, path, token=token)
     except urllib.error.HTTPError as error:
         with error:
             status = error.code
-            detail = blocked_detail(error.headers) if status == 403 else ""
+            headers = error.headers
+            detail = blocked_detail(headers) if status == 403 else ""
+            access_redirect = 300 <= status < 400 and ACCESS_REDIRECT_MARKER in (
+                (headers.get("Location") or "") if headers else ""
+            )
+        if blocked_is_access and access_redirect:
+            raise AccessBlocked(f"redirect to {ACCESS_REDIRECT_MARKER}") from None
         if status == 403 and blocked_is_access:
             raise AccessBlocked(detail) from None
         fail(probe_failure(label, status))
