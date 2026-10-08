@@ -627,6 +627,12 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         skipped.len(),
         illust_prefix.as_ref()
     ));
+    if image_names.is_empty() {
+        // 実体が 1 枚も無い。debug-mode に依存せず切り分けの材料を出す:
+        // 「挿絵がどこにも無い」のか「一次ストア (D1) に残っている」のかで
+        // 対処が変わる (後者は挿絵側ストアへ取り直せば直る)。
+        report_missing_illustrations(&env, &services.objects, &keys, illust_prefix.as_ref()).await;
+    }
     for name in &skipped {
         narou_rs::application::debug::emit(format!("EPUB: 挿絵を除外: {name}"));
     }
@@ -764,6 +770,54 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
             &format!("attachment; filename=\"{}\"", sanitize_header_filename(&filename)),
         )?
         .from_stream(stream)
+}
+
+/// 挿絵の一覧が 0 件だったときに、切り分けの材料を Web コンソールへ出す。
+///
+/// `debug-mode` に依存せず必ず出す (「挿絵が EPUB に入らない」の一次切り分けは
+/// ここで決まる)。挿絵側ストア (S3) に実体が無い場合、一次ストア (D1) に
+/// 残っていれば「取り直せば直る」、どこにも無ければ「そもそも取得されていない」
+/// と分かる。方針どおり D1 の旧挿絵は EPUB には使わない (取り直しの判断材料)。
+async fn report_missing_illustrations(
+    env: &Env,
+    objects: &std::sync::Arc<dyn narou_rs::platform::ObjectStore>,
+    keys: &narou_rs::platform::NovelObjectKeys,
+    illust_prefix: &str,
+) {
+    let mut leftovers: Vec<String> = Vec::new();
+    let probe = narou_rs::platform::ObjectPrefix::new(keys.prefix().as_ref().to_string())
+        .ok()
+        .and_then(|prefix| {
+            std::num::NonZeroUsize::new(1000)
+                .map(|limit| narou_rs::platform::ObjectListRequest::new(prefix, limit))
+        });
+    if let Some(request) = probe
+        && let Ok(page) = objects.list_page(&request).await
+    {
+        for metadata in page.objects {
+            if let Some((_, name)) = metadata.key.as_ref().rsplit_once("/挿絵/") {
+                leftovers.push(name.to_string());
+            }
+        }
+    }
+    let detail = if leftovers.is_empty() {
+        "WARN: EPUB: 一次ストア (D1) にも挿絵がありません。まだ取得できていないか、保存先の設定 (asset_backend) と実際の保存先がずれています".to_string()
+    } else {
+        format!(
+            "WARN: EPUB: 一次ストア (D1) に挿絵 {} 件残っています ({}). 挿絵側ストア (S3) へ取り直す必要があります (Web UI の「更新」または narou update)",
+            leftovers.len(),
+            leftovers.join(", ")
+        )
+    };
+    let push = crate::push_hub::PushHubClient::new(env, crate::budget::SubrequestBudget::new());
+    push.broadcast_best_effort(&[
+        crate::push_hub::echo(
+            &format!("WARN: EPUB: 挿絵の一覧が 0 件です (prefix={illust_prefix})"),
+            "stdout",
+        ),
+        crate::push_hub::echo(&detail, "stdout"),
+    ])
+    .await;
 }
 
 /// D1 のローカルスコープ設定を読む (fs が無いので `app_state` 経由)。
