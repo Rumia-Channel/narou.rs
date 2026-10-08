@@ -597,6 +597,15 @@ npx wrangler deploy --config wrangler.ci.toml --secrets-file <json>
   注意: Lite の `image_references` はパス正規化で空セグメントを弾くため `https://…` を参照として
   認識しない。narou.rs 側の URL 対応スキャナ (`epub_lite::illustration_references`) を使うこと
   (AozoraEpub3_Lite 側は無改造)。
+- **挿絵の取得はダウンロード時の既定パターンまで (2026-10-08 修正)**: Worker では挿絵の実体を
+  ダウンロード時にしか取得しないため、サイト定義が `illust_grep_pattern` を持たないサイト
+  (なろう / R18なろう / カクヨム / Arcadia) は挿絵が 1 枚も S3 に入らなかった。narou.rb は
+  `HTML#initialize` の既定 `<img>` パターンで変換時に拾うので、同じ既定
+  (`downloader::DEFAULT_ILLUST_GREP_PATTERN`) をダウンロード時にも使う。既定パターンでは
+  narou.rb `Illustration#scanner` と同じく URL でない注記 (相対パス) は取得せず、挿絵 URL は
+  protocol-relative (`//host/...`) を本文のスキームで解決し (`build_section_url` が以前は
+  `<top_url>//host/...` に壊していた)、mitemin は取得用 URL (`viewimagebig` → `viewimage`) へ
+  寄せる。挿絵が 1 枚も無い小説には空の `.illustration_cache.yaml` を作らない。
 - **D1 の `objects`/`object_chunks` の扱い**: 本文の移行後もしばらく残す。削除（容量回収）は P4 の判断。
 - **APNG 挿絵**: `zip` の feature を純 Rust 構成に絞ったため Worker でも組み立て可能（`worker-runtime` が
   `illustration-animation` を有効化済み）。組み立ては**フレームを 1 枚ずつ復号 → 符号化 → 追記して即解放**し、

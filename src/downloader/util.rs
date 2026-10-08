@@ -15,6 +15,11 @@ pub fn build_section_url(setting: &SiteSetting, toc_url: &str, href: &str) -> St
     let href = decode_html_href(href);
     if href.starts_with("http://") || href.starts_with("https://") {
         href
+    } else if let Some(host_and_path) = href.strip_prefix("//") {
+        // スキーム相対 (`//host/path`) はページと同じスキームで解決する。
+        // なろうの挿絵 (mitemin) がこの形で、`/` 始まりとして扱うと
+        // `<top_url>//host/...` という存在しない URL になっていた。
+        format!("{}://{}", url_scheme(&setting.top_url()), host_and_path)
     } else if href.starts_with('/') {
         format!("{}{}", setting.top_url(), href)
     } else if href.is_empty() {
@@ -22,6 +27,14 @@ pub fn build_section_url(setting: &SiteSetting, toc_url: &str, href: &str) -> St
     } else {
         format!("{}/{}", toc_url.trim_end_matches('/'), href)
     }
+}
+
+/// URL のスキーム部分 (`https` など)。解釈できなければ `https`。
+fn url_scheme(url: &str) -> &str {
+    url.split_once("://")
+        .map(|(scheme, _)| scheme)
+        .filter(|scheme| !scheme.is_empty())
+        .unwrap_or("https")
 }
 
 pub fn decode_html_text(text: &str) -> String {
@@ -255,6 +268,34 @@ mod tests {
         assert_eq!(
             url,
             "http://www.mai-net.net/bbs/sst/sst.php?act=dump&cate=all&all=6858&n=0"
+        );
+    }
+
+    #[test]
+    fn build_section_url_resolves_protocol_relative_hrefs_with_the_site_scheme() {
+        let settings = SiteSetting::load_all().unwrap();
+        let narou = settings
+            .iter()
+            .find(|s| s.domain == "ncode.syosetu.com")
+            .unwrap();
+        assert_eq!(
+            build_section_url(
+                narou,
+                "https://ncode.syosetu.com/n9364bq/12/",
+                "//9496.mitemin.net/userpageimage/viewimagebig/icode/i88657/"
+            ),
+            "https://9496.mitemin.net/userpageimage/viewimagebig/icode/i88657/"
+        );
+
+        // スキームはサイト定義の top_url に従う (Arcadia は http)。
+        let arcadia = settings.iter().find(|s| s.name == "Arcadia").unwrap();
+        assert_eq!(
+            build_section_url(
+                arcadia,
+                "http://www.mai-net.net/bbs/sst/sst.php",
+                "//example.com/x"
+            ),
+            "http://example.com/x"
         );
     }
 

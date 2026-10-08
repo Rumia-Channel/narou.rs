@@ -89,6 +89,14 @@ impl IllustrationIndex {
         self.0.mark_clean();
     }
 
+    /// 読み込み後に内容が変わったか。
+    ///
+    /// ダウンロードは挿絵が 1 枚も無い小説でも索引を読むので、変化が無い
+    /// (空の) 索引を書き戻さないための判定に使う。
+    pub fn is_dirty(&self) -> bool {
+        self.0.dirty
+    }
+
     #[cfg(feature = "native-runtime")]
     pub(crate) fn from_store(store: IllustrationStore) -> Self {
         Self(store)
