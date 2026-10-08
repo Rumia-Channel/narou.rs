@@ -57,9 +57,9 @@ async fn a_new_download_consumes_exactly_one_id() {
     let http = Arc::new(MockHttpClient::new());
     for ncode in ["n1111aa", "n2222bb"] {
         http.add_text(
-            &format!("https://example.com/novel/{ncode}/"),
+            format!("https://example.com/novel/{ncode}/"),
             200,
-            &format!(
+            format!(
                 concat!(
                     r#"<h1 class="title">作品 {ncode}</h1><span class="author">作者</span>"#,
                     r#"<a href="/novel/{ncode}/1/" class="subtitle">第1話</a>"#
@@ -68,7 +68,7 @@ async fn a_new_download_consumes_exactly_one_id() {
             ),
         );
         http.add_text(
-            &format!("https://example.com/novel/{ncode}/1/"),
+            format!("https://example.com/novel/{ncode}/1/"),
             200,
             r#"<div class="body">本文</div>"#,
         );
