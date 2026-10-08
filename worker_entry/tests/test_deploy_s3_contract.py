@@ -368,7 +368,7 @@ class RenderTests(unittest.TestCase):
         self.assertIn('pattern = "production.example.invalid/*"', rendered)
         self.assertIn("custom_domain = false", rendered)
         self.assertIn('zone_name = "example.invalid"', rendered)
-        self.assertIn('workers_dev = "false"', rendered)
+        self.assertIn('workers_dev = false', rendered)
 
     def test_custom_domain_mode_stays_the_default(self):
         rendered = self.render_template(
