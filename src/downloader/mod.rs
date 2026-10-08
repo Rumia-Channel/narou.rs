@@ -1190,12 +1190,6 @@ impl Downloader {
     ) -> Result<()> {
         // サイト定義がパターンを持たない場合は narou.rb の既定パターンを使う。
         let default_pattern = setting.illust_grep_pattern.is_none();
-        if default_pattern {
-            crate::application::debug::emit(format!(
-                "挿絵: サイト定義に illust_grep_pattern が無いので既定の <img> パターンで取得します ({})",
-                setting.domain
-            ));
-        }
 
         // 既定パターンは全サイト共通の定数なので、セクションごとに
         // コンパイルし直さない。
@@ -1302,11 +1296,14 @@ impl Downloader {
                             ));
                             self.report_warn(&messages::download::warn_illustration_save(url, err));
                         } else {
+                            // `filename_for_source` は拡張子込みのファイル名を
+                            // 返すので、ここで `ext` を足さない (以前は
+                            // `挿絵/i88657.jpg.jpg` と二重に出ていた)。
+                            let filename = illustration_store
+                                .filename_for_source(url)
+                                .unwrap_or("(unknown)");
                             crate::application::debug::emit(format!(
-                                "挿絵を保存しました: {url} → 挿絵/{}.{ext} ({} bytes)",
-                                illustration_store
-                                    .filename_for_source(url)
-                                    .unwrap_or("(unknown)"),
+                                "挿絵を保存しました: {url} → 挿絵/{filename} ({} bytes)",
                                 body.len()
                             ));
                         }
@@ -1939,6 +1936,14 @@ impl Downloader {
             .load_cache(&object_keys)
             .await?
             .unwrap_or_default();
+        if setting.illust_grep_pattern.is_none() {
+            // 既定パターンは本文の `<img>` 全部に当たるため、セクションごとでは
+            // なく小説 1 件につき 1 行だけ出す (24 話で 24 行出していた)。
+            crate::application::debug::emit(format!(
+                "挿絵: サイト定義に illust_grep_pattern が無いので既定の <img> パターンで取得します ({})",
+                setting.domain
+            ));
+        }
 
         let resume_from = resume_from_section.unwrap_or(0);
         if resume_from > subtitles.len() {
@@ -3052,16 +3057,22 @@ mod tests {
     /// サイト定義に挿絵パターンが無いサイト (なろう等) でも、ダウンロード時に
     /// narou.rb 既定の `<img>` パターンで挿絵を取得し、挿絵側のストア
     /// (Worker では S3) へ保存すること。`SplitStore` で Worker と同じ配線にする。
+    ///
+    /// 併せて詳細ログの 2 点を固定する: 既定パターンの案内は **小説 1 件につき
+    /// 1 行** (以前はセクションごとに出ていた)、保存行のファイル名は
+    /// **拡張子を足さない** (以前は `挿絵/i88657.jpg.jpg` と表示していた)。
     #[tokio::test]
     async fn default_img_pattern_stores_illustrations_in_the_illustration_store() {
+        // 既定 sink と debug フラグはプロセス共通なので、他のテストと直列化する。
+        let _global = crate::test_support::global_state_guard();
         let mut setting: SiteSetting = serde_yaml::from_str(
             r#"
 name: Illustration Default Test
-domain: example.com
-top_url: https://example.com
-url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+domain: illust-default.test
+top_url: https://illust-default.test
+url: https?://illust-default\.test/(?<ncode>n\d+[a-z]+)/?
 sitename: Illustration Default Test
-toc_url: 'https://example.com/\k<ncode>/'
+toc_url: 'https://illust-default.test/\k<ncode>/'
 subtitles: |-
   <a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a>
 body_pattern: '<div class="body">(?<body>.+?)</div>'
@@ -3074,17 +3085,40 @@ is_narou: false
         setting.compile();
         assert!(setting.illust_grep_pattern.is_none());
 
-        let target = "https://example.com/n1234ab/";
+        struct Lines(std::sync::Mutex<Vec<String>>);
+        impl crate::application::messages::MessageSink for Lines {
+            fn emit(&self, _stream: crate::application::messages::Stream, text: &str) {
+                self.0.lock().unwrap().push(text.to_string());
+            }
+        }
+        /// 既定 sink と debug フラグを必ず元へ戻す (panic しても戻す)。
+        struct Capture(Arc<Lines>);
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                crate::application::debug::set_enabled(false);
+                crate::application::messages::take_default_sink();
+            }
+        }
+        let capture = Capture(Arc::new(Lines(std::sync::Mutex::new(Vec::new()))));
+        crate::application::messages::set_default_sink(capture.0.clone());
+        crate::application::debug::set_enabled(true);
+
+        let target = "https://illust-default.test/n1234ab/";
         let http = Arc::new(MockHttpClient::new());
         http.add_text(
             target,
             200,
-            r#"<h1>挿絵テスト</h1><span>作者</span><a href="/n1234ab/1/">第1話</a>"#,
+            r#"<h1>挿絵テスト</h1><span>作者</span><a href="/n1234ab/1/">第1話</a><a href="/n1234ab/2/">第2話</a>"#,
         );
         http.add_text(
-            "https://example.com/n1234ab/1/",
+            "https://illust-default.test/n1234ab/1/",
             200,
             r#"<div class="body"><a href="//9496.mitemin.net/i88657/"><img src="//9496.mitemin.net/userpageimage/viewimagebig/icode/i88657/" alt="挿絵(By みてみん)" border="0" /></a>本文</div>"#,
+        );
+        http.add_text(
+            "https://illust-default.test/n1234ab/2/",
+            200,
+            r#"<div class="body">挿絵の無い話</div>"#,
         );
         http.add_response(
             "https://9496.mitemin.net/userpageimage/viewimage/icode/i88657/",
@@ -3130,6 +3164,32 @@ is_narou: false
             )
             .await
             .unwrap();
+
+        // 取り込みを止めてから検証する (他のテストの行が混ざらないように)。
+        crate::application::debug::set_enabled(false);
+        crate::application::messages::take_default_sink();
+        let captured: Vec<String> = capture.0.0.lock().unwrap().clone();
+        let mine: Vec<&String> = captured
+            .iter()
+            .filter(|line| line.contains("illust-default.test"))
+            .collect();
+        assert_eq!(
+            mine.iter()
+                .filter(|line| line.contains("既定の <img> パターン"))
+                .count(),
+            1,
+            "既定パターンの案内は小説 1 件につき 1 行だけ出す: {captured:?}"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|line| line.contains("挿絵/i88657.jpg (")),
+            "保存行は拡張子を二重にしない: {captured:?}"
+        );
+        assert!(
+            !captured.iter().any(|line| line.contains(".jpg.jpg")),
+            "保存行は拡張子を二重にしない: {captured:?}"
+        );
 
         async fn keys_of(store: Arc<MemoryObjectStore>) -> Vec<String> {
             store
