@@ -240,7 +240,7 @@ async fn load_section_hash_cache(db: &DbHandle) -> HashMap<String, HashMap<Strin
 
 /// `app_state` の値を bool として解釈する。YAML/JSON の真偽値と
 /// `"true"` / `"false"` 文字列を受け付け、それ以外は未設定として `None`。
-fn setting_bool(value: &serde_yaml::Value) -> Option<bool> {
+pub(crate) fn setting_bool(value: &serde_yaml::Value) -> Option<bool> {
     match value {
         serde_yaml::Value::Bool(value) => Some(*value),
         serde_yaml::Value::String(value) => match value.trim() {

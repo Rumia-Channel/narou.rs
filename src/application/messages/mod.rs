@@ -44,6 +44,20 @@ impl Stream {
             Stream::Stderr => "stdout2",
         }
     }
+
+    /// `stdout` 行の宛先を上書きして解決する。
+    ///
+    /// native の `web::worker::console_target_for_job` は convert/send/backup/mail
+    /// (外部通信を持たないジョブ) の行を、`concurrency` 有効時に `stdout2` へ
+    /// 寄せる。Worker の `PushHubSink` も同じ上書きを使うので、規則をここ 1 箇所に
+    /// 置く (`stderr` 行は元から `stdout2` なので上書きしない)。
+    pub fn target_console_with(self, override_console: Option<&'static str>) -> &'static str {
+        match (override_console, self) {
+            (_, Stream::Stderr) => "stdout2",
+            (Some(console), Stream::Stdout) => console,
+            (None, Stream::Stdout) => "stdout",
+        }
+    }
 }
 
 /// メッセージの送出先 port。
@@ -182,6 +196,16 @@ mod tests {
     fn stream_maps_to_web_console_names() {
         assert_eq!(Stream::Stdout.target_console(), "stdout");
         assert_eq!(Stream::Stderr.target_console(), "stdout2");
+    }
+
+    /// `concurrency` 有効時の上書き (native `console_target_for_job` 相当)。
+    #[test]
+    fn stream_target_console_can_be_overridden_for_local_jobs() {
+        assert_eq!(Stream::Stdout.target_console_with(None), "stdout");
+        assert_eq!(Stream::Stdout.target_console_with(Some("stdout2")), "stdout2");
+        // stderr は元から別コンソールなので上書きしない。
+        assert_eq!(Stream::Stderr.target_console_with(None), "stdout2");
+        assert_eq!(Stream::Stderr.target_console_with(Some("stdout2")), "stdout2");
     }
 
     #[test]

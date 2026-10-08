@@ -21,6 +21,26 @@ use crate::composition::WorkerRuntime;
 use crate::executor::JobOutcome;
 use crate::push_hub::{PushHubClient, PushHubSink};
 
+/// 変換ジョブの行を送るコンソール。
+///
+/// native `web::worker::console_target_for_job` は外部通信を持たないジョブ
+/// (convert/send/backup/mail) の行を、`concurrency` 有効時に `stdout2` へ寄せる
+/// (DL/update の行と同じコンソールに混ざらないようにする)。Worker の変換は
+/// 別ジョブとして走るので、同じ規則をここでも適用する。無効時は `None`
+/// (= 既定の `stdout` / `stdout2` 分離)。
+async fn console_target(runtime: &WorkerRuntime) -> Option<&'static str> {
+    let local = runtime
+        .settings_store()
+        .load(narou_rs::setting_core::SettingScope::Local)
+        .await
+        .ok()?;
+    local
+        .get("concurrency")
+        .and_then(crate::composition::setting_bool)
+        .filter(|enabled| *enabled)
+        .map(|_| "stdout2")
+}
+
 /// `Convert` プランを実行する。対象は単一小説の id のみ。
 ///
 /// コンソール行は native `narou convert <id>` と同じものを出す。download
@@ -42,7 +62,7 @@ pub async fn execute_convert(
         }
     };
 
-    let push_sink = PushHubSink::install(push.clone());
+    let push_sink = PushHubSink::install_with_console(push.clone(), console_target(runtime).await);
     let report = emit_convert_item_lines(push_sink.as_ref(), &job.target.as_str(), target.0, || {
         convert(runtime, target)
     })
