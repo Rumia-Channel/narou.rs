@@ -302,6 +302,45 @@ class ProbeTests(unittest.TestCase):
         self.assertIsNone(deploy.NoRedirect().redirect_request(request, None, 302, "Found", {}, "https://other.invalid"))
 
 
+class DomainFallbackTests(unittest.TestCase):
+    """SORAHOST と Workers のホスト名の取り合い (Cloudflare error 100117)。"""
+
+    def setUp(self):
+        self.env = patch.dict(os.environ, ENV, clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_custom_domain_conflict_switches_to_route_when_workers_are_active(self):
+        conflict = (
+            "[ERROR] Trigger configuration was only partially updated: "
+            "Hostname 'app.example.invalid' already has externally managed DNS records "
+            "(A, CNAME, etc). [code: 100117]"
+        )
+        with patch.object(
+            deploy,
+            "run_deploy",
+            side_effect=[(1, conflict), (0, "Deployed https://worker.example.workers.dev")],
+        ) as run_deploy, patch.object(deploy, "render") as render, \
+                contextlib.redirect_stdout(io.StringIO()):
+            url = deploy.deploy(None, "production", {"database_name": "narou-rs"})
+        self.assertEqual(url, "https://worker.example.workers.dev")
+        self.assertEqual(run_deploy.call_count, 2, "route で 1 回だけ再試行する")
+        render.assert_called_once()
+        self.assertEqual(os.environ.get("NAROU_DOMAIN_MODE"), "route")
+
+    def test_sorahost_keeps_the_hostname_while_it_is_the_target(self):
+        os.environ["NAROU_SORAHOST"] = "T"
+        with patch.object(
+            deploy, "run_deploy", return_value=(1, "externally managed DNS records")
+        ) as run_deploy, patch.object(deploy, "render") as render, \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                deploy.deploy(None, "production", {"database_name": "narou-rs"})
+        self.assertEqual(run_deploy.call_count, 1, "SORAHOST が配備先なら奪わない")
+        render.assert_not_called()
+        self.assertNotIn("NAROU_DOMAIN_MODE", os.environ)
+
+
 class RenderTests(unittest.TestCase):
     def render_template(self, template, target="develop", extra_env=None):
         env = {**ENV, "NAROU_DEPLOY_TARGET": target, "SERVICE_DOMAIN": "production.example.invalid"}
@@ -316,6 +355,23 @@ class RenderTests(unittest.TestCase):
     def test_ci_template_without_s3_requirement_is_refused(self):
         with self.assertRaises(SystemExit):
             self.render_template('[vars]\nS3_BUCKET = "__S3_BUCKET__"\n')
+
+    def test_route_mode_keeps_the_existing_hostname_record(self):
+        # SORAHOST のコネクタが持つ DNS レコードを消さずに Workers を載せる形。
+        rendered = self.render_template(
+            '[vars]\nNAROU_REQUIRE_S3 = "true"\n',
+            target="production",
+            extra_env={"NAROU_DOMAIN_MODE": "route", "NAROU_ZONE_NAME": "example.invalid"},
+        )
+        self.assertIn('pattern = "production.example.invalid/*"', rendered)
+        self.assertIn("custom_domain = false", rendered)
+        self.assertIn('zone_name = "example.invalid"', rendered)
+        self.assertIn('workers_dev = "false"', rendered)
+
+    def test_custom_domain_mode_stays_the_default(self):
+        rendered = self.render_template('[vars]\nNAROU_REQUIRE_S3 = "true"\n', target="production")
+        self.assertIn('pattern = "production.example.invalid"', rendered)
+        self.assertIn("custom_domain = true", rendered)
 
     def test_false_or_boolean_requirement_is_refused(self):
         for value in ('"false"', 'false', 'true'):

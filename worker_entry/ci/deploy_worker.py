@@ -80,6 +80,10 @@ PROBE_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0"
 )
 
+# custom domain を付けられないときの wrangler のエラー文言 (Cloudflare error
+# 100117)。SORAHOST のコネクタ等が同じホスト名の DNS レコードを持っていると出る。
+DNS_CONFLICT_MARKER = "externally managed DNS records"
+
 # 必須の S3 検証が 403 で返ったときの説明。Worker 自身は S3 LIST の失敗を
 # 503 で返し、この経路で 403 は返さないため、403 は前段 (Cloudflare Access や
 # WAF) で弾かれたことを意味する。custom domain が Access の内側にある構成では
@@ -147,6 +151,17 @@ def mask(value: str) -> None:
 def auth_required() -> bool:
     """Bearer トークン検査が有効か（Zero Trust を境界にする場合は false）。"""
     return os.environ.get("NAROU_AUTH_REQUIRED", "true").strip().lower() != "false"
+
+
+def sorahost_active() -> bool:
+    """配備先が SORAHOST か (Repository variable `SORAHOST=T`)。
+
+    `T` の間は Workers 側のジョブが workflow の `if` で止まるので、ここは
+    「Workers が配備先か」の判定として使う。ドメインの取り合いでは、動いて
+    いる側がホスト名を取る: SORAHOST が配備先なら Workers は DNS レコードを
+    奪わない (route への切替もしない)。
+    """
+    return os.environ.get("NAROU_SORAHOST", "").strip().upper() == "T"
 
 
 def required(name: str) -> str:
@@ -467,18 +482,58 @@ def secret_file(target: str) -> Path | None:
     return path
 
 
-def deploy(secrets: Path | None) -> str | None:
+def run_deploy(secrets: Path | None) -> tuple[int, str]:
+    """`wrangler deploy` を実行し `(exit code, log)` を返す (失敗でも落とさない)。"""
+    command = ["npx", "--yes", "wrangler@4", "deploy", "-c", "wrangler.ci.toml"]
+    if secrets is not None:
+        command += ["--secrets-file", str(secrets)]
+    result = subprocess.run(
+        command,
+        cwd=WORKER_DIR,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return result.returncode, (result.stdout or "") + (result.stderr or "")
+
+
+def deploy(
+    secrets: Path | None,
+    target: str,
+    resources: dict[str, str],
+) -> str | None:
     """デプロイし、wrangler が報告した workers.dev の URL を返す（無ければ None）。
 
     custom domain 運用 (`workers_dev = false`) では有人の URL を出さないため、
     smoke の宛先は `smoke_url()` が custom domain から決める。ログ中の任意の
     https URL を拾うと無関係なリンクを掴むので、フォールバックはしない。
+
+    ホスト名の DNS レコードを SORAHOST などの前段が持っている場合、custom
+    domain は付け替えられない (`externally managed DNS records`)。そのときは
+    `NAROU_DOMAIN_MODE=route` で組み直し、同じホスト名に Workers の route と
+    して載せ直す (DNS は触らない・Access はホスト名単位のまま)。
     """
-    command = ["npx", "--yes", "wrangler@4", "deploy", "-c", "wrangler.ci.toml"]
-    if secrets is not None:
-        command += ["--secrets-file", str(secrets)]
-    log = run(command, capture=True)
+    code, log = run_deploy(secrets)
+    if code != 0 and DNS_CONFLICT_MARKER in log:
+        if sorahost_active():
+            # SORAHOST が配備先のときは、そのホスト名は SORAHOST のもの。
+            # Workers からは奪わない (workflow の if で通常はここへ来ない)。
+            print(log)
+            fail(
+                "hostname is managed by SORAHOST while SORAHOST=T; "
+                "switch the deployment target or release the hostname first"
+            )
+        print(
+            "::notice::ホスト名の既存 DNS レコードのため custom domain を route に切り替えます "
+            "(NAROU_DOMAIN_MODE=route; SORAHOST=F なので Workers が受け持ちます)"
+        )
+        os.environ["NAROU_DOMAIN_MODE"] = "route"
+        render(target, resources)
+        code, log = run_deploy(secrets)
     print(log)
+    if code != 0:
+        fail(f"npx --yes wrangler@4 deploy -c wrangler.ci.toml failed with {code}")
     urls = WORKER_URL_PATTERN.findall(log)
     return urls[-1] if urls else None
 
@@ -594,7 +649,7 @@ def main() -> None:
 
     secrets = secret_file(target)
     try:
-        url = deploy(secrets)
+        url = deploy(secrets, target, resources)
     finally:
         if secrets is not None:
             secrets.unlink(missing_ok=True)

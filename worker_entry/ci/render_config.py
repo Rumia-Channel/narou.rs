@@ -184,9 +184,28 @@ def main() -> None:
     if domain:
         if not HOSTNAME_PATTERN.fullmatch(domain) or "." not in domain:
             fail(f"{domain_var} must be a hostname without a scheme or path")
-        replacements["__CUSTOM_DOMAIN_BLOCK__"] = (
-            f'\n[[routes]]\npattern = "{domain}"\ncustom_domain = true\n'
-        )
+        # custom domain は Cloudflare に DNS レコードを作らせる (= 既存レコードが
+        # あると "externally managed DNS records" で失敗する)。SORAHOST の
+        # コネクタのように既存レコードがそのホスト名を握っている場合は、
+        # `NAROU_DOMAIN_MODE=route` で Workers の route として載せる — DNS は
+        # 触らず、そのホスト名への要求は Workers が前段で受ける (Access も
+        # ホスト名単位のまま効く)。
+        mode = optional("NAROU_DOMAIN_MODE", "custom_domain").strip().lower()
+        if mode not in ("custom_domain", "route"):
+            fail("NAROU_DOMAIN_MODE must be custom_domain or route")
+        if mode == "route":
+            zone = optional("NAROU_ZONE_NAME", "").strip()
+            if zone and (not HOSTNAME_PATTERN.fullmatch(zone) or "." not in zone):
+                fail("NAROU_ZONE_NAME must be a hostname without a scheme or path")
+            zone_line = f'zone_name = "{zone}"\n' if zone else ""
+            replacements["__CUSTOM_DOMAIN_BLOCK__"] = (
+                f'\n[[routes]]\npattern = "{domain}/*"\n'
+                f"{zone_line}custom_domain = false\n"
+            )
+        else:
+            replacements["__CUSTOM_DOMAIN_BLOCK__"] = (
+                f'\n[[routes]]\npattern = "{domain}"\ncustom_domain = true\n'
+            )
     # workers_dev は domain の有無から決める (NAROU_WORKERS_DEV で明示もできる)。
     workers_dev = optional("NAROU_WORKERS_DEV", "").strip().lower()
     if not workers_dev:
