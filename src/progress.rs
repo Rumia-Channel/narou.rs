@@ -348,11 +348,20 @@ fn current_web_progress_scope(topic: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{STDOUT_LOCK, WEB_PROGRESS_SCOPE_ENV, current_web_progress_scope};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
+
+    /// 環境変数はプロセス全体で共有されるため、書き換えるテストは直列化する
+    /// (並列実行だと片方の `remove_var` がもう片方の `set_var` を消してしまう)。
+    static SCOPE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_scope_env() -> std::sync::MutexGuard<'static, ()> {
+        SCOPE_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    }
 
     #[test]
     fn web_progress_scope_uses_env_override_when_present() {
+        let _guard = lock_scope_env();
         unsafe { std::env::set_var(WEB_PROGRESS_SCOPE_ENV, "job-123"); }
         assert_eq!(current_web_progress_scope("convert"), "job-123");
         unsafe { std::env::remove_var(WEB_PROGRESS_SCOPE_ENV); }
@@ -360,6 +369,7 @@ mod tests {
 
     #[test]
     fn web_progress_scope_falls_back_to_topic() {
+        let _guard = lock_scope_env();
         unsafe { std::env::remove_var(WEB_PROGRESS_SCOPE_ENV); }
         assert_eq!(current_web_progress_scope("convert"), "convert");
     }

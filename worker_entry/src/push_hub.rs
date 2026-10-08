@@ -198,15 +198,20 @@ fn event_batches<'a>(events: &'a [Value]) -> impl Iterator<Item = &'a [Value]> +
 pub struct PushHubSink {
     client: PushHubClient,
     queue: Arc<messages::flush::FlushQueue<Value>>,
+    /// `stdout` 行の宛先コンソールの上書き。native
+    /// `web::worker::console_target_for_job` と同じく、外部通信を持たない
+    /// ジョブ (`concurrency` 有効時の convert など) の行を `stdout2` へ流す。
+    console: Option<&'static str>,
 }
 
 impl PushHubSink {
-    fn new(client: PushHubClient) -> Self {
+    fn new(client: PushHubClient, console: Option<&'static str>) -> Self {
         Self {
             client,
             queue: Arc::new(messages::flush::FlushQueue::new(
                 messages::flush::DEFAULT_MIN_INTERVAL_MS,
             )),
+            console,
         }
     }
 
@@ -214,7 +219,17 @@ impl PushHubSink {
     /// (`narou_rs::application::messages::emit_default` が読む共有スロット) にも
     /// 登録して返す。download / convert いずれのジョブ境界でも同じ手順。
     pub fn install(client: PushHubClient) -> std::sync::Arc<Self> {
-        let sink = std::sync::Arc::new(Self::new(client));
+        Self::install_with_console(client, None)
+    }
+
+    /// `stdout` 行の宛先コンソールを上書きして sink を作る。`None` は既定
+    /// (`stdout` / `stdout2` を `Stream` で分ける)。`emit` は
+    /// `Stream::target_console_with` に委譲する。
+    pub fn install_with_console(
+        client: PushHubClient,
+        console: Option<&'static str>,
+    ) -> std::sync::Arc<Self> {
+        let sink = std::sync::Arc::new(Self::new(client, console));
         narou_rs::application::messages::set_default_sink(sink.clone());
         sink
     }
@@ -266,7 +281,10 @@ impl PushHubSink {
 
 impl narou_rs::application::messages::MessageSink for PushHubSink {
     fn emit(&self, stream: narou_rs::application::messages::Stream, text: &str) {
-        if self.queue.push(echo(text, stream.target_console())) {
+        if self
+            .queue
+            .push(echo(text, stream.target_console_with(self.console)))
+        {
             self.spawn_sender();
         }
     }

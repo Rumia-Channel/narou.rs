@@ -109,9 +109,9 @@ fn result_body(success: bool, message: &str) -> serde_json::Value {
 ///   `webui/job_actions.rs` が device を plan に載せないと明記)、
 ///   `convert.copy-*` / `folder` / `normalize-filename` /
 ///   `filename-length-limit` / `folder-length-limit` (ローカル FS の
-///   出力・コピー・ファイル名前提)、`concurrency` / `concurrency.*`
-///   (Worker のジョブは常に並列実行。UI 側が読む `concurrency_enabled` は
-///   stdout2 ペインの表示だけで stderr 行を出す経路が Worker に無い)、
+///   出力・コピー・ファイル名前提)、`concurrency.*` (native コンソールの
+///   キュー表示整形。Worker は読まない。`concurrency` 自体は Worker でも
+///   効く — convert ジョブの行を `stdout2` へ分ける)、
 ///   `economy` / `no-color` / `color-parser` / `multiple-delimiter` /
 ///   `time-zone` (CLI・コンソール・native ファイル出力専用)、
 ///   `narou-compat` (D1 固定ストアの切替対象が無い)、
@@ -171,7 +171,6 @@ fn is_worker_ineffective(name: &str) -> bool {
     const NAMES: &[&str] = &[
         "aozoraepub3dir",
         "color-parser",
-        "concurrency",
         "convert.add-dc-subject-to-epub",
         "convert.copy-to",
         "convert.copy-to-grouping",
@@ -228,6 +227,8 @@ mod tests {
             "webui.theme",
             "webui.debug-mode",
             "webui.new-tag-color",
+            // UI のデュアルコンソール表示と convert ジョブの行の宛先に効く
+            "concurrency",
             // server- prefix でも Worker が読む唯一の例外
             "server-max-targets-per-request",
             // download.epub のファイル名に効く命名設定と挿絵回転
