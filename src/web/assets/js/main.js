@@ -115,6 +115,8 @@ async function init() {
   setInterval(async () => {
     await refreshListWithUiState();
     await refreshQueue();
+    // イベント取りこぼしで残ったバーを、キューが空になった時点で片付ける。
+    clearProgressBarsWhenQueueIdle(State.queueStatus);
     if (isQueueModalOpen()) {
       await refreshQueueDetailed();
     }
@@ -260,7 +262,7 @@ function handleWsMessage(msg) {
     case 'status':
     case 'queue':
     case 'notification.queue':
-      refreshQueue();
+      refreshQueueAndSyncProgressBars();
       refreshQueueDetailedIfOpen();
       break;
     case 'refresh':
@@ -290,11 +292,13 @@ function handleWsMessage(msg) {
       refreshQueueDetailedIfOpen();
       break;
     case 'queue_complete':
-      refreshQueue();
+      removeProgressBarsForScope(queueEventJobId(msg.data));
+      refreshQueueAndSyncProgressBars();
       refreshQueueDetailedIfOpen();
       break;
     case 'queue_failed':
-      refreshQueue();
+      removeProgressBarsForScope(queueEventJobId(msg.data));
+      refreshQueueAndSyncProgressBars();
       refreshQueueDetailedIfOpen();
       notifyQueueFailure(msg.data);
       break;
@@ -304,13 +308,15 @@ function handleWsMessage(msg) {
       break;
     case 'queue_partial':
     case 'queue.partial':
-      refreshQueue();
+      removeProgressBarsForScope(queueEventJobId(msg.data));
+      refreshQueueAndSyncProgressBars();
       refreshQueueDetailed();
       notifyQueuePartial(msg.data);
       break;
     case 'queue_cancelled':
     case 'queue.cancelled':
-      refreshQueue();
+      removeProgressBarsForScope(queueEventJobId(msg.data));
+      refreshQueueAndSyncProgressBars();
       refreshQueueDetailed();
       notifyQueueCancelled(msg.data);
       break;
@@ -596,9 +602,83 @@ function progressBarKey(topic, targetConsole, scope) {
   return (targetConsole || 'stdout') + ':' + (scope || topic || 'default');
 }
 
+/**
+ * 同じコンソール・同じ topic の job バーは 1 本だけにする。
+ *
+ * バーは job id を scope に持つので、scope が変わった古いバーが消し損ねられると
+ * 「進捗 0/0 0.0%」が積み重なって見える。新しい init の時点で同じ topic の
+ * 古いバーを落としておけば、その状態が画面に残らない。
+ *
+ * job id を持たないバー (自己アップデート等) は scope が空なので対象外。
+ * 別系統のバーを巻き込まないよう、新規バーにも scope があるときだけ動かす。
+ */
+function removeTopicProgressBars(topic, targetConsole, keepKey, scope) {
+  if (!scope) return;
+  var target = targetConsole || 'stdout';
+  var wanted = topic || '';
+  Object.keys(progressBars).forEach(function(key) {
+    if (key === keepKey) return;
+    var entry = progressBars[key];
+    if (!entry || !entry.scope) return;
+    if (entry.console !== target || entry.topic !== wanted) return;
+    removeProgressBar(entry.topic, entry.console, entry.scope);
+  });
+}
+
+/**
+ * job の終端でスコープ指定のバーを消す (サーバの `progressbar.clear` が
+ * 届かなかった場合の保険。通常はサーバ側も同じ scope で clear を送る)。
+ */
+function removeProgressBarsForScope(scope) {
+  if (typeof scope !== 'string' || !scope) return;
+  Object.keys(progressBars).forEach(function(key) {
+    var entry = progressBars[key];
+    if (!entry || entry.scope !== scope) return;
+    removeProgressBar(entry.topic, entry.console, entry.scope);
+  });
+}
+
+/**
+ * キュー終端イベントの payload から job id を取り出す。
+ * `queue_complete` は文字列、それ以外は `{ job_id }` 形式。
+ */
+function queueEventJobId(data) {
+  if (typeof data === 'string') return data;
+  if (data && typeof data === 'object' && typeof data.job_id === 'string') return data.job_id;
+  return '';
+}
+
+/**
+ * キューが空なら job スコープのバーは残っていてはいけない
+ * (「完了時に消去」の最後の砦)。自己アップデートのように job id を持たない
+ * バー (scope が空) はここでは消さない。
+ */
+function clearProgressBarsWhenQueueIdle(queueStatus) {
+  if (!queueStatus) return;
+  var running = Number.isFinite(queueStatus.running_count) ? queueStatus.running_count : 0;
+  var pending = Number.isFinite(queueStatus.pending) ? queueStatus.pending : 0;
+  if (running !== 0 || pending !== 0) return;
+  Object.keys(progressBars).forEach(function(key) {
+    var entry = progressBars[key];
+    if (!entry || !entry.scope) return;
+    removeProgressBar(entry.topic, entry.console, entry.scope);
+  });
+}
+
+/** キュー状態を取り直し、空になったら残っているバーを片付ける。 */
+function refreshQueueAndSyncProgressBars() {
+  var pending = refreshQueue();
+  if (pending && typeof pending.then === 'function') {
+    pending.then(function() {
+      clearProgressBarsWhenQueueIdle(State.queueStatus);
+    }, function() {});
+  }
+}
+
 function initProgressBar(topic, targetConsole, scope) {
   var key = progressBarKey(topic, targetConsole, scope);
   removeProgressBar(topic, targetConsole, scope);
+  removeTopicProgressBars(topic, targetConsole, key, scope);
   var host = getProgressHost(targetConsole);
   if (!host) return;
   var wrapper = document.createElement('div');
@@ -616,6 +696,9 @@ function initProgressBar(topic, targetConsole, scope) {
     wrapper: wrapper,
     bar: progress.querySelector('.progress-bar'),
     label: label,
+    topic: topic || '',
+    console: targetConsole || 'stdout',
+    scope: scope || '',
   };
   updateProgressHostVisibility(targetConsole);
 }
