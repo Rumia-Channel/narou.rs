@@ -5,6 +5,16 @@ narou_rs は、日本の Web 小説を取得・管理・変換する CLI / Web U
 
 README では、導入方法、基本操作、主な注意点をまとめます。詳細なコマンド互換性や未完了項目は `COMMANDS.md` を参照してください。
 
+## v0.4.7 の主な変更
+
+- SQLite 管理のライブラリで `freeze` を実行すると、それまでの凍結が外れて `.narou/freeze.yaml.imported-*` が増え続ける不具合を修正しました（[#35](https://github.com/Rumia-Channel/narou.rs/issues/35)）。凍結状態の保存先を YAML / SQLite の共通入口に統一し、取り込みを和集合にしたうえで `frozen_novels` へ投影します。既に失われた凍結は更新後に `narou db repair-freeze --dry-run` で確認し、`narou db repair-freeze` で復旧できます。
+- Cloudflare Workers の Web コンソールで、ダウンロードの進捗が完了時にまとめて表示される不具合を修正しました。行ごとに送信し、順序・取りこぼし・送信間隔は共有バッファが管理します。
+- Worker の EPUB に挿絵が入らない不具合を修正しました。変換後の本文に残る取得元 URL を、ダウンロード時に保存した `挿絵/<file>` へ寄せてから組み立てます。挿絵が見つからない場合は警告を出します。
+- `webui.debug-mode` を ON にすると、挿絵の取り込みや EPUB の解決状況などの詳細を `[debug]` 行として Web コンソールへ流し、ブラウザの開発者コンソールにも転送します。
+- 配備の修正: Worker 配備後の S3 検証が、プローブの User-Agent がボット判定に掛かって失敗していた問題を修正し、smoke でも同じ検証を行うようにしました。
+
+変更一覧は [v0.4.6...v0.4.7](https://github.com/Rumia-Channel/narou.rs/compare/v0.4.6...v0.4.7) を参照してください。
+
 ## v0.4.6 の主な変更
 
 - Cloudflare Workers の小説一覧・全体設定・タグ・キュー表示から、不要な S3・ログイン・ダウンローダ等の初期化を取り除きました。
