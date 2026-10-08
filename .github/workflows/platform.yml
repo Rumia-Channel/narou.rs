@@ -54,6 +54,8 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_sorahost_smoke.py'
       - name: Web UI source-link escaping regressions
         run: node --test tests/render_links.test.mjs
+      - name: Web UI progress bar regressions
+        run: node --test tests/progress_bars.test.mjs
       - run: cargo check --workspace --all-targets
       - name: Web UI queue and refresh regressions
         run: node --test tests/queue_refresh.test.mjs
