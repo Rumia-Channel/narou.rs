@@ -105,13 +105,15 @@ async fn webui_config(req: &Request, runtime: &WorkerRuntime) -> worker::Result<
         .flatten()
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    // Worker のジョブは常に並列なので既定は有効 (native の `concurrency=true` と
+    // 同じ 2 ペイン表示)。明示的に false を保存したときだけ 1 ペインに戻す。
     let concurrency_enabled = settings
         .get("concurrency")
         .await
         .ok()
         .flatten()
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
+        .and_then(|value| crate::composition::setting_bool(&value))
+        .unwrap_or(true);
 
     // native は HTTP/WS サーバーの待受ポートを返す。Worker では `/ws` も同じ
     // オリジンに同居するので、リクエストの実効ポート (明示ポートまたは

@@ -25,20 +25,34 @@ use crate::push_hub::{PushHubClient, PushHubSink};
 ///
 /// native `web::worker::console_target_for_job` は外部通信を持たないジョブ
 /// (convert/send/backup/mail) の行を、`concurrency` 有効時に `stdout2` へ寄せる
-/// (DL/update の行と同じコンソールに混ざらないようにする)。Worker の変換は
-/// 別ジョブとして走るので、同じ規則をここでも適用する。無効時は `None`
-/// (= 既定の `stdout` / `stdout2` 分離)。
+/// (DL/update の行と同じコンソールに混ざらないようにする)。
+///
+/// Worker は queue の `max_concurrency` でジョブが**常に並列**なので、native の
+/// 「`concurrency=false` = 全ジョブを 1 レーンで逐次実行」に相当する状態が無い。
+/// そのため既定を「有効」に倒し、明示的に `concurrency=false` を保存したときだけ
+/// 1 コンソールへまとめる (native と同じ設定で同じ見え方になる)。
 async fn console_target(runtime: &WorkerRuntime) -> Option<&'static str> {
-    let local = runtime
+    if concurrency_enabled(runtime).await {
+        Some("stdout2")
+    } else {
+        None
+    }
+}
+
+/// `concurrency` 設定 (未設定の Worker では有効)。
+async fn concurrency_enabled(runtime: &WorkerRuntime) -> bool {
+    match runtime
         .settings_store()
         .load(narou_rs::setting_core::SettingScope::Local)
         .await
-        .ok()?;
-    local
-        .get("concurrency")
-        .and_then(crate::composition::setting_bool)
-        .filter(|enabled| *enabled)
-        .map(|_| "stdout2")
+    {
+        Ok(local) => local
+            .get("concurrency")
+            .and_then(crate::composition::setting_bool)
+            .unwrap_or(true),
+        // 設定を読めないときは分離側 (既定) に倒す。
+        Err(_) => true,
+    }
 }
 
 /// `Convert` プランを実行する。対象は単一小説の id のみ。

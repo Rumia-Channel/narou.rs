@@ -411,11 +411,15 @@ phase と対象を持たない共通カーソル/`done` は移行完了の証明
 - 設定ページの JSON は `src/application/settings_view.rs` に集約し、native（axum ハンドラ）と Worker が
   同じコードで組み立てる。`SettingsService`（`SettingsStore` port の上）と `setting_core` /
   `setting_info` だけで完結するため、両方のビルドでそのまま動く。
-- **コンソールの分離 (2026-10-08 修正)**: `concurrency` は Worker でも設定でき、有効時は
-  convert ジョブの行を native の `web::worker::console_target_for_job` と同じ `stdout2` へ送る
+- **コンソールの分離 (2026-10-08 修正)**: `concurrency` は Worker でも設定でき、convert ジョブの行を
+  native の `web::worker::console_target_for_job` と同じ `stdout2` へ送る
   (`application::messages::Stream::target_console_with` + `PushHubSink::install_with_console`)。
-  DL/update の行は `stdout` のままなので、Web UI のデュアルコンソールが native と同じ分け方に
-  なる。`concurrency.*` (native コンソールのキュー表示整形) は native 専用のまま無効扱い。
+  Worker はジョブが常に並列 (queue の `max_concurrency`) で、native の「`concurrency=false` =
+  全ジョブを 1 レーンで逐次」に相当する状態が無いため **既定は有効**とし、明示的に
+  `concurrency=false` を保存したときだけ 1 コンソールへまとめる (`worker_entry/src/convert.rs` と
+  `webui/ui_prefs.rs`)。DL/update の行は `stdout` のままなので、Web UI のデュアルコンソールが
+  native と同じ分け方になる。`concurrency.*` (native コンソールのキュー表示整形) は native 専用の
+  まま無効扱い。
 
 ---
 
