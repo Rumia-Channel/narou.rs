@@ -621,6 +621,40 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
         }
     }
 
+    // 一覧に載っていない参照は、共通のキー生成 (`NovelObjectKeys::illustration`)
+    // — 保存側と同じ関数 — で直接 stat して拾う。挿絵の保存はできているのに
+    // ストアの LIST が返らない環境でも、実体があれば EPUB に入る
+    // (本文の参照順に足すので、表紙も本文の先頭の挿絵のまま)。
+    for reference in narou_rs::epub_lite::illustration_references(&text) {
+        if image_names.iter().any(|name| name == &reference) {
+            continue;
+        }
+        let Some(name) = reference.strip_prefix("挿絵/") else {
+            continue;
+        };
+        let Ok(key) = keys.illustration(name) else {
+            continue;
+        };
+        match services.objects.stat(&key).await {
+            Ok(Some(_)) => {
+                if image_names.len() >= MAX_IMAGES {
+                    return Response::error(
+                        format!("Illustrations exceed the Worker budget ({MAX_IMAGES} images)"),
+                        413,
+                    );
+                }
+                narou_rs::application::debug::emit(format!(
+                    "EPUB: 挿絵を一覧に依らず直接確認しました: {reference}"
+                ));
+                image_names.push(reference);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Response::error(format!("Object store error: {error}"), 500);
+            }
+        }
+    }
+
     narou_rs::application::debug::emit(format!(
         "EPUB: 挿絵一覧 {} 件 (除外 {} 件) prefix={}",
         image_names.len(),
@@ -801,10 +835,10 @@ async fn report_missing_illustrations(
         }
     }
     let detail = if leftovers.is_empty() {
-        "WARN: EPUB: 一次ストア (D1) にも挿絵がありません。まだ取得できていないか、保存先の設定 (asset_backend) と実際の保存先がずれています".to_string()
+        "WARN: EPUB: 一覧でも直接確認でも挿絵が見つからず、一次ストア (D1) にもありません。保存先の設定 (asset_backend) と実際の保存先がずれている可能性があります".to_string()
     } else {
         format!(
-            "WARN: EPUB: 一次ストア (D1) に挿絵 {} 件残っています ({}). 挿絵側ストア (S3) へ取り直す必要があります (Web UI の「更新」または narou update)",
+            "WARN: EPUB: 一覧でも直接確認でも見つからず、一次ストア (D1) に挿絵 {} 件残っています ({}). 挿絵側ストア (S3) へ取り直す必要があります (Web UI の「更新」または narou update)",
             leftovers.len(),
             leftovers.join(", ")
         )
@@ -812,7 +846,7 @@ async fn report_missing_illustrations(
     let push = crate::push_hub::PushHubClient::new(env, crate::budget::SubrequestBudget::new());
     push.broadcast_best_effort(&[
         crate::push_hub::echo(
-            &format!("WARN: EPUB: 挿絵の一覧が 0 件です (prefix={illust_prefix})"),
+            &format!("WARN: EPUB: 挿絵を 1 枚も解決できませんでした (prefix={illust_prefix})"),
             "stdout",
         ),
         crate::push_hub::echo(&detail, "stdout"),
