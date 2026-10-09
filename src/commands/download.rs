@@ -52,7 +52,8 @@ async fn cmd_download_inner(
             return Ok(127);
         }
     };
-    downloader.set_message_sink(narou_rs::progress::direct_console_sink());
+    // レポート行もログに残す (narou.rb と同じ)。
+    downloader.set_message_sink(narou_rs::progress::console_sink());
 
     let mut targets = opts.targets.clone();
 

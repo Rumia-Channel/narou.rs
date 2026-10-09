@@ -1517,7 +1517,9 @@ async fn run_serial_update(
             std::process::exit(1);
         }
     };
-    downloader.set_message_sink(narou_rs::progress::direct_console_sink());
+    // レポート行もログに残す (narou.rb と同じ)。並列時の行混線は
+    // ConsoleSink 内の STDOUT_LOCK が防ぐ。
+    downloader.set_message_sink(narou_rs::progress::console_sink());
     let mut last_started_by_domain = HashMap::new();
 
     for (i, &id) in target_ids.iter().enumerate() {
@@ -1601,7 +1603,7 @@ async fn run_parallel_per_domain_update(
                     return Ok((0, HashMap::new()));
                 }
             };
-            downloader.set_message_sink(narou_rs::progress::direct_console_sink());
+            downloader.set_message_sink(narou_rs::progress::console_sink());
             let mut last_started_by_domain = HashMap::new();
             let mut local_mistook = 0usize;
             let mut local_hotentries: HashMap<i64, Vec<SubtitleInfo>> = HashMap::new();

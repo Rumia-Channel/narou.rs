@@ -791,10 +791,9 @@ fn watch_server_settings(state: narou_rs::web::AppState) -> tokio::task::JoinHan
             } else {
                 let first = last_logging.replace(logging).is_none();
                 if !first {
-                    // bin 側 (`mod logger` in main.rs) と lib 側の両方の
-                    // LoggerState を再構築する。
+                    // 設定変更で LoggerState を再構築する。ロガーは lib 側
+                    // (`narou_rs::logger`) を bin と共有しているので 1 回で足りる。
                     crate::logger::init();
-                    narou_rs::logger::init();
                 }
             }
         }

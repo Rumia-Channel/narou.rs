@@ -2951,9 +2951,9 @@ impl Downloader {
     }
 
     /// ユーザーに見える行の送り先を差し替える。native のコマンドは
-    /// `progress::direct_console_sink()` (従来の `safe_println` と同一の
-    /// 出力先)、Worker のジョブ実行は PushHub へ `echo` する sink を渡す。
-    /// 未設定のときは cfg 別のフォールバックで従来動作を維持する。
+    /// `progress::console_sink()` (コンソールとログの両方へ書く)、Worker の
+    /// ジョブ実行は PushHub へ `echo` する sink を渡す。未設定のときは cfg 別の
+    /// フォールバックで従来動作を維持する。
     pub fn set_message_sink(&mut self, sink: Arc<dyn crate::application::messages::MessageSink>) {
         self.message_sink = Some(sink);
     }
@@ -3739,6 +3739,102 @@ is_narou: false
         assert_eq!(old.element.body, "旧本文");
         assert_eq!(old.subtitle, "03_164 屍者の来訪");
         assert_eq!(http.requested_urls().iter().filter(|url| url.ends_with(section_url)).count(), 3);
+    }
+
+    /// Downloader のレポート行 (DL 開始・削除済み小説の通知) はコンソールと
+    /// ログの両方に出る。narou.rb は `$stdout` への write をすべてログへ
+    /// 追記する (`lib/narou_logger.rb`) ため、片方だけに出す sink は使えない。
+    /// v0.3.0 の並列化以降これらがログから消えていた (issue #36)。
+    #[tokio::test]
+    async fn downloader_report_lines_reach_the_log_file() {
+        use crate::application::messages;
+
+        let temp = tempfile::tempdir().unwrap();
+        let log_text = {
+            let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
+            std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+            std::fs::write(
+                temp.path().join(".narou").join("local_setting.yaml"),
+                "logging: true\n",
+            )
+            .unwrap();
+            crate::logger::init();
+
+            let mut setting: SiteSetting = serde_yaml::from_str(
+                r#"
+name: Log Test
+domain: example.com
+top_url: https://example.com
+url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+sitename: Log Test
+toc_url: 'https://example.com/\k<ncode>/'
+subtitles: |-
+  <h2>(?<chapter>[^<]+)</h2><a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a><time>(?<subdate>[^<]+)</time>
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+is_narou: false
+"#,
+            )
+            .unwrap();
+            setting.compile();
+            let target = "https://example.com/n1234ab/";
+            let store = Arc::new(MemoryObjectStore::new());
+            let novels = Arc::new(MemoryNovelRepository::new());
+            let http = Arc::new(MockHttpClient::new());
+            http.add_text(
+                target,
+                200,
+                r#"<h1>Log Test</h1><span>Author</span><h2>第一章</h2><a href="/n1234ab/1/">1 話</a><time>2026-10-09</time>"#,
+            );
+            http.add_text(
+                "https://example.com/n1234ab/1/",
+                200,
+                r#"<div class="body">本文</div>"#,
+            );
+
+            let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+                DownloaderPlatform {
+                    http: http.clone(),
+                    rate_limiter: Arc::new(FakeRateLimiter::new()),
+                    novels: novels.clone(),
+                    objects: store.clone(),
+                    assets: store.clone(),
+                    clock: Arc::new(SystemClock),
+                },
+                vec![setting],
+                HashMap::new(),
+                Arc::new(crate::downloader::settings::SnapshotDownloaderSettings::default()),
+            )
+            .unwrap();
+            downloader.set_message_sink(crate::progress::console_sink());
+
+            let first = downloader.download_novel_with_force(target, false).await.unwrap();
+
+            // 2 回目は 404 (サイトから消えた小説)。エラーになった小説の行も
+            // ログに残らないと、どの小説が失敗したのか追えない。
+            http.add_text(target, 404, "");
+            let _ = downloader.download_novel_with_force(target, false).await;
+
+            let log_path = std::fs::read_dir(temp.path().join("log"))
+                .unwrap()
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .next()
+                .expect("logging: true must create a log file");
+            let text = std::fs::read_to_string(&log_path).unwrap();
+            assert!(
+                text.contains(&messages::download::download_started(first.id, "Log Test")),
+                "DL 開始行がログに無い: {text}"
+            );
+            text
+        };
+        // このテストの CWD 依存のログ設定を後続テストへ持ち越さない。
+        crate::logger::init();
+
+        assert!(
+            log_text.contains(messages::download::novel_unavailable()),
+            "削除済み小説の行がログに無い: {log_text}"
+        );
     }
 
     #[tokio::test]

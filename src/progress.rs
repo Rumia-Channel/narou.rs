@@ -74,32 +74,15 @@ impl crate::application::messages::MessageSink for ConsoleSink {
 }
 
 /// `Arc<dyn MessageSink>` で CLI コマンドへ渡す共有コンソール sink を作る。
+///
+/// native の送出先はこれ 1 本で、`Downloader` の report 行 (話ごとの進捗や
+/// 「小説が削除されているか非公開な可能性があります」) も必ずこれを使う。
+/// narou.rb は `$stdout` への write をすべてログにも追記する
+/// (`lib/narou_logger.rb` の `append_log`) ため、logger を迂回する sink を
+/// 併用すると「コンソールには出るがログに残らない行」ができてしまう。
+/// `safe_println` 直結の sink が存在した時期にそれが起きている (issue #36)。
 pub fn console_sink() -> Arc<dyn crate::application::messages::MessageSink> {
     Arc::new(ConsoleSink)
-}
-
-/// `safe_println`/`safe_stderr_println` 直結の sink — `Downloader` 内部の
-/// report 行など、従来から logger を介さず直接 stdout/stderr へ書いていた
-/// 経路に使う。`ConsoleSink` と違いログファイルへも転送しない。
-pub struct DirectConsoleSink;
-
-impl crate::application::messages::MessageSink for DirectConsoleSink {
-    fn emit(&self, stream: crate::application::messages::Stream, text: &str) {
-        use crate::application::messages::Stream;
-        match stream {
-            Stream::Stdout => safe_println(text),
-            Stream::Stderr => safe_stderr_println(text),
-        }
-    }
-
-    fn emit_fragment(&self, stream: crate::application::messages::Stream, text: &str) {
-        self.emit(stream, text);
-    }
-}
-
-/// Downloader 系 (従来 `safe_println` 系で出していた経路) に渡す共有 sink。
-pub fn direct_console_sink() -> Arc<dyn crate::application::messages::MessageSink> {
-    Arc::new(DirectConsoleSink)
 }
 
 /// Check if running under the web server (subprocess mode)

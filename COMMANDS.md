@@ -178,6 +178,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - リダイレクトを自前で辿るモード (`resolve_final_url`) も curl ティアを先に試す。CDN challenge 下のホストでは reqwest が 403 でも libcurl が 200 を返すことがあるため
 - `preprocess:` DSL は `request(url)` / `fetch_json(url)` で追加取得を要求できる。実行側がサイトの取得ポリシー経由で取得し、定義を再実行する (最大 4 ラウンド)。結果は `fetched["<url>"]`、失敗は null。ジョブは URL 単位で、結果は 1 小説分だけ保持する
 - 保存済みログイン Cookie のフォールバックを実装。TOC 取得がログイン壁 (404 やサイト定義の `login_pattern`) / 部分一覧 (`login_partial_pattern`) に当たったとき `narou login` の資格情報を試行順に試し、成功した資格情報の ID を小説レコードの `login_session` に保存して次回から最初のリクエストで使う。取得側の `narou_rs_login` は親ドメインの Cookie も拾い、サイト全体で使える資格情報として保存する。`update` でも同じ経路を通る
+- 話ごとの進捗行・章/節の見出し・ログイン再試行・「小説が削除されているか非公開な可能性があります」などのレポート行は、コンソールと同時に `logging` のログファイルへも出力する。narou.rb は `$stdout` への write をすべて `append_log` するため、ログに残らない行があってはならない。並列ドメインワーカー間の行混線は sink 内の排他 (`STDOUT_LOCK`) で防ぐ。原因は `src/logger.rs` が bin と lib の両方にコンパイルされて `LoggerState` が 2 つ存在し、`logger::init()` が bin 側しか初期化していなかったこと。`MessageSink` (`progress::console_sink`) 経由の行は未初期化の lib 側ロガーへ書かれていた。bin は lib のロガーを共有する (2026-10 修正、issue #36)
 
 ---
 
@@ -235,6 +236,7 @@ narou.rb はコマンド名の先頭1文字または2文字でコマンドを一
 - Ctrl+C 割り込み時はフラグを検知して `アップデートを中断しました` を表示し、終了コード126で終了
 - `--all` は Ruby版に存在しないRust独自オプションだったため削除
 - ログイン Cookie のフォールバックは `download` と共通の downloader 経路を通るため、保存済みの `login` 資格情報によるログイン壁/部分一覧の再取得は update でも動く
+- 失敗した小説は downloader 側が「小説が削除されているか非公開な可能性があります」を出し、コマンド側は行を出さない (Ruby版と同じ)。この行がログに残るので、`n 件のエラーが発生しました` の内訳をログから追える (2026-10 修正、issue #36)
 
 **完了扱いにしない理由 / 不足動作**:
 - Ruby版の詳細表示・hotentry後処理など、周辺出力/イベント処理の細部は追加突合が必要
@@ -438,7 +440,7 @@ narou setting name         # 読み取り
 | `device` | select | 対象端末 (kindle/kobo/epub/ibunko/reader/ibooks) |
 | `hotentry` | boolean | hotentry 自動生成 |
 | `concurrency` | boolean | 並列DL+変換 |
-| `logging` | boolean | ログ保存 |
+| `logging` | boolean | ログ保存 (コンソール出力を `log/` にも追記) |
 | `update.interval` | float | 同一サイトドメインの小説間ウェイト (秒、最小2.5) |
 | `update.strong` | boolean | 同日更新時の内容チェック |
 | `update.convert-only-new-arrival` | boolean | 新着時のみ変換 |
@@ -834,6 +836,8 @@ narou setting name         # 読み取り
 | `<path>` | | string | — | ログファイルパス直接指定可 |
 
 **Rust 実装**: `src/commands/log.rs` で `narou log` / `-n` / `-t` / `-c` / `<path>` に対応。最新ログは `log/*.txt` を更新日時順で選択し、`.narou/local_setting.yaml` の `log.num` / `log.tail` / `log.source-convert` も既定値として反映。`-c` は Ruby版同様 `*_convert` ログだけを対象にする。
+
+**ログに残る範囲**: コンソールへ出る行は `log/*.txt` にも追記される (narou.rb `lib/narou_logger.rb` の `append_log` 相当)。`MessageSink` (`progress::console_sink`) 経由の行も同じログへ入る。以前は `src/logger.rs` が bin と lib の両方にコンパイルされて `LoggerState` が 2 つ存在し、sink 経由の行が未初期化の lib 側ロガーへ書かれて記録されなかった (2026-10 修正、issue #36)。`list` / `diff` / `help` / `log` は `logger::without_logging` で意図的にログへ残さない。回帰テストは `tests/cli_logging.rs`。
 
 ---
 

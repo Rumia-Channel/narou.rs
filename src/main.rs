@@ -3,7 +3,6 @@ mod output_macros;
 mod backtracer;
 mod cli;
 mod commands;
-mod logger;
 #[cfg(test)]
 mod test_support;
 
@@ -14,6 +13,12 @@ use std::time::Instant;
 
 use clap::Parser;
 use futures::FutureExt;
+
+// ロガーは lib 側 (`narou_rs::logger`) をそのまま使う。bin にも同じ
+// `src/logger.rs` をコンパイルすると `LoggerState` が 2 つになり、
+// `logger::init()` が bin 側しか初期化しないため、lib 側の logger 経由で
+// 出した行 (MessageSink / Downloader のレポート行) がログに残らなくなる。
+use narou_rs::logger;
 
 use cli::{Cli, Commands};
 use commands::illust::IllustSubcommand;

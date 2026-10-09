@@ -145,7 +145,7 @@ pub fn latest_log_path(source_convert: bool) -> Option<PathBuf> {
     latest_log_path_in(&dir, source_convert)
 }
 
-pub(crate) fn latest_log_path_in(dir: &Path, source_convert: bool) -> Option<PathBuf> {
+pub fn latest_log_path_in(dir: &Path, source_convert: bool) -> Option<PathBuf> {
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)
         .ok()?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -323,7 +323,7 @@ fn modified_time(path: &Path) -> std::time::SystemTime {
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
 }
 
-pub(crate) fn find_narou_root() -> Option<PathBuf> {
+pub fn find_narou_root() -> Option<PathBuf> {
     let mut current = std::env::current_dir().ok()?;
     loop {
         if current.join(".narou").is_dir() {
