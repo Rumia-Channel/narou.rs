@@ -75,6 +75,13 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - SQLite migration / compat 判定等のストレージ実装内部、`webnovel/*.yaml` のようなユーザー編集可能なサイト定義、`setting.ini` 等の小説固有入力は別用途なのでこの禁止の対象外とする。設定保存時は必要に応じて `update` で同時更新による上書きを防ぐ。
 - 保存元と読み出し先の不一致を防ぐため、SQLite 有効時に `setting` で保存した `default.*` / `force.*` が converter に反映されることを回帰テストで確認する。
 
+## ログ出力の境界 (2026-10 修正)
+- ログファイルを書く `src/logger.rs` は **lib 側 (`narou_rs::logger`) だけにコンパイルする**。`main.rs` に `mod logger;` を戻すと `LoggerState` が 2 つになり、`logger::init()` が bin 側しか初期化しないため、lib 側の logger を通る行 — `MessageSink` (`progress::console_sink`) や Downloader のレポート行 — がログに残らなくなる (issue #36)。bin は `use narou_rs::logger;` で lib のロガーを共有する。
+- コンソールへ出す行は **必ず logger 経由**にする。`safe_println` / `safe_stderr_println` は `STDOUT_LOCK` を取って素の stdout / stderr へ書くためログに残らない (`Downloader::report_line` の sink 未設定時フォールバック専用)。並列実行時の行混線は `ConsoleSink` が取る `STDOUT_LOCK` が防ぐので、ログへ残すために直書きへ戻す必要はない。
+- narou.rb は `$stdout` への write をすべて `append_log` する (`lib/narou_logger.rb`)。「コンソールには出るがログに残らない行」を作らないこと。
+- `list` / `diff` / `help` / `log` は `logger::without_logging` で意図的にログへ残さない。
+- 回帰テスト: `tests/cli_logging.rs` (実バイナリで sink 経由行と bin 側行が同じログに入ること)。
+
 ## ログインが必要なサイト (フォールバック方式)
 - 本体 (`narou_rs`) はログイン処理そのものを持たない。担うのは (1) ログインが必要かの判定、(2) どの小説の取得にログインが必要かの区別、(3) ログイン済み Cookie の更新の 3 点だけ。
 - 通常は Cookie を送らない。取得に失敗したときだけ、保存済みのログイン Cookie を付けて 1 回再試行する。`404`（小説が消えた）またはサイト定義の `login_pattern` に一致するログイン壁が対象で、それ以外のエラーは従来どおり失敗させる。
