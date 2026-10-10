@@ -110,7 +110,8 @@ narou.rb（Ruby製の日本のWeb小説管理・電子書籍変換ソフトウ�
 - 機能ブランチ名は内容が分かる短い英数字・ハイフン形式にする。例: `fix-web-concurrency`, `feature-series-url`。
 - 機能ブランチでは適切な動作テストを済ませてから `develop` に統合する。統合後も `develop` 上で必要なテストを再実行する。
 - `main` への統合は、ユーザーが明示的に依頼した場合、またはリリース作業として明確に合意された場合だけ行う。`develop` は削除せず残す。
-- `main` へ統合する前に、`develop` が clean であること、必要なテストが通っていること、バージョン更新や README 更新などリリースに必要な差分が揃っていることを確認する。
+- `main` へ統合する前に、`develop` が clean であること、必要なテストが通っていること、バージョン更新や `VERSION.md` の変更履歴などリリースに必要な差分が揃っていることを確認する。
+- **変更履歴は `VERSION.md` に置く**。`README.md` には変更履歴の本文を書かず、`VERSION.md` への参照だけを置く。リリース時は `VERSION.md` の先頭へ新しいバージョンの節を追加し、`README.md` は触らない (バージョン更新そのものは `Cargo.toml` / `worker_entry/Cargo.toml` / `Cargo.lock` / `about-probe/Cargo.lock` / `Third-Party-License*.md` に行う)。
 - タグ作成はユーザーがバージョン番号を明示した場合だけ行う。`main` へ統合した後、`main` 上でのみタグ作成を許可する。タグは `main` のリリースコミットを指すようにし、作成後に push する。
 - 実装が一区切りついたら、機能単位で git commit する。無関係な変更をひとつの commit に混ぜず、レビューやロールバックがしやすい粒度に分ける。
 - commit 前には `git diff` / `git status` を確認し、ユーザー由来または別作業由来の変更を混ぜない。意図しない整形差分、改行だけの変更、import 並び替えだけの変更を含めない。
