@@ -382,10 +382,6 @@ impl NovelObjectKeys {
     fn child(&self, component: &str) -> ObjectKey {
         ObjectKey::new_unchecked(format!("{}/{}", self.prefix.0, component))
     }
-
-    fn child_checked(&self, component: &str) -> Result<ObjectKey> {
-        ObjectKey::try_new(format!("{}/{}", self.prefix.0, component))
-    }
 }
 
 pub fn sanitize_key_component(value: &str) -> String {
@@ -644,16 +640,16 @@ mod tests {
         // 書き込み側 (`IllustrationStorageService`) と読み出し側
         // (`NovelObjectKeys::illustration`) は同じ関数を通る。
         assert_eq!(
-            illustration_key(&prefix, "i422674.jpg").unwrap(),
+            illustration_key(prefix, "i422674.jpg").unwrap(),
             keys.illustration("i422674.jpg").unwrap()
         );
         // sanitize が掛かる名前でも一致する (片側だけ掛けるとキーがずれる)。
         assert_eq!(
-            illustration_key(&prefix, "a:b.jpg").unwrap().as_ref(),
+            illustration_key(prefix, "a:b.jpg").unwrap().as_ref(),
             "novels/site/n1234ab/挿絵/a_b.jpg"
         );
         assert_eq!(
-            illustration_key(&prefix, "a:b.jpg").unwrap(),
+            illustration_key(prefix, "a:b.jpg").unwrap(),
             keys.illustration("a:b.jpg").unwrap()
         );
     }

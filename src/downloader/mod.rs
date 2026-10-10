@@ -1232,6 +1232,9 @@ impl Downloader {
         Some(stored)
     }
 
+    /// 挿絵の取得。`stored_illustrations` は索引が知っている実体名の集合で、
+    /// 空の一覧が返ったときに取り直しの要否を判断するために渡す。
+    #[allow(clippy::too_many_arguments)]
     async fn download_illustration(
         &mut self,
         setting: &SiteSetting,
