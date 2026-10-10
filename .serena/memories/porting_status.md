@@ -3,7 +3,7 @@
 最新の正本はリポジトリの `AGENTS.md` と `COMMANDS.md`。古い日付の監査表ではなく、各コマンドの当該節と実装を確認する。
 
 - narou.rb 由来 24 コマンドと Rust 拡張 `db` / `illust` / `login` の計 27 コマンド。✅ 23、🟡 4（`download` / `update` / `convert` / `web`）、❌ 0。`db` はトップレベル help 一覧の 26 件には載っていない。完了印は Ruby 版との全側面の突き合わせが必要であり、実装があるだけで昇格させない。
-- Cargo.toml の現行バージョンは 0.4.5（リリース済み）。0.4.5 は issue #31/#32 を含む修正版。新機能ツアーの追加は無し (0.4.2 と同じ扱い)。
+- Cargo.toml の現行バージョンは 0.4.9（リリース済み。最新の変更点は最終行を参照）。0.4.5 は issue #31/#32 を含む修正版で、新機能ツアーの追加は無し (0.4.2 と同じ扱い)。
 - issue #31: converter の半角カナ変換を NKF 相当の対応表・濁点/半濁点合成へ修正（0.4.5 でリリース済み）。HTML ルビからの変換回帰テストと実 CLI で `ＲＰＧ《ロールプレイングゲーム》` を確認。EPUB 生成前の問題であり Lite 側の変更は不要。
 - issue #32: 各話の題名変更時は旧目次のファイル名で本文を履歴へ退避し、保存先を Ruby版・`narou diff` と同じ `本文/cache/` に統一（0.4.5 でリリース済み）。SQLite（ミラーあり/なし）とファイル保存で、題名変更・差分なし再更新・章題変更・旧本文の履歴保存を確認。サイト固有処理・Lite 側の変更は無し。
 - issue #33: `original_url` は HTTP(S) ページ URL だけを記録・表示し、旧データの ID/Nコード/別名は `toc_url` へフォールバック。個別「変換」ハンドラを登録。SQLite + Lite の設定再読み出しによる接続デッドロックを本文のみ／端末出力の両経路で除去し、EPUB の挿絵取り出しを Tokio 外へ分離（未リリース）。Firefox で選択 0 件から ID 0 の `queue_complete`、36 話の変換・EPUB 出力を確認。既存 SQLite 回帰テストは両経路と current-thread runtime からの挿絵実体化・ガード削除をカバーする。
@@ -12,3 +12,4 @@
 - `login` は複数資格情報・順序変更・セッション ID・暗号化保存・Web UI 管理に対応し、`narou login -h` も `add` / `order` / `clear --index` を掲載済み。`clear --index` は host 必須（省略時はエラー）。配布 zip には署名済みの `narou_rs_login` を同梱し、`scripts/package-release.ps1` が Windows 実行ファイルの Authenticode 署名を検証する。
 - `COMMANDS.md`、`AGENTS.md` の変更と同時に、このメモリの要約も同期する。`sample/narou` はローカルの Ruby 参照ソースで、必ず存在するとは限らない。
 - **現行バージョンは 0.4.8（2026-10-08 リリース済み、詳細は `porting_status/release_0_4_8_2026-10-08.md`）**。0.4.8 の修正: (1) 新規ダウンロードで ID を二重採番していた不具合（DL開始行の ID と実レコード ID の食い違い、一覧 ID の飛び。native / Worker 共通の core `src/downloader/mod.rs`）、(2) Web UI の進捗バーがジョブ終了後に残って積み重なる不具合（`src/web/assets/js/main.js`。同一コンソール・同一 topic のバーを 1 本化し、終端イベントとキューが空になった時点でスコープ単位に消去）、(3) SORAHOST と Workers の同一ホスト名の持ち合い、(4) 前段 Access の 403 を S3 プローブのスキップとして扱う。
+- **現行バージョンは 0.4.9（2026-10-10 リリース済み、詳細は `porting_status/release_0_4_9_2026-10-10.md`）**。0.4.9 の修正: (1) CLI のログに小説ごとの行が出ない不具合（issue #36）。`src/logger.rs` が bin と lib の両方にコンパイルされて `LoggerState` が 2 つ存在し、`logger::init()` が bin 側しか初期化していなかったことと、Downloader のレポート行が logger を迂回する sink へ出ていたことの 2 つが原因。bin は lib のロガーを共有し、Downloader も `console_sink()` に統一した。回帰は `tests/cli_logging.rs`。(2) 挿絵が EPUB に入らない / 取り直されない不具合（`illust_grep_pattern` が無いサイトでも既定 `<img>` パターンで取得、索引にあるのに実体が無い挿絵は取り直し、EPUB 側は参照画像を 1 件ずつ stat）。(3) Worker の convert 出力をダウンロードのコンソールから分離（既定オン）。(4) `-D warnings` の clippy 5 件を修正。
