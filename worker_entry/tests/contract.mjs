@@ -298,6 +298,22 @@ await check("GET /api/novels/:id/download.epub returns 404 for an unknown novel"
   assert(response.status === 404, `status ${response.status}`);
 });
 
+await check("HEAD preserves text and JSON error metadata without a body", async () => {
+  for (const [path, status, contentType] of [
+    ["/api/novels/999999999/download.epub", 404, "text/plain; charset=utf-8"],
+    ["/api/novels/not-a-number", 400, "application/json"],
+  ]) {
+    const get = await request(path, auth());
+    assert.equal(get.status, status);
+    assert.equal(get.headers.get("content-type"), contentType);
+    await get.arrayBuffer();
+    const head = await request(path, { method: "HEAD", ...auth() });
+    assert.equal(head.status, status);
+    assert.equal(head.headers.get("content-type"), contentType);
+    assert.equal((await head.arrayBuffer()).byteLength, 0);
+  }
+});
+
 await check("GET /api/jobs/:id returns 404 for an unknown job", async () => {
   const response = await request("/api/jobs/does-not-exist", auth());
   assert(response.status === 404, `status ${response.status}`);

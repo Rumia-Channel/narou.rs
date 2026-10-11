@@ -50,11 +50,19 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // native (axum) は GET ルートに HEAD も通す。Worker の各ハンドラは
     // GET/POST 前提で 405 を返すので、HEAD は GET として処理し、応答から
     // 本文だけを落として返す (method とヘッダを引き継いだ複製を作る)。
-    if req.method() == Method::Head {
+    let is_head = req.method() == Method::Head;
+    let mut response = if is_head {
         let get_request = request_as_get(&req)?;
-        return route(get_request, env).await.and_then(head_response);
+        route(get_request, env).await?
+    } else {
+        route(req, env).await?
+    };
+    // Response::error has no Content-Type. Browsers otherwise guess an encoding
+    // and display Japanese object keys as mojibake instead of the actual key.
+    if response.status_code() >= 400 && response.headers().get("content-type")?.is_none() {
+        response.headers_mut().set("Content-Type", "text/plain; charset=utf-8")?;
     }
-    route(req, env).await
+    if is_head { head_response(response) } else { Ok(response) }
 }
 
 /// HEAD を GET として処理するための複製 (本文なし・Content-Length なし)。
@@ -74,10 +82,10 @@ fn head_response(response: Response) -> Result<Response> {
     let status = response.status_code();
     let headers = response.headers().clone();
     headers.delete("content-length")?;
-    worker::ResponseBuilder::new()
+    Ok(worker::ResponseBuilder::new()
         .with_status(status)
         .with_headers(headers)
-        .from_bytes(Vec::new())
+        .empty())
 }
 
 async fn route(req: Request, env: Env) -> Result<Response> {

@@ -223,7 +223,10 @@ impl S3Store {
                 host: &self.host,
                 path: &path,
                 query: &query,
-                headers: extra_headers,
+                // A fetch cache can remove/change Range before contacting S3.
+                // Sign only the required headers for GET; the optional Range
+                // is still sent below and 200/206 size handling stays unchanged.
+                headers: if method == HttpMethod::Get { &[] } else { extra_headers },
                 payload_sha256: &payload_sha256,
                 amz_date: &amz_date,
             },
