@@ -205,9 +205,9 @@ mod tests {
                 .path()
                 .join("target/x86_64-unknown-linux-gnu/release/narou_rs")
         ));
-        assert!(!is_cargo_target_executable(
-            &temp.path().join("narou/narou_rs")
-        ));
+        // The negative case must be outside every Cargo target ancestor,
+        // even when TEMP itself points into the build directory.
+        assert!(!is_cargo_target_executable(Path::new("narou/narou_rs")));
     }
 
     #[test]
