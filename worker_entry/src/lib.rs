@@ -644,10 +644,16 @@ async fn api_novel_download_epub(req: Request, env: Env, id: i64) -> Result<Resp
             continue;
         };
         match services.objects.stat(&key).await {
-            Ok(Some(_)) => {
+            Ok(Some(meta)) => {
                 if image_names.len() >= MAX_IMAGES {
                     return Response::error(
                         format!("Illustrations exceed the Worker budget ({MAX_IMAGES} images)"),
+                        413,
+                    );
+                }
+                if meta.size > MAX_IMAGE_BYTES {
+                    return Response::error(
+                        format!("Illustration {name} exceeds the {} MiB read limit", MAX_IMAGE_BYTES / 1024 / 1024),
                         413,
                     );
                 }
