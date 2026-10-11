@@ -8,7 +8,6 @@ use std::fs;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::StreamExt;
 
@@ -21,7 +20,6 @@ use crate::platform::{
 };
 
 pub(crate) const MAX_SMALL_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct NativeObjectStore {
@@ -235,25 +233,19 @@ pub(crate) fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| NarouError::Platform(format!("object has no parent: {}", path.display())))?;
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temp_path = parent.join(format!(
-        ".narou-object-{}-{sequence}.tmp",
-        std::process::id()
-    ));
-    {
-        let mut file = fs::File::create(&temp_path)?;
-        // Chunked writes keep a single oversized buffer from being handed to
-        // one write(2) call; some filesystems short-write large buffers.
-        for chunk in data.chunks(1024 * 1024) {
-            file.write_all(chunk)?;
-        }
-        file.sync_all()?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".narou-object-")
+        .tempfile_in(parent)?;
+    // NamedTempFile creates exclusively; existing links are never opened.
+    for chunk in data.chunks(1024 * 1024) {
+        temporary.write_all(chunk)?;
     }
+    temporary.as_file().sync_all()?;
     // std::fs::rename replaces an existing destination atomically on every
     // supported platform (rename(2) on Unix, MoveFileExW with
     // MOVEFILE_REPLACE_EXISTING on Windows). A preceding exists+remove would
     // only open a window where the destination is missing.
-    fs::rename(temp_path, path)?;
+    temporary.persist(path).map_err(|error| NarouError::Io(error.error))?;
     Ok(())
 }
 
@@ -462,12 +454,11 @@ impl AssetStore for NativeObjectStore {
                 }
             })
             .await?;
-            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let temp_path = parent.join(format!(
-                ".narou-asset-{}-{sequence}.tmp",
-                std::process::id()
-            ));
-            let mut file = tokio::fs::File::create(&temp_path).await?;
+            let temporary = run_blocking(move || {
+                tempfile::Builder::new().prefix(".narou-asset-").tempfile_in(parent)
+                    .map_err(NarouError::Io)
+            }).await?;
+            let mut file = tokio::fs::File::from_std(temporary.reopen()?);
             while let Some(chunk) = stream.next().await {
                 use tokio::io::AsyncWriteExt;
                 file.write_all(&chunk?).await?;
@@ -475,7 +466,11 @@ impl AssetStore for NativeObjectStore {
             file.sync_all().await?;
             // Same rationale as atomic_write_bytes: rename already replaces
             // the destination atomically; removing first only opens a gap.
-            tokio::fs::rename(temp_path, path).await?;
+            drop(file);
+            run_blocking(move || {
+                temporary.persist(path).map_err(|error| NarouError::Io(error.error))?;
+                Ok(())
+            }).await?;
             Ok(())
         })
     }
