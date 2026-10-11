@@ -136,6 +136,16 @@ pub fn preprocess_args(args: &mut Vec<String>) -> GlobalFlags {
     flags
 }
 
+pub fn parse_error_message(error: &clap::Error) -> Option<String> {
+    use clap::error::{ContextKind, ErrorKind};
+    match error.kind() {
+        ErrorKind::InvalidSubcommand => Some("不明なコマンドです。narou help を確認してください".to_string()),
+        ErrorKind::UnknownArgument => error.get(ContextKind::InvalidArg)
+            .map(|argument| format!("不明なオプションです(invalid option: {argument})")),
+        _ => None,
+    }
+}
+
 fn resolve_command_shortcut(args: &mut [String], cmd_index: usize) {
     let shortcuts = build_shortcuts();
     if let Some(resolved) = shortcuts.get(&args[cmd_index].to_lowercase()) {

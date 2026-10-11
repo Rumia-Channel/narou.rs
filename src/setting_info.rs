@@ -194,7 +194,7 @@ pub const WEBUI_THEME_NAMES: &[&str] = &[
 /// Command names that support `default_args.*`.
 pub const DEFAULT_ARG_COMMAND_NAMES: &[&str] = &[
     "alias", "backup", "browser", "clean", "console", "convert", "csv", "diff", "download",
-    "folder", "freeze", "help", "init", "inspect", "list", "log", "mail", "remove", "send",
+    "folder", "freeze", "help", "init", "inspect", "list", "log", "mail", "remove", "restore346", "send",
     "setting", "tag", "trace", "update", "version", "web",
 ];
 
