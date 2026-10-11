@@ -79,8 +79,8 @@ CF_SHA256="77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
 CF_URL="https://github.com/cloudflare/cloudflared/releases/download/${CF_TAG}/cloudflared-linux-amd64"
 PUBLIC_HOST="${NAROU_PUBLIC_HOST:-}"
 
-# コネクタのトークンを先に解決する。前段に Access を置く構成では basic 認証は
-# 二重になるだけなので、これがあるかで basic 認証の既定を切り替える。
+# コネクタのトークンを先に解決する。トンネルの有無だけでは利用者認証を
+# 保証できないため、basic 認証の無効化には明示的な設定を必要とする。
 NAROU_CONNECTOR="${NAROU_CONNECTOR_TOKEN:-}"
 if [ -z "$NAROU_CONNECTOR" ] && [ -f "$TOKEN_FILE" ]; then
   NAROU_CONNECTOR="$(tr -d '\r\n' < "$TOKEN_FILE")"
@@ -173,25 +173,19 @@ fi
 # 公開しない。ただし起動自体を止めると PteWorker がデプロイ失敗 (422) と見なし、
 # **前のリリースを配り続けてしまう** (実測) ので、その場でランダムなパスワードを
 # 設定して「誰も入れない状態」で起動する。値を決めたいときは NAROU_WEB_PASSWORD を
-# .env に置く。前段のコネクタ (Cloudflare Access) を使うときは basic 認証を
-# 切る (二重になるだけのため)。明示的に NAROU_WEB_PASSWORD を置けばコネクタと
-# 併用できる。コネクタなしで認証なしにしたいときだけ NAROU_ALLOW_NO_PASSWORD=1。
+# .env に置く。コネクタのトークンはトンネルの認証であり、利用者の認証ではない。
+# 検証済みの Cloudflare Access 等に認証を任せる場合だけ NAROU_ALLOW_NO_PASSWORD=1
+# を明示する。NAROU_WEB_PASSWORD があれば basic 認証を有効にする。
 STORED_PASSWORD="$("$BIN" setting server-basic-auth.password < /dev/null)"
 BASIC_AUTH=on
-if [ -n "$NAROU_CONNECTOR" ] && [ -z "${NAROU_WEB_PASSWORD:-}" ]; then
+if [ -z "${NAROU_WEB_PASSWORD:-}" ] && [ "${NAROU_ALLOW_NO_PASSWORD:-0}" = "1" ]; then
   BASIC_AUTH=off
-  echo "[narou] 前段のコネクタが有効なため basic 認証を無効にします" \
-    "(NAROU_WEB_PASSWORD を置くと有効に戻せます)"
+  echo "[narou] 警告: basic 認証なしで公開します (NAROU_ALLOW_NO_PASSWORD=1)" >&2
 elif [ -z "${NAROU_WEB_PASSWORD:-}" ] && [ -z "$STORED_PASSWORD" ]; then
-  if [ "${NAROU_ALLOW_NO_PASSWORD:-0}" = "1" ]; then
-    BASIC_AUTH=off
-    echo "[narou] 警告: basic 認証なしで公開します (NAROU_ALLOW_NO_PASSWORD=1)" >&2
-  else
-    NAROU_WEB_PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
-    echo "[narou] NAROU_WEB_PASSWORD が未設定のため、一時的なパスワードを設定しました:" >&2
-    echo "[narou]   ${NAROU_WEB_USER:-admin} / $NAROU_WEB_PASSWORD" >&2
-    echo "[narou]   .env に NAROU_WEB_PASSWORD を入れて再起動すると置き換わります" >&2
-  fi
+  NAROU_WEB_PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
+  echo "[narou] NAROU_WEB_PASSWORD が未設定のため、一時的なパスワードを設定しました:" >&2
+  echo "[narou]   ${NAROU_WEB_USER:-admin} / $NAROU_WEB_PASSWORD" >&2
+  echo "[narou]   .env に NAROU_WEB_PASSWORD を入れて再起動すると置き換わります" >&2
 fi
 # narou は user と password の**両方**が埋まっていないと認証ヘッダを作らない
 # (片方だけだと素通しになる) ので、パスワードがあるときは user を既定で補う。

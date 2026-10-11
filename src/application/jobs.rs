@@ -370,24 +370,34 @@ pub mod worker_ledger {
         }
     }
 
-    /// `AND NOT EXISTS …` clause plus the canonical target binds for the
-    /// candidate's novel ids, or an empty clause when the target carries no
-    /// numeric id. `other.job_id != worker_jobs.job_id` keeps the reclaim
-    /// statement from seeing its own still-`running` row as a conflict.
+    /// Resolve both spellings inside the atomic claim, using the repository's
+    /// id / ncode / TOC URL rules. Identical new targets also exclude one
+    /// another before a novel record exists.
     fn conflict_clause(target: &str) -> (String, Vec<String>) {
         let novel_ids: HashSet<i64> = extract_novel_ids(target);
-        if novel_ids.is_empty() {
-            return (String::new(), Vec::new());
-        }
-        // Deterministic order keeps the generated SQL (and tests) stable.
         let mut ids: Vec<i64> = novel_ids.into_iter().collect();
         ids.sort_unstable();
-        let binds: Vec<String> = ids.iter().map(i64::to_string).collect();
-        let placeholders = binds.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let mut binds = vec![target.to_string()];
+        let candidate = if ids.is_empty() {
+            let folded = crate::db::novel_codec::fold(target);
+            binds.extend([folded.clone(), folded.clone(), folded.clone(), folded]);
+            "n.id = (SELECT id FROM novels WHERE toc_url_fold = ? OR ncode_fold = ?
+                OR substr(rtrim(toc_url_fold, '/'), -(length(?) + 1)) = '/' || ?
+                ORDER BY id LIMIT 1)".to_string()
+        } else {
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            binds.extend(ids.iter().map(i64::to_string));
+            format!("n.id IN ({placeholders})")
+        };
         let clause = format!(
             " AND NOT EXISTS (SELECT 1 FROM worker_jobs AS other \
              WHERE other.status = 'running' AND other.job_id != worker_jobs.job_id \
-               AND other.target IN ({placeholders}))"
+               AND (other.target = ? OR EXISTS (SELECT 1 FROM novels AS n \
+                 WHERE {candidate} AND (CAST(n.id AS TEXT) = other.target \
+                   OR n.id = (SELECT id FROM novels \
+                     WHERE toc_url_fold = lower(other.target) OR ncode_fold = lower(other.target) \
+                       OR substr(rtrim(toc_url_fold, '/'), -(length(other.target) + 1)) \
+                          = '/' || lower(other.target) ORDER BY id LIMIT 1)))))"
         );
         (clause, binds)
     }
@@ -2018,7 +2028,9 @@ mod tests {
                     lease_until TEXT,
                     execution_token TEXT,
                     checkpoint_json TEXT
-                ) STRICT;",
+                ) STRICT;
+                CREATE TABLE novels (id INTEGER PRIMARY KEY, ncode_fold TEXT, toc_url_fold TEXT NOT NULL);
+                INSERT INTO novels VALUES (42, 'n1234ab', 'https://example.com/n1234ab/');",
             )
             .unwrap();
             conn
@@ -2131,17 +2143,46 @@ mod tests {
             assert_eq!(changed, 1);
         }
 
+
+        /// The same novel spelled as `42`, `n1234ab`, and its toc URL must
+        /// serialize: a bookmarklet / drag&drop / `/api/download` request
+        /// carries the URL while `update` carries the id, and both write the
+        /// same object keys and the same `.illustration_cache.yaml`.
         #[test]
-        fn non_novel_targets_never_conflict() {
+        fn claim_exclusion_covers_cross_spelling_targets_for_the_same_novel() {
+            for running_target in ["42", "n1234ab", "https://example.com/n1234ab/"] {
+                for target in ["42", "N1234AB", "https://example.com/n1234ab/", "99"] {
+                    for reclaim in [false, true] {
+                        let conn = db();
+                        insert(&conn, "running", running_target, "running", Some(LEASE));
+                        let status = if reclaim { "running" } else { "pending" };
+                        insert(&conn, "candidate", target, status, Some("2026-01-01T00:01:00Z"));
+                        let claim = if reclaim { claim_reclaim } else { claim_fresh };
+                        let stmt = claim(NOW, LEASE, "token", "candidate", target);
+                        let changed = conn.execute(&stmt.sql,
+                            rusqlite::params_from_iter(stmt.binds.iter())).unwrap();
+                        assert_eq!(changed, i64::from(target == "99") as usize,
+                            "running={running_target}, candidate={target}, reclaim={reclaim}");
+                        assert_eq!(status_of(&conn, "candidate"),
+                            if target == "99" { "running" } else { status });
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn unregistered_urls_exclude_identical_targets_but_not_other_novels() {
             let conn = db();
-            insert(&conn, "j-nc", "n1234ab", "running", Some(LEASE));
-            insert(&conn, "j-nc2", "n1234ab", "pending", None);
-            // ncode targets carry no numeric id: native parity says no lock.
-            let stmt = claim_fresh(NOW, LEASE, "tok-h", "j-nc2", "n1234ab");
-            let changed = conn
-                .execute(&stmt.sql, rusqlite::params_from_iter(stmt.binds.iter()))
-                .unwrap();
-            assert_eq!(changed, 1);
+            insert(&conn, "new", "https://example.com/new/", "running", Some(LEASE));
+            for (job_id, target, expected) in [
+                ("duplicate", "https://example.com/new/", 0),
+                ("unrelated", "https://example.com/other/", 1),
+            ] {
+                insert(&conn, job_id, target, "pending", None);
+                let stmt = claim_fresh(NOW, LEASE, "token", job_id, target);
+                assert_eq!(conn.execute(&stmt.sql,
+                    rusqlite::params_from_iter(stmt.binds.iter())).unwrap(), expected);
+            }
         }
     }
 

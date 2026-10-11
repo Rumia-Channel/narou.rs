@@ -1545,9 +1545,14 @@ impl Downloader {
                         .and_then(|record| record.login_session.as_deref())
                         .and_then(|id| groups.iter().find(|group| group.id == id))
                         .or_else(|| groups.first());
-                    chosen
-                        .map(|group| group.merged_cookie())
-                        .filter(|cookie| !cookie.is_empty())
+                    chosen.and_then(|group| {
+                        let cookie = group.merged_cookie();
+                        if cookie.is_empty() {
+                            return None;
+                        }
+                        apply_login_cookie(&mut setting, &cookie, &group.cookies);
+                        Some(cookie)
+                    })
                 } else {
                     None
                 }
@@ -1558,9 +1563,6 @@ impl Downloader {
         // 採用した資格情報の ID。小説レコードに残して次回の最初の
         // リクエストで同じセッションを使う。
         let mut login_session: Option<String> = None;
-        if let Some(cookie) = login_cookie.as_deref() {
-            apply_login_cookie(&mut setting, cookie);
-        }
         let (resolved_toc_url, prefetched_toc) =
             match crate::downloader::http_policy::resolve_final_url_with_body(
                 self.http.as_ref(),
@@ -1672,7 +1674,7 @@ impl Downloader {
                 let mut winner: Option<LoginGroup> = None;
                 for group in &groups {
                     setting.cookie = base_cookie.clone();
-                    apply_login_cookie(&mut setting, &group.merged_cookie());
+                    apply_login_cookie(&mut setting, &group.merged_cookie(), &group.cookies);
                     let retried = fetch_toc(
                         self.http.as_ref(),
                         self.rate_limiter.as_ref(),
@@ -1704,8 +1706,9 @@ impl Downloader {
                 }
                 // 採用した資格情報を最終状態に残す（本文も同じ Cookie で取る）。
                 setting.cookie = base_cookie;
+                setting.login_cookie_hosts.clear();
                 if let Some(winner) = &winner {
-                    apply_login_cookie(&mut setting, &winner.merged_cookie());
+                    apply_login_cookie(&mut setting, &winner.merged_cookie(), &winner.cookies);
                 }
             }
         }
@@ -1875,7 +1878,7 @@ impl Downloader {
                 let mut winner: Option<LoginGroup> = None;
                 for group in &groups {
                     setting.cookie = base_cookie.clone();
-                    apply_login_cookie(&mut setting, &group.merged_cookie());
+                    apply_login_cookie(&mut setting, &group.merged_cookie(), &group.cookies);
                     let Ok((retried, retried_partial)) =
                         parse_subtitles_multipage(toc::MultipageTocRequest {
                             http: self.http.as_ref(),
@@ -1903,8 +1906,9 @@ impl Downloader {
                     }
                 }
                 setting.cookie = base_cookie;
+                setting.login_cookie_hosts.clear();
                 if let Some(winner) = &winner {
-                    apply_login_cookie(&mut setting, &winner.merged_cookie());
+                    apply_login_cookie(&mut setting, &winner.merged_cookie(), &winner.cookies);
                 }
             }
         }
@@ -2093,6 +2097,9 @@ impl Downloader {
         let mut new_arrival_subtitles = Vec::new();
         let mut final_subtitles = Vec::with_capacity(subtitles.len());
         let strong_update = self.settings.local_setting_bool("update.strong");
+        // Budgeted strong-update comparisons must fetch only after the
+        // per-section yield check. Unbudgeted CLI runs retain exact pre-counts.
+        let defer_strong_update = strong_update && budget.is_some();
         let site_timezone = setting.site_timezone();
         let mut cache_dir: Option<String> = None;
         let mut pending_section_hashes: HashMap<String, String> = HashMap::new();
@@ -2116,7 +2123,7 @@ impl Downloader {
                     existing_id,
                     keys: &object_keys,
                     toc_url: &toc_url,
-                    strong_update,
+                    strong_update: strong_update && !defer_strong_update,
                     timezone: site_timezone,
                     existed,
                 })
@@ -2145,7 +2152,7 @@ impl Downloader {
         let mut started_download = false;
         let mut downloaded_index = 0usize;
 
-        for (section_index, (subtitle, plan)) in subtitles.iter().zip(section_plans).enumerate() {
+        for (section_index, (subtitle, mut plan)) in subtitles.iter().zip(section_plans).enumerate() {
             if section_index >= resume_from
                 && budget
                     .as_deref_mut()
@@ -2155,8 +2162,58 @@ impl Downloader {
                     next_section_index: section_index,
                 });
             }
+            if defer_strong_update && !force && plan.resumed.is_none() && plan.needs_download {
+                let (needs_download, predownloaded) = self
+                    .section_needs_download(SectionDecision {
+                        setting: &setting,
+                        latest: subtitle,
+                        old: old_subtitles.get(&subtitle.index).copied(),
+                        existing_id,
+                        keys: &object_keys,
+                        toc_url: &toc_url,
+                        strong_update: true,
+                        timezone: site_timezone,
+                        existed: plan.existed,
+                    })
+                    .await?;
+                plan.needs_download = needs_download;
+                plan.predownloaded = predownloaded;
+                if !needs_download {
+                    download_count -= 1;
+                    if let Some(ref p) = self.progress {
+                        p.set_length(download_count as u64);
+                    }
+                }
+            }
             let is_new_arrival = plan.is_new_arrival;
             let needs_download = plan.needs_download;
+            let resumed_was_tracked = plan.resumed.is_some();
+            // 中断された実行を再開したセクションは、前回の索引保存前に実行が
+            // 終わっている可能性がある (挿絵の実体だけが残り、対応表が無い
+            // 状態)。再開したセクションは取得を省く分だけ挿絵の登録も
+            // 通り過ぎてしまうため、保存済みの本文から索引を作り直す。
+            // 強更新の予定段階で取得しただけの本文も同じ理由でここを通す。
+            // 索引が残っている通常の更新では `download_illustration` が
+            // 取得済みと判断して何もしない。
+            if resumed_was_tracked || (!needs_download && plan.predownloaded.is_some()) {
+                let section = plan
+                    .resumed
+                    .as_ref()
+                    .map(|resumed| &resumed.element)
+                    .or_else(|| plan.predownloaded.as_ref().map(|(section, _)| section));
+                if let Some(section) = section {
+                    self.download_illustration(
+                        &setting,
+                        section,
+                        &object_keys,
+                        &mut illustration_store,
+                        stored_illustrations.as_ref(),
+                        &toc_url,
+                        None,
+                    )
+                    .await?;
+                }
+            }
 
             let download_time = if let Some(resumed) = plan.resumed {
                 resumed.download_time
@@ -2186,10 +2243,9 @@ impl Downloader {
                     last_subchapter = subtitle.subchapter.clone();
                 }
 
-                let (section, raw_html) = if let Some(downloaded) = plan.predownloaded {
-                    downloaded
-                } else {
-                    download_section(
+                let (section, raw_html) = match plan.predownloaded {
+                    Some(downloaded) => downloaded,
+                    None => download_section(
                         self.http.as_ref(),
                         self.rate_limiter.as_ref(),
                         &mut self.section_cache,
@@ -2198,7 +2254,7 @@ impl Downloader {
                         &toc_url,
                         &mut self.preprocess_jobs,
                     )
-                    .await?
+                    .await?,
                 };
                 let had_existing = plan.existed;
                 if had_existing {
@@ -2248,22 +2304,8 @@ impl Downloader {
                 downloaded_index += 1;
                 Some(download_time)
             } else {
-                if let Some(section_file) = self
-                    .persistence
-                    .load_section(&object_keys, subtitle)
-                    .await?
-                {
-                    self.download_illustration(
-                        &setting,
-                        &section_file.element,
-                        &object_keys,
-                        &mut illustration_store,
-                        stored_illustrations.as_ref(),
-                        &toc_url,
-                        None,
-                    )
-                    .await?;
-                }
+                // 内容が変わっていない (`needs_download=false`) セクションは
+                // 保存も取得もしないので、保存時刻は旧 TOC の値を引き継ぐ。
                 old_subtitles
                     .get(&subtitle.index)
                     .and_then(|old| old.download_time.clone())
@@ -2564,6 +2606,10 @@ impl Downloader {
         })
     }
 
+    /// 戻り値: `(要 DL, 強更新の比較で取得済みなら (本文, raw))`。
+    ///
+    /// 取得はセクションループと同じ `download_section` を通るので、
+    /// 比較済みの本文を保存・挿絵走査へ渡せば二重取得は起きない。
     async fn section_needs_download(
         &mut self,
         probe: SectionDecision<'_>,
@@ -2661,7 +2707,9 @@ impl Downloader {
                     if let Some(id) = existing_id {
                         self.store_section_digest(id, &relative_path, &new_hash);
                     }
-                    return Ok((false, None));
+                    // 内容が同じなので保存は不要。予定段階で取得した本文で
+                    // 挿絵の走査だけ行えるよう、取得結果を返す。
+                    return Ok((false, Some(downloaded)));
                 }
                 return Ok((true, Some(downloaded)));
             }
@@ -2993,8 +3041,13 @@ impl Downloader {
 }
 
 /// Merge the stored login cookie into the site's static cookie value.
-fn apply_login_cookie(setting: &mut SiteSetting, login_cookie: &str) {
+fn apply_login_cookie(
+    setting: &mut SiteSetting,
+    login_cookie: &str,
+    cookies: &[crate::platform::HostCookie],
+) {
     setting.cookie = crate::platform::merge_cookie_headers(setting.cookie(), Some(login_cookie));
+    setting.login_cookie_hosts = cookies.iter().map(|entry| entry.host.clone()).collect();
 }
 
 /// Whether a retry after a partial listing is worth keeping.
@@ -3072,15 +3125,17 @@ mod tests {
         resolve_novel_type, resolve_user_agent,
     };
     use crate::db::{self, Database};
+    use crate::downloader::SectionFile;
     use crate::platform::NovelRepository;
     use crate::platform::mocks::{
         FakeRateLimiter, MemoryNovelRepository, MemoryObjectStore, MockHttpClient,
     };
     use crate::downloader::settings::DownloaderSettings;
     use crate::platform::{
-        AssetStore, NovelMutation, NovelObjectKeys, ObjectListRequest, ObjectPrefix, ObjectStore,
+        AssetStore, HttpResponse, NovelMutation, NovelObjectKeys, ObjectListRequest, ObjectPrefix, ObjectStore,
         SystemClock,
     };
+    use base64::Engine;
     use chrono::TimeZone;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -3975,6 +4030,392 @@ is_narou: false
                 .filter(|url| url.ends_with(section_2))
                 .count(),
             1
+        );
+    }
+
+    /// 強更新 (`update.strong`) の予定段階の取得は予算の対象で、中断しても
+    /// 取得済みの本文は保存される。以前は予定段階が予算チェックの外にあり、
+    /// 予定段階だけで予算を使い切ると `next_section_index: 0` のまま同じ
+    /// セクションを毎回取り直して前進しなかった。
+    #[tokio::test]
+    async fn strong_update_plan_phase_stops_at_the_budget_and_keeps_its_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let db = Database::new().unwrap();
+        let previous_db = {
+            let mut db_slot = db::DATABASE.lock();
+            let previous_db = db_slot.take();
+            *db_slot = Some(db);
+            previous_db
+        };
+        let _db_guard = DatabaseGuard(previous_db);
+
+        struct YieldBeforeSection(usize);
+
+        impl SectionBudget for YieldBeforeSection {
+            fn should_yield(&mut self, next_section_index: usize) -> bool {
+                next_section_index >= self.0
+            }
+        }
+
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            r#"
+name: Strong Budget Test
+domain: example.com
+top_url: https://example.com
+url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+sitename: Strong Budget Test
+toc_url: 'https://example.com/\k<ncode>/'
+timezone: UTC
+subtitles: |-
+  <a href="(?<href>/n1234ab/(?<index>\d+)/)" data-date="(?<subdate>[^<]+)">(?<subtitle>[^<]+)</a>
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+is_narou: false
+"#,
+        )
+        .unwrap();
+        setting.compile();
+
+        let target = "https://example.com/n1234ab/";
+        let section_1 = "https://example.com/n1234ab/1/";
+        let section_2 = "https://example.com/n1234ab/2/";
+        let http = Arc::new(MockHttpClient::new());
+        http.add_text(
+            target,
+            200,
+            r#"<h1>Strong Budget Test</h1><span>Author</span>
+<a href="/n1234ab/1/" data-date="2000-01-01">第一話</a>
+<a href="/n1234ab/2/" data-date="2000-01-01">第二話</a>"#,
+        );
+        http.add_text(section_1, 200, r#"<div class="body">本文1</div>"#);
+        http.add_text(section_2, 200, r#"<div class="body">本文2</div>"#);
+
+        struct StrongSettings;
+        impl crate::downloader::settings::DownloaderSettings for StrongSettings {
+            fn local_setting_bool(&self, key: &str) -> bool {
+                key == "update.strong"
+            }
+        }
+
+        let store = Arc::new(MemoryObjectStore::new());
+        let objects: Arc<dyn ObjectStore> = store.clone();
+        let assets: Arc<dyn AssetStore> = store;
+        let mut downloader = Downloader::with_platform_and_storage_and_settings_and_support(
+            DownloaderPlatform {
+                http: http.clone(),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new()),
+                objects: objects.clone(),
+                assets,
+                clock: Arc::new(SystemClock),
+            },
+            vec![setting],
+            HashMap::new(),
+            Arc::new(StrongSettings),
+        )
+        .unwrap();
+        let keys = NovelObjectKeys::new("Strong Budget Test", "n1234ab", false).unwrap();
+
+        downloader.download_novel(target).await.unwrap();
+        // 強更新の基準日 (`subupdate`) と保存済み本文の取得日を揃え、
+        // 本文が変わったセクションだけが強更新の予定段階を通るようにする。
+        let toc_bytes = objects.read_small(&keys.toc()).await.unwrap().unwrap();
+        let toc: TocFile = serde_yaml::from_slice(&toc_bytes).unwrap();
+        for subtitle in &toc.subtitles {
+            let key = keys.section(&subtitle.index, &subtitle.file_subtitle);
+            let mut section: SectionFile =
+                serde_yaml::from_slice(&objects.read_small(&key).await.unwrap().unwrap()).unwrap();
+            section.download_time = Some("2000-01-01T00:00:00Z".into());
+            objects
+                .write_small(&key, serde_yaml::to_string(&section).unwrap().into_bytes())
+                .await
+                .unwrap();
+        }
+        // A new Worker invocation has a fresh HTTP/section cache.
+        let http = Arc::new(MockHttpClient::new());
+        downloader.http = http.clone();
+        downloader.section_cache = super::section::SectionCache::new();
+        http.add_text(
+            target,
+            200,
+            r#"<h1>Strong Budget Test</h1><span>Author</span>
+<a href="/n1234ab/1/" data-date="2000-01-02">第一話</a>
+<a href="/n1234ab/2/" data-date="2000-01-02">第二話</a>"#,
+        );
+        http.add_text(section_1, 200, r#"<div class="body">改稿1</div>"#);
+        http.add_text(section_2, 200, r#"<div class="body">改稿2</div>"#);
+
+        // 1 回目: 予算内でセクション 0 を取得・保存し、保存済み prefix の
+        // 次 (1) で止まる。予定段階の取得で止まると同じ prefix を毎回
+        // 取り直して前進しなくなる (修正前の livelock) ので、ここは必ず
+        // 「保存済みの次」を指す。
+        let mut budget = YieldBeforeSection(1);
+        let partial = downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: false,
+                    budget: Some(&mut budget),
+                    resume_from_section: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                partial,
+                crate::error::NarouError::DownloadBudgetExpired {
+                    next_section_index: 1
+                }
+            ),
+            "unexpected partial result: {partial:?}; requests={:?}",
+            http.requested_urls()
+        );
+        let first_section: SectionFile = serde_yaml::from_slice(
+            &objects
+                .read_small(&keys.section("1", "第一話"))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first_section.element.body, "改稿1");
+        // 予算 1 は「本文を 1 件保存したら止まる」なので、未保存の後続を
+        // 取得しない。
+        assert_eq!(
+            http.requested_urls()
+                .iter()
+                .filter(|url| url.ends_with(section_2))
+                .count(),
+            0,
+            "予算外のセクションは取得しない"
+        );
+
+        // 2 回目: 同じ予算で再開。境界で直ちに止まるので後続を取得せず、
+        // 保存済み本文も取り直さない。
+        let mut budget = YieldBeforeSection(1);
+        let partial = downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: false,
+                    budget: Some(&mut budget),
+                    resume_from_section: Some(1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                partial,
+                crate::error::NarouError::DownloadBudgetExpired {
+                    next_section_index: 1
+                }
+            ),
+            "unexpected partial result: {partial:?}"
+        );
+        let first_section: SectionFile = serde_yaml::from_slice(
+            &objects
+                .read_small(&keys.section("1", "第一話"))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            first_section.element.body, "改稿1",
+            "再開時に保存済みの本文を上書きしない"
+        );
+
+        // 3 回目: 1 件先まで許可し、保存済み prefix の次まで進む。
+        let mut budget = YieldBeforeSection(2);
+        let partial = downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: false,
+                    budget: Some(&mut budget),
+                    resume_from_section: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(partial.status, crate::downloader::types::UpdateStatus::Ok);
+        assert_eq!(partial.updated_count, 1);
+        assert_eq!(
+            http.requested_urls().iter().filter(|url| url.ends_with(section_1)).count(),
+            1,
+            "保存済み prefix の本文を取り直さない"
+        );
+        assert_eq!(
+            http.requested_urls().iter().filter(|url| url.ends_with(section_2)).count(),
+            1,
+            "予算に収まった後続を一度だけ取得する"
+        );
+
+    }
+
+    /// 中断された実行を再開したセクションでも挿絵の索引を書き戻す。中断時は
+    /// 索引 (`.illustration_cache.yaml`) が未保存なので、再開側で登録し直さないと
+    /// 実体だけが保存先に残り、EPUB の参照が解決できなくなる。
+    #[tokio::test]
+    async fn resumed_download_registers_the_skipped_sections_illustrations_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd_guard = crate::test_support::set_current_dir_for_test(temp.path());
+        std::fs::create_dir_all(temp.path().join(".narou")).unwrap();
+        let db = Database::new().unwrap();
+        let previous_db = {
+            let mut db_slot = db::DATABASE.lock();
+            let previous_db = db_slot.take();
+            *db_slot = Some(db);
+            previous_db
+        };
+        let _db_guard = DatabaseGuard(previous_db);
+
+        struct YieldBeforeSection(usize);
+
+        impl SectionBudget for YieldBeforeSection {
+            fn should_yield(&mut self, next_section_index: usize) -> bool {
+                next_section_index >= self.0
+            }
+        }
+
+        let mut setting: SiteSetting = serde_yaml::from_str(
+            r#"
+name: Resume Image Test
+domain: example.com
+top_url: https://example.com
+url: https?://example\.com/(?<ncode>n\d+[a-z]+)/?
+sitename: Resume Image Test
+toc_url: 'https://example.com/\k<ncode>/'
+subtitles: |-
+  <a href="(?<href>/n1234ab/(?<index>\d+)/)">(?<subtitle>[^<]+)</a>
+body_pattern: '<div class="body">(?<body>.+?)</div>'
+title: '<h1>(?<title>[^<]+)</h1>'
+author: '<span>(?<author>[^<]+)</span>'
+is_narou: false
+"#,
+        )
+        .unwrap();
+        setting.compile();
+
+        let target = "https://example.com/n1234ab/";
+        let section_1 = "https://example.com/n1234ab/1/";
+        let section_2 = "https://example.com/n1234ab/2/";
+        let image_url = "https://9496.mitemin.net/userpageimage/viewimage/icode/i83860/";
+        let http = Arc::new(MockHttpClient::new());
+        http.add_text(
+            target,
+            200,
+            r#"<h1>Resume Image Test</h1><span>Author</span>
+<a href="/n1234ab/1/">第一話</a>
+<a href="/n1234ab/2/">第二話</a>"#,
+        );
+        http.add_text(
+            section_1,
+            200,
+            r#"<div class="body">本文1<img src="//9496.mitemin.net/userpageimage/viewimagebig/icode/i83860/" /></div>"#,
+        );
+        http.add_text(section_2, 200, r#"<div class="body">本文2</div>"#);
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3Z5A0AAAAASUVORK5CYII=",
+            )
+            .unwrap();
+        http.add_response(
+            image_url,
+            HttpResponse {
+                status: 200,
+                headers: vec![("Content-Type".into(), "image/png".into())],
+                body: png,
+            },
+        );
+
+        let store = Arc::new(MemoryObjectStore::new());
+        let objects: Arc<dyn ObjectStore> = store.clone();
+        let assets: Arc<dyn AssetStore> = store;
+        let mut downloader = Downloader::with_platform_and_storage_and_settings(
+            DownloaderPlatform {
+                http: http.clone(),
+                rate_limiter: Arc::new(FakeRateLimiter::new()),
+                novels: Arc::new(MemoryNovelRepository::new()),
+                objects: objects.clone(),
+                assets: assets.clone(),
+                clock: Arc::new(SystemClock),
+            },
+            vec![setting],
+            HashMap::new(),
+        )
+        .unwrap();
+        let keys = NovelObjectKeys::new("Resume Image Test", "n1234ab", false).unwrap();
+
+        // 1 回目: 第 1 話 (挿絵つき) の保存直後に中断。索引はまだ書き戻されない。
+        let mut budget = YieldBeforeSection(1);
+        let partial = downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: true,
+                    budget: Some(&mut budget),
+                    resume_from_section: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            partial,
+            crate::error::NarouError::DownloadBudgetExpired { .. }
+        ));
+        assert!(
+            AssetStore::stat(assets.as_ref(), &keys.illustration("i83860.png").unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "第 1 話の挿絵は保存されている"
+        );
+        assert!(
+            objects
+                .read_small(&keys.illustration_cache())
+                .await
+                .unwrap()
+                .is_none(),
+            "中断時点では索引は未保存"
+        );
+
+        // 2 回目: 第 2 話から再開。索引は中断前に走ったセクションを含めて書き戻す。
+        downloader
+            .download_novel_with_execution_options(
+                target,
+                DownloadExecutionOptions {
+                    force: false,
+                    budget: None,
+                    resume_from_section: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        let cache = objects
+            .read_small(&keys.illustration_cache())
+            .await
+            .unwrap()
+            .expect("再開後は索引が保存される");
+        let index: crate::illustration_store::IllustrationIndex =
+            serde_yaml::from_slice(&cache).unwrap();
+        assert_eq!(index.source_count(), 1);
+        let (_, unresolved) = crate::epub_lite::rewrite_illustration_references(
+            "［＃挿絵（//9496.mitemin.net/userpageimage/viewimagebig/icode/i83860/）入る］",
+            |url| {
+                index
+                    .filename_for_source(url)
+                    .map(|name| format!("挿絵/{name}"))
+            },
+        );
+        assert!(
+            unresolved.is_empty(),
+            "再開後は EPUB の挿絵参照が解決できる: {unresolved:?}"
         );
     }
 

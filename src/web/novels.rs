@@ -517,6 +517,17 @@ async fn generate_epub_on_demand(
     crate::application::debug::set_enabled(crate::compat::load_local_setting_bool(
         "webui.debug-mode",
     ));
+    let inventory = crate::db::inventory::Inventory::with_default_root()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    // Restore inputs before loading native settings (including setting.ini and
+    // the per-novel/global replace.txt), and images before localizing HTML.
+    let _files = crate::native::object_store::NativeStore::for_narou_root(inventory.root_dir())
+        .and_then(|store| store.materialize_novel_files(novel_dir))
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let _materialized = crate::native::illustrations::Materialized::new(
+        crate::native::illustrations::materialize(novel_dir).await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
+    );
     // 保存済み EPUB と同じ命名規則で Content-Disposition 名を決める
     // (変換時の txt basename に `.epub` を付けたもの)。
     // `convert.filename` / `convert.filename-to-ncode` は
@@ -550,7 +561,8 @@ async fn generate_epub_on_demand(
     // `convert.keep-txt=false` では変換済みテキストを保存しない構成なので、
     // 残っていても読まずに本文から組み立て直す (Worker の download.epub と
     // 同じ扱い)。
-    if crate::converter::keep_converted_text_file()
+    let keep_text = crate::converter::keep_converted_text_file();
+    let cached_text = if keep_text
         && !crate::native::sqlite::state::legacy_yaml_active()
         && let Some(narou_dir) = crate::db::inventory::Inventory::with_default_root()
             .ok()
@@ -569,15 +581,15 @@ async fn generate_epub_on_demand(
         }
         && !payload.is_empty()
     {
-        return Ok((payload, filename));
-    }
-
-    let keep_text = crate::converter::keep_converted_text_file();
+        Some(payload)
+    } else {
+        None
+    };
     // 変換済みテキストを保存しない構成では本文から組み立てた novel.txt を
     // 使い、命名は record 由来の filename (fast path と同じ) を保つ。
     // 保存する構成は従来どおり toc.yaml から命名・txt パスを解決する。
     let mut filename = filename;
-    let toc_object = if keep_text {
+    let toc_object = if keep_text && cached_text.is_none() {
         let toc_content = std::fs::read_to_string(novel_dir.join("toc.yaml"))
             .map_err(|e| (StatusCode::CONFLICT, format!("toc.yaml: {e}")))?;
         let toc: crate::downloader::TocFile = serde_yaml::from_str(&toc_content)
@@ -605,7 +617,7 @@ async fn generate_epub_on_demand(
     // 変換済みテキストを保存しない構成では保存済みの本文からその都度
     // 変換する。build_book はファイルを要求するため、材料を novel_dir へ
     // 取り出し、組み立てた txt は消えるガードとして書き出す。
-    let (txt_path, _conversion_guard) = if let Some(toc_object) = &toc_object {
+    let (txt_path, _text_guard) = if let Some(toc_object) = &toc_object {
         (
             crate::converter::output::create_output_text_path(
                 &settings,
@@ -617,51 +629,46 @@ async fn generate_epub_on_demand(
             None,
         )
     } else {
-        let stores = crate::native::object_store::NativeStores::for_current_root()
+        let text = if let Some(payload) = cached_text {
+            // `converted_text` contains UTF-8 text, never EPUB bytes.
+            String::from_utf8(payload)
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        } else {
+            let record = record.clone();
+            let novel_dir = novel_dir.to_path_buf();
+            let settings = settings.clone();
+            tokio::task::spawn_blocking(move || {
+                let toc: crate::downloader::TocFile =
+                    serde_yaml::from_str(&std::fs::read_to_string(novel_dir.join("toc.yaml"))?)?;
+                let sections = crate::converter::load_sections_from_dir(&novel_dir, &toc.subtitles)?;
+                let user_converter = crate::converter::user_converter::UserConverter::load_with_title(
+                    &novel_dir, &settings.title_for_output(&record.title),
+                );
+                let mut converter = match user_converter {
+                    Some(user) => crate::converter::NovelConverter::with_user_converter(settings, user),
+                    None => crate::converter::NovelConverter::new(settings),
+                };
+                converter.apply_record_fetch_policy(Some(&record));
+                let toc = crate::downloader::TocObject {
+                    title: toc.title, author: toc.author, toc_url: toc.toc_url,
+                    story: toc.story, subtitles: toc.subtitles, novel_type: toc.novel_type,
+                };
+                converter.convert_novel(&toc, &sections)
+            })
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .map_err(|error| (StatusCode::CONFLICT, format!("convert: {error}")))?
+        };
+        std::fs::create_dir_all(novel_dir)
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        let narou_root = novel_dir
-            .ancestors()
-            .find(|candidate| candidate.join(".narou").is_dir())
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let files =
-            crate::native::object_store::NativeStore::for_narou_root(&narou_root)
-                .and_then(|store| store.materialize_novel_files(novel_dir))
-                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        let inventory = crate::db::inventory::Inventory::with_default_root()
+        // The request owns only this temporary file; never overwrite or delete
+        // an existing novel.txt, even on an EPUB build failure.
+        let mut temporary = tempfile::Builder::new().prefix(".narou-epub-").suffix(".txt")
+            .tempfile_in(novel_dir)
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        let service = std::sync::Arc::new(crate::application::convert::ConvertService::new(
-            stores.objects.clone(),
-            stores.assets.clone(),
-            std::sync::Arc::new(
-                crate::native::application::NativeSettingsStore::new(
-                    std::sync::Arc::new(inventory),
-                ),
-            ),
-        ));
-        // NovelConverter が内部に Rc を持つため非 Send。スレッド内で block_on して
-        // そのスレッド上で完結させる (結果の String は Send)。
-        let record = record.clone();
-        let text = tokio::task::spawn_blocking(move || {
-            futures::executor::block_on(service.convert_only(&record))
-                .map(|converted| converted.text)
-        })
-        .await
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .map_err(|error| (StatusCode::CONFLICT, format!("convert: {error}")))?;
-        let on_demand_txt = novel_dir.join("novel.txt");
-        let _ = std::fs::create_dir_all(novel_dir);
-        std::fs::write(&on_demand_txt, text.as_bytes())
+        std::io::Write::write_all(&mut temporary, text.as_bytes())
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        (
-            on_demand_txt.clone(),
-            Some((
-                files,
-                crate::native::object_store::MaterializedNovelFiles::from_paths(vec![
-                    on_demand_txt,
-                ]),
-            )),
-        )
+        (temporary.path().to_path_buf(), Some(temporary))
     };
     if !txt_path.is_file() {
         let message = if keep_text {
@@ -672,13 +679,6 @@ async fn generate_epub_on_demand(
         return Err((StatusCode::CONFLICT, message.to_string()));
     }
 
-    // 挿絵を S3 に置く構成ではローカルに実体が無い。EPUB 生成はファイルを
-    // 要求するので、ここで取り出し、スコープを抜けた時点で片付ける。
-    let _materialized = crate::native::illustrations::Materialized::new(
-        crate::native::illustrations::materialize(novel_dir)
-            .await
-            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?,
-    );
     let options = crate::epub_lite::EpubBuildOptions {
         title: record.title.clone(),
         author: record.author.clone(),
@@ -709,11 +709,6 @@ async fn generate_epub_on_demand(
     crate::epub_lite::stream_epub(&build.book, &mut bytes, |epub_path| build.resolve(epub_path))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // keep=false + 実ファイル無しの構成で作った空の novel_dir を片付ける
-    // (中身があれば失敗してそのまま残る)。
-    if !keep_text {
-        let _ = std::fs::remove_dir(novel_dir);
-    }
 
     Ok((bytes, filename))
 }
@@ -772,5 +767,91 @@ mod tests {
         assert_eq!(value["general_lastup"], json!(1_776_470_400));
         assert_eq!(value["last_check_date"], json!(1_776_556_800));
         assert_eq!(value["new_arrivals_date"], json!(1_776_384_000));
+    }
+
+    #[cfg(feature = "lite")]
+    #[test]
+    fn on_demand_epub_preserves_stored_images_cover_and_global_replacements() {
+        use std::io::{Cursor, Read};
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd = crate::test_support::set_current_dir_for_test(temp.path());
+        let _legacy = crate::test_support::legacy_yaml_guard();
+        std::fs::create_dir(temp.path().join(".narou")).unwrap();
+        std::fs::write(temp.path().join(".narou/local_setting.yaml"),
+            "convert.keep-txt: false\n").unwrap();
+        let dir = temp.path().join("小説データ/audit/fixture");
+        std::fs::create_dir_all(dir.join("本文")).unwrap();
+        std::fs::create_dir(dir.join("挿絵")).unwrap();
+        std::fs::write(temp.path().join("replace.txt"), "置換前\t置換後\n").unwrap();
+        std::fs::write(dir.join("toc.yaml"),
+            "title: 監査確認\nauthor: author\ntoc_url: https://example.com/story\nnovel_type: 2\nsubtitles:\n- index: '1'\n  href: '1'\n  subtitle: 第一話\n  file_subtitle: 第一話\n  subdate: ''\n").unwrap();
+        std::fs::write(dir.join("本文/1 第一話.yaml"),
+            "index: '1'\nhref: '1'\nsubtitle: 第一話\nfile_subtitle: 第一話\nsubdate: ''\nelement:\n  data_type: html\n  body: '<p>置換前</p><img src=\"https://example.com/picture.png\">'\n").unwrap();
+        std::fs::write(dir.join(".illustration_cache.yaml"),
+            "version: 2\nsources:\n  https://example.com/picture.png: picture.png\n").unwrap();
+        let mut image = Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .write_to(&mut image, image::ImageFormat::Png).unwrap();
+        let illustration = image.get_ref().clone();
+        std::fs::write(dir.join("挿絵/picture.png"), &illustration).unwrap();
+        let mut cover_cursor = Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(3, 3, image::Rgba([0, 0, 255, 255]))
+            .write_to(&mut cover_cursor, image::ImageFormat::Png).unwrap();
+        let cover = cover_cursor.get_ref().clone();
+        std::fs::write(dir.join("cover.png"), &cover).unwrap();
+        let record = serde_yaml::from_str(
+            "id: 990001\ntitle: 監査確認\nauthor: author\nfile_title: fixture\nsitename: audit\ntoc_url: https://example.com/story\nnovel_type: 2\nlast_update: 2026-01-01T00:00:00Z\n").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (bytes, _) = runtime.block_on(super::generate_epub_on_demand(990001, &record, &dir)).unwrap();
+        let mut epub = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut images: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut body_xhtml = String::new();
+        let mut xhtml = String::new();
+        for index in 0..epub.len() {
+            let mut entry = epub.by_index(index).unwrap();
+            let name = entry.name().to_string();
+            if name.starts_with("item/image/") {
+                let mut data = Vec::new();
+                entry.read_to_end(&mut data).unwrap();
+                images.push((name, data));
+            } else if name.ends_with(".xhtml") {
+                let mut content = String::new();
+                entry.read_to_string(&mut content).unwrap();
+                if content.contains("置換後") {
+                    body_xhtml = content.clone();
+                }
+                xhtml.push_str(&content);
+            }
+        }
+        // Lite は画像を連番 (`item/image/0001.png` …) で格納するため、名前では
+        // なく実体で照合する。保存済み挿絵と表紙の両方が EPUB に入ること。
+        let names: Vec<&str> = images.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(
+            images.iter().any(|(_, data)| data == &illustration),
+            "保存済み挿絵が EPUB に無い: {names:?}"
+        );
+        assert!(
+            images.iter().any(|(_, data)| data == &cover),
+            "表紙が EPUB に無い: {names:?}"
+        );
+        assert!(xhtml.contains("置換後"), "{xhtml}");
+        assert!(!xhtml.contains("置換前"), "{xhtml}");
+        // 本文の `<img>` は格納済みの挿絵 (表紙ではない) を指す。
+        let reference = body_xhtml
+            .split("src=\"../image/")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default()
+            .to_string();
+        assert!(!reference.is_empty(), "{body_xhtml}");
+        let stored = images
+            .iter()
+            .find(|(name, _)| name == &format!("item/image/{reference}"))
+            .map(|(_, data)| data)
+            .unwrap_or_else(|| panic!("本文が参照する画像が EPUB に無い: {reference}"));
+        assert_eq!(stored, &illustration, "{body_xhtml}");
+        assert!(!dir.join("novel.txt").exists());
+        assert!(!std::fs::read_dir(&dir).unwrap().any(|entry|
+            entry.unwrap().path().extension().is_some_and(|extension| extension == "txt")));
     }
 }

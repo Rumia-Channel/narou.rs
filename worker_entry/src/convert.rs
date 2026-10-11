@@ -86,7 +86,7 @@ pub async fn execute_convert(
     narou_rs::application::messages::take_default_sink();
 
     match report {
-        ConvertItemReport::Written { .. } => {
+        ConvertItemReport::Converted { .. } => {
             // native `clear_convert_failure` 相当: 成功したら失敗フラグを落とす。
             set_convert_failure_flag(runtime, target, false).await;
             JobOutcome::Succeeded

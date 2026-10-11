@@ -309,15 +309,6 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                         sink,
                     );
                     print_inspection_output(&mut converter, sink);
-                    // `convert.keep-txt=false` のときは中間の txt を残さない
-                    // (変換済みテキストはどこにも保存せず、EPUB は都度再変換)。
-                    if !narou_rs::converter::keep_converted_text_file() {
-                        if let Some(txt) = converter.last_converted_text_path() {
-                            let _ = std::fs::remove_file(txt);
-                        }
-                        // 固定名ミラーも残さない (過去の実行で残っていれば消す)。
-                        let _ = std::fs::remove_file(novel_dir.join("novel.txt"));
-                    }
                     completed_count += 1;
                     sink.emit(
                         Stream::Stdout,
@@ -330,6 +321,14 @@ pub fn cmd_convert(options: ConvertOptions<'_>) {
                         &messages::convert::item_error(index + 1, total_count, target, e),
                     );
                 }
+            }
+            // Device errors occur after the intermediate text was written.
+            // Apply the keep-txt contract on both success and failure.
+            if !narou_rs::converter::keep_converted_text_file() {
+                if let Some(txt) = converter.last_converted_text_path() {
+                    let _ = std::fs::remove_file(txt);
+                }
+                let _ = std::fs::remove_file(novel_dir.join("novel.txt"));
             }
         }
 

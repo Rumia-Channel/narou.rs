@@ -71,7 +71,7 @@ pub fn export_yaml(out: Option<PathBuf>, in_place: bool) -> Result<PathBuf> {
         }
         if let Some(payload) = state.get_raw("global", "global_setting")? {
             let global_dir = if in_place {
-                home_dir().join(".narousetting")
+                crate::db::inventory::global_setting_dir(&root)
             } else {
                 out_dir.join(".narousetting")
             };
@@ -91,13 +91,6 @@ pub fn export_yaml(out: Option<PathBuf>, in_place: bool) -> Result<PathBuf> {
     Ok(out_dir)
 }
 
-/// Home directory holding `~/.narousetting`.
-pub fn home_dir() -> PathBuf {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_default()
-}
 
 /// Whether the rollback bundle can be written for this library.
 pub fn sqlite_active(narou_dir: &Path) -> bool {

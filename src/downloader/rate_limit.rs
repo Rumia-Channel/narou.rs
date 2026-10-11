@@ -382,9 +382,9 @@ mod tests {
 
             let alpha_handle = thread::spawn(move || {
                 barrier_a.wait();
-                let local = Instant::now();
                 limiter_alpha.wait_for_host("alpha.example");
-                local.elapsed()
+                // Include thread/barrier startup since the priming request.
+                started.elapsed()
             });
             let beta_handle = thread::spawn(move || {
                 barrier_b.wait();

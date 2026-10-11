@@ -85,8 +85,8 @@ impl StateDb {
                 let ext = if key == "notepad" { "txt" } else { "yaml" };
                 Some(self.narou_dir.join(format!("{key}.{ext}")))
             }
-            "global" if key == "global_setting" => dirs_home()
-                .map(|home| home.join(".narousetting").join("global_setting.yaml")),
+            "global" if key == "global_setting" => self.narou_dir.parent()
+                .map(|root| crate::db::inventory::global_setting_dir(root).join("global_setting.yaml")),
             _ => None,
         }
     }
@@ -510,11 +510,6 @@ fn merge_freeze_payload(existing: Option<&str>, incoming: &str) -> String {
         .unwrap_or_else(|_| incoming.to_string())
 }
 
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-}
 
 /// Rename imported legacy files instead of deleting them: old versions can
 /// still be reached manually, satisfying the backward-compatibility promise.

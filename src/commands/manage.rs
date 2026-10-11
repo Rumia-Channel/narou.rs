@@ -855,7 +855,7 @@ pub fn cmd_freeze(targets: &[String], list: bool, on: bool, off: bool) {
 
     for target in download::tagname_to_ids(targets) {
         let Some(data) = download::get_data_by_target(&target) else {
-            eprintln!("{} は存在しません", target);
+            println!("{} は存在しません", target);
             continue;
         };
         let id = data.id;
