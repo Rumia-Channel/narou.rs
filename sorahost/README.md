@@ -111,8 +111,8 @@ TLS と本人確認 (Zero Trust) を前段に置く。直の IP:ポート宛は 
 - Zero Trust が未有効のアカウントでは Access の作成が 403 で止まる。ダッシュボードで有効化するか、
   `SORAHOST_ACCESS_EMAIL` / `SORAHOST_ACCESS_DOMAIN` を外して Access なしで進める
   (その場合は TLS だけが付く)
-- 前段に Access を置く構成では **basic 認証は自動で切る** (二重になるだけのため)。
-  残したいときだけ `NAROU_WEB_PASSWORD` を `.env` に置く (併用も可)
+- basic 認証は既定で有効のまま。前段の Access に認証を任せて二重にしたくない場合だけ
+  `NAROU_ALLOW_NO_PASSWORD=1` を `.env` に置く (トンネルの有無では切らない)
 
 ### B. PteWorker の公開 URL をそのまま使う
 
@@ -161,9 +161,9 @@ NAROU_PUBLIC_HOST=narou.example.com     # 公開ホスト名
 
 | 変数 | 何のため | 設定する値 | 設定ファイルとの優先 |
 | --- | --- | --- | --- |
-| `NAROU_WEB_PASSWORD` | Web UI の basic 認証。素の公開 URL では必須。コネクタを使うときは不要 (自動で切る) | 長いランダム文字列 | start.sh が `server-basic-auth.password` に書く |
+| `NAROU_WEB_PASSWORD` | Web UI の basic 認証。素の公開 URL では必須 (コネクタ併用時も有効) | 長いランダム文字列 | start.sh が `server-basic-auth.password` に書く |
 | `NAROU_WEB_USER` | basic 認証のユーザ名 | 例 `admin` | 同 `server-basic-auth.user` (**未設定なら `admin` を補う**) |
-| `NAROU_ALLOW_NO_PASSWORD` | `1` で「パスワード無しでも起動する」 | コネクタなしで認証なしにするときだけ `1` (コネクタ使用時は自動で切るので不要) | — |
+| `NAROU_ALLOW_NO_PASSWORD` | `1` で「パスワード無しでも起動する」 | 検証済みの Cloudflare Access 等に認証を任せるときだけ `1` | — |
 | `NAROU_RS_ASSET_BACKEND` | `s3` で挿絵だけ S3 へ | `s3` (未設定 = ローカル保存) | **設定 `s3.asset-backend` が優先** |
 | `S3_ENDPOINT` | S3 互換の接続先 | Wasabi: `https://s3.ap-northeast-1.wasabisys.com` | 設定 `s3.endpoint` が優先 |
 | `S3_BUCKET` | バケット | 例 `mybucket` | 設定 `s3.bucket` が優先 |
@@ -179,7 +179,7 @@ NAROU_PUBLIC_HOST=narou.example.com     # 公開ホスト名
 | `NAROU_RS_APP` / `NAROU_RS_LIBRARY` | `app/` とライブラリの場所 | 通常は未設定 (配備パスから自動) | start.sh |
 | `NAROU_RS_PORT` | 待受ポート | 通常は未設定 (プラットフォームの `PORT` を使う) | start.sh (リレー同居時のみ 8080) |
 | `NAROU_RELAY` / `SORAHOST_PROXY_KEY` | 同じサーバーで取得リレーも動かすときだけ (§10) | `1` / 合言葉 | start.sh |
-| `NAROU_CONNECTOR_TOKEN` | コネクタ (cloudflared) の接続トークン。置くと起動し、basic 認証を切る (`NAROU_WEB_PASSWORD` 併記で併用) | ダッシュボードの Add a replica の値 | start.sh |
+| `NAROU_CONNECTOR_TOKEN` | コネクタ (cloudflared) の接続トークン。置くと起動する (basic 認証は既定で有効のまま) | ダッシュボードの Add a replica の値 | start.sh |
 | `NAROU_PUBLIC_HOST` | 公開ホスト名。置くとその Host 以外を弾く | 例 `narou.example.com` | start.sh |
 | `NAROU_CONNECTOR_TOKEN_FILE` | トークンをファイルで渡す場合のパス | 既定 `$VOLUME_DIR/.connector-token` | start.sh |
 
@@ -191,8 +191,8 @@ NAROU_PUBLIC_HOST=narou.example.com     # 公開ホスト名
   未設定のまま起動すると `start.sh` がその場でランダムなパスワードを作って設定し、
   コンソールに表示する (誰も入れない状態で公開だけは避ける)。起動自体は成功するので配備は
   成功する (止めると PteWorker がデプロイ失敗 422 と見なし、前のリリースを配り続けるため)。
-  コネクタを使うときは basic 認証を自動で切るので、パスワードは要らない。
-  コネクタなしで認証なしにしたいときだけ `NAROU_ALLOW_NO_PASSWORD=1`
+  コネクタ (トンネル) は利用者の認証ではないため、basic 認証はコネクタ併用時も有効のままにする。
+  検証済みの Cloudflare Access 等に認証を任せる場合だけ `NAROU_ALLOW_NO_PASSWORD=1` を明示する。
 
 ### 3.2 GitHub 側に置く値 (CI)
 
