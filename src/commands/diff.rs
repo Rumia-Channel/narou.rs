@@ -720,7 +720,10 @@ fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Re
     if let Some(version_id) = opts.restore {
         versions::restore_version(&mut guard, novel_id, version_id, false)
             .map_err(|e| e.to_string())?;
-        write_back_working_set(context, &guard)?;
+        let working_set = load_working_set(&guard, novel_id)?;
+        // 書戻しは ObjectStore 経由で同じ接続を掴むため、ロックを解放してから行う。
+        drop(guard);
+        write_back_working_set(context, &working_set)?;
         println!("バージョン{version_id}から復元しました (新しいヘッドとして記録)");
         return Ok(());
     }
@@ -734,7 +737,10 @@ fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Re
         });
         versions::merge_from_version(&mut guard, novel_id, version_id, only.as_deref(), None)
             .map_err(|e| e.to_string())?;
-        write_back_working_set(context, &guard)?;
+        let working_set = load_working_set(&guard, novel_id)?;
+        // 書戻しは ObjectStore 経由で同じ接続を掴むため、ロックを解放してから行う。
+        drop(guard);
+        write_back_working_set(context, &working_set)?;
         println!("バージョン{version_id}からマージしました");
         return Ok(());
     }
@@ -742,30 +748,51 @@ fn run_version_ops(context: &NovelContext, opts: DiffOptions) -> std::result::Re
     Ok(())
 }
 
-/// Write the mirrored working set back to `本文/*.yaml` after a
-/// restore/merge. The SQLite tables are a mirror; the section files remain
-/// authoritative for conversion, so a version operation that only updates
-/// the mirror would be silently discarded by the next convert.
+#[cfg(feature = "native-runtime")]
+fn load_working_set(
+    conn: &rusqlite::Connection,
+    novel_id: i64,
+) -> std::result::Result<narou_rs::native::sqlite::content::SectionMap, String> {
+    narou_rs::native::sqlite::content::load_sections(conn, novel_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "作業セットがミラーされていません".to_string())
+}
+
+/// Write the mirrored working set back after a restore/merge.
+///
+/// The SQLite tables are a mirror of the version history; the working set
+/// (`本文/*.yaml`) is what conversion, the web reader and the version tooling
+/// observe. In SQLite mode a filesystem-only write is shadowed by the stored
+/// `objects` rows (reads prefer the database), so the update must go through
+/// the same ObjectStore boundary the readers use — which also keeps the
+/// filesystem mirror in sync when it is enabled.
 #[cfg(feature = "native-runtime")]
 fn write_back_working_set(
     context: &NovelContext,
-    conn: &rusqlite::Connection,
+    sections: &narou_rs::native::sqlite::content::SectionMap,
 ) -> std::result::Result<(), String> {
     use narou_rs::downloader::persistence::section_filename;
     use narou_rs::downloader::types::SubtitleInfo;
-
-    let novel_id = context.record.id;
-    let sections = narou_rs::native::sqlite::content::load_sections(conn, novel_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "作業セットがミラーされていません".to_string())?;
+    use narou_rs::platform::{ObjectListRequest, ObjectPrefix, ObjectStore};
 
     let novel_dir =
         narou_rs::db::existing_novel_dir_for_record(&context.archive_root, &context.record);
     let section_dir = novel_dir.join(SECTION_SAVE_DIR);
-    fs::create_dir_all(&section_dir).map_err(|e| e.to_string())?;
+    let store = narou_rs::native::object_store::NativeStore::for_current_root()
+        .map_err(|e| e.to_string())?;
+    let section_prefix = narou_rs::native::object_store::novel_object_prefix(
+        &context.archive_root,
+        &novel_dir,
+    )
+    .map(|prefix| {
+        prefix
+            .join(SECTION_SAVE_DIR)
+            .map_err(|e| e.to_string())
+    })
+    .transpose()?;
 
     let mut expected = std::collections::HashSet::new();
-    for (idx, (subtitle, body_yaml)) in &sections {
+    for (idx, (subtitle, body_yaml)) in sections {
         let section: SectionFile = serde_yaml::from_str(body_yaml).map_err(|e| e.to_string())?;
         let info = SubtitleInfo {
             index: idx.clone(),
@@ -780,26 +807,72 @@ fn write_back_working_set(
         };
         let name = section_filename(&info);
         expected.insert(name.clone());
-        fs::write(section_dir.join(&name), body_yaml).map_err(|e| e.to_string())?;
+        match &section_prefix {
+            Some(prefix) => {
+                let key = prefix.join(&name).map_err(|e| e.to_string())?;
+                futures::executor::block_on(store.write_small(&key, body_yaml.clone().into_bytes()))
+                    .map_err(|e| e.to_string())?;
+            }
+            None => {
+                fs::create_dir_all(&section_dir).map_err(|e| e.to_string())?;
+                fs::write(section_dir.join(&name), body_yaml).map_err(|e| e.to_string())?;
+            }
+        }
     }
 
-    // Remove section files that no longer exist in the working set.
-    for entry in fs::read_dir(&section_dir).map_err(|e| e.to_string())? {
-        let path = entry.map_err(|e| e.to_string())?.path();
-        let is_yaml = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext == "yaml");
-        if !is_yaml {
-            continue;
+    // Remove section entries that no longer exist in the working set
+    // (renamed subtitles leave the previous file name behind).
+    match &section_prefix {
+        Some(prefix) => {
+            let request = ObjectListRequest::new(
+                ObjectPrefix::new(prefix.as_ref()).map_err(|e| e.to_string())?,
+                std::num::NonZeroUsize::new(512).expect("page size is non-zero"),
+            );
+            let mut cursor: Option<String> = None;
+            loop {
+                let request = match &cursor {
+                    Some(cursor) => request.clone().after(cursor.clone()),
+                    None => request.clone(),
+                };
+                let page = futures::executor::block_on(store.list_page(&request))
+                    .map_err(|e| e.to_string())?;
+                for metadata in &page.objects {
+                    let key = metadata.key.as_ref();
+                    let Some(name) = key.strip_prefix(&format!("{}/", prefix.as_ref())) else {
+                        continue;
+                    };
+                    if name.contains('/') || !name.ends_with(".yaml") || expected.contains(name) {
+                        continue;
+                    }
+                    futures::executor::block_on(store.delete(&metadata.key))
+                        .map_err(|e| e.to_string())?;
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
         }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        if !expected.contains(&name) {
-            fs::remove_file(&path).map_err(|e| e.to_string())?;
+        None => {
+            fs::create_dir_all(&section_dir).map_err(|e| e.to_string())?;
+            for entry in fs::read_dir(&section_dir).map_err(|e| e.to_string())? {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                let is_yaml = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext == "yaml");
+                if !is_yaml {
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if !expected.contains(&name) {
+                    fs::remove_file(&path).map_err(|e| e.to_string())?;
+                }
+            }
         }
     }
     Ok(())

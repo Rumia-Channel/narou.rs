@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,22 +6,22 @@ use chrono::SecondsFormat;
 use narou_rs::application::settings::SettingsStore;
 use narou_rs::application::{
     AppServiceDependencies, AppServices, EmptySiteDefinitionProvider, EmptySiteTimezoneProvider,
-    EmptyWebActionService, JobClaim, JobLedgerStatus, JobPlan, JobQueue, JobService,
-    NoopSelfUpdateService, NovelActionService, NovelContentService, NovelSettingsService,
-    SchedulerService, SettingsService, TagColorService, WorkerJobEnvelope, envelope_bytes,
-    job_limits,
+    EmptyWebActionService, FreezeStore, JobClaim, JobId, JobKind, JobLedgerStatus, JobPlan, JobQueue, JobService,
+    JobTarget, NoopSelfUpdateService, NovelActionService, NovelContentService,
+    NovelSettingsService, SchedulerService, SettingsService, TagColorService, WorkerJobEnvelope,
+    envelope_bytes, job_limits,
 };
 use narou_rs::downloader::Downloader;
 use narou_rs::downloader::settings::{DownloaderSettings, SnapshotDownloaderSettings};
 use narou_rs::downloader::site_setting::SiteSetting;
-use narou_rs::error::Result;
+use narou_rs::error::{NarouError, Result};
 use narou_rs::platform::{
-    AssetStore, Clock, HttpClient, NovelRepository, ObjectStore, RateLimiter, S3Store, SplitStore,
-    SystemClock,
+    AssetStore, Clock, HttpClient, NovelFilter, NovelRepository, ObjectStore, RateLimiter, S3Store,
+    SplitStore, SystemClock,
 };
 use narou_rs::setting_core::SettingScope;
 use serde::Deserialize;
-use worker::{Env, Queue};
+use worker::{Env, Queue, console_log};
 
 use crate::db_handle::DbHandle;
 use crate::d1_object_store::D1ObjectStore;
@@ -51,6 +51,11 @@ pub type PendingSectionHashCache =
 
 /// `update.interval` の既定値・下限 — native `commands::update::INTERVAL_MIN_SECS`。
 const UPDATE_INTERVAL_MIN_SECS: f64 = 2.5;
+
+/// Cloudflare Queues `sendBatch` accepts at most 100 messages. Page dispatch
+/// chunks sends to this bound and falls back to per-message sends when a
+/// chunk fails, so one rejected envelope cannot fail the rest of the page.
+const QUEUE_SEND_BATCH_SIZE: usize = 100;
 
 /// Everything the Worker event handlers need: the application services plus
 /// the Phase 8 queue/ledger/checkpoint/rate-limiter wiring.
@@ -649,15 +654,20 @@ impl WorkerRuntime {
     /// Expand before writing any ledger rows, preserving input groups for the
     /// Web UI response. UI composition skips site loading, so load the current
     /// primary definitions only for requests containing download URLs.
+    ///
+    /// Author pages can be login-walled, so the expander gets the same D1
+    /// credential store the downloader/HTTP client use. `&*self.cookie_store`
+    /// borrows the runtime field for the expander's lifetime — never a
+    /// temporary clone.
     pub async fn expand_download_plans(&self, plans: Vec<JobPlan>) -> Result<Vec<Vec<JobPlan>>> {
-        use narou_rs::application::{JobKind, JobTarget};
         if !plans.iter().any(|plan| plan.kind == JobKind::Download && matches!(plan.target, JobTarget::Url(_))) {
             return Ok(plans.into_iter().map(|plan| vec![plan]).collect());
         }
         let sites = crate::bundled_sites::load_site_settings_uncached(&self.write_objects).await?;
         let expander = narou_rs::application::download_targets::DownloadTargetExpander::new(
             self.http.as_ref(), self.rate_limiter.as_ref(), &sites,
-        );
+        )
+        .with_cookie_store(Some(&*self.cookie_store));
         let mut expanded = Vec::with_capacity(plans.len());
         for plan in plans {
             expanded.push(expander.expand_plan(&plan).await?.unwrap_or_else(|| vec![plan]));
@@ -668,167 +678,292 @@ impl WorkerRuntime {
     /// Enqueue one plan through the ledger and Queue binding as one operation.
     /// Pending/retryable rows are sent; a live running row is not duplicated.
     pub async fn enqueue_plan(&self, plan: JobPlan) -> Result<DispatchOutcome> {
-        let queued = self.ledger.enqueue(plan.clone()).await?;
-        let view = self.ledger.get(&queued.job_id).await?.ok_or_else(|| {
-            narou_rs::error::NarouError::Platform("queued job disappeared".to_string())
-        })?;
-        // 凍結小説の除外はここでも行う (native の update/download 拒否と
-        // 同じ規則、`--force` 指定時のみ通す)。キューへ流さず、代わりに
-        // 台帳行を `partial` で閉じて理由を残す — native の単発 mistook=1
-        // → queue_partial と同じ終端。bulk 呼び出し (`job_actions`) が
-        // `blocked` を致命的に扱うため、凍結スキップは `blocked` ではなく
-        // `sent: false` + 終端行として報告する。
-        if let Some(reason) = self.frozen_skip_reason(&plan).await? {
-            self.ledger
-                .settle_skipped(&queued.job_id, &reason)
-                .await?;
-            return Ok(DispatchOutcome {
-                job_id: queued.job_id.as_str().to_string(),
+        let mut outcomes = self.dispatch_plans(std::slice::from_ref(&plan)).await?;
+        outcomes
+            .pop()
+            .ok_or_else(|| NarouError::Platform("enqueue produced no outcome".to_string()))?
+            .map_err(NarouError::Platform)
+    }
+
+    /// Enqueue a bounded page as one batch operation: one ledger dedupe
+    /// SELECT + one INSERT batch per 100 plans, one frozen snapshot for the
+    /// whole page, and Queue sends in bounded `send_batch` chunks. Every plan
+    /// is attempted before a partial failure is reported; failed sends stay
+    /// active in the ledger for the reaper to repair.
+    pub async fn enqueue_batch(&self, plans: &[JobPlan]) -> Result<Vec<DispatchOutcome>> {
+        if plans.is_empty() {
+            return Ok(Vec::new());
+        }
+        let results = self.dispatch_plans(plans).await?;
+        let mut outcomes = Vec::with_capacity(results.len());
+        let mut failures = Vec::new();
+        for result in results {
+            match result {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(error) => failures.push(error),
+            }
+        }
+        if failures.is_empty() {
+            Ok(outcomes)
+        } else {
+            Err(NarouError::Platform(format!(
+                "queue page partially failed ({}): {}",
+                failures.len(),
+                failures.join("; ")
+            )))
+        }
+    }
+
+    /// Shared bounded dispatch used by both the single-plan and page paths.
+    ///
+    /// Per-plan failures are returned in place so the caller can either
+    /// surface one error or aggregate a partial page. Ordering is the input
+    /// order: `results[i]` always belongs to `plans[i]`, and duplicate plans
+    /// that dedupe onto one ledger row share that row's job id.
+    async fn dispatch_plans(
+        &self,
+        plans: &[JobPlan],
+    ) -> Result<Vec<std::result::Result<DispatchOutcome, String>>> {
+        // One ledger round trip per chunk: dedupe lookup, bounded inserts,
+        // and the status of every winning row (no per-plan re-read).
+        let enqueued = self.ledger.enqueue_batch(plans).await?;
+        let frozen = self.frozen_skip_reasons(plans).await;
+        let mut results: Vec<std::result::Result<DispatchOutcome, String>> =
+            Vec::with_capacity(plans.len());
+        let mut sends: Vec<usize> = Vec::new();
+        for (index, plan) in plans.iter().enumerate() {
+            let job_id = enqueued[index].queued.job_id.clone();
+            // 凍結小説の除外はここでも行う (native の update/download 拒否と
+            // 同じ規則、`--force` 指定時のみ通す)。キューへ流さず、代わりに
+            // 台帳行を `partial` で閉じて理由を残す — native の単発 mistook=1
+            // → queue_partial と同じ終端。bulk 呼び出し (`job_actions`) が
+            // `blocked` を致命的に扱うため、凍結スキップは `blocked` ではなく
+            // `sent: false` + 終端行として報告する。
+            if let Some(reason) = &frozen[index] {
+                if let Err(error) = self.ledger.settle_skipped(&job_id, reason).await {
+                    results.push(Err(error.to_string()));
+                    continue;
+                }
+                results.push(Ok(DispatchOutcome {
+                    job_id: job_id.as_str().to_string(),
+                    sent: false,
+                    blocked: None,
+                }));
+                continue;
+            }
+            if let Some(reason) = self.blocked_plan_reason(plan, &job_id) {
+                match self.ledger.claim(&job_id).await {
+                    Ok(JobClaim::Claimed { execution_token, .. }) => {
+                        if let Err(error) = self
+                            .ledger
+                            .mark_terminal(
+                                &job_id,
+                                &execution_token,
+                                JobLedgerStatus::Blocked,
+                                Some(&reason),
+                            )
+                            .await
+                        {
+                            results.push(Err(error.to_string()));
+                            continue;
+                        }
+                    }
+                    Ok(JobClaim::AlreadyTerminal | JobClaim::Unknown) => {}
+                    Ok(JobClaim::Busy { retry_after }) => {
+                        results.push(Err(format!(
+                            "cannot block a job with a live execution lease; retry after {}s",
+                            retry_after.as_secs()
+                        )));
+                        continue;
+                    }
+                    Err(error) => {
+                        results.push(Err(error.to_string()));
+                        continue;
+                    }
+                }
+                results.push(Ok(DispatchOutcome {
+                    job_id: job_id.as_str().to_string(),
+                    sent: false,
+                    blocked: Some(reason),
+                }));
+                continue;
+            }
+            if !matches!(
+                enqueued[index].status,
+                JobLedgerStatus::Pending | JobLedgerStatus::Retryable
+            ) {
+                results.push(Ok(DispatchOutcome {
+                    job_id: job_id.as_str().to_string(),
+                    sent: false,
+                    blocked: None,
+                }));
+                continue;
+            }
+            sends.push(index);
+            results.push(Ok(DispatchOutcome {
+                job_id: job_id.as_str().to_string(),
                 sent: false,
                 blocked: None,
+            }));
+        }
+        // Bounded Queue batches. A failed `send_batch` is retried per message
+        // so the failure stays attached to its own plan and the rest of the
+        // page (and later chunks) still goes out.
+        for chunk in sends.chunks(QUEUE_SEND_BATCH_SIZE) {
+            let envelopes: Vec<WorkerJobEnvelope> = chunk
+                .iter()
+                .map(|index| WorkerJobEnvelope::v2(enqueued[*index].queued.job_id.clone()))
+                .collect();
+            match self.queue.send_batch(envelopes).await {
+                Ok(()) => {
+                    for index in chunk {
+                        if let Ok(outcome) = &mut results[*index] {
+                            outcome.sent = true;
+                        }
+                    }
+                }
+                Err(batch_error) => {
+                    console_log!(
+                        "queue send_batch of {} messages failed ({batch_error}); retrying per message",
+                        chunk.len()
+                    );
+                    for index in chunk {
+                        let envelope =
+                            WorkerJobEnvelope::v2(enqueued[*index].queued.job_id.clone());
+                        match self.queue.send(&envelope).await {
+                            Ok(()) => {
+                                if let Ok(outcome) = &mut results[*index] {
+                                    outcome.sent = true;
+                                }
+                            }
+                            Err(error) => {
+                                results[*index] = Err(format!("queue send failed: {error}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Frozen-target exclusion for a whole page, loaded once: without
+    /// `--force`, a Download/Update plan whose target resolves to a frozen
+    /// novel is folded into a terminal `partial` row instead of entering the
+    /// runnable queue (native `commands::{update,download}` skip parity — a
+    /// queued job that must not run). The native notice text is recorded as
+    /// `last_error` so the queue row shows why it settled.
+    ///
+    /// The set is the same union the single-plan path uses —
+    /// `FreezeStore::frozen_ids` (primary, cache-bypassing) plus the legacy
+    /// `frozen` record tag — read once for the page instead of once per plan.
+    /// Read failures stay fail-open, exactly like `NovelActionService::is_frozen`.
+    /// Returns `None` per plan when it is not frozen-skippable (force, other
+    /// kinds, unresolved/new targets — all proceed as before). The executor
+    /// keeps an identical check as the last line of defense for envelopes
+    /// that bypass dispatch (legacy v1, direct ledger writes).
+    async fn frozen_skip_reasons(&self, plans: &[JobPlan]) -> Vec<Option<String>> {
+        use narou_rs::application::messages;
+        let mut reasons: Vec<Option<String>> = std::iter::repeat_with(|| None)
+            .take(plans.len())
+            .collect();
+        let candidates: Vec<usize> = plans
+            .iter()
+            .enumerate()
+            .filter(|(_, plan)| {
+                matches!(plan.kind, JobKind::Download | JobKind::Update)
+                    && !plan
+                        .options
+                        .iter()
+                        .any(|option| option == "--force" || option == "-f")
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if candidates.is_empty() {
+            return reasons;
+        }
+        // 凍結判定は更新系 (primary + キャッシュ無し) で行う — 読み取り系の
+        // `services` は isolate キャッシュ・replica 遅延の凍結集合を返し得て、
+        // 直前の凍結/解除を見落とす。
+        let tagged = NovelFilter {
+            tag: Some("frozen".to_string()),
+            ..NovelFilter::default()
+        };
+        let (store_ids, tagged_ids) = futures::join!(
+            self.freeze.frozen_ids(),
+            self.write_services().library.all_ids(&tagged),
+        );
+        let mut frozen: HashSet<i64> = store_ids.unwrap_or_default();
+        frozen.extend(
+            tagged_ids
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| id.0),
+        );
+        if frozen.is_empty() {
+            return reasons;
+        }
+        let mut resolved: HashMap<String, Option<i64>> = HashMap::new();
+        for index in candidates {
+            let plan = &plans[index];
+            let target = plan.target.as_str();
+            let id = match resolved.get(&target) {
+                Some(id) => *id,
+                None => {
+                    let id = crate::executor::resolve_novel_id(self.novels.as_ref(), &plan.target)
+                        .await
+                        .map(|id| id.0);
+                    resolved.insert(target, id);
+                    id
+                }
+            };
+            let Some(id) = id else {
+                continue;
+            };
+            if !frozen.contains(&id) {
+                continue;
+            }
+            let title = self
+                .novels
+                .get(narou_rs::platform::NovelId(id))
+                .await
+                .ok()
+                .flatten()
+                .map(|record| record.title)
+                .unwrap_or_default();
+            reasons[index] = Some(match plan.kind {
+                JobKind::Update => messages::update::frozen_id(id, title),
+                _ => messages::download::frozen_abort(title),
             });
         }
+        reasons
+    }
 
+    /// Queue-refused plans: kinds without a worker execution path, the
+    /// library-wide auto-update placeholder, and envelopes over the payload
+    /// limit. Each is settled `blocked` in the ledger instead of being sent.
+    fn blocked_plan_reason(&self, plan: &JobPlan, job_id: &JobId) -> Option<String> {
         let unsupported = if !plan.kind.is_worker_executable() {
             Some(format!(
                 "unsupported job kind {:?} on the worker (no subprocess support)",
                 plan.kind
             ))
-        } else if plan.target == narou_rs::application::JobTarget::All {
+        } else if plan.target == JobTarget::All {
             Some("auto-update must be planned into discrete per-novel jobs".to_string())
         } else {
             None
         };
-        let oversized = envelope_bytes(&WorkerJobEnvelope::v2(queued.job_id.clone()))
+        let oversized = envelope_bytes(&WorkerJobEnvelope::v2(job_id.clone()))
             .map(|size| size > job_limits::MAX_ENVELOPE_BYTES)
             .unwrap_or(true);
-        let blocked_reason = unsupported.or_else(|| {
+        unsupported.or_else(|| {
             oversized.then(|| {
                 format!(
                     "envelope exceeds queue payload limit (max {} bytes)",
                     job_limits::MAX_ENVELOPE_BYTES
                 )
             })
-        });
-        if let Some(reason) = blocked_reason {
-            match self.ledger.claim(&queued.job_id).await? {
-                JobClaim::Claimed {
-                    execution_token, ..
-                } => {
-                    self.ledger
-                        .mark_terminal(
-                            &queued.job_id,
-                            &execution_token,
-                            JobLedgerStatus::Blocked,
-                            Some(&reason),
-                        )
-                        .await?;
-                }
-                JobClaim::AlreadyTerminal | JobClaim::Unknown => {}
-                JobClaim::Busy { retry_after } => {
-                    return Err(narou_rs::error::NarouError::Platform(format!(
-                        "cannot block a job with a live execution lease; retry after {}s",
-                        retry_after.as_secs()
-                    )));
-                }
-            }
-            return Ok(DispatchOutcome {
-                job_id: queued.job_id.as_str().to_string(),
-                sent: false,
-                blocked: Some(reason),
-            });
-        }
-        if !matches!(
-            view.status,
-            narou_rs::application::JobLedgerStatus::Pending
-                | narou_rs::application::JobLedgerStatus::Retryable
-        ) {
-            return Ok(DispatchOutcome {
-                job_id: queued.job_id.as_str().to_string(),
-                sent: false,
-                blocked: None,
-            });
-        }
-        let envelope = WorkerJobEnvelope::v2(queued.job_id.clone());
-        self.queue.send(&envelope).await.map_err(|error| {
-            narou_rs::error::NarouError::Platform(format!("queue send failed: {error}"))
-        })?;
-        Ok(DispatchOutcome {
-            job_id: envelope.job_id.as_str().to_string(),
-            sent: true,
-            blocked: None,
         })
-    }
-
-
-    /// Frozen-target exclusion for the planning boundary: without `--force`,
-    /// a Download/Update plan whose target resolves to a frozen novel is
-    /// folded into a terminal `partial` row instead of entering the runnable
-    /// queue (native `commands::{update,download}` skip parity — a queued
-    /// job that must not run). The native notice text is recorded as
-    /// `last_error` so the queue row shows why it settled.
-    ///
-    /// Returns `None` when the plan is not frozen-skippable (force, other
-    /// kinds, unresolved/new targets — all proceed as before). The executor
-    /// keeps an identical check as the last line of defense for envelopes
-    /// that bypass `enqueue_plan` (legacy v1, direct ledger writes).
-    async fn frozen_skip_reason(&self, plan: &JobPlan) -> Result<Option<String>> {
-        use narou_rs::application::{JobKind, messages};
-        if !matches!(plan.kind, JobKind::Download | JobKind::Update) {
-            return Ok(None);
-        }
-        let force = plan
-            .options
-            .iter()
-            .any(|option| option == "--force" || option == "-f");
-        if force {
-            return Ok(None);
-        }
-        let Some(id) = crate::executor::resolve_novel_id(self.novels.as_ref(), &plan.target).await
-        else {
-            return Ok(None);
-        };
-        // 凍結判定は更新系サービス (primary + キャッシュ無し) で行う —
-        // 読み取り系の `services` は isolate キャッシュ・replica 遅延の
-        // 凍結集合を返し得て、直前の凍結/解除を見落とす。
-        if !self.write_services.novel_actions.is_frozen(id).await {
-            return Ok(None);
-        }
-        let title = self
-            .novels
-            .get(id)
-            .await
-            .ok()
-            .flatten()
-            .map(|record| record.title)
-            .unwrap_or_default();
-        Ok(Some(match plan.kind {
-            JobKind::Update => messages::update::frozen_id(id.0, title),
-            _ => messages::download::frozen_abort(title),
-        }))
-    }
-
-
-    /// Dispatch a bounded page, attempting every plan before returning a
-    /// partial failure. Failed sends remain active in the ledger for repair.
-    pub async fn enqueue_batch(&self, plans: &[JobPlan]) -> Result<Vec<DispatchOutcome>> {
-        let mut outcomes = Vec::with_capacity(plans.len());
-        let mut failures = Vec::new();
-        for plan in plans {
-            match self.enqueue_plan(plan.clone()).await {
-                Ok(outcome) => outcomes.push(outcome),
-                Err(error) => failures.push(error.to_string()),
-            }
-        }
-        if failures.is_empty() {
-            Ok(outcomes)
-        } else {
-            Err(narou_rs::error::NarouError::Platform(format!(
-                "queue page partially failed ({}): {}",
-                failures.len(),
-                failures.join("; ")
-            )))
-        }
     }
 }
 

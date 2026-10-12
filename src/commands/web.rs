@@ -279,6 +279,10 @@ fn fill_general_all_no_in_database() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let archive_root = narou_rs::db::with_database(|db| Ok(db.archive_root().to_path_buf()))
         .map_err(|e| e.to_string())?;
+    // mirror-files=false では toc.yaml が実ファイルに無いので、
+    // ストアのオブジェクトから読めるようにする。
+    let store = narou_rs::native::object_store::NativeStore::for_current_root()
+        .map_err(|e| e.to_string())?;
     let mut modified = false;
 
     for id in ids {
@@ -289,7 +293,9 @@ fn fill_general_all_no_in_database() -> Result<(), String> {
             continue;
         }
         let novel_dir = narou_rs::db::existing_novel_dir_for_record(&archive_root, &record);
-        let Some(toc) = narou_rs::native::legacy_persistence::load_toc_file(&novel_dir) else {
+        let toc = narou_rs::native::legacy_persistence::load_toc_file(&novel_dir)
+            .or_else(|| load_toc_from_store(&store, &archive_root, &novel_dir));
+        let Some(toc) = toc else {
             continue;
         };
         record.general_all_no = Some(toc.subtitles.len() as i64);
@@ -301,6 +307,22 @@ fn fill_general_all_no_in_database() -> Result<(), String> {
 
     let _ = modified;
     Ok(())
+}
+
+/// ストア上の `toc.yaml` を読む (実ファイルが無い構成の補完用)。
+fn load_toc_from_store(
+    store: &narou_rs::native::object_store::NativeStore,
+    archive_root: &std::path::Path,
+    novel_dir: &std::path::Path,
+) -> Option<narou_rs::downloader::TocFile> {
+    let prefix = narou_rs::native::object_store::novel_object_prefix(archive_root, novel_dir)?;
+    let key = prefix.join("toc.yaml").ok()?;
+    let bytes = futures::executor::block_on(narou_rs::platform::ObjectStore::read_small(
+        store, &key,
+    ))
+    .ok()
+    .flatten()?;
+    serde_yaml::from_slice(&bytes).ok()
 }
 
 fn resolve_web_address(user_port: Option<u16>) -> Result<WebAddress, String> {
@@ -725,11 +747,18 @@ fn watch_server_settings(state: narou_rs::web::AppState) -> tokio::task::JoinHan
         "logging.format-timestamp",
         "concurrency",
     ];
+    /// 起動時に組んだストア (NativeStore / SqliteObjectStore / SplitStore) を
+    /// 組み替えないと反映できない設定。値をその場で差し替えると、CLI の
+    /// 子プロセス (新しい設定を読む) と常駐 Web (古いストア) が別の保存先を
+    /// 指すため、ここでは変更を検知して再起動を要求するだけにする。
+    /// 判定対象と文言は `SettingsEffect::StorageRestartRequired` と共有する。
+    const STORAGE_NAMES: &[&str] = narou_rs::native::application::STORAGE_RESTART_SETTING_NAMES;
 
     tokio::spawn(async move {
         let mut last_auto_schedule: Option<Vec<(String, Value)>> = None;
         let mut last_webui: Option<Vec<(String, Value)>> = None;
         let mut last_logging: Option<Vec<(String, Value)>> = None;
+        let mut last_storage: Option<Vec<(String, Value)>> = None;
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             if !narou_rs::db::narou_root_exists() {
@@ -794,6 +823,33 @@ fn watch_server_settings(state: narou_rs::web::AppState) -> tokio::task::JoinHan
                     // 設定変更で LoggerState を再構築する。ロガーは lib 側
                     // (`narou_rs::logger`) を bin と共有しているので 1 回で足りる。
                     crate::logger::init();
+                }
+            }
+
+            let storage = signature(&local, STORAGE_NAMES);
+            if last_storage.as_ref() == Some(&storage) {
+                // unchanged
+            } else {
+                let first = last_storage.replace(storage).is_none();
+                if !first {
+                    // 常駐ストアを組み替えられないため、保存先の構成変更は
+                    // ストレージモード切替と同じ再起動経路に乗せる
+                    // (CLI の子プロセスだけ新設定を読み続ける混在を防ぐ)。
+                    let note = narou_rs::native::application::STORAGE_RESTART_REQUIRED_NOTE;
+                    match narou_rs::web::jobs::schedule_server_reboot(state.clone()).await {
+                        Ok(()) => {
+                            state.push_server.broadcast_event("reboot", "");
+                            state.push_server.broadcast_echo(note, "yellow");
+                        }
+                        Err(error) => {
+                            state.push_server.broadcast_echo(
+                                &format!(
+                                    "{note} (自動再起動に失敗したので手動で再起動して下さい: {error})"
+                                ),
+                                "yellow",
+                            );
+                        }
+                    }
                 }
             }
         }

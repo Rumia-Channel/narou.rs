@@ -18,6 +18,9 @@ fn map_application_error(error: crate::application::ApplicationError) -> (Status
         crate::application::ApplicationError::InvalidRequest(message) => {
             (StatusCode::BAD_REQUEST, message)
         }
+        crate::application::ApplicationError::Conflict(message) => {
+            (StatusCode::CONFLICT, message)
+        }
         crate::application::ApplicationError::NotFound(message) => {
             (StatusCode::NOT_FOUND, message)
         }

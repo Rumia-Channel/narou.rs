@@ -1,5 +1,4 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use narou_rs::converter::inspector::INSPECT_LOG_NAME;
 use narou_rs::db;
@@ -52,6 +51,7 @@ fn cmd_inspect_inner(targets: &[String]) -> Result<(), String> {
 struct InspectEntry {
     title: String,
     archive_path: PathBuf,
+    archive_root: PathBuf,
 }
 
 fn resolve_inspect_entry(target: &str) -> Option<InspectEntry> {
@@ -63,47 +63,31 @@ fn resolve_inspect_entry(target: &str) -> Option<InspectEntry> {
     Some(InspectEntry {
         title: record.title.clone(),
         archive_path: narou_rs::db::existing_novel_dir_for_record(&archive_root, &record),
+        archive_root,
     })
 }
 
 fn display_log(entry: &InspectEntry) {
     println!("({} の小説状態調査状況ログ)", entry.title);
-    match read_inspect_log(&entry.archive_path) {
-        Some(content) => {
+    match read_inspect_log(entry) {
+        Ok(Some(content)) => {
             print!("{}", content);
             if !content.ends_with('\n') {
                 println!();
             }
         }
-        None => println!("調査ログがまだ無いようです"),
+        Ok(None) => println!("調査ログがまだ無いようです"),
+        Err(error) => log::report_error(&error.to_string()),
     }
 }
 
-fn read_inspect_log(archive_path: &Path) -> Option<String> {
-    let path = archive_path.join(INSPECT_LOG_NAME);
-    fs::read_to_string(path).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use super::read_inspect_log;
-
-    #[test]
-    fn read_inspect_log_returns_file_content() {
-        let base = std::env::temp_dir().join(format!(
-            "narou-rs-inspect-test-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(base.join(super::INSPECT_LOG_NAME), "sample log\n").unwrap();
-
-        assert_eq!(read_inspect_log(&base).as_deref(), Some("sample log\n"));
-
-        std::fs::remove_dir_all(base).unwrap();
-    }
+fn read_inspect_log(entry: &InspectEntry) -> narou_rs::error::Result<Option<String>> {
+    let path = entry.archive_path.join(INSPECT_LOG_NAME);
+    let key = narou_rs::native::object_store::object_key_for_file(&entry.archive_root, &path)
+        .ok_or_else(|| narou_rs::error::NarouError::Database(format!("調査ログが保存フォルダの外です: {}", path.display())))?;
+    let store = narou_rs::native::object_store::NativeStore::for_current_root()?;
+    let bytes = futures::executor::block_on(narou_rs::platform::ObjectStore::read_small(&store, &key))?;
+    bytes.map(|bytes| String::from_utf8(bytes).map_err(|error| {
+        narou_rs::error::NarouError::Database(format!("調査ログを読めません: {error}"))
+    })).transpose()
 }

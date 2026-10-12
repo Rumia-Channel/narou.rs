@@ -32,6 +32,13 @@ fn cmd_folder_inner(targets: &[String], no_open: bool) -> Result<(), String> {
             log::report_error(&format!("{} は存在しません", target));
             continue;
         };
+        if !dir.is_dir() {
+            log::report_error(&format!(
+                "保存フォルダがありません: {} (SQLite の実ファイル保存を無効にしている場合は narou db export-yaml --in-place で復元できます)",
+                dir.display()
+            ));
+            continue;
+        }
 
         // Ruby は open の有無に関わらずパスを表示する (folder.rb: `puts dir`)。
         if !no_open {

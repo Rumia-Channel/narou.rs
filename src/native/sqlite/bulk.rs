@@ -15,6 +15,9 @@ use super::record_map::record_from_row;
 use super::repository::upsert_record_conn;
 use super::sqlite_error;
 
+/// Maximum number of ids bound into one `DELETE ... IN (...)` statement.
+const DELETE_CHUNK: usize = 200;
+
 /// Load every novel as `(id, record)`, ordered by id.
 pub(crate) fn load_all_records(
     conn: &Connection,
@@ -53,12 +56,19 @@ pub(crate) fn replace_all_records(
     for record in records.values() {
         upsert_record_conn(&tx, record)?;
     }
-    for id in existing {
-        if !records.contains_key(&id) {
-            // Cascades to novel_tags / frozen_novels.
-            tx.execute("DELETE FROM novels WHERE id = ?", [id])
-                .map_err(sqlite_error)?;
-        }
+    let stale: Vec<i64> = existing
+        .into_iter()
+        .filter(|id| !records.contains_key(id))
+        .collect();
+    // Cascades to novel_tags / frozen_novels per row; chunking the `IN` list
+    // turns one statement per removed id into one statement per 200 ids.
+    for chunk in stale.chunks(DELETE_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE FROM novels WHERE id IN ({placeholders})");
+        tx.execute(&sql, rusqlite::params_from_iter(chunk.iter()))
+            .map_err(sqlite_error)?;
     }
     let max_id = records.keys().copied().max().unwrap_or(0);
     tx.execute(

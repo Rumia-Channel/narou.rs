@@ -6,72 +6,23 @@
 //! 日本語文言に揃える。資格情報はサイト単位の `LoginGroup` で保存する。
 
 use narou_rs::error::Result;
-use narou_rs::platform::{mask_cookie, normalize_cookie_host, parse_cookie_header};
+use narou_rs::platform::normalize_cookie_host;
 use worker::Response;
 
 use crate::composition::WorkerRuntime;
 
+/// 資格情報一覧の整形 (平文を出さない規則) はホストテスト対象の純関数。
+pub(crate) mod listing;
+
 /// 一覧ペイロード (native `status_payload`)。値は名前と長さだけを返す
 /// (Cookie 本体は返さない)。
+///
+/// 保存 payload は 1 回だけ読み、サイトごとの暗号化フラグは復号前の生値
+/// からその場で判定する — サイト数ぶん保存行を読み直さない。
 pub async fn status_payload(runtime: &WorkerRuntime) -> Result<serde_json::Value> {
     let store = runtime.cookie_store();
-    let sites = store.groups_by_site().await?;
-    let mut total = 0;
-    let mut encrypted_sites: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
-    for site in sites.keys() {
-        if store.is_encrypted(site).await.unwrap_or(false) {
-            encrypted_sites.insert(site.clone());
-        }
-    }
-    let entries: Vec<serde_json::Value> = sites
-        .iter()
-        .map(|(site, groups)| {
-            total += groups.len();
-            let logins: Vec<serde_json::Value> = groups
-                .iter()
-                .enumerate()
-                .map(|(index, group)| {
-                    let hosts: Vec<serde_json::Value> = group
-                        .cookies
-                        .iter()
-                        .map(|entry| {
-                            serde_json::json!({
-                                "host": entry.host,
-                                "cookies": mask_cookie(&entry.cookie),
-                                "names": parse_cookie_header(&entry.cookie)
-                                    .into_iter()
-                                    .map(|(name, _)| name)
-                                    .collect::<Vec<_>>(),
-                                "length": entry.cookie.chars().count(),
-                            })
-                        })
-                        .collect();
-                    serde_json::json!({
-                        "index": index,
-                        "id": group.id,
-                        "short_id": group.short_id(),
-                        "label": group.label,
-                        "display_name": group.display_name(),
-                        "hosts": hosts,
-                        "host_count": group.cookies.len(),
-                        "added_at": group.added_at,
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "site": site,
-                "logins": logins,
-                "encrypted": encrypted_sites.contains(site),
-            })
-        })
-        .collect();
-    Ok(serde_json::json!({
-        "sites": entries,
-        "sites_count": sites.len(),
-        "logins_count": total,
-        "key_source": store.key_source(),
-    }))
+    let (sites, encrypted) = store.groups_and_encryption().await?;
+    Ok(listing::status_json(&sites, &encrypted, store.key_source()))
 }
 
 /// `GET /api/login` — `{success: true, data: <status_payload>}` (native

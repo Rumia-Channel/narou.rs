@@ -250,6 +250,36 @@ pub trait ObjectStore: PlatformService {
 
     fn delete<'a>(&'a self, key: &'a ObjectKey) -> PlatformFuture<'a, Result<()>>;
 
+    /// Delete every object stored below `prefix`.
+    ///
+    /// The default implementation walks the listing and deletes key by key;
+    /// backends with a bulk operation (SQLite) override it so a prefix delete
+    /// does not pay one round trip per object.
+    fn delete_prefix<'a>(&'a self, prefix: &'a ObjectKey) -> PlatformFuture<'a, Result<()>> {
+        let prefix = ObjectPrefix::from(prefix.clone());
+        Box::pin(async move {
+            let mut cursor: Option<String> = None;
+            loop {
+                let request = ObjectListRequest::new(
+                    prefix.clone(),
+                    NonZeroUsize::new(100).expect("page size is non-zero"),
+                );
+                let request = match &cursor {
+                    Some(cursor) => request.after(cursor.clone()),
+                    None => request,
+                };
+                let page = self.list_page(&request).await?;
+                for object in &page.objects {
+                    self.delete(&object.key).await?;
+                }
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => return Ok(()),
+                }
+            }
+        })
+    }
+
     fn list_page<'a>(
         &'a self,
         request: &'a ObjectListRequest,

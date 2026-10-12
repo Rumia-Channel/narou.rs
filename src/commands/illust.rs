@@ -350,6 +350,14 @@ fn resolve_novel_dir(target: &str) -> Option<PathBuf> {
 }
 
 fn run_orphan(archive_path: &Path, force: bool) -> Result<(), String> {
+    if !archive_path.join("挿絵").is_dir() {
+        // 実体がローカルに無い構成では、ストア上のオブジェクトを直接調べる。
+        let scan =
+            narou_rs::native::illustrations::scan_stored_illustrations_blocking(archive_path)
+                .map_err(|e| e.to_string())?;
+        return run_orphan_scan(archive_path, scan, force);
+    }
+
     let orphans =
         illustration_store::find_orphan_illustrations(archive_path).map_err(|e| e.to_string())?;
     if orphans.is_empty() {
@@ -359,10 +367,11 @@ fn run_orphan(archive_path: &Path, force: bool) -> Result<(), String> {
     println!("  孤児挿絵: {} 件", orphans.len());
     for path in &orphans {
         if force {
-            if let Err(err) = std::fs::remove_file(path) {
-                log::report_error(&format!("{} の削除に失敗しました: {}", path.display(), err));
-            } else {
-                println!("  [削除] {}", path.display());
+            match remove_illustration_or_local(path) {
+                Ok(()) => println!("  [削除] {}", path.display()),
+                Err(err) => {
+                    log::report_error(&format!("{} の削除に失敗しました: {}", path.display(), err))
+                }
             }
         } else {
             println!("  {}", path.display());
@@ -374,7 +383,85 @@ fn run_orphan(archive_path: &Path, force: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// ストア上のオブジェクトを対象にした孤児の表示・削除。
+fn run_orphan_scan(
+    archive_path: &Path,
+    scan: narou_rs::native::illustrations::StoredIllustrationScan,
+    force: bool,
+) -> Result<(), String> {
+    if scan.total == 0 || scan.orphans.is_empty() {
+        println!("  孤児挿絵はありません。");
+        return Ok(());
+    }
+    println!("  孤児挿絵: {} 件", scan.orphans.len());
+    let stores = native_stores()?;
+    for (filename, key) in &scan.orphans {
+        let display = archive_path.join("挿絵").join(filename);
+        if force {
+            match futures::executor::block_on(narou_rs::platform::ObjectStore::delete(
+                stores.objects.as_ref(),
+                key,
+            )) {
+                Ok(()) => println!("  [削除] {}", display.display()),
+                Err(err) => log::report_error(&format!(
+                    "{} の削除に失敗しました: {}",
+                    display.display(),
+                    err
+                )),
+            }
+        } else {
+            println!("  {}", display.display());
+        }
+    }
+    if !force {
+        println!("  -f を指定すると実際に削除します。");
+    }
+    Ok(())
+}
+
+/// 挿絵 1 件をストアとローカルの両方から消す。
+///
+/// mirror-files=false ではストアの delete が実ファイルに触れないため、
+/// 残っていればファイルも消す (どちらか一方だけが残ると不整合になる)。
+fn remove_illustration_or_local(path: &Path) -> Result<(), String> {
+    let archive_root = archive_root()?;
+    let stores = native_stores()?;
+    if let Some(key) = narou_rs::native::object_store::object_key_for_file(&archive_root, path) {
+        futures::executor::block_on(narou_rs::platform::ObjectStore::delete(
+            stores.objects.as_ref(),
+            &key,
+        ))
+        .map_err(|e| e.to_string())?;
+    }
+    if path.is_file() {
+        std::fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn archive_root() -> Result<PathBuf, String> {
+    let inventory = narou_rs::db::inventory::Inventory::with_default_root()
+        .map_err(|e| e.to_string())?;
+    Ok(inventory
+        .root_dir()
+        .join(narou_rs::downloader::ARCHIVE_ROOT_DIR))
+}
+
+fn native_stores() -> Result<narou_rs::native::object_store::NativeStores, String> {
+    let inventory = narou_rs::db::inventory::Inventory::with_default_root()
+        .map_err(|e| e.to_string())?;
+    narou_rs::native::object_store::NativeStores::for_narou_root(inventory.root_dir())
+        .map_err(|e| e.to_string())
+}
+
 fn run_migrate(archive_path: &Path, force: bool) -> Result<(), String> {
+    if store_backed_illustrations_only(archive_path)? {
+        report_fs_only_operation(
+            "legacy ファイル名の移行",
+            Some("S3 上の legacy 配置は `narou illust s3-dedup` で dedup プールへ移せます"),
+        );
+        return Ok(());
+    }
     let plans = illustration_store::plan_legacy_illustration_migrations(archive_path)
         .map_err(|e| e.to_string())?;
     if plans.is_empty() {
@@ -403,11 +490,21 @@ fn run_migrate(archive_path: &Path, force: bool) -> Result<(), String> {
     }
     let renamed = illustration_store::apply_legacy_illustration_migrations(archive_path)
         .map_err(|e| e.to_string())?;
+    let renames: Vec<(PathBuf, PathBuf)> = plans
+        .iter()
+        .map(|plan| (plan.old_path.clone(), plan.new_path.clone()))
+        .collect();
+    sync_illustration_renames_in_store(&renames)?;
+    push_illustration_index_to_store(archive_path)?;
     println!("  移行完了: {} 件", renamed);
     Ok(())
 }
 
 fn run_fix_ext(archive_path: &Path, force: bool) -> Result<(), String> {
+    if store_backed_illustrations_only(archive_path)? {
+        report_fs_only_operation("拡張子の修正", None);
+        return Ok(());
+    }
     let illust_dir = archive_path.join("挿絵");
     let plans = illustration_store::plan_extension_fixes(&illust_dir).map_err(|e| e.to_string())?;
     if plans.is_empty() {
@@ -432,15 +529,160 @@ fn run_fix_ext(archive_path: &Path, force: bool) -> Result<(), String> {
     }
     let renamed = illustration_store::apply_extension_fixes(&illust_dir, &plans)
         .map_err(|e| e.to_string())?;
+    sync_illustration_renames_in_store(&plans)?;
     println!("  改名完了: {} 件", renamed);
     Ok(())
 }
 
+/// ローカル `挿絵/` に実体が無く、挿絵がストアにだけある構成か。
+fn store_backed_illustrations_only(archive_path: &Path) -> Result<bool, String> {
+    if archive_path.join("挿絵").is_dir() {
+        return Ok(false);
+    }
+    let count = narou_rs::native::illustrations::stored_illustration_count_blocking(archive_path)
+        .map_err(|e| e.to_string())?;
+    Ok(count > 0)
+}
+
+fn report_fs_only_operation(operation: &str, hint: Option<&str>) {
+    println!("  挿絵はローカルに無く、ストア (SQLite/S3) に保存されています。");
+    println!(
+        "  「{operation}」はローカルの実体を対象にする操作のため、この構成では実行できません。"
+    );
+    if let Some(hint) = hint {
+        println!("  {hint}");
+    }
+}
+
+/// ローカルで改名した挿絵を、ストア側のキーにも反映する。
+///
+/// mirror-files=true / S3 構成では DB 行や S3 オブジェクトのキーは改名に
+/// 追随しないため、旧キーが保管されている場合だけ copy → delete する。
+/// (純 YAML 構成では改名済みで旧キーが無いので何もしない。)
+fn sync_illustration_renames_in_store(renames: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    if renames.is_empty() {
+        return Ok(());
+    }
+    let archive_root = archive_root()?;
+    let stores = native_stores()?;
+    for (old_path, new_path) in renames {
+        let Some(old_key) = narou_rs::native::object_store::object_key_for_file(&archive_root, old_path)
+        else {
+            continue;
+        };
+        let Some(new_key) = narou_rs::native::object_store::object_key_for_file(&archive_root, new_path)
+        else {
+            continue;
+        };
+        let stored =
+            futures::executor::block_on(narou_rs::platform::AssetStore::stat(stores.assets.as_ref(), &old_key))
+                .map_err(|e| e.to_string())?;
+        if stored.is_none() {
+            continue;
+        }
+        futures::executor::block_on(narou_rs::platform::AssetStore::copy(
+            stores.assets.as_ref(),
+            &old_key,
+            &new_key,
+        ))
+        .map_err(|e| e.to_string())?;
+        futures::executor::block_on(narou_rs::platform::AssetStore::delete(
+            stores.assets.as_ref(),
+            &old_key,
+        ))
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// ローカルの索引ファイルをストアの `.illustration_cache.yaml` へ書き戻す。
+fn push_illustration_index_to_store(archive_path: &Path) -> Result<(), String> {
+    let cache = illustration_store::cache_path(archive_path);
+    let Ok(body) = std::fs::read(&cache) else {
+        return Ok(());
+    };
+    let archive_root = archive_root()?;
+    let Some(prefix) =
+        narou_rs::native::object_store::novel_object_prefix(&archive_root, archive_path)
+    else {
+        return Ok(());
+    };
+    let key = prefix.join(".illustration_cache.yaml").map_err(|e| e.to_string())?;
+    let stores = native_stores()?;
+    futures::executor::block_on(narou_rs::platform::ObjectStore::write_small(
+        stores.objects.as_ref(),
+        &key,
+        body,
+    ))
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn run_rebuild(archive_path: &Path) -> Result<(), String> {
+    if !archive_path.join("挿絵").is_dir() {
+        return run_rebuild_via_store(archive_path);
+    }
     let count =
         illustration_store::rebuild_illustration_cache(archive_path).map_err(|e| e.to_string())?;
     println!("  cache 再構築完了: {} エントリ", count);
     Ok(())
+}
+
+/// 実体がストアにだけある構成の索引再構築。
+///
+/// ストアから本文 (`raw/*.html` を含む) と挿絵を取り出し、既存の FS 再構築
+/// ロジックで索引を組み直してストアへ書き戻す。取り出したファイルは
+/// ガードが片付けるので、ローカルには残さない。
+fn run_rebuild_via_store(archive_path: &Path) -> Result<(), String> {
+    let inventory = narou_rs::db::inventory::Inventory::with_default_root()
+        .map_err(|e| e.to_string())?;
+    let archive_root = inventory
+        .root_dir()
+        .join(narou_rs::downloader::ARCHIVE_ROOT_DIR);
+    let store = narou_rs::native::object_store::NativeStore::for_narou_root(inventory.root_dir())
+        .map_err(|e| e.to_string())?;
+    let _files = store
+        .materialize_novel_files(archive_path)
+        .map_err(|e| e.to_string())?;
+    let _illustrations = narou_rs::native::illustrations::materialize_blocking(archive_path)
+        .map_err(|e| e.to_string())?;
+    let count =
+        illustration_store::rebuild_illustration_cache(archive_path).map_err(|e| e.to_string())?;
+    let cache = illustration_store::cache_path(archive_path);
+    let body = match std::fs::read(&cache) {
+        Ok(body) => body,
+        // エントリ 0 件では flush がファイルを書かない (空の索引を表す)。
+        Err(_) => illustration_index_empty_yaml(),
+    };
+    let Some(prefix) =
+        narou_rs::native::object_store::novel_object_prefix(&archive_root, archive_path)
+    else {
+        return Err("索引の保存先を解決できません".to_string());
+    };
+    let key = prefix.join(".illustration_cache.yaml").map_err(|e| e.to_string())?;
+    let stores = native_stores()?;
+    futures::executor::block_on(narou_rs::platform::ObjectStore::write_small(
+        stores.objects.as_ref(),
+        &key,
+        body,
+    ))
+    .map_err(|e| e.to_string())?;
+    let narou_dir = inventory.root_dir().join(".narou");
+    if narou_rs::native::sqlite::state::active_for(&narou_dir).is_some()
+        && !narou_rs::native::sqlite::state::mirror_files_enabled()
+    {
+        // mirror-files=false では索引はストアにだけ置く。
+        let _ = std::fs::remove_file(&cache);
+    }
+    println!("  cache 再構築完了: {} エントリ (ストア保存)", count);
+    Ok(())
+}
+
+/// 空の索引 YAML (`IllustrationIndex::to_cache_yaml` と同じ形式)。
+fn illustration_index_empty_yaml() -> Vec<u8> {
+    narou_rs::illustration_store::IllustrationIndex::default()
+        .to_cache_yaml()
+        .unwrap_or_else(|_| b"version: 2\n".to_vec())
 }
 
 #[cfg(test)]

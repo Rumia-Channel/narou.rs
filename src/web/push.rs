@@ -26,8 +26,10 @@ use crate::application::push_events;
 use super::AppState;
 
 const MAX_WS_CLIENTS: usize = 64;
-const MAX_WS_HISTORY_LINES: usize = 1000;
-const MAX_WS_HISTORY_BYTES: usize = 1024 * 1024;
+/// `/api/history` が返す件数・バイト数の上限は `capabilities` の宣言と共有する
+/// (UI が「実際に取得できる量」と食い違わないようにする唯一の定義)。
+const MAX_WS_HISTORY_LINES: usize = crate::application::webui::capabilities::NATIVE_CONSOLE_HISTORY_CAPACITY;
+const MAX_WS_HISTORY_BYTES: usize = crate::application::webui::capabilities::NATIVE_CONSOLE_HISTORY_MAX_BYTES;
 const MAX_WS_FRAME_SIZE: usize = 64 * 1024;
 const MAX_WS_MESSAGE_SIZE: usize = 256 * 1024;
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);

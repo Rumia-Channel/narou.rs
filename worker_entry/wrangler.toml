@@ -75,7 +75,8 @@ name = "RATE_LIMITER"
 class_name = "SiteRateLimiter"
 
 # Web UI のコンソール/進捗イベントを WebSocket 接続へ配信する hub。
-# メモリ上の履歴リングバッファのみ (ストレージは使わない)。
+# 直近の replayable イベントは DO storage に永続化する (上限付き、
+# hibernation 明けも再接続リプレイが戻る)。
 [[durable_objects.bindings]]
 name = "PUSH_HUB"
 class_name = "PushHub"

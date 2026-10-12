@@ -14,10 +14,10 @@
 //! - `GET /api/notepad/read` / `POST /api/notepad/save` —
 //!   `app_state('inv','notepad')` の生テキスト (native `StateDb::set_raw` と同じく
 //!   `value_yaml` に格納)。`object_id` は本文の SHA-256 hex で競合検知に使う。
-//! - `GET /api/history` / `POST /api/clear_history` — Worker には PushServer の
-//!   コンソール履歴バッファが無い (websocket.rs 参照)。保持する履歴が無いので
-//!   `history` は空を返し、`clear_history` はクリア対象が無い = native の
-//!   クリア済み状態と同じ成功応答になる。
+//! - `GET /api/history` / `POST /api/clear_history` — PushHub DO
+//!   (`push_hub.rs`) が永続化するコンソール履歴を読む / 消す。native
+//!   `console_history` / `clear_history` と同じ受理形 (`stream` 既定
+//!   `stdout`、`format=json`) で、DO が読めないときは空履歴に潰さず 502。
 //! - `GET`/`POST /api/taginfo.json` — タグ情報配列。native は POST のみだが、
 //!   ルート表で GET に割り当てられているため GET (クエリ `ids` 指定) も受理する。
 //! - `GET /api/version/current.json` / `GET /api/version/latest.json` —
@@ -160,10 +160,13 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         }
     };
 
-    // バージョン系はリポジトリに触れないので runtime 組み立てをスキップする。
+    // バージョン系と履歴系はリポジトリ/D1 サービスに触れないので runtime
+    // 組み立てをスキップする (履歴は PushHub DO だけを読む)。
     match route {
         Route::VersionCurrent => return version_current(),
         Route::VersionLatest => return version_latest().await,
+        Route::History => return console_history(&req, &env).await,
+        Route::ClearHistory => return clear_history(&env).await,
         _ => {}
     }
 
@@ -183,10 +186,9 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
         Route::Inspect => inspect(&mut req, &runtime).await,
         Route::NotepadRead => notepad_read(&env).await,
         Route::NotepadSave => notepad_save(&mut req, &env).await,
-        Route::History => console_history(&req),
-        Route::ClearHistory => clear_history(),
         Route::TagInfoGet => taginfo_get(&req, &runtime).await,
         Route::TagInfoPost => taginfo_post(&mut req, &runtime).await,
+        Route::History | Route::ClearHistory => unreachable!(),
         Route::VersionCurrent | Route::VersionLatest => unreachable!(),
     }
 }
@@ -199,6 +201,7 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
 fn map_application_error(error: ApplicationError) -> worker::Result<Response> {
     let (status, code, message) = match error {
         ApplicationError::InvalidRequest(message) => (400, "bad_request", message),
+        ApplicationError::Conflict(message) => (409, "conflict", message),
         ApplicationError::NotFound(message) => (404, "not_found", message),
         ApplicationError::Platform(message) => (500, "internal_error", message),
     };
@@ -881,24 +884,51 @@ async fn notepad_save(req: &mut Request, env: &Env) -> worker::Result<Response> 
 // (native: src/web/misc.rs:429 console_history / :444 clear_history)
 // ---------------------------------------------------------------------------
 
-/// Worker には `PushServer` のコンソール履歴が無い (`websocket.rs` は接続を
-/// 受理するだけで履歴を保持しない)。`stream`/`format` パラメータは受理し、
-/// native の履歴ゼロ状態と同じ形を返す。
-fn console_history(req: &Request) -> worker::Result<Response> {
+/// PushHub DO の履歴を native `console_history` と同じ形で返す。
+///
+/// `stream` (既定 `stdout`) と `format=json` は native と同じ解釈。Worker の
+/// 履歴は DO (`push_hub.rs`) が永続化しており、上限 (`HISTORY_CAPACITY` /
+/// `HISTORY_MAX_BYTES`) を超えた分は古い方から落ちる — 能力の上限は
+/// `/api/webui/config` の `capabilities.console_history` が伝える。
+/// DO が読めないときは空履歴に潰さず 502 を返す。
+async fn console_history(req: &Request, env: &Env) -> worker::Result<Response> {
     let url = req.url()?;
+    let stream = query_param(&url, "stream").unwrap_or_else(|| "stdout".to_string());
+    let history = match crate::push_hub::history_text(env, &stream).await {
+        Ok(history) => history,
+        Err(error) => {
+            console_log!("push hub history failed: {error}");
+            return json_error(
+                502,
+                "push_hub_unavailable",
+                Some("履歴を取得できませんでした"),
+            );
+        }
+    };
     if query_param(&url, "format").as_deref() == Some("json") {
-        return Response::from_json(&json!({ "history": "" }));
+        return Response::from_json(&json!({ "history": history }));
     }
-    Response::ok("").and_then(|response| {
+    Response::ok(history).and_then(|response| {
         let headers = Headers::new();
         headers.set("Content-Type", "text/plain; charset=utf-8")?;
         Ok(response.with_headers(headers))
     })
 }
 
-/// Worker の履歴は常に空なので、native のクリア後と同じ成功応答になる。
-fn clear_history() -> worker::Result<Response> {
-    api_json_response(true, "History cleared")
+/// PushHub DO の履歴 (永続チャンク + 再生バッファ) を実際に消す。
+/// native と同じ成功応答を返し、消去に失敗したときは成功を偽らない。
+async fn clear_history(env: &Env) -> worker::Result<Response> {
+    match crate::push_hub::clear_remote_history(env).await {
+        Ok(()) => api_json_response(true, "History cleared"),
+        Err(error) => {
+            console_log!("push hub clear failed: {error}");
+            json_error(
+                502,
+                "push_hub_unavailable",
+                Some("履歴を消去できませんでした"),
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

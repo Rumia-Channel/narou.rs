@@ -45,7 +45,7 @@ headers:
   Referer: \k<top_url>/
 confirm_over18: no
 append_title_to_folder_name: yes
-version: 1.1
+version: 1.2
 
 # ------------------------------------------------------------
 # 前処理設定 (DSL — pest parser で実行)
@@ -289,8 +289,14 @@ preprocess: |-
             end
           else
             # 本文が無い小説ページ = ログインが要る作品 (R-18 / ログイン限定)。
-            # この目印に一致したら narou 側が保存済み Cookie で 1 回だけ再試行する。
-            emit "login_required::1"
+            # この目印に一致したら narou 側が保存済み Cookie で再試行する。
+            # 作者一覧 (/ajax/user/{id}/profile/all) の応答は作品ページではない
+            # ので出さない: 空の作者や作品を持たない作者が「ログインが必要」に
+            # 化けないようにする (一覧はこの目印が無ければ読めたことになる)。
+            let author_listing = body.novels != null || body.novelSeries != null || body.mangaSeries != null || body.illusts != null || body.manga != null
+            if !author_listing
+              emit "login_required::1"
+            end
           end
         end
       end

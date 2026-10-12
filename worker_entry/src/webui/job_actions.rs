@@ -36,7 +36,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use narou_rs::application::webui::{
-    MAX_WEB_TAGS_PER_REQUEST, normalize_web_device_override, sort_display_label,
+    MAX_WEB_TAGS_PER_REQUEST, CurrentSortState, normalize_web_device_override, sort_display_label,
     sort_ids_from_records, sort_records, targets_to_strings, validate_web_tag_name,
     validate_web_target_value,
 };
@@ -46,7 +46,7 @@ use narou_rs::application::{JobKind, JobPlan, JobTarget};
 use narou_rs::db::NovelRecord;
 use narou_rs::downloader::site_setting::SiteSetting;
 use narou_rs::downloader::{Downloader, TargetType};
-use narou_rs::platform::NovelId;
+use narou_rs::platform::{NovelFilter, NovelId};
 use serde::Deserialize;
 use serde_json::json;
 use worker::{Env, Method, Request, Response, console_log};
@@ -211,8 +211,10 @@ fn not_supported_on_worker(message: &str) -> worker::Result<Response> {
 
 /// native `sort_numeric_targets_for_state`: 全ターゲットが数値のときだけ
 /// サーバーソート順に並べ替える (1 つでも非数値があれば入力順のまま)。
-async fn sort_numeric_targets_for_state(
-    runtime: &WorkerRuntime,
+/// ソート状態はリクエストごとに 1 回だけ読み、並べ替えと案内文
+/// (更新開始メッセージ) の両方へ渡す。
+fn sort_numeric_targets_for_state(
+    sort_state: &CurrentSortState,
     records: &[NovelRecord],
     targets: &[String],
 ) -> Vec<String> {
@@ -223,9 +225,7 @@ async fn sort_numeric_targets_for_state(
     else {
         return targets.to_vec();
     };
-    // キュー投入計画 (update/convert 対象の並び) の材料なので更新系で読む。
-    let sort_state = load_current_sort_state_for_writes(runtime).await;
-    sort_ids_from_records(&ids, records, &sort_state)
+    sort_ids_from_records(&ids, records, sort_state)
         .into_iter()
         .map(|id| id.to_string())
         .collect()
@@ -233,15 +233,21 @@ async fn sort_numeric_targets_for_state(
 
 /// native `sorted_update_all_ids`: 更新対象を全件スキャンし、サーバーソート順の
 /// id 列にする (native は文字列にするが、Worker では plan 化まで id のまま)。
-async fn sorted_update_all_ids(runtime: &WorkerRuntime) -> Vec<i64> {
-    let sort_state = load_current_sort_state_for_writes(runtime).await;
+///
+/// ソート状態は `current_sort` の任意列なので、レコード全件の該当フィールドが
+/// 要る (ID 投影では並べ替えられない)。読み取りは 1 回で、対象 id を確定する
+/// ためのもの。
+async fn sorted_update_all_ids(
+    runtime: &WorkerRuntime,
+    sort_state: &CurrentSortState,
+) -> Vec<i64> {
     let mut records = runtime
         .write_services()
         .library
         .records()
         .await
         .unwrap_or_default();
-    sort_records(&mut records, &sort_state);
+    sort_records(&mut records, sort_state);
     records.into_iter().map(|record| record.id).collect()
 }
 
@@ -318,40 +324,90 @@ async fn resolve_convert_target_to_id(
     }
 }
 
+/// タグ完全一致 (`novel_tags.tag = ?`) の id 列 (native `tag_ids` 相当)。
+/// 全レコードの復号ではなく ID 投影の 1 クエリで読む。
+async fn tag_ids_for(
+    library: &narou_rs::application::LibraryService,
+    tag_name: &str,
+) -> Vec<i64> {
+    let filter = NovelFilter {
+        tag: Some(tag_name.to_string()),
+        ..NovelFilter::default()
+    };
+    ids_from_filter(library, &filter).await
+}
+
+/// 全件の id 列 (id 昇順)。`^tag:` の除外にだけ使う。
+async fn all_novel_ids(library: &narou_rs::application::LibraryService) -> Vec<i64> {
+    ids_from_filter(library, &NovelFilter::all()).await
+}
+
+async fn ids_from_filter(
+    library: &narou_rs::application::LibraryService,
+    filter: &NovelFilter,
+) -> Vec<i64> {
+    library
+        .all_ids(filter)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| id.0)
+        .collect()
+}
+
 /// `commands/update.rs::expand_tag_targets` の写し。
 ///
 /// `tag:` / `^tag:` / 裸のタグ名を、そのタグを持つ既存レコードの id に展開し
 /// 重複を除く。タグに該当が無いときは native 同様、プレフィックスを剥がした
 /// 名前だけを残す (後段の id 解決で落とされる)。数値 id は存在確認済みの
 /// ものだけ残る。
-fn expand_tag_targets(records: &[NovelRecord], targets: &[String]) -> Vec<String> {
-    // `scan_ids` (ORDER BY id ASC) 相当: records() は id 昇順で返るので
-    // 全件スキャン順とタグ絞り順が native と一致する。
-    let all_ids: Vec<i64> = records.iter().map(|record| record.id).collect();
-    let existing: HashSet<i64> = all_ids.iter().copied().collect();
-    let tag_ids = |tag_name: &str| -> Vec<i64> {
-        records
-            .iter()
-            .filter(|record| record.tags.iter().any(|tag| tag == tag_name))
-            .map(|record| record.id)
-            .collect()
-    };
-
+///
+/// native `commands::update` と同じく ID 投影 (`NovelRepository::scan_ids` の
+/// タグ完全一致フィルタ) で判定する — 全レコードを読む必要はない。
+/// `existing_numeric` は呼び出し側が数値ターゲット分について 1 クエリで
+/// 確定した既存 id 集合 (並べ替えにも使った `records_by_ids` の結果)。
+/// `all_ids` は `^tag:` の除外にだけ要るので遅延して 1 回だけ読む。
+async fn expand_tag_targets(
+    runtime: &WorkerRuntime,
+    targets: &[String],
+    existing_numeric: &HashSet<i64>,
+) -> Vec<String> {
+    let library = &*runtime.write_services().library;
+    let mut tag_cache: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut all_ids: Option<Vec<i64>> = None;
     let mut expanded = Vec::new();
     for target in targets {
         if let Ok(id) = target.parse::<i64>()
-            && existing.contains(&id)
+            && existing_numeric.contains(&id)
         {
             expanded.push(id.to_string());
             continue;
         }
 
         if let Some(tag_name) = target.strip_prefix("^tag:") {
-            let exclude: HashSet<i64> = tag_ids(tag_name).into_iter().collect();
+            let exclude: HashSet<i64> = {
+                match tag_cache.get(tag_name) {
+                    Some(ids) => ids.clone(),
+                    None => {
+                        let ids = tag_ids_for(library, tag_name).await;
+                        tag_cache.insert(tag_name.to_string(), ids.clone());
+                        ids
+                    }
+                }
+            }
+            .into_iter()
+            .collect();
             if !exclude.is_empty() {
+                let all = match &all_ids {
+                    Some(ids) => ids.clone(),
+                    None => {
+                        let ids = all_novel_ids(library).await;
+                        all_ids = Some(ids.clone());
+                        ids
+                    }
+                };
                 expanded.extend(
-                    all_ids
-                        .iter()
+                    all.iter()
                         .filter(|id| !exclude.contains(id))
                         .map(|id| id.to_string()),
                 );
@@ -359,14 +415,28 @@ fn expand_tag_targets(records: &[NovelRecord], targets: &[String]) -> Vec<String
                 expanded.push(tag_name.to_string());
             }
         } else if let Some(tag_name) = target.strip_prefix("tag:") {
-            let ids = tag_ids(tag_name);
+            let ids = match tag_cache.get(tag_name) {
+                Some(ids) => ids.clone(),
+                None => {
+                    let ids = tag_ids_for(library, tag_name).await;
+                    tag_cache.insert(tag_name.to_string(), ids.clone());
+                    ids
+                }
+            };
             if !ids.is_empty() {
                 expanded.extend(ids.iter().map(|id| id.to_string()));
             } else {
                 expanded.push(tag_name.to_string());
             }
         } else {
-            let ids = tag_ids(target);
+            let ids = match tag_cache.get(target) {
+                Some(ids) => ids.clone(),
+                None => {
+                    let ids = tag_ids_for(library, target).await;
+                    tag_cache.insert(target.clone(), ids.clone());
+                    ids
+                }
+            };
             if !ids.is_empty() {
                 expanded.extend(ids.iter().map(|id| id.to_string()));
             } else {
@@ -433,6 +503,24 @@ async fn resolve_update_target_to_id(
     }
 }
 
+/// 別名が無く、存在が確定している数値ターゲットの id。
+///
+/// `resolve_update_target_to_id` / `resolve_convert_target_to_id` の数値分岐は
+/// 「別名解決 → `library.get` → 存在すれば Some(id)」なので、その存在が
+/// 事前の 1 クエリ (`records_by_ids`) で分かっている場合は `get` を省ける。
+/// 別名があるときは native 同様エイリアス先を解決するため `None` を返し、
+/// 通常の解決に落とす。
+fn numeric_target_id(
+    aliases: &HashMap<String, String>,
+    existing: &HashSet<i64>,
+    target: &str,
+) -> Option<i64> {
+    if aliases.contains_key(target) {
+        return None;
+    }
+    target.parse::<i64>().ok().filter(|id| existing.contains(id))
+}
+
 // ---------------------------------------------------------------------------
 // POST /api/update — native `api_update`
 // ---------------------------------------------------------------------------
@@ -448,7 +536,12 @@ async fn api_update(
     };
 
     let raw_targets = targets_to_strings(&body.targets);
-    let max_targets = super::max_web_targets(runtime).await;
+    // 件数上限とソート状態はどちらも毎回必要な独立した設定なので同時に読む
+    // (1 リクエストの設定読み取りを 1 往復分にまとめる)。
+    let (max_targets, sort_state) = futures::join!(
+        super::max_web_targets(runtime),
+        load_current_sort_state_for_writes(runtime),
+    );
     let targets = match normalize_update_targets(&raw_targets, max_targets) {
         Ok(targets) => targets,
         Err(message) => return update_failure(&message),
@@ -473,24 +566,60 @@ async fn api_update(
     //     ここで黙って落とすと UI から「積んだのに動かない」原因が分からなく
     //     なるので、落とした対象を `unresolved` に残し応答の `results` で
     //     報告する (キューに積める対象の扱いは native と同じ)。
+    // ソート状態は冒頭の join で読み済み (並べ替えと開始案内で共用)。
     let mut unresolved: Vec<String> = Vec::new();
     let ids: Vec<i64> = if is_update_all {
-        sorted_update_all_ids(runtime).await
+        sorted_update_all_ids(runtime, &sort_state).await
     } else {
-        let records = runtime
-            .services
-            .library
-            .records()
-            .await
-            .unwrap_or_default();
-        let sorted = sort_numeric_targets_for_state(runtime, &records, &targets).await;
-        let expanded = expand_tag_targets(&records, &sorted);
-        let aliases = super::download::load_aliases(env).await;
-        let site_settings = site_settings(runtime).await;
+        // 数値ターゲットの存在確認と並べ替えに要るのは選択分のレコードだけ。
+        // 非数値が混ざっていても数値ターゲットの存在確認には同じ 1 クエリを
+        // 使う。別名表の読み込みとは同時に走らせる。
+        let numeric_ids: Vec<i64> = targets
+            .iter()
+            .filter_map(|target| target.parse::<i64>().ok())
+            .collect();
+        let (aliases, records) = futures::join!(
+            super::download::load_aliases(env),
+            async {
+                if numeric_ids.is_empty() {
+                    Vec::new()
+                } else {
+                    runtime
+                        .write_services()
+                        .library
+                        .records_by_ids(&numeric_ids)
+                        .await
+                        .unwrap_or_default()
+                }
+            },
+        );
+        let existing_numeric: HashSet<i64> =
+            records.iter().map(|record| record.id).collect();
+        let sorted = sort_numeric_targets_for_state(&sort_state, &records, &targets);
+        let expanded = expand_tag_targets(runtime, &sorted, &existing_numeric).await;
+        // サイト定義 (オブジェクトストア LIST) は URL 解決でしか要らない:
+        // 別名解決後の分類に URL が 1 つも無ければ読まない。分類は解決側と
+        // 同じ `alias_to_target_for_update` を通す。
+        let needs_sites = expanded.iter().any(|target| {
+            matches!(Downloader::get_target_type(&alias_to_target_for_update(&aliases, target)), TargetType::Url)
+        });
+        let site_settings = if needs_sites {
+            site_settings(runtime).await
+        } else {
+            Vec::new()
+        };
         let mut resolved = Vec::new();
         let mut seen = HashSet::new();
         for target in &expanded {
-            match resolve_update_target_to_id(runtime, &aliases, &site_settings, target).await {
+            // 別名が無く、存在が確定している数値 id は解決クエリを省く
+            // (`resolve_update_target_to_id` の数値分岐と同じ結果)。
+            let resolved_id = match numeric_target_id(&aliases, &existing_numeric, target) {
+                Some(id) => Some(id),
+                None => {
+                    resolve_update_target_to_id(runtime, &aliases, &site_settings, target).await
+                }
+            };
+            match resolved_id {
                 Some(id) => {
                     // 同一 id への重複解決は native 同様 1 ジョブに束ねる
                     // (落とさない・未解決でもない)。
@@ -540,18 +669,23 @@ async fn api_update(
     // (d) `push_update_job_if_needed` parity: native は結合 target 文字列の
     //     完全一致で重複を弾く。Worker の ledger dedupe は kind+target+
     //     options 単位なので、同一リクエスト内の重複 id と既キューイング済み
-    let mut job_ids = Vec::with_capacity(ids.len());
-    let mut queued_any = false;
-    for id in &ids {
-        let plan = JobPlan {
+    //     分は同じ job_id に畳まれる。投入は 1 回の bounded batch で行い、
+    //     対象ごとの lookup→insert→get 往復を無くす (順序は ids のまま)。
+    let plans: Vec<JobPlan> = ids
+        .iter()
+        .map(|id| JobPlan {
             kind: JobKind::Update,
             target: JobTarget::Id(NovelId(*id)),
             options: options.clone(),
-        };
-        let outcome = match runtime.enqueue_plan(plan).await {
-            Ok(outcome) => outcome,
-            Err(error) => return update_failure(&error.to_string()),
-        };
+        })
+        .collect();
+    let outcomes = match runtime.enqueue_batch(&plans).await {
+        Ok(outcomes) => outcomes,
+        Err(error) => return update_failure(&error.to_string()),
+    };
+    let mut job_ids = Vec::with_capacity(ids.len());
+    let mut queued_any = false;
+    for outcome in &outcomes {
         if let Some(reason) = &outcome.blocked {
             // Update+Id は常に executable なので到達しないはず。万が一のときは
             // native の push 失敗と同じ失敗形で返す。
@@ -560,7 +694,7 @@ async fn api_update(
         if outcome.sent {
             queued_any = true;
         }
-        job_ids.push(outcome.job_id);
+        job_ids.push(outcome.job_id.clone());
     }
 
     // native は更新開始案内 ("全ての小説の更新を開始します…" / "更新を開始
@@ -571,7 +705,6 @@ async fn api_update(
         // native `api_update` は `queued` のときだけ `notification.queue` を
         // 送る (既キューイング済みで重複が弾かれたときは送らない)。
         notify_queue_changed(env, runtime).await;
-        let sort_state = load_current_sort_state_for_writes(runtime).await;
         let message = job_msgs::update_started(
             is_update_all,
             count,
@@ -676,13 +809,37 @@ async fn api_convert(
         Ok(device) => device,
         Err(message) => return convert_failure(&message),
     };
-    let records = runtime
-        .services
-        .library
-        .records()
-        .await
-        .unwrap_or_default();
-    let ordered_targets = sort_numeric_targets_for_state(runtime, &records, &targets).await;
+    if let Some(device) = device.as_deref()
+        && !narou_rs::application::webui::capabilities::worker_convert_device_supported(device)
+    {
+        return convert_failure(&format!("Cloudflare Workers 版では {device} 形式を出力できません。EPUB を指定してください"));
+    }
+    // ソート状態は 1 リクエスト 1 回だけ読む。
+    let sort_state = load_current_sort_state_for_writes(runtime).await;
+    // 並べ替えがレコードを使うのは全ターゲットが数値のときだけ
+    // (`sort_numeric_targets_for_state`)。存在確認用にも同じ 1 クエリを使い、
+    // 別名表の読み込みとは同時に走らせる。
+    let numeric_ids: Vec<i64> = targets
+        .iter()
+        .filter_map(|target| target.parse::<i64>().ok())
+        .collect();
+    let (aliases, records) = futures::join!(
+        super::download::load_aliases(env),
+        async {
+            if numeric_ids.is_empty() {
+                Vec::new()
+            } else {
+                runtime
+                    .write_services()
+                    .library
+                    .records_by_ids(&numeric_ids)
+                    .await
+                    .unwrap_or_default()
+            }
+        },
+    );
+    let existing_numeric: HashSet<i64> = records.iter().map(|record| record.id).collect();
+    let ordered_targets = sort_numeric_targets_for_state(&sort_state, &records, &targets);
 
     // native の convert ジョブは複合 target 1 つを子プロセスへ渡し、
     // `narou convert` が `resolve_target_to_id` で id に落として処理する。
@@ -696,24 +853,36 @@ async fn api_convert(
     //   UI から見て「変換が走らない」原因が分からなくなる。
     // - 数値でないターゲットは `JobTarget` で表せないためキューに積めず、
     //   `status: "unresolved"` として results に残す (落とさない)。
-    let aliases = super::download::load_aliases(env).await;
-    let site_settings = site_settings(runtime).await;
+    // サイト定義 (オブジェクトストア LIST) は URL 解決でしか要らない:
+    // 別名解決後の分類に URL が 1 つも無ければ読まない。
+    let needs_sites = ordered_targets.iter().any(|target| {
+        matches!(Downloader::get_target_type(&resolve_alias_target(&aliases, target)), TargetType::Url)
+    });
+    let site_settings = if needs_sites {
+        site_settings(runtime).await
+    } else {
+        Vec::new()
+    };
 
-    // `NAROU_RS_WEB_DEVICE` (native meta `device`) は現在の Worker convert
-    // (`convert.rs::execute_convert` → `ConvertService::convert_and_store`)
-    // では使われない。device 固有の出力量を偽らないため plan.options には
-    // 載せず、応答の `device` フィールドだけ native と同じく echo する。
+    // Worker の出力は組み込み EPUB のみ。対応形式は上で検証済みなので、
+    // 外部ツール用 device オプションをジョブへ積む必要はない。
     // ターゲットごとに (表示用文字列, 解決した id) を保持する。同一 id に
     // 解決したターゲットが複数あっても native 同様に行は出す (enqueue の
     // dedupe が同一 job_id を返す)。
     let mut resolved: Vec<(String, Option<i64>)> = Vec::with_capacity(ordered_targets.len());
     for target in &ordered_targets {
-        let id = match resolve_convert_target_to_id(runtime, &aliases, &site_settings, target).await
-        {
+        // 別名が無く、存在が確定している数値 id は解決クエリを省く。
+        // 存在しない数値 id は resolve が None を返し、下の parse フォール
+        // バックで同じ id になる (native がミスを実行時に報告するのと同じ)。
+        let id = match numeric_target_id(&aliases, &existing_numeric, target) {
             Some(id) => Some(id),
-            // 数値 id は解決を通さずそのままキューへ (native がミスを実行時に
-            // 報告するのと同じ)。
-            None => target.parse::<i64>().ok(),
+            None => {
+                match resolve_convert_target_to_id(runtime, &aliases, &site_settings, target).await
+                {
+                    Some(id) => Some(id),
+                    None => target.parse::<i64>().ok(),
+                }
+            }
         };
         resolved.push((target.clone(), id));
     }
@@ -728,26 +897,37 @@ async fn api_convert(
         }
     }
 
+    // 解決できた行だけを 1 回の bounded batch で投入する (対象ごとの
+    // lookup→insert→get 往復を無くす)。results は unresolved 行を挟んだ
+    // 行順のまま組み立てる。
+    let mut plans = Vec::with_capacity(resolved.len());
+    for (_, id) in &resolved {
+        if let Some(id) = id {
+            plans.push(JobPlan {
+                kind: JobKind::Convert,
+                target: JobTarget::Id(NovelId(*id)),
+                options: Vec::new(),
+            });
+        }
+    }
+    let outcomes = match runtime.enqueue_batch(&plans).await {
+        Ok(outcomes) => outcomes,
+        Err(error) => return convert_failure(&error.to_string()),
+    };
+    let mut outcomes = outcomes.into_iter();
     let mut results = Vec::with_capacity(resolved.len());
     let mut queued_any = false;
     for (target, id) in &resolved {
-        let Some(id) = id else {
+        if id.is_none() {
             results.push(json!({
                 "target": target,
                 "device": device.as_deref(),
                 "status": "unresolved",
             }));
             continue;
-        };
-
-        let plan = JobPlan {
-            kind: JobKind::Convert,
-            target: JobTarget::Id(NovelId(*id)),
-            options: Vec::new(),
-        };
-        let outcome = match runtime.enqueue_plan(plan).await {
-            Ok(outcome) => outcome,
-            Err(error) => return convert_failure(&error.to_string()),
+        }
+        let Some(outcome) = outcomes.next() else {
+            return convert_failure("internal enqueue mismatch");
         };
         if let Some(reason) = &outcome.blocked {
             return convert_failure(reason);
@@ -829,15 +1009,14 @@ async fn api_update_by_tag(
     // 同じ経路 (snapshot_ids の列) で流す。native が meta に積む
     // `tag_params`/`snapshot_ids`/`sort_by` は Worker の ledger に入らない
     // (投入時点で id 展開済みなので実行には不要)。
-    let server_sort_state = load_current_sort_state_for_writes(runtime).await;
-    // タグ条件のマッチングがこの後のキュー投入を形作るので、スナップ
-    // ショットの材料は更新系サービス (primary + キャッシュ無し) で読む。
-    let records = runtime
-        .write_services()
-        .library
-        .records()
-        .await
-        .unwrap_or_default();
+    //
+    // タグ条件のマッチングには全レコードのタグが要る (ID 投影では判定
+    // できない) が、ソート状態の読み取りとは同時に走らせる。
+    let (server_sort_state, records) = futures::join!(
+        load_current_sort_state_for_writes(runtime),
+        runtime.write_services().library.records(),
+    );
+    let records = records.unwrap_or_default();
     let snapshot_ids: Vec<i64> = {
         let mut matching = records
             .into_iter()
@@ -866,24 +1045,28 @@ async fn api_update_by_tag(
 
     // native はスナップショット済み id 列を 1 ジョブに積む (`tag:` 引数自体は
     // worker 側の `update_by_tag_update_args` で snapshot_ids に置き換わる)。
-    // Worker では id ごとの discrete plan として積む。
-    let mut queued_any = false;
-    for id in &snapshot_ids {
-        let plan = JobPlan {
+    // Worker では id ごとの discrete plan を 1 回の bounded batch で積む
+    // (対象ごとの lookup→insert→get 往復を無くす。順序は snapshot_ids のまま)。
+    let plans: Vec<JobPlan> = snapshot_ids
+        .iter()
+        .map(|id| JobPlan {
             kind: JobKind::Update,
             target: JobTarget::Id(NovelId(*id)),
             options: Vec::new(),
-        };
-        let outcome = match runtime.enqueue_plan(plan).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return Response::from_json(&json!({
-                    "success": false,
-                    "message": error.to_string(),
-                    "count": 0,
-                }));
-            }
-        };
+        })
+        .collect();
+    let outcomes = match runtime.enqueue_batch(&plans).await {
+        Ok(outcomes) => outcomes,
+        Err(error) => {
+            return Response::from_json(&json!({
+                "success": false,
+                "message": error.to_string(),
+                "count": 0,
+            }));
+        }
+    };
+    let mut queued_any = false;
+    for outcome in &outcomes {
         if let Some(reason) = &outcome.blocked {
             return Response::from_json(&json!({
                 "success": false,

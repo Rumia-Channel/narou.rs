@@ -9,6 +9,7 @@
   let settingsData = null;
   let activeTab = null;
   let saveInFlight = false;
+  let baselineFormData = {};
 
   // ─── Init ──────────────────────────────────────────────
   document.addEventListener('DOMContentLoaded', init);
@@ -107,13 +108,13 @@
       '<div class="list-group-item">' +
       '<h4 class="list-group-item-heading">データ管理方式</h4>' +
       '<div class="list-group-item-text">' +
-      '<div class="setting-help">作品データを従来の YAML ファイルで管理するか、SQLite データベースで管理するかを選びます。' +
+      '<div class="setting-help" id="storage-mode-description">作品データを従来の YAML ファイルで管理するか、SQLite データベースで管理するかを選びます。' +
       'SQLite へ移行すると旧 YAML は <code>*.imported-*</code> へ退避され、戻すときは YAML を書き出してから切り替えます。' +
       'どちらの方式でも作品データはそのまま使えます。</div>' +
       '<div id="storage-mode-status"><em>読み込み中…</em></div>' +
       '<div class="storage-mode-actions">' +
-      '<button type="button" class="btn btn-primary" id="storage-mode-to-sqlite">SQLite 管理へ移行</button>' +
-      '<button type="button" class="btn btn-default" id="storage-mode-to-yaml">YAML 管理へ戻す</button>' +
+      '<button type="button" class="btn btn-primary hide" id="storage-mode-to-sqlite" disabled>SQLite 管理へ移行</button>' +
+      '<button type="button" class="btn btn-default hide" id="storage-mode-to-yaml" disabled>YAML 管理へ戻す</button>' +
       '</div>' +
       '</div></div></div>';
   }
@@ -124,6 +125,9 @@
     const status = document.getElementById('storage-mode-status');
     const toSqlite = document.getElementById('storage-mode-to-sqlite');
     const toYaml = document.getElementById('storage-mode-to-yaml');
+    [toSqlite, toYaml].forEach(function(button) {
+      if (button) { button.disabled = true; button.classList.add('hide'); }
+    });
     const bind = function(button, mode) {
       if (!button || button.dataset.bound === '1') return;
       button.dataset.bound = '1';
@@ -132,16 +136,25 @@
     try {
       const resp = await fetch('/api/storage/mode');
       const data = await resp.json();
+      if (!resp.ok || data.error || data.success === false || !['sqlite', 'yaml'].includes(data.mode)) {
+        throw new Error(data.error?.message || data.message || '保存方式を取得できません');
+      }
       const sqlite = data.mode === 'sqlite';
       const locked = Boolean(data.locked_by_env);
       let html = '<p class="storage-mode-current">現在: <strong>' +
-        (sqlite ? 'SQLite 管理' : 'YAML 管理') + '</strong>' +
+        (data.metadata_backend === 'd1' ? 'D1 管理' : sqlite ? 'SQLite 管理' : 'YAML 管理') + '</strong>' +
         (locked ? '（' + escapeHtml(data.reason || 'この環境では固定されています') + '）' : '') + '</p>';
       if (data.marker) {
         html += '<p class="setting-help storage-mode-paths">切替ファイル: <code>' + escapeHtml(data.marker) + '</code>' +
           (data.database ? ' / データベース: <code>' + escapeHtml(data.database) + '</code>' : '') + '</p>';
       }
       status.innerHTML = html;
+      if (data.metadata_backend === 'd1') {
+        document.getElementById('storage-mode-description').textContent =
+          'この環境では管理情報と本文を D1 に保存します。YAML / SQLite の切り替えはできません。挿絵の保存先は Worker の配備設定で指定します。';
+      }
+      if (toSqlite) toSqlite.disabled = locked;
+      if (toYaml) toYaml.disabled = locked;
       if (toSqlite) toSqlite.classList.toggle('hide', sqlite || locked);
       if (toYaml) toYaml.classList.toggle('hide', !sqlite || locked);
       bind(toSqlite, 'sqlite');
@@ -163,13 +176,24 @@
         body: JSON.stringify({ mode: mode }),
       });
       const result = await resp.json();
-      if (!result.success) throw new Error(result.message || '切り替えに失敗しました');
+      if (!resp.ok || result.success !== true) throw new Error(result.error?.message || result.message || '切り替えに失敗しました');
       showToast(result.message || '切り替えました', 'success');
-      setTimeout(function() { window.location.reload(); }, 1200);
+      if (result.reboot) {
+        navigateAfterReboot();
+      } else {
+        await loadStorageMode();
+      }
     } catch (e) {
       showToast('切り替えに失敗しました: ' + e.message, 'error');
       if (button) button.disabled = false;
     }
+  }
+
+  function navigateAfterReboot() {
+    try {
+      sessionStorage.setItem('narou-rs-webui-reboot-return-to', location.pathname + location.search + location.hash);
+    } catch (e) {}
+    location.href = '/_rebooting';
   }
 
   function renderSettingItem(setting) {
@@ -195,6 +219,9 @@
     if (setting.worker_note) {
       html += '<p class="setting-help">⚠ ' + escapeHtml(setting.worker_note) + '</p>';
     }
+    if (setting.requires_restart) {
+      html += '<p class="setting-help">変更するとサーバーを再起動します。</p>';
+    }
 
     html += '</div></div>';
     return html;
@@ -207,10 +234,7 @@
     const dis = disabled ? ' disabled' : '';
 
     if (type === 'boolean') {
-      if (setting.three_way) {
-        return renderThreeWay(name, value, dis);
-      }
-      return renderToggle(name, value, dis);
+      return renderThreeWay(name, value, dis, setting.default_value);
     }
 
     if (type === 'select') {
@@ -221,30 +245,29 @@
       return renderMultiple(name, value, setting.select_keys || [], setting.select_summaries || [], dis);
     }
 
-    // text / integer / float / string / directory
     const placeholder = getPlaceholder(type);
     const strVal = (value !== null && value !== undefined) ? String(value) : '';
-    return '<input type="text" class="setting-input" data-name="' + escapeAttr(name) +
-           '" value="' + escapeAttr(strVal) + '" placeholder="' + escapeAttr(placeholder) + '"' + dis + '>';
+    const inputType = type === 'integer' || type === 'float' ? 'number'
+      : /(?:password|secret-access-key)$/.test(name) ? 'password' : 'text';
+    const numeric = inputType === 'number'
+      ? ' step="' + (type === 'integer' ? '1' : 'any') + '"' +
+        (typeof setting.max_value === 'number' ? ' max="' + setting.max_value + '"' : '')
+      : '';
+    return '<input type="' + inputType + '" class="setting-input" data-name="' + escapeAttr(name) +
+           '" value="' + escapeAttr(strVal) + '" placeholder="' + escapeAttr(placeholder) + '"' + numeric + dis + '>';
   }
 
-  function renderToggle(name, value, dis) {
-    const checked = value === true ? ' checked' : '';
-    return '<label class="switch-light">' +
-           '<input type="checkbox" data-name="' + escapeAttr(name) + '"' + checked + dis + '>' +
-           '<span class="switch-track"></span>' +
-           '<span class="switch-label-text">' + (value ? 'はい' : 'いいえ') + '</span>' +
-           '</label>';
-  }
 
-  function renderThreeWay(name, value, dis) {
+  function renderThreeWay(name, value, dis, defaultValue) {
     const nilChecked = (value === null || value === undefined) ? ' checked' : '';
     const offChecked = (value === false) ? ' checked' : '';
     const onChecked = (value === true) ? ' checked' : '';
+    const defaultLabel = defaultValue === true ? '未設定 (既定: はい)'
+      : defaultValue === false ? '未設定 (既定: いいえ)' : '未設定 (既定を使用)';
 
     return '<div class="switch-3way">' +
            '<input type="radio" id="' + escapeAttr(name) + '-nil" name="' + escapeAttr(name) + '" value="nil"' + nilChecked + dis + '>' +
-           '<label for="' + escapeAttr(name) + '-nil">未設定</label>' +
+           '<label for="' + escapeAttr(name) + '-nil">' + defaultLabel + '</label>' +
            '<input type="radio" id="' + escapeAttr(name) + '-off" name="' + escapeAttr(name) + '" value="off"' + offChecked + dis + '>' +
            '<label for="' + escapeAttr(name) + '-off">いいえ</label>' +
            '<input type="radio" id="' + escapeAttr(name) + '-on" name="' + escapeAttr(name) + '" value="on"' + onChecked + dis + '>' +
@@ -689,14 +712,32 @@
   // ─── Save ──────────────────────────────────────────────
   async function saveSettings() {
     if (saveInFlight) return;
-    const settings = collectFormData();
-    const body = { settings: settings };
+    const current = collectFormData();
+    const settings = {};
+    const expected = {};
+    Object.entries(current).forEach(function(entry) {
+      const name = entry[0], value = entry[1];
+      if (value !== baselineFormData[name]) {
+        settings[name] = value;
+        expected[name] = findSetting(name)?.value ?? null;
+      }
+    });
+    for (const input of document.querySelectorAll('input.setting-input[data-name]')) {
+      if (Object.hasOwn(settings, input.dataset.name) && !input.checkValidity()) {
+        input.reportValidity();
+        return;
+      }
+    }
+    const body = { settings: settings, expected_settings: expected };
     const tabToRestore = activeTab || getCurrentTabId();
-
-    // Include replace content
     const replaceEl = document.getElementById('replace-content');
-    if (replaceEl) {
+    if (replaceEl && replaceEl.value !== settingsData.replace_content) {
       body.replace_content = replaceEl.value;
+      body.expected_replace_content = settingsData.replace_content;
+    }
+    if (Object.keys(settings).length === 0 && !Object.hasOwn(body, 'replace_content')) {
+      showToast('変更された設定はありません', 'success');
+      return;
     }
 
     try {
@@ -707,12 +748,18 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
-      if (!resp.ok) {
-        throw new Error('設定の保存に失敗しました');
-      }
       const result = await resp.json();
+      if (!resp.ok) {
+        throw new Error(result?.message || (resp.status === 409
+          ? '別の操作で設定が変更されています。入力内容を控えてから再読み込みしてください'
+          : '設定の保存に失敗しました'));
+      }
       if (!result || result.success !== true) {
         showToast(result?.message || '保存に失敗しました', 'error');
+        return;
+      }
+      if (result.reboot) {
+        navigateAfterReboot();
         return;
       }
       try {
@@ -732,13 +779,6 @@
   function collectFormData() {
     const data = {};
 
-    // Worker 版で無効化されたコントロール (disabled) は値を送らない。
-    // サーバー側でも同じ名前を拒否するが、送らなければ他の項目の保存を
-    // 巻き込んで失敗させることがない。
-    document.querySelectorAll('.switch-light input[type="checkbox"][data-name]').forEach(function(input) {
-      if (input.disabled) return;
-      data[input.dataset.name] = input.checked;
-    });
 
     // Radio buttons (3-way)
     document.querySelectorAll('.switch-3way').forEach(function(group) {
@@ -773,7 +813,7 @@
     });
 
     // Text inputs
-    document.querySelectorAll('input.setting-input[type="text"][data-name]').forEach(function(input) {
+    document.querySelectorAll('input.setting-input[data-name]').forEach(function(input) {
       if (input.disabled) return;
       const name = input.dataset.name;
       const val = input.value.trim();
@@ -818,6 +858,7 @@
     applyLoadedTheme();
     renderTabs();
     renderTabContent();
+    baselineFormData = collectFormData();
     await loadStorageMode();
     restoreActiveTab(preferredTabId);
   }
@@ -827,7 +868,11 @@
     if (!resp.ok) {
       throw new Error('Failed to load settings');
     }
-    return resp.json();
+    const data = await resp.json();
+    if (data.error || !Array.isArray(data.settings) || !Array.isArray(data.tabs)) {
+      throw new Error(data.error || '設定一覧の形式が不正です');
+    }
+    return data;
   }
 
   function getCurrentTabId() {

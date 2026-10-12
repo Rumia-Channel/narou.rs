@@ -100,10 +100,9 @@ export const State = {
   concurrencyEnabled: false,
 
   // Config from server
+  capabilities: null,
   performanceMode: 'auto',
-  tableReloadTiming: 'every',
   debugMode: false,
-  wsPort: null,
   theme: lsGet('theme', 'default'),
   pollIntervalSeconds: 600,
   language: lsGet('language', 'ja'),

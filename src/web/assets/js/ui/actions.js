@@ -3,7 +3,7 @@
  * Mirrors narou.rb's full set of UI interactions.
  */
 import { State, El, lsSet, lsBool } from '../core/state.js';
-import { fetchJson, postJson } from '../core/http.js';
+import { fetchJson, postJson, request } from '../core/http.js';
 import { toggleLanguage } from './i18n.js';
 import { openFeatureTour } from './feature_tour.js';
 import {
@@ -263,9 +263,12 @@ export function bindActions() {
 
   on('action-option-about', openAbout);
 
-  on('action-option-shutdown', async () => {
+  on('action-option-shutdown', async (e) => {
     if (!confirm('サーバをシャットダウンしますか？')) return;
-    await postJson('/api/shutdown', {});
+    await runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/shutdown', {});
+      assertApiSuccess(result, 'サーバを停止できませんでした');
+    }, 'サーバを停止できませんでした');
   });
 
   on('action-option-server-reboot', async () => {
@@ -609,7 +612,7 @@ export function bindActions() {
 
   on('update-by-tag-close', () => document.getElementById('update-by-tag-modal')?.classList.add('hide'));
   on('update-by-tag-cancel', () => document.getElementById('update-by-tag-modal')?.classList.add('hide'));
-  on('update-by-tag-submit', () => {
+  on('update-by-tag-submit', async (e) => {
     const tags = [];
     const exclusion_tags = [];
     document.querySelectorAll('#update-by-tag-include input[data-tagname]:checked').forEach(cb => {
@@ -622,8 +625,11 @@ export function bindActions() {
       showNotification('タグを選択してください', 'warning');
       return;
     }
-    postJson('/api/update_by_tag', { tags, exclusion_tags, ...currentSortStatePayload() });
-    document.getElementById('update-by-tag-modal')?.classList.add('hide');
+    await runGuardedAction(e.currentTarget, async () => {
+      const result = await postJson('/api/update_by_tag', { tags, exclusion_tags, ...currentSortStatePayload() });
+      assertApiSuccess(result, 'タグ指定の更新要求に失敗しました');
+      document.getElementById('update-by-tag-modal')?.classList.add('hide');
+    }, 'タグ指定の更新要求に失敗しました');
   });
 
   on('action-update-view', (e) => {
@@ -876,6 +882,7 @@ export function bindActions() {
     refreshTags: () => refreshTags(),
     tagColorChanged: () => refreshOpenTagEditor(),
     refreshList: () => refreshList(),
+    notifyError: message => showNotification(message, 'error'),
   };
 
   setShortcutHandlers(handlers);
@@ -933,9 +940,14 @@ export function handleRegisterParam(url) {
 /* ===== Helpers ===== */
 
 function on(id, handler) {
-  document.getElementById(id)?.addEventListener('click', (e) => {
+  document.getElementById(id)?.addEventListener('click', async (e) => {
     e.preventDefault();
-    handler(e);
+    try {
+      const result = await handler(e);
+      assertApiSuccess(result, '操作に失敗しました');
+    } catch (error) {
+      showNotification(error.message || '操作に失敗しました', 'error');
+    }
   });
 }
 
@@ -1746,8 +1758,7 @@ function showRemoveModal(ids) {
 /* ===== CSV ===== */
 
 async function downloadCsv() {
-  const resp = await fetch('/api/csv/download');
-  if (!resp.ok) return;
+  const resp = await request('/api/csv/download');
   const blob = await resp.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1906,56 +1917,99 @@ function closeMenuStyleModal() {
 
 /* ===== Data refresh ===== */
 
+const refreshRequests = new Map();
 let listRefreshGeneration = 0;
 
-export async function refreshList() {
-  const generation = ++listRefreshGeneration;
-  try {
-    const resp = await fetchJson('/api/list?all=true');
-    if (generation !== listRefreshGeneration) return;
-    if (resp && Array.isArray(resp.data)) {
-      State.novels = resp.data;
-      State.frozenIds = new Set(
-        resp.data.filter(n => n.frozen).map(n => String(n.id))
-      );
-      pruneSelectedIdsToCurrentList();
-    }
-  } catch { /* ignore */ }
-  if (generation === listRefreshGeneration) renderNovelList();
+function runRefresh(key, action) {
+  const existing = refreshRequests.get(key);
+  if (existing) {
+    existing.dirty = true;
+    return existing.promise;
+  }
+  const work = { dirty: false, promise: null };
+  work.promise = Promise.resolve().then(async () => {
+    let result;
+    do {
+      work.dirty = false;
+      result = await action();
+    } while (work.dirty);
+    return result;
+  }).finally(() => refreshRequests.delete(key));
+  refreshRequests.set(key, work);
+  return work.promise;
+}
+
+export async function refreshList(redraw = true) {
+  ++listRefreshGeneration;
+  return runRefresh('list', async () => {
+    const generation = listRefreshGeneration;
+    try {
+      const resp = await fetchJson('/api/list?all=true');
+      if (generation !== listRefreshGeneration) return;
+      if (resp && Array.isArray(resp.data)) {
+        State.novels = resp.data;
+        State.frozenIds = new Set(resp.data.filter(n => n.frozen).map(n => String(n.id)));
+        pruneSelectedIdsToCurrentList();
+      }
+    } catch { /* keep the last successfully loaded list */ }
+    if (redraw && generation === listRefreshGeneration) renderNovelList();
+  });
 }
 
 export async function refreshQueue() {
-  try {
-    const data = await fetchJson('/api/queue/status');
-    if (data) {
-      State.queueStatus = data;
-      renderQueueStatus();
-      return data;
-    }
-  } catch { /* ignore */ }
-  return null;
+  return runRefresh('queue', async () => {
+    try {
+      const data = await fetchJson('/api/queue/status');
+      if (data) {
+        State.queueStatus = data;
+        renderQueueStatus();
+        return data;
+      }
+    } catch { /* keep the last successfully loaded status */ }
+    return null;
+  });
 }
 
 export async function refreshQueueDetailed() {
-  try {
-    const data = await fetchJson('/api/get_pending_tasks');
-    if (data) {
-      State.queueDetailed = data;
+  return runRefresh('queue-details', async () => {
+    try {
+      const pending = [];
+      const running = [];
+      const cursors = new Set();
+      let cursor = null;
+      let data;
+      do {
+        const query = cursor ? '?cursor=' + encodeURIComponent(cursor) : '';
+        data = await fetchJson('/api/get_pending_tasks' + query);
+        if (!data || !Array.isArray(data.pending) || !Array.isArray(data.running)) {
+          throw new Error('待機キューの応答が不正です');
+        }
+        pending.push(...data.pending);
+        running.push(...data.running);
+        cursor = data.next_cursor;
+        if (cursor && cursors.has(cursor)) throw new Error('待機キューのページ取得が進みません');
+        if (cursor) cursors.add(cursor);
+      } while (cursor);
+      State.queueDetailed = { ...data, pending, running };
       renderQueueDetailed();
+    } catch (error) {
+      showNotification(error.message || '待機キューを取得できませんでした', 'error');
     }
-  } catch { /* ignore */ }
+  });
 }
 
-export async function refreshTags() {
-  try {
-    const data = await fetchJson('/api/tag_list?format=json');
-    if (data) {
-      State.tags = data.tags || [];
-      State.tagColors = data.tag_colors || data.colors || {};
-      renderTagList();
-      renderNovelList();
-    }
-  } catch { /* ignore */ }
+export async function refreshTags(redraw = true) {
+  return runRefresh('tags', async () => {
+    try {
+      const data = await fetchJson('/api/tag_list?format=json');
+      if (data) {
+        State.tags = data.tags || [];
+        State.tagColors = data.tag_colors || data.colors || {};
+        renderTagList();
+        if (redraw) renderNovelList();
+      }
+    } catch { /* keep the last successfully loaded tags */ }
+  });
 }
 
 function replaceConsoleHistory(consoleEl, history) {

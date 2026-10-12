@@ -263,7 +263,10 @@ impl NativeHttpClient {
                 )
             })
             .collect();
-        let body = read_response_bytes(response)?;
+        let limit = if (200..300).contains(&status) {
+            request.trusted_response_body_limit.unwrap_or(MAX_RESPONSE_BYTES).min(MAX_RESPONSE_BYTES)
+        } else { MAX_RESPONSE_BYTES };
+        let body = read_response_bytes(response, limit)?;
         Ok(HttpResponse {
             status,
             headers,
@@ -373,7 +376,7 @@ impl NativeHttpClient {
             }
 
         let headers = content_type_header(content_type_of(&response));
-        let body = read_response_bytes(response)?;
+        let body = read_response_bytes(response, MAX_RESPONSE_BYTES)?;
         Ok(HttpResponse {
             status,
             headers,
@@ -399,7 +402,7 @@ impl NativeHttpClient {
         let response = req.send().map_err(|e| NarouError::Http(e.to_string()))?;
         let status = response.status().as_u16();
         let headers = content_type_header(content_type_of(&response));
-        let body = read_response_bytes(response)?;
+        let body = read_response_bytes(response, MAX_RESPONSE_BYTES)?;
         Ok(HttpResponse {
             status,
             headers,
@@ -488,7 +491,7 @@ impl NativeHttpClient {
         let status = response.status().as_u16();
         if status == 404 || status == 503 {
             let headers = content_type_header(content_type_of(&response));
-            let body = read_response_bytes(response)?;
+            let body = read_response_bytes(response, MAX_RESPONSE_BYTES)?;
             return Ok(HttpResponse {
                 status,
                 headers,
@@ -499,7 +502,7 @@ impl NativeHttpClient {
             return Err(io_error(format!("HTTP {status} while fetching {url}")));
         }
         let headers = content_type_header(content_type_of(&response));
-        let body = read_response_bytes(response)?;
+        let body = read_response_bytes(response, MAX_RESPONSE_BYTES)?;
         Ok(HttpResponse {
             status,
             headers,
@@ -1017,19 +1020,19 @@ fn build_reqwest_client(
         .map_err(|e| NarouError::Http(e.to_string()))
 }
 
-fn read_response_bytes(mut response: reqwest::blocking::Response) -> Result<Vec<u8>> {
-    let mut body = Vec::new();
+fn read_response_bytes(mut response: reqwest::blocking::Response, limit: usize) -> Result<Vec<u8>> {
+    if response.content_length().is_some_and(|size| size > limit as u64) {
+        return Err(io_error(format!("response body exceeded {limit} bytes")));
+    }
+    let mut body = Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
     let mut chunk = [0u8; 8192];
     loop {
         let read = response.read(&mut chunk)?;
         if read == 0 {
             break;
         }
-        if body.len() + read > MAX_RESPONSE_BYTES {
-            return Err(io_error(format!(
-                "response body exceeded {} bytes",
-                MAX_RESPONSE_BYTES
-            )));
+        if read > limit.saturating_sub(body.len()) {
+            return Err(io_error(format!("response body exceeded {limit} bytes")));
         }
         body.extend_from_slice(&chunk[..read]);
     }

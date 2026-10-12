@@ -51,14 +51,18 @@ pub async fn count(services: &AppServices) -> worker::Result<Response> {
 }
 
 /// native `all_novel_ids`: `{"ids": [...]}` (全件・ソート順なし)。
+///
+/// ID だけが必要なので `records()` (全レコード復号) ではなく
+/// `NovelRepository::scan_ids` の ID 投影を使う。順序は native と同じ
+/// id 昇順。
 pub async fn all_ids(services: &AppServices) -> worker::Result<Response> {
     let ids = services
         .library
-        .records()
+        .all_ids(&narou_rs::platform::NovelFilter::all())
         .await
         .unwrap_or_default()
         .into_iter()
-        .map(|record| record.id)
+        .map(|id| id.0)
         .collect::<Vec<i64>>();
     Response::from_json(&json!({ "ids": ids }))
 }
@@ -400,8 +404,12 @@ pub async fn batch_tag(
 
 /// native `sort_ids_for_request`: リクエストの sort_state/timestamp は参照
 /// せず、サーバー保存の現在ソートで並べ直す (row_actions.rs と同じ規則)。
+/// `sort_ids_from_records` は選択 id のレコードしか見ないので、全件ではなく
+/// 選択分だけを 1 クエリで読み、ソート状態の読み取りとは同時に走らせる。
 async fn sort_ids_for_request(services: &AppServices, ids: &[i64]) -> Vec<i64> {
-    let records = services.library.records().await.unwrap_or_default();
-    let sort_state = super::load_current_sort_state_for(services).await;
-    sort_ids_from_records(ids, &records, &sort_state)
+    let (records, sort_state) = futures::join!(
+        services.library.records_by_ids(ids),
+        super::load_current_sort_state_for(services),
+    );
+    sort_ids_from_records(ids, &records.unwrap_or_default(), &sort_state)
 }

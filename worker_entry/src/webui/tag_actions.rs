@@ -121,6 +121,7 @@ async fn apply_tag_change(
         .await
         .map_err(|error| match error {
             ApplicationError::InvalidRequest(message)
+            | ApplicationError::Conflict(message)
             | ApplicationError::NotFound(message)
             | ApplicationError::Platform(message) => message,
         })
@@ -142,16 +143,15 @@ fn ensure_all_ids_found(
 /// 並び替えるので、こちらも `current_sort` 設定 (D1 `app_state` global) を読む。
 /// 型・正規化・比較自体は `narou_rs::application::webui` の共有実装。
 async fn sort_ids_for_request(runtime: &WorkerRuntime, ids: &[i64]) -> Vec<i64> {
-    // ソート状態と現在のレコードはこの後のタグ更新を形作るので、判断材料の
+    // ソート状態と対象レコードはこの後のタグ更新を形作るので、判断材料の
     // 読み取りは更新系サービス (primary + キャッシュ無し) で行う。
-    let records = runtime
-        .write_services()
-        .library
-        .records()
-        .await
-        .unwrap_or_default();
-    let sort_state = load_current_sort_state_for_writes(runtime).await;
-    sort_ids_from_records(ids, &records, &sort_state)
+    // `sort_ids_from_records` は選択 id のレコードしか見ないため、全件
+    // スキャンではなく選択分だけを 1 クエリで読み、ソート状態とは同時に読む。
+    let (records, sort_state) = futures::join!(
+        runtime.write_services().library.records_by_ids(ids),
+        load_current_sort_state_for_writes(runtime),
+    );
+    sort_ids_from_records(ids, &records.unwrap_or_default(), &sort_state)
 }
 
 /// native `edit_tag` (`src/web/tags.rs:186`) の写し。

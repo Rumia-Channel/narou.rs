@@ -91,7 +91,11 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     };
 
     // `super::max_web_targets` parity: same setting key, same fallback.
-    let max_targets = super::max_web_targets(&runtime).await;
+    // 件数上限の設定読み取りと別名表の読み込みは独立なので同時に読む。
+    let (max_targets, aliases) = futures::join!(
+        super::max_web_targets(&runtime),
+        load_aliases(&env),
+    );
 
     // `queue_download_jobs` → `validate_download_targets` parity.
     if let Err(message) = validate_download_targets(&body.targets, max_targets) {
@@ -120,7 +124,6 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
     // `--mail` は上の 501 で拒否されるので積まない (積っても実行経路に
     // 消費者が無く、送信されない要求を黙って受理することになる)。
 
-    let aliases = load_aliases(&env).await;
     let mut plans = Vec::with_capacity(body.targets.len());
     for target in &body.targets {
         match resolve_plan_target(&runtime, &aliases, target).await {
@@ -141,20 +144,28 @@ pub async fn handle(mut req: Request, env: Env) -> worker::Result<Response> {
 
     // `push_batch` parity: enqueue through the shared ledger + Queue binding;
     // an enqueue failure reports the error string as the message (native does
-    // `map_err(|e| e.to_string())` into the same response shape).
-    let mut results = Vec::with_capacity(plans.len());
-    for (target, members) in body.targets.iter().zip(plans) {
+    // `map_err(|e| e.to_string())` into the same response shape). 展開後の
+    // 全メンバーを 1 回の bounded batch で投入し、結果は入力順・グループ順の
+    // まま並べる。
+    let mut batch: Vec<JobPlan> = Vec::new();
+    let mut labels: Vec<usize> = Vec::new();
+    for (index, members) in plans.into_iter().enumerate() {
         for plan in members {
-            let outcome = match runtime.enqueue_plan(plan).await {
-                Ok(outcome) => outcome,
-                Err(error) => return download_failure(&error.to_string()),
-            };
-            results.push(json!({
-                "target": target,
-                "job_id": outcome.job_id,
-                "status": "queued",
-            }));
+            labels.push(index);
+            batch.push(plan);
         }
+    }
+    let outcomes = match runtime.enqueue_batch(&batch).await {
+        Ok(outcomes) => outcomes,
+        Err(error) => return download_failure(&error.to_string()),
+    };
+    let mut results = Vec::with_capacity(batch.len());
+    for (index, outcome) in labels.iter().zip(outcomes) {
+        results.push(json!({
+            "target": &body.targets[*index],
+            "job_id": outcome.job_id,
+            "status": "queued",
+        }));
     }
 
     // native `api_download` は受理できたジョブを積んだあとに

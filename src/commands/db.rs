@@ -56,8 +56,13 @@ fn cmd_verify() -> narou_rs::error::Result<()> {
     // must match its decompressed payload. PRAGMA integrity_check covers
     // B-tree structure, not application-level corruption.
     match narou_rs::db::with_database(|db| db.sqlite_payload_check())? {
-        Some(0) => println!("payloads: ok"),
-        Some(bad) => println!("payloads: {bad} corrupted"),
+        Some(issues) if issues.is_empty() => println!("payloads: ok"),
+        Some(issues) => {
+            for issue in &issues {
+                println!("payloads: {issue}");
+            }
+            println!("payloads: {} corrupted", issues.len());
+        }
         None => {}
     }
     // Freeze fragments written by older builds still hold ids the stored

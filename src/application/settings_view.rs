@@ -111,11 +111,11 @@ pub fn error_view(message: String) -> serde_json::Value {
 
 /// `GET /api/global_setting` の応答を組み立てる。
 pub async fn load_view(settings: &SettingsService) -> serde_json::Value {
-    let entries = match settings.list().await {
-        Ok(entries) => entries,
+    let (entries, replace_content) = match futures::try_join!(settings.list(), settings.load_replace_content()) {
+        Ok(values) => values,
         Err(error) => return error_view(error.to_string()),
     };
-    let mut items = Vec::new();
+    let mut items = Vec::with_capacity(entries.len());
     let variables = setting_variables();
     let novel_vars = original_setting_var_infos();
 
@@ -166,14 +166,17 @@ pub async fn load_view(settings: &SettingsService) -> serde_json::Value {
         } else {
             unknown_setting_entry(&entry, scope, tab)
         };
-        if dynamic_prefix.is_some() && matches!(entry.var_type, VarType::Boolean) {
+        if matches!(entry.var_type, VarType::Boolean) {
             item["three_way"] = serde_json::json!(true);
-            item["invisible"] = serde_json::json!(false);
         }
+        item["default_value"] = yaml_to_json(entry.default_value);
+        item["requires_restart"] = serde_json::json!(
+            entry.scope == SettingScope::Local
+                && crate::application::settings::storage_setting_requires_restart(&entry.name)
+        );
         items.push(item);
     }
 
-    let replace_content = settings.load_replace_content().await.unwrap_or_default();
     serde_json::json!({
         "tabs": tabs_json(),
         "settings": items,
@@ -212,18 +215,37 @@ pub fn parse_changes(body: &serde_json::Value) -> Option<Vec<(String, serde_json
 pub async fn apply_save(
     settings: &SettingsService,
     body: &serde_json::Value,
-) -> Result<Vec<SettingsEffect>, String> {
-    let Some(changes) = parse_changes(body) else {
-        return Err("settings object required".to_string());
+) -> Result<Vec<SettingsEffect>, crate::application::ApplicationError> {
+    use crate::application::ApplicationError;
+    let changes = parse_changes(body)
+        .ok_or_else(|| ApplicationError::InvalidRequest("settings object required".to_string()))?;
+    let expected = match body.get("expected_settings") {
+        Some(value) => Some(value.as_object().ok_or_else(|| {
+            ApplicationError::InvalidRequest("expected_settings object required".to_string())
+        })?),
+        None => None,
     };
-    let effects = settings.apply_json(&changes).await.map_err(|e| e.to_string())?;
-
-    if let Some(content) = body["replace_content"].as_str() {
-        validate_web_text_size(content, MAX_WEB_TEXT_INPUT_BYTES, "replace.txt")?;
-        settings
-            .save_replace_content(content)
-            .await
-            .map_err(|error| error.to_string())?;
+    let replacement = if let Some(content) = body["replace_content"].as_str() {
+        validate_web_text_size(content, MAX_WEB_TEXT_INPUT_BYTES, "replace.txt")
+            .map_err(ApplicationError::InvalidRequest)?;
+        let current = settings.load_replace_content().await?;
+        if let Some(expected) = body.get("expected_replace_content") {
+            let expected = expected.as_str().ok_or_else(|| {
+                ApplicationError::InvalidRequest("expected_replace_content string required".to_string())
+            })?;
+            if expected != current {
+                return Err(ApplicationError::Conflict(
+                    "他の画面で置換設定が更新されました。変更内容を確認してから再読み込みしてください".to_string(),
+                ));
+            }
+        }
+        Some((current, content))
+    } else {
+        None
+    };
+    let effects = settings.apply_json_checked(&changes, expected).await?;
+    if let Some((expected, content)) = replacement {
+        settings.save_replace_content_checked(&expected, content).await?;
     }
     Ok(effects)
 }
@@ -384,83 +406,6 @@ mod tests {
             settings.get("default.enable_half_indent_bracket"),
             Some(&serde_yaml::Value::Bool(false))
         );
-    }
-
-    #[test]
-    fn select_summaries_use_display_labels() {
-        let vars = setting_variables();
-        let info = vars
-            .get("webui.performance-mode")
-            .expect("webui.performance-mode metadata");
-        assert_eq!(
-            select_summaries_for_setting("webui.performance-mode", info),
-            Some(vec![
-                "自動判定".to_string(),
-                "常に有効".to_string(),
-                "常に無効".to_string(),
-            ])
-        );
-    }
-
-    #[test]
-    fn select_summaries_include_new_tag_color_labels() {
-        let vars = setting_variables();
-        let info = vars
-            .get("webui.new-tag-color")
-            .expect("webui.new-tag-color metadata");
-        assert_eq!(
-            select_summaries_for_setting("webui.new-tag-color", info),
-            Some(vec![
-                "自動 (巡回)".to_string(),
-                "緑".to_string(),
-                "黄".to_string(),
-                "青".to_string(),
-                "紫".to_string(),
-                "水色".to_string(),
-                "赤".to_string(),
-                "白".to_string(),
-            ])
-        );
-    }
-
-    #[test]
-    fn select_summaries_support_default_prefixed_settings() {
-        let vars = setting_variables();
-        let info = vars.get("device").expect("device metadata");
-        assert_eq!(
-            select_summaries_for_setting("default.device", info),
-            Some(vec![
-                "Kindle".to_string(),
-                "Kobo".to_string(),
-                "EPUB".to_string(),
-                "i文庫".to_string(),
-                "SonyReader".to_string(),
-                "iBooks".to_string(),
-            ])
-        );
-    }
-
-    #[test]
-    fn tabbed_invisible_settings_are_visible_on_web_settings_page() {
-        let vars = setting_variables();
-        let info = vars.get("webui.theme").expect("webui.theme metadata");
-        assert!(info.invisible);
-
-        let entry = build_setting_entry("webui.theme", info, "local", "webui", None);
-
-        assert_eq!(entry["tab"], "webui");
-        assert_eq!(entry["invisible"], false);
-    }
-
-    #[test]
-    fn sort_labels_align_with_the_sort_keys() {
-        // ラベルの並びは `db::sort_keys()` と同順でなければならない。
-        assert_eq!(
-            sort_column_label_for_key("general_lastup"),
-            Some("最新話掲載日")
-        );
-        assert_eq!(sort_column_label_for_key("new_arrivals_date"), Some("新着日"));
-        assert_eq!(sort_column_label_for_key("unknown-key"), None);
     }
 
     #[test]

@@ -4,6 +4,7 @@
  */
 import { State, El, lsSet, persistListState } from '../core/state.js';
 import { fetchJson, postJson } from '../core/http.js';
+import { canUseAction, applyActionCapabilities } from '../core/capabilities.js';
 import { showContextMenu, showTagColorMenu } from './context_menu.js';
 
 const TAG_COLOR_MAP = {
@@ -813,6 +814,7 @@ export function updateEnableSelected() {
       el.classList.toggle('disabled', !hasSelection);
     }
   });
+  applyActionCapabilities();
 }
 
 /* ===== Tags ===== */
@@ -967,15 +969,16 @@ function renderTaskItem(task, isRunning, idx, total) {
   if (isRunning) {
     actionBtns = `<button class="queue-task-cancel" data-task-id="${esc(task.id)}" title="中止">${materialIcon('stop', 'icon-only')}</button>`;
   } else {
-    const upBtn = idx > 0
+    const reorder = canUseAction('queue_reorder');
+    const upBtn = reorder && idx > 0
       ? `<button class="queue-task-up" data-task-idx="${idx}" title="上へ">${materialIcon('keyboard_arrow_up', 'icon-only')}</button>`
       : `<button class="queue-task-up" disabled title="上へ">${materialIcon('keyboard_arrow_up', 'icon-only')}</button>`;
-    const downBtn = idx < total - 1
+    const downBtn = reorder && idx < total - 1
       ? `<button class="queue-task-down" data-task-idx="${idx}" title="下へ">${materialIcon('keyboard_arrow_down', 'icon-only')}</button>`
       : `<button class="queue-task-down" disabled title="下へ">${materialIcon('keyboard_arrow_down', 'icon-only')}</button>`;
-    actionBtns = `${upBtn}${downBtn}<button class="queue-task-delete" data-task-id="${esc(task.id)}" title="削除">${materialIcon('delete', 'icon-only')}</button>`;
+    actionBtns = `${reorder ? upBtn + downBtn : ''}<button class="queue-task-delete" data-task-id="${esc(task.id)}" title="削除">${materialIcon('delete', 'icon-only')}</button>`;
   }
-  return `<div class="queue-task-item${isRunning ? ' queue-running' : ''}" data-task-id="${esc(task.id)}"${isRunning ? '' : ' draggable="true"'}>
+  return `<div class="queue-task-item${isRunning ? ' queue-running' : ''}" data-task-id="${esc(task.id)}"${!isRunning && canUseAction('queue_reorder') ? ' draggable="true"' : ''}>
     <span class="queue-task-icon">${icon}</span>
     <span class="queue-task-label">${esc(label)}</span>
     <span class="queue-task-target">${esc(task.display_target || task.target || '')}</span>
@@ -1019,10 +1022,12 @@ export function renderQueueDetailed() {
       El.queueModalPendingList.innerHTML = qd.pending.map((t, i) => renderTaskItem(t, false, i, qd.pending.length)).join('');
       El.queueModalPendingList.querySelectorAll('.queue-task-delete').forEach(btn => {
         btn.addEventListener('click', async () => {
-          const taskId = btn.dataset.taskId;
-          await postJson('/api/remove_pending_task', { task_id: taskId });
-          const { refreshQueueDetailed } = await import('./actions.js');
-          await refreshQueueDetailed();
+          const { refreshQueue, refreshQueueDetailed, runGuardedAction } = await import('./actions.js');
+          await runGuardedAction(btn, async () => {
+            const result = await postJson('/api/remove_pending_task', { task_id: btn.dataset.taskId });
+            assertQueueActionSuccess(result, '待機中の処理を削除できませんでした');
+            await Promise.all([refreshQueue(), refreshQueueDetailed()]);
+          }, '待機中の処理を削除できませんでした');
         });
       });
       // Up/down reorder buttons
@@ -1039,9 +1044,11 @@ export function renderQueueDetailed() {
           });
         });
       };
-      wireReorder('.queue-task-up', -1);
-      wireReorder('.queue-task-down', 1);
-      wireQueueDragDrop();
+      if (canUseAction('queue_reorder')) {
+        wireReorder('.queue-task-up', -1);
+        wireReorder('.queue-task-down', 1);
+        wireQueueDragDrop();
+      }
     } else {
       El.queueModalPendingList.textContent = 'なし';
     }
